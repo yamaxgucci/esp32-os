@@ -262,6 +262,53 @@ int32_t ag_console_getch(uint32_t timeout_ms)
     }
 }
 
+int32_t ag_console_readline(char *buf, size_t len)
+{
+    if (buf == NULL || len == 0) {
+        return -AG_EINVAL;
+    }
+
+    size_t n = 0;
+    buf[0] = '\0';
+
+    for (;;) {
+        ag_event_t ev;
+        if (!ag_console_read_event(&ev, UINT32_MAX)) {
+            continue;
+        }
+        if (ev.type != AG_EV_KEY_DOWN) {
+            continue;
+        }
+
+        if (ev.key.mods & AG_MOD_CTRL) {
+            if (ev.key.keycode == AG_KEY_C) {
+                return -AG_EKILLED;
+            }
+            continue;
+        }
+
+        if (ev.key.keycode == AG_KEY_ENTER) {
+            break;
+        }
+        if (ev.key.keycode == AG_KEY_BACKSPACE) {
+            if (n > 0) {
+                n--;
+                ag_console_puts("\b \b");
+            }
+            continue;
+        }
+
+        /* Plain ASCII only; a confirmation prompt has no use for more. */
+        if (ev.key.unicode >= 0x20 && ev.key.unicode < 0x7f && n + 1 < len) {
+            buf[n++] = (char)ev.key.unicode;
+            ag_console_write(&buf[n - 1], 1);
+        }
+    }
+
+    buf[n] = '\0';
+    return (int32_t)n;
+}
+
 /* ---------------------------------------------------------------------- */
 
 static void console_task(void *arg)

@@ -1,9 +1,11 @@
 ﻿set(ARGON_KERNEL_SRCS
     "src/boot/kernel.c"
     "src/boot/platform.c"
+    "src/boot/board.c"
     "src/core/path.c"
     "src/core/cfg.c"
     "src/core/cmdline.c"
+    "src/core/sysconfig.c"
     "src/console/screen.c"
     "src/console/vtout.c"
     "src/console/vtin.c"
@@ -25,7 +27,7 @@ idf_component_register(
     PRIV_REQUIRES esp_psram esp_timer esp_partition nvs_flash spi_flash
                   esp_system esp_hw_support esp_driver_uart log
                   fatfs wear_levelling vfs sdmmc esp_driver_sdmmc
-                  esp_driver_sdspi)
+                  esp_driver_sdspi esp_driver_spi esp_driver_gpio)
 
 # Stamp the build with a git description when one is available.
 find_package(Git QUIET)

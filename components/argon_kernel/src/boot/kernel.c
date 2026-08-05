@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <argon/board.h>
 #include <argon/console.h>
 #include <argon/shell.h>
 
@@ -25,6 +26,7 @@
 
 #include "boot/platform.h"
 #include "console/uart_console.h"
+#include "core/sysconfig.h"
 #include "fs/storage.h"
 
 #define AG_CONSOLE_COLS 80
@@ -143,12 +145,12 @@ static const ag_stage_desc_t s_stages[AG_STAGE_COUNT] = {
     [AG_STAGE_PLATFORM]   = {"platform",   stage_platform, true},
     [AG_STAGE_MEMORY]     = {"memory",     NULL,           false},
     [AG_STAGE_LOG]        = {"log",        NULL,           false},
-    [AG_STAGE_BOARD]      = {"board",      NULL,           false},
+    [AG_STAGE_BOARD]      = {"board",      ag_board_init,  false},
     [AG_STAGE_CONSOLE]    = {"console",    stage_console,  true},
     [AG_STAGE_STORAGE]    = {"storage",    ag_storage_init, false},
-    [AG_STAGE_CONFIG]     = {"config",     NULL,           false},
+    [AG_STAGE_CONFIG]     = {"config",     ag_sysconfig_init, false},
     [AG_STAGE_DEVICES]    = {"devices",    NULL,           false},
-    [AG_STAGE_MEDIA]      = {"media",      NULL,           false},
+    [AG_STAGE_MEDIA]      = {"media",      ag_storage_mount_media, false},
     [AG_STAGE_MODULES]    = {"modules",    NULL,           false},
     [AG_STAGE_SUPERVISOR] = {"supervisor", NULL,           false},
     [AG_STAGE_SHELL]      = {"shell",      stage_shell,    true},

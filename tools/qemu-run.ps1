@@ -14,7 +14,9 @@
 param(
     [switch]$Tcp,
     [int]$Port = 5556,
-    [switch]$NoBuild
+    [switch]$NoBuild,
+    [switch]$Sd,
+    [string]$SdImage = 'build\sdcard.img'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -30,6 +32,10 @@ Update-FlashImage
 $efuse = Initialize-EfuseFile
 
 $qemuArgs = Get-QemuMachineArgs -EfusePath $efuse
+
+if ($Sd) {
+    $qemuArgs += Get-QemuSdArgs -Path $SdImage
+}
 
 if ($Tcp) {
     # wait=on: the board holds still until you connect, so you see the boot

@@ -13,6 +13,8 @@
 #include <argon/shell.h>
 #include <argon/vfs.h>
 
+#include "fs/storage.h"
+
 #define AG_COPY_CHUNK 512
 
 /* ---------------------------------------------------------------------- */
@@ -449,6 +451,63 @@ int ag_cmd_mount(int argc, char **argv)
                           (unsigned)(mi.info.free / 1024),
                           (unsigned)mi.open_handles,
                           (mi.flags & AG_MOUNT_READONLY) ? "  read-only" : "");
+    }
+    return 0;
+}
+
+int ag_cmd_format(int argc, char **argv)
+{
+    if (argc < 2) {
+        ag_console_puts("usage: format <drive> [/y]\n");
+        ag_console_puts("only removable media can be formatted\n");
+        return 1;
+    }
+
+    /* Only A: for now: reformatting the drive the system lives on is a way to
+     * lose a board, and no useful reason to do it has come up. */
+    char resolved[AG_PATH_MAX];
+    if (ag_path_resolve(argv[1], ag_shell_cwd(), resolved, sizeof(resolved)) !=
+            AG_OK ||
+        strcmp(resolved, "/sd") != 0) {
+        ag_console_printf("%s: only drive A: can be formatted\n", argv[1]);
+        return 1;
+    }
+
+    bool confirmed = false;
+    for (int i = 2; i < argc; i++) {
+        if (ag_path_icmp(argv[i], "/y") == 0) {
+            confirmed = true;
+        }
+    }
+
+    if (!confirmed) {
+        ag_console_puts("WARNING: ALL DATA ON DRIVE A: WILL BE LOST!\n");
+        ag_console_puts("Proceed with format (type YES)? ");
+
+        char answer[8];
+        const int32_t n = ag_console_readline(answer, sizeof(answer));
+        ag_console_puts("\n");
+        if (n < 0 || ag_path_icmp(answer, "YES") != 0) {
+            ag_console_puts("format cancelled\n");
+            return 1;
+        }
+    }
+
+    ag_console_puts("formatting drive A:...\n");
+    ag_console_sync();
+
+    const ag_err_t err = ag_storage_format_media();
+    if (err != AG_OK) {
+        print_error("format", err);
+        return 1;
+    }
+
+    ag_console_puts("format complete\n");
+
+    /* The working directory may have been on the card that just went away. */
+    ag_stat_t st;
+    if (ag_vfs_stat(ag_shell_cwd(), NULL, &st) != AG_OK) {
+        ag_shell_set_cwd("/sd");
     }
     return 0;
 }

@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <argon/board.h>
 #include <argon/cmdline.h>
 #include <argon/console.h>
 #include <argon/kernel.h>
@@ -21,6 +22,7 @@
 #include "esp_timer.h"
 
 #include "boot/platform.h"
+#include "core/sysconfig.h"
 #include "shell/cmd_fs.h"
 
 typedef struct {
@@ -219,8 +221,13 @@ static int cmd_ver(int argc, char **argv)
     ag_console_printf("%s rev %u, %u cores at %u MHz, profile %s\n", si->chip,
                       (unsigned)pl->chip_revision, (unsigned)si->cpu_cores,
                       (unsigned)(si->cpu_hz / 1000000u), si->profile);
-    ag_console_printf("board %s, ABI %u.%u, application core %u\n", si->board,
-                      si->abi_major, si->abi_minor, si->app_core);
+    /* The board name comes from the board layer, which is where it is decided. */
+    ag_console_printf("board %s, ABI %u.%u, application core %u\n",
+                      ag_board()->name, si->abi_major, si->abi_minor,
+                      si->app_core);
+    if (ag_sysconfig_sources()[0] != '\0') {
+        ag_console_printf("configured by %s\n", ag_sysconfig_sources());
+    }
     return 0;
 }
 
@@ -401,6 +408,7 @@ static const ag_command_t k_commands[] = {
     {"rd", "<path>", "remove a directory", ag_cmd_rmdir},
     {"ren", "<old> <new>", "rename a file", ag_cmd_rename},
     {"mount", "", "list mounted drives", ag_cmd_mount},
+    {"format", "<drive> [/y]", "make a fresh filesystem", ag_cmd_format},
     {"hexdump", "<file>", "dump a file as bytes", ag_cmd_hexdump},
     {"run", "<file>", "run an application", cmd_not_ready},
     {"errorlevel", "", "exit code of the last command", cmd_errorlevel},
@@ -505,11 +513,22 @@ int ag_shell_execute(const char *line)
         ag_console_redirect(file_sink, (void *)(intptr_t)redirect);
     }
 
-    for (int i = 0; k_commands[i].name != NULL; i++) {
+    /*
+     * A bare drive specification changes drive, the way it did in DOS.  Unlike
+     * DOS we do not remember a separate directory per drive: "A:" goes to the
+     * root of A, which is what someone typing it after a reboot expects.
+     */
+    if (argv[0][0] != '\0' && argv[0][1] == ':' && argv[0][2] == '\0') {
+        char verb[3] = "cd";
+        char *cd_argv[2] = {verb, argv[0]};
+        status = ag_cmd_cd(2, cd_argv);
+        found = true;
+    }
+
+    for (int i = 0; !found && k_commands[i].name != NULL; i++) {
         if (ag_path_icmp(argv[0], k_commands[i].name) == 0) {
             status = k_commands[i].fn(argc, argv);
             found = true;
-            break;
         }
     }
 

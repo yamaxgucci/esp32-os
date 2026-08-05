@@ -1,0 +1,87 @@
+/*
+ * ArgonOS - board description.
+ *
+ * One firmware image has to come up on boards that wire the same peripherals to
+ * different pins.  The description is built in three layers, each overriding
+ * the last:
+ *
+ *   1. generic defaults for the chip,
+ *   2. a compiled-in board pack, selected by NVS, efuse or autodetect,
+ *   3. BOARD.CFG on internal flash.
+ *
+ * Note what is NOT in that list: BOARD.CFG on the SD card.  The pins needed to
+ * reach the card cannot be read from a file on the card, so anything required
+ * to mount removable media has to come from the first two layers or from
+ * internal flash.  Everything discovered later - displays, sensors, buses -
+ * can be configured from either place.
+ *
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
+ */
+#ifndef ARGON_BOARD_H
+#define ARGON_BOARD_H
+
+#include <argon/abi.h>
+#include <argon/cfg.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef enum {
+    AG_SD_NONE = 0, /* the board has no card slot            */
+    AG_SD_SDMMC,    /* native SD host, 1 or 4 data lines     */
+    AG_SD_SPI,      /* card on a SPI bus, slower but frees pins */
+} ag_sd_kind_t;
+
+/* -1 means "not connected"; every pin field uses that convention. */
+#define AG_PIN_NONE (-1)
+
+typedef struct {
+    ag_sd_kind_t kind;
+
+    /* SDMMC */
+    int16_t clk;
+    int16_t cmd;
+    int16_t d0;
+    int16_t d1;
+    int16_t d2;
+    int16_t d3;
+    uint8_t width; /* 1 or 4 */
+
+    /* SD over SPI */
+    int16_t sck;
+    int16_t mosi;
+    int16_t miso;
+    int16_t cs;
+    uint8_t spi_host;
+
+    /* Card detect, when the board has one.  Without it, removal is noticed
+     * only when a transfer fails. */
+    int16_t card_detect;
+
+    uint32_t max_khz;
+} ag_board_sd_t;
+
+typedef struct {
+    char          name[24];
+    ag_board_sd_t sd;
+    uint16_t      console_cols;
+    uint16_t      console_rows;
+} ag_board_t;
+
+/* Applies the generic defaults for the chip, then any compiled-in board pack. */
+ag_err_t ag_board_init(void);
+
+/*
+ * Applies overrides from a parsed configuration.  Called once internal flash
+ * is mounted, which is why it is separate from ag_board_init().
+ */
+ag_err_t ag_board_apply_config(const ag_cfg_t *cfg);
+
+const ag_board_t *ag_board(void);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* ARGON_BOARD_H */

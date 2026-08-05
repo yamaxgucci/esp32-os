@@ -81,15 +81,27 @@ switch ($Command.ToLowerInvariant()) {
         }
 
         # Bare words after "test" are commands to type at the prompt, so
-        # `argon test ver mem` works from cmd without array syntax.
+        # `argon test ver mem` works from cmd without array syntax.  Options
+        # that take a value have to be named: -Sd is a switch, and treating the
+        # word after it as its value would swallow the first command.
+        #
+        # Options go into a hashtable, not an array: splatting an array passes
+        # its elements positionally, so "-Sd" would arrive as the value of the
+        # first positional parameter instead of as a switch.
+        #
+        $valued = @('marker', 'timeoutsec', 'port', 'sdimage', 'quietms',
+                    'logpath')
         $send = @()
-        $opts = @()
+        $opts = @{}
         for ($i = 0; $i -lt $Rest.Count; $i++) {
             if ($Rest[$i] -like '-*') {
-                $opts += $Rest[$i]
-                if (($i + 1) -lt $Rest.Count -and $Rest[$i + 1] -notlike '-*') {
-                    $opts += $Rest[$i + 1]
+                $name = $Rest[$i].TrimStart('-')
+                if ($valued -contains $name.ToLowerInvariant() -and
+                    ($i + 1) -lt $Rest.Count) {
+                    $opts[$name] = $Rest[$i + 1]
                     $i++
+                } else {
+                    $opts[$name] = $true
                 }
             } else {
                 $send += $Rest[$i]

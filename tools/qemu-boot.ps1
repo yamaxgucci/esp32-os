@@ -21,7 +21,11 @@ param(
     [string[]]$Send = @(),
     [int]$Port = 5556,
     [string]$LogPath = 'build\qemu-boot.log',
-    [int]$QuietMs = 1200
+    [int]$QuietMs = 1200,
+    # Attach a card image. Off by default so a test that does not care about
+    # removable media is not slowed down by probing for it.
+    [switch]$Sd,
+    [string]$SdImage = 'build\sdcard.img'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -39,6 +43,10 @@ $qemuArgs = (Get-QemuMachineArgs -EfusePath $efuse) + @(
     '-monitor', 'none'
     '-serial', "tcp:127.0.0.1:$Port,server=on,wait=on"
 )
+
+if ($Sd) {
+    $qemuArgs += Get-QemuSdArgs -Path $SdImage
+}
 
 # A leftover emulator would still hold the port and answer with silence.
 Get-Process qemu-system-xtensa -ErrorAction SilentlyContinue |

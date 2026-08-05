@@ -64,6 +64,13 @@ bool ag_console_read_event(ag_event_t *ev, uint32_t timeout_ms);
 int32_t ag_console_getch(uint32_t timeout_ms);
 
 /*
+ * Reads a line, echoing it, with backspace.  Deliberately minimal: this is for
+ * a yes-or-no prompt, not for editing a command - the shell has a proper line
+ * editor for that.  Returns the length, or -AG_EKILLED if interrupted.
+ */
+int32_t ag_console_readline(char *buf, size_t len);
+
+/*
  * Direct screen access for code that draws rather than prints.  Take the lock
  * around a group of operations that must appear at once.
  */

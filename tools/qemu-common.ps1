@@ -126,6 +126,23 @@ public static class ArgonConsoleVt
 function Enable-ConsoleVt { return [ArgonConsoleVt]::Enable() }
 function Restore-ConsoleVt { [ArgonConsoleVt]::Restore() }
 
+# Attaches a card image, creating a blank one if it is missing.  A blank image
+# will not mount, by design: ArgonOS never formats removable media on its own.
+# Use the format command in the shell to make a filesystem on it.
+function Get-QemuSdArgs {
+    param([string]$Path = 'build\sdcard.img', [int]$SizeMB = 64)
+
+    if (-not (Test-Path $Path)) {
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Path) |
+            Out-Null
+        $file = [System.IO.File]::Create((Join-Path (Get-Location) $Path))
+        $file.SetLength([long]$SizeMB * 1MB)
+        $file.Close()
+        Write-Host "Created blank $SizeMB MB card image $Path"
+    }
+    return @('-drive', "file=$Path,if=sd,format=raw")
+}
+
 # Machine arguments common to every way we start the emulator.
 function Get-QemuMachineArgs {
     param([string]$EfusePath)

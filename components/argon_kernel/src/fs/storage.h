@@ -8,7 +8,23 @@
 
 #include <argon/abi.h>
 
-/* Initialises the VFS and mounts what does not need a board: /tmp. */
+/* Initialises the VFS and mounts what needs no board description: /tmp, /sys. */
 ag_err_t ag_storage_init(void);
+
+/*
+ * Mounts removable media at /sd, using the pins from the board description, so
+ * it must run after the board and configuration stages.  Returns -AG_ENODEV
+ * when the board has no slot and -AG_EIO when there is no readable card, both
+ * of which are ordinary conditions rather than faults.
+ */
+ag_err_t ag_storage_mount_media(void);
+
+/*
+ * Writes a fresh filesystem to the card, destroying what was on it, then mounts
+ * it.  Only reachable through the format command, which asks first.
+ */
+ag_err_t ag_storage_format_media(void);
+
+bool ag_storage_media_present(void);
 
 #endif /* ARGON_STORAGE_H */
