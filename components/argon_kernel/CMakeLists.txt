@@ -1,4 +1,4 @@
-﻿set(ARGON_KERNEL_SRCS
+set(ARGON_KERNEL_SRCS
     "src/boot/kernel.c"
     "src/boot/platform.c"
     "src/boot/board.c"
@@ -6,6 +6,8 @@
     "src/core/cfg.c"
     "src/core/cmdline.c"
     "src/core/sysconfig.c"
+    "src/core/journal.c"
+    "src/core/log.c"
     "src/console/screen.c"
     "src/console/vtout.c"
     "src/console/vtin.c"

@@ -14,6 +14,7 @@
 #include <argon/console.h>
 #include <argon/kernel.h>
 #include <argon/lineedit.h>
+#include <argon/log.h>
 #include <argon/path.h>
 #include <argon/vfs.h>
 
@@ -353,6 +354,50 @@ static int cmd_color(int argc, char **argv)
     return 0;
 }
 
+static int cmd_log(int argc, char **argv)
+{
+    uint32_t want = UINT32_MAX;
+
+    for (int i = 1; i < argc; i++) {
+        if (ag_path_icmp(argv[i], "clear") == 0) {
+            ag_log_clear();
+            ag_console_puts("journal cleared\n");
+            return 0;
+        }
+        if (ag_path_icmp(argv[i], "-n") == 0 && i + 1 < argc) {
+            const int n = atoi(argv[++i]);
+            if (n > 0) {
+                want = (uint32_t)n;
+            }
+        }
+    }
+
+    const ag_journal_t *j = ag_log_journal();
+    const uint32_t      held = ag_journal_count(j);
+    const uint32_t      skip = (want < held) ? (held - want) : 0;
+
+    ag_journal_iter_t it;
+    ag_journal_begin(j, &it);
+
+    char     line[AG_JOURNAL_LINE_MAX];
+    uint32_t index = 0;
+    while (ag_journal_next(j, &it, line, sizeof(line))) {
+        if (index++ < skip) {
+            continue;
+        }
+        ag_console_printf("%s\n", line);
+    }
+
+    const uint32_t lost = ag_journal_lost(j);
+    ag_console_printf("\n%u lines held", (unsigned)held);
+    if (lost > 0) {
+        ag_console_printf(", %u older lines already overwritten",
+                          (unsigned)lost);
+    }
+    ag_console_puts("\n");
+    return 0;
+}
+
 static int cmd_errorlevel(int argc, char **argv)
 {
     (void)argc;
@@ -394,6 +439,7 @@ static const ag_command_t k_commands[] = {
     {"ver", "", "version and hardware", cmd_ver},
     {"mem", "", "memory usage", cmd_mem},
     {"boot", "", "boot stage report", cmd_boot},
+    {"log", "[-n N|clear]", "system journal", cmd_log},
     {"uptime", "", "time since reset", cmd_uptime},
     {"cls", "", "clear the screen", cmd_cls},
     {"echo", "<text>", "print text", cmd_echo},

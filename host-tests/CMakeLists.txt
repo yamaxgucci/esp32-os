@@ -27,7 +27,8 @@ set(ARGON_PORTABLE_SRCS
     "${ARGON_ROOT}/components/argon_kernel/src/console/vtin.c"
     "${ARGON_ROOT}/components/argon_kernel/src/shell/lineedit.c"
     "${ARGON_ROOT}/components/argon_kernel/src/fs/vfs.c"
-    "${ARGON_ROOT}/components/argon_kernel/src/fs/ramfs.c")
+    "${ARGON_ROOT}/components/argon_kernel/src/fs/ramfs.c"
+    "${ARGON_ROOT}/components/argon_kernel/src/core/journal.c")
 
 set(ARGON_INCLUDES
     "${CMAKE_CURRENT_LIST_DIR}"
@@ -47,6 +48,7 @@ add_executable(argon_tests
     test_cmdline.c
     test_lineedit.c
     test_vfs.c
+    test_journal.c
     ${ARGON_PORTABLE_SRCS})
 
 target_include_directories(argon_tests PRIVATE ${ARGON_INCLUDES})

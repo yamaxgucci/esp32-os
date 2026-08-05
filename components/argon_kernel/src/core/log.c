@@ -1,0 +1,120 @@
+/*
+ * ArgonOS - logging.
+ *
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
+ */
+#include <argon/log.h>
+
+#include <stdio.h>
+#include <string.h>
+
+#include <argon/console.h>
+
+#include "esp_log.h"
+#include "esp_timer.h"
+
+/*
+ * Static storage, in internal RAM, available before any allocator has run.  4 KB
+ * is roughly two hundred lines: enough to hold a whole boot plus recent history,
+ * which is what the journal is for.  It is charged against the kernel's memory
+ * budget deliberately - see docs/00-architecture.md section 10.
+ */
+#define AG_JOURNAL_BYTES 4096
+
+static char         s_storage[AG_JOURNAL_BYTES];
+static ag_journal_t s_journal;
+static bool         s_echo = true;
+static bool         s_ready;
+
+const ag_journal_t *ag_log_journal(void) { return &s_journal; }
+
+void ag_log_clear(void) { ag_journal_clear(&s_journal); }
+
+void ag_log_set_echo(bool on) { s_echo = on; }
+bool ag_log_echo(void) { return s_echo; }
+
+/*
+ * Where ESP-IDF's log output goes.  Note the order: the journal first, always,
+ * and the console only if there is one and it is wanted.  Reversing that is how
+ * a message about a failure gets lost in the failure.
+ */
+static int log_vprintf(const char *fmt, va_list ap)
+{
+    char      line[AG_JOURNAL_LINE_MAX + 8];
+    const int n = vsnprintf(line, sizeof(line), fmt, ap);
+
+    if (n <= 0) {
+        return n;
+    }
+    const size_t len = ((size_t)n < sizeof(line)) ? (size_t)n
+                                                  : sizeof(line) - 1;
+
+    ag_journal_write(&s_journal, line, len);
+
+    if (s_echo && ag_console_ready()) {
+        ag_console_write(line, len);
+    } else if (!ag_console_ready()) {
+        /* Before the console exists the raw port is the only way out. */
+        (void)fwrite(line, 1, len, stdout);
+        (void)fflush(stdout);
+    }
+    return n;
+}
+
+ag_err_t ag_log_init(void)
+{
+    const ag_err_t err = ag_journal_init(&s_journal, s_storage,
+                                         sizeof(s_storage));
+    if (err != AG_OK) {
+        return err;
+    }
+
+    s_ready = true;
+    esp_log_set_vprintf(log_vprintf);
+    return AG_OK;
+}
+
+void ag_vlog(ag_log_level_t level, const char *tag, const char *fmt,
+             va_list ap)
+{
+    static const char k_mark[] = {'E', 'W', 'I', 'D', 'V'};
+
+    if (!s_ready) {
+        return;
+    }
+
+    const char mark = (level < sizeof(k_mark)) ? k_mark[level] : '?';
+    const uint32_t ms = (uint32_t)(esp_timer_get_time() / 1000);
+
+    /* Same shape as ESP-IDF's own lines, so a mixed journal reads as one thing. */
+    char head[48];
+    const int hn = snprintf(head, sizeof(head), "%c (%u) %s: ", mark,
+                            (unsigned)ms, (tag != NULL) ? tag : "argon");
+    if (hn > 0) {
+        ag_journal_write(&s_journal, head, (size_t)hn);
+        if (s_echo && ag_console_ready()) {
+            ag_console_write(head, (size_t)hn);
+        }
+    }
+
+    char body[AG_JOURNAL_LINE_MAX];
+    const int bn = vsnprintf(body, sizeof(body), fmt, ap);
+    if (bn > 0) {
+        const size_t len = ((size_t)bn < sizeof(body)) ? (size_t)bn
+                                                      : sizeof(body) - 1;
+        ag_journal_write(&s_journal, body, len);
+        ag_journal_puts(&s_journal, "\n");
+        if (s_echo && ag_console_ready()) {
+            ag_console_write(body, len);
+            ag_console_puts("\n");
+        }
+    }
+}
+
+void ag_log(ag_log_level_t level, const char *tag, const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    ag_vlog(level, tag, fmt, ap);
+    va_end(ap);
+}

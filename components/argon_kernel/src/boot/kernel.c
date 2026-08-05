@@ -16,6 +16,7 @@
 
 #include <argon/board.h>
 #include <argon/console.h>
+#include <argon/log.h>
 #include <argon/shell.h>
 
 #include "esp_log.h"
@@ -122,14 +123,10 @@ static ag_err_t stage_console(void)
     AG_TRACE("uart attached\n");
 
     /*
-     * From here on, ESP-IDF log output goes through the screen like everything
-     * else.  Left alone it would write straight to the UART and tear whatever
-     * the console had drawn.
+     * Log output already goes through the journal, which took over ESP-IDF's
+     * hook in the log stage.  Nothing needs redirecting here: the console has
+     * simply become one of the journal's readers.
      */
-#if !AG_BOOT_TRACE
-    esp_log_set_vprintf(ag_console_vprintf);
-#endif
-
     print_banner();
     return AG_OK;
 }
@@ -144,7 +141,7 @@ static ag_err_t stage_shell(void) { return AG_OK; }
 static const ag_stage_desc_t s_stages[AG_STAGE_COUNT] = {
     [AG_STAGE_PLATFORM]   = {"platform",   stage_platform, true},
     [AG_STAGE_MEMORY]     = {"memory",     NULL,           false},
-    [AG_STAGE_LOG]        = {"log",        NULL,           false},
+    [AG_STAGE_LOG]        = {"log",        ag_log_init,    false},
     [AG_STAGE_BOARD]      = {"board",      ag_board_init,  false},
     [AG_STAGE_CONSOLE]    = {"console",    stage_console,  true},
     [AG_STAGE_STORAGE]    = {"storage",    ag_storage_init, false},
@@ -207,9 +204,16 @@ void ag_kernel_main(void)
 
         if (err != AG_OK) {
             s_report.degraded = true;
-            kout("argon: stage '%s' failed with %d\n", st->name, (int)err);
+            /*
+             * Logged rather than printed: the journal is the record and the
+             * console is one of its readers, so this reaches both without
+             * being written twice.  A boot failure is exactly the kind of
+             * message that used to scroll away before anyone read it.
+             */
+            ag_log(AG_LOG_ERROR, "boot", "stage '%s' failed with %d", st->name,
+                   (int)err);
             if (st->fatal) {
-                kout("argon: cannot continue\n");
+                ag_log(AG_LOG_ERROR, "boot", "cannot continue");
                 fatal_failure = true;
                 break;
             }
