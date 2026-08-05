@@ -255,12 +255,17 @@ static int cmd_mem(int argc, char **argv)
     } else {
         ag_console_puts("  extended         none\n");
     }
-    ag_console_printf("  executable %6u KB  %8u KB\n",
-                      (unsigned)(heap_caps_get_total_size(MALLOC_CAP_EXEC) / 1024),
-                      (unsigned)(heap_caps_get_free_size(MALLOC_CAP_EXEC) / 1024));
-
     ag_console_printf("\n  %u KB used by the system\n",
                       (unsigned)((int_total - int_free) / 1024));
+
+    /*
+     * The arena is the honest answer to "how much executable memory is there":
+     * MALLOC_CAP_EXEC reports zero on this chip because ESP-IDF gives none of
+     * that memory to the heap, which is why the arena is reserved at link time.
+     */
+    ag_console_printf("  %u KB reserved for application code (%s)\n",
+                      (unsigned)(ag_loader_arena_size() / 1024),
+                      ag_loader_arena_busy() ? "in use" : "free");
 
     /* Silent when it is zero, which is the only acceptable value. */
     const uint32_t dropped = ag_console_dropped_events();

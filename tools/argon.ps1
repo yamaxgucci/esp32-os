@@ -91,7 +91,7 @@ switch ($Command.ToLowerInvariant()) {
         # first positional parameter instead of as a switch.
         #
         $valued = @('marker', 'timeoutsec', 'port', 'sdimage', 'quietms',
-                    'logpath')
+                    'logpath', 'put')
         $send = @()
         $opts = @{}
         for ($i = 0; $i -lt $Rest.Count; $i++) {
@@ -99,7 +99,13 @@ switch ($Command.ToLowerInvariant()) {
                 $name = $Rest[$i].TrimStart('-')
                 if ($valued -contains $name.ToLowerInvariant() -and
                     ($i + 1) -lt $Rest.Count) {
-                    $opts[$name] = $Rest[$i + 1]
+                    # Repeating an option collects its values, so that more than
+                    # one file can be sent in a single run.
+                    if ($opts.ContainsKey($name)) {
+                        $opts[$name] = @($opts[$name]) + $Rest[$i + 1]
+                    } else {
+                        $opts[$name] = $Rest[$i + 1]
+                    }
                     $i++
                 } else {
                     $opts[$name] = $true

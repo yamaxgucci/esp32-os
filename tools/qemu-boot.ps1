@@ -4,6 +4,7 @@
 #   . .\tools\idf-env.ps1
 #   .\tools\qemu-boot.ps1
 #   .\tools\qemu-boot.ps1 -Send @('ver','mem') -Marker 'A:\>'
+#   .\tools\qemu-boot.ps1 -Put 'HELLO.AXE=t:\hello.axe' -Send @('run t:\hello.axe')
 #
 # QEMU's serial port is exposed over TCP rather than stdio.  Piping stdio is
 # what the obvious version of this script does, and it does not work: a
@@ -19,6 +20,10 @@ param(
     [string]$Marker = '\>',
     [int]$TimeoutSec = 60,
     [string[]]$Send = @(),
+    # Files to copy into the guest before the commands run, as
+    # 'localpath=guestpath'.  There is no other way in: the emulator has no card
+    # reader, and the shell's recv command is what the console is for.
+    [string[]]$Put = @(),
     [int]$Port = 5556,
     [string]$LogPath = 'build\qemu-boot.log',
     [int]$QuietMs = 1200,
@@ -101,21 +106,63 @@ try {
         Start-Sleep -Milliseconds 100
     }
 
+    # A terminal sends CR for Enter; CRLF would look like two keys.
+    function Send-Line {
+        param([string]$Text)
+        $bytes = [System.Text.Encoding]::ASCII.GetBytes($Text + "`r")
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush()
+    }
+
+    # Waits for one more prompt than has been seen so far, which is how a
+    # command says it has finished.
+    function Wait-Prompt {
+        param([int]$Was, [int]$Seconds = 10)
+        $deadline = (Get-Date).AddSeconds($Seconds)
+        while ((Get-Date) -lt $deadline) {
+            $now = Read-Available
+            if ($now -gt $Was) { return $now }
+            Start-Sleep -Milliseconds 100
+        }
+        return Read-Available
+    }
+
+    if ($found -and $Put.Count -gt 0) {
+        foreach ($spec in $Put) {
+            $split = $spec.IndexOf('=')
+            if ($split -lt 1) { throw "Bad -Put spec '$spec'; want local=guest" }
+            $local = $spec.Substring(0, $split)
+            $guest = $spec.Substring($split + 1)
+            if (-not (Test-Path $local)) { throw "No such file: $local" }
+
+            $bytes = [System.IO.File]::ReadAllBytes(
+                (Join-Path (Get-Location) $local))
+            Write-Host "Sending $local ($($bytes.Length) bytes) to $guest"
+
+            $was = $seen
+            Send-Line "recv $guest"
+
+            # 32 bytes a line, and the line editor echoes every one of them, so
+            # the reader is pumped as we go: filling the input queue faster than
+            # the guest drains it is how input gets dropped.
+            for ($at = 0; $at -lt $bytes.Length; $at += 32) {
+                $take = [Math]::Min(32, $bytes.Length - $at)
+                $hex = -join (0..($take - 1) | ForEach-Object {
+                    $bytes[$at + $_].ToString('x2') })
+                Send-Line $hex
+                Start-Sleep -Milliseconds 20
+                [void](Read-Available)
+            }
+
+            Send-Line 'END'
+            $seen = Wait-Prompt -Was $was -Seconds 30
+        }
+    }
+
     if ($found -and $Send.Count -gt 0) {
         foreach ($cmd in $Send) {
-            # A terminal sends CR for Enter; CRLF would look like two keys.
-            $bytes = [System.Text.Encoding]::ASCII.GetBytes($cmd + "`r")
-            $stream.Write($bytes, 0, $bytes.Length)
-            $stream.Flush()
-
-            # The command is done when the prompt comes back.
-            $want = $seen + 1
-            $cmdDeadline = (Get-Date).AddSeconds(10)
-            while ((Get-Date) -lt $cmdDeadline) {
-                $seen = Read-Available
-                if ($seen -ge $want) { break }
-                Start-Sleep -Milliseconds 100
-            }
+            Send-Line $cmd
+            $seen = Wait-Prompt -Was $seen
         }
     }
 

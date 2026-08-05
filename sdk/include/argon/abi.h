@@ -661,6 +661,14 @@ enum ag_axe_flags {
     AG_AXE_NEEDS_NET = 1u << 2,
     AG_AXE_DRIVER = 1u << 3,     /* .SYS module, entry is ag_driver_init    */
     AG_AXE_RESIDENT = 1u << 4,
+
+    /*
+     * Set by the build tool, not by the application: the two parts of the image
+     * must be placed adjacent, data immediately after code, and share one bias.
+     * Needed where code reaches its data PC-relatively - RISC-V does, with the
+     * medany code model - so the distance between the parts cannot change.
+     */
+    AG_AXE_CONTIGUOUS = 1u << 5,
 };
 
 /*

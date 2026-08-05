@@ -2,10 +2,10 @@
  * ArgonOS - placing a .AXE image in memory.
  *
  * The part of loading that has no dependency on the chip: validating the
- * header, zeroing bss, adding the load bias to the absolute words, and working
- * out where the entry point and the API pointer ended up.  Everything about
- * where the memory came from is somebody else's problem, which is what makes
- * this testable on a host against a reference build.
+ * header, zeroing bss, adding each part's load bias to the absolute words, and
+ * working out where the entry point and the API pointer ended up.  Everything
+ * about where the memory came from is somebody else's problem, which is what
+ * makes this testable on a host against a reference build.
  *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
  */
@@ -19,9 +19,25 @@
 extern "C" {
 #endif
 
+/*
+ * Where the caller put the two parts.  The stored bytes of each are expected to
+ * be in place already; the capacities are here so that an allocation too small
+ * for what the header asks is caught before anything is written to it.
+ *
+ * `data` may be NULL when the image has no data part.  For a contiguous image
+ * it points into the same allocation as `code`, immediately after it.
+ */
 typedef struct {
-    uintptr_t base;  /* where the image actually is                        */
-    void     *entry; /* ag_main, as a function pointer                     */
+    void  *code;
+    size_t code_capacity;
+    void  *data;
+    size_t data_capacity;
+} ag_axe_place_t;
+
+typedef struct {
+    uintptr_t code_base; /* where the code part actually is                */
+    uintptr_t data_base; /* where the data part actually is, 0 if absent    */
+    void     *entry;     /* ag_main, as a function pointer                  */
 
     /*
      * The application's pointer to the syscall table, as a 32-bit word rather
@@ -51,13 +67,20 @@ ag_err_t ag_axe_validate(const ag_axe_header_t *header, size_t file_bytes,
                          uint16_t abi_minor);
 
 /*
- * Finishes an image already copied to `image`, which must be at least
- * header->image_size bytes.  The stored part is expected to be in place; bss is
- * zeroed here, so the caller need not clear the allocation first.
+ * Finishes an image whose parts are already copied into `place`.  bss is zeroed
+ * here, so the caller need not clear the allocations first.
  */
-ag_err_t ag_axe_apply(void *image, size_t image_capacity,
-                      const ag_axe_header_t *header, const uint32_t *relocs,
+ag_err_t ag_axe_apply(const ag_axe_header_t *header,
+                      const ag_axe_place_t *place, const uint32_t *relocs,
                       uint32_t reloc_count, ag_axe_binding_t *out);
+
+/*
+ * Turns an address as linked into the address it ended up at, by finding which
+ * part it falls in.  NULL when it belongs to neither, which means the header
+ * and the image disagree.
+ */
+void *ag_axe_resolve(const ag_axe_header_t *header, const ag_axe_place_t *place,
+                     uint32_t linked_addr);
 
 /* Which architecture this build of the kernel can run. */
 ag_axe_arch_t ag_axe_native_arch(void);
