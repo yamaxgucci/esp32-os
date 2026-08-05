@@ -24,10 +24,13 @@ add_executable(argon_tests
     test_vtin.c
     test_cmdline.c
     test_lineedit.c
+    test_vfs.c
     "${ARGON_ROOT}/components/argon_kernel/src/core/path.c"
     "${ARGON_ROOT}/components/argon_kernel/src/core/cfg.c"
     "${ARGON_ROOT}/components/argon_kernel/src/core/cmdline.c"
     "${ARGON_ROOT}/components/argon_kernel/src/shell/lineedit.c"
+    "${ARGON_ROOT}/components/argon_kernel/src/fs/vfs.c"
+    "${ARGON_ROOT}/components/argon_kernel/src/fs/ramfs.c"
     "${ARGON_ROOT}/components/argon_kernel/src/console/screen.c"
     "${ARGON_ROOT}/components/argon_kernel/src/console/vtout.c"
     "${ARGON_ROOT}/components/argon_kernel/src/console/vtin.c")

@@ -9,8 +9,12 @@ set(ARGON_KERNEL_SRCS
     "src/console/vtin.c"
     "src/console/console.c"
     "src/console/uart_console.c"
+    "src/fs/vfs.c"
+    "src/fs/ramfs.c"
+    "src/fs/storage.c"
     "src/shell/lineedit.c"
-    "src/shell/shell.c")
+    "src/shell/shell.c"
+    "src/shell/cmd_fs.c")
 
 idf_component_register(
     SRCS ${ARGON_KERNEL_SRCS}

@@ -25,6 +25,7 @@
 
 #include "boot/platform.h"
 #include "console/uart_console.h"
+#include "fs/storage.h"
 
 #define AG_CONSOLE_COLS 80
 #define AG_CONSOLE_ROWS 25
@@ -142,7 +143,7 @@ static const ag_stage_desc_t s_stages[AG_STAGE_COUNT] = {
     [AG_STAGE_LOG]        = {"log",        NULL,           false},
     [AG_STAGE_BOARD]      = {"board",      NULL,           false},
     [AG_STAGE_CONSOLE]    = {"console",    stage_console,  true},
-    [AG_STAGE_STORAGE]    = {"storage",    NULL,           false},
+    [AG_STAGE_STORAGE]    = {"storage",    ag_storage_init, false},
     [AG_STAGE_CONFIG]     = {"config",     NULL,           false},
     [AG_STAGE_DEVICES]    = {"devices",    NULL,           false},
     [AG_STAGE_MEDIA]      = {"media",      NULL,           false},

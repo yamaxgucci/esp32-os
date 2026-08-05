@@ -41,6 +41,8 @@ static SemaphoreHandle_t  s_lock;
 static QueueHandle_t      s_events;
 static TaskHandle_t       s_task;
 static bool               s_ready;
+static ag_con_sink_fn     s_redirect;
+static void              *s_redirect_ctx;
 
 /* ---------------------------------------------------------------------- */
 
@@ -90,13 +92,26 @@ static void render_all(void)
     ag_screen_clear_dirty(&s_screen);
 }
 
+void ag_console_redirect(ag_con_sink_fn sink, void *ctx)
+{
+    ag_console_lock();
+    s_redirect = sink;
+    s_redirect_ctx = ctx;
+    ag_console_unlock();
+}
+
 void ag_console_write(const char *buf, size_t len)
 {
     if (!s_ready || buf == NULL) {
         return;
     }
+
     ag_console_lock();
-    ag_screen_write(&s_screen, buf, len);
+    if (s_redirect != NULL) {
+        s_redirect(s_redirect_ctx, buf, len);
+    } else {
+        ag_screen_write(&s_screen, buf, len);
+    }
     ag_console_unlock();
 }
 

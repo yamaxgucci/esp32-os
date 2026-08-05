@@ -41,6 +41,17 @@ bool     ag_console_ready(void);
 /* Adds an endpoint.  It starts with a full repaint owed to it. */
 ag_err_t ag_console_attach(const ag_con_transport_t *transport, void *ctx);
 
+/*
+ * Sends console output somewhere else until cleared, which is how the shell
+ * implements "dir > files.txt".  The console does not know what the sink is,
+ * so it does not have to know about the filesystem.
+ *
+ * Pass NULL to go back to the screen.  One redirection at a time; the shell
+ * is the only thing that redirects and it does so around a single command.
+ */
+typedef int32_t (*ag_con_sink_fn)(void *ctx, const char *data, size_t len);
+void ag_console_redirect(ag_con_sink_fn sink, void *ctx);
+
 void ag_console_write(const char *buf, size_t len);
 void ag_console_puts(const char *s);
 int  ag_console_printf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));

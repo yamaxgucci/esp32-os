@@ -14,12 +14,14 @@
 #include <argon/kernel.h>
 #include <argon/lineedit.h>
 #include <argon/path.h>
+#include <argon/vfs.h>
 
 #include "esp_heap_caps.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 
 #include "boot/platform.h"
+#include "shell/cmd_fs.h"
 
 typedef struct {
     const char *name;
@@ -28,12 +30,12 @@ typedef struct {
     int (*fn)(int argc, char **argv);
 } ag_command_t;
 
-static char          s_cwd[AG_PATH_MAX] = "/sd";
+static char          s_cwd[AG_PATH_MAX] = "/";
 static ag_lineedit_t s_line;
 static int           s_last_status;
 
 /* ---------------------------------------------------------------------- */
-/* Prompt                                                                 */
+/* Presentation                                                           */
 /* ---------------------------------------------------------------------- */
 
 static const struct {
@@ -46,20 +48,23 @@ static const struct {
     {"/dev", 'D'},
 };
 
-/*
- * Renders the working directory the way DOS would have: A:\APPS> rather than
- * /sd/apps>.  The kernel deals only in POSIX paths; this is presentation.
- */
-static void build_prompt(char *out, size_t n)
+void ag_shell_dos_path(const char *posix_path, char *out, size_t n)
 {
+    if (out == NULL || n == 0) {
+        return;
+    }
+    if (posix_path == NULL) {
+        posix_path = "/";
+    }
+
     for (size_t i = 0; i < sizeof(k_drives) / sizeof(k_drives[0]); i++) {
         const char  *mount = k_drives[i].mount;
         const size_t len = strlen(mount);
 
-        if (strncmp(s_cwd, mount, len) != 0) {
+        if (strncmp(posix_path, mount, len) != 0) {
             continue;
         }
-        if (s_cwd[len] != '\0' && s_cwd[len] != '/') {
+        if (posix_path[len] != '\0' && posix_path[len] != '/') {
             continue;
         }
 
@@ -69,18 +74,57 @@ static void build_prompt(char *out, size_t n)
             out[w++] = ':';
             out[w++] = '\\';
         }
-        for (const char *p = s_cwd + len + (s_cwd[len] == '/' ? 1 : 0);
-             *p != '\0' && w + 2 < n; p++) {
+        const char *tail = posix_path + len + (posix_path[len] == '/' ? 1 : 0);
+        for (const char *p = tail; *p != '\0' && w + 1 < n; p++) {
             out[w++] = (*p == '/') ? '\\' : *p;
-        }
-        if (w + 2 < n) {
-            out[w++] = '>';
         }
         out[w] = '\0';
         return;
     }
 
-    snprintf(out, n, "%s>", s_cwd);
+    snprintf(out, n, "%s", posix_path);
+}
+
+static void build_prompt(char *out, size_t n)
+{
+    ag_shell_dos_path(s_cwd, out, n - 2);
+    const size_t len = strlen(out);
+    if (len + 2 <= n) {
+        out[len] = '>';
+        out[len + 1] = '\0';
+    }
+}
+
+ag_err_t ag_shell_set_cwd(const char *path)
+{
+    if (path == NULL || path[0] != '/') {
+        return -AG_EINVAL;
+    }
+    if (strlen(path) >= sizeof(s_cwd)) {
+        return -AG_ERANGE;
+    }
+    strcpy(s_cwd, path);
+    return AG_OK;
+}
+
+/*
+ * Where the shell starts.  Preferring removable media matches the habit of
+ * booting off the floppy, and falls back through internal storage to the RAM
+ * disk so that there is always somewhere to be.
+ */
+static void pick_initial_cwd(void)
+{
+    static const char *const candidates[] = {"/sd", "/sys", "/tmp"};
+
+    for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
+        ag_stat_t st;
+        if (ag_vfs_stat(candidates[i], NULL, &st) == AG_OK &&
+            (st.attr & AG_A_DIR)) {
+            ag_shell_set_cwd(candidates[i]);
+            return;
+        }
+    }
+    ag_shell_set_cwd("/");
 }
 
 /* ---------------------------------------------------------------------- */
@@ -314,11 +358,11 @@ static int cmd_reboot(int argc, char **argv)
     return 0;
 }
 
-/* Filesystem commands wait for the VFS; say so plainly rather than lying. */
+/* Waits for the process loader; say so plainly rather than lying. */
 static int cmd_not_ready(int argc, char **argv)
 {
     (void)argc;
-    ag_console_printf("%s: no filesystem mounted (drive not ready)\n", argv[0]);
+    ag_console_printf("%s: not implemented yet\n", argv[0]);
     return 1;
 }
 
@@ -341,9 +385,16 @@ static const ag_command_t k_commands[] = {
     {"echo", "<text>", "print text", cmd_echo},
     {"color", "<fg> <bg>", "set text colours", cmd_color},
     {"ps", "", "list running applications", cmd_ps},
-    {"dir", "[path]", "list a directory", cmd_not_ready},
-    {"cd", "<path>", "change directory", cmd_not_ready},
-    {"type", "<file>", "print a file", cmd_not_ready},
+    {"dir", "[path]", "list a directory", ag_cmd_dir},
+    {"cd", "[path]", "change directory", ag_cmd_cd},
+    {"type", "<file>", "print a file", ag_cmd_type},
+    {"copy", "<src> <dst>", "copy a file", ag_cmd_copy},
+    {"del", "<pattern>", "delete files", ag_cmd_del},
+    {"md", "<path>", "make a directory", ag_cmd_mkdir},
+    {"rd", "<path>", "remove a directory", ag_cmd_rmdir},
+    {"ren", "<old> <new>", "rename a file", ag_cmd_rename},
+    {"mount", "", "list mounted drives", ag_cmd_mount},
+    {"hexdump", "<file>", "dump a file as bytes", ag_cmd_hexdump},
     {"run", "<file>", "run an application", cmd_not_ready},
     {"errorlevel", "", "exit code of the last command", cmd_errorlevel},
     {"reboot", "", "restart the board", cmd_reboot},
@@ -362,13 +413,60 @@ static int cmd_help(int argc, char **argv)
     }
     ag_console_puts(
         "\nLine editing: arrows, Home, End, Ctrl+A/E/U/K/W; history with up "
-        "and down.\n");
+        "and down.\n"
+        "Output can be sent to a file:  dir > files.txt   or   ver >> log.txt\n");
     return 0;
 }
 
 /* ---------------------------------------------------------------------- */
 
 const char *ag_shell_cwd(void) { return s_cwd; }
+
+/* Output redirection: the sink the console writes through for "dir > file". */
+static int32_t file_sink(void *ctx, const char *data, size_t len)
+{
+    const ag_handle_t h = (ag_handle_t)(intptr_t)ctx;
+    return ag_vfs_write(h, data, len);
+}
+
+/*
+ * Finds "> file" or ">> file" at the end of the argument list, opens the
+ * target and shortens argc so the command never sees it.  Returns the new
+ * argc, or a negative error.
+ */
+static int take_redirection(int argc, char **argv, ag_handle_t *out)
+{
+    *out = AG_INVALID_HANDLE;
+
+    for (int i = 1; i < argc; i++) {
+        if (argv[i][0] != '>') {
+            continue;
+        }
+
+        const bool  append = argv[i][1] == '>';
+        const char *target = argv[i] + (append ? 2 : 1);
+
+        if (*target == '\0') {
+            if (i + 1 >= argc) {
+                ag_console_puts("syntax error: expected a file after >\n");
+                return -AG_EINVAL;
+            }
+            target = argv[i + 1];
+        }
+
+        const uint32_t flags = AG_O_WRONLY | AG_O_CREATE |
+                               (append ? AG_O_APPEND : AG_O_TRUNC);
+        const ag_handle_t h = ag_vfs_open(target, s_cwd, flags);
+        if (h < 0) {
+            ag_console_printf("cannot write %s\n", target);
+            return h;
+        }
+
+        *out = h;
+        return i; /* everything from here on was redirection */
+    }
+    return argc;
+}
 
 int ag_shell_execute(const char *line)
 {
@@ -381,20 +479,43 @@ int ag_shell_execute(const char *line)
     strncpy(work, line, sizeof(work) - 1);
     work[sizeof(work) - 1] = '\0';
 
-    const int argc = ag_cmdline_split(work, argv, AG_ARGV_MAX);
+    int argc = ag_cmdline_split(work, argv, AG_ARGV_MAX);
     if (argc == 0) {
         return 0;
     }
 
+    ag_handle_t redirect = AG_INVALID_HANDLE;
+    const int   trimmed = take_redirection(argc, argv, &redirect);
+    if (trimmed < 0) {
+        return 1;
+    }
+    argc = trimmed;
+
+    int status = 127;
+    bool found = false;
+
+    if (redirect >= 0) {
+        ag_console_redirect(file_sink, (void *)(intptr_t)redirect);
+    }
+
     for (int i = 0; k_commands[i].name != NULL; i++) {
         if (ag_path_icmp(argv[0], k_commands[i].name) == 0) {
-            return k_commands[i].fn(argc, argv);
+            status = k_commands[i].fn(argc, argv);
+            found = true;
+            break;
         }
     }
 
-    /* The message every DOS user knows. */
-    ag_console_printf("Bad command or file name: %s\n", argv[0]);
-    return 127;
+    if (redirect >= 0) {
+        ag_console_redirect(NULL, NULL);
+        ag_vfs_close(redirect);
+    }
+
+    if (!found) {
+        /* The message every DOS user knows. */
+        ag_console_printf("Bad command or file name: %s\n", argv[0]);
+    }
+    return status;
 }
 
 static void show_prompt(prompt_pos_t *pos)
@@ -418,6 +539,7 @@ static void show_prompt(prompt_pos_t *pos)
 void ag_shell_run(void)
 {
     ag_lineedit_init(&s_line);
+    pick_initial_cwd();
 
     ag_console_puts("\nType 'help' for a list of commands.\n");
 

@@ -32,10 +32,14 @@ $efuse = Initialize-EfuseFile
 $qemuArgs = Get-QemuMachineArgs -EfusePath $efuse
 
 if ($Tcp) {
+    # wait=on: the board holds still until you connect, so you see the boot
+    # rather than joining after it. A TCP serial port with no peer discards
+    # everything it is given.
     $qemuArgs += @('-display', 'none', '-monitor', 'none',
-                   '-serial', "tcp:127.0.0.1:$Port,server=on,wait=off")
+                   '-serial', "tcp:127.0.0.1:$Port,server=on,wait=on")
     Write-Host "ArgonOS console on 127.0.0.1:$Port (raw TCP)."
     Write-Host 'Connect with PuTTY in Raw mode, or any terminal program.'
+    Write-Host 'The board waits for your connection before booting.'
     Write-Host 'Press Ctrl+C here to stop the emulator.'
 } else {
     $qemuArgs += @('-nographic', '-serial', 'mon:stdio')

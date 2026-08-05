@@ -29,11 +29,18 @@ $qemu = Resolve-Qemu
 Update-FlashImage
 $efuse = Initialize-EfuseFile
 
+# wait=on is essential: a TCP serial port with no peer throws its output away,
+# and the whole boot is over in a quarter of a second.  Without it the test
+# races the emulator and loses often enough to be useless.
 $qemuArgs = (Get-QemuMachineArgs -EfusePath $efuse) + @(
     '-display', 'none'
     '-monitor', 'none'
-    '-serial', "tcp:127.0.0.1:$Port,server=on,wait=off"
+    '-serial', "tcp:127.0.0.1:$Port,server=on,wait=on"
 )
+
+# A leftover emulator would still hold the port and answer with silence.
+Get-Process qemu-system-xtensa -ErrorAction SilentlyContinue |
+    Stop-Process -Force -ErrorAction SilentlyContinue
 
 $proc = Start-Process -FilePath $qemu -ArgumentList $qemuArgs -NoNewWindow -PassThru
 
