@@ -28,7 +28,8 @@ set(ARGON_PORTABLE_SRCS
     "${ARGON_ROOT}/components/argon_kernel/src/shell/lineedit.c"
     "${ARGON_ROOT}/components/argon_kernel/src/fs/vfs.c"
     "${ARGON_ROOT}/components/argon_kernel/src/fs/ramfs.c"
-    "${ARGON_ROOT}/components/argon_kernel/src/core/journal.c")
+    "${ARGON_ROOT}/components/argon_kernel/src/core/journal.c"
+    "${ARGON_ROOT}/components/argon_kernel/src/loader/axeload.c")
 
 set(ARGON_INCLUDES
     "${CMAKE_CURRENT_LIST_DIR}"
@@ -49,9 +50,15 @@ add_executable(argon_tests
     test_lineedit.c
     test_vfs.c
     test_journal.c
+    test_axeload.c
     ${ARGON_PORTABLE_SRCS})
 
 target_include_directories(argon_tests PRIVATE ${ARGON_INCLUDES})
+
+# Compiled in rather than guessed: the working directory differs between running
+# the executable directly and running it through ctest.
+target_compile_definitions(argon_tests PRIVATE
+    AG_FIXTURE_DIR="${CMAKE_CURRENT_LIST_DIR}/fixtures")
 
 # Renders a raw serial transcript into the screen it produces, using the
 # kernel's own screen module.

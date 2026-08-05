@@ -9,6 +9,7 @@
 #include <string.h>
 
 #include <argon/console.h>
+#include <argon/lineedit.h>
 #include <argon/path.h>
 #include <argon/shell.h>
 #include <argon/vfs.h>
@@ -510,6 +511,104 @@ int ag_cmd_format(int argc, char **argv)
         ag_shell_set_cwd("/sd");
     }
     return 0;
+}
+
+/*
+ * Writes a file from hex typed at the console.  A board with no card reader
+ * within reach still needs a way to receive an application, and hex over the
+ * console needs nothing at either end - no protocol, no tool, and it survives
+ * a terminal that eats control characters.
+ */
+int ag_cmd_recv(int argc, char **argv)
+{
+    if (argc < 2) {
+        ag_console_puts("usage: recv <file>\n");
+        ag_console_puts("then send lines of hex; END on its own line finishes\n");
+        return 1;
+    }
+
+    const ag_handle_t h = ag_vfs_open(argv[1], ag_shell_cwd(),
+                                      AG_O_WRONLY | AG_O_CREATE | AG_O_TRUNC);
+    if (h < 0) {
+        print_error(argv[1], h);
+        return 1;
+    }
+
+    ag_console_puts("send hex, END to finish\n");
+
+    uint8_t  out[64];
+    size_t   pending = 0;
+    uint64_t total = 0;
+    int      status = 0;
+    int      nibble = -1;
+    char     line[AG_LINE_MAX];
+
+    for (;;) {
+        const int32_t n = ag_console_readline(line, sizeof(line));
+        if (n < 0) {
+            ag_console_puts("\ncancelled\n");
+            status = 1;
+            break;
+        }
+        ag_console_puts("\n");
+
+        if (ag_path_icmp(line, "END") == 0) {
+            break;
+        }
+
+        for (const char *p = line; *p != '\0' && status == 0; p++) {
+            int value;
+            if (*p >= '0' && *p <= '9') {
+                value = *p - '0';
+            } else if (*p >= 'a' && *p <= 'f') {
+                value = *p - 'a' + 10;
+            } else if (*p >= 'A' && *p <= 'F') {
+                value = *p - 'A' + 10;
+            } else if (*p == ' ' || *p == '\t' || *p == ':') {
+                continue; /* let the sender group the bytes however it likes */
+            } else {
+                ag_console_printf("not hex: '%c'\n", *p);
+                status = 1;
+                break;
+            }
+
+            if (nibble < 0) {
+                nibble = value;
+                continue;
+            }
+            out[pending++] = (uint8_t)((nibble << 4) | value);
+            nibble = -1;
+
+            if (pending == sizeof(out)) {
+                if (ag_vfs_write(h, out, pending) != (int32_t)pending) {
+                    print_error(argv[1], -AG_ENOSPC);
+                    status = 1;
+                    break;
+                }
+                total += pending;
+                pending = 0;
+            }
+        }
+    }
+
+    if (status == 0 && pending > 0) {
+        if (ag_vfs_write(h, out, pending) != (int32_t)pending) {
+            print_error(argv[1], -AG_ENOSPC);
+            status = 1;
+        } else {
+            total += pending;
+        }
+    }
+    if (status == 0 && nibble >= 0) {
+        ag_console_puts("odd number of hex digits; last one ignored\n");
+    }
+
+    ag_vfs_close(h);
+
+    if (status == 0) {
+        ag_console_printf("%u bytes written\n", (unsigned)total);
+    }
+    return status;
 }
 
 int ag_cmd_hexdump(int argc, char **argv)

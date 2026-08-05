@@ -14,6 +14,7 @@
 #include <argon/console.h>
 #include <argon/kernel.h>
 #include <argon/lineedit.h>
+#include <argon/loader.h>
 #include <argon/log.h>
 #include <argon/path.h>
 #include <argon/vfs.h>
@@ -254,6 +255,10 @@ static int cmd_mem(int argc, char **argv)
     } else {
         ag_console_puts("  extended         none\n");
     }
+    ag_console_printf("  executable %6u KB  %8u KB\n",
+                      (unsigned)(heap_caps_get_total_size(MALLOC_CAP_EXEC) / 1024),
+                      (unsigned)(heap_caps_get_free_size(MALLOC_CAP_EXEC) / 1024));
+
     ag_console_printf("\n  %u KB used by the system\n",
                       (unsigned)((int_total - int_free) / 1024));
 
@@ -354,6 +359,47 @@ static int cmd_color(int argc, char **argv)
     return 0;
 }
 
+static int cmd_run(int argc, char **argv)
+{
+    if (argc < 2) {
+        ag_console_puts("usage: run <file> [arguments]\n");
+        return 1;
+    }
+
+    ag_loaded_app_t app;
+    const ag_err_t  err = ag_loader_load(argv[1], s_cwd, &app);
+
+    if (err != AG_OK) {
+        const char *why;
+        switch (-err) {
+        case AG_ENOENT:  why = "file not found"; break;
+        case AG_EFORMAT: why = "not an ArgonOS application"; break;
+        case AG_ENOTSUP: why = "built for a different processor"; break;
+        case AG_EABI:    why = "built for a different version of this system";
+                         break;
+        case AG_ENOMEM:  why = "not enough memory to load it"; break;
+        default:         why = "could not be loaded"; break;
+        }
+        ag_console_printf("%s: %s\n", argv[1], why);
+        return 1;
+    }
+
+    /*
+     * The application sees the path it was started with as argv[0], which is
+     * what a program expects and what lets it find its own files.
+     */
+    const int status = ag_loader_run(&app, argc - 1, &argv[1]);
+    ag_loader_unload(&app);
+
+    /* Whatever the application did to the screen, the prompt starts clean. */
+    ag_console_lock();
+    ag_screen_set_attr(ag_console_screen(), AG_ATTR_DEFAULT);
+    ag_screen_set_cursor(ag_console_screen(), true);
+    ag_console_unlock();
+
+    return status;
+}
+
 static int cmd_log(int argc, char **argv)
 {
     uint32_t want = UINT32_MAX;
@@ -417,14 +463,6 @@ static int cmd_reboot(int argc, char **argv)
     return 0;
 }
 
-/* Waits for the process loader; say so plainly rather than lying. */
-static int cmd_not_ready(int argc, char **argv)
-{
-    (void)argc;
-    ag_console_printf("%s: not implemented yet\n", argv[0]);
-    return 1;
-}
-
 static int cmd_ps(int argc, char **argv)
 {
     (void)argc;
@@ -456,7 +494,8 @@ static const ag_command_t k_commands[] = {
     {"mount", "", "list mounted drives", ag_cmd_mount},
     {"format", "<drive> [/y]", "make a fresh filesystem", ag_cmd_format},
     {"hexdump", "<file>", "dump a file as bytes", ag_cmd_hexdump},
-    {"run", "<file>", "run an application", cmd_not_ready},
+    {"recv", "<file>", "receive a file as hex", ag_cmd_recv},
+    {"run", "<file> [args]", "run an application", cmd_run},
     {"errorlevel", "", "exit code of the last command", cmd_errorlevel},
     {"reboot", "", "restart the board", cmd_reboot},
     {NULL, NULL, NULL, NULL},

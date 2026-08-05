@@ -17,6 +17,9 @@ set(ARGON_KERNEL_SRCS
     "src/fs/ramfs.c"
     "src/fs/idfvfs.c"
     "src/fs/storage.c"
+    "src/loader/axeload.c"
+    "src/loader/loader.c"
+    "src/loader/api.c"
     "src/shell/lineedit.c"
     "src/shell/shell.c"
     "src/shell/cmd_fs.c")
