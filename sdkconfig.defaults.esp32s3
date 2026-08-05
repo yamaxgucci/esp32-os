@@ -23,6 +23,8 @@ CONFIG_SPIRAM_RODATA=y
 
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 
-# USB host for keyboards arrives in phase 3; the peripheral stays free until
-# then so the built-in USB-serial-JTAG can be used for the console.
-CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+# UART0 is the one console every board and QEMU agree on, and the ROM
+# bootloader already talks there, so early output is not split across two
+# devices.  USB-serial-JTAG becomes an additional console endpoint at runtime
+# once the console multiplexer exists.
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y

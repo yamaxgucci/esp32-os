@@ -4,7 +4,8 @@ set(ARGON_KERNEL_SRCS
     "src/core/path.c"
     "src/core/cfg.c"
     "src/console/screen.c"
-    "src/console/vtout.c")
+    "src/console/vtout.c"
+    "src/console/vtin.c")
 
 idf_component_register(
     SRCS ${ARGON_KERNEL_SRCS}

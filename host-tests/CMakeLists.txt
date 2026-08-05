@@ -21,10 +21,12 @@ add_executable(argon_tests
     test_cfg.c
     test_screen.c
     test_vtout.c
+    test_vtin.c
     "${ARGON_ROOT}/components/argon_kernel/src/core/path.c"
     "${ARGON_ROOT}/components/argon_kernel/src/core/cfg.c"
     "${ARGON_ROOT}/components/argon_kernel/src/console/screen.c"
-    "${ARGON_ROOT}/components/argon_kernel/src/console/vtout.c")
+    "${ARGON_ROOT}/components/argon_kernel/src/console/vtout.c"
+    "${ARGON_ROOT}/components/argon_kernel/src/console/vtin.c")
 
 target_include_directories(argon_tests PRIVATE
     "${CMAKE_CURRENT_LIST_DIR}"
