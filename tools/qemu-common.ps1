@@ -242,6 +242,40 @@ public static class ArgonConsoleVt
         return !literal;
     }
 
+    //
+    // Looks at what is actually on the screen.  Enabling the mode and having it
+    // verified turned out not to be the same thing as the child process's
+    // output being interpreted, so the only trustworthy check is to read the
+    // rendered result: an ESC sitting in a cell means the console printed the
+    // sequence instead of acting on it.
+    //
+    public static int CountEscapesOnScreen(int rows)
+    {
+        IntPtr o = OpenConsole("CONOUT$", GENERIC_READ | GENERIC_WRITE);
+        if (Invalid(o)) { return -1; }
+
+        CSBI info;
+        if (!GetConsoleScreenBufferInfo(o, out info)) { return -1; }
+
+        int width = info.Size.X;
+        int first = info.Cursor.Y - rows;
+        if (first < 0) { first = 0; }
+
+        int found = 0;
+        for (int y = first; y <= info.Cursor.Y; y++) {
+            StringBuilder line = new StringBuilder(width + 1);
+            COORD at; at.X = 0; at.Y = (short)y;
+            uint read;
+            if (!ReadConsoleOutputCharacter(o, line, (uint)width, at, out read)) {
+                continue;
+            }
+            for (int x = 0; x < (int)read; x++) {
+                if (line[x] == '\u001b') { found++; }
+            }
+        }
+        return found;
+    }
+
     public static void Restore()
     {
         if (HaveOut) {
