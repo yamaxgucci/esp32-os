@@ -14,7 +14,9 @@
 # Exit code 0 means the marker was seen.
 [CmdletBinding()]
 param(
-    [string]$Marker = 'A:\>',
+    # Matches any drive prompt: A:\> on a card, C:\> on flash, T:\> on the
+    # RAM disk.  Which one appears depends on what managed to mount.
+    [string]$Marker = '\>',
     [int]$TimeoutSec = 60,
     [string[]]$Send = @(),
     [int]$Port = 5556,
@@ -42,7 +44,11 @@ $qemuArgs = (Get-QemuMachineArgs -EfusePath $efuse) + @(
 Get-Process qemu-system-xtensa -ErrorAction SilentlyContinue |
     Stop-Process -Force -ErrorAction SilentlyContinue
 
-$proc = Start-Process -FilePath $qemu -ArgumentList $qemuArgs -NoNewWindow -PassThru
+# QEMU's own chatter goes to a file: it is not part of what the board said,
+# and PowerShell renders anything on stderr as an error.
+$qemuOut = 'build\qemu-emulator.log'
+$proc = Start-Process -FilePath $qemu -ArgumentList $qemuArgs -NoNewWindow `
+    -PassThru -RedirectStandardOutput $qemuOut -RedirectStandardError "$qemuOut.err"
 
 $text = New-Object System.Text.StringBuilder
 $client = $null

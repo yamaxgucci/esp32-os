@@ -49,20 +49,31 @@ your code running on a dedicated CPU core with almost all of the RAM.
 Primary: **ESP32-S3** with at least 4 MB PSRAM and 8 MB flash.
 Planned: ESP32-P4. Reduced profiles for ESP32 / C3 / C6.
 
-## Building
+## Building and running
 
-Requires ESP-IDF 5.3 or newer.
+Requires ESP-IDF 5.5 or newer. Everything goes through one entry point:
 
-```bash
-idf.py set-target esp32s3
-idf.py build flash monitor
+```
+argon build              build the firmware
+argon run                run in QEMU, console attached to this window
+argon run -tcp           run in QEMU, console on 127.0.0.1:5556
+argon test ver mem       boot in QEMU, type commands, print the screen
+argon tests              host unit tests, no hardware needed
+argon flash -port COM5   flash a real board and open the monitor
 ```
 
-Host-side unit tests (no hardware required):
+`argon` is a batch file rather than a PowerShell script so that it works on a
+stock Windows install, where running `.ps1` files is disabled by default.
 
-```bash
-cmake -S host-tests -B build-host && cmake --build build-host && ctest --test-dir build-host
-```
+Machine specific paths (where ESP-IDF and a host compiler live) go in
+`tools\local-env.ps1`, which is not committed; `tools\idf-env.ps1` guesses the
+usual locations when it is absent.
+
+No board is required to work on this: ArgonOS boots in Espressif's QEMU, and
+`argon test` drives its console and prints the resulting screen. Everything
+that has no dependency on the chip - path handling, the config parser, the text
+screen, the terminal codecs, line editing, the VFS and the RAM disk - also
+builds and runs on the host.
 
 ## License
 
