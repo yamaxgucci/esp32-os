@@ -1,0 +1,28 @@
+# ArgonOS - ESP32-S3 defaults (primary target).
+#
+# These assume an N16R8 style module: 16 MB flash, 8 MB octal PSRAM.
+# Boards with quad PSRAM need CONFIG_SPIRAM_MODE_QUAD instead; that lives in
+# the board pack, not here.
+
+CONFIG_IDF_TARGET="esp32s3"
+
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+
+# PSRAM stays out of the general malloc pool: ArgonOS hands it out through
+# per-process arenas and the executable app-text arena.
+CONFIG_SPIRAM_USE_CAPS_ALLOC=y
+
+# Required for mapping PSRAM into the instruction bus at runtime (loader).
+CONFIG_SPIRAM_FETCH_INSTRUCTIONS=y
+CONFIG_SPIRAM_RODATA=y
+
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+
+# USB host for keyboards arrives in phase 3; the peripheral stays free until
+# then so the built-in USB-serial-JTAG can be used for the console.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y

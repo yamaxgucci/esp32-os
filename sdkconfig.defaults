@@ -1,0 +1,23 @@
+# ArgonOS - target independent defaults.
+
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# 1 kHz tick: the supervisor needs millisecond granularity for app watchdogs.
+CONFIG_FREERTOS_HZ=1000
+
+# The kernel runs from app_main; give it room for the boot sequence.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+CONFIG_ESP_MAIN_TASK_AFFINITY_CPU0=y
+
+# Speed over size: ArgonOS exists to get out of the application's way.
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+# ArgonOS installs its own panic handler so it can blame the right process.
+CONFIG_ESP_SYSTEM_PANIC_PRINT_HALT=y
+
+# We run a per-process watchdog in the supervisor instead of the IDF one.
+CONFIG_ESP_TASK_WDT_INIT=n
+
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+CONFIG_LOG_MAXIMUM_LEVEL_DEBUG=y

@@ -1,0 +1,9 @@
+# ArgonOS partition table - 8 MB flash baseline.
+# Larger flash sizes get a second app slot for OTA; see docs/00-architecture.md.
+#
+# Name,     Type, SubType,  Offset,   Size,     Flags
+nvs,        data, nvs,      0x9000,   0x6000,
+phy_init,   data, phy,      0xf000,   0x1000,
+factory,    app,  factory,  0x10000,  0x300000,
+sysfs,      data, spiffs,   0x310000, 0x100000,
+appfs,      data, fat,      0x410000, 0x3F0000,
