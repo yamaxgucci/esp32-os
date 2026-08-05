@@ -29,6 +29,7 @@ ArgonOS
   argon monitor -port COM5 open the serial monitor on a real board
   argon clean              remove the firmware build directory
   argon env                open a shell with the build environment loaded
+  argon vt                 check whether this console can show the screen
 
 Machine specific paths live in tools\local-env.ps1, which is not committed.
 '@
@@ -133,6 +134,11 @@ switch ($Command.ToLowerInvariant()) {
     'monitor' {
         Initialize-Environment
         & idf.py @Rest monitor
+        exit $LASTEXITCODE
+    }
+
+    'vt' {
+        & (Join-Path $PSScriptRoot 'vt-probe.ps1')
         exit $LASTEXITCODE
     }
 

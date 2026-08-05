@@ -70,60 +70,125 @@ public static class ArgonConsoleVt
     static extern bool GetConsoleMode(IntPtr handle, out uint mode);
     [DllImport("kernel32.dll", SetLastError = true)]
     static extern bool SetConsoleMode(IntPtr handle, uint mode);
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+    static extern IntPtr CreateFile(string name, uint access, uint share,
+                                    IntPtr security, uint disposition,
+                                    uint flags, IntPtr template);
 
     const int STD_INPUT = -10;
     const int STD_OUTPUT = -11;
+
+    const uint GENERIC_READ = 0x80000000;
+    const uint GENERIC_WRITE = 0x40000000;
+    const uint FILE_SHARE_RW = 0x00000003;
+    const uint OPEN_EXISTING = 3;
 
     const uint ENABLE_PROCESSED_INPUT = 0x0001;
     const uint ENABLE_LINE_INPUT = 0x0002;
     const uint ENABLE_ECHO_INPUT = 0x0004;
     const uint ENABLE_VIRTUAL_TERMINAL_INPUT = 0x0200;
+    const uint ENABLE_PROCESSED_OUTPUT = 0x0001;
     const uint ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004;
 
-    public static uint SavedIn = 0;
-    public static uint SavedOut = 0;
-    public static bool Saved = false;
+    public static uint SavedIn, SavedOut;
+    public static bool HaveIn, HaveOut, VtEnabled;
+    public static string Report = "";
 
-    public static bool Enable()
+    //
+    // The console screen buffer is opened by name rather than taken from the
+    // standard handle.  PowerShell's stdout is not always the console - a
+    // pipeline anywhere in the call chain can replace it - and the mode has to
+    // be set on the console itself, since that is what the child process will
+    // inherit and write to.
+    //
+    static IntPtr OpenConsole(string name, uint access)
     {
-        IntPtr o = GetStdHandle(STD_OUTPUT);
-        IntPtr i = GetStdHandle(STD_INPUT);
-        uint om, im;
+        IntPtr h = CreateFile(name, access, FILE_SHARE_RW, IntPtr.Zero,
+                              OPEN_EXISTING, 0, IntPtr.Zero);
+        return h;
+    }
 
-        if (!GetConsoleMode(o, out om) || !GetConsoleMode(i, out im)) {
-            return false;   // not a real console, e.g. output is redirected
+    static bool Invalid(IntPtr h) { return h == IntPtr.Zero || h == new IntPtr(-1); }
+
+    public static bool Configure()
+    {
+        string outcome = "";
+        VtEnabled = false;
+
+        // Output and input are handled independently: a failure on one must not
+        // leave the other untouched, which is the bug this replaced.
+        IntPtr o = OpenConsole("CONOUT$", GENERIC_READ | GENERIC_WRITE);
+        if (Invalid(o)) {
+            o = GetStdHandle(STD_OUTPUT);
+        }
+        uint om;
+        if (!GetConsoleMode(o, out om)) {
+            outcome = "no console on output (" + Marshal.GetLastWin32Error() + ")";
+        } else {
+            SavedOut = om;
+            HaveOut = true;
+            uint want = om | ENABLE_PROCESSED_OUTPUT |
+                        ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+            if (!SetConsoleMode(o, want)) {
+                outcome = "console refused escape sequences (" +
+                          Marshal.GetLastWin32Error() + ")";
+            } else {
+                uint check;
+                GetConsoleMode(o, out check);
+                if ((check & ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0) {
+                    outcome = "escape sequences enabled";
+                    VtEnabled = true;
+                } else {
+                    outcome = "console dropped the escape sequence flag";
+                }
+            }
         }
 
-        SavedOut = om;
-        SavedIn = im;
-        Saved = true;
-
-        if (!SetConsoleMode(o, om | ENABLE_VIRTUAL_TERMINAL_PROCESSING)) {
-            return false;
+        IntPtr i = OpenConsole("CONIN$", GENERIC_READ | GENERIC_WRITE);
+        if (Invalid(i)) {
+            i = GetStdHandle(STD_INPUT);
+        }
+        uint im;
+        if (GetConsoleMode(i, out im)) {
+            SavedIn = im;
+            HaveIn = true;
+            // Virtual terminal input turns arrow keys into the escape sequences
+            // the OS already decodes.  Line input and echo have to go, or the
+            // console would buffer a whole line and print it twice.  Processed
+            // input stays on deliberately so Ctrl+C can still break out of a
+            // wedged emulator; the cost is that Ctrl+C does not reach the guest.
+            uint want = (im | ENABLE_VIRTUAL_TERMINAL_INPUT |
+                         ENABLE_PROCESSED_INPUT) &
+                        ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT);
+            if (!SetConsoleMode(i, want)) {
+                outcome += ", keyboard left as it was";
+            }
+        } else {
+            outcome += ", no console on input";
         }
 
-        // Virtual terminal input turns arrow keys into the escape sequences the
-        // OS already knows how to decode.  Line input and echo have to go or
-        // the console would buffer a whole line and print it twice.  Processed
-        // input stays on deliberately, so Ctrl+C still breaks out of a wedged
-        // emulator; the cost is that Ctrl+C does not reach the guest.
-        im |= ENABLE_VIRTUAL_TERMINAL_INPUT;
-        im &= ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT);
-        im |= ENABLE_PROCESSED_INPUT;
-        SetConsoleMode(i, im);
-        return true;
+        Report = outcome;
+        return VtEnabled;
     }
 
     public static void Restore()
     {
-        if (!Saved) { return; }
-        SetConsoleMode(GetStdHandle(STD_OUTPUT), SavedOut);
-        SetConsoleMode(GetStdHandle(STD_INPUT), SavedIn);
+        if (HaveOut) {
+            IntPtr o = OpenConsole("CONOUT$", GENERIC_READ | GENERIC_WRITE);
+            if (Invalid(o)) { o = GetStdHandle(STD_OUTPUT); }
+            SetConsoleMode(o, SavedOut);
+        }
+        if (HaveIn) {
+            IntPtr i = OpenConsole("CONIN$", GENERIC_READ | GENERIC_WRITE);
+            if (Invalid(i)) { i = GetStdHandle(STD_INPUT); }
+            SetConsoleMode(i, SavedIn);
+        }
     }
 }
 '@
 
-function Enable-ConsoleVt { return [ArgonConsoleVt]::Enable() }
+function Enable-ConsoleVt { return [ArgonConsoleVt]::Configure() }
+function Get-ConsoleVtReport { return [ArgonConsoleVt]::Report }
 function Restore-ConsoleVt { [ArgonConsoleVt]::Restore() }
 
 # Attaches a card image, creating a blank one if it is missing.  A blank image
