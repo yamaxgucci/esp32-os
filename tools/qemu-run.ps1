@@ -43,7 +43,16 @@ if ($Tcp) {
     Write-Host 'Press Ctrl+C here to stop the emulator.'
 } else {
     $qemuArgs += @('-nographic', '-serial', 'mon:stdio')
+    if (-not (Enable-ConsoleVt)) {
+        Write-Host 'Warning: this console cannot display the screen properly.'
+        Write-Host 'Use Windows Terminal, or run with -Tcp and connect PuTTY.'
+    }
     Write-Host 'ArgonOS console attached to this window.  Ctrl+A then X quits.'
 }
 
-& $qemu @qemuArgs
+try {
+    & $qemu @qemuArgs
+} finally {
+    # Leaving echo disabled would make the shell look broken after we exit.
+    Restore-ConsoleVt
+}
