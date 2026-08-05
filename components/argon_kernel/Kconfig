@@ -1,0 +1,35 @@
+menu "ArgonOS"
+
+    config ARGON_APP_ARENA_KB
+        int "Application code arena, KB"
+        range 4 192
+        default 64
+        help
+            Executable RAM reserved at link time for the code part of a running
+            application: literals, instructions and constants.
+
+            It has to be reserved rather than allocated because ESP-IDF hands
+            none of the memory that is both executable and writable through one
+            address to the heap - MALLOC_CAP_EXEC reports zero bytes free - and
+            an image has to be written before it can be executed.
+
+            Every byte of it is taken out of the internal heap whether an
+            application is running or not, because the executable window and the
+            data window reach the same physical SRAM.  Raise it for larger
+            applications, lower it if the kernel needs the internal memory.
+
+            The data part of an application does not come from here; it is
+            allocated from extended memory (PSRAM), so statics and bss are not
+            bounded by this number.
+
+    config ARGON_APP_STACK_KB
+        int "Default application stack, KB"
+        range 2 64
+        default 16
+        help
+            Stack for the task an application runs on, when its image does not
+            ask for a size of its own.  It comes from the internal heap for the
+            lifetime of the application, and it is guarded: overrunning it is
+            caught by FreeRTOS rather than quietly corrupting the shell.
+
+endmenu

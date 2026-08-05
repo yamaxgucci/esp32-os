@@ -15,8 +15,10 @@ your code running on a dedicated CPU core with almost all of the RAM.
 ## Status
 
 **Early development.** It boots, gives a prompt, mounts three drives, and runs
-applications built with `tools/mkaxe.py`. There is no process model yet, so an
-application runs on the shell's task and can take it down with it.
+applications built with `tools/mkaxe.py` on a task of their own, with as much
+data memory as the PSRAM has to spare. There is no process model yet: no
+resource accounting, no Ctrl-C, and a wild pointer still reaches the rest of the
+system.
 
 Start with **[docs/05-status.md](docs/05-status.md)**: what works, what does not,
 how to build and verify, and the traps already found. Then
@@ -29,7 +31,7 @@ file.
 ## Design in one screen
 
 ```
-  Applications (.AXE)   native code, loaded from SD, runs on core 1
+  Applications (.AXE)   native code, loaded from SD, runs on a task of its own
   ─────────────────────────────────────────────────────────────────
   libargon              inline wrappers over a versioned syscall table
   ─────────────────────────────────────────────────────────────────
@@ -42,9 +44,9 @@ file.
   ESP-IDF               FreeRTOS · drivers · Wi-Fi · USB · lwIP
 ```
 
-* **Applications** are relocatable ELF images loaded into internal SRAM or
-  into PSRAM mapped executable. No interpreter, no JIT, no sandbox — native
-  speed after load.
+* **Applications** are relocatable native images in two parts: code into the
+  executable arena in internal SRAM, data and bss into PSRAM. No interpreter, no
+  JIT, no sandbox — native speed after load.
 * **The console** is a virtual text screen rendered simultaneously to UART,
   telnet and a local display, so the same build works headless or with a
   screen and a USB keyboard.
@@ -66,6 +68,8 @@ argon build              build the firmware
 argon run                run in QEMU, console attached to this window
 argon run -tcp           run in QEMU, console on 127.0.0.1:5556
 argon test ver mem       boot in QEMU, type commands, print the screen
+argon test -Put "build\HELLO.AXE=t:\hello.axe" "run t:\hello.axe"
+                         the same, with a file copied into the guest first
 argon tests              host unit tests, no hardware needed
 argon flash -port COM5   flash a real board and open the monitor
 ```
