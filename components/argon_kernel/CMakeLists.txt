@@ -3,9 +3,14 @@ set(ARGON_KERNEL_SRCS
     "src/boot/platform.c"
     "src/core/path.c"
     "src/core/cfg.c"
+    "src/core/cmdline.c"
     "src/console/screen.c"
     "src/console/vtout.c"
-    "src/console/vtin.c")
+    "src/console/vtin.c"
+    "src/console/console.c"
+    "src/console/uart_console.c"
+    "src/shell/lineedit.c"
+    "src/shell/shell.c")
 
 idf_component_register(
     SRCS ${ARGON_KERNEL_SRCS}
@@ -13,7 +18,7 @@ idf_component_register(
     PRIV_INCLUDE_DIRS "src"
     REQUIRES argon_abi
     PRIV_REQUIRES esp_psram esp_timer esp_partition nvs_flash spi_flash
-                  esp_system esp_hw_support)
+                  esp_system esp_hw_support esp_driver_uart log)
 
 # Stamp the build with a git description when one is available.
 find_package(Git QUIET)

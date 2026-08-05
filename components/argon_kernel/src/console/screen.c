@@ -527,7 +527,22 @@ static void ground_char(ag_screen_t *s, char ch)
         break;
 
     default:
-        if ((unsigned char)ch >= 0x20) {
+        if ((unsigned char)ch >= 0x80) {
+            /*
+             * A cell holds one byte, so a multi-byte code point cannot be
+             * stored as itself yet.  Storing one placeholder per code point
+             * at least keeps the column count honest, which storing each
+             * byte in its own cell would not.
+             *
+             * The real fix is a single-byte code page for the screen, CP437
+             * by default and CP866 for Cyrillic, the way DOS did it; see
+             * docs/04-roadmap.md.  Continuation bytes are skipped here, which
+             * also makes a code point split across two writes work.
+             */
+            if (((unsigned char)ch & 0xc0u) != 0x80u) {
+                ag_screen_putc_raw(s, '?');
+            }
+        } else if ((unsigned char)ch >= 0x20) {
             ag_screen_putc_raw(s, ch);
         }
         break;

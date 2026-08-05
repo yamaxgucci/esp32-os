@@ -10,15 +10,44 @@
  */
 #include <argon/kernel.h>
 
+#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 
+#include <argon/console.h>
+#include <argon/shell.h>
+
+#include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "sdkconfig.h"
 
 #include "boot/platform.h"
+#include "console/uart_console.h"
+
+#define AG_CONSOLE_COLS 80
+#define AG_CONSOLE_ROWS 25
+
+/*
+ * Early boot tracing writes straight to the raw console, bypassing everything
+ * ArgonOS provides.  It is the only way to see anything when the failure is in
+ * the code that makes output possible, which is exactly when it is needed.
+ * Off by default; build with -DAG_BOOT_TRACE=1 to bring up a new board.
+ */
+#ifndef AG_BOOT_TRACE
+#define AG_BOOT_TRACE 0
+#endif
+
+#if AG_BOOT_TRACE
+#define AG_TRACE(...)                                                        \
+    do {                                                                     \
+        printf("argon-trace: " __VA_ARGS__);                                 \
+        fflush(stdout);                                                      \
+    } while (0)
+#else
+#define AG_TRACE(...) ((void)0)
+#endif
 
 typedef ag_err_t (*ag_stage_fn)(void);
 
@@ -30,6 +59,22 @@ typedef struct {
 
 static ag_sysinfo_t     s_sysinfo;
 static ag_boot_report_t s_report;
+
+/*
+ * Before the console exists there is nowhere to print but the raw UART, and
+ * after it exists printing anywhere else would corrupt the screen.
+ */
+static void kout(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    if (ag_console_ready()) {
+        (void)ag_console_vprintf(fmt, ap);
+    } else {
+        (void)vprintf(fmt, ap);
+    }
+    va_end(ap);
+}
 
 /* ---------------------------------------------------------------------- */
 
@@ -43,6 +88,49 @@ static ag_err_t stage_platform(void)
     return AG_OK;
 }
 
+static void print_banner(void)
+{
+    const ag_platform_t *p = ag_platform();
+
+    kout("\n");
+    kout("ArgonOS %s (%s)  %s  profile=%s\n", s_sysinfo.os_version,
+         s_sysinfo.build, s_sysinfo.chip, s_sysinfo.profile);
+    kout("%u KB conventional memory, %u KB extended\n",
+         (unsigned)(p->sram_free_at_boot / 1024u),
+         (unsigned)(p->psram_total / 1024u));
+    kout("ABI %u.%u  cores=%u  app core=%u\n", s_sysinfo.abi_major,
+         s_sysinfo.abi_minor, s_sysinfo.cpu_cores, s_sysinfo.app_core);
+    kout("\n");
+}
+
+static ag_err_t stage_console(void)
+{
+    AG_TRACE("console init %ux%u\n", AG_CONSOLE_COLS, AG_CONSOLE_ROWS);
+    ag_err_t err = ag_console_init(AG_CONSOLE_COLS, AG_CONSOLE_ROWS);
+    if (err != AG_OK) {
+        return err;
+    }
+
+    AG_TRACE("attaching uart%d\n", CONFIG_ESP_CONSOLE_UART_NUM);
+    err = ag_uart_console_attach(CONFIG_ESP_CONSOLE_UART_NUM, 115200);
+    if (err != AG_OK) {
+        return err;
+    }
+    AG_TRACE("uart attached\n");
+
+    /*
+     * From here on, ESP-IDF log output goes through the screen like everything
+     * else.  Left alone it would write straight to the UART and tear whatever
+     * the console had drawn.
+     */
+    esp_log_set_vprintf(ag_console_vprintf);
+
+    print_banner();
+    return AG_OK;
+}
+
+static ag_err_t stage_shell(void) { return AG_OK; }
+
 /*
  * Stages are added here as they are implemented; see docs/04-roadmap.md.
  * Keeping the unimplemented ones visible makes the boot report honest about
@@ -50,60 +138,53 @@ static ag_err_t stage_platform(void)
  */
 static const ag_stage_desc_t s_stages[AG_STAGE_COUNT] = {
     [AG_STAGE_PLATFORM]   = {"platform",   stage_platform, true},
-    [AG_STAGE_MEMORY]     = {"memory",     NULL,           true},
+    [AG_STAGE_MEMORY]     = {"memory",     NULL,           false},
     [AG_STAGE_LOG]        = {"log",        NULL,           false},
     [AG_STAGE_BOARD]      = {"board",      NULL,           false},
-    [AG_STAGE_CONSOLE]    = {"console",    NULL,           true},
+    [AG_STAGE_CONSOLE]    = {"console",    stage_console,  true},
     [AG_STAGE_STORAGE]    = {"storage",    NULL,           false},
     [AG_STAGE_CONFIG]     = {"config",     NULL,           false},
     [AG_STAGE_DEVICES]    = {"devices",    NULL,           false},
     [AG_STAGE_MEDIA]      = {"media",      NULL,           false},
     [AG_STAGE_MODULES]    = {"modules",    NULL,           false},
     [AG_STAGE_SUPERVISOR] = {"supervisor", NULL,           false},
-    [AG_STAGE_SHELL]      = {"shell",      NULL,           true},
+    [AG_STAGE_SHELL]      = {"shell",      stage_shell,    true},
 };
 
 /* ---------------------------------------------------------------------- */
 
-static void print_banner(void)
+static void print_summary(void)
 {
-    const ag_platform_t *p = ag_platform();
+    int pending = 0;
+    for (int i = 0; i < AG_STAGE_COUNT; i++) {
+        if (s_stages[i].fn == NULL) {
+            pending++;
+        }
+    }
 
-    printf("\n");
-    printf("ArgonOS %s (%s)  %s  profile=%s\n", s_sysinfo.os_version,
-           s_sysinfo.build, s_sysinfo.chip, s_sysinfo.profile);
-    printf("%u KB conventional memory, %u KB extended\n",
-           (unsigned)(p->sram_free_at_boot / 1024u),
-           (unsigned)(p->psram_total / 1024u));
-    printf("ABI %u.%u  cores=%u  app core=%u\n", s_sysinfo.abi_major,
-           s_sysinfo.abi_minor, s_sysinfo.cpu_cores, s_sysinfo.app_core);
-    printf("\n");
-}
-
-static void print_report(void)
-{
-    printf("boot: %u us total%s\n", (unsigned)s_report.boot_us,
-           s_report.degraded ? " (degraded)" : "");
+    kout("boot: %u us", (unsigned)s_report.boot_us);
+    if (pending > 0) {
+        kout(", %d subsystems not implemented yet ('boot' for details)",
+             pending);
+    }
+    kout("\n");
 
     for (int i = 0; i < AG_STAGE_COUNT; i++) {
-        const ag_stage_desc_t *st = &s_stages[i];
-        if (st->fn == NULL) {
-            printf("  %-11s  pending\n", st->name);
-        } else if (s_report.stage_result[i] == AG_OK) {
-            printf("  %-11s  ok      %6u us\n", st->name,
-                   (unsigned)s_report.stage_us[i]);
-        } else {
-            printf("  %-11s  FAILED  err=%d\n", st->name,
-                   (int)s_report.stage_result[i]);
+        if (s_stages[i].fn != NULL && s_report.stage_result[i] != AG_OK) {
+            kout("  stage '%s' FAILED with %d\n", s_stages[i].name,
+                 (int)s_report.stage_result[i]);
         }
     }
 }
 
 void ag_kernel_main(void)
 {
+    AG_TRACE("kernel entry\n");
     const int64_t t0 = esp_timer_get_time();
 
     memset(&s_report, 0, sizeof(s_report));
+
+    bool fatal_failure = false;
 
     for (int i = 0; i < AG_STAGE_COUNT; i++) {
         const ag_stage_desc_t *st = &s_stages[i];
@@ -121,29 +202,26 @@ void ag_kernel_main(void)
 
         if (err != AG_OK) {
             s_report.degraded = true;
-            printf("argon: stage '%s' failed with %d\n", st->name, (int)err);
+            kout("argon: stage '%s' failed with %d\n", st->name, (int)err);
             if (st->fatal) {
-                printf("argon: cannot continue\n");
+                kout("argon: cannot continue\n");
+                fatal_failure = true;
                 break;
             }
-        }
-
-        if (i == AG_STAGE_PLATFORM) {
-            print_banner();
         }
     }
 
     s_report.boot_us = (uint32_t)(esp_timer_get_time() - t0);
-    print_report();
+    print_summary();
 
-    /*
-     * The shell stage will take over from here.  Until it exists, park the
-     * boot task so the board stays alive for inspection.
-     */
-    printf("\nargon: no shell yet, idling.\n");
-    for (;;) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
+    if (fatal_failure) {
+        /* Keep the board alive so the failure can be read off the console. */
+        for (;;) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
     }
+
+    ag_shell_run();
 }
 
 const ag_sysinfo_t *ag_sysinfo(void) { return &s_sysinfo; }
