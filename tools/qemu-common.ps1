@@ -61,6 +61,7 @@ function Initialize-EfuseFile {
 Add-Type -ErrorAction SilentlyContinue -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
+using System.Text;
 
 public static class ArgonConsoleVt
 {
@@ -74,6 +75,28 @@ public static class ArgonConsoleVt
     static extern IntPtr CreateFile(string name, uint access, uint share,
                                     IntPtr security, uint disposition,
                                     uint flags, IntPtr template);
+
+    [StructLayout(LayoutKind.Sequential)] struct COORD { public short X, Y; }
+    [StructLayout(LayoutKind.Sequential)] struct SMALL_RECT { public short L, T, R, B; }
+    [StructLayout(LayoutKind.Sequential)] struct CSBI {
+        public COORD Size; public COORD Cursor; public ushort Attr;
+        public SMALL_RECT Window; public COORD MaxSize;
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool GetConsoleScreenBufferInfo(IntPtr h, out CSBI info);
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern bool WriteConsole(IntPtr h, string buf, uint len,
+                                    out uint written, IntPtr reserved);
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern bool ReadConsoleOutputCharacter(IntPtr h, StringBuilder buf,
+                                                  uint len, COORD at,
+                                                  out uint read);
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern bool FillConsoleOutputCharacter(IntPtr h, char c, uint len,
+                                                  COORD at, out uint written);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool SetConsoleCursorPosition(IntPtr h, COORD at);
 
     const int STD_INPUT = -10;
     const int STD_OUTPUT = -11;
@@ -167,8 +190,56 @@ public static class ArgonConsoleVt
             outcome += ", no console on input";
         }
 
+        //
+        // Trusting SetConsoleMode is what went wrong twice.  Write an escape
+        // sequence, read the cell back, and believe the answer: if the console
+        // interpreted it the cell is untouched, and if it did not the ESC is
+        // sitting there in plain sight.
+        //
+        if (VtEnabled) {
+            if (!Interprets(o)) {
+                Report = "console accepted the flag but still prints escapes";
+                VtEnabled = false;
+                return false;
+            }
+            outcome = "escape sequences enabled and verified";
+        }
+
         Report = outcome;
         return VtEnabled;
+    }
+
+    static bool Interprets(IntPtr o)
+    {
+        CSBI before;
+        if (!GetConsoleScreenBufferInfo(o, out before)) {
+            return false;
+        }
+
+        // Erase-to-end-of-line: nothing to see if it works, three visible
+        // characters if it does not.
+        string probe = "\u001b[K";
+        uint written;
+        if (!WriteConsole(o, probe, (uint)probe.Length, out written, IntPtr.Zero)) {
+            return false;
+        }
+
+        StringBuilder cell = new StringBuilder(4);
+        uint read;
+        if (!ReadConsoleOutputCharacter(o, cell, 1, before.Cursor, out read) ||
+            read == 0) {
+            return false;
+        }
+
+        bool literal = cell[0] == '\u001b';
+        if (literal) {
+            // Wipe the evidence and put the cursor back where it was.
+            uint cleared;
+            FillConsoleOutputCharacter(o, ' ', (uint)probe.Length,
+                                       before.Cursor, out cleared);
+            SetConsoleCursorPosition(o, before.Cursor);
+        }
+        return !literal;
     }
 
     public static void Restore()
