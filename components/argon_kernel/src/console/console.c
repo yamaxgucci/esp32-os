@@ -23,7 +23,13 @@
 #define AG_CON_ESC_IDLE_MS 30
 
 #define AG_CON_TICK_MS 10
-#define AG_CON_EVENT_QUEUE 32
+
+/*
+ * Deep enough for a pasted command line to arrive in one burst.  It is not the
+ * real defence against overflow - that is the backpressure in pump_endpoint -
+ * but it keeps the common case from ever touching it.
+ */
+#define AG_CON_EVENT_QUEUE 64
 #define AG_CON_READ_CHUNK 64
 
 typedef struct {
@@ -43,6 +49,7 @@ static TaskHandle_t       s_task;
 static bool               s_ready;
 static ag_con_sink_fn     s_redirect;
 static void              *s_redirect_ctx;
+static uint32_t           s_dropped_events;
 
 /* ---------------------------------------------------------------------- */
 
@@ -145,6 +152,8 @@ int ag_console_printf(const char *fmt, ...)
     return n;
 }
 
+uint32_t ag_console_dropped_events(void) { return s_dropped_events; }
+
 void ag_console_sync(void)
 {
     if (!s_ready) {
@@ -163,15 +172,18 @@ static void publish(const ag_event_t *ev)
 {
     ag_event_t stamped = *ev;
     stamped.ts = (ag_time_t)esp_timer_get_time();
+
     /*
-     * A full queue means nobody is reading.  Dropping the oldest event keeps
-     * the most recent keystrokes, which is what a user expects after the
-     * system was briefly busy.
+     * Dropping the newest, not the oldest.  Losing the head of a burst
+     * silently rewrites what the user typed - "delete foo" arriving as
+     * "lete foo" is a different command, and could have been a worse one.
+     * Losing the tail leaves a visibly truncated line that can be fixed.
+     *
+     * This should not happen: pump_endpoint only reads what the queue can
+     * hold.  The counter exists so that if it ever does, it is visible.
      */
     if (xQueueSend(s_events, &stamped, 0) != pdTRUE) {
-        ag_event_t discard;
-        (void)xQueueReceive(s_events, &discard, 0);
-        (void)xQueueSend(s_events, &stamped, 0);
+        s_dropped_events++;
     }
 }
 
@@ -183,7 +195,21 @@ static void pump_endpoint(ag_con_endpoint_t *ep)
         return;
     }
 
-    const int32_t n = ep->transport->read(ep->ctx, chunk, sizeof(chunk));
+    /*
+     * Backpressure: never read more bytes than the event queue can accept,
+     * since one byte can produce one event.  What is not read stays in the
+     * transport's own buffer, which is where it is safe.
+     */
+    const UBaseType_t space = uxQueueSpacesAvailable(s_events);
+    if (space == 0) {
+        return;
+    }
+    size_t want = sizeof(chunk);
+    if ((size_t)space < want) {
+        want = (size_t)space;
+    }
+
+    const int32_t n = ep->transport->read(ep->ctx, chunk, want);
     for (int32_t i = 0; i < n; i++) {
         ag_event_t ev;
         if (ag_vtin_feed(&ep->in, chunk[i], &ev)) {

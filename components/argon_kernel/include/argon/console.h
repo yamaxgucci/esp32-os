@@ -74,6 +74,13 @@ void         ag_console_unlock(void);
 /* Pushes pending output to every endpoint now instead of at the next tick. */
 void ag_console_sync(void);
 
+/*
+ * Input events lost to a full queue.  Should be zero: the console reads only
+ * what the queue can hold.  Reported so that a regression is visible rather
+ * than showing up as mistyped commands.
+ */
+uint32_t ag_console_dropped_events(void);
+
 #ifdef __cplusplus
 }
 #endif

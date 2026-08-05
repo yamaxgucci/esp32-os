@@ -248,6 +248,13 @@ static int cmd_mem(int argc, char **argv)
     }
     ag_console_printf("\n  %u KB used by the system\n",
                       (unsigned)((int_total - int_free) / 1024));
+
+    /* Silent when it is zero, which is the only acceptable value. */
+    const uint32_t dropped = ag_console_dropped_events();
+    if (dropped != 0) {
+        ag_console_printf("  WARNING: %u console input events lost\n",
+                          (unsigned)dropped);
+    }
     return 0;
 }
 

@@ -124,7 +124,9 @@ static ag_err_t stage_console(void)
      * else.  Left alone it would write straight to the UART and tear whatever
      * the console had drawn.
      */
+#if !AG_BOOT_TRACE
     esp_log_set_vprintf(ag_console_vprintf);
+#endif
 
     print_banner();
     return AG_OK;

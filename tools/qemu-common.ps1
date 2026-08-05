@@ -131,7 +131,12 @@ function Get-QemuMachineArgs {
     param([string]$EfusePath)
     return @(
         '-M', 'esp32s3'
-        '-m', '32M'
+        # 8 MB, matching an N16R8 module.  Not a detail: the S3 reaches flash
+        # and PSRAM through one 32 MB window on the data bus, so 32 MB of PSRAM
+        # leaves no address space to map flash into, and esp_partition - which
+        # reads the partition table through a mapping rather than a read - then
+        # finds no partitions at all.
+        '-m', '8M'
         '-drive', 'file=build\qemu_flash.bin,if=mtd,format=raw'
         '-drive', "file=$EfusePath,if=none,format=raw,id=efuse"
         '-global', 'driver=nvram.esp32s3.efuse,property=drive,value=efuse'

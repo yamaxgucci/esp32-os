@@ -240,11 +240,17 @@ ag_err_t ag_vfs_mount_info(uint32_t index, ag_mountinfo_t *out)
         strncpy(out->mount, m->point, sizeof(out->mount) - 1);
         out->flags = m->flags;
         out->open_handles = m->open_handles;
-        if (!m->ejected && m->ops != NULL && m->ops->info != NULL) {
-            m->ops->info(m->ctx, &out->info);
-        }
+
+        /*
+         * The backend's own name comes first as a default, then info() may
+         * replace it: an adapter serves several filesystems and only the
+         * instance knows which one this is.
+         */
         if (m->ops != NULL && m->ops->name != NULL) {
             strncpy(out->info.fs, m->ops->name, sizeof(out->info.fs) - 1);
+        }
+        if (!m->ejected && m->ops != NULL && m->ops->info != NULL) {
+            m->ops->info(m->ctx, &out->info);
         }
         out->info.removable = (m->flags & AG_MOUNT_REMOVABLE) != 0;
         out->info.read_only = (m->flags & AG_MOUNT_READONLY) != 0;

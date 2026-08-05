@@ -17,9 +17,12 @@ CONFIG_SPIRAM_SPEED_80M=y
 # per-process arenas and the executable app-text arena.
 CONFIG_SPIRAM_USE_CAPS_ALLOC=y
 
-# Required for mapping PSRAM into the instruction bus at runtime (loader).
-CONFIG_SPIRAM_FETCH_INSTRUCTIONS=y
-CONFIG_SPIRAM_RODATA=y
+# Deliberately NOT enabled: these copy the kernel's own code and constants into
+# PSRAM at boot, which costs boot time and PSRAM and buys nothing here - both
+# flash and PSRAM are reached through the same cache.  They are also unrelated
+# to the application loader, which maps PSRAM into the instruction bus itself.
+# CONFIG_SPIRAM_FETCH_INSTRUCTIONS
+# CONFIG_SPIRAM_RODATA
 
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 
