@@ -14,9 +14,17 @@ your code running on a dedicated CPU core with almost all of the RAM.
 
 ## Status
 
-**Early development.** Nothing is usable yet. See
-[docs/04-roadmap.md](docs/04-roadmap.md) for the plan and
-[docs/00-architecture.md](docs/00-architecture.md) for the design.
+**Early development.** It boots, gives a prompt, mounts three drives, and runs
+applications built with `tools/mkaxe.py`. There is no process model yet, so an
+application runs on the shell's task and can take it down with it.
+
+Start with **[docs/05-status.md](docs/05-status.md)**: what works, what does not,
+how to build and verify, and the traps already found. Then
+[docs/00-architecture.md](docs/00-architecture.md) for why the design is what it
+is, and [docs/04-roadmap.md](docs/04-roadmap.md) for what comes next.
+
+No ESP32 board is required to work on this — see the note at the end of this
+file.
 
 ## Design in one screen
 
