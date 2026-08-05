@@ -1,6 +1,8 @@
 set(ARGON_KERNEL_SRCS
     "src/boot/kernel.c"
-    "src/boot/platform.c")
+    "src/boot/platform.c"
+    "src/core/path.c"
+    "src/core/cfg.c")
 
 idf_component_register(
     SRCS ${ARGON_KERNEL_SRCS}
