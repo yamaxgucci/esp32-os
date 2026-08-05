@@ -16,6 +16,9 @@ CMakeCache.txt
 *.map
 Testing/
 
+# Machine specific toolchain paths
+tools/local-env.ps1
+
 # Editors / OS
 .vscode/
 .idea/

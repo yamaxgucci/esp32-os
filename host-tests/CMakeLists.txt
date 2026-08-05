@@ -19,8 +19,10 @@ add_executable(argon_tests
     main.c
     test_path.c
     test_cfg.c
+    test_screen.c
     "${ARGON_ROOT}/components/argon_kernel/src/core/path.c"
-    "${ARGON_ROOT}/components/argon_kernel/src/core/cfg.c")
+    "${ARGON_ROOT}/components/argon_kernel/src/core/cfg.c"
+    "${ARGON_ROOT}/components/argon_kernel/src/con/screen.c")
 
 target_include_directories(argon_tests PRIVATE
     "${CMAKE_CURRENT_LIST_DIR}"
