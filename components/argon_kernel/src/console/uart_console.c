@@ -9,7 +9,11 @@
 
 #include "driver/uart.h"
 
-#define AG_UART_RX_BUFFER 1024
+/*
+ * 2 KB rather than 1: this is what absorbs the bytes already in flight when the
+ * console sends XOFF, and at 115200 baud a kilobyte is only 89 ms of line.
+ */
+#define AG_UART_RX_BUFFER 2048
 
 typedef struct {
     uart_port_t port;

@@ -67,6 +67,8 @@ $text = New-Object System.Text.StringBuilder
 $client = $null
 $stream = $null
 $found = $false
+# Set when the guest sends XOFF, cleared on XON: see Read-Available.
+$script:paused = $false
 
 try {
     # QEMU listens before it starts executing, but not before it starts.
@@ -85,11 +87,23 @@ try {
 
     # Pumps whatever has arrived into $text and returns how many marker
     # occurrences are now present.
+    #
+    # XOFF and XON are taken out of the stream and acted on rather than recorded:
+    # they are the guest saying "stop sending" and "go on", not something it put
+    # on its screen, and leaving them in the transcript would put a stray
+    # character into the screen vtdump reconstructs.
     function Read-Available {
         while ($stream.DataAvailable) {
             $n = $stream.Read($buffer, 0, $buffer.Length)
             if ($n -le 0) { break }
-            [void]$text.Append([System.Text.Encoding]::ASCII.GetString($buffer, 0, $n))
+            $keep = New-Object System.Text.StringBuilder
+            for ($i = 0; $i -lt $n; $i++) {
+                $b = $buffer[$i]
+                if ($b -eq 0x13) { $script:paused = $true; continue }
+                if ($b -eq 0x11) { $script:paused = $false; continue }
+                [void]$keep.Append([char]$b)
+            }
+            [void]$text.Append($keep.ToString())
         }
         $s = $text.ToString()
         $count = 0
@@ -112,6 +126,38 @@ try {
         $bytes = [System.Text.Encoding]::ASCII.GetBytes($Text + "`r")
         $stream.Write($bytes, 0, $bytes.Length)
         $stream.Flush()
+    }
+
+    # How many times some text appears in what has arrived so far.
+    #
+    # Note what this is counting: a rendered screen, not a log.  When the screen
+    # scrolls, rows that are still on it are drawn again, so the same text can be
+    # counted more than once.  For waiting on a command that is fine - one more
+    # prompt than before means it finished, whether the count grew by one or
+    # three.  For anything where "it happened" must be exact, wait for text that
+    # is printed once and does not sit on the screen scrolling.
+    function Count-Of {
+        param([string]$Needle)
+        $s = $text.ToString()
+        $count = 0
+        $idx = 0
+        while (($idx = $s.IndexOf($Needle, $idx)) -ge 0) {
+            $count++
+            $idx += $Needle.Length
+        }
+        return $count
+    }
+
+    # Waits for text to appear more often than it already has.
+    function Wait-Text {
+        param([string]$Needle, [int]$Was, [int]$Seconds)
+        $deadline = (Get-Date).AddSeconds($Seconds)
+        while ((Get-Date) -lt $deadline) {
+            [void](Read-Available)
+            if ((Count-Of $Needle) -gt $Was) { return $true }
+            Start-Sleep -Milliseconds 100
+        }
+        return $false
     }
 
     # Waits for one more prompt than has been seen so far, which is how a
@@ -139,24 +185,69 @@ try {
                 (Join-Path (Get-Location) $local))
             Write-Host "Sending $local ($($bytes.Length) bytes) to $guest"
 
-            $was = $seen
+            # recv says "N bytes written" when it is done, and that is what is
+            # waited for: the prompt cannot be used here, because a screen full
+            # of scrolling hex redraws the prompts already on it and the count
+            # grows on its own.  That looked exactly like a transfer that worked
+            # and a file that was half there.
+            $written = Count-Of 'bytes written'
             Send-Line "recv $guest"
 
             # 64 bytes a line - 128 hex characters, which is what the line
-            # editor's buffer holds with room to spare - and the reader is pumped
-            # as we go, since the guest echoes every character back: filling the
-            # input queue faster than it drains is how input gets dropped.
+            # editor's buffer holds with room to spare.
+            #
+            # Paced by the guest's own echo rather than by a delay.  There is no
+            # flow control on this link: when the far end is slow - and writing to
+            # FAT on flash is slow, a sector rewrite every line - the input queue
+            # fills, the port drops bytes, and recv sees a line that is not hex
+            # and gives up.  Waiting for each line to come back means the sender
+            # can never get ahead of the receiver, whatever it is writing to.
             for ($at = 0; $at -lt $bytes.Length; $at += 64) {
                 $take = [Math]::Min(64, $bytes.Length - $at)
                 $hex = -join (0..($take - 1) | ForEach-Object {
                     $bytes[$at + $_].ToString('x2') })
                 Send-Line $hex
-                Start-Sleep -Milliseconds 12
+
+                # One line at a time, and never a second one while the guest has
+                # said stop.  That makes the transfer as fast as whatever is on
+                # the other end can write - instant to the RAM disk, a sector
+                # rewrite per line to flash - without ever getting ahead of it.
                 [void](Read-Available)
+                $waited = 0
+                while ($script:paused -and $waited -lt 10000) {
+                    Start-Sleep -Milliseconds 5
+                    $waited += 5
+                    [void](Read-Available)
+                }
+                if ($script:paused) {
+                    throw "$guest stalled at byte $at : the guest never resumed"
+                }
             }
 
+            # Generous, and scaled: writing to the RAM disk is instant, but the
+            # same file onto FAT on flash is a sector rewrite every 64 bytes and
+            # takes seconds per kilobyte.
             Send-Line 'END'
-            $seen = Wait-Prompt -Was $was -Seconds 30
+            # Generous, and generous again for flash: a fresh FAT on flash is
+            # slower than a used one, so the first big transfer after a firmware
+            # rebuild - which reformats C: - takes minutes rather than seconds.
+            if (-not (Wait-Text -Needle 'bytes written' -Was $written `
+                                -Seconds (120 + $bytes.Length / 64))) {
+                throw "$guest did not arrive: recv never reported it written"
+            }
+            $seen = Read-Available
+
+            # And the count it reported has to be the count that was sent.  A
+            # transfer over a console with no checksum can only be trusted as far
+            # as this, but a wrong length is the failure that actually happens.
+            $tail = $text.ToString()
+            $tail = $tail.Substring([Math]::Max(0, $tail.Length - 4096))
+            if ($tail -match '(\d+) bytes written') {
+                if ([int]$Matches[1] -ne $bytes.Length) {
+                    throw ("$guest arrived as $($Matches[1]) bytes, not " +
+                           "$($bytes.Length): the transfer lost data")
+                }
+            }
         }
     }
 
@@ -206,10 +297,14 @@ try {
     if ($proc -and -not $proc.HasExited) {
         Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
     }
-}
 
-New-Item -ItemType Directory -Force -Path (Split-Path -Parent $LogPath) | Out-Null
-[System.IO.File]::WriteAllText((Join-Path (Get-Location) $LogPath), $text.ToString())
+    # Written here, not after the try: a run that failed is the run whose
+    # transcript is worth having, and a throw would have skipped it.
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $LogPath) |
+        Out-Null
+    [System.IO.File]::WriteAllText((Join-Path (Get-Location) $LogPath),
+                                   $text.ToString())
+}
 
 if ($found) {
     Write-Host "--- marker '$Marker' seen; transcript in $LogPath ---"
