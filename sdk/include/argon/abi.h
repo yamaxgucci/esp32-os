@@ -618,6 +618,18 @@ typedef struct ag_proc_api {
      * of.  Long loops should check it; short programs need not bother.
      */
     bool (*interrupted)(void);
+
+    /*
+     * Arms a deadline for this process: if it does not call sys->heartbeat()
+     * within `ms`, the supervisor treats it as hung and stops it.  0 disarms.
+     *
+     * Opt-in, and deliberately so.  A deadline the system imposed would be wrong
+     * for every application that legitimately waits a long time - for a key, for
+     * a card, for a reply - and being killed for waiting is worse than not being
+     * watched.  An application that arms this is saying it knows how long its own
+     * work takes, which is a promise only it can make.
+     */
+    void (*watchdog)(uint32_t ms);
 } ag_proc_api_t;
 
 /* ------------------------------------------------------------------------ */

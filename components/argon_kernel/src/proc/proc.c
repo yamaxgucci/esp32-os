@@ -347,6 +347,47 @@ bool ag_proc_note_fault(uint32_t cause, uint32_t pc, uint32_t vaddr, uint32_t sp
     return true;
 }
 
+/*
+ * The last crash, formatted and waiting to be written to disk by the supervisor.
+ * One slot: a second crash before the first is written overwrites it, which is
+ * the right trade - the journal has both, and a queue of crash records is a
+ * feature nobody needs on a machine that has just lost a process.
+ */
+#define AG_CRASH_TEXT_MAX 512
+static char s_crash_text[AG_CRASH_TEXT_MAX];
+static bool s_crash_waiting;
+
+/* Appends to the pending record, never overrunning it. */
+static void crash_printf(const char *fmt, ...)
+{
+    const size_t at = strlen(s_crash_text);
+    if (at + 1 >= sizeof(s_crash_text)) {
+        return;
+    }
+
+    va_list ap;
+    va_start(ap, fmt);
+    (void)vsnprintf(&s_crash_text[at], sizeof(s_crash_text) - at, fmt, ap);
+    va_end(ap);
+}
+
+bool ag_proc_take_crash_record(char *out, size_t len)
+{
+    if (out == NULL || len == 0) {
+        return false;
+    }
+
+    lock();
+    const bool waiting = s_crash_waiting;
+    if (waiting) {
+        set_string(out, len, s_crash_text);
+        s_crash_text[0] = '\0';
+        s_crash_waiting = false;
+    }
+    unlock();
+    return waiting;
+}
+
 static void crash_record(proc_t *p, const char *reason)
 {
     const uint32_t up_ms = now_ms() - (uint32_t)(p->started / 1000);
@@ -366,6 +407,19 @@ static void crash_record(proc_t *p, const char *reason)
            ag_proc_state_name(p->state), (unsigned)up_ms, (unsigned)used,
            (unsigned)(p->heap_size / 1024u), (unsigned)ag_reslist_count(&p->res),
            (unsigned)ag_vfs_open_count());
+
+    /* The same thing again, for the file the supervisor will write. */
+    s_crash_text[0] = '\0';
+    crash_printf("%s (pid %u) killed at %u ms uptime: %s\n", p->name,
+                 (unsigned)p->pid, (unsigned)now_ms(),
+                 (reason != NULL) ? reason : "no reason given");
+    crash_printf("  %s for %u ms, %u B of a %u KB arena, %u resource(s), "
+                 "%u B code at %p\n",
+                 ag_proc_state_name(p->state), (unsigned)up_ms, (unsigned)used,
+                 (unsigned)(p->heap_size / 1024u),
+                 (unsigned)ag_reslist_count(&p->res),
+                 (unsigned)p->app.header.code.size, p->app.place.code);
+    s_crash_waiting = true;
 
     /*
      * A process whose thread faulted is reported twice on the way down - once by
@@ -389,15 +443,22 @@ static void crash_record(proc_t *p, const char *reason)
            ag_fault_cause_name(p->fault.cause), (unsigned)p->fault.pc,
            (unsigned)p->fault.vaddr, (unsigned)p->fault.sp);
 
+    crash_printf("  %s at pc %08x, address %08x, sp %08x\n",
+                 ag_fault_cause_name(p->fault.cause), (unsigned)p->fault.pc,
+                 (unsigned)p->fault.vaddr, (unsigned)p->fault.sp);
+
     if (p->fault.pc >= code && p->fault.pc < code_end) {
         ag_log(AG_LOG_ERROR, "proc",
                "  pc is offset 0x%x in %s's own code (%u bytes at %08x)",
                (unsigned)(p->fault.pc - code), p->name,
                (unsigned)p->app.header.code.size, (unsigned)code);
+        crash_printf("  pc is offset 0x%x in its own code\n",
+                     (unsigned)(p->fault.pc - code));
     } else {
         ag_log(AG_LOG_ERROR, "proc",
                "  pc is outside %s's code, which starts at %08x", p->name,
                (unsigned)code);
+        crash_printf("  pc is outside its own code\n");
     }
 }
 
@@ -1138,6 +1199,54 @@ void ag_proc_heartbeat(void)
     if (p != NULL) {
         p->heartbeat_ms = now_ms();
     }
+}
+
+void ag_proc_watchdog(uint32_t ms)
+{
+    proc_t *p = current();
+
+    if (p == NULL) {
+        return;
+    }
+    /* Armed from now, not from whenever the last heartbeat happened to be. */
+    p->heartbeat_ms = now_ms();
+    p->watchdog_ms = ms;
+
+    if (ms != 0) {
+        ag_log(AG_LOG_INFO, "proc", "%s (pid %u) promises a heartbeat every %u ms",
+               p->name, (unsigned)p->pid, (unsigned)ms);
+    }
+}
+
+ag_pid_t ag_proc_overdue(uint32_t *late_by_ms)
+{
+    const uint32_t now = now_ms();
+    ag_pid_t       found = AG_PID_KERNEL;
+    uint32_t       late = 0;
+
+    lock();
+    for (uint32_t i = 0; i < AG_PROC_MAX; i++) {
+        const proc_t *p = &s_procs[i];
+
+        if (!p->used || p->watchdog_ms == 0) {
+            continue;
+        }
+        if (p->state != AG_PS_RUNNING && p->state != AG_PS_BACKGROUND) {
+            continue;
+        }
+        const uint32_t since = now - p->heartbeat_ms;
+        if (since > p->watchdog_ms) {
+            found = p->pid;
+            late = since - p->watchdog_ms;
+            break;
+        }
+    }
+    unlock();
+
+    if (late_by_ms != NULL) {
+        *late_by_ms = late;
+    }
+    return found;
 }
 
 /* ---------------------------------------------------------------------- */

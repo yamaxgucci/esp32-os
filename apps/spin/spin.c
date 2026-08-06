@@ -8,6 +8,9 @@
  *   run t:\spin.axe deaf   rude: never asks.  Only Ctrl+\ (or Ctrl-Alt-Del on a
  *                          real keyboard) gets rid of it, which is the case the
  *                          supervisor exists for.
+ *   run t:\spin.axe wd     promises a heartbeat every 500 ms and then stops
+ *                          sending one: the watchdog should end it by itself,
+ *                          with nobody pressing anything.
  *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
  */
@@ -18,9 +21,15 @@ AG_APP("SPIN", "1.0", "argon", 0);
 int ag_main(int argc, char **argv)
 {
     const bool deaf = (argc > 1) && argv[1][0] == 'd';
+    const bool watched = (argc > 1) && argv[1][0] == 'w';
 
     ag_printf("spinning%s; pid %d\n", deaf ? " and not listening" : "",
               (int)ag_getpid());
+
+    if (watched) {
+        ag_watchdog(500);
+        ag_print("promised a heartbeat every 500 ms; will stop sending them\n");
+    }
 
     for (unsigned round = 0;; round++) {
         /* Some work, so the loop is not optimised into nothing. */
@@ -35,8 +44,14 @@ int ag_main(int argc, char **argv)
             return 0;
         }
 
-        /* A heartbeat is how a long job says it is still making progress. */
-        ag_heartbeat();
+        /*
+         * A heartbeat is how a long job says it is still making progress.  In the
+         * watched flavour it stops after five rounds, which is the failure the
+         * watchdog is for: still running, no longer getting anywhere.
+         */
+        if (!watched || round < 5) {
+            ag_heartbeat();
+        }
         ag_print(".");
     }
 }
