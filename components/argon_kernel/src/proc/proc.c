@@ -25,6 +25,7 @@
 #include "multi_heap.h"
 
 #include "fs/storage.h"
+#include "proc/supervisor.h"
 
 /* Stack, in bytes, and the arena an application allocates from. */
 #define AG_PROC_STACK_MIN (2u * 1024u)
@@ -315,7 +316,38 @@ static bool holds_kernel_lock(TaskHandle_t task)
            ag_storage_vfs_lock_holder() == (void *)task;
 }
 
-static void crash_record(const proc_t *p, const char *reason)
+bool ag_proc_task_in_kernel(TaskHandle_t task)
+{
+    return holds_kernel_lock(task);
+}
+
+/*
+ * Written down in an exception context, so: no locks, no logging, no allocation.
+ * Answers whether this fault belongs to an application that can be unwound.
+ */
+bool ag_proc_note_fault(uint32_t cause, uint32_t pc, uint32_t vaddr, uint32_t sp)
+{
+    proc_t *p = current();
+
+    if (p == NULL) {
+        return false; /* the kernel's own fault: not ours to paper over */
+    }
+    if (p->fault.pending) {
+        return false; /* faulting while being unwound: let it go to the panic */
+    }
+    if (holds_kernel_lock(xTaskGetCurrentTaskHandle())) {
+        return false; /* unwinding would leave a kernel lock held forever */
+    }
+
+    p->fault.pending = true;
+    p->fault.cause = cause;
+    p->fault.pc = pc;
+    p->fault.vaddr = vaddr;
+    p->fault.sp = sp;
+    return true;
+}
+
+static void crash_record(proc_t *p, const char *reason)
 {
     const uint32_t up_ms = now_ms() - (uint32_t)(p->started / 1000);
     size_t         used = 0;
@@ -334,6 +366,39 @@ static void crash_record(const proc_t *p, const char *reason)
            ag_proc_state_name(p->state), (unsigned)up_ms, (unsigned)used,
            (unsigned)(p->heap_size / 1024u), (unsigned)ag_reslist_count(&p->res),
            (unsigned)ag_vfs_open_count());
+
+    /*
+     * A process whose thread faulted is reported twice on the way down - once by
+     * the thread, once by the kill that follows - and the second copy of the same
+     * addresses is noise.
+     */
+    if (!p->fault.pending || p->fault.reported) {
+        return;
+    }
+    p->fault.reported = true;
+
+    /*
+     * Where the fault was, said in terms the author of the application can act
+     * on: an offset into its own code is a line they can find, and an address
+     * outside it says the program had already gone somewhere it should not.
+     */
+    const uintptr_t code = (uintptr_t)p->app.place.code;
+    const uintptr_t code_end = code + p->app.header.code.size;
+
+    ag_log(AG_LOG_ERROR, "proc", "  %s at pc %08x, address %08x, sp %08x",
+           ag_fault_cause_name(p->fault.cause), (unsigned)p->fault.pc,
+           (unsigned)p->fault.vaddr, (unsigned)p->fault.sp);
+
+    if (p->fault.pc >= code && p->fault.pc < code_end) {
+        ag_log(AG_LOG_ERROR, "proc",
+               "  pc is offset 0x%x in %s's own code (%u bytes at %08x)",
+               (unsigned)(p->fault.pc - code), p->name,
+               (unsigned)p->app.header.code.size, (unsigned)code);
+    } else {
+        ag_log(AG_LOG_ERROR, "proc",
+               "  pc is outside %s's code, which starts at %08x", p->name,
+               (unsigned)code);
+    }
 }
 
 /* ---------------------------------------------------------------------- */
@@ -1016,6 +1081,44 @@ void ag_proc_exit(int code)
         longjmp(p->exit_jump, 1);
     }
     /* Called with nothing running: there is nowhere to go, so ignore it. */
+}
+
+/*
+ * Where a faulted application resumes - ordinary task context again, on its own
+ * stack, so locking and logging are allowed here and this is where all of it
+ * happens.
+ */
+void ag_proc_fault_exit(void)
+{
+    proc_t *p = current();
+
+    if (p == NULL) {
+        /* Cannot happen: the handler only diverts application tasks. */
+        vTaskDelete(NULL);
+        return;
+    }
+
+    crash_record(p, "faulted");
+    p->killed = true;
+    p->exit_code = -AG_EKILLED;
+
+    if (xTaskGetCurrentTaskHandle() == p->task) {
+        /* The main task can unwind to where it was started from. */
+        longjmp(p->exit_jump, 1);
+    }
+
+    /*
+     * A thread cannot: exit_jump belongs to another task's stack, and jumping
+     * onto it would land on a frame that is still in use.  So the thread ends
+     * here and the supervisor takes the process down - a fault in one thread is
+     * a fault in the process, since they share everything.
+     *
+     * Marked finished first: the reclaim that follows deletes threads that are
+     * still marked running, and this one is about to stop existing.
+     */
+    ag_thread_mark_self_finished();
+    ag_supervisor_kill_request(p->pid);
+    vTaskDelete(NULL);
 }
 
 bool ag_proc_interrupted(void)
