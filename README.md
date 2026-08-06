@@ -16,12 +16,13 @@ your code running on a dedicated CPU core with almost all of the RAM.
 
 **Early development.** It boots, gives a prompt, mounts three drives, and runs
 applications built with `tools/mkaxe.py` as processes: a task and a core of
-their own, an arena they allocate from, and full accounting - a hung application
-can be stopped from the keyboard and every byte of it comes back. What is still
-missing from that picture is threads inside an application, catching a fault and
-blaming the right process for it, and a per-process watchdog. And without an MMU
-a wild pointer still reaches the rest of the system; that is a deliberate
-trade, not an oversight.
+their own, threads if they want them, an arena they allocate from, and full
+accounting - a hung application can be stopped from the keyboard, one that
+dereferences a null pointer is stopped by itself with the offset in its own code
+written down, and every byte of either comes back. What is still missing from
+that picture is a per-process watchdog and crash records on disk. And without an
+MMU a wild pointer can still corrupt memory that is not the application's; that
+is a deliberate trade, not an oversight.
 
 Start with **[docs/05-status.md](docs/05-status.md)**: what works, what does not,
 how to build and verify, and the traps already found. Then

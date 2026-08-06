@@ -24,6 +24,7 @@ set(ARGON_KERNEL_SRCS
     "src/loader/api.c"
     "src/proc/proc.c"
     "src/proc/threads.c"
+    "src/proc/fault.c"
     "src/proc/supervisor.c"
     "src/shell/lineedit.c"
     "src/shell/shell.c"
@@ -37,7 +38,9 @@ idf_component_register(
     PRIV_REQUIRES esp_psram esp_timer esp_partition nvs_flash spi_flash
                   esp_system esp_hw_support esp_driver_uart log
                   fatfs wear_levelling vfs sdmmc esp_driver_sdmmc
-                  esp_driver_sdspi esp_driver_spi esp_driver_gpio)
+                  esp_driver_sdspi esp_driver_spi esp_driver_gpio
+                  # xtensa: the exception table the fault handler installs into
+                  xtensa)
 
 # Stamp the build with a git description when one is available.
 find_package(Git QUIET)

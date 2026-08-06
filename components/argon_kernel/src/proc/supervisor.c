@@ -18,6 +18,8 @@
 #include <argon/log.h>
 #include <argon/proc.h>
 
+#include "proc/proc_internal.h"
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -32,10 +34,19 @@
 /* Nothing needs doing most of the time; a wake-up also collects zombies. */
 #define AG_SUP_TICK_MS 250
 
-static TaskHandle_t   s_task;
-static volatile bool  s_stop_request;
-static volatile bool  s_interrupt_request;
-static uint32_t       s_stops;
+static TaskHandle_t      s_task;
+static volatile bool     s_stop_request;
+static volatile bool     s_interrupt_request;
+static volatile ag_pid_t s_kill_request;
+static uint32_t          s_stops;
+
+void ag_supervisor_kill_request(ag_pid_t pid)
+{
+    s_kill_request = pid;
+    if (s_task != NULL) {
+        xTaskNotifyGive(s_task);
+    }
+}
 
 /*
  * Runs on the console task, so it decides and returns; the work happens on the
@@ -149,6 +160,16 @@ static void supervisor_task(void *arg)
             s_stop_request = false;
             stop_foreground();
         }
+        /*
+         * A process that asked to be ended from inside itself - a thread that
+         * faulted, say.  Its crash record is already written; what is left is the
+         * part it could not do for itself.
+         */
+        const ag_pid_t victim = s_kill_request;
+        if (victim != AG_PID_KERNEL) {
+            s_kill_request = AG_PID_KERNEL;
+            (void)ag_proc_kill(victim, "a thread of it faulted");
+        }
 
         (void)ag_proc_reap_finished();
     }
@@ -164,9 +185,21 @@ ag_err_t ag_supervisor_init(void)
         return AG_OK;
     }
 
-    const ag_err_t err = ag_proc_init();
+    ag_err_t err = ag_proc_init();
     if (err != AG_OK) {
         return err;
+    }
+
+    /*
+     * Before any application can run: from here on a fault in one costs that
+     * application rather than the machine.
+     */
+    err = ag_fault_init();
+    if (err != AG_OK) {
+        ag_log(AG_LOG_WARN, "supervisor",
+               "faults will not be caught (%d): an application that faults takes "
+               "the system with it",
+               (int)err);
     }
 
     if (xTaskCreatePinnedToCore(supervisor_task, "ag_super", AG_SUP_STACK, NULL,

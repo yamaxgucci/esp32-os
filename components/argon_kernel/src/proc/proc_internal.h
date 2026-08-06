@@ -26,6 +26,20 @@
 #define AG_PROC_RES_MAX 32
 #define AG_PROC_ARGS_MAX 16
 
+/*
+ * What the exception handler managed to write down.  Filled in an exception
+ * context, where nothing may be locked and nothing may be logged, and read back
+ * in ordinary task context where both are fine.
+ */
+typedef struct {
+    bool     pending;
+    bool     reported; /* so a fault is not written out twice on the way down */
+    uint32_t cause;
+    uint32_t pc;
+    uint32_t vaddr;
+    uint32_t sp;
+} ag_proc_fault_t;
+
 typedef struct {
     bool            used;
     ag_pid_t        pid;
@@ -59,6 +73,8 @@ typedef struct {
     uint32_t  heartbeat_ms;
     uint32_t  stack_bytes;
     uint32_t  stack_unused;
+
+    ag_proc_fault_t fault;
 
     /*
      * Who had the console before this one took it.  A process started by another
@@ -98,5 +114,43 @@ bool ag_thread_owns(const void *record, TaskHandle_t task);
 
 /* Stops the thread if it is still running and frees the record. */
 void ag_thread_release(void *record);
+
+/*
+ * Records that the calling thread has stopped running.  Every path that ends a
+ * thread must call this before it deletes itself: the reclaim at the end of the
+ * process deletes threads that are still marked running, and deleting a task
+ * that is already gone is a freed TCB used again.
+ */
+void ag_thread_mark_self_finished(void);
+
+/* ---------------------------------------------------------------------- */
+/* Faults (fault.c)                                                       */
+/* ---------------------------------------------------------------------- */
+
+/* Installs the exception handlers, on every core.  Part of the supervisor. */
+ag_err_t ag_fault_init(void);
+
+/* "store to a prohibited address", "illegal instruction" - for the record. */
+const char *ag_fault_cause_name(uint32_t cause);
+
+/*
+ * True while this task is inside the kernel holding a lock the rest of the system
+ * needs.  A process in that state cannot be unwound or deleted: the lock would
+ * stay held.
+ */
+bool ag_proc_task_in_kernel(TaskHandle_t task);
+
+/*
+ * Called from an exception context: writes down what happened and nothing else.
+ * Returns false when this process cannot be recovered, in which case the caller
+ * must let the fault take its normal course.
+ */
+bool ag_proc_note_fault(uint32_t cause, uint32_t pc, uint32_t vaddr, uint32_t sp);
+
+/*
+ * Where a faulted process resumes, in ordinary task context: reports what
+ * happened and ends the process.  Does not return.
+ */
+void ag_proc_fault_exit(void);
 
 #endif /* ARGON_PROC_INTERNAL_H */

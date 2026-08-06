@@ -185,6 +185,30 @@ static ag_thread_t api_create(void (*fn)(void *), void *arg, const char *name,
     return (ag_thread_t)rec;
 }
 
+/*
+ * Marks the calling thread's record as done.  Every path by which a thread stops
+ * running has to go through this before deleting itself, or the reclaim at the
+ * end of the process will delete a task that no longer exists - which is not an
+ * error FreeRTOS reports, it is a freed TCB used again, and the system stops
+ * making sense silently.  That cost an evening.
+ */
+void ag_thread_mark_self_finished(void)
+{
+    proc_t *p = ag_proc_current();
+    const TaskHandle_t me = xTaskGetCurrentTaskHandle();
+
+    if (p == NULL) {
+        return;
+    }
+    for (uint32_t i = 0; i < AG_PROC_RES_MAX; i++) {
+        if (p->res_slots[i].type == AG_RES_THREAD &&
+            ag_thread_owns(p->res_slots[i].ref, me)) {
+            ((ag_thread_rec_t *)p->res_slots[i].ref)->finished = true;
+            return;
+        }
+    }
+}
+
 static void api_exit(void)
 {
     /*
@@ -192,18 +216,7 @@ static void api_exit(void)
      * finished, and is freed when the process ends - the same path a thread that
      * simply returned takes.
      */
-    proc_t *p = ag_proc_current();
-    const TaskHandle_t me = xTaskGetCurrentTaskHandle();
-
-    if (p != NULL) {
-        for (uint32_t i = 0; i < AG_PROC_RES_MAX; i++) {
-            if (p->res_slots[i].type == AG_RES_THREAD &&
-                ag_thread_owns(p->res_slots[i].ref, me)) {
-                ((ag_thread_rec_t *)p->res_slots[i].ref)->finished = true;
-                break;
-            }
-        }
-    }
+    ag_thread_mark_self_finished();
     vTaskDelete(NULL);
 }
 
