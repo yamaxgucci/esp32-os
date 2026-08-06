@@ -88,9 +88,9 @@ flash-XIP. Результат определяет §3.2 архитектуры.
    `Ctrl-Alt-Del`) как снятие, сбор завершённых, crash-record в журнал;
    ⬜ watchdog по биениям, ⬜ перехват исключений с определением виновника
    (свой panic-handler — отдельный шаг со спайком), ⬜ crash-record на диск
-5. Таблицы ABI: ✅ `sys mem fs con time proc`; ⬜ `task cfg io dev inp gfx`
+5. Таблицы ABI: ✅ `sys mem fs con time proc task`; ⬜ `cfg io dev inp gfx`
 6. ⬜ SDK: `libargon` как библиотека, шаблон приложения; сборка `.AXE` ✅,
-   примеры `apps/hello`, `apps/spin`, `apps/leak` ✅
+   примеры `apps/hello`, `spin`, `leak`, `threads` ✅
 7. ✅ Команды `ps kill fg`, `run /b`; ✅ `run`, ✅ `recv` (приём файла как hex
    через консоль — как доставлять приложение на плату без картридера)
 8. ✅ **Разделение образа на две части** — код в арену D/IRAM, данные и bss в

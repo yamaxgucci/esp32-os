@@ -139,6 +139,72 @@ static inline bool ag_interrupted(void)
     return g_ag_api->proc->interrupted();
 }
 
+/* ---- threads ------------------------------------------------------------ */
+
+/*
+ * Threads belong to the process: whatever it has not tidied up is stopped when
+ * it ends.  They are FreeRTOS tasks, so they are preemptive and they cost a
+ * stack out of internal memory - the scarce kind.  Four per process.
+ */
+static inline ag_thread_t ag_thread_create(void (*fn)(void *), void *arg,
+                                           const char *name, size_t stack,
+                                           int priority, uint32_t flags)
+{
+    return g_ag_api->task->create(fn, arg, name, stack, priority, flags);
+}
+static inline ag_err_t ag_thread_join(ag_thread_t t, uint32_t timeout_ms)
+{
+    return g_ag_api->task->join(t, timeout_ms);
+}
+static inline void ag_thread_exit(void) { g_ag_api->task->exit(); }
+static inline void ag_yield(void) { g_ag_api->task->yield(); }
+
+static inline ag_mutex_t ag_mutex_create(void)
+{
+    return g_ag_api->task->mutex_create();
+}
+static inline void ag_mutex_delete(ag_mutex_t m)
+{
+    g_ag_api->task->mutex_delete(m);
+}
+static inline bool ag_mutex_lock(ag_mutex_t m, uint32_t timeout_ms)
+{
+    return g_ag_api->task->mutex_lock(m, timeout_ms);
+}
+static inline void ag_mutex_unlock(ag_mutex_t m)
+{
+    g_ag_api->task->mutex_unlock(m);
+}
+
+static inline ag_sem_t ag_sem_create(uint32_t initial, uint32_t max)
+{
+    return g_ag_api->task->sem_create(initial, max);
+}
+static inline void ag_sem_delete(ag_sem_t s) { g_ag_api->task->sem_delete(s); }
+static inline bool ag_sem_take(ag_sem_t s, uint32_t timeout_ms)
+{
+    return g_ag_api->task->sem_take(s, timeout_ms);
+}
+static inline void ag_sem_give(ag_sem_t s) { g_ag_api->task->sem_give(s); }
+
+static inline ag_queue_t ag_queue_create(uint32_t items, size_t item_size)
+{
+    return g_ag_api->task->queue_create(items, item_size);
+}
+static inline void ag_queue_delete(ag_queue_t q)
+{
+    g_ag_api->task->queue_delete(q);
+}
+static inline bool ag_queue_send(ag_queue_t q, const void *item,
+                                 uint32_t timeout_ms)
+{
+    return g_ag_api->task->queue_send(q, item, timeout_ms);
+}
+static inline bool ag_queue_recv(ag_queue_t q, void *item, uint32_t timeout_ms)
+{
+    return g_ag_api->task->queue_recv(q, item, timeout_ms);
+}
+
 /* ---- time --------------------------------------------------------------- */
 
 static inline ag_time_t ag_micros(void) { return g_ag_api->time->us(); }

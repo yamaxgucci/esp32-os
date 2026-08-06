@@ -96,12 +96,24 @@ static void stop_foreground(void)
 
     if (fg == AG_PID_KERNEL) {
         /*
-         * DOS would have rebooted here.  On a machine that is supposed to be
-         * running a process this is not a favour: a stray key would take the
-         * system down with everything it was doing.  Say so instead.
+         * The stop key is aimed at whatever is in front, and background work is
+         * deliberately not in front - a global key that reached into the
+         * background would stop things nobody was looking at.  So say which
+         * situation this is, because the two need different answers.
+         *
+         * And no reboot, which is what DOS did here: on a machine that is
+         * supposed to be running something, a stray keypress must not take the
+         * system down with everything it was doing.
          */
-        ag_log(AG_LOG_INFO, "supervisor",
-               "stop requested with nothing running; use reboot to restart");
+        if (ag_proc_count() > 0) {
+            ag_log(AG_LOG_INFO, "supervisor",
+                   "nothing in the foreground; %u process(es) in the "
+                   "background - stop one with kill <pid>, see ps",
+                   (unsigned)ag_proc_count());
+        } else {
+            ag_log(AG_LOG_INFO, "supervisor",
+                   "stop requested with nothing running; use reboot to restart");
+        }
         return;
     }
 
