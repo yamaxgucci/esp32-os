@@ -326,6 +326,17 @@ bool ag_console_read_event(ag_event_t *ev, uint32_t timeout_ms)
     return xQueueReceive(s_events, ev, ticks) == pdTRUE;
 }
 
+bool ag_console_peek_event(ag_event_t *ev)
+{
+    if (!s_ready) {
+        return false;
+    }
+
+    /* A caller that only wants the answer still needs somewhere for the copy. */
+    ag_event_t scratch;
+    return xQueuePeek(s_events, (ev != NULL) ? ev : &scratch, 0) == pdTRUE;
+}
+
 int32_t ag_console_getch(uint32_t timeout_ms)
 {
     const uint32_t deadline = now_ms() + timeout_ms;

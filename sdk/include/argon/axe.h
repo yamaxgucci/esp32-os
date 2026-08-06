@@ -16,10 +16,15 @@
  * leaves the loader with a copy, a pass over a list of offsets, and a jump.
  *
  * An image has two parts, because the memory they need is not the same memory.
- * Code and constants have to be executable; data and bss have to be writable,
- * and on this family most memory is one or the other.  Keeping them apart lets
- * the code sit in the small executable arena while the data - usually the part
- * that grows - lives in extended memory, megabytes of it.
+ * Code has to be executable; data and bss have to be writable, and on this
+ * family most memory is one or the other.  Keeping them apart lets the code sit
+ * in the small executable arena while the data - usually the part that grows -
+ * lives in extended memory, megabytes of it.
+ *
+ * Constants belong to the data part, not to the code: a font or a bitmap is read
+ * and never executed, so there is no reason for it to take up the arena.  The
+ * exception is .hot_rodata, which an application asks for by name when the read
+ * latency matters more than the space.
  *
  * The two parts are relocated by two independent biases, so a word holding an
  * address must say which part that address is in.  The offsets in the table are
@@ -32,10 +37,11 @@
  *   +-------------------------+ code.offset
  *   | code part               |
  *   |  (literals, text,       | code.file_size bytes
- *   |   rodata, app header)   |
+ *   |   hot_rodata, header)   |
  *   +-------------------------+ data.offset
  *   | data part               |
- *   |  (data - not bss)       | data.file_size bytes
+ *   |  (rodata and data -     | data.file_size bytes
+ *   |   not bss)              |
  *   +-------------------------+ reloc_offset
  *   | uint32 relocations      | reloc_count entries
  *   +-------------------------+
@@ -98,8 +104,8 @@ typedef struct {
     uint16_t header_size; /* so a newer tool can add fields               */
     uint32_t flags;       /* ag_axe_flags                                 */
 
-    ag_axe_part_t code; /* executable: literals, text, rodata            */
-    ag_axe_part_t data; /* writable: data and bss                        */
+    ag_axe_part_t code; /* executable: literals, text, hot constants      */
+    ag_axe_part_t data; /* writable: constants, data and bss             */
 
     /*
      * Addresses as linked.  The loader subtracts the base of whichever part
