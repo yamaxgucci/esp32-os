@@ -209,6 +209,46 @@ static void test_fixtures_are_present(void)
     free(b.data);
 }
 
+/* Whether a run of bytes appears anywhere in a block. */
+static bool contains(const uint8_t *where, uint32_t bytes, const char *what)
+{
+    const size_t n = strlen(what);
+    if (bytes < n) {
+        return false;
+    }
+    for (uint32_t i = 0; i + n <= bytes; i++) {
+        if (memcmp(where + i, what, n) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * Constants belong to the data part.  A font, a bitmap or a lookup table is read
+ * and never executed, and the code part is the arena - tens of kilobytes of the
+ * scarcest memory on the chip - while the data part is limited only by free
+ * PSRAM.  The fixture is built with no option asked for, so this is a test of
+ * what the build tool does by default.
+ *
+ * Read from the file rather than from a loaded image: where a constant ends up is
+ * decided at link time, and the point is that it never arrives in the arena at
+ * all.
+ */
+static void test_constants_live_in_the_data_part(void)
+{
+    blob_t a = load_file(FIXTURE_NOMINAL);
+    if (a.size == 0) {
+        return;
+    }
+    const ag_axe_header_t *h = header_of(&a);
+
+    AG_CHECK(contains(data_of(&a), h->data.file_size, "sample application"));
+    AG_CHECK(!contains(code_of(&a), h->code.file_size, "sample application"));
+
+    free(a.data);
+}
+
 static void test_validate(void)
 {
     blob_t a = load_file(FIXTURE_NOMINAL);
@@ -656,6 +696,7 @@ static void test_arch_names(void)
 void run_axeload_tests(void)
 {
     test_fixtures_are_present();
+    test_constants_live_in_the_data_part();
     test_validate();
     test_contiguous_validates();
     test_relocation_matches_a_direct_link();

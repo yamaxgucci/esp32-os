@@ -38,6 +38,26 @@ extern "C" {
         .author = (app_author),                                              \
     }
 
+/*
+ * Keeps one constant in the code part of the image, which is internal SRAM.
+ *
+ * Constants normally travel with the data, in PSRAM: a font or a bitmap is read,
+ * never executed, and the code arena is tens of kilobytes while PSRAM is
+ * megabytes.  Use this for the exception - a small table read in a tight loop,
+ * where the read latency matters more than the space it takes from the arena:
+ *
+ *     AG_HOT_RODATA const uint8_t k_gamma[256] = { ... };
+ *
+ * It says nothing in a built-in build: that code is already inside the kernel
+ * image, which has its own linker script and no .hot_rodata in it, and a section
+ * nobody places is a section the linker puts wherever it likes.
+ */
+#ifdef AG_BUILTIN
+#define AG_HOT_RODATA
+#else
+#define AG_HOT_RODATA __attribute__((used, section(".hot_rodata")))
+#endif
+
 /* ---- sys ---------------------------------------------------------------- */
 
 static inline void ag_exit(int code) { g_ag_api->sys->exit(code); }
