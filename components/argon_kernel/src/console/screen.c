@@ -529,19 +529,16 @@ static void ground_char(ag_screen_t *s, char ch)
     default:
         if ((unsigned char)ch >= 0x80) {
             /*
-             * A cell holds one byte, so a multi-byte code point cannot be
-             * stored as itself yet.  Storing one placeholder per code point
-             * at least keeps the column count honest, which storing each
-             * byte in its own cell would not.
+             * One byte, one cell, one character - the byte means whatever the
+             * active code page says it means, and the renderer converts it for
+             * whoever is watching.  Nothing here has to know: that is the whole
+             * reason the screen is bytes and not code points.
              *
-             * The real fix is a single-byte code page for the screen, CP437
-             * by default and CP866 for Cyrillic, the way DOS did it; see
-             * docs/04-roadmap.md.  Continuation bytes are skipped here, which
-             * also makes a code point split across two writes work.
+             * Text that arrives as UTF-8 therefore lands as two or three cells
+             * of code page characters, which is exactly what DOS did with a file
+             * in the wrong page.  `chcp` is the answer, not a decoder here.
              */
-            if (((unsigned char)ch & 0xc0u) != 0x80u) {
-                ag_screen_putc_raw(s, '?');
-            }
+            ag_screen_putc_raw(s, ch);
         } else if ((unsigned char)ch >= 0x20) {
             ag_screen_putc_raw(s, ch);
         }

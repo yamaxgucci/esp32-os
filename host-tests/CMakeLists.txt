@@ -22,6 +22,7 @@ set(ARGON_PORTABLE_SRCS
     "${ARGON_ROOT}/components/argon_kernel/src/core/path.c"
     "${ARGON_ROOT}/components/argon_kernel/src/core/cfg.c"
     "${ARGON_ROOT}/components/argon_kernel/src/core/cmdline.c"
+    "${ARGON_ROOT}/components/argon_kernel/src/console/codepage.c"
     "${ARGON_ROOT}/components/argon_kernel/src/console/screen.c"
     "${ARGON_ROOT}/components/argon_kernel/src/console/vtout.c"
     "${ARGON_ROOT}/components/argon_kernel/src/console/vtin.c"
@@ -55,6 +56,7 @@ add_executable(argon_tests
     test_reslist.c
     test_arena.c
     test_axeload.c
+    test_codepage.c
     ${ARGON_PORTABLE_SRCS})
 
 target_include_directories(argon_tests PRIVATE ${ARGON_INCLUDES})
@@ -68,6 +70,7 @@ target_compile_definitions(argon_tests PRIVATE
 # kernel's own screen module.
 add_executable(vtdump
     "${ARGON_ROOT}/tools/vtdump/vtdump.c"
+    "${ARGON_ROOT}/components/argon_kernel/src/console/codepage.c"
     "${ARGON_ROOT}/components/argon_kernel/src/console/screen.c")
 
 target_include_directories(vtdump PRIVATE ${ARGON_INCLUDES})

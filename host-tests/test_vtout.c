@@ -9,6 +9,8 @@
  */
 #include <argon/vtout.h>
 
+#include <argon/codepage.h>
+
 #include "test.h"
 
 static uint32_t g_mem[512];
@@ -295,8 +297,64 @@ static void test_control_characters_are_not_forwarded(void)
     AG_CHECK(strchr(g_cap, '\x07') == NULL);
 }
 
+/*
+ * The screen holds one code page byte per cell; a terminal speaks UTF-8.  The
+ * renderer is the place that converts, and the column arithmetic must keep
+ * counting cells while the byte count grows - a Cyrillic letter is two bytes on
+ * the wire and one column on the glass.
+ */
+static void test_high_bytes_go_out_as_utf8(void)
+{
+    ag_screen_t *s = screen8x2();
+    ag_vtout_init(&g_out);
+    ag_vtout_mark_all(&g_out);
+
+    ag_cp_set_active(AG_CP_866);
+    ag_screen_poke(s, 0, 0, (char)0xa4, AG_ATTR_DEFAULT); /* д */
+    ag_screen_poke(s, 1, 0, (char)0xa0, AG_ATTR_DEFAULT); /* а */
+    ag_screen_poke(s, 2, 0, (char)0xc4, AG_ATTR_DEFAULT); /* ─ */
+
+    cap_reset();
+    ag_vtout_flush(&g_out, s, cap_sink, NULL);
+
+    /* d0 b4, d0 b0, e2 94 80 - and then the row ends after three columns. */
+    AG_CHECK(strstr(g_cap, "\x1b[1;1H\xd0\xb4\xd0\xb0\xe2\x94\x80\x1b[K") !=
+             NULL);
+
+    /* The same bytes in CP437 are other characters entirely, which is the point
+     * of having a page at all: nothing was rewritten, only reinterpreted. */
+    ag_cp_set_active(AG_CP_437);
+    ag_vtout_mark_all(&g_out);
+    cap_reset();
+    ag_vtout_flush(&g_out, s, cap_sink, NULL);
+    AG_CHECK(strstr(g_cap, "\xd0\xb4") == NULL);
+    /* 0xc4 in CP437 is the same box character, so that one survives. */
+    AG_CHECK(strstr(g_cap, "\xe2\x94\x80") != NULL);
+}
+
+/* CP1251 leaves 0x98 undefined; an undefined byte must not become U+0000. */
+static void test_undefined_byte_renders_as_space(void)
+{
+    ag_screen_t *s = screen8x2();
+    ag_vtout_init(&g_out);
+    ag_vtout_mark_all(&g_out);
+
+    ag_cp_set_active(AG_CP_1251);
+    ag_screen_poke(s, 0, 0, (char)0x98, AG_ATTR_DEFAULT);
+    ag_screen_poke(s, 1, 0, 'Z', AG_ATTR_DEFAULT);
+
+    cap_reset();
+    ag_vtout_flush(&g_out, s, cap_sink, NULL);
+    AG_CHECK(strstr(g_cap, "\x1b[1;1H Z") != NULL);
+    AG_CHECK(strchr(g_cap, '\0') == g_cap + g_cap_len);
+
+    ag_cp_set_active(AG_CP_437);
+}
+
 void run_vtout_tests(void)
 {
+    test_high_bytes_go_out_as_utf8();
+    test_undefined_byte_renders_as_space();
     test_first_flush_paints_everything();
     test_incremental_update();
     test_nothing_to_do();

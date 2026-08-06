@@ -1,9 +1,11 @@
 /*
  * ArgonOS - command line editing.
  *
- * The buffer holds UTF-8, so the cursor moves by code point rather than by
- * byte: otherwise a left arrow through a Cyrillic word would land in the
- * middle of a character and backspace would leave half of one behind.
+ * The buffer holds one byte per character, in the machine's code page: the same
+ * bytes the screen holds and the same bytes a command receives as its arguments.
+ * A typed code point is converted here, at the edge, and a character the page
+ * cannot represent is not accepted at all - which is better than accepting it as
+ * two bytes that would then behave as two characters everywhere else.
  *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
  */
@@ -11,38 +13,23 @@
 
 #include <string.h>
 
-static inline bool is_continuation(char c)
-{
-    return ((unsigned char)c & 0xc0u) == 0x80u;
-}
+#include <argon/codepage.h>
 
 static inline bool is_word_char(char c)
 {
     return c != ' ' && c != '\t';
 }
 
+/* One byte is one character, so a step is a step. */
 static uint16_t step_left(const ag_lineedit_t *le, uint16_t pos)
 {
-    if (pos == 0) {
-        return 0;
-    }
-    pos--;
-    while (pos > 0 && is_continuation(le->buf[pos])) {
-        pos--;
-    }
-    return pos;
+    (void)le;
+    return (pos == 0) ? 0 : (uint16_t)(pos - 1);
 }
 
 static uint16_t step_right(const ag_lineedit_t *le, uint16_t pos)
 {
-    if (pos >= le->len) {
-        return le->len;
-    }
-    pos++;
-    while (pos < le->len && is_continuation(le->buf[pos])) {
-        pos++;
-    }
-    return pos;
+    return (pos >= le->len) ? le->len : (uint16_t)(pos + 1);
 }
 
 static uint16_t word_left(const ag_lineedit_t *le, uint16_t pos)
@@ -79,44 +66,23 @@ static void erase_range(ag_lineedit_t *le, uint16_t from, uint16_t to)
     le->cursor = from;
 }
 
-static uint8_t utf8_encode(uint32_t cp, char *out)
+/* False when the character does not fit, or the code page has no byte for it. */
+static bool insert(ag_lineedit_t *le, uint32_t codepoint)
 {
-    if (cp < 0x80u) {
-        out[0] = (char)cp;
-        return 1;
-    }
-    if (cp < 0x800u) {
-        out[0] = (char)(0xc0u | (cp >> 6));
-        out[1] = (char)(0x80u | (cp & 0x3fu));
-        return 2;
-    }
-    if (cp < 0x10000u) {
-        out[0] = (char)(0xe0u | (cp >> 12));
-        out[1] = (char)(0x80u | ((cp >> 6) & 0x3fu));
-        out[2] = (char)(0x80u | (cp & 0x3fu));
-        return 3;
-    }
-    out[0] = (char)(0xf0u | (cp >> 18));
-    out[1] = (char)(0x80u | ((cp >> 12) & 0x3fu));
-    out[2] = (char)(0x80u | ((cp >> 6) & 0x3fu));
-    out[3] = (char)(0x80u | (cp & 0x3fu));
-    return 4;
-}
+    const int32_t byte = ag_cp_from_unicode(ag_cp_active(), codepoint);
 
-static bool insert(ag_lineedit_t *le, uint32_t cp)
-{
-    char    encoded[4];
-    const uint8_t n = utf8_encode(cp, encoded);
-
-    if ((size_t)le->len + n + 1 > sizeof(le->buf)) {
+    if (byte < 0) {
+        return false;
+    }
+    if ((size_t)le->len + 2 > sizeof(le->buf)) {
         return false;
     }
 
-    memmove(le->buf + le->cursor + n, le->buf + le->cursor,
+    memmove(le->buf + le->cursor + 1, le->buf + le->cursor,
             (size_t)(le->len - le->cursor));
-    memcpy(le->buf + le->cursor, encoded, n);
-    le->len = (uint16_t)(le->len + n);
-    le->cursor = (uint16_t)(le->cursor + n);
+    le->buf[le->cursor] = (char)byte;
+    le->len = (uint16_t)(le->len + 1);
+    le->cursor = (uint16_t)(le->cursor + 1);
     le->buf[le->len] = '\0';
     return true;
 }

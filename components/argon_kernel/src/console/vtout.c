@@ -7,6 +7,8 @@
 
 #include <string.h>
 
+#include <argon/codepage.h>
+
 /*
  * The PC attribute byte orders colours blue-first, ANSI orders them red-first.
  * The permutation happens to be its own inverse, so the same table converts in
@@ -178,13 +180,38 @@ static void render_row(ag_vtout_t *o, const ag_screen_t *s, uint16_t y,
     emit_goto(e, 0, y);
     o->last_y = y;
 
+    const ag_cp_t cp = ag_cp_active();
+
     for (uint16_t x = 0; x < extent; x++) {
         if (row[x].attr != o->last_attr) {
             emit_attr(e, row[x].attr);
             o->last_attr = row[x].attr;
         }
+
         const unsigned char ch = (unsigned char)row[x].ch;
-        emit_char(e, (ch < 0x20 || ch == 0x7f) ? ' ' : row[x].ch);
+        if (ch < 0x20 || ch == 0x7f) {
+            /* DOS drew shapes down here; a terminal would obey them. */
+            emit_char(e, ' ');
+            continue;
+        }
+        if (ch < 0x80) {
+            emit_char(e, (char)ch);
+            continue;
+        }
+
+        /*
+         * Out here the byte is a code page character and the terminal speaks
+         * UTF-8, so it goes out as one to four bytes - and still occupies one
+         * column, which is why the column arithmetic above counts cells.
+         */
+        char           utf8[4];
+        const uint32_t u = ag_cp_to_unicode(cp, ch);
+        const size_t   n = (u != 0) ? ag_utf8_encode(u, utf8) : 0;
+        if (n > 0) {
+            emit(e, utf8, n);
+        } else {
+            emit_char(e, ' '); /* a byte this page does not define */
+        }
     }
 
     if (extent < cols) {

@@ -10,6 +10,7 @@ set(ARGON_KERNEL_SRCS
     "src/core/log.c"
     "src/core/reslist.c"
     "src/core/arena.c"
+    "src/console/codepage.c"
     "src/console/screen.c"
     "src/console/vtout.c"
     "src/console/vtin.c"

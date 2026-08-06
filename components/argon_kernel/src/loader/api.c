@@ -11,6 +11,7 @@
 #include <string.h>
 #include <time.h>
 
+#include <argon/codepage.h>
 #include <argon/console.h>
 #include <argon/kernel.h>
 #include <argon/loader.h>
@@ -280,6 +281,23 @@ static void api_fill(uint16_t x, uint16_t y, uint16_t w, uint16_t h, char ch,
     ag_console_unlock();
 }
 
+static uint16_t api_codepage(void) { return ag_cp_number(ag_cp_active()); }
+
+static ag_err_t api_set_codepage(uint16_t number)
+{
+    ag_cp_t chosen;
+    if (!ag_cp_from_number(number, &chosen)) {
+        return -AG_EINVAL;
+    }
+    ag_cp_set_active(chosen);
+
+    /* The bytes on the screen now mean other characters, so every row is stale. */
+    ag_console_lock();
+    ag_screen_mark_all_dirty(ag_console_screen());
+    ag_console_unlock();
+    return AG_OK;
+}
+
 static const ag_con_api_t k_con = {
     .size = sizeof(ag_con_api_t),
     .write = api_con_write,
@@ -296,6 +314,8 @@ static const ag_con_api_t k_con = {
     .info = api_coninfo,
     .poke = api_poke,
     .fill = api_fill,
+    .codepage = api_codepage,
+    .set_codepage = api_set_codepage,
 };
 
 /* ---------------------------------------------------------------------- */

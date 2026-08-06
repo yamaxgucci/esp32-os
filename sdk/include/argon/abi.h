@@ -32,9 +32,10 @@ extern "C" {
  * running, which is why the loader compares them rather than demanding a match.
  *
  * 0.2 added the proc and task subtables, and proc->interrupted with them.
+ * 0.3 added con->codepage and con->set_codepage at the end of the con subtable.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 2u
+#define AG_ABI_MINOR 3u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -296,6 +297,18 @@ typedef struct ag_con_api {
     void (*poke)(uint16_t x, uint16_t y, char ch, uint8_t attr);
     void (*fill)(uint16_t x, uint16_t y, uint16_t w, uint16_t h, char ch,
                  uint8_t attr);
+
+    /*
+     * The code page of the screen: 437, 866 or 1251.  A cell holds one byte, and
+     * this says what that byte means - an application that draws Cyrillic has to
+     * know which bytes to write, and one that ships its own box drawing has to
+     * know whether the page has any.
+     *
+     * set_codepage returns -AG_EINVAL for a number the system does not know, and
+     * changing the page does not rewrite what is already on the screen.
+     */
+    uint16_t (*codepage)(void);
+    ag_err_t (*set_codepage)(uint16_t number);
 } ag_con_api_t;
 
 /* ------------------------------------------------------------------------ */

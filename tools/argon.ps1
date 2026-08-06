@@ -24,6 +24,7 @@ ArgonOS
   argon run -tcp           run in QEMU, console on 127.0.0.1:5556
                            (connect with PuTTY in Raw mode)
   argon test [-Send ...]   automated boot test; prints the resulting screen
+  argon test -cp 866 ...   the same, when the screen is in another code page
   argon tests              host unit tests (needs a host C compiler)
   argon flash -port COM5   flash a real board and open the monitor
   argon monitor -port COM5 open the serial monitor on a real board
@@ -94,10 +95,18 @@ switch ($Command.ToLowerInvariant()) {
                     'logpath', 'put')
         $send = @()
         $opts = @{}
+        # -cp says which code page the screen bytes are in, for the dump only:
+        # the transcript is UTF-8 and vtdump has to convert it back to the bytes
+        # the guest's cells held, or a Cyrillic screen comes out as questions.
+        $codepage = 437
         for ($i = 0; $i -lt $Rest.Count; $i++) {
             if ($Rest[$i] -like '-*') {
                 $name = $Rest[$i].TrimStart('-')
-                if ($valued -contains $name.ToLowerInvariant() -and
+                if ($name.ToLowerInvariant() -eq 'cp' -and
+                    ($i + 1) -lt $Rest.Count) {
+                    $codepage = $Rest[$i + 1]
+                    $i++
+                } elseif ($valued -contains $name.ToLowerInvariant() -and
                     ($i + 1) -lt $Rest.Count) {
                     # Repeating an option collects its values, so that more than
                     # one file can be sent in a single run.
@@ -120,8 +129,13 @@ switch ($Command.ToLowerInvariant()) {
 
         Write-Host ''
         Write-Host '--- screen ---'
-        # vtdump reads the transcript on stdin; cmd does the redirection.
-        & cmd /c 'build-host\vtdump.exe < build\qemu-boot.log'
+        # vtdump reads the transcript on stdin; cmd does the redirection.  UTF-8
+        # out of this console as well, or the dump is mangled on the last step
+        # after being right on every earlier one.
+        $wasOut = [Console]::OutputEncoding
+        [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+        & cmd /c "build-host\vtdump.exe 80 25 $codepage < build\qemu-boot.log"
+        [Console]::OutputEncoding = $wasOut
         exit $bootStatus
     }
 
