@@ -11,6 +11,26 @@
 #include <argon/libc.h>
 
 /*
+ * The same source builds two ways.
+ *
+ * As an application it is an ordinary .AXE: AG_APP declares it, ag_main is its
+ * entry, and it reaches the system through the syscall table like anything else.
+ *
+ * With AG_BUILTIN it is part of the kernel image and reachable as the shell's fm
+ * command, so a board that boots has a file manager without anything having to be
+ * copied to it first.  Nothing about the code changes - it still goes through the
+ * same syscall table, which is the point: if the built-in works, the application
+ * works, and the ABI is being exercised rather than bypassed.
+ */
+#ifdef AG_BUILTIN
+#define FM_ENTRY ag_fm_main
+#else
+#define FM_ENTRY ag_main
+#endif
+
+int FM_ENTRY(int argc, char **argv);
+
+/*
  * Screen layout, 80x25.  Two panels side by side over four lines of chrome:
  *
  *   rows 0..20   panel boxes: border, 19 entries, border with the totals

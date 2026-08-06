@@ -78,7 +78,7 @@ argon flash -port COM5   прошить настоящую плату
 | RAM-диск `T:` | `src/fs/ramfs.c` | ✅ 1 МБ в PSRAM |
 | FAT на flash `C:` | `src/fs/idfvfs.c`, `storage.c` | ✅ |
 | FAT на SD `A:` | `storage.c` | ✅ SDMMC и SPI, `format a:` |
-| Шелл | `src/shell/` | ✅ история, перенаправление, 25 команд |
+| Шелл | `src/shell/` | ✅ история, перенаправление, 26 команд |
 | Загрузчик `.AXE` | `src/loader/`, `tools/mkaxe.py` | ✅ две части, см. ниже |
 | Арена кода | `src/core/arena.c` | ✅ несколько образов в 64 КБ |
 | Модель процессов | `src/proc/proc.c` | ✅ до 4 процессов, арена, cwd, учёт ресурсов |
@@ -87,7 +87,7 @@ argon flash -port COM5   прошить настоящую плату
 | Перехват исключений | `src/proc/fault.c` | ✅ падает приложение, а не система |
 | Ресурсный список | `src/core/reslist.c` | ✅ порядок по типам, ловит двойное free |
 | Примеры приложений | `apps/hello`, `spin`, `leak`, `threads`, `crash` | ✅ проверяют сами себя |
-| Файловый менеджер | `apps/fm/` | ✅ две панели, `F1`..`F10`, 11 КБ кода |
+| Файловый менеджер | `apps/fm/` | ✅ **команда `fm`, встроена в ОС**; тот же код собирается и как `.AXE` |
 | Таблица ABI | `src/loader/api.c` | ⚠ `sys mem fs con time proc task inp`, остальные `NULL` |
 
 Загрузка в QEMU: **109 мс с картой, 93 мс без**. Цель <400 мс.
@@ -173,37 +173,37 @@ argon test -Put "build\HELLO.AXE=t:\hello.axe" "run t:\hello.axe alpha"
 
 ## Как запустить файловый менеджер
 
-Собрать (из двух файлов, оба в один образ):
+Он **встроен в ОС** — это команда шелла, доставлять ничего не нужно:
 
 ```
-argon env
-python tools\mkaxe.py --arch xtensa --gcc xtensa-esp32s3-elf-gcc ^
-    --include sdk/include -o build\FM.AXE apps\fm\fm.c apps\fm\fmops.c
-```
-
-**Посмотреть, не входя в эмулятор** — обвязка сама доставит файл и напечатает
-экран; клавиши можно послать сырыми байтами:
-
-```
-argon test -Put 'build\FM.AXE=t:\fm.axe' 'run t:\fm.axe t: c:'
-argon test -Put 'build\FM.AXE=t:\fm.axe' 'run t:\fm.axe t: c:' '~\x1b[B' '~\x1bOP'
-```
-
-`~` — сырая посылка без Enter: `\x1b[B` это ↓, `\x1bOP` это F1, `\x0d` — Enter,
-`\x09` — Tab, `\x1b[21~` — F10.
-
-**Поработать руками.** Диск `C:` живёт в образе flash и переживает перезапуски
-эмулятора, поэтому доставить туда нужно один раз:
-
-```
-argon test -Put 'build\FM.AXE=c:\fm.axe' 'dir c:'
 argon run
 ```
 
-и в приглашении: `run c:\fm.axe c: t:`. После **пересборки прошивки** образ flash
-создаётся заново и `C:` форматируется — доставить придётся снова.
+и в приглашении:
 
-На настоящей плате проще: файл кладётся на SD-карту с ПК, и `run a:\fm.axe`.
+```
+fm            обе панели в текущем каталоге
+fm t: c:      левая на RAM-диске, правая на flash
+```
+
+`F10` или `Esc` — выход, `F1` — все клавиши.
+
+Тот же код собирается и как обычное приложение `.AXE` — это способ проверить, что
+встроенное и загруженное ходят через одну и ту же таблицу ABI, а не мимо неё:
+
+```
+python tools\mkaxe.py --arch xtensa --gcc xtensa-esp32s3-elf-gcc ^
+    --include sdk/include -o build\FM.AXE apps\fm\fm.c apps\fm\fmops.c
+argon test -Put 'build\FM.AXE=t:\fm.axe' 'run t:\fm.axe t: c:'
+```
+
+Проверять из скриптов удобно так — клавиши посылаются сырыми байтами с префиксом
+`~`: `\x1b[B` это ↓, `\x1bOP` это F1, `\x0d` — Enter, `\x09` — Tab,
+`\x1b[21~` — F10:
+
+```
+argon test 'fm t: c:' '~\x1b[B' '~\x1bOP'
+```
 
 **Одинарные кавычки в PowerShell не случайны:** аргумент, кончающийся на `\`,
 в двойных кавычках съедает закрывающую кавычку, и следующие аргументы

@@ -30,6 +30,14 @@ extern "C" {
 
 /* ---- what the compiler emits ------------------------------------------- */
 
+/*
+ * Left out where a real C library is present - the kernel builds the file
+ * manager into itself, and there these would shadow newlib's own, which are
+ * better than these and live in the right kind of memory.  An application
+ * defines nothing and gets them.
+ */
+#ifndef AG_HAVE_LIBC
+
 __attribute__((weak)) void *memcpy(void *dst, const void *src, size_t n)
 {
     unsigned char       *d = (unsigned char *)dst;
@@ -105,6 +113,10 @@ __attribute__((weak)) size_t strlen(const char *s)
     }
     return (size_t)(p - s);
 }
+
+#else /* AG_HAVE_LIBC */
+#include <string.h>
+#endif
 
 /* ---- bounded string handling ------------------------------------------- */
 

@@ -7,7 +7,10 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 CONFIG_FREERTOS_HZ=1000
 
 # The kernel runs from app_main; give it room for the boot sequence.
-CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+# The shell runs on the main task, and so does the built-in file manager, whose
+# deepest paths carry a couple of full paths and a copy buffer on the stack.
+# 4 KB more out of 256 is a cheap way not to find that out from a reboot.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=12288
 CONFIG_ESP_MAIN_TASK_AFFINITY_CPU0=y
 
 # Speed over size: ArgonOS exists to get out of the application's way.
