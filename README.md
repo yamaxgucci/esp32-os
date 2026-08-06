@@ -19,15 +19,29 @@ applications built with `tools/mkaxe.py` as processes: a task and a core of
 their own, threads if they want them, an arena they allocate from, and full
 accounting - a hung application can be stopped from the keyboard, one that
 dereferences a null pointer is stopped by itself with the offset in its own code
-written down, and every byte of either comes back. What is still missing from
-that picture is a per-process watchdog and crash records on disk. And without an
-MMU a wild pointer can still corrupt memory that is not the application's; that
-is a deliberate trade, not an oversight.
+written down, one that promises a heartbeat and stops sending it is ended by its
+own watchdog, and every byte of any of them comes back. Crash records survive the
+reboot on disk. Without an MMU a wild pointer can still corrupt memory that is
+not the application's; that is a deliberate trade, not an oversight.
+
+What is missing is the hardware half: no display driver, no USB keyboard, no
+device model, no networking. An application's *code* is also still bounded by the
+64 KB executable arena - its data and constants are not, they live in PSRAM and
+run to megabytes.
 
 Start with **[docs/05-status.md](docs/05-status.md)**: what works, what does not,
 how to build and verify, and the traps already found. Then
 [docs/00-architecture.md](docs/00-architecture.md) for why the design is what it
 is, and [docs/04-roadmap.md](docs/04-roadmap.md) for what comes next.
+
+Writing an application? **[docs/sdk/01-getting-started.md](docs/sdk/01-getting-started.md)**
+goes from an empty file to a running program; the rest of the contract is in
+[02-api-reference.md](docs/sdk/02-api-reference.md),
+[03-application-anatomy.md](docs/sdk/03-application-anatomy.md) and
+[04-axe-format.md](docs/sdk/04-axe-format.md). Using the machine rather than
+programming it: [docs/user/01-shell.md](docs/user/01-shell.md) and
+[docs/user/02-board-setup.md](docs/user/02-board-setup.md). The SDK docs are in
+Russian, like the rest of the design notes.
 
 No ESP32 board is required to work on this — see the note at the end of this
 file.
@@ -49,8 +63,10 @@ file.
 ```
 
 * **Applications** are relocatable native images in two parts: code into the
-  executable arena in internal SRAM, data and bss into PSRAM. No interpreter, no
-  JIT, no sandbox — native speed after load.
+  executable arena in internal SRAM, constants and data into PSRAM. No
+  interpreter, no JIT, no sandbox — native speed after load. A font or a bitmap
+  costs PSRAM, not arena: measured at 212 bytes of arena for an application whose
+  96 KB font would otherwise not have fit at all.
 * **A file manager** is part of the system, not a program to copy onto the board
   first: type `fm`. Two panels, the ten function keys everyone already knows, and
   it starts other programs and gets the screen back afterwards. The same source
@@ -85,6 +101,14 @@ argon flash -port COM5   flash a real board and open the monitor
 
 `argon` is a batch file rather than a PowerShell script so that it works on a
 stock Windows install, where running `.ps1` files is disabled by default.
+
+An application is built by the SDK's image tool rather than by the firmware
+build, because it is a separate binary with its own link layout:
+
+```
+python tools/mkaxe.py --arch xtensa --gcc xtensa-esp32s3-elf-gcc \
+    --include sdk/include -o HELLO.AXE apps/hello/hello.c
+```
 
 Machine specific paths (where ESP-IDF and a host compiler live) go in
 `tools\local-env.ps1`, which is not committed; `tools\idf-env.ps1` guesses the

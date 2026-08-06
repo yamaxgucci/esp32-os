@@ -6,7 +6,9 @@ menu "ArgonOS"
         default 64
         help
             Executable RAM reserved at link time for the code part of a running
-            application: literals, instructions and constants.
+            application: literals, instructions, and any constant the image
+            asked to keep here with AG_HOT_RODATA.  Ordinary constants travel
+            with the data, in extended memory, and do not come out of this.
 
             It has to be reserved rather than allocated because ESP-IDF hands
             none of the memory that is both executable and writable through one

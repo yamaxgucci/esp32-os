@@ -198,14 +198,19 @@ static int32_t api_getch(void)
     return ag_console_getch(UINT32_MAX);
 }
 
+/*
+ * Looks without taking: the idiom this exists for is `if (kbhit()) getch()`, and
+ * a version that consumed the event would throw away the key it reported.  It
+ * answers "something is waiting", not "how many" - and an event carrying no
+ * character counts as something, because deciding that here would mean taking
+ * the event to look at it.
+ */
 static int32_t api_kbhit(void)
 {
     if (!has_the_keyboard()) {
         return 0;
     }
-    ag_event_t ev;
-    /* Peeking without consuming needs a queue this console does not have yet. */
-    return ag_console_read_event(&ev, 0) ? 1 : 0;
+    return ag_console_peek_event(NULL) ? 1 : 0;
 }
 
 static int32_t api_readline(char *buf, size_t len)

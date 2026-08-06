@@ -22,8 +22,29 @@ extern "C" {
  *
  *     AG_APP("HELLO", "1.0", "you", 0);
  *     int ag_main(int argc, char **argv) { ag_print("hi\n"); return 0; }
+ *
+ * Zero for the stack and the heap means "whatever the system gives" - which is
+ * the right answer for almost everything, and the reason this is the short form.
  */
 #define AG_APP(app_name, app_version, app_author, app_flags)                 \
+    AG_APP_SIZED(app_name, app_version, app_author, app_flags, 0, 0)
+
+/*
+ * The same, for an application that knows how much stack or arena its own work
+ * needs.  Both in bytes, either may be 0 to take the default.
+ *
+ *     AG_APP_SIZED("DEEP", "1.0", "you", 0, 32 * 1024, 4 * 1024 * 1024);
+ *
+ * Asking is not the same as taking the default: a size named here is required,
+ * and the application is refused at startup if it cannot be had.  A default the
+ * system cannot meet is quietly reduced instead.  So name a size when running
+ * with less would fail anyway, and stay silent otherwise.
+ *
+ * The stack is clamped to 2..64 KB and comes out of internal SRAM for as long as
+ * the process lives; the arena comes from extended memory.
+ */
+#define AG_APP_SIZED(app_name, app_version, app_author, app_flags,           \
+                     app_stack, app_heap)                                    \
     const ag_api_t *g_ag_api = NULL;                                         \
     __attribute__((used, section(".ag_header")))                             \
     const ag_app_header_t __ag_app_header = {                                \
@@ -31,8 +52,8 @@ extern "C" {
         .abi_major = AG_ABI_MAJOR,                                           \
         .abi_minor = AG_ABI_MINOR,                                           \
         .flags = (app_flags),                                                \
-        .stack_size = 0,                                                     \
-        .heap_size = 0,                                                      \
+        .stack_size = (app_stack),                                           \
+        .heap_size = (app_heap),                                             \
         .name = (app_name),                                                  \
         .version = (app_version),                                            \
         .author = (app_author),                                              \

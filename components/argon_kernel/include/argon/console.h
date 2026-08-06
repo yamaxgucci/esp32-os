@@ -57,8 +57,16 @@ void ag_console_puts(const char *s);
 int  ag_console_printf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 int  ag_console_vprintf(const char *fmt, va_list ap);
 
-/* Blocks up to timeout_ms; UINT32_MAX waits forever. */
+/* Blocks up to timeout_ms; UINT32_MAX waits forever.  Takes the event. */
 bool ag_console_read_event(ag_event_t *ev, uint32_t timeout_ms);
+
+/*
+ * Whether an event is waiting, without taking it - which is the whole point:
+ * `if (kbhit()) c = getch();` is the oldest idiom there is, and a look that
+ * consumed the event would make it lose the key it just saw.  `ev` may be NULL
+ * when only the answer is wanted.
+ */
+bool ag_console_peek_event(ag_event_t *ev);
 
 /* Returns a character, or < 0 on timeout.  Keys with no character are skipped. */
 int32_t ag_console_getch(uint32_t timeout_ms);
