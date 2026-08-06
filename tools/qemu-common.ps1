@@ -13,16 +13,29 @@ function Resolve-Qemu {
     return $exe.FullName
 }
 
-# Rebuilds build\qemu_flash.bin when the application binary is newer.
+# Rebuilds build\qemu_flash.bin when it does not match the current firmware.
+#
+# The freshness check is a recorded stamp rather than a comparison of file times,
+# because the emulator writes to the flash image itself - the FAT on C: lives in
+# there - so after any run the image looks newer than the firmware it was built
+# from.  Comparing times then silently keeps testing the previous build, which is
+# the worst kind of test result: a passing one, of the wrong thing.
+#
+# The image is kept rather than regenerated every time on purpose: C: is formatted
+# on first boot, and throwing it away would add half a second to every boot and
+# change the numbers the boot report is measured against.
 function Update-FlashImage {
     $app = 'build\argonos.bin'
     $flash = 'build\qemu_flash.bin'
+    $stamp = 'build\qemu_flash.stamp'
 
     if (-not (Test-Path $app)) {
         throw "$app not found. Run idf.py build first."
     }
-    if ((Test-Path $flash) -and
-        (Get-Item $flash).LastWriteTime -ge (Get-Item $app).LastWriteTime) {
+
+    $want = "$((Get-Item $app).LastWriteTimeUtc.Ticks):$((Get-Item $app).Length)"
+    if ((Test-Path $flash) -and (Test-Path $stamp) -and
+        (Get-Content $stamp -Raw).Trim() -eq $want) {
         return
     }
 
@@ -39,6 +52,8 @@ function Update-FlashImage {
         0x8000 build\partition_table\partition-table.bin `
         0x10000 $app | Out-Null
     if (-not $?) { throw 'esptool merge_bin failed.' }
+
+    Set-Content -Path $stamp -Value $want -Encoding ascii
 }
 
 function Initialize-EfuseFile {

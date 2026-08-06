@@ -71,6 +71,7 @@ typedef struct {
 
     ag_time_t started;
     uint32_t  heartbeat_ms;
+    uint32_t  watchdog_ms; /* 0 = not watched, which is the default          */
     uint32_t  stack_bytes;
     uint32_t  stack_unused;
 

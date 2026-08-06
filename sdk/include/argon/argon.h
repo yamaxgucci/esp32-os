@@ -139,6 +139,13 @@ static inline bool ag_interrupted(void)
     return g_ag_api->proc->interrupted();
 }
 
+/*
+ * Promises to call ag_heartbeat() at least every `ms`; the system stops this
+ * process if it does not.  0 disarms.  Only arm it if the promise is true - a
+ * long wait for input counts as not reporting.
+ */
+static inline void ag_watchdog(uint32_t ms) { g_ag_api->proc->watchdog(ms); }
+
 /* ---- threads ------------------------------------------------------------ */
 
 /*

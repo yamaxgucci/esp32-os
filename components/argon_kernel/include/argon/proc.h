@@ -111,6 +111,28 @@ bool ag_proc_interrupted(void);
 void ag_proc_heartbeat(void);
 
 /*
+ * Arms or disarms the calling process's deadline: it promises a heartbeat every
+ * `ms`.  0 disarms, and is the default - a deadline nobody asked for would be
+ * wrong for every application that legitimately waits.
+ */
+void ag_proc_watchdog(uint32_t ms);
+
+/*
+ * The first process that has missed its deadline, or AG_PID_KERNEL when none
+ * has.  `late_by_ms` receives how long ago it should have reported.  The
+ * supervisor asks; ending it is the supervisor's job, not this one's.
+ */
+ag_pid_t ag_proc_overdue(uint32_t *late_by_ms);
+
+/*
+ * Takes the last crash record, if one is waiting, and clears it.  The record is
+ * formatted where the crash happened - which may be a task that is about to stop
+ * existing, or one whose stack is nearly gone - and written to disk by the
+ * supervisor, which is neither.  Returns false when there is nothing waiting.
+ */
+bool ag_proc_take_crash_record(char *out, size_t len);
+
+/*
  * The threads-and-synchronisation subtable of the ABI, defined by the process
  * layer because everything in it belongs to a process.  A constant, so the
  * syscall table can point at it without a call at start-up.

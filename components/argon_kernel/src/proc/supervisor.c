@@ -13,10 +13,15 @@
  */
 #include "proc/supervisor.h"
 
+#include <stdio.h>
+#include <string.h>
+
 #include <argon/console.h>
+#include <argon/journal.h>
 #include <argon/keys.h>
 #include <argon/log.h>
 #include <argon/proc.h>
+#include <argon/vfs.h>
 
 #include "proc/proc_internal.h"
 
@@ -29,7 +34,13 @@
  * immediately; low enough not to interfere with drivers.
  */
 #define AG_SUP_PRIORITY 15
-#define AG_SUP_STACK 3072
+
+/*
+ * 4 KB: the deepest thing it does is write a crash record, which is a filesystem
+ * call with a line buffer on this stack.  A supervisor that overflows its own
+ * stack while reporting somebody else's failure would be a poor joke.
+ */
+#define AG_SUP_STACK 4096
 
 /* Nothing needs doing most of the time; a wake-up also collects zombies. */
 #define AG_SUP_TICK_MS 250
@@ -144,6 +155,75 @@ static void interrupt_foreground(void)
     }
 }
 
+/*
+ * The crash record on disk.  Written here rather than where the crash happened:
+ * that task may be one instruction from ceasing to exist, or short of stack, and
+ * writing to a filesystem is not the thing to attempt in either state.
+ *
+ * The journal tail goes in with it, because the useful part of a post-mortem is
+ * usually not the fault itself but what the application was saying just before.
+ */
+#define AG_CRASH_PATH "/sys/crash.log"
+#define AG_CRASH_KEEP_BYTES (32u * 1024u)
+#define AG_CRASH_TAIL_LINES 20
+
+static void write_crash_record(void)
+{
+    char text[512];
+
+    if (!ag_proc_take_crash_record(text, sizeof(text))) {
+        return;
+    }
+
+    /*
+     * Bounded rather than rotated: a system that crashes often must not fill its
+     * own filesystem, and the recent records are the ones anybody reads.
+     */
+    uint32_t  flags = AG_O_WRONLY | AG_O_CREATE;
+    ag_stat_t st;
+    if (ag_vfs_stat(AG_CRASH_PATH, NULL, &st) == AG_OK &&
+        st.size > AG_CRASH_KEEP_BYTES) {
+        flags |= AG_O_TRUNC;
+    }
+
+    const ag_handle_t h = ag_vfs_open(AG_CRASH_PATH, NULL, flags);
+    if (h < 0) {
+        ag_log(AG_LOG_WARN, "supervisor", "no crash record on disk: %s is %d",
+               AG_CRASH_PATH, (int)h);
+        return;
+    }
+    (void)ag_vfs_seek(h, 0, AG_SEEK_END);
+
+    (void)ag_vfs_write(h, "\n--- crash ---\n", 15);
+    (void)ag_vfs_write(h, text, strlen(text));
+    (void)ag_vfs_write(h, "journal:\n", 9);
+
+    const ag_journal_t *journal = ag_log_journal();
+    const uint32_t      held = ag_journal_count(journal);
+    const uint32_t      skip =
+        (held > AG_CRASH_TAIL_LINES) ? (held - AG_CRASH_TAIL_LINES) : 0;
+
+    ag_journal_iter_t it;
+    ag_journal_begin(journal, &it);
+
+    char     line[AG_JOURNAL_LINE_MAX];
+    uint32_t index = 0;
+    while (ag_journal_next(journal, &it, line, sizeof(line))) {
+        if (index++ < skip) {
+            continue;
+        }
+        (void)ag_vfs_write(h, "  ", 2);
+        (void)ag_vfs_write(h, line, strlen(line));
+        (void)ag_vfs_write(h, "\n", 1);
+    }
+
+    (void)ag_vfs_sync(h);
+    (void)ag_vfs_close(h);
+
+    ag_log(AG_LOG_INFO, "supervisor", "crash record appended to %s",
+           AG_CRASH_PATH);
+}
+
 static void supervisor_task(void *arg)
 {
     (void)arg;
@@ -171,7 +251,25 @@ static void supervisor_task(void *arg)
             (void)ag_proc_kill(victim, "a thread of it faulted");
         }
 
+        /*
+         * A process that promised to report progress and stopped.  Checked here
+         * rather than by a timer, because this task is the one that is certain to
+         * be scheduled while an application is spinning on the other core.
+         */
+        uint32_t       late = 0;
+        const ag_pid_t hung = ag_proc_overdue(&late);
+        if (hung != AG_PID_KERNEL) {
+            char reason[64];
+            snprintf(reason, sizeof(reason), "no heartbeat, %u ms past its own "
+                                             "deadline",
+                     (unsigned)late);
+            (void)ag_proc_kill(hung, reason);
+        }
+
         (void)ag_proc_reap_finished();
+
+        /* Last, so that the journal tail it writes includes everything above. */
+        write_crash_record();
     }
 }
 

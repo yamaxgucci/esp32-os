@@ -511,6 +511,7 @@ static const ag_proc_api_t k_proc = {
     .getenv = NULL, /* no environment yet */
     .setenv = NULL,
     .interrupted = ag_proc_interrupted,
+    .watchdog = ag_proc_watchdog,
 };
 
 /* ---------------------------------------------------------------------- */
