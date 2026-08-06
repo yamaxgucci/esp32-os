@@ -142,15 +142,16 @@ try {
             $was = $seen
             Send-Line "recv $guest"
 
-            # 32 bytes a line, and the line editor echoes every one of them, so
-            # the reader is pumped as we go: filling the input queue faster than
-            # the guest drains it is how input gets dropped.
-            for ($at = 0; $at -lt $bytes.Length; $at += 32) {
-                $take = [Math]::Min(32, $bytes.Length - $at)
+            # 64 bytes a line - 128 hex characters, which is what the line
+            # editor's buffer holds with room to spare - and the reader is pumped
+            # as we go, since the guest echoes every character back: filling the
+            # input queue faster than it drains is how input gets dropped.
+            for ($at = 0; $at -lt $bytes.Length; $at += 64) {
+                $take = [Math]::Min(64, $bytes.Length - $at)
                 $hex = -join (0..($take - 1) | ForEach-Object {
                     $bytes[$at + $_].ToString('x2') })
                 Send-Line $hex
-                Start-Sleep -Milliseconds 20
+                Start-Sleep -Milliseconds 12
                 [void](Read-Available)
             }
 

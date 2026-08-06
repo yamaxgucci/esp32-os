@@ -194,6 +194,14 @@ enum ag_file_attr {
     AG_A_SYSTEM = 1u << 3,
 };
 
+/*
+ * How long a path and a name can be.  Part of the contract rather than a kernel
+ * detail: an application that calls getcwd has to size a buffer, and guessing is
+ * how buffers get overrun.
+ */
+#define AG_PATH_MAX 256
+#define AG_NAME_MAX 64
+
 typedef struct {
     uint64_t size;
     uint64_t mtime; /* unix seconds, 0 when unknown                         */

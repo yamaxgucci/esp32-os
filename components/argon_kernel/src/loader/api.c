@@ -461,6 +461,42 @@ static const ag_time_api_t k_time = {
 };
 
 /* ---------------------------------------------------------------------- */
+/* inp                                                                    */
+/* ---------------------------------------------------------------------- */
+
+/*
+ * Whole events, for applications that need more than characters: arrow keys,
+ * function keys and modifiers have no character to report, so con->getch cannot
+ * carry them.  Anything that draws its own screen - a file manager, an editor -
+ * needs this rather than that.
+ */
+static bool api_inp_poll(ag_event_t *out, uint32_t timeout_ms)
+{
+    if (!has_the_keyboard()) {
+        return false;
+    }
+    return ag_console_read_event(out, timeout_ms);
+}
+
+static void api_inp_flush(void) { ag_console_flush_input(); }
+
+static uint16_t api_inp_mods(void) { return ag_console_mods(); }
+
+static const ag_inp_api_t k_inp = {
+    .size = sizeof(ag_inp_api_t),
+    .poll = api_inp_poll,
+    .flush = api_inp_flush,
+    /*
+     * NULL, and honestly so: whether a key is held down right now is not
+     * something a terminal reports - it sends a press and says nothing more.
+     * AG_HAS(inp, key_pressed) is how an application asks; it becomes available
+     * with the USB keyboard.
+     */
+    .key_pressed = NULL,
+    .mods = api_inp_mods,
+};
+
+/* ---------------------------------------------------------------------- */
 /* proc                                                                   */
 /* ---------------------------------------------------------------------- */
 
@@ -529,7 +565,7 @@ static const ag_api_t k_api = {
     .mem = &k_mem,
     .fs = &k_fs,
     .con = &k_con,
-    .inp = NULL,
+    .inp = &k_inp,
     .gfx = NULL,
     .dev = NULL,
     .io = NULL,

@@ -89,6 +89,17 @@ void *ag_console_lock_holder(void);
 /* Pushes pending output to every endpoint now instead of at the next tick. */
 void ag_console_sync(void);
 
+/* Throws away input that has arrived but not been read. */
+void ag_console_flush_input(void);
+
+/*
+ * The modifiers of the last key seen.  A terminal reports them with the key and
+ * says nothing in between, so this is "what was held when something was last
+ * pressed" rather than "what is held now" - the second question has no answer
+ * over a serial line, and will have one when a USB keyboard arrives.
+ */
+uint16_t ag_console_mods(void);
+
 /*
  * A look at every input event before it is queued for whoever is reading.
  * Returning true means the event has been dealt with and must not be delivered;
