@@ -18,6 +18,8 @@ void run_lineedit_tests(void);
 void run_vfs_tests(void);
 void run_journal_tests(void);
 void run_axeload_tests(void);
+void run_reslist_tests(void);
+void run_arena_tests(void);
 
 int main(void)
 {
@@ -31,6 +33,8 @@ int main(void)
     run_vfs_tests();
     run_journal_tests();
     run_axeload_tests();
+    run_reslist_tests();
+    run_arena_tests();
 
     printf("%d checks, %d failures\n", ag_test_checks, ag_test_failures);
     return ag_test_failures == 0 ? 0 : 1;

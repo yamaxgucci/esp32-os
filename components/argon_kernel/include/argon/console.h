@@ -78,8 +78,28 @@ ag_screen_t *ag_console_screen(void);
 void         ag_console_lock(void);
 void         ag_console_unlock(void);
 
+/*
+ * Which task holds the console lock right now, as a FreeRTOS task handle, or
+ * NULL.  The supervisor asks before it deletes a task: deleting the holder of
+ * this lock leaves it locked forever, which trades a hung application for a
+ * hung console - and the console is how anyone would find out.
+ */
+void *ag_console_lock_holder(void);
+
 /* Pushes pending output to every endpoint now instead of at the next tick. */
 void ag_console_sync(void);
+
+/*
+ * A look at every input event before it is queued for whoever is reading.
+ * Returning true means the event has been dealt with and must not be delivered;
+ * the event may also be rewritten in place and let through, which is how Ctrl+C
+ * becomes AG_EV_QUIT for the process it was aimed at.
+ *
+ * The supervisor installs this.  A key that stops a runaway application has to
+ * be seen when nobody is reading the keyboard - which is precisely the situation
+ * it exists for - so it cannot be handled by whoever happens to call getch.
+ */
+void ag_console_set_hotkeys(bool (*fn)(ag_event_t *ev));
 
 /*
  * Input events lost to a full queue.  Should be zero: the console reads only

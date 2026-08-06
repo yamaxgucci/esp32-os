@@ -345,10 +345,34 @@ static bool ground_byte(ag_vtin_t *in, uint8_t b, ag_event_t *ev)
         break;
     }
 
-    if (b < 0x20) {
-        /* Ctrl + letter. */
+    if (b >= 0x01 && b <= 0x1a) {
+        /* Ctrl + letter, and only letter: the formula stops at Ctrl+Z. */
         ev_key(ev, (uint16_t)(AG_KEY_A + (b - 1)), 0, AG_MOD_CTRL);
         return true;
+    }
+
+    /*
+     * The four control codes above Ctrl+Z are Ctrl with a punctuation key, and
+     * they are worth naming correctly rather than reporting as a letter that was
+     * never pressed.  Ctrl+\ in particular is the only thing a plain terminal can
+     * send that the supervisor treats as "stop this now" - a terminal has no way
+     * to send Ctrl-Alt-Del.
+     */
+    switch (b) {
+    case 0x1c:
+        ev_key(ev, AG_KEY_BACKSLASH, 0, AG_MOD_CTRL);
+        return true;
+    case 0x1d:
+        ev_key(ev, AG_KEY_RBRACKET, 0, AG_MOD_CTRL);
+        return true;
+    case 0x1e:
+        ev_key(ev, AG_KEY_6, 0, AG_MOD_CTRL | AG_MOD_SHIFT);
+        return true;
+    case 0x1f:
+        ev_key(ev, AG_KEY_MINUS, 0, AG_MOD_CTRL | AG_MOD_SHIFT);
+        return true;
+    default:
+        break;
     }
 
     if (b < 0x7f) {

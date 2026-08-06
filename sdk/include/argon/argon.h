@@ -110,6 +110,35 @@ static inline ag_err_t ag_stat(const char *p, ag_stat_t *o)
     return g_ag_api->fs->stat(p, o);
 }
 
+/* ---- processes ---------------------------------------------------------- */
+
+/* Runs another application and waits for it; returns its exit code. */
+static inline int32_t ag_exec(const char *path, int argc, const char **argv)
+{
+    return g_ag_api->proc->exec(path, argc, argv);
+}
+static inline ag_pid_t ag_spawn(const char *path, int argc, const char **argv,
+                                uint32_t flags)
+{
+    return g_ag_api->proc->spawn(path, argc, argv, flags);
+}
+static inline ag_err_t ag_wait(ag_pid_t pid, int32_t *code, uint32_t timeout_ms)
+{
+    return g_ag_api->proc->wait(pid, code, timeout_ms);
+}
+static inline ag_err_t ag_kill(ag_pid_t pid) { return g_ag_api->proc->kill(pid); }
+static inline ag_pid_t ag_getpid(void) { return g_ag_api->proc->self(); }
+
+/*
+ * True once when the system has asked this process to stop.  Check it in long
+ * loops: an application that does can be asked to stop and tidy up, one that
+ * does not has to be killed.
+ */
+static inline bool ag_interrupted(void)
+{
+    return g_ag_api->proc->interrupted();
+}
+
 /* ---- time --------------------------------------------------------------- */
 
 static inline ag_time_t ag_micros(void) { return g_ag_api->time->us(); }

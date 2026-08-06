@@ -29,6 +29,7 @@
 #include "console/uart_console.h"
 #include "core/sysconfig.h"
 #include "fs/storage.h"
+#include "proc/supervisor.h"
 
 #define AG_CONSOLE_COLS 80
 #define AG_CONSOLE_ROWS 25
@@ -149,7 +150,7 @@ static const ag_stage_desc_t s_stages[AG_STAGE_COUNT] = {
     [AG_STAGE_DEVICES]    = {"devices",    NULL,           false},
     [AG_STAGE_MEDIA]      = {"media",      ag_storage_mount_media, false},
     [AG_STAGE_MODULES]    = {"modules",    NULL,           false},
-    [AG_STAGE_SUPERVISOR] = {"supervisor", NULL,           false},
+    [AG_STAGE_SUPERVISOR] = {"supervisor", ag_supervisor_init, false},
     [AG_STAGE_SHELL]      = {"shell",      stage_shell,    true},
 };
 
