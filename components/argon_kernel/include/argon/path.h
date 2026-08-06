@@ -24,8 +24,8 @@
 extern "C" {
 #endif
 
-#define AG_PATH_MAX 256
-#define AG_NAME_MAX 64
+/* AG_PATH_MAX and AG_NAME_MAX are in argon/abi.h: applications size buffers by
+ * them too, so they belong to the contract rather than to the kernel. */
 
 /*
  * Drive letter aliases, DOS style.  The table is fixed at build time and

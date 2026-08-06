@@ -83,6 +83,23 @@ static inline int32_t ag_readline(char *b, size_t n)
 {
     return g_ag_api->con->readline(b, n);
 }
+static inline void ag_cursor(bool visible) { g_ag_api->con->set_cursor(visible); }
+static inline void ag_coninfo(ag_coninfo_t *o) { g_ag_api->con->info(o); }
+
+/*
+ * Straight into a cell of the screen, without moving the cursor and without any
+ * chance of scrolling - which is what drawing a frame or a panel needs, and why
+ * writing to the bottom right corner with ag_print is a mistake.
+ */
+static inline void ag_poke(uint16_t x, uint16_t y, char ch, uint8_t attr)
+{
+    g_ag_api->con->poke(x, y, ch, attr);
+}
+static inline void ag_fill(uint16_t x, uint16_t y, uint16_t w, uint16_t h,
+                           char ch, uint8_t attr)
+{
+    g_ag_api->con->fill(x, y, w, h, ch, attr);
+}
 
 #define ag_printf(...) (g_ag_api->con->printf(__VA_ARGS__))
 
@@ -108,6 +125,40 @@ static inline int64_t ag_seek(ag_handle_t h, int64_t off, int whence)
 static inline ag_err_t ag_stat(const char *p, ag_stat_t *o)
 {
     return g_ag_api->fs->stat(p, o);
+}
+static inline ag_err_t ag_sync(ag_handle_t h) { return g_ag_api->fs->sync(h); }
+static inline ag_err_t ag_unlink(const char *p)
+{
+    return g_ag_api->fs->unlink(p);
+}
+static inline ag_err_t ag_rename(const char *from, const char *to)
+{
+    return g_ag_api->fs->rename(from, to);
+}
+static inline ag_err_t ag_mkdir(const char *p) { return g_ag_api->fs->mkdir(p); }
+static inline ag_err_t ag_rmdir(const char *p) { return g_ag_api->fs->rmdir(p); }
+
+static inline ag_handle_t ag_opendir(const char *p)
+{
+    return g_ag_api->fs->opendir(p);
+}
+static inline ag_err_t ag_readdir(ag_handle_t h, ag_dirent_t *e)
+{
+    return g_ag_api->fs->readdir(h, e);
+}
+static inline ag_err_t ag_closedir(ag_handle_t h)
+{
+    return g_ag_api->fs->closedir(h);
+}
+
+static inline ag_err_t ag_getcwd(char *b, size_t n)
+{
+    return g_ag_api->fs->getcwd(b, n);
+}
+static inline ag_err_t ag_chdir(const char *p) { return g_ag_api->fs->chdir(p); }
+static inline ag_err_t ag_mountinfo(const char *mount, ag_fsinfo_t *o)
+{
+    return g_ag_api->fs->mountinfo(mount, o);
 }
 
 /* ---- processes ---------------------------------------------------------- */
@@ -221,10 +272,17 @@ static inline void ag_delay_us(uint32_t us) { g_ag_api->time->delay_us(us); }
 
 /* ---- input -------------------------------------------------------------- */
 
+/*
+ * Whole events, which is what an application that draws its own screen needs:
+ * arrow and function keys have no character, so ag_getch cannot report them.
+ * timeout_ms: 0 polls, UINT32_MAX waits.
+ */
 static inline bool ag_poll_event(ag_event_t *e, uint32_t timeout_ms)
 {
     return g_ag_api->inp->poll(e, timeout_ms);
 }
+static inline void ag_flush_input(void) { g_ag_api->inp->flush(); }
+static inline uint16_t ag_mods(void) { return g_ag_api->inp->mods(); }
 
 /* ---- graphics ----------------------------------------------------------- */
 

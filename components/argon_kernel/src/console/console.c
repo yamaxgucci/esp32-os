@@ -50,6 +50,7 @@ static bool               s_ready;
 static ag_con_sink_fn     s_redirect;
 static void              *s_redirect_ctx;
 static uint32_t           s_dropped_events;
+static uint16_t           s_mods;
 static bool (*s_hotkeys)(ag_event_t *ev);
 
 /* ---------------------------------------------------------------------- */
@@ -193,6 +194,10 @@ static void publish(const ag_event_t *ev)
         return;
     }
 
+    if (stamped.type == AG_EV_KEY_DOWN) {
+        s_mods = stamped.key.mods;
+    }
+
     /*
      * Dropping the newest, not the oldest.  Losing the head of a burst
      * silently rewrites what the user typed - "delete foo" arriving as
@@ -247,6 +252,18 @@ static void pump_endpoint(ag_con_endpoint_t *ep)
         }
     }
 }
+
+void ag_console_flush_input(void)
+{
+    if (!s_ready) {
+        return;
+    }
+    ag_event_t drop;
+    while (xQueueReceive(s_events, &drop, 0) == pdTRUE) {
+    }
+}
+
+uint16_t ag_console_mods(void) { return s_mods; }
 
 bool ag_console_read_event(ag_event_t *ev, uint32_t timeout_ms)
 {
