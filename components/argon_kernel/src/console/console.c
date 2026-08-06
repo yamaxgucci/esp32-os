@@ -50,6 +50,7 @@ static bool               s_ready;
 static ag_con_sink_fn     s_redirect;
 static void              *s_redirect_ctx;
 static uint32_t           s_dropped_events;
+static bool (*s_hotkeys)(ag_event_t *ev);
 
 /* ---------------------------------------------------------------------- */
 
@@ -67,6 +68,16 @@ void ag_console_unlock(void)
     if (s_lock != NULL) {
         xSemaphoreGiveRecursive(s_lock);
     }
+}
+
+void ag_console_set_hotkeys(bool (*fn)(ag_event_t *ev)) { s_hotkeys = fn; }
+
+void *ag_console_lock_holder(void)
+{
+    if (s_lock == NULL) {
+        return NULL;
+    }
+    return (void *)xSemaphoreGetMutexHolder(s_lock);
 }
 
 ag_screen_t *ag_console_screen(void) { return &s_screen; }
@@ -174,6 +185,15 @@ static void publish(const ag_event_t *ev)
     stamped.ts = (ag_time_t)esp_timer_get_time();
 
     /*
+     * The supervisor gets first look.  It must be quick - this runs on the
+     * console task, and a console that is busy is a console that stops reading
+     * input - so it notes what to do and does it on its own task.
+     */
+    if (s_hotkeys != NULL && s_hotkeys(&stamped)) {
+        return;
+    }
+
+    /*
      * Dropping the newest, not the oldest.  Losing the head of a burst
      * silently rewrites what the user typed - "delete foo" arriving as
      * "lete foo" is a different command, and could have been a worse one.
@@ -253,6 +273,13 @@ int32_t ag_console_getch(uint32_t timeout_ms)
         if (!ag_console_read_event(&ev, remaining)) {
             return -1;
         }
+        /*
+         * Being asked to stop is an answer to "give me a key": a read that went
+         * on waiting would be exactly the hang the request is trying to end.
+         */
+        if (ev.type == AG_EV_QUIT) {
+            return -AG_EKILLED;
+        }
         if (ev.type == AG_EV_KEY_DOWN && ev.key.unicode != 0) {
             return (int32_t)ev.key.unicode;
         }
@@ -275,6 +302,9 @@ int32_t ag_console_readline(char *buf, size_t len)
         ag_event_t ev;
         if (!ag_console_read_event(&ev, UINT32_MAX)) {
             continue;
+        }
+        if (ev.type == AG_EV_QUIT) {
+            return -AG_EKILLED;
         }
         if (ev.type != AG_EV_KEY_DOWN) {
             continue;

@@ -15,6 +15,7 @@
 #include <argon/kernel.h>
 #include <argon/loader.h>
 #include <argon/log.h>
+#include <argon/proc.h>
 #include <argon/shell.h>
 #include <argon/vfs.h>
 
@@ -48,12 +49,12 @@ static void api_vlog(ag_log_level_t level, const char *tag, const char *fmt,
     ag_vlog(level, (tag != NULL) ? tag : "app", fmt, ap);
 }
 
-static void api_exit(int code) { ag_loader_exit(code); }
+static void api_exit(int code) { ag_proc_exit(code); }
 
 static void api_panic(const char *msg)
 {
     ag_log(AG_LOG_ERROR, "app", "panic: %s", (msg != NULL) ? msg : "(no reason)");
-    ag_loader_exit(-1);
+    ag_proc_exit(-1);
 }
 
 static void *api_sym(const char *name)
@@ -93,10 +94,7 @@ static const char *api_strerror(ag_err_t err)
     }
 }
 
-static void api_heartbeat(void)
-{
-    /* The per-process watchdog arrives with the supervisor. */
-}
+static void api_heartbeat(void) { ag_proc_heartbeat(); }
 
 static const ag_sys_api_t k_sys = {
     .size = sizeof(ag_sys_api_t),
@@ -115,67 +113,31 @@ static const ag_sys_api_t k_sys = {
 /* ---------------------------------------------------------------------- */
 
 /*
- * Straight to the system heap for now.  Per-process arenas are what make
- * killing an application reclaim its memory; until those exist, an application
- * that leaks leaks for good, and saying so beats pretending otherwise.
+ * Memory comes from the calling process's arena, so that ending the process
+ * gives all of it back at once and no application can fragment the kernel's
+ * heap.  The process layer is where that lives; this is forwarding, as
+ * everything in this file should be.
  */
-static void *api_alloc(size_t bytes)
-{
-    return heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) ?:
-           heap_caps_malloc(bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-}
+static void *api_alloc(size_t bytes) { return ag_proc_alloc(bytes, 0); }
 
 static void *api_alloc_caps(size_t bytes, uint32_t caps)
 {
-    uint32_t want = MALLOC_CAP_8BIT;
-
-    if (caps & AG_MEM_FAST) {
-        want |= MALLOC_CAP_INTERNAL;
-    }
-    if (caps & AG_MEM_DMA) {
-        want |= MALLOC_CAP_DMA;
-    }
-    if (caps & AG_MEM_EXEC) {
-        want |= MALLOC_CAP_EXEC;
-    }
-    if ((caps & (AG_MEM_FAST | AG_MEM_DMA | AG_MEM_EXEC)) == 0) {
-        want |= MALLOC_CAP_SPIRAM;
-    }
-
-    void *p = heap_caps_malloc(bytes, want);
-    if (p == NULL && (want & MALLOC_CAP_SPIRAM)) {
-        p = heap_caps_malloc(bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    }
-    if (p != NULL && (caps & AG_MEM_ZERO)) {
-        memset(p, 0, bytes);
-    }
-    return p;
+    return ag_proc_alloc(bytes, caps);
 }
 
 static void *api_realloc(void *ptr, size_t bytes)
 {
-    return heap_caps_realloc(ptr, bytes, MALLOC_CAP_8BIT);
+    return ag_proc_realloc(ptr, bytes);
 }
 
-static void api_free(void *ptr) { heap_caps_free(ptr); }
+static void api_free(void *ptr) { ag_proc_free(ptr); }
 
 static size_t api_usable_size(const void *ptr)
 {
-    return (ptr != NULL) ? heap_caps_get_allocated_size((void *)ptr) : 0;
+    return ag_proc_usable_size(ptr);
 }
 
-static void api_meminfo(ag_meminfo_t *out)
-{
-    if (out == NULL) {
-        return;
-    }
-    memset(out, 0, sizeof(*out));
-    out->arena_total = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
-    out->arena_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-    out->arena_largest = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
-    out->fast_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
-    out->system_free = out->fast_free;
-}
+static void api_meminfo(ag_meminfo_t *out) { ag_proc_meminfo(out); }
 
 static const ag_mem_api_t k_mem = {
     .size = sizeof(ag_mem_api_t),
@@ -217,10 +179,30 @@ static int32_t api_con_vprintf(const char *fmt, va_list ap)
     return ag_console_vprintf(fmt, ap);
 }
 
-static int32_t api_getch(void) { return ag_console_getch(UINT32_MAX); }
+/*
+ * The keyboard belongs to whatever is in the foreground.  A background process
+ * that asks for input is not made to wait for something it will never get: it is
+ * told, which is the only answer it can do anything with.
+ */
+static bool has_the_keyboard(void)
+{
+    const ag_pid_t me = ag_proc_self();
+    return me == AG_PID_KERNEL || me == ag_proc_foreground();
+}
+
+static int32_t api_getch(void)
+{
+    if (!has_the_keyboard()) {
+        return -AG_EPERM;
+    }
+    return ag_console_getch(UINT32_MAX);
+}
 
 static int32_t api_kbhit(void)
 {
+    if (!has_the_keyboard()) {
+        return 0;
+    }
     ag_event_t ev;
     /* Peeking without consuming needs a queue this console does not have yet. */
     return ag_console_read_event(&ev, 0) ? 1 : 0;
@@ -228,6 +210,9 @@ static int32_t api_kbhit(void)
 
 static int32_t api_readline(char *buf, size_t len)
 {
+    if (!has_the_keyboard()) {
+        return -AG_EPERM;
+    }
     return ag_console_readline(buf, len);
 }
 
@@ -314,37 +299,37 @@ static const ag_con_api_t k_con = {
 
 static ag_handle_t api_open(const char *path, uint32_t flags)
 {
-    return ag_vfs_open(path, ag_shell_cwd(), flags);
+    return ag_vfs_open(path, ag_proc_cwd(), flags);
 }
 
 static ag_err_t api_stat(const char *path, ag_stat_t *out)
 {
-    return ag_vfs_stat(path, ag_shell_cwd(), out);
+    return ag_vfs_stat(path, ag_proc_cwd(), out);
 }
 
 static ag_err_t api_unlink(const char *path)
 {
-    return ag_vfs_unlink(path, ag_shell_cwd());
+    return ag_vfs_unlink(path, ag_proc_cwd());
 }
 
 static ag_err_t api_rename(const char *from, const char *to)
 {
-    return ag_vfs_rename(from, to, ag_shell_cwd());
+    return ag_vfs_rename(from, to, ag_proc_cwd());
 }
 
 static ag_err_t api_mkdir(const char *path)
 {
-    return ag_vfs_mkdir(path, ag_shell_cwd());
+    return ag_vfs_mkdir(path, ag_proc_cwd());
 }
 
 static ag_err_t api_rmdir(const char *path)
 {
-    return ag_vfs_rmdir(path, ag_shell_cwd());
+    return ag_vfs_rmdir(path, ag_proc_cwd());
 }
 
 static ag_handle_t api_opendir(const char *path)
 {
-    return ag_vfs_opendir(path, ag_shell_cwd());
+    return ag_vfs_opendir(path, ag_proc_cwd());
 }
 
 static ag_err_t api_getcwd(char *buf, size_t len)
@@ -352,7 +337,7 @@ static ag_err_t api_getcwd(char *buf, size_t len)
     if (buf == NULL || len == 0) {
         return -AG_EINVAL;
     }
-    const char  *cwd = ag_shell_cwd();
+    const char  *cwd = ag_proc_cwd();
     const size_t n = strlen(cwd);
     if (n + 1 > len) {
         return -AG_ERANGE;
@@ -364,7 +349,7 @@ static ag_err_t api_getcwd(char *buf, size_t len)
 static ag_err_t api_chdir(const char *path)
 {
     char resolved[AG_PATH_MAX];
-    ag_err_t err = ag_path_resolve(path, ag_shell_cwd(), resolved,
+    ag_err_t err = ag_path_resolve(path, ag_proc_cwd(), resolved,
                                    sizeof(resolved));
     if (err != AG_OK) {
         return err;
@@ -378,7 +363,12 @@ static ag_err_t api_chdir(const char *path)
     if (!(st.attr & AG_A_DIR)) {
         return -AG_ENOTDIR;
     }
-    return ag_shell_set_cwd(resolved);
+    /*
+     * The process's own directory, not the shell's.  An application that changes
+     * directory used to change the shell's, which came back as a surprise the
+     * moment it exited.
+     */
+    return ag_proc_set_cwd(resolved);
 }
 
 static ag_err_t api_mountinfo(const char *mount, ag_fsinfo_t *out)
@@ -471,6 +461,59 @@ static const ag_time_api_t k_time = {
 };
 
 /* ---------------------------------------------------------------------- */
+/* proc                                                                   */
+/* ---------------------------------------------------------------------- */
+
+/*
+ * The ABI hands out `const char **` because an application has no business
+ * modifying its own arguments; the process layer copies them into the child
+ * immediately, so casting the constness away here goes nowhere.
+ */
+static int32_t api_exec(const char *path, int argc, const char **argv)
+{
+    int32_t        code = 0;
+    const ag_err_t err = ag_proc_exec(path, argc, (char **)argv, 0, &code);
+
+    if (err != AG_OK && err != -AG_EKILLED) {
+        return err;
+    }
+    return code;
+}
+
+static ag_pid_t api_spawn(const char *path, int argc, const char **argv,
+                          uint32_t flags)
+{
+    ag_pid_t       pid = 0;
+    const ag_err_t err = ag_proc_spawn(path, argc, (char **)argv, flags, &pid);
+
+    return (err == AG_OK) ? pid : (ag_pid_t)err;
+}
+
+static ag_err_t api_wait(ag_pid_t pid, int32_t *exit_code, uint32_t timeout_ms)
+{
+    return ag_proc_wait(pid, exit_code, timeout_ms);
+}
+
+static ag_err_t api_kill(ag_pid_t pid)
+{
+    return ag_proc_kill(pid, "killed by another process");
+}
+
+static const ag_proc_api_t k_proc = {
+    .size = sizeof(ag_proc_api_t),
+    .exec = api_exec,
+    .spawn = api_spawn,
+    .wait = api_wait,
+    .kill = api_kill,
+    .self = ag_proc_self,
+    .enumerate = ag_proc_info,
+    .foreground = ag_proc_set_foreground,
+    .getenv = NULL, /* no environment yet */
+    .setenv = NULL,
+    .interrupted = ag_proc_interrupted,
+};
+
+/* ---------------------------------------------------------------------- */
 
 /*
  * Subsystems that do not exist yet are NULL rather than stubs that fail.  An
@@ -491,7 +534,7 @@ static const ag_api_t k_api = {
     .io = NULL,
     .time = &k_time,
     .task = NULL,
-    .proc = NULL,
+    .proc = &k_proc,
     .cfg = NULL,
     .net = NULL,
 };

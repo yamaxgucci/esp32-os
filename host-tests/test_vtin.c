@@ -90,6 +90,18 @@ static void test_control_keys(void)
     EXPECT_KEY("\x00", AG_KEY_SPACE, 0, AG_MOD_CTRL);
 
     /*
+     * Above Ctrl+Z the codes are Ctrl with a punctuation key, and the letter
+     * formula does not reach them - it used to be applied anyway, which reported
+     * keys that were never pressed.  Ctrl+\ matters: it is the only "stop this
+     * now" a plain terminal can send, since Ctrl-Alt-Del is not a thing a
+     * terminal has.
+     */
+    EXPECT_KEY("\x1c", AG_KEY_BACKSLASH, 0, AG_MOD_CTRL);
+    EXPECT_KEY("\x1d", AG_KEY_RBRACKET, 0, AG_MOD_CTRL);
+    EXPECT_KEY("\x1e", AG_KEY_6, 0, AG_MOD_CTRL | AG_MOD_SHIFT);
+    EXPECT_KEY("\x1f", AG_KEY_MINUS, 0, AG_MOD_CTRL | AG_MOD_SHIFT);
+
+    /*
      * Ctrl+H, Ctrl+I and Ctrl+M are the same bytes as Backspace, Tab and
      * Enter.  Naming the key is more useful than naming the combination.
      */

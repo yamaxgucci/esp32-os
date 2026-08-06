@@ -17,6 +17,7 @@
 #include <argon/loader.h>
 #include <argon/log.h>
 #include <argon/path.h>
+#include <argon/proc.h>
 #include <argon/vfs.h>
 
 #include "esp_heap_caps.h"
@@ -364,28 +365,35 @@ static int cmd_color(int argc, char **argv)
     return 0;
 }
 
+static void print_load_error(const char *path, ag_err_t err)
+{
+    const char *why;
+
+    switch (-err) {
+    case AG_ENOENT:  why = "file not found"; break;
+    case AG_EFORMAT: why = "not an ArgonOS application"; break;
+    case AG_ENOTSUP: why = "built for a different processor"; break;
+    case AG_EABI:    why = "built for a different version of this system"; break;
+    case AG_ENOMEM:  why = "not enough memory to load it"; break;
+    case AG_EBUSY:   why = "too many applications are loaded"; break;
+    case AG_ERANGE:  why = "too many arguments"; break;
+    default:         why = "could not be loaded"; break;
+    }
+    ag_console_printf("%s: %s\n", path, why);
+}
+
 static int cmd_run(int argc, char **argv)
 {
-    if (argc < 2) {
-        ag_console_puts("usage: run <file> [arguments]\n");
-        return 1;
+    bool background = false;
+    int  first = 1;
+
+    if (argc > 1 && ag_path_icmp(argv[1], "/b") == 0) {
+        background = true;
+        first = 2;
     }
-
-    ag_loaded_app_t app;
-    const ag_err_t  err = ag_loader_load(argv[1], s_cwd, &app);
-
-    if (err != AG_OK) {
-        const char *why;
-        switch (-err) {
-        case AG_ENOENT:  why = "file not found"; break;
-        case AG_EFORMAT: why = "not an ArgonOS application"; break;
-        case AG_ENOTSUP: why = "built for a different processor"; break;
-        case AG_EABI:    why = "built for a different version of this system";
-                         break;
-        case AG_ENOMEM:  why = "not enough memory to load it"; break;
-        default:         why = "could not be loaded"; break;
-        }
-        ag_console_printf("%s: %s\n", argv[1], why);
+    if (argc <= first) {
+        ag_console_puts("usage: run [/b] <file> [arguments]\n");
+        ag_console_puts("  /b  leave it running in the background\n");
         return 1;
     }
 
@@ -393,8 +401,30 @@ static int cmd_run(int argc, char **argv)
      * The application sees the path it was started with as argv[0], which is
      * what a program expects and what lets it find its own files.
      */
-    const int status = ag_loader_run(&app, argc - 1, &argv[1]);
-    ag_loader_unload(&app);
+    if (background) {
+        ag_pid_t       pid = 0;
+        const ag_err_t err = ag_proc_spawn(argv[first], argc - first,
+                                           &argv[first], AG_SPAWN_BACKGROUND,
+                                           &pid);
+        if (err != AG_OK) {
+            print_load_error(argv[first], err);
+            return 1;
+        }
+        ag_console_printf("started pid %u\n", (unsigned)pid);
+        return 0;
+    }
+
+    int32_t        status = 0;
+    const ag_err_t err = ag_proc_exec(argv[first], argc - first, &argv[first], 0,
+                                      &status);
+    if (err == -AG_EKILLED) {
+        ag_console_printf("%s: stopped\n", argv[first]);
+        return 1;
+    }
+    if (err != AG_OK) {
+        print_load_error(argv[first], err);
+        return 1;
+    }
 
     /* Whatever the application did to the screen, the prompt starts clean. */
     ag_console_lock();
@@ -402,7 +432,7 @@ static int cmd_run(int argc, char **argv)
     ag_screen_set_cursor(ag_console_screen(), true);
     ag_console_unlock();
 
-    return status;
+    return (int)status;
 }
 
 static int cmd_log(int argc, char **argv)
@@ -472,9 +502,96 @@ static int cmd_ps(int argc, char **argv)
 {
     (void)argc;
     (void)argv;
-    ag_console_puts("  pid  name              state        memory\n");
-    ag_console_puts("  no applications loaded\n");
+
+    ag_console_puts("  pid  name              state        memory     \n");
+
+    uint32_t shown = 0;
+    for (uint32_t i = 0;; i++) {
+        ag_procinfo_t info;
+        if (ag_proc_info(i, &info) != AG_OK) {
+            break;
+        }
+        ag_console_printf("  %-4u %-17s %-12s %5u KB%s\n", (unsigned)info.pid,
+                          info.name, ag_proc_state_name(info.state),
+                          (unsigned)(info.mem_used / 1024u),
+                          info.foreground ? "  (foreground)" : "");
+        shown++;
+    }
+
+    if (shown == 0) {
+        ag_console_puts("  no applications loaded\n");
+    }
     return 0;
+}
+
+static int cmd_kill(int argc, char **argv)
+{
+    if (argc != 2) {
+        ag_console_puts("usage: kill <pid>\n");
+        return 1;
+    }
+
+    const ag_pid_t pid = (ag_pid_t)atoi(argv[1]);
+    if (pid <= 0) {
+        ag_console_puts("pid must be a number above zero\n");
+        return 1;
+    }
+
+    const ag_err_t err = ag_proc_kill(pid, "killed from the shell");
+    switch (-err) {
+    case AG_OK:
+        ag_console_printf("pid %u stopped\n", (unsigned)pid);
+        return 0;
+    case AG_ENOENT:
+        ag_console_printf("no process with pid %u\n", (unsigned)pid);
+        return 1;
+    case AG_EBUSY:
+        /* The journal has the detail; the prompt gets the decision. */
+        ag_console_puts("it is inside the system and cannot be stopped "
+                        "safely; see log\n");
+        return 1;
+    default:
+        ag_console_printf("could not stop pid %u: %d\n", (unsigned)pid,
+                          (int)err);
+        return 1;
+    }
+}
+
+static int cmd_fg(int argc, char **argv)
+{
+    if (argc != 2) {
+        ag_console_printf("usage: fg <pid>\n");
+        return 1;
+    }
+
+    const ag_pid_t pid = (ag_pid_t)atoi(argv[1]);
+    ag_err_t       err = ag_proc_set_foreground(pid);
+    if (err != AG_OK) {
+        ag_console_printf("no process with pid %u\n", (unsigned)pid);
+        return 1;
+    }
+
+    /*
+     * Bringing it to the front means the shell steps back: it waits, rather
+     * than going on reading the same keyboard the process now owns.
+     */
+    int32_t status = 0;
+    err = ag_proc_wait(pid, &status, UINT32_MAX);
+
+    ag_console_lock();
+    ag_screen_set_attr(ag_console_screen(), AG_ATTR_DEFAULT);
+    ag_screen_set_cursor(ag_console_screen(), true);
+    ag_console_unlock();
+
+    if (err == -AG_EKILLED) {
+        ag_console_printf("pid %u stopped\n", (unsigned)pid);
+        return 1;
+    }
+    if (err != AG_OK) {
+        ag_console_printf("pid %u: %d\n", (unsigned)pid, (int)err);
+        return 1;
+    }
+    return (int)status;
 }
 
 static const ag_command_t k_commands[] = {
@@ -488,6 +605,8 @@ static const ag_command_t k_commands[] = {
     {"echo", "<text>", "print text", cmd_echo},
     {"color", "<fg> <bg>", "set text colours", cmd_color},
     {"ps", "", "list running applications", cmd_ps},
+    {"kill", "<pid>", "stop an application", cmd_kill},
+    {"fg", "<pid>", "bring an application to the foreground and wait", cmd_fg},
     {"dir", "[path]", "list a directory", ag_cmd_dir},
     {"cd", "[path]", "change directory", ag_cmd_cd},
     {"type", "<file>", "print a file", ag_cmd_type},
@@ -500,7 +619,7 @@ static const ag_command_t k_commands[] = {
     {"format", "<drive> [/y]", "make a fresh filesystem", ag_cmd_format},
     {"hexdump", "<file>", "dump a file as bytes", ag_cmd_hexdump},
     {"recv", "<file>", "receive a file as hex", ag_cmd_recv},
-    {"run", "<file> [args]", "run an application", cmd_run},
+    {"run", "[/b] <file> [args]", "run an application", cmd_run},
     {"errorlevel", "", "exit code of the last command", cmd_errorlevel},
     {"reboot", "", "restart the board", cmd_reboot},
     {NULL, NULL, NULL, NULL},

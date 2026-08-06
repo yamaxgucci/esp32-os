@@ -161,6 +161,33 @@ try {
 
     if ($found -and $Send.Count -gt 0) {
         foreach ($cmd in $Send) {
+            # A leading ~ means raw bytes, sent without an Enter and without
+            # waiting for a prompt: that is how a key that interrupts a running
+            # application is delivered, since there is no prompt to wait for
+            # while it runs.  \xNN escapes are decoded, so ~\x1c is Ctrl+\.
+            if ($cmd.StartsWith('~')) {
+                # Escapes are decoded by hand: -replace with a scriptblock is a
+                # PowerShell 6 feature, and on 5.1 it quietly substitutes the
+                # text of the scriptblock instead of calling it.
+                $raw = $cmd.Substring(1)
+                $out = New-Object System.Collections.Generic.List[byte]
+                for ($i = 0; $i -lt $raw.Length; $i++) {
+                    if ($raw[$i] -eq '\' -and ($i + 4) -le $raw.Length -and
+                        $raw[$i + 1] -eq 'x') {
+                        $out.Add([byte][Convert]::ToInt32(
+                            $raw.Substring($i + 2, 2), 16))
+                        $i += 3
+                    } else {
+                        $out.Add([byte][char]$raw[$i])
+                    }
+                }
+                $bytes = $out.ToArray()
+                $stream.Write($bytes, 0, $bytes.Length)
+                $stream.Flush()
+                Start-Sleep -Milliseconds 300
+                $seen = Read-Available
+                continue
+            }
             Send-Line $cmd
             $seen = Wait-Prompt -Was $seen
         }

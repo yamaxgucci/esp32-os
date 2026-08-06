@@ -27,4 +27,11 @@ ag_err_t ag_storage_format_media(void);
 
 bool ag_storage_media_present(void);
 
+/*
+ * Which task holds the filesystem lock, as a FreeRTOS task handle, or NULL.
+ * Asked for the same reason as the console's: a task deleted while it holds this
+ * would leave every later file operation waiting forever.
+ */
+void *ag_storage_vfs_lock_holder(void);
+
 #endif /* ARGON_STORAGE_H */

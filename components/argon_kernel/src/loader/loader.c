@@ -1,20 +1,23 @@
 /*
- * ArgonOS - loading and running an application.
+ * ArgonOS - placing an application image in memory.
+ *
+ * Reading the file, finding room for its two parts and relocating them.  What
+ * happens after that - the task it runs on, the memory it is allowed to ask for,
+ * and giving all of it back afterwards - belongs to the process layer in
+ * src/proc/, so that nothing here has to know what a process is.
  *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
  */
 #include <argon/loader.h>
 
-#include <setjmp.h>
 #include <string.h>
 
+#include <argon/arena.h>
 #include <argon/log.h>
+#include <argon/proc.h>
 #include <argon/vfs.h>
 
 #include "esp_heap_caps.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/semphr.h"
-#include "freertos/task.h"
 
 /*
  * A .AXE is read whole before anything is placed, so that a truncated file is
@@ -105,26 +108,63 @@ static ag_err_t read_whole(const char *path, const char *cwd, uint8_t **out,
  */
 static uint8_t s_arena[AG_APP_ARENA_BYTES]
     __attribute__((aligned(16), section(".iram.bss.ag_app_arena")));
-static bool s_arena_taken;
 
-static void *arena_take(size_t bytes)
-{
-    if (s_arena_taken || bytes > sizeof(s_arena)) {
-        return NULL;
-    }
-    s_arena_taken = true;
-    return s_arena;
-}
+/*
+ * The arena holds one block per loaded application, and its bookkeeping lives
+ * out here in ordinary memory - see argon/arena.h for why it is not a heap.
+ */
+static ag_arena_block_t s_arena_blocks[AG_PROC_MAX];
+static ag_arena_t       s_code;
 
-static void arena_release(void *p)
+static void arena_ready(void)
 {
-    if (p == s_arena) {
-        s_arena_taken = false;
+    if (s_code.base == NULL) {
+        ag_arena_init(&s_code, s_arena, sizeof(s_arena), s_arena_blocks,
+                      AG_PROC_MAX);
     }
 }
 
 size_t ag_loader_arena_size(void) { return sizeof(s_arena); }
-bool   ag_loader_arena_busy(void) { return s_arena_taken; }
+
+size_t ag_loader_arena_free(void)
+{
+    arena_ready();
+    return ag_arena_free_bytes(&s_code);
+}
+
+size_t ag_loader_arena_largest(void)
+{
+    arena_ready();
+    return ag_arena_largest_free(&s_code, 16);
+}
+
+bool ag_loader_arena_busy(void)
+{
+    arena_ready();
+    return ag_arena_blocks(&s_code) > 0;
+}
+
+/*
+ * The arena is executable memory addressed through the instruction window, and
+ * byte-wide writes through that window are not something to rely on across this
+ * family - the original ESP32 refused them outright, which is why ESP-IDF marks
+ * executable memory as word-only (docs/05-status.md).  Both ends are word
+ * aligned by construction here: the header is a multiple of 16 bytes and part
+ * sizes are multiples of four.  So the copy is done in words, and the byte-wise
+ * fallback exists only for a file that turns out to disagree.
+ */
+static void copy_image(void *dst, const void *src, size_t bytes)
+{
+    if ((((uintptr_t)dst | (uintptr_t)src | (uintptr_t)bytes) & 3u) == 0) {
+        uint32_t       *d = (uint32_t *)dst;
+        const uint32_t *s = (const uint32_t *)src;
+        for (size_t i = 0; i < bytes / 4u; i++) {
+            d[i] = s[i];
+        }
+        return;
+    }
+    memcpy(dst, src, bytes);
+}
 
 /*
  * The data part goes to extended memory: it has to be writable, not executable,
@@ -150,17 +190,21 @@ static void *data_alloc(size_t bytes)
  */
 static ag_err_t place_image(const ag_axe_header_t *header, ag_loaded_app_t *out)
 {
+    arena_ready();
+
     const bool contiguous = (header->flags & AG_AXE_CONTIGUOUS) != 0;
     const size_t code_bytes =
         contiguous ? (size_t)header->code.size + header->data.size
                    : (size_t)header->code.size;
 
-    void *code = arena_take(code_bytes);
+    void *code = ag_arena_alloc(&s_code, code_bytes, 16);
     if (code == NULL) {
         ag_log(AG_LOG_ERROR, "loader",
-               "%u bytes of code will not fit the %u byte arena%s",
-               (unsigned)code_bytes, (unsigned)sizeof(s_arena),
-               s_arena_taken ? " (already in use)" : "");
+               "%u bytes of code will not fit the arena: %u of %u bytes free, "
+               "largest block %u",
+               (unsigned)code_bytes, (unsigned)ag_arena_free_bytes(&s_code),
+               (unsigned)sizeof(s_arena),
+               (unsigned)ag_arena_largest_free(&s_code, 16));
         return -AG_ENOMEM;
     }
 
@@ -182,7 +226,7 @@ static ag_err_t place_image(const ag_axe_header_t *header, ag_loaded_app_t *out)
         ag_log(AG_LOG_ERROR, "loader",
                "no memory for %u bytes of application data",
                (unsigned)header->data.size);
-        arena_release(code);
+        (void)ag_arena_free(&s_code, code);
         memset(&out->place, 0, sizeof(out->place));
         return -AG_ENOMEM;
     }
@@ -198,7 +242,12 @@ static void release_image(ag_loaded_app_t *app)
     if (app->data_owned != NULL) {
         heap_caps_free(app->data_owned);
     }
-    arena_release(app->place.code);
+    if (app->place.code != NULL && !ag_arena_free(&s_code, app->place.code)) {
+        /* Only reachable if the block table and the image disagree, which would
+         * mean memory was handed back twice.  Worth a line in the journal. */
+        ag_log(AG_LOG_ERROR, "loader", "arena does not own %p",
+               app->place.code);
+    }
     memset(&app->place, 0, sizeof(app->place));
     app->data_owned = NULL;
 }
@@ -234,8 +283,10 @@ ag_err_t ag_loader_load(const char *path, const char *cwd,
         return err;
     }
 
-    memcpy(out->place.code, file + header->code.offset, header->code.file_size);
+    copy_image(out->place.code, file + header->code.offset,
+               header->code.file_size);
     if (header->data.file_size > 0) {
+        /* Ordinary memory through the data bus; no reason to be careful. */
         memcpy(out->place.data, file + header->data.offset,
                header->data.file_size);
     }
@@ -279,144 +330,3 @@ void ag_loader_unload(ag_loaded_app_t *app)
     }
 }
 
-/* ------------------------------------------------------------------------ */
-/* Running                                                                  */
-/* ------------------------------------------------------------------------ */
-
-/*
- * What one run needs, on the caller's stack for as long as the run lasts.  One
- * application at a time for now, so one of these is in flight at a time; the
- * process model turns it into a table.
- */
-typedef struct {
-    ag_loaded_app_t  *app;
-    int               argc;
-    char            **argv;
-    int               result;
-    int               exit_code;
-    jmp_buf           exit_jump;
-    TaskHandle_t      task;
-    SemaphoreHandle_t done;
-} app_run_t;
-
-static app_run_t *s_current;
-
-/* Bounds on what an image may ask for; the default comes from the config. */
-#define AG_APP_STACK_MIN (2u * 1024u)
-#define AG_APP_STACK_MAX (64u * 1024u)
-#ifndef CONFIG_ARGON_APP_STACK_KB
-#define CONFIG_ARGON_APP_STACK_KB 16
-#endif
-
-static uint32_t stack_bytes(const ag_axe_header_t *header)
-{
-    uint32_t want = header->stack_size;
-    if (want == 0) {
-        want = (uint32_t)CONFIG_ARGON_APP_STACK_KB * 1024u;
-    }
-    if (want < AG_APP_STACK_MIN) {
-        want = AG_APP_STACK_MIN;
-    }
-    if (want > AG_APP_STACK_MAX) {
-        want = AG_APP_STACK_MAX;
-    }
-    return want;
-}
-
-static void app_task(void *arg)
-{
-    app_run_t *run = (app_run_t *)arg;
-
-    /*
-     * Taken here rather than from xTaskCreate so that it is set before anything
-     * of the application runs: ag_exit compares against it to know it is being
-     * called from the application and not from somewhere else.
-     */
-    run->task = xTaskGetCurrentTaskHandle();
-
-    typedef int (*entry_fn)(int, char **);
-    const entry_fn entry = (entry_fn)run->app->binding.entry;
-
-    if (setjmp(run->exit_jump) == 0) {
-        run->result = entry(run->argc, run->argv);
-    } else {
-        run->result = run->exit_code; /* came back through ag_exit */
-    }
-
-    /*
-     * How much of the stack was never touched, while the task still exists.  An
-     * application that comes close is worth telling its author about.
-     */
-    const uint32_t spare =
-        (uint32_t)uxTaskGetStackHighWaterMark(NULL);
-
-    SemaphoreHandle_t done = run->done;
-    s_current = NULL;
-
-    ag_log(AG_LOG_DEBUG, "loader", "%s: returned %d, %u stack bytes unused",
-           run->app->header.name, run->result, (unsigned)spare);
-
-    /* Nothing may touch `run` after this: the waiter owns it again. */
-    xSemaphoreGive(done);
-    vTaskDelete(NULL);
-}
-
-void ag_loader_exit(int code)
-{
-    app_run_t *run = s_current;
-
-    if (run != NULL && run->task == xTaskGetCurrentTaskHandle()) {
-        run->exit_code = code;
-        longjmp(run->exit_jump, 1);
-    }
-    /* Called with nothing running: there is nowhere to go, so ignore it. */
-}
-
-int ag_loader_run(ag_loaded_app_t *app, int argc, char **argv)
-{
-    if (app == NULL || app->binding.entry == NULL) {
-        return -AG_EINVAL;
-    }
-    if (s_current != NULL) {
-        return -AG_EBUSY;
-    }
-
-    app_run_t run;
-    memset(&run, 0, sizeof(run));
-    run.app = app;
-    run.argc = argc;
-    run.argv = argv;
-
-    run.done = xSemaphoreCreateBinary();
-    if (run.done == NULL) {
-        return -AG_ENOMEM;
-    }
-
-    const char *name = (app->header.name[0] != '\0') ? app->header.name : "app";
-    s_current = &run;
-
-    /*
-     * Pinned to the core the shell is on, deliberately.  Nothing in the kernel
-     * is written for two cores executing it at once, and an application calls
-     * into the kernel constantly; giving it a core of its own belongs with the
-     * process model, where the locking is designed rather than hoped for.
-     *
-     * Same priority as the caller: an application should not be able to starve
-     * the system it asked to run it, nor be starved by it.
-     */
-    BaseType_t created = xTaskCreatePinnedToCore(
-        app_task, name, (uint32_t)stack_bytes(&app->header), &run,
-        uxTaskPriorityGet(NULL), NULL, xPortGetCoreID());
-
-    if (created != pdPASS) {
-        s_current = NULL;
-        vSemaphoreDelete(run.done);
-        ag_log(AG_LOG_ERROR, "loader", "%s: no memory for a %u byte stack", name,
-               (unsigned)stack_bytes(&app->header));
-        return -AG_ENOMEM;
-    }
-
-    xSemaphoreTake(run.done, portMAX_DELAY);
-    vSemaphoreDelete(run.done);
-    return run.result;
-}

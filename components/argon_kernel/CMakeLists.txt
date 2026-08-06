@@ -8,6 +8,8 @@ set(ARGON_KERNEL_SRCS
     "src/core/sysconfig.c"
     "src/core/journal.c"
     "src/core/log.c"
+    "src/core/reslist.c"
+    "src/core/arena.c"
     "src/console/screen.c"
     "src/console/vtout.c"
     "src/console/vtin.c"
@@ -20,6 +22,8 @@ set(ARGON_KERNEL_SRCS
     "src/loader/axeload.c"
     "src/loader/loader.c"
     "src/loader/api.c"
+    "src/proc/proc.c"
+    "src/proc/supervisor.c"
     "src/shell/lineedit.c"
     "src/shell/shell.c"
     "src/shell/cmd_fs.c")

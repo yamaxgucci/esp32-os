@@ -29,6 +29,8 @@ set(ARGON_PORTABLE_SRCS
     "${ARGON_ROOT}/components/argon_kernel/src/fs/vfs.c"
     "${ARGON_ROOT}/components/argon_kernel/src/fs/ramfs.c"
     "${ARGON_ROOT}/components/argon_kernel/src/core/journal.c"
+    "${ARGON_ROOT}/components/argon_kernel/src/core/reslist.c"
+    "${ARGON_ROOT}/components/argon_kernel/src/core/arena.c"
     "${ARGON_ROOT}/components/argon_kernel/src/loader/axeload.c")
 
 set(ARGON_INCLUDES
@@ -50,6 +52,8 @@ add_executable(argon_tests
     test_lineedit.c
     test_vfs.c
     test_journal.c
+    test_reslist.c
+    test_arena.c
     test_axeload.c
     ${ARGON_PORTABLE_SRCS})
 

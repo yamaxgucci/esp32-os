@@ -54,6 +54,14 @@ static void vfs_unlock(void *ctx)
     xSemaphoreGiveRecursive(s_vfs_mutex);
 }
 
+void *ag_storage_vfs_lock_holder(void)
+{
+    if (s_vfs_mutex == NULL) {
+        return NULL;
+    }
+    return (void *)xSemaphoreGetMutexHolder(s_vfs_mutex);
+}
+
 static uint64_t now_unix(void)
 {
     /*

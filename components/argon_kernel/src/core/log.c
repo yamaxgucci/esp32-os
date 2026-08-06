@@ -12,6 +12,8 @@
 
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
 /*
  * Static storage, in internal RAM, available before any allocator has run.  4 KB
@@ -25,6 +27,33 @@ static char         s_storage[AG_JOURNAL_BYTES];
 static ag_journal_t s_journal;
 static bool         s_echo = true;
 static bool         s_ready;
+
+/*
+ * One line is several writes to the journal - the head, then the body, then the
+ * newline - so without this a task preempted between them has its line spliced
+ * into somebody else's.  That was possible on one core already; with an
+ * application running on the other one it stops being theoretical.
+ *
+ * Recursive, because a line is written while it is being echoed to the console,
+ * and anything on that path that logs would otherwise deadlock against itself.
+ * Taken only when it exists: the first messages of the boot arrive before any
+ * allocator has run, and losing those is not an option.
+ */
+static SemaphoreHandle_t s_lock;
+
+static void log_lock(void)
+{
+    if (s_lock != NULL) {
+        xSemaphoreTakeRecursive(s_lock, portMAX_DELAY);
+    }
+}
+
+static void log_unlock(void)
+{
+    if (s_lock != NULL) {
+        xSemaphoreGiveRecursive(s_lock);
+    }
+}
 
 const ag_journal_t *ag_log_journal(void) { return &s_journal; }
 
@@ -49,6 +78,7 @@ static int log_vprintf(const char *fmt, va_list ap)
     const size_t len = ((size_t)n < sizeof(line)) ? (size_t)n
                                                   : sizeof(line) - 1;
 
+    log_lock();
     ag_journal_write(&s_journal, line, len);
 
     if (s_echo && ag_console_ready()) {
@@ -58,6 +88,7 @@ static int log_vprintf(const char *fmt, va_list ap)
         (void)fwrite(line, 1, len, stdout);
         (void)fflush(stdout);
     }
+    log_unlock();
     return n;
 }
 
@@ -67,6 +98,11 @@ ag_err_t ag_log_init(void)
                                          sizeof(s_storage));
     if (err != AG_OK) {
         return err;
+    }
+
+    s_lock = xSemaphoreCreateRecursiveMutex();
+    if (s_lock == NULL) {
+        return -AG_ENOMEM;
     }
 
     s_ready = true;
@@ -85,6 +121,9 @@ void ag_vlog(ag_log_level_t level, const char *tag, const char *fmt,
 
     const char mark = (level < sizeof(k_mark)) ? k_mark[level] : '?';
     const uint32_t ms = (uint32_t)(esp_timer_get_time() / 1000);
+
+    /* One line, whoever else is logging at the same time. */
+    log_lock();
 
     /* Same shape as ESP-IDF's own lines, so a mixed journal reads as one thing. */
     char head[48];
@@ -109,6 +148,7 @@ void ag_vlog(ag_log_level_t level, const char *tag, const char *fmt,
             ag_console_puts("\n");
         }
     }
+    log_unlock();
 }
 
 void ag_log(ag_log_level_t level, const char *tag, const char *fmt, ...)

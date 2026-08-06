@@ -26,8 +26,15 @@
 extern "C" {
 #endif
 
+/*
+ * Minor goes up when the table grows: a new call at the end of a subtable, or a
+ * subtable that stops being NULL.  An image built against an older minor keeps
+ * running, which is why the loader compares them rather than demanding a match.
+ *
+ * 0.2 added the proc subtable, and proc->interrupted with it.
+ */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 1u
+#define AG_ABI_MINOR 2u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -600,6 +607,17 @@ typedef struct ag_proc_api {
 
     const char *(*getenv)(const char *key);
     ag_err_t (*setenv)(const char *key, const char *value);
+
+    /*
+     * True once, when the system has asked this process to stop - Ctrl+C, or
+     * another process being polite about it.  Reading it clears it.
+     *
+     * An application that checks this between pieces of work is one that can be
+     * asked to stop and tidy up after itself.  One that does not is one that has
+     * to be killed, which works but throws away whatever it was in the middle
+     * of.  Long loops should check it; short programs need not bother.
+     */
+    bool (*interrupted)(void);
 } ag_proc_api_t;
 
 /* ------------------------------------------------------------------------ */

@@ -15,10 +15,13 @@ your code running on a dedicated CPU core with almost all of the RAM.
 ## Status
 
 **Early development.** It boots, gives a prompt, mounts three drives, and runs
-applications built with `tools/mkaxe.py` on a task of their own, with as much
-data memory as the PSRAM has to spare. There is no process model yet: no
-resource accounting, no Ctrl-C, and a wild pointer still reaches the rest of the
-system.
+applications built with `tools/mkaxe.py` as processes: a task and a core of
+their own, an arena they allocate from, and full accounting - a hung application
+can be stopped from the keyboard and every byte of it comes back. What is still
+missing from that picture is threads inside an application, catching a fault and
+blaming the right process for it, and a per-process watchdog. And without an MMU
+a wild pointer still reaches the rest of the system; that is a deliberate
+trade, not an oversight.
 
 Start with **[docs/05-status.md](docs/05-status.md)**: what works, what does not,
 how to build and verify, and the traps already found. Then

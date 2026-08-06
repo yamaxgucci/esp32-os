@@ -35,22 +35,12 @@ ag_err_t ag_loader_load(const char *path, const char *cwd,
 void ag_loader_unload(ag_loaded_app_t *app);
 
 /*
- * Calls ag_main on a task of its own and returns its exit code, or the code
- * passed to ag_exit().  The caller waits.
- *
- * The task gives the application its own stack, which is guarded, so an
- * application that overruns it is caught instead of quietly writing over the
- * shell.  It is not yet a process: there is no resource list, no Ctrl-C, and a
- * wild pointer still reaches the rest of the system.  That is the supervisor's
- * job, and the supervisor is not written yet.
+ * The code arena.  Running an image is the process layer's business (argon/proc.h);
+ * what belongs here is how much room there is for one.
  */
-int ag_loader_run(ag_loaded_app_t *app, int argc, char **argv);
-
-/* Ends the running application.  Does not return.  Called by the ABI's exit. */
-void ag_loader_exit(int code);
-
-/* Size of the reserved code arena, and whether an image occupies it. */
 size_t ag_loader_arena_size(void);
+size_t ag_loader_arena_free(void);
+size_t ag_loader_arena_largest(void);
 bool   ag_loader_arena_busy(void);
 
 /* The syscall table handed to applications. */

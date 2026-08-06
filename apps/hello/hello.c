@@ -59,9 +59,14 @@ int ag_main(int argc, char **argv)
               (unsigned)(sizeof(s_big) / 1024), (void *)s_big, dirty, bad);
     ag_printf("this code is at %p\n", (void *)(uintptr_t)&ag_main);
 
+    /*
+     * The arena belongs to this process: what it allocates comes out of here,
+     * and all of it goes back when the process ends, however it ends.
+     */
     ag_meminfo_t mem;
     ag_meminfo(&mem);
-    ag_printf("%u KB of extended memory still free\n",
+    ag_printf("pid %d, arena %u KB with %u KB free\n", (int)ag_getpid(),
+              (unsigned)(mem.arena_total / 1024),
               (unsigned)(mem.arena_free / 1024));
 
     return (dirty == 0 && bad == 0) ? 0 : 1;
