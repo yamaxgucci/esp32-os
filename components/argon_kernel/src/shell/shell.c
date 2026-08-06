@@ -11,6 +11,7 @@
 
 #include <argon/board.h>
 #include <argon/cmdline.h>
+#include <argon/codepage.h>
 #include <argon/console.h>
 #include <argon/kernel.h>
 #include <argon/lineedit.h>
@@ -141,32 +142,6 @@ typedef struct {
     uint16_t col0;
 } prompt_pos_t;
 
-/* Display columns occupied by the first `bytes` bytes of UTF-8 text. */
-static uint16_t cols_of(const char *s, uint16_t bytes)
-{
-    uint16_t cols = 0;
-    for (uint16_t i = 0; i < bytes; i++) {
-        if (((unsigned char)s[i] & 0xc0u) != 0x80u) {
-            cols++;
-        }
-    }
-    return cols;
-}
-
-static uint16_t byte_of_col(const char *s, uint16_t len, uint16_t col)
-{
-    uint16_t cols = 0;
-    for (uint16_t i = 0; i < len; i++) {
-        if (((unsigned char)s[i] & 0xc0u) != 0x80u) {
-            if (cols == col) {
-                return i;
-            }
-            cols++;
-        }
-    }
-    return len;
-}
-
 static void redraw_line(const ag_lineedit_t *le, const prompt_pos_t *pos)
 {
     ag_console_lock();
@@ -174,34 +149,27 @@ static void redraw_line(const ag_lineedit_t *le, const prompt_pos_t *pos)
 
     const uint16_t avail =
         (sc->cols > pos->col0 + 1) ? (uint16_t)(sc->cols - pos->col0) : 1;
-    const uint16_t cursor_col = cols_of(le->buf, le->cursor);
 
     /*
-     * A line longer than the screen scrolls horizontally rather than wrapping;
-     * wrapping would move the prompt row and lose track of where to redraw.
+     * A byte is a character is a column, because the line editor holds code page
+     * bytes - the same bytes the screen holds.  A line longer than the screen
+     * scrolls horizontally rather than wrapping; wrapping would move the prompt
+     * row and lose track of where to redraw.
      */
-    const uint16_t offset =
-        (cursor_col >= avail) ? (uint16_t)(cursor_col - avail + 1) : 0;
+    const uint16_t offset = (le->cursor >= avail)
+                                ? (uint16_t)(le->cursor - avail + 1)
+                                : 0;
+    const uint16_t shown =
+        ((uint16_t)(le->len - offset) < avail) ? (uint16_t)(le->len - offset)
+                                              : avail;
 
     ag_screen_gotoxy(sc, pos->col0, pos->row);
-
-    uint16_t shown = 0;
-    uint16_t i = byte_of_col(le->buf, le->len, offset);
-    while (i < le->len && shown < avail) {
-        uint16_t next = (uint16_t)(i + 1);
-        while (next < le->len &&
-               ((unsigned char)le->buf[next] & 0xc0u) == 0x80u) {
-            next++;
-        }
-        ag_screen_write(sc, le->buf + i, (size_t)(next - i));
-        i = next;
-        shown++;
-    }
+    ag_screen_write(sc, le->buf + offset, shown);
     for (uint16_t x = shown; x < avail; x++) {
         ag_screen_putc_raw(sc, ' ');
     }
 
-    ag_screen_gotoxy(sc, (uint16_t)(pos->col0 + cursor_col - offset), pos->row);
+    ag_screen_gotoxy(sc, (uint16_t)(pos->col0 + le->cursor - offset), pos->row);
     ag_console_unlock();
 }
 
@@ -479,6 +447,44 @@ static int cmd_log(int argc, char **argv)
     return 0;
 }
 
+/*
+ * The screen holds bytes; this says what they mean.  Changing the page does not
+ * rewrite what is already on the screen - the same as changing the font on a PC -
+ * so the sensible time to do it is before printing the text it is meant for.
+ */
+static int cmd_chcp(int argc, char **argv)
+{
+    if (argc < 2) {
+        const ag_cp_t now = ag_cp_active();
+        ag_console_printf("active code page: %u  (%s)\n",
+                          (unsigned)ag_cp_number(now), ag_cp_title(now));
+        for (int i = 0; i < AG_CP_COUNT; i++) {
+            if ((ag_cp_t)i != now) {
+                ag_console_printf("  %u  %s\n",
+                                  (unsigned)ag_cp_number((ag_cp_t)i),
+                                  ag_cp_title((ag_cp_t)i));
+            }
+        }
+        return 0;
+    }
+
+    ag_cp_t chosen;
+    if (!ag_cp_from_number((uint16_t)atoi(argv[1]), &chosen)) {
+        ag_console_printf("%s: no such code page\n", argv[1]);
+        return 1;
+    }
+
+    ag_cp_set_active(chosen);
+
+    /* Every row has to be sent again: the same bytes now mean other characters. */
+    ag_console_lock();
+    ag_screen_mark_all_dirty(ag_console_screen());
+    ag_console_unlock();
+
+    ag_console_printf("active code page: %u\n", (unsigned)ag_cp_number(chosen));
+    return 0;
+}
+
 static int cmd_errorlevel(int argc, char **argv)
 {
     (void)argc;
@@ -617,6 +623,7 @@ static const ag_command_t k_commands[] = {
     {"cls", "", "clear the screen", cmd_cls},
     {"echo", "<text>", "print text", cmd_echo},
     {"color", "<fg> <bg>", "set text colours", cmd_color},
+    {"chcp", "[437|866|1251]", "screen code page", cmd_chcp},
     {"fm", "[left] [right]", "file manager, two panels", cmd_fm},
     {"ps", "", "list running applications", cmd_ps},
     {"kill", "<pid>", "stop an application", cmd_kill},

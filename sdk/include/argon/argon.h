@@ -144,6 +144,17 @@ static inline void ag_fill(uint16_t x, uint16_t y, uint16_t w, uint16_t h,
 
 #define ag_printf(...) (g_ag_api->con->printf(__VA_ARGS__))
 
+/*
+ * The code page the screen's bytes are in: 437, 866 or 1251.  Ask before drawing
+ * anything above ASCII - the byte for a Cyrillic letter is not the same in 866 as
+ * in 1251, and 1251 has no box drawing at all.
+ */
+static inline uint16_t ag_codepage(void) { return g_ag_api->con->codepage(); }
+static inline ag_err_t ag_set_codepage(uint16_t number)
+{
+    return g_ag_api->con->set_codepage(number);
+}
+
 /* ---- files -------------------------------------------------------------- */
 
 static inline ag_handle_t ag_open(const char *p, uint32_t f)

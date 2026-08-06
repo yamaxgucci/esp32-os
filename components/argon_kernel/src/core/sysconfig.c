@@ -9,6 +9,8 @@
 #include <string.h>
 
 #include <argon/board.h>
+#include <argon/codepage.h>
+#include <argon/log.h>
 #include <argon/vfs.h>
 
 #include "esp_heap_caps.h"
@@ -95,6 +97,21 @@ ag_err_t ag_sysconfig_init(void)
      */
     (void)load_one("/sys/BOARD.CFG", "BOARD.CFG");
     (void)load_one("/sys/SYSTEM.CFG", "SYSTEM.CFG");
+
+    /*
+     * The code page is applied here rather than in the console stage, which runs
+     * earlier: an installation whose files are Cyrillic should not have to type
+     * chcp after every boot, and boot messages are ASCII either way.
+     */
+    const int32_t page = ag_cfg_get_int(&s_cfg, "console.codepage", 0);
+    if (page != 0) {
+        ag_cp_t chosen;
+        if (ag_cp_from_number((uint16_t)page, &chosen)) {
+            ag_cp_set_active(chosen);
+        } else {
+            ag_log(AG_LOG_WARN, "config", "no such code page: %d", (int)page);
+        }
+    }
 
     /* Hardware description reaches the board layer even if nothing was read:
      * it is then a no-op, and the defaults stand. */

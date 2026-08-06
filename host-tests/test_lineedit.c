@@ -5,6 +5,8 @@
  */
 #include <argon/lineedit.h>
 
+#include <argon/codepage.h>
+
 #include "test.h"
 
 static ag_lineedit_t g_le;
@@ -208,30 +210,69 @@ static void test_history_dedup_and_depth(void)
     AG_CHECK_STR(g_le.history[AG_HISTORY_DEPTH - 1], "cmd4");
 }
 
-static void test_utf8_moves_by_character(void)
+/*
+ * A typed code point becomes one byte of the active code page - the same byte the
+ * screen will hold and the same byte the command will receive.  The editor is
+ * where that conversion happens, because it is the edge.
+ */
+static void test_typing_cyrillic_in_866(void)
 {
-    /* Cyrillic "да" is four bytes but two characters. */
+    ag_cp_set_active(AG_CP_866);
+
     fresh(NULL);
     key(AG_KEY_NONE, 0x0434, 0); /* д */
     key(AG_KEY_NONE, 0x0430, 0); /* а */
-    AG_CHECK_INT(g_le.len, 4);
-    AG_CHECK_INT(g_le.cursor, 4);
 
-    /* One left arrow must skip the whole character, not land inside it. */
-    key(AG_KEY_LEFT, 0, 0);
+    /* Two characters, two bytes, two columns. */
+    AG_CHECK_INT(g_le.len, 2);
     AG_CHECK_INT(g_le.cursor, 2);
+    AG_CHECK_INT((unsigned char)g_le.buf[0], 0xa4);
+    AG_CHECK_INT((unsigned char)g_le.buf[1], 0xa0);
+
     key(AG_KEY_LEFT, 0, 0);
-    AG_CHECK_INT(g_le.cursor, 0);
-
-    key(AG_KEY_RIGHT, 0, 0);
-    AG_CHECK_INT(g_le.cursor, 2);
-
-    /* And backspace must remove the whole character. */
+    AG_CHECK_INT(g_le.cursor, 1);
     key(AG_KEY_END, 0, 0);
     key(AG_KEY_BACKSPACE, 0, 0);
-    AG_CHECK_INT(g_le.len, 2);
-    AG_CHECK_INT(g_le.buf[0], (char)0xd0);
-    AG_CHECK_INT(g_le.buf[1], (char)0xb4);
+    AG_CHECK_INT(g_le.len, 1);
+    AG_CHECK_INT((unsigned char)g_le.buf[0], 0xa4);
+
+    ag_cp_set_active(AG_CP_437);
+}
+
+/*
+ * And in a page that has no such letter the key does nothing at all.  The
+ * alternative - taking it as some other byte, or as two - would put a character
+ * on the screen that the user did not type.
+ */
+static void test_typing_cyrillic_in_437(void)
+{
+    ag_cp_set_active(AG_CP_437);
+
+    fresh(NULL);
+    key(AG_KEY_NONE, 'a', 0);
+    key(AG_KEY_NONE, 0x0434, 0); /* д, absent from CP437 */
+    key(AG_KEY_NONE, 'b', 0);
+
+    AG_CHECK_STR(g_le.buf, "ab");
+    AG_CHECK_INT(g_le.cursor, 2);
+}
+
+/* A box drawing character types as one byte in both PC pages. */
+static void test_typing_box_drawing(void)
+{
+    ag_cp_set_active(AG_CP_437);
+    fresh(NULL);
+    key(AG_KEY_NONE, 0x2500, 0); /* ─ */
+    AG_CHECK_INT(g_le.len, 1);
+    AG_CHECK_INT((unsigned char)g_le.buf[0], 0xc4);
+
+    ag_cp_set_active(AG_CP_866);
+    fresh(NULL);
+    key(AG_KEY_NONE, 0x2500, 0);
+    AG_CHECK_INT(g_le.len, 1);
+    AG_CHECK_INT((unsigned char)g_le.buf[0], 0xc4);
+
+    ag_cp_set_active(AG_CP_437);
 }
 
 static void test_buffer_full(void)
@@ -274,7 +315,9 @@ void run_lineedit_tests(void)
     test_history();
     test_history_parks_the_current_line();
     test_history_dedup_and_depth();
-    test_utf8_moves_by_character();
+    test_typing_cyrillic_in_866();
+    test_typing_cyrillic_in_437();
+    test_typing_box_drawing();
     test_buffer_full();
     test_non_text_keys_are_ignored();
 }

@@ -300,10 +300,17 @@ try {
 
     # Written here, not after the try: a run that failed is the run whose
     # transcript is worth having, and a throw would have skipped it.
+    #
+    # Byte for byte, through Latin-1: every byte of the line was appended as the
+    # character of the same number, and Latin-1 is the encoding that turns it back
+    # into that byte.  WriteAllText's UTF-8 would encode anything above 0x7f as
+    # two bytes, which was invisible while the guest only ever said ASCII and
+    # turned every Cyrillic character into mojibake the moment it did not.
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $LogPath) |
         Out-Null
     [System.IO.File]::WriteAllText((Join-Path (Get-Location) $LogPath),
-                                   $text.ToString())
+                                   $text.ToString(),
+                                   [System.Text.Encoding]::GetEncoding(28591))
 }
 
 if ($found) {

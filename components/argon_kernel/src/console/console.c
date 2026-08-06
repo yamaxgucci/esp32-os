@@ -8,6 +8,8 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <argon/codepage.h>
+
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -358,8 +360,19 @@ int32_t ag_console_getch(uint32_t timeout_ms)
         if (ev.type == AG_EV_QUIT) {
             return -AG_EKILLED;
         }
+        /*
+         * A byte in the active code page, not a code point: this is what an
+         * application puts on the screen or into a file, and both are bytes.
+         * A character the page cannot represent is not delivered at all - it
+         * would have to become either a wrong byte or two bytes behaving as two
+         * characters, and both are worse than nothing arriving.
+         */
         if (ev.type == AG_EV_KEY_DOWN && ev.key.unicode != 0) {
-            return (int32_t)ev.key.unicode;
+            const int32_t byte =
+                ag_cp_from_unicode(ag_cp_active(), ev.key.unicode);
+            if (byte >= 0) {
+                return byte;
+            }
         }
         if (timeout_ms != UINT32_MAX && now_ms() >= deadline) {
             return -1;
