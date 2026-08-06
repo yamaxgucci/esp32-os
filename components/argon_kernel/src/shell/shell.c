@@ -524,6 +524,19 @@ static int cmd_ps(int argc, char **argv)
     return 0;
 }
 
+/*
+ * The file manager, built into the image.  It is the same code as apps/fm builds
+ * into a .AXE, called here directly instead of being loaded - so a board that
+ * boots has one without anything having to be copied onto it.
+ */
+int ag_fm_main(int argc, char **argv);
+
+static int cmd_fm(int argc, char **argv)
+{
+    /* argv[0] is the command; the manager takes the two panels' directories. */
+    return ag_fm_main(argc, argv);
+}
+
 static int cmd_kill(int argc, char **argv)
 {
     if (argc != 2) {
@@ -604,6 +617,7 @@ static const ag_command_t k_commands[] = {
     {"cls", "", "clear the screen", cmd_cls},
     {"echo", "<text>", "print text", cmd_echo},
     {"color", "<fg> <bg>", "set text colours", cmd_color},
+    {"fm", "[left] [right]", "file manager, two panels", cmd_fm},
     {"ps", "", "list running applications", cmd_ps},
     {"kill", "<pid>", "stop an application", cmd_kill},
     {"fg", "<pid>", "bring an application to the foreground and wait", cmd_fg},

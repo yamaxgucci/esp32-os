@@ -577,3 +577,12 @@ static const ag_api_t k_api = {
 };
 
 const ag_api_t *ag_loader_api(void) { return &k_api; }
+
+/*
+ * The same pointer an application gets, for the parts of the system that are
+ * built into the image but written as applications - the file manager is one.
+ * They call through this table exactly as a loaded program would, which is the
+ * point: if the built-in works, the loaded one works, and the contract is being
+ * used rather than worked around.
+ */
+const ag_api_t *g_ag_api = &k_api;

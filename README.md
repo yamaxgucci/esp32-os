@@ -51,10 +51,11 @@ file.
 * **Applications** are relocatable native images in two parts: code into the
   executable arena in internal SRAM, data and bss into PSRAM. No interpreter, no
   JIT, no sandbox — native speed after load.
-* **A file manager** ships with it (`apps/fm`): two panels, the ten function
-  keys everyone already knows, and it starts other programs and gets the screen
-  back afterwards. 11 KB of code, and the first application that uses the system
-  the way a real one does.
+* **A file manager** is part of the system, not a program to copy onto the board
+  first: type `fm`. Two panels, the ten function keys everyone already knows, and
+  it starts other programs and gets the screen back afterwards. The same source
+  also builds as a loadable `.AXE`, which is how the built-in and the loaded path
+  are kept honest - both go through the one syscall table.
 * **The console** is a virtual text screen rendered simultaneously to UART,
   telnet and a local display, so the same build works headless or with a
   screen and a USB keyboard.

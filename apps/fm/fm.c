@@ -14,7 +14,11 @@
  */
 #include "fm.h"
 
+/* Only the application build declares an image header and an API slot; the
+ * built-in is already inside the image that would have loaded it. */
+#ifndef AG_BUILTIN
 AG_APP("FM", "1.0", "argon", 0);
+#endif
 
 fm_panel_t g_panel[2];
 int        g_active;
@@ -634,17 +638,22 @@ static void choose_drive(int which)
     fm_message("");
 }
 
-int ag_main(int argc, char **argv)
+int FM_ENTRY(int argc, char **argv)
 {
     /*
      * Both panels' entries come out of the process arena, which is the whole
      * point of having one: 512 entries a panel is a quarter of a megabyte, and
      * when this process ends it all goes back without anybody freeing it.
      */
+    g_active = 0;
     for (int i = 0; i < 2; i++) {
+        /* Cleared rather than assumed empty: as a built-in this runs more than
+         * once, and what the last run left behind is not a starting state. */
+        memset(&g_panel[i], 0, sizeof(g_panel[i]));
         g_panel[i].entries =
             (fm_entry_t *)ag_malloc(sizeof(fm_entry_t) * FM_MAX_ENTRIES);
         if (g_panel[i].entries == NULL) {
+            ag_free(g_panel[0].entries);
             ag_print("not enough memory for the panels\n");
             return 1;
         }
@@ -765,5 +774,16 @@ int ag_main(int argc, char **argv)
     ag_color(AG_LGRAY, AG_BLACK);
     ag_cls();
     ag_cursor(true);
+
+    /*
+     * And the memory too.  A process would have it taken back on the way out,
+     * but the built-in runs inside the kernel, where nobody is going to do that
+     * - and a file manager that leaks ninety kilobytes every time it is opened
+     * would be a poor advertisement for the accounting.
+     */
+    for (int i = 0; i < 2; i++) {
+        ag_free(g_panel[i].entries);
+        g_panel[i].entries = NULL;
+    }
     return 0;
 }

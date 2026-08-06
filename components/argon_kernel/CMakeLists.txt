@@ -28,7 +28,12 @@ set(ARGON_KERNEL_SRCS
     "src/proc/supervisor.c"
     "src/shell/lineedit.c"
     "src/shell/shell.c"
-    "src/shell/cmd_fs.c")
+    "src/shell/cmd_fs.c"
+    # The file manager is part of the system, not something to be copied onto a
+    # board before it is useful.  Same sources as the .AXE in apps/fm, built with
+    # AG_BUILTIN: see apps/fm/fm.h.
+    "../../apps/fm/fm.c"
+    "../../apps/fm/fmops.c")
 
 idf_component_register(
     SRCS ${ARGON_KERNEL_SRCS}
@@ -67,7 +72,14 @@ else()
 endif()
 
 target_compile_definitions(${COMPONENT_LIB}
-    PRIVATE ${ARGON_TRACE_DEF} ARGON_BUILD_ID="${ARGON_BUILD_ID}")
+    PRIVATE ${ARGON_TRACE_DEF} ARGON_BUILD_ID="${ARGON_BUILD_ID}"
+            # For the sources shared with apps/: inside the kernel there is a
+            # real C library, and this code is a built-in rather than an image.
+            AG_BUILTIN=1 AG_HAVE_LIBC=1)
+
+# The manager's own header sits next to its sources.
+target_include_directories(${COMPONENT_LIB}
+    PRIVATE "${CMAKE_CURRENT_LIST_DIR}/../../apps/fm")
 
 target_compile_options(${COMPONENT_LIB} PRIVATE
     -Wall -Wextra -Werror=implicit-function-declaration
