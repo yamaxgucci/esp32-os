@@ -32,6 +32,13 @@
 #define AG_CON_EVENT_QUEUE 64
 #define AG_CON_READ_CHUNK 64
 
+/*
+ * How many times a tick will go round reading before it goes back to rendering.
+ * 16 chunks is a kilobyte a tick, comfortably above the line rate; the loop
+ * stops early the moment the ports are empty, which is nearly always.
+ */
+#define AG_CON_DRAIN_ROUNDS 16
+
 typedef struct {
     const ag_con_transport_t *transport;
     void                     *ctx;
@@ -39,7 +46,25 @@ typedef struct {
     ag_vtin_t                 in;
     uint32_t                  last_byte_ms;
     bool                      used;
+    bool                      paused; /* XOFF has been sent to this endpoint */
 } ag_con_endpoint_t;
+
+/*
+ * Flow control on the input side.
+ *
+ * The queue and the backpressure in pump_endpoint stop the console from losing
+ * events, but they cannot stop a sender: bytes keep arriving, the port's own
+ * buffer fills, and the driver drops what does not fit.  For someone typing that
+ * is invisible.  For a file arriving through the recv command it is a file that
+ * is quietly wrong, which is the worst of the possible outcomes - measured, at
+ * 11 KB into a 12 KB transfer.
+ *
+ * XOFF and XON are what a serial line has for exactly this, they cost two bytes,
+ * and every terminal understands them.  The port's buffer absorbs whatever was
+ * already in flight when the sender is told to stop.
+ */
+#define AG_CON_XOFF 0x13
+#define AG_CON_XON 0x11
 
 static ag_screen_t        s_screen;
 static ag_con_endpoint_t  s_endpoints[AG_CON_MAX_ENDPOINTS];
@@ -212,22 +237,46 @@ static void publish(const ag_event_t *ev)
     }
 }
 
-static void pump_endpoint(ag_con_endpoint_t *ep)
+/* Tells the sender to stop while the queue is filling, and to go on once it has
+ * drained.  Two thresholds rather than one, so a queue hovering at the limit does
+ * not turn into a stream of XOFF and XON. */
+static void update_flow(ag_con_endpoint_t *ep, UBaseType_t space)
+{
+    if (ep->transport->write == NULL) {
+        return;
+    }
+
+    if (!ep->paused && space <= AG_CON_EVENT_QUEUE / 2) {
+        const char stop = AG_CON_XOFF;
+        ep->transport->write(ep->ctx, &stop, 1);
+        ep->paused = true;
+    } else if (ep->paused && space >= (AG_CON_EVENT_QUEUE * 3) / 4) {
+        const char go = AG_CON_XON;
+        ep->transport->write(ep->ctx, &go, 1);
+        ep->paused = false;
+    }
+}
+
+/* Returns how many bytes were taken from the port, so the caller knows whether
+ * there is more to do before it goes back to sleep. */
+static int32_t pump_endpoint(ag_con_endpoint_t *ep)
 {
     uint8_t chunk[AG_CON_READ_CHUNK];
 
     if (ep->transport->read == NULL) {
-        return;
+        return 0;
     }
 
     /*
      * Backpressure: never read more bytes than the event queue can accept,
      * since one byte can produce one event.  What is not read stays in the
-     * transport's own buffer, which is where it is safe.
+     * transport's own buffer, which is where it is safe - and the sender is told
+     * to stop before that buffer is the only thing holding the line.
      */
     const UBaseType_t space = uxQueueSpacesAvailable(s_events);
+    update_flow(ep, space);
     if (space == 0) {
-        return;
+        return 0;
     }
     size_t want = sizeof(chunk);
     if ((size_t)space < want) {
@@ -251,6 +300,7 @@ static void pump_endpoint(ag_con_endpoint_t *ep)
             publish(&ev);
         }
     }
+    return n;
 }
 
 void ag_console_flush_input(void)
@@ -363,9 +413,24 @@ static void console_task(void *arg)
     (void)arg;
 
     for (;;) {
-        for (int i = 0; i < AG_CON_MAX_ENDPOINTS; i++) {
-            if (s_endpoints[i].used) {
-                pump_endpoint(&s_endpoints[i]);
+        /*
+         * Read until the ports are empty rather than one chunk a tick.  One chunk
+         * a tick is 64 bytes every 10 ms - 6.4 KB a second, which is *below* the
+         * line rate at 115200 baud: a burst then overran the port's buffer and
+         * lost bytes, which showed up as a file arriving through recv with a hole
+         * in it.  Bounded so that a stuck endpoint cannot keep this task from
+         * rendering, and it stops as soon as there is nothing left, so an idle
+         * console costs exactly what it did before.
+         */
+        for (int round = 0; round < AG_CON_DRAIN_ROUNDS; round++) {
+            int32_t taken = 0;
+            for (int i = 0; i < AG_CON_MAX_ENDPOINTS; i++) {
+                if (s_endpoints[i].used) {
+                    taken += pump_endpoint(&s_endpoints[i]);
+                }
+            }
+            if (taken <= 0) {
+                break;
             }
         }
 
