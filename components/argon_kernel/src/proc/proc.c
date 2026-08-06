@@ -3,7 +3,7 @@
  *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
  */
-#include <argon/proc.h>
+#include "proc/proc_internal.h"
 
 #include <setjmp.h>
 #include <string.h>
@@ -19,16 +19,12 @@
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "multi_heap.h"
 
 #include "fs/storage.h"
-
-/* Bounds on what one process may hold.  A bound that is reached is a diagnosable
- * event; an unbounded list is a leak with extra steps (see argon/reslist.h). */
-#define AG_PROC_RES_MAX 32
-#define AG_PROC_ARGS_MAX 16
 
 /* Stack, in bytes, and the arena an application allocates from. */
 #define AG_PROC_STACK_MIN (2u * 1024u)
@@ -43,49 +39,6 @@
 
 /* How long a process is given to leave the kernel before it is killed anyway. */
 #define AG_PROC_KILL_GRACE_MS 500
-
-typedef struct {
-    bool            used;
-    ag_pid_t        pid;
-    char            name[32];
-    ag_proc_state_t state;
-    uint32_t        flags;
-
-    ag_loaded_app_t   app;
-    TaskHandle_t      task;
-    SemaphoreHandle_t done;
-    int32_t           exit_code;
-    bool              killed;
-    bool              has_waiter; /* somebody is in ag_proc_wait for it      */
-    volatile bool     signalled;
-    jmp_buf           exit_jump;
-
-    int   argc;
-    char *argv[AG_PROC_ARGS_MAX];
-    char  argbuf[AG_LINE_MAX];
-
-    char cwd[AG_PATH_MAX];
-
-    void               *heap_mem;
-    multi_heap_handle_t heap;
-    size_t              heap_size;
-
-    ag_res_t     res_slots[AG_PROC_RES_MAX];
-    ag_reslist_t res;
-
-    ag_time_t started;
-    uint32_t  heartbeat_ms;
-    uint32_t  stack_bytes;
-    uint32_t  stack_unused;
-
-    /*
-     * Who had the console before this one took it.  A process started by another
-     * process gives it back to its parent when it ends, not to the shell - which
-     * is what makes exec() from inside an application behave the way the shell's
-     * own run does.
-     */
-    ag_pid_t prev_foreground;
-} proc_t;
 
 static proc_t            s_procs[AG_PROC_MAX];
 static SemaphoreHandle_t s_lock;
@@ -107,6 +60,9 @@ static void unlock(void)
         xSemaphoreGiveRecursive(s_lock);
     }
 }
+
+void ag_proc_table_lock(void) { lock(); }
+void ag_proc_table_unlock(void) { unlock(); }
 
 static uint32_t now_ms(void) { return (uint32_t)(esp_timer_get_time() / 1000); }
 
@@ -133,6 +89,11 @@ static void set_string(char *dst, size_t len, const char *src)
  * A scan rather than thread-local storage: there are four slots, the comparison
  * is a pointer, and it costs nothing to be independent of how many thread-local
  * slots ESP-IDF happens to reserve for itself.
+ *
+ * The main task of each process is checked first, because that is the common case
+ * by a wide margin - most applications have no threads at all.  Only if none
+ * matches are the threads looked through, which is the slower path and is paid
+ * for only by applications that have some.
  */
 static proc_t *current(void)
 {
@@ -143,8 +104,23 @@ static proc_t *current(void)
             return &s_procs[i];
         }
     }
+
+    for (uint32_t i = 0; i < AG_PROC_MAX; i++) {
+        proc_t *p = &s_procs[i];
+        if (!p->used) {
+            continue;
+        }
+        for (uint32_t j = 0; j < AG_PROC_RES_MAX; j++) {
+            if (p->res_slots[j].type == AG_RES_THREAD &&
+                ag_thread_owns(p->res_slots[j].ref, me)) {
+                return p;
+            }
+        }
+    }
     return NULL;
 }
+
+proc_t *ag_proc_current(void) { return current(); }
 
 static proc_t *by_pid(ag_pid_t pid)
 {
@@ -259,6 +235,16 @@ static void release_resource(ag_res_type_t type, void *ref, uint32_t extra,
         break;
     case AG_RES_FILE:
         (void)ag_vfs_close((ag_handle_t)(intptr_t)ref);
+        break;
+    case AG_RES_THREAD:
+        ag_thread_release(ref);
+        break;
+    case AG_RES_MUTEX:
+    case AG_RES_SEM:
+        vSemaphoreDelete((SemaphoreHandle_t)ref);
+        break;
+    case AG_RES_QUEUE:
+        vQueueDelete((QueueHandle_t)ref);
         break;
     default:
         ag_log(AG_LOG_WARN, "proc", "%s: no way to release a %s yet", p->name,
@@ -707,14 +693,21 @@ ag_err_t ag_proc_kill(ag_pid_t pid, const char *reason)
     p->exit_code = -AG_EKILLED;
     p->state = AG_PS_ZOMBIE;
 
+    /*
+     * Whoever is waiting for it owns the collecting, so it is woken; with nobody
+     * waiting, the killer does it here and now, so that ps right after a kill
+     * shows the truth rather than a corpse the supervisor has not swept up yet.
+     */
     SemaphoreHandle_t done = p->done;
+    const bool        waited_for = p->has_waiter;
+    if (!waited_for) {
+        reap(p);
+    }
     unlock();
 
     console_restore();
 
-    /* Wakes whoever is waiting, which is who reaps it.  With nobody waiting the
-     * supervisor collects it on its next round. */
-    if (done != NULL) {
+    if (waited_for && done != NULL) {
         xSemaphoreGive(done);
     }
     return AG_OK;

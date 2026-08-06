@@ -31,7 +31,7 @@ extern "C" {
  * subtable that stops being NULL.  An image built against an older minor keeps
  * running, which is why the loader compares them rather than demanding a match.
  *
- * 0.2 added the proc subtable, and proc->interrupted with it.
+ * 0.2 added the proc and task subtables, and proc->interrupted with them.
  */
 #define AG_ABI_MAJOR 0u
 #define AG_ABI_MINOR 2u

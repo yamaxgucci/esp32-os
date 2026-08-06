@@ -23,6 +23,7 @@ set(ARGON_KERNEL_SRCS
     "src/loader/loader.c"
     "src/loader/api.c"
     "src/proc/proc.c"
+    "src/proc/threads.c"
     "src/proc/supervisor.c"
     "src/shell/lineedit.c"
     "src/shell/shell.c"

@@ -110,6 +110,13 @@ bool ag_proc_interrupted(void);
 /* Says the process is alive, for the watchdog.  What the ABI's heartbeat does. */
 void ag_proc_heartbeat(void);
 
+/*
+ * The threads-and-synchronisation subtable of the ABI, defined by the process
+ * layer because everything in it belongs to a process.  A constant, so the
+ * syscall table can point at it without a call at start-up.
+ */
+extern const ag_task_api_t ag_task_api_table;
+
 #ifdef __cplusplus
 }
 #endif
