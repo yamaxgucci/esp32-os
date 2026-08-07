@@ -9,6 +9,7 @@
 #include <string.h>
 
 #include <argon/codepage.h>
+#include <argon/display.h>
 
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
@@ -135,6 +136,8 @@ static void render_all(void)
         ag_vtout_take_dirty(&ep->out, &s_screen);
         ag_vtout_flush(&ep->out, &s_screen, sink_to_transport, ep);
     }
+    /* Soft (or panel) local fb, while graphics mode has not taken it over. */
+    ag_display_render_console(&s_screen);
     ag_screen_clear_dirty(&s_screen);
 }
 

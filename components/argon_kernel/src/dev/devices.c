@@ -17,6 +17,7 @@
 #include <argon/console.h>
 #include <argon/devfs.h>
 #include <argon/device.h>
+#include <argon/display.h>
 #include <argon/keys.h>
 #include <argon/log.h>
 #include <argon/vfs.h>
@@ -242,6 +243,12 @@ ag_err_t ag_devices_init(void)
     /* Whatever storage found while mounting: the flash partition, and later
      * the card, which registers itself when it is mounted. */
     ag_storage_register_devices();
+
+    /* Soft RGB565 framebuffer (or later a panel driver).  BOARD.CFG sizes it. */
+    err = ag_display_init();
+    if (err != AG_OK) {
+        return err;
+    }
 
     ag_log(AG_LOG_INFO, "dev", "%u devices", (unsigned)ag_dev_count());
     return AG_OK;

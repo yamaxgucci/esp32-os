@@ -67,7 +67,7 @@ if (AG_HAS(ag_api()->inp, key_pressed)) { ... }   /* есть ли вызов в
 | [`proc`](#proc--процессы) | ⚠ | процессы; `getenv`/`setenv` — `NULL` |
 | [`dev`](#dev--устройства) | ✅ | реестр, `/dev`, `ioctl`; `add`/`remove` для `.SYS` |
 | [`io`](#io--железо-напрямую) | ⚠ | GPIO, прерывания, I2C, SPI, UART, PWM; `adc_read` — `NULL` без `CONFIG_ARGON_ENABLE_ADC` |
-| `gfx` | ⬜ `NULL` | графика — фаза 3 |
+| [`gfx`](#gfx--графика) | ✅ | soft RGB565 framebuffer; панели SPI — позже |
 | `cfg` | ⬜ `NULL` | доступ к `SYSTEM.CFG` из приложения |
 | `net` | ⬜ `NULL` | сеть — фаза 3 |
 
@@ -75,7 +75,7 @@ if (AG_HAS(ag_api()->inp, key_pressed)) { ... }   /* есть ли вызов в
 
 ```c
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 7u
+#define AG_ABI_MINOR 8u
 ```
 
 * **minor + 1** — таблица выросла: новый вызов в конце подтаблицы, новая
@@ -83,7 +83,7 @@ if (AG_HAS(ag_api()->inp, key_pressed)) { ... }   /* есть ли вызов в
 * **major + 1** — всё остальное: изменение сигнатуры, удаление, перестановка.
 
 Загрузчик пускает образ, если `major` совпал, а `minor` образа **не больше**
-системного. Собранное против 0.1 работает на 0.2; собранное против 0.7 на 0.6 —
+системного. Собранное против 0.1 работает на 0.2; собранное против 0.8 на 0.7 —
 нет, и получает `built for a different version of this system`.
 
 Проверять наличие конкретного вызова нужно не по версии, а по таблице — каждая
@@ -371,7 +371,31 @@ if (ag_codepage() == 866) {
 знает ничего — и в этом смысл: столбцы считаются в ячейках, а не в байтах.
 
 `info` заполняет `ag_coninfo_t`: размер, положение курсора, текущий атрибут и
-`has_local_display` (сейчас всегда `false` — дисплея ещё нет).
+`has_local_display` (`true`, когда soft/`fb0` или будущая панель подняты).
+
+## `gfx` — графика
+
+```c
+ag_err_t acquire(ag_gfxinfo_t *out);
+void     release(void);
+void     flush(uint16_t x, uint16_t y, uint16_t w, uint16_t h);
+void     swap(void);
+void     clear(uint32_t color);          /* 0x00RRGGBB */
+void     fill_rect(int16_t x, int16_t y, uint16_t w, uint16_t h, uint32_t color);
+void     blit(...);
+int32_t  text(int16_t x, int16_t y, const char *s, uint32_t fg, uint32_t bg);
+void     backlight(uint8_t percent);    /* no-op на soft */
+```
+
+Сейчас бэкенд — **программный** RGB565 framebuffer в PSRAM (`d:\fb0`, по
+умолчанию 320×240). `acquire` отдаёт указатель на буфер (`direct = true`);
+текстовый blit на этот fb на время захвата останавливается. `release`
+возвращает текст. Цвета — `0x00RRGGBB`. Шрифт ядра — 8×16.
+
+Без дисплея (`display.driver = none`) `acquire` даёт `-AG_ENODEV`. Флаг
+образа `AG_AXE_NEEDS_GFX` отказывает в запуске, если дисплея нет.
+
+Проверка в QEMU: `apps/gfxdemo`, затем `gfxdump t:\shot.ppm`.
 
 ## `inp` — ввод событиями
 

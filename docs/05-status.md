@@ -80,7 +80,7 @@ argon flash -port COM5   прошить настоящую плату
 | RAM-диск `T:` | `src/fs/ramfs.c` | ✅ 1 МБ в PSRAM |
 | FAT на flash `C:` | `src/fs/idfvfs.c`, `storage.c` | ✅ |
 | FAT на SD `A:` | `storage.c` | ✅ SDMMC и SPI, `format a:` |
-| Шелл | `src/shell/` | ✅ история, перенаправление, 31 команда |
+| Шелл | `src/shell/` | ✅ история, перенаправление, 32 команды |
 | Загрузчик `.AXE` | `src/loader/`, `tools/mkaxe.py` | ✅ две части, см. ниже |
 | Арена кода | `src/core/arena.c` | ✅ несколько образов в 64 КБ |
 | Модель процессов | `src/proc/proc.c` | ✅ до 4 процессов, арена, cwd, учёт ресурсов |
@@ -93,10 +93,11 @@ argon flash -port COM5   прошить настоящую плату
 | Текстовый редактор | `apps/edit/` | ✅ **команда `edit`**, встроена; до 64 КБ / 2048 строк, F2 сохранить |
 | Реестр устройств | `src/dev/device.c` | ✅ классы, владельцы, эксклюзивный доступ, отзыв при извлечении |
 | Устройства как файлы | `src/dev/devfs.c` | ✅ `/dev` — диск `D:`, одна таблица дескрипторов с файлами |
-| Встроенные устройства | `src/dev/devices.c`, `storage.c` | ✅ `null zero con flash0 sd0`, команда `dev` |
+| Встроенные устройства | `src/dev/devices.c`, `storage.c` | ✅ `null zero con flash0 sd0 fb0`, команда `dev` |
+| Soft display / `gfx` | `src/dev/display.c`, `font8x16.c` | ✅ RGB565 в PSRAM (320×240), ABI 0.8, `gfxdump`, демо `apps/gfxdemo` |
 | Владение пинами | `src/dev/ioclaim.c` | ✅ пины системы, занятые пины, возврат за упавшим процессом |
 | Железо напрямую | `src/dev/io.c` | ✅ GPIO, ISR, I2C, SPI, UART, PWM; команда `io`, скан I2C |
-| Таблица ABI | `src/loader/api.c` | ⚠ 0.7: `sys mem fs con time proc task inp dev io`, остальные `NULL` |
+| Таблица ABI | `src/loader/api.c` | ⚠ 0.8: `sys mem fs con time proc task inp dev io gfx`, `cfg`/`net` — `NULL` |
 | Загрузчик `.SYS` | `src/loader/module.c` | ✅ `ag_driver_init`, резидент, `drv`, стадия `modules`, пример `apps/echo` |
 | Probe I2C | `src/loader/probe.c` | ✅ `modules.probe`, `drv probe`, `ag_probe_hint`, пример `apps/whoami` |
 
@@ -216,6 +217,15 @@ argon flash -port COM5   прошить настоящую плату
 python tools/mkaxe.py --arch xtensa --gcc xtensa-esp32s3-elf-gcc \
     --include sdk/include -o build\HELLO.AXE apps/hello/hello.c
 argon test -Put "build\HELLO.AXE=t:\hello.axe" "run t:\hello.axe alpha"
+```
+
+Soft graphics (без платы):
+
+```
+python tools/mkaxe.py --arch xtensa --gcc xtensa-esp32s3-elf-gcc \
+    --include sdk/include -o build\GFXDEMO.AXE apps/gfxdemo/gfxdemo.c
+argon test -Put "build\GFXDEMO.AXE=t:\gfxdemo.axe" \
+    "run t:\gfxdemo.axe" "gfxdump t:\shot.ppm" "dir t:\shot.ppm"
 ```
 
 Вручную доставить в эмулятор: `recv t:\hello.axe`, затем строки hex, затем `END`.
@@ -496,9 +506,10 @@ argon test -Sd -Put 'build\DEVS.AXE=t:\devs.axe' 'run t:\devs.axe' 'errorlevel'
 
    Это же фундамент под **универсальную сборку с приёмом драйверов на месте** —
    фаза 4.5 в [04-roadmap.md](04-roadmap.md), добавлена 6 августа 2026.
-6. **Дисплей и ввод**: класс `display`, драйверы ST7789/ILI9341/SSD1306, рендер
-   текстового экрана шрифтом, переключение текст/графика, подтаблица `gfx`;
-   USB host для HID-клавиатуры, подтаблица `inp`. Это закрывает критерий v1.
+6. **Дисплей и ввод**: ✅ soft framebuffer + `gfx` (ABI 0.8) уже в QEMU без
+   платы — `fb0`, шрифт 8×16, текст→fb, `gfxdump`, `apps/gfxdemo`. Дальше на
+   железо: драйверы ST7789/ILI9341/SSD1306 / RGB-панель, USB host HID
+   (клавиатура), доводка `inp`. Это закрывает критерий v1.
    Сюда же добавился класс `audio` (I2S) — без него не будет ни звука, ни
    эмулятора.
 7. **littlefs вместо FAT для `/sys`** — переживает пропадание питания.
@@ -536,9 +547,10 @@ argon test -Sd -Put 'build\DEVS.AXE=t:\devs.axe' 'run t:\devs.axe' 'errorlevel'
   ArgonOS на незнакомой плате», от требований к модулю до таблицы симптомов.
 * ✅ примеры в `apps/`: `hello` (две части образа, константы, bss больше арены),
   **`disk` (файлы и диски)**, **`devs` (устройства и железо напрямую)**,
-  **`echo` / `whoami` (`.SYS`)**, `spin`, `leak`, `threads`, `crash`, `fm`,
-  `edit`. Приложения проверяют себя сами (`run` + `errorlevel`); `echo` —
-  через `drv load`; `whoami` — через probe hint; `edit` — встроенная команда.
+  **`echo` / `whoami` (`.SYS`)**, **`gfxdemo` (soft gfx)**, `spin`, `leak`,
+  `threads`, `crash`, `fm`, `edit`. Приложения проверяют себя сами (`run` +
+  `errorlevel`); `echo` — через `drv load`; `whoami` — через probe hint;
+  `edit` — встроенная команда; `gfxdemo` — `AG_AXE_NEEDS_GFX` + `gfxdump`.
 
 Написано после модели процессов, как и планировалось: подтаблицы `task` и `proc`
 появились там же, и описывать ABI до них значило бы переписывать дважды.

@@ -15,6 +15,7 @@
 #include <argon/console.h>
 #include <argon/devfs.h>
 #include <argon/device.h>
+#include <argon/display.h>
 #include <argon/kernel.h>
 #include <argon/loader.h>
 #include <argon/log.h>
@@ -267,7 +268,7 @@ static void api_coninfo(ag_coninfo_t *out)
     out->cur_x = sc->cur_x;
     out->cur_y = sc->cur_y;
     out->attr = sc->attr;
-    out->has_local_display = false;
+    out->has_local_display = ag_display_ready();
     ag_console_unlock();
 }
 
@@ -719,8 +720,8 @@ static const ag_proc_api_t k_proc = {
 
 /*
  * Subsystems that do not exist yet are NULL rather than stubs that fail.  An
- * application can then ask - if (ag_api()->gfx) - and adapt, which is what the
- * feature probing in the ABI is for.
+ * application can then ask - if (ag_api()->net) - and adapt, which is what the
+ * feature probing in the ABI is for.  gfx is live from 0.8 (soft framebuffer).
  */
 static const ag_api_t k_api = {
     .size = sizeof(ag_api_t),
@@ -731,7 +732,7 @@ static const ag_api_t k_api = {
     .fs = &k_fs,
     .con = &k_con,
     .inp = &k_inp,
-    .gfx = NULL,
+    .gfx = &ag_gfx_api_table,
     .dev = &k_dev,
     .io = &ag_io_api_table,
     .time = &k_time,
