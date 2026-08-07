@@ -28,6 +28,7 @@
 #include "boot/platform.h"
 #include "console/uart_console.h"
 #include "core/sysconfig.h"
+#include "dev/devices.h"
 #include "fs/storage.h"
 #include "proc/supervisor.h"
 
@@ -147,7 +148,7 @@ static const ag_stage_desc_t s_stages[AG_STAGE_COUNT] = {
     [AG_STAGE_CONSOLE]    = {"console",    stage_console,  true},
     [AG_STAGE_STORAGE]    = {"storage",    ag_storage_init, false},
     [AG_STAGE_CONFIG]     = {"config",     ag_sysconfig_init, false},
-    [AG_STAGE_DEVICES]    = {"devices",    NULL,           false},
+    [AG_STAGE_DEVICES]    = {"devices",    ag_devices_init, false},
     [AG_STAGE_MEDIA]      = {"media",      ag_storage_mount_media, false},
     [AG_STAGE_MODULES]    = {"modules",    NULL,           false},
     [AG_STAGE_SUPERVISOR] = {"supervisor", ag_supervisor_init, false},

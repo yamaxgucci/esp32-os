@@ -206,11 +206,21 @@ int ag_cmd_type(int argc, char **argv)
 
     char    chunk[AG_COPY_CHUNK];
     int32_t n;
+    bool    stopped = false;
     while ((n = ag_vfs_read(h, chunk, sizeof(chunk))) > 0) {
         ag_console_write(chunk, (size_t)n);
+        /* A device has no end; the operator is the end. */
+        if (ag_shell_interrupted()) {
+            stopped = true;
+            break;
+        }
     }
     ag_vfs_close(h);
 
+    if (stopped) {
+        ag_console_puts("\n^C\n");
+        return 1;
+    }
     if (n < 0) {
         print_error(argv[1], n);
         return 1;
@@ -280,6 +290,17 @@ int ag_cmd_copy(int argc, char **argv)
             break;
         }
         total += (uint64_t)written;
+
+        /*
+         * Copying from a device that never ends fills the destination until the
+         * media is full, so the operator has to be able to say when.  What has
+         * been written stays written - it is a real file, just a shorter one.
+         */
+        if (ag_shell_interrupted()) {
+            ag_console_puts("^C\n");
+            status = 1;
+            break;
+        }
     }
     if (n < 0) {
         print_error(argv[1], n);
@@ -648,6 +669,12 @@ int ag_cmd_hexdump(int argc, char **argv)
         }
         ag_console_puts("|\n");
         offset += (uint32_t)n;
+
+        if (ag_shell_interrupted()) {
+            ag_console_puts("^C\n");
+            ag_vfs_close(h);
+            return 1;
+        }
     }
     ag_vfs_close(h);
 

@@ -33,9 +33,11 @@ extern "C" {
  *
  * 0.2 added the proc and task subtables, and proc->interrupted with them.
  * 0.3 added con->codepage and con->set_codepage at the end of the con subtable.
+ * 0.4 made dev stop being NULL: the device registry, /dev, and the ioctl
+ *     numbering with it.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 3u
+#define AG_ABI_MINOR 4u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -437,6 +439,14 @@ typedef enum {
     AG_DEV_MOTOR,
 } ag_dev_class_t;
 
+enum ag_dev_flags {
+    AG_DEVF_EXCLUSIVE = 1u << 0, /* one holder at a time; second open is EBUSY */
+    AG_DEVF_HOTPLUG = 1u << 1,   /* can disappear while open                   */
+    AG_DEVF_DMA = 1u << 2,       /* transfers can go straight to DMA memory    */
+    AG_DEVF_READONLY = 1u << 3,  /* opening for writing fails with EROFS       */
+    AG_DEVF_BUSY = 1u << 4,      /* reported by enumerate: somebody has it open */
+};
+
 typedef struct {
     char           name[24];
     char           driver[24];
@@ -444,6 +454,33 @@ typedef struct {
     uint32_t       flags;
 } ag_devinfo_t;
 
+/*
+ * ioctl command numbers.  The class is in the high half, so a command meant for
+ * a disk that reaches a sensor fails instead of meaning something else there.
+ * AG_DEV_ANY commands are the ones every device answers.
+ */
+#define AG_IOC(cls, nr) ((uint32_t)(((uint32_t)(cls) << 16) | (uint16_t)(nr)))
+
+enum ag_ioctl_cmd {
+    AG_IOC_INFO = AG_IOC(AG_DEV_ANY, 1),  /* arg: ag_devinfo_t              */
+    AG_IOC_RESET = AG_IOC(AG_DEV_ANY, 2), /* arg: NULL                      */
+    AG_IOC_FLUSH = AG_IOC(AG_DEV_ANY, 3), /* arg: NULL                      */
+
+    AG_IOC_GEOMETRY = AG_IOC(AG_DEV_STORAGE, 1), /* arg: ag_geometry_t      */
+};
+
+typedef struct {
+    uint32_t sector_size; /* smallest unit the media reads and writes      */
+    uint64_t sectors;
+} ag_geometry_t;
+
+/*
+ * A device is a byte addressable object with a name, and the handle carries the
+ * position - so fs->read, fs->write and fs->seek work on "/dev/sd0" exactly as
+ * they do on a file, and `copy` needs no special case for a device.  This
+ * sub-table is the other way in: it opens by bare name, and it carries the two
+ * things a file has no room for, ioctl and the class vtable.
+ */
 typedef struct ag_dev_api {
     uint32_t size;
 

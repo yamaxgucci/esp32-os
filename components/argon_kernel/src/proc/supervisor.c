@@ -48,6 +48,7 @@
 static TaskHandle_t      s_task;
 static volatile bool     s_stop_request;
 static volatile bool     s_interrupt_request;
+static volatile bool     s_shell_interrupt;
 static volatile ag_pid_t s_kill_request;
 static uint32_t          s_stops;
 
@@ -105,6 +106,13 @@ static bool hotkeys(ag_event_t *ev)
                 xTaskNotifyGive(s_task);
             }
             ev->type = AG_EV_QUIT;
+        } else {
+            /*
+             * Aimed at the shell.  Recorded rather than acted on, and the key
+             * still goes through: at the prompt it cancels the line, and in the
+             * middle of a long command it is what that command is checking for.
+             */
+            s_shell_interrupt = true;
         }
         return false;
     }
@@ -276,6 +284,10 @@ static void supervisor_task(void *arg)
 uint32_t ag_supervisor_stops(void) { return s_stops; }
 
 bool ag_supervisor_running(void) { return s_task != NULL; }
+
+bool ag_supervisor_interrupted(void) { return s_shell_interrupt; }
+
+void ag_supervisor_clear_interrupt(void) { s_shell_interrupt = false; }
 
 ag_err_t ag_supervisor_init(void)
 {

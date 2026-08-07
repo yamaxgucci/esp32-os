@@ -315,6 +315,22 @@ uint32_t ag_vfs_open_count(void)
     return n;
 }
 
+void *ag_vfs_backend_object(ag_handle_t h, const ag_fs_ops_t *ops)
+{
+    void *obj = NULL;
+
+    lock();
+    const ag_vfs_handle_slot_t *s = slot_of(h);
+    if (s != NULL && !s->is_root && !s->is_dir) {
+        const ag_mount_t *m = &s_mounts[s->mount];
+        if (m->used && !m->ejected && m->ops == ops) {
+            obj = s->obj;
+        }
+    }
+    unlock();
+    return obj;
+}
+
 uint32_t ag_vfs_close_owned_by(ag_pid_t pid)
 {
     uint32_t closed = 0;

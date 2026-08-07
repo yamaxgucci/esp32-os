@@ -5,9 +5,12 @@
  */
 #include "fs/storage.h"
 
+#include <string.h>
 #include <time.h>
 
 #include <argon/board.h>
+#include <argon/device.h>
+#include <argon/log.h>
 #include <argon/ramfs.h>
 #include <argon/vfs.h>
 
@@ -15,6 +18,7 @@
 #include "driver/sdspi_host.h"
 #include "driver/spi_common.h"
 #include "esp_heap_caps.h"
+#include "esp_partition.h"
 #include "esp_vfs_fat.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -234,8 +238,220 @@ static esp_err_t mount_sd_spi(const ag_board_sd_t *sd, bool allow_format)
                                    &s_sd_card);
 }
 
+/* ---------------------------------------------------------------------- */
+/* The media as devices                                                   */
+/* ---------------------------------------------------------------------- */
+
+/*
+ * Both of these are read-only, and that is a decision rather than a gap.  The
+ * filesystem above them is mounted and has its own cache; writing underneath it
+ * would corrupt what it thinks it wrote, and on the flash partition it would
+ * also go behind the wear levelling, which is the one thing keeping the board
+ * from wearing a hole in one sector.  Reading is what a device node is for
+ * here: looking at what is actually on the media when the filesystem disagrees
+ * with what you expect.
+ */
+
+static ag_device_t *s_flash_dev;
+static ag_device_t *s_sd_dev;
+static uint8_t     *s_sd_bounce; /* one sector, DMA capable                */
+
+static uint64_t flash_size(ag_device_t *dev)
+{
+    return ((const esp_partition_t *)dev->priv)->size;
+}
+
+static int32_t flash_read(ag_device_t *dev, void *buf, size_t len, uint64_t off)
+{
+    const esp_partition_t *part = (const esp_partition_t *)dev->priv;
+
+    if (off >= part->size) {
+        return 0;
+    }
+    if (off + len > part->size) {
+        len = (size_t)(part->size - off);
+    }
+    if (esp_partition_read(part, (size_t)off, buf, len) != ESP_OK) {
+        return -AG_EIO;
+    }
+    return (int32_t)len;
+}
+
+static ag_err_t flash_ioctl(ag_device_t *dev, uint32_t cmd, void *arg,
+                            size_t arglen)
+{
+    const esp_partition_t *part = (const esp_partition_t *)dev->priv;
+
+    if (cmd != AG_IOC_GEOMETRY) {
+        return -AG_ENOTSUP;
+    }
+    if (arg == NULL || arglen < sizeof(ag_geometry_t)) {
+        return -AG_EINVAL;
+    }
+
+    /* The erase block, not the read granularity: it is what a write costs. */
+    const uint32_t erase = (part->erase_size > 0) ? part->erase_size : 4096u;
+
+    ag_geometry_t *geo = (ag_geometry_t *)arg;
+    geo->sector_size = erase;
+    geo->sectors = part->size / erase;
+    return AG_OK;
+}
+
+static const ag_dev_ops_t k_flash_ops = {
+    .read = flash_read,
+    .ioctl = flash_ioctl,
+    .size = flash_size,
+};
+
+static uint64_t sd_sector_size(const sdmmc_card_t *card)
+{
+    return (card->csd.sector_size > 0) ? (uint64_t)card->csd.sector_size : 512u;
+}
+
+static uint64_t sd_dev_size(ag_device_t *dev)
+{
+    const sdmmc_card_t *card = (const sdmmc_card_t *)dev->priv;
+    return (uint64_t)card->csd.capacity * sd_sector_size(card);
+}
+
+/*
+ * A sector at a time through a bounce buffer, so that a read of sixteen bytes
+ * at an odd offset works - which is what a hexdump of the boot sector is.  It
+ * is not the way to copy a whole card and does not pretend to be; the card is
+ * mounted as A: and copying files off it is what that mount is for.
+ */
+static int32_t sd_dev_read(ag_device_t *dev, void *buf, size_t len,
+                           uint64_t off)
+{
+    sdmmc_card_t  *card = (sdmmc_card_t *)dev->priv;
+    const uint64_t ss = sd_sector_size(card);
+    const uint64_t total = (uint64_t)card->csd.capacity * ss;
+
+    if (s_sd_bounce == NULL) {
+        return -AG_ENOMEM;
+    }
+    if (off >= total) {
+        return 0;
+    }
+    if (off + len > total) {
+        len = (size_t)(total - off);
+    }
+
+    uint8_t *out = (uint8_t *)buf;
+    size_t   done = 0;
+    while (done < len) {
+        const uint64_t here = off + done;
+        const uint64_t sector = here / ss;
+        const size_t   in_sector = (size_t)(here % ss);
+        size_t         chunk = (size_t)ss - in_sector;
+        if (chunk > len - done) {
+            chunk = len - done;
+        }
+
+        if (sdmmc_read_sectors(card, s_sd_bounce, (size_t)sector, 1) !=
+            ESP_OK) {
+            /* Partial success is still success: say how much arrived. */
+            return (done > 0) ? (int32_t)done : -AG_EIO;
+        }
+        memcpy(out + done, s_sd_bounce + in_sector, chunk);
+        done += chunk;
+    }
+    return (int32_t)done;
+}
+
+static ag_err_t sd_dev_ioctl(ag_device_t *dev, uint32_t cmd, void *arg,
+                             size_t arglen)
+{
+    const sdmmc_card_t *card = (const sdmmc_card_t *)dev->priv;
+
+    if (cmd != AG_IOC_GEOMETRY) {
+        return -AG_ENOTSUP;
+    }
+    if (arg == NULL || arglen < sizeof(ag_geometry_t)) {
+        return -AG_EINVAL;
+    }
+
+    ag_geometry_t *geo = (ag_geometry_t *)arg;
+    geo->sector_size = (uint32_t)sd_sector_size(card);
+    geo->sectors = card->csd.capacity;
+    return AG_OK;
+}
+
+static const ag_dev_ops_t k_sd_ops = {
+    .read = sd_dev_read,
+    .ioctl = sd_dev_ioctl,
+    .size = sd_dev_size,
+};
+
+void ag_storage_register_devices(void)
+{
+    if (s_flash_dev != NULL) {
+        return;
+    }
+
+    const esp_partition_t *part = esp_partition_find_first(
+        ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, AG_SYS_PARTITION);
+    if (part == NULL) {
+        return;
+    }
+
+    const ag_dev_desc_t desc = {
+        .name = "flash0",
+        .driver = "spiflash",
+        .cls = AG_DEV_STORAGE,
+        .flags = AG_DEVF_READONLY,
+        .ops = &k_flash_ops,
+        .priv = (void *)part,
+    };
+    (void)ag_dev_register(&desc, &s_flash_dev);
+}
+
+static void sd_register_device(void)
+{
+    if (s_sd_dev != NULL || s_sd_card == NULL) {
+        return;
+    }
+
+    if (s_sd_bounce == NULL) {
+        s_sd_bounce = heap_caps_malloc((size_t)sd_sector_size(s_sd_card),
+                                       MALLOC_CAP_DMA);
+        if (s_sd_bounce == NULL) {
+            ag_log(AG_LOG_WARN, "dev", "no DMA buffer for sd0");
+            return;
+        }
+    }
+
+    const ag_dev_desc_t desc = {
+        .name = "sd0",
+        .driver = (ag_board()->sd.kind == AG_SD_SDMMC) ? "sdmmc" : "sdspi",
+        .cls = AG_DEV_STORAGE,
+        .flags = AG_DEVF_READONLY | AG_DEVF_HOTPLUG,
+        .ops = &k_sd_ops,
+        .priv = s_sd_card,
+    };
+    (void)ag_dev_register(&desc, &s_sd_dev);
+}
+
+/*
+ * The card is going away.  Revoke rather than unregister: somebody may be
+ * holding a handle, and they have to be told on their next call instead of
+ * being waited for.
+ */
+static void sd_revoke_device(void)
+{
+    if (s_sd_dev != NULL) {
+        (void)ag_dev_revoke(s_sd_dev);
+        s_sd_dev = NULL;
+    }
+}
+
+/* ---------------------------------------------------------------------- */
+
 static void unmount_media(void)
 {
+    sd_revoke_device();
+
     if (s_sdfs != NULL) {
         /* Eject rather than unmount: whatever is open must fail, not block. */
         (void)ag_vfs_eject("/sd");
@@ -276,8 +492,13 @@ static ag_err_t mount_media(bool allow_format)
     if (rc != AG_OK) {
         (void)esp_vfs_fat_sdcard_unmount(AG_SD_BASE_PATH, s_sd_card);
         s_sd_card = NULL;
+        return rc;
     }
-    return rc;
+
+    /* The card is here and readable, so it is also a device.  A failure to
+     * register it costs the device node and nothing else, so the mount stands. */
+    sd_register_device();
+    return AG_OK;
 }
 
 ag_err_t ag_storage_mount_media(void) { return mount_media(false); }

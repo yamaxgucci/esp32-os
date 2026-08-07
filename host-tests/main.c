@@ -16,6 +16,7 @@ void run_vtin_tests(void);
 void run_cmdline_tests(void);
 void run_lineedit_tests(void);
 void run_vfs_tests(void);
+void run_device_tests(void);
 void run_journal_tests(void);
 void run_axeload_tests(void);
 void run_codepage_tests(void);
@@ -32,6 +33,7 @@ int main(void)
     run_cmdline_tests();
     run_lineedit_tests();
     run_vfs_tests();
+    run_device_tests();
     run_journal_tests();
     run_axeload_tests();
     run_codepage_tests();

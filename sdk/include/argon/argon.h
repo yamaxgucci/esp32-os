@@ -213,6 +213,33 @@ static inline ag_err_t ag_mountinfo(const char *mount, ag_fsinfo_t *o)
     return g_ag_api->fs->mountinfo(mount, o);
 }
 
+/* ---- devices ------------------------------------------------------------ */
+
+/*
+ * A device handle is a file handle: ag_read, ag_write, ag_seek and ag_close all
+ * work on it, and so does opening "D:\\sd0" with ag_open.  What this adds is
+ * opening by bare name, asking what exists, and the two things a file has no
+ * room for - ioctl and the class vtable.
+ */
+static inline ag_err_t ag_dev_enumerate(uint32_t index, ag_dev_class_t filter,
+                                        ag_devinfo_t *o)
+{
+    return g_ag_api->dev->enumerate(index, filter, o);
+}
+static inline ag_handle_t ag_dev_open(const char *name)
+{
+    return g_ag_api->dev->open(name);
+}
+static inline ag_err_t ag_dev_ioctl(ag_handle_t h, uint32_t cmd, void *arg,
+                                    size_t arglen)
+{
+    return g_ag_api->dev->ioctl(h, cmd, arg, arglen);
+}
+static inline const void *ag_dev_ops(ag_handle_t h)
+{
+    return g_ag_api->dev->ops(h);
+}
+
 /* ---- processes ---------------------------------------------------------- */
 
 /* Runs another application and waits for it; returns its exit code. */
