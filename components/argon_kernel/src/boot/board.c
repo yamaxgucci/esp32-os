@@ -27,6 +27,10 @@ static void apply_generic_defaults(void)
     s_board.console_cols = 80;
     s_board.console_rows = 25;
 
+    strcpy(s_board.display.driver, "soft");
+    s_board.display.width = 320;
+    s_board.display.height = 240;
+
     s_board.sd.kind = AG_SD_SDMMC;
     s_board.sd.clk = 14;
     s_board.sd.cmd = 15;
@@ -205,5 +209,22 @@ ag_err_t ag_board_apply_config(const ag_cfg_t *cfg)
     }
 
     apply_bus_config(cfg);
+
+    const char *disp = ag_cfg_get(cfg, "display.driver", NULL);
+    if (disp != NULL && disp[0] != '\0') {
+        snprintf(s_board.display.driver, sizeof(s_board.display.driver), "%s",
+                 disp);
+    }
+    const int32_t dw = ag_cfg_get_int(cfg, "display.width",
+                                      (int32_t)s_board.display.width);
+    if (dw >= 0 && dw <= 800) {
+        s_board.display.width = (uint16_t)dw;
+    }
+    const int32_t dh = ag_cfg_get_int(cfg, "display.height",
+                                      (int32_t)s_board.display.height);
+    if (dh >= 0 && dh <= 480) {
+        s_board.display.height = (uint16_t)dh;
+    }
+
     return AG_OK;
 }

@@ -13,6 +13,7 @@
 #include <argon/cmdline.h>
 #include <argon/codepage.h>
 #include <argon/console.h>
+#include <argon/display.h>
 #include <argon/device.h>
 #include <argon/ioclaim.h>
 #include <argon/kernel.h>
@@ -867,6 +868,45 @@ static int cmd_edit(int argc, char **argv)
     return ag_edit_main(argc, argv);
 }
 
+static int cmd_gfxdump(int argc, char **argv)
+{
+    if (argc < 2) {
+        ag_console_puts("usage: gfxdump [/live] <file.ppm>\n");
+        return 1;
+    }
+    if (!ag_display_ready()) {
+        ag_console_puts("no display\n");
+        return 1;
+    }
+
+    int argi = 1;
+    bool live = false;
+    if (ag_path_icmp(argv[1], "/live") == 0) {
+        live = true;
+        argi++;
+    }
+    if (argi >= argc) {
+        ag_console_puts("usage: gfxdump [/live] <file.ppm>\n");
+        return 1;
+    }
+
+    /* /live: paint the text console onto the soft fb, then dump that buffer. */
+    if (live && !ag_display_acquired() && ag_console_ready()) {
+        ag_console_lock();
+        ag_screen_mark_all_dirty(ag_console_screen());
+        ag_display_render_console(ag_console_screen());
+        ag_console_unlock();
+    }
+
+    const ag_err_t err = ag_display_dump_ppm(argv[argi], ag_shell_cwd(), live);
+    if (err != AG_OK) {
+        ag_console_printf("gfxdump: %d\n", (int)err);
+        return 1;
+    }
+    ag_console_printf("wrote %s\n", argv[argi]);
+    return 0;
+}
+
 static int cmd_kill(int argc, char **argv)
 {
     if (argc != 2) {
@@ -950,6 +990,7 @@ static const ag_command_t k_commands[] = {
     {"chcp", "[437|866|1251]", "screen code page", cmd_chcp},
     {"fm", "[left] [right]", "file manager, two panels", cmd_fm},
     {"edit", "[file]", "create or edit a text file", cmd_edit},
+    {"gfxdump", "[/live] <file.ppm>", "save framebuffer as PPM", cmd_gfxdump},
     {"dev", "[name]", "list devices, or describe one", cmd_dev},
     {"drv", "[load|unload|probe]", "modules: list, load, unload, I2C probe",
      cmd_drv},

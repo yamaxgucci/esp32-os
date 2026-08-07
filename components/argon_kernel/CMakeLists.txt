@@ -19,6 +19,8 @@ set(ARGON_KERNEL_SRCS
     "src/dev/device.c"
     "src/dev/devfs.c"
     "src/dev/devices.c"
+    "src/dev/display.c"
+    "src/dev/font8x16.c"
     "src/dev/ioclaim.c"
     "src/dev/io.c"
     "src/fs/vfs.c"

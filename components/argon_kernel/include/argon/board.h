@@ -109,13 +109,25 @@ typedef struct {
 } ag_board_uart_t;
 
 typedef struct {
-    char            name[24];
-    ag_board_sd_t   sd;
-    ag_board_i2c_t  i2c[AG_I2C_BUSES];
-    ag_board_spi_t  spi[AG_SPI_BUSES];
-    ag_board_uart_t uart[AG_UART_PORTS];
-    uint16_t        console_cols;
-    uint16_t        console_rows;
+    /*
+     * Soft framebuffer by default (QEMU and boards without a panel driver).
+     * `driver` is "soft", "none", or a panel name for a future .SYS / static
+     * driver.  width/height 0 means the soft default (320x240).
+     */
+    char     driver[16];
+    uint16_t width;
+    uint16_t height;
+} ag_board_display_t;
+
+typedef struct {
+    char              name[24];
+    ag_board_sd_t     sd;
+    ag_board_i2c_t    i2c[AG_I2C_BUSES];
+    ag_board_spi_t    spi[AG_SPI_BUSES];
+    ag_board_uart_t   uart[AG_UART_PORTS];
+    ag_board_display_t display;
+    uint16_t          console_cols;
+    uint16_t          console_rows;
 } ag_board_t;
 
 /* Applies the generic defaults for the chip, then any compiled-in board pack. */

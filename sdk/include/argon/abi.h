@@ -41,9 +41,11 @@ extern "C" {
  *     device from ag_driver_init and take it back on unload.
  * 0.7 appended probe_hint on dev: during a probe-driven load, ag_driver_init
  *     can ask which bus and address matched.
+ * 0.8 made gfx stop being NULL: soft RGB565 framebuffer, acquire/release,
+ *     primitives, and built-in 8x16 text.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 7u
+#define AG_ABI_MINOR 8u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */

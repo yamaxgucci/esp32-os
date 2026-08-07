@@ -492,6 +492,20 @@ static inline void ag_gfx_flush(uint16_t x, uint16_t y, uint16_t w, uint16_t h)
 {
     g_ag_api->gfx->flush(x, y, w, h);
 }
+static inline void ag_gfx_clear(uint32_t color)
+{
+    g_ag_api->gfx->clear(color);
+}
+static inline void ag_gfx_fill_rect(int16_t x, int16_t y, uint16_t w, uint16_t h,
+                                    uint32_t color)
+{
+    g_ag_api->gfx->fill_rect(x, y, w, h, color);
+}
+static inline int32_t ag_gfx_text(int16_t x, int16_t y, const char *s,
+                                  uint32_t fg, uint32_t bg)
+{
+    return g_ag_api->gfx->text(x, y, s, fg, bg);
+}
 
 #ifdef __cplusplus
 }
