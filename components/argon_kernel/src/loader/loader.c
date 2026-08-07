@@ -14,6 +14,7 @@
 
 #include <argon/arena.h>
 #include <argon/log.h>
+#include <argon/module.h>
 #include <argon/proc.h>
 #include <argon/vfs.h>
 
@@ -110,17 +111,20 @@ static uint8_t s_arena[AG_APP_ARENA_BYTES]
     __attribute__((aligned(16), section(".iram.bss.ag_app_arena")));
 
 /*
- * The arena holds one block per loaded application, and its bookkeeping lives
- * out here in ordinary memory - see argon/arena.h for why it is not a heap.
+ * The arena holds one block per loaded image - applications and .SYS modules
+ * share it.  Bookkeeping lives out here in ordinary memory; see argon/arena.h
+ * for why it is not a heap.
  */
-static ag_arena_block_t s_arena_blocks[AG_PROC_MAX];
+#define AG_LOADER_SLOTS (AG_PROC_MAX + AG_MODULE_MAX)
+
+static ag_arena_block_t s_arena_blocks[AG_LOADER_SLOTS];
 static ag_arena_t       s_code;
 
 static void arena_ready(void)
 {
     if (s_code.base == NULL) {
         ag_arena_init(&s_code, s_arena, sizeof(s_arena), s_arena_blocks,
-                      AG_PROC_MAX);
+                      AG_LOADER_SLOTS);
     }
 }
 

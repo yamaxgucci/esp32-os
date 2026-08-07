@@ -30,6 +30,16 @@ extern "C" {
     AG_APP_SIZED(app_name, app_version, app_author, app_flags, 0, 0)
 
 /*
+ * Declares a loadable .SYS driver.  Same header as an application, with the
+ * AG_AXE_DRIVER flag set so the loader calls ag_driver_init instead of ag_main.
+ *
+ *     AG_DRV("ECHO", "1.0", "you");
+ *     ag_err_t ag_driver_init(void) { ...; return AG_OK; }
+ */
+#define AG_DRV(drv_name, drv_version, drv_author)                            \
+    AG_APP((drv_name), (drv_version), (drv_author), AG_AXE_DRIVER)
+
+/*
  * The same, for an application that knows how much stack or arena its own work
  * needs.  Both in bytes, either may be 0 to take the default.
  *
@@ -238,6 +248,24 @@ static inline ag_err_t ag_dev_ioctl(ag_handle_t h, uint32_t cmd, void *arg,
 static inline const void *ag_dev_ops(ag_handle_t h)
 {
     return g_ag_api->dev->ops(h);
+}
+
+/*
+ * Publish a device from ag_driver_init.  Outside that call the system refuses:
+ * an ordinary application is not a driver.  The module that is loading becomes
+ * the owner, so unloading it takes the device with it.
+ */
+static inline ag_err_t ag_dev_add(const ag_dev_add_t *desc)
+{
+    return g_ag_api->dev->add(desc);
+}
+static inline ag_err_t ag_dev_remove(const char *name)
+{
+    return g_ag_api->dev->remove(name);
+}
+static inline void *ag_dev_priv(ag_device_t *dev)
+{
+    return g_ag_api->dev->get_priv(dev);
 }
 
 /* ---- hardware, directly ------------------------------------------------- */

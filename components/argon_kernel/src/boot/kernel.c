@@ -17,6 +17,7 @@
 #include <argon/board.h>
 #include <argon/console.h>
 #include <argon/log.h>
+#include <argon/module.h>
 #include <argon/shell.h>
 
 #include "esp_log.h"
@@ -150,7 +151,7 @@ static const ag_stage_desc_t s_stages[AG_STAGE_COUNT] = {
     [AG_STAGE_CONFIG]     = {"config",     ag_sysconfig_init, false},
     [AG_STAGE_DEVICES]    = {"devices",    ag_devices_init, false},
     [AG_STAGE_MEDIA]      = {"media",      ag_storage_mount_media, false},
-    [AG_STAGE_MODULES]    = {"modules",    NULL,           false},
+    [AG_STAGE_MODULES]    = {"modules",    ag_modules_boot, false},
     [AG_STAGE_SUPERVISOR] = {"supervisor", ag_supervisor_init, false},
     [AG_STAGE_SHELL]      = {"shell",      stage_shell,    true},
 };

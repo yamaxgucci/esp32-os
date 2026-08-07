@@ -611,6 +611,19 @@ ag_err_t ag_proc_spawn(const char *path, int argc, char **argv, uint32_t flags,
         return err;
     }
 
+    /*
+     * A .SYS is not an application: it has no ag_main and stays resident.  The
+     * shell's `drv load` is the way in; `run` on one would only confuse.
+     */
+    if ((p->app.header.flags & AG_AXE_DRIVER) != 0) {
+        ag_log(AG_LOG_ERROR, "proc",
+               "%s: is a driver; use 'drv load'", path);
+        ag_loader_unload(&p->app);
+        memset(p, 0, sizeof(*p));
+        unlock();
+        return -AG_EINVAL;
+    }
+
     /* The name comes from the image, and is what ps and the journal show. */
     set_string(p->name, sizeof(p->name),
                (p->app.header.name[0] != '\0') ? p->app.header.name : "app");

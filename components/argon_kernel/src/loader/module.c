@@ -1,0 +1,226 @@
+/*
+ * ArgonOS - loadable .SYS driver modules.
+ *
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
+ */
+#include <argon/module.h>
+
+#include <string.h>
+
+#include <argon/cfg.h>
+#include <argon/device.h>
+#include <argon/log.h>
+#include <argon/path.h>
+
+#include "core/sysconfig.h"
+
+typedef struct {
+    bool            used;
+    char            path[AG_PATH_MAX];
+    ag_loaded_app_t app;
+} module_t;
+
+static module_t  s_modules[AG_MODULE_MAX];
+static module_t *s_loading;
+
+const void *ag_module_loading(void) { return s_loading; }
+
+static void set_string_path(char *dst, size_t dst_len, const char *src)
+{
+    if (dst_len == 0) {
+        return;
+    }
+    if (src == NULL) {
+        dst[0] = '\0';
+        return;
+    }
+    size_t n = strlen(src);
+    if (n >= dst_len) {
+        n = dst_len - 1u;
+    }
+    memcpy(dst, src, n);
+    dst[n] = '\0';
+}
+
+static module_t *find_by_name(const char *name)
+{
+    if (name == NULL || name[0] == '\0') {
+        return NULL;
+    }
+    for (uint32_t i = 0; i < AG_MODULE_MAX; i++) {
+        if (s_modules[i].used &&
+            ag_path_icmp(s_modules[i].app.header.name, name) == 0) {
+            return &s_modules[i];
+        }
+    }
+    return NULL;
+}
+
+static module_t *alloc_slot(void)
+{
+    for (uint32_t i = 0; i < AG_MODULE_MAX; i++) {
+        if (!s_modules[i].used) {
+            return &s_modules[i];
+        }
+    }
+    return NULL;
+}
+
+static void drop_module(module_t *m)
+{
+    if (m == NULL || !m->used) {
+        return;
+    }
+    (void)ag_dev_revoke_owner(m);
+    ag_loader_unload(&m->app);
+    memset(m, 0, sizeof(*m));
+}
+
+ag_err_t ag_module_load(const char *path, const char *cwd)
+{
+    if (path == NULL || path[0] == '\0') {
+        return -AG_EINVAL;
+    }
+
+    module_t *slot = alloc_slot();
+    if (slot == NULL) {
+        ag_log(AG_LOG_ERROR, "modules",
+               "cannot load %s: already %u modules", path,
+               (unsigned)AG_MODULE_MAX);
+        return -AG_ENFILE;
+    }
+
+    memset(slot, 0, sizeof(*slot));
+    ag_err_t err = ag_loader_load(path, cwd, &slot->app);
+    if (err != AG_OK) {
+        return err;
+    }
+
+    if ((slot->app.header.flags & AG_AXE_DRIVER) == 0) {
+        ag_log(AG_LOG_ERROR, "modules",
+               "%s: not a driver (missing AG_AXE_DRIVER)", path);
+        ag_loader_unload(&slot->app);
+        return -AG_EINVAL;
+    }
+
+    const char *name = slot->app.header.name;
+    if (name[0] == '\0') {
+        ag_loader_unload(&slot->app);
+        return -AG_EFORMAT;
+    }
+    if (find_by_name(name) != NULL) {
+        ag_log(AG_LOG_ERROR, "modules", "%s: module '%s' already loaded", path,
+               name);
+        ag_loader_unload(&slot->app);
+        return -AG_EEXIST;
+    }
+
+    if (slot->app.binding.entry == NULL) {
+        ag_loader_unload(&slot->app);
+        return -AG_EFORMAT;
+    }
+
+    set_string_path(slot->path, sizeof(slot->path), path);
+    slot->used = true;
+
+    /*
+     * The owner cookie is the module slot itself.  Anything registered during
+     * init is tagged with it, and unload revokes by that pointer.
+     */
+    s_loading = slot;
+    const ag_driver_init_fn init =
+        (ag_driver_init_fn)(uintptr_t)slot->app.binding.entry;
+    err = init();
+    s_loading = NULL;
+
+    if (err != AG_OK) {
+        ag_log(AG_LOG_ERROR, "modules", "%s: ag_driver_init returned %d", name,
+               (int)err);
+        drop_module(slot);
+        return err;
+    }
+
+    ag_log(AG_LOG_INFO, "modules", "loaded %s v%s from %s", name,
+           slot->app.header.version, path);
+    return AG_OK;
+}
+
+ag_err_t ag_module_unload(const char *name)
+{
+    module_t *m = find_by_name(name);
+    if (m == NULL) {
+        return -AG_ENOENT;
+    }
+
+    ag_log(AG_LOG_INFO, "modules", "unloading %s", m->app.header.name);
+    drop_module(m);
+    return AG_OK;
+}
+
+ag_err_t ag_module_info(uint32_t index, ag_modinfo_t *out)
+{
+    if (out == NULL) {
+        return -AG_EINVAL;
+    }
+
+    uint32_t seen = 0;
+    for (uint32_t i = 0; i < AG_MODULE_MAX; i++) {
+        if (!s_modules[i].used) {
+            continue;
+        }
+        if (seen == index) {
+            memset(out, 0, sizeof(*out));
+            memcpy(out->name, s_modules[i].app.header.name,
+                   sizeof(out->name) - 1u);
+            memcpy(out->version, s_modules[i].app.header.version,
+                   sizeof(out->version) - 1u);
+            memcpy(out->path, s_modules[i].path, sizeof(out->path) - 1u);
+            out->code_bytes = s_modules[i].app.header.code.size;
+            out->data_bytes = s_modules[i].app.header.data.size;
+            return AG_OK;
+        }
+        seen++;
+    }
+    return -AG_ENOENT;
+}
+
+uint32_t ag_module_count(void)
+{
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < AG_MODULE_MAX; i++) {
+        if (s_modules[i].used) {
+            n++;
+        }
+    }
+    return n;
+}
+
+ag_err_t ag_modules_boot(void)
+{
+    const ag_cfg_t *cfg = ag_sysconfig();
+    if (cfg == NULL) {
+        return AG_OK;
+    }
+
+    size_t      it = 0;
+    const char *path;
+    uint32_t    loaded = 0;
+    uint32_t    failed = 0;
+
+    while ((path = ag_cfg_next(cfg, "modules.device", &it)) != NULL) {
+        const ag_err_t err = ag_module_load(path, NULL);
+        if (err == AG_OK) {
+            loaded++;
+        } else {
+            failed++;
+            ag_log(AG_LOG_WARN, "modules", "boot: %s failed (%d)", path,
+                   (int)err);
+        }
+    }
+
+    if (loaded > 0 || failed > 0) {
+        ag_log(AG_LOG_INFO, "modules", "boot: %u loaded, %u failed",
+               (unsigned)loaded, (unsigned)failed);
+    }
+    return AG_OK;
+}
