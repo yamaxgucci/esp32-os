@@ -37,9 +37,11 @@ extern "C" {
  *     numbering with it.
  * 0.5 made io stop being NULL: pins, interrupts and the buses.  io->adc_read is
  *     NULL unless the build asked for the ADC - see AG_HAS.
+ * 0.6 appended add / remove / get_priv on dev: a .SYS module can publish a
+ *     device from ag_driver_init and take it back on unload.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 5u
+#define AG_ABI_MINOR 6u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -449,9 +451,12 @@ enum ag_dev_flags {
     AG_DEVF_BUSY = 1u << 4,      /* reported by enumerate: somebody has it open */
 };
 
+/* Same width as the name field of ag_devinfo_t; a path component in /dev. */
+#define AG_DEV_NAME_MAX 24
+
 typedef struct {
-    char           name[24];
-    char           driver[24];
+    char           name[AG_DEV_NAME_MAX];
+    char           driver[AG_DEV_NAME_MAX];
     ag_dev_class_t cls;
     uint32_t       flags;
 } ag_devinfo_t;
@@ -477,11 +482,50 @@ typedef struct {
 } ag_geometry_t;
 
 /*
+ * Opaque here; the kernel's struct starts with the fields a driver needs, and
+ * get_priv() is how a .SYS reaches the pointer it passed to add().  Built-in
+ * drivers see the full struct through the kernel header.
+ */
+typedef struct ag_device ag_device_t;
+
+/*
+ * What a driver supplies for one device.  Any entry may be NULL; the registry
+ * then answers -AG_ENOTSUP rather than crashing.  Called with the registry lock
+ * held - do not call back into add/remove or the filesystem from here.
+ */
+typedef struct ag_dev_ops {
+    ag_err_t (*open)(ag_device_t *dev, uint32_t flags);
+    ag_err_t (*close)(ag_device_t *dev);
+    int32_t (*read)(ag_device_t *dev, void *buf, size_t len, uint64_t off);
+    int32_t (*write)(ag_device_t *dev, const void *buf, size_t len,
+                     uint64_t off);
+    ag_err_t (*ioctl)(ag_device_t *dev, uint32_t cmd, void *arg, size_t arglen);
+    uint64_t (*size)(ag_device_t *dev);
+} ag_dev_ops_t;
+
+/*
+ * How a .SYS publishes a device from ag_driver_init.  The owner is filled in by
+ * the loader: unload of that module revokes everything it added.  add() outside
+ * of ag_driver_init is refused - an ordinary application is not a driver.
+ */
+typedef struct {
+    const char         *name;   /* required, unique, no path separators     */
+    const char         *driver; /* who implements it, for `dev` and the log */
+    ag_dev_class_t      cls;
+    uint32_t            flags;
+    const ag_dev_ops_t *ops;
+    const void         *class_ops;
+    void               *priv;
+} ag_dev_add_t;
+
+/*
  * A device is a byte addressable object with a name, and the handle carries the
  * position - so fs->read, fs->write and fs->seek work on "/dev/sd0" exactly as
  * they do on a file, and `copy` needs no special case for a device.  This
  * sub-table is the other way in: it opens by bare name, and it carries the two
  * things a file has no room for, ioctl and the class vtable.
+ *
+ * 0.6 appended add / remove / get_priv for loadable drivers.
  */
 typedef struct ag_dev_api {
     uint32_t size;
@@ -496,6 +540,12 @@ typedef struct ag_dev_api {
     ag_err_t (*ioctl)(ag_handle_t h, uint32_t cmd, void *arg, size_t arglen);
     /* Class specific operations table, or NULL. */
     const void *(*ops)(ag_handle_t h);
+
+    /* Publish / withdraw a device.  Only legal inside ag_driver_init. */
+    ag_err_t (*add)(const ag_dev_add_t *desc);
+    ag_err_t (*remove)(const char *name);
+    /* The priv pointer the driver passed to add(), for use inside ops. */
+    void *(*get_priv)(ag_device_t *dev);
 } ag_dev_api_t;
 
 /* ------------------------------------------------------------------------ */

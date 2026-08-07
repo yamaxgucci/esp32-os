@@ -39,38 +39,13 @@ extern "C" {
  */
 #define AG_DEV_MAX 24
 
-/* The name field of ag_devinfo_t is the contract; the registry matches it. */
-#define AG_DEV_NAME_MAX 24
-
-typedef struct ag_device ag_device_t;
-
-/*
- * What a driver supplies.  Any entry may be NULL, and the registry then
- * reports -AG_ENOTSUP for it rather than crashing - a sensor that can only be
- * read has no business inventing a write.
- *
- * `off` is where in the device to work, and a device that has no position
- * (a console, a sink) ignores it.  `size` reports how big the device is, or 0
- * when it is a stream with no end.
- *
- * These are called with the registry lock held and, when the call arrived
- * through the filesystem, with the VFS lock held as well.  A device operation
- * must therefore not call back into the filesystem or register devices.
- */
-typedef struct ag_dev_ops {
-    ag_err_t (*open)(ag_device_t *dev, uint32_t flags);
-    ag_err_t (*close)(ag_device_t *dev);
-    int32_t (*read)(ag_device_t *dev, void *buf, size_t len, uint64_t off);
-    int32_t (*write)(ag_device_t *dev, const void *buf, size_t len,
-                     uint64_t off);
-    ag_err_t (*ioctl)(ag_device_t *dev, uint32_t cmd, void *arg, size_t arglen);
-    uint64_t (*size)(ag_device_t *dev);
-} ag_dev_ops_t;
-
 /*
  * Public because a driver needs its own priv pointer back in every callback,
  * and because the shell and the tests read the bookkeeping.  The last three
  * fields belong to the registry; a driver must not write them.
+ *
+ * The ops table and AG_DEV_NAME_MAX live in the ABI: a .SYS sees the same
+ * definitions through <argon/abi.h>.
  */
 struct ag_device {
     char           name[AG_DEV_NAME_MAX];

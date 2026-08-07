@@ -19,6 +19,7 @@
 #include <argon/lineedit.h>
 #include <argon/loader.h>
 #include <argon/log.h>
+#include <argon/module.h>
 #include <argon/path.h>
 #include <argon/proc.h>
 #include <argon/vfs.h>
@@ -348,6 +349,9 @@ static void print_load_error(const char *path, ag_err_t err)
     case AG_ENOMEM:  why = "not enough memory to load it"; break;
     case AG_EBUSY:   why = "too many applications are loaded"; break;
     case AG_ERANGE:  why = "too many arguments"; break;
+    case AG_EINVAL:  why = "is a driver; use 'drv load'"; break;
+    case AG_EEXIST:  why = "already loaded"; break;
+    case AG_ENFILE:  why = "too many modules are loaded"; break;
     default:         why = "could not be loaded"; break;
     }
     ag_console_printf("%s: %s\n", path, why);
@@ -634,6 +638,74 @@ static int cmd_dev(int argc, char **argv)
     return 0;
 }
 
+/*
+ * Loadable .SYS modules.  `dev` shows what they registered; this shows the
+ * modules themselves, and is how one is brought in or taken out by hand.
+ */
+static int cmd_drv(int argc, char **argv)
+{
+    if (argc >= 2 && ag_path_icmp(argv[1], "load") == 0) {
+        if (argc != 3) {
+            ag_console_puts("usage: drv load <file>\n");
+            return 1;
+        }
+        const ag_err_t err = ag_module_load(argv[2], s_cwd);
+        if (err != AG_OK) {
+            print_load_error(argv[2], err);
+            return 1;
+        }
+        ag_console_printf("loaded %s\n", argv[2]);
+        return 0;
+    }
+
+    if (argc >= 2 && ag_path_icmp(argv[1], "unload") == 0) {
+        if (argc != 3) {
+            ag_console_puts("usage: drv unload <name>\n");
+            return 1;
+        }
+        const ag_err_t err = ag_module_unload(argv[2]);
+        if (err == -AG_ENOENT) {
+            ag_console_printf("%s: not loaded\n", argv[2]);
+            return 1;
+        }
+        if (err != AG_OK) {
+            ag_console_printf("%s: %d\n", argv[2], (int)err);
+            return 1;
+        }
+        ag_console_printf("unloaded %s\n", argv[2]);
+        return 0;
+    }
+
+    if (argc > 1) {
+        ag_console_puts("usage: drv [load <file>|unload <name>]\n");
+        return 1;
+    }
+
+    ag_console_puts("name      version  code       data       path\n");
+
+    uint32_t shown = 0;
+    for (uint32_t i = 0;; i++) {
+        ag_modinfo_t info;
+        if (ag_module_info(i, &info) != AG_OK) {
+            break;
+        }
+
+        char code[16];
+        char data[16];
+        human_size(info.code_bytes, code, sizeof(code));
+        human_size(info.data_bytes, data, sizeof(data));
+
+        ag_console_printf("%-9s %-8s %-10s %-10s %s\n", info.name,
+                          info.version, code, data, info.path);
+        shown++;
+    }
+
+    if (shown == 0) {
+        ag_console_puts("no modules loaded\n");
+    }
+    return 0;
+}
+
 /* ---------------------------------------------------------------------- */
 
 static const char *pin_state_name(ag_pin_state_t state)
@@ -849,6 +921,7 @@ static const ag_command_t k_commands[] = {
     {"chcp", "[437|866|1251]", "screen code page", cmd_chcp},
     {"fm", "[left] [right]", "file manager, two panels", cmd_fm},
     {"dev", "[name]", "list devices, or describe one", cmd_dev},
+    {"drv", "[load|unload] ...", "list, load or unload .SYS modules", cmd_drv},
     {"io", "[pin [mode]] | i2c <bus>", "pins and buses", cmd_io},
     {"ps", "", "list running applications", cmd_ps},
     {"kill", "<pid>", "stop an application", cmd_kill},

@@ -27,6 +27,7 @@ set(ARGON_KERNEL_SRCS
     "src/fs/storage.c"
     "src/loader/axeload.c"
     "src/loader/loader.c"
+    "src/loader/module.c"
     "src/loader/api.c"
     "src/proc/proc.c"
     "src/proc/threads.c"

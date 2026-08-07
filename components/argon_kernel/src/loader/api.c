@@ -18,6 +18,7 @@
 #include <argon/kernel.h>
 #include <argon/loader.h>
 #include <argon/log.h>
+#include <argon/module.h>
 #include <argon/proc.h>
 #include <argon/shell.h>
 #include <argon/vfs.h>
@@ -590,6 +591,56 @@ static const void *api_dev_ops(ag_handle_t h)
     return (dev != NULL) ? dev->class_ops : NULL;
 }
 
+/*
+ * Only a module that is mid-init may publish a device.  The owner cookie is the
+ * module slot, so unload can revoke everything that init registered - including
+ * devices it added before a later failure.
+ */
+static ag_err_t api_dev_add(const ag_dev_add_t *desc)
+{
+    const void *owner = ag_module_loading();
+    if (owner == NULL) {
+        return -AG_EPERM;
+    }
+    if (desc == NULL) {
+        return -AG_EINVAL;
+    }
+
+    const ag_dev_desc_t full = {
+        .name = desc->name,
+        .driver = desc->driver,
+        .cls = desc->cls,
+        .flags = desc->flags,
+        .ops = desc->ops,
+        .class_ops = desc->class_ops,
+        .priv = desc->priv,
+        .owner = owner,
+    };
+    return ag_dev_register(&full, NULL);
+}
+
+static ag_err_t api_dev_remove(const char *name)
+{
+    const void *owner = ag_module_loading();
+    if (owner == NULL) {
+        return -AG_EPERM;
+    }
+
+    ag_device_t *dev = ag_dev_find(name);
+    if (dev == NULL) {
+        return -AG_ENOENT;
+    }
+    if (dev->owner != owner) {
+        return -AG_EPERM;
+    }
+    return ag_dev_unregister(dev);
+}
+
+static void *api_dev_get_priv(ag_device_t *dev)
+{
+    return (dev != NULL) ? dev->priv : NULL;
+}
+
 static const ag_dev_api_t k_dev = {
     .size = sizeof(ag_dev_api_t),
     .enumerate = ag_dev_info,
@@ -599,6 +650,9 @@ static const ag_dev_api_t k_dev = {
     .write = ag_vfs_write,
     .ioctl = api_dev_ioctl,
     .ops = api_dev_ops,
+    .add = api_dev_add,
+    .remove = api_dev_remove,
+    .get_priv = api_dev_get_priv,
 };
 
 /* ---------------------------------------------------------------------- */
