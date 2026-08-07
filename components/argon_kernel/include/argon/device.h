@@ -16,10 +16,8 @@
  * fewer than two.
  *
  * No dependency on FreeRTOS or the chip, so this is built and tested on the
- * host.  What is deliberately absent: any notion of a bus scan or a driver
- * match table.  Those need the io subtable to exist first (docs/04-roadmap.md,
- * phase 4.5), and inventing them before there is a bus to scan would be
- * guessing.
+ * host.  Matching a .SYS to a chip on a bus lives next door, in probe.h: the
+ * registry only stores what was registered, not how the driver was chosen.
  *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
  */

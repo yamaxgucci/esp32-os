@@ -96,8 +96,9 @@ argon flash -port COM5   прошить настоящую плату
 | Встроенные устройства | `src/dev/devices.c`, `storage.c` | ✅ `null zero con flash0 sd0`, команда `dev` |
 | Владение пинами | `src/dev/ioclaim.c` | ✅ пины системы, занятые пины, возврат за упавшим процессом |
 | Железо напрямую | `src/dev/io.c` | ✅ GPIO, ISR, I2C, SPI, UART, PWM; команда `io`, скан I2C |
-| Таблица ABI | `src/loader/api.c` | ⚠ 0.6: `sys mem fs con time proc task inp dev io`, остальные `NULL` |
+| Таблица ABI | `src/loader/api.c` | ⚠ 0.7: `sys mem fs con time proc task inp dev io`, остальные `NULL` |
 | Загрузчик `.SYS` | `src/loader/module.c` | ✅ `ag_driver_init`, резидент, `drv`, стадия `modules`, пример `apps/echo` |
+| Probe I2C | `src/loader/probe.c` | ✅ `modules.probe`, `drv probe`, `ag_probe_hint`, пример `apps/whoami` |
 
 Загрузка в QEMU: **100–165 мс с картой**, из них этап `devices` — 4 мс. Цель
 <400 мс. Разброс в полтора раза дают этапы `storage` и `media`: свежеснятый
@@ -169,11 +170,10 @@ argon flash -port COM5   прошить настоящую плату
    после его отпускания — не сделано.
 5. **`Ctrl+C` не доходит до гостя** в консольном режиме QEMU: он оставлен
    консоли, чтобы можно было выйти из зависшего эмулятора.
-6. **Модель устройств и загрузка `.SYS` есть; `probe` и классы с vtable — нет.**
-   Реестр, `/dev`, `ioctl`, пины, шины и `drv load`/`unload` работают. Чего нет:
-   `probe` по таблице ID; ни одного класса со своей таблицей операций
-   (`dev->ops` / class_ops у всех `NULL`); из шин — TWAI, 1-Wire, RMT, I2S,
-   MCPWM.
+6. **Модель устройств, `.SYS` и I2C-`probe` есть; классы с vtable — нет.**
+   Реестр, `/dev`, `ioctl`, пины, шины, `drv load`/`unload`/`probe` работают.
+   Чего нет: ни одного класса со своей таблицей операций (`class_ops` у всех
+   `NULL`); probe по SPI-панелям; из шин — TWAI, 1-Wire, RMT, I2S, MCPWM.
 7. **`io` проверено в QEMU, а не на железе, и это разные вещи.** Что проверено:
    отказ на пине системы, занятие и возврат пина, отзыв обработчика за упавшим
    процессом, чтение `BOARD.CFG`, подъём шины при первом обращении, скан I2C.
@@ -485,16 +485,14 @@ argon test -Sd -Put 'build\DEVS.AXE=t:\devs.axe' 'run t:\devs.axe' 'errorlevel'
    кириллицей внутри рисуется приложением через `poke`, а после `chcp 1251` те же
    байты честно становятся другими буквами. Осталось: научить `fm` рисовать
    рамки псевдографикой, когда страница её содержит.
-5. **Модель устройств, `io` и `.SYS` — сделаны.** ✅ Реестр, классы, `/dev`,
-   `ioctl`, `dev`; ✅ пины и шины, `io`; ✅ загрузчик модулей (`module.c`),
-   `ag_driver_init`, `drv load`/`unload`, стадия `modules` из
-   `[modules] device=`, ABI `dev->add`/`remove`/`get_priv` (0.6), пример
-   `apps/echo`.
+5. **Модель устройств, `io`, `.SYS` и I2C-probe — сделаны.** ✅ Реестр, `/dev`,
+   `ioctl`, `dev`; ✅ пины и шины, `io`; ✅ загрузчик модулей, `drv`, стадия
+   `modules`; ✅ `modules.probe` / `drv probe` / `ag_probe_hint` (ABI 0.7),
+   примеры `apps/echo`, `apps/whoami`.
    Дальше, по зависимостям:
-   * **`probe`** — скан шин и подбор по таблице ID; `i2c_probe` и `io i2c`
-     уже есть, не хватает таблицы соответствий;
    * остальная периферия: TWAI(CAN), RS-485/Modbus, 1-Wire, RMT, I2S, MCPWM,
-     и ADC, которому нужна не работа, а плата (грабли 26).
+     и ADC, которому нужна не работа, а плата (грабли 26);
+   * классы устройств со своими vtable (`class_ops`).
 
    Это же фундамент под **универсальную сборку с приёмом драйверов на месте** —
    фаза 4.5 в [04-roadmap.md](04-roadmap.md), добавлена 6 августа 2026.
@@ -538,9 +536,9 @@ argon test -Sd -Put 'build\DEVS.AXE=t:\devs.axe' 'run t:\devs.axe' 'errorlevel'
   ArgonOS на незнакомой плате», от требований к модулю до таблицы симптомов.
 * ✅ примеры в `apps/`: `hello` (две части образа, константы, bss больше арены),
   **`disk` (файлы и диски)**, **`devs` (устройства и железо напрямую)**,
-  **`echo` (загружаемый `.SYS`)**, `spin`, `leak`, `threads`, `crash`, `fm`,
-  `edit`. Приложения проверяют себя сами (`run` + `errorlevel`); `echo` — через
-  `drv load` / `type d:\echo` / `drv unload`; `edit` — встроенная команда.
+  **`echo` / `whoami` (`.SYS`)**, `spin`, `leak`, `threads`, `crash`, `fm`,
+  `edit`. Приложения проверяют себя сами (`run` + `errorlevel`); `echo` —
+  через `drv load`; `whoami` — через probe hint; `edit` — встроенная команда.
 
 Написано после модели процессов, как и планировалось: подтаблицы `task` и `proc`
 появились там же, и описывать ABI до них значило бы переписывать дважды.

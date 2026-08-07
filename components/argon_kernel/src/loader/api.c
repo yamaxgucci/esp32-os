@@ -641,6 +641,11 @@ static void *api_dev_get_priv(ag_device_t *dev)
     return (dev != NULL) ? dev->priv : NULL;
 }
 
+static const ag_probe_hint_t *api_dev_probe_hint(void)
+{
+    return ag_module_probe_hint();
+}
+
 static const ag_dev_api_t k_dev = {
     .size = sizeof(ag_dev_api_t),
     .enumerate = ag_dev_info,
@@ -653,6 +658,7 @@ static const ag_dev_api_t k_dev = {
     .add = api_dev_add,
     .remove = api_dev_remove,
     .get_priv = api_dev_get_priv,
+    .probe_hint = api_dev_probe_hint,
 };
 
 /* ---------------------------------------------------------------------- */

@@ -11,6 +11,7 @@
 #include <argon/device.h>
 #include <argon/log.h>
 #include <argon/path.h>
+#include <argon/probe.h>
 
 #include "core/sysconfig.h"
 
@@ -20,10 +21,13 @@ typedef struct {
     ag_loaded_app_t app;
 } module_t;
 
-static module_t  s_modules[AG_MODULE_MAX];
-static module_t *s_loading;
+static module_t               s_modules[AG_MODULE_MAX];
+static module_t              *s_loading;
+static const ag_probe_hint_t *s_hint;
 
 const void *ag_module_loading(void) { return s_loading; }
+
+const ag_probe_hint_t *ag_module_probe_hint(void) { return s_hint; }
 
 static void set_string_path(char *dst, size_t dst_len, const char *src)
 {
@@ -76,7 +80,8 @@ static void drop_module(module_t *m)
     memset(m, 0, sizeof(*m));
 }
 
-ag_err_t ag_module_load(const char *path, const char *cwd)
+ag_err_t ag_module_load_hinted(const char *path, const char *cwd,
+                               const ag_probe_hint_t *hint)
 {
     if (path == NULL || path[0] == '\0') {
         return -AG_EINVAL;
@@ -125,13 +130,17 @@ ag_err_t ag_module_load(const char *path, const char *cwd)
 
     /*
      * The owner cookie is the module slot itself.  Anything registered during
-     * init is tagged with it, and unload revokes by that pointer.
+     * init is tagged with it, and unload revokes by that pointer.  The probe
+     * hint is visible for the same window, so the driver knows which address
+     * matched without reading the config itself.
      */
+    s_hint = hint;
     s_loading = slot;
     const ag_driver_init_fn init =
         (ag_driver_init_fn)(uintptr_t)slot->app.binding.entry;
     err = init();
     s_loading = NULL;
+    s_hint = NULL;
 
     if (err != AG_OK) {
         ag_log(AG_LOG_ERROR, "modules", "%s: ag_driver_init returned %d", name,
@@ -143,6 +152,11 @@ ag_err_t ag_module_load(const char *path, const char *cwd)
     ag_log(AG_LOG_INFO, "modules", "loaded %s v%s from %s", name,
            slot->app.header.version, path);
     return AG_OK;
+}
+
+ag_err_t ag_module_load(const char *path, const char *cwd)
+{
+    return ag_module_load_hinted(path, cwd, NULL);
 }
 
 ag_err_t ag_module_unload(const char *name)
@@ -222,5 +236,10 @@ ag_err_t ag_modules_boot(void)
         ag_log(AG_LOG_INFO, "modules", "boot: %u loaded, %u failed",
                (unsigned)loaded, (unsigned)failed);
     }
+
+    /* After the explicit list: pick up whatever the buses can see. */
+    uint32_t probed = 0;
+    uint32_t missed = 0;
+    (void)ag_probe_run(&probed, &missed);
     return AG_OK;
 }

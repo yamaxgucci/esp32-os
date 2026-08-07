@@ -268,6 +268,15 @@ static inline void *ag_dev_priv(ag_device_t *dev)
     return g_ag_api->dev->get_priv(dev);
 }
 
+/*
+ * Which bus and address matched when this .SYS was loaded by probe.  NULL for
+ * an ordinary `drv load`, and NULL outside ag_driver_init.
+ */
+static inline const ag_probe_hint_t *ag_probe_hint(void)
+{
+    return g_ag_api->dev->probe_hint();
+}
+
 /* ---- hardware, directly ------------------------------------------------- */
 
 /*
