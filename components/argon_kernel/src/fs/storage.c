@@ -210,7 +210,8 @@ static esp_err_t mount_sd_sdmmc(const ag_board_sd_t *sd, bool allow_format)
 static esp_err_t mount_sd_spi(const ag_board_sd_t *sd, bool allow_format)
 {
     sdmmc_host_t host = SDSPI_HOST_DEFAULT();
-    host.slot = (int)sd->spi_host;
+    /* sd.spi_host is the chip's number, as the schematic writes it. */
+    host.slot = AG_SPI_HOST_OF((int)sd->spi_host);
     host.max_freq_khz = (int)sd->max_khz;
 
     const spi_bus_config_t bus = {

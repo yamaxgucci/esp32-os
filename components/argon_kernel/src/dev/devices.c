@@ -24,6 +24,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
+#include "dev/io.h"
 #include "fs/storage.h"
 
 static SemaphoreHandle_t s_dev_mutex;
@@ -226,6 +227,17 @@ ag_err_t ag_devices_init(void)
     register_builtin("null", AG_DEV_CHAR, &k_null_ops, 0);
     register_builtin("zero", AG_DEV_CHAR, &k_zero_ops, 0);
     register_builtin("con", AG_DEV_CHAR, &k_con_ops, 0);
+
+    /*
+     * Pins and buses.  No bus is touched here - ag_io_init only writes down
+     * which pins the system is already using, so that nothing can take them.
+     * A bus comes up the first time somebody uses it.
+     */
+    err = ag_io_init();
+    if (err != AG_OK) {
+        return err;
+    }
+    ag_io_register_devices();
 
     /* Whatever storage found while mounting: the flash partition, and later
      * the card, which registers itself when it is mounted. */

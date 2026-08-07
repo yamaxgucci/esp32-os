@@ -240,6 +240,87 @@ static inline const void *ag_dev_ops(ag_handle_t h)
     return g_ag_api->dev->ops(h);
 }
 
+/* ---- hardware, directly ------------------------------------------------- */
+
+/*
+ * Full trust: drive a pin, talk to a chip on a bus, no driver's permission
+ * needed.  What is not allowed is taking what something else is using -
+ * gpio_config answers -AG_EACCES for a pin the system needs and -AG_EBUSY for
+ * one another process holds.  Reading any pin is always allowed.
+ *
+ * Everything a process takes comes back when it ends, interrupt handlers
+ * included.
+ */
+static inline ag_err_t ag_gpio_config(int pin, int mode)
+{
+    return g_ag_api->io->gpio_config(pin, mode);
+}
+static inline void ag_gpio_write(int pin, int level)
+{
+    g_ag_api->io->gpio_write(pin, level);
+}
+static inline int ag_gpio_read(int pin) { return g_ag_api->io->gpio_read(pin); }
+
+static inline ag_err_t ag_gpio_isr(int pin, int edge, ag_isr_fn fn, void *arg)
+{
+    return g_ag_api->io->gpio_isr(pin, edge, fn, arg);
+}
+static inline ag_err_t ag_gpio_isr_clear(int pin)
+{
+    return g_ag_api->io->gpio_isr_clear(pin);
+}
+
+/* AG_OK: something is there.  -AG_ENOENT: nothing at that address.
+ * -AG_ENODEV: no such bus - it is not described in BOARD.CFG. */
+static inline ag_err_t ag_i2c_probe(int bus, uint8_t addr)
+{
+    return g_ag_api->io->i2c_probe(bus, addr);
+}
+static inline ag_err_t ag_i2c_write(int bus, uint8_t addr, const void *buf,
+                                    size_t len, uint32_t timeout_ms)
+{
+    return g_ag_api->io->i2c_write(bus, addr, buf, len, timeout_ms);
+}
+static inline ag_err_t ag_i2c_read(int bus, uint8_t addr, void *buf, size_t len,
+                                   uint32_t timeout_ms)
+{
+    return g_ag_api->io->i2c_read(bus, addr, buf, len, timeout_ms);
+}
+/* Write then read without letting go of the bus - how a register is read. */
+static inline ag_err_t ag_i2c_wrrd(int bus, uint8_t addr, const void *wbuf,
+                                   size_t wlen, void *rbuf, size_t rlen,
+                                   uint32_t timeout_ms)
+{
+    return g_ag_api->io->i2c_wrrd(bus, addr, wbuf, wlen, rbuf, rlen,
+                                  timeout_ms);
+}
+
+/* cs < 0 leaves the chip select to the caller.  At most 1024 bytes at a time. */
+static inline ag_err_t ag_spi_xfer(int bus, int cs, const void *tx, void *rx,
+                                   size_t len)
+{
+    return g_ag_api->io->spi_xfer(bus, cs, tx, rx, len);
+}
+
+static inline int32_t ag_uart_write(int port, const void *buf, size_t len)
+{
+    return g_ag_api->io->uart_write(port, buf, len);
+}
+static inline int32_t ag_uart_read(int port, void *buf, size_t len,
+                                   uint32_t timeout_ms)
+{
+    return g_ag_api->io->uart_read(port, buf, len, timeout_ms);
+}
+
+static inline ag_err_t ag_pwm_config(int pin, uint32_t freq_hz, uint8_t bits)
+{
+    return g_ag_api->io->pwm_config(pin, freq_hz, bits);
+}
+static inline ag_err_t ag_pwm_set(int pin, uint32_t duty)
+{
+    return g_ag_api->io->pwm_set(pin, duty);
+}
+
 /* ---- processes ---------------------------------------------------------- */
 
 /* Runs another application and waits for it; returns its exit code. */

@@ -14,6 +14,7 @@
 #include <argon/codepage.h>
 #include <argon/console.h>
 #include <argon/device.h>
+#include <argon/ioclaim.h>
 #include <argon/kernel.h>
 #include <argon/lineedit.h>
 #include <argon/loader.h>
@@ -633,6 +634,125 @@ static int cmd_dev(int argc, char **argv)
     return 0;
 }
 
+/* ---------------------------------------------------------------------- */
+
+static const char *pin_state_name(ag_pin_state_t state)
+{
+    switch (state) {
+    case AG_PIN_RESERVED: return "system";
+    case AG_PIN_HELD:     return "held";
+    case AG_PIN_FREE:
+    default:              return "free";
+    }
+}
+
+static void io_show_pin(int pin)
+{
+    ag_pin_info_t info;
+    if (ag_io_pin_info(pin, &info) != AG_OK) {
+        ag_console_printf("no pin %d on this chip\n", pin);
+        return;
+    }
+
+    const ag_io_api_t *io = ag_loader_api()->io;
+    ag_console_printf("%4d  %-8s %-6s %-12s %5d%s\n", pin,
+                      pin_state_name(info.state),
+                      (info.state == AG_PIN_HELD && info.owner != AG_PID_KERNEL)
+                          ? "app"
+                          : (info.state == AG_PIN_FREE ? "-" : "system"),
+                      (info.why[0] != '\0') ? info.why : "-",
+                      (int)io->gpio_read(pin), info.isr ? "  isr" : "");
+}
+
+/*
+ * The pin map, and the one tool that makes an unknown board tractable: a scan
+ * of an I2C bus.  Both belong in the shell rather than in an application,
+ * because the moment you need them is before anything has been copied onto the
+ * board - see docs/user/02-board-setup.md.
+ */
+static int cmd_io(int argc, char **argv)
+{
+    const ag_io_api_t *io = ag_loader_api()->io;
+    if (io == NULL) {
+        ag_console_puts("this build has no direct hardware access\n");
+        return 1;
+    }
+
+    if (argc >= 3 && ag_path_icmp(argv[1], "i2c") == 0) {
+        const int bus = atoi(argv[2]);
+        ag_console_printf("scanning i2c%d...\n", bus);
+
+        uint32_t found = 0;
+        for (uint8_t addr = 0x08; addr <= 0x77; addr++) {
+            const ag_err_t err = io->i2c_probe(bus, addr);
+            if (err == AG_OK) {
+                ag_console_printf("  0x%02x answers\n", (unsigned)addr);
+                found++;
+            } else if (err != -AG_ENOENT) {
+                /* Not "nothing at this address" but "no such bus" or "the bus
+                 * is not working": say so once and stop, rather than printing
+                 * a hundred and twelve identical lines. */
+                ag_console_printf("  i2c%d: %s\n", bus,
+                                  ag_loader_api()->sys->strerror(err));
+                return 1;
+            }
+        }
+        ag_console_printf("%u device(s)\n", (unsigned)found);
+        return 0;
+    }
+
+    if (argc >= 2) {
+        const int pin = atoi(argv[1]);
+
+        if (argc >= 3) {
+            ag_err_t err = AG_OK;
+            if (ag_path_icmp(argv[2], "in") == 0) {
+                err = io->gpio_config(pin, AG_GPIO_IN);
+            } else if (ag_path_icmp(argv[2], "up") == 0) {
+                err = io->gpio_config(pin, AG_GPIO_IN_PULLUP);
+            } else if (ag_path_icmp(argv[2], "down") == 0) {
+                err = io->gpio_config(pin, AG_GPIO_IN_PULLDOWN);
+            } else if (ag_path_icmp(argv[2], "out") == 0) {
+                err = io->gpio_config(pin, AG_GPIO_OUT);
+            } else if (ag_path_icmp(argv[2], "0") == 0 ||
+                       ag_path_icmp(argv[2], "1") == 0) {
+                io->gpio_write(pin, argv[2][0] - '0');
+            } else {
+                ag_console_puts("usage: io <pin> [in|up|down|out|0|1]\n");
+                return 1;
+            }
+            if (err != AG_OK) {
+                ag_console_printf("pin %d: %s\n", pin,
+                                  ag_loader_api()->sys->strerror(err));
+                return 1;
+            }
+        }
+
+        ag_console_puts(" pin  state    owner  what         level\n");
+        io_show_pin(pin);
+        return 0;
+    }
+
+    ag_console_puts(" pin  state    owner  what         level\n");
+
+    uint32_t   shown = 0;
+    const int  pins = ag_io_pin_count();
+    for (int pin = 0; pin < pins; pin++) {
+        ag_pin_info_t info;
+        if (ag_io_pin_info(pin, &info) != AG_OK ||
+            info.state == AG_PIN_FREE) {
+            continue;
+        }
+        io_show_pin(pin);
+        shown++;
+    }
+
+    /* The free ones are not listed - there are forty of them and they all say
+     * the same thing - but the count is what tells you there is room. */
+    ag_console_printf("%u of %d pins free\n", (unsigned)(pins - shown), pins);
+    return 0;
+}
+
 /*
  * The file manager, built into the image.  It is the same code as apps/fm builds
  * into a .AXE, called here directly instead of being loaded - so a board that
@@ -729,6 +849,7 @@ static const ag_command_t k_commands[] = {
     {"chcp", "[437|866|1251]", "screen code page", cmd_chcp},
     {"fm", "[left] [right]", "file manager, two panels", cmd_fm},
     {"dev", "[name]", "list devices, or describe one", cmd_dev},
+    {"io", "[pin [mode]] | i2c <bus>", "pins and buses", cmd_io},
     {"ps", "", "list running applications", cmd_ps},
     {"kill", "<pid>", "stop an application", cmd_kill},
     {"fg", "<pid>", "bring an application to the foreground and wait", cmd_fg},

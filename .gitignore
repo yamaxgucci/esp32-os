@@ -20,6 +20,7 @@ Testing/
 tools/local-env.ps1
 
 # Editors / OS
+.claude/
 .vscode/
 .idea/
 .cache/
