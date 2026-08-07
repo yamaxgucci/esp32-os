@@ -23,6 +23,15 @@ typedef struct {
      * released with it.
      */
     void *data_owned;
+
+    /*
+     * R-1 flash XIP: code runs from a mapped appfs slot.  `code_scratch` held
+     * the relocated bytes until they were programmed; it is freed after mmap.
+     * `xip_slot` is an opaque ag_appfs_slot_t*.
+     */
+    void *code_scratch;
+    void *xip_slot;
+    bool  code_from_xip;
 } ag_loaded_app_t;
 
 /*

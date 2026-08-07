@@ -28,6 +28,7 @@ set(ARGON_KERNEL_SRCS
     "src/fs/idfvfs.c"
     "src/fs/storage.c"
     "src/loader/axeload.c"
+    "src/loader/appfs.c"
     "src/loader/loader.c"
     "src/loader/module.c"
     "src/loader/probe.c"
