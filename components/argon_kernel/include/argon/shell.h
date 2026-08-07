@@ -27,6 +27,14 @@ int ag_shell_execute(const char *line);
 
 const char *ag_shell_cwd(void);
 
+/*
+ * True when the operator pressed Ctrl+C during the command that is running now.
+ * A command whose work is bounded need not ask; one that reads until the end of
+ * a file has to, because a device has no end - `type d:\zero` would otherwise
+ * be a machine that has to be reset.
+ */
+bool ag_shell_interrupted(void);
+
 /* Expects an already canonical absolute path; the caller checks it exists. */
 ag_err_t ag_shell_set_cwd(const char *path);
 

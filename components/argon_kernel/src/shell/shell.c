@@ -13,6 +13,7 @@
 #include <argon/cmdline.h>
 #include <argon/codepage.h>
 #include <argon/console.h>
+#include <argon/device.h>
 #include <argon/kernel.h>
 #include <argon/lineedit.h>
 #include <argon/loader.h>
@@ -27,6 +28,7 @@
 
 #include "boot/platform.h"
 #include "core/sysconfig.h"
+#include "proc/supervisor.h"
 #include "shell/cmd_fs.h"
 
 typedef struct {
@@ -530,6 +532,107 @@ static int cmd_ps(int argc, char **argv)
     return 0;
 }
 
+/* Bytes, kilobytes or megabytes, whichever makes the number readable. */
+static void human_size(uint64_t bytes, char *out, size_t len)
+{
+    if (bytes == 0) {
+        snprintf(out, len, "%s", "-");
+    } else if (bytes < 1024u) {
+        snprintf(out, len, "%u B", (unsigned)bytes);
+    } else if (bytes < 1024u * 1024u) {
+        snprintf(out, len, "%u KB", (unsigned)(bytes / 1024u));
+    } else {
+        snprintf(out, len, "%u MB", (unsigned)(bytes / (1024u * 1024u)));
+    }
+}
+
+static void dev_flag_text(uint32_t flags, char *out, size_t len)
+{
+    out[0] = '\0';
+    const struct {
+        uint32_t    bit;
+        const char *text;
+    } names[] = {
+        {AG_DEVF_EXCLUSIVE, "exclusive"},
+        {AG_DEVF_READONLY, "read-only"},
+        {AG_DEVF_HOTPLUG, "removable"},
+        {AG_DEVF_DMA, "dma"},
+        {AG_DEVF_BUSY, "open"},
+    };
+
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        if ((flags & names[i].bit) == 0) {
+            continue;
+        }
+        if (out[0] != '\0') {
+            strncat(out, " ", len - strlen(out) - 1);
+        }
+        strncat(out, names[i].text, len - strlen(out) - 1);
+    }
+}
+
+/*
+ * What is registered, and what one device is.  The listing is the answer to
+ * "what does this board have", which on a system whose whole point is being
+ * brought up on an unknown board is the first question anybody asks.
+ */
+static int cmd_dev(int argc, char **argv)
+{
+    if (argc > 1) {
+        ag_device_t *dev = ag_dev_find(argv[1]);
+        if (dev == NULL) {
+            ag_console_printf("%s: no such device\n", argv[1]);
+            return 1;
+        }
+
+        char size[16];
+        char flags[64];
+        human_size(ag_dev_size(dev), size, sizeof(size));
+        dev_flag_text(dev->flags | (dev->open_count ? AG_DEVF_BUSY : 0), flags,
+                      sizeof(flags));
+
+        ag_console_printf("name    %s\n", dev->name);
+        ag_console_printf("class   %s\n", ag_dev_class_name(dev->cls));
+        ag_console_printf("driver  %s\n", dev->driver);
+        ag_console_printf("size    %s\n", size);
+        ag_console_printf("open    %u\n", (unsigned)dev->open_count);
+        ag_console_printf("flags   %s\n", (flags[0] != '\0') ? flags : "-");
+        ag_console_printf("path    d:\\%s\n", dev->name);
+
+        ag_geometry_t geo;
+        if (ag_dev_ioctl(dev, AG_IOC_GEOMETRY, &geo, sizeof(geo)) == AG_OK) {
+            ag_console_printf("sectors %u of %u bytes\n",
+                              (unsigned)geo.sectors, (unsigned)geo.sector_size);
+        }
+        return 0;
+    }
+
+    ag_console_puts("name      class     driver      size       flags\n");
+
+    uint32_t shown = 0;
+    for (uint32_t i = 0;; i++) {
+        ag_devinfo_t info;
+        if (ag_dev_info(i, AG_DEV_ANY, &info) != AG_OK) {
+            break;
+        }
+
+        char size[16];
+        char flags[64];
+        human_size(ag_dev_size(ag_dev_find(info.name)), size, sizeof(size));
+        dev_flag_text(info.flags, flags, sizeof(flags));
+
+        ag_console_printf("%-9s %-9s %-11s %-10s %s\n", info.name,
+                          ag_dev_class_name(info.cls), info.driver, size,
+                          flags);
+        shown++;
+    }
+
+    if (shown == 0) {
+        ag_console_puts("no devices\n");
+    }
+    return 0;
+}
+
 /*
  * The file manager, built into the image.  It is the same code as apps/fm builds
  * into a .AXE, called here directly instead of being loaded - so a board that
@@ -625,6 +728,7 @@ static const ag_command_t k_commands[] = {
     {"color", "<fg> <bg>", "set text colours", cmd_color},
     {"chcp", "[437|866|1251]", "screen code page", cmd_chcp},
     {"fm", "[left] [right]", "file manager, two panels", cmd_fm},
+    {"dev", "[name]", "list devices, or describe one", cmd_dev},
     {"ps", "", "list running applications", cmd_ps},
     {"kill", "<pid>", "stop an application", cmd_kill},
     {"fg", "<pid>", "bring an application to the foreground and wait", cmd_fg},
@@ -666,6 +770,8 @@ static int cmd_help(int argc, char **argv)
 /* ---------------------------------------------------------------------- */
 
 const char *ag_shell_cwd(void) { return s_cwd; }
+
+bool ag_shell_interrupted(void) { return ag_supervisor_interrupted(); }
 
 /* Output redirection: the sink the console writes through for "dir > file". */
 static int32_t file_sink(void *ctx, const char *data, size_t len)
@@ -739,6 +845,9 @@ int ag_shell_execute(const char *line)
     int status = 127;
     bool found = false;
 
+    /* This command's own answer to "was I interrupted", not the last one's. */
+    ag_supervisor_clear_interrupt();
+
     if (redirect >= 0) {
         ag_console_redirect(file_sink, (void *)(intptr_t)redirect);
     }
@@ -765,6 +874,17 @@ int ag_shell_execute(const char *line)
     if (redirect >= 0) {
         ag_console_redirect(NULL, NULL);
         ag_vfs_close(redirect);
+    }
+
+    /*
+     * The Ctrl+C that stopped the command is still in the queue, along with
+     * anything else typed while it was scrolling.  Those keys were aimed at the
+     * command, not at the next prompt - a terminal drops them for the same
+     * reason, and leaving them would mean the prompt comes back with a line
+     * somebody typed at something else.
+     */
+    if (ag_supervisor_interrupted()) {
+        ag_console_flush_input();
     }
 
     if (!found) {

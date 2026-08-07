@@ -126,6 +126,20 @@ uint32_t ag_vfs_close_owned_by(ag_pid_t pid);
 /* Number of handles currently open, for the shell and for leak checks. */
 uint32_t ag_vfs_open_count(void);
 
+/*
+ * The backend's own object behind an open file handle, or NULL.
+ *
+ * `ops` says which backend the caller believes it is talking to, and a handle
+ * belonging to any other one answers NULL.  Without that the caller would be
+ * casting whatever the last mount put there, and a handle on a file would look
+ * exactly like a handle on a device.
+ *
+ * This exists for the one thing a file handle has no room for: the device layer
+ * needs to get from an open handle back to the device, so that ioctl and the
+ * class vtable can be reached without a second handle table.
+ */
+void *ag_vfs_backend_object(ag_handle_t h, const ag_fs_ops_t *ops);
+
 #ifdef __cplusplus
 }
 #endif

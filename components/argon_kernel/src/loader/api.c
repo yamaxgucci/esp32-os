@@ -13,6 +13,8 @@
 
 #include <argon/codepage.h>
 #include <argon/console.h>
+#include <argon/devfs.h>
+#include <argon/device.h>
 #include <argon/kernel.h>
 #include <argon/loader.h>
 #include <argon/log.h>
@@ -522,6 +524,82 @@ static const ag_inp_api_t k_inp = {
 };
 
 /* ---------------------------------------------------------------------- */
+/* dev                                                                    */
+/* ---------------------------------------------------------------------- */
+
+/*
+ * A device handle is a file handle.  Everything below forwards to the VFS,
+ * because /dev is a mount and the handle table, the ownership and the closing
+ * of what a killed process left open are already there - a second table would
+ * be a second place to forget.  Only ioctl and the class vtable need the device
+ * itself, and those come back from the handle.
+ */
+static ag_handle_t api_dev_open(const char *name)
+{
+    if (name == NULL || name[0] == '\0') {
+        return -AG_EINVAL;
+    }
+
+    /*
+     * Both spellings work: "sd0" because that is the device's name, and
+     * "d:\sd0" or "/dev/sd0" because that is where it lives.  An application
+     * that has a path from somewhere else should not have to take it apart.
+     */
+    char        path[AG_PATH_MAX];
+    const char *target = name;
+    const bool  is_path = strchr(name, '/') != NULL ||
+                         strchr(name, '\\') != NULL ||
+                         strchr(name, ':') != NULL;
+
+    if (!is_path) {
+        const size_t n = strlen(name);
+        if (n + sizeof("/dev/") > sizeof(path)) {
+            return -AG_ERANGE;
+        }
+        memcpy(path, "/dev/", sizeof("/dev/") - 1);
+        memcpy(path + sizeof("/dev/") - 1, name, n + 1);
+        target = path;
+    }
+
+    /*
+     * Read-write first, and read-only when the device refuses to be written.
+     * The ABI has one way in, so it cannot ask the caller which it wanted, and
+     * a caller that only reads must not be turned away from a read-only device.
+     */
+    const char *cwd = is_path ? ag_proc_cwd() : NULL;
+
+    const ag_handle_t h = ag_vfs_open(target, cwd, AG_O_RDWR);
+    return (h != -AG_EROFS) ? h : ag_vfs_open(target, cwd, AG_O_RDONLY);
+}
+
+static ag_err_t api_dev_ioctl(ag_handle_t h, uint32_t cmd, void *arg,
+                              size_t arglen)
+{
+    ag_device_t *dev = ag_devfs_device_of(h);
+    if (dev == NULL) {
+        return -AG_EBADF;
+    }
+    return ag_dev_ioctl(dev, cmd, arg, arglen);
+}
+
+static const void *api_dev_ops(ag_handle_t h)
+{
+    const ag_device_t *dev = ag_devfs_device_of(h);
+    return (dev != NULL) ? dev->class_ops : NULL;
+}
+
+static const ag_dev_api_t k_dev = {
+    .size = sizeof(ag_dev_api_t),
+    .enumerate = ag_dev_info,
+    .open = api_dev_open,
+    .close = ag_vfs_close,
+    .read = ag_vfs_read,
+    .write = ag_vfs_write,
+    .ioctl = api_dev_ioctl,
+    .ops = api_dev_ops,
+};
+
+/* ---------------------------------------------------------------------- */
 /* proc                                                                   */
 /* ---------------------------------------------------------------------- */
 
@@ -592,7 +670,7 @@ static const ag_api_t k_api = {
     .con = &k_con,
     .inp = &k_inp,
     .gfx = NULL,
-    .dev = NULL,
+    .dev = &k_dev,
     .io = NULL,
     .time = &k_time,
     .task = &ag_task_api_table,

@@ -24,10 +24,15 @@ own watchdog, and every byte of any of them comes back. Crash records survive th
 reboot on disk. Without an MMU a wild pointer can still corrupt memory that is
 not the application's; that is a deliberate trade, not an oversight.
 
+Devices have a model now: a registry with classes, owners and exclusive access,
+reachable through the filesystem as `/dev` - so a device is a file, with the same
+handle table, the same ownership and the same reclaim when a process dies. Behind
+it are the card and the flash partition, sector by sector.
+
 What is missing is the hardware half: no display driver, no USB keyboard, no
-device model, no networking. An application's *code* is also still bounded by the
-64 KB executable arena - its data and constants are not, they live in PSRAM and
-run to megabytes.
+loadable `.SYS` drivers and no direct bus access for them to use, no networking.
+An application's *code* is also still bounded by the 64 KB executable arena - its
+data and constants are not, they live in PSRAM and run to megabytes.
 
 Start with **[docs/05-status.md](docs/05-status.md)**: what works, what does not,
 how to build and verify, and the traps already found. Then
