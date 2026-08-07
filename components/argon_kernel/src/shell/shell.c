@@ -838,6 +838,13 @@ static int cmd_fm(int argc, char **argv)
     return ag_fm_main(argc, argv);
 }
 
+int ag_edit_main(int argc, char **argv);
+
+static int cmd_edit(int argc, char **argv)
+{
+    return ag_edit_main(argc, argv);
+}
+
 static int cmd_kill(int argc, char **argv)
 {
     if (argc != 2) {
@@ -920,6 +927,7 @@ static const ag_command_t k_commands[] = {
     {"color", "<fg> <bg>", "set text colours", cmd_color},
     {"chcp", "[437|866|1251]", "screen code page", cmd_chcp},
     {"fm", "[left] [right]", "file manager, two panels", cmd_fm},
+    {"edit", "[file]", "create or edit a text file", cmd_edit},
     {"dev", "[name]", "list devices, or describe one", cmd_dev},
     {"drv", "[load|unload] ...", "list, load or unload .SYS modules", cmd_drv},
     {"io", "[pin [mode]] | i2c <bus>", "pins and buses", cmd_io},
