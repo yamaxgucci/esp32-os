@@ -50,12 +50,20 @@ argon test -Put "build\ECHO.SYS=t:\echo.sys" ^
 ```
 [modules]
 device = t:\echo.sys
-device = a:\drv\bme280.sys
+device = a:\drv\force.sys
+; I2C: bus:addr:path   или   bus:addr:idreg=idval:path
+probe  = 0:0x76:a:\drv\bme280.sys
+probe  = 0:0x76:0xD0=0x60:a:\drv\bme280.sys
 ```
 
-Шелл: `drv` (список), `drv load <file>`, `drv unload <name>`. Имя для unload —
-из заголовка образа (`ECHO`), не путь к файлу. `dev` показывает устройства;
-`run` на `.SYS` отказывает.
+`device=` грузит всегда. `probe=` — только если на шине ответил адрес (и, если
+указано, совпал байт ID). Перед загрузкой ядро само читает регистр: чужой чип
+в арену не попадает. В `ag_driver_init` совпадение доступно через
+`ag_probe_hint()` (шина, адрес, id). Пример — `apps/whoami`.
+
+Шелл: `drv` (список), `drv load <file>`, `drv unload <name>`, `drv probe`
+(повторить подбор из конфига). Имя для unload — из заголовка образа (`ECHO`),
+не путь к файлу. `dev` показывает устройства; `run` на `.SYS` отказывает.
 
 ## Ограничения
 
@@ -63,4 +71,5 @@ device = a:\drv\bme280.sys
   модули). Константы — в PSRAM, арену не занимают.
 * До восьми модулей сразу (`AG_MODULE_MAX`).
 * Нет изоляции: дикий указатель в драйвере портит систему, как и в приложении.
-* Подбор по ID шины (`probe`) и классы со своими vtable — ещё впереди.
+* `probe` пока только I2C. SPI-панели на скан не отвечают — их тип и пины
+  остаются в `BOARD.CFG`. Классы со своими vtable — ещё впереди.

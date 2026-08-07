@@ -307,8 +307,9 @@ sd0       storage   sdmmc       64 MB      read-only removable
 **`drv`** — загруженные модули `.SYS`. Без аргументов — список; `drv load
 <file>` поднимает модуль и вызывает его `ag_driver_init`; `drv unload <name>`
 снимает модуль и отзывает устройства, которые он зарегистрировал (`name` —
-имя из заголовка образа, например `ECHO`). `run` на `.SYS` отказывает: это не
-приложение.
+имя из заголовка образа, например `ECHO`); `drv probe` подбирает модули из
+`[modules] probe=` в `SYSTEM.CFG` по ответам на I2C. `run` на `.SYS`
+отказывает: это не приложение.
 
 ```
 A:\> drv load t:\echo.sys
@@ -316,6 +317,8 @@ loaded t:\echo.sys
 A:\> drv
 name      version  code       data       path
 ECHO      1.0      ...        ...        t:\echo.sys
+A:\> drv probe
+probe: 0 loaded, 1 absent
 A:\> drv unload ECHO
 unloaded ECHO
 ```

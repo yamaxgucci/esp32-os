@@ -21,6 +21,7 @@
 #include <argon/log.h>
 #include <argon/module.h>
 #include <argon/path.h>
+#include <argon/probe.h>
 #include <argon/proc.h>
 #include <argon/vfs.h>
 
@@ -676,8 +677,29 @@ static int cmd_drv(int argc, char **argv)
         return 0;
     }
 
+    if (argc >= 2 && ag_path_icmp(argv[1], "probe") == 0) {
+        if (argc != 2) {
+            ag_console_puts("usage: drv probe\n");
+            ag_console_puts(
+                "  load modules listed under [modules] probe= in SYSTEM.CFG\n");
+            ag_console_puts(
+                "  for chips that answer on I2C (see docs/sdk/05-drivers.md)\n");
+            return 1;
+        }
+        uint32_t       loaded = 0;
+        uint32_t       missed = 0;
+        const ag_err_t err = ag_probe_run(&loaded, &missed);
+        if (err != AG_OK) {
+            ag_console_printf("probe: %d\n", (int)err);
+            return 1;
+        }
+        ag_console_printf("probe: %u loaded, %u absent\n", (unsigned)loaded,
+                          (unsigned)missed);
+        return 0;
+    }
+
     if (argc > 1) {
-        ag_console_puts("usage: drv [load <file>|unload <name>]\n");
+        ag_console_puts("usage: drv [load|unload|probe] ...\n");
         return 1;
     }
 
@@ -929,7 +951,8 @@ static const ag_command_t k_commands[] = {
     {"fm", "[left] [right]", "file manager, two panels", cmd_fm},
     {"edit", "[file]", "create or edit a text file", cmd_edit},
     {"dev", "[name]", "list devices, or describe one", cmd_dev},
-    {"drv", "[load|unload] ...", "list, load or unload .SYS modules", cmd_drv},
+    {"drv", "[load|unload|probe]", "modules: list, load, unload, I2C probe",
+     cmd_drv},
     {"io", "[pin [mode]] | i2c <bus>", "pins and buses", cmd_io},
     {"ps", "", "list running applications", cmd_ps},
     {"kill", "<pid>", "stop an application", cmd_kill},

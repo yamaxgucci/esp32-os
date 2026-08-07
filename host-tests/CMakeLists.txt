@@ -35,7 +35,8 @@ set(ARGON_PORTABLE_SRCS
     "${ARGON_ROOT}/components/argon_kernel/src/core/journal.c"
     "${ARGON_ROOT}/components/argon_kernel/src/core/reslist.c"
     "${ARGON_ROOT}/components/argon_kernel/src/core/arena.c"
-    "${ARGON_ROOT}/components/argon_kernel/src/loader/axeload.c")
+    "${ARGON_ROOT}/components/argon_kernel/src/loader/axeload.c"
+    "${ARGON_ROOT}/components/argon_kernel/src/loader/probe.c")
 
 set(ARGON_INCLUDES
     "${CMAKE_CURRENT_LIST_DIR}"
@@ -62,6 +63,7 @@ add_executable(argon_tests
     test_arena.c
     test_axeload.c
     test_codepage.c
+    test_probe.c
     ${ARGON_PORTABLE_SRCS})
 
 target_include_directories(argon_tests PRIVATE ${ARGON_INCLUDES})

@@ -16,6 +16,7 @@
 #define ARGON_MODULE_H
 
 #include <argon/loader.h>
+#include <argon/abi.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -45,6 +46,13 @@ typedef struct {
 ag_err_t ag_module_load(const char *path, const char *cwd);
 
 /*
+ * Same as ag_module_load, but ag_driver_init can ask for `hint` through
+ * dev->probe_hint().  Used when the module was chosen by a bus match.
+ */
+ag_err_t ag_module_load_hinted(const char *path, const char *cwd,
+                               const ag_probe_hint_t *hint);
+
+/*
  * Revokes every device the module published and frees its image.  `name` is the
  * name from the image header (what `drv` lists), not the file path.
  * -AG_ENOENT when nothing of that name is loaded.
@@ -60,10 +68,13 @@ uint32_t ag_module_count(void);
  */
 const void *ag_module_loading(void);
 
+/* Probe hint for that same window, or NULL.  What dev->probe_hint() returns. */
+const ag_probe_hint_t *ag_module_probe_hint(void);
+
 /*
- * Walks [modules] device=... from SYSTEM.CFG and loads each path.  A missing or
- * failing module is logged; the board still reaches the shell.  Boot stage
- * `modules` calls this.
+ * Walks [modules] device=... from SYSTEM.CFG, then runs I2C probe against
+ * modules.probe.  A missing or failing module is logged; the board still
+ * reaches the shell.  Boot stage `modules` calls this.
  */
 ag_err_t ag_modules_boot(void);
 

@@ -15,7 +15,7 @@
  *
  *     [modules]
  *     device = /sd/drv/bme280.sys
- *     device = /sd/drv/mcp23017.sys
+ *     probe  = 0:0x76:0xD0=0x60:/sd/drv/bme280.sys
  *
  * Parsing is zero-copy: the text buffer is chopped up in place and the table
  * holds pointers into it, so the buffer must outlive the ag_cfg_t.

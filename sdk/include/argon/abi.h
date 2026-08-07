@@ -39,9 +39,11 @@ extern "C" {
  *     NULL unless the build asked for the ADC - see AG_HAS.
  * 0.6 appended add / remove / get_priv on dev: a .SYS module can publish a
  *     device from ag_driver_init and take it back on unload.
+ * 0.7 appended probe_hint on dev: during a probe-driven load, ag_driver_init
+ *     can ask which bus and address matched.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 6u
+#define AG_ABI_MINOR 7u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -519,6 +521,20 @@ typedef struct {
 } ag_dev_add_t;
 
 /*
+ * What matched when the module was loaded by probe, not by an explicit
+ * `drv load`.  NULL outside ag_driver_init, and NULL for a forced load.
+ * The driver uses bus/addr to talk to the chip; when has_id is set the kernel
+ * already checked the ID register before loading, so the match is real.
+ */
+typedef struct {
+    int     bus;    /* I2C bus number as in BOARD.CFG / io             */
+    uint8_t addr;   /* 7-bit address that answered                     */
+    bool    has_id; /* kernel verified id_reg reads as id_val          */
+    uint8_t id_reg;
+    uint8_t id_val;
+} ag_probe_hint_t;
+
+/*
  * A device is a byte addressable object with a name, and the handle carries the
  * position - so fs->read, fs->write and fs->seek work on "/dev/sd0" exactly as
  * they do on a file, and `copy` needs no special case for a device.  This
@@ -526,6 +542,7 @@ typedef struct {
  * things a file has no room for, ioctl and the class vtable.
  *
  * 0.6 appended add / remove / get_priv for loadable drivers.
+ * 0.7 appended probe_hint for probe-driven loads.
  */
 typedef struct ag_dev_api {
     uint32_t size;
@@ -546,6 +563,9 @@ typedef struct ag_dev_api {
     ag_err_t (*remove)(const char *name);
     /* The priv pointer the driver passed to add(), for use inside ops. */
     void *(*get_priv)(ag_device_t *dev);
+
+    /* Bus/address that matched, or NULL when this load was not from probe. */
+    const ag_probe_hint_t *(*probe_hint)(void);
 } ag_dev_api_t;
 
 /* ------------------------------------------------------------------------ */
