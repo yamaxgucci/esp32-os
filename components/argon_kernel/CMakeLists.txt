@@ -40,7 +40,9 @@ set(ARGON_KERNEL_SRCS
     # board before it is useful.  Same sources as the .AXE in apps/fm, built with
     # AG_BUILTIN: see apps/fm/fm.h.
     "../../apps/fm/fm.c"
-    "../../apps/fm/fmops.c")
+    "../../apps/fm/fmops.c"
+    # Same dual-build idea as fm: shell command `edit`, also buildable as .AXE.
+    "../../apps/edit/edit.c")
 
 idf_component_register(
     SRCS ${ARGON_KERNEL_SRCS}
@@ -94,9 +96,10 @@ target_compile_definitions(${COMPONENT_LIB}
             # real C library, and this code is a built-in rather than an image.
             AG_BUILTIN=1 AG_HAVE_LIBC=1)
 
-# The manager's own header sits next to its sources.
+# Built-in app headers sit next to their sources.
 target_include_directories(${COMPONENT_LIB}
-    PRIVATE "${CMAKE_CURRENT_LIST_DIR}/../../apps/fm")
+    PRIVATE "${CMAKE_CURRENT_LIST_DIR}/../../apps/fm"
+            "${CMAKE_CURRENT_LIST_DIR}/../../apps/edit")
 
 target_compile_options(${COMPONENT_LIB} PRIVATE
     -Wall -Wextra -Werror=implicit-function-declaration
