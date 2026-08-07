@@ -95,6 +95,7 @@ argon flash -port COM5   прошить настоящую плату
 | Устройства как файлы | `src/dev/devfs.c` | ✅ `/dev` — диск `D:`, одна таблица дескрипторов с файлами |
 | Встроенные устройства | `src/dev/devices.c`, `storage.c` | ✅ `null zero con flash0 sd0 fb0`, команда `dev` |
 | Soft display / `gfx` | `src/dev/display.c`, `font8x16.c` | ✅ RGB565 в PSRAM (320×240), ABI 0.8, `gfxdump`, демо `apps/gfxdemo` |
+| Master System `.AXE` | `apps/sms/` (SMS Plus GX, GPLv2+) | ✅ mute: VDP→soft fb, клавиатура→pad, QEMU `run` + `gfxdump` |
 | Владение пинами | `src/dev/ioclaim.c` | ✅ пины системы, занятые пины, возврат за упавшим процессом |
 | Железо напрямую | `src/dev/io.c` | ✅ GPIO, ISR, I2C, SPI, UART, PWM; команда `io`, скан I2C |
 | Таблица ABI | `src/loader/api.c` | ⚠ 0.8: `sys mem fs con time proc task inp dev io gfx`, `cfg`/`net` — `NULL` |
@@ -237,6 +238,14 @@ python tools\mkaxe.py --arch xtensa --gcc xtensa-esp32s3-elf-gcc \
     apps\bigcode\bigcode.c apps\bigcode\bigcode_body.c
 argon test -Put "build\BIGCODE.AXE=t:\bigcode.axe" -TimeoutSec 180 \
     "run t:\bigcode.axe" "errorlevel"
+```
+
+Master System (отдельное GPL-приложение): точная команда сборки — в
+[`apps/sms/README.md`](../apps/sms/README.md). Проверка:
+
+```
+argon test -Put "build\SMS.AXE=t:\sms.axe" -TimeoutSec 180 `
+  "run t:\sms.axe" "errorlevel" "gfxdump t:\sms.ppm"
 ```
 
 Вручную доставить в эмулятор: `recv t:\hello.axe`, затем строки hex, затем `END`.
@@ -558,10 +567,11 @@ argon test -Sd -Put 'build\DEVS.AXE=t:\devs.axe' 'run t:\devs.axe' 'errorlevel'
   ArgonOS на незнакомой плате», от требований к модулю до таблицы симптомов.
 * ✅ примеры в `apps/`: `hello` (две части образа, константы, bss больше арены),
   **`disk` (файлы и диски)**, **`devs` (устройства и железо напрямую)**,
-  **`echo` / `whoami` (`.SYS`)**, **`gfxdemo` (soft gfx)**, `spin`, `leak`,
-  `threads`, `crash`, `fm`, `edit`. Приложения проверяют себя сами (`run` +
-  `errorlevel`); `echo` — через `drv load`; `whoami` — через probe hint;
-  `edit` — встроенная команда; `gfxdemo` — `AG_AXE_NEEDS_GFX` + `gfxdump`.
+  **`echo` / `whoami` (`.SYS`)**, **`gfxdemo` (soft gfx)**, **`sms` (Master
+  System, GPLv2+ core)**, `spin`, `leak`, `threads`, `crash`, `fm`, `edit`.
+  Приложения проверяют себя сами (`run` + `errorlevel`); `echo` — через
+  `drv load`; `whoami` — через probe hint; `edit` — встроенная команда;
+  `gfxdemo` / `sms` — `AG_AXE_NEEDS_GFX` + `gfxdump`.
 
 Написано после модели процессов, как и планировалось: подтаблицы `task` и `proc`
 появились там же, и описывать ABI до них значило бы переписывать дважды.
