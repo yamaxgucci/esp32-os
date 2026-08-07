@@ -28,10 +28,16 @@ extern "C" {
  * it points into the same allocation as `code`, immediately after it.
  */
 typedef struct {
-    void  *code;
+    void  *code; /* final address: biases, entry, execution          */
     size_t code_capacity;
     void  *data;
     size_t data_capacity;
+    /*
+     * When non-NULL, relocation patches and api_slot resolution for the code
+     * part write through this buffer instead of `code`.  Used for flash XIP:
+     * biases target the eventual mmap address while bytes are still in RAM.
+     */
+    void *code_writable;
 } ag_axe_place_t;
 
 typedef struct {

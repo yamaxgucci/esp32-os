@@ -204,8 +204,11 @@ ag_err_t ag_axe_apply(const ag_axe_header_t *header,
         return -AG_ENOMEM;
     }
 
-    uint8_t *const code = (uint8_t *)place->code;
-    uint8_t       *data = NULL;
+    uint8_t *const code_final = (uint8_t *)place->code;
+    uint8_t *const code_write =
+        (place->code_writable != NULL) ? (uint8_t *)place->code_writable
+                                       : code_final;
+    uint8_t *data = NULL;
     if (header->data.size > 0) {
         if (place->data == NULL) {
             return -AG_EINVAL;
@@ -234,9 +237,12 @@ ag_err_t ag_axe_apply(const ag_axe_header_t *header,
      * is already correct, because it and its target moved together; only words
      * holding an absolute address need it added, and which of the two biases
      * depends on which part the address points into.
+     *
+     * Biases use the final code address (`code`), even when patches are written
+     * into `code_writable` for a later flash program (R-1 XIP).
      */
     const uint32_t code_bias =
-        (uint32_t)((uintptr_t)code - (uintptr_t)header->code.base);
+        (uint32_t)((uintptr_t)code_final - (uintptr_t)header->code.base);
     const uint32_t data_bias =
         (data != NULL)
             ? (uint32_t)((uintptr_t)data - (uintptr_t)header->data.base)
@@ -253,7 +259,7 @@ ag_err_t ag_axe_apply(const ag_axe_header_t *header,
             return -AG_EFORMAT;
         }
 
-        uint8_t *const part = in_data ? data : code;
+        uint8_t *const part = in_data ? data : code_write;
         const uint32_t stored =
             in_data ? header->data.file_size : header->code.file_size;
 
@@ -272,10 +278,16 @@ ag_err_t ag_axe_apply(const ag_axe_header_t *header,
         memcpy(part + at, &word, sizeof(word));
     }
 
-    out->code_base = (uintptr_t)code;
+    out->code_base = (uintptr_t)code_final;
     out->data_base = (uintptr_t)data;
-    out->entry = ag_axe_resolve(header, place, header->entry);
-    out->api_slot = (uint32_t *)ag_axe_resolve(header, place, header->api_slot);
+    out->entry = (void *)(code_final + (header->entry - header->code.base));
+    if (part_covers(&header->code, header->api_slot, 4)) {
+        out->api_slot =
+            (uint32_t *)(code_write + (header->api_slot - header->code.base));
+    } else {
+        out->api_slot =
+            (uint32_t *)ag_axe_resolve(header, place, header->api_slot);
+    }
     if (out->entry == NULL || out->api_slot == NULL) {
         return -AG_EFORMAT;
     }

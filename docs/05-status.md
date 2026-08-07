@@ -81,7 +81,7 @@ argon flash -port COM5   прошить настоящую плату
 | FAT на flash `C:` | `src/fs/idfvfs.c`, `storage.c` | ✅ |
 | FAT на SD `A:` | `storage.c` | ✅ SDMMC и SPI, `format a:` |
 | Шелл | `src/shell/` | ✅ история, перенаправление, 32 команды |
-| Загрузчик `.AXE` | `src/loader/`, `tools/mkaxe.py` | ✅ две части, см. ниже |
+| Загрузчик `.AXE` | `src/loader/`, `tools/mkaxe.py` | ✅ две части; R-1 flash XIP при переполнении арены |
 | Арена кода | `src/core/arena.c` | ✅ несколько образов в 64 КБ |
 | Модель процессов | `src/proc/proc.c` | ✅ до 4 процессов, арена, cwd, учёт ресурсов |
 | Потоки приложения | `src/proc/threads.c` | ✅ до 4 на процесс, мьютексы, семафоры, очереди |
@@ -226,6 +226,17 @@ python tools/mkaxe.py --arch xtensa --gcc xtensa-esp32s3-elf-gcc \
     --include sdk/include -o build\GFXDEMO.AXE apps/gfxdemo/gfxdemo.c
 argon test -Put "build\GFXDEMO.AXE=t:\gfxdemo.axe" \
     "run t:\gfxdemo.axe" "gfxdump t:\shot.ppm" "dir t:\shot.ppm"
+```
+
+Flash XIP / R-1 (код больше арены):
+
+```
+python tools\gen_bigcode.py
+python tools\mkaxe.py --arch xtensa --gcc xtensa-esp32s3-elf-gcc \
+    --include sdk/include -o build\BIGCODE.AXE \
+    apps\bigcode\bigcode.c apps\bigcode\bigcode_body.c
+argon test -Put "build\BIGCODE.AXE=t:\bigcode.axe" -TimeoutSec 180 \
+    "run t:\bigcode.axe" "errorlevel"
 ```
 
 Вручную доставить в эмулятор: `recv t:\hello.axe`, затем строки hex, затем `END`.
@@ -486,8 +497,8 @@ argon test -Sd -Put 'build\DEVS.AXE=t:\devs.axe' 'run t:\devs.axe' 'errorlevel'
      вместо 98 552, `AG_HOT_RODATA` оставляет отдельную таблицу в SRAM,
      `--rodata code` возвращает старое размещение целиком.
    * **Код в окно инструкций PSRAM** — мегабайты кода, спайк S-1, требует платы.
-   * **`.text` в раздел flash и XIP** — план Б без платы, ценой износа flash и
-     задержки старта.
+   * ✅ **`.text` в раздел flash и XIP** (R-1) — авто при переполнении арены;
+     раздел `appfs`, `apps/bigcode` в QEMU.
 4. ✅ **Кодовая страница экрана** — `chcp 437|866|1251`, `[console] codepage` в
    `SYSTEM.CFG`, `con->codepage`/`set_codepage` в ABI (0.3). Ячейка хранит один
    байт, конвертация на краях. Проверено в QEMU: файл в CP866 читается как
