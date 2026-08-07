@@ -31,6 +31,7 @@ set(ARGON_PORTABLE_SRCS
     "${ARGON_ROOT}/components/argon_kernel/src/fs/ramfs.c"
     "${ARGON_ROOT}/components/argon_kernel/src/dev/device.c"
     "${ARGON_ROOT}/components/argon_kernel/src/dev/devfs.c"
+    "${ARGON_ROOT}/components/argon_kernel/src/dev/ioclaim.c"
     "${ARGON_ROOT}/components/argon_kernel/src/core/journal.c"
     "${ARGON_ROOT}/components/argon_kernel/src/core/reslist.c"
     "${ARGON_ROOT}/components/argon_kernel/src/core/arena.c"
@@ -55,6 +56,7 @@ add_executable(argon_tests
     test_lineedit.c
     test_vfs.c
     test_device.c
+    test_ioclaim.c
     test_journal.c
     test_reslist.c
     test_arena.c

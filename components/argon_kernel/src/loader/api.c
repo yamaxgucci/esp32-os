@@ -27,6 +27,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "dev/io.h"
+
 /* ---------------------------------------------------------------------- */
 /* sys                                                                    */
 /* ---------------------------------------------------------------------- */
@@ -671,7 +673,7 @@ static const ag_api_t k_api = {
     .inp = &k_inp,
     .gfx = NULL,
     .dev = &k_dev,
-    .io = NULL,
+    .io = &ag_io_api_table,
     .time = &k_time,
     .task = &ag_task_api_table,
     .proc = &k_proc,

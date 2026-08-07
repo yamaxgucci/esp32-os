@@ -24,6 +24,7 @@
 #include "freertos/task.h"
 #include "multi_heap.h"
 
+#include "dev/io.h"
 #include "fs/storage.h"
 #include "proc/supervisor.h"
 
@@ -263,11 +264,19 @@ static void reap(proc_t *p)
 {
     const uint32_t held = ag_reslist_reclaim(&p->res, release_resource, p);
     const uint32_t files = ag_vfs_close_owned_by(p->pid);
+    /*
+     * Pins last, and never skipped.  An interrupt handler belonging to code
+     * that is about to be freed is not a leak - it is a board that stops at the
+     * next edge on that pin, with nothing in the journal to say why.
+     */
+    const uint32_t pins = ag_io_reclaim(p->pid);
 
-    if (held > 0 || files > 0) {
+    if (held > 0 || files > 0 || pins > 0) {
         ag_log(AG_LOG_INFO, "proc",
-               "%s (pid %u) left %u resource(s) and %u open file(s); reclaimed",
-               p->name, (unsigned)p->pid, (unsigned)held, (unsigned)files);
+               "%s (pid %u) left %u resource(s), %u open file(s) and %u pin(s); "
+               "reclaimed",
+               p->name, (unsigned)p->pid, (unsigned)held, (unsigned)files,
+               (unsigned)pins);
     }
 
     ag_loader_unload(&p->app);

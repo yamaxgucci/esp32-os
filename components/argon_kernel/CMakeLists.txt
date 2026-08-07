@@ -19,6 +19,8 @@ set(ARGON_KERNEL_SRCS
     "src/dev/device.c"
     "src/dev/devfs.c"
     "src/dev/devices.c"
+    "src/dev/ioclaim.c"
+    "src/dev/io.c"
     "src/fs/vfs.c"
     "src/fs/ramfs.c"
     "src/fs/idfvfs.c"
@@ -48,8 +50,18 @@ idf_component_register(
                   esp_system esp_hw_support esp_driver_uart log
                   fatfs wear_levelling vfs sdmmc esp_driver_sdmmc
                   esp_driver_sdspi esp_driver_spi esp_driver_gpio
+                  # api->io: buses and pins straight through to the chip.
+                  # esp_adc is deliberately absent - see ARGON_ENABLE_ADC.
+                  esp_driver_i2c esp_driver_ledc
                   # xtensa: the exception table the fault handler installs into
                   xtensa)
+
+# Analogue input, off by default: linking esp_adc runs a constructor that stops
+# the boot under QEMU, and QEMU is how this system is verified.  See Kconfig.
+if(CONFIG_ARGON_ENABLE_ADC)
+    idf_component_get_property(adc_lib esp_adc COMPONENT_LIB)
+    target_link_libraries(${COMPONENT_LIB} PRIVATE ${adc_lib})
+endif()
 
 # Stamp the build with a git description when one is available.
 find_package(Git QUIET)

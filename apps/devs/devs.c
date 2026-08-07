@@ -232,6 +232,98 @@ static void refusals(void)
     }
 }
 
+/* ---- the pins themselves ------------------------------------------------ */
+
+/*
+ * Direct access is allowed, and it is also the one place where an application
+ * can quietly break the machine it is running on.  Everything here is either a
+ * read, which changes nothing, or a claim of a pin the system has said is free.
+ */
+static void use_pins(void)
+{
+    const ag_io_api_t *io = ag_api()->io;
+    if (io == NULL) {
+        ag_print("no direct hardware access in this build\n");
+        return;
+    }
+
+    /*
+     * The console's own pin.  Refused, and that refusal is the whole point of
+     * the pin table: an application that took it would end the conversation it
+     * is reporting over, and nobody would ever see why.
+     */
+    const ag_err_t console = io->gpio_config(43, AG_GPIO_OUT);
+    if (console != -AG_EACCES) {
+        ag_printf("  driving the console pin gave %d, wanted -AG_EACCES\n",
+                  (int)console);
+        s_failures++;
+    } else {
+        ag_print("the console pin is refused, as it should be\n");
+    }
+
+    /* A pin that is nobody's.  Configure it, drive it, read it back. */
+    const int pin = 5;
+    ag_err_t  err = io->gpio_config(pin, AG_GPIO_OUT);
+    if (err != AG_OK) {
+        failed("gpio_config", err);
+        return;
+    }
+
+    io->gpio_write(pin, 1);
+    const int high = io->gpio_read(pin);
+    io->gpio_write(pin, 0);
+    const int low = io->gpio_read(pin);
+    ag_printf("pin %d reads %d when driven high and %d when driven low\n", pin,
+              high, low);
+
+    /* Reading is allowed anywhere - it is how a wiring problem gets looked at
+     * rather than guessed at - so a reserved pin still answers. */
+    if (io->gpio_read(43) < 0) {
+        wrong("reading a reserved pin should still work");
+    }
+    /* A pin the chip does not have is out of range, not a crash. */
+    if (io->gpio_read(9999) != -AG_ERANGE) {
+        wrong("a pin that does not exist should answer -AG_ERANGE");
+    }
+
+    /*
+     * Not released on purpose: the point being made is that ending the process
+     * gives it back anyway.  `io` at the prompt afterwards shows pin 5 free.
+     */
+}
+
+static void buses(void)
+{
+    const ag_io_api_t *io = ag_api()->io;
+    if (io == NULL) {
+        return;
+    }
+
+    /*
+     * On a board whose BOARD.CFG never named the pins there is no bus, and the
+     * answer says exactly that rather than pretending the bus is empty.  The
+     * two are different: -AG_ENODEV is "no such bus", -AG_ENOENT is "the bus is
+     * fine and nothing is at that address".
+     */
+    const ag_err_t err = io->i2c_probe(0, 0x50);
+    if (err == AG_OK) {
+        ag_print("something answers at 0x50 on i2c0\n");
+    } else if (err == -AG_ENOENT) {
+        ag_print("i2c0 works and has nothing at 0x50\n");
+    } else if (err == -AG_ENODEV) {
+        ag_print("this board has no i2c0 in BOARD.CFG\n");
+    } else {
+        failed("i2c_probe", err);
+    }
+
+    /* The analogue input is a build option, so ask rather than assume. */
+    if (AG_HAS(io, adc_read)) {
+        ag_printf("adc channel 0 reads %d\n", (int)io->adc_read(0));
+    } else {
+        ag_print("no analogue input in this build\n");
+    }
+}
+
 int ag_main(int argc, char **argv)
 {
     (void)argc;
@@ -249,6 +341,9 @@ int ag_main(int argc, char **argv)
     write_null();
     ask_flash();
     refusals();
+    ag_print("\n");
+    use_pins();
+    buses();
 
     ag_printf("\n%s\n", (s_failures == 0) ? "all checks passed"
                                           : "some checks failed");

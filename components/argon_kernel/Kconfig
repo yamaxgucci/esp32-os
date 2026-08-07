@@ -34,4 +34,23 @@ menu "ArgonOS"
             lifetime of the application, and it is guarded: overrunning it is
             caught by FreeRTOS rather than quietly corrupting the shell.
 
+    config ARGON_ENABLE_ADC
+        bool "Analogue input (io->adc_read)"
+        default n
+        help
+            Links ESP-IDF's ADC driver and makes io->adc_read work.  Off by
+            default, and the reason is not taste.
+
+            esp_adc installs a C constructor, adc_hw_calibration(), which runs
+            before app_main and reads the calibration state machine of the
+            analogue front end.  QEMU does not model that state machine, so the
+            board stops there - before the console exists, with nothing on the
+            screen after the ESP-IDF banner.  Merely linking the component is
+            enough; no call of ours is involved.
+
+            Since the whole system is verified in QEMU, a build that cannot boot
+            there cannot be verified at all, so the default build leaves the ADC
+            out and io->adc_read is NULL.  Turn this on for a real board, where
+            the calibration works, and expect QEMU to stop booting.
+
 endmenu

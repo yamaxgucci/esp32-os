@@ -27,12 +27,15 @@ not the application's; that is a deliberate trade, not an oversight.
 Devices have a model now: a registry with classes, owners and exclusive access,
 reachable through the filesystem as `/dev` - so a device is a file, with the same
 handle table, the same ownership and the same reclaim when a process dies. Behind
-it are the card and the flash partition, sector by sector.
+it are the card and the flash partition, sector by sector. Underneath that,
+applications reach the hardware directly - pins, interrupts, I2C, SPI, UART, PWM
+- with one rule: you may not take what something else is using, and everything
+you took comes back when your process ends.
 
 What is missing is the hardware half: no display driver, no USB keyboard, no
-loadable `.SYS` drivers and no direct bus access for them to use, no networking.
-An application's *code* is also still bounded by the 64 KB executable arena - its
-data and constants are not, they live in PSRAM and run to megabytes.
+loadable `.SYS` drivers, no networking. An application's *code* is also still
+bounded by the 64 KB executable arena - its data and constants are not, they live
+in PSRAM and run to megabytes.
 
 Start with **[docs/05-status.md](docs/05-status.md)**: what works, what does not,
 how to build and verify, and the traps already found. Then

@@ -62,11 +62,60 @@ typedef struct {
     uint32_t max_khz;
 } ag_board_sd_t;
 
+/*
+ * The buses an application or a driver reaches through api->io.
+ *
+ * There are no default pins, and that is the whole point.  A bus is wired to
+ * whatever the board designer wired it to, and driving a pin on a guess is not
+ * a failed read - it is an output fighting another output.  An unconfigured bus
+ * answers -AG_ENODEV and says which key would configure it.
+ *
+ * Numbering follows the chip, not an enumeration inside ESP-IDF: `[i2c0]`,
+ * `[spi2]`, `[uart1]` mean I2C0, SPI2 and UART1 as the datasheet names them.
+ */
+#define AG_I2C_BUSES 2  /* I2C0, I2C1                                       */
+#define AG_SPI_BUSES 2  /* SPI2, SPI3; SPI1 belongs to the flash            */
+#define AG_UART_PORTS 3 /* UART0 is the console                             */
+
+#define AG_SPI_FIRST 2 /* the chip's number of the first usable SPI         */
+
+/*
+ * ESP-IDF numbers its SPI hosts from SPI1_HOST = 0, so the chip's SPI2 is host
+ * 1.  Everything ArgonOS shows or accepts - BOARD.CFG, the ABI, the `dev`
+ * listing - uses the chip's own number, because that is what the schematic
+ * says; this macro is the single place the two meet.  Without it the off-by-one
+ * lands as "SPI3 works and SPI2 does not", which is not a clue.
+ */
+#define AG_SPI_HOST_OF(chip) ((chip) - 1)
+
 typedef struct {
-    char          name[24];
-    ag_board_sd_t sd;
-    uint16_t      console_cols;
-    uint16_t      console_rows;
+    int16_t  sda;
+    int16_t  scl;
+    uint32_t khz;
+    bool     pullups; /* switch on the internal ones; weak, but often enough */
+} ag_board_i2c_t;
+
+typedef struct {
+    int16_t  sck;
+    int16_t  mosi;
+    int16_t  miso;
+    uint32_t khz;
+} ag_board_spi_t;
+
+typedef struct {
+    int16_t  tx;
+    int16_t  rx;
+    uint32_t baud;
+} ag_board_uart_t;
+
+typedef struct {
+    char            name[24];
+    ag_board_sd_t   sd;
+    ag_board_i2c_t  i2c[AG_I2C_BUSES];
+    ag_board_spi_t  spi[AG_SPI_BUSES];
+    ag_board_uart_t uart[AG_UART_PORTS];
+    uint16_t        console_cols;
+    uint16_t        console_rows;
 } ag_board_t;
 
 /* Applies the generic defaults for the chip, then any compiled-in board pack. */

@@ -35,9 +35,11 @@ extern "C" {
  * 0.3 added con->codepage and con->set_codepage at the end of the con subtable.
  * 0.4 made dev stop being NULL: the device registry, /dev, and the ioctl
  *     numbering with it.
+ * 0.5 made io stop being NULL: pins, interrupts and the buses.  io->adc_read is
+ *     NULL unless the build asked for the ADC - see AG_HAS.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 4u
+#define AG_ABI_MINOR 5u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
