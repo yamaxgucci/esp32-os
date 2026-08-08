@@ -40,14 +40,28 @@ $python = if ($env:ARGON_PYTHON) { $env:ARGON_PYTHON }
           elseif ($venvPython) { $venvPython.FullName }
           else { 'python' }
 
-& $python (Join-Path $env:IDF_PATH 'tools\idf_tools.py') export --format key-value |
-    ForEach-Object {
-        if ($_ -match '^([^=]+)=(.*)$') {
-            $name = $Matches[1]
-            $value = $Matches[2].Replace('%PATH%', $env:PATH)
-            Set-Item -Path "Env:$name" -Value $value
-        }
+# stderr from idf_tools ("Not using an unsupported version of cmake…") must not
+# become a terminating error when the caller has $ErrorActionPreference=Stop.
+# Redirect through a temp file so native stderr is never a PowerShell error.
+$exportPy = Join-Path $env:IDF_PATH 'tools\idf_tools.py'
+$exportTxt = Join-Path $env:TEMP ("argon-idf-export-{0}.txt" -f $PID)
+$exportErr = Join-Path $env:TEMP ("argon-idf-export-{0}.err" -f $PID)
+$p = Start-Process -FilePath $python -ArgumentList @(
+        $exportPy, 'export', '--format', 'key-value'
+    ) -NoNewWindow -Wait -PassThru `
+    -RedirectStandardOutput $exportTxt -RedirectStandardError $exportErr
+if ($p.ExitCode -ne 0) {
+    Write-Error "idf_tools.py export failed (exit $($p.ExitCode))."
+    return
+}
+foreach ($line in Get-Content -LiteralPath $exportTxt) {
+    if ($line -match '^([A-Za-z_][A-Za-z0-9_]*)=(.*)$') {
+        $name = $Matches[1]
+        $value = $Matches[2].Replace('%PATH%', $env:PATH)
+        [Environment]::SetEnvironmentVariable($name, $value, 'Process')
     }
+}
+Remove-Item -LiteralPath $exportTxt, $exportErr -Force -ErrorAction SilentlyContinue
 
 # The host unit tests need a native compiler, which ESP-IDF does not provide.
 if ($env:ARGON_HOST_CC_BIN -and (Test-Path $env:ARGON_HOST_CC_BIN)) {

@@ -5,6 +5,8 @@
  */
 #include "fs/idfvfs.h"
 
+#include <argon/path.h>
+
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -74,6 +76,58 @@ static ag_err_t full_path(const ag_idfvfs_t *fs, const char *rel, char *out,
         return -AG_ERANGE;
     }
     return AG_OK;
+}
+
+/*
+ * littlefs is case-sensitive; DOS habits are not.  If the exact path misses,
+ * look in the parent directory for a case-insensitive name match and rewrite
+ * `path` in place (still under fs->base).
+ */
+static ag_err_t fixup_case(char *path, size_t pathlen)
+{
+    struct stat st;
+    if (stat(path, &st) == 0) {
+        return AG_OK;
+    }
+
+    char *slash = strrchr(path, '/');
+    if (slash == NULL || slash[1] == '\0') {
+        return -AG_ENOENT;
+    }
+
+    const char *want = slash + 1;
+    char        dirbuf[AG_PATH_MAX];
+    const size_t dir_len = (size_t)(slash - path);
+    if (dir_len >= sizeof(dirbuf)) {
+        return -AG_ERANGE;
+    }
+    memcpy(dirbuf, path, dir_len);
+    dirbuf[dir_len] = '\0';
+
+    DIR *dir = opendir(dirbuf[0] != '\0' ? dirbuf : "/");
+    if (dir == NULL) {
+        return -AG_ENOENT;
+    }
+
+    ag_err_t          err = -AG_ENOENT;
+    struct dirent    *ent;
+    while ((ent = readdir(dir)) != NULL) {
+        if (ent->d_name[0] == '.' &&
+            (ent->d_name[1] == '\0' ||
+             (ent->d_name[1] == '.' && ent->d_name[2] == '\0'))) {
+            continue;
+        }
+        if (ag_path_icmp(ent->d_name, want) != 0) {
+            continue;
+        }
+        const int n =
+            snprintf(path, pathlen, "%s/%s",
+                     dirbuf[0] != '\0' ? dirbuf : "", ent->d_name);
+        err = (n > 0 && (size_t)n < pathlen) ? AG_OK : -AG_ERANGE;
+        break;
+    }
+    closedir(dir);
+    return err;
 }
 
 static int to_posix_flags(uint32_t flags)
@@ -150,6 +204,11 @@ static ag_err_t idf_open(void *ctx, const char *rel, uint32_t flags, void **out)
     ag_err_t err = full_path(fs, rel, path, sizeof(path));
     if (err != AG_OK) {
         return err;
+    }
+
+    /* Do not invent a case match when CREATE would make a new file. */
+    if ((flags & AG_O_CREATE) == 0) {
+        (void)fixup_case(path, sizeof(path));
     }
 
     /*
@@ -260,7 +319,14 @@ static ag_err_t idf_stat(void *ctx, const char *rel, ag_stat_t *out)
             out->attr = AG_A_DIR;
             return AG_OK;
         }
-        return from_errno(errno);
+        err = fixup_case(path, sizeof(path));
+        if (err != AG_OK) {
+            return (err == -AG_ENOENT) ? from_errno(ENOENT) : err;
+        }
+        errno = 0;
+        if (stat(path, &st) != 0) {
+            return from_errno(errno);
+        }
     }
 
     fill_stat(&st, out);

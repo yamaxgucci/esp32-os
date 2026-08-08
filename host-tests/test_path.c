@@ -49,6 +49,7 @@ static void test_resolve_dos(void)
     AG_CHECK_STR(resolve("A:\\APPS\\HELLO.AXE", NULL), "/sd/APPS/HELLO.AXE");
     AG_CHECK_STR(resolve("C:\\SYSTEM.CFG", NULL), "/sys/SYSTEM.CFG");
     AG_CHECK_STR(resolve("T:\\scratch", NULL), "/tmp/scratch");
+    AG_CHECK_STR(resolve("H:\\roms\\game.sms", NULL), "/host/roms/game.sms");
     /* Mixed separators are a fact of life once both styles are accepted. */
     AG_CHECK_STR(resolve("A:\\apps/sub\\x", NULL), "/sd/apps/sub/x");
     /* A drive letter with no mapping is an error, not a silent guess. */

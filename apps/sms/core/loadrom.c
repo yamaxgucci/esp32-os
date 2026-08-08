@@ -522,7 +522,9 @@ uint32_t load_rom_mem (const char *data, size_t size)
 
 	cart.size = size;
 	if (cart.size < 0x4000) cart.size = 0x4000;
-	cart.rom = malloc(cart.size);	
+	cart.rom = malloc(cart.size);
+	if (!cart.rom)
+		return 0;
 
 	/* Take care of image header, if present */
 	if ((cart.size / 512) & 1)

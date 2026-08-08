@@ -1,4 +1,4 @@
-﻿/*
+/*
  * ArgonOS - storage bring-up.
  *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
@@ -10,6 +10,7 @@
 
 #include <argon/board.h>
 #include <argon/device.h>
+#include <argon/hostfs.h>
 #include <argon/log.h>
 #include <argon/ramfs.h>
 #include <argon/vfs.h>
@@ -18,6 +19,7 @@
 #include "driver/sdspi_host.h"
 #include "driver/spi_common.h"
 #include "esp_heap_caps.h"
+#include "esp_littlefs.h"
 #include "esp_partition.h"
 #include "esp_vfs_fat.h"
 #include "freertos/FreeRTOS.h"
@@ -34,7 +36,6 @@
 /* Where ESP-IDF mounts each filesystem, before we re-expose it. */
 #define AG_SYS_BASE_PATH "/flash"
 #define AG_SYS_PARTITION "sysfs"
-#define AG_SYS_MAX_FILES 6
 
 #define AG_SD_BASE_PATH "/sdcard"
 #define AG_SD_MAX_FILES 8
@@ -42,7 +43,6 @@
 static SemaphoreHandle_t s_vfs_mutex;
 static ag_ramfs_t       *s_tmpfs;
 static ag_idfvfs_t      *s_sysfs;
-static wl_handle_t       s_sys_wl = WL_INVALID_HANDLE;
 static ag_idfvfs_t      *s_sdfs;
 static sdmmc_card_t     *s_sd_card;
 
@@ -91,48 +91,46 @@ static void tmp_free(void *ptr) { heap_caps_free(ptr); }
 static ag_err_t sys_space(void *ctx, uint64_t *total, uint64_t *available)
 {
     (void)ctx;
-    uint64_t bytes_total = 0;
-    uint64_t bytes_free = 0;
+    size_t bytes_total = 0;
+    size_t bytes_used = 0;
 
-    if (esp_vfs_fat_info(AG_SYS_BASE_PATH, &bytes_total, &bytes_free) !=
+    if (esp_littlefs_info(AG_SYS_PARTITION, &bytes_total, &bytes_used) !=
         ESP_OK) {
         return -AG_EIO;
     }
-    *total = bytes_total;
-    *available = bytes_free;
+    *total = (uint64_t)bytes_total;
+    *available = (bytes_used < bytes_total)
+                     ? (uint64_t)(bytes_total - bytes_used)
+                     : 0;
     return AG_OK;
 }
 
 /*
  * The internal flash filesystem, mounted at /sys and shown as drive C:.
  *
- * FAT is used because ESP-IDF provides it and its wear levelling out of the
- * box.  littlefs would survive a power cut mid-write, which matters for a
- * system that keeps its configuration and log here; that is a swap of this one
- * call once the dependency is worth taking on.  See docs/04-roadmap.md.
+ * littlefs survives a power cut mid-write, which matters for configuration and
+ * the crash log.  FAT remains for the SD card (A:).  A blank or foreign
+ * partition is formatted on first mount.  See docs/04-roadmap.md.
  *
  * A failure here is not fatal: the board still boots to a prompt with /tmp.
  */
 static ag_err_t mount_internal_flash(void)
 {
-    const esp_vfs_fat_mount_config_t cfg = {
-        .max_files = AG_SYS_MAX_FILES,
-        /* A blank or corrupt partition is formatted rather than left dead. */
+    const esp_vfs_littlefs_conf_t cfg = {
+        .base_path = AG_SYS_BASE_PATH,
+        .partition_label = AG_SYS_PARTITION,
         .format_if_mount_failed = true,
-        .allocation_unit_size = CONFIG_WL_SECTOR_SIZE,
-        .use_one_fat = false,
+        .dont_mount = false,
     };
 
-    if (esp_vfs_fat_spiflash_mount_rw_wl(AG_SYS_BASE_PATH, AG_SYS_PARTITION,
-                                         &cfg, &s_sys_wl) != ESP_OK) {
+    if (esp_vfs_littlefs_register(&cfg) != ESP_OK) {
         return -AG_EIO;
     }
 
-    ag_err_t err = ag_idfvfs_create(AG_SYS_BASE_PATH, "fat", sys_space, NULL,
+    ag_err_t err = ag_idfvfs_create(AG_SYS_BASE_PATH, "lfs", sys_space, NULL,
                                     &s_sysfs);
     if (err != AG_OK) {
-        esp_vfs_fat_spiflash_unmount_rw_wl(AG_SYS_BASE_PATH, s_sys_wl);
-        s_sys_wl = WL_INVALID_HANDLE;
+        (void)esp_vfs_littlefs_unregister(AG_SYS_PARTITION);
         return err;
     }
 
@@ -140,8 +138,7 @@ static ag_err_t mount_internal_flash(void)
     if (err != AG_OK) {
         ag_idfvfs_destroy(s_sysfs);
         s_sysfs = NULL;
-        esp_vfs_fat_spiflash_unmount_rw_wl(AG_SYS_BASE_PATH, s_sys_wl);
-        s_sys_wl = WL_INVALID_HANDLE;
+        (void)esp_vfs_littlefs_unregister(AG_SYS_PARTITION);
         return err;
     }
     return AG_OK;
@@ -502,7 +499,15 @@ static ag_err_t mount_media(bool allow_format)
     return AG_OK;
 }
 
-ag_err_t ag_storage_mount_media(void) { return mount_media(false); }
+ag_err_t ag_storage_mount_hostfs(void) { return ag_hostfs_try_mount(); }
+
+ag_err_t ag_storage_mount_media(void)
+{
+    const ag_err_t sd = mount_media(false);
+    /* Host helper optional: no answer → no H:, boot continues. */
+    (void)ag_hostfs_try_mount();
+    return sd;
+}
 
 ag_err_t ag_storage_format_media(void)
 {

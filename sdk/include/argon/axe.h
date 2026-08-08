@@ -125,7 +125,14 @@ typedef struct {
     char version[16];
     char author[32];
 
-    uint32_t reserved[6]; /* future: signature, resources                 */
+    /*
+     * Signature / future resources.  Layout when used for HMAC:
+     *   reserved[0] = algo (0 = none; 1 = HMAC-SHA256 truncated to 16 bytes)
+     *   reserved[1] = key_id (0 = built-in development key)
+     *   reserved[2..5] = 16-byte tag
+     * All zeros means unsigned (accepted).  See argon/axesig.h.
+     */
+    uint32_t reserved[6];
 } ag_axe_header_t;
 
 #ifdef __cplusplus

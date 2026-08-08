@@ -13,6 +13,7 @@
 #include <string.h>
 
 #include <argon/arena.h>
+#include <argon/axesig.h>
 #include <argon/log.h>
 #include <argon/module.h>
 #include <argon/proc.h>
@@ -344,6 +345,13 @@ ag_err_t ag_loader_load(const char *path, const char *cwd,
     err = ag_axe_validate(header, file_size, ag_axe_native_arch(),
                           AG_ABI_MAJOR, AG_ABI_MINOR);
     if (err != AG_OK) {
+        heap_caps_free(file);
+        return err;
+    }
+    err = ag_axe_check_sig(file, file_size);
+    if (err != AG_OK) {
+        ag_log(AG_LOG_ERROR, "loader", "%s: bad signature (%d)", path,
+               (int)err);
         heap_caps_free(file);
         return err;
     }

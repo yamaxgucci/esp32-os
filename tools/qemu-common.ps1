@@ -16,7 +16,7 @@ function Resolve-Qemu {
 # Rebuilds build\qemu_flash.bin when it does not match the current firmware.
 #
 # The freshness check is a recorded stamp rather than a comparison of file times,
-# because the emulator writes to the flash image itself - the FAT on C: lives in
+# because the emulator writes to the flash image itself - littlefs on C: lives in
 # there - so after any run the image looks newer than the firmware it was built
 # from.  Comparing times then silently keeps testing the previous build, which is
 # the worst kind of test result: a passing one, of the wrong thing.

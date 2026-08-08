@@ -19,6 +19,9 @@ ag_err_t ag_storage_init(void);
  */
 ag_err_t ag_storage_mount_media(void);
 
+/* Optional HostFS (H:) after media; no-op when the host helper is absent. */
+ag_err_t ag_storage_mount_hostfs(void);
+
 /*
  * Writes a fresh filesystem to the card, destroying what was on it, then mounts
  * it.  Only reachable through the format command, which asks first.

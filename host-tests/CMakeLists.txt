@@ -36,12 +36,14 @@ set(ARGON_PORTABLE_SRCS
     "${ARGON_ROOT}/components/argon_kernel/src/core/reslist.c"
     "${ARGON_ROOT}/components/argon_kernel/src/core/arena.c"
     "${ARGON_ROOT}/components/argon_kernel/src/loader/axeload.c"
+    "${ARGON_ROOT}/components/argon_kernel/src/loader/axesig.c"
     "${ARGON_ROOT}/components/argon_kernel/src/loader/probe.c")
 
 set(ARGON_INCLUDES
     "${CMAKE_CURRENT_LIST_DIR}"
     "${ARGON_ROOT}/sdk/include"
-    "${ARGON_ROOT}/components/argon_kernel/include")
+    "${ARGON_ROOT}/components/argon_kernel/include"
+    "${ARGON_ROOT}/apps/cc")
 
 # Predictable paths for the scripts that invoke these.
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
@@ -62,8 +64,11 @@ add_executable(argon_tests
     test_reslist.c
     test_arena.c
     test_axeload.c
+    test_axesig.c
     test_codepage.c
     test_probe.c
+    test_cc.c
+    "${ARGON_ROOT}/apps/cc/cc_compile.c"
     ${ARGON_PORTABLE_SRCS})
 
 target_include_directories(argon_tests PRIVATE ${ARGON_INCLUDES})
@@ -71,7 +76,8 @@ target_include_directories(argon_tests PRIVATE ${ARGON_INCLUDES})
 # Compiled in rather than guessed: the working directory differs between running
 # the executable directly and running it through ctest.
 target_compile_definitions(argon_tests PRIVATE
-    AG_FIXTURE_DIR="${CMAKE_CURRENT_LIST_DIR}/fixtures")
+    AG_FIXTURE_DIR="${CMAKE_CURRENT_LIST_DIR}/fixtures"
+    AG_HOST=1)
 
 # Renders a raw serial transcript into the screen it produces, using the
 # kernel's own screen module.

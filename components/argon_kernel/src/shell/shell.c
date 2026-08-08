@@ -58,6 +58,7 @@ static const struct {
     {"/sys", 'C'},
     {"/tmp", 'T'},
     {"/dev", 'D'},
+    {"/host", 'H'},
 };
 
 void ag_shell_dos_path(const char *posix_path, char *out, size_t n)

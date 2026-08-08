@@ -492,6 +492,7 @@ static inline void ag_gfx_flush(uint16_t x, uint16_t y, uint16_t w, uint16_t h)
 {
     g_ag_api->gfx->flush(x, y, w, h);
 }
+static inline void ag_gfx_swap(void) { g_ag_api->gfx->swap(); }
 static inline void ag_gfx_clear(uint32_t color)
 {
     g_ag_api->gfx->clear(color);

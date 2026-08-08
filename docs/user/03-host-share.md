@@ -1,113 +1,73 @@
-# Доступ к файлам Windows из ArgonOS (QEMU)
+# Host share — files from Windows into the guest
 
-Два разных механизма. Сейчас реализован только первый.
+Two ways to see a Windows folder from ArgonOS in QEMU.
 
-## 1. Sync — снимок папки на диск `A:` ✅
+---
 
-Не «живая шара», а **пересборка образа карты** из папки на хосте.
-QEMU подключает `build\sdcard.img` как SD; ArgonOS монтирует её как `A:`.
+## 1. Sync — snapshot on `A:` (done)
 
-### Команды
+Pack a folder into `build\sdcard.img` (FAT16). The guest mounts it as `A:`.
+Changes on Windows appear only after another sync.
 
 ```bat
-cd /d "D:\Work\Unity Projects\ESP32-OS"
-
-rem Один шаг: упаковать папку и сразу загрузиться
-argon run -Share D:\roms
-
-rem Или отдельно
-argon sync D:\roms
+argon sync build\sd_card
 argon run -Sd
 ```
 
-Опции sync:
+Or in one step: `argon run -Share build\sd_card`.
 
-```bat
-argon sync D:\roms -SizeMB 128 -Out build\sdcard.img
-```
-
-После загрузки в шелле:
-
-```
-A:\> dir
-A:\> run sms.axe rambo.sms 120
-A:\> gfxdump shot.ppm
-```
-
-Забрать PPM на Windows (файл лежит **внутри** `build\sdcard.img`, не рядом):
+Pull a file back out:
 
 ```bat
 argon get shot.ppm
 ```
 
-откроется как `build\shot.ppm`.
+### Живая картинка в QEMU (играть SMS)
 
-### Живая картинка в QEMU (играть)
+Нужен **HostFS** с `--pad-cfg` (так делает `argon run -HostFs`): хост **пушит**
+состояние клавиш ~60 Гц, гость читает кэш — диагонали и «идти + стрелять»
+без лагов UART.
 
 ```bat
-argon run -Gfx -Share build\sd_card
+argon run -Gfx -HostFs build\sms_share
 ```
 
-Откроется SDL-окно с RGB. Клавиатура — в **терминале** `argon run` (окно
-только видео). В госте:
+В папку шары положи `SMS.AXE`, ROM и при желании свой `sms.cfg`. В госте:
 
 ```
-A:\> run sms.axe rambo.sms
+H:\> run sms.axe game.sms
 ```
 
-Без числа кадров SMS крутит до `Esc`/`Q`.
-
-### ASCII-превью (fbcon)
-
-`fb0` без `gfx_acquire`. Полублоки CP437; SMS в фоне, fbcon без `/b`:
-
-```
-A:\> run /b sms.axe rambo.sms
-A:\> run fbcon.axe
-```
-
-Кадр на диск: `gfxdump` + `argon get shot.ppm`.
+Жди `sms: live pad H:\sms.pad (host push)`. Фокус можно на SDL.
 
 ### Важно
 
-* Меняли файлы на Windows → снова `argon sync` (или `run -Share`), иначе
-  гость видит старый снимок.
-* Образ по умолчанию **64 МиБ**, FAT16, длинные имена (VFAT) поддерживаются.
-* ArgonOS патчит FatFs: тип тома берётся из BPB (`FATSz16` / строка `FAT16   `),
-  а не только из «числа кластеров». Иначе маленький, но честно размеченный
-  FAT16 монтировался как FAT12.
-* Это только QEMU-удобство. На плате нужна настоящая microSD с теми же файлами.
-* `T:` сюда не кладём: RAM-диск маленький; для ROM удобнее `A:`.
+* Меняли файлы на Windows → снова `argon sync` (или `run -Share`).
+* Образ по умолчанию **64 МиБ**, FAT16, VFAT.
+* FatFs патч: тип тома из BPB, не только из числа кластеров.
+* На плате нужна настоящая microSD.
 
-Реализация: `tools/mkfatimg.py` + `argon sync` / `argon run -Share`.
+Реализация: `tools/mkfatimg.py`, `tools/fatget.py`.
 
 ---
 
-## 2. HostFS — живой доступ (ещё не сделан)
+## 2. HostFS — live folder on `H:` (done for QEMU)
 
-### Что это
-
-Не отдельное приложение-эмулятор и не Windows Explorer внутри ОС.
-
-**HostFS** — это:
-
-1. **протокол** запросов по UART (или другому каналу к хосту):
-   `opendir` / `readdir` / `open` / `read` / `write` / `stat` / `close`;
-2. **драйвер / VFS-бэкенд в ядре ArgonOS**, который выглядит как обычный диск
-   (например `H:` → `/host`);
-3. **helper на Windows** (скрипт или маленькая программа рядом с `argon`),
-   который слушает канал и выполняет операции в выбранной папке хоста.
-
-Приложение вроде SMS ничего про HostFS не знает: оно делает `ag_open("h:\\rom.sms")`,
-как для любого другого файла.
-
-### Как бы этим пользовались (если сделать)
+**HostFS** is a VFS backend on UART1 talking to `tools/hostfsd.py`. The guest
+drive `H:` maps to `/host`. No image rebuild: drop a file on Windows, `dir` on
+`H:` sees it.
 
 ```bat
-argon run -HostFs D:\roms
+argon run -Gfx -HostFs D:\roms
 ```
 
-В госте:
+Optional together with a packed card:
+
+```bat
+argon run -Gfx -Share build\sd_card -HostFs D:\roms
+```
+
+Guest:
 
 ```
 A:\> h:
@@ -115,27 +75,34 @@ H:\> dir
 H:\> run a:\sms.axe sonic.sms
 ```
 
-Положили новый файл в `D:\roms` на Windows — `dir` на `H:` сразу его видит
-(без пересборки образа). Запись с гостя могла бы создавать файлы на хосте
-(если разрешить).
+(`sonic.sms` lives under `D:\roms` on the host.)
 
-### Чем отличается от sync
+### How it works
 
-| | Sync (`A:` из образа) | HostFS (`H:`) |
+| Side | Role |
+|------|------|
+| `hostfsd.py` | TCP server on `127.0.0.1:5557`, serves `--root` |
+| QEMU 2nd `-serial` | UART1 as TCP client to that port |
+| Guest `hostfs.c` | RPC over UART1, mount `/host` read-only |
+
+Console stays on the first serial (`mon:stdio` / `-Tcp`). HostFS never shares
+the console byte stream.
+
+Read-only MVP: `dir`, `cd`, `type`, `run` / `ag_open`+`read`+`seek`. No write,
+delete, or mkdir yet. With `--pad-cfg`, hostfsd **pushes** live pad snapshots
+(`HSFS_OP_PADPUSH`); guest `H:\sms.pad` reads a RAM cache (playable SMS input).
+
+Without `-HostFs`, boot tries a short UART1 ping and skips `H:` if nobody answers.
+
+### Sync vs HostFS
+
+| | Sync (`A:`) | HostFS (`H:`) |
 |---|---|---|
-| Когда видны изменения | только после `argon sync` | сразу |
-| Где код | только хост-тулзы | ядро + helper |
-| На реальной плате | не нужен | обычно нет (или другой транспорт) |
-| Сложность | низкая | средняя |
+| When changes appear | after `argon sync` | immediately |
+| Where code lives | host tools only | kernel + `hostfsd.py` |
+| On a real board | use a real SD | needs another transport later |
+| Complexity | low | medium |
 
-### Почему это не 9p/virtfs
+### Why not 9p/virtfs
 
-Машина QEMU `esp32s3` не даёт стандартный virtio-9p. HostFS обходит это:
-тот же serial, которым уже пользуется консоль/`recv`, плюс свой простой
-бинарный/текстовый протокол.
-
-### Когда имеет смысл делать
-
-Если sync начнёт мешать (часто меняете ROM, большие деревья, нужна запись
-логов с гостя прямо в папку проекта). До тех пор sync достаточно для
-`SMS.AXE` и разработки `.AXE`.
+QEMU `esp32s3` has no virtio-9p. HostFS uses the second UART instead.

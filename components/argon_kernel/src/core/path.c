@@ -32,6 +32,7 @@ const char *ag_path_drive(char letter)
     case 'c': return "/sys";
     case 't': return "/tmp";
     case 'd': return "/dev";
+    case 'h': return "/host"; /* HostFS — live host folder (QEMU) */
     default:  return NULL;
     }
 }

@@ -387,15 +387,19 @@ int32_t  text(int16_t x, int16_t y, const char *s, uint32_t fg, uint32_t bg);
 void     backlight(uint8_t percent);    /* no-op на soft */
 ```
 
-Сейчас бэкенд — **программный** RGB565 framebuffer в PSRAM (`d:\fb0`, по
-умолчанию 640×400). `acquire` отдаёт указатель на буфер (`direct = true`);
-текстовый blit на этот fb на время захвата останавливается. `release`
-возвращает текст. Цвета — `0x00RRGGBB`. Шрифт ядра — 8×16.
+Сейчас бэкенд — **программный** RGB565 framebuffer (`d:\fb0`, по умолчанию
+640×400). Front — то, что видит QEMU/`fb0`/консоль; при `acquire`, если есть
+PSRAM, приложение рисует в **back** (`double_buf = true`, `direct = false`).
+`flush` и `swap` копируют draw→front и делают present (без busy-wait на ENA).
+Без back-буфера (`direct = true`) рисуют прямо во front. Текстовый blit на fb
+на время захвата останавливается; `release` презентует и возвращает текст.
+Цвета — `0x00RRGGBB`. Шрифт ядра — 8×16.
 
 Без дисплея (`display.driver = none`) `acquire` даёт `-AG_ENODEV`. Флаг
 образа `AG_AXE_NEEDS_GFX` отказывает в запуске, если дисплея нет.
 
-Проверка в QEMU: `apps/gfxdemo`, затем `gfxdump t:\shot.ppm`.
+Проверка в QEMU: `apps/gfxdemo` (`ag_gfx_swap` после отрисовки), затем
+`gfxdump t:\shot.ppm`.
 
 ## `inp` — ввод событиями
 

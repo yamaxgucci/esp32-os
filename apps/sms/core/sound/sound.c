@@ -55,6 +55,16 @@ uint32_t SMSPLUS_sound_init(void)
 	int32_t restore_sound = 0;
 	int32_t i;
 
+	/*
+	 * ArgonOS mute build: libc math stubs (logf/sinf → 0) make YM2413 table
+	 * init divide by zero / write wild indices and reboot the board.  Skip
+	 * the whole sound path when the app asked for silence.
+	 */
+	if (option.nosound) {
+		snd.enabled = 0;
+		return 1;
+	}
+
 	snd.fm_which = option.fm;
 	snd.fps = (sms.display == DISPLAY_NTSC) ? FPS_NTSC : FPS_PAL;
 	snd.fm_clock = (sms.display == DISPLAY_NTSC) ? CLOCK_NTSC : CLOCK_PAL;
