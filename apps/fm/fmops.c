@@ -10,9 +10,20 @@
  */
 #include "fm.h"
 
+#ifdef AG_BUILTIN
+#include <argon/shell.h>
+#endif
+
 /* Big enough that copying is not a syscall per kilobyte, small enough that two
  * of them are nothing next to the arena. */
 #define FM_COPY_CHUNK (8u * 1024u)
+
+/* How often the message line may change during a copy.  HostFS is slow enough
+ * that every chunk already qualifies; a fast RAM-disk copy would otherwise burn
+ * the serial console redrawing the same row thousands of times. */
+#define FM_COPY_UI_MS 100u
+
+#define FM_COPY_BAR_W 20
 
 /* What the viewer will hold.  A bound, because a viewer that tries to load a
  * card-sized file is a viewer that fails on the interesting file. */
@@ -268,9 +279,66 @@ void fm_view(void)
 /* Copying                                                                */
 /* ---------------------------------------------------------------------- */
 
+/*
+ * Soft stop while a long copy runs on the shell task (builtin) or as an .AXE.
+ * The supervisor already accepted Ctrl+C; this is the cooperative half.
+ */
+static bool copy_cancelled(void)
+{
+#ifdef AG_BUILTIN
+    return ag_shell_interrupted();
+#else
+    return ag_interrupted();
+#endif
+}
+
+/* Message-line progress: bar + percent when the size is known, else KB + spinner. */
+static void copy_progress(const char *label, uint64_t done, uint64_t total,
+                          unsigned spin)
+{
+    static const char k_spin[] = "|/-\\";
+    char              line[FM_COLS];
+    char              number[24];
+
+    ag_strlcpy(line, (label != NULL) ? label : "copying", sizeof(line));
+    ag_strlcat(line, ": ", sizeof(line));
+
+    if (total > 0) {
+        uint32_t pct = (uint32_t)((done * 100u) / total);
+        if (pct > 100u) {
+            pct = 100u;
+        }
+        uint32_t filled = (uint32_t)((done * (uint64_t)FM_COPY_BAR_W) / total);
+        if (filled > FM_COPY_BAR_W) {
+            filled = FM_COPY_BAR_W;
+        }
+
+        ag_strlcat(line, "[", sizeof(line));
+        for (uint32_t i = 0; i < FM_COPY_BAR_W; i++) {
+            const char mark[2] = {(i < filled) ? '=' : ' ', '\0'};
+            ag_strlcat(line, mark, sizeof(line));
+        }
+        ag_strlcat(line, "] ", sizeof(line));
+        ag_strlcat(line, ag_utoa(pct, number, sizeof(number), 0, false),
+                   sizeof(line));
+        ag_strlcat(line, "% ", sizeof(line));
+    } else {
+        ag_strlcat(line, ag_utoa(done / 1024u, number, sizeof(number), 0, true),
+                   sizeof(line));
+        ag_strlcat(line, " KB ", sizeof(line));
+    }
+
+    const char spin_ch[2] = {k_spin[spin % 4u], '\0'};
+    ag_strlcat(line, spin_ch, sizeof(line));
+
+    fm_message(line);
+    ag_yield();
+}
+
 /* Copies one file, reporting as it goes.  The error is returned, not printed:
  * the caller knows which of the two names to put in front of it. */
-static ag_err_t copy_file(const char *from, const char *to, const char *label)
+static ag_err_t copy_file(const char *from, const char *to, const char *label,
+                          uint64_t total)
 {
     const ag_handle_t src = ag_open(from, AG_O_RDONLY);
     if (src < 0) {
@@ -292,9 +360,19 @@ static ag_err_t copy_file(const char *from, const char *to, const char *label)
 
     ag_err_t err = AG_OK;
     uint64_t done = 0;
-    uint64_t announced = 0;
+    uint32_t last_ui_ms = 0;
+    unsigned spin = 0;
+
+    /* Something on screen before the first HostFS read, which can take a while. */
+    copy_progress(label, 0, total, spin++);
+    last_ui_ms = ag_millis();
 
     for (;;) {
+        if (copy_cancelled()) {
+            err = -AG_EKILLED;
+            break;
+        }
+
         const int32_t n = ag_read(src, buf, FM_COPY_CHUNK);
         if (n < 0) {
             err = (ag_err_t)n;
@@ -310,19 +388,11 @@ static ag_err_t copy_file(const char *from, const char *to, const char *label)
         }
         done += (uint64_t)n;
 
-        /* A word every 64 KB: often enough to show it is alive, rarely enough
-         * not to spend the copy on drawing. */
-        if (done - announced >= 64u * 1024u) {
-            announced = done;
-            char line[FM_COLS];
-            char number[24];
-            ag_strlcpy(line, label, sizeof(line));
-            ag_strlcat(line, ": ", sizeof(line));
-            ag_strlcat(line, ag_utoa(done / 1024u, number, sizeof(number), 0,
-                                     true),
-                       sizeof(line));
-            ag_strlcat(line, " KB", sizeof(line));
-            fm_message(line);
+        const uint32_t now = ag_millis();
+        if ((now - last_ui_ms) >= FM_COPY_UI_MS ||
+            (total > 0 && done >= total)) {
+            last_ui_ms = now;
+            copy_progress(label, done, total, spin++);
         }
     }
 
@@ -390,8 +460,10 @@ void fm_copy(void)
         return;
     }
 
-    const ag_err_t err = copy_file(from, to, e->name);
-    if (err != AG_OK) {
+    const ag_err_t err = copy_file(from, to, e->name, e->size);
+    if (err == -AG_EKILLED) {
+        fm_message("cancelled");
+    } else if (err != AG_OK) {
         fm_error(e->name, err);
     } else {
         fm_message("copied");
@@ -442,14 +514,16 @@ void fm_move(void)
         ag_strlcat(question, "). Copy and delete instead?", sizeof(question));
 
         if (fm_confirm(question)) {
-            err = copy_file(from, to, e->name);
+            err = copy_file(from, to, e->name, e->size);
             if (err == AG_OK) {
                 err = ag_unlink(from);
             }
         }
     }
 
-    if (err != AG_OK) {
+    if (err == -AG_EKILLED) {
+        fm_message("cancelled");
+    } else if (err != AG_OK) {
         fm_error(e->name, err);
     } else {
         fm_message("moved");
@@ -581,7 +655,8 @@ void fm_help(void)
         "  F5 copy          F6 move or rename       F7 make a directory",
         "  F8 delete        F10 or Esc quit",
         "",
-        "  Ctrl+C asks this program to stop; Ctrl+\\ makes the system stop it.",
+        "  Ctrl+C cancels a long copy (or asks this program to stop);",
+        "  Ctrl+\\ makes the system stop a runaway .AXE.",
         "",
         "A directory that is not empty cannot be deleted, and copying a whole",
         "directory is not implemented yet - both say so rather than pretending.",
