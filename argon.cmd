@@ -5,6 +5,9 @@ rem   argon help
 rem   argon build
 rem   argon run            boot the emulator with the console in this window
 rem   argon run -tcp       expose the console on a TCP port instead
+rem   argon run -Share DIR pack a Windows folder onto A: then boot
+rem   argon sync DIR       rebuild build\sdcard.img from a Windows folder
+rem   argon get FILE       copy FILE out of sdcard.img to build\
 rem   argon test           automated boot test, prints the resulting screen
 rem   argon tests          host unit tests
 rem   argon flash -port COM5

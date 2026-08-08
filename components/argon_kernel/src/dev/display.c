@@ -17,9 +17,15 @@
 
 #include "dev/font8x16.h"
 #include "esp_heap_caps.h"
+#include "esp_lcd_panel_ops.h"
+#include "esp_lcd_qemu_rgb.h"
 
-#define AG_DISPLAY_DEFAULT_W 320
-#define AG_DISPLAY_DEFAULT_H 240
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+/* Match the text console: 80×25 cells at 8×16 px. */
+#define AG_DISPLAY_DEFAULT_W 640
+#define AG_DISPLAY_DEFAULT_H 400
 #define AG_DISPLAY_MAX_W     800
 #define AG_DISPLAY_MAX_H     480
 
@@ -51,10 +57,66 @@ static uint32_t  s_stride; /* bytes per row */
 static bool      s_ready;
 static bool      s_acquired;
 static bool      s_have_snap;
+static bool      s_fb_owned; /* false when s_fb is QEMU's dedicated buffer */
 static uint32_t  s_console_gen;
 static ag_device_t *s_dev;
+static esp_lcd_panel_handle_t s_qemu_panel; /* NULL on real hardware */
 
 /* ---------------------------------------------------------------------- */
+
+/*
+ * QEMU RGB MMIO (see espressif/qemu hw/display/esp_rgb.c).  Do NOT call
+ * esp_lcd_rgb_qemu_refresh: it busy-waits on UPDATE_STATUS.ENA, and that bit
+ * only clears from QEMU's display thread — a guest spin deadlocks SMS/console.
+ */
+enum {
+    RGB_MMIO_UPDATE_FROM = 0x08u / 4u,
+    RGB_MMIO_UPDATE_TO = 0x0cu / 4u,
+    RGB_MMIO_UPDATE_CONTENT = 0x10u / 4u,
+    RGB_MMIO_UPDATE_STATUS = 0x14u / 4u,
+};
+
+static void qemu_present(void)
+{
+    if (s_qemu_panel == NULL || s_fb == NULL || s_w == 0 || s_h == 0) {
+        return;
+    }
+    volatile uint32_t *const rgb = (volatile uint32_t *)0x21000000u;
+    /* X in high half, Y in low — matches QEMU FIELD_* layout. */
+    rgb[RGB_MMIO_UPDATE_FROM] = 0u;
+    rgb[RGB_MMIO_UPDATE_TO] =
+        ((uint32_t)s_w << 16) | (uint32_t)s_h;
+    rgb[RGB_MMIO_UPDATE_CONTENT] = (uint32_t)(uintptr_t)s_fb;
+    rgb[RGB_MMIO_UPDATE_STATUS] = 1u; /* ENA; QEMU clears asynchronously */
+    taskYIELD();
+}
+
+/* On success, *out_fb is QEMU's dedicated RGB565 buffer (do not free). */
+static bool qemu_try_attach(uint16_t w, uint16_t h, uint16_t **out_fb)
+{
+    const esp_lcd_rgb_qemu_config_t cfg = {
+        .width = w,
+        .height = h,
+        .bpp = RGB_QEMU_BPP_16,
+    };
+    esp_lcd_panel_handle_t panel = NULL;
+    if (esp_lcd_new_rgb_qemu(&cfg, &panel) != ESP_OK || panel == NULL) {
+        return false;
+    }
+    (void)esp_lcd_panel_reset(panel);
+    (void)esp_lcd_panel_init(panel);
+
+    void *qfb = NULL;
+    if (esp_lcd_rgb_qemu_get_frame_buffer(panel, &qfb) != ESP_OK ||
+        qfb == NULL) {
+        (void)esp_lcd_panel_del(panel);
+        return false;
+    }
+
+    s_qemu_panel = panel;
+    *out_fb = (uint16_t *)qfb;
+    return true;
+}
 
 /* Colour arguments are 0x00RRGGBB. */
 static uint16_t rgb_to_565(uint32_t color)
@@ -108,8 +170,10 @@ static void draw_glyph(int32_t x, int32_t y, uint8_t ch, uint16_t fg, uint16_t b
     const uint8_t *rows = ag_font8x16[ch];
     for (int32_t row = 0; row < AG_FONT8X16_H; row++) {
         const uint8_t bits = rows[row];
+        /* font8x8: bit 0 (LSB) is the leftmost pixel of the row. */
         for (int32_t col = 0; col < AG_FONT8X16_W; col++) {
-            const uint16_t c = (bits & (uint8_t)(0x80u >> col)) ? fg : bg;
+            const uint16_t c =
+                (bits & (uint8_t)(1u << col)) != 0 ? fg : bg;
             put_pixel(x + col, y + row, c);
         }
     }
@@ -216,7 +280,8 @@ static void gfx_flush(uint16_t x, uint16_t y, uint16_t w, uint16_t h)
     (void)y;
     (void)w;
     (void)h;
-    /* Soft display: pixels are already in s_fb. */
+    /* Soft pixels are already in s_fb; push to QEMU RGB when present. */
+    qemu_present();
 }
 
 static void gfx_swap(void) { /* single buffer */ }
@@ -347,6 +412,7 @@ void ag_display_render_console(const ag_screen_t *screen)
     }
 
     s_console_gen = screen->generation != 0 ? screen->generation : 1;
+    qemu_present();
 }
 
 ag_err_t ag_display_dump_ppm(const char *path, const char *cwd, bool live)
@@ -443,17 +509,23 @@ ag_err_t ag_display_init(void)
     }
 
     const size_t bytes = (size_t)w * (size_t)h * sizeof(uint16_t);
-    uint16_t *fb = (uint16_t *)heap_caps_malloc(bytes,
-                                                MALLOC_CAP_SPIRAM |
-                                                    MALLOC_CAP_8BIT);
-    if (fb == NULL) {
+    uint16_t *fb = NULL;
+    bool      owned = false;
+
+    /* Prefer QEMU's dedicated FB so flush/refresh stays address-valid. */
+    if (!qemu_try_attach(w, h, &fb)) {
         fb = (uint16_t *)heap_caps_malloc(bytes,
-                                          MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    }
-    if (fb == NULL) {
-        ag_log(AG_LOG_ERROR, "display", "no memory for %ux%u framebuffer",
-               (unsigned)w, (unsigned)h);
-        return -AG_ENOMEM;
+                                          MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (fb == NULL) {
+            fb = (uint16_t *)heap_caps_malloc(
+                bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        }
+        if (fb == NULL) {
+            ag_log(AG_LOG_ERROR, "display", "no memory for %ux%u framebuffer",
+                   (unsigned)w, (unsigned)h);
+            return -AG_ENOMEM;
+        }
+        owned = true;
     }
 
     uint16_t *snap = (uint16_t *)heap_caps_malloc(bytes,
@@ -467,6 +539,7 @@ ag_err_t ag_display_init(void)
 
     memset(fb, 0, bytes);
     s_fb = fb;
+    s_fb_owned = owned;
     s_snap = snap;
     s_w = w;
     s_h = h;
@@ -485,7 +558,9 @@ ag_err_t ag_display_init(void)
     };
     const ag_err_t err = ag_dev_register(&desc, &s_dev);
     if (err != AG_OK) {
-        heap_caps_free(fb);
+        if (owned) {
+            heap_caps_free(fb);
+        }
         if (snap != NULL) {
             heap_caps_free(snap);
         }
@@ -495,7 +570,14 @@ ag_err_t ag_display_init(void)
     }
 
     s_ready = true;
-    ag_log(AG_LOG_INFO, "display", "soft %ux%u RGB565 (%u KB) as fb0",
-           (unsigned)w, (unsigned)h, (unsigned)(bytes / 1024u));
+    if (s_qemu_panel != NULL) {
+        ag_log(AG_LOG_INFO, "display",
+               "soft %ux%u RGB565 (%u KB) as fb0 + QEMU RGB window",
+               (unsigned)w, (unsigned)h, (unsigned)(bytes / 1024u));
+        qemu_present();
+    } else {
+        ag_log(AG_LOG_INFO, "display", "soft %ux%u RGB565 (%u KB) as fb0",
+               (unsigned)w, (unsigned)h, (unsigned)(bytes / 1024u));
+    }
     return AG_OK;
 }

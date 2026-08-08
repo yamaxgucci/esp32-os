@@ -33,21 +33,33 @@ arena today (R-1 XIP applies if `.text` grows past 64 KB).
 
 ## Run (QEMU)
 
+Live pixels (SDL window):
+
+```
+argon run -Gfx -Share build\sd_card
+```
+
+Then in the guest: `run sms.axe game.sms` (runs until Esc/Q). Keep keyboard
+focus on the `argon run` terminal; watch the SDL window.
+
+Headless frame dump:
+
 ```
 argon test -Put build\SMS.AXE=t:\sms.axe -TimeoutSec 180 `
-  "run t:\sms.axe" "errorlevel" "gfxdump t:\sms.ppm"
+  "run t:\sms.axe 180" "errorlevel" "gfxdump t:\sms.ppm"
 ```
 
-Optional args: `run t:\sms.axe t:\game.sms 300` (ROM + frame count), or
-`run t:\sms.axe 60` (built-in tiny cart, N frames). Without a ROM, the built-in
-cart still exercises gfx.
+Args: `run sms.axe rom.sms` (forever), `run sms.axe rom.sms 300` (N frames),
+`run sms.axe 60` (tiny cart, N frames).
 
 ## Controls
+
+Type in the **serial terminal** (`argon run`), not the SDL window.
 
 | Key | Pad |
 |-----|-----|
 | Arrows / WASD | D-pad |
-| Z / J | Button 1 |
+| Z / J / Space | Button 1 |
 | X / K | Button 2 |
-| Enter | Start |
+| Enter / P | Pause (= SMS “Start” / NMI) |
 | Esc / Q | Quit |

@@ -80,6 +80,8 @@ argon flash -port COM5   прошить настоящую плату
 | RAM-диск `T:` | `src/fs/ramfs.c` | ✅ 1 МБ в PSRAM |
 | FAT на flash `C:` | `src/fs/idfvfs.c`, `storage.c` | ✅ |
 | FAT на SD `A:` | `storage.c` | ✅ SDMMC и SPI, `format a:` |
+| Sync папки хоста → `A:` | `tools/mkfatimg.py`, `argon sync` / `run -Share` | ✅ снимок FAT16 в `build\sdcard.img` (не live HostFS) |
+| FatFs BPB subtype | `components/fatfs` + `tools/patch_fatfs_bpb.py` | ✅ FAT12/16/32 по BPB, не только по nclst |
 | Шелл | `src/shell/` | ✅ история, перенаправление, 32 команды |
 | Загрузчик `.AXE` | `src/loader/`, `tools/mkaxe.py` | ✅ две части; R-1 flash XIP при переполнении арены |
 | Арена кода | `src/core/arena.c` | ✅ несколько образов в 64 КБ |
@@ -94,8 +96,8 @@ argon flash -port COM5   прошить настоящую плату
 | Реестр устройств | `src/dev/device.c` | ✅ классы, владельцы, эксклюзивный доступ, отзыв при извлечении |
 | Устройства как файлы | `src/dev/devfs.c` | ✅ `/dev` — диск `D:`, одна таблица дескрипторов с файлами |
 | Встроенные устройства | `src/dev/devices.c`, `storage.c` | ✅ `null zero con flash0 sd0 fb0`, команда `dev` |
-| Soft display / `gfx` | `src/dev/display.c`, `font8x16.c` | ✅ RGB565 в PSRAM (320×240), ABI 0.8, `gfxdump`, демо `apps/gfxdemo` |
-| Master System `.AXE` | `apps/sms/` (SMS Plus GX, GPLv2+) | ✅ mute: VDP→soft fb, клавиатура→pad, QEMU `run` + `gfxdump` |
+| Soft display / `gfx` | `src/dev/display.c`, `font8x16.c` | ✅ RGB565 в PSRAM (640×400 = 80×25), ABI 0.8, `gfxdump`, демо `apps/gfxdemo`; QEMU RGB (`esp_lcd_qemu_rgb`, `argon run -Gfx`) |
+| Master System `.AXE` | `apps/sms/` (SMS Plus GX, GPLv2+) | ✅ mute: VDP→soft fb→QEMU RGB, клавиатура→pad, до Esc без лимита кадров |
 | Владение пинами | `src/dev/ioclaim.c` | ✅ пины системы, занятые пины, возврат за упавшим процессом |
 | Железо напрямую | `src/dev/io.c` | ✅ GPIO, ISR, I2C, SPI, UART, PWM; команда `io`, скан I2C |
 | Таблица ABI | `src/loader/api.c` | ⚠ 0.8: `sys mem fs con time proc task inp dev io gfx`, `cfg`/`net` — `NULL` |
@@ -245,7 +247,7 @@ Master System (отдельное GPL-приложение): точная ком
 
 ```
 argon test -Put "build\SMS.AXE=t:\sms.axe" -TimeoutSec 180 `
-  "run t:\sms.axe" "errorlevel" "gfxdump t:\sms.ppm"
+  "run t:\sms.axe 180" "errorlevel" "gfxdump t:\sms.ppm"
 ```
 
 Вручную доставить в эмулятор: `recv t:\hello.axe`, затем строки hex, затем `END`.

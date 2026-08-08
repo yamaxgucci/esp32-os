@@ -22,6 +22,10 @@ static const uint8_t k_tiny_rom[0x4000] = {
 
 static uint16_t s_frame[VIDEO_WIDTH_SMS * VIDEO_HEIGHT_SMS];
 
+/* Terminals send KEY_DOWN only; hold bits for a few frames / until refreshed. */
+static uint8_t s_pad_ttl;
+static uint8_t s_pause_ttl;
+
 static int load_cart(const char *path)
 {
     if (path == NULL || path[0] == '\0') {
@@ -102,14 +106,18 @@ static void poll_pad(void)
         case AG_KEY_RIGHT:
         case AG_KEY_D: bit = INPUT_RIGHT; break;
         case AG_KEY_Z:
-        case AG_KEY_J: bit = INPUT_BUTTON1; break;
+        case AG_KEY_J:
+        case AG_KEY_SPACE: bit = INPUT_BUTTON1; break;
         case AG_KEY_X:
         case AG_KEY_K: bit = INPUT_BUTTON2; break;
         case AG_KEY_ENTER:
+        case AG_KEY_P:
+            /*
+             * SMS "Start" is the console Pause button (NMI). INPUT_START is
+             * Game Gear only — mapping Enter there did nothing on SMS carts.
+             */
             if (down) {
-                input.system |= INPUT_START;
-            } else {
-                input.system &= (uint8_t)~INPUT_START;
+                s_pause_ttl = 3;
             }
             continue;
         case AG_KEY_ESC:
@@ -122,9 +130,23 @@ static void poll_pad(void)
         }
         if (down) {
             input.pad[0] |= bit;
+            s_pad_ttl = 12; /* ~200 ms at 60 fps; covers no KEY_UP from UART */
         } else {
             input.pad[0] &= (uint8_t)~bit;
         }
+    }
+
+    if (s_pause_ttl > 0u) {
+        input.system |= (uint8_t)INPUT_PAUSE;
+        s_pause_ttl--;
+    } else {
+        input.system &= (uint8_t)~INPUT_PAUSE;
+    }
+
+    if (s_pad_ttl > 0u) {
+        s_pad_ttl--;
+    } else {
+        input.pad[0] = 0;
     }
 }
 
@@ -156,12 +178,13 @@ static int looks_like_frames_only(const char *s)
 int ag_main(int argc, char **argv)
 {
     const char *rom = NULL;
-    int         frames = 180;
+    /* <0 = run until Esc/Q. Explicit N frames still works for benches. */
+    int         frames = -1;
 
     if (argc > 1 && argv[1] != NULL) {
         if (argc > 2) {
             rom = argv[1];
-            frames = parse_frames(argv[2], 180);
+            frames = parse_frames(argv[2], -1);
         } else if (looks_like_frames_only(argv[1])) {
             frames = parse_frames(argv[1], 180);
         } else {
@@ -201,17 +224,22 @@ int ag_main(int argc, char **argv)
         return 1;
     }
     ag_gfx_clear(0x00000000u);
-    for (int i = 0; i < frames; i++) {
+    int ran = 0;
+    for (; frames < 0 || ran < frames; ran++) {
+        const uint32_t t0 = ag_millis();
         poll_pad();
         system_frame(0);
         blit_to_fb(&info);
-        if ((i % 30) == 0) {
-            ag_gfx_flush(0, 0, info.width, info.height);
+        /* Every frame: soft fb → QEMU RGB / fbcon / gfxdump /live. */
+        ag_gfx_flush(0, 0, info.width, info.height);
+        /* Cap ~60 fps (without QEMU RGB busy-wait the guest ran away). */
+        ag_yield();
+        const uint32_t dt = ag_millis() - t0;
+        if (dt < 16u) {
+            ag_delay(16u - dt);
         }
     }
-
-    ag_gfx_flush(0, 0, info.width, info.height);
-    ag_printf("sms: %d frames, cart %u KB crc=%08x\n", frames,
+    ag_printf("sms: %d frames, cart %u KB crc=%08x\n", ran,
               (unsigned)(cart.size / 1024u), (unsigned)cart.crc);
     ag_gfx_release();
     system_poweroff();
