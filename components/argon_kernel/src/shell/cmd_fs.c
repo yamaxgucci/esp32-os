@@ -5,6 +5,7 @@
  */
 #include "shell/cmd_fs.h"
 
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -635,8 +636,22 @@ int ag_cmd_recv(int argc, char **argv)
 int ag_cmd_hexdump(int argc, char **argv)
 {
     if (argc < 2) {
-        ag_console_puts("usage: hexdump <file>\n");
+        ag_console_puts("usage: hexdump <file> [bytes]\n");
+        ag_console_puts("  bytes  stop after this many bytes (default: whole file)\n");
         return 1;
+    }
+
+    uint32_t limit = UINT32_MAX;
+    if (argc >= 3) {
+        int v = 0;
+        for (const char *p = argv[2]; *p >= '0' && *p <= '9'; p++) {
+            v = v * 10 + (*p - '0');
+        }
+        if (v <= 0) {
+            ag_console_puts("bytes must be a positive number\n");
+            return 1;
+        }
+        limit = (uint32_t)v;
     }
 
     const ag_handle_t h = ag_vfs_open(argv[1], ag_shell_cwd(), AG_O_RDONLY);
@@ -649,7 +664,11 @@ int ag_cmd_hexdump(int argc, char **argv)
     uint32_t offset = 0;
     int32_t  n;
 
-    while ((n = ag_vfs_read(h, row, sizeof(row))) > 0) {
+    while (offset < limit &&
+           (n = ag_vfs_read(h, row, sizeof(row))) > 0) {
+        if ((uint32_t)n > limit - offset) {
+            n = (int32_t)(limit - offset);
+        }
         ag_console_printf("%08x  ", (unsigned)offset);
         for (int32_t i = 0; i < 16; i++) {
             if (i < n) {

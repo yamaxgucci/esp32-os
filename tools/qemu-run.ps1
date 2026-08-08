@@ -16,7 +16,11 @@ param(
     [int]$Port = 5556,
     [switch]$NoBuild,
     [switch]$Sd,
-    [string]$SdImage = 'build\sdcard.img'
+    [string]$SdImage = 'build\sdcard.img',
+    # Open Espressif QEMU's virtual RGB panel (SDL window). Soft fb / gfx flush
+    # land there. Serial console stays on stdio or -Tcp; keep focus on that
+    # terminal for keyboard (the SDL window is video-only).
+    [switch]$Gfx
 )
 
 $ErrorActionPreference = 'Stop'
@@ -55,14 +59,24 @@ if ($Tcp) {
     # wait=on: the board holds still until you connect, so you see the boot
     # rather than joining after it. A TCP serial port with no peer discards
     # everything it is given.
-    $qemuArgs += @('-display', 'none', '-monitor', 'none',
+    $display = if ($Gfx) { 'sdl' } else { 'none' }
+    $qemuArgs += @('-display', $display, '-monitor', 'none',
                    '-serial', "tcp:127.0.0.1:$Port,server=on,wait=on")
     Write-Host ''
     Write-Host "ArgonOS console on 127.0.0.1:$Port (raw TCP)."
     Write-Host 'Connect with PuTTY: Session, Connection type Raw,'
     Write-Host "  Host Name 127.0.0.1, Port $Port, then Open."
     Write-Host 'The board waits for your connection before booting.'
+    if ($Gfx) {
+        Write-Host 'SDL window: live RGB pixels. Type in PuTTY for the keyboard.'
+    }
     Write-Host 'Press Ctrl+C here to stop the emulator.'
+} elseif ($Gfx) {
+    # Video in an SDL window; console + keyboard on this terminal.
+    $qemuArgs += @('-display', 'sdl', '-serial', 'mon:stdio')
+    Write-Host 'ArgonOS: SDL RGB window + console here.'
+    Write-Host 'Keep focus on this terminal for keys; watch the SDL window.'
+    Write-Host 'Ctrl+A then X quits the emulator.'
 } else {
     $qemuArgs += @('-nographic', '-serial', 'mon:stdio')
     Write-Host 'ArgonOS console attached to this window.  Ctrl+A then X quits.'

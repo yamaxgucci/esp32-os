@@ -18,7 +18,10 @@ extern "C" {
 
 /*
  * Allocates the soft RGB565 framebuffer (PSRAM), registers `fb0`, and wires
- * the gfx ABI.  Size comes from BOARD.CFG `[display]`; default 320x240 soft.
+ * the gfx ABI.  Size comes from BOARD.CFG `[display]`; default 640x400 soft
+ * (80×25 text cells at 8×16).
+ * Under Espressif QEMU, also attaches the virtual RGB panel so `gfx_flush`
+ * and console blits appear in an SDL window (`argon run -Gfx`).
  * A driver of `none` or a zero size skips the device (headless).
  */
 ag_err_t ag_display_init(void);

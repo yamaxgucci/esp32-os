@@ -28,8 +28,8 @@ static void apply_generic_defaults(void)
     s_board.console_rows = 25;
 
     strcpy(s_board.display.driver, "soft");
-    s_board.display.width = 320;
-    s_board.display.height = 240;
+    s_board.display.width = 640;  /* 80 cols × 8 px */
+    s_board.display.height = 400; /* 25 rows × 16 px */
 
     s_board.sd.kind = AG_SD_SDMMC;
     s_board.sd.clk = 14;

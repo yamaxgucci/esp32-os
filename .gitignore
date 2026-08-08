@@ -6,6 +6,9 @@ sdkconfig.old
 managed_components/
 dependencies.lock
 
+# Copied from IDF at CMake configure (fatfs component override)
+components/fatfs/Kconfig
+
 # Host test output
 CMakeFiles/
 CMakeCache.txt

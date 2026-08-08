@@ -47,8 +47,10 @@ goes from an empty file to a running program; the rest of the contract is in
 [02-api-reference.md](docs/sdk/02-api-reference.md),
 [03-application-anatomy.md](docs/sdk/03-application-anatomy.md) and
 [04-axe-format.md](docs/sdk/04-axe-format.md). Using the machine rather than
-programming it: [docs/user/01-shell.md](docs/user/01-shell.md) and
-[docs/user/02-board-setup.md](docs/user/02-board-setup.md). The SDK docs are in
+programming it: [docs/user/01-shell.md](docs/user/01-shell.md),
+[docs/user/02-board-setup.md](docs/user/02-board-setup.md), and
+[docs/user/03-host-share.md](docs/user/03-host-share.md) (QEMU folder sync).
+The SDK docs are in
 Russian, like the rest of the design notes.
 
 No ESP32 board is required to work on this — see the note at the end of this
