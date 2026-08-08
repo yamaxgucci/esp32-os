@@ -29,9 +29,10 @@ int ag_main(int argc, char **argv)
         return 1;
     }
 
-    ag_printf("gfx %ux%u fmt=%u stride=%u\n", (unsigned)info.width,
-              (unsigned)info.height, (unsigned)info.fmt,
-              (unsigned)info.stride);
+    ag_printf("gfx %ux%u fmt=%u stride=%u db=%d direct=%d\n",
+              (unsigned)info.width, (unsigned)info.height, (unsigned)info.fmt,
+              (unsigned)info.stride, info.double_buf ? 1 : 0,
+              info.direct ? 1 : 0);
 
     ag_gfx_clear(0x00102040u);
     ag_gfx_fill_rect(16, 16, (uint16_t)(info.width - 32), 40, 0x00C04020u);
@@ -41,6 +42,7 @@ int ag_main(int argc, char **argv)
     (void)ag_gfx_text(24, 160, "RGB565 framebuffer", 0x00E0E0E0u, 0x00102040u);
 
     ag_gfx_flush(0, 0, info.width, info.height);
+    ag_gfx_swap();
     ag_gfx_release();
 
     ag_printf("ok\n");

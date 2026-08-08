@@ -27,7 +27,9 @@ set(ARGON_KERNEL_SRCS
     "src/fs/ramfs.c"
     "src/fs/idfvfs.c"
     "src/fs/storage.c"
+    "src/fs/hostfs.c"
     "src/loader/axeload.c"
+    "src/loader/axesig.c"
     "src/loader/appfs.c"
     "src/loader/loader.c"
     "src/loader/module.c"
@@ -57,6 +59,8 @@ idf_component_register(
                   esp_system esp_hw_support esp_driver_uart log
                   fatfs wear_levelling vfs sdmmc esp_driver_sdmmc
                   esp_driver_sdspi esp_driver_spi esp_driver_gpio
+                  # /sys (C:): littlefs via IDF component manager
+                  joltwallet__littlefs
                   # api->io: buses and pins straight through to the chip.
                   # esp_adc is deliberately absent - see ARGON_ENABLE_ADC.
                   esp_driver_i2c esp_driver_ledc

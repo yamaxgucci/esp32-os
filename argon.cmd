@@ -10,6 +10,7 @@ rem   argon sync DIR       rebuild build\sdcard.img from a Windows folder
 rem   argon get FILE       copy FILE out of sdcard.img to build\
 rem   argon test           automated boot test, prints the resulting screen
 rem   argon tests          host unit tests
+rem   argon check          local CI: host tests + firmware build
 rem   argon flash -port COM5
 rem
 rem This is a .cmd rather than a .ps1 on purpose: Windows refuses to run

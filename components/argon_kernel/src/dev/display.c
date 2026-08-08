@@ -1,5 +1,9 @@
 /*
- * ArgonOS - soft local display: RGB565 framebuffer in PSRAM.
+ * ArgonOS - soft local display: RGB565 front + optional back buffer.
+ *
+ * Front is what QEMU / fb0 / the console present.  While graphics is acquired
+ * and a back buffer exists, apps draw there; flush/swap copy to front and kick
+ * the QEMU RGB window (no busy-wait on UPDATE_STATUS.ENA).
  *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
  */
@@ -49,18 +53,25 @@ static const uint16_t k_cga565[16] = {
     0xFFFF, /* white        */
 };
 
-static uint16_t *s_fb;
-static uint16_t *s_snap; /* last released graphics frame, for gfxdump */
+static uint16_t *s_front; /* presented: QEMU FB or owned PSRAM          */
+static uint16_t *s_back;  /* draw target while acquired; NULL = single */
+static uint16_t *s_draw;  /* s_back while acquired with DB, else front */
+static uint16_t *s_snap;  /* last released graphics frame, for gfxdump */
 static uint16_t  s_w;
 static uint16_t  s_h;
 static uint32_t  s_stride; /* bytes per row */
 static bool      s_ready;
 static bool      s_acquired;
 static bool      s_have_snap;
-static bool      s_fb_owned; /* false when s_fb is QEMU's dedicated buffer */
+static bool      s_front_owned; /* false when front is QEMU's dedicated FB */
 static uint32_t  s_console_gen;
 static ag_device_t *s_dev;
 static esp_lcd_panel_handle_t s_qemu_panel; /* NULL on real hardware */
+
+static size_t fb_bytes(void)
+{
+    return (size_t)s_stride * (size_t)s_h;
+}
 
 /* ---------------------------------------------------------------------- */
 
@@ -78,7 +89,7 @@ enum {
 
 static void qemu_present(void)
 {
-    if (s_qemu_panel == NULL || s_fb == NULL || s_w == 0 || s_h == 0) {
+    if (s_qemu_panel == NULL || s_front == NULL || s_w == 0 || s_h == 0) {
         return;
     }
     volatile uint32_t *const rgb = (volatile uint32_t *)0x21000000u;
@@ -86,9 +97,21 @@ static void qemu_present(void)
     rgb[RGB_MMIO_UPDATE_FROM] = 0u;
     rgb[RGB_MMIO_UPDATE_TO] =
         ((uint32_t)s_w << 16) | (uint32_t)s_h;
-    rgb[RGB_MMIO_UPDATE_CONTENT] = (uint32_t)(uintptr_t)s_fb;
+    rgb[RGB_MMIO_UPDATE_CONTENT] = (uint32_t)(uintptr_t)s_front;
     rgb[RGB_MMIO_UPDATE_STATUS] = 1u; /* ENA; QEMU clears asynchronously */
     taskYIELD();
+}
+
+/* Copy draw → front (full frame). No-op when drawing already targets front. */
+static void present_draw_to_front(void)
+{
+    if (s_front == NULL || s_draw == NULL) {
+        return;
+    }
+    if (s_draw != s_front) {
+        memcpy(s_front, s_draw, fb_bytes());
+    }
+    qemu_present();
 }
 
 /* On success, *out_fb is QEMU's dedicated RGB565 buffer (do not free). */
@@ -129,15 +152,15 @@ static uint16_t rgb_to_565(uint32_t color)
 
 static void put_pixel(int32_t x, int32_t y, uint16_t c)
 {
-    if ((uint32_t)x >= s_w || (uint32_t)y >= s_h) {
+    if (s_draw == NULL || (uint32_t)x >= s_w || (uint32_t)y >= s_h) {
         return;
     }
-    s_fb[(uint32_t)y * s_w + (uint32_t)x] = c;
+    s_draw[(uint32_t)y * s_w + (uint32_t)x] = c;
 }
 
 static void fill_rect_raw(int32_t x, int32_t y, int32_t w, int32_t h, uint16_t c)
 {
-    if (w <= 0 || h <= 0 || s_fb == NULL) {
+    if (w <= 0 || h <= 0 || s_draw == NULL) {
         return;
     }
     if (x < 0) {
@@ -158,7 +181,7 @@ static void fill_rect_raw(int32_t x, int32_t y, int32_t w, int32_t h, uint16_t c
         h = (int32_t)s_h - y;
     }
     for (int32_t row = 0; row < h; row++) {
-        uint16_t *dst = &s_fb[(uint32_t)(y + row) * s_w + (uint32_t)x];
+        uint16_t *dst = &s_draw[(uint32_t)(y + row) * s_w + (uint32_t)x];
         for (int32_t col = 0; col < w; col++) {
             dst[col] = c;
         }
@@ -186,7 +209,7 @@ static void draw_glyph(int32_t x, int32_t y, uint8_t ch, uint16_t fg, uint16_t b
 static int32_t fb_read(ag_device_t *dev, void *buf, size_t len, uint64_t off)
 {
     (void)dev;
-    if (s_fb == NULL || buf == NULL) {
+    if (s_front == NULL || buf == NULL) {
         return -AG_EINVAL;
     }
     const uint64_t total = (uint64_t)s_stride * s_h;
@@ -196,7 +219,7 @@ static int32_t fb_read(ag_device_t *dev, void *buf, size_t len, uint64_t off)
     if (off + len > total) {
         len = (size_t)(total - off);
     }
-    memcpy(buf, (const uint8_t *)s_fb + (size_t)off, len);
+    memcpy(buf, (const uint8_t *)s_front + (size_t)off, len);
     return (int32_t)len;
 }
 
@@ -204,7 +227,7 @@ static int32_t fb_write(ag_device_t *dev, const void *buf, size_t len,
                         uint64_t off)
 {
     (void)dev;
-    if (s_fb == NULL || buf == NULL) {
+    if (s_front == NULL || buf == NULL) {
         return -AG_EINVAL;
     }
     const uint64_t total = (uint64_t)s_stride * s_h;
@@ -214,7 +237,7 @@ static int32_t fb_write(ag_device_t *dev, const void *buf, size_t len,
     if (off + len > total) {
         len = (size_t)(total - off);
     }
-    memcpy((uint8_t *)s_fb + (size_t)off, buf, len);
+    memcpy((uint8_t *)s_front + (size_t)off, buf, len);
     return (int32_t)len;
 }
 
@@ -236,21 +259,28 @@ static const ag_dev_ops_t k_fb_ops = {
 
 static ag_err_t gfx_acquire(ag_gfxinfo_t *out)
 {
-    if (!s_ready || s_fb == NULL) {
+    if (!s_ready || s_front == NULL) {
         return -AG_ENODEV;
     }
     if (s_acquired) {
         return -AG_EBUSY;
     }
     s_acquired = true;
+    if (s_back != NULL) {
+        /* Start the back buffer from the last presented frame. */
+        memcpy(s_back, s_front, fb_bytes());
+        s_draw = s_back;
+    } else {
+        s_draw = s_front;
+    }
     if (out != NULL) {
         out->width = s_w;
         out->height = s_h;
         out->fmt = AG_PIX_RGB565;
         out->stride = s_stride;
-        out->fb = s_fb;
-        out->double_buf = false;
-        out->direct = true; /* soft fb is the front buffer */
+        out->fb = s_draw;
+        out->double_buf = (s_back != NULL);
+        out->direct = (s_back == NULL);
     }
     return AG_OK;
 }
@@ -260,11 +290,13 @@ static void gfx_release(void)
     if (!s_acquired) {
         return;
     }
-    /* Keep a copy so `gfxdump` after `run` still sees the demo frame. */
-    if (s_snap != NULL && s_fb != NULL) {
-        memcpy(s_snap, s_fb, (size_t)s_stride * s_h);
+    /* Show the last drawn frame and keep a snapshot for gfxdump. */
+    present_draw_to_front();
+    if (s_snap != NULL && s_front != NULL) {
+        memcpy(s_snap, s_front, fb_bytes());
         s_have_snap = true;
     }
+    s_draw = s_front;
     s_acquired = false;
     s_console_gen = 0; /* force a full console redraw on the next tick */
     if (ag_console_ready()) {
@@ -280,15 +312,18 @@ static void gfx_flush(uint16_t x, uint16_t y, uint16_t w, uint16_t h)
     (void)y;
     (void)w;
     (void)h;
-    /* Soft pixels are already in s_fb; push to QEMU RGB when present. */
-    qemu_present();
+    /* Soft path: full-frame present (rect is reserved for panel backends). */
+    present_draw_to_front();
 }
 
-static void gfx_swap(void) { /* single buffer */ }
+static void gfx_swap(void)
+{
+    present_draw_to_front();
+}
 
 static void gfx_clear(uint32_t color)
 {
-    if (s_fb == NULL) {
+    if (s_draw == NULL) {
         return;
     }
     fill_rect_raw(0, 0, (int32_t)s_w, (int32_t)s_h, rgb_to_565(color));
@@ -303,7 +338,7 @@ static void gfx_fill_rect(int16_t x, int16_t y, uint16_t w, uint16_t h,
 static void gfx_blit(int16_t x, int16_t y, uint16_t w, uint16_t h,
                      const void *src, uint32_t src_stride, ag_pixfmt_t src_fmt)
 {
-    if (s_fb == NULL || src == NULL || w == 0 || h == 0) {
+    if (s_draw == NULL || src == NULL || w == 0 || h == 0) {
         return;
     }
     if (src_fmt != AG_PIX_RGB565 && src_fmt != AG_PIX_RGB565_BE) {
@@ -325,7 +360,7 @@ static void gfx_blit(int16_t x, int16_t y, uint16_t w, uint16_t h,
             if (src_fmt == AG_PIX_RGB565_BE) {
                 pix = (uint16_t)((pix << 8) | (pix >> 8));
             }
-            s_fb[(uint32_t)dy * s_w + (uint32_t)dx] = pix;
+            s_draw[(uint32_t)dy * s_w + (uint32_t)dx] = pix;
         }
     }
 }
@@ -333,7 +368,7 @@ static void gfx_blit(int16_t x, int16_t y, uint16_t w, uint16_t h,
 static int32_t gfx_text(int16_t x, int16_t y, const char *s, uint32_t fg,
                         uint32_t bg)
 {
-    if (s == NULL || s_fb == NULL) {
+    if (s == NULL || s_draw == NULL) {
         return 0;
     }
     const uint16_t fgc = rgb_to_565(fg);
@@ -381,7 +416,7 @@ bool ag_display_acquired(void) { return s_acquired; }
 
 void ag_display_render_console(const ag_screen_t *screen)
 {
-    if (!s_ready || s_acquired || s_fb == NULL || screen == NULL) {
+    if (!s_ready || s_acquired || s_front == NULL || screen == NULL) {
         return;
     }
 
@@ -417,7 +452,7 @@ void ag_display_render_console(const ag_screen_t *screen)
 
 ag_err_t ag_display_dump_ppm(const char *path, const char *cwd, bool live)
 {
-    if (!s_ready || s_fb == NULL || path == NULL) {
+    if (!s_ready || s_front == NULL || path == NULL) {
         return -AG_ENODEV;
     }
 
@@ -425,7 +460,7 @@ ag_err_t ag_display_dump_ppm(const char *path, const char *cwd, bool live)
      * Prefer the last graphics snapshot when text has already been painted
      * back over the live buffer - that is the usual case right after `run`.
      */
-    const uint16_t *src = s_fb;
+    const uint16_t *src = s_front;
     if (!live && !s_acquired && s_have_snap && s_snap != NULL) {
         src = s_snap;
     }
@@ -509,18 +544,18 @@ ag_err_t ag_display_init(void)
     }
 
     const size_t bytes = (size_t)w * (size_t)h * sizeof(uint16_t);
-    uint16_t *fb = NULL;
+    uint16_t *front = NULL;
     bool      owned = false;
 
     /* Prefer QEMU's dedicated FB so flush/refresh stays address-valid. */
-    if (!qemu_try_attach(w, h, &fb)) {
-        fb = (uint16_t *)heap_caps_malloc(bytes,
-                                          MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (fb == NULL) {
-            fb = (uint16_t *)heap_caps_malloc(
+    if (!qemu_try_attach(w, h, &front)) {
+        front = (uint16_t *)heap_caps_malloc(
+            bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (front == NULL) {
+            front = (uint16_t *)heap_caps_malloc(
                 bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
         }
-        if (fb == NULL) {
+        if (front == NULL) {
             ag_log(AG_LOG_ERROR, "display", "no memory for %ux%u framebuffer",
                    (unsigned)w, (unsigned)h);
             return -AG_ENOMEM;
@@ -528,18 +563,30 @@ ag_err_t ag_display_init(void)
         owned = true;
     }
 
-    uint16_t *snap = (uint16_t *)heap_caps_malloc(bytes,
-                                                   MALLOC_CAP_SPIRAM |
-                                                       MALLOC_CAP_8BIT);
+    uint16_t *back = (uint16_t *)heap_caps_malloc(
+        bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (back == NULL) {
+        back = (uint16_t *)heap_caps_malloc(
+            bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+    /* Back buffer optional: without it we stay single-buffered (direct). */
+
+    uint16_t *snap = (uint16_t *)heap_caps_malloc(
+        bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (snap == NULL) {
         snap = (uint16_t *)heap_caps_malloc(
             bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     }
     /* Snapshot is optional: gfxdump then falls back to the live buffer. */
 
-    memset(fb, 0, bytes);
-    s_fb = fb;
-    s_fb_owned = owned;
+    memset(front, 0, bytes);
+    if (back != NULL) {
+        memset(back, 0, bytes);
+    }
+    s_front = front;
+    s_back = back;
+    s_draw = front;
+    s_front_owned = owned;
     s_snap = snap;
     s_w = w;
     s_h = h;
@@ -554,17 +601,22 @@ ag_err_t ag_display_init(void)
         .cls = AG_DEV_DISPLAY,
         .flags = 0,
         .ops = &k_fb_ops,
-        .priv = fb,
+        .priv = front,
     };
     const ag_err_t err = ag_dev_register(&desc, &s_dev);
     if (err != AG_OK) {
         if (owned) {
-            heap_caps_free(fb);
+            heap_caps_free(front);
+        }
+        if (back != NULL) {
+            heap_caps_free(back);
         }
         if (snap != NULL) {
             heap_caps_free(snap);
         }
-        s_fb = NULL;
+        s_front = NULL;
+        s_back = NULL;
+        s_draw = NULL;
         s_snap = NULL;
         return err;
     }
@@ -572,12 +624,14 @@ ag_err_t ag_display_init(void)
     s_ready = true;
     if (s_qemu_panel != NULL) {
         ag_log(AG_LOG_INFO, "display",
-               "soft %ux%u RGB565 (%u KB) as fb0 + QEMU RGB window",
-               (unsigned)w, (unsigned)h, (unsigned)(bytes / 1024u));
+               "soft %ux%u RGB565 (%u KB)%s as fb0 + QEMU RGB window",
+               (unsigned)w, (unsigned)h, (unsigned)(bytes / 1024u),
+               back != NULL ? " + back" : "");
         qemu_present();
     } else {
-        ag_log(AG_LOG_INFO, "display", "soft %ux%u RGB565 (%u KB) as fb0",
-               (unsigned)w, (unsigned)h, (unsigned)(bytes / 1024u));
+        ag_log(AG_LOG_INFO, "display", "soft %ux%u RGB565 (%u KB)%s as fb0",
+               (unsigned)w, (unsigned)h, (unsigned)(bytes / 1024u),
+               back != NULL ? " + back" : "");
     }
     return AG_OK;
 }

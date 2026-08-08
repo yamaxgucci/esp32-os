@@ -34,6 +34,7 @@ argon test ... "~\x1c"   послать сырые байты, не дожида
                          так проверяется Ctrl+\ по работающему приложению
 argon test -cp 866 ...   разобрать экран как CP866, а не CP437
 argon tests              юнит-тесты на ПК (2773 проверки)
+argon check              локальный CI: `tests` + сборка прошивки
 argon vt                 умеет ли эта консоль показывать экран
 argon flash -port COM5   прошить настоящую плату
 ```
@@ -78,12 +79,14 @@ argon flash -port COM5   прошить настоящую плату
 | Консоль-мультиплексор | `src/console/console.c` | ✅ UART, backpressure и XON/XOFF на вводе |
 | VFS | `src/fs/vfs.c` | ✅ монтирование, владельцы, eject |
 | RAM-диск `T:` | `src/fs/ramfs.c` | ✅ 1 МБ в PSRAM |
-| FAT на flash `C:` | `src/fs/idfvfs.c`, `storage.c` | ✅ |
+| littlefs на flash `C:` | `storage.c` + `joltwallet/littlefs`, `idfvfs` | ✅ `/sys` power-fail-safe; тип `lfs` |
+| FAT на flash `C:` | — | ❌ заменён littlefs |
 | FAT на SD `A:` | `storage.c` | ✅ SDMMC и SPI, `format a:` |
-| Sync папки хоста → `A:` | `tools/mkfatimg.py`, `argon sync` / `run -Share` | ✅ снимок FAT16 в `build\sdcard.img` (не live HostFS) |
+| Sync папки хоста → `A:` | `tools/mkfatimg.py`, `argon sync` / `run -Share` | ✅ снимок FAT16 в `build\sdcard.img` |
+| HostFS → `H:` | `src/fs/hostfs.c`, `tools/hostfsd.py`, `argon run -HostFs` | ✅ live read-only папка хоста по UART1 (QEMU) |
 | FatFs BPB subtype | `components/fatfs` + `tools/patch_fatfs_bpb.py` | ✅ FAT12/16/32 по BPB, не только по nclst |
 | Шелл | `src/shell/` | ✅ история, перенаправление, 32 команды |
-| Загрузчик `.AXE` | `src/loader/`, `tools/mkaxe.py` | ✅ две части; R-1 flash XIP при переполнении арены |
+| Загрузчик `.AXE` | `src/loader/`, `tools/mkaxe.py` | ✅ две части; R-1 flash XIP; HMAC в `reserved[6]` (`axesig`, `signaxe.py`) |
 | Арена кода | `src/core/arena.c` | ✅ несколько образов в 64 КБ |
 | Модель процессов | `src/proc/proc.c` | ✅ до 4 процессов, арена, cwd, учёт ресурсов |
 | Потоки приложения | `src/proc/threads.c` | ✅ до 4 на процесс, мьютексы, семафоры, очереди |
@@ -93,11 +96,12 @@ argon flash -port COM5   прошить настоящую плату
 | Примеры приложений | `apps/hello`, `disk`, `spin`, `leak`, `threads`, `crash` | ✅ проверяют сами себя |
 | Файловый менеджер | `apps/fm/` | ✅ **команда `fm`, встроена в ОС**; тот же код собирается и как `.AXE` |
 | Текстовый редактор | `apps/edit/` | ✅ **команда `edit`**, встроена; до 64 КБ / 2048 строк, F2 сохранить |
+| Компилятор C → `.AXE` | `apps/cc/` (`CC.AXE`) | ✅ MVP без ABI (нет пинов/печати из CC); бэклог языка — §2 в `04-roadmap.md` |
 | Реестр устройств | `src/dev/device.c` | ✅ классы, владельцы, эксклюзивный доступ, отзыв при извлечении |
 | Устройства как файлы | `src/dev/devfs.c` | ✅ `/dev` — диск `D:`, одна таблица дескрипторов с файлами |
 | Встроенные устройства | `src/dev/devices.c`, `storage.c` | ✅ `null zero con flash0 sd0 fb0`, команда `dev` |
-| Soft display / `gfx` | `src/dev/display.c`, `font8x16.c` | ✅ RGB565 в PSRAM (640×400 = 80×25), ABI 0.8, `gfxdump`, демо `apps/gfxdemo`; QEMU RGB (`esp_lcd_qemu_rgb`, `argon run -Gfx`) |
-| Master System `.AXE` | `apps/sms/` (SMS Plus GX, GPLv2+) | ✅ mute: VDP→soft fb→QEMU RGB, клавиатура→pad, до Esc без лимита кадров |
+| Soft display / `gfx` | `src/dev/display.c`, `font8x16.c` | ✅ RGB565 front+back (640×400 = 80×25), `double_buf`/`swap`/`flush`→present, ABI 0.8, `gfxdump`, демо `apps/gfxdemo`; QEMU RGB (`esp_lcd_qemu_rgb`, `argon run -Gfx`) |
+| Master System `.AXE` | `apps/sms/` (SMS Plus GX, GPLv2+) | ✅ mute + HostFS **PADPUSH** pad cache; sticky UART fallback |
 | Владение пинами | `src/dev/ioclaim.c` | ✅ пины системы, занятые пины, возврат за упавшим процессом |
 | Железо напрямую | `src/dev/io.c` | ✅ GPIO, ISR, I2C, SPI, UART, PWM; команда `io`, скан I2C |
 | Таблица ABI | `src/loader/api.c` | ⚠ 0.8: `sys mem fs con time proc task inp dev io gfx`, `cfg`/`net` — `NULL` |
@@ -192,10 +196,8 @@ argon flash -port COM5   прошить настоящую плату
    фоновый процесс, читающий файл, ждёт вместе с ним. Причина общая: VFS
    держит свой замок на всё время обмена с бэкендом. Лечится тем же, чем
    медленная перерисовка экрана, — отпускать замок на время передачи.
-10. **Нет сети, дисплея, USB, `littlefs`.**
-11. **`/sys` на FAT, а не littlefs** — не переживёт пропадание питания посреди
-   записи. Замена одного вызова в `storage.c`.
-12. **В менеджере нет** копирования каталога целиком, рекурсивного удаления,
+10. **Нет сети, дисплея, USB.**
+11. **В менеджере нет** копирования каталога целиком, рекурсивного удаления,
    поиска и командной строки внизу.
 
 ## Формат `.AXE` в трёх абзацах
@@ -220,6 +222,14 @@ argon flash -port COM5   прошить настоящую плату
 python tools/mkaxe.py --arch xtensa --gcc xtensa-esp32s3-elf-gcc \
     --include sdk/include -o build\HELLO.AXE apps/hello/hello.c
 argon test -Put "build\HELLO.AXE=t:\hello.axe" "run t:\hello.axe alpha"
+```
+
+Подпись `.AXE` (HMAC в `reserved[6]`, нули = без подписи):
+
+```
+python tools/signaxe.py build\HELLO.AXE
+python tools/signaxe.py --verify build\HELLO.AXE
+argon test -Put "build\HELLO.AXE=t:\hello.axe" "run t:\hello.axe"
 ```
 
 Soft graphics (без платы):
@@ -417,18 +427,17 @@ argon test -Sd -Put 'build\DEVS.AXE=t:\devs.axe' 'run t:\devs.axe' 'errorlevel'
     буфер драйвера, и байты **терялись молча**: файл через `recv` приезжал тихо
     неверным. Теперь порт вычитывается до конца в пределах такта, и добавлен
     XON/XOFF — а обвязка сверяет число записанных байт с размером файла.
-18. **Свежеотформатированный FAT на flash пишется в разы медленнее**, чем уже
-    использованный. Первая большая передача после пересборки прошивки (которая
-    пересоздаёт образ flash) идёт минуты, а не секунды. Выглядит как зависание.
-19. **Транскрипт QEMU — это отрендеренный экран, а не лог.** При прокрутке строки
+18. **Транскрипт QEMU — это отрендеренный экран, а не лог.** При прокрутке строки
     перерисовываются, поэтому считать в нём вхождения (например приглашения)
     можно только там, где «стало больше» — достаточный признак. Для «это точно
     произошло» нужен текст, который печатается один раз.
-20. **Образ flash для QEMU нельзя проверять на свежесть по времени файла.**
-    Эмулятор сам пишет в этот файл (в нём живёт FAT на `C:`), поэтому после
+19. **Образ flash для QEMU нельзя проверять на свежесть по времени файла.**
+    Эмулятор сам пишет в этот файл (в нём живёт littlefs на `C:`), поэтому после
     любого прогона образ выглядит новее прошивки, из которой собран, и тест
     молча гоняет предыдущую сборку. Час ушёл на «watchdog не работает», который
     работал. Теперь сверяется записанная метка (время и размер `argonos.bin`).
+    Смена таблицы разделов / прошивки пересоздаёт образ и снова автоформатирует
+    `C:`.
 21. **Задачу, держащую мьютекс, нельзя снимать.** Легального способа отобрать
     мьютекс у удалённой задачи в FreeRTOS нет: удаление семафора с ожидающими —
     UB, пересоздание оставляет ждущих на старом хэндле. Поэтому супервизор
@@ -529,12 +538,13 @@ argon test -Sd -Put 'build\DEVS.AXE=t:\devs.axe' 'run t:\devs.axe' 'errorlevel'
    Это же фундамент под **универсальную сборку с приёмом драйверов на месте** —
    фаза 4.5 в [04-roadmap.md](04-roadmap.md), добавлена 6 августа 2026.
 6. **Дисплей и ввод**: ✅ soft framebuffer + `gfx` (ABI 0.8) уже в QEMU без
-   платы — `fb0`, шрифт 8×16, текст→fb, `gfxdump`, `apps/gfxdemo`. Дальше на
-   железо: драйверы ST7789/ILI9341/SSD1306 / RGB-панель, USB host HID
-   (клавиатура), доводка `inp`. Это закрывает критерий v1.
+   платы — `fb0`, front+back double-buffer, шрифт 8×16, текст→fb, `gfxdump`,
+   `apps/gfxdemo`. Дальше на железо: драйверы ST7789/ILI9341/SSD1306 /
+   RGB-панель, USB host HID (клавиатура), доводка `inp`. Это закрывает
+   критерий v1.
    Сюда же добавился класс `audio` (I2S) — без него не будет ни звука, ни
    эмулятора.
-7. **littlefs вместо FAT для `/sys`** — переживает пропадание питания.
+7. ✅ **littlefs вместо FAT для `/sys`**
 8. **Сеть**: Wi-Fi, сокеты, telnet-консоль как второй endpoint, подтаблица `net`.
    Тут же — приём драйверов и приложений по сети вместо UART.
 9. **Спайк S-1 на железе**: исполнение из PSRAM, замер латентности, бенчмарки
@@ -570,10 +580,12 @@ argon test -Sd -Put 'build\DEVS.AXE=t:\devs.axe' 'run t:\devs.axe' 'errorlevel'
 * ✅ примеры в `apps/`: `hello` (две части образа, константы, bss больше арены),
   **`disk` (файлы и диски)**, **`devs` (устройства и железо напрямую)**,
   **`echo` / `whoami` (`.SYS`)**, **`gfxdemo` (soft gfx)**, **`sms` (Master
-  System, GPLv2+ core)**, `spin`, `leak`, `threads`, `crash`, `fm`, `edit`.
+  System, GPLv2+ core)**, `spin`, `leak`, `threads`, `crash`, `fm`, `edit`,
+  **`cc` (tiny C → `.AXE`)**.
   Приложения проверяют себя сами (`run` + `errorlevel`); `echo` — через
   `drv load`; `whoami` — через probe hint; `edit` — встроенная команда;
-  `gfxdemo` / `sms` — `AG_AXE_NEEDS_GFX` + `gfxdump`.
+  `gfxdemo` / `sms` — `AG_AXE_NEEDS_GFX` + `gfxdump`; `cc` — компиляция на
+  госте (`run a:\cc.axe in.c out.axe`).
 
 Написано после модели процессов, как и планировалось: подтаблицы `task` и `proc`
 появились там же, и описывать ABI до них значило бы переписывать дважды.

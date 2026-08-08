@@ -20,7 +20,10 @@ param(
     # Open Espressif QEMU's virtual RGB panel (SDL window). Soft fb / gfx flush
     # land there. Serial console stays on stdio or -Tcp; keep focus on that
     # terminal for keyboard (the SDL window is video-only).
-    [switch]$Gfx
+    [switch]$Gfx,
+    # Live host folder as guest H: (UART1 ↔ tools/hostfsd.py on HostFsPort).
+    [string]$HostFs = '',
+    [int]$HostFsPort = 5557
 )
 
 $ErrorActionPreference = 'Stop'
@@ -39,6 +42,75 @@ $qemuArgs = Get-QemuMachineArgs -EfusePath $efuse
 
 if ($Sd) {
     $qemuArgs += Get-QemuSdArgs -Path $SdImage
+}
+
+$hostfsProc = $null
+$hostfsSerial = $null
+if ($HostFs) {
+    if (-not (Test-Path -LiteralPath $HostFs)) {
+        New-Item -ItemType Directory -Force -Path $HostFs | Out-Null
+        Write-Host "HostFS: created $HostFs"
+    } elseif (-not (Test-Path -LiteralPath $HostFs -PathType Container)) {
+        throw "HostFs path is not a directory: $HostFs"
+    }
+    $python = Get-ChildItem -Path (Join-Path $env:IDF_TOOLS_PATH 'python_env') `
+        -Filter 'python.exe' -Recurse -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if (-not $python) {
+        $python = Get-Command python -ErrorAction SilentlyContinue
+        if (-not $python) { throw 'Python not found for hostfsd.' }
+        $py = $python.Source
+    } else {
+        $py = $python.FullName
+    }
+    $hostfsScript = (Resolve-Path (Join-Path $PSScriptRoot 'hostfsd.py')).Path
+    $rootAbs = (Resolve-Path -LiteralPath $HostFs).Path
+    $hostfsOut = Join-Path (Get-Location) 'build\hostfsd.out.log'
+    $hostfsErr = Join-Path (Get-Location) 'build\hostfsd.err.log'
+    New-Item -ItemType Directory -Force -Path (Split-Path $hostfsOut) | Out-Null
+    # SMS live pad: same sms.cfg the guest loads from H:\
+    $padCfg = Join-Path $rootAbs 'sms.cfg'
+    $defaultPadCfg = Join-Path $PSScriptRoot '..\apps\sms\sms.cfg'
+    if (-not (Test-Path -LiteralPath $padCfg)) {
+        if (Test-Path -LiteralPath $defaultPadCfg) {
+            Copy-Item -LiteralPath $defaultPadCfg -Destination $padCfg -Force
+        }
+    }
+    if (-not (Test-Path -LiteralPath $padCfg)) {
+        $padCfg = (Resolve-Path -LiteralPath $defaultPadCfg).Path
+    }
+    Write-Host "HostFS: $rootAbs -> guest H: (TCP $HostFsPort / UART1)"
+    Write-Host "SMS pad: live H:\sms.pad from $padCfg"
+    # Drop a stale hostfsd still bound to this port (previous argon run).
+    try {
+        Get-NetTCPConnection -LocalPort $HostFsPort -State Listen -ErrorAction SilentlyContinue |
+            ForEach-Object {
+                Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue
+            }
+        Start-Sleep -Milliseconds 200
+    } catch {}
+    # Start-Process mangles ArgumentList arrays when paths contain spaces
+    # ("Unity Projects"); pass one pre-quoted command line instead.
+    $hostfsArgs = '"{0}" --root "{1}" --port {2} --pad-cfg "{3}"' -f `
+        $hostfsScript, $rootAbs, $HostFsPort, $padCfg
+    $hostfsProc = Start-Process -FilePath $py `
+        -ArgumentList $hostfsArgs `
+        -PassThru -WindowStyle Hidden `
+        -RedirectStandardOutput $hostfsOut `
+        -RedirectStandardError $hostfsErr
+    Start-Sleep -Milliseconds 500
+    if ($hostfsProc.HasExited) {
+        $tail = @()
+        foreach ($f in @($hostfsOut, $hostfsErr)) {
+            if (Test-Path $f) {
+                $tail += Get-Content $f -ErrorAction SilentlyContinue
+            }
+        }
+        throw ("hostfsd exited immediately (exit {0}). {1}" -f `
+            $hostfsProc.ExitCode, ($tail -join ' '))
+    }
+    # Appended AFTER console -serial so this is UART1, not UART0.
+    $hostfsSerial = "tcp:127.0.0.1:$HostFsPort"
 }
 
 # Decide where the console goes before building the arguments: a window that
@@ -68,18 +140,22 @@ if ($Tcp) {
     Write-Host "  Host Name 127.0.0.1, Port $Port, then Open."
     Write-Host 'The board waits for your connection before booting.'
     if ($Gfx) {
-        Write-Host 'SDL window: live RGB pixels. Type in PuTTY for the keyboard.'
+        Write-Host 'SDL window: live RGB. With -HostFs, pad keys work with SDL focus.'
     }
     Write-Host 'Press Ctrl+C here to stop the emulator.'
 } elseif ($Gfx) {
     # Video in an SDL window; console + keyboard on this terminal.
     $qemuArgs += @('-display', 'sdl', '-serial', 'mon:stdio')
     Write-Host 'ArgonOS: SDL RGB window + console here.'
-    Write-Host 'Keep focus on this terminal for keys; watch the SDL window.'
+    Write-Host 'With -HostFs, SMS pad works with SDL focus (host push).'
     Write-Host 'Ctrl+A then X quits the emulator.'
 } else {
     $qemuArgs += @('-nographic', '-serial', 'mon:stdio')
     Write-Host 'ArgonOS console attached to this window.  Ctrl+A then X quits.'
+}
+
+if ($hostfsSerial) {
+    $qemuArgs += @('-serial', $hostfsSerial)
 }
 
 #
@@ -99,6 +175,9 @@ try {
     $proc = Start-Qemu -Exe $qemu -Arguments $qemuArgs
     $proc.WaitForExit()
 } finally {
+    if ($hostfsProc -and -not $hostfsProc.HasExited) {
+        Stop-Process -Id $hostfsProc.Id -Force -ErrorAction SilentlyContinue
+    }
     # Leaving echo disabled would make the shell look broken after we exit.
     Restore-ConsoleVt
 }

@@ -22,6 +22,8 @@ ArgonOS
   argon run                run in QEMU, console attached to this window
                            (Ctrl+A then X quits the emulator)
   argon run -Gfx           same + SDL window with live RGB (gfx / SMS)
+  argon run -HostFs DIR    live Windows folder as guest H: (UART1 helper);
+                           pushes SMS pad (~60 Hz) when sms.cfg is present
   argon run -tcp           run in QEMU, console on 127.0.0.1:5556
                            (connect with PuTTY in Raw mode)
   argon run -Share DIR     pack DIR into build\sdcard.img and boot with A:
@@ -32,6 +34,7 @@ ArgonOS
   argon test [-Send ...]   automated boot test; prints the resulting screen
   argon test -cp 866 ...   the same, when the screen is in another code page
   argon tests              host unit tests (needs a host C compiler)
+  argon check              local CI: host tests, then firmware build
   argon flash -port COM5   flash a real board and open the monitor
   argon monitor -port COM5 open the serial monitor on a real board
   argon clean              remove the firmware build directory
@@ -183,6 +186,12 @@ switch ($Command.ToLowerInvariant()) {
                 $runOpts['Tcp'] = $true
             } elseif ($a -match '^(?i)-(Gfx|Graphics)$') {
                 $runOpts['Gfx'] = $true
+            } elseif ($a -match '^(?i)-HostFs$' -and ($i + 1) -lt $Rest.Count) {
+                $runOpts['HostFs'] = $Rest[$i + 1]
+                $i++
+            } elseif ($a -match '^(?i)-HostFsPort$' -and ($i + 1) -lt $Rest.Count) {
+                $runOpts['HostFsPort'] = [int]$Rest[$i + 1]
+                $i++
             } elseif ($a -match '^(?i)-NoBuild$') {
                 $runOpts['NoBuild'] = $true
             } elseif ($a -match '^(?i)-Port$' -and ($i + 1) -lt $Rest.Count) {
@@ -269,6 +278,30 @@ switch ($Command.ToLowerInvariant()) {
         Build-HostTools
         & ctest --test-dir build-host --output-on-failure
         exit $LASTEXITCODE
+    }
+
+    'check' {
+        # Local CI without a cloud runner: same gate as the no-board queue item.
+        Write-Host '== host tests =='
+        Build-HostTools
+        & ctest --test-dir build-host --output-on-failure
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host 'check: host tests failed.'
+            exit $LASTEXITCODE
+        }
+
+        Write-Host ''
+        Write-Host '== firmware build =='
+        Initialize-Environment
+        & idf.py build @Rest
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host 'check: firmware build failed.'
+            exit $LASTEXITCODE
+        }
+
+        Write-Host ''
+        Write-Host 'check: OK (host tests + firmware build)'
+        exit 0
     }
 
     'flash' {
