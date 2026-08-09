@@ -363,8 +363,8 @@ Mega Drive — после S-1 и с замерами на плате, с сам�
 
 ✅ **Mute SMS.AXE** (7 августа 2026) — vendored SMS Plus GX в `apps/sms/`
 (GPLv2+; ядро ArgonOS остаётся Apache-2.0). QEMU: `run` + soft `gfx` +
-клавиатура→pad + `gfxdump`; звук выключен (`SOUND_FREQUENCY 0`). Дальше —
-I2S/PSG, USB gamepad, замер % realtime на плате.
+клавиатура→pad + `gfxdump`; звук opt-in: PSG+FM→WAV/mock; FM = OPLL→`ag_fm`
+(не полный `ym2413.c`). Дальше на плате — I2S, USB gamepad, замер % realtime.
 
 **Целевые числа, по которым это будет считаться сделанным:** вывод 25 Гц, звук без
 разрывов, отставание ввода до 2 кадров. Если 68000 не укладывается — говорим об
@@ -526,9 +526,14 @@ MQTT, Modbus TCP, OTA. Подтаблица `api->net` перестаёт быт
    подписи; `tools/signaxe.py`, `ag_axe_check_sig` в загрузчике
 6. ✅ **CI (локально)** — `argon check`: host-тесты + сборка прошивки
    (без GitHub Actions; облако — по желанию позже)
-7. 🔄 **Доводка SMS** — ✅ host **PADPUSH** → guest cache (`H:\sms.pad` без
-   RPC/кадр); sticky TTL по времени как fallback; ⬜ звук в файл/мок
+7. ✅ **Доводка SMS** — host **PADPUSH** → guest cache; sticky TTL fallback;
+   ✅ PSG + FM → `t:\sms.wav` / mock (без I2S); FM = decode OPLL → `ag_fm`;
+   выгрузка WAV пока надёжнее через `A:` + `argon get` (не через `copy` на `H:`)
 8. **Mute Mega Drive** — видео + клавиатура (без претензии на realtime)
+9. **HostFS: надёжный `copy` больших файлов на `H:`** — сейчас крупные записи
+   (сотни КБ, напр. `sms.wav`) у пользователя дают `no space left` / обрыв при
+   живом PADPUSH; обход: `a:\…` + `argon get`. Нужно добить протокол/hostfsd
+   так, чтобы `copy t:\sms.wav h:\…` стабильно работал в интерактивном `argon run`
 
 После появления платы: S-1, панели, USB-HID, I2S, замеры % realtime SMS/MD.
 

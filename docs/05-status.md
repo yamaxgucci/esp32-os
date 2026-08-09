@@ -3,7 +3,7 @@
 > Читать первым при возобновлении работы. Здесь — что сделано, что нет, как
 > собрать и проверить, и на какие грабли уже наступили.
 >
-> Дата: 7 августа 2026. Обновлять при каждой смене этапа.
+> Дата: 9 августа 2026. Обновлять при каждой смене этапа.
 
 ## Что это
 
@@ -78,12 +78,12 @@ argon flash -port COM5   прошить настоящую плату
 | Кодовая страница | `src/console/codepage.c` | ✅ CP437/866/1251, `chcp`, конвертация на краях |
 | Консоль-мультиплексор | `src/console/console.c` | ✅ UART, backpressure и XON/XOFF на вводе |
 | VFS | `src/fs/vfs.c` | ✅ монтирование, владельцы, eject |
-| RAM-диск `T:` | `src/fs/ramfs.c` | ✅ 1 МБ в PSRAM |
+| RAM-диск `T:` | `src/fs/ramfs.c` | ✅ до 4 МБ в PSRAM (для WAV-захвата) |
 | littlefs на flash `C:` | `storage.c` + `joltwallet/littlefs`, `idfvfs` | ✅ `/sys` power-fail-safe; тип `lfs` |
 | FAT на flash `C:` | — | ❌ заменён littlefs |
 | FAT на SD `A:` | `storage.c` | ✅ SDMMC и SPI, `format a:` |
 | Sync папки хоста → `A:` | `tools/mkfatimg.py`, `argon sync` / `run -Share` | ✅ снимок FAT16 в `build\sdcard.img` |
-| HostFS → `H:` | `src/fs/hostfs.c`, `tools/hostfsd.py`, `argon run -HostFs` | ✅ live read-only папка хоста по UART1 (QEMU) |
+| HostFS → `H:` | `src/fs/hostfs.c`, `tools/hostfsd.py`, `argon run -HostFs` | ✅ чтение, запись мелких файлов, `del`; ⚠ крупные `copy` на `H:` (WAV) у пользователя ещё ломаются — в плане п.9; обход `A:`+`argon get` |
 | FatFs BPB subtype | `components/fatfs` + `tools/patch_fatfs_bpb.py` | ✅ FAT12/16/32 по BPB, не только по nclst |
 | Шелл | `src/shell/` | ✅ история, перенаправление, 32 команды |
 | Загрузчик `.AXE` | `src/loader/`, `tools/mkaxe.py` | ✅ две части; R-1 flash XIP; HMAC в `reserved[6]` (`axesig`, `signaxe.py`) |
@@ -101,7 +101,7 @@ argon flash -port COM5   прошить настоящую плату
 | Устройства как файлы | `src/dev/devfs.c` | ✅ `/dev` — диск `D:`, одна таблица дескрипторов с файлами |
 | Встроенные устройства | `src/dev/devices.c`, `storage.c` | ✅ `null zero con flash0 sd0 fb0`, команда `dev` |
 | Soft display / `gfx` | `src/dev/display.c`, `font8x16.c` | ✅ RGB565 front+back (640×400 = 80×25), `double_buf`/`swap`/`flush`→present, ABI 0.8, `gfxdump`, демо `apps/gfxdemo`; QEMU RGB (`esp_lcd_qemu_rgb`, `argon run -Gfx`) |
-| Master System `.AXE` | `apps/sms/` (SMS Plus GX, GPLv2+) | ✅ mute + HostFS **PADPUSH** pad cache; sticky UART fallback |
+| Master System `.AXE` | `apps/sms/` (SMS Plus GX, GPLv2+) | ✅ play + PADPUSH; PSG+FM→WAV/mock (`ag_fm`, не `ym2413.c`); realtime audio — позже (I2S на плате или host-player в QEMU) |
 | Владение пинами | `src/dev/ioclaim.c` | ✅ пины системы, занятые пины, возврат за упавшим процессом |
 | Железо напрямую | `src/dev/io.c` | ✅ GPIO, ISR, I2C, SPI, UART, PWM; команда `io`, скан I2C |
 | Таблица ABI | `src/loader/api.c` | ⚠ 0.8: `sys mem fs con time proc task inp dev io gfx`, `cfg`/`net` — `NULL` |
@@ -258,6 +258,14 @@ Master System (отдельное GPL-приложение): точная ком
 ```
 argon test -Put "build\SMS.AXE=t:\sms.axe" -TimeoutSec 180 `
   "run t:\sms.axe 180" "errorlevel" "gfxdump t:\sms.ppm"
+```
+
+Звук (PSG + FM/`ag_fm` → mock / WAV, без I2S):
+
+```
+argon test -Sd -TimeoutSec 120 `
+  "run a:\SMS.AXE 30 nolivepad mock" "errorlevel" `
+  "run a:\SMS.AXE 60 nolivepad wav" "errorlevel"
 ```
 
 Вручную доставить в эмулятор: `recv t:\hello.axe`, затем строки hex, затем `END`.

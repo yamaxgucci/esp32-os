@@ -35,14 +35,15 @@ typedef struct sn76489_struct {
 
     uint8_t latched_reg;
 
-    float counter[4];
+    /* Q8.8: clocks of PSG (chip/16) per output sample.  32-bit only — no
+     * soft-float and no uint64 libgcc helpers in the .AXE. */
+    int32_t counter[4];
+    int32_t clocks_per_sample;
 
     uint8_t enabled_channels;
 
     uint8_t output_channels;
     uint32_t channel_masks[2][4];
-
-    float clocks_per_sample;
 } sn76489_t;
 
 #define LATCH_TONE0 0x00
@@ -80,11 +81,13 @@ typedef struct sn76489_struct {
 #define SN76489_NOISE_TAPPED_SG1000 SN76489_NOISE_TAPPED_NORMAL
 #define SN76489_NOISE_BITS_SG1000   SN76489_NOISE_BITS_NORMAL
 
-uint32_t sn76489_init(sn76489_t *psg, float clock, float sample_rate, uint16_t noise_bits, uint16_t tapped);
-uint32_t sn76489_reset(sn76489_t *psg, float clock, float sample_rate, uint16_t noise_bits, uint16_t tapped);
+uint32_t sn76489_init(sn76489_t *psg, uint32_t clock, uint32_t sample_rate,
+                      uint16_t noise_bits, uint16_t tapped);
+uint32_t sn76489_reset(sn76489_t *psg, uint32_t clock, uint32_t sample_rate,
+                       uint16_t noise_bits, uint16_t tapped);
 void sn76489_write(sn76489_t *psg, uint8_t byte);
 
-void sn76489_execute_samples(sn76489_t *psg, int16_t *bufl, int16_t *bufr, uint32_t samples) ;
+void sn76489_execute_samples(sn76489_t *psg, int16_t *bufl, int16_t *bufr, uint32_t samples);
 void sn76489_set_output_channels(sn76489_t *psg, uint8_t data);
 int32_t SN76489_GetContextSize(void);
 void SN76489_SetContext(uint8_t* data);

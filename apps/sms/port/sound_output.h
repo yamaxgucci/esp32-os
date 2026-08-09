@@ -3,14 +3,16 @@
 
 #include <stdint.h>
 
-static inline void Sound_Init(void) {}
-static inline void Sound_Update(int16_t *sound_buffer, unsigned long len)
-{
-    (void)sound_buffer;
-    (void)len;
-}
-static inline void Sound_Close(void) {}
-static inline void Sound_Pause(void) {}
-static inline void Sound_Unpause(void) {}
+/*
+ * ArgonOS SMS audio sink (no I2S yet): optional WAV file or discard ("mock").
+ * Call Sound_SetPath() before Sound_Init().  Path NULL / "mock" / "nul" → mock.
+ */
+void Sound_SetPath(const char *path);
+void Sound_Init(void);
+void Sound_Update(int16_t *sound_buffer, unsigned long len);
+void Sound_Close(void);
+void Sound_Pause(void);
+void Sound_Unpause(void);
+int  Sound_IsActive(void);
 
 #endif

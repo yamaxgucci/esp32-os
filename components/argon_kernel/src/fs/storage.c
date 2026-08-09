@@ -29,8 +29,12 @@
 #include "boot/platform.h"
 #include "fs/idfvfs.h"
 
-/* /tmp is generous when there is PSRAM to spend and modest when there is not. */
-#define AG_TMP_BUDGET_PSRAM (1024u * 1024u)
+/*
+ * /tmp is generous when there is PSRAM to spend and modest when there is not.
+ * SMS WAV capture (~1 MB PCM) needs headroom: ramfs grows by doubling, so a
+ * ~880 KB file holds a 1 MB capacity block plus node overhead.
+ */
+#define AG_TMP_BUDGET_PSRAM (4u * 1024u * 1024u)
 #define AG_TMP_BUDGET_SRAM (32u * 1024u)
 
 /* Where ESP-IDF mounts each filesystem, before we re-expose it. */

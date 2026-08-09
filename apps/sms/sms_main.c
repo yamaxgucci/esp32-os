@@ -1,8 +1,10 @@
 /*
- * ArgonOS - mute Master System player (SMS Plus GX core).
+ * ArgonOS - Master System player (SMS Plus GX core).
  *
  *   python tools/mkaxe.py ... -o SMS.AXE (see apps/sms/README.md)
  *   run t:\sms.axe t:\rom.sms
+ *   run t:\sms.axe 60 nolivepad wav   # PSG → t:\sms.wav
+ *   run t:\sms.axe 60 nolivepad mock  # PSG, discard samples
  *
  * Core: GPLv2+ (SMS Plus GX).  This file: Apache-2.0.
  */
@@ -11,6 +13,7 @@
 
 #include "shared.h"
 #include "sms_cfg.h"
+#include "sound_output.h"
 
 AG_APP_SIZED("SMS", "1.0", "argon", AG_AXE_NEEDS_GFX, 32 * 1024, 2 * 1024 * 1024);
 
@@ -70,6 +73,63 @@ static int arg_is_nolivepad(const char *s)
         return 0;
     }
     const char *a = "nolivepad";
+    for (; *a && *s; a++, s++) {
+        char ca = *a;
+        char cb = *s;
+        if (cb >= 'A' && cb <= 'Z') {
+            cb = (char)(cb - 'A' + 'a');
+        }
+        if (ca != cb) {
+            return 0;
+        }
+    }
+    return *a == '\0' && *s == '\0';
+}
+
+static int arg_is_mock(const char *s)
+{
+    if (s == NULL) {
+        return 0;
+    }
+    const char *a = "mock";
+    for (; *a && *s; a++, s++) {
+        char ca = *a;
+        char cb = *s;
+        if (cb >= 'A' && cb <= 'Z') {
+            cb = (char)(cb - 'A' + 'a');
+        }
+        if (ca != cb) {
+            return 0;
+        }
+    }
+    return *a == '\0' && *s == '\0';
+}
+
+static int arg_is_sound(const char *s)
+{
+    if (s == NULL) {
+        return 0;
+    }
+    const char *a = "sound";
+    for (; *a && *s; a++, s++) {
+        char ca = *a;
+        char cb = *s;
+        if (cb >= 'A' && cb <= 'Z') {
+            cb = (char)(cb - 'A' + 'a');
+        }
+        if (ca != cb) {
+            return 0;
+        }
+    }
+    return *a == '\0' && *s == '\0';
+}
+
+static int arg_is_wav(const char *s)
+{
+    if (s == NULL) {
+        return 0;
+    }
+    const char *a = "wav";
     for (; *a && *s; a++, s++) {
         char ca = *a;
         char cb = *s;
@@ -350,6 +410,24 @@ static int looks_like_frames_only(const char *s)
     return 1;
 }
 
+static int looks_like_wav_path(const char *s)
+{
+    size_t n = 0;
+    if (s == NULL) {
+        return 0;
+    }
+    while (s[n]) {
+        n++;
+    }
+    if (n < 5) {
+        return 0;
+    }
+    return (s[n - 4] == '.') &&
+           (s[n - 3] == 'w' || s[n - 3] == 'W') &&
+           (s[n - 2] == 'a' || s[n - 2] == 'A') &&
+           (s[n - 1] == 'v' || s[n - 1] == 'V');
+}
+
 int ag_main(int argc, char **argv)
 {
     const char *rom = NULL;
@@ -357,6 +435,8 @@ int ag_main(int argc, char **argv)
     int         frames = -1;
     int         want_livepad = 1; /* default: try host push pad */
     int         force_sticky = 0;
+    int         want_sound = 0;
+    const char *wav_path = "mock";
 
     for (int i = 1; i < argc; i++) {
         if (arg_is_nolivepad(argv[i])) {
@@ -366,6 +446,23 @@ int ag_main(int argc, char **argv)
         }
         if (arg_is_livepad(argv[i])) {
             want_livepad = 1;
+            continue;
+        }
+        if (arg_is_mock(argv[i]) || arg_is_sound(argv[i])) {
+            want_sound = 1;
+            wav_path = "mock";
+            continue;
+        }
+        if (arg_is_wav(argv[i])) {
+            want_sound = 1;
+            if (!looks_like_wav_path(wav_path)) {
+                wav_path = "t:\\sms.wav";
+            }
+            continue;
+        }
+        if (looks_like_wav_path(argv[i])) {
+            want_sound = 1;
+            wav_path = argv[i];
             continue;
         }
         if (rom == NULL && !looks_like_frames_only(argv[i])) {
@@ -380,8 +477,9 @@ int ag_main(int argc, char **argv)
     memset(&option, 0, sizeof(option));
     option.console = 2; /* SMS2 (tiny built-in ROM has no TMR SEGA header) */
     option.country = 1; /* USA / NTSC */
-    option.fm = 0;
-    option.nosound = 1;
+    option.fm = want_sound ? 1 : 0; /* OPLL regs → ag_fm lite synth */
+    option.nosound = want_sound ? 0 : 1;
+    option.soundlevel = 2;
     option.spritelimit = 1;
 
     sms_bitmap = s_frame;
@@ -407,11 +505,18 @@ int ag_main(int argc, char **argv)
         return 1;
     }
 
+    if (want_sound) {
+        Sound_SetPath(wav_path);
+    }
     system_poweron();
+    if (want_sound) {
+        Sound_Init();
+    }
 
     ag_gfxinfo_t info;
     if (ag_gfx_acquire(&info) != AG_OK) {
         ag_printf("gfx acquire failed\n");
+        Sound_Close();
         system_poweroff();
         return 1;
     }
@@ -433,6 +538,7 @@ int ag_main(int argc, char **argv)
     }
     ag_printf("sms: %d frames, cart %u KB crc=%08x\n", ran,
               (unsigned)(cart.size / 1024u), (unsigned)cart.crc);
+    Sound_Close();
     if (s_host_pad >= 0) {
         ag_close(s_host_pad);
     }

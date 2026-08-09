@@ -1,31 +1,39 @@
 # SMS — Master System player for ArgonOS
 
-Mute port of **SMS Plus GX** (GPLv2+) as an ArgonOS `.AXE`. Video via soft
-`gfx`; sound disabled; keyboard maps to two pads.
+Port of **SMS Plus GX** (GPLv2+) as an ArgonOS `.AXE`. Video via soft `gfx`.
+Sound is **opt-in** (PSG + FM → WAV or mock; no I2S yet).
+
+FM is **not** the heavy `ym2413.c` emulator. `fmintf` decodes the YM2413/OPLL
+register protocol and drives [`apps/common/fm`](../common/fm) (`ag_fm`) — a
+lightweight integer synth (own timbre, same note/volume/key protocol).
 
 ## License
 
 - `core/` and `LICENSE` — SMS Plus GX, **GPLv2 or later**
-- `sms_main.c`, `sms_cfg.*`, `port/` (except where noted) — Apache-2.0
+- `sms_main.c`, `sms_cfg.*`, `port/`, `apps/common/fm` — Apache-2.0
 
 The kernel stays Apache-2.0; this application image is a separate GPL work.
 
 ## Build
 
+Do **not** link `ym2413.c`. Include `sound_wav.c` and `ag_fm.c`.
+
 ```
 python tools/mkaxe.py --arch xtensa --gcc xtensa-esp32s3-elf-gcc `
   --include sdk/include --include apps/sms/port --include apps/sms/core `
   --include apps/sms/core/z80 --include apps/sms/core/sound `
-  --cflags "-Os -ffunction-sections -fdata-sections -DLSB_FIRST -DNOZIP_SUPPORT -DUSE_Z80 -Wno-unused -Wno-sign-compare" `
+  --include apps/common/fm `
+  --cflags "-Os -ffunction-sections -fdata-sections -fno-builtin -DLSB_FIRST -DNOZIP_SUPPORT -DUSE_Z80 -Wno-unused -Wno-sign-compare" `
   -o build/SMS.AXE `
   apps/sms/sms_main.c apps/sms/sms_cfg.c `
-  apps/sms/port/libc_shim.c apps/sms/port/platform.c `
+  apps/sms/port/libc_shim.c apps/sms/port/platform.c apps/sms/port/sound_wav.c `
+  apps/common/fm/ag_fm.c `
   apps/sms/core/loadrom.c apps/sms/core/memz80.c apps/sms/core/pio.c `
   apps/sms/core/render.c apps/sms/core/sms.c apps/sms/core/system.c `
   apps/sms/core/tms.c apps/sms/core/vdp.c `
   apps/sms/core/z80/z80.c `
   apps/sms/core/sound/sound.c apps/sms/core/sound/fmintf.c `
-  apps/sms/core/sound/ym2413.c apps/sms/core/sound/sn76489.c
+  apps/sms/core/sound/sn76489.c
 ```
 
 `-DLSB_FIRST` is required (Xtensa is little-endian; the Z80 core's `PAIR` union
@@ -41,30 +49,38 @@ argon run -Gfx -HostFs build\sms_share
 run h:\sms.axe h:\game.sms
 ```
 
+Default play is **mute** (best FPS). Enable sound:
+
+| Arg | Effect |
+|-----|--------|
+| `mock` or `sound` | PSG + FM (`ag_fm`), samples discarded |
+| `wav` | write `t:\sms.wav` |
+| `t:\out.wav` (any `*.wav`) | write that path — **must** end in `.wav` or it is ignored / treated as ROM |
+
+Prefer `T:` or `A:` for capture (HostFS every frame is slow). `T:` is ~4 MB
+RAM (PSRAM); long free-run captures can still fill it. Then in the **same**
+session (reboot clears `T:`):
+
+```
+copy t:\sms.wav h:\capture.wav
+del h:\old.wav
+```
+
+Look for `sms: sound = wav t:\sms.wav @ 22050 Hz` and `sms: wav closed, …`.
+
+
+```
+run t:\sms.axe 60 nolivepad mock
+run t:\sms.axe 60 nolivepad wav
+dir t:\sms.wav
+```
+
 With `-HostFs` (and `sms.cfg`), **hostfsd pushes** live pad state ~60 Hz over
-UART1.  Guest caches it; `H:\sms.pad` reads that cache — **no per-frame RPC**,
-so diagonals / move+fire work without killing FPS.  Look for
-`sms: live pad H:\sms.pad (host push)`.
+UART1.  Guest caches it; `H:\sms.pad` reads that cache — **no per-frame RPC**.
 
-Focus can be on the **SDL window** (Win32 hook) or the terminal.  Keys come
-from the host keyboard sampler, not from UART autorepeat.
-
-Without HostFS / without a pad push, SMS falls back to **serial sticky keys**
-(time-based TTL).  Force that with `nolivepad`.
-
-### What is `H:\sms.pad`?
-
-A **virtual 3-byte file** (pad0, pad1, sys).  On the host, `hostfsd --pad-cfg`
-samples the Windows keyboard and **pushes** snapshots (`HSFS_OP_PADPUSH`).
-The guest drain task updates a RAM cache; opening/reading `H:\sms.pad` is local.
-
-Old pull-every-frame mode was too slow on QEMU UART1 and is gone from the
-play path.
+Without HostFS, SMS falls back to **serial sticky keys**. Force with `nolivepad`.
 
 ## Controls (defaults)
-
-Guest always uses these bindings for serial sticky keys (no on-disk `sms.cfg`
-in-guest — that path could hang). Host `sms.cfg` only matters for `livepad`.
 
 ```
 pad0.up=UP
@@ -86,20 +102,10 @@ pad1.pause=P
 pad1.quit=Q
 ```
 
-| Default | Pad 0 | Pad 1 |
-|---------|-------|-------|
-| D-pad | Arrows | WASD |
-| B1 / B2 | Z / X | J / K |
-| Pause | Enter | P |
-| Quit | Esc | Q |
-
 ## Headless smoke
 
 ```
-argon test -Put build\SMS.AXE=t:\sms.axe -TimeoutSec 180 `
-  "run t:\sms.axe 180" "errorlevel" "gfxdump t:\sms.ppm"
+argon test -Sd -TimeoutSec 120 `
+  "run a:\SMS.AXE 30 nolivepad mock" "errorlevel" `
+  "run a:\SMS.AXE 60 nolivepad wav" "errorlevel"
 ```
-
-Args: `run sms.axe rom.sms` (forever), `run sms.axe rom.sms 300` (N frames),
-`run sms.axe 60` (tiny cart, N frames), `run sms.axe rom.sms nolivepad`
-(force serial sticky).

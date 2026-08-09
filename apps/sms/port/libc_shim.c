@@ -314,8 +314,22 @@ double cos(double x)
     (void)x;
     return 0.0;
 }
-double fabs(double x) { return x < 0 ? -x : x; }
-float  fabsf(float x) { return x < 0 ? -x : x; }
+/* No soft-double compares (would pull libgcc __ltdf2 into the .AXE). */
+double fabs(double x)
+{
+    (void)x;
+    return 0;
+}
+float fabsf(float x)
+{
+    union {
+        float    f;
+        uint32_t u;
+    } v;
+    v.f = x;
+    v.u &= ~0x80000000u;
+    return v.f;
+}
 float  sinf(float x)
 {
     (void)x;
