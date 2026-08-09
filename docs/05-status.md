@@ -98,16 +98,16 @@ argon flash -port COM5   прошить настоящую плату
 | Файловый менеджер | `apps/fm/` | ✅ **команда `fm`, встроена в ОС**; тот же код собирается и как `.AXE` |
 | ZIP | — | ⬜ план: **`unzip` builtin** в ядре; полный **`ZIP.AXE`** на карте (фаза 3.5 §1a, очередь п.11) |
 | Текстовый редактор | `apps/edit/` | ✅ **команда `edit`**, встроена; до 64 КБ / 2048 строк, F2 сохранить |
-| Компилятор C → `.AXE` | `apps/cc/` (`CC.AXE`) | ✅ MVP без ABI (нет пинов/печати из CC); бэклог языка — §2 в `04-roadmap.md` |
+| Компилятор C → `.AXE` | `apps/cc/` (`CC.AXE`) | ✅ **Argon CC**: функции/вызовы, globals/`int[]`, `for`, строки, builtins `ag_delay`/`ag_key`/`ag_gfx_*`; демо [`asteroids.c`](../apps/cc/examples/asteroids.c) |
 | Реестр устройств | `src/dev/device.c` | ✅ классы, владельцы, эксклюзивный доступ, отзыв при извлечении |
 | Устройства как файлы | `src/dev/devfs.c` | ✅ `/dev` — диск `D:`, одна таблица дескрипторов с файлами |
 | Встроенные устройства | `src/dev/devices.c`, `storage.c` | ✅ `null zero con flash0 sd0 fb0`, команда `dev` |
-| Soft display / `gfx` | `src/dev/display.c`, `font8x16.c` | ✅ RGB565 front+back (640×400 = 80×25), `double_buf`/`swap`, **`flush` прямоугольником** (узкий копир draw→front, present целыми строками — почему именно так, см. [`07-emulator-performance.md`](07-emulator-performance.md)), `clear` чистит и front, ABI 0.8, `gfxdump`, демо `apps/gfxdemo`; QEMU RGB (`esp_lcd_qemu_rgb`, `argon run -Gfx`) |
+| Soft display / `gfx` | `src/dev/display.c`, `draw.c`, `font8x16.c` | ✅ RGB565 front+back (640×400), `double_buf`/`swap`, dirty-rect `flush`, ABI **0.9** soft-draw (`pixel`/`line`/`circle`/`poly_*`/`fill_convex`), `gfxdump`, `apps/gfxdemo`; QEMU RGB (`argon run -Gfx`) |
 | Master System `.AXE` | `apps/sms/` (SMS Plus GX, GPLv2+) | ✅ play + PADPUSH; рендер **прямо в back-буфер `gfx`** без промежуточного кадра, `stats` печатает % realtime, `fps30` делит показ; PSG+FM→WAV/mock (`ag_fm`, не `ym2413.c`); realtime audio — позже (I2S на плате или host-player в QEMU) |
 | Mega Drive `.AXE` | `apps/md/` (gwenesis, GPLv3 + Musashi MIT) | ⚠ mute: 68000 + VDP, рендер прямо в back-буфер, клавиатура и host-pad, `stats`/`fps30`. Звуковой блок (Z80 + YM2612 + PSG) заглушен в `port/md_mute.c` и не компилируется — в том числе потому, что Z80 Фаязуллина запрещено распространять коммерчески. 129 КБ кода в арене 192 КБ, 61 643 релокации. Не проверен на настоящем ROM; лицензии — в [`apps/md/README.md`](../apps/md/README.md) |
 | Владение пинами | `src/dev/ioclaim.c` | ✅ пины системы, занятые пины, возврат за упавшим процессом |
 | Железо напрямую | `src/dev/io.c` | ✅ GPIO, ISR, I2C, SPI, UART, PWM; команда `io`, скан I2C |
-| Таблица ABI | `src/loader/api.c` | ⚠ 0.8: `sys mem fs con time proc task inp dev io gfx`, `cfg`/`net` — `NULL` |
+| Таблица ABI | `src/loader/api.c` | ⚠ 0.10: `inp->btn`/`pad` (PADPUSH), `gfx` draw; `cfg`/`net` — `NULL` |
 | Загрузчик `.SYS` | `src/loader/module.c` | ✅ `ag_driver_init`, резидент, `drv`, стадия `modules`, пример `apps/echo` |
 | Probe I2C | `src/loader/probe.c` | ✅ `modules.probe`, `drv probe`, `ag_probe_hint`, пример `apps/whoami` |
 
@@ -563,7 +563,7 @@ argon test -Sd -Put 'build\DEVS.AXE=t:\devs.axe' 'run t:\devs.axe' 'errorlevel'
 
    Это же фундамент под **универсальную сборку с приёмом драйверов на месте** —
    фаза 4.5 в [04-roadmap.md](04-roadmap.md), добавлена 6 августа 2026.
-6. **Дисплей и ввод**: ✅ soft framebuffer + `gfx` (ABI 0.8) уже в QEMU без
+6. **Дисплей и ввод**: ✅ soft framebuffer + `gfx` (ABI 0.9 draw) уже в QEMU без
    платы — `fb0`, front+back double-buffer, шрифт 8×16, текст→fb, `gfxdump`,
    `apps/gfxdemo`. Дальше на железо: драйверы ST7789/ILI9341/SSD1306 /
    RGB-панель, USB host HID (клавиатура), доводка `inp`. Это закрывает

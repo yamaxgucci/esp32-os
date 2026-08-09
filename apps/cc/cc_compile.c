@@ -1,8 +1,9 @@
 /*
  * ArgonOS - Tiny C → Xtensa .AXE (stack-machine codegen).
  *
- * Subset: int, locals, return, if/else, while, expressions.
- * Entry must be named ag_main.  No preprocessor, floats, structs, or calls.
+ * Subset: int/void, locals, globals, int arrays, return, if/else, while/for,
+ * multiple functions (callx8), string literals, and ABI builtins for time/input/gfx.
+ * Entry must be named ag_main.
  *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
  */
@@ -37,11 +38,52 @@ static void cc_free(void *p)
 #define CODE_BASE 0x42000000u
 #define DATA_BASE 0x3C000000u
 #define AXE_HDR   176u
-#define CODE_CAP  (24u * 1024u)
-#define LIT_CAP   64
-#define MAX_LOCALS 32
+#define CODE_CAP  (48u * 1024u)
+#define DATA_CAP  4096u
+#define LIT_CAP   256
+#define MAX_LIT_SITES 2048
+#define MAX_LOCALS 64
+#define MAX_GLOBALS 32
+#define MAX_FUNCS 32
+#define MAX_RELOCS 512
 #define MAX_NAME   32
+#define MAX_STR    192
 #define SPILL_SLOTS 16
+
+#define AG_AXE_R_IN_DATA 0x1u
+#define AG_AXE_R_TO_DATA 0x2u
+#define AG_AXE_NEEDS_GFX (1u << 1)
+
+#define API_OFF_INP  24
+#define API_OFF_GFX  28
+#define API_OFF_TIME 40
+
+#define INP_OFF_KEY_PRESSED 12
+#define INP_OFF_PAD         20
+#define INP_OFF_BTN         24
+#define TIME_OFF_DELAY_MS   16
+
+#define GFX_OFF_ACQUIRE     4
+#define GFX_OFF_RELEASE     8
+#define GFX_OFF_FLUSH       12
+#define GFX_OFF_SWAP        16
+#define GFX_OFF_CLEAR       20
+#define GFX_OFF_FILL_RECT   24
+#define GFX_OFF_TEXT        32
+#define GFX_OFF_PIXEL       40
+#define GFX_OFF_LINE        44
+#define GFX_OFF_CIRCLE      48
+#define GFX_OFF_FILL_CIRCLE 52
+#define GFX_OFF_POLY_BEGIN  56
+#define GFX_OFF_POLY_VERTEX 60
+#define GFX_OFF_POLY_FILL   64
+#define GFX_OFF_POLY_STROKE 68
+
+enum {
+    LIT_IMM = 0,
+    LIT_CODE_OFF = 1,
+    LIT_DATA_OFF = 2
+};
 
 static void cpy_err(char *dst, size_t n, const char *msg)
 {
@@ -62,16 +104,20 @@ typedef enum {
     T_EOF = 0,
     T_IDENT,
     T_NUM,
+    T_STRING,
     T_INT,
     T_VOID,
     T_RETURN,
     T_IF,
     T_ELSE,
     T_WHILE,
+    T_FOR,
     T_LPAREN,
     T_RPAREN,
     T_LBRACE,
     T_RBRACE,
+    T_LBRACK,
+    T_RBRACK,
     T_SEMI,
     T_COMMA,
     T_ASSIGN,
@@ -98,6 +144,7 @@ typedef struct {
     size_t      pos;
     tok_t       tok;
     char        text[MAX_NAME];
+    char        strbuf[MAX_STR];
     int32_t     num;
     int         err;
     char        errmsg[160];
@@ -180,6 +227,9 @@ static tok_t kw(const char *s)
     if (CC_STRCMP(s, "while") == 0) {
         return T_WHILE;
     }
+    if (CC_STRCMP(s, "for") == 0) {
+        return T_FOR;
+    }
     return T_IDENT;
 }
 
@@ -226,6 +276,42 @@ static void lex_next(lex_t *L)
         L->tok = T_NUM;
         return;
     }
+    if (c == '"') {
+        size_t n = 0;
+        L->pos++;
+        while (L->pos < L->len && L->src[L->pos] != '"') {
+            char ch = L->src[L->pos++];
+            if (ch == '\\') {
+                if (L->pos >= L->len) {
+                    lex_fail(L, "unterminated string");
+                    return;
+                }
+                const char e = L->src[L->pos++];
+                if (e == 'n') {
+                    ch = '\n';
+                } else if (e == 't') {
+                    ch = '\t';
+                } else if (e == '\\' || e == '"') {
+                    ch = e;
+                } else {
+                    ch = e;
+                }
+            }
+            if (n + 1 >= sizeof(L->strbuf)) {
+                lex_fail(L, "string too long");
+                return;
+            }
+            L->strbuf[n++] = ch;
+        }
+        if (L->pos >= L->len || L->src[L->pos] != '"') {
+            lex_fail(L, "unterminated string");
+            return;
+        }
+        L->pos++;
+        L->strbuf[n] = '\0';
+        L->tok = T_STRING;
+        return;
+    }
 
     L->pos++;
     switch (c) {
@@ -240,6 +326,12 @@ static void lex_next(lex_t *L)
         break;
     case '}':
         L->tok = T_RBRACE;
+        break;
+    case '[':
+        L->tok = T_LBRACK;
+        break;
+    case ']':
+        L->tok = T_RBRACK;
         break;
     case ';':
         L->tok = T_SEMI;
@@ -319,13 +411,43 @@ static void lex_next(lex_t *L)
 /* ---- codegen ----------------------------------------------------------- */
 
 typedef struct {
+    char name[MAX_NAME];
+    int  off;
+    int  nwords;
+    int  is_array;
+} sym_t;
+
+typedef struct {
+    char   name[MAX_NAME];
+    size_t code_off;
+    int    nparams;
+    int    is_void;
+} func_t;
+
+typedef struct {
     uint8_t *code;
     size_t   len;
     size_t   cap;
     uint32_t lit[LIT_CAP];
+    uint8_t  lit_kind[LIT_CAP];
+    uint32_t lit_off[LIT_CAP];
+    size_t   lit_site_off[MAX_LIT_SITES];
+    uint16_t lit_site_li[MAX_LIT_SITES];
+    int      nlit_sites;
     int      nlit;
     int      nlocals;
-    char     local_name[MAX_LOCALS][MAX_NAME];
+    sym_t    locals[MAX_LOCALS];
+    int      local_words;
+    int      nglobals;
+    sym_t    globals[MAX_GLOBALS];
+    int      data_next;
+    uint8_t  data[DATA_CAP];
+    int      nfuncs;
+    func_t   funcs[MAX_FUNCS];
+    int      ag_main_idx;
+    uint32_t relocs[MAX_RELOCS];
+    int      nrelocs;
+    int      needs_gfx;
     int      spill_base;
     int      spill_top;
     int      err;
@@ -382,10 +504,44 @@ static void emit_mov_n(gen_t *g, int ad, int as)
     emit2(g, (uint8_t)((ad << 4) | 0x0d), (uint8_t)as);
 }
 
+static int add_lit(gen_t *g, uint8_t kind, uint32_t val_or_off)
+{
+    for (int i = 0; i < g->nlit; i++) {
+        if (g->lit_kind[i] == kind && g->lit_off[i] == val_or_off) {
+            return i;
+        }
+    }
+    if (g->nlit >= LIT_CAP) {
+        gfail(g, "too many constants");
+        return -1;
+    }
+    const int li = g->nlit++;
+    g->lit_kind[li] = kind;
+    g->lit_off[li] = val_or_off;
+    g->lit[li] = (kind == LIT_IMM) ? val_or_off : 0;
+    return li;
+}
+
+static void emit_l32r_lit(gen_t *g, int at, int li)
+{
+    if (li < 0 || li >= g->nlit) {
+        gfail(g, "bad literal index");
+        return;
+    }
+    if (g->nlit_sites >= MAX_LIT_SITES) {
+        gfail(g, "too many literal uses");
+        return;
+    }
+    g->lit_site_off[g->nlit_sites] = g->len;
+    g->lit_site_li[g->nlit_sites] = (uint16_t)li;
+    g->nlit_sites++;
+    /* Placeholder: byte1/byte2 patched in fix_l32r (li kept in side table). */
+    emit3(g, (uint8_t)((at << 4) | 0x1), 0xff, 0xff);
+}
+
 static void emit_movi(gen_t *g, int at, int32_t imm)
 {
     if (imm >= -32 && imm <= 95) {
-        /* MOVI.N: byte0 = ((imm>>4)<<4)|0xC, byte1 = ((imm&0xf)<<4)|at */
         const uint32_t u = (uint32_t)imm & 0x7fu;
         emit2(g, (uint8_t)(((u >> 4) << 4) | 0x0c),
               (uint8_t)(((u & 0x0fu) << 4) | (uint32_t)at));
@@ -397,14 +553,29 @@ static void emit_movi(gen_t *g, int at, int32_t imm)
               (uint8_t)(0xa0u | ((u >> 8) & 0xfu)), (uint8_t)(u & 0xffu));
         return;
     }
-    if (g->nlit >= LIT_CAP) {
-        gfail(g, "too many constants");
+    const int li = add_lit(g, LIT_IMM, (uint32_t)imm);
+    if (li < 0) {
         return;
     }
-    const int li = g->nlit++;
-    g->lit[li] = (uint32_t)imm;
-    /* Placeholder l32r: byte1=0xFF, byte2=lit index — fixed in finish. */
-    emit3(g, (uint8_t)((at << 4) | 0x1), 0xff, (uint8_t)li);
+    emit_l32r_lit(g, at, li);
+}
+
+static void emit_li_data(gen_t *g, int at, uint32_t data_off)
+{
+    const int li = add_lit(g, LIT_DATA_OFF, data_off);
+    if (li < 0) {
+        return;
+    }
+    emit_l32r_lit(g, at, li);
+}
+
+static void emit_li_code(gen_t *g, int at, uint32_t code_off)
+{
+    const int li = add_lit(g, LIT_CODE_OFF, code_off);
+    if (li < 0) {
+        return;
+    }
+    emit_l32r_lit(g, at, li);
 }
 
 static void emit_add_n(gen_t *g, int ar, int as, int at)
@@ -412,7 +583,6 @@ static void emit_add_n(gen_t *g, int ar, int as, int at)
     emit2(g, (uint8_t)((at << 4) | 0x0a), (uint8_t)((ar << 4) | as));
 }
 
-/* RRR packed LE: byte0=(at<<4), byte1=(ar<<4)|as, byte2=opc */
 static void emit_rrr(gen_t *g, uint8_t opc, int ar, int as, int at)
 {
     emit3(g, (uint8_t)((at << 4) | 0x0), (uint8_t)((ar << 4) | as), opc);
@@ -466,6 +636,11 @@ static void emit_s32i(gen_t *g, int at, int as, int off)
         emit3(g, (uint8_t)((at << 4) | 0x2), (uint8_t)((0x6 << 4) | as),
               (uint8_t)imm);
     }
+}
+
+static void emit_callx8(gen_t *g, int as)
+{
+    emit3(g, 0xe0, (uint8_t)as, 0x00);
 }
 
 static void emit_j_to(gen_t *g, size_t from_off, size_t target_off)
@@ -523,7 +698,6 @@ static void patch_b(gen_t *g, size_t site, size_t target)
               (g->code[site] >> 4) & 0xf, site, target);
 }
 
-/* ar = (as < at) ? 1 : 0 — branch form (avoid optional SALT). */
 static void emit_setlt(gen_t *g, int ar, int as, int at)
 {
     size_t blt_site, j_site;
@@ -535,35 +709,120 @@ static void emit_setlt(gen_t *g, int ar, int as, int at)
     emit_j_to(g, j_site, g->len);
 }
 
-static int local_off(gen_t *g, int idx)
-{
-    (void)g;
-    return idx * 4;
-}
-
 static int find_local(gen_t *g, const char *name)
 {
     for (int i = 0; i < g->nlocals; i++) {
-        if (CC_STRCMP(g->local_name[i], name) == 0) {
+        if (CC_STRCMP(g->locals[i].name, name) == 0) {
             return i;
         }
     }
     return -1;
 }
 
-static int add_local(gen_t *g, const char *name)
+static int find_global(gen_t *g, const char *name)
+{
+    for (int i = 0; i < g->nglobals; i++) {
+        if (CC_STRCMP(g->globals[i].name, name) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static int find_func(gen_t *g, const char *name)
+{
+    for (int i = 0; i < g->nfuncs; i++) {
+        if (CC_STRCMP(g->funcs[i].name, name) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static int add_local_n(gen_t *g, const char *name, int nwords, int is_array)
 {
     if (find_local(g, name) >= 0) {
         gfail(g, "duplicate local");
+        return -1;
+    }
+    if (nwords <= 0) {
+        gfail(g, "bad array size");
         return -1;
     }
     if (g->nlocals >= MAX_LOCALS) {
         gfail(g, "too many locals");
         return -1;
     }
+    if (g->local_words + nwords > MAX_LOCALS) {
+        gfail(g, "too many local slots");
+        return -1;
+    }
     const int i = g->nlocals++;
-    cpy_err(g->local_name[i], MAX_NAME, name);
+    cpy_err(g->locals[i].name, MAX_NAME, name);
+    g->locals[i].off = g->local_words * 4;
+    g->locals[i].nwords = nwords;
+    g->locals[i].is_array = is_array;
+    g->local_words += nwords;
     return i;
+}
+
+static int add_local(gen_t *g, const char *name)
+{
+    return add_local_n(g, name, 1, 0);
+}
+
+static int add_global_n(gen_t *g, const char *name, int nwords, int is_array)
+{
+    if (find_global(g, name) >= 0 || find_func(g, name) >= 0) {
+        gfail(g, "duplicate global");
+        return -1;
+    }
+    if (nwords <= 0) {
+        gfail(g, "bad array size");
+        return -1;
+    }
+    if (g->nglobals >= MAX_GLOBALS) {
+        gfail(g, "too many globals");
+        return -1;
+    }
+    const int bytes = nwords * 4;
+    if (g->data_next + bytes > (int)DATA_CAP) {
+        gfail(g, "data too large");
+        return -1;
+    }
+    const int i = g->nglobals++;
+    cpy_err(g->globals[i].name, MAX_NAME, name);
+    g->globals[i].off = g->data_next;
+    g->globals[i].nwords = nwords;
+    g->globals[i].is_array = is_array;
+    g->data_next += bytes;
+    return i;
+}
+
+static int add_string(gen_t *g, const char *s)
+{
+    size_t n = 0;
+    while (s[n] != '\0') {
+        n++;
+    }
+    n++;
+    if (g->data_next + (int)n > (int)DATA_CAP) {
+        gfail(g, "data too large");
+        return -1;
+    }
+    const int off = g->data_next;
+    memcpy(g->data + off, s, n);
+    g->data_next += (int)n;
+    return off;
+}
+
+static void add_reloc(gen_t *g, uint32_t entry)
+{
+    if (g->nrelocs >= MAX_RELOCS) {
+        gfail(g, "too many relocations");
+        return;
+    }
+    g->relocs[g->nrelocs++] = entry;
 }
 
 static void push_a8(gen_t *g)
@@ -586,7 +845,6 @@ static void pop_a9(gen_t *g)
     emit_l32i(g, 9, 7, g->spill_base + g->spill_top * 4);
 }
 
-/* a8 = (a8 == 0) ? 1 : 0  — used for ! and inverted compares */
 static void emit_bool_not_a8(gen_t *g)
 {
     emit_movi(g, 9, 0);
@@ -597,6 +855,86 @@ static void emit_bool_not_a8(gen_t *g)
     patch_b(g, beq_site, g->len);
     emit_movi(g, 8, 1);
     emit_j_to(g, j_site, g->len);
+}
+
+static void emit_load_api_fn(gen_t *g, int at, int api_off, int fn_off)
+{
+    emit_li_data(g, at, 0);
+    emit_l32i(g, at, at, 0);
+    emit_l32i(g, at, at, api_off);
+    emit_l32i(g, at, at, fn_off);
+}
+
+static void emit_base_local(gen_t *g, int li)
+{
+    emit_mov_n(g, 8, 7);
+    if (g->locals[li].off != 0) {
+        emit_movi(g, 9, g->locals[li].off);
+        emit_add_n(g, 8, 8, 9);
+    }
+}
+
+static void emit_base_global(gen_t *g, int gi)
+{
+    emit_li_data(g, 8, (uint32_t)g->globals[gi].off);
+}
+
+static void emit_index_addr(gen_t *g, int is_global, int idx)
+{
+    push_a8(g);
+    if (is_global) {
+        emit_base_global(g, idx);
+    } else {
+        emit_base_local(g, idx);
+    }
+    pop_a9(g);
+    emit_movi(g, 10, 4);
+    emit_mull(g, 9, 9, 10);
+    emit_add_n(g, 8, 8, 9);
+}
+
+/* ---- builtins ---------------------------------------------------------- */
+
+typedef struct {
+    const char *name;
+    int         nargs;
+    int         api_off;
+    int         fn_off;
+    int         is_gfx;
+    int         returns;
+    int         acquire_null;
+} builtin_t;
+
+static const builtin_t BUILTINS[] = {
+    {"ag_delay", 1, API_OFF_TIME, TIME_OFF_DELAY_MS, 0, 0, 0},
+    {"ag_key", 1, API_OFF_INP, INP_OFF_KEY_PRESSED, 0, 1, 0},
+    /* ag_btn: level state via HostFS PADPUSH (same path as SMS). ids 0..7 */
+    {"ag_btn", 1, API_OFF_INP, INP_OFF_BTN, 0, 1, 0},
+    {"ag_gfx_acquire", 0, API_OFF_GFX, GFX_OFF_ACQUIRE, 1, 0, 1},
+    {"ag_gfx_release", 0, API_OFF_GFX, GFX_OFF_RELEASE, 1, 0, 0},
+    {"ag_gfx_clear", 1, API_OFF_GFX, GFX_OFF_CLEAR, 1, 0, 0},
+    {"ag_gfx_flush", 4, API_OFF_GFX, GFX_OFF_FLUSH, 1, 0, 0},
+    {"ag_gfx_swap", 0, API_OFF_GFX, GFX_OFF_SWAP, 1, 0, 0},
+    {"ag_gfx_fill_rect", 5, API_OFF_GFX, GFX_OFF_FILL_RECT, 1, 0, 0},
+    {"ag_gfx_text", 5, API_OFF_GFX, GFX_OFF_TEXT, 1, 0, 0},
+    {"ag_gfx_pixel", 3, API_OFF_GFX, GFX_OFF_PIXEL, 1, 0, 0},
+    {"ag_gfx_line", 5, API_OFF_GFX, GFX_OFF_LINE, 1, 0, 0},
+    {"ag_gfx_circle", 4, API_OFF_GFX, GFX_OFF_CIRCLE, 1, 0, 0},
+    {"ag_gfx_fill_circle", 4, API_OFF_GFX, GFX_OFF_FILL_CIRCLE, 1, 0, 0},
+    {"ag_gfx_poly_begin", 0, API_OFF_GFX, GFX_OFF_POLY_BEGIN, 1, 0, 0},
+    {"ag_gfx_poly_vertex", 2, API_OFF_GFX, GFX_OFF_POLY_VERTEX, 1, 0, 0},
+    {"ag_gfx_poly_fill", 1, API_OFF_GFX, GFX_OFF_POLY_FILL, 1, 0, 0},
+    {"ag_gfx_poly_stroke", 1, API_OFF_GFX, GFX_OFF_POLY_STROKE, 1, 0, 0},
+};
+
+static const builtin_t *find_builtin(const char *name)
+{
+    for (size_t i = 0; i < sizeof(BUILTINS) / sizeof(BUILTINS[0]); i++) {
+        if (CC_STRCMP(BUILTINS[i].name, name) == 0) {
+            return &BUILTINS[i];
+        }
+    }
+    return NULL;
 }
 
 /* ---- parser ------------------------------------------------------------ */
@@ -629,6 +967,85 @@ static void expect(par_t *p, tok_t t, const char *msg)
 
 static void parse_expr(par_t *p);
 static void parse_stmt(par_t *p);
+static void parse_call_by_name(par_t *p, const char *name);
+
+static void parse_call_args_to_regs(par_t *p, int nargs)
+{
+    expect(p, T_LPAREN, "expected '('");
+    if (nargs == 0) {
+        expect(p, T_RPAREN, "expected ')'");
+        return;
+    }
+    for (int i = 0; i < nargs; i++) {
+        parse_expr(p);
+        if (i + 1 < nargs) {
+            push_a8(p->g);
+            expect(p, T_COMMA, "expected ','");
+        }
+    }
+    expect(p, T_RPAREN, "expected ')'");
+    emit_mov_n(p->g, 10 + nargs - 1, 8);
+    for (int i = nargs - 2; i >= 0; i--) {
+        pop_a9(p->g);
+        emit_mov_n(p->g, 10 + i, 9);
+    }
+}
+
+static void emit_user_call(par_t *p, int fi)
+{
+    const func_t *fn = &p->g->funcs[fi];
+    parse_call_args_to_regs(p, fn->nparams);
+    emit_li_code(p->g, 8, (uint32_t)fn->code_off);
+    emit_callx8(p->g, 8);
+    if (!fn->is_void) {
+        emit_mov_n(p->g, 8, 10);
+    } else {
+        emit_movi(p->g, 8, 0);
+    }
+}
+
+static void emit_builtin_call(par_t *p, const builtin_t *b)
+{
+    if (b->is_gfx) {
+        p->g->needs_gfx = 1;
+    }
+    if (b->acquire_null) {
+        expect(p, T_LPAREN, "expected '('");
+        expect(p, T_RPAREN, "expected ')'");
+        emit_movi(p->g, 10, 0);
+    } else {
+        parse_call_args_to_regs(p, b->nargs);
+    }
+    emit_load_api_fn(p->g, 8, b->api_off, b->fn_off);
+    emit_callx8(p->g, 8);
+    if (b->returns) {
+        emit_mov_n(p->g, 8, 10);
+        emit_movi(p->g, 9, 0);
+        size_t bne_site, j_end;
+        emit_b_placeholder(p->g, B_BNE, 8, 9, &bne_site);
+        emit_j_placeholder(p->g, &j_end);
+        patch_b(p->g, bne_site, p->g->len);
+        emit_movi(p->g, 8, 1);
+        emit_j_to(p->g, j_end, p->g->len);
+    } else {
+        emit_movi(p->g, 8, 0);
+    }
+}
+
+static void parse_call_by_name(par_t *p, const char *name)
+{
+    const builtin_t *b = find_builtin(name);
+    if (b != NULL) {
+        emit_builtin_call(p, b);
+        return;
+    }
+    const int fi = find_func(p->g, name);
+    if (fi < 0) {
+        pfail(p, "unknown function");
+        return;
+    }
+    emit_user_call(p, fi);
+}
 
 static void parse_primary(par_t *p)
 {
@@ -640,14 +1057,67 @@ static void parse_primary(par_t *p)
         lex_next(p->L);
         return;
     }
-    if (p->L->tok == T_IDENT) {
-        const int idx = find_local(p->g, p->L->text);
-        if (idx < 0) {
-            pfail(p, "unknown identifier");
+    if (p->L->tok == T_STRING) {
+        const int off = add_string(p->g, p->L->strbuf);
+        lex_next(p->L);
+        if (off < 0) {
             return;
         }
-        emit_l32i(p->g, 8, 7, local_off(p->g, idx));
+        emit_li_data(p->g, 8, (uint32_t)off);
+        return;
+    }
+    if (p->L->tok == T_IDENT) {
+        char name[MAX_NAME];
+        cpy_err(name, sizeof(name), p->L->text);
         lex_next(p->L);
+        if (p->L->tok == T_LPAREN) {
+            parse_call_by_name(p, name);
+            return;
+        }
+        if (accept(p, T_LBRACK)) {
+            parse_expr(p);
+            expect(p, T_RBRACK, "expected ']'");
+            const int li = find_local(p->g, name);
+            const int gi = (li < 0) ? find_global(p->g, name) : -1;
+            if (li >= 0) {
+                if (!p->g->locals[li].is_array) {
+                    pfail(p, "not an array");
+                    return;
+                }
+                emit_index_addr(p->g, 0, li);
+            } else if (gi >= 0) {
+                if (!p->g->globals[gi].is_array) {
+                    pfail(p, "not an array");
+                    return;
+                }
+                emit_index_addr(p->g, 1, gi);
+            } else {
+                pfail(p, "unknown identifier");
+                return;
+            }
+            emit_l32i(p->g, 8, 8, 0);
+            return;
+        }
+        const int li = find_local(p->g, name);
+        if (li >= 0) {
+            if (p->g->locals[li].is_array) {
+                emit_base_local(p->g, li);
+            } else {
+                emit_l32i(p->g, 8, 7, p->g->locals[li].off);
+            }
+            return;
+        }
+        const int gi = find_global(p->g, name);
+        if (gi >= 0) {
+            if (p->g->globals[gi].is_array) {
+                emit_base_global(p->g, gi);
+            } else {
+                emit_li_data(p->g, 8, (uint32_t)p->g->globals[gi].off);
+                emit_l32i(p->g, 8, 8, 0);
+            }
+            return;
+        }
+        pfail(p, "unknown identifier");
         return;
     }
     if (accept(p, T_LPAREN)) {
@@ -810,6 +1280,127 @@ static void parse_block(par_t *p)
     expect(p, T_RBRACE, "expected '}'");
 }
 
+static void store_scalar_from_a8(par_t *p, const char *name)
+{
+    const int li = find_local(p->g, name);
+    if (li >= 0) {
+        if (p->g->locals[li].is_array) {
+            pfail(p, "array needs index");
+            return;
+        }
+        emit_s32i(p->g, 8, 7, p->g->locals[li].off);
+        return;
+    }
+    const int gi = find_global(p->g, name);
+    if (gi >= 0) {
+        if (p->g->globals[gi].is_array) {
+            pfail(p, "array needs index");
+            return;
+        }
+        push_a8(p->g);
+        emit_li_data(p->g, 8, (uint32_t)p->g->globals[gi].off);
+        pop_a9(p->g);
+        emit_s32i(p->g, 9, 8, 0);
+        return;
+    }
+    pfail(p, "unknown identifier");
+}
+
+static void assign_array(par_t *p, const char *name)
+{
+    parse_expr(p);
+    expect(p, T_RBRACK, "expected ']'");
+    expect(p, T_ASSIGN, "expected '='");
+    push_a8(p->g);
+    parse_expr(p);
+    push_a8(p->g);
+
+    const int li = find_local(p->g, name);
+    const int gi = (li < 0) ? find_global(p->g, name) : -1;
+    if (li < 0 && gi < 0) {
+        pfail(p, "unknown identifier");
+        return;
+    }
+    if (li >= 0 && !p->g->locals[li].is_array) {
+        pfail(p, "not an array");
+        return;
+    }
+    if (gi >= 0 && !p->g->globals[gi].is_array) {
+        pfail(p, "not an array");
+        return;
+    }
+
+    pop_a9(p->g);
+    if (p->g->spill_top >= SPILL_SLOTS) {
+        gfail(p->g, "expression too deep");
+        return;
+    }
+    const int val_slot = p->g->spill_base + p->g->spill_top * 4;
+    emit_s32i(p->g, 9, 7, val_slot);
+
+    pop_a9(p->g);
+    emit_mov_n(p->g, 8, 9);
+    if (li >= 0) {
+        emit_index_addr(p->g, 0, li);
+    } else {
+        emit_index_addr(p->g, 1, gi);
+    }
+    emit_l32i(p->g, 9, 7, val_slot);
+    emit_s32i(p->g, 9, 8, 0);
+}
+
+static void parse_for_assign_or_empty(par_t *p, int allow_decl)
+{
+    if (p->L->tok == T_SEMI || p->L->tok == T_RPAREN) {
+        return;
+    }
+    if (allow_decl && accept(p, T_INT)) {
+        if (p->L->tok != T_IDENT) {
+            pfail(p, "expected identifier after int");
+            return;
+        }
+        char name[MAX_NAME];
+        cpy_err(name, sizeof(name), p->L->text);
+        lex_next(p->L);
+        if (accept(p, T_LBRACK)) {
+            if (p->L->tok != T_NUM || p->L->num <= 0) {
+                pfail(p, "expected array size");
+                return;
+            }
+            const int n = (int)p->L->num;
+            lex_next(p->L);
+            expect(p, T_RBRACK, "expected ']'");
+            (void)add_local_n(p->g, name, n, 1);
+            return;
+        }
+        const int idx = add_local(p->g, name);
+        if (idx < 0) {
+            return;
+        }
+        if (accept(p, T_ASSIGN)) {
+            parse_expr(p);
+        } else {
+            emit_movi(p->g, 8, 0);
+        }
+        emit_s32i(p->g, 8, 7, p->g->locals[idx].off);
+        return;
+    }
+    if (p->L->tok != T_IDENT) {
+        pfail(p, "expected assignment in for");
+        return;
+    }
+    char name[MAX_NAME];
+    cpy_err(name, sizeof(name), p->L->text);
+    lex_next(p->L);
+    if (accept(p, T_LBRACK)) {
+        assign_array(p, name);
+        return;
+    }
+    expect(p, T_ASSIGN, "expected '='");
+    parse_expr(p);
+    store_scalar_from_a8(p, name);
+}
+
 static void parse_stmt(par_t *p)
 {
     if (p->g->err || p->L->err) {
@@ -868,6 +1459,42 @@ static void parse_stmt(par_t *p)
         emit_j_to(p->g, j_done, p->g->len);
         return;
     }
+    if (accept(p, T_FOR)) {
+        expect(p, T_LPAREN, "expected '(' after for");
+        parse_for_assign_or_empty(p, 1);
+        expect(p, T_SEMI, "expected ';' in for");
+        const size_t check = p->g->len;
+        size_t j_done = 0;
+        int has_cond = 0;
+        if (p->L->tok != T_SEMI) {
+            has_cond = 1;
+            parse_expr(p);
+        }
+        expect(p, T_SEMI, "expected ';' in for");
+        if (has_cond) {
+            emit_movi(p->g, 9, 0);
+            size_t bne_site;
+            emit_b_placeholder(p->g, B_BNE, 8, 9, &bne_site);
+            emit_j_placeholder(p->g, &j_done);
+            patch_b(p->g, bne_site, p->g->len);
+        }
+        size_t j_body, step_start, j_after_step;
+        emit_j_placeholder(p->g, &j_body);
+        step_start = p->g->len;
+        parse_for_assign_or_empty(p, 0);
+        expect(p, T_RPAREN, "expected ')'");
+        emit_j_placeholder(p->g, &j_after_step);
+        emit_j_to(p->g, j_after_step, check);
+        emit_j_to(p->g, j_body, p->g->len);
+        parse_stmt(p);
+        size_t j_to_step;
+        emit_j_placeholder(p->g, &j_to_step);
+        emit_j_to(p->g, j_to_step, step_start);
+        if (has_cond) {
+            emit_j_to(p->g, j_done, p->g->len);
+        }
+        return;
+    }
     if (accept(p, T_INT)) {
         if (p->L->tok != T_IDENT) {
             pfail(p, "expected identifier after int");
@@ -876,6 +1503,18 @@ static void parse_stmt(par_t *p)
         char name[MAX_NAME];
         cpy_err(name, sizeof(name), p->L->text);
         lex_next(p->L);
+        if (accept(p, T_LBRACK)) {
+            if (p->L->tok != T_NUM || p->L->num <= 0) {
+                pfail(p, "expected array size");
+                return;
+            }
+            const int n = (int)p->L->num;
+            lex_next(p->L);
+            expect(p, T_RBRACK, "expected ']'");
+            (void)add_local_n(p->g, name, n, 1);
+            expect(p, T_SEMI, "expected ';' after declaration");
+            return;
+        }
         const int idx = add_local(p->g, name);
         if (idx < 0) {
             return;
@@ -885,7 +1524,7 @@ static void parse_stmt(par_t *p)
         } else {
             emit_movi(p->g, 8, 0);
         }
-        emit_s32i(p->g, 8, 7, local_off(p->g, idx));
+        emit_s32i(p->g, 8, 7, p->g->locals[idx].off);
         expect(p, T_SEMI, "expected ';' after declaration");
         return;
     }
@@ -893,17 +1532,19 @@ static void parse_stmt(par_t *p)
         char name[MAX_NAME];
         cpy_err(name, sizeof(name), p->L->text);
         lex_next(p->L);
-        if (!accept(p, T_ASSIGN)) {
-            pfail(p, "expected '=' after identifier");
+        if (p->L->tok == T_LPAREN) {
+            parse_call_by_name(p, name);
+            expect(p, T_SEMI, "expected ';'");
             return;
         }
-        const int idx = find_local(p->g, name);
-        if (idx < 0) {
-            pfail(p, "unknown identifier");
+        if (accept(p, T_LBRACK)) {
+            assign_array(p, name);
+            expect(p, T_SEMI, "expected ';'");
             return;
         }
+        expect(p, T_ASSIGN, "expected '=' after identifier");
         parse_expr(p);
-        emit_s32i(p->g, 8, 7, local_off(p->g, idx));
+        store_scalar_from_a8(p, name);
         expect(p, T_SEMI, "expected ';'");
         return;
     }
@@ -911,92 +1552,180 @@ static void parse_stmt(par_t *p)
     expect(p, T_SEMI, "expected ';'");
 }
 
-static void parse_params(par_t *p)
+static int parse_params(par_t *p)
 {
+    int nparams = 0;
     expect(p, T_LPAREN, "expected '('");
     if (accept(p, T_VOID) || p->L->tok == T_RPAREN) {
         expect(p, T_RPAREN, "expected ')'");
-        return;
+        return 0;
     }
-    /* int argc, int argv-style — accept and ignore names as locals. */
     for (;;) {
         expect(p, T_INT, "expected parameter type");
         if (p->L->tok != T_IDENT) {
             pfail(p, "expected parameter name");
-            return;
+            return 0;
+        }
+        if (nparams >= 4) {
+            pfail(p, "too many parameters");
+            return 0;
         }
         (void)add_local(p->g, p->L->text);
         lex_next(p->L);
+        nparams++;
         if (!accept(p, T_COMMA)) {
             break;
         }
     }
     expect(p, T_RPAREN, "expected ')'");
+    return nparams;
 }
 
-static void parse_program(par_t *p)
+static void parse_function(par_t *p, int is_void, const char *name)
 {
-    /* int|void ag_main(...) { ... } */
-    if (p->L->tok != T_INT && p->L->tok != T_VOID) {
-        pfail(p, "expected function");
+    if (find_func(p->g, name) >= 0 || find_global(p->g, name) >= 0) {
+        pfail(p, "duplicate function");
         return;
     }
-    lex_next(p->L);
-    if (p->L->tok != T_IDENT || CC_STRCMP(p->L->text, "ag_main") != 0) {
-        pfail(p, "entry must be ag_main");
+    if (find_builtin(name) != NULL) {
+        pfail(p, "reserved builtin name");
         return;
     }
-    lex_next(p->L);
+    if (p->g->nfuncs >= MAX_FUNCS) {
+        pfail(p, "too many functions");
+        return;
+    }
 
-    /* Frame: reserve max locals + spills up front (fixed layout). */
-    const int framesize = 32 + MAX_LOCALS * 4 + SPILL_SLOTS * 4;
-    p->g->spill_base = MAX_LOCALS * 4;
+    p->g->nlocals = 0;
+    p->g->local_words = 0;
     p->g->spill_top = 0;
-    emit_entry(p->g, framesize);
-    emit_mov_n(p->g, 7, 1); /* a7 = frame */
+    p->g->spill_base = MAX_LOCALS * 4;
 
-    parse_params(p);
-    /* Copy incoming a2/a3 into first locals if present. */
-    if (p->g->nlocals >= 1) {
-        emit_s32i(p->g, 2, 7, 0);
+    const int framesize = 32 + MAX_LOCALS * 4 + SPILL_SLOTS * 4;
+    const size_t code_off = p->g->len;
+    emit_entry(p->g, framesize);
+    emit_mov_n(p->g, 7, 1);
+
+    const int nparams = parse_params(p);
+    if (p->g->err) {
+        return;
     }
-    if (p->g->nlocals >= 2) {
-        emit_s32i(p->g, 3, 7, 4);
+    for (int i = 0; i < nparams && i < 4; i++) {
+        emit_s32i(p->g, 2 + i, 7, p->g->locals[i].off);
+    }
+
+    const int fi = p->g->nfuncs++;
+    cpy_err(p->g->funcs[fi].name, MAX_NAME, name);
+    p->g->funcs[fi].code_off = code_off;
+    p->g->funcs[fi].nparams = nparams;
+    p->g->funcs[fi].is_void = is_void;
+    if (CC_STRCMP(name, "ag_main") == 0) {
+        p->g->ag_main_idx = fi;
     }
 
     parse_block(p);
 
-    /* Fallthrough return 0. */
     emit_movi(p->g, 2, 0);
     emit_retw_n(p->g);
+}
 
-    if (p->L->tok != T_EOF && !p->g->err) {
-        pfail(p, "trailing junk after ag_main");
+static void parse_program(par_t *p)
+{
+    p->g->data_next = 4;
+    p->g->ag_main_idx = -1;
+
+    while (p->L->tok != T_EOF && !p->g->err && !p->L->err) {
+        if (accept(p, T_VOID)) {
+            if (p->L->tok != T_IDENT) {
+                pfail(p, "expected function name");
+                return;
+            }
+            char name[MAX_NAME];
+            cpy_err(name, sizeof(name), p->L->text);
+            lex_next(p->L);
+            parse_function(p, 1, name);
+            continue;
+        }
+        if (!accept(p, T_INT)) {
+            pfail(p, "expected declaration or function");
+            return;
+        }
+        if (p->L->tok != T_IDENT) {
+            pfail(p, "expected identifier");
+            return;
+        }
+        char name[MAX_NAME];
+        cpy_err(name, sizeof(name), p->L->text);
+        lex_next(p->L);
+        if (p->L->tok == T_LPAREN) {
+            parse_function(p, 0, name);
+            continue;
+        }
+        if (p->g->nfuncs > 0) {
+            pfail(p, "globals must precede functions");
+            return;
+        }
+        if (accept(p, T_LBRACK)) {
+            if (p->L->tok != T_NUM || p->L->num <= 0) {
+                pfail(p, "expected array size");
+                return;
+            }
+            const int n = (int)p->L->num;
+            lex_next(p->L);
+            expect(p, T_RBRACK, "expected ']'");
+            expect(p, T_SEMI, "expected ';'");
+            (void)add_global_n(p->g, name, n, 1);
+            continue;
+        }
+        expect(p, T_SEMI, "expected ';'");
+        (void)add_global_n(p->g, name, 1, 0);
+    }
+
+    if (!p->g->err && p->g->ag_main_idx < 0) {
+        pfail(p, "entry must be ag_main");
     }
 }
 
-/* ---- AXE packing ------------------------------------------------------- */
+static void finalize_lits(gen_t *g, size_t lit_bytes)
+{
+    for (int i = 0; i < g->nlit; i++) {
+        if (g->lit_kind[i] == LIT_IMM) {
+            continue;
+        }
+        if (g->lit_kind[i] == LIT_CODE_OFF) {
+            g->lit[i] = CODE_BASE + (uint32_t)lit_bytes + g->lit_off[i];
+            add_reloc(g, (uint32_t)i * 4u);
+        } else if (g->lit_kind[i] == LIT_DATA_OFF) {
+            g->lit[i] = DATA_BASE + g->lit_off[i];
+            add_reloc(g, ((uint32_t)i * 4u) | AG_AXE_R_TO_DATA);
+        }
+    }
+}
 
 static void fix_l32r(gen_t *g, size_t lit_bytes)
 {
-    for (size_t i = 0; i + 2 < g->len; i++) {
-        if ((g->code[i] & 0x0f) == 0x1 && g->code[i + 1] == 0xff) {
-            const int li = g->code[i + 2];
-            if (li < 0 || li >= g->nlit) {
-                gfail(g, "bad literal index");
-                return;
-            }
-            const uint32_t pc = CODE_BASE + (uint32_t)lit_bytes + (uint32_t)i;
-            const uint32_t next = (pc + 3u) & ~3u;
-            const uint32_t target = CODE_BASE + (uint32_t)li * 4u;
-            const int32_t imm = (int32_t)((int32_t)target - (int32_t)next) >> 2;
-            if (imm < -32768 || imm > 32767) {
-                gfail(g, "literal out of range");
-                return;
-            }
-            g->code[i + 1] = (uint8_t)(imm & 0xff);
-            g->code[i + 2] = (uint8_t)((imm >> 8) & 0xff);
+    for (int s = 0; s < g->nlit_sites; s++) {
+        const size_t i = g->lit_site_off[s];
+        const int li = (int)g->lit_site_li[s];
+        if (i + 2 >= g->len || (g->code[i] & 0x0f) != 0x1 ||
+            g->code[i + 1] != 0xff || g->code[i + 2] != 0xff) {
+            gfail(g, "bad literal site");
+            return;
         }
+        if (li < 0 || li >= g->nlit) {
+            gfail(g, "bad literal index");
+            return;
+        }
+        const uint32_t pc = CODE_BASE + (uint32_t)lit_bytes + (uint32_t)i;
+        const uint32_t next = (pc + 3u) & ~3u;
+        const uint32_t target = CODE_BASE + (uint32_t)li * 4u;
+        const int32_t imm = (int32_t)((int32_t)target - (int32_t)next) >> 2;
+        if (imm < -32768 || imm > 32767) {
+            gfail(g, "literal out of range");
+            return;
+        }
+        g->code[i + 1] = (uint8_t)(imm & 0xff);
+        g->code[i + 2] = (uint8_t)((imm >> 8) & 0xff);
     }
 }
 
@@ -1043,10 +1772,17 @@ int cc_compile_to_axe(const char *src, size_t src_len, cc_result_t *out)
         return -1;
     }
 
-    gen_t g;
-    memset(&g, 0, sizeof(g));
-    g.code = text;
-    g.cap = CODE_CAP;
+    gen_t *g = (gen_t *)CC_ALLOC(sizeof(gen_t));
+    if (g == NULL) {
+        cpy_err(out->err, sizeof(out->err), "out of memory");
+        CC_FREE(text);
+        return -1;
+    }
+    memset(g, 0, sizeof(*g));
+    g->code = text;
+    g->cap = CODE_CAP;
+    g->ag_main_idx = -1;
+    g->data_next = 4;
 
     lex_t L;
     memset(&L, 0, sizeof(L));
@@ -1054,48 +1790,60 @@ int cc_compile_to_axe(const char *src, size_t src_len, cc_result_t *out)
     L.len = src_len;
     lex_next(&L);
 
-    par_t p = {.L = &L, .g = &g};
+    par_t p = {.L = &L, .g = g};
     parse_program(&p);
 
     if (L.err) {
         cpy_err(out->err, sizeof(out->err), L.errmsg);
         CC_FREE(text);
+        CC_FREE(g);
         return -1;
     }
-    if (g.err) {
-        cpy_err(out->err, sizeof(out->err), g.errmsg);
+    if (g->err) {
+        cpy_err(out->err, sizeof(out->err), g->errmsg);
         CC_FREE(text);
+        CC_FREE(g);
         return -1;
     }
 
-    const size_t lit_bytes = (size_t)g.nlit * 4u;
-    fix_l32r(&g, lit_bytes);
-    if (g.err) {
-        cpy_err(out->err, sizeof(out->err), g.errmsg);
+    const size_t lit_bytes = (size_t)g->nlit * 4u;
+    finalize_lits(g, lit_bytes);
+    if (g->err) {
+        cpy_err(out->err, sizeof(out->err), g->errmsg);
         CC_FREE(text);
+        CC_FREE(g);
+        return -1;
+    }
+    fix_l32r(g, lit_bytes);
+    if (g->err) {
+        cpy_err(out->err, sizeof(out->err), g->errmsg);
+        CC_FREE(text);
+        CC_FREE(g);
         return -1;
     }
 
-    /* Loader requires each part's size to be word-aligned. */
-    const size_t code_raw = lit_bytes + g.len;
+    const size_t code_raw = lit_bytes + g->len;
     const size_t code_size = (code_raw + 3u) & ~3u;
-    const size_t data_size = 4; /* g_ag_api bss */
-    const size_t file_size = AXE_HDR + code_size;
+    const size_t data_size = ((size_t)g->data_next + 3u) & ~3u;
+    const size_t data_file = data_size;
+    const size_t reloc_bytes = (size_t)g->nrelocs * 4u;
+    const size_t file_size = AXE_HDR + code_size + data_file + reloc_bytes;
+
     uint8_t *axe = (uint8_t *)CC_ALLOC(file_size);
     if (axe == NULL) {
         cpy_err(out->err, sizeof(out->err), "out of memory");
         CC_FREE(text);
+        CC_FREE(g);
         return -1;
     }
     memset(axe, 0, file_size);
 
-    /* ag_axe_header_t — must match tools/mkaxe.py HEADER_FORMAT */
     memcpy(axe + 0, "AXE1", 4);
-    wr_u16(axe + 4, 0); /* abi_major */
-    wr_u16(axe + 6, 8); /* abi_minor */
-    wr_u16(axe + 8, 1); /* arch = xtensa */
+    wr_u16(axe + 4, 0);
+    wr_u16(axe + 6, 10);
+    wr_u16(axe + 8, 1);
     wr_u16(axe + 10, (uint16_t)AXE_HDR);
-    wr_u32(axe + 12, 0); /* flags */
+    wr_u32(axe + 12, g->needs_gfx ? AG_AXE_NEEDS_GFX : 0);
 
     wr_u32(axe + 16, CODE_BASE);
     wr_u32(axe + 20, (uint32_t)code_size);
@@ -1104,29 +1852,39 @@ int cc_compile_to_axe(const char *src, size_t src_len, cc_result_t *out)
 
     wr_u32(axe + 32, DATA_BASE);
     wr_u32(axe + 36, (uint32_t)data_size);
-    wr_u32(axe + 40, 0);
+    wr_u32(axe + 40, (uint32_t)data_file);
     wr_u32(axe + 44, AXE_HDR + (uint32_t)code_size);
 
-    wr_u32(axe + 48, CODE_BASE + (uint32_t)lit_bytes); /* entry */
-    wr_u32(axe + 52, DATA_BASE);                       /* api_slot */
+    const uint32_t entry = CODE_BASE + (uint32_t)lit_bytes +
+                           (uint32_t)g->funcs[g->ag_main_idx].code_off;
+    wr_u32(axe + 48, entry);
+    wr_u32(axe + 52, DATA_BASE);
 
-    wr_u32(axe + 56, AXE_HDR + (uint32_t)code_size); /* reloc_offset */
-    wr_u32(axe + 60, 0);                             /* reloc_count */
+    wr_u32(axe + 56, AXE_HDR + (uint32_t)code_size + (uint32_t)data_file);
+    wr_u32(axe + 60, (uint32_t)g->nrelocs);
 
-    wr_u32(axe + 64, 0); /* stack */
-    wr_u32(axe + 68, 0); /* heap */
+    wr_u32(axe + 64, 0);
+    wr_u32(axe + 68, 0);
     wr_str(axe + 72, 32, "TCC");
-    wr_str(axe + 104, 16, "0.1");
+    wr_str(axe + 104, 16, "0.2");
     wr_str(axe + 120, 32, "cc");
 
     uint8_t *code = axe + AXE_HDR;
-    for (int i = 0; i < g.nlit; i++) {
-        wr_u32(code + (size_t)i * 4u, g.lit[i]);
+    for (int i = 0; i < g->nlit; i++) {
+        wr_u32(code + (size_t)i * 4u, g->lit[i]);
     }
-    memcpy(code + lit_bytes, text, g.len);
-    /* Padding bytes stay zero from memset. */
+    memcpy(code + lit_bytes, text, g->len);
+
+    uint8_t *data = axe + AXE_HDR + code_size;
+    memcpy(data, g->data, (size_t)g->data_next);
+
+    uint8_t *rel = data + data_file;
+    for (int i = 0; i < g->nrelocs; i++) {
+        wr_u32(rel + (size_t)i * 4u, g->relocs[i]);
+    }
 
     CC_FREE(text);
+    CC_FREE(g);
     out->axe = axe;
     out->axe_len = file_size;
     return 0;
@@ -1141,8 +1899,6 @@ void cc_result_free(cc_result_t *out)
     out->axe = NULL;
     out->axe_len = 0;
 }
-
-/* ---- host expression evaluator ----------------------------------------- */
 
 typedef struct {
     lex_t L;

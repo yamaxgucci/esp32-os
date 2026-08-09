@@ -109,6 +109,13 @@ void ag_console_flush_input(void);
 uint16_t ag_console_mods(void);
 
 /*
+ * Sticky key state for games: KEY_DOWN arms a key for a short time (or until
+ * KEY_UP).  Also drains the input queue so a poll loop does not fill it.
+ * Terminals rarely send KEY_UP; auto-repeat refreshes the sticky window.
+ */
+bool ag_console_key_pressed(uint16_t keycode);
+
+/*
  * A look at every input event before it is queued for whoever is reading.
  * Returning true means the event has been dealt with and must not be delivered;
  * the event may also be rewritten in place and let through, which is how Ctrl+C

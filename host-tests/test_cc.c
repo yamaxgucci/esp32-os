@@ -5,6 +5,7 @@
  */
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "cc_compile.h"
@@ -49,6 +50,63 @@ static void check_prog(const char *src, int expect_ok)
     }
 }
 
+static int axe_contains(const uint8_t *axe, size_t len, const char *needle)
+{
+    const size_t n = strlen(needle);
+    if (n == 0 || len < n) {
+        return 0;
+    }
+    for (size_t i = 0; i + n <= len; i++) {
+        if (memcmp(axe + i, needle, n) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void check_asteroids_example(void)
+{
+    /* Path relative to repo when tests run from build-host via argon.ps1. */
+    const char *paths[] = {
+        "../apps/cc/examples/asteroids.c",
+        "apps/cc/examples/asteroids.c",
+        NULL,
+    };
+    FILE *f = NULL;
+    for (int i = 0; paths[i] != NULL; i++) {
+        f = fopen(paths[i], "rb");
+        if (f != NULL) {
+            break;
+        }
+    }
+    AG_CHECK(f != NULL);
+    if (f == NULL) {
+        return;
+    }
+    char *buf = (char *)malloc(64 * 1024);
+    AG_CHECK(buf != NULL);
+    if (buf == NULL) {
+        fclose(f);
+        return;
+    }
+    const size_t n = fread(buf, 1, 64 * 1024 - 1, f);
+    fclose(f);
+    buf[n] = '\0';
+    cc_result_t res;
+    const int rc = cc_compile_to_axe(buf, n, &res);
+    AG_CHECK(rc == 0);
+    if (rc != 0) {
+        printf("     asteroids: %s\n", res.err);
+    } else {
+        const uint32_t flags = (uint32_t)res.axe[12] | ((uint32_t)res.axe[13] << 8) |
+                               ((uint32_t)res.axe[14] << 16) |
+                               ((uint32_t)res.axe[15] << 24);
+        AG_CHECK((flags & 2u) != 0);
+        cc_result_free(&res);
+    }
+    free(buf);
+}
+
 void run_cc_tests(void)
 {
     printf("cc\n");
@@ -81,4 +139,65 @@ void run_cc_tests(void)
                1);
     check_prog("int foo(void) { return 1; }\n", 0);
     check_prog("int ag_main(void) { return unknown; }\n", 0);
+
+    /* Multiple functions + call */
+    check_prog("int add(int a, int b) { return a + b; }\n"
+               "int ag_main(void) { return add(20, 22); }\n",
+               1);
+
+    /* Globals + array access */
+    check_prog("int g;\n"
+               "int a[4];\n"
+               "int ag_main(void) {\n"
+               "  g = 1;\n"
+               "  a[0] = 2;\n"
+               "  a[1] = a[0] + g;\n"
+               "  return a[1];\n"
+               "}\n",
+               1);
+
+    /* for loop */
+    check_prog("int ag_main(void) {\n"
+               "  int s = 0;\n"
+               "  int i;\n"
+               "  for (i = 0; i < 5; i = i + 1) { s = s + i; }\n"
+               "  return s;\n"
+               "}\n",
+               1);
+    check_prog("int ag_main(void) {\n"
+               "  int s = 0;\n"
+               "  for (int i = 0; i < 3; i = i + 1) { s = s + 1; }\n"
+               "  return s;\n"
+               "}\n",
+               1);
+
+    /* String literal present in .AXE data */
+    {
+        const char *src =
+            "int ag_main(void) {\n"
+            "  ag_gfx_acquire();\n"
+            "  ag_gfx_text(0, 0, \"HiCC\", 1, 0);\n"
+            "  ag_gfx_release();\n"
+            "  return 0;\n"
+            "}\n";
+        cc_result_t res;
+        const int rc = cc_compile_to_axe(src, strlen(src), &res);
+        AG_CHECK(rc == 0);
+        if (rc == 0) {
+            AG_CHECK(axe_contains(res.axe, res.axe_len, "HiCC"));
+            /* NEEDS_GFX flag at offset 12 */
+            const uint32_t flags = (uint32_t)res.axe[12] | ((uint32_t)res.axe[13] << 8) |
+                                   ((uint32_t)res.axe[14] << 16) |
+                                   ((uint32_t)res.axe[15] << 24);
+            AG_CHECK((flags & 2u) != 0);
+            /* abi_minor = 10 at offset 6 */
+            AG_CHECK(res.axe[6] == 10 && res.axe[7] == 0);
+            cc_result_free(&res);
+        } else {
+            printf("     string/gfx compile: %s\n", res.err);
+            cc_result_free(&res);
+        }
+    }
+
+    check_asteroids_example();
 }

@@ -1,31 +1,46 @@
-# CC — tiny C → `.AXE` on the device
+# Argon CC — tiny C → `.AXE` on the device
 
-Compiles a small subset of C to a runnable Xtensa `.AXE` without a host toolchain.
+**Argon CC** compiles a small subset of C to a runnable Xtensa `.AXE` without a
+host toolchain (image name `CC.AXE`).
 
-## Now (MVP)
+## Language
 
-- Types: `int`, `void` (return only)
-- Entry: `ag_main` only (no other functions / calls)
-- Statements: locals, assign, `return`, `if`/`else`, `while`, blocks
-- Expressions: `+ - * / %`, compares, `&& || !`, parentheses
-- Result is the process exit code (`errorlevel`)
+- Types: `int`, `void` (return / empty params)
+- Entry: `ag_main` (required). Other functions allowed; **define before use**
+- Functions: up to 4 `int` params; calls use windowed `callx8`
+- Globals (before functions): `int x;`, `int arr[N];` (int arrays only)
+- Locals: `int x`, `int arr[N]`, assign, `return`, `if`/`else`, `while`, `for`, blocks
+- `for (init; cond; step)` — init may be `int name = expr`, assignment, or empty
+- Arrays: `a[i]`, `a[i] = expr` (locals and globals)
+- Expressions: `+ - * / %`, compares, `&& || !`, parentheses, calls
+- String literals `"..."` → address (`int`), usable as builtin args
+- Result of `ag_main` is the process exit code (`errorlevel`)
 
-No preprocessor, floats, structs, pointers, or arrays yet.
+No preprocessor, floats, structs, or general pointers yet.
 
-**Pins / console / files:** not from CC yet. Generated images have a `g_ag_api`
-slot but emit no syscalls. Normal apps built with GCC + `mkaxe` can already use
-`ag_gpio_*` from [`argon.h`](../../sdk/include/argon/argon.h); CC needs ABI
-calls first (see backlog).
+Example game written in this subset: [`examples/asteroids.c`](examples/asteroids.c).
 
-## Later (backlog)
+## Builtins (ABI)
 
-Order when we return to CC (see also [`docs/04-roadmap.md`](../../docs/04-roadmap.md) §2):
+Hardcoded calls through `g_ag_api` (data slot + relocations). Using any `ag_gfx_*`
+sets `AG_AXE_NEEDS_GFX` and requires ABI minor 9.
 
-1. Multiple functions + calls (`callx`)
-2. ABI calls — print, then **GPIO** (`ag_gpio_config` / `write` / `read`)
-3. `char`, pointers, arrays
-4. `for`, globals
-5. Later still: structs, simple preprocessor, RISC-V backend
+| Builtin | Notes |
+|---------|--------|
+| `ag_delay(ms)` | `time->delay_ms` |
+| `ag_key(code)` | sticky `key_pressed` (serial; imperfect for chords) |
+| `ag_btn(id)` | **live pad** (HostFS PADPUSH): 0=up…3=right, 4=b1, 5=b2, 6=pause, 7=quit |
+| `ag_gfx_acquire()` | `gfx->acquire(NULL)` |
+| `ag_gfx_release()` | |
+| `ag_gfx_clear(c)` | |
+| `ag_gfx_flush(x,y,w,h)` | |
+| `ag_gfx_swap()` | |
+| `ag_gfx_fill_rect(x,y,w,h,color)` | |
+| `ag_gfx_text(x,y,s,fg,bg)` | `s` string literal or int pointer |
+| `ag_gfx_pixel(x,y,color)` | |
+| `ag_gfx_line(x0,y0,x1,y1,color)` | |
+| `ag_gfx_circle` / `ag_gfx_fill_circle` | |
+| `ag_gfx_poly_begin` / `vertex` / `fill` / `stroke` | Convex poly helpers |
 
 ## Build
 
@@ -38,7 +53,25 @@ python tools/mkaxe.py --arch xtensa --gcc xtensa-esp32s3-elf-gcc ^
 ## Use (QEMU)
 
 ```text
-edit t:\hi.c          # or copy via HostFS / sync
+argon run -Gfx -HostFs build\sms_share
+```
+
+Guest (`H:` = share with `CC.AXE`, `asteroids.c`, optional `ASTEROIDS.AXE`):
+
+```text
+run h:\cc.axe h:\asteroids.c h:\asteroids.axe
+run h:\asteroids.axe
+```
+
+Asteroids input is the **same HostFS PADPUSH path as SMS** (`H:\sms.pad`,
+level keys ~60 Hz). Controls (defaults in `sms.cfg`): Left/Right rotate, Up
+thrust, **Z** fire, **Esc** quit; after Game Over Z restarts. Focus the SDL
+window. Do not rely on `ag_key` sticky serial keys for play.
+
+Smaller smoke:
+
+```text
+edit t:\hi.c
 run t:\cc.axe t:\hi.c t:\hi.axe
 run t:\hi.axe
 errorlevel
@@ -47,12 +80,18 @@ errorlevel
 Example source:
 
 ```c
+int add(int a, int b)
+{
+    return a + b;
+}
+
 int ag_main(void)
 {
-    int n = 0;
-    while (n < 10) {
-        n = n + 1;
+    int s = 0;
+    int i;
+    for (i = 0; i < 10; i = i + 1) {
+        s = s + add(i, 1);
     }
-    return n;
+    return s;
 }
 ```

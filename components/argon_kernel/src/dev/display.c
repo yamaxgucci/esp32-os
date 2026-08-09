@@ -15,6 +15,7 @@
 #include <argon/board.h>
 #include <argon/console.h>
 #include <argon/device.h>
+#include <argon/draw.h>
 #include <argon/log.h>
 #include <argon/path.h>
 #include <argon/vfs.h>
@@ -227,21 +228,27 @@ static bool qemu_try_attach(uint16_t w, uint16_t h, uint16_t **out_fb)
     return true;
 }
 
-/* Colour arguments are 0x00RRGGBB. */
+#define AG_POLY_MAX_VERTS 32
+
+static ag_point_t s_poly[AG_POLY_MAX_VERTS];
+static int        s_poly_n;
+static bool       s_poly_active;
+
 static uint16_t rgb_to_565(uint32_t color)
 {
-    const uint32_t r = (color >> 16) & 0xFFu;
-    const uint32_t g = (color >> 8) & 0xFFu;
-    const uint32_t b = color & 0xFFu;
-    return (uint16_t)(((r & 0xF8u) << 8) | ((g & 0xFCu) << 3) | (b >> 3));
+    return ag_draw_rgb_to_565(color);
+}
+
+static ag_draw_surf_t draw_surf(void)
+{
+    ag_draw_surf_t s = {.pix = s_draw, .w = s_w, .h = s_h};
+    return s;
 }
 
 static void put_pixel(int32_t x, int32_t y, uint16_t c)
 {
-    if (s_draw == NULL || (uint32_t)x >= s_w || (uint32_t)y >= s_h) {
-        return;
-    }
-    s_draw[(uint32_t)y * s_w + (uint32_t)x] = c;
+    ag_draw_surf_t s = draw_surf();
+    ag_draw_pixel(&s, x, y, c);
 }
 
 static void fill_rect_raw(int32_t x, int32_t y, int32_t w, int32_t h, uint16_t c)
@@ -494,6 +501,89 @@ static void gfx_backlight(uint8_t percent)
     (void)percent; /* soft display has no backlight */
 }
 
+static void gfx_pixel(int16_t x, int16_t y, uint32_t color)
+{
+    ag_draw_surf_t s = draw_surf();
+    ag_draw_pixel(&s, x, y, rgb_to_565(color));
+}
+
+static void gfx_line(int16_t x0, int16_t y0, int16_t x1, int16_t y1,
+                     uint32_t color)
+{
+    ag_draw_surf_t s = draw_surf();
+    ag_draw_line(&s, x0, y0, x1, y1, rgb_to_565(color));
+}
+
+static void gfx_circle(int16_t cx, int16_t cy, uint16_t r, uint32_t color)
+{
+    ag_draw_surf_t s = draw_surf();
+    ag_draw_circle(&s, cx, cy, (int32_t)r, rgb_to_565(color));
+}
+
+static void gfx_fill_circle(int16_t cx, int16_t cy, uint16_t r, uint32_t color)
+{
+    ag_draw_surf_t s = draw_surf();
+    ag_draw_fill_circle(&s, cx, cy, (int32_t)r, rgb_to_565(color));
+}
+
+static void gfx_poly_begin(void)
+{
+    s_poly_n = 0;
+    s_poly_active = true;
+}
+
+static ag_err_t gfx_poly_vertex(int16_t x, int16_t y)
+{
+    if (!s_poly_active) {
+        return -AG_EINVAL;
+    }
+    if (s_poly_n >= AG_POLY_MAX_VERTS) {
+        return -AG_ENOMEM;
+    }
+    s_poly[s_poly_n].x = x;
+    s_poly[s_poly_n].y = y;
+    s_poly_n++;
+    return AG_OK;
+}
+
+static void gfx_poly_fill(uint32_t color)
+{
+    if (!s_poly_active || s_poly_n < 3) {
+        return;
+    }
+    ag_draw_surf_t s = draw_surf();
+    ag_draw_fill_convex(&s, s_poly, s_poly_n, rgb_to_565(color));
+    s_poly_active = false;
+}
+
+static void gfx_poly_stroke(uint32_t color)
+{
+    if (!s_poly_active || s_poly_n < 2) {
+        return;
+    }
+    ag_draw_surf_t s = draw_surf();
+    ag_draw_stroke_convex(&s, s_poly, s_poly_n, rgb_to_565(color));
+    s_poly_active = false;
+}
+
+static void gfx_fill_convex(const ag_point_t *pts, int32_t n, uint32_t color)
+{
+    if (pts == NULL || n < 3) {
+        return;
+    }
+    ag_draw_surf_t s = draw_surf();
+    ag_draw_fill_convex(&s, pts, (int)n, rgb_to_565(color));
+}
+
+static void gfx_stroke_convex(const ag_point_t *pts, int32_t n, uint32_t color)
+{
+    if (pts == NULL || n < 2) {
+        return;
+    }
+    ag_draw_surf_t s = draw_surf();
+    ag_draw_stroke_convex(&s, pts, (int)n, rgb_to_565(color));
+}
+
 const ag_gfx_api_t ag_gfx_api_table = {
     .size = sizeof(ag_gfx_api_t),
     .acquire = gfx_acquire,
@@ -505,6 +595,16 @@ const ag_gfx_api_t ag_gfx_api_table = {
     .blit = gfx_blit,
     .text = gfx_text,
     .backlight = gfx_backlight,
+    .pixel = gfx_pixel,
+    .line = gfx_line,
+    .circle = gfx_circle,
+    .fill_circle = gfx_fill_circle,
+    .poly_begin = gfx_poly_begin,
+    .poly_vertex = gfx_poly_vertex,
+    .poly_fill = gfx_poly_fill,
+    .poly_stroke = gfx_poly_stroke,
+    .fill_convex = gfx_fill_convex,
+    .stroke_convex = gfx_stroke_convex,
 };
 
 /* ---------------------------------------------------------------------- */
