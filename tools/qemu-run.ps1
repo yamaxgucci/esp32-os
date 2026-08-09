@@ -23,7 +23,10 @@ param(
     [switch]$Gfx,
     # Live host folder as guest H: (UART1 ↔ tools/hostfsd.py on HostFsPort).
     [string]$HostFs = '',
-    [int]$HostFsPort = 5557
+    [int]$HostFsPort = 5557,
+    # OpenEth + hostfwd (default on).  Windows connects to NetPort → guest.
+    [switch]$NoNet,
+    [int]$NetPort = 5558
 )
 
 $ErrorActionPreference = 'Stop'
@@ -39,6 +42,11 @@ Update-FlashImage
 $efuse = Initialize-EfuseFile
 
 $qemuArgs = Get-QemuMachineArgs -EfusePath $efuse
+
+if (-not $NoNet) {
+    $qemuArgs += Get-QemuNetArgs -HostPort $NetPort -GuestPort $NetPort
+    Write-Host "Net: OpenEth hostfwd 127.0.0.1:$NetPort -> guest :$NetPort"
+}
 
 if ($Sd) {
     $qemuArgs += Get-QemuSdArgs -Path $SdImage

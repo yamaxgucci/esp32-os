@@ -67,4 +67,18 @@ menu "ArgonOS"
             play in QEMU should use HostFS PADPUSH instead - that path already
             has real level state from a Win32 keyboard hook.
 
+    config ARGON_ENABLE_NET
+        bool "Networking (api->net)"
+        default y
+        select ETH_USE_OPENETH
+        help
+            Brings up a thin socket API (api->net) and, for now, the OpenCores
+            Ethernet MAC that Espressif QEMU emulates.  That is the path for
+            streaming PCM to a Windows host without the UART bottleneck.
+
+            OpenEth does not exist on a real chip: leave this on for QEMU
+            development, and turn it off (or replace the link with Wi-Fi)
+            before flashing hardware.  A failed bring-up is non-fatal; the
+            table stays present but ready() stays false.
+
 endmenu

@@ -21,6 +21,7 @@
 #include <argon/input.h>
 #include <argon/keys.h>
 #include <argon/log.h>
+#include <argon/net.h>
 #include <argon/vfs.h>
 
 #include "freertos/FreeRTOS.h"
@@ -255,6 +256,16 @@ ag_err_t ag_devices_init(void)
     err = ag_input_init();
     if (err != AG_OK) {
         return err;
+    }
+
+    /*
+     * Networking is optional and non-fatal: OpenEth only exists under QEMU.
+     * api->net is still present when the build enables it; ready() stays
+     * false until DHCP succeeds.
+     */
+    err = ag_net_init();
+    if (err != AG_OK && err != -AG_ENOSYS) {
+        ag_log(AG_LOG_WARN, "dev", "net init failed (%d)", (int)err);
     }
 
     ag_log(AG_LOG_INFO, "dev", "%u devices", (unsigned)ag_dev_count());

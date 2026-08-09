@@ -12,6 +12,7 @@
 #include <argon/display.h>
 #include <argon/kernel.h>
 #include <argon/lineedit.h>
+#include <argon/loader.h>
 #include <argon/log.h>
 #include <argon/path.h>
 #include <argon/shell.h>
@@ -633,6 +634,15 @@ ag_err_t ag_proc_spawn(const char *path, int argc, char **argv, uint32_t flags,
 
     if ((p->app.header.flags & AG_AXE_NEEDS_GFX) != 0 && !ag_display_ready()) {
         ag_log(AG_LOG_ERROR, "proc", "%s: needs a display", path);
+        ag_loader_unload(&p->app);
+        memset(p, 0, sizeof(*p));
+        unlock();
+        return -AG_ENODEV;
+    }
+
+    if ((p->app.header.flags & AG_AXE_NEEDS_NET) != 0 &&
+        ag_loader_api()->net == NULL) {
+        ag_log(AG_LOG_ERROR, "proc", "%s: needs networking", path);
         ag_loader_unload(&p->app);
         memset(p, 0, sizeof(*p));
         unlock();

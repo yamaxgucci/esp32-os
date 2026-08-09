@@ -592,6 +592,87 @@ static inline int32_t ag_btnp(int pad, int id)
                                                     : 0;
 }
 
+/* ---- net (ABI 0.12; NULL when the build has no networking) -------------- */
+
+static inline bool ag_net_is_ready(void)
+{
+    return g_ag_api->net != NULL && g_ag_api->net->ready != NULL &&
+           g_ag_api->net->ready();
+}
+
+static inline ag_err_t ag_net_wait_ready(uint32_t timeout_ms)
+{
+    if (g_ag_api->net == NULL || g_ag_api->net->wait_ready == NULL) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->net->wait_ready(timeout_ms);
+}
+
+static inline ag_err_t ag_net_ifaddr(uint32_t *addr_out)
+{
+    if (g_ag_api->net == NULL || g_ag_api->net->ifaddr == NULL) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->net->ifaddr(addr_out);
+}
+
+static inline ag_handle_t ag_tcp_listen(uint16_t port)
+{
+    if (g_ag_api->net == NULL || g_ag_api->net->tcp_listen == NULL) {
+        return (ag_handle_t)(-AG_ENOSYS);
+    }
+    return g_ag_api->net->tcp_listen(port);
+}
+
+static inline ag_handle_t ag_tcp_accept(ag_handle_t listen, uint32_t timeout_ms)
+{
+    if (g_ag_api->net == NULL || g_ag_api->net->tcp_accept == NULL) {
+        return (ag_handle_t)(-AG_ENOSYS);
+    }
+    return g_ag_api->net->tcp_accept(listen, timeout_ms);
+}
+
+static inline ag_handle_t ag_tcp_connect(uint32_t addr, uint16_t port,
+                                         uint32_t timeout_ms)
+{
+    if (g_ag_api->net == NULL || g_ag_api->net->tcp_connect == NULL) {
+        return (ag_handle_t)(-AG_ENOSYS);
+    }
+    return g_ag_api->net->tcp_connect(addr, port, timeout_ms);
+}
+
+static inline int32_t ag_net_send(ag_handle_t sock, const void *buf, size_t len)
+{
+    if (g_ag_api->net == NULL || g_ag_api->net->send == NULL) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->net->send(sock, buf, len);
+}
+
+static inline int32_t ag_net_recv(ag_handle_t sock, void *buf, size_t len)
+{
+    if (g_ag_api->net == NULL || g_ag_api->net->recv == NULL) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->net->recv(sock, buf, len);
+}
+
+static inline ag_err_t ag_net_close(ag_handle_t sock)
+{
+    if (g_ag_api->net == NULL || g_ag_api->net->close == NULL) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->net->close(sock);
+}
+
+static inline ag_err_t ag_net_set_nonblock(ag_handle_t sock, bool on)
+{
+    if (g_ag_api->net == NULL || g_ag_api->net->set_nonblock == NULL) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->net->set_nonblock(sock, on);
+}
+
 #ifdef __cplusplus
 }
 #endif

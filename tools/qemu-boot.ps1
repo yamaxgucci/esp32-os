@@ -33,7 +33,9 @@ param(
     [string]$SdImage = 'build\sdcard.img',
     # Live host folder as guest H: (UART1 ↔ hostfsd). Same helper as qemu-run.
     [string]$HostFs = '',
-    [int]$HostFsPort = 5557
+    [int]$HostFsPort = 5557,
+    [switch]$NoNet,
+    [int]$NetPort = 5558
 )
 
 $ErrorActionPreference = 'Stop'
@@ -100,6 +102,10 @@ $qemuArgs = (Get-QemuMachineArgs -EfusePath $efuse) + @(
     '-monitor', 'none'
     '-serial', "tcp:127.0.0.1:$Port,server=on,wait=on"
 )
+
+if (-not $NoNet) {
+    $qemuArgs += Get-QemuNetArgs -HostPort $NetPort -GuestPort $NetPort
+}
 
 if ($HostFs) {
     # Second -serial is UART1 (HostFS). Console stays on the first.

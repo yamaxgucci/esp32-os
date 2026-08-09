@@ -1,0 +1,270 @@
+#!/usr/bin/env python3
+"""Play a streaming WAV PCM feed from ArgonOS (MD `net` sink) over TCP.
+
+Guest listens; QEMU hostfwd maps 127.0.0.1:PORT to the guest.  Typical:
+
+  # guest:  run a:\\MD.AXE a:\\game.bin net
+  python tools/pcmplay.py
+
+A reader thread keeps the TCP window drained so the guest never blocks on send.
+Playback uses a short jitter buffer; underruns insert silence (QEMU MD is often
+far below realtime, so gaps are expected unless the emu catches up).
+"""
+
+from __future__ import annotations
+
+import argparse
+import shutil
+import socket
+import struct
+import subprocess
+import sys
+import threading
+import time
+import wave
+from pathlib import Path
+
+
+def read_exact(sock: socket.socket, n: int) -> bytes:
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise EOFError("connection closed")
+        buf.extend(chunk)
+    return bytes(buf)
+
+
+def parse_wav_header(hdr: bytes) -> tuple[int, int, int]:
+    if len(hdr) < 44 or hdr[0:4] != b"RIFF" or hdr[8:12] != b"WAVE":
+        raise ValueError("not a WAV stream")
+    channels = struct.unpack_from("<H", hdr, 22)[0]
+    rate = struct.unpack_from("<I", hdr, 24)[0]
+    bits = struct.unpack_from("<H", hdr, 34)[0]
+    if channels < 1 or rate < 1 or bits != 16:
+        raise ValueError(f"unsupported WAV: ch={channels} rate={rate} bits={bits}")
+    return rate, channels, bits
+
+
+class PcmRing:
+    """Thread-safe byte ring for PCM (int16 interleaved)."""
+
+    def __init__(self, capacity: int) -> None:
+        self._buf = bytearray()
+        self._cap = capacity
+        self._cv = threading.Condition()
+        self._closed = False
+        self.dropped = 0
+
+    def close(self) -> None:
+        with self._cv:
+            self._closed = True
+            self._cv.notify_all()
+
+    def write(self, data: bytes) -> None:
+        if not data:
+            return
+        with self._cv:
+            if self._closed:
+                return
+            self._buf.extend(data)
+            overflow = len(self._buf) - self._cap
+            if overflow > 0:
+                # Drop oldest to keep latency bounded.
+                del self._buf[:overflow]
+                self.dropped += overflow
+            self._cv.notify_all()
+
+    def read(self, n: int, timeout: float | None = None) -> bytes:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        with self._cv:
+            while len(self._buf) < n and not self._closed:
+                if deadline is None:
+                    self._cv.wait()
+                else:
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        break
+                    self._cv.wait(timeout=left)
+            take = min(n, len(self._buf))
+            out = bytes(self._buf[:take])
+            del self._buf[:take]
+            return out
+
+    def available(self) -> int:
+        with self._cv:
+            return len(self._buf)
+
+
+def reader_thread(sock: socket.socket, ring: PcmRing) -> None:
+    try:
+        while True:
+            chunk = sock.recv(8192)
+            if not chunk:
+                break
+            ring.write(chunk)
+    except OSError:
+        pass
+    finally:
+        ring.close()
+
+
+def play_sounddevice(sock: socket.socket, rate: int, channels: int) -> None:
+    import sounddevice as sd
+
+    frame_bytes = channels * 2
+    # ~750 ms capacity; prebuffer ~120 ms before starting.
+    ring = PcmRing(capacity=rate * frame_bytes * 3 // 4)
+    prebuffer = rate * frame_bytes * 12 // 100
+    chunk = max(frame_bytes * (rate // 40), frame_bytes * 128)  # ~25 ms
+
+    t = threading.Thread(target=reader_thread, args=(sock, ring), daemon=True)
+    t.start()
+
+    print(f"buffering ~{prebuffer // frame_bytes} samples...", flush=True)
+    while ring.available() < prebuffer and t.is_alive():
+        time.sleep(0.01)
+
+    print(f"playing {rate} Hz, {channels} ch (sounddevice). Ctrl+C to stop.")
+    silence = bytes(chunk)
+    with sd.RawOutputStream(
+        samplerate=rate,
+        channels=channels,
+        dtype="int16",
+        blocksize=0,
+    ) as stream:
+        while True:
+            data = ring.read(chunk, timeout=0.05)
+            if not data:
+                if not t.is_alive() and ring.available() == 0:
+                    break
+                stream.write(silence)
+                continue
+            rem = len(data) % frame_bytes
+            if rem:
+                data = data[:-rem]
+            if data:
+                stream.write(data)
+
+
+def play_ffplay(sock: socket.socket, rate: int, channels: int) -> None:
+    ffplay = shutil.which("ffplay")
+    if not ffplay:
+        raise SystemExit("ffplay not found on PATH")
+    hdr = bytearray(44)
+    hdr[0:4] = b"RIFF"
+    struct.pack_into("<I", hdr, 4, 0x7FFFFFFF)
+    hdr[8:12] = b"WAVE"
+    hdr[12:16] = b"fmt "
+    struct.pack_into("<I", hdr, 16, 16)
+    struct.pack_into("<H", hdr, 20, 1)
+    struct.pack_into("<H", hdr, 22, channels)
+    struct.pack_into("<I", hdr, 24, rate)
+    struct.pack_into("<I", hdr, 28, rate * channels * 2)
+    struct.pack_into("<H", hdr, 32, channels * 2)
+    struct.pack_into("<H", hdr, 34, 16)
+    hdr[36:40] = b"data"
+    struct.pack_into("<I", hdr, 40, 0x7FFFFFFF)
+
+    cmd = [ffplay, "-nodisp", "-autoexit", "-loglevel", "warning", "-i", "pipe:0"]
+    print(f"playing via ffplay ({rate} Hz, {channels} ch). Ctrl+C to stop.")
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+    assert proc.stdin is not None
+    try:
+        proc.stdin.write(hdr)
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            proc.stdin.write(chunk)
+    finally:
+        try:
+            proc.stdin.close()
+        except OSError:
+            pass
+        proc.wait(timeout=5)
+
+
+def save_wav(sock: socket.socket, rate: int, channels: int, path: Path) -> None:
+    print(f"recording to {path} (Ctrl+C to stop)...")
+    with wave.open(str(path), "wb") as wf:
+        wf.setnchannels(channels)
+        wf.setsampwidth(2)
+        wf.setframerate(rate)
+        try:
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                if len(chunk) & 1:
+                    chunk = chunk[:-1]
+                wf.writeframes(chunk)
+        except KeyboardInterrupt:
+            print("stopped.")
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--port", type=int, default=5558)
+    ap.add_argument("--ffplay", action="store_true", help="use ffplay instead of sounddevice")
+    ap.add_argument("--save", type=Path, help="write PCM to a WAV file instead of playing")
+    ap.add_argument("--retries", type=int, default=60, help="connect attempts (1/s)")
+    args = ap.parse_args()
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    # Large host recv buffer so guest non-blocking sends rarely drop.
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 256 * 1024)
+
+    last_err: Exception | None = None
+    for i in range(max(1, args.retries)):
+        try:
+            sock.connect((args.host, args.port))
+            last_err = None
+            break
+        except OSError as e:
+            last_err = e
+            if i + 1 < args.retries:
+                print(f"waiting for guest on {args.host}:{args.port}...", flush=True)
+                time.sleep(1)
+    if last_err is not None:
+        print(f"connect failed: {last_err}", file=sys.stderr)
+        print(
+            "Start QEMU, then in guest: run a:\\MD.AXE rom.bin net",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        hdr = read_exact(sock, 44)
+        rate, channels, _bits = parse_wav_header(hdr)
+        print(f"connected: {rate} Hz, {channels} ch")
+        if args.save:
+            save_wav(sock, rate, channels, args.save)
+        elif args.ffplay:
+            play_ffplay(sock, rate, channels)
+        else:
+            try:
+                play_sounddevice(sock, rate, channels)
+            except ImportError:
+                print(
+                    "sounddevice missing; install with:\n"
+                    '  "D:\\Espressif\\tools\\python_env\\idf5.5_py3.12_env\\Scripts\\python.exe"'
+                    " -m pip install sounddevice\n"
+                    "or use --ffplay",
+                    file=sys.stderr,
+                )
+                return 1
+    except KeyboardInterrupt:
+        print("\nstopped.")
+    except Exception as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    finally:
+        sock.close()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

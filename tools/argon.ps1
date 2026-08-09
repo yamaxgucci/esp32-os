@@ -26,6 +26,9 @@ ArgonOS
                            pushes SMS pad (~60 Hz) when sms.cfg is present
   argon run -tcp           run in QEMU, console on 127.0.0.1:5556
                            (connect with PuTTY in Raw mode)
+  argon run                (default) also OpenEth hostfwd 127.0.0.1:5558
+  argon run -NoNet         skip the virtual NIC
+  python tools/pcmplay.py  play guest PCM streamed to :5558 (MD `net`)
   argon run -Share DIR     pack DIR into build\sdcard.img and boot with A:
   argon sync DIR           rebuild build\sdcard.img from a Windows folder
                            (FAT16 snapshot; then: argon run -Sd)
@@ -194,6 +197,11 @@ switch ($Command.ToLowerInvariant()) {
                 $i++
             } elseif ($a -match '^(?i)-NoBuild$') {
                 $runOpts['NoBuild'] = $true
+            } elseif ($a -match '^(?i)-NoNet$') {
+                $runOpts['NoNet'] = $true
+            } elseif ($a -match '^(?i)-NetPort$' -and ($i + 1) -lt $Rest.Count) {
+                $runOpts['NetPort'] = [int]$Rest[$i + 1]
+                $i++
             } elseif ($a -match '^(?i)-Port$' -and ($i + 1) -lt $Rest.Count) {
                 $runOpts['Port'] = [int]$Rest[$i + 1]
                 $i++

@@ -69,7 +69,7 @@ if (AG_HAS(ag_api()->inp, key_pressed)) { ... }   /* есть ли вызов в
 | [`io`](#io--железо-напрямую) | ⚠ | GPIO, прерывания, I2C, SPI, UART, PWM; `adc_read` — `NULL` без `CONFIG_ARGON_ENABLE_ADC` |
 | [`gfx`](#gfx--графика) | ✅ | soft RGB565 framebuffer; панели SPI — позже |
 | `cfg` | ⬜ `NULL` | доступ к `SYSTEM.CFG` из приложения |
-| `net` | ⬜ `NULL` | сеть — фаза 3 |
+| `net` | ✅ 0.12 | TCP listen/accept/connect/send/recv (OpenEth в QEMU; `ARGON_ENABLE_NET`) |
 
 ## Версии и проверка возможностей
 
