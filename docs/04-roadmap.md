@@ -573,10 +573,10 @@ MQTT, Modbus TCP, OTA. Подтаблица `api->net` перестаёт быт
    [`07-emulator-performance.md`](07-emulator-performance.md). Сделано в тот же
    день: ✅ замеры и починка пути вывода на SMS, ✅ арена 192 КБ вместо
    `hot_text`, ✅ gwenesis как `MD.AXE` в mute, ✅ ввод через pad layer,
-   ✅ ROM Alex Kidd, ✅ Ofast на VDP + cycle tables в `AG_HOT_RODATA` + `setjmp`
-   раз за кадр (~190 КБ кода, Alex Kidd ~200% realtime в QEMU). Осталось:
-   разбор стартовых кадров, звук как Z80+`ag_fm`+PSG на том же ядре и
-   `audio`/I2S, замеры на плате
+   ✅ ROM Alex Kidd, ✅ Ofast на VDP + `setjmp` раз за кадр, ✅ звук:
+   Z80(SMS)+`ag_fm`+PSG на том же ядре, WAV/mock (~169 КБ кода, Alex Kidd
+   ~125% realtime с звуком в QEMU). Осталось: стартовые кадры, `audio`/I2S,
+   тембр FM, замеры на плате
 9. **HostFS: надёжный `copy` больших файлов на `H:`** — сейчас крупные записи
    (сотни КБ, напр. `sms.wav`) у пользователя дают `no space left` / обрыв при
    живом PADPUSH; обход: `a:\…` + `argon get`. Нужно добить протокол/hostfsd

@@ -117,8 +117,23 @@
  *      to a detailed description by Sean Young which can be found at:
  *      http://www.msxnet.org/tech/z80-documented.pdf
  *****************************************************************************/
+#ifdef ARGON_MD_Z80
+/*
+ * Mega Drive builds the same core without the SMS shared.h world, and need
+ * function-pointer memory (YM2612 / bank window are not plain pages).  The
+ * gwenesis host API also owns the name z80_execute(target), so this TU's
+ * relative-cycle entry is renamed.
+ */
+#include <stdint.h>
+#include <string.h>
+#include "z80.h"
+#define z80_execute sms_z80_execute
+uint8_t argon_z80_read(uint16_t address);
+void    argon_z80_write(uint16_t address, uint8_t data);
+#else
 #include "shared.h"
 #include "z80.h"
+#endif
 
 #undef INLINE
 #define INLINE static __inline__
@@ -141,9 +156,15 @@ uint8_t (*cpu_readport16)(uint16_t port);
    the CMOS Z80, so until knowing (most) Z80 types on hardware, it's disabled */
 #define HAS_LDAIR_QUIRK     0
 
+#ifdef ARGON_MD_Z80
+#define cpu_readmem16(a) argon_z80_read((uint16_t)(a))
+#define cpu_readop(a) argon_z80_read((uint16_t)(a))
+#define cpu_readop_arg(a) argon_z80_read((uint16_t)(a))
+#else
 #define cpu_readmem16(a) cpu_readmap[(a) >> 10][(a) & 0x03FF]
 #define cpu_readop(a) cpu_readmap[(a) >> 10][(a) & 0x03FF]
 #define cpu_readop_arg(a) cpu_readmap[(a) >> 10][(a) & 0x03FF]
+#endif
 
 /****************************************************************************/
 /* The Z80 registers. halt is set to 1 when the CPU is halted, the refresh  */
@@ -3447,6 +3468,12 @@ void z80_init(int32_t (*irqcallback)(int32_t))
 	memset(&Z80, 0, sizeof(Z80));
 	Z80.irq_callback = irqcallback;
 	
+#ifdef ARGON_MD_Z80
+	/* Mega Drive: cold Z80 after 68k releases RESET. */
+	IX = IY = 0xffff;
+	F = ZF;
+	SP = 0;
+#else
 	/* TODO
 	* For Colecovision, we need to check for the Z80 registers.
 	* Unfortunately, there are not a lot of test ROMs for the Colecovision.
@@ -3474,6 +3501,7 @@ void z80_init(int32_t (*irqcallback)(int32_t))
 	{
 		SP = 0;
 	}
+#endif
 	
 	/* setup cycle tables */
 	cc[Z80_TABLE_op] = cc_op;

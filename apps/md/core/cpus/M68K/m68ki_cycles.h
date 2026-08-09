@@ -1,10 +1,8 @@
 /*
- * ArgonOS: 64 KB of per-opcode cycle counts, touched on every instruction.
- * Keep them in the code arena (internal SRAM) rather than PSRAM.
+ * Cycle counts used to live in AG_HOT_RODATA (~64 KB in the arena).  Sound
+ * needs that room for the SMS Z80 core, so these sit in ordinary .rodata
+ * (PSRAM) again until the arena grows or hot_text lands.
  */
-#if ARGON_TARGET
-AG_HOT_RODATA
-#endif
 static const unsigned char m68ki_cycles[] =
 {
     8*7,   8*7,   8*7,   8*7,   8*7,   8*7,   8*7,   8*7,   0*7,   0*7,   0*7,   0*7,   0*7,   0*7,   0*7,   0*7, 
