@@ -53,4 +53,18 @@ menu "ArgonOS"
             out and io->adc_read is NULL.  Turn this on for a real board, where
             the calibration works, and expect QEMU to stop booting.
 
+    config ARGON_CONSOLE_KEY_EVENTS
+        bool "Request key-up events from the terminal"
+        default n
+        help
+            On console attach, ask the host terminal for a keyboard protocol
+            that reports key releases (kitty CSI u with event types, and
+            Windows Terminal win32-input-mode).  The decoder already understands
+            those sequences; this only sends the enable request.
+
+            Classic cmd.exe and PuTTY ignore the request, so leave this off
+            unless the console is Windows Terminal, kitty, or WezTerm.  Emulator
+            play in QEMU should use HostFS PADPUSH instead - that path already
+            has real level state from a Win32 keyboard hook.
+
 endmenu

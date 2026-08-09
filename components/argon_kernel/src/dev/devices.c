@@ -18,6 +18,7 @@
 #include <argon/devfs.h>
 #include <argon/device.h>
 #include <argon/display.h>
+#include <argon/input.h>
 #include <argon/keys.h>
 #include <argon/log.h>
 #include <argon/vfs.h>
@@ -246,6 +247,12 @@ ag_err_t ag_devices_init(void)
 
     /* Soft RGB565 framebuffer (or later a panel driver).  BOARD.CFG sizes it. */
     err = ag_display_init();
+    if (err != AG_OK) {
+        return err;
+    }
+
+    /* Pad layer and /dev/joy0.  HostFS PADPUSH is one source into it. */
+    err = ag_input_init();
     if (err != AG_OK) {
         return err;
     }

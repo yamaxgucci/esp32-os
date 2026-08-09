@@ -103,11 +103,12 @@ argon flash -port COM5   прошить настоящую плату
 | Устройства как файлы | `src/dev/devfs.c` | ✅ `/dev` — диск `D:`, одна таблица дескрипторов с файлами |
 | Встроенные устройства | `src/dev/devices.c`, `storage.c` | ✅ `null zero con flash0 sd0 fb0`, команда `dev` |
 | Soft display / `gfx` | `src/dev/display.c`, `draw.c`, `font8x16.c` | ✅ RGB565 front+back (640×400), `double_buf`/`swap`, dirty-rect `flush`, ABI **0.9** soft-draw (`pixel`/`line`/`circle`/`poly_*`/`fill_convex`), `gfxdump`, `apps/gfxdemo`; QEMU RGB (`argon run -Gfx`) |
-| Master System `.AXE` | `apps/sms/` (SMS Plus GX, GPLv2+) | ✅ play + PADPUSH; рендер **прямо в back-буфер `gfx`** без промежуточного кадра, `stats` печатает % realtime, `fps30` делит показ; PSG+FM→WAV/mock (`ag_fm`, не `ym2413.c`); realtime audio — позже (I2S на плате или host-player в QEMU) |
-| Mega Drive `.AXE` | `apps/md/` (gwenesis, GPLv3 + Musashi MIT) | ⚠ mute: 68000 + VDP, рендер прямо в back-буфер, клавиатура и host-pad, `stats`/`fps30`. Звуковой блок (Z80 + YM2612 + PSG) заглушен в `port/md_mute.c` и не компилируется — в том числе потому, что Z80 Фаязуллина запрещено распространять коммерчески. 129 КБ кода в арене 192 КБ, 61 643 релокации. Не проверен на настоящем ROM; лицензии — в [`apps/md/README.md`](../apps/md/README.md) |
+| Soft input / `joy0` | `src/dev/input.c` | ✅ слой pad: PADPUSH → `/dev/joy0` + `inp->pad`/`btn`/`btnp` (ABI 0.11), снимок 6 байт; `H:\sms.pad` — совместимость |
+| Master System `.AXE` | `apps/sms/` (SMS Plus GX, GPLv2+) | ✅ play + `ag_btnp` / PADPUSH; рендер **прямо в back-буфер `gfx`** без промежуточного кадра, `stats` печатает % realtime, `fps30` делит показ; PSG+FM→WAV/mock (`ag_fm`, не `ym2413.c`); realtime audio — позже (I2S на плате или host-player в QEMU) |
+| Mega Drive `.AXE` | `apps/md/` (gwenesis, GPLv3 + Musashi MIT) | ⚠ mute: 68000 + VDP, рендер прямо в back-буфер, `ag_btnp` (A/B/C/Start) + host PADPUSH, `stats`/`fps30`. Звуковой блок заглушен в `port/md_mute.c`. 129 КБ кода в арене 192 КБ. Проверен на Alex Kidd в QEMU; лицензии — в [`apps/md/README.md`](../apps/md/README.md) |
 | Владение пинами | `src/dev/ioclaim.c` | ✅ пины системы, занятые пины, возврат за упавшим процессом |
 | Железо напрямую | `src/dev/io.c` | ✅ GPIO, ISR, I2C, SPI, UART, PWM; команда `io`, скан I2C |
-| Таблица ABI | `src/loader/api.c` | ⚠ 0.10: `inp->btn`/`pad` (PADPUSH), `gfx` draw; `cfg`/`net` — `NULL` |
+| Таблица ABI | `src/loader/api.c` | ⚠ 0.11: `inp->btnp`, расширенный `ag_btn`, `pad` hi-байты; `gfx` draw; `cfg`/`net` — `NULL` |
 | Загрузчик `.SYS` | `src/loader/module.c` | ✅ `ag_driver_init`, резидент, `drv`, стадия `modules`, пример `apps/echo` |
 | Probe I2C | `src/loader/probe.c` | ✅ `modules.probe`, `drv probe`, `ag_probe_hint`, пример `apps/whoami` |
 

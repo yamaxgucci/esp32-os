@@ -17,6 +17,7 @@
 #include <argon/device.h>
 #include <argon/display.h>
 #include <argon/hostfs.h>
+#include <argon/input.h>
 #include <argon/kernel.h>
 #include <argon/keys.h>
 #include <argon/loader.h>
@@ -516,45 +517,14 @@ static void api_inp_flush(void) { ag_console_flush_input(); }
 static uint16_t api_inp_mods(void) { return ag_console_mods(); }
 
 /*
- * Same level-state path SMS uses: HostFS PADPUSH cache (H:\sms.pad).  Stale or
- * missing pad → 0 so callers can fall back to sticky keys.
+ * Level state from the input layer (HostFS PADPUSH is one source).  Stale or
+ * missing → 0 so callers can fall back to sticky keys via btn/btnp.
  */
-static uint32_t api_inp_pad(int which)
-{
-    uint8_t snap[3];
-    if (which < 0 || which > 2) {
-        return 0;
-    }
-    if (!ag_hostfs_pad_peek(snap, 250u)) {
-        return 0;
-    }
-    return snap[which];
-}
+static uint32_t api_inp_pad(int which) { return ag_input_pad_byte(which); }
 
-static int32_t api_inp_btn(int id)
-{
-    static const uint8_t k_pad_bit[6] = {0x01, 0x02, 0x04, 0x08, 0x10, 0x20};
-    static const uint8_t k_sys_bit[2] = {0x01, 0x02}; /* pause, quit */
-    /* Sticky fallback HID (sms.cfg defaults): arrows, Z/X, Enter, Esc. */
-    static const uint16_t k_hid[8] = {
-        AG_KEY_UP, AG_KEY_DOWN, AG_KEY_LEFT, AG_KEY_RIGHT,
-        AG_KEY_Z, AG_KEY_X, AG_KEY_ENTER, AG_KEY_ESC,
-    };
+static int32_t api_inp_btn(int id) { return ag_input_btnp(0, id); }
 
-    if (id < 0 || id > 7) {
-        return 0;
-    }
-
-    uint8_t snap[3];
-    if (ag_hostfs_pad_peek(snap, 250u)) {
-        if (id <= 5) {
-            return (snap[0] & k_pad_bit[id]) != 0 ? 1 : 0;
-        }
-        return (snap[2] & k_sys_bit[id - 6]) != 0 ? 1 : 0;
-    }
-
-    return ag_console_key_pressed(k_hid[id]) ? 1 : 0;
-}
+static int32_t api_inp_btnp(int pad, int id) { return ag_input_btnp(pad, id); }
 
 static const ag_inp_api_t k_inp = {
     .size = sizeof(ag_inp_api_t),
@@ -564,6 +534,7 @@ static const ag_inp_api_t k_inp = {
     .mods = api_inp_mods,
     .pad = api_inp_pad,
     .btn = api_inp_btn,
+    .btnp = api_inp_btnp,
 };
 
 /* ---------------------------------------------------------------------- */

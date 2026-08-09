@@ -106,12 +106,13 @@ run a:\MD.AXE a:\game.bin
 | `stats` | print fps, per-frame split (emu / show), max, and **% realtime** every 2 s and at exit |
 | `fps30` | emulate all 60 frames, rasterise and show every second one |
 | `fps60` | show every frame (default) |
-| `livepad` / `nolivepad` | use `H:\sms.pad` host push, or serial keys only |
+| `livepad` / `nolivepad` | live pad via `inp->btnp` (HostFS PADPUSH), or serial sticky only |
 
-Keys: arrows, `Z` = A, `X` = B, `C` = C, Enter = Start, Esc or `Q` quits. Serial
-has no key-up, so a held button expires after a second. The host pad is the file
-hostfsd already serves (`/sms.pad`); its two buttons map to A and B and its pause
-bit to Start.
+Keys (with `-HostFs` and `sms.cfg`): arrows, `Z` = A, `X` = B, `C` = C,
+Enter = Start, Esc quits. That path is real level state from a Win32 keyboard
+hook, so directions and buttons can be held. `nolivepad` forces serial sticky
+keys: the terminal has no key-up, so a held button expires quickly — a degraded
+reserve, not for play.
 
 Save states are accepted and silently discarded — the cores can serialise
 themselves, but nothing writes the bytes yet.

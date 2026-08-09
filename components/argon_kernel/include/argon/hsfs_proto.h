@@ -31,9 +31,14 @@ enum hsfs_op {
     HSFS_OP_READ = 6,
     HSFS_OP_CLOSE = 7,
     /*
-     * Host → guest only (no request).  data_len == 3: pad0, pad1, sys.
+     * Host → guest only (no request).  Pad snapshot:
+     *   data_len == 3 (legacy): pad0, pad1, sys
+     *   data_len == 6:          pad0, pad1, sys, pad0hi, pad1hi, ver
+     * pad0/pad1 bits: UP DOWN LEFT RIGHT B1 B2.
+     * hi bits:        C START X Y Z MODE.
+     * sys bits:       PAUSE/START(compat) QUIT.
      * Guest demuxes these while waiting for RPC replies and in an idle
-     * drain task so SMS can read a RAM cache without a UART round-trip.
+     * drain task; the input layer caches them for inp->pad /joy0.
      */
     HSFS_OP_PADPUSH = 8,
     /*

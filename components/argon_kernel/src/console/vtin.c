@@ -19,6 +19,19 @@ static void ev_key(ag_event_t *ev, uint16_t keycode, uint32_t unicode,
     ev->key.mods = mods;
 }
 
+static void ev_key_typed(ag_event_t *ev, ag_event_type_t type, uint16_t keycode,
+                         uint32_t unicode, uint16_t mods)
+{
+    memset(ev, 0, sizeof(*ev));
+    ev->type = type;
+    ev->key.keycode = keycode;
+    ev->key.unicode = unicode;
+    ev->key.mods = mods;
+    if (type == AG_EV_KEY_UP) {
+        ev->key.unicode = 0; /* release carries no character */
+    }
+}
+
 uint16_t ag_key_from_ascii(char c, uint16_t *mods)
 {
     uint16_t m = 0;
@@ -100,6 +113,7 @@ bool ag_vtin_busy(const ag_vtin_t *in)
 
 typedef struct {
     int32_t value[AG_VTIN_MAX_PARAMS];
+    int32_t event; /* kitty/win32 event type after ':', -1 if absent */
     uint8_t count;
     char    prefix; /* '?', '<', '>' or 0 */
 } csi_params_t;
@@ -110,6 +124,7 @@ static void parse_params(const char *seq, uint8_t len, csi_params_t *out)
     for (uint8_t i = 0; i < AG_VTIN_MAX_PARAMS; i++) {
         out->value[i] = -1;
     }
+    out->event = -1;
 
     uint8_t i = 0;
     if (len > 0 && (seq[0] == '?' || seq[0] == '<' || seq[0] == '>')) {
@@ -117,9 +132,17 @@ static void parse_params(const char *seq, uint8_t len, csi_params_t *out)
         i = 1;
     }
 
+    bool in_event = false;
     for (; i < len; i++) {
         const char c = seq[i];
         if (c >= '0' && c <= '9') {
+            if (in_event) {
+                const int32_t base = (out->event < 0) ? 0 : out->event;
+                if (base < 1000000) {
+                    out->event = base * 10 + (c - '0');
+                }
+                continue;
+            }
             if (out->count == 0) {
                 out->count = 1;
             }
@@ -128,7 +151,16 @@ static void parse_params(const char *seq, uint8_t len, csi_params_t *out)
             if (base < 1000000) {
                 *p = base * 10 + (c - '0');
             }
+        } else if (c == ':') {
+            /*
+             * Kitty keyboard protocol: modifiers:event-type as a sub-parameter
+             * of the second field.  Digits after ':' are the event type
+             * (1=press, 2=repeat, 3=release), not more of the modifier value.
+             */
+            in_event = true;
+            out->event = 0;
         } else if (c == ';') {
+            in_event = false;
             if (out->count == 0) {
                 out->count = 1;
             }
@@ -258,8 +290,9 @@ static bool handle_csi(ag_vtin_t *in, char final, ag_event_t *ev)
 
     case 'u': {
         /*
-         * The "CSI u" encoding modern terminals use for combinations the
-         * legacy scheme cannot express, such as Ctrl+Enter.
+         * CSI u: xterm modifyOtherKeys, and kitty's keyboard protocol.
+         * Kitty adds an event type after a colon on the modifiers field
+         * (1=press, 2=repeat, 3=release).  Without a colon this is a press.
          */
         const int32_t cp = param(&p, 0, -1);
         if (cp < 0) {
@@ -284,7 +317,69 @@ static bool handle_csi(ag_vtin_t *in, char final, ag_event_t *ev)
         const uint32_t unicode = (m & (AG_MOD_CTRL | AG_MOD_ALT))
                                      ? 0
                                      : (uint32_t)cp;
-        ev_key(ev, k, unicode, (uint16_t)(m | (base_mods & AG_MOD_SHIFT)));
+        const uint16_t mods = (uint16_t)(m | (base_mods & AG_MOD_SHIFT));
+        if (p.event == 3) {
+            ev_key_typed(ev, AG_EV_KEY_UP, k, 0, mods);
+        } else {
+            /* press (1), repeat (2), or legacy with no event field */
+            ev_key_typed(ev, AG_EV_KEY_DOWN, k, unicode, mods);
+            if (p.event == 2) {
+                ev->key.repeat = true;
+            }
+        }
+        return true;
+    }
+
+    case '_': {
+        /*
+         * Windows Terminal win32-input-mode:
+         * CSI Vk ; Sc ; Uc ; Kd ; Cs ; Rc _
+         * Kd is 1 for key-down and 0 for key-up.
+         */
+        const int32_t vk = param(&p, 0, -1);
+        const int32_t uc = param(&p, 2, 0);
+        const int32_t kd = param(&p, 3, 1);
+        if (vk < 0) {
+            return false;
+        }
+        uint16_t k = AG_KEY_NONE;
+        uint16_t base_mods = 0;
+        if (vk >= 0x41 && vk <= 0x5A) {
+            k = (uint16_t)(AG_KEY_A + (vk - 0x41));
+        } else if (vk >= 0x30 && vk <= 0x39) {
+            k = (vk == 0x30) ? AG_KEY_0
+                             : (uint16_t)(AG_KEY_1 + (vk - 0x31));
+        } else {
+            switch (vk) {
+            case 0x08: k = AG_KEY_BACKSPACE; break;
+            case 0x09: k = AG_KEY_TAB; break;
+            case 0x0D: k = AG_KEY_ENTER; break;
+            case 0x1B: k = AG_KEY_ESC; break;
+            case 0x20: k = AG_KEY_SPACE; break;
+            case 0x25: k = AG_KEY_LEFT; break;
+            case 0x26: k = AG_KEY_UP; break;
+            case 0x27: k = AG_KEY_RIGHT; break;
+            case 0x28: k = AG_KEY_DOWN; break;
+            case 0x2D: k = AG_KEY_INSERT; break;
+            case 0x2E: k = AG_KEY_DELETE; break;
+            case 0x24: k = AG_KEY_HOME; break;
+            case 0x23: k = AG_KEY_END; break;
+            case 0x21: k = AG_KEY_PAGEUP; break;
+            case 0x22: k = AG_KEY_PAGEDOWN; break;
+            default:
+                if (uc >= 0x20 && uc < 0x7f) {
+                    k = ag_key_from_ascii((char)uc, &base_mods);
+                }
+                break;
+            }
+        }
+        if (k == AG_KEY_NONE) {
+            return false;
+        }
+        const uint32_t unicode =
+            (kd != 0 && uc >= 0x20 && uc < 0x7f) ? (uint32_t)uc : 0u;
+        ev_key_typed(ev, (kd != 0) ? AG_EV_KEY_DOWN : AG_EV_KEY_UP, k, unicode,
+                     base_mods);
         return true;
     }
 

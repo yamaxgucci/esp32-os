@@ -9,6 +9,12 @@
 
 #include <argon/codepage.h>
 
+#include "sdkconfig.h"
+
+#ifndef CONFIG_ARGON_CONSOLE_KEY_EVENTS
+#define CONFIG_ARGON_CONSOLE_KEY_EVENTS 0
+#endif
+
 /*
  * The PC attribute byte orders colours blue-first, ANSI orders them red-first.
  * The permutation happens to be its own inverse, so the same table converts in
@@ -295,6 +301,16 @@ void ag_vtout_hello(ag_vtout_t *o, ag_vt_sink_fn sink, void *ctx)
 
     /* Reset attributes, enable autowrap, clear, home. */
     emit_str(&e, "\x1b[0m\x1b[?7h\x1b[2J\x1b[H");
+#if CONFIG_ARGON_CONSOLE_KEY_EVENTS
+    /*
+     * Ask the host terminal for key-release reports.  Kitty: progressive
+     * enhancement flags 1|2 (disambiguate + event types).  Windows Terminal:
+     * win32-input-mode.  Classic cmd/PuTTY ignore both; leave the Kconfig
+     * off unless the console is a terminal that understands them.
+     */
+    emit_str(&e, "\x1b[>3u");
+    emit_str(&e, "\x1b[?9001h");
+#endif
     emit_drain(&e);
 
     ag_vtout_init(o);

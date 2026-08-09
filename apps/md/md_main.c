@@ -51,18 +51,25 @@ extern void m68k_frame_end(int master_cycles);
 static int s_ox;
 static int s_oy;
 
-/* Input, same two paths as SMS: host-pushed level state, or sticky serial keys.
- * The pad file is the one hostfsd already serves (PAD_VPATH = /sms.pad). */
-static ag_handle_t s_host_pad = -1;
-static int         s_use_host_pad;
+/*
+ * Input: prefer the kernel pad layer (HostFS PADPUSH → inp->btnp).  That is
+ * real level state, so directions and A+B+C can be held.  `nolivepad` forces
+ * the serial sticky path, which has no key-up and is only a degraded reserve.
+ */
+static int s_use_live_pad = 1;
 
-#define PAD_HOLD_MS 1000u
+#define PAD_HOLD_MS 150u /* matches console sticky TTL; serial has no key-up */
 #define MD_BUTTONS 8
 static uint32_t s_pad_until[MD_BUTTONS];
 
-/* h:\sms.pad bit order is up, down, left, right, button1, button2. */
-static const int k_host_bit_to_pad[6] = {
-    PAD_UP, PAD_DOWN, PAD_LEFT, PAD_RIGHT, PAD_A, PAD_B,
+static const struct {
+    int ag;
+    int md;
+} k_live_map[] = {
+    {AG_BTN_UP, PAD_UP}, {AG_BTN_DOWN, PAD_DOWN},
+    {AG_BTN_LEFT, PAD_LEFT}, {AG_BTN_RIGHT, PAD_RIGHT},
+    {AG_BTN_B1, PAD_A}, {AG_BTN_B2, PAD_B}, {AG_BTN_C, PAD_C},
+    {AG_BTN_START, PAD_S},
 };
 
 static int key_to_pad(uint16_t keycode)
@@ -223,48 +230,23 @@ static unsigned char *load_rom_file(const char *path, size_t *size_out)
     return buf;
 }
 
-static void try_open_host_pad(void)
+static void poll_pad_live(void)
 {
-    for (int i = 0; i < 40; i++) {
-        s_host_pad = ag_open("h:\\sms.pad", AG_O_RDONLY);
-        if (s_host_pad >= 0) {
-            s_use_host_pad = 1;
-            ag_printf("md: live pad H:\\sms.pad (host push)\n");
-            return;
+    for (unsigned i = 0; i < sizeof(k_live_map) / sizeof(k_live_map[0]); i++) {
+        if (ag_btnp(0, k_live_map[i].ag)) {
+            gwenesis_io_pad_press_button(0, k_live_map[i].md);
+        } else {
+            gwenesis_io_pad_release_button(0, k_live_map[i].md);
         }
-        ag_delay(25);
     }
-    ag_printf("md: no H:\\sms.pad - serial sticky keys\n");
+    /* Old 3-byte hosts only have sys.pause; btnp(START) already ORs that in. */
+    if (ag_btnp(0, AG_BTN_QUIT)) {
+        ag_exit(0);
+    }
 }
 
-static void poll_pad(void)
+static void poll_pad_serial(void)
 {
-    if (s_use_host_pad) {
-        /* Guest VFS reports the file as 3 bytes; rewind so each frame re-reads
-         * the PADPUSH cache instead of hitting EOF. */
-        uint8_t buf[3];
-        if (ag_seek(s_host_pad, 0, AG_SEEK_SET) >= 0 &&
-            ag_read(s_host_pad, buf, 3) >= 2) {
-            for (unsigned i = 0; i < 6u; i++) {
-                if ((buf[0] & (uint8_t)(1u << i)) != 0u) {
-                    gwenesis_io_pad_press_button(0, k_host_bit_to_pad[i]);
-                } else {
-                    gwenesis_io_pad_release_button(0, k_host_bit_to_pad[i]);
-                }
-            }
-            if ((buf[2] & 1u) != 0u) {
-                gwenesis_io_pad_press_button(0, PAD_S);
-            } else {
-                gwenesis_io_pad_release_button(0, PAD_S);
-            }
-            if ((buf[2] & 2u) != 0u) {
-                ag_exit(0);
-            }
-            return;
-        }
-        s_use_host_pad = 0; /* host went away; fall through to keys */
-    }
-
     ag_event_t ev;
     while (ag_poll_event(&ev, 0)) {
         if (ev.type != AG_EV_KEY_DOWN && ev.type != AG_EV_KEY_UP) {
@@ -294,6 +276,15 @@ static void poll_pad(void)
             gwenesis_io_pad_release_button(0, b);
         }
     }
+}
+
+static void poll_pad(void)
+{
+    if (s_use_live_pad) {
+        poll_pad_live();
+        return;
+    }
+    poll_pad_serial();
 }
 
 /* The cores call this when the 68000 reads the pad port; our state is already
@@ -421,8 +412,11 @@ int ag_main(int argc, char **argv)
     power_on();
     reset_emulation();
 
-    if (want_livepad) {
-        try_open_host_pad();
+    s_use_live_pad = want_livepad;
+    if (s_use_live_pad) {
+        ag_printf("md: controls = live pad (inp / HostFS PADPUSH)\n");
+    } else {
+        ag_printf("md: controls = serial sticky (no key-up)\n");
     }
 
     ag_printf("md: %dx%d at %d,%d, rom %u KB, present every %d frame(s)\n",
@@ -481,9 +475,6 @@ int ag_main(int argc, char **argv)
                      emu_sum, present_sum, work_max);
     }
     ag_printf("md: %d frames\n", ran);
-    if (s_host_pad >= 0) {
-        ag_close(s_host_pad);
-    }
     ag_gfx_release();
     return 0;
 }
