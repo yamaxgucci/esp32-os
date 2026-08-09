@@ -18,6 +18,9 @@ void md_sound_begin_frame(int lines_per_frame);
 void md_sound_line(int line, int lines_per_frame);
 void md_sound_end_frame(void);
 
+/* Per-frame YM clock/buffer reset (native YM); no-op-ish for ag_fm. */
+void md_ym_frame_begin(int lines_per_frame);
+
 /* Chip fronts call these when registers change; samples are produced in md_sound_line. */
 void md_ym_render(int16_t *left, int16_t *right, int samples);
 void md_psg_render(int16_t *left, int16_t *right, int samples);

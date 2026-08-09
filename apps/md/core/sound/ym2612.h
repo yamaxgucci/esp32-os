@@ -16,6 +16,11 @@
 #ifndef _H_YM2612_
 #define _H_YM2612_
 
+#if ARGON_TARGET
+#define GWENESIS_YM2612_BUF_LEN 1024
+void YM2612SetSampleDivisor(int div);
+#endif
+
 extern int16_t gwenesis_ym2612_buffer[];
 extern int ym2612_index;
 extern int ym2612_clock;

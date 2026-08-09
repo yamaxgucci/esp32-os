@@ -16,6 +16,7 @@
 #include "gwenesis_vdp.h"
 #include "m68k.h"
 #include "md_sound.h"
+#include "ym2612.h"
 #include "z80inst.h"
 
 /* 24 KB stack: with OpenEth/lwIP the largest internal free block is ~31 KB. */
@@ -371,6 +372,8 @@ resume_m68k:
         }
 
         if (s_run_sound) {
+            /* Catch YM up to the line clock before draining samples. */
+            ym2612_run(system_clock);
             md_sound_line(scan_line, lines_per_frame);
         }
         if (profile) {

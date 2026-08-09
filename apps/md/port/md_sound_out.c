@@ -351,6 +351,7 @@ void md_sound_begin_frame(int lines_per_frame)
         s_frame_samples = MD_SOUND_MAX_FRAME;
     }
     s_emitted = 0;
+    md_ym_frame_begin(s_lines);
 }
 
 void md_sound_line(int line, int lines_per_frame)

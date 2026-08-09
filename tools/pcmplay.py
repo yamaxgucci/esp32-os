@@ -5,6 +5,8 @@ Guest listens; QEMU hostfwd maps 127.0.0.1:PORT to the guest.  Typical:
 
   # guest:  run a:\\MD.AXE a:\\game.bin net
   python tools/pcmplay.py
+  python tools/pcmplay.py --record build/md_agfm.wav   # play + WAV
+  python tools/pcmplay.py --save build/md_only.wav     # WAV only
 
 A reader thread keeps the TCP window drained so the guest never blocks on send.
 Playback uses a short jitter buffer; underruns insert silence (QEMU MD is often
@@ -96,12 +98,43 @@ class PcmRing:
             return len(self._buf)
 
 
-def reader_thread(sock: socket.socket, ring: PcmRing) -> None:
+class WavRecorder:
+    """Append raw s16 PCM; finalize WAV sizes on close."""
+
+    def __init__(self, path: Path, rate: int, channels: int) -> None:
+        self.path = path
+        self._wf = wave.open(str(path), "wb")
+        self._wf.setnchannels(channels)
+        self._wf.setsampwidth(2)
+        self._wf.setframerate(rate)
+        self._lock = threading.Lock()
+        self._bytes = 0
+
+    def write(self, data: bytes) -> None:
+        if not data:
+            return
+        if len(data) & 1:
+            data = data[:-1]
+        with self._lock:
+            self._wf.writeframes(data)
+            self._bytes += len(data)
+
+    def close(self) -> None:
+        with self._lock:
+            self._wf.close()
+        print(f"wrote {self.path} ({self._bytes} bytes PCM)", flush=True)
+
+
+def reader_thread(
+    sock: socket.socket, ring: PcmRing, rec: WavRecorder | None = None
+) -> None:
     try:
         while True:
             chunk = sock.recv(8192)
             if not chunk:
                 break
+            if rec is not None:
+                rec.write(chunk)
             ring.write(chunk)
     except OSError:
         pass
@@ -109,7 +142,9 @@ def reader_thread(sock: socket.socket, ring: PcmRing) -> None:
         ring.close()
 
 
-def play_sounddevice(sock: socket.socket, rate: int, channels: int) -> None:
+def play_sounddevice(
+    sock: socket.socket, rate: int, channels: int, rec: WavRecorder | None = None
+) -> None:
     import sounddevice as sd
 
     frame_bytes = channels * 2
@@ -118,7 +153,9 @@ def play_sounddevice(sock: socket.socket, rate: int, channels: int) -> None:
     prebuffer = rate * frame_bytes * 12 // 100
     chunk = max(frame_bytes * (rate // 40), frame_bytes * 128)  # ~25 ms
 
-    t = threading.Thread(target=reader_thread, args=(sock, ring), daemon=True)
+    t = threading.Thread(
+        target=reader_thread, args=(sock, ring, rec), daemon=True
+    )
     t.start()
 
     print(f"buffering ~{prebuffer // frame_bytes} samples...", flush=True)
@@ -147,7 +184,9 @@ def play_sounddevice(sock: socket.socket, rate: int, channels: int) -> None:
                 stream.write(data)
 
 
-def play_ffplay(sock: socket.socket, rate: int, channels: int) -> None:
+def play_ffplay(
+    sock: socket.socket, rate: int, channels: int, rec: WavRecorder | None = None
+) -> None:
     ffplay = shutil.which("ffplay")
     if not ffplay:
         raise SystemExit("ffplay not found on PATH")
@@ -176,6 +215,8 @@ def play_ffplay(sock: socket.socket, rate: int, channels: int) -> None:
             chunk = sock.recv(4096)
             if not chunk:
                 break
+            if rec is not None:
+                rec.write(chunk)
             proc.stdin.write(chunk)
     finally:
         try:
@@ -187,20 +228,17 @@ def play_ffplay(sock: socket.socket, rate: int, channels: int) -> None:
 
 def save_wav(sock: socket.socket, rate: int, channels: int, path: Path) -> None:
     print(f"recording to {path} (Ctrl+C to stop)...")
-    with wave.open(str(path), "wb") as wf:
-        wf.setnchannels(channels)
-        wf.setsampwidth(2)
-        wf.setframerate(rate)
-        try:
-            while True:
-                chunk = sock.recv(4096)
-                if not chunk:
-                    break
-                if len(chunk) & 1:
-                    chunk = chunk[:-1]
-                wf.writeframes(chunk)
-        except KeyboardInterrupt:
-            print("stopped.")
+    rec = WavRecorder(path, rate, channels)
+    try:
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            rec.write(chunk)
+    except KeyboardInterrupt:
+        print("stopped.")
+    finally:
+        rec.close()
 
 
 def main() -> int:
@@ -208,9 +246,21 @@ def main() -> int:
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=5558)
     ap.add_argument("--ffplay", action="store_true", help="use ffplay instead of sounddevice")
-    ap.add_argument("--save", type=Path, help="write PCM to a WAV file instead of playing")
+    ap.add_argument(
+        "--save",
+        type=Path,
+        help="write PCM to a WAV file instead of playing",
+    )
+    ap.add_argument(
+        "--record",
+        type=Path,
+        help="while playing, also write the same PCM to a WAV file",
+    )
     ap.add_argument("--retries", type=int, default=60, help="connect attempts (1/s)")
     args = ap.parse_args()
+    if args.save and args.record:
+        print("use either --save or --record, not both", file=sys.stderr)
+        return 2
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -236,32 +286,40 @@ def main() -> int:
         )
         return 1
 
+    rec: WavRecorder | None = None
     try:
         hdr = read_exact(sock, 44)
         rate, channels, _bits = parse_wav_header(hdr)
         print(f"connected: {rate} Hz, {channels} ch")
         if args.save:
             save_wav(sock, rate, channels, args.save)
-        elif args.ffplay:
-            play_ffplay(sock, rate, channels)
         else:
-            try:
-                play_sounddevice(sock, rate, channels)
-            except ImportError:
-                print(
-                    "sounddevice missing; install with:\n"
-                    '  "D:\\Espressif\\tools\\python_env\\idf5.5_py3.12_env\\Scripts\\python.exe"'
-                    " -m pip install sounddevice\n"
-                    "or use --ffplay",
-                    file=sys.stderr,
-                )
-                return 1
+            if args.record:
+                args.record.parent.mkdir(parents=True, exist_ok=True)
+                rec = WavRecorder(args.record, rate, channels)
+                print(f"recording to {args.record}", flush=True)
+            if args.ffplay:
+                play_ffplay(sock, rate, channels, rec)
+            else:
+                try:
+                    play_sounddevice(sock, rate, channels, rec)
+                except ImportError:
+                    print(
+                        "sounddevice missing; install with:\n"
+                        '  "D:\\Espressif\\tools\\python_env\\idf5.5_py3.12_env\\Scripts\\python.exe"'
+                        " -m pip install sounddevice\n"
+                        "or use --ffplay",
+                        file=sys.stderr,
+                    )
+                    return 1
     except KeyboardInterrupt:
         print("\nstopped.")
     except Exception as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
     finally:
+        if rec is not None:
+            rec.close()
         sock.close()
     return 0
 

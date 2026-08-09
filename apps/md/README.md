@@ -17,10 +17,11 @@ is written down here.
 | `core/cpus/M68K` | MIT | Musashi by Karl Stenerud. See below |
 | Z80 | BSD-3-Clause | linked from `apps/sms/core/z80` (MAME), not Fayzullin |
 | PSG | GPLv2+ | SMS `sn76489.c` (CrabEmu) behind gwenesis SN76489 names |
-| `ag_fm` | Apache-2.0 | `apps/common/fm` — approximate FM, not a real YM2612 |
+| `ag_fm` | Apache-2.0 | `apps/common/fm` — OPN 4-op + sin/TL lite FM, default `MD.AXE` |
+| `core/sound/ym2612.c` | GPLv3 (MAME/Genesis Plus GX lineage) | only in comparison build `MDYM.AXE` |
 | `md_main.c`, `md_cfg.h`, `port/` | Apache-2.0 | ours |
 | Z80 (`Z80.c` by Marat Fayzullin) | **not vendored** | commercial distribution forbidden |
-| `core/sound/ym2612.c`, `gwenesis_sn76489.c` | **not compiled** | present for reference / fallback only |
+| `gwenesis_sn76489.c` | **not compiled** | PSG is SMS `sn76489.c` instead |
 
 Two things to know about the two CPU cores gwenesis bundles.
 
@@ -68,6 +69,11 @@ SMS Z80 (`apps/sms/core/z80/z80.c`): under `ARGON_MD_Z80`, skip SMS `shared.h`,
 use `argon_z80_read`/`write` for the MD map, and rename the relative-cycle
 `z80_execute` to `sms_z80_execute` so it does not clash with `z80inst.h`.
 
+`sound/ym2612.c` (only linked into `MDYM.AXE`): `Ofast` and 22050 Hz sample
+divisor under `ARGON_TARGET`; buffer clamp; host-generated `tl`/`sin`/LFO tables
+(`ym2612_tables_argon.inc`) instead of `libm` at init; save-state helpers live
+in `port/md_ym_native.c`.
+
 ## Build
 
 ```
@@ -93,9 +99,43 @@ python tools/mkaxe.py --arch xtensa --gcc xtensa-esp32s3-elf-gcc `
 built for ArgonOS (see `md_cfg.h`). `-DARGON_MD_Z80` selects the MD memory path
 in the shared SMS Z80. `--libs c` is for `setjmp` (68000 address error).
 
-The image is **~170 KB of code** in the 192 KB arena and asks for a **24 KB**
-stack (OpenEth/lwIP leave a ~31 KB largest internal free block). Cycle tables
-stay in ordinary `.rodata` (PSRAM) so the Z80 fits; put them back in
+### Native YM2612 comparison (`MDYM.AXE`)
+
+Same app, but FM comes from vendored `ym2612.c` instead of `ag_fm`. Use this to
+A/B listen over `net` / `pcmplay.py`. Sin/pow tables are host-generated
+(`tools/gen_ym2612_tables.py` → `ym2612_tables_argon.inc`) so we do not need
+`libm`. Heavier CPU — expect lower % realtime.
+
+```
+python tools/mkaxe.py --arch xtensa --gcc xtensa-esp32s3-elf-gcc `
+  --include sdk/include --include apps/common/libc --include apps/md `
+  --include apps/md/port --include apps/md/core/bus --include apps/md/core/cpus/M68K `
+  --include apps/md/core/vdp --include apps/md/core/io `
+  --include apps/md/core/savestate --include apps/md/core/sound `
+  --include apps/sms/core/z80 --include apps/sms/core/sound `
+  --cflags "-Os -ffunction-sections -fdata-sections -fno-builtin -include md_cfg.h -DARGON_MD_Z80 -DLSB_FIRST -Wno-unused -Wno-sign-compare" `
+  --libs c -o build/MDYM.AXE `
+  apps/md/md_main.c `
+  apps/md/port/md_z80.c apps/md/port/md_ym_native.c apps/md/port/md_psg.c `
+  apps/md/port/md_sound_out.c apps/md/port/md_savestate_stub.c `
+  apps/common/libc/libc_shim.c `
+  apps/sms/core/z80/z80.c apps/sms/core/sound/sn76489.c `
+  apps/md/core/sound/ym2612.c `
+  apps/md/core/bus/gwenesis_bus.c apps/md/core/cpus/M68K/m68kcpu.c `
+  apps/md/core/vdp/gwenesis_vdp_gfx.c apps/md/core/vdp/gwenesis_vdp_mem.c `
+  apps/md/core/io/gwenesis_io.c apps/md/core/savestate/gwenesis_savestate.c
+```
+
+Then copy `build/MDYM.AXE` beside `MD.AXE` and compare:
+
+```
+run a:\MD.AXE a:\game.bin net      # lite FM
+run a:\MDYM.AXE a:\game.bin net    # native YM2612
+```
+
+The image is **~170 KB of code** (`MD.AXE`) in the 192 KB arena and asks for a
+**24 KB** stack (OpenEth/lwIP leave a ~31 KB largest internal free block). Cycle
+tables stay in ordinary `.rodata` (PSRAM) so the Z80 fits; put them back in
 `AG_HOT_RODATA` only if the arena grows.
 
 ## Run
@@ -116,6 +156,8 @@ Realtime audio over the QEMU OpenEth NIC (not UART):
 argon run -Sd -Gfx -HostFs build\md_share
 # guest waits after: run a:\MD.AXE a:\game.bin net
 python tools/pcmplay.py                 # or: python tools/pcmplay.py --ffplay
+python tools/pcmplay.py --record build\md_agfm.wav   # play + save
+python tools/pcmplay.py --save build\md_only.wav     # save, no speakers
 ```
 
 `argon run` enables `hostfwd` on `127.0.0.1:5558` by default. Use `net:PORT` on the guest and `-NetPort PORT` on the host if you change it.
@@ -151,5 +193,9 @@ The image has to be a **raw** cartridge dump, whatever it is called: a 68000
 vector table at 0 and `SEGA` in the header. Interleaved Super Magic Drive files
 are not supported.
 
-YM2612 timbre is approximate (six one-op voices + DAC in `ag_fm`). PSG uses the
-same integer core as SMS. Native `ym2612.c` remains a measured fallback.
+Default `MD.AXE` YM is lite `ag_fm` OPN: 4 operators, ALG 0–7, FB, sin/TL
+tables (`ag_fm_ym_tables.inc` from `tools/gen_ym2612_tables.py`), simplified
+EG (no DT/LFO/SSG), pitch matched to `MDYM.AXE` by ear, −6 dB mix pad.
+`MDYM.AXE` remains the chip-accurate A/B reference (`net` +
+`pcmplay.py --record`). FM drums should stay percussive rather than a squeak;
+DAC/PCM on ch6 is a separate path. PSG matches SMS.
