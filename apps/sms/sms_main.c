@@ -41,18 +41,15 @@ static int s_ox;
 static int s_oy;
 
 /*
- * Preferred input: host-pushed live pad (H:\sms.pad via HostFS PADPUSH).
- * That is level-state Win32 keys — diagonals and move+fire work, no UART
- * round-trip per frame (guest reads a RAM cache).
+ * Preferred input: kernel pad layer (HostFS PADPUSH → inp->btnp).  Real level
+ * state, so diagonals and move+fire work with no per-frame file I/O.
  *
- * Fallback: serial KEY_DOWN sticky keys.  Terminals have no KEY_UP and OS
- * autorepeat only refreshes the last key; we keep bits for PAD_HOLD_MS after
- * any mapped KEY_DOWN (refreshes all currently held bits).
+ * `nolivepad` forces serial KEY_DOWN sticky keys.  Terminals have no KEY_UP,
+ * so that path is a degraded reserve only.
  */
-static ag_handle_t s_host_pad = -1;
-static int         s_use_host_pad;
+static int s_use_live_pad = 1;
 
-#define PAD_HOLD_MS 1000u
+#define PAD_HOLD_MS 150u /* matches console sticky TTL */
 static uint32_t s_pad_until[2][6]; /* millis deadline per bit */
 static uint8_t  s_pause_ttl;
 
@@ -260,44 +257,6 @@ static void bind_frame_to_fb(const ag_gfxinfo_t *info)
     bitmap.viewport.h = VIDEO_HEIGHT_SMS;
 }
 
-static void try_open_host_pad(void)
-{
-    /* Host starts PADPUSH on connect; wait briefly for the first snapshot. */
-    for (int i = 0; i < 40; i++) {
-        s_host_pad = ag_open("h:\\sms.pad", AG_O_RDONLY);
-        if (s_host_pad >= 0) {
-            s_use_host_pad = 1;
-            ag_printf("sms: live pad H:\\sms.pad (host push)\n");
-            return;
-        }
-        ag_delay(25);
-    }
-    ag_printf("sms: no H:\\sms.pad — serial sticky keys\n");
-}
-
-static int poll_host_pad(uint8_t *pad0, uint8_t *pad1, uint8_t *sys)
-{
-    if (!s_use_host_pad || s_host_pad < 0) {
-        return 0;
-    }
-    /*
-     * Guest VFS treats the file as size 3; after one read pos==EOF.  Rewind
-     * each frame.  Reads hit the PADPUSH RAM cache (no UART round-trip).
-     */
-    if (ag_seek(s_host_pad, 0, AG_SEEK_SET) < 0) {
-        return 0;
-    }
-    uint8_t buf[3];
-    const int32_t n = ag_read(s_host_pad, buf, 3);
-    if (n < 2) {
-        return 0;
-    }
-    *pad0 = buf[0];
-    *pad1 = buf[1];
-    *sys = (n >= 3) ? buf[2] : 0;
-    return 1;
-}
-
 static void refresh_held(int pad)
 {
     const uint32_t until = ag_millis() + PAD_HOLD_MS;
@@ -396,48 +355,40 @@ static void poll_pad_events(void)
     }
 }
 
+static void poll_pad_live(void)
+{
+    static const int     k_ids[6] = {AG_BTN_UP,    AG_BTN_DOWN, AG_BTN_LEFT,
+                                     AG_BTN_RIGHT, AG_BTN_B1,   AG_BTN_B2};
+    static const uint8_t k_bits[6] = {INPUT_UP,    INPUT_DOWN, INPUT_LEFT,
+                                      INPUT_RIGHT, INPUT_BUTTON1, INPUT_BUTTON2};
+    uint8_t p0 = 0;
+    uint8_t p1 = 0;
+    for (unsigned i = 0; i < 6u; i++) {
+        if (ag_btnp(0, k_ids[i])) {
+            p0 |= k_bits[i];
+        }
+        if (ag_btnp(1, k_ids[i])) {
+            p1 |= k_bits[i];
+        }
+    }
+    input.pad[0] = p0;
+    input.pad[1] = p1;
+    if (ag_btnp(0, AG_BTN_PAUSE) || ag_btnp(1, AG_BTN_PAUSE)) {
+        input.system |= (uint8_t)INPUT_PAUSE;
+    } else {
+        input.system &= (uint8_t)~INPUT_PAUSE;
+    }
+    if (ag_btnp(0, AG_BTN_QUIT) || ag_btnp(1, AG_BTN_QUIT)) {
+        ag_exit(0);
+    }
+}
+
 static void poll_pad(void)
 {
-    uint8_t host0 = 0;
-    uint8_t host1 = 0;
-    uint8_t host_sys = 0;
-    int     got_host = 0;
-
-    if (s_use_host_pad) {
-        got_host = poll_host_pad(&host0, &host1, &host_sys);
-        if (!got_host) {
-            s_use_host_pad = 0;
-        }
-    }
-
-    if (got_host) {
-        /* Level state from host — replace sticky bits for both pads. */
-        input.pad[0] = host0;
-        input.pad[1] = host1;
-        if ((host_sys & 1u) != 0u) {
-            input.system |= (uint8_t)INPUT_PAUSE;
-        } else {
-            input.system &= (uint8_t)~INPUT_PAUSE;
-        }
-        if ((host_sys & 2u) != 0u) {
-            ag_exit(0);
-        }
-        /* Still drain serial so Esc/Quit from terminal works if mapped. */
-        ag_event_t ev;
-        while (ag_poll_event(&ev, 0)) {
-            if (ev.type != AG_EV_KEY_DOWN) {
-                continue;
-            }
-            int pad = 0;
-            int act = 0;
-            if (sms_cfg_lookup(&s_cfg, ev.key.keycode, &pad, &act) &&
-                act == SMS_ACT_QUIT) {
-                ag_exit(0);
-            }
-        }
+    if (s_use_live_pad) {
+        poll_pad_live();
         return;
     }
-
     poll_pad_events();
 }
 
@@ -563,10 +514,11 @@ int ag_main(int argc, char **argv)
     bind_frame_to_fb(&info);
 
     sms_cfg_load(&s_cfg, rom);
-    if (want_livepad && !force_sticky) {
-        try_open_host_pad();
+    s_use_live_pad = (want_livepad && !force_sticky) ? 1 : 0;
+    if (s_use_live_pad) {
+        ag_printf("sms: controls = live pad (inp / HostFS PADPUSH)\n");
     } else {
-        ag_printf("sms: controls = serial sticky\n");
+        ag_printf("sms: controls = serial sticky (no key-up)\n");
     }
 
     if (!load_cart(rom)) {
@@ -646,9 +598,6 @@ int ag_main(int argc, char **argv)
     ag_printf("sms: %d frames, cart %u KB crc=%08x\n", ran,
               (unsigned)(cart.size / 1024u), (unsigned)cart.crc);
     Sound_Close();
-    if (s_host_pad >= 0) {
-        ag_close(s_host_pad);
-    }
     ag_gfx_release();
     system_poweroff();
     return 0;

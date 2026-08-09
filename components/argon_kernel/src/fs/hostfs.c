@@ -9,6 +9,7 @@
 #include <string.h>
 
 #include <argon/hsfs_proto.h>
+#include <argon/input.h>
 #include <argon/log.h>
 #include <argon/vfs.h>
 
@@ -43,7 +44,7 @@ static bool              s_uart_up;
 static bool              s_mounted;
 static uint16_t          s_seq;
 
-static uint8_t  s_pad[3];
+static uint8_t  s_pad[AG_PAD_BYTES];
 static uint32_t s_pad_ms; /* esp_timer ms of last PADPUSH; 0 = never */
 static TaskHandle_t s_pad_task;
 
@@ -84,10 +85,12 @@ static void pad_store(const uint8_t *blob, uint32_t len)
     if (blob == NULL || len < 2u) {
         return;
     }
-    s_pad[0] = blob[0];
-    s_pad[1] = blob[1];
-    s_pad[2] = (len >= 3u) ? blob[2] : 0;
+    memset(s_pad, 0, sizeof(s_pad));
+    const uint32_t n = (len > AG_PAD_BYTES) ? AG_PAD_BYTES : len;
+    memcpy(s_pad, blob, n);
     s_pad_ms = now_ms();
+    /* Input layer is what apps and /dev/joy0 read; we stay a source. */
+    ag_input_push_pad(s_pad, AG_PAD_BYTES);
 }
 
 static bool ingest_padpush_locked(const hsfs_hdr_t *hdr, uint32_t timeout_ms)
@@ -419,7 +422,7 @@ static ag_err_t hs_stat(void *ctx, const char *rel, ag_stat_t *out)
             return -AG_ENOENT; /* host not pushing (no --pad-cfg) */
         }
         memset(out, 0, sizeof(*out));
-        out->size = 3;
+        out->size = AG_PAD_BYTES;
         out->attr = AG_A_READONLY;
         return AG_OK;
     }
@@ -521,7 +524,7 @@ static ag_err_t hs_open(void *ctx, const char *rel, uint32_t flags, void **file)
         }
         pf->host_h = 0;
         pf->pos = 0;
-        pf->size = 3;
+        pf->size = AG_PAD_BYTES;
         pf->is_pad = true;
         pf->writable = false;
         *file = pf;
@@ -578,15 +581,15 @@ static int32_t hs_read(void *ctx, void *file, void *buf, size_t len)
     if (f->is_pad) {
         /* Live snapshot from host PADPUSH; rewind is local (see hs_seek). */
         pad_drain_once();
-        uint8_t snap[3];
+        uint8_t snap[AG_PAD_BYTES];
         if (!ag_hostfs_pad_peek(snap, 250)) {
             /* No recent push — zeros (keys up), not a hard error. */
             memset(snap, 0, sizeof(snap));
         }
-        if (f->pos >= 3u) {
+        if (f->pos >= AG_PAD_BYTES) {
             return 0;
         }
-        const size_t avail = 3u - (size_t)f->pos;
+        const size_t avail = AG_PAD_BYTES - (size_t)f->pos;
         const size_t n = (len < avail) ? len : avail;
         memcpy(buf, snap + (size_t)f->pos, n);
         f->pos += n;
@@ -767,7 +770,7 @@ ag_err_t ag_hostfs_try_mount(void)
 
 bool ag_hostfs_mounted(void) { return s_mounted; }
 
-bool ag_hostfs_pad_peek(uint8_t out[3], uint32_t max_age_ms)
+bool ag_hostfs_pad_peek(uint8_t out[6], uint32_t max_age_ms)
 {
     if (out == NULL || s_pad_ms == 0u) {
         return false;
@@ -778,8 +781,6 @@ bool ag_hostfs_pad_peek(uint8_t out[3], uint32_t max_age_ms)
             return false;
         }
     }
-    out[0] = s_pad[0];
-    out[1] = s_pad[1];
-    out[2] = s_pad[2];
+    memcpy(out, s_pad, AG_PAD_BYTES);
     return true;
 }

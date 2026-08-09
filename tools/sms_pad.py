@@ -51,15 +51,31 @@ NAME_TO_HID = {
     "KPDIV": 0x54,
 }
 
+# Low byte of each pad (bytes 0 / 1 of the snapshot).
 ACT_BIT = {
     "UP": 0x01, "DOWN": 0x02, "LEFT": 0x04, "RIGHT": 0x08,
     "B1": 0x10, "BUTTON1": 0x10, "B2": 0x20, "BUTTON2": 0x20,
+    # Aliases used by Mega Drive configs.
+    "A": 0x10, "B": 0x20,
+}
+
+# High byte of each pad (bytes 3 / 4).  START here is the dedicated button;
+# padN.pause still sets the sys pause bit for SMS / old guests.
+ACT_BIT_HI = {
+    "C": 0x01,
+    "START": 0x02,
+    "X": 0x04,
+    "Y": 0x08,
+    "Z": 0x10,
+    "MODE": 0x20,
 }
 
 ACT_SYS = {
-    "PAUSE": 0x01, "START": 0x01,
+    "PAUSE": 0x01,  # also treated as Start by Mega Drive for 3-byte hosts
     "QUIT": 0x02, "EXIT": 0x02,
 }
+
+PAD_VER = 1
 
 DEFAULTS = """\
 pad0.up=UP
@@ -68,6 +84,8 @@ pad0.left=LEFT
 pad0.right=RIGHT
 pad0.b1=Z
 pad0.b2=X
+pad0.c=C
+pad0.start=ENTER
 pad0.pause=ENTER
 pad0.quit=ESC
 pad1.up=W
@@ -76,6 +94,8 @@ pad1.left=A
 pad1.right=D
 pad1.b1=J
 pad1.b2=K
+pad1.c=L
+pad1.start=P
 pad1.pause=P
 pad1.quit=Q
 """
@@ -103,11 +123,23 @@ LowLevelKeyboardProc = ctypes.WINFUNCTYPE(
 )
 
 
-def load_binds(path: Path | None) -> tuple[list[tuple[int, int, int]], list[tuple[int, int]]]:
+def load_binds(
+    path: Path | None,
+) -> tuple[
+    list[tuple[int, int, int]],
+    list[tuple[int, int, int]],
+    list[tuple[int, int]],
+]:
+    """Return (lo_binds, hi_binds, sys_binds).
+
+    lo/hi entries are (pad, vk, bit); sys entries are (vk, bit).  An old
+    sms.cfg without c/start/x/y/z/mode still loads; those bits stay zero.
+    """
     text = DEFAULTS
     if path is not None and path.is_file():
         text = path.read_text(encoding="utf-8", errors="replace")
     pad_binds: list[tuple[int, int, int]] = []
+    hi_binds: list[tuple[int, int, int]] = []
     sys_binds: list[tuple[int, int]] = []
     for raw in text.splitlines():
         line = raw.split("#", 1)[0].strip()
@@ -127,13 +159,15 @@ def load_binds(path: Path | None) -> tuple[list[tuple[int, int, int]], list[tupl
             continue
         if act in ACT_BIT:
             pad_binds.append((pad, vk, ACT_BIT[act]))
+        elif act in ACT_BIT_HI:
+            hi_binds.append((pad, vk, ACT_BIT_HI[act]))
         elif act in ACT_SYS:
             sys_binds.append((vk, ACT_SYS[act]))
-    return pad_binds, sys_binds
+    return pad_binds, hi_binds, sys_binds
 
 
 class PadState:
-    """Live 3-byte pad snapshot: pad0, pad1, sys(pause|quit).
+    """Live 6-byte pad snapshot: pad0, pad1, sys, pad0hi, pad1hi, ver.
 
     QEMU/SDL on Windows installs a low-level keyboard hook when the display
     grabs input; GetAsyncKeyState alone often stays zero.  We keep our own
@@ -141,9 +175,9 @@ class PadState:
     """
 
     def __init__(self, cfg_path: Path | None) -> None:
-        self.pad_binds, self.sys_binds = load_binds(cfg_path)
+        self.pad_binds, self.hi_binds, self.sys_binds = load_binds(cfg_path)
         self.lock = threading.Lock()
-        self.bytes = bytes([0, 0, 0])
+        self.bytes = bytes([0, 0, 0, 0, 0, PAD_VER])
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._down: set[int] = set()
@@ -204,17 +238,32 @@ class PadState:
                 self._user32.TranslateMessage(ctypes.byref(msg))
                 self._user32.DispatchMessageW(ctypes.byref(msg))
 
-            p0 = p1 = sysb = 0
+            p0 = p1 = sysb = p0h = p1h = 0
             for pad, vk, bit in self.pad_binds:
                 if self._key_down(vk):
                     if pad == 0:
                         p0 |= bit
                     else:
                         p1 |= bit
+            for pad, vk, bit in self.hi_binds:
+                if self._key_down(vk):
+                    if pad == 0:
+                        p0h |= bit
+                    else:
+                        p1h |= bit
             for vk, bit in self.sys_binds:
                 if self._key_down(vk):
                     sysb |= bit
-            blob = bytes((p0 & 0xFF, p1 & 0xFF, sysb & 0xFF))
+            blob = bytes(
+                (
+                    p0 & 0xFF,
+                    p1 & 0xFF,
+                    sysb & 0xFF,
+                    p0h & 0xFF,
+                    p1h & 0xFF,
+                    PAD_VER,
+                )
+            )
             with self.lock:
                 self.bytes = blob
             time.sleep(0.004)

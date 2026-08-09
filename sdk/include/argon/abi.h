@@ -45,9 +45,11 @@ extern "C" {
  *     primitives, and built-in 8x16 text.
  * 0.9 added soft-draw: pixel/line/circle/fill_circle/poly_* / fill_convex.
  * 0.10 appended inp->btn / inp->pad: HostFS PADPUSH live buttons (SMS/Asteroids).
+ * 0.11 appended inp->btnp and extended ag_btn (C/START/X/Y/Z/MODE); pad()
+ *      also returns high bytes (which 3/4).  Input layer + /dev/joy0.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 10u
+#define AG_ABI_MINOR 11u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -377,18 +379,25 @@ typedef struct {
 } ag_event_t;
 
 /*
- * HostFS PADPUSH / H:\sms.pad button ids for inp->btn (level state, not edges).
- * Bits match SMS pad0: UP DOWN LEFT RIGHT B1 B2; then PAUSE/QUIT from sys byte.
+ * Button ids for inp->btn / btnp (level state, not edges).
+ * Low six match the classic pad0/pad1 byte; PAUSE/QUIT are sys bits.
+ * C..MODE live in the high byte of the 6-byte PADPUSH snapshot (ABI 0.11).
  */
 enum ag_btn {
     AG_BTN_UP = 0,
     AG_BTN_DOWN = 1,
     AG_BTN_LEFT = 2,
     AG_BTN_RIGHT = 3,
-    AG_BTN_B1 = 4,    /* fire / confirm — sms.cfg pad0.b1 */
-    AG_BTN_B2 = 5,
+    AG_BTN_B1 = 4, /* fire / A — sms.cfg pad0.b1 */
+    AG_BTN_B2 = 5, /* B */
     AG_BTN_PAUSE = 6,
     AG_BTN_QUIT = 7,
+    AG_BTN_C = 8,
+    AG_BTN_START = 9,
+    AG_BTN_X = 10,
+    AG_BTN_Y = 11,
+    AG_BTN_Z = 12,
+    AG_BTN_MODE = 13,
 };
 
 typedef struct ag_inp_api {
@@ -400,12 +409,15 @@ typedef struct ag_inp_api {
     bool (*key_pressed)(uint16_t keycode);
     uint16_t (*mods)(void);
     /*
-     * Live pad byte: which 0=pad0, 1=pad1, 2=sys.  From HostFS PADPUSH cache;
-     * 0 if HostFS pad is missing/stale.  Prefer btn() from games/CC.
+     * Live pad byte from the input layer (HostFS PADPUSH today):
+     * which 0=pad0, 1=pad1, 2=sys, 3=pad0hi, 4=pad1hi.
+     * 0 if the snapshot is missing/stale.  Prefer btn()/btnp() from games.
      */
     uint32_t (*pad)(int which);
-    /* Level button: 1 if held.  PADPUSH when available, else sticky key_pressed. */
+    /* Level button on pad 0: 1 if held.  Live pad when available, else sticky. */
     int32_t (*btn)(int id);
+    /* Level button on pad 0 or 1 (ABI 0.11).  Same fallback rules as btn(). */
+    int32_t (*btnp)(int pad, int id);
 } ag_inp_api_t;
 
 /* ------------------------------------------------------------------------ */

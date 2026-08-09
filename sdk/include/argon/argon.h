@@ -559,7 +559,10 @@ static inline bool ag_key(uint16_t keycode)
     }
     return g_ag_api->inp->key_pressed(keycode);
 }
-/* Live HostFS pad byte (0=pad0, 1=pad1, 2=sys); 0 if PADPUSH unavailable. */
+/*
+ * Live pad byte from the input layer (HostFS PADPUSH today):
+ * 0=pad0, 1=pad1, 2=sys, 3=pad0hi, 4=pad1hi.  0 if the snapshot is stale.
+ */
 static inline uint32_t ag_pad(int which)
 {
     if (g_ag_api->inp == NULL || g_ag_api->inp->pad == NULL) {
@@ -567,13 +570,26 @@ static inline uint32_t ag_pad(int which)
     }
     return g_ag_api->inp->pad(which);
 }
-/* Level button (AG_BTN_*). Prefers PADPUSH; else sticky key_pressed. */
+/* Level button on pad 0 (AG_BTN_*). Prefers live pad; else sticky key_pressed. */
 static inline int32_t ag_btn(int id)
 {
     if (g_ag_api->inp == NULL || g_ag_api->inp->btn == NULL) {
         return 0;
     }
     return g_ag_api->inp->btn(id);
+}
+/* Level button on pad 0 or 1 (ABI 0.11). */
+static inline int32_t ag_btnp(int pad, int id)
+{
+    if (g_ag_api->inp == NULL) {
+        return 0;
+    }
+    if (g_ag_api->inp->btnp != NULL) {
+        return g_ag_api->inp->btnp(pad, id);
+    }
+    /* Older kernels: only pad 0 via btn(). */
+    return (pad == 0 && g_ag_api->inp->btn != NULL) ? g_ag_api->inp->btn(id)
+                                                    : 0;
 }
 
 #ifdef __cplusplus

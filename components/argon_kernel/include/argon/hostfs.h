@@ -21,11 +21,12 @@ ag_err_t ag_hostfs_try_mount(void);
 bool ag_hostfs_mounted(void);
 
 /*
- * Last host-pushed SMS pad snapshot (pad0, pad1, sys).  Returns true when a
- * push arrived within `max_age_ms` (0 = any cached value).  Used by the
- * virtual H:\sms.pad backend; apps normally open that path via VFS.
+ * Last host-pushed pad snapshot (AG_PAD_BYTES).  Returns true when a push
+ * arrived within `max_age_ms` (0 = any cached value).  Prefer the input
+ * layer (ag_input_pad_peek / inp->btn); this remains for the virtual
+ * H:\sms.pad compatibility path.
  */
-bool ag_hostfs_pad_peek(uint8_t out[3], uint32_t max_age_ms);
+bool ag_hostfs_pad_peek(uint8_t out[6], uint32_t max_age_ms);
 
 #ifdef __cplusplus
 }

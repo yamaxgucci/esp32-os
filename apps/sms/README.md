@@ -91,10 +91,12 @@ run t:\sms.axe 60 nolivepad wav
 dir t:\sms.wav
 ```
 
-With `-HostFs` (and `sms.cfg`), **hostfsd pushes** live pad state ~60 Hz over
-UART1.  Guest caches it; `H:\sms.pad` reads that cache — **no per-frame RPC**.
+With `-HostFs` (and `sms.cfg`), **hostfsd pushes** a 6-byte pad snapshot ~60 Hz
+into the guest input layer (`inp->btnp`, `/dev/joy0`).  `H:\sms.pad` is the same
+cache as a compatibility file — apps no longer `seek`/`read` it each frame.
 
-Without HostFS, SMS falls back to **serial sticky keys**. Force with `nolivepad`.
+Without HostFS, SMS falls back to **serial sticky keys** (no key-up). Force with
+`nolivepad`.
 
 ## Controls (defaults)
 
@@ -105,6 +107,8 @@ pad0.left=LEFT
 pad0.right=RIGHT
 pad0.b1=Z
 pad0.b2=X
+pad0.c=C
+pad0.start=ENTER
 pad0.pause=ENTER
 pad0.quit=ESC
 
@@ -114,6 +118,8 @@ pad1.left=A
 pad1.right=D
 pad1.b1=J
 pad1.b2=K
+pad1.c=L
+pad1.start=P
 pad1.pause=P
 pad1.quit=Q
 ```

@@ -432,17 +432,22 @@ bool     poll(ag_event_t *out, uint32_t timeout_ms);
 void     flush(void);
 bool     key_pressed(uint16_t keycode);   /* sticky serial; drains queue */
 uint16_t mods(void);
-uint32_t pad(int which);   /* 0=pad0, 1=pad1, 2=sys — HostFS PADPUSH cache */
-int32_t  btn(int id);      /* AG_BTN_*: live pad, else sticky fallback */
+uint32_t pad(int which);   /* 0=pad0, 1=pad1, 2=sys, 3=pad0hi, 4=pad1hi */
+int32_t  btn(int id);      /* AG_BTN_* on pad 0; live pad, else sticky */
+int32_t  btnp(int pad, int id); /* ABI 0.11: same on pad 0 or 1 */
 ```
 
 Целые события — то, что нужно приложению, рисующему свой экран: у стрелок и
 F-клавиш нет символа, и `con->getch` их передать не может.
 
-**Игры / удержание / аккорды (SMS, Asteroids):** не `key_pressed` по UART.
-Нужен HostFS PADPUSH (`argon run -HostFs`, `sms.cfg`) → кэш `H:\sms.pad` /
-`inp->pad` / `inp->btn`. Это level-state с хоста ~60 Гц; диагонали и
-«газ + поворот» работают. `key_pressed` — только fallback без HostFS.
+**Игры / удержание / аккорды (SMS, MD, Asteroids):** не `key_pressed` по UART.
+Нужен слой ввода (`/dev/joy0`, `inp->pad` / `btn` / `btnp`), который сегодня
+кормит HostFS PADPUSH (`argon run -HostFs`, `sms.cfg`). Снимок — 6 байт
+(pad0, pad1, sys, pad0hi, pad1hi, ver); первые три совместимы со старым
+3-байтовым хостом. Level-state ~60 Гц: диагонали, A+B+C и Start держатся.
+`H:\sms.pad` — тот же кэш как файл совместимости. `key_pressed` — только
+fallback без HostFS. Кнопки: `AG_BTN_UP..B2`, `PAUSE`, `QUIT`, плюс
+`C` / `START` / `X` / `Y` / `Z` / `MODE` (высокие биты).
 
 **`poll`** возвращает `true`, если событие получено. `timeout_ms`: `0` — только
 опрос, `UINT32_MAX` — ждать сколько угодно. В фоновом процессе — всегда `false`.

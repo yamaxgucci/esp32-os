@@ -24,6 +24,7 @@ set(ARGON_KERNEL_SRCS
     "src/dev/font8x16.c"
     "src/dev/ioclaim.c"
     "src/dev/io.c"
+    "src/dev/input.c"
     "src/fs/vfs.c"
     "src/fs/ramfs.c"
     "src/fs/idfvfs.c"

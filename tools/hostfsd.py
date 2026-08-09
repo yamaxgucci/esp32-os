@@ -130,8 +130,10 @@ class Session:
                     time.sleep(0.016)
                     continue
                 snap = self.pad.snapshot()
-                if len(snap) < 3:
-                    snap = (snap + b"\x00\x00\x00")[:3]
+                # Prefer the 6-byte form; pad a short snapshot so a mixed
+                # host/guest pair still speaks a legal length.
+                if len(snap) < 6:
+                    snap = (snap + b"\x00\x00\x00\x00\x00\x01")[:6]
                 try:
                     with self.send_lock:
                         if self._rpc_busy or self._writable_open():
@@ -268,7 +270,7 @@ class Session:
 
         if op == OP_STAT:
             if self.is_pad_path(path):
-                send_resp(conn, op, seq, AG_OK, a0=0, a1=3, lock=lock)
+                send_resp(conn, op, seq, AG_OK, a0=0, a1=6, lock=lock)
                 return
             p = self.resolve(path)
             if p is None or not p.exists():
@@ -330,7 +332,7 @@ class Session:
                 h = self.next_h
                 self.next_h += 1
                 self.pad_handles.add(h)
-                send_resp(conn, op, seq, AG_OK, a0=h, a1=3, lock=lock)
+                send_resp(conn, op, seq, AG_OK, a0=h, a1=6, lock=lock)
                 return
             p = self.resolve(path)
             if p is None:

@@ -38,7 +38,8 @@ argon run -Gfx -HostFs build\sms_share
 H:\> run sms.axe game.sms
 ```
 
-Жди `sms: live pad H:\sms.pad (host push)`. Фокус можно на SDL.
+Жди `sms: controls = live pad (inp / HostFS PADPUSH)` (или то же у `MD.AXE`).
+Фокус можно на SDL — хост ловит клавиши низкоуровневым хуком.
 
 ### Важно
 
@@ -90,8 +91,11 @@ the console byte stream.
 
 Supported: `dir`, `cd`, `type`, `run`, `copy` onto `H:` (create/overwrite via
 `OPEN` + `HSFS_OP_WRITE`), `del` (`HSFS_OP_UNLINK`). Not yet: mkdir, rename.
-With `--pad-cfg`, hostfsd **pushes** live pad snapshots (`HSFS_OP_PADPUSH`);
-guest `H:\sms.pad` reads a RAM cache (playable SMS input) and stays read-only.
+With `--pad-cfg`, hostfsd **pushes** live pad snapshots (`HSFS_OP_PADPUSH`,
+6 bytes: pad0, pad1, sys, pad0hi, pad1hi, ver). The guest input layer caches
+them for `inp->pad` / `btn` / `btnp` and `/dev/joy0`. `H:\sms.pad` is the same
+cache as a read-only compatibility file. Bindings come from `sms.cfg`
+(`pad0.c`, `pad0.start`, …).
 
 Small files: `copy` onto `H:` and `del` work. **Large files** (e.g. SMS WAV,
 hundreds of KB) are still unreliable on `H:` while PADPUSH is live — use the
