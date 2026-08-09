@@ -388,13 +388,11 @@ RGB-панелью отдельной передачи нет вообще. Пр
 пути вывода и роста арены. Разбор бюджетов и план по шагам —
 в [`07-emulator-performance.md`](07-emulator-performance.md).
 
-✅ **Mute MD.AXE** (9 августа 2026) — vendored gwenesis в `apps/md/`: 68000 и VDP,
-видео прямо в back-буфер `gfx`, клавиатура и host-pad, `stats`/`fps30`. Звуковой
-блок (Z80 + YM2612 + PSG) заглушен и не компилируется — заодно это снимает
-лицензионную проблему: у Z80 Фаязуллина запрет на коммерческое распространение,
-и в дереве его нет. Лицензии разобраны в [`apps/md/README.md`](../apps/md/README.md).
-В QEMU на синтетическом ROM 142–150% realtime, но это VDP при простаивающем
-68000, не игра.
+✅ **MD.AXE** (9 августа 2026) — vendored gwenesis в `apps/md/`: 68000 и VDP,
+затем в тот же день Z80 из SMS + PSG + YM→`ag_fm` (WAV/mock), видео прямо в
+back-буфер `gfx`, pad layer, `stats`/`fps30`. Фаязуллин не используется.
+Лицензии — [`apps/md/README.md`](../apps/md/README.md). В QEMU Alex Kidd с
+звуком ~125% realtime; стартовые кадры и I2S — ещё открыты.
 
 ✅ **Mute SMS.AXE** (7 августа 2026) — vendored SMS Plus GX в `apps/sms/`
 (GPLv2+; ядро ArgonOS остаётся Apache-2.0). QEMU: `run` + soft `gfx` +
@@ -572,7 +570,7 @@ MQTT, Modbus TCP, OTA. Подтаблица `api->net` перестаёт быт
    на realtime» на 60 Гц: разбор бюджетов, затыков и план по шагам в
    [`07-emulator-performance.md`](07-emulator-performance.md). Сделано в тот же
    день: ✅ замеры и починка пути вывода на SMS, ✅ арена 192 КБ вместо
-   `hot_text`, ✅ gwenesis как `MD.AXE` в mute, ✅ ввод через pad layer,
+   `hot_text`, ✅ gwenesis как `MD.AXE`, ✅ ввод через pad layer,
    ✅ ROM Alex Kidd, ✅ Ofast на VDP + `setjmp` раз за кадр, ✅ звук:
    Z80(SMS)+`ag_fm`+PSG на том же ядре, WAV/mock (~169 КБ кода, Alex Kidd
    ~125% realtime с звуком в QEMU). Осталось: стартовые кадры, `audio`/I2S,
