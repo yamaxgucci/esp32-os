@@ -21,8 +21,8 @@
 
 #define HSFS_UART           UART_NUM_1
 #define HSFS_UART_BAUD      115200
-#define HSFS_RX_BUF         (8 * 1024)
-#define HSFS_TX_BUF         (4 * 1024)
+#define HSFS_RX_BUF         (64 * 1024)
+#define HSFS_TX_BUF         (16 * 1024)
 #define HSFS_RPC_TIMEOUT_MS 5000
 #define HSFS_PING_TIMEOUT_MS 1000
 
@@ -30,7 +30,8 @@ typedef struct {
     uint32_t host_h;
     uint64_t pos;
     uint64_t size;
-    bool     is_pad; /* H:\sms.pad — served from push cache, no READ RPC */
+    bool     is_pad;  /* H:\sms.pad — served from push cache, no READ RPC */
+    bool     writable;
 } hsfs_file_t;
 
 typedef struct {
@@ -46,7 +47,13 @@ static uint8_t  s_pad[3];
 static uint32_t s_pad_ms; /* esp_timer ms of last PADPUSH; 0 = never */
 static TaskHandle_t s_pad_task;
 
+/* One-header lookaside: pad_drain must not eat a real RPC response. */
+static hsfs_hdr_t s_held_hdr;
+static bool       s_held_hdr_valid;
+
 static bool read_all(void *buf, size_t len, uint32_t timeout_ms);
+static bool read_hdr(hsfs_hdr_t *hdr, uint32_t timeout_ms);
+static bool drain_bytes(uint32_t len, uint32_t timeout_ms);
 
 static uint32_t now_ms(void)
 {
@@ -154,11 +161,42 @@ static bool uart_open(void)
     return true;
 }
 
+/*
+ * While transmitting a large request, the host may still be trying to deliver
+ * a PADPUSH.  If our RX fills, host sendall blocks, stops reading our TX, and
+ * uart_write_bytes waits forever.  Pump PADPUSH (or hold a non-pad hdr) here.
+ */
+static void pump_rx_during_tx(void)
+{
+    for (;;) {
+        if (s_held_hdr_valid) {
+            return;
+        }
+        size_t avail = 0;
+        if (uart_get_buffered_data_len(HSFS_UART, &avail) != ESP_OK ||
+            avail < sizeof(hsfs_hdr_t)) {
+            return;
+        }
+        hsfs_hdr_t hdr;
+        if (!read_all(&hdr, sizeof(hdr), 50)) {
+            return;
+        }
+        if (hdr.magic == HSFS_MAGIC && hdr.op == HSFS_OP_PADPUSH) {
+            (void)ingest_padpush_locked(&hdr, 50);
+            continue;
+        }
+        s_held_hdr = hdr;
+        s_held_hdr_valid = true;
+        return;
+    }
+}
+
 static bool write_all(const void *buf, size_t len)
 {
     const uint8_t *p = (const uint8_t *)buf;
     size_t         left = len;
     while (left > 0) {
+        pump_rx_during_tx();
         const int n = uart_write_bytes(HSFS_UART, p, left);
         if (n <= 0) {
             return false;
@@ -192,6 +230,33 @@ static bool read_all(void *buf, size_t len, uint32_t timeout_ms)
         left -= (size_t)n;
     }
     return true;
+}
+
+static bool drain_bytes(uint32_t len, uint32_t timeout_ms)
+{
+    uint8_t sink[64];
+    while (len > 0) {
+        const uint32_t chunk =
+            len > sizeof(sink) ? (uint32_t)sizeof(sink) : len;
+        if (!read_all(sink, chunk, timeout_ms)) {
+            return false;
+        }
+        len -= chunk;
+    }
+    return true;
+}
+
+static bool read_hdr(hsfs_hdr_t *hdr, uint32_t timeout_ms)
+{
+    if (hdr == NULL) {
+        return false;
+    }
+    if (s_held_hdr_valid) {
+        *hdr = s_held_hdr;
+        s_held_hdr_valid = false;
+        return true;
+    }
+    return read_all(hdr, sizeof(*hdr), timeout_ms);
 }
 
 static ag_err_t rpc(uint16_t op, uint32_t a0, uint32_t a1, const char *path,
@@ -238,7 +303,7 @@ static ag_err_t rpc(uint16_t op, uint32_t a0, uint32_t a1, const char *path,
 
     hsfs_hdr_t resp;
     for (;;) {
-        if (!read_all(&resp, sizeof(resp), timeout_ms)) {
+        if (!read_hdr(&resp, timeout_ms)) {
             goto done;
         }
         if (resp.magic != HSFS_MAGIC) {
@@ -253,28 +318,24 @@ static ag_err_t rpc(uint16_t op, uint32_t a0, uint32_t a1, const char *path,
             }
             continue;
         }
-        if (resp.seq != seq || resp.op != op) {
+        if (resp.path_len != 0 || resp.data_len > HSFS_MAX_DATA) {
+            (void)drain_bytes(resp.path_len + resp.data_len, timeout_ms);
             err = -AG_EIO;
             goto done;
         }
+        if (resp.seq != seq || resp.op != op) {
+            /* Stale/late frame — discard payload and keep waiting. */
+            if (!drain_bytes(resp.data_len, timeout_ms)) {
+                err = -AG_EIO;
+                goto done;
+            }
+            continue;
+        }
         break;
-    }
-    if (resp.path_len != 0 || resp.data_len > HSFS_MAX_DATA) {
-        err = -AG_EIO;
-        goto done;
     }
     if (resp.data_len > 0) {
         if (data_out == NULL || resp.data_len > data_out_cap) {
-            /* Drain and fail. */
-            uint8_t sink[64];
-            uint32_t left = resp.data_len;
-            while (left > 0) {
-                const uint32_t chunk = left > sizeof(sink) ? sizeof(sink) : left;
-                if (!read_all(sink, chunk, timeout_ms)) {
-                    break;
-                }
-                left -= chunk;
-            }
+            (void)drain_bytes(resp.data_len, timeout_ms);
             err = -AG_ERANGE;
             goto done;
         }
@@ -310,16 +371,20 @@ static void pad_drain_once(void)
     }
     for (;;) {
         size_t avail = 0;
-        if (uart_get_buffered_data_len(HSFS_UART, &avail) != ESP_OK ||
-            avail < sizeof(hsfs_hdr_t)) {
-            break;
+        if (!s_held_hdr_valid) {
+            if (uart_get_buffered_data_len(HSFS_UART, &avail) != ESP_OK ||
+                avail < sizeof(hsfs_hdr_t)) {
+                break;
+            }
         }
         hsfs_hdr_t hdr;
-        if (!read_all(&hdr, sizeof(hdr), 50)) {
+        if (!read_hdr(&hdr, 50)) {
             break;
         }
         if (hdr.magic != HSFS_MAGIC || hdr.op != HSFS_OP_PADPUSH) {
-            /* Not a pad push — leave framing broken rather than invent bytes. */
+            /* Put it back for the next RPC — do not drop WRITE/READ replies. */
+            s_held_hdr = hdr;
+            s_held_hdr_valid = true;
             break;
         }
         if (!ingest_padpush_locked(&hdr, 50)) {
@@ -368,7 +433,6 @@ static ag_err_t hs_stat(void *ctx, const char *rel, ag_stat_t *out)
     memset(out, 0, sizeof(*out));
     out->size = size32;
     out->attr = (mode & HSFS_MODE_DIR) != 0 ? AG_A_DIR : 0;
-    out->attr |= AG_A_READONLY;
     return AG_OK;
 }
 
@@ -420,7 +484,6 @@ static ag_err_t hs_readdir(void *ctx, void *dir, ag_dirent_t *out)
     memcpy(out->name, name, nlen);
     out->name[nlen] = '\0';
     out->st.attr = (mode & HSFS_MODE_DIR) != 0 ? AG_A_DIR : 0;
-    out->st.attr |= AG_A_READONLY;
     return AG_OK;
 }
 
@@ -441,10 +504,13 @@ static ag_err_t hs_closedir(void *ctx, void *dir)
 static ag_err_t hs_open(void *ctx, const char *rel, uint32_t flags, void **file)
 {
     (void)ctx;
-    if ((flags & (AG_O_WRONLY | AG_O_RDWR | AG_O_CREATE | AG_O_TRUNC)) != 0) {
-        return -AG_EROFS;
-    }
+    const bool want_write =
+        (flags & (AG_O_WRONLY | AG_O_RDWR | AG_O_CREATE | AG_O_TRUNC |
+                  AG_O_APPEND)) != 0;
     if (is_pad_rel(rel)) {
+        if (want_write) {
+            return -AG_EROFS;
+        }
         pad_drain_once();
         if (s_pad_ms == 0u) {
             return -AG_ENOENT;
@@ -457,13 +523,14 @@ static ag_err_t hs_open(void *ctx, const char *rel, uint32_t flags, void **file)
         pf->pos = 0;
         pf->size = 3;
         pf->is_pad = true;
+        pf->writable = false;
         *file = pf;
         return AG_OK;
     }
     uint32_t host_h = 0, size32 = 0;
     const ag_err_t err =
-        rpc(HSFS_OP_OPEN, 0, 0, rel, NULL, 0, &host_h, &size32, NULL, 0, NULL,
-            HSFS_RPC_TIMEOUT_MS);
+        rpc(HSFS_OP_OPEN, flags, 0, rel, NULL, 0, &host_h, &size32, NULL, 0,
+            NULL, HSFS_RPC_TIMEOUT_MS);
     if (err != AG_OK) {
         return err;
     }
@@ -477,6 +544,7 @@ static ag_err_t hs_open(void *ctx, const char *rel, uint32_t flags, void **file)
     f->pos = 0;
     f->size = size32;
     f->is_pad = false;
+    f->writable = want_write;
     *file = f;
     return AG_OK;
 }
@@ -548,6 +616,43 @@ static int32_t hs_read(void *ctx, void *file, void *buf, size_t len)
     return (int32_t)got;
 }
 
+static int32_t hs_write(void *ctx, void *file, const void *buf, size_t len)
+{
+    (void)ctx;
+    hsfs_file_t *f = (hsfs_file_t *)file;
+    if (f == NULL || buf == NULL) {
+        return -AG_EINVAL;
+    }
+    if (f->is_pad || !f->writable) {
+        return -AG_EROFS;
+    }
+    if (len == 0) {
+        return 0;
+    }
+    uint32_t want = (uint32_t)len;
+    if (want > HSFS_MAX_DATA) {
+        want = HSFS_MAX_DATA;
+    }
+    uint32_t wrote = 0;
+    const ag_err_t err =
+        rpc(HSFS_OP_WRITE, f->host_h, (uint32_t)f->pos, NULL, buf, want, &wrote,
+            NULL, NULL, 0, NULL, HSFS_RPC_TIMEOUT_MS);
+    if (err != AG_OK) {
+        return (int32_t)err;
+    }
+    if (wrote == 0u) {
+        return -AG_EIO;
+    }
+    if (wrote > want) {
+        wrote = want;
+    }
+    f->pos += wrote;
+    if (f->pos > f->size) {
+        f->size = f->pos;
+    }
+    return (int32_t)wrote;
+}
+
 static int64_t hs_seek(void *ctx, void *file, int64_t off, int whence)
 {
     (void)ctx;
@@ -565,8 +670,25 @@ static int64_t hs_seek(void *ctx, void *file, int64_t off, int whence)
     if (next < 0) {
         return -AG_EINVAL;
     }
+    /* Writers may seek past EOF; readers stay within the known size. */
+    if (!f->writable && !f->is_pad && (uint64_t)next > f->size) {
+        next = (int64_t)f->size;
+    }
     f->pos = (uint64_t)next;
     return next;
+}
+
+static ag_err_t hs_unlink(void *ctx, const char *rel)
+{
+    (void)ctx;
+    if (rel == NULL) {
+        return -AG_EINVAL;
+    }
+    if (is_pad_rel(rel)) {
+        return -AG_EROFS;
+    }
+    return rpc(HSFS_OP_UNLINK, 0, 0, rel, NULL, 0, NULL, NULL, NULL, 0, NULL,
+               HSFS_RPC_TIMEOUT_MS);
 }
 
 static ag_err_t hs_info(void *ctx, ag_fsinfo_t *out)
@@ -577,9 +699,10 @@ static ag_err_t hs_info(void *ctx, ag_fsinfo_t *out)
     }
     memset(out, 0, sizeof(*out));
     strncpy(out->fs, "host", sizeof(out->fs) - 1);
-    out->total = 0;
-    out->free = 0;
-    out->read_only = true;
+    /* Host disk space is unknown; advertise "plenty" so dir/copy are not misled. */
+    out->total = 1ull << 40;
+    out->free = 1ull << 40;
+    out->read_only = false;
     return AG_OK;
 }
 
@@ -588,12 +711,12 @@ static const ag_fs_ops_t k_ops = {
     .open = hs_open,
     .close = hs_close,
     .read = hs_read,
-    .write = NULL,
+    .write = hs_write,
     .seek = hs_seek,
     .sync = NULL,
     .truncate = NULL,
     .stat = hs_stat,
-    .unlink = NULL,
+    .unlink = hs_unlink,
     .rename = NULL,
     .mkdir = NULL,
     .rmdir = NULL,
@@ -628,7 +751,7 @@ ag_err_t ag_hostfs_try_mount(void)
         return -AG_ENODEV;
     }
 
-    const ag_err_t m = ag_vfs_mount("/host", &k_ops, NULL, AG_MOUNT_READONLY);
+    const ag_err_t m = ag_vfs_mount("/host", &k_ops, NULL, 0);
     if (m != AG_OK) {
         ag_log(AG_LOG_ERROR, "hostfs", "mount /host failed (%d)", (int)m);
         return m;

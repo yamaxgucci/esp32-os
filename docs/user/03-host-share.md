@@ -83,16 +83,29 @@ H:\> run a:\sms.axe sonic.sms
 |------|------|
 | `hostfsd.py` | TCP server on `127.0.0.1:5557`, serves `--root` |
 | QEMU 2nd `-serial` | UART1 as TCP client to that port |
-| Guest `hostfs.c` | RPC over UART1, mount `/host` read-only |
+| Guest `hostfs.c` | RPC over UART1, mount `/host` (read + file write) |
 
 Console stays on the first serial (`mon:stdio` / `-Tcp`). HostFS never shares
 the console byte stream.
 
-Read-only MVP: `dir`, `cd`, `type`, `run` / `ag_open`+`read`+`seek`. No write,
-delete, or mkdir yet. With `--pad-cfg`, hostfsd **pushes** live pad snapshots
-(`HSFS_OP_PADPUSH`); guest `H:\sms.pad` reads a RAM cache (playable SMS input).
+Supported: `dir`, `cd`, `type`, `run`, `copy` onto `H:` (create/overwrite via
+`OPEN` + `HSFS_OP_WRITE`), `del` (`HSFS_OP_UNLINK`). Not yet: mkdir, rename.
+With `--pad-cfg`, hostfsd **pushes** live pad snapshots (`HSFS_OP_PADPUSH`);
+guest `H:\sms.pad` reads a RAM cache (playable SMS input) and stays read-only.
+
+Small files: `copy` onto `H:` and `del` work. **Large files** (e.g. SMS WAV,
+hundreds of KB) are still unreliable on `H:` while PADPUSH is live — use the
+SD image instead:
+
+```
+run h:\SMS.AXE … a:\sms.wav
+```
+
+Then on the host: `argon get a:\sms.wav build\sms.wav`. Fixing large `H:`
+copies is backlog item 9 in [`04-roadmap.md`](../04-roadmap.md).
 
 Without `-HostFs`, boot tries a short UART1 ping and skips `H:` if nobody answers.
+Guest firmware and `hostfsd.py` must match for writes (old helper opens read-only).
 
 ### Sync vs HostFS
 

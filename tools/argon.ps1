@@ -227,7 +227,7 @@ switch ($Command.ToLowerInvariant()) {
         # first positional parameter instead of as a switch.
         #
         $valued = @('marker', 'timeoutsec', 'port', 'sdimage', 'quietms',
-                    'logpath', 'put')
+                    'logpath', 'put', 'hostfs', 'hostfsport')
         $send = @()
         $opts = @{}
         # -cp says which code page the screen bytes are in, for the dump only:

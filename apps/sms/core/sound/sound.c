@@ -35,6 +35,8 @@
 #include "config.h"
 
 snd_t snd;
+void (*argon_sms_audio_sink)(int16_t *output, int32_t length);
+
 static int16_t **fm_buffer;
 static int16_t **psg_buffer;
 static int32_t *smptab;
@@ -56,9 +58,8 @@ uint32_t SMSPLUS_sound_init(void)
 	int32_t i;
 
 	/*
-	 * ArgonOS mute build: libc math stubs (logf/sinf → 0) make YM2413 table
-	 * init divide by zero / write wild indices and reboot the board.  Skip
-	 * the whole sound path when the app asked for silence.
+	 * ArgonOS: nosound skips the whole path.  FM is ag_fm via fmintf
+	 * (YM2413 register decode), not ym2413.c.
 	 */
 	if (option.nosound) {
 		snd.enabled = 0;
@@ -134,9 +135,7 @@ uint32_t SMSPLUS_sound_init(void)
 	
 	for (i = 0; i < smptab_len; i++)
 	{
-		float calc = (snd.sample_count * i);
-		calc = calc / (float)smptab_len;
-		smptab[i] = (int32_t)calc;
+		smptab[i] = (int32_t)((snd.sample_count * (int32_t)i) / smptab_len);
 	}
 
 	/* Allocate emulated sound streams */
@@ -182,7 +181,7 @@ uint32_t SMSPLUS_sound_init(void)
     SN76489_Init(0, snd.psg_clock, snd.sample_rate);
     SN76489_Config(0, MUTE_ALLON, BOOST_ON, VOL_FULL, (sms.console < CONSOLE_SMS) ? FB_SC3000 : FB_SEGAVDP);
     #else
-	sn76489_init(&psg_sn, (float)snd.psg_clock, (float)snd.sample_rate, 
+	sn76489_init(&psg_sn, snd.psg_clock, snd.sample_rate, 
 	(sms.console < CONSOLE_SMS) ? SN76489_NOISE_BITS_SG1000 : SN76489_NOISE_BITS_SMS, 
 	(sms.console < CONSOLE_SMS) ? SN76489_NOISE_TAPPED_SG1000 : SN76489_NOISE_TAPPED_SMS);
 	#endif
@@ -263,7 +262,7 @@ void SMSPLUS_sound_reset(void)
 	#elif defined(MAXIM_PSG)
 	SN76489_Reset(0);
 	#else
-	sn76489_reset(&psg_sn, (float)snd.psg_clock, (float)snd.sample_rate,
+	sn76489_reset(&psg_sn, snd.psg_clock, snd.sample_rate,
 	(sms.console < CONSOLE_SMS) ? SN76489_NOISE_BITS_SG1000 : SN76489_NOISE_BITS_SMS, 
 	(sms.console < CONSOLE_SMS) ? SN76489_NOISE_TAPPED_SG1000 : SN76489_NOISE_TAPPED_SMS);
 	#endif
@@ -303,6 +302,10 @@ void SMSPLUS_sound_update(int32_t line)
 
 		/* Mix streams into output buffer */
 		snd.mixer_callback(snd.output, snd.sample_count);
+		/* ArgonOS sink (WAV/mock); optional — set by Sound_Init. */
+		if (argon_sms_audio_sink) {
+			argon_sms_audio_sink(snd.output, snd.sample_count);
+		}
 		/* Reset */
 		snd.done_so_far = 0;
 	}

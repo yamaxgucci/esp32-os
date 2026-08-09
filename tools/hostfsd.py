@@ -39,16 +39,28 @@ OP_OPEN = 5
 OP_READ = 6
 OP_CLOSE = 7
 OP_PADPUSH = 8
+OP_WRITE = 9
+OP_UNLINK = 10
 
 MODE_DIR = 1
+
+# Match argon/abi.h AG_O_* (guest open flags on OPEN a0).
+AG_O_WRONLY = 1 << 0
+AG_O_RDWR = 1 << 1
+AG_O_CREATE = 1 << 2
+AG_O_TRUNC = 1 << 3
+AG_O_APPEND = 1 << 4
+AG_O_EXCL = 1 << 5
 
 # Match argon/abi.h style errors (negated).
 AG_OK = 0
 AG_ENOENT = -2
 AG_EIO = -5
+AG_EEXIST = -17
 AG_EINVAL = -22
 AG_ENOTDIR = -20
 AG_EISDIR = -21
+AG_EROFS = -30
 AG_ERANGE = -34
 
 HDR_FMT = "<IHH i IIII"  # magic op seq status a0 a1 path_len data_len
@@ -102,6 +114,8 @@ class Session:
         self.send_lock = threading.Lock()
         self._stop = threading.Event()
         self._push_thread: threading.Thread | None = None
+        # True while handling a guest RPC (recv request → send reply).
+        self._rpc_busy = False
 
     def start_pad_push(self, conn: socket.socket) -> None:
         if self.pad is None:
@@ -109,19 +123,35 @@ class Session:
 
         def loop() -> None:
             while not self._stop.is_set():
+                # Never push during an RPC or while a writable file is open.
+                # PADPUSH + large WRITE payloads deadlock the TCP serial link
+                # (host blocked in sendall, guest blocked in uart_write).
+                if self._rpc_busy or self._writable_open():
+                    time.sleep(0.016)
+                    continue
                 snap = self.pad.snapshot()
                 if len(snap) < 3:
                     snap = (snap + b"\x00\x00\x00")[:3]
-                # Always push so the guest cache age stays fresh.
                 try:
-                    send_resp(
-                        conn,
-                        OP_PADPUSH,
-                        0,
-                        AG_OK,
-                        data=snap,
-                        lock=self.send_lock,
-                    )
+                    with self.send_lock:
+                        if self._rpc_busy or self._writable_open():
+                            pass
+                        else:
+                            old_to = conn.gettimeout()
+                            conn.settimeout(0.05)
+                            try:
+                                send_resp(
+                                    conn,
+                                    OP_PADPUSH,
+                                    0,
+                                    AG_OK,
+                                    data=snap,
+                                    lock=None,
+                                )
+                            except (TimeoutError, socket.timeout):
+                                pass
+                            finally:
+                                conn.settimeout(old_to)
                 except OSError:
                     return
                 time.sleep(0.016)
@@ -144,6 +174,15 @@ class Session:
         if not norm.startswith("/"):
             norm = "/" + norm
         return norm.lower() == PAD_VPATH
+
+    def _writable_open(self) -> bool:
+        for f in self.files.values():
+            try:
+                if f.writable():
+                    return True
+            except Exception:  # noqa: BLE001
+                continue
+        return False
 
     def resolve(self, rel: str) -> Path | None:
         # Guest paths are POSIX-ish under mount root ("/", "/foo").
@@ -182,17 +221,24 @@ class Session:
                     return
                 if path_len > 512 or data_len > HSFS_MAX_DATA:
                     return
-                path_b = read_exact(conn, path_len) if path_len else b""
-                # READ: data_len is max bytes wanted; no payload follows.
-                payload = b""
-                if data_len and op != OP_READ:
-                    payload = read_exact(conn, data_len)
-                path = path_b.decode("utf-8", errors="surrogateescape")
+                self._rpc_busy = True
                 try:
-                    self.dispatch(conn, op, seq, a0, a1, path, data_len, payload)
-                except Exception as exc:  # noqa: BLE001 — keep link alive
-                    send_resp(conn, op, seq, AG_EIO, lock=self.send_lock)
-                    print(f"hostfsd: op {op} error: {exc}", file=sys.stderr)
+                    path_b = read_exact(conn, path_len) if path_len else b""
+                    # READ: data_len is max bytes wanted; no payload follows.
+                    # WRITE: data_len is payload length.
+                    payload = b""
+                    if data_len and op != OP_READ:
+                        payload = read_exact(conn, data_len)
+                    path = path_b.decode("utf-8", errors="surrogateescape")
+                    try:
+                        self.dispatch(
+                            conn, op, seq, a0, a1, path, data_len, payload
+                        )
+                    except Exception as exc:  # noqa: BLE001 — keep link alive
+                        send_resp(conn, op, seq, AG_EIO, lock=self.send_lock)
+                        print(f"hostfsd: op {op} error: {exc}", file=sys.stderr)
+                finally:
+                    self._rpc_busy = False
                 if (
                     op == OP_PING
                     and self.pad is not None
@@ -215,7 +261,6 @@ class Session:
         data_len: int,
         payload: bytes,
     ) -> None:
-        del payload
         lock = self.send_lock
         if op == OP_PING:
             send_resp(conn, op, seq, AG_OK, a0=1, lock=lock)
@@ -275,24 +320,53 @@ class Session:
             return
 
         if op == OP_OPEN:
+            flags = int(a0)
+            want_write = (flags & (AG_O_WRONLY | AG_O_RDWR | AG_O_CREATE |
+                                   AG_O_TRUNC | AG_O_APPEND)) != 0
             if self.is_pad_path(path):
+                if want_write:
+                    send_resp(conn, op, seq, AG_EROFS, lock=lock)
+                    return
                 h = self.next_h
                 self.next_h += 1
                 self.pad_handles.add(h)
                 send_resp(conn, op, seq, AG_OK, a0=h, a1=3, lock=lock)
                 return
             p = self.resolve(path)
-            if p is None or not p.exists():
+            if p is None:
                 send_resp(conn, op, seq, AG_ENOENT, lock=lock)
                 return
-            if p.is_dir():
+            if p.exists() and p.is_dir():
                 send_resp(conn, op, seq, AG_EISDIR, lock=lock)
                 return
-            f = open(p, "rb")
+            try:
+                mode = self.open_mode(flags, p.exists())
+            except ValueError:
+                send_resp(conn, op, seq, AG_EINVAL, lock=lock)
+                return
+            if mode is None:
+                # EXCL + exists
+                send_resp(conn, op, seq, AG_EEXIST, lock=lock)
+                return
+            try:
+                if want_write and not p.parent.exists():
+                    send_resp(conn, op, seq, AG_ENOENT, lock=lock)
+                    return
+                f = open(p, mode)
+            except FileNotFoundError:
+                send_resp(conn, op, seq, AG_ENOENT, lock=lock)
+                return
+            except OSError as exc:
+                print(f"hostfsd: open {p}: {exc}", file=sys.stderr)
+                send_resp(conn, op, seq, AG_EIO, lock=lock)
+                return
             h = self.next_h
             self.next_h += 1
             self.files[h] = f
-            size = p.stat().st_size
+            try:
+                size = p.stat().st_size
+            except OSError:
+                size = 0
             if size > 0xFFFFFFFF:
                 size = 0xFFFFFFFF
             send_resp(conn, op, seq, AG_OK, a0=h, a1=int(size), lock=lock)
@@ -320,6 +394,31 @@ class Session:
             send_resp(conn, op, seq, AG_OK, a0=len(blob), data=blob, lock=lock)
             return
 
+        if op == OP_WRITE:
+            if a0 in self.pad_handles:
+                send_resp(conn, op, seq, AG_EROFS, lock=lock)
+                return
+            f = self.files.get(a0)
+            if f is None:
+                send_resp(conn, op, seq, AG_EINVAL, lock=lock)
+                return
+            if f.writable() is False:
+                send_resp(conn, op, seq, AG_EROFS, lock=lock)
+                return
+            blob = payload
+            if len(blob) > HSFS_MAX_DATA:
+                blob = blob[:HSFS_MAX_DATA]
+            try:
+                f.seek(int(a1))
+                n = f.write(blob)
+                f.flush()
+            except OSError as exc:
+                print(f"hostfsd: write: {exc}", file=sys.stderr)
+                send_resp(conn, op, seq, AG_EIO, lock=lock)
+                return
+            send_resp(conn, op, seq, AG_OK, a0=int(n), lock=lock)
+            return
+
         if op == OP_CLOSE:
             if a0 in self.pad_handles:
                 self.pad_handles.discard(a0)
@@ -331,7 +430,60 @@ class Session:
             send_resp(conn, op, seq, AG_OK, lock=lock)
             return
 
+        if op == OP_UNLINK:
+            if self.is_pad_path(path):
+                send_resp(conn, op, seq, AG_EROFS, lock=lock)
+                return
+            p = self.resolve(path)
+            if p is None:
+                send_resp(conn, op, seq, AG_ENOENT, lock=lock)
+                return
+            if not p.exists():
+                send_resp(conn, op, seq, AG_ENOENT, lock=lock)
+                return
+            if p.is_dir():
+                send_resp(conn, op, seq, AG_EISDIR, lock=lock)
+                return
+            try:
+                p.unlink()
+            except OSError as exc:
+                print(f"hostfsd: unlink {p}: {exc}", file=sys.stderr)
+                send_resp(conn, op, seq, AG_EIO, lock=lock)
+                return
+            send_resp(conn, op, seq, AG_OK, lock=lock)
+            return
+
         send_resp(conn, op, seq, AG_EINVAL, lock=lock)
+
+    @staticmethod
+    def open_mode(flags: int, exists: bool) -> str | None:
+        """Map AG_O_* flags to a Python open mode, or None for EEXIST."""
+        want_write = (flags & (AG_O_WRONLY | AG_O_RDWR | AG_O_CREATE |
+                               AG_O_TRUNC | AG_O_APPEND)) != 0
+        if not want_write:
+            return "rb"
+        if (flags & AG_O_EXCL) != 0 and exists:
+            return None
+        if (flags & AG_O_APPEND) != 0:
+            if (flags & AG_O_RDWR) != 0:
+                return "a+b"
+            return "ab"
+        if (flags & AG_O_TRUNC) != 0 or (
+            (flags & AG_O_CREATE) != 0 and not exists
+        ):
+            if (flags & AG_O_RDWR) != 0:
+                return "w+b"
+            return "wb"
+        if not exists:
+            if (flags & AG_O_CREATE) != 0:
+                return "wb" if (flags & AG_O_WRONLY) != 0 else "w+b"
+            raise ValueError("missing")
+        if (flags & AG_O_RDWR) != 0:
+            return "r+b"
+        if (flags & AG_O_WRONLY) != 0:
+            # Update in place without truncating.
+            return "r+b"
+        return "rb"
 
 
 def serve(

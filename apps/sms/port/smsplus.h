@@ -8,8 +8,8 @@
 #define VIDEO_WIDTH_GG   160
 #define VIDEO_HEIGHT_GG  144
 
-/* Mute: SMSPLUS_sound_init sees an invalid rate and leaves sound disabled. */
-#define SOUND_FREQUENCY 0
+/* PSG → WAV / mock (no I2S). 22.05 kHz keeps CPU and file size modest. */
+#define SOUND_FREQUENCY 22050
 
 extern uint16_t *sms_bitmap;
 

@@ -54,6 +54,9 @@ typedef struct
 /* Global data */
 extern snd_t snd;
 
+/* Optional ArgonOS PCM sink (WAV/mock).  NULL = discard after mix. */
+extern void (*argon_sms_audio_sink)(int16_t *output, int32_t length);
+
 /* Function prototypes */
 void psg_write(int32_t data);
 void psg_stereo_w(int32_t data);

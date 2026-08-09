@@ -17,7 +17,8 @@
 
 #include "fs/storage.h"
 
-#define AG_COPY_CHUNK 512
+/* Sized for one HostFS WRITE (HSFS_MAX_DATA). Buffer is static — not on stack. */
+#define AG_COPY_CHUNK 4096
 
 /* ---------------------------------------------------------------------- */
 /* Shared plumbing                                                        */
@@ -33,12 +34,14 @@ static void print_error(const char *what, ag_err_t err)
     case AG_EEXIST:  text = "already exists"; break;
     case AG_EBUSY:   text = "directory not empty"; break;
     case AG_EROFS:   text = "write protected"; break;
-    case AG_ENOSPC:  text = "insufficient disk space"; break;
+    case AG_ENOSPC:  text = "no space left"; break;
     case AG_EIO:     text = "drive not ready"; break;
     case AG_EACCES:  text = "access denied"; break;
     case AG_EPERM:   text = "not permitted across drives"; break;
     case AG_ENFILE:  text = "too many open files"; break;
     case AG_EINVAL:  text = "invalid path"; break;
+    case AG_ENOTSUP: text = "not supported"; break;
+    case AG_ENOSYS:  text = "not implemented"; break;
     default:         text = "error"; break;
     }
     ag_console_printf("%s: %s\n", what, text);
@@ -273,24 +276,36 @@ int ag_cmd_copy(int argc, char **argv)
         return 1;
     }
 
-    char     chunk[AG_COPY_CHUNK];
+    /* Static: 4 KiB on the shell stack was enough to corrupt the copy path. */
+    static uint8_t chunk[AG_COPY_CHUNK];
     uint64_t total = 0;
     int32_t  n;
     int      status = 0;
 
     while ((n = ag_vfs_read(in, chunk, sizeof(chunk))) > 0) {
-        const int32_t written = ag_vfs_write(out, chunk, (size_t)n);
-        if (written < 0) {
-            print_error(dest, written);
+        size_t   left = (size_t)n;
+        size_t   off = 0;
+        ag_err_t werr = AG_OK;
+        while (left > 0) {
+            const int32_t written =
+                ag_vfs_write(out, chunk + off, left);
+            if (written < 0) {
+                werr = (ag_err_t)written;
+                break;
+            }
+            if (written == 0) {
+                werr = -AG_ENOSPC;
+                break;
+            }
+            off += (size_t)written;
+            left -= (size_t)written;
+            total += (uint64_t)written;
+        }
+        if (werr != AG_OK) {
+            print_error(ag_path_basename(dest), werr);
             status = 1;
             break;
         }
-        if (written != n) {
-            print_error(dest, -AG_ENOSPC);
-            status = 1;
-            break;
-        }
-        total += (uint64_t)written;
 
         /*
          * Copying from a device that never ends fills the destination until the

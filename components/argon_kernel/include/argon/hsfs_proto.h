@@ -22,7 +22,12 @@ enum hsfs_op {
     HSFS_OP_OPENDIR = 2,
     HSFS_OP_READDIR = 3,
     HSFS_OP_CLOSEDIR = 4,
+    /*
+     * OPEN request: a0 = guest AG_O_* flags (0 = read-only, legacy).
+     * Response: a0 = host handle, a1 = size (0 for a new/truncated file).
+     */
     HSFS_OP_OPEN = 5,
+    /* READ request: a0 = handle, a1 = offset, data_len = max bytes (no payload). */
     HSFS_OP_READ = 6,
     HSFS_OP_CLOSE = 7,
     /*
@@ -31,6 +36,13 @@ enum hsfs_op {
      * drain task so SMS can read a RAM cache without a UART round-trip.
      */
     HSFS_OP_PADPUSH = 8,
+    /*
+     * WRITE request: a0 = handle, a1 = offset, payload = bytes to write
+     * (data_len <= HSFS_MAX_DATA).  Response: a0 = bytes written.
+     */
+    HSFS_OP_WRITE = 9,
+    /* UNLINK request: path only.  Response: status. */
+    HSFS_OP_UNLINK = 10,
 };
 
 /* a0 on STAT/OPEN responses: bit0 = directory */

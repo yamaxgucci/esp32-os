@@ -39,13 +39,15 @@ void SN76489_SetContext(uint8_t* data)
     memcpy(&psg_sn, data, sizeof(sn76489_t));
 }
 
-uint32_t sn76489_init(sn76489_t *psg, float clock, float sample_rate, uint16_t noise_bits, uint16_t tapped) 
+uint32_t sn76489_init(sn76489_t *psg, uint32_t clock, uint32_t sample_rate,
+                      uint16_t noise_bits, uint16_t tapped)
 {
 	psg->enabled_channels = 0x0F;
 	return sn76489_reset(psg, clock, sample_rate, noise_bits, tapped);
 }
 
-uint32_t sn76489_reset(sn76489_t *psg, float clock, float sample_rate, uint16_t noise_bits, uint16_t tapped) 
+uint32_t sn76489_reset(sn76489_t *psg, uint32_t clock, uint32_t sample_rate,
+                       uint16_t noise_bits, uint16_t tapped)
 {
     psg->volume[0] = 0xF;
     psg->volume[1] = 0xF;
@@ -74,7 +76,15 @@ uint32_t sn76489_reset(sn76489_t *psg, float clock, float sample_rate, uint16_t 
     memset(psg->channel_masks[0], 0xFF, 4 * sizeof(uint32_t));
     memset(psg->channel_masks[1], 0xFF, 4 * sizeof(uint32_t));
 
-    psg->clocks_per_sample = clock / 16.0f / sample_rate;
+    /*
+     * ArgonOS: no soft-float / uint64 helpers in .AXE.
+     * Q8.8 clocks_per_sample = (clock/16) / sample_rate.
+     */
+    if (sample_rate == 0) {
+        sample_rate = 1;
+    }
+    psg->clocks_per_sample =
+        (int32_t)(((clock / 16u) << 8) / sample_rate);
 
     psg->noise_shift = (1 << (noise_bits - 1));
     psg->noise_tapped = tapped;
@@ -173,7 +183,7 @@ void sn76489_execute_samples(sn76489_t *psg, int16_t *bufl, int16_t *bufr, uint3
             psg->counter[j] -= psg->clocks_per_sample;
             channels[j] = ((psg->enabled_channels >> j) & 0x01) *
                 psg->tone_state[j] * volume_values[psg->volume[j]];
-            if(psg->counter[j] <= 0.0f) 
+            if(psg->counter[j] <= 0) 
             {
                 if(psg->tone[j] < 7) 
                 {
@@ -187,7 +197,7 @@ void sn76489_execute_samples(sn76489_t *psg, int16_t *bufl, int16_t *bufr, uint3
                     psg->tone_state[j] = -psg->tone_state[j];
                 }
 
-                psg->counter[j] += psg->tone[j];
+                psg->counter[j] += ((int32_t)psg->tone[j] << 8);
             }
         }
 
@@ -196,7 +206,7 @@ void sn76489_execute_samples(sn76489_t *psg, int16_t *bufl, int16_t *bufr, uint3
 
         psg->counter[3] -= psg->clocks_per_sample;
 
-        if(psg->counter[3] < 0.0f) 
+        if(psg->counter[3] < 0) 
         {
             psg->tone_state[3] = -psg->tone_state[3];
             if((psg->noise & 0x03) == 0x03) 
@@ -205,7 +215,7 @@ void sn76489_execute_samples(sn76489_t *psg, int16_t *bufl, int16_t *bufr, uint3
             }
             else 
             {
-                psg->counter[3] += 0x10 << (psg->noise & 0x03);
+                psg->counter[3] += ((int32_t)(0x10 << (psg->noise & 0x03)) << 8);
             }
 
             if(psg->tone_state[3] == 1) 

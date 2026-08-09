@@ -30,7 +30,10 @@ param(
     # Attach a card image. Off by default so a test that does not care about
     # removable media is not slowed down by probing for it.
     [switch]$Sd,
-    [string]$SdImage = 'build\sdcard.img'
+    [string]$SdImage = 'build\sdcard.img',
+    # Live host folder as guest H: (UART1 ↔ hostfsd). Same helper as qemu-run.
+    [string]$HostFs = '',
+    [int]$HostFsPort = 5557
 )
 
 $ErrorActionPreference = 'Stop'
@@ -40,6 +43,55 @@ $qemu = Resolve-Qemu
 Update-FlashImage
 $efuse = Initialize-EfuseFile
 
+$hostfsProc = $null
+if ($HostFs) {
+    if (-not (Test-Path -LiteralPath $HostFs)) {
+        New-Item -ItemType Directory -Force -Path $HostFs | Out-Null
+    } elseif (-not (Test-Path -LiteralPath $HostFs -PathType Container)) {
+        throw "HostFs path is not a directory: $HostFs"
+    }
+    $python = Get-ChildItem -Path (Join-Path $env:IDF_TOOLS_PATH 'python_env') `
+        -Filter 'python.exe' -Recurse -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    $py = if ($python) { $python.FullName } else {
+        $g = Get-Command python -ErrorAction SilentlyContinue
+        if (-not $g) { throw 'Python not found for hostfsd.' }
+        $g.Source
+    }
+    $hostfsScript = (Resolve-Path (Join-Path $PSScriptRoot 'hostfsd.py')).Path
+    $rootAbs = (Resolve-Path -LiteralPath $HostFs).Path
+    $padCfg = Join-Path $rootAbs 'sms.cfg'
+    $defaultPadCfg = Join-Path $PSScriptRoot '..\apps\sms\sms.cfg'
+    if (-not (Test-Path -LiteralPath $padCfg) -and
+        (Test-Path -LiteralPath $defaultPadCfg)) {
+        Copy-Item -LiteralPath $defaultPadCfg -Destination $padCfg -Force
+    }
+    if (-not (Test-Path -LiteralPath $padCfg)) {
+        $padCfg = (Resolve-Path -LiteralPath $defaultPadCfg).Path
+    }
+    try {
+        Get-NetTCPConnection -LocalPort $HostFsPort -State Listen `
+            -ErrorAction SilentlyContinue |
+            ForEach-Object {
+                Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue
+            }
+        Start-Sleep -Milliseconds 200
+    } catch {}
+    $hostfsOut = Join-Path (Get-Location) 'build\hostfsd.out.log'
+    $hostfsErr = Join-Path (Get-Location) 'build\hostfsd.err.log'
+    New-Item -ItemType Directory -Force -Path (Split-Path $hostfsOut) | Out-Null
+    $hostfsArgs = '"{0}" --root "{1}" --port {2} --pad-cfg "{3}"' -f `
+        $hostfsScript, $rootAbs, $HostFsPort, $padCfg
+    $hostfsProc = Start-Process -FilePath $py -ArgumentList $hostfsArgs `
+        -PassThru -WindowStyle Hidden `
+        -RedirectStandardOutput $hostfsOut -RedirectStandardError $hostfsErr
+    Start-Sleep -Milliseconds 500
+    if ($hostfsProc.HasExited) {
+        throw "hostfsd exited immediately (exit $($hostfsProc.ExitCode))"
+    }
+    Write-Host "HostFS: $rootAbs -> guest H: (TCP $HostFsPort / UART1)"
+}
+
 # wait=on is essential: a TCP serial port with no peer throws its output away,
 # and the whole boot is over in a quarter of a second.  Without it the test
 # races the emulator and loses often enough to be useless.
@@ -48,6 +100,11 @@ $qemuArgs = (Get-QemuMachineArgs -EfusePath $efuse) + @(
     '-monitor', 'none'
     '-serial', "tcp:127.0.0.1:$Port,server=on,wait=on"
 )
+
+if ($HostFs) {
+    # Second -serial is UART1 (HostFS). Console stays on the first.
+    $qemuArgs += @('-serial', "tcp:127.0.0.1:$HostFsPort")
+}
 
 if ($Sd) {
     $qemuArgs += Get-QemuSdArgs -Path $SdImage
@@ -280,8 +337,32 @@ try {
                 $seen = Read-Available
                 continue
             }
-            Send-Line $cmd
-            $seen = Wait-Prompt -Was $seen
+            # Prefer stable completion markers: screen redraws bump `\>` counts
+            # and would cut a long `copy` / `run` short.
+            if ($cmd -match '(?i)^copy\s') {
+                $wasCopy = Count-Of 'file(s) copied'
+                $wasErr = Count-Of ': no space left'
+                Send-Line $cmd
+                $deadline = (Get-Date).AddSeconds($TimeoutSec)
+                while ((Get-Date) -lt $deadline) {
+                    [void](Read-Available)
+                    if ((Count-Of 'file(s) copied') -gt $wasCopy) { break }
+                    if ((Count-Of ': no space left') -gt $wasErr) { break }
+                    Start-Sleep -Milliseconds 200
+                }
+                $seen = Read-Available
+            } elseif ($cmd -match '(?i)^run\s') {
+                $wasRet = Count-Of 'returned '
+                Send-Line $cmd
+                if (-not (Wait-Text -Needle 'returned ' -Was $wasRet `
+                                    -Seconds $TimeoutSec)) {
+                    Write-Host "warning: run did not report process exit"
+                }
+                $seen = Read-Available
+            } else {
+                Send-Line $cmd
+                $seen = Wait-Prompt -Was $seen -Seconds $TimeoutSec
+            }
         }
     }
 
@@ -296,6 +377,9 @@ try {
     if ($client) { $client.Dispose() }
     if ($proc -and -not $proc.HasExited) {
         Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+    }
+    if ($hostfsProc -and -not $hostfsProc.HasExited) {
+        Stop-Process -Id $hostfsProc.Id -Force -ErrorAction SilentlyContinue
     }
 
     # Written here, not after the try: a run that failed is the run whose
