@@ -75,7 +75,7 @@ if (AG_HAS(ag_api()->inp, key_pressed)) { ... }   /* есть ли вызов в
 
 ```c
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 8u
+#define AG_ABI_MINOR 10u
 ```
 
 * **minor + 1** — таблица выросла: новый вызов в конце подтаблицы, новая
@@ -385,6 +385,18 @@ void     fill_rect(int16_t x, int16_t y, uint16_t w, uint16_t h, uint32_t color)
 void     blit(...);
 int32_t  text(int16_t x, int16_t y, const char *s, uint32_t fg, uint32_t bg);
 void     backlight(uint8_t percent);    /* no-op на soft */
+
+/* Soft-draw (ABI 0.9), integer raster, clip to framebuffer */
+void     pixel(int16_t x, int16_t y, uint32_t color);
+void     line(int16_t x0, int16_t y0, int16_t x1, int16_t y1, uint32_t color);
+void     circle(int16_t cx, int16_t cy, uint16_t r, uint32_t color);
+void     fill_circle(int16_t cx, int16_t cy, uint16_t r, uint32_t color);
+void     poly_begin(void);
+ag_err_t poly_vertex(int16_t x, int16_t y);
+void     poly_fill(uint32_t color);      /* convex, ≥3 verts */
+void     poly_stroke(uint32_t color);
+void     fill_convex(const ag_point_t *pts, int32_t n, uint32_t color);
+void     stroke_convex(const ag_point_t *pts, int32_t n, uint32_t color);
 ```
 
 Сейчас бэкенд — **программный** RGB565 framebuffer (`d:\fb0`, по умолчанию
@@ -403,24 +415,34 @@ front, то есть остаются какими были, но панели �
 Без back-буфера (`direct = true`) рисуют прямо во front. Текстовый blit на fb
 на время захвата останавливается; `release` презентует и возвращает текст.
 Цвета — `0x00RRGGBB`. Шрифт ядра — 8×16.
+Soft-draw (`pixel`/`line`/`circle`/`poly_*`) — целочисленный растеризатор в
+[`draw.c`](../../components/argon_kernel/src/dev/draw.c); полигоны только
+**выпуклые**. Полноценный GUI toolkit — не в ядре.
 
 Без дисплея (`display.driver = none`) `acquire` даёт `-AG_ENODEV`. Флаг
 образа `AG_AXE_NEEDS_GFX` отказывает в запуске, если дисплея нет.
 
-Проверка в QEMU: `apps/gfxdemo` (`ag_gfx_swap` после отрисовки), затем
-`gfxdump t:\shot.ppm`.
+Проверка в QEMU: `apps/gfxdemo` (rects + line/circle/poly), затем
+`gfxdump t:\shot.ppm`. Игра на Argon CC: `apps/cc/examples/asteroids.c`.
 
 ## `inp` — ввод событиями
 
 ```c
 bool     poll(ag_event_t *out, uint32_t timeout_ms);
 void     flush(void);
-bool     key_pressed(uint16_t keycode);   /* NULL в этой версии */
+bool     key_pressed(uint16_t keycode);   /* sticky serial; drains queue */
 uint16_t mods(void);
+uint32_t pad(int which);   /* 0=pad0, 1=pad1, 2=sys — HostFS PADPUSH cache */
+int32_t  btn(int id);      /* AG_BTN_*: live pad, else sticky fallback */
 ```
 
 Целые события — то, что нужно приложению, рисующему свой экран: у стрелок и
 F-клавиш нет символа, и `con->getch` их передать не может.
+
+**Игры / удержание / аккорды (SMS, Asteroids):** не `key_pressed` по UART.
+Нужен HostFS PADPUSH (`argon run -HostFs`, `sms.cfg`) → кэш `H:\sms.pad` /
+`inp->pad` / `inp->btn`. Это level-state с хоста ~60 Гц; диагонали и
+«газ + поворот» работают. `key_pressed` — только fallback без HostFS.
 
 **`poll`** возвращает `true`, если событие получено. `timeout_ms`: `0` — только
 опрос, `UINT32_MAX` — ждать сколько угодно. В фоновом процессе — всегда `false`.

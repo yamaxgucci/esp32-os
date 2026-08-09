@@ -81,6 +81,11 @@ static uint32_t           s_dropped_events;
 static uint16_t           s_mods;
 static bool (*s_hotkeys)(ag_event_t *ev);
 
+/* HID usage page 0x07 keycodes fit in a byte; sticky TTL covers auto-repeat. */
+#define AG_KEY_STICKY_MS 150u
+static uint8_t  s_key_down[32];
+static uint32_t s_key_stamp[256];
+
 /* ---------------------------------------------------------------------- */
 
 static uint32_t now_ms(void) { return (uint32_t)(esp_timer_get_time() / 1000); }
@@ -226,6 +231,16 @@ static void publish(const ag_event_t *ev)
 
     if (stamped.type == AG_EV_KEY_DOWN) {
         s_mods = stamped.key.mods;
+        if (stamped.key.keycode < 256u) {
+            const uint16_t k = stamped.key.keycode;
+            s_key_down[k >> 3] |= (uint8_t)(1u << (k & 7u));
+            s_key_stamp[k] = now_ms();
+        }
+    } else if (stamped.type == AG_EV_KEY_UP) {
+        if (stamped.key.keycode < 256u) {
+            const uint16_t k = stamped.key.keycode;
+            s_key_down[k >> 3] &= (uint8_t)~(1u << (k & 7u));
+        }
     }
 
     /*
@@ -316,6 +331,7 @@ void ag_console_flush_input(void)
     ag_event_t drop;
     while (xQueueReceive(s_events, &drop, 0) == pdTRUE) {
     }
+    memset(s_key_down, 0, sizeof(s_key_down));
 }
 
 uint16_t ag_console_mods(void) { return s_mods; }
@@ -329,6 +345,27 @@ bool ag_console_read_event(ag_event_t *ev, uint32_t timeout_ms)
                                  ? portMAX_DELAY
                                  : pdMS_TO_TICKS(timeout_ms);
     return xQueueReceive(s_events, ev, ticks) == pdTRUE;
+}
+
+bool ag_console_key_pressed(uint16_t keycode)
+{
+    if (!s_ready || keycode >= 256u) {
+        return false;
+    }
+    /* Drain so a game poll loop does not fill the queue; sticky already set
+     * in publish() for each KEY_DOWN. */
+    ag_event_t drop;
+    while (ag_console_read_event(&drop, 0)) {
+    }
+    const uint32_t now = now_ms();
+    if ((s_key_down[keycode >> 3] & (uint8_t)(1u << (keycode & 7u))) == 0) {
+        return false;
+    }
+    if ((now - s_key_stamp[keycode]) > AG_KEY_STICKY_MS) {
+        s_key_down[keycode >> 3] &= (uint8_t)~(1u << (keycode & 7u));
+        return false;
+    }
+    return true;
 }
 
 bool ag_console_peek_event(ag_event_t *ev)

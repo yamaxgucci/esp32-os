@@ -26,6 +26,7 @@ void run_reslist_tests(void);
 void run_arena_tests(void);
 void run_probe_tests(void);
 void run_cc_tests(void);
+void run_draw_tests(void);
 
 int main(void)
 {
@@ -47,6 +48,7 @@ int main(void)
     run_arena_tests();
     run_probe_tests();
     run_cc_tests();
+    run_draw_tests();
 
     printf("%d checks, %d failures\n", ag_test_checks, ag_test_failures);
     return ag_test_failures == 0 ? 0 : 1;

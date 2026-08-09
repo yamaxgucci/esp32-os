@@ -68,7 +68,9 @@ add_executable(argon_tests
     test_codepage.c
     test_probe.c
     test_cc.c
+    test_draw.c
     "${ARGON_ROOT}/apps/cc/cc_compile.c"
+    "${ARGON_ROOT}/components/argon_kernel/src/dev/draw.c"
     ${ARGON_PORTABLE_SRCS})
 
 target_include_directories(argon_tests PRIVATE ${ARGON_INCLUDES})

@@ -507,6 +507,74 @@ static inline int32_t ag_gfx_text(int16_t x, int16_t y, const char *s,
 {
     return g_ag_api->gfx->text(x, y, s, fg, bg);
 }
+static inline void ag_gfx_pixel(int16_t x, int16_t y, uint32_t color)
+{
+    g_ag_api->gfx->pixel(x, y, color);
+}
+static inline void ag_gfx_line(int16_t x0, int16_t y0, int16_t x1, int16_t y1,
+                               uint32_t color)
+{
+    g_ag_api->gfx->line(x0, y0, x1, y1, color);
+}
+static inline void ag_gfx_circle(int16_t cx, int16_t cy, uint16_t r,
+                                 uint32_t color)
+{
+    g_ag_api->gfx->circle(cx, cy, r, color);
+}
+static inline void ag_gfx_fill_circle(int16_t cx, int16_t cy, uint16_t r,
+                                      uint32_t color)
+{
+    g_ag_api->gfx->fill_circle(cx, cy, r, color);
+}
+static inline void ag_gfx_poly_begin(void) { g_ag_api->gfx->poly_begin(); }
+static inline ag_err_t ag_gfx_poly_vertex(int16_t x, int16_t y)
+{
+    return g_ag_api->gfx->poly_vertex(x, y);
+}
+static inline void ag_gfx_poly_fill(uint32_t color)
+{
+    g_ag_api->gfx->poly_fill(color);
+}
+static inline void ag_gfx_poly_stroke(uint32_t color)
+{
+    g_ag_api->gfx->poly_stroke(color);
+}
+static inline void ag_gfx_fill_convex(const ag_point_t *pts, int32_t n,
+                                      uint32_t color)
+{
+    g_ag_api->gfx->fill_convex(pts, n, color);
+}
+static inline void ag_gfx_stroke_convex(const ag_point_t *pts, int32_t n,
+                                        uint32_t color)
+{
+    g_ag_api->gfx->stroke_convex(pts, n, color);
+}
+
+/* ---- input helpers ------------------------------------------------------ */
+
+static inline bool ag_key(uint16_t keycode)
+{
+    if (g_ag_api->inp == NULL || g_ag_api->inp->key_pressed == NULL) {
+        return false;
+    }
+    return g_ag_api->inp->key_pressed(keycode);
+}
+/* Live HostFS pad byte (0=pad0, 1=pad1, 2=sys); 0 if PADPUSH unavailable. */
+static inline uint32_t ag_pad(int which)
+{
+    if (g_ag_api->inp == NULL || g_ag_api->inp->pad == NULL) {
+        return 0;
+    }
+    return g_ag_api->inp->pad(which);
+}
+/* Level button (AG_BTN_*). Prefers PADPUSH; else sticky key_pressed. */
+static inline int32_t ag_btn(int id)
+{
+    if (g_ag_api->inp == NULL || g_ag_api->inp->btn == NULL) {
+        return 0;
+    }
+    return g_ag_api->inp->btn(id);
+}
 
 #ifdef __cplusplus
 }

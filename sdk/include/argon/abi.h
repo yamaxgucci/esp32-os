@@ -43,9 +43,11 @@ extern "C" {
  *     can ask which bus and address matched.
  * 0.8 made gfx stop being NULL: soft RGB565 framebuffer, acquire/release,
  *     primitives, and built-in 8x16 text.
+ * 0.9 added soft-draw: pixel/line/circle/fill_circle/poly_* / fill_convex.
+ * 0.10 appended inp->btn / inp->pad: HostFS PADPUSH live buttons (SMS/Asteroids).
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 8u
+#define AG_ABI_MINOR 10u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -374,6 +376,21 @@ typedef struct {
     };
 } ag_event_t;
 
+/*
+ * HostFS PADPUSH / H:\sms.pad button ids for inp->btn (level state, not edges).
+ * Bits match SMS pad0: UP DOWN LEFT RIGHT B1 B2; then PAUSE/QUIT from sys byte.
+ */
+enum ag_btn {
+    AG_BTN_UP = 0,
+    AG_BTN_DOWN = 1,
+    AG_BTN_LEFT = 2,
+    AG_BTN_RIGHT = 3,
+    AG_BTN_B1 = 4,    /* fire / confirm — sms.cfg pad0.b1 */
+    AG_BTN_B2 = 5,
+    AG_BTN_PAUSE = 6,
+    AG_BTN_QUIT = 7,
+};
+
 typedef struct ag_inp_api {
     uint32_t size;
 
@@ -382,6 +399,13 @@ typedef struct ag_inp_api {
     void (*flush)(void);
     bool (*key_pressed)(uint16_t keycode);
     uint16_t (*mods)(void);
+    /*
+     * Live pad byte: which 0=pad0, 1=pad1, 2=sys.  From HostFS PADPUSH cache;
+     * 0 if HostFS pad is missing/stale.  Prefer btn() from games/CC.
+     */
+    uint32_t (*pad)(int which);
+    /* Level button: 1 if held.  PADPUSH when available, else sticky key_pressed. */
+    int32_t (*btn)(int id);
 } ag_inp_api_t;
 
 /* ------------------------------------------------------------------------ */
@@ -407,6 +431,11 @@ typedef struct {
     bool        direct;    /* true when fb is scanned out without a flush  */
 } ag_gfxinfo_t;
 
+typedef struct {
+    int16_t x;
+    int16_t y;
+} ag_point_t;
+
 typedef struct ag_gfx_api {
     uint32_t size;
 
@@ -426,6 +455,23 @@ typedef struct ag_gfx_api {
     int32_t (*text)(int16_t x, int16_t y, const char *s, uint32_t fg,
                     uint32_t bg);
     void (*backlight)(uint8_t percent);
+
+    /* Soft-draw primitives (RGB colour 0x00RRGGBB). Require acquire. */
+    void (*pixel)(int16_t x, int16_t y, uint32_t color);
+    void (*line)(int16_t x0, int16_t y0, int16_t x1, int16_t y1,
+                 uint32_t color);
+    void (*circle)(int16_t cx, int16_t cy, uint16_t r, uint32_t color);
+    void (*fill_circle)(int16_t cx, int16_t cy, uint16_t r, uint32_t color);
+    /*
+     * Stateful convex polygon (CC-friendly, no pointer args):
+     * poly_begin → poly_vertex… → poly_fill / poly_stroke.
+     */
+    void (*poly_begin)(void);
+    ag_err_t (*poly_vertex)(int16_t x, int16_t y);
+    void (*poly_fill)(uint32_t color);
+    void (*poly_stroke)(uint32_t color);
+    void (*fill_convex)(const ag_point_t *pts, int32_t n, uint32_t color);
+    void (*stroke_convex)(const ag_point_t *pts, int32_t n, uint32_t color);
 } ag_gfx_api_t;
 
 /* ------------------------------------------------------------------------ */
