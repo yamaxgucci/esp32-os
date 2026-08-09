@@ -24,8 +24,21 @@ static const uint8_t k_tiny_rom[0x4000] = {
     0x18, 0xFE,             /* jr $ */
 };
 
-static uint16_t s_frame[VIDEO_WIDTH_SMS * VIDEO_HEIGHT_SMS];
 static sms_cfg_t s_cfg;
+
+/*
+ * The emulator renders straight into the gfx back buffer: bitmap.pitch is the
+ * display stride and bitmap.data points at where line 0 lands.  There is no
+ * intermediate frame and no blit - the old path copied 96 KB per frame for
+ * nothing, and then flushed all 640x400 on top of that.
+ *
+ * Room for 224 lines is reserved even though most games run 192, because the
+ * VDP can switch to the taller mode at runtime while the origin cannot move:
+ * render_reset() clears pitch x height bytes from it once, at power-on.
+ */
+#define SMS_MAX_LINES 224
+static int s_ox;
+static int s_oy;
 
 /*
  * Preferred input: host-pushed live pad (H:\sms.pad via HostFS PADPUSH).
@@ -143,6 +156,46 @@ static int arg_is_wav(const char *s)
     return *a == '\0' && *s == '\0';
 }
 
+static int arg_eq(const char *s, const char *lit)
+{
+    if (s == NULL) {
+        return 0;
+    }
+    for (; *lit && *s; lit++, s++) {
+        char cb = *s;
+        if (cb >= 'A' && cb <= 'Z') {
+            cb = (char)(cb - 'A' + 'a');
+        }
+        if (*lit != cb) {
+            return 0;
+        }
+    }
+    return *lit == '\0' && *s == '\0';
+}
+
+/*
+ * "% realtime" is the number that decides whether this is playable: one NTSC
+ * frame is 16667 us of guest time, so spending that much on it means keeping up
+ * exactly.  Everything here is wall time on the emulator's own work - the pacing
+ * sleep is deliberately outside it.
+ */
+static void report_stats(const char *tag, uint32_t frames, uint64_t span_us,
+                         uint64_t work_sum, uint64_t emu_sum,
+                         uint64_t present_sum, uint64_t work_max)
+{
+    if (frames == 0u || span_us == 0u) {
+        return;
+    }
+    const unsigned avg = (unsigned)(work_sum / frames);
+    const unsigned emu = (unsigned)(emu_sum / frames);
+    const unsigned pres = (unsigned)(present_sum / frames);
+    const unsigned fps = (unsigned)((uint64_t)frames * 1000000u / span_us);
+    const unsigned pct = (avg > 0u) ? (unsigned)(1666700u / avg) : 0u;
+    ag_printf("%s: %u fps, work %u us (emu %u, show %u), max %u us, "
+              "%u%% realtime\n",
+              tag, fps, avg, emu, pres, (unsigned)work_max, pct);
+}
+
 static int load_cart(const char *path)
 {
     if (path == NULL || path[0] == '\0') {
@@ -182,26 +235,29 @@ static int load_cart(const char *path)
     return ok;
 }
 
-static void blit_to_fb(ag_gfxinfo_t *info)
+/* Aim the emulator at the acquired framebuffer.  Must run before
+ * system_poweron(), which clears the bitmap through these fields. */
+static void bind_frame_to_fb(const ag_gfxinfo_t *info)
 {
-    const int ox = ((int)info->width - VIDEO_WIDTH_SMS) / 2;
-    const int oy = ((int)info->height - VIDEO_HEIGHT_SMS) / 2;
-    uint16_t *dst = (uint16_t *)info->fb;
+    s_ox = ((int)info->width > VIDEO_WIDTH_SMS)
+               ? ((int)info->width - VIDEO_WIDTH_SMS) / 2
+               : 0;
+    s_oy = ((int)info->height > SMS_MAX_LINES)
+               ? ((int)info->height - SMS_MAX_LINES) / 2
+               : 0;
 
-    for (int y = 0; y < VIDEO_HEIGHT_SMS; y++) {
-        const int dy = oy + y;
-        if ((unsigned)dy >= info->height) {
-            continue;
-        }
-        uint16_t *row = dst + dy * (info->stride / 2) + (ox > 0 ? ox : 0);
-        const uint16_t *src = s_frame + y * VIDEO_WIDTH_SMS;
-        const int copy_w = VIDEO_WIDTH_SMS;
-        for (int x = 0; x < copy_w; x++) {
-            if ((unsigned)(ox + x) < info->width) {
-                row[x] = src[x];
-            }
-        }
-    }
+    uint8_t *const origin = (uint8_t *)info->fb + (size_t)s_oy * info->stride +
+                            (size_t)s_ox * sizeof(uint16_t);
+
+    sms_bitmap = (uint16_t *)origin;
+    memset(&bitmap, 0, sizeof(bitmap));
+    bitmap.data = origin;
+    bitmap.width = VIDEO_WIDTH_SMS;
+    bitmap.height = VIDEO_HEIGHT_SMS;
+    bitmap.pitch = (int32_t)info->stride;
+    bitmap.depth = 16;
+    bitmap.viewport.w = VIDEO_WIDTH_SMS;
+    bitmap.viewport.h = VIDEO_HEIGHT_SMS;
 }
 
 static void try_open_host_pad(void)
@@ -437,8 +493,22 @@ int ag_main(int argc, char **argv)
     int         force_sticky = 0;
     int         want_sound = 0;
     const char *wav_path = "mock";
+    int         present_div = 1; /* frames of emulation per frame shown */
+    int         stats = 0;
 
     for (int i = 1; i < argc; i++) {
+        if (arg_eq(argv[i], "fps30")) {
+            present_div = 2;
+            continue;
+        }
+        if (arg_eq(argv[i], "fps60")) {
+            present_div = 1;
+            continue;
+        }
+        if (arg_eq(argv[i], "stats")) {
+            stats = 1;
+            continue;
+        }
         if (arg_is_nolivepad(argv[i])) {
             force_sticky = 1;
             want_livepad = 0;
@@ -482,16 +552,15 @@ int ag_main(int argc, char **argv)
     option.soundlevel = 2;
     option.spritelimit = 1;
 
-    sms_bitmap = s_frame;
-    memset(s_frame, 0, sizeof(s_frame));
-    memset(&bitmap, 0, sizeof(bitmap));
-    bitmap.data = (uint8_t *)s_frame;
-    bitmap.width = VIDEO_WIDTH_SMS;
-    bitmap.height = VIDEO_HEIGHT_SMS;
-    bitmap.pitch = VIDEO_WIDTH_SMS * 2;
-    bitmap.depth = 16;
-    bitmap.viewport.w = VIDEO_WIDTH_SMS;
-    bitmap.viewport.h = VIDEO_HEIGHT_SMS;
+    /* Graphics first: the emulator draws into the acquired buffer, and
+     * system_poweron() already clears it through bitmap.*. */
+    ag_gfxinfo_t info;
+    if (ag_gfx_acquire(&info) != AG_OK) {
+        ag_printf("gfx acquire failed\n");
+        return 1;
+    }
+    ag_gfx_clear(0x00000000u);
+    bind_frame_to_fb(&info);
 
     sms_cfg_load(&s_cfg, rom);
     if (want_livepad && !force_sticky) {
@@ -502,6 +571,7 @@ int ag_main(int argc, char **argv)
 
     if (!load_cart(rom)) {
         ag_printf("failed to load rom\n");
+        ag_gfx_release();
         return 1;
     }
 
@@ -513,28 +583,65 @@ int ag_main(int argc, char **argv)
         Sound_Init();
     }
 
-    ag_gfxinfo_t info;
-    if (ag_gfx_acquire(&info) != AG_OK) {
-        ag_printf("gfx acquire failed\n");
-        Sound_Close();
-        system_poweroff();
-        return 1;
-    }
-    ag_gfx_clear(0x00000000u);
-    int ran = 0;
+    ag_printf("sms: %ux%u at %d,%d, present every %d frame(s)\n",
+              (unsigned)VIDEO_WIDTH_SMS, (unsigned)VIDEO_HEIGHT_SMS, s_ox, s_oy,
+              present_div);
+
+    /*
+     * Emulation always runs at the guest's 60 Hz - the Z80 and the sound chips
+     * have to, or the game plays slowly rather than less smoothly.  The divider
+     * only skips rasterising and showing, which is where the cost is.
+     */
+    uint64_t work_sum = 0; /* emu + present, no pacing sleep */
+    uint64_t emu_sum = 0;
+    uint64_t present_sum = 0;
+    uint64_t work_max = 0;
+    uint32_t window = 0;
+    ag_time_t window_t0 = ag_micros();
+    int       ran = 0;
+
     for (; frames < 0 || ran < frames; ran++) {
-        const uint32_t t0 = ag_millis();
+        const uint32_t  t0 = ag_millis();
+        const ag_time_t f0 = ag_micros();
+
         poll_pad();
-        system_frame(0);
-        blit_to_fb(&info);
-        /* Every frame: soft fb → QEMU RGB / fbcon / gfxdump /live. */
-        ag_gfx_flush(0, 0, info.width, info.height);
+        const int show = (present_div <= 1) || ((ran % present_div) == 0);
+        system_frame(show ? 0 : 1);
+
+        const ag_time_t f1 = ag_micros();
+        if (show) {
+            ag_gfx_flush((uint16_t)s_ox, (uint16_t)s_oy, VIDEO_WIDTH_SMS,
+                         (uint16_t)bitmap.viewport.h);
+        }
+        const ag_time_t f2 = ag_micros();
+
+        const uint64_t work = (uint64_t)(f2 - f0);
+        work_sum += work;
+        emu_sum += (uint64_t)(f1 - f0);
+        present_sum += (uint64_t)(f2 - f1);
+        if (work > work_max) {
+            work_max = work;
+        }
+        window++;
+
+        if (stats && (uint64_t)(f2 - window_t0) >= 2000000u) {
+            report_stats("sms", window, (uint64_t)(f2 - window_t0), work_sum,
+                         emu_sum, present_sum, work_max);
+            work_sum = emu_sum = present_sum = work_max = 0;
+            window = 0;
+            window_t0 = f2;
+        }
+
         /* Cap ~60 fps (without QEMU RGB busy-wait the guest ran away). */
         ag_yield();
         const uint32_t dt = ag_millis() - t0;
         if (dt < 16u) {
             ag_delay(16u - dt);
         }
+    }
+    if (window > 0) {
+        report_stats("sms", window, (uint64_t)(ag_micros() - window_t0),
+                     work_sum, emu_sum, present_sum, work_max);
     }
     ag_printf("sms: %d frames, cart %u KB crc=%08x\n", ran,
               (unsigned)(cart.size / 1024u), (unsigned)cart.crc);

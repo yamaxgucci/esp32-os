@@ -87,19 +87,105 @@ enum {
     RGB_MMIO_UPDATE_STATUS = 0x14u / 4u,
 };
 
-static void qemu_present(void)
+/*
+ * Present rows y .. y+h of the framebuffer.
+ *
+ * Rows, not rectangles, and that is the whole point: UPDATE_CONTENT is a
+ * *tightly packed* bitmap of exactly the region being updated - the same
+ * contract as esp_lcd_panel_draw_bitmap, whose caller always hands over a
+ * standalone w*h buffer.  A framebuffer is only tightly packed when the region
+ * spans full rows; for anything narrower QEMU would read w*h pixels straight
+ * from the pointer and paint the top-left corner of the frame into the region.
+ * That is not theoretical - it looked like the console text reappearing in the
+ * middle of the screen in diagonal bands.
+ *
+ * A caller that touched a narrow rectangle therefore still gets its rows
+ * presented whole.  The extra columns cost nothing on this side: they are read
+ * by QEMU's display thread, while the copy the guest pays for stays narrow.
+ */
+static void qemu_present_rows(int32_t y, int32_t h)
 {
     if (s_qemu_panel == NULL || s_front == NULL || s_w == 0 || s_h == 0) {
         return;
     }
+    if (y < 0) {
+        h += y;
+        y = 0;
+    }
+    if (y + h > (int32_t)s_h) {
+        h = (int32_t)s_h - y;
+    }
+    if (h <= 0) {
+        return;
+    }
+
     volatile uint32_t *const rgb = (volatile uint32_t *)0x21000000u;
-    /* X in high half, Y in low — matches QEMU FIELD_* layout. */
-    rgb[RGB_MMIO_UPDATE_FROM] = 0u;
-    rgb[RGB_MMIO_UPDATE_TO] =
-        ((uint32_t)s_w << 16) | (uint32_t)s_h;
-    rgb[RGB_MMIO_UPDATE_CONTENT] = (uint32_t)(uintptr_t)s_front;
+    /* X in the high half, Y in the low one, per rgb_qemu_dev_t. Ends are
+     * exclusive. */
+    rgb[RGB_MMIO_UPDATE_FROM] = (uint32_t)y;
+    rgb[RGB_MMIO_UPDATE_TO] = ((uint32_t)s_w << 16) | (uint32_t)(y + h);
+    rgb[RGB_MMIO_UPDATE_CONTENT] =
+        (uint32_t)(uintptr_t)((const uint8_t *)s_front + (size_t)y * s_stride);
     rgb[RGB_MMIO_UPDATE_STATUS] = 1u; /* ENA; QEMU clears asynchronously */
     taskYIELD();
+}
+
+static void qemu_present(void)
+{
+    qemu_present_rows(0, (int32_t)s_h);
+}
+
+/*
+ * Copy draw → front within a rectangle, then present the rows it touched.
+ * An empty rectangle after clipping still presents: callers use flush as the
+ * "show what I drew" signal, and the QEMU window needs the kick regardless.
+ *
+ * The rectangle is what makes an emulator affordable: a 320x224 frame is 140 KB
+ * to copy against 500 KB for a full 640x400 frame, and this copy is CPU, not
+ * DMA.  Only the copy narrows, though - see qemu_present_rows for why the
+ * presented region cannot.
+ */
+static void present_rect_to_front(int32_t x, int32_t y, int32_t w, int32_t h)
+{
+    if (s_front == NULL || s_draw == NULL) {
+        return;
+    }
+    if (x < 0) {
+        w += x;
+        x = 0;
+    }
+    if (y < 0) {
+        h += y;
+        y = 0;
+    }
+    if (x + w > (int32_t)s_w) {
+        w = (int32_t)s_w - x;
+    }
+    if (y + h > (int32_t)s_h) {
+        h = (int32_t)s_h - y;
+    }
+    if (w <= 0 || h <= 0) {
+        qemu_present();
+        return;
+    }
+
+    if (s_draw != s_front) {
+        if (x == 0 && w == (int32_t)s_w) {
+            /* Whole rows are one contiguous run. */
+            const size_t off = (size_t)y * s_stride;
+            memcpy((uint8_t *)s_front + off, (const uint8_t *)s_draw + off,
+                   (size_t)h * s_stride);
+        } else {
+            const size_t row_bytes = (size_t)w * sizeof(uint16_t);
+            for (int32_t row = 0; row < h; row++) {
+                const size_t off =
+                    (size_t)(y + row) * s_stride + (size_t)x * sizeof(uint16_t);
+                memcpy((uint8_t *)s_front + off, (const uint8_t *)s_draw + off,
+                       row_bytes);
+            }
+        }
+    }
+    qemu_present_rows(y, h);
 }
 
 /* Copy draw → front (full frame). No-op when drawing already targets front. */
@@ -308,12 +394,11 @@ static void gfx_release(void)
 
 static void gfx_flush(uint16_t x, uint16_t y, uint16_t w, uint16_t h)
 {
-    (void)x;
-    (void)y;
-    (void)w;
-    (void)h;
-    /* Soft path: full-frame present (rect is reserved for panel backends). */
-    present_draw_to_front();
+    if (w == 0 || h == 0) {
+        present_draw_to_front();
+        return;
+    }
+    present_rect_to_front((int32_t)x, (int32_t)y, (int32_t)w, (int32_t)h);
 }
 
 static void gfx_swap(void)
@@ -321,12 +406,26 @@ static void gfx_swap(void)
     present_draw_to_front();
 }
 
+/*
+ * Clear means clear the screen, so the front buffer goes too.  An app that
+ * clears once and then flushes a sub-rectangle every frame - which is exactly
+ * what the emulators do - would otherwise keep whatever the console left around
+ * its window on display for as long as it runs.
+ */
 static void gfx_clear(uint32_t color)
 {
     if (s_draw == NULL) {
         return;
     }
-    fill_rect_raw(0, 0, (int32_t)s_w, (int32_t)s_h, rgb_to_565(color));
+    const uint16_t c = rgb_to_565(color);
+    fill_rect_raw(0, 0, (int32_t)s_w, (int32_t)s_h, c);
+    if (s_front != NULL && s_front != s_draw) {
+        const size_t pixels = (size_t)s_w * s_h;
+        for (size_t i = 0; i < pixels; i++) {
+            s_front[i] = c;
+        }
+    }
+    qemu_present();
 }
 
 static void gfx_fill_rect(int16_t x, int16_t y, uint16_t w, uint16_t h,

@@ -18,10 +18,10 @@
  * of them are nothing next to the arena. */
 #define FM_COPY_CHUNK (8u * 1024u)
 
-/* How often the message line may change during a copy.  HostFS is slow enough
- * that every chunk already qualifies; a fast RAM-disk copy would otherwise burn
- * the serial console redrawing the same row thousands of times. */
-#define FM_COPY_UI_MS 100u
+/* How often the message line may change during a copy.  Half a second is often
+ * enough to look alive without burning the serial console on a fast RAM-disk
+ * copy (where every chunk would otherwise redraw). */
+#define FM_COPY_UI_MS 500u
 
 #define FM_COPY_BAR_W 20
 

@@ -58,6 +58,15 @@ void free(void *p)
 void exit(int code) { ag_exit(code); }
 void abort(void) { ag_panic("abort"); }
 
+/* What a failed assert() expands to.  Print where it happened, then panic. */
+void __assert_func(const char *file, int line, const char *func,
+                   const char *expr)
+{
+    ag_printf("assert: %s:%d %s: %s\n", file ? file : "?", line,
+              func ? func : "?", expr ? expr : "?");
+    ag_panic("assert");
+}
+
 int abs(int x) { return x < 0 ? -x : x; }
 long labs(long x) { return x < 0 ? -x : x; }
 

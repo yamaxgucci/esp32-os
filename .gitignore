@@ -22,6 +22,9 @@ Testing/
 # Machine specific toolchain paths
 tools/local-env.ps1
 
+# Python bytecode from the host tools
+__pycache__/
+
 # Editors / OS
 .claude/
 .vscode/

@@ -366,6 +366,12 @@ def main():
                          "default) keeps fonts, images and tables out of the "
                          "code arena, code puts them back in SRAM for latency. "
                          "AG_HOT_RODATA does the same for one object")
+    ap.add_argument("--libs", action="append", default=[],
+                    help="extra archives to link against, by name and without "
+                         "the -l (libgcc is always linked). Only members that "
+                         "resolve a still-undefined symbol are pulled in, so "
+                         "asking for c to get setjmp does not drag newlib's "
+                         "malloc past the app's own")
     ap.add_argument("--keep-elf", help="also write the intermediate ELF here")
     args = ap.parse_args()
 
@@ -404,7 +410,7 @@ def main():
         run([args.gcc, "-nostdlib", "-nostartfiles",
              "-Wl,--emit-relocs", "-Wl,-T", script,
              "-Wl,--no-warn-rwx-segments", "-o", elf_path] + objects +
-            ["-lgcc"])
+            ["-l" + lib for lib in args.libs] + ["-lgcc"])
 
         with open(elf_path, "rb") as f:
             elf_data = f.read()
