@@ -57,6 +57,15 @@ static int s_oy;
  * the serial sticky path, which has no key-up and is only a degraded reserve.
  */
 static int s_use_live_pad = 1;
+static int s_run_z80_cpu = 1;   /* 0: advance zclk only, no sms_z80_execute */
+static int s_run_sound = 1;     /* 0: skip sample mix (still accepts reg writes) */
+static int s_profile_frames = 0; /* print per-frame m68k/z80/vdp split */
+
+/* Last run_frame phase times (µs), filled when s_profile_frames > 0. */
+static uint32_t s_prof_m68k_us;
+static uint32_t s_prof_z80_us;
+static uint32_t s_prof_snd_us;
+static uint32_t s_prof_vdp_us;
 
 #define PAD_HOLD_MS 150u /* matches console sticky TTL; serial has no key-up */
 #define MD_BUTTONS 8
@@ -293,9 +302,8 @@ void gwenesis_io_get_buttons(void) {}
 
 /*
  * One frame, line by line, on one core.  Every unit takes an absolute master
- * clock target, so advancing one counter keeps the 68000 and the VDP in step
- * without either of them knowing about the other.  The sound units are absent in
- * this build (see port/md_mute.c).
+ * clock target, so advancing one counter keeps the 68000, Z80 and VDP in step
+ * without either of them knowing about the other.
  *
  * `render` is what the display divider switches off: skipping the rasteriser is
  * where the saving is, and the 68000 has to run either way or the game slows
@@ -311,6 +319,11 @@ static void run_frame(int render)
      */
     static int hint_counter;
     static int system_clock;
+    const int  profile = s_profile_frames > 0;
+    uint64_t   m68k_us = 0;
+    uint64_t   z80_us = 0;
+    uint64_t   snd_us = 0;
+    uint64_t   vdp_us = 0;
 
     screen_width = REG12_MODE_H40 ? 320 : 256;
     screen_height = REG1_PAL ? VISIBLE_LINES_PAL : VISIBLE_LINES_NTSC;
@@ -319,7 +332,9 @@ static void run_frame(int render)
     hint_counter = gwenesis_vdp_regs[10];
     system_clock = 0;
     scan_line = 0;
-    md_sound_begin_frame(lines_per_frame);
+    if (s_run_sound) {
+        md_sound_begin_frame(lines_per_frame);
+    }
 
     if (m68k_arm_address_error_trap() != 0) {
         m68k_on_address_error();
@@ -328,14 +343,47 @@ static void run_frame(int render)
     }
 
     while (scan_line < lines_per_frame) {
+        ag_time_t t0, t1;
+
         system_clock += VDP_CYCLES_PER_LINE;
 resume_m68k:
+        t0 = profile ? ag_micros() : 0;
         m68k_run(system_clock);
-        z80_run(system_clock);
-        md_sound_line(scan_line, lines_per_frame);
+        if (profile) {
+            t1 = ag_micros();
+            m68k_us += (uint64_t)(t1 - t0);
+            t0 = t1;
+        }
+
+        if (s_run_z80_cpu) {
+            z80_run(system_clock);
+        } else {
+            /* Keep the Z80 clock in step so BUSREQ sync does not run away. */
+            if (system_clock > zclk) {
+                zclk = system_clock;
+            }
+        }
+        if (profile) {
+            t1 = ag_micros();
+            z80_us += (uint64_t)(t1 - t0);
+            t0 = t1;
+        }
+
+        if (s_run_sound) {
+            md_sound_line(scan_line, lines_per_frame);
+        }
+        if (profile) {
+            t1 = ag_micros();
+            snd_us += (uint64_t)(t1 - t0);
+            t0 = t1;
+        }
 
         if (render && scan_line < screen_height) {
             gwenesis_vdp_render_line(scan_line);
+        }
+        if (profile) {
+            t1 = ag_micros();
+            vdp_us += (uint64_t)(t1 - t0);
         }
 
         /* The line-interrupt counter reloads outside the active display. */
@@ -360,14 +408,20 @@ resume_m68k:
                 gwenesis_vdp_status |= STATUS_VIRQPENDING;
                 m68k_set_irq(6);
             }
-            z80_irq_line(1);
+            if (s_run_z80_cpu) {
+                z80_irq_line(1);
+            }
         }
         if (scan_line == (screen_height + 1)) {
-            z80_irq_line(0);
+            if (s_run_z80_cpu) {
+                z80_irq_line(0);
+            }
         }
     }
 
-    md_sound_end_frame();
+    if (s_run_sound) {
+        md_sound_end_frame();
+    }
     /* Rebase the 68000's counter so next frame starts from zero again. */
     m68k_frame_end(system_clock);
     /* Z80 clock is absolute within the frame; rebase with the 68k. */
@@ -375,6 +429,12 @@ resume_m68k:
         zclk -= system_clock;
     } else {
         zclk = 0;
+    }
+    if (profile) {
+        s_prof_m68k_us = (uint32_t)m68k_us;
+        s_prof_z80_us = (uint32_t)z80_us;
+        s_prof_snd_us = (uint32_t)snd_us;
+        s_prof_vdp_us = (uint32_t)vdp_us;
     }
     frame_counter++;
 }
@@ -395,6 +455,15 @@ int ag_main(int argc, char **argv)
             present_div = 1;
         } else if (arg_eq(argv[i], "stats")) {
             stats = 1;
+        } else if (arg_eq(argv[i], "profile")) {
+            /* Per-frame m68k/z80/snd/vdp for the run (use with a frame count). */
+            s_profile_frames = 1;
+            stats = 1;
+        } else if (arg_eq(argv[i], "noz80")) {
+            s_run_z80_cpu = 0;
+        } else if (arg_eq(argv[i], "nosound")) {
+            s_run_sound = 0;
+            sound_path = "mock";
         } else if (arg_eq(argv[i], "nolivepad")) {
             want_livepad = 0;
         } else if (arg_eq(argv[i], "livepad")) {
@@ -461,6 +530,15 @@ int ag_main(int argc, char **argv)
     ag_printf("md: %dx%d at %d,%d, rom %u KB, present every %d frame(s)\n",
               MD_WIDTH, MD_MAX_LINES, s_ox, s_oy,
               (unsigned)(rom_size / 1024u), present_div);
+    if (!s_run_z80_cpu) {
+        ag_printf("md: Z80 CPU off (zclk only; BUSREQ still live)\n");
+    }
+    if (!s_run_sound) {
+        ag_printf("md: sound mix off\n");
+    }
+    if (s_profile_frames) {
+        ag_printf("md: profile = m68k/z80/snd/vdp us per frame\n");
+    }
 
     uint64_t  work_sum = 0;
     uint64_t  emu_sum = 0;
@@ -476,6 +554,10 @@ int ag_main(int argc, char **argv)
 
         poll_pad();
         const int show = (present_div <= 1) || ((ran % present_div) == 0);
+        if (s_profile_frames && ran >= 120) {
+            /* Keep the first two seconds of detail; then normal stats only. */
+            s_profile_frames = 0;
+        }
         run_frame(show);
 
         const ag_time_t f1 = ag_micros();
@@ -494,7 +576,15 @@ int ag_main(int argc, char **argv)
         }
         window++;
 
-        if (stats && (uint64_t)(f2 - window_t0) >= 2000000u) {
+        if (s_profile_frames) {
+            const unsigned pct =
+                (work > 0u) ? (unsigned)(1666700u / (unsigned)work) : 0u;
+            ag_printf("md: f%u work %u (m68k %u z80 %u snd %u vdp %u show %u) "
+                      "%u%%\n",
+                      (unsigned)ran, (unsigned)work, (unsigned)s_prof_m68k_us,
+                      (unsigned)s_prof_z80_us, (unsigned)s_prof_snd_us,
+                      (unsigned)s_prof_vdp_us, (unsigned)(f2 - f1), pct);
+        } else if (stats && (uint64_t)(f2 - window_t0) >= 2000000u) {
             report_stats(window, (uint64_t)(f2 - window_t0), work_sum, emu_sum,
                          present_sum, work_max);
             work_sum = emu_sum = present_sum = work_max = 0;
