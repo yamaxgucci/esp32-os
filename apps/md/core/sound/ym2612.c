@@ -128,17 +128,21 @@
 /*    YM2610B : PSG:3ch FM:6ch ADPCM(18.5KHz):6ch DeltaT ADPCM:1ch      */
 /************************************************************************/
 
-#if GNW_TARGET_MARIO !=0 || GNW_TARGET_ZELDA!=0
+#if GNW_TARGET_MARIO !=0 || GNW_TARGET_ZELDA!=0 || ARGON_TARGET !=0
   #pragma GCC optimize("Ofast")
 #endif
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#if !ARGON_TARGET
 #include <math.h>
+#endif
 
 #include "ym2612.h"
 #include "gwenesis_bus.h"
+#if !ARGON_TARGET
 #include "gwenesis_savestate.h"
+#endif
 
 typedef uint32_t UINT32;
 typedef uint16_t UINT16;
@@ -206,12 +210,16 @@ void ym_log(const char *subs, const char *fmt, ...) {
 *   TL_RES_LEN - sinus resolution (X axis)
 */
 #define TL_TAB_LEN (13*2*TL_RES_LEN)
+#if !ARGON_TARGET
 static signed int tl_tab[TL_TAB_LEN];
+#endif
 
 #define ENV_QUIET    (TL_TAB_LEN>>3)
 
+#if !ARGON_TARGET
 /* sin waveform table in 'decibel' scale */
 static unsigned int sin_tab[SIN_LEN] ;
+#endif
 
 /* sustain level table (3dB per step) */
 /* bit0, bit1, bit2, bit3, bit4, bit5, bit6 */
@@ -505,7 +513,10 @@ static const UINT8 lfo_pm_output[7*8][8]={
 };
 
 /* all 128 LFO PM waveforms */
-#if GW_TARGET
+#if ARGON_TARGET
+/* tl_tab / sin_tab / lfo_pm_table: tools/gen_ym2612_tables.py */
+#include "ym2612_tables_argon.inc"
+#elif GW_TARGET
 static UINT8 lfo_pm_table[128*8*16];  /* 128 combinations of 7 bits meaningful (of F-NUMBER), 8 LFO depths, 32 LFO output levels per one depth */
 #else
 static INT32 lfo_pm_table[128*8*32] ;  /* 128 combinations of 7 bits meaningful (of F-NUMBER), 8 LFO depths, 32 LFO output levels per one depth */
@@ -1841,7 +1852,9 @@ static void reset_channels(FM_CH *CH , int num )
 static void init_tables(void)
 {
   //printf("YM2612 init tables\n");
-  signed int d,i,x;
+  signed int d,i;
+#if !ARGON_TARGET
+  signed int x;
   signed int n;
   double o,m;
 
@@ -1943,6 +1956,7 @@ static void init_tables(void)
       }
     }
   }
+#endif /* !ARGON_TARGET */
 
   /* build DETUNE table */
   for (d = 0;d <= 3;d++)
@@ -2123,7 +2137,14 @@ static inline void YM2612Update(int16_t *buffer, int length)
     lt += out_fm[5];
    // rt += out_fm[5];
 
-    *buffer++ = lt;
+#if ARGON_TARGET
+    if (lt > 32767) {
+      lt = 32767;
+    } else if (lt < -32768) {
+      lt = -32768;
+    }
+#endif
+    *buffer++ = (INT16)lt;
 
     /* CSM mode: if CSM Key ON has occured, CSM Key OFF need to be sent       */
     /* only if Timer A does not overflow again (i.e CSM Key ON not set again) */
@@ -2155,6 +2176,11 @@ void ym2612_run( int target) {
   }
   int ym2612_prev_index = ym2612_index;
   ym2612_index += (target-ym2612_clock) / ym2612.divisor;
+#if ARGON_TARGET
+  if (ym2612_index > GWENESIS_YM2612_BUF_LEN) {
+    ym2612_index = GWENESIS_YM2612_BUF_LEN;
+  }
+#endif
   if (ym2612_index > ym2612_prev_index) {
     YM2612Update(gwenesis_ym2612_buffer + ym2612_prev_index, ym2612_index-ym2612_prev_index);
     ym2612_clock = ym2612_index*ym2612.divisor;
@@ -2245,8 +2271,25 @@ void YM2612Config(unsigned char dac_bits) //,unsigned int AUDIO_FREQ_DIVISOR)
       ym2612.OPN.pan[i] = bitmask;
     }
   }
+#if ARGON_TARGET
+  /*
+   * ArgonOS mixes at MD_SOUND_RATE (22050).  Divisor is refined per frame in
+   * YM2612SetSampleDivisor(); this is a safe NTSC default.
+   */
+  ym2612.divisor = 2441;
+#else
   ym2612.divisor = AUDIO_FREQ_DIVISOR;
+#endif
 }
+
+#if ARGON_TARGET
+void YM2612SetSampleDivisor(int div)
+{
+  if (div > 0) {
+    ym2612.divisor = div;
+  }
+}
+#endif
 
 void YM2612SaveRegs(uint8_t *regs)
 {
@@ -2331,6 +2374,7 @@ int YM2612SaveContext(unsigned char *state)
 }
 #endif
 
+#if !ARGON_TARGET
 void gwenesis_ym2612_save_state() {
   SaveState* state;
   state = saveGwenesisStateOpenForWrite("ym2612");
@@ -2355,3 +2399,4 @@ void gwenesis_ym2612_load_state() {
   bitmask = saveGwenesisStateGet(state, "bitmask");
   saveGwenesisStateGetBuffer(state, "OPNREGS", OPNREGS, sizeof(OPNREGS));
 }
+#endif
