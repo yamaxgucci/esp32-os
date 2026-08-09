@@ -31,7 +31,7 @@ __license__ = "GPLv3"
 
 #include <assert.h>
 
-#if GNW_TARGET_MARIO !=0 || GNW_TARGET_ZELDA!=0
+#if GNW_TARGET_MARIO !=0 || GNW_TARGET_ZELDA!=0 || ARGON_TARGET !=0
   #pragma GCC optimize("Ofast")
 #endif
 

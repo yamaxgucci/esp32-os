@@ -1,3 +1,10 @@
+/*
+ * ArgonOS: 64 KB of per-opcode cycle counts, touched on every instruction.
+ * Keep them in the code arena (internal SRAM) rather than PSRAM.
+ */
+#if ARGON_TARGET
+AG_HOT_RODATA
+#endif
 static const unsigned char m68ki_cycles[] =
 {
     8*7,   8*7,   8*7,   8*7,   8*7,   8*7,   8*7,   8*7,   0*7,   0*7,   0*7,   0*7,   0*7,   0*7,   0*7,   0*7, 
