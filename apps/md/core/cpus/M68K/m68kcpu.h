@@ -311,11 +311,21 @@
 
 /* Enable or disable Address error emulation */
 #if M68K_EMULATE_ADDRESS_ERROR
-  #define m68ki_set_address_error_trap() \
-    if(setjmp(m68ki_cpu.aerr_trap) != 0) \
-    { \
-      m68ki_exception_address_error(); \
-    }
+  /*
+   * ArgonOS: setjmp once per frame in the platform loop (m68k_arm_address_error_trap),
+   * not once per scanline in m68k_run.  262 setjmps/frame on Xtensa spill the
+   * register window every time; one armed trap for the whole frame is enough
+   * because longjmp only needs the jmp_buf's owner still to be live.
+   */
+  #if ARGON_TARGET
+    #define m68ki_set_address_error_trap()
+  #else
+    #define m68ki_set_address_error_trap() \
+      if(setjmp(m68ki_cpu.aerr_trap) != 0) \
+      { \
+        m68ki_exception_address_error(); \
+      }
+  #endif
 
   #define m68ki_check_address_error(ADDR, WRITE_MODE, FC) \
     if((ADDR)&1) \

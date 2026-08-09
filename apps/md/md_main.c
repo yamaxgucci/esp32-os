@@ -32,9 +32,8 @@ extern unsigned char  gwenesis_vdp_regs[];
 extern int            screen_width;
 extern int            screen_height;
 
-/* Both added to the vendored core; see README, "Local changes". */
+/* Added to the vendored core; see README, "Local changes". */
 extern void gwenesis_vdp_set_buffer_stride(int pixels);
-extern void m68k_frame_end(int master_cycles);
 
 /*
  * Like the Master System player, the emulator renders straight into the gfx back
@@ -305,17 +304,30 @@ static void run_frame(int render)
 {
     const int lines_per_frame = REG1_PAL ? LINES_PER_FRAME_PAL
                                          : LINES_PER_FRAME_NTSC;
-    int       hint_counter = gwenesis_vdp_regs[10];
-    int       system_clock = 0;
+    /*
+     * hint_counter and system_clock must survive a longjmp from an odd
+     * 68000 address: the trap is armed once below for the whole frame.
+     */
+    static int hint_counter;
+    static int system_clock;
 
     screen_width = REG12_MODE_H40 ? 320 : 256;
     screen_height = REG1_PAL ? VISIBLE_LINES_PAL : VISIBLE_LINES_NTSC;
     gwenesis_vdp_render_config();
 
+    hint_counter = gwenesis_vdp_regs[10];
+    system_clock = 0;
     scan_line = 0;
+
+    if (m68k_arm_address_error_trap() != 0) {
+        m68k_on_address_error();
+        /* Resume the current line's m68k_run; do not re-add line cycles. */
+        goto resume_m68k;
+    }
+
     while (scan_line < lines_per_frame) {
         system_clock += VDP_CYCLES_PER_LINE;
-
+resume_m68k:
         m68k_run(system_clock);
 
         if (render && scan_line < screen_height) {

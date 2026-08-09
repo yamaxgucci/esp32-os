@@ -445,6 +445,13 @@ extern void m68k_pulse_reset(void);
 /* Run until given cycle count is reached */
 extern void m68k_run(unsigned int cycles);
 
+#if ARGON_TARGET
+/* ArgonOS: rebase cycles at end of frame; arm address-error trap once/frame. */
+extern void m68k_frame_end(int master_cycles);
+extern int  m68k_arm_address_error_trap(void);
+extern void m68k_on_address_error(void);
+#endif
+
 /* Get current instruction execution time */
 extern int m68k_cycles(void);
 

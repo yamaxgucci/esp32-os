@@ -58,7 +58,16 @@ gwenesis needs the list.
 - `cpus/M68K/m68kcpu.c` — added `m68k_frame_end()`, which rebases the CPU cycle
   counter at end of frame. Upstream platforms reach into `m68k.cycles` directly;
   that global is file-static, and the platform has no business including the
-  55 KB `m68kcpu.h`
+  55 KB `m68kcpu.h`. Also `m68k_arm_address_error_trap()` /
+  `m68k_on_address_error()` so the platform can arm `setjmp` once per frame
+- `cpus/M68K/m68kcpu.h` — under `ARGON_TARGET`, `m68ki_set_address_error_trap()`
+  is empty (trap armed from `md_main.c`, not 262×/frame inside `m68k_run`)
+- `cpus/M68K/m68ki_cycles.h` — cycle tables marked `AG_HOT_RODATA` (~64 KB in
+  the code arena). `md_cfg.h` defines that attribute without including
+  `argon.h`, because forcing the SDK into every vendored TU breaks gwenesis'
+  local `uint32_t` typedefs
+- `vdp/gwenesis_vdp_gfx.c`, `vdp/gwenesis_vdp_mem.c` — `Ofast` also under
+  `ARGON_TARGET` (upstream already did this for the Game & Watch targets)
 - deleted `m68ki_cycles_full.h` and `m68ki_instruction_jump_table_full.h`
   (1.7 MB of source for the `TABLES_FULL` build, which we do not use)
 
@@ -86,9 +95,9 @@ built for ArgonOS (see `md_cfg.h`).
 address from becoming an unaligned load on the host, where it would fault. So
 `M68K_EMULATE_ADDRESS_ERROR` stays on and one object comes out of newlib.
 
-The image is **129 KB of code**, which does not fit the 64 KB arena; ArgonOS is
-built with `CONFIG_ARGON_APP_ARENA_KB=192` so that it lands in internal SRAM
-whole. There are also **61 643 relocations**, nearly all of them entries in the
+The image is **~190 KB of code** (text + ~64 KB hot cycle tables), which needs
+the 192 KB arena (`CONFIG_ARGON_APP_ARENA_KB=192`) with only ~1.7 KB of headroom.
+There are also **~61 650 relocations**, nearly all of them entries in the
 68000's instruction jump table, so expect the loader to spend real time on them.
 
 ## Run

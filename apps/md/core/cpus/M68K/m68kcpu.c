@@ -343,6 +343,30 @@ void m68k_frame_end(int master_cycles)
 	m68k.cycles -= master_cycles;
 }
 
+#if ARGON_TARGET
+/*
+ * Arm the address-error jmp_buf for the whole frame.  Returns non-zero after
+ * a longjmp from an odd-address access; the caller then invokes
+ * m68k_on_address_error() and resumes the line loop.  No-op stubs when
+ * address-error emulation is compiled out.
+ */
+int m68k_arm_address_error_trap(void)
+{
+#if M68K_EMULATE_ADDRESS_ERROR
+	return setjmp(m68k.aerr_trap);
+#else
+	return 0;
+#endif
+}
+
+void m68k_on_address_error(void)
+{
+#if M68K_EMULATE_ADDRESS_ERROR
+	m68ki_exception_address_error();
+#endif
+}
+#endif
+
 void m68k_init(void)
 {
 #ifdef BUILD_TABLES

@@ -28,4 +28,11 @@
 #define VISIBLE_LINES_NTSC 224
 #define VISIBLE_LINES_PAL 240
 
+/*
+ * Mirror of AG_HOT_RODATA from argon.h.  Do not #include argon.h from this
+ * forced header: vendored TUs (e.g. gwenesis_vdp_gfx.c) typedef their own
+ * uint32_t and conflict with stdint pulled in by the SDK.
+ */
+#define AG_HOT_RODATA __attribute__((used, section(".hot_rodata")))
+
 #endif /* ARGON_MD_CFG_H */
