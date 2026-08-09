@@ -318,3 +318,13 @@ function Get-QemuMachineArgs {
         '-global', 'driver=ssi_psram,property=is_octal,value=true'
     )
 }
+
+# OpenEth user-mode NIC + hostfwd so Windows can reach a guest TCP listener.
+# Default port 5558 matches MD's `net` sound sink / tools/pcmplay.py.
+function Get-QemuNetArgs {
+    param([int]$HostPort = 5558, [int]$GuestPort = 5558)
+    return @(
+        '-nic', ("user,model=open_eth,id=argon0,hostfwd=tcp:127.0.0.1:{0}-:{1}" -f `
+            $HostPort, $GuestPort)
+    )
+}

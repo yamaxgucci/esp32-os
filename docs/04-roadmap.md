@@ -590,6 +590,9 @@ MQTT, Modbus TCP, OTA. Подтаблица `api->net` перестаёт быт
     `config` уже до первого использования арены — порядок загрузки ок.
 11. **`unzip` в ядре + `ZIP.AXE`** — см. фазу 3.5 §1a: builtin extract/list
     (tinfl/miniz), полный архиватор только как приложение на карте.
+12. ✅ **Сеть в QEMU (срез под звук)** — 9 августа 2026: OpenEth + `api->net`
+    (TCP), `hostfwd` на `:5558`, MD `net` → `tools/pcmplay.py`. Wi‑Fi/полная
+    фаза 5 — на плату.
 
 После появления платы: S-1, панели, USB-HID, I2S, замеры % realtime SMS/MD.
 

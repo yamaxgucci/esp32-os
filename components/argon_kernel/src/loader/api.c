@@ -23,9 +23,12 @@
 #include <argon/loader.h>
 #include <argon/log.h>
 #include <argon/module.h>
+#include <argon/net.h>
 #include <argon/proc.h>
 #include <argon/shell.h>
 #include <argon/vfs.h>
+
+#include "sdkconfig.h"
 
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
@@ -749,7 +752,11 @@ static const ag_api_t k_api = {
     .task = &ag_task_api_table,
     .proc = &k_proc,
     .cfg = NULL,
+#if defined(CONFIG_ARGON_ENABLE_NET) && CONFIG_ARGON_ENABLE_NET
+    .net = &ag_net_api_impl,
+#else
     .net = NULL,
+#endif
 };
 
 const ag_api_t *ag_loader_api(void) { return &k_api; }

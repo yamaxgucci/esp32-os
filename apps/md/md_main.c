@@ -18,7 +18,8 @@
 #include "md_sound.h"
 #include "z80inst.h"
 
-AG_APP_SIZED("MD", "0.1", "argon", AG_AXE_NEEDS_GFX, 32 * 1024, 5 * 1024 * 1024);
+/* 24 KB stack: with OpenEth/lwIP the largest internal free block is ~31 KB. */
+AG_APP_SIZED("MD", "0.1", "argon", AG_AXE_NEEDS_GFX, 24 * 1024, 5 * 1024 * 1024);
 
 /*
  * The cores expect these two to live in the platform: every logging site and the
@@ -472,6 +473,13 @@ int ag_main(int argc, char **argv)
             sound_path = "mock";
         } else if (arg_eq(argv[i], "wav")) {
             sound_path = "a:\\md.wav";
+        } else if (arg_eq(argv[i], "net") || arg_eq(argv[i], "tcp")) {
+            sound_path = "net";
+        } else if ((argv[i][0] == 'n' || argv[i][0] == 'N') &&
+                   (argv[i][1] == 'e' || argv[i][1] == 'E') &&
+                   (argv[i][2] == 't' || argv[i][2] == 'T') &&
+                   argv[i][3] == ':') {
+            sound_path = argv[i]; /* net:PORT */
         } else if (looks_like_number(argv[i])) {
             frames = parse_int(argv[i], -1);
         } else if (rom == NULL) {

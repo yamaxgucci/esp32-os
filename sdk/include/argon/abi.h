@@ -47,9 +47,12 @@ extern "C" {
  * 0.10 appended inp->btn / inp->pad: HostFS PADPUSH live buttons (SMS/Asteroids).
  * 0.11 appended inp->btnp and extended ag_btn (C/START/X/Y/Z/MODE); pad()
  *      also returns high bytes (which 3/4).  Input layer + /dev/joy0.
+ * 0.12 made net stop being NULL (when the build enables networking): TCP
+ *      listen/accept/connect/send/recv plus ready/wait_ready/ifaddr.
+ * 0.13 appended net->set_nonblock.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 11u
+#define AG_ABI_MINOR 13u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -838,10 +841,34 @@ typedef struct ag_cfg_api {
 } ag_cfg_api_t;
 
 /* ------------------------------------------------------------------------ */
-/* net - reserved for phase 3; api->net is NULL until then                  */
+/* net - TCP sockets (OpenEth in QEMU today; Wi-Fi later on hardware)       */
 /* ------------------------------------------------------------------------ */
 
-struct ag_net_api;
+/*
+ * Handles are opaque and distinct from filesystem handles.  Close them with
+ * net->close, not fs->close.  IPv4 addresses and ports are host byte order.
+ * timeout_ms of UINT32_MAX means "wait forever"; 0 means "return at once"
+ * (typically -AG_EAGAIN when nothing is ready).
+ */
+typedef struct ag_net_api {
+    uint32_t size;
+
+    bool (*ready)(void);
+    ag_err_t (*wait_ready)(uint32_t timeout_ms);
+    ag_err_t (*ifaddr)(uint32_t *addr_out); /* host-order IPv4 */
+
+    ag_handle_t (*tcp_listen)(uint16_t port);
+    ag_handle_t (*tcp_accept)(ag_handle_t listen, uint32_t timeout_ms);
+    ag_handle_t (*tcp_connect)(uint32_t addr, uint16_t port,
+                               uint32_t timeout_ms);
+
+    int32_t (*send)(ag_handle_t sock, const void *buf, size_t len);
+    int32_t (*recv)(ag_handle_t sock, void *buf, size_t len);
+    ag_err_t (*close)(ag_handle_t sock);
+
+    /* ABI 0.13: O_NONBLOCK.  send/recv then return -AG_EAGAIN instead of stalling. */
+    ag_err_t (*set_nonblock)(ag_handle_t sock, bool on);
+} ag_net_api_t;
 
 /* ------------------------------------------------------------------------ */
 /* Root table                                                               */
@@ -866,7 +893,7 @@ typedef struct ag_api {
     const ag_cfg_api_t  *cfg;
 
     /* NULL when the profile has no networking. */
-    const struct ag_net_api *net;
+    const ag_net_api_t *net;
 } ag_api_t;
 
 /* ------------------------------------------------------------------------ */

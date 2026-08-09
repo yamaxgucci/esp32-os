@@ -93,9 +93,10 @@ python tools/mkaxe.py --arch xtensa --gcc xtensa-esp32s3-elf-gcc `
 built for ArgonOS (see `md_cfg.h`). `-DARGON_MD_Z80` selects the MD memory path
 in the shared SMS Z80. `--libs c` is for `setjmp` (68000 address error).
 
-The image is **~165 KB of code** in the 192 KB arena. Cycle tables stay in
-ordinary `.rodata` (PSRAM) so the Z80 fits; put them back in `AG_HOT_RODATA`
-only if the arena grows.
+The image is **~170 KB of code** in the 192 KB arena and asks for a **24 KB**
+stack (OpenEth/lwIP leave a ~31 KB largest internal free block). Cycle tables
+stay in ordinary `.rodata` (PSRAM) so the Z80 fits; put them back in
+`AG_HOT_RODATA` only if the arena grows.
 
 ## Run
 
@@ -106,7 +107,18 @@ run a:\MD.AXE a:\game.bin
 run a:\MD.AXE a:\game.bin mock        # Z80+PSG+FM, discard samples (default)
 run a:\MD.AXE a:\game.bin wav         # write a:\md.wav
 run a:\MD.AXE a:\game.bin a:\out.wav  # explicit WAV path
+run a:\MD.AXE a:\game.bin net         # TCP stream → Windows (see below)
 ```
+
+Realtime audio over the QEMU OpenEth NIC (not UART):
+
+```
+argon run -Sd -Gfx -HostFs build\md_share
+# guest waits after: run a:\MD.AXE a:\game.bin net
+python tools/pcmplay.py                 # or: python tools/pcmplay.py --ffplay
+```
+
+`argon run` enables `hostfwd` on `127.0.0.1:5558` by default. Use `net:PORT` on the guest and `-NetPort PORT` on the host if you change it.
 
 | Arg | Effect |
 |-----|--------|
@@ -117,6 +129,7 @@ run a:\MD.AXE a:\game.bin a:\out.wav  # explicit WAV path
 | `fps60` | show every frame (default) |
 | `livepad` / `nolivepad` | live pad via `inp->btnp` (HostFS PADPUSH), or serial sticky only |
 | `mock` / `wav` / path | sound sink: discard, `a:\md.wav`, or an explicit path |
+| `net` / `net:PORT` | stream stereo s16 PCM over TCP (WAV header); host: `tools/pcmplay.py` |
 | `profile` | print m68k/z80/snd/vdp µs for the first 120 frames |
 | `noz80` | advance Z80 clock only (no CPU execute; BUSREQ still live) |
 | `nosound` | skip sample mix |

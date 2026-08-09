@@ -37,6 +37,7 @@ set(ARGON_KERNEL_SRCS
     "src/loader/module.c"
     "src/loader/probe.c"
     "src/loader/api.c"
+    "src/net/net.c"
     "src/proc/proc.c"
     "src/proc/threads.c"
     "src/proc/fault.c"
@@ -68,6 +69,8 @@ idf_component_register(
                   esp_driver_i2c esp_driver_ledc
                   # Virtual RGB panel under Espressif QEMU (no-op on hardware).
                   esp_lcd espressif__esp_lcd_qemu_rgb
+                  # api->net: OpenEth + lwIP sockets (QEMU today).
+                  esp_eth esp_netif esp_event nvs_flash
                   # xtensa: the exception table the fault handler installs into
                   xtensa)
 
