@@ -11,7 +11,8 @@
 владеет машиной, ОС — тонкий слой сервисов. Не клон Linux, не «поделка»:
 целевое применение промышленное. Обоснование всех решений — в
 [00-architecture.md](00-architecture.md), план — в [04-roadmap.md](04-roadmap.md),
-конфигурация плат — в [03-board-config.md](03-board-config.md).
+конфигурация плат — в [03-board-config.md](03-board-config.md), бюджеты и затыки
+realtime-эмуляции — в [07-emulator-performance.md](07-emulator-performance.md).
 
 Основная платформа **ESP32-S3** с PSRAM 8 или 16 МБ.
 **Модуль с 32 МБ PSRAM непригоден** — см. «Грабли» ниже.
@@ -95,13 +96,15 @@ argon flash -port COM5   прошить настоящую плату
 | Ресурсный список | `src/core/reslist.c` | ✅ порядок по типам, ловит двойное free |
 | Примеры приложений | `apps/hello`, `disk`, `spin`, `leak`, `threads`, `crash` | ✅ проверяют сами себя |
 | Файловый менеджер | `apps/fm/` | ✅ **команда `fm`, встроена в ОС**; тот же код собирается и как `.AXE` |
+| ZIP | — | ⬜ план: **`unzip` builtin** в ядре; полный **`ZIP.AXE`** на карте (фаза 3.5 §1a, очередь п.11) |
 | Текстовый редактор | `apps/edit/` | ✅ **команда `edit`**, встроена; до 64 КБ / 2048 строк, F2 сохранить |
 | Компилятор C → `.AXE` | `apps/cc/` (`CC.AXE`) | ✅ MVP без ABI (нет пинов/печати из CC); бэклог языка — §2 в `04-roadmap.md` |
 | Реестр устройств | `src/dev/device.c` | ✅ классы, владельцы, эксклюзивный доступ, отзыв при извлечении |
 | Устройства как файлы | `src/dev/devfs.c` | ✅ `/dev` — диск `D:`, одна таблица дескрипторов с файлами |
 | Встроенные устройства | `src/dev/devices.c`, `storage.c` | ✅ `null zero con flash0 sd0 fb0`, команда `dev` |
-| Soft display / `gfx` | `src/dev/display.c`, `font8x16.c` | ✅ RGB565 front+back (640×400 = 80×25), `double_buf`/`swap`/`flush`→present, ABI 0.8, `gfxdump`, демо `apps/gfxdemo`; QEMU RGB (`esp_lcd_qemu_rgb`, `argon run -Gfx`) |
-| Master System `.AXE` | `apps/sms/` (SMS Plus GX, GPLv2+) | ✅ play + PADPUSH; PSG+FM→WAV/mock (`ag_fm`, не `ym2413.c`); realtime audio — позже (I2S на плате или host-player в QEMU) |
+| Soft display / `gfx` | `src/dev/display.c`, `font8x16.c` | ✅ RGB565 front+back (640×400 = 80×25), `double_buf`/`swap`, **`flush` прямоугольником** (узкий копир draw→front, present целыми строками — почему именно так, см. [`07-emulator-performance.md`](07-emulator-performance.md)), `clear` чистит и front, ABI 0.8, `gfxdump`, демо `apps/gfxdemo`; QEMU RGB (`esp_lcd_qemu_rgb`, `argon run -Gfx`) |
+| Master System `.AXE` | `apps/sms/` (SMS Plus GX, GPLv2+) | ✅ play + PADPUSH; рендер **прямо в back-буфер `gfx`** без промежуточного кадра, `stats` печатает % realtime, `fps30` делит показ; PSG+FM→WAV/mock (`ag_fm`, не `ym2413.c`); realtime audio — позже (I2S на плате или host-player в QEMU) |
+| Mega Drive `.AXE` | `apps/md/` (gwenesis, GPLv3 + Musashi MIT) | ⚠ mute: 68000 + VDP, рендер прямо в back-буфер, клавиатура и host-pad, `stats`/`fps30`. Звуковой блок (Z80 + YM2612 + PSG) заглушен в `port/md_mute.c` и не компилируется — в том числе потому, что Z80 Фаязуллина запрещено распространять коммерчески. 129 КБ кода в арене 192 КБ, 61 643 релокации. Не проверен на настоящем ROM; лицензии — в [`apps/md/README.md`](../apps/md/README.md) |
 | Владение пинами | `src/dev/ioclaim.c` | ✅ пины системы, занятые пины, возврат за упавшим процессом |
 | Железо напрямую | `src/dev/io.c` | ✅ GPIO, ISR, I2C, SPI, UART, PWM; команда `io`, скан I2C |
 | Таблица ABI | `src/loader/api.c` | ⚠ 0.8: `sys mem fs con time proc task inp dev io gfx`, `cfg`/`net` — `NULL` |
@@ -266,6 +269,21 @@ argon test -Put "build\SMS.AXE=t:\sms.axe" -TimeoutSec 180 `
 argon test -Sd -TimeoutSec 120 `
   "run a:\SMS.AXE 30 nolivepad mock" "errorlevel" `
   "run a:\SMS.AXE 60 nolivepad wav" "errorlevel"
+```
+
+Скорость (печатает fps, разбивку кадра и % realtime; `fps30` — показ через кадр):
+
+```
+argon test -Sd -TimeoutSec 240 `
+  "run a:\SMS.AXE 600 nolivepad stats" "errorlevel" `
+  "run a:\SMS.AXE 300 nolivepad fps30 stats" "errorlevel"
+```
+
+Mega Drive — то же самое, без ROM запускается синтетический картридж, который
+крутит 68000 на месте (то есть меряется VDP при простаивающем процессоре):
+
+```
+argon test -Sd -TimeoutSec 240 "run a:\MD.AXE 300 nolivepad stats" "errorlevel"
 ```
 
 Вручную доставить в эмулятор: `recv t:\hello.axe`, затем строки hex, затем `END`.

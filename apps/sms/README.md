@@ -20,13 +20,13 @@ Do **not** link `ym2413.c`. Include `sound_wav.c` and `ag_fm.c`.
 
 ```
 python tools/mkaxe.py --arch xtensa --gcc xtensa-esp32s3-elf-gcc `
-  --include sdk/include --include apps/sms/port --include apps/sms/core `
-  --include apps/sms/core/z80 --include apps/sms/core/sound `
-  --include apps/common/fm `
+  --include sdk/include --include apps/common/libc --include apps/sms/port `
+  --include apps/sms/core --include apps/sms/core/z80 `
+  --include apps/sms/core/sound --include apps/common/fm `
   --cflags "-Os -ffunction-sections -fdata-sections -fno-builtin -DLSB_FIRST -DNOZIP_SUPPORT -DUSE_Z80 -Wno-unused -Wno-sign-compare" `
   -o build/SMS.AXE `
   apps/sms/sms_main.c apps/sms/sms_cfg.c `
-  apps/sms/port/libc_shim.c apps/sms/port/platform.c apps/sms/port/sound_wav.c `
+  apps/common/libc/libc_shim.c apps/sms/port/platform.c apps/sms/port/sound_wav.c `
   apps/common/fm/ag_fm.c `
   apps/sms/core/loadrom.c apps/sms/core/memz80.c apps/sms/core/pio.c `
   apps/sms/core/render.c apps/sms/core/sms.c apps/sms/core/system.c `
@@ -56,6 +56,22 @@ Default play is **mute** (best FPS). Enable sound:
 | `mock` or `sound` | PSG + FM (`ag_fm`), samples discarded |
 | `wav` | write `t:\sms.wav` |
 | `t:\out.wav` (any `*.wav`) | write that path — **must** end in `.wav` or it is ignored / treated as ROM |
+
+## Speed and measurement
+
+| Arg | Effect |
+|-----|--------|
+| `stats` | print fps, per-frame work split (emu / show), max, and **% realtime** every 2 s and at exit |
+| `fps30` | emulate all 60 frames, rasterise and show every second one |
+| `fps60` | show every frame (default) |
+
+`% realtime` is against one NTSC frame of 16667 µs, so 100% means exactly keeping
+up. In QEMU it is only a lower bound of sanity — QEMU models neither the cache
+nor PSRAM latency, so it cannot prove realtime on a board, only rule it out.
+
+The emulator renders **straight into the `gfx` back buffer** and flushes only its
+own rectangle; there is no intermediate frame and no blit. Budgets and the plan
+behind this: [`docs/07-emulator-performance.md`](../../docs/07-emulator-performance.md).
 
 Prefer `T:` or `A:` for capture (HostFS every frame is slow). `T:` is ~4 MB
 RAM (PSRAM); long free-run captures can still fill it. Then in the **same**
@@ -108,4 +124,12 @@ pad1.quit=Q
 argon test -Sd -TimeoutSec 120 `
   "run a:\SMS.AXE 30 nolivepad mock" "errorlevel" `
   "run a:\SMS.AXE 60 nolivepad wav" "errorlevel"
+```
+
+Speed:
+
+```
+argon test -Sd -TimeoutSec 240 `
+  "run a:\SMS.AXE 600 nolivepad stats" "errorlevel" `
+  "run a:\SMS.AXE 300 nolivepad fps30 stats" "errorlevel"
 ```

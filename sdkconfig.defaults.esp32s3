@@ -26,6 +26,20 @@ CONFIG_SPIRAM_USE_CAPS_ALLOC=y
 
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 
+# 32 KB of instruction cache instead of the default 16.  Interpreters - the
+# emulators' inner loops above all - do not fit in 16 KB and thrash it, and any
+# .AXE larger than the code arena executes from flash through this cache.  The
+# 16 KB comes out of internal SRAM, which is the price.
+CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB=y
+
+# 192 KB of executable arena, the Kconfig maximum.  The Mega Drive image is
+# 129 KB of code and the sound block is still to come, so the alternative would
+# be flash XIP for the whole emulator plus a `hot_text` split to pull the inner
+# loops back into SRAM - a format change to buy what this line buys outright.
+# The cost is real and permanent: the arena is reserved at link time whether an
+# app is running or not, so this is 128 KB the internal heap never sees.
+CONFIG_ARGON_APP_ARENA_KB=192
+
 # UART0 is the one console every board and QEMU agree on, and the ROM
 # bootloader already talks there, so early output is not split across two
 # devices.  USB-serial-JTAG becomes an additional console endpoint at runtime
