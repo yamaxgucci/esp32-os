@@ -15,6 +15,7 @@
 #include "gwenesis_io.h"
 #include "gwenesis_vdp.h"
 #include "m68k.h"
+#include "md_sound.h"
 #include "z80inst.h"
 
 AG_APP_SIZED("MD", "0.1", "argon", AG_AXE_NEEDS_GFX, 32 * 1024, 5 * 1024 * 1024);
@@ -318,6 +319,7 @@ static void run_frame(int render)
     hint_counter = gwenesis_vdp_regs[10];
     system_clock = 0;
     scan_line = 0;
+    md_sound_begin_frame(lines_per_frame);
 
     if (m68k_arm_address_error_trap() != 0) {
         m68k_on_address_error();
@@ -329,6 +331,8 @@ static void run_frame(int render)
         system_clock += VDP_CYCLES_PER_LINE;
 resume_m68k:
         m68k_run(system_clock);
+        z80_run(system_clock);
+        md_sound_line(scan_line, lines_per_frame);
 
         if (render && scan_line < screen_height) {
             gwenesis_vdp_render_line(scan_line);
@@ -363,14 +367,22 @@ resume_m68k:
         }
     }
 
+    md_sound_end_frame();
     /* Rebase the 68000's counter so next frame starts from zero again. */
     m68k_frame_end(system_clock);
+    /* Z80 clock is absolute within the frame; rebase with the 68k. */
+    if (zclk >= system_clock) {
+        zclk -= system_clock;
+    } else {
+        zclk = 0;
+    }
     frame_counter++;
 }
 
 int ag_main(int argc, char **argv)
 {
     const char *rom = NULL;
+    const char *sound_path = "mock";
     int         frames = -1; /* <0: until Esc/Q */
     int         present_div = 1;
     int         stats = 0;
@@ -387,12 +399,26 @@ int ag_main(int argc, char **argv)
             want_livepad = 0;
         } else if (arg_eq(argv[i], "livepad")) {
             want_livepad = 1;
+        } else if (arg_eq(argv[i], "mock")) {
+            sound_path = "mock";
+        } else if (arg_eq(argv[i], "wav")) {
+            sound_path = "a:\\md.wav";
         } else if (looks_like_number(argv[i])) {
             frames = parse_int(argv[i], -1);
         } else if (rom == NULL) {
             rom = argv[i];
+        } else if (argv[i][0] != '\0' &&
+                   (argv[i][1] == ':' || argv[i][0] == '/' ||
+                    argv[i][0] == '\\' || argv[i][0] == 'a' ||
+                    argv[i][0] == 'A' || argv[i][0] == 't' ||
+                    argv[i][0] == 'T' || argv[i][0] == 'h' ||
+                    argv[i][0] == 'H')) {
+            /* Second path-like arg: WAV output (same idea as SMS). */
+            sound_path = argv[i];
         }
     }
+
+    md_sound_set_path(sound_path);
 
     ag_gfxinfo_t info;
     if (ag_gfx_acquire(&info) != AG_OK) {
@@ -423,6 +449,7 @@ int ag_main(int argc, char **argv)
     load_cartridge(rom_data, rom_size);
     power_on();
     reset_emulation();
+    md_sound_init();
 
     s_use_live_pad = want_livepad;
     if (s_use_live_pad) {
@@ -487,6 +514,7 @@ int ag_main(int argc, char **argv)
                      emu_sum, present_sum, work_max);
     }
     ag_printf("md: %d frames\n", ran);
+    md_sound_close();
     ag_gfx_release();
     return 0;
 }
