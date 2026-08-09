@@ -117,6 +117,13 @@ run a:\MD.AXE a:\game.bin a:\out.wav  # explicit WAV path
 | `fps60` | show every frame (default) |
 | `livepad` / `nolivepad` | live pad via `inp->btnp` (HostFS PADPUSH), or serial sticky only |
 | `mock` / `wav` / path | sound sink: discard, `a:\md.wav`, or an explicit path |
+| `profile` | print m68k/z80/snd/vdp µs for the first 120 frames |
+| `noz80` | advance Z80 clock only (no CPU execute; BUSREQ still live) |
+| `nosound` | skip sample mix |
+
+Startup frames on Alex Kidd are slow because the **68000** is busy (~35 ms/frame
+of m68k time), not because something waits on the Z80 — confirmed with
+`profile` vs `noz80 nosound`. It settles on its own after a couple of seconds.
 
 Keys (with `-HostFs` and `sms.cfg`): arrows, `Z` = A, `X` = B, `C` = C,
 Enter = Start, Esc quits. That path is real level state from a Win32 keyboard
