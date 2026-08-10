@@ -20,11 +20,11 @@ Do **not** link `ym2413.c`. Include `sound_wav.c` and `ag_fm.c`.
 
 ```
 python tools/mkaxe.py --arch xtensa --gcc xtensa-esp32s3-elf-gcc `
-  --include sdk/include --include apps/common/libc --include apps/sms/port `
+  --include sdk/include --include apps/common --include apps/common/libc --include apps/sms/port `
   --include apps/sms/core --include apps/sms/core/z80 `
   --include apps/sms/core/sound --include apps/common/fm `
   --cflags "-Os -ffunction-sections -fdata-sections -fno-builtin -DLSB_FIRST -DNOZIP_SUPPORT -DUSE_Z80 -Wno-unused -Wno-sign-compare" `
-  -o build/SMS.AXE `
+  -o build/apps/SMS.AXE `
   apps/sms/sms_main.c apps/sms/sms_cfg.c `
   apps/common/libc/libc_shim.c apps/sms/port/platform.c apps/sms/port/sound_wav.c `
   apps/common/fm/ag_fm.c `
@@ -41,22 +41,28 @@ depends on it).
 
 ## Run in QEMU
 
+`mkaxe` stages into `build/apps/` and `build/sd_card/`. Always use:
+
 ```
-argon run -Gfx -HostFs build\sms_share
+argon run -Gfx -HostFs build\sd_card
 ```
 
 ```
 run h:\sms.axe h:\game.sms
 ```
 
-Default play is **mute** (best FPS). Enable sound:
+Default play is **mute** (best FPS). Enable sound (writes to a `/dev/pcm*`
+device or a WAV file):
 
 | Arg | Effect |
 |-----|--------|
-| `mock` or `sound` | PSG + FM (`ag_fm`), samples discarded |
-| `audio` / `i2s` | kernel `api->audio` (I2S if `[audio]` pins set, else stub) |
+| `mock` / `sound` / `pcmnull` | PSG + FM → `/dev/pcmnull` (discard) |
+| `pcmvirt` / `net` | `/dev/pcmvirt` (needs `drv install` of `PCMVIRT.SYS`) |
+| `audio` / `i2s` / `pcm0` | `/dev/pcm0` (future I2S `.SYS`) |
 | `wav` | write `t:\sms.wav` |
 | `t:\out.wav` (any `*.wav`) | write that path — **must** end in `.wav` or it is ignored / treated as ROM |
+
+Host listen (after virt is installed): `python tools/pcmplay.py`
 
 ## Speed and measurement
 

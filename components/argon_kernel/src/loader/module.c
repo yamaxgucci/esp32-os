@@ -5,6 +5,7 @@
  */
 #include <argon/module.h>
 
+#include <stdio.h>
 #include <string.h>
 
 #include <argon/cfg.h>
@@ -209,6 +210,47 @@ uint32_t ag_module_count(void)
     return n;
 }
 
+/*
+ * Older drv install wrote files under /sys/DRV while SYSTEM.CFG listed
+ * c:\drv\… → /sys/drv/… . LittleFS is case-sensitive, so boot missed them.
+ */
+static ag_err_t load_device_path(const char *path)
+{
+    char       resolved[AG_PATH_MAX];
+    char       alt[AG_PATH_MAX];
+    ag_err_t   err;
+    const char *rest;
+
+    err = ag_module_load(path, NULL);
+    if (err != -AG_ENOENT) {
+        return err;
+    }
+    if (ag_path_resolve(path, NULL, resolved, sizeof(resolved)) != AG_OK) {
+        return err;
+    }
+    if (strncmp(resolved, "/sys/drv/", 9) == 0) {
+        rest = resolved + 9;
+        if (snprintf(alt, sizeof(alt), "/sys/DRV/%s", rest) < (int)sizeof(alt)) {
+            const ag_err_t err2 = ag_module_load(alt, NULL);
+            if (err2 == AG_OK) {
+                ag_log(AG_LOG_WARN, "modules",
+                       "boot: loaded legacy path %s (use drv install again)",
+                       alt);
+                return AG_OK;
+            }
+        }
+    } else if (strncmp(resolved, "/sys/DRV/", 9) == 0) {
+        rest = resolved + 9;
+        if (snprintf(alt, sizeof(alt), "/sys/drv/%s", rest) < (int)sizeof(alt)) {
+            const ag_err_t err2 = ag_module_load(alt, NULL);
+            if (err2 == AG_OK) {
+                return AG_OK;
+            }
+        }
+    }
+    return err;
+}
+
 ag_err_t ag_modules_boot(void)
 {
     const ag_cfg_t *cfg = ag_sysconfig();
@@ -222,7 +264,7 @@ ag_err_t ag_modules_boot(void)
     uint32_t    failed = 0;
 
     while ((path = ag_cfg_next(cfg, "modules.device", &it)) != NULL) {
-        const ag_err_t err = ag_module_load(path, NULL);
+        const ag_err_t err = load_device_path(path);
         if (err == AG_OK) {
             loaded++;
         } else {

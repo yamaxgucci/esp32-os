@@ -1,22 +1,27 @@
 /*
- * ArgonOS SMS — PCM sink: write stereo s16 LE WAV, or discard (mock).
+ * ArgonOS SMS — PCM sink: /dev/* via audio_out, or stereo s16 WAV file.
  * SPDX-License-Identifier: Apache-2.0
  */
 #include "sound_output.h"
 
 #include <argon/argon.h>
 
+#include "audio_out.h"
 #include "smsplus.h"
 #include "sound.h"
 
 #define WAV_HDR 44u
 
+enum {
+    SINK_DEV = 0,
+    SINK_WAV = 1,
+};
+
 static char        s_path[AG_PATH_MAX];
-static int         s_mock = 1;
-static int         s_audio; /* api->audio sink */
+static int         s_sink = SINK_DEV;
 static int         s_active;
 static int         s_write_err_reported;
-static ag_handle_t s_fd = -1;
+static ag_handle_t s_fd = -1; /* WAV file or device handle */
 static uint32_t    s_data_bytes;
 static uint32_t    s_rate = SOUND_FREQUENCY;
 
@@ -65,7 +70,7 @@ static void write_header(uint32_t data_bytes)
     mem_copy(h + 36, "data", 4);
     put_u32(h + 40, data_bytes);
 
-    if (s_fd < 0) {
+    if (s_fd < 0 || s_sink != SINK_WAV) {
         return;
     }
     (void)ag_seek(s_fd, 0, AG_SEEK_SET);
@@ -75,47 +80,11 @@ static void write_header(uint32_t data_bytes)
 
 void Sound_SetPath(const char *path)
 {
-    s_path[0] = '\0';
-    s_mock = 1;
-    s_audio = 0;
-    if (path == NULL || path[0] == '\0') {
-        return;
+    if (ag_audio_out_resolve(path, s_path, sizeof(s_path))) {
+        s_sink = SINK_DEV;
+    } else {
+        s_sink = SINK_WAV;
     }
-    if (path[0] == 'm' || path[0] == 'M') {
-        if ((path[1] == 'o' || path[1] == 'O') &&
-            (path[2] == 'c' || path[2] == 'C') &&
-            (path[3] == 'k' || path[3] == 'K') && path[4] == '\0') {
-            return;
-        }
-    }
-    if ((path[0] == 'n' || path[0] == 'N') &&
-        (path[1] == 'u' || path[1] == 'U') &&
-        (path[2] == 'l' || path[2] == 'L') && path[3] == '\0') {
-        return;
-    }
-    if ((path[0] == 'a' || path[0] == 'A') &&
-        (path[1] == 'u' || path[1] == 'U') &&
-        (path[2] == 'd' || path[2] == 'D') &&
-        (path[3] == 'i' || path[3] == 'I') &&
-        (path[4] == 'o' || path[4] == 'O') && path[5] == '\0') {
-        s_mock = 0;
-        s_audio = 1;
-        return;
-    }
-    if ((path[0] == 'i' || path[0] == 'I') &&
-        (path[1] == '2') && (path[2] == 's' || path[2] == 'S') &&
-        path[3] == '\0') {
-        s_mock = 0;
-        s_audio = 1;
-        return;
-    }
-    size_t n = 0;
-    while (path[n] && n + 1u < sizeof(s_path)) {
-        s_path[n] = path[n];
-        n++;
-    }
-    s_path[n] = '\0';
-    s_mock = 0;
 }
 
 void Sound_Init(void)
@@ -126,45 +95,33 @@ void Sound_Init(void)
     s_rate = SOUND_FREQUENCY;
     argon_sms_audio_sink = NULL;
     if (s_fd >= 0) {
-        ag_close(s_fd);
+        if (s_sink == SINK_DEV) {
+            (void)ag_dev_close(s_fd);
+        } else {
+            ag_close(s_fd);
+        }
         s_fd = -1;
     }
-    if (s_mock) {
-        s_active = 1;
-        argon_sms_audio_sink = sound_sink_frame;
-        ag_printf("sms: sound = mock (PSG, discard)\n");
-        return;
-    }
-    if (s_audio) {
-        ag_audio_fmt_t fmt;
-        ag_err_t       err;
-        if (!ag_audio_present()) {
-            ag_printf("sms: audio: api->audio missing\n");
-            s_mock = 1;
-            s_active = 1;
-            argon_sms_audio_sink = sound_sink_frame;
-            return;
-        }
-        fmt.rate = s_rate;
-        fmt.channels = 2;
-        fmt.bits = 16;
-        err = ag_audio_open(&fmt);
-        if (err != AG_OK) {
-            ag_printf("sms: audio open: %s\n", ag_strerror(err));
-            s_mock = 1;
-            s_active = 1;
-            argon_sms_audio_sink = sound_sink_frame;
-            return;
-        }
-        s_active = 1;
-        argon_sms_audio_sink = sound_sink_frame;
-        ag_printf("sms: sound = audio %s @ %u Hz\n",
-                  ag_audio_is_hw() ? "I2S" : "stub", (unsigned)s_rate);
-        return;
-    }
     if (s_path[0] == '\0') {
+        Sound_SetPath("mock");
+    }
+
+    if (s_sink == SINK_DEV) {
+        s_fd = ag_audio_out_open_dev(s_path, s_rate, 2);
+        if (s_fd < 0) {
+            ag_printf("sms: %s: %s\n", s_path, ag_strerror((ag_err_t)s_fd));
+            Sound_SetPath("mock");
+            s_fd = ag_audio_out_open_dev(s_path, s_rate, 2);
+            if (s_fd < 0) {
+                return;
+            }
+        }
+        s_active = 1;
+        argon_sms_audio_sink = sound_sink_frame;
+        ag_printf("sms: sound = %s @ %u Hz\n", s_path, (unsigned)s_rate);
         return;
     }
+
     s_fd = ag_open(s_path, AG_O_WRONLY | AG_O_CREATE | AG_O_TRUNC);
     if (s_fd < 0) {
         ag_printf("sms: %s: %s\n", s_path, ag_strerror((ag_err_t)s_fd));
@@ -178,33 +135,29 @@ void Sound_Init(void)
 
 void Sound_Update(int16_t *sound_buffer, unsigned long len)
 {
-    if (!s_active || sound_buffer == NULL || len == 0) {
+    if (!s_active || sound_buffer == NULL || len == 0 || s_fd < 0) {
         return;
     }
-    if (s_audio) {
-        const int32_t n = ag_audio_write(sound_buffer, (int32_t)len);
+    if (s_sink == SINK_DEV) {
+        const size_t  bytes = (size_t)len * 4u;
+        const int32_t n = ag_dev_write(s_fd, sound_buffer, bytes);
         if (n < 0 && !s_write_err_reported) {
             s_write_err_reported = 1;
-            ag_printf("sms: audio write: %s\n", ag_strerror((ag_err_t)n));
+            ag_printf("sms: %s: %s\n", s_path, ag_strerror((ag_err_t)n));
         }
         return;
     }
-    if (s_mock || s_fd < 0) {
-        return;
-    }
-    const size_t bytes = (size_t)len * 4u;
-    const int32_t n = ag_write(s_fd, sound_buffer, bytes);
-    if (n > 0) {
-        s_data_bytes += (uint32_t)n;
-        if ((size_t)n < bytes && !s_write_err_reported) {
+    {
+        const size_t  bytes = (size_t)len * 4u;
+        const int32_t n = ag_write(s_fd, sound_buffer, bytes);
+        if (n > 0) {
+            s_data_bytes += (uint32_t)n;
+            return;
+        }
+        if (n < 0 && !s_write_err_reported) {
             s_write_err_reported = 1;
-            ag_printf("sms: %s: %s\n", s_path, ag_strerror(-AG_ENOSPC));
+            ag_printf("sms: %s: %s\n", s_path, ag_strerror((ag_err_t)n));
         }
-        return;
-    }
-    if (n < 0 && !s_write_err_reported) {
-        s_write_err_reported = 1;
-        ag_printf("sms: %s: %s\n", s_path, ag_strerror((ag_err_t)n));
     }
 }
 
@@ -216,15 +169,15 @@ static void sound_sink_frame(int16_t *sound_buffer, int32_t len)
 void Sound_Close(void)
 {
     argon_sms_audio_sink = NULL;
-    if (s_audio) {
-        ag_audio_close();
-        s_audio = 0;
-    }
     if (s_fd >= 0) {
-        write_header(s_data_bytes);
-        ag_close(s_fd);
+        if (s_sink == SINK_WAV) {
+            write_header(s_data_bytes);
+            ag_close(s_fd);
+            ag_printf("sms: wav closed, %u bytes PCM\n", (unsigned)s_data_bytes);
+        } else {
+            (void)ag_dev_close(s_fd);
+        }
         s_fd = -1;
-        ag_printf("sms: wav closed, %u bytes PCM\n", (unsigned)s_data_bytes);
     }
     s_active = 0;
     s_data_bytes = 0;

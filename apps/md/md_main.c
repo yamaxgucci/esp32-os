@@ -472,17 +472,21 @@ int ag_main(int argc, char **argv)
             want_livepad = 0;
         } else if (arg_eq(argv[i], "livepad")) {
             want_livepad = 1;
-        } else if (arg_eq(argv[i], "mock")) {
-            sound_path = "mock";
+        } else if (arg_eq(argv[i], "mock") || arg_eq(argv[i], "pcmnull")) {
+            sound_path = "pcmnull";
         } else if (arg_eq(argv[i], "wav")) {
             sound_path = "a:\\md.wav";
-        } else if (arg_eq(argv[i], "net") || arg_eq(argv[i], "tcp")) {
-            sound_path = "net";
+        } else if (arg_eq(argv[i], "net") || arg_eq(argv[i], "tcp") ||
+                   arg_eq(argv[i], "pcmvirt")) {
+            sound_path = "pcmvirt";
+        } else if (arg_eq(argv[i], "audio") || arg_eq(argv[i], "i2s") ||
+                   arg_eq(argv[i], "pcm0")) {
+            sound_path = "pcm0";
         } else if ((argv[i][0] == 'n' || argv[i][0] == 'N') &&
                    (argv[i][1] == 'e' || argv[i][1] == 'E') &&
                    (argv[i][2] == 't' || argv[i][2] == 'T') &&
                    argv[i][3] == ':') {
-            sound_path = argv[i]; /* net:PORT */
+            sound_path = "pcmvirt"; /* port owned by PCMVIRT.SYS */
         } else if (looks_like_number(argv[i])) {
             frames = parse_int(argv[i], -1);
         } else if (rom == NULL) {

@@ -118,7 +118,8 @@ if ($HostFs) {
             $hostfsProc.ExitCode, ($tail -join ' '))
     }
     # Appended AFTER console -serial so this is UART1, not UART0.
-    $hostfsSerial = "tcp:127.0.0.1:$HostFsPort"
+    # reconnect=: guest `reboot` drops UART1; QEMU reopens so H: comes back.
+    $hostfsSerial = "tcp:127.0.0.1:$HostFsPort,reconnect=1"
 }
 
 # Decide where the console goes before building the arguments: a window that

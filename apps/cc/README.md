@@ -58,17 +58,20 @@ A structural DX7-like synth is the host-built [`apps/dx7`](../dx7) (`DX7.AXE`).
 
 ```text
 python tools/mkaxe.py --arch xtensa --gcc xtensa-esp32s3-elf-gcc ^
-    --include sdk/include --include apps/cc -o build\sd_card\CC.AXE ^
+    --include sdk/include --include apps/cc -o build\apps\CC.AXE ^
     apps/cc/cc_main.c apps/cc/cc_compile.c
 ```
+
+`mkaxe` also stages into `build/sd_card/` (see
+[`docs/user/03-host-share.md`](../../docs/user/03-host-share.md)).
 
 ## Use (QEMU)
 
 ```text
-argon run -Gfx -HostFs build\sms_share
+argon run -Gfx -HostFs build\sd_card
 ```
 
-Guest (`H:` = share with `CC.AXE`, `asteroids.c`, optional `ASTEROIDS.AXE`):
+Guest (`H:` = `build\sd_card` with `CC.AXE`, `asteroids.c`, optional `ASTEROIDS.AXE`):
 
 ```text
 run h:\cc.axe h:\asteroids.c h:\asteroids.axe

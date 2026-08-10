@@ -1,5 +1,5 @@
 /*
- * ArgonOS - PCM audio output (I2S TX or discard stub).
+ * ArgonOS - built-in mute PCM (/dev/pcmnull); virt/I2S via .SYS.
  *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
  */

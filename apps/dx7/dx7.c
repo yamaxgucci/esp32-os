@@ -1,33 +1,24 @@
 /*
  * DX7 — polyphonic structural 6-op FM synth for ArgonOS.
  *
- * Sound sinks (same idea as MD):
- *   mock  — render and discard (default)
- *   net   — TCP WAV stream → host tools/pcmplay.py
- *   audio — kernel api->audio (I2S or discard stub)
+ * Sound via audio_out device path (default /dev/pcmnull). Use pcmvirt after
+ * `drv install` of PCMVIRT.SYS for host playback (tools/pcmplay.py).
  *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
  */
 #include <argon/argon.h>
 #include <argon/keys.h>
 
+#include "audio_out.h"
 #include "ag_dx7.h"
 #include "ag_mid.h"
 
 AG_APP_SIZED("DX7", "0.3", "argon", 0, 8 * 1024, 128 * 1024);
 
 #define RATE 22050u
-#define CHUNK 441 /* ~20 ms @ 22050 — fewer TCP writes than 256 */
+#define CHUNK 441 /* ~20 ms @ 22050 */
 #define CHUNK_US ((uint32_t)((CHUNK * 1000000ull) / RATE))
-#define WAV_HDR 44u
-#define NET_PORT_DEFAULT 5558u
 #define UI_PERIOD_MS 250u
-
-enum {
-    SINK_MOCK = 0,
-    SINK_NET = 1,
-    SINK_AUDIO = 2,
-};
 
 static ag_dx7_t s_dx;
 static int16_t s_pcm[CHUNK * 2];
@@ -56,10 +47,8 @@ static char s_mid_err[80];
 static int s_mid_loaded;
 static uint32_t s_mid_notes; /* note-ons fired (UI) */
 
-static int s_sink = SINK_MOCK;
-static uint16_t s_net_port = NET_PORT_DEFAULT;
-static ag_handle_t s_listen = -1;
-static ag_handle_t s_conn = -1;
+static char s_audio_path[AG_PATH_MAX];
+static ag_handle_t s_audio_fd = -1;
 static int s_send_err_reported;
 
 /* Perf / stream health (shown in UI). */
@@ -95,29 +84,6 @@ static const key_map_t k_keys[] = {
 
 enum { K_KEYS_N = (int)(sizeof(k_keys) / sizeof(k_keys[0])) };
 
-static void mem_copy(void *dst, const void *src, unsigned n)
-{
-    unsigned char *d = (unsigned char *)dst;
-    const unsigned char *s = (const unsigned char *)src;
-    while (n--) {
-        *d++ = *s++;
-    }
-}
-
-static void put_u16(uint8_t *p, uint16_t v)
-{
-    p[0] = (uint8_t)(v & 0xffu);
-    p[1] = (uint8_t)((v >> 8) & 0xffu);
-}
-
-static void put_u32(uint8_t *p, uint32_t v)
-{
-    p[0] = (uint8_t)(v & 0xffu);
-    p[1] = (uint8_t)((v >> 8) & 0xffu);
-    p[2] = (uint8_t)((v >> 16) & 0xffu);
-    p[3] = (uint8_t)((v >> 24) & 0xffu);
-}
-
 static int str_ieq(const char *s, const char *lit)
 {
     if (s == NULL || lit == NULL) {
@@ -133,64 +99,6 @@ static int str_ieq(const char *s, const char *lit)
         }
     }
     return *lit == '\0' && *s == '\0';
-}
-
-static void fill_wav_header(uint8_t *h, uint32_t data_bytes)
-{
-    mem_copy(h, "RIFF", 4);
-    put_u32(h + 4, 36u + data_bytes);
-    mem_copy(h + 8, "WAVE", 4);
-    mem_copy(h + 12, "fmt ", 4);
-    put_u32(h + 16, 16u);
-    put_u16(h + 20, 1u);
-    put_u16(h + 22, 2u);
-    put_u32(h + 24, RATE);
-    put_u32(h + 28, RATE * 4u);
-    put_u16(h + 32, 4u);
-    put_u16(h + 34, 16u);
-    mem_copy(h + 36, "data", 4);
-    put_u32(h + 40, data_bytes);
-}
-
-static int send_all(ag_handle_t sock, const void *buf, size_t len)
-{
-    const uint8_t *p = (const uint8_t *)buf;
-    size_t left = len;
-    while (left > 0) {
-        const int32_t n = ag_net_send(sock, p, left);
-        if (n < 0) {
-            return (int)n;
-        }
-        if (n == 0) {
-            return -AG_EIO;
-        }
-        p += (size_t)n;
-        left -= (size_t)n;
-    }
-    return 0;
-}
-
-static int32_t send_nb(ag_handle_t sock, const void *buf, size_t len)
-{
-    const uint8_t *p = (const uint8_t *)buf;
-    size_t left = len;
-    size_t sent = 0;
-    while (left > 0) {
-        const int32_t n = ag_net_send(sock, p, left);
-        if (n == -AG_EAGAIN) {
-            break;
-        }
-        if (n < 0) {
-            return n;
-        }
-        if (n == 0) {
-            break;
-        }
-        p += (size_t)n;
-        left -= (size_t)n;
-        sent += (size_t)n;
-    }
-    return (int32_t)sent;
 }
 
 static void piano_all_off(void);
@@ -384,36 +292,19 @@ static void syx_next_file(int delta)
 
 static int parse_sink_arg(const char *arg)
 {
-    uint32_t port = 0;
-    const char *p;
-
     if (arg == NULL || arg[0] == '\0') {
         return 0;
     }
-    if (str_ieq(arg, "net") || str_ieq(arg, "tcp")) {
-        s_sink = SINK_NET;
+    if (str_ieq(arg, "net") || str_ieq(arg, "tcp") || str_ieq(arg, "pcmvirt") ||
+        str_ieq(arg, "audio") || str_ieq(arg, "i2s") || str_ieq(arg, "pcm0") ||
+        str_ieq(arg, "mock") || str_ieq(arg, "mute") || str_ieq(arg, "pcmnull") ||
+        ((arg[0] == 'n' || arg[0] == 'N') && (arg[1] == 'e' || arg[1] == 'E') &&
+         (arg[2] == 't' || arg[2] == 'T') && arg[3] == ':') ||
+        (arg[0] == '/' ||
+         ((arg[0] == 'd' || arg[0] == 'D') && arg[1] == ':') ||
+         ((arg[0] == 'p' || arg[0] == 'P') && (arg[1] == 'c' || arg[1] == 'C')))) {
+        (void)ag_audio_out_resolve(arg, s_audio_path, sizeof(s_audio_path));
         return 0;
-    }
-    if (str_ieq(arg, "audio") || str_ieq(arg, "i2s")) {
-        s_sink = SINK_AUDIO;
-        return 0;
-    }
-    if (str_ieq(arg, "mock") || str_ieq(arg, "mute")) {
-        s_sink = SINK_MOCK;
-        return 0;
-    }
-    if ((arg[0] == 'n' || arg[0] == 'N') && (arg[1] == 'e' || arg[1] == 'E') &&
-        (arg[2] == 't' || arg[2] == 'T') && arg[3] == ':') {
-        p = arg + 4;
-        while (*p >= '0' && *p <= '9') {
-            port = port * 10u + (uint32_t)(*p - '0');
-            p++;
-        }
-        if (port > 0u && port <= 65535u && *p == '\0') {
-            s_net_port = (uint16_t)port;
-            s_sink = SINK_NET;
-            return 0;
-        }
     }
     if (ends_with_syx(arg)) {
         path_copy(s_bank_path, arg, SYX_PATH_LEN);
@@ -574,108 +465,30 @@ static void scan_mid_autoload(void)
     }
 }
 
-static int net_listen_and_accept(void)
-{
-    uint32_t ip = 0;
-    uint8_t hdr[WAV_HDR];
-
-    if (g_ag_api->net == NULL) {
-        ag_printf("dx7: net: api->net is NULL\n");
-        return -1;
-    }
-    if (ag_net_wait_ready(10000u) != AG_OK) {
-        ag_printf("dx7: net: DHCP timeout\n");
-        return -1;
-    }
-    (void)ag_net_ifaddr(&ip);
-    ag_printf("dx7: net: ip %u.%u.%u.%u, listen :%u (hostfwd)\n",
-              (unsigned)((ip >> 24) & 0xffu), (unsigned)((ip >> 16) & 0xffu),
-              (unsigned)((ip >> 8) & 0xffu), (unsigned)(ip & 0xffu),
-              (unsigned)s_net_port);
-
-    s_listen = ag_tcp_listen(s_net_port);
-    if (s_listen < 0) {
-        ag_printf("dx7: net: listen: %s\n", ag_strerror((ag_err_t)s_listen));
-        return -1;
-    }
-
-    ag_printf("dx7: net: waiting for host (python tools/pcmplay.py)...\n");
-    for (;;) {
-        s_conn = ag_tcp_accept(s_listen, 1000u);
-        if (s_conn >= 0) {
-            break;
-        }
-        if ((ag_err_t)s_conn != -AG_EAGAIN &&
-            (ag_err_t)s_conn != -AG_ETIMEDOUT) {
-            ag_printf("dx7: net: accept: %s\n",
-                      ag_strerror((ag_err_t)s_conn));
-            (void)ag_net_close(s_listen);
-            s_listen = -1;
-            return -1;
-        }
-        if (ag_key(AG_KEY_ESC) || ag_key(AG_KEY_Q)) {
-            ag_printf("dx7: net: cancelled\n");
-            (void)ag_net_close(s_listen);
-            s_listen = -1;
-            return -1;
-        }
-        ag_heartbeat();
-    }
-
-    fill_wav_header(hdr, 0x7fffffffu);
-    if (send_all(s_conn, hdr, WAV_HDR) < 0) {
-        ag_printf("dx7: net: header send failed\n");
-        (void)ag_net_close(s_conn);
-        s_conn = -1;
-        (void)ag_net_close(s_listen);
-        s_listen = -1;
-        return -1;
-    }
-    if (ag_net_set_nonblock(s_conn, true) != AG_OK) {
-        ag_printf("dx7: net: set_nonblock failed\n");
-    }
-    ag_printf("dx7: sound = net :%u @ %u Hz (connected)\n",
-              (unsigned)s_net_port, (unsigned)RATE);
-    return 0;
-}
-
 static int open_sink(void)
 {
-    if (s_sink == SINK_MOCK) {
-        ag_printf("dx7: sound = mock (discard)\n");
-        return 0;
+    if (s_audio_path[0] == '\0') {
+        (void)ag_audio_out_resolve("pcmnull", s_audio_path, sizeof(s_audio_path));
     }
-    if (s_sink == SINK_AUDIO) {
-        ag_audio_fmt_t fmt = {.rate = RATE, .channels = 2, .bits = 16};
-        ag_err_t err;
-        if (!ag_audio_present()) {
-            ag_printf("dx7: audio: api->audio missing\n");
+    s_audio_fd = ag_audio_out_open_dev(s_audio_path, RATE, 2);
+    if (s_audio_fd < 0) {
+        ag_printf("dx7: %s: %s\n", s_audio_path,
+                  ag_strerror((ag_err_t)s_audio_fd));
+        (void)ag_audio_out_resolve("pcmnull", s_audio_path, sizeof(s_audio_path));
+        s_audio_fd = ag_audio_out_open_dev(s_audio_path, RATE, 2);
+        if (s_audio_fd < 0) {
             return -1;
         }
-        err = ag_audio_open(&fmt);
-        if (err != AG_OK) {
-            ag_printf("dx7: audio open: %s\n", ag_strerror(err));
-            return -1;
-        }
-        ag_printf("dx7: sound = audio %s @ %u Hz\n",
-                  ag_audio_is_hw() ? "I2S" : "stub", (unsigned)RATE);
-        return 0;
     }
-    return net_listen_and_accept();
+    ag_printf("dx7: sound = %s @ %u Hz\n", s_audio_path, (unsigned)RATE);
+    return 0;
 }
 
 static void close_sink(void)
 {
-    if (s_conn >= 0) {
-        (void)ag_net_close(s_conn);
-        s_conn = -1;
-    }
-    if (s_listen >= 0) {
-        (void)ag_net_close(s_listen);
-        s_listen = -1;
-    }
-    if (s_sink == SINK_AUDIO) {
-        ag_audio_close();
+    if (s_audio_fd >= 0) {
+        (void)ag_dev_close(s_audio_fd);
+        s_audio_fd = -1;
     }
 }
 
@@ -814,13 +627,7 @@ static const char *note_name(uint8_t note)
 
 static const char *sink_name(void)
 {
-    if (s_sink == SINK_AUDIO) {
-        return "audio";
-    }
-    if (s_sink == SINK_MOCK) {
-        return "mock";
-    }
-    return "net";
+    return s_audio_path[0] ? s_audio_path : "/dev/pcmnull";
 }
 
 static void draw_ui(void)
@@ -1116,37 +923,6 @@ static void handle_key(int key, int down, int is_repeat, uint32_t uni)
     }
 }
 
-/*
- * Push the whole buffer; retry on EAGAIN until deadline.
- * Returns bytes not sent (0 = ok).
- */
-static size_t send_fully(const void *buf, size_t len, ag_time_t deadline)
-{
-    const uint8_t *p = (const uint8_t *)buf;
-    size_t left = len;
-
-    while (left > 0) {
-        const int32_t n = ag_net_send(s_conn, p, left);
-        if (n > 0) {
-            p += (size_t)n;
-            left -= (size_t)n;
-            continue;
-        }
-        if (n < 0 && n != -AG_EAGAIN) {
-            if (!s_send_err_reported) {
-                s_send_err_reported = 1;
-                ag_printf("dx7: net send: %s\n", ag_strerror((ag_err_t)n));
-            }
-            return left;
-        }
-        if (ag_micros() >= deadline) {
-            return left;
-        }
-        ag_heartbeat();
-    }
-    return 0;
-}
-
 static void pace_wait(ag_time_t due)
 {
     for (;;) {
@@ -1168,8 +944,8 @@ static void pump_audio(void)
 {
     const int32_t n = (int32_t)CHUNK;
     const size_t bytes = (size_t)n * 4u;
-    ag_time_t t0, t1, t2;
-    size_t left;
+    ag_time_t t0, t1;
+    int32_t wr;
 
     t0 = ag_micros();
     if (s_mid_loaded && s_mid.playing) {
@@ -1186,26 +962,20 @@ static void pump_audio(void)
         }
     }
 
-    if (s_sink == SINK_MOCK) {
+    if (s_audio_fd < 0) {
         s_send_us = 0;
         return;
     }
-    if (s_sink == SINK_AUDIO) {
-        (void)ag_audio_write(s_pcm, n);
-        s_send_us = (uint32_t)(ag_micros() - t1);
-        return;
-    }
-    if (s_conn < 0) {
-        s_send_us = 0;
-        return;
-    }
-
-    /* Allow up to ~1.5 chunk periods to flush (avoid dropping mid-buffer). */
-    left = send_fully(s_pcm, bytes, t1 + (ag_time_t)CHUNK_US + (CHUNK_US / 2u));
-    t2 = ag_micros();
-    s_send_us = (uint32_t)(t2 - t1);
-    if (left > 0u) {
-        s_drop += (uint32_t)left;
+    wr = ag_dev_write(s_audio_fd, s_pcm, bytes);
+    s_send_us = (uint32_t)(ag_micros() - t1);
+    if (wr < 0) {
+        if (!s_send_err_reported) {
+            s_send_err_reported = 1;
+            ag_printf("dx7: %s: %s\n", s_audio_path, ag_strerror((ag_err_t)wr));
+        }
+        s_drop += (uint32_t)bytes;
+    } else if ((size_t)wr < bytes) {
+        s_drop += (uint32_t)(bytes - (size_t)wr);
     }
 }
 
@@ -1214,10 +984,13 @@ int ag_main(int argc, char **argv)
     ag_event_t ev;
     int i;
 
+    (void)ag_audio_out_resolve("pcmnull", s_audio_path, sizeof(s_audio_path));
+
     for (i = 1; i < argc; i++) {
         if (parse_sink_arg(argv[i]) != 0) {
-            ag_printf("dx7: unknown arg '%s' (net|audio|mock|.syx|.mid)\n",
-                      argv[i]);
+            ag_printf(
+                "dx7: unknown arg '%s' (pcmvirt|pcmnull|audio|mock|.syx|.mid)\n",
+                argv[i]);
         }
     }
 

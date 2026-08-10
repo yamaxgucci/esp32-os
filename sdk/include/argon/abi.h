@@ -51,9 +51,10 @@ extern "C" {
  *      listen/accept/connect/send/recv plus ready/wait_ready/ifaddr.
  * 0.13 appended net->set_nonblock.
  * 0.14 added api->audio (I2S or discard stub) and AG_AXE_NEEDS_AUDIO.
+ * 0.15 pcmnull built-in; AG_IOC_AUDIO_GETFMT/SETFMT; I2S/virt via .SYS drivers.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 14u
+#define AG_ABI_MINOR 15u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -540,6 +541,10 @@ enum ag_ioctl_cmd {
     AG_IOC_FLUSH = AG_IOC(AG_DEV_ANY, 3), /* arg: NULL                      */
 
     AG_IOC_GEOMETRY = AG_IOC(AG_DEV_STORAGE, 1), /* arg: ag_geometry_t      */
+
+    /* PCM devices (/dev/pcmnull, loadable pcmvirt, …): arg ag_audio_fmt_t */
+    AG_IOC_AUDIO_GETFMT = AG_IOC(AG_DEV_AUDIO, 1),
+    AG_IOC_AUDIO_SETFMT = AG_IOC(AG_DEV_AUDIO, 2),
 };
 
 typedef struct {
@@ -872,7 +877,7 @@ typedef struct ag_net_api {
 } ag_net_api_t;
 
 /* ------------------------------------------------------------------------ */
-/* audio - PCM output (I2S on hardware; discard stub without pins / QEMU)   */
+/* audio - PCM output (built-in pcmnull discard; I2S/virt via .SYS)         */
 /* ------------------------------------------------------------------------ */
 
 typedef struct {
@@ -884,12 +889,12 @@ typedef struct {
 typedef struct ag_audio_api {
     uint32_t size;
 
-    /* Always 1 after devices init once the class is built in. */
+    /* Always 1 after devices init (built-in /dev/pcmnull). */
     int (*present)(void);
-    /* 1 when BOARD.CFG wired I2S pins and the TX channel is live. */
+    /* 1 only when a real hardware backend is open (never for pcmnull). */
     int (*is_hw)(void);
 
-    /* Exclusive open; fmt NULL → 22050 Hz stereo s16. */
+    /* Exclusive open of the built-in null sink; fmt NULL → board rate stereo s16. */
     ag_err_t (*open)(const ag_audio_fmt_t *fmt);
     void (*close)(void);
 
@@ -899,7 +904,7 @@ typedef struct ag_audio_api {
      * rather than block the emulator for long.
      */
     int32_t (*write)(const int16_t *pcm, int32_t frames);
-    /* Best-effort free space in frames (0 on stub). */
+    /* Best-effort free space in frames. */
     int32_t (*space)(void);
 } ag_audio_api_t;
 
@@ -928,7 +933,7 @@ typedef struct ag_api {
     /* NULL when the profile has no networking. */
     const ag_net_api_t *net;
 
-    /* ABI 0.14: PCM out.  Non-NULL when the kernel builds audio support. */
+    /* ABI 0.14+: PCM out (built-in pcmnull; virt/I2S via .SYS). */
     const ag_audio_api_t *audio;
 } ag_api_t;
 

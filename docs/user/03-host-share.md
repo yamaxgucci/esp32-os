@@ -1,6 +1,28 @@
 # Host share — files from Windows into the guest
 
-Two ways to see a Windows folder from ArgonOS in QEMU.
+## Canonical folders
+
+| Folder | Role |
+|--------|------|
+| [`build/apps/`](../../build/apps) | Archive of every built `.AXE` / `.SYS` |
+| [`build/sd_card/`](../../build/sd_card) | **The** share: HostFS root and `argon sync` input |
+
+`tools/mkaxe.py` writes your `-o` path, then **always** copies the image into
+both folders (unless `--no-stage`). Prefer:
+
+```
+… -o build/apps/SMS.AXE …
+```
+
+Then use **only** `build\sd_card` with QEMU:
+
+```bat
+argon run -Gfx -HostFs build\sd_card
+argon sync build\sd_card
+argon run -Share build\sd_card
+```
+
+Do not invent per-app shares (`sms_share`, `cc_share`, …).
 
 ---
 
@@ -22,61 +44,54 @@ Pull a file back out:
 argon get shot.ppm
 ```
 
-### Живая картинка в QEMU (играть SMS)
+### Live graphics + pad (SMS / MD)
 
-Нужен **HostFS** с `--pad-cfg` (так делает `argon run -HostFs`): хост **пушит**
-состояние клавиш ~60 Гц, гость читает кэш — диагонали и «идти + стрелять»
-без лагов UART.
+Need **HostFS** with `--pad-cfg` (`argon run -HostFs`): host pushes pad state
+~60 Hz.
 
 ```bat
-argon run -Gfx -HostFs build\sms_share
+argon run -Gfx -HostFs build\sd_card
 ```
 
-В папку шары положи `SMS.AXE`, ROM и при желании свой `sms.cfg`. В госте:
+Put `SMS.AXE` / `MD.AXE`, ROMs, and optional `sms.cfg` in `build\sd_card`. Guest:
 
 ```
 H:\> run sms.axe game.sms
 ```
 
-Жди `sms: controls = live pad (inp / HostFS PADPUSH)` (или то же у `MD.AXE`).
-Фокус можно на SDL — хост ловит клавиши низкоуровневым хуком.
+Expect `sms: controls = live pad (inp / HostFS PADPUSH)` (same idea for MD).
 
-### Важно
+### Notes
 
-* Меняли файлы на Windows → снова `argon sync` (или `run -Share`).
-* Образ по умолчанию **64 МиБ**, FAT16, VFAT.
-* FatFs патч: тип тома из BPB, не только из числа кластеров.
-* На плате нужна настоящая microSD.
+* Changed files on Windows → `argon sync` again (or use HostFS for live `H:`).
+* Default image **64 MiB**, FAT16, VFAT.
+* On hardware, use a real microSD.
 
-Реализация: `tools/mkfatimg.py`, `tools/fatget.py`.
+Implementation: `tools/mkfatimg.py`, `tools/fatget.py`.
 
 ---
 
 ## 2. HostFS — live folder on `H:` (done for QEMU)
 
-**HostFS** is a VFS backend on UART1 talking to `tools/hostfsd.py`. The guest
-drive `H:` maps to `/host`. No image rebuild: drop a file on Windows, `dir` on
-`H:` sees it.
+**HostFS** is a VFS backend on UART1 talking to `tools/hostfsd.py`. Guest drive
+`H:` maps to `/host`. Drop a file on Windows → `dir` on `H:` sees it.
 
 ```bat
-argon run -Gfx -HostFs D:\roms
+argon run -Gfx -HostFs build\sd_card
 ```
 
-Optional together with a packed card:
+Optional together with a packed card (same folder for sync):
 
 ```bat
-argon run -Gfx -Share build\sd_card -HostFs D:\roms
+argon run -Gfx -Share build\sd_card -HostFs build\sd_card
 ```
 
 Guest:
 
 ```
-A:\> h:
 H:\> dir
-H:\> run a:\sms.axe sonic.sms
+H:\> run sms.axe sonic.sms
 ```
-
-(`sonic.sms` lives under `D:\roms` on the host.)
 
 ### How it works
 
@@ -86,30 +101,9 @@ H:\> run a:\sms.axe sonic.sms
 | QEMU 2nd `-serial` | UART1 as TCP client to that port |
 | Guest `hostfs.c` | RPC over UART1, mount `/host` (read + file write) |
 
-Console stays on the first serial (`mon:stdio` / `-Tcp`). HostFS never shares
-the console byte stream.
-
-Supported: `dir`, `cd`, `type`, `run`, `copy` onto `H:` (create/overwrite via
-`OPEN` + `HSFS_OP_WRITE`), `del` (`HSFS_OP_UNLINK`). Not yet: mkdir, rename.
-With `--pad-cfg`, hostfsd **pushes** live pad snapshots (`HSFS_OP_PADPUSH`,
-6 bytes: pad0, pad1, sys, pad0hi, pad1hi, ver). The guest input layer caches
-them for `inp->pad` / `btn` / `btnp` and `/dev/joy0`. `H:\sms.pad` is the same
-cache as a read-only compatibility file. Bindings come from `sms.cfg`
-(`pad0.c`, `pad0.start`, …).
-
-Small files: `copy` onto `H:` and `del` work. **Large files** (e.g. SMS WAV,
-hundreds of KB) are still unreliable on `H:` while PADPUSH is live — use the
-SD image instead:
-
-```
-run h:\SMS.AXE … a:\sms.wav
-```
-
-Then on the host: `argon get a:\sms.wav build\sms.wav`. Fixing large `H:`
-copies is backlog item 9 in [`04-roadmap.md`](../04-roadmap.md).
-
-Without `-HostFs`, boot tries a short UART1 ping and skips `H:` if nobody answers.
-Guest firmware and `hostfsd.py` must match for writes (old helper opens read-only).
+Console stays on the first serial. With `--pad-cfg`, hostfsd **pushes** live pad
+snapshots. Large WAV copies on `H:` while PADPUSH is live can be flaky — prefer
+`A:` + `argon get` for big captures (backlog in [`04-roadmap.md`](../04-roadmap.md)).
 
 ### Sync vs HostFS
 
@@ -118,7 +112,6 @@ Guest firmware and `hostfsd.py` must match for writes (old helper opens read-onl
 | When changes appear | after `argon sync` | immediately |
 | Where code lives | host tools only | kernel + `hostfsd.py` |
 | On a real board | use a real SD | needs another transport later |
-| Complexity | low | medium |
 
 ### Why not 9p/virtfs
 

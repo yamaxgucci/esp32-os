@@ -39,17 +39,20 @@ ag_err_t ag_driver_init(void)
 
 ```
 python tools\mkaxe.py --arch xtensa --gcc xtensa-esp32s3-elf-gcc ^
-    --include sdk/include -o build\ECHO.SYS apps\echo\echo.c
+    --include sdk/include -o build\apps\ECHO.SYS apps\echo\echo.c
 
-argon test -Put "build\ECHO.SYS=t:\echo.sys" ^
+argon test -Put "build\sd_card\ECHO.SYS=t:\echo.sys" ^
     "drv load t:\echo.sys" "drv" "dev echo" "drv unload ECHO"
 ```
+
+Образы клади в `build/apps/` — `mkaxe` сам копирует ещё в `build/sd_card/`
+(см. [`docs/user/03-host-share.md`](../user/03-host-share.md)).
 
 В `SYSTEM.CFG` — список на старт (после монтирования носителей):
 
 ```
 [modules]
-device = t:\echo.sys
+device = c:\drv\pcmvirt.sys
 device = a:\drv\force.sys
 ; I2C: bus:addr:path   или   bus:addr:idreg=idval:path
 probe  = 0:0x76:a:\drv\bme280.sys
@@ -61,9 +64,21 @@ probe  = 0:0x76:0xD0=0x60:a:\drv\bme280.sys
 в арену не попадает. В `ag_driver_init` совпадение доступно через
 `ag_probe_hint()` (шина, адрес, id). Пример — `apps/whoami`.
 
-Шелл: `drv` (список), `drv load <file>`, `drv unload <name>`, `drv probe`
-(повторить подбор из конфига). Имя для unload — из заголовка образа (`ECHO`),
-не путь к файлу. `dev` показывает устройства; `run` на `.SYS` отказывает.
+**Установка один раз** (файл на `C:` + строка в `SYSTEM.CFG` + load сейчас):
+
+```
+drv install t:\pcmvirt.sys
+```
+
+После reboot модуль поднимается сам со стадии `modules`. `drv uninstall <name>`
+снимает запись и файл. Временно: `drv load t:\…` (без persist).
+
+Шелл: `drv` (список), `drv load` / `unload` / `install` / `uninstall` / `probe`.
+Имя для unload — из заголовка образа (`PCMVIRT`, `ECHO`), не путь к файлу.
+`dev` показывает устройства; `run` на `.SYS` отказывает.
+
+Пример audio: [`apps/pcmvirt`](../../apps/pcmvirt) публикует `/dev/pcmvirt`
+(TCP WAV → `tools/pcmplay.py`). Ядро по умолчанию даёт только `/dev/pcmnull`.
 
 ## Ограничения
 

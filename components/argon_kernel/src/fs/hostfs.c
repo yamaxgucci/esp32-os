@@ -745,13 +745,27 @@ ag_err_t ag_hostfs_try_mount(void)
         return -AG_ENODEV;
     }
 
-    uint32_t pong = 0;
-    const ag_err_t ping =
-        rpc(HSFS_OP_PING, 0, 0, NULL, NULL, 0, &pong, NULL, NULL, 0, NULL,
-            HSFS_PING_TIMEOUT_MS);
-    if (ping != AG_OK) {
-        ag_log(AG_LOG_INFO, "hostfs", "no host helper on UART1 (skip H:)");
-        return -AG_ENODEV;
+    /*
+     * After guest `reboot`, QEMU may drop/reopen the UART1 TCP link.  Retry
+     * briefly so a reconnecting hostfsd is not missed on the first PING.
+     */
+    {
+        uint32_t pong = 0;
+        ag_err_t ping = -AG_ENODEV;
+        int      attempt;
+
+        for (attempt = 0; attempt < 25; attempt++) {
+            ping = rpc(HSFS_OP_PING, 0, 0, NULL, NULL, 0, &pong, NULL, NULL, 0,
+                       NULL, HSFS_PING_TIMEOUT_MS);
+            if (ping == AG_OK) {
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+        if (ping != AG_OK) {
+            ag_log(AG_LOG_INFO, "hostfs", "no host helper on UART1 (skip H:)");
+            return -AG_ENODEV;
+        }
     }
 
     const ag_err_t m = ag_vfs_mount("/host", &k_ops, NULL, 0);

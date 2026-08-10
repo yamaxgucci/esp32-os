@@ -10,8 +10,8 @@
 #define MD_SOUND_RATE 22050u
 #define MD_SOUND_NET_PORT_DEFAULT 5558u
 
-void md_sound_set_path(const char *path); /* NULL/"mock" → discard; "net" → TCP; else WAV */
-void md_sound_set_net_port(uint16_t port);
+void md_sound_set_path(const char *path); /* mock/net/pcmvirt/… or WAV path */
+void md_sound_set_net_port(uint16_t port); /* obsolete; virt port is in PCMVIRT.SYS */
 void md_sound_init(void);
 void md_sound_close(void);
 void md_sound_begin_frame(int lines_per_frame);

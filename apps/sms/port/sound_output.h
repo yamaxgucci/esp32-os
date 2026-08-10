@@ -4,8 +4,8 @@
 #include <stdint.h>
 
 /*
- * ArgonOS SMS audio sink (no I2S yet): optional WAV file or discard ("mock").
- * Call Sound_SetPath() before Sound_Init().  Path NULL / "mock" / "nul" → mock.
+ * ArgonOS SMS audio sink: /dev/pcm* (audio_out) or a WAV file path.
+ * Call Sound_SetPath() before Sound_Init().  "mock"/"nul" → /dev/pcmnull.
  */
 void Sound_SetPath(const char *path);
 void Sound_Init(void);
