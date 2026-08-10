@@ -10,6 +10,7 @@
 
 #include <argon/board.h>
 #include <argon/codepage.h>
+#include <argon/loader.h>
 #include <argon/log.h>
 #include <argon/vfs.h>
 
@@ -110,6 +111,28 @@ ag_err_t ag_sysconfig_init(void)
             ag_cp_set_active(chosen);
         } else {
             ag_log(AG_LOG_WARN, "config", "no such code page: %d", (int)page);
+        }
+    }
+
+    /*
+     * Code arena: the linked buffer is a ceiling (CONFIG_ARGON_APP_ARENA_KB).
+     * [memory] app_arena_kb= clips how much of it the loader may hand out.
+     * Missing key → full ceiling.  Needs reboot to take effect after a change.
+     */
+    {
+        const char *raw = ag_cfg_get(&s_cfg, "memory.app_arena_kb", NULL);
+        if (raw != NULL) {
+            const int32_t want = ag_cfg_get_int(&s_cfg, "memory.app_arena_kb", 0);
+            if (want <= 0) {
+                ag_log(AG_LOG_WARN, "config",
+                       "memory.app_arena_kb=%s ignored (need positive KB)", raw);
+            } else {
+                const size_t usable =
+                    ag_loader_set_arena_kb((uint32_t)want);
+                ag_log(AG_LOG_INFO, "config",
+                       "app code arena %u KB (asked %d)",
+                       (unsigned)(usable / 1024u), (int)want);
+            }
         }
     }
 

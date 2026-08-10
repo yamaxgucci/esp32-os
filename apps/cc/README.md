@@ -41,6 +41,18 @@ sets `AG_AXE_NEEDS_GFX` and requires ABI minor 9.
 | `ag_gfx_line(x0,y0,x1,y1,color)` | |
 | `ag_gfx_circle` / `ag_gfx_fill_circle` | |
 | `ag_gfx_poly_begin` / `vertex` / `fill` / `stroke` | Convex poly helpers |
+| `ag_audio_present()` | 1 if `api->audio` exists |
+| `ag_audio_is_hw()` | 1 when I2S pins live |
+| `ag_audio_open()` | default 22050 Hz stereo s16 (`fmt` NULL) |
+| `ag_audio_close()` | |
+| `ag_audio_write(buf, frames)` | `buf` is `int[]` address; kernel reads interleaved s16 (see `fmtoy.c`) |
+| `ag_audio_space()` | free frames (best-effort) |
+
+Using any `ag_gfx_*` sets `AG_AXE_NEEDS_GFX`. Using any `ag_audio_*` sets
+`AG_AXE_NEEDS_AUDIO` (ABI minor 14).
+
+Audio toy (2-op FM, not DX7): [`examples/fmtoy.c`](examples/fmtoy.c).
+A structural DX7-like synth is the host-built [`apps/dx7`](../dx7) (`DX7.AXE`).
 
 ## Build
 

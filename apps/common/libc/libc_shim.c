@@ -33,19 +33,8 @@ void *calloc(size_t n, size_t sz)
 
 void *realloc(void *p, size_t n)
 {
-    if (p == NULL) {
-        return malloc(n);
-    }
-    if (n == 0) {
-        free(p);
-        return NULL;
-    }
-    void *q = malloc(n);
-    if (q != NULL) {
-        memcpy(q, p, n);
-        free(p);
-    }
-    return q;
+    /* Prefer the ABI realloc: it knows the old block size (multi_heap). */
+    return ag_realloc(p, n);
 }
 
 void free(void *p)

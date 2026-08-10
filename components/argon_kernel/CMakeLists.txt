@@ -20,6 +20,7 @@ set(ARGON_KERNEL_SRCS
     "src/dev/devfs.c"
     "src/dev/devices.c"
     "src/dev/display.c"
+    "src/dev/audio.c"
     "src/dev/draw.c"
     "src/dev/font8x16.c"
     "src/dev/ioclaim.c"
@@ -45,6 +46,11 @@ set(ARGON_KERNEL_SRCS
     "src/shell/lineedit.c"
     "src/shell/shell.c"
     "src/shell/cmd_fs.c"
+    "src/shell/cmd_unzip.c"
+    # miniz (reader/inflate only — see third_party/miniz/README.md)
+    "../../third_party/miniz/miniz.c"
+    "../../third_party/miniz/miniz_tinfl.c"
+    "../../third_party/miniz/miniz_zip.c"
     # The file manager is part of the system, not something to be copied onto a
     # board before it is useful.  Same sources as the .AXE in apps/fm, built with
     # AG_BUILTIN: see apps/fm/fm.h.
@@ -66,7 +72,7 @@ idf_component_register(
                   joltwallet__littlefs
                   # api->io: buses and pins straight through to the chip.
                   # esp_adc is deliberately absent - see ARGON_ENABLE_ADC.
-                  esp_driver_i2c esp_driver_ledc
+                  esp_driver_i2c esp_driver_ledc esp_driver_i2s
                   # Virtual RGB panel under Espressif QEMU (no-op on hardware).
                   esp_lcd espressif__esp_lcd_qemu_rgb
                   # api->net: OpenEth + lwIP sockets (QEMU today).
@@ -114,7 +120,17 @@ target_compile_definitions(${COMPONENT_LIB}
 # Built-in app headers sit next to their sources.
 target_include_directories(${COMPONENT_LIB}
     PRIVATE "${CMAKE_CURRENT_LIST_DIR}/../../apps/fm"
-            "${CMAKE_CURRENT_LIST_DIR}/../../apps/edit")
+            "${CMAKE_CURRENT_LIST_DIR}/../../apps/edit"
+            "${CMAKE_CURRENT_LIST_DIR}/../../third_party/miniz")
+
+# Kernel unzip: no stdio, no archive writer (compressor stays in ZIP.AXE).
+set_source_files_properties(
+    "${CMAKE_CURRENT_LIST_DIR}/../../third_party/miniz/miniz.c"
+    "${CMAKE_CURRENT_LIST_DIR}/../../third_party/miniz/miniz_tinfl.c"
+    "${CMAKE_CURRENT_LIST_DIR}/../../third_party/miniz/miniz_zip.c"
+    "${CMAKE_CURRENT_LIST_DIR}/src/shell/cmd_unzip.c"
+    PROPERTIES COMPILE_DEFINITIONS
+        "MINIZ_NO_STDIO;MINIZ_NO_TIME;MINIZ_NO_DEFLATE_APIS")
 
 target_compile_options(${COMPONENT_LIB} PRIVATE
     -Wall -Wextra -Werror=implicit-function-declaration

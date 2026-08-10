@@ -2,7 +2,7 @@
  * ArgonOS - Tiny C → Xtensa .AXE (stack-machine codegen).
  *
  * Subset: int/void, locals, globals, int arrays, return, if/else, while/for,
- * multiple functions (callx8), string literals, and ABI builtins for time/input/gfx.
+ * multiple functions (callx8), string literals, and ABI builtins for time/input/gfx/audio.
  * Entry must be named ag_main.
  *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
@@ -53,10 +53,12 @@ static void cc_free(void *p)
 #define AG_AXE_R_IN_DATA 0x1u
 #define AG_AXE_R_TO_DATA 0x2u
 #define AG_AXE_NEEDS_GFX (1u << 1)
+#define AG_AXE_NEEDS_AUDIO (1u << 6)
 
-#define API_OFF_INP  24
-#define API_OFF_GFX  28
-#define API_OFF_TIME 40
+#define API_OFF_INP   24
+#define API_OFF_GFX   28
+#define API_OFF_TIME  40
+#define API_OFF_AUDIO 60
 
 #define INP_OFF_KEY_PRESSED 12
 #define INP_OFF_PAD         20
@@ -78,6 +80,17 @@ static void cc_free(void *p)
 #define GFX_OFF_POLY_VERTEX 60
 #define GFX_OFF_POLY_FILL   64
 #define GFX_OFF_POLY_STROKE 68
+
+#define AUDIO_OFF_PRESENT 4
+#define AUDIO_OFF_IS_HW   8
+#define AUDIO_OFF_OPEN    12
+#define AUDIO_OFF_CLOSE   16
+#define AUDIO_OFF_WRITE   20
+#define AUDIO_OFF_SPACE   24
+
+#define RET_VOID 0
+#define RET_BOOL 1
+#define RET_RAW  2
 
 enum {
     LIT_IMM = 0,
@@ -448,6 +461,7 @@ typedef struct {
     uint32_t relocs[MAX_RELOCS];
     int      nrelocs;
     int      needs_gfx;
+    int      needs_audio;
     int      spill_base;
     int      spill_top;
     int      err;
@@ -901,30 +915,38 @@ typedef struct {
     int         api_off;
     int         fn_off;
     int         is_gfx;
-    int         returns;
-    int         acquire_null;
+    int         is_audio;
+    int         ret_mode; /* RET_VOID / RET_BOOL / RET_RAW */
+    int         null_arg; /* call with a10=0 and no parsed args */
 } builtin_t;
 
 static const builtin_t BUILTINS[] = {
-    {"ag_delay", 1, API_OFF_TIME, TIME_OFF_DELAY_MS, 0, 0, 0},
-    {"ag_key", 1, API_OFF_INP, INP_OFF_KEY_PRESSED, 0, 1, 0},
+    {"ag_delay", 1, API_OFF_TIME, TIME_OFF_DELAY_MS, 0, 0, RET_VOID, 0},
+    {"ag_key", 1, API_OFF_INP, INP_OFF_KEY_PRESSED, 0, 0, RET_BOOL, 0},
     /* ag_btn: level state via HostFS PADPUSH (same path as SMS). ids 0..7 */
-    {"ag_btn", 1, API_OFF_INP, INP_OFF_BTN, 0, 1, 0},
-    {"ag_gfx_acquire", 0, API_OFF_GFX, GFX_OFF_ACQUIRE, 1, 0, 1},
-    {"ag_gfx_release", 0, API_OFF_GFX, GFX_OFF_RELEASE, 1, 0, 0},
-    {"ag_gfx_clear", 1, API_OFF_GFX, GFX_OFF_CLEAR, 1, 0, 0},
-    {"ag_gfx_flush", 4, API_OFF_GFX, GFX_OFF_FLUSH, 1, 0, 0},
-    {"ag_gfx_swap", 0, API_OFF_GFX, GFX_OFF_SWAP, 1, 0, 0},
-    {"ag_gfx_fill_rect", 5, API_OFF_GFX, GFX_OFF_FILL_RECT, 1, 0, 0},
-    {"ag_gfx_text", 5, API_OFF_GFX, GFX_OFF_TEXT, 1, 0, 0},
-    {"ag_gfx_pixel", 3, API_OFF_GFX, GFX_OFF_PIXEL, 1, 0, 0},
-    {"ag_gfx_line", 5, API_OFF_GFX, GFX_OFF_LINE, 1, 0, 0},
-    {"ag_gfx_circle", 4, API_OFF_GFX, GFX_OFF_CIRCLE, 1, 0, 0},
-    {"ag_gfx_fill_circle", 4, API_OFF_GFX, GFX_OFF_FILL_CIRCLE, 1, 0, 0},
-    {"ag_gfx_poly_begin", 0, API_OFF_GFX, GFX_OFF_POLY_BEGIN, 1, 0, 0},
-    {"ag_gfx_poly_vertex", 2, API_OFF_GFX, GFX_OFF_POLY_VERTEX, 1, 0, 0},
-    {"ag_gfx_poly_fill", 1, API_OFF_GFX, GFX_OFF_POLY_FILL, 1, 0, 0},
-    {"ag_gfx_poly_stroke", 1, API_OFF_GFX, GFX_OFF_POLY_STROKE, 1, 0, 0},
+    {"ag_btn", 1, API_OFF_INP, INP_OFF_BTN, 0, 0, RET_BOOL, 0},
+    {"ag_gfx_acquire", 0, API_OFF_GFX, GFX_OFF_ACQUIRE, 1, 0, RET_VOID, 1},
+    {"ag_gfx_release", 0, API_OFF_GFX, GFX_OFF_RELEASE, 1, 0, RET_VOID, 0},
+    {"ag_gfx_clear", 1, API_OFF_GFX, GFX_OFF_CLEAR, 1, 0, RET_VOID, 0},
+    {"ag_gfx_flush", 4, API_OFF_GFX, GFX_OFF_FLUSH, 1, 0, RET_VOID, 0},
+    {"ag_gfx_swap", 0, API_OFF_GFX, GFX_OFF_SWAP, 1, 0, RET_VOID, 0},
+    {"ag_gfx_fill_rect", 5, API_OFF_GFX, GFX_OFF_FILL_RECT, 1, 0, RET_VOID, 0},
+    {"ag_gfx_text", 5, API_OFF_GFX, GFX_OFF_TEXT, 1, 0, RET_VOID, 0},
+    {"ag_gfx_pixel", 3, API_OFF_GFX, GFX_OFF_PIXEL, 1, 0, RET_VOID, 0},
+    {"ag_gfx_line", 5, API_OFF_GFX, GFX_OFF_LINE, 1, 0, RET_VOID, 0},
+    {"ag_gfx_circle", 4, API_OFF_GFX, GFX_OFF_CIRCLE, 1, 0, RET_VOID, 0},
+    {"ag_gfx_fill_circle", 4, API_OFF_GFX, GFX_OFF_FILL_CIRCLE, 1, 0, RET_VOID, 0},
+    {"ag_gfx_poly_begin", 0, API_OFF_GFX, GFX_OFF_POLY_BEGIN, 1, 0, RET_VOID, 0},
+    {"ag_gfx_poly_vertex", 2, API_OFF_GFX, GFX_OFF_POLY_VERTEX, 1, 0, RET_VOID, 0},
+    {"ag_gfx_poly_fill", 1, API_OFF_GFX, GFX_OFF_POLY_FILL, 1, 0, RET_VOID, 0},
+    {"ag_gfx_poly_stroke", 1, API_OFF_GFX, GFX_OFF_POLY_STROKE, 1, 0, RET_VOID, 0},
+    /* audio (ABI 0.14): open(NULL) default 22050 stereo s16 */
+    {"ag_audio_present", 0, API_OFF_AUDIO, AUDIO_OFF_PRESENT, 0, 1, RET_RAW, 0},
+    {"ag_audio_is_hw", 0, API_OFF_AUDIO, AUDIO_OFF_IS_HW, 0, 1, RET_RAW, 0},
+    {"ag_audio_open", 0, API_OFF_AUDIO, AUDIO_OFF_OPEN, 0, 1, RET_RAW, 1},
+    {"ag_audio_close", 0, API_OFF_AUDIO, AUDIO_OFF_CLOSE, 0, 1, RET_VOID, 0},
+    {"ag_audio_write", 2, API_OFF_AUDIO, AUDIO_OFF_WRITE, 0, 1, RET_RAW, 0},
+    {"ag_audio_space", 0, API_OFF_AUDIO, AUDIO_OFF_SPACE, 0, 1, RET_RAW, 0},
 };
 
 static const builtin_t *find_builtin(const char *name)
@@ -1009,7 +1031,10 @@ static void emit_builtin_call(par_t *p, const builtin_t *b)
     if (b->is_gfx) {
         p->g->needs_gfx = 1;
     }
-    if (b->acquire_null) {
+    if (b->is_audio) {
+        p->g->needs_audio = 1;
+    }
+    if (b->null_arg) {
         expect(p, T_LPAREN, "expected '('");
         expect(p, T_RPAREN, "expected ')'");
         emit_movi(p->g, 10, 0);
@@ -1018,7 +1043,7 @@ static void emit_builtin_call(par_t *p, const builtin_t *b)
     }
     emit_load_api_fn(p->g, 8, b->api_off, b->fn_off);
     emit_callx8(p->g, 8);
-    if (b->returns) {
+    if (b->ret_mode == RET_BOOL) {
         emit_mov_n(p->g, 8, 10);
         emit_movi(p->g, 9, 0);
         size_t bne_site, j_end;
@@ -1027,6 +1052,8 @@ static void emit_builtin_call(par_t *p, const builtin_t *b)
         patch_b(p->g, bne_site, p->g->len);
         emit_movi(p->g, 8, 1);
         emit_j_to(p->g, j_end, p->g->len);
+    } else if (b->ret_mode == RET_RAW) {
+        emit_mov_n(p->g, 8, 10);
     } else {
         emit_movi(p->g, 8, 0);
     }
@@ -1840,10 +1867,19 @@ int cc_compile_to_axe(const char *src, size_t src_len, cc_result_t *out)
 
     memcpy(axe + 0, "AXE1", 4);
     wr_u16(axe + 4, 0);
-    wr_u16(axe + 6, 10);
+    wr_u16(axe + 6, 14);
     wr_u16(axe + 8, 1);
     wr_u16(axe + 10, (uint16_t)AXE_HDR);
-    wr_u32(axe + 12, g->needs_gfx ? AG_AXE_NEEDS_GFX : 0);
+    {
+        uint32_t flags = 0;
+        if (g->needs_gfx) {
+            flags |= AG_AXE_NEEDS_GFX;
+        }
+        if (g->needs_audio) {
+            flags |= AG_AXE_NEEDS_AUDIO;
+        }
+        wr_u32(axe + 12, flags);
+    }
 
     wr_u32(axe + 16, CODE_BASE);
     wr_u32(axe + 20, (uint32_t)code_size);

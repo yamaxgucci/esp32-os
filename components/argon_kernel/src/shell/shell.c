@@ -34,6 +34,7 @@
 #include "core/sysconfig.h"
 #include "proc/supervisor.h"
 #include "shell/cmd_fs.h"
+#include "shell/cmd_unzip.h"
 
 typedef struct {
     const char *name;
@@ -1011,6 +1012,7 @@ static const ag_command_t k_commands[] = {
     {"format", "<drive> [/y]", "make a fresh filesystem", ag_cmd_format},
     {"hexdump", "<file>", "dump a file as bytes", ag_cmd_hexdump},
     {"recv", "<file>", "receive a file as hex", ag_cmd_recv},
+    {"unzip", "<zip> [dest]", "list or extract a zip archive", ag_cmd_unzip},
     {"run", "[/b] <file> [args]", "run an application", cmd_run},
     {"errorlevel", "", "exit code of the last command", cmd_errorlevel},
     {"reboot", "", "restart the board", cmd_reboot},

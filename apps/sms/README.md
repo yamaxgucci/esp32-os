@@ -1,7 +1,7 @@
 # SMS — Master System player for ArgonOS
 
 Port of **SMS Plus GX** (GPLv2+) as an ArgonOS `.AXE`. Video via soft `gfx`.
-Sound is **opt-in** (PSG + FM → WAV or mock; no I2S yet).
+Sound is **opt-in** (PSG + FM → WAV, mock, or kernel `audio`/I2S).
 
 FM is **not** the heavy `ym2413.c` emulator. `fmintf` decodes the YM2413/OPLL
 register protocol and drives [`apps/common/fm`](../common/fm) (`ag_fm`) — a
@@ -54,6 +54,7 @@ Default play is **mute** (best FPS). Enable sound:
 | Arg | Effect |
 |-----|--------|
 | `mock` or `sound` | PSG + FM (`ag_fm`), samples discarded |
+| `audio` / `i2s` | kernel `api->audio` (I2S if `[audio]` pins set, else stub) |
 | `wav` | write `t:\sms.wav` |
 | `t:\out.wav` (any `*.wav`) | write that path — **must** end in `.wav` or it is ignored / treated as ROM |
 

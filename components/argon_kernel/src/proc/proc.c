@@ -9,6 +9,7 @@
 #include <string.h>
 
 #include <argon/console.h>
+#include <argon/audio.h>
 #include <argon/display.h>
 #include <argon/kernel.h>
 #include <argon/lineedit.h>
@@ -285,6 +286,9 @@ static void reap(proc_t *p)
      * the soft framebuffer permanently stolen from the text console. */
     if (ag_display_acquired()) {
         ag_gfx_api_table.release();
+    }
+    if (ag_audio_opened()) {
+        ag_audio_api_table.close();
     }
 
     ag_loader_unload(&p->app);
@@ -643,6 +647,17 @@ ag_err_t ag_proc_spawn(const char *path, int argc, char **argv, uint32_t flags,
     if ((p->app.header.flags & AG_AXE_NEEDS_NET) != 0 &&
         ag_loader_api()->net == NULL) {
         ag_log(AG_LOG_ERROR, "proc", "%s: needs networking", path);
+        ag_loader_unload(&p->app);
+        memset(p, 0, sizeof(*p));
+        unlock();
+        return -AG_ENODEV;
+    }
+
+    if ((p->app.header.flags & AG_AXE_NEEDS_AUDIO) != 0 &&
+        (ag_loader_api()->audio == NULL ||
+         ag_loader_api()->audio->present == NULL ||
+         !ag_loader_api()->audio->present())) {
+        ag_log(AG_LOG_ERROR, "proc", "%s: needs audio", path);
         ag_loader_unload(&p->app);
         memset(p, 0, sizeof(*p));
         unlock();

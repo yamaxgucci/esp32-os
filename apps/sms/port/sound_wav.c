@@ -13,6 +13,7 @@
 
 static char        s_path[AG_PATH_MAX];
 static int         s_mock = 1;
+static int         s_audio; /* api->audio sink */
 static int         s_active;
 static int         s_write_err_reported;
 static ag_handle_t s_fd = -1;
@@ -76,6 +77,7 @@ void Sound_SetPath(const char *path)
 {
     s_path[0] = '\0';
     s_mock = 1;
+    s_audio = 0;
     if (path == NULL || path[0] == '\0') {
         return;
     }
@@ -89,6 +91,22 @@ void Sound_SetPath(const char *path)
     if ((path[0] == 'n' || path[0] == 'N') &&
         (path[1] == 'u' || path[1] == 'U') &&
         (path[2] == 'l' || path[2] == 'L') && path[3] == '\0') {
+        return;
+    }
+    if ((path[0] == 'a' || path[0] == 'A') &&
+        (path[1] == 'u' || path[1] == 'U') &&
+        (path[2] == 'd' || path[2] == 'D') &&
+        (path[3] == 'i' || path[3] == 'I') &&
+        (path[4] == 'o' || path[4] == 'O') && path[5] == '\0') {
+        s_mock = 0;
+        s_audio = 1;
+        return;
+    }
+    if ((path[0] == 'i' || path[0] == 'I') &&
+        (path[1] == '2') && (path[2] == 's' || path[2] == 'S') &&
+        path[3] == '\0') {
+        s_mock = 0;
+        s_audio = 1;
         return;
     }
     size_t n = 0;
@@ -117,6 +135,33 @@ void Sound_Init(void)
         ag_printf("sms: sound = mock (PSG, discard)\n");
         return;
     }
+    if (s_audio) {
+        ag_audio_fmt_t fmt;
+        ag_err_t       err;
+        if (!ag_audio_present()) {
+            ag_printf("sms: audio: api->audio missing\n");
+            s_mock = 1;
+            s_active = 1;
+            argon_sms_audio_sink = sound_sink_frame;
+            return;
+        }
+        fmt.rate = s_rate;
+        fmt.channels = 2;
+        fmt.bits = 16;
+        err = ag_audio_open(&fmt);
+        if (err != AG_OK) {
+            ag_printf("sms: audio open: %s\n", ag_strerror(err));
+            s_mock = 1;
+            s_active = 1;
+            argon_sms_audio_sink = sound_sink_frame;
+            return;
+        }
+        s_active = 1;
+        argon_sms_audio_sink = sound_sink_frame;
+        ag_printf("sms: sound = audio %s @ %u Hz\n",
+                  ag_audio_is_hw() ? "I2S" : "stub", (unsigned)s_rate);
+        return;
+    }
     if (s_path[0] == '\0') {
         return;
     }
@@ -134,6 +179,14 @@ void Sound_Init(void)
 void Sound_Update(int16_t *sound_buffer, unsigned long len)
 {
     if (!s_active || sound_buffer == NULL || len == 0) {
+        return;
+    }
+    if (s_audio) {
+        const int32_t n = ag_audio_write(sound_buffer, (int32_t)len);
+        if (n < 0 && !s_write_err_reported) {
+            s_write_err_reported = 1;
+            ag_printf("sms: audio write: %s\n", ag_strerror((ag_err_t)n));
+        }
         return;
     }
     if (s_mock || s_fd < 0) {
@@ -163,6 +216,10 @@ static void sound_sink_frame(int16_t *sound_buffer, int32_t len)
 void Sound_Close(void)
 {
     argon_sms_audio_sink = NULL;
+    if (s_audio) {
+        ag_audio_close();
+        s_audio = 0;
+    }
     if (s_fd >= 0) {
         write_header(s_data_bytes);
         ag_close(s_fd);

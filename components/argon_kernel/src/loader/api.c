@@ -15,6 +15,7 @@
 #include <argon/console.h>
 #include <argon/devfs.h>
 #include <argon/device.h>
+#include <argon/audio.h>
 #include <argon/display.h>
 #include <argon/hostfs.h>
 #include <argon/input.h>
@@ -757,6 +758,7 @@ static const ag_api_t k_api = {
 #else
     .net = NULL,
 #endif
+    .audio = &ag_audio_api_table,
 };
 
 const ag_api_t *ag_loader_api(void) { return &k_api; }

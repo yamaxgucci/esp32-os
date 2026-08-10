@@ -736,10 +736,9 @@ help`. Плюс сетевые (§9.4) во второй фазе.
 встроенный вариант вызывает те же функции таблицы ABI, что и загруженный, поэтому
 контракт проверяется, а не обходится.
 
-**ZIP (принято 9 августа 2026):** в ядро — только **`unzip`** (list/extract,
-streaming, tinfl/miniz). Полный архиватор (**create/update**) — отдельное
-приложение `.AXE` на карте, не builtin: компрессор дороже по flash и RAM, а
-нужен реже распаковки.
+**ZIP (принято 9 августа 2026, сделано):** в ядро — **`unzip`** (list/extract,
+store/deflate, miniz в `third_party/miniz`). **`ZIP.AXE`** — create/update (store)
+и list/store-extract на карте; deflate-extract — через builtin.
 
 ### 9.4 Сеть [Т-27]
 

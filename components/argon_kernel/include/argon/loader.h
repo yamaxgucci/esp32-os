@@ -46,11 +46,22 @@ void ag_loader_unload(ag_loaded_app_t *app);
 /*
  * The code arena.  Running an image is the process layer's business (argon/proc.h);
  * what belongs here is how much room there is for one.
+ *
+ * The physical buffer is linked at CONFIG_ARGON_APP_ARENA_KB.  SYSTEM.CFG may
+ * shrink the usable size via [memory] app_arena_kb= (see ag_loader_set_arena_kb);
+ * the unused tail stays reserved and is not returned to the IDF heap.
  */
 size_t ag_loader_arena_size(void);
 size_t ag_loader_arena_free(void);
 size_t ag_loader_arena_largest(void);
 bool   ag_loader_arena_busy(void);
+
+/*
+ * Clip usable arena size before the first load.  `kb` is clamped to
+ * [4 .. linked ceiling].  Returns the usable size actually selected (bytes).
+ * No-op (returns current usable) once the arena has been initialised.
+ */
+size_t ag_loader_set_arena_kb(uint32_t kb);
 
 /* The syscall table handed to applications. */
 const ag_api_t *ag_loader_api(void);

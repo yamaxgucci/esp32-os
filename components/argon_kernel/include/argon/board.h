@@ -119,6 +119,19 @@ typedef struct {
     uint16_t height;
 } ag_board_display_t;
 
+/*
+ * I2S TX to an external DAC (MAX98357, PCM5102, …).  All pins AG_PIN_NONE
+ * means the kernel keeps a discard stub (QEMU / no codec wired).
+ */
+typedef struct {
+    char     driver[12]; /* "auto", "i2s", "stub" */
+    int16_t  bclk;
+    int16_t  ws;
+    int16_t  dout;
+    int16_t  mclk; /* optional; AG_PIN_NONE if unused */
+    uint32_t rate; /* default sample rate hint; apps may reopen */
+} ag_board_audio_t;
+
 typedef struct {
     char              name[24];
     ag_board_sd_t     sd;
@@ -126,6 +139,7 @@ typedef struct {
     ag_board_spi_t    spi[AG_SPI_BUSES];
     ag_board_uart_t   uart[AG_UART_PORTS];
     ag_board_display_t display;
+    ag_board_audio_t  audio;
     uint16_t          console_cols;
     uint16_t          console_rows;
 } ag_board_t;

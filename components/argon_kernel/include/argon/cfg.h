@@ -5,9 +5,8 @@
  * in brackets, KEY=VALUE lines, ';' or '#' comments.
  *
  *     ; A:\SYSTEM.CFG
- *     [kernel]
- *     app_core_exclusive = yes
- *     app_text_arena     = 2M
+ *     [memory]
+ *     app_arena_kb = 64
  *
  *     [display]
  *     driver = st7789
