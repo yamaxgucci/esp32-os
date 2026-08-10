@@ -1,7 +1,8 @@
 # Mega Drive (`MD.AXE`) — Z80 + approximate sound
 
 68000, VDP, Z80, PSG, and a light YM2612→`ag_fm` front-end. Video goes straight
-into the `gfx` back buffer. Sound is WAV or mock until the kernel has `audio`/I2S.
+into the `gfx` back buffer. Sound: `mock` / `wav` / `net` / `audio` (kernel
+I2S or stub).
 
 Cores: [gwenesis](https://github.com/bzhxx/gwenesis) by bzhxx — read
 **Licensing** below before shipping this anywhere.
@@ -172,6 +173,7 @@ python tools/pcmplay.py --save build\md_only.wav     # save, no speakers
 | `livepad` / `nolivepad` | live pad via `inp->btnp` (HostFS PADPUSH), or serial sticky only |
 | `mock` / `wav` / path | sound sink: discard, `a:\md.wav`, or an explicit path |
 | `net` / `net:PORT` | stream stereo s16 PCM over TCP (WAV header); host: `tools/pcmplay.py` |
+| `audio` / `i2s` | kernel `api->audio` — real I2S when `[audio]` pins are set, else stub |
 | `profile` | print m68k/z80/snd/vdp µs for the first 120 frames |
 | `noz80` | advance Z80 clock only (no CPU execute; BUSREQ still live) |
 | `nosound` | skip sample mix |

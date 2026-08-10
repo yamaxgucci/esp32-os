@@ -50,9 +50,10 @@ extern "C" {
  * 0.12 made net stop being NULL (when the build enables networking): TCP
  *      listen/accept/connect/send/recv plus ready/wait_ready/ifaddr.
  * 0.13 appended net->set_nonblock.
+ * 0.14 added api->audio (I2S or discard stub) and AG_AXE_NEEDS_AUDIO.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 13u
+#define AG_ABI_MINOR 14u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -871,6 +872,38 @@ typedef struct ag_net_api {
 } ag_net_api_t;
 
 /* ------------------------------------------------------------------------ */
+/* audio - PCM output (I2S on hardware; discard stub without pins / QEMU)   */
+/* ------------------------------------------------------------------------ */
+
+typedef struct {
+    uint32_t rate;     /* Hz, typically 22050 */
+    uint8_t  channels; /* 1 or 2 */
+    uint8_t  bits;     /* 16 */
+} ag_audio_fmt_t;
+
+typedef struct ag_audio_api {
+    uint32_t size;
+
+    /* Always 1 after devices init once the class is built in. */
+    int (*present)(void);
+    /* 1 when BOARD.CFG wired I2S pins and the TX channel is live. */
+    int (*is_hw)(void);
+
+    /* Exclusive open; fmt NULL → 22050 Hz stereo s16. */
+    ag_err_t (*open)(const ag_audio_fmt_t *fmt);
+    void (*close)(void);
+
+    /*
+     * Interleaved signed PCM.  `frames` is sample-frames (stereo L+R = 1).
+     * Returns frames accepted, or a negative -AG_Exxx.  May drop on overrun
+     * rather than block the emulator for long.
+     */
+    int32_t (*write)(const int16_t *pcm, int32_t frames);
+    /* Best-effort free space in frames (0 on stub). */
+    int32_t (*space)(void);
+} ag_audio_api_t;
+
+/* ------------------------------------------------------------------------ */
 /* Root table                                                               */
 /* ------------------------------------------------------------------------ */
 
@@ -894,6 +927,9 @@ typedef struct ag_api {
 
     /* NULL when the profile has no networking. */
     const ag_net_api_t *net;
+
+    /* ABI 0.14: PCM out.  Non-NULL when the kernel builds audio support. */
+    const ag_audio_api_t *audio;
 } ag_api_t;
 
 /* ------------------------------------------------------------------------ */
@@ -908,7 +944,6 @@ enum ag_axe_flags {
     AG_AXE_NEEDS_NET = 1u << 2,
     AG_AXE_DRIVER = 1u << 3,     /* .SYS module, entry is ag_driver_init    */
     AG_AXE_RESIDENT = 1u << 4,
-
     /*
      * Set by the build tool, not by the application: the two parts of the image
      * must be placed adjacent, data immediately after code, and share one bias.
@@ -916,6 +951,7 @@ enum ag_axe_flags {
      * medany code model - so the distance between the parts cannot change.
      */
     AG_AXE_CONTIGUOUS = 1u << 5,
+    AG_AXE_NEEDS_AUDIO = 1u << 6, /* refuses to start without api->audio    */
 };
 
 /*

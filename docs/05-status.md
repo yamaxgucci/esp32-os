@@ -96,7 +96,7 @@ argon flash -port COM5   прошить настоящую плату
 | Ресурсный список | `src/core/reslist.c` | ✅ порядок по типам, ловит двойное free |
 | Примеры приложений | `apps/hello`, `disk`, `spin`, `leak`, `threads`, `crash` | ✅ проверяют сами себя |
 | Файловый менеджер | `apps/fm/` | ✅ **команда `fm`, встроена в ОС**; тот же код собирается и как `.AXE` |
-| ZIP | — | ⬜ план: **`unzip` builtin** в ядре; полный **`ZIP.AXE`** на карте (фаза 3.5 §1a, очередь п.11) |
+| ZIP | `cmd_unzip.c`, `apps/zip/`, `third_party/miniz/` | ✅ **`unzip` builtin** (list/extract, store/deflate via miniz); **`ZIP.AXE`** create/update (store) + list/extract (store; deflate → builtin) |
 | Текстовый редактор | `apps/edit/` | ✅ **команда `edit`**, встроена; до 64 КБ / 2048 строк, F2 сохранить |
 | Компилятор C → `.AXE` | `apps/cc/` (`CC.AXE`) | ✅ **Argon CC**: функции/вызовы, globals/`int[]`, `for`, строки, builtins `ag_delay`/`ag_key`/`ag_gfx_*`; демо [`asteroids.c`](../apps/cc/examples/asteroids.c) |
 | Реестр устройств | `src/dev/device.c` | ✅ классы, владельцы, эксклюзивный доступ, отзыв при извлечении |
@@ -136,7 +136,7 @@ argon flash -port COM5   прошить настоящую плату
 
 | Что | Сколько | Где |
 |---|---|---|
-| код | **64 КБ** на все процессы, `CONFIG_ARGON_APP_ARENA_KB` (4..192) | арена в D/IRAM |
+| код | потолок `CONFIG_ARGON_APP_ARENA_KB` (4..192, S3: 192); usable клипает `[memory] app_arena_kb=` | арена в D/IRAM |
 | константы `.rodata` | вся свободная PSRAM; в арене только то, что помечено `AG_HOT_RODATA` | окно данных PSRAM |
 | `.data` + `.bss` | вся свободная PSRAM, мегабайты | окно данных PSRAM |
 | куча `ag_mem.alloc` | **арена процесса, 1 МБ** по умолчанию (`CONFIG_ARGON_APP_HEAP_KB`) или из манифеста | PSRAM |

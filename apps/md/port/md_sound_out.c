@@ -14,6 +14,7 @@ enum {
     MD_SINK_MOCK = 0,
     MD_SINK_WAV = 1,
     MD_SINK_NET = 2,
+    MD_SINK_AUDIO = 3, /* api->audio (I2S or kernel stub) */
 };
 
 static char        s_path[AG_PATH_MAX];
@@ -179,6 +180,10 @@ void md_sound_set_path(const char *path)
         s_sink = MD_SINK_NET;
         return;
     }
+    if (str_ieq(path, "audio") || str_ieq(path, "i2s")) {
+        s_sink = MD_SINK_AUDIO;
+        return;
+    }
     /* net:PORT */
     if ((path[0] == 'n' || path[0] == 'N') &&
         (path[1] == 'e' || path[1] == 'E') &&
@@ -291,6 +296,31 @@ void md_sound_init(void)
         return;
     }
 
+    if (s_sink == MD_SINK_AUDIO) {
+        ag_audio_fmt_t fmt;
+        ag_err_t       err;
+        if (!ag_audio_present()) {
+            ag_printf("md: audio: api->audio missing\n");
+            s_sink = MD_SINK_MOCK;
+            s_active = 1;
+            return;
+        }
+        fmt.rate = MD_SOUND_RATE;
+        fmt.channels = 2;
+        fmt.bits = 16;
+        err = ag_audio_open(&fmt);
+        if (err != AG_OK) {
+            ag_printf("md: audio open: %s\n", ag_strerror(err));
+            s_sink = MD_SINK_MOCK;
+            s_active = 1;
+            return;
+        }
+        s_active = 1;
+        ag_printf("md: sound = audio %s @ %u Hz\n",
+                  ag_audio_is_hw() ? "I2S" : "stub", (unsigned)MD_SOUND_RATE);
+        return;
+    }
+
     if (s_sink == MD_SINK_NET) {
         if (g_ag_api->net == NULL) {
             ag_printf("md: net: api->net is NULL (rebuild with ARGON_ENABLE_NET)\n");
@@ -338,6 +368,9 @@ void md_sound_close(void)
     if (s_listen >= 0) {
         (void)ag_net_close(s_listen);
         s_listen = -1;
+    }
+    if (s_sink == MD_SINK_AUDIO) {
+        ag_audio_close();
     }
     s_active = 0;
 }
@@ -398,7 +431,7 @@ void md_sound_line(int line, int lines_per_frame)
         if (r < -32768) {
             r = -32768;
         }
-        if (s_sink == MD_SINK_NET) {
+        if (s_sink == MD_SINK_NET || s_sink == MD_SINK_AUDIO) {
             s_stereo[(s_emitted + i) * 2] = (int16_t)l;
             s_stereo[(s_emitted + i) * 2 + 1] = (int16_t)r;
         } else {
@@ -434,6 +467,15 @@ void md_sound_end_frame(void)
         } else if (n < 0 && n != -AG_EAGAIN && !s_write_err_reported) {
             s_write_err_reported = 1;
             ag_printf("md: net send: %s\n", ag_strerror((ag_err_t)n));
+        }
+    }
+    if (s_sink == MD_SINK_AUDIO && s_emitted > 0) {
+        const int32_t n = ag_audio_write(s_stereo, s_emitted);
+        if (n > 0) {
+            s_data_bytes += (uint32_t)n * 4u;
+        } else if (n < 0 && !s_write_err_reported) {
+            s_write_err_reported = 1;
+            ag_printf("md: audio write: %s\n", ag_strerror((ag_err_t)n));
         }
     }
 }

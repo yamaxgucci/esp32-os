@@ -550,6 +550,46 @@ static inline void ag_gfx_stroke_convex(const ag_point_t *pts, int32_t n,
     g_ag_api->gfx->stroke_convex(pts, n, color);
 }
 
+/* ---- audio helpers (ABI 0.14) ------------------------------------------- */
+
+static inline int ag_audio_present(void)
+{
+    return g_ag_api->audio != NULL && g_ag_api->audio->present != NULL &&
+           g_ag_api->audio->present();
+}
+static inline int ag_audio_is_hw(void)
+{
+    return g_ag_api->audio != NULL && g_ag_api->audio->is_hw != NULL &&
+           g_ag_api->audio->is_hw();
+}
+static inline ag_err_t ag_audio_open(const ag_audio_fmt_t *fmt)
+{
+    if (g_ag_api->audio == NULL || g_ag_api->audio->open == NULL) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->audio->open(fmt);
+}
+static inline void ag_audio_close(void)
+{
+    if (g_ag_api->audio != NULL && g_ag_api->audio->close != NULL) {
+        g_ag_api->audio->close();
+    }
+}
+static inline int32_t ag_audio_write(const int16_t *pcm, int32_t frames)
+{
+    if (g_ag_api->audio == NULL || g_ag_api->audio->write == NULL) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->audio->write(pcm, frames);
+}
+static inline int32_t ag_audio_space(void)
+{
+    if (g_ag_api->audio == NULL || g_ag_api->audio->space == NULL) {
+        return 0;
+    }
+    return g_ag_api->audio->space();
+}
+
 /* ---- input helpers ------------------------------------------------------ */
 
 static inline bool ag_key(uint16_t keycode)

@@ -94,6 +94,7 @@ static ag_err_t read_whole(const char *path, const char *cwd, uint8_t **out,
 #define CONFIG_ARGON_APP_ARENA_KB 64
 #endif
 #define AG_APP_ARENA_BYTES ((size_t)CONFIG_ARGON_APP_ARENA_KB * 1024u)
+#define AG_APP_ARENA_MIN_KB 4u
 
 static uint8_t s_arena[AG_APP_ARENA_BYTES]
     __attribute__((aligned(16), section(".iram.bss.ag_app_arena")));
@@ -102,16 +103,33 @@ static uint8_t s_arena[AG_APP_ARENA_BYTES]
 
 static ag_arena_block_t s_arena_blocks[AG_LOADER_SLOTS];
 static ag_arena_t       s_code;
+/* Usable bytes from the linked ceiling; set from SYSTEM.CFG before first load. */
+static size_t           s_arena_usable = AG_APP_ARENA_BYTES;
 
 static void arena_ready(void)
 {
     if (s_code.base == NULL) {
-        ag_arena_init(&s_code, s_arena, sizeof(s_arena), s_arena_blocks,
+        ag_arena_init(&s_code, s_arena, s_arena_usable, s_arena_blocks,
                       AG_LOADER_SLOTS);
     }
 }
 
-size_t ag_loader_arena_size(void) { return sizeof(s_arena); }
+size_t ag_loader_set_arena_kb(uint32_t kb)
+{
+    if (s_code.base != NULL) {
+        return s_arena_usable;
+    }
+    if (kb < AG_APP_ARENA_MIN_KB) {
+        kb = AG_APP_ARENA_MIN_KB;
+    }
+    if (kb > (uint32_t)CONFIG_ARGON_APP_ARENA_KB) {
+        kb = (uint32_t)CONFIG_ARGON_APP_ARENA_KB;
+    }
+    s_arena_usable = (size_t)kb * 1024u;
+    return s_arena_usable;
+}
+
+size_t ag_loader_arena_size(void) { return s_arena_usable; }
 
 size_t ag_loader_arena_free(void)
 {
