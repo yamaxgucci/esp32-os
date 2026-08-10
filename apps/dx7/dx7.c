@@ -3,6 +3,7 @@
  *
  * Sound via audio_out device path (default /dev/pcmnull). Use pcmvirt after
  * `drv install` of PCMVIRT.SYS for host playback (tools/pcmplay.py).
+ * Optional live notes: MIDIVIRT.SYS → /dev/midivirt + tools/midikbd.py :5559.
  *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
  */
@@ -16,7 +17,7 @@
 #include "ag_mid.h"
 #include "ag_fx.h"
 
-AG_APP_SIZED("DX7", "0.4", "argon", 0, 10 * 1024, 192 * 1024);
+AG_APP_SIZED("DX7", "0.5", "argon", 0, 10 * 1024, 192 * 1024);
 
 #define RATE 22050u
 #define CHUNK 441 /* ~20 ms @ 22050 */
@@ -36,7 +37,14 @@ static int s_notes_down;
 static uint8_t s_key_held[32]; /* parallel to k_keys[] */
 static uint8_t s_have_keyup;   /* set when terminal sends real KEY_UP */
 static uint8_t s_last_note;    /* last MIDI note triggered (debug) */
+static uint8_t s_note_held[128]; /* any source: kbd / midivirt / SMF */
+static int s_held_n;
 static int s_dirty = 1;
+
+/* Live MIDI-in from /dev/midivirt (host midikbd.py). */
+static ag_handle_t s_midi_fd = -1;
+static int s_midi_want = 1; /* default: try open */
+static uint32_t s_midi_ev;  /* events consumed (UI) */
 
 /* Master-bus FX (lazy-init buffers on first fx0/fx1). */
 static ag_fx_t s_fx;
@@ -470,6 +478,14 @@ static int parse_sink_arg(const char *arg)
         s_fx_want = FX_CORE1;
         return 0;
     }
+    if (str_ieq(arg, "midivirt") || str_ieq(arg, "midi")) {
+        s_midi_want = 1;
+        return 0;
+    }
+    if (str_ieq(arg, "nomidi") || str_ieq(arg, "nomidivirt")) {
+        s_midi_want = 0;
+        return 0;
+    }
     if (str_ieq(arg, "net") || str_ieq(arg, "tcp") || str_ieq(arg, "pcmvirt") ||
         str_ieq(arg, "audio") || str_ieq(arg, "i2s") || str_ieq(arg, "pcm0") ||
         str_ieq(arg, "mock") || str_ieq(arg, "mute") || str_ieq(arg, "pcmnull") ||
@@ -492,23 +508,131 @@ static int parse_sink_arg(const char *arg)
     return -1;
 }
 
+static void held_clear_all(void)
+{
+    memset(s_note_held, 0, sizeof(s_note_held));
+    s_held_n = 0;
+}
+
+static void held_set(uint8_t note, int on)
+{
+    if (note >= 128u) {
+        return;
+    }
+    if (on) {
+        if (!s_note_held[note]) {
+            s_note_held[note] = 1;
+            s_held_n++;
+        }
+    } else if (s_note_held[note]) {
+        s_note_held[note] = 0;
+        if (s_held_n > 0) {
+            s_held_n--;
+        }
+    }
+}
+
+static void voice_note_on(uint8_t note, uint8_t vel)
+{
+    ag_dx7_note_on(&s_dx, note, vel ? vel : 100);
+    held_set(note, 1);
+    s_last_note = note;
+    s_dirty = 1;
+}
+
+static void voice_note_off(uint8_t note)
+{
+    ag_dx7_note_off(&s_dx, note);
+    held_set(note, 0);
+    s_dirty = 1;
+}
+
+static void voice_panic(void)
+{
+    ag_dx7_note_off_all(&s_dx);
+    held_clear_all();
+    s_dirty = 1;
+}
+
 static void mid_note_cb(void *ctx, int on, uint8_t note, uint8_t vel,
                         uint8_t ch)
 {
     (void)ctx;
     if (note == 0xffu) {
-        ag_dx7_note_off_all(&s_dx);
+        voice_panic();
         return;
     }
     if (ch == 9u) {
         return; /* GM drum channel */
     }
     if (on) {
-        ag_dx7_note_on(&s_dx, note, vel ? vel : 100);
+        voice_note_on(note, vel ? vel : 100);
         s_mid_notes++;
-        s_last_note = note;
     } else {
-        ag_dx7_note_off(&s_dx, note);
+        voice_note_off(note);
+    }
+}
+
+static void open_midivirt(void)
+{
+    if (!s_midi_want || s_midi_fd >= 0) {
+        return;
+    }
+    s_midi_fd = ag_dev_open("/dev/midivirt");
+    if (s_midi_fd < 0) {
+        /* Quiet: driver may not be installed yet. */
+        return;
+    }
+    ag_printf("dx7: MIDI-in = /dev/midivirt (host midikbd.py :5559)\n");
+}
+
+static void close_midivirt(void)
+{
+    if (s_midi_fd >= 0) {
+        (void)ag_dev_close(s_midi_fd);
+        s_midi_fd = -1;
+    }
+}
+
+static void pump_midivirt(void)
+{
+    uint8_t buf[64];
+    int32_t n;
+    int i;
+
+    if (s_midi_fd < 0) {
+        return;
+    }
+    n = ag_dev_read(s_midi_fd, buf, sizeof(buf));
+    if (n <= 0) {
+        return;
+    }
+    n = (n / 4) * 4;
+    for (i = 0; i + 3 < n; i += 4) {
+        uint8_t st = buf[i];
+        uint8_t d1 = buf[i + 1];
+        uint8_t d2 = buf[i + 2];
+        uint8_t hi = (uint8_t)(st & 0xf0u);
+
+        s_midi_ev++;
+        if (hi == 0x90u) {
+            if (d2) {
+                voice_note_on(d1, d2);
+            } else {
+                voice_note_off(d1);
+            }
+        } else if (hi == 0x80u) {
+            voice_note_off(d1);
+        } else if (hi == 0xb0u && d1 == 0x7bu) {
+            voice_panic();
+            {
+                int k;
+                for (k = 0; k < K_KEYS_N; k++) {
+                    s_key_held[k] = 0;
+                }
+                s_notes_down = 0;
+            }
+        }
     }
 }
 
@@ -596,47 +720,11 @@ static int load_mid_file(const char *path)
     return 0;
 }
 
-static void scan_mid_autoload(void)
+/* SMF only when argv passes path.mid — no HostFS autoload / autoplay. */
+static void load_mid_if_requested(void)
 {
-    /* Prefer explicit path; else first .mid under h:\dx7 or h: */
-    ag_handle_t d;
-    ag_dirent_t ent;
-    const char *dirs[2];
-    int di;
     if (s_mid_path[0] != '\0') {
         (void)load_mid_file(s_mid_path);
-        return;
-    }
-    dirs[0] = "h:\\dx7";
-    dirs[1] = "h:";
-    for (di = 0; di < 2; di++) {
-        d = ag_opendir(dirs[di]);
-        if (d < 0) {
-            continue;
-        }
-        while (ag_readdir(d, &ent) == AG_OK) {
-            char full[SYX_PATH_LEN];
-            int i, j;
-            if (!ends_with_mid(ent.name)) {
-                continue;
-            }
-            for (i = 0; i < SYX_PATH_LEN - 1 && dirs[di][i]; i++) {
-                full[i] = dirs[di][i];
-            }
-            if (i > 0 && full[i - 1] != '\\') {
-                if (i < SYX_PATH_LEN - 1) {
-                    full[i++] = '\\';
-                }
-            }
-            for (j = 0; i < SYX_PATH_LEN - 1 && ent.name[j]; j++, i++) {
-                full[i] = ent.name[j];
-            }
-            full[i] = '\0';
-            ag_close(d);
-            (void)load_mid_file(full);
-            return;
-        }
-        ag_close(d);
     }
 }
 
@@ -761,11 +849,11 @@ static void recount_keys(void)
 static void piano_all_off(void)
 {
     int i;
-    ag_dx7_note_off_all(&s_dx);
     for (i = 0; i < K_KEYS_N; i++) {
         s_key_held[i] = 0;
     }
     s_notes_down = 0;
+    voice_panic();
 }
 
 static void piano_release_all_held(void)
@@ -773,11 +861,11 @@ static void piano_release_all_held(void)
     int i;
     for (i = 0; i < K_KEYS_N; i++) {
         if (s_key_held[i]) {
-            ag_dx7_note_off(&s_dx, (uint8_t)k_keys[i].note);
+            voice_note_off((uint8_t)k_keys[i].note);
             s_key_held[i] = 0;
         }
     }
-    s_notes_down = 0;
+    recount_keys();
 }
 
 static const char *note_name(uint8_t note)
@@ -805,6 +893,47 @@ static const char *sink_name(void)
     return s_audio_path[0] ? s_audio_path : "/dev/pcmnull";
 }
 
+/* Build "C4 E4 G4" (up to 8 names) into out; uses note_name() carefully. */
+static void format_held(char *out, int out_len)
+{
+    int i;
+    int n = 0;
+    int pos = 0;
+
+    if (out == NULL || out_len < 2) {
+        return;
+    }
+    out[0] = '\0';
+    if (s_held_n <= 0) {
+        out[0] = '-';
+        out[1] = '\0';
+        return;
+    }
+    for (i = 0; i < 128 && n < 8; i++) {
+        const char *nm;
+        int k;
+        if (!s_note_held[i]) {
+            continue;
+        }
+        nm = note_name((uint8_t)i);
+        if (pos > 0 && pos + 1 < out_len) {
+            out[pos++] = ' ';
+        }
+        for (k = 0; nm[k] && pos + 1 < out_len; k++) {
+            out[pos++] = nm[k];
+        }
+        out[pos] = '\0';
+        n++;
+    }
+    if (s_held_n > 8 && pos + 4 < out_len) {
+        out[pos++] = ' ';
+        out[pos++] = '.';
+        out[pos++] = '.';
+        out[pos++] = '.';
+        out[pos] = '\0';
+    }
+}
+
 static void draw_ui(void)
 {
     const ag_dx7_patch_t *p = &s_dx.patch;
@@ -827,7 +956,7 @@ static void draw_ui(void)
         ag_printf("MIDI  : FAIL %s  (%s)\n", s_mid_err,
                   s_mid_path[0] ? s_mid_path : "?");
     } else {
-        ag_printf("MIDI  : (none — put .mid on h:\\dx7 or pass path)\n");
+        ag_printf("MIDI  : (none — pass path.mid to load/play)\n");
     }
     ag_printf("Alg   : %2u / 32     Feedback: %u     Transpose: %u (%+d st)\n",
               (unsigned)p->algorithm + 1u, (unsigned)p->feedback,
@@ -851,10 +980,24 @@ static void draw_ui(void)
               (unsigned)s_dx.perf.porta_time, (unsigned)s_dx.perf.unison,
               (unsigned)s_dx.perf.unison_detune,
               s_dx.perf.audition ? "ON" : "off");
-    ag_printf("Voices: %d / %d active   keys: %d   last: %u %s  keyup:%s\n",
-              ag_dx7_active_voices(&s_dx), AG_DX7_VOICES, s_notes_down,
-              (unsigned)s_last_note, note_name(s_last_note),
-              s_have_keyup ? "yes(poly)" : "no(mono/VT)");
+    {
+        char held[48];
+        char lastbuf[8];
+        const char *ln = note_name(s_last_note);
+        int k;
+        format_held(held, (int)sizeof(held));
+        for (k = 0; ln[k] && k < 7; k++) {
+            lastbuf[k] = ln[k];
+        }
+        lastbuf[k] = '\0';
+        ag_printf("Voices: %d / %d active   kbdkeys: %d   keyup:%s\n",
+                  ag_dx7_active_voices(&s_dx), AG_DX7_VOICES, s_notes_down,
+                  s_have_keyup ? "yes(poly)" : "no(mono/VT)");
+        ag_printf("Keys  : held %s   last %s(%u)   src %s   n=%d  inev %u\n",
+                  held, lastbuf, (unsigned)s_last_note,
+                  s_midi_fd >= 0 ? "midivirt+kbd" : "kbd", s_held_n,
+                  (unsigned)s_midi_ev);
+    }
     ag_printf("Perf  : render %u us / %u us (%u%%)  send %u us  loop %u us\n",
               (unsigned)s_render_us, (unsigned)budget, (unsigned)s_load_pct,
               (unsigned)s_send_us, (unsigned)s_loop_us);
@@ -874,10 +1017,11 @@ static void draw_ui(void)
                   (unsigned)s_fx_late);
     }
     ag_printf("\n");
-    ag_printf("Keys  : , . patch   K L bank   Tab .syx   ; builtins\n");
+    ag_printf("Help  : , . patch   K L bank   Tab .syx   ; builtins\n");
     ag_printf("        Enter mid play/stop   \\ restart   A audition\n");
     ag_printf("        [ ] alg  - = fb   Space panic   Esc quit\n");
     ag_printf("        F FX mode   D/C/V delay/chor/rev   8/9 wet\n");
+    ag_printf("        host midikbd.py → /dev/midivirt (poly)\n");
     s_dirty = 0;
 }
 
@@ -967,19 +1111,16 @@ static void handle_key(int key, int down, int is_repeat, uint32_t uni)
                 piano_release_all_held();
             }
             if (!s_key_held[pi]) {
-                ag_dx7_note_on(&s_dx, note, 100);
+                voice_note_on(note, 100);
                 s_key_held[pi] = 1;
-                s_last_note = note;
                 recount_keys();
-                s_dirty = 1;
             }
         } else {
             s_have_keyup = 1;
             if (s_key_held[pi]) {
-                ag_dx7_note_off(&s_dx, note);
+                voice_note_off(note);
                 s_key_held[pi] = 0;
                 recount_keys();
-                s_dirty = 1;
             }
         }
         return;
@@ -993,7 +1134,6 @@ static void handle_key(int key, int down, int is_repeat, uint32_t uni)
         break;
     case AG_KEY_SPACE:
         piano_all_off();
-        s_dirty = 1;
         break;
     case AG_KEY_ENTER:
         if (!s_mid_loaded) {
@@ -1001,7 +1141,7 @@ static void handle_key(int key, int down, int is_repeat, uint32_t uni)
         }
         if (s_mid.playing) {
             ag_mid_stop(&s_mid);
-            ag_dx7_note_off_all(&s_dx);
+            voice_panic();
         } else {
             ag_mid_start(&s_mid);
         }
@@ -1011,7 +1151,7 @@ static void handle_key(int key, int down, int is_repeat, uint32_t uni)
         if (!s_mid_loaded) {
             break;
         }
-        ag_dx7_note_off_all(&s_dx);
+        voice_panic();
         ag_mid_start(&s_mid);
         s_mid_notes = 0;
         s_dirty = 1;
@@ -1267,8 +1407,8 @@ int ag_main(int argc, char **argv)
 
     for (i = 1; i < argc; i++) {
         if (parse_sink_arg(argv[i]) != 0) {
-            ag_printf("dx7: unknown arg '%s' "
-                      "(pcmvirt|pcmnull|audio|mock|nofx|fx0|fx1|.syx|.mid)\n",
+            ag_printf("dx7: unknown arg '%s' (pcmvirt|pcmnull|audio|mock|"
+                      "nofx|fx0|fx1|midivirt|nomidi|.syx|.mid)\n",
                       argv[i]);
         }
     }
@@ -1279,6 +1419,7 @@ int ag_main(int argc, char **argv)
 
     ag_dx7_init(&s_dx, RATE);
     ag_mid_init(&s_mid);
+    open_midivirt();
     if (s_fx_want != FX_OFF) {
         (void)fx_set_mode(s_fx_want);
     }
@@ -1296,7 +1437,7 @@ int ag_main(int argc, char **argv)
             (void)load_syx_file(s_syx_list[0]);
         }
     }
-    scan_mid_autoload();
+    load_mid_if_requested();
     draw_ui();
     s_ui_ms = ag_millis();
     s_next_due = ag_micros() + (ag_time_t)CHUNK_US;
@@ -1314,6 +1455,7 @@ int ag_main(int argc, char **argv)
             }
         }
 
+        pump_midivirt();
         pump_audio();
 
         /*
@@ -1349,12 +1491,13 @@ int ag_main(int argc, char **argv)
     }
 
 done:
-    ag_dx7_note_off_all(&s_dx);
+    voice_panic();
     fx_stop_worker();
     if (s_fx_ready) {
         ag_fx_free(&s_fx);
         s_fx_ready = 0;
     }
+    close_midivirt();
     ag_mid_unload(&s_mid);
     console_disable_key_events();
     close_sink();

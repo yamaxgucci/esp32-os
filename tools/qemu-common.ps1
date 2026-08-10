@@ -319,12 +319,15 @@ function Get-QemuMachineArgs {
     )
 }
 
-# OpenEth user-mode NIC + hostfwd so Windows can reach a guest TCP listener.
-# Default port 5558 matches MD's `net` sound sink / tools/pcmplay.py.
+# OpenEth user-mode NIC + hostfwd so Windows can reach guest TCP listeners.
+# 5558 = PCMVIRT / pcmplay.py; 5559 = MIDIVIRT / midikbd.py.
 function Get-QemuNetArgs {
     param([int]$HostPort = 5558, [int]$GuestPort = 5558)
+    $fwd = "hostfwd=tcp:127.0.0.1:{0}-:{1}" -f $HostPort, $GuestPort
+    if ($HostPort -eq 5558 -and $GuestPort -eq 5558) {
+        $fwd = "hostfwd=tcp:127.0.0.1:5558-:5558,hostfwd=tcp:127.0.0.1:5559-:5559"
+    }
     return @(
-        '-nic', ("user,model=open_eth,id=argon0,hostfwd=tcp:127.0.0.1:{0}-:{1}" -f `
-            $HostPort, $GuestPort)
+        '-nic', ("user,model=open_eth,id=argon0,{0}" -f $fwd)
     )
 }
