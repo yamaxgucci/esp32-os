@@ -18,12 +18,21 @@
  * of them are nothing next to the arena. */
 #define FM_COPY_CHUNK (8u * 1024u)
 
-/* How often the message line may change during a copy.  Half a second is often
- * enough to look alive without burning the serial console on a fast RAM-disk
- * copy (where every chunk would otherwise redraw). */
+/* How often the progress dialog may change during a copy.  Half a second is
+ * often enough to look alive without burning the serial console on a fast
+ * RAM-disk copy (where every chunk would otherwise redraw). */
 #define FM_COPY_UI_MS 500u
 
-#define FM_COPY_BAR_W 20
+/* Dialog sits over the panels (not the chrome rows).
+ * Interior text width is DLG_W-4; the bar is [ + track + ], so the track is
+ * two shorter — otherwise fm_put_clipped eats the closing ']'. */
+#define FM_COPY_DLG_W 52
+#define FM_COPY_DLG_H 7
+#define FM_COPY_DLG_Y 6
+#define FM_COPY_BAR_W (FM_COPY_DLG_W - 6)
+
+/* Solid yellow cells for the filled part of the copy bar. */
+#define FM_ATTR_BAR_FILL AG_ATTR(AG_BLACK, AG_YELLOW)
 
 /* What the viewer will hold.  A bound, because a viewer that tries to load a
  * card-sized file is a viewer that fails on the interesting file. */
@@ -292,46 +301,80 @@ static bool copy_cancelled(void)
 #endif
 }
 
-/* Message-line progress: bar + percent when the size is known, else KB + spinner. */
-static void copy_progress(const char *label, uint64_t done, uint64_t total,
-                          unsigned spin)
+/* Modal progress over the panels: title, bar, percent / KB — no spinner. */
+static void copy_progress(const char *label, uint64_t done, uint64_t total)
 {
-    static const char k_spin[] = "|/-\\";
-    char              line[FM_COLS];
-    char              number[24];
+    const int w = FM_COPY_DLG_W;
+    const int h = FM_COPY_DLG_H;
+    const int x = (FM_COLS - w) / 2;
+    const int y = FM_COPY_DLG_Y;
+    const int inner = w - 4;
+    char      number[24];
+    char      title[FM_COLS];
+    char      status[FM_COLS];
 
-    ag_strlcpy(line, (label != NULL) ? label : "copying", sizeof(line));
-    ag_strlcat(line, ": ", sizeof(line));
+    ag_fill((uint16_t)x, (uint16_t)y, (uint16_t)w, (uint16_t)h, ' ',
+            FM_ATTR_DIALOG);
+    fm_frame(x, y, w, h, FM_ATTR_DIALOG);
 
+    ag_strlcpy(title, "Copying ", sizeof(title));
+    ag_strlcat(title, (label != NULL) ? label : "file", sizeof(title));
+    ag_strlcat(title, "...", sizeof(title));
+    fm_put_clipped(x + 2, y + 1, inner, title, FM_ATTR_DIALOG);
+
+    uint32_t filled = 0;
+    uint32_t pct = 0;
     if (total > 0) {
-        uint32_t pct = (uint32_t)((done * 100u) / total);
+        pct = (uint32_t)((done * 100u) / total);
         if (pct > 100u) {
             pct = 100u;
         }
-        uint32_t filled = (uint32_t)((done * (uint64_t)FM_COPY_BAR_W) / total);
+        filled = (uint32_t)((done * (uint64_t)FM_COPY_BAR_W) / total);
         if (filled > FM_COPY_BAR_W) {
             filled = FM_COPY_BAR_W;
         }
-
-        ag_strlcat(line, "[", sizeof(line));
-        for (uint32_t i = 0; i < FM_COPY_BAR_W; i++) {
-            const char mark[2] = {(i < filled) ? '=' : ' ', '\0'};
-            ag_strlcat(line, mark, sizeof(line));
-        }
-        ag_strlcat(line, "] ", sizeof(line));
-        ag_strlcat(line, ag_utoa(pct, number, sizeof(number), 0, false),
-                   sizeof(line));
-        ag_strlcat(line, "% ", sizeof(line));
-    } else {
-        ag_strlcat(line, ag_utoa(done / 1024u, number, sizeof(number), 0, true),
-                   sizeof(line));
-        ag_strlcat(line, " KB ", sizeof(line));
     }
 
-    const char spin_ch[2] = {k_spin[spin % 4u], '\0'};
-    ag_strlcat(line, spin_ch, sizeof(line));
+    /* Brackets in dialog ink; filled track = yellow rectangles; empty = '-'. */
+    {
+        const int bar_x = x + 2;
+        const int bar_y = y + 3;
+        ag_poke((uint16_t)bar_x, (uint16_t)bar_y, '[', FM_ATTR_DIALOG);
+        for (uint32_t i = 0; i < FM_COPY_BAR_W; i++) {
+            if (i < filled) {
+                ag_poke((uint16_t)(bar_x + 1 + (int)i), (uint16_t)bar_y, ' ',
+                        FM_ATTR_BAR_FILL);
+            } else {
+                ag_poke((uint16_t)(bar_x + 1 + (int)i), (uint16_t)bar_y, '-',
+                        FM_ATTR_DIALOG);
+            }
+        }
+        ag_poke((uint16_t)(bar_x + 1 + (int)FM_COPY_BAR_W), (uint16_t)bar_y, ']',
+                FM_ATTR_DIALOG);
+    }
 
-    fm_message(line);
+    status[0] = '\0';
+    if (total > 0) {
+        ag_strlcat(status, ag_utoa(pct, number, sizeof(number), 0, false),
+                   sizeof(status));
+        ag_strlcat(status, "%   ", sizeof(status));
+        ag_strlcat(status,
+                   ag_utoa(done / 1024u, number, sizeof(number), 0, true),
+                   sizeof(status));
+        ag_strlcat(status, " / ", sizeof(status));
+        ag_strlcat(status,
+                   ag_utoa(total / 1024u, number, sizeof(number), 0, true),
+                   sizeof(status));
+        ag_strlcat(status, " KB", sizeof(status));
+    } else {
+        ag_strlcat(status,
+                   ag_utoa(done / 1024u, number, sizeof(number), 0, true),
+                   sizeof(status));
+        ag_strlcat(status, " KB", sizeof(status));
+    }
+    fm_put_clipped(x + 2, y + 4, inner, status, FM_ATTR_DIALOG);
+    fm_put_clipped(x + 2, y + 5, inner, "Ctrl+C to cancel", FM_ATTR_DIALOG);
+
     ag_yield();
 }
 
@@ -340,6 +383,14 @@ static void copy_progress(const char *label, uint64_t done, uint64_t total,
 static ag_err_t copy_file(const char *from, const char *to, const char *label,
                           uint64_t total)
 {
+    /* HostFS readdir does not fill sizes; ask again so the bar can show %. */
+    if (total == 0) {
+        ag_stat_t st;
+        if (ag_stat(from, &st) == AG_OK && (st.attr & AG_A_DIR) == 0) {
+            total = st.size;
+        }
+    }
+
     const ag_handle_t src = ag_open(from, AG_O_RDONLY);
     if (src < 0) {
         return src;
@@ -361,10 +412,9 @@ static ag_err_t copy_file(const char *from, const char *to, const char *label,
     ag_err_t err = AG_OK;
     uint64_t done = 0;
     uint32_t last_ui_ms = 0;
-    unsigned spin = 0;
 
     /* Something on screen before the first HostFS read, which can take a while. */
-    copy_progress(label, 0, total, spin++);
+    copy_progress(label, 0, total);
     last_ui_ms = ag_millis();
 
     for (;;) {
@@ -392,7 +442,7 @@ static ag_err_t copy_file(const char *from, const char *to, const char *label,
         if ((now - last_ui_ms) >= FM_COPY_UI_MS ||
             (total > 0 && done >= total)) {
             last_ui_ms = now;
-            copy_progress(label, done, total, spin++);
+            copy_progress(label, done, total);
         }
     }
 
