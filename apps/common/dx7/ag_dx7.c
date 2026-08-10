@@ -391,19 +391,27 @@ static int32_t lfo_wave(const ag_dx7_t *dx)
     return v;
 }
 
+/*
+ * Phase step for 32-bit accumulator: freq_hz * 2^32 / sample_rate.
+ * hz_x100 is Hertz * 100. Must use 64-bit math — the old
+ * (hz%rate)*42949673 / rate path overflowed uint32, so every note with the
+ * same (hz/rate) quotient (e.g. C4..A4, or B4..E5) collapsed to one pitch.
+ */
 static uint32_t freq_to_step(int32_t hz_x100, uint32_t rate)
 {
-    uint32_t hz;
-    uint32_t lo;
+    uint64_t num;
     if (rate < 1u) {
         rate = 22050u;
     }
     if (hz_x100 < 1) {
         hz_x100 = 1;
     }
-    hz = (uint32_t)hz_x100;
-    lo = (hz % rate) * 42949673u / rate;
-    return (hz / rate) * 42949673u + lo;
+    num = (uint64_t)(uint32_t)hz_x100 << 32;
+    num /= 100ull * (uint64_t)rate;
+    if (num > 0xffffffffull) {
+        num = 0xffffffffull;
+    }
+    return (uint32_t)num;
 }
 
 static int32_t op_freq_hz_x100(const ag_dx7_t *dx, const ag_dx7_voice_t *v,

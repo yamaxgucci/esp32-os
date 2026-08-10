@@ -78,9 +78,10 @@ static void fill_wav_header(uint8_t *h, const ag_audio_fmt_t *fmt)
     put_u32(h + 40, data_bytes);
 }
 
-static void close_conn(pcmvirt_state_t *st)
+static void close_conn(pcmvirt_state_t *st, const char *why)
 {
     if (st->conn >= 0) {
+        ag_log(AG_LOG_INFO, "pcmvirt", "close conn (%s)", why ? why : "?");
         (void)ag_net_close(st->conn);
         st->conn = -1;
     }
@@ -138,7 +139,7 @@ static void try_accept(pcmvirt_state_t *st)
         return;
     }
 
-    close_conn(st);
+    close_conn(st, "replaced by new peer");
     st->conn = peer;
     (void)ag_net_set_nonblock(st->conn, true);
     if (!st->fmt_set) {
@@ -147,7 +148,7 @@ static void try_accept(pcmvirt_state_t *st)
     }
     fill_wav_header(hdr, &st->fmt);
     if (send_all_nb_header(st->conn, hdr, WAV_HDR) != 0) {
-        close_conn(st);
+        close_conn(st, "wav header send failed");
     }
 }
 
@@ -204,7 +205,7 @@ static ag_err_t pcm_ioctl(ag_device_t *dev, uint32_t cmd, void *arg,
         st->fmt = *fmt;
         st->fmt_set = 1;
         /* New format → new WAV header on next peer. */
-        close_conn(st);
+        close_conn(st, "SETFMT");
         return AG_OK;
     }
     if (cmd == AG_IOC_FLUSH || cmd == AG_IOC_RESET) {
@@ -256,7 +257,7 @@ static int32_t pcm_write(ag_device_t *dev, const void *buf, size_t len,
             break; /* drop remainder; never stall */
         }
         if (n <= 0) {
-            close_conn(st);
+            close_conn(st, "send failed");
             break;
         }
         p += (size_t)n;

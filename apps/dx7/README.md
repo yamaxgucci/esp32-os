@@ -43,14 +43,24 @@ Guest:
 
 ```
 drv install h:\pcmvirt.sys
+drv install h:\midivirt.sys
 run h:\dx7.axe pcmvirt
 ```
 
-Terminal 2:
+Terminal 2 (audio):
 
 ```powershell
-& $py tools\pcmplay.py
+& $py tools\pcmplay.py --reconnect
 ```
+
+Terminal 3 (poly keyboard → guest MIDI-in):
+
+```powershell
+& $py tools\midikbd.py --reconnect
+```
+
+Focus the midikbd window. Same piano map as the guest (`Z..M` / `Q..I`).
+See [`apps/midivirt/README.md`](../midivirt/README.md).
 
 Optional: `& $py tools\pcmplay.py --record build\dx7.wav`.
 
@@ -59,6 +69,8 @@ Optional: `& $py tools\pcmplay.py --record build\dx7.wav`.
 | *(default)* / `mock` / `mute` / `pcmnull` | render → `/dev/pcmnull` |
 | `pcmvirt` / `net` / `tcp` | `/dev/pcmvirt` → `pcmplay.py` |
 | `audio` / `i2s` / `pcm0` | `/dev/pcm0` (future I2S `.SYS`) |
+| `midivirt` / `midi` | open `/dev/midivirt` (default: try) |
+| `nomidi` | skip MIDI-in device |
 | `nofx` | dry output (default; no FX buffers until first enable) |
 | `fx0` | same-core: render → delay/chorus/reverb → write |
 | `fx1` | FX worker on `AG_THREAD_SYS_CORE` (+1 chunk latency) |
@@ -75,8 +87,9 @@ python tools/dx7syx.py gen -o build/sd_card/dx7/ROM.SYX
 python tools/dx7mid.py -o build/sd_card/dx7/DEMO.MID
 ```
 
-On start the app auto-loads the first `.syx` and `.mid` under `h:` / `h:\dx7`.
-MIDI drives the synth in a loop (keyboard optional).
+On start the app auto-loads the first `.syx` under `h:` / `h:\dx7`.
+A `.mid` file is loaded and looped only if you pass its path on the command
+line (keyboard / `midikbd.py` otherwise).
 
 ## Keys
 
@@ -104,5 +117,5 @@ MIDI drives the synth in a loop (keyboard optional).
 Plain serial consoles have no KEY_UP → mono (each key releases the previous).
 With win32-input / kitty key events (`CONFIG_ARGON_CONSOLE_KEY_EVENTS`) → poly chords.
 
-UI shows `Perf` (render/send/loop µs, % of chunk budget) and `Stream`
-(late / dropped bytes / resync). Chunk is ~20 ms @ 22050 Hz.
+UI shows `Keys : held … last … src midivirt+kbd`, plus `Perf` /
+`Stream` (chunk ~20 ms @ 22050 Hz).
