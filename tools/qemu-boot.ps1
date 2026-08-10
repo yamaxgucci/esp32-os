@@ -109,7 +109,7 @@ if (-not $NoNet) {
 
 if ($HostFs) {
     # Second -serial is UART1 (HostFS). Console stays on the first.
-    $qemuArgs += @('-serial', "tcp:127.0.0.1:$HostFsPort")
+    $qemuArgs += @('-serial', "tcp:127.0.0.1:$HostFsPort,reconnect=1")
 }
 
 if ($Sd) {

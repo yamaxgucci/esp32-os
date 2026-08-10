@@ -240,6 +240,18 @@ static inline ag_handle_t ag_dev_open(const char *name)
 {
     return g_ag_api->dev->open(name);
 }
+static inline ag_err_t ag_dev_close(ag_handle_t h)
+{
+    return g_ag_api->dev->close(h);
+}
+static inline int32_t ag_dev_read(ag_handle_t h, void *buf, size_t len)
+{
+    return g_ag_api->dev->read(h, buf, len);
+}
+static inline int32_t ag_dev_write(ag_handle_t h, const void *buf, size_t len)
+{
+    return g_ag_api->dev->write(h, buf, len);
+}
 static inline ag_err_t ag_dev_ioctl(ag_handle_t h, uint32_t cmd, void *arg,
                                     size_t arglen)
 {
@@ -550,7 +562,7 @@ static inline void ag_gfx_stroke_convex(const ag_point_t *pts, int32_t n,
     g_ag_api->gfx->stroke_convex(pts, n, color);
 }
 
-/* ---- audio helpers (ABI 0.14) ------------------------------------------- */
+/* ---- audio helpers (ABI 0.14+; built-in pcmnull) ------------------------- */
 
 static inline int ag_audio_present(void)
 {

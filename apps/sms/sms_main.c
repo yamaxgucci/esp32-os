@@ -471,7 +471,15 @@ int ag_main(int argc, char **argv)
         }
         if (arg_is_mock(argv[i]) || arg_is_sound(argv[i])) {
             want_sound = 1;
-            wav_path = "mock";
+            wav_path = "pcmnull";
+            continue;
+        }
+        if (arg_eq(argv[i], "pcmnull") || arg_eq(argv[i], "pcmvirt") ||
+            arg_eq(argv[i], "net") || arg_eq(argv[i], "tcp") ||
+            arg_eq(argv[i], "audio") || arg_eq(argv[i], "i2s") ||
+            arg_eq(argv[i], "pcm0")) {
+            want_sound = 1;
+            wav_path = argv[i];
             continue;
         }
         if (arg_is_wav(argv[i])) {
@@ -481,7 +489,9 @@ int ag_main(int argc, char **argv)
             }
             continue;
         }
-        if (looks_like_wav_path(argv[i])) {
+        if (looks_like_wav_path(argv[i]) ||
+            (argv[i][0] == '/' ||
+             ((argv[i][0] == 'd' || argv[i][0] == 'D') && argv[i][1] == ':'))) {
             want_sound = 1;
             wav_path = argv[i];
             continue;

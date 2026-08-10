@@ -642,6 +642,426 @@ static int cmd_dev(int argc, char **argv)
     return 0;
 }
 
+#define DRV_CFG_PATH     "/sys/SYSTEM.CFG"
+/* Lowercase: LittleFS is case-sensitive; c:\drv\… resolves to /sys/drv/… */
+#define DRV_DIR_PATH     "/sys/drv"
+#define DRV_CFG_MAX      4096
+#define DRV_COPY_CHUNK   4096
+
+static int cfg_has_device_line(const char *text, const char *dos_path)
+{
+    const char *p = text;
+    int         in_modules = 0;
+
+    while (*p) {
+        const char *line = p;
+        const char *eol = strchr(p, '\n');
+        size_t      len = eol ? (size_t)(eol - p) : strlen(p);
+        char        buf[192];
+        char       *s;
+        char       *eq;
+
+        if (len >= sizeof(buf)) {
+            len = sizeof(buf) - 1u;
+        }
+        memcpy(buf, line, len);
+        buf[len] = '\0';
+        if (len > 0 && buf[len - 1u] == '\r') {
+            buf[len - 1u] = '\0';
+        }
+
+        s = buf;
+        while (*s == ' ' || *s == '\t') {
+            s++;
+        }
+        if (*s == ';' || *s == '#' || *s == '\0') {
+            /* skip */
+        } else if (*s == '[') {
+            char *end = strchr(s, ']');
+            if (end != NULL) {
+                *end = '\0';
+                in_modules = (ag_path_icmp(s + 1, "modules") == 0);
+            } else {
+                in_modules = 0;
+            }
+        } else if (in_modules) {
+            eq = strchr(s, '=');
+            if (eq != NULL) {
+                char *key = s;
+                char *val;
+                *eq = '\0';
+                while (eq > key && (eq[-1] == ' ' || eq[-1] == '\t')) {
+                    eq--;
+                    *eq = '\0';
+                }
+                val = eq + 1;
+                while (*val == ' ' || *val == '\t') {
+                    val++;
+                }
+                if (ag_path_icmp(key, "device") == 0 &&
+                    ag_path_icmp(val, dos_path) == 0) {
+                    return 1;
+                }
+            }
+        }
+
+        if (eol == NULL) {
+            break;
+        }
+        p = eol + 1;
+    }
+    return 0;
+}
+
+static ag_err_t cfg_ensure_device(const char *dos_path)
+{
+    char        text[DRV_CFG_MAX];
+    ag_handle_t h;
+    int32_t     n;
+    size_t      used = 0;
+    char        add[192];
+    size_t      add_len;
+
+    h = ag_vfs_open(DRV_CFG_PATH, NULL, AG_O_RDONLY);
+    if (h >= 0) {
+        n = ag_vfs_read(h, text, sizeof(text) - 1u);
+        ag_vfs_close(h);
+        if (n < 0) {
+            return (ag_err_t)n;
+        }
+        used = (size_t)n;
+        text[used] = '\0';
+        if (cfg_has_device_line(text, dos_path)) {
+            return AG_OK;
+        }
+    } else if (h != -AG_ENOENT) {
+        return (ag_err_t)h;
+    } else {
+        text[0] = '\0';
+        used = 0;
+    }
+
+    /* Extra [modules] block is fine: ag_cfg_next walks every device=. */
+    add_len = (size_t)snprintf(add, sizeof(add), "%s[modules]\ndevice = %s\n",
+                               (used > 0 && text[used - 1u] != '\n') ? "\n" : "",
+                               dos_path);
+    if (add_len >= sizeof(add) || used + add_len + 1u > sizeof(text)) {
+        return -AG_ENOSPC;
+    }
+    memcpy(text + used, add, add_len + 1u);
+    used += add_len;
+
+    h = ag_vfs_open(DRV_CFG_PATH, NULL, AG_O_WRONLY | AG_O_CREATE | AG_O_TRUNC);
+    if (h < 0) {
+        return (ag_err_t)h;
+    }
+    n = ag_vfs_write(h, text, used);
+    (void)ag_vfs_close(h);
+    if (n < 0) {
+        return (ag_err_t)n;
+    }
+    if ((size_t)n != used) {
+        return -AG_EIO;
+    }
+    return AG_OK;
+}
+
+static ag_err_t cfg_remove_device(const char *dos_path)
+{
+    char        text[DRV_CFG_MAX];
+    char        out[DRV_CFG_MAX];
+    ag_handle_t h;
+    int32_t     n;
+    size_t      used;
+    size_t      out_used = 0;
+    const char *p;
+    int         in_modules = 0;
+    int         changed = 0;
+
+    h = ag_vfs_open(DRV_CFG_PATH, NULL, AG_O_RDONLY);
+    if (h < 0) {
+        return (h == -AG_ENOENT) ? AG_OK : (ag_err_t)h;
+    }
+    n = ag_vfs_read(h, text, sizeof(text) - 1u);
+    ag_vfs_close(h);
+    if (n < 0) {
+        return (ag_err_t)n;
+    }
+    used = (size_t)n;
+    text[used] = '\0';
+
+    p = text;
+    while (*p) {
+        const char *line = p;
+        const char *eol = strchr(p, '\n');
+        size_t      len = eol ? (size_t)(eol - p) : strlen(p);
+        char        buf[192];
+        char        raw[192];
+        char       *s;
+        char       *eq;
+        int         drop = 0;
+        size_t      copy_len;
+
+        if (len >= sizeof(buf)) {
+            len = sizeof(buf) - 1u;
+        }
+        memcpy(raw, line, len);
+        raw[len] = '\0';
+        memcpy(buf, raw, len + 1u);
+        if (len > 0 && buf[len - 1u] == '\r') {
+            buf[len - 1u] = '\0';
+        }
+
+        s = buf;
+        while (*s == ' ' || *s == '\t') {
+            s++;
+        }
+        if (*s == '[') {
+            char *end = strchr(s, ']');
+            if (end != NULL) {
+                *end = '\0';
+                in_modules = (ag_path_icmp(s + 1, "modules") == 0);
+            } else {
+                in_modules = 0;
+            }
+        } else if (in_modules && *s != ';' && *s != '#' && *s != '\0') {
+            eq = strchr(s, '=');
+            if (eq != NULL) {
+                char *key = s;
+                char *val;
+                *eq = '\0';
+                while (eq > key && (eq[-1] == ' ' || eq[-1] == '\t')) {
+                    eq--;
+                    *eq = '\0';
+                }
+                val = eq + 1;
+                while (*val == ' ' || *val == '\t') {
+                    val++;
+                }
+                if (ag_path_icmp(key, "device") == 0 &&
+                    ag_path_icmp(val, dos_path) == 0) {
+                    drop = 1;
+                    changed = 1;
+                }
+            }
+        }
+
+        copy_len = eol ? (size_t)(eol - line + 1) : strlen(line);
+        if (!drop) {
+            if (out_used + copy_len + 1u > sizeof(out)) {
+                return -AG_ENOSPC;
+            }
+            memcpy(out + out_used, line, copy_len);
+            out_used += copy_len;
+        }
+        if (eol == NULL) {
+            break;
+        }
+        p = eol + 1;
+    }
+
+    if (!changed) {
+        return AG_OK;
+    }
+
+    h = ag_vfs_open(DRV_CFG_PATH, NULL, AG_O_WRONLY | AG_O_CREATE | AG_O_TRUNC);
+    if (h < 0) {
+        return (ag_err_t)h;
+    }
+    n = ag_vfs_write(h, out, out_used);
+    (void)ag_vfs_close(h);
+    if (n < 0) {
+        return (ag_err_t)n;
+    }
+    return AG_OK;
+}
+
+static ag_err_t drv_copy_file(const char *src_arg, const char *dst_abs)
+{
+    static uint8_t chunk[DRV_COPY_CHUNK];
+    ag_handle_t    in;
+    ag_handle_t    out;
+    int32_t        n;
+
+    in = ag_vfs_open(src_arg, s_cwd, AG_O_RDONLY);
+    if (in < 0) {
+        return (ag_err_t)in;
+    }
+    out = ag_vfs_open(dst_abs, NULL, AG_O_WRONLY | AG_O_CREATE | AG_O_TRUNC);
+    if (out < 0) {
+        ag_vfs_close(in);
+        return (ag_err_t)out;
+    }
+    while ((n = ag_vfs_read(in, chunk, sizeof(chunk))) > 0) {
+        size_t left = (size_t)n;
+        size_t off = 0;
+        while (left > 0) {
+            const int32_t w = ag_vfs_write(out, chunk + off, left);
+            if (w < 0) {
+                ag_vfs_close(in);
+                ag_vfs_close(out);
+                return (ag_err_t)w;
+            }
+            if (w == 0) {
+                ag_vfs_close(in);
+                ag_vfs_close(out);
+                return -AG_ENOSPC;
+            }
+            off += (size_t)w;
+            left -= (size_t)w;
+        }
+    }
+    ag_vfs_close(in);
+    ag_vfs_close(out);
+    return (n < 0) ? (ag_err_t)n : AG_OK;
+}
+
+static int cmd_drv_install(int argc, char **argv)
+{
+    char        src_res[AG_PATH_MAX];
+    char        dst_abs[AG_PATH_MAX];
+    char        dos_path[64];
+    const char *base;
+    ag_err_t    err;
+
+    if (argc != 3) {
+        ag_console_puts("usage: drv install <file.sys>\n");
+        return 1;
+    }
+    err = ag_path_resolve(argv[2], s_cwd, src_res, sizeof(src_res));
+    if (err != AG_OK) {
+        ag_console_printf("%s: %d\n", argv[2], (int)err);
+        return 1;
+    }
+    base = ag_path_basename(src_res);
+    if (base == NULL || base[0] == '\0') {
+        ag_console_puts("drv install: bad name\n");
+        return 1;
+    }
+
+    err = ag_vfs_mkdir(DRV_DIR_PATH, NULL);
+    if (err != AG_OK && err != -AG_EEXIST) {
+        ag_console_printf("mkdir %s: %d\n", DRV_DIR_PATH, (int)err);
+        return 1;
+    }
+    /* Drop legacy uppercase folder from early builds (case-sensitive FS). */
+    (void)ag_vfs_rmdir("/sys/DRV", NULL);
+    err = ag_path_join(DRV_DIR_PATH, base, dst_abs, sizeof(dst_abs));
+    if (err != AG_OK) {
+        ag_console_printf("drv install: %d\n", (int)err);
+        return 1;
+    }
+
+    err = drv_copy_file(argv[2], dst_abs);
+    if (err != AG_OK) {
+        ag_console_printf("copy: %d\n", (int)err);
+        return 1;
+    }
+
+    snprintf(dos_path, sizeof(dos_path), "c:\\drv\\%s", base);
+    err = cfg_ensure_device(dos_path);
+    if (err != AG_OK) {
+        ag_console_printf("SYSTEM.CFG: %d\n", (int)err);
+        return 1;
+    }
+
+    err = ag_module_load(dst_abs, NULL);
+    if (err == -AG_EEXIST) {
+        ag_console_printf("installed %s (already loaded)\n", dos_path);
+        return 0;
+    }
+    if (err != AG_OK) {
+        print_load_error(dst_abs, err);
+        return 1;
+    }
+    ag_console_printf("installed %s (autoload on boot)\n", dos_path);
+    return 0;
+}
+
+static int cmd_drv_uninstall(int argc, char **argv)
+{
+    char        dst_abs[AG_PATH_MAX];
+    char        dos_path[64];
+    const char *name;
+    ag_err_t    err;
+    int         i;
+
+    if (argc != 3) {
+        ag_console_puts("usage: drv uninstall <name|file.sys>\n");
+        return 1;
+    }
+    name = ag_path_basename(argv[2]);
+    if (name == NULL || name[0] == '\0') {
+        name = argv[2];
+    }
+
+    /* Unload by module header name when possible; also try basename. */
+    err = ag_module_unload(argv[2]);
+    if (err == -AG_ENOENT) {
+        for (i = 0;; i++) {
+            ag_modinfo_t info;
+            if (ag_module_info((uint32_t)i, &info) != AG_OK) {
+                break;
+            }
+            if (ag_path_icmp(info.name, argv[2]) == 0 ||
+                ag_path_icmp(ag_path_basename(info.path), name) == 0) {
+                err = ag_module_unload(info.name);
+                break;
+            }
+        }
+    }
+    if (err != AG_OK && err != -AG_ENOENT) {
+        ag_console_printf("unload: %d\n", (int)err);
+        return 1;
+    }
+
+    snprintf(dos_path, sizeof(dos_path), "c:\\drv\\%s", name);
+    if (ag_path_ext(name) == NULL) {
+        /* Header name like PCMVIRT → file pcmvirt.sys is unknown; try .sys */
+        snprintf(dos_path, sizeof(dos_path), "c:\\drv\\%s.sys", name);
+    }
+    (void)cfg_remove_device(dos_path);
+
+    /* Also remove exact basename form if user passed file.sys */
+    if (ag_path_ext(name) != NULL) {
+        snprintf(dos_path, sizeof(dos_path), "c:\\drv\\%s", name);
+        (void)cfg_remove_device(dos_path);
+        err = ag_path_join(DRV_DIR_PATH, name, dst_abs, sizeof(dst_abs));
+        if (err == AG_OK) {
+            (void)ag_vfs_unlink(dst_abs, NULL);
+        }
+    } else {
+        char lower[40];
+        size_t k;
+        for (k = 0; name[k] && k + 1u < sizeof(lower); k++) {
+            char c = name[k];
+            if (c >= 'A' && c <= 'Z') {
+                c = (char)(c - 'A' + 'a');
+            }
+            lower[k] = c;
+        }
+        lower[k] = '\0';
+        snprintf(dos_path, sizeof(dos_path), "c:\\drv\\%s.sys", lower);
+        (void)cfg_remove_device(dos_path);
+        err = ag_path_join(DRV_DIR_PATH, lower, dst_abs, sizeof(dst_abs));
+        if (err == AG_OK) {
+            size_t n = strlen(dst_abs);
+            if (n + 4u < sizeof(dst_abs)) {
+                memcpy(dst_abs + n, ".sys", 5);
+                (void)ag_vfs_unlink(dst_abs, NULL);
+            }
+        }
+        /* Uppercase .SYS variant from install basename */
+        snprintf(dst_abs, sizeof(dst_abs), "%s/%s.SYS", DRV_DIR_PATH, name);
+        (void)ag_vfs_unlink(dst_abs, NULL);
+        snprintf(dos_path, sizeof(dos_path), "c:\\drv\\%s.SYS", name);
+        (void)cfg_remove_device(dos_path);
+    }
+
+    ag_console_printf("uninstalled %s\n", argv[2]);
+    return 0;
+}
+
 /*
  * Loadable .SYS modules.  `dev` shows what they registered; this shows the
  * modules themselves, and is how one is brought in or taken out by hand.
@@ -680,6 +1100,14 @@ static int cmd_drv(int argc, char **argv)
         return 0;
     }
 
+    if (argc >= 2 && ag_path_icmp(argv[1], "install") == 0) {
+        return cmd_drv_install(argc, argv);
+    }
+
+    if (argc >= 2 && ag_path_icmp(argv[1], "uninstall") == 0) {
+        return cmd_drv_uninstall(argc, argv);
+    }
+
     if (argc >= 2 && ag_path_icmp(argv[1], "probe") == 0) {
         if (argc != 2) {
             ag_console_puts("usage: drv probe\n");
@@ -702,7 +1130,8 @@ static int cmd_drv(int argc, char **argv)
     }
 
     if (argc > 1) {
-        ag_console_puts("usage: drv [load|unload|probe] ...\n");
+        ag_console_puts(
+            "usage: drv [load|unload|install|uninstall|probe] ...\n");
         return 1;
     }
 
@@ -994,8 +1423,8 @@ static const ag_command_t k_commands[] = {
     {"edit", "[file]", "create or edit a text file", cmd_edit},
     {"gfxdump", "[/live] <file.ppm>", "save framebuffer as PPM", cmd_gfxdump},
     {"dev", "[name]", "list devices, or describe one", cmd_dev},
-    {"drv", "[load|unload|probe]", "modules: list, load, unload, I2C probe",
-     cmd_drv},
+    {"drv", "[load|unload|install|uninstall|probe]",
+     "modules: list, load, install to C:, unload, I2C probe", cmd_drv},
     {"io", "[pin [mode]] | i2c <bus>", "pins and buses", cmd_io},
     {"ps", "", "list running applications", cmd_ps},
     {"kill", "<pid>", "stop an application", cmd_kill},

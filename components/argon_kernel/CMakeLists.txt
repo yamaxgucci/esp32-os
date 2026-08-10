@@ -72,7 +72,7 @@ idf_component_register(
                   joltwallet__littlefs
                   # api->io: buses and pins straight through to the chip.
                   # esp_adc is deliberately absent - see ARGON_ENABLE_ADC.
-                  esp_driver_i2c esp_driver_ledc esp_driver_i2s
+                  esp_driver_i2c esp_driver_ledc
                   # Virtual RGB panel under Espressif QEMU (no-op on hardware).
                   esp_lcd espressif__esp_lcd_qemu_rgb
                   # api->net: OpenEth + lwIP sockets (QEMU today).

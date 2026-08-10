@@ -10,54 +10,62 @@ bit-exact / SysEx-complete. Engine: [`apps/common/dx7`](../common/dx7).
 
 ```
 python tools/mkaxe.py --arch xtensa --gcc xtensa-esp32s3-elf-gcc `
-  --include sdk/include --include apps/common/dx7 --include apps/common/libc `
+  --include sdk/include --include apps/common --include apps/common/dx7 --include apps/common/libc `
   --cflags "-Os -ffunction-sections -fdata-sections -fno-builtin" `
-  -o build/DX7.AXE `
-  apps/dx7/dx7.c apps/common/dx7/ag_dx7.c apps/common/libc/libc_shim.c
+  -o build/apps/DX7.AXE `
+  apps/dx7/dx7.c apps/common/dx7/ag_dx7.c apps/common/dx7/ag_mid.c `
+  apps/common/libc/libc_shim.c
 ```
 
-Copy `DX7.AXE` to a HostFS share (e.g. `build\sms_share` or `build\cc_share`).
+`mkaxe` stages into `build/apps/` and `build/sd_card/` (see
+[`docs/user/03-host-share.md`](../../docs/user/03-host-share.md)).
 
-## Realtime on Windows (same path as MD)
+## Realtime on Windows
 
-By default the app is **mute** (`mock`). Pass **`net`** to stream stereo s16
-WAV PCM @ 22050 Hz over TCP `:5558` → host `tools/pcmplay.py`.
-`argon run` hostfwd’s `127.0.0.1:5558`.
+By default the app writes to **`/dev/pcmnull`**. For host speakers: install
+[`PCMVIRT.SYS`](../pcmvirt) once (`drv install h:\pcmvirt.sys`), then pass
+`pcmvirt` (or `net`). Full checklist: [`apps/pcmvirt/README.md`](../pcmvirt/README.md).
+
+PowerShell / Windows Terminal (repo root):
+
+```powershell
+$py = "D:\Espressif\tools\python_env\idf5.5_py3.12_env\Scripts\python.exe"
+```
 
 Terminal 1:
 
-```
-argon run -HostFs build\cc_share
+```powershell
+.\argon.cmd run -Gfx -HostFs build\sd_card
 ```
 
 Guest:
 
 ```
-run h:\dx7.axe net
+drv install h:\pcmvirt.sys
+run h:\dx7.axe pcmvirt
 ```
 
-Terminal 2 — after the guest prints `waiting for host`:
+Terminal 2:
 
-```
-python tools/pcmplay.py
+```powershell
+& $py tools\pcmplay.py
 ```
 
-Optional: `pcmplay.py --record build\dx7.wav`, or `net:PORT` + `argon run -NetPort PORT`.
+Optional: `& $py tools\pcmplay.py --record build\dx7.wav`.
 
 | Arg | Effect |
 |-----|--------|
-| *(default)* / `mock` / `mute` | render, discard |
-| `net` / `tcp` | TCP → `pcmplay.py` |
-| `net:PORT` | same, custom port |
-| `audio` / `i2s` | kernel `api->audio` (I2S or stub) |
+| *(default)* / `mock` / `mute` / `pcmnull` | render → `/dev/pcmnull` |
+| `pcmvirt` / `net` / `tcp` | `/dev/pcmvirt` → `pcmplay.py` |
+| `audio` / `i2s` / `pcm0` | `/dev/pcm0` (future I2S `.SYS`) |
 | `path.syx` | load DX7 SysEx bank (1 or 32 voices) |
 | `path.mid` | load Standard MIDI file (loops) |
 
 Demo bank / MIDI on the HostFS share:
 
 ```
-python tools/dx7syx.py gen -o build/cc_share/dx7/ROM.SYX
-python tools/dx7mid.py -o build/cc_share/dx7/DEMO.MID
+python tools/dx7syx.py gen -o build/sd_card/dx7/ROM.SYX
+python tools/dx7mid.py -o build/sd_card/dx7/DEMO.MID
 ```
 
 On start the app auto-loads the first `.syx` and `.mid` under `h:` / `h:\dx7`.

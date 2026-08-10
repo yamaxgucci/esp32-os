@@ -120,16 +120,16 @@ typedef struct {
 } ag_board_display_t;
 
 /*
- * I2S TX to an external DAC (MAX98357, PCM5102, …).  All pins AG_PIN_NONE
- * means the kernel keeps a discard stub (QEMU / no codec wired).
+ * Pinout and default rate for a future I2S .SYS driver.  The kernel only
+ * registers /dev/pcmnull; virt/I2S devices come from loadable modules.
  */
 typedef struct {
-    char     driver[12]; /* "auto", "i2s", "stub" */
+    char     driver[12]; /* reserved / hint for future PCMI2S.SYS ("i2s", …) */
     int16_t  bclk;
     int16_t  ws;
     int16_t  dout;
     int16_t  mclk; /* optional; AG_PIN_NONE if unused */
-    uint32_t rate; /* default sample rate hint; apps may reopen */
+    uint32_t rate; /* default sample rate hint for pcmnull / drivers */
 } ag_board_audio_t;
 
 typedef struct {

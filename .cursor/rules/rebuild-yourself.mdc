@@ -7,10 +7,21 @@ alwaysApply: true
 
 After changing kernel, apps, host tools that affect the guest, or anything the user needs to run next — **rebuild and stage artifacts yourself**. Do not leave `argon build` / `mkaxe` / copy-into-share as “you should run…”.
 
-Typical:
+## Paths (canonical)
+
+| What | Path |
+|---|---|
+| App / driver images (archive) | `build/apps/` (`.AXE`, `.SYS`) |
+| HostFS / sync share | `build/sd_card/` |
+
+`tools/mkaxe.py` **always** copies the built image into both directories after a
+successful write (unless `--no-stage`). Prefer `-o build/apps/NAME.AXE`.
+
+## Typical
 
 - Firmware: `argon build` (or `argon check` when tests are warranted)
-- Apps: `python tools/mkaxe.py …` per app README; copy `.AXE` into the active HostFS/share dir if that is how we run (e.g. `build\sms_share\SMS.AXE`)
+- Apps: `python tools/mkaxe.py … -o build/apps/FOO.AXE …` (auto-stages to `build/sd_card/` too)
+- Run QEMU with HostFS: `argon run -Gfx -HostFs build\sd_card` (or `-Share build\sd_card`)
 - Report what you rebuilt and any command that failed
 
 Only skip a rebuild when the change is docs-only or the user explicitly says not to build.

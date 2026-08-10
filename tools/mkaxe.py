@@ -373,6 +373,11 @@ def main():
                          "asking for c to get setjmp does not drag newlib's "
                          "malloc past the app's own")
     ap.add_argument("--keep-elf", help="also write the intermediate ELF here")
+    ap.add_argument(
+        "--no-stage",
+        action="store_true",
+        help="do not also copy the image into build/apps and build/sd_card",
+    )
     args = ap.parse_args()
 
     if args.arch == "xtensa":
@@ -550,8 +555,39 @@ def main():
                   code["size"], data["size"], len(data["stored"]),
                   data["size"] - len(data["stored"]), rodata_bytes,
                   args.rodata, len(relocs)))
+
+        if not args.no_stage:
+            stage_image(args.output)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
+
+
+def repo_root():
+    """Directory that contains tools/mkaxe.py (repo root)."""
+    return os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
+
+def stage_image(path):
+    """
+    Canonical layout: every .AXE / .SYS also lands in build/apps (archive) and
+    build/sd_card (HostFS / sync share). Prefer -o build/apps/NAME.AXE; staging
+    still runs so rebuilds always refresh the share.
+    """
+    src = os.path.abspath(path)
+    if not os.path.isfile(src):
+        return
+    name = os.path.basename(src)
+    root = repo_root()
+    apps = os.path.join(root, "build", "apps")
+    share = os.path.join(root, "build", "sd_card")
+    os.makedirs(apps, exist_ok=True)
+    os.makedirs(share, exist_ok=True)
+    for dest_dir in (apps, share):
+        dest = os.path.join(dest_dir, name)
+        if os.path.abspath(dest) == src:
+            continue
+        shutil.copy2(src, dest)
+    print("staged -> build/apps/%s, build/sd_card/%s" % (name, name))
 
 
 if __name__ == "__main__":

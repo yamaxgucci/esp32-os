@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
-"""Play a streaming WAV PCM feed from ArgonOS (MD `net` sink) over TCP.
+"""Play a streaming WAV PCM feed from ArgonOS (/dev/pcmvirt via PCMVIRT.SYS).
 
-Guest listens; QEMU hostfwd maps 127.0.0.1:PORT to the guest.  Typical:
+The guest publishes PCM on TCP :5558 (QEMU hostfwd).  Connect anytime — the
+guest does not wait for you.  Typical:
 
-  # guest:  run a:\\MD.AXE a:\\game.bin net
+  # guest (once):  drv install t:\\pcmvirt.sys
+  # guest:         run … with audio_out=/dev/pcmvirt
   python tools/pcmplay.py
-  python tools/pcmplay.py --record build/md_agfm.wav   # play + WAV
-  python tools/pcmplay.py --save build/md_only.wav     # WAV only
+  python tools/pcmplay.py --reconnect          # survive guest restart
+  python tools/pcmplay.py --record build/out.wav
 
 A reader thread keeps the TCP window drained so the guest never blocks on send.
-Playback uses a short jitter buffer; underruns insert silence (QEMU MD is often
+Playback uses a short jitter buffer; underruns insert silence (QEMU is often
 far below realtime, so gaps are expected unless the emu catches up).
 """
 
@@ -72,7 +74,6 @@ class PcmRing:
             self._buf.extend(data)
             overflow = len(self._buf) - self._cap
             if overflow > 0:
-                # Drop oldest to keep latency bounded.
                 del self._buf[:overflow]
                 self.dropped += overflow
             self._cv.notify_all()
@@ -148,10 +149,9 @@ def play_sounddevice(
     import sounddevice as sd
 
     frame_bytes = channels * 2
-    # ~750 ms capacity; prebuffer ~120 ms before starting.
     ring = PcmRing(capacity=rate * frame_bytes * 3 // 4)
     prebuffer = rate * frame_bytes * 12 // 100
-    chunk = max(frame_bytes * (rate // 40), frame_bytes * 128)  # ~25 ms
+    chunk = max(frame_bytes * (rate // 40), frame_bytes * 128)
 
     t = threading.Thread(
         target=reader_thread, args=(sock, ring, rec), daemon=True
@@ -241,6 +241,58 @@ def save_wav(sock: socket.socket, rate: int, channels: int, path: Path) -> None:
         rec.close()
 
 
+def connect(host: str, port: int, retries: int) -> socket.socket:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 256 * 1024)
+
+    last_err: Exception | None = None
+    for i in range(max(1, retries)):
+        try:
+            sock.connect((host, port))
+            return sock
+        except OSError as e:
+            last_err = e
+            if i + 1 < retries:
+                print(f"waiting for pcmvirt on {host}:{port}...", flush=True)
+                time.sleep(1)
+    sock.close()
+    raise OSError(f"connect failed: {last_err}")
+
+
+def session(sock: socket.socket, args: argparse.Namespace) -> None:
+    rec: WavRecorder | None = None
+    try:
+        hdr = read_exact(sock, 44)
+        rate, channels, _bits = parse_wav_header(hdr)
+        print(f"connected: {rate} Hz, {channels} ch", flush=True)
+        if args.save:
+            save_wav(sock, rate, channels, args.save)
+            return
+        if args.record:
+            args.record.parent.mkdir(parents=True, exist_ok=True)
+            rec = WavRecorder(args.record, rate, channels)
+            print(f"recording to {args.record}", flush=True)
+        if args.ffplay:
+            play_ffplay(sock, rate, channels, rec)
+        else:
+            try:
+                play_sounddevice(sock, rate, channels, rec)
+            except ImportError:
+                print(
+                    "sounddevice missing; install with:\n"
+                    '  "D:\\Espressif\\tools\\python_env\\idf5.5_py3.12_env\\Scripts\\python.exe"'
+                    " -m pip install sounddevice\n"
+                    "or use --ffplay",
+                    file=sys.stderr,
+                )
+                raise SystemExit(1)
+    finally:
+        if rec is not None:
+            rec.close()
+        sock.close()
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--host", default="127.0.0.1")
@@ -257,71 +309,43 @@ def main() -> int:
         help="while playing, also write the same PCM to a WAV file",
     )
     ap.add_argument("--retries", type=int, default=60, help="connect attempts (1/s)")
+    ap.add_argument(
+        "--reconnect",
+        action="store_true",
+        help="after the stream ends, wait and connect again (guest restart)",
+    )
     args = ap.parse_args()
     if args.save and args.record:
         print("use either --save or --record, not both", file=sys.stderr)
         return 2
 
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    # Large host recv buffer so guest non-blocking sends rarely drop.
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 256 * 1024)
-
-    last_err: Exception | None = None
-    for i in range(max(1, args.retries)):
-        try:
-            sock.connect((args.host, args.port))
-            last_err = None
-            break
-        except OSError as e:
-            last_err = e
-            if i + 1 < args.retries:
-                print(f"waiting for guest on {args.host}:{args.port}...", flush=True)
-                time.sleep(1)
-    if last_err is not None:
-        print(f"connect failed: {last_err}", file=sys.stderr)
-        print(
-            "Start QEMU, then in guest: run a:\\MD.AXE rom.bin net",
-            file=sys.stderr,
-        )
-        return 1
-
-    rec: WavRecorder | None = None
     try:
-        hdr = read_exact(sock, 44)
-        rate, channels, _bits = parse_wav_header(hdr)
-        print(f"connected: {rate} Hz, {channels} ch")
-        if args.save:
-            save_wav(sock, rate, channels, args.save)
-        else:
-            if args.record:
-                args.record.parent.mkdir(parents=True, exist_ok=True)
-                rec = WavRecorder(args.record, rate, channels)
-                print(f"recording to {args.record}", flush=True)
-            if args.ffplay:
-                play_ffplay(sock, rate, channels, rec)
-            else:
-                try:
-                    play_sounddevice(sock, rate, channels, rec)
-                except ImportError:
-                    print(
-                        "sounddevice missing; install with:\n"
-                        '  "D:\\Espressif\\tools\\python_env\\idf5.5_py3.12_env\\Scripts\\python.exe"'
-                        " -m pip install sounddevice\n"
-                        "or use --ffplay",
-                        file=sys.stderr,
-                    )
+        while True:
+            try:
+                sock = connect(args.host, args.port, args.retries)
+            except OSError as e:
+                print(str(e), file=sys.stderr)
+                print(
+                    "Install/load PCMVIRT.SYS in guest, set audio_out=/dev/pcmvirt",
+                    file=sys.stderr,
+                )
+                return 1
+            try:
+                session(sock, args)
+            except KeyboardInterrupt:
+                print("\nstopped.")
+                return 0
+            except Exception as e:
+                print(f"error: {e}", file=sys.stderr)
+                if not args.reconnect:
                     return 1
+            if not args.reconnect:
+                return 0
+            print("reconnect: waiting for next stream...", flush=True)
+            time.sleep(0.5)
     except KeyboardInterrupt:
         print("\nstopped.")
-    except Exception as e:
-        print(f"error: {e}", file=sys.stderr)
-        return 1
-    finally:
-        if rec is not None:
-            rec.close()
-        sock.close()
-    return 0
+        return 0
 
 
 if __name__ == "__main__":

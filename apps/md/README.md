@@ -1,8 +1,8 @@
 # Mega Drive (`MD.AXE`) — Z80 + approximate sound
 
 68000, VDP, Z80, PSG, and a light YM2612→`ag_fm` front-end. Video goes straight
-into the `gfx` back buffer. Sound: `mock` / `wav` / `net` / `audio` (kernel
-I2S or stub).
+into the `gfx` back buffer. Sound: `/dev/pcmnull` (default), `/dev/pcmvirt`
+(after `drv install` of [`PCMVIRT.SYS`](../pcmvirt)), WAV file, or future `/dev/pcm0`.
 
 Cores: [gwenesis](https://github.com/bzhxx/gwenesis) by bzhxx — read
 **Licensing** below before shipping this anywhere.
@@ -79,13 +79,13 @@ in `port/md_ym_native.c`.
 
 ```
 python tools/mkaxe.py --arch xtensa --gcc xtensa-esp32s3-elf-gcc `
-  --include sdk/include --include apps/common/libc --include apps/md `
+  --include sdk/include --include apps/common --include apps/common/libc --include apps/md `
   --include apps/md/port --include apps/md/core/bus --include apps/md/core/cpus/M68K `
   --include apps/md/core/vdp --include apps/md/core/io `
   --include apps/md/core/savestate --include apps/md/core/sound `
   --include apps/sms/core/z80 --include apps/sms/core/sound --include apps/common/fm `
   --cflags "-Os -ffunction-sections -fdata-sections -fno-builtin -include md_cfg.h -DARGON_MD_Z80 -DLSB_FIRST -Wno-unused -Wno-sign-compare" `
-  --libs c -o build/MD.AXE `
+  --libs c -o build/apps/MD.AXE `
   apps/md/md_main.c `
   apps/md/port/md_z80.c apps/md/port/md_ym_ag_fm.c apps/md/port/md_psg.c `
   apps/md/port/md_sound_out.c apps/md/port/md_savestate_stub.c `
@@ -109,13 +109,13 @@ A/B listen over `net` / `pcmplay.py`. Sin/pow tables are host-generated
 
 ```
 python tools/mkaxe.py --arch xtensa --gcc xtensa-esp32s3-elf-gcc `
-  --include sdk/include --include apps/common/libc --include apps/md `
+  --include sdk/include --include apps/common --include apps/common/libc --include apps/md `
   --include apps/md/port --include apps/md/core/bus --include apps/md/core/cpus/M68K `
   --include apps/md/core/vdp --include apps/md/core/io `
   --include apps/md/core/savestate --include apps/md/core/sound `
   --include apps/sms/core/z80 --include apps/sms/core/sound `
   --cflags "-Os -ffunction-sections -fdata-sections -fno-builtin -include md_cfg.h -DARGON_MD_Z80 -DLSB_FIRST -Wno-unused -Wno-sign-compare" `
-  --libs c -o build/MDYM.AXE `
+  --libs c -o build/apps/MDYM.AXE `
   apps/md/md_main.c `
   apps/md/port/md_z80.c apps/md/port/md_ym_native.c apps/md/port/md_psg.c `
   apps/md/port/md_sound_out.c apps/md/port/md_savestate_stub.c `
@@ -127,11 +127,11 @@ python tools/mkaxe.py --arch xtensa --gcc xtensa-esp32s3-elf-gcc `
   apps/md/core/io/gwenesis_io.c apps/md/core/savestate/gwenesis_savestate.c
 ```
 
-Then copy `build/MDYM.AXE` beside `MD.AXE` and compare:
+Both land in `build/sd_card/` via staging. Compare:
 
 ```
-run a:\MD.AXE a:\game.bin net      # lite FM
-run a:\MDYM.AXE a:\game.bin net    # native YM2612
+run h:\MD.AXE h:\game.bin pcmvirt      # lite FM
+run h:\MDYM.AXE h:\game.bin pcmvirt    # native YM2612
 ```
 
 The image is **~170 KB of code** (`MD.AXE`) in the 192 KB arena and asks for a
@@ -142,26 +142,25 @@ tables stay in ordinary `.rodata` (PSRAM) so the Z80 fits; put them back in
 ## Run
 
 ```
-argon sync build\sd_card          # with MD.AXE copied in
-argon run -Sd -Gfx
-run a:\MD.AXE a:\game.bin
-run a:\MD.AXE a:\game.bin mock        # Z80+PSG+FM, discard samples (default)
-run a:\MD.AXE a:\game.bin wav         # write a:\md.wav
-run a:\MD.AXE a:\game.bin a:\out.wav  # explicit WAV path
-run a:\MD.AXE a:\game.bin net         # TCP stream → Windows (see below)
+argon run -Gfx -HostFs build\sd_card
+run h:\MD.AXE h:\game.bin
+run h:\MD.AXE h:\game.bin mock        # Z80+PSG+FM → /dev/pcmnull (default)
+run h:\MD.AXE h:\game.bin wav         # write wav on a mounted drive
+run h:\MD.AXE h:\game.bin pcmvirt     # /dev/pcmvirt → Windows (see below)
 ```
 
-Realtime audio over the QEMU OpenEth NIC (not UART):
+Realtime audio (OpenEth NIC, not UART) — full steps in
+[`apps/pcmvirt/README.md`](../pcmvirt/README.md):
 
 ```
-argon run -Sd -Gfx -HostFs build\md_share
-# guest waits after: run a:\MD.AXE a:\game.bin net
+argon run -Gfx -HostFs build\sd_card
+# guest: drv install h:\pcmvirt.sys ; run h:\MD.AXE h:\game.bin pcmvirt
 python tools/pcmplay.py                 # or: python tools/pcmplay.py --ffplay
 python tools/pcmplay.py --record build\md_agfm.wav   # play + save
 python tools/pcmplay.py --save build\md_only.wav     # save, no speakers
 ```
 
-`argon run` enables `hostfwd` on `127.0.0.1:5558` by default. Use `net:PORT` on the guest and `-NetPort PORT` on the host if you change it.
+`argon run` hostfwd’s `127.0.0.1:5558` by default.
 
 | Arg | Effect |
 |-----|--------|

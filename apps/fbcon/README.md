@@ -9,7 +9,7 @@ This is a **debug preview**, not a real display. For real pixels see below.
 
 ```
 python tools/mkaxe.py --arch xtensa --gcc xtensa-esp32s3-elf-gcc `
-  --include sdk/include -o build/FBCON.AXE apps/fbcon/fbcon.c
+  --include sdk/include -o build/apps/FBCON.AXE apps/fbcon/fbcon.c
 ```
 
 ## Run (Esc must reach fbcon)

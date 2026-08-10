@@ -269,7 +269,7 @@ static ag_handle_t api_tcp_listen(uint16_t port)
         close(fd);
         return (ag_handle_t)e;
     }
-    if (listen(fd, 1) != 0) {
+    if (listen(fd, 4) != 0) {
         const ag_err_t e = map_errno(errno);
         close(fd);
         return (ag_handle_t)e;
@@ -284,16 +284,34 @@ static ag_handle_t api_tcp_accept(ag_handle_t listen_h, uint32_t timeout_ms)
         return (ag_handle_t)(-AG_EBADF);
     }
 
+    /*
+     * ABI: 0 = return at once, UINT32_MAX = block forever.
+     * Do NOT use SO_RCVTIMEO=0 for poll — on lwIP that means "wait forever",
+     * which hung pcmvirt write() until Windows connected.
+     */
     if (timeout_ms != UINT32_MAX) {
+        fd_set         rfds;
         struct timeval tv;
+
+        FD_ZERO(&rfds);
+        FD_SET(lfd, &rfds);
         tv.tv_sec = (time_t)(timeout_ms / 1000u);
         tv.tv_usec = (suseconds_t)((timeout_ms % 1000u) * 1000u);
-        (void)setsockopt(lfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        {
+            const int pr = select(lfd + 1, &rfds, NULL, NULL, &tv);
+            if (pr < 0) {
+                return (ag_handle_t)map_errno(errno);
+            }
+            if (pr == 0) {
+                return (ag_handle_t)(timeout_ms == 0u ? -AG_EAGAIN
+                                                     : -AG_ETIMEDOUT);
+            }
+        }
     }
 
     struct sockaddr_in peer;
-    socklen_t plen = sizeof(peer);
-    const int cfd = accept(lfd, (struct sockaddr *)&peer, &plen);
+    socklen_t          plen = sizeof(peer);
+    const int          cfd = accept(lfd, (struct sockaddr *)&peer, &plen);
     if (cfd < 0) {
         return (ag_handle_t)map_errno(errno);
     }

@@ -339,22 +339,23 @@ sd0       storage   sdmmc       64 MB      read-only removable
 ```
 
 **`drv`** — загруженные модули `.SYS`. Без аргументов — список; `drv load
-<file>` поднимает модуль и вызывает его `ag_driver_init`; `drv unload <name>`
-снимает модуль и отзывает устройства, которые он зарегистрировал (`name` —
-имя из заголовка образа, например `ECHO`); `drv probe` подбирает модули из
-`[modules] probe=` в `SYSTEM.CFG` по ответам на I2C. `run` на `.SYS`
-отказывает: это не приложение.
+<file>` поднимает модуль сейчас; `drv install <file>` копирует на `C:\drv\`
+(`/sys/drv/`, lowercase — LittleFS чувствителен к регистру), прописывает
+`[modules] device=` в `C:\SYSTEM.CFG` и грузит (после reboot модуль
+поднимается сам и снова публикует устройства в `dev`); `drv uninstall <name>`
+снимает запись/файл; `drv unload <name>` только выгружает из RAM (`name` —
+из заголовка, например `PCMVIRT`); `drv probe` — I2C-подбор из
+`[modules] probe=`. `run` на `.SYS` отказывает: это не приложение.
 
 ```
-A:\> drv load t:\echo.sys
-loaded t:\echo.sys
+A:\> drv install t:\pcmvirt.sys
+installed c:\drv\pcmvirt.sys (autoload on boot)
 A:\> drv
 name      version  code       data       path
-ECHO      1.0      ...        ...        t:\echo.sys
-A:\> drv probe
-probe: 0 loaded, 1 absent
-A:\> drv unload ECHO
-unloaded ECHO
+PCMVIRT   1.0      ...        ...        /sys/drv/pcmvirt.sys
+A:\> dev pcmvirt
+A:\> drv uninstall PCMVIRT
+uninstalled PCMVIRT
 ```
 
 **`dev <имя>`** — про одно устройство подробно:

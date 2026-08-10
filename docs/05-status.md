@@ -22,14 +22,27 @@ realtime-эмуляции — в [07-emulator-performance.md](07-emulator-perfor
 Одна точка входа, `argon.cmd` в корне. Это батник, а не `.ps1`, потому что
 Windows по умолчанию запрещает выполнение скриптов PowerShell.
 
+**Образы приложений и шара (обязательные пути):**
+
+| Папка | Назначение |
+|---|---|
+| `build/apps/` | все собранные `.AXE` / `.SYS` (архив) |
+| `build/sd_card/` | HostFS (`-HostFs`) и вход для `argon sync` / `-Share` |
+
+`tools/mkaxe.py` после сборки сам копирует образ в обе папки (если не
+`--no-stage`). Пиши `-o build/apps/NAME.AXE`. Подробнее —
+[`docs/user/03-host-share.md`](user/03-host-share.md). Проверка звука
+QEMU→Windows: [`apps/pcmvirt/README.md`](../apps/pcmvirt/README.md).
+
 ```
 argon build              собрать прошивку
 argon run                запустить в QEMU, консоль в этом окне (Ctrl+A, X — выход)
 argon run -Sd            то же, с образом SD-карты
+argon run -HostFs build\sd_card   живая папка Windows как H:
 argon run -tcp           консоль на 127.0.0.1:5556, подключаться PuTTY в Raw
 argon test ver mem       автотест: загрузка, набор команд, печать экрана
 argon test -Sd ...       то же с картой
-argon test -Put "build\HELLO.AXE=t:\hello.axe" "run t:\hello.axe"
+argon test -Put "build\apps\HELLO.AXE=t:\hello.axe" "run t:\hello.axe"
                          то же, предварительно залив файл в гостя через recv
 argon test ... "~\x1c"   послать сырые байты, не дожидаясь приглашения:
                          так проверяется Ctrl+\ по работающему приложению
@@ -39,6 +52,45 @@ argon check              локальный CI: `tests` + сборка прош�
 argon vt                 умеет ли эта консоль показывать экран
 argon flash -port COM5   прошить настоящую плату
 ```
+
+### Проверка виртуального звука (QEMU → Windows)
+
+Полный чеклист также в [`apps/pcmvirt/README.md`](../apps/pcmvirt/README.md).
+Образы уже должны лежать в `build/sd_card/` (`PCMVIRT.SYS`, `DX7.AXE`; демо
+`build/sd_card/dx7/`).
+
+В **PowerShell / Windows Terminal** из корня репо: `argon` не в PATH —
+вызывай `.\argon.cmd`. Python — из IDF venv (не глобальный).
+
+Сначала в каждом хост-терминале:
+
+```powershell
+cd "D:\Work\Unity Projects\ESP32-OS"
+$py = "D:\Espressif\tools\python_env\idf5.5_py3.12_env\Scripts\python.exe"
+```
+
+1. Один раз (если нет `sounddevice`):
+   `& $py -m pip install sounddevice`
+2. Терминал 1 — гость:
+   `.\argon.cmd run -Gfx -HostFs build\sd_card`
+   Дождись сети (OpenEth / DHCP).
+3. В госте (один раз на этот flash-образ):
+   `drv install h:\pcmvirt.sys` → `dev pcmvirt`
+   Должны появиться `pcmvirt` / драйвер `PCMVIRT`. После reboot `dev` без
+   повторного install — ок.
+4. Терминал 2 — хост (снова `$py=…` и `cd` в корень):
+   `& $py tools\pcmplay.py`
+   Можно `& $py tools\pcmplay.py --reconnect` или
+   `& $py tools\pcmplay.py --record build\pcm_capture.wav`.
+   Ждать клиента нормально: гость **не** блокируется.
+5. В госте: `run h:\dx7.axe pcmvirt`
+   Ожидай `sound = /dev/pcmvirt @ 22050 Hz`, без «waiting for host».
+   Клавиши Z…M / Q…I или авто-MIDI из `h:\dx7\`.
+6. Pass: в `pcmplay` строка `connected: 22050 Hz, 2 ch` и слышен звук;
+   без плеера DX7 не ждёт; с `--reconnect` после обрыва звук возвращается.
+
+Снять: `drv uninstall PCMVIRT`. Порт по умолчанию `127.0.0.1:5558`
+(hostfwd у `.\argon.cmd run`).
 
 Машинно-зависимые пути живут в `tools/local-env.ps1` (не в git):
 
@@ -104,8 +156,8 @@ argon flash -port COM5   прошить настоящую плату
 | Встроенные устройства | `src/dev/devices.c`, `storage.c` | ✅ `null zero con flash0 sd0 fb0`, команда `dev` |
 | Soft display / `gfx` | `src/dev/display.c`, `draw.c`, `font8x16.c` | ✅ RGB565 front+back (640×400), `double_buf`/`swap`, dirty-rect `flush`, ABI **0.9** soft-draw (`pixel`/`line`/`circle`/`poly_*`/`fill_convex`), `gfxdump`, `apps/gfxdemo`; QEMU RGB (`argon run -Gfx`) |
 | Soft input / `joy0` | `src/dev/input.c` | ✅ слой pad: PADPUSH → `/dev/joy0` + `inp->pad`/`btn`/`btnp` (ABI 0.11), снимок 6 байт; `H:\sms.pad` — совместимость |
-| Master System `.AXE` | `apps/sms/` (SMS Plus GX, GPLv2+) | ✅ play + `ag_btnp` / PADPUSH; рендер **прямо в back-буфер `gfx`** без промежуточного кадра, `stats` печатает % realtime, `fps30` делит показ; PSG+FM→WAV/mock (`ag_fm`, не `ym2413.c`); realtime audio — позже (I2S на плате или host-player в QEMU) |
-| Mega Drive `.AXE` | `apps/md/` (gwenesis, GPLv3 + Musashi MIT) | ⚠ play+sound: 68000 + VDP + Z80(SMS) + PSG + YM→`ag_fm`, рендер в back-буфер, `ag_btnp` + PADPUSH, `stats`/`fps30`, `mock`/`wav`. ~169 КБ кода в арене 192 КБ; Alex Kidd ~125% realtime в QEMU с mock. I2S/`audio` и точный YM — позже. Лицензии — [`apps/md/README.md`](../apps/md/README.md) |
+| Master System `.AXE` | `apps/sms/` (SMS Plus GX, GPLv2+) | ✅ play + `ag_btnp` / PADPUSH; рендер в back-буфер `gfx`; PSG+FM→`/dev/pcm*` или WAV (`ag_fm`); QEMU: `PCMVIRT.SYS` + `pcmplay.py` |
+| Mega Drive `.AXE` | `apps/md/` (gwenesis, GPLv3 + Musashi MIT) | ⚠ play+sound: 68000 + VDP + Z80 + PSG + YM→`ag_fm`; звук в `/dev/pcmnull`/`pcmvirt` или WAV; I2S — будущий `.SYS`. Лицензии — [`apps/md/README.md`](../apps/md/README.md) |
 | Владение пинами | `src/dev/ioclaim.c` | ✅ пины системы, занятые пины, возврат за упавшим процессом |
 | Железо напрямую | `src/dev/io.c` | ✅ GPIO, ISR, I2C, SPI, UART, PWM; команда `io`, скан I2C |
 | Таблица ABI | `src/loader/api.c` | ⚠ 0.11: `inp->btnp`, расширенный `ag_btn`, `pad` hi-байты; `gfx` draw; `cfg`/`net` — `NULL` |
@@ -224,16 +276,16 @@ argon flash -port COM5   прошить настоящую плату
 
 ```
 python tools/mkaxe.py --arch xtensa --gcc xtensa-esp32s3-elf-gcc \
-    --include sdk/include -o build\HELLO.AXE apps/hello/hello.c
-argon test -Put "build\HELLO.AXE=t:\hello.axe" "run t:\hello.axe alpha"
+    --include sdk/include -o build\apps\HELLO.AXE apps/hello/hello.c
+argon test -Put "build\apps\HELLO.AXE=t:\hello.axe" "run t:\hello.axe alpha"
 ```
 
 Подпись `.AXE` (HMAC в `reserved[6]`, нули = без подписи):
 
 ```
-python tools/signaxe.py build\HELLO.AXE
-python tools/signaxe.py --verify build\HELLO.AXE
-argon test -Put "build\HELLO.AXE=t:\hello.axe" "run t:\hello.axe"
+python tools/signaxe.py build\apps\HELLO.AXE
+python tools/signaxe.py --verify build\apps\HELLO.AXE
+argon test -Put "build\apps\HELLO.AXE=t:\hello.axe" "run t:\hello.axe"
 ```
 
 Soft graphics (без платы):
