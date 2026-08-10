@@ -119,3 +119,13 @@ With win32-input / kitty key events (`CONFIG_ARGON_CONSOLE_KEY_EVENTS`) → poly
 
 UI shows `Keys : held … last … src midivirt+kbd`, plus `Perf` /
 `Stream` (chunk ~20 ms @ 22050 Hz).
+
+## Future (backlog)
+
+- **Per-op / LFO waves:** keep sine (`isin`) and current LFO shapes; add
+  `wave_id` so each operator and the LFO can select sine / built-in shapes /
+  a **custom one-cycle table loaded from `.wav`** (alternative, not a global
+  replace of `isin`). See [`docs/06-ideas.md`](../../docs/06-ideas.md).
+- More polyphony / multi-timbral, bit-exact EG — deferred.
+- Guest nofx structural synth on Argon CC: [`apps/cc/examples/dx7nofx.c`](../cc/examples/dx7nofx.c)
+  (phase E). This host `DX7.AXE` remains the FX / WAV / richer UI line.

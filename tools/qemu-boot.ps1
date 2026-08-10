@@ -253,7 +253,6 @@ try {
             # of scrolling hex redraws the prompts already on it and the count
             # grows on its own.  That looked exactly like a transfer that worked
             # and a file that was half there.
-            $written = Count-Of 'bytes written'
             Send-Line "recv $guest"
 
             # 64 bytes a line - 128 hex characters, which is what the line
@@ -291,26 +290,16 @@ try {
             # same file onto FAT on flash is a sector rewrite every 64 bytes and
             # takes seconds per kilobyte.
             Send-Line 'END'
-            # Generous, and generous again for flash: a fresh FAT on flash is
-            # slower than a used one, so the first big transfer after a firmware
-            # rebuild - which reformats C: - takes minutes rather than seconds.
-            if (-not (Wait-Text -Needle 'bytes written' -Was $written `
+            # Wait for this transfer's own length, not a bare "bytes written":
+            # a previous Put's report can still be on the scrolling screen and
+            # would look like a new one if only the words were counted.
+            $done = "$($bytes.Length) bytes written"
+            $written = Count-Of $done
+            if (-not (Wait-Text -Needle $done -Was $written `
                                 -Seconds (120 + $bytes.Length / 64))) {
                 throw "$guest did not arrive: recv never reported it written"
             }
             $seen = Read-Available
-
-            # And the count it reported has to be the count that was sent.  A
-            # transfer over a console with no checksum can only be trusted as far
-            # as this, but a wrong length is the failure that actually happens.
-            $tail = $text.ToString()
-            $tail = $tail.Substring([Math]::Max(0, $tail.Length - 4096))
-            if ($tail -match '(\d+) bytes written') {
-                if ([int]$Matches[1] -ne $bytes.Length) {
-                    throw ("$guest arrived as $($Matches[1]) bytes, not " +
-                           "$($bytes.Length): the transfer lost data")
-                }
-            }
         }
     }
 

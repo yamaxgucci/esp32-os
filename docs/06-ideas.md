@@ -256,6 +256,66 @@ Ariel: memory safety через язык не переносится без см
 
 ---
 
+## 3a. DX7 waves + Argon CC Mini-C *(зафиксировано август 2026)*
+
+Не текущая работа: бэклог host DX7 и отдельный трек языка CC. Сводка из
+плана `dx7_wav_and_cc`. Host app: [`apps/dx7`](../apps/dx7/); движок:
+[`apps/common/dx7`](../apps/common/dx7/). CC roadmap: [`04-roadmap.md`](04-roadmap.md)
+(бэклог CC).
+
+### 3a.1. DX7 — custom WAV для operators и LFO
+
+**Сейчас:** каждый operator — только sine (`isin`). Разные формы есть лишь у
+LFO (`lfo_wave`: triangle / saw↓ / saw↑ / square / sine). Поле `op.mode` —
+ratio/fixed freq, не shape.
+
+**Цель (host `DX7.AXE`, позже):**
+
+- `isin` и текущие LFO shapes **остаются**.
+- У каждого operator — `wave_id`: sine | (опционально built-in shapes) | слот
+  custom wavetable.
+- У LFO — те же 0..4 **плюс** WAV-слот(ы) как альтернатива.
+- Загрузка моно `.wav` → одноцикловая таблица (напр. 1024×s16) → слот;
+  назначение на op и/или LFO.
+- **Не** глобально подменять `isin` одним файлом на все op.
+
+Отложено рядом: больше полифонии / multi-timbral, bit-exact EG, LVGL UI.
+
+### 3a.2. Argon CC → Mini-C (отдельный чат / трек)
+
+**Цель языка:** вырастить CC так, чтобы стал возможен порт **текущего DX7
+без FX и без второго ядра** (`nofx`; midivirt / SysEx / SMF — допустимы).
+
+**Не цель ближайших фаз:** полный C11, float, bit-exact Dexed, `ag_fx`,
+`fx1` / `AG_THREAD_SYS_CORE`.
+
+| Phase | Содержание | Критерий готово |
+|-------|------------|-----------------|
+| ✅ **A** | `ag_print` / `ag_printf`; затем GPIO builtins | текст в консоль; мигание пина с гостя |
+| ✅ **B** | `& \| ^ << >>`; `char` + указатели (байтовый load/store) | маски/фаза; строка через pointer |
+| ✅ **C** | structs; preprocessor `#define`/`#include`; caps | struct + массив struct; `#include` на госте |
+| ✅ **D** | Builtins: FS open/read/close/opendir; malloc/free; `ag_dev_open`/`read`/`write` | чтение файла + write PCM chunk |
+| ✅ **E** | Реимплемент structural DX7 **nofx**: 6 op, 32 alg, 8 voices, sine ops, LFO shapes | играет ноты на CC; без `ag_fx`, без threads/queues |
+
+A–C = взрослый язык (и опора для CC→`.SYS` на госте). D–E = критерий
+«DX7-nofx на CC возможен». WAV-слоты op/LFO в CC-порте — после базового E
+или остаются на host DX7.
+
+**Фазы A–E сделаны (август 2026)** — A с гигиеной кодогенерации и лимитов, B —
+биты/`char`/указатели, C — структуры и препроцессор, D — FS/malloc/`ag_dev_*`,
+E — [`dx7nofx.c`](../apps/cc/examples/dx7nofx.c) (не host `ag_dx7.c` as-is).
+Замеры в [`04-roadmap.md`](04-roadmap.md), § 2. Критерий D: `fsmem.c` на госте.
+Критерий E: гостевой `CC.AXE` собирает `dx7nofx.c`, QEMU печатает
+`dx7nofx: smoke ok` (poly + audio); pad B1/B2 / L/R alg / U/D preset.
+
+Следующее по этому треку — сборка `.SYS` на госте или (по запросу) SysEx с
+диска / WAV-слоты. RISC-V backend по-прежнему отдельно, по мере нужды.
+
+Handoff: A–E ✅; не делать WAV waves, пока не попросят; host `DX7.AXE` (mkaxe)
+— линия для FX и WAV.
+
+---
+
 ## 4. Уже сделано у нас, у других называется иначе
 
 Не план, а напоминание, чтобы не «изобретать повторно»:
