@@ -10,11 +10,12 @@ bit-exact / SysEx-complete. Engine: [`apps/common/dx7`](../common/dx7).
 
 ```
 python tools/mkaxe.py --arch xtensa --gcc xtensa-esp32s3-elf-gcc `
-  --include sdk/include --include apps/common --include apps/common/dx7 --include apps/common/libc `
+  --include sdk/include --include apps/common --include apps/common/dx7 `
+  --include apps/common/fx --include apps/common/libc `
   --cflags "-Os -ffunction-sections -fdata-sections -fno-builtin" `
   -o build/apps/DX7.AXE `
   apps/dx7/dx7.c apps/common/dx7/ag_dx7.c apps/common/dx7/ag_mid.c `
-  apps/common/libc/libc_shim.c
+  apps/common/fx/ag_fx.c apps/common/libc/libc_shim.c
 ```
 
 `mkaxe` stages into `build/apps/` and `build/sd_card/` (see
@@ -58,8 +59,14 @@ Optional: `& $py tools\pcmplay.py --record build\dx7.wav`.
 | *(default)* / `mock` / `mute` / `pcmnull` | render → `/dev/pcmnull` |
 | `pcmvirt` / `net` / `tcp` | `/dev/pcmvirt` → `pcmplay.py` |
 | `audio` / `i2s` / `pcm0` | `/dev/pcm0` (future I2S `.SYS`) |
+| `nofx` | dry output (default; no FX buffers until first enable) |
+| `fx0` | same-core: render → delay/chorus/reverb → write |
+| `fx1` | FX worker on `AG_THREAD_SYS_CORE` (+1 chunk latency) |
 | `path.syx` | load DX7 SysEx bank (1 or 32 voices) |
 | `path.mid` | load Standard MIDI file (loops) |
+
+FX library: [`apps/common/fx`](../common/fx) (~25 KB heap when enabled; app
+arena 192 KB).
 
 Demo bank / MIDI on the HostFS share:
 
@@ -88,6 +95,9 @@ MIDI drives the synth in a loop (keyboard optional).
 | `P` / `O` | Portamento / unison |
 | Enter / `\` | MIDI play-stop / restart |
 | Space | Panic (all notes off) |
+| `F` | Cycle FX mode: off → local → core1 → off |
+| `D` / `C` / `V` | Toggle delay / chorus / reverb (while FX ≠ off; steals those piano keys) |
+| `8` / `9` | Master wet −/+ (while FX ≠ off) |
 | F1–F6 / F7–F12 | Op level −10 / +10 |
 | Esc | Quit |
 
