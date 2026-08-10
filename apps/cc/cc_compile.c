@@ -38,55 +38,55 @@ static void cc_free(void *p)
 #define CODE_BASE 0x42000000u
 #define DATA_BASE 0x3C000000u
 #define AXE_HDR   176u
-#define CODE_CAP  (48u * 1024u)
-#define DATA_CAP  4096u
-#define LIT_CAP   256
-#define MAX_LIT_SITES 2048
-#define MAX_LOCALS 64
-#define MAX_GLOBALS 32
-#define MAX_FUNCS 32
-#define MAX_RELOCS 512
+
+/*
+ * Code has to fit the executable arena the loader hands out, so the ceiling
+ * here is the arena ceiling (CONFIG_ARGON_APP_ARENA_KB, 192 on S3) and not a
+ * number of its own - a smaller one would refuse programs the system is
+ * perfectly able to run.  Everything else lives in PSRAM, where the working
+ * buffers of a compiler cost nothing worth counting.
+ */
+#define CODE_CAP  (192u * 1024u)
+#define DATA_CAP  (128u * 1024u)
+#define LIT_CAP   1024
+#define MAX_LIT_SITES 8192
+#define MAX_GLOBALS 128
+#define MAX_FUNCS 128
+#define MAX_RELOCS 2048
 #define MAX_NAME   32
-#define MAX_STR    192
-#define SPILL_SLOTS 16
+#define MAX_STR    256
+#define MAX_STRUCTS 24
+#define MAX_FIELDS  24
+#define MAX_ARRAY   (1 << 20)
+#define MAX_MACROS  64
+#define MAX_MPARAMS 6
+#define MAX_INCLUDES 16
+#define MAX_FRAMES  12
+#define MAX_PATH    64
+#define EXP_CAP     4096
+
+/*
+ * Frame layout, from the frame pointer up: spill slots, then locals, then the
+ * 16 bytes at the top of every frame where a caller's a4-a7 are saved on window
+ * overflow (32 given, for alignment and margin).  Spills come first so that a
+ * local's offset is known the moment it is declared - the size of the locals
+ * area is not known until the body has been parsed, and offsets are baked into
+ * instructions as they are emitted.
+ *
+ * l32i/s32i reach 1020 bytes, which is what caps the locals area: the highest
+ * word must stay addressable from the frame pointer.
+ */
+#define SPILL_SLOTS 24
+#define SPILL_BYTES (SPILL_SLOTS * 4)
+#define MAX_LOCALS 96
+#define MAX_LOCAL_WORDS 224
+#define FRAME_TOP_SAVE 32
+#define MAX_PARAMS 6
 
 #define AG_AXE_R_IN_DATA 0x1u
 #define AG_AXE_R_TO_DATA 0x2u
 #define AG_AXE_NEEDS_GFX (1u << 1)
 #define AG_AXE_NEEDS_AUDIO (1u << 6)
-
-#define API_OFF_INP   24
-#define API_OFF_GFX   28
-#define API_OFF_TIME  40
-#define API_OFF_AUDIO 60
-
-#define INP_OFF_KEY_PRESSED 12
-#define INP_OFF_PAD         20
-#define INP_OFF_BTN         24
-#define TIME_OFF_DELAY_MS   16
-
-#define GFX_OFF_ACQUIRE     4
-#define GFX_OFF_RELEASE     8
-#define GFX_OFF_FLUSH       12
-#define GFX_OFF_SWAP        16
-#define GFX_OFF_CLEAR       20
-#define GFX_OFF_FILL_RECT   24
-#define GFX_OFF_TEXT        32
-#define GFX_OFF_PIXEL       40
-#define GFX_OFF_LINE        44
-#define GFX_OFF_CIRCLE      48
-#define GFX_OFF_FILL_CIRCLE 52
-#define GFX_OFF_POLY_BEGIN  56
-#define GFX_OFF_POLY_VERTEX 60
-#define GFX_OFF_POLY_FILL   64
-#define GFX_OFF_POLY_STROKE 68
-
-#define AUDIO_OFF_PRESENT 4
-#define AUDIO_OFF_IS_HW   8
-#define AUDIO_OFF_OPEN    12
-#define AUDIO_OFF_CLOSE   16
-#define AUDIO_OFF_WRITE   20
-#define AUDIO_OFF_SPACE   24
 
 #define RET_VOID 0
 #define RET_BOOL 1
@@ -111,6 +111,27 @@ static void cpy_err(char *dst, size_t n, const char *msg)
     dst[i] = '\0';
 }
 
+static void cpy_num(char *dst, size_t n, int v)
+{
+    char rev[12];
+    int  k = 0;
+    size_t at = 0;
+    while (dst[at] != '\0' && at + 1 < n) {
+        at++;
+    }
+    if (v <= 0) {
+        rev[k++] = '0';
+    }
+    while (v > 0 && k < (int)sizeof(rev)) {
+        rev[k++] = (char)('0' + (v % 10));
+        v /= 10;
+    }
+    while (k > 0 && at + 1 < n) {
+        dst[at++] = rev[--k];
+    }
+    dst[at] = '\0';
+}
+
 /* ---- lexer ------------------------------------------------------------- */
 
 typedef enum {
@@ -119,6 +140,7 @@ typedef enum {
     T_NUM,
     T_STRING,
     T_INT,
+    T_CHAR,
     T_VOID,
     T_RETURN,
     T_IF,
@@ -148,8 +170,72 @@ typedef enum {
     T_ANDAND,
     T_OROR,
     T_NOT,
+    T_AMP,
+    T_PIPE,
+    T_CARET,
+    T_TILDE,
+    T_SHL,
+    T_SHR,
+    T_STRUCT,
+    T_DOT,
+    T_ARROW,
     T_BAD
 } tok_t;
+
+/*
+ * The preprocessor, such as it is.  A macro body is not copied anywhere: it is
+ * a span of the source (or of an included file, which is kept for the whole
+ * compile), and expanding one means reading from that span for a while and then
+ * going back.  Only a macro with parameters has to build text, and that goes on
+ * a stack in `exp` which unwinds with the frame that used it.
+ */
+typedef struct {
+    char        name[MAX_NAME];
+    char        params[MAX_MPARAMS][MAX_NAME];
+    int         nparams; /* -1 when the macro takes no argument list */
+    int         live;
+    const char *body;
+    size_t      body_len;
+} macro_t;
+
+typedef struct {
+    char   path[MAX_PATH];
+    char  *text;
+    size_t len;
+} incl_t;
+
+/*
+ * Where the lexer was before it stepped into a macro body or an included file.
+ * `mac` is what it stepped *into*, so that a macro cannot expand inside its own
+ * expansion, and `exp_mark` is where the argument text for it starts.
+ */
+typedef struct {
+    const char *src;
+    size_t      len;
+    size_t      pos;
+    size_t      exp_mark;
+    int         mac;
+    int         incl;
+    /*
+     * Where the arguments landed in the expansion.  A macro is not expanded
+     * inside its own body, but text that came from an argument is the caller's,
+     * not the body's: `SQ(SQ(2))` has to work, while `#define X X + 1` still
+     * has to stop.  These ranges are what tells the two apart.
+     */
+    int      nargr;
+    uint16_t argr[MAX_MPARAMS][2];
+} frame_t;
+
+typedef struct {
+    int        nmacros;
+    macro_t    macros[MAX_MACROS];
+    int        nincls;
+    incl_t     incls[MAX_INCLUDES];
+    frame_t    frames[MAX_FRAMES];
+    char       exp[EXP_CAP];
+    cc_read_file_fn reader;
+    void      *reader_ctx;
+} pp_t;
 
 typedef struct {
     const char *src;
@@ -161,6 +247,18 @@ typedef struct {
     int32_t     num;
     int         err;
     char        errmsg[160];
+    /*
+     * Preprocessor state that a peek must be able to undo, and so lives here
+     * rather than in pp_t: peek_tok saves and restores the whole lexer.  What
+     * stays in pp_t is either idempotent (a macro defined twice is the same
+     * macro) or a cache, so re-running a directive after a peek changes
+     * nothing.
+     */
+    pp_t       *pp;
+    int         nframes;
+    int         cond_depth;
+    int         cur_incl;
+    size_t      exp_top;
 } lex_t;
 
 static int is_id0(char c)
@@ -178,14 +276,445 @@ static int is_digit(char c)
     return c >= '0' && c <= '9';
 }
 
+static int same_n(const char *a, const char *b, size_t n)
+{
+    for (size_t i = 0; i < n; i++) {
+        if (a[i] != b[i]) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/*
+ * Where the error is, counted when it happens rather than tracked as the lexer
+ * runs.  A compiler that lives on the machine it compiles for has no host and
+ * no IDE behind it: "expected ';'" without a line is a search by hand.
+ */
+static void cpy_err_at(char *dst, size_t n, const char *msg, const lex_t *L)
+{
+    cpy_err(dst, n, msg);
+    if (L == NULL || L->src == NULL) {
+        return;
+    }
+    /*
+     * A line inside a macro body is no help to anyone: walk back out of any
+     * expansion to the text of a file, and count there.  What is left is where
+     * the user would look - the line that used the macro.
+     */
+    const char *src = L->src;
+    size_t      pos = L->pos;
+    if (L->pp != NULL) {
+        int k = L->nframes;
+        while (k > 0 && L->pp->frames[k - 1].mac >= 0) {
+            k--;
+            src = L->pp->frames[k].src;
+            pos = L->pp->frames[k].pos;
+        }
+    }
+    int line = 1;
+    for (size_t i = 0; i < pos; i++) {
+        if (src[i] == '\n') {
+            line++;
+        }
+    }
+    size_t at = 0;
+    while (dst[at] != '\0' && at + 1 < n) {
+        at++;
+    }
+    const char *tail = " at line ";
+    for (size_t i = 0; tail[i] != '\0' && at + 1 < n; i++) {
+        dst[at++] = tail[i];
+    }
+    dst[at] = '\0';
+    cpy_num(dst, n, line);
+    if (L->pp == NULL || L->cur_incl < 0) {
+        return;
+    }
+    at = 0;
+    while (dst[at] != '\0' && at + 1 < n) {
+        at++;
+    }
+    const char *of = " of ";
+    for (size_t i = 0; of[i] != '\0' && at + 1 < n; i++) {
+        dst[at++] = of[i];
+    }
+    const char *path = L->pp->incls[L->cur_incl].path;
+    for (size_t i = 0; path[i] != '\0' && at + 1 < n; i++) {
+        dst[at++] = path[i];
+    }
+    dst[at] = '\0';
+}
+
 static void lex_fail(lex_t *L, const char *msg)
 {
     if (L->err) {
         return;
     }
     L->err = 1;
-    cpy_err(L->errmsg, sizeof(L->errmsg), msg);
+    cpy_err_at(L->errmsg, sizeof(L->errmsg), msg, L);
     L->tok = T_BAD;
+}
+
+/* ---- preprocessor ------------------------------------------------------ */
+
+static int pp_find(const lex_t *L, const char *name)
+{
+    if (L->pp == NULL) {
+        return -1;
+    }
+    for (int i = 0; i < L->pp->nmacros; i++) {
+        if (L->pp->macros[i].live &&
+            CC_STRCMP(L->pp->macros[i].name, name) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/*
+ * A macro already being expanded is not expanded again, as C requires - unless
+ * the name being looked at came from an argument, which is the caller's text
+ * and was never part of the body.
+ */
+static int pp_active(const lex_t *L, int mi)
+{
+    for (int i = 0; i < L->nframes; i++) {
+        const frame_t *f = &L->pp->frames[i];
+        if (f->mac != mi) {
+            continue;
+        }
+        const size_t at = (i + 1 < L->nframes) ? L->pp->frames[i + 1].pos
+                                               : L->pos;
+        int in_arg = 0;
+        for (int k = 0; k < f->nargr; k++) {
+            if (at >= f->argr[k][0] && at < f->argr[k][1]) {
+                in_arg = 1;
+                break;
+            }
+        }
+        if (!in_arg) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void pp_push(lex_t *L, const char *src, size_t len, int mac,
+                    size_t exp_mark)
+{
+    if (L->nframes >= MAX_FRAMES) {
+        lex_fail(L, "includes or macros nested too deep");
+        return;
+    }
+    frame_t *f = &L->pp->frames[L->nframes++];
+    f->src = L->src;
+    f->len = L->len;
+    f->pos = L->pos;
+    f->exp_mark = exp_mark;
+    f->mac = mac;
+    f->incl = L->cur_incl;
+    f->nargr = 0;
+    L->src = src;
+    L->len = len;
+    L->pos = 0;
+}
+
+static void pp_pop(lex_t *L)
+{
+    const frame_t *f = &L->pp->frames[--L->nframes];
+    L->src = f->src;
+    L->len = f->len;
+    L->pos = f->pos;
+    L->exp_top = f->exp_mark;
+    L->cur_incl = f->incl;
+}
+
+static void skip_line(lex_t *L)
+{
+    while (L->pos < L->len && L->src[L->pos] != '\n') {
+        L->pos++;
+    }
+}
+
+static void skip_blanks(lex_t *L)
+{
+    while (L->pos < L->len &&
+           (L->src[L->pos] == ' ' || L->src[L->pos] == '\t')) {
+        L->pos++;
+    }
+}
+
+/* A directive's name or argument; anything that is not one is an error there. */
+static int pp_word(lex_t *L, char *out, size_t cap)
+{
+    skip_blanks(L);
+    size_t n = 0;
+    while (L->pos < L->len && is_id(L->src[L->pos])) {
+        if (n + 1 < cap) {
+            out[n++] = L->src[L->pos];
+        }
+        L->pos++;
+    }
+    out[n] = '\0';
+    return n > 0;
+}
+
+static void pp_define(lex_t *L)
+{
+    char name[MAX_NAME];
+    if (!pp_word(L, name, sizeof(name))) {
+        lex_fail(L, "expected a macro name");
+        return;
+    }
+    int mi = pp_find(L, name);
+    if (mi < 0) {
+        if (L->pp->nmacros >= MAX_MACROS) {
+            lex_fail(L, "too many macros");
+            return;
+        }
+        mi = L->pp->nmacros++;
+        cpy_err(L->pp->macros[mi].name, MAX_NAME, name);
+    }
+    macro_t *m = &L->pp->macros[mi];
+    m->live = 1;
+    m->nparams = -1;
+    /*
+     * `#define f(x)` takes arguments only when the paren touches the name;
+     * with a space it is an object-like macro whose body starts with one.
+     */
+    if (L->pos < L->len && L->src[L->pos] == '(') {
+        L->pos++;
+        m->nparams = 0;
+        skip_blanks(L);
+        if (L->pos < L->len && L->src[L->pos] == ')') {
+            L->pos++;
+        } else {
+            for (;;) {
+                if (m->nparams >= MAX_MPARAMS) {
+                    lex_fail(L, "too many macro parameters");
+                    return;
+                }
+                if (!pp_word(L, m->params[m->nparams], MAX_NAME)) {
+                    lex_fail(L, "expected a macro parameter");
+                    return;
+                }
+                m->nparams++;
+                skip_blanks(L);
+                if (L->pos < L->len && L->src[L->pos] == ',') {
+                    L->pos++;
+                    continue;
+                }
+                if (L->pos < L->len && L->src[L->pos] == ')') {
+                    L->pos++;
+                    break;
+                }
+                lex_fail(L, "expected ',' or ')' in macro parameters");
+                return;
+            }
+        }
+    }
+    skip_blanks(L);
+    const size_t start = L->pos;
+    skip_line(L);
+    size_t end = L->pos;
+    while (end > start && (L->src[end - 1] == ' ' || L->src[end - 1] == '\t' ||
+                           L->src[end - 1] == '\r')) {
+        end--;
+    }
+    m->body = L->src + start;
+    m->body_len = end - start;
+}
+
+/*
+ * Everything up to the `#else` or `#endif` that closes this one.  Directives
+ * inside are not obeyed, only counted, so a conditional nested in a branch that
+ * was not taken cannot end the one that skipped it.
+ */
+static void pp_skip_branch(lex_t *L, int stop_at_else)
+{
+    int depth = 0;
+    for (;;) {
+        skip_line(L);
+        if (L->pos >= L->len) {
+            lex_fail(L, "unterminated #ifdef");
+            return;
+        }
+        L->pos++;
+        skip_blanks(L);
+        if (L->pos >= L->len || L->src[L->pos] != '#') {
+            continue;
+        }
+        L->pos++;
+        char word[MAX_NAME];
+        if (!pp_word(L, word, sizeof(word))) {
+            continue;
+        }
+        if (CC_STRCMP(word, "ifdef") == 0 || CC_STRCMP(word, "ifndef") == 0) {
+            depth++;
+            continue;
+        }
+        if (CC_STRCMP(word, "endif") == 0) {
+            if (depth == 0) {
+                skip_line(L);
+                return;
+            }
+            depth--;
+            continue;
+        }
+        if (CC_STRCMP(word, "else") == 0 && depth == 0 && stop_at_else) {
+            L->cond_depth++;
+            skip_line(L);
+            return;
+        }
+    }
+}
+
+static void pp_include(lex_t *L)
+{
+    skip_blanks(L);
+    if (L->pos >= L->len || L->src[L->pos] != '"') {
+        lex_fail(L, "expected \"file\" after #include");
+        return;
+    }
+    L->pos++;
+    char path[MAX_PATH];
+    size_t n = 0;
+    while (L->pos < L->len && L->src[L->pos] != '"' && L->src[L->pos] != '\n') {
+        if (n + 1 >= sizeof(path)) {
+            lex_fail(L, "include path too long");
+            return;
+        }
+        path[n++] = L->src[L->pos++];
+    }
+    path[n] = '\0';
+    if (L->pos >= L->len || L->src[L->pos] != '"') {
+        lex_fail(L, "expected \"file\" after #include");
+        return;
+    }
+    L->pos++;
+    skip_line(L);
+    if (L->pp->reader == NULL) {
+        lex_fail(L, "#include is not available here");
+        return;
+    }
+    /*
+     * Read once per path: an include guard stops the second copy from being
+     * compiled, but nothing else would stop it from being read again - and a
+     * peek across the directive would read it a third time.
+     */
+    for (int i = 0; i < L->pp->nincls; i++) {
+        if (CC_STRCMP(L->pp->incls[i].path, path) == 0) {
+            pp_push(L, L->pp->incls[i].text, L->pp->incls[i].len, -1,
+                    L->exp_top);
+            L->cur_incl = i;
+            return;
+        }
+    }
+    if (L->pp->nincls >= MAX_INCLUDES) {
+        lex_fail(L, "too many included files");
+        return;
+    }
+    char  *text = NULL;
+    size_t len = 0;
+    if (L->pp->reader(L->pp->reader_ctx, path, &text, &len) != 0 ||
+        text == NULL) {
+        lex_fail(L, "cannot read the included file");
+        return;
+    }
+    const int idx = L->pp->nincls++;
+    incl_t   *inc = &L->pp->incls[idx];
+    cpy_err(inc->path, sizeof(inc->path), path);
+    inc->text = text;
+    inc->len = len;
+    pp_push(L, text, len, -1, L->exp_top);
+    L->cur_incl = idx;
+}
+
+/* One directive, the '#' already behind us.  Returns with the line consumed. */
+static void pp_directive(lex_t *L)
+{
+    L->pos++;
+    char word[MAX_NAME];
+    if (!pp_word(L, word, sizeof(word))) {
+        lex_fail(L, "expected a directive after '#'");
+        return;
+    }
+    if (CC_STRCMP(word, "define") == 0) {
+        pp_define(L);
+        return;
+    }
+    if (CC_STRCMP(word, "undef") == 0) {
+        char name[MAX_NAME];
+        if (!pp_word(L, name, sizeof(name))) {
+            lex_fail(L, "expected a macro name");
+            return;
+        }
+        const int mi = pp_find(L, name);
+        if (mi >= 0) {
+            L->pp->macros[mi].live = 0;
+        }
+        skip_line(L);
+        return;
+    }
+    if (CC_STRCMP(word, "ifdef") == 0 || CC_STRCMP(word, "ifndef") == 0) {
+        char name[MAX_NAME];
+        if (!pp_word(L, name, sizeof(name))) {
+            lex_fail(L, "expected a macro name");
+            return;
+        }
+        skip_line(L);
+        int taken = pp_find(L, name) >= 0;
+        if (word[2] == 'n') {
+            taken = !taken;
+        }
+        if (taken) {
+            L->cond_depth++;
+        } else {
+            pp_skip_branch(L, 1);
+        }
+        return;
+    }
+    if (CC_STRCMP(word, "else") == 0) {
+        if (L->cond_depth == 0) {
+            lex_fail(L, "#else without #ifdef");
+            return;
+        }
+        L->cond_depth--;
+        pp_skip_branch(L, 0);
+        return;
+    }
+    if (CC_STRCMP(word, "endif") == 0) {
+        if (L->cond_depth == 0) {
+            lex_fail(L, "#endif without #ifdef");
+            return;
+        }
+        L->cond_depth--;
+        skip_line(L);
+        return;
+    }
+    if (CC_STRCMP(word, "include") == 0) {
+        pp_include(L);
+        return;
+    }
+    lex_fail(L, "unknown directive");
+}
+
+/* A '#' counts as a directive only when nothing but blanks precede it. */
+static int at_line_start(const lex_t *L)
+{
+    size_t i = L->pos;
+    while (i > 0) {
+        const char c = L->src[i - 1];
+        if (c == '\n') {
+            return 1;
+        }
+        if (c != ' ' && c != '\t' && c != '\r') {
+            return 0;
+        }
+        i--;
+    }
+    return 1;
 }
 
 static void lex_skip(lex_t *L)
@@ -194,6 +723,13 @@ static void lex_skip(lex_t *L)
         const char c = L->src[L->pos];
         if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
             L->pos++;
+            continue;
+        }
+        if (c == '#' && L->pp != NULL && at_line_start(L)) {
+            pp_directive(L);
+            if (L->err) {
+                return;
+            }
             continue;
         }
         if (c == '/' && L->pos + 1 < L->len && L->src[L->pos + 1] == '/') {
@@ -225,6 +761,12 @@ static tok_t kw(const char *s)
     if (CC_STRCMP(s, "int") == 0) {
         return T_INT;
     }
+    if (CC_STRCMP(s, "char") == 0) {
+        return T_CHAR;
+    }
+    if (CC_STRCMP(s, "struct") == 0) {
+        return T_STRUCT;
+    }
     if (CC_STRCMP(s, "void") == 0) {
         return T_VOID;
     }
@@ -246,6 +788,199 @@ static tok_t kw(const char *s)
     return T_IDENT;
 }
 
+/* The character an escape stands for; anything unknown stands for itself. */
+static char lex_escape(char e)
+{
+    if (e == 'n') {
+        return '\n';
+    }
+    if (e == 't') {
+        return '\t';
+    }
+    if (e == 'r') {
+        return '\r';
+    }
+    if (e == '0') {
+        return '\0';
+    }
+    return e;
+}
+
+/*
+ * The text a macro stands for, with its parameters replaced by the arguments
+ * written at the call.  Built on a stack that unwinds when the expansion ends,
+ * so a macro used inside an argument of another one costs only its own text.
+ */
+static void pp_expand_args(lex_t *L, int mi)
+{
+    const macro_t *m = &L->pp->macros[mi];
+    const char *args[MAX_MPARAMS];
+    size_t      arglen[MAX_MPARAMS];
+    int         nargs = 0;
+
+    L->pos++; /* the '(' */
+    if (m->nparams > 0) {
+        for (;;) {
+            if (nargs >= MAX_MPARAMS) {
+                lex_fail(L, "too many macro arguments");
+                return;
+            }
+            int depth = 0;
+            const size_t start = L->pos;
+            while (L->pos < L->len) {
+                const char c = L->src[L->pos];
+                if (c == '(') {
+                    depth++;
+                } else if (c == ')') {
+                    if (depth == 0) {
+                        break;
+                    }
+                    depth--;
+                } else if (c == ',' && depth == 0) {
+                    break;
+                }
+                L->pos++;
+            }
+            if (L->pos >= L->len) {
+                lex_fail(L, "unterminated macro arguments");
+                return;
+            }
+            args[nargs] = L->src + start;
+            arglen[nargs] = L->pos - start;
+            nargs++;
+            if (L->src[L->pos] == ',') {
+                L->pos++;
+                continue;
+            }
+            break;
+        }
+    }
+    if (L->pos >= L->len || L->src[L->pos] != ')') {
+        lex_fail(L, "expected ')' after macro arguments");
+        return;
+    }
+    L->pos++;
+    if (nargs != m->nparams) {
+        lex_fail(L, "wrong number of macro arguments");
+        return;
+    }
+
+    const size_t mark = L->exp_top;
+    size_t       top = L->exp_top;
+    size_t       i = 0;
+    uint16_t     argr[MAX_MPARAMS][2];
+    int          nargr = 0;
+    while (i < m->body_len) {
+        const char c = m->body[i];
+        /* A name inside a literal is text, not a parameter. */
+        if (c == '"' || c == '\'') {
+            const char quote = c;
+            do {
+                if (top + 1 >= EXP_CAP) {
+                    lex_fail(L, "macro expansion too long");
+                    return;
+                }
+                L->pp->exp[top++] = m->body[i];
+                if (m->body[i] == '\\' && i + 1 < m->body_len) {
+                    L->pp->exp[top++] = m->body[++i];
+                }
+                i++;
+            } while (i < m->body_len && m->body[i] != quote);
+            continue;
+        }
+        if (is_id0(c)) {
+            size_t n = 0;
+            while (i + n < m->body_len && is_id(m->body[i + n])) {
+                n++;
+            }
+            int pi = -1;
+            for (int k = 0; k < m->nparams; k++) {
+                size_t plen = 0;
+                while (m->params[k][plen] != '\0') {
+                    plen++;
+                }
+                if (plen == n && same_n(m->params[k], m->body + i, n)) {
+                    pi = k;
+                    break;
+                }
+            }
+            const char  *from = (pi >= 0) ? args[pi] : m->body + i;
+            const size_t flen = (pi >= 0) ? arglen[pi] : n;
+            if (top + flen + 2 >= EXP_CAP) {
+                lex_fail(L, "macro expansion too long");
+                return;
+            }
+            /*
+             * An argument is wrapped: `SQ(a + 1)` has to square the sum, not
+             * add 1 to the square, and the same for the expansion as a whole.
+             */
+            if (pi >= 0) {
+                L->pp->exp[top++] = '(';
+            }
+            const size_t astart = top;
+            for (size_t k = 0; k < flen; k++) {
+                L->pp->exp[top++] = from[k];
+            }
+            if (pi >= 0) {
+                L->pp->exp[top++] = ')';
+                if (nargr < MAX_MPARAMS) {
+                    argr[nargr][0] = (uint16_t)(astart - mark);
+                    argr[nargr][1] = (uint16_t)(top - mark);
+                    nargr++;
+                }
+            }
+            i += n;
+            continue;
+        }
+        if (top + 1 >= EXP_CAP) {
+            lex_fail(L, "macro expansion too long");
+            return;
+        }
+        L->pp->exp[top++] = c;
+        i++;
+    }
+    L->exp_top = top;
+    pp_push(L, L->pp->exp + mark, top - mark, mi, mark);
+    if (L->err) {
+        return;
+    }
+    frame_t *f = &L->pp->frames[L->nframes - 1];
+    f->nargr = nargr;
+    for (int k = 0; k < nargr; k++) {
+        f->argr[k][0] = argr[k][0];
+        f->argr[k][1] = argr[k][1];
+    }
+}
+
+/*
+ * An identifier that names a macro reads from the macro instead.  A macro with
+ * parameters only does so when a '(' follows it, as C says - the name on its
+ * own is then just a name.
+ */
+static int pp_expand(lex_t *L)
+{
+    const int mi = pp_find(L, L->text);
+    if (mi < 0 || pp_active(L, mi)) {
+        return 0;
+    }
+    const macro_t *m = &L->pp->macros[mi];
+    if (m->nparams < 0) {
+        pp_push(L, m->body, m->body_len, mi, L->exp_top);
+        return 1;
+    }
+    size_t at = L->pos;
+    while (at < L->len && (L->src[at] == ' ' || L->src[at] == '\t' ||
+                           L->src[at] == '\n' || L->src[at] == '\r')) {
+        at++;
+    }
+    if (at >= L->len || L->src[at] != '(') {
+        return 0;
+    }
+    L->pos = at;
+    pp_expand_args(L, mi);
+    return 1;
+}
+
 static void lex_next(lex_t *L)
 {
     if (L->err) {
@@ -256,7 +991,19 @@ static void lex_next(lex_t *L)
     if (L->err) {
         return;
     }
+    /* The end of a macro body or of an included file is not the end of input. */
+    while (L->pos >= L->len && L->nframes > 0) {
+        pp_pop(L);
+        lex_skip(L);
+        if (L->err) {
+            return;
+        }
+    }
     if (L->pos >= L->len) {
+        if (L->cond_depth != 0) {
+            lex_fail(L, "unterminated #ifdef");
+            return;
+        }
         L->tok = T_EOF;
         return;
     }
@@ -271,6 +1018,10 @@ static void lex_next(lex_t *L)
             L->pos++;
         }
         L->text[n] = '\0';
+        if (L->pp != NULL && kw(L->text) == T_IDENT && pp_expand(L)) {
+            lex_next(L);
+            return;
+        }
         L->tok = kw(L->text);
         return;
     }
@@ -299,16 +1050,7 @@ static void lex_next(lex_t *L)
                     lex_fail(L, "unterminated string");
                     return;
                 }
-                const char e = L->src[L->pos++];
-                if (e == 'n') {
-                    ch = '\n';
-                } else if (e == 't') {
-                    ch = '\t';
-                } else if (e == '\\' || e == '"') {
-                    ch = e;
-                } else {
-                    ch = e;
-                }
+                ch = lex_escape(L->src[L->pos++]);
             }
             if (n + 1 >= sizeof(L->strbuf)) {
                 lex_fail(L, "string too long");
@@ -323,6 +1065,33 @@ static void lex_next(lex_t *L)
         L->pos++;
         L->strbuf[n] = '\0';
         L->tok = T_STRING;
+        return;
+    }
+    /*
+     * A character constant is a number, not a type of its own: the value domain
+     * of this language is the 32-bit int, and 'A' is 65 the moment it is read.
+     */
+    if (c == '\'') {
+        L->pos++;
+        if (L->pos >= L->len) {
+            lex_fail(L, "unterminated character constant");
+            return;
+        }
+        char ch = L->src[L->pos++];
+        if (ch == '\\') {
+            if (L->pos >= L->len) {
+                lex_fail(L, "unterminated character constant");
+                return;
+            }
+            ch = lex_escape(L->src[L->pos++]);
+        }
+        if (L->pos >= L->len || L->src[L->pos] != '\'') {
+            lex_fail(L, "unterminated character constant");
+            return;
+        }
+        L->pos++;
+        L->num = (int32_t)(uint8_t)ch;
+        L->tok = T_NUM;
         return;
     }
 
@@ -356,7 +1125,15 @@ static void lex_next(lex_t *L)
         L->tok = T_PLUS;
         break;
     case '-':
-        L->tok = T_MINUS;
+        if (L->pos < L->len && L->src[L->pos] == '>') {
+            L->pos++;
+            L->tok = T_ARROW;
+        } else {
+            L->tok = T_MINUS;
+        }
+        break;
+    case '.':
+        L->tok = T_DOT;
         break;
     case '*':
         L->tok = T_STAR;
@@ -387,6 +1164,9 @@ static void lex_next(lex_t *L)
         if (L->pos < L->len && L->src[L->pos] == '=') {
             L->pos++;
             L->tok = T_LE;
+        } else if (L->pos < L->len && L->src[L->pos] == '<') {
+            L->pos++;
+            L->tok = T_SHL;
         } else {
             L->tok = T_LT;
         }
@@ -395,6 +1175,9 @@ static void lex_next(lex_t *L)
         if (L->pos < L->len && L->src[L->pos] == '=') {
             L->pos++;
             L->tok = T_GE;
+        } else if (L->pos < L->len && L->src[L->pos] == '>') {
+            L->pos++;
+            L->tok = T_SHR;
         } else {
             L->tok = T_GT;
         }
@@ -404,7 +1187,7 @@ static void lex_next(lex_t *L)
             L->pos++;
             L->tok = T_ANDAND;
         } else {
-            lex_fail(L, "bitwise & not supported");
+            L->tok = T_AMP;
         }
         break;
     case '|':
@@ -412,8 +1195,14 @@ static void lex_next(lex_t *L)
             L->pos++;
             L->tok = T_OROR;
         } else {
-            lex_fail(L, "bitwise | not supported");
+            L->tok = T_PIPE;
         }
+        break;
+    case '^':
+        L->tok = T_CARET;
+        break;
+    case '~':
+        L->tok = T_TILDE;
         break;
     default:
         lex_fail(L, "unexpected character");
@@ -421,14 +1210,91 @@ static void lex_next(lex_t *L)
     }
 }
 
+/*
+ * One token of lookahead past the current one.  The lexer holds no state that
+ * is not in the struct, so a peek is a copy, a step and a copy back - which is
+ * what tells `a` in `x * a` apart from `a` in `x * a[i]` without a second
+ * parser pass.
+ */
+static tok_t peek_tok(lex_t *L)
+{
+    const lex_t save = *L;
+    lex_next(L);
+    const tok_t t = L->tok;
+    *L = save;
+    return t;
+}
+
 /* ---- codegen ----------------------------------------------------------- */
 
+/*
+ * A type here is a shape, the size of one element, and which struct that
+ * element is (or none).  Values live in registers as 32-bit words and nothing
+ * else, so this is not a type system for expressions: it exists to answer three
+ * questions at the point of a load, a store or an index - how many bytes does
+ * this touch, what does an index step by, and does this name have fields.
+ *
+ * PK_PTR keeps the *pointee* in esize/sidx; the pointer itself is a word.
+ * PK_ARRAY and PK_STRUCT are addresses when used as values, which is why an
+ * array name and a `&v` are the same kind of thing to everything downstream.
+ */
+enum { PK_SCALAR = 0, PK_PTR, PK_ARRAY, PK_STRUCT };
+
 typedef struct {
-    char name[MAX_NAME];
-    int  off;
-    int  nwords;
-    int  is_array;
+    int kind;
+    int esize;
+    int sidx;
+} ptype_t;
+
+typedef struct {
+    char    name[MAX_NAME];
+    int     off;
+    int     nwords;
+    ptype_t t;
 } sym_t;
+
+/* A field is a symbol at an offset inside its struct. */
+typedef struct {
+    char    name[MAX_NAME];
+    int     off;
+    ptype_t t;
+} field_t;
+
+typedef struct {
+    char    name[MAX_NAME];
+    int     size;
+    int     nfields;
+    field_t fields[MAX_FIELDS];
+} struct_t;
+
+static ptype_t ty_scalar(int esize)
+{
+    ptype_t t = {PK_SCALAR, esize, -1};
+    return t;
+}
+
+/* What one element of an array, or the target of a pointer, is. */
+static ptype_t ty_elem(const ptype_t *t)
+{
+    ptype_t e = {PK_SCALAR, t->esize, t->sidx};
+    if (t->sidx >= 0) {
+        e.kind = PK_STRUCT;
+    }
+    return e;
+}
+
+/* How much memory the place itself takes: a pointer is a word. */
+static int ty_store(const ptype_t *t)
+{
+    return (t->kind == PK_PTR) ? 4 : t->esize;
+}
+
+
+/* Whether the value of this place is its address rather than its contents. */
+static int ty_is_addr(const ptype_t *t)
+{
+    return t->kind == PK_ARRAY || t->kind == PK_STRUCT;
+}
 
 typedef struct {
     char   name[MAX_NAME];
@@ -453,6 +1319,9 @@ typedef struct {
     int      local_words;
     int      nglobals;
     sym_t    globals[MAX_GLOBALS];
+    int      nstructs;
+    struct_t structs[MAX_STRUCTS];
+    pp_t     pp;
     int      data_next;
     uint8_t  data[DATA_CAP];
     int      nfuncs;
@@ -462,7 +1331,7 @@ typedef struct {
     int      nrelocs;
     int      needs_gfx;
     int      needs_audio;
-    int      spill_base;
+    int      min_abi;
     int      spill_top;
     int      err;
     char     errmsg[160];
@@ -475,6 +1344,17 @@ static void gfail(gen_t *g, const char *msg)
     }
     g->err = 1;
     cpy_err(g->errmsg, sizeof(g->errmsg), msg);
+}
+
+/*
+ * The size of one element.  For a struct it is read from the table rather than
+ * from the type, because `struct node *next;` inside `struct node` is written
+ * while that size is still unknown - and a stale zero there would scale every
+ * step through such a list to nothing.
+ */
+static int ty_size(const gen_t *g, const ptype_t *t)
+{
+    return (t->sidx >= 0) ? g->structs[t->sidx].size : t->esize;
 }
 
 static void emit_raw(gen_t *g, const uint8_t *b, size_t n)
@@ -506,6 +1386,23 @@ static void emit_entry(gen_t *g, int framesize)
 {
     const int imm = framesize / 8;
     emit3(g, 0x36, (uint8_t)(((imm & 0xf) << 4) | 1), (uint8_t)(imm >> 4));
+}
+
+/*
+ * How much stack a function needs is only known once its body has been read,
+ * and ENTRY stands at the top of it - so it is emitted with the largest frame
+ * and rewritten with the real one.  Sizing every frame at the maximum instead
+ * would cost each call the deepest function's stack.
+ */
+static void patch_entry(gen_t *g, size_t site, int framesize)
+{
+    if (site + 2 >= g->len || g->code[site] != 0x36) {
+        gfail(g, "bad entry site");
+        return;
+    }
+    const int imm = framesize / 8;
+    g->code[site + 1] = (uint8_t)(((imm & 0xf) << 4) | 1);
+    g->code[site + 2] = (uint8_t)(imm >> 4);
 }
 
 static void emit_retw_n(gen_t *g)
@@ -620,6 +1517,79 @@ static void emit_quos(gen_t *g, int ar, int as, int at)
 static void emit_rems(gen_t *g, int ar, int as, int at)
 {
     emit_rrr(g, 0xf2, ar, as, at);
+}
+
+static void emit_and(gen_t *g, int ar, int as, int at)
+{
+    emit_rrr(g, 0x10, ar, as, at);
+}
+
+static void emit_or(gen_t *g, int ar, int as, int at)
+{
+    emit_rrr(g, 0x20, ar, as, at);
+}
+
+static void emit_xor(gen_t *g, int ar, int as, int at)
+{
+    emit_rrr(g, 0x30, ar, as, at);
+}
+
+/*
+ * Shifts by a register go through SAR: SSL/SSR set it, SLL/SRA use it.  SLL
+ * takes its operand in the s field and SRA in the t field - an asymmetry of the
+ * ISA, not of this compiler.
+ */
+static void emit_ssl(gen_t *g, int as)
+{
+    emit3(g, 0x00, (uint8_t)(0x10 | as), 0x40);
+}
+
+static void emit_ssr(gen_t *g, int as)
+{
+    emit3(g, 0x00, (uint8_t)as, 0x40);
+}
+
+static void emit_sll(gen_t *g, int ar, int as)
+{
+    emit3(g, 0x00, (uint8_t)((ar << 4) | as), 0xa1);
+}
+
+static void emit_sra(gen_t *g, int ar, int at)
+{
+    emit3(g, (uint8_t)(at << 4), (uint8_t)(ar << 4), 0xb1);
+}
+
+/* SLLI encodes 32 - sa, which is why a shift by 0 has no encoding at all. */
+static void emit_slli(gen_t *g, int ar, int as, int sa)
+{
+    const int inv = 32 - sa;
+    emit3(g, (uint8_t)((inv & 0xf) << 4), (uint8_t)((ar << 4) | as),
+          (uint8_t)(((inv >> 4) << 4) | 0x1));
+}
+
+static void emit_srai(gen_t *g, int ar, int at, int sa)
+{
+    emit3(g, (uint8_t)(at << 4), (uint8_t)((ar << 4) | (sa & 0xf)),
+          (uint8_t)(((0x2 | (sa >> 4)) << 4) | 0x1));
+}
+
+static void emit_l8ui(gen_t *g, int at, int as, int off)
+{
+    if (off < 0 || off > 255) {
+        gfail(g, "bad load offset");
+        return;
+    }
+    emit3(g, (uint8_t)((at << 4) | 0x2), (uint8_t)as, (uint8_t)off);
+}
+
+static void emit_s8i(gen_t *g, int at, int as, int off)
+{
+    if (off < 0 || off > 255) {
+        gfail(g, "bad store offset");
+        return;
+    }
+    emit3(g, (uint8_t)((at << 4) | 0x2), (uint8_t)((0x4 << 4) | as),
+          (uint8_t)off);
 }
 
 static void emit_l32i(gen_t *g, int at, int as, int off)
@@ -753,45 +1723,54 @@ static int find_func(gen_t *g, const char *name)
     return -1;
 }
 
-static int add_local_n(gen_t *g, const char *name, int nwords, int is_array)
+/*
+ * How much memory a declaration takes: a pointer is a word whatever it points
+ * at, an array is its elements, everything else is itself.
+ */
+static int sym_bytes(const gen_t *g, const ptype_t *t, int nelem)
+{
+    if (t->kind == PK_PTR) {
+        return 4;
+    }
+    const int size = ty_size(g, t);
+    return (t->kind == PK_ARRAY) ? nelem * size : size;
+}
+
+static int add_local_t(gen_t *g, const char *name, const ptype_t *t, int nelem)
 {
     if (find_local(g, name) >= 0) {
         gfail(g, "duplicate local");
         return -1;
     }
-    if (nwords <= 0) {
+    if (nelem <= 0 || ty_size(g, t) <= 0) {
         gfail(g, "bad array size");
         return -1;
     }
+    const int nwords = (sym_bytes(g, t, nelem) + 3) / 4;
     if (g->nlocals >= MAX_LOCALS) {
         gfail(g, "too many locals");
         return -1;
     }
-    if (g->local_words + nwords > MAX_LOCALS) {
+    if (g->local_words + nwords > MAX_LOCAL_WORDS) {
         gfail(g, "too many local slots");
         return -1;
     }
     const int i = g->nlocals++;
     cpy_err(g->locals[i].name, MAX_NAME, name);
-    g->locals[i].off = g->local_words * 4;
+    g->locals[i].off = SPILL_BYTES + g->local_words * 4;
     g->locals[i].nwords = nwords;
-    g->locals[i].is_array = is_array;
+    g->locals[i].t = *t;
     g->local_words += nwords;
     return i;
 }
 
-static int add_local(gen_t *g, const char *name)
-{
-    return add_local_n(g, name, 1, 0);
-}
-
-static int add_global_n(gen_t *g, const char *name, int nwords, int is_array)
+static int add_global_t(gen_t *g, const char *name, const ptype_t *t, int nelem)
 {
     if (find_global(g, name) >= 0 || find_func(g, name) >= 0) {
         gfail(g, "duplicate global");
         return -1;
     }
-    if (nwords <= 0) {
+    if (nelem <= 0 || ty_size(g, t) <= 0) {
         gfail(g, "bad array size");
         return -1;
     }
@@ -799,7 +1778,13 @@ static int add_global_n(gen_t *g, const char *name, int nwords, int is_array)
         gfail(g, "too many globals");
         return -1;
     }
-    const int bytes = nwords * 4;
+    /*
+     * Every global starts on a word even when it is a char array: word loads
+     * must stay aligned, and globals are all declared before the first string
+     * literal is placed, so nothing packed follows them into the same word.
+     */
+    g->data_next = (g->data_next + 3) & ~3;
+    const int bytes = sym_bytes(g, t, nelem);
     if (g->data_next + bytes > (int)DATA_CAP) {
         gfail(g, "data too large");
         return -1;
@@ -807,10 +1792,30 @@ static int add_global_n(gen_t *g, const char *name, int nwords, int is_array)
     const int i = g->nglobals++;
     cpy_err(g->globals[i].name, MAX_NAME, name);
     g->globals[i].off = g->data_next;
-    g->globals[i].nwords = nwords;
-    g->globals[i].is_array = is_array;
+    g->globals[i].nwords = (bytes + 3) / 4;
+    g->globals[i].t = *t;
     g->data_next += bytes;
     return i;
+}
+
+static int find_struct(gen_t *g, const char *name)
+{
+    for (int i = 0; i < g->nstructs; i++) {
+        if (CC_STRCMP(g->structs[i].name, name) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static int find_field(const struct_t *s, const char *name)
+{
+    for (int i = 0; i < s->nfields; i++) {
+        if (CC_STRCMP(s->fields[i].name, name) == 0) {
+            return i;
+        }
+    }
+    return -1;
 }
 
 static int add_string(gen_t *g, const char *s)
@@ -845,7 +1850,7 @@ static void push_a8(gen_t *g)
         gfail(g, "expression too deep");
         return;
     }
-    emit_s32i(g, 8, 7, g->spill_base + g->spill_top * 4);
+    emit_s32i(g, 8, 7, g->spill_top * 4);
     g->spill_top++;
 }
 
@@ -856,7 +1861,7 @@ static void pop_a9(gen_t *g)
         return;
     }
     g->spill_top--;
-    emit_l32i(g, 9, 7, g->spill_base + g->spill_top * 4);
+    emit_l32i(g, 9, 7, g->spill_top * 4);
 }
 
 static void emit_bool_not_a8(gen_t *g)
@@ -879,74 +1884,263 @@ static void emit_load_api_fn(gen_t *g, int at, int api_off, int fn_off)
     emit_l32i(g, at, at, fn_off);
 }
 
-static void emit_base_local(gen_t *g, int li)
+/* The size of one access to this variable; a pointer is read as a word. */
+static int sym_access_size(const sym_t *s)
 {
-    emit_mov_n(g, 8, 7);
-    if (g->locals[li].off != 0) {
-        emit_movi(g, 9, g->locals[li].off);
-        emit_add_n(g, 8, 8, 9);
+    return ty_store(&s->t);
+}
+
+/*
+ * [as + off] -> at, a byte or a word.  A byte offset only reaches 255, far less
+ * than a frame is deep, so past that the address is computed - in `at` itself,
+ * which is why it must not be the base register.
+ */
+static void emit_load_sized(gen_t *g, int at, int as, int off, int esize)
+{
+    if (esize != 1) {
+        emit_l32i(g, at, as, off);
+        return;
     }
+    if (off <= 255) {
+        emit_l8ui(g, at, as, off);
+        return;
+    }
+    emit_movi(g, at, off);
+    emit_add_n(g, at, at, as);
+    emit_l8ui(g, at, at, 0);
 }
 
-static void emit_base_global(gen_t *g, int gi)
+static void emit_store_sized(gen_t *g, int at, int as, int off, int esize,
+                             int scratch)
 {
-    emit_li_data(g, 8, (uint32_t)g->globals[gi].off);
+    if (esize != 1) {
+        emit_s32i(g, at, as, off);
+        return;
+    }
+    if (off <= 255) {
+        emit_s8i(g, at, as, off);
+        return;
+    }
+    emit_movi(g, scratch, off);
+    emit_add_n(g, scratch, scratch, as);
+    emit_s8i(g, at, scratch, 0);
 }
 
-static void emit_index_addr(gen_t *g, int is_global, int idx)
+/*
+ * An index times the element size.  Two adds beat movi + mull for a word, a
+ * shift wins as soon as the element is bigger, and a struct of an awkward size
+ * is the only case that has to multiply.  a11 is the scratch: an address is
+ * always computed before the value that will be stored into it, so nothing of
+ * the caller's is living there yet.
+ */
+static void emit_scale(gen_t *g, int reg, int size)
 {
-    push_a8(g);
-    if (is_global) {
-        emit_base_global(g, idx);
+    if (size <= 1) {
+        return;
+    }
+    if (size == 2) {
+        emit_add_n(g, reg, reg, reg);
+        return;
+    }
+    if (size == 4) {
+        emit_add_n(g, reg, reg, reg);
+        emit_add_n(g, reg, reg, reg);
+        return;
+    }
+    int sh = 0;
+    int v = size;
+    while ((v & 1) == 0) {
+        v >>= 1;
+        sh++;
+    }
+    if (v == 1 && sh <= 31) {
+        emit_slli(g, reg, reg, sh);
+        return;
+    }
+    emit_movi(g, 11, size);
+    emit_mull(g, reg, reg, 11);
+}
+
+/*
+ * A place is where a name leads: a base - a symbol, or an address already in
+ * a8 - plus a constant byte offset, plus what is found there.  Keeping that
+ * offset constant for as long as possible is the point: it rides into the
+ * immediate of the final load or store, so `p->x` is one instruction and
+ * `v.a.b` costs nothing at all beyond reaching `v`.
+ */
+typedef struct {
+    int     mat; /* the base address is in a8 */
+    int     li;
+    int     gi;
+    int     off;
+    ptype_t t;
+} place_t;
+
+static int off_fits(int size, int off)
+{
+    if (off < 0) {
+        return 0;
+    }
+    if (size == 1) {
+        return off <= 255;
+    }
+    return (off & 3) == 0 && off <= 1020;
+}
+
+/* The address of the place, in a8, with no offset left pending. */
+static void place_addr(gen_t *g, place_t *pl)
+{
+    if (pl->mat) {
+        if (pl->off != 0) {
+            emit_movi(g, 9, pl->off);
+            emit_add_n(g, 8, 8, 9);
+            pl->off = 0;
+        }
+        return;
+    }
+    if (pl->li >= 0) {
+        const int off = g->locals[pl->li].off + pl->off;
+        if (off == 0) {
+            emit_mov_n(g, 8, 7);
+        } else {
+            emit_movi(g, 8, off);
+            emit_add_n(g, 8, 8, 7);
+        }
     } else {
-        emit_base_local(g, idx);
+        emit_li_data(g, 8, (uint32_t)(g->globals[pl->gi].off + pl->off));
     }
-    pop_a9(g);
-    emit_movi(g, 10, 4);
-    emit_mull(g, 9, 9, 10);
-    emit_add_n(g, 8, 8, 9);
+    pl->mat = 1;
+    pl->li = -1;
+    pl->gi = -1;
+    pl->off = 0;
+}
+
+static void place_load(gen_t *g, place_t *pl, int at)
+{
+    const int size = ty_store(&pl->t);
+    if (ty_is_addr(&pl->t)) {
+        gfail(g, "not a value");
+        return;
+    }
+    if (!pl->mat) {
+        if (pl->li >= 0) {
+            emit_load_sized(g, at, 7, g->locals[pl->li].off + pl->off, size);
+        } else {
+            emit_li_data(g, at, (uint32_t)(g->globals[pl->gi].off + pl->off));
+            emit_load_sized(g, at, at, 0, size);
+        }
+        return;
+    }
+    if (!off_fits(size, pl->off)) {
+        place_addr(g, pl);
+    }
+    emit_load_sized(g, at, 8, pl->off, size);
+}
+
+static void place_store(gen_t *g, place_t *pl, int val, int scratch)
+{
+    const int size = ty_store(&pl->t);
+    if (ty_is_addr(&pl->t)) {
+        gfail(g, "cannot assign a whole array or struct");
+        return;
+    }
+    if (!pl->mat) {
+        if (pl->li >= 0) {
+            emit_store_sized(g, val, 7, g->locals[pl->li].off + pl->off, size,
+                             scratch);
+        } else {
+            emit_li_data(g, scratch, (uint32_t)(g->globals[pl->gi].off +
+                                                pl->off));
+            emit_store_sized(g, val, scratch, 0, size, scratch);
+        }
+        return;
+    }
+    if (!off_fits(size, pl->off)) {
+        place_addr(g, pl);
+    }
+    emit_store_sized(g, val, 8, pl->off, size, scratch);
 }
 
 /* ---- builtins ---------------------------------------------------------- */
 
 typedef struct {
     const char *name;
-    int         nargs;
+    int         nargs;    /* -1: 1..MAX_PARAMS arguments, counted at the call */
     int         api_off;
     int         fn_off;
-    int         is_gfx;
-    int         is_audio;
     int         ret_mode; /* RET_VOID / RET_BOOL / RET_RAW */
     int         null_arg; /* call with a10=0 and no parsed args */
+    int         min_abi;
+    const char *fmt;      /* format the compiler supplies itself, or NULL */
 } builtin_t;
 
 static const builtin_t BUILTINS[] = {
-    {"ag_delay", 1, API_OFF_TIME, TIME_OFF_DELAY_MS, 0, 0, RET_VOID, 0},
-    {"ag_key", 1, API_OFF_INP, INP_OFF_KEY_PRESSED, 0, 0, RET_BOOL, 0},
+    {"ag_delay", 1, API_OFF_TIME, TIME_OFF_DELAY_MS, RET_VOID, 0, ABI_MINOR_BASE, NULL},
+    /* us() is uint64 in the ABI; windowed return puts the low 32 bits in a2. */
+    {"ag_micros", 0, API_OFF_TIME, TIME_OFF_US, RET_RAW, 0, ABI_MINOR_BASE, NULL},
+    {"ag_millis", 0, API_OFF_TIME, TIME_OFF_MS, RET_RAW, 0, ABI_MINOR_BASE, NULL},
+    {"ag_key", 1, API_OFF_INP, INP_OFF_KEY_PRESSED, RET_BOOL, 0, ABI_MINOR_BASE, NULL},
     /* ag_btn: level state via HostFS PADPUSH (same path as SMS). ids 0..7 */
-    {"ag_btn", 1, API_OFF_INP, INP_OFF_BTN, 0, 0, RET_BOOL, 0},
-    {"ag_gfx_acquire", 0, API_OFF_GFX, GFX_OFF_ACQUIRE, 1, 0, RET_VOID, 1},
-    {"ag_gfx_release", 0, API_OFF_GFX, GFX_OFF_RELEASE, 1, 0, RET_VOID, 0},
-    {"ag_gfx_clear", 1, API_OFF_GFX, GFX_OFF_CLEAR, 1, 0, RET_VOID, 0},
-    {"ag_gfx_flush", 4, API_OFF_GFX, GFX_OFF_FLUSH, 1, 0, RET_VOID, 0},
-    {"ag_gfx_swap", 0, API_OFF_GFX, GFX_OFF_SWAP, 1, 0, RET_VOID, 0},
-    {"ag_gfx_fill_rect", 5, API_OFF_GFX, GFX_OFF_FILL_RECT, 1, 0, RET_VOID, 0},
-    {"ag_gfx_text", 5, API_OFF_GFX, GFX_OFF_TEXT, 1, 0, RET_VOID, 0},
-    {"ag_gfx_pixel", 3, API_OFF_GFX, GFX_OFF_PIXEL, 1, 0, RET_VOID, 0},
-    {"ag_gfx_line", 5, API_OFF_GFX, GFX_OFF_LINE, 1, 0, RET_VOID, 0},
-    {"ag_gfx_circle", 4, API_OFF_GFX, GFX_OFF_CIRCLE, 1, 0, RET_VOID, 0},
-    {"ag_gfx_fill_circle", 4, API_OFF_GFX, GFX_OFF_FILL_CIRCLE, 1, 0, RET_VOID, 0},
-    {"ag_gfx_poly_begin", 0, API_OFF_GFX, GFX_OFF_POLY_BEGIN, 1, 0, RET_VOID, 0},
-    {"ag_gfx_poly_vertex", 2, API_OFF_GFX, GFX_OFF_POLY_VERTEX, 1, 0, RET_VOID, 0},
-    {"ag_gfx_poly_fill", 1, API_OFF_GFX, GFX_OFF_POLY_FILL, 1, 0, RET_VOID, 0},
-    {"ag_gfx_poly_stroke", 1, API_OFF_GFX, GFX_OFF_POLY_STROKE, 1, 0, RET_VOID, 0},
+    {"ag_btn", 1, API_OFF_INP, INP_OFF_BTN, RET_BOOL, 0, ABI_MINOR_BTN, NULL},
+
+    /* Console text.  ag_printf is the kernel's own, reached with its arguments
+     * in the outgoing registers, which is what the windowed ABI asks of any
+     * caller of a variadic function. */
+    {"ag_print", 1, API_OFF_CON, CON_OFF_PUTS, RET_RAW, 0, ABI_MINOR_BASE, NULL},
+    {"ag_printf", -1, API_OFF_CON, CON_OFF_PRINTF, RET_RAW, 0, ABI_MINOR_BASE, NULL},
+    {"ag_print_int", 1, API_OFF_CON, CON_OFF_PRINTF, RET_RAW, 0, ABI_MINOR_BASE, "%d"},
+    {"ag_print_hex", 1, API_OFF_CON, CON_OFF_PRINTF, RET_RAW, 0, ABI_MINOR_BASE, "%08x"},
+    {"ag_cls", 0, API_OFF_CON, CON_OFF_CLS, RET_VOID, 0, ABI_MINOR_BASE, NULL},
+    {"ag_gotoxy", 2, API_OFF_CON, CON_OFF_GOTOXY, RET_VOID, 0, ABI_MINOR_BASE, NULL},
+
+    /* Pins, so that a board can be made to do something without a host GCC. */
+    {"ag_gpio_config", 2, API_OFF_IO, IO_OFF_GPIO_CONFIG, RET_RAW, 0, ABI_MINOR_BASE, NULL},
+    {"ag_gpio_write", 2, API_OFF_IO, IO_OFF_GPIO_WRITE, RET_VOID, 0, ABI_MINOR_BASE, NULL},
+    {"ag_gpio_read", 1, API_OFF_IO, IO_OFF_GPIO_READ, RET_RAW, 0, ABI_MINOR_BASE, NULL},
+    {"ag_adc_read", 1, API_OFF_IO, IO_OFF_ADC_READ, RET_RAW, 0, ABI_MINOR_BASE, NULL},
+
+    {"ag_gfx_acquire", 0, API_OFF_GFX, GFX_OFF_ACQUIRE, RET_VOID, 1, ABI_MINOR_GFX, NULL},
+    {"ag_gfx_release", 0, API_OFF_GFX, GFX_OFF_RELEASE, RET_VOID, 0, ABI_MINOR_GFX, NULL},
+    {"ag_gfx_clear", 1, API_OFF_GFX, GFX_OFF_CLEAR, RET_VOID, 0, ABI_MINOR_GFX, NULL},
+    {"ag_gfx_flush", 4, API_OFF_GFX, GFX_OFF_FLUSH, RET_VOID, 0, ABI_MINOR_GFX, NULL},
+    {"ag_gfx_swap", 0, API_OFF_GFX, GFX_OFF_SWAP, RET_VOID, 0, ABI_MINOR_GFX, NULL},
+    {"ag_gfx_fill_rect", 5, API_OFF_GFX, GFX_OFF_FILL_RECT, RET_VOID, 0, ABI_MINOR_GFX, NULL},
+    {"ag_gfx_text", 5, API_OFF_GFX, GFX_OFF_TEXT, RET_VOID, 0, ABI_MINOR_GFX, NULL},
+    {"ag_gfx_pixel", 3, API_OFF_GFX, GFX_OFF_PIXEL, RET_VOID, 0, ABI_MINOR_GFX, NULL},
+    {"ag_gfx_line", 5, API_OFF_GFX, GFX_OFF_LINE, RET_VOID, 0, ABI_MINOR_GFX, NULL},
+    {"ag_gfx_circle", 4, API_OFF_GFX, GFX_OFF_CIRCLE, RET_VOID, 0, ABI_MINOR_GFX, NULL},
+    {"ag_gfx_fill_circle", 4, API_OFF_GFX, GFX_OFF_FILL_CIRCLE, RET_VOID, 0, ABI_MINOR_GFX, NULL},
+    {"ag_gfx_poly_begin", 0, API_OFF_GFX, GFX_OFF_POLY_BEGIN, RET_VOID, 0, ABI_MINOR_GFX, NULL},
+    {"ag_gfx_poly_vertex", 2, API_OFF_GFX, GFX_OFF_POLY_VERTEX, RET_VOID, 0, ABI_MINOR_GFX, NULL},
+    {"ag_gfx_poly_fill", 1, API_OFF_GFX, GFX_OFF_POLY_FILL, RET_VOID, 0, ABI_MINOR_GFX, NULL},
+    {"ag_gfx_poly_stroke", 1, API_OFF_GFX, GFX_OFF_POLY_STROKE, RET_VOID, 0, ABI_MINOR_GFX, NULL},
+
     /* audio (ABI 0.14): open(NULL) default 22050 stereo s16 */
-    {"ag_audio_present", 0, API_OFF_AUDIO, AUDIO_OFF_PRESENT, 0, 1, RET_RAW, 0},
-    {"ag_audio_is_hw", 0, API_OFF_AUDIO, AUDIO_OFF_IS_HW, 0, 1, RET_RAW, 0},
-    {"ag_audio_open", 0, API_OFF_AUDIO, AUDIO_OFF_OPEN, 0, 1, RET_RAW, 1},
-    {"ag_audio_close", 0, API_OFF_AUDIO, AUDIO_OFF_CLOSE, 0, 1, RET_VOID, 0},
-    {"ag_audio_write", 2, API_OFF_AUDIO, AUDIO_OFF_WRITE, 0, 1, RET_RAW, 0},
-    {"ag_audio_space", 0, API_OFF_AUDIO, AUDIO_OFF_SPACE, 0, 1, RET_RAW, 0},
+    {"ag_audio_present", 0, API_OFF_AUDIO, AUDIO_OFF_PRESENT, RET_RAW, 0, ABI_MINOR_AUDIO, NULL},
+    {"ag_audio_is_hw", 0, API_OFF_AUDIO, AUDIO_OFF_IS_HW, RET_RAW, 0, ABI_MINOR_AUDIO, NULL},
+    {"ag_audio_open", 0, API_OFF_AUDIO, AUDIO_OFF_OPEN, RET_RAW, 1, ABI_MINOR_AUDIO, NULL},
+    {"ag_audio_close", 0, API_OFF_AUDIO, AUDIO_OFF_CLOSE, RET_VOID, 0, ABI_MINOR_AUDIO, NULL},
+    {"ag_audio_write", 2, API_OFF_AUDIO, AUDIO_OFF_WRITE, RET_RAW, 0, ABI_MINOR_AUDIO, NULL},
+    {"ag_audio_space", 0, API_OFF_AUDIO, AUDIO_OFF_SPACE, RET_RAW, 0, ABI_MINOR_AUDIO, NULL},
+
+    /* mem / fs / dev - phase D; seek is omitted (int64_t, Mini-C is 32-bit). */
+    {"ag_malloc", 1, API_OFF_MEM, MEM_OFF_ALLOC, RET_RAW, 0, ABI_MINOR_BASE, NULL},
+    {"ag_realloc", 2, API_OFF_MEM, MEM_OFF_REALLOC, RET_RAW, 0, ABI_MINOR_BASE, NULL},
+    {"ag_free", 1, API_OFF_MEM, MEM_OFF_FREE, RET_VOID, 0, ABI_MINOR_BASE, NULL},
+
+    {"ag_open", 2, API_OFF_FS, FS_OFF_OPEN, RET_RAW, 0, ABI_MINOR_BASE, NULL},
+    {"ag_close", 1, API_OFF_FS, FS_OFF_CLOSE, RET_RAW, 0, ABI_MINOR_BASE, NULL},
+    {"ag_read", 3, API_OFF_FS, FS_OFF_READ, RET_RAW, 0, ABI_MINOR_BASE, NULL},
+    {"ag_write", 3, API_OFF_FS, FS_OFF_WRITE, RET_RAW, 0, ABI_MINOR_BASE, NULL},
+    {"ag_opendir", 1, API_OFF_FS, FS_OFF_OPENDIR, RET_RAW, 0, ABI_MINOR_BASE, NULL},
+    {"ag_readdir", 2, API_OFF_FS, FS_OFF_READDIR, RET_RAW, 0, ABI_MINOR_BASE, NULL},
+    {"ag_closedir", 1, API_OFF_FS, FS_OFF_CLOSEDIR, RET_RAW, 0, ABI_MINOR_BASE, NULL},
+
+    {"ag_dev_open", 1, API_OFF_DEV, DEV_OFF_OPEN, RET_RAW, 0, ABI_MINOR_BASE, NULL},
+    {"ag_dev_close", 1, API_OFF_DEV, DEV_OFF_CLOSE, RET_RAW, 0, ABI_MINOR_BASE, NULL},
+    {"ag_dev_read", 3, API_OFF_DEV, DEV_OFF_READ, RET_RAW, 0, ABI_MINOR_BASE, NULL},
+    {"ag_dev_write", 3, API_OFF_DEV, DEV_OFF_WRITE, RET_RAW, 0, ABI_MINOR_BASE, NULL},
+    {"ag_dev_ioctl", 4, API_OFF_DEV, DEV_OFF_IOCTL, RET_RAW, 0, ABI_MINOR_BASE, NULL},
 };
 
 static const builtin_t *find_builtin(const char *name)
@@ -961,14 +2155,36 @@ static const builtin_t *find_builtin(const char *name)
 
 /* ---- parser ------------------------------------------------------------ */
 
+/*
+ * `pesize`/`psidx` are the whole of the type system for expressions: the size
+ * of what the value now in a8 points at, and which struct that is - or 0 and -1
+ * when the value is a plain int.  Whatever produced the value sets them; `*`,
+ * `[]`, `->` and pointer arithmetic consult them; every operator that yields a
+ * number rather than an address clears them.  That is enough for `char *s` to
+ * walk a string a byte at a time and for `struct v *p` to step by its size,
+ * without carrying a type on every node of a tree this compiler never builds.
+ */
 typedef struct {
     lex_t *L;
     gen_t *g;
+    int    pesize;
+    int    psidx;
 } par_t;
+
+/* A declared type: what one element is, and whether the name is a pointer. */
+typedef struct {
+    int esize;
+    int sidx;
+    int is_ptr;
+} type_t;
 
 static void pfail(par_t *p, const char *msg)
 {
-    gfail(p->g, msg);
+    if (p->g->err) {
+        return;
+    }
+    p->g->err = 1;
+    cpy_err_at(p->g->errmsg, sizeof(p->g->errmsg), msg, p->L);
 }
 
 static int accept(par_t *p, tok_t t)
@@ -985,6 +2201,72 @@ static void expect(par_t *p, tok_t t, const char *msg)
     if (!accept(p, t)) {
         pfail(p, msg);
     }
+}
+
+static int32_t const_expr_from(lex_t *L);
+
+/*
+ * How many elements `[...]` asks for.  It is a constant expression and not just
+ * a number because a macro is not a number: with `#define W 320`, `int b[W * 4]`
+ * is the ordinary way to write it, and refusing that would make the two
+ * features useless together.
+ */
+static int parse_array_size(par_t *p)
+{
+    const int32_t n = const_expr_from(p->L);
+    if (p->L->err) {
+        pfail(p, "expected array size");
+        return -1;
+    }
+    if (n <= 0 || n > MAX_ARRAY) {
+        pfail(p, "expected array size");
+        return -1;
+    }
+    return (int)n;
+}
+
+static int accept_type(par_t *p, type_t *ty)
+{
+    ty->sidx = -1;
+    if (accept(p, T_INT)) {
+        ty->esize = 4;
+    } else if (accept(p, T_CHAR)) {
+        ty->esize = 1;
+    } else if (p->L->tok == T_STRUCT) {
+        lex_next(p->L);
+        if (p->L->tok != T_IDENT) {
+            pfail(p, "expected a struct name");
+            return 0;
+        }
+        const int si = find_struct(p->g, p->L->text);
+        if (si < 0) {
+            pfail(p, "unknown struct");
+            return 0;
+        }
+        lex_next(p->L);
+        ty->sidx = si;
+        ty->esize = p->g->structs[si].size;
+    } else {
+        return 0;
+    }
+    ty->is_ptr = accept(p, T_STAR) ? 1 : 0;
+    return 1;
+}
+
+/* The declared type as a place type, once the shape of the name is known. */
+static ptype_t ty_of(const type_t *ty, int is_array)
+{
+    ptype_t t;
+    t.esize = ty->esize;
+    t.sidx = ty->sidx;
+    if (ty->is_ptr) {
+        t.kind = PK_PTR;
+    } else if (is_array) {
+        t.kind = PK_ARRAY;
+    } else {
+        t.kind = (ty->sidx >= 0) ? PK_STRUCT : PK_SCALAR;
+    }
+    return t;
 }
 
 static void parse_expr(par_t *p);
@@ -1013,6 +2295,39 @@ static void parse_call_args_to_regs(par_t *p, int nargs)
     }
 }
 
+/*
+ * The same, for a call whose arity the source decides - a printf.  Every
+ * argument is spilled, because the count is only known at the closing paren
+ * and the last one cannot be left in a8 without knowing which register it
+ * belongs in.
+ */
+static int parse_call_args_var(par_t *p, int maxargs)
+{
+    int n = 0;
+    expect(p, T_LPAREN, "expected '('");
+    if (accept(p, T_RPAREN)) {
+        return 0;
+    }
+    for (;;) {
+        parse_expr(p);
+        if (n >= maxargs) {
+            pfail(p, "too many arguments");
+            return n;
+        }
+        push_a8(p->g);
+        n++;
+        if (!accept(p, T_COMMA)) {
+            break;
+        }
+    }
+    expect(p, T_RPAREN, "expected ')'");
+    for (int i = n - 1; i >= 0; i--) {
+        pop_a9(p->g);
+        emit_mov_n(p->g, 10 + i, 9);
+    }
+    return n;
+}
+
 static void emit_user_call(par_t *p, int fi)
 {
     const func_t *fn = &p->g->funcs[fi];
@@ -1028,16 +2343,32 @@ static void emit_user_call(par_t *p, int fi)
 
 static void emit_builtin_call(par_t *p, const builtin_t *b)
 {
-    if (b->is_gfx) {
+    if (b->api_off == API_OFF_GFX) {
         p->g->needs_gfx = 1;
     }
-    if (b->is_audio) {
+    if (b->api_off == API_OFF_AUDIO) {
         p->g->needs_audio = 1;
+    }
+    if (b->min_abi > p->g->min_abi) {
+        p->g->min_abi = b->min_abi;
     }
     if (b->null_arg) {
         expect(p, T_LPAREN, "expected '('");
         expect(p, T_RPAREN, "expected ')'");
         emit_movi(p->g, 10, 0);
+    } else if (b->fmt != NULL) {
+        parse_call_args_to_regs(p, 1);
+        emit_mov_n(p->g, 11, 10);
+        const int off = add_string(p->g, b->fmt);
+        if (off < 0) {
+            return;
+        }
+        emit_li_data(p->g, 10, (uint32_t)off);
+    } else if (b->nargs < 0) {
+        if (parse_call_args_var(p, MAX_PARAMS) < 1) {
+            pfail(p, "expected a format string");
+            return;
+        }
     } else {
         parse_call_args_to_regs(p, b->nargs);
     }
@@ -1074,11 +2405,269 @@ static void parse_call_by_name(par_t *p, const char *name)
     emit_user_call(p, fi);
 }
 
+/*
+ * Precedence levels of the operand a binary operator expects on its right:
+ * 0 unary, 1 product, 2 sum, 3 shift, 4 comparison, 5 equality, 6 bit-and,
+ * 7 bit-xor.  A shortcut may only take the operand if nothing that follows it
+ * binds tighter - `a + b / 2` must not hand `b` to the addition and leave the
+ * division behind.
+ */
+static int binds_tighter(tok_t t, int level)
+{
+    /*
+     * Postfix binds tighter than every operator, at every level: a name with
+     * `[`, `.` or `->` after it is a place, and handing the bare name to the
+     * operator would leave the rest of the designator for the next parser to
+     * trip on.
+     */
+    if (t == T_LPAREN || t == T_LBRACK || t == T_DOT || t == T_ARROW) {
+        return 1;
+    }
+    if (level >= 1 && (t == T_STAR || t == T_SLASH || t == T_PERCENT)) {
+        return 1;
+    }
+    if (level >= 2 && (t == T_PLUS || t == T_MINUS)) {
+        return 1;
+    }
+    if (level >= 3 && (t == T_SHL || t == T_SHR)) {
+        return 1;
+    }
+    if (level >= 4 && (t == T_LT || t == T_GT || t == T_LE || t == T_GE)) {
+        return 1;
+    }
+    if (level >= 5 && (t == T_EQ || t == T_NE)) {
+        return 1;
+    }
+    if (level >= 6 && t == T_AMP) {
+        return 1;
+    }
+    if (level >= 7 && t == T_CARET) {
+        return 1;
+    }
+    return 0;
+}
+
+/*
+ * A binary operator has to keep its left side somewhere while the right side is
+ * evaluated, and the general answer is a spill slot.  But most right sides are
+ * a constant or a plain variable - nothing that can disturb a8 - and those can
+ * go straight into a9, which removes a store and a load from the majority of
+ * the arithmetic in a program.
+ *
+ * Returns 1 when it did so, leaving the left side in a8 and the right in a9;
+ * the caller must then emit the operation with the operands that way round.
+ */
+static int try_operand_to_a9(par_t *p, int level)
+{
+    lex_t *L = p->L;
+    if (p->g->err || L->err) {
+        return 0;
+    }
+    if (L->tok != T_NUM && L->tok != T_IDENT) {
+        return 0;
+    }
+    if (binds_tighter(peek_tok(L), level)) {
+        return 0;
+    }
+    if (L->tok == T_NUM) {
+        emit_movi(p->g, 9, L->num);
+        lex_next(L);
+        p->pesize = 0;
+        p->psidx = -1;
+        return 1;
+    }
+    const int li = find_local(p->g, L->text);
+    const int gi = (li < 0) ? find_global(p->g, L->text) : -1;
+    if (li < 0 && gi < 0) {
+        return 0;
+    }
+    const sym_t *s = (li >= 0) ? &p->g->locals[li] : &p->g->globals[gi];
+    if (ty_is_addr(&s->t)) {
+        return 0;
+    }
+    if (li >= 0) {
+        emit_load_sized(p->g, 9, 7, s->off, sym_access_size(s));
+    } else {
+        emit_li_data(p->g, 9, (uint32_t)s->off);
+        emit_load_sized(p->g, 9, 9, 0, sym_access_size(s));
+    }
+    lex_next(L);
+    p->pesize = (s->t.kind == PK_PTR) ? ty_size(p->g, &s->t) : 0;
+    p->psidx = (s->t.kind == PK_PTR) ? s->t.sidx : -1;
+    return 1;
+}
+
+/*
+ * `[i]` on a place.  The index goes into a8 first when the base is still a
+ * symbol plus a constant, which is the ordinary `a[i]` and costs no spill; an
+ * address already computed - `p->row[i]` - has to be parked while the index is
+ * evaluated, because evaluating it needs a8 too.
+ */
+static void place_index(par_t *p, place_t *pl)
+{
+    gen_t *g = p->g;
+    if (pl->t.kind != PK_ARRAY && pl->t.kind != PK_PTR) {
+        pfail(p, "not an array");
+        return;
+    }
+    const ptype_t el = ty_elem(&pl->t);
+    const int esize = ty_size(g, &el);
+    if (pl->t.kind == PK_PTR) {
+        place_load(g, pl, 8);
+        pl->mat = 1;
+        pl->li = -1;
+        pl->gi = -1;
+        pl->off = 0;
+    }
+    if (pl->mat) {
+        place_addr(g, pl);
+        push_a8(g);
+        parse_expr(p);
+        emit_scale(g, 8, esize);
+        pop_a9(g);
+    } else {
+        parse_expr(p);
+        emit_scale(g, 8, esize);
+        if (pl->li >= 0) {
+            emit_movi(g, 9, g->locals[pl->li].off + pl->off);
+            emit_add_n(g, 9, 9, 7);
+        } else {
+            emit_li_data(g, 9, (uint32_t)(g->globals[pl->gi].off + pl->off));
+        }
+        pl->mat = 1;
+        pl->li = -1;
+        pl->gi = -1;
+    }
+    emit_add_n(g, 8, 8, 9);
+    pl->off = 0;
+    pl->t = el;
+}
+
+/* `.f` and `->f`: the first only moves the offset, the second reads a pointer. */
+static void place_field(par_t *p, place_t *pl, int arrow)
+{
+    gen_t *g = p->g;
+    if (arrow) {
+        if (pl->t.kind != PK_PTR || pl->t.sidx < 0) {
+            pfail(p, "not a pointer to a struct");
+            return;
+        }
+        const ptype_t target = ty_elem(&pl->t);
+        place_load(g, pl, 8);
+        pl->mat = 1;
+        pl->li = -1;
+        pl->gi = -1;
+        pl->off = 0;
+        pl->t = target;
+    }
+    if (pl->t.kind != PK_STRUCT) {
+        pfail(p, "not a struct");
+        return;
+    }
+    if (p->L->tok != T_IDENT) {
+        pfail(p, "expected a field name");
+        return;
+    }
+    const struct_t *s = &g->structs[pl->t.sidx];
+    const int fi = find_field(s, p->L->text);
+    if (fi < 0) {
+        pfail(p, "no such field");
+        return;
+    }
+    lex_next(p->L);
+    pl->off += s->fields[fi].off;
+    pl->t = s->fields[fi].t;
+}
+
+/*
+ * A name and everything that follows it - `x`, `a[i]`, `v.f`, `p->row[i].g`.
+ * One parser for every place a value can be read from or written to, so that
+ * reading and assigning cannot disagree about what a name means.
+ */
+static int parse_place(par_t *p, const char *name, place_t *pl)
+{
+    const int li = find_local(p->g, name);
+    const int gi = (li < 0) ? find_global(p->g, name) : -1;
+    if (li < 0 && gi < 0) {
+        pfail(p, "unknown identifier");
+        return 0;
+    }
+    pl->mat = 0;
+    pl->li = li;
+    pl->gi = gi;
+    pl->off = 0;
+    pl->t = (li >= 0) ? p->g->locals[li].t : p->g->globals[gi].t;
+    for (;;) {
+        if (accept(p, T_LBRACK)) {
+            place_index(p, pl);
+            expect(p, T_RBRACK, "expected ']'");
+        } else if (accept(p, T_DOT)) {
+            place_field(p, pl, 0);
+        } else if (accept(p, T_ARROW)) {
+            place_field(p, pl, 1);
+        } else {
+            break;
+        }
+        if (p->g->err) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* The value of a place: an array is its address, a scalar is its contents. */
+static void place_rvalue(par_t *p, place_t *pl)
+{
+    if (pl->t.kind == PK_STRUCT) {
+        pfail(p, "a struct is not a value; take a field or its address");
+        return;
+    }
+    if (pl->t.kind == PK_ARRAY) {
+        place_addr(p->g, pl);
+        const ptype_t el = ty_elem(&pl->t);
+        p->pesize = ty_size(p->g, &el);
+        p->psidx = el.sidx;
+        return;
+    }
+    place_load(p->g, pl, 8);
+    if (pl->t.kind == PK_PTR) {
+        p->pesize = ty_size(p->g, &pl->t);
+        p->psidx = pl->t.sidx;
+    } else {
+        p->pesize = 0;
+        p->psidx = -1;
+    }
+}
+
+/*
+ * `place = expr`.  A place that is still a symbol plus a constant needs nothing
+ * held anywhere: the value can be computed straight into a8 and stored.  An
+ * address that had to be computed is parked in a spill slot while the value is
+ * evaluated, and comes back to a8 for the store.
+ */
+static void assign_to_place(par_t *p, place_t *pl)
+{
+    expect(p, T_ASSIGN, "expected '='");
+    if (!pl->mat) {
+        parse_expr(p);
+        place_store(p->g, pl, 8, 9);
+        return;
+    }
+    push_a8(p->g);
+    parse_expr(p);
+    emit_mov_n(p->g, 11, 8);
+    pop_a9(p->g);
+    emit_mov_n(p->g, 8, 9);
+    place_store(p->g, pl, 11, 9);
+}
+
 static void parse_primary(par_t *p)
 {
     if (p->g->err) {
         return;
     }
+    p->pesize = 0;
+    p->psidx = -1;
     if (p->L->tok == T_NUM) {
         emit_movi(p->g, 8, p->L->num);
         lex_next(p->L);
@@ -1091,6 +2680,7 @@ static void parse_primary(par_t *p)
             return;
         }
         emit_li_data(p->g, 8, (uint32_t)off);
+        p->pesize = 1;
         return;
     }
     if (p->L->tok == T_IDENT) {
@@ -1099,52 +2689,14 @@ static void parse_primary(par_t *p)
         lex_next(p->L);
         if (p->L->tok == T_LPAREN) {
             parse_call_by_name(p, name);
+            p->pesize = 0;
+            p->psidx = -1;
             return;
         }
-        if (accept(p, T_LBRACK)) {
-            parse_expr(p);
-            expect(p, T_RBRACK, "expected ']'");
-            const int li = find_local(p->g, name);
-            const int gi = (li < 0) ? find_global(p->g, name) : -1;
-            if (li >= 0) {
-                if (!p->g->locals[li].is_array) {
-                    pfail(p, "not an array");
-                    return;
-                }
-                emit_index_addr(p->g, 0, li);
-            } else if (gi >= 0) {
-                if (!p->g->globals[gi].is_array) {
-                    pfail(p, "not an array");
-                    return;
-                }
-                emit_index_addr(p->g, 1, gi);
-            } else {
-                pfail(p, "unknown identifier");
-                return;
-            }
-            emit_l32i(p->g, 8, 8, 0);
-            return;
+        place_t pl;
+        if (parse_place(p, name, &pl)) {
+            place_rvalue(p, &pl);
         }
-        const int li = find_local(p->g, name);
-        if (li >= 0) {
-            if (p->g->locals[li].is_array) {
-                emit_base_local(p->g, li);
-            } else {
-                emit_l32i(p->g, 8, 7, p->g->locals[li].off);
-            }
-            return;
-        }
-        const int gi = find_global(p->g, name);
-        if (gi >= 0) {
-            if (p->g->globals[gi].is_array) {
-                emit_base_global(p->g, gi);
-            } else {
-                emit_li_data(p->g, 8, (uint32_t)p->g->globals[gi].off);
-                emit_l32i(p->g, 8, 8, 0);
-            }
-            return;
-        }
-        pfail(p, "unknown identifier");
         return;
     }
     if (accept(p, T_LPAREN)) {
@@ -1155,17 +2707,74 @@ static void parse_primary(par_t *p)
     pfail(p, "expected expression");
 }
 
+/*
+ * `&place`: the address of storage rather than what is in it.  A pointer to a
+ * pointer has nowhere to say so in a type this thin, so taking the address of
+ * one is refused instead of quietly losing the second star.
+ */
+static void parse_addr_of(par_t *p)
+{
+    if (p->L->tok != T_IDENT) {
+        pfail(p, "expected a variable after '&'");
+        return;
+    }
+    char name[MAX_NAME];
+    cpy_err(name, sizeof(name), p->L->text);
+    lex_next(p->L);
+    place_t pl;
+    if (!parse_place(p, name, &pl)) {
+        return;
+    }
+    if (pl.t.kind == PK_PTR) {
+        pfail(p, "no pointer to pointer");
+        return;
+    }
+    const ptype_t target =
+        (pl.t.kind == PK_ARRAY) ? ty_elem(&pl.t) : pl.t;
+    place_addr(p->g, &pl);
+    p->pesize = ty_size(p->g, &target);
+    p->psidx = target.sidx;
+}
+
 static void parse_unary(par_t *p)
 {
     if (accept(p, T_MINUS)) {
         parse_unary(p);
         emit_movi(p->g, 9, 0);
         emit_sub(p->g, 8, 9, 8);
+        p->pesize = 0;
         return;
     }
     if (accept(p, T_NOT)) {
         parse_unary(p);
         emit_bool_not_a8(p->g);
+        p->pesize = 0;
+        return;
+    }
+    if (accept(p, T_TILDE)) {
+        parse_unary(p);
+        emit_movi(p->g, 9, -1);
+        emit_xor(p->g, 8, 8, 9);
+        p->pesize = 0;
+        return;
+    }
+    if (accept(p, T_STAR)) {
+        parse_unary(p);
+        const int k = p->pesize;
+        if (k == 0) {
+            pfail(p, "not a pointer");
+            return;
+        }
+        if (p->psidx >= 0) {
+            pfail(p, "a struct is not a value; use '->'");
+            return;
+        }
+        emit_load_sized(p->g, 8, 8, 0, k);
+        p->pesize = 0;
+        return;
+    }
+    if (accept(p, T_AMP)) {
+        parse_addr_of(p);
         return;
     }
     if (accept(p, T_PLUS)) {
@@ -1182,16 +2791,22 @@ static void parse_mul(par_t *p)
            p->L->tok == T_PERCENT) {
         const tok_t op = p->L->tok;
         lex_next(p->L);
-        push_a8(p->g);
-        parse_unary(p);
-        pop_a9(p->g);
-        if (op == T_STAR) {
-            emit_mull(p->g, 8, 9, 8);
-        } else if (op == T_SLASH) {
-            emit_quos(p->g, 8, 9, 8);
-        } else {
-            emit_rems(p->g, 8, 9, 8);
+        int lhs = 8, rhs = 9;
+        if (!try_operand_to_a9(p, 0)) {
+            push_a8(p->g);
+            parse_unary(p);
+            pop_a9(p->g);
+            lhs = 9;
+            rhs = 8;
         }
+        if (op == T_STAR) {
+            emit_mull(p->g, 8, lhs, rhs);
+        } else if (op == T_SLASH) {
+            emit_quos(p->g, 8, lhs, rhs);
+        } else {
+            emit_rems(p->g, 8, lhs, rhs);
+        }
+        p->pesize = 0;
     }
 }
 
@@ -1200,39 +2815,117 @@ static void parse_add(par_t *p)
     parse_mul(p);
     while (p->L->tok == T_PLUS || p->L->tok == T_MINUS) {
         const tok_t op = p->L->tok;
+        const int lp = p->pesize;
+        const int lsid = p->psidx;
         lex_next(p->L);
-        push_a8(p->g);
-        parse_mul(p);
-        pop_a9(p->g);
-        if (op == T_PLUS) {
-            emit_add_n(p->g, 8, 9, 8);
-        } else {
-            emit_sub(p->g, 8, 9, 8);
+        int lhs = 8, rhs = 9;
+        if (!try_operand_to_a9(p, 1)) {
+            push_a8(p->g);
+            parse_mul(p);
+            pop_a9(p->g);
+            lhs = 9;
+            rhs = 8;
         }
+        const int rp = p->pesize;
+        const int rsid = p->psidx;
+        /*
+         * A pointer steps by elements, as C says, so the int side is scaled
+         * before the add - which for a char pointer is no instruction at all.
+         * Two pointers have no meaning added and their difference is not worth
+         * a divide here, so those stay plain ints.
+         */
+        int res = 0;
+        int res_sid = -1;
+        if (lp != 0 && rp == 0) {
+            emit_scale(p->g, rhs, lp);
+            res = lp;
+            res_sid = lsid;
+        } else if (lp == 0 && rp != 0 && op == T_PLUS) {
+            emit_scale(p->g, lhs, rp);
+            res = rp;
+            res_sid = rsid;
+        }
+        if (op == T_PLUS) {
+            emit_add_n(p->g, 8, lhs, rhs);
+        } else {
+            emit_sub(p->g, 8, lhs, rhs);
+        }
+        p->pesize = res;
+        p->psidx = res_sid;
+    }
+}
+
+static void parse_shift(par_t *p)
+{
+    parse_add(p);
+    while (p->L->tok == T_SHL || p->L->tok == T_SHR) {
+        const tok_t op = p->L->tok;
+        lex_next(p->L);
+        /*
+         * Shifting by a constant is the case that matters - masks, fixed point,
+         * a phase accumulator - and it needs neither SAR nor a register for the
+         * count.  A shift by zero is not encodable in SLLI, and is nothing.
+         */
+        if (p->L->tok == T_NUM && p->L->num >= 0 && p->L->num <= 31 &&
+            !binds_tighter(peek_tok(p->L), 2)) {
+            const int sa = (int)p->L->num;
+            lex_next(p->L);
+            if (sa != 0) {
+                if (op == T_SHL) {
+                    emit_slli(p->g, 8, 8, sa);
+                } else {
+                    emit_srai(p->g, 8, 8, sa);
+                }
+            }
+            p->pesize = 0;
+            continue;
+        }
+        int lhs = 8, rhs = 9;
+        if (!try_operand_to_a9(p, 2)) {
+            push_a8(p->g);
+            parse_add(p);
+            pop_a9(p->g);
+            lhs = 9;
+            rhs = 8;
+        }
+        if (op == T_SHL) {
+            emit_ssl(p->g, rhs);
+            emit_sll(p->g, 8, lhs);
+        } else {
+            emit_ssr(p->g, rhs);
+            emit_sra(p->g, 8, lhs);
+        }
+        p->pesize = 0;
     }
 }
 
 static void parse_rel(par_t *p)
 {
-    parse_add(p);
+    parse_shift(p);
     while (p->L->tok == T_LT || p->L->tok == T_GT || p->L->tok == T_LE ||
            p->L->tok == T_GE) {
         const tok_t op = p->L->tok;
         lex_next(p->L);
-        push_a8(p->g);
-        parse_add(p);
-        pop_a9(p->g);
+        int lhs = 8, rhs = 9;
+        if (!try_operand_to_a9(p, 3)) {
+            push_a8(p->g);
+            parse_shift(p);
+            pop_a9(p->g);
+            lhs = 9;
+            rhs = 8;
+        }
         if (op == T_LT) {
-            emit_setlt(p->g, 8, 9, 8);
+            emit_setlt(p->g, 8, lhs, rhs);
         } else if (op == T_GT) {
-            emit_setlt(p->g, 8, 8, 9);
+            emit_setlt(p->g, 8, rhs, lhs);
         } else if (op == T_LE) {
-            emit_setlt(p->g, 8, 8, 9);
+            emit_setlt(p->g, 8, rhs, lhs);
             emit_bool_not_a8(p->g);
         } else {
-            emit_setlt(p->g, 8, 9, 8);
+            emit_setlt(p->g, 8, lhs, rhs);
             emit_bool_not_a8(p->g);
         }
+        p->pesize = 0;
     }
 }
 
@@ -1242,28 +2935,98 @@ static void parse_eq(par_t *p)
     while (p->L->tok == T_EQ || p->L->tok == T_NE) {
         const tok_t op = p->L->tok;
         lex_next(p->L);
-        push_a8(p->g);
-        parse_rel(p);
-        pop_a9(p->g);
+        int lhs = 8, rhs = 9;
+        if (!try_operand_to_a9(p, 4)) {
+            push_a8(p->g);
+            parse_rel(p);
+            pop_a9(p->g);
+            lhs = 9;
+            rhs = 8;
+        }
         const int opn = (op == T_EQ) ? B_BEQ : B_BNE;
         size_t b_site, j_site;
-        emit_b_placeholder(p->g, opn, 9, 8, &b_site);
+        emit_b_placeholder(p->g, opn, lhs, rhs, &b_site);
         emit_movi(p->g, 8, 0);
         emit_j_placeholder(p->g, &j_site);
         patch_b(p->g, b_site, p->g->len);
         emit_movi(p->g, 8, 1);
         emit_j_to(p->g, j_site, p->g->len);
+        p->pesize = 0;
+    }
+}
+
+/*
+ * The three bitwise levels sit between equality and `&&`, exactly where C puts
+ * them - which is the reason `(x & 3) == 0` needs its parentheses there too.
+ */
+static void parse_bitand(par_t *p)
+{
+    parse_eq(p);
+    while (p->L->tok == T_AMP) {
+        lex_next(p->L);
+        int lhs = 8, rhs = 9;
+        if (!try_operand_to_a9(p, 5)) {
+            push_a8(p->g);
+            parse_eq(p);
+            pop_a9(p->g);
+            lhs = 9;
+            rhs = 8;
+        }
+        emit_and(p->g, 8, lhs, rhs);
+        p->pesize = 0;
+    }
+}
+
+static void parse_bitxor(par_t *p)
+{
+    parse_bitand(p);
+    while (p->L->tok == T_CARET) {
+        lex_next(p->L);
+        int lhs = 8, rhs = 9;
+        if (!try_operand_to_a9(p, 6)) {
+            push_a8(p->g);
+            parse_bitand(p);
+            pop_a9(p->g);
+            lhs = 9;
+            rhs = 8;
+        }
+        emit_xor(p->g, 8, lhs, rhs);
+        p->pesize = 0;
+    }
+}
+
+static void parse_bitor(par_t *p)
+{
+    parse_bitxor(p);
+    while (p->L->tok == T_PIPE) {
+        lex_next(p->L);
+        int lhs = 8, rhs = 9;
+        if (!try_operand_to_a9(p, 7)) {
+            push_a8(p->g);
+            parse_bitxor(p);
+            pop_a9(p->g);
+            lhs = 9;
+            rhs = 8;
+        }
+        emit_or(p->g, 8, lhs, rhs);
+        p->pesize = 0;
     }
 }
 
 static void parse_and(par_t *p)
 {
-    parse_eq(p);
+    parse_bitor(p);
     while (accept(p, T_ANDAND)) {
         emit_movi(p->g, 9, 0);
         size_t false_b, false_b2, end_j;
         emit_b_placeholder(p->g, B_BEQ, 8, 9, &false_b);
-        parse_eq(p);
+        parse_bitor(p);
+        /*
+         * The right side freely uses a9 (the fast operand path leaves a
+         * constant there), so zero it again before asking whether the result
+         * is zero - otherwise `a && b != 5` compares the bool against 5.
+         */
+        emit_movi(p->g, 9, 0);
         emit_b_placeholder(p->g, B_BEQ, 8, 9, &false_b2);
         emit_movi(p->g, 8, 1);
         emit_j_placeholder(p->g, &end_j);
@@ -1271,6 +3034,7 @@ static void parse_and(par_t *p)
         patch_b(p->g, false_b2, p->g->len);
         emit_movi(p->g, 8, 0);
         emit_j_to(p->g, end_j, p->g->len);
+        p->pesize = 0;
     }
 }
 
@@ -1282,6 +3046,7 @@ static void parse_or(par_t *p)
         size_t true_b, true_b2, end_j;
         emit_b_placeholder(p->g, B_BNE, 8, 9, &true_b);
         parse_and(p);
+        emit_movi(p->g, 9, 0);
         emit_b_placeholder(p->g, B_BNE, 8, 9, &true_b2);
         emit_movi(p->g, 8, 0);
         emit_j_placeholder(p->g, &end_j);
@@ -1289,6 +3054,7 @@ static void parse_or(par_t *p)
         patch_b(p->g, true_b2, p->g->len);
         emit_movi(p->g, 8, 1);
         emit_j_to(p->g, end_j, p->g->len);
+        p->pesize = 0;
     }
 }
 
@@ -1307,73 +3073,72 @@ static void parse_block(par_t *p)
     expect(p, T_RBRACE, "expected '}'");
 }
 
-static void store_scalar_from_a8(par_t *p, const char *name)
+/* `*expr = value` - the one assignment whose target is an address, not a name. */
+static void assign_deref(par_t *p)
 {
-    const int li = find_local(p->g, name);
-    if (li >= 0) {
-        if (p->g->locals[li].is_array) {
-            pfail(p, "array needs index");
-            return;
-        }
-        emit_s32i(p->g, 8, 7, p->g->locals[li].off);
+    parse_unary(p);
+    const int k = p->pesize;
+    if (k == 0) {
+        pfail(p, "not a pointer");
         return;
     }
-    const int gi = find_global(p->g, name);
-    if (gi >= 0) {
-        if (p->g->globals[gi].is_array) {
-            pfail(p, "array needs index");
-            return;
-        }
-        push_a8(p->g);
-        emit_li_data(p->g, 8, (uint32_t)p->g->globals[gi].off);
-        pop_a9(p->g);
-        emit_s32i(p->g, 9, 8, 0);
+    if (p->psidx >= 0) {
+        pfail(p, "cannot assign a whole struct");
         return;
     }
-    pfail(p, "unknown identifier");
-}
-
-static void assign_array(par_t *p, const char *name)
-{
-    parse_expr(p);
-    expect(p, T_RBRACK, "expected ']'");
     expect(p, T_ASSIGN, "expected '='");
     push_a8(p->g);
     parse_expr(p);
-    push_a8(p->g);
-
-    const int li = find_local(p->g, name);
-    const int gi = (li < 0) ? find_global(p->g, name) : -1;
-    if (li < 0 && gi < 0) {
-        pfail(p, "unknown identifier");
-        return;
-    }
-    if (li >= 0 && !p->g->locals[li].is_array) {
-        pfail(p, "not an array");
-        return;
-    }
-    if (gi >= 0 && !p->g->globals[gi].is_array) {
-        pfail(p, "not an array");
-        return;
-    }
-
+    emit_mov_n(p->g, 11, 8);
     pop_a9(p->g);
-    if (p->g->spill_top >= SPILL_SLOTS) {
-        gfail(p->g, "expression too deep");
+    emit_store_sized(p->g, 11, 9, 0, k, 8);
+}
+
+/*
+ * The name and shape of a local declaration, the type having been taken
+ * already: `x`, `c`, `*p`, `a[N]` and `struct v s` all arrive here.
+ */
+static void parse_local_decl(par_t *p, const type_t *ty)
+{
+    if (p->L->tok != T_IDENT) {
+        pfail(p, "expected identifier after type");
         return;
     }
-    const int val_slot = p->g->spill_base + p->g->spill_top * 4;
-    emit_s32i(p->g, 9, 7, val_slot);
-
-    pop_a9(p->g);
-    emit_mov_n(p->g, 8, 9);
-    if (li >= 0) {
-        emit_index_addr(p->g, 0, li);
+    char name[MAX_NAME];
+    cpy_err(name, sizeof(name), p->L->text);
+    lex_next(p->L);
+    if (accept(p, T_LBRACK)) {
+        if (ty->is_ptr) {
+            pfail(p, "no arrays of pointers");
+            return;
+        }
+        const int n = parse_array_size(p);
+        if (n < 0) {
+            return;
+        }
+        expect(p, T_RBRACK, "expected ']'");
+        const ptype_t t = ty_of(ty, 1);
+        (void)add_local_t(p->g, name, &t, n);
+        return;
+    }
+    const ptype_t t = ty_of(ty, 0);
+    const int idx = add_local_t(p->g, name, &t, 1);
+    if (idx < 0) {
+        return;
+    }
+    if (t.kind == PK_STRUCT) {
+        if (p->L->tok == T_ASSIGN) {
+            pfail(p, "cannot assign a whole struct");
+        }
+        return;
+    }
+    if (accept(p, T_ASSIGN)) {
+        parse_expr(p);
     } else {
-        emit_index_addr(p->g, 1, gi);
+        emit_movi(p->g, 8, 0);
     }
-    emit_l32i(p->g, 9, 7, val_slot);
-    emit_s32i(p->g, 9, 8, 0);
+    emit_store_sized(p->g, 8, 7, p->g->locals[idx].off,
+                     sym_access_size(&p->g->locals[idx]), 9);
 }
 
 static void parse_for_assign_or_empty(par_t *p, int allow_decl)
@@ -1381,35 +3146,18 @@ static void parse_for_assign_or_empty(par_t *p, int allow_decl)
     if (p->L->tok == T_SEMI || p->L->tok == T_RPAREN) {
         return;
     }
-    if (allow_decl && accept(p, T_INT)) {
-        if (p->L->tok != T_IDENT) {
-            pfail(p, "expected identifier after int");
+    if (allow_decl && (p->L->tok == T_INT || p->L->tok == T_CHAR ||
+                       p->L->tok == T_STRUCT)) {
+        type_t ty;
+        if (!accept_type(p, &ty)) {
             return;
         }
-        char name[MAX_NAME];
-        cpy_err(name, sizeof(name), p->L->text);
+        parse_local_decl(p, &ty);
+        return;
+    }
+    if (p->L->tok == T_STAR) {
         lex_next(p->L);
-        if (accept(p, T_LBRACK)) {
-            if (p->L->tok != T_NUM || p->L->num <= 0) {
-                pfail(p, "expected array size");
-                return;
-            }
-            const int n = (int)p->L->num;
-            lex_next(p->L);
-            expect(p, T_RBRACK, "expected ']'");
-            (void)add_local_n(p->g, name, n, 1);
-            return;
-        }
-        const int idx = add_local(p->g, name);
-        if (idx < 0) {
-            return;
-        }
-        if (accept(p, T_ASSIGN)) {
-            parse_expr(p);
-        } else {
-            emit_movi(p->g, 8, 0);
-        }
-        emit_s32i(p->g, 8, 7, p->g->locals[idx].off);
+        assign_deref(p);
         return;
     }
     if (p->L->tok != T_IDENT) {
@@ -1419,13 +3167,10 @@ static void parse_for_assign_or_empty(par_t *p, int allow_decl)
     char name[MAX_NAME];
     cpy_err(name, sizeof(name), p->L->text);
     lex_next(p->L);
-    if (accept(p, T_LBRACK)) {
-        assign_array(p, name);
-        return;
+    place_t pl;
+    if (parse_place(p, name, &pl)) {
+        assign_to_place(p, &pl);
     }
-    expect(p, T_ASSIGN, "expected '='");
-    parse_expr(p);
-    store_scalar_from_a8(p, name);
 }
 
 static void parse_stmt(par_t *p)
@@ -1522,37 +3267,19 @@ static void parse_stmt(par_t *p)
         }
         return;
     }
-    if (accept(p, T_INT)) {
-        if (p->L->tok != T_IDENT) {
-            pfail(p, "expected identifier after int");
+    if (p->L->tok == T_INT || p->L->tok == T_CHAR || p->L->tok == T_STRUCT) {
+        type_t ty;
+        if (!accept_type(p, &ty)) {
             return;
         }
-        char name[MAX_NAME];
-        cpy_err(name, sizeof(name), p->L->text);
-        lex_next(p->L);
-        if (accept(p, T_LBRACK)) {
-            if (p->L->tok != T_NUM || p->L->num <= 0) {
-                pfail(p, "expected array size");
-                return;
-            }
-            const int n = (int)p->L->num;
-            lex_next(p->L);
-            expect(p, T_RBRACK, "expected ']'");
-            (void)add_local_n(p->g, name, n, 1);
-            expect(p, T_SEMI, "expected ';' after declaration");
-            return;
-        }
-        const int idx = add_local(p->g, name);
-        if (idx < 0) {
-            return;
-        }
-        if (accept(p, T_ASSIGN)) {
-            parse_expr(p);
-        } else {
-            emit_movi(p->g, 8, 0);
-        }
-        emit_s32i(p->g, 8, 7, p->g->locals[idx].off);
+        parse_local_decl(p, &ty);
         expect(p, T_SEMI, "expected ';' after declaration");
+        return;
+    }
+    if (p->L->tok == T_STAR) {
+        lex_next(p->L);
+        assign_deref(p);
+        expect(p, T_SEMI, "expected ';'");
         return;
     }
     if (p->L->tok == T_IDENT) {
@@ -1564,14 +3291,10 @@ static void parse_stmt(par_t *p)
             expect(p, T_SEMI, "expected ';'");
             return;
         }
-        if (accept(p, T_LBRACK)) {
-            assign_array(p, name);
-            expect(p, T_SEMI, "expected ';'");
-            return;
+        place_t pl;
+        if (parse_place(p, name, &pl)) {
+            assign_to_place(p, &pl);
         }
-        expect(p, T_ASSIGN, "expected '=' after identifier");
-        parse_expr(p);
-        store_scalar_from_a8(p, name);
         expect(p, T_SEMI, "expected ';'");
         return;
     }
@@ -1588,16 +3311,25 @@ static int parse_params(par_t *p)
         return 0;
     }
     for (;;) {
-        expect(p, T_INT, "expected parameter type");
+        type_t ty;
+        if (!accept_type(p, &ty)) {
+            pfail(p, "expected parameter type");
+            return 0;
+        }
         if (p->L->tok != T_IDENT) {
             pfail(p, "expected parameter name");
             return 0;
         }
-        if (nparams >= 4) {
+        if (nparams >= MAX_PARAMS) {
             pfail(p, "too many parameters");
             return 0;
         }
-        (void)add_local(p->g, p->L->text);
+        if (ty.sidx >= 0 && !ty.is_ptr) {
+            pfail(p, "no struct parameters; pass a pointer");
+            return 0;
+        }
+        const ptype_t t = ty_of(&ty, 0);
+        (void)add_local_t(p->g, p->L->text, &t, 1);
         lex_next(p->L);
         nparams++;
         if (!accept(p, T_COMMA)) {
@@ -1626,20 +3358,25 @@ static void parse_function(par_t *p, int is_void, const char *name)
     p->g->nlocals = 0;
     p->g->local_words = 0;
     p->g->spill_top = 0;
-    p->g->spill_base = MAX_LOCALS * 4;
 
-    const int framesize = 32 + MAX_LOCALS * 4 + SPILL_SLOTS * 4;
     const size_t code_off = p->g->len;
-    emit_entry(p->g, framesize);
-    emit_mov_n(p->g, 7, 1);
+    emit_entry(p->g, SPILL_BYTES + MAX_LOCAL_WORDS * 4 + FRAME_TOP_SAVE);
 
+    /*
+     * Parameters arrive in a2..a7 and are stored through a1, because a7 is
+     * about to become the frame pointer - with six parameters the last one
+     * would otherwise be overwritten by its own frame pointer.  a7 and a1 hold
+     * the same address; only the order matters.
+     */
     const int nparams = parse_params(p);
     if (p->g->err) {
         return;
     }
-    for (int i = 0; i < nparams && i < 4; i++) {
-        emit_s32i(p->g, 2 + i, 7, p->g->locals[i].off);
+    for (int i = 0; i < nparams && i < MAX_PARAMS; i++) {
+        emit_store_sized(p->g, 2 + i, 1, p->g->locals[i].off,
+                         sym_access_size(&p->g->locals[i]), 8);
     }
+    emit_mov_n(p->g, 7, 1);
 
     const int fi = p->g->nfuncs++;
     cpy_err(p->g->funcs[fi].name, MAX_NAME, name);
@@ -1654,6 +3391,108 @@ static void parse_function(par_t *p, int is_void, const char *name)
 
     emit_movi(p->g, 2, 0);
     emit_retw_n(p->g);
+
+    /* The stack pointer stays 16-byte aligned, so the frame rounds to 16. */
+    const int used = SPILL_BYTES + p->g->local_words * 4 + FRAME_TOP_SAVE;
+    patch_entry(p->g, code_off, (used + 15) & ~15);
+}
+
+/*
+ * `struct name { ... };`.  The name is registered before the body is read, so a
+ * field can point at the struct being defined; its size stays 0 until the body
+ * closes, which is why nothing but a pointer to it can be declared inside.
+ *
+ * Fields are laid out in order, each on its natural alignment - a word for
+ * everything but a char - and the whole rounds up to a word.  That is what the
+ * C on the host does with the same fields, so a struct described here and one
+ * described there are the same bytes, which matters the moment a program passes
+ * a pointer to one across the ABI.
+ */
+static void parse_struct_body(par_t *p, const char *name)
+{
+    gen_t *g = p->g;
+    if (find_struct(g, name) >= 0) {
+        pfail(p, "duplicate struct");
+        return;
+    }
+    if (g->nstructs >= MAX_STRUCTS) {
+        pfail(p, "too many structs");
+        return;
+    }
+    const int si = g->nstructs++;
+    struct_t *s = &g->structs[si];
+    cpy_err(s->name, MAX_NAME, name);
+    s->size = 0;
+    s->nfields = 0;
+    expect(p, T_LBRACE, "expected '{'");
+    int off = 0;
+    while (p->L->tok != T_RBRACE && !p->g->err && !p->L->err) {
+        type_t ty;
+        if (!accept_type(p, &ty)) {
+            pfail(p, "expected a field type");
+            return;
+        }
+        if (p->L->tok != T_IDENT) {
+            pfail(p, "expected a field name");
+            return;
+        }
+        char fname[MAX_NAME];
+        cpy_err(fname, sizeof(fname), p->L->text);
+        lex_next(p->L);
+        int nelem = 1;
+        int is_array = 0;
+        if (accept(p, T_LBRACK)) {
+            if (ty.is_ptr) {
+                pfail(p, "no arrays of pointers");
+                return;
+            }
+            nelem = parse_array_size(p);
+            if (nelem < 0) {
+                return;
+            }
+            is_array = 1;
+            expect(p, T_RBRACK, "expected ']'");
+        }
+        expect(p, T_SEMI, "expected ';' after a field");
+        if (p->g->err || p->L->err) {
+            return;
+        }
+        if (s->nfields >= MAX_FIELDS) {
+            pfail(p, "too many fields");
+            return;
+        }
+        if (find_field(s, fname) >= 0) {
+            pfail(p, "duplicate field");
+            return;
+        }
+        const ptype_t t = ty_of(&ty, is_array);
+        if (t.kind != PK_PTR && ty.sidx == si) {
+            pfail(p, "a struct cannot contain itself");
+            return;
+        }
+        const int bytes = sym_bytes(g, &t, nelem);
+        if (bytes <= 0) {
+            pfail(p, "bad field size");
+            return;
+        }
+        const int align = (t.kind != PK_PTR && ty_size(g, &t) == 1) ? 1 : 4;
+        off = (off + align - 1) & ~(align - 1);
+        field_t *f = &s->fields[s->nfields++];
+        cpy_err(f->name, MAX_NAME, fname);
+        f->off = off;
+        f->t = t;
+        off += bytes;
+    }
+    expect(p, T_RBRACE, "expected '}'");
+    expect(p, T_SEMI, "expected ';'");
+    if (p->g->err || p->L->err) {
+        return;
+    }
+    if (s->nfields == 0) {
+        pfail(p, "a struct needs a field");
+        return;
+    }
+    s->size = (off + 3) & ~3;
 }
 
 static void parse_program(par_t *p)
@@ -1673,7 +3512,34 @@ static void parse_program(par_t *p)
             parse_function(p, 1, name);
             continue;
         }
-        if (!accept(p, T_INT)) {
+        type_t ty;
+        if (p->L->tok == T_STRUCT) {
+            /*
+             * `struct v {` defines, `struct v x` declares: which one it is only
+             * shows up a token after the name, so the type is taken apart here
+             * rather than in accept_type.
+             */
+            lex_next(p->L);
+            if (p->L->tok != T_IDENT) {
+                pfail(p, "expected a struct name");
+                return;
+            }
+            char sname[MAX_NAME];
+            cpy_err(sname, sizeof(sname), p->L->text);
+            lex_next(p->L);
+            if (p->L->tok == T_LBRACE) {
+                parse_struct_body(p, sname);
+                continue;
+            }
+            const int si = find_struct(p->g, sname);
+            if (si < 0) {
+                pfail(p, "unknown struct");
+                return;
+            }
+            ty.sidx = si;
+            ty.esize = p->g->structs[si].size;
+            ty.is_ptr = accept(p, T_STAR) ? 1 : 0;
+        } else if (!accept_type(p, &ty)) {
             pfail(p, "expected declaration or function");
             return;
         }
@@ -1685,6 +3551,11 @@ static void parse_program(par_t *p)
         cpy_err(name, sizeof(name), p->L->text);
         lex_next(p->L);
         if (p->L->tok == T_LPAREN) {
+            /* Values are ints; an address returned as an int is one too. */
+            if (ty.is_ptr || ty.sidx >= 0 || ty.esize != 4) {
+                pfail(p, "a function returns int or void");
+                return;
+            }
             parse_function(p, 0, name);
             continue;
         }
@@ -1693,19 +3564,23 @@ static void parse_program(par_t *p)
             return;
         }
         if (accept(p, T_LBRACK)) {
-            if (p->L->tok != T_NUM || p->L->num <= 0) {
-                pfail(p, "expected array size");
+            if (ty.is_ptr) {
+                pfail(p, "no arrays of pointers");
                 return;
             }
-            const int n = (int)p->L->num;
-            lex_next(p->L);
+            const int n = parse_array_size(p);
+            if (n < 0) {
+                return;
+            }
             expect(p, T_RBRACK, "expected ']'");
             expect(p, T_SEMI, "expected ';'");
-            (void)add_global_n(p->g, name, n, 1);
+            const ptype_t t = ty_of(&ty, 1);
+            (void)add_global_t(p->g, name, &t, n);
             continue;
         }
         expect(p, T_SEMI, "expected ';'");
-        (void)add_global_n(p->g, name, 1, 0);
+        const ptype_t t = ty_of(&ty, 0);
+        (void)add_global_t(p->g, name, &t, 1);
     }
 
     if (!p->g->err && p->g->ag_main_idx < 0) {
@@ -1782,7 +3657,22 @@ static void wr_str(uint8_t *p, size_t n, const char *s)
     }
 }
 
+/* The compiler owns what the include reader handed it; this is where it goes. */
+static void gen_free(gen_t *g)
+{
+    for (int i = 0; i < g->pp.nincls; i++) {
+        CC_FREE(g->pp.incls[i].text);
+    }
+    CC_FREE(g);
+}
+
 int cc_compile_to_axe(const char *src, size_t src_len, cc_result_t *out)
+{
+    return cc_compile_to_axe_inc(src, src_len, NULL, NULL, out);
+}
+
+int cc_compile_to_axe_inc(const char *src, size_t src_len,
+                          cc_read_file_fn reader, void *ctx, cc_result_t *out)
 {
     if (out == NULL) {
         return -1;
@@ -1810,11 +3700,16 @@ int cc_compile_to_axe(const char *src, size_t src_len, cc_result_t *out)
     g->cap = CODE_CAP;
     g->ag_main_idx = -1;
     g->data_next = 4;
+    g->min_abi = ABI_MINOR_BASE;
+    g->pp.reader = reader;
+    g->pp.reader_ctx = ctx;
 
     lex_t L;
     memset(&L, 0, sizeof(L));
     L.src = src;
     L.len = src_len;
+    L.pp = &g->pp;
+    L.cur_incl = -1;
     lex_next(&L);
 
     par_t p = {.L = &L, .g = g};
@@ -1823,13 +3718,13 @@ int cc_compile_to_axe(const char *src, size_t src_len, cc_result_t *out)
     if (L.err) {
         cpy_err(out->err, sizeof(out->err), L.errmsg);
         CC_FREE(text);
-        CC_FREE(g);
+        gen_free(g);
         return -1;
     }
     if (g->err) {
         cpy_err(out->err, sizeof(out->err), g->errmsg);
         CC_FREE(text);
-        CC_FREE(g);
+        gen_free(g);
         return -1;
     }
 
@@ -1838,14 +3733,14 @@ int cc_compile_to_axe(const char *src, size_t src_len, cc_result_t *out)
     if (g->err) {
         cpy_err(out->err, sizeof(out->err), g->errmsg);
         CC_FREE(text);
-        CC_FREE(g);
+        gen_free(g);
         return -1;
     }
     fix_l32r(g, lit_bytes);
     if (g->err) {
         cpy_err(out->err, sizeof(out->err), g->errmsg);
         CC_FREE(text);
-        CC_FREE(g);
+        gen_free(g);
         return -1;
     }
 
@@ -1860,14 +3755,14 @@ int cc_compile_to_axe(const char *src, size_t src_len, cc_result_t *out)
     if (axe == NULL) {
         cpy_err(out->err, sizeof(out->err), "out of memory");
         CC_FREE(text);
-        CC_FREE(g);
+        gen_free(g);
         return -1;
     }
     memset(axe, 0, file_size);
 
     memcpy(axe + 0, "AXE1", 4);
     wr_u16(axe + 4, 0);
-    wr_u16(axe + 6, 14);
+    wr_u16(axe + 6, (uint16_t)g->min_abi);
     wr_u16(axe + 8, 1);
     wr_u16(axe + 10, (uint16_t)AXE_HDR);
     {
@@ -1920,7 +3815,7 @@ int cc_compile_to_axe(const char *src, size_t src_len, cc_result_t *out)
     }
 
     CC_FREE(text);
-    CC_FREE(g);
+    gen_free(g);
     out->axe = axe;
     out->axe_len = file_size;
     return 0;
@@ -1936,45 +3831,61 @@ void cc_result_free(cc_result_t *out)
     out->axe_len = 0;
 }
 
+/*
+ * The constant evaluator borrows the lexer rather than owning one, so that the
+ * same code can read `cc -e "1+2"` and the size in `int buf[W * H];` - where the
+ * tokens come from the middle of a program, and from macros.
+ */
 typedef struct {
-    lex_t L;
+    lex_t *L;
 } ev_t;
 
 static int32_t ev_expr(ev_t *e);
 
+/* The value of a constant expression read from a program being compiled. */
+static int32_t const_expr_from(lex_t *L)
+{
+    ev_t e = {.L = L};
+    return ev_expr(&e);
+}
+
 static int32_t ev_primary(ev_t *e)
 {
-    if (e->L.tok == T_NUM) {
-        const int32_t v = e->L.num;
-        lex_next(&e->L);
+    if (e->L->tok == T_NUM) {
+        const int32_t v = e->L->num;
+        lex_next(e->L);
         return v;
     }
-    if (e->L.tok == T_LPAREN) {
-        lex_next(&e->L);
+    if (e->L->tok == T_LPAREN) {
+        lex_next(e->L);
         const int32_t v = ev_expr(e);
-        if (e->L.tok != T_RPAREN) {
-            lex_fail(&e->L, "expected ')'");
+        if (e->L->tok != T_RPAREN) {
+            lex_fail(e->L, "expected ')'");
             return 0;
         }
-        lex_next(&e->L);
+        lex_next(e->L);
         return v;
     }
-    lex_fail(&e->L, "expected expression");
+    lex_fail(e->L, "expected expression");
     return 0;
 }
 
 static int32_t ev_unary(ev_t *e)
 {
-    if (e->L.tok == T_MINUS) {
-        lex_next(&e->L);
+    if (e->L->tok == T_MINUS) {
+        lex_next(e->L);
         return -ev_unary(e);
     }
-    if (e->L.tok == T_NOT) {
-        lex_next(&e->L);
+    if (e->L->tok == T_NOT) {
+        lex_next(e->L);
         return ev_unary(e) == 0 ? 1 : 0;
     }
-    if (e->L.tok == T_PLUS) {
-        lex_next(&e->L);
+    if (e->L->tok == T_TILDE) {
+        lex_next(e->L);
+        return (int32_t)~(uint32_t)ev_unary(e);
+    }
+    if (e->L->tok == T_PLUS) {
+        lex_next(e->L);
         return ev_unary(e);
     }
     return ev_primary(e);
@@ -1983,21 +3894,21 @@ static int32_t ev_unary(ev_t *e)
 static int32_t ev_mul(ev_t *e)
 {
     int32_t v = ev_unary(e);
-    while (e->L.tok == T_STAR || e->L.tok == T_SLASH || e->L.tok == T_PERCENT) {
-        const tok_t op = e->L.tok;
-        lex_next(&e->L);
+    while (e->L->tok == T_STAR || e->L->tok == T_SLASH || e->L->tok == T_PERCENT) {
+        const tok_t op = e->L->tok;
+        lex_next(e->L);
         const int32_t r = ev_unary(e);
         if (op == T_STAR) {
             v *= r;
         } else if (op == T_SLASH) {
             if (r == 0) {
-                lex_fail(&e->L, "division by zero");
+                lex_fail(e->L, "division by zero");
                 return 0;
             }
             v /= r;
         } else {
             if (r == 0) {
-                lex_fail(&e->L, "division by zero");
+                lex_fail(e->L, "division by zero");
                 return 0;
             }
             v %= r;
@@ -2009,23 +3920,48 @@ static int32_t ev_mul(ev_t *e)
 static int32_t ev_add(ev_t *e)
 {
     int32_t v = ev_mul(e);
-    while (e->L.tok == T_PLUS || e->L.tok == T_MINUS) {
-        const tok_t op = e->L.tok;
-        lex_next(&e->L);
+    while (e->L->tok == T_PLUS || e->L->tok == T_MINUS) {
+        const tok_t op = e->L->tok;
+        lex_next(e->L);
         const int32_t r = ev_mul(e);
         v = (op == T_PLUS) ? (v + r) : (v - r);
     }
     return v;
 }
 
-static int32_t ev_rel(ev_t *e)
+/*
+ * The evaluator answers `cc -e` and the tests, and it exists to agree with the
+ * code generator: the two share a lexer, and the levels below are the same
+ * levels, so an expression cannot mean one thing here and another in a program.
+ */
+static int32_t ev_shift(ev_t *e)
 {
     int32_t v = ev_add(e);
-    while (e->L.tok == T_LT || e->L.tok == T_GT || e->L.tok == T_LE ||
-           e->L.tok == T_GE) {
-        const tok_t op = e->L.tok;
-        lex_next(&e->L);
+    while (e->L->tok == T_SHL || e->L->tok == T_SHR) {
+        const tok_t op = e->L->tok;
+        lex_next(e->L);
         const int32_t r = ev_add(e);
+        if (r < 0 || r > 31) {
+            lex_fail(e->L, "shift count out of range");
+            return 0;
+        }
+        if (op == T_SHL) {
+            v = (int32_t)((uint32_t)v << r);
+        } else {
+            v = v >> r;
+        }
+    }
+    return v;
+}
+
+static int32_t ev_rel(ev_t *e)
+{
+    int32_t v = ev_shift(e);
+    while (e->L->tok == T_LT || e->L->tok == T_GT || e->L->tok == T_LE ||
+           e->L->tok == T_GE) {
+        const tok_t op = e->L->tok;
+        lex_next(e->L);
+        const int32_t r = ev_shift(e);
         if (op == T_LT) {
             v = v < r;
         } else if (op == T_GT) {
@@ -2042,21 +3978,51 @@ static int32_t ev_rel(ev_t *e)
 static int32_t ev_eq(ev_t *e)
 {
     int32_t v = ev_rel(e);
-    while (e->L.tok == T_EQ || e->L.tok == T_NE) {
-        const tok_t op = e->L.tok;
-        lex_next(&e->L);
+    while (e->L->tok == T_EQ || e->L->tok == T_NE) {
+        const tok_t op = e->L->tok;
+        lex_next(e->L);
         const int32_t r = ev_rel(e);
         v = (op == T_EQ) ? (v == r) : (v != r);
     }
     return v;
 }
 
-static int32_t ev_and(ev_t *e)
+static int32_t ev_bitand(ev_t *e)
 {
     int32_t v = ev_eq(e);
-    while (e->L.tok == T_ANDAND) {
-        lex_next(&e->L);
-        const int32_t r = ev_eq(e);
+    while (e->L->tok == T_AMP) {
+        lex_next(e->L);
+        v = (int32_t)((uint32_t)v & (uint32_t)ev_eq(e));
+    }
+    return v;
+}
+
+static int32_t ev_bitxor(ev_t *e)
+{
+    int32_t v = ev_bitand(e);
+    while (e->L->tok == T_CARET) {
+        lex_next(e->L);
+        v = (int32_t)((uint32_t)v ^ (uint32_t)ev_bitand(e));
+    }
+    return v;
+}
+
+static int32_t ev_bitor(ev_t *e)
+{
+    int32_t v = ev_bitxor(e);
+    while (e->L->tok == T_PIPE) {
+        lex_next(e->L);
+        v = (int32_t)((uint32_t)v | (uint32_t)ev_bitxor(e));
+    }
+    return v;
+}
+
+static int32_t ev_and(ev_t *e)
+{
+    int32_t v = ev_bitor(e);
+    while (e->L->tok == T_ANDAND) {
+        lex_next(e->L);
+        const int32_t r = ev_bitor(e);
         v = (v != 0 && r != 0);
     }
     return v;
@@ -2065,8 +4031,8 @@ static int32_t ev_and(ev_t *e)
 static int32_t ev_or(ev_t *e)
 {
     int32_t v = ev_and(e);
-    while (e->L.tok == T_OROR) {
-        lex_next(&e->L);
+    while (e->L->tok == T_OROR) {
+        lex_next(e->L);
         const int32_t r = ev_and(e);
         v = (v != 0 || r != 0);
     }
@@ -2086,19 +4052,21 @@ int cc_eval_expr(const char *expr, int32_t *out_value, char *err, size_t errlen)
         }
         return -1;
     }
-    ev_t e;
-    memset(&e, 0, sizeof(e));
-    e.L.src = expr;
-    e.L.len = strlen(expr);
-    lex_next(&e.L);
+    lex_t L;
+    memset(&L, 0, sizeof(L));
+    L.src = expr;
+    L.len = strlen(expr);
+    L.cur_incl = -1;
+    lex_next(&L);
+    ev_t e = {.L = &L};
     const int32_t v = ev_expr(&e);
-    if (e.L.err) {
+    if (L.err) {
         if (err != NULL) {
-            cpy_err(err, errlen, e.L.errmsg);
+            cpy_err(err, errlen, L.errmsg);
         }
         return -1;
     }
-    if (e.L.tok != T_EOF) {
+    if (L.tok != T_EOF) {
         if (err != NULL) {
             cpy_err(err, errlen, "trailing junk");
         }

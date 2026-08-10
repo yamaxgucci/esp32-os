@@ -5,31 +5,84 @@ host toolchain (image name `CC.AXE`).
 
 ## Language
 
-- Types: `int`, `void` (return / empty params)
+- Types: `int` (32-bit), `char` (one **unsigned** byte), `struct`, a pointer to
+  any of those, `void` (return / empty params)
 - Entry: `ag_main` (required). Other functions allowed; **define before use**
-- Functions: up to 4 `int` params; calls use windowed `callx8`
-- Globals (before functions): `int x;`, `int arr[N];` (int arrays only)
-- Locals: `int x`, `int arr[N]`, assign, `return`, `if`/`else`, `while`, `for`, blocks
-- `for (init; cond; step)` — init may be `int name = expr`, assignment, or empty
-- Arrays: `a[i]`, `a[i] = expr` (locals and globals)
-- Expressions: `+ - * / %`, compares, `&& || !`, parentheses, calls
-- String literals `"..."` → address (`int`), usable as builtin args
+- Functions: up to 6 params of any of those types; calls use windowed `callx8`
+- Globals (before functions): `int x;`, `char c;`, `int a[N];`, `char b[N];`,
+  `char *p;`, `struct v s;`, `struct v a[N];`, `struct v *p;`
+- Locals: the same, plus assign, `return`, `if`/`else`, `while`, `for`, blocks
+- `for (init; cond; step)` — init may be a declaration, an assignment, or empty
+- Arrays and pointers: `a[i]`, `a[i] = expr`, `*p`, `*p = expr`, `&x`, `&a[i]`
+- Structs: `struct v { int x; char tag; int a[4]; struct v *next; };` then
+  `s.x`, `p->x`, `a[i].x`, `p[i].x`, `&s` — in any combination, on either side
+  of an `=`
+- Pointer arithmetic steps by the element: `p + 1` moves 1 byte for `char *`,
+  4 for `int *` and the whole struct for a `struct v *`; an array name is the
+  address of its first element
+- Expressions: `+ - * / %`, compares, `& | ^ ~ << >>`, `&& || !`, parentheses,
+  calls — at C's precedence, so `(x & 3) == 0` needs its parentheses
+- `>>` is arithmetic (sign-keeping); a shift count belongs in 0…31
+- Character constants `'a'`, `'\n'`; string literals `"..."` are `char *`
+- Preprocessor: `#define` / `#undef` (object- and function-like), `#ifdef` /
+  `#ifndef` / `#else` / `#endif`, `#include "file"` (resolved next to the
+  source being compiled). No `#if` expressions, no `##`, no angle-bracket
+  includes. A header with a function body ends the globals window — keep
+  function definitions in `.c` files
 - Result of `ag_main` is the process exit code (`errorlevel`)
+- Errors carry the source line: `expected ';' at line 42`
 
-No preprocessor, floats, structs, or general pointers yet.
+No floats, unions, `++`, `+=`, arrays of pointers, or pointers to pointers.
+Functions return `int` or `void` — an address is an `int` like any other, so a
+function that hands one back is declared `int`.
 
-Example game written in this subset: [`examples/asteroids.c`](examples/asteroids.c).
+A struct is only ever handled by address: no struct assignment (`a = b`), no
+struct parameter or return value — pass `&s` and take a `struct v *`. Fields go
+in declaration order, each on its natural alignment (a word for everything but
+a `char`), and the struct rounds up to a word — the same bytes the host C
+compiler lays down for the same fields, which is what makes it safe to hand a
+pointer to one across the ABI. A struct local starts out holding whatever the
+frame held, as in C.
+
+A value is always a 32-bit word in a register; `char` describes *storage*, so it
+is what a load or a store touches and what an index is scaled by. `char c = 300`
+keeps 44, and reads back positive.
+
+Limits per program: 128 functions, 128 globals, 96 locals (224 words) per
+function, 24 structs of 24 fields, 128 KB of data, and code up to the 192 KB
+executable arena — the same ceiling the loader hands out, so anything that
+compiles will load. Guest `CC.AXE` reads up to 64 KB of source per file.
+
+Examples: [`examples/asteroids.c`](examples/asteroids.c) (a game),
+[`examples/selftest.c`](examples/selftest.c) (checks the generated code,
+including `#include "ppinc.h"`, and exits with the number of failures),
+[`examples/fsmem.c`](examples/fsmem.c) (phase D: file + mute PCM chunk),
+[`examples/dx7nofx.c`](examples/dx7nofx.c) (phase E: structural DX7 nofx on CC).
 
 ## Builtins (ABI)
 
-Hardcoded calls through `g_ag_api` (data slot + relocations). Using any `ag_gfx_*`
-sets `AG_AXE_NEEDS_GFX` and requires ABI minor 9.
+Hardcoded calls through `g_ag_api` (data slot + relocations). The offsets live
+in `cc_compile.h` and are checked against `offsetof()` on the real `abi.h` by
+`host-tests/test_cc.c`, so a table reordered in the kernel fails a build instead
+of a guest.
+
+The image demands the highest ABI minor of the features it uses: 8 plain, 9 for
+`ag_gfx_*` (which also sets `AG_AXE_NEEDS_GFX`), 10 for `ag_btn`, 14 for
+`ag_audio_*` (`AG_AXE_NEEDS_AUDIO`).
 
 | Builtin | Notes |
 |---------|--------|
 | `ag_delay(ms)` | `time->delay_ms` |
+| `ag_micros()` / `ag_millis()` | boot time; micros is low 32 bits of `time->us` |
 | `ag_key(code)` | sticky `key_pressed` (serial; imperfect for chords) |
 | `ag_btn(id)` | **live pad** (HostFS PADPUSH): 0=up…3=right, 4=b1, 5=b2, 6=pause, 7=quit |
+| `ag_print(s)` | `con->puts`; `s` is a string literal or any address |
+| `ag_printf(fmt, ...)` | `con->printf`, up to 6 arguments including the format |
+| `ag_print_int(n)` / `ag_print_hex(n)` | the same with a format the compiler supplies |
+| `ag_cls()` / `ag_gotoxy(x, y)` | text screen |
+| `ag_gpio_config(pin, mode)` | mode: 0 in, 1 out, 2 out-OD, 3 in-pullup, 4 in-pulldown |
+| `ag_gpio_write(pin, level)` / `ag_gpio_read(pin)` | |
+| `ag_adc_read(channel)` | |
 | `ag_gfx_acquire()` | `gfx->acquire(NULL)` |
 | `ag_gfx_release()` | |
 | `ag_gfx_clear(c)` | |
@@ -47,12 +100,47 @@ sets `AG_AXE_NEEDS_GFX` and requires ABI minor 9.
 | `ag_audio_close()` | |
 | `ag_audio_write(buf, frames)` | `buf` is `int[]` address; kernel reads interleaved s16 (see `fmtoy.c`) |
 | `ag_audio_space()` | free frames (best-effort) |
+| `ag_malloc(n)` / `ag_realloc(p, n)` / `ag_free(p)` | process arena in PSRAM |
+| `ag_open(path, flags)` / `ag_close(h)` | `flags`: `#define AG_O_RDONLY 0`, `WRONLY 1`, `RDWR 2`, `CREATE 4`, `TRUNC 8` |
+| `ag_read(h, buf, n)` / `ag_write(h, buf, n)` | returns byte count or negative error |
+| `ag_opendir(path)` / `ag_readdir(h, &ent)` / `ag_closedir(h)` | `ent` is a buffer/`struct` the size of `ag_dirent_t` |
+| `ag_dev_open(name)` / `ag_dev_close(h)` | open by bare device name |
+| `ag_dev_read` / `ag_dev_write` / `ag_dev_ioctl` | same shapes as the FS calls |
+
+No `ag_seek`: the kernel API is `int64_t`, and every value in this language is a
+32-bit word. Open flags are ordinary `#define`s (see above), not keywords.
 
 Using any `ag_gfx_*` sets `AG_AXE_NEEDS_GFX`. Using any `ag_audio_*` sets
 `AG_AXE_NEEDS_AUDIO` (ABI minor 14).
 
 Audio toy (2-op FM, not DX7): [`examples/fmtoy.c`](examples/fmtoy.c).
-A structural DX7-like synth is the host-built [`apps/dx7`](../dx7) (`DX7.AXE`).
+Phase D smoke (file read + mute PCM chunk): [`examples/fsmem.c`](examples/fsmem.c).
+
+Phase E — structural DX7 **nofx** written in the CC dialect (6 op, 32 alg,
+8 voices, EG, LFO shapes): [`examples/dx7nofx.c`](examples/dx7nofx.c).
+It is a reimplementation for Mini-C, not a compile of host
+[`apps/common/dx7`](../common/dx7). The host-built [`apps/dx7`](../dx7)
+(`DX7.AXE` via `mkaxe`) stays the line for FX / WAV / richer UI.
+
+Same virt devices as host DX7 (not mute `ag_audio_*` → pcmnull):
+
+```powershell
+.\argon.cmd run -Gfx -HostFs build\sd_card
+# guest:
+drv install h:\pcmvirt.sys
+drv install h:\midivirt.sys
+run h:\cc.axe h:\dx7nofx.c h:\dx7nofx.axe
+run h:\dx7nofx.axe
+# host (IDF Python):
+pcmplay.py --reconnect
+midikbd.py --reconnect
+```
+
+Focus the **midikbd** window for poly notes (`Z..M` / `Q..I`). Console
+sticky keys remain a fallback. `[` `]` algorithm, `,` `.` preset, `-` `=`
+feedback, Space panic, Esc quit. The live UI shows `Perf` / `Stream`
+(render load %, late, drop, resync) like host DX7. Smoke prints
+`dx7nofx: smoke ok`.
 
 ## Build
 
@@ -92,21 +180,69 @@ run t:\hi.axe
 errorlevel
 ```
 
+The self-test is the one that checks the *generated code* rather than the
+parser, which host tests cannot do — they have no Xtensa to run it on:
+
+```text
+argon test -Put "build\sd_card\CC.AXE=t:\cc.axe" ^
+    -Put "apps\cc\examples\selftest.c=t:\st.c" ^
+    "run t:\cc.axe t:\st.c t:\st.axe" "run t:\st.axe" errorlevel
+```
+
+`errorlevel 0` is the pass; anything else is the number of checks that failed,
+each printed with what it got and what it wanted.
+
 Example source:
 
 ```c
+struct pt {
+    int x;
+    int y;
+};
+
 int add(int a, int b)
 {
     return a + b;
 }
 
+/* A struct travels by address: the callee takes a pointer and writes through it. */
+int move(struct pt *p, int dx, int dy)
+{
+    p->x = p->x + dx;
+    p->y = p->y + dy;
+    return p->x * p->x + p->y * p->y;
+}
+
+/* A string is a char pointer, and walking one is the ordinary C loop. */
+int upper(char *s, char *out)
+{
+    int n = 0;
+    while (*s != 0) {
+        char c = *s;
+        if (c >= 'a' && c <= 'z') {
+            c = c & ~32;
+        }
+        out[n] = c;
+        n = n + 1;
+        s = s + 1;
+    }
+    out[n] = 0;
+    return n;
+}
+
 int ag_main(void)
 {
-    int s = 0;
-    int i;
+    char      buf[32];
+    struct pt p;
+    int       s = 0;
+    int       i;
     for (i = 0; i < 10; i = i + 1) {
         s = s + add(i, 1);
     }
+    p.x = 0;
+    p.y = 0;
+    upper("argon cc", buf);
+    ag_printf("%s %d %d\n", buf, s, move(&p, 3, 4));
     return s;
 }
 ```

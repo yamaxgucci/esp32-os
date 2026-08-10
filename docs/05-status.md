@@ -150,7 +150,7 @@ $py = "D:\Espressif\tools\python_env\idf5.5_py3.12_env\Scripts\python.exe"
 | Файловый менеджер | `apps/fm/` | ✅ **команда `fm`, встроена в ОС**; тот же код собирается и как `.AXE` |
 | ZIP | `cmd_unzip.c`, `apps/zip/`, `third_party/miniz/` | ✅ **`unzip` builtin** (list/extract, store/deflate via miniz); **`ZIP.AXE`** create/update (store) + list/extract (store; deflate → builtin) |
 | Текстовый редактор | `apps/edit/` | ✅ **команда `edit`**, встроена; до 64 КБ / 2048 строк, F2 сохранить |
-| Компилятор C → `.AXE` | `apps/cc/` (`CC.AXE`) | ✅ **Argon CC**: функции/вызовы, globals/`int[]`, `for`, строки, builtins `ag_delay`/`ag_key`/`ag_gfx_*`; демо [`asteroids.c`](../apps/cc/examples/asteroids.c) |
+| Компилятор C → `.AXE` | `apps/cc/` (`CC.AXE`) | ✅ **Argon CC** (фазы A–E): `int`/`char`/указатели, **структуры**, **препроцессор**, **FS/mem/dev**, биты/сдвиги; builtins `ag_delay`/`ag_key`/`ag_btn`/`ag_gfx_*`/`ag_audio_*`/`ag_print*`/`ag_gpio_*`; демо [`asteroids.c`](../apps/cc/examples/asteroids.c), [`fsmem.c`](../apps/cc/examples/fsmem.c), structural DX7 nofx [`dx7nofx.c`](../apps/cc/examples/dx7nofx.c) (гость `CC.AXE`, не host `DX7.AXE`) |
 | Реестр устройств | `src/dev/device.c` | ✅ классы, владельцы, эксклюзивный доступ, отзыв при извлечении |
 | Устройства как файлы | `src/dev/devfs.c` | ✅ `/dev` — диск `D:`, одна таблица дескрипторов с файлами |
 | Встроенные устройства | `src/dev/devices.c`, `storage.c` | ✅ `null zero con flash0 sd0 fb0`, команда `dev` |
