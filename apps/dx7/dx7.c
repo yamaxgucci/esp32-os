@@ -6,19 +6,28 @@
  *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
  */
+#include <string.h>
+
 #include <argon/argon.h>
 #include <argon/keys.h>
 
 #include "audio_out.h"
 #include "ag_dx7.h"
 #include "ag_mid.h"
+#include "ag_fx.h"
 
-AG_APP_SIZED("DX7", "0.3", "argon", 0, 8 * 1024, 128 * 1024);
+AG_APP_SIZED("DX7", "0.4", "argon", 0, 10 * 1024, 192 * 1024);
 
 #define RATE 22050u
 #define CHUNK 441 /* ~20 ms @ 22050 */
 #define CHUNK_US ((uint32_t)((CHUNK * 1000000ull) / RATE))
 #define UI_PERIOD_MS 250u
+
+enum {
+    FX_OFF = 0,
+    FX_LOCAL = 1,
+    FX_CORE1 = 2
+};
 
 static ag_dx7_t s_dx;
 static int16_t s_pcm[CHUNK * 2];
@@ -28,6 +37,21 @@ static uint8_t s_key_held[32]; /* parallel to k_keys[] */
 static uint8_t s_have_keyup;   /* set when terminal sends real KEY_UP */
 static uint8_t s_last_note;    /* last MIDI note triggered (debug) */
 static int s_dirty = 1;
+
+/* Master-bus FX (lazy-init buffers on first fx0/fx1). */
+static ag_fx_t s_fx;
+static int s_fx_ready;
+static int s_fx_mode = FX_OFF; /* default: dry */
+static int s_fx_want = FX_OFF; /* from args; applied after open */
+static uint32_t s_fx_late;     /* core1 wet timeout / underrun */
+static int16_t s_fx_dry[2][CHUNK * 2];
+static int16_t s_fx_wet[2][CHUNK * 2];
+static ag_queue_t s_q_dry;
+static ag_queue_t s_q_wet;
+static ag_thread_t s_fx_thr;
+static volatile int s_fx_run;
+static int s_fx_slot;
+static int s_fx_primed; /* core1: have a wet chunk to play */
 
 /* SysEx bank (packed 128 × N). */
 enum { SYX_MAX = 16, SYX_PATH_LEN = 96 };
@@ -290,9 +314,160 @@ static void syx_next_file(int delta)
     (void)load_syx_file(s_syx_list[s_syx_i]);
 }
 
+static int fx_ensure(void)
+{
+    if (s_fx_ready) {
+        return 0;
+    }
+    if (ag_fx_init(&s_fx, RATE) != 0) {
+        ag_printf("dx7: FX init failed (OOM)\n");
+        return -1;
+    }
+    s_fx_ready = 1;
+    return 0;
+}
+
+static void fx_worker(void *arg)
+{
+    (void)arg;
+    while (s_fx_run) {
+        int slot = 0;
+        if (!ag_queue_recv(s_q_dry, &slot, 50)) {
+            continue;
+        }
+        if (slot < 0) {
+            break;
+        }
+        if (slot > 1) {
+            slot = 0;
+        }
+        memcpy(s_fx_wet[slot], s_fx_dry[slot], sizeof(s_fx_dry[0]));
+        if (s_fx_ready) {
+            ag_fx_process(&s_fx, s_fx_wet[slot], (int32_t)CHUNK);
+        }
+        (void)ag_queue_send(s_q_wet, &slot, 50);
+    }
+    ag_thread_exit();
+}
+
+static void fx_stop_worker(void)
+{
+    int poison = -1;
+    if (s_fx_thr == NULL && s_q_dry == NULL) {
+        s_fx_run = 0;
+        s_fx_primed = 0;
+        return;
+    }
+    s_fx_run = 0;
+    if (s_q_dry) {
+        (void)ag_queue_send(s_q_dry, &poison, 20);
+    }
+    if (s_fx_thr) {
+        (void)ag_thread_join(s_fx_thr, 500);
+        s_fx_thr = NULL;
+    }
+    if (s_q_dry) {
+        ag_queue_delete(s_q_dry);
+        s_q_dry = NULL;
+    }
+    if (s_q_wet) {
+        ag_queue_delete(s_q_wet);
+        s_q_wet = NULL;
+    }
+    s_fx_primed = 0;
+    s_fx_slot = 0;
+}
+
+static int fx_start_worker(void)
+{
+    if (s_fx_thr != NULL) {
+        return 0;
+    }
+    s_q_dry = ag_queue_create(2, sizeof(int));
+    s_q_wet = ag_queue_create(2, sizeof(int));
+    if (s_q_dry == NULL || s_q_wet == NULL) {
+        fx_stop_worker();
+        return -1;
+    }
+    s_fx_run = 1;
+    s_fx_primed = 0;
+    s_fx_slot = 0;
+    /* prio a bit above typical app (0); run on system core */
+    s_fx_thr = ag_thread_create(fx_worker, NULL, "dx7fx", 10 * 1024, 2,
+                                AG_THREAD_SYS_CORE);
+    if (s_fx_thr == NULL) {
+        fx_stop_worker();
+        return -1;
+    }
+    return 0;
+}
+
+static int fx_set_mode(int mode)
+{
+    if (mode < FX_OFF) {
+        mode = FX_OFF;
+    }
+    if (mode > FX_CORE1) {
+        mode = FX_OFF;
+    }
+    if (mode == s_fx_mode) {
+        return 0;
+    }
+    if (mode == FX_OFF) {
+        fx_stop_worker();
+        s_fx_mode = FX_OFF;
+        s_dirty = 1;
+        return 0;
+    }
+    if (fx_ensure() != 0) {
+        return -1;
+    }
+    if (mode == FX_LOCAL) {
+        fx_stop_worker();
+        s_fx_mode = FX_LOCAL;
+        s_dirty = 1;
+        return 0;
+    }
+    /* FX_CORE1 */
+    fx_stop_worker();
+    if (fx_start_worker() != 0) {
+        ag_printf("dx7: FX core1 worker failed; staying local\n");
+        s_fx_mode = FX_LOCAL;
+        s_dirty = 1;
+        return -1;
+    }
+    s_fx_mode = FX_CORE1;
+    s_dirty = 1;
+    return 0;
+}
+
+static const char *fx_mode_name(int mode)
+{
+    if (mode == FX_LOCAL) {
+        return "local";
+    }
+    if (mode == FX_CORE1) {
+        return "core1";
+    }
+    return "off";
+}
+
 static int parse_sink_arg(const char *arg)
 {
     if (arg == NULL || arg[0] == '\0') {
+        return 0;
+    }
+    if (str_ieq(arg, "nofx") || str_ieq(arg, "fxoff")) {
+        s_fx_want = FX_OFF;
+        return 0;
+    }
+    if (str_ieq(arg, "fx0") || str_ieq(arg, "fxlocal")) {
+        s_fx_want = FX_LOCAL;
+        return 0;
+    }
+    if (str_ieq(arg, "fx1") || str_ieq(arg, "fxcore") ||
+        str_ieq(arg, "fxcore1")) {
+        s_fx_want = FX_CORE1;
         return 0;
     }
     if (str_ieq(arg, "net") || str_ieq(arg, "tcp") || str_ieq(arg, "pcmvirt") ||
@@ -686,10 +861,23 @@ static void draw_ui(void)
     ag_printf("Stream: late %u  drop %u B  resync %u  chunk %u\n",
               (unsigned)s_late, (unsigned)s_drop, (unsigned)s_resync,
               (unsigned)CHUNK);
+    if (s_fx_mode == FX_OFF) {
+        ag_printf("FX    : mode=off  (F cycle  nofx|fx0|fx1)\n");
+    } else {
+        unsigned en = s_fx_ready ? s_fx.enable : 0u;
+        ag_printf("FX    : mode=%s  D%c C%c R%c  wet %u/127  fxlate %u\n",
+                  fx_mode_name(s_fx_mode),
+                  (en & AG_FX_DELAY) ? '+' : '-',
+                  (en & AG_FX_CHORUS) ? '+' : '-',
+                  (en & AG_FX_REVERB) ? '+' : '-',
+                  s_fx_ready ? (unsigned)s_fx.master_wet : 0u,
+                  (unsigned)s_fx_late);
+    }
     ag_printf("\n");
     ag_printf("Keys  : , . patch   K L bank   Tab .syx   ; builtins\n");
     ag_printf("        Enter mid play/stop   \\ restart   A audition\n");
     ag_printf("        [ ] alg  - = fb   Space panic   Esc quit\n");
+    ag_printf("        F FX mode   D/C/V delay/chor/rev   8/9 wet\n");
     s_dirty = 0;
 }
 
@@ -710,7 +898,60 @@ static void load_preset(int idx)
 
 static void handle_key(int key, int down, int is_repeat, uint32_t uni)
 {
-    int pi = piano_index_ex(key, uni);
+    int pi;
+
+    /* FX controls (F / 8 / 9 always; D/C/V steal piano keys while FX on). */
+    if (down && !is_repeat) {
+        if (key == AG_KEY_F) {
+            int next = s_fx_mode + 1;
+            if (next > FX_CORE1) {
+                next = FX_OFF;
+            }
+            (void)fx_set_mode(next);
+            return;
+        }
+        if (key == AG_KEY_8) {
+            if (s_fx_mode != FX_OFF && fx_ensure() == 0) {
+                if (s_fx.master_wet >= 8u) {
+                    s_fx.master_wet = (uint8_t)(s_fx.master_wet - 8u);
+                } else {
+                    s_fx.master_wet = 0;
+                }
+                s_dirty = 1;
+            }
+            return;
+        }
+        if (key == AG_KEY_9) {
+            if (s_fx_mode != FX_OFF && fx_ensure() == 0) {
+                if (s_fx.master_wet <= 119u) {
+                    s_fx.master_wet = (uint8_t)(s_fx.master_wet + 8u);
+                } else {
+                    s_fx.master_wet = 127u;
+                }
+                s_dirty = 1;
+            }
+            return;
+        }
+        if (s_fx_mode != FX_OFF && fx_ensure() == 0) {
+            if (key == AG_KEY_D) {
+                s_fx.enable ^= AG_FX_DELAY;
+                s_dirty = 1;
+                return;
+            }
+            if (key == AG_KEY_C) {
+                s_fx.enable ^= AG_FX_CHORUS;
+                s_dirty = 1;
+                return;
+            }
+            if (key == AG_KEY_V) {
+                s_fx.enable ^= AG_FX_REVERB;
+                s_dirty = 1;
+                return;
+            }
+        }
+    }
+
+    pi = piano_index_ex(key, uni);
     if (pi >= 0) {
         uint8_t note = (uint8_t)k_keys[pi].note;
         /*
@@ -940,12 +1181,15 @@ static void pace_wait(ag_time_t due)
     }
 }
 
+static int16_t s_fx_prev_wet[CHUNK * 2];
+
 static void pump_audio(void)
 {
     const int32_t n = (int32_t)CHUNK;
     const size_t bytes = (size_t)n * 4u;
     ag_time_t t0, t1;
     int32_t wr;
+    int core1 = (s_fx_mode == FX_CORE1 && s_q_dry && s_q_wet);
 
     t0 = ag_micros();
     if (s_mid_loaded && s_mid.playing) {
@@ -953,6 +1197,26 @@ static void pump_audio(void)
                        NULL);
     }
     ag_dx7_render(&s_dx, s_pcm, n);
+
+    if (s_fx_mode == FX_LOCAL && s_fx_ready) {
+        ag_fx_process(&s_fx, s_pcm, n);
+    } else if (core1) {
+        int slot = s_fx_slot;
+
+        memcpy(s_fx_dry[slot], s_pcm, sizeof(s_fx_dry[0]));
+        if (!ag_queue_send(s_q_dry, &slot, 5)) {
+            s_fx_late++;
+        } else {
+            s_fx_slot ^= 1;
+        }
+        /* +1 chunk: play previous wet (or silence) while worker runs. */
+        if (s_fx_primed) {
+            memcpy(s_pcm, s_fx_prev_wet, sizeof(s_fx_prev_wet));
+        } else {
+            memset(s_pcm, 0, sizeof(s_pcm));
+        }
+    }
+
     t1 = ag_micros();
     s_render_us = (uint32_t)(t1 - t0);
     if (CHUNK_US > 0u) {
@@ -964,18 +1228,33 @@ static void pump_audio(void)
 
     if (s_audio_fd < 0) {
         s_send_us = 0;
-        return;
-    }
-    wr = ag_dev_write(s_audio_fd, s_pcm, bytes);
-    s_send_us = (uint32_t)(ag_micros() - t1);
-    if (wr < 0) {
-        if (!s_send_err_reported) {
-            s_send_err_reported = 1;
-            ag_printf("dx7: %s: %s\n", s_audio_path, ag_strerror((ag_err_t)wr));
+    } else {
+        wr = ag_dev_write(s_audio_fd, s_pcm, bytes);
+        s_send_us = (uint32_t)(ag_micros() - t1);
+        if (wr < 0) {
+            if (!s_send_err_reported) {
+                s_send_err_reported = 1;
+                ag_printf("dx7: %s: %s\n", s_audio_path,
+                          ag_strerror((ag_err_t)wr));
+            }
+            s_drop += (uint32_t)bytes;
+        } else if ((size_t)wr < bytes) {
+            s_drop += (uint32_t)(bytes - (size_t)wr);
         }
-        s_drop += (uint32_t)bytes;
-    } else if ((size_t)wr < bytes) {
-        s_drop += (uint32_t)(bytes - (size_t)wr);
+    }
+
+    /* Collect wet after write so FX overlaps device I/O. */
+    if (core1) {
+        int wet_slot = 0;
+        if (ag_queue_recv(s_q_wet, &wet_slot, 10)) {
+            if (wet_slot < 0 || wet_slot > 1) {
+                wet_slot = 0;
+            }
+            memcpy(s_fx_prev_wet, s_fx_wet[wet_slot], sizeof(s_fx_prev_wet));
+            s_fx_primed = 1;
+        } else {
+            s_fx_late++;
+        }
     }
 }
 
@@ -988,9 +1267,9 @@ int ag_main(int argc, char **argv)
 
     for (i = 1; i < argc; i++) {
         if (parse_sink_arg(argv[i]) != 0) {
-            ag_printf(
-                "dx7: unknown arg '%s' (pcmvirt|pcmnull|audio|mock|.syx|.mid)\n",
-                argv[i]);
+            ag_printf("dx7: unknown arg '%s' "
+                      "(pcmvirt|pcmnull|audio|mock|nofx|fx0|fx1|.syx|.mid)\n",
+                      argv[i]);
         }
     }
 
@@ -1000,6 +1279,9 @@ int ag_main(int argc, char **argv)
 
     ag_dx7_init(&s_dx, RATE);
     ag_mid_init(&s_mid);
+    if (s_fx_want != FX_OFF) {
+        (void)fx_set_mode(s_fx_want);
+    }
     console_enable_key_events();
     load_preset(0);
     if (s_bank_path[0] != '\0') {
@@ -1068,6 +1350,11 @@ int ag_main(int argc, char **argv)
 
 done:
     ag_dx7_note_off_all(&s_dx);
+    fx_stop_worker();
+    if (s_fx_ready) {
+        ag_fx_free(&s_fx);
+        s_fx_ready = 0;
+    }
     ag_mid_unload(&s_mid);
     console_disable_key_events();
     close_sink();
