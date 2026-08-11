@@ -447,18 +447,18 @@ A–E в [`docs/06-ideas.md`](06-ideas.md) (§ DX7 / Argon CC):
    chunk — [`fsmem.c`](../apps/cc/examples/fsmem.c)
 5. ✅ **E:** structural **DX7 nofx** на CC — [`dx7nofx.c`](../apps/cc/examples/dx7nofx.c)
    (без `ag_fx`, без второго ядра). Host `DX7.AXE` — FX / WAV.
-6. **Сборка загружаемых драйверов `.SYS` на госте** — после A–E. Сейчас `.SYS`
-   собирает только host `mkaxe` (`AG_DRV` / `ag_driver_init`). CC должен уметь
-   эмитить образ с `AG_AXE_DRIVER`, точкой входа `ag_driver_init` (не `ag_main`)
-   и вызовами `ag_dev_add` / `ag_dev_ioctl` / `api->net` и т.п. Цикл на плате:
-   `edit` → `cc` → `drv install`
+6. ✅ **Сборка загружаемых драйверов `.SYS` на госте** (10 августа 2026) —
+   `ag_driver_init` + `AG_AXE_DRIVER`, `#pragma drv "NAME" "VER" "AUTHOR"`,
+   `&func`, builtins `ag_dev_add` / `ag_dev_remove` / `ag_dev_priv`. Пример
+   [`apps/cc/examples/echo.c`](../apps/cc/examples/echo.c):
+   `run h:\cc.axe h:\echo.c h:\echo.sys` → `drv load` → `d:\echo`. Host
+   `mkaxe` + `AG_DRV` остаётся для модулей, которым нужен полный C.
 
 Критерий для пинов: исходник с `ag_gpio_config` / `ag_gpio_write` собирается
 CC на госте и дергает GPIO без host GCC.
 
-Критерий для `.SYS`: исходник с `AG_DRV` / `ag_driver_init` / `ag_dev_add`
-собирается CC на госте в `.SYS`, `drv install` поднимает устройство, оно видно
-в `dev`, приложение пишет в `/dev/…` без host GCC.
+Критерий для `.SYS`: ✅ исходник с `#pragma drv` / `ag_driver_init` /
+`ag_dev_add` собирается CC на госте в `.SYS`, `drv load` поднимает устройство.
 
 Критерий Mini-C / DX7-nofx: фазы A–E ✅ — см. `06-ideas.md`.
 
@@ -642,11 +642,9 @@ BIOS: все контроллеры SoC и все шины. Всё, что по�
    необходимости читает ID, грузит модуль с `ag_probe_hint()`. `drv probe`
    повторяет подбор вручную. Пример — `apps/whoami`. Для панелей на SPI
    сканировать нечего — тип и пины из `BOARD.CFG`.
-5. ⬜ **Argon CC → `.SYS` на госте** (см. бэклог CC п. 4). Без этого «драйверы
-   на месте» всё равно требуют ПК с `mkaxe`. С CC: написал модуль в `edit`,
-   собрал, `drv install` — и устройство в `/dev` без пересборки прошивки и без
-   host toolchain. Минимальный образец — аналог `apps/echo` или тонкий PCM-
-   бэкенд поверх уже существующего `api->net`.
+5. ✅ **Argon CC → `.SYS` на госте** (10 августа 2026; см. бэклог CC п. 6).
+   `edit` → `cc` → `drv load` / `drv install` без host `mkaxe`. Образец —
+   [`apps/cc/examples/echo.c`](../apps/cc/examples/echo.c).
 6. ⬜ **Каналы доставки**, по возрастанию цены:
    * **UART** — работает уже сегодня: `recv` принимает файл шестнадцатеричными
      строками, без протокола и без инструментов на другом конце. Медленно
@@ -727,10 +725,10 @@ MQTT, Modbus TCP, OTA. Подтаблица `api->net` перестаёт быт
    + упрощённый EG. ✅ сравнение с `ym2612.c` как `MDYM.AXE` (~180 КБ). ✅
    стартовые кадры = тяжёлый 68000. ✅ `api->audio` + I2S/`pcm0` (stub без пинов).
    Осталось: замеры на плате
-9. **HostFS: надёжный `copy` больших файлов на `H:`** — сейчас крупные записи
-   (сотни КБ, напр. `sms.wav`) у пользователя дают `no space left` / обрыв при
-   живом PADPUSH; обход: `a:\…` + `argon get`. Нужно добить протокол/hostfsd
-   так, чтобы `copy t:\sms.wav h:\…` стабильно работал в интерактивном `argon run`
+9. ✅ **HostFS: надёжный `copy` больших файлов на `H:`** (10 августа 2026) —
+   PADPUSH глушится, пока открыт writable-хэндл; гость шлёт TX кусками по 128 Б
+   и крутит RX между ними (иначе host `sendall` + guest `uart_write` клинят
+   одну UART/TCP трубу). `copy t:\….wav h:\…` при живом `--pad-cfg` ок
 10. ✅ **Размер арены кода из `SYSTEM.CFG`** — `[memory] app_arena_kb=` клипает
     usable размер связанного потолка (`CONFIG_ARGON_APP_ARENA_KB`); хвост IRAM
     линкеру не возвращается; нужен `reboot`. После S-1 — полноценное

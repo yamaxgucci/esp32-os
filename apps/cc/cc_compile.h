@@ -45,11 +45,14 @@ extern "C" {
 #define FS_OFF_READDIR  56
 #define FS_OFF_CLOSEDIR 60
 
-#define DEV_OFF_OPEN  8
-#define DEV_OFF_CLOSE 12
-#define DEV_OFF_READ  16
-#define DEV_OFF_WRITE 20
-#define DEV_OFF_IOCTL 24
+#define DEV_OFF_OPEN     8
+#define DEV_OFF_CLOSE    12
+#define DEV_OFF_READ     16
+#define DEV_OFF_WRITE    20
+#define DEV_OFF_IOCTL    24
+#define DEV_OFF_ADD      32
+#define DEV_OFF_REMOVE   36
+#define DEV_OFF_GET_PRIV 40
 
 #define CON_OFF_PUTS   8
 #define CON_OFF_PRINTF 12
@@ -84,6 +87,10 @@ extern "C" {
 #define GFX_OFF_POLY_VERTEX 60
 #define GFX_OFF_POLY_FILL   64
 #define GFX_OFF_POLY_STROKE 68
+#define GFX_OFF_CLIP            80
+#define GFX_OFF_CLIP_RESET      84
+#define GFX_OFF_STROKE_RECT     88
+#define GFX_OFF_FILL_ROUND_RECT 92
 
 #define AUDIO_OFF_PRESENT 4
 #define AUDIO_OFF_IS_HW   8
@@ -101,6 +108,7 @@ extern "C" {
 #define ABI_MINOR_GFX   9
 #define ABI_MINOR_BTN   10
 #define ABI_MINOR_AUDIO 14
+#define ABI_MINOR_GFX16 16
 
 typedef struct {
     uint8_t *axe;

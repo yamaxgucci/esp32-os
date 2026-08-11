@@ -67,6 +67,11 @@ _Static_assert(SUB_SLOT(ag_dev_api_t, write) == DEV_OFF_WRITE,
                "dev.write moved");
 _Static_assert(SUB_SLOT(ag_dev_api_t, ioctl) == DEV_OFF_IOCTL,
                "dev.ioctl moved");
+_Static_assert(SUB_SLOT(ag_dev_api_t, add) == DEV_OFF_ADD, "dev.add moved");
+_Static_assert(SUB_SLOT(ag_dev_api_t, remove) == DEV_OFF_REMOVE,
+               "dev.remove moved");
+_Static_assert(SUB_SLOT(ag_dev_api_t, get_priv) == DEV_OFF_GET_PRIV,
+               "dev.get_priv moved");
 
 _Static_assert(SUB_SLOT(ag_con_api_t, puts) == CON_OFF_PUTS, "con.puts moved");
 _Static_assert(SUB_SLOT(ag_con_api_t, printf) == CON_OFF_PRINTF,
@@ -121,6 +126,14 @@ _Static_assert(SUB_SLOT(ag_gfx_api_t, poly_fill) == GFX_OFF_POLY_FILL,
                "gfx.poly_fill moved");
 _Static_assert(SUB_SLOT(ag_gfx_api_t, poly_stroke) == GFX_OFF_POLY_STROKE,
                "gfx.poly_stroke moved");
+_Static_assert(SUB_SLOT(ag_gfx_api_t, clip) == GFX_OFF_CLIP, "gfx.clip moved");
+_Static_assert(SUB_SLOT(ag_gfx_api_t, clip_reset) == GFX_OFF_CLIP_RESET,
+               "gfx.clip_reset moved");
+_Static_assert(SUB_SLOT(ag_gfx_api_t, stroke_rect) == GFX_OFF_STROKE_RECT,
+               "gfx.stroke_rect moved");
+_Static_assert(SUB_SLOT(ag_gfx_api_t, fill_round_rect) ==
+                   GFX_OFF_FILL_ROUND_RECT,
+               "gfx.fill_round_rect moved");
 
 _Static_assert(SUB_SLOT(ag_audio_api_t, present) == AUDIO_OFF_PRESENT,
                "audio.present moved");
@@ -318,6 +331,13 @@ static void check_dx7nofx_example(void)
                        "apps/cc/examples/dx7nofx.c", 128 * 1024, 0u);
 }
 
+static void check_echo_sys_example(void)
+{
+    /* AG_AXE_DRIVER = 1<<3 */
+    check_example_file("echo.sys", "../apps/cc/examples/echo.c",
+                       "apps/cc/examples/echo.c", 16 * 1024, 8u);
+}
+
 void run_cc_tests(void)
 {
     printf("cc\n");
@@ -358,6 +378,35 @@ void run_cc_tests(void)
     check_expr("'\\n'", 10);
 
     check_prog("int ag_main(void) { return 42; }\n", 1);
+    check_prog("#pragma drv \"ECHO\" \"1.0\" \"cc\"\n"
+               "int ag_driver_init(void) { return 0; }\n",
+               1);
+    check_prog("int ag_driver_init(void) { return 0; }\n", 0);
+    check_prog("#pragma drv \"ECHO\" \"1.0\" \"cc\"\n"
+               "int echo_read(int d, char *p, int n, int a, int b) { return 0; }\n"
+               "int ag_driver_init(void) {\n"
+               "  int ops[6];\n"
+               "  ops[2] = &echo_read;\n"
+               "  return ag_dev_add(ops);\n"
+               "}\n",
+               1);
+    check_prog("int ag_main(void) { return 0; }\n"
+               "int ag_driver_init(void) { return 0; }\n",
+               0);
+    {
+        cc_result_t res;
+        const char *src = "#pragma drv \"ECHO\" \"1.0\" \"cc\"\n"
+                          "int ag_driver_init(void) { return 0; }\n";
+        AG_CHECK(cc_compile_to_axe(src, strlen(src), &res) == 0);
+        if (res.axe != NULL) {
+            const uint32_t flags =
+                (uint32_t)res.axe[12] | ((uint32_t)res.axe[13] << 8) |
+                ((uint32_t)res.axe[14] << 16) | ((uint32_t)res.axe[15] << 24);
+            AG_CHECK((flags & 8u) != 0);
+            AG_CHECK(memcmp(res.axe + 72, "ECHO", 4) == 0);
+            cc_result_free(&res);
+        }
+    }
     check_prog("int ag_main(void) {\n"
                "  int x = 1;\n"
                "  int y = 2;\n"
@@ -951,4 +1000,5 @@ void run_cc_tests(void)
 
     check_asteroids_example();
     check_dx7nofx_example();
+    check_echo_sys_example();
 }
