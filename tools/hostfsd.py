@@ -116,6 +116,12 @@ class Session:
         self._push_thread: threading.Thread | None = None
         # True while handling a guest RPC (recv request → send reply).
         self._rpc_busy = False
+        # Handles opened for write.  PADPUSH must stay off for the whole copy
+        # (not only mid-RPC), or WRITE payloads deadlock the shared UART pipe.
+        self.writable_handles: set[int] = set()
+
+    def _pad_blocked(self) -> bool:
+        return self._rpc_busy or bool(self.writable_handles)
 
     def start_pad_push(self, conn: socket.socket) -> None:
         if self.pad is None:
@@ -126,7 +132,7 @@ class Session:
                 # Never push during an RPC or while a writable file is open.
                 # PADPUSH + large WRITE payloads deadlock the TCP serial link
                 # (host blocked in sendall, guest blocked in uart_write).
-                if self._rpc_busy or self._writable_open():
+                if self._pad_blocked():
                     time.sleep(0.016)
                     continue
                 snap = self.pad.snapshot()
@@ -136,7 +142,7 @@ class Session:
                     snap = (snap + b"\x00\x00\x00\x00\x00\x01")[:6]
                 try:
                     with self.send_lock:
-                        if self._rpc_busy or self._writable_open():
+                        if self._pad_blocked():
                             pass
                         else:
                             old_to = conn.gettimeout()
@@ -177,15 +183,6 @@ class Session:
             norm = "/" + norm
         return norm.lower() == PAD_VPATH
 
-    def _writable_open(self) -> bool:
-        for f in self.files.values():
-            try:
-                if f.writable():
-                    return True
-            except Exception:  # noqa: BLE001
-                continue
-        return False
-
     def resolve(self, rel: str) -> Path | None:
         # Guest paths are POSIX-ish under mount root ("/", "/foo").
         rel = rel.replace("\\", "/")
@@ -223,6 +220,8 @@ class Session:
                     return
                 if path_len > 512 or data_len > HSFS_MAX_DATA:
                     return
+                # Quiesce PADPUSH before reading the rest of the request body
+                # (WRITE payloads are up to 4 KiB and share this TCP pipe).
                 self._rpc_busy = True
                 try:
                     path_b = read_exact(conn, path_len) if path_len else b""
@@ -365,6 +364,8 @@ class Session:
             h = self.next_h
             self.next_h += 1
             self.files[h] = f
+            if want_write:
+                self.writable_handles.add(h)
             try:
                 size = p.stat().st_size
             except OSError:
@@ -427,6 +428,7 @@ class Session:
                 send_resp(conn, op, seq, AG_OK, lock=lock)
                 return
             f = self.files.pop(a0, None)
+            self.writable_handles.discard(a0)
             if f is not None:
                 f.close()
             send_resp(conn, op, seq, AG_OK, lock=lock)

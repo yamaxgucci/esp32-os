@@ -102,8 +102,8 @@ H:\> run sms.axe sonic.sms
 | Guest `hostfs.c` | RPC over UART1, mount `/host` (read + file write) |
 
 Console stays on the first serial. With `--pad-cfg`, hostfsd **pushes** live pad
-snapshots. Large WAV copies on `H:` while PADPUSH is live can be flaky — prefer
-`A:` + `argon get` for big captures (backlog in [`04-roadmap.md`](../04-roadmap.md)).
+snapshots, and pauses them while a guest file on `H:` is open for write so large
+`copy … h:\…` does not deadlock the shared UART pipe.
 
 ### Sync vs HostFS
 
