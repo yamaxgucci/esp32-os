@@ -30,9 +30,13 @@ from pathlib import Path
 
 
 def read_exact(sock: socket.socket, n: int) -> bytes:
+    """Read n bytes.  Honors sock timeout; raises TimeoutError on wait expiry."""
     buf = bytearray()
     while len(buf) < n:
-        chunk = sock.recv(n - len(buf))
+        try:
+            chunk = sock.recv(n - len(buf))
+        except socket.timeout as e:
+            raise TimeoutError("recv timed out") from e
         if not chunk:
             raise EOFError("connection closed")
         buf.extend(chunk)
@@ -283,29 +287,55 @@ def save_wav(sock: socket.socket, rate: int, channels: int, path: Path) -> None:
 
 
 def connect(host: str, port: int, retries: int) -> socket.socket:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 256 * 1024)
-
     last_err: Exception | None = None
     for i in range(max(1, retries)):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 256 * 1024)
+        # Short timeouts so Ctrl+C is delivered on Windows (blocking recv
+        # otherwise swallows SIGINT until the guest sends data).
+        sock.settimeout(1.0)
         try:
             sock.connect((host, port))
             return sock
         except OSError as e:
             last_err = e
+            sock.close()
             if i + 1 < retries:
                 print(f"waiting for pcmvirt on {host}:{port}...", flush=True)
                 time.sleep(1)
-    sock.close()
     raise OSError(f"connect failed: {last_err}")
+
+
+def read_wav_header(sock: socket.socket) -> bytes:
+    """Wait for the 44-byte WAV header; print status; stay Ctrl+C-friendly."""
+    print(
+        "TCP up; waiting for WAV header from guest "
+        "(run an app with audio_out=/dev/pcmvirt — e.g. grain/dx7)...",
+        flush=True,
+    )
+    last_ping = time.monotonic()
+    while True:
+        try:
+            return read_exact(sock, 44)
+        except TimeoutError:
+            now = time.monotonic()
+            if now - last_ping >= 5.0:
+                print(
+                    "still waiting for header "
+                    "(driver alone is not enough — start the guest app)...",
+                    flush=True,
+                )
+                last_ping = now
 
 
 def session(sock: socket.socket, args: argparse.Namespace) -> None:
     rec: WavRecorder | None = None
     try:
-        hdr = read_exact(sock, 44)
+        hdr = read_wav_header(sock)
         rate, channels, _bits = parse_wav_header(hdr)
+        # Full-block recv again — timeouts were only for the header wait / Ctrl+C.
+        sock.settimeout(None)
         print(f"connected: {rate} Hz, {channels} ch", flush=True)
         if args.save:
             save_wav(sock, rate, channels, args.save)
