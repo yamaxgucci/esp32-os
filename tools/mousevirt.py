@@ -234,10 +234,15 @@ def main() -> int:
         flush=True,
     )
 
+    def hwnd_i(h: object | None) -> int:
+        # Win32 NULL HWND often arrives as None from ctypes.
+        return int(h) if h else 0
+
     def console_focused() -> bool:
-        if not hwnd_console:
+        cons = hwnd_i(hwnd_console)
+        if cons == 0:
             return True
-        return int(user32.GetForegroundWindow()) == int(hwnd_console)
+        return hwnd_i(user32.GetForegroundWindow()) == cons
 
     while True:
         if sock is None:
@@ -334,7 +339,9 @@ def main() -> int:
                     sock = None
                     if not args.reconnect:
                         return 1
-                    time.sleep(0.3)
+                    # Let the guest notice EOF before we SYN again (avoids
+                    # connect→RST while a zombie fd still owns the slot).
+                    time.sleep(0.75)
                     continue
 
         time.sleep(period)

@@ -15,7 +15,7 @@
 #include <argon/argon.h>
 #include <argon/libc.h>
 
-AG_DRV("MOUSEVIRT", "1.2", "argon");
+AG_DRV("MOUSEVIRT", "1.3", "argon");
 
 #define MOUSEVIRT_PORT 5560u
 #define PKT_SIZE       8u
@@ -177,12 +177,12 @@ static void try_accept(mousevirt_state_t *st)
         return;
     }
     /*
-     * Single host tool.  Replacing a live peer on every backlog SYN (host
-     * reconnect race) used to flap TCP and starve GRAIN of POINTER events.
+     * One host tool.  Always take the newest peer (same as pcmvirt/midivirt).
+     * Rejecting while a half-closed zombie still sat in st->conn made the host
+     * see connect → WinError 10053 on every --reconnect attempt.
      */
     if (st->conn >= 0) {
-        (void)ag_net_close(peer);
-        return;
+        close_conn(st, "replaced by new peer");
     }
     st->conn = peer;
     (void)ag_net_set_nonblock(st->conn, true);
@@ -190,10 +190,10 @@ static void try_accept(mousevirt_state_t *st)
     ag_log(AG_LOG_INFO, "mousevirt", "host connected");
 }
 
-static void pump_rx(mousevirt_state_t *st)
+/* Non-blocking drain; closes st->conn on peer error/EOF. */
+static void recv_available(mousevirt_state_t *st)
 {
     uint8_t buf[RX_CHUNK];
-    try_accept(st);
     if (st->conn < 0) {
         return;
     }
@@ -208,6 +208,14 @@ static void pump_rx(mousevirt_state_t *st)
         }
         feed_bytes(st, buf, n);
     }
+}
+
+static void pump_rx(mousevirt_state_t *st)
+{
+    /* Drop a dead peer before accept so reconnect can bind cleanly. */
+    recv_available(st);
+    try_accept(st);
+    recv_available(st);
 }
 
 static ag_err_t mouse_open(ag_device_t *dev, uint32_t flags)
