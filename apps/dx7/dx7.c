@@ -22,6 +22,8 @@ AG_APP_SIZED("DX7", "0.5", "argon", 0, 10 * 1024, 192 * 1024);
 #define RATE 22050u
 #define CHUNK 441 /* ~20 ms @ 22050 */
 #define CHUNK_US ((uint32_t)((CHUNK * 1000000ull) / RATE))
+/* Only start a UI redraw if this much slack remains before the audio due. */
+#define UI_SLACK_US 4000u
 #define UI_PERIOD_MS 250u
 
 enum {
@@ -537,21 +539,19 @@ static void voice_note_on(uint8_t note, uint8_t vel)
     ag_dx7_note_on(&s_dx, note, vel ? vel : 100);
     held_set(note, 1);
     s_last_note = note;
-    s_dirty = 1;
+    /* Do not s_dirty: full console redraw must not steal the audio budget. */
 }
 
 static void voice_note_off(uint8_t note)
 {
     ag_dx7_note_off(&s_dx, note);
     held_set(note, 0);
-    s_dirty = 1;
 }
 
 static void voice_panic(void)
 {
     ag_dx7_note_off_all(&s_dx);
     held_clear_all();
-    s_dirty = 1;
 }
 
 static void mid_note_cb(void *ctx, int on, uint8_t note, uint8_t vel,
@@ -954,33 +954,34 @@ static void draw_ui(void)
 {
     const ag_dx7_patch_t *p = &s_dx.patch;
     uint32_t budget = CHUNK_US ? CHUNK_US : 1u;
-    ag_printf("\x1b[H\x1b[2J");
-    ag_printf("DX7 structural FM  (%d-voice)  sink=%s\n", AG_DX7_VOICES,
+    /* Home + EL; avoid full CLS (serial/QEMU — tens of ms, steals audio). */
+    ag_printf("\x1b[H");
+    ag_printf("DX7 structural FM  (%d-voice)  sink=%s\x1b[K\n", AG_DX7_VOICES,
               sink_name());
-    ag_printf("-------------------------\n");
+    ag_printf("-------------------------\x1b[K\n");
     if (s_use_bank && s_bank_n > 0) {
-        ag_printf("Patch : bank %d/%d %-10s  (%s)\n", s_bank_voice + 1,
+        ag_printf("Patch : bank %d/%d %-10s  (%s)\x1b[K\n", s_bank_voice + 1,
                   s_bank_n, p->name, path_base(s_bank_path));
     } else {
-        ag_printf("Patch : builtin [%d] %-10s\n", s_preset, p->name);
+        ag_printf("Patch : builtin [%d] %-10s\x1b[K\n", s_preset, p->name);
     }
     if (s_mid_loaded) {
-        ag_printf("MIDI  : %s  %s  ev %d/%d  noteons %u  loop\n",
+        ag_printf("MIDI  : %s  %s  ev %d/%d  noteons %u  loop\x1b[K\n",
                   s_mid.name, s_mid.playing ? "PLAY" : "stop", s_mid.iev,
                   s_mid.nev, (unsigned)s_mid_notes);
     } else if (s_mid_err[0]) {
-        ag_printf("MIDI  : FAIL %s  (%s)\n", s_mid_err,
+        ag_printf("MIDI  : FAIL %s  (%s)\x1b[K\n", s_mid_err,
                   s_mid_path[0] ? s_mid_path : "?");
     } else {
-        ag_printf("MIDI  : (none — pass path.mid to load/play)\n");
+        ag_printf("MIDI  : (none — pass path.mid to load/play)\x1b[K\n");
     }
-    ag_printf("Alg   : %2u / 32     Feedback: %u     Transpose: %u (%+d st)\n",
+    ag_printf("Alg   : %2u / 32     Feedback: %u     Transpose: %u (%+d st)\x1b[K\n",
               (unsigned)p->algorithm + 1u, (unsigned)p->feedback,
               (unsigned)p->transpose, (int)p->transpose - 24);
-    ag_printf("OP lvl: %2u %2u %2u %2u %2u %2u\n",
+    ag_printf("OP lvl: %2u %2u %2u %2u %2u %2u\x1b[K\n",
               p->op[0].out_level, p->op[1].out_level, p->op[2].out_level,
               p->op[3].out_level, p->op[4].out_level, p->op[5].out_level);
-    ag_printf("OP en : %c%c%c%c%c%c   car mute:%s\n",
+    ag_printf("OP en : %c%c%c%c%c%c   car mute:%s\x1b[K\n",
               (s_dx.perf.op_enable & 1) ? '1' : '-',
               (s_dx.perf.op_enable & 2) ? '2' : '-',
               (s_dx.perf.op_enable & 4) ? '3' : '-',
@@ -988,9 +989,9 @@ static void draw_ui(void)
               (s_dx.perf.op_enable & 16) ? '5' : '-',
               (s_dx.perf.op_enable & 32) ? '6' : '-',
               s_dx.perf.carrier_mute ? "ON" : "off");
-    ag_printf("LFO   : spd %u  pmd %u  amd %u  wave %u\n",
+    ag_printf("LFO   : spd %u  pmd %u  amd %u  wave %u\x1b[K\n",
               p->lfo_speed, p->lfo_pmd, p->lfo_amd, p->lfo_wave);
-    ag_printf("Ctrl  : MW %u  AT %u  porta %s/%u  uni %u/%u  audition:%s\n",
+    ag_printf("Ctrl  : MW %u  AT %u  porta %s/%u  uni %u/%u  audition:%s\x1b[K\n",
               (unsigned)s_dx.perf.mod_wheel, (unsigned)s_dx.perf.aftertouch,
               s_dx.perf.porta_on ? "on" : "off",
               (unsigned)s_dx.perf.porta_time, (unsigned)s_dx.perf.unison,
@@ -1006,25 +1007,25 @@ static void draw_ui(void)
             lastbuf[k] = ln[k];
         }
         lastbuf[k] = '\0';
-        ag_printf("Voices: %d / %d active   kbdkeys: %d   keyup:%s\n",
+        ag_printf("Voices: %d / %d active   kbdkeys: %d   keyup:%s\x1b[K\n",
                   ag_dx7_active_voices(&s_dx), AG_DX7_VOICES, s_notes_down,
                   s_have_keyup ? "yes(poly)" : "no(mono/VT)");
-        ag_printf("Keys  : held %s   last %s(%u)   src %s   n=%d  inev %u\n",
+        ag_printf("Keys  : held %s   last %s(%u)   src %s   n=%d  inev %u\x1b[K\n",
                   held, lastbuf, (unsigned)s_last_note,
                   s_midi_fd >= 0 ? "midivirt+kbd" : "kbd", s_held_n,
                   (unsigned)s_midi_ev);
     }
-    ag_printf("Perf  : render %u us / %u us (%u%%)  send %u us  loop %u us\n",
+    ag_printf("Perf  : render %u us / %u us (%u%%)  send %u us  loop %u us\x1b[K\n",
               (unsigned)s_render_us, (unsigned)budget, (unsigned)s_load_pct,
               (unsigned)s_send_us, (unsigned)s_loop_us);
-    ag_printf("Stream: late %u  drop %u B  resync %u  chunk %u\n",
+    ag_printf("Stream: late %u  drop %u B  resync %u  chunk %u\x1b[K\n",
               (unsigned)s_late, (unsigned)s_drop, (unsigned)s_resync,
               (unsigned)CHUNK);
     if (s_fx_mode == FX_OFF) {
-        ag_printf("FX    : mode=off  (F cycle  nofx|fx0|fx1)\n");
+        ag_printf("FX    : mode=off  (F cycle  nofx|fx0|fx1)\x1b[K\n");
     } else {
         unsigned en = s_fx_ready ? s_fx.enable : 0u;
-        ag_printf("FX    : mode=%s  D%c C%c R%c  wet %u/127  fxlate %u\n",
+        ag_printf("FX    : mode=%s  D%c C%c R%c  wet %u/127  fxlate %u\x1b[K\n",
                   fx_mode_name(s_fx_mode),
                   (en & AG_FX_DELAY) ? '+' : '-',
                   (en & AG_FX_CHORUS) ? '+' : '-',
@@ -1032,12 +1033,13 @@ static void draw_ui(void)
                   s_fx_ready ? (unsigned)s_fx.master_wet : 0u,
                   (unsigned)s_fx_late);
     }
-    ag_printf("\n");
-    ag_printf("Help  : , . patch   K L bank   Tab .syx   ; builtins\n");
-    ag_printf("        Enter mid play/stop   \\ restart   A audition\n");
-    ag_printf("        [ ] alg  - = fb   Space panic   Esc quit\n");
-    ag_printf("        F FX mode   D/C/V delay/chor/rev   8/9 wet\n");
-    ag_printf("        host midikbd.py → /dev/midivirt (poly)\n");
+    ag_printf("\x1b[K\n");
+    ag_printf("Help  : , . patch   K L bank   Tab .syx   ; builtins\x1b[K\n");
+    ag_printf("        Enter mid play/stop   \\ restart   A audition\x1b[K\n");
+    ag_printf("        [ ] alg  - = fb   Space panic   Esc quit\x1b[K\n");
+    ag_printf("        F FX mode   D/C/V delay/chor/rev   8/9 wet\x1b[K\n");
+    ag_printf("        host midikbd.py → /dev/midivirt (poly)\x1b[K\n");
+    ag_printf("\x1b[J");
     s_dirty = 0;
 }
 
@@ -1475,12 +1477,27 @@ int ag_main(int argc, char **argv)
         pump_audio();
 
         /*
-         * Steady realtime clock: never "catch up" by bursting extra chunks
-         * (that floods pcmplay → overflow drop → underrun crackle on a sine).
-         * If late, slide the schedule forward from now.
+         * UI only in spare time before the audio due — never after pace_wait
+         * (that stole the next chunk and spiked loop/late under note spam).
+         * Note on/off do not set s_dirty; Keys/Perf refresh on the period.
          */
         {
             ag_time_t now = ag_micros();
+            uint32_t ms = ag_millis();
+            int want_ui = s_dirty || (ms - s_ui_ms) >= UI_PERIOD_MS;
+
+            if (want_ui && now < s_next_due &&
+                (uint32_t)(s_next_due - now) >= UI_SLACK_US) {
+                s_ui_ms = ms;
+                draw_ui();
+                now = ag_micros();
+            }
+
+            /*
+             * Steady realtime clock: never "catch up" by bursting extra chunks
+             * (that floods pcmplay → overflow drop → underrun crackle on a sine).
+             * If late, slide the schedule forward from now.
+             */
             if (now <= s_next_due) {
                 pace_wait(s_next_due);
                 s_next_due += (ag_time_t)CHUNK_US;
@@ -1494,15 +1511,6 @@ int ag_main(int argc, char **argv)
         }
 
         s_loop_us = (uint32_t)(ag_micros() - loop0);
-
-        /* Throttle UI: patch changes or periodic perf refresh (no every-note CLS). */
-        {
-            uint32_t ms = ag_millis();
-            if (s_dirty || (ms - s_ui_ms) >= UI_PERIOD_MS) {
-                s_ui_ms = ms;
-                draw_ui();
-            }
-        }
         ag_heartbeat();
     }
 
