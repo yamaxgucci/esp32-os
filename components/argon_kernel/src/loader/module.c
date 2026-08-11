@@ -114,16 +114,23 @@ ag_err_t ag_module_load_hinted(const char *path, const char *cwd,
         ag_loader_unload(&slot->app);
         return -AG_EFORMAT;
     }
-    if (find_by_name(name) != NULL) {
-        ag_log(AG_LOG_ERROR, "modules", "%s: module '%s' already loaded", path,
-               name);
-        ag_loader_unload(&slot->app);
-        return -AG_EEXIST;
-    }
-
     if (slot->app.binding.entry == NULL) {
         ag_loader_unload(&slot->app);
         return -AG_EFORMAT;
+    }
+
+    /*
+     * Same header name → replace the resident image.  drv install copies a
+     * fresh .SYS onto C: then load(); refusing with EEXIST left the old code
+     * running ("already loaded") while the file on disk was new.
+     */
+    {
+        module_t *existing = find_by_name(name);
+        if (existing != NULL) {
+            ag_log(AG_LOG_INFO, "modules", "replacing %s (%s → %s)", name,
+                   existing->path, path);
+            drop_module(existing);
+        }
     }
 
     set_string_path(slot->path, sizeof(slot->path), path);

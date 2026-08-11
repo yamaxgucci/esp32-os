@@ -346,10 +346,13 @@ sd0       storage   sdmmc       64 MB      read-only removable
 <file>` поднимает модуль сейчас; `drv install <file>` копирует на `C:\drv\`
 (`/sys/drv/`, lowercase — LittleFS чувствителен к регистру), прописывает
 `[modules] device=` в `C:\SYSTEM.CFG` и грузит (после reboot модуль
-поднимается сам и снова публикует устройства в `dev`); `drv uninstall <name>`
-снимает запись/файл; `drv unload <name>` только выгружает из RAM (`name` —
-из заголовка, например `PCMVIRT`); `drv probe` — I2C-подбор из
-`[modules] probe=`. `run` на `.SYS` отказывает: это не приложение.
+поднимается сам и снова публикует устройства в `dev`). Повторный
+`install`/`load` с тем же именем в заголовке **заменяет** резидентный образ
+(выгрузка + новый init) — файл на `C:` уже перезаписывался и раньше, но старый
+код в RAM оставался. `drv uninstall <name>` снимает запись/файл; `drv unload
+<name>` только выгружает из RAM (`name` — из заголовка, например `PCMVIRT`);
+`drv probe` — I2C-подбор из `[modules] probe=`. `run` на `.SYS` отказывает:
+это не приложение.
 
 ```
 A:\> drv install t:\pcmvirt.sys

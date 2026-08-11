@@ -38,7 +38,9 @@ typedef struct {
 
 /*
  * Loads a .SYS (or any .AXE with AG_AXE_DRIVER), calls ag_driver_init, and keeps
- * the image.  -AG_EEXIST when a module of that name is already loaded,
+ * the image.  If a module with the same header name is already resident, it is
+ * unloaded first (devices revoked) and this image takes its place — so
+ * `drv install` / `drv load` pick up a newer .SYS without a reboot.
  * -AG_EINVAL when the image is an ordinary application, -AG_ENFILE when the
  * table is full.  A failing init unloads the image and revokes anything it
  * managed to register before returning the error.

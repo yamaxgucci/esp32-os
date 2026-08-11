@@ -66,14 +66,16 @@ probe  = 0:0x76:0xD0=0x60:a:\drv\bme280.sys
 в арену не попадает. В `ag_driver_init` совпадение доступно через
 `ag_probe_hint()` (шина, адрес, id). Пример — `apps/whoami`.
 
-**Установка один раз** (файл на `C:` + строка в `SYSTEM.CFG` + load сейчас):
+**Установка** (файл на `C:` + строка в `SYSTEM.CFG` + load сейчас):
 
 ```
 drv install t:\pcmvirt.sys
 ```
 
-После reboot модуль поднимается сам со стадии `modules`. `drv uninstall <name>`
-снимает запись и файл. Временно: `drv load t:\…` (без persist).
+Повторный `drv install` того же драйвера перезаписывает файл и **перезагружает**
+модуль в RAM (то же имя в `AG_DRV` → unload + init). После reboot модуль
+поднимается сам со стадии `modules`. `drv uninstall <name>` снимает запись и
+файл. Временно: `drv load t:\…` (без persist; тоже replace по имени).
 
 Шелл: `drv` (список), `drv load` / `unload` / `install` / `uninstall` / `probe`.
 Имя для unload — из заголовка образа (`PCMVIRT`, `ECHO`), не путь к файлу.
