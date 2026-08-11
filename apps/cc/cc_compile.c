@@ -3,7 +3,7 @@
  *
  * Subset: int/void, locals, globals, int arrays, return, if/else, while/for,
  * multiple functions (callx8), string literals, and ABI builtins for time/input/gfx/audio.
- * Entry must be named ag_main.
+ * Entry must be named ag_main (app) or ag_driver_init (driver / .SYS).
  *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
  */
@@ -86,6 +86,7 @@ static void cc_free(void *p)
 #define AG_AXE_R_IN_DATA 0x1u
 #define AG_AXE_R_TO_DATA 0x2u
 #define AG_AXE_NEEDS_GFX (1u << 1)
+#define AG_AXE_DRIVER (1u << 3)
 #define AG_AXE_NEEDS_AUDIO (1u << 6)
 
 #define RET_VOID 0
@@ -235,6 +236,11 @@ typedef struct {
     char       exp[EXP_CAP];
     cc_read_file_fn reader;
     void      *reader_ctx;
+    /* #pragma drv "NAME" "VER" "AUTHOR" — header identity for .SYS images. */
+    int        has_drv;
+    char       drv_name[32];
+    char       drv_ver[16];
+    char       drv_author[32];
 } pp_t;
 
 typedef struct {
@@ -458,6 +464,31 @@ static int pp_word(lex_t *L, char *out, size_t cap)
     }
     out[n] = '\0';
     return n > 0;
+}
+
+/* A quoted string argument of a directive (`#pragma drv "ECHO" …`). */
+static int pp_qstr(lex_t *L, char *out, size_t cap)
+{
+    skip_blanks(L);
+    if (L->pos >= L->len || L->src[L->pos] != '"') {
+        return 0;
+    }
+    L->pos++;
+    size_t n = 0;
+    while (L->pos < L->len && L->src[L->pos] != '"' &&
+           L->src[L->pos] != '\n') {
+        if (n + 1 < cap) {
+            out[n++] = L->src[L->pos];
+        }
+        L->pos++;
+    }
+    out[n] = '\0';
+    if (L->pos >= L->len || L->src[L->pos] != '"') {
+        lex_fail(L, "unterminated string in directive");
+        return 0;
+    }
+    L->pos++;
+    return 1;
 }
 
 static void pp_define(lex_t *L)
@@ -695,6 +726,32 @@ static void pp_directive(lex_t *L)
     }
     if (CC_STRCMP(word, "include") == 0) {
         pp_include(L);
+        return;
+    }
+    if (CC_STRCMP(word, "pragma") == 0) {
+        char kind[MAX_NAME];
+        if (!pp_word(L, kind, sizeof(kind))) {
+            lex_fail(L, "expected a pragma name");
+            return;
+        }
+        if (CC_STRCMP(kind, "drv") != 0) {
+            lex_fail(L, "unknown pragma");
+            return;
+        }
+        if (!pp_qstr(L, L->pp->drv_name, sizeof(L->pp->drv_name)) ||
+            !pp_qstr(L, L->pp->drv_ver, sizeof(L->pp->drv_ver)) ||
+            !pp_qstr(L, L->pp->drv_author, sizeof(L->pp->drv_author))) {
+            if (!L->err) {
+                lex_fail(L, "expected #pragma drv \"NAME\" \"VER\" \"AUTHOR\"");
+            }
+            return;
+        }
+        if (L->pp->drv_name[0] == '\0') {
+            lex_fail(L, "empty driver name in #pragma drv");
+            return;
+        }
+        L->pp->has_drv = 1;
+        skip_line(L);
         return;
     }
     lex_fail(L, "unknown directive");
@@ -1326,7 +1383,8 @@ typedef struct {
     uint8_t  data[DATA_CAP];
     int      nfuncs;
     func_t   funcs[MAX_FUNCS];
-    int      ag_main_idx;
+    int      entry_idx; /* ag_main or ag_driver_init */
+    int      is_driver;
     uint32_t relocs[MAX_RELOCS];
     int      nrelocs;
     int      needs_gfx;
@@ -2114,6 +2172,13 @@ static const builtin_t BUILTINS[] = {
     {"ag_gfx_poly_vertex", 2, API_OFF_GFX, GFX_OFF_POLY_VERTEX, RET_VOID, 0, ABI_MINOR_GFX, NULL},
     {"ag_gfx_poly_fill", 1, API_OFF_GFX, GFX_OFF_POLY_FILL, RET_VOID, 0, ABI_MINOR_GFX, NULL},
     {"ag_gfx_poly_stroke", 1, API_OFF_GFX, GFX_OFF_POLY_STROKE, RET_VOID, 0, ABI_MINOR_GFX, NULL},
+    {"ag_gfx_clip", 4, API_OFF_GFX, GFX_OFF_CLIP, RET_VOID, 0, ABI_MINOR_GFX16, NULL},
+    {"ag_gfx_clip_reset", 0, API_OFF_GFX, GFX_OFF_CLIP_RESET, RET_VOID, 0,
+     ABI_MINOR_GFX16, NULL},
+    {"ag_gfx_stroke_rect", 5, API_OFF_GFX, GFX_OFF_STROKE_RECT, RET_VOID, 0,
+     ABI_MINOR_GFX16, NULL},
+    {"ag_gfx_fill_round_rect", 6, API_OFF_GFX, GFX_OFF_FILL_ROUND_RECT, RET_VOID,
+     0, ABI_MINOR_GFX16, NULL},
 
     /* audio (ABI 0.14): open(NULL) default 22050 stereo s16 */
     {"ag_audio_present", 0, API_OFF_AUDIO, AUDIO_OFF_PRESENT, RET_RAW, 0, ABI_MINOR_AUDIO, NULL},
@@ -2141,6 +2206,10 @@ static const builtin_t BUILTINS[] = {
     {"ag_dev_read", 3, API_OFF_DEV, DEV_OFF_READ, RET_RAW, 0, ABI_MINOR_BASE, NULL},
     {"ag_dev_write", 3, API_OFF_DEV, DEV_OFF_WRITE, RET_RAW, 0, ABI_MINOR_BASE, NULL},
     {"ag_dev_ioctl", 4, API_OFF_DEV, DEV_OFF_IOCTL, RET_RAW, 0, ABI_MINOR_BASE, NULL},
+    /* Publish-side: only legal inside ag_driver_init (kernel enforces). */
+    {"ag_dev_add", 1, API_OFF_DEV, DEV_OFF_ADD, RET_RAW, 0, ABI_MINOR_BASE, NULL},
+    {"ag_dev_remove", 1, API_OFF_DEV, DEV_OFF_REMOVE, RET_RAW, 0, ABI_MINOR_BASE, NULL},
+    {"ag_dev_priv", 1, API_OFF_DEV, DEV_OFF_GET_PRIV, RET_RAW, 0, ABI_MINOR_BASE, NULL},
 };
 
 static const builtin_t *find_builtin(const char *name)
@@ -2711,6 +2780,9 @@ static void parse_primary(par_t *p)
  * `&place`: the address of storage rather than what is in it.  A pointer to a
  * pointer has nowhere to say so in a type this thin, so taking the address of
  * one is refused instead of quietly losing the second star.
+ *
+ * `&func` is the code address of a function already defined (define-before-use),
+ * as an ordinary word — enough to fill an `ag_dev_ops_t` from Mini-C.
  */
 static void parse_addr_of(par_t *p)
 {
@@ -2721,6 +2793,15 @@ static void parse_addr_of(par_t *p)
     char name[MAX_NAME];
     cpy_err(name, sizeof(name), p->L->text);
     lex_next(p->L);
+    if (p->L->tok != T_LBRACK && p->L->tok != T_DOT && p->L->tok != T_ARROW) {
+        const int fi = find_func(p->g, name);
+        if (fi >= 0) {
+            emit_li_code(p->g, 8, (uint32_t)p->g->funcs[fi].code_off);
+            p->pesize = 4;
+            p->psidx = -1;
+            return;
+        }
+    }
     place_t pl;
     if (!parse_place(p, name, &pl)) {
         return;
@@ -3383,8 +3464,14 @@ static void parse_function(par_t *p, int is_void, const char *name)
     p->g->funcs[fi].code_off = code_off;
     p->g->funcs[fi].nparams = nparams;
     p->g->funcs[fi].is_void = is_void;
-    if (CC_STRCMP(name, "ag_main") == 0) {
-        p->g->ag_main_idx = fi;
+    if (CC_STRCMP(name, "ag_main") == 0 ||
+        CC_STRCMP(name, "ag_driver_init") == 0) {
+        if (p->g->entry_idx >= 0) {
+            pfail(p, "only one of ag_main / ag_driver_init");
+            return;
+        }
+        p->g->entry_idx = fi;
+        p->g->is_driver = (CC_STRCMP(name, "ag_driver_init") == 0) ? 1 : 0;
     }
 
     parse_block(p);
@@ -3498,7 +3585,8 @@ static void parse_struct_body(par_t *p, const char *name)
 static void parse_program(par_t *p)
 {
     p->g->data_next = 4;
-    p->g->ag_main_idx = -1;
+    p->g->entry_idx = -1;
+    p->g->is_driver = 0;
 
     while (p->L->tok != T_EOF && !p->g->err && !p->L->err) {
         if (accept(p, T_VOID)) {
@@ -3583,8 +3671,11 @@ static void parse_program(par_t *p)
         (void)add_global_t(p->g, name, &t, 1);
     }
 
-    if (!p->g->err && p->g->ag_main_idx < 0) {
-        pfail(p, "entry must be ag_main");
+    if (!p->g->err && p->g->entry_idx < 0) {
+        pfail(p, "entry must be ag_main or ag_driver_init");
+    }
+    if (!p->g->err && p->g->is_driver && !p->g->pp.has_drv) {
+        pfail(p, "driver needs #pragma drv \"NAME\" \"VER\" \"AUTHOR\"");
     }
 }
 
@@ -3698,7 +3789,8 @@ int cc_compile_to_axe_inc(const char *src, size_t src_len,
     memset(g, 0, sizeof(*g));
     g->code = text;
     g->cap = CODE_CAP;
-    g->ag_main_idx = -1;
+    g->entry_idx = -1;
+    g->is_driver = 0;
     g->data_next = 4;
     g->min_abi = ABI_MINOR_BASE;
     g->pp.reader = reader;
@@ -3773,6 +3865,9 @@ int cc_compile_to_axe_inc(const char *src, size_t src_len,
         if (g->needs_audio) {
             flags |= AG_AXE_NEEDS_AUDIO;
         }
+        if (g->is_driver) {
+            flags |= AG_AXE_DRIVER;
+        }
         wr_u32(axe + 12, flags);
     }
 
@@ -3787,7 +3882,7 @@ int cc_compile_to_axe_inc(const char *src, size_t src_len,
     wr_u32(axe + 44, AXE_HDR + (uint32_t)code_size);
 
     const uint32_t entry = CODE_BASE + (uint32_t)lit_bytes +
-                           (uint32_t)g->funcs[g->ag_main_idx].code_off;
+                           (uint32_t)g->funcs[g->entry_idx].code_off;
     wr_u32(axe + 48, entry);
     wr_u32(axe + 52, DATA_BASE);
 
@@ -3796,9 +3891,15 @@ int cc_compile_to_axe_inc(const char *src, size_t src_len,
 
     wr_u32(axe + 64, 0);
     wr_u32(axe + 68, 0);
-    wr_str(axe + 72, 32, "TCC");
-    wr_str(axe + 104, 16, "0.2");
-    wr_str(axe + 120, 32, "cc");
+    if (g->is_driver) {
+        wr_str(axe + 72, 32, g->pp.drv_name);
+        wr_str(axe + 104, 16, g->pp.drv_ver);
+        wr_str(axe + 120, 32, g->pp.drv_author);
+    } else {
+        wr_str(axe + 72, 32, "TCC");
+        wr_str(axe + 104, 16, "0.2");
+        wr_str(axe + 120, 32, "cc");
+    }
 
     uint8_t *code = axe + AXE_HDR;
     for (int i = 0; i < g->nlit; i++) {

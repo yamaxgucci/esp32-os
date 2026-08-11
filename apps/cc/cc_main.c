@@ -132,7 +132,7 @@ static int write_all(const char *path, const void *data, size_t len)
 int ag_main(int argc, char **argv)
 {
     if (argc < 3) {
-        ag_print("usage: cc <in.c> <out.axe>\n");
+        ag_print("usage: cc <in.c> <out.axe|out.sys>\n");
         return 1;
     }
 

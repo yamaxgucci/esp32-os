@@ -7,13 +7,18 @@ host toolchain (image name `CC.AXE`).
 
 - Types: `int` (32-bit), `char` (one **unsigned** byte), `struct`, a pointer to
   any of those, `void` (return / empty params)
-- Entry: `ag_main` (required). Other functions allowed; **define before use**
+- Entry: `ag_main` (app) or `ag_driver_init` (`.SYS` driver). Exactly one.
+  Other functions allowed; **define before use**
+- Drivers: `#pragma drv "NAME" "VER" "AUTHOR"` (required) sets the image
+  header; the compiler stamps `AG_AXE_DRIVER`. `&func` yields a code address
+  for filling an ops table
 - Functions: up to 6 params of any of those types; calls use windowed `callx8`
 - Globals (before functions): `int x;`, `char c;`, `int a[N];`, `char b[N];`,
   `char *p;`, `struct v s;`, `struct v a[N];`, `struct v *p;`
 - Locals: the same, plus assign, `return`, `if`/`else`, `while`, `for`, blocks
 - `for (init; cond; step)` — init may be a declaration, an assignment, or empty
-- Arrays and pointers: `a[i]`, `a[i] = expr`, `*p`, `*p = expr`, `&x`, `&a[i]`
+- Arrays and pointers: `a[i]`, `a[i] = expr`, `*p`, `*p = expr`, `&x`, `&a[i]`,
+  `&func` (code address of a function already defined)
 - Structs: `struct v { int x; char tag; int a[4]; struct v *next; };` then
   `s.x`, `p->x`, `a[i].x`, `p[i].x`, `&s` — in any combination, on either side
   of an `=`
@@ -57,7 +62,8 @@ Examples: [`examples/asteroids.c`](examples/asteroids.c) (a game),
 [`examples/selftest.c`](examples/selftest.c) (checks the generated code,
 including `#include "ppinc.h"`, and exits with the number of failures),
 [`examples/fsmem.c`](examples/fsmem.c) (phase D: file + mute PCM chunk),
-[`examples/dx7nofx.c`](examples/dx7nofx.c) (phase E: structural DX7 nofx on CC).
+[`examples/dx7nofx.c`](examples/dx7nofx.c) (phase E: structural DX7 nofx on CC),
+[`examples/echo.c`](examples/echo.c) (guest-built `.SYS`: `drv load` echo device).
 
 ## Builtins (ABI)
 
@@ -94,6 +100,8 @@ The image demands the highest ABI minor of the features it uses: 8 plain, 9 for
 | `ag_gfx_line(x0,y0,x1,y1,color)` | |
 | `ag_gfx_circle` / `ag_gfx_fill_circle` | |
 | `ag_gfx_poly_begin` / `vertex` / `fill` / `stroke` | Convex poly helpers |
+| `ag_gfx_clip` / `ag_gfx_clip_reset` | Soft-draw clip (ABI 0.16) |
+| `ag_gfx_stroke_rect` / `ag_gfx_fill_round_rect` | Rect helpers (ABI 0.16) |
 | `ag_audio_present()` | 1 if `api->audio` exists |
 | `ag_audio_is_hw()` | 1 when I2S pins live |
 | `ag_audio_open()` | default 22050 Hz stereo s16 (`fmt` NULL) |
@@ -106,6 +114,8 @@ The image demands the highest ABI minor of the features it uses: 8 plain, 9 for
 | `ag_opendir(path)` / `ag_readdir(h, &ent)` / `ag_closedir(h)` | `ent` is a buffer/`struct` the size of `ag_dirent_t` |
 | `ag_dev_open(name)` / `ag_dev_close(h)` | open by bare device name |
 | `ag_dev_read` / `ag_dev_write` / `ag_dev_ioctl` | same shapes as the FS calls |
+| `ag_dev_add(desc)` / `ag_dev_remove(name)` | publish / withdraw (only in `ag_driver_init`) |
+| `ag_dev_priv(dev)` | driver's `priv` from inside ops callbacks |
 
 No `ag_seek`: the kernel API is `int64_t`, and every value in this language is a
 32-bit word. Open flags are ordinary `#define`s (see above), not keywords.
@@ -152,6 +162,27 @@ python tools/mkaxe.py --arch xtensa --gcc xtensa-esp32s3-elf-gcc ^
 
 `mkaxe` also stages into `build/sd_card/` (see
 [`docs/user/03-host-share.md`](../../docs/user/03-host-share.md)).
+
+## Drivers (`.SYS`) on the guest
+
+```c
+#pragma drv "ECHO" "1.0" "cc"
+
+struct ops { int open; int close; int read; int write; int ioctl; int size; };
+/* … fill ops.read = &echo_read; … */
+
+int ag_driver_init(void)
+{
+    return ag_dev_add(&g_desc);
+}
+```
+
+```text
+run h:\cc.axe h:\echo.c h:\echo.sys
+drv load h:\echo.sys
+dev
+drv unload ECHO
+```
 
 ## Use (QEMU)
 

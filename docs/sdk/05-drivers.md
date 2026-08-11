@@ -2,7 +2,9 @@
 
 Как написать модуль, который публикует устройство, и как его загрузить.
 Контракт — [`argon/abi.h`](../../sdk/include/argon/abi.h); пример —
-[`apps/echo/echo.c`](../../apps/echo/echo.c).
+[`apps/echo/echo.c`](../../apps/echo/echo.c). Тот же echo можно собрать на
+госте через Argon CC: [`apps/cc/examples/echo.c`](../../apps/cc/examples/echo.c)
+(`#pragma drv`, `ag_driver_init`, без host GCC).
 
 ## Что это
 
