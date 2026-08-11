@@ -74,6 +74,14 @@ const void *ag_module_loading(void);
 const ag_probe_hint_t *ag_module_probe_hint(void);
 
 /*
+ * Register a callback for when this module is unloaded/replaced.  Only valid
+ * during ag_driver_init (while ag_module_loading() is non-NULL).  Use it to
+ * close TCP listen/conn handles — revoke alone does not free net slots, and a
+ * leaked listen steals hostfwd accepts from the new image.
+ */
+void ag_module_on_unload(void (*fn)(void));
+
+/*
  * Walks [modules] device=... from SYSTEM.CFG, then runs I2C probe against
  * modules.probe.  A missing or failing module is logged; the board still
  * reaches the shell.  Boot stage `modules` calls this.

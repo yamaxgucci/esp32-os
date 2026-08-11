@@ -16,7 +16,7 @@
 #include <argon/argon.h>
 #include <argon/libc.h>
 
-AG_DRV("PCMVIRT", "1.1.1", "argon");
+AG_DRV("PCMVIRT", "1.2", "argon");
 
 #define PCMVIRT_PORT     5558u
 #define WAV_HDR          44u
@@ -43,6 +43,7 @@ typedef struct {
     uint32_t eagain_events;
     uint32_t overflow_events;
     uint32_t last_log_ms;
+    int      noclient_noted; /* one journal line while no TCP peer */
 } pcmvirt_state_t;
 
 static pcmvirt_state_t s_st;
@@ -121,8 +122,19 @@ static void maybe_log_stats(pcmvirt_state_t *st)
     if (st->last_log_ms != 0u && (now - st->last_log_ms) < STATS_LOG_MS) {
         return;
     }
-    if (st->bytes_drop_overflow == 0u && st->bytes_drop_noclient == 0u &&
-        st->eagain_events == 0u && st->ring_used == 0u) {
+    /* No peer: one note, do not flood the 4 KB journal (hides accept lines). */
+    if (st->conn < 0) {
+        if (st->bytes_drop_noclient > 0u && !st->noclient_noted) {
+            st->noclient_noted = 1;
+            st->last_log_ms = now;
+            ag_log(AG_LOG_INFO, "pcmvirt",
+                   "no TCP client — dropping PCM (start host pcmplay)");
+        }
+        return;
+    }
+    st->noclient_noted = 0;
+    if (st->bytes_drop_overflow == 0u && st->eagain_events == 0u &&
+        st->ring_used == 0u && st->bytes_sent == 0u) {
         st->last_log_ms = now;
         return;
     }
@@ -473,6 +485,20 @@ static const ag_dev_ops_t k_ops = {
     .ioctl = pcm_ioctl,
 };
 
+static void pcm_fini(void)
+{
+    if (s_st.conn >= 0) {
+        (void)ag_net_close(s_st.conn);
+        s_st.conn = -1;
+    }
+    if (s_st.listen >= 0) {
+        (void)ag_net_close(s_st.listen);
+        s_st.listen = -1;
+        ag_log(AG_LOG_INFO, "pcmvirt", "fini: listen closed");
+    }
+    s_st.hdr_sent = 0;
+}
+
 ag_err_t ag_driver_init(void)
 {
     if (!AG_HAS(ag_api()->dev, add)) {
@@ -484,6 +510,7 @@ ag_err_t ag_driver_init(void)
     s_st.conn = -1;
     default_fmt(&s_st.fmt);
     s_st.fmt_set = 1;
+    ag_module_on_unload(pcm_fini);
 
     {
         const ag_dev_add_t desc = {

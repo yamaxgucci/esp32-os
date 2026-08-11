@@ -14,7 +14,7 @@
 #include <argon/argon.h>
 #include <argon/libc.h>
 
-AG_DRV("MIDIVIRT", "1.1", "argon");
+AG_DRV("MIDIVIRT", "1.2", "argon");
 
 #define MIDIVIRT_PORT 5559u
 #define RING_EV       64u
@@ -341,6 +341,19 @@ static const ag_dev_ops_t k_ops = {
     .ioctl = midi_ioctl,
 };
 
+static void midi_fini(void)
+{
+    if (s_st.conn >= 0) {
+        (void)ag_net_close(s_st.conn);
+        s_st.conn = -1;
+    }
+    if (s_st.listen >= 0) {
+        (void)ag_net_close(s_st.listen);
+        s_st.listen = -1;
+        ag_log(AG_LOG_INFO, "midivirt", "fini: listen closed");
+    }
+}
+
 ag_err_t ag_driver_init(void)
 {
     if (!AG_HAS(ag_api()->dev, add)) {
@@ -351,6 +364,7 @@ ag_err_t ag_driver_init(void)
     s_st.listen = -1;
     s_st.conn = -1;
     parser_reset(&s_st);
+    ag_module_on_unload(midi_fini);
 
     {
         const ag_dev_add_t desc = {

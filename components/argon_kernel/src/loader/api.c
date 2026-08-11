@@ -110,6 +110,11 @@ static const char *api_strerror(ag_err_t err)
 
 static void api_heartbeat(void) { ag_proc_heartbeat(); }
 
+static void api_module_on_unload(void (*fn)(void))
+{
+    ag_module_on_unload(fn);
+}
+
 static const ag_sys_api_t k_sys = {
     .size = sizeof(ag_sys_api_t),
     .info = api_info,
@@ -120,6 +125,7 @@ static const ag_sys_api_t k_sys = {
     .sym = api_sym,
     .strerror = api_strerror,
     .heartbeat = api_heartbeat,
+    .module_on_unload = api_module_on_unload,
 };
 
 /* ---------------------------------------------------------------------- */
