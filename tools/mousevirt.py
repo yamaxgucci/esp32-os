@@ -9,9 +9,8 @@ Maps the letterboxed framebuffer inside the QEMU SDL client area onto the
 guest size (default 640×400).
 
 Anti-grab: a WH_MOUSE_LL hook on a **dedicated thread with a message pump**
-swallows button/wheel over the QEMU client (not WM_MOUSEMOVE).  Installing the
-hook on the sleepy main thread without PeekMessage made the host cursor crawl.
-TCP is sent only from the main loop — never from the hook.
+swallows button/wheel over the QEMU *client* framebuffer only (not the title
+bar / resize border, not WM_MOUSEMOVE).  TCP is sent only from the main loop.
 
 Hold Right-Ctrl to pause (clicks reach QEMU).  Esc / Ctrl+C quits.
 
@@ -224,23 +223,18 @@ class AntiGrab:
             return w
 
     def _hit(self, x: int, y: int) -> bool:
+        """True only over the QEMU *client* rect (framebuffer), never chrome.
+
+        Title bar / resize borders are non-client: WindowFromPoint still returns
+        the QEMU HWND there — swallowing those clicks blocked drag/resize.
+        """
         with self._lock:
             if self._paused:
                 return False
-            hwnd = self._qemu_hwnd
             cx, cy, cw, ch = self._client
-        if hwnd and cw > 0 and ch > 0:
-            if cx <= x < cx + cw and cy <= y < cy + ch:
-                return True
-        # Fallback: any HWND under the cursor belonging to the QEMU top-level.
-        if hwnd:
-            pt = POINT(x, y)
-            under = hwnd_i(USER32.WindowFromPoint(pt))
-            if under:
-                root = hwnd_i(USER32.GetAncestor(under, GA_ROOT))
-                if root == hwnd or under == hwnd:
-                    return True
-        return False
+        if cw < 1 or ch < 1:
+            return False
+        return cx <= x < cx + cw and cy <= y < cy + ch
 
     def _apply_button_msg(self, msg: int, mouse_data: int) -> None:
         """Track physical buttons from LL messages we are about to swallow."""
