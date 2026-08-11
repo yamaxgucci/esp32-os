@@ -33,9 +33,10 @@ void ag_vlog(ag_log_level_t level, const char *tag, const char *fmt,
              va_list ap);
 
 /*
- * Whether log lines also go to the console as they arrive.  On by default; the
- * shell turns it off while an application owns the screen, so that a driver
- * logging in the background does not draw over it.
+ * Whether log lines also go to the console as they arrive.  On during early
+ * bring-up so boot failures are visible; the shell turns it off once the
+ * interactive prompt is up — drivers keep writing the journal (`log`) without
+ * stomping the edit line.
  */
 void ag_log_set_echo(bool on);
 bool ag_log_echo(void);
