@@ -15,7 +15,7 @@
 #include <argon/argon.h>
 #include <argon/libc.h>
 
-AG_DRV("MOUSEVIRT", "1.1", "argon");
+AG_DRV("MOUSEVIRT", "1.2", "argon");
 
 #define MOUSEVIRT_PORT 5560u
 #define PKT_SIZE       8u
@@ -176,7 +176,14 @@ static void try_accept(mousevirt_state_t *st)
     if (peer < 0) {
         return;
     }
-    close_conn(st, "replaced by new peer");
+    /*
+     * Single host tool.  Replacing a live peer on every backlog SYN (host
+     * reconnect race) used to flap TCP and starve GRAIN of POINTER events.
+     */
+    if (st->conn >= 0) {
+        (void)ag_net_close(peer);
+        return;
+    }
     st->conn = peer;
     (void)ag_net_set_nonblock(st->conn, true);
     st->rx_n = 0;
