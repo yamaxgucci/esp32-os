@@ -53,9 +53,11 @@ extern "C" {
  * 0.14 added api->audio (I2S or discard stub) and AG_AXE_NEEDS_AUDIO.
  * 0.15 pcmnull built-in; AG_IOC_AUDIO_GETFMT/SETFMT; I2S/virt via .SYS drivers.
  * 0.16 appended gfx clip / clip_reset / stroke_rect / fill_round_rect.
+ * 0.17 appended gfx blit_key + stateful blit_bind / blit_copy / blit_keyed
+ *      (RGB565 chroma blit; CC-friendly ≤6-arg path).
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 16u
+#define AG_ABI_MINOR 17u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -498,6 +500,24 @@ typedef struct ag_gfx_api {
                         uint32_t color);
     void (*fill_round_rect)(int16_t x, int16_t y, uint16_t w, uint16_t h,
                             uint16_t r, uint32_t color);
+
+    /*
+     * ABI 0.17: chroma-key blit.  Soft path supports RGB565 / RGB565_BE.
+     * key_rgb is 0x00RRGGBB (same as fill colours); matching source pixels
+     * are skipped.  Native one-shot; Argon CC uses blit_bind + blit_keyed
+     * instead (call-arg limit).
+     */
+    void (*blit_key)(int16_t x, int16_t y, uint16_t w, uint16_t h,
+                     const void *src, uint32_t src_stride, ag_pixfmt_t src_fmt,
+                     uint32_t key_rgb);
+    /*
+     * Stateful RGB565 (LE) blit for CC: blit_bind → blit_copy / blit_keyed.
+     * blit_keyed key is 0x00RRGGBB.
+     */
+    void (*blit_bind)(const void *src, uint32_t src_stride);
+    void (*blit_copy)(int16_t x, int16_t y, uint16_t w, uint16_t h);
+    void (*blit_keyed)(int16_t x, int16_t y, uint16_t w, uint16_t h,
+                       uint32_t key_rgb);
 } ag_gfx_api_t;
 
 /* ------------------------------------------------------------------------ */

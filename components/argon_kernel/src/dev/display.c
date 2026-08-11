@@ -234,6 +234,10 @@ static ag_point_t s_poly[AG_POLY_MAX_VERTS];
 static int        s_poly_n;
 static bool       s_poly_active;
 
+/* Stateful RGB565 blit (ABI 0.17) — for Argon CC's 6-arg call limit. */
+static const void *s_blit_src;
+static uint32_t    s_blit_stride;
+
 /* Soft-draw clip (ABI 0.16).  Zero size means "whole framebuffer". */
 static int16_t  s_clip_x;
 static int16_t  s_clip_y;
@@ -448,19 +452,50 @@ static void gfx_blit(int16_t x, int16_t y, uint16_t w, uint16_t h,
         return; /* soft path only knows 16-bit RGB for now */
     }
     ag_draw_surf_t surf = draw_surf();
-    for (uint16_t row = 0; row < h; row++) {
-        const int32_t dy = (int32_t)y + (int32_t)row;
-        const uint8_t *srow = (const uint8_t *)src + (uint32_t)row * src_stride;
-        for (uint16_t col = 0; col < w; col++) {
-            const int32_t dx = (int32_t)x + (int32_t)col;
-            uint16_t pix = (uint16_t)srow[col * 2] |
-                           ((uint16_t)srow[col * 2 + 1] << 8);
-            if (src_fmt == AG_PIX_RGB565_BE) {
-                pix = (uint16_t)((pix << 8) | (pix >> 8));
-            }
-            ag_draw_pixel(&surf, dx, dy, pix);
-        }
+    ag_draw_blit(&surf, x, y, (int32_t)w, (int32_t)h, src, src_stride,
+                 src_fmt == AG_PIX_RGB565_BE, 0, 0);
+}
+
+static void gfx_blit_key(int16_t x, int16_t y, uint16_t w, uint16_t h,
+                         const void *src, uint32_t src_stride,
+                         ag_pixfmt_t src_fmt, uint32_t key_rgb)
+{
+    if (s_draw == NULL || src == NULL || w == 0 || h == 0) {
+        return;
     }
+    if (src_fmt != AG_PIX_RGB565 && src_fmt != AG_PIX_RGB565_BE) {
+        return;
+    }
+    ag_draw_surf_t surf = draw_surf();
+    ag_draw_blit(&surf, x, y, (int32_t)w, (int32_t)h, src, src_stride,
+                 src_fmt == AG_PIX_RGB565_BE, 1, rgb_to_565(key_rgb));
+}
+
+static void gfx_blit_bind(const void *src, uint32_t src_stride)
+{
+    s_blit_src = src;
+    s_blit_stride = src_stride;
+}
+
+static void gfx_blit_copy(int16_t x, int16_t y, uint16_t w, uint16_t h)
+{
+    if (s_draw == NULL || s_blit_src == NULL || w == 0 || h == 0) {
+        return;
+    }
+    ag_draw_surf_t surf = draw_surf();
+    ag_draw_blit(&surf, x, y, (int32_t)w, (int32_t)h, s_blit_src, s_blit_stride,
+                 0, 0, 0);
+}
+
+static void gfx_blit_keyed(int16_t x, int16_t y, uint16_t w, uint16_t h,
+                           uint32_t key_rgb)
+{
+    if (s_draw == NULL || s_blit_src == NULL || w == 0 || h == 0) {
+        return;
+    }
+    ag_draw_surf_t surf = draw_surf();
+    ag_draw_blit(&surf, x, y, (int32_t)w, (int32_t)h, s_blit_src, s_blit_stride,
+                 0, 1, rgb_to_565(key_rgb));
 }
 
 static int32_t gfx_text(int16_t x, int16_t y, const char *s, uint32_t fg,
@@ -632,6 +667,10 @@ const ag_gfx_api_t ag_gfx_api_table = {
     .clip_reset = gfx_clip_reset,
     .stroke_rect = gfx_stroke_rect,
     .fill_round_rect = gfx_fill_round_rect,
+    .blit_key = gfx_blit_key,
+    .blit_bind = gfx_blit_bind,
+    .blit_copy = gfx_blit_copy,
+    .blit_keyed = gfx_blit_keyed,
 };
 
 /* ---------------------------------------------------------------------- */

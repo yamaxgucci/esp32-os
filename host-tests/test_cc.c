@@ -134,6 +134,14 @@ _Static_assert(SUB_SLOT(ag_gfx_api_t, stroke_rect) == GFX_OFF_STROKE_RECT,
 _Static_assert(SUB_SLOT(ag_gfx_api_t, fill_round_rect) ==
                    GFX_OFF_FILL_ROUND_RECT,
                "gfx.fill_round_rect moved");
+_Static_assert(SUB_SLOT(ag_gfx_api_t, blit_key) == GFX_OFF_BLIT_KEY,
+               "gfx.blit_key moved");
+_Static_assert(SUB_SLOT(ag_gfx_api_t, blit_bind) == GFX_OFF_BLIT_BIND,
+               "gfx.blit_bind moved");
+_Static_assert(SUB_SLOT(ag_gfx_api_t, blit_copy) == GFX_OFF_BLIT_COPY,
+               "gfx.blit_copy moved");
+_Static_assert(SUB_SLOT(ag_gfx_api_t, blit_keyed) == GFX_OFF_BLIT_KEYED,
+               "gfx.blit_keyed moved");
 
 _Static_assert(SUB_SLOT(ag_audio_api_t, present) == AUDIO_OFF_PRESENT,
                "audio.present moved");
@@ -324,6 +332,126 @@ static void check_asteroids_example(void)
                        "apps/cc/examples/asteroids.c", 64 * 1024, 2u /* NEEDS_GFX */);
 }
 
+static int example_include_reader(void *ctx, const char *path, char **out_text,
+                                  size_t *out_len)
+{
+    const char *dir = (const char *)ctx;
+    char        full[512];
+    size_t      n = 0;
+    size_t      i;
+    FILE       *f;
+    long        sz;
+    char       *buf;
+
+    for (i = 0; dir != NULL && dir[i] != '\0' && n + 1 < sizeof(full); i++) {
+        full[n++] = dir[i];
+    }
+    if (n > 0 && full[n - 1] != '/' && full[n - 1] != '\\' &&
+        n + 1 < sizeof(full)) {
+        full[n++] = '/';
+    }
+    for (i = 0; path[i] != '\0' && n + 1 < sizeof(full); i++) {
+        full[n++] = path[i];
+    }
+    full[n] = '\0';
+
+    f = fopen(full, "rb");
+    if (f == NULL) {
+        return -1;
+    }
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        return -1;
+    }
+    sz = ftell(f);
+    if (sz < 0 || fseek(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        return -1;
+    }
+    buf = (char *)malloc((size_t)sz + 1);
+    if (buf == NULL) {
+        fclose(f);
+        return -1;
+    }
+    n = fread(buf, 1, (size_t)sz, f);
+    fclose(f);
+    buf[n] = '\0';
+    *out_text = buf;
+    *out_len = n;
+    return 0;
+}
+
+static void check_example_inc(const char *label, const char *rel_a,
+                              const char *rel_b, const char *inc_dir_a,
+                              const char *inc_dir_b, size_t max_src,
+                              uint32_t want_flags)
+{
+    const char *paths[] = {rel_a, rel_b, NULL};
+    const char *dirs[] = {inc_dir_a, inc_dir_b, NULL};
+    FILE       *f = NULL;
+    const char *dir = NULL;
+    char       *buf;
+    size_t      n;
+    cc_result_t res;
+    int         rc;
+    int         i;
+
+    for (i = 0; paths[i] != NULL; i++) {
+        f = fopen(paths[i], "rb");
+        if (f != NULL) {
+            dir = dirs[i];
+            break;
+        }
+    }
+    AG_CHECK(f != NULL);
+    if (f == NULL) {
+        return;
+    }
+    buf = (char *)malloc(max_src);
+    AG_CHECK(buf != NULL);
+    if (buf == NULL) {
+        fclose(f);
+        return;
+    }
+    n = fread(buf, 1, max_src - 1, f);
+    fclose(f);
+    buf[n] = '\0';
+    rc = cc_compile_to_axe_inc(buf, n, example_include_reader, (void *)dir,
+                               &res);
+    AG_CHECK(rc == 0);
+    if (rc != 0) {
+        printf("     %s: %s\n", label, res.err);
+    } else {
+        const uint32_t flags = (uint32_t)res.axe[12] | ((uint32_t)res.axe[13] << 8) |
+                               ((uint32_t)res.axe[14] << 16) |
+                               ((uint32_t)res.axe[15] << 24);
+        const uint16_t minor =
+            (uint16_t)res.axe[6] | ((uint16_t)res.axe[7] << 8);
+        AG_CHECK((flags & want_flags) == want_flags);
+        AG_CHECK(minor >= 17);
+        if ((flags & want_flags) != want_flags || minor < 17) {
+            printf("     %s: flags=0x%x minor=%u\n", label, (unsigned)flags,
+                   (unsigned)minor);
+        }
+        cc_result_free(&res);
+    }
+    free(buf);
+}
+
+static void check_tile_demo_example(void)
+{
+    check_example_inc("tile_demo", "../apps/cc/examples/tile_demo.c",
+                      "apps/cc/examples/tile_demo.c", "../apps/cc/examples",
+                      "apps/cc/examples", 64 * 1024, 2u /* NEEDS_GFX */);
+}
+
+static void check_wetspot_example(void)
+{
+    check_example_inc("wetspot", "../apps/cc/examples/wetspot.c",
+                      "apps/cc/examples/wetspot.c", "../apps/cc/examples",
+                      "apps/cc/examples", 128 * 1024, 2u /* NEEDS_GFX */);
+}
+
 static void check_dx7nofx_example(void)
 {
     /* pcmvirt/midivirt via ag_dev_* (no AG_AXE_NEEDS_AUDIO; not ag_audio_*). */
@@ -445,6 +573,61 @@ void run_cc_tests(void)
                "  int s = 0;\n"
                "  for (int i = 0; i < 3; i = i + 1) { s = s + 1; }\n"
                "  return s;\n"
+               "}\n",
+               1);
+
+    /* Cheap package: ++/--, compound assign, do/while, break/continue, ?: */
+    check_expr("0xff", 255);
+    check_expr("010", 8);
+    check_expr("0x10 + 010", 24);
+    check_prog("int ag_main(void) {\n"
+               "  int i = 0;\n"
+               "  int s = 0;\n"
+               "  for (i = 0; i < 5; i++) { s += i; }\n"
+               "  return s;\n"
+               "}\n",
+               1);
+    check_prog("int ag_main(void) {\n"
+               "  int i = 0;\n"
+               "  int s = 0;\n"
+               "  do { s += i; i++; } while (i < 4);\n"
+               "  return s;\n"
+               "}\n",
+               1);
+    check_prog("int ag_main(void) {\n"
+               "  int i = 0;\n"
+               "  int s = 0;\n"
+               "  while (1) {\n"
+               "    if (i >= 5) break;\n"
+               "    i++;\n"
+               "    if (i == 3) continue;\n"
+               "    s += i;\n"
+               "  }\n"
+               "  return s;\n"
+               "}\n",
+               1);
+    check_prog("int ag_main(void) {\n"
+               "  int x = 2;\n"
+               "  int y = x == 2 ? 10 : 20;\n"
+               "  return y;\n"
+               "}\n",
+               1);
+    check_prog("enum { A, B = 5, C };\n"
+               "typedef int i32;\n"
+               "int ag_main(void) {\n"
+               "  i32 a[sizeof(i32)];\n"
+               "  a[0] = A + C;\n"
+               "  switch (B) {\n"
+               "    case 5: return a[0];\n"
+               "    default: return 0;\n"
+               "  }\n"
+               "}\n",
+               1);
+    check_prog("int ag_main(void) {\n"
+               "  int x = 1;\n"
+               "  x <<= 3;\n"
+               "  x |= 1;\n"
+               "  return x;\n"
                "}\n",
                1);
 
@@ -1001,4 +1184,6 @@ void run_cc_tests(void)
     check_asteroids_example();
     check_dx7nofx_example();
     check_echo_sys_example();
+    check_tile_demo_example();
+    check_wetspot_example();
 }

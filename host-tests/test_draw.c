@@ -109,4 +109,22 @@ void run_draw_tests(void)
     surf_clear(0);
     ag_draw_fill_round_rect(&s_surf, 4, 4, 16, 12, 3, 0x07E0);
     AG_CHECK(count_color(0x07E0) > 80);
+
+    /* Opaque + chroma-key blit (RGB565 LE, stride = w*2). */
+    {
+        static const uint16_t spr[2 * 2] = {0xF800, 0xF81F, 0x07E0, 0xF81F};
+        surf_clear(0);
+        ag_draw_blit(&s_surf, 1, 1, 2, 2, spr, 4, 0, 0, 0);
+        AG_CHECK(s_fb[1 * W + 1] == 0xF800);
+        AG_CHECK(s_fb[1 * W + 2] == 0xF81F);
+        AG_CHECK(s_fb[2 * W + 1] == 0x07E0);
+        AG_CHECK(s_fb[2 * W + 2] == 0xF81F);
+
+        surf_clear(0xFFFF);
+        ag_draw_blit(&s_surf, 1, 1, 2, 2, spr, 4, 0, 1, 0xF81F);
+        AG_CHECK(s_fb[1 * W + 1] == 0xF800);
+        AG_CHECK(s_fb[1 * W + 2] == 0xFFFF); /* keyed out */
+        AG_CHECK(s_fb[2 * W + 1] == 0x07E0);
+        AG_CHECK(s_fb[2 * W + 2] == 0xFFFF);
+    }
 }

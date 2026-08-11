@@ -514,6 +514,12 @@ static inline void ag_gfx_fill_rect(int16_t x, int16_t y, uint16_t w, uint16_t h
 {
     g_ag_api->gfx->fill_rect(x, y, w, h, color);
 }
+static inline void ag_gfx_blit(int16_t x, int16_t y, uint16_t w, uint16_t h,
+                               const void *src, uint32_t src_stride,
+                               ag_pixfmt_t src_fmt)
+{
+    g_ag_api->gfx->blit(x, y, w, h, src, src_stride, src_fmt);
+}
 static inline int32_t ag_gfx_text(int16_t x, int16_t y, const char *s,
                                   uint32_t fg, uint32_t bg)
 {
@@ -576,6 +582,26 @@ static inline void ag_gfx_fill_round_rect(int16_t x, int16_t y, uint16_t w,
                                           uint32_t color)
 {
     g_ag_api->gfx->fill_round_rect(x, y, w, h, r, color);
+}
+static inline void ag_gfx_blit_key(int16_t x, int16_t y, uint16_t w, uint16_t h,
+                                   const void *src, uint32_t src_stride,
+                                   ag_pixfmt_t src_fmt, uint32_t key_rgb)
+{
+    g_ag_api->gfx->blit_key(x, y, w, h, src, src_stride, src_fmt, key_rgb);
+}
+static inline void ag_gfx_blit_bind(const void *src, uint32_t src_stride)
+{
+    g_ag_api->gfx->blit_bind(src, src_stride);
+}
+static inline void ag_gfx_blit_copy(int16_t x, int16_t y, uint16_t w,
+                                    uint16_t h)
+{
+    g_ag_api->gfx->blit_copy(x, y, w, h);
+}
+static inline void ag_gfx_blit_keyed(int16_t x, int16_t y, uint16_t w,
+                                     uint16_t h, uint32_t key_rgb)
+{
+    g_ag_api->gfx->blit_keyed(x, y, w, h, key_rgb);
 }
 
 /* ---- audio helpers (ABI 0.14+; built-in pcmnull) ------------------------- */
