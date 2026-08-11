@@ -378,6 +378,15 @@ def main() -> int:
                 return 0
             except Exception as e:
                 print(f"error: {e}", file=sys.stderr)
+                if str(e) == "connection closed" and not args.reconnect:
+                    print(
+                        "hint: guest closed the stream (app SETFMT/restart, or "
+                        "pcmvirt not ready). Typical fix:\n"
+                        "  1) guest: drv install h:\\pcmvirt.sys\n"
+                        "  2) guest: run h:\\grain.axe pcmvirt   (or dx7)\n"
+                        "  3) host:  python tools/pcmplay.py --reconnect",
+                        file=sys.stderr,
+                    )
                 if not args.reconnect:
                     return 1
             if not args.reconnect:
