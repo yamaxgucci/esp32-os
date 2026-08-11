@@ -535,6 +535,25 @@ void run_cc_tests(void)
             cc_result_free(&res);
         }
     }
+    {
+        cc_result_t res;
+        const char *src = "#pragma appstack 24576\n"
+                          "#pragma appheap 0x200000\n"
+                          "int ag_main(void) { return 0; }\n";
+        AG_CHECK(cc_compile_to_axe(src, strlen(src), &res) == 0);
+        if (res.axe != NULL) {
+            const uint32_t stack =
+                (uint32_t)res.axe[64] | ((uint32_t)res.axe[65] << 8) |
+                ((uint32_t)res.axe[66] << 16) | ((uint32_t)res.axe[67] << 24);
+            const uint32_t heap =
+                (uint32_t)res.axe[68] | ((uint32_t)res.axe[69] << 8) |
+                ((uint32_t)res.axe[70] << 16) | ((uint32_t)res.axe[71] << 24);
+            AG_CHECK(stack == 24576u);
+            AG_CHECK(heap == 0x200000u);
+            cc_result_free(&res);
+        }
+    }
+    check_prog("#pragma appheap 0\nint ag_main(void) { return 0; }\n", 0);
     check_prog("int ag_main(void) {\n"
                "  int x = 1;\n"
                "  int y = 2;\n"

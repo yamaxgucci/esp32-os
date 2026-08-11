@@ -42,25 +42,24 @@ static void cc_free(void *p)
 #define AXE_HDR   176u
 
 /*
- * Code has to fit the executable arena the loader hands out, so the ceiling
- * here is the arena ceiling (CONFIG_ARGON_APP_ARENA_KB, 192 on S3) and not a
- * number of its own - a smaller one would refuse programs the system is
- * perfectly able to run.  Everything else lives in PSRAM, where the working
- * buffers of a compiler cost nothing worth counting.
+ * Code may exceed the IRAM arena (CONFIG_ARGON_APP_ARENA_KB, 192 on S3): the
+ * loader places oversized images in flash XIP.  Static data and the compiler's
+ * own working buffers live in PSRAM.  These ceilings are emit-time caps so a
+ * guest program cannot blow the format / host-test budgets by accident.
  */
-#define CODE_CAP  (192u * 1024u)
-#define DATA_CAP  (128u * 1024u)
+#define CODE_CAP  (512u * 1024u)
+#define DATA_CAP  (512u * 1024u)
 #define LIT_CAP   1024
 #define MAX_LIT_SITES 8192
-#define MAX_GLOBALS 256
-#define MAX_FUNCS 256
-#define MAX_RELOCS 2048
+#define MAX_GLOBALS 512
+#define MAX_FUNCS 512
+#define MAX_RELOCS 8192
 #define MAX_NAME   32
 #define MAX_STR    256
 #define MAX_STRUCTS 24
 #define MAX_FIELDS  24
 #define MAX_ARRAY   (1 << 20)
-#define MAX_MACROS  64
+#define MAX_MACROS  256
 #define MAX_MPARAMS 6
 #define MAX_INCLUDES 16
 #define MAX_FRAMES  12
@@ -273,6 +272,9 @@ typedef struct {
     char       drv_name[32];
     char       drv_ver[16];
     char       drv_author[32];
+    /* #pragma appstack N / #pragma appheap N — AXE header sizes (0 = default). */
+    uint32_t   app_stack;
+    uint32_t   app_heap;
 } pp_t;
 
 typedef struct {
@@ -523,6 +525,48 @@ static int pp_qstr(lex_t *L, char *out, size_t cap)
     return 1;
 }
 
+/* Decimal / 0x hex size for `#pragma appheap` / `appstack`. */
+static int pp_u32(lex_t *L, uint32_t *out)
+{
+    skip_blanks(L);
+    if (L->pos >= L->len || !is_digit(L->src[L->pos])) {
+        return 0;
+    }
+    uint32_t v = 0;
+    if (L->pos + 1 < L->len && L->src[L->pos] == '0' &&
+        (L->src[L->pos + 1] == 'x' || L->src[L->pos + 1] == 'X')) {
+        L->pos += 2;
+        int any = 0;
+        while (L->pos < L->len) {
+            const char c = L->src[L->pos];
+            int d = -1;
+            if (c >= '0' && c <= '9') {
+                d = c - '0';
+            } else if (c >= 'a' && c <= 'f') {
+                d = c - 'a' + 10;
+            } else if (c >= 'A' && c <= 'F') {
+                d = c - 'A' + 10;
+            }
+            if (d < 0) {
+                break;
+            }
+            v = (v << 4) | (uint32_t)d;
+            L->pos++;
+            any = 1;
+        }
+        if (!any) {
+            return 0;
+        }
+    } else {
+        while (L->pos < L->len && is_digit(L->src[L->pos])) {
+            v = v * 10u + (uint32_t)(L->src[L->pos] - '0');
+            L->pos++;
+        }
+    }
+    *out = v;
+    return 1;
+}
+
 static void pp_define(lex_t *L)
 {
     char name[MAX_NAME];
@@ -766,24 +810,44 @@ static void pp_directive(lex_t *L)
             lex_fail(L, "expected a pragma name");
             return;
         }
-        if (CC_STRCMP(kind, "drv") != 0) {
-            lex_fail(L, "unknown pragma");
-            return;
-        }
-        if (!pp_qstr(L, L->pp->drv_name, sizeof(L->pp->drv_name)) ||
-            !pp_qstr(L, L->pp->drv_ver, sizeof(L->pp->drv_ver)) ||
-            !pp_qstr(L, L->pp->drv_author, sizeof(L->pp->drv_author))) {
-            if (!L->err) {
-                lex_fail(L, "expected #pragma drv \"NAME\" \"VER\" \"AUTHOR\"");
+        if (CC_STRCMP(kind, "drv") == 0) {
+            if (!pp_qstr(L, L->pp->drv_name, sizeof(L->pp->drv_name)) ||
+                !pp_qstr(L, L->pp->drv_ver, sizeof(L->pp->drv_ver)) ||
+                !pp_qstr(L, L->pp->drv_author, sizeof(L->pp->drv_author))) {
+                if (!L->err) {
+                    lex_fail(L, "expected #pragma drv \"NAME\" \"VER\" \"AUTHOR\"");
+                }
+                return;
             }
+            if (L->pp->drv_name[0] == '\0') {
+                lex_fail(L, "empty driver name in #pragma drv");
+                return;
+            }
+            L->pp->has_drv = 1;
+            skip_line(L);
             return;
         }
-        if (L->pp->drv_name[0] == '\0') {
-            lex_fail(L, "empty driver name in #pragma drv");
+        if (CC_STRCMP(kind, "appstack") == 0) {
+            uint32_t n = 0;
+            if (!pp_u32(L, &n) || n == 0) {
+                lex_fail(L, "expected #pragma appstack N");
+                return;
+            }
+            L->pp->app_stack = n;
+            skip_line(L);
             return;
         }
-        L->pp->has_drv = 1;
-        skip_line(L);
+        if (CC_STRCMP(kind, "appheap") == 0) {
+            uint32_t n = 0;
+            if (!pp_u32(L, &n) || n == 0) {
+                lex_fail(L, "expected #pragma appheap N");
+                return;
+            }
+            L->pp->app_heap = n;
+            skip_line(L);
+            return;
+        }
+        lex_fail(L, "unknown pragma");
         return;
     }
     lex_fail(L, "unknown directive");
@@ -1565,7 +1629,8 @@ typedef struct {
     enum_t   enums[MAX_ENUMS];
     pp_t     pp;
     int      data_next;
-    uint8_t  data[DATA_CAP];
+    int      data_cap;
+    uint8_t *data;
     int      nfuncs;
     func_t   funcs[MAX_FUNCS];
     int      entry_idx; /* ag_main or ag_driver_init */
@@ -2028,7 +2093,7 @@ static int add_global_t(gen_t *g, const char *name, const ptype_t *t, int nelem)
      */
     g->data_next = (g->data_next + 3) & ~3;
     const int bytes = sym_bytes(g, t, nelem);
-    if (g->data_next + bytes > (int)DATA_CAP) {
+    if (g->data_next + bytes > g->data_cap) {
         gfail(g, "data too large");
         return -1;
     }
@@ -2105,7 +2170,7 @@ static int add_string(gen_t *g, const char *s)
         n++;
     }
     n++;
-    if (g->data_next + (int)n > (int)DATA_CAP) {
+    if (g->data_next + (int)n > g->data_cap) {
         gfail(g, "data too large");
         return -1;
     }
@@ -4570,6 +4635,7 @@ static void gen_free(gen_t *g)
     for (int i = 0; i < g->pp.nincls; i++) {
         CC_FREE(g->pp.incls[i].text);
     }
+    CC_FREE(g->data);
     CC_FREE(g);
 }
 
@@ -4596,15 +4662,26 @@ int cc_compile_to_axe_inc(const char *src, size_t src_len,
         return -1;
     }
 
+    uint8_t *data_buf = (uint8_t *)CC_ALLOC(DATA_CAP);
+    if (data_buf == NULL) {
+        cpy_err(out->err, sizeof(out->err), "out of memory");
+        CC_FREE(text);
+        return -1;
+    }
+
     gen_t *g = (gen_t *)CC_ALLOC(sizeof(gen_t));
     if (g == NULL) {
         cpy_err(out->err, sizeof(out->err), "out of memory");
         CC_FREE(text);
+        CC_FREE(data_buf);
         return -1;
     }
     memset(g, 0, sizeof(*g));
     g->code = text;
     g->cap = CODE_CAP;
+    g->data = data_buf;
+    g->data_cap = (int)DATA_CAP;
+    memset(data_buf, 0, DATA_CAP);
     g->entry_idx = -1;
     g->is_driver = 0;
     g->data_next = 4;
@@ -4705,8 +4782,8 @@ int cc_compile_to_axe_inc(const char *src, size_t src_len,
     wr_u32(axe + 56, AXE_HDR + (uint32_t)code_size + (uint32_t)data_file);
     wr_u32(axe + 60, (uint32_t)g->nrelocs);
 
-    wr_u32(axe + 64, 0);
-    wr_u32(axe + 68, 0);
+    wr_u32(axe + 64, g->pp.app_stack);
+    wr_u32(axe + 68, g->pp.app_heap);
     if (g->is_driver) {
         wr_str(axe + 72, 32, g->pp.drv_name);
         wr_str(axe + 104, 16, g->pp.drv_ver);
