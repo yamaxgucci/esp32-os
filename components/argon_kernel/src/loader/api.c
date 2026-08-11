@@ -530,6 +530,11 @@ static int32_t api_inp_btn(int id) { return ag_input_btnp(0, id); }
 
 static int32_t api_inp_btnp(int pad, int id) { return ag_input_btnp(pad, id); }
 
+static bool api_inp_inject(const ag_event_t *ev)
+{
+    return ag_console_inject_event(ev);
+}
+
 static const ag_inp_api_t k_inp = {
     .size = sizeof(ag_inp_api_t),
     .poll = api_inp_poll,
@@ -539,6 +544,7 @@ static const ag_inp_api_t k_inp = {
     .pad = api_inp_pad,
     .btn = api_inp_btn,
     .btnp = api_inp_btnp,
+    .inject = api_inp_inject,
 };
 
 /* ---------------------------------------------------------------------- */

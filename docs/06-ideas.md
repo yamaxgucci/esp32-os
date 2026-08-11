@@ -115,16 +115,21 @@ PATH логично продолжает это.
 
 ### 1.8. Виртуальные input-устройства (мышь / джойстик)
 
-**Статус (9 августа 2026):** pad-половина сделана. Слой
+**Статус (11 августа 2026):** pad-половина + сетевая мышь. Слой
 `components/argon_kernel/src/dev/input.c` принимает снимки от источников
 (`ag_input_push_pad`; сегодня — HostFS PADPUSH), отдаёт `/dev/joy0`
 (`AG_DEV_INPUT`) и `inp->pad` / `btn` / `btnp` (ABI 0.11). `H:\sms.pad` —
 совместимый вид того же кэша. SMS/MD больше не читают файл каждый кадр.
 
+Мышь: ABI 0.18 `inp->inject` → `ag_console_inject_event`; loadable
+[`MOUSEVIRT.SYS`](../apps/mousevirt) (`/dev/mouse0`, TCP `:5560`) +
+[`tools/mousevirt.py`](../tools/mousevirt.py). GRAIN и другие gfx-приложения
+читают `POINTER_*` через `ag_poll_event`.
+
 **Что ещё из наброска:**
 1. источники GPIO-кнопок и USB HID → тот же `ag_input_push_pad` (или edge →
    `ag_event_t`);
-2. `/dev/mouse0` и маппинг «кнопки → POINTER_*» с inject в очередь `inp`;
+2. ~~`/dev/mouse0` + POINTER inject~~ ✅ mousevirt; USB HID mouse на плате — позже;
 3. полноценный `input_ops` class vtable (§1.2), если понадобится больше, чем
    чтение снимка как файла.
 
