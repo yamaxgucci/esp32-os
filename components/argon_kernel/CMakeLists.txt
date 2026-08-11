@@ -56,6 +56,7 @@ set(ARGON_KERNEL_SRCS
     # AG_BUILTIN: see apps/fm/fm.h.
     "../../apps/fm/fm.c"
     "../../apps/fm/fmops.c"
+    "../../apps/fm/fm_ui_text.c"
     # Same dual-build idea as fm: shell command `edit`, also buildable as .AXE.
     "../../apps/edit/edit.c")
 

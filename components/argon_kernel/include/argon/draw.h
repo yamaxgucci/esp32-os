@@ -20,6 +20,11 @@ typedef struct {
     uint16_t *pix;
     uint16_t  w;
     uint16_t  h;
+    /* Inclusive-exclusive clip; when clip_w/clip_h are 0, the whole surface. */
+    int16_t   clip_x;
+    int16_t   clip_y;
+    uint16_t  clip_w;
+    uint16_t  clip_h;
 } ag_draw_surf_t;
 
 /* Colour is already RGB565. */
@@ -34,6 +39,12 @@ void ag_draw_stroke_convex(ag_draw_surf_t *s, const ag_point_t *pts, int n,
                            uint16_t c565);
 void ag_draw_fill_convex(ag_draw_surf_t *s, const ag_point_t *pts, int n,
                          uint16_t c565);
+void ag_draw_stroke_rect(ag_draw_surf_t *s, int32_t x, int32_t y, int32_t w,
+                         int32_t h, uint16_t c565);
+void ag_draw_fill_round_rect(ag_draw_surf_t *s, int32_t x, int32_t y, int32_t w,
+                             int32_t h, int32_t r, uint16_t c565);
+void ag_draw_fill_rect(ag_draw_surf_t *s, int32_t x, int32_t y, int32_t w,
+                       int32_t h, uint16_t c565);
 
 /* 0x00RRGGBB → RGB565 */
 uint16_t ag_draw_rgb_to_565(uint32_t color);

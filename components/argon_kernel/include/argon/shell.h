@@ -35,6 +35,9 @@ const char *ag_shell_cwd(void);
  */
 bool ag_shell_interrupted(void);
 
+/* Clears the flag after a command has handled Ctrl+C (e.g. cancel a copy). */
+void ag_shell_clear_interrupted(void);
+
 /* Expects an already canonical absolute path; the caller checks it exists. */
 ag_err_t ag_shell_set_cwd(const char *path);
 

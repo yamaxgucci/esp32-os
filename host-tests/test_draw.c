@@ -39,6 +39,7 @@ void run_draw_tests(void)
 {
     printf("draw\n");
 
+    memset(&s_surf, 0, sizeof(s_surf));
     s_surf.pix = s_fb;
     s_surf.w = W;
     s_surf.h = H;
@@ -87,4 +88,25 @@ void run_draw_tests(void)
         ag_draw_fill_convex(&s_surf, bad, 2, 0xFFFF);
         AG_CHECK(count_color(0xFFFF) == 0);
     }
+
+    surf_clear(0);
+    ag_draw_stroke_rect(&s_surf, 2, 2, 8, 6, 0xF800);
+    AG_CHECK(s_fb[2 * W + 2] == 0xF800);
+    AG_CHECK(s_fb[7 * W + 9] == 0xF800);
+
+    surf_clear(0);
+    s_surf.clip_x = 4;
+    s_surf.clip_y = 4;
+    s_surf.clip_w = 8;
+    s_surf.clip_h = 8;
+    ag_draw_fill_rect(&s_surf, 0, 0, W, H, 0x001F);
+    AG_CHECK(count_color(0x001F) == 64);
+    ag_draw_pixel(&s_surf, 0, 0, 0xFFFF);
+    AG_CHECK(s_fb[0] == 0);
+    s_surf.clip_w = 0;
+    s_surf.clip_h = 0;
+
+    surf_clear(0);
+    ag_draw_fill_round_rect(&s_surf, 4, 4, 16, 12, 3, 0x07E0);
+    AG_CHECK(count_color(0x07E0) > 80);
 }

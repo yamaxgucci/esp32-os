@@ -52,9 +52,10 @@ extern "C" {
  * 0.13 appended net->set_nonblock.
  * 0.14 added api->audio (I2S or discard stub) and AG_AXE_NEEDS_AUDIO.
  * 0.15 pcmnull built-in; AG_IOC_AUDIO_GETFMT/SETFMT; I2S/virt via .SYS drivers.
+ * 0.16 appended gfx clip / clip_reset / stroke_rect / fill_round_rect.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 15u
+#define AG_ABI_MINOR 16u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -489,6 +490,14 @@ typedef struct ag_gfx_api {
     void (*poly_stroke)(uint32_t color);
     void (*fill_convex)(const ag_point_t *pts, int32_t n, uint32_t color);
     void (*stroke_convex)(const ag_point_t *pts, int32_t n, uint32_t color);
+
+    /* ABI 0.16: soft-draw clip + rectangles (RGB 0x00RRGGBB). Require acquire. */
+    void (*clip)(int16_t x, int16_t y, uint16_t w, uint16_t h);
+    void (*clip_reset)(void);
+    void (*stroke_rect)(int16_t x, int16_t y, uint16_t w, uint16_t h,
+                        uint32_t color);
+    void (*fill_round_rect)(int16_t x, int16_t y, uint16_t w, uint16_t h,
+                            uint16_t r, uint32_t color);
 } ag_gfx_api_t;
 
 /* ------------------------------------------------------------------------ */
