@@ -14,7 +14,8 @@
 
 #include "cc_compile.h"
 
-AG_APP("CC", "0.1", "argon", 0);
+/* Large CODE/DATA emit buffers live on the process heap (PSRAM). */
+AG_APP_SIZED("CC", "0.2", "argon", 0, 24 * 1024, 3 * 1024 * 1024);
 
 #define SRC_CAP (128u * 1024u)
 

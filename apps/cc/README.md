@@ -12,6 +12,9 @@ host toolchain (image name `CC.AXE`).
 - Drivers: `#pragma drv "NAME" "VER" "AUTHOR"` (required) sets the image
   header; the compiler stamps `AG_AXE_DRIVER`. `&func` yields a code address
   for filling an ops table
+- App sizes: `#pragma appstack N` / `#pragma appheap N` write non-zero
+  `stack_size` / `heap_size` into the AXE header (kernel defaults if omitted;
+  `N` is decimal or `0x` hex bytes)
 - Functions: up to 6 params of any of those types; calls use windowed `callx8`
 - Globals (before functions): `int x;`, `char c;`, `int a[N];`, `char b[N];`,
   `char *p;`, `struct v s;`, `struct v a[N];`, `struct v *p;`
@@ -61,10 +64,11 @@ A value is always a 32-bit word in a register; `char` describes *storage*, so it
 is what a load or a store touches and what an index is scaled by. `char c = 300`
 keeps 44, and reads back positive.
 
-Limits per program: 256 functions, 256 globals, 96 locals (224 words) per
-function, 24 structs of 24 fields, 128 KB of data, and code up to the 192 KB
-executable arena — the same ceiling the loader hands out, so anything that
-compiles will load. Guest `CC.AXE` reads up to 128 KB of source per file.
+Limits per program: 512 functions, 512 globals, 256 macros, 96 locals
+(224 words) per function, 24 structs of 24 fields, 512 KB of static data
+(PSRAM), and code up to 512 KB. Code that fits the IRAM arena (192 KB on S3)
+runs from there; larger images use flash XIP. Guest `CC.AXE` reads up to
+128 KB of source per file — split large games with `#include`.
 
 Examples: [`examples/asteroids.c`](examples/asteroids.c) (a game),
 [`examples/selftest.c`](examples/selftest.c) (checks the generated code,
@@ -213,7 +217,13 @@ run h:\tile_demo.axe
 
 run h:\cc.axe h:\wetspot.c h:\wetspot.axe
 run h:\wetspot.axe
+
+run h:\cc.axe h:\harbor.c h:\harbr.axe
+run h:\harbr.axe
 ```
+
+RPG demo: [`games/harbor`](games/harbor) (Harbor Quest). Stage `harbor.c`,
+`hq_data.h`, `atlas.bin`, and the g2d headers on HostFS.
 
 2D games: Mini-C library [`lib/g2d`](lib/g2d) (copy `g2d_globals.h` /
 `g2d_impl.h` beside your `.c`). Needs ABI 0.17 `ag_gfx_blit_bind` /
