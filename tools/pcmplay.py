@@ -11,8 +11,9 @@ guest does not wait for you.  Typical:
   python tools/pcmplay.py --record build/out.wav
 
 A reader thread keeps the TCP window drained so the guest never blocks on send.
-Playback uses a short jitter buffer; underruns insert silence (QEMU is often
-far below realtime, so gaps are expected unless the emu catches up).
+Live playback uses a jitter buffer with hold-last-sample underruns and light
+time-stretch when the buffer runs low (QEMU is often below realtime; --save
+recordings stay bit-exact without stretch).
 """
 
 from __future__ import annotations
@@ -143,18 +144,45 @@ def reader_thread(
         ring.close()
 
 
+def _hold_chunk(last_frame: bytes, frame_bytes: int, nbytes: int) -> bytes:
+    """Repeat the last PCM frame to fill nbytes (avoids zero-click underruns)."""
+    if frame_bytes <= 0 or nbytes < frame_bytes:
+        return bytes(nbytes)
+    n = nbytes // frame_bytes
+    return last_frame * n
+
+
+def _stretch_pcm(data: bytes, frame_bytes: int, add_every: int) -> bytes:
+    """Duplicate 1 frame every add_every frames (~slowdown, no pitch DSP)."""
+    if add_every < 2 or frame_bytes <= 0 or len(data) < frame_bytes:
+        return data
+    out = bytearray()
+    nframes = len(data) // frame_bytes
+    for i in range(nframes):
+        fr = data[i * frame_bytes : (i + 1) * frame_bytes]
+        out.extend(fr)
+        if (i + 1) % add_every == 0:
+            out.extend(fr)
+    return bytes(out)
+
+
 def play_sounddevice(
     sock: socket.socket, rate: int, channels: int, rec: WavRecorder | None = None
 ) -> None:
     import sounddevice as sd
 
     frame_bytes = channels * 2
-    # ~1.0 s capacity / ~200 ms prebuffer — fewer live underruns under QEMU.
-    ring = PcmRing(capacity=rate * frame_bytes)
-    prebuffer = rate * frame_bytes * 20 // 100
+    # 2 s capacity / ~500 ms prebuffer. Below ~300 ms we time-stretch a little
+    # so a chronic ~0.9× guest does not empty the ring into clicky underruns.
+    ring = PcmRing(capacity=rate * frame_bytes * 2)
+    prebuffer = rate * frame_bytes * 50 // 100
+    low = rate * frame_bytes * 30 // 100
+    very_low = rate * frame_bytes * 15 // 100
     chunk = max(frame_bytes * (rate // 40), frame_bytes * 128)
     underruns = 0
+    stretches = 0
     played = 0
+    last_frame = bytes(frame_bytes)
     last_report = time.monotonic()
 
     t = threading.Thread(
@@ -167,10 +195,10 @@ def play_sounddevice(
         time.sleep(0.01)
 
     print(
-        f"playing {rate} Hz, {channels} ch (sounddevice). Ctrl+C to stop.",
+        f"playing {rate} Hz, {channels} ch (sounddevice, hold+stretch). "
+        "Ctrl+C to stop.",
         flush=True,
     )
-    silence = bytes(chunk)
     try:
         with sd.RawOutputStream(
             samplerate=rate,
@@ -179,32 +207,46 @@ def play_sounddevice(
             blocksize=0,
         ) as stream:
             while True:
-                data = ring.read(chunk, timeout=0.05)
+                data = ring.read(chunk, timeout=0.08)
                 if not data:
                     if not t.is_alive() and ring.available() == 0:
                         break
-                    stream.write(silence)
+                    hold = _hold_chunk(last_frame, frame_bytes, chunk)
+                    if hold:
+                        stream.write(hold)
                     underruns += 1
                     continue
                 rem = len(data) % frame_bytes
                 if rem:
                     data = data[:-rem]
-                if data:
-                    stream.write(data)
-                    played += len(data)
+                if not data:
+                    continue
+                last_frame = data[-frame_bytes:]
+
+                buffered = ring.available()
+                if buffered < very_low:
+                    data = _stretch_pcm(data, frame_bytes, add_every=6)
+                    stretches += 1
+                elif buffered < low:
+                    data = _stretch_pcm(data, frame_bytes, add_every=14)
+                    stretches += 1
+
+                stream.write(data)
+                played += len(data)
 
                 now = time.monotonic()
                 if now - last_report >= 2.0:
                     print(
                         f"stats: played={played} B  ring_drop={ring.dropped} B  "
-                        f"underruns={underruns}  buffered={ring.available()} B",
+                        f"underruns={underruns}  stretch={stretches}  "
+                        f"buffered={ring.available()} B",
                         flush=True,
                     )
                     last_report = now
     finally:
         print(
             f"final: played={played} B  ring_drop={ring.dropped} B  "
-            f"underruns={underruns}",
+            f"underruns={underruns}  stretch={stretches}",
             flush=True,
         )
 

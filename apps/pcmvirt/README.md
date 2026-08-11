@@ -156,7 +156,7 @@ run h:\md.axe h:\game.bin pcmvirt
 | `dev pcmvirt` missing | Module not loaded — `drv` list; re-`install` |
 | `pcmplay` never connects | QEMU not running, wrong port, or net not up in guest |
 | Connected but silence | App still on `pcmnull` / `mock`; pass `pcmvirt` |
-| Stutter / gaps | Under QEMU the usual cause is guest below realtime (`late`/`resync` in DX7; `pcmplay` `xrealtime` &lt; 1). Not clipping: check peak via `--save`. Ring overflow is `tcp_ov` / log `drop_ov`; short TCP stalls are absorbed by the 32 KiB guest ring. Host live path also prints `underruns` / `ring_drop`. |
+| Stutter / gaps | Under QEMU the usual cause is guest below realtime (`late`/`resync` in DX7; `pcmplay` `xrealtime` &lt; 1). Not clipping: check peak via `--save`. Ring overflow is `tcp_ov` / log `drop_ov`; short TCP stalls are absorbed by the 32 KiB guest ring. Live `pcmplay` holds the last sample on underrun and lightly time-stretches when its jitter buffer is low (stats: `underruns` / `stretch` / `ring_drop`). |
 | `api->net is NULL` | Firmware built without networking |
 
 Uninstall:
