@@ -574,6 +574,8 @@ enum ag_ioctl_cmd {
     /* PCM devices (/dev/pcmnull, loadable pcmvirt, …): arg ag_audio_fmt_t */
     AG_IOC_AUDIO_GETFMT = AG_IOC(AG_DEV_AUDIO, 1),
     AG_IOC_AUDIO_SETFMT = AG_IOC(AG_DEV_AUDIO, 2),
+    /* Optional: arg ag_audio_stats_t (pcmvirt; pcmnull returns zeros). */
+    AG_IOC_AUDIO_GETSTATS = AG_IOC(AG_DEV_AUDIO, 3),
 };
 
 typedef struct {
@@ -914,6 +916,18 @@ typedef struct {
     uint8_t  channels; /* 1 or 2 */
     uint8_t  bits;     /* 16 */
 } ag_audio_fmt_t;
+
+/* Cumulative stream accounting for virtual/HW PCM sinks (GETSTATS). */
+typedef struct {
+    uint64_t bytes_in;           /* accepted from write() */
+    uint64_t bytes_sent;         /* delivered to host/HW */
+    uint64_t bytes_drop_noclient;/* no peer / not open */
+    uint64_t bytes_drop_overflow;/* ring/TCP backpressure */
+    uint32_t eagain_events;      /* send returned EAGAIN */
+    uint32_t overflow_events;    /* ring overflow discards */
+    uint32_t ring_used;          /* bytes pending in driver ring */
+    uint32_t ring_cap;           /* ring capacity */
+} ag_audio_stats_t;
 
 typedef struct ag_audio_api {
     uint32_t size;

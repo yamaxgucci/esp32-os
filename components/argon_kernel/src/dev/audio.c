@@ -94,6 +94,13 @@ static ag_err_t pcm_ioctl(ag_device_t *dev, uint32_t cmd, void *arg,
         }
         return apply_fmt((const ag_audio_fmt_t *)arg);
     }
+    if (cmd == AG_IOC_AUDIO_GETSTATS) {
+        if (arg == NULL || arglen < sizeof(ag_audio_stats_t)) {
+            return -AG_EINVAL;
+        }
+        memset(arg, 0, sizeof(ag_audio_stats_t));
+        return AG_OK;
+    }
     if (cmd == AG_IOC_FLUSH || cmd == AG_IOC_RESET) {
         return AG_OK;
     }
