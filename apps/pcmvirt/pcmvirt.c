@@ -16,7 +16,7 @@
 #include <argon/argon.h>
 #include <argon/libc.h>
 
-AG_DRV("PCMVIRT", "1.1", "argon");
+AG_DRV("PCMVIRT", "1.1.1", "argon");
 
 #define PCMVIRT_PORT     5558u
 #define WAV_HDR          44u
@@ -238,11 +238,14 @@ static void ensure_listen(pcmvirt_state_t *st)
     }
     st->listen = ag_tcp_listen(PCMVIRT_PORT);
     if (st->listen < 0) {
+        ag_log(AG_LOG_ERROR, "pcmvirt", "listen :%u failed: %d",
+               (unsigned)PCMVIRT_PORT, (int)st->listen);
         st->listen = -1;
         return;
     }
     /* Keep accept() pollable even if a caller passes a blocking timeout. */
     (void)ag_net_set_nonblock(st->listen, true);
+    ag_log(AG_LOG_INFO, "pcmvirt", "listen :%u ok", (unsigned)PCMVIRT_PORT);
 }
 
 static int send_all_nb_header(ag_handle_t sock, const uint8_t *buf, size_t len)
@@ -278,9 +281,15 @@ static void try_accept(pcmvirt_state_t *st)
 
     peer = ag_tcp_accept(st->listen, 0u);
     if (peer < 0) {
+        /* EAGAIN is the normal idle poll; anything else explains host EOF. */
+        if (peer != (ag_handle_t)(-AG_EAGAIN)) {
+            ag_log(AG_LOG_ERROR, "pcmvirt", "accept failed: %d", (int)peer);
+        }
         return;
     }
 
+    ag_log(AG_LOG_INFO, "pcmvirt", "accept peer=%d (had_conn=%d)", (int)peer,
+           st->conn >= 0 ? 1 : 0);
     close_conn(st, "replaced by new peer");
     st->conn = peer;
     st->hdr_sent = 0;
@@ -295,6 +304,8 @@ static void try_accept(pcmvirt_state_t *st)
         return;
     }
     st->hdr_sent = 1;
+    ag_log(AG_LOG_INFO, "pcmvirt", "wav header sent (%u Hz, %u ch)",
+           (unsigned)st->fmt.rate, (unsigned)st->fmt.channels);
 }
 
 static ag_err_t pcm_open(ag_device_t *dev, uint32_t flags)

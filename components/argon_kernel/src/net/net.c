@@ -105,7 +105,17 @@ static ag_handle_t adopt_fd(int fd)
             return (ag_handle_t)(AG_NET_HANDLE_BASE + i);
         }
     }
-    unlock();
+    {
+        int used = 0;
+        for (int i = 0; i < AG_NET_MAX_SOCK; i++) {
+            if (s_in_use[i]) {
+                used++;
+            }
+        }
+        unlock();
+        ag_log(AG_LOG_ERROR, "net", "adopt_fd ENFILE used=%d/%d", used,
+               AG_NET_MAX_SOCK);
+    }
     close(fd);
     return (ag_handle_t)(-AG_ENFILE);
 }
