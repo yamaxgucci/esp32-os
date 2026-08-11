@@ -16,7 +16,7 @@
 
 AG_APP("CC", "0.1", "argon", 0);
 
-#define SRC_CAP (64u * 1024u)
+#define SRC_CAP (128u * 1024u)
 
 static int read_all(const char *path, char *buf, size_t cap, size_t *out_len)
 {

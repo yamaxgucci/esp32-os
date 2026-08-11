@@ -404,6 +404,16 @@ void     clip_reset(void);               /* whole framebuffer again */
 void     stroke_rect(int16_t x, int16_t y, uint16_t w, uint16_t h, uint32_t color);
 void     fill_round_rect(int16_t x, int16_t y, uint16_t w, uint16_t h,
                          uint16_t r, uint32_t color);
+
+/* ABI 0.17 — chroma blit; soft path RGB565 / RGB565_BE */
+void     blit_key(int16_t x, int16_t y, uint16_t w, uint16_t h,
+                  const void *src, uint32_t src_stride, ag_pixfmt_t fmt,
+                  uint32_t key_rgb);
+/* Stateful RGB565 LE path for Argon CC (≤6 call args): bind → copy/keyed */
+void     blit_bind(const void *src, uint32_t src_stride);
+void     blit_copy(int16_t x, int16_t y, uint16_t w, uint16_t h);
+void     blit_keyed(int16_t x, int16_t y, uint16_t w, uint16_t h,
+                    uint32_t key_rgb);
 ```
 
 Сейчас бэкенд — **программный** RGB565 framebuffer (`d:\fb0`, по умолчанию
@@ -425,6 +435,9 @@ front, то есть остаются какими были, но панели �
 Soft-draw (`pixel`/`line`/`circle`/`poly_*`) — целочисленный растеризатор в
 [`draw.c`](../../components/argon_kernel/src/dev/draw.c); полигоны только
 **выпуклые**. ABI 0.16 добавляет `clip` / `stroke_rect` / `fill_round_rect`.
+ABI 0.17 — `blit_key` и stateful `blit_bind` / `blit_copy` / `blit_keyed`
+(прозрачный blit для спрайтов; игровой tilemap/sprite слой — Mini-C
+библиотека [`apps/cc/lib/g2d`](../../apps/cc/lib/g2d), не ядро).
 Полноценный GUI toolkit — не в ядре (LVGL при необходимости линкуется в
 host-`.AXE`, см. [`06-ideas.md`](../06-ideas.md) §3.4).
 

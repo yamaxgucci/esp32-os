@@ -91,6 +91,10 @@ extern "C" {
 #define GFX_OFF_CLIP_RESET      84
 #define GFX_OFF_STROKE_RECT     88
 #define GFX_OFF_FILL_ROUND_RECT 92
+#define GFX_OFF_BLIT_KEY        96
+#define GFX_OFF_BLIT_BIND       100
+#define GFX_OFF_BLIT_COPY       104
+#define GFX_OFF_BLIT_KEYED      108
 
 #define AUDIO_OFF_PRESENT 4
 #define AUDIO_OFF_IS_HW   8
@@ -109,6 +113,7 @@ extern "C" {
 #define ABI_MINOR_BTN   10
 #define ABI_MINOR_AUDIO 14
 #define ABI_MINOR_GFX16 16
+#define ABI_MINOR_GFX17 17
 
 typedef struct {
     uint8_t *axe;

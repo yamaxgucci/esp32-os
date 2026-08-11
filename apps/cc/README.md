@@ -15,8 +15,13 @@ host toolchain (image name `CC.AXE`).
 - Functions: up to 6 params of any of those types; calls use windowed `callx8`
 - Globals (before functions): `int x;`, `char c;`, `int a[N];`, `char b[N];`,
   `char *p;`, `struct v s;`, `struct v a[N];`, `struct v *p;`
-- Locals: the same, plus assign, `return`, `if`/`else`, `while`, `for`, blocks
-- `for (init; cond; step)` — init may be a declaration, an assignment, or empty
+- Locals: the same, plus assign, `return`, `if`/`else`, `while`, `for`, `do`,
+  `break`/`continue`, `switch`/`case`/`default`, blocks
+- `for (init; cond; step)` — init may be a declaration, an assignment, `++`/`+=`,
+  or empty; step the same (no decl)
+- `switch` is an if-chain with fall-through; `break` leaves it (no `continue`)
+- `typedef` and `enum { A, B = 3 }` (enumerators are int constants); `const` /
+  `volatile` are accepted and ignored; `sizeof(type)` for known types
 - Arrays and pointers: `a[i]`, `a[i] = expr`, `*p`, `*p = expr`, `&x`, `&a[i]`,
   `&func` (code address of a function already defined)
 - Structs: `struct v { int x; char tag; int a[4]; struct v *next; };` then
@@ -25,10 +30,13 @@ host toolchain (image name `CC.AXE`).
 - Pointer arithmetic steps by the element: `p + 1` moves 1 byte for `char *`,
   4 for `int *` and the whole struct for a `struct v *`; an array name is the
   address of its first element
-- Expressions: `+ - * / %`, compares, `& | ^ ~ << >>`, `&& || !`, parentheses,
-  calls — at C's precedence, so `(x & 3) == 0` needs its parentheses
+- Expressions: `+ - * / %`, compares, `& | ^ ~ << >>`, `&& || !`, `?:`,
+  `++`/`--` (prefix/postfix on names), `+=` `-=` `*=` `/=` `%=` `&=` `|=` `^=`
+  `<<=` `>>=`, parentheses, calls — at C's precedence, so `(x & 3) == 0` needs
+  its parentheses
 - `>>` is arithmetic (sign-keeping); a shift count belongs in 0…31
-- Character constants `'a'`, `'\n'`; string literals `"..."` are `char *`
+- Integer constants: decimal, `0x` hex, `0` octal; character constants `'a'`,
+  `'\n'`; string literals `"..."` are `char *`
 - Preprocessor: `#define` / `#undef` (object- and function-like), `#ifdef` /
   `#ifndef` / `#else` / `#endif`, `#include "file"` (resolved next to the
   source being compiled). No `#if` expressions, no `##`, no angle-bracket
@@ -37,9 +45,9 @@ host toolchain (image name `CC.AXE`).
 - Result of `ag_main` is the process exit code (`errorlevel`)
 - Errors carry the source line: `expected ';' at line 42`
 
-No floats, unions, `++`, `+=`, arrays of pointers, or pointers to pointers.
-Functions return `int` or `void` — an address is an `int` like any other, so a
-function that hands one back is declared `int`.
+No floats, unions, arrays of pointers, or pointers to pointers. Functions return
+`int` or `void` — an address is an `int` like any other, so a function that hands
+one back is declared `int`.
 
 A struct is only ever handled by address: no struct assignment (`a = b`), no
 struct parameter or return value — pass `&s` and take a `struct v *`. Fields go
@@ -53,10 +61,10 @@ A value is always a 32-bit word in a register; `char` describes *storage*, so it
 is what a load or a store touches and what an index is scaled by. `char c = 300`
 keeps 44, and reads back positive.
 
-Limits per program: 128 functions, 128 globals, 96 locals (224 words) per
+Limits per program: 256 functions, 256 globals, 96 locals (224 words) per
 function, 24 structs of 24 fields, 128 KB of data, and code up to the 192 KB
 executable arena — the same ceiling the loader hands out, so anything that
-compiles will load. Guest `CC.AXE` reads up to 64 KB of source per file.
+compiles will load. Guest `CC.AXE` reads up to 128 KB of source per file.
 
 Examples: [`examples/asteroids.c`](examples/asteroids.c) (a game),
 [`examples/selftest.c`](examples/selftest.c) (checks the generated code,
@@ -74,7 +82,8 @@ of a guest.
 
 The image demands the highest ABI minor of the features it uses: 8 plain, 9 for
 `ag_gfx_*` (which also sets `AG_AXE_NEEDS_GFX`), 10 for `ag_btn`, 14 for
-`ag_audio_*` (`AG_AXE_NEEDS_AUDIO`).
+`ag_audio_*` (`AG_AXE_NEEDS_AUDIO`), 16 for clip/round-rect, 17 for
+`ag_gfx_blit_bind` / `blit_copy` / `blit_keyed`.
 
 | Builtin | Notes |
 |---------|--------|
@@ -102,6 +111,9 @@ The image demands the highest ABI minor of the features it uses: 8 plain, 9 for
 | `ag_gfx_poly_begin` / `vertex` / `fill` / `stroke` | Convex poly helpers |
 | `ag_gfx_clip` / `ag_gfx_clip_reset` | Soft-draw clip (ABI 0.16) |
 | `ag_gfx_stroke_rect` / `ag_gfx_fill_round_rect` | Rect helpers (ABI 0.16) |
+| `ag_gfx_blit_bind(src, stride)` | RGB565 LE source for stateful blit (ABI 0.17) |
+| `ag_gfx_blit_copy(x,y,w,h)` | Opaque copy from bound source |
+| `ag_gfx_blit_keyed(x,y,w,h,key)` | Chroma-key blit; `key` is `0x00RRGGBB` |
 | `ag_audio_present()` | 1 if `api->audio` exists |
 | `ag_audio_is_hw()` | 1 when I2S pins live |
 | `ag_audio_open()` | default 22050 Hz stereo s16 (`fmt` NULL) |
@@ -190,12 +202,22 @@ drv unload ECHO
 argon run -Gfx -HostFs build\sd_card
 ```
 
-Guest (`H:` = `build\sd_card` with `CC.AXE`, `asteroids.c`, optional `ASTEROIDS.AXE`):
+Guest (`H:` = `build\sd_card` with `CC.AXE`, examples, and `g2d_*.h`):
 
 ```text
 run h:\cc.axe h:\asteroids.c h:\asteroids.axe
 run h:\asteroids.axe
+
+run h:\cc.axe h:\tile_demo.c h:\tile_demo.axe
+run h:\tile_demo.axe
+
+run h:\cc.axe h:\wetspot.c h:\wetspot.axe
+run h:\wetspot.axe
 ```
+
+2D games: Mini-C library [`lib/g2d`](lib/g2d) (copy `g2d_globals.h` /
+`g2d_impl.h` beside your `.c`). Needs ABI 0.17 `ag_gfx_blit_bind` /
+`blit_copy` / `blit_keyed`.
 
 Asteroids input is the **same HostFS PADPUSH path as SMS** (`H:\sms.pad`,
 level keys ~60 Hz). Controls (defaults in `sms.cfg`): Left/Right rotate, Up

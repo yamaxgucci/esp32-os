@@ -46,6 +46,14 @@ void ag_draw_fill_round_rect(ag_draw_surf_t *s, int32_t x, int32_t y, int32_t w,
 void ag_draw_fill_rect(ag_draw_surf_t *s, int32_t x, int32_t y, int32_t w,
                        int32_t h, uint16_t c565);
 
+/*
+ * Copy an RGB565 (or RGB565_BE) rectangle onto the surface.  When use_key is
+ * non-zero, pixels equal to key565 are skipped (sprite chroma key).
+ */
+void ag_draw_blit(ag_draw_surf_t *s, int32_t x, int32_t y, int32_t w, int32_t h,
+                  const void *src, uint32_t src_stride, int src_be, int use_key,
+                  uint16_t key565);
+
 /* 0x00RRGGBB → RGB565 */
 uint16_t ag_draw_rgb_to_565(uint32_t color);
 

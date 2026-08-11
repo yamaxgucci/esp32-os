@@ -1,8 +1,10 @@
 /*
  * ArgonOS - Tiny C → Xtensa .AXE (stack-machine codegen).
  *
- * Subset: int/void, locals, globals, int arrays, return, if/else, while/for,
- * multiple functions (callx8), string literals, and ABI builtins for time/input/gfx/audio.
+ * Subset: int/void/char/struct, locals, globals, arrays, return, if/else,
+ * while/for/do, break/continue, switch (if-chain), typedef/enum/sizeof,
+ * ++/-- and compound assigns, ?: , hex/oct constants, string literals,
+ * multiple functions (callx8), and ABI builtins for time/input/gfx/audio.
  * Entry must be named ag_main (app) or ag_driver_init (driver / .SYS).
  *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
@@ -50,8 +52,8 @@ static void cc_free(void *p)
 #define DATA_CAP  (128u * 1024u)
 #define LIT_CAP   1024
 #define MAX_LIT_SITES 8192
-#define MAX_GLOBALS 128
-#define MAX_FUNCS 128
+#define MAX_GLOBALS 256
+#define MAX_FUNCS 256
 #define MAX_RELOCS 2048
 #define MAX_NAME   32
 #define MAX_STR    256
@@ -64,6 +66,11 @@ static void cc_free(void *p)
 #define MAX_FRAMES  12
 #define MAX_PATH    64
 #define EXP_CAP     4096
+#define MAX_TYPEDEFS 32
+#define MAX_ENUMS 128
+#define MAX_LOOP_DEPTH 16
+#define MAX_BREAK_SITES 32
+#define MAX_CASES 32
 
 /*
  * Frame layout, from the frame pointer up: spill slots, then locals, then the
@@ -148,6 +155,17 @@ typedef enum {
     T_ELSE,
     T_WHILE,
     T_FOR,
+    T_DO,
+    T_BREAK,
+    T_CONTINUE,
+    T_SWITCH,
+    T_CASE,
+    T_DEFAULT,
+    T_TYPEDEF,
+    T_ENUM,
+    T_SIZEOF,
+    T_CONST,
+    T_VOLATILE,
     T_LPAREN,
     T_RPAREN,
     T_LBRACE,
@@ -177,6 +195,20 @@ typedef enum {
     T_TILDE,
     T_SHL,
     T_SHR,
+    T_PLUSPLUS,
+    T_MINUSMINUS,
+    T_PLUS_EQ,
+    T_MINUS_EQ,
+    T_STAR_EQ,
+    T_SLASH_EQ,
+    T_PERCENT_EQ,
+    T_AMP_EQ,
+    T_PIPE_EQ,
+    T_CARET_EQ,
+    T_SHL_EQ,
+    T_SHR_EQ,
+    T_QUESTION,
+    T_COLON,
     T_STRUCT,
     T_DOT,
     T_ARROW,
@@ -842,6 +874,39 @@ static tok_t kw(const char *s)
     if (CC_STRCMP(s, "for") == 0) {
         return T_FOR;
     }
+    if (CC_STRCMP(s, "do") == 0) {
+        return T_DO;
+    }
+    if (CC_STRCMP(s, "break") == 0) {
+        return T_BREAK;
+    }
+    if (CC_STRCMP(s, "continue") == 0) {
+        return T_CONTINUE;
+    }
+    if (CC_STRCMP(s, "switch") == 0) {
+        return T_SWITCH;
+    }
+    if (CC_STRCMP(s, "case") == 0) {
+        return T_CASE;
+    }
+    if (CC_STRCMP(s, "default") == 0) {
+        return T_DEFAULT;
+    }
+    if (CC_STRCMP(s, "typedef") == 0) {
+        return T_TYPEDEF;
+    }
+    if (CC_STRCMP(s, "enum") == 0) {
+        return T_ENUM;
+    }
+    if (CC_STRCMP(s, "sizeof") == 0) {
+        return T_SIZEOF;
+    }
+    if (CC_STRCMP(s, "const") == 0) {
+        return T_CONST;
+    }
+    if (CC_STRCMP(s, "volatile") == 0) {
+        return T_VOLATILE;
+    }
     return T_IDENT;
 }
 
@@ -1084,14 +1149,61 @@ static void lex_next(lex_t *L)
     }
     if (is_digit(c)) {
         int32_t v = 0;
-        while (L->pos < L->len && is_digit(L->src[L->pos])) {
-            const int d = L->src[L->pos] - '0';
-            if (v > (2147483647 - d) / 10) {
-                lex_fail(L, "integer constant too large");
+        /* 0x… hex, 0… octal, otherwise decimal. */
+        if (c == '0' && L->pos + 1 < L->len &&
+            (L->src[L->pos + 1] == 'x' || L->src[L->pos + 1] == 'X')) {
+            int digits = 0;
+            L->pos += 2;
+            while (L->pos < L->len) {
+                const char h = L->src[L->pos];
+                int d;
+                if (h >= '0' && h <= '9') {
+                    d = h - '0';
+                } else if (h >= 'a' && h <= 'f') {
+                    d = 10 + (h - 'a');
+                } else if (h >= 'A' && h <= 'F') {
+                    d = 10 + (h - 'A');
+                } else {
+                    break;
+                }
+                if (v > (int32_t)((0x7fffffffu - (uint32_t)d) / 16u)) {
+                    lex_fail(L, "integer constant too large");
+                    return;
+                }
+                v = (int32_t)(((uint32_t)v << 4) | (uint32_t)d);
+                L->pos++;
+                digits++;
+            }
+            if (digits == 0) {
+                lex_fail(L, "bad hex constant");
                 return;
             }
-            v = v * 10 + d;
+        } else if (c == '0') {
+            /* Octal (or lone 0). Digits 8/9 after a leading 0 are invalid. */
             L->pos++;
+            while (L->pos < L->len && is_digit(L->src[L->pos])) {
+                const int d = L->src[L->pos] - '0';
+                if (d >= 8) {
+                    lex_fail(L, "bad octal constant");
+                    return;
+                }
+                if (v > (2147483647 - d) / 8) {
+                    lex_fail(L, "integer constant too large");
+                    return;
+                }
+                v = v * 8 + d;
+                L->pos++;
+            }
+        } else {
+            while (L->pos < L->len && is_digit(L->src[L->pos])) {
+                const int d = L->src[L->pos] - '0';
+                if (v > (2147483647 - d) / 10) {
+                    lex_fail(L, "integer constant too large");
+                    return;
+                }
+                v = v * 10 + d;
+                L->pos++;
+            }
         }
         L->num = v;
         L->tok = T_NUM;
@@ -1179,12 +1291,26 @@ static void lex_next(lex_t *L)
         L->tok = T_COMMA;
         break;
     case '+':
-        L->tok = T_PLUS;
+        if (L->pos < L->len && L->src[L->pos] == '+') {
+            L->pos++;
+            L->tok = T_PLUSPLUS;
+        } else if (L->pos < L->len && L->src[L->pos] == '=') {
+            L->pos++;
+            L->tok = T_PLUS_EQ;
+        } else {
+            L->tok = T_PLUS;
+        }
         break;
     case '-':
         if (L->pos < L->len && L->src[L->pos] == '>') {
             L->pos++;
             L->tok = T_ARROW;
+        } else if (L->pos < L->len && L->src[L->pos] == '-') {
+            L->pos++;
+            L->tok = T_MINUSMINUS;
+        } else if (L->pos < L->len && L->src[L->pos] == '=') {
+            L->pos++;
+            L->tok = T_MINUS_EQ;
         } else {
             L->tok = T_MINUS;
         }
@@ -1193,13 +1319,34 @@ static void lex_next(lex_t *L)
         L->tok = T_DOT;
         break;
     case '*':
-        L->tok = T_STAR;
+        if (L->pos < L->len && L->src[L->pos] == '=') {
+            L->pos++;
+            L->tok = T_STAR_EQ;
+        } else {
+            L->tok = T_STAR;
+        }
         break;
     case '%':
-        L->tok = T_PERCENT;
+        if (L->pos < L->len && L->src[L->pos] == '=') {
+            L->pos++;
+            L->tok = T_PERCENT_EQ;
+        } else {
+            L->tok = T_PERCENT;
+        }
         break;
     case '/':
-        L->tok = T_SLASH;
+        if (L->pos < L->len && L->src[L->pos] == '=') {
+            L->pos++;
+            L->tok = T_SLASH_EQ;
+        } else {
+            L->tok = T_SLASH;
+        }
+        break;
+    case '?':
+        L->tok = T_QUESTION;
+        break;
+    case ':':
+        L->tok = T_COLON;
         break;
     case '!':
         if (L->pos < L->len && L->src[L->pos] == '=') {
@@ -1223,7 +1370,12 @@ static void lex_next(lex_t *L)
             L->tok = T_LE;
         } else if (L->pos < L->len && L->src[L->pos] == '<') {
             L->pos++;
-            L->tok = T_SHL;
+            if (L->pos < L->len && L->src[L->pos] == '=') {
+                L->pos++;
+                L->tok = T_SHL_EQ;
+            } else {
+                L->tok = T_SHL;
+            }
         } else {
             L->tok = T_LT;
         }
@@ -1234,7 +1386,12 @@ static void lex_next(lex_t *L)
             L->tok = T_GE;
         } else if (L->pos < L->len && L->src[L->pos] == '>') {
             L->pos++;
-            L->tok = T_SHR;
+            if (L->pos < L->len && L->src[L->pos] == '=') {
+                L->pos++;
+                L->tok = T_SHR_EQ;
+            } else {
+                L->tok = T_SHR;
+            }
         } else {
             L->tok = T_GT;
         }
@@ -1243,6 +1400,9 @@ static void lex_next(lex_t *L)
         if (L->pos < L->len && L->src[L->pos] == '&') {
             L->pos++;
             L->tok = T_ANDAND;
+        } else if (L->pos < L->len && L->src[L->pos] == '=') {
+            L->pos++;
+            L->tok = T_AMP_EQ;
         } else {
             L->tok = T_AMP;
         }
@@ -1251,12 +1411,20 @@ static void lex_next(lex_t *L)
         if (L->pos < L->len && L->src[L->pos] == '|') {
             L->pos++;
             L->tok = T_OROR;
+        } else if (L->pos < L->len && L->src[L->pos] == '=') {
+            L->pos++;
+            L->tok = T_PIPE_EQ;
         } else {
             L->tok = T_PIPE;
         }
         break;
     case '^':
-        L->tok = T_CARET;
+        if (L->pos < L->len && L->src[L->pos] == '=') {
+            L->pos++;
+            L->tok = T_CARET_EQ;
+        } else {
+            L->tok = T_CARET;
+        }
         break;
     case '~':
         L->tok = T_TILDE;
@@ -1360,6 +1528,19 @@ typedef struct {
     int    is_void;
 } func_t;
 
+/* A typedef is only a name for an existing type (optional pointer). */
+typedef struct {
+    char name[MAX_NAME];
+    int  esize;
+    int  sidx;
+    int  is_ptr;
+} tdef_t;
+
+typedef struct {
+    char    name[MAX_NAME];
+    int32_t val;
+} enum_t;
+
 typedef struct {
     uint8_t *code;
     size_t   len;
@@ -1378,6 +1559,10 @@ typedef struct {
     sym_t    globals[MAX_GLOBALS];
     int      nstructs;
     struct_t structs[MAX_STRUCTS];
+    int      ntdefs;
+    tdef_t   tdefs[MAX_TYPEDEFS];
+    int      nenums;
+    enum_t   enums[MAX_ENUMS];
     pp_t     pp;
     int      data_next;
     uint8_t  data[DATA_CAP];
@@ -1856,6 +2041,43 @@ static int add_global_t(gen_t *g, const char *name, const ptype_t *t, int nelem)
     return i;
 }
 
+static int find_tdef(gen_t *g, const char *name)
+{
+    for (int i = 0; i < g->ntdefs; i++) {
+        if (CC_STRCMP(g->tdefs[i].name, name) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static int find_enum(gen_t *g, const char *name)
+{
+    for (int i = 0; i < g->nenums; i++) {
+        if (CC_STRCMP(g->enums[i].name, name) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static int add_enum(gen_t *g, const char *name, int32_t val)
+{
+    if (find_enum(g, name) >= 0 || find_global(g, name) >= 0 ||
+        find_tdef(g, name) >= 0) {
+        gfail(g, "duplicate enumerator");
+        return -1;
+    }
+    if (g->nenums >= MAX_ENUMS) {
+        gfail(g, "too many enumerators");
+        return -1;
+    }
+    const int i = g->nenums++;
+    cpy_err(g->enums[i].name, MAX_NAME, name);
+    g->enums[i].val = val;
+    return i;
+}
+
 static int find_struct(gen_t *g, const char *name)
 {
     for (int i = 0; i < g->nstructs; i++) {
@@ -2179,6 +2401,13 @@ static const builtin_t BUILTINS[] = {
      ABI_MINOR_GFX16, NULL},
     {"ag_gfx_fill_round_rect", 6, API_OFF_GFX, GFX_OFF_FILL_ROUND_RECT, RET_VOID,
      0, ABI_MINOR_GFX16, NULL},
+    /* ABI 0.17: stateful RGB565 blit (one-shot blit_key is 8 args — CC max 6). */
+    {"ag_gfx_blit_bind", 2, API_OFF_GFX, GFX_OFF_BLIT_BIND, RET_VOID, 0,
+     ABI_MINOR_GFX17, NULL},
+    {"ag_gfx_blit_copy", 4, API_OFF_GFX, GFX_OFF_BLIT_COPY, RET_VOID, 0,
+     ABI_MINOR_GFX17, NULL},
+    {"ag_gfx_blit_keyed", 5, API_OFF_GFX, GFX_OFF_BLIT_KEYED, RET_VOID, 0,
+     ABI_MINOR_GFX17, NULL},
 
     /* audio (ABI 0.14): open(NULL) default 22050 stereo s16 */
     {"ag_audio_present", 0, API_OFF_AUDIO, AUDIO_OFF_PRESENT, RET_RAW, 0, ABI_MINOR_AUDIO, NULL},
@@ -2233,11 +2462,27 @@ static const builtin_t *find_builtin(const char *name)
  * walk a string a byte at a time and for `struct v *p` to step by its size,
  * without carrying a type on every node of a tree this compiler never builds.
  */
+/*
+ * break/continue targets for the innermost loop or switch.  Continue is only
+ * armed for real loops; a switch frame accepts break alone.
+ */
 typedef struct {
-    lex_t *L;
-    gen_t *g;
-    int    pesize;
-    int    psidx;
+    int    has_cont;
+    int    cont_known;
+    size_t cont_target;
+    size_t conts[MAX_BREAK_SITES];
+    int    nconts;
+    size_t breaks[MAX_BREAK_SITES];
+    int    nbreaks;
+} jump_frame_t;
+
+typedef struct {
+    lex_t        *L;
+    gen_t        *g;
+    int           pesize;
+    int           psidx;
+    jump_frame_t  jumps[MAX_LOOP_DEPTH];
+    int           njumps;
 } par_t;
 
 /* A declared type: what one element is, and whether the name is a pointer. */
@@ -2272,7 +2517,100 @@ static void expect(par_t *p, tok_t t, const char *msg)
     }
 }
 
-static int32_t const_expr_from(lex_t *L);
+static int32_t const_expr_from(lex_t *L, gen_t *g);
+
+static void skip_cv(par_t *p)
+{
+    while (accept(p, T_CONST) || accept(p, T_VOLATILE)) {
+    }
+}
+
+static void jump_push(par_t *p, int has_cont, int cont_known, size_t cont_target)
+{
+    if (p->njumps >= MAX_LOOP_DEPTH) {
+        pfail(p, "too many nested loops");
+        return;
+    }
+    jump_frame_t *f = &p->jumps[p->njumps++];
+    f->has_cont = has_cont;
+    f->cont_known = cont_known;
+    f->cont_target = cont_target;
+    f->nconts = 0;
+    f->nbreaks = 0;
+}
+
+static void jump_set_cont(par_t *p, size_t target)
+{
+    if (p->njumps <= 0) {
+        return;
+    }
+    jump_frame_t *f = &p->jumps[p->njumps - 1];
+    f->cont_target = target;
+    f->cont_known = 1;
+    for (int i = 0; i < f->nconts; i++) {
+        emit_j_to(p->g, f->conts[i], target);
+    }
+    f->nconts = 0;
+}
+
+static void jump_break(par_t *p)
+{
+    if (p->njumps <= 0) {
+        pfail(p, "break outside loop or switch");
+        return;
+    }
+    jump_frame_t *f = &p->jumps[p->njumps - 1];
+    if (f->nbreaks >= MAX_BREAK_SITES) {
+        pfail(p, "too many breaks");
+        return;
+    }
+    size_t site;
+    emit_j_placeholder(p->g, &site);
+    f->breaks[f->nbreaks++] = site;
+}
+
+static void jump_continue(par_t *p)
+{
+    int i;
+    for (i = p->njumps - 1; i >= 0; i--) {
+        if (p->jumps[i].has_cont) {
+            break;
+        }
+    }
+    if (i < 0) {
+        pfail(p, "continue outside loop");
+        return;
+    }
+    jump_frame_t *f = &p->jumps[i];
+    if (f->cont_known) {
+        size_t site;
+        emit_j_placeholder(p->g, &site);
+        emit_j_to(p->g, site, f->cont_target);
+        return;
+    }
+    if (f->nconts >= MAX_BREAK_SITES) {
+        pfail(p, "too many continues");
+        return;
+    }
+    size_t site;
+    emit_j_placeholder(p->g, &site);
+    f->conts[f->nconts++] = site;
+}
+
+static void jump_finish(par_t *p, size_t break_target)
+{
+    if (p->njumps <= 0) {
+        return;
+    }
+    jump_frame_t *f = &p->jumps[p->njumps - 1];
+    for (int i = 0; i < f->nbreaks; i++) {
+        emit_j_to(p->g, f->breaks[i], break_target);
+    }
+    if (f->nconts > 0) {
+        pfail(p, "continue target unresolved");
+    }
+    p->njumps--;
+}
 
 /*
  * How many elements `[...]` asks for.  It is a constant expression and not just
@@ -2282,7 +2620,7 @@ static int32_t const_expr_from(lex_t *L);
  */
 static int parse_array_size(par_t *p)
 {
-    const int32_t n = const_expr_from(p->L);
+    const int32_t n = const_expr_from(p->L, p->g);
     if (p->L->err) {
         pfail(p, "expected array size");
         return -1;
@@ -2296,7 +2634,9 @@ static int parse_array_size(par_t *p)
 
 static int accept_type(par_t *p, type_t *ty)
 {
+    skip_cv(p);
     ty->sidx = -1;
+    ty->is_ptr = 0;
     if (accept(p, T_INT)) {
         ty->esize = 4;
     } else if (accept(p, T_CHAR)) {
@@ -2315,10 +2655,27 @@ static int accept_type(par_t *p, type_t *ty)
         lex_next(p->L);
         ty->sidx = si;
         ty->esize = p->g->structs[si].size;
+    } else if (p->L->tok == T_IDENT) {
+        const int ti = find_tdef(p->g, p->L->text);
+        if (ti < 0) {
+            return 0;
+        }
+        lex_next(p->L);
+        ty->esize = p->g->tdefs[ti].esize;
+        ty->sidx = p->g->tdefs[ti].sidx;
+        ty->is_ptr = p->g->tdefs[ti].is_ptr;
     } else {
         return 0;
     }
-    ty->is_ptr = accept(p, T_STAR) ? 1 : 0;
+    skip_cv(p);
+    if (accept(p, T_STAR)) {
+        if (ty->is_ptr) {
+            pfail(p, "no pointer to pointer");
+            return 0;
+        }
+        ty->is_ptr = 1;
+        skip_cv(p);
+    }
     return 1;
 }
 
@@ -2489,7 +2846,8 @@ static int binds_tighter(tok_t t, int level)
      * operator would leave the rest of the designator for the next parser to
      * trip on.
      */
-    if (t == T_LPAREN || t == T_LBRACK || t == T_DOT || t == T_ARROW) {
+    if (t == T_LPAREN || t == T_LBRACK || t == T_DOT || t == T_ARROW ||
+        t == T_PLUSPLUS || t == T_MINUSMINUS) {
         return 1;
     }
     if (level >= 1 && (t == T_STAR || t == T_SLASH || t == T_PERCENT)) {
@@ -2708,6 +3066,50 @@ static void place_rvalue(par_t *p, place_t *pl)
     }
 }
 
+static int is_compound_assign(tok_t t)
+{
+    return t == T_PLUS_EQ || t == T_MINUS_EQ || t == T_STAR_EQ ||
+           t == T_SLASH_EQ || t == T_PERCENT_EQ || t == T_AMP_EQ ||
+           t == T_PIPE_EQ || t == T_CARET_EQ || t == T_SHL_EQ ||
+           t == T_SHR_EQ;
+}
+
+static int place_step(gen_t *g, const place_t *pl)
+{
+    if (pl->t.kind == PK_PTR) {
+        const ptype_t el = ty_elem(&pl->t);
+        return ty_size(g, &el);
+    }
+    return 1;
+}
+
+static void emit_compound_op(gen_t *g, tok_t op, int dst, int lhs, int rhs)
+{
+    if (op == T_PLUS_EQ) {
+        emit_add_n(g, dst, lhs, rhs);
+    } else if (op == T_MINUS_EQ) {
+        emit_sub(g, dst, lhs, rhs);
+    } else if (op == T_STAR_EQ) {
+        emit_mull(g, dst, lhs, rhs);
+    } else if (op == T_SLASH_EQ) {
+        emit_quos(g, dst, lhs, rhs);
+    } else if (op == T_PERCENT_EQ) {
+        emit_rems(g, dst, lhs, rhs);
+    } else if (op == T_AMP_EQ) {
+        emit_and(g, dst, lhs, rhs);
+    } else if (op == T_PIPE_EQ) {
+        emit_or(g, dst, lhs, rhs);
+    } else if (op == T_CARET_EQ) {
+        emit_xor(g, dst, lhs, rhs);
+    } else if (op == T_SHL_EQ) {
+        emit_ssl(g, rhs);
+        emit_sll(g, dst, lhs);
+    } else {
+        emit_ssr(g, rhs);
+        emit_sra(g, dst, lhs);
+    }
+}
+
 /*
  * `place = expr`.  A place that is still a symbol plus a constant needs nothing
  * held anywhere: the value can be computed straight into a8 and stored.  An
@@ -2728,6 +3130,133 @@ static void assign_to_place(par_t *p, place_t *pl)
     pop_a9(p->g);
     emit_mov_n(p->g, 8, 9);
     place_store(p->g, pl, 11, 9);
+}
+
+/* `place op= expr` and prefix/postfix `++`/`--` on a place. */
+static void compound_to_place(par_t *p, place_t *pl, tok_t op)
+{
+    gen_t *g = p->g;
+    const int step = place_step(g, pl);
+    lex_next(p->L);
+    if (ty_is_addr(&pl->t)) {
+        pfail(p, "cannot assign a whole array or struct");
+        return;
+    }
+    if (!pl->mat) {
+        place_load(g, pl, 8);
+        push_a8(g);
+        parse_expr(p);
+        if (pl->t.kind == PK_PTR && (op == T_PLUS_EQ || op == T_MINUS_EQ)) {
+            emit_scale(g, 8, step);
+        }
+        pop_a9(g);
+        emit_compound_op(g, op, 8, 9, 8);
+        place_store(g, pl, 8, 9);
+        return;
+    }
+    push_a8(g);
+    place_load(g, pl, 8);
+    push_a8(g);
+    parse_expr(p);
+    if (pl->t.kind == PK_PTR && (op == T_PLUS_EQ || op == T_MINUS_EQ)) {
+        emit_scale(g, 8, step);
+    }
+    pop_a9(g);
+    emit_compound_op(g, op, 11, 9, 8);
+    pop_a9(g);
+    emit_mov_n(g, 8, 9);
+    place_store(g, pl, 11, 9);
+    emit_mov_n(g, 8, 11);
+}
+
+static void incdec_place(par_t *p, place_t *pl, int is_inc, int is_prefix)
+{
+    gen_t *g = p->g;
+    const int step = place_step(g, pl);
+    if (ty_is_addr(&pl->t)) {
+        pfail(p, "cannot increment array or struct");
+        return;
+    }
+    if (!pl->mat) {
+        place_load(g, pl, 8);
+        if (!is_prefix) {
+            emit_mov_n(g, 11, 8);
+        }
+        emit_movi(g, 9, is_inc ? step : -step);
+        emit_add_n(g, 8, 8, 9);
+        place_store(g, pl, 8, 9);
+        if (!is_prefix) {
+            emit_mov_n(g, 8, 11);
+        }
+        p->pesize = (pl->t.kind == PK_PTR) ? step : 0;
+        p->psidx = (pl->t.kind == PK_PTR) ? pl->t.sidx : -1;
+        return;
+    }
+    /* mat: loading through a8 destroys the base — keep the address in a spill. */
+    push_a8(g);
+    place_load(g, pl, 8);
+    if (!is_prefix) {
+        emit_mov_n(g, 11, 8);
+    }
+    emit_movi(g, 9, is_inc ? step : -step);
+    emit_add_n(g, 8, 8, 9);
+    emit_mov_n(g, 10, 8);
+    pop_a9(g);
+    emit_mov_n(g, 8, 9);
+    place_store(g, pl, 10, 9);
+    if (is_prefix) {
+        emit_mov_n(g, 8, 10);
+    } else {
+        emit_mov_n(g, 8, 11);
+    }
+    p->pesize = (pl->t.kind == PK_PTR) ? step : 0;
+    p->psidx = (pl->t.kind == PK_PTR) ? pl->t.sidx : -1;
+}
+
+/* Assign / compound / ++/-- on a parsed place (statement or for-step). */
+static void assign_or_update_place(par_t *p, place_t *pl)
+{
+    if (p->L->tok == T_PLUSPLUS) {
+        lex_next(p->L);
+        incdec_place(p, pl, 1, 0);
+        return;
+    }
+    if (p->L->tok == T_MINUSMINUS) {
+        lex_next(p->L);
+        incdec_place(p, pl, 0, 0);
+        return;
+    }
+    if (is_compound_assign(p->L->tok)) {
+        compound_to_place(p, pl, p->L->tok);
+        return;
+    }
+    assign_to_place(p, pl);
+}
+
+static int sizeof_type_bytes(par_t *p, const type_t *ty)
+{
+    if (ty->is_ptr) {
+        return 4;
+    }
+    if (ty->sidx >= 0) {
+        return p->g->structs[ty->sidx].size;
+    }
+    return ty->esize;
+}
+
+/* `sizeof(type)` only — enough for array sizes and layout constants. */
+static void parse_sizeof(par_t *p)
+{
+    expect(p, T_LPAREN, "expected '(' after sizeof");
+    type_t ty;
+    if (!accept_type(p, &ty)) {
+        pfail(p, "expected type in sizeof");
+        return;
+    }
+    expect(p, T_RPAREN, "expected ')'");
+    emit_movi(p->g, 8, sizeof_type_bytes(p, &ty));
+    p->pesize = 0;
+    p->psidx = -1;
 }
 
 static void parse_primary(par_t *p)
@@ -2762,8 +3291,24 @@ static void parse_primary(par_t *p)
             p->psidx = -1;
             return;
         }
+        const int ei = find_enum(p->g, name);
+        if (ei >= 0 && p->L->tok != T_LBRACK && p->L->tok != T_DOT &&
+            p->L->tok != T_ARROW) {
+            emit_movi(p->g, 8, p->g->enums[ei].val);
+            return;
+        }
         place_t pl;
         if (parse_place(p, name, &pl)) {
+            if (p->L->tok == T_PLUSPLUS) {
+                lex_next(p->L);
+                incdec_place(p, &pl, 1, 0);
+                return;
+            }
+            if (p->L->tok == T_MINUSMINUS) {
+                lex_next(p->L);
+                incdec_place(p, &pl, 0, 0);
+                return;
+            }
             place_rvalue(p, &pl);
         }
         return;
@@ -2819,6 +3364,30 @@ static void parse_addr_of(par_t *p)
 
 static void parse_unary(par_t *p)
 {
+    if (accept(p, T_SIZEOF)) {
+        parse_sizeof(p);
+        return;
+    }
+    /*
+     * Prefix ++/-- need a place.  Only `++name…` is accepted (not `++*p`);
+     * `*p = *p + 1` remains the general form for indirect updates.
+     */
+    if (p->L->tok == T_PLUSPLUS || p->L->tok == T_MINUSMINUS) {
+        const int is_inc = (p->L->tok == T_PLUSPLUS);
+        lex_next(p->L);
+        if (p->L->tok != T_IDENT) {
+            pfail(p, "expected a variable after ++/--");
+            return;
+        }
+        char name[MAX_NAME];
+        cpy_err(name, sizeof(name), p->L->text);
+        lex_next(p->L);
+        place_t pl;
+        if (parse_place(p, name, &pl)) {
+            incdec_place(p, &pl, is_inc, 1);
+        }
+        return;
+    }
     if (accept(p, T_MINUS)) {
         parse_unary(p);
         emit_movi(p->g, 9, 0);
@@ -3139,9 +3708,31 @@ static void parse_or(par_t *p)
     }
 }
 
-static void parse_expr(par_t *p)
+/* `cond ? a : b` — both arms leave a value in a8. */
+static void parse_cond(par_t *p)
 {
     parse_or(p);
+    if (!accept(p, T_QUESTION)) {
+        return;
+    }
+    emit_movi(p->g, 9, 0);
+    size_t bne_site, j_else, j_end;
+    emit_b_placeholder(p->g, B_BNE, 8, 9, &bne_site);
+    emit_j_placeholder(p->g, &j_else);
+    patch_b(p->g, bne_site, p->g->len);
+    parse_expr(p);
+    emit_j_placeholder(p->g, &j_end);
+    emit_j_to(p->g, j_else, p->g->len);
+    expect(p, T_COLON, "expected ':' in ?:");
+    parse_cond(p);
+    emit_j_to(p->g, j_end, p->g->len);
+    p->pesize = 0;
+    p->psidx = -1;
+}
+
+static void parse_expr(par_t *p)
+{
+    parse_cond(p);
 }
 
 static void parse_block(par_t *p)
@@ -3154,7 +3745,7 @@ static void parse_block(par_t *p)
     expect(p, T_RBRACE, "expected '}'");
 }
 
-/* `*expr = value` - the one assignment whose target is an address, not a name. */
+/* `*expr = value` / `*expr op= value` — target is an address, not a name. */
 static void assign_deref(par_t *p)
 {
     parse_unary(p);
@@ -3165,6 +3756,20 @@ static void assign_deref(par_t *p)
     }
     if (p->psidx >= 0) {
         pfail(p, "cannot assign a whole struct");
+        return;
+    }
+    if (is_compound_assign(p->L->tok)) {
+        const tok_t op = p->L->tok;
+        lex_next(p->L);
+        push_a8(p->g);
+        emit_load_sized(p->g, 8, 8, 0, k);
+        push_a8(p->g);
+        parse_expr(p);
+        pop_a9(p->g);
+        emit_compound_op(p->g, op, 11, 9, 8);
+        pop_a9(p->g);
+        emit_store_sized(p->g, 11, 9, 0, k, 8);
+        emit_mov_n(p->g, 8, 11);
         return;
     }
     expect(p, T_ASSIGN, "expected '='");
@@ -3227,18 +3832,20 @@ static void parse_for_assign_or_empty(par_t *p, int allow_decl)
     if (p->L->tok == T_SEMI || p->L->tok == T_RPAREN) {
         return;
     }
-    if (allow_decl && (p->L->tok == T_INT || p->L->tok == T_CHAR ||
-                       p->L->tok == T_STRUCT)) {
+    if (allow_decl) {
         type_t ty;
-        if (!accept_type(p, &ty)) {
+        if (accept_type(p, &ty)) {
+            parse_local_decl(p, &ty);
             return;
         }
-        parse_local_decl(p, &ty);
-        return;
     }
     if (p->L->tok == T_STAR) {
         lex_next(p->L);
         assign_deref(p);
+        return;
+    }
+    if (p->L->tok == T_PLUSPLUS || p->L->tok == T_MINUSMINUS) {
+        parse_unary(p);
         return;
     }
     if (p->L->tok != T_IDENT) {
@@ -3250,8 +3857,90 @@ static void parse_for_assign_or_empty(par_t *p, int allow_decl)
     lex_next(p->L);
     place_t pl;
     if (parse_place(p, name, &pl)) {
-        assign_to_place(p, &pl);
+        assign_or_update_place(p, &pl);
     }
+}
+
+static void parse_switch(par_t *p)
+{
+    expect(p, T_LPAREN, "expected '(' after switch");
+    parse_expr(p);
+    expect(p, T_RPAREN, "expected ')'");
+    if (p->g->spill_top >= SPILL_SLOTS) {
+        pfail(p, "expression too deep");
+        return;
+    }
+    const int slot = p->g->spill_top++;
+    emit_s32i(p->g, 8, 7, slot * 4);
+
+    size_t j_dispatch;
+    emit_j_placeholder(p->g, &j_dispatch);
+    jump_push(p, 0, 0, 0);
+
+    size_t case_off[MAX_CASES];
+    int32_t case_val[MAX_CASES];
+    int ncases = 0;
+    size_t default_off = (size_t)-1;
+
+    expect(p, T_LBRACE, "expected '{' after switch");
+    while (p->L->tok != T_RBRACE && p->L->tok != T_EOF && !p->g->err &&
+           !p->L->err) {
+        if (accept(p, T_CASE)) {
+            const int32_t v = const_expr_from(p->L, p->g);
+            if (p->L->err) {
+                pfail(p, "expected case value");
+                return;
+            }
+            expect(p, T_COLON, "expected ':' after case");
+            if (ncases >= MAX_CASES) {
+                pfail(p, "too many cases");
+                return;
+            }
+            case_val[ncases] = v;
+            case_off[ncases] = p->g->len;
+            ncases++;
+            continue;
+        }
+        if (accept(p, T_DEFAULT)) {
+            expect(p, T_COLON, "expected ':' after default");
+            if (default_off != (size_t)-1) {
+                pfail(p, "duplicate default");
+                return;
+            }
+            default_off = p->g->len;
+            continue;
+        }
+        parse_stmt(p);
+    }
+    expect(p, T_RBRACE, "expected '}'");
+
+    size_t j_end;
+    emit_j_placeholder(p->g, &j_end);
+    emit_j_to(p->g, j_dispatch, p->g->len);
+    emit_l32i(p->g, 8, 7, slot * 4);
+    for (int i = 0; i < ncases; i++) {
+        /* beq is only ±128 bytes; case bodies sit above the dispatch. */
+        emit_movi(p->g, 9, case_val[i]);
+        size_t bne_site, j_case;
+        emit_b_placeholder(p->g, B_BNE, 8, 9, &bne_site);
+        emit_j_placeholder(p->g, &j_case);
+        emit_j_to(p->g, j_case, case_off[i]);
+        patch_b(p->g, bne_site, p->g->len);
+    }
+    size_t j_miss = 0;
+    if (default_off != (size_t)-1) {
+        size_t j_def;
+        emit_j_placeholder(p->g, &j_def);
+        emit_j_to(p->g, j_def, default_off);
+    } else {
+        emit_j_placeholder(p->g, &j_miss);
+    }
+    emit_j_to(p->g, j_end, p->g->len);
+    if (default_off == (size_t)-1) {
+        emit_j_to(p->g, j_miss, p->g->len);
+    }
+    jump_finish(p, p->g->len);
+    p->g->spill_top--;
 }
 
 static void parse_stmt(par_t *p)
@@ -3261,6 +3950,16 @@ static void parse_stmt(par_t *p)
     }
     if (p->L->tok == T_LBRACE) {
         parse_block(p);
+        return;
+    }
+    if (accept(p, T_BREAK)) {
+        expect(p, T_SEMI, "expected ';' after break");
+        jump_break(p);
+        return;
+    }
+    if (accept(p, T_CONTINUE)) {
+        expect(p, T_SEMI, "expected ';' after continue");
+        jump_continue(p);
         return;
     }
     if (accept(p, T_RETURN)) {
@@ -3298,6 +3997,7 @@ static void parse_stmt(par_t *p)
     if (accept(p, T_WHILE)) {
         expect(p, T_LPAREN, "expected '(' after while");
         const size_t check = p->g->len;
+        jump_push(p, 1, 1, check);
         parse_expr(p);
         expect(p, T_RPAREN, "expected ')'");
         emit_movi(p->g, 9, 0);
@@ -3310,6 +4010,24 @@ static void parse_stmt(par_t *p)
         emit_j_placeholder(p->g, &j_back);
         emit_j_to(p->g, j_back, check);
         emit_j_to(p->g, j_done, p->g->len);
+        jump_finish(p, p->g->len);
+        return;
+    }
+    if (accept(p, T_DO)) {
+        const size_t body = p->g->len;
+        jump_push(p, 1, 0, 0);
+        parse_stmt(p);
+        expect(p, T_WHILE, "expected 'while' after do");
+        expect(p, T_LPAREN, "expected '(' after while");
+        jump_set_cont(p, p->g->len);
+        parse_expr(p);
+        expect(p, T_RPAREN, "expected ')'");
+        expect(p, T_SEMI, "expected ';' after do-while");
+        emit_movi(p->g, 9, 0);
+        size_t bne_site;
+        emit_b_placeholder(p->g, B_BNE, 8, 9, &bne_site);
+        patch_b(p->g, bne_site, body);
+        jump_finish(p, p->g->len);
         return;
     }
     if (accept(p, T_FOR)) {
@@ -3339,6 +4057,7 @@ static void parse_stmt(par_t *p)
         emit_j_placeholder(p->g, &j_after_step);
         emit_j_to(p->g, j_after_step, check);
         emit_j_to(p->g, j_body, p->g->len);
+        jump_push(p, 1, 1, step_start);
         parse_stmt(p);
         size_t j_to_step;
         emit_j_placeholder(p->g, &j_to_step);
@@ -3346,16 +4065,20 @@ static void parse_stmt(par_t *p)
         if (has_cond) {
             emit_j_to(p->g, j_done, p->g->len);
         }
+        jump_finish(p, p->g->len);
         return;
     }
-    if (p->L->tok == T_INT || p->L->tok == T_CHAR || p->L->tok == T_STRUCT) {
+    if (accept(p, T_SWITCH)) {
+        parse_switch(p);
+        return;
+    }
+    {
         type_t ty;
-        if (!accept_type(p, &ty)) {
+        if (accept_type(p, &ty)) {
+            parse_local_decl(p, &ty);
+            expect(p, T_SEMI, "expected ';' after declaration");
             return;
         }
-        parse_local_decl(p, &ty);
-        expect(p, T_SEMI, "expected ';' after declaration");
-        return;
     }
     if (p->L->tok == T_STAR) {
         lex_next(p->L);
@@ -3374,7 +4097,7 @@ static void parse_stmt(par_t *p)
         }
         place_t pl;
         if (parse_place(p, name, &pl)) {
-            assign_to_place(p, &pl);
+            assign_or_update_place(p, &pl);
         }
         expect(p, T_SEMI, "expected ';'");
         return;
@@ -3582,6 +4305,79 @@ static void parse_struct_body(par_t *p, const char *name)
     s->size = (off + 3) & ~3;
 }
 
+/* `enum [tag] { A, B = 3, C };` — enumerators become int constants. */
+static void parse_enum_body(par_t *p)
+{
+    expect(p, T_LBRACE, "expected '{' after enum");
+    int32_t next = 0;
+    int got = 0;
+    while (p->L->tok != T_RBRACE && !p->g->err && !p->L->err) {
+        if (p->L->tok != T_IDENT) {
+            pfail(p, "expected enumerator");
+            return;
+        }
+        char name[MAX_NAME];
+        cpy_err(name, sizeof(name), p->L->text);
+        lex_next(p->L);
+        if (accept(p, T_ASSIGN)) {
+            next = const_expr_from(p->L, p->g);
+            if (p->L->err) {
+                pfail(p, "expected enumerator value");
+                return;
+            }
+        }
+        if (add_enum(p->g, name, next) < 0) {
+            pfail(p, p->g->errmsg);
+            return;
+        }
+        next++;
+        got = 1;
+        if (!accept(p, T_COMMA)) {
+            break;
+        }
+    }
+    expect(p, T_RBRACE, "expected '}'");
+    if (!got) {
+        pfail(p, "empty enum");
+    }
+}
+
+static void parse_typedef(par_t *p)
+{
+    type_t ty;
+    if (accept(p, T_ENUM)) {
+        if (p->L->tok == T_IDENT) {
+            lex_next(p->L); /* optional tag */
+        }
+        parse_enum_body(p);
+        ty.esize = 4;
+        ty.sidx = -1;
+        ty.is_ptr = 0;
+    } else if (!accept_type(p, &ty)) {
+        pfail(p, "expected type after typedef");
+        return;
+    }
+    if (p->L->tok != T_IDENT) {
+        pfail(p, "expected typedef name");
+        return;
+    }
+    if (find_tdef(p->g, p->L->text) >= 0 || find_enum(p->g, p->L->text) >= 0) {
+        pfail(p, "duplicate typedef");
+        return;
+    }
+    if (p->g->ntdefs >= MAX_TYPEDEFS) {
+        pfail(p, "too many typedefs");
+        return;
+    }
+    tdef_t *td = &p->g->tdefs[p->g->ntdefs++];
+    cpy_err(td->name, MAX_NAME, p->L->text);
+    td->esize = ty.esize;
+    td->sidx = ty.sidx;
+    td->is_ptr = ty.is_ptr;
+    lex_next(p->L);
+    expect(p, T_SEMI, "expected ';' after typedef");
+}
+
 static void parse_program(par_t *p)
 {
     p->g->data_next = 4;
@@ -3589,6 +4385,26 @@ static void parse_program(par_t *p)
     p->g->is_driver = 0;
 
     while (p->L->tok != T_EOF && !p->g->err && !p->L->err) {
+        if (accept(p, T_TYPEDEF)) {
+            if (p->g->nfuncs > 0) {
+                pfail(p, "typedefs must precede functions");
+                return;
+            }
+            parse_typedef(p);
+            continue;
+        }
+        if (accept(p, T_ENUM)) {
+            if (p->g->nfuncs > 0) {
+                pfail(p, "enums must precede functions");
+                return;
+            }
+            if (p->L->tok == T_IDENT) {
+                lex_next(p->L);
+            }
+            parse_enum_body(p);
+            expect(p, T_SEMI, "expected ';' after enum");
+            continue;
+        }
         if (accept(p, T_VOID)) {
             if (p->L->tok != T_IDENT) {
                 pfail(p, "expected function name");
@@ -3939,15 +4755,88 @@ void cc_result_free(cc_result_t *out)
  */
 typedef struct {
     lex_t *L;
+    gen_t *g; /* NULL for cc_eval_expr; set when evaluating inside a program */
 } ev_t;
 
 static int32_t ev_expr(ev_t *e);
 
 /* The value of a constant expression read from a program being compiled. */
-static int32_t const_expr_from(lex_t *L)
+static int32_t const_expr_from(lex_t *L, gen_t *g)
 {
-    ev_t e = {.L = L};
+    ev_t e = {.L = L, .g = g};
     return ev_expr(&e);
+}
+
+static int32_t ev_sizeof(ev_t *e)
+{
+    if (e->L->tok != T_LPAREN) {
+        lex_fail(e->L, "expected '(' after sizeof");
+        return 0;
+    }
+    lex_next(e->L);
+    /* Mirror accept_type without a parser — const/volatile are ignored. */
+    while (e->L->tok == T_CONST || e->L->tok == T_VOLATILE) {
+        lex_next(e->L);
+    }
+    int esize = 0;
+    int sidx = -1;
+    int is_ptr = 0;
+    if (e->L->tok == T_INT) {
+        esize = 4;
+        lex_next(e->L);
+    } else if (e->L->tok == T_CHAR) {
+        esize = 1;
+        lex_next(e->L);
+    } else if (e->L->tok == T_STRUCT) {
+        lex_next(e->L);
+        if (e->L->tok != T_IDENT || e->g == NULL) {
+            lex_fail(e->L, "expected a struct name");
+            return 0;
+        }
+        sidx = find_struct(e->g, e->L->text);
+        if (sidx < 0) {
+            lex_fail(e->L, "unknown struct");
+            return 0;
+        }
+        esize = e->g->structs[sidx].size;
+        lex_next(e->L);
+    } else if (e->L->tok == T_IDENT && e->g != NULL) {
+        const int ti = find_tdef(e->g, e->L->text);
+        if (ti < 0) {
+            lex_fail(e->L, "expected type in sizeof");
+            return 0;
+        }
+        esize = e->g->tdefs[ti].esize;
+        sidx = e->g->tdefs[ti].sidx;
+        is_ptr = e->g->tdefs[ti].is_ptr;
+        lex_next(e->L);
+    } else {
+        lex_fail(e->L, "expected type in sizeof");
+        return 0;
+    }
+    while (e->L->tok == T_CONST || e->L->tok == T_VOLATILE) {
+        lex_next(e->L);
+    }
+    if (e->L->tok == T_STAR) {
+        if (is_ptr) {
+            lex_fail(e->L, "no pointer to pointer");
+            return 0;
+        }
+        is_ptr = 1;
+        lex_next(e->L);
+    }
+    if (e->L->tok != T_RPAREN) {
+        lex_fail(e->L, "expected ')'");
+        return 0;
+    }
+    lex_next(e->L);
+    if (is_ptr) {
+        return 4;
+    }
+    if (sidx >= 0 && e->g != NULL) {
+        return e->g->structs[sidx].size;
+    }
+    return esize;
 }
 
 static int32_t ev_primary(ev_t *e)
@@ -3956,6 +4845,14 @@ static int32_t ev_primary(ev_t *e)
         const int32_t v = e->L->num;
         lex_next(e->L);
         return v;
+    }
+    if (e->L->tok == T_IDENT && e->g != NULL) {
+        const int ei = find_enum(e->g, e->L->text);
+        if (ei >= 0) {
+            const int32_t v = e->g->enums[ei].val;
+            lex_next(e->L);
+            return v;
+        }
     }
     if (e->L->tok == T_LPAREN) {
         lex_next(e->L);
@@ -3973,6 +4870,10 @@ static int32_t ev_primary(ev_t *e)
 
 static int32_t ev_unary(ev_t *e)
 {
+    if (e->L->tok == T_SIZEOF) {
+        lex_next(e->L);
+        return ev_sizeof(e);
+    }
     if (e->L->tok == T_MINUS) {
         lex_next(e->L);
         return -ev_unary(e);
@@ -4159,7 +5060,7 @@ int cc_eval_expr(const char *expr, int32_t *out_value, char *err, size_t errlen)
     L.len = strlen(expr);
     L.cur_incl = -1;
     lex_next(&L);
-    ev_t e = {.L = &L};
+    ev_t e = {.L = &L, .g = NULL};
     const int32_t v = ev_expr(&e);
     if (L.err) {
         if (err != NULL) {

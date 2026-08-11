@@ -5,6 +5,8 @@
  */
 #include <argon/draw.h>
 
+#include <stddef.h>
+
 uint16_t ag_draw_rgb_to_565(uint32_t color)
 {
     const uint32_t r = (color >> 16) & 0xFFu;
@@ -301,6 +303,32 @@ void ag_draw_fill_convex(ag_draw_surf_t *s, const ag_point_t *pts, int n,
         }
         if (hits >= 2) {
             hline(s, x_min, x_max, y, c565);
+        }
+    }
+}
+
+void ag_draw_blit(ag_draw_surf_t *s, int32_t x, int32_t y, int32_t w, int32_t h,
+                  const void *src, uint32_t src_stride, int src_be, int use_key,
+                  uint16_t key565)
+{
+    if (s == NULL || s->pix == NULL || src == NULL || w <= 0 || h <= 0) {
+        return;
+    }
+    for (int32_t row = 0; row < h; row++) {
+        const int32_t dy = y + row;
+        const uint8_t *srow =
+            (const uint8_t *)src + (uint32_t)row * src_stride;
+        for (int32_t col = 0; col < w; col++) {
+            const int32_t dx = x + col;
+            uint16_t pix = (uint16_t)srow[(uint32_t)col * 2u] |
+                           ((uint16_t)srow[(uint32_t)col * 2u + 1u] << 8);
+            if (src_be) {
+                pix = (uint16_t)((pix << 8) | (pix >> 8));
+            }
+            if (use_key && pix == key565) {
+                continue;
+            }
+            ag_draw_pixel(s, dx, dy, pix);
         }
     }
 }
