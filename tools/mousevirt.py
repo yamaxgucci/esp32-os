@@ -191,6 +191,8 @@ class AntiGrab:
         self._paused = False
         self._qemu_hwnd = 0
         self._client = (0, 0, 0, 0)  # screen x,y,w,h of full client
+        self._buttons = 0  # bit0=L bit1=R bit2=M — from hook (not GetAsyncKeyState)
+        self._wheel = 0  # accumulated notches for guest
         self._hook = None
         self._proc = None
         self._thread: threading.Thread | None = None
@@ -202,11 +204,24 @@ class AntiGrab:
     def set_paused(self, paused: bool) -> None:
         with self._lock:
             self._paused = paused
+            if paused:
+                self._buttons = 0
+                self._wheel = 0
 
     def set_target(self, qemu_hwnd: int, client: tuple[int, int, int, int] | None) -> None:
         with self._lock:
             self._qemu_hwnd = qemu_hwnd
             self._client = client if client is not None else (0, 0, 0, 0)
+
+    def buttons(self) -> int:
+        with self._lock:
+            return self._buttons
+
+    def take_wheel(self) -> int:
+        with self._lock:
+            w = self._wheel
+            self._wheel = 0
+            return w
 
     def _hit(self, x: int, y: int) -> bool:
         with self._lock:
@@ -227,6 +242,30 @@ class AntiGrab:
                     return True
         return False
 
+    def _apply_button_msg(self, msg: int, mouse_data: int) -> None:
+        """Track physical buttons from LL messages we are about to swallow."""
+        with self._lock:
+            b = self._buttons
+            if msg == WM_LBUTTONDOWN:
+                b |= 1
+            elif msg == WM_LBUTTONUP:
+                b &= ~1
+            elif msg == WM_RBUTTONDOWN:
+                b |= 2
+            elif msg == WM_RBUTTONUP:
+                b &= ~2
+            elif msg == WM_MBUTTONDOWN:
+                b |= 4
+            elif msg == WM_MBUTTONUP:
+                b &= ~4
+            elif msg in (WM_MOUSEWHEEL, WM_MOUSEHWHEEL):
+                # high word of mouseData is signed notch*WHEEL_DELTA (120)
+                delta = ctypes.c_short((mouse_data >> 16) & 0xFFFF).value
+                step = int(delta // 120) if delta else 0
+                if step:
+                    self._wheel += step
+            self._buttons = b & 7
+
     def _hook_proc(self, n_code: int, w_param: int, l_param: int) -> int:
         if n_code >= 0:
             msg = int(w_param)
@@ -235,6 +274,9 @@ class AntiGrab:
                     l_param, ctypes.POINTER(MSLLHOOKSTRUCT)
                 ).contents
                 if self._hit(int(info.pt.x), int(info.pt.y)):
+                    # Swallowing stops GetAsyncKeyState from seeing clicks for
+                    # the main loop — record state here and send via TCP later.
+                    self._apply_button_msg(msg, int(info.mouseData))
                     return 1
         return int(USER32.CallNextHookEx(self._hook, n_code, w_param, l_param))
 
@@ -533,20 +575,37 @@ def main() -> int:
                     args.width,
                     args.height,
                 )
-                if require_inside and not inside:
+
+                # After swallow, GetAsyncKeyState(VK_*BUTTON) stays 0 — use
+                # the hook's tracked mask.  Without anti-grab, fall back to async.
+                if anti is not None:
+                    buttons = anti.buttons()
+                    wheel = anti.take_wheel()
+                else:
+                    buttons = 0
+                    if user32.GetAsyncKeyState(VK_LBUTTON) & 0x8000:
+                        buttons |= 1
+                    if user32.GetAsyncKeyState(VK_RBUTTON) & 0x8000:
+                        buttons |= 2
+                    if user32.GetAsyncKeyState(VK_MBUTTON) & 0x8000:
+                        buttons |= 4
+                    wheel = 0
+
+                # Pure moves outside the letterbox are ignored; button/wheel
+                # edges still go out (clamped) so clicks on the client register.
+                if require_inside and not inside and buttons == prev_btn and wheel == 0:
                     time.sleep(period)
                     continue
 
-                buttons = 0
-                if user32.GetAsyncKeyState(VK_LBUTTON) & 0x8000:
-                    buttons |= 1
-                if user32.GetAsyncKeyState(VK_RBUTTON) & 0x8000:
-                    buttons |= 2
-                if user32.GetAsyncKeyState(VK_MBUTTON) & 0x8000:
-                    buttons |= 4
-
-                if gx != prev_x or gy != prev_y or buttons != prev_btn:
-                    pkt = pack_pkt(1, buttons, gx, gy, 0)
+                if (
+                    gx != prev_x
+                    or gy != prev_y
+                    or buttons != prev_btn
+                    or wheel != 0
+                ):
+                    typ = 3 if wheel != 0 else 1
+                    w8 = max(-127, min(127, wheel))
+                    pkt = pack_pkt(typ, buttons, gx, gy, w8)
                     try:
                         n = sock.send(pkt)
                         if n == len(pkt):
