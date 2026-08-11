@@ -149,9 +149,13 @@ def play_sounddevice(
     import sounddevice as sd
 
     frame_bytes = channels * 2
-    ring = PcmRing(capacity=rate * frame_bytes * 3 // 4)
-    prebuffer = rate * frame_bytes * 12 // 100
+    # ~1.0 s capacity / ~200 ms prebuffer — fewer live underruns under QEMU.
+    ring = PcmRing(capacity=rate * frame_bytes)
+    prebuffer = rate * frame_bytes * 20 // 100
     chunk = max(frame_bytes * (rate // 40), frame_bytes * 128)
+    underruns = 0
+    played = 0
+    last_report = time.monotonic()
 
     t = threading.Thread(
         target=reader_thread, args=(sock, ring, rec), daemon=True
@@ -162,26 +166,47 @@ def play_sounddevice(
     while ring.available() < prebuffer and t.is_alive():
         time.sleep(0.01)
 
-    print(f"playing {rate} Hz, {channels} ch (sounddevice). Ctrl+C to stop.")
+    print(
+        f"playing {rate} Hz, {channels} ch (sounddevice). Ctrl+C to stop.",
+        flush=True,
+    )
     silence = bytes(chunk)
-    with sd.RawOutputStream(
-        samplerate=rate,
-        channels=channels,
-        dtype="int16",
-        blocksize=0,
-    ) as stream:
-        while True:
-            data = ring.read(chunk, timeout=0.05)
-            if not data:
-                if not t.is_alive() and ring.available() == 0:
-                    break
-                stream.write(silence)
-                continue
-            rem = len(data) % frame_bytes
-            if rem:
-                data = data[:-rem]
-            if data:
-                stream.write(data)
+    try:
+        with sd.RawOutputStream(
+            samplerate=rate,
+            channels=channels,
+            dtype="int16",
+            blocksize=0,
+        ) as stream:
+            while True:
+                data = ring.read(chunk, timeout=0.05)
+                if not data:
+                    if not t.is_alive() and ring.available() == 0:
+                        break
+                    stream.write(silence)
+                    underruns += 1
+                    continue
+                rem = len(data) % frame_bytes
+                if rem:
+                    data = data[:-rem]
+                if data:
+                    stream.write(data)
+                    played += len(data)
+
+                now = time.monotonic()
+                if now - last_report >= 2.0:
+                    print(
+                        f"stats: played={played} B  ring_drop={ring.dropped} B  "
+                        f"underruns={underruns}  buffered={ring.available()} B",
+                        flush=True,
+                    )
+                    last_report = now
+    finally:
+        print(
+            f"final: played={played} B  ring_drop={ring.dropped} B  "
+            f"underruns={underruns}",
+            flush=True,
+        )
 
 
 def play_ffplay(
@@ -229,15 +254,31 @@ def play_ffplay(
 def save_wav(sock: socket.socket, rate: int, channels: int, path: Path) -> None:
     print(f"recording to {path} (Ctrl+C to stop)...")
     rec = WavRecorder(path, rate, channels)
+    got = 0
+    t0 = time.monotonic()
+    last_report = t0
     try:
         while True:
             chunk = sock.recv(4096)
             if not chunk:
                 break
             rec.write(chunk)
+            got += len(chunk)
+            now = time.monotonic()
+            if now - last_report >= 2.0:
+                elapsed = max(now - t0, 1e-3)
+                xrt = (got / (rate * channels * 2)) / elapsed
+                print(
+                    f"stats: saved={got} B  xrealtime={xrt:.2f}",
+                    flush=True,
+                )
+                last_report = now
     except KeyboardInterrupt:
         print("stopped.")
     finally:
+        elapsed = max(time.monotonic() - t0, 1e-3)
+        xrt = (got / (rate * channels * 2)) / elapsed if got else 0.0
+        print(f"final: saved={got} B  xrealtime={xrt:.2f}", flush=True)
         rec.close()
 
 

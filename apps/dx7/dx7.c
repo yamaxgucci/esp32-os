@@ -93,6 +93,8 @@ static uint32_t s_load_pct; /* render / chunk budget */
 static uint32_t s_late;     /* paced deadline missed */
 static uint32_t s_drop;     /* bytes we failed to push in time */
 static uint32_t s_resync;
+static ag_audio_stats_t s_pcm_stats; /* from AG_IOC_AUDIO_GETSTATS when supported */
+static int s_pcm_stats_ok;
 static ag_time_t s_next_due;
 static uint32_t s_ui_ms;
 
@@ -1018,9 +1020,20 @@ static void draw_ui(void)
     ag_printf("Perf  : render %u us / %u us (%u%%)  send %u us  loop %u us\x1b[K\n",
               (unsigned)s_render_us, (unsigned)budget, (unsigned)s_load_pct,
               (unsigned)s_send_us, (unsigned)s_loop_us);
-    ag_printf("Stream: late %u  drop %u B  resync %u  chunk %u\x1b[K\n",
-              (unsigned)s_late, (unsigned)s_drop, (unsigned)s_resync,
-              (unsigned)CHUNK);
+    if (s_pcm_stats_ok) {
+        ag_printf(
+            "Stream: late %u  drop %u B  resync %u  chunk %u  "
+            "tcp_ov %llu B eagain %u ring %u\x1b[K\n",
+            (unsigned)s_late, (unsigned)s_drop, (unsigned)s_resync,
+            (unsigned)CHUNK,
+            (unsigned long long)s_pcm_stats.bytes_drop_overflow,
+            (unsigned)s_pcm_stats.eagain_events,
+            (unsigned)s_pcm_stats.ring_used);
+    } else {
+        ag_printf("Stream: late %u  drop %u B  resync %u  chunk %u\x1b[K\n",
+                  (unsigned)s_late, (unsigned)s_drop, (unsigned)s_resync,
+                  (unsigned)CHUNK);
+    }
     if (s_fx_mode == FX_OFF) {
         ag_printf("FX    : mode=off  (F cycle  nofx|fx0|fx1)\x1b[K\n");
     } else {
@@ -1489,6 +1502,12 @@ int ag_main(int argc, char **argv)
             if (want_ui && now < s_next_due &&
                 (uint32_t)(s_next_due - now) >= UI_SLACK_US) {
                 s_ui_ms = ms;
+                s_pcm_stats_ok = 0;
+                if (s_audio_fd >= 0) {
+                    ag_err_t st = ag_dev_ioctl(s_audio_fd, AG_IOC_AUDIO_GETSTATS,
+                                               &s_pcm_stats, sizeof(s_pcm_stats));
+                    s_pcm_stats_ok = (st == AG_OK) ? 1 : 0;
+                }
                 draw_ui();
                 now = ag_micros();
             }
