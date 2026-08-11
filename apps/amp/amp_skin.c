@@ -323,33 +323,45 @@ static int alloc_paint(amp_skin_t *sk)
              sk->panel[AMP_PANEL_EQ].h);
     paint_pl(sk->panel[AMP_PANEL_PL].pixels, sk->panel[AMP_PANEL_PL].w,
              sk->panel[AMP_PANEL_PL].h);
-
-    if (sk->qvga) {
-        (void)try_load_rgb565("h:\\amp\\skin\\qvga\\main.rgb565",
-                              sk->panel[AMP_PANEL_MAIN].pixels,
-                              (uint32_t)sk->panel[AMP_PANEL_MAIN].w *
-                                  sk->panel[AMP_PANEL_MAIN].h * 2u);
-        (void)try_load_rgb565("h:\\amp\\skin\\qvga\\eq.rgb565",
-                              sk->panel[AMP_PANEL_EQ].pixels,
-                              (uint32_t)sk->panel[AMP_PANEL_EQ].w *
-                                  sk->panel[AMP_PANEL_EQ].h * 2u);
-        (void)try_load_rgb565("h:\\amp\\skin\\qvga\\pl.rgb565",
-                              sk->panel[AMP_PANEL_PL].pixels,
-                              (uint32_t)sk->panel[AMP_PANEL_PL].w *
-                                  sk->panel[AMP_PANEL_PL].h * 2u);
-    } else {
-        (void)try_load_rgb565("h:\\amp\\skin\\vga\\main.rgb565",
-                              sk->panel[AMP_PANEL_MAIN].pixels,
-                              (uint32_t)sk->panel[AMP_PANEL_MAIN].w *
-                                  sk->panel[AMP_PANEL_MAIN].h * 2u);
-        (void)try_load_rgb565("h:\\amp\\skin\\vga\\eq.rgb565",
-                              sk->panel[AMP_PANEL_EQ].pixels,
-                              (uint32_t)sk->panel[AMP_PANEL_EQ].w *
-                                  sk->panel[AMP_PANEL_EQ].h * 2u);
-        (void)try_load_rgb565("h:\\amp\\skin\\vga\\pl.rgb565",
-                              sk->panel[AMP_PANEL_PL].pixels,
-                              (uint32_t)sk->panel[AMP_PANEL_PL].w *
-                                  sk->panel[AMP_PANEL_PL].h * 2u);
+    /*
+     * Do not auto-load HostFS .rgb565 overrides here: VGA skins are ~400 KB and
+     * HostFS in QEMU can take minutes. Procedural paint is the default; override
+     * only when h:\amp\skin\{vga|qvga}\load exists (empty marker file).
+     */
+    {
+        const char *marker =
+            sk->qvga ? "h:\\amp\\skin\\qvga\\load" : "h:\\amp\\skin\\vga\\load";
+        ag_handle_t mh = ag_open(marker, AG_O_RDONLY);
+        if (mh >= 0) {
+            (void)ag_close(mh);
+            if (sk->qvga) {
+                (void)try_load_rgb565("h:\\amp\\skin\\qvga\\main.rgb565",
+                                      sk->panel[AMP_PANEL_MAIN].pixels,
+                                      (uint32_t)sk->panel[AMP_PANEL_MAIN].w *
+                                          sk->panel[AMP_PANEL_MAIN].h * 2u);
+                (void)try_load_rgb565("h:\\amp\\skin\\qvga\\eq.rgb565",
+                                      sk->panel[AMP_PANEL_EQ].pixels,
+                                      (uint32_t)sk->panel[AMP_PANEL_EQ].w *
+                                          sk->panel[AMP_PANEL_EQ].h * 2u);
+                (void)try_load_rgb565("h:\\amp\\skin\\qvga\\pl.rgb565",
+                                      sk->panel[AMP_PANEL_PL].pixels,
+                                      (uint32_t)sk->panel[AMP_PANEL_PL].w *
+                                          sk->panel[AMP_PANEL_PL].h * 2u);
+            } else {
+                (void)try_load_rgb565("h:\\amp\\skin\\vga\\main.rgb565",
+                                      sk->panel[AMP_PANEL_MAIN].pixels,
+                                      (uint32_t)sk->panel[AMP_PANEL_MAIN].w *
+                                          sk->panel[AMP_PANEL_MAIN].h * 2u);
+                (void)try_load_rgb565("h:\\amp\\skin\\vga\\eq.rgb565",
+                                      sk->panel[AMP_PANEL_EQ].pixels,
+                                      (uint32_t)sk->panel[AMP_PANEL_EQ].w *
+                                          sk->panel[AMP_PANEL_EQ].h * 2u);
+                (void)try_load_rgb565("h:\\amp\\skin\\vga\\pl.rgb565",
+                                      sk->panel[AMP_PANEL_PL].pixels,
+                                      (uint32_t)sk->panel[AMP_PANEL_PL].w *
+                                          sk->panel[AMP_PANEL_PL].h * 2u);
+            }
+        }
     }
     return 0;
 }

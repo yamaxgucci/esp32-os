@@ -157,17 +157,25 @@ int ag_main(int argc, char **argv)
     }
 
     open_mouse();
-    ag_printf("amp: %ux%u skin=%s audio=%s\n", (unsigned)s_p.fb_w,
-              (unsigned)s_p.fb_h, s_p.skin.qvga ? "qvga" : "vga",
-              s_p.audio_path);
-
-    if (s_p.pl.count > 0) {
-        if (s_p.pl.cur < 0) {
-            s_p.pl.cur = 0;
-            s_p.pl.sel = 0;
-        }
-        (void)amp_open_track(&s_p, amp_pl_current(&s_p.pl));
+    /* Open PCM early (non-blocking sink); do not wait on a track first. */
+    s_p.audio_fd = ag_audio_out_open_dev(s_p.audio_path, s_p.rate, 2);
+    if (s_p.audio_fd < 0) {
+        (void)ag_audio_out_resolve("pcmnull", s_p.audio_path,
+                                   sizeof(s_p.audio_path));
+        s_p.audio_fd = ag_audio_out_open_dev(s_p.audio_path, s_p.rate, 2);
     }
+    ag_printf("amp: %ux%u skin=%s audio=%s tracks=%d\n", (unsigned)s_p.fb_w,
+              (unsigned)s_p.fb_h, s_p.skin.qvga ? "qvga" : "vga",
+              s_p.audio_path, s_p.pl.count);
+    if (s_p.pl.count > 0 && s_p.pl.cur < 0) {
+        s_p.pl.cur = 0;
+        s_p.pl.sel = 0;
+    }
+    /* First paint before any HostFS MP3 I/O — otherwise QEMU looks hung. */
+    amp_ui_draw(&s_p);
+    s_p.dirty = 0;
+    ui_ms = ag_millis();
+    ag_printf("amp: ui ready (Space = play)\n");
 
     while (!s_p.quit && !ag_interrupted()) {
         ag_event_t ev;
@@ -197,9 +205,8 @@ int ag_main(int argc, char **argv)
             }
         }
         ag_heartbeat();
-        if (s_p.state != AMP_PLAYING) {
-            ag_delay(10);
-        }
+        /* Always yield: HostFS decode bursts otherwise starve the guest. */
+        ag_delay(s_p.state == AMP_PLAYING ? 1 : 10);
     }
 
     if (s_p.mp3) {

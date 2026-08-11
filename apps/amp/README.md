@@ -69,9 +69,13 @@ $py = "D:\Espressif\tools\python_env\idf5.5_py3.12_env\Scripts\python.exe"
 
 ## Skins
 
-Built-in paint matches Winamp-ish chrome; override with HostFS:
+Default chrome is painted in RAM (fast). Optional HostFS override (slow on
+QEMU HostFS — ~400 KB for VGA) only if a marker file exists:
 
-- `H:\amp\skin\vga\{main,eq,pl}.rgb565`
-- `H:\amp\skin\qvga\{main,eq,pl}.rgb565`
+- `H:\amp\skin\vga\load` plus `main.rgb565` / `eq.rgb565` / `pl.rgb565`
+- `H:\amp\skin\qvga\load` plus the same names
 
 Profile is chosen from framebuffer width (`< 400` → QVGA).
+
+Startup shows the UI before opening any MP3; press **Space** / Play to load
+the selected playlist entry (`H:\amp\*.mp3`).
