@@ -45,6 +45,9 @@ $py = "D:\Espressif\tools\python_env\idf5.5_py3.12_env\Scripts\python.exe"
 Piano map matches DX7 (`Z..M` / `Q..I`). Esc quits; Space = all notes off.
 Focus the midikbd console so Win32 sees the keys.
 
+Apps may `write()` raw bytes back on the same TCP conn (DX7 ACKs note-on as
+`F0 7D <note> F7` for `midikbd.py --probe` input-latency RTT).
+
 ## With DX7 + sound
 
 Three terminals (repo root):
