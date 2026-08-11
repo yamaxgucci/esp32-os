@@ -39,10 +39,19 @@ int amp_open_track(amp_player_t *p, const char *path)
         return -1;
     }
     p->mp3 = m;
-    /* Prime one frame for rate */
+    /* Bounded prime: junk/HostFS MP3 must not block the UI thread. */
     {
         int16_t tmp[2304];
-        (void)ag_mp3_read(m, tmp, 1);
+        int     tries;
+        for (tries = 0; tries < 8 && ag_mp3_rate(m) == 0; tries++) {
+            int n = ag_mp3_read(m, tmp, 1);
+            if (n < 0) {
+                break;
+            }
+            if (n == 0) {
+                break;
+            }
+        }
         (void)ag_mp3_seek_permille(m, 0);
     }
     rate = ag_mp3_rate(m);
@@ -54,14 +63,19 @@ int amp_open_track(amp_player_t *p, const char *path)
     }
     p->rate = rate;
     amp_eq_set_rate(&p->eq, rate);
-    if (p->audio_fd >= 0) {
-        (void)ag_dev_close(p->audio_fd);
-        p->audio_fd = -1;
-    }
-    p->audio_fd = ag_audio_out_open_dev(p->audio_path, rate, 2);
     if (p->audio_fd < 0) {
-        (void)ag_audio_out_resolve("pcmnull", p->audio_path, sizeof(p->audio_path));
         p->audio_fd = ag_audio_out_open_dev(p->audio_path, rate, 2);
+        if (p->audio_fd < 0) {
+            (void)ag_audio_out_resolve("pcmnull", p->audio_path,
+                                       sizeof(p->audio_path));
+            p->audio_fd = ag_audio_out_open_dev(p->audio_path, rate, 2);
+        }
+    } else if (rate != 0) {
+        ag_audio_fmt_t fmt;
+        fmt.rate = rate;
+        fmt.channels = 2;
+        fmt.bits = 16;
+        (void)ag_dev_ioctl(p->audio_fd, AG_IOC_AUDIO_SETFMT, &fmt, sizeof(fmt));
     }
     {
         const char *t = ag_mp3_title(m);
@@ -241,9 +255,9 @@ void amp_cmd_add_dirs(amp_player_t *p)
     if (p == NULL) {
         return;
     }
+    /* Only shallow music folders — scanning all of H: is brutal on HostFS. */
     n += amp_pl_add_dir(&p->pl, "h:\\amp");
     n += amp_pl_add_dir(&p->pl, "h:\\music");
-    n += amp_pl_add_dir(&p->pl, "h:");
     if (n > 0) {
         set_status(p, "added tracks");
     } else {

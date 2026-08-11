@@ -241,9 +241,15 @@ static int decode_one(ag_mp3_t *m)
 {
     mp3dec_frame_info_t info;
     int samples;
-    int free_format_bytes = 0;
+    int skipped = 0;
+    int empty_frames = 0;
+    int guard = 0;
 
     for (;;) {
+        if (++guard > 64) {
+            /* Bound work per call so UI/audio pump cannot wedge on HostFS junk. */
+            return m->pcm_frames > 0 ? 1 : (m->eof ? 0 : -1);
+        }
         if (refill(m) < 0) {
             return -1;
         }
@@ -258,16 +264,19 @@ static int decode_one(ag_mp3_t *m)
         } else if (m->eof) {
             return 0;
         } else if (m->in_len == AG_MP3_BUF) {
-            /* stuck — drop a byte */
-            memmove(m->in, m->in + 1, (size_t)(m->in_len - 1));
-            m->in_len--;
-            free_format_bytes++;
-            if (free_format_bytes > 4096) {
+            /* Resync in larger steps — byte-walk + memmove is deadly on QEMU/HostFS. */
+            int drop = 64;
+            if (drop > m->in_len) {
+                drop = m->in_len;
+            }
+            memmove(m->in, m->in + drop, (size_t)(m->in_len - drop));
+            m->in_len -= drop;
+            skipped += drop;
+            if (skipped > 8192) {
                 return -1;
             }
             continue;
         } else {
-            /* need more data */
             if (m->eof) {
                 return 0;
             }
@@ -283,10 +292,11 @@ static int decode_one(ag_mp3_t *m)
             }
             m->pcm_frames = samples;
             m->pcm_off = 0;
-            /* minimp3 returns samples per channel */
             return 1;
         }
-        /* frame consumed but no samples (skipped) — loop */
+        if (++empty_frames > 32) {
+            return -1;
+        }
     }
 }
 
