@@ -150,9 +150,12 @@ typedef struct {
     uint16_t col0;
 } prompt_pos_t;
 
-static void redraw_line(const ag_lineedit_t *le, const prompt_pos_t *pos)
+static char         s_prompt[AG_PATH_MAX + 8];
+static prompt_pos_t s_prompt_pos;
+
+/* Caller holds the console lock. */
+static void redraw_line_locked(const ag_lineedit_t *le, const prompt_pos_t *pos)
 {
-    ag_console_lock();
     ag_screen_t *sc = ag_console_screen();
 
     const uint16_t avail =
@@ -178,7 +181,27 @@ static void redraw_line(const ag_lineedit_t *le, const prompt_pos_t *pos)
     }
 
     ag_screen_gotoxy(sc, (uint16_t)(pos->col0 + le->cursor - offset), pos->row);
+}
+
+static void redraw_line(const ag_lineedit_t *le, const prompt_pos_t *pos)
+{
+    ag_console_lock();
+    redraw_line_locked(le, pos);
     ag_console_unlock();
+}
+
+/*
+ * Log echo calls this with the console lock held after printing a background
+ * message over the edit row.  Re-paint the prompt and whatever has been typed.
+ */
+static void live_restore(void *ctx)
+{
+    (void)ctx;
+    ag_screen_t *sc = ag_console_screen();
+    ag_screen_puts(sc, s_prompt);
+    s_prompt_pos.row = sc->cur_y;
+    s_prompt_pos.col0 = sc->cur_x;
+    redraw_line_locked(&s_line, &s_prompt_pos);
 }
 
 /* ---------------------------------------------------------------------- */
@@ -1594,11 +1617,9 @@ int ag_shell_execute(const char *line)
     return status;
 }
 
-static void show_prompt(prompt_pos_t *pos)
+static void show_prompt(void)
 {
-    /* Large enough for the longest path the VFS will accept, plus "A:\>". */
-    char prompt[AG_PATH_MAX + 8];
-    build_prompt(prompt, sizeof(prompt));
+    build_prompt(s_prompt, sizeof(s_prompt));
 
     ag_console_lock();
     ag_screen_t *sc = ag_console_screen();
@@ -1606,9 +1627,11 @@ static void show_prompt(prompt_pos_t *pos)
     if (sc->cur_x != 0) {
         ag_screen_puts(sc, "\n");
     }
-    ag_screen_puts(sc, prompt);
-    pos->row = sc->cur_y;
-    pos->col0 = sc->cur_x;
+    ag_screen_puts(sc, s_prompt);
+    s_prompt_pos.row = sc->cur_y;
+    s_prompt_pos.col0 = sc->cur_x;
+    /* Armed under the same lock so a log cannot land between paint and live. */
+    ag_console_set_live(live_restore, NULL);
     ag_console_unlock();
 }
 
@@ -1620,10 +1643,9 @@ void ag_shell_run(void)
     ag_console_puts("\nType 'help' for a list of commands.\n");
 
     for (;;) {
-        prompt_pos_t pos;
-        show_prompt(&pos);
         ag_lineedit_reset(&s_line);
-        redraw_line(&s_line, &pos);
+        show_prompt();
+        redraw_line(&s_line, &s_prompt_pos);
 
         bool done = false;
         while (!done) {
@@ -1634,11 +1656,14 @@ void ag_shell_run(void)
 
             switch (ag_lineedit_key(&s_line, &ev)) {
             case AG_LINE_CHANGED:
-                redraw_line(&s_line, &pos);
+                redraw_line(&s_line, &s_prompt_pos);
                 break;
 
             case AG_LINE_DONE:
-                ag_console_puts("\n");
+                ag_console_lock();
+                ag_console_set_live(NULL, NULL);
+                ag_screen_puts(ag_console_screen(), "\n");
+                ag_console_unlock();
                 if (s_line.len > 0) {
                     ag_lineedit_remember(&s_line, s_line.buf);
                     s_last_status = ag_shell_execute(s_line.buf);
@@ -1647,7 +1672,10 @@ void ag_shell_run(void)
                 break;
 
             case AG_LINE_CANCEL:
-                ag_console_puts("^C\n");
+                ag_console_lock();
+                ag_console_set_live(NULL, NULL);
+                ag_screen_puts(ag_console_screen(), "^C\n");
+                ag_console_unlock();
                 done = true;
                 break;
 

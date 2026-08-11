@@ -77,6 +77,8 @@ static TaskHandle_t       s_task;
 static bool               s_ready;
 static ag_con_sink_fn     s_redirect;
 static void              *s_redirect_ctx;
+static ag_con_live_fn     s_live;
+static void              *s_live_ctx;
 static uint32_t           s_dropped_events;
 static uint16_t           s_mods;
 static bool (*s_hotkeys)(ag_event_t *ev);
@@ -154,6 +156,14 @@ void ag_console_redirect(ag_con_sink_fn sink, void *ctx)
     ag_console_unlock();
 }
 
+void ag_console_set_live(ag_con_live_fn fn, void *ctx)
+{
+    ag_console_lock();
+    s_live = fn;
+    s_live_ctx = ctx;
+    ag_console_unlock();
+}
+
 void ag_console_write(const char *buf, size_t len)
 {
     if (!s_ready || buf == NULL) {
@@ -163,6 +173,34 @@ void ag_console_write(const char *buf, size_t len)
     ag_console_lock();
     if (s_redirect != NULL) {
         s_redirect(s_redirect_ctx, buf, len);
+    } else {
+        ag_screen_write(&s_screen, buf, len);
+    }
+    ag_console_unlock();
+}
+
+void ag_console_write_log(const char *buf, size_t len)
+{
+    if (!s_ready || buf == NULL || len == 0) {
+        return;
+    }
+
+    ag_console_lock();
+    if (s_redirect != NULL) {
+        s_redirect(s_redirect_ctx, buf, len);
+    } else if (s_live != NULL) {
+        /*
+         * The prompt leaves the cursor mid-line.  Break away, print the
+         * message, then hand the row back to whoever is editing.
+         */
+        if (s_screen.cur_x != 0) {
+            ag_screen_puts(&s_screen, "\n");
+        }
+        ag_screen_write(&s_screen, buf, len);
+        if (buf[len - 1] != '\n') {
+            ag_screen_puts(&s_screen, "\n");
+        }
+        s_live(s_live_ctx);
     } else {
         ag_screen_write(&s_screen, buf, len);
     }

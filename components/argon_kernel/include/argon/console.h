@@ -52,7 +52,22 @@ ag_err_t ag_console_attach(const ag_con_transport_t *transport, void *ctx);
 typedef int32_t (*ag_con_sink_fn)(void *ctx, const char *data, size_t len);
 void ag_console_redirect(ag_con_sink_fn sink, void *ctx);
 
+/*
+ * While the shell is editing a line, it installs a redraw callback here.  Log
+ * echo uses ag_console_write_log so a background message starts on a fresh row
+ * and the callback restores the prompt afterwards.  The callback runs with the
+ * console lock held.  Pass NULL to clear.
+ */
+typedef void (*ag_con_live_fn)(void *ctx);
+void ag_console_set_live(ag_con_live_fn fn, void *ctx);
+
 void ag_console_write(const char *buf, size_t len);
+/*
+ * Write a complete log line.  Unlike ag_console_write, this cooperates with a
+ * live edit line so DHCP (and any other async log) does not glue itself to the
+ * prompt.
+ */
+void ag_console_write_log(const char *buf, size_t len);
 void ag_console_puts(const char *s);
 int  ag_console_printf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 int  ag_console_vprintf(const char *fmt, va_list ap);

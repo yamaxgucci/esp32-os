@@ -18,6 +18,7 @@
 
 #include "esp_eth.h"
 #include "esp_event.h"
+#include "esp_log.h"
 #include "esp_netif.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -204,6 +205,11 @@ ag_err_t ag_net_init(void)
 
     (void)esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_GOT_IP, &on_got_ip,
                                      NULL);
+    /*
+     * ESP-IDF also logs GOT_IP under this tag.  Ours in on_got_ip is enough;
+     * the duplicate used to glue itself to the shell prompt.
+     */
+    esp_log_level_set("esp_netif_handlers", ESP_LOG_WARN);
 
     err = esp_eth_start(s_eth);
     if (err != ESP_OK) {

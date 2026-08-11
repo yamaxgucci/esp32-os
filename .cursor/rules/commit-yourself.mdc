@@ -1,0 +1,24 @@
+---
+description: Agent commits finished work without waiting to be asked
+alwaysApply: true
+---
+
+# Commit yourself
+
+When a coherent unit of work is done and a commit is warranted — **commit it yourself**. Do not leave “should I commit?” or wait for an explicit “commit” unless the user said not to, or the change is still exploratory / half-baked.
+
+## When to commit
+
+- A bugfix, feature slice, or refactor that builds and is ready to keep
+- After the related rebuild/tests you already ran for that work
+- Include new/updated project rules that belong with the change
+
+## When not to
+
+- User said not to commit, or is mid-design / still iterating on the same WIP
+- Only scratch, secrets, or generated junk (`build/`, local logs, credentials)
+- Empty or purely cosmetic churn with no meaningful intent
+
+## How
+
+Follow the repo’s normal git safety protocol: status + diff + log style, stage only the relevant files, concise message focused on why, no amend/force/hooks-skip unless explicitly requested. Report the commit hash briefly when done.

@@ -82,7 +82,7 @@ static int log_vprintf(const char *fmt, va_list ap)
     ag_journal_write(&s_journal, line, len);
 
     if (s_echo && ag_console_ready()) {
-        ag_console_write(line, len);
+        ag_console_write_log(line, len);
     } else if (!ag_console_ready()) {
         /* Before the console exists the raw port is the only way out. */
         (void)fwrite(line, 1, len, stdout);
@@ -131,9 +131,6 @@ void ag_vlog(ag_log_level_t level, const char *tag, const char *fmt,
                             (unsigned)ms, (tag != NULL) ? tag : "argon");
     if (hn > 0) {
         ag_journal_write(&s_journal, head, (size_t)hn);
-        if (s_echo && ag_console_ready()) {
-            ag_console_write(head, (size_t)hn);
-        }
     }
 
     char body[AG_JOURNAL_LINE_MAX];
@@ -143,10 +140,32 @@ void ag_vlog(ag_log_level_t level, const char *tag, const char *fmt,
                                                       : sizeof(body) - 1;
         ag_journal_write(&s_journal, body, len);
         ag_journal_puts(&s_journal, "\n");
-        if (s_echo && ag_console_ready()) {
-            ag_console_write(body, len);
-            ag_console_puts("\n");
+    }
+
+    /*
+     * Echo as a single write so a live prompt is broken once, not once per
+     * fragment of the line.
+     */
+    if (s_echo && ag_console_ready() && hn > 0) {
+        char line[sizeof(head) + AG_JOURNAL_LINE_MAX + 1];
+        size_t off = 0;
+        const size_t hlen = (size_t)hn;
+        if (hlen < sizeof(line)) {
+            memcpy(line, head, hlen);
+            off = hlen;
         }
+        if (bn > 0) {
+            const size_t blen = ((size_t)bn < sizeof(body)) ? (size_t)bn
+                                                            : sizeof(body) - 1;
+            const size_t room = sizeof(line) - off - 1;
+            const size_t take = (blen < room) ? blen : room;
+            memcpy(line + off, body, take);
+            off += take;
+        }
+        if (off + 1 < sizeof(line)) {
+            line[off++] = '\n';
+        }
+        ag_console_write_log(line, off);
     }
     log_unlock();
 }
