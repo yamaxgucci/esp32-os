@@ -44,6 +44,7 @@ CONFIG_ETH_USE_OPENETH=y
 # largest free DRAM block after a default lwIP bring-up was only ~31 KB.
 CONFIG_ETH_OPENETH_DMA_RX_BUFFER_NUM=2
 CONFIG_ETH_OPENETH_DMA_TX_BUFFER_NUM=1
-CONFIG_LWIP_MAX_SOCKETS=4
+# pcmvirt+midivirt+mousevirt each need listen(+conn); 4 left no room for pcmplay.
+CONFIG_LWIP_MAX_SOCKETS=12
 CONFIG_LWIP_TCP_SND_BUF_DEFAULT=2880
 CONFIG_LWIP_TCP_WND_DEFAULT=2880
