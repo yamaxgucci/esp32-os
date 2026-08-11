@@ -1636,6 +1636,13 @@ void ag_shell_run(void)
     ag_lineedit_init(&s_line);
     pick_initial_cwd();
 
+    /*
+     * Boot already echoed to the screen.  From the prompt onward, system
+     * messages stay in the journal only — pcmvirt stats and friends must not
+     * break the live edit line.  Use `log` to read them.
+     */
+    ag_log_set_echo(false);
+
     ag_console_puts("\nType 'help' for a list of commands.\n");
 
     for (;;) {
