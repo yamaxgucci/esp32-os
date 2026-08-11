@@ -1,1 +1,5 @@
-﻿apps/cc/games/harbor/assets/raw/
+﻿# Third-party packs stay local; regenerate atlas with tools/rpg_atlas.py
+raw/
+
+# Repo tracks the built RGB565 atlas (root *.bin ignore would drop it).
+!atlas.bin
