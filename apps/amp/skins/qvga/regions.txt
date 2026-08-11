@@ -1,0 +1,4 @@
+# AMP skin qvga logical classic 275x116 mapped to panel sizes
+main=275x116
+eq=275x116
+pl=312x232

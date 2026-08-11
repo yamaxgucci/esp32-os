@@ -1,0 +1,4 @@
+# AMP skin vga logical classic 275x116 mapped to panel sizes
+main=550x148
+eq=550x100
+pl=550x120
