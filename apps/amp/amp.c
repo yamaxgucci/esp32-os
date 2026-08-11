@@ -1,0 +1,218 @@
+/*
+ * AMP — Winamp-style MP3 player for ArgonOS.
+ *
+ * Soft RGB565 UI (VGA 640x400 or QVGA 320x240 bitmap skins), streaming
+ * minimp3 decode, 10-band EQ, playlist, mouse + keyboard.
+ *
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
+ */
+#include <string.h>
+
+#include <argon/argon.h>
+#include <argon/keys.h>
+
+#include "amp_app.h"
+#include "audio_out.h"
+
+AG_APP_SIZED("AMP", "0.1", "argon", AG_AXE_NEEDS_GFX, 16 * 1024, 1024 * 1024);
+
+#define CHUNK_FRAMES 512
+#define UI_PERIOD_MS 50u
+
+static amp_player_t s_p;
+static int16_t      s_pcm[CHUNK_FRAMES * 2];
+
+static int ends_mp3(const char *s)
+{
+    size_t n;
+    if (s == NULL) {
+        return 0;
+    }
+    n = strlen(s);
+    return n >= 4 && s[n - 4] == '.' &&
+           (s[n - 3] == 'm' || s[n - 3] == 'M') &&
+           (s[n - 2] == 'p' || s[n - 2] == 'P') && s[n - 1] == '3';
+}
+
+static void apply_volume(int16_t *stereo, int frames, int vol, int bal)
+{
+    int i;
+    int vl = vol;
+    int vr = vol;
+    if (bal < 0) {
+        vr = (vr * (100 + bal)) / 100;
+    } else if (bal > 0) {
+        vl = (vl * (100 - bal)) / 100;
+    }
+    for (i = 0; i < frames; i++) {
+        int l = ((int)stereo[i * 2] * vl) / 100;
+        int r = ((int)stereo[i * 2 + 1] * vr) / 100;
+        if (l > 32767) {
+            l = 32767;
+        }
+        if (l < -32768) {
+            l = -32768;
+        }
+        if (r > 32767) {
+            r = 32767;
+        }
+        if (r < -32768) {
+            r = -32768;
+        }
+        stereo[i * 2] = (int16_t)l;
+        stereo[i * 2 + 1] = (int16_t)r;
+    }
+}
+
+static void pump_audio(void)
+{
+    int n;
+    if (s_p.state != AMP_PLAYING || s_p.mp3 == NULL || s_p.audio_fd < 0) {
+        return;
+    }
+    n = ag_mp3_read(s_p.mp3, s_pcm, CHUNK_FRAMES);
+    if (n < 0) {
+        s_p.state = AMP_STOPPED;
+        s_p.dirty = 1;
+        return;
+    }
+    if (n == 0) {
+        amp_cmd_next(&s_p);
+        return;
+    }
+    amp_eq_process(&s_p.eq, s_pcm, n);
+    apply_volume(s_pcm, n, s_p.volume, s_p.balance);
+    (void)ag_dev_write(s_p.audio_fd, s_pcm, (size_t)n * 4u);
+    s_p.dirty = 1;
+}
+
+static void open_mouse(void)
+{
+    s_p.mouse_fd = ag_dev_open("/dev/mouse0");
+}
+
+static void pump_mouse(void)
+{
+    uint8_t buf[64];
+    if (s_p.mouse_fd < 0) {
+        return;
+    }
+    (void)ag_dev_read(s_p.mouse_fd, buf, sizeof(buf));
+}
+
+static int parse_args(int argc, char **argv)
+{
+    int i;
+    const char *audio = "pcmvirt";
+    (void)ag_audio_out_resolve(audio, s_p.audio_path, sizeof(s_p.audio_path));
+    for (i = 1; i < argc; i++) {
+        if (ag_audio_out_ieq(argv[i], "pcmvirt") ||
+            ag_audio_out_ieq(argv[i], "pcmnull") ||
+            ag_audio_out_ieq(argv[i], "audio") ||
+            ag_audio_out_ieq(argv[i], "mock") ||
+            ag_audio_out_ieq(argv[i], "net")) {
+            (void)ag_audio_out_resolve(argv[i], s_p.audio_path,
+                                       sizeof(s_p.audio_path));
+        } else if (ends_mp3(argv[i])) {
+            (void)amp_pl_add(&s_p.pl, argv[i]);
+            s_p.pl.cur = 0;
+            s_p.pl.sel = 0;
+        } else {
+            (void)amp_pl_add_dir(&s_p.pl, argv[i]);
+        }
+    }
+    return 0;
+}
+
+int ag_main(int argc, char **argv)
+{
+    ag_gfxinfo_t info;
+    uint32_t     ui_ms = 0;
+
+    memset(&s_p, 0, sizeof(s_p));
+    s_p.audio_fd = -1;
+    s_p.mouse_fd = -1;
+    s_p.volume = 80;
+    s_p.balance = 0;
+    s_p.focus = AMP_PANEL_MAIN;
+    s_p.dirty = 1;
+    s_p.rate = 22050;
+    amp_pl_init(&s_p.pl);
+    amp_eq_init(&s_p.eq, s_p.rate);
+    parse_args(argc, argv);
+    if (s_p.pl.count == 0) {
+        amp_cmd_add_dirs(&s_p);
+    }
+
+    if (ag_gfx_acquire(&info) != AG_OK) {
+        ag_printf("amp: gfx acquire failed\n");
+        return 1;
+    }
+    s_p.fb_w = info.width;
+    s_p.fb_h = info.height;
+    if (amp_skin_load(&s_p.skin, s_p.fb_w, s_p.fb_h) != 0) {
+        ag_printf("amp: skin load failed\n");
+        ag_gfx_release();
+        return 1;
+    }
+
+    open_mouse();
+    ag_printf("amp: %ux%u skin=%s audio=%s\n", (unsigned)s_p.fb_w,
+              (unsigned)s_p.fb_h, s_p.skin.qvga ? "qvga" : "vga",
+              s_p.audio_path);
+
+    if (s_p.pl.count > 0) {
+        if (s_p.pl.cur < 0) {
+            s_p.pl.cur = 0;
+            s_p.pl.sel = 0;
+        }
+        (void)amp_open_track(&s_p, amp_pl_current(&s_p.pl));
+    }
+
+    while (!s_p.quit && !ag_interrupted()) {
+        ag_event_t ev;
+        pump_mouse();
+        while (ag_poll_event(&ev, 0)) {
+            if (ev.type == AG_EV_QUIT) {
+                s_p.quit = 1;
+                break;
+            }
+            if (ev.type == AG_EV_KEY_DOWN || ev.type == AG_EV_KEY_UP) {
+                amp_handle_key(&s_p, (int)ev.key.keycode,
+                               ev.type == AG_EV_KEY_DOWN, ev.key.mods);
+            } else if (ev.type == AG_EV_POINTER_DOWN ||
+                       ev.type == AG_EV_POINTER_UP ||
+                       ev.type == AG_EV_POINTER_MOVE ||
+                       ev.type == AG_EV_WHEEL) {
+                amp_ui_pointer(&s_p, &ev);
+            }
+        }
+        pump_audio();
+        {
+            uint32_t now = ag_millis();
+            if (s_p.dirty || (now - ui_ms) >= UI_PERIOD_MS) {
+                amp_ui_draw(&s_p);
+                s_p.dirty = 0;
+                ui_ms = now;
+            }
+        }
+        ag_heartbeat();
+        if (s_p.state != AMP_PLAYING) {
+            ag_delay(10);
+        }
+    }
+
+    if (s_p.mp3) {
+        ag_mp3_close(s_p.mp3);
+        s_p.mp3 = NULL;
+    }
+    if (s_p.mouse_fd >= 0) {
+        (void)ag_dev_close(s_p.mouse_fd);
+    }
+    if (s_p.audio_fd >= 0) {
+        (void)ag_dev_close(s_p.audio_fd);
+    }
+    amp_skin_free(&s_p.skin);
+    ag_gfx_release();
+    return 0;
+}
