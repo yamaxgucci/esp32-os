@@ -1471,6 +1471,8 @@ const char *ag_shell_cwd(void) { return s_cwd; }
 
 bool ag_shell_interrupted(void) { return ag_supervisor_interrupted(); }
 
+void ag_shell_clear_interrupted(void) { ag_supervisor_clear_interrupt(); }
+
 /* Output redirection: the sink the console writes through for "dir > file". */
 static int32_t file_sink(void *ctx, const char *data, size_t len)
 {

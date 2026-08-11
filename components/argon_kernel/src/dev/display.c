@@ -234,6 +234,12 @@ static ag_point_t s_poly[AG_POLY_MAX_VERTS];
 static int        s_poly_n;
 static bool       s_poly_active;
 
+/* Soft-draw clip (ABI 0.16).  Zero size means "whole framebuffer". */
+static int16_t  s_clip_x;
+static int16_t  s_clip_y;
+static uint16_t s_clip_w;
+static uint16_t s_clip_h;
+
 static uint16_t rgb_to_565(uint32_t color)
 {
     return ag_draw_rgb_to_565(color);
@@ -241,7 +247,15 @@ static uint16_t rgb_to_565(uint32_t color)
 
 static ag_draw_surf_t draw_surf(void)
 {
-    ag_draw_surf_t s = {.pix = s_draw, .w = s_w, .h = s_h};
+    ag_draw_surf_t s = {
+        .pix = s_draw,
+        .w = s_w,
+        .h = s_h,
+        .clip_x = s_clip_x,
+        .clip_y = s_clip_y,
+        .clip_w = s_clip_w,
+        .clip_h = s_clip_h,
+    };
     return s;
 }
 
@@ -256,29 +270,8 @@ static void fill_rect_raw(int32_t x, int32_t y, int32_t w, int32_t h, uint16_t c
     if (w <= 0 || h <= 0 || s_draw == NULL) {
         return;
     }
-    if (x < 0) {
-        w += x;
-        x = 0;
-    }
-    if (y < 0) {
-        h += y;
-        y = 0;
-    }
-    if (x >= (int32_t)s_w || y >= (int32_t)s_h) {
-        return;
-    }
-    if (x + w > (int32_t)s_w) {
-        w = (int32_t)s_w - x;
-    }
-    if (y + h > (int32_t)s_h) {
-        h = (int32_t)s_h - y;
-    }
-    for (int32_t row = 0; row < h; row++) {
-        uint16_t *dst = &s_draw[(uint32_t)(y + row) * s_w + (uint32_t)x];
-        for (int32_t col = 0; col < w; col++) {
-            dst[col] = c;
-        }
-    }
+    ag_draw_surf_t s = draw_surf();
+    ag_draw_fill_rect(&s, x, y, w, h, c);
 }
 
 static void draw_glyph(int32_t x, int32_t y, uint8_t ch, uint16_t fg, uint16_t bg)
@@ -359,6 +352,10 @@ static ag_err_t gfx_acquire(ag_gfxinfo_t *out)
         return -AG_EBUSY;
     }
     s_acquired = true;
+    s_clip_x = 0;
+    s_clip_y = 0;
+    s_clip_w = 0;
+    s_clip_h = 0;
     if (s_back != NULL) {
         /* Start the back buffer from the last presented frame. */
         memcpy(s_back, s_front, fb_bytes());
@@ -450,23 +447,18 @@ static void gfx_blit(int16_t x, int16_t y, uint16_t w, uint16_t h,
     if (src_fmt != AG_PIX_RGB565 && src_fmt != AG_PIX_RGB565_BE) {
         return; /* soft path only knows 16-bit RGB for now */
     }
+    ag_draw_surf_t surf = draw_surf();
     for (uint16_t row = 0; row < h; row++) {
         const int32_t dy = (int32_t)y + (int32_t)row;
-        if ((uint32_t)dy >= s_h) {
-            continue;
-        }
         const uint8_t *srow = (const uint8_t *)src + (uint32_t)row * src_stride;
         for (uint16_t col = 0; col < w; col++) {
             const int32_t dx = (int32_t)x + (int32_t)col;
-            if ((uint32_t)dx >= s_w) {
-                continue;
-            }
             uint16_t pix = (uint16_t)srow[col * 2] |
                            ((uint16_t)srow[col * 2 + 1] << 8);
             if (src_fmt == AG_PIX_RGB565_BE) {
                 pix = (uint16_t)((pix << 8) | (pix >> 8));
             }
-            s_draw[(uint32_t)dy * s_w + (uint32_t)dx] = pix;
+            ag_draw_pixel(&surf, dx, dy, pix);
         }
     }
 }
@@ -584,6 +576,37 @@ static void gfx_stroke_convex(const ag_point_t *pts, int32_t n, uint32_t color)
     ag_draw_stroke_convex(&s, pts, (int)n, rgb_to_565(color));
 }
 
+static void gfx_clip(int16_t x, int16_t y, uint16_t w, uint16_t h)
+{
+    s_clip_x = x;
+    s_clip_y = y;
+    s_clip_w = w;
+    s_clip_h = h;
+}
+
+static void gfx_clip_reset(void)
+{
+    s_clip_x = 0;
+    s_clip_y = 0;
+    s_clip_w = 0;
+    s_clip_h = 0;
+}
+
+static void gfx_stroke_rect(int16_t x, int16_t y, uint16_t w, uint16_t h,
+                            uint32_t color)
+{
+    ag_draw_surf_t s = draw_surf();
+    ag_draw_stroke_rect(&s, x, y, (int32_t)w, (int32_t)h, rgb_to_565(color));
+}
+
+static void gfx_fill_round_rect(int16_t x, int16_t y, uint16_t w, uint16_t h,
+                                uint16_t r, uint32_t color)
+{
+    ag_draw_surf_t s = draw_surf();
+    ag_draw_fill_round_rect(&s, x, y, (int32_t)w, (int32_t)h, (int32_t)r,
+                            rgb_to_565(color));
+}
+
 const ag_gfx_api_t ag_gfx_api_table = {
     .size = sizeof(ag_gfx_api_t),
     .acquire = gfx_acquire,
@@ -605,6 +628,10 @@ const ag_gfx_api_t ag_gfx_api_table = {
     .poly_stroke = gfx_poly_stroke,
     .fill_convex = gfx_fill_convex,
     .stroke_convex = gfx_stroke_convex,
+    .clip = gfx_clip,
+    .clip_reset = gfx_clip_reset,
+    .stroke_rect = gfx_stroke_rect,
+    .fill_round_rect = gfx_fill_round_rect,
 };
 
 /* ---------------------------------------------------------------------- */

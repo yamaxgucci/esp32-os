@@ -13,12 +13,32 @@ uint16_t ag_draw_rgb_to_565(uint32_t color)
     return (uint16_t)(((r & 0xF8u) << 8) | ((g & 0xFCu) << 3) | (b >> 3));
 }
 
-void ag_draw_pixel(ag_draw_surf_t *s, int32_t x, int32_t y, uint16_t c565)
+static bool in_clip(const ag_draw_surf_t *s, int32_t x, int32_t y)
 {
     if (s == NULL || s->pix == NULL) {
-        return;
+        return false;
     }
     if ((uint32_t)x >= s->w || (uint32_t)y >= s->h) {
+        return false;
+    }
+    if (s->clip_w == 0 || s->clip_h == 0) {
+        return true;
+    }
+    if (x < s->clip_x || y < s->clip_y) {
+        return false;
+    }
+    if (x >= (int32_t)s->clip_x + (int32_t)s->clip_w) {
+        return false;
+    }
+    if (y >= (int32_t)s->clip_y + (int32_t)s->clip_h) {
+        return false;
+    }
+    return true;
+}
+
+void ag_draw_pixel(ag_draw_surf_t *s, int32_t x, int32_t y, uint16_t c565)
+{
+    if (!in_clip(s, x, y)) {
         return;
     }
     s->pix[(uint32_t)y * s->w + (uint32_t)x] = c565;
@@ -95,6 +115,17 @@ static void hline(ag_draw_surf_t *s, int32_t x0, int32_t x1, int32_t y,
     if (s == NULL || s->pix == NULL || (uint32_t)y >= s->h) {
         return;
     }
+    if (s->clip_w != 0 && s->clip_h != 0) {
+        if (y < s->clip_y || y >= (int32_t)s->clip_y + (int32_t)s->clip_h) {
+            return;
+        }
+        if (x0 < s->clip_x) {
+            x0 = s->clip_x;
+        }
+        if (x1 >= (int32_t)s->clip_x + (int32_t)s->clip_w) {
+            x1 = (int32_t)s->clip_x + (int32_t)s->clip_w - 1;
+        }
+    }
     if (x0 > x1) {
         const int32_t t = x0;
         x0 = x1;
@@ -141,6 +172,65 @@ void ag_draw_fill_circle(ag_draw_surf_t *s, int32_t cx, int32_t cy, int32_t r,
             err += 2 * (y - x) + 1;
         }
     }
+}
+
+void ag_draw_fill_rect(ag_draw_surf_t *s, int32_t x, int32_t y, int32_t w,
+                       int32_t h, uint16_t c565)
+{
+    if (s == NULL || s->pix == NULL || w <= 0 || h <= 0) {
+        return;
+    }
+    for (int32_t row = 0; row < h; row++) {
+        hline(s, x, x + w - 1, y + row, c565);
+    }
+}
+
+void ag_draw_stroke_rect(ag_draw_surf_t *s, int32_t x, int32_t y, int32_t w,
+                         int32_t h, uint16_t c565)
+{
+    if (s == NULL || w <= 0 || h <= 0) {
+        return;
+    }
+    const int32_t x1 = x + w - 1;
+    const int32_t y1 = y + h - 1;
+    ag_draw_line(s, x, y, x1, y, c565);
+    ag_draw_line(s, x, y1, x1, y1, c565);
+    ag_draw_line(s, x, y, x, y1, c565);
+    ag_draw_line(s, x1, y, x1, y1, c565);
+}
+
+void ag_draw_fill_round_rect(ag_draw_surf_t *s, int32_t x, int32_t y, int32_t w,
+                             int32_t h, int32_t r, uint16_t c565)
+{
+    if (s == NULL || w <= 0 || h <= 0) {
+        return;
+    }
+    if (r < 0) {
+        r = 0;
+    }
+    if (r * 2 > w) {
+        r = w / 2;
+    }
+    if (r * 2 > h) {
+        r = h / 2;
+    }
+    if (r == 0) {
+        ag_draw_fill_rect(s, x, y, w, h, c565);
+        return;
+    }
+
+    /* Centre and side slabs; circles cover the corners. */
+    if (w > 2 * r) {
+        ag_draw_fill_rect(s, x + r, y, w - 2 * r, h, c565);
+    }
+    if (h > 2 * r) {
+        ag_draw_fill_rect(s, x, y + r, r, h - 2 * r, c565);
+        ag_draw_fill_rect(s, x + w - r, y + r, r, h - 2 * r, c565);
+    }
+    ag_draw_fill_circle(s, x + r, y + r, r, c565);
+    ag_draw_fill_circle(s, x + w - 1 - r, y + r, r, c565);
+    ag_draw_fill_circle(s, x + r, y + h - 1 - r, r, c565);
+    ag_draw_fill_circle(s, x + w - 1 - r, y + h - 1 - r, r, c565);
 }
 
 void ag_draw_stroke_convex(ag_draw_surf_t *s, const ag_point_t *pts, int n,
@@ -198,7 +288,6 @@ void ag_draw_fill_convex(ag_draw_surf_t *s, const ag_point_t *pts, int n,
             if ((y < y0 && y < y1) || (y >= y0 && y >= y1)) {
                 continue;
             }
-            /* Intersect edge with scanline y (top-left fill rule-ish). */
             const int32_t dy = y1 - y0;
             const int32_t x =
                 x0 + (int32_t)((int64_t)(y - y0) * (x1 - x0) / dy);

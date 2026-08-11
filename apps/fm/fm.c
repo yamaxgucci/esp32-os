@@ -13,10 +13,11 @@
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
  */
 #include "fm.h"
+#include "fm_ui.h"
 
-/* Only the application build declares an image header and an API slot; the
- * built-in is already inside the image that would have loaded it. */
-#ifndef AG_BUILTIN
+/* Only the plain text application build declares an image header; the built-in
+ * lives in the kernel image, and GFXFM supplies its own header. */
+#if !defined(AG_BUILTIN) && !defined(FM_GFX_BUILD)
 AG_APP("FM", "1.0", "argon", 0);
 #endif
 
@@ -33,7 +34,7 @@ void fm_put(int x, int y, const char *s, uint8_t attr)
         return;
     }
     for (int i = 0; s[i] != '\0' && x + i < FM_COLS; i++) {
-        ag_poke((uint16_t)(x + i), (uint16_t)y, s[i], attr);
+        fm_ui_poke(x + i, y, s[i], attr);
     }
 }
 
@@ -47,35 +48,21 @@ void fm_put_clipped(int x, int y, int width, const char *s, uint8_t attr)
     int i = 0;
 
     for (; s != NULL && s[i] != '\0' && i < width; i++) {
-        ag_poke((uint16_t)(x + i), (uint16_t)y, s[i], attr);
+        fm_ui_poke(x + i, y, s[i], attr);
     }
     for (; i < width; i++) {
-        ag_poke((uint16_t)(x + i), (uint16_t)y, ' ', attr);
+        fm_ui_poke(x + i, y, ' ', attr);
     }
 }
 
 void fm_clear_row(int y, uint8_t attr)
 {
-    ag_fill(0, (uint16_t)y, FM_COLS, 1, ' ', attr);
+    fm_ui_fill(0, y, FM_COLS, 1, ' ', attr);
 }
 
-/* A single-line box, in the characters a plain terminal can be relied on to
- * show: the drawing set is code page 437, and the screen holds one byte a cell. */
 void fm_frame(int x, int y, int w, int h, uint8_t attr)
 {
-    ag_poke((uint16_t)x, (uint16_t)y, '+', attr);
-    ag_poke((uint16_t)(x + w - 1), (uint16_t)y, '+', attr);
-    ag_poke((uint16_t)x, (uint16_t)(y + h - 1), '+', attr);
-    ag_poke((uint16_t)(x + w - 1), (uint16_t)(y + h - 1), '+', attr);
-
-    for (int i = 1; i < w - 1; i++) {
-        ag_poke((uint16_t)(x + i), (uint16_t)y, '-', attr);
-        ag_poke((uint16_t)(x + i), (uint16_t)(y + h - 1), '-', attr);
-    }
-    for (int j = 1; j < h - 1; j++) {
-        ag_poke((uint16_t)x, (uint16_t)(y + j), '|', attr);
-        ag_poke((uint16_t)(x + w - 1), (uint16_t)(y + j), '|', attr);
-    }
+    fm_ui_frame(x, y, w, h, attr);
 }
 
 void fm_message(const char *text)
@@ -506,6 +493,7 @@ void fm_draw_all(void)
     /* Measured before the status line is drawn, since it shows the measurement. */
     s_last_redraw_us = (uint32_t)(ag_micros() - t0);
     draw_status();
+    fm_ui_present();
 }
 
 /*
@@ -523,6 +511,7 @@ void fm_draw_light(void)
 
     s_last_redraw_us = (uint32_t)(ag_micros() - t0);
     draw_status();
+    fm_ui_present();
 }
 
 /* ---------------------------------------------------------------------- */
@@ -680,10 +669,10 @@ int FM_ENTRY(int argc, char **argv)
     /* The panel that is not active must not leave the cwd where it looked last. */
     (void)ag_chdir(g_panel[0].path);
 
-    ag_cursor(false);
-    ag_cls();
+    fm_ui_begin();
     fm_draw_all();
     fm_message("F1 for the keys");
+    fm_ui_present();
 
     bool running = true;
     while (running) {
@@ -770,10 +759,7 @@ int FM_ENTRY(int argc, char **argv)
         }
     }
 
-    /* Hand the screen back the way it was found. */
-    ag_color(AG_LGRAY, AG_BLACK);
-    ag_cls();
-    ag_cursor(true);
+    fm_ui_end();
 
     /*
      * And the memory too.  A process would have it taken back on the way out,

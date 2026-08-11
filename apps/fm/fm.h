@@ -11,16 +11,13 @@
 #include <argon/libc.h>
 
 /*
- * The same source builds two ways.
+ * The same panels/ops build three ways.
  *
- * As an application it is an ordinary .AXE: AG_APP declares it, ag_main is its
- * entry, and it reaches the system through the syscall table like anything else.
+ * As a text .AXE: AG_APP in fm.c, cell drawing via fm_ui_text.c.
+ * With AG_BUILTIN: part of the kernel image as the shell's `fm` command.
+ * As GFXFM.AXE: FM_GFX_BUILD + apps/gfxfm (soft gfx cell backend, same ops).
  *
- * With AG_BUILTIN it is part of the kernel image and reachable as the shell's fm
- * command, so a board that boots has a file manager without anything having to be
- * copied to it first.  Nothing about the code changes - it still goes through the
- * same syscall table, which is the point: if the built-in works, the application
- * works, and the ABI is being exercised rather than bypassed.
+ * Drawing goes through fm_ui.h so ops never call the console or gfx directly.
  */
 #ifdef AG_BUILTIN
 #define FM_ENTRY ag_fm_main

@@ -561,6 +561,22 @@ static inline void ag_gfx_stroke_convex(const ag_point_t *pts, int32_t n,
 {
     g_ag_api->gfx->stroke_convex(pts, n, color);
 }
+static inline void ag_gfx_clip(int16_t x, int16_t y, uint16_t w, uint16_t h)
+{
+    g_ag_api->gfx->clip(x, y, w, h);
+}
+static inline void ag_gfx_clip_reset(void) { g_ag_api->gfx->clip_reset(); }
+static inline void ag_gfx_stroke_rect(int16_t x, int16_t y, uint16_t w,
+                                      uint16_t h, uint32_t color)
+{
+    g_ag_api->gfx->stroke_rect(x, y, w, h, color);
+}
+static inline void ag_gfx_fill_round_rect(int16_t x, int16_t y, uint16_t w,
+                                          uint16_t h, uint16_t r,
+                                          uint32_t color)
+{
+    g_ag_api->gfx->fill_round_rect(x, y, w, h, r, color);
+}
 
 /* ---- audio helpers (ABI 0.14+; built-in pcmnull) ------------------------- */
 

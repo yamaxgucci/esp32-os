@@ -136,7 +136,7 @@ $py = "D:\Espressif\tools\python_env\idf5.5_py3.12_env\Scripts\python.exe"
 | FAT на flash `C:` | — | ❌ заменён littlefs |
 | FAT на SD `A:` | `storage.c` | ✅ SDMMC и SPI, `format a:` |
 | Sync папки хоста → `A:` | `tools/mkfatimg.py`, `argon sync` / `run -Share` | ✅ снимок FAT16 в `build\sdcard.img` |
-| HostFS → `H:` | `src/fs/hostfs.c`, `tools/hostfsd.py`, `argon run -HostFs` | ✅ чтение, запись мелких файлов, `del`; ⚠ крупные `copy` на `H:` (WAV) у пользователя ещё ломаются — в плане п.9; обход `A:`+`argon get` |
+| HostFS → `H:` | `src/fs/hostfs.c`, `tools/hostfsd.py`, `argon run -HostFs` | ✅ чтение/запись/`del`; крупные `copy` на `H:` при живом PADPUSH — TX кусками + пауза push на writable open |
 | FatFs BPB subtype | `components/fatfs` + `tools/patch_fatfs_bpb.py` | ✅ FAT12/16/32 по BPB, не только по nclst |
 | Шелл | `src/shell/` | ✅ история, перенаправление, 32 команды |
 | Загрузчик `.AXE` | `src/loader/`, `tools/mkaxe.py` | ✅ две части; R-1 flash XIP; HMAC в `reserved[6]` (`axesig`, `signaxe.py`) |
@@ -148,13 +148,14 @@ $py = "D:\Espressif\tools\python_env\idf5.5_py3.12_env\Scripts\python.exe"
 | Ресурсный список | `src/core/reslist.c` | ✅ порядок по типам, ловит двойное free |
 | Примеры приложений | `apps/hello`, `disk`, `spin`, `leak`, `threads`, `crash` | ✅ проверяют сами себя |
 | Файловый менеджер | `apps/fm/` | ✅ **команда `fm`, встроена в ОС**; тот же код собирается и как `.AXE` |
+| Графический FM | `apps/gfxfm/` | ✅ `GFXFM.AXE` — полный паритет клавиш/ops с `fm`, soft gfx (cell UI) |
 | ZIP | `cmd_unzip.c`, `apps/zip/`, `third_party/miniz/` | ✅ **`unzip` builtin** (list/extract, store/deflate via miniz); **`ZIP.AXE`** create/update (store) + list/extract (store; deflate → builtin) |
 | Текстовый редактор | `apps/edit/` | ✅ **команда `edit`**, встроена; до 64 КБ / 2048 строк, F2 сохранить |
-| Компилятор C → `.AXE` | `apps/cc/` (`CC.AXE`) | ✅ **Argon CC** (фазы A–E): `int`/`char`/указатели, **структуры**, **препроцессор**, **FS/mem/dev**, биты/сдвиги; builtins `ag_delay`/`ag_key`/`ag_btn`/`ag_gfx_*`/`ag_audio_*`/`ag_print*`/`ag_gpio_*`; демо [`asteroids.c`](../apps/cc/examples/asteroids.c), [`fsmem.c`](../apps/cc/examples/fsmem.c), structural DX7 nofx [`dx7nofx.c`](../apps/cc/examples/dx7nofx.c) (гость `CC.AXE`, не host `DX7.AXE`) |
+| Компилятор C → `.AXE` / `.SYS` | `apps/cc/` (`CC.AXE`) | ✅ **Argon CC** (фазы A–E + `.SYS`): `int`/`char`/указатели, **структуры**, **препроцессор**, **FS/mem/dev**, биты/сдвиги; builtins `ag_delay`/`ag_key`/`ag_btn`/`ag_gfx_*`/`ag_audio_*`/`ag_print*`/`ag_gpio_*`/`ag_dev_add`; демо [`asteroids.c`](../apps/cc/examples/asteroids.c), [`fsmem.c`](../apps/cc/examples/fsmem.c), DX7 nofx [`dx7nofx.c`](../apps/cc/examples/dx7nofx.c), guest `.SYS` [`echo.c`](../apps/cc/examples/echo.c) (`#pragma drv` / `ag_driver_init`) |
 | Реестр устройств | `src/dev/device.c` | ✅ классы, владельцы, эксклюзивный доступ, отзыв при извлечении |
 | Устройства как файлы | `src/dev/devfs.c` | ✅ `/dev` — диск `D:`, одна таблица дескрипторов с файлами |
 | Встроенные устройства | `src/dev/devices.c`, `storage.c` | ✅ `null zero con flash0 sd0 fb0`, команда `dev` |
-| Soft display / `gfx` | `src/dev/display.c`, `draw.c`, `font8x16.c` | ✅ RGB565 front+back (640×400), `double_buf`/`swap`, dirty-rect `flush`, ABI **0.9** soft-draw (`pixel`/`line`/`circle`/`poly_*`/`fill_convex`), `gfxdump`, `apps/gfxdemo`; QEMU RGB (`argon run -Gfx`) |
+| Soft display / `gfx` | `src/dev/display.c`, `draw.c`, `font8x16.c` | ✅ RGB565 front+back (640×400), `double_buf`/`swap`, dirty-rect `flush`, soft-draw + ABI **0.16** (`clip`/`stroke_rect`/`fill_round_rect`), `gfxdump`, `apps/gfxdemo`, `GFXFM`; QEMU RGB (`argon run -Gfx`). LVGL — не в ядре: линковать в host-`.AXE` при необходимости ([`06-ideas.md`](06-ideas.md) §3.4) |
 | Soft input / `joy0` | `src/dev/input.c` | ✅ слой pad: PADPUSH → `/dev/joy0` + `inp->pad`/`btn`/`btnp` (ABI 0.11), снимок 6 байт; `H:\sms.pad` — совместимость |
 | Master System `.AXE` | `apps/sms/` (SMS Plus GX, GPLv2+) | ✅ play + `ag_btnp` / PADPUSH; рендер в back-буфер `gfx`; PSG+FM→`/dev/pcm*` или WAV (`ag_fm`); QEMU: `PCMVIRT.SYS` + `pcmplay.py` |
 | Mega Drive `.AXE` | `apps/md/` (gwenesis, GPLv3 + Musashi MIT) | ⚠ play+sound: 68000 + VDP + Z80 + PSG + YM→`ag_fm`; звук в `/dev/pcmnull`/`pcmvirt` или WAV; I2S — будущий `.SYS`. Лицензии — [`apps/md/README.md`](../apps/md/README.md) |
@@ -365,8 +366,20 @@ edit t:\a.c   создать или открыть текстовый файл
 
 ```
 python tools\mkaxe.py --arch xtensa --gcc xtensa-esp32s3-elf-gcc ^
-    --include sdk/include -o build\FM.AXE apps\fm\fm.c apps\fm\fmops.c
+    --include sdk/include --include apps/fm ^
+    -o build\FM.AXE apps\fm\fm.c apps\fm\fmops.c apps\fm\fm_ui_text.c
 argon test -Put 'build\FM.AXE=t:\fm.axe' 'run t:\fm.axe t: c:'
+```
+
+Графический twin (`GFXFM.AXE`, нужен `-Gfx`):
+
+```
+python tools\mkaxe.py --arch xtensa --gcc xtensa-esp32s3-elf-gcc ^
+    --include sdk/include --include apps/fm ^
+    --cflags "-Os -ffunction-sections -fdata-sections -DFM_GFX_BUILD" ^
+    -o build\apps\GFXFM.AXE ^
+    apps\gfxfm\gfxfm_app.c apps\gfxfm\fm_ui_gfx.c ^
+    apps\fm\fm.c apps\fm\fmops.c
 ```
 
 Проверять из скриптов удобно так — клавиши посылаются сырыми байтами с префиксом

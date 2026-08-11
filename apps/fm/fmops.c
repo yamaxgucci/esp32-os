@@ -9,6 +9,7 @@
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
  */
 #include "fm.h"
+#include "fm_ui.h"
 
 #ifdef AG_BUILTIN
 #include <argon/shell.h>
@@ -56,9 +57,9 @@ bool fm_ask(const char *prompt, char *buf, size_t len)
         /* A block where the next character will go, since the real cursor is
          * hidden while the manager owns the screen. */
         if (start + (int)at < FM_COLS - 1) {
-            ag_poke((uint16_t)(start + (int)at), FM_ROW_MESSAGE, '_',
-                    FM_ATTR_CURSOR);
+            fm_ui_poke(start + (int)at, FM_ROW_MESSAGE, '_', FM_ATTR_CURSOR);
         }
+        fm_ui_present();
 
         ag_event_t ev;
         if (!ag_poll_event(&ev, UINT32_MAX)) {
@@ -99,6 +100,7 @@ bool fm_confirm(const char *question)
 
     fm_clear_row(FM_ROW_MESSAGE, FM_ATTR_DIALOG);
     fm_put_clipped(1, FM_ROW_MESSAGE, FM_COLS - 2, line, FM_ATTR_DIALOG);
+    fm_ui_present();
 
     for (;;) {
         ag_event_t ev;
@@ -123,6 +125,7 @@ void fm_pause(const char *note)
     fm_clear_row(FM_ROW_MESSAGE, FM_ATTR_DIALOG);
     fm_put(1, FM_ROW_MESSAGE, (note != NULL) ? note : "Press any key",
            FM_ATTR_DIALOG);
+    fm_ui_present();
 
     for (;;) {
         ag_event_t ev;
@@ -244,6 +247,7 @@ void fm_view(void)
         fm_put(0, FM_ROWS - 1,
                " arrows and PgUp/PgDn scroll, Home/End jump, Esc or F3 returns",
                FM_ATTR_KEYS);
+        fm_ui_present();
 
         ag_event_t ev;
         if (!ag_poll_event(&ev, UINT32_MAX)) {
@@ -281,7 +285,7 @@ void fm_view(void)
 
     ag_free(text);
     ag_free(lines);
-    ag_cls();
+    fm_ui_cls();
 }
 
 /* ---------------------------------------------------------------------- */
@@ -291,14 +295,43 @@ void fm_view(void)
 /*
  * Soft stop while a long copy runs on the shell task (builtin) or as an .AXE.
  * The supervisor already accepted Ctrl+C; this is the cooperative half.
+ *
+ * For an .AXE, Ctrl+C is also queued as AG_EV_QUIT.  That means "cancel the
+ * copy" while we are inside copy_file, not "leave the manager" - so we consume
+ * those events here and clear the interrupt after handling cancel.
  */
 static bool copy_cancelled(void)
 {
+    bool hit = false;
+
 #ifdef AG_BUILTIN
-    return ag_shell_interrupted();
+    if (ag_shell_interrupted()) {
+        hit = true;
+    }
 #else
-    return ag_interrupted();
+    if (ag_interrupted()) {
+        hit = true;
+    }
 #endif
+
+    ag_event_t ev;
+    while (ag_poll_event(&ev, 0)) {
+        if (ev.type == AG_EV_QUIT) {
+            hit = true;
+        }
+    }
+    return hit;
+}
+
+/* After a cancelled copy: do not let a leftover QUIT close the manager. */
+static void absorb_copy_interrupt(void)
+{
+#ifdef AG_BUILTIN
+    ag_shell_clear_interrupted();
+#else
+    (void)ag_interrupted();
+#endif
+    ag_flush_input();
 }
 
 /* Modal progress over the panels: title, bar, percent / KB — no spinner. */
@@ -313,8 +346,7 @@ static void copy_progress(const char *label, uint64_t done, uint64_t total)
     char      title[FM_COLS];
     char      status[FM_COLS];
 
-    ag_fill((uint16_t)x, (uint16_t)y, (uint16_t)w, (uint16_t)h, ' ',
-            FM_ATTR_DIALOG);
+    fm_ui_fill(x, y, w, h, ' ', FM_ATTR_DIALOG);
     fm_frame(x, y, w, h, FM_ATTR_DIALOG);
 
     ag_strlcpy(title, "Copying ", sizeof(title));
@@ -339,18 +371,15 @@ static void copy_progress(const char *label, uint64_t done, uint64_t total)
     {
         const int bar_x = x + 2;
         const int bar_y = y + 3;
-        ag_poke((uint16_t)bar_x, (uint16_t)bar_y, '[', FM_ATTR_DIALOG);
+        fm_ui_poke(bar_x, bar_y, '[', FM_ATTR_DIALOG);
         for (uint32_t i = 0; i < FM_COPY_BAR_W; i++) {
             if (i < filled) {
-                ag_poke((uint16_t)(bar_x + 1 + (int)i), (uint16_t)bar_y, ' ',
-                        FM_ATTR_BAR_FILL);
+                fm_ui_poke(bar_x + 1 + (int)i, bar_y, ' ', FM_ATTR_BAR_FILL);
             } else {
-                ag_poke((uint16_t)(bar_x + 1 + (int)i), (uint16_t)bar_y, '-',
-                        FM_ATTR_DIALOG);
+                fm_ui_poke(bar_x + 1 + (int)i, bar_y, '-', FM_ATTR_DIALOG);
             }
         }
-        ag_poke((uint16_t)(bar_x + 1 + (int)FM_COPY_BAR_W), (uint16_t)bar_y, ']',
-                FM_ATTR_DIALOG);
+        fm_ui_poke(bar_x + 1 + (int)FM_COPY_BAR_W, bar_y, ']', FM_ATTR_DIALOG);
     }
 
     status[0] = '\0';
@@ -374,6 +403,7 @@ static void copy_progress(const char *label, uint64_t done, uint64_t total)
     }
     fm_put_clipped(x + 2, y + 4, inner, status, FM_ATTR_DIALOG);
     fm_put_clipped(x + 2, y + 5, inner, "Ctrl+C to cancel", FM_ATTR_DIALOG);
+    fm_ui_present();
 
     ag_yield();
 }
@@ -512,6 +542,7 @@ void fm_copy(void)
 
     const ag_err_t err = copy_file(from, to, e->name, e->size);
     if (err == -AG_EKILLED) {
+        absorb_copy_interrupt();
         fm_message("cancelled");
     } else if (err != AG_OK) {
         fm_error(e->name, err);
@@ -572,6 +603,7 @@ void fm_move(void)
     }
 
     if (err == -AG_EKILLED) {
+        absorb_copy_interrupt();
         fm_message("cancelled");
     } else if (err != AG_OK) {
         fm_error(e->name, err);
@@ -652,17 +684,13 @@ void fm_run(const fm_entry_t *entry)
     fm_join(fm_active()->path, entry->name, path, sizeof(path));
 
     /*
-     * The screen goes back to an ordinary console for the duration: whatever it
-     * prints, it prints over this, and it has every right to.
+     * Hand the display back for the duration: whatever the child prints, it
+     * prints over an ordinary console, and it has every right to.
      */
-    ag_color(AG_LGRAY, AG_BLACK);
-    ag_cls();
-    ag_cursor(true);
+    fm_ui_end();
 
     const char *argv[1] = {path};
     const int32_t status = ag_exec(path, 1, argv);
-
-    ag_cursor(false);
 
     char note[FM_COLS];
     char number[24];
@@ -686,7 +714,7 @@ void fm_run(const fm_entry_t *entry)
             break;
         }
     }
-    ag_cls();
+    fm_ui_begin();
 }
 
 void fm_help(void)
@@ -721,13 +749,13 @@ void fm_help(void)
      * border to them. */
     const int y = 1;
 
-    ag_fill((uint16_t)x, (uint16_t)y, (uint16_t)w, (uint16_t)h, ' ',
-            FM_ATTR_DIALOG);
+    fm_ui_fill(x, y, w, h, ' ', FM_ATTR_DIALOG);
     fm_frame(x, y, w, h, FM_ATTR_DIALOG);
 
     for (int i = 0; i < lines; i++) {
         fm_put(x + 2, y + 2 + i, k_lines[i], FM_ATTR_DIALOG);
     }
+    fm_ui_present();
 
     fm_pause("Press any key");
 }
