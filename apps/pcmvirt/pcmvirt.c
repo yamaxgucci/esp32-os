@@ -29,6 +29,7 @@ typedef struct {
     int            fmt_set;
     ag_handle_t    listen;
     ag_handle_t    conn;
+    int            hdr_sent; /* 1 = WAV header already on this conn */
 
     uint8_t ring[PCMVIRT_RING_CAP];
     size_t  ring_r;
@@ -213,11 +214,18 @@ static void close_conn(pcmvirt_state_t *st, const char *why)
         (void)ag_net_close(st->conn);
         st->conn = -1;
     }
+    st->hdr_sent = 0;
     /* Pending PCM is undeliverable without a peer. */
     if (st->ring_used > 0u) {
         st->bytes_drop_noclient += (uint64_t)st->ring_used;
         ring_clear(st);
     }
+}
+
+static int fmt_eq(const ag_audio_fmt_t *a, const ag_audio_fmt_t *b)
+{
+    return a != NULL && b != NULL && a->rate == b->rate &&
+           a->channels == b->channels && a->bits == b->bits;
 }
 
 static void ensure_listen(pcmvirt_state_t *st)
@@ -240,11 +248,12 @@ static void ensure_listen(pcmvirt_state_t *st)
 static int send_all_nb_header(ag_handle_t sock, const uint8_t *buf, size_t len)
 {
     size_t left = len;
-    int    spins = 32;
+    int    spins = 200;
 
     while (left > 0 && spins-- > 0) {
         const int32_t n = ag_net_send(sock, buf, left);
         if (n == -AG_EAGAIN) {
+            ag_delay(1);
             continue;
         }
         if (n <= 0) {
@@ -274,6 +283,7 @@ static void try_accept(pcmvirt_state_t *st)
 
     close_conn(st, "replaced by new peer");
     st->conn = peer;
+    st->hdr_sent = 0;
     (void)ag_net_set_nonblock(st->conn, true);
     if (!st->fmt_set) {
         default_fmt(&st->fmt);
@@ -282,7 +292,9 @@ static void try_accept(pcmvirt_state_t *st)
     fill_wav_header(hdr, &st->fmt);
     if (send_all_nb_header(st->conn, hdr, WAV_HDR) != 0) {
         close_conn(st, "wav header send failed");
+        return;
     }
+    st->hdr_sent = 1;
 }
 
 static ag_err_t pcm_open(ag_device_t *dev, uint32_t flags)
@@ -338,9 +350,17 @@ static ag_err_t pcm_ioctl(ag_device_t *dev, uint32_t cmd, void *arg,
         if (!fmt_ok(fmt)) {
             return -AG_EINVAL;
         }
+        /*
+         * Same format as already advertised: keep the host connection.
+         * (Apps always SETFMT on open; dropping the peer here caused
+         * pcmplay "connection closed" right after connect.)
+         */
+        if (st->fmt_set && fmt_eq(&st->fmt, fmt)) {
+            return AG_OK;
+        }
         st->fmt = *fmt;
         st->fmt_set = 1;
-        /* New format → new WAV header on next peer. */
+        /* Real format change → new WAV header on next peer. */
         close_conn(st, "SETFMT");
         return AG_OK;
     }
