@@ -6,23 +6,17 @@ Guest listens on TCP :5560 (QEMU hostfwd).  8-byte LE packets:
   type(1) buttons(1) x(i16) y(i16) wheel(i8) pad(1)
 
 Maps the letterboxed framebuffer inside the QEMU SDL client area onto the
-guest size (default 640×400).  Falls back to the primary monitor if no QEMU
-window is found.
+guest size (default 640×400).
 
-A WH_MOUSE_LL hook swallows **button/wheel only** over that content rect so
-QEMU SDL cannot click-to-grab the host pointer.  WM_MOUSEMOVE is never
-swallowed (that made an invisible wall).  TCP packets are sent only from the
-main loop at --hz — never from the hook (sending in the hook flooded lwIP).
+Anti-grab: a WH_MOUSE_LL hook on a **dedicated thread with a message pump**
+swallows button/wheel over the QEMU client (not WM_MOUSEMOVE).  Installing the
+hook on the sleepy main thread without PeekMessage made the host cursor crawl.
+TCP is sent only from the main loop — never from the hook.
 
-TCP: connect timeout is cleared after connect; sends are non-blocking so a
-slow guest drops packets instead of flapping the session.
-
-Hold Right-Ctrl to pause (and let clicks reach QEMU).  Esc / Ctrl+C quits.
+Hold Right-Ctrl to pause (clicks reach QEMU).  Esc / Ctrl+C quits.
 
 Typical:
 
-  # guest (once):  drv install h:\\\\mousevirt.sys
-  # guest:         run h:\\\\grain.axe pcmvirt
   python tools/mousevirt.py --reconnect
 """
 
@@ -35,6 +29,7 @@ import ctypes.wintypes as wt
 import socket
 import struct
 import sys
+import threading
 import time
 
 VK_ESCAPE = 0x1B
@@ -55,6 +50,7 @@ WM_MOUSEWHEEL = 0x020A
 WM_XBUTTONDOWN = 0x020B
 WM_XBUTTONUP = 0x020C
 WM_MOUSEHWHEEL = 0x020E
+PM_REMOVE = 0x0001
 
 SWALLOW_MSG = frozenset(
     {
@@ -72,7 +68,6 @@ SWALLOW_MSG = frozenset(
 )
 
 WNDENUMPROC = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
-# Hook proc returns LRESULT; use c_ssize_t / pointer-sized types on Win64.
 LowLevelMouseProc = ctypes.WINFUNCTYPE(
     ctypes.c_ssize_t, ctypes.c_int, wt.WPARAM, wt.LPARAM
 )
@@ -101,36 +96,19 @@ class MSLLHOOKSTRUCT(ctypes.Structure):
     ]
 
 
-class GrabState:
-    """Shared hit-test rect for the hook (updated by the main loop)."""
-
-    __slots__ = (
-        "enabled",
-        "paused",
-        "origin_x",
-        "origin_y",
-        "content_x",
-        "content_y",
-        "content_w",
-        "content_h",
-        "hook",
-        "proc",
-    )
-
-    def __init__(self) -> None:
-        self.enabled = False
-        self.paused = False
-        self.origin_x = 0
-        self.origin_y = 0
-        self.content_x = 0
-        self.content_y = 0
-        self.content_w = 0
-        self.content_h = 0
-        self.hook = None
-        self.proc = None
+class MSG(ctypes.Structure):
+    _fields_ = [
+        ("hwnd", wt.HWND),
+        ("message", wt.UINT),
+        ("wParam", wt.WPARAM),
+        ("lParam", wt.LPARAM),
+        ("time", wt.DWORD),
+        ("pt", POINT),
+    ]
 
 
-S = GrabState()
+def hwnd_i(h: object | None) -> int:
+    return int(h) if h else 0
 
 
 def _bind_user32() -> ctypes.WinDLL:
@@ -155,6 +133,12 @@ def _bind_user32() -> ctypes.WinDLL:
     user32.GetForegroundWindow.restype = wt.HWND
     user32.GetSystemMetrics.argtypes = (ctypes.c_int,)
     user32.GetSystemMetrics.restype = ctypes.c_int
+    user32.WindowFromPoint.argtypes = (POINT,)
+    user32.WindowFromPoint.restype = wt.HWND
+    user32.GetAncestor.argtypes = (wt.HWND, ctypes.c_uint)
+    user32.GetAncestor.restype = wt.HWND
+    user32.ClipCursor.argtypes = (ctypes.POINTER(RECT),)
+    user32.ClipCursor.restype = wt.BOOL
     user32.SetWindowsHookExW.argtypes = (
         ctypes.c_int,
         LowLevelMouseProc,
@@ -171,6 +155,20 @@ def _bind_user32() -> ctypes.WinDLL:
     user32.CallNextHookEx.restype = ctypes.c_ssize_t
     user32.UnhookWindowsHookEx.argtypes = (wt.HHOOK,)
     user32.UnhookWindowsHookEx.restype = wt.BOOL
+    user32.PeekMessageW.argtypes = (
+        ctypes.POINTER(MSG),
+        wt.HWND,
+        wt.UINT,
+        wt.UINT,
+        wt.UINT,
+    )
+    user32.PeekMessageW.restype = wt.BOOL
+    user32.TranslateMessage.argtypes = (ctypes.POINTER(MSG),)
+    user32.TranslateMessage.restype = wt.BOOL
+    user32.DispatchMessageW.argtypes = (ctypes.POINTER(MSG),)
+    user32.DispatchMessageW.restype = ctypes.c_ssize_t
+    user32.PostThreadMessageW.argtypes = (wt.DWORD, wt.UINT, wt.WPARAM, wt.LPARAM)
+    user32.PostThreadMessageW.restype = wt.BOOL
     try:
         user32.SetProcessDPIAware.argtypes = ()
         user32.SetProcessDPIAware.restype = wt.BOOL
@@ -181,10 +179,113 @@ def _bind_user32() -> ctypes.WinDLL:
 
 
 USER32 = _bind_user32()
+GA_ROOT = 2
+WM_QUIT = 0x0012
 
 
-def hwnd_i(h: object | None) -> int:
-    return int(h) if h else 0
+class AntiGrab:
+    """WH_MOUSE_LL on its own pumped thread (required or the cursor crawls)."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._paused = False
+        self._qemu_hwnd = 0
+        self._client = (0, 0, 0, 0)  # screen x,y,w,h of full client
+        self._hook = None
+        self._proc = None
+        self._thread: threading.Thread | None = None
+        self._tid = 0
+        self._ready = threading.Event()
+        self._stop = threading.Event()
+        self._error: str | None = None
+
+    def set_paused(self, paused: bool) -> None:
+        with self._lock:
+            self._paused = paused
+
+    def set_target(self, qemu_hwnd: int, client: tuple[int, int, int, int] | None) -> None:
+        with self._lock:
+            self._qemu_hwnd = qemu_hwnd
+            self._client = client if client is not None else (0, 0, 0, 0)
+
+    def _hit(self, x: int, y: int) -> bool:
+        with self._lock:
+            if self._paused:
+                return False
+            hwnd = self._qemu_hwnd
+            cx, cy, cw, ch = self._client
+        if hwnd and cw > 0 and ch > 0:
+            if cx <= x < cx + cw and cy <= y < cy + ch:
+                return True
+        # Fallback: any HWND under the cursor belonging to the QEMU top-level.
+        if hwnd:
+            pt = POINT(x, y)
+            under = hwnd_i(USER32.WindowFromPoint(pt))
+            if under:
+                root = hwnd_i(USER32.GetAncestor(under, GA_ROOT))
+                if root == hwnd or under == hwnd:
+                    return True
+        return False
+
+    def _hook_proc(self, n_code: int, w_param: int, l_param: int) -> int:
+        if n_code >= 0:
+            msg = int(w_param)
+            if msg != WM_MOUSEMOVE and msg in SWALLOW_MSG:
+                info = ctypes.cast(
+                    l_param, ctypes.POINTER(MSLLHOOKSTRUCT)
+                ).contents
+                if self._hit(int(info.pt.x), int(info.pt.y)):
+                    return 1
+        return int(USER32.CallNextHookEx(self._hook, n_code, w_param, l_param))
+
+    def _thread_main(self) -> None:
+        # Hook MUST be installed on this thread, which then pumps messages.
+        self._tid = threading.get_native_id()
+        self._proc = LowLevelMouseProc(self._hook_proc)
+        self._hook = USER32.SetWindowsHookExW(WH_MOUSE_LL, self._proc, None, 0)
+        if not self._hook:
+            self._error = f"SetWindowsHookExW failed: {ctypes.get_last_error()}"
+            self._ready.set()
+            return
+        self._ready.set()
+        msg = MSG()
+        while not self._stop.is_set():
+            while USER32.PeekMessageW(ctypes.byref(msg), None, 0, 0, PM_REMOVE):
+                if msg.message == WM_QUIT:
+                    self._stop.set()
+                    break
+                USER32.TranslateMessage(ctypes.byref(msg))
+                USER32.DispatchMessageW(ctypes.byref(msg))
+            time.sleep(0.001)
+        if self._hook:
+            USER32.UnhookWindowsHookEx(self._hook)
+            self._hook = None
+        self._proc = None
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._stop.clear()
+        self._ready.clear()
+        self._thread = threading.Thread(
+            target=self._thread_main, name="mousevirt-hook", daemon=True
+        )
+        self._thread.start()
+        if not self._ready.wait(timeout=3.0):
+            raise OSError("anti-grab hook thread did not start")
+        if self._error:
+            raise OSError(self._error)
+
+    def stop(self) -> None:
+        self._stop.set()
+        tid = self._tid
+        if tid:
+            USER32.PostThreadMessageW(tid, WM_QUIT, 0, 0)
+        t = self._thread
+        if t is not None:
+            t.join(timeout=2.0)
+        self._thread = None
+        self._tid = 0
 
 
 def pack_pkt(typ: int, buttons: int, x: int, y: int, wheel: int = 0) -> bytes:
@@ -195,8 +296,6 @@ def pack_pkt(typ: int, buttons: int, x: int, y: int, wheel: int = 0) -> bytes:
 
 def connect(host: str, port: int, timeout: float) -> socket.socket:
     s = socket.create_connection((host, port), timeout=timeout)
-    # create_connection leaves timeout on the socket; that made send raise
-    # under QEMU backlog and flap connected/disconnected while moving.
     s.settimeout(None)
     s.setblocking(False)
     s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -204,7 +303,6 @@ def connect(host: str, port: int, timeout: float) -> socket.socket:
 
 
 def find_qemu_hwnd(user32: ctypes.WinDLL) -> int:
-    """First visible top-level window whose title mentions QEMU / ArgonOS."""
     found = wt.HWND(0)
     holders: list[object] = []
 
@@ -289,63 +387,23 @@ def map_to_guest(
     return gx, gy, inside
 
 
-def _point_in_content(x: int, y: int) -> bool:
-    if S.content_w < 1 or S.content_h < 1:
-        return False
-    left = S.origin_x + S.content_x
-    top = S.origin_y + S.content_y
-    return left <= x < left + S.content_w and top <= y < top + S.content_h
-
-
-def _hook_proc(n_code: int, w_param: int, l_param: int) -> int:
-    if n_code >= 0 and S.enabled and not S.paused:
-        msg = int(w_param)
-        # Never swallow MOVE — only buttons/wheel so SDL cannot grab.
-        if msg != WM_MOUSEMOVE and msg in SWALLOW_MSG:
-            info = ctypes.cast(l_param, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
-            if _point_in_content(int(info.pt.x), int(info.pt.y)):
-                return 1
-    return int(USER32.CallNextHookEx(S.hook, n_code, w_param, l_param))
-
-
-def install_hook() -> None:
-    if S.hook:
-        return
-    # WH_MOUSE_LL: hMod must be NULL when the proc lives in this process.
-    S.proc = LowLevelMouseProc(_hook_proc)
-    S.hook = USER32.SetWindowsHookExW(WH_MOUSE_LL, S.proc, None, 0)
-    if not S.hook:
-        err = ctypes.get_last_error()
-        raise OSError(f"SetWindowsHookExW(WH_MOUSE_LL) failed: {err}")
-    S.enabled = True
-    atexit.register(uninstall_hook)
-
-
-def uninstall_hook() -> None:
-    S.enabled = False
-    if S.hook:
-        USER32.UnhookWindowsHookEx(S.hook)
-        S.hook = None
-    S.proc = None
-
-
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=5560)
-    ap.add_argument("--width", type=int, default=640, help="guest FB width")
-    ap.add_argument("--height", type=int, default=400, help="guest FB height")
+    ap.add_argument("--width", type=int, default=640)
+    ap.add_argument("--height", type=int, default=400)
     ap.add_argument("--reconnect", action="store_true")
     ap.add_argument("--hz", type=float, default=60.0)
     ap.add_argument(
         "--fullscreen-map",
         action="store_true",
-        help="map primary monitor instead of QEMU client area",
+        help="map primary monitor; disables anti-grab filter",
     )
     ap.add_argument(
         "--no-grab-filter",
         action="store_true",
-        help="do not install WH_MOUSE_LL (QEMU will grab on click)",
+        help="do not install WH_MOUSE_LL",
     )
     args = ap.parse_args()
 
@@ -371,6 +429,7 @@ def main() -> int:
     last_find = 0.0
     map_mode = "monitor"
     warned_no_qemu = False
+    anti: AntiGrab | None = None
 
     print(
         f"mousevirt → {args.host}:{args.port}  guest {args.width}x{args.height}  "
@@ -386,9 +445,11 @@ def main() -> int:
 
     try:
         if not args.no_grab_filter and not args.fullscreen_map:
-            install_hook()
+            anti = AntiGrab()
+            anti.start()
+            atexit.register(anti.stop)
             print(
-                "anti-grab: swallowing button/wheel over QEMU (not move)",
+                "anti-grab: pumped WH_MOUSE_LL (buttons/wheel over QEMU client)",
                 flush=True,
             )
 
@@ -409,13 +470,18 @@ def main() -> int:
                 break
 
             paused = bool(user32.GetAsyncKeyState(VK_RCONTROL) & 0x8000)
-            S.paused = paused
+            if anti is not None:
+                anti.set_paused(paused)
 
             if not paused:
+                # If SDL already grabbed, drop any ClipCursor confinement.
+                user32.ClipCursor(None)
+
                 origin_x, origin_y = 0, 0
                 content_x, content_y = 0, 0
                 content_w, content_h = sw, sh
                 require_inside = False
+                client: tuple[int, int, int, int] | None = None
 
                 if not args.fullscreen_map:
                     now = time.monotonic()
@@ -424,8 +490,7 @@ def main() -> int:
                         last_find = now
                         if qemu_hwnd == 0 and not warned_no_qemu:
                             print(
-                                "QEMU window not found — mapping primary monitor "
-                                "(start QEMU with a title containing 'qemu')",
+                                "QEMU window not found — mapping primary monitor",
                                 flush=True,
                             )
                             warned_no_qemu = True
@@ -441,19 +506,15 @@ def main() -> int:
                         else None
                     )
                     if cr is not None:
+                        client = cr
                         origin_x, origin_y, cw, ch = cr
                         content_x, content_y, content_w, content_h = letterbox(
                             cw, ch, args.width, args.height
                         )
                         require_inside = True
 
-                # Publish hit-test for the hook (main thread only writes).
-                S.origin_x = origin_x
-                S.origin_y = origin_y
-                S.content_x = content_x
-                S.content_y = content_y
-                S.content_w = content_w
-                S.content_h = content_h
+                if anti is not None:
+                    anti.set_target(qemu_hwnd, client)
 
                 pt = POINT()
                 if not user32.GetCursorPos(ctypes.byref(pt)):
@@ -510,7 +571,9 @@ def main() -> int:
         print("\nquit", flush=True)
         return 0
     finally:
-        uninstall_hook()
+        if anti is not None:
+            anti.stop()
+        user32.ClipCursor(None)
         if sock is not None:
             try:
                 sock.close()
