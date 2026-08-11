@@ -7,12 +7,17 @@ Guest listens on TCP :5560 (QEMU hostfwd).  8-byte LE packets:
 
 Maps the letterboxed framebuffer inside the QEMU SDL client area onto the
 guest size (default 640×400).  Falls back to the primary monitor if no QEMU
-window is found.  No WH_MOUSE hooks (those caused Win64 / grab regressions).
+window is found.
+
+A WH_MOUSE_LL hook swallows **button/wheel only** over that content rect so
+QEMU SDL cannot click-to-grab the host pointer.  WM_MOUSEMOVE is never
+swallowed (that made an invisible wall).  TCP packets are sent only from the
+main loop at --hz — never from the hook (sending in the hook flooded lwIP).
 
 TCP: connect timeout is cleared after connect; sends are non-blocking so a
 slow guest drops packets instead of flapping the session.
 
-Hold Right-Ctrl to pause.  Esc in this console quits.
+Hold Right-Ctrl to pause (and let clicks reach QEMU).  Esc / Ctrl+C quits.
 
 Typical:
 
@@ -24,6 +29,7 @@ Typical:
 from __future__ import annotations
 
 import argparse
+import atexit
 import ctypes
 import ctypes.wintypes as wt
 import socket
@@ -37,7 +43,39 @@ VK_MBUTTON = 0x04
 VK_LBUTTON = 0x01
 VK_RCONTROL = 0xA3
 
+WH_MOUSE_LL = 14
+WM_MOUSEMOVE = 0x0200
+WM_LBUTTONDOWN = 0x0201
+WM_LBUTTONUP = 0x0202
+WM_RBUTTONDOWN = 0x0204
+WM_RBUTTONUP = 0x0205
+WM_MBUTTONDOWN = 0x0207
+WM_MBUTTONUP = 0x0208
+WM_MOUSEWHEEL = 0x020A
+WM_XBUTTONDOWN = 0x020B
+WM_XBUTTONUP = 0x020C
+WM_MOUSEHWHEEL = 0x020E
+
+SWALLOW_MSG = frozenset(
+    {
+        WM_LBUTTONDOWN,
+        WM_LBUTTONUP,
+        WM_RBUTTONDOWN,
+        WM_RBUTTONUP,
+        WM_MBUTTONDOWN,
+        WM_MBUTTONUP,
+        WM_XBUTTONDOWN,
+        WM_XBUTTONUP,
+        WM_MOUSEWHEEL,
+        WM_MOUSEHWHEEL,
+    }
+)
+
 WNDENUMPROC = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
+# Hook proc returns LRESULT; use c_ssize_t / pointer-sized types on Win64.
+LowLevelMouseProc = ctypes.WINFUNCTYPE(
+    ctypes.c_ssize_t, ctypes.c_int, wt.WPARAM, wt.LPARAM
+)
 
 
 class POINT(ctypes.Structure):
@@ -51,6 +89,48 @@ class RECT(ctypes.Structure):
         ("right", ctypes.c_long),
         ("bottom", ctypes.c_long),
     ]
+
+
+class MSLLHOOKSTRUCT(ctypes.Structure):
+    _fields_ = [
+        ("pt", POINT),
+        ("mouseData", wt.DWORD),
+        ("flags", wt.DWORD),
+        ("time", wt.DWORD),
+        ("dwExtraInfo", ctypes.c_ulonglong),
+    ]
+
+
+class GrabState:
+    """Shared hit-test rect for the hook (updated by the main loop)."""
+
+    __slots__ = (
+        "enabled",
+        "paused",
+        "origin_x",
+        "origin_y",
+        "content_x",
+        "content_y",
+        "content_w",
+        "content_h",
+        "hook",
+        "proc",
+    )
+
+    def __init__(self) -> None:
+        self.enabled = False
+        self.paused = False
+        self.origin_x = 0
+        self.origin_y = 0
+        self.content_x = 0
+        self.content_y = 0
+        self.content_w = 0
+        self.content_h = 0
+        self.hook = None
+        self.proc = None
+
+
+S = GrabState()
 
 
 def _bind_user32() -> ctypes.WinDLL:
@@ -75,6 +155,22 @@ def _bind_user32() -> ctypes.WinDLL:
     user32.GetForegroundWindow.restype = wt.HWND
     user32.GetSystemMetrics.argtypes = (ctypes.c_int,)
     user32.GetSystemMetrics.restype = ctypes.c_int
+    user32.SetWindowsHookExW.argtypes = (
+        ctypes.c_int,
+        LowLevelMouseProc,
+        wt.HINSTANCE,
+        wt.DWORD,
+    )
+    user32.SetWindowsHookExW.restype = wt.HHOOK
+    user32.CallNextHookEx.argtypes = (
+        wt.HHOOK,
+        ctypes.c_int,
+        wt.WPARAM,
+        wt.LPARAM,
+    )
+    user32.CallNextHookEx.restype = ctypes.c_ssize_t
+    user32.UnhookWindowsHookEx.argtypes = (wt.HHOOK,)
+    user32.UnhookWindowsHookEx.restype = wt.BOOL
     try:
         user32.SetProcessDPIAware.argtypes = ()
         user32.SetProcessDPIAware.restype = wt.BOOL
@@ -82,6 +178,13 @@ def _bind_user32() -> ctypes.WinDLL:
     except AttributeError:
         pass
     return user32
+
+
+USER32 = _bind_user32()
+
+
+def hwnd_i(h: object | None) -> int:
+    return int(h) if h else 0
 
 
 def pack_pkt(typ: int, buttons: int, x: int, y: int, wheel: int = 0) -> bytes:
@@ -103,7 +206,6 @@ def connect(host: str, port: int, timeout: float) -> socket.socket:
 def find_qemu_hwnd(user32: ctypes.WinDLL) -> int:
     """First visible top-level window whose title mentions QEMU / ArgonOS."""
     found = wt.HWND(0)
-    # Keep the callback alive for the duration of EnumWindows.
     holders: list[object] = []
 
     def _enum(hwnd: int, _lparam: int) -> bool:
@@ -121,13 +223,12 @@ def find_qemu_hwnd(user32: ctypes.WinDLL) -> int:
     cb = WNDENUMPROC(_enum)
     holders.append(cb)
     user32.EnumWindows(cb, 0)
-    return int(found.value) if found.value else 0
+    return hwnd_i(found.value)
 
 
 def client_screen_rect(
     user32: ctypes.WinDLL, hwnd: int
 ) -> tuple[int, int, int, int] | None:
-    """(screen_x, screen_y, width, height) of hwnd client area, or None."""
     if not hwnd or not user32.IsWindow(hwnd):
         return None
     rc = RECT()
@@ -146,7 +247,6 @@ def client_screen_rect(
 def letterbox(
     client_w: int, client_h: int, guest_w: int, guest_h: int
 ) -> tuple[int, int, int, int]:
-    """Content rect (ox, oy, cw, ch) inside client that preserves guest aspect."""
     if client_w < 1 or client_h < 1 or guest_w < 1 or guest_h < 1:
         return 0, 0, max(client_w, 1), max(client_h, 1)
     scale = min(client_w / guest_w, client_h / guest_h)
@@ -169,7 +269,6 @@ def map_to_guest(
     guest_w: int,
     guest_h: int,
 ) -> tuple[int, int, bool]:
-    """Return (gx, gy, inside).  gx/gy clamped when outside."""
     rel_x = screen_x - origin_x - content_x
     rel_y = screen_y - origin_y - content_y
     inside = 0 <= rel_x < content_w and 0 <= rel_y < content_h
@@ -190,6 +289,46 @@ def map_to_guest(
     return gx, gy, inside
 
 
+def _point_in_content(x: int, y: int) -> bool:
+    if S.content_w < 1 or S.content_h < 1:
+        return False
+    left = S.origin_x + S.content_x
+    top = S.origin_y + S.content_y
+    return left <= x < left + S.content_w and top <= y < top + S.content_h
+
+
+def _hook_proc(n_code: int, w_param: int, l_param: int) -> int:
+    if n_code >= 0 and S.enabled and not S.paused:
+        msg = int(w_param)
+        # Never swallow MOVE — only buttons/wheel so SDL cannot grab.
+        if msg != WM_MOUSEMOVE and msg in SWALLOW_MSG:
+            info = ctypes.cast(l_param, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
+            if _point_in_content(int(info.pt.x), int(info.pt.y)):
+                return 1
+    return int(USER32.CallNextHookEx(S.hook, n_code, w_param, l_param))
+
+
+def install_hook() -> None:
+    if S.hook:
+        return
+    # WH_MOUSE_LL: hMod must be NULL when the proc lives in this process.
+    S.proc = LowLevelMouseProc(_hook_proc)
+    S.hook = USER32.SetWindowsHookExW(WH_MOUSE_LL, S.proc, None, 0)
+    if not S.hook:
+        err = ctypes.get_last_error()
+        raise OSError(f"SetWindowsHookExW(WH_MOUSE_LL) failed: {err}")
+    S.enabled = True
+    atexit.register(uninstall_hook)
+
+
+def uninstall_hook() -> None:
+    S.enabled = False
+    if S.hook:
+        USER32.UnhookWindowsHookEx(S.hook)
+        S.hook = None
+    S.proc = None
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--host", default="127.0.0.1")
@@ -203,9 +342,14 @@ def main() -> int:
         action="store_true",
         help="map primary monitor instead of QEMU client area",
     )
+    ap.add_argument(
+        "--no-grab-filter",
+        action="store_true",
+        help="do not install WH_MOUSE_LL (QEMU will grab on click)",
+    )
     args = ap.parse_args()
 
-    user32 = _bind_user32()
+    user32 = USER32
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32.GetConsoleWindow.argtypes = ()
     kernel32.GetConsoleWindow.restype = wt.HWND
@@ -230,13 +374,9 @@ def main() -> int:
 
     print(
         f"mousevirt → {args.host}:{args.port}  guest {args.width}x{args.height}  "
-        f"(RCtrl=pause, Esc=quit)",
+        f"(RCtrl=pause, Esc/Ctrl+C=quit)",
         flush=True,
     )
-
-    def hwnd_i(h: object | None) -> int:
-        # Win32 NULL HWND often arrives as None from ctypes.
-        return int(h) if h else 0
 
     def console_focused() -> bool:
         cons = hwnd_i(hwnd_console)
@@ -244,113 +384,138 @@ def main() -> int:
             return True
         return hwnd_i(user32.GetForegroundWindow()) == cons
 
-    while True:
-        if sock is None:
-            try:
-                sock = connect(args.host, args.port, 2.0)
-                print("connected", flush=True)
-            except OSError as e:
-                if not args.reconnect:
-                    print(f"connect failed: {e}", file=sys.stderr)
-                    return 1
-                time.sleep(0.5)
-                continue
-
-        if console_focused() and (user32.GetAsyncKeyState(VK_ESCAPE) & 0x8000):
-            print("quit", flush=True)
-            break
-
-        paused = bool(user32.GetAsyncKeyState(VK_RCONTROL) & 0x8000)
-        if not paused:
-            origin_x, origin_y = 0, 0
-            content_x, content_y = 0, 0
-            content_w, content_h = sw, sh
-            require_inside = False
-
-            if not args.fullscreen_map:
-                now = time.monotonic()
-                if qemu_hwnd == 0 or (now - last_find) >= 2.0:
-                    qemu_hwnd = find_qemu_hwnd(user32)
-                    last_find = now
-                    if qemu_hwnd == 0 and not warned_no_qemu:
-                        print(
-                            "QEMU window not found — mapping primary monitor "
-                            "(start QEMU with a title containing 'qemu')",
-                            flush=True,
-                        )
-                        warned_no_qemu = True
-                        map_mode = "monitor"
-                    elif qemu_hwnd != 0 and map_mode != "qemu":
-                        print("mapping QEMU client (letterboxed)", flush=True)
-                        map_mode = "qemu"
-                        warned_no_qemu = False
-
-                cr = client_screen_rect(user32, qemu_hwnd) if qemu_hwnd else None
-                if cr is not None:
-                    origin_x, origin_y, cw, ch = cr
-                    content_x, content_y, content_w, content_h = letterbox(
-                        cw, ch, args.width, args.height
-                    )
-                    require_inside = True
-
-            pt = POINT()
-            if not user32.GetCursorPos(ctypes.byref(pt)):
-                time.sleep(period)
-                continue
-
-            gx, gy, inside = map_to_guest(
-                int(pt.x),
-                int(pt.y),
-                origin_x,
-                origin_y,
-                content_x,
-                content_y,
-                content_w,
-                content_h,
-                args.width,
-                args.height,
+    try:
+        if not args.no_grab_filter and not args.fullscreen_map:
+            install_hook()
+            print(
+                "anti-grab: swallowing button/wheel over QEMU (not move)",
+                flush=True,
             )
-            if require_inside and not inside:
-                time.sleep(period)
-                continue
 
-            buttons = 0
-            if user32.GetAsyncKeyState(VK_LBUTTON) & 0x8000:
-                buttons |= 1
-            if user32.GetAsyncKeyState(VK_RBUTTON) & 0x8000:
-                buttons |= 2
-            if user32.GetAsyncKeyState(VK_MBUTTON) & 0x8000:
-                buttons |= 4
-
-            if gx != prev_x or gy != prev_y or buttons != prev_btn:
-                pkt = pack_pkt(1, buttons, gx, gy, 0)
+        while True:
+            if sock is None:
                 try:
-                    n = sock.send(pkt)
-                    if n == len(pkt):
-                        prev_x, prev_y, prev_btn = gx, gy, buttons
-                except BlockingIOError:
-                    pass
+                    sock = connect(args.host, args.port, 2.0)
+                    print("connected", flush=True)
                 except OSError as e:
-                    print(f"disconnected: {e}", flush=True)
-                    try:
-                        sock.close()
-                    except OSError:
-                        pass
-                    sock = None
                     if not args.reconnect:
+                        print(f"connect failed: {e}", file=sys.stderr)
                         return 1
-                    # Let the guest notice EOF before we SYN again (avoids
-                    # connect→RST while a zombie fd still owns the slot).
-                    time.sleep(0.75)
+                    time.sleep(0.5)
                     continue
 
-        time.sleep(period)
+            if console_focused() and (user32.GetAsyncKeyState(VK_ESCAPE) & 0x8000):
+                print("quit", flush=True)
+                break
 
-    if sock is not None:
-        try:
-            sock.close()
-        except OSError:
-            pass
+            paused = bool(user32.GetAsyncKeyState(VK_RCONTROL) & 0x8000)
+            S.paused = paused
+
+            if not paused:
+                origin_x, origin_y = 0, 0
+                content_x, content_y = 0, 0
+                content_w, content_h = sw, sh
+                require_inside = False
+
+                if not args.fullscreen_map:
+                    now = time.monotonic()
+                    if qemu_hwnd == 0 or (now - last_find) >= 2.0:
+                        qemu_hwnd = find_qemu_hwnd(user32)
+                        last_find = now
+                        if qemu_hwnd == 0 and not warned_no_qemu:
+                            print(
+                                "QEMU window not found — mapping primary monitor "
+                                "(start QEMU with a title containing 'qemu')",
+                                flush=True,
+                            )
+                            warned_no_qemu = True
+                            map_mode = "monitor"
+                        elif qemu_hwnd != 0 and map_mode != "qemu":
+                            print("mapping QEMU client (letterboxed)", flush=True)
+                            map_mode = "qemu"
+                            warned_no_qemu = False
+
+                    cr = (
+                        client_screen_rect(user32, qemu_hwnd)
+                        if qemu_hwnd
+                        else None
+                    )
+                    if cr is not None:
+                        origin_x, origin_y, cw, ch = cr
+                        content_x, content_y, content_w, content_h = letterbox(
+                            cw, ch, args.width, args.height
+                        )
+                        require_inside = True
+
+                # Publish hit-test for the hook (main thread only writes).
+                S.origin_x = origin_x
+                S.origin_y = origin_y
+                S.content_x = content_x
+                S.content_y = content_y
+                S.content_w = content_w
+                S.content_h = content_h
+
+                pt = POINT()
+                if not user32.GetCursorPos(ctypes.byref(pt)):
+                    time.sleep(period)
+                    continue
+
+                gx, gy, inside = map_to_guest(
+                    int(pt.x),
+                    int(pt.y),
+                    origin_x,
+                    origin_y,
+                    content_x,
+                    content_y,
+                    content_w,
+                    content_h,
+                    args.width,
+                    args.height,
+                )
+                if require_inside and not inside:
+                    time.sleep(period)
+                    continue
+
+                buttons = 0
+                if user32.GetAsyncKeyState(VK_LBUTTON) & 0x8000:
+                    buttons |= 1
+                if user32.GetAsyncKeyState(VK_RBUTTON) & 0x8000:
+                    buttons |= 2
+                if user32.GetAsyncKeyState(VK_MBUTTON) & 0x8000:
+                    buttons |= 4
+
+                if gx != prev_x or gy != prev_y or buttons != prev_btn:
+                    pkt = pack_pkt(1, buttons, gx, gy, 0)
+                    try:
+                        n = sock.send(pkt)
+                        if n == len(pkt):
+                            prev_x, prev_y, prev_btn = gx, gy, buttons
+                    except BlockingIOError:
+                        pass
+                    except OSError as e:
+                        print(f"disconnected: {e}", flush=True)
+                        try:
+                            sock.close()
+                        except OSError:
+                            pass
+                        sock = None
+                        if not args.reconnect:
+                            return 1
+                        time.sleep(0.75)
+                        continue
+
+            time.sleep(period)
+
+    except KeyboardInterrupt:
+        print("\nquit", flush=True)
+        return 0
+    finally:
+        uninstall_hook()
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
     return 0
 
 
