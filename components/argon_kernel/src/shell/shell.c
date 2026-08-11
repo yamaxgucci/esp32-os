@@ -989,15 +989,11 @@ static int cmd_drv_install(int argc, char **argv)
     }
 
     err = ag_module_load(dst_abs, NULL);
-    if (err == -AG_EEXIST) {
-        ag_console_printf("installed %s (already loaded)\n", dos_path);
-        return 0;
-    }
     if (err != AG_OK) {
         print_load_error(dst_abs, err);
         return 1;
     }
-    ag_console_printf("installed %s (autoload on boot)\n", dos_path);
+    ag_console_printf("installed %s (loaded; autoload on boot)\n", dos_path);
     return 0;
 }
 
