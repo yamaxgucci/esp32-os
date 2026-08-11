@@ -16,10 +16,13 @@
 
 #include "core/sysconfig.h"
 
+typedef void (*ag_module_fini_fn)(void);
+
 typedef struct {
-    bool            used;
-    char            path[AG_PATH_MAX];
-    ag_loaded_app_t app;
+    bool             used;
+    char             path[AG_PATH_MAX];
+    ag_loaded_app_t  app;
+    ag_module_fini_fn fini;
 } module_t;
 
 static module_t               s_modules[AG_MODULE_MAX];
@@ -29,6 +32,16 @@ static const ag_probe_hint_t *s_hint;
 const void *ag_module_loading(void) { return s_loading; }
 
 const ag_probe_hint_t *ag_module_probe_hint(void) { return s_hint; }
+
+void ag_module_on_unload(void (*fn)(void))
+{
+    if (s_loading == NULL) {
+        ag_log(AG_LOG_WARN, "modules",
+               "ag_module_on_unload outside ag_driver_init — ignored");
+        return;
+    }
+    s_loading->fini = fn;
+}
 
 static void set_string_path(char *dst, size_t dst_len, const char *src)
 {
@@ -75,6 +88,12 @@ static void drop_module(module_t *m)
 {
     if (m == NULL || !m->used) {
         return;
+    }
+    /* While the image is still mapped: close net listens etc. */
+    if (m->fini != NULL) {
+        ag_module_fini_fn fini = m->fini;
+        m->fini = NULL;
+        fini();
     }
     (void)ag_dev_revoke_owner(m);
     ag_loader_unload(&m->app);

@@ -15,7 +15,7 @@
 #include <argon/argon.h>
 #include <argon/libc.h>
 
-AG_DRV("MOUSEVIRT", "1.3", "argon");
+AG_DRV("MOUSEVIRT", "1.4", "argon");
 
 #define MOUSEVIRT_PORT 5560u
 #define PKT_SIZE       8u
@@ -300,6 +300,19 @@ static const ag_dev_ops_t k_ops = {
     .ioctl = mouse_ioctl,
 };
 
+static void mouse_fini(void)
+{
+    if (s_st.conn >= 0) {
+        (void)ag_net_close(s_st.conn);
+        s_st.conn = -1;
+    }
+    if (s_st.listen >= 0) {
+        (void)ag_net_close(s_st.listen);
+        s_st.listen = -1;
+        ag_log(AG_LOG_INFO, "mousevirt", "fini: listen closed");
+    }
+}
+
 ag_err_t ag_driver_init(void)
 {
     if (!AG_HAS(ag_api()->dev, add)) {
@@ -313,6 +326,7 @@ ag_err_t ag_driver_init(void)
     memset(&s_st, 0, sizeof(s_st));
     s_st.listen = -1;
     s_st.conn = -1;
+    ag_module_on_unload(mouse_fini);
 
     {
         const ag_dev_add_t desc = {

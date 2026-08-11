@@ -57,9 +57,10 @@ extern "C" {
  *      (RGB565 chroma blit; CC-friendly ≤6-arg path).
  * 0.18 appended inp->inject: push ag_event_t into the console/input queue
  *      (MOUSEVIRT /dev/mouse0 → POINTER_* for gfx apps).
+ * 0.19 appended sys->module_on_unload so .SYS can close TCP listens on reload.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 18u
+#define AG_ABI_MINOR 19u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -162,6 +163,12 @@ typedef struct ag_sys_api {
 
     /* Tell the supervisor the process is alive (per-process watchdog). */
     void (*heartbeat)(void);
+
+    /*
+     * ABI 0.19: during ag_driver_init only — register teardown (close listen
+     * sockets, etc.) before the image is unmapped on drv unload/replace.
+     */
+    void (*module_on_unload)(void (*fn)(void));
 } ag_sys_api_t;
 
 /* ------------------------------------------------------------------------ */

@@ -25,7 +25,8 @@
 #include "lwip/sockets.h"
 #include "nvs_flash.h"
 
-#define AG_NET_MAX_SOCK 8
+/* 3 virt drivers × (listen+conn) plus brief replace peaks and reload slack. */
+#define AG_NET_MAX_SOCK 16
 #define AG_NET_HANDLE_BASE 0x71000000
 
 static esp_netif_t                   *s_netif;

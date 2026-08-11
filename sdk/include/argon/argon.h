@@ -100,6 +100,14 @@ static inline const char *ag_strerror(ag_err_t e)
 }
 static inline void ag_heartbeat(void) { g_ag_api->sys->heartbeat(); }
 
+/* ABI 0.19: register .SYS teardown during ag_driver_init (close TCP, etc.). */
+static inline void ag_module_on_unload(void (*fn)(void))
+{
+    if (AG_HAS(g_ag_api->sys, module_on_unload)) {
+        g_ag_api->sys->module_on_unload(fn);
+    }
+}
+
 #define ag_log(lvl, tag, ...) (g_ag_api->sys->log((lvl), (tag), __VA_ARGS__))
 
 /* ---- memory ------------------------------------------------------------- */
