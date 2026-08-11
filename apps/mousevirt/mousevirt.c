@@ -1,10 +1,10 @@
 /*
  * ArgonOS - virtual mouse (.SYS): TCP :5560 → POINTER_* via inp->inject.
  *
- * Host tools/mousevirt.py sends 8-byte packets; the driver injects
- * AG_EV_POINTER_MOVE/DOWN/UP/WHEEL into the console event queue so gfx apps
- * see them through ag_poll_event.  Also publishes /dev/mouse0 for optional
- * non-blocking read of the same packed events.
+ * Pump on open/read only (same as MIDIVIRT).  No resident thread: a 4 KB
+ * FreeRTOS stack at drv install stole internal DRAM and made GRAIN fail
+ * with "no memory for a 12288 byte stack".  Apps that want mouse must
+ * open /dev/mouse0 and read() each frame (GRAIN does).
  *
  *   python tools/mkaxe.py --arch xtensa --gcc xtensa-esp32s3-elf-gcc \
  *       --include sdk/include -o build\apps\MOUSEVIRT.SYS apps/mousevirt/mousevirt.c
@@ -15,7 +15,7 @@
 #include <argon/argon.h>
 #include <argon/libc.h>
 
-AG_DRV("MOUSEVIRT", "1.0", "argon");
+AG_DRV("MOUSEVIRT", "1.1", "argon");
 
 #define MOUSEVIRT_PORT 5560u
 #define PKT_SIZE       8u
@@ -52,8 +52,6 @@ typedef struct {
     int16_t     y;
     uint8_t     rx_buf[PKT_SIZE];
     uint8_t     rx_n;
-    ag_thread_t thr;
-    volatile int run;
 } mousevirt_state_t;
 
 static mousevirt_state_t s_st;
@@ -205,16 +203,6 @@ static void pump_rx(mousevirt_state_t *st)
     }
 }
 
-static void pump_thread(void *arg)
-{
-    mousevirt_state_t *st = (mousevirt_state_t *)arg;
-    while (st->run) {
-        pump_rx(st);
-        ag_delay(5);
-    }
-    ag_thread_exit();
-}
-
 static ag_err_t mouse_open(ag_device_t *dev, uint32_t flags)
 {
     mousevirt_state_t *st = (mousevirt_state_t *)ag_dev_priv(dev);
@@ -310,7 +298,6 @@ ag_err_t ag_driver_init(void)
     memset(&s_st, 0, sizeof(s_st));
     s_st.listen = -1;
     s_st.conn = -1;
-    s_st.run = 1;
 
     {
         const ag_dev_add_t desc = {
@@ -328,10 +315,5 @@ ag_err_t ag_driver_init(void)
     }
 
     ensure_listen(&s_st);
-    s_st.thr = ag_thread_create(pump_thread, &s_st, "mousevirt", 4 * 1024, 2,
-                                AG_THREAD_SYS_CORE);
-    if (s_st.thr == NULL) {
-        ag_log(AG_LOG_WARN, "mousevirt", "no pump thread; pump on read only");
-    }
     return AG_OK;
 }
