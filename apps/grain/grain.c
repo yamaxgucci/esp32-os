@@ -24,7 +24,7 @@
 #include "ag_wav.h"
 #include "ag_fx.h"
 
-AG_APP_SIZED("GRAIN", "0.1", "argon", AG_AXE_NEEDS_GFX, 12 * 1024, 768 * 1024);
+AG_APP_SIZED("GRAIN", "0.1", "argon", AG_AXE_NEEDS_GFX, 8 * 1024, 512 * 1024);
 
 #define RATE     22050u
 #define CHUNK    441
@@ -70,6 +70,7 @@ static int16_t    s_pcm[CHUNK * 2];
 static char       s_audio_path[AG_PATH_MAX];
 static ag_handle_t s_audio_fd = -1;
 static ag_handle_t s_midi_fd = -1;
+static ag_handle_t s_mouse_fd = -1;
 static int        s_midi_want = 1;
 
 static ag_gfxinfo_t s_gi;
@@ -332,6 +333,25 @@ static void open_midivirt(void)
     if (s_midi_fd >= 0) {
         ag_printf("grain: MIDI-in = /dev/midivirt\n");
     }
+}
+
+static void open_mousevirt(void)
+{
+    /* Drives MOUSEVIRT accept/recv (no resident pump thread). */
+    s_mouse_fd = ag_dev_open("/dev/mouse0");
+    if (s_mouse_fd >= 0) {
+        ag_printf("grain: mouse = /dev/mouse0\n");
+    }
+}
+
+static void pump_mousevirt(void)
+{
+    uint8_t buf[64];
+    if (s_mouse_fd < 0) {
+        return;
+    }
+    /* read() runs pump_rx → inject POINTER_*; poll_event consumes them. */
+    (void)ag_dev_read(s_mouse_fd, buf, sizeof(buf));
 }
 
 static void pump_midivirt(void)
@@ -1065,6 +1085,7 @@ int ag_main(int argc, char **argv)
     }
 
     open_midivirt();
+    open_mousevirt();
     ag_printf("\x1b[>3u");
     ag_printf("\x1b[?9001h");
 
@@ -1075,6 +1096,7 @@ int ag_main(int argc, char **argv)
     for (;;) {
         ag_time_t loop0 = ag_micros();
 
+        pump_mousevirt();
         while (ag_poll_event(&ev, 0)) {
             if (ev.type == AG_EV_QUIT) {
                 goto done;
@@ -1123,6 +1145,10 @@ done:
     ag_grain_all_notes_off(&s_g);
     if (s_midi_fd >= 0) {
         (void)ag_dev_close(s_midi_fd);
+    }
+    if (s_mouse_fd >= 0) {
+        (void)ag_dev_close(s_mouse_fd);
+        s_mouse_fd = -1;
     }
     if (s_audio_fd >= 0) {
         (void)ag_dev_close(s_audio_fd);
