@@ -330,10 +330,7 @@ static ag_handle_t api_tcp_accept(ag_handle_t listen_h, uint32_t timeout_ms)
     socklen_t          plen = sizeof(peer);
     const int          cfd = accept(lfd, (struct sockaddr *)&peer, &plen);
     if (cfd < 0) {
-        const int e = errno;
-        ag_log(AG_LOG_ERROR, "net", "accept errno=%d (lwIP sockets exhausted?)",
-               e);
-        return (ag_handle_t)map_errno(e);
+        return (ag_handle_t)map_errno(errno);
     }
     {
         int yes = 1;
