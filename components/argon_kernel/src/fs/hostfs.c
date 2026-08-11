@@ -24,8 +24,11 @@
 #define HSFS_UART_BAUD      115200
 #define HSFS_RX_BUF         (64 * 1024)
 #define HSFS_TX_BUF         (16 * 1024)
-#define HSFS_RPC_TIMEOUT_MS 5000
+/* Large WRITE + PADPUSH needs headroom: one 4 KiB RPC at 115200 is ~0.4 s. */
+#define HSFS_RPC_TIMEOUT_MS 30000
 #define HSFS_PING_TIMEOUT_MS 1000
+/* Cap each uart_write so pump_rx_during_tx can drain PADPUSH between slices. */
+#define HSFS_TX_SLICE       128
 
 typedef struct {
     uint32_t host_h;
@@ -168,6 +171,9 @@ static bool uart_open(void)
  * While transmitting a large request, the host may still be trying to deliver
  * a PADPUSH.  If our RX fills, host sendall blocks, stops reading our TX, and
  * uart_write_bytes waits forever.  Pump PADPUSH (or hold a non-pad hdr) here.
+ *
+ * Only start a read when a full header is buffered so a short timeout cannot
+ * consume a partial frame and desync the stream.
  */
 static void pump_rx_during_tx(void)
 {
@@ -181,11 +187,14 @@ static void pump_rx_during_tx(void)
             return;
         }
         hsfs_hdr_t hdr;
-        if (!read_all(&hdr, sizeof(hdr), 50)) {
+        if (!read_all(&hdr, sizeof(hdr), 200)) {
             return;
         }
         if (hdr.magic == HSFS_MAGIC && hdr.op == HSFS_OP_PADPUSH) {
-            (void)ingest_padpush_locked(&hdr, 50);
+            /* Payload is small (3 or 6); give it time to finish arriving. */
+            if (!ingest_padpush_locked(&hdr, 200)) {
+                return;
+            }
             continue;
         }
         s_held_hdr = hdr;
@@ -200,7 +209,8 @@ static bool write_all(const void *buf, size_t len)
     size_t         left = len;
     while (left > 0) {
         pump_rx_during_tx();
-        const int n = uart_write_bytes(HSFS_UART, p, left);
+        const size_t chunk = left > HSFS_TX_SLICE ? HSFS_TX_SLICE : left;
+        const int n = uart_write_bytes(HSFS_UART, p, chunk);
         if (n <= 0) {
             return false;
         }
