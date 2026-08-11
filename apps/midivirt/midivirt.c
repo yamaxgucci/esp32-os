@@ -1,8 +1,9 @@
 /*
- * ArgonOS - virtual MIDI input (.SYS): TCP :5559 → /dev/midivirt.
+ * ArgonOS - virtual MIDI input (.SYS): TCP :5559 ↔ /dev/midivirt.
  *
  * Host (tools/midikbd.py via QEMU hostfwd) connects and sends raw MIDI
  * channel voice messages.  Apps non-blocking read() packed 4-byte events.
+ * write() sends raw bytes back on the same TCP conn (input-latency ACK).
  *
  *   python tools/mkaxe.py --arch xtensa --gcc xtensa-esp32s3-elf-gcc \
  *       --include sdk/include -o build\apps\MIDIVIRT.SYS apps/midivirt/midivirt.c
@@ -13,7 +14,7 @@
 #include <argon/argon.h>
 #include <argon/libc.h>
 
-AG_DRV("MIDIVIRT", "1.0", "argon");
+AG_DRV("MIDIVIRT", "1.1", "argon");
 
 #define MIDIVIRT_PORT 5559u
 #define RING_EV       64u
@@ -301,10 +302,42 @@ static int32_t midi_read(ag_device_t *dev, void *buf, size_t len, uint64_t off)
     return (int32_t)(got * EV_SIZE);
 }
 
+static int32_t midi_write(ag_device_t *dev, const void *buf, size_t len,
+                          uint64_t off)
+{
+    midivirt_state_t *st = (midivirt_state_t *)ag_dev_priv(dev);
+    int32_t           n;
+
+    (void)off;
+    if (st == NULL) {
+        return -AG_ENODEV;
+    }
+    if (buf == NULL) {
+        return -AG_EINVAL;
+    }
+    if (len == 0u) {
+        return 0;
+    }
+    try_accept(st);
+    if (st->conn < 0) {
+        return -AG_EAGAIN;
+    }
+    n = ag_net_send(st->conn, buf, len);
+    if (n == -AG_EAGAIN) {
+        return -AG_EAGAIN;
+    }
+    if (n <= 0) {
+        close_conn(st, "peer closed / send err");
+        return (n < 0) ? n : -AG_EIO;
+    }
+    return n;
+}
+
 static const ag_dev_ops_t k_ops = {
     .open = midi_open,
     .close = midi_close,
     .read = midi_read,
+    .write = midi_write,
     .ioctl = midi_ioctl,
 };
 
@@ -324,7 +357,7 @@ ag_err_t ag_driver_init(void)
             .name = "midivirt",
             .driver = "MIDIVIRT",
             .cls = AG_DEV_INPUT,
-            .flags = AG_DEVF_READONLY,
+            .flags = 0,
             .ops = &k_ops,
             .priv = &s_st,
         };

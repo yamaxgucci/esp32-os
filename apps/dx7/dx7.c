@@ -594,6 +594,21 @@ static void close_midivirt(void)
     }
 }
 
+/* Host midikbd --probe: F0 7D <note> F7 after note-on is inside DX7. */
+static void midivirt_ack_note(uint8_t note)
+{
+    uint8_t ack[4];
+
+    if (s_midi_fd < 0) {
+        return;
+    }
+    ack[0] = 0xf0u;
+    ack[1] = 0x7du;
+    ack[2] = (uint8_t)(note & 0x7fu);
+    ack[3] = 0xf7u;
+    (void)ag_dev_write(s_midi_fd, ack, sizeof(ack));
+}
+
 static void pump_midivirt(void)
 {
     uint8_t buf[64];
@@ -618,6 +633,7 @@ static void pump_midivirt(void)
         if (hi == 0x90u) {
             if (d2) {
                 voice_note_on(d1, d2);
+                midivirt_ack_note(d1);
             } else {
                 voice_note_off(d1);
             }
