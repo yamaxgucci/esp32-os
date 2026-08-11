@@ -493,6 +493,15 @@ static inline bool ag_poll_event(ag_event_t *e, uint32_t timeout_ms)
 static inline void ag_flush_input(void) { g_ag_api->inp->flush(); }
 static inline uint16_t ag_mods(void) { return g_ag_api->inp->mods(); }
 
+/* ABI 0.18: inject POINTER/KEY/… into the same queue as ag_poll_event. */
+static inline bool ag_inject_event(const ag_event_t *e)
+{
+    if (g_ag_api->inp == NULL || !AG_HAS(g_ag_api->inp, inject)) {
+        return false;
+    }
+    return g_ag_api->inp->inject(e);
+}
+
 /* ---- graphics ----------------------------------------------------------- */
 
 static inline ag_err_t ag_gfx_acquire(ag_gfxinfo_t *o)

@@ -76,6 +76,13 @@ int  ag_console_vprintf(const char *fmt, va_list ap);
 bool ag_console_read_event(ag_event_t *ev, uint32_t timeout_ms);
 
 /*
+ * Push an event into the console input queue (same path as VT decode).
+ * Safe for POINTER, WHEEL, and KEY events from drivers.  Returns false if
+ * not ready or the queue refused the event.
+ */
+bool ag_console_inject_event(const ag_event_t *ev);
+
+/*
  * Whether an event is waiting, without taking it - which is the whole point:
  * `if (kbhit()) c = getch();` is the oldest idiom there is, and a look that
  * consumed the event would make it lose the key it just saw.  `ev` may be NULL

@@ -457,10 +457,13 @@ uint16_t mods(void);
 uint32_t pad(int which);   /* 0=pad0, 1=pad1, 2=sys, 3=pad0hi, 4=pad1hi */
 int32_t  btn(int id);      /* AG_BTN_* on pad 0; live pad, else sticky */
 int32_t  btnp(int pad, int id); /* ABI 0.11: same on pad 0 or 1 */
+bool     inject(const ag_event_t *ev); /* ABI 0.18: push into poll queue */
 ```
 
 Целые события — то, что нужно приложению, рисующему свой экран: у стрелок и
-F-клавиш нет символа, и `con->getch` их передать не может.
+F-клавиш нет символа, и `con->getch` их передать не может. ABI 0.18
+`inject` — для драйверов вроде [`MOUSEVIRT.SYS`](../../apps/mousevirt)
+(`POINTER` / `WHEEL` → тот же `poll`).
 
 **Игры / удержание / аккорды (SMS, MD, Asteroids):** не `key_pressed` по UART.
 Нужен слой ввода (`/dev/joy0`, `inp->pad` / `btn` / `btnp`), который сегодня

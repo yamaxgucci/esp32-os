@@ -374,6 +374,18 @@ void ag_console_flush_input(void)
 
 uint16_t ag_console_mods(void) { return s_mods; }
 
+bool ag_console_inject_event(const ag_event_t *ev)
+{
+    if (!s_ready || ev == NULL || s_events == NULL) {
+        return false;
+    }
+    if (ev->type == AG_EV_NONE) {
+        return false;
+    }
+    publish(ev);
+    return true;
+}
+
 bool ag_console_read_event(ag_event_t *ev, uint32_t timeout_ms)
 {
     if (!s_ready || ev == NULL) {

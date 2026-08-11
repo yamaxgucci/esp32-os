@@ -55,9 +55,11 @@ extern "C" {
  * 0.16 appended gfx clip / clip_reset / stroke_rect / fill_round_rect.
  * 0.17 appended gfx blit_key + stateful blit_bind / blit_copy / blit_keyed
  *      (RGB565 chroma blit; CC-friendly ≤6-arg path).
+ * 0.18 appended inp->inject: push ag_event_t into the console/input queue
+ *      (MOUSEVIRT /dev/mouse0 → POINTER_* for gfx apps).
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 17u
+#define AG_ABI_MINOR 18u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -426,6 +428,12 @@ typedef struct ag_inp_api {
     int32_t (*btn)(int id);
     /* Level button on pad 0 or 1 (ABI 0.11).  Same fallback rules as btn(). */
     int32_t (*btnp)(int pad, int id);
+    /*
+     * ABI 0.18: inject a fully-formed event into the same queue as poll().
+     * Used by MOUSEVIRT.SYS (and later USB HID) for POINTER and WHEEL events.
+     * Returns false if the queue is full or the event type is refused.
+     */
+    bool (*inject)(const ag_event_t *ev);
 } ag_inp_api_t;
 
 /* ------------------------------------------------------------------------ */
