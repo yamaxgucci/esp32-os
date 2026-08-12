@@ -125,6 +125,7 @@ bool fm_confirm(const char *question);
 void fm_pause(const char *note);
 
 void fm_view(void);   /* F3 */
+void fm_edit(void);   /* F4 */
 void fm_copy(void);   /* F5 */
 void fm_move(void);   /* F6 */
 void fm_mkdir(void);  /* F7 */
