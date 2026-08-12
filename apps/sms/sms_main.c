@@ -624,7 +624,8 @@ int ag_main(int argc, char **argv)
     option.soundlevel = 2;
     option.spritelimit = 1;
 
-    sms_cfg_load(&s_cfg, rom);
+    char cfg_from[AG_PATH_MAX];
+    sms_cfg_load(&s_cfg, rom, cfg_from, sizeof(cfg_from));
     s_fullscreen = s_cfg.fullscreen ? 1 : 0;
     if (s_fullscreen) {
         const size_t nbytes =
@@ -649,6 +650,11 @@ int ag_main(int argc, char **argv)
     bind_frame_to_fb(&s_gi);
 
     s_use_live_pad = (want_livepad && !force_sticky) ? 1 : 0;
+    if (cfg_from[0] != '\0') {
+        ag_printf("sms: cfg %s\n", cfg_from);
+    } else {
+        ag_printf("sms: cfg (defaults)\n");
+    }
     if (s_use_live_pad) {
         ag_printf("sms: controls = live pad (inp / HostFS PADPUSH)\n");
     } else {
@@ -656,6 +662,8 @@ int ag_main(int argc, char **argv)
     }
     if (s_fullscreen) {
         ag_printf("sms: video = fullscreen (nearest stretch)\n");
+    } else {
+        ag_printf("sms: video = 1:1 centered\n");
     }
 
     if (!load_cart(rom)) {
