@@ -1352,10 +1352,15 @@ static int cmd_fm(int argc, char **argv)
     }
 
     ag_pid_t       pid = 0;
+    /*
+     * Panels need ~100 KB + viewer/copy headroom — not the 1 MB default.
+     * Leaving the default made FM + AMP both demand 1 MB PSRAM heaps and the
+     * second spawn failed with ENOMEM.
+     */
     const ag_err_t err = ag_proc_spawn_builtin(
         "FM", ag_fm_main, argc, argv,
-        (uint32_t)AG_SPAWN_BACKGROUND | (uint32_t)AG_SPAWN_NO_SESSION, 0, 0,
-        &pid);
+        (uint32_t)AG_SPAWN_BACKGROUND | (uint32_t)AG_SPAWN_NO_SESSION, 0,
+        256u * 1024u, &pid);
     if (err != AG_OK) {
         ag_console_printf("fm: could not start (%d)\n", (int)err);
         return 1;
