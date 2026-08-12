@@ -346,6 +346,65 @@ static const ag_dev_ops_t k_fb_ops = {
     .size = fb_size,
 };
 
+static ag_err_t gfx_acquire(ag_gfxinfo_t *out);
+static void     gfx_release(void);
+static void     gfx_flush(uint16_t x, uint16_t y, uint16_t w, uint16_t h);
+static void     gfx_swap(void);
+
+/* ---------------------------------------------------------------------- */
+/* display class_ops (dev->ops)                                            */
+/* ---------------------------------------------------------------------- */
+
+static ag_err_t disp_info(ag_handle_t h, ag_gfxinfo_t *out)
+{
+    (void)h;
+    if (!s_ready || out == NULL) {
+        return -AG_ENODEV;
+    }
+    out->width = s_w;
+    out->height = s_h;
+    out->fmt = AG_PIX_RGB565;
+    out->stride = s_stride;
+    out->fb = NULL;
+    out->double_buf = (s_back != NULL);
+    out->direct = (s_back == NULL);
+    return AG_OK;
+}
+
+static ag_err_t disp_acquire(ag_handle_t h, ag_gfxinfo_t *out)
+{
+    (void)h;
+    return gfx_acquire(out);
+}
+
+static void disp_release(ag_handle_t h)
+{
+    (void)h;
+    gfx_release();
+}
+
+static void disp_flush(ag_handle_t h, uint16_t x, uint16_t y, uint16_t w,
+                       uint16_t hgt)
+{
+    (void)h;
+    gfx_flush(x, y, w, hgt);
+}
+
+static void disp_swap(ag_handle_t h)
+{
+    (void)h;
+    gfx_swap();
+}
+
+static const ag_display_ops_t k_fb_class_ops = {
+    .size = sizeof(ag_display_ops_t),
+    .info = disp_info,
+    .acquire = disp_acquire,
+    .release = disp_release,
+    .flush = disp_flush,
+    .swap = disp_swap,
+};
+
 /* ---------------------------------------------------------------------- */
 /* gfx API                                                                 */
 /* ---------------------------------------------------------------------- */
@@ -918,6 +977,7 @@ ag_err_t ag_display_init(void)
         .cls = AG_DEV_DISPLAY,
         .flags = 0,
         .ops = &k_fb_ops,
+        .class_ops = &k_fb_class_ops,
         .priv = front,
     };
     const ag_err_t err = ag_dev_register(&desc, &s_dev);

@@ -535,6 +535,63 @@ static void test_handle_carries_the_device(void)
     AG_CHECK(ag_devfs_device_of(-1) == NULL);
 }
 
+static ag_err_t fake_disp_info(ag_handle_t h, ag_gfxinfo_t *out)
+{
+    (void)h;
+    if (out == NULL) {
+        return -AG_EINVAL;
+    }
+    out->width = 320;
+    out->height = 240;
+    out->fmt = AG_PIX_RGB565;
+    out->stride = 640;
+    out->fb = NULL;
+    out->double_buf = false;
+    out->direct = true;
+    return AG_OK;
+}
+
+static const ag_display_ops_t k_fake_display_ops = {
+    .size = sizeof(ag_display_ops_t),
+    .info = fake_disp_info,
+    .acquire = NULL,
+    .release = NULL,
+    .flush = NULL,
+    .swap = NULL,
+};
+
+static void test_display_class_ops(void)
+{
+    setup();
+    const ag_dev_desc_t desc = {
+        .name = "fb0",
+        .driver = "soft",
+        .cls = AG_DEV_DISPLAY,
+        .flags = 0,
+        .ops = &k_stream_ops,
+        .class_ops = &k_fake_display_ops,
+        .priv = &g_stream,
+    };
+    ag_device_t *dev = NULL;
+    AG_CHECK_INT(ag_dev_register(&desc, &dev), AG_OK);
+
+    const ag_handle_t h = ag_vfs_open("/dev/fb0", NULL, AG_O_RDWR);
+    AG_CHECK(h >= 0);
+    const ag_display_ops_t *ops =
+        (const ag_display_ops_t *)ag_devfs_device_of(h)->class_ops;
+    AG_CHECK(ops == &k_fake_display_ops);
+    AG_CHECK(ops->size == sizeof(ag_display_ops_t));
+    AG_CHECK(ops->info != NULL);
+
+    ag_gfxinfo_t info;
+    memset(&info, 0, sizeof(info));
+    AG_CHECK_INT(ops->info(h, &info), AG_OK);
+    AG_CHECK_INT(info.width, 320);
+    AG_CHECK_INT(info.height, 240);
+    AG_CHECK(info.fb == NULL);
+    AG_CHECK_INT(ag_vfs_close(h), AG_OK);
+}
+
 /* ---------------------------------------------------------------------- */
 /* Going away                                                             */
 /* ---------------------------------------------------------------------- */
@@ -658,6 +715,7 @@ void run_device_tests(void)
     test_devfs_refusals();
     test_devfs_pool();
     test_handle_carries_the_device();
+    test_display_class_ops();
 
     test_unregister_is_refused_while_open();
     test_revoke_with_handles_open();
