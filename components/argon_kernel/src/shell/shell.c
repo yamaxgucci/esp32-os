@@ -412,16 +412,19 @@ static int cmd_run(int argc, char **argv)
     }
     if (argc <= first) {
         ag_console_puts("usage: run [/b] <file> [arguments]\n");
-        ag_console_puts("  starts in a free session slot; system shell stays\n");
+        ag_console_puts("  starts in the current session slot (or a free one)\n");
         ag_console_puts("  /b  same, without switching focus to the app\n");
-        ag_console_puts("  Alt+1..4 / fg <slot|pid> to focus; Ctrl+\\ = system\n");
+        ag_console_puts("  Alt+1..4 / fg <slot|pid> to focus; Ctrl+\\ = slot 1\n");
         return 1;
     }
 
     /*
-     * Always spawn into a user session slot and return to the system prompt.
-     * Waiting forever in run blocked break-in from ever showing a live shell.
+     * Pin the target slot before spawn: Alt+N can race on the console task and
+     * would otherwise bind the new app into whichever slot is focused at the
+     * moment bind runs (often slot 1).
      */
+    const int target_slot = ag_session_focused();
+
     ag_pid_t       pid = 0;
     const ag_err_t err = ag_proc_spawn(argv[first], argc - first, &argv[first],
                                        AG_SPAWN_BACKGROUND, &pid);
@@ -430,11 +433,33 @@ static int cmd_run(int argc, char **argv)
         return 1;
     }
 
+    char name[32] = "app";
+    for (uint32_t i = 0;; i++) {
+        ag_procinfo_t info;
+        if (ag_proc_info(i, &info) != AG_OK) {
+            break;
+        }
+        if (info.pid == pid) {
+            memcpy(name, info.name, sizeof(name) - 1);
+            name[sizeof(name) - 1] = '\0';
+            break;
+        }
+    }
+
+    if (ag_session_bind_to(pid, name, target_slot) != AG_OK) {
+        /* Target slot already has an app — keep whatever free slot spawn used. */
+        (void)ag_session_bind(pid, name);
+    }
+
     const int slot = ag_session_slot_of(pid);
     ag_console_printf("started pid %u in slot %d\n", (unsigned)pid,
                       slot >= 0 ? ag_session_display_number(slot) : -1);
 
-    if (!detach_only && slot >= 0) {
+    /*
+     * Focus the new app only if the user stayed on the launch slot.  Alt+N
+     * during a long load must not yank them back from another slot.
+     */
+    if (!detach_only && slot >= 0 && ag_session_focused() == target_slot) {
         (void)ag_session_focus(slot);
     }
     return 0;
@@ -1587,6 +1612,9 @@ int ag_shell_execute(const char *line)
     /* This command's own answer to "was I interrupted", not the last one's. */
     ag_supervisor_clear_interrupt();
 
+    const int cmd_slot = ag_session_focused();
+    ag_session_note_shell_cmd(cmd_slot, line);
+
     if (redirect >= 0) {
         ag_console_redirect(file_sink, (void *)(intptr_t)redirect);
     }
@@ -1624,11 +1652,15 @@ int ag_shell_execute(const char *line)
      */
     if (ag_supervisor_interrupted()) {
         ag_console_flush_input();
+        /* Resume line was parked by ag_session_focus when Alt+N left this slot. */
+    } else {
+        ag_session_clear_shell_cmd(cmd_slot);
     }
 
     if (!found) {
         /* The message every DOS user knows. */
         ag_console_printf("Bad command or file name: %s\n", argv[0]);
+        ag_session_clear_shell_cmd(cmd_slot);
     }
     return status;
 }
@@ -1675,6 +1707,23 @@ void ag_shell_run(void)
 
         sync_cwd_from_session();
         ag_shell_clear_interrupted();
+
+        /*
+         * Returning to a slot whose builtin (fm, …) was interrupted by Alt+N:
+         * restart that command instead of an empty prompt.
+         */
+        {
+            /* Copy out: execute() re-notes into the same session buffer. */
+            char        resume_line[AG_SESSION_PARK_CMD_MAX];
+            const char *resume = ag_session_take_resume(ag_session_focused());
+            if (resume != NULL) {
+                strncpy(resume_line, resume, sizeof(resume_line) - 1);
+                resume_line[sizeof(resume_line) - 1] = '\0';
+                s_last_status = ag_shell_execute(resume_line);
+                continue;
+            }
+        }
+
         ag_lineedit_reset(&s_line);
         show_prompt();
         redraw_line(&s_line, &s_prompt_pos);

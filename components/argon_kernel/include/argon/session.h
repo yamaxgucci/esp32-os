@@ -18,6 +18,8 @@ extern "C" {
 
 #define AG_SESSION_SLOTS 4
 #define AG_SESSION_SYSTEM 0
+/** Parked shell builtin (e.g. "fm"); keep small — DRAM is tight. */
+#define AG_SESSION_PARK_CMD_MAX 32
 
 typedef struct {
     ag_pid_t pid; /* AG_PID_KERNEL = shell owns this slot (no app) */
@@ -27,46 +29,40 @@ typedef struct {
 
 void ag_session_init(void);
 
-/* Currently focused slot index (0..3). */
-int ag_session_focused(void);
-
-/* 1-based number for prompts / Alt+N labels (slot 0 → 1, …). */
-int ag_session_display_number(int slot);
-
-/* Pid that should own the keyboard: app if present, else KERNEL (shell). */
+int      ag_session_focused(void);
+int      ag_session_display_number(int slot);
 ag_pid_t ag_session_focused_pid(void);
+bool     ag_session_shell_owns_keyboard(void);
 
-/* True when the focused slot has no app — shell should read the console. */
-bool ag_session_shell_owns_keyboard(void);
-
-/* Bind a newly spawned process into a slot (prefer focused if empty). */
+/* Bind into the first free slot (fallback for non-shell spawners). */
 ag_err_t ag_session_bind(ag_pid_t pid, const char *name);
 
-/* Clear a slot when its process ends. */
+/*
+ * Bind (or move) `pid` into an exact slot.  Fails with -AG_EBUSY if that slot
+ * already has a different process.
+ */
+ag_err_t ag_session_bind_to(ag_pid_t pid, const char *name, int slot);
+
 void ag_session_unbind(ag_pid_t pid);
 
-/*
- * Switch focus to `slot` (0..3).  Empty slots are valid: gfx is released and
- * the shell owns the console for that slot.
- */
 ag_err_t ag_session_focus(int slot);
-
-/*
- * Break-in: focus slot 0 shell without killing.  Second press within ~1 s
- * hard-kills the last user app pid.
- */
-bool ag_session_enter_system(void);
-
-/* Cycle all four slots. */
+bool     ag_session_enter_system(void);
 ag_err_t ag_session_alt_tab(void);
 
 void ag_session_info(ag_session_slot_t out[AG_SESSION_SLOTS]);
+int  ag_session_slot_of(ag_pid_t pid);
 
-int ag_session_slot_of(ag_pid_t pid);
-
-/* Per-slot working directory (shell syncs on focus / cd). */
 const char *ag_session_cwd(int slot);
 ag_err_t    ag_session_set_cwd(int slot, const char *absolute_path);
+
+/*
+ * Shell builtins (fm, …) are not processes.  While one runs, note its command
+ * line; on Alt+N away, it is parked as a resume line so returning to the slot
+ * restarts it.
+ */
+void        ag_session_note_shell_cmd(int slot, const char *line);
+void        ag_session_clear_shell_cmd(int slot);
+const char *ag_session_take_resume(int slot);
 
 #ifdef __cplusplus
 }

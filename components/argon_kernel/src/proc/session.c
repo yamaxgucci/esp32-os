@@ -22,10 +22,19 @@
 
 #define AG_BREAKIN_DOUBLE_US 1000000ll
 
-static ag_session_slot_t s_slots[AG_SESSION_SLOTS];
-static int               s_focused = AG_SESSION_SYSTEM;
-static ag_pid_t          s_last_user = AG_PID_KERNEL;
-static int64_t           s_last_breakin_us;
+typedef struct {
+    ag_pid_t pid;
+    char     name[32];
+    char     cwd[AG_PATH_MAX];
+    /* Active or parked shell builtin; only one string is needed at a time. */
+    char     shell_cmd[AG_SESSION_PARK_CMD_MAX];
+    bool     resume_pending;
+} slot_t;
+
+static slot_t   s_slots[AG_SESSION_SLOTS];
+static int      s_focused = AG_SESSION_SYSTEM;
+static ag_pid_t s_last_user = AG_PID_KERNEL;
+static int64_t  s_last_breakin_us;
 
 static void slot_set_default_cwd(int slot)
 {
@@ -100,6 +109,76 @@ ag_err_t ag_session_set_cwd(int slot, const char *absolute_path)
     return AG_OK;
 }
 
+void ag_session_note_shell_cmd(int slot, const char *line)
+{
+    if (slot < 0 || slot >= AG_SESSION_SLOTS || line == NULL) {
+        return;
+    }
+    strncpy(s_slots[slot].shell_cmd, line, AG_SESSION_PARK_CMD_MAX - 1);
+    s_slots[slot].shell_cmd[AG_SESSION_PARK_CMD_MAX - 1] = '\0';
+    s_slots[slot].resume_pending = false;
+}
+
+void ag_session_clear_shell_cmd(int slot)
+{
+    if (slot < 0 || slot >= AG_SESSION_SLOTS) {
+        return;
+    }
+    s_slots[slot].shell_cmd[0] = '\0';
+    s_slots[slot].resume_pending = false;
+}
+
+const char *ag_session_take_resume(int slot)
+{
+    if (slot < 0 || slot >= AG_SESSION_SLOTS || !s_slots[slot].resume_pending) {
+        return NULL;
+    }
+    s_slots[slot].resume_pending = false;
+    return s_slots[slot].shell_cmd[0] != '\0' ? s_slots[slot].shell_cmd : NULL;
+}
+
+static void park_shell_cmd(int slot)
+{
+    if (slot < 0 || slot >= AG_SESSION_SLOTS) {
+        return;
+    }
+    if (s_slots[slot].shell_cmd[0] == '\0') {
+        return;
+    }
+    /* Keep the text in shell_cmd; mark it for restart on return. */
+    s_slots[slot].resume_pending = true;
+}
+
+static void clear_pid_from_slots(ag_pid_t pid)
+{
+    for (int i = 0; i < AG_SESSION_SLOTS; i++) {
+        if (s_slots[i].pid == pid) {
+            s_slots[i].pid = AG_PID_KERNEL;
+            s_slots[i].name[0] = '\0';
+        }
+    }
+}
+
+ag_err_t ag_session_bind_to(ag_pid_t pid, const char *name, int slot)
+{
+    if (pid == AG_PID_KERNEL || slot < 0 || slot >= AG_SESSION_SLOTS) {
+        return -AG_EINVAL;
+    }
+    if (s_slots[slot].pid != AG_PID_KERNEL && s_slots[slot].pid != pid) {
+        return -AG_EBUSY;
+    }
+    clear_pid_from_slots(pid);
+    s_slots[slot].pid = pid;
+    memset(s_slots[slot].name, 0, sizeof(s_slots[slot].name));
+    if (name != NULL) {
+        strncpy(s_slots[slot].name, name, sizeof(s_slots[slot].name) - 1);
+    }
+    /* An app occupies the slot — cancel any parked shell builtin. */
+    s_slots[slot].shell_cmd[0] = '\0';
+    s_slots[slot].resume_pending = false;
+    return AG_OK;
+}
+
 ag_err_t ag_session_bind(ag_pid_t pid, const char *name)
 {
     if (pid == AG_PID_KERNEL) {
@@ -108,26 +187,9 @@ ag_err_t ag_session_bind(ag_pid_t pid, const char *name)
     if (ag_session_slot_of(pid) >= 0) {
         return AG_OK;
     }
-
-    /* Prefer the focused slot when it has no app. */
-    if (s_slots[s_focused].pid == AG_PID_KERNEL) {
-        s_slots[s_focused].pid = pid;
-        memset(s_slots[s_focused].name, 0, sizeof(s_slots[s_focused].name));
-        if (name != NULL) {
-            strncpy(s_slots[s_focused].name, name,
-                    sizeof(s_slots[s_focused].name) - 1);
-        }
-        return AG_OK;
-    }
-
     for (int i = 0; i < AG_SESSION_SLOTS; i++) {
         if (s_slots[i].pid == AG_PID_KERNEL) {
-            s_slots[i].pid = pid;
-            memset(s_slots[i].name, 0, sizeof(s_slots[i].name));
-            if (name != NULL) {
-                strncpy(s_slots[i].name, name, sizeof(s_slots[i].name) - 1);
-            }
-            return AG_OK;
+            return ag_session_bind_to(pid, name, i);
         }
     }
     return -AG_ENFILE;
@@ -162,7 +224,6 @@ static void notify_focus(ag_pid_t prev_pid, ag_pid_t next_pid)
 
 static void enter_shell_view(int slot)
 {
-    /* Hide leftover gfx (AMP etc.) and restore the text console. */
     if (ag_display_acquired()) {
         ag_display_force_release();
     }
@@ -173,13 +234,15 @@ static void enter_shell_view(int slot)
         ag_screen_set_attr(ag_console_screen(), AG_ATTR_DEFAULT);
         ag_screen_set_cursor(ag_console_screen(), true);
         ag_console_unlock();
-        ag_console_printf("slot %d\n", ag_session_display_number(slot));
+        if (s_slots[slot].resume_pending && s_slots[slot].shell_cmd[0] != '\0') {
+            ag_console_printf("slot %d — resuming %s\n",
+                              ag_session_display_number(slot),
+                              s_slots[slot].shell_cmd);
+        } else {
+            ag_console_printf("slot %d\n", ag_session_display_number(slot));
+        }
     }
 
-    /*
-     * Wake builtins (fm) blocked in poll, and mark shell interrupted so long
-     * commands bail out between chunks.
-     */
     ag_supervisor_raise_shell_interrupt();
     {
         ag_event_t quit = {0};
@@ -199,6 +262,14 @@ ag_err_t ag_session_focus(int slot)
 
     if (slot == prev_slot) {
         return AG_OK;
+    }
+
+    /*
+     * Leaving a shell slot that was mid-builtin (fm, …): park the command so
+     * returning to this slot restarts it.  Then interrupt the builtin.
+     */
+    if (prev_pid == AG_PID_KERNEL) {
+        park_shell_cmd(prev_slot);
     }
 
     const ag_pid_t next_pid = s_slots[slot].pid;
@@ -295,5 +366,9 @@ void ag_session_info(ag_session_slot_t out[AG_SESSION_SLOTS])
     if (out == NULL) {
         return;
     }
-    memcpy(out, s_slots, sizeof(s_slots));
+    for (int i = 0; i < AG_SESSION_SLOTS; i++) {
+        out[i].pid = s_slots[i].pid;
+        memcpy(out[i].name, s_slots[i].name, sizeof(out[i].name));
+        memcpy(out[i].cwd, s_slots[i].cwd, sizeof(out[i].cwd));
+    }
 }
