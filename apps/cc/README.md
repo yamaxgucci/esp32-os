@@ -87,7 +87,7 @@ of a guest.
 The image demands the highest ABI minor of the features it uses: 8 plain, 9 for
 `ag_gfx_*` (which also sets `AG_AXE_NEEDS_GFX`), 10 for `ag_btn`, 14 for
 `ag_audio_*` (`AG_AXE_NEEDS_AUDIO`), 16 for clip/round-rect, 17 for
-`ag_gfx_blit_bind` / `blit_copy` / `blit_keyed`.
+`ag_gfx_blit_bind` / `blit_copy` / `blit_keyed`, 20 for `ag_focused`.
 
 | Builtin | Notes |
 |---------|--------|
@@ -95,6 +95,9 @@ The image demands the highest ABI minor of the features it uses: 8 plain, 9 for
 | `ag_micros()` / `ag_millis()` | boot time; micros is low 32 bits of `time->us` |
 | `ag_key(code)` | sticky `key_pressed` (serial; imperfect for chords) |
 | `ag_btn(id)` | **live pad** (HostFS PADPUSH): 0=up…3=right, 4=b1, 5=b2, 6=pause, 7=quit |
+| `ag_poll_event(ev, ms)` | `inp->poll`; `ev` is a buffer/`struct` ≥ `ag_event_t` (type at offset 0) |
+| `ag_heartbeat()` | `sys->heartbeat` (call while backgrounded / long waits) |
+| `ag_focused()` | true while this process owns the focused session slot (ABI 0.20) |
 | `ag_print(s)` | `con->puts`; `s` is a string literal or any address |
 | `ag_printf(fmt, ...)` | `con->printf`, up to 6 arguments including the format |
 | `ag_print_int(n)` / `ag_print_hex(n)` | the same with a format the compiler supplies |

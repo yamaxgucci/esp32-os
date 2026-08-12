@@ -1,7 +1,7 @@
 /*
  * ArgonOS - tiny C compiler host tests (expressions + .AXE shape).
  *
- * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #include <stddef.h>
 #include <stdint.h>
@@ -32,6 +32,7 @@
     (4u + 4u * (unsigned)((offsetof(type, field) - sizeof(void *)) / \
                           sizeof(void *)))
 
+_Static_assert(API_SLOT(sys) == API_OFF_SYS, "ag_api_t.sys moved");
 _Static_assert(API_SLOT(mem) == API_OFF_MEM, "ag_api_t.mem moved");
 _Static_assert(API_SLOT(fs) == API_OFF_FS, "ag_api_t.fs moved");
 _Static_assert(API_SLOT(con) == API_OFF_CON, "ag_api_t.con moved");
@@ -40,6 +41,7 @@ _Static_assert(API_SLOT(gfx) == API_OFF_GFX, "ag_api_t.gfx moved");
 _Static_assert(API_SLOT(dev) == API_OFF_DEV, "ag_api_t.dev moved");
 _Static_assert(API_SLOT(io) == API_OFF_IO, "ag_api_t.io moved");
 _Static_assert(API_SLOT(time) == API_OFF_TIME, "ag_api_t.time moved");
+_Static_assert(API_SLOT(proc) == API_OFF_PROC, "ag_api_t.proc moved");
 _Static_assert(API_SLOT(audio) == API_OFF_AUDIO, "ag_api_t.audio moved");
 
 _Static_assert(SUB_SLOT(ag_mem_api_t, alloc) == MEM_OFF_ALLOC,
@@ -80,10 +82,16 @@ _Static_assert(SUB_SLOT(ag_con_api_t, cls) == CON_OFF_CLS, "con.cls moved");
 _Static_assert(SUB_SLOT(ag_con_api_t, gotoxy) == CON_OFF_GOTOXY,
                "con.gotoxy moved");
 
+_Static_assert(SUB_SLOT(ag_inp_api_t, poll) == INP_OFF_POLL, "inp.poll moved");
 _Static_assert(SUB_SLOT(ag_inp_api_t, key_pressed) == INP_OFF_KEY_PRESSED,
                "inp.key_pressed moved");
 _Static_assert(SUB_SLOT(ag_inp_api_t, pad) == INP_OFF_PAD, "inp.pad moved");
 _Static_assert(SUB_SLOT(ag_inp_api_t, btn) == INP_OFF_BTN, "inp.btn moved");
+
+_Static_assert(SUB_SLOT(ag_sys_api_t, heartbeat) == SYS_OFF_HEARTBEAT,
+               "sys.heartbeat moved");
+_Static_assert(SUB_SLOT(ag_proc_api_t, focused) == PROC_OFF_FOCUSED,
+               "proc.focused moved");
 
 _Static_assert(SUB_SLOT(ag_time_api_t, us) == TIME_OFF_US, "time.us moved");
 _Static_assert(SUB_SLOT(ag_time_api_t, ms) == TIME_OFF_MS, "time.ms moved");
@@ -736,6 +744,9 @@ void run_cc_tests(void)
     check_minor("int ag_main(void) { ag_gfx_clear(0); return 0; }\n",
                 ABI_MINOR_GFX);
     check_minor("int ag_main(void) { return ag_btn(4); }\n", ABI_MINOR_BTN);
+    check_minor("int ag_main(void) { ag_heartbeat(); return 0; }\n",
+                ABI_MINOR_BASE);
+    check_minor("int ag_main(void) { return ag_focused(); }\n", ABI_MINOR_FOCUS);
     check_minor("int ag_main(void) { ag_audio_open(); return 0; }\n",
                 ABI_MINOR_AUDIO);
     check_minor("int ag_main(void) {\n"

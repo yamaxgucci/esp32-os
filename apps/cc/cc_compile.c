@@ -2427,6 +2427,10 @@ static const builtin_t BUILTINS[] = {
     {"ag_key", 1, API_OFF_INP, INP_OFF_KEY_PRESSED, RET_BOOL, 0, ABI_MINOR_BASE, NULL},
     /* ag_btn: level state via HostFS PADPUSH (same path as SMS). ids 0..7 */
     {"ag_btn", 1, API_OFF_INP, INP_OFF_BTN, RET_BOOL, 0, ABI_MINOR_BTN, NULL},
+    /* Session focus: drain with poll; sleep+heartbeat while backgrounded. */
+    {"ag_poll_event", 2, API_OFF_INP, INP_OFF_POLL, RET_BOOL, 0, ABI_MINOR_BASE, NULL},
+    {"ag_heartbeat", 0, API_OFF_SYS, SYS_OFF_HEARTBEAT, RET_VOID, 0, ABI_MINOR_BASE, NULL},
+    {"ag_focused", 0, API_OFF_PROC, PROC_OFF_FOCUSED, RET_BOOL, 0, ABI_MINOR_FOCUS, NULL},
 
     /* Console text.  ag_printf is the kernel's own, reached with its arguments
      * in the outgoing registers, which is what the windowed ABI asks of any

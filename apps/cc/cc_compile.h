@@ -23,6 +23,7 @@ extern "C" {
  * a table only ever grows at its end; that test is what turns a violation of it
  * into a failed build instead of a guest jumping through the wrong slot.
  */
+#define API_OFF_SYS   8
 #define API_OFF_MEM   12
 #define API_OFF_FS    16
 #define API_OFF_CON   20
@@ -31,6 +32,7 @@ extern "C" {
 #define API_OFF_DEV   32
 #define API_OFF_IO    36
 #define API_OFF_TIME  40
+#define API_OFF_PROC  48
 #define API_OFF_AUDIO 60
 
 #define MEM_OFF_ALLOC   4
@@ -59,9 +61,14 @@ extern "C" {
 #define CON_OFF_CLS    32
 #define CON_OFF_GOTOXY 36
 
+#define INP_OFF_POLL        4
 #define INP_OFF_KEY_PRESSED 12
 #define INP_OFF_PAD         20
 #define INP_OFF_BTN         24
+
+#define SYS_OFF_HEARTBEAT 32
+
+#define PROC_OFF_FOCUSED 48
 
 #define TIME_OFF_US       4
 #define TIME_OFF_MS       8
@@ -108,12 +115,13 @@ extern "C" {
  * highest of the ones a program actually uses, rather than a constant, is what
  * lets a program that only draws run on a kernel that has no audio.
  */
-#define ABI_MINOR_BASE  8
-#define ABI_MINOR_GFX   9
-#define ABI_MINOR_BTN   10
-#define ABI_MINOR_AUDIO 14
-#define ABI_MINOR_GFX16 16
-#define ABI_MINOR_GFX17 17
+#define ABI_MINOR_BASE   8
+#define ABI_MINOR_GFX    9
+#define ABI_MINOR_BTN    10
+#define ABI_MINOR_AUDIO  14
+#define ABI_MINOR_GFX16  16
+#define ABI_MINOR_GFX17  17
+#define ABI_MINOR_FOCUS  20
 
 typedef struct {
     uint8_t *axe;

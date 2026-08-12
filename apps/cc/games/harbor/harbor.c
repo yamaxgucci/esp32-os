@@ -17,6 +17,24 @@
 
 #include "g2d_impl.h"
 
+/* ag_event_t layout (ILP32): type @0, then pad+ts+union — keep ≥40 bytes. */
+#define AG_EV_FOCUS_GAINED 12
+#define AG_EV_FOCUS_LOST   13
+#define AG_EV_QUIT         14
+
+struct ag_ev {
+    int type;
+    int pad;
+    int ts0;
+    int ts1;
+    int u0;
+    int u1;
+    int u2;
+    int u3;
+    int u4;
+    int u5;
+};
+
 /* sms.cfg: pad0.b1=Z, pad0.b2=X, pad0.start=ENTER, pad0.quit=ESC */
 int btn_ok(void)
 {
@@ -1571,6 +1589,28 @@ int ag_main(void)
     enc_cool = 0;
 
     while (running) {
+        struct ag_ev ev;
+
+        while (ag_poll_event(&ev, 0)) {
+            if (ev.type == AG_EV_FOCUS_GAINED) {
+                /* Kernel force-releases gfx on focus loss; reclaim it. */
+                ag_gfx_acquire();
+            } else if (ev.type == AG_EV_QUIT) {
+                /* Shell Ctrl+C while unfocused is for the slot, not us. */
+                if (ag_focused()) {
+                    running = 0;
+                }
+            }
+        }
+        if (!running) {
+            break;
+        }
+        if (!ag_focused()) {
+            ag_heartbeat();
+            ag_delay(50);
+            continue;
+        }
+
         tick = tick + 1;
         if (state == ST_TITLE) {
             draw_title();
