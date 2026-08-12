@@ -16,6 +16,7 @@
 #ifndef ARGON_PROC_H
 #define ARGON_PROC_H
 
+#include <argon/abi.h>
 #include <argon/loader.h>
 #include <argon/reslist.h>
 
@@ -106,6 +107,23 @@ void ag_proc_exit(int code);
  * not is one that has to be killed.
  */
 bool ag_proc_interrupted(void);
+
+/*
+ * True while the calling process has been asked to stop or marked killed, and
+ * the flag has not been cleared by ag_proc_interrupted().  HostFS polls this
+ * during long RPCs so a kill can proceed instead of waiting on the VFS lock.
+ */
+bool ag_proc_stopping(void);
+
+/* True when this process's session slot currently has input/display focus. */
+bool ag_proc_focused(void);
+
+/*
+ * Pending AG_EV_FOCUS_LOST / GAINED for `pid` (one deep).  Consumed by
+ * ag_proc_take_focus_event() from the inp poll path.
+ */
+void ag_proc_post_focus_event(ag_pid_t pid, bool gained);
+bool ag_proc_take_focus_event(ag_event_t *out);
 
 /* Says the process is alive, for the watchdog.  What the ABI's heartbeat does. */
 void ag_proc_heartbeat(void);

@@ -84,6 +84,9 @@ typedef struct {
      * own run does.
      */
     ag_pid_t prev_foreground;
+
+    /* One pending focus event: 0 = none, 1 = GAINED, 2 = LOST. */
+    volatile uint8_t focus_ev;
 } proc_t;
 
 /* The process the calling task belongs to, or NULL for the kernel's own tasks. */

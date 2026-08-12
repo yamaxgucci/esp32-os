@@ -31,6 +31,18 @@ bool ag_display_ready(void);
 /* True while an application holds the framebuffer (text blit is suspended). */
 bool ag_display_acquired(void);
 
+/* Pid that called acquire, or AG_PID_KERNEL when free. */
+ag_pid_t ag_display_owner(void);
+
+/*
+ * Force-release graphics (focus lost / break-in).  Keeps the snapshot for
+ * Alt-Tab preview.  Safe when not acquired.
+ */
+void ag_display_force_release(void);
+
+/* Present the last snap with a one-line label (Alt-Tab overlay). */
+void ag_display_show_overlay(const char *label);
+
 /* The gfx subtable wired into ag_api_t.  acquire fails until init succeeds. */
 extern const ag_gfx_api_t ag_gfx_api_table;
 

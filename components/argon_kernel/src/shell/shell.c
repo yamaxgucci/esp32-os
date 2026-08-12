@@ -13,6 +13,7 @@
 #include <argon/cmdline.h>
 #include <argon/codepage.h>
 #include <argon/console.h>
+#include <argon/session.h>
 #include <argon/display.h>
 #include <argon/device.h>
 #include <argon/ioclaim.h>
@@ -29,6 +30,8 @@
 #include "esp_heap_caps.h"
 #include "esp_system.h"
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #include "boot/platform.h"
 #include "core/sysconfig.h"
@@ -386,55 +389,41 @@ static void print_load_error(const char *path, ag_err_t err)
 
 static int cmd_run(int argc, char **argv)
 {
-    bool background = false;
+    bool detach_only = false;
     int  first = 1;
 
     if (argc > 1 && ag_path_icmp(argv[1], "/b") == 0) {
-        background = true;
+        detach_only = true;
         first = 2;
     }
     if (argc <= first) {
         ag_console_puts("usage: run [/b] <file> [arguments]\n");
-        ag_console_puts("  /b  leave it running in the background\n");
+        ag_console_puts("  starts in a free session slot; system shell stays\n");
+        ag_console_puts("  /b  same, without switching focus to the app\n");
+        ag_console_puts("  Alt+1..4 / fg <slot|pid> to focus; Ctrl+\\ = system\n");
         return 1;
     }
 
     /*
-     * The application sees the path it was started with as argv[0], which is
-     * what a program expects and what lets it find its own files.
+     * Always spawn into a user session slot and return to the system prompt.
+     * Waiting forever in run blocked break-in from ever showing a live shell.
      */
-    if (background) {
-        ag_pid_t       pid = 0;
-        const ag_err_t err = ag_proc_spawn(argv[first], argc - first,
-                                           &argv[first], AG_SPAWN_BACKGROUND,
-                                           &pid);
-        if (err != AG_OK) {
-            print_load_error(argv[first], err);
-            return 1;
-        }
-        ag_console_printf("started pid %u\n", (unsigned)pid);
-        return 0;
-    }
-
-    int32_t        status = 0;
-    const ag_err_t err = ag_proc_exec(argv[first], argc - first, &argv[first], 0,
-                                      &status);
-    if (err == -AG_EKILLED) {
-        ag_console_printf("%s: stopped\n", argv[first]);
-        return 1;
-    }
+    ag_pid_t       pid = 0;
+    const ag_err_t err = ag_proc_spawn(argv[first], argc - first, &argv[first],
+                                       AG_SPAWN_BACKGROUND, &pid);
     if (err != AG_OK) {
         print_load_error(argv[first], err);
         return 1;
     }
 
-    /* Whatever the application did to the screen, the prompt starts clean. */
-    ag_console_lock();
-    ag_screen_set_attr(ag_console_screen(), AG_ATTR_DEFAULT);
-    ag_screen_set_cursor(ag_console_screen(), true);
-    ag_console_unlock();
+    const int slot = ag_session_slot_of(pid);
+    ag_console_printf("started pid %u in slot %d\n", (unsigned)pid,
+                      slot >= 0 ? slot : -1);
 
-    return (int)status;
+    if (!detach_only && slot > 0) {
+        (void)ag_session_focus(slot);
+    }
+    return 0;
 }
 
 static int cmd_log(int argc, char **argv)
@@ -1390,41 +1379,65 @@ static int cmd_kill(int argc, char **argv)
     }
 }
 
+static int cmd_slots(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+
+    ag_session_slot_t slots[AG_SESSION_SLOTS];
+    ag_session_info(slots);
+    const int focused = ag_session_focused();
+
+    ag_console_puts("  slot  pid   name\n");
+    for (int i = 0; i < AG_SESSION_SLOTS; i++) {
+        if (i == AG_SESSION_SYSTEM) {
+            ag_console_printf("  %d%s   -     system\n", i,
+                              focused == i ? "*" : " ");
+            continue;
+        }
+        if (slots[i].pid == AG_PID_KERNEL) {
+            ag_console_printf("  %d%s   -     (empty)\n", i,
+                              focused == i ? "*" : " ");
+        } else {
+            ag_console_printf("  %d%s   %-4u  %s\n", i, focused == i ? "*" : " ",
+                              (unsigned)slots[i].pid,
+                              slots[i].name[0] ? slots[i].name : "?");
+        }
+    }
+    return 0;
+}
+
 static int cmd_fg(int argc, char **argv)
 {
     if (argc != 2) {
-        ag_console_printf("usage: fg <pid>\n");
+        ag_console_printf("usage: fg <slot|pid>\n");
         return 1;
     }
 
-    const ag_pid_t pid = (ag_pid_t)atoi(argv[1]);
-    ag_err_t       err = ag_proc_set_foreground(pid);
-    if (err != AG_OK) {
+    const int n = atoi(argv[1]);
+
+    /* 0..3 → session slot; larger numbers → pid. */
+    if (n >= 0 && n < AG_SESSION_SLOTS) {
+        const ag_err_t err = ag_session_focus(n);
+        if (err != AG_OK) {
+            ag_console_printf("slot %d empty\n", n);
+            return 1;
+        }
+        return 0;
+    }
+
+    const ag_pid_t pid = (ag_pid_t)n;
+    const int      slot = ag_session_slot_of(pid);
+    if (slot < 0) {
         ag_console_printf("no process with pid %u\n", (unsigned)pid);
         return 1;
     }
-
-    /*
-     * Bringing it to the front means the shell steps back: it waits, rather
-     * than going on reading the same keyboard the process now owns.
-     */
-    int32_t status = 0;
-    err = ag_proc_wait(pid, &status, UINT32_MAX);
-
-    ag_console_lock();
-    ag_screen_set_attr(ag_console_screen(), AG_ATTR_DEFAULT);
-    ag_screen_set_cursor(ag_console_screen(), true);
-    ag_console_unlock();
-
-    if (err == -AG_EKILLED) {
-        ag_console_printf("pid %u stopped\n", (unsigned)pid);
-        return 1;
-    }
+    const ag_err_t err = ag_session_focus(slot);
     if (err != AG_OK) {
-        ag_console_printf("pid %u: %d\n", (unsigned)pid, (int)err);
+        ag_console_printf("could not focus pid %u\n", (unsigned)pid);
         return 1;
     }
-    return (int)status;
+    return 0;
 }
 
 static const ag_command_t k_commands[] = {
@@ -1446,8 +1459,9 @@ static const ag_command_t k_commands[] = {
      "modules: list, load, install to C:, unload, I2C probe", cmd_drv},
     {"io", "[pin [mode]] | i2c <bus>", "pins and buses", cmd_io},
     {"ps", "", "list running applications", cmd_ps},
+    {"slots", "", "list session slots (* = focused)", cmd_slots},
     {"kill", "<pid>", "stop an application", cmd_kill},
-    {"fg", "<pid>", "bring an application to the foreground and wait", cmd_fg},
+    {"fg", "<slot|pid>", "focus a session slot (or pid's slot)", cmd_fg},
     {"dir", "[path]", "list a directory", ag_cmd_dir},
     {"cd", "[path]", "change directory", ag_cmd_cd},
     {"type", "<file>", "print a file", ag_cmd_type},
@@ -1644,16 +1658,29 @@ void ag_shell_run(void)
     ag_log_set_echo(false);
 
     ag_console_puts("\nType 'help' for a list of commands.\n");
+    ag_console_puts("Ctrl+\\ = system shell; Alt+1..4 / Alt+Tab = session slots.\n");
 
     for (;;) {
+        /* Do not steal keys while a user slot owns the keyboard. */
+        while (ag_session_focused() != AG_SESSION_SYSTEM) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+
         ag_lineedit_reset(&s_line);
         show_prompt();
         redraw_line(&s_line, &s_prompt_pos);
 
         bool done = false;
         while (!done) {
+            if (ag_session_focused() != AG_SESSION_SYSTEM) {
+                ag_console_lock();
+                ag_console_set_live(NULL, NULL);
+                ag_console_unlock();
+                break;
+            }
+
             ag_event_t ev;
-            if (!ag_console_read_event(&ev, UINT32_MAX)) {
+            if (!ag_console_read_event(&ev, 50)) {
                 continue;
             }
 

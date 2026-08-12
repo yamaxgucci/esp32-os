@@ -19,7 +19,9 @@ param(
     [string]$SdImage = 'build\sdcard.img',
     # Open Espressif QEMU's virtual RGB panel (SDL window). Soft fb / gfx flush
     # land there. Serial console stays on stdio or -Tcp; keep focus on that
-    # terminal for keyboard (the SDL window is video-only).
+    # terminal for OS keys (the SDL window is video-only).
+    # Break-in: Ctrl+\ in the console → system shell; again within 1s → kill.
+    # Soft-stop guest: F12 (host often eats Ctrl+C). Alt+1..4 / Alt+Tab = slots.
     [switch]$Gfx,
     # Live host folder as guest H: (UART1 ↔ tools/hostfsd.py on HostFsPort).
     [string]$HostFs = '',

@@ -298,6 +298,17 @@ int ag_main(int argc, char **argv)
                 s_p.quit = 1;
                 break;
             }
+            if (ev.type == AG_EV_FOCUS_LOST) {
+                /* Session switched away — stop drawing until focus returns. */
+                continue;
+            }
+            if (ev.type == AG_EV_FOCUS_GAINED) {
+                s_p.dirty = 1;
+                continue;
+            }
+            if (!ag_focused()) {
+                continue;
+            }
             if (ev.type == AG_EV_KEY_DOWN || ev.type == AG_EV_KEY_UP) {
                 amp_handle_key(&s_p, (int)ev.key.keycode,
                                ev.type == AG_EV_KEY_DOWN, ev.key.mods);
@@ -307,6 +318,11 @@ int ag_main(int argc, char **argv)
                        ev.type == AG_EV_WHEEL) {
                 amp_ui_pointer(&s_p, &ev);
             }
+        }
+        if (!ag_focused()) {
+            ag_heartbeat();
+            ag_delay(50);
+            continue;
         }
         /* Paint "loading..." first, then HostFS open (can stall on slow H:). */
         if (s_p.want_open && s_p.pending_path[0]) {

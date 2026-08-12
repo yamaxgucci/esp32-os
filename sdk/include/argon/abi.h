@@ -60,7 +60,7 @@ extern "C" {
  * 0.19 appended sys->module_on_unload so .SYS can close TCP listens on reload.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 19u
+#define AG_ABI_MINOR 20u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -79,6 +79,7 @@ enum ag_errno {
     AG_OK = 0,
     AG_EPERM = 1,     /* operation not permitted                */
     AG_ENOENT = 2,    /* no such file, device or symbol         */
+    AG_EINTR = 4,     /* interrupted by signal / stop request   */
     AG_EIO = 5,       /* hardware or media I/O error            */
     AG_EBADF = 9,     /* invalid handle                         */
     AG_EAGAIN = 11,   /* would block / try again                */
@@ -875,6 +876,12 @@ typedef struct ag_proc_api {
      * work takes, which is a promise only it can make.
      */
     void (*watchdog)(uint32_t ms);
+
+    /*
+     * ABI 0.20: true while this process's session slot has keyboard/display
+     * focus.  Outside focus, apps should not flush/swap or run heavy redraw.
+     */
+    bool (*focused)(void);
 } ag_proc_api_t;
 
 /* ------------------------------------------------------------------------ */

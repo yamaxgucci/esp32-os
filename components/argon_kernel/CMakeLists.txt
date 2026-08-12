@@ -40,6 +40,7 @@ set(ARGON_KERNEL_SRCS
     "src/loader/api.c"
     "src/net/net.c"
     "src/proc/proc.c"
+    "src/proc/session.c"
     "src/proc/threads.c"
     "src/proc/fault.c"
     "src/proc/supervisor.c"

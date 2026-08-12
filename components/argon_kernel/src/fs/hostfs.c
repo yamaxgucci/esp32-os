@@ -11,6 +11,7 @@
 #include <argon/hsfs_proto.h>
 #include <argon/input.h>
 #include <argon/log.h>
+#include <argon/proc.h>
 #include <argon/vfs.h>
 
 #include "driver/uart.h"
@@ -43,6 +44,7 @@ typedef struct {
 } hsfs_dir_t;
 
 static SemaphoreHandle_t s_rpc_mu;
+static TaskHandle_t      s_rpc_holder;
 static bool              s_uart_up;
 static bool              s_mounted;
 static uint16_t          s_seq;
@@ -227,11 +229,18 @@ static bool read_all(void *buf, size_t len, uint32_t timeout_ms)
     const TickType_t deadline =
         xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
     while (left > 0) {
+        if (ag_proc_stopping()) {
+            return false;
+        }
         const TickType_t now = xTaskGetTickCount();
         if (now >= deadline) {
             return false;
         }
-        const TickType_t slice = deadline - now;
+        TickType_t slice = deadline - now;
+        /* Cap slices so kill/stop is noticed within ~50 ms. */
+        if (slice > pdMS_TO_TICKS(50)) {
+            slice = pdMS_TO_TICKS(50);
+        }
         const int n = uart_read_bytes(HSFS_UART, p, left, slice);
         if (n < 0) {
             return false;
@@ -288,6 +297,7 @@ static ag_err_t rpc(uint16_t op, uint32_t a0, uint32_t a1, const char *path,
     }
 
     xSemaphoreTake(s_rpc_mu, portMAX_DELAY);
+    s_rpc_holder = xTaskGetCurrentTaskHandle();
 
     const uint16_t seq = ++s_seq;
     hsfs_hdr_t     req = {
@@ -369,8 +379,17 @@ static ag_err_t rpc(uint16_t op, uint32_t a0, uint32_t a1, const char *path,
     err = (ag_err_t)resp.status;
 
 done:
+    if (ag_proc_stopping()) {
+        err = -AG_EINTR;
+    }
+    s_rpc_holder = NULL;
     xSemaphoreGive(s_rpc_mu);
     return err;
+}
+
+void *ag_hostfs_rpc_holder(void)
+{
+    return (void *)s_rpc_holder;
 }
 
 /* Drain unsolicited PADPUSH while no RPC is in flight (SMS play loop). */

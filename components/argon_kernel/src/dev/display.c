@@ -18,6 +18,8 @@
 #include <argon/draw.h>
 #include <argon/log.h>
 #include <argon/path.h>
+#include <argon/proc.h>
+#include <argon/session.h>
 #include <argon/vfs.h>
 
 #include "dev/font8x16.h"
@@ -63,6 +65,7 @@ static uint16_t  s_h;
 static uint32_t  s_stride; /* bytes per row */
 static bool      s_ready;
 static bool      s_acquired;
+static ag_pid_t  s_owner = AG_PID_KERNEL;
 static bool      s_have_snap;
 static bool      s_front_owned; /* false when front is QEMU's dedicated FB */
 static uint32_t  s_console_gen;
@@ -347,6 +350,19 @@ static const ag_dev_ops_t k_fb_ops = {
 /* gfx API                                                                 */
 /* ---------------------------------------------------------------------- */
 
+static bool gfx_may_present(void)
+{
+    if (!s_acquired) {
+        return false;
+    }
+    /* Safety net: ignore flush/swap from a background session slot. */
+    const ag_pid_t me = ag_proc_self();
+    if (me != AG_PID_KERNEL && me != ag_session_focused_pid()) {
+        return false;
+    }
+    return true;
+}
+
 static ag_err_t gfx_acquire(ag_gfxinfo_t *out)
 {
     if (!s_ready || s_front == NULL) {
@@ -356,6 +372,7 @@ static ag_err_t gfx_acquire(ag_gfxinfo_t *out)
         return -AG_EBUSY;
     }
     s_acquired = true;
+    s_owner = ag_proc_self();
     s_clip_x = 0;
     s_clip_y = 0;
     s_clip_w = 0;
@@ -384,7 +401,7 @@ static void gfx_release(void)
     if (!s_acquired) {
         return;
     }
-    /* Show the last drawn frame and keep a snapshot for gfxdump. */
+    /* Show the last drawn frame and keep a snapshot for gfxdump / Alt-Tab. */
     present_draw_to_front();
     if (s_snap != NULL && s_front != NULL) {
         memcpy(s_snap, s_front, fb_bytes());
@@ -392,6 +409,7 @@ static void gfx_release(void)
     }
     s_draw = s_front;
     s_acquired = false;
+    s_owner = AG_PID_KERNEL;
     s_console_gen = 0; /* force a full console redraw on the next tick */
     if (ag_console_ready()) {
         ag_console_lock();
@@ -402,6 +420,9 @@ static void gfx_release(void)
 
 static void gfx_flush(uint16_t x, uint16_t y, uint16_t w, uint16_t h)
 {
+    if (!gfx_may_present()) {
+        return;
+    }
     if (w == 0 || h == 0) {
         present_draw_to_front();
         return;
@@ -411,6 +432,9 @@ static void gfx_flush(uint16_t x, uint16_t y, uint16_t w, uint16_t h)
 
 static void gfx_swap(void)
 {
+    if (!gfx_may_present()) {
+        return;
+    }
     present_draw_to_front();
 }
 
@@ -679,6 +703,33 @@ const ag_gfx_api_t ag_gfx_api_table = {
 bool ag_display_ready(void) { return s_ready; }
 
 bool ag_display_acquired(void) { return s_acquired; }
+
+ag_pid_t ag_display_owner(void) { return s_owner; }
+
+void ag_display_force_release(void) { gfx_release(); }
+
+void ag_display_show_overlay(const char *label)
+{
+    if (!s_ready || s_front == NULL) {
+        return;
+    }
+    if (s_have_snap && s_snap != NULL) {
+        memcpy(s_front, s_snap, fb_bytes());
+    }
+    if (label != NULL && label[0] != '\0') {
+        /* Dark bar + label at top of the soft framebuffer. */
+        fill_rect_raw(0, 0, (int32_t)s_w, 20, 0x1082);
+        const uint16_t fg = 0xFFFF;
+        const uint16_t bg = 0x1082;
+        int32_t cx = 8;
+        for (const char *p = label; *p != '\0' && cx + 8 < (int32_t)s_w; p++) {
+            draw_glyph(cx, 2, (uint8_t)*p, fg, bg);
+            cx += 8;
+        }
+    }
+    s_draw = s_front;
+    qemu_present();
+}
 
 void ag_display_render_console(const ag_screen_t *screen)
 {

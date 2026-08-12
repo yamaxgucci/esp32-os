@@ -83,6 +83,7 @@ static const char *api_strerror(ag_err_t err)
     case AG_OK:        return "ok";
     case AG_EPERM:     return "not permitted";
     case AG_ENOENT:    return "not found";
+    case AG_EINTR:     return "interrupted";
     case AG_EIO:       return "input/output error";
     case AG_EBADF:     return "bad handle";
     case AG_EAGAIN:    return "try again";
@@ -516,6 +517,9 @@ static const ag_time_api_t k_time = {
  */
 static bool api_inp_poll(ag_event_t *out, uint32_t timeout_ms)
 {
+    if (ag_proc_take_focus_event(out)) {
+        return true;
+    }
     if (!has_the_keyboard()) {
         return false;
     }
@@ -740,6 +744,7 @@ static const ag_proc_api_t k_proc = {
     .setenv = NULL,
     .interrupted = ag_proc_interrupted,
     .watchdog = ag_proc_watchdog,
+    .focused = ag_proc_focused,
 };
 
 /* ---------------------------------------------------------------------- */

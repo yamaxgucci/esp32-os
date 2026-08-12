@@ -9,6 +9,8 @@
 #include <string.h>
 
 #include <argon/console.h>
+#include <argon/hostfs.h>
+#include <argon/session.h>
 #include <argon/audio.h>
 #include <argon/display.h>
 #include <argon/kernel.h>
@@ -282,14 +284,15 @@ static void reap(proc_t *p)
                (unsigned)pins);
     }
 
-    /* Graphics mode is process-scoped: dying without release must not leave
-     * the soft framebuffer permanently stolen from the text console. */
-    if (ag_display_acquired()) {
+    /* Graphics: only release if this pid still owns the display. */
+    if (ag_display_owner() == p->pid) {
         ag_gfx_api_table.release();
     }
     if (ag_audio_opened()) {
         ag_audio_api_table.close();
     }
+
+    ag_session_unbind(p->pid);
 
     ag_loader_unload(&p->app);
 
@@ -334,7 +337,8 @@ static bool holds_kernel_lock(TaskHandle_t task)
         return false;
     }
     return ag_console_lock_holder() == (void *)task ||
-           ag_storage_vfs_lock_holder() == (void *)task;
+           ag_storage_vfs_lock_holder() == (void *)task ||
+           ag_hostfs_rpc_holder() == (void *)task;
 }
 
 bool ag_proc_task_in_kernel(TaskHandle_t task)
@@ -730,8 +734,19 @@ ag_err_t ag_proc_spawn(const char *path, int argc, char **argv, uint32_t flags,
     if (out_pid != NULL) {
         *out_pid = p->pid;
     }
-    unlock();
-    return AG_OK;
+    {
+        const ag_pid_t  bound_pid = p->pid;
+        char            bound_name[32];
+        set_string(bound_name, sizeof(bound_name), p->name);
+        unlock();
+        const ag_err_t bind_err = ag_session_bind(bound_pid, bound_name);
+        if (bind_err != AG_OK) {
+            ag_log(AG_LOG_WARN, "proc",
+                   "pid %u: no free session slot (%d)", (unsigned)bound_pid,
+                   (int)bind_err);
+        }
+        return AG_OK;
+    }
 }
 
 ag_err_t ag_proc_exec(const char *path, int argc, char **argv, uint32_t flags,
@@ -1252,6 +1267,51 @@ bool ag_proc_interrupted(void)
         return false;
     }
     p->signalled = false;
+    return true;
+}
+
+bool ag_proc_stopping(void)
+{
+    proc_t *p = current();
+    if (p == NULL) {
+        return false;
+    }
+    return p->signalled || p->killed;
+}
+
+bool ag_proc_focused(void)
+{
+    proc_t *p = current();
+    if (p == NULL) {
+        return ag_session_focused() == AG_SESSION_SYSTEM;
+    }
+    return ag_session_focused_pid() == p->pid;
+}
+
+void ag_proc_post_focus_event(ag_pid_t pid, bool gained)
+{
+    lock();
+    proc_t *p = by_pid(pid);
+    if (p != NULL) {
+        p->focus_ev = gained ? 1u : 2u;
+    }
+    unlock();
+}
+
+bool ag_proc_take_focus_event(ag_event_t *out)
+{
+    if (out == NULL) {
+        return false;
+    }
+    proc_t *p = current();
+    if (p == NULL || p->focus_ev == 0) {
+        return false;
+    }
+    const uint8_t kind = p->focus_ev;
+    p->focus_ev = 0;
+    memset(out, 0, sizeof(*out));
+    out->type = (kind == 1u) ? AG_EV_FOCUS_GAINED : AG_EV_FOCUS_LOST;
+    out->ts = (ag_time_t)esp_timer_get_time();
     return true;
 }
 

@@ -408,6 +408,16 @@ static inline bool ag_interrupted(void)
 }
 
 /*
+ * True while this process's session slot has keyboard/display focus.
+ * Outside focus, stop flush/swap and heavy redraw; sleep or yield until
+ * AG_EV_FOCUS_GAINED (or this returns true again).
+ */
+static inline bool ag_focused(void)
+{
+    return g_ag_api->proc->focused != NULL && g_ag_api->proc->focused();
+}
+
+/*
  * Promises to call ag_heartbeat() at least every `ms`; the system stops this
  * process if it does not.  0 disarms.  Only arm it if the promise is true - a
  * long wait for input counts as not reporting.

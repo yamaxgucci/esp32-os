@@ -7,6 +7,8 @@
 
 #include <string.h>
 
+#include <argon/path.h>
+
 typedef struct {
     char               point[32];
     size_t             point_len;
@@ -418,26 +420,50 @@ ag_handle_t ag_vfs_open(const char *path, const char *cwd, uint32_t flags)
         return -AG_ENOTSUP;
     }
 
+    /*
+     * Drop the VFS lock across the backend open: HostFS (and slow SD) can block
+     * for seconds.  Holding the lock that long makes Ctrl+\ return -AG_EBUSY
+     * with no useful console feedback.
+     */
+    void              *ctx = r.mount->ctx;
+    const ag_fs_ops_t *ops = r.mount->ops;
+    char               rel_copy[AG_PATH_MAX];
+    strncpy(rel_copy, r.rel != NULL ? r.rel : "/", sizeof(rel_copy) - 1);
+    rel_copy[sizeof(rel_copy) - 1] = '\0';
+    const int mount_index = r.index;
+    const uint32_t mount_flags = r.mount->flags;
+    unlock();
+
     void *file = NULL;
-    err = r.mount->ops->open(r.mount->ctx, r.rel, flags, &file);
+    err = ops->open(ctx, rel_copy, flags, &file);
     if (err != AG_OK) {
-        unlock();
         return err;
     }
 
-    const ag_handle_t h = alloc_slot();
-    if (h < 0) {
-        if (r.mount->ops->close != NULL) {
-            r.mount->ops->close(r.mount->ctx, file);
+    lock();
+    if (!s_mounts[mount_index].used || s_mounts[mount_index].ejected) {
+        if (ops->close != NULL) {
+            unlock();
+            (void)ops->close(ctx, file);
+            return -AG_EIO;
         }
         unlock();
+        return -AG_EIO;
+    }
+    const ag_handle_t h = alloc_slot();
+    if (h < 0) {
+        unlock();
+        if (ops->close != NULL) {
+            (void)ops->close(ctx, file);
+        }
         return h;
     }
 
-    s_handles[h].mount = (uint8_t)r.index;
+    s_handles[h].mount = (uint8_t)mount_index;
     s_handles[h].obj = file;
     s_handles[h].is_dir = false;
-    r.mount->open_handles++;
+    s_mounts[mount_index].open_handles++;
+    (void)mount_flags;
 
     unlock();
     return h;
@@ -506,11 +532,12 @@ int32_t ag_vfs_read(ag_handle_t h, void *buf, size_t len)
         unlock();
         return -AG_ENOTSUP;
     }
-
-    const int32_t n = ref.mount->ops->read(ref.mount->ctx, ref.slot->obj, buf,
-                                           len);
+    void              *ctx = ref.mount->ctx;
+    void              *obj = ref.slot->obj;
+    int32_t (*read_fn)(void *, void *, void *, size_t) = ref.mount->ops->read;
     unlock();
-    return n;
+
+    return read_fn(ctx, obj, buf, len);
 }
 
 int32_t ag_vfs_write(ag_handle_t h, const void *buf, size_t len)
@@ -531,11 +558,13 @@ int32_t ag_vfs_write(ag_handle_t h, const void *buf, size_t len)
         unlock();
         return -AG_ENOTSUP;
     }
-
-    const int32_t n = ref.mount->ops->write(ref.mount->ctx, ref.slot->obj, buf,
-                                            len);
+    void              *ctx = ref.mount->ctx;
+    void              *obj = ref.slot->obj;
+    int32_t (*write_fn)(void *, void *, const void *, size_t) =
+        ref.mount->ops->write;
     unlock();
-    return n;
+
+    return write_fn(ctx, obj, buf, len);
 }
 
 int64_t ag_vfs_seek(ag_handle_t h, int64_t off, int whence)
@@ -552,11 +581,12 @@ int64_t ag_vfs_seek(ag_handle_t h, int64_t off, int whence)
         unlock();
         return -AG_ENOTSUP;
     }
-
-    const int64_t pos = ref.mount->ops->seek(ref.mount->ctx, ref.slot->obj, off,
-                                             whence);
+    void    *ctx = ref.mount->ctx;
+    void    *obj = ref.slot->obj;
+    int64_t (*seek_fn)(void *, void *, int64_t, int) = ref.mount->ops->seek;
     unlock();
-    return pos;
+
+    return seek_fn(ctx, obj, off, whence);
 }
 
 ag_err_t ag_vfs_sync(ag_handle_t h)

@@ -21,6 +21,7 @@
 #include <argon/keys.h>
 #include <argon/log.h>
 #include <argon/proc.h>
+#include <argon/session.h>
 #include <argon/vfs.h>
 
 #include "proc/proc_internal.h"
@@ -49,6 +50,8 @@ static TaskHandle_t      s_task;
 static volatile bool     s_stop_request;
 static volatile bool     s_interrupt_request;
 static volatile bool     s_shell_interrupt;
+static volatile bool     s_alt_tab_request;
+static volatile int      s_focus_slot_request; /* -1 = none, 0..3 = slot */
 static volatile ag_pid_t s_kill_request;
 static uint32_t          s_stops;
 
@@ -60,9 +63,22 @@ void ag_supervisor_kill_request(ag_pid_t pid)
     }
 }
 
+static void request_soft_interrupt(ag_event_t *ev)
+{
+    if (ag_proc_foreground() != AG_PID_KERNEL) {
+        s_interrupt_request = true;
+        if (s_task != NULL) {
+            xTaskNotifyGive(s_task);
+        }
+        ev->type = AG_EV_QUIT;
+    } else {
+        s_shell_interrupt = true;
+    }
+}
+
 /*
  * Runs on the console task, so it decides and returns; the work happens on the
- * supervisor's own task.
+ * supervisor's own task (except session focus, which is safe here).
  */
 static bool hotkeys(ag_event_t *ev)
 {
@@ -74,9 +90,8 @@ static bool hotkeys(ag_event_t *ev)
     const uint16_t key = ev->key.keycode;
 
     /*
-     * Two ways to say "stop this now": Ctrl-Alt-Del from a real keyboard, and
-     * Ctrl+\ from a terminal, which has no way to send the first.  Both are
-     * swallowed - they are for the system, not for whatever is running.
+     * Break-in: Ctrl-Alt-Del (USB HID) or Ctrl+\ (terminal).  Swallowed.
+     * First press → system shell; second within 1 s → kill last user app.
      */
     const bool ctrl_alt_del = (mods & AG_MOD_CTRL) && (mods & AG_MOD_ALT) &&
                               key == AG_KEY_DELETE;
@@ -91,68 +106,42 @@ static bool hotkeys(ag_event_t *ev)
         return true;
     }
 
-    /*
-     * Ctrl+C is a request, not an order: the application is told, and it decides.
-     * With an application in front, the key becomes AG_EV_QUIT and is delivered
-     * as that - so an application blocked in a read wakes up and hears the
-     * request, instead of the key sitting in the queue for whoever reads next.
-     * With nothing running it is left alone, which is what keeps the shell's own
-     * Ctrl+C working.
-     */
-    if ((mods & AG_MOD_CTRL) && key == AG_KEY_C) {
-        if (ag_proc_foreground() != AG_PID_KERNEL) {
-            s_interrupt_request = true;
+    /* Alt+` → system slot; Alt+1..4 → that slot; Alt+Tab → cycle. */
+    if (mods & AG_MOD_ALT) {
+        if (key == AG_KEY_GRAVE) {
+            s_focus_slot_request = AG_SESSION_SYSTEM;
             if (s_task != NULL) {
                 xTaskNotifyGive(s_task);
             }
-            ev->type = AG_EV_QUIT;
-        } else {
-            /*
-             * Aimed at the shell.  Recorded rather than acted on, and the key
-             * still goes through: at the prompt it cancels the line, and in the
-             * middle of a long command it is what that command is checking for.
-             */
-            s_shell_interrupt = true;
+            return true;
         }
-        return false;
+        if (key >= AG_KEY_1 && key <= AG_KEY_4) {
+            s_focus_slot_request = (int)(key - AG_KEY_1);
+            if (s_task != NULL) {
+                xTaskNotifyGive(s_task);
+            }
+            return true;
+        }
+        if (key == AG_KEY_TAB) {
+            s_alt_tab_request = true;
+            if (s_task != NULL) {
+                xTaskNotifyGive(s_task);
+            }
+            return true;
+        }
+    }
+
+    /*
+     * Soft stop: Ctrl+C (often eaten by the QEMU host) and F12 (reliable guest
+     * path under -Gfx).
+     */
+    if (((mods & AG_MOD_CTRL) && key == AG_KEY_C) || key == AG_KEY_F12) {
+        request_soft_interrupt(ev);
+        /* F12 is swallowed; Ctrl+C may become AG_EV_QUIT for the app. */
+        return key == AG_KEY_F12;
     }
 
     return false;
-}
-
-static void stop_foreground(void)
-{
-    const ag_pid_t fg = ag_proc_foreground();
-
-    if (fg == AG_PID_KERNEL) {
-        /*
-         * The stop key is aimed at whatever is in front, and background work is
-         * deliberately not in front - a global key that reached into the
-         * background would stop things nobody was looking at.  So say which
-         * situation this is, because the two need different answers.
-         *
-         * And no reboot, which is what DOS did here: on a machine that is
-         * supposed to be running something, a stray keypress must not take the
-         * system down with everything it was doing.
-         */
-        if (ag_proc_count() > 0) {
-            ag_log(AG_LOG_INFO, "supervisor",
-                   "nothing in the foreground; %u process(es) in the "
-                   "background - stop one with kill <pid>, see ps",
-                   (unsigned)ag_proc_count());
-        } else {
-            ag_log(AG_LOG_INFO, "supervisor",
-                   "stop requested with nothing running; use reboot to restart");
-        }
-        return;
-    }
-
-    s_stops++;
-    const ag_err_t err = ag_proc_kill(fg, "stopped from the keyboard");
-    if (err != AG_OK && err != -AG_ENOENT) {
-        ag_log(AG_LOG_ERROR, "supervisor", "could not stop pid %u: %d",
-               (unsigned)fg, (int)err);
-    }
 }
 
 static void interrupt_foreground(void)
@@ -246,7 +235,23 @@ static void supervisor_task(void *arg)
         }
         if (s_stop_request) {
             s_stop_request = false;
-            stop_foreground();
+            if (ag_session_enter_system()) {
+                s_stops++;
+            }
+        }
+        if (s_alt_tab_request) {
+            s_alt_tab_request = false;
+            (void)ag_session_alt_tab();
+        }
+        {
+            const int slot = s_focus_slot_request;
+            if (slot >= 0) {
+                s_focus_slot_request = -1;
+                const ag_err_t err = ag_session_focus(slot);
+                if (err != AG_OK && ag_console_ready()) {
+                    ag_console_printf("slot %d empty\n", slot);
+                }
+            }
         }
         /*
          * A process that asked to be ended from inside itself - a thread that
@@ -299,6 +304,9 @@ ag_err_t ag_supervisor_init(void)
     if (err != AG_OK) {
         return err;
     }
+
+    ag_session_init();
+    s_focus_slot_request = -1;
 
     /*
      * Before any application can run: from here on a fault in one costs that
