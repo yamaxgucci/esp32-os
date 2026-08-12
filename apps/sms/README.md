@@ -109,8 +109,8 @@ Without HostFS, SMS falls back to **serial sticky keys** (no key-up). Force with
 
 ## Controls / video (`sms.cfg`)
 
-Load order (first readable wins): `sms.cfg` beside the ROM, then cwd `sms.cfg`,
-then `h:\sms.cfg`, then `a:\sms.cfg`. Startup logs `sms: cfg …` and
+Load order (first readable wins): `sms.cfg` beside the ROM, beside `SMS.AXE`,
+cwd `sms.cfg`, then `h:\sms.cfg` / `a:\sms.cfg`. Startup logs `sms: cfg …` and
 `sms: video = fullscreen …` or `sms: video = 1:1 centered`.
 
 ```

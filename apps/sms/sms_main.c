@@ -545,6 +545,28 @@ static int looks_like_wav_path(const char *s)
            (s[n - 1] == 'v' || s[n - 1] == 'V');
 }
 
+static int looks_like_sound_target(const char *s)
+{
+    if (s == NULL || s[0] == '\0') {
+        return 0;
+    }
+    if (looks_like_wav_path(s)) {
+        return 1;
+    }
+    /* Device paths only — do not steal POSIX ROM paths like /sys/Sega/x.sms. */
+    if ((s[0] == 'd' || s[0] == 'D') && s[1] == ':') {
+        return 1;
+    }
+    if (s[0] == '/' &&
+        (s[1] == 'd' || s[1] == 'D') &&
+        (s[2] == 'e' || s[2] == 'E') &&
+        (s[3] == 'v' || s[3] == 'V') &&
+        (s[4] == '/' || s[4] == '\0')) {
+        return 1;
+    }
+    return 0;
+}
+
 int ag_main(int argc, char **argv)
 {
     const char *rom = NULL;
@@ -600,9 +622,7 @@ int ag_main(int argc, char **argv)
             }
             continue;
         }
-        if (looks_like_wav_path(argv[i]) ||
-            (argv[i][0] == '/' ||
-             ((argv[i][0] == 'd' || argv[i][0] == 'D') && argv[i][1] == ':'))) {
+        if (looks_like_sound_target(argv[i])) {
             want_sound = 1;
             wav_path = argv[i];
             continue;
@@ -625,7 +645,8 @@ int ag_main(int argc, char **argv)
     option.spritelimit = 1;
 
     char cfg_from[AG_PATH_MAX];
-    sms_cfg_load(&s_cfg, rom, cfg_from, sizeof(cfg_from));
+    const char *exe = (argc > 0) ? argv[0] : NULL;
+    sms_cfg_load(&s_cfg, rom, exe, cfg_from, sizeof(cfg_from));
     s_fullscreen = s_cfg.fullscreen ? 1 : 0;
     if (s_fullscreen) {
         const size_t nbytes =
