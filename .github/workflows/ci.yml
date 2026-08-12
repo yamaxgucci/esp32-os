@@ -1,0 +1,43 @@
+# Local equivalent: argon check (host tests + idf.py build).
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  host:
+    name: Host tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build gcc g++
+
+      - name: Configure and build host tests
+        run: |
+          cmake -S host-tests -B build-host -G Ninja
+          cmake --build build-host
+
+      - name: Run ctest
+        run: ctest --test-dir build-host --output-on-failure
+
+  firmware:
+    name: Firmware build (esp32s3)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build with ESP-IDF 5.5
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v5.5.5
+          target: esp32s3
+          command: idf.py build

@@ -49,6 +49,7 @@ argon test ... "~\x1c"   послать сырые байты, не дожида
 argon test -cp 866 ...   разобрать экран как CP866, а не CP437
 argon tests              юнит-тесты на ПК (2773 проверки)
 argon check              локальный CI: `tests` + сборка прошивки
+                         (то же в GitHub Actions: `.github/workflows/ci.yml`)
 argon vt                 умеет ли эта консоль показывать экран
 argon flash -port COM5   прошить настоящую плату
 ```
