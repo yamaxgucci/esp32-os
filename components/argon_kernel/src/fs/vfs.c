@@ -5,6 +5,7 @@
  */
 #include <argon/vfs.h>
 
+#include <stdio.h>
 #include <string.h>
 
 #include <argon/path.h>
@@ -667,6 +668,46 @@ ag_err_t ag_vfs_stat(const char *path, const char *cwd, ag_stat_t *out)
     err = r.mount->ops->stat(r.mount->ctx, r.rel, out);
     unlock();
     return err;
+}
+
+ag_err_t ag_vfs_realpath(const char *path, const char *cwd, char *out,
+                         size_t outlen)
+{
+    if (out == NULL || outlen == 0) {
+        return -AG_EINVAL;
+    }
+
+    resolved_t r;
+    lock();
+    ag_err_t err = resolve(path, cwd, &r);
+    if (err != AG_OK) {
+        unlock();
+        return err;
+    }
+
+    char rel[AG_PATH_MAX];
+    if (strlen(r.rel) >= sizeof(rel)) {
+        unlock();
+        return -AG_ERANGE;
+    }
+    memcpy(rel, r.rel, strlen(r.rel) + 1);
+
+    if (r.mount->ops->canonicalize != NULL) {
+        err = r.mount->ops->canonicalize(r.mount->ctx, rel, sizeof(rel));
+        if (err != AG_OK) {
+            unlock();
+            return err;
+        }
+    }
+
+    int n;
+    if (rel[0] == '/' && rel[1] == '\0') {
+        n = snprintf(out, outlen, "%s", r.mount->point);
+    } else {
+        n = snprintf(out, outlen, "%s%s", r.mount->point, rel);
+    }
+    unlock();
+    return (n < 0 || (size_t)n >= outlen) ? -AG_ERANGE : AG_OK;
 }
 
 /* The three single-path mutating operations differ only in which op to call. */

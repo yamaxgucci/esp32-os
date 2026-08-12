@@ -5,6 +5,7 @@
  */
 #include <argon/ramfs.h>
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -640,6 +641,63 @@ static ag_err_t ramfs_info(void *ctx, ag_fsinfo_t *out)
     return AG_OK;
 }
 
+static ag_err_t ramfs_canonicalize(void *ctx, char *rel, size_t rel_len)
+{
+    ag_ramfs_t *fs = (ag_ramfs_t *)ctx;
+
+    if (rel == NULL || rel_len == 0) {
+        return -AG_EINVAL;
+    }
+
+    char        out[AG_PATH_MAX];
+    size_t      at = 0;
+    ram_node_t *node = &fs->root;
+    const char *p = rel;
+
+    out[0] = '\0';
+    while (*p != '\0') {
+        while (*p == '/') {
+            p++;
+        }
+        if (*p == '\0') {
+            break;
+        }
+        const char *start = p;
+        while (*p != '\0' && *p != '/') {
+            p++;
+        }
+        const size_t len = (size_t)(p - start);
+        if (!node->is_dir) {
+            return -AG_ENOTDIR;
+        }
+        ram_node_t *child = find_child(node, start, len);
+        if (child == NULL) {
+            return -AG_ENOENT;
+        }
+        const int n =
+            snprintf(out + at, sizeof(out) - at, "/%s", child->name);
+        if (n < 0 || (size_t)n >= sizeof(out) - at) {
+            return -AG_ERANGE;
+        }
+        at += (size_t)n;
+        node = child;
+    }
+
+    if (at == 0) {
+        if (rel_len < 2) {
+            return -AG_ERANGE;
+        }
+        rel[0] = '/';
+        rel[1] = '\0';
+        return AG_OK;
+    }
+    if (at >= rel_len) {
+        return -AG_ERANGE;
+    }
+    memcpy(rel, out, at + 1);
+    return AG_OK;
+}
+
 static const ag_fs_ops_t k_ramfs_ops = {
     .name = "ram",
     .open = ramfs_open,
@@ -658,6 +716,7 @@ static const ag_fs_ops_t k_ramfs_ops = {
     .readdir = ramfs_readdir,
     .closedir = ramfs_closedir,
     .info = ramfs_info,
+    .canonicalize = ramfs_canonicalize,
 };
 
 const ag_fs_ops_t *ag_ramfs_ops(void) { return &k_ramfs_ops; }

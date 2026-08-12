@@ -53,6 +53,12 @@ typedef struct {
     ag_err_t (*closedir)(void *ctx, void *dir);
 
     ag_err_t (*info)(void *ctx, ag_fsinfo_t *out);
+
+    /*
+     * Rewrite `rel` in place to the on-disk spelling (DOS-style case fold).
+     * Optional: NULL means the resolved path is already final.
+     */
+    ag_err_t (*canonicalize)(void *ctx, char *rel, size_t rel_len);
 } ag_fs_ops_t;
 
 enum ag_mount_flags {
@@ -106,6 +112,13 @@ ag_err_t ag_vfs_unlink(const char *path, const char *cwd);
 ag_err_t ag_vfs_rename(const char *from, const char *to, const char *cwd);
 ag_err_t ag_vfs_mkdir(const char *path, const char *cwd);
 ag_err_t ag_vfs_rmdir(const char *path, const char *cwd);
+
+/*
+ * Absolute path with on-disk component spelling (when the backend can fold
+ * case).  Used by `cd` so the cwd matches what `dir` will open.
+ */
+ag_err_t ag_vfs_realpath(const char *path, const char *cwd, char *out,
+                         size_t outlen);
 
 ag_handle_t ag_vfs_opendir(const char *path, const char *cwd);
 ag_err_t ag_vfs_readdir(ag_handle_t h, ag_dirent_t *out);

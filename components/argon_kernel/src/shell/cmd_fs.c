@@ -187,7 +187,13 @@ int ag_cmd_cd(int argc, char **argv)
         return 1;
     }
 
-    err = ag_shell_set_cwd(resolved);
+    char real[AG_PATH_MAX];
+    err = ag_vfs_realpath(resolved, NULL, real, sizeof(real));
+    if (err == AG_OK) {
+        err = ag_shell_set_cwd(real);
+    } else {
+        err = ag_shell_set_cwd(resolved);
+    }
     if (err != AG_OK) {
         print_error(argv[1], err);
         return 1;

@@ -79,55 +79,129 @@ static ag_err_t full_path(const ag_idfvfs_t *fs, const char *rel, char *out,
 }
 
 /*
- * littlefs is case-sensitive; DOS habits are not.  If the exact path misses,
- * look in the parent directory for a case-insensitive name match and rewrite
- * `path` in place (still under fs->base).
+ * Look up `want` in `dirpath`.  Prefer an exact spelling when both an exact and
+ * a case-only sibling exist (so a mistaken empty `sega` next to `Sega` stays
+ * reachable).  On success writes the on-disk name into `found`.
  */
-static ag_err_t fixup_case(char *path, size_t pathlen)
+static ag_err_t lookup_ci(const char *dirpath, const char *want, char *found,
+                          size_t foundlen)
 {
-    struct stat st;
-    if (stat(path, &st) == 0) {
-        return AG_OK;
-    }
-
-    char *slash = strrchr(path, '/');
-    if (slash == NULL || slash[1] == '\0') {
-        return -AG_ENOENT;
-    }
-
-    const char *want = slash + 1;
-    char        dirbuf[AG_PATH_MAX];
-    const size_t dir_len = (size_t)(slash - path);
-    if (dir_len >= sizeof(dirbuf)) {
-        return -AG_ERANGE;
-    }
-    memcpy(dirbuf, path, dir_len);
-    dirbuf[dir_len] = '\0';
-
-    DIR *dir = opendir(dirbuf[0] != '\0' ? dirbuf : "/");
+    DIR *dir = opendir((dirpath[0] != '\0') ? dirpath : "/");
     if (dir == NULL) {
         return -AG_ENOENT;
     }
 
-    ag_err_t          err = -AG_ENOENT;
-    struct dirent    *ent;
+    char        folded[AG_NAME_MAX];
+    bool        have_fold = false;
+    const char *pick = NULL;
+
+    struct dirent *ent;
     while ((ent = readdir(dir)) != NULL) {
         if (ent->d_name[0] == '.' &&
             (ent->d_name[1] == '\0' ||
              (ent->d_name[1] == '.' && ent->d_name[2] == '\0'))) {
             continue;
         }
-        if (ag_path_icmp(ent->d_name, want) != 0) {
-            continue;
+        if (strcmp(ent->d_name, want) == 0) {
+            pick = ent->d_name;
+            break;
         }
-        const int n =
-            snprintf(path, pathlen, "%s/%s",
-                     dirbuf[0] != '\0' ? dirbuf : "", ent->d_name);
-        err = (n > 0 && (size_t)n < pathlen) ? AG_OK : -AG_ERANGE;
-        break;
+        if (!have_fold && ag_path_icmp(ent->d_name, want) == 0) {
+            if (strlen(ent->d_name) >= sizeof(folded)) {
+                closedir(dir);
+                return -AG_ERANGE;
+            }
+            memcpy(folded, ent->d_name, strlen(ent->d_name) + 1);
+            have_fold = true;
+        }
+    }
+
+    ag_err_t err = -AG_ENOENT;
+    if (pick != NULL || have_fold) {
+        const char *name = (pick != NULL) ? pick : folded;
+        if (strlen(name) >= foundlen) {
+            err = -AG_ERANGE;
+        } else {
+            memcpy(found, name, strlen(name) + 1);
+            err = AG_OK;
+        }
     }
     closedir(dir);
     return err;
+}
+
+/*
+ * littlefs is case-sensitive; DOS habits are not.  Walk every component under
+ * the mount base and rewrite `path` to the on-disk spelling.
+ *
+ * When `force` is false and the exact path already exists, leave it alone
+ * (open/stat fast path).  When `force` is true, always rebuild from directory
+ * entries so `cd` / realpath get the real names.
+ */
+static ag_err_t fixup_case(const ag_idfvfs_t *fs, char *path, size_t pathlen,
+                           bool force)
+{
+    struct stat st;
+    if (!force && stat(path, &st) == 0) {
+        return AG_OK;
+    }
+
+    if (strncmp(path, fs->base, fs->base_len) != 0) {
+        return -AG_ENOENT;
+    }
+
+    char        built[AG_PATH_MAX];
+    const int   nbase = snprintf(built, sizeof(built), "%s", fs->base);
+    if (nbase < 0 || (size_t)nbase >= sizeof(built)) {
+        return -AG_ERANGE;
+    }
+
+    const char *p = path + fs->base_len;
+    while (*p == '/') {
+        p++;
+    }
+    if (*p == '\0') {
+        if ((size_t)nbase >= pathlen) {
+            return -AG_ERANGE;
+        }
+        memcpy(path, built, (size_t)nbase + 1);
+        return AG_OK;
+    }
+
+    while (*p != '\0') {
+        const char *slash = strchr(p, '/');
+        const size_t len = (slash != NULL) ? (size_t)(slash - p) : strlen(p);
+        char         want[AG_NAME_MAX];
+        if (len == 0 || len >= sizeof(want)) {
+            return (len == 0) ? -AG_ENOENT : -AG_ERANGE;
+        }
+        memcpy(want, p, len);
+        want[len] = '\0';
+
+        char found[AG_NAME_MAX];
+        const ag_err_t err = lookup_ci(built, want, found, sizeof(found));
+        if (err != AG_OK) {
+            return err;
+        }
+
+        char next[AG_PATH_MAX];
+        const int n = snprintf(next, sizeof(next), "%s/%s", built, found);
+        if (n < 0 || (size_t)n >= sizeof(next)) {
+            return -AG_ERANGE;
+        }
+        memcpy(built, next, (size_t)n + 1);
+
+        p += len;
+        while (*p == '/') {
+            p++;
+        }
+    }
+
+    if (strlen(built) >= pathlen) {
+        return -AG_ERANGE;
+    }
+    memcpy(path, built, strlen(built) + 1);
+    return AG_OK;
 }
 
 static int to_posix_flags(uint32_t flags)
@@ -208,7 +282,7 @@ static ag_err_t idf_open(void *ctx, const char *rel, uint32_t flags, void **out)
 
     /* Do not invent a case match when CREATE would make a new file. */
     if ((flags & AG_O_CREATE) == 0) {
-        (void)fixup_case(path, sizeof(path));
+        (void)fixup_case(fs, path, sizeof(path), false);
     }
 
     /*
@@ -319,7 +393,7 @@ static ag_err_t idf_stat(void *ctx, const char *rel, ag_stat_t *out)
             out->attr = AG_A_DIR;
             return AG_OK;
         }
-        err = fixup_case(path, sizeof(path));
+        err = fixup_case(fs, path, sizeof(path), false);
         if (err != AG_OK) {
             return (err == -AG_ENOENT) ? from_errno(ENOENT) : err;
         }
@@ -335,8 +409,13 @@ static ag_err_t idf_stat(void *ctx, const char *rel, ag_stat_t *out)
 
 static ag_err_t idf_unlink(void *ctx, const char *rel)
 {
-    char     path[AG_PATH_MAX];
-    ag_err_t err = full_path((ag_idfvfs_t *)ctx, rel, path, sizeof(path));
+    ag_idfvfs_t *fs = (ag_idfvfs_t *)ctx;
+    char         path[AG_PATH_MAX];
+    ag_err_t     err = full_path(fs, rel, path, sizeof(path));
+    if (err != AG_OK) {
+        return err;
+    }
+    err = fixup_case(fs, path, sizeof(path), false);
     if (err != AG_OK) {
         return err;
     }
@@ -352,15 +431,19 @@ static ag_err_t idf_unlink(void *ctx, const char *rel)
 
 static ag_err_t idf_rename(void *ctx, const char *from, const char *to)
 {
-    char from_path[AG_PATH_MAX];
-    char to_path[AG_PATH_MAX];
+    ag_idfvfs_t *fs = (ag_idfvfs_t *)ctx;
+    char         from_path[AG_PATH_MAX];
+    char         to_path[AG_PATH_MAX];
 
-    ag_err_t err = full_path((ag_idfvfs_t *)ctx, from, from_path,
-                             sizeof(from_path));
+    ag_err_t err = full_path(fs, from, from_path, sizeof(from_path));
     if (err != AG_OK) {
         return err;
     }
-    err = full_path((ag_idfvfs_t *)ctx, to, to_path, sizeof(to_path));
+    err = fixup_case(fs, from_path, sizeof(from_path), false);
+    if (err != AG_OK) {
+        return err;
+    }
+    err = full_path(fs, to, to_path, sizeof(to_path));
     if (err != AG_OK) {
         return err;
     }
@@ -374,6 +457,14 @@ static ag_err_t idf_rename(void *ctx, const char *from, const char *to)
     if (stat(to_path, &st) == 0) {
         return -AG_EEXIST;
     }
+    /* Also refuse a case-only collision with an existing name. */
+    {
+        char folded[AG_PATH_MAX];
+        memcpy(folded, to_path, sizeof(folded));
+        if (fixup_case(fs, folded, sizeof(folded), false) == AG_OK) {
+            return -AG_EEXIST;
+        }
+    }
 
     errno = 0;
     return (rename(from_path, to_path) == 0) ? AG_OK : from_errno(errno);
@@ -381,10 +472,24 @@ static ag_err_t idf_rename(void *ctx, const char *from, const char *to)
 
 static ag_err_t idf_mkdir(void *ctx, const char *rel)
 {
-    char     path[AG_PATH_MAX];
-    ag_err_t err = full_path((ag_idfvfs_t *)ctx, rel, path, sizeof(path));
+    ag_idfvfs_t *fs = (ag_idfvfs_t *)ctx;
+    char         path[AG_PATH_MAX];
+    ag_err_t     err = full_path(fs, rel, path, sizeof(path));
     if (err != AG_OK) {
         return err;
+    }
+
+    struct stat st;
+    if (stat(path, &st) == 0) {
+        return -AG_EEXIST;
+    }
+    /* Do not create `sega` beside an existing `Sega` on littlefs. */
+    {
+        char folded[AG_PATH_MAX];
+        memcpy(folded, path, sizeof(folded));
+        if (fixup_case(fs, folded, sizeof(folded), false) == AG_OK) {
+            return -AG_EEXIST;
+        }
     }
 
     errno = 0;
@@ -393,8 +498,13 @@ static ag_err_t idf_mkdir(void *ctx, const char *rel)
 
 static ag_err_t idf_rmdir(void *ctx, const char *rel)
 {
-    char     path[AG_PATH_MAX];
-    ag_err_t err = full_path((ag_idfvfs_t *)ctx, rel, path, sizeof(path));
+    ag_idfvfs_t *fs = (ag_idfvfs_t *)ctx;
+    char         path[AG_PATH_MAX];
+    ag_err_t     err = full_path(fs, rel, path, sizeof(path));
+    if (err != AG_OK) {
+        return err;
+    }
+    err = fixup_case(fs, path, sizeof(path), false);
     if (err != AG_OK) {
         return err;
     }
@@ -418,6 +528,11 @@ static ag_err_t idf_opendir(void *ctx, const char *rel, void **out)
     }
 
     ag_err_t err = full_path(fs, rel, d->path, sizeof(d->path));
+    if (err != AG_OK) {
+        free(d);
+        return err;
+    }
+    err = fixup_case(fs, d->path, sizeof(d->path), false);
     if (err != AG_OK) {
         free(d);
         return err;
@@ -492,6 +607,43 @@ static ag_err_t idf_info(void *ctx, ag_fsinfo_t *out)
     return AG_OK;
 }
 
+static ag_err_t idf_canonicalize(void *ctx, char *rel, size_t rel_len)
+{
+    ag_idfvfs_t *fs = (ag_idfvfs_t *)ctx;
+    char         path[AG_PATH_MAX];
+
+    if (rel == NULL || rel_len == 0) {
+        return -AG_EINVAL;
+    }
+
+    ag_err_t err = full_path(fs, rel, path, sizeof(path));
+    if (err != AG_OK) {
+        return err;
+    }
+    err = fixup_case(fs, path, sizeof(path), true);
+    if (err != AG_OK) {
+        return err;
+    }
+
+    if (strcmp(path, fs->base) == 0) {
+        if (rel_len < 2) {
+            return -AG_ERANGE;
+        }
+        rel[0] = '/';
+        rel[1] = '\0';
+        return AG_OK;
+    }
+    if (strncmp(path, fs->base, fs->base_len) != 0) {
+        return -AG_EIO;
+    }
+    const char *tail = path + fs->base_len; /* begins with '/' */
+    if (strlen(tail) >= rel_len) {
+        return -AG_ERANGE;
+    }
+    memcpy(rel, tail, strlen(tail) + 1);
+    return AG_OK;
+}
+
 static const ag_fs_ops_t k_idfvfs_ops = {
     .name = "idf",
     .open = idf_open,
@@ -510,6 +662,7 @@ static const ag_fs_ops_t k_idfvfs_ops = {
     .readdir = idf_readdir,
     .closedir = idf_closedir,
     .info = idf_info,
+    .canonicalize = idf_canonicalize,
 };
 
 const ag_fs_ops_t *ag_idfvfs_ops(void) { return &k_idfvfs_ops; }
