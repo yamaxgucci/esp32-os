@@ -9,6 +9,7 @@
 static int ends_with_mp3(const char *name)
 {
     size_t n;
+    char   c0, c1, c2, c3;
     if (name == NULL) {
         return 0;
     }
@@ -16,19 +17,18 @@ static int ends_with_mp3(const char *name)
     if (n < 4) {
         return 0;
     }
-    /* Skip generator stub — it is not a real bitstream and wedges decode/HostFS. */
-    if (n == 8 &&
-        (name[0] == 'd' || name[0] == 'D') &&
-        (name[1] == 'e' || name[1] == 'E') &&
-        (name[2] == 'm' || name[2] == 'M') &&
-        (name[3] == 'o' || name[3] == 'O') &&
-        name[4] == '.' ) {
-        return 0;
+    /* Match ".mp3" / ".MP3" at end (also "...foo.mp3"). */
+    c0 = name[n - 4];
+    c1 = name[n - 3];
+    c2 = name[n - 2];
+    c3 = name[n - 1];
+    if (c1 >= 'A' && c1 <= 'Z') {
+        c1 = (char)(c1 - 'A' + 'a');
     }
-    return (name[n - 4] == '.' &&
-            (name[n - 3] == 'm' || name[n - 3] == 'M') &&
-            (name[n - 2] == 'p' || name[n - 2] == 'P') &&
-            (name[n - 1] == '3'));
+    if (c2 >= 'A' && c2 <= 'Z') {
+        c2 = (char)(c2 - 'A' + 'a');
+    }
+    return c0 == '.' && c1 == 'm' && c2 == 'p' && c3 == '3';
 }
 
 void amp_pl_init(amp_playlist_t *pl)
@@ -65,17 +65,20 @@ int amp_pl_add_dir(amp_playlist_t *pl, const char *dir)
     ag_dirent_t e;
     char        path[AG_PATH_MAX];
     int         added = 0;
+    int         seen = 0;
 
     if (pl == NULL || dir == NULL) {
         return -1;
     }
     h = ag_opendir(dir);
     if (h < 0) {
+        ag_printf("amp: opendir %s failed (%d)\n", dir, (int)h);
         return -1;
     }
     while (ag_readdir(h, &e) == AG_OK) {
         size_t dlen;
         size_t nlen;
+        seen++;
         if (e.name[0] == '.') {
             continue;
         }
@@ -97,9 +100,11 @@ int amp_pl_add_dir(amp_playlist_t *pl, const char *dir)
         memcpy(path + dlen, e.name, nlen + 1);
         if (amp_pl_add(pl, path) == 0) {
             added++;
+            ag_printf("amp: + %s\n", path);
         }
     }
     (void)ag_closedir(h);
+    ag_printf("amp: scan %s: %d entries, %d mp3\n", dir, seen, added);
     return added;
 }
 

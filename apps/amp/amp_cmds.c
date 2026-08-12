@@ -267,16 +267,25 @@ void amp_cmd_open_sel(amp_player_t *p)
 void amp_cmd_add_dirs(amp_player_t *p)
 {
     int n = 0;
+    int r;
     char msg[64];
     int i;
     if (p == NULL) {
         return;
     }
-    /* Shallow dirs only (no recursion). Root H:\ included so drops there work. */
-    n += amp_pl_add_dir(&p->pl, "h:\\amp");
-    n += amp_pl_add_dir(&p->pl, "h:\\music");
-    n += amp_pl_add_dir(&p->pl, "h:\\");
-    /* status: "N tracks" */
+    /* Shallow dirs only. Failed opendir counts as 0 added, not -1. */
+    r = amp_pl_add_dir(&p->pl, "h:\\amp");
+    if (r > 0) {
+        n += r;
+    }
+    r = amp_pl_add_dir(&p->pl, "h:\\music");
+    if (r > 0) {
+        n += r;
+    }
+    r = amp_pl_add_dir(&p->pl, "h:\\");
+    if (r > 0) {
+        n += r;
+    }
     i = 0;
     if (p->pl.count >= 100) {
         msg[i++] = (char)('0' + (p->pl.count / 100) % 10);
@@ -292,13 +301,13 @@ void amp_cmd_add_dirs(amp_player_t *p)
     msg[i++] = 'c';
     msg[i++] = 'k';
     msg[i++] = 's';
-    if (n <= 0 && p->pl.count == 0) {
+    msg[i] = '\0';
+    if (p->pl.count == 0) {
         set_status(p, "no mp3 (Eject/A)");
     } else {
-        msg[i] = '\0';
         set_status(p, msg);
     }
-    ag_printf("amp: playlist %d (+%d) — Eject or A to rescan, Enter to play\n",
+    ag_printf("amp: playlist %d (+%d). Eject/A=rescan, Enter=play\n",
               p->pl.count, n);
 }
 
