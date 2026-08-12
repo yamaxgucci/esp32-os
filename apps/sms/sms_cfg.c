@@ -237,35 +237,94 @@ static void parse_cfg_text(sms_cfg_t *cfg, char *text)
     }
 }
 
-int sms_cfg_load(sms_cfg_t *cfg, const char *rom_path, char *loaded_path,
-                 size_t loaded_len)
+static int is_abs_path(const char *path)
+{
+    if (path == NULL || path[0] == '\0') {
+        return 0;
+    }
+    if (path[0] == '/' || path[0] == '\\') {
+        return 1;
+    }
+    return (path[1] == ':' &&
+            ((path[0] >= 'a' && path[0] <= 'z') ||
+             (path[0] >= 'A' && path[0] <= 'Z')));
+}
+
+/* Resolve relative paths against the process cwd so "game.sms" still finds
+ * sms.cfg in that directory. */
+static int make_abs_path(const char *path, char *out, size_t outlen)
+{
+    if (path == NULL || path[0] == '\0' || out == NULL || outlen == 0) {
+        return 0;
+    }
+    if (is_abs_path(path)) {
+        strncpy(out, path, outlen - 1);
+        out[outlen - 1] = '\0';
+        return 1;
+    }
+
+    char cwd[AG_PATH_MAX];
+    if (ag_getcwd(cwd, sizeof(cwd)) != AG_OK) {
+        return 0;
+    }
+    size_t n = strlen(cwd);
+    while (n > 1 && (cwd[n - 1] == '/' || cwd[n - 1] == '\\')) {
+        cwd[--n] = '\0';
+    }
+    if (n + 1 + strlen(path) >= outlen) {
+        return 0;
+    }
+    memcpy(out, cwd, n);
+    out[n] = '/';
+    memcpy(out + n + 1, path, strlen(path) + 1);
+    return 1;
+}
+
+/* Replace the final path component with sms.cfg. */
+static int path_beside(const char *file, char *out, size_t outlen)
+{
+    char abs[AG_PATH_MAX];
+    if (!make_abs_path(file, abs, sizeof(abs))) {
+        return 0;
+    }
+
+    size_t cut = 0;
+    for (size_t i = 0; abs[i] != '\0'; i++) {
+        if (abs[i] == '\\' || abs[i] == '/' || abs[i] == ':') {
+            cut = i + 1;
+        }
+    }
+    if (cut == 0 || cut + 8 > outlen) {
+        return 0;
+    }
+    memcpy(out, abs, cut);
+    memcpy(out + cut, "sms.cfg", 8);
+    return 1;
+}
+
+int sms_cfg_load(sms_cfg_t *cfg, const char *rom_path, const char *exe_path,
+                 char *loaded_path, size_t loaded_len)
 {
     sms_cfg_set_defaults(cfg);
     if (loaded_path != NULL && loaded_len > 0) {
         loaded_path[0] = '\0';
     }
 
-    char beside[AG_PATH_MAX];
-    beside[0] = '\0';
+    char beside_rom[AG_PATH_MAX];
+    char beside_exe[AG_PATH_MAX];
+    beside_rom[0] = '\0';
+    beside_exe[0] = '\0';
     if (rom_path != NULL && rom_path[0] != '\0') {
-        size_t cut = 0;
-        for (size_t i = 0; rom_path[i] != '\0' && i + 1 < sizeof(beside); i++) {
-            beside[i] = rom_path[i];
-            if (rom_path[i] == '\\' || rom_path[i] == '/' ||
-                rom_path[i] == ':') {
-                cut = i + 1;
-            }
-        }
-        if (cut > 0 && cut + 8 < sizeof(beside)) {
-            memcpy(beside + cut, "sms.cfg", 8);
-        } else {
-            beside[0] = '\0';
-        }
+        (void)path_beside(rom_path, beside_rom, sizeof(beside_rom));
+    }
+    if (exe_path != NULL && exe_path[0] != '\0') {
+        (void)path_beside(exe_path, beside_exe, sizeof(beside_exe));
     }
 
-    /* More specific first: beside the ROM wins over the HostFS default. */
+    /* More specific first: beside ROM, beside .AXE, cwd, then HostFS / A:. */
     const char *cands[] = {
-        beside[0] != '\0' ? beside : NULL,
+        beside_rom[0] != '\0' ? beside_rom : NULL,
+        beside_exe[0] != '\0' ? beside_exe : NULL,
         "sms.cfg",
         "h:\\sms.cfg",
         "/host/sms.cfg",
@@ -281,6 +340,12 @@ int sms_cfg_load(sms_cfg_t *cfg, const char *rom_path, char *loaded_path,
     int loaded = 0;
     for (int i = 0; cands[i] != NULL; i++) {
         if (cands[i][0] == '\0') {
+            continue;
+        }
+        /* Skip duplicate beside paths (ROM and AXE in the same folder). */
+        if (i > 0 && cands[0] != NULL && cands[i] == beside_exe &&
+            beside_rom[0] != '\0' &&
+            strcmp(beside_rom, beside_exe) == 0) {
             continue;
         }
         if (read_cfg_file(cands[i], buf, CFG_MAX) >= 0) {
