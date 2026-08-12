@@ -4,7 +4,7 @@
  * Backs /tmp.  Small, allocation-bounded, and free of any dependency on the
  * chip, which also makes it the filesystem the VFS core is tested against.
  *
- * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #ifndef ARGON_RAMFS_H
 #define ARGON_RAMFS_H

@@ -11,7 +11,7 @@
  * wrong does not drive them at boot, before anybody has had a chance to look at
  * the console and notice.
  *
- * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #include "dev/io.h"
 

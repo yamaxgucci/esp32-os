@@ -14,7 +14,7 @@
  *
  * Regenerate the fixtures with host-tests/fixtures/regenerate.ps1.
  *
- * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #include <argon/axeload.h>
 

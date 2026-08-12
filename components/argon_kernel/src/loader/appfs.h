@@ -1,7 +1,7 @@
 /*
  * ArgonOS - flash slots for application code (R-1 XIP).
  *
- * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #ifndef ARGON_APPFS_H
 #define ARGON_APPFS_H

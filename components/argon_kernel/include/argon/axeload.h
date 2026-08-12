@@ -7,7 +7,7 @@
  * about where the memory came from is somebody else's problem, which is what
  * makes this testable on a host against a reference build.
  *
- * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #ifndef ARGON_AXELOAD_H
 #define ARGON_AXELOAD_H

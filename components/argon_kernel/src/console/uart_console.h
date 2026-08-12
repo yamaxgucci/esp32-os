@@ -1,7 +1,7 @@
 /*
  * ArgonOS - UART console endpoint (kernel private).
  *
- * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #ifndef ARGON_UART_CONSOLE_H
 #define ARGON_UART_CONSOLE_H

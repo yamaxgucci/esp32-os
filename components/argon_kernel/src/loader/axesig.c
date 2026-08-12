@@ -9,7 +9,7 @@
  * MAC covers the whole file with those 24 bytes treated as zero, so the tag
  * does not cover itself.
  *
- * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #include <argon/axesig.h>
 

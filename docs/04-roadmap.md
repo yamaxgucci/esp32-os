@@ -542,7 +542,7 @@ back-буфер `gfx`, pad layer, `stats`/`fps30`. Фаязуллин не ис�
 звуком ~125% realtime; стартовые кадры и I2S — ещё открыты.
 
 ✅ **Mute SMS.AXE** (7 августа 2026) — vendored SMS Plus GX в `apps/sms/`
-(GPLv2+; ядро ArgonOS остаётся Apache-2.0). QEMU: `run` + soft `gfx` +
+(GPLv2+; ядро ArgonOS — GPL-3.0-or-later, SDK/ABI — Apache-2.0). QEMU: `run` + soft `gfx` +
 клавиатура→pad + `gfxdump`; звук opt-in: PSG+FM→WAV/mock; FM = OPLL→`ag_fm`
 (не полный `ym2413.c`). Дальше на плате — I2S, USB gamepad, замер % realtime.
 

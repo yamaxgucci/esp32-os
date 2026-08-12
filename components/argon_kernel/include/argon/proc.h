@@ -11,7 +11,7 @@
  * What is added over DOS is accounting, and accounting is what makes a hung
  * application removable instead of a reason to reboot (architecture §5).
  *
- * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #ifndef ARGON_PROC_H
 #define ARGON_PROC_H

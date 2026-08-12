@@ -33,7 +33,7 @@
  * goes straight to the panic path.  That is the correct outcome anyway, and it is
  * why the panic handler is the one that lives in IRAM and this one does not.
  *
- * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #include "proc/proc_internal.h"
 

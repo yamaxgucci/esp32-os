@@ -9,7 +9,7 @@
  * it, except for one thing: being scheduled at all while an application is
  * spinning on the other core.  That is what it is for.
  *
- * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #include "proc/supervisor.h"
 

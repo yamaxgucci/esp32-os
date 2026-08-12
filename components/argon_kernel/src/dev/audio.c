@@ -4,7 +4,7 @@
  * Real output (virt TCP, I2S, …) is published by loadable .SYS drivers.
  * api->audio is a convenience alias for the null sink.
  *
- * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #include "argon/audio.h"
 

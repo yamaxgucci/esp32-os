@@ -10,7 +10,7 @@
  * wrap what ESP-IDF already provides (FAT on a card or on flash).  The core
  * has no idea which is which, which is what lets it be tested on a host.
  *
- * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #ifndef ARGON_VFS_H
 #define ARGON_VFS_H

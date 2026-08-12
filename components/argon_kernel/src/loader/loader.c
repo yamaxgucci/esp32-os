@@ -6,7 +6,7 @@
  * and giving all of it back afterwards - belongs to the process layer in
  * src/proc/, so that nothing here has to know what a process is.
  *
- * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #include <argon/loader.h>
 

@@ -19,7 +19,7 @@
  * host.  Matching a .SYS to a chip on a bus lives next door, in probe.h: the
  * registry only stores what was registered, not how the driver was chosen.
  *
- * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #ifndef ARGON_DEVICE_H
 #define ARGON_DEVICE_H

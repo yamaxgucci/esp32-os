@@ -1,7 +1,7 @@
 /*
  * ArgonOS - VT100 renderer for the virtual text screen.
  *
- * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #include <argon/vtout.h>
 

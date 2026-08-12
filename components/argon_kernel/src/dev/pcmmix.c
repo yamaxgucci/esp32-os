@@ -7,7 +7,7 @@
  * written to a single exclusive sink: pcmvirt if present, else pcm0, else
  * pcmnull.  Missing clients contribute silence for that period.
  *
- * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #include "argon/audio.h"
 

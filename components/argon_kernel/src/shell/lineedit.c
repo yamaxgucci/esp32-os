@@ -7,7 +7,7 @@
  * cannot represent is not accepted at all - which is better than accepting it as
  * two bytes that would then behave as two characters everywhere else.
  *
- * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #include <argon/lineedit.h>
 

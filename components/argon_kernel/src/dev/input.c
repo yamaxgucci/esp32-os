@@ -1,7 +1,7 @@
 /*
  * ArgonOS - pad / button input layer and /dev/joy0.
  *
- * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #include <argon/input.h>
 

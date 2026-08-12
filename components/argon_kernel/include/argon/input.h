@@ -6,7 +6,7 @@
  * as the /dev/joy0 character device.  H:\sms.pad remains a compatibility
  * view of the same cache.
  *
- * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #ifndef ARGON_INPUT_H
 #define ARGON_INPUT_H

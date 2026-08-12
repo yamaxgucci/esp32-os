@@ -12,7 +12,7 @@
  * is not handed out, because a resource nobody owns outlives the process and
  * there is no second chance to notice.
  *
- * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #include "proc/proc_internal.h"
 

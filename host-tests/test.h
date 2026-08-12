@@ -4,7 +4,7 @@
  * Deliberately tiny: the point of host tests is to run kernel logic without a
  * board, not to adopt a framework.
  *
- * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #ifndef ARGON_TEST_H
 #define ARGON_TEST_H

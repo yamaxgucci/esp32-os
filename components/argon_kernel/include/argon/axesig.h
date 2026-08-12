@@ -1,7 +1,7 @@
 /*
  * ArgonOS - HMAC signature over a .AXE file (header reserved[6]).
  *
- * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #ifndef ARGON_AXESIG_H
 #define ARGON_AXESIG_H

@@ -1,7 +1,7 @@
 /*
  * ArgonOS - storage bring-up (kernel private).
  *
- * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #ifndef ARGON_STORAGE_H
 #define ARGON_STORAGE_H

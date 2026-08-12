@@ -4,7 +4,7 @@
  * Separate and dependency-free because argument parsing is exactly the kind of
  * code that quietly gets edge cases wrong.
  *
- * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #ifndef ARGON_CMDLINE_H
 #define ARGON_CMDLINE_H

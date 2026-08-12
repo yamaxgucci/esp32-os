@@ -1,7 +1,7 @@
 /*
  * ArgonOS - session slots (per-slot shell + optional app) and system shell.
  *
- * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #ifndef ARGON_SESSION_H
 #define ARGON_SESSION_H

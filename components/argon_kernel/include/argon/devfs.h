@@ -12,7 +12,7 @@
  * that have to remember to close what a dead process left open, and the second
  * one would be the one that forgets.
  *
- * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #ifndef ARGON_DEVFS_H
 #define ARGON_DEVFS_H
