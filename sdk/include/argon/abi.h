@@ -60,7 +60,7 @@ extern "C" {
  * 0.19 appended sys->module_on_unload so .SYS can close TCP listens on reload.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 20u
+#define AG_ABI_MINOR 21u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -828,6 +828,8 @@ typedef struct {
     size_t          mem_used;
     uint32_t        cpu_permille; /* rough CPU share, 0..1000              */
     ag_time_t       started;
+    /* 0=low, 1=normal, 2=high — see ag_proc_prio_t in argon/proc.h */
+    uint8_t         priority;
 } ag_procinfo_t;
 
 enum ag_spawn_flags {

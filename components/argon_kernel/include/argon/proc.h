@@ -33,6 +33,15 @@ extern "C" {
 /* The pid the kernel's own work belongs to: the shell, the console, drivers. */
 #define AG_PID_KERNEL 0
 
+/* Scheduling class for process main tasks (below the supervisor). */
+typedef enum {
+    AG_PRIO_LOW = 0,
+    AG_PRIO_NORMAL = 1,
+    AG_PRIO_HIGH = 2,
+} ag_proc_prio_t;
+
+typedef int (*ag_proc_entry_fn)(int argc, char **argv);
+
 ag_err_t ag_proc_init(void);
 
 /*
@@ -46,11 +55,27 @@ ag_err_t ag_proc_init(void);
 ag_err_t ag_proc_exec(const char *path, int argc, char **argv, uint32_t flags,
                       int32_t *exit_code);
 
-/* Starts it and returns its pid without waiting. */
+/*
+ * Starts it and returns its pid without waiting.  Image load runs on the new
+ * process task so the caller (shell) is not blocked on HostFS/XIP.
+ */
 ag_err_t ag_proc_spawn(const char *path, int argc, char **argv, uint32_t flags,
                        ag_pid_t *out_pid);
 
+/*
+ * Same as spawn, but entry is already in the kernel image (no .AXE load).
+ * `stack_bytes` / `heap_bytes` of 0 mean the kernel defaults.
+ */
+ag_err_t ag_proc_spawn_builtin(const char *name, ag_proc_entry_fn entry,
+                               int argc, char **argv, uint32_t flags,
+                               uint32_t stack_bytes, uint32_t heap_bytes,
+                               ag_pid_t *out_pid);
+
 ag_err_t ag_proc_wait(ag_pid_t pid, int32_t *exit_code, uint32_t timeout_ms);
+
+ag_err_t    ag_proc_set_priority(ag_pid_t pid, ag_proc_prio_t prio);
+ag_err_t    ag_proc_get_priority(ag_pid_t pid, ag_proc_prio_t *out);
+const char *ag_proc_prio_name(ag_proc_prio_t prio);
 
 /*
  * Ends a process that is not going to end by itself.  Refuses with -AG_EBUSY

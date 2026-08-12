@@ -61,6 +61,9 @@ typedef struct {
     char  argbuf[AG_LINE_MAX];
 
     char cwd[AG_PATH_MAX];
+    /* Path for deferred AXE load inside proc_task; empty for builtins. */
+    char path[AG_PATH_MAX];
+    bool load_pending;
 
     void               *heap_mem;
     multi_heap_handle_t heap;
@@ -74,6 +77,9 @@ typedef struct {
     uint32_t  watchdog_ms; /* 0 = not watched, which is the default          */
     uint32_t  stack_bytes;
     uint32_t  stack_unused;
+
+    /* User/sched class: AG_PRIO_LOW / NORMAL / HIGH (see argon/proc.h). */
+    uint8_t sched_class;
 
     ag_proc_fault_t fault;
 

@@ -299,7 +299,7 @@ int ag_main(int argc, char **argv)
                 break;
             }
             if (ev.type == AG_EV_FOCUS_LOST) {
-                /* Session switched away — stop drawing until focus returns. */
+                /* Keep decode/playback; only UI pauses. */
                 continue;
             }
             if (ev.type == AG_EV_FOCUS_GAINED) {
@@ -324,9 +324,29 @@ int ag_main(int argc, char **argv)
                 amp_ui_pointer(&s_p, &ev);
             }
         }
+        /* Open / decode / audio continue without focus; drawing does not. */
+        if (s_p.want_open && s_p.pending_path[0]) {
+            char path[AG_PATH_MAX];
+            strncpy(path, s_p.pending_path, sizeof(path) - 1);
+            path[sizeof(path) - 1] = '\0';
+            s_p.want_open = 0;
+            s_p.pending_path[0] = '\0';
+            if (ag_focused()) {
+                amp_ui_draw(&s_p);
+                s_p.dirty = 0;
+                ui_ms = ag_millis();
+            }
+            ag_printf("amp: opening %s\n", path);
+            s_sync_empty = 0;
+            (void)amp_open_track(&s_p, path);
+            amp_pace_sync();
+        }
+        pump_audio();
         if (!ag_focused()) {
             ag_heartbeat();
-            ag_delay(50);
+            if (s_p.state != AMP_PLAYING) {
+                ag_delay(10);
+            }
             continue;
         }
         {
@@ -338,22 +358,6 @@ int ag_main(int argc, char **argv)
                 s_p.dirty = 1;
             }
         }
-        /* Paint "loading..." first, then HostFS open (can stall on slow H:). */
-        if (s_p.want_open && s_p.pending_path[0]) {
-            char path[AG_PATH_MAX];
-            strncpy(path, s_p.pending_path, sizeof(path) - 1);
-            path[sizeof(path) - 1] = '\0';
-            s_p.want_open = 0;
-            s_p.pending_path[0] = '\0';
-            amp_ui_draw(&s_p);
-            s_p.dirty = 0;
-            ui_ms = ag_millis();
-            ag_printf("amp: opening %s\n", path);
-            s_sync_empty = 0;
-            (void)amp_open_track(&s_p, path);
-            amp_pace_sync();
-        }
-        pump_audio();
         {
             uint32_t now = ag_millis();
             uint32_t ui_period =

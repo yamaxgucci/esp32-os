@@ -11,10 +11,6 @@
 #include "fm.h"
 #include "fm_ui.h"
 
-#ifdef AG_BUILTIN
-#include <argon/shell.h>
-#endif
-
 /* Big enough that copying is not a syscall per kilobyte, small enough that two
  * of them are nothing next to the arena. */
 #define FM_COPY_CHUNK (8u * 1024u)
@@ -293,32 +289,23 @@ void fm_view(void)
 /* ---------------------------------------------------------------------- */
 
 /*
- * Soft stop while a long copy runs on the shell task (builtin) or as an .AXE.
- * The supervisor already accepted Ctrl+C; this is the cooperative half.
- *
- * For an .AXE, Ctrl+C is also queued as AG_EV_QUIT.  That means "cancel the
- * copy" while we are inside copy_file, not "leave the manager" - so we consume
- * those events here and clear the interrupt after handling cancel.
+ * Soft stop while a long copy runs.  Ctrl+C / signal cancels; Alt+N only sends
+ * FOCUS_LOST and must not abort the copy (work continues in the background).
  */
 static bool copy_cancelled(void)
 {
     bool hit = false;
 
-#ifdef AG_BUILTIN
-    if (ag_shell_interrupted()) {
-        hit = true;
-    }
-#else
     if (ag_interrupted()) {
         hit = true;
     }
-#endif
 
     ag_event_t ev;
     while (ag_poll_event(&ev, 0)) {
         if (ev.type == AG_EV_QUIT) {
             hit = true;
         }
+        /* FOCUS_* ignored — unfocus is not cancel. */
     }
     return hit;
 }
@@ -326,17 +313,20 @@ static bool copy_cancelled(void)
 /* After a cancelled copy: do not let a leftover QUIT close the manager. */
 static void absorb_copy_interrupt(void)
 {
-#ifdef AG_BUILTIN
-    ag_shell_clear_interrupted();
-#else
     (void)ag_interrupted();
-#endif
     ag_flush_input();
 }
 
 /* Modal progress over the panels: title, bar, percent / KB — no spinner. */
 static void copy_progress(const char *label, uint64_t done, uint64_t total)
 {
+    /* Background slot: keep copying, do not paint over the focused app. */
+    if (!ag_focused()) {
+        ag_heartbeat();
+        ag_yield();
+        return;
+    }
+
     const int w = FM_COPY_DLG_W;
     const int h = FM_COPY_DLG_H;
     const int x = (FM_COLS - w) / 2;

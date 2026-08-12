@@ -453,7 +453,7 @@ static int cmd_run(int argc, char **argv)
     }
 
     const int slot = ag_session_slot_of(pid);
-    ag_console_printf("started pid %u in slot %d\n", (unsigned)pid,
+    ag_console_printf("started pid %u in slot %d (loading)\n", (unsigned)pid,
                       slot >= 0 ? ag_session_display_number(slot) : -1);
 
     /*
@@ -572,7 +572,8 @@ static int cmd_ps(int argc, char **argv)
     (void)argc;
     (void)argv;
 
-    ag_console_puts("  pid  name              state        memory     \n");
+    ag_console_puts(
+        "  pid  name              state        prio    memory\n");
 
     uint32_t shown = 0;
     for (uint32_t i = 0;; i++) {
@@ -580,8 +581,10 @@ static int cmd_ps(int argc, char **argv)
         if (ag_proc_info(i, &info) != AG_OK) {
             break;
         }
-        ag_console_printf("  %-4u %-17s %-12s %5u KB%s\n", (unsigned)info.pid,
-                          info.name, ag_proc_state_name(info.state),
+        ag_console_printf("  %-4u %-17s %-12s %-7s %5u KB%s\n",
+                          (unsigned)info.pid, info.name,
+                          ag_proc_state_name(info.state),
+                          ag_proc_prio_name((ag_proc_prio_t)info.priority),
                           (unsigned)(info.mem_used / 1024u),
                           info.foreground ? "  (foreground)" : "");
         shown++;
@@ -1328,16 +1331,105 @@ static int cmd_io(int argc, char **argv)
 }
 
 /*
- * The file manager, built into the image.  It is the same code as apps/fm builds
- * into a .AXE, called here directly instead of being loaded - so a board that
- * boots has one without anything having to be copied onto it.
+ * The file manager lives in the kernel image (same sources as apps/fm) but runs
+ * as a real process in the current session slot so Alt+N leaves it alive.
  */
 int ag_fm_main(int argc, char **argv);
 
 static int cmd_fm(int argc, char **argv)
 {
-    /* argv[0] is the command; the manager takes the two panels' directories. */
-    return ag_fm_main(argc, argv);
+    const int target_slot = ag_session_focused();
+
+    /* Already have FM in this slot — just focus it. */
+    {
+        ag_session_slot_t slots[AG_SESSION_SLOTS];
+        ag_session_info(slots);
+        if (slots[target_slot].pid != AG_PID_KERNEL &&
+            ag_path_icmp(slots[target_slot].name, "FM") == 0) {
+            (void)ag_session_focus(target_slot);
+            return 0;
+        }
+    }
+
+    ag_pid_t       pid = 0;
+    const ag_err_t err = ag_proc_spawn_builtin(
+        "FM", ag_fm_main, argc, argv,
+        (uint32_t)AG_SPAWN_BACKGROUND | (uint32_t)AG_SPAWN_NO_SESSION, 0, 0,
+        &pid);
+    if (err != AG_OK) {
+        ag_console_printf("fm: could not start (%d)\n", (int)err);
+        return 1;
+    }
+
+    if (ag_session_bind_to(pid, "FM", target_slot) != AG_OK) {
+        (void)ag_session_bind(pid, "FM");
+    }
+
+    const int slot = ag_session_slot_of(pid);
+    ag_console_printf("started fm pid %u in slot %d\n", (unsigned)pid,
+                      slot >= 0 ? ag_session_display_number(slot) : -1);
+
+    if (slot >= 0 && ag_session_focused() == target_slot) {
+        (void)ag_session_focus(slot);
+    }
+    return 0;
+}
+
+static ag_pid_t resolve_slot_or_pid(const char *arg)
+{
+    const int n = atoi(arg);
+    if (n >= 1 && n <= AG_SESSION_SLOTS) {
+        ag_session_slot_t slots[AG_SESSION_SLOTS];
+        ag_session_info(slots);
+        return slots[n - 1].pid;
+    }
+    return (ag_pid_t)n;
+}
+
+static int cmd_prio(int argc, char **argv)
+{
+    if (argc < 2 || argc > 3) {
+        ag_console_puts("usage: prio <slot|pid> [low|normal|high]\n");
+        return 1;
+    }
+
+    const ag_pid_t pid = resolve_slot_or_pid(argv[1]);
+    if (pid == AG_PID_KERNEL) {
+        ag_console_puts("no process in that slot\n");
+        return 1;
+    }
+
+    if (argc == 2) {
+        ag_proc_prio_t cur;
+        if (ag_proc_get_priority(pid, &cur) != AG_OK) {
+            ag_console_printf("pid %u not found\n", (unsigned)pid);
+            return 1;
+        }
+        ag_console_printf("pid %u priority %s\n", (unsigned)pid,
+                          ag_proc_prio_name(cur));
+        return 0;
+    }
+
+    ag_proc_prio_t want = AG_PRIO_NORMAL;
+    if (ag_path_icmp(argv[2], "low") == 0) {
+        want = AG_PRIO_LOW;
+    } else if (ag_path_icmp(argv[2], "normal") == 0) {
+        want = AG_PRIO_NORMAL;
+    } else if (ag_path_icmp(argv[2], "high") == 0) {
+        want = AG_PRIO_HIGH;
+    } else {
+        ag_console_puts("priority must be low, normal, or high\n");
+        return 1;
+    }
+
+    const ag_err_t err = ag_proc_set_priority(pid, want);
+    if (err != AG_OK) {
+        ag_console_printf("could not set priority: %d\n", (int)err);
+        return 1;
+    }
+    ag_console_printf("pid %u priority %s\n", (unsigned)pid,
+                      ag_proc_prio_name(want));
+    return 0;
 }
 
 int ag_edit_main(int argc, char **argv);
@@ -1428,15 +1520,18 @@ static int cmd_slots(int argc, char **argv)
     ag_session_info(slots);
     const int focused = ag_session_focused();
 
-    ag_console_puts("  slot  pid   name\n");
+    ag_console_puts("  slot  pid   prio     name\n");
     for (int i = 0; i < AG_SESSION_SLOTS; i++) {
         const int shown = ag_session_display_number(i);
         if (slots[i].pid == AG_PID_KERNEL) {
-            ag_console_printf("  %d%s   -     shell\n", shown,
+            ag_console_printf("  %d%s   -     -        shell\n", shown,
                               focused == i ? "*" : " ");
         } else {
-            ag_console_printf("  %d%s   %-4u  %s\n", shown,
-                              focused == i ? "*" : " ", (unsigned)slots[i].pid,
+            ag_proc_prio_t pr = AG_PRIO_NORMAL;
+            (void)ag_proc_get_priority(slots[i].pid, &pr);
+            ag_console_printf("  %d%s   %-4u  %-7s  %s\n", shown,
+                              focused == i ? "*" : " ",
+                              (unsigned)slots[i].pid, ag_proc_prio_name(pr),
                               slots[i].name[0] ? slots[i].name : "?");
         }
     }
@@ -1491,6 +1586,8 @@ static const ag_command_t k_commands[] = {
      "modules: list, load, install to C:, unload, I2C probe", cmd_drv},
     {"io", "[pin [mode]] | i2c <bus>", "pins and buses", cmd_io},
     {"ps", "", "list running applications", cmd_ps},
+    {"prio", "<slot|pid> [low|normal|high]", "show or set process priority",
+     cmd_prio},
     {"slots", "", "list session slots (* = focused)", cmd_slots},
     {"kill", "<pid>", "stop an application", cmd_kill},
     {"fg", "<slot|pid>", "focus a session slot (or pid's slot)", cmd_fg},
@@ -1613,9 +1710,6 @@ int ag_shell_execute(const char *line)
     /* This command's own answer to "was I interrupted", not the last one's. */
     ag_supervisor_clear_interrupt();
 
-    const int cmd_slot = ag_session_focused();
-    ag_session_note_shell_cmd(cmd_slot, line);
-
     if (redirect >= 0) {
         ag_console_redirect(file_sink, (void *)(intptr_t)redirect);
     }
@@ -1653,15 +1747,11 @@ int ag_shell_execute(const char *line)
      */
     if (ag_supervisor_interrupted()) {
         ag_console_flush_input();
-        /* Resume line was parked by ag_session_focus when Alt+N left this slot. */
-    } else {
-        ag_session_clear_shell_cmd(cmd_slot);
     }
 
     if (!found) {
         /* The message every DOS user knows. */
         ag_console_printf("Bad command or file name: %s\n", argv[0]);
-        ag_session_clear_shell_cmd(cmd_slot);
     }
     return status;
 }
@@ -1708,22 +1798,6 @@ void ag_shell_run(void)
 
         sync_cwd_from_session();
         ag_shell_clear_interrupted();
-
-        /*
-         * Returning to a slot whose builtin (fm, …) was interrupted by Alt+N:
-         * restart that command instead of an empty prompt.
-         */
-        {
-            /* Copy out: execute() re-notes into the same session buffer. */
-            char        resume_line[AG_SESSION_PARK_CMD_MAX];
-            const char *resume = ag_session_take_resume(ag_session_focused());
-            if (resume != NULL) {
-                strncpy(resume_line, resume, sizeof(resume_line) - 1);
-                resume_line[sizeof(resume_line) - 1] = '\0';
-                s_last_status = ag_shell_execute(resume_line);
-                continue;
-            }
-        }
 
         ag_lineedit_reset(&s_line);
         show_prompt();

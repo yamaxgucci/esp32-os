@@ -491,10 +491,8 @@ static void crash_record(proc_t *p, const char *reason)
 /* Starting a process                                                     */
 /* ---------------------------------------------------------------------- */
 
-static uint32_t stack_bytes_for(const ag_axe_header_t *header)
+static uint32_t clamp_stack_bytes(uint32_t want)
 {
-    uint32_t want = header->stack_size;
-
     if (want == 0) {
         want = (uint32_t)CONFIG_ARGON_APP_STACK_KB * 1024u;
     }
@@ -505,6 +503,159 @@ static uint32_t stack_bytes_for(const ag_axe_header_t *header)
         want = AG_PROC_STACK_MAX;
     }
     return want;
+}
+
+static uint32_t stack_bytes_for(const ag_axe_header_t *header)
+{
+    return clamp_stack_bytes(header->stack_size);
+}
+
+/* FreeRTOS priorities below AG_SUP_PRIORITY (15). */
+static UBaseType_t freertos_prio_for(uint8_t sched_class)
+{
+    switch (sched_class) {
+    case AG_PRIO_LOW:
+        return 2u;
+    case AG_PRIO_HIGH:
+        return 8u;
+    case AG_PRIO_NORMAL:
+    default:
+        return 5u;
+    }
+}
+
+static void apply_task_priority(proc_t *p)
+{
+    if (p == NULL || p->task == NULL) {
+        return;
+    }
+    vTaskPrioritySet(p->task, freertos_prio_for(p->sched_class));
+}
+
+static void name_from_path(char *dst, size_t dst_len, const char *path)
+{
+    const char *base = path;
+    if (path != NULL) {
+        for (const char *s = path; *s != '\0'; s++) {
+            if (*s == '/' || *s == '\\' || *s == ':') {
+                base = s + 1;
+            }
+        }
+    }
+    set_string(dst, dst_len, (base != NULL && base[0] != '\0') ? base : "app");
+}
+
+const char *ag_proc_prio_name(ag_proc_prio_t prio)
+{
+    switch (prio) {
+    case AG_PRIO_LOW:
+        return "low";
+    case AG_PRIO_HIGH:
+        return "high";
+    case AG_PRIO_NORMAL:
+    default:
+        return "normal";
+    }
+}
+
+ag_err_t ag_proc_get_priority(ag_pid_t pid, ag_proc_prio_t *out)
+{
+    if (out == NULL) {
+        return -AG_EINVAL;
+    }
+    lock();
+    proc_t *p = by_pid(pid);
+    if (p == NULL) {
+        unlock();
+        return -AG_ENOENT;
+    }
+    *out = (ag_proc_prio_t)p->sched_class;
+    unlock();
+    return AG_OK;
+}
+
+ag_err_t ag_proc_set_priority(ag_pid_t pid, ag_proc_prio_t prio)
+{
+    if (prio > AG_PRIO_HIGH) {
+        return -AG_EINVAL;
+    }
+    lock();
+    proc_t *p = by_pid(pid);
+    if (p == NULL) {
+        unlock();
+        return -AG_ENOENT;
+    }
+    p->sched_class = (uint8_t)prio;
+    apply_task_priority(p);
+    unlock();
+    return AG_OK;
+}
+
+/*
+ * Finish AXE load on the process task.  On failure the task becomes a zombie
+ * with a negative exit_code; the slot is reaped by wait/reap_finished.
+ */
+static ag_err_t proc_finish_load(proc_t *p)
+{
+    ag_err_t err = ag_loader_load(p->path, p->cwd, &p->app);
+    if (err != AG_OK) {
+        ag_log(AG_LOG_ERROR, "proc", "pid %u: load %s failed (%d)",
+               (unsigned)p->pid, p->path, (int)err);
+        return err;
+    }
+
+    if ((p->app.header.flags & AG_AXE_DRIVER) != 0) {
+        ag_log(AG_LOG_ERROR, "proc", "%s: is a driver; use 'drv load'", p->path);
+        ag_loader_unload(&p->app);
+        return -AG_EINVAL;
+    }
+    if ((p->app.header.flags & AG_AXE_NEEDS_GFX) != 0 && !ag_display_ready()) {
+        ag_log(AG_LOG_ERROR, "proc", "%s: needs a display", p->path);
+        ag_loader_unload(&p->app);
+        return -AG_ENODEV;
+    }
+    if ((p->app.header.flags & AG_AXE_NEEDS_NET) != 0 &&
+        ag_loader_api()->net == NULL) {
+        ag_log(AG_LOG_ERROR, "proc", "%s: needs networking", p->path);
+        ag_loader_unload(&p->app);
+        return -AG_ENODEV;
+    }
+    if ((p->app.header.flags & AG_AXE_NEEDS_AUDIO) != 0 &&
+        (ag_loader_api()->audio == NULL ||
+         ag_loader_api()->audio->present == NULL ||
+         !ag_loader_api()->audio->present())) {
+        ag_log(AG_LOG_ERROR, "proc", "%s: needs audio", p->path);
+        ag_loader_unload(&p->app);
+        return -AG_ENODEV;
+    }
+
+    if (p->app.header.name[0] != '\0') {
+        set_string(p->name, sizeof(p->name), p->app.header.name);
+        const int slot = ag_session_slot_of(p->pid);
+        if (slot >= 0) {
+            (void)ag_session_bind_to(p->pid, p->name, slot);
+        }
+    }
+
+    if ((p->app.header.flags & AG_AXE_NEEDS_AUDIO) != 0) {
+        p->sched_class = (uint8_t)AG_PRIO_HIGH;
+    }
+
+    err = heap_create(p, p->app.header.heap_size);
+    if (err != AG_OK) {
+        ag_loader_unload(&p->app);
+        return err;
+    }
+
+    /* Stack was sized at create; header may ask for more — warn only. */
+    const uint32_t want = stack_bytes_for(&p->app.header);
+    if (want > p->stack_bytes) {
+        ag_log(AG_LOG_WARN, "proc",
+               "%s: header wants %u stack bytes; running with %u", p->name,
+               (unsigned)want, (unsigned)p->stack_bytes);
+    }
+
+    return AG_OK;
 }
 
 /*
@@ -547,9 +698,37 @@ static void proc_task(void *arg)
      */
     p->task = xTaskGetCurrentTaskHandle();
     p->heartbeat_ms = now_ms();
+    apply_task_priority(p);
+
+    if (p->load_pending) {
+        const ag_err_t load_err = proc_finish_load(p);
+        p->load_pending = false;
+        if (load_err != AG_OK) {
+            p->exit_code = (int32_t)load_err;
+            p->state = AG_PS_ZOMBIE;
+            ag_log(AG_LOG_ERROR, "proc", "%s (pid %u) failed to load: %d",
+                   p->name, (unsigned)p->pid, (int)load_err);
+            SemaphoreHandle_t done_fail = p->done;
+            xSemaphoreGive(done_fail);
+            vTaskDelete(NULL);
+            return;
+        }
+        apply_task_priority(p);
+    }
+
+    const bool background = (p->flags & (uint32_t)AG_SPAWN_BACKGROUND) != 0;
+    p->state = background ? AG_PS_BACKGROUND : AG_PS_RUNNING;
 
     typedef int (*entry_fn)(int, char **);
     const entry_fn entry = (entry_fn)p->app.binding.entry;
+    if (entry == NULL) {
+        p->exit_code = (int32_t)-AG_EINVAL;
+        p->state = AG_PS_ZOMBIE;
+        SemaphoreHandle_t done_bad = p->done;
+        xSemaphoreGive(done_bad);
+        vTaskDelete(NULL);
+        return;
+    }
 
     if (setjmp(p->exit_jump) == 0) {
         p->exit_code = (int32_t)entry(p->argc, p->argv);
@@ -579,6 +758,65 @@ static proc_t *free_slot(void)
     return NULL;
 }
 
+/*
+ * Common path: reserve a slot, create the task, return immediately.
+ * AXE images set load_pending; builtins set binding.entry and heap already.
+ */
+static ag_err_t spawn_common(proc_t *p, uint32_t flags, ag_pid_t *out_pid)
+{
+    p->done = xSemaphoreCreateBinary();
+    if (p->done == NULL) {
+        return -AG_ENOMEM;
+    }
+
+    const bool background = (flags & (uint32_t)AG_SPAWN_BACKGROUND) != 0;
+    p->state = AG_PS_LOADING;
+    p->prev_foreground = s_foreground;
+    if (!background) {
+        s_foreground = p->pid;
+    }
+
+    /*
+     * App core for interactive starts; system core for background.  Priority
+     * comes from sched_class (applied inside proc_task); create uses normal.
+     */
+    const BaseType_t core =
+        background ? (BaseType_t)0 : (BaseType_t)ag_sysinfo()->app_core;
+    const UBaseType_t prio = freertos_prio_for(p->sched_class);
+
+    const BaseType_t created =
+        xTaskCreatePinnedToCore(proc_task, p->name, p->stack_bytes, p, prio,
+                                NULL, core);
+    if (created != pdPASS) {
+        ag_log(AG_LOG_ERROR, "proc", "%s: no memory for a %u byte stack",
+               p->name, (unsigned)p->stack_bytes);
+        if (s_foreground == p->pid) {
+            s_foreground = p->prev_foreground;
+        }
+        vSemaphoreDelete(p->done);
+        p->done = NULL;
+        return -AG_ENOMEM;
+    }
+
+    if (out_pid != NULL) {
+        *out_pid = p->pid;
+    }
+
+    const ag_pid_t bound_pid = p->pid;
+    char           bound_name[32];
+    const bool     skip_bind = (flags & (uint32_t)AG_SPAWN_NO_SESSION) != 0;
+    set_string(bound_name, sizeof(bound_name), p->name);
+    unlock();
+    if (!skip_bind) {
+        const ag_err_t bind_err = ag_session_bind(bound_pid, bound_name);
+        if (bind_err != AG_OK) {
+            ag_log(AG_LOG_WARN, "proc", "pid %u: no free session slot (%d)",
+                   (unsigned)bound_pid, (int)bind_err);
+        }
+    }
+    return AG_OK;
+}
+
 ag_err_t ag_proc_spawn(const char *path, int argc, char **argv, uint32_t flags,
                        ag_pid_t *out_pid)
 {
@@ -598,13 +836,68 @@ ag_err_t ag_proc_spawn(const char *path, int argc, char **argv, uint32_t flags,
 
     memset(p, 0, sizeof(*p));
     p->used = true;
-    p->state = AG_PS_LOADING;
     p->pid = s_next_pid++;
     p->flags = flags;
     p->started = (ag_time_t)esp_timer_get_time();
+    p->sched_class = (uint8_t)AG_PRIO_NORMAL;
+    p->load_pending = true;
     ag_reslist_init(&p->res, p->res_slots, AG_PROC_RES_MAX);
 
-    /* Inherited from whoever asked, which is what a child process expects. */
+    const char *parent_cwd = ag_proc_cwd();
+    set_string(p->cwd, sizeof(p->cwd), parent_cwd);
+    set_string(p->path, sizeof(p->path), path);
+    name_from_path(p->name, sizeof(p->name), path);
+
+    ag_err_t err = copy_args(p, argc, argv);
+    if (err != AG_OK) {
+        memset(p, 0, sizeof(*p));
+        unlock();
+        return err;
+    }
+
+    /* Sized for load + typical app; header may ask for less after load. */
+    p->stack_bytes = clamp_stack_bytes(0);
+
+    err = spawn_common(p, flags, out_pid);
+    if (err != AG_OK) {
+        memset(p, 0, sizeof(*p));
+        unlock();
+        return err;
+    }
+    /* spawn_common unlocked on success */
+    return AG_OK;
+}
+
+ag_err_t ag_proc_spawn_builtin(const char *name, ag_proc_entry_fn entry,
+                               int argc, char **argv, uint32_t flags,
+                               uint32_t stack_bytes, uint32_t heap_bytes,
+                               ag_pid_t *out_pid)
+{
+    if (name == NULL || entry == NULL) {
+        return -AG_EINVAL;
+    }
+
+    lock();
+
+    proc_t *p = free_slot();
+    if (p == NULL) {
+        unlock();
+        ag_log(AG_LOG_ERROR, "proc", "all %u process slots are in use",
+               (unsigned)AG_PROC_MAX);
+        return -AG_EBUSY;
+    }
+
+    memset(p, 0, sizeof(*p));
+    p->used = true;
+    p->pid = s_next_pid++;
+    p->flags = flags;
+    p->started = (ag_time_t)esp_timer_get_time();
+    p->sched_class = (uint8_t)AG_PRIO_NORMAL;
+    p->load_pending = false;
+    p->app.binding.entry = (void *)entry;
+    set_string(p->name, sizeof(p->name), name);
+    ag_reslist_init(&p->res, p->res_slots, AG_PROC_RES_MAX);
+
     const char *parent_cwd = ag_proc_cwd();
     set_string(p->cwd, sizeof(p->cwd), parent_cwd);
 
@@ -615,142 +908,24 @@ ag_err_t ag_proc_spawn(const char *path, int argc, char **argv, uint32_t flags,
         return err;
     }
 
-    /* The file read is the slow part; the slot is reserved, so let go of the
-     * table while it happens. */
-    unlock();
-    err = ag_loader_load(path, p->cwd, &p->app);
-    lock();
-
+    p->stack_bytes = clamp_stack_bytes(stack_bytes);
+    err = heap_create(p, heap_bytes);
     if (err != AG_OK) {
         memset(p, 0, sizeof(*p));
         unlock();
         return err;
     }
 
-    /*
-     * A .SYS is not an application: it has no ag_main and stays resident.  The
-     * shell's `drv load` is the way in; `run` on one would only confuse.
-     */
-    if ((p->app.header.flags & AG_AXE_DRIVER) != 0) {
-        ag_log(AG_LOG_ERROR, "proc",
-               "%s: is a driver; use 'drv load'", path);
-        ag_loader_unload(&p->app);
-        memset(p, 0, sizeof(*p));
-        unlock();
-        return -AG_EINVAL;
-    }
-
-    if ((p->app.header.flags & AG_AXE_NEEDS_GFX) != 0 && !ag_display_ready()) {
-        ag_log(AG_LOG_ERROR, "proc", "%s: needs a display", path);
-        ag_loader_unload(&p->app);
-        memset(p, 0, sizeof(*p));
-        unlock();
-        return -AG_ENODEV;
-    }
-
-    if ((p->app.header.flags & AG_AXE_NEEDS_NET) != 0 &&
-        ag_loader_api()->net == NULL) {
-        ag_log(AG_LOG_ERROR, "proc", "%s: needs networking", path);
-        ag_loader_unload(&p->app);
-        memset(p, 0, sizeof(*p));
-        unlock();
-        return -AG_ENODEV;
-    }
-
-    if ((p->app.header.flags & AG_AXE_NEEDS_AUDIO) != 0 &&
-        (ag_loader_api()->audio == NULL ||
-         ag_loader_api()->audio->present == NULL ||
-         !ag_loader_api()->audio->present())) {
-        ag_log(AG_LOG_ERROR, "proc", "%s: needs audio", path);
-        ag_loader_unload(&p->app);
-        memset(p, 0, sizeof(*p));
-        unlock();
-        return -AG_ENODEV;
-    }
-
-    /* The name comes from the image, and is what ps and the journal show. */
-    set_string(p->name, sizeof(p->name),
-               (p->app.header.name[0] != '\0') ? p->app.header.name : "app");
-
-    err = heap_create(p, p->app.header.heap_size);
+    err = spawn_common(p, flags, out_pid);
     if (err != AG_OK) {
-        ag_loader_unload(&p->app);
-        memset(p, 0, sizeof(*p));
-        unlock();
-        return err;
-    }
-
-    p->done = xSemaphoreCreateBinary();
-    if (p->done == NULL) {
-        err = -AG_ENOMEM;
-    }
-
-    p->stack_bytes = stack_bytes_for(&p->app.header);
-
-    const bool background = (flags & AG_SPAWN_BACKGROUND) != 0;
-    p->state = background ? AG_PS_BACKGROUND : AG_PS_RUNNING;
-    p->prev_foreground = s_foreground;
-    if (!background) {
-        s_foreground = p->pid;
-    }
-
-    /*
-     * The foreground application runs on the application core at the caller's
-     * priority; a background one shares the system core at the bottom priority,
-     * so that it cannot take time away from whatever is in front.  Both are
-     * below the supervisor, which is what lets Ctrl-Alt-Del be heard at all.
-     */
-    const BaseType_t core =
-        background ? (BaseType_t)0 : (BaseType_t)ag_sysinfo()->app_core;
-    const UBaseType_t prio = background ? 1u : uxTaskPriorityGet(NULL);
-
-    if (err == AG_OK) {
-        const BaseType_t created =
-            xTaskCreatePinnedToCore(proc_task, p->name, p->stack_bytes, p,
-                                    prio, NULL, core);
-        if (created != pdPASS) {
-            ag_log(AG_LOG_ERROR, "proc", "%s: no memory for a %u byte stack",
-                   p->name, (unsigned)p->stack_bytes);
-            err = -AG_ENOMEM;
-        }
-    }
-
-    if (err != AG_OK) {
-        if (p->done != NULL) {
-            vSemaphoreDelete(p->done);
-        }
-        ag_loader_unload(&p->app);
         if (p->heap_mem != NULL) {
             heap_caps_free(p->heap_mem);
         }
-        if (s_foreground == p->pid) {
-            s_foreground = p->prev_foreground;
-        }
         memset(p, 0, sizeof(*p));
         unlock();
         return err;
     }
-
-    if (out_pid != NULL) {
-        *out_pid = p->pid;
-    }
-    {
-        const ag_pid_t  bound_pid = p->pid;
-        char            bound_name[32];
-        const bool      skip_bind =
-            (flags & (uint32_t)AG_SPAWN_NO_SESSION) != 0;
-        set_string(bound_name, sizeof(bound_name), p->name);
-        unlock();
-        if (!skip_bind) {
-            const ag_err_t bind_err = ag_session_bind(bound_pid, bound_name);
-            if (bind_err != AG_OK) {
-                ag_log(AG_LOG_WARN, "proc",
-                       "pid %u: no free session slot (%d)",
-                       (unsigned)bound_pid, (int)bind_err);
-            }
-        }
-        return AG_OK;
-    }
+    return AG_OK;
 }
 
 ag_err_t ag_proc_exec(const char *path, int argc, char **argv, uint32_t flags,
@@ -1013,6 +1188,7 @@ ag_err_t ag_proc_info(uint32_t index, ag_procinfo_t *out)
         out->mem_used = p->app.header.code.size + p->app.header.data.size +
                         p->stack_bytes + p->heap_size +
                         ag_reslist_total_of(&p->res, AG_RES_MEM);
+        out->priority = p->sched_class;
 
         unlock();
         return AG_OK;

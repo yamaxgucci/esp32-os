@@ -18,8 +18,6 @@ extern "C" {
 
 #define AG_SESSION_SLOTS 4
 #define AG_SESSION_SYSTEM 0
-/** Parked shell builtin (e.g. "fm"); keep small — DRAM is tight. */
-#define AG_SESSION_PARK_CMD_MAX 32
 
 typedef struct {
     ag_pid_t pid; /* AG_PID_KERNEL = shell owns this slot (no app) */
@@ -54,15 +52,6 @@ int  ag_session_slot_of(ag_pid_t pid);
 
 const char *ag_session_cwd(int slot);
 ag_err_t    ag_session_set_cwd(int slot, const char *absolute_path);
-
-/*
- * Shell builtins (fm, …) are not processes.  While one runs, note its command
- * line; on Alt+N away, it is parked as a resume line so returning to the slot
- * restarts it.
- */
-void        ag_session_note_shell_cmd(int slot, const char *line);
-void        ag_session_clear_shell_cmd(int slot);
-const char *ag_session_take_resume(int slot);
 
 #ifdef __cplusplus
 }
