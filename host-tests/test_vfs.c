@@ -499,6 +499,21 @@ static void test_case_insensitive(void)
     AG_CHECK_INT(ag_vfs_readdir(d, &ent), AG_OK);
     AG_CHECK_STR(ent.name, "Hello.TXT");
     ag_vfs_closedir(d);
+
+    /* mkdir must not invent a second spelling of the same name. */
+    AG_CHECK_INT(ag_vfs_mkdir("/tmp/Hello.TXT", NULL), -AG_EEXIST);
+    AG_CHECK_INT(ag_vfs_mkdir("/tmp/hello.txt", NULL), -AG_EEXIST);
+
+    AG_CHECK_INT(ag_vfs_mkdir("/tmp/Sega", NULL), AG_OK);
+    AG_CHECK_INT(write_file("/tmp/Sega/rom.sms", "x"), AG_OK);
+    AG_CHECK_INT(ag_vfs_mkdir("/tmp/sega", NULL), -AG_EEXIST);
+
+    char real[AG_PATH_MAX];
+    AG_CHECK_INT(ag_vfs_realpath("/tmp/sega", NULL, real, sizeof(real)), AG_OK);
+    AG_CHECK_STR(real, "/tmp/Sega");
+    AG_CHECK_INT(ag_vfs_realpath("/tmp/SEGA/rom.sms", NULL, real, sizeof(real)),
+                 AG_OK);
+    AG_CHECK_STR(real, "/tmp/Sega/rom.sms");
 }
 
 void run_vfs_tests(void)
