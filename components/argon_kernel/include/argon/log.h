@@ -34,9 +34,10 @@ void ag_vlog(ag_log_level_t level, const char *tag, const char *fmt,
 
 /*
  * Whether log lines also go to the console as they arrive.  On during early
- * bring-up so boot failures are visible; the shell turns it off once the
- * interactive prompt is up — drivers keep writing the journal (`log`) without
- * stomping the edit line.
+ * bring-up so boot failures are visible.  The shell leaves it off while the
+ * interactive prompt is waiting for input (async noise stays in the journal;
+ * use `log` to read it) and turns it on around each command so load/install
+ * progress is visible on screen.
  */
 void ag_log_set_echo(bool on);
 bool ag_log_echo(void);
