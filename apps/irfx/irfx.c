@@ -23,11 +23,12 @@
 #include "ag_ir.h"
 #include "ag_wav.h"
 
-AG_APP_SIZED("IRFX", "0.1", "argon", 0, 12 * 1024, 1024 * 1024);
+AG_APP_SIZED("IRFX", "0.2", "argon", 0, 12 * 1024, 1024 * 1024);
 
 #define RATE  22050u
 #define CHUNK AG_IR_BLOCK
 #define CHUNK_US ((uint32_t)((CHUNK * 1000000ull) / RATE))
+#define UI_PERIOD_MS 250u
 
 enum {
     SRC_CLICK = 0,
@@ -64,6 +65,17 @@ static char         s_status[72] = "";
 
 static char s_ir_path[AG_PATH_MAX];
 static char s_dry_path[AG_PATH_MAX];
+
+/* Resource / timing (refreshed every UI_PERIOD_MS). */
+static uint32_t s_render_us;
+static uint32_t s_send_us;
+static uint32_t s_loop_us;
+static uint32_t s_load_pct;
+static uint32_t s_late;
+static uint32_t s_ui_ms;
+static ag_meminfo_t s_mem;
+static ag_audio_stats_t s_pcm_stats;
+static int s_pcm_stats_ok;
 
 static int str_ieq(const char *a, const char *b)
 {
@@ -303,9 +315,23 @@ static int open_sink(void)
     return 0;
 }
 
+static uint32_t ir_spectra_kb(void)
+{
+    /* H + X: parts * FFT * 2 (re/im) * sizeof(int16_t) each */
+    uint32_t bytes;
+    if (!s_ir.ready || s_ir.parts == 0u) {
+        return 0u;
+    }
+    bytes = s_ir.parts * AG_IR_FFT * 2u * (uint32_t)sizeof(int16_t) * 2u;
+    return (bytes + 1023u) / 1024u;
+}
+
 static void draw_ui(void)
 {
     uint32_t ms;
+    uint32_t arena_used_kb, arena_total_kb, arena_free_kb;
+    uint32_t dry_kb;
+
     if (!s_dirty) {
         return;
     }
@@ -322,6 +348,34 @@ static void draw_ui(void)
               (unsigned)s_ir.wet, (unsigned)s_ir.gain, s_ir.bypass ? "ON" : "off",
               s_auto_click ? "on" : "off");
     ag_printf("stat : %s\n", s_status[0] ? s_status : "-");
+
+    arena_total_kb = (uint32_t)(s_mem.arena_total / 1024u);
+    arena_free_kb = (uint32_t)(s_mem.arena_free / 1024u);
+    arena_used_kb = arena_total_kb > arena_free_kb ? arena_total_kb - arena_free_kb
+                                                   : 0u;
+    dry_kb = 0u;
+    if (s_dry.data != NULL && s_dry.frames > 0u) {
+        dry_kb = (uint32_t)((s_dry.frames * sizeof(int16_t) + 1023u) / 1024u);
+    }
+    ag_printf("CPU  : render %u us / %u us (%u%%)  send %u us  loop %u us  "
+              "late %u\n",
+              (unsigned)s_render_us, (unsigned)CHUNK_US, (unsigned)s_load_pct,
+              (unsigned)s_send_us, (unsigned)s_loop_us, (unsigned)s_late);
+    ag_printf("MEM  : arena %u / %u KB used  free %u KB  largest %u KB\n",
+              (unsigned)arena_used_kb, (unsigned)arena_total_kb,
+              (unsigned)arena_free_kb,
+              (unsigned)(s_mem.arena_largest / 1024u));
+    ag_printf("DSP  : IR spectra %u KB  dry wav %u KB  block %u  fft %u\n",
+              (unsigned)ir_spectra_kb(), (unsigned)dry_kb, (unsigned)AG_IR_BLOCK,
+              (unsigned)AG_IR_FFT);
+    if (s_pcm_stats_ok) {
+        ag_printf("PCM  : drop_ov %llu B  eagain %u  ring %u / %u\n",
+                  (unsigned long long)s_pcm_stats.bytes_drop_overflow,
+                  (unsigned)s_pcm_stats.eagain_events,
+                  (unsigned)s_pcm_stats.ring_used,
+                  (unsigned)s_pcm_stats.ring_cap);
+    }
+
     ag_printf("\n");
     ag_printf("[Space] trigger   [A] auto   [B] bypass\n");
     ag_printf("[1/2/3] room/hall/spring   [S] click  [N] noise  [W] wav-src\n");
@@ -501,12 +555,16 @@ int ag_main(int argc, char **argv)
     }
 
     ag_cursor(false);
+    ag_meminfo(&s_mem);
     s_dirty = 1;
+    s_ui_ms = 0;
     draw_ui();
     trigger_click();
 
     next_due = ag_micros() + (ag_time_t)CHUNK_US;
     while (s_running) {
+        ag_time_t loop0 = ag_micros();
+
         while (ag_poll_event(&ev, 0)) {
             if (ev.type == AG_EV_QUIT) {
                 s_running = 0;
@@ -520,12 +578,47 @@ int ag_main(int argc, char **argv)
             break;
         }
 
-        draw_ui();
-        fill_mono();
-        ag_ir_process_block(&s_ir, s_mono, s_stereo);
-        if (s_audio_fd >= 0) {
-            (void)ag_dev_write(s_audio_fd, s_stereo, sizeof(s_stereo));
+        {
+            ag_time_t t0 = ag_micros();
+            fill_mono();
+            ag_ir_process_block(&s_ir, s_mono, s_stereo);
+            s_render_us = (uint32_t)(ag_micros() - t0);
+            if (CHUNK_US > 0u) {
+                s_load_pct = (s_render_us * 100u + CHUNK_US / 2u) / CHUNK_US;
+                if (s_load_pct == 0u && s_render_us > 0u) {
+                    s_load_pct = 1u;
+                }
+            }
         }
+
+        {
+            ag_time_t t1 = ag_micros();
+            if (s_audio_fd >= 0) {
+                (void)ag_dev_write(s_audio_fd, s_stereo, sizeof(s_stereo));
+            }
+            s_send_us = (uint32_t)(ag_micros() - t1);
+        }
+
+        {
+            ag_time_t now = ag_micros();
+            uint32_t ms = (uint32_t)(now / 1000u);
+            int want_ui = s_dirty || (ms - s_ui_ms) >= UI_PERIOD_MS;
+            if (want_ui && now < next_due &&
+                (uint32_t)(next_due - now) >= 2000u) {
+                ag_meminfo(&s_mem);
+                s_pcm_stats_ok = 0;
+                if (s_audio_fd >= 0) {
+                    ag_err_t st = ag_dev_ioctl(s_audio_fd, AG_IOC_AUDIO_GETSTATS,
+                                               &s_pcm_stats, sizeof(s_pcm_stats));
+                    s_pcm_stats_ok = (st == AG_OK) ? 1 : 0;
+                }
+                s_dirty = 1;
+                draw_ui();
+                s_ui_ms = ms;
+            }
+        }
+
+        s_loop_us = (uint32_t)(ag_micros() - loop0);
 
         {
             ag_time_t now = ag_micros();
@@ -536,6 +629,7 @@ int ag_main(int argc, char **argv)
                 }
                 next_due += (ag_time_t)CHUNK_US;
             } else {
+                s_late++;
                 if (now > next_due + (ag_time_t)CHUNK_US * 4) {
                     next_due = now;
                 }

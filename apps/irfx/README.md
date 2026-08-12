@@ -44,6 +44,10 @@ Host: `tools\pcmplay.py --reconnect`.
 | `-` `=` | Gain − / + |
 | Esc | Quit |
 
+Live resource lines (refresh ~250 ms): **CPU** render/budget/load%, send,
+loop, late; **MEM** arena used/free; **DSP** IR spectra + dry WAV KB; **PCM**
+drop/ring when the sink supports GETSTATS.
+
 ## Args
 
 `pcmvirt` / `pcmnull` / `pcmmix` / `audio`, optional `room`|`hall`|`spring`,
