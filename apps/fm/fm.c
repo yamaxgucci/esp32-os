@@ -693,7 +693,7 @@ int FM_ENTRY(int argc, char **argv)
         exit_why = "interrupted before focus";
         goto out;
     }
-    ag_log(AG_LOG_INFO, "fm", "focused — painting");
+    ag_log(AG_LOG_INFO, "fm", "focused - painting");
 
     fm_ui_begin();
     fm_draw_all();
@@ -718,7 +718,7 @@ int FM_ENTRY(int argc, char **argv)
             continue;
         }
         if (ev.type == AG_EV_FOCUS_GAINED) {
-            ag_log(AG_LOG_INFO, "fm", "FOCUS_GAINED — redraw");
+            ag_log(AG_LOG_INFO, "fm", "FOCUS_GAINED - redraw");
             fm_ui_begin();
             fm_draw_all();
             fm_ui_present();
