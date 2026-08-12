@@ -209,6 +209,40 @@ static void enter_shell_view(int slot)
     }
 }
 
+/*
+ * Bound AXE still reading its image: the process owns the slot (so Alt+N can
+ * return here) but cannot paint yet.  Without this, focus looks like a hang.
+ */
+static void enter_loading_view(int slot, ag_pid_t pid)
+{
+    const char *name = s_slots[slot].name[0] ? s_slots[slot].name : "app";
+
+    ag_log(AG_LOG_INFO, "session", "enter_loading_view slot %d pid %u (%s)",
+           ag_session_display_number(slot), (unsigned)pid, name);
+
+    if (ag_display_acquired()) {
+        ag_display_force_release();
+    }
+
+    if (ag_console_ready()) {
+        ag_console_lock();
+        ag_screen_cls(ag_console_screen());
+        ag_screen_set_attr(ag_console_screen(), AG_ATTR_DEFAULT);
+        ag_screen_set_cursor(ag_console_screen(), false);
+        ag_console_unlock();
+        ag_console_printf("slot %d - loading %s (pid %u)\n",
+                          ag_session_display_number(slot), name, (unsigned)pid);
+        ag_console_puts("please wait; Alt+1..4 switches slots\n");
+    }
+}
+
+static bool proc_is_loading(ag_pid_t pid)
+{
+    ag_proc_state_t st;
+    return pid != AG_PID_KERNEL && ag_proc_state_of(pid, &st) == AG_OK &&
+           st == AG_PS_LOADING;
+}
+
 ag_err_t ag_session_focus(int slot)
 {
     if (slot < 0 || slot >= AG_SESSION_SLOTS) {
@@ -222,7 +256,7 @@ ag_err_t ag_session_focus(int slot)
     /*
      * Same slot after bind_to(app): index unchanged but the occupant went from
      * shell → process.  Still need foreground + FOCUS_GAINED (and no banner
-     * over the app's screen).
+     * over a ready app's screen).
      */
     if (slot == prev_slot) {
         if (next_pid != AG_PID_KERNEL && ag_proc_foreground() != next_pid) {
@@ -232,6 +266,9 @@ ag_err_t ag_session_focus(int slot)
                 ag_console_flush_input();
             }
             notify_focus(AG_PID_KERNEL, next_pid);
+            if (proc_is_loading(next_pid)) {
+                enter_loading_view(slot, next_pid);
+            }
             ag_log(AG_LOG_INFO, "session", "adopt pid %u in slot %d",
                    (unsigned)next_pid, ag_session_display_number(slot));
         }
@@ -258,8 +295,10 @@ ag_err_t ag_session_focus(int slot)
 
     if (next_pid == AG_PID_KERNEL) {
         enter_shell_view(slot);
+    } else if (proc_is_loading(next_pid)) {
+        enter_loading_view(slot, next_pid);
     }
-    /* No console banner when focusing an app — it owns the screen. */
+    /* Ready apps own the screen — no console banner over them. */
 
     ag_log(AG_LOG_INFO, "session", "focus %d -> %d (pid %u)",
            ag_session_display_number(prev_slot),

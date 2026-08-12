@@ -97,6 +97,9 @@ uint32_t ag_proc_count(void);
 /* Iterates live processes; -AG_ENOENT past the last one. */
 ag_err_t ag_proc_info(uint32_t index, ag_procinfo_t *out);
 
+/* State of a live pid; -AG_ENOENT if it is gone. */
+ag_err_t ag_proc_state_of(ag_pid_t pid, ag_proc_state_t *out);
+
 /* "running", "background", "finished" - for ps and for the journal. */
 const char *ag_proc_state_name(ag_proc_state_t state);
 
