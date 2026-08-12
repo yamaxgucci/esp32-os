@@ -1,5 +1,5 @@
 /*
- * ArgonOS SMS - control config (two pads).
+ * ArgonOS SMS - control / video config (two pads).
  *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
  */
@@ -27,6 +27,8 @@ enum sms_cfg_action {
 typedef struct {
     /* HID usage id (AG_KEY_*), 0 = unbound */
     uint16_t key[2][SMS_ACT_COUNT];
+    /* 1: stretch SMS framebuffer to the full soft display (nearest). */
+    int      fullscreen;
 } sms_cfg_t;
 
 void sms_cfg_set_defaults(sms_cfg_t *cfg);

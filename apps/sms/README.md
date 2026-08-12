@@ -76,9 +76,11 @@ Host listen (after virt is installed): `python tools/pcmplay.py`
 up. In QEMU it is only a lower bound of sanity — QEMU models neither the cache
 nor PSRAM latency, so it cannot prove realtime on a board, only rule it out.
 
-The emulator renders **straight into the `gfx` back buffer** and flushes only its
-own rectangle; there is no intermediate frame and no blit. Budgets and the plan
-behind this: [`docs/07-emulator-performance.md`](../../docs/07-emulator-performance.md).
+By default the emulator renders **straight into the `gfx` back buffer** and
+flushes only its own rectangle (centered 1:1). Set `fullscreen=1` in `sms.cfg`
+for a nearest-neighbor stretch to the whole soft display (offscreen frame +
+scale each present). Budgets and the plan behind the 1:1 path:
+[`docs/07-emulator-performance.md`](../../docs/07-emulator-performance.md).
 
 Prefer `T:` or `A:` for capture (HostFS every frame is slow). `T:` is ~4 MB
 RAM (PSRAM); long free-run captures can still fill it. Then in the **same**
@@ -105,9 +107,11 @@ cache as a compatibility file — apps no longer `seek`/`read` it each frame.
 Without HostFS, SMS falls back to **serial sticky keys** (no key-up). Force with
 `nolivepad`.
 
-## Controls (defaults)
+## Controls / video (`sms.cfg`)
 
 ```
+fullscreen=0
+
 pad0.up=UP
 pad0.down=DOWN
 pad0.left=LEFT
