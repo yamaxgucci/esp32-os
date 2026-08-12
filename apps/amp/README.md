@@ -28,6 +28,12 @@ Stages to `build/apps/` and `build/sd_card/`. Put MP3 files under
 
 ## Run (QEMU)
 
+QEMU + HostFS is much slower than a real ESP32-S3: soft gfx blit, HostFS
+reads, and float EQ all compete with decode. Underruns sound like crackle and
+make the on-screen timer lag realtime. Prefer `pcmnull` to measure decode-only,
+or hardware + SD/`pcm0` for actual listening. Flat EQ (default) skips the
+biquad chain.
+
 ```powershell
 .\argon.cmd run -Gfx -HostFs build\sd_card
 # guest:

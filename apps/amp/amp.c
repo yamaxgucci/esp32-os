@@ -17,7 +17,10 @@
 AG_APP_SIZED("AMP", "0.1", "argon", AG_AXE_NEEDS_GFX, 16 * 1024, 1024 * 1024);
 
 #define CHUNK_FRAMES 512
-#define UI_PERIOD_MS 50u
+#define UI_PERIOD_MS 100u
+#define UI_PERIOD_PLAY_MS 200u
+/* Wall budget per main-loop audio burst (keep UI/events alive). */
+#define PUMP_BUDGET_MS 12u
 
 static amp_player_t s_p;
 static int16_t      s_pcm[CHUNK_FRAMES * 2];
@@ -66,25 +69,23 @@ static void apply_volume(int16_t *stereo, int frames, int vol, int bal)
 
 static int s_sync_empty; /* consecutive empty reads before first frame */
 
-static void pump_audio(void)
+static int pump_audio_once(void)
 {
     int n;
     uint32_t rate;
     if (s_p.state != AMP_PLAYING || s_p.mp3 == NULL || s_p.audio_fd < 0) {
-        return;
+        return 0;
     }
-    /* Small decode quantum so HostFS reads stay short and UI keeps ticking. */
-    n = ag_mp3_read(s_p.mp3, s_pcm, 128);
+    n = ag_mp3_read(s_p.mp3, s_pcm, CHUNK_FRAMES);
     if (n < 0) {
         s_p.state = AMP_STOPPED;
         strncpy(s_p.status, "decode fail", sizeof(s_p.status) - 1);
         s_p.dirty = 1;
         s_sync_empty = 0;
-        return;
+        return 0;
     }
     if (n == 0) {
         if (ag_mp3_rate(s_p.mp3) == 0) {
-            /* Still hunting sync — not EOF yet. Cap attempts so junk never wedes. */
             if (++s_sync_empty > 256) {
                 s_p.state = AMP_STOPPED;
                 strncpy(s_p.status, "no mp3 frames", sizeof(s_p.status) - 1);
@@ -92,10 +93,9 @@ static void pump_audio(void)
                 s_sync_empty = 0;
                 ag_printf("amp: no frames after sync hunt\n");
             }
-            return;
+            return 0;
         }
         s_sync_empty = 0;
-        /* EOF: advance once; do not spin forever on a broken stub file. */
         {
             int prev = s_p.pl.cur;
             amp_cmd_next(&s_p);
@@ -105,7 +105,7 @@ static void pump_audio(void)
                 s_p.dirty = 1;
             }
         }
-        return;
+        return 0;
     }
     s_sync_empty = 0;
     rate = ag_mp3_rate(s_p.mp3);
@@ -120,8 +120,37 @@ static void pump_audio(void)
         ag_printf("amp: rate=%u\n", (unsigned)rate);
     }
     amp_eq_process(&s_p.eq, s_pcm, n);
-    apply_volume(s_pcm, n, s_p.volume, s_p.balance);
+    if (s_p.volume != 100 || s_p.balance != 0) {
+        apply_volume(s_pcm, n, s_p.volume, s_p.balance);
+    }
     (void)ag_dev_write(s_p.audio_fd, s_pcm, (size_t)n * 4u);
+    return n;
+}
+
+static void pump_audio(void)
+{
+    uint32_t t0;
+    int      produced = 0;
+    int      target;
+    if (s_p.state != AMP_PLAYING || s_p.mp3 == NULL || s_p.audio_fd < 0) {
+        return;
+    }
+    /* Catch up toward realtime: ~40ms of PCM per burst, wall-capped. */
+    target = (int)(s_p.rate / 25u);
+    if (target < CHUNK_FRAMES) {
+        target = CHUNK_FRAMES;
+    }
+    t0 = ag_millis();
+    while (produced < target) {
+        int n = pump_audio_once();
+        if (n <= 0) {
+            break;
+        }
+        produced += n;
+        if ((ag_millis() - t0) >= PUMP_BUDGET_MS) {
+            break;
+        }
+    }
 }
 
 static void open_mouse(void)
@@ -259,20 +288,27 @@ int ag_main(int argc, char **argv)
         pump_audio();
         {
             uint32_t now = ag_millis();
+            uint32_t ui_period =
+                (s_p.state == AMP_PLAYING) ? UI_PERIOD_PLAY_MS : UI_PERIOD_MS;
             if (s_p.pressed != AMP_CTRL_NONE &&
                 (now - s_p.press_ms) > 180u) {
                 s_p.pressed = AMP_CTRL_NONE;
                 s_p.dirty = 1;
             }
-            if (s_p.dirty || (now - ui_ms) >= UI_PERIOD_MS) {
+            if (s_p.dirty || (now - ui_ms) >= ui_period) {
                 amp_ui_draw(&s_p);
                 s_p.dirty = 0;
                 ui_ms = now;
             }
         }
         ag_heartbeat();
-        /* Always yield: HostFS decode bursts otherwise starve the guest. */
-        ag_delay(s_p.state == AMP_PLAYING ? 2 : 10);
+        /*
+         * Do not sleep while playing: a 2ms delay after each tiny decode
+         * guaranteed underruns (slow clock + crackle). Idle only when stopped.
+         */
+        if (s_p.state != AMP_PLAYING) {
+            ag_delay(10);
+        }
     }
 
     if (s_p.mp3) {
