@@ -669,6 +669,26 @@ int FM_ENTRY(int argc, char **argv)
     /* The panel that is not active must not leave the cwd where it looked last. */
     (void)ag_chdir(g_panel[0].path);
 
+    /*
+     * Wait until the session adopts us before painting — otherwise the shell's
+     * "started…" line (or a late focus) lands on top of the panels.
+     */
+    while (!ag_focused() && !ag_interrupted()) {
+        ag_event_t ev;
+        if (ag_poll_event(&ev, 50)) {
+            if (ev.type == AG_EV_QUIT) {
+                goto out;
+            }
+            if (ev.type == AG_EV_FOCUS_GAINED) {
+                break;
+            }
+        }
+        ag_heartbeat();
+    }
+    if (ag_interrupted()) {
+        goto out;
+    }
+
     fm_ui_begin();
     fm_draw_all();
     fm_message("F1 for the keys");
@@ -773,6 +793,7 @@ int FM_ENTRY(int argc, char **argv)
 
     fm_ui_end();
 
+out:
     /* Arena is reclaimed with the process; free anyway for tidy builtins. */
     for (int i = 0; i < 2; i++) {
         ag_free(g_panel[i].entries);

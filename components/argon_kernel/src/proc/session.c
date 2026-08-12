@@ -211,12 +211,26 @@ ag_err_t ag_session_focus(int slot)
 
     const ag_pid_t prev_pid = ag_session_focused_pid();
     const int      prev_slot = s_focused;
+    const ag_pid_t next_pid = s_slots[slot].pid;
 
+    /*
+     * Same slot after bind_to(app): index unchanged but the occupant went from
+     * shell → process.  Still need foreground + FOCUS_GAINED (and no banner
+     * over the app's screen).
+     */
     if (slot == prev_slot) {
+        if (next_pid != AG_PID_KERNEL && ag_proc_foreground() != next_pid) {
+            (void)ag_proc_set_foreground(next_pid);
+            s_last_user = next_pid;
+            if (ag_console_ready()) {
+                ag_console_flush_input();
+            }
+            notify_focus(AG_PID_KERNEL, next_pid);
+            ag_log(AG_LOG_INFO, "session", "adopt pid %u in slot %d",
+                   (unsigned)next_pid, ag_session_display_number(slot));
+        }
         return AG_OK;
     }
-
-    const ag_pid_t next_pid = s_slots[slot].pid;
 
     if (ag_display_acquired() && ag_display_owner() != next_pid) {
         ag_display_force_release();
@@ -228,16 +242,18 @@ ag_err_t ag_session_focus(int slot)
     }
 
     (void)ag_proc_set_foreground(next_pid);
+
+    /* Drop shell QUIT/keys so the app does not treat them as its own exit. */
+    if (next_pid != AG_PID_KERNEL && ag_console_ready()) {
+        ag_console_flush_input();
+    }
+
     notify_focus(prev_pid, next_pid);
 
     if (next_pid == AG_PID_KERNEL) {
         enter_shell_view(slot);
-    } else if (ag_console_ready()) {
-        ag_console_printf("\n[slot %d] %s (pid %u)\n",
-                          ag_session_display_number(slot),
-                          s_slots[slot].name[0] ? s_slots[slot].name : "?",
-                          (unsigned)next_pid);
     }
+    /* No console banner when focusing an app — it owns the screen. */
 
     ag_log(AG_LOG_INFO, "session", "focus %d -> %d (pid %u)",
            ag_session_display_number(prev_slot),
