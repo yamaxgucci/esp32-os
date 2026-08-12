@@ -9,6 +9,8 @@
  * Build on the guest:
  *   run t:\cc.axe t:\asteroids.c t:\asteroids.axe
  *   run t:\asteroids.axe
+ *
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
  */
 
 #define AG_EV_FOCUS_GAINED 12

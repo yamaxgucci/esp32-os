@@ -18,6 +18,8 @@
  *
  * Fallback console keys (sticky ag_key): Z..M / Q..I, [] alg, ,. preset,
  * -= feedback, Space panic, Esc quit.
+ *
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
  */
 
 #define OPS       6

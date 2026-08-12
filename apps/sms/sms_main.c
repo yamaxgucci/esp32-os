@@ -7,6 +7,8 @@
  *   run t:\sms.axe 60 nolivepad mock  # PSG, discard samples
  *
  * Core: GPLv2+ (SMS Plus GX).  This file: Apache-2.0.
+ *
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
  */
 #include <argon/argon.h>
 #include <argon/keys.h>
