@@ -14,6 +14,7 @@
 #define COL_THUMB  0x00E8E8F0u
 #define COL_SEL    0x0030A060u
 #define COL_ICON   0x00101820u
+#define COL_BTN_BG 0x00B8B8C0u /* match painted button face for text glyphs */
 #define COL_CURSOR 0x00E8A54Bu
 
 static void blit_panel(const amp_skin_panel_t *pan)
@@ -133,20 +134,31 @@ static void draw_btn_icon(amp_player_t *p, amp_ctrl_t c)
         break;
     }
     case AMP_CTRL_EQ_TOGGLE:
-        ag_gfx_text((int16_t)(r.x + 2), (int16_t)(r.y + (int)r.h / 2 - 6), "EQ",
-                    COL_ICON, 0);
+        /* Simple EQ bars — avoid ag_gfx_text(bg=0) black glyph boxes. */
+        icon_bar(cx - 6, cy + 2, 2, 4, COL_ICON);
+        icon_bar(cx - 2, cy - 2, 2, 8, COL_ICON);
+        icon_bar(cx + 2, cy, 2, 6, COL_ICON);
+        icon_bar(cx + 6, cy - 4, 2, 10, COL_ICON);
         break;
     case AMP_CTRL_PL_TOGGLE:
-        ag_gfx_text((int16_t)(r.x + 2), (int16_t)(r.y + (int)r.h / 2 - 6), "PL",
-                    COL_ICON, 0);
+        icon_bar(cx - 6, cy - 5, 12, 2, COL_ICON);
+        icon_bar(cx - 6, cy - 1, 12, 2, COL_ICON);
+        icon_bar(cx - 6, cy + 3, 12, 2, COL_ICON);
         break;
     case AMP_CTRL_REPEAT:
-        ag_gfx_text((int16_t)(r.x + 1), (int16_t)(r.y + (int)r.h / 2 - 6),
-                    p->repeat ? "R*" : "RPT", COL_ICON, 0);
+        ag_gfx_circle((int16_t)cx, (int16_t)cy, 5, COL_ICON);
+        if (p->repeat) {
+            icon_bar(cx + 3, cy - 1, 4, 2, COL_ICON);
+        }
         break;
     case AMP_CTRL_SHUFFLE:
-        ag_gfx_text((int16_t)(r.x + 1), (int16_t)(r.y + (int)r.h / 2 - 6),
-                    p->shuffle ? "S*" : "SHUF", COL_ICON, 0);
+        ag_gfx_line((int16_t)(cx - 6), (int16_t)(cy - 3), (int16_t)(cx + 6),
+                    (int16_t)(cy + 3), COL_ICON);
+        ag_gfx_line((int16_t)(cx - 6), (int16_t)(cy + 3), (int16_t)(cx + 6),
+                    (int16_t)(cy - 3), COL_ICON);
+        if (p->shuffle) {
+            icon_bar(cx - 1, cy - 1, 3, 3, COL_ICON);
+        }
         break;
     default:
         break;
@@ -219,10 +231,10 @@ static void draw_overlays_main(amp_player_t *p)
                          (uint16_t)(bw > 1 ? bw - 1 : 1), (uint16_t)h, COL_BAR);
     }
 
-    /* ticker */
+    /* ticker (LCD-ish bg — bg=0 would paint black glyph boxes) */
     ag_gfx_text((int16_t)(pos->x + p->skin.ticker.x + 2),
                 (int16_t)(pos->y + p->skin.ticker.y),
-                p->title[0] ? p->title : "(no title)", COL_TEXT, 0);
+                p->title[0] ? p->title : "(no title)", COL_TEXT, 0x00002018u);
 
     if (p->mp3) {
         pos_ms = ag_mp3_position_ms(p->mp3);
@@ -249,16 +261,19 @@ static void draw_overlays_main(amp_player_t *p)
         buf[n] = '\0';
     }
     ag_gfx_text((int16_t)(pos->x + p->skin.timebox.x),
-                (int16_t)(pos->y + p->skin.timebox.y), buf, COL_TEXT, 0);
+                (int16_t)(pos->y + p->skin.timebox.y), buf, COL_TEXT,
+                0x00002018u);
 
     ctrl_screen_rect(p, AMP_CTRL_SEEK, &r);
     draw_slider_thumb(&r, permille, 0);
     ctrl_screen_rect(p, AMP_CTRL_VOL, &r);
     draw_slider_thumb(&r, p->volume * 10, 0);
-    ag_gfx_text((int16_t)(r.x - 28), (int16_t)(r.y - 2), "VOL", COL_MUTED, 0);
+    ag_gfx_text((int16_t)(r.x - 28), (int16_t)(r.y - 2), "VOL", COL_MUTED,
+                COL_BG);
     ctrl_screen_rect(p, AMP_CTRL_BAL, &r);
     draw_slider_thumb(&r, (p->balance + 100) * 5, 0);
-    ag_gfx_text((int16_t)(r.x - 28), (int16_t)(r.y - 2), "BAL", COL_MUTED, 0);
+    ag_gfx_text((int16_t)(r.x - 28), (int16_t)(r.y - 2), "BAL", COL_MUTED,
+                COL_BG);
 
     draw_transport_icons(p);
 }
@@ -295,13 +310,14 @@ static void draw_overlays_eq(amp_player_t *p)
     {
         amp_rect_t r;
         ctrl_screen_rect(p, AMP_CTRL_EQ_ON, &r);
-        ag_gfx_text((int16_t)(r.x + 2), (int16_t)(r.y + 1),
-                    p->eq.enabled ? "ON" : "OFF", COL_ICON, 0);
+        ag_gfx_text((int16_t)(r.x + 4), (int16_t)(r.y + 1),
+                    p->eq.enabled ? "ON" : "OFF", COL_ICON, COL_BTN_BG);
         if (!p->eq.enabled) {
             ag_gfx_stroke_rect(r.x, r.y, r.w, r.h, 0x00C04040u);
         }
         ctrl_screen_rect(p, AMP_CTRL_EQ_AUTO, &r);
-        ag_gfx_text((int16_t)(r.x + 2), (int16_t)(r.y + 1), "RST", COL_ICON, 0);
+        ag_gfx_text((int16_t)(r.x + 4), (int16_t)(r.y + 1), "RST", COL_ICON,
+                    COL_BTN_BG);
     }
 }
 
@@ -350,13 +366,16 @@ static void draw_overlays_pl(amp_player_t *p)
         if (idx == p->pl.sel) {
             ag_gfx_fill_rect(list.x, y, list.w, (uint16_t)row_h, COL_SEL);
         }
-        if (idx == p->pl.cur) {
-            ag_gfx_text((int16_t)(list.x + 2), y, ">", COL_BAR, 0);
+        {
+            uint32_t row_bg = (idx == p->pl.sel) ? COL_SEL : 0x00001810u;
+            if (idx == p->pl.cur) {
+                ag_gfx_text((int16_t)(list.x + 2), y, ">", COL_BAR, row_bg);
+            }
+            ag_gfx_text((int16_t)(list.x + 12), y, base, COL_TEXT, row_bg);
         }
-        ag_gfx_text((int16_t)(list.x + 12), y, base, COL_TEXT, 0);
     }
     ag_gfx_text((int16_t)(pos->x + 8), (int16_t)(pos->y + 1), "PLAYLIST",
-                COL_MUTED, 0);
+                COL_MUTED, 0x00182030u);
     (void)pos;
 }
 
@@ -366,7 +385,7 @@ void amp_ui_draw(amp_player_t *p)
     if (p == NULL) {
         return;
     }
-    ag_gfx_clear(COL_BG);
+    ag_gfx_fill_rect(0, 0, p->fb_w, p->fb_h, COL_BG);
     if (p->skin.qvga) {
         blit_panel(&p->skin.panel[p->focus]);
         draw_focus(p, p->focus);
@@ -387,7 +406,7 @@ void amp_ui_draw(amp_player_t *p)
         draw_overlays_pl(p);
     }
     if (p->status[0]) {
-        ag_gfx_text(8, (int16_t)(p->fb_h - 18), p->status, COL_MUTED, 0);
+        ag_gfx_text(8, (int16_t)(p->fb_h - 18), p->status, COL_MUTED, COL_BG);
     }
     draw_cursor(p);
     ag_gfx_flush(0, 0, 0, 0);

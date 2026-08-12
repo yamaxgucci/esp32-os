@@ -744,7 +744,10 @@ static void draw_ui(void)
         return;
     }
     ag_gfx_clip_reset();
-    ag_gfx_clear(COL_BG);
+    /* fill_rect on the draw buffer only — ag_gfx_clear used to present a blank
+     * frame immediately (flicker). Kernel clear no longer presents; keep local
+     * fill for the same double-buffer-friendly path as harbor. */
+    ag_gfx_fill_rect(0, 0, s_fb_w, s_fb_h, COL_BG);
 
     {
         int ti = 0;
