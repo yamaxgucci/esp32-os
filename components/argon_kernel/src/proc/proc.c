@@ -788,7 +788,14 @@ static ag_err_t spawn_common(proc_t *p, uint32_t flags, ag_pid_t *out_pid)
         xTaskCreatePinnedToCore(proc_task, p->name, p->stack_bytes, p, prio,
                                 NULL, core);
     if (created != pdPASS) {
-        ag_log(AG_LOG_ERROR, "proc", "%s: no memory for a %u byte stack",
+        /*
+         * FreeRTOS task stacks come from internal SRAM, not PSRAM heaps and
+         * not the AXE code arena.  FM + shell + Wi‑Fi/etc. can leave no 16 KB
+         * contiguous block even when megabytes of PSRAM are free.
+         */
+        ag_log(AG_LOG_ERROR, "proc",
+               "%s: no internal SRAM for a %u byte task stack "
+               "(not PSRAM / not the code arena)",
                p->name, (unsigned)p->stack_bytes);
         if (s_foreground == p->pid) {
             s_foreground = p->prev_foreground;
