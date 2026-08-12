@@ -713,6 +713,16 @@ void fm_run(const fm_entry_t *entry)
      */
     fm_ui_end();
 
+    /*
+     * ag_exec blocks while the image loads (HostFS / XIP can take a while).
+     * Without a line here the operator only sees a cleared black screen.
+     */
+    ag_color(AG_LGRAY, AG_BLACK);
+    ag_print("Loading ");
+    ag_print(entry->name);
+    ag_print(" ...\n");
+    ag_print("please wait\n");
+
     const char *argv[1] = {path};
     const int32_t status = ag_exec(path, 1, argv);
 
