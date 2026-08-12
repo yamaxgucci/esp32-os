@@ -48,6 +48,7 @@ static int s_oy;
  * so that path is a degraded reserve only.
  */
 static int s_use_live_pad = 1;
+static int s_quit;
 
 #define PAD_HOLD_MS 150u /* matches console sticky TTL */
 static uint32_t s_pad_until[2][6]; /* millis deadline per bit */
@@ -319,10 +320,38 @@ static void apply_action(int pad, int act, bool down)
     }
 }
 
+/* FOCUS_GAINED: reclaim gfx after the kernel force-released it. */
+static int handle_session_ev(const ag_event_t *ev)
+{
+    if (ev->type == AG_EV_FOCUS_GAINED) {
+        ag_gfxinfo_t info;
+        if (ag_gfx_acquire(&info) == AG_OK) {
+            bind_frame_to_fb(&info);
+        }
+        return 1;
+    }
+    if (ev->type == AG_EV_FOCUS_LOST) {
+        return 1;
+    }
+    if (ev->type == AG_EV_QUIT) {
+        if (ag_focused()) {
+            s_quit = 1;
+        }
+        return 1;
+    }
+    return 0;
+}
+
 static void poll_pad_events(void)
 {
     ag_event_t ev;
     while (ag_poll_event(&ev, 0)) {
+        if (handle_session_ev(&ev)) {
+            continue;
+        }
+        if (!ag_focused()) {
+            continue;
+        }
         if (ev.type != AG_EV_KEY_DOWN && ev.type != AG_EV_KEY_UP) {
             continue;
         }
@@ -361,6 +390,16 @@ static void poll_pad_live(void)
                                      AG_BTN_RIGHT, AG_BTN_B1,   AG_BTN_B2};
     static const uint8_t k_bits[6] = {INPUT_UP,    INPUT_DOWN, INPUT_LEFT,
                                       INPUT_RIGHT, INPUT_BUTTON1, INPUT_BUTTON2};
+    ag_event_t ev;
+    while (ag_poll_event(&ev, 0)) {
+        (void)handle_session_ev(&ev);
+    }
+    if (!ag_focused()) {
+        input.pad[0] = 0;
+        input.pad[1] = 0;
+        input.system &= (uint8_t)~(INPUT_PAUSE);
+        return;
+    }
     uint8_t p0 = 0;
     uint8_t p1 = 0;
     for (unsigned i = 0; i < 6u; i++) {
@@ -379,7 +418,7 @@ static void poll_pad_live(void)
         input.system &= (uint8_t)~INPUT_PAUSE;
     }
     if (ag_btnp(0, AG_BTN_QUIT) || ag_btnp(1, AG_BTN_QUIT)) {
-        ag_exit(0);
+        s_quit = 1;
     }
 }
 
@@ -563,11 +602,20 @@ int ag_main(int argc, char **argv)
     ag_time_t window_t0 = ag_micros();
     int       ran = 0;
 
-    for (; frames < 0 || ran < frames; ran++) {
+    for (; !s_quit && (frames < 0 || ran < frames);) {
+        poll_pad();
+        if (s_quit) {
+            break;
+        }
+        if (!ag_focused()) {
+            ag_heartbeat();
+            ag_delay(50);
+            continue;
+        }
+
         const uint32_t  t0 = ag_millis();
         const ag_time_t f0 = ag_micros();
 
-        poll_pad();
         const int show = (present_div <= 1) || ((ran % present_div) == 0);
         system_frame(show ? 0 : 1);
 
@@ -586,6 +634,7 @@ int ag_main(int argc, char **argv)
             work_max = work;
         }
         window++;
+        ran++;
 
         if (stats && (uint64_t)(f2 - window_t0) >= 2000000u) {
             report_stats("sms", window, (uint64_t)(f2 - window_t0), work_sum,

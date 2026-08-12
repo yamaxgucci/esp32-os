@@ -74,6 +74,24 @@
 #define KEY_COMMA 54
 #define KEY_DOT   55
 
+/* ag_event_t type field @0 (ILP32 layout; buffer ≥ real event). */
+#define AG_EV_FOCUS_GAINED 12
+#define AG_EV_FOCUS_LOST   13
+#define AG_EV_QUIT         14
+
+struct ag_ev {
+    int type;
+    int pad;
+    int ts0;
+    int ts1;
+    int u0;
+    int u1;
+    int u2;
+    int u3;
+    int u4;
+    int u5;
+};
+
 struct op_patch {
     int rate[4];
     int level[4];
@@ -1486,6 +1504,7 @@ int ag_main(void)
     int loop0;
     int now;
     int ms;
+    int running;
 
     fill_sin();
     fill_amp_lut();
@@ -1589,12 +1608,38 @@ int ag_main(void)
     g_dirty = 1;
     draw_ui();
 
-    while (ag_key(KEY_ESC) == 0) {
+    running = 1;
+    while (running) {
+        struct ag_ev ev;
+
         loop0 = ag_micros();
+        while (ag_poll_event(&ev, 0)) {
+            if (ev.type == AG_EV_FOCUS_GAINED) {
+                g_dirty = 1;
+            } else if (ev.type == AG_EV_QUIT) {
+                if (ag_focused()) {
+                    running = 0;
+                }
+            }
+        }
+        if (running == 0) {
+            break;
+        }
+
+        /* Keep PCM/MIDI alive in the background; pause console UI + keys. */
         pump_midivirt();
+        pump_audio();
+        if (!ag_focused()) {
+            ag_heartbeat();
+            g_next_due = ag_micros() + CHUNK_US;
+            continue;
+        }
+        if (ag_key(KEY_ESC)) {
+            running = 0;
+            break;
+        }
         poll_piano();
         poll_controls();
-        pump_audio();
 
         now = ag_micros();
         if (now - g_next_due < 0) {

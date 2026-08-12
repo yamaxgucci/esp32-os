@@ -10,6 +10,24 @@
  *   run t:\cc.axe t:\asteroids.c t:\asteroids.axe
  *   run t:\asteroids.axe
  */
+
+#define AG_EV_FOCUS_GAINED 12
+#define AG_EV_FOCUS_LOST   13
+#define AG_EV_QUIT         14
+
+struct ag_ev {
+    int type;
+    int pad;
+    int ts0;
+    int ts1;
+    int u0;
+    int u1;
+    int u2;
+    int u3;
+    int u4;
+    int u5;
+};
+
 int W;
 int H;
 int score;
@@ -356,16 +374,36 @@ int rocks_left(void)
 int ag_main(void)
 {
     int frames;
+    int running;
     W = 640;
     H = 400;
     init_tables();
     ag_gfx_acquire();
     reset_game();
     frames = 0;
-    while (frames < 3600) {
+    running = 1;
+    while (running && frames < 3600) {
+        struct ag_ev ev;
+        while (ag_poll_event(&ev, 0)) {
+            if (ev.type == AG_EV_FOCUS_GAINED) {
+                ag_gfx_acquire();
+            } else if (ev.type == AG_EV_QUIT) {
+                if (ag_focused()) {
+                    running = 0;
+                }
+            }
+        }
+        if (running == 0) {
+            break;
+        }
+        if (!ag_focused()) {
+            ag_heartbeat();
+            ag_delay(50);
+            continue;
+        }
         if (ag_btn(7)) {
-            ag_gfx_release();
-            return score;
+            running = 0;
+            break;
         }
         if (alive) {
             update();
