@@ -29,11 +29,11 @@
 #include "freertos/task.h"
 
 /*
- * Bounds, and why these ones.  A thread costs a stack out of internal RAM, which
- * is the scarce memory on this chip; four per process at the default 8 KB is
- * 32 KB, which is a sum worth being deliberate about.  The stack is clamped for
- * the same reason: an application that asks for a megabyte of stack has made a
- * mistake, and failing at create() is a better place to find out.
+ * Bounds, and why these ones.  A thread costs a stack (internal SRAM first,
+ * PSRAM fallback); four per process at the default 8 KB is still a sum worth
+ * being deliberate about.  The stack is clamped for the same reason: an
+ * application that asks for a megabyte of stack has made a mistake, and failing
+ * at create() is a better place to find out.
  */
 #define AG_THREAD_STACK_MIN (2u * 1024u)
 #define AG_THREAD_STACK_MAX (32u * 1024u)
@@ -170,8 +170,8 @@ static ag_thread_t api_create(void (*fn)(void *), void *arg, const char *name,
     snprintf(label, sizeof(label), "%.11s/t", (name != NULL) ? name : p->name);
 
     TaskHandle_t task = NULL;
-    if (xTaskCreatePinnedToCore(thread_entry, label, (uint32_t)want, rec,
-                                (UBaseType_t)prio, &task, core) != pdPASS) {
+    if (ag_proc_task_create(thread_entry, label, (uint32_t)want, rec,
+                            (UBaseType_t)prio, core, &task) != pdPASS) {
         (void)ag_reslist_remove(&p->res, AG_RES_THREAD, rec, NULL);
         heap_caps_free(rec);
         ag_proc_table_unlock();
