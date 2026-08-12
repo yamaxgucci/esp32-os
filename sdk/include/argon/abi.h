@@ -58,9 +58,11 @@ extern "C" {
  * 0.18 appended inp->inject: push ag_event_t into the console/input queue
  *      (MOUSEVIRT /dev/mouse0 → POINTER_* for gfx apps).
  * 0.19 appended sys->module_on_unload so .SYS can close TCP listens on reload.
+ * 0.22 appended optional per-open session ops on ag_dev_ops (multi-open devices
+ *      such as /dev/pcmmix); built-in software PCM mixer.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 21u
+#define AG_ABI_MINOR 22u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -590,7 +592,7 @@ enum ag_ioctl_cmd {
     /* PCM devices (/dev/pcmnull, loadable pcmvirt, …): arg ag_audio_fmt_t */
     AG_IOC_AUDIO_GETFMT = AG_IOC(AG_DEV_AUDIO, 1),
     AG_IOC_AUDIO_SETFMT = AG_IOC(AG_DEV_AUDIO, 2),
-    /* Optional: arg ag_audio_stats_t (pcmvirt; pcmnull returns zeros). */
+    /* Optional: arg ag_audio_stats_t (pcmvirt/pcmmix; pcmnull returns zeros). */
     AG_IOC_AUDIO_GETSTATS = AG_IOC(AG_DEV_AUDIO, 3),
 };
 
@@ -619,6 +621,20 @@ typedef struct ag_dev_ops {
                      uint64_t off);
     ag_err_t (*ioctl)(ag_device_t *dev, uint32_t cmd, void *arg, size_t arglen);
     uint64_t (*size)(ag_device_t *dev);
+    /*
+     * ABI 0.22: optional per-open session.  When open_session is non-NULL the
+     * filesystem open path uses these instead of open/close/read/write/ioctl,
+     * so several holders can each keep private state (e.g. mixer client rings).
+     * Older drivers leave these NULL and keep the classic single-state path.
+     */
+    ag_err_t (*open_session)(ag_device_t *dev, uint32_t flags, void **session);
+    ag_err_t (*close_session)(ag_device_t *dev, void *session);
+    int32_t (*read_session)(ag_device_t *dev, void *session, void *buf,
+                            size_t len, uint64_t off);
+    int32_t (*write_session)(ag_device_t *dev, void *session, const void *buf,
+                             size_t len, uint64_t off);
+    ag_err_t (*ioctl_session)(ag_device_t *dev, void *session, uint32_t cmd,
+                              void *arg, size_t arglen);
 } ag_dev_ops_t;
 
 /*

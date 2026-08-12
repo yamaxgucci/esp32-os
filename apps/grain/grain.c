@@ -1046,10 +1046,10 @@ int ag_main(int argc, char **argv)
     ag_event_t ev;
     int i;
 
-    (void)ag_audio_out_resolve("pcmvirt", s_audio_path, sizeof(s_audio_path));
+    (void)ag_audio_out_resolve("pcmmix", s_audio_path, sizeof(s_audio_path));
     for (i = 1; i < argc; i++) {
         if (parse_arg(argv[i]) != 0) {
-            ag_printf("grain: arg '%s' (pcmvirt|pcmnull|path.wav|nomidi)\n",
+            ag_printf("grain: arg '%s' (pcmmix|pcmvirt|pcmnull|path.wav|nomidi)\n",
                       argv[i]);
         }
     }

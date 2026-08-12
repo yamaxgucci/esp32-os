@@ -16,6 +16,7 @@ typedef struct {
     bool         used;
     ag_device_t *dev;
     uint64_t     pos;
+    void        *session; /* from open_session; NULL for classic devices */
 } devfs_file_t;
 
 typedef struct {
@@ -95,16 +96,20 @@ static ag_err_t devfs_open(void *ctx, const char *rel, uint32_t flags,
         return -AG_ENFILE;
     }
 
-    err = ag_dev_open(dev, flags);
-    if (err != AG_OK) {
-        return err;
-    }
+    {
+        void *session = NULL;
+        err = ag_dev_open2(dev, flags, &session);
+        if (err != AG_OK) {
+            return err;
+        }
 
-    memset(slot, 0, sizeof(*slot));
-    slot->used = true;
-    slot->dev = dev;
-    *file = slot;
-    return AG_OK;
+        memset(slot, 0, sizeof(*slot));
+        slot->used = true;
+        slot->dev = dev;
+        slot->session = session;
+        *file = slot;
+        return AG_OK;
+    }
 }
 
 static ag_err_t devfs_close(void *ctx, void *file)
@@ -115,7 +120,7 @@ static ag_err_t devfs_close(void *ctx, void *file)
         return -AG_EBADF;
     }
 
-    const ag_err_t err = ag_dev_close(f->dev);
+    const ag_err_t err = ag_dev_close2(f->dev, f->session);
     memset(f, 0, sizeof(*f));
     return err;
 }
@@ -128,7 +133,7 @@ static int32_t devfs_read(void *ctx, void *file, void *buf, size_t len)
         return -AG_EBADF;
     }
 
-    const int32_t n = ag_dev_read(f->dev, buf, len, f->pos);
+    const int32_t n = ag_dev_read2(f->dev, f->session, buf, len, f->pos);
     if (n > 0) {
         f->pos += (uint64_t)n;
     }
@@ -143,7 +148,7 @@ static int32_t devfs_write(void *ctx, void *file, const void *buf, size_t len)
         return -AG_EBADF;
     }
 
-    const int32_t n = ag_dev_write(f->dev, buf, len, f->pos);
+    const int32_t n = ag_dev_write2(f->dev, f->session, buf, len, f->pos);
     if (n > 0) {
         f->pos += (uint64_t)n;
     }
@@ -187,7 +192,8 @@ static ag_err_t devfs_sync(void *ctx, void *file)
         return -AG_EBADF;
     }
     /* A device that has nothing to flush says so by not implementing it. */
-    const ag_err_t err = ag_dev_ioctl(f->dev, AG_IOC_FLUSH, NULL, 0);
+    const ag_err_t err =
+        ag_dev_ioctl2(f->dev, f->session, AG_IOC_FLUSH, NULL, 0);
     return (err == -AG_ENOTSUP) ? AG_OK : err;
 }
 
@@ -328,4 +334,10 @@ ag_device_t *ag_devfs_device_of(ag_handle_t h)
 {
     devfs_file_t *f = (devfs_file_t *)ag_vfs_backend_object(h, &k_devfs_ops);
     return (f != NULL && f->used) ? f->dev : NULL;
+}
+
+void *ag_devfs_session_of(ag_handle_t h)
+{
+    devfs_file_t *f = (devfs_file_t *)ag_vfs_backend_object(h, &k_devfs_ops);
+    return (f != NULL && f->used) ? f->session : NULL;
 }

@@ -13,6 +13,7 @@ extern "C" {
 #endif
 
 ag_err_t ag_audio_init(void);
+ag_err_t ag_pcmmix_init(void); /* multi-open summing mixer → pcmvirt/pcmnull */
 int      ag_audio_opened(void); /* for process teardown */
 
 extern const ag_audio_api_t ag_audio_api_table;
