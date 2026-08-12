@@ -104,12 +104,10 @@ void ag_shell_dos_path(const char *posix_path, char *out, size_t n)
 
 static void build_prompt(char *out, size_t n)
 {
-    ag_shell_dos_path(s_cwd, out, n - 2);
-    const size_t len = strlen(out);
-    if (len + 2 <= n) {
-        out[len] = '>';
-        out[len + 1] = '\0';
-    }
+    const int slot_n = ag_session_display_number(ag_session_focused());
+    char      path[AG_PATH_MAX];
+    ag_shell_dos_path(s_cwd, path, sizeof(path));
+    snprintf(out, n, "(%d) %s>", slot_n, path);
 }
 
 ag_err_t ag_shell_set_cwd(const char *path)
@@ -121,7 +119,17 @@ ag_err_t ag_shell_set_cwd(const char *path)
         return -AG_ERANGE;
     }
     strcpy(s_cwd, path);
+    (void)ag_session_set_cwd(ag_session_focused(), path);
     return AG_OK;
+}
+
+static void sync_cwd_from_session(void)
+{
+    const char *cwd = ag_session_cwd(ag_session_focused());
+    if (cwd != NULL && cwd[0] == '/') {
+        strncpy(s_cwd, cwd, sizeof(s_cwd) - 1);
+        s_cwd[sizeof(s_cwd) - 1] = '\0';
+    }
 }
 
 /*
@@ -138,10 +146,16 @@ static void pick_initial_cwd(void)
         if (ag_vfs_stat(candidates[i], NULL, &st) == AG_OK &&
             (st.attr & AG_A_DIR)) {
             ag_shell_set_cwd(candidates[i]);
+            for (int s = 0; s < AG_SESSION_SLOTS; s++) {
+                (void)ag_session_set_cwd(s, s_cwd);
+            }
             return;
         }
     }
     ag_shell_set_cwd("/");
+    for (int s = 0; s < AG_SESSION_SLOTS; s++) {
+        (void)ag_session_set_cwd(s, s_cwd);
+    }
 }
 
 /* ---------------------------------------------------------------------- */
@@ -153,7 +167,7 @@ typedef struct {
     uint16_t col0;
 } prompt_pos_t;
 
-static char         s_prompt[AG_PATH_MAX + 8];
+static char         s_prompt[AG_PATH_MAX + 16];
 static prompt_pos_t s_prompt_pos;
 
 /* Caller holds the console lock. */
@@ -418,9 +432,9 @@ static int cmd_run(int argc, char **argv)
 
     const int slot = ag_session_slot_of(pid);
     ag_console_printf("started pid %u in slot %d\n", (unsigned)pid,
-                      slot >= 0 ? slot : -1);
+                      slot >= 0 ? ag_session_display_number(slot) : -1);
 
-    if (!detach_only && slot > 0) {
+    if (!detach_only && slot >= 0) {
         (void)ag_session_focus(slot);
     }
     return 0;
@@ -1390,17 +1404,13 @@ static int cmd_slots(int argc, char **argv)
 
     ag_console_puts("  slot  pid   name\n");
     for (int i = 0; i < AG_SESSION_SLOTS; i++) {
-        if (i == AG_SESSION_SYSTEM) {
-            ag_console_printf("  %d%s   -     system\n", i,
-                              focused == i ? "*" : " ");
-            continue;
-        }
+        const int shown = ag_session_display_number(i);
         if (slots[i].pid == AG_PID_KERNEL) {
-            ag_console_printf("  %d%s   -     (empty)\n", i,
+            ag_console_printf("  %d%s   -     shell\n", shown,
                               focused == i ? "*" : " ");
         } else {
-            ag_console_printf("  %d%s   %-4u  %s\n", i, focused == i ? "*" : " ",
-                              (unsigned)slots[i].pid,
+            ag_console_printf("  %d%s   %-4u  %s\n", shown,
+                              focused == i ? "*" : " ", (unsigned)slots[i].pid,
                               slots[i].name[0] ? slots[i].name : "?");
         }
     }
@@ -1410,19 +1420,19 @@ static int cmd_slots(int argc, char **argv)
 static int cmd_fg(int argc, char **argv)
 {
     if (argc != 2) {
-        ag_console_printf("usage: fg <slot|pid>\n");
+        ag_console_printf("usage: fg <slot|pid>   (slot is 1..4)\n");
         return 1;
     }
 
     const int n = atoi(argv[1]);
 
-    /* 0..3 → session slot; larger numbers → pid. */
-    if (n >= 0 && n < AG_SESSION_SLOTS) {
-        const ag_err_t err = ag_session_focus(n);
-        if (err != AG_OK) {
-            ag_console_printf("slot %d empty\n", n);
-            return 1;
-        }
+    /* 1..4 → display slot number; bare 0 also accepted as slot 1's index. */
+    if (n >= 1 && n <= AG_SESSION_SLOTS) {
+        (void)ag_session_focus(n - 1);
+        return 0;
+    }
+    if (n == 0) {
+        (void)ag_session_focus(0);
         return 0;
     }
 
@@ -1432,11 +1442,7 @@ static int cmd_fg(int argc, char **argv)
         ag_console_printf("no process with pid %u\n", (unsigned)pid);
         return 1;
     }
-    const ag_err_t err = ag_session_focus(slot);
-    if (err != AG_OK) {
-        ag_console_printf("could not focus pid %u\n", (unsigned)pid);
-        return 1;
-    }
+    (void)ag_session_focus(slot);
     return 0;
 }
 
@@ -1658,21 +1664,24 @@ void ag_shell_run(void)
     ag_log_set_echo(false);
 
     ag_console_puts("\nType 'help' for a list of commands.\n");
-    ag_console_puts("Ctrl+\\ = system shell; Alt+1..4 / Alt+Tab = session slots.\n");
+    ag_console_puts(
+        "Alt+1..4 / Alt+Tab = slots; Ctrl+\\ = slot 1 shell (again = kill).\n");
 
     for (;;) {
-        /* Do not steal keys while a user slot owns the keyboard. */
-        while (ag_session_focused() != AG_SESSION_SYSTEM) {
+        /* App in the focused slot owns the keyboard; shell waits. */
+        while (!ag_session_shell_owns_keyboard()) {
             vTaskDelay(pdMS_TO_TICKS(50));
         }
 
+        sync_cwd_from_session();
+        ag_shell_clear_interrupted();
         ag_lineedit_reset(&s_line);
         show_prompt();
         redraw_line(&s_line, &s_prompt_pos);
 
         bool done = false;
         while (!done) {
-            if (ag_session_focused() != AG_SESSION_SYSTEM) {
+            if (!ag_session_shell_owns_keyboard()) {
                 ag_console_lock();
                 ag_console_set_live(NULL, NULL);
                 ag_console_unlock();
@@ -1682,6 +1691,14 @@ void ag_shell_run(void)
             ag_event_t ev;
             if (!ag_console_read_event(&ev, 50)) {
                 continue;
+            }
+            if (ev.type == AG_EV_QUIT) {
+                /* Session switch injected this — redraw prompt for new slot. */
+                ag_console_lock();
+                ag_console_set_live(NULL, NULL);
+                ag_console_unlock();
+                done = true;
+                break;
             }
 
             switch (ag_lineedit_key(&s_line, &ev)) {

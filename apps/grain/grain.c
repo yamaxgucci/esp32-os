@@ -1108,6 +1108,12 @@ int ag_main(int argc, char **argv)
                 continue;
             }
             if (ev.type == AG_EV_FOCUS_GAINED) {
+                if (ag_gfx_acquire(&s_gi) == AG_OK) {
+                    s_have_gfx = 1;
+                    s_fb_w = s_gi.width ? s_gi.width : 640;
+                    s_fb_h = s_gi.height ? s_gi.height : 400;
+                    layout_geom();
+                }
                 s_dirty = 1;
                 continue;
             }
@@ -1132,6 +1138,13 @@ int ag_main(int argc, char **argv)
             ag_delay(50);
             s_next_due = ag_micros() + (ag_time_t)CHUNK_US;
             continue;
+        }
+        if (ag_gfx_acquire(&s_gi) == AG_OK) {
+            s_have_gfx = 1;
+            s_fb_w = s_gi.width ? s_gi.width : 640;
+            s_fb_h = s_gi.height ? s_gi.height : 400;
+            layout_geom();
+            s_dirty = 1;
         }
 
         pump_midivirt();

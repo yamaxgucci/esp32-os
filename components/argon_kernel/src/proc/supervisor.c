@@ -247,10 +247,7 @@ static void supervisor_task(void *arg)
             const int slot = s_focus_slot_request;
             if (slot >= 0) {
                 s_focus_slot_request = -1;
-                const ag_err_t err = ag_session_focus(slot);
-                if (err != AG_OK && ag_console_ready()) {
-                    ag_console_printf("slot %d empty\n", slot);
-                }
+                (void)ag_session_focus(slot);
             }
         }
         /*
@@ -293,6 +290,8 @@ bool ag_supervisor_running(void) { return s_task != NULL; }
 bool ag_supervisor_interrupted(void) { return s_shell_interrupt; }
 
 void ag_supervisor_clear_interrupt(void) { s_shell_interrupt = false; }
+
+void ag_supervisor_raise_shell_interrupt(void) { s_shell_interrupt = true; }
 
 ag_err_t ag_supervisor_init(void)
 {
