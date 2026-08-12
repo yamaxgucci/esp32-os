@@ -67,10 +67,12 @@ static void apply_volume(int16_t *stereo, int frames, int vol, int bal)
 static void pump_audio(void)
 {
     int n;
+    uint32_t rate;
     if (s_p.state != AMP_PLAYING || s_p.mp3 == NULL || s_p.audio_fd < 0) {
         return;
     }
-    n = ag_mp3_read(s_p.mp3, s_pcm, CHUNK_FRAMES);
+    /* Small decode quantum so HostFS reads stay short and UI keeps ticking. */
+    n = ag_mp3_read(s_p.mp3, s_pcm, 128);
     if (n < 0) {
         s_p.state = AMP_STOPPED;
         strncpy(s_p.status, "decode fail", sizeof(s_p.status) - 1);
@@ -78,20 +80,36 @@ static void pump_audio(void)
         return;
     }
     if (n == 0) {
+        if (ag_mp3_rate(s_p.mp3) == 0) {
+            /* Still hunting sync — not EOF yet. */
+            return;
+        }
         /* EOF: advance once; do not spin forever on a broken stub file. */
-        int prev = s_p.pl.cur;
-        amp_cmd_next(&s_p);
-        if (s_p.pl.cur == prev && s_p.state == AMP_PLAYING) {
-            s_p.state = AMP_STOPPED;
-            strncpy(s_p.status, "end of track", sizeof(s_p.status) - 1);
-            s_p.dirty = 1;
+        {
+            int prev = s_p.pl.cur;
+            amp_cmd_next(&s_p);
+            if (s_p.pl.cur == prev && s_p.state == AMP_PLAYING) {
+                s_p.state = AMP_STOPPED;
+                strncpy(s_p.status, "end of track", sizeof(s_p.status) - 1);
+                s_p.dirty = 1;
+            }
         }
         return;
+    }
+    rate = ag_mp3_rate(s_p.mp3);
+    if (rate != 0 && rate != s_p.rate && rate <= 48000u) {
+        ag_audio_fmt_t fmt;
+        s_p.rate = rate;
+        amp_eq_set_rate(&s_p.eq, rate);
+        fmt.rate = rate;
+        fmt.channels = 2;
+        fmt.bits = 16;
+        (void)ag_dev_ioctl(s_p.audio_fd, AG_IOC_AUDIO_SETFMT, &fmt, sizeof(fmt));
+        ag_printf("amp: rate=%u\n", (unsigned)rate);
     }
     amp_eq_process(&s_p.eq, s_pcm, n);
     apply_volume(s_pcm, n, s_p.volume, s_p.balance);
     (void)ag_dev_write(s_p.audio_fd, s_pcm, (size_t)n * 4u);
-    /* Spectrum/time refresh on the UI timer only — full blit every chunk freezes QEMU. */
 }
 
 static void open_mouse(void)
