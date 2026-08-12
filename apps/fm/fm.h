@@ -14,7 +14,7 @@
  * The same panels/ops build three ways.
  *
  * As a text .AXE: AG_APP in fm.c, cell drawing via fm_ui_text.c.
- * With AG_BUILTIN: part of the kernel image as the shell's `fm` command.
+ * With AG_BUILTIN: linked into the kernel; `fm` spawns it as a process in a slot.
  * As GFXFM.AXE: FM_GFX_BUILD + apps/gfxfm (soft gfx cell backend, same ops).
  *
  * Drawing goes through fm_ui.h so ops never call the console or gfx directly.

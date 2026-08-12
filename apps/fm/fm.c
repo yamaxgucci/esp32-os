@@ -14,9 +14,6 @@
  */
 #include "fm.h"
 #include "fm_ui.h"
-#ifdef AG_BUILTIN
-#include <argon/shell.h>
-#endif
 
 /* Only the plain text application build declares an image header; the built-in
  * lives in the kernel image, and GFXFM supplies its own header. */
@@ -679,25 +676,33 @@ int FM_ENTRY(int argc, char **argv)
 
     bool running = true;
     while (running) {
-#ifdef AG_BUILTIN
-        if (ag_shell_interrupted()) {
+        if (ag_interrupted()) {
             break;
         }
-#endif
 
         ag_event_t ev;
         if (!ag_poll_event(&ev, 50)) {
+            if (!ag_focused()) {
+                ag_heartbeat();
+            }
             continue;
         }
 
-        /*
-         * Ctrl+C / session switch (Alt+N) become QUIT so a drawn screen can
-         * restore the console.
-         */
+        if (ev.type == AG_EV_FOCUS_LOST) {
+            continue;
+        }
+        if (ev.type == AG_EV_FOCUS_GAINED) {
+            fm_ui_begin();
+            fm_draw_all();
+            fm_ui_present();
+            continue;
+        }
+
+        /* Ctrl+C → QUIT.  Alt+N is FOCUS_LOST only; do not exit. */
         if (ev.type == AG_EV_QUIT) {
             break;
         }
-        if (ev.type != AG_EV_KEY_DOWN) {
+        if (!ag_focused() || ev.type != AG_EV_KEY_DOWN) {
             continue;
         }
 
@@ -759,7 +764,7 @@ int FM_ENTRY(int argc, char **argv)
             break;
         }
 
-        if (running) {
+        if (running && ag_focused()) {
             if (moved_only) {
                 fm_draw_light();
             } else {
@@ -770,12 +775,7 @@ int FM_ENTRY(int argc, char **argv)
 
     fm_ui_end();
 
-    /*
-     * And the memory too.  A process would have it taken back on the way out,
-     * but the built-in runs inside the kernel, where nobody is going to do that
-     * - and a file manager that leaks ninety kilobytes every time it is opened
-     * would be a poor advertisement for the accounting.
-     */
+    /* Arena is reclaimed with the process; free anyway for tidy builtins. */
     for (int i = 0; i < 2; i++) {
         ag_free(g_panel[i].entries);
         g_panel[i].entries = NULL;
