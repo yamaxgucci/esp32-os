@@ -1,5 +1,5 @@
 /*
- * ArgonOS - session slots (per-slot shell + optional app).
+ * ArgonOS - session slots (per-slot shell + optional app) and system shell.
  *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
  */
@@ -16,6 +16,7 @@
 
 #include "proc/supervisor.h"
 
+#include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -28,25 +29,74 @@ typedef struct {
     char     cwd[AG_PATH_MAX];
 } slot_t;
 
-static slot_t   s_slots[AG_SESSION_SLOTS];
-static int      s_focused = AG_SESSION_SYSTEM;
+/* cwd[] is large; keep the table out of scarce internal DRAM. */
+static slot_t  *s_slots;
+static slot_t  *s_sys;
+static int      s_focused = 0; /* boot: user slot 1 (index 0) */
+static int      s_last_user_slot = 0;
 static ag_pid_t s_last_user = AG_PID_KERNEL;
 static int64_t  s_last_breakin_us;
 
-static void slot_set_default_cwd(int slot)
+static void cwd_set_default(char *cwd, size_t n)
 {
-    strncpy(s_slots[slot].cwd, "/", sizeof(s_slots[slot].cwd) - 1);
-    s_slots[slot].cwd[sizeof(s_slots[slot].cwd) - 1] = '\0';
+    strncpy(cwd, "/", n - 1);
+    cwd[n - 1] = '\0';
+}
+
+static bool is_user_slot(int slot)
+{
+    return slot >= 0 && slot < AG_SESSION_SLOTS;
+}
+
+static ag_pid_t slot_pid(int slot)
+{
+    if (slot == AG_SESSION_SYSTEM) {
+        return AG_PID_KERNEL;
+    }
+    if (!is_user_slot(slot) || s_slots == NULL) {
+        return AG_PID_KERNEL;
+    }
+    return s_slots[slot].pid;
 }
 
 void ag_session_init(void)
 {
-    memset(s_slots, 0, sizeof(s_slots));
-    for (int i = 0; i < AG_SESSION_SLOTS; i++) {
-        slot_set_default_cwd(i);
+    if (s_slots == NULL) {
+        s_slots = (slot_t *)heap_caps_calloc(
+            AG_SESSION_SLOTS, sizeof(slot_t),
+            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     }
-    strncpy(s_slots[0].name, "shell", sizeof(s_slots[0].name) - 1);
-    s_focused = AG_SESSION_SYSTEM;
+    if (s_sys == NULL) {
+        s_sys = (slot_t *)heap_caps_calloc(1, sizeof(slot_t),
+                                           MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    }
+    if (s_slots == NULL || s_sys == NULL) {
+        /* Last resort: internal DRAM (boot must not proceed half-init). */
+        if (s_slots == NULL) {
+            s_slots = (slot_t *)heap_caps_calloc(
+                AG_SESSION_SLOTS, sizeof(slot_t),
+                MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        }
+        if (s_sys == NULL) {
+            s_sys = (slot_t *)heap_caps_calloc(
+                1, sizeof(slot_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        }
+    }
+    if (s_slots == NULL || s_sys == NULL) {
+        ag_log(AG_LOG_ERROR, "session", "no memory for session slots");
+        abort();
+    }
+
+    memset(s_slots, 0, AG_SESSION_SLOTS * sizeof(slot_t));
+    memset(s_sys, 0, sizeof(*s_sys));
+    for (int i = 0; i < AG_SESSION_SLOTS; i++) {
+        cwd_set_default(s_slots[i].cwd, sizeof(s_slots[i].cwd));
+    }
+    cwd_set_default(s_sys->cwd, sizeof(s_sys->cwd));
+    strncpy(s_sys->name, "system", sizeof(s_sys->name) - 1);
+
+    s_focused = 0;
+    s_last_user_slot = 0;
     s_last_user = AG_PID_KERNEL;
     s_last_breakin_us = 0;
     (void)ag_proc_set_foreground(AG_PID_KERNEL);
@@ -54,22 +104,24 @@ void ag_session_init(void)
 
 int ag_session_focused(void) { return s_focused; }
 
+bool ag_session_is_system(void) { return s_focused == AG_SESSION_SYSTEM; }
+
 int ag_session_display_number(int slot)
 {
-    if (slot < 0 || slot >= AG_SESSION_SLOTS) {
+    if (!is_user_slot(slot)) {
         return 0;
     }
     return slot + 1;
 }
 
-ag_pid_t ag_session_focused_pid(void)
-{
-    return s_slots[s_focused].pid;
-}
+ag_pid_t ag_session_focused_pid(void) { return slot_pid(s_focused); }
 
 bool ag_session_shell_owns_keyboard(void)
 {
-    return s_slots[s_focused].pid == AG_PID_KERNEL;
+    if (s_focused == AG_SESSION_SYSTEM) {
+        return true;
+    }
+    return is_user_slot(s_focused) && s_slots[s_focused].pid == AG_PID_KERNEL;
 }
 
 int ag_session_slot_of(ag_pid_t pid)
@@ -87,7 +139,10 @@ int ag_session_slot_of(ag_pid_t pid)
 
 const char *ag_session_cwd(int slot)
 {
-    if (slot < 0 || slot >= AG_SESSION_SLOTS) {
+    if (slot == AG_SESSION_SYSTEM) {
+        return (s_sys != NULL) ? s_sys->cwd : "/";
+    }
+    if (!is_user_slot(slot) || s_slots == NULL) {
         return "/";
     }
     return s_slots[slot].cwd;
@@ -95,14 +150,26 @@ const char *ag_session_cwd(int slot)
 
 ag_err_t ag_session_set_cwd(int slot, const char *absolute_path)
 {
-    if (slot < 0 || slot >= AG_SESSION_SLOTS || absolute_path == NULL ||
-        absolute_path[0] != '/') {
+    char  *cwd;
+    size_t cap;
+
+    if (absolute_path == NULL || absolute_path[0] != '/' || s_slots == NULL ||
+        s_sys == NULL) {
         return -AG_EINVAL;
     }
-    if (strlen(absolute_path) >= sizeof(s_slots[slot].cwd)) {
+    if (slot == AG_SESSION_SYSTEM) {
+        cwd = s_sys->cwd;
+        cap = sizeof(s_sys->cwd);
+    } else if (is_user_slot(slot)) {
+        cwd = s_slots[slot].cwd;
+        cap = sizeof(s_slots[slot].cwd);
+    } else {
+        return -AG_EINVAL;
+    }
+    if (strlen(absolute_path) >= cap) {
         return -AG_ERANGE;
     }
-    strcpy(s_slots[slot].cwd, absolute_path);
+    strcpy(cwd, absolute_path);
     return AG_OK;
 }
 
@@ -118,7 +185,7 @@ static void clear_pid_from_slots(ag_pid_t pid)
 
 ag_err_t ag_session_bind_to(ag_pid_t pid, const char *name, int slot)
 {
-    if (pid == AG_PID_KERNEL || slot < 0 || slot >= AG_SESSION_SLOTS) {
+    if (pid == AG_PID_KERNEL || !is_user_slot(slot)) {
         return -AG_EINVAL;
     }
     if (s_slots[slot].pid != AG_PID_KERNEL && s_slots[slot].pid != pid) {
@@ -141,8 +208,8 @@ ag_err_t ag_session_bind(ag_pid_t pid, const char *name)
     if (ag_session_slot_of(pid) >= 0) {
         return AG_OK;
     }
-    /* Prefer the focused free slot so spawners match where the user typed. */
-    if (s_slots[s_focused].pid == AG_PID_KERNEL) {
+    /* Prefer the focused free user slot so spawners match where the user typed. */
+    if (is_user_slot(s_focused) && s_slots[s_focused].pid == AG_PID_KERNEL) {
         return ag_session_bind_to(pid, name, s_focused);
     }
     for (int i = 0; i < AG_SESSION_SLOTS; i++) {
@@ -185,8 +252,12 @@ static void notify_focus(ag_pid_t prev_pid, ag_pid_t next_pid)
 
 static void enter_shell_view(int slot)
 {
-    ag_log(AG_LOG_INFO, "session", "enter_shell_view slot %d (inject QUIT)",
-           ag_session_display_number(slot));
+    if (slot == AG_SESSION_SYSTEM) {
+        ag_log(AG_LOG_INFO, "session", "enter_shell_view sys (inject QUIT)");
+    } else {
+        ag_log(AG_LOG_INFO, "session", "enter_shell_view slot %d (inject QUIT)",
+               ag_session_display_number(slot));
+    }
 
     if (ag_display_acquired()) {
         ag_display_force_release();
@@ -198,7 +269,11 @@ static void enter_shell_view(int slot)
         ag_screen_set_attr(ag_console_screen(), AG_ATTR_DEFAULT);
         ag_screen_set_cursor(ag_console_screen(), true);
         ag_console_unlock();
-        ag_console_printf("slot %d\n", ag_session_display_number(slot));
+        if (slot == AG_SESSION_SYSTEM) {
+            ag_console_puts("system shell\n");
+        } else {
+            ag_console_printf("slot %d\n", ag_session_display_number(slot));
+        }
     }
 
     ag_supervisor_raise_shell_interrupt();
@@ -245,21 +320,21 @@ static bool proc_is_loading(ag_pid_t pid)
 
 ag_err_t ag_session_focus(int slot)
 {
-    if (slot < 0 || slot >= AG_SESSION_SLOTS) {
+    if (slot != AG_SESSION_SYSTEM && !is_user_slot(slot)) {
         return -AG_EINVAL;
     }
 
     const ag_pid_t prev_pid = ag_session_focused_pid();
     const int      prev_slot = s_focused;
-    const ag_pid_t next_pid = s_slots[slot].pid;
+    const ag_pid_t next_pid = slot_pid(slot);
 
     /*
-     * Same slot after bind_to(app): index unchanged but the occupant went from
-     * shell → process.  Still need foreground + FOCUS_GAINED (and no banner
-     * over a ready app's screen).
+     * Same user slot after bind_to(app): index unchanged but the occupant went
+     * from shell → process.  Still need foreground + FOCUS_GAINED.
      */
     if (slot == prev_slot) {
-        if (next_pid != AG_PID_KERNEL && ag_proc_foreground() != next_pid) {
+        if (is_user_slot(slot) && next_pid != AG_PID_KERNEL &&
+            ag_proc_foreground() != next_pid) {
             (void)ag_proc_set_foreground(next_pid);
             s_last_user = next_pid;
             if (ag_console_ready()) {
@@ -279,7 +354,14 @@ ag_err_t ag_session_focus(int slot)
         ag_display_force_release();
     }
 
+    if (is_user_slot(prev_slot)) {
+        s_last_user_slot = prev_slot;
+    }
+
     s_focused = slot;
+    if (is_user_slot(slot)) {
+        s_last_user_slot = slot;
+    }
     if (next_pid != AG_PID_KERNEL) {
         s_last_user = next_pid;
     }
@@ -300,9 +382,8 @@ ag_err_t ag_session_focus(int slot)
     }
     /* Ready apps own the screen — no console banner over them. */
 
-    ag_log(AG_LOG_INFO, "session", "focus %d -> %d (pid %u)",
-           ag_session_display_number(prev_slot),
-           ag_session_display_number(slot), (unsigned)next_pid);
+    ag_log(AG_LOG_INFO, "session", "focus %d -> %d (pid %u)", prev_slot, slot,
+           (unsigned)next_pid);
     return AG_OK;
 }
 
@@ -343,13 +424,18 @@ bool ag_session_enter_system(void)
     }
 
     (void)ag_session_focus(AG_SESSION_SYSTEM);
-    ag_console_puts("system shell (Ctrl+\\ again = kill last app)\n");
+    ag_console_puts("Ctrl+\\ again = kill last app\n");
     return false;
 }
 
 ag_err_t ag_session_alt_tab(void)
 {
-    const int next = (s_focused + 1) % AG_SESSION_SLOTS;
+    int next;
+    if (s_focused == AG_SESSION_SYSTEM) {
+        next = is_user_slot(s_last_user_slot) ? s_last_user_slot : 0;
+    } else {
+        next = (s_focused + 1) % AG_SESSION_SLOTS;
+    }
 
     char label[64];
     if (s_slots[next].pid == AG_PID_KERNEL) {

@@ -104,10 +104,14 @@ void ag_shell_dos_path(const char *posix_path, char *out, size_t n)
 
 static void build_prompt(char *out, size_t n)
 {
-    const int slot_n = ag_session_display_number(ag_session_focused());
-    char      path[AG_PATH_MAX];
+    char path[AG_PATH_MAX];
     ag_shell_dos_path(s_cwd, path, sizeof(path));
-    snprintf(out, n, "(%d) %s>", slot_n, path);
+    if (ag_session_is_system()) {
+        snprintf(out, n, "(sys) %s>", path);
+    } else {
+        snprintf(out, n, "(%d) %s>", ag_session_display_number(ag_session_focused()),
+                 path);
+    }
 }
 
 ag_err_t ag_shell_set_cwd(const char *path)
@@ -408,22 +412,27 @@ static int cmd_run(int argc, char **argv)
     bool detach_only = false;
     int  first = 1;
 
+    if (ag_session_is_system()) {
+        ag_console_puts("run: use a user slot (Alt+1..4)\n");
+        return 1;
+    }
+
     if (argc > 1 && ag_path_icmp(argv[1], "/b") == 0) {
         detach_only = true;
         first = 2;
     }
     if (argc <= first) {
         ag_console_puts("usage: run [/b] <file> [arguments]\n");
-        ag_console_puts("  starts in the current session slot (or a free one)\n");
+        ag_console_puts("  starts in the current user slot (or a free one)\n");
         ag_console_puts("  /b  same, without switching focus to the app\n");
-        ag_console_puts("  Alt+1..4 / fg <slot|pid> to focus; Ctrl+\\ = slot 1\n");
+        ag_console_puts("  Alt+1..4 / fg <slot|pid>; Ctrl+\\ = system shell\n");
         return 1;
     }
 
     /*
      * Pin the target slot before spawn: Alt+N can race on the console task and
      * would otherwise bind the new app into whichever slot is focused at the
-     * moment bind runs (often slot 1).
+     * moment bind runs.
      */
     const int target_slot = ag_session_focused();
 
@@ -1340,6 +1349,11 @@ int ag_fm_main(int argc, char **argv);
 
 static int cmd_fm(int argc, char **argv)
 {
+    if (ag_session_is_system()) {
+        ag_console_puts("fm: use a user slot (Alt+1..4)\n");
+        return 1;
+    }
+
     const int target_slot = ag_session_focused();
 
     /* Already have FM in this slot — just focus it. */
@@ -1528,6 +1542,8 @@ static int cmd_slots(int argc, char **argv)
     const int focused = ag_session_focused();
 
     ag_console_puts("  slot  pid   prio     name\n");
+    ag_console_printf("  sys%s  -     -        system\n",
+                      focused == AG_SESSION_SYSTEM ? "*" : " ");
     for (int i = 0; i < AG_SESSION_SLOTS; i++) {
         const int shown = ag_session_display_number(i);
         if (slots[i].pid == AG_PID_KERNEL) {
@@ -1552,15 +1568,16 @@ static int cmd_fg(int argc, char **argv)
         return 1;
     }
 
+    if (ag_path_icmp(argv[1], "sys") == 0) {
+        ag_console_puts("fg: system shell is Ctrl+\\ only\n");
+        return 1;
+    }
+
     const int n = atoi(argv[1]);
 
-    /* 1..4 → display slot number; bare 0 also accepted as slot 1's index. */
+    /* 1..4 → display slot number */
     if (n >= 1 && n <= AG_SESSION_SLOTS) {
         (void)ag_session_focus(n - 1);
-        return 0;
-    }
-    if (n == 0) {
-        (void)ag_session_focus(0);
         return 0;
     }
 
@@ -1795,7 +1812,8 @@ void ag_shell_run(void)
 
     ag_console_puts("\nType 'help' for a list of commands.\n");
     ag_console_puts(
-        "Alt+1..4 / Alt+Tab = slots; Ctrl+\\ = slot 1 shell (again = kill).\n");
+        "Alt+1..4 / Alt+Tab = user slots; Ctrl+\\ = system shell "
+        "(again = kill last app).\n");
 
     for (;;) {
         /* App in the focused slot owns the keyboard; shell waits. */

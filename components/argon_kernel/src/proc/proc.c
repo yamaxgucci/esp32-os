@@ -1533,7 +1533,7 @@ bool ag_proc_focused(void)
 {
     proc_t *p = current();
     if (p == NULL) {
-        return ag_session_focused() == AG_SESSION_SYSTEM;
+        return ag_session_shell_owns_keyboard();
     }
     return ag_session_focused_pid() == p->pid;
 }

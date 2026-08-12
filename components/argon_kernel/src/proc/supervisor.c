@@ -106,15 +106,8 @@ static bool hotkeys(ag_event_t *ev)
         return true;
     }
 
-    /* Alt+` → system slot; Alt+1..4 → that slot; Alt+Tab → cycle. */
+    /* Alt+1..4 → user slot; Alt+Tab → cycle user slots.  Sys is Ctrl+\ only. */
     if (mods & AG_MOD_ALT) {
-        if (key == AG_KEY_GRAVE) {
-            s_focus_slot_request = AG_SESSION_SYSTEM;
-            if (s_task != NULL) {
-                xTaskNotifyGive(s_task);
-            }
-            return true;
-        }
         if (key >= AG_KEY_1 && key <= AG_KEY_4) {
             s_focus_slot_request = (int)(key - AG_KEY_1);
             if (s_task != NULL) {
