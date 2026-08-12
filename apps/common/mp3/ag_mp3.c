@@ -12,8 +12,9 @@
 #define MINIMP3_NO_SIMD
 #include "minimp3.h"
 
-#define AG_MP3_BUF     16384
-#define AG_MP3_PCM_MAX MINIMP3_MAX_SAMPLES_PER_FRAME
+#define AG_MP3_BUF        4096
+#define AG_MP3_READ_CHUNK 512 /* HostFS large reads can wedge QEMU forever */
+#define AG_MP3_PCM_MAX    MINIMP3_MAX_SAMPLES_PER_FRAME
 
 struct ag_mp3 {
     ag_handle_t fd;
@@ -149,12 +150,17 @@ const char *ag_mp3_title(const ag_mp3_t *m)
 static int refill(ag_mp3_t *m)
 {
     int32_t n;
+    size_t  want;
     if (m->eof) {
         return m->in_len;
     }
     if (m->in_len < AG_MP3_BUF) {
-        n = ag_read(m->fd, m->in + m->in_len,
-                    (size_t)(AG_MP3_BUF - m->in_len));
+        want = (size_t)(AG_MP3_BUF - m->in_len);
+        if (want > AG_MP3_READ_CHUNK) {
+            want = AG_MP3_READ_CHUNK;
+        }
+        ag_heartbeat();
+        n = ag_read(m->fd, m->in + m->in_len, want);
         if (n < 0) {
             return -1;
         }
@@ -193,7 +199,7 @@ static int decode_one(ag_mp3_t *m)
             m->in_len -= info.frame_bytes;
         } else if (m->eof) {
             return 0;
-        } else if (m->in_len == AG_MP3_BUF) {
+        } else if (m->in_len >= AG_MP3_BUF) {
             /* Resync in larger steps — byte-walk + memmove is deadly on QEMU/HostFS. */
             int drop = 64;
             if (drop > m->in_len) {
@@ -210,6 +216,7 @@ static int decode_one(ag_mp3_t *m)
             if (m->eof) {
                 return 0;
             }
+            /* Keep refilling in 512-byte HostFS chunks until guard trips. */
             continue;
         }
         if (samples > 0) {

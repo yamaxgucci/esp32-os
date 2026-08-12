@@ -22,10 +22,22 @@ static void set_status(amp_player_t *p, const char *s)
     p->dirty = 1;
 }
 
+static void set_title_from_path(amp_player_t *p, const char *path)
+{
+    const char *base = path;
+    const char *s;
+    for (s = path; *s; s++) {
+        if (*s == '\\' || *s == '/') {
+            base = s + 1;
+        }
+    }
+    strncpy(p->title, base, sizeof(p->title) - 1);
+    p->title[sizeof(p->title) - 1] = '\0';
+}
+
 int amp_open_track(amp_player_t *p, const char *path)
 {
     ag_mp3_t *m = NULL;
-    uint32_t rate;
     if (p == NULL || path == NULL) {
         return -1;
     }
@@ -40,70 +52,26 @@ int amp_open_track(amp_player_t *p, const char *path)
         p->state = AMP_STOPPED;
         return -1;
     }
-    ag_printf("amp: file opened, priming\n");
+    /*
+     * No priming decode here: the first HostFS read of a real MP3 was wedging
+     * the guest before we returned to the UI loop. Rate is discovered while
+     * pumping audio; start at 22050 until then.
+     */
     p->mp3 = m;
-    /* Bounded prime: junk/HostFS MP3 must not block the UI thread. */
-    {
-        int16_t tmp[2304];
-        int     tries;
-        for (tries = 0; tries < 4 && ag_mp3_rate(m) == 0; tries++) {
-            int n;
-            ag_heartbeat();
-            n = ag_mp3_read(m, tmp, 1);
-            if (n <= 0) {
-                break;
-            }
-        }
-        (void)ag_mp3_seek_permille(m, 0);
-    }
-    rate = ag_mp3_rate(m);
-    ag_printf("amp: rate=%u\n", (unsigned)rate);
-    if (rate == 0) {
-        /* Stub / undecodable file — do not enter PLAYING and spin. */
-        ag_mp3_close(m);
-        p->mp3 = NULL;
-        set_status(p, "bad mp3");
-        p->state = AMP_STOPPED;
-        p->dirty = 1;
-        return -1;
-    }
-    if (rate > 48000) {
-        rate = 48000;
-    }
-    p->rate = rate;
-    amp_eq_set_rate(&p->eq, rate);
+    p->rate = 22050;
+    amp_eq_set_rate(&p->eq, p->rate);
     if (p->audio_fd < 0) {
-        p->audio_fd = ag_audio_out_open_dev(p->audio_path, rate, 2);
+        p->audio_fd = ag_audio_out_open_dev(p->audio_path, p->rate, 2);
         if (p->audio_fd < 0) {
             (void)ag_audio_out_resolve("pcmnull", p->audio_path,
                                        sizeof(p->audio_path));
-            p->audio_fd = ag_audio_out_open_dev(p->audio_path, rate, 2);
+            p->audio_fd = ag_audio_out_open_dev(p->audio_path, p->rate, 2);
         }
-    } else if (rate != 0) {
-        ag_audio_fmt_t fmt;
-        fmt.rate = rate;
-        fmt.channels = 2;
-        fmt.bits = 16;
-        (void)ag_dev_ioctl(p->audio_fd, AG_IOC_AUDIO_SETFMT, &fmt, sizeof(fmt));
     }
-    {
-        const char *t = ag_mp3_title(m);
-        if (t && t[0]) {
-            strncpy(p->title, t, sizeof(p->title) - 1);
-        } else {
-            const char *base = path;
-            const char *s;
-            for (s = path; *s; s++) {
-                if (*s == '\\' || *s == '/') {
-                    base = s + 1;
-                }
-            }
-            strncpy(p->title, base, sizeof(p->title) - 1);
-        }
-        p->title[sizeof(p->title) - 1] = '\0';
-    }
+    set_title_from_path(p, path);
     p->state = AMP_PLAYING;
     set_status(p, "playing");
+    ag_printf("amp: playing (rate TBD)\n");
     p->dirty = 1;
     return 0;
 }
