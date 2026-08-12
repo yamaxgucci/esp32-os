@@ -123,6 +123,7 @@ void amp_cmd_play_pause(amp_player_t *p)
     } else if (p->state == AMP_PAUSED) {
         p->state = AMP_PLAYING;
         set_status(p, "playing");
+        amp_pace_sync();
     } else if (p->pl.count <= 0) {
         amp_cmd_open_picker(p);
     } else {
@@ -169,6 +170,7 @@ void amp_cmd_prev(amp_player_t *p)
     }
     if (p->mp3 && ag_mp3_position_ms(p->mp3) > 3000) {
         (void)ag_mp3_seek_permille(p->mp3, 0);
+        amp_pace_sync();
         p->dirty = 1;
         return;
     }
@@ -200,6 +202,7 @@ void amp_cmd_seek_delta(amp_player_t *p, int delta_ms)
     }
     permille = (int)((pos * 1000u) / dur);
     (void)ag_mp3_seek_permille(p->mp3, permille);
+    amp_pace_sync();
     p->dirty = 1;
 }
 
@@ -209,6 +212,7 @@ void amp_cmd_seek_permille(amp_player_t *p, int permille)
         return;
     }
     (void)ag_mp3_seek_permille(p->mp3, permille);
+    amp_pace_sync();
     p->dirty = 1;
 }
 
