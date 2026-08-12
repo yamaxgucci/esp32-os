@@ -303,7 +303,10 @@ static bool copy_cancelled(void)
     ag_event_t ev;
     while (ag_poll_event(&ev, 0)) {
         if (ev.type == AG_EV_QUIT) {
-            hit = true;
+            /* Same rule as the main loop: shell QUIT must not cancel bg copy. */
+            if (ag_focused()) {
+                hit = true;
+            }
         }
         /* FOCUS_* ignored — unfocus is not cancel. */
     }

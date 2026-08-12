@@ -669,16 +669,20 @@ int FM_ENTRY(int argc, char **argv)
     /* The panel that is not active must not leave the cwd where it looked last. */
     (void)ag_chdir(g_panel[0].path);
 
+    const char *exit_why = NULL;
+
     /*
      * Wait until the session adopts us before painting — otherwise the shell's
      * "started…" line (or a late focus) lands on top of the panels.
      */
+    ag_log(AG_LOG_INFO, "fm", "waiting for focus (pid %u)",
+           (unsigned)ag_getpid());
     while (!ag_focused() && !ag_interrupted()) {
         ag_event_t ev;
         if (ag_poll_event(&ev, 50)) {
-            if (ev.type == AG_EV_QUIT) {
-                goto out;
-            }
+            ag_log(AG_LOG_INFO, "fm", "pre-focus ev type=%u focused=%d",
+                   (unsigned)ev.type, ag_focused() ? 1 : 0);
+            /* QUIT while unfocused is for the shell — never exit on it. */
             if (ev.type == AG_EV_FOCUS_GAINED) {
                 break;
             }
@@ -686,8 +690,10 @@ int FM_ENTRY(int argc, char **argv)
         ag_heartbeat();
     }
     if (ag_interrupted()) {
+        exit_why = "interrupted before focus";
         goto out;
     }
+    ag_log(AG_LOG_INFO, "fm", "focused — painting");
 
     fm_ui_begin();
     fm_draw_all();
@@ -697,6 +703,7 @@ int FM_ENTRY(int argc, char **argv)
     bool running = true;
     while (running) {
         if (ag_interrupted()) {
+            exit_why = "interrupted";
             break;
         }
 
@@ -707,17 +714,28 @@ int FM_ENTRY(int argc, char **argv)
         }
 
         if (ev.type == AG_EV_FOCUS_LOST) {
+            ag_log(AG_LOG_INFO, "fm", "FOCUS_LOST");
             continue;
         }
         if (ev.type == AG_EV_FOCUS_GAINED) {
+            ag_log(AG_LOG_INFO, "fm", "FOCUS_GAINED — redraw");
             fm_ui_begin();
             fm_draw_all();
             fm_ui_present();
             continue;
         }
 
-        /* Ctrl+C → QUIT.  Alt+N is FOCUS_LOST only; do not exit. */
+        /*
+         * Ctrl+C while focused → QUIT.  A QUIT left in the console queue from
+         * enter_shell_view must not kill us when we are (or were) in the
+         * background.
+         */
         if (ev.type == AG_EV_QUIT) {
+            if (!ag_focused()) {
+                ag_log(AG_LOG_INFO, "fm", "ignore QUIT while unfocused");
+                continue;
+            }
+            exit_why = "QUIT while focused";
             break;
         }
         if (!ag_focused() || ev.type != AG_EV_KEY_DOWN) {
@@ -775,6 +793,7 @@ int FM_ENTRY(int argc, char **argv)
         case AG_KEY_F8:  fm_delete(); break;
         case AG_KEY_F10:
         case AG_KEY_ESC:
+            exit_why = (key == AG_KEY_ESC) ? "ESC" : "F10";
             running = false;
             break;
 
@@ -794,6 +813,11 @@ int FM_ENTRY(int argc, char **argv)
     fm_ui_end();
 
 out:
+    if (exit_why == NULL) {
+        exit_why = "out";
+    }
+    ag_log(AG_LOG_INFO, "fm", "exit: %s (focused=%d)", exit_why,
+           ag_focused() ? 1 : 0);
     /* Arena is reclaimed with the process; free anyway for tidy builtins. */
     for (int i = 0; i < 2; i++) {
         ag_free(g_panel[i].entries);

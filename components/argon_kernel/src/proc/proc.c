@@ -738,7 +738,7 @@ static void proc_task(void *arg)
     p->stack_unused = (uint32_t)uxTaskGetStackHighWaterMark(NULL);
     p->state = AG_PS_ZOMBIE;
 
-    ag_log(AG_LOG_DEBUG, "proc", "%s (pid %u) returned %d, %u stack bytes unused",
+    ag_log(AG_LOG_INFO, "proc", "%s (pid %u) returned %d, %u stack bytes unused",
            p->name, (unsigned)p->pid, (int)p->exit_code,
            (unsigned)p->stack_unused);
 
