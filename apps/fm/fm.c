@@ -682,9 +682,7 @@ int FM_ENTRY(int argc, char **argv)
 
         ag_event_t ev;
         if (!ag_poll_event(&ev, 50)) {
-            if (!ag_focused()) {
-                ag_heartbeat();
-            }
+            ag_heartbeat();
             continue;
         }
 
