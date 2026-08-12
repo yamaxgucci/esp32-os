@@ -1366,8 +1366,9 @@ static int cmd_fm(int argc, char **argv)
     }
 
     const int slot = ag_session_slot_of(pid);
-    ag_console_printf("started fm pid %u in slot %d\n", (unsigned)pid,
-                      slot >= 0 ? ag_session_display_number(slot) : -1);
+    /* Journal only — printing here races the FM screen and paints over it. */
+    ag_log(AG_LOG_INFO, "shell", "fm pid %u in slot %d", (unsigned)pid,
+           slot >= 0 ? ag_session_display_number(slot) : -1);
 
     if (slot >= 0 && ag_session_focused() == target_slot) {
         (void)ag_session_focus(slot);
