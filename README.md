@@ -14,6 +14,22 @@ It is not a Linux clone. There is no MMU-backed process isolation, no virtual
 memory, no POSIX emulation layer. There is a thin kernel, a syscall table, and
 your code running on a dedicated CPU core with almost all of the RAM.
 
+## Screenshots
+
+<p align="center">
+  <img src="docs/images/boot-prompt.png" alt="ArgonOS boot log and C:\ prompt" width="720" />
+</p>
+
+<p align="center">
+  <img src="docs/images/file-manager.png" alt="Built-in dual-pane file manager" width="720" />
+</p>
+
+<p align="center">
+  <img src="docs/images/amp.png" alt="AMP Winamp-style MP3 player" width="480" />
+  &nbsp;
+  <img src="docs/images/dx7.png" alt="DX7 structural FM synth console UI" width="480" />
+</p>
+
 ## Status
 
 **Early development.** It boots, gives a prompt, mounts three drives, and runs
