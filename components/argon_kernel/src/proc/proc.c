@@ -755,8 +755,17 @@ static void proc_task(void *arg)
         apply_task_priority(p);
     }
 
+    /*
+     * BACKGROUND at spawn means "do not steal focus at create".  If the user
+     * already focused this slot while the image was loading, we are foreground
+     * now and must not stay marked background.
+     */
     const bool background = (p->flags & (uint32_t)AG_SPAWN_BACKGROUND) != 0;
-    p->state = background ? AG_PS_BACKGROUND : AG_PS_RUNNING;
+    if (s_foreground == p->pid) {
+        p->state = AG_PS_RUNNING;
+    } else {
+        p->state = background ? AG_PS_BACKGROUND : AG_PS_RUNNING;
+    }
 
     typedef int (*entry_fn)(int, char **);
     const entry_fn entry = (entry_fn)p->app.binding.entry;
@@ -1197,6 +1206,22 @@ uint32_t ag_proc_count(void)
         }
     }
     return n;
+}
+
+ag_err_t ag_proc_state_of(ag_pid_t pid, ag_proc_state_t *out)
+{
+    if (out == NULL) {
+        return -AG_EINVAL;
+    }
+    lock();
+    const proc_t *p = by_pid(pid);
+    if (p == NULL) {
+        unlock();
+        return -AG_ENOENT;
+    }
+    *out = p->state;
+    unlock();
+    return AG_OK;
 }
 
 ag_err_t ag_proc_info(uint32_t index, ag_procinfo_t *out)
