@@ -236,9 +236,13 @@ static void parse_cfg_text(sms_cfg_t *cfg, char *text)
     }
 }
 
-int sms_cfg_load(sms_cfg_t *cfg, const char *rom_path)
+int sms_cfg_load(sms_cfg_t *cfg, const char *rom_path, char *loaded_path,
+                 size_t loaded_len)
 {
     sms_cfg_set_defaults(cfg);
+    if (loaded_path != NULL && loaded_len > 0) {
+        loaded_path[0] = '\0';
+    }
 
     char beside[AG_PATH_MAX];
     beside[0] = '\0';
@@ -258,11 +262,12 @@ int sms_cfg_load(sms_cfg_t *cfg, const char *rom_path)
         }
     }
 
+    /* More specific first: beside the ROM wins over the HostFS default. */
     const char *cands[] = {
-        "h:\\sms.cfg",
-        "a:\\sms.cfg",
         beside[0] != '\0' ? beside : NULL,
         "sms.cfg",
+        "h:\\sms.cfg",
+        "a:\\sms.cfg",
         NULL,
     };
 
@@ -279,6 +284,10 @@ int sms_cfg_load(sms_cfg_t *cfg, const char *rom_path)
         if (read_cfg_file(cands[i], buf, CFG_MAX) >= 0) {
             parse_cfg_text(cfg, buf);
             loaded = 1;
+            if (loaded_path != NULL && loaded_len > 0) {
+                strncpy(loaded_path, cands[i], loaded_len - 1);
+                loaded_path[loaded_len - 1] = '\0';
+            }
             break;
         }
     }

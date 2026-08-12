@@ -6,6 +6,7 @@
 #ifndef SMS_CFG_H
 #define SMS_CFG_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -33,9 +34,13 @@ typedef struct {
 
 void sms_cfg_set_defaults(sms_cfg_t *cfg);
 
-/* Loads first readable path among the usual candidates.  Always leaves
- * defaults filled in; returns 1 if a file was parsed. */
-int sms_cfg_load(sms_cfg_t *cfg, const char *rom_path);
+/*
+ * Loads the first readable candidate (beside the ROM, then cwd, then H:/A:).
+ * Always leaves defaults filled in; returns 1 if a file was parsed.
+ * When `loaded_path` is non-NULL, copies the path that won (empty if none).
+ */
+int sms_cfg_load(sms_cfg_t *cfg, const char *rom_path, char *loaded_path,
+                 size_t loaded_len);
 
 /* Map HID keycode → pad index (-1 none), action. */
 int sms_cfg_lookup(const sms_cfg_t *cfg, uint16_t keycode, int *pad_out,
