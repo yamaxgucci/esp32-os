@@ -262,7 +262,13 @@ static int handle_session_ev(const ag_event_t *ev)
 {
     if (ev->type == AG_EV_FOCUS_GAINED) {
         if (ag_gfx_acquire(&s_gi) == AG_OK) {
+            /*
+             * acquire() copies the previous front (often FM/console) into the
+             * back buffer; MD only flushes its 320xN window.  Wipe letterbox.
+             */
+            ag_gfx_clear(0x00000000u);
             bind_vdp_to_fb(&s_gi);
+            ag_gfx_flush(0, 0, s_gi.width, s_gi.height);
         }
         return 1;
     }

@@ -328,7 +328,14 @@ static int handle_session_ev(const ag_event_t *ev)
     if (ev->type == AG_EV_FOCUS_GAINED) {
         ag_gfxinfo_t info;
         if (ag_gfx_acquire(&info) == AG_OK) {
+            /*
+             * acquire() seeds the back buffer from the front (often the other
+             * slot's console/FM).  We only flush the SMS viewport each frame,
+             * so clear + full present once or letterbox keeps the old UI.
+             */
+            ag_gfx_clear(0x00000000u);
             bind_frame_to_fb(&info);
+            ag_gfx_flush(0, 0, info.width, info.height);
         }
         return 1;
     }
