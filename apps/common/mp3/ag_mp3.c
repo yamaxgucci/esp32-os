@@ -12,8 +12,9 @@
 #define MINIMP3_NO_SIMD
 #include "minimp3.h"
 
-#define AG_MP3_BUF        4096
-#define AG_MP3_READ_CHUNK 512 /* HostFS large reads can wedge QEMU forever */
+#define AG_MP3_BUF        8192
+/* HostFS: huge single reads wedged QEMU; tiny ones starve the decoder. */
+#define AG_MP3_READ_CHUNK 2048
 #define AG_MP3_PCM_MAX    MINIMP3_MAX_SAMPLES_PER_FRAME
 
 struct ag_mp3 {

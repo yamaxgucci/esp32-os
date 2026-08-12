@@ -126,18 +126,35 @@ static float biquad(amp_eq_t *eq, int filt, int ch, float x)
     return y;
 }
 
+static int eq_is_flat(const amp_eq_t *eq)
+{
+    int i;
+    if (eq->preamp != 0) {
+        return 0;
+    }
+    for (i = 0; i < AMP_EQ_BANDS; i++) {
+        if (eq->gain[i] != 0) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 void amp_eq_process(amp_eq_t *eq, int16_t *stereo, int frames)
 {
     int i, f, ch;
     float peaks[AMP_EQ_BANDS];
+    int filter;
     if (eq == NULL || stereo == NULL || frames <= 0) {
         return;
     }
+    /* 11 stereo float biquads/sample is the hot path — skip when flat. */
+    filter = eq->enabled && !eq_is_flat(eq);
     for (i = 0; i < AMP_EQ_BANDS; i++) {
         peaks[i] = eq->spectrum[i] * 0.85f;
     }
     for (i = 0; i < frames; i++) {
-        if (eq->enabled) {
+        if (filter) {
             for (ch = 0; ch < 2; ch++) {
                 float x = (float)stereo[i * 2 + ch];
                 float y = x;
