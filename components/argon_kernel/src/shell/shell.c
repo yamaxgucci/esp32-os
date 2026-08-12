@@ -426,8 +426,9 @@ static int cmd_run(int argc, char **argv)
     const int target_slot = ag_session_focused();
 
     ag_pid_t       pid = 0;
-    const ag_err_t err = ag_proc_spawn(argv[first], argc - first, &argv[first],
-                                       AG_SPAWN_BACKGROUND, &pid);
+    const ag_err_t err = ag_proc_spawn(
+        argv[first], argc - first, &argv[first],
+        (uint32_t)AG_SPAWN_BACKGROUND | (uint32_t)AG_SPAWN_NO_SESSION, &pid);
     if (err != AG_OK) {
         print_load_error(argv[first], err);
         return 1;

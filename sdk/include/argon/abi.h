@@ -835,6 +835,8 @@ enum ag_spawn_flags {
     AG_SPAWN_BACKGROUND = 1u << 0,
     AG_SPAWN_RESIDENT = 1u << 1, /* TSR: stays loaded after ag_main returns */
     AG_SPAWN_NO_CONSOLE = 1u << 2,
+    /* Caller will ag_session_bind_to(); do not auto-bind (avoids wiping parked builtins). */
+    AG_SPAWN_NO_SESSION = 1u << 3,
 };
 
 typedef struct ag_proc_api {

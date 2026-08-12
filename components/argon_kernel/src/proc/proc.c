@@ -737,13 +737,17 @@ ag_err_t ag_proc_spawn(const char *path, int argc, char **argv, uint32_t flags,
     {
         const ag_pid_t  bound_pid = p->pid;
         char            bound_name[32];
+        const bool      skip_bind =
+            (flags & (uint32_t)AG_SPAWN_NO_SESSION) != 0;
         set_string(bound_name, sizeof(bound_name), p->name);
         unlock();
-        const ag_err_t bind_err = ag_session_bind(bound_pid, bound_name);
-        if (bind_err != AG_OK) {
-            ag_log(AG_LOG_WARN, "proc",
-                   "pid %u: no free session slot (%d)", (unsigned)bound_pid,
-                   (int)bind_err);
+        if (!skip_bind) {
+            const ag_err_t bind_err = ag_session_bind(bound_pid, bound_name);
+            if (bind_err != AG_OK) {
+                ag_log(AG_LOG_WARN, "proc",
+                       "pid %u: no free session slot (%d)",
+                       (unsigned)bound_pid, (int)bind_err);
+            }
         }
         return AG_OK;
     }
