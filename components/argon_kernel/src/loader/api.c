@@ -201,14 +201,13 @@ static int32_t api_con_vprintf(const char *fmt, va_list ap)
 }
 
 /*
- * The keyboard belongs to whatever is in the foreground.  A background process
- * that asks for input is not made to wait for something it will never get: it is
- * told, which is the only answer it can do anything with.
+ * The keyboard belongs to the focused session process.  A background process
+ * that asks for input is not made to wait forever for keys it will never get.
  */
 static bool has_the_keyboard(void)
 {
     const ag_pid_t me = ag_proc_self();
-    return me == AG_PID_KERNEL || me == ag_proc_foreground();
+    return me == AG_PID_KERNEL || ag_proc_focused();
 }
 
 static int32_t api_getch(void)
@@ -521,6 +520,25 @@ static bool api_inp_poll(ag_event_t *out, uint32_t timeout_ms)
         return true;
     }
     if (!has_the_keyboard()) {
+        /*
+         * Must sleep: a tight poll while unfocused starves the shell (and
+         * everything else on this core).  Wake early if focus returns.
+         */
+        if (timeout_ms == 0) {
+            return false;
+        }
+        uint32_t left = timeout_ms;
+        while (left > 0u) {
+            const uint32_t step = left > 50u ? 50u : left;
+            vTaskDelay(pdMS_TO_TICKS(step < 1u ? 1u : step));
+            left -= step;
+            if (ag_proc_take_focus_event(out)) {
+                return true;
+            }
+            if (has_the_keyboard()) {
+                return ag_console_read_event(out, left);
+            }
+        }
         return false;
     }
     return ag_console_read_event(out, timeout_ms);
