@@ -42,6 +42,14 @@ void ag_vlog(ag_log_level_t level, const char *tag, const char *fmt,
 void ag_log_set_echo(bool on);
 bool ag_log_echo(void);
 
+/*
+ * Append stdout from an unfocused app into the journal (not the screen).
+ * Incomplete lines are buffered per pid until a newline or the line limit.
+ * When echo is on, complete lines also reach the console via write_log.
+ */
+void ag_log_app_write(ag_pid_t pid, const char *name, const char *data,
+                      size_t len);
+
 const ag_journal_t *ag_log_journal(void);
 void                ag_log_clear(void);
 
