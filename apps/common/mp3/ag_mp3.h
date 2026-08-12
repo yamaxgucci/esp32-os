@@ -13,11 +13,7 @@ extern "C" {
 
 typedef struct ag_mp3 ag_mp3_t;
 
-/*
- * Open path, load the whole file into RAM (max 512 KiB), then decode from
- * memory. Returns 0 on success. Larger files fail — keep tracks small or
- * split them for the current heap budget.
- */
+/* Open path for streaming decode. Returns 0 on success. */
 int ag_mp3_open(ag_mp3_t **out, const char *path);
 
 void ag_mp3_close(ag_mp3_t *m);

@@ -4,10 +4,10 @@ Soft-gfx player: streaming MP3 (minimp3), 10-band EQ, playlist, classic
 bitmap skins for **640×400 (VGA)** and **320×240 (QVGA)**. Mouse and full
 keyboard control.
 
-Decoder: [`apps/common/mp3`](../common/mp3) — loads the whole MP3 into RAM
-(max 512 KiB) before play so HostFS is off the hot path. Skins:
-[`skins/vga`](skins/vga), [`skins/qvga`](skins/qvga) — regenerate / stage with
-`python tools/skin2rgb565.py`.
+Decoder: [`apps/common/mp3`](../common/mp3) — streaming minimp3 (VFS/HostFS or
+SD on hardware). Playback is wall-clock paced so fast decode cannot overrun
+`pcmvirt`. Skins: [`skins/vga`](skins/vga), [`skins/qvga`](skins/qvga) —
+regenerate / stage with `python tools/skin2rgb565.py`.
 
 ## Build
 
