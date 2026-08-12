@@ -1,6 +1,5 @@
 /*
- * In-memory MP3 decode via minimp3 + ArgonOS VFS.
- * Small files are slurped entirely so playback never touches HostFS.
+ * Streaming MP3 via minimp3 + ArgonOS VFS.
  * SPDX-License-Identifier: Apache-2.0
  */
 #include "ag_mp3.h"
@@ -13,21 +12,23 @@
 #define MINIMP3_NO_SIMD
 #include "minimp3.h"
 
-#define AG_MP3_PCM_MAX     MINIMP3_MAX_SAMPLES_PER_FRAME
-#define AG_MP3_LOAD_CHUNK  2048
-#define AG_MP3_MAX_LOAD    (512u * 1024u) /* leave heap for PCM/UI */
+#define AG_MP3_BUF        8192
+#define AG_MP3_READ_CHUNK 2048
+#define AG_MP3_PCM_MAX    MINIMP3_MAX_SAMPLES_PER_FRAME
 
 struct ag_mp3 {
-    uint8_t    *file;
-    size_t      file_len;
-    size_t      pos; /* decode cursor */
-    size_t      data_off;
+    ag_handle_t fd;
     mp3dec_t    dec;
+    uint8_t     in[AG_MP3_BUF];
+    int         in_len;
+    int         eof;
     int16_t     pcm[AG_MP3_PCM_MAX];
     int         pcm_frames;
     int         pcm_off;
     uint32_t    rate;
     uint8_t     channels;
+    int64_t     file_size;
+    int64_t     data_off;
     uint32_t    bitrate;
     uint32_t    frames_out;
     char        title[64];
@@ -58,90 +59,35 @@ static void set_title_basename(char *title, size_t title_len, const char *path)
     title[n] = '\0';
 }
 
-static size_t skip_id3v2_mem(const uint8_t *buf, size_t len)
+static int skip_id3v2(ag_handle_t fd, char *title, size_t title_len)
 {
+    uint8_t hdr[10];
     uint32_t size;
-    if (len < 10u) {
-        return 0;
-    }
-    if (buf[0] != 'I' || buf[1] != 'D' || buf[2] != '3') {
-        return 0;
-    }
-    size = ((uint32_t)(buf[6] & 0x7f) << 21) | ((uint32_t)(buf[7] & 0x7f) << 14) |
-           ((uint32_t)(buf[8] & 0x7f) << 7) | (uint32_t)(buf[9] & 0x7f);
-    if ((size_t)(10u + size) > len) {
-        return 0;
-    }
-    return 10u + (size_t)size;
-}
 
-static int load_entire(ag_handle_t fd, uint8_t **out, size_t *out_len)
-{
-    size_t   cap = 64u * 1024u;
-    size_t   len = 0;
-    uint8_t *buf;
-
-    if (cap > AG_MP3_MAX_LOAD) {
-        cap = AG_MP3_MAX_LOAD;
-    }
-    buf = (uint8_t *)ag_malloc(cap);
-    if (buf == NULL) {
+    (void)title;
+    (void)title_len;
+    if (ag_seek(fd, 0, AG_SEEK_SET) < 0) {
         return -1;
     }
-    for (;;) {
-        size_t  want;
-        int32_t n;
-        if (len >= AG_MP3_MAX_LOAD) {
-            /* More data remains — refuse (keeps heap bounded). */
-            ag_free(buf);
-            return -1;
-        }
-        if (len == cap) {
-            size_t   ncap = cap * 2u;
-            uint8_t *nbuf;
-            if (ncap > AG_MP3_MAX_LOAD) {
-                ncap = AG_MP3_MAX_LOAD;
-            }
-            if (ncap <= cap) {
-                ag_free(buf);
-                return -1;
-            }
-            nbuf = (uint8_t *)ag_realloc(buf, ncap);
-            if (nbuf == NULL) {
-                ag_free(buf);
-                return -1;
-            }
-            buf = nbuf;
-            cap = ncap;
-        }
-        want = cap - len;
-        if (want > AG_MP3_LOAD_CHUNK) {
-            want = AG_MP3_LOAD_CHUNK;
-        }
-        ag_heartbeat();
-        n = ag_read(fd, buf + len, want);
-        if (n < 0) {
-            ag_free(buf);
-            return -1;
-        }
-        if (n == 0) {
-            break;
-        }
-        len += (size_t)n;
+    if (ag_read(fd, hdr, 10) != 10) {
+        (void)ag_seek(fd, 0, AG_SEEK_SET);
+        return 0;
     }
-    if (len == 0) {
-        ag_free(buf);
+    if (hdr[0] != 'I' || hdr[1] != 'D' || hdr[2] != '3') {
+        (void)ag_seek(fd, 0, AG_SEEK_SET);
+        return 0;
+    }
+    size = ((uint32_t)(hdr[6] & 0x7f) << 21) | ((uint32_t)(hdr[7] & 0x7f) << 14) |
+           ((uint32_t)(hdr[8] & 0x7f) << 7) | (uint32_t)(hdr[9] & 0x7f);
+    if (ag_seek(fd, (int64_t)(10 + size), AG_SEEK_SET) < 0) {
         return -1;
     }
-    *out = buf;
-    *out_len = len;
     return 0;
 }
 
 int ag_mp3_open(ag_mp3_t **out, const char *path)
 {
-    ag_mp3_t   *m;
-    ag_handle_t fd;
+    ag_mp3_t *m;
 
     if (out == NULL || path == NULL) {
         return -1;
@@ -153,28 +99,28 @@ int ag_mp3_open(ag_mp3_t **out, const char *path)
     }
     memset(m, 0, sizeof(*m));
     set_title_basename(m->title, sizeof(m->title), path);
-
-    fd = ag_open(path, AG_O_RDONLY);
-    if (fd < 0) {
+    m->fd = ag_open(path, AG_O_RDONLY);
+    if (m->fd < 0) {
         ag_free(m);
         return -1;
     }
     /*
-     * Slurp with small chunked reads (no SEEK_END — that wedges HostFS on
-     * QEMU for some files). Playback then never touches the VFS again.
+     * Do not SEEK_END: on QEMU HostFS that can wedge the guest. Duration stays
+     * 0 until bitrate is known from frames.
      */
-    if (load_entire(fd, &m->file, &m->file_len) != 0) {
-        (void)ag_close(fd);
+    m->file_size = 0;
+    if (skip_id3v2(m->fd, m->title, sizeof(m->title)) != 0) {
+        (void)ag_close(m->fd);
         ag_free(m);
         return -1;
     }
-    (void)ag_close(fd);
-
-    m->data_off = skip_id3v2_mem(m->file, m->file_len);
-    m->pos = m->data_off;
+    m->data_off = ag_seek(m->fd, 0, AG_SEEK_CUR);
+    if (m->data_off < 0) {
+        (void)ag_close(m->fd);
+        ag_free(m);
+        return -1;
+    }
     mp3dec_init(&m->dec);
-    ag_printf("ag_mp3: loaded %u bytes (data@%u)\n", (unsigned)m->file_len,
-              (unsigned)m->data_off);
     *out = m;
     return 0;
 }
@@ -184,9 +130,8 @@ void ag_mp3_close(ag_mp3_t *m)
     if (m == NULL) {
         return;
     }
-    if (m->file) {
-        ag_free(m->file);
-        m->file = NULL;
+    if (m->fd >= 0) {
+        (void)ag_close(m->fd);
     }
     ag_free(m);
 }
@@ -203,12 +148,12 @@ uint8_t ag_mp3_channels(const ag_mp3_t *m)
 
 uint32_t ag_mp3_duration_ms(const ag_mp3_t *m)
 {
-    size_t bytes;
-    if (m == NULL || m->bitrate == 0 || m->file_len <= m->data_off) {
+    int64_t bytes;
+    if (m == NULL || m->bitrate == 0 || m->file_size <= m->data_off) {
         return 0;
     }
-    bytes = m->file_len - m->data_off;
-    return (uint32_t)(((uint64_t)bytes * 8000ull) / (uint64_t)m->bitrate);
+    bytes = m->file_size - m->data_off;
+    return (uint32_t)((bytes * 8000ll) / (int64_t)m->bitrate);
 }
 
 uint32_t ag_mp3_position_ms(const ag_mp3_t *m)
@@ -224,6 +169,32 @@ const char *ag_mp3_title(const ag_mp3_t *m)
     return m ? m->title : "";
 }
 
+static int refill(ag_mp3_t *m)
+{
+    int32_t n;
+    size_t  want;
+    if (m->eof) {
+        return m->in_len;
+    }
+    if (m->in_len < AG_MP3_BUF) {
+        want = (size_t)(AG_MP3_BUF - m->in_len);
+        if (want > AG_MP3_READ_CHUNK) {
+            want = AG_MP3_READ_CHUNK;
+        }
+        ag_heartbeat();
+        n = ag_read(m->fd, m->in + m->in_len, want);
+        if (n < 0) {
+            return -1;
+        }
+        if (n == 0) {
+            m->eof = 1;
+        } else {
+            m->in_len += (int)n;
+        }
+    }
+    return m->in_len;
+}
+
 static int decode_one(ag_mp3_t *m)
 {
     mp3dec_frame_info_t info;
@@ -233,29 +204,36 @@ static int decode_one(ag_mp3_t *m)
     int guard = 0;
 
     for (;;) {
-        size_t avail;
-        if (++guard > 256) {
-            return m->pcm_frames > 0 ? 1 : -1;
+        if (++guard > 64) {
+            /* Bound HostFS work per call so the UI loop can tick. */
+            return m->pcm_frames > 0 ? 1 : 0;
         }
-        if (m->pos >= m->file_len) {
+        if (refill(m) < 0) {
+            return -1;
+        }
+        if (m->in_len <= 0) {
             return 0;
         }
-        avail = m->file_len - m->pos;
-        samples = mp3dec_decode_frame(&m->dec, m->file + m->pos, (int)avail,
-                                      m->pcm, &info);
+        samples = mp3dec_decode_frame(&m->dec, m->in, m->in_len, m->pcm, &info);
         if (info.frame_bytes > 0) {
-            m->pos += (size_t)info.frame_bytes;
-        } else {
-            /* Resync */
-            size_t drop = 64;
-            if (drop > avail) {
-                drop = avail;
+            memmove(m->in, m->in + info.frame_bytes,
+                    (size_t)(m->in_len - info.frame_bytes));
+            m->in_len -= info.frame_bytes;
+        } else if (m->eof) {
+            return 0;
+        } else if (m->in_len >= AG_MP3_BUF) {
+            int drop = 64;
+            if (drop > m->in_len) {
+                drop = m->in_len;
             }
-            m->pos += drop;
-            skipped += (int)drop;
+            memmove(m->in, m->in + drop, (size_t)(m->in_len - drop));
+            m->in_len -= drop;
+            skipped += drop;
             if (skipped > 8192) {
                 return -1;
             }
+            continue;
+        } else {
             continue;
         }
         if (samples > 0) {
@@ -325,8 +303,25 @@ int ag_mp3_read(ag_mp3_t *m, int16_t *out, int max_frames)
 
 int ag_mp3_seek_permille(ag_mp3_t *m, int permille)
 {
-    size_t span;
-    if (m == NULL || m->file == NULL || m->file_len <= m->data_off) {
+    int64_t span;
+    int64_t off;
+    if (m == NULL) {
+        return -1;
+    }
+    /* file_size 0 means we skipped SEEK_END — only restart from data_off. */
+    if (m->file_size <= m->data_off) {
+        if (permille <= 0) {
+            if (ag_seek(m->fd, m->data_off, AG_SEEK_SET) < 0) {
+                return -1;
+            }
+            m->in_len = 0;
+            m->eof = 0;
+            m->pcm_frames = 0;
+            m->pcm_off = 0;
+            m->frames_out = 0;
+            mp3dec_init(&m->dec);
+            return 0;
+        }
         return -1;
     }
     if (permille < 0) {
@@ -335,8 +330,13 @@ int ag_mp3_seek_permille(ag_mp3_t *m, int permille)
     if (permille > 1000) {
         permille = 1000;
     }
-    span = m->file_len - m->data_off;
-    m->pos = m->data_off + (span * (size_t)permille) / 1000u;
+    span = m->file_size - m->data_off;
+    off = m->data_off + (span * (int64_t)permille) / 1000;
+    if (ag_seek(m->fd, off, AG_SEEK_SET) < 0) {
+        return -1;
+    }
+    m->in_len = 0;
+    m->eof = 0;
     m->pcm_frames = 0;
     m->pcm_off = 0;
     mp3dec_init(&m->dec);
