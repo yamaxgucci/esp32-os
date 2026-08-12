@@ -8,8 +8,11 @@
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #include <stdarg.h>
+#include <stdio.h>
 #include <string.h>
 #include <time.h>
+
+#include <argon/journal.h>
 
 #include <argon/codepage.h>
 #include <argon/console.h>
@@ -176,9 +179,9 @@ static const ag_mem_api_t k_mem = {
 
 /*
  * Console I/O belongs to the focused session process.  One shared text screen:
- * a background app must not paint or print over the focused slot (FM/shell).
- * Kernel/shell call ag_console_* directly and are unaffected.  ag_log stays
- * in the journal (and optional echo) outside this gate.
+ * a background app must not paint over the focused slot (FM/shell).  Its
+ * stdout still goes to the journal (`log`) so `run /b` progress is not lost.
+ * Kernel/shell call ag_console_* directly and are unaffected.
  */
 static bool has_console_focus(void)
 {
@@ -186,9 +189,31 @@ static bool has_console_focus(void)
     return me == AG_PID_KERNEL || ag_proc_focused();
 }
 
+static void bg_stdout_write(const char *buf, size_t len)
+{
+    if (buf == NULL || len == 0) {
+        return;
+    }
+    const ag_pid_t me = ag_proc_self();
+    char           name[32] = "app";
+    for (uint32_t i = 0;; i++) {
+        ag_procinfo_t info;
+        if (ag_proc_info(i, &info) != AG_OK) {
+            break;
+        }
+        if (info.pid == me) {
+            memcpy(name, info.name, sizeof(name) - 1);
+            name[sizeof(name) - 1] = '\0';
+            break;
+        }
+    }
+    ag_log_app_write(me, name, buf, len);
+}
+
 static int32_t api_con_write(const char *buf, size_t len)
 {
     if (!has_console_focus()) {
+        bg_stdout_write(buf, len);
         return (int32_t)len;
     }
     ag_console_write(buf, len);
@@ -197,31 +222,43 @@ static int32_t api_con_write(const char *buf, size_t len)
 
 static int32_t api_con_puts(const char *s)
 {
-    if (!has_console_focus()) {
-        return (s != NULL) ? (int32_t)strlen(s) : 0;
-    }
-    ag_console_puts(s);
-    return (s != NULL) ? (int32_t)strlen(s) : 0;
-}
-
-static int32_t api_con_printf(const char *fmt, ...)
-{
-    if (!has_console_focus()) {
+    if (s == NULL) {
         return 0;
     }
-    va_list ap;
-    va_start(ap, fmt);
-    const int n = ag_console_vprintf(fmt, ap);
-    va_end(ap);
-    return n;
+    if (!has_console_focus()) {
+        bg_stdout_write(s, strlen(s));
+        if (s[0] != '\0' && s[strlen(s) - 1] != '\n') {
+            bg_stdout_write("\n", 1);
+        }
+        return (int32_t)strlen(s);
+    }
+    ag_console_puts(s);
+    return (int32_t)strlen(s);
 }
 
 static int32_t api_con_vprintf(const char *fmt, va_list ap)
 {
     if (!has_console_focus()) {
-        return 0;
+        char buf[AG_JOURNAL_LINE_MAX];
+        const int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+        if (n <= 0) {
+            return n;
+        }
+        const size_t len =
+            ((size_t)n < sizeof(buf)) ? (size_t)n : sizeof(buf) - 1;
+        bg_stdout_write(buf, len);
+        return n;
     }
     return ag_console_vprintf(fmt, ap);
+}
+
+static int32_t api_con_printf(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    const int32_t n = api_con_vprintf(fmt, ap);
+    va_end(ap);
+    return n;
 }
 
 static bool has_the_keyboard(void) { return has_console_focus(); }

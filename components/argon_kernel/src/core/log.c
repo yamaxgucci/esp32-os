@@ -63,6 +63,99 @@ void ag_log_set_echo(bool on) { s_echo = on; }
 bool ag_log_echo(void) { return s_echo; }
 
 /*
+ * One incomplete line per live pid.  Four processes is the hard system limit,
+ * so a fixed table is enough and needs no allocator.
+ */
+#define AG_APP_LOG_SLOTS 4
+#define AG_APP_LOG_BODY  (AG_JOURNAL_LINE_MAX - 48)
+
+typedef struct {
+    ag_pid_t pid;
+    size_t   len;
+    char     body[AG_APP_LOG_BODY];
+} ag_app_log_slot_t;
+
+static ag_app_log_slot_t s_app_slots[AG_APP_LOG_SLOTS];
+
+static ag_app_log_slot_t *app_slot_for(ag_pid_t pid)
+{
+    ag_app_log_slot_t *free_slot = NULL;
+    for (int i = 0; i < AG_APP_LOG_SLOTS; i++) {
+        if (s_app_slots[i].pid == pid) {
+            return &s_app_slots[i];
+        }
+        if (s_app_slots[i].len == 0 && free_slot == NULL) {
+            free_slot = &s_app_slots[i];
+        }
+    }
+    if (free_slot != NULL) {
+        free_slot->pid = pid;
+        free_slot->len = 0;
+        return free_slot;
+    }
+    /* Steal the first slot rather than drop the write silently. */
+    s_app_slots[0].pid = pid;
+    s_app_slots[0].len = 0;
+    return &s_app_slots[0];
+}
+
+static void app_flush_line(ag_pid_t pid, const char *name, const char *body,
+                           size_t body_len)
+{
+    char line[AG_JOURNAL_LINE_MAX];
+    const char *tag = (name != NULL && name[0] != '\0') ? name : "app";
+    const uint32_t ms = (uint32_t)(esp_timer_get_time() / 1000);
+    int n = snprintf(line, sizeof(line), "I (%u) app/%s:%u: ", (unsigned)ms,
+                     tag, (unsigned)pid);
+    if (n < 0) {
+        n = 0;
+    }
+    size_t off = ((size_t)n < sizeof(line)) ? (size_t)n : sizeof(line) - 1;
+    const size_t room = sizeof(line) - off - 1;
+    const size_t take = (body_len < room) ? body_len : room;
+    if (take > 0) {
+        memcpy(line + off, body, take);
+        off += take;
+    }
+    if (off + 1 < sizeof(line)) {
+        line[off++] = '\n';
+    }
+
+    ag_journal_write(&s_journal, line, off);
+    if (s_echo && ag_console_ready()) {
+        ag_console_write_log(line, off);
+    }
+}
+
+void ag_log_app_write(ag_pid_t pid, const char *name, const char *data,
+                      size_t len)
+{
+    if (!s_ready || data == NULL || len == 0) {
+        return;
+    }
+
+    log_lock();
+    ag_app_log_slot_t *slot = app_slot_for(pid);
+    for (size_t i = 0; i < len; i++) {
+        const char c = data[i];
+        if (c == '\r') {
+            continue;
+        }
+        if (c == '\n') {
+            app_flush_line(pid, name, slot->body, slot->len);
+            slot->len = 0;
+            continue;
+        }
+        if (slot->len + 1 >= sizeof(slot->body)) {
+            app_flush_line(pid, name, slot->body, slot->len);
+            slot->len = 0;
+        }
+        slot->body[slot->len++] = c;
+    }
+    log_unlock();
+}
+
+/*
  * Where ESP-IDF's log output goes.  Note the order: the journal first, always,
  * and the console only if there is one and it is wanted.  Reversing that is how
  * a message about a failure gets lost in the failure.
