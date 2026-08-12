@@ -39,8 +39,11 @@ static sms_cfg_t s_cfg;
  * render_reset() clears pitch x height bytes from it once, at power-on.
  */
 #define SMS_MAX_LINES 224
-static int s_ox;
-static int s_oy;
+static int          s_ox;
+static int          s_oy;
+static ag_gfxinfo_t s_gi;
+static uint16_t    *s_frame; /* offscreen when sms.cfg fullscreen=1 */
+static int          s_fullscreen;
 
 /*
  * Preferred input: kernel pad layer (HostFS PADPUSH → inp->btnp).  Real level
@@ -235,29 +238,89 @@ static int load_cart(const char *path)
     return ok;
 }
 
-/* Aim the emulator at the acquired framebuffer.  Must run before
- * system_poweron(), which clears the bitmap through these fields. */
+/* Aim the emulator at the acquired framebuffer (or an offscreen for scale).
+ * Must run before system_poweron(), which clears the bitmap through these. */
 static void bind_frame_to_fb(const ag_gfxinfo_t *info)
 {
-    s_ox = ((int)info->width > VIDEO_WIDTH_SMS)
-               ? ((int)info->width - VIDEO_WIDTH_SMS) / 2
-               : 0;
-    s_oy = ((int)info->height > SMS_MAX_LINES)
-               ? ((int)info->height - SMS_MAX_LINES) / 2
-               : 0;
+    s_gi = *info;
+    uint8_t *origin;
+    int32_t  pitch;
 
-    uint8_t *const origin = (uint8_t *)info->fb + (size_t)s_oy * info->stride +
-                            (size_t)s_ox * sizeof(uint16_t);
+    if (s_fullscreen && s_frame != NULL) {
+        s_ox = 0;
+        s_oy = 0;
+        origin = (uint8_t *)s_frame;
+        pitch = (int32_t)(VIDEO_WIDTH_SMS * (int)sizeof(uint16_t));
+    } else {
+        s_fullscreen = 0;
+        s_ox = ((int)info->width > VIDEO_WIDTH_SMS)
+                   ? ((int)info->width - VIDEO_WIDTH_SMS) / 2
+                   : 0;
+        s_oy = ((int)info->height > SMS_MAX_LINES)
+                   ? ((int)info->height - SMS_MAX_LINES) / 2
+                   : 0;
+        origin = (uint8_t *)info->fb + (size_t)s_oy * info->stride +
+                 (size_t)s_ox * sizeof(uint16_t);
+        pitch = (int32_t)info->stride;
+    }
 
     sms_bitmap = (uint16_t *)origin;
     memset(&bitmap, 0, sizeof(bitmap));
     bitmap.data = origin;
     bitmap.width = VIDEO_WIDTH_SMS;
-    bitmap.height = VIDEO_HEIGHT_SMS;
-    bitmap.pitch = (int32_t)info->stride;
+    bitmap.height = s_fullscreen ? (uint32_t)SMS_MAX_LINES : VIDEO_HEIGHT_SMS;
+    bitmap.pitch = pitch;
     bitmap.depth = 16;
     bitmap.viewport.w = VIDEO_WIDTH_SMS;
     bitmap.viewport.h = VIDEO_HEIGHT_SMS;
+}
+
+/* Nearest-neighbor stretch of the SMS viewport onto the soft display. */
+static void present_fullscreen(void)
+{
+    if (s_gi.fb == NULL || s_frame == NULL) {
+        return;
+    }
+    const int sw = VIDEO_WIDTH_SMS;
+    int       sh = (int)bitmap.viewport.h;
+    if (sh <= 0) {
+        sh = VIDEO_HEIGHT_SMS;
+    }
+    if (sh > SMS_MAX_LINES) {
+        sh = SMS_MAX_LINES;
+    }
+    const int dw = (int)s_gi.width;
+    const int dh = (int)s_gi.height;
+    if (dw <= 0 || dh <= 0) {
+        return;
+    }
+
+    const uint32_t x_step = ((uint32_t)sw << 16) / (uint32_t)dw;
+    const uint32_t y_step = ((uint32_t)sh << 16) / (uint32_t)dh;
+    uint32_t       y_acc = 0;
+    for (int y = 0; y < dh; y++) {
+        const int       sy = (int)(y_acc >> 16);
+        const uint16_t *src = s_frame + (size_t)sy * (size_t)sw;
+        uint16_t       *dst =
+            (uint16_t *)((uint8_t *)s_gi.fb + (size_t)y * s_gi.stride);
+        uint32_t x_acc = 0;
+        for (int x = 0; x < dw; x++) {
+            dst[x] = src[x_acc >> 16];
+            x_acc += x_step;
+        }
+        y_acc += y_step;
+    }
+    ag_gfx_flush(0, 0, s_gi.width, s_gi.height);
+}
+
+static void present_frame(void)
+{
+    if (s_fullscreen) {
+        present_fullscreen();
+        return;
+    }
+    ag_gfx_flush((uint16_t)s_ox, (uint16_t)s_oy, VIDEO_WIDTH_SMS,
+                 (uint16_t)bitmap.viewport.h);
 }
 
 static void refresh_held(int pad)
@@ -330,12 +393,11 @@ static int handle_session_ev(const ag_event_t *ev)
         if (ag_gfx_acquire(&info) == AG_OK) {
             /*
              * acquire() seeds the back buffer from the front (often the other
-             * slot's console/FM).  We only flush the SMS viewport each frame,
-             * so clear + full present once or letterbox keeps the old UI.
+             * slot's console/FM).  Clear + present so letterbox / scale wipe it.
              */
             ag_gfx_clear(0x00000000u);
             bind_frame_to_fb(&info);
-            ag_gfx_flush(0, 0, info.width, info.height);
+            present_frame();
         }
         return 1;
     }
@@ -562,27 +624,47 @@ int ag_main(int argc, char **argv)
     option.soundlevel = 2;
     option.spritelimit = 1;
 
-    /* Graphics first: the emulator draws into the acquired buffer, and
-     * system_poweron() already clears it through bitmap.*. */
-    ag_gfxinfo_t info;
-    if (ag_gfx_acquire(&info) != AG_OK) {
+    sms_cfg_load(&s_cfg, rom);
+    s_fullscreen = s_cfg.fullscreen ? 1 : 0;
+    if (s_fullscreen) {
+        const size_t nbytes =
+            (size_t)VIDEO_WIDTH_SMS * (size_t)SMS_MAX_LINES * sizeof(uint16_t);
+        s_frame = (uint16_t *)ag_malloc(nbytes);
+        if (s_frame == NULL) {
+            ag_printf("sms: fullscreen buffer alloc failed; using 1:1\n");
+            s_fullscreen = 0;
+        }
+    }
+
+    /* Graphics: 1:1 draws into the gfx back buffer; fullscreen uses s_frame. */
+    if (ag_gfx_acquire(&s_gi) != AG_OK) {
         ag_printf("gfx acquire failed\n");
+        if (s_frame != NULL) {
+            ag_free(s_frame);
+            s_frame = NULL;
+        }
         return 1;
     }
     ag_gfx_clear(0x00000000u);
-    bind_frame_to_fb(&info);
+    bind_frame_to_fb(&s_gi);
 
-    sms_cfg_load(&s_cfg, rom);
     s_use_live_pad = (want_livepad && !force_sticky) ? 1 : 0;
     if (s_use_live_pad) {
         ag_printf("sms: controls = live pad (inp / HostFS PADPUSH)\n");
     } else {
         ag_printf("sms: controls = serial sticky (no key-up)\n");
     }
+    if (s_fullscreen) {
+        ag_printf("sms: video = fullscreen (nearest stretch)\n");
+    }
 
     if (!load_cart(rom)) {
         ag_printf("failed to load rom\n");
         ag_gfx_release();
+        if (s_frame != NULL) {
+            ag_free(s_frame);
+            s_frame = NULL;
+        }
         return 1;
     }
 
@@ -594,9 +676,15 @@ int ag_main(int argc, char **argv)
         Sound_Init();
     }
 
-    ag_printf("sms: %ux%u at %d,%d, present every %d frame(s)\n",
-              (unsigned)VIDEO_WIDTH_SMS, (unsigned)VIDEO_HEIGHT_SMS, s_ox, s_oy,
-              present_div);
+    if (s_fullscreen) {
+        ag_printf("sms: %ux%u -> %ux%u fullscreen, present every %d frame(s)\n",
+                  (unsigned)VIDEO_WIDTH_SMS, (unsigned)VIDEO_HEIGHT_SMS,
+                  (unsigned)s_gi.width, (unsigned)s_gi.height, present_div);
+    } else {
+        ag_printf("sms: %ux%u at %d,%d, present every %d frame(s)\n",
+                  (unsigned)VIDEO_WIDTH_SMS, (unsigned)VIDEO_HEIGHT_SMS, s_ox,
+                  s_oy, present_div);
+    }
 
     /*
      * Emulation always runs at the guest's 60 Hz - the Z80 and the sound chips
@@ -630,8 +718,7 @@ int ag_main(int argc, char **argv)
 
         const ag_time_t f1 = ag_micros();
         if (show) {
-            ag_gfx_flush((uint16_t)s_ox, (uint16_t)s_oy, VIDEO_WIDTH_SMS,
-                         (uint16_t)bitmap.viewport.h);
+            present_frame();
         }
         const ag_time_t f2 = ag_micros();
 
@@ -669,5 +756,9 @@ int ag_main(int argc, char **argv)
     Sound_Close();
     ag_gfx_release();
     system_poweroff();
+    if (s_frame != NULL) {
+        ag_free(s_frame);
+        s_frame = NULL;
+    }
     return 0;
 }
