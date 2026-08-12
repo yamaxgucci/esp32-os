@@ -15,6 +15,10 @@
 #include "fm.h"
 #include "fm_ui.h"
 
+#ifdef AG_BUILTIN
+#include <argon/shell.h>
+#endif
+
 /* Only the plain text application build declares an image header; the built-in
  * lives in the kernel image, and GFXFM supplies its own header. */
 #if !defined(AG_BUILTIN) && !defined(FM_GFX_BUILD)
@@ -583,6 +587,22 @@ static void enter_current(void)
         fm_run(e);
         return;
     }
+
+#ifdef AG_BUILTIN
+    {
+        char full[AG_PATH_MAX];
+        fm_join(p->path, e->name, full, sizeof(full));
+        fm_ui_end();
+        if (ag_shell_open_associated(full)) {
+            fm_pause("press any key");
+            fm_ui_begin();
+            (void)fm_reload(fm_active());
+            (void)fm_reload(fm_other());
+            return;
+        }
+        fm_ui_begin();
+    }
+#endif
 
     /* Anything else: show it, which is what F3 does. */
     fm_view();

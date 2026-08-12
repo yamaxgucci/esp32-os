@@ -28,6 +28,13 @@ int ag_shell_execute(const char *line);
 const char *ag_shell_cwd(void);
 
 /*
+ * Opens `path` through a SYSTEM.CFG [assoc] handler (builtin `edit` or an
+ * .AXE).  Returns true when an association ran; false when there is none
+ * (caller may fall back to a viewer).  Used by the built-in file manager.
+ */
+bool ag_shell_open_associated(const char *path);
+
+/*
  * True when the operator pressed Ctrl+C during the command that is running now.
  * A command whose work is bounded need not ask; one that reads until the end of
  * a file has to, because a device has no end - `type d:\zero` would otherwise
