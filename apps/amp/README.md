@@ -36,13 +36,16 @@ Stages to `build/apps/` and `build/sd_card/`. Put MP3 files under
 #   run h:\amp.axe pcmvirt
 ```
 
-Host helpers:
+Host helpers (mouse cursor is drawn by AMP; needs mousevirt + host bridge):
 
 ```powershell
 $py = "D:\Espressif\tools\python_env\idf5.5_py3.12_env\Scripts\python.exe"
 & $py tools\pcmplay.py --reconnect
 & $py tools\mousevirt.py --reconnect
 ```
+
+Guest: `drv install h:\mousevirt.sys` (once). Without it, a centered cursor still
+shows but does not track the host mouse.
 
 ## Args
 

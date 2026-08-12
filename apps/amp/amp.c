@@ -73,17 +73,25 @@ static void pump_audio(void)
     n = ag_mp3_read(s_p.mp3, s_pcm, CHUNK_FRAMES);
     if (n < 0) {
         s_p.state = AMP_STOPPED;
+        strncpy(s_p.status, "decode fail", sizeof(s_p.status) - 1);
         s_p.dirty = 1;
         return;
     }
     if (n == 0) {
+        /* EOF: advance once; do not spin forever on a broken stub file. */
+        int prev = s_p.pl.cur;
         amp_cmd_next(&s_p);
+        if (s_p.pl.cur == prev && s_p.state == AMP_PLAYING) {
+            s_p.state = AMP_STOPPED;
+            strncpy(s_p.status, "end of track", sizeof(s_p.status) - 1);
+            s_p.dirty = 1;
+        }
         return;
     }
     amp_eq_process(&s_p.eq, s_pcm, n);
     apply_volume(s_pcm, n, s_p.volume, s_p.balance);
     (void)ag_dev_write(s_p.audio_fd, s_pcm, (size_t)n * 4u);
-    s_p.dirty = 1;
+    /* Spectrum/time refresh on the UI timer only — full blit every chunk freezes QEMU. */
 }
 
 static void open_mouse(void)
@@ -157,6 +165,11 @@ int ag_main(int argc, char **argv)
     }
 
     open_mouse();
+    if (s_p.mouse_fd < 0) {
+        ag_printf("amp: no /dev/mouse0 (drv install h:\\mousevirt.sys)\n");
+    } else {
+        ag_printf("amp: mouse = /dev/mouse0\n");
+    }
     /* Open PCM early (non-blocking sink); do not wait on a track first. */
     s_p.audio_fd = ag_audio_out_open_dev(s_p.audio_path, s_p.rate, 2);
     if (s_p.audio_fd < 0) {
@@ -171,6 +184,10 @@ int ag_main(int argc, char **argv)
         s_p.pl.cur = 0;
         s_p.pl.sel = 0;
     }
+    /* Cursor visible before first host event (center). */
+    s_p.mx = (int)s_p.fb_w / 2;
+    s_p.my = (int)s_p.fb_h / 2;
+    s_p.mouse_live = 1;
     /* First paint before any HostFS MP3 I/O — otherwise QEMU looks hung. */
     amp_ui_draw(&s_p);
     s_p.dirty = 0;
@@ -195,10 +212,24 @@ int ag_main(int argc, char **argv)
                 amp_ui_pointer(&s_p, &ev);
             }
         }
+        /* Paint "loading..." first, then HostFS open (can stall on slow H:). */
+        if (s_p.want_open && s_p.pending_path[0]) {
+            char path[AG_PATH_MAX];
+            strncpy(path, s_p.pending_path, sizeof(path) - 1);
+            path[sizeof(path) - 1] = '\0';
+            s_p.want_open = 0;
+            s_p.pending_path[0] = '\0';
+            amp_ui_draw(&s_p);
+            s_p.dirty = 0;
+            ui_ms = ag_millis();
+            ag_printf("amp: opening %s\n", path);
+            (void)amp_open_track(&s_p, path);
+        }
         pump_audio();
         {
             uint32_t now = ag_millis();
-            if (s_p.dirty || (now - ui_ms) >= UI_PERIOD_MS) {
+            uint32_t period = (s_p.state == AMP_PLAYING) ? UI_PERIOD_MS : UI_PERIOD_MS;
+            if (s_p.dirty || (now - ui_ms) >= period) {
                 amp_ui_draw(&s_p);
                 s_p.dirty = 0;
                 ui_ms = now;
@@ -206,7 +237,7 @@ int ag_main(int argc, char **argv)
         }
         ag_heartbeat();
         /* Always yield: HostFS decode bursts otherwise starve the guest. */
-        ag_delay(s_p.state == AMP_PLAYING ? 1 : 10);
+        ag_delay(s_p.state == AMP_PLAYING ? 2 : 10);
     }
 
     if (s_p.mp3) {

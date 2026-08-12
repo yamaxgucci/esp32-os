@@ -99,6 +99,23 @@ int amp_open_track(amp_player_t *p, const char *path)
     return 0;
 }
 
+static void request_open_current(amp_player_t *p)
+{
+    const char *path;
+    if (p->pl.cur < 0 && p->pl.count > 0) {
+        p->pl.cur = p->pl.sel;
+    }
+    path = amp_pl_current(&p->pl);
+    if (path == NULL) {
+        set_status(p, "no track");
+        return;
+    }
+    strncpy(p->pending_path, path, sizeof(p->pending_path) - 1);
+    p->pending_path[sizeof(p->pending_path) - 1] = '\0';
+    p->want_open = 1;
+    set_status(p, "loading...");
+}
+
 void amp_cmd_play_pause(amp_player_t *p)
 {
     if (p == NULL) {
@@ -111,14 +128,7 @@ void amp_cmd_play_pause(amp_player_t *p)
         p->state = AMP_PLAYING;
         set_status(p, "playing");
     } else {
-        if (p->pl.cur < 0 && p->pl.count > 0) {
-            p->pl.cur = p->pl.sel;
-        }
-        if (amp_pl_current(&p->pl)) {
-            (void)amp_open_track(p, amp_pl_current(&p->pl));
-        } else {
-            set_status(p, "no track");
-        }
+        request_open_current(p);
     }
 }
 
@@ -151,9 +161,7 @@ void amp_cmd_next(amp_player_t *p)
         amp_cmd_stop(p);
         return;
     }
-    if (amp_pl_current(&p->pl)) {
-        (void)amp_open_track(p, amp_pl_current(&p->pl));
-    }
+    request_open_current(p);
 }
 
 void amp_cmd_prev(amp_player_t *p)
@@ -169,9 +177,7 @@ void amp_cmd_prev(amp_player_t *p)
     if (amp_pl_prev(&p->pl, p->repeat) < 0) {
         return;
     }
-    if (amp_pl_current(&p->pl)) {
-        (void)amp_open_track(p, amp_pl_current(&p->pl));
-    }
+    request_open_current(p);
 }
 
 void amp_cmd_seek_delta(amp_player_t *p, int delta_ms)
@@ -244,9 +250,7 @@ void amp_cmd_open_sel(amp_player_t *p)
         return;
     }
     p->pl.cur = p->pl.sel;
-    if (amp_pl_current(&p->pl)) {
-        (void)amp_open_track(p, amp_pl_current(&p->pl));
-    }
+    request_open_current(p);
 }
 
 void amp_cmd_add_dirs(amp_player_t *p)
