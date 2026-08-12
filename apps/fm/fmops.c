@@ -291,7 +291,13 @@ void fm_view(void)
 /*
  * Soft stop while a long copy runs.  Ctrl+C / signal cancels; Alt+N only sends
  * FOCUS_LOST and must not abort the copy (work continues in the background).
+ *
+ * While copy_file runs, the main loop is blocked — FOCUS_GAINED is handled here
+ * so returning to the slot repaints panels under the dialog.
  */
+static bool s_copy_need_panels;
+static bool s_copy_was_focused;
+
 static bool copy_cancelled(void)
 {
     bool hit = false;
@@ -302,13 +308,18 @@ static bool copy_cancelled(void)
 
     ag_event_t ev;
     while (ag_poll_event(&ev, 0)) {
-        if (ev.type == AG_EV_QUIT) {
+        if (ev.type == AG_EV_FOCUS_GAINED) {
+            s_copy_need_panels = true;
+            ag_log(AG_LOG_INFO, "fm", "copy: FOCUS_GAINED (will redraw panels)");
+        } else if (ev.type == AG_EV_FOCUS_LOST) {
+            s_copy_was_focused = false;
+            ag_log(AG_LOG_INFO, "fm", "copy: FOCUS_LOST");
+        } else if (ev.type == AG_EV_QUIT) {
             /* Same rule as the main loop: shell QUIT must not cancel bg copy. */
             if (ag_focused()) {
                 hit = true;
             }
         }
-        /* FOCUS_* ignored — unfocus is not cancel. */
     }
     return hit;
 }
@@ -325,9 +336,21 @@ static void copy_progress(const char *label, uint64_t done, uint64_t total)
 {
     /* Background slot: keep copying, do not paint over the focused app. */
     if (!ag_focused()) {
+        s_copy_was_focused = false;
         ag_heartbeat();
         ag_yield();
         return;
+    }
+
+    /*
+     * Returning from another slot during copy: shell text is still on screen.
+     * Repaint panels first, then the dialog on top.
+     */
+    if (!s_copy_was_focused || s_copy_need_panels) {
+        s_copy_was_focused = true;
+        s_copy_need_panels = false;
+        fm_ui_begin();
+        fm_draw_all();
     }
 
     const int w = FM_COPY_DLG_W;
@@ -436,6 +459,9 @@ static ag_err_t copy_file(const char *from, const char *to, const char *label,
     uint64_t done = 0;
     uint32_t last_ui_ms = 0;
 
+    s_copy_need_panels = ag_focused();
+    s_copy_was_focused = false;
+
     /* Something on screen before the first HostFS read, which can take a while. */
     copy_progress(label, 0, total);
     last_ui_ms = ag_millis();
@@ -444,6 +470,11 @@ static ag_err_t copy_file(const char *from, const char *to, const char *label,
         if (copy_cancelled()) {
             err = -AG_EKILLED;
             break;
+        }
+        /* FOCUS_GAINED while mid-copy: repaint immediately, not next UI tick. */
+        if (s_copy_need_panels && ag_focused()) {
+            last_ui_ms = ag_millis();
+            copy_progress(label, done, total);
         }
 
         const int32_t n = ag_read(src, buf, FM_COPY_CHUNK);
