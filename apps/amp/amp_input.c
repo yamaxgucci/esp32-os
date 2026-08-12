@@ -17,7 +17,33 @@ void amp_handle_key(amp_player_t *p, int key, int down, uint32_t mods)
 
     /* Global transport */
     if (key == AG_KEY_ESC) {
+        if (p->picker) {
+            p->picker = 0;
+            p->dirty = 1;
+            return;
+        }
         p->quit = 1;
+        return;
+    }
+    if (p->picker) {
+        if (key == AG_KEY_UP) {
+            if (p->pick_i > 0) {
+                p->pick_i--;
+            }
+            p->dirty = 1;
+            return;
+        }
+        if (key == AG_KEY_DOWN) {
+            if (p->pick_i + 1 < p->pick_n) {
+                p->pick_i++;
+            }
+            p->dirty = 1;
+            return;
+        }
+        if (key == AG_KEY_ENTER) {
+            amp_cmd_picker_choose(p);
+            return;
+        }
         return;
     }
     if (key == AG_KEY_TAB) {
@@ -54,8 +80,8 @@ void amp_handle_key(amp_player_t *p, int key, int down, uint32_t mods)
         p->dirty = 1;
         return;
     }
-    if (key == AG_KEY_A) {
-        amp_cmd_add_dirs(p);
+    if (key == AG_KEY_A || key == AG_KEY_O) {
+        amp_cmd_open_picker(p);
         return;
     }
     if (key == AG_KEY_L) {

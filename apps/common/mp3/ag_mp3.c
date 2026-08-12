@@ -64,7 +64,6 @@ static int skip_id3v2(ag_handle_t fd, char *title, size_t title_len)
 int ag_mp3_open(ag_mp3_t **out, const char *path)
 {
     ag_mp3_t *m;
-    int64_t   sz;
 
     if (out == NULL || path == NULL) {
         return -1;
@@ -80,14 +79,12 @@ int ag_mp3_open(ag_mp3_t **out, const char *path)
         ag_free(m);
         return -1;
     }
-    sz = ag_seek(m->fd, 0, AG_SEEK_END);
-    if (sz < 0) {
-        (void)ag_close(m->fd);
-        ag_free(m);
-        return -1;
-    }
-    m->file_size = sz;
-    /* Skip ID3v1 (extra end-of-file HostFS seek). Title comes from the path. */
+    /*
+     * Do not SEEK_END here: on QEMU HostFS a large file can wedge the guest
+     * forever in that call. Duration stays 0 until bitrate is known from frames;
+     * title comes from the path basename.
+     */
+    m->file_size = 0;
     if (skip_id3v2(m->fd, m->title, sizeof(m->title)) != 0) {
         (void)ag_close(m->fd);
         ag_free(m);
@@ -284,7 +281,23 @@ int ag_mp3_seek_permille(ag_mp3_t *m, int permille)
 {
     int64_t span;
     int64_t off;
-    if (m == NULL || m->file_size <= m->data_off) {
+    if (m == NULL) {
+        return -1;
+    }
+    /* file_size 0 means we skipped SEEK_END (HostFS hang risk) — cannot scrub. */
+    if (m->file_size <= m->data_off) {
+        if (permille <= 0) {
+            if (ag_seek(m->fd, m->data_off, AG_SEEK_SET) < 0) {
+                return -1;
+            }
+            m->in_len = 0;
+            m->eof = 0;
+            m->pcm_frames = 0;
+            m->pcm_off = 0;
+            m->frames_out = 0;
+            mp3dec_init(&m->dec);
+            return 0;
+        }
         return -1;
     }
     if (permille < 0) {

@@ -33,12 +33,14 @@ int amp_open_track(amp_player_t *p, const char *path)
         ag_mp3_close(p->mp3);
         p->mp3 = NULL;
     }
+    ag_printf("amp: open %s\n", path);
     ag_heartbeat();
     if (ag_mp3_open(&m, path) != 0) {
         set_status(p, "open failed");
         p->state = AMP_STOPPED;
         return -1;
     }
+    ag_printf("amp: file opened, priming\n");
     p->mp3 = m;
     /* Bounded prime: junk/HostFS MP3 must not block the UI thread. */
     {
@@ -55,11 +57,12 @@ int amp_open_track(amp_player_t *p, const char *path)
         (void)ag_mp3_seek_permille(m, 0);
     }
     rate = ag_mp3_rate(m);
+    ag_printf("amp: rate=%u\n", (unsigned)rate);
     if (rate == 0) {
         /* Stub / undecodable file — do not enter PLAYING and spin. */
         ag_mp3_close(m);
         p->mp3 = NULL;
-        set_status(p, "bad mp3 (need real file)");
+        set_status(p, "bad mp3");
         p->state = AMP_STOPPED;
         p->dirty = 1;
         return -1;
@@ -133,6 +136,8 @@ void amp_cmd_play_pause(amp_player_t *p)
     } else if (p->state == AMP_PAUSED) {
         p->state = AMP_PLAYING;
         set_status(p, "playing");
+    } else if (p->pl.count <= 0) {
+        amp_cmd_open_picker(p);
     } else {
         request_open_current(p);
     }
@@ -262,17 +267,100 @@ void amp_cmd_open_sel(amp_player_t *p)
 void amp_cmd_add_dirs(amp_player_t *p)
 {
     int n = 0;
+    char msg[64];
+    int i;
     if (p == NULL) {
         return;
     }
-    /* Only shallow music folders — scanning all of H: is brutal on HostFS. */
+    /* Shallow dirs only (no recursion). Root H:\ included so drops there work. */
     n += amp_pl_add_dir(&p->pl, "h:\\amp");
     n += amp_pl_add_dir(&p->pl, "h:\\music");
-    if (n > 0) {
-        set_status(p, "added tracks");
-    } else {
-        set_status(p, "no mp3 found");
+    n += amp_pl_add_dir(&p->pl, "h:\\");
+    /* status: "N tracks" */
+    i = 0;
+    if (p->pl.count >= 100) {
+        msg[i++] = (char)('0' + (p->pl.count / 100) % 10);
     }
+    if (p->pl.count >= 10) {
+        msg[i++] = (char)('0' + (p->pl.count / 10) % 10);
+    }
+    msg[i++] = (char)('0' + p->pl.count % 10);
+    msg[i++] = ' ';
+    msg[i++] = 't';
+    msg[i++] = 'r';
+    msg[i++] = 'a';
+    msg[i++] = 'c';
+    msg[i++] = 'k';
+    msg[i++] = 's';
+    if (n <= 0 && p->pl.count == 0) {
+        set_status(p, "no mp3 (Eject/A)");
+    } else {
+        msg[i] = '\0';
+        set_status(p, msg);
+    }
+    ag_printf("amp: playlist %d (+%d) — Eject or A to rescan, Enter to play\n",
+              p->pl.count, n);
+}
+
+void amp_btn_press(amp_player_t *p, amp_ctrl_t c)
+{
+    if (p == NULL || c == AMP_CTRL_NONE) {
+        return;
+    }
+    p->pressed = c;
+    p->press_ms = ag_millis();
+    p->dirty = 1;
+}
+
+void amp_cmd_open_picker(amp_player_t *p)
+{
+    int i;
+    if (p == NULL) {
+        return;
+    }
+    /* Refresh playlist from disk, then show picker of current list. */
+    amp_cmd_add_dirs(p);
+    p->pick_n = 0;
+    p->pick_i = 0;
+    for (i = 0; i < p->pl.count && p->pick_n < 32; i++) {
+        strncpy(p->pick[p->pick_n], p->pl.paths[i], AG_PATH_MAX - 1);
+        p->pick[p->pick_n][AG_PATH_MAX - 1] = '\0';
+        p->pick_n++;
+    }
+    if (p->pick_n == 0) {
+        set_status(p, "no mp3 in H:\\amp|music|\\");
+        p->picker = 0;
+        p->dirty = 1;
+        return;
+    }
+    p->picker = 1;
+    p->focus = AMP_PANEL_PL;
+    set_status(p, "pick file, Enter");
+    p->dirty = 1;
+}
+
+void amp_cmd_picker_choose(amp_player_t *p)
+{
+    int i;
+    if (p == NULL || !p->picker || p->pick_n <= 0) {
+        return;
+    }
+    if (p->pick_i < 0) {
+        p->pick_i = 0;
+    }
+    if (p->pick_i >= p->pick_n) {
+        p->pick_i = p->pick_n - 1;
+    }
+    /* Select matching playlist row and open. */
+    for (i = 0; i < p->pl.count; i++) {
+        if (strcmp(p->pl.paths[i], p->pick[p->pick_i]) == 0) {
+            p->pl.sel = i;
+            p->pl.cur = i;
+            break;
+        }
+    }
+    p->picker = 0;
+    request_open_current(p);
 }
 
 void amp_cmd_load_m3u(amp_player_t *p)

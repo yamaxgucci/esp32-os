@@ -45,6 +45,14 @@ typedef struct amp_player {
     /* Deferred open so Space/Play can paint "loading" before HostFS blocks. */
     int            want_open;
     char           pending_path[AG_PATH_MAX];
+    /* Button press feedback */
+    amp_ctrl_t     pressed;
+    uint32_t       press_ms;
+    /* File picker overlay */
+    int            picker;
+    int            pick_n;
+    int            pick_i;
+    char           pick[32][AG_PATH_MAX];
 } amp_player_t;
 
 void amp_cmd_play_pause(amp_player_t *p);
@@ -61,7 +69,10 @@ void amp_cmd_load_m3u(amp_player_t *p);
 void amp_cmd_save_m3u(amp_player_t *p);
 void amp_cmd_focus_next(amp_player_t *p, int dir);
 void amp_cmd_eq_adjust(amp_player_t *p, int delta);
+void amp_cmd_open_picker(amp_player_t *p);
+void amp_cmd_picker_choose(amp_player_t *p);
 int  amp_open_track(amp_player_t *p, const char *path);
+void amp_btn_press(amp_player_t *p, amp_ctrl_t c);
 
 void amp_ui_draw(amp_player_t *p);
 void amp_ui_pointer(amp_player_t *p, const ag_event_t *ev);

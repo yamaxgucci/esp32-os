@@ -228,8 +228,12 @@ int ag_main(int argc, char **argv)
         pump_audio();
         {
             uint32_t now = ag_millis();
-            uint32_t period = (s_p.state == AMP_PLAYING) ? UI_PERIOD_MS : UI_PERIOD_MS;
-            if (s_p.dirty || (now - ui_ms) >= period) {
+            if (s_p.pressed != AMP_CTRL_NONE &&
+                (now - s_p.press_ms) > 180u) {
+                s_p.pressed = AMP_CTRL_NONE;
+                s_p.dirty = 1;
+            }
+            if (s_p.dirty || (now - ui_ms) >= UI_PERIOD_MS) {
                 amp_ui_draw(&s_p);
                 s_p.dirty = 0;
                 ui_ms = now;

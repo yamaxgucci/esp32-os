@@ -95,11 +95,31 @@ static void icon_bar(int x, int y, int w, int h, uint32_t col)
     ag_gfx_fill_rect((int16_t)x, (int16_t)y, (uint16_t)w, (uint16_t)h, col);
 }
 
+static void draw_btn_press(amp_player_t *p, amp_ctrl_t c)
+{
+    amp_rect_t r;
+    uint32_t age;
+    if (p->pressed != c) {
+        return;
+    }
+    age = ag_millis() - p->press_ms;
+    if (age > 180u) {
+        return;
+    }
+    ctrl_screen_rect(p, c, &r);
+    /* Inset darkening while held/just clicked */
+    ag_gfx_fill_rect((int16_t)(r.x + 1), (int16_t)(r.y + 1),
+                     (uint16_t)(r.w > 2 ? r.w - 2 : 1),
+                     (uint16_t)(r.h > 2 ? r.h - 2 : 1), 0x00686878u);
+    ag_gfx_stroke_rect(r.x, r.y, r.w, r.h, COL_FOCUS);
+}
+
 static void draw_btn_icon(amp_player_t *p, amp_ctrl_t c)
 {
     amp_rect_t r;
     int cx, cy;
     ctrl_screen_rect(p, c, &r);
+    draw_btn_press(p, c);
     cx = r.x + (int)r.w / 2;
     cy = r.y + (int)r.h / 2;
     switch (c) {
@@ -177,6 +197,32 @@ static void draw_transport_icons(amp_player_t *p)
     draw_btn_icon(p, AMP_CTRL_PL_TOGGLE);
     draw_btn_icon(p, AMP_CTRL_REPEAT);
     draw_btn_icon(p, AMP_CTRL_SHUFFLE);
+}
+
+static void draw_eq_btn_icons(amp_player_t *p)
+{
+    amp_rect_t r;
+    int cx, cy;
+    /* ON — power dot */
+    ctrl_screen_rect(p, AMP_CTRL_EQ_ON, &r);
+    draw_btn_press(p, AMP_CTRL_EQ_ON);
+    cx = r.x + (int)r.w / 2;
+    cy = r.y + (int)r.h / 2;
+    ag_gfx_circle((int16_t)cx, (int16_t)cy, 5, COL_ICON);
+    icon_bar(cx - 1, cy - 7, 2, 6, COL_ICON);
+    if (!p->eq.enabled) {
+        ag_gfx_stroke_rect(r.x, r.y, r.w, r.h, 0x00C04040u);
+    }
+    /* RST — circular arrow hint (X + arc-ish) */
+    ctrl_screen_rect(p, AMP_CTRL_EQ_AUTO, &r);
+    draw_btn_press(p, AMP_CTRL_EQ_AUTO);
+    cx = r.x + (int)r.w / 2;
+    cy = r.y + (int)r.h / 2;
+    ag_gfx_circle((int16_t)cx, (int16_t)cy, 5, COL_ICON);
+    ag_gfx_line((int16_t)(cx + 2), (int16_t)(cy - 5), (int16_t)(cx + 6),
+                (int16_t)(cy - 2), COL_ICON);
+    ag_gfx_line((int16_t)(cx + 6), (int16_t)(cy - 2), (int16_t)(cx + 3),
+                (int16_t)(cy + 1), COL_ICON);
 }
 
 static void draw_cursor(const amp_player_t *p)
@@ -307,17 +353,69 @@ static void draw_overlays_eq(amp_player_t *p)
             }
         }
     }
-    {
-        amp_rect_t r;
-        ctrl_screen_rect(p, AMP_CTRL_EQ_ON, &r);
-        ag_gfx_text((int16_t)(r.x + 4), (int16_t)(r.y + 1),
-                    p->eq.enabled ? "ON" : "OFF", COL_ICON, COL_BTN_BG);
-        if (!p->eq.enabled) {
-            ag_gfx_stroke_rect(r.x, r.y, r.w, r.h, 0x00C04040u);
+    draw_eq_btn_icons(p);
+}
+
+static void draw_picker(amp_player_t *p)
+{
+    int i;
+    int row_h = 16;
+    int x = 40, y = 40;
+    int w = (int)p->fb_w - 80;
+    int h = (int)p->fb_h - 80;
+    int visible;
+    if (!p->picker) {
+        return;
+    }
+    if (w < 160) {
+        w = (int)p->fb_w - 16;
+        x = 8;
+    }
+    if (h < 80) {
+        h = (int)p->fb_h - 16;
+        y = 8;
+    }
+    ag_gfx_fill_rect((int16_t)x, (int16_t)y, (uint16_t)w, (uint16_t)h,
+                     0x00101820u);
+    ag_gfx_stroke_rect((int16_t)x, (int16_t)y, (uint16_t)w, (uint16_t)h,
+                       COL_FOCUS);
+    ag_gfx_text((int16_t)(x + 8), (int16_t)(y + 4), "Open MP3 (Enter)", COL_TEXT,
+                0x00101820u);
+    visible = (h - 28) / row_h;
+    if (visible < 1) {
+        visible = 1;
+    }
+    if (p->pick_i < 0) {
+        p->pick_i = 0;
+    }
+    for (i = 0; i < visible && i < p->pick_n; i++) {
+        int idx = i;
+        int16_t ty = (int16_t)(y + 24 + i * row_h);
+        const char *base = p->pick[idx];
+        const char *s;
+        uint32_t bg = 0x00101820u;
+        /* simple window: show around selection */
+        if (p->pick_n > visible) {
+            idx = p->pick_i - visible / 2 + i;
+            if (idx < 0) {
+                continue;
+            }
+            if (idx >= p->pick_n) {
+                break;
+            }
         }
-        ctrl_screen_rect(p, AMP_CTRL_EQ_AUTO, &r);
-        ag_gfx_text((int16_t)(r.x + 4), (int16_t)(r.y + 1), "RST", COL_ICON,
-                    COL_BTN_BG);
+        base = p->pick[idx];
+        for (s = base; *s; s++) {
+            if (*s == '\\' || *s == '/') {
+                base = s + 1;
+            }
+        }
+        if (idx == p->pick_i) {
+            bg = COL_SEL;
+            ag_gfx_fill_rect((int16_t)(x + 4), ty, (uint16_t)(w - 8),
+                             (uint16_t)row_h, bg);
+        }
+        ag_gfx_text((int16_t)(x + 8), ty, base, COL_TEXT, bg);
     }
 }
 
@@ -407,7 +505,29 @@ void amp_ui_draw(amp_player_t *p)
     }
     if (p->status[0]) {
         ag_gfx_text(8, (int16_t)(p->fb_h - 18), p->status, COL_MUTED, COL_BG);
+    } else {
+        char nbuf[24];
+        int n = 0;
+        nbuf[n++] = (char)('0' + (p->pl.count / 10) % 10);
+        nbuf[n++] = (char)('0' + p->pl.count % 10);
+        nbuf[n++] = ' ';
+        nbuf[n++] = 't';
+        nbuf[n++] = 'r';
+        nbuf[n++] = 'k';
+        nbuf[n++] = ' ';
+        nbuf[n++] = 'E';
+        nbuf[n++] = 'j';
+        nbuf[n++] = '/';
+        nbuf[n++] = 'A';
+        nbuf[n++] = '=';
+        nbuf[n++] = 'o';
+        nbuf[n++] = 'p';
+        nbuf[n++] = 'e';
+        nbuf[n++] = 'n';
+        nbuf[n] = '\0';
+        ag_gfx_text(8, (int16_t)(p->fb_h - 18), nbuf, COL_MUTED, COL_BG);
     }
+    draw_picker(p);
     draw_cursor(p);
     ag_gfx_flush(0, 0, 0, 0);
 }
@@ -465,9 +585,23 @@ void amp_ui_pointer(amp_player_t *p, const ag_event_t *ev)
 
     if (ev->type == AG_EV_POINTER_DOWN) {
         amp_panel_t pan = AMP_PANEL_MAIN;
-        amp_ctrl_t c = amp_skin_hit(&p->skin, p->focus, x, y, &pan);
+        amp_ctrl_t c;
+        if (p->picker) {
+            /* Click row in picker */
+            int row = (y - 64) / 16;
+            if (row >= 0 && row < p->pick_n) {
+                p->pick_i = row;
+                amp_btn_press(p, AMP_CTRL_EJECT);
+                amp_cmd_picker_choose(p);
+            }
+            return;
+        }
+        c = amp_skin_hit(&p->skin, p->focus, x, y, &pan);
         p->mbtn = 1;
         p->focus = pan;
+        if (c != AMP_CTRL_NONE) {
+            amp_btn_press(p, c);
+        }
         if (c == AMP_CTRL_PLAY || c == AMP_CTRL_PAUSE) {
             amp_cmd_play_pause(p);
         } else if (c == AMP_CTRL_STOP) {
@@ -476,7 +610,9 @@ void amp_ui_pointer(amp_player_t *p, const ag_event_t *ev)
             amp_cmd_next(p);
         } else if (c == AMP_CTRL_PREV) {
             amp_cmd_prev(p);
-        } else if (c == AMP_CTRL_EJECT || c == AMP_CTRL_PL_TOGGLE) {
+        } else if (c == AMP_CTRL_EJECT) {
+            amp_cmd_open_picker(p);
+        } else if (c == AMP_CTRL_PL_TOGGLE) {
             p->focus = AMP_PANEL_PL;
             p->dirty = 1;
         } else if (c == AMP_CTRL_EQ_TOGGLE) {
@@ -493,6 +629,7 @@ void amp_ui_pointer(amp_player_t *p, const ag_event_t *ev)
             p->dirty = 1;
         } else if (c == AMP_CTRL_EQ_AUTO) {
             amp_eq_reset(&p->eq);
+            p->dirty = 1;
         } else if (c == AMP_CTRL_PL_LIST) {
             amp_rect_t list;
             int row;
