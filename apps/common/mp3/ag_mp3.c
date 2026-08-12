@@ -36,14 +36,12 @@ struct ag_mp3 {
 static int skip_id3v2(ag_handle_t fd, char *title, size_t title_len)
 {
     uint8_t hdr[10];
-    int64_t pos;
     uint32_t size;
 
     if (title && title_len) {
         title[0] = '\0';
     }
-    pos = ag_seek(fd, 0, AG_SEEK_SET);
-    if (pos < 0) {
+    if (ag_seek(fd, 0, AG_SEEK_SET) < 0) {
         return -1;
     }
     if (ag_read(fd, hdr, 10) != 10) {
@@ -56,76 +54,11 @@ static int skip_id3v2(ag_handle_t fd, char *title, size_t title_len)
     }
     size = ((uint32_t)(hdr[6] & 0x7f) << 21) | ((uint32_t)(hdr[7] & 0x7f) << 14) |
            ((uint32_t)(hdr[8] & 0x7f) << 7) | (uint32_t)(hdr[9] & 0x7f);
-    /* Best-effort TIT2 scan in first 2 KiB of tag. */
-    if (title && title_len > 1 && size > 0) {
-        uint8_t scratch[2048];
-        uint32_t n = size;
-        if (n > sizeof(scratch)) {
-            n = (uint32_t)sizeof(scratch);
-        }
-        if (ag_read(fd, scratch, n) == (int32_t)n) {
-            uint32_t i;
-            for (i = 0; i + 11 < n; i++) {
-                if (scratch[i] == 'T' && scratch[i + 1] == 'I' &&
-                    scratch[i + 2] == 'T' && scratch[i + 3] == '2') {
-                    uint32_t tsz =
-                        ((uint32_t)scratch[i + 4] << 24) |
-                        ((uint32_t)scratch[i + 5] << 16) |
-                        ((uint32_t)scratch[i + 6] << 8) | scratch[i + 7];
-                    uint8_t enc = scratch[i + 10];
-                    uint32_t src = i + 11;
-                    uint32_t j = 0;
-                    if (tsz > 1 && enc == 0) {
-                        while (j + 1 < title_len && src < i + 10 + tsz &&
-                               scratch[src] >= 32) {
-                            title[j++] = (char)scratch[src++];
-                        }
-                        title[j] = '\0';
-                    }
-                    break;
-                }
-            }
-        }
-    }
+    /* Skip tag body with one seek — no HostFS scan of the whole tag. */
     if (ag_seek(fd, (int64_t)(10 + size), AG_SEEK_SET) < 0) {
         return -1;
     }
     return 0;
-}
-
-static void try_id3v1(ag_handle_t fd, int64_t file_size, char *title,
-                      size_t title_len)
-{
-    uint8_t tag[128];
-    if (!title || title_len < 2 || file_size < 128) {
-        return;
-    }
-    if (title[0] != '\0') {
-        return;
-    }
-    if (ag_seek(fd, file_size - 128, AG_SEEK_SET) < 0) {
-        return;
-    }
-    if (ag_read(fd, tag, 128) != 128) {
-        return;
-    }
-    if (tag[0] == 'T' && tag[1] == 'A' && tag[2] == 'G') {
-        size_t j = 0;
-        size_t i;
-        for (i = 3; i < 33 && j + 1 < title_len; i++) {
-            char c = (char)tag[i];
-            if (c == '\0') {
-                break;
-            }
-            if (c >= 32) {
-                title[j++] = c;
-            }
-        }
-        while (j > 0 && title[j - 1] == ' ') {
-            j--;
-        }
-        title[j] = '\0';
-    }
 }
 
 int ag_mp3_open(ag_mp3_t **out, const char *path)
@@ -154,7 +87,7 @@ int ag_mp3_open(ag_mp3_t **out, const char *path)
         return -1;
     }
     m->file_size = sz;
-    try_id3v1(m->fd, sz, m->title, sizeof(m->title));
+    /* Skip ID3v1 (extra end-of-file HostFS seek). Title comes from the path. */
     if (skip_id3v2(m->fd, m->title, sizeof(m->title)) != 0) {
         (void)ag_close(m->fd);
         ag_free(m);

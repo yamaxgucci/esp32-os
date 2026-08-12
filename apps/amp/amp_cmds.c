@@ -33,6 +33,7 @@ int amp_open_track(amp_player_t *p, const char *path)
         ag_mp3_close(p->mp3);
         p->mp3 = NULL;
     }
+    ag_heartbeat();
     if (ag_mp3_open(&m, path) != 0) {
         set_status(p, "open failed");
         p->state = AMP_STOPPED;
@@ -43,12 +44,11 @@ int amp_open_track(amp_player_t *p, const char *path)
     {
         int16_t tmp[2304];
         int     tries;
-        for (tries = 0; tries < 8 && ag_mp3_rate(m) == 0; tries++) {
-            int n = ag_mp3_read(m, tmp, 1);
-            if (n < 0) {
-                break;
-            }
-            if (n == 0) {
+        for (tries = 0; tries < 4 && ag_mp3_rate(m) == 0; tries++) {
+            int n;
+            ag_heartbeat();
+            n = ag_mp3_read(m, tmp, 1);
+            if (n <= 0) {
                 break;
             }
         }
@@ -56,7 +56,13 @@ int amp_open_track(amp_player_t *p, const char *path)
     }
     rate = ag_mp3_rate(m);
     if (rate == 0) {
-        rate = 22050;
+        /* Stub / undecodable file — do not enter PLAYING and spin. */
+        ag_mp3_close(m);
+        p->mp3 = NULL;
+        set_status(p, "bad mp3 (need real file)");
+        p->state = AMP_STOPPED;
+        p->dirty = 1;
+        return -1;
     }
     if (rate > 48000) {
         rate = 48000;

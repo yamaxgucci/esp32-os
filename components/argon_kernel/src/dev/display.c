@@ -415,10 +415,12 @@ static void gfx_swap(void)
 }
 
 /*
- * Clear means clear the screen, so the front buffer goes too.  An app that
- * clears once and then flushes a sub-rectangle every frame - which is exactly
- * what the emulators do - would otherwise keep whatever the console left around
- * its window on display for as long as it runs.
+ * Clear the draw surface (and the front buffer in memory when double-buffered)
+ * so a later partial flush does not leave console trash in the margins.
+ *
+ * Do NOT call qemu_present() here: apps that clear→draw→flush every frame
+ * (GRAIN, AMP, …) would flash a blank frame between clear and flush.  The next
+ * flush/swap is what pushes pixels to the host display.
  */
 static void gfx_clear(uint32_t color)
 {
@@ -433,7 +435,6 @@ static void gfx_clear(uint32_t color)
             s_front[i] = c;
         }
     }
-    qemu_present();
 }
 
 static void gfx_fill_rect(int16_t x, int16_t y, uint16_t w, uint16_t h,

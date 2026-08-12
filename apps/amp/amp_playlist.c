@@ -16,6 +16,15 @@ static int ends_with_mp3(const char *name)
     if (n < 4) {
         return 0;
     }
+    /* Skip generator stub — it is not a real bitstream and wedges decode/HostFS. */
+    if (n == 8 &&
+        (name[0] == 'd' || name[0] == 'D') &&
+        (name[1] == 'e' || name[1] == 'E') &&
+        (name[2] == 'm' || name[2] == 'M') &&
+        (name[3] == 'o' || name[3] == 'O') &&
+        name[4] == '.' ) {
+        return 0;
+    }
     return (name[n - 4] == '.' &&
             (name[n - 3] == 'm' || name[n - 3] == 'M') &&
             (name[n - 2] == 'p' || name[n - 2] == 'P') &&
