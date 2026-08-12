@@ -5,7 +5,7 @@
  * can be loaded after the first one has come and gone: alignment, reuse of a
  * freed hole, and coalescing of neighbouring holes.
  *
- * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #include <argon/arena.h>
 

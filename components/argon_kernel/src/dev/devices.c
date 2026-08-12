@@ -7,7 +7,7 @@
  * Everything else comes from a driver - built into the image, like the card
  * reader in storage.c, or loaded later as a .SYS module.
  *
- * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #include "dev/devices.h"
 

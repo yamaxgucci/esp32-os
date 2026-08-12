@@ -1,7 +1,7 @@
 /*
  * ArgonOS - platform detection (kernel private).
  *
- * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #ifndef ARGON_PLATFORM_H
 #define ARGON_PLATFORM_H

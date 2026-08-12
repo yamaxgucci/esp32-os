@@ -5,7 +5,7 @@
  * and a back buffer exists, apps draw there; flush/swap copy to front and kick
  * the QEMU RGB window (no busy-wait on UPDATE_STATUS.ENA).
  *
- * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #include <argon/display.h>
 

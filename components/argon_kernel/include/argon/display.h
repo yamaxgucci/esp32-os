@@ -1,7 +1,7 @@
 /*
  * ArgonOS - local display (soft framebuffer for QEMU; panel drivers later).
  *
- * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #ifndef ARGON_DISPLAY_H
 #define ARGON_DISPLAY_H

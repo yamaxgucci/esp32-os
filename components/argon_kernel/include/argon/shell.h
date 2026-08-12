@@ -6,7 +6,7 @@
  * inspected.  That is the difference between a system that is degraded and one
  * that is bricked.
  *
- * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #ifndef ARGON_SHELL_H
 #define ARGON_SHELL_H

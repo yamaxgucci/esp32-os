@@ -4,7 +4,7 @@
  * Little-endian.  Request and response share the same header; `status` is 0
  * on requests and an ag_err_t (0 or negative) on responses.
  *
- * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #ifndef ARGON_HSFS_PROTO_H
 #define ARGON_HSFS_PROTO_H

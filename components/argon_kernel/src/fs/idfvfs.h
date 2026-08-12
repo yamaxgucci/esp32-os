@@ -10,7 +10,7 @@
  * decision rather than a rewrite: swapping FAT for littlefs changes which
  * mount call runs, not this file.
  *
- * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #ifndef ARGON_IDFVFS_H
 #define ARGON_IDFVFS_H

@@ -5,7 +5,7 @@
  * is initialised: the loader, the memory manager and the console all size
  * themselves from the answer.
  *
- * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #include "platform.h"
 

@@ -14,7 +14,7 @@
  * SPI panels are deliberately absent: they do not ACK a scan, so their type and
  * pins stay in BOARD.CFG.
  *
- * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #ifndef ARGON_PROBE_H
 #define ARGON_PROBE_H

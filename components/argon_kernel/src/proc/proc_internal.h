@@ -5,7 +5,7 @@
  * Only proc.c and threads.c include this.  Everything else talks to processes
  * through argon/proc.h, which is deliberately free of FreeRTOS.
  *
- * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #ifndef ARGON_PROC_INTERNAL_H
 #define ARGON_PROC_INTERNAL_H

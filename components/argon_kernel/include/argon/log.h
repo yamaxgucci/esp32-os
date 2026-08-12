@@ -6,7 +6,7 @@
  * a message written while the screen is scrolling would otherwise be gone
  * before anyone could see it.
  *
- * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #ifndef ARGON_LOG_H
 #define ARGON_LOG_H

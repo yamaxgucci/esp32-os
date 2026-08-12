@@ -15,7 +15,7 @@
  * internal flash.  Everything discovered later - displays, sensors, buses -
  * can be configured from either place.
  *
- * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #ifndef ARGON_BOARD_H
 #define ARGON_BOARD_H

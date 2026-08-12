@@ -15,7 +15,7 @@
  * This file is free of kernel and ESP-IDF dependencies so it can be unit
  * tested on a host.
  *
- * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #ifndef ARGON_JOURNAL_H
 #define ARGON_JOURNAL_H

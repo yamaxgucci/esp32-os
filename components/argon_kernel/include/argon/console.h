@@ -10,7 +10,7 @@
  * queue, so a command typed over telnet is indistinguishable from one typed
  * on a keyboard plugged into the board.
  *
- * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #ifndef ARGON_CONSOLE_H
 #define ARGON_CONSOLE_H

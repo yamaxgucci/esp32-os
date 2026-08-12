@@ -19,7 +19,7 @@
  * host - which matters, because "who is allowed to do what" is the kind of rule
  * that is easy to get almost right.
  *
- * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #ifndef ARGON_IOCLAIM_H
 #define ARGON_IOCLAIM_H

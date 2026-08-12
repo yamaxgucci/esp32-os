@@ -1,7 +1,7 @@
 /*
  * ArgonOS - networking bring-up and the api->net table.
  *
- * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #ifndef ARGON_NET_H
 #define ARGON_NET_H

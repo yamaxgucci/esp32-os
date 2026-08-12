@@ -7,7 +7,7 @@
  * is reported as absent rather than mapped to something plausible, and that the
  * bytes a Cyrillic screen is made of are the ones DOS used.
  *
- * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #include <argon/codepage.h>
 

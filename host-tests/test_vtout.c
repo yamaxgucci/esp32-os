@@ -5,7 +5,7 @@
  * helper renders both sides of a comparison.  Without that, a failure prints
  * raw escape sequences and reprograms the terminal running the tests.
  *
- * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #include <argon/vtout.h>
 

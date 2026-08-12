@@ -1,7 +1,7 @@
 /*
  * ArgonOS - built-in 8x16 bitmap font.
  *
- * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #ifndef ARGON_FONT8X16_H
 #define ARGON_FONT8X16_H

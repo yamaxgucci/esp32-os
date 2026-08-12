@@ -1,7 +1,7 @@
 /*
  * ArgonOS - kernel entry point.
  *
- * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #ifndef ARGON_KERNEL_H
 #define ARGON_KERNEL_H

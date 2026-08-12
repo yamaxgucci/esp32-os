@@ -10,7 +10,7 @@
  * in the shared executable arena, which is why a driver and an application
  * compete for the same kilobytes (docs/04-roadmap.md, phase 4.5).
  *
- * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #ifndef ARGON_MODULE_H
 #define ARGON_MODULE_H

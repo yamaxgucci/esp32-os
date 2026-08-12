@@ -12,7 +12,7 @@ lightweight integer synth (own timbre, same note/volume/key protocol).
 - `core/` and `LICENSE` — SMS Plus GX, **GPLv2 or later**
 - `sms_main.c`, `sms_cfg.*`, `port/`, `apps/common/fm` — Apache-2.0
 
-The kernel stays Apache-2.0; this application image is a separate GPL work.
+The kernel is GPL-3.0-or-later (SDK/ABI Apache-2.0); this application image is a separate GPL work.
 
 ## Build
 

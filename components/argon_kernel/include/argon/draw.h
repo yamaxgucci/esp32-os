@@ -3,7 +3,7 @@
  *
  * Pure geometry; no display ownership.  Used by the gfx ABI and host tests.
  *
- * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #ifndef ARGON_DRAW_H
 #define ARGON_DRAW_H

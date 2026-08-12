@@ -6,7 +6,7 @@
  * board with no SD card, no display or no config file must still reach a
  * usable prompt on the serial console.
  *
- * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #include <argon/kernel.h>
 

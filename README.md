@@ -132,4 +132,11 @@ builds and runs on the host.
 
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE).
+Split licensing — details in [LICENSING.md](LICENSING.md):
+
+- **Kernel** (`components/argon_kernel/`, `main/`) and host-tests: **GPL-3.0-or-later** ([LICENSE](LICENSE))
+- **SDK** (`sdk/`), tools, and most apps: **Apache-2.0** ([LICENSE.Apache-2.0](LICENSE.Apache-2.0))
+- Third-party trees keep their own licenses
+
+Applications that only use the public syscall ABI are not required to be GPL.
+Set the GitHub repository license to **GPL-3.0**.

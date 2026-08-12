@@ -10,7 +10,7 @@
  * model - naming, exclusivity, position, what happens when the hardware is
  * pulled - and a fake answers those questions without a board.
  *
- * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #include <argon/devfs.h>
 #include <argon/device.h>

@@ -1,7 +1,7 @@
 /*
  * ArgonOS - a small allocator for a fixed region.
  *
- * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #include <argon/arena.h>
 

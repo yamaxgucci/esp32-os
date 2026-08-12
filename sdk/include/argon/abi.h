@@ -12,6 +12,9 @@
  *   - new sub-tables are appended to the END of ag_api_t     -> minor + 1;
  *   - anything else (signature change, removal, reorder)     -> major + 1.
  *
+ * This header is Apache-2.0 (see LICENSING.md).  Using only this ABI does not
+ * make an application a derivative of the GPL kernel.
+ *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
  */
 #ifndef ARGON_ABI_H

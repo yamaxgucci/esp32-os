@@ -1,7 +1,7 @@
 /*
  * ArgonOS - the supervisor (kernel private).
  *
- * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #ifndef ARGON_SUPERVISOR_H
 #define ARGON_SUPERVISOR_H

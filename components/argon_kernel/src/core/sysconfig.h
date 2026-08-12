@@ -5,7 +5,7 @@
  * the board overrides to the board layer.  Parsing is zero-copy, so the text
  * buffer is kept for the lifetime of the system rather than freed.
  *
- * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #ifndef ARGON_SYSCONFIG_H
 #define ARGON_SYSCONFIG_H

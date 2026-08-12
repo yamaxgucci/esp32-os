@@ -8,7 +8,7 @@
  * the whole contract: the host build stays independent of ESP-IDF, which is
  * the point of host-tests.
  *
- * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #ifndef ARGON_HOST_SDKCONFIG_H
 #define ARGON_HOST_SDKCONFIG_H

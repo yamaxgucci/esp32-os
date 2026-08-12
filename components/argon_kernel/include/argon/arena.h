@@ -18,7 +18,7 @@
  *
  * No dependency on FreeRTOS or the chip: built and tested on the host.
  *
- * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #ifndef ARGON_ARENA_H
 #define ARGON_ARENA_H

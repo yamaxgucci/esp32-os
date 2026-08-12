@@ -5,7 +5,7 @@
  * backend to be worth testing, and the RAM disk is the one backend that runs
  * anywhere.
  *
- * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #include <argon/ramfs.h>
 #include <argon/vfs.h>

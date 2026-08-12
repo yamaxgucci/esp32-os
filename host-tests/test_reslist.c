@@ -5,7 +5,7 @@
  * come out in and the fact that a full list refuses instead of losing an entry.
  * Both decide whether killing a process actually gives its resources back.
  *
- * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #include <argon/reslist.h>
 
