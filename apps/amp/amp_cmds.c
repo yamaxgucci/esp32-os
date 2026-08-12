@@ -53,25 +53,44 @@ int amp_open_track(amp_player_t *p, const char *path)
         return -1;
     }
     /*
-     * No priming decode here: the first HostFS read of a real MP3 was wedging
-     * the guest before we returned to the UI loop. Rate is discovered while
-     * pumping audio; start at 22050 until then.
+     * File is already fully in RAM (ag_mp3_open). Prime one decode so we can
+     * SETFMT before the first PCM write; HostFS is no longer involved.
      */
     p->mp3 = m;
-    p->rate = 22050;
-    amp_eq_set_rate(&p->eq, p->rate);
-    if (p->audio_fd < 0) {
-        p->audio_fd = ag_audio_out_open_dev(p->audio_path, p->rate, 2);
+    {
+        int16_t probe[128 * 2];
+        int     n = ag_mp3_read(m, probe, 128);
+        if (n <= 0 || ag_mp3_rate(m) == 0) {
+            ag_mp3_close(m);
+            p->mp3 = NULL;
+            set_status(p, "decode fail");
+            p->state = AMP_STOPPED;
+            return -1;
+        }
+        p->rate = ag_mp3_rate(m);
+        /* Rewind — probe consumed PCM/frames; restart from bitstream start. */
+        (void)ag_mp3_seek_permille(m, 0);
+        amp_eq_set_rate(&p->eq, p->rate);
         if (p->audio_fd < 0) {
-            (void)ag_audio_out_resolve("pcmnull", p->audio_path,
-                                       sizeof(p->audio_path));
             p->audio_fd = ag_audio_out_open_dev(p->audio_path, p->rate, 2);
+            if (p->audio_fd < 0) {
+                (void)ag_audio_out_resolve("pcmnull", p->audio_path,
+                                           sizeof(p->audio_path));
+                p->audio_fd = ag_audio_out_open_dev(p->audio_path, p->rate, 2);
+            }
+        } else {
+            ag_audio_fmt_t fmt;
+            fmt.rate = p->rate;
+            fmt.channels = 2;
+            fmt.bits = 16;
+            (void)ag_dev_ioctl(p->audio_fd, AG_IOC_AUDIO_SETFMT, &fmt,
+                               sizeof(fmt));
         }
     }
     set_title_from_path(p, path);
     p->state = AMP_PLAYING;
     set_status(p, "playing");
-    ag_printf("amp: playing (rate TBD)\n");
+    ag_printf("amp: playing rate=%u\n", (unsigned)p->rate);
     p->dirty = 1;
     return 0;
 }
