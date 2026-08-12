@@ -491,7 +491,9 @@ HID-нумерация выбрана не из любви к стандарта
 `AG_HAS(inp, key_pressed)`; вызов появится вместе с USB-клавиатурой.
 
 Типы событий за пределами клавиатуры (`AG_EV_POINTER_*`, `AG_EV_DEVICE_*`,
-`AG_EV_MEDIA_*`, `AG_EV_FOCUS_*`, `AG_EV_QUIT`) объявлены, но пока не приходят:
+`AG_EV_MEDIA_*` объявлены, но пока не приходят. `AG_EV_QUIT` приходит при soft-stop
+(`Ctrl+C` / `F12`). `AG_EV_FOCUS_LOST` / `GAINED` приходят при смене слота сессии
+(ABI 0.20); вне фокуса не вызывайте `flush`/`swap` — есть также `ag_focused()`:
 источников для них ещё нет.
 
 ## `time` — время
@@ -581,6 +583,7 @@ ag_err_t foreground(ag_pid_t pid);
 const char *getenv(const char *key);            /* NULL: окружения нет */
 ag_err_t    setenv(const char *key, const char *value);  /* NULL */
 bool     interrupted(void);
+bool     focused(void);      /* ABI 0.20: session slot has input/display focus */
 void     watchdog(uint32_t ms);
 ```
 

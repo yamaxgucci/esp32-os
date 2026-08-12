@@ -93,7 +93,8 @@ flash-XIP. Результат определяет §3.2 архитектуры.
    приложение, а не система, и в журнале смещение отказа в его собственном коде
    (§5.5 архитектуры); ✅ watchdog по заявке приложения (`ag_watchdog`);
    ✅ crash-record в `/sys/crash.log` с хвостом журнала;
-   ⬜ вывод фоновых процессов в лог, ⬜ горячие клавиши `Alt+1..4`
+   ⬜ вывод фоновых процессов в лог, ✅ горячие клавиши `Alt+1..4` / `Alt+Tab`
+   (session slots + system shell; см. `docs/plans/session-slots-and-system-shell.md`)
 5. Таблицы ABI: ✅ `sys mem fs con time proc task inp dev io`; ⬜ `cfg gfx`
 6. ⬜ SDK: `libargon` как библиотека, шаблон приложения; сборка `.AXE` ✅,
    примеры `apps/hello`, `spin`, `leak`, `threads`, `crash` ✅

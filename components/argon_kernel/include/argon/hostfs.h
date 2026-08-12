@@ -21,6 +21,12 @@ ag_err_t ag_hostfs_try_mount(void);
 bool ag_hostfs_mounted(void);
 
 /*
+ * Task currently inside a HostFS UART RPC (holding the RPC mutex), or NULL.
+ * Used by the process killer so it does not delete a task mid-RPC.
+ */
+void *ag_hostfs_rpc_holder(void);
+
+/*
  * Last host-pushed pad snapshot (AG_PAD_BYTES).  Returns true when a push
  * arrived within `max_age_ms` (0 = any cached value).  Prefer the input
  * layer (ag_input_pad_peek / inp->btn); this remains for the virtual

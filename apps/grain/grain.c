@@ -1104,6 +1104,16 @@ int ag_main(int argc, char **argv)
             if (ev.type == AG_EV_QUIT) {
                 goto done;
             }
+            if (ev.type == AG_EV_FOCUS_LOST) {
+                continue;
+            }
+            if (ev.type == AG_EV_FOCUS_GAINED) {
+                s_dirty = 1;
+                continue;
+            }
+            if (!ag_focused()) {
+                continue;
+            }
             if (ev.type == AG_EV_KEY_DOWN || ev.type == AG_EV_KEY_UP) {
                 handle_key((int)ev.key.keycode, ev.type == AG_EV_KEY_DOWN,
                            ev.key.unicode);
@@ -1116,6 +1126,12 @@ int ag_main(int argc, char **argv)
         }
         if (ag_interrupted()) {
             break;
+        }
+        if (!ag_focused()) {
+            ag_heartbeat();
+            ag_delay(50);
+            s_next_due = ag_micros() + (ag_time_t)CHUNK_US;
+            continue;
         }
 
         pump_midivirt();
