@@ -11,6 +11,10 @@
 #include "fm.h"
 #include "fm_ui.h"
 
+#ifdef AG_BUILTIN
+int ag_edit_main(int argc, char **argv);
+#endif
+
 /* Big enough that copying is not a syscall per kilobyte, small enough that two
  * of them are nothing next to the arena. */
 #define FM_COPY_CHUNK (8u * 1024u)
@@ -282,6 +286,67 @@ void fm_view(void)
     ag_free(text);
     ag_free(lines);
     fm_ui_cls();
+}
+
+/* ---------------------------------------------------------------------- */
+/* Editing                                                                */
+/* ---------------------------------------------------------------------- */
+
+#ifndef AG_BUILTIN
+/* Guest FM.AXE / GFXFM: look for a packaged editor next to the usual app roots. */
+static bool fm_exec_edit_axe(const char *file)
+{
+    static const char *const k_edit[] = {
+        "/sd/EDIT.AXE",
+        "/sd/apps/EDIT.AXE",
+        "/tmp/EDIT.AXE",
+        "/sys/EDIT.AXE",
+        "EDIT.AXE",
+    };
+
+    for (unsigned i = 0; i < sizeof(k_edit) / sizeof(k_edit[0]); i++) {
+        const ag_handle_t h = ag_open(k_edit[i], AG_O_RDONLY);
+        if (h < 0) {
+            continue;
+        }
+        (void)ag_close(h);
+
+        ag_print("Loading EDIT.AXE ...\n");
+        const char *argv[2] = {k_edit[i], file};
+        (void)ag_exec(k_edit[i], 2, argv);
+        return true;
+    }
+    return false;
+}
+#endif
+
+void fm_edit(void)
+{
+    const fm_entry_t *e = fm_current();
+    if (e == NULL || e->is_dir) {
+        return;
+    }
+
+    char full[AG_PATH_MAX];
+    fm_join(fm_active()->path, e->name, full, sizeof(full));
+
+    fm_ui_end();
+
+#ifdef AG_BUILTIN
+    {
+        char *eargv[2] = {(char *)"edit", full};
+        (void)ag_edit_main(2, eargv);
+    }
+#else
+    if (!fm_exec_edit_axe(full)) {
+        ag_print("No EDIT.AXE found (tried /sd, /sd/apps, /tmp, /sys).\n");
+    }
+#endif
+
+    fm_pause("press any key");
+    fm_ui_begin();
+    (void)fm_reload(fm_active());
+    (void)fm_reload(fm_other());
 }
 
 /* ---------------------------------------------------------------------- */
@@ -759,13 +824,13 @@ void fm_help(void)
         "  arrows, PgUp, PgDn, Home, End   move the cursor",
         "  Tab                             the other panel",
         "  Enter                           open a directory, run a .AXE,",
-        "                                  view anything else",
+        "                                  open by assoc, or view",
         "  Backspace                       up one directory",
         "  Alt+F1 / Alt+F2                 pick a drive for the left / right",
         "",
         "  F1 help          F2 reread the panel     F3 view a file",
-        "  F5 copy          F6 move or rename       F7 make a directory",
-        "  F8 delete        F10 or Esc quit",
+        "  F4 edit          F5 copy                 F6 move or rename",
+        "  F7 make a directory  F8 delete           F10 or Esc quit",
         "",
         "  Ctrl+C cancels a long copy (or asks this program to stop);",
         "  Ctrl+\\ makes the system stop a runaway .AXE.",

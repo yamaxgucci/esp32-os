@@ -444,7 +444,7 @@ void fm_draw_detail(void)
 static void draw_keys(void)
 {
     static const char *k_labels[10] = {
-        "1Help", "2Reld", "3View", "4    ", "5Copy",
+        "1Help", "2Reld", "3View", "4Edit", "5Copy",
         "6Move", "7MkDr", "8Del ", "9    ", "10Quit",
     };
 
@@ -819,6 +819,7 @@ int FM_ENTRY(int argc, char **argv)
         case AG_KEY_F1:  fm_help(); break;
         case AG_KEY_F2:  (void)fm_reload(fm_active()); fm_message("reloaded"); break;
         case AG_KEY_F3:  fm_view(); break;
+        case AG_KEY_F4:  fm_edit(); break;
         case AG_KEY_F5:  fm_copy(); break;
         case AG_KEY_F6:  fm_move(); break;
         case AG_KEY_F7:  fm_mkdir(); break;
