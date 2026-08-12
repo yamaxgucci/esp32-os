@@ -183,8 +183,12 @@ static int decode_one(ag_mp3_t *m)
 
     for (;;) {
         if (++guard > 64) {
-            /* Bound work per call so UI/audio pump cannot wedge on HostFS junk. */
-            return m->pcm_frames > 0 ? 1 : (m->eof ? 0 : -1);
+            /*
+             * Bound HostFS work per call so the UI loop can tick. Not EOF —
+             * caller should call again (amp treats rate==0 + 0 frames as
+             * "still priming", not end-of-track).
+             */
+            return m->pcm_frames > 0 ? 1 : 0;
         }
         if (refill(m) < 0) {
             return -1;

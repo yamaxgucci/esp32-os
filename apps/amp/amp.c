@@ -64,6 +64,8 @@ static void apply_volume(int16_t *stereo, int frames, int vol, int bal)
     }
 }
 
+static int s_sync_empty; /* consecutive empty reads before first frame */
+
 static void pump_audio(void)
 {
     int n;
@@ -77,13 +79,22 @@ static void pump_audio(void)
         s_p.state = AMP_STOPPED;
         strncpy(s_p.status, "decode fail", sizeof(s_p.status) - 1);
         s_p.dirty = 1;
+        s_sync_empty = 0;
         return;
     }
     if (n == 0) {
         if (ag_mp3_rate(s_p.mp3) == 0) {
-            /* Still hunting sync — not EOF yet. */
+            /* Still hunting sync — not EOF yet. Cap attempts so junk never wedes. */
+            if (++s_sync_empty > 256) {
+                s_p.state = AMP_STOPPED;
+                strncpy(s_p.status, "no mp3 frames", sizeof(s_p.status) - 1);
+                s_p.dirty = 1;
+                s_sync_empty = 0;
+                ag_printf("amp: no frames after sync hunt\n");
+            }
             return;
         }
+        s_sync_empty = 0;
         /* EOF: advance once; do not spin forever on a broken stub file. */
         {
             int prev = s_p.pl.cur;
@@ -96,6 +107,7 @@ static void pump_audio(void)
         }
         return;
     }
+    s_sync_empty = 0;
     rate = ag_mp3_rate(s_p.mp3);
     if (rate != 0 && rate != s_p.rate && rate <= 48000u) {
         ag_audio_fmt_t fmt;
@@ -241,6 +253,7 @@ int ag_main(int argc, char **argv)
             s_p.dirty = 0;
             ui_ms = ag_millis();
             ag_printf("amp: opening %s\n", path);
+            s_sync_empty = 0;
             (void)amp_open_track(&s_p, path);
         }
         pump_audio();
