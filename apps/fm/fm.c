@@ -14,6 +14,9 @@
  */
 #include "fm.h"
 #include "fm_ui.h"
+#ifdef AG_BUILTIN
+#include <argon/shell.h>
+#endif
 
 /* Only the plain text application build declares an image header; the built-in
  * lives in the kernel image, and GFXFM supplies its own header. */
@@ -676,14 +679,20 @@ int FM_ENTRY(int argc, char **argv)
 
     bool running = true;
     while (running) {
+#ifdef AG_BUILTIN
+        if (ag_shell_interrupted()) {
+            break;
+        }
+#endif
+
         ag_event_t ev;
-        if (!ag_poll_event(&ev, UINT32_MAX)) {
+        if (!ag_poll_event(&ev, 50)) {
             continue;
         }
 
         /*
-         * The system asking this process to stop, which is what Ctrl+C becomes.
-         * An application that draws the screen has to put it back.
+         * Ctrl+C / session switch (Alt+N) become QUIT so a drawn screen can
+         * restore the console.
          */
         if (ev.type == AG_EV_QUIT) {
             break;

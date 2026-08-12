@@ -35,4 +35,7 @@ void ag_supervisor_kill_request(ag_pid_t pid);
 bool ag_supervisor_interrupted(void);
 void ag_supervisor_clear_interrupt(void);
 
+/* Session switch / break-in: wake long shell builtins (fm, copy, …). */
+void ag_supervisor_raise_shell_interrupt(void);
+
 #endif /* ARGON_SUPERVISOR_H */

@@ -1,5 +1,5 @@
 /*
- * ArgonOS - session slots (system shell + user app slots).
+ * ArgonOS - session slots (per-slot shell + optional app).
  *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
  */
@@ -10,6 +10,7 @@
 #include <stdint.h>
 
 #include <argon/abi.h>
+#include <argon/path.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -19,45 +20,53 @@ extern "C" {
 #define AG_SESSION_SYSTEM 0
 
 typedef struct {
-    ag_pid_t pid; /* AG_PID_KERNEL = empty (slot 0 is always system) */
+    ag_pid_t pid; /* AG_PID_KERNEL = shell owns this slot (no app) */
     char     name[32];
+    char     cwd[AG_PATH_MAX];
 } ag_session_slot_t;
 
 void ag_session_init(void);
 
-/* Currently focused slot index (0 = system shell). */
+/* Currently focused slot index (0..3). */
 int ag_session_focused(void);
 
-/* Pid that should own the keyboard for the focused slot. */
+/* 1-based number for prompts / Alt+N labels (slot 0 → 1, …). */
+int ag_session_display_number(int slot);
+
+/* Pid that should own the keyboard: app if present, else KERNEL (shell). */
 ag_pid_t ag_session_focused_pid(void);
 
-/* Bind a newly spawned process into a free user slot (1..3). */
+/* True when the focused slot has no app — shell should read the console. */
+bool ag_session_shell_owns_keyboard(void);
+
+/* Bind a newly spawned process into a slot (prefer focused if empty). */
 ag_err_t ag_session_bind(ag_pid_t pid, const char *name);
 
 /* Clear a slot when its process ends. */
 void ag_session_unbind(ag_pid_t pid);
 
 /*
- * Switch focus to `slot`.  Releases gfx from the previous owner, posts focus
- * events, updates process foreground.  Slot 0 = system shell.
+ * Switch focus to `slot` (0..3).  Empty slots are valid: gfx is released and
+ * the shell owns the console for that slot.
  */
 ag_err_t ag_session_focus(int slot);
 
 /*
- * Break-in: focus system shell without killing.  If already in system and a
- * second press arrives within ~1 s, hard-kills the last user foreground pid.
- * Returns true when a kill was performed.
+ * Break-in: focus slot 0 shell without killing.  Second press within ~1 s
+ * hard-kills the last user app pid.
  */
 bool ag_session_enter_system(void);
 
-/* Cycle live slots (system + occupied user).  Used by Alt+Tab. */
+/* Cycle all four slots. */
 ag_err_t ag_session_alt_tab(void);
 
-/* Fill slot table for `slots` command / overlay. */
 void ag_session_info(ag_session_slot_t out[AG_SESSION_SLOTS]);
 
-/* Slot index for pid, or -1. */
 int ag_session_slot_of(ag_pid_t pid);
+
+/* Per-slot working directory (shell syncs on focus / cd). */
+const char *ag_session_cwd(int slot);
+ag_err_t    ag_session_set_cwd(int slot, const char *absolute_path);
 
 #ifdef __cplusplus
 }

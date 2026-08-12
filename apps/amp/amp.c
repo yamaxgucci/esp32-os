@@ -303,6 +303,11 @@ int ag_main(int argc, char **argv)
                 continue;
             }
             if (ev.type == AG_EV_FOCUS_GAINED) {
+                ag_gfxinfo_t gi;
+                if (ag_gfx_acquire(&gi) == AG_OK) {
+                    s_p.fb_w = gi.width;
+                    s_p.fb_h = gi.height;
+                }
                 s_p.dirty = 1;
                 continue;
             }
@@ -323,6 +328,15 @@ int ag_main(int argc, char **argv)
             ag_heartbeat();
             ag_delay(50);
             continue;
+        }
+        {
+            /* Kernel may have force-released gfx while we were unfocused. */
+            ag_gfxinfo_t gi;
+            if (ag_gfx_acquire(&gi) == AG_OK) {
+                s_p.fb_w = gi.width;
+                s_p.fb_h = gi.height;
+                s_p.dirty = 1;
+            }
         }
         /* Paint "loading..." first, then HostFS open (can stall on slow H:). */
         if (s_p.want_open && s_p.pending_path[0]) {
