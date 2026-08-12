@@ -1,5 +1,7 @@
 # ArgonOS
 
+This operating system was written entirely using AI.
+
 A small, fast operating system for ESP32-class microcontrollers.
 
 ArgonOS follows the MS-DOS execution model — **the application owns the
