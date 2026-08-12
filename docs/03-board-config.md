@@ -209,6 +209,42 @@ app_arena_kb = 64
 |---|---|
 | `app_arena_kb` | сколько килобайт из связанной арены кода (потолок `CONFIG_ARGON_APP_ARENA_KB`, на S3 обычно 192) реально отдаёт загрузчик. Clamp 4…потолок. Нет ключа — весь потолок. Хвост IRAM линкеру не возвращается. Нужен `reboot` после правки |
 
+## Шелл: PATH, AUTOEXEC, ассоциации
+
+```ini
+[shell]
+path = a:\bin;c:\bin;h:\
+autoexec = c:\autoexec.bat
+
+[assoc]
+.txt = edit
+.c = edit
+.h = edit
+```
+
+| Ключ | Значение |
+|---|---|
+| `shell.path` | каталоги через `;` (DOS-пути). Bare-имя ищет `name.axe` / `name.AXE` |
+| `shell.autoexec` | скрипт после boot; нет ключа — `/sys/AUTOEXEC.BAT` при наличии файла |
+| `assoc.<ext>` | обработчик: builtin `edit` или путь/имя `.AXE`. Enter в `fm` и «голый» файл в шелле |
+
+`AUTOEXEC.BAT` — построчно команды шелла (пустые / `REM` / `;` пропускаются). В recovery не выполняется.
+
+## Safe boot / recovery
+
+```ini
+[boot]
+recovery_after = 3
+; safe = 1
+```
+
+| Ключ | Значение |
+|---|---|
+| `boot.recovery_after` | сколько unclean reset подряд → recovery (по умолчанию 3) |
+| `boot.safe` | `1` — этот boot сразу в recovery |
+
+Также маркер `C:\boot.safe` (`boot recovery` / `boot normal` в шелле). В recovery пропускаются `[modules]` и AUTOEXEC.
+
 ## Что ещё не читается из конфигурации
 
-Секция `[modules]` (`device=`, `probe=`) уже читается. Прочее — по мере появления. См. `docs/04-roadmap.md`.
+Секции `[modules]`, `[shell]`, `[assoc]`, `[boot]` уже читаются. Прочее — по мере появления. См. `docs/04-roadmap.md`.

@@ -25,6 +25,8 @@
 #include <argon/path.h>
 #include <argon/probe.h>
 #include <argon/proc.h>
+#include <argon/recovery.h>
+#include <argon/shell_path.h>
 #include <argon/vfs.h>
 
 #include "esp_heap_caps.h"
@@ -45,6 +47,8 @@ typedef struct {
     const char *help;
     int (*fn)(int argc, char **argv);
 } ag_command_t;
+
+int ag_edit_main(int argc, char **argv);
 
 static char          s_cwd[AG_PATH_MAX] = "/";
 static ag_lineedit_t s_line;
@@ -322,8 +326,25 @@ static int cmd_echo(int argc, char **argv)
 
 static int cmd_boot(int argc, char **argv)
 {
-    (void)argc;
-    (void)argv;
+    if (argc >= 2 && ag_path_icmp(argv[1], "recovery") == 0) {
+        const ag_err_t err = ag_boot_recovery_set_marker(true);
+        if (err != AG_OK) {
+            ag_console_printf("boot recovery: %d\n", (int)err);
+            return 1;
+        }
+        ag_console_puts("next boot will skip modules (marker "
+                        AG_BOOT_SAFE_PATH ")\n");
+        return 0;
+    }
+    if (argc >= 2 && ag_path_icmp(argv[1], "normal") == 0) {
+        const ag_err_t err = ag_boot_recovery_set_marker(false);
+        if (err != AG_OK) {
+            ag_console_printf("boot normal: %d\n", (int)err);
+            return 1;
+        }
+        ag_console_puts("recovery marker cleared; modules load on next boot\n");
+        return 0;
+    }
 
     static const char *const k_stage_names[AG_STAGE_COUNT] = {
         "platform", "memory", "log",     "board",  "console",    "storage",
@@ -346,6 +367,17 @@ static int cmd_boot(int argc, char **argv)
                               (int)r->stage_result[i]);
         }
     }
+
+    ag_console_printf("\nrecovery: %s",
+                      ag_boot_in_recovery() ? "ACTIVE" : "off");
+    if (ag_boot_in_recovery()) {
+        ag_console_printf(" (%s)", ag_boot_recovery_reason());
+    }
+    ag_console_printf(", unclean streak %u, marker %s\n",
+                      ag_boot_recovery_attempts(),
+                      ag_boot_recovery_marker_present() ? "yes" : "no");
+    ag_console_puts("  boot recovery  — set marker for next boot\n");
+    ag_console_puts("  boot normal    — clear marker\n");
     return 0;
 }
 
@@ -407,25 +439,24 @@ static void print_load_error(const char *path, ag_err_t err)
     ag_console_printf("%s: %s\n", path, why);
 }
 
-static int cmd_run(int argc, char **argv)
+static const char *shell_path_env(void)
 {
-    bool detach_only = false;
-    int  first = 1;
+    const ag_cfg_t *cfg = ag_sysconfig();
+    if (cfg == NULL) {
+        return NULL;
+    }
+    return ag_cfg_get(cfg, "shell.path", NULL);
+}
 
+/*
+ * Spawn into the focused user slot.  `path` is the resolved image; argv[0]
+ * should be that path (or the name the user typed — loader uses `path`).
+ */
+static int spawn_in_slot(const char *path, int argc, char **argv,
+                         bool detach_only)
+{
     if (ag_session_is_system()) {
         ag_console_puts("run: use a user slot (Alt+1..4)\n");
-        return 1;
-    }
-
-    if (argc > 1 && ag_path_icmp(argv[1], "/b") == 0) {
-        detach_only = true;
-        first = 2;
-    }
-    if (argc <= first) {
-        ag_console_puts("usage: run [/b] <file> [arguments]\n");
-        ag_console_puts("  starts in the current user slot (or a free one)\n");
-        ag_console_puts("  /b  same, without switching focus to the app\n");
-        ag_console_puts("  Alt+1..4 / fg <slot|pid>; Ctrl+\\ = system shell\n");
         return 1;
     }
 
@@ -438,10 +469,10 @@ static int cmd_run(int argc, char **argv)
 
     ag_pid_t       pid = 0;
     const ag_err_t err = ag_proc_spawn(
-        argv[first], argc - first, &argv[first],
+        path, argc, argv,
         (uint32_t)AG_SPAWN_BACKGROUND | (uint32_t)AG_SPAWN_NO_SESSION, &pid);
     if (err != AG_OK) {
-        print_load_error(argv[first], err);
+        print_load_error(path, err);
         return 1;
     }
 
@@ -475,6 +506,35 @@ static int cmd_run(int argc, char **argv)
         (void)ag_session_focus(slot);
     }
     return 0;
+}
+
+static int cmd_run(int argc, char **argv)
+{
+    bool detach_only = false;
+    int  first = 1;
+
+    if (argc > 1 && ag_path_icmp(argv[1], "/b") == 0) {
+        detach_only = true;
+        first = 2;
+    }
+    if (argc <= first) {
+        ag_console_puts("usage: run [/b] <file> [arguments]\n");
+        ag_console_puts("  starts in the current user slot (or a free one)\n");
+        ag_console_puts("  /b  same, without switching focus to the app\n");
+        ag_console_puts("  Alt+1..4 / fg <slot|pid>; Ctrl+\\ = system shell\n");
+        return 1;
+    }
+
+    char resolved[AG_PATH_MAX];
+    const ag_err_t rerr =
+        ag_shell_resolve_cmd(argv[first], s_cwd, shell_path_env(), resolved,
+                             sizeof(resolved));
+    if (rerr != AG_OK) {
+        print_load_error(argv[first], rerr);
+        return 1;
+    }
+    argv[first] = resolved;
+    return spawn_in_slot(resolved, argc - first, &argv[first], detach_only);
 }
 
 static int cmd_log(int argc, char **argv)
@@ -1453,8 +1513,6 @@ static int cmd_prio(int argc, char **argv)
     return 0;
 }
 
-int ag_edit_main(int argc, char **argv);
-
 static int cmd_edit(int argc, char **argv)
 {
     return ag_edit_main(argc, argv);
@@ -1595,7 +1653,8 @@ static const ag_command_t k_commands[] = {
     {"help", "", "list these commands", cmd_help},
     {"ver", "", "version and hardware", cmd_ver},
     {"mem", "", "memory usage", cmd_mem},
-    {"boot", "", "boot stage report", cmd_boot},
+    {"boot", "[recovery|normal]", "boot report; set/clear recovery marker",
+     cmd_boot},
     {"log", "[-n N|clear]", "system journal", cmd_log},
     {"uptime", "", "time since reset", cmd_uptime},
     {"cls", "", "clear the screen", cmd_cls},
@@ -1764,6 +1823,23 @@ int ag_shell_execute(const char *line)
         }
     }
 
+    char resolved[AG_PATH_MAX];
+    if (!found) {
+        const ag_err_t rerr =
+            ag_shell_resolve_cmd(argv[0], s_cwd, shell_path_env(), resolved,
+                                 sizeof(resolved));
+        if (rerr == AG_OK) {
+            argv[0] = resolved;
+            status = spawn_in_slot(resolved, argc, argv, false);
+            found = true;
+        }
+    }
+
+    if (!found && ag_shell_open_associated(argv[0])) {
+        status = 0;
+        found = true;
+    }
+
     if (redirect >= 0) {
         ag_console_redirect(NULL, NULL);
         ag_vfs_close(redirect);
@@ -1787,6 +1863,109 @@ int ag_shell_execute(const char *line)
 
     ag_log_set_echo(false);
     return status;
+}
+
+bool ag_shell_open_associated(const char *path)
+{
+    if (path == NULL || path[0] == '\0') {
+        return false;
+    }
+
+    char abs[AG_PATH_MAX];
+    if (ag_path_resolve(path, s_cwd, abs, sizeof(abs)) != AG_OK) {
+        return false;
+    }
+
+    const ag_cfg_t *cfg = ag_sysconfig();
+    const char *handler = ag_shell_assoc_lookup(cfg, abs);
+    if (handler == NULL || handler[0] == '\0') {
+        return false;
+    }
+
+    if (ag_path_icmp(handler, "edit") == 0) {
+        char *eargv[2] = {(char *)"edit", abs};
+        (void)ag_edit_main(2, eargv);
+        return true;
+    }
+
+    char prog[AG_PATH_MAX];
+    if (ag_shell_resolve_cmd(handler, s_cwd, shell_path_env(), prog,
+                             sizeof(prog)) != AG_OK) {
+        ag_console_printf("assoc: cannot find handler '%s'\n", handler);
+        return true; /* association existed; failed to run it */
+    }
+
+    char *pargv[2] = {prog, abs};
+    (void)spawn_in_slot(prog, 2, pargv, false);
+    return true;
+}
+
+static void run_autoexec(void)
+{
+    if (ag_boot_in_recovery()) {
+        return;
+    }
+
+    const ag_cfg_t *cfg = ag_sysconfig();
+    const char *configured =
+        (cfg != NULL) ? ag_cfg_get(cfg, "shell.autoexec", NULL) : NULL;
+
+    char path[AG_PATH_MAX];
+    if (configured != NULL && configured[0] != '\0') {
+        if (ag_path_resolve(configured, s_cwd, path, sizeof(path)) != AG_OK) {
+            ag_log(AG_LOG_WARN, "shell", "autoexec: bad path '%s'", configured);
+            return;
+        }
+    } else {
+        strncpy(path, "/sys/AUTOEXEC.BAT", sizeof(path) - 1);
+        path[sizeof(path) - 1] = '\0';
+    }
+
+    ag_stat_t st;
+    if (ag_vfs_stat(path, NULL, &st) != AG_OK || (st.attr & AG_A_DIR) != 0) {
+        return;
+    }
+
+    const ag_handle_t h = ag_vfs_open(path, NULL, AG_O_RDONLY);
+    if (h < 0) {
+        ag_log(AG_LOG_WARN, "shell", "autoexec: open %s failed (%d)", path,
+               (int)h);
+        return;
+    }
+
+    ag_console_printf("AUTOEXEC: %s\n", path);
+
+    char     line[AG_LINE_MAX];
+    size_t   len = 0;
+    char     ch;
+    int32_t  n;
+    while ((n = ag_vfs_read(h, &ch, 1)) == 1) {
+        if (ch == '\r') {
+            continue;
+        }
+        if (ch == '\n') {
+            line[len] = '\0';
+            if (!ag_shell_autoexec_skip_line(line)) {
+                const int st_line = ag_shell_execute(line);
+                if (st_line != 0) {
+                    ag_log(AG_LOG_WARN, "shell", "autoexec: '%s' => %d", line,
+                           st_line);
+                }
+            }
+            len = 0;
+            continue;
+        }
+        if (len + 1 < sizeof(line)) {
+            line[len++] = ch;
+        }
+    }
+    if (len > 0) {
+        line[len] = '\0';
+        if (!ag_shell_autoexec_skip_line(line)) {
+            (void)ag_shell_execute(line);
+        }
+    }
+    ag_vfs_close(h);
 }
 
 static void show_prompt(void)
@@ -1819,6 +1998,18 @@ void ag_shell_run(void)
      * on for the duration of each command so install/load progress is visible.
      */
     ag_log_set_echo(false);
+
+    if (ag_boot_in_recovery()) {
+        ag_console_printf(
+            "\nRECOVERY: modules skipped (%s). Use 'boot normal' then reboot "
+            "when the board is healthy.\n",
+            ag_boot_recovery_reason());
+    }
+
+    /* Streak clears once a prompt is reachable — not when AUTOEXEC finishes. */
+    ag_boot_recovery_shell_ok();
+
+    run_autoexec();
 
     ag_console_puts("\nType 'help' for a list of commands.\n");
     ag_console_puts(

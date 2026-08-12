@@ -27,6 +27,7 @@ set(ARGON_PORTABLE_SRCS
     "${ARGON_ROOT}/components/argon_kernel/src/console/vtout.c"
     "${ARGON_ROOT}/components/argon_kernel/src/console/vtin.c"
     "${ARGON_ROOT}/components/argon_kernel/src/shell/lineedit.c"
+    "${ARGON_ROOT}/components/argon_kernel/src/shell/shell_path.c"
     "${ARGON_ROOT}/components/argon_kernel/src/fs/vfs.c"
     "${ARGON_ROOT}/components/argon_kernel/src/fs/ramfs.c"
     "${ARGON_ROOT}/components/argon_kernel/src/dev/device.c"
@@ -57,6 +58,7 @@ add_executable(argon_tests
     test_vtin.c
     test_cmdline.c
     test_lineedit.c
+    test_shell_path.c
     test_vfs.c
     test_device.c
     test_ioclaim.c

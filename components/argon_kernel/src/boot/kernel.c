@@ -18,6 +18,7 @@
 #include <argon/console.h>
 #include <argon/log.h>
 #include <argon/module.h>
+#include <argon/recovery.h>
 #include <argon/shell.h>
 
 #include "esp_log.h"
@@ -136,6 +137,19 @@ static ag_err_t stage_console(void)
 
 static ag_err_t stage_shell(void) { return AG_OK; }
 
+static ag_err_t stage_modules(void)
+{
+    /*
+     * Recovery is decided here: storage and config are already up (so the
+     * marker and SYSTEM.CFG can be read), but loadable .SYS have not run yet.
+     */
+    ag_boot_recovery_begin();
+    if (ag_boot_in_recovery()) {
+        return AG_OK;
+    }
+    return ag_modules_boot();
+}
+
 /*
  * Stages are added here as they are implemented; see docs/04-roadmap.md.
  * Keeping the unimplemented ones visible makes the boot report honest about
@@ -151,7 +165,7 @@ static const ag_stage_desc_t s_stages[AG_STAGE_COUNT] = {
     [AG_STAGE_CONFIG]     = {"config",     ag_sysconfig_init, false},
     [AG_STAGE_DEVICES]    = {"devices",    ag_devices_init, false},
     [AG_STAGE_MEDIA]      = {"media",      ag_storage_mount_media, false},
-    [AG_STAGE_MODULES]    = {"modules",    ag_modules_boot, false},
+    [AG_STAGE_MODULES]    = {"modules",    stage_modules,  false},
     [AG_STAGE_SUPERVISOR] = {"supervisor", ag_supervisor_init, false},
     [AG_STAGE_SHELL]      = {"shell",      stage_shell,    true},
 };
