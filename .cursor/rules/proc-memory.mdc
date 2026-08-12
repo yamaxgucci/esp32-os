@@ -1,0 +1,34 @@
+---
+description: Process memory — PSRAM heaps vs internal SRAM stacks
+globs: components/argon_kernel/src/proc/**/*.{c,h},sdkconfig.defaults,apps/**/*
+alwaysApply: false
+---
+
+# Process memory (ESP32-S3)
+
+## Two different scarcities
+
+| What | Where | Typical failure |
+|---|---|---|
+| App heap / AXE code+data | PSRAM (arenas, heaps) | `ENOMEM` on load / alloc |
+| FreeRTOS task stack | Internal SRAM first | `no memory for a N byte task stack` |
+
+Megabytes free in PSRAM do **not** mean a 16 KB task stack will succeed.
+
+## Stacks
+
+- Create via `ag_proc_task_create`: internal SRAM, then PSRAM fallback (`CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM`).
+- Uses IDF `prvTaskCreateDynamicPinnedToCoreWithCaps` so ordinary `vTaskDelete` still works.
+- PSRAM stack caveat: must not run while flash cache is disabled (keep flash erase/write off app tasks).
+- Prefer smaller stacks where safe (FM ~8 KB); AMP default remains ~16 KB.
+
+## Heaps (keep both FM + AMP resident)
+
+- FM builtin heap ~256 KB (not 1 MB default).
+- AMP AXE heap ~512 KB when packing both slots.
+- Shrink heaps before blaming the code arena.
+
+## Diagnosis
+
+- Log `proc`: stack failures vs load failures.
+- Shell `mem` / caps: internal largest block vs PSRAM free.
