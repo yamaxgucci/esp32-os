@@ -6,6 +6,9 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 # 1 kHz tick: the supervisor needs millisecond granularity for app watchdogs.
 CONFIG_FREERTOS_HZ=1000
 
+# Allow process/thread stacks to fall back to PSRAM when internal SRAM is tight.
+CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM=y
+
 # The kernel runs from app_main; give it room for the boot sequence.
 # The shell runs on the main task, and so does the built-in file manager, whose
 # deepest paths carry a couple of full paths and a copy buffer on the stack.

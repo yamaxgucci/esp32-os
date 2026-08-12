@@ -391,7 +391,7 @@ static void print_load_error(const char *path, ag_err_t err)
     case AG_ENOTSUP: why = "built for a different processor"; break;
     case AG_EABI:    why = "built for a different version of this system"; break;
     case AG_ENOMEM:
-        why = "not enough memory (often internal SRAM for the 16 KB task stack)";
+        why = "not enough memory (task stack / heap / code arena)";
         break;
     case AG_EBUSY:   why = "too many applications are loaded"; break;
     case AG_ERANGE:  why = "too many arguments"; break;
@@ -1356,8 +1356,7 @@ static int cmd_fm(int argc, char **argv)
     ag_pid_t       pid = 0;
     /*
      * Panels need ~100 KB + viewer/copy headroom — not the 1 MB default heap.
-     * Stack 8 KB (not 16): task stacks are internal SRAM; saving here helps
-     * leave room for AMP's stack when both slots are occupied.
+     * Stack 8 KB is enough for FM; smaller stacks still prefer scarce SRAM.
      */
     const ag_err_t err = ag_proc_spawn_builtin(
         "FM", ag_fm_main, argc, argv,

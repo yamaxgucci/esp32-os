@@ -102,6 +102,16 @@ proc_t *ag_proc_current(void);
 void ag_proc_table_lock(void);
 void ag_proc_table_unlock(void);
 
+/*
+ * Create a process/thread FreeRTOS task.  Tries an internal-SRAM stack first,
+ * then PSRAM when CONFIG_SPIRAM allows it — same self-delete semantics as
+ * xTaskCreatePinnedToCore (use plain vTaskDelete).
+ */
+BaseType_t ag_proc_task_create(TaskFunction_t fn, const char *name,
+                               uint32_t stack_bytes, void *arg,
+                               UBaseType_t prio, BaseType_t core,
+                               TaskHandle_t *out);
+
 /* ---------------------------------------------------------------------- */
 /* Threads (threads.c)                                                    */
 /* ---------------------------------------------------------------------- */

@@ -28,6 +28,10 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "multi_heap.h"
+#include "sdkconfig.h"
+#if CONFIG_SPIRAM
+#include "esp_private/freertos_idf_additions_priv.h"
+#endif
 
 #include "dev/io.h"
 #include "fs/storage.h"
@@ -491,6 +495,41 @@ static void crash_record(proc_t *p, const char *reason)
 /* Starting a process                                                     */
 /* ---------------------------------------------------------------------- */
 
+BaseType_t ag_proc_task_create(TaskFunction_t fn, const char *name,
+                               uint32_t stack_bytes, void *arg,
+                               UBaseType_t prio, BaseType_t core,
+                               TaskHandle_t *out)
+{
+#if CONFIG_SPIRAM && CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM
+    /*
+     * prvTaskCreateDynamic* (not xTaskCreate*WithCaps): stack can live in
+     * PSRAM, but the task still tears down with ordinary vTaskDelete — which
+     * is what every process/thread exit path already uses.
+     *
+     * Caveat (ESP-IDF): a PSRAM stack must not run while the flash cache is
+     * disabled.  Argon apps talk to HostFS/SD; keep flash erase/write off the
+     * app task if that ever changes.
+     */
+    BaseType_t ok = prvTaskCreateDynamicPinnedToCoreWithCaps(
+        fn, name, stack_bytes, arg, prio, core,
+        MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT, out);
+    if (ok == pdPASS) {
+        return ok;
+    }
+    ok = prvTaskCreateDynamicPinnedToCoreWithCaps(
+        fn, name, stack_bytes, arg, prio, core,
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT, out);
+    if (ok == pdPASS) {
+        ag_log(AG_LOG_INFO, "proc",
+               "%s: task stack in PSRAM (%u bytes; internal SRAM was short)",
+               name != NULL ? name : "?", (unsigned)stack_bytes);
+    }
+    return ok;
+#else
+    return xTaskCreatePinnedToCore(fn, name, stack_bytes, arg, prio, out, core);
+#endif
+}
+
 static uint32_t clamp_stack_bytes(uint32_t want)
 {
     if (want == 0) {
@@ -785,17 +824,16 @@ static ag_err_t spawn_common(proc_t *p, uint32_t flags, ag_pid_t *out_pid)
     const UBaseType_t prio = freertos_prio_for(p->sched_class);
 
     const BaseType_t created =
-        xTaskCreatePinnedToCore(proc_task, p->name, p->stack_bytes, p, prio,
-                                NULL, core);
+        ag_proc_task_create(proc_task, p->name, p->stack_bytes, p, prio, core,
+                            NULL);
     if (created != pdPASS) {
         /*
-         * FreeRTOS task stacks come from internal SRAM, not PSRAM heaps and
-         * not the AXE code arena.  FM + shell + Wi‑Fi/etc. can leave no 16 KB
-         * contiguous block even when megabytes of PSRAM are free.
+         * Tried internal SRAM, then PSRAM (when enabled).  Failure here means
+         * both are exhausted or the TCB (always internal) could not be taken.
          */
         ag_log(AG_LOG_ERROR, "proc",
-               "%s: no internal SRAM for a %u byte task stack "
-               "(not PSRAM / not the code arena)",
+               "%s: no memory for a %u byte task stack "
+               "(internal SRAM and PSRAM both failed)",
                p->name, (unsigned)p->stack_bytes);
         if (s_foreground == p->pid) {
             s_foreground = p->prev_foreground;
