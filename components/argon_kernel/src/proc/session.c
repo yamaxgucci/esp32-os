@@ -159,6 +159,9 @@ void ag_session_unbind(ag_pid_t pid)
     if (slot < 0) {
         return;
     }
+    ag_log(AG_LOG_INFO, "session", "unbind pid %u from slot %d (was %s)",
+           (unsigned)pid, ag_session_display_number(slot),
+           s_slots[slot].name[0] ? s_slots[slot].name : "?");
     s_slots[slot].pid = AG_PID_KERNEL;
     s_slots[slot].name[0] = '\0';
     if (s_last_user == pid) {
@@ -182,6 +185,9 @@ static void notify_focus(ag_pid_t prev_pid, ag_pid_t next_pid)
 
 static void enter_shell_view(int slot)
 {
+    ag_log(AG_LOG_INFO, "session", "enter_shell_view slot %d (inject QUIT)",
+           ag_session_display_number(slot));
+
     if (ag_display_acquired()) {
         ag_display_force_release();
     }
