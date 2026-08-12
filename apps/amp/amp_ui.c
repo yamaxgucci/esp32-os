@@ -13,6 +13,8 @@
 #define COL_BAR    0x0000E068u
 #define COL_THUMB  0x00E8E8F0u
 #define COL_SEL    0x0030A060u
+#define COL_ICON   0x00101820u
+#define COL_CURSOR 0x00E8A54Bu
 
 static void blit_panel(const amp_skin_panel_t *pan)
 {
@@ -62,6 +64,130 @@ static void ctrl_screen_rect(const amp_player_t *p, amp_ctrl_t c,
     out->y = (int16_t)(pos->y + p->skin.ctrl[c].y);
     out->w = p->skin.ctrl[c].w;
     out->h = p->skin.ctrl[c].h;
+}
+
+static void icon_tri(int cx, int cy, int dir, uint32_t col)
+{
+    /* dir: -1 left, +1 right */
+    ag_point_t pts[3];
+    int s = 6;
+    if (dir >= 0) {
+        pts[0].x = (int16_t)(cx - s / 2);
+        pts[0].y = (int16_t)(cy - s);
+        pts[1].x = (int16_t)(cx + s);
+        pts[1].y = (int16_t)cy;
+        pts[2].x = (int16_t)(cx - s / 2);
+        pts[2].y = (int16_t)(cy + s);
+    } else {
+        pts[0].x = (int16_t)(cx + s / 2);
+        pts[0].y = (int16_t)(cy - s);
+        pts[1].x = (int16_t)(cx - s);
+        pts[1].y = (int16_t)cy;
+        pts[2].x = (int16_t)(cx + s / 2);
+        pts[2].y = (int16_t)(cy + s);
+    }
+    ag_gfx_fill_convex(pts, 3, col);
+}
+
+static void icon_bar(int x, int y, int w, int h, uint32_t col)
+{
+    ag_gfx_fill_rect((int16_t)x, (int16_t)y, (uint16_t)w, (uint16_t)h, col);
+}
+
+static void draw_btn_icon(amp_player_t *p, amp_ctrl_t c)
+{
+    amp_rect_t r;
+    int cx, cy;
+    ctrl_screen_rect(p, c, &r);
+    cx = r.x + (int)r.w / 2;
+    cy = r.y + (int)r.h / 2;
+    switch (c) {
+    case AMP_CTRL_PREV:
+        icon_bar(cx - 7, cy - 5, 2, 10, COL_ICON);
+        icon_tri(cx + 2, cy, -1, COL_ICON);
+        break;
+    case AMP_CTRL_PLAY:
+        icon_tri(cx - 1, cy, 1, COL_ICON);
+        break;
+    case AMP_CTRL_PAUSE:
+        icon_bar(cx - 5, cy - 5, 3, 10, COL_ICON);
+        icon_bar(cx + 2, cy - 5, 3, 10, COL_ICON);
+        break;
+    case AMP_CTRL_STOP:
+        icon_bar(cx - 5, cy - 5, 10, 10, COL_ICON);
+        break;
+    case AMP_CTRL_NEXT:
+        icon_tri(cx - 2, cy, 1, COL_ICON);
+        icon_bar(cx + 5, cy - 5, 2, 10, COL_ICON);
+        break;
+    case AMP_CTRL_EJECT: {
+        ag_point_t pts[3];
+        pts[0].x = (int16_t)(cx - 6);
+        pts[0].y = (int16_t)(cy + 2);
+        pts[1].x = (int16_t)(cx + 6);
+        pts[1].y = (int16_t)(cy + 2);
+        pts[2].x = (int16_t)cx;
+        pts[2].y = (int16_t)(cy - 6);
+        ag_gfx_fill_convex(pts, 3, COL_ICON);
+        icon_bar(cx - 6, cy + 4, 12, 2, COL_ICON);
+        break;
+    }
+    case AMP_CTRL_EQ_TOGGLE:
+        ag_gfx_text((int16_t)(r.x + 2), (int16_t)(r.y + (int)r.h / 2 - 6), "EQ",
+                    COL_ICON, 0);
+        break;
+    case AMP_CTRL_PL_TOGGLE:
+        ag_gfx_text((int16_t)(r.x + 2), (int16_t)(r.y + (int)r.h / 2 - 6), "PL",
+                    COL_ICON, 0);
+        break;
+    case AMP_CTRL_REPEAT:
+        ag_gfx_text((int16_t)(r.x + 1), (int16_t)(r.y + (int)r.h / 2 - 6),
+                    p->repeat ? "R*" : "RPT", COL_ICON, 0);
+        break;
+    case AMP_CTRL_SHUFFLE:
+        ag_gfx_text((int16_t)(r.x + 1), (int16_t)(r.y + (int)r.h / 2 - 6),
+                    p->shuffle ? "S*" : "SHUF", COL_ICON, 0);
+        break;
+    default:
+        break;
+    }
+}
+
+static void draw_transport_icons(amp_player_t *p)
+{
+    draw_btn_icon(p, AMP_CTRL_PREV);
+    draw_btn_icon(p, AMP_CTRL_PLAY);
+    draw_btn_icon(p, AMP_CTRL_PAUSE);
+    draw_btn_icon(p, AMP_CTRL_STOP);
+    draw_btn_icon(p, AMP_CTRL_NEXT);
+    draw_btn_icon(p, AMP_CTRL_EJECT);
+    draw_btn_icon(p, AMP_CTRL_EQ_TOGGLE);
+    draw_btn_icon(p, AMP_CTRL_PL_TOGGLE);
+    draw_btn_icon(p, AMP_CTRL_REPEAT);
+    draw_btn_icon(p, AMP_CTRL_SHUFFLE);
+}
+
+static void draw_cursor(const amp_player_t *p)
+{
+    int x, y;
+    if (!p->mouse_live || p->mx < 0 || p->my < 0) {
+        return;
+    }
+    x = p->mx;
+    y = p->my;
+    /* Arrow cursor */
+    {
+        ag_point_t pts[3];
+        pts[0].x = (int16_t)x;
+        pts[0].y = (int16_t)y;
+        pts[1].x = (int16_t)(x + 10);
+        pts[1].y = (int16_t)(y + 4);
+        pts[2].x = (int16_t)(x + 4);
+        pts[2].y = (int16_t)(y + 10);
+        ag_gfx_fill_convex(pts, 3, COL_CURSOR);
+    }
+    ag_gfx_line((int16_t)x, (int16_t)y, (int16_t)(x + 12), (int16_t)(y + 12),
+                COL_ICON);
 }
 
 static void draw_overlays_main(amp_player_t *p)
@@ -129,8 +255,12 @@ static void draw_overlays_main(amp_player_t *p)
     draw_slider_thumb(&r, permille, 0);
     ctrl_screen_rect(p, AMP_CTRL_VOL, &r);
     draw_slider_thumb(&r, p->volume * 10, 0);
+    ag_gfx_text((int16_t)(r.x - 28), (int16_t)(r.y - 2), "VOL", COL_MUTED, 0);
     ctrl_screen_rect(p, AMP_CTRL_BAL, &r);
     draw_slider_thumb(&r, (p->balance + 100) * 5, 0);
+    ag_gfx_text((int16_t)(r.x - 28), (int16_t)(r.y - 2), "BAL", COL_MUTED, 0);
+
+    draw_transport_icons(p);
 }
 
 static void draw_overlays_eq(amp_player_t *p)
@@ -162,10 +292,16 @@ static void draw_overlays_eq(amp_player_t *p)
             }
         }
     }
-    if (!p->eq.enabled) {
+    {
         amp_rect_t r;
         ctrl_screen_rect(p, AMP_CTRL_EQ_ON, &r);
-        ag_gfx_stroke_rect(r.x, r.y, r.w, r.h, 0x00C04040u);
+        ag_gfx_text((int16_t)(r.x + 2), (int16_t)(r.y + 1),
+                    p->eq.enabled ? "ON" : "OFF", COL_ICON, 0);
+        if (!p->eq.enabled) {
+            ag_gfx_stroke_rect(r.x, r.y, r.w, r.h, 0x00C04040u);
+        }
+        ctrl_screen_rect(p, AMP_CTRL_EQ_AUTO, &r);
+        ag_gfx_text((int16_t)(r.x + 2), (int16_t)(r.y + 1), "RST", COL_ICON, 0);
     }
 }
 
@@ -253,6 +389,7 @@ void amp_ui_draw(amp_player_t *p)
     if (p->status[0]) {
         ag_gfx_text(8, (int16_t)(p->fb_h - 18), p->status, COL_MUTED, 0);
     }
+    draw_cursor(p);
     ag_gfx_flush(0, 0, 0, 0);
 }
 
@@ -304,6 +441,8 @@ void amp_ui_pointer(amp_player_t *p, const ag_event_t *ev)
     y = (int)ev->ptr.y;
     p->mx = x;
     p->my = y;
+    p->mouse_live = 1;
+    p->dirty = 1;
 
     if (ev->type == AG_EV_POINTER_DOWN) {
         amp_panel_t pan = AMP_PANEL_MAIN;

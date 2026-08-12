@@ -38,9 +38,13 @@ typedef struct amp_player {
     ag_handle_t    mouse_fd;
     char           audio_path[AG_PATH_MAX];
     uint32_t       rate;
-    /* drag */
+    /* drag / pointer */
     amp_ctrl_t     drag;
     int            mx, my, mbtn;
+    int            mouse_live; /* 1 after first POINTER event */
+    /* Deferred open so Space/Play can paint "loading" before HostFS blocks. */
+    int            want_open;
+    char           pending_path[AG_PATH_MAX];
 } amp_player_t;
 
 void amp_cmd_play_pause(amp_player_t *p);
