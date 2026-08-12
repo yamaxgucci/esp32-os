@@ -475,6 +475,7 @@ int ag_main(int argc, char **argv)
             continue;
         }
         if (arg_eq(argv[i], "pcmnull") || arg_eq(argv[i], "pcmvirt") ||
+            arg_eq(argv[i], "pcmmix") || arg_eq(argv[i], "mix") ||
             arg_eq(argv[i], "net") || arg_eq(argv[i], "tcp") ||
             arg_eq(argv[i], "audio") || arg_eq(argv[i], "i2s") ||
             arg_eq(argv[i], "pcm0")) {

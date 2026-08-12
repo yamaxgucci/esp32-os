@@ -30,7 +30,7 @@ extern "C" {
  * cannot be opened because the pool is full is a clearer failure than a file
  * that cannot be opened because a device took the last slot.
  */
-#define AG_DEVFS_MAX_OPEN 8
+#define AG_DEVFS_MAX_OPEN 12
 #define AG_DEVFS_MAX_DIRS 4
 
 /* Pass to ag_vfs_mount with a NULL context: the registry is the one there is. */
@@ -45,6 +45,9 @@ void ag_devfs_reset(void);
  * the two things a file has no room for.
  */
 ag_device_t *ag_devfs_device_of(ag_handle_t h);
+
+/* Per-open driver cookie from open_session, or NULL for classic devices. */
+void *ag_devfs_session_of(ag_handle_t h);
 
 #ifdef __cplusplus
 }

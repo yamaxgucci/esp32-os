@@ -49,6 +49,7 @@ static inline void ag_audio_out_copy(char *out, size_t outlen, const char *src)
 /*
  * Normalize CLI/cfg value into out[].
  *   mock/nul/empty → /dev/pcmnull
+ *   mix/pcmmix     → /dev/pcmmix (multi-app sum → pcmvirt|pcm0|pcmnull)
  *   net/tcp        → /dev/pcmvirt
  *   audio/i2s      → /dev/pcm0
  * Returns 1 if result is a PCM device path, 0 if caller should treat as WAV file.
@@ -64,6 +65,10 @@ static inline int ag_audio_out_resolve(const char *in, char *out, size_t outlen)
         ag_audio_out_ieq(in, "nul") || ag_audio_out_ieq(in, "null") ||
         ag_audio_out_ieq(in, "pcmnull")) {
         ag_audio_out_copy(out, outlen, "/dev/pcmnull");
+        return 1;
+    }
+    if (ag_audio_out_ieq(in, "mix") || ag_audio_out_ieq(in, "pcmmix")) {
+        ag_audio_out_copy(out, outlen, "/dev/pcmmix");
         return 1;
     }
     if (ag_audio_out_ieq(in, "net") || ag_audio_out_ieq(in, "tcp") ||

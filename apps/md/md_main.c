@@ -479,6 +479,8 @@ int ag_main(int argc, char **argv)
         } else if (arg_eq(argv[i], "net") || arg_eq(argv[i], "tcp") ||
                    arg_eq(argv[i], "pcmvirt")) {
             sound_path = "pcmvirt";
+        } else if (arg_eq(argv[i], "mix") || arg_eq(argv[i], "pcmmix")) {
+            sound_path = "pcmmix";
         } else if (arg_eq(argv[i], "audio") || arg_eq(argv[i], "i2s") ||
                    arg_eq(argv[i], "pcm0")) {
             sound_path = "pcm0";

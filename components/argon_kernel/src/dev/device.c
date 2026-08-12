@@ -318,6 +318,11 @@ static ag_err_t usable(const ag_device_t *dev)
 
 ag_err_t ag_dev_open(ag_device_t *dev, uint32_t flags)
 {
+    return ag_dev_open2(dev, flags, NULL);
+}
+
+ag_err_t ag_dev_open2(ag_device_t *dev, uint32_t flags, void **session_out)
+{
     lock();
     ag_err_t err = usable(dev);
     if (err != AG_OK) {
@@ -334,12 +339,26 @@ ag_err_t ag_dev_open(ag_device_t *dev, uint32_t flags)
         return -AG_EROFS;
     }
 
-    if (dev->ops->open != NULL) {
+    void *session = NULL;
+    if (dev->ops->open_session != NULL) {
+        if (session_out == NULL) {
+            unlock();
+            return -AG_EINVAL;
+        }
+        err = dev->ops->open_session(dev, flags, &session);
+        if (err != AG_OK) {
+            unlock();
+            return err;
+        }
+    } else if (dev->ops->open != NULL) {
         err = dev->ops->open(dev, flags);
         if (err != AG_OK) {
             unlock();
             return err;
         }
+    }
+    if (session_out != NULL) {
+        *session_out = session;
     }
     dev->open_count++;
     unlock();
@@ -348,6 +367,11 @@ ag_err_t ag_dev_open(ag_device_t *dev, uint32_t flags)
 
 ag_err_t ag_dev_close(ag_device_t *dev)
 {
+    return ag_dev_close2(dev, NULL);
+}
+
+ag_err_t ag_dev_close2(ag_device_t *dev, void *session)
+{
     lock();
     if (dev == NULL || !dev->used || dev->open_count == 0) {
         unlock();
@@ -355,8 +379,12 @@ ag_err_t ag_dev_close(ag_device_t *dev)
     }
 
     ag_err_t err = AG_OK;
-    if (!dev->revoked && dev->ops != NULL && dev->ops->close != NULL) {
-        err = dev->ops->close(dev);
+    if (!dev->revoked && dev->ops != NULL) {
+        if (session != NULL && dev->ops->close_session != NULL) {
+            err = dev->ops->close_session(dev, session);
+        } else if (dev->ops->close != NULL) {
+            err = dev->ops->close(dev);
+        }
     }
 
     dev->open_count--;
@@ -370,28 +398,43 @@ ag_err_t ag_dev_close(ag_device_t *dev)
 
 int32_t ag_dev_read(ag_device_t *dev, void *buf, size_t len, uint64_t off)
 {
+    return ag_dev_read2(dev, NULL, buf, len, off);
+}
+
+int32_t ag_dev_read2(ag_device_t *dev, void *session, void *buf, size_t len,
+                     uint64_t off)
+{
     lock();
     ag_err_t err = usable(dev);
     if (err != AG_OK) {
         unlock();
         return err;
     }
-    if (dev->ops->read == NULL) {
-        unlock();
-        return -AG_ENOTSUP;
-    }
     if (len == 0) {
         unlock();
         return 0;
     }
-
-    const int32_t n = dev->ops->read(dev, buf, len, off);
+    int32_t n;
+    if (session != NULL && dev->ops->read_session != NULL) {
+        n = dev->ops->read_session(dev, session, buf, len, off);
+    } else if (dev->ops->read != NULL) {
+        n = dev->ops->read(dev, buf, len, off);
+    } else {
+        unlock();
+        return -AG_ENOTSUP;
+    }
     unlock();
     return n;
 }
 
 int32_t ag_dev_write(ag_device_t *dev, const void *buf, size_t len,
                      uint64_t off)
+{
+    return ag_dev_write2(dev, NULL, buf, len, off);
+}
+
+int32_t ag_dev_write2(ag_device_t *dev, void *session, const void *buf,
+                      size_t len, uint64_t off)
 {
     lock();
     ag_err_t err = usable(dev);
@@ -403,21 +446,30 @@ int32_t ag_dev_write(ag_device_t *dev, const void *buf, size_t len,
         unlock();
         return -AG_EROFS;
     }
-    if (dev->ops->write == NULL) {
-        unlock();
-        return -AG_ENOTSUP;
-    }
     if (len == 0) {
         unlock();
         return 0;
     }
-
-    const int32_t n = dev->ops->write(dev, buf, len, off);
+    int32_t n;
+    if (session != NULL && dev->ops->write_session != NULL) {
+        n = dev->ops->write_session(dev, session, buf, len, off);
+    } else if (dev->ops->write != NULL) {
+        n = dev->ops->write(dev, buf, len, off);
+    } else {
+        unlock();
+        return -AG_ENOTSUP;
+    }
     unlock();
     return n;
 }
 
 ag_err_t ag_dev_ioctl(ag_device_t *dev, uint32_t cmd, void *arg, size_t arglen)
+{
+    return ag_dev_ioctl2(dev, NULL, cmd, arg, arglen);
+}
+
+ag_err_t ag_dev_ioctl2(ag_device_t *dev, void *session, uint32_t cmd, void *arg,
+                       size_t arglen)
 {
     lock();
     ag_err_t err = usable(dev);
@@ -440,11 +492,13 @@ ag_err_t ag_dev_ioctl(ag_device_t *dev, uint32_t cmd, void *arg, size_t arglen)
         return AG_OK;
     }
 
-    if (dev->ops->ioctl == NULL) {
-        unlock();
-        return -AG_ENOTSUP;
+    if (session != NULL && dev->ops->ioctl_session != NULL) {
+        err = dev->ops->ioctl_session(dev, session, cmd, arg, arglen);
+    } else if (dev->ops->ioctl != NULL) {
+        err = dev->ops->ioctl(dev, cmd, arg, arglen);
+    } else {
+        err = -AG_ENOTSUP;
     }
-    err = dev->ops->ioctl(dev, cmd, arg, arglen);
     unlock();
     return err;
 }

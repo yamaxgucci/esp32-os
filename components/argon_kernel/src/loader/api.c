@@ -665,7 +665,7 @@ static ag_err_t api_dev_ioctl(ag_handle_t h, uint32_t cmd, void *arg,
     if (dev == NULL) {
         return -AG_EBADF;
     }
-    return ag_dev_ioctl(dev, cmd, arg, arglen);
+    return ag_dev_ioctl2(dev, ag_devfs_session_of(h), cmd, arg, arglen);
 }
 
 static const void *api_dev_ops(ag_handle_t h)

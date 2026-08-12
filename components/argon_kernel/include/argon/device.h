@@ -149,6 +149,20 @@ int32_t  ag_dev_write(ag_device_t *dev, const void *buf, size_t len,
 ag_err_t ag_dev_ioctl(ag_device_t *dev, uint32_t cmd, void *arg, size_t arglen);
 uint64_t ag_dev_size(ag_device_t *dev);
 
+/*
+ * Session-aware open used by /dev.  When the driver supplies open_session,
+ * *session_out receives the cookie for later read/write/ioctl/close2 calls.
+ * Drivers without session ops leave *session_out NULL and use the classic path.
+ */
+ag_err_t ag_dev_open2(ag_device_t *dev, uint32_t flags, void **session_out);
+ag_err_t ag_dev_close2(ag_device_t *dev, void *session);
+int32_t  ag_dev_read2(ag_device_t *dev, void *session, void *buf, size_t len,
+                      uint64_t off);
+int32_t  ag_dev_write2(ag_device_t *dev, void *session, const void *buf,
+                       size_t len, uint64_t off);
+ag_err_t ag_dev_ioctl2(ag_device_t *dev, void *session, uint32_t cmd, void *arg,
+                       size_t arglen);
+
 /* "char", "storage", "display" - for `dev` and for the journal. */
 const char *ag_dev_class_name(ag_dev_class_t cls);
 

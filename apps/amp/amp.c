@@ -208,10 +208,12 @@ static void pump_mouse(void)
 static int parse_args(int argc, char **argv)
 {
     int i;
-    const char *audio = "pcmvirt";
+    const char *audio = "pcmmix";
     (void)ag_audio_out_resolve(audio, s_p.audio_path, sizeof(s_p.audio_path));
     for (i = 1; i < argc; i++) {
         if (ag_audio_out_ieq(argv[i], "pcmvirt") ||
+            ag_audio_out_ieq(argv[i], "pcmmix") ||
+            ag_audio_out_ieq(argv[i], "mix") ||
             ag_audio_out_ieq(argv[i], "pcmnull") ||
             ag_audio_out_ieq(argv[i], "audio") ||
             ag_audio_out_ieq(argv[i], "mock") ||

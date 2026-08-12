@@ -82,7 +82,8 @@ drv install t:\pcmvirt.sys
 `dev` показывает устройства; `run` на `.SYS` отказывает.
 
 Пример audio: [`apps/pcmvirt`](../../apps/pcmvirt) публикует `/dev/pcmvirt`
-(TCP WAV → `tools/pcmplay.py`). Ядро по умолчанию даёт только `/dev/pcmnull`.
+(TCP WAV → `tools/pcmplay.py`). Ядро по умолчанию даёт `/dev/pcmnull` и
+`/dev/pcmmix` (multi-open, sample-wise sum → `pcmvirt`|`pcm0`|`pcmnull`).
 
 ## Ограничения
 

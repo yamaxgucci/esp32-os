@@ -491,6 +491,7 @@ static int parse_sink_arg(const char *arg)
         return 0;
     }
     if (str_ieq(arg, "net") || str_ieq(arg, "tcp") || str_ieq(arg, "pcmvirt") ||
+        str_ieq(arg, "mix") || str_ieq(arg, "pcmmix") ||
         str_ieq(arg, "audio") || str_ieq(arg, "i2s") || str_ieq(arg, "pcm0") ||
         str_ieq(arg, "mock") || str_ieq(arg, "mute") || str_ieq(arg, "pcmnull") ||
         ((arg[0] == 'n' || arg[0] == 'N') && (arg[1] == 'e' || arg[1] == 'E') &&
@@ -1438,7 +1439,7 @@ int ag_main(int argc, char **argv)
 
     for (i = 1; i < argc; i++) {
         if (parse_sink_arg(argv[i]) != 0) {
-            ag_printf("dx7: unknown arg '%s' (pcmvirt|pcmnull|audio|mock|"
+            ag_printf("dx7: unknown arg '%s' (pcmmix|pcmvirt|pcmnull|audio|mock|"
                       "nofx|fx0|fx1|midivirt|nomidi|.syx|.mid)\n",
                       argv[i]);
         }

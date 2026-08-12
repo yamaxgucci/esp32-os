@@ -1,8 +1,8 @@
 /*
- * ArgonOS - built-in mute PCM device (/dev/pcmnull).
+ * ArgonOS - built-in mute PCM (/dev/pcmnull) and mixer (/dev/pcmmix).
  *
  * Real output (virt TCP, I2S, …) is published by loadable .SYS drivers.
- * api->audio is a convenience alias for this null sink.
+ * api->audio is a convenience alias for the null sink.
  *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
  */
@@ -232,5 +232,11 @@ ag_err_t ag_audio_init(void)
     }
     (void)apply_fmt(NULL);
     ag_log(AG_LOG_INFO, TAG, "pcmnull ready (mute; load .SYS for virt/I2S)");
+    {
+        const ag_err_t mix_err = ag_pcmmix_init();
+        if (mix_err != AG_OK) {
+            return mix_err;
+        }
+    }
     return AG_OK;
 }
