@@ -51,24 +51,37 @@ shows but does not track the host mouse.
 
 `pcmvirt` / `pcmnull` / `audio`, optional `file.mp3` or directory to scan.
 
+## Open a file
+
+Put `.mp3` under the HostFS share (`build\sd_card\`):
+
+- `amp\song.mp3`
+- `music\song.mp3`
+- or directly in the share root
+
+Then in AMP: **Eject** button, or keys **A** / **O** → picker → **Enter** (or
+double-click a playlist row). **Space** / Play uses the selected playlist entry;
+if the list is empty, Play opens the picker.
+
 ## Keyboard
 
 | Key | Action |
 |-----|--------|
 | Tab / Shift+Tab | Focus Main → EQ → Playlist (QVGA: visible panel) |
-| Space | Play / pause |
+| Space | Play / pause (opens picker if no tracks) |
+| A / O / Eject | Rescan `H:\amp`, `H:\music`, `H:\` and open picker |
+| Enter | Play selection (or confirm picker) |
 | V | Stop |
 | B / N | Next |
 | Z / P | Previous (P = preamp select when EQ focused) |
 | Left / Right | Seek ±5s |
-| Up / Down | Volume (playlist/EQ focus: list / band gain) |
+| Up / Down | Volume (playlist/EQ/picker: list) |
 | , / . | Balance |
 | R / S | Repeat / shuffle |
-| A | Add `H:\amp`, `H:\music`, `H:\` |
 | L / W | Load / save `H:\amp\playlist.m3u` |
 | E / Q | EQ on/off / reset |
 | 0–9 / \` | Select EQ band / preamp |
-| Esc | Quit |
+| Esc | Close picker / quit |
 
 ## Skins
 

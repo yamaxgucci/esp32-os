@@ -79,6 +79,9 @@ int amp_pl_add_dir(amp_playlist_t *pl, const char *dir)
         if (e.name[0] == '.') {
             continue;
         }
+        if ((e.st.attr & AG_A_DIR) != 0) {
+            continue;
+        }
         if (!ends_with_mp3(e.name)) {
             continue;
         }
