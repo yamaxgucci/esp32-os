@@ -50,21 +50,30 @@ applications reach the hardware directly - pins, interrupts, I2C, SPI, UART, PWM
 - with one rule: you may not take what something else is using, and everything
 you took comes back when your process ends.
 
-What is missing is the hardware half: no display driver, no USB keyboard, no
-loadable `.SYS` drivers, no networking. An application's *code* is also still
-bounded by the 64 KB executable arena - its data and constants are not, they live
-in PSRAM and run to megabytes.
+On the machine itself you can write programs in **Argon CC** — a small C-like
+language with its own compiler (`CC.AXE`). It turns source into native
+Xtensa `.AXE` applications or loadable `.SYS` drivers without a host toolchain:
+edit on the board (or over HostFS), compile, `run` / `drv load`. Details and
+the language subset are in [apps/cc/README.md](apps/cc/README.md).
+
+What is still thin on real hardware is the panel/keyboard side; in QEMU soft
+gfx, HostFS, OpenEth, and loadable `.SYS` modules already work. An
+application's *code* that must live in the IRAM arena is size-capped; its data
+and constants are not — they live in PSRAM and can run to megabytes. Larger
+code can use flash XIP.
 
 Start with **[docs/05-status.md](docs/05-status.md)**: what works, what does not,
 how to build and verify, and the traps already found. Then
 [docs/00-architecture.md](docs/00-architecture.md) for why the design is what it
 is, and [docs/04-roadmap.md](docs/04-roadmap.md) for what comes next.
 
-Writing an application? **[docs/sdk/01-getting-started.md](docs/sdk/01-getting-started.md)**
+Writing an application? Host-side SDK path:
+**[docs/sdk/01-getting-started.md](docs/sdk/01-getting-started.md)**
 goes from an empty file to a running program; the rest of the contract is in
 [02-api-reference.md](docs/sdk/02-api-reference.md),
 [03-application-anatomy.md](docs/sdk/03-application-anatomy.md) and
-[04-axe-format.md](docs/sdk/04-axe-format.md). Using the machine rather than
+[04-axe-format.md](docs/sdk/04-axe-format.md).
+On the OS itself, use Argon CC as above. Using the machine rather than
 programming it: [docs/user/01-shell.md](docs/user/01-shell.md),
 [docs/user/02-board-setup.md](docs/user/02-board-setup.md), and
 [docs/user/03-host-share.md](docs/user/03-host-share.md) (QEMU folder sync).
@@ -106,6 +115,8 @@ file.
 * **Graphics** are opt-in: text by default, an application can take the
   display and draw, exactly like a DOS video mode switch.
 * **Drivers** are either linked in or loaded from `.SYS` modules at runtime.
+* **Argon CC** is an on-device compiler for a C subset: build `.AXE` apps and
+  `.SYS` drivers inside the OS (`CC.AXE`), no host GCC required for that path.
 
 ## Target hardware
 
