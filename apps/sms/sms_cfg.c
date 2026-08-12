@@ -32,7 +32,8 @@ void sms_cfg_set_defaults(sms_cfg_t *cfg)
     cfg->key[1][SMS_ACT_B2] = AG_KEY_K;
     cfg->key[1][SMS_ACT_PAUSE] = AG_KEY_P;
     cfg->key[1][SMS_ACT_QUIT] = AG_KEY_Q;
-    cfg->fullscreen = 0;
+    /* Match shipped sms.cfg: stretch unless a file explicitly sets 0. */
+    cfg->fullscreen = 1;
 }
 
 static int truthy(const char *v)
@@ -267,6 +268,7 @@ int sms_cfg_load(sms_cfg_t *cfg, const char *rom_path, char *loaded_path,
         beside[0] != '\0' ? beside : NULL,
         "sms.cfg",
         "h:\\sms.cfg",
+        "/host/sms.cfg",
         "a:\\sms.cfg",
         NULL,
     };
