@@ -62,6 +62,8 @@ static int s_use_live_pad = 1;
 static int s_run_z80_cpu = 1;   /* 0: advance zclk only, no sms_z80_execute */
 static int s_run_sound = 1;     /* 0: skip sample mix (still accepts reg writes) */
 static int s_profile_frames = 0; /* print per-frame m68k/z80/vdp split */
+static int s_quit;
+static ag_gfxinfo_t s_gi;
 
 /* Last run_frame phase times (µs), filled when s_profile_frames > 0. */
 static uint32_t s_prof_m68k_us;
@@ -241,8 +243,52 @@ static unsigned char *load_rom_file(const char *path, size_t *size_out)
     return buf;
 }
 
+static void bind_vdp_to_fb(const ag_gfxinfo_t *info)
+{
+    s_ox = ((int)info->width > MD_WIDTH) ? ((int)info->width - MD_WIDTH) / 2 : 0;
+    s_oy = ((int)info->height > MD_MAX_LINES)
+               ? ((int)info->height - MD_MAX_LINES) / 2
+               : 0;
+    unsigned short *const origin =
+        (unsigned short *)((uint8_t *)info->fb + (size_t)s_oy * info->stride +
+                           (size_t)s_ox * sizeof(uint16_t));
+    gwenesis_vdp_set_buffer(origin);
+    gwenesis_vdp_set_buffer_stride((int)(info->stride / sizeof(uint16_t)));
+}
+
+static int handle_session_ev(const ag_event_t *ev)
+{
+    if (ev->type == AG_EV_FOCUS_GAINED) {
+        if (ag_gfx_acquire(&s_gi) == AG_OK) {
+            bind_vdp_to_fb(&s_gi);
+        }
+        return 1;
+    }
+    if (ev->type == AG_EV_FOCUS_LOST) {
+        return 1;
+    }
+    if (ev->type == AG_EV_QUIT) {
+        if (ag_focused()) {
+            s_quit = 1;
+        }
+        return 1;
+    }
+    return 0;
+}
+
 static void poll_pad_live(void)
 {
+    ag_event_t ev;
+    while (ag_poll_event(&ev, 0)) {
+        (void)handle_session_ev(&ev);
+    }
+    if (!ag_focused()) {
+        for (unsigned i = 0; i < sizeof(k_live_map) / sizeof(k_live_map[0]);
+             i++) {
+            gwenesis_io_pad_release_button(0, k_live_map[i].md);
+        }
+        return;
+    }
     for (unsigned i = 0; i < sizeof(k_live_map) / sizeof(k_live_map[0]); i++) {
         if (ag_btnp(0, k_live_map[i].ag)) {
             gwenesis_io_pad_press_button(0, k_live_map[i].md);
@@ -252,7 +298,7 @@ static void poll_pad_live(void)
     }
     /* Old 3-byte hosts only have sys.pause; btnp(START) already ORs that in. */
     if (ag_btnp(0, AG_BTN_QUIT)) {
-        ag_exit(0);
+        s_quit = 1;
     }
 }
 
@@ -260,11 +306,18 @@ static void poll_pad_serial(void)
 {
     ag_event_t ev;
     while (ag_poll_event(&ev, 0)) {
+        if (handle_session_ev(&ev)) {
+            continue;
+        }
+        if (!ag_focused()) {
+            continue;
+        }
         if (ev.type != AG_EV_KEY_DOWN && ev.type != AG_EV_KEY_UP) {
             continue;
         }
         if (ev.key.keycode == AG_KEY_ESC || ev.key.keycode == AG_KEY_Q) {
-            ag_exit(0);
+            s_quit = 1;
+            continue;
         }
         const int btn = key_to_pad(ev.key.keycode);
         if (btn < 0) {
@@ -506,22 +559,12 @@ int ag_main(int argc, char **argv)
 
     md_sound_set_path(sound_path);
 
-    ag_gfxinfo_t info;
-    if (ag_gfx_acquire(&info) != AG_OK) {
+    if (ag_gfx_acquire(&s_gi) != AG_OK) {
         ag_printf("md: gfx acquire failed\n");
         return 1;
     }
     ag_gfx_clear(0x00000000u);
-
-    s_ox = ((int)info.width > MD_WIDTH) ? ((int)info.width - MD_WIDTH) / 2 : 0;
-    s_oy = ((int)info.height > MD_MAX_LINES)
-               ? ((int)info.height - MD_MAX_LINES) / 2
-               : 0;
-    unsigned short *const origin =
-        (unsigned short *)((uint8_t *)info.fb + (size_t)s_oy * info.stride +
-                           (size_t)s_ox * sizeof(uint16_t));
-    gwenesis_vdp_set_buffer(origin);
-    gwenesis_vdp_set_buffer_stride((int)(info.stride / sizeof(uint16_t)));
+    bind_vdp_to_fb(&s_gi);
 
     size_t         rom_size = 0;
     unsigned char *rom_data = (rom != NULL) ? load_rom_file(rom, &rom_size)
@@ -565,11 +608,20 @@ int ag_main(int argc, char **argv)
     ag_time_t window_t0 = ag_micros();
     int       ran = 0;
 
-    for (; frames < 0 || ran < frames; ran++) {
+    for (; !s_quit && (frames < 0 || ran < frames);) {
+        poll_pad();
+        if (s_quit) {
+            break;
+        }
+        if (!ag_focused()) {
+            ag_heartbeat();
+            ag_delay(50);
+            continue;
+        }
+
         const uint32_t  t0 = ag_millis();
         const ag_time_t f0 = ag_micros();
 
-        poll_pad();
         const int show = (present_div <= 1) || ((ran % present_div) == 0);
         if (s_profile_frames && ran >= 120) {
             /* Keep the first two seconds of detail; then normal stats only. */
@@ -592,6 +644,7 @@ int ag_main(int argc, char **argv)
             work_max = work;
         }
         window++;
+        ran++;
 
         if (s_profile_frames) {
             const unsigned pct =

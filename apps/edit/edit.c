@@ -632,13 +632,21 @@ static bool confirm(const char *question)
 
     for (;;) {
         ag_event_t ev;
-        if (!ag_poll_event(&ev, UINT32_MAX)) {
+        if (!ag_poll_event(&ev, 50)) {
+            ag_heartbeat();
+            continue;
+        }
+        if (ev.type == AG_EV_FOCUS_GAINED) {
+            put_clipped(0, EDIT_ROW_STATUS, EDIT_COLS, line, EDIT_ATTR_DIALOG);
             continue;
         }
         if (ev.type == AG_EV_QUIT) {
+            if (!ag_focused()) {
+                continue;
+            }
             return false;
         }
-        if (ev.type != AG_EV_KEY_DOWN) {
+        if (!ag_focused() || ev.type != AG_EV_KEY_DOWN) {
             continue;
         }
         if (ev.key.keycode == AG_KEY_Y) {
@@ -665,13 +673,20 @@ static bool ask_path(char *out, size_t out_len)
         }
 
         ag_event_t ev;
-        if (!ag_poll_event(&ev, UINT32_MAX)) {
+        if (!ag_poll_event(&ev, 50)) {
+            ag_heartbeat();
             continue;
         }
+        if (ev.type == AG_EV_FOCUS_GAINED) {
+            continue; /* redraw on next loop iteration */
+        }
         if (ev.type == AG_EV_QUIT) {
+            if (!ag_focused()) {
+                continue;
+            }
             return false;
         }
-        if (ev.type != AG_EV_KEY_DOWN) {
+        if (!ag_focused() || ev.type != AG_EV_KEY_DOWN) {
             continue;
         }
         if (ev.key.keycode == AG_KEY_ESC) {
@@ -724,10 +739,24 @@ static void show_help(void)
     }
     for (;;) {
         ag_event_t ev;
-        if (!ag_poll_event(&ev, UINT32_MAX)) {
+        if (!ag_poll_event(&ev, 50)) {
+            ag_heartbeat();
             continue;
         }
-        if (ev.type == AG_EV_QUIT || ev.type == AG_EV_KEY_DOWN) {
+        if (ev.type == AG_EV_FOCUS_GAINED) {
+            ag_fill(0, 0, EDIT_COLS, EDIT_ROWS, ' ', EDIT_ATTR_DIALOG);
+            for (int i = 0; i < n; i++) {
+                put_clipped(0, i + 2, EDIT_COLS, lines[i], EDIT_ATTR_DIALOG);
+            }
+            continue;
+        }
+        if (ev.type == AG_EV_QUIT) {
+            if (!ag_focused()) {
+                continue;
+            }
+            break;
+        }
+        if (ag_focused() && ev.type == AG_EV_KEY_DOWN) {
             break;
         }
     }
@@ -864,18 +893,26 @@ int EDIT_ENTRY(int argc, char **argv)
         redraw();
 
         ag_event_t ev;
-        if (!ag_poll_event(&ev, UINT32_MAX)) {
+        if (!ag_poll_event(&ev, 50)) {
+            ag_heartbeat();
             continue;
         }
+        if (ev.type == AG_EV_FOCUS_GAINED) {
+            continue; /* redraw() at top of loop */
+        }
         if (ev.type == AG_EV_QUIT) {
+            if (!ag_focused()) {
+                continue;
+            }
             if (!s_dirty || confirm("Discard unsaved changes?")) {
                 break;
             }
             continue;
         }
-        if (ev.type == AG_EV_KEY_DOWN) {
-            handle_key(&ev);
+        if (!ag_focused() || ev.type != AG_EV_KEY_DOWN) {
+            continue;
         }
+        handle_key(&ev);
     }
 
     free_buffer();

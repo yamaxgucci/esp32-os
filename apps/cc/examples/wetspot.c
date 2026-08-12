@@ -14,6 +14,23 @@
  */
 #include "g2d_globals.h"
 
+#define AG_EV_FOCUS_GAINED 12
+#define AG_EV_FOCUS_LOST   13
+#define AG_EV_QUIT         14
+
+struct ag_ev {
+    int type;
+    int pad;
+    int ts0;
+    int ts1;
+    int u0;
+    int u1;
+    int u2;
+    int u3;
+    int u4;
+    int u5;
+};
+
 #define VIEW_W 320
 #define VIEW_H 176
 #define TW 16
@@ -481,6 +498,24 @@ int ag_main(void)
     g2d_set_scroll(0, 0);
 
     while (running) {
+        struct ag_ev ev;
+        while (ag_poll_event(&ev, 0)) {
+            if (ev.type == AG_EV_FOCUS_GAINED) {
+                ag_gfx_acquire();
+            } else if (ev.type == AG_EV_QUIT) {
+                if (ag_focused()) {
+                    running = 0;
+                }
+            }
+        }
+        if (running == 0) {
+            break;
+        }
+        if (!ag_focused()) {
+            ag_heartbeat();
+            ag_delay(50);
+            continue;
+        }
         if (ag_btn(7)) {
             running = 0;
         }
