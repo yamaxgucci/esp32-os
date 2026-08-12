@@ -174,20 +174,41 @@ static const ag_mem_api_t k_mem = {
 /* con                                                                    */
 /* ---------------------------------------------------------------------- */
 
+/*
+ * Console I/O belongs to the focused session process.  One shared text screen:
+ * a background app must not paint or print over the focused slot (FM/shell).
+ * Kernel/shell call ag_console_* directly and are unaffected.  ag_log stays
+ * in the journal (and optional echo) outside this gate.
+ */
+static bool has_console_focus(void)
+{
+    const ag_pid_t me = ag_proc_self();
+    return me == AG_PID_KERNEL || ag_proc_focused();
+}
+
 static int32_t api_con_write(const char *buf, size_t len)
 {
+    if (!has_console_focus()) {
+        return (int32_t)len;
+    }
     ag_console_write(buf, len);
     return (int32_t)len;
 }
 
 static int32_t api_con_puts(const char *s)
 {
+    if (!has_console_focus()) {
+        return (s != NULL) ? (int32_t)strlen(s) : 0;
+    }
     ag_console_puts(s);
     return (s != NULL) ? (int32_t)strlen(s) : 0;
 }
 
 static int32_t api_con_printf(const char *fmt, ...)
 {
+    if (!has_console_focus()) {
+        return 0;
+    }
     va_list ap;
     va_start(ap, fmt);
     const int n = ag_console_vprintf(fmt, ap);
@@ -197,18 +218,13 @@ static int32_t api_con_printf(const char *fmt, ...)
 
 static int32_t api_con_vprintf(const char *fmt, va_list ap)
 {
+    if (!has_console_focus()) {
+        return 0;
+    }
     return ag_console_vprintf(fmt, ap);
 }
 
-/*
- * The keyboard belongs to the focused session process.  A background process
- * that asks for input is not made to wait forever for keys it will never get.
- */
-static bool has_the_keyboard(void)
-{
-    const ag_pid_t me = ag_proc_self();
-    return me == AG_PID_KERNEL || ag_proc_focused();
-}
+static bool has_the_keyboard(void) { return has_console_focus(); }
 
 static int32_t api_getch(void)
 {
@@ -243,6 +259,9 @@ static int32_t api_readline(char *buf, size_t len)
 
 static void api_cls(void)
 {
+    if (!has_console_focus()) {
+        return;
+    }
     ag_console_lock();
     ag_screen_cls(ag_console_screen());
     ag_console_unlock();
@@ -250,6 +269,9 @@ static void api_cls(void)
 
 static void api_gotoxy(uint16_t x, uint16_t y)
 {
+    if (!has_console_focus()) {
+        return;
+    }
     ag_console_lock();
     ag_screen_gotoxy(ag_console_screen(), x, y);
     ag_console_unlock();
@@ -257,6 +279,9 @@ static void api_gotoxy(uint16_t x, uint16_t y)
 
 static void api_set_attr(uint8_t attr)
 {
+    if (!has_console_focus()) {
+        return;
+    }
     ag_console_lock();
     ag_screen_set_attr(ag_console_screen(), attr);
     ag_console_unlock();
@@ -264,6 +289,9 @@ static void api_set_attr(uint8_t attr)
 
 static void api_set_cursor(bool visible)
 {
+    if (!has_console_focus()) {
+        return;
+    }
     ag_console_lock();
     ag_screen_set_cursor(ag_console_screen(), visible);
     ag_console_unlock();
@@ -287,6 +315,9 @@ static void api_coninfo(ag_coninfo_t *out)
 
 static void api_poke(uint16_t x, uint16_t y, char ch, uint8_t attr)
 {
+    if (!has_console_focus()) {
+        return;
+    }
     ag_console_lock();
     ag_screen_poke(ag_console_screen(), x, y, ch, attr);
     ag_console_unlock();
@@ -295,6 +326,9 @@ static void api_poke(uint16_t x, uint16_t y, char ch, uint8_t attr)
 static void api_fill(uint16_t x, uint16_t y, uint16_t w, uint16_t h, char ch,
                      uint8_t attr)
 {
+    if (!has_console_focus()) {
+        return;
+    }
     ag_console_lock();
     ag_screen_fill(ag_console_screen(), x, y, w, h, ch, attr);
     ag_console_unlock();

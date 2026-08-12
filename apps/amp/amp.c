@@ -14,7 +14,8 @@
 #include "amp_app.h"
 #include "audio_out.h"
 
-AG_APP_SIZED("AMP", "0.1", "argon", AG_AXE_NEEDS_GFX, 16 * 1024, 1024 * 1024);
+/* 512 KB arena is enough for VGA skin paint buffers; 1 MB blocked FM+AMP. */
+AG_APP_SIZED("AMP", "0.1", "argon", AG_AXE_NEEDS_GFX, 16 * 1024, 512 * 1024);
 
 #define CHUNK_FRAMES 512
 #define UI_PERIOD_MS 100u
