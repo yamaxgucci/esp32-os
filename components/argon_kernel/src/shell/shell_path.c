@@ -56,39 +56,54 @@ static ag_err_t try_candidate(const char *dir, const char *name, char *out,
     return AG_OK;
 }
 
-static bool is_axe_name(const char *name)
+bool ag_shell_is_script(const char *path)
+{
+    const char *ext = ag_path_ext(path);
+    if (ext == NULL) {
+        return false;
+    }
+    return ag_path_icmp(ext, ".bat") == 0 || ag_path_icmp(ext, ".cmd") == 0;
+}
+
+static bool is_path_cmd_ext(const char *name)
 {
     const char *ext = ag_path_ext(name);
-    return ext != NULL && ag_path_icmp(ext, ".axe") == 0;
+    if (ext == NULL) {
+        return false;
+    }
+    return ag_path_icmp(ext, ".axe") == 0 || ag_shell_is_script(name);
 }
 
 static ag_err_t try_name_variants(const char *dir, const char *name, char *out,
                                   size_t outlen)
 {
     /*
-     * PATH only finds applications.  A bare `readme.txt` must fall through to
-     * associations, not be spawned as an image.
+     * PATH finds applications and shell scripts.  A bare `readme.txt` must
+     * fall through to associations, not be treated as a command.
      */
     if (ag_path_ext(name) != NULL) {
-        if (!is_axe_name(name)) {
+        if (!is_path_cmd_ext(name)) {
             return -AG_ENOENT;
         }
         return try_candidate(dir, name, out, outlen);
     }
 
+    static const char *const k_exts[] = {".axe", ".AXE", ".bat", ".BAT",
+                                         ".cmd", ".CMD"};
     char with_ext[AG_NAME_MAX + 8];
     const size_t nlen = strlen(name);
-    if (nlen + 5 >= sizeof(with_ext)) {
-        return -AG_ERANGE;
+    for (size_t i = 0; i < sizeof(k_exts) / sizeof(k_exts[0]); i++) {
+        const size_t elen = strlen(k_exts[i]);
+        if (nlen + elen + 1 > sizeof(with_ext)) {
+            return -AG_ERANGE;
+        }
+        memcpy(with_ext, name, nlen);
+        memcpy(with_ext + nlen, k_exts[i], elen + 1);
+        if (try_candidate(dir, with_ext, out, outlen) == AG_OK) {
+            return AG_OK;
+        }
     }
-    memcpy(with_ext, name, nlen);
-    memcpy(with_ext + nlen, ".axe", 5);
-    ag_err_t err = try_candidate(dir, with_ext, out, outlen);
-    if (err == AG_OK) {
-        return AG_OK;
-    }
-    memcpy(with_ext + nlen, ".AXE", 5);
-    return try_candidate(dir, with_ext, out, outlen);
+    return -AG_ENOENT;
 }
 
 ag_err_t ag_shell_resolve_cmd(const char *name, const char *cwd,

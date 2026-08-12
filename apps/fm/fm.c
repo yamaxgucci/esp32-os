@@ -589,6 +589,18 @@ static void enter_current(void)
     }
 
 #ifdef AG_BUILTIN
+    if (ag_ends_with_i(e->name, ".bat") || ag_ends_with_i(e->name, ".cmd")) {
+        char full[AG_PATH_MAX];
+        fm_join(p->path, e->name, full, sizeof(full));
+        fm_ui_end();
+        (void)ag_shell_run_script(full);
+        fm_pause("press any key");
+        fm_ui_begin();
+        (void)fm_reload(fm_active());
+        (void)fm_reload(fm_other());
+        return;
+    }
+
     {
         char full[AG_PATH_MAX];
         fm_join(p->path, e->name, full, sizeof(full));

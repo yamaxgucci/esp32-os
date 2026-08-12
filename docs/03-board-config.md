@@ -224,11 +224,12 @@ autoexec = c:\autoexec.bat
 
 | Ключ | Значение |
 |---|---|
-| `shell.path` | каталоги через `;` (DOS-пути). Bare-имя ищет `name.axe` / `name.AXE` |
+| `shell.path` | каталоги через `;` (DOS-пути). Bare-имя: `name.axe`, затем `name.bat` / `name.cmd` |
 | `shell.autoexec` | скрипт после boot; нет ключа — `/sys/AUTOEXEC.BAT` при наличии файла |
 | `assoc.<ext>` | обработчик: builtin `edit` или путь/имя `.AXE`. Enter в `fm` и «голый» файл в шелле |
 
-`AUTOEXEC.BAT` — построчно команды шелла (пустые / `REM` / `;` пропускаются). В recovery не выполняется.
+`.bat` / `.cmd` — командные скрипты шелла (построчно, без `IF`/`GOTO`).  
+`AUTOEXEC.BAT` — тот же формат. В recovery не выполняется.
 
 ## Safe boot / recovery
 
