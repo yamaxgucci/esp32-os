@@ -2,7 +2,10 @@
  * actually produces - internal calls, literal pool loads, string constants,
  * static data, calls out to the kernel through the API table, and initialised
  * pointers in both directions across the split, which are the words that need
- * the bias of a part other than the one they live in. */
+ * the bias of a part other than the one they live in.
+ *
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
+ */
 #include <argon/argon.h>
 
 AG_APP("SAMPLE", "1.0", "argon", 0);

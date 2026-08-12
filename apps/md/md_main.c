@@ -7,6 +7,8 @@
  *   run a:\MD.AXE a:\game.bin fps30  # emulate 60, show 30
  *
  * Cores: gwenesis, GPLv3 (see LICENSE and README).  This file: Apache-2.0.
+ *
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
  */
 #include <argon/argon.h>
 #include <argon/keys.h>

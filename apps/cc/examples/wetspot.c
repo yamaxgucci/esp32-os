@@ -11,6 +11,8 @@
  *   run h:\wetspot.axe
  *
  * Pad: D-pad move, B1 (Z) wait/noop, Esc quit. Push soft blocks into enemies.
+ *
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
  */
 #include "g2d_globals.h"
 

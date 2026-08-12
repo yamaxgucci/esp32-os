@@ -7,6 +7,8 @@
  *   run h:\tile_demo.axe
  *
  * Pad: Left/Right scroll, Up/Down move sprite, Esc quit.
+ *
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
  */
 #include "g2d_globals.h"
 
