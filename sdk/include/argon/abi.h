@@ -63,9 +63,10 @@ extern "C" {
  * 0.19 appended sys->module_on_unload so .SYS can close TCP listens on reload.
  * 0.22 appended optional per-open session ops on ag_dev_ops (multi-open devices
  *      such as /dev/pcmmix); built-in software PCM mixer.
+ * 0.23 defined ag_display_ops_t; soft fb0 publishes it via dev->ops(h).
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 22u
+#define AG_ABI_MINOR 23u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -540,6 +541,24 @@ typedef struct ag_gfx_api {
     void (*blit_keyed)(int16_t x, int16_t y, uint16_t w, uint16_t h,
                        uint32_t key_rgb);
 } ag_gfx_api_t;
+
+/*
+ * Class vtable for AG_DEV_DISPLAY devices, returned by dev->ops(h).
+ * Compact subset of ag_gfx_api_t keyed by the open handle — for drivers that
+ * publish a panel as /dev/name rather than (or as well as) the global gfx
+ * singleton.  Soft fb0 implements this; api->gfx remains the convenience path.
+ */
+typedef struct ag_display_ops {
+    uint32_t size;
+
+    /* Geometry/format without taking the display; out->fb is NULL. */
+    ag_err_t (*info)(ag_handle_t h, ag_gfxinfo_t *out);
+    ag_err_t (*acquire)(ag_handle_t h, ag_gfxinfo_t *out);
+    void (*release)(ag_handle_t h);
+    void (*flush)(ag_handle_t h, uint16_t x, uint16_t y, uint16_t w,
+                  uint16_t hgt);
+    void (*swap)(ag_handle_t h);
+} ag_display_ops_t;
 
 /* ------------------------------------------------------------------------ */
 /* dev - device manager                                                     */
