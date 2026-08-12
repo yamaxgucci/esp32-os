@@ -21,9 +21,21 @@ AG_APP_SIZED("AMP", "0.1", "argon", AG_AXE_NEEDS_GFX, 16 * 1024, 1024 * 1024);
 #define UI_PERIOD_PLAY_MS 200u
 /* Wall budget per main-loop audio burst (keep UI/events alive). */
 #define PUMP_BUDGET_MS 12u
+/* How far ahead of wall-clock we may fill the PCM sink. */
+#define PACE_LEAD_MS 100u
 
 static amp_player_t s_p;
 static int16_t      s_pcm[CHUNK_FRAMES * 2];
+static uint64_t     s_pcm_sent;       /* frames written to audio sink */
+static uint32_t     s_pace_origin_ms; /* wall clock when s_pcm_sent matched pos */
+
+void amp_pace_sync(void)
+{
+    uint32_t rate = s_p.rate ? s_p.rate : 22050u;
+    uint32_t pos_ms = (s_p.mp3 != NULL) ? ag_mp3_position_ms(s_p.mp3) : 0u;
+    s_pcm_sent = ((uint64_t)pos_ms * (uint64_t)rate) / 1000ull;
+    s_pace_origin_ms = ag_millis();
+}
 
 static int ends_mp3(const char *s)
 {
@@ -127,26 +139,51 @@ static int pump_audio_once(void)
     return n;
 }
 
+static int sink_almost_full(void)
+{
+    ag_audio_stats_t st;
+    if (s_p.audio_fd < 0) {
+        return 0;
+    }
+    if (ag_dev_ioctl(s_p.audio_fd, AG_IOC_AUDIO_GETSTATS, &st, sizeof(st)) !=
+        0) {
+        return 0;
+    }
+    if (st.ring_cap == 0u) {
+        return 0;
+    }
+    /* Leave ~25% free so pcmvirt never discards oldest (heard as end-jump). */
+    return st.ring_used >= (st.ring_cap - (st.ring_cap / 4u));
+}
+
 static void pump_audio(void)
 {
     uint32_t t0;
-    int      produced = 0;
-    int      target;
+    uint32_t rate;
+    uint32_t elapsed;
+    uint64_t limit;
     if (s_p.state != AMP_PLAYING || s_p.mp3 == NULL || s_p.audio_fd < 0) {
         return;
     }
-    /* Catch up toward realtime: ~40ms of PCM per burst, wall-capped. */
-    target = (int)(s_p.rate / 25u);
-    if (target < CHUNK_FRAMES) {
-        target = CHUNK_FRAMES;
+    rate = s_p.rate ? s_p.rate : 22050u;
+    elapsed = ag_millis() - s_pace_origin_ms;
+    limit = ((uint64_t)(elapsed + PACE_LEAD_MS) * (uint64_t)rate) / 1000ull;
+    /*
+     * In-RAM decode is far faster than realtime. Without pacing we dump the
+     * whole track into pcmvirt's 32KB ring; it drops the head and the UI
+     * clock jumps to the end after a few hundred ms of audio.
+     */
+    if (s_pcm_sent >= limit || sink_almost_full()) {
+        ag_delay(1);
+        return;
     }
     t0 = ag_millis();
-    while (produced < target) {
+    while (s_pcm_sent < limit && !sink_almost_full()) {
         int n = pump_audio_once();
         if (n <= 0) {
             break;
         }
-        produced += n;
+        s_pcm_sent += (uint64_t)n;
         if ((ag_millis() - t0) >= PUMP_BUDGET_MS) {
             break;
         }
@@ -284,6 +321,7 @@ int ag_main(int argc, char **argv)
             ag_printf("amp: opening %s\n", path);
             s_sync_empty = 0;
             (void)amp_open_track(&s_p, path);
+            amp_pace_sync();
         }
         pump_audio();
         {

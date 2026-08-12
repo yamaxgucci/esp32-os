@@ -73,6 +73,8 @@ void amp_cmd_open_picker(amp_player_t *p);
 void amp_cmd_picker_choose(amp_player_t *p);
 int  amp_open_track(amp_player_t *p, const char *path);
 void amp_btn_press(amp_player_t *p, amp_ctrl_t c);
+/* Sync wall-clock PCM pacing to current decode position (open/seek/resume). */
+void amp_pace_sync(void);
 
 void amp_ui_draw(amp_player_t *p);
 void amp_ui_pointer(amp_player_t *p, const ag_event_t *ev);
