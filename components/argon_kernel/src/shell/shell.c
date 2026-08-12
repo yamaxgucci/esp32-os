@@ -1734,6 +1734,13 @@ int ag_shell_execute(const char *line)
     /* This command's own answer to "was I interrupted", not the last one's. */
     ag_supervisor_clear_interrupt();
 
+    /*
+     * While a command runs, show journal lines on the console (module load,
+     * probe, etc.).  Echo stays off at the live prompt so async noise does
+     * not fight the edit line.
+     */
+    ag_log_set_echo(true);
+
     if (redirect >= 0) {
         ag_console_redirect(file_sink, (void *)(intptr_t)redirect);
     }
@@ -1777,6 +1784,8 @@ int ag_shell_execute(const char *line)
         /* The message every DOS user knows. */
         ag_console_printf("Bad command or file name: %s\n", argv[0]);
     }
+
+    ag_log_set_echo(false);
     return status;
 }
 
@@ -1804,9 +1813,10 @@ void ag_shell_run(void)
     pick_initial_cwd();
 
     /*
-     * Boot already echoed to the screen.  From the prompt onward, system
-     * messages stay in the journal only — pcmvirt stats and friends must not
-     * break the live edit line.  Use `log` to read them.
+     * Boot already echoed to the screen.  At the live prompt, system messages
+     * stay in the journal only — pcmvirt stats and friends must not break the
+     * edit line (`log` still shows them).  ag_shell_execute turns echo back
+     * on for the duration of each command so install/load progress is visible.
      */
     ag_log_set_echo(false);
 
