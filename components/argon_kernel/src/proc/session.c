@@ -109,9 +109,32 @@ ag_err_t ag_session_set_cwd(int slot, const char *absolute_path)
     return AG_OK;
 }
 
+/* Only interactive builtins are worth restarting; never park `run`, `dir`, … */
+static bool shell_cmd_is_parkable(const char *line)
+{
+    while (line != NULL && (*line == ' ' || *line == '\t')) {
+        line++;
+    }
+    if (line == NULL || line[0] == '\0') {
+        return false;
+    }
+    /* `fm` or `fm …` */
+    if ((line[0] == 'f' || line[0] == 'F') &&
+        (line[1] == 'm' || line[1] == 'M') &&
+        (line[2] == '\0' || line[2] == ' ' || line[2] == '\t')) {
+        return true;
+    }
+    return false;
+}
+
 void ag_session_note_shell_cmd(int slot, const char *line)
 {
     if (slot < 0 || slot >= AG_SESSION_SLOTS || line == NULL) {
+        return;
+    }
+    if (!shell_cmd_is_parkable(line)) {
+        s_slots[slot].shell_cmd[0] = '\0';
+        s_slots[slot].resume_pending = false;
         return;
     }
     strncpy(s_slots[slot].shell_cmd, line, AG_SESSION_PARK_CMD_MAX - 1);
@@ -187,6 +210,10 @@ ag_err_t ag_session_bind(ag_pid_t pid, const char *name)
     if (ag_session_slot_of(pid) >= 0) {
         return AG_OK;
     }
+    /* Prefer the focused free slot so spawners match where the user typed. */
+    if (s_slots[s_focused].pid == AG_PID_KERNEL) {
+        return ag_session_bind_to(pid, name, s_focused);
+    }
     for (int i = 0; i < AG_SESSION_SLOTS; i++) {
         if (s_slots[i].pid == AG_PID_KERNEL) {
             return ag_session_bind_to(pid, name, i);
@@ -234,13 +261,7 @@ static void enter_shell_view(int slot)
         ag_screen_set_attr(ag_console_screen(), AG_ATTR_DEFAULT);
         ag_screen_set_cursor(ag_console_screen(), true);
         ag_console_unlock();
-        if (s_slots[slot].resume_pending && s_slots[slot].shell_cmd[0] != '\0') {
-            ag_console_printf("slot %d — resuming %s\n",
-                              ag_session_display_number(slot),
-                              s_slots[slot].shell_cmd);
-        } else {
-            ag_console_printf("slot %d\n", ag_session_display_number(slot));
-        }
+        ag_console_printf("slot %d\n", ag_session_display_number(slot));
     }
 
     ag_supervisor_raise_shell_interrupt();
