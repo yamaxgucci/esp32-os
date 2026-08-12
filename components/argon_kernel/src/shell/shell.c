@@ -53,6 +53,12 @@ int ag_edit_main(int argc, char **argv);
 static char          s_cwd[AG_PATH_MAX] = "/";
 static ag_lineedit_t s_line;
 static int           s_last_status;
+static int           s_script_depth;
+
+#define AG_SHELL_SCRIPT_MAX_DEPTH 8
+
+/* Defined below; used by run/call before the body. */
+int ag_shell_run_script(const char *path);
 
 /* ---------------------------------------------------------------------- */
 /* Presentation                                                           */
@@ -508,6 +514,18 @@ static int spawn_in_slot(const char *path, int argc, char **argv,
     return 0;
 }
 
+static int launch_resolved(const char *path, int argc, char **argv,
+                           bool detach_only)
+{
+    if (ag_shell_is_script(path)) {
+        if (argc > 1) {
+            ag_console_puts("script: arguments are ignored\n");
+        }
+        return ag_shell_run_script(path);
+    }
+    return spawn_in_slot(path, argc, argv, detach_only);
+}
+
 static int cmd_run(int argc, char **argv)
 {
     bool detach_only = false;
@@ -521,6 +539,7 @@ static int cmd_run(int argc, char **argv)
         ag_console_puts("usage: run [/b] <file> [arguments]\n");
         ag_console_puts("  starts in the current user slot (or a free one)\n");
         ag_console_puts("  /b  same, without switching focus to the app\n");
+        ag_console_puts("  .bat/.cmd run as shell scripts (line by line)\n");
         ag_console_puts("  Alt+1..4 / fg <slot|pid>; Ctrl+\\ = system shell\n");
         return 1;
     }
@@ -534,7 +553,29 @@ static int cmd_run(int argc, char **argv)
         return 1;
     }
     argv[first] = resolved;
-    return spawn_in_slot(resolved, argc - first, &argv[first], detach_only);
+    return launch_resolved(resolved, argc - first, &argv[first], detach_only);
+}
+
+static int cmd_call(int argc, char **argv)
+{
+    if (argc != 2) {
+        ag_console_puts("usage: call <script.bat|.cmd>\n");
+        ag_console_puts("  runs a shell command script (same as typing its name)\n");
+        return 1;
+    }
+    char resolved[AG_PATH_MAX];
+    const ag_err_t err =
+        ag_shell_resolve_cmd(argv[1], s_cwd, shell_path_env(), resolved,
+                             sizeof(resolved));
+    if (err != AG_OK) {
+        ag_console_printf("%s: not found\n", argv[1]);
+        return 1;
+    }
+    if (!ag_shell_is_script(resolved)) {
+        ag_console_puts("call: not a .bat/.cmd script\n");
+        return 1;
+    }
+    return ag_shell_run_script(resolved);
 }
 
 static int cmd_log(int argc, char **argv)
@@ -1687,7 +1728,8 @@ static const ag_command_t k_commands[] = {
     {"hexdump", "<file>", "dump a file as bytes", ag_cmd_hexdump},
     {"recv", "<file>", "receive a file as hex", ag_cmd_recv},
     {"unzip", "<zip> [dest]", "list or extract a zip archive", ag_cmd_unzip},
-    {"run", "[/b] <file> [args]", "run an application", cmd_run},
+    {"run", "[/b] <file> [args]", "run an application or .bat script", cmd_run},
+    {"call", "<script.bat>", "run a shell command script", cmd_call},
     {"errorlevel", "", "exit code of the last command", cmd_errorlevel},
     {"reboot", "", "restart the board", cmd_reboot},
     {NULL, NULL, NULL, NULL},
@@ -1830,7 +1872,7 @@ int ag_shell_execute(const char *line)
                                  sizeof(resolved));
         if (rerr == AG_OK) {
             argv[0] = resolved;
-            status = spawn_in_slot(resolved, argc, argv, false);
+            status = launch_resolved(resolved, argc, argv, false);
             found = true;
         }
     }
@@ -1900,6 +1942,72 @@ bool ag_shell_open_associated(const char *path)
     return true;
 }
 
+int ag_shell_run_script(const char *path)
+{
+    if (path == NULL || path[0] == '\0') {
+        return 1;
+    }
+
+    char abs[AG_PATH_MAX];
+    if (ag_path_resolve(path, s_cwd, abs, sizeof(abs)) != AG_OK) {
+        ag_console_printf("%s: bad path\n", path);
+        return 1;
+    }
+
+    if (s_script_depth >= AG_SHELL_SCRIPT_MAX_DEPTH) {
+        ag_console_printf("%s: script nesting too deep\n", abs);
+        return 1;
+    }
+
+    ag_stat_t st;
+    if (ag_vfs_stat(abs, NULL, &st) != AG_OK || (st.attr & AG_A_DIR) != 0) {
+        ag_console_printf("%s: not found\n", abs);
+        return 1;
+    }
+
+    const ag_handle_t h = ag_vfs_open(abs, NULL, AG_O_RDONLY);
+    if (h < 0) {
+        ag_console_printf("%s: open failed (%d)\n", abs, (int)h);
+        return 1;
+    }
+
+    s_script_depth++;
+    int status = 0;
+
+    char    line[AG_LINE_MAX];
+    size_t  len = 0;
+    char    ch;
+    int32_t n;
+    while ((n = ag_vfs_read(h, &ch, 1)) == 1) {
+        if (ch == '\r') {
+            continue;
+        }
+        if (ch == '\n') {
+            line[len] = '\0';
+            if (!ag_shell_autoexec_skip_line(line)) {
+                status = ag_shell_execute(line);
+                if (ag_shell_interrupted()) {
+                    break;
+                }
+            }
+            len = 0;
+            continue;
+        }
+        if (len + 1 < sizeof(line)) {
+            line[len++] = ch;
+        }
+    }
+    if (len > 0 && !ag_shell_interrupted()) {
+        line[len] = '\0';
+        if (!ag_shell_autoexec_skip_line(line)) {
+            status = ag_shell_execute(line);
+        }
+    }
+    ag_vfs_close(h);
+    s_script_depth--;
+    return status;
+}
+
 static void run_autoexec(void)
 {
     if (ag_boot_in_recovery()) {
@@ -1926,46 +2034,11 @@ static void run_autoexec(void)
         return;
     }
 
-    const ag_handle_t h = ag_vfs_open(path, NULL, AG_O_RDONLY);
-    if (h < 0) {
-        ag_log(AG_LOG_WARN, "shell", "autoexec: open %s failed (%d)", path,
-               (int)h);
-        return;
-    }
-
     ag_console_printf("AUTOEXEC: %s\n", path);
-
-    char     line[AG_LINE_MAX];
-    size_t   len = 0;
-    char     ch;
-    int32_t  n;
-    while ((n = ag_vfs_read(h, &ch, 1)) == 1) {
-        if (ch == '\r') {
-            continue;
-        }
-        if (ch == '\n') {
-            line[len] = '\0';
-            if (!ag_shell_autoexec_skip_line(line)) {
-                const int st_line = ag_shell_execute(line);
-                if (st_line != 0) {
-                    ag_log(AG_LOG_WARN, "shell", "autoexec: '%s' => %d", line,
-                           st_line);
-                }
-            }
-            len = 0;
-            continue;
-        }
-        if (len + 1 < sizeof(line)) {
-            line[len++] = ch;
-        }
+    const int status = ag_shell_run_script(path);
+    if (status != 0) {
+        ag_log(AG_LOG_WARN, "shell", "autoexec finished with %d", status);
     }
-    if (len > 0) {
-        line[len] = '\0';
-        if (!ag_shell_autoexec_skip_line(line)) {
-            (void)ag_shell_execute(line);
-        }
-    }
-    ag_vfs_close(h);
 }
 
 static void show_prompt(void)

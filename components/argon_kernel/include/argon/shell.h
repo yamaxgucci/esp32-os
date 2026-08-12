@@ -25,6 +25,14 @@ void ag_shell_run(void);
 /* Executes one command line, as if it had been typed.  Returns the exit code. */
 int ag_shell_execute(const char *line);
 
+/*
+ * Runs a shell command script (.bat / .cmd): each non-comment line is fed to
+ * ag_shell_execute.  Not a DOS batch interpreter — no IF/GOTO/%1.  Returns the
+ * exit code of the last command, or 1 if the file cannot be read.  Nesting is
+ * bounded; deeper calls fail rather than blow the stack.
+ */
+int ag_shell_run_script(const char *path);
+
 const char *ag_shell_cwd(void);
 
 /*

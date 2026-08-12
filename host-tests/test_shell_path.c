@@ -64,7 +64,9 @@ static void test_resolve_path(void)
     setup();
     AG_CHECK_INT(ag_vfs_mkdir("/sd/bin", NULL), AG_OK);
     AG_CHECK_INT(write_file("/sd/bin/hello.axe", "X"), AG_OK);
+    AG_CHECK_INT(write_file("/sd/bin/setup.bat", "echo hi\n"), AG_OK);
     AG_CHECK_INT(write_file("/sys/readme.txt", "hi"), AG_OK);
+    AG_CHECK_INT(write_file("/sys/only.bat", "ver\n"), AG_OK);
 
     char out[AG_PATH_MAX];
     AG_CHECK_INT(ag_shell_resolve_cmd("hello", "/tmp", "a:\\bin;c:\\bin", out,
@@ -72,7 +74,25 @@ static void test_resolve_path(void)
                  AG_OK);
     AG_CHECK_STR(out, "/sd/bin/hello.axe");
 
-    /* .txt is not an application — PATH must not claim it. */
+    /* .axe wins over .bat when both exist under the same stem. */
+    AG_CHECK_INT(write_file("/sd/bin/dual.bat", "echo bat\n"), AG_OK);
+    AG_CHECK_INT(write_file("/sd/bin/dual.axe", "X"), AG_OK);
+    AG_CHECK_INT(ag_shell_resolve_cmd("dual", "/tmp", "a:\\bin", out,
+                                      sizeof(out)),
+                 AG_OK);
+    AG_CHECK_STR(out, "/sd/bin/dual.axe");
+
+    AG_CHECK_INT(ag_shell_resolve_cmd("setup", "/tmp", "a:\\bin", out,
+                                      sizeof(out)),
+                 AG_OK);
+    AG_CHECK_STR(out, "/sd/bin/setup.bat");
+    AG_CHECK(ag_shell_is_script(out));
+
+    AG_CHECK_INT(ag_shell_resolve_cmd("only", "/sys", "c:\\", out, sizeof(out)),
+                 AG_OK);
+    AG_CHECK_STR(out, "/sys/only.bat");
+
+    /* .txt is not a command — PATH must not claim it. */
     AG_CHECK_INT(ag_shell_resolve_cmd("readme.txt", "/sys", "c:\\", out,
                                       sizeof(out)),
                  -AG_ENOENT);
@@ -81,6 +101,10 @@ static void test_resolve_path(void)
         ag_shell_resolve_cmd("a:\\bin\\hello.axe", "/", NULL, out, sizeof(out)),
         AG_OK);
     AG_CHECK_STR(out, "/sd/bin/hello.axe");
+
+    AG_CHECK(ag_shell_is_script("c:\\AUTOEXEC.BAT"));
+    AG_CHECK(ag_shell_is_script("foo.cmd"));
+    AG_CHECK(!ag_shell_is_script("foo.axe"));
 }
 
 static void test_assoc_and_autoexec(void)

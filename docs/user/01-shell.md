@@ -507,18 +507,37 @@ autoexec = c:\autoexec.bat
 .txt = edit
 ```
 
-- Bare-имя (`hello`) ищет `hello.axe` в текущем каталоге и по `shell.path`.
+- Bare-имя (`hello`) ищет `hello.axe`, затем `hello.bat` / `hello.cmd` в cwd и
+  по `shell.path` (`.axe` важнее `.bat`, если есть оба).
 - `C:\AUTOEXEC.BAT` (или `shell.autoexec`) выполняется построчно после boot.
-- Enter в `fm` на `.txt` открывает `edit`, если есть `[assoc]`.
+- Enter в `fm` на `.txt` открывает `edit`, если есть `[assoc]`; на `.bat`/`.cmd`
+  запускает скрипт.
+
+### Командные скрипты (`.bat` / `.cmd`)
+
+Это **не** DOS batch: нет `IF`, `GOTO`, `%1`, переменных. Файл — список команд
+шелла по одной на строку (пустые / `REM` / `;` / `#` пропускаются).
+
+```
+C:\> type a:\bin\setup.bat
+echo preparing...
+copy h:\app.axe c:\
+drv install c:\pcmvirt.sys
+
+C:\> setup
+C:\> call a:\bin\setup.bat
+```
+
+Вложенность ограничена (защита от рекурсии). Аргументы скрипту пока
+игнорируются.
 
 Команда `boot` показывает стадии; `boot recovery` / `boot normal` — маркер
 безопасной загрузки без модулей (см. [03-board-config.md](../03-board-config.md)).
 
 ### Чего в шелле нет
 
-Полноценных пакетных файлов (ветки, `GOTO`), переменных окружения (`set`),
-конвейеров и циклов. `AUTOEXEC.BAT` — только список команд шелла по одной на
-строку.
+Полноценного batch-языка (`IF`/`GOTO`/`FOR`/`%VAR%`), переменных окружения
+(`set`), конвейеров и циклов.
 
 ## Сообщения об ошибках
 

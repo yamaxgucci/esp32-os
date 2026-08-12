@@ -31,12 +31,16 @@ bool ag_shell_name_is_path(const char *name);
  *
  * When `name` is already a path, only `ag_path_resolve` + VFS stat are used.
  * Otherwise each `;`-separated entry in `path_env` (NULL or "" = no search) is
- * tried with `name`, then `name.axe` / `name.AXE`.  `cwd` is the process cwd
- * for relative PATH entries.  On success writes a canonical absolute path to
- * `out` and returns AG_OK; otherwise -AG_ENOENT / -AG_EINVAL / -AG_ERANGE.
+ * tried with `name.axe`, then `name.bat` / `name.cmd` (and uppercase variants).
+ * `cwd` is the process cwd for relative PATH entries.  On success writes a
+ * canonical absolute path to `out` and returns AG_OK; otherwise -AG_ENOENT /
+ * -AG_EINVAL / -AG_ERANGE.
  */
 ag_err_t ag_shell_resolve_cmd(const char *name, const char *cwd,
                               const char *path_env, char *out, size_t outlen);
+
+/* True for shell command scripts: .bat / .cmd (case-insensitive). */
+bool ag_shell_is_script(const char *path);
 
 /*
  * Looks up an association for the extension of `filename` (including the dot)
