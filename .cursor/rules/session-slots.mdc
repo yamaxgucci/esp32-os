@@ -1,5 +1,5 @@
 ---
-description: Session slots, focus, and AXE load UX (FM/AMP)
+description: Session slots, system shell, focus, and AXE load UX
 globs: components/argon_kernel/src/proc/**/*.{c,h},components/argon_kernel/src/shell/shell.c,apps/**/*
 alwaysApply: false
 ---
@@ -8,24 +8,31 @@ alwaysApply: false
 
 ## Model
 
-- Apps are real processes bound to a slot (`ag_session_bind_to`), not parked builtins.
-- `run` / `fm` pin the launch slot, spawn with `AG_SPAWN_NO_SESSION`, then bind.
-- AXE load is deferred in `proc_task` (`AG_PS_LOADING`); shell must not block on HostFS.
+- **sys** (`AG_SESSION_SYSTEM = -1`): OS shell only; no app bind. Prompt `(sys) …>`.
+  Enter only via `Ctrl+\` / `Ctrl+Alt+Del`. Double tap kills last user app.
+- **User slots 0..3** (display 1..4): empty = shell `(N) …>`; occupied = app focus.
+- Boot focuses **slot 1** (index 0), not sys.
+- Apps are real processes (`ag_session_bind_to` on a user slot only).
+- `run` / `fm` refuse on sys; pin launch user slot, spawn `AG_SPAWN_NO_SESSION`, bind.
+- AXE load is deferred in `proc_task` (`AG_PS_LOADING`).
 
 ## Focus rules
 
-- Ready app owns the screen: **no** console banner on focus (overpaints FM/AMP).
-- Same-slot bind (`shell → app`) must still set foreground + `FOCUS_GAINED` (adopt path).
-- While `AG_PS_LOADING`, focus must show `enter_loading_view` — otherwise Alt-back looks hung.
-- Unfocused apps: no console writes; `ag_poll_event` must sleep on timeout (no busy-spin).
-- Ignore `QUIT` while unfocused (shell injects QUIT only for its own prompt).
+- Ready app owns the screen: **no** console banner on focus.
+- Same-slot bind (`shell → app`) still needs foreground + `FOCUS_GAINED` (adopt).
+- While `AG_PS_LOADING`, show `enter_loading_view` (Alt-back must not look hung).
+- Unfocused apps: no console writes; poll sleeps on timeout (no busy-spin).
+- Ignore `QUIT` while unfocused.
+- `fg` / Alt+1..4 / Alt+Tab never enter sys; Alt+Tab cycles user slots only.
 
 ## Keyboard
 
-- `ag_session_shell_owns_keyboard` is true only when focused slot pid is kernel.
-- Alt+1..4 / Ctrl+\ are supervisor hotkeys; they work even when an app owns the slot.
+- Shell owns keyboard on sys **or** empty focused user slot.
+- Supervisor hotkeys work even when an app owns the slot.
 
 ## Do not
 
-- Defer bind until load finishes (reopens Alt race into the wrong slot).
+- Treat sys as user slot 0 / display “1”.
+- Allow `run`/`fm`/`fg sys` into the system shell.
+- Defer bind until load finishes (Alt race into the wrong slot).
 - Restore a generic “focused app” console banner for ready apps.
