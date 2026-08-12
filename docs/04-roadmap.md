@@ -17,7 +17,7 @@
 - [x] Host-тесты: сборка чистой логики обычным GCC
 - [x] Тулчейн: MinGW-w64 GCC 16.1 (host) + ESP-IDF 5.5.5 (esp32s3), оба на `D:`
 - [x] Прошивка собирается: `argonos.bin`, 415 КБ, ноль предупреждений
-- [ ] CI (сборка прошивки + host-тесты)
+- [x] CI (сборка прошивки + host-тесты) — `.github/workflows/ci.yml`
 
 ## Спайк S-1 — исполнение кода из PSRAM  ⚠ ограничивает размер кода
 
@@ -93,7 +93,7 @@ flash-XIP. Результат определяет §3.2 архитектуры.
    приложение, а не система, и в журнале смещение отказа в его собственном коде
    (§5.5 архитектуры); ✅ watchdog по заявке приложения (`ag_watchdog`);
    ✅ crash-record в `/sys/crash.log` с хвостом журнала;
-   ⬜ вывод фоновых процессов в лог, ✅ горячие клавиши `Alt+1..4` / `Alt+Tab`
+   ✅ вывод фоновых процессов в лог, ✅ горячие клавиши `Alt+1..4` / `Alt+Tab`
    (session slots + system shell; см. `docs/plans/session-slots-and-system-shell.md`)
 5. Таблицы ABI: ✅ `sys mem fs con time proc task inp dev io`; ⬜ `cfg gfx`
 6. ⬜ SDK: `libargon` как библиотека, шаблон приложения; сборка `.AXE` ✅,
@@ -708,8 +708,8 @@ MQTT, Modbus TCP, OTA. Подтаблица `api->net` перестаёт быт
    PSRAM; `acquire` → `double_buf`; `flush`/`swap` копируют на front
 5. ✅ **Подпись `.AXE`** — HMAC-SHA256-128 в `reserved[6]`; нули = без
    подписи; `tools/signaxe.py`, `ag_axe_check_sig` в загрузчике
-6. ✅ **CI (локально)** — `argon check`: host-тесты + сборка прошивки
-   (без GitHub Actions; облако — по желанию позже)
+6. ✅ **CI** — локально `argon check`; в облаке `.github/workflows/ci.yml`
+   (host-тесты + `idf.py build` на esp32s3 / IDF 5.5.5)
 7. ✅ **Доводка SMS** — host **PADPUSH** → guest cache; sticky TTL fallback;
    ✅ PSG + FM → `t:\sms.wav` / mock (без I2S); FM = decode OPLL → `ag_fm`;
    выгрузка WAV пока надёжнее через `A:` + `argon get` (не через `copy` на `H:`)
