@@ -92,7 +92,23 @@ static void draw_scene(const ag_gfxinfo_t *info)
         ag_gfx_blit_bind(tex, 16);
         ag_gfx_blit_src_rect(0, 0, 8, 8);
         ag_gfx_blit_scaled(400, 280, 48, 48);
-        ag_gfx_blit_tiled(456, 280, 64, 32);
+        /* 1:1 of the 8×8 checker is unreadable when the window is scaled; 4px
+         * cells make the repeat obvious. */
+        {
+            uint16_t chunky[8 * 8];
+            int cy;
+            for (cy = 0; cy < 8; cy++) {
+                int cx;
+                for (cx = 0; cx < 8; cx++) {
+                    chunky[cy * 8 + cx] =
+                        ((cx / 4) ^ (cy / 4)) & 1 ? (uint16_t)0xF800
+                                                  : (uint16_t)0x07E0;
+                }
+            }
+            ag_gfx_blit_bind(chunky, 16);
+            ag_gfx_blit_tiled(456, 280, 64, 32);
+            ag_gfx_blit_bind(tex, 16);
+        }
         ag_gfx_poly_begin();
         ag_gfx_poly_uv(0, 4);
         (void)ag_gfx_poly_vertex(556, 304);
