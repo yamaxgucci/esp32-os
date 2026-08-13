@@ -76,6 +76,8 @@ def main():
         os.path.join("apps", "doom", "doom_main.c"),
         os.path.join("apps", "doom", "port", "doomgeneric_argon.c"),
         os.path.join("apps", "doom", "port", "i_sound_argon.c"),
+        os.path.join("apps", "doom", "port", "i_music_argon.c"),
+        os.path.join("apps", "common", "fm", "ag_fm.c"),
         os.path.join("apps", "common", "libc", "libc_shim.c"),
     ] + cores
     doom = [
@@ -89,6 +91,8 @@ def main():
         "sdk/include",
         "--include",
         "apps/common",
+        "--include",
+        "apps/common/fm",
         "--include",
         "apps/common/libc",
         "--include",
