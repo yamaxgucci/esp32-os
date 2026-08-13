@@ -323,7 +323,11 @@ void I_GetEvent(void)
             {
                 D_PostEvent(&event);
             }
+#ifdef ARGON_TARGET
+            /* One tic per slow QEMU frame: drain the whole queue. */
+#else
             break;
+#endif
         }
     }
 

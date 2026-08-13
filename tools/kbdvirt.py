@@ -6,10 +6,9 @@ Guest listens on TCP :5561 (QEMU hostfwd).  8-byte LE packets:
   type(1) mods(1) hid(u16) unicode(u16) repeat(1) pad(1)
 
 GetAsyncKeyState is global, so keys work while the QEMU SDL window is
-focused (that window is video-only).  Starts **paused** so typing at the
-serial console (and Ctrl+C in other windows) is not dumped into the guest
-when Doom first opens /dev/kbd0.  Right-Ctrl toggles capture.  Ctrl+C
-quits this tool (not sent to the guest).
+focused (that window is video-only).  Capture follows that window: click
+the QEMU RGB view to play, click the serial console to type at A:\\>.
+Right-Ctrl force-pauses.  Ctrl+C is not sent to the guest.
 
 Typical:
 
@@ -20,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import ctypes.wintypes as wt
 import socket
 import struct
 import sys
@@ -97,6 +97,34 @@ for i in range(9):
     VK_TO_HID[VK_1 + i] = HID_1 + i
 VK_TO_HID[VK_0] = HID_0
 
+WNDENUMPROC = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
+
+
+def hwnd_i(h: object | None) -> int:
+    return int(h) if h else 0
+
+
+def find_qemu_hwnd(user32: ctypes.WinDLL) -> int:
+    found = wt.HWND(0)
+    holders: list[object] = []
+
+    def _enum(hwnd: int, _lparam: int) -> bool:
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        buf = ctypes.create_unicode_buffer(256)
+        if user32.GetWindowTextW(hwnd, buf, 256) <= 0:
+            return True
+        low = buf.value.lower()
+        if "qemu" in low or "argonos" in low:
+            found.value = hwnd
+            return False
+        return True
+
+    cb = WNDENUMPROC(_enum)
+    holders.append(cb)
+    user32.EnumWindows(cb, 0)
+    return hwnd_i(found.value)
+
 
 def pack_pkt(typ: int, mods: int, hid: int, unicode: int = 0, repeat: int = 0) -> bytes:
     return struct.pack("<BBHHBB", typ, mods & 0xFF, hid & 0xFFFF, unicode & 0xFFFF,
@@ -129,22 +157,38 @@ def main() -> int:
     args = ap.parse_args()
 
     user32 = ctypes.windll.user32
+    user32.EnumWindows.argtypes = (WNDENUMPROC, wt.LPARAM)
+    user32.EnumWindows.restype = wt.BOOL
+    user32.IsWindowVisible.argtypes = (wt.HWND,)
+    user32.IsWindowVisible.restype = wt.BOOL
+    user32.GetWindowTextW.argtypes = (wt.HWND, wt.LPWSTR, ctypes.c_int)
+    user32.GetWindowTextW.restype = ctypes.c_int
+    user32.GetForegroundWindow.argtypes = ()
+    user32.GetForegroundWindow.restype = wt.HWND
     period = 1.0 / max(args.hz, 1.0)
     sock: socket.socket | None = None
     prev: dict[int, bool] = {vk: False for vk in VK_TO_HID}
     paused = True
-    rctrl_was = False
+    qemu_hwnd = 0
+    last_find = 0.0
 
     print(
         f"kbdvirt → {args.host}:{args.port}  "
-        f"(RCtrl=toggle capture, starts PAUSED; Ctrl+C=quit this tool)",
+        f"(click QEMU window to capture; RCtrl pauses; Ctrl+C=quit)",
         flush=True,
     )
 
     while True:
+        now_t = time.monotonic()
+        if qemu_hwnd == 0 or (now_t - last_find) >= 1.0:
+            qemu_hwnd = find_qemu_hwnd(user32)
+            last_find = now_t
+
+        fg = hwnd_i(user32.GetForegroundWindow())
         rctrl = bool(user32.GetAsyncKeyState(VK_RCONTROL) & 0x8000)
-        if rctrl and not rctrl_was:
-            paused = not paused
+        want_paused = rctrl or qemu_hwnd == 0 or fg != qemu_hwnd
+        if want_paused != paused:
+            paused = want_paused
             if paused:
                 for vk in prev:
                     if prev[vk]:
@@ -156,12 +200,11 @@ def main() -> int:
                             except OSError:
                                 pass
                     prev[vk] = False
-                print("capture OFF (RCtrl to arm)", flush=True)
+                print("capture OFF (click QEMU / release RCtrl)", flush=True)
             else:
                 for vk, hid in VK_TO_HID.items():
                     prev[vk] = bool(user32.GetAsyncKeyState(vk) & 0x8000)
                 print("capture ON", flush=True)
-        rctrl_was = rctrl
 
         edges: list[tuple[int, int, int]] = []
         for vk, hid in VK_TO_HID.items():

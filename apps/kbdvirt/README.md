@@ -59,6 +59,6 @@ the host tool (not HostFS PADPUSH).
 `-Virt` (or `argon virt` / `python tools/virt.py`) starts kbdvirt with pcmplay
 and mousevirt. Standalone: `python tools/kbdvirt.py --reconnect`.
 
-Right-Ctrl **toggles** capture (starts **paused**). Ctrl+C quits the host
-tool and is not forwarded. Arrows / Ctrl / Shift / Space / Enter / Esc
-match vanilla Doom.
+Right-Ctrl **pauses** capture (held). Click the QEMU RGB window to send keys;
+the serial console does not. Ctrl+C is not forwarded. Arrows / Ctrl / Shift /
+Space / Enter / Esc match vanilla Doom.

@@ -23,7 +23,7 @@ ArgonOS
                            (Ctrl+A then X quits the emulator)
   argon run -Gfx           same + SDL window with live RGB (gfx / SMS)
   argon run -Virt          also start pcmplay + kbdvirt + mousevirt (reconnect);
-                           Right-Ctrl arms keyboard / pauses mouse
+                           click the QEMU window to capture keys; Right-Ctrl pauses
   argon virt               same helpers in this window (QEMU already running)
   argon run -HostFs DIR    live Windows folder as guest H: (UART1 helper);
                            pushes SMS pad (~60 Hz) when sms.cfg is present

@@ -211,7 +211,7 @@ if ($Virt) {
         throw ("virt helpers exited immediately (exit {0}). {1}" -f `
             $virtProc.ExitCode, ($tail -join ' '))
     }
-    Write-Host "Virt: pcmplay :5558, kbdvirt :5561 (PAUSED, Right-Ctrl arms), mousevirt :5560"
+    Write-Host "Virt: pcmplay :5558, kbdvirt :5561 (click QEMU to capture), mousevirt :5560"
     Write-Host "      python $py"
     Write-Host "      logs $virtOut  (killed when QEMU exits)"
 }
@@ -244,7 +244,7 @@ if ($Tcp) {
     Write-Host 'The board waits for your connection before booting.'
     if ($Gfx) {
         if ($Virt) {
-            Write-Host 'SDL window: live RGB. Virt helpers: pcm/kbd/mouse (Right-Ctrl arms kbd).'
+            Write-Host 'SDL window: live RGB. Virt helpers: pcm/kbd/mouse (click QEMU to capture keys).'
         } else {
             Write-Host 'SDL window: live RGB. Keys: serial console here, or argon run -Virt.'
         }
@@ -255,7 +255,7 @@ if ($Tcp) {
     $qemuArgs += @('-display', 'sdl', '-serial', 'mon:stdio')
     Write-Host 'ArgonOS: SDL RGB window + console here.'
     if ($Virt) {
-        Write-Host 'Doom keys/mouse/audio: virt helpers already running (Right-Ctrl arms kbd).'
+        Write-Host 'Doom keys/mouse/audio: virt helpers already running (click the QEMU window).'
     } else {
         Write-Host 'Doom keys: argon run -Virt   (or: python tools/virt.py)'
     }

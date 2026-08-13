@@ -218,8 +218,9 @@ int ag_main(int argc, char **argv)
                 break;
             }
             if (frames < 0 && !ag_focused()) {
+                doom_argon_service();
                 ag_heartbeat();
-                ag_delay(50);
+                ag_delay(20);
                 continue;
             }
             doomgeneric_Tick();
