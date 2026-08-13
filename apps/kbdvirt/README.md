@@ -36,8 +36,10 @@ python tools/mkaxe.py --arch xtensa --gcc xtensa-esp32s3-elf-gcc `
 
 ```
 dir a:\kbdvirt.sys
-drv install a:\kbdvirt.sys
+virt
 ```
+
+`virt` is `A:\VIRT.BAT` (kbd + pcm + mouse). Only this driver: `drv install a:\kbdvirt.sys`.
 
 Persists via `[modules]` in `C:\SYSTEM.CFG`. This session only: `drv load a:\kbdvirt.sys`.
 
@@ -50,7 +52,7 @@ the host tool (not HostFS PADPUSH).
 
 ```powershell
 .\argon.cmd run -Gfx -Sd -Virt
-# guest, once:  drv install a:\kbdvirt.sys
+# guest, once:  virt          (A:\VIRT.BAT — kbd + pcm + mouse)
 # guest:        run a:\doom.axe -iwad a:\doom1.wad
 ```
 

@@ -60,11 +60,14 @@ argon run -Gfx -Sd -Virt
 background and kills them when QEMU exits. Same helpers without QEMU:
 `argon virt` (or `python tools/virt.py`).
 
-Guest (once; `.SYS` files are on `A:`, not the RAM disk `T:`):
+Guest (once; `.SYS` files are on `A:`, not the RAM disk `T:`). Cwd is `A:\`,
+so `virt` runs `VIRT.BAT`:
 
 ```
-drv install a:\kbdvirt.sys a:\pcmvirt.sys a:\mousevirt.sys
+virt
 ```
+
+Same as `call a:\virt.bat` — three `drv install` lines, then autoload on boot.
 
 ```
 run a:\doom.axe -iwad a:\doom1.wad pcmvirt
