@@ -36,31 +36,43 @@ Needs `xtensa-esp32s3-elf-gcc` on PATH (IDF export).
 python apps/doom/build.py
 ```
 
-Stages `build/apps/DOOM.AXE` and `build/sd_card/DOOM.AXE`.
+Builds `DOOM.AXE` and `KBDVIRT.SYS`, stages them into `build/sd_card/`, then
+bakes `build/sdcard.img` (put `doom1.wad` in `build/sd_card/` yourself).
 
 ## Run
 
+Input is **KBDVIRT**, not HostFS PADPUSH. WAD and `.AXE` come from the SD
+image (`A:`).
+
+```
+argon run -Gfx -Sd
+```
+
+Guest (once): `drv install a:\kbdvirt.sys`
+
+```
+run a:\doom.axe -iwad a:\doom1.wad
+```
+
+Host (second terminal):
+
+```
+python tools/kbdvirt.py --reconnect
+```
+
+Arrows move, Ctrl fire, Space use, Shift run, Enter, Esc menu. Right-Ctrl
+on the host pauses injection so you can type at the serial console.
+
 The QEMU RGB window stays **black until the first presented frame** — after
-`R_Init` / `P_Init` / `I_InitGraphics`. `R_Init` on HostFS (`h:`) is slow:
-every sprite lump is a UART round-trip. Prefer the WAD on `A:` (`argon sync`
-then `run a:\doom.axe -iwad a:\doom1.wad`), or wait until dots after
-`sprites` finish.
+`R_Init` / `P_Init` / `I_InitGraphics`. Watch `textures` / `flats` / `sprites`
+dots. QEMU is slow on the software renderer (seconds to minutes per frame);
+see `docs/07-emulator-performance.md`.
+
+Warp straight into shareware E1M1:
 
 ```
-argon run -Gfx -HostFs build\sd_card
-run h:\doom.axe -iwad h:\doom1.wad
-```
-
-Warp straight into shareware E1M1 (handy for a timed QEMU test):
-
-```
-run h:\doom.axe -iwad h:\doom1.wad -warp 1 1 -skill 3 frames90
+run a:\doom.axe -iwad a:\doom1.wad -warp 1 1 -skill 3 frames90
 ```
 
 `frames90` exits after 90 ticks (not a bare number — that would clash with `-warp`).
-QEMU is slow on the software renderer (seconds to minutes per frame);
-that is expected, see `docs/07-emulator-performance.md`.
-
-Pad (HostFS PADPUSH, same as MD/SMS): D-pad, B1 fire, B2 use, C run, Start
-Enter, Pause Esc, Y/X = y/n, Quit exits. `nolivepad` falls back to serial
-sticky keys (no key-up).
+`livepad` turns HostFS PADPUSH back on if you really want it.

@@ -151,14 +151,14 @@ if ($Tcp) {
     Write-Host "  Host Name 127.0.0.1, Port $Port, then Open."
     Write-Host 'The board waits for your connection before booting.'
     if ($Gfx) {
-        Write-Host 'SDL window: live RGB. With -HostFs, pad keys work with SDL focus.'
+        Write-Host 'SDL window: live RGB. Keys: serial console here, or kbdvirt.py :5561.'
     }
     Write-Host 'Press Ctrl+C here to stop the emulator.'
 } elseif ($Gfx) {
     # Video in an SDL window; console + keyboard on this terminal.
     $qemuArgs += @('-display', 'sdl', '-serial', 'mon:stdio')
     Write-Host 'ArgonOS: SDL RGB window + console here.'
-    Write-Host 'With -HostFs, SMS pad works with SDL focus (host push).'
+    Write-Host 'Doom keys: python tools/kbdvirt.py --reconnect (not HostFS PADPUSH).'
     Write-Host 'Ctrl+A then X quits the emulator.'
 } else {
     $qemuArgs += @('-nographic', '-serial', 'mon:stdio')
