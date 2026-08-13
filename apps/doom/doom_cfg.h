@@ -11,7 +11,7 @@
 #define DOOMGENERIC_RESX 320
 #define DOOMGENERIC_RESY 200
 
-/* Mute milestone: no SDL mixer / FEATURE_SOUND. */
+/* Sound is ARGON_TARGET's i_sound_argon.c, not SDL_mixer / FEATURE_SOUND. */
 #undef FEATURE_SOUND
 
 #endif

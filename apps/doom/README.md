@@ -4,7 +4,7 @@
 guest `.AXE`. The engine draws 320×200 pal8; the port integer-scales nearest
 (2× on the default 640×400 soft framebuffer) into RGB565.
 
-Sound is mute in this milestone.
+Sound: SFX mix to `/dev/pcmvirt` (music mute). Needs `PCMVIRT.SYS`.
 
 ## Licensing
 
@@ -27,6 +27,7 @@ supply the shareware IWAD yourself (freely redistributable).
 - `w_file_stdc.c` — 256 KiB WAD read cache (HostFS UART kills uncached R_Init)
 - `r_data.c` — louder R_Init progress
 - `doomtype.h` — DOS path separators (`\` / `;`) so `h:\doom1.wad` parses
+- `i_sound.c` — register Argon `DG_sound_module` without SDL; 256 KiB sfx cache
 
 ## Build
 
@@ -36,8 +37,9 @@ Needs `xtensa-esp32s3-elf-gcc` on PATH (IDF export).
 python apps/doom/build.py
 ```
 
-Builds `DOOM.AXE` and `KBDVIRT.SYS`, stages them into `build/sd_card/`, then
-bakes `build/sdcard.img` (put `doom1.wad` in `build/sd_card/` yourself).
+Builds `DOOM.AXE`, `KBDVIRT.SYS`, and `PCMVIRT.SYS`, stages them into
+`build/sd_card/`, then bakes `build/sdcard.img` (put `doom1.wad` in
+`build/sd_card/` yourself).
 
 ## Run
 
@@ -49,16 +51,18 @@ argon run -Gfx -Sd
 ```
 
 Guest (once): `dir a:\kbdvirt.sys` then `drv install a:\kbdvirt.sys`
-(`T:` is the RAM disk; the `.SYS` is on `A:`). This session only: `drv load a:\kbdvirt.sys`.
+and `drv install a:\pcmvirt.sys`
+(`T:` is the RAM disk; the `.SYS` files are on `A:`).
 
 ```
-run a:\doom.axe -iwad a:\doom1.wad
+run a:\doom.axe -iwad a:\doom1.wad pcmvirt
 ```
 
-Host (second terminal):
+Host (two extra terminals):
 
 ```
 python tools/kbdvirt.py --reconnect
+python tools/pcmplay.py --reconnect
 ```
 
 Arrows move, Ctrl fire, Space use, Shift run, Enter, Esc menu.
@@ -78,3 +82,5 @@ run a:\doom.axe -iwad a:\doom1.wad -warp 1 1 -skill 3 frames90
 
 `frames90` exits after 90 ticks (not a bare number — that would clash with `-warp`).
 `livepad` turns HostFS PADPUSH back on if you really want it.
+`nosound` / `pcmnull` mute SFX; default is `pcmvirt` (`pcmplay.py` on :5558).
+QEMU SFX will stutter (seconds per frame); that is the renderer, not the mixer.

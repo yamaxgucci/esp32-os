@@ -4,5 +4,6 @@
 int  doom_argon_quit(void);
 int  doom_argon_poll_sys(void);
 void doom_argon_set_live_pad(int on);
+void doom_argon_set_sound_path(const char *path);
 
 #endif

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build DOOM.AXE, KBDVIRT.SYS, and bake build/sdcard.img from build/sd_card."""
+"""Build DOOM.AXE, KBDVIRT.SYS, PCMVIRT.SYS, and bake build/sdcard.img."""
 import glob
 import os
 import subprocess
@@ -35,10 +35,29 @@ def main():
     if err:
         return err
 
+    pcm = [
+        sys.executable,
+        mkaxe,
+        "--arch",
+        "xtensa",
+        "--gcc",
+        gcc,
+        "--include",
+        "sdk/include",
+        "-o",
+        os.path.join("build", "apps", "PCMVIRT.SYS"),
+        os.path.join("apps", "pcmvirt", "pcmvirt.c"),
+    ]
+    print("PCMVIRT.SYS")
+    err = run(pcm)
+    if err:
+        return err
+
     cores = sorted(glob.glob(os.path.join("apps", "doom", "core", "*.c")))
     sources = [
         os.path.join("apps", "doom", "doom_main.c"),
         os.path.join("apps", "doom", "port", "doomgeneric_argon.c"),
+        os.path.join("apps", "doom", "port", "i_sound_argon.c"),
         os.path.join("apps", "common", "libc", "libc_shim.c"),
     ] + cores
     doom = [

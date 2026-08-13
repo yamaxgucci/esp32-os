@@ -1,8 +1,8 @@
 /*
- * ArgonOS - Doom (doomgeneric). Mute milestone.
+ * ArgonOS - Doom (doomgeneric). SFX via /dev/pcmvirt; music mute.
  *
  *   python apps/doom/build.py
- *   run a:\doom.axe -iwad a:\doom1.wad
+ *   run a:\doom.axe -iwad a:\doom1.wad pcmvirt
  *
  * Core: doomgeneric / Chocolate Doom, GPLv2+.  This file: Apache-2.0.
  *
@@ -109,6 +109,14 @@ static int parse_frames_arg(const char *s, int *out)
     return 1;
 }
 
+static int is_sound_cli(const char *s)
+{
+    return arg_eq(s, "nosound") || arg_eq(s, "pcmnull") || arg_eq(s, "pcmvirt") ||
+           arg_eq(s, "mock") || arg_eq(s, "net") || arg_eq(s, "tcp") ||
+           arg_eq(s, "mix") || arg_eq(s, "pcmmix") || arg_eq(s, "audio") ||
+           arg_eq(s, "i2s") || arg_eq(s, "pcm0");
+}
+
 static const char *first_wad(int argc, char **argv)
 {
     int i;
@@ -143,17 +151,23 @@ int ag_main(int argc, char **argv)
     int          livepad = 0;
     int          frames = -1;
     int          have_iwad;
+    const char  *sound_path = "pcmvirt";
 
     for (i = 1; i < argc; i++) {
         if (arg_eq(argv[i], "livepad")) {
             livepad = 1;
         } else if (arg_eq(argv[i], "nolivepad")) {
             livepad = 0;
+        } else if (arg_eq(argv[i], "nosound") || arg_eq(argv[i], "mock")) {
+            sound_path = "nosound";
+        } else if (is_sound_cli(argv[i])) {
+            sound_path = argv[i];
         } else {
             (void)parse_frames_arg(argv[i], &frames);
         }
     }
     doom_argon_set_live_pad(livepad);
+    doom_argon_set_sound_path(sound_path);
 
     have_iwad = has_iwad_flag(argc, argv);
     wad = NULL;
@@ -187,7 +201,7 @@ int ag_main(int argc, char **argv)
     for (i = 1; i < argc && n < (int)(sizeof own / sizeof own[0]) - 1; i++) {
         int dummy = 0;
         if (arg_eq(argv[i], "nolivepad") || arg_eq(argv[i], "livepad") ||
-            parse_frames_arg(argv[i], &dummy)) {
+            is_sound_cli(argv[i]) || parse_frames_arg(argv[i], &dummy)) {
             continue;
         }
         if (!have_iwad && wad != NULL && argv[i] == wad) {

@@ -237,8 +237,10 @@ void I_BindSoundVariables(void);
 // Sound modules
 
 void I_InitTimidityConfig(void);
-#ifdef FEATURE_SOUND
+#if defined(FEATURE_SOUND) || defined(ARGON_TARGET)
 extern sound_module_t DG_sound_module;
+#endif
+#ifdef FEATURE_SOUND
 extern music_module_t DG_music_module;
 #endif
 extern sound_module_t sound_pcsound_module;
