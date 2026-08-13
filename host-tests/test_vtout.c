@@ -267,7 +267,7 @@ static void test_hello_and_goodbye(void)
     ag_vtout_t o;
     cap_reset();
     ag_vtout_hello(&o, cap_sink, NULL);
-    AG_CHECK_STR(captured(), "^[[0m^[[?7h^[[2J^[[H");
+    AG_CHECK_STR(captured(), "^[[0m^[[?7h^[[2J^[[H^[[?25h");
 
     /* A terminal that just attached owes the whole screen. */
     AG_CHECK(ag_vtout_pending(&o));

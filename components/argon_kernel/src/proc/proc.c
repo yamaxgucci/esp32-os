@@ -296,7 +296,11 @@ static void reap(proc_t *p)
         ag_audio_api_table.close();
     }
 
+    const bool restore_tty = (ag_session_focused_pid() == p->pid);
     ag_session_unbind(p->pid);
+    if (restore_tty) {
+        ag_console_restore_tty();
+    }
 
     ag_loader_unload(&p->app);
 
@@ -317,16 +321,11 @@ static void reap(proc_t *p)
 
 /* Whatever the application did to the console, the next thing to print gets it
  * back in a known state.  Done here as well as in the shell, because a killed
- * process never reaches the shell's tidying up. */
+ * process never reaches the shell's tidying up — and neither does a normal
+ * `run` exit (background spawn, supervisor reaps). */
 static void console_restore(void)
 {
-    if (!ag_console_ready()) {
-        return;
-    }
-    ag_console_lock();
-    ag_screen_set_attr(ag_console_screen(), AG_ATTR_DEFAULT);
-    ag_screen_set_cursor(ag_console_screen(), true);
-    ag_console_unlock();
+    ag_console_restore_tty();
 }
 
 /*

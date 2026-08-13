@@ -126,6 +126,19 @@ int gfxbench_backend_init(const ag_gfxinfo_t *gi, const gfxbench_layout_t *L)
     return 0;
 }
 
+void gfxbench_backend_on_reacquire(const ag_gfxinfo_t *gi)
+{
+    uint32_t buf_sz;
+    if (s_disp == NULL || gi->fb == NULL) {
+        return;
+    }
+    buf_sz = (uint32_t)gi->stride * (uint32_t)gi->height;
+    lv_display_set_buffers_with_stride(s_disp, gi->fb, NULL, buf_sz,
+                                       (uint32_t)gi->stride,
+                                       LV_DISPLAY_RENDER_MODE_DIRECT);
+    lv_obj_invalidate(lv_screen_active());
+}
+
 void gfxbench_backend_frame(const gfxbench_state_t *st,
                             const gfxbench_layout_t *L, gfxbench_mode_t mode,
                             gfxbench_timing_t *t)

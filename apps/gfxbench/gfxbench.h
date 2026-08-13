@@ -60,6 +60,7 @@ const char *gfxbench_track_name(int i);
 
 int         gfxbench_backend_init(const ag_gfxinfo_t *gi,
                                   const gfxbench_layout_t *L);
+void        gfxbench_backend_on_reacquire(const ag_gfxinfo_t *gi);
 void        gfxbench_backend_frame(const gfxbench_state_t *st,
                                    const gfxbench_layout_t *L,
                                    gfxbench_mode_t mode, gfxbench_timing_t *t);

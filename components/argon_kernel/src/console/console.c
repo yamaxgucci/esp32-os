@@ -249,6 +249,23 @@ void ag_console_sync(void)
     ag_console_unlock();
 }
 
+void ag_console_restore_tty(void)
+{
+    if (!s_ready) {
+        return;
+    }
+    ag_console_lock();
+    ag_screen_set_attr(&s_screen, AG_ATTR_DEFAULT);
+    ag_screen_set_cursor(&s_screen, true);
+    for (int i = 0; i < AG_CON_MAX_ENDPOINTS; i++) {
+        if (s_endpoints[i].used) {
+            /* Next flush emits ?25h even if we already thought it was shown. */
+            s_endpoints[i].out.cursor_visible = false;
+        }
+    }
+    ag_console_unlock();
+}
+
 /* ---------------------------------------------------------------------- */
 /* Input                                                                  */
 /* ---------------------------------------------------------------------- */
