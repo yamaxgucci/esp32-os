@@ -2,6 +2,7 @@
 """Build DOOM.AXE, KBDVIRT/PCMVIRT/MOUSEVIRT.SYS, and bake build/sdcard.img."""
 import glob
 import os
+import shutil
 import subprocess
 import sys
 
@@ -115,6 +116,10 @@ def main():
 
     share = os.path.join("build", "sd_card")
     os.makedirs(share, exist_ok=True)
+    shutil.copy2(
+        os.path.join("apps", "doom", "virt.bat"),
+        os.path.join(share, "VIRT.BAT"),
+    )
     img = [
         sys.executable,
         os.path.join("tools", "mkfatimg.py"),
