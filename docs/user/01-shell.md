@@ -379,7 +379,7 @@ sd0       storage   sdmmc       64 MB      read-only removable
 ```
 
 **`drv`** — загруженные модули `.SYS`. Без аргументов — список; `drv load
-<file>` поднимает модуль сейчас; `drv install <file>` копирует на `C:\drv\`
+<file>` поднимает модуль сейчас; `drv install <file> [file …]` копирует на `C:\drv\`
 (`/sys/drv/`, lowercase — LittleFS чувствителен к регистру), прописывает
 `[modules] device=` в `C:\SYSTEM.CFG` и грузит (после reboot модуль
 поднимается сам и снова публикует устройства в `dev`). Повторный
@@ -391,8 +391,10 @@ sd0       storage   sdmmc       64 MB      read-only removable
 это не приложение.
 
 ```
-A:\> drv install t:\pcmvirt.sys
-installed c:\drv\pcmvirt.sys (autoload on boot)
+A:\> drv install a:\kbdvirt.sys a:\pcmvirt.sys a:\mousevirt.sys
+installed c:\drv\kbdvirt.sys (loaded; autoload on boot)
+installed c:\drv\pcmvirt.sys (loaded; autoload on boot)
+installed c:\drv\mousevirt.sys (loaded; autoload on boot)
 A:\> drv
 name      version  code       data       path
 PCMVIRT   1.0      ...        ...        /sys/drv/pcmvirt.sys

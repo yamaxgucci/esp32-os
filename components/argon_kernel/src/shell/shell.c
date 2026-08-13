@@ -1083,7 +1083,7 @@ static ag_err_t drv_copy_file(const char *src_abs, const char *dst_abs)
     return (n < 0) ? (ag_err_t)n : AG_OK;
 }
 
-static int cmd_drv_install(int argc, char **argv)
+static int drv_install_one(const char *spec)
 {
     char        src_res[AG_PATH_MAX];
     char        drv_dir[AG_PATH_MAX];
@@ -1093,13 +1093,9 @@ static int cmd_drv_install(int argc, char **argv)
     ag_err_t    err;
     ag_stat_t   st;
 
-    if (argc != 3) {
-        ag_console_puts("usage: drv install <file.sys>\n");
-        return 1;
-    }
-    err = ag_path_resolve(argv[2], s_cwd, src_res, sizeof(src_res));
+    err = ag_path_resolve(spec, s_cwd, src_res, sizeof(src_res));
     if (err != AG_OK) {
-        ag_console_printf("%s: %d\n", argv[2], (int)err);
+        ag_console_printf("%s: %d\n", spec, (int)err);
         return 1;
     }
     base = ag_path_basename(src_res);
@@ -1108,7 +1104,7 @@ static int cmd_drv_install(int argc, char **argv)
         return 1;
     }
     if (ag_vfs_stat(src_res, NULL, &st) != AG_OK) {
-        ag_console_printf("%s: file not found\n", argv[2]);
+        ag_console_printf("%s: file not found\n", spec);
         if (strncmp(src_res, "/sd", 3) == 0 &&
             ag_vfs_stat("/sd", NULL, &st) != AG_OK) {
             ag_console_puts("A: is not mounted (argon run -Sd)\n");
@@ -1157,6 +1153,23 @@ static int cmd_drv_install(int argc, char **argv)
     }
     ag_console_printf("installed %s (loaded; autoload on boot)\n", dos_path);
     return 0;
+}
+
+static int cmd_drv_install(int argc, char **argv)
+{
+    int failed = 0;
+    int i;
+
+    if (argc < 3) {
+        ag_console_puts("usage: drv install <file.sys> [file.sys ...]\n");
+        return 1;
+    }
+    for (i = 2; i < argc; i++) {
+        if (drv_install_one(argv[i]) != 0) {
+            failed++;
+        }
+    }
+    return failed ? 1 : 0;
 }
 
 static int cmd_drv_uninstall(int argc, char **argv)

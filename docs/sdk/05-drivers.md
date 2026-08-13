@@ -70,6 +70,7 @@ probe  = 0:0x76:0xD0=0x60:a:\drv\bme280.sys
 
 ```
 drv install t:\pcmvirt.sys
+drv install a:\kbdvirt.sys a:\pcmvirt.sys a:\mousevirt.sys
 ```
 
 Повторный `drv install` того же драйвера перезаписывает файл и **перезагружает**
