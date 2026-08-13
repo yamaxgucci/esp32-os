@@ -335,12 +335,11 @@ void I_GetEvent(void)
     {
         int buttons;
         int dx;
-        int dy;
-        while (doom_argon_get_mouse(&buttons, &dx, &dy)) {
+        while (doom_argon_get_mouse(&buttons, &dx, NULL)) {
             event.type = ev_mouse;
             event.data1 = buttons;
             event.data2 = dx;
-            event.data3 = -dy;
+            event.data3 = 0; /* mouse turns only; walk is WASD */
             event.data4 = 0;
             D_PostEvent(&event);
         }

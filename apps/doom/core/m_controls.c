@@ -26,12 +26,19 @@
 // Keyboard controls
 //
 
-int key_right = KEY_RIGHTARROW;
-int key_left = KEY_LEFTARROW;
+#ifdef ARGON_TARGET
+int key_up = 'w';
+int key_down = 's';
+int key_strafeleft = 'a';
+int key_straferight = 'd';
+#else
 int key_up = KEY_UPARROW;
 int key_down = KEY_DOWNARROW; 
 int key_strafeleft = KEY_STRAFE_L;
 int key_straferight = KEY_STRAFE_R;
+#endif
+int key_right = KEY_RIGHTARROW;
+int key_left = KEY_LEFTARROW;
 int key_fire = KEY_FIRE;
 int key_use = KEY_USE;
 int key_strafe = KEY_RALT;
@@ -93,8 +100,13 @@ int key_invdrop   = KEY_BACKSPACE;
 //
 
 int mousebfire = 0;
+#ifdef ARGON_TARGET
+int mousebstrafe = -1;
+int mousebforward = -1;
+#else
 int mousebstrafe = 1;
 int mousebforward = 2;
+#endif
 
 int mousebjump = -1;
 
@@ -398,6 +410,15 @@ void M_BindChatControls(unsigned int num_players)
 
 void M_ApplyPlatformDefaults(void)
 {
-    // no-op. Add your platform-specific patches here.
+#ifdef ARGON_TARGET
+    /* FPS layout: WASD walk/strafe, mouse turns, LMB fires.  Re-apply after
+     * M_LoadDefaults so a leftover default.cfg cannot restore arrows. */
+    key_up = 'w';
+    key_down = 's';
+    key_strafeleft = 'a';
+    key_straferight = 'd';
+    mousebstrafe = -1;
+    mousebforward = -1;
+#endif
 }
 

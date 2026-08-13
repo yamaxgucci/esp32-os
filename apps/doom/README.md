@@ -73,10 +73,11 @@ Same as `call a:\virt.bat` — three `drv install` lines, then autoload on boot.
 run a:\doom.axe -iwad a:\doom1.wad pcmvirt
 ```
 
-Arrows move, Ctrl fire, Space use, Shift run, Enter, Esc menu.
-Mouse: X turn, Y walk, LMB fire, RMB strafe, wheel weapons.
 Click the **QEMU RGB window** so `kbdvirt` captures keys (the serial console
 keeps A:\\> typing). Right-Ctrl force-pauses kbd and mouse.
+
+**WASD** walk/strafe, **mouse** turns, **LMB** fire, Space use, Shift run,
+Esc menu, wheel weapons. Arrows still work in the menu.
 
 The QEMU RGB window stays **black until the first presented frame** — after
 `R_Init` / `P_Init` / `I_InitGraphics`. Watch `textures` / `flats` / `sprites`
