@@ -36,12 +36,13 @@
 
 // Sound sample rate to use for digital output (Hz)
 
+#ifdef ARGON_TARGET
+int snd_samplerate = 11025;
+int snd_cachesize = 256 * 1024;
+#else
 int snd_samplerate = 44100;
-
-// Maximum number of bytes to dedicate to allocated sound effects.
-// (Default: 64MB)
-
 int snd_cachesize = 64 * 1024 * 1024;
+#endif
 
 // Config variable that controls the sound buffer size.
 // We default to 28ms (1000 / 35fps = 1 buffer per tic).
@@ -73,9 +74,9 @@ static int snd_mport = 0;
 
 static sound_module_t *sound_modules[] = 
 {
-    #ifdef FEATURE_SOUND
+#if defined(FEATURE_SOUND) || defined(ARGON_TARGET)
     &DG_sound_module,
-    #endif
+#endif
     NULL,
 };
 
