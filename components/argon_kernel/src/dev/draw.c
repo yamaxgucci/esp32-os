@@ -552,28 +552,36 @@ void ag_draw_blit_tiled(ag_draw_surf_t *s, int32_t dx, int32_t dy, int32_t dw,
     }
 }
 
-void ag_draw_fill_convex_tex(ag_draw_surf_t *s, const ag_draw_texvert_t *pts,
-                             int n, const void *src, uint32_t src_stride,
-                             int32_t sx, int32_t sy, int32_t sw, int32_t sh)
+static int32_t lerp16(int32_t a, int32_t b, int32_t t, int32_t den)
 {
-    int32_t ymin;
-    int32_t ymax;
+    if (den == 0) {
+        return a << 16;
+    }
+    return (a << 16) + (int32_t)(((int64_t)(b - a) << 16) * t / den);
+}
+
+/* Affine UV on one triangle.  n-gons are fanned; span-UV on n>3 disagrees. */
+static void fill_tex_tri(ag_draw_surf_t *s, ag_draw_texvert_t a,
+                         ag_draw_texvert_t b, ag_draw_texvert_t c,
+                         const void *src, uint32_t src_stride, int32_t sx,
+                         int32_t sy, int32_t sw, int32_t sh)
+{
+    const ag_draw_texvert_t pts[3] = {a, b, c};
+    int32_t ymin = a.y;
+    int32_t ymax = a.y;
     int i;
 
-    if (s == NULL || s->pix == NULL || pts == NULL || src == NULL || n < 3 ||
-        sw <= 0 || sh <= 0) {
-        return;
+    if (b.y < ymin) {
+        ymin = b.y;
     }
-
-    ymin = pts[0].y;
-    ymax = pts[0].y;
-    for (i = 1; i < n; i++) {
-        if (pts[i].y < ymin) {
-            ymin = pts[i].y;
-        }
-        if (pts[i].y > ymax) {
-            ymax = pts[i].y;
-        }
+    if (c.y < ymin) {
+        ymin = c.y;
+    }
+    if (b.y > ymax) {
+        ymax = b.y;
+    }
+    if (c.y > ymax) {
+        ymax = c.y;
     }
     if (ymax < 0 || ymin >= (int32_t)s->h) {
         return;
@@ -593,29 +601,24 @@ void ag_draw_fill_convex_tex(ag_draw_surf_t *s, const ag_draw_texvert_t *pts,
         int32_t u_max = 0;
         int32_t v_max = 0;
         int hits = 0;
-        for (i = 0; i < n; i++) {
+        for (i = 0; i < 3; i++) {
             const int32_t y0 = pts[i].y;
-            const int32_t y1 = pts[(i + 1) % n].y;
+            const int32_t y1 = pts[(i + 1) % 3].y;
             const int32_t x0 = pts[i].x;
-            const int32_t x1 = pts[(i + 1) % n].x;
-            const int32_t tu0 = pts[i].u;
-            const int32_t tv0 = pts[i].v;
-            const int32_t tu1 = pts[(i + 1) % n].u;
-            const int32_t tv1 = pts[(i + 1) % n].v;
+            const int32_t x1 = pts[(i + 1) % 3].x;
+            const int32_t dy = y1 - y0;
             int32_t x;
             int32_t u;
             int32_t v;
-            int32_t dy;
-            if (y0 == y1) {
+            if (dy == 0) {
                 continue;
             }
             if ((y < y0 && y < y1) || (y >= y0 && y >= y1)) {
                 continue;
             }
-            dy = y1 - y0;
             x = x0 + (int32_t)((int64_t)(y - y0) * (x1 - x0) / dy);
-            u = tu0 + (int32_t)((int64_t)(y - y0) * (tu1 - tu0) / dy);
-            v = tv0 + (int32_t)((int64_t)(y - y0) * (tv1 - tv0) / dy);
+            u = lerp16(pts[i].u, pts[(i + 1) % 3].u, y - y0, dy);
+            v = lerp16(pts[i].v, pts[(i + 1) % 3].v, y - y0, dy);
             if (x < x_min) {
                 x_min = x;
                 u_min = u;
@@ -633,19 +636,34 @@ void ag_draw_fill_convex_tex(ag_draw_surf_t *s, const ag_draw_texvert_t *pts,
         }
         if (x_max == x_min) {
             ag_draw_pixel(s, x_min, y,
-                          sample_clamp(src, src_stride, sx, sy, sw, sh, u_min,
-                                       v_min));
+                          sample_clamp(src, src_stride, sx, sy, sw, sh,
+                                       u_min >> 16, v_min >> 16));
             continue;
         }
         for (int32_t x = x_min; x <= x_max; x++) {
+            const int32_t den = x_max - x_min;
             const int32_t u =
-                u_min +
-                (int32_t)((int64_t)(x - x_min) * (u_max - u_min) / (x_max - x_min));
+                u_min + (int32_t)((int64_t)(u_max - u_min) * (x - x_min) / den);
             const int32_t v =
-                v_min +
-                (int32_t)((int64_t)(x - x_min) * (v_max - v_min) / (x_max - x_min));
+                v_min + (int32_t)((int64_t)(v_max - v_min) * (x - x_min) / den);
             ag_draw_pixel(s, x, y,
-                          sample_clamp(src, src_stride, sx, sy, sw, sh, u, v));
+                          sample_clamp(src, src_stride, sx, sy, sw, sh, u >> 16,
+                                       v >> 16));
         }
+    }
+}
+
+void ag_draw_fill_convex_tex(ag_draw_surf_t *s, const ag_draw_texvert_t *pts,
+                             int n, const void *src, uint32_t src_stride,
+                             int32_t sx, int32_t sy, int32_t sw, int32_t sh)
+{
+    int i;
+    if (s == NULL || s->pix == NULL || pts == NULL || src == NULL || n < 3 ||
+        sw <= 0 || sh <= 0) {
+        return;
+    }
+    for (i = 1; i < n - 1; i++) {
+        fill_tex_tri(s, pts[0], pts[i], pts[i + 1], src, src_stride, sx, sy, sw,
+                     sh);
     }
 }
