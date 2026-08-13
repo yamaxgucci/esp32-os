@@ -472,3 +472,180 @@ int32_t ag_draw_text8x16(ag_draw_surf_t *s, int32_t x, int32_t y,
         return nfit * 8;
     }
 }
+
+static uint16_t load_rgb565(const void *src, uint32_t stride, int32_t x,
+                            int32_t y)
+{
+    const uint8_t *p =
+        (const uint8_t *)src + (uint32_t)y * stride + (uint32_t)x * 2u;
+    return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+}
+
+static uint16_t sample_clamp(const void *src, uint32_t stride, int32_t sx,
+                             int32_t sy, int32_t sw, int32_t sh, int32_t u,
+                             int32_t v)
+{
+    if (u < sx) {
+        u = sx;
+    }
+    if (v < sy) {
+        v = sy;
+    }
+    if (u >= sx + sw) {
+        u = sx + sw - 1;
+    }
+    if (v >= sy + sh) {
+        v = sy + sh - 1;
+    }
+    return load_rgb565(src, stride, u, v);
+}
+
+static int32_t wrap_dim(int32_t a, int32_t n)
+{
+    if (n <= 0) {
+        return 0;
+    }
+    a %= n;
+    if (a < 0) {
+        a += n;
+    }
+    return a;
+}
+
+void ag_draw_blit_scaled(ag_draw_surf_t *s, int32_t dx, int32_t dy, int32_t dw,
+                         int32_t dh, const void *src, uint32_t src_stride,
+                         int32_t sx, int32_t sy, int32_t sw, int32_t sh)
+{
+    int32_t row;
+    if (s == NULL || s->pix == NULL || src == NULL || dw <= 0 || dh <= 0 ||
+        sw <= 0 || sh <= 0) {
+        return;
+    }
+    for (row = 0; row < dh; row++) {
+        int32_t col;
+        const int32_t v = sy + (int32_t)((int64_t)row * sh / dh);
+        for (col = 0; col < dw; col++) {
+            const int32_t u = sx + (int32_t)((int64_t)col * sw / dw);
+            ag_draw_pixel(s, dx + col, dy + row,
+                          sample_clamp(src, src_stride, sx, sy, sw, sh, u, v));
+        }
+    }
+}
+
+void ag_draw_blit_tiled(ag_draw_surf_t *s, int32_t dx, int32_t dy, int32_t dw,
+                        int32_t dh, const void *src, uint32_t src_stride,
+                        int32_t sx, int32_t sy, int32_t sw, int32_t sh)
+{
+    int32_t row;
+    if (s == NULL || s->pix == NULL || src == NULL || dw <= 0 || dh <= 0 ||
+        sw <= 0 || sh <= 0) {
+        return;
+    }
+    for (row = 0; row < dh; row++) {
+        int32_t col;
+        const int32_t v = sy + wrap_dim(row, sh);
+        for (col = 0; col < dw; col++) {
+            const int32_t u = sx + wrap_dim(col, sw);
+            ag_draw_pixel(s, dx + col, dy + row,
+                          load_rgb565(src, src_stride, u, v));
+        }
+    }
+}
+
+void ag_draw_fill_convex_tex(ag_draw_surf_t *s, const ag_draw_texvert_t *pts,
+                             int n, const void *src, uint32_t src_stride,
+                             int32_t sx, int32_t sy, int32_t sw, int32_t sh)
+{
+    int32_t ymin;
+    int32_t ymax;
+    int i;
+
+    if (s == NULL || s->pix == NULL || pts == NULL || src == NULL || n < 3 ||
+        sw <= 0 || sh <= 0) {
+        return;
+    }
+
+    ymin = pts[0].y;
+    ymax = pts[0].y;
+    for (i = 1; i < n; i++) {
+        if (pts[i].y < ymin) {
+            ymin = pts[i].y;
+        }
+        if (pts[i].y > ymax) {
+            ymax = pts[i].y;
+        }
+    }
+    if (ymax < 0 || ymin >= (int32_t)s->h) {
+        return;
+    }
+    if (ymin < 0) {
+        ymin = 0;
+    }
+    if (ymax >= (int32_t)s->h) {
+        ymax = (int32_t)s->h - 1;
+    }
+
+    for (int32_t y = ymin; y <= ymax; y++) {
+        int32_t x_min = 0x7fffffff;
+        int32_t x_max = -0x7fffffff - 1;
+        int32_t u_min = 0;
+        int32_t v_min = 0;
+        int32_t u_max = 0;
+        int32_t v_max = 0;
+        int hits = 0;
+        for (i = 0; i < n; i++) {
+            const int32_t y0 = pts[i].y;
+            const int32_t y1 = pts[(i + 1) % n].y;
+            const int32_t x0 = pts[i].x;
+            const int32_t x1 = pts[(i + 1) % n].x;
+            const int32_t tu0 = pts[i].u;
+            const int32_t tv0 = pts[i].v;
+            const int32_t tu1 = pts[(i + 1) % n].u;
+            const int32_t tv1 = pts[(i + 1) % n].v;
+            int32_t x;
+            int32_t u;
+            int32_t v;
+            int32_t dy;
+            if (y0 == y1) {
+                continue;
+            }
+            if ((y < y0 && y < y1) || (y >= y0 && y >= y1)) {
+                continue;
+            }
+            dy = y1 - y0;
+            x = x0 + (int32_t)((int64_t)(y - y0) * (x1 - x0) / dy);
+            u = tu0 + (int32_t)((int64_t)(y - y0) * (tu1 - tu0) / dy);
+            v = tv0 + (int32_t)((int64_t)(y - y0) * (tv1 - tv0) / dy);
+            if (x < x_min) {
+                x_min = x;
+                u_min = u;
+                v_min = v;
+            }
+            if (x > x_max) {
+                x_max = x;
+                u_max = u;
+                v_max = v;
+            }
+            hits++;
+        }
+        if (hits < 2) {
+            continue;
+        }
+        if (x_max == x_min) {
+            ag_draw_pixel(s, x_min, y,
+                          sample_clamp(src, src_stride, sx, sy, sw, sh, u_min,
+                                       v_min));
+            continue;
+        }
+        for (int32_t x = x_min; x <= x_max; x++) {
+            const int32_t u =
+                u_min +
+                (int32_t)((int64_t)(x - x_min) * (u_max - u_min) / (x_max - x_min));
+            const int32_t v =
+                v_min +
+                (int32_t)((int64_t)(x - x_min) * (v_max - v_min) / (x_max - x_min));
+            ag_draw_pixel(s, x, y,
+                          sample_clamp(src, src_stride, sx, sy, sw, sh, u, v));
+        }
+    }
+}

@@ -276,12 +276,22 @@ static bool qemu_try_attach(uint16_t w, uint16_t h, uint16_t **out_fb)
 #define AG_POLY_MAX_VERTS 32
 
 static ag_point_t s_poly[AG_POLY_MAX_VERTS];
+static int16_t    s_poly_u[AG_POLY_MAX_VERTS];
+static int16_t    s_poly_v[AG_POLY_MAX_VERTS];
+static uint8_t    s_poly_uv_on[AG_POLY_MAX_VERTS];
 static int        s_poly_n;
 static bool       s_poly_active;
+static int16_t    s_uv_u;
+static int16_t    s_uv_v;
+static bool       s_uv_pending;
 
 /* Stateful RGB565 blit (ABI 0.17) — for Argon CC's 6-arg call limit. */
 static const void *s_blit_src;
 static uint32_t    s_blit_stride;
+static int16_t     s_blit_sx;
+static int16_t     s_blit_sy;
+static uint16_t    s_blit_sw;
+static uint16_t    s_blit_sh;
 
 /* Soft-draw clip (ABI 0.16).  Zero size means "whole framebuffer". */
 static int16_t  s_clip_x;
@@ -596,6 +606,38 @@ static void gfx_blit_bind(const void *src, uint32_t src_stride)
     s_blit_stride = src_stride;
 }
 
+static void gfx_blit_src_rect(int16_t sx, int16_t sy, uint16_t sw, uint16_t sh)
+{
+    s_blit_sx = sx;
+    s_blit_sy = sy;
+    s_blit_sw = sw;
+    s_blit_sh = sh;
+}
+
+static void gfx_blit_scaled(int16_t dx, int16_t dy, uint16_t dw, uint16_t dh)
+{
+    if (s_draw == NULL || s_blit_src == NULL || dw == 0 || dh == 0 ||
+        s_blit_sw == 0 || s_blit_sh == 0) {
+        return;
+    }
+    ag_draw_surf_t surf = draw_surf();
+    ag_draw_blit_scaled(&surf, dx, dy, (int32_t)dw, (int32_t)dh, s_blit_src,
+                        s_blit_stride, s_blit_sx, s_blit_sy, (int32_t)s_blit_sw,
+                        (int32_t)s_blit_sh);
+}
+
+static void gfx_blit_tiled(int16_t dx, int16_t dy, uint16_t dw, uint16_t dh)
+{
+    if (s_draw == NULL || s_blit_src == NULL || dw == 0 || dh == 0 ||
+        s_blit_sw == 0 || s_blit_sh == 0) {
+        return;
+    }
+    ag_draw_surf_t surf = draw_surf();
+    ag_draw_blit_tiled(&surf, dx, dy, (int32_t)dw, (int32_t)dh, s_blit_src,
+                       s_blit_stride, s_blit_sx, s_blit_sy, (int32_t)s_blit_sw,
+                       (int32_t)s_blit_sh);
+}
+
 static void gfx_blit_copy(int16_t x, int16_t y, uint16_t w, uint16_t h)
 {
     if (s_draw == NULL || s_blit_src == NULL || w == 0 || h == 0) {
@@ -678,6 +720,14 @@ static void gfx_poly_begin(void)
 {
     s_poly_n = 0;
     s_poly_active = true;
+    s_uv_pending = false;
+}
+
+static void gfx_poly_uv(int16_t u, int16_t v)
+{
+    s_uv_u = u;
+    s_uv_v = v;
+    s_uv_pending = true;
 }
 
 static ag_err_t gfx_poly_vertex(int16_t x, int16_t y)
@@ -690,6 +740,16 @@ static ag_err_t gfx_poly_vertex(int16_t x, int16_t y)
     }
     s_poly[s_poly_n].x = x;
     s_poly[s_poly_n].y = y;
+    if (s_uv_pending) {
+        s_poly_u[s_poly_n] = s_uv_u;
+        s_poly_v[s_poly_n] = s_uv_v;
+        s_poly_uv_on[s_poly_n] = 1;
+        s_uv_pending = false;
+    } else {
+        s_poly_u[s_poly_n] = 0;
+        s_poly_v[s_poly_n] = 0;
+        s_poly_uv_on[s_poly_n] = 0;
+    }
     s_poly_n++;
     return AG_OK;
 }
@@ -711,6 +771,76 @@ static void gfx_poly_stroke(uint32_t color)
     }
     ag_draw_surf_t s = draw_surf();
     ag_draw_stroke_convex(&s, s_poly, s_poly_n, rgb_to_565(color));
+    s_poly_active = false;
+}
+
+static void gfx_poly_fill_tex(void)
+{
+    ag_draw_texvert_t verts[AG_POLY_MAX_VERTS];
+    int i;
+    int any_uv = 0;
+    if (!s_poly_active || s_poly_n < 3 || s_draw == NULL || s_blit_src == NULL ||
+        s_blit_sw == 0 || s_blit_sh == 0) {
+        s_poly_active = false;
+        return;
+    }
+    for (i = 0; i < s_poly_n; i++) {
+        if (s_poly_uv_on[i]) {
+            any_uv = 1;
+            break;
+        }
+    }
+    if (!any_uv) {
+        int32_t minx = s_poly[0].x;
+        int32_t maxx = s_poly[0].x;
+        int32_t miny = s_poly[0].y;
+        int32_t maxy = s_poly[0].y;
+        for (i = 1; i < s_poly_n; i++) {
+            if (s_poly[i].x < minx) {
+                minx = s_poly[i].x;
+            }
+            if (s_poly[i].x > maxx) {
+                maxx = s_poly[i].x;
+            }
+            if (s_poly[i].y < miny) {
+                miny = s_poly[i].y;
+            }
+            if (s_poly[i].y > maxy) {
+                maxy = s_poly[i].y;
+            }
+        }
+        for (i = 0; i < s_poly_n; i++) {
+            verts[i].x = s_poly[i].x;
+            verts[i].y = s_poly[i].y;
+            if (maxx == minx) {
+                verts[i].u = s_blit_sx;
+            } else {
+                verts[i].u = (int16_t)(s_blit_sx + (int32_t)(s_poly[i].x - minx) *
+                                                       (int32_t)(s_blit_sw - 1) /
+                                                       (maxx - minx));
+            }
+            if (maxy == miny) {
+                verts[i].v = s_blit_sy;
+            } else {
+                verts[i].v = (int16_t)(s_blit_sy + (int32_t)(s_poly[i].y - miny) *
+                                                       (int32_t)(s_blit_sh - 1) /
+                                                       (maxy - miny));
+            }
+        }
+    } else {
+        for (i = 0; i < s_poly_n; i++) {
+            verts[i].x = s_poly[i].x;
+            verts[i].y = s_poly[i].y;
+            verts[i].u = s_poly_u[i];
+            verts[i].v = s_poly_v[i];
+        }
+    }
+    {
+        ag_draw_surf_t s = draw_surf();
+        ag_draw_fill_convex_tex(&s, verts, s_poly_n, s_blit_src, s_blit_stride,
+                                s_blit_sx, s_blit_sy, (int32_t)s_blit_sw,
+                                (int32_t)s_blit_sh);
+    }
     s_poly_active = false;
 }
 
@@ -793,6 +923,11 @@ const ag_gfx_api_t ag_gfx_api_table = {
     .blit_copy = gfx_blit_copy,
     .blit_keyed = gfx_blit_keyed,
     .text_fit = gfx_text_fit,
+    .blit_src_rect = gfx_blit_src_rect,
+    .blit_scaled = gfx_blit_scaled,
+    .blit_tiled = gfx_blit_tiled,
+    .poly_uv = gfx_poly_uv,
+    .poly_fill_tex = gfx_poly_fill_tex,
 };
 
 /* ---------------------------------------------------------------------- */

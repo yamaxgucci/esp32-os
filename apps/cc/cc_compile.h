@@ -103,6 +103,11 @@ extern "C" {
 #define GFX_OFF_BLIT_COPY       104
 #define GFX_OFF_BLIT_KEYED      108
 #define GFX_OFF_TEXT_FIT        112
+#define GFX_OFF_BLIT_SRC_RECT   116
+#define GFX_OFF_BLIT_SCALED     120
+#define GFX_OFF_BLIT_TILED      124
+#define GFX_OFF_POLY_UV         128
+#define GFX_OFF_POLY_FILL_TEX   132
 
 #define AUDIO_OFF_PRESENT 4
 #define AUDIO_OFF_IS_HW   8
@@ -123,6 +128,7 @@ extern "C" {
 #define ABI_MINOR_GFX16  16
 #define ABI_MINOR_GFX17  17
 #define ABI_MINOR_GFX25  25
+#define ABI_MINOR_GFX26  26
 #define ABI_MINOR_FOCUS  20
 
 typedef struct {

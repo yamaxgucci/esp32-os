@@ -152,6 +152,16 @@ _Static_assert(SUB_SLOT(ag_gfx_api_t, blit_keyed) == GFX_OFF_BLIT_KEYED,
                "gfx.blit_keyed moved");
 _Static_assert(SUB_SLOT(ag_gfx_api_t, text_fit) == GFX_OFF_TEXT_FIT,
                "gfx.text_fit moved");
+_Static_assert(SUB_SLOT(ag_gfx_api_t, blit_src_rect) == GFX_OFF_BLIT_SRC_RECT,
+               "gfx.blit_src_rect moved");
+_Static_assert(SUB_SLOT(ag_gfx_api_t, blit_scaled) == GFX_OFF_BLIT_SCALED,
+               "gfx.blit_scaled moved");
+_Static_assert(SUB_SLOT(ag_gfx_api_t, blit_tiled) == GFX_OFF_BLIT_TILED,
+               "gfx.blit_tiled moved");
+_Static_assert(SUB_SLOT(ag_gfx_api_t, poly_uv) == GFX_OFF_POLY_UV,
+               "gfx.poly_uv moved");
+_Static_assert(SUB_SLOT(ag_gfx_api_t, poly_fill_tex) == GFX_OFF_POLY_FILL_TEX,
+               "gfx.poly_fill_tex moved");
 
 _Static_assert(SUB_SLOT(ag_audio_api_t, present) == AUDIO_OFF_PRESENT,
                "audio.present moved");

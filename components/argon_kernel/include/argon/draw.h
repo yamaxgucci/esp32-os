@@ -77,6 +77,30 @@ int32_t ag_draw_text8x16(ag_draw_surf_t *s, int32_t x, int32_t y,
                          const uint8_t font[256][16], const char *str,
                          uint16_t fg, uint16_t bg, int trans, int32_t max_w);
 
+/* Vertex with texture coordinates in source pixels. */
+typedef struct {
+    int16_t x;
+    int16_t y;
+    int16_t u;
+    int16_t v;
+} ag_draw_texvert_t;
+
+/*
+ * Nearest-neighbour stretch / tile of an RGB565 LE rectangle.  Sample
+ * coordinates are clamped (scaled) or wrapped (tiled) inside sx,sy,sw,sh.
+ */
+void ag_draw_blit_scaled(ag_draw_surf_t *s, int32_t dx, int32_t dy, int32_t dw,
+                         int32_t dh, const void *src, uint32_t src_stride,
+                         int32_t sx, int32_t sy, int32_t sw, int32_t sh);
+void ag_draw_blit_tiled(ag_draw_surf_t *s, int32_t dx, int32_t dy, int32_t dw,
+                        int32_t dh, const void *src, uint32_t src_stride,
+                        int32_t sx, int32_t sy, int32_t sw, int32_t sh);
+
+/* Affine-map RGB565 LE onto a convex polygon (nearest, UV clamped to src rect). */
+void ag_draw_fill_convex_tex(ag_draw_surf_t *s, const ag_draw_texvert_t *pts,
+                             int n, const void *src, uint32_t src_stride,
+                             int32_t sx, int32_t sy, int32_t sw, int32_t sh);
+
 /* 0x00RRGGBB → RGB565 */
 uint16_t ag_draw_rgb_to_565(uint32_t color);
 

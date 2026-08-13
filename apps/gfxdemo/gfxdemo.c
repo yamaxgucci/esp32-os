@@ -93,6 +93,34 @@ int ag_main(int argc, char **argv)
         ag_gfx_blit(248, 188, 24, 24, blob, 24u * 4u, AG_PIX_ARGB8888);
     }
 
+    /* RGB565 nearest scale, tile, and a textured diamond. */
+    {
+        uint16_t tex[8 * 8];
+        int y;
+        for (y = 0; y < 8; y++) {
+            int x;
+            for (x = 0; x < 8; x++) {
+                tex[y * 8 + x] =
+                    ((x ^ y) & 1) ? (uint16_t)0xF800 : (uint16_t)0x07E0;
+            }
+        }
+        ag_gfx_blit_bind(tex, 16);
+        ag_gfx_blit_src_rect(0, 0, 8, 8);
+        ag_gfx_blit_scaled(400, 280, 48, 48);
+        ag_gfx_blit_tiled(456, 280, 64, 32);
+        ag_gfx_poly_begin();
+        ag_gfx_poly_uv(0, 0);
+        (void)ag_gfx_poly_vertex(540, 300);
+        ag_gfx_poly_uv(7, 0);
+        (void)ag_gfx_poly_vertex(580, 280);
+        ag_gfx_poly_uv(7, 7);
+        (void)ag_gfx_poly_vertex(620, 300);
+        ag_gfx_poly_uv(0, 7);
+        (void)ag_gfx_poly_vertex(580, 328);
+        ag_gfx_poly_fill_tex();
+        (void)ag_gfx_text(400, 332, "scale/tile/uv", 0x00E0E0E0u, 0x00102040u);
+    }
+
     ag_gfx_flush(0, 0, info.width, info.height);
     ag_gfx_swap();
     ag_gfx_release();

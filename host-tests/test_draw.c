@@ -203,4 +203,42 @@ void run_draw_tests(void)
                                   -1) == 24);
         AG_CHECK(count_color(0x07E0) == 40);
     }
+
+    /* Nearest scale + tile of a 2×2 RGB565 checker. */
+    {
+        static const uint16_t tex[2 * 2] = {0xF800, 0x07E0, 0x001F, 0xFFFF};
+        surf_clear(0);
+        ag_draw_blit_scaled(&s_surf, 0, 0, 4, 4, tex, 4, 0, 0, 2, 2);
+        AG_CHECK(s_fb[0] == 0xF800);
+        AG_CHECK(s_fb[1] == 0xF800);
+        AG_CHECK(s_fb[2] == 0x07E0);
+        AG_CHECK(s_fb[W] == 0xF800);
+        AG_CHECK(s_fb[2 * W + 0] == 0x001F);
+        AG_CHECK(s_fb[3 * W + 3] == 0xFFFF);
+
+        surf_clear(0);
+        ag_draw_blit_tiled(&s_surf, 0, 0, 4, 2, tex, 4, 0, 0, 2, 2);
+        AG_CHECK(s_fb[0] == 0xF800);
+        AG_CHECK(s_fb[2] == 0xF800);
+        AG_CHECK(s_fb[1] == 0x07E0);
+        AG_CHECK(s_fb[3] == 0x07E0);
+        AG_CHECK(s_fb[W + 0] == 0x001F);
+        AG_CHECK(s_fb[W + 1] == 0xFFFF);
+    }
+
+    /* Textured triangle: UVs cover the 2×2 tex over a 4×4 right triangle. */
+    {
+        static const uint16_t tex[2 * 2] = {0xF800, 0x07E0, 0x001F, 0xFFFF};
+        const ag_draw_texvert_t tri[3] = {
+            {0, 0, 0, 0},
+            {4, 0, 1, 0},
+            {0, 4, 0, 1},
+        };
+        surf_clear(0);
+        ag_draw_fill_convex_tex(&s_surf, tri, 3, tex, 4, 0, 0, 2, 2);
+        AG_CHECK(s_fb[0] == 0xF800);
+        AG_CHECK(count_color(0xF800) > 0);
+        AG_CHECK(count_color(0x07E0) + count_color(0x001F) + count_color(0xFFFF) >
+                 0);
+    }
 }
