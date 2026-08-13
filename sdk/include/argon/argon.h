@@ -636,6 +636,29 @@ static inline int32_t ag_gfx_text_fit(int16_t x, int16_t y, uint16_t w,
 {
     return g_ag_api->gfx->text_fit(x, y, w, s, fg, bg);
 }
+static inline void ag_gfx_blit_src_rect(int16_t sx, int16_t sy, uint16_t sw,
+                                        uint16_t sh)
+{
+    g_ag_api->gfx->blit_src_rect(sx, sy, sw, sh);
+}
+static inline void ag_gfx_blit_scaled(int16_t dx, int16_t dy, uint16_t dw,
+                                      uint16_t dh)
+{
+    g_ag_api->gfx->blit_scaled(dx, dy, dw, dh);
+}
+static inline void ag_gfx_blit_tiled(int16_t dx, int16_t dy, uint16_t dw,
+                                     uint16_t dh)
+{
+    g_ag_api->gfx->blit_tiled(dx, dy, dw, dh);
+}
+static inline void ag_gfx_poly_uv(int16_t u, int16_t v)
+{
+    g_ag_api->gfx->poly_uv(u, v);
+}
+static inline void ag_gfx_poly_fill_tex(void)
+{
+    g_ag_api->gfx->poly_fill_tex();
+}
 
 /* ---- audio helpers (ABI 0.14+; built-in pcmnull) ------------------------- */
 

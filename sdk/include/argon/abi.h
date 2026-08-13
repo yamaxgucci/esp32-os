@@ -69,9 +69,11 @@ extern "C" {
  *      vtable slots.
  * 0.25 appended gfx->text_fit: 8×16 text clipped to a pixel width, with
  *      "..." when the string does not fit.
+ * 0.26 appended blit_src_rect / blit_scaled / blit_tiled (nearest RGB565 on
+ *      the bound source) and poly_uv / poly_fill_tex (affine UV).
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 25u
+#define AG_ABI_MINOR 26u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -558,6 +560,21 @@ typedef struct ag_gfx_api {
      */
     int32_t (*text_fit)(int16_t x, int16_t y, uint16_t w, const char *s,
                         uint32_t fg, uint32_t bg);
+    /*
+     * ABI 0.26: source rectangle in the buffer from blit_bind (RGB565 LE).
+     * blit_scaled stretches it nearest-neighbour into the dest rect.
+     * blit_tiled repeats it (modulo) across the dest rect.
+     */
+    void (*blit_src_rect)(int16_t sx, int16_t sy, uint16_t sw, uint16_t sh);
+    void (*blit_scaled)(int16_t dx, int16_t dy, uint16_t dw, uint16_t dh);
+    void (*blit_tiled)(int16_t dx, int16_t dy, uint16_t dw, uint16_t dh);
+    /*
+     * UV in source pixels for the next poly_vertex.  poly_fill_tex fills the
+     * convex polygon by affine-mapping the bound blit_src_rect.  Vertices
+     * without poly_uv get a bounding-box map onto that rect.
+     */
+    void (*poly_uv)(int16_t u, int16_t v);
+    void (*poly_fill_tex)(void);
 } ag_gfx_api_t;
 
 /*
