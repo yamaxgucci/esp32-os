@@ -112,6 +112,7 @@ The image demands the highest ABI minor of the features it uses: 8 plain, 9 for
 | `ag_gfx_swap()` | |
 | `ag_gfx_fill_rect(x,y,w,h,color)` | |
 | `ag_gfx_text(x,y,s,fg,bg)` | `s` string literal or int pointer |
+| `ag_gfx_text_fit(x,y,w,s,fg,bg)` | same, clipped to `w` pixels with `"..."` (ABI 0.25) |
 | `ag_gfx_pixel(x,y,color)` | |
 | `ag_gfx_line(x0,y0,x1,y1,color)` | |
 | `ag_gfx_circle` / `ag_gfx_fill_circle` | |

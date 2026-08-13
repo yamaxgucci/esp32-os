@@ -80,8 +80,8 @@ static void draw_static(const gfxbench_layout_t *L, const gfxbench_state_t *st)
     panel(&L->mainp);
     panel(&L->eq);
     panel(&L->pl);
-    (void)ag_gfx_text(L->title.x, L->title.y, gfxbench_track_name(st->sel),
-                      COL_TEXT, COL_PANEL);
+    (void)ag_gfx_text_fit(L->title.x, L->title.y, L->title.w,
+                          gfxbench_track_name(st->sel), COL_TEXT, COL_PANEL);
     for (i = 0; i < GFXBENCH_BTN_N; i++) {
         const gfxbench_rect_t *b = &L->btn[i];
         uint32_t col = (st->playing && i == 2) ? COL_ACCENT : COL_BTN;
@@ -96,7 +96,9 @@ static void draw_static(const gfxbench_layout_t *L, const gfxbench_state_t *st)
         uint32_t bg = (i == st->sel) ? COL_SEL : COL_PANEL;
         uint32_t fg = (i == st->sel) ? COL_TEXT : COL_MUTED;
         ag_gfx_fill_rect(r->x, r->y, r->w, r->h, bg);
-        (void)ag_gfx_text(r->x + 2, r->y, gfxbench_track_name(i), fg, bg);
+        (void)ag_gfx_text_fit((int16_t)(r->x + 2), r->y,
+                              (uint16_t)(r->w > 2 ? r->w - 2 : 0),
+                              gfxbench_track_name(i), fg, bg);
     }
 }
 

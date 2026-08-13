@@ -67,9 +67,11 @@ extern "C" {
  * 0.24 soft gfx: ag_gfx_text(bg=AG_GFX_TRANS) skips off-bits; blit() blends
  *      AG_PIX_ARGB8888 (LE bytes B,G,R,A) onto the RGB565 surface.  No new
  *      vtable slots.
+ * 0.25 appended gfx->text_fit: 8×16 text clipped to a pixel width, with
+ *      "..." when the string does not fit.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 24u
+#define AG_ABI_MINOR 25u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -549,6 +551,13 @@ typedef struct ag_gfx_api {
     void (*blit_copy)(int16_t x, int16_t y, uint16_t w, uint16_t h);
     void (*blit_keyed)(int16_t x, int16_t y, uint16_t w, uint16_t h,
                        uint32_t key_rgb);
+    /*
+     * ABI 0.25: 8×16 text in at most `w` pixels (one line; `\n` ends).
+     * If the string is wider, the tail is replaced with "...".  Same fg/bg
+     * / AG_GFX_TRANS rules as text().  Returns advance actually drawn.
+     */
+    int32_t (*text_fit)(int16_t x, int16_t y, uint16_t w, const char *s,
+                        uint32_t fg, uint32_t bg);
 } ag_gfx_api_t;
 
 /*

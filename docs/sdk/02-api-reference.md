@@ -414,6 +414,10 @@ void     blit_bind(const void *src, uint32_t src_stride);
 void     blit_copy(int16_t x, int16_t y, uint16_t w, uint16_t h);
 void     blit_keyed(int16_t x, int16_t y, uint16_t w, uint16_t h,
                     uint32_t key_rgb);
+
+/* ABI 0.25 — clip 8×16 text to `w` pixels; overflow becomes "..." */
+int32_t  text_fit(int16_t x, int16_t y, uint16_t w, const char *s,
+                  uint32_t fg, uint32_t bg);
 ```
 
 Сейчас бэкенд — **программный** RGB565 framebuffer (`d:\fb0`, по умолчанию
@@ -442,6 +446,7 @@ ABI 0.17 — `blit_key` и stateful `blit_bind` / `blit_copy` / `blit_keyed`
 (chroma-key спрайты; игровой tilemap/sprite слой — Mini-C
 библиотека [`apps/cc/lib/g2d`](../../apps/cc/lib/g2d), не ядро).
 ABI 0.24 — прозрачный текст и ARGB blit, без новых слотов vtable.
+ABI 0.25 — `text_fit` (обрезка строки по ширине с `"..."`).
 Полноценный GUI toolkit — не в ядре (LVGL при необходимости линкуется в
 host-`.AXE`, см. [`06-ideas.md`](../06-ideas.md) §3.4).
 

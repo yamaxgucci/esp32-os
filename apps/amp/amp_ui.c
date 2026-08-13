@@ -277,10 +277,19 @@ static void draw_overlays_main(amp_player_t *p)
                          (uint16_t)(bw > 1 ? bw - 1 : 1), (uint16_t)h, COL_BAR);
     }
 
-    /* ticker / time: overlay on the skin bitmap */
-    ag_gfx_text((int16_t)(pos->x + p->skin.ticker.x + 2),
-                (int16_t)(pos->y + p->skin.ticker.y),
-                p->title[0] ? p->title : "(no title)", COL_TEXT, AG_GFX_TRANS);
+    /* ticker: stay inside the LCD window; long titles become "..." */
+    {
+        int16_t tx = (int16_t)(pos->x + p->skin.ticker.x);
+        int16_t ty = (int16_t)(pos->y + p->skin.ticker.y);
+        uint16_t tw = p->skin.ticker.w;
+        uint16_t th = p->skin.ticker.h;
+        uint16_t fit_w = tw > 4 ? (uint16_t)(tw - 4) : tw;
+        ag_gfx_clip(tx, ty, tw, th);
+        (void)ag_gfx_text_fit((int16_t)(tx + 2), ty, fit_w,
+                              p->title[0] ? p->title : "(no title)", COL_TEXT,
+                              AG_GFX_TRANS);
+        ag_gfx_clip_reset();
+    }
 
     if (p->mp3) {
         pos_ms = ag_mp3_position_ms(p->mp3);
@@ -306,9 +315,14 @@ static void draw_overlays_main(amp_player_t *p)
         buf[n++] = (char)('0' + ds % 10u);
         buf[n] = '\0';
     }
-    ag_gfx_text((int16_t)(pos->x + p->skin.timebox.x),
-                (int16_t)(pos->y + p->skin.timebox.y), buf, COL_TEXT,
-                AG_GFX_TRANS);
+    {
+        int16_t x = (int16_t)(pos->x + p->skin.timebox.x);
+        int16_t y = (int16_t)(pos->y + p->skin.timebox.y);
+        ag_gfx_clip(x, y, p->skin.timebox.w, p->skin.timebox.h);
+        (void)ag_gfx_text_fit(x, y, p->skin.timebox.w, buf, COL_TEXT,
+                              AG_GFX_TRANS);
+        ag_gfx_clip_reset();
+    }
 
     ctrl_screen_rect(p, AMP_CTRL_SEEK, &r);
     draw_slider_thumb(&r, permille, 0);
@@ -415,7 +429,8 @@ static void draw_picker(amp_player_t *p)
             ag_gfx_fill_rect((int16_t)(x + 4), ty, (uint16_t)(w - 8),
                              (uint16_t)row_h, bg);
         }
-        ag_gfx_text((int16_t)(x + 8), ty, base, COL_TEXT, bg);
+        ag_gfx_text_fit((int16_t)(x + 8), ty,
+                        (uint16_t)(w > 16 ? w - 16 : 0), base, COL_TEXT, bg);
     }
 }
 
@@ -443,6 +458,7 @@ static void draw_overlays_pl(amp_player_t *p)
     if (p->pl.sel >= p->pl.scroll + visible) {
         p->pl.scroll = p->pl.sel - visible + 1;
     }
+    ag_gfx_clip(list.x, list.y, list.w, list.h);
     for (i = 0; i < visible; i++) {
         int idx = p->pl.scroll + i;
         int16_t y = (int16_t)(list.y + i * row_h);
@@ -469,9 +485,12 @@ static void draw_overlays_pl(amp_player_t *p)
             if (idx == p->pl.cur) {
                 ag_gfx_text((int16_t)(list.x + 2), y, ">", COL_BAR, row_bg);
             }
-            ag_gfx_text((int16_t)(list.x + 12), y, base, COL_TEXT, row_bg);
+            ag_gfx_text_fit((int16_t)(list.x + 12), y,
+                            (uint16_t)(list.w > 14 ? list.w - 14 : 0), base,
+                            COL_TEXT, row_bg);
         }
     }
+    ag_gfx_clip_reset();
     ag_gfx_text((int16_t)(pos->x + 8), (int16_t)(pos->y + 1), "PLAYLIST",
                 COL_MUTED, AG_GFX_TRANS);
     (void)pos;
@@ -504,7 +523,9 @@ void amp_ui_draw(amp_player_t *p)
         draw_overlays_pl(p);
     }
     if (p->status[0]) {
-        ag_gfx_text(8, (int16_t)(p->fb_h - 18), p->status, COL_MUTED, COL_BG);
+        ag_gfx_text_fit(8, (int16_t)(p->fb_h - 18),
+                        (uint16_t)(p->fb_w > 16 ? p->fb_w - 16 : 0), p->status,
+                        COL_MUTED, COL_BG);
     } else {
         char nbuf[24];
         int n = 0;

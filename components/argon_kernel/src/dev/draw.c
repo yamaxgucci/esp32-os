@@ -405,3 +405,70 @@ void ag_draw_glyph8x16(ag_draw_surf_t *s, int32_t x, int32_t y,
         }
     }
 }
+
+int32_t ag_draw_text8x16(ag_draw_surf_t *s, int32_t x, int32_t y,
+                         const uint8_t font[256][16], const char *str,
+                         uint16_t fg, uint16_t bg, int trans, int32_t max_w)
+{
+    int32_t cx;
+    int32_t cy;
+    int32_t advance;
+
+    if (s == NULL || font == NULL || str == NULL) {
+        return 0;
+    }
+    cx = x;
+    cy = y;
+    advance = 0;
+    if (max_w < 0) {
+        const char *p;
+        for (p = str; *p != '\0'; p++) {
+            const uint8_t ch = (uint8_t)*p;
+            if (ch == '\n') {
+                cx = x;
+                cy += 16;
+                continue;
+            }
+            ag_draw_glyph8x16(s, cx, cy, font[ch], fg, bg, trans);
+            cx += 8;
+            advance += 8;
+        }
+        return advance;
+    }
+
+    {
+        int n = 0;
+        int nfit;
+        int dots;
+        int i;
+        const char *p;
+
+        for (p = str; *p != '\0' && *p != '\n'; p++) {
+            n++;
+        }
+        if (n * 8 <= max_w) {
+            for (i = 0; i < n; i++) {
+                ag_draw_glyph8x16(s, x + i * 8, y, font[(uint8_t)str[i]], fg, bg,
+                                  trans);
+            }
+            return n * 8;
+        }
+        dots = max_w >= 24;
+        nfit = dots ? (max_w - 24) / 8 : max_w / 8;
+        if (nfit < 0) {
+            nfit = 0;
+        }
+        for (i = 0; i < nfit; i++) {
+            ag_draw_glyph8x16(s, x + i * 8, y, font[(uint8_t)str[i]], fg, bg,
+                              trans);
+        }
+        if (dots) {
+            for (i = 0; i < 3; i++) {
+                ag_draw_glyph8x16(s, x + (nfit + i) * 8, y, font[(uint8_t)'.'],
+                                  fg, bg, trans);
+            }
+            return (nfit + 3) * 8;
+        }
+        return nfit * 8;
+    }
+}

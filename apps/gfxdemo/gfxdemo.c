@@ -66,7 +66,8 @@ int ag_main(int argc, char **argv)
             ag_gfx_fill_rect((int16_t)(24 + i * 12), 348, 12, 20,
                              (i & 1) ? 0x00304860u : 0x007090A0u);
         }
-        (void)ag_gfx_text(28, 350, "trans text", 0x00FFFFFFu, AG_GFX_TRANS);
+        (void)ag_gfx_text_fit(28, 350, 96, "trans text that overflows the strip",
+                              0x00FFFFFFu, AG_GFX_TRANS);
     }
 
     /* ARGB8888 overlay: 24×24 red disc, a=160, over the yellow fill. */

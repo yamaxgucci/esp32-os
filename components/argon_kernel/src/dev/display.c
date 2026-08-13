@@ -627,21 +627,21 @@ static int32_t gfx_text(int16_t x, int16_t y, const char *s, uint32_t fg,
     const int trans = (bg == AG_GFX_TRANS);
     const uint16_t bgc = trans ? 0 : rgb_to_565(bg);
     ag_draw_surf_t surf = draw_surf();
-    int32_t advance = 0;
-    int32_t cx = x;
-    int32_t cy = y;
-    for (const char *p = s; *p != '\0'; p++) {
-        const uint8_t ch = (uint8_t)*p;
-        if (ch == '\n') {
-            cx = x;
-            cy += AG_FONT8X16_H;
-            continue;
-        }
-        ag_draw_glyph8x16(&surf, cx, cy, ag_font8x16[ch], fgc, bgc, trans);
-        cx += AG_FONT8X16_W;
-        advance += AG_FONT8X16_W;
+    return ag_draw_text8x16(&surf, x, y, ag_font8x16, s, fgc, bgc, trans, -1);
+}
+
+static int32_t gfx_text_fit(int16_t x, int16_t y, uint16_t w, const char *s,
+                            uint32_t fg, uint32_t bg)
+{
+    if (s == NULL || s_draw == NULL) {
+        return 0;
     }
-    return advance;
+    const uint16_t fgc = rgb_to_565(fg);
+    const int trans = (bg == AG_GFX_TRANS);
+    const uint16_t bgc = trans ? 0 : rgb_to_565(bg);
+    ag_draw_surf_t surf = draw_surf();
+    return ag_draw_text8x16(&surf, x, y, ag_font8x16, s, fgc, bgc, trans,
+                            (int32_t)w);
 }
 
 static void gfx_backlight(uint8_t percent)
@@ -792,6 +792,7 @@ const ag_gfx_api_t ag_gfx_api_table = {
     .blit_bind = gfx_blit_bind,
     .blit_copy = gfx_blit_copy,
     .blit_keyed = gfx_blit_keyed,
+    .text_fit = gfx_text_fit,
 };
 
 /* ---------------------------------------------------------------------- */

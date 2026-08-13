@@ -150,6 +150,8 @@ _Static_assert(SUB_SLOT(ag_gfx_api_t, blit_copy) == GFX_OFF_BLIT_COPY,
                "gfx.blit_copy moved");
 _Static_assert(SUB_SLOT(ag_gfx_api_t, blit_keyed) == GFX_OFF_BLIT_KEYED,
                "gfx.blit_keyed moved");
+_Static_assert(SUB_SLOT(ag_gfx_api_t, text_fit) == GFX_OFF_TEXT_FIT,
+               "gfx.text_fit moved");
 
 _Static_assert(SUB_SLOT(ag_audio_api_t, present) == AUDIO_OFF_PRESENT,
                "audio.present moved");

@@ -102,6 +102,7 @@ extern "C" {
 #define GFX_OFF_BLIT_BIND       100
 #define GFX_OFF_BLIT_COPY       104
 #define GFX_OFF_BLIT_KEYED      108
+#define GFX_OFF_TEXT_FIT        112
 
 #define AUDIO_OFF_PRESENT 4
 #define AUDIO_OFF_IS_HW   8
@@ -121,6 +122,7 @@ extern "C" {
 #define ABI_MINOR_AUDIO  14
 #define ABI_MINOR_GFX16  16
 #define ABI_MINOR_GFX17  17
+#define ABI_MINOR_GFX25  25
 #define ABI_MINOR_FOCUS  20
 
 typedef struct {
