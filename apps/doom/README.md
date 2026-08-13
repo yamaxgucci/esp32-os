@@ -1,5 +1,9 @@
 # Doom (`DOOM.AXE`)
 
+**QEMU input is broken (parked 2026-08-13).** Keys often never reach the
+guest — cannot start from the title screen. Do not keep patching without
+new evidence. Plan: [`docs/plans/doom-input.md`](../../docs/plans/doom-input.md).
+
 [doomgeneric](https://github.com/ozkl/doomgeneric) (Chocolate Doom) as a
 guest `.AXE`. The engine draws 320×200 pal8; the port integer-scales nearest
 (2× on the default 640×400 soft framebuffer) into RGB565.
