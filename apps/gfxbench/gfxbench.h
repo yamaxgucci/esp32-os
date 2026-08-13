@@ -71,4 +71,9 @@ const char *gfxbench_backend_name(void);
 void     gfxbench_flush_begin(void);
 uint32_t gfxbench_flush_end(void);
 
+/* Fold LVGL's many dirty rects into one present (QEMU waits if a kick shrinks). */
+void     gfxbench_flush_union_reset(void);
+void     gfxbench_flush_union_add(int16_t x, int16_t y, uint16_t w, uint16_t h);
+uint32_t gfxbench_flush_union_present(void);
+
 #endif /* GFXBENCH_H */

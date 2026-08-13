@@ -15,18 +15,14 @@ static lv_obj_t     *s_eq[GFXBENCH_EQ_N];
 static lv_obj_t     *s_spec[GFXBENCH_SPEC_N];
 static lv_obj_t     *s_pl[GFXBENCH_PL_N];
 static lv_obj_t     *s_btn[GFXBENCH_BTN_N];
-static uint32_t      s_flush_acc;
 static char          s_time_buf[8];
 
 static void flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
 {
-    uint16_t w, h;
     (void)px_map;
-    w = (uint16_t)(area->x2 - area->x1 + 1);
-    h = (uint16_t)(area->y2 - area->y1 + 1);
-    gfxbench_flush_begin();
-    ag_gfx_flush((uint16_t)area->x1, (uint16_t)area->y1, w, h);
-    s_flush_acc += gfxbench_flush_end();
+    gfxbench_flush_union_add((int16_t)area->x1, (int16_t)area->y1,
+                             (uint16_t)(area->x2 - area->x1 + 1),
+                             (uint16_t)(area->y2 - area->y1 + 1));
     lv_display_flush_ready(disp);
 }
 
@@ -121,8 +117,9 @@ int gfxbench_backend_init(const ag_gfxinfo_t *gi, const gfxbench_layout_t *L)
         lv_label_set_text(s_pl[i], gfxbench_track_name(i));
     }
 
-    s_flush_acc = 0;
+    gfxbench_flush_union_reset();
     lv_refr_now(s_disp);
+    (void)gfxbench_flush_union_present();
     return 0;
 }
 
@@ -146,10 +143,9 @@ void gfxbench_backend_frame(const gfxbench_state_t *st,
     int i;
     unsigned sec;
     ag_time_t t0;
-    uint32_t total;
     (void)L;
 
-    s_flush_acc = 0;
+    gfxbench_flush_union_reset();
     t0 = ag_micros();
 
     lv_slider_set_value(s_seek, st->seek, LV_ANIM_OFF);
@@ -177,10 +173,8 @@ void gfxbench_backend_frame(const gfxbench_state_t *st,
     }
 
     lv_refr_now(s_disp);
-
-    total = (uint32_t)(ag_micros() - t0);
-    t->flush_us = s_flush_acc;
-    t->draw_us = (total > s_flush_acc) ? (total - s_flush_acc) : 0u;
+    t->draw_us = (uint32_t)(ag_micros() - t0);
+    t->flush_us = gfxbench_flush_union_present();
 }
 
 void gfxbench_backend_shutdown(void)
