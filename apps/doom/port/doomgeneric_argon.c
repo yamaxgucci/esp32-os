@@ -15,7 +15,8 @@
 
 static ag_gfxinfo_t s_gi;
 static int          s_quit;
-static int          s_use_live_pad = 1;
+static int          s_use_live_pad;
+static ag_handle_t  s_kbd = -1;
 
 static unsigned short s_keyq[KEYQUEUE_SIZE];
 static unsigned       s_keyq_w;
@@ -135,6 +136,11 @@ void doom_argon_set_live_pad(int on) { s_use_live_pad = on ? 1 : 0; }
 int doom_argon_poll_sys(void)
 {
     ag_event_t ev;
+    if (s_kbd >= 0) {
+        uint8_t buf[64];
+        /* read() runs KBDVIRT pump_rx → inject KEY_*; poll_event consumes them. */
+        (void)ag_dev_read(s_kbd, buf, sizeof(buf));
+    }
     while (ag_poll_event(&ev, 0)) {
         if (ev.type == AG_EV_QUIT) {
             s_quit = 1;
@@ -169,6 +175,12 @@ void DG_Init(void)
     }
     ag_gfx_clear(0);
     ag_gfx_flush(0, 0, s_gi.width, s_gi.height);
+    s_kbd = ag_dev_open("/dev/kbd0");
+    if (s_kbd >= 0) {
+        ag_printf("doom: kbd = /dev/kbd0 (kbdvirt.py :5561)\n");
+    } else {
+        ag_printf("doom: no /dev/kbd0 (drv install a:\\kbdvirt.sys)\n");
+    }
 }
 
 void DG_DrawFrame(void)

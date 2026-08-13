@@ -2,7 +2,7 @@
  * ArgonOS - Doom (doomgeneric). Mute milestone.
  *
  *   python apps/doom/build.py
- *   run h:\doom.axe -iwad h:\doom1.wad
+ *   run a:\doom.axe -iwad a:\doom1.wad
  *
  * Core: doomgeneric / Chocolate Doom, GPLv2+.  This file: Apache-2.0.
  *
@@ -140,12 +140,14 @@ int ag_main(int argc, char **argv)
     int          n = 0;
     const char  *wad;
     int          i;
-    int          livepad = 1;
+    int          livepad = 0;
     int          frames = -1;
     int          have_iwad;
 
     for (i = 1; i < argc; i++) {
-        if (arg_eq(argv[i], "nolivepad")) {
+        if (arg_eq(argv[i], "livepad")) {
+            livepad = 1;
+        } else if (arg_eq(argv[i], "nolivepad")) {
             livepad = 0;
         } else {
             (void)parse_frames_arg(argv[i], &frames);
@@ -159,8 +161,8 @@ int ag_main(int argc, char **argv)
         wad = first_wad(argc, argv);
         if (wad == NULL) {
             static const char *k_try[] = {
-                "h:\\doom1.wad", "a:\\doom1.wad", "h:\\DOOM1.WAD",
-                "a:\\DOOM1.WAD", NULL};
+                "a:\\doom1.wad", "a:\\DOOM1.WAD", "h:\\doom1.wad",
+                "h:\\DOOM1.WAD", NULL};
             int t;
             for (t = 0; k_try[t] != NULL; t++) {
                 if (file_ok(k_try[t])) {
@@ -171,7 +173,7 @@ int ag_main(int argc, char **argv)
         }
         if (wad == NULL) {
             ag_printf("doom: need shareware doom1.wad\n");
-            ag_printf("doom: run h:\\doom.axe -iwad h:\\doom1.wad\n");
+            ag_printf("doom: run a:\\doom.axe -iwad a:\\doom1.wad\n");
             return 1;
         }
         ag_printf("doom: iwad %s\n", wad);
@@ -184,7 +186,8 @@ int ag_main(int argc, char **argv)
     }
     for (i = 1; i < argc && n < (int)(sizeof own / sizeof own[0]) - 1; i++) {
         int dummy = 0;
-        if (arg_eq(argv[i], "nolivepad") || parse_frames_arg(argv[i], &dummy)) {
+        if (arg_eq(argv[i], "nolivepad") || arg_eq(argv[i], "livepad") ||
+            parse_frames_arg(argv[i], &dummy)) {
             continue;
         }
         if (!have_iwad && wad != NULL && argv[i] == wad) {

@@ -27,6 +27,7 @@ ArgonOS
   argon run -tcp           run in QEMU, console on 127.0.0.1:5556
                            (connect with PuTTY in Raw mode)
   argon run                (default) also OpenEth hostfwd 127.0.0.1:5558
+                           (5559 midivirt, 5560 mousevirt, 5561 kbdvirt)
   argon run -NoNet         skip the virtual NIC
   python tools/pcmplay.py  play guest PCM streamed to :5558 (MD `net`)
   argon run -Share DIR     pack DIR into build\sdcard.img and boot with A:
