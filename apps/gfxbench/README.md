@@ -30,7 +30,36 @@ Typical image size (xtensa `-Os`, LVGL 9.3 trimmed widgets):
 | `GFXBENCH.AXE` | ~5 KB | ~0.5 KB |
 | `LVGLBENCH.AXE` | ~137 KB | ~18 KB (font + theme) |
 
-LVGLBENCH is larger than the code arena, so the loader puts it in flash XIP.
+LVGLBENCH is ~137 KB of code. The S3 firmware reserves a **192 KB** executable
+arena (`CONFIG_ARGON_APP_ARENA_KB`); `SYSTEM.CFG` may clip it (docs example is
+64 KB). Below the image size the loader uses flash XIP instead of IRAM.
+
+## IRAM vs XIP (fair toolkit comparison)
+
+1. In the guest: `mem` — look for `N KB reserved for application code`.
+2. If it is already **192 KB** and a previous `run h:\lvglbench.axe` log had
+   `code … B at 0x3…` (no `XIP`), that run was already IRAM. Stop here.
+3. If it is **64 KB** (or the log said `XIP at 0x42…`):
+
+```
+copy h:\arena192.cfg c:\system.cfg
+reboot
+```
+
+If `C:\SYSTEM.CFG` already has `[modules]` (pcmvirt etc.), do not overwrite:
+open it in `edit` and add the `[memory]` block from `h:\arena192.cfg`.
+
+4. After reboot, `mem` must show 192 KB. Then:
+
+```
+run h:\lvglbench.axe full 300
+```
+
+Success: loader line is `LVGLBENCH: … code 140228 B at …` **without** `XIP`.
+Still XIP: another image is occupying the arena (`ps` / `drv`), or the running
+firmware was built with a 64 KB ceiling (rebuild: `argon build`).
+
+`copy` of `arena192.cfg` is staged next to the `.AXE` files in `build/sd_card/`.
 
 ## Run (QEMU)
 

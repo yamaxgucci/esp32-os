@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import subprocess
 import sys
 
@@ -142,6 +143,12 @@ def main() -> int:
             "apps/gfxbench/lvgl_draw.c",
             "apps/common/libc/libc_shim.c",
         ] + srcs)
+
+    cfg_src = os.path.join(ROOT, "apps", "gfxbench", "arena192.cfg")
+    share = os.path.join(ROOT, "build", "sd_card")
+    os.makedirs(share, exist_ok=True)
+    shutil.copy2(cfg_src, os.path.join(share, "arena192.cfg"))
+    print("staged -> build/sd_card/arena192.cfg", flush=True)
 
     return 0
 
