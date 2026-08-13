@@ -31,13 +31,24 @@ if (-not $env:ARGON_IDF_PATH -or -not (Test-Path $env:ARGON_IDF_PATH)) {
 $env:IDF_PATH = $env:ARGON_IDF_PATH
 $env:IDF_TOOLS_PATH = $env:ARGON_IDF_TOOLS_PATH
 
+# idf_tools.py (and later idf.py) write temp files under %TEMP%.  On this
+# machine that is often a small C: volume; export then dies with exit 120 /
+# "No space left on device".  Keep the session temp next to the IDF tools
+# (D:, no spaces) instead of the user profile.
+$argonTmp = Join-Path $env:IDF_TOOLS_PATH 'tmp'
+New-Item -ItemType Directory -Force -Path $argonTmp | Out-Null
+$env:TEMP = $argonTmp
+$env:TMP = $argonTmp
+
 # idf_tools.py needs a Python to run itself; the one inside the IDF virtual
-# environment is the right choice once it exists.
+# environment is the right choice once it exists.  ARGON_PYTHON is for host
+# tools (mkfatimg, virt.py) and often lacks the IDF venv packages — using it
+# here makes `export` fail with a bare exit 120.
 $venvPython = Get-ChildItem -Path (Join-Path $env:IDF_TOOLS_PATH 'python_env') `
     -Filter 'python.exe' -Recurse -ErrorAction SilentlyContinue |
     Select-Object -First 1
-$python = if ($env:ARGON_PYTHON) { $env:ARGON_PYTHON }
-          elseif ($venvPython) { $venvPython.FullName }
+$python = if ($venvPython) { $venvPython.FullName }
+          elseif ($env:ARGON_PYTHON) { $env:ARGON_PYTHON }
           else { 'python' }
 
 # stderr from idf_tools ("Not using an unsupported version of cmake…") must not
@@ -51,7 +62,16 @@ $p = Start-Process -FilePath $python -ArgumentList @(
     ) -NoNewWindow -Wait -PassThru `
     -RedirectStandardOutput $exportTxt -RedirectStandardError $exportErr
 if ($p.ExitCode -ne 0) {
-    Write-Error "idf_tools.py export failed (exit $($p.ExitCode))."
+    $detail = ''
+    if (Test-Path -LiteralPath $exportErr) {
+        $detail = (Get-Content -LiteralPath $exportErr -Raw -ErrorAction SilentlyContinue)
+    }
+    if (-not $detail -and (Test-Path -LiteralPath $exportTxt)) {
+        $detail = (Get-Content -LiteralPath $exportTxt -Raw -ErrorAction SilentlyContinue)
+    }
+    if (-not $detail) { $detail = '' }
+    Write-Error ("idf_tools.py export failed (exit {0}) using {1}.{2}{3}" -f `
+        $p.ExitCode, $python, [Environment]::NewLine, $detail.Trim())
     return
 }
 foreach ($line in Get-Content -LiteralPath $exportTxt) {
@@ -70,3 +90,4 @@ if ($env:ARGON_HOST_CC_BIN -and (Test-Path $env:ARGON_HOST_CC_BIN)) {
 
 Write-Host "IDF_PATH       = $env:IDF_PATH"
 Write-Host "IDF_TOOLS_PATH = $env:IDF_TOOLS_PATH"
+Write-Host "TEMP           = $env:TEMP"
