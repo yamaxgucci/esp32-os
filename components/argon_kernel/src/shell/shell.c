@@ -1043,14 +1043,14 @@ static ag_err_t cfg_remove_device(const char *dos_path)
     return AG_OK;
 }
 
-static ag_err_t drv_copy_file(const char *src_arg, const char *dst_abs)
+static ag_err_t drv_copy_file(const char *src_abs, const char *dst_abs)
 {
     static uint8_t chunk[DRV_COPY_CHUNK];
     ag_handle_t    in;
     ag_handle_t    out;
     int32_t        n;
 
-    in = ag_vfs_open(src_arg, s_cwd, AG_O_RDONLY);
+    in = ag_vfs_open(src_abs, NULL, AG_O_RDONLY);
     if (in < 0) {
         return (ag_err_t)in;
     }
@@ -1086,10 +1086,12 @@ static ag_err_t drv_copy_file(const char *src_arg, const char *dst_abs)
 static int cmd_drv_install(int argc, char **argv)
 {
     char        src_res[AG_PATH_MAX];
+    char        drv_dir[AG_PATH_MAX];
     char        dst_abs[AG_PATH_MAX];
     char        dos_path[64];
     const char *base;
     ag_err_t    err;
+    ag_stat_t   st;
 
     if (argc != 3) {
         ag_console_puts("usage: drv install <file.sys>\n");
@@ -1105,23 +1107,39 @@ static int cmd_drv_install(int argc, char **argv)
         ag_console_puts("drv install: bad name\n");
         return 1;
     }
-
-    err = ag_vfs_mkdir(DRV_DIR_PATH, NULL);
-    if (err != AG_OK && err != -AG_EEXIST) {
-        ag_console_printf("mkdir %s: %d\n", DRV_DIR_PATH, (int)err);
+    if (ag_vfs_stat(src_res, NULL, &st) != AG_OK) {
+        ag_console_printf("%s: file not found\n", argv[2]);
+        if (strncmp(src_res, "/sd", 3) == 0 &&
+            ag_vfs_stat("/sd", NULL, &st) != AG_OK) {
+            ag_console_puts("A: is not mounted (argon run -Sd)\n");
+        }
         return 1;
     }
-    /* Drop legacy uppercase folder from early builds (case-sensitive FS). */
+
+    /* Empty leftover only.  A populated C:\DRV cannot be rmdir'd. */
     (void)ag_vfs_rmdir("/sys/DRV", NULL);
-    err = ag_path_join(DRV_DIR_PATH, base, dst_abs, sizeof(dst_abs));
+    if (ag_vfs_realpath(DRV_DIR_PATH, NULL, drv_dir, sizeof(drv_dir)) !=
+        AG_OK) {
+        err = ag_vfs_mkdir(DRV_DIR_PATH, NULL);
+        if (err != AG_OK && err != -AG_EEXIST) {
+            ag_console_printf("mkdir %s: %d\n", DRV_DIR_PATH, (int)err);
+            return 1;
+        }
+        snprintf(drv_dir, sizeof(drv_dir), "%s", DRV_DIR_PATH);
+    }
+    err = ag_path_join(drv_dir, base, dst_abs, sizeof(dst_abs));
     if (err != AG_OK) {
         ag_console_printf("drv install: %d\n", (int)err);
         return 1;
     }
 
-    err = drv_copy_file(argv[2], dst_abs);
+    err = drv_copy_file(src_res, dst_abs);
     if (err != AG_OK) {
-        ag_console_printf("copy: %d\n", (int)err);
+        if (err == -AG_ENOENT) {
+            ag_console_printf("copy: cannot create %s\n", dst_abs);
+        } else {
+            ag_console_printf("copy: %d\n", (int)err);
+        }
         return 1;
     }
 

@@ -204,6 +204,45 @@ static ag_err_t fixup_case(const ag_idfvfs_t *fs, char *path, size_t pathlen,
     return AG_OK;
 }
 
+/*
+ * Fold every existing directory on `path`; leave the final component alone.
+ * Used when creating a file so `/sys/drv/x` lands in an on-disk `/sys/DRV`.
+ */
+static ag_err_t fixup_parents(const ag_idfvfs_t *fs, char *path, size_t pathlen)
+{
+    char *slash = strrchr(path, '/');
+    if (slash == NULL || slash[1] == '\0') {
+        return AG_OK;
+    }
+
+    char   leaf[AG_NAME_MAX];
+    size_t leaf_len = strlen(slash + 1);
+    if (leaf_len >= sizeof(leaf)) {
+        return -AG_ERANGE;
+    }
+    memcpy(leaf, slash + 1, leaf_len + 1);
+
+    *slash = '\0';
+    if (path[0] == '\0' || strcmp(path, fs->base) == 0) {
+        *slash = '/';
+        return AG_OK;
+    }
+
+    const ag_err_t err = fixup_case(fs, path, pathlen, false);
+    if (err != AG_OK) {
+        *slash = '/';
+        return AG_OK;
+    }
+
+    const size_t plen = strlen(path);
+    if (plen + 1u + leaf_len + 1u > pathlen) {
+        return -AG_ERANGE;
+    }
+    path[plen] = '/';
+    memcpy(path + plen + 1u, leaf, leaf_len + 1u);
+    return AG_OK;
+}
+
 static int to_posix_flags(uint32_t flags)
 {
     int out;
@@ -280,8 +319,14 @@ static ag_err_t idf_open(void *ctx, const char *rel, uint32_t flags, void **out)
         return err;
     }
 
-    /* Do not invent a case match when CREATE would make a new file. */
-    if ((flags & AG_O_CREATE) == 0) {
+    /*
+     * CREATE must still fold *parent* directories (c:\drv vs leftover
+     * c:\DRV on littlefs).  The leaf stays as typed so a new file is not
+     * silently redirected onto a case-only sibling.
+     */
+    if ((flags & AG_O_CREATE) != 0) {
+        (void)fixup_parents(fs, path, sizeof(path));
+    } else {
         (void)fixup_case(fs, path, sizeof(path), false);
     }
 
