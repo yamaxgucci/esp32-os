@@ -48,7 +48,8 @@ image (`A:`).
 argon run -Gfx -Sd
 ```
 
-Guest (once): `drv install a:\kbdvirt.sys`
+Guest (once): `dir a:\kbdvirt.sys` then `drv install a:\kbdvirt.sys`
+(`T:` is the RAM disk; the `.SYS` is on `A:`). This session only: `drv load a:\kbdvirt.sys`.
 
 ```
 run a:\doom.axe -iwad a:\doom1.wad

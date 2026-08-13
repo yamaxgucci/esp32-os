@@ -32,11 +32,16 @@ python tools/mkaxe.py --arch xtensa --gcc xtensa-esp32s3-elf-gcc `
 
 ## Install once
 
+`A:` is the SD image (`argon run -Sd`). `T:` is the RAM disk, not the card.
+
 ```
+dir a:\kbdvirt.sys
 drv install a:\kbdvirt.sys
 ```
 
-Persists via `[modules]` in `C:\SYSTEM.CFG`.
+Persists via `[modules]` in `C:\SYSTEM.CFG`. This session only: `drv load a:\kbdvirt.sys`.
+
+If `dir` does not see the file, QEMU is still on an old/blank `sdcard.img` — quit and `argon run -Gfx -Sd` again after `python apps/doom/build.py`.
 
 ## Host → guest
 
