@@ -54,6 +54,20 @@ void ag_draw_blit(ag_draw_surf_t *s, int32_t x, int32_t y, int32_t w, int32_t h,
                   const void *src, uint32_t src_stride, int src_be, int use_key,
                   uint16_t key565);
 
+/*
+ * Blend packed ARGB8888 (LE bytes B,G,R,A; stride in bytes) onto RGB565.
+ * a=0 skips; a=255 replaces; otherwise src over dest.
+ */
+void ag_draw_blit_argb8888(ag_draw_surf_t *s, int32_t x, int32_t y, int32_t w,
+                           int32_t h, const void *src, uint32_t src_stride);
+
+/*
+ * 8×16 bitmap glyph (bit 0 = leftmost).  trans non-zero: paint only 'on' bits.
+ */
+void ag_draw_glyph8x16(ag_draw_surf_t *s, int32_t x, int32_t y,
+                       const uint8_t rows[16], uint16_t fg, uint16_t bg,
+                       int trans);
+
 /* 0x00RRGGBB → RGB565 */
 uint16_t ag_draw_rgb_to_565(uint32_t color);
 

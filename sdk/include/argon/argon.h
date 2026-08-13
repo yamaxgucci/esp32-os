@@ -550,6 +550,7 @@ static inline void ag_gfx_blit(int16_t x, int16_t y, uint16_t w, uint16_t h,
 static inline int32_t ag_gfx_text(int16_t x, int16_t y, const char *s,
                                   uint32_t fg, uint32_t bg)
 {
+    /* bg = AG_GFX_TRANS: draw fg bits only (no glyph boxes). */
     return g_ag_api->gfx->text(x, y, s, fg, bg);
 }
 static inline void ag_gfx_pixel(int16_t x, int16_t y, uint32_t color)

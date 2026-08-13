@@ -332,3 +332,76 @@ void ag_draw_blit(ag_draw_surf_t *s, int32_t x, int32_t y, int32_t w, int32_t h,
         }
     }
 }
+
+static uint16_t pack_565(uint32_t r, uint32_t g, uint32_t b)
+{
+    return (uint16_t)(((r & 0xF8u) << 8) | ((g & 0xFCu) << 3) | (b >> 3));
+}
+
+static uint16_t blend_565(uint16_t dst, uint8_t r, uint8_t g, uint8_t b,
+                          uint8_t a)
+{
+    const uint32_t ia = 255u - (uint32_t)a;
+    uint32_t dr = (uint32_t)((dst >> 11) & 31u);
+    uint32_t dg = (uint32_t)((dst >> 5) & 63u);
+    uint32_t db = (uint32_t)(dst & 31u);
+    dr = (dr << 3) | (dr >> 2);
+    dg = (dg << 2) | (dg >> 4);
+    db = (db << 3) | (db >> 2);
+    const uint32_t or = ((uint32_t)r * a + dr * ia) / 255u;
+    const uint32_t og = ((uint32_t)g * a + dg * ia) / 255u;
+    const uint32_t ob = ((uint32_t)b * a + db * ia) / 255u;
+    return pack_565(or, og, ob);
+}
+
+void ag_draw_blit_argb8888(ag_draw_surf_t *s, int32_t x, int32_t y, int32_t w,
+                           int32_t h, const void *src, uint32_t src_stride)
+{
+    if (s == NULL || s->pix == NULL || src == NULL || w <= 0 || h <= 0) {
+        return;
+    }
+    for (int32_t row = 0; row < h; row++) {
+        const int32_t dy = y + row;
+        const uint8_t *srow =
+            (const uint8_t *)src + (uint32_t)row * src_stride;
+        for (int32_t col = 0; col < w; col++) {
+            const int32_t dx = x + col;
+            const uint8_t *p = srow + (uint32_t)col * 4u;
+            const uint8_t b = p[0];
+            const uint8_t g = p[1];
+            const uint8_t r = p[2];
+            const uint8_t a = p[3];
+            if (a == 0 || !in_clip(s, dx, dy)) {
+                continue;
+            }
+            if (a == 255) {
+                ag_draw_pixel(s, dx, dy, pack_565(r, g, b));
+                continue;
+            }
+            const uint16_t dst =
+                s->pix[(uint32_t)dy * s->w + (uint32_t)dx];
+            ag_draw_pixel(s, dx, dy, blend_565(dst, r, g, b, a));
+        }
+    }
+}
+
+void ag_draw_glyph8x16(ag_draw_surf_t *s, int32_t x, int32_t y,
+                       const uint8_t rows[16], uint16_t fg, uint16_t bg,
+                       int trans)
+{
+    int32_t row;
+    if (s == NULL || rows == NULL) {
+        return;
+    }
+    for (row = 0; row < 16; row++) {
+        const uint8_t bits = rows[row];
+        int32_t col;
+        for (col = 0; col < 8; col++) {
+            if ((bits & (uint8_t)(1u << col)) != 0) {
+                ag_draw_pixel(s, x + col, y + row, fg);
+            } else if (!trans) {
+                ag_draw_pixel(s, x + col, y + row, bg);
+            }
+        }
+    }
+}

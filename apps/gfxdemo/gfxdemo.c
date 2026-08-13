@@ -59,6 +59,39 @@ int ag_main(int argc, char **argv)
     (void)ag_gfx_text(24, 320, "pixel/line/circle/poly", 0x00E0E0E0u,
                       0x00102040u);
 
+    /* Transparent labels over stripes (no glyph boxes). */
+    {
+        int i;
+        for (i = 0; i < 12; i++) {
+            ag_gfx_fill_rect((int16_t)(24 + i * 12), 348, 12, 20,
+                             (i & 1) ? 0x00304860u : 0x007090A0u);
+        }
+        (void)ag_gfx_text(28, 350, "trans text", 0x00FFFFFFu, AG_GFX_TRANS);
+    }
+
+    /* ARGB8888 overlay: 24×24 red disc, a=160, over the yellow fill. */
+    {
+        uint32_t blob[24 * 24];
+        int y;
+        for (y = 0; y < 24; y++) {
+            int x;
+            for (x = 0; x < 24; x++) {
+                int dx = x - 11;
+                int dy = y - 11;
+                uint8_t *p = (uint8_t *)&blob[y * 24 + x];
+                if (dx * dx + dy * dy <= 11 * 11) {
+                    p[0] = 0x20;
+                    p[1] = 0x40;
+                    p[2] = 0xE0;
+                    p[3] = 160;
+                } else {
+                    p[0] = p[1] = p[2] = p[3] = 0;
+                }
+            }
+        }
+        ag_gfx_blit(248, 188, 24, 24, blob, 24u * 4u, AG_PIX_ARGB8888);
+    }
+
     ag_gfx_flush(0, 0, info.width, info.height);
     ag_gfx_swap();
     ag_gfx_release();

@@ -154,7 +154,7 @@ static void draw_btn_icon(amp_player_t *p, amp_ctrl_t c)
         break;
     }
     case AMP_CTRL_EQ_TOGGLE:
-        /* Simple EQ bars — avoid ag_gfx_text(bg=0) black glyph boxes. */
+        /* Simple EQ bars. */
         icon_bar(cx - 6, cy + 2, 2, 4, COL_ICON);
         icon_bar(cx - 2, cy - 2, 2, 8, COL_ICON);
         icon_bar(cx + 2, cy, 2, 6, COL_ICON);
@@ -277,10 +277,10 @@ static void draw_overlays_main(amp_player_t *p)
                          (uint16_t)(bw > 1 ? bw - 1 : 1), (uint16_t)h, COL_BAR);
     }
 
-    /* ticker (LCD-ish bg — bg=0 would paint black glyph boxes) */
+    /* ticker / time: overlay on the skin bitmap */
     ag_gfx_text((int16_t)(pos->x + p->skin.ticker.x + 2),
                 (int16_t)(pos->y + p->skin.ticker.y),
-                p->title[0] ? p->title : "(no title)", COL_TEXT, 0x00002018u);
+                p->title[0] ? p->title : "(no title)", COL_TEXT, AG_GFX_TRANS);
 
     if (p->mp3) {
         pos_ms = ag_mp3_position_ms(p->mp3);
@@ -308,18 +308,18 @@ static void draw_overlays_main(amp_player_t *p)
     }
     ag_gfx_text((int16_t)(pos->x + p->skin.timebox.x),
                 (int16_t)(pos->y + p->skin.timebox.y), buf, COL_TEXT,
-                0x00002018u);
+                AG_GFX_TRANS);
 
     ctrl_screen_rect(p, AMP_CTRL_SEEK, &r);
     draw_slider_thumb(&r, permille, 0);
     ctrl_screen_rect(p, AMP_CTRL_VOL, &r);
     draw_slider_thumb(&r, p->volume * 10, 0);
     ag_gfx_text((int16_t)(r.x - 28), (int16_t)(r.y - 2), "VOL", COL_MUTED,
-                COL_BG);
+                AG_GFX_TRANS);
     ctrl_screen_rect(p, AMP_CTRL_BAL, &r);
     draw_slider_thumb(&r, (p->balance + 100) * 5, 0);
     ag_gfx_text((int16_t)(r.x - 28), (int16_t)(r.y - 2), "BAL", COL_MUTED,
-                COL_BG);
+                AG_GFX_TRANS);
 
     draw_transport_icons(p);
 }
@@ -465,7 +465,7 @@ static void draw_overlays_pl(amp_player_t *p)
             ag_gfx_fill_rect(list.x, y, list.w, (uint16_t)row_h, COL_SEL);
         }
         {
-            uint32_t row_bg = (idx == p->pl.sel) ? COL_SEL : 0x00001810u;
+            uint32_t row_bg = (idx == p->pl.sel) ? COL_SEL : AG_GFX_TRANS;
             if (idx == p->pl.cur) {
                 ag_gfx_text((int16_t)(list.x + 2), y, ">", COL_BAR, row_bg);
             }
@@ -473,7 +473,7 @@ static void draw_overlays_pl(amp_player_t *p)
         }
     }
     ag_gfx_text((int16_t)(pos->x + 8), (int16_t)(pos->y + 1), "PLAYLIST",
-                COL_MUTED, 0x00182030u);
+                COL_MUTED, AG_GFX_TRANS);
     (void)pos;
 }
 
