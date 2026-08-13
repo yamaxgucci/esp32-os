@@ -424,7 +424,7 @@ void     blit_src_rect(int16_t sx, int16_t sy, uint16_t sw, uint16_t sh);
 void     blit_scaled(int16_t dx, int16_t dy, uint16_t dw, uint16_t dh);
 void     blit_tiled(int16_t dx, int16_t dy, uint16_t dw, uint16_t dh);
 void     poly_uv(int16_t u, int16_t v);   /* source pixels; next poly_vertex */
-void     poly_fill_tex(void);             /* affine UV, convex */
+void     poly_fill_tex(void);             /* bilinear UV on quads; else affine */
 ```
 
 Сейчас бэкенд — **программный** RGB565 framebuffer (`d:\fb0`, по умолчанию
@@ -455,7 +455,8 @@ ABI 0.17 — `blit_key` и stateful `blit_bind` / `blit_copy` / `blit_keyed`
 ABI 0.24 — прозрачный текст и ARGB blit, без новых слотов vtable.
 ABI 0.25 — `text_fit` (обрезка строки по ширине с `"..."`).
 ABI 0.26 — `blit_src_rect` / `blit_scaled` / `blit_tiled` (nearest RGB565) и
-`poly_uv` / `poly_fill_tex` (аффинные UV на выпуклом полигоне).
+`poly_uv` / `poly_fill_tex` (билинейные UV на четырёхугольнике, иначе
+аффинный веер треугольников).
 Полноценный GUI toolkit — не в ядре (LVGL при необходимости линкуется в
 host-`.AXE`, см. [`06-ideas.md`](../06-ideas.md) §3.4).
 

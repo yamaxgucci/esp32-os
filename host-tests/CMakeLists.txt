@@ -76,6 +76,9 @@ add_executable(argon_tests
     ${ARGON_PORTABLE_SRCS})
 
 target_include_directories(argon_tests PRIVATE ${ARGON_INCLUDES})
+if(NOT MSVC)
+    target_link_libraries(argon_tests PRIVATE m)
+endif()
 
 # Compiled in rather than guessed: the working directory differs between running
 # the executable directly and running it through ctest.

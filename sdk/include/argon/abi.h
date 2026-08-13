@@ -70,7 +70,8 @@ extern "C" {
  * 0.25 appended gfx->text_fit: 8×16 text clipped to a pixel width, with
  *      "..." when the string does not fit.
  * 0.26 appended blit_src_rect / blit_scaled / blit_tiled (nearest RGB565 on
- *      the bound source) and poly_uv / poly_fill_tex (affine UV).
+ *      the bound source) and poly_uv / poly_fill_tex (bilinear UV on quads,
+ *      affine triangles otherwise).
  */
 #define AG_ABI_MAJOR 0u
 #define AG_ABI_MINOR 26u
@@ -570,7 +571,8 @@ typedef struct ag_gfx_api {
     void (*blit_tiled)(int16_t dx, int16_t dy, uint16_t dw, uint16_t dh);
     /*
      * UV in source pixels for the next poly_vertex.  poly_fill_tex fills the
-     * convex polygon by affine-mapping the bound blit_src_rect.  Vertices
+     * convex polygon from the bound blit_src_rect: a quad is one bilinear map
+     * (no triangle-fan seam); n!=4 is a fan of affine triangles.  Vertices
      * without poly_uv get a bounding-box map onto that rect.
      */
     void (*poly_uv)(int16_t u, int16_t v);
