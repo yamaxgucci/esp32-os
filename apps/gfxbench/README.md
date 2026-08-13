@@ -7,7 +7,8 @@ present path.
 | Image | Backend |
 |---|---|
 | `GFXBENCH.AXE` | kernel `ag_gfx_*` (fill/blit/text) |
-| `LVGLBENCH.AXE` | LVGL 9.3 widgets → direct RGB565 into the gfx back buffer |
+| `LVGLBENCH.AXE` | LVGL 9.3 widgets + default theme → `ag_gfx_flush` |
+| `LVGLPLAIN.AXE` | LVGL 9.3 `lv_obj` rects + labels, no theme/slider/bar, simple SW fill |
 
 LVGL is **not** in the kernel. The tree is fetched into `third_party/lvgl`
 (gitignored) at build time.
@@ -20,7 +21,7 @@ Needs `xtensa-esp32s3-elf-gcc` on PATH (IDF export).
 python apps/gfxbench/build.py
 ```
 
-`--native-only` / `--lvgl-only` if you only want one image. `mkaxe` stages
+`--native-only` / `--lvgl-only` / `--plain-only` if you only want one image. `mkaxe` stages
 into `build/apps/` and `build/sd_card/`.
 
 Typical image size (xtensa `-Os`, LVGL 9.3 trimmed widgets):
@@ -29,6 +30,7 @@ Typical image size (xtensa `-Os`, LVGL 9.3 trimmed widgets):
 |---|---:|---:|
 | `GFXBENCH.AXE` | ~5 KB | ~0.5 KB |
 | `LVGLBENCH.AXE` | ~137 KB | ~18 KB (font + theme) |
+| `LVGLPLAIN.AXE` | ~113 KB | ~18 KB (font, no theme) |
 
 LVGLBENCH is ~137 KB of code. The S3 firmware reserves a **192 KB** executable
 arena (`CONFIG_ARGON_APP_ARENA_KB`); `SYSTEM.CFG` may clip it (docs example is
@@ -70,10 +72,10 @@ argon run -Gfx -HostFs build\sd_card
 ```
 run h:\gfxbench.axe full 300
 run h:\lvglbench.axe full 300
+run h:\lvglplain.axe full 300
 run h:\gfxbench.axe dirty 300
 run h:\lvglbench.axe dirty 300
-run h:\gfxbench.axe idle 300
-run h:\lvglbench.axe idle 300
+run h:\lvglplain.axe dirty 300
 ```
 
 Modes:
@@ -92,7 +94,11 @@ gfxbench mem: arena …/… free, largest …, fast …, sys …
 ```
 
 QEMU numbers are **relative** only — HostFS/soft present is not ESP32-S3
-PSRAM latency. Compare the two images on the same run, same mode.
+PSRAM latency. Compare the three images on the same run, same mode.
+
+`LVGLPLAIN` is the rasterizer+`lv_obj` cost without default theme or slider/bar
+chrome. If it is close to `GFXBENCH`, the gap was widgets. If it stays near
+`LVGLBENCH`, the gap is LVGL's software draw / object tree.
 
 ## What this does not measure
 

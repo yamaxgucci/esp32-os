@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build GFXBENCH.AXE (native) and LVGLBENCH.AXE (LVGL v9.3.0)."""
+"""Build GFXBENCH.AXE (native), LVGLBENCH.AXE (widgets), LVGLPLAIN.AXE (rects)."""
 from __future__ import annotations
 
 import argparse
@@ -44,6 +44,31 @@ KEEP_PREFIX = (
     "src/widgets/slider/",
 )
 
+KEEP_PREFIX_PLAIN = (
+    "src/lv_init.c",
+    "src/core/",
+    "src/display/",
+    "src/draw/lv_draw",
+    "src/draw/lv_image_decoder.c",
+    "src/draw/sw/",
+    "src/font/lv_font.c",
+    "src/font/lv_font_fmt_txt.c",
+    "src/font/lv_font_montserrat_14.c",
+    "src/indev/",
+    "src/layouts/lv_layout.c",
+    "src/libs/bin_decoder/",
+    "src/misc/",
+    "src/osal/lv_os.c",
+    "src/osal/lv_os_none.c",
+    "src/stdlib/lv_mem.c",
+    "src/stdlib/builtin/lv_string_builtin.c",
+    "src/stdlib/builtin/lv_sprintf_builtin.c",
+    "src/stdlib/clib/lv_mem_core_clib.c",
+    "src/themes/lv_theme.c",
+    "src/tick/",
+    "src/widgets/label/",
+)
+
 SKIP_SUB = (
     "src/core/lv_obj_id_builtin.c",
     "src/core/lv_obj_property.c",
@@ -73,7 +98,7 @@ def ensure_lvgl() -> None:
     )
 
 
-def lvgl_sources() -> list[str]:
+def lvgl_sources(keep: tuple[str, ...]) -> list[str]:
     out = []
     src_root = os.path.join(LVGL, "src")
     for dirpath, _, files in os.walk(src_root):
@@ -82,12 +107,11 @@ def lvgl_sources() -> list[str]:
                 continue
             full = os.path.join(dirpath, name)
             r = rel(full)
-            # path relative to third_party/lvgl
             inner = r[len("third_party/lvgl/") :]
             inner = inner.replace("\\", "/")
             if any(inner == s or inner.startswith(s) for s in SKIP_SUB):
                 continue
-            if not any(inner == p or inner.startswith(p) for p in KEEP_PREFIX):
+            if not any(inner == p or inner.startswith(p) for p in keep):
                 continue
             out.append(r)
     out.sort()
@@ -106,6 +130,7 @@ def main() -> int:
     ap.add_argument("--arch", default="xtensa")
     ap.add_argument("--native-only", action="store_true")
     ap.add_argument("--lvgl-only", action="store_true")
+    ap.add_argument("--plain-only", action="store_true")
     args = ap.parse_args()
 
     base_cflags = (
@@ -119,7 +144,7 @@ def main() -> int:
         "--include", "apps/gfxbench",
     ]
 
-    if not args.lvgl_only:
+    if not args.lvgl_only and not args.plain_only:
         run_mkaxe(common + [
             "--cflags", base_cflags,
             "-o", "build/apps/GFXBENCH.AXE",
@@ -128,12 +153,12 @@ def main() -> int:
             "apps/common/libc/libc_shim.c",
         ])
 
-    if not args.native_only:
+    if not args.native_only and not args.plain_only:
         ensure_lvgl()
-        srcs = lvgl_sources()
+        srcs = lvgl_sources(KEEP_PREFIX)
         if not srcs:
             raise SystemExit("no LVGL sources matched; is third_party/lvgl present?")
-        print("lvgl: %d source files" % len(srcs), flush=True)
+        print("lvgl widgets: %d source files" % len(srcs), flush=True)
         run_mkaxe(common + [
             "--cflags",
             base_cflags + " -DGFXBENCH_LVGL -DLV_CONF_INCLUDE_SIMPLE -DLV_KCONFIG_IGNORE",
@@ -141,6 +166,29 @@ def main() -> int:
             "-o", "build/apps/LVGLBENCH.AXE",
             "apps/gfxbench/gfxbench.c",
             "apps/gfxbench/lvgl_draw.c",
+            "apps/common/libc/libc_shim.c",
+        ] + srcs)
+
+    if not args.native_only and not args.lvgl_only:
+        ensure_lvgl()
+        srcs = lvgl_sources(KEEP_PREFIX_PLAIN)
+        if not srcs:
+            raise SystemExit("no LVGL plain sources matched")
+        print("lvgl plain: %d source files" % len(srcs), flush=True)
+        run_mkaxe([
+            "--arch", args.arch, "--gcc", args.gcc,
+            "--include", "sdk/include",
+            "--include", "apps/common/libc",
+            "--include", "apps/gfxbench/plain",
+            "--include", "apps/gfxbench",
+            "--cflags",
+            base_cflags
+            + " -DGFXBENCH_LVGL -DGFXBENCH_LVGL_PLAIN -DLV_CONF_INCLUDE_SIMPLE"
+            + " -DLV_KCONFIG_IGNORE",
+            "--include", "third_party/lvgl",
+            "-o", "build/apps/LVGLPLAIN.AXE",
+            "apps/gfxbench/gfxbench.c",
+            "apps/gfxbench/lvgl_plain.c",
             "apps/common/libc/libc_shim.c",
         ] + srcs)
 
