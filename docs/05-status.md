@@ -160,6 +160,7 @@ $py = "D:\Espressif\tools\python_env\idf5.5_py3.12_env\Scripts\python.exe"
 | Soft input / `joy0` | `src/dev/input.c` | ✅ слой pad: PADPUSH → `/dev/joy0` + `inp->pad`/`btn`/`btnp` (ABI 0.11), снимок 6 байт; `H:\sms.pad` — совместимость |
 | Master System `.AXE` | `apps/sms/` (SMS Plus GX, GPLv2+) | ✅ play + `ag_btnp` / PADPUSH; рендер в back-буфер `gfx`; PSG+FM→`/dev/pcm*` или WAV (`ag_fm`); QEMU: `PCMVIRT.SYS` + `pcmplay.py` |
 | Mega Drive `.AXE` | `apps/md/` (gwenesis, GPLv3 + Musashi MIT) | ⚠ play+sound: 68000 + VDP + Z80 + PSG + YM→`ag_fm`; звук в `/dev/pcmnull`/`pcmvirt` или WAV; I2S — будущий `.SYS`. Лицензии — [`apps/md/README.md`](../apps/md/README.md) |
+| Doom `.AXE` | `apps/doom/` (doomgeneric / Chocolate, GPLv2+) | ⚠ картинка + OPL3/SFX через `pcmvirt`; **ввод в QEMU сломан** (клавиши теряются, с титра не стартует). Отложено: [`plans/doom-input.md`](plans/doom-input.md) |
 | Владение пинами | `src/dev/ioclaim.c` | ✅ пины системы, занятые пины, возврат за упавшим процессом |
 | Железо напрямую | `src/dev/io.c` | ✅ GPIO, ISR, I2C, SPI, UART, PWM; команда `io`, скан I2C |
 | Таблица ABI | `src/loader/api.c` | ⚠ 0.11: `inp->btnp`, расширенный `ag_btn`, `pad` hi-байты; `gfx` draw; `cfg`/`net` — `NULL` |
@@ -258,7 +259,11 @@ $py = "D:\Espressif\tools\python_env\idf5.5_py3.12_env\Scripts\python.exe"
    медленная перерисовка экрана, — отпускать замок на время передачи.
 10. **Нет сети, дисплея, USB.**
 11. **В менеджере нет** копирования каталога целиком, рекурсивного удаления,
-   поиска и командной строки внизу.
+    поиска и командной строки внизу.
+12. **Doom в QEMU: клавиатура не доезжает.** Несколько попыток (фокус SDL в
+    `kbdvirt`, FIFO/bitmap в госте, мышь не в меню) не починили — с титра
+    нельзя стартовать. Работа остановлена; план
+    [`plans/doom-input.md`](plans/doom-input.md).
 
 ## Формат `.AXE` в трёх абзацах
 
