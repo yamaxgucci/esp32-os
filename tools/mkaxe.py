@@ -372,6 +372,8 @@ def main():
                          "resolve a still-undefined symbol are pulled in, so "
                          "asking for c to get setjmp does not drag newlib's "
                          "malloc past the app's own")
+    ap.add_argument("--ldflags", default="",
+                    help="extra linker flags (e.g. -Wl,--gc-sections)")
     ap.add_argument("--keep-elf", help="also write the intermediate ELF here")
     ap.add_argument(
         "--no-stage",
@@ -392,11 +394,12 @@ def main():
     workdir = tempfile.mkdtemp(prefix="mkaxe-")
     try:
         objects = []
-        for src in args.sources:
+        for i, src in enumerate(args.sources):
             if src.endswith(".o"):
                 objects.append(src)
                 continue
-            obj = os.path.join(workdir, os.path.basename(src) + ".o")
+            # Unique names: LVGL (and any multi-dir tree) repeats basenames.
+            obj = os.path.join(workdir, "s%d.o" % i)
             cmd = [args.gcc, "-c"] + args.cflags.split()
             for inc in args.include:
                 cmd += ["-I", inc]
@@ -412,10 +415,11 @@ def main():
                                   args.contiguous, rodata_in_code))
 
         elf_path = os.path.join(workdir, "image.elf")
+        ldflags = args.ldflags.split() if args.ldflags else []
         run([args.gcc, "-nostdlib", "-nostartfiles",
              "-Wl,--emit-relocs", "-Wl,-T", script,
-             "-Wl,--no-warn-rwx-segments", "-o", elf_path] + objects +
-            ["-l" + lib for lib in args.libs] + ["-lgcc"])
+             "-Wl,--no-warn-rwx-segments", "-o", elf_path] + ldflags +
+            objects + ["-l" + lib for lib in args.libs] + ["-lgcc"])
 
         with open(elf_path, "rb") as f:
             elf_data = f.read()

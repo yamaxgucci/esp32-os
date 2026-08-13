@@ -22,6 +22,9 @@ Testing/
 # Machine specific toolchain paths
 tools/local-env.ps1
 
+# Fetched by apps/gfxbench/build.py (LVGL v9.3.0). Not vendored.
+third_party/lvgl/
+
 # Python bytecode from the host tools
 __pycache__/
 
