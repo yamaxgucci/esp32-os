@@ -11,6 +11,7 @@
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
  */
 #include <argon/argon.h>
+#include <argon/keys.h>
 #include <argon/libc.h>
 
 AG_DRV("KBDVIRT", "1.0", "argon");
@@ -47,6 +48,7 @@ typedef struct {
     uint16_t     count;
     uint8_t      rx_buf[PKT_SIZE];
     uint8_t      rx_n;
+    uint8_t      drop_stale;
 } kbdvirt_state_t;
 
 static kbdvirt_state_t s_st;
@@ -94,6 +96,13 @@ static void handle_pkt(kbdvirt_state_t *st, const kbdvirt_pkt_t *pkt)
     if (pkt->hid == 0u) {
         return;
     }
+    /* Host Ctrl+C / F12 are supervisor stop keys, not Doom fire/menu. */
+    if ((pkt->mods & AG_MOD_CTRL) && pkt->hid == (uint16_t)AG_KEY_C) {
+        return;
+    }
+    if (pkt->hid == (uint16_t)AG_KEY_F12) {
+        return;
+    }
     ring_push(st, pkt);
     inject_key(pkt);
 }
@@ -113,6 +122,23 @@ static void feed_bytes(kbdvirt_state_t *st, const uint8_t *buf, int32_t n)
             pkt._pad = st->rx_buf[7];
             st->rx_n = 0;
             handle_pkt(st, &pkt);
+        }
+    }
+}
+
+static void drain_rx(kbdvirt_state_t *st)
+{
+    uint8_t dump[RX_CHUNK];
+    int     spins = 0;
+    if (st->conn < 0) {
+        return;
+    }
+    st->rx_n = 0;
+    ring_clear(st);
+    while (spins++ < 64) {
+        const int32_t n = ag_net_recv(st->conn, dump, sizeof(dump));
+        if (n == -AG_EAGAIN || n <= 0) {
+            break;
         }
     }
 }
@@ -160,7 +186,8 @@ static void try_accept(kbdvirt_state_t *st)
     }
     st->conn = peer;
     (void)ag_net_set_nonblock(st->conn, true);
-    st->rx_n = 0;
+    drain_rx(st);
+    st->drop_stale = 1;
     ag_log(AG_LOG_INFO, "kbdvirt", "host connected");
 }
 
@@ -199,6 +226,7 @@ static ag_err_t kbd_open(ag_device_t *dev, uint32_t flags)
     }
     ensure_listen(st);
     try_accept(st);
+    st->drop_stale = 1;
     return AG_OK;
 }
 
@@ -242,6 +270,10 @@ static int32_t kbd_read(ag_device_t *dev, void *buf, size_t len, uint64_t off)
         return 0;
     }
 
+    if (st->drop_stale) {
+        drain_rx(st);
+        st->drop_stale = 0;
+    }
     pump_rx(st);
 
     out = (uint8_t *)buf;

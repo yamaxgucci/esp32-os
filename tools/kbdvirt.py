@@ -6,8 +6,10 @@ Guest listens on TCP :5561 (QEMU hostfwd).  8-byte LE packets:
   type(1) mods(1) hid(u16) unicode(u16) repeat(1) pad(1)
 
 GetAsyncKeyState is global, so keys work while the QEMU SDL window is
-focused (that window is video-only).  Right-Ctrl pauses injection so the
-serial console can be typed at.  Ctrl+C quits.
+focused (that window is video-only).  Starts **paused** so typing at the
+serial console (and Ctrl+C in other windows) is not dumped into the guest
+when Doom first opens /dev/kbd0.  Right-Ctrl toggles capture.  Ctrl+C
+quits this tool (not sent to the guest).
 
 Typical:
 
@@ -130,21 +132,47 @@ def main() -> int:
     period = 1.0 / max(args.hz, 1.0)
     sock: socket.socket | None = None
     prev: dict[int, bool] = {vk: False for vk in VK_TO_HID}
+    paused = True
+    rctrl_was = False
 
     print(
         f"kbdvirt → {args.host}:{args.port}  "
-        f"(RCtrl=pause, Ctrl+C=quit; arrows/Ctrl/Shift/Space/Enter/Esc → Doom)",
+        f"(RCtrl=toggle capture, starts PAUSED; Ctrl+C=quit this tool)",
         flush=True,
     )
 
     while True:
-        paused = bool(user32.GetAsyncKeyState(VK_RCONTROL) & 0x8000)
+        rctrl = bool(user32.GetAsyncKeyState(VK_RCONTROL) & 0x8000)
+        if rctrl and not rctrl_was:
+            paused = not paused
+            if paused:
+                for vk in prev:
+                    if prev[vk]:
+                        hid = VK_TO_HID[vk]
+                        edges_up = pack_pkt(TYPE_UP, 0, hid)
+                        if sock is not None:
+                            try:
+                                sock.send(edges_up)
+                            except OSError:
+                                pass
+                    prev[vk] = False
+                print("capture OFF (RCtrl to arm)", flush=True)
+            else:
+                for vk, hid in VK_TO_HID.items():
+                    prev[vk] = bool(user32.GetAsyncKeyState(vk) & 0x8000)
+                print("capture ON", flush=True)
+        rctrl_was = rctrl
+
         edges: list[tuple[int, int, int]] = []
         for vk, hid in VK_TO_HID.items():
             now = (not paused) and bool(user32.GetAsyncKeyState(vk) & 0x8000)
             was = prev[vk]
             if now and not was:
-                edges.append((TYPE_DOWN, hid, mods_now(user32)))
+                m = mods_now(user32)
+                if hid == HID_A + (ord("c") - ord("a")) and (m & AG_MOD_CTRL):
+                    prev[vk] = now
+                    continue
+                edges.append((TYPE_DOWN, hid, m))
             elif was and not now:
                 edges.append((TYPE_UP, hid, 0))
             prev[vk] = now

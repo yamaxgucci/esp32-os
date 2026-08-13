@@ -143,6 +143,7 @@ int doom_argon_poll_sys(void)
     }
     while (ag_poll_event(&ev, 0)) {
         if (ev.type == AG_EV_QUIT) {
+            ag_printf("doom: quit (F12 / supervisor)\n");
             s_quit = 1;
             return 1;
         }
@@ -159,10 +160,8 @@ int doom_argon_poll_sys(void)
             }
         }
     }
-    if (ag_btn(AG_BTN_QUIT)) {
-        s_quit = 1;
-        return 1;
-    }
+    /* Do not use ag_btn(AG_BTN_QUIT): without a live pad that is sticky Esc,
+     * which Doom needs for the menu.  Process stop is AG_EV_QUIT (F12). */
     poll_pad_edges();
     return s_quit;
 }
