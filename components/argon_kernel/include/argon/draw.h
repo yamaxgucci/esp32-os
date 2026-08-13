@@ -96,7 +96,9 @@ void ag_draw_blit_tiled(ag_draw_surf_t *s, int32_t dx, int32_t dy, int32_t dw,
                         int32_t dh, const void *src, uint32_t src_stride,
                         int32_t sx, int32_t sy, int32_t sw, int32_t sh);
 
-/* Affine-map RGB565 LE onto a convex polygon (nearest, UV clamped to src rect). */
+/* Affine-map RGB565 LE onto a convex polygon (nearest).  Quads use bilinear
+ * UV (no triangle-fan seam); n!=4 is a fan of affine triangles.
+ */
 void ag_draw_fill_convex_tex(ag_draw_surf_t *s, const ag_draw_texvert_t *pts,
                              int n, const void *src, uint32_t src_stride,
                              int32_t sx, int32_t sy, int32_t sw, int32_t sh);

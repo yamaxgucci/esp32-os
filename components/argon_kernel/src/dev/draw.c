@@ -5,6 +5,7 @@
  */
 #include <argon/draw.h>
 
+#include <math.h>
 #include <stddef.h>
 
 uint16_t ag_draw_rgb_to_565(uint32_t color)
@@ -653,6 +654,178 @@ static void fill_tex_tri(ag_draw_surf_t *s, ag_draw_texvert_t a,
     }
 }
 
+static float cross2(float ax, float ay, float bx, float by)
+{
+    return ax * by - ay * bx;
+}
+
+/*
+ * Inverse bilinear: p = mix(mix(A,B,s), mix(D,C,s), t) for quad A,B,C,D.
+ * After Iñigo Quílez.  Returns 0 if the point is degenerate.
+ */
+static int inv_bilinear(int32_t px, int32_t py, const ag_draw_texvert_t q[4],
+                        float *out_s, float *out_t)
+{
+    const float ax = (float)q[0].x;
+    const float ay = (float)q[0].y;
+    const float ex = (float)q[1].x - ax;
+    const float ey = (float)q[1].y - ay;
+    const float fx = (float)q[3].x - ax;
+    const float fy = (float)q[3].y - ay;
+    const float gx = ax - (float)q[1].x + (float)q[2].x - (float)q[3].x;
+    const float gy = ay - (float)q[1].y + (float)q[2].y - (float)q[3].y;
+    const float hx = (float)px - ax;
+    const float hy = (float)py - ay;
+    const float k2 = cross2(gx, gy, fx, fy);
+    const float k1 = cross2(ex, ey, fx, fy) + cross2(hx, hy, gx, gy);
+    const float k0 = cross2(hx, hy, ex, ey);
+    const float eps = 1e-4f;
+    float s;
+    float t;
+
+    if (k2 > -eps && k2 < eps) {
+        float den;
+        if (k1 > -eps && k1 < eps) {
+            return 0;
+        }
+        t = -k0 / k1;
+        den = ex * k1 - gx * k0;
+        if (den > -eps && den < eps) {
+            return 0;
+        }
+        s = (hx * k1 + fx * k0) / den;
+    } else {
+        float w = k1 * k1 - 4.f * k0 * k2;
+        float ik2;
+        float den;
+        if (w < 0.f) {
+            return 0;
+        }
+        w = sqrtf(w);
+        ik2 = 0.5f / k2;
+        t = (-k1 - w) * ik2;
+        den = ex + gx * t;
+        if (den > -eps && den < eps) {
+            den = ey + gy * t;
+            if (den > -eps && den < eps) {
+                return 0;
+            }
+            s = (hy - fy * t) / den;
+        } else {
+            s = (hx - fx * t) / den;
+        }
+        if (s < -0.02f || s > 1.02f || t < -0.02f || t > 1.02f) {
+            t = (-k1 + w) * ik2;
+            den = ex + gx * t;
+            if (den > -eps && den < eps) {
+                den = ey + gy * t;
+                if (den > -eps && den < eps) {
+                    return 0;
+                }
+                s = (hy - fy * t) / den;
+            } else {
+                s = (hx - fx * t) / den;
+            }
+        }
+    }
+    *out_s = s;
+    *out_t = t;
+    return 1;
+}
+
+/* One bilinear map over a quad — no triangle-fan seam. */
+static void fill_tex_quad(ag_draw_surf_t *s, const ag_draw_texvert_t q[4],
+                          const void *src, uint32_t src_stride, int32_t sx,
+                          int32_t sy, int32_t sw, int32_t sh)
+{
+    int32_t ymin = q[0].y;
+    int32_t ymax = q[0].y;
+    int i;
+
+    for (i = 1; i < 4; i++) {
+        if (q[i].y < ymin) {
+            ymin = q[i].y;
+        }
+        if (q[i].y > ymax) {
+            ymax = q[i].y;
+        }
+    }
+    if (ymax < 0 || ymin >= (int32_t)s->h) {
+        return;
+    }
+    if (ymin < 0) {
+        ymin = 0;
+    }
+    if (ymax >= (int32_t)s->h) {
+        ymax = (int32_t)s->h - 1;
+    }
+
+    for (int32_t y = ymin; y <= ymax; y++) {
+        int32_t x_min = 0x7fffffff;
+        int32_t x_max = -0x7fffffff - 1;
+        int hits = 0;
+        for (i = 0; i < 4; i++) {
+            const int32_t y0 = q[i].y;
+            const int32_t y1 = q[(i + 1) % 4].y;
+            const int32_t x0 = q[i].x;
+            const int32_t x1 = q[(i + 1) % 4].x;
+            const int32_t dy = y1 - y0;
+            int32_t x;
+            if (dy == 0) {
+                continue;
+            }
+            if ((y < y0 && y < y1) || (y >= y0 && y >= y1)) {
+                continue;
+            }
+            x = x0 + (int32_t)((int64_t)(y - y0) * (x1 - x0) / dy);
+            if (x < x_min) {
+                x_min = x;
+            }
+            if (x > x_max) {
+                x_max = x;
+            }
+            hits++;
+        }
+        if (hits < 2) {
+            continue;
+        }
+        for (int32_t x = x_min; x <= x_max; x++) {
+            float st_s;
+            float st_t;
+            float u;
+            float v;
+            if (!inv_bilinear(x, y, q, &st_s, &st_t)) {
+                continue;
+            }
+            if (st_s < 0.f) {
+                st_s = 0.f;
+            }
+            if (st_s > 1.f) {
+                st_s = 1.f;
+            }
+            if (st_t < 0.f) {
+                st_t = 0.f;
+            }
+            if (st_t > 1.f) {
+                st_t = 1.f;
+            }
+            u = (1.f - st_s) * (1.f - st_t) * (float)q[0].u +
+                st_s * (1.f - st_t) * (float)q[1].u +
+                st_s * st_t * (float)q[2].u +
+                (1.f - st_s) * st_t * (float)q[3].u;
+            v = (1.f - st_s) * (1.f - st_t) * (float)q[0].v +
+                st_s * (1.f - st_t) * (float)q[1].v +
+                st_s * st_t * (float)q[2].v +
+                (1.f - st_s) * st_t * (float)q[3].v;
+            ag_draw_pixel(
+                s, x, y,
+                sample_clamp(src, src_stride, sx, sy, sw, sh,
+                             (int32_t)(u + (u >= 0.f ? 0.5f : -0.5f)),
+                             (int32_t)(v + (v >= 0.f ? 0.5f : -0.5f))));
+        }
+    }
+}
+
 void ag_draw_fill_convex_tex(ag_draw_surf_t *s, const ag_draw_texvert_t *pts,
                              int n, const void *src, uint32_t src_stride,
                              int32_t sx, int32_t sy, int32_t sw, int32_t sh)
@@ -660,6 +833,10 @@ void ag_draw_fill_convex_tex(ag_draw_surf_t *s, const ag_draw_texvert_t *pts,
     int i;
     if (s == NULL || s->pix == NULL || pts == NULL || src == NULL || n < 3 ||
         sw <= 0 || sh <= 0) {
+        return;
+    }
+    if (n == 4) {
+        fill_tex_quad(s, pts, src, src_stride, sx, sy, sw, sh);
         return;
     }
     for (i = 1; i < n - 1; i++) {

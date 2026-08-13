@@ -258,4 +258,27 @@ void run_draw_tests(void)
         AG_CHECK(s_fb[3 * W] == 0x001F);
         AG_CHECK(s_fb[3 * W + 3] == 0xFFFF);
     }
+
+    /* Kite (unequal halves): bilinear UV covers the interior, no empty waist. */
+    {
+        static const uint16_t tex[2 * 2] = {0xF800, 0x07E0, 0x001F, 0xFFFF};
+        const ag_draw_texvert_t kite[4] = {
+            {2, 10, 0, 1},
+            {10, 2, 1, 0},
+            {18, 10, 2, 1},
+            {10, 20, 1, 2},
+        };
+        surf_clear(0);
+        ag_draw_fill_convex_tex(&s_surf, kite, 4, tex, 4, 0, 0, 2, 2);
+        AG_CHECK(s_fb[10 * W + 2] != 0);
+        AG_CHECK(s_fb[2 * W + 10] != 0);
+        AG_CHECK(s_fb[10 * W + 18] != 0);
+        AG_CHECK(s_fb[19 * W + 10] != 0);
+        AG_CHECK(s_fb[10 * W + 10] != 0);
+        AG_CHECK(s_fb[9 * W + 10] != 0);
+        AG_CHECK(s_fb[11 * W + 10] != 0);
+        AG_CHECK(count_color(0xF800) + count_color(0x07E0) + count_color(0x001F) +
+                     count_color(0xFFFF) >
+                 20);
+    }
 }
