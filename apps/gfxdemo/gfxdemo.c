@@ -3,42 +3,27 @@
  *
  *   python tools/mkaxe.py --arch xtensa --gcc xtensa-esp32s3-elf-gcc \
  *       --include sdk/include -o GFXDEMO.AXE apps/gfxdemo/gfxdemo.c
- *   run t:\gfxdemo.axe
- *   gfxdump t:\shot.ppm
+ *   run t:\gfxdemo.axe          (Esc / Q / Enter to leave)
+ *   gfxdump t:\shot.ppm         (while it is still on screen)
+ *
+ * Pass `once` to paint and exit (scripts / gfxdump after a foreground run).
  *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
  */
 #include <argon/argon.h>
+#include <argon/keys.h>
 
 AG_APP("GFXDEMO", "1.0", "argon", AG_AXE_NEEDS_GFX);
 
-int ag_main(int argc, char **argv)
+static void draw_scene(const ag_gfxinfo_t *info)
 {
-    (void)argc;
-    (void)argv;
-
-    if (ag_api()->gfx == NULL) {
-        ag_printf("no gfx\n");
-        return 1;
-    }
-
-    ag_gfxinfo_t info;
-    const ag_err_t err = ag_gfx_acquire(&info);
-    if (err != AG_OK) {
-        ag_printf("acquire failed: %s\n", ag_strerror(err));
-        return 1;
-    }
-
-    ag_printf("gfx %ux%u fmt=%u stride=%u db=%d direct=%d\n",
-              (unsigned)info.width, (unsigned)info.height, (unsigned)info.fmt,
-              (unsigned)info.stride, info.double_buf ? 1 : 0,
-              info.direct ? 1 : 0);
-
     ag_gfx_clear(0x00102040u);
-    ag_gfx_fill_rect(16, 16, (uint16_t)(info.width - 32), 40, 0x00C04020u);
+    ag_gfx_fill_rect(16, 16, (uint16_t)(info->width - 32), 40, 0x00C04020u);
     (void)ag_gfx_text(24, 24, "ArgonOS soft gfx", 0x00FFFFFFu, 0x00C04020u);
+    (void)ag_gfx_text((int16_t)(info->width - 120), 24, "Esc/Q quit",
+                      0x00FFFFFFu, 0x00C04020u);
 
-    ag_gfx_line(24, 80, (int16_t)(info.width - 24), 80, 0x00E0E0E0u);
+    ag_gfx_line(24, 80, (int16_t)(info->width - 24), 80, 0x00E0E0E0u);
     ag_gfx_circle(120, 200, 48, 0x0020A0FFu);
     ag_gfx_fill_circle(260, 200, 40, 0x00E0C040u);
 
@@ -121,10 +106,77 @@ int ag_main(int argc, char **argv)
         (void)ag_gfx_text(400, 332, "scale/tile/uv", 0x00E0E0E0u, 0x00102040u);
     }
 
-    ag_gfx_flush(0, 0, info.width, info.height);
+    ag_gfx_flush(0, 0, info->width, info->height);
     ag_gfx_swap();
-    ag_gfx_release();
+}
 
-    ag_printf("ok\n");
+int ag_main(int argc, char **argv)
+{
+    ag_gfxinfo_t info;
+    int once = 0;
+    int running = 1;
+
+    if (argc >= 2 && argv[1] != NULL && argv[1][0] == 'o') {
+        once = 1;
+    }
+
+    if (ag_api()->gfx == NULL) {
+        ag_printf("no gfx\n");
+        return 1;
+    }
+
+    {
+        const ag_err_t err = ag_gfx_acquire(&info);
+        if (err != AG_OK) {
+            ag_printf("acquire failed: %s\n", ag_strerror(err));
+            return 1;
+        }
+    }
+
+    ag_printf("gfx %ux%u fmt=%u stride=%u db=%d direct=%d\n",
+              (unsigned)info.width, (unsigned)info.height, (unsigned)info.fmt,
+              (unsigned)info.stride, info.double_buf ? 1 : 0,
+              info.direct ? 1 : 0);
+
+    draw_scene(&info);
+    ag_printf("ok  Esc/Q/Enter quit\n");
+    if (once) {
+        ag_gfx_release();
+        return 0;
+    }
+
+    while (running) {
+        ag_event_t ev;
+        while (ag_poll_event(&ev, 0)) {
+            if (ev.type == AG_EV_QUIT) {
+                running = 0;
+                break;
+            }
+            if (ev.type == AG_EV_KEY_DOWN &&
+                (ev.key.keycode == AG_KEY_ESC || ev.key.keycode == AG_KEY_Q ||
+                 ev.key.keycode == AG_KEY_ENTER)) {
+                running = 0;
+                break;
+            }
+        }
+        if (!running || ag_interrupted()) {
+            break;
+        }
+        if (!ag_focused()) {
+            ag_heartbeat();
+            ag_delay(20);
+            continue;
+        }
+        {
+            ag_gfxinfo_t gi2;
+            if (ag_gfx_acquire(&gi2) == AG_OK) {
+                draw_scene(&gi2);
+            }
+        }
+        ag_heartbeat();
+        ag_delay(20);
+    }
+
+    ag_gfx_release();
     return 0;
 }
