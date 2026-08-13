@@ -56,6 +56,6 @@ the host tool (not HostFS PADPUSH).
 python tools/kbdvirt.py --reconnect
 ```
 
-Right-Ctrl pauses injection (so you can type at the serial console).
-Ctrl+C quits the host tool. Arrows / Ctrl / Shift / Space / Enter / Esc
+Right-Ctrl **toggles** capture (starts **paused**). Ctrl+C quits the host
+tool and is not forwarded. Arrows / Ctrl / Shift / Space / Enter / Esc
 match vanilla Doom.

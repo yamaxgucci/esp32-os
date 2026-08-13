@@ -61,8 +61,9 @@ Host (second terminal):
 python tools/kbdvirt.py --reconnect
 ```
 
-Arrows move, Ctrl fire, Space use, Shift run, Enter, Esc menu. Right-Ctrl
-on the host pauses injection so you can type at the serial console.
+Arrows move, Ctrl fire, Space use, Shift run, Enter, Esc menu.
+`kbdvirt.py` starts **paused**; Right-Ctrl toggles capture. Do not arm until
+the title screen is up, or keys typed during WAD load get injected as a burst.
 
 The QEMU RGB window stays **black until the first presented frame** — after
 `R_Init` / `P_Init` / `I_InitGraphics`. Watch `textures` / `flats` / `sprites`
