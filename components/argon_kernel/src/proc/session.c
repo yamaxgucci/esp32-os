@@ -303,7 +303,7 @@ static void enter_loading_view(int slot, ag_pid_t pid)
         ag_console_lock();
         ag_screen_cls(ag_console_screen());
         ag_screen_set_attr(ag_console_screen(), AG_ATTR_DEFAULT);
-        ag_screen_set_cursor(ag_console_screen(), false);
+        ag_screen_set_cursor(ag_console_screen(), true);
         ag_console_unlock();
         ag_console_printf("slot %d - loading %s (pid %u)\n",
                           ag_session_display_number(slot), name, (unsigned)pid);

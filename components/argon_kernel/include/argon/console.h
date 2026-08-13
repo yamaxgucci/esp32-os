@@ -119,6 +119,13 @@ void *ag_console_lock_holder(void);
 /* Pushes pending output to every endpoint now instead of at the next tick. */
 void ag_console_sync(void);
 
+/*
+ * Default attributes, cursor shown, and every VT endpoint forced to re-emit
+ * DECTCEM.  Used after an app exits: loading/hide-cursor otherwise sticks,
+ * and a dropped `\e[?25h` is never resent while the endpoint thinks it showed.
+ */
+void ag_console_restore_tty(void);
+
 /* Throws away input that has arrived but not been read. */
 void ag_console_flush_input(void);
 

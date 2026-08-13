@@ -81,7 +81,7 @@ Modes:
 | Arg | What happens |
 |---|---|
 | `full` | animate seek, spectrum, EQ, volume, selection; redraw everything |
-| `dirty` | animate seek + spectrum + time only; partial update |
+| `dirty` | animate seek + spectrum + time only; partial update (full paint after (re)acquire) |
 | `idle` | static UI, still full redraw each frame (AMP-like) |
 
 A number is a frame count (then exit). Esc/Q quits. Stats every 2 s:

@@ -320,6 +320,14 @@ int ag_main(int argc, char **argv)
             ag_delay(20);
             continue;
         }
+        {
+            /* Kernel may have force-released gfx (loading view / Alt-Tab). */
+            ag_gfxinfo_t gi2;
+            if (ag_gfx_acquire(&gi2) == AG_OK) {
+                gi = gi2;
+                gfxbench_backend_on_reacquire(&gi);
+            }
+        }
 
         gfxbench_state_step(&st, mode);
         gfxbench_backend_frame(&st, &lay, mode, &tm);

@@ -16,6 +16,7 @@
 #define COL_ACCENT 0x00E8A54Bu
 
 static uint16_t s_fb_w, s_fb_h;
+static int s_need_full;
 
 static void hslider(const gfxbench_rect_t *r, int permille)
 {
@@ -149,23 +150,33 @@ int gfxbench_backend_init(const ag_gfxinfo_t *gi, const gfxbench_layout_t *L)
     draw_static(L, &st);
     draw_dynamic(L, &st);
     ag_gfx_flush(0, 0, 0, 0);
+    s_need_full = 0;
     return 0;
+}
+
+void gfxbench_backend_on_reacquire(const ag_gfxinfo_t *gi)
+{
+    s_fb_w = gi->width;
+    s_fb_h = gi->height;
+    s_need_full = 1;
 }
 
 void gfxbench_backend_frame(const gfxbench_state_t *st,
                             const gfxbench_layout_t *L, gfxbench_mode_t mode,
                             gfxbench_timing_t *t)
 {
+    int full_present = (mode != GFXBENCH_DIRTY) || s_need_full;
     ag_time_t t0 = ag_micros();
-    if (mode == GFXBENCH_DIRTY) {
-        draw_dynamic(L, st);
-    } else {
+    if (full_present) {
         draw_static(L, st);
+        draw_dynamic(L, st);
+        s_need_full = 0;
+    } else {
         draw_dynamic(L, st);
     }
     t->draw_us = (uint32_t)(ag_micros() - t0);
     gfxbench_flush_begin();
-    if (mode == GFXBENCH_DIRTY) {
+    if (!full_present) {
         gfxbench_rect_t spec_all = L->spec[0];
         const gfxbench_rect_t *last = &L->spec[GFXBENCH_SPEC_N - 1];
         spec_all.w = (uint16_t)(last->x + last->w - spec_all.x);

@@ -299,8 +299,8 @@ void ag_vtout_hello(ag_vtout_t *o, ag_vt_sink_fn sink, void *ctx)
 
     emitter_t e = {.sink = sink, .ctx = ctx, .len = 0};
 
-    /* Reset attributes, enable autowrap, clear, home. */
-    emit_str(&e, "\x1b[0m\x1b[?7h\x1b[2J\x1b[H");
+    /* Reset attributes, enable autowrap, clear, home, show the cursor. */
+    emit_str(&e, "\x1b[0m\x1b[?7h\x1b[2J\x1b[H\x1b[?25h");
 #if CONFIG_ARGON_CONSOLE_KEY_EVENTS
     /*
      * Ask the host terminal for key-release reports.  Kitty: progressive

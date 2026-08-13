@@ -3,7 +3,8 @@
  *
  * Front is what QEMU / fb0 / the console present.  While graphics is acquired
  * and a back buffer exists, apps draw there; flush/swap copy to front and kick
- * the QEMU RGB window (no busy-wait on UPDATE_STATUS.ENA).
+ * the QEMU RGB window.  Present waits (with yield) for the previous blit so a
+ * later partial update cannot replace an in-flight full frame.
  *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
@@ -26,6 +27,7 @@
 #include "esp_heap_caps.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_qemu_rgb.h"
+#include "esp_timer.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -69,6 +71,8 @@ static ag_pid_t  s_owner = AG_PID_KERNEL;
 static bool      s_have_snap;
 static bool      s_front_owned; /* false when front is QEMU's dedicated FB */
 static uint32_t  s_console_gen;
+static int16_t   s_caret_col = -1; /* last inverted console cell, or -1 */
+static int16_t   s_caret_row = -1;
 static ag_device_t *s_dev;
 static esp_lcd_panel_handle_t s_qemu_panel; /* NULL on real hardware */
 
@@ -82,7 +86,9 @@ static size_t fb_bytes(void)
 /*
  * QEMU RGB MMIO (see espressif/qemu hw/display/esp_rgb.c).  Do NOT call
  * esp_lcd_rgb_qemu_refresh: it busy-waits on UPDATE_STATUS.ENA, and that bit
- * only clears from QEMU's display thread — a guest spin deadlocks SMS/console.
+ * only clears from QEMU's display thread — a guest spin (no yield) deadlocks
+ * SMS/console.  Waiting with yield is fine and required: kicking a smaller
+ * region while a full-frame blit is in flight left the SDL window half-painted.
  */
 enum {
     RGB_MMIO_UPDATE_FROM = 0x08u / 4u,
@@ -107,6 +113,24 @@ enum {
  * presented whole.  The extra columns cost nothing on this side: they are read
  * by QEMU's display thread, while the copy the guest pays for stays narrow.
  */
+static void qemu_wait_idle(void)
+{
+    volatile uint32_t *const rgb = (volatile uint32_t *)0x21000000u;
+    const int64_t deadline = esp_timer_get_time() + 50000; /* 50 ms */
+    int yields = 0;
+    while ((rgb[RGB_MMIO_UPDATE_STATUS] & 1u) != 0) {
+        if (esp_timer_get_time() >= deadline) {
+            break;
+        }
+        if (yields < 8) {
+            taskYIELD();
+            yields++;
+        } else {
+            vTaskDelay(1);
+        }
+    }
+}
+
 static void qemu_present_rows(int32_t y, int32_t h)
 {
     if (s_qemu_panel == NULL || s_front == NULL || s_w == 0 || s_h == 0) {
@@ -122,6 +146,8 @@ static void qemu_present_rows(int32_t y, int32_t h)
     if (h <= 0) {
         return;
     }
+
+    qemu_wait_idle();
 
     volatile uint32_t *const rgb = (volatile uint32_t *)0x21000000u;
     /* X in the high half, Y in the low one, per rgb_qemu_dev_t. Ends are
@@ -432,6 +458,7 @@ static ag_err_t gfx_acquire(ag_gfxinfo_t *out)
     }
     s_acquired = true;
     s_owner = ag_proc_self();
+    s_caret_col = -1;
     s_clip_x = 0;
     s_clip_y = 0;
     s_clip_w = 0;
@@ -469,6 +496,7 @@ static void gfx_release(void)
     s_draw = s_front;
     s_acquired = false;
     s_owner = AG_PID_KERNEL;
+    s_caret_col = -1;
     s_console_gen = 0; /* force a full console redraw on the next tick */
     if (ag_console_ready()) {
         ag_console_lock();
@@ -790,6 +818,27 @@ void ag_display_show_overlay(const char *label)
     qemu_present();
 }
 
+static void paint_console_cell(const ag_screen_t *screen, uint16_t col,
+                               uint16_t row, bool invert)
+{
+    const uint16_t max_cols = (uint16_t)(s_w / AG_FONT8X16_W);
+    const uint16_t max_rows = (uint16_t)(s_h / AG_FONT8X16_H);
+    if (col >= screen->cols || row >= screen->rows || col >= max_cols ||
+        row >= max_rows) {
+        return;
+    }
+    const ag_cell_t cell = ag_screen_at(screen, col, row);
+    uint8_t fg = (uint8_t)(cell.attr & 0x0Fu);
+    uint8_t bg = (uint8_t)((cell.attr >> 4) & 0x0Fu);
+    if (invert) {
+        const uint8_t t = fg;
+        fg = bg;
+        bg = t;
+    }
+    draw_glyph((int32_t)col * AG_FONT8X16_W, (int32_t)row * AG_FONT8X16_H,
+               (uint8_t)cell.ch, k_cga565[fg], k_cga565[bg]);
+}
+
 void ag_display_render_console(const ag_screen_t *screen)
 {
     if (!s_ready || s_acquired || s_front == NULL || screen == NULL) {
@@ -797,7 +846,13 @@ void ag_display_render_console(const ag_screen_t *screen)
     }
 
     const bool full = (s_console_gen == 0);
-    if (!full && !ag_screen_any_dirty(screen)) {
+    const bool dirty = full || ag_screen_any_dirty(screen);
+    const bool want_caret = screen->cursor_visible;
+    const bool lit =
+        want_caret &&
+        (((uint64_t)esp_timer_get_time() / 530000ull) % 2ull == 0ull);
+
+    if (!dirty && !want_caret && s_caret_col < 0) {
         return;
     }
 
@@ -808,22 +863,47 @@ void ag_display_render_console(const ag_screen_t *screen)
     const uint16_t draw_cols = cols < max_cols ? cols : max_cols;
     const uint16_t draw_rows = rows < max_rows ? rows : max_rows;
 
-    for (uint16_t row = 0; row < draw_rows; row++) {
-        if (!full && !ag_screen_row_dirty(screen, row)) {
-            continue;
+    if (dirty) {
+        for (uint16_t row = 0; row < draw_rows; row++) {
+            if (!full && !ag_screen_row_dirty(screen, row)) {
+                continue;
+            }
+            for (uint16_t col = 0; col < draw_cols; col++) {
+                paint_console_cell(screen, col, row, false);
+            }
         }
-        for (uint16_t col = 0; col < draw_cols; col++) {
-            const ag_cell_t cell = ag_screen_at(screen, col, row);
-            const uint8_t fg = (uint8_t)(cell.attr & 0x0Fu);
-            const uint8_t bg = (uint8_t)((cell.attr >> 4) & 0x0Fu);
-            draw_glyph((int32_t)col * AG_FONT8X16_W,
-                       (int32_t)row * AG_FONT8X16_H, (uint8_t)cell.ch,
-                       k_cga565[fg], k_cga565[bg]);
-        }
+        s_console_gen = screen->generation != 0 ? screen->generation : 1;
     }
 
-    s_console_gen = screen->generation != 0 ? screen->generation : 1;
-    qemu_present();
+    int32_t carety0 = -1;
+    int32_t carety1 = -1;
+    if (s_caret_col >= 0 &&
+        (!lit || s_caret_col != (int16_t)screen->cur_x ||
+         s_caret_row != (int16_t)screen->cur_y)) {
+        paint_console_cell(screen, (uint16_t)s_caret_col, (uint16_t)s_caret_row,
+                           false);
+        carety0 = (int32_t)s_caret_row * AG_FONT8X16_H;
+        carety1 = carety0 + AG_FONT8X16_H;
+        s_caret_col = -1;
+    }
+    if (lit) {
+        paint_console_cell(screen, screen->cur_x, screen->cur_y, true);
+        const int32_t y = (int32_t)screen->cur_y * AG_FONT8X16_H;
+        if (carety0 < 0 || y < carety0) {
+            carety0 = y;
+        }
+        if (y + AG_FONT8X16_H > carety1) {
+            carety1 = y + AG_FONT8X16_H;
+        }
+        s_caret_col = (int16_t)screen->cur_x;
+        s_caret_row = (int16_t)screen->cur_y;
+    }
+
+    if (dirty) {
+        qemu_present();
+    } else if (carety0 >= 0) {
+        qemu_present_rows(carety0, carety1 - carety0);
+    }
 }
 
 ag_err_t ag_display_dump_ppm(const char *path, const char *cwd, bool live)
