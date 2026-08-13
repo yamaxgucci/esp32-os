@@ -476,7 +476,8 @@ def main() -> int:
     def console_focused() -> bool:
         cons = hwnd_i(hwnd_console)
         if cons == 0:
-            return True
+            # Hidden / CREATE_NO_WINDOW (tools/virt.py): Esc must not quit.
+            return False
         return hwnd_i(user32.GetForegroundWindow()) == cons
 
     try:

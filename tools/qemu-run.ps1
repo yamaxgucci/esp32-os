@@ -28,7 +28,9 @@ param(
     [int]$HostFsPort = 5557,
     # OpenEth + hostfwd (default on).  Windows connects to NetPort → guest.
     [switch]$NoNet,
-    [int]$NetPort = 5558
+    [int]$NetPort = 5558,
+    # Spawn pcmplay + kbdvirt + mousevirt (--reconnect) like hostfsd; kill with QEMU.
+    [switch]$Virt
 )
 
 $ErrorActionPreference = 'Stop'
@@ -124,6 +126,96 @@ if ($HostFs) {
     $hostfsSerial = "tcp:127.0.0.1:$HostFsPort,reconnect=1"
 }
 
+function Test-PythonHasSounddevice {
+    param([string]$Exe)
+    if (-not $Exe -or -not (Test-Path -LiteralPath $Exe)) { return $false }
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    & $Exe -c "import sounddevice" 2>$null | Out-Null
+    $ok = ($LASTEXITCODE -eq 0)
+    $ErrorActionPreference = $prev
+    return $ok
+}
+
+function Resolve-VirtPython {
+    # pcmplay needs sounddevice; IDF's venv usually does not have it.
+    $candidates = [System.Collections.Generic.List[string]]::new()
+    if ($env:ARGON_PYTHON) { [void]$candidates.Add($env:ARGON_PYTHON) }
+    foreach ($name in @('python', 'python3')) {
+        Get-Command $name -All -ErrorAction SilentlyContinue | ForEach-Object {
+            if ($_.Source) { [void]$candidates.Add($_.Source) }
+        }
+    }
+    if ($env:IDF_TOOLS_PATH) {
+        Get-ChildItem -Path (Join-Path $env:IDF_TOOLS_PATH 'python_env') `
+            -Filter 'python.exe' -Recurse -ErrorAction SilentlyContinue |
+            Select-Object -First 1 | ForEach-Object { [void]$candidates.Add($_.FullName) }
+    }
+    $seen = @{}
+    foreach ($py in $candidates) {
+        if ($seen.ContainsKey($py)) { continue }
+        $seen[$py] = $true
+        if (Test-PythonHasSounddevice $py) { return $py }
+    }
+    foreach ($py in $seen.Keys) {
+        if (Test-Path -LiteralPath $py) { return $py }
+    }
+    throw 'Python not found for virt helpers (pcmplay/kbdvirt/mousevirt).'
+}
+
+function Stop-ProcessTree {
+    param([int]$Id)
+    if ($Id -le 0) { return }
+    Get-CimInstance Win32_Process -Filter "ParentProcessId=$Id" `
+        -ErrorAction SilentlyContinue |
+        ForEach-Object { Stop-ProcessTree -Id $_.ProcessId }
+    Stop-Process -Id $Id -Force -ErrorAction SilentlyContinue
+}
+
+function Stop-ArgonVirtHelpers {
+    Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.Name -match '(?i)python' -and
+            $_.CommandLine -and
+            $_.CommandLine -match '(virt|kbdvirt|mousevirt|pcmplay)\.py'
+        } |
+        ForEach-Object {
+            Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+        }
+}
+
+$virtProc = $null
+if ($Virt) {
+    $py = Resolve-VirtPython
+    $virtScript = (Resolve-Path (Join-Path $PSScriptRoot 'virt.py')).Path
+    $virtOut = Join-Path (Get-Location) 'build\virt.out.log'
+    $virtErr = Join-Path (Get-Location) 'build\virt.err.log'
+    New-Item -ItemType Directory -Force -Path (Split-Path $virtOut) | Out-Null
+    Stop-ArgonVirtHelpers
+    Start-Sleep -Milliseconds 200
+    # Start-Process mangles ArgumentList arrays when paths contain spaces.
+    $virtArgs = '-u "{0}"' -f $virtScript
+    $virtProc = Start-Process -FilePath $py `
+        -ArgumentList $virtArgs `
+        -PassThru -WindowStyle Hidden `
+        -RedirectStandardOutput $virtOut `
+        -RedirectStandardError $virtErr
+    Start-Sleep -Milliseconds 400
+    if ($virtProc.HasExited) {
+        $tail = @()
+        foreach ($f in @($virtOut, $virtErr)) {
+            if (Test-Path $f) {
+                $tail += Get-Content $f -ErrorAction SilentlyContinue
+            }
+        }
+        throw ("virt helpers exited immediately (exit {0}). {1}" -f `
+            $virtProc.ExitCode, ($tail -join ' '))
+    }
+    Write-Host "Virt: pcmplay :5558, kbdvirt :5561 (PAUSED, Right-Ctrl arms), mousevirt :5560"
+    Write-Host "      python $py"
+    Write-Host "      logs $virtOut  (killed when QEMU exits)"
+}
+
 # Decide where the console goes before building the arguments: a window that
 # cannot render the screen is worse than no window, so it is not offered.
 if (-not $Tcp) {
@@ -151,14 +243,22 @@ if ($Tcp) {
     Write-Host "  Host Name 127.0.0.1, Port $Port, then Open."
     Write-Host 'The board waits for your connection before booting.'
     if ($Gfx) {
-        Write-Host 'SDL window: live RGB. Keys: serial console here, or kbdvirt.py :5561.'
+        if ($Virt) {
+            Write-Host 'SDL window: live RGB. Virt helpers: pcm/kbd/mouse (Right-Ctrl arms kbd).'
+        } else {
+            Write-Host 'SDL window: live RGB. Keys: serial console here, or argon run -Virt.'
+        }
     }
     Write-Host 'Press Ctrl+C here to stop the emulator.'
 } elseif ($Gfx) {
     # Video in an SDL window; console + keyboard on this terminal.
     $qemuArgs += @('-display', 'sdl', '-serial', 'mon:stdio')
     Write-Host 'ArgonOS: SDL RGB window + console here.'
-    Write-Host 'Doom keys: python tools/kbdvirt.py --reconnect (not HostFS PADPUSH).'
+    if ($Virt) {
+        Write-Host 'Doom keys/mouse/audio: virt helpers already running (Right-Ctrl arms kbd).'
+    } else {
+        Write-Host 'Doom keys: argon run -Virt   (or: python tools/virt.py)'
+    }
     Write-Host 'Ctrl+A then X quits the emulator.'
 } else {
     $qemuArgs += @('-nographic', '-serial', 'mon:stdio')
@@ -186,6 +286,10 @@ try {
     $proc = Start-Qemu -Exe $qemu -Arguments $qemuArgs
     $proc.WaitForExit()
 } finally {
+    if ($virtProc) {
+        Stop-ProcessTree -Id $virtProc.Id
+        Stop-ArgonVirtHelpers
+    }
     if ($hostfsProc -and -not $hostfsProc.HasExited) {
         Stop-Process -Id $hostfsProc.Id -Force -ErrorAction SilentlyContinue
     }

@@ -22,6 +22,9 @@ ArgonOS
   argon run                run in QEMU, console attached to this window
                            (Ctrl+A then X quits the emulator)
   argon run -Gfx           same + SDL window with live RGB (gfx / SMS)
+  argon run -Virt          also start pcmplay + kbdvirt + mousevirt (reconnect);
+                           Right-Ctrl arms keyboard / pauses mouse
+  argon virt               same helpers in this window (QEMU already running)
   argon run -HostFs DIR    live Windows folder as guest H: (UART1 helper);
                            pushes SMS pad (~60 Hz) when sms.cfg is present
   argon run -tcp           run in QEMU, console on 127.0.0.1:5556
@@ -29,7 +32,8 @@ ArgonOS
   argon run                (default) also OpenEth hostfwd 127.0.0.1:5558
                            (5559 midivirt, 5560 mousevirt, 5561 kbdvirt)
   argon run -NoNet         skip the virtual NIC
-  python tools/pcmplay.py  play guest PCM streamed to :5558 (MD `net`)
+  python tools/pcmplay.py  play guest PCM streamed to :5558 (MD `net`);
+                           or use -Virt / argon virt with kbd+mouse
   argon run -Share DIR     pack DIR into build\sdcard.img and boot with A:
   argon sync DIR           rebuild build\sdcard.img from a Windows folder
                            (FAT16 snapshot; then: argon run -Sd)
@@ -190,6 +194,8 @@ switch ($Command.ToLowerInvariant()) {
                 $runOpts['Tcp'] = $true
             } elseif ($a -match '^(?i)-(Gfx|Graphics)$') {
                 $runOpts['Gfx'] = $true
+            } elseif ($a -match '^(?i)-Virt$') {
+                $runOpts['Virt'] = $true
             } elseif ($a -match '^(?i)-HostFs$' -and ($i + 1) -lt $Rest.Count) {
                 $runOpts['HostFs'] = $Rest[$i + 1]
                 $i++
@@ -214,6 +220,13 @@ switch ($Command.ToLowerInvariant()) {
             }
         }
         & (Join-Path $PSScriptRoot 'qemu-run.ps1') @runOpts
+        exit $LASTEXITCODE
+    }
+
+    'virt' {
+        $py = Resolve-HostPython
+        $script = Join-Path $PSScriptRoot 'virt.py'
+        & $py.Exe @($py.Prefix) $script @Rest
         exit $LASTEXITCODE
     }
 
