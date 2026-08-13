@@ -3,6 +3,7 @@
  *
  *   run h:\gfxbench.axe [full|dirty|idle] [frames]
  *   run h:\lvglbench.axe ...
+ *   run h:\lvglplain.axe ...
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -11,7 +12,10 @@
 #include <argon/keys.h>
 #include <string.h>
 
-#ifdef GFXBENCH_LVGL
+#ifdef GFXBENCH_LVGL_PLAIN
+AG_APP_SIZED("LVGLPLAIN", "0.1", "argon", AG_AXE_NEEDS_GFX, 24 * 1024,
+             512 * 1024);
+#elif defined(GFXBENCH_LVGL)
 AG_APP_SIZED("LVGLBENCH", "0.1", "argon", AG_AXE_NEEDS_GFX, 24 * 1024,
              512 * 1024);
 #else
