@@ -64,9 +64,12 @@ extern "C" {
  * 0.22 appended optional per-open session ops on ag_dev_ops (multi-open devices
  *      such as /dev/pcmmix); built-in software PCM mixer.
  * 0.23 defined ag_display_ops_t; soft fb0 publishes it via dev->ops(h).
+ * 0.24 soft gfx: ag_gfx_text(bg=AG_GFX_TRANS) skips off-bits; blit() blends
+ *      AG_PIX_ARGB8888 (LE bytes B,G,R,A) onto the RGB565 surface.  No new
+ *      vtable slots.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 23u
+#define AG_ABI_MINOR 24u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -460,8 +463,14 @@ typedef enum {
     AG_PIX_RGB565,
     AG_PIX_RGB565_BE,
     AG_PIX_RGB888,
-    AG_PIX_ARGB8888,
+    AG_PIX_ARGB8888, /* packed LE: B,G,R,A per pixel; blit() blends onto RGB565 */
 } ag_pixfmt_t;
+
+/*
+ * Not a 0x00RRGGBB colour.  Pass as ag_gfx_text() bg to leave off-bits alone
+ * (labels over skins / sprites).  0 still means opaque black.
+ */
+#define AG_GFX_TRANS 0xFFFFFFFFu
 
 typedef struct {
     uint16_t    width;
@@ -493,7 +502,7 @@ typedef struct ag_gfx_api {
                       uint32_t color);
     void (*blit)(int16_t x, int16_t y, uint16_t w, uint16_t h, const void *src,
                  uint32_t src_stride, ag_pixfmt_t src_fmt);
-    /* Built-in bitmap font; returns advance in pixels. */
+    /* Built-in 8×16 font; returns advance in pixels.  bg=AG_GFX_TRANS: fg only. */
     int32_t (*text)(int16_t x, int16_t y, const char *s, uint32_t fg,
                     uint32_t bg);
     void (*backlight)(uint8_t percent);

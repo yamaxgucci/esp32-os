@@ -127,4 +127,46 @@ void run_draw_tests(void)
         AG_CHECK(s_fb[2 * W + 1] == 0x07E0);
         AG_CHECK(s_fb[2 * W + 2] == 0xFFFF);
     }
+
+    /* ARGB8888 blend: LE bytes B,G,R,A. */
+    {
+        uint32_t px;
+        uint8_t *b = (uint8_t *)&px;
+        b[0] = 0;
+        b[1] = 0;
+        b[2] = 255;
+        b[3] = 255; /* opaque red */
+        surf_clear(0);
+        ag_draw_blit_argb8888(&s_surf, 2, 2, 1, 1, &px, 4);
+        AG_CHECK(s_fb[2 * W + 2] == 0xF800);
+
+        b[3] = 0; /* fully transparent */
+        surf_clear(0xFFFF);
+        ag_draw_blit_argb8888(&s_surf, 2, 2, 1, 1, &px, 4);
+        AG_CHECK(s_fb[2 * W + 2] == 0xFFFF);
+
+        b[2] = 255;
+        b[3] = 128; /* 50% red over black → r8=128 → 565 0x8000 */
+        surf_clear(0);
+        ag_draw_blit_argb8888(&s_surf, 3, 3, 1, 1, &px, 4);
+        AG_CHECK(s_fb[3 * W + 3] == 0x8000);
+    }
+
+    /* Transparent 8×16 glyph: left column on, rest off. */
+    {
+        uint8_t rows[16];
+        int i;
+        for (i = 0; i < 16; i++) {
+            rows[i] = 0x01;
+        }
+        surf_clear(0xFFFF);
+        ag_draw_glyph8x16(&s_surf, 0, 0, rows, 0xF800, 0x001F, 1);
+        AG_CHECK(count_color(0xF800) == 16);
+        AG_CHECK(s_fb[0] == 0xF800);
+        AG_CHECK(s_fb[1] == 0xFFFF); /* off-bit left alone */
+        surf_clear(0xFFFF);
+        ag_draw_glyph8x16(&s_surf, 0, 0, rows, 0xF800, 0x001F, 0);
+        AG_CHECK(count_color(0xF800) == 16);
+        AG_CHECK(count_color(0x001F) == 8 * 16 - 16);
+    }
 }

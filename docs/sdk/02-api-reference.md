@@ -431,13 +431,17 @@ front, то есть остаются какими были, но панели �
 показывает только свой прямоугольник, не остаётся в рамке из остатков консоли.
 Без back-буфера (`direct = true`) рисуют прямо во front. Текстовый blit на fb
 на время захвата останавливается; `release` презентует и возвращает текст.
-Цвета — `0x00RRGGBB`. Шрифт ядра — 8×16.
+Цвета — `0x00RRGGBB`. Шрифт ядра — 8×16. `text(..., bg=AG_GFX_TRANS)` рисует
+только «включённые» биты глифа (подписи поверх скина). `blit` с
+`AG_PIX_ARGB8888` блендит packed LE `B,G,R,A` на RGB565 (a=0 пропуск, a=255
+замена).
 Soft-draw (`pixel`/`line`/`circle`/`poly_*`) — целочисленный растеризатор в
 [`draw.c`](../../components/argon_kernel/src/dev/draw.c); полигоны только
 **выпуклые**. ABI 0.16 добавляет `clip` / `stroke_rect` / `fill_round_rect`.
 ABI 0.17 — `blit_key` и stateful `blit_bind` / `blit_copy` / `blit_keyed`
-(прозрачный blit для спрайтов; игровой tilemap/sprite слой — Mini-C
+(chroma-key спрайты; игровой tilemap/sprite слой — Mini-C
 библиотека [`apps/cc/lib/g2d`](../../apps/cc/lib/g2d), не ядро).
+ABI 0.24 — прозрачный текст и ARGB blit, без новых слотов vtable.
 Полноценный GUI toolkit — не в ядре (LVGL при необходимости линкуется в
 host-`.AXE`, см. [`06-ideas.md`](../06-ideas.md) §3.4).
 

@@ -308,12 +308,6 @@ static ag_draw_surf_t draw_surf(void)
     return s;
 }
 
-static void put_pixel(int32_t x, int32_t y, uint16_t c)
-{
-    ag_draw_surf_t s = draw_surf();
-    ag_draw_pixel(&s, x, y, c);
-}
-
 static void fill_rect_raw(int32_t x, int32_t y, int32_t w, int32_t h, uint16_t c)
 {
     if (w <= 0 || h <= 0 || s_draw == NULL) {
@@ -325,16 +319,8 @@ static void fill_rect_raw(int32_t x, int32_t y, int32_t w, int32_t h, uint16_t c
 
 static void draw_glyph(int32_t x, int32_t y, uint8_t ch, uint16_t fg, uint16_t bg)
 {
-    const uint8_t *rows = ag_font8x16[ch];
-    for (int32_t row = 0; row < AG_FONT8X16_H; row++) {
-        const uint8_t bits = rows[row];
-        /* font8x8: bit 0 (LSB) is the leftmost pixel of the row. */
-        for (int32_t col = 0; col < AG_FONT8X16_W; col++) {
-            const uint16_t c =
-                (bits & (uint8_t)(1u << col)) != 0 ? fg : bg;
-            put_pixel(x + col, y + row, c);
-        }
-    }
+    ag_draw_surf_t s = draw_surf();
+    ag_draw_glyph8x16(&s, x, y, ag_font8x16[ch], fg, bg, 0);
 }
 
 /* ---------------------------------------------------------------------- */
@@ -576,10 +562,15 @@ static void gfx_blit(int16_t x, int16_t y, uint16_t w, uint16_t h,
     if (s_draw == NULL || src == NULL || w == 0 || h == 0) {
         return;
     }
-    if (src_fmt != AG_PIX_RGB565 && src_fmt != AG_PIX_RGB565_BE) {
-        return; /* soft path only knows 16-bit RGB for now */
-    }
     ag_draw_surf_t surf = draw_surf();
+    if (src_fmt == AG_PIX_ARGB8888) {
+        ag_draw_blit_argb8888(&surf, x, y, (int32_t)w, (int32_t)h, src,
+                              src_stride);
+        return;
+    }
+    if (src_fmt != AG_PIX_RGB565 && src_fmt != AG_PIX_RGB565_BE) {
+        return; /* remaining formats unused on the soft RGB565 path */
+    }
     ag_draw_blit(&surf, x, y, (int32_t)w, (int32_t)h, src, src_stride,
                  src_fmt == AG_PIX_RGB565_BE, 0, 0);
 }
@@ -633,7 +624,9 @@ static int32_t gfx_text(int16_t x, int16_t y, const char *s, uint32_t fg,
         return 0;
     }
     const uint16_t fgc = rgb_to_565(fg);
-    const uint16_t bgc = rgb_to_565(bg);
+    const int trans = (bg == AG_GFX_TRANS);
+    const uint16_t bgc = trans ? 0 : rgb_to_565(bg);
+    ag_draw_surf_t surf = draw_surf();
     int32_t advance = 0;
     int32_t cx = x;
     int32_t cy = y;
@@ -644,7 +637,7 @@ static int32_t gfx_text(int16_t x, int16_t y, const char *s, uint32_t fg,
             cy += AG_FONT8X16_H;
             continue;
         }
-        draw_glyph(cx, cy, ch, fgc, bgc);
+        ag_draw_glyph8x16(&surf, cx, cy, ag_font8x16[ch], fgc, bgc, trans);
         cx += AG_FONT8X16_W;
         advance += AG_FONT8X16_W;
     }
