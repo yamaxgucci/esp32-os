@@ -3,8 +3,9 @@
  *
  * Front is what QEMU / fb0 / the console present.  While graphics is acquired
  * and a back buffer exists, apps draw there; flush/swap copy to front and kick
- * the QEMU RGB window.  Present waits (with yield) for the previous blit so a
- * later partial update cannot replace an in-flight full frame.
+ * the QEMU RGB window.  Full-frame kicks do not wait on ENA (dropping a frame
+ * is fine).  A smaller kick waits so it cannot replace an in-flight full blit
+ * and leave the SDL window half-painted.
  *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
@@ -73,6 +74,8 @@ static bool      s_front_owned; /* false when front is QEMU's dedicated FB */
 static uint32_t  s_console_gen;
 static int16_t   s_caret_col = -1; /* last inverted console cell, or -1 */
 static int16_t   s_caret_row = -1;
+static int32_t   s_qemu_y0; /* last kicked row range, exclusive y1     */
+static int32_t   s_qemu_y1;
 static ag_device_t *s_dev;
 static esp_lcd_panel_handle_t s_qemu_panel; /* NULL on real hardware */
 
@@ -87,8 +90,8 @@ static size_t fb_bytes(void)
  * QEMU RGB MMIO (see espressif/qemu hw/display/esp_rgb.c).  Do NOT call
  * esp_lcd_rgb_qemu_refresh: it busy-waits on UPDATE_STATUS.ENA, and that bit
  * only clears from QEMU's display thread — a guest spin (no yield) deadlocks
- * SMS/console.  Waiting with yield is fine and required: kicking a smaller
- * region while a full-frame blit is in flight left the SDL window half-painted.
+ * SMS/console.  Do not wait on every kick: that capped gfx at ~32 fps.  Wait
+ * only when the new region does not cover the in-flight one.
  */
 enum {
     RGB_MMIO_UPDATE_FROM = 0x08u / 4u,
@@ -147,9 +150,20 @@ static void qemu_present_rows(int32_t y, int32_t h)
         return;
     }
 
-    qemu_wait_idle();
-
     volatile uint32_t *const rgb = (volatile uint32_t *)0x21000000u;
+    /*
+     * Replacing an in-flight *larger* blit with a smaller one leaves stale
+     * rows in the SDL window (dirty gfxbench on top of the loading banner).
+     * Same-or-larger kicks may overwrite: dropping a full frame is how ~130
+     * fps full-redraw stays possible.
+     */
+    if ((rgb[RGB_MMIO_UPDATE_STATUS] & 1u) != 0) {
+        const bool covers = (y <= s_qemu_y0) && ((y + h) >= s_qemu_y1);
+        if (!covers) {
+            qemu_wait_idle();
+        }
+    }
+
     /* X in the high half, Y in the low one, per rgb_qemu_dev_t. Ends are
      * exclusive. */
     rgb[RGB_MMIO_UPDATE_FROM] = (uint32_t)y;
@@ -157,6 +171,8 @@ static void qemu_present_rows(int32_t y, int32_t h)
     rgb[RGB_MMIO_UPDATE_CONTENT] =
         (uint32_t)(uintptr_t)((const uint8_t *)s_front + (size_t)y * s_stride);
     rgb[RGB_MMIO_UPDATE_STATUS] = 1u; /* ENA; QEMU clears asynchronously */
+    s_qemu_y0 = y;
+    s_qemu_y1 = y + h;
     taskYIELD();
 }
 
