@@ -68,6 +68,15 @@ void ag_draw_glyph8x16(ag_draw_surf_t *s, int32_t x, int32_t y,
                        const uint8_t rows[16], uint16_t fg, uint16_t bg,
                        int trans);
 
+/*
+ * 8×16 string.  max_w < 0: full string, `\n` advances a row.
+ * max_w >= 0: first line only, clipped to max_w; overflow becomes "...".
+ * Returns advance in pixels (last line for the unlimited path).
+ */
+int32_t ag_draw_text8x16(ag_draw_surf_t *s, int32_t x, int32_t y,
+                         const uint8_t font[256][16], const char *str,
+                         uint16_t fg, uint16_t bg, int trans, int32_t max_w);
+
 /* 0x00RRGGBB → RGB565 */
 uint16_t ag_draw_rgb_to_565(uint32_t color);
 

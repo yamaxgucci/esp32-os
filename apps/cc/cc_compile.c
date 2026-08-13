@@ -2477,6 +2477,8 @@ static const builtin_t BUILTINS[] = {
      ABI_MINOR_GFX17, NULL},
     {"ag_gfx_blit_keyed", 5, API_OFF_GFX, GFX_OFF_BLIT_KEYED, RET_VOID, 0,
      ABI_MINOR_GFX17, NULL},
+    {"ag_gfx_text_fit", 6, API_OFF_GFX, GFX_OFF_TEXT_FIT, RET_RAW, 0,
+     ABI_MINOR_GFX25, NULL},
 
     /* audio (ABI 0.14): open(NULL) default 22050 stereo s16 */
     {"ag_audio_present", 0, API_OFF_AUDIO, AUDIO_OFF_PRESENT, RET_RAW, 0, ABI_MINOR_AUDIO, NULL},

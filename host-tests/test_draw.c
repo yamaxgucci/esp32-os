@@ -169,4 +169,38 @@ void run_draw_tests(void)
         AG_CHECK(count_color(0xF800) == 16);
         AG_CHECK(count_color(0x001F) == 8 * 16 - 16);
     }
+
+    /* text_fit: ellipsis when the string is wider than max_w. */
+    {
+        uint8_t font[256][16];
+        int i;
+        memset(font, 0, sizeof(font));
+        for (i = 0; i < 16; i++) {
+            font[(unsigned char)'A'][i] = 0x01;
+            font[(unsigned char)'.'][i] = 0x01;
+            font[(unsigned char)'B'][i] = 0x01;
+        }
+        surf_clear(0);
+        AG_CHECK(ag_draw_text8x16(&s_surf, 0, 0, font, "AA", 0xF800, 0, 1, -1) ==
+                 16);
+        AG_CHECK(count_color(0xF800) == 32);
+
+        surf_clear(0);
+        /* "AAAA" = 32px, max_w=24 → "..." only (nfit=0). */
+        AG_CHECK(ag_draw_text8x16(&s_surf, 0, 0, font, "AAAA", 0xF800, 0, 1,
+                                  24) == 24);
+        AG_CHECK(count_color(0xF800) == 48);
+
+        surf_clear(0);
+        /* max_w=32 → one 'A' + "..." = 32px, 4 glyphs. */
+        AG_CHECK(ag_draw_text8x16(&s_surf, 0, 0, font, "AAAA", 0xF800, 0, 1,
+                                  32) == 32);
+        AG_CHECK(count_color(0xF800) == 64);
+
+        surf_clear(0);
+        /* Second line is clipped to H=24 (8 visible rows of the glyph). */
+        AG_CHECK(ag_draw_text8x16(&s_surf, 0, 0, font, "AB\nB", 0x07E0, 0, 1,
+                                  -1) == 24);
+        AG_CHECK(count_color(0x07E0) == 40);
+    }
 }

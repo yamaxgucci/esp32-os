@@ -631,6 +631,11 @@ static inline void ag_gfx_blit_keyed(int16_t x, int16_t y, uint16_t w,
 {
     g_ag_api->gfx->blit_keyed(x, y, w, h, key_rgb);
 }
+static inline int32_t ag_gfx_text_fit(int16_t x, int16_t y, uint16_t w,
+                                      const char *s, uint32_t fg, uint32_t bg)
+{
+    return g_ag_api->gfx->text_fit(x, y, w, s, fg, bg);
+}
 
 /* ---- audio helpers (ABI 0.14+; built-in pcmnull) ------------------------- */
 
