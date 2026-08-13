@@ -27,7 +27,6 @@ static lv_obj_t     *s_eq_thumb[GFXBENCH_EQ_N];
 static lv_obj_t     *s_btn[GFXBENCH_BTN_N];
 static lv_obj_t     *s_pl_row[GFXBENCH_PL_N];
 static lv_obj_t     *s_pl[GFXBENCH_PL_N];
-static uint32_t      s_flush_acc;
 static char          s_time_buf[8];
 static gfxbench_rect_t s_seek_r;
 static gfxbench_rect_t s_vol_r;
@@ -36,13 +35,10 @@ static gfxbench_rect_t s_spec_r[GFXBENCH_SPEC_N];
 
 static void flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
 {
-    uint16_t w, h;
     (void)px_map;
-    w = (uint16_t)(area->x2 - area->x1 + 1);
-    h = (uint16_t)(area->y2 - area->y1 + 1);
-    gfxbench_flush_begin();
-    ag_gfx_flush((uint16_t)area->x1, (uint16_t)area->y1, w, h);
-    s_flush_acc += gfxbench_flush_end();
+    gfxbench_flush_union_add((int16_t)area->x1, (int16_t)area->y1,
+                             (uint16_t)(area->x2 - area->x1 + 1),
+                             (uint16_t)(area->y2 - area->y1 + 1));
     lv_display_flush_ready(disp);
 }
 
@@ -98,7 +94,7 @@ static void set_spec(int i, int pct)
         h = 1;
     }
     lv_obj_set_height(s_spec_fill[i], h);
-    lv_obj_align(s_spec_fill[i], LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_y(s_spec_fill[i], (int32_t)s_spec_r[i].h - h);
 }
 
 int gfxbench_backend_init(const ag_gfxinfo_t *gi, const gfxbench_layout_t *L)
@@ -182,8 +178,9 @@ int gfxbench_backend_init(const ag_gfxinfo_t *gi, const gfxbench_layout_t *L)
         s_pl[i] = label_at(scr, &L->pl_row[i], gfxbench_track_name(i), fg, bg);
     }
 
-    s_flush_acc = 0;
+    gfxbench_flush_union_reset();
     lv_refr_now(s_disp);
+    (void)gfxbench_flush_union_present();
     return 0;
 }
 
@@ -207,10 +204,9 @@ void gfxbench_backend_frame(const gfxbench_state_t *st,
     int i;
     unsigned sec;
     ag_time_t t0;
-    uint32_t total;
     (void)L;
 
-    s_flush_acc = 0;
+    gfxbench_flush_union_reset();
     t0 = ag_micros();
 
     set_hthumb(s_seek_thumb, &s_seek_r, st->seek);
@@ -249,10 +245,8 @@ void gfxbench_backend_frame(const gfxbench_state_t *st,
     }
 
     lv_refr_now(s_disp);
-
-    total = (uint32_t)(ag_micros() - t0);
-    t->flush_us = s_flush_acc;
-    t->draw_us = (total > s_flush_acc) ? (total - s_flush_acc) : 0u;
+    t->draw_us = (uint32_t)(ag_micros() - t0);
+    t->flush_us = gfxbench_flush_union_present();
 }
 
 void gfxbench_backend_shutdown(void)

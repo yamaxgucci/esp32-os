@@ -39,6 +39,61 @@ uint32_t gfxbench_flush_end(void)
     return (uint32_t)(ag_micros() - s_flush_t0);
 }
 
+static int s_uni_n;
+static int16_t s_uni_x0, s_uni_y0, s_uni_x1, s_uni_y1;
+
+void gfxbench_flush_union_reset(void) { s_uni_n = 0; }
+
+void gfxbench_flush_union_add(int16_t x, int16_t y, uint16_t w, uint16_t h)
+{
+    int x1 = (int)x + (int)w;
+    int y1 = (int)y + (int)h;
+    if (x < 0) {
+        x = 0;
+    }
+    if (y < 0) {
+        y = 0;
+    }
+    if (s_uni_n == 0) {
+        s_uni_x0 = x;
+        s_uni_y0 = y;
+        s_uni_x1 = (int16_t)x1;
+        s_uni_y1 = (int16_t)y1;
+        s_uni_n = 1;
+        return;
+    }
+    if (x < s_uni_x0) {
+        s_uni_x0 = x;
+    }
+    if (y < s_uni_y0) {
+        s_uni_y0 = y;
+    }
+    if (x1 > s_uni_x1) {
+        s_uni_x1 = (int16_t)x1;
+    }
+    if (y1 > s_uni_y1) {
+        s_uni_y1 = (int16_t)y1;
+    }
+}
+
+uint32_t gfxbench_flush_union_present(void)
+{
+    uint16_t w, h;
+    if (s_uni_n == 0) {
+        return 0;
+    }
+    if (s_uni_x1 <= s_uni_x0 || s_uni_y1 <= s_uni_y0) {
+        s_uni_n = 0;
+        return 0;
+    }
+    w = (uint16_t)(s_uni_x1 - s_uni_x0);
+    h = (uint16_t)(s_uni_y1 - s_uni_y0);
+    s_uni_n = 0;
+    gfxbench_flush_begin();
+    ag_gfx_flush((uint16_t)s_uni_x0, (uint16_t)s_uni_y0, w, h);
+    return gfxbench_flush_end();
+}
+
 const char *gfxbench_track_name(int i)
 {
     if (i < 0 || i >= GFXBENCH_PL_N) {
