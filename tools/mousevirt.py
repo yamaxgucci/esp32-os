@@ -120,6 +120,8 @@ def _bind_user32() -> ctypes.WinDLL:
     user32.IsWindow.restype = wt.BOOL
     user32.GetWindowTextW.argtypes = (wt.HWND, wt.LPWSTR, ctypes.c_int)
     user32.GetWindowTextW.restype = ctypes.c_int
+    user32.GetClassNameW.argtypes = (wt.HWND, wt.LPWSTR, ctypes.c_int)
+    user32.GetClassNameW.restype = ctypes.c_int
     user32.GetClientRect.argtypes = (wt.HWND, ctypes.POINTER(RECT))
     user32.GetClientRect.restype = wt.BOOL
     user32.ClientToScreen.argtypes = (wt.HWND, ctypes.POINTER(POINT))
@@ -338,26 +340,46 @@ def connect(host: str, port: int, timeout: float) -> socket.socket:
     return s
 
 
+SKIP_CLASSES = {
+    "consolewindowclass",
+    "cascadia_hosting_window_class",
+    "virtualconsoleclass",
+}
+
+
 def find_qemu_hwnd(user32: ctypes.WinDLL) -> int:
-    found = wt.HWND(0)
+    """Largest non-console window titled qemu/argonos (not a qemu-run terminal)."""
+    best = 0
+    best_area = -1
     holders: list[object] = []
 
     def _enum(hwnd: int, _lparam: int) -> bool:
+        nonlocal best, best_area
         if not user32.IsWindowVisible(hwnd):
+            return True
+        cls = ctypes.create_unicode_buffer(256)
+        user32.GetClassNameW(hwnd, cls, 256)
+        if cls.value.lower() in SKIP_CLASSES:
             return True
         buf = ctypes.create_unicode_buffer(256)
         if user32.GetWindowTextW(hwnd, buf, 256) <= 0:
             return True
         low = buf.value.lower()
-        if "qemu" in low or "argonos" in low:
-            found.value = hwnd
-            return False
+        if "qemu" not in low and "argonos" not in low:
+            return True
+        rc = RECT()
+        area = 0
+        if user32.GetClientRect(hwnd, ctypes.byref(rc)):
+            area = int(rc.right - rc.left) * int(rc.bottom - rc.top)
+        if area > best_area:
+            best_area = area
+            best = hwnd_i(hwnd)
         return True
 
     cb = WNDENUMPROC(_enum)
     holders.append(cb)
     user32.EnumWindows(cb, 0)
-    return hwnd_i(found.value)
+    return best
 
 
 def client_screen_rect(

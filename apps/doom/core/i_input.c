@@ -43,6 +43,8 @@
 
 #ifdef ARGON_TARGET
 #include "doomgeneric_argon.h"
+#include "doomdef.h"
+#include "doomstat.h"
 #endif
 
 int vanilla_keyboard_mapping = 1;
@@ -336,6 +338,11 @@ void I_GetEvent(void)
         int buttons;
         int dx;
         while (doom_argon_get_mouse(&buttons, &dx, NULL)) {
+            /* Title/menu: dx was arrow keys, LMB was Enter. Drain so the
+             * first in-level tic is not a huge leftover look. */
+            if (gamestate != GS_LEVEL || menuactive) {
+                continue;
+            }
             event.type = ev_mouse;
             event.data1 = buttons;
             event.data2 = dx;
