@@ -27,7 +27,8 @@
 #define HSFS_TX_BUF         (16 * 1024)
 /* Large WRITE + PADPUSH needs headroom: one 4 KiB RPC at 115200 is ~0.4 s. */
 #define HSFS_RPC_TIMEOUT_MS 30000
-#define HSFS_PING_TIMEOUT_MS 1000
+#define HSFS_PING_TIMEOUT_MS 250
+#define HSFS_HELPER_WAIT_MS  3000
 /* Cap each uart_write so pump_rx_during_tx can drain PADPUSH between slices. */
 #define HSFS_TX_SLICE       128
 
@@ -776,20 +777,34 @@ ag_err_t ag_hostfs_try_mount(void)
 
     /*
      * After guest `reboot`, QEMU may drop/reopen the UART1 TCP link.  Retry
-     * briefly so a reconnecting hostfsd is not missed on the first PING.
+     * for a few seconds so a reconnecting hostfsd is not missed on the first
+     * PING.  Without -HostFs this is just boot delay, so keep it short.
      */
     {
-        uint32_t pong = 0;
-        ag_err_t ping = -AG_ENODEV;
-        int      attempt;
+        uint32_t      pong = 0;
+        ag_err_t      ping = -AG_ENODEV;
+        const int64_t deadline =
+            esp_timer_get_time() + (int64_t)HSFS_HELPER_WAIT_MS * 1000;
 
-        for (attempt = 0; attempt < 25; attempt++) {
+        while (esp_timer_get_time() < deadline) {
+            int64_t  left_us = deadline - esp_timer_get_time();
+            uint32_t to_ms;
+
+            if (left_us <= 0) {
+                break;
+            }
+            to_ms = (uint32_t)(left_us / 1000);
+            if (to_ms < 1u) {
+                to_ms = 1u;
+            }
+            if (to_ms > HSFS_PING_TIMEOUT_MS) {
+                to_ms = HSFS_PING_TIMEOUT_MS;
+            }
             ping = rpc(HSFS_OP_PING, 0, 0, NULL, NULL, 0, &pong, NULL, NULL, 0,
-                       NULL, HSFS_PING_TIMEOUT_MS);
+                       NULL, to_ms);
             if (ping == AG_OK) {
                 break;
             }
-            vTaskDelay(pdMS_TO_TICKS(100));
         }
         if (ping != AG_OK) {
             ag_log(AG_LOG_INFO, "hostfs", "no host helper on UART1 (skip H:)");
