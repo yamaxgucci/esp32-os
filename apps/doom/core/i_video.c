@@ -75,7 +75,11 @@ struct FB_ScreenInfo
 
 static struct FB_ScreenInfo s_Fb;
 int fb_scaling = 1;
+#ifdef ARGON_TARGET
+int usemouse = 1;
+#else
 int usemouse = 0;
+#endif
 
 
 #ifdef ARGON_TARGET

@@ -41,6 +41,10 @@
 
 #include "doomgeneric.h"
 
+#ifdef ARGON_TARGET
+#include "doomgeneric_argon.h"
+#endif
+
 int vanilla_keyboard_mapping = 1;
 
 // Is the shift key currently down?
@@ -323,16 +327,21 @@ void I_GetEvent(void)
         }
     }
 
-
-                /*
-            case SDL_MOUSEMOTION:
-                event.type = ev_mouse;
-                event.data1 = mouse_button_state;
-                event.data2 = AccelerateMouse(sdlevent.motion.xrel);
-                event.data3 = -AccelerateMouse(sdlevent.motion.yrel);
-                D_PostEvent(&event);
-                break;
-                */
+#ifdef ARGON_TARGET
+    {
+        int buttons;
+        int dx;
+        int dy;
+        while (doom_argon_get_mouse(&buttons, &dx, &dy)) {
+            event.type = ev_mouse;
+            event.data1 = buttons;
+            event.data2 = dx;
+            event.data3 = -dy;
+            event.data4 = 0;
+            D_PostEvent(&event);
+        }
+    }
+#endif
 }
 
 void I_InitInput(void)
