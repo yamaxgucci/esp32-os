@@ -4,8 +4,8 @@
 guest `.AXE`. The engine draws 320×200 pal8; the port integer-scales nearest
 (2× on the default 640×400 soft framebuffer) into RGB565.
 
-Sound: SFX + music mix to `/dev/pcmvirt`. Music is MUS→MIDI through the
-existing `ag_fm` synth (OPLL-style, not AdLib/Nuked). Needs `PCMVIRT.SYS`.
+Sound: SFX + music mix to `/dev/pcmvirt`. Music is MUS→MIDI through
+Nuked OPL3 with the IWAD `GENMIDI` lump (AdLib / DMX). Needs `PCMVIRT.SYS`.
 Mouse: `/dev/mouse0` via `MOUSEVIRT.SYS` (`mousevirt.py :5560`). Vanilla:
 X turns, Y walks; LMB fire, RMB strafe, wheel prev/next weapon.
 
@@ -14,7 +14,8 @@ X turns, Y walks; LMB fire, RMB strafe, wheel prev/next weapon.
 | Component | Licence | Notes |
 |---|---|---|
 | `core/` | GPLv2+ | doomgeneric / Chocolate Doom / id Software |
-| `doom_main.c`, `port/`, `doom_cfg.h` | Apache-2.0 | ours |
+| `port/nuked/` | LGPL-2.1+ | [Nuked-OPL3](https://github.com/nukeykt/Nuked-OPL3) |
+| `doom_main.c`, `port/` (except nuked), `doom_cfg.h` | Apache-2.0 | ours |
 
 The shipped `.AXE` is a GPL work. **Do not put `doom1.wad` in this tree** —
 supply the shareware IWAD yourself (freely redistributable).
@@ -31,9 +32,9 @@ supply the shareware IWAD yourself (freely redistributable).
 - `r_data.c` — louder R_Init progress
 - `doomtype.h` — DOS path separators (`\` / `;`) so `h:\doom1.wad` parses
 - `i_sound.c` — register Argon `DG_sound_module` / `DG_music_module` without SDL; 256 KiB sfx cache
-- `i_input.c` — `ev_mouse` from Argon `doom_argon_get_mouse`
+- `i_input.c` — `ev_mouse` from Argon `doom_argon_get_mouse`; mouse look/buttons only in-level (not title/menu)
 - `i_video.c` — `usemouse = 1` under `ARGON_TARGET`
-- `m_controls.c` — wheel → prev/next weapon under `ARGON_TARGET`
+- `m_controls.c` — WASD + mouse-turn defaults under `ARGON_TARGET`; wheel → prev/next weapon
 
 ## Build
 
@@ -74,7 +75,8 @@ run a:\doom.axe -iwad a:\doom1.wad pcmvirt
 ```
 
 Click the **QEMU RGB window** so `kbdvirt` captures keys (the serial console
-keeps A:\\> typing). Right-Ctrl force-pauses kbd and mouse.
+keeps A:\\> typing). If keys still do not arrive, Right-Ctrl **toggles sticky
+capture**. Right-Ctrl also pauses the mouse while held.
 
 **WASD** walk/strafe, **mouse** turns, **LMB** fire, Space use, Shift run,
 Esc menu, wheel weapons. Arrows still work in the menu.

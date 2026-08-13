@@ -30,10 +30,13 @@ static int          s_mdy;
 static int          s_mwheel;
 static int          s_mpending;
 
-/* 256 doom-keys: held now, last posted to Doom, down-edge since last GetKey. */
-static uint8_t s_held[32];
-static uint8_t s_posted[32];
-static uint8_t s_tap[32];
+/* Key FIFO: drop oldest when full so a late key-up is never lost. */
+#define KEYQ 128
+static unsigned char s_kq_key[KEYQ];
+static uint8_t       s_kq_down[KEYQ];
+static unsigned      s_kq_h;
+static unsigned      s_kq_t;
+static unsigned      s_kq_n;
 
 static uint16_t s_lut[256];
 
@@ -98,32 +101,24 @@ static unsigned char hid_to_doom(uint16_t hid)
     }
 }
 
-static int key_bit(const uint8_t *m, unsigned char k)
-{
-    return (int)((m[k >> 3] >> (k & 7u)) & 1u);
-}
-
-static void key_put(uint8_t *m, unsigned char k, int on)
-{
-    uint8_t bit = (uint8_t)(1u << (k & 7u));
-    if (on) {
-        m[k >> 3] |= bit;
-    } else {
-        m[k >> 3] &= (uint8_t)~bit;
-    }
-}
-
-static void key_edge(unsigned char k, int down)
+static void key_push(unsigned char k, int down)
 {
     if (k == 0) {
         return;
     }
-    if (down) {
-        key_put(s_held, k, 1);
-        key_put(s_tap, k, 1);
-    } else {
-        key_put(s_held, k, 0);
+    if (s_kq_n == KEYQ) {
+        s_kq_h = (s_kq_h + 1u) % KEYQ;
+        s_kq_n--;
     }
+    s_kq_key[s_kq_t] = k;
+    s_kq_down[s_kq_t] = down ? 1 : 0;
+    s_kq_t = (s_kq_t + 1u) % KEYQ;
+    s_kq_n++;
+}
+
+static void key_edge(unsigned char k, int down)
+{
+    key_push(k, down);
 }
 
 static void poll_pad_edges(void)
@@ -162,7 +157,6 @@ void doom_argon_service(void)
         return;
     }
     s_svc_ms = now;
-    (void)doom_argon_poll_sys();
     doom_argon_audio_pump();
 }
 
@@ -367,30 +361,15 @@ uint32_t DG_GetTicksMs(void) { return ag_millis(); }
 
 int DG_GetKey(int *pressed, unsigned char *key)
 {
-    unsigned k;
-
     (void)doom_argon_poll_sys();
-    for (k = 1; k < 256u; k++) {
-        unsigned char ck = (unsigned char)k;
-        int held = key_bit(s_held, ck);
-        int posted = key_bit(s_posted, ck);
-        int tap = key_bit(s_tap, ck);
-        if (!posted && (held || tap)) {
-            key_put(s_posted, ck, 1);
-            key_put(s_tap, ck, 0);
-            *pressed = 1;
-            *key = ck;
-            return 1;
-        }
-        if (posted && !held) {
-            key_put(s_posted, ck, 0);
-            key_put(s_tap, ck, 0);
-            *pressed = 0;
-            *key = ck;
-            return 1;
-        }
+    if (s_kq_n == 0u) {
+        return 0;
     }
-    return 0;
+    *key = s_kq_key[s_kq_h];
+    *pressed = (int)s_kq_down[s_kq_h];
+    s_kq_h = (s_kq_h + 1u) % KEYQ;
+    s_kq_n--;
+    return 1;
 }
 
 void DG_SetWindowTitle(const char *title)

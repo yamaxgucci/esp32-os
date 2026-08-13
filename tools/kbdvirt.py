@@ -6,9 +6,10 @@ Guest listens on TCP :5561 (QEMU hostfwd).  8-byte LE packets:
   type(1) mods(1) hid(u16) unicode(u16) repeat(1) pad(1)
 
 GetAsyncKeyState is global, so keys work while the QEMU SDL window is
-focused (that window is video-only).  Capture follows that window: click
-the QEMU RGB view to play, click the serial console to type at A:\\>.
-Right-Ctrl force-pauses.  Ctrl+C is not sent to the guest.
+focused (that window is video-only).  Capture follows that window *or any
+child* (SDL often focuses a child hwnd).  Click the QEMU RGB view to play,
+click the serial console to type at A:\\>.  Right-Ctrl *toggles* a sticky
+override if focus matching fails.  Ctrl+C is not sent to the guest.
 
 Typical:
 
@@ -98,32 +99,93 @@ for i in range(9):
 VK_TO_HID[VK_0] = HID_0
 
 WNDENUMPROC = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
+GA_ROOT = 2
+SKIP_CLASSES = {
+    "consolewindowclass",
+    "cascadia_hosting_window_class",
+    "virtualconsoleclass",
+}
+
+
+class RECT(ctypes.Structure):
+    _fields_ = [
+        ("left", ctypes.c_long),
+        ("top", ctypes.c_long),
+        ("right", ctypes.c_long),
+        ("bottom", ctypes.c_long),
+    ]
 
 
 def hwnd_i(h: object | None) -> int:
     return int(h) if h else 0
 
 
+def _text(user32: ctypes.WinDLL, hwnd: int, fn) -> str:
+    buf = ctypes.create_unicode_buffer(256)
+    if fn(hwnd, buf, 256) <= 0:
+        return ""
+    return buf.value
+
+
+def window_title(user32: ctypes.WinDLL, hwnd: int) -> str:
+    return _text(user32, hwnd, user32.GetWindowTextW)
+
+
+def window_class(user32: ctypes.WinDLL, hwnd: int) -> str:
+    return _text(user32, hwnd, user32.GetClassNameW)
+
+
+def is_qemu_title(title: str) -> bool:
+    low = title.lower()
+    return "qemu" in low or "argonos" in low
+
+
 def find_qemu_hwnd(user32: ctypes.WinDLL) -> int:
-    found = wt.HWND(0)
+    """Prefer the largest non-console window whose title looks like QEMU.
+
+    A PowerShell/Windows Terminal tab named qemu-run must not win over SDL.
+    """
+    best = 0
+    best_area = -1
     holders: list[object] = []
 
     def _enum(hwnd: int, _lparam: int) -> bool:
+        nonlocal best, best_area
         if not user32.IsWindowVisible(hwnd):
             return True
-        buf = ctypes.create_unicode_buffer(256)
-        if user32.GetWindowTextW(hwnd, buf, 256) <= 0:
+        if window_class(user32, hwnd).lower() in SKIP_CLASSES:
             return True
-        low = buf.value.lower()
-        if "qemu" in low or "argonos" in low:
-            found.value = hwnd
-            return False
+        if not is_qemu_title(window_title(user32, hwnd)):
+            return True
+        rc = RECT()
+        area = 0
+        if user32.GetClientRect(hwnd, ctypes.byref(rc)):
+            area = int(rc.right - rc.left) * int(rc.bottom - rc.top)
+        if area > best_area:
+            best_area = area
+            best = hwnd_i(hwnd)
         return True
 
     cb = WNDENUMPROC(_enum)
     holders.append(cb)
     user32.EnumWindows(cb, 0)
-    return hwnd_i(found.value)
+    return best
+
+
+def focused_in_qemu(user32: ctypes.WinDLL, qemu_hwnd: int, fg: int) -> bool:
+    if qemu_hwnd == 0 or fg == 0:
+        return False
+    if fg == qemu_hwnd:
+        return True
+    root = hwnd_i(user32.GetAncestor(wt.HWND(fg), GA_ROOT))
+    if root == qemu_hwnd:
+        return True
+    parent = hwnd_i(user32.GetParent(wt.HWND(fg)))
+    while parent:
+        if parent == qemu_hwnd:
+            return True
+        parent = hwnd_i(user32.GetParent(wt.HWND(parent)))
+    return False
 
 
 def pack_pkt(typ: int, mods: int, hid: int, unicode: int = 0, repeat: int = 0) -> bytes:
@@ -165,16 +227,26 @@ def main() -> int:
     user32.GetWindowTextW.restype = ctypes.c_int
     user32.GetForegroundWindow.argtypes = ()
     user32.GetForegroundWindow.restype = wt.HWND
+    user32.GetClassNameW.argtypes = (wt.HWND, wt.LPWSTR, ctypes.c_int)
+    user32.GetClassNameW.restype = ctypes.c_int
+    user32.GetClientRect.argtypes = (wt.HWND, ctypes.POINTER(RECT))
+    user32.GetClientRect.restype = wt.BOOL
+    user32.GetAncestor.argtypes = (wt.HWND, ctypes.c_uint)
+    user32.GetAncestor.restype = wt.HWND
+    user32.GetParent.argtypes = (wt.HWND,)
+    user32.GetParent.restype = wt.HWND
     period = 1.0 / max(args.hz, 1.0)
     sock: socket.socket | None = None
     prev: dict[int, bool] = {vk: False for vk in VK_TO_HID}
     paused = True
+    sticky = False
+    rctrl_was = False
     qemu_hwnd = 0
     last_find = 0.0
 
     print(
         f"kbdvirt → {args.host}:{args.port}  "
-        f"(click QEMU window to capture; RCtrl pauses; Ctrl+C=quit)",
+        f"(click QEMU RGB to capture; RCtrl toggles sticky; Ctrl+C=quit)",
         flush=True,
     )
 
@@ -186,7 +258,12 @@ def main() -> int:
 
         fg = hwnd_i(user32.GetForegroundWindow())
         rctrl = bool(user32.GetAsyncKeyState(VK_RCONTROL) & 0x8000)
-        want_paused = rctrl or qemu_hwnd == 0 or fg != qemu_hwnd
+        if rctrl and not rctrl_was:
+            sticky = not sticky
+            print(f"sticky {'ON' if sticky else 'OFF'}", flush=True)
+        rctrl_was = rctrl
+        qemu_fg = focused_in_qemu(user32, qemu_hwnd, fg)
+        want_paused = not (sticky or qemu_fg)
         if want_paused != paused:
             paused = want_paused
             if paused:
@@ -200,7 +277,7 @@ def main() -> int:
                             except OSError:
                                 pass
                     prev[vk] = False
-                print("capture OFF (click QEMU / release RCtrl)", flush=True)
+                print("capture OFF (click QEMU RGB / RCtrl sticky)", flush=True)
             else:
                 for vk, hid in VK_TO_HID.items():
                     prev[vk] = bool(user32.GetAsyncKeyState(vk) & 0x8000)
