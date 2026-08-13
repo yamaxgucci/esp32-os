@@ -241,4 +241,21 @@ void run_draw_tests(void)
         AG_CHECK(count_color(0x07E0) + count_color(0x001F) + count_color(0xFFFF) >
                  0);
     }
+
+    /* Axis-aligned quad (fan of 2 triangles) must match a 2×2 nearest scale. */
+    {
+        static const uint16_t tex[2 * 2] = {0xF800, 0x07E0, 0x001F, 0xFFFF};
+        const ag_draw_texvert_t quad[4] = {
+            {0, 0, 0, 0},
+            {4, 0, 2, 0},
+            {4, 4, 2, 2},
+            {0, 4, 0, 2},
+        };
+        surf_clear(0);
+        ag_draw_fill_convex_tex(&s_surf, quad, 4, tex, 4, 0, 0, 2, 2);
+        AG_CHECK(s_fb[0] == 0xF800);
+        AG_CHECK(s_fb[3] == 0x07E0);
+        AG_CHECK(s_fb[3 * W] == 0x001F);
+        AG_CHECK(s_fb[3 * W + 3] == 0xFFFF);
+    }
 }

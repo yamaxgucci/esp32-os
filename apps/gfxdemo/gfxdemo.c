@@ -94,13 +94,13 @@ static void draw_scene(const ag_gfxinfo_t *info)
         ag_gfx_blit_scaled(400, 280, 48, 48);
         ag_gfx_blit_tiled(456, 280, 64, 32);
         ag_gfx_poly_begin();
-        ag_gfx_poly_uv(0, 0);
+        ag_gfx_poly_uv(0, 4);
         (void)ag_gfx_poly_vertex(540, 300);
-        ag_gfx_poly_uv(7, 0);
+        ag_gfx_poly_uv(4, 0);
         (void)ag_gfx_poly_vertex(580, 280);
-        ag_gfx_poly_uv(7, 7);
+        ag_gfx_poly_uv(7, 4);
         (void)ag_gfx_poly_vertex(620, 300);
-        ag_gfx_poly_uv(0, 7);
+        ag_gfx_poly_uv(4, 7);
         (void)ag_gfx_poly_vertex(580, 328);
         ag_gfx_poly_fill_tex();
         (void)ag_gfx_text(400, 332, "scale/tile/uv", 0x00E0E0E0u, 0x00102040u);
