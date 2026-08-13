@@ -15,7 +15,7 @@
 #include <argon/argon.h>
 #include <argon/libc.h>
 
-AG_DRV("MOUSEVIRT", "1.4", "argon");
+AG_DRV("MOUSEVIRT", "1.5", "argon");
 
 #define MOUSEVIRT_PORT 5560u
 #define PKT_SIZE       8u
@@ -52,6 +52,7 @@ typedef struct {
     int16_t     y;
     uint8_t     rx_buf[PKT_SIZE];
     uint8_t     rx_n;
+    uint8_t     pending_move;
 } mousevirt_state_t;
 
 static mousevirt_state_t s_st;
@@ -93,6 +94,14 @@ static void inject_ptr(mousevirt_state_t *st, ag_event_type_t type, int8_t wheel
     (void)ag_inject_event(&ev);
 }
 
+static void flush_move(mousevirt_state_t *st)
+{
+    if (st->pending_move) {
+        inject_ptr(st, AG_EV_POINTER_MOVE, 0);
+        st->pending_move = 0;
+    }
+}
+
 static void handle_pkt(mousevirt_state_t *st, const mousevirt_pkt_t *pkt)
 {
     uint8_t prev = st->buttons;
@@ -109,11 +118,14 @@ static void handle_pkt(mousevirt_state_t *st, const mousevirt_pkt_t *pkt)
     }
 
     if ((cur & 1u) && !(prev & 1u)) {
+        flush_move(st);
         inject_ptr(st, AG_EV_POINTER_DOWN, 0);
     } else if (!(cur & 1u) && (prev & 1u)) {
+        flush_move(st);
         inject_ptr(st, AG_EV_POINTER_UP, 0);
     } else {
-        inject_ptr(st, AG_EV_POINTER_MOVE, 0);
+        /* Coalesce moves: a slow guest would overflow the 64-event queue. */
+        st->pending_move = 1;
     }
 }
 
@@ -216,6 +228,7 @@ static void pump_rx(mousevirt_state_t *st)
     recv_available(st);
     try_accept(st);
     recv_available(st);
+    flush_move(st);
 }
 
 static ag_err_t mouse_open(ag_device_t *dev, uint32_t flags)

@@ -14,7 +14,7 @@
 
 #define OUT_RATE 11025u
 #define MIX_CH   8
-#define MIX_MAX  512
+#define MIX_MAX  1024
 #define DMX_HDR  8
 #define DMX_PAD  16
 
@@ -33,6 +33,7 @@ static int         s_open_logged;
 static ag_handle_t s_fd = -1;
 static ch_t        s_ch[MIX_CH];
 static int16_t     s_out[MIX_MAX * 2];
+static uint32_t    s_last_ms;
 
 static snddevice_t k_devs[] = {
     SNDDEVICE_SB, SNDDEVICE_PAS, SNDDEVICE_GUS,
@@ -209,18 +210,32 @@ static int snd_GetSfxLumpNum(sfxinfo_t *sfxinfo)
 
 static void snd_Update(void)
 {
-    int n;
-    int i;
-    int c;
-    int sl, sr;
+    uint32_t now;
+    uint32_t elapsed;
+    int      n;
+    int      i;
+    int      c;
+    int      sl, sr;
 
     if (s_fd < 0) {
         return;
     }
-    n = (int)(OUT_RATE * (unsigned)snd_maxslicetime_ms / 1000u);
-    if (n < 1) {
-        n = 1;
+    now = ag_millis();
+    if (s_last_ms == 0u || now < s_last_ms) {
+        s_last_ms = now;
+        return;
     }
+    elapsed = now - s_last_ms;
+    /* A multi-second QEMU frame must not dump seconds of FM in one write. */
+    if (elapsed > 80u) {
+        s_last_ms = now - 20u;
+        elapsed = 20u;
+    }
+    n = (int)((elapsed * OUT_RATE) / 1000u);
+    if (n < 1) {
+        return;
+    }
+    s_last_ms += (uint32_t)n * 1000u / OUT_RATE;
     if (n > MIX_MAX) {
         n = MIX_MAX;
     }
@@ -245,6 +260,8 @@ static void snd_Update(void)
     doom_argon_music_mix(s_out, n);
     (void)ag_dev_write(s_fd, s_out, (size_t)n * 4u);
 }
+
+void doom_argon_audio_pump(void) { snd_Update(); }
 
 static void snd_UpdateSoundParams(int channel, int vol, int sep)
 {

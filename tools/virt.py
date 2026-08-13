@@ -11,7 +11,7 @@ Typical:
   python tools/virt.py --midi       # also midikbd.py (:5559)
   python tools/virt.py --no-kbd --no-mouse   # pcmplay only
 
-Right-Ctrl: kbdvirt starts paused (toggle); mousevirt pauses while held.
+Right-Ctrl: pauses kbd/mouse while held. Click the QEMU window to capture keys.
 Ctrl+C here stops every helper.
 """
 

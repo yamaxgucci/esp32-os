@@ -75,9 +75,8 @@ run a:\doom.axe -iwad a:\doom1.wad pcmvirt
 
 Arrows move, Ctrl fire, Space use, Shift run, Enter, Esc menu.
 Mouse: X turn, Y walk, LMB fire, RMB strafe, wheel weapons.
-`kbdvirt` starts **paused**; Right-Ctrl toggles capture. Do not arm until
-the title screen is up, or keys typed during WAD load get injected as a burst.
-Right-Ctrl also pauses `mousevirt` (clicks then reach QEMU).
+Click the **QEMU RGB window** so `kbdvirt` captures keys (the serial console
+keeps A:\\> typing). Right-Ctrl force-pauses kbd and mouse.
 
 The QEMU RGB window stays **black until the first presented frame** — after
 `R_Init` / `P_Init` / `I_InitGraphics`. Watch `textures` / `flats` / `sprites`

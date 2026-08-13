@@ -10,5 +10,7 @@ void doom_argon_set_sound_path(const char *path);
 /* Coalesced since last call. buttons: bit0 L, bit1 R, bit2 M, bit3 wheel-, bit4 wheel+. */
 int  doom_argon_get_mouse(int *buttons, int *dx, int *dy);
 void doom_argon_music_mix(int16_t *stereo, int nframes);
+void doom_argon_audio_pump(void);
+void doom_argon_service(void);
 
 #endif

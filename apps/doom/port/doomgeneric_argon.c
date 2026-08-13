@@ -13,7 +13,7 @@
 #define SCREEN_W 320
 #define SCREEN_H 200
 
-#define MOUSE_CLAMP 80
+#define MOUSE_CLAMP 320
 #define MWHEEL_PREV (1 << 3)
 #define MWHEEL_NEXT (1 << 4)
 
@@ -143,6 +143,19 @@ static void poll_pad_edges(void)
 }
 
 int doom_argon_quit(void) { return s_quit; }
+
+static uint32_t     s_svc_ms;
+
+void doom_argon_service(void)
+{
+    uint32_t now = ag_millis();
+    if (s_svc_ms != 0u && (now - s_svc_ms) < 15u) {
+        return;
+    }
+    s_svc_ms = now;
+    (void)doom_argon_poll_sys();
+    doom_argon_audio_pump();
+}
 
 void doom_argon_set_live_pad(int on) { s_use_live_pad = on ? 1 : 0; }
 
@@ -277,6 +290,7 @@ void DG_DrawFrame(void)
     static int          s_presents;
 
     (void)doom_argon_poll_sys();
+    doom_argon_service();
     ag_heartbeat();
 
     if (s_gi.fb == NULL || I_VideoBuffer == NULL) {
@@ -305,6 +319,9 @@ void DG_DrawFrame(void)
     }
 
     for (y = 0; y < SCREEN_H; y++) {
+        if ((y & 7) == 0) {
+            doom_argon_service();
+        }
         src = I_VideoBuffer + (size_t)y * SCREEN_W;
         for (r = 0; r < scale; r++) {
             dst = (uint16_t *)((uint8_t *)s_gi.fb +
@@ -319,6 +336,7 @@ void DG_DrawFrame(void)
         }
     }
     ag_gfx_flush(0, 0, s_gi.width, s_gi.height);
+    doom_argon_service();
     if (s_presents < 3) {
         s_presents++;
         ag_printf("doom: present %d\n", s_presents);
@@ -327,6 +345,7 @@ void DG_DrawFrame(void)
 
 void DG_SleepMs(uint32_t ms)
 {
+    doom_argon_service();
     ag_heartbeat();
     if (ms == 0) {
         ag_yield();

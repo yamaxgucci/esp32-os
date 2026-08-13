@@ -17,6 +17,7 @@
 #define MUS_VOICES 9
 #define MUS_EVMAX  4096
 #define MIDI_DRUM  9
+#define MUS_MIXMAX 1024
 
 typedef struct {
     uint32_t tick;
@@ -60,8 +61,8 @@ static uint8_t   s_prog[16];
 static uint8_t   s_cc7[16];
 static voice_t   s_vc[MUS_VOICES];
 static uint32_t  s_age;
-static int16_t   s_l[512];
-static int16_t   s_r[512];
+static int16_t   s_l[MUS_MIXMAX];
+static int16_t   s_r[MUS_MIXMAX];
 
 static const uint16_t k_fn[12] = {
     173, 183, 194, 206, 218, 231, 245, 259, 275, 291, 308, 327,
@@ -502,8 +503,8 @@ void doom_argon_music_mix(int16_t *stereo, int n)
         n < 1) {
         return;
     }
-    if (n > 512) {
-        n = 512;
+    if (n > MUS_MIXMAX) {
+        n = MUS_MIXMAX;
     }
     div = s_song->division ? s_song->division : 70u;
     den = MUS_RATE * (s_tempo ? s_tempo : 500000u);
