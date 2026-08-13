@@ -131,9 +131,9 @@ static void InitSfxModule(boolean use_sfx_prefix)
 
 static void InitMusicModule(void)
 {
-#ifdef FEATURE_SOUND
+#if defined(FEATURE_SOUND) || defined(ARGON_TARGET)
     music_module = &DG_music_module;
-#endif /* FEATURE_SOUND */
+#endif
 }
 
 //

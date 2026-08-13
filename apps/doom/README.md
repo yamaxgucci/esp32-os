@@ -4,7 +4,8 @@
 guest `.AXE`. The engine draws 320×200 pal8; the port integer-scales nearest
 (2× on the default 640×400 soft framebuffer) into RGB565.
 
-Sound: SFX mix to `/dev/pcmvirt` (music mute). Needs `PCMVIRT.SYS`.
+Sound: SFX + music mix to `/dev/pcmvirt`. Music is MUS→MIDI through the
+existing `ag_fm` synth (OPLL-style, not AdLib/Nuked). Needs `PCMVIRT.SYS`.
 Mouse: `/dev/mouse0` via `MOUSEVIRT.SYS` (`mousevirt.py :5560`). Vanilla:
 X turns, Y walks; LMB fire, RMB strafe, wheel prev/next weapon.
 
@@ -29,7 +30,7 @@ supply the shareware IWAD yourself (freely redistributable).
 - `w_file_stdc.c` — 256 KiB WAD read cache (HostFS UART kills uncached R_Init)
 - `r_data.c` — louder R_Init progress
 - `doomtype.h` — DOS path separators (`\` / `;`) so `h:\doom1.wad` parses
-- `i_sound.c` — register Argon `DG_sound_module` without SDL; 256 KiB sfx cache
+- `i_sound.c` — register Argon `DG_sound_module` / `DG_music_module` without SDL; 256 KiB sfx cache
 - `i_input.c` — `ev_mouse` from Argon `doom_argon_get_mouse`
 - `i_video.c` — `usemouse = 1` under `ARGON_TARGET`
 - `m_controls.c` — wheel → prev/next weapon under `ARGON_TARGET`
@@ -90,5 +91,5 @@ run a:\doom.axe -iwad a:\doom1.wad -warp 1 1 -skill 3 frames90
 
 `frames90` exits after 90 ticks (not a bare number — that would clash with `-warp`).
 `livepad` turns HostFS PADPUSH back on if you really want it.
-`nosound` / `pcmnull` mute SFX; default is `pcmvirt` (`pcmplay.py` on :5558).
-QEMU SFX will stutter (seconds per frame); that is the renderer, not the mixer.
+`nosound` / `pcmnull` mute SFX and music; default is `pcmvirt` (`pcmplay.py` on :5558).
+QEMU audio will stutter (seconds per frame); that is the renderer, not the mixer.

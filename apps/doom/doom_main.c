@@ -1,5 +1,5 @@
 /*
- * ArgonOS - Doom (doomgeneric). SFX via /dev/pcmvirt; music mute.
+ * ArgonOS - Doom (doomgeneric). SFX+music via /dev/pcmvirt.
  *
  *   python apps/doom/build.py
  *   run a:\doom.axe -iwad a:\doom1.wad pcmvirt

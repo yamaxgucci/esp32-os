@@ -242,6 +242,7 @@ static void snd_Update(void)
         s_out[i * 2] = (int16_t)clamp16(sl / 254);
         s_out[i * 2 + 1] = (int16_t)clamp16(sr / 254);
     }
+    doom_argon_music_mix(s_out, n);
     (void)ag_dev_write(s_fd, s_out, (size_t)n * 4u);
 }
 
