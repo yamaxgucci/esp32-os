@@ -1,5 +1,5 @@
 /*
- * ArgonOS doomgeneric platform: gfx, time, pad → Doom keys.
+ * ArgonOS doomgeneric platform: gfx, time, kbd/mouse → Doom keys/ev_mouse.
  * SPDX-License-Identifier: Apache-2.0
  */
 #include <argon/argon.h>
@@ -13,10 +13,23 @@
 #define SCREEN_W 320
 #define SCREEN_H 200
 
+#define MOUSE_CLAMP 80
+#define MWHEEL_PREV (1 << 3)
+#define MWHEEL_NEXT (1 << 4)
+
 static ag_gfxinfo_t s_gi;
 static int          s_quit;
 static int          s_use_live_pad;
 static ag_handle_t  s_kbd = -1;
+static ag_handle_t  s_mouse = -1;
+static int          s_mx;
+static int          s_my;
+static int          s_mhave;
+static int          s_mbtn;
+static int          s_mdx;
+static int          s_mdy;
+static int          s_mwheel;
+static int          s_mpending;
 
 static unsigned short s_keyq[KEYQUEUE_SIZE];
 static unsigned       s_keyq_w;
@@ -133,6 +146,57 @@ int doom_argon_quit(void) { return s_quit; }
 
 void doom_argon_set_live_pad(int on) { s_use_live_pad = on ? 1 : 0; }
 
+static int clamp_delta(int v)
+{
+    if (v > MOUSE_CLAMP) {
+        return MOUSE_CLAMP;
+    }
+    if (v < -MOUSE_CLAMP) {
+        return -MOUSE_CLAMP;
+    }
+    return v;
+}
+
+static void on_pointer(const ag_event_t *ev)
+{
+    int x = ev->ptr.x;
+    int y = ev->ptr.y;
+
+    s_mbtn = ev->ptr.buttons & 7;
+    if (s_mhave) {
+        s_mdx += x - s_mx;
+        s_mdy += y - s_my;
+    }
+    s_mx = x;
+    s_my = y;
+    s_mhave = 1;
+    s_mpending = 1;
+}
+
+int doom_argon_get_mouse(int *buttons, int *dx, int *dy)
+{
+    int b;
+
+    if (!s_mpending) {
+        return 0;
+    }
+    b = s_mbtn | s_mwheel;
+    if (buttons != NULL) {
+        *buttons = b;
+    }
+    if (dx != NULL) {
+        *dx = clamp_delta(s_mdx);
+    }
+    if (dy != NULL) {
+        *dy = clamp_delta(s_mdy);
+    }
+    s_mdx = 0;
+    s_mdy = 0;
+    s_mwheel = 0;
+    s_mpending = 0;
+    return 1;
+}
+
 int doom_argon_poll_sys(void)
 {
     ag_event_t ev;
@@ -140,6 +204,10 @@ int doom_argon_poll_sys(void)
         uint8_t buf[64];
         /* read() runs KBDVIRT pump_rx → inject KEY_*; poll_event consumes them. */
         (void)ag_dev_read(s_kbd, buf, sizeof(buf));
+    }
+    if (s_mouse >= 0) {
+        uint8_t buf[64];
+        (void)ag_dev_read(s_mouse, buf, sizeof(buf));
     }
     while (ag_poll_event(&ev, 0)) {
         if (ev.type == AG_EV_QUIT) {
@@ -158,6 +226,18 @@ int doom_argon_poll_sys(void)
             if (k != 0) {
                 keyq_push(ev.type == AG_EV_KEY_DOWN, k);
             }
+        }
+        if (ev.type == AG_EV_POINTER_DOWN || ev.type == AG_EV_POINTER_UP ||
+            ev.type == AG_EV_POINTER_MOVE) {
+            on_pointer(&ev);
+        }
+        if (ev.type == AG_EV_WHEEL) {
+            if (ev.ptr.dy > 0) {
+                s_mwheel |= MWHEEL_NEXT;
+            } else if (ev.ptr.dy < 0) {
+                s_mwheel |= MWHEEL_PREV;
+            }
+            s_mpending = 1;
         }
     }
     /* Do not use ag_btn(AG_BTN_QUIT): without a live pad that is sticky Esc,
@@ -179,6 +259,12 @@ void DG_Init(void)
         ag_printf("doom: kbd = /dev/kbd0 (kbdvirt.py :5561)\n");
     } else {
         ag_printf("doom: no /dev/kbd0 (drv install a:\\kbdvirt.sys)\n");
+    }
+    s_mouse = ag_dev_open("/dev/mouse0");
+    if (s_mouse >= 0) {
+        ag_printf("doom: mouse = /dev/mouse0 (mousevirt.py :5560)\n");
+    } else {
+        ag_printf("doom: no /dev/mouse0 (drv install a:\\mousevirt.sys)\n");
     }
 }
 

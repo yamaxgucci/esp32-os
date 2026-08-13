@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build DOOM.AXE, KBDVIRT.SYS, PCMVIRT.SYS, and bake build/sdcard.img."""
+"""Build DOOM.AXE, KBDVIRT/PCMVIRT/MOUSEVIRT.SYS, and bake build/sdcard.img."""
 import glob
 import os
 import subprocess
@@ -50,6 +50,24 @@ def main():
     ]
     print("PCMVIRT.SYS")
     err = run(pcm)
+    if err:
+        return err
+
+    mouse = [
+        sys.executable,
+        mkaxe,
+        "--arch",
+        "xtensa",
+        "--gcc",
+        gcc,
+        "--include",
+        "sdk/include",
+        "-o",
+        os.path.join("build", "apps", "MOUSEVIRT.SYS"),
+        os.path.join("apps", "mousevirt", "mousevirt.c"),
+    ]
+    print("MOUSEVIRT.SYS")
+    err = run(mouse)
     if err:
         return err
 

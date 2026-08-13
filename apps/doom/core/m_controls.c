@@ -103,8 +103,13 @@ int mousebstraferight = -1;
 int mousebbackward = -1;
 int mousebuse = -1;
 
+#ifdef ARGON_TARGET
+int mousebprevweapon = 3;
+int mousebnextweapon = 4;
+#else
 int mousebprevweapon = -1;
 int mousebnextweapon = -1;
+#endif
 
 
 int key_message_refresh = KEY_ENTER;

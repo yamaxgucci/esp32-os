@@ -5,6 +5,8 @@ guest `.AXE`. The engine draws 320×200 pal8; the port integer-scales nearest
 (2× on the default 640×400 soft framebuffer) into RGB565.
 
 Sound: SFX mix to `/dev/pcmvirt` (music mute). Needs `PCMVIRT.SYS`.
+Mouse: `/dev/mouse0` via `MOUSEVIRT.SYS` (`mousevirt.py :5560`). Vanilla:
+X turns, Y walks; LMB fire, RMB strafe, wheel prev/next weapon.
 
 ## Licensing
 
@@ -28,6 +30,9 @@ supply the shareware IWAD yourself (freely redistributable).
 - `r_data.c` — louder R_Init progress
 - `doomtype.h` — DOS path separators (`\` / `;`) so `h:\doom1.wad` parses
 - `i_sound.c` — register Argon `DG_sound_module` without SDL; 256 KiB sfx cache
+- `i_input.c` — `ev_mouse` from Argon `doom_argon_get_mouse`
+- `i_video.c` — `usemouse = 1` under `ARGON_TARGET`
+- `m_controls.c` — wheel → prev/next weapon under `ARGON_TARGET`
 
 ## Build
 
@@ -37,8 +42,8 @@ Needs `xtensa-esp32s3-elf-gcc` on PATH (IDF export).
 python apps/doom/build.py
 ```
 
-Builds `DOOM.AXE`, `KBDVIRT.SYS`, and `PCMVIRT.SYS`, stages them into
-`build/sd_card/`, then bakes `build/sdcard.img` (put `doom1.wad` in
+Builds `DOOM.AXE`, `KBDVIRT.SYS`, `PCMVIRT.SYS`, and `MOUSEVIRT.SYS`, stages
+them into `build/sd_card/`, then bakes `build/sdcard.img` (put `doom1.wad` in
 `build/sd_card/` yourself).
 
 ## Run
@@ -51,23 +56,26 @@ argon run -Gfx -Sd
 ```
 
 Guest (once): `dir a:\kbdvirt.sys` then `drv install a:\kbdvirt.sys`
-and `drv install a:\pcmvirt.sys`
+and `drv install a:\pcmvirt.sys` and `drv install a:\mousevirt.sys`
 (`T:` is the RAM disk; the `.SYS` files are on `A:`).
 
 ```
 run a:\doom.axe -iwad a:\doom1.wad pcmvirt
 ```
 
-Host (two extra terminals):
+Host (three extra terminals):
 
 ```
 python tools/kbdvirt.py --reconnect
+python tools/mousevirt.py --reconnect
 python tools/pcmplay.py --reconnect
 ```
 
 Arrows move, Ctrl fire, Space use, Shift run, Enter, Esc menu.
+Mouse: X turn, Y walk, LMB fire, RMB strafe, wheel weapons.
 `kbdvirt.py` starts **paused**; Right-Ctrl toggles capture. Do not arm until
 the title screen is up, or keys typed during WAD load get injected as a burst.
+`mousevirt.py` also uses Right-Ctrl to pause (clicks then reach QEMU).
 
 The QEMU RGB window stays **black until the first presented frame** — after
 `R_Init` / `P_Init` / `I_InitGraphics`. Watch `textures` / `flats` / `sprites`
