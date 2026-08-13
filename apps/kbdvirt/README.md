@@ -49,12 +49,13 @@ If `dir` does not see the file, QEMU is still on an old/blank `sdcard.img` — q
 the host tool (not HostFS PADPUSH).
 
 ```powershell
-.\argon.cmd run -Gfx -Sd
+.\argon.cmd run -Gfx -Sd -Virt
 # guest, once:  drv install a:\kbdvirt.sys
 # guest:        run a:\doom.axe -iwad a:\doom1.wad
-
-python tools/kbdvirt.py --reconnect
 ```
+
+`-Virt` (or `argon virt` / `python tools/virt.py`) starts kbdvirt with pcmplay
+and mousevirt. Standalone: `python tools/kbdvirt.py --reconnect`.
 
 Right-Ctrl **toggles** capture (starts **paused**). Ctrl+C quits the host
 tool and is not forwarded. Arrows / Ctrl / Shift / Space / Enter / Esc

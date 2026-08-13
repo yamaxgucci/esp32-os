@@ -32,12 +32,16 @@ Persists via `[modules]` in `C:\SYSTEM.CFG` (same as PCMVIRT / MIDIVIRT).
 `.\argon.cmd run` hostfwd’s **5560** (with 5558/5559).
 
 ```powershell
-$py = "D:\Espressif\tools\python_env\idf5.5_py3.12_env\Scripts\python.exe"
-& $py tools\mousevirt.py --reconnect
+.\argon.cmd run -Gfx -Virt
+# or, if QEMU is already up:
+python tools/virt.py
+# standalone:
+python tools/mousevirt.py --reconnect
 ```
 
-Maps the primary monitor to the guest framebuffer (default 640×400).
-**Right-Ctrl** pauses sending; **Esc** in the mousevirt console quits.
+Maps the letterboxed QEMU client (default guest 640×400).
+**Right-Ctrl** pauses sending; **Esc** quits only when the mousevirt console
+is focused (`virt.py` has no console — Ctrl+C / QEMU exit stops it).
 
 ## Packet (8 bytes LE)
 

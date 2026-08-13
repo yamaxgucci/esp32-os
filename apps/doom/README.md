@@ -53,30 +53,28 @@ Input is **KBDVIRT**, not HostFS PADPUSH. WAD and `.AXE` come from the SD
 image (`A:`).
 
 ```
-argon run -Gfx -Sd
+argon run -Gfx -Sd -Virt
 ```
 
-Guest (once): `dir a:\kbdvirt.sys` then `drv install a:\kbdvirt.sys`
-and `drv install a:\pcmvirt.sys` and `drv install a:\mousevirt.sys`
-(`T:` is the RAM disk; the `.SYS` files are on `A:`).
+`-Virt` starts `pcmplay` + `kbdvirt` + `mousevirt` (`--reconnect`) in the
+background and kills them when QEMU exits. Same helpers without QEMU:
+`argon virt` (or `python tools/virt.py`).
+
+Guest (once; `.SYS` files are on `A:`, not the RAM disk `T:`):
+
+```
+drv install a:\kbdvirt.sys a:\pcmvirt.sys a:\mousevirt.sys
+```
 
 ```
 run a:\doom.axe -iwad a:\doom1.wad pcmvirt
 ```
 
-Host (three extra terminals):
-
-```
-python tools/kbdvirt.py --reconnect
-python tools/mousevirt.py --reconnect
-python tools/pcmplay.py --reconnect
-```
-
 Arrows move, Ctrl fire, Space use, Shift run, Enter, Esc menu.
 Mouse: X turn, Y walk, LMB fire, RMB strafe, wheel weapons.
-`kbdvirt.py` starts **paused**; Right-Ctrl toggles capture. Do not arm until
+`kbdvirt` starts **paused**; Right-Ctrl toggles capture. Do not arm until
 the title screen is up, or keys typed during WAD load get injected as a burst.
-`mousevirt.py` also uses Right-Ctrl to pause (clicks then reach QEMU).
+Right-Ctrl also pauses `mousevirt` (clicks then reach QEMU).
 
 The QEMU RGB window stays **black until the first presented frame** — after
 `R_Init` / `P_Init` / `I_InitGraphics`. Watch `textures` / `flats` / `sprites`
