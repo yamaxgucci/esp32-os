@@ -661,14 +661,22 @@ void R_InitSpriteLumps (void)
     lastspritelump = W_GetNumForName (DEH_String("S_END")) - 1;
     
     numspritelumps = lastspritelump - firstspritelump + 1;
+#ifdef ARGON_TARGET
+    printf (" %d", numspritelumps);
+#endif
     spritewidth = Z_Malloc (numspritelumps*sizeof(*spritewidth), PU_STATIC, 0);
     spriteoffset = Z_Malloc (numspritelumps*sizeof(*spriteoffset), PU_STATIC, 0);
     spritetopoffset = Z_Malloc (numspritelumps*sizeof(*spritetopoffset), PU_STATIC, 0);
 	
     for (i=0 ; i< numspritelumps ; i++)
     {
+#ifdef ARGON_TARGET
+	if (!(i&15))
+	    printf (".");
+#else
 	if (!(i&63))
 	    printf (".");
+#endif
 
 	patch = W_CacheLumpNum (firstspritelump+i, PU_CACHE);
 	spritewidth[i] = SHORT(patch->width)<<FRACBITS;
@@ -702,10 +710,19 @@ void R_InitColormaps (void)
 //
 void R_InitData (void)
 {
+#ifdef ARGON_TARGET
+    printf ("textures");
+#endif
     R_InitTextures ();
     printf (".");
+#ifdef ARGON_TARGET
+    printf ("flats");
+#endif
     R_InitFlats ();
     printf (".");
+#ifdef ARGON_TARGET
+    printf ("sprites");
+#endif
     R_InitSpriteLumps ();
     printf (".");
     R_InitColormaps ();

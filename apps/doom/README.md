@@ -24,6 +24,8 @@ supply the shareware IWAD yourself (freely redistributable).
 - `doomgeneric.c` — dummy `DG_ScreenBuffer` (present path uses `I_VideoBuffer`)
 - `i_system.c` — no zenity/`system()` GUI on `I_Error`; zone 4 MiB (heap is 5)
 - `d_main.c` — skip melt wipe (each wipe step was a full-screen present)
+- `w_file_stdc.c` — 256 KiB WAD read cache (HostFS UART kills uncached R_Init)
+- `r_data.c` — louder R_Init progress
 - `doomtype.h` — DOS path separators (`\` / `;`) so `h:\doom1.wad` parses
 
 ## Build
@@ -38,7 +40,11 @@ Stages `build/apps/DOOM.AXE` and `build/sd_card/DOOM.AXE`.
 
 ## Run
 
-Put shareware `doom1.wad` on the HostFS share (same folder as the `.AXE`).
+The QEMU RGB window stays **black until the first presented frame** — after
+`R_Init` / `P_Init` / `I_InitGraphics`. `R_Init` on HostFS (`h:`) is slow:
+every sprite lump is a UART round-trip. Prefer the WAD on `A:` (`argon sync`
+then `run a:\doom.axe -iwad a:\doom1.wad`), or wait until dots after
+`sprites` finish.
 
 ```
 argon run -Gfx -HostFs build\sd_card
