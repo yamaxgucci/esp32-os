@@ -9,7 +9,6 @@
 #include "doomkeys.h"
 #include "i_video.h"
 
-#define KEYQUEUE_SIZE 32
 #define SCREEN_W 320
 #define SCREEN_H 200
 
@@ -31,9 +30,10 @@ static int          s_mdy;
 static int          s_mwheel;
 static int          s_mpending;
 
-static unsigned short s_keyq[KEYQUEUE_SIZE];
-static unsigned       s_keyq_w;
-static unsigned       s_keyq_r;
+/* 256 doom-keys: held now, last posted to Doom, down-edge since last GetKey. */
+static uint8_t s_held[32];
+static uint8_t s_posted[32];
+static uint8_t s_tap[32];
 
 static uint16_t s_lut[256];
 
@@ -41,10 +41,10 @@ static const struct {
     int          btn;
     unsigned char doom;
 } k_pad_map[] = {
-    {AG_BTN_UP, KEY_UPARROW},
-    {AG_BTN_DOWN, KEY_DOWNARROW},
-    {AG_BTN_LEFT, KEY_LEFTARROW},
-    {AG_BTN_RIGHT, KEY_RIGHTARROW},
+    {AG_BTN_UP, 'w'},
+    {AG_BTN_DOWN, 's'},
+    {AG_BTN_LEFT, 'a'},
+    {AG_BTN_RIGHT, 'd'},
     {AG_BTN_B1, KEY_FIRE},
     {AG_BTN_B2, KEY_USE},
     {AG_BTN_C, KEY_RSHIFT},
@@ -98,23 +98,32 @@ static unsigned char hid_to_doom(uint16_t hid)
     }
 }
 
-static void keyq_push(int pressed, unsigned char key)
+static int key_bit(const uint8_t *m, unsigned char k)
 {
-    unsigned short data = (unsigned short)((pressed ? 0x100u : 0u) | key);
-    s_keyq[s_keyq_w] = data;
-    s_keyq_w = (s_keyq_w + 1u) % KEYQUEUE_SIZE;
+    return (int)((m[k >> 3] >> (k & 7u)) & 1u);
 }
 
-static int keyq_pop(int *pressed, unsigned char *key)
+static void key_put(uint8_t *m, unsigned char k, int on)
 {
-    if (s_keyq_r == s_keyq_w) {
-        return 0;
+    uint8_t bit = (uint8_t)(1u << (k & 7u));
+    if (on) {
+        m[k >> 3] |= bit;
+    } else {
+        m[k >> 3] &= (uint8_t)~bit;
     }
-    unsigned short data = s_keyq[s_keyq_r];
-    s_keyq_r = (s_keyq_r + 1u) % KEYQUEUE_SIZE;
-    *pressed = (data >> 8) & 1;
-    *key = (unsigned char)(data & 0xffu);
-    return 1;
+}
+
+static void key_edge(unsigned char k, int down)
+{
+    if (k == 0) {
+        return;
+    }
+    if (down) {
+        key_put(s_held, k, 1);
+        key_put(s_tap, k, 1);
+    } else {
+        key_put(s_held, k, 0);
+    }
 }
 
 static void poll_pad_edges(void)
@@ -134,9 +143,9 @@ static void poll_pad_edges(void)
     for (i = 0; i < (unsigned)(sizeof k_pad_map / sizeof k_pad_map[0]); i++) {
         uint32_t bit = 1u << i;
         if ((now & bit) && !(prev & bit)) {
-            keyq_push(1, k_pad_map[i].doom);
+            key_edge(k_pad_map[i].doom, 1);
         } else if (!(now & bit) && (prev & bit)) {
-            keyq_push(0, k_pad_map[i].doom);
+            key_edge(k_pad_map[i].doom, 0);
         }
     }
     prev = now;
@@ -237,7 +246,7 @@ int doom_argon_poll_sys(void)
         if (ev.type == AG_EV_KEY_DOWN || ev.type == AG_EV_KEY_UP) {
             unsigned char k = hid_to_doom(ev.key.keycode);
             if (k != 0) {
-                keyq_push(ev.type == AG_EV_KEY_DOWN, k);
+                key_edge(k, ev.type == AG_EV_KEY_DOWN);
             }
         }
         if (ev.type == AG_EV_POINTER_DOWN || ev.type == AG_EV_POINTER_UP ||
@@ -358,8 +367,30 @@ uint32_t DG_GetTicksMs(void) { return ag_millis(); }
 
 int DG_GetKey(int *pressed, unsigned char *key)
 {
+    unsigned k;
+
     (void)doom_argon_poll_sys();
-    return keyq_pop(pressed, key);
+    for (k = 1; k < 256u; k++) {
+        unsigned char ck = (unsigned char)k;
+        int held = key_bit(s_held, ck);
+        int posted = key_bit(s_posted, ck);
+        int tap = key_bit(s_tap, ck);
+        if (!posted && (held || tap)) {
+            key_put(s_posted, ck, 1);
+            key_put(s_tap, ck, 0);
+            *pressed = 1;
+            *key = ck;
+            return 1;
+        }
+        if (posted && !held) {
+            key_put(s_posted, ck, 0);
+            key_put(s_tap, ck, 0);
+            *pressed = 0;
+            *key = ck;
+            return 1;
+        }
+    }
+    return 0;
 }
 
 void DG_SetWindowTitle(const char *title)

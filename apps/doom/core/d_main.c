@@ -1363,6 +1363,9 @@ void D_DoomMain (void)
     M_SetConfigFilenames("default.cfg", PROGRAM_PREFIX "doom.cfg");
     D_BindVariables();
     M_LoadDefaults();
+#ifdef ARGON_TARGET
+    M_ApplyPlatformDefaults();
+#endif
 
     // Save configuration at exit.
     I_AtExit(M_SaveDefaults, false);
