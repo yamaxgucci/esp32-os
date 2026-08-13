@@ -659,11 +659,20 @@ static float cross2(float ax, float ay, float bx, float by)
     return ax * by - ay * bx;
 }
 
+static int32_t ifloor(float x)
+{
+    const int32_t i = (int32_t)x;
+    if (x < 0.f && (float)i != x) {
+        return i - 1;
+    }
+    return i;
+}
+
 /*
  * Inverse bilinear: p = mix(mix(A,B,s), mix(D,C,s), t) for quad A,B,C,D.
  * After Iñigo Quílez.  Returns 0 if the point is degenerate.
  */
-static int inv_bilinear(int32_t px, int32_t py, const ag_draw_texvert_t q[4],
+static int inv_bilinear(float px, float py, const ag_draw_texvert_t q[4],
                         float *out_s, float *out_t)
 {
     const float ax = (float)q[0].x;
@@ -794,7 +803,8 @@ static void fill_tex_quad(ag_draw_surf_t *s, const ag_draw_texvert_t q[4],
             float st_t;
             float u;
             float v;
-            if (!inv_bilinear(x, y, q, &st_s, &st_t)) {
+            if (!inv_bilinear((float)x + 0.5f, (float)y + 0.5f, q, &st_s,
+                              &st_t)) {
                 continue;
             }
             if (st_s < 0.f) {
@@ -817,11 +827,9 @@ static void fill_tex_quad(ag_draw_surf_t *s, const ag_draw_texvert_t q[4],
                 st_s * (1.f - st_t) * (float)q[1].v +
                 st_s * st_t * (float)q[2].v +
                 (1.f - st_s) * st_t * (float)q[3].v;
-            ag_draw_pixel(
-                s, x, y,
-                sample_clamp(src, src_stride, sx, sy, sw, sh,
-                             (int32_t)(u + (u >= 0.f ? 0.5f : -0.5f)),
-                             (int32_t)(v + (v >= 0.f ? 0.5f : -0.5f))));
+            ag_draw_pixel(s, x, y,
+                          sample_clamp(src, src_stride, sx, sy, sw, sh,
+                                       ifloor(u), ifloor(v)));
         }
     }
 }
