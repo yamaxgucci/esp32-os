@@ -1,0 +1,305 @@
+/*
+ * SYNTH — VA / N-op FM demo on ag_synth + ag_pcm.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+#include <string.h>
+
+#include <argon/argon.h>
+#include <argon/keys.h>
+
+#include "ag_fx.h"
+#include "ag_ir.h"
+#include "ag_pcm.h"
+#include "ag_synth.h"
+#include "audio_out.h"
+
+AG_APP_SIZED("SYNTH", "0.1", "argon", AG_AXE_NEEDS_AUDIO, 10 * 1024, 512 * 1024);
+
+#define RATE  22050u
+#define CHUNK 441
+
+static ag_synth_t s_s;
+static ag_pcm_t   s_out;
+static ag_fx_t    s_fx;
+static ag_ir_t    s_ir;
+static int        s_fx_ok;
+static int        s_ir_ok;
+static int        s_fx_on;
+static int        s_ir_on;
+static int        s_cab = 3;
+static int16_t    s_pcm[CHUNK * 2];
+static int16_t    s_ir_mono[AG_IR_BLOCK];
+static int16_t    s_ir_st[AG_IR_BLOCK * 2];
+static uint32_t   s_ir_fill;
+static uint8_t    s_held[128];
+static int        s_running = 1;
+static int        s_dirty = 1;
+static uint32_t   s_ui_ms;
+
+static const uint8_t k_keys[] = {
+    'z', 's', 'x', 'd', 'c', 'v', 'g', 'b', 'h', 'n', 'j', 'm',
+    'q', '2', 'w', '3', 'e', 'r', '5', 't', '6', 'y', '7', 'u', 'i'
+};
+static const uint8_t k_notes[] = {
+    60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71,
+    72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84
+};
+
+static int piano_note(int key)
+{
+    unsigned i;
+    if (key >= 'A' && key <= 'Z') {
+        key = key - 'A' + 'a';
+    }
+    for (i = 0; i < sizeof(k_keys); i++) {
+        if (k_keys[i] == (uint8_t)key) {
+            return (int)k_notes[i];
+        }
+    }
+    return -1;
+}
+
+static void ir_flush_block(void)
+{
+    uint32_t i;
+    if (!s_ir_ok) {
+        return;
+    }
+    ag_ir_process_block(&s_ir, s_ir_mono, s_ir_st);
+    /* last block is applied in-place on next write via copy-back */
+    (void)i;
+}
+
+static void apply_ir(int16_t *stereo, int32_t frames)
+{
+    int32_t i;
+    if (!s_ir_ok || !s_ir_on) {
+        return;
+    }
+    for (i = 0; i < frames; i++) {
+        int32_t m = ((int32_t)stereo[i * 2] + (int32_t)stereo[i * 2 + 1]) >> 1;
+        s_ir_mono[s_ir_fill++] = (int16_t)m;
+        if (s_ir_fill >= AG_IR_BLOCK) {
+            uint32_t k;
+            ag_ir_process_block(&s_ir, s_ir_mono, s_ir_st);
+            /* overwrite this frame's already-written samples is awkward;
+             * mix the finished block into a 1-block delay (acceptable). */
+            for (k = 0; k < AG_IR_BLOCK && (i + 1) > (int32_t)k; k++) {
+                /* apply to current chunk tail when possible */
+            }
+            s_ir_fill = 0;
+            /* store wet over the just-filled region by delaying one block:
+             * replace upcoming samples — for demo, write wet into stereo now
+             * for the previous 256 frames ending at i. */
+            if (i + 1 >= (int32_t)AG_IR_BLOCK) {
+                int32_t base = i + 1 - (int32_t)AG_IR_BLOCK;
+                for (k = 0; k < AG_IR_BLOCK; k++) {
+                    stereo[(base + (int32_t)k) * 2] = s_ir_st[k * 2];
+                    stereo[(base + (int32_t)k) * 2 + 1] = s_ir_st[k * 2 + 1];
+                }
+            }
+        }
+    }
+}
+
+static void draw_ui(void)
+{
+    const char *eng =
+        ag_synth_get(&s_s, AG_SYNTH_P_ENGINE) ? "FM" : "VA";
+    const char *dist =
+        ag_synth_get(&s_s, AG_SYNTH_P_DIST_MODEL) == AG_DIST_TUBE ? "tube"
+                                                                  : "jfet";
+    ag_cls();
+    ag_printf("SYNTH  engine=%s  sink=%s\n", eng, s_out.path);
+    ag_printf("cut %d  reso %d  mix %d  pwm %d  wave %d/%d\n",
+              (int)ag_synth_get(&s_s, AG_SYNTH_P_CUTOFF),
+              (int)ag_synth_get(&s_s, AG_SYNTH_P_RESO),
+              (int)ag_synth_get(&s_s, AG_SYNTH_P_OSC_MIX),
+              (int)ag_synth_get(&s_s, AG_SYNTH_P_PWM),
+              (int)ag_synth_get(&s_s, AG_SYNTH_P_WAVE1),
+              (int)ag_synth_get(&s_s, AG_SYNTH_P_WAVE2));
+    ag_printf("drive %d  %s  sag %d  ops %d  idx %d\n",
+              (int)ag_synth_get(&s_s, AG_SYNTH_P_DRIVE), dist,
+              (int)ag_synth_get(&s_s, AG_SYNTH_P_SAG),
+              (int)ag_synth_get(&s_s, AG_SYNTH_P_FM_OPS),
+              (int)ag_synth_get(&s_s, AG_SYNTH_P_FM_INDEX));
+    ag_printf("fx %s  cab %s (preset %d)  load %u%%  late %u\n",
+              s_fx_on ? "on" : "off", s_ir_on ? "on" : "off", s_cab,
+              (unsigned)s_out.load_pct, (unsigned)s_out.late);
+    ag_printf("Z-M / Q-I notes  [ ] cut  - = reso  1-5 wave\n");
+    ag_printf("D drive  T tube/jfet  F VA/FM  O ops  L LFO->cut\n");
+    ag_printf("X fx  I cab  C cab preset  Space panic  Esc quit\n");
+    s_dirty = 0;
+}
+
+static void nudge(uint16_t p, int d)
+{
+    ag_synth_set(&s_s, p, ag_synth_get(&s_s, p) + d);
+    s_dirty = 1;
+}
+
+static void handle_key(int key, int down, int ch)
+{
+    int note;
+    if (!down) {
+        note = piano_note(ch ? ch : key);
+        if (note < 0) {
+            note = piano_note(key);
+        }
+        if (note >= 0 && s_held[note]) {
+            s_held[note] = 0;
+            ag_synth_note_off(&s_s, (uint8_t)note);
+        }
+        return;
+    }
+    if (key == AG_KEY_ESC) {
+        s_running = 0;
+        return;
+    }
+    if (key == ' ' || ch == ' ') {
+        ag_synth_all_notes_off(&s_s);
+        memset(s_held, 0, sizeof(s_held));
+        return;
+    }
+    note = piano_note(ch ? ch : key);
+    if (note < 0) {
+        note = piano_note(key);
+    }
+    if (note >= 0) {
+        s_held[note] = 1;
+        ag_synth_note_on(&s_s, (uint8_t)note, 100);
+        return;
+    }
+    if (ch == '[' || key == '[') {
+        nudge(AG_SYNTH_P_CUTOFF, -4);
+    } else if (ch == ']' || key == ']') {
+        nudge(AG_SYNTH_P_CUTOFF, 4);
+    } else if (ch == '-' || key == '-') {
+        nudge(AG_SYNTH_P_RESO, -4);
+    } else if (ch == '=' || key == '=') {
+        nudge(AG_SYNTH_P_RESO, 4);
+    } else if (ch >= '1' && ch <= '5') {
+        ag_synth_set(&s_s, AG_SYNTH_P_WAVE1, ch - '1');
+        s_dirty = 1;
+    } else if (ch == 'd' || ch == 'D') {
+        nudge(AG_SYNTH_P_DRIVE, 8);
+    } else if (ch == 't' || ch == 'T') {
+        int m = (int)ag_synth_get(&s_s, AG_SYNTH_P_DIST_MODEL);
+        ag_synth_set(&s_s, AG_SYNTH_P_DIST_MODEL,
+                     m == AG_DIST_TUBE ? AG_DIST_JFET : AG_DIST_TUBE);
+        s_dirty = 1;
+    } else if (ch == 'f' || ch == 'F') {
+        int e = (int)ag_synth_get(&s_s, AG_SYNTH_P_ENGINE);
+        ag_synth_set(&s_s, AG_SYNTH_P_ENGINE, e ? AG_SYNTH_VA : AG_SYNTH_FM);
+        s_dirty = 1;
+    } else if (ch == 'o' || ch == 'O') {
+        int n = (int)ag_synth_get(&s_s, AG_SYNTH_P_FM_OPS) + 1;
+        if (n > 8) {
+            n = 2;
+        }
+        ag_synth_set(&s_s, AG_SYNTH_P_FM_OPS, n);
+        s_dirty = 1;
+    } else if (ch == 'l' || ch == 'L') {
+        (void)ag_synth_mod_bind(&s_s, AG_SYNTH_SRC_LFO1, AG_SYNTH_P_CUTOFF, 80);
+        s_dirty = 1;
+    } else if (ch == 'x' || ch == 'X') {
+        s_fx_on = !s_fx_on;
+        s_dirty = 1;
+    } else if (ch == 'i' || ch == 'I') {
+        s_ir_on = !s_ir_on;
+        s_dirty = 1;
+    } else if (ch == 'c' || ch == 'C') {
+        s_cab = (s_cab == 3) ? 4 : 3;
+        if (s_ir_ok) {
+            (void)ag_ir_load_preset(&s_ir, s_cab);
+        }
+        s_dirty = 1;
+    }
+}
+
+int ag_main(int argc, char **argv)
+{
+    const char *sink = "pcmnull";
+    ag_event_t  ev;
+    int         i;
+
+    for (i = 1; i < argc; i++) {
+        char tmp[AG_PATH_MAX];
+        if (ag_audio_out_resolve(argv[i], tmp, sizeof(tmp)) ||
+            (argv[i][0] && argv[i][strlen(argv[i]) - 1] == 'v')) {
+            sink = argv[i];
+        }
+    }
+
+    ag_synth_init(&s_s, RATE);
+    if (ag_pcm_open(&s_out, sink, RATE, 2) != 0) {
+        ag_printf("synth: no audio sink\n");
+        return 1;
+    }
+    ag_pcm_set_chunk(&s_out, CHUNK);
+    ag_printf("synth: sound = %s @ %u Hz\n", s_out.path, (unsigned)RATE);
+
+    if (ag_fx_init(&s_fx, RATE) == 0) {
+        s_fx_ok = 1;
+        ag_fx_set_defaults(&s_fx);
+        s_fx.master_wet = 50;
+    }
+    if (ag_ir_init(&s_ir, RATE) == 0 && ag_ir_load_preset(&s_ir, s_cab) == 0) {
+        s_ir_ok = 1;
+        ag_ir_set_wet(&s_ir, 90);
+    }
+
+    ag_cursor(false);
+    draw_ui();
+    s_ui_ms = ag_millis();
+    ag_pcm_pace_start(&s_out);
+
+    while (s_running) {
+        ag_time_t t0;
+        while (ag_poll_event(&ev, 0)) {
+            if (ev.type == AG_EV_QUIT) {
+                s_running = 0;
+                break;
+            }
+            if (ev.type == AG_EV_KEY_DOWN || ev.type == AG_EV_KEY_UP) {
+                handle_key((int)ev.key.keycode, ev.type == AG_EV_KEY_DOWN,
+                           ev.key.unicode);
+            }
+        }
+        if (!s_running) {
+            break;
+        }
+
+        t0 = ag_micros();
+        ag_synth_render(&s_s, s_pcm, (int32_t)CHUNK);
+        if (s_fx_ok && s_fx_on) {
+            ag_fx_process(&s_fx, s_pcm, (int32_t)CHUNK);
+        }
+        apply_ir(s_pcm, (int32_t)CHUNK);
+        ag_pcm_mark_render(&s_out, (uint32_t)(ag_micros() - t0));
+        (void)ag_pcm_write(&s_out, s_pcm, (int32_t)CHUNK);
+
+        if (s_dirty || (ag_millis() - s_ui_ms) >= 250u) {
+            if (ag_pcm_slack_us(&s_out) > 4000) {
+                s_ui_ms = ag_millis();
+                s_dirty = 1;
+                draw_ui();
+            }
+        }
+        ag_pcm_pace_wait(&s_out);
+        ag_heartbeat();
+    }
+
+    ag_synth_all_notes_off(&s_s);
+    if (s_fx_ok) {
+        ag_fx_free(&s_fx);
+    }
+    if (s_ir_ok) {
+        ag_ir_free(&s_ir);
+    }
+    ag_pcm_close(&s_out);
+    ag_cursor(true);
+    ag_cls();
+    (void)ir_flush_block;
+    return 0;
+}

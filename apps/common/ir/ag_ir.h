@@ -35,7 +35,7 @@ void ag_ir_reset(ag_ir_t *ir);
 /* Mono IR; resampled to ir->rate, truncated to AG_IR_MAX_MS. */
 int ag_ir_load(ag_ir_t *ir, const int16_t *mono, uint32_t frames, uint32_t src_rate);
 
-/* 0=room, 1=hall (~500 ms), 2=spring. */
+/* 0=room, 1=hall (~500 ms), 2=spring, 3=cab dark, 4=cab bright. */
 int ag_ir_load_preset(ag_ir_t *ir, int preset);
 
 void ag_ir_set_wet(ag_ir_t *ir, uint8_t wet);
