@@ -267,20 +267,20 @@ static void render_tube_cab(const char *path)
     }
     ag_synth_init(&s, RATE);
     ag_synth_set(&s, AG_SYNTH_P_WAVE1, AG_OSC_SAW);
-    ag_synth_set(&s, AG_SYNTH_P_CUTOFF, 90);
-    ag_synth_set(&s, AG_SYNTH_P_RESO, 30);
-    ag_synth_set(&s, AG_SYNTH_P_DRIVE, 96);
-    ag_synth_set(&s, AG_SYNTH_P_BIAS, 70);
-    ag_synth_set(&s, AG_SYNTH_P_SAG, 40);
+    ag_synth_set(&s, AG_SYNTH_P_CUTOFF, 86);
+    ag_synth_set(&s, AG_SYNTH_P_RESO, 28);
+    ag_synth_set(&s, AG_SYNTH_P_DRIVE, 56);
+    ag_synth_set(&s, AG_SYNTH_P_BIAS, 68);
+    ag_synth_set(&s, AG_SYNTH_P_SAG, 18);
     ag_synth_set(&s, AG_SYNTH_P_DIST_MODEL, AG_DIST_TUBE);
-    ag_synth_note_on(&s, 52, 120);
+    ag_synth_note_on(&s, 64, 110);
     for (i = 0; i < frames; i += 256u) {
         uint32_t n = 256u;
         if (i + n > frames) {
             n = frames - i;
         }
         if (i == hold) {
-            ag_synth_note_off(&s, 52);
+            ag_synth_note_off(&s, 64);
         }
         ag_synth_render(&s, pcm + (int32_t)i * 2, (int32_t)n);
     }
@@ -350,7 +350,7 @@ static void render_smp(const char *path, int preset, uint8_t note)
     } else if (preset == AG_SMP_BASS) {
         ag_smp_set_adsr(&s, 2, 50, 40, 40);
     } else {
-        ag_smp_set_adsr(&s, 2, 70, 20, 50);
+        ag_smp_set_adsr(&s, 2, 50, 80, 40);
     }
     ag_smp_note_on(&s, note, 110);
     for (i = 0; i < frames; i += 256u) {
@@ -398,8 +398,8 @@ int main(int argc, char **argv)
     snprintf(path, sizeof(path), "%s/smp_organ.wav", dir);
     render_smp(path, AG_SMP_ORGAN, 60);
     snprintf(path, sizeof(path), "%s/smp_piano.wav", dir);
-    render_smp(path, AG_SMP_PIANO, 64);
+    render_smp(path, AG_SMP_PIANO, 67);
     snprintf(path, sizeof(path), "%s/smp_bass.wav", dir);
-    render_smp(path, AG_SMP_BASS, 40);
+    render_smp(path, AG_SMP_BASS, 52);
     return 0;
 }

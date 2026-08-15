@@ -73,6 +73,7 @@ static char        s_audio_arg[AG_PATH_MAX];
 static ag_handle_t s_midi_fd = -1;
 static ag_handle_t s_mouse_fd = -1;
 static int        s_midi_want = 1;
+static uint32_t   s_wav_until;
 
 static ag_gfxinfo_t s_gi;
 static int          s_have_gfx;
@@ -1004,7 +1005,13 @@ static int parse_arg(const char *a)
                  a[0] == 't' || a[0] == 'T')) {
         size_t n = strlen(a);
         if (n > 4 && (a[n - 1] == 'v' || a[n - 1] == 'V')) {
-            (void)load_wav_path(a);
+            ag_handle_t fd = ag_open(a, AG_O_RDONLY);
+            if (fd >= 0) {
+                (void)ag_close(fd);
+                (void)load_wav_path(a);
+            } else {
+                ag_audio_out_copy(s_audio_arg, sizeof(s_audio_arg), a);
+            }
             return 0;
         }
     }
@@ -1051,6 +1058,17 @@ int ag_main(int argc, char **argv)
         return 1;
     }
     ag_printf("grain: sound = %s @ %u Hz\n", s_out.path, (unsigned)RATE);
+    {
+        const char *p = s_out.path;
+        int n = 0;
+        while (p[n]) {
+            n++;
+        }
+        if (n > 4 && (p[n - 1] == 'v' || p[n - 1] == 'V')) {
+            s_wav_until = ag_millis() + 4500u;
+            note_set(60, 1);
+        }
+    }
 
     if (ag_fx_init(&s_fx, RATE) == 0) {
         s_fx_ready = 1;
@@ -1061,8 +1079,10 @@ int ag_main(int argc, char **argv)
         s_fx.delay_mix = 20;
     }
 
-    open_midivirt();
-    open_mousevirt();
+    if (s_wav_until == 0u) {
+        open_midivirt();
+        open_mousevirt();
+    }
     ag_printf("\x1b[>3u");
     ag_printf("\x1b[?9001h");
 
@@ -1072,10 +1092,16 @@ int ag_main(int argc, char **argv)
 
     for (;;) {
         ag_time_t loop0 = ag_micros();
+        if (s_wav_until != 0u && (int32_t)(ag_millis() - s_wav_until) >= 0) {
+            goto done;
+        }
 
         pump_mousevirt();
         while (ag_poll_event(&ev, 0)) {
             if (ev.type == AG_EV_QUIT) {
+                if (s_wav_until != 0u) {
+                    continue;
+                }
                 goto done;
             }
             if (ev.type == AG_EV_FOCUS_LOST) {
@@ -1107,13 +1133,13 @@ int ag_main(int argc, char **argv)
         if (ag_interrupted()) {
             break;
         }
-        if (!ag_focused()) {
+        if (!ag_focused() && s_wav_until == 0u) {
             ag_heartbeat();
             ag_delay(50);
             ag_pcm_pace_start(&s_out);
             continue;
         }
-        if (ag_gfx_acquire(&s_gi) == AG_OK) {
+        if (s_wav_until == 0u && ag_gfx_acquire(&s_gi) == AG_OK) {
             s_have_gfx = 1;
             s_fb_w = s_gi.width ? s_gi.width : 640;
             s_fb_h = s_gi.height ? s_gi.height : 400;
