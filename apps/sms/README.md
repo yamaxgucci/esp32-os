@@ -22,12 +22,12 @@ Do **not** link `ym2413.c`. Include `sound_wav.c` and `ag_fm.c`.
 python tools/mkaxe.py --arch xtensa --gcc xtensa-esp32s3-elf-gcc `
   --include sdk/include --include apps/common --include apps/common/libc --include apps/sms/port `
   --include apps/sms/core --include apps/sms/core/z80 `
-  --include apps/sms/core/sound --include apps/common/fm `
+  --include apps/sms/core/sound --include apps/common/fm --include apps/common/dsp `
   --cflags "-Os -ffunction-sections -fdata-sections -fno-builtin -DLSB_FIRST -DNOZIP_SUPPORT -DUSE_Z80 -Wno-unused -Wno-sign-compare" `
   -o build/apps/SMS.AXE `
   apps/sms/sms_main.c apps/sms/sms_cfg.c `
   apps/common/libc/libc_shim.c apps/sms/port/platform.c apps/sms/port/sound_wav.c `
-  apps/common/fm/ag_fm.c `
+  apps/common/fm/ag_fm.c apps/common/dsp/ag_dsp.c `
   apps/sms/core/loadrom.c apps/sms/core/memz80.c apps/sms/core/pio.c `
   apps/sms/core/render.c apps/sms/core/sms.c apps/sms/core/system.c `
   apps/sms/core/tms.c apps/sms/core/vdp.c `

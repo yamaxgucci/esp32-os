@@ -83,13 +83,13 @@ python tools/mkaxe.py --arch xtensa --gcc xtensa-esp32s3-elf-gcc `
   --include apps/md/port --include apps/md/core/bus --include apps/md/core/cpus/M68K `
   --include apps/md/core/vdp --include apps/md/core/io `
   --include apps/md/core/savestate --include apps/md/core/sound `
-  --include apps/sms/core/z80 --include apps/sms/core/sound --include apps/common/fm `
+  --include apps/sms/core/z80 --include apps/sms/core/sound --include apps/common/fm --include apps/common/dsp `
   --cflags "-Os -ffunction-sections -fdata-sections -fno-builtin -include md_cfg.h -DARGON_MD_Z80 -DLSB_FIRST -Wno-unused -Wno-sign-compare" `
   --libs c -o build/apps/MD.AXE `
   apps/md/md_main.c `
   apps/md/port/md_z80.c apps/md/port/md_ym_ag_fm.c apps/md/port/md_psg.c `
   apps/md/port/md_sound_out.c apps/md/port/md_savestate_stub.c `
-  apps/common/libc/libc_shim.c apps/common/fm/ag_fm.c `
+  apps/common/libc/libc_shim.c apps/common/fm/ag_fm.c apps/common/dsp/ag_dsp.c `
   apps/sms/core/z80/z80.c apps/sms/core/sound/sn76489.c `
   apps/md/core/bus/gwenesis_bus.c apps/md/core/cpus/M68K/m68kcpu.c `
   apps/md/core/vdp/gwenesis_vdp_gfx.c apps/md/core/vdp/gwenesis_vdp_mem.c `

@@ -11,11 +11,13 @@ Engine: [`apps/common/grain`](../common/grain). WAV: [`apps/common/wav`](../comm
 
 ```
 python tools/mkaxe.py --arch xtensa --gcc xtensa-esp32s3-elf-gcc `
-  --include sdk/include --include apps/common --include apps/common/grain `
+  --include sdk/include --include apps/common --include apps/common/dsp `
+  --include apps/common/pcm --include apps/common/grain `
   --include apps/common/wav --include apps/common/fx --include apps/common/libc `
   --cflags "-Os -ffunction-sections -fdata-sections -fno-builtin" `
   -o build/apps/GRAIN.AXE `
-  apps/grain/grain.c apps/common/grain/ag_grain.c apps/common/wav/ag_wav.c `
+  apps/grain/grain.c apps/common/dsp/ag_dsp.c apps/common/pcm/ag_pcm.c `
+  apps/common/grain/ag_grain.c apps/common/wav/ag_wav.c `
   apps/common/fx/ag_fx.c apps/common/libc/libc_shim.c
 ```
 

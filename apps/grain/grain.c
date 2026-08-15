@@ -20,6 +20,7 @@
 #include <argon/keys.h>
 
 #include "audio_out.h"
+#include "ag_pcm.h"
 #include "ag_grain.h"
 #include "ag_wav.h"
 #include "ag_fx.h"
@@ -67,8 +68,8 @@ static ag_grain_t s_g;
 static ag_fx_t    s_fx;
 static int        s_fx_ready;
 static int16_t    s_pcm[CHUNK * 2];
-static char       s_audio_path[AG_PATH_MAX];
-static ag_handle_t s_audio_fd = -1;
+static ag_pcm_t    s_out;
+static char        s_audio_arg[AG_PATH_MAX];
 static ag_handle_t s_midi_fd = -1;
 static ag_handle_t s_mouse_fd = -1;
 static int        s_midi_want = 1;
@@ -85,11 +86,7 @@ static int      s_freeze;
 static uint8_t  s_note_held[128];
 static int      s_held_n;
 
-static ag_time_t s_next_due;
 static uint32_t  s_ui_ms;
-static uint32_t  s_render_us;
-static uint32_t  s_load_pct;
-static uint32_t  s_late;
 
 /* Pointer UI state */
 static int s_mx = -1, s_my = -1;
@@ -316,12 +313,12 @@ static void open_picker(void)
 
 static int open_sink(void)
 {
-    s_audio_fd = ag_audio_out_open_dev(s_audio_path, RATE, 2);
-    if (s_audio_fd < 0) {
-        (void)ag_audio_out_resolve("pcmnull", s_audio_path, sizeof(s_audio_path));
-        s_audio_fd = ag_audio_out_open_dev(s_audio_path, RATE, 2);
+    if (ag_pcm_open(&s_out, s_audio_arg[0] ? s_audio_arg : "pcmmix", RATE,
+                    2) != 0) {
+        return -1;
     }
-    return s_audio_fd < 0 ? -1 : 0;
+    ag_pcm_set_chunk(&s_out, CHUNK);
+    return 0;
 }
 
 static void open_midivirt(void)
@@ -672,7 +669,7 @@ static void draw_adsr_fx(void)
     u8_to_dec(r, s_g.params.release);
     u8_to_dec(w, s_fx_ready ? s_fx.master_wet : 0u);
     u8_to_dec(g, s_g.active_grains);
-    u8_to_dec(l, s_load_pct);
+    u8_to_dec(l, s_out.load_pct);
     /* "ADSR aaa/ddd/sss/rrr  FX www  ggg gr  load lll%" */
     {
         int i = 0;
@@ -984,46 +981,23 @@ static void handle_key(int key, int down, uint32_t uni)
     }
 }
 
-static void pace_wait(ag_time_t due)
-{
-    for (;;) {
-        ag_time_t now = ag_micros();
-        if (now >= due) {
-            return;
-        }
-        {
-            uint32_t rem = (uint32_t)(due - now);
-            if (rem > 1000u) {
-                ag_delay((rem / 1000u) - 1u);
-            }
-        }
-    }
-}
-
 static void pump_audio(void)
 {
     ag_time_t t0 = ag_micros();
-    int32_t n;
     ag_grain_render(&s_g, s_pcm, CHUNK);
     if (s_fx_ready && s_fx.master_wet > 0u) {
         ag_fx_process(&s_fx, s_pcm, (int32_t)CHUNK);
     }
     ag_grain_viz_update(&s_g);
-    s_render_us = (uint32_t)(ag_micros() - t0);
-    s_load_pct = CHUNK_US ? (s_render_us * 100u + CHUNK_US / 2u) / CHUNK_US : 0u;
-
-    if (s_audio_fd < 0) {
-        return;
-    }
-    n = ag_dev_write(s_audio_fd, s_pcm, sizeof(s_pcm));
-    if (n < (int32_t)sizeof(s_pcm)) {
-        s_late++;
-    }
+    ag_pcm_mark_render(&s_out, (uint32_t)(ag_micros() - t0));
+    (void)ag_pcm_write(&s_out, s_pcm, (int32_t)CHUNK);
 }
 
 static int parse_arg(const char *a)
 {
-    if (ag_audio_out_resolve(a, s_audio_path, sizeof(s_audio_path))) {
+    char tmp[AG_PATH_MAX];
+    if (ag_audio_out_resolve(a, tmp, sizeof(tmp))) {
+        ag_audio_out_copy(s_audio_arg, sizeof(s_audio_arg), a);
         return 0;
     }
     if (a[0] && (a[1] == ':' || a[0] == '/' || a[0] == 'h' || a[0] == 'H' ||
@@ -1046,7 +1020,7 @@ int ag_main(int argc, char **argv)
     ag_event_t ev;
     int i;
 
-    (void)ag_audio_out_resolve("pcmmix", s_audio_path, sizeof(s_audio_path));
+    ag_audio_out_copy(s_audio_arg, sizeof(s_audio_arg), "pcmmix");
     for (i = 1; i < argc; i++) {
         if (parse_arg(argv[i]) != 0) {
             ag_printf("grain: arg '%s' (pcmmix|pcmvirt|pcmnull|path.wav|nomidi)\n",
@@ -1076,7 +1050,7 @@ int ag_main(int argc, char **argv)
         ag_gfx_release();
         return 1;
     }
-    ag_printf("grain: sound = %s @ %u Hz\n", s_audio_path, (unsigned)RATE);
+    ag_printf("grain: sound = %s @ %u Hz\n", s_out.path, (unsigned)RATE);
 
     if (ag_fx_init(&s_fx, RATE) == 0) {
         s_fx_ready = 1;
@@ -1092,7 +1066,7 @@ int ag_main(int argc, char **argv)
     ag_printf("\x1b[>3u");
     ag_printf("\x1b[?9001h");
 
-    s_next_due = ag_micros() + (ag_time_t)CHUNK_US;
+    ag_pcm_pace_start(&s_out);
     s_ui_ms = ag_millis();
     draw_ui();
 
@@ -1136,7 +1110,7 @@ int ag_main(int argc, char **argv)
         if (!ag_focused()) {
             ag_heartbeat();
             ag_delay(50);
-            s_next_due = ag_micros() + (ag_time_t)CHUNK_US;
+            ag_pcm_pace_start(&s_out);
             continue;
         }
         if (ag_gfx_acquire(&s_gi) == AG_OK) {
@@ -1151,23 +1125,14 @@ int ag_main(int argc, char **argv)
         pump_audio();
 
         {
-            ag_time_t now = ag_micros();
             uint32_t ms = ag_millis();
             int want_ui = s_dirty || (ms - s_ui_ms) >= UI_PERIOD_MS;
-            if (want_ui && now < s_next_due &&
-                (uint32_t)(s_next_due - now) >= UI_SLACK_US) {
+            if (want_ui && ag_pcm_slack_us(&s_out) >= (int32_t)UI_SLACK_US) {
                 s_ui_ms = ms;
                 s_dirty = 0;
                 draw_ui();
-                now = ag_micros();
             }
-            if (now <= s_next_due) {
-                pace_wait(s_next_due);
-                s_next_due += (ag_time_t)CHUNK_US;
-            } else {
-                s_late++;
-                s_next_due = now + (ag_time_t)CHUNK_US;
-            }
+            ag_pcm_pace_wait(&s_out);
         }
         (void)loop0;
         ag_heartbeat();
@@ -1182,9 +1147,7 @@ done:
         (void)ag_dev_close(s_mouse_fd);
         s_mouse_fd = -1;
     }
-    if (s_audio_fd >= 0) {
-        (void)ag_dev_close(s_audio_fd);
-    }
+    ag_pcm_close(&s_out);
     if (s_fx_ready) {
         ag_fx_free(&s_fx);
     }

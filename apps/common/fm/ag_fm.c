@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 #include "ag_fm.h"
+#include "ag_dsp.h"
 
 #define AG_FM_RAW_INST 0xffu
 
@@ -57,13 +58,6 @@ static const uint16_t k_eg_dec[32] = {
     3, 3, 4, 5, 6, 8, 10, 13, 16, 20, 26, 32, 40, 52, 64, 80
 };
 
-static void mem_zero(void *p, unsigned n)
-{
-    unsigned char *d = (unsigned char *)p;
-    while (n--) {
-        *d++ = 0;
-    }
-}
 
 static int32_t rate_from_nibble(uint8_t n, int attack)
 {
@@ -187,7 +181,7 @@ static void refresh_step(ag_fm_t *fm, int ch)
 
 void ag_fm_init(ag_fm_t *fm, uint32_t clock, uint32_t sample_rate)
 {
-    mem_zero(fm, sizeof(*fm));
+    ag_dsp_zero(fm, sizeof(*fm));
     fm->clock = clock ? clock : 3579545u;
     fm->rate = sample_rate ? sample_rate : 22050u;
     fm->clk_div = AG_FM_CLKDIV_OPLL;
@@ -207,7 +201,7 @@ void ag_fm_reset(ag_fm_t *fm)
 {
     int i, s;
     for (i = 0; i < AG_FM_CHANNELS; i++) {
-        mem_zero(&fm->ch[i], sizeof(fm->ch[i]));
+        ag_dsp_zero(&fm->ch[i], sizeof(fm->ch[i]));
         fm->ch[i].mul = 2;
         fm->ch[i].vol = 15;
         fm->ch[i].ar = 12;
@@ -225,7 +219,7 @@ void ag_fm_reset(ag_fm_t *fm)
             fm->ch[i].op[s].eg_state = AG_EG_OFF;
         }
     }
-    mem_zero(fm->patch, sizeof(fm->patch));
+    ag_dsp_zero(fm->patch, sizeof(fm->patch));
     fm->rhythm = 0;
 }
 

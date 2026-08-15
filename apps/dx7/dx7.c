@@ -13,6 +13,7 @@
 #include <argon/keys.h>
 
 #include "audio_out.h"
+#include "ag_pcm.h"
 #include "ag_dx7.h"
 #include "ag_mid.h"
 #include "ag_fx.h"
@@ -81,21 +82,10 @@ static char s_mid_err[80];
 static int s_mid_loaded;
 static uint32_t s_mid_notes; /* note-ons fired (UI) */
 
-static char s_audio_path[AG_PATH_MAX];
-static ag_handle_t s_audio_fd = -1;
-static int s_send_err_reported;
-
-/* Perf / stream health (shown in UI). */
-static uint32_t s_render_us;
-static uint32_t s_send_us;
+static ag_pcm_t s_out;
+static char     s_audio_arg[AG_PATH_MAX];
+static int      s_send_err_reported;
 static uint32_t s_loop_us;
-static uint32_t s_load_pct; /* render / chunk budget */
-static uint32_t s_late;     /* paced deadline missed */
-static uint32_t s_drop;     /* bytes we failed to push in time */
-static uint32_t s_resync;
-static ag_audio_stats_t s_pcm_stats; /* from AG_IOC_AUDIO_GETSTATS when supported */
-static int s_pcm_stats_ok;
-static ag_time_t s_next_due;
 static uint32_t s_ui_ms;
 
 typedef struct {
@@ -499,7 +489,7 @@ static int parse_sink_arg(const char *arg)
         (arg[0] == '/' ||
          ((arg[0] == 'd' || arg[0] == 'D') && arg[1] == ':') ||
          ((arg[0] == 'p' || arg[0] == 'P') && (arg[1] == 'c' || arg[1] == 'C')))) {
-        (void)ag_audio_out_resolve(arg, s_audio_path, sizeof(s_audio_path));
+        ag_audio_out_copy(s_audio_arg, sizeof(s_audio_arg), arg);
         return 0;
     }
     if (ends_with_syx(arg)) {
@@ -749,29 +739,18 @@ static void load_mid_if_requested(void)
 
 static int open_sink(void)
 {
-    if (s_audio_path[0] == '\0') {
-        (void)ag_audio_out_resolve("pcmnull", s_audio_path, sizeof(s_audio_path));
+    if (ag_pcm_open(&s_out, s_audio_arg[0] ? s_audio_arg : "pcmnull", RATE,
+                    2) != 0) {
+        return -1;
     }
-    s_audio_fd = ag_audio_out_open_dev(s_audio_path, RATE, 2);
-    if (s_audio_fd < 0) {
-        ag_printf("dx7: %s: %s\n", s_audio_path,
-                  ag_strerror((ag_err_t)s_audio_fd));
-        (void)ag_audio_out_resolve("pcmnull", s_audio_path, sizeof(s_audio_path));
-        s_audio_fd = ag_audio_out_open_dev(s_audio_path, RATE, 2);
-        if (s_audio_fd < 0) {
-            return -1;
-        }
-    }
-    ag_printf("dx7: sound = %s @ %u Hz\n", s_audio_path, (unsigned)RATE);
+    ag_pcm_set_chunk(&s_out, CHUNK);
+    ag_printf("dx7: sound = %s @ %u Hz\n", s_out.path, (unsigned)RATE);
     return 0;
 }
 
 static void close_sink(void)
 {
-    if (s_audio_fd >= 0) {
-        (void)ag_dev_close(s_audio_fd);
-        s_audio_fd = -1;
-    }
+    ag_pcm_close(&s_out);
 }
 
 static int piano_index(int key)
@@ -909,7 +888,7 @@ static const char *note_name(uint8_t note)
 
 static const char *sink_name(void)
 {
-    return s_audio_path[0] ? s_audio_path : "/dev/pcmnull";
+    return s_out.path[0] ? s_out.path : "/dev/pcmnull";
 }
 
 /* Build "C4 E4 G4" (up to 8 names) into out; uses note_name() carefully. */
@@ -1019,21 +998,21 @@ static void draw_ui(void)
                   (unsigned)s_midi_ev);
     }
     ag_printf("Perf  : render %u us / %u us (%u%%)  send %u us  loop %u us\x1b[K\n",
-              (unsigned)s_render_us, (unsigned)budget, (unsigned)s_load_pct,
-              (unsigned)s_send_us, (unsigned)s_loop_us);
-    if (s_pcm_stats_ok) {
+              (unsigned)s_out.render_us, (unsigned)budget, (unsigned)s_out.load_pct,
+              (unsigned)s_out.send_us, (unsigned)s_loop_us);
+    if (s_out.stats_ok) {
         ag_printf(
             "Stream: late %u  drop %u B  resync %u  chunk %u  "
             "tcp_ov %llu B eagain %u ring %u\x1b[K\n",
-            (unsigned)s_late, (unsigned)s_drop, (unsigned)s_resync,
+            (unsigned)s_out.late, (unsigned)s_out.drop, (unsigned)s_out.resync,
             (unsigned)CHUNK,
-            (unsigned long long)s_pcm_stats.bytes_drop_overflow,
-            (unsigned)s_pcm_stats.eagain_events,
-            (unsigned)s_pcm_stats.ring_used);
+            (unsigned long long)s_out.stats.bytes_drop_overflow,
+            (unsigned)s_out.stats.eagain_events,
+            (unsigned)s_out.stats.ring_used);
     } else {
         ag_printf("Stream: late %u  drop %u B  resync %u  chunk %u\x1b[K\n",
-                  (unsigned)s_late, (unsigned)s_drop, (unsigned)s_resync,
-                  (unsigned)CHUNK);
+                  (unsigned)s_out.late, (unsigned)s_out.drop,
+                  (unsigned)s_out.resync, (unsigned)CHUNK);
     }
     if (s_fx_mode == FX_OFF) {
         ag_printf("FX    : mode=off  (F cycle  nofx|fx0|fx1)\x1b[K\n");
@@ -1336,30 +1315,12 @@ static void handle_key(int key, int down, int is_repeat, uint32_t uni)
     }
 }
 
-static void pace_wait(ag_time_t due)
-{
-    for (;;) {
-        ag_time_t now = ag_micros();
-        uint32_t rem;
-        if (now >= due) {
-            return;
-        }
-        rem = (uint32_t)(due - now);
-        if (rem > 2000u) {
-            ag_delay((rem / 1000u) - 1u);
-        } else {
-            ag_heartbeat();
-        }
-    }
-}
-
 static int16_t s_fx_prev_wet[CHUNK * 2];
 
 static void pump_audio(void)
 {
     const int32_t n = (int32_t)CHUNK;
-    const size_t bytes = (size_t)n * 4u;
-    ag_time_t t0, t1;
+    ag_time_t t0;
     int32_t wr;
     int core1 = (s_fx_mode == FX_CORE1 && s_q_dry && s_q_wet);
 
@@ -1389,30 +1350,11 @@ static void pump_audio(void)
         }
     }
 
-    t1 = ag_micros();
-    s_render_us = (uint32_t)(t1 - t0);
-    if (CHUNK_US > 0u) {
-        s_load_pct = (s_render_us * 100u + CHUNK_US / 2u) / CHUNK_US;
-        if (s_load_pct == 0u && s_render_us > 0u) {
-            s_load_pct = 1u; /* show sub-percent as 1% */
-        }
-    }
-
-    if (s_audio_fd < 0) {
-        s_send_us = 0;
-    } else {
-        wr = ag_dev_write(s_audio_fd, s_pcm, bytes);
-        s_send_us = (uint32_t)(ag_micros() - t1);
-        if (wr < 0) {
-            if (!s_send_err_reported) {
-                s_send_err_reported = 1;
-                ag_printf("dx7: %s: %s\n", s_audio_path,
-                          ag_strerror((ag_err_t)wr));
-            }
-            s_drop += (uint32_t)bytes;
-        } else if ((size_t)wr < bytes) {
-            s_drop += (uint32_t)(bytes - (size_t)wr);
-        }
+    ag_pcm_mark_render(&s_out, (uint32_t)(ag_micros() - t0));
+    wr = ag_pcm_write(&s_out, s_pcm, n);
+    if (wr < 0 && !s_send_err_reported) {
+        s_send_err_reported = 1;
+        ag_printf("dx7: %s: %s\n", s_out.path, ag_strerror((ag_err_t)wr));
     }
 
     /* Collect wet after write so FX overlaps device I/O. */
@@ -1435,7 +1377,7 @@ int ag_main(int argc, char **argv)
     ag_event_t ev;
     int i;
 
-    (void)ag_audio_out_resolve("pcmnull", s_audio_path, sizeof(s_audio_path));
+    s_audio_arg[0] = '\0';
 
     for (i = 1; i < argc; i++) {
         if (parse_sink_arg(argv[i]) != 0) {
@@ -1472,7 +1414,7 @@ int ag_main(int argc, char **argv)
     load_mid_if_requested();
     draw_ui();
     s_ui_ms = ag_millis();
-    s_next_due = ag_micros() + (ag_time_t)CHUNK_US;
+    ag_pcm_pace_start(&s_out);
 
     for (;;) {
         ag_time_t loop0 = ag_micros();
@@ -1506,7 +1448,7 @@ int ag_main(int argc, char **argv)
 
         if (!ag_focused()) {
             ag_heartbeat();
-            s_next_due = ag_micros() + (ag_time_t)CHUNK_US;
+            ag_pcm_pace_start(&s_out);
             continue;
         }
 
@@ -1516,38 +1458,15 @@ int ag_main(int argc, char **argv)
          * Note on/off do not set s_dirty; Keys/Perf refresh on the period.
          */
         {
-            ag_time_t now = ag_micros();
             uint32_t ms = ag_millis();
             int want_ui = s_dirty || (ms - s_ui_ms) >= UI_PERIOD_MS;
 
-            if (want_ui && now < s_next_due &&
-                (uint32_t)(s_next_due - now) >= UI_SLACK_US) {
+            if (want_ui && ag_pcm_slack_us(&s_out) >= (int32_t)UI_SLACK_US) {
                 s_ui_ms = ms;
-                s_pcm_stats_ok = 0;
-                if (s_audio_fd >= 0) {
-                    ag_err_t st = ag_dev_ioctl(s_audio_fd, AG_IOC_AUDIO_GETSTATS,
-                                               &s_pcm_stats, sizeof(s_pcm_stats));
-                    s_pcm_stats_ok = (st == AG_OK) ? 1 : 0;
-                }
+                ag_pcm_poll_stats(&s_out);
                 draw_ui();
-                now = ag_micros();
             }
-
-            /*
-             * Steady realtime clock: never "catch up" by bursting extra chunks
-             * (that floods pcmplay → overflow drop → underrun crackle on a sine).
-             * If late, slide the schedule forward from now.
-             */
-            if (now <= s_next_due) {
-                pace_wait(s_next_due);
-                s_next_due += (ag_time_t)CHUNK_US;
-            } else {
-                s_late++;
-                if (now > s_next_due + (ag_time_t)CHUNK_US) {
-                    s_resync++;
-                }
-                s_next_due = now + (ag_time_t)CHUNK_US;
-            }
+            ag_pcm_pace_wait(&s_out);
         }
 
         s_loop_us = (uint32_t)(ag_micros() - loop0);

@@ -8,6 +8,8 @@
 
 #include <argon/argon.h>
 
+#include "ag_dsp.h"
+
 /* ~370 ms mono @ 22.05 kHz */
 #define FX_DELAY_MS_MAX 370u
 /* Chorus delay line ~30 ms */
@@ -16,16 +18,6 @@
 static const uint16_t k_comb_base[4] = {1116u, 1188u, 1277u, 1356u};
 static const uint16_t k_ap_base[2] = {556u, 441u};
 
-static int16_t sat16(int32_t x)
-{
-    if (x > 32767) {
-        return 32767;
-    }
-    if (x < -32768) {
-        return -32768;
-    }
-    return (int16_t)x;
-}
 
 static uint32_t scale_len(uint32_t base441, uint32_t rate)
 {
@@ -230,22 +222,23 @@ static void process_delay(ag_fx_t *fx, int16_t *L, int16_t *R)
         r_off = 1u;
     }
 
-    tapL = fx->delay_buf[(fx->delay_w + fx->delay_cap - dsamps) % fx->delay_cap];
-    tapR = fx->delay_buf[(fx->delay_w + fx->delay_cap - dsamps + r_off) %
-                         fx->delay_cap];
-
-    mono = (dryL + dryR) >> 1;
-    fb = tapL + ((int32_t)fx->delay_fb * (tapL + tapR) >> 8);
-    fx->delay_buf[fx->delay_w] = sat16(mono + (fb >> 1));
-    fx->delay_w++;
-    if (fx->delay_w >= fx->delay_cap) {
-        fx->delay_w = 0;
+    {
+        ag_dsp_delay_t dl;
+        dl.buf = fx->delay_buf;
+        dl.cap = fx->delay_cap;
+        dl.w = fx->delay_w;
+        tapL = ag_dsp_delay_tap(&dl, dsamps);
+        tapR = ag_dsp_delay_tap(&dl, dsamps - r_off);
+        mono = (dryL + dryR) >> 1;
+        fb = tapL + ((int32_t)fx->delay_fb * (tapL + tapR) >> 8);
+        ag_dsp_delay_write(&dl, ag_sat16(mono + (fb >> 1)));
+        fx->delay_w = dl.w;
     }
 
     wetL = (dryL * (int32_t)imix + tapL * (int32_t)mix) >> 7;
     wetR = (dryR * (int32_t)imix + tapR * (int32_t)mix) >> 7;
-    *L = sat16(wetL);
-    *R = sat16(wetR);
+    *L = ag_sat16(wetL);
+    *R = ag_sat16(wetR);
 }
 
 static void process_chorus(ag_fx_t *fx, int16_t *L, int16_t *R)
@@ -286,8 +279,8 @@ static void process_chorus(ag_fx_t *fx, int16_t *L, int16_t *R)
         fx->chorus_w = 0;
     }
 
-    *L = sat16((dryL * (int32_t)imix + tapL * (int32_t)mix) >> 7);
-    *R = sat16((dryR * (int32_t)imix + tapR * (int32_t)mix) >> 7);
+    *L = ag_sat16((dryL * (int32_t)imix + tapL * (int32_t)mix) >> 7);
+    *R = ag_sat16((dryR * (int32_t)imix + tapR * (int32_t)mix) >> 7);
 }
 
 static int32_t comb_process(ag_fx_t *fx, int ch, int idx, int32_t in)
@@ -306,7 +299,7 @@ static int32_t comb_process(ag_fx_t *fx, int ch, int idx, int32_t in)
     filtered = fx->comb_filter[bi] +
                (((y - fx->comb_filter[bi]) * (128 - damp)) >> 7);
     fx->comb_filter[bi] = filtered;
-    buf[w] = sat16(in + ((filtered * room) >> 7));
+    buf[w] = ag_sat16(in + ((filtered * room) >> 7));
     /* advance write only once per stereo pair — caller advances after R */
     (void)len;
     return y;
@@ -319,7 +312,7 @@ static int32_t ap_process(ag_fx_t *fx, int ch, int idx, int32_t in)
     int16_t *buf = fx->ap_buf[bi];
     int32_t bufout = buf[w];
     int32_t out = bufout - in;
-    buf[w] = sat16(in + ((bufout * 5) >> 3)); /* ~0.625 feedback */
+    buf[w] = ag_sat16(in + ((bufout * 5) >> 3)); /* ~0.625 feedback */
     return out;
 }
 
@@ -363,8 +356,8 @@ static void process_reverb(ag_fx_t *fx, int16_t *L, int16_t *R)
 
     wetL = (*L * (int32_t)imix + accL * (int32_t)mix) >> 7;
     wetR = (*R * (int32_t)imix + accR * (int32_t)mix) >> 7;
-    *L = sat16(wetL);
-    *R = sat16(wetR);
+    *L = ag_sat16(wetL);
+    *R = ag_sat16(wetR);
 }
 
 void ag_fx_process(ag_fx_t *fx, int16_t *stereo_io, int32_t frames)
@@ -399,7 +392,7 @@ void ag_fx_process(ag_fx_t *fx, int16_t *stereo_io, int32_t frames)
             process_reverb(fx, &L, &R);
         }
 
-        s[0] = sat16((dryL * (int32_t)imw + L * (int32_t)mw) >> 7);
-        s[1] = sat16((dryR * (int32_t)imw + R * (int32_t)mw) >> 7);
+        s[0] = ag_sat16((dryL * (int32_t)imw + L * (int32_t)mw) >> 7);
+        s[1] = ag_sat16((dryR * (int32_t)imw + R * (int32_t)mw) >> 7);
     }
 }

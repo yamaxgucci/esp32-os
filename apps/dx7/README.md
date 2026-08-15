@@ -10,11 +10,13 @@ bit-exact / SysEx-complete. Engine: [`apps/common/dx7`](../common/dx7).
 
 ```
 python tools/mkaxe.py --arch xtensa --gcc xtensa-esp32s3-elf-gcc `
-  --include sdk/include --include apps/common --include apps/common/dx7 `
+  --include sdk/include --include apps/common --include apps/common/dsp `
+  --include apps/common/pcm --include apps/common/dx7 `
   --include apps/common/fx --include apps/common/libc `
   --cflags "-Os -ffunction-sections -fdata-sections -fno-builtin" `
   -o build/apps/DX7.AXE `
-  apps/dx7/dx7.c apps/common/dx7/ag_dx7.c apps/common/dx7/ag_mid.c `
+  apps/dx7/dx7.c apps/common/dsp/ag_dsp.c apps/common/pcm/ag_pcm.c `
+  apps/common/dx7/ag_dx7.c apps/common/dx7/ag_mid.c `
   apps/common/fx/ag_fx.c apps/common/libc/libc_shim.c
 ```
 

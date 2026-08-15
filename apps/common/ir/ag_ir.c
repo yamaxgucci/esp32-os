@@ -8,18 +8,8 @@
 
 #include <argon/argon.h>
 
+#include "ag_dsp.h"
 #include "ag_fft.h"
-
-static int16_t sat16(int32_t x)
-{
-    if (x > 32767) {
-        return 32767;
-    }
-    if (x < -32768) {
-        return -32768;
-    }
-    return (int16_t)x;
-}
 
 static uint32_t ir_max_frames(uint32_t rate)
 {
@@ -155,7 +145,7 @@ static void normalize_peak(int16_t *x, uint32_t n, int32_t target_peak)
         return;
     }
     for (i = 0; i < n; i++) {
-        x[i] = sat16(((int32_t)x[i] * target_peak) / peak);
+        x[i] = ag_sat16(((int32_t)x[i] * target_peak) / peak);
     }
 }
 
@@ -199,8 +189,8 @@ static int build_partitions(ag_ir_t *ir, int16_t *mono, uint32_t frames)
             return -1;
         }
         for (i = 0; i < AG_IR_FFT; i++) {
-            Hp[i * 2u] = sat16(re[i] >> 9);
-            Hp[i * 2u + 1u] = sat16(im[i] >> 9);
+            Hp[i * 2u] = ag_sat16(re[i] >> 9);
+            Hp[i * 2u + 1u] = ag_sat16(im[i] >> 9);
         }
     }
 
@@ -254,8 +244,8 @@ int ag_ir_load_preset(ag_ir_t *ir, int preset)
     if (preset < 0) {
         preset = 0;
     }
-    if (preset > 2) {
-        preset = 2;
+    if (preset > 4) {
+        preset = 4;
     }
 
     n = ir_max_frames(ir->rate);
@@ -265,6 +255,31 @@ int ag_ir_load_preset(ag_ir_t *ir, int preset)
     }
     memset(buf, 0, sizeof(int16_t) * n);
 
+    if (preset >= 3) {
+        /* Short cabinet-ish IR: 20 ms, LF bump + HF roll-off. */
+        uint32_t cab_n = (ir->rate * 20u) / 1000u;
+        int32_t  lp = 0;
+        if (cab_n < 32u) {
+            cab_n = 32u;
+        }
+        if (cab_n > n) {
+            cab_n = n;
+        }
+        buf[0] = 24000;
+        for (i = 1; i < cab_n; i++) {
+            int32_t noise = (int32_t)rnd16() >> 4;
+            int32_t env = (int32_t)((cab_n - i) * 20000u / cab_n);
+            int32_t x = ((noise * env) >> 15);
+            /* one-pole LP: dark=stronger */
+            lp += ((x - lp) * (preset == 3 ? 24 : 48)) >> 7;
+            buf[i] = ag_sat16(lp);
+        }
+        n = cab_n;
+        normalize_peak(buf, n, 14000);
+        rc = build_partitions(ir, buf, n);
+        ag_free(buf);
+        return rc;
+    }
     if (preset == 0) {
         decay_q = 32768 - (32768 * 8) / (int32_t)(ir->rate / 3u + 1u);
     } else if (preset == 1) {
@@ -291,7 +306,7 @@ int ag_ir_load_preset(ag_ir_t *ir, int preset)
             early += env / 5;
         }
         env = (env * decay_q) >> 15;
-        buf[i] = sat16(early + ((noise * env) >> 15));
+        buf[i] = ag_sat16(early + ((noise * env) >> 15));
         if (env < 40) {
             break;
         }
@@ -337,8 +352,8 @@ void ag_ir_process_block(ag_ir_t *ir, const int16_t *mono_in, int16_t *stereo_ou
 
     slot = ir->X + ir->x_pos * AG_IR_FFT * 2u;
     for (i = 0; i < AG_IR_FFT; i++) {
-        slot[i * 2u] = sat16(re[i] >> 9);
-        slot[i * 2u + 1u] = sat16(im[i] >> 9);
+        slot[i * 2u] = ag_sat16(re[i] >> 9);
+        slot[i * 2u + 1u] = ag_sat16(im[i] >> 9);
     }
 
     /* Y = Σ X[pos−p] * H[p] */
@@ -373,10 +388,10 @@ void ag_ir_process_block(ag_ir_t *ir, const int16_t *mono_in, int16_t *stereo_ou
         int32_t dry = (int32_t)mono_in[i];
         int32_t m;
         wet = (wet * (int32_t)ir->gain) >> 6;
-        wet = sat16(wet);
-        ir->overlap[i] = sat16(re[i + AG_IR_BLOCK] << 9);
+        wet = ag_sat16(wet);
+        ir->overlap[i] = ag_sat16(re[i + AG_IR_BLOCK] << 9);
         m = dry + (((wet - dry) * (int32_t)ir->wet) >> 7);
-        m = sat16(m);
+        m = ag_sat16(m);
         stereo_out[i * 2u] = (int16_t)m;
         stereo_out[i * 2u + 1u] = (int16_t)m;
     }

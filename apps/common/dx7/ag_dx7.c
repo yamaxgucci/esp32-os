@@ -3,11 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 #include "ag_dx7.h"
-
-#define SIN_BITS 10
-#define SIN_LEN  (1 << SIN_BITS)
-#define SIN_MASK (SIN_LEN - 1)
-#define PHASE_SHIFT (32 - SIN_BITS)
+#include "ag_dsp.h"
 
 static const uint8_t k_alg_dest[AG_DX7_ALGS][AG_DX7_OPS] = {
     {1, 2, 3, 4, 5, 6}, {1, 2, 3, 4, 6, 6}, {1, 2, 3, 6, 5, 6},
@@ -23,107 +19,6 @@ static const uint8_t k_alg_dest[AG_DX7_ALGS][AG_DX7_OPS] = {
     {1, 6, 6, 6, 6, 6}, {6, 6, 6, 6, 6, 6},
 };
 
-static int16_t s_sin[SIN_LEN];
-static int s_sin_ready;
-
-static void mem_zero(void *p, unsigned n)
-{
-    unsigned char *d = (unsigned char *)p;
-    while (n--) {
-        *d++ = 0;
-    }
-}
-
-static void mem_copy(void *dst, const void *src, unsigned n)
-{
-    unsigned char *d = (unsigned char *)dst;
-    const unsigned char *s = (const unsigned char *)src;
-    while (n--) {
-        *d++ = *s++;
-    }
-}
-
-static int clampi(int v, int lo, int hi)
-{
-    if (v < lo) {
-        return lo;
-    }
-    if (v > hi) {
-        return hi;
-    }
-    return v;
-}
-
-static void ensure_sin(void)
-{
-    int i;
-    if (s_sin_ready) {
-        return;
-    }
-    for (i = 0; i < SIN_LEN; i++) {
-        int x = i & SIN_MASK;
-        int neg = 0;
-        int32_t u, u2, u3, s;
-        if (x >= SIN_LEN / 2) {
-            x -= SIN_LEN / 2;
-            neg = 1;
-        }
-        if (x >= SIN_LEN / 4) {
-            x = SIN_LEN / 2 - x;
-        }
-        u = ((int32_t)x * 32767) / (SIN_LEN / 4);
-        if (u > 32767) {
-            u = 32767;
-        }
-        u2 = (u * u) >> 15;
-        u3 = (u2 * u) >> 15;
-        s = (3 * u - u3) >> 1;
-        if (s > 32767) {
-            s = 32767;
-        }
-        if (s < 0) {
-            s = 0;
-        }
-        s_sin[i] = (int16_t)(neg ? -s : s);
-    }
-    s_sin_ready = 1;
-}
-
-static int16_t isin(uint32_t phase)
-{
-    return s_sin[(phase >> PHASE_SHIFT) & SIN_MASK];
-}
-
-static int32_t note_hz_x100(int note)
-{
-    static const int32_t k_a4 = 44000;
-    static const int32_t k_ratio[12] = {
-        10000, 10595, 11225, 11892, 12599, 13348,
-        14142, 14983, 15874, 16818, 17817, 18877
-    };
-    int n = clampi(note, 0, 127);
-    int d = n - 69;
-    int octs = d / 12;
-    int rem = d % 12;
-    int32_t hz;
-    if (rem < 0) {
-        rem += 12;
-        octs -= 1;
-    }
-    hz = (k_a4 * k_ratio[rem]) / 10000;
-    while (octs > 0) {
-        hz *= 2;
-        octs--;
-    }
-    while (octs < 0) {
-        hz /= 2;
-        octs++;
-    }
-    if (hz < 100) {
-        hz = 100;
-    }
-    return hz;
-}
 
 /*
  * DX7-ish rate → level units/sample. Quadratic was too soft at mid rates;
@@ -131,7 +26,7 @@ static int32_t note_hz_x100(int note)
  */
 static int32_t rate_to_delta(uint8_t rate, uint32_t sample_rate)
 {
-    int r = clampi((int)rate, 0, 99);
+    int r = ag_clampi((int)rate, 0, 99);
     int32_t d;
     if (r == 0) {
         return 0;
@@ -156,7 +51,7 @@ static int32_t rate_to_delta(uint8_t rate, uint32_t sample_rate)
 /* Level 0..99 → linear amp 0..256 (~0.75 dB/step near top, DX7-like). */
 static int32_t level_to_amp256(int level)
 {
-    int n = 99 - clampi(level, 0, 99);
+    int n = 99 - ag_clampi(level, 0, 99);
     int32_t amp = 256;
     while (n >= 8) {
         amp >>= 1;
@@ -192,7 +87,7 @@ static int32_t kbd_scale_delta(int dist, int depth, int curve)
 
 static void perf_reset(ag_dx7_perf_t *p)
 {
-    mem_zero(p, sizeof(*p));
+    ag_dsp_zero(p, sizeof(*p));
     p->op_enable = 0x3fu;
     p->unison = 1;
     p->audition = 1; /* default: hear every MIDI note clearly */
@@ -359,61 +254,6 @@ static void pitch_eg_advance(ag_dx7_t *dx, ag_dx7_voice_t *v)
     }
 }
 
-static int32_t lfo_wave(const ag_dx7_t *dx)
-{
-    uint32_t ph = dx->lfo_phase;
-    uint8_t w = dx->patch.lfo_wave;
-    int32_t v;
-    switch (w) {
-    case 1:
-        v = 32767 - (int32_t)((ph >> 16) & 0xffff);
-        break;
-    case 2:
-        v = (int32_t)((ph >> 16) & 0xffff) - 32768;
-        break;
-    case 3:
-        v = (ph & 0x80000000u) ? 32767 : -32768;
-        break;
-    case 4:
-        v = isin(ph);
-        break;
-    default: {
-        uint32_t x = (ph >> 14) & 0xffff;
-        if (x < 32768u) {
-            v = (int32_t)x - 16384;
-        } else {
-            v = 49151 - (int32_t)x;
-        }
-        v *= 2;
-        break;
-    }
-    }
-    return v;
-}
-
-/*
- * Phase step for 32-bit accumulator: freq_hz * 2^32 / sample_rate.
- * hz_x100 is Hertz * 100. Must use 64-bit math — the old
- * (hz%rate)*42949673 / rate path overflowed uint32, so every note with the
- * same (hz/rate) quotient (e.g. C4..A4, or B4..E5) collapsed to one pitch.
- */
-static uint32_t freq_to_step(int32_t hz_x100, uint32_t rate)
-{
-    uint64_t num;
-    if (rate < 1u) {
-        rate = 22050u;
-    }
-    if (hz_x100 < 1) {
-        hz_x100 = 1;
-    }
-    num = (uint64_t)(uint32_t)hz_x100 << 32;
-    num /= 100ull * (uint64_t)rate;
-    if (num > 0xffffffffull) {
-        num = 0xffffffffull;
-    }
-    return (uint32_t)num;
-}
-
 static int32_t op_freq_hz_x100(const ag_dx7_t *dx, const ag_dx7_voice_t *v,
                                int oi)
 {
@@ -433,7 +273,7 @@ static int32_t op_freq_hz_x100(const ag_dx7_t *dx, const ag_dx7_voice_t *v,
             (coarse == 0) ? (50 + fine) : (coarse * 100 + fine);
         hz = (base * ratio_x100) / 100;
     } else {
-        int32_t c = clampi((int)p->coarse, 0, 3);
+        int32_t c = ag_clampi((int)p->coarse, 0, 3);
         static const int32_t k_fix[4] = {100, 1000, 10000, 100000};
         hz = k_fix[c] + (int32_t)p->fine * (k_fix[c] / 100);
     }
@@ -454,7 +294,7 @@ static void refresh_steps(ag_dx7_t *dx, ag_dx7_voice_t *v)
     /* Mod wheel 0..127 scales pitch LFO depth. */
     pmd = (pmd * (64 + (int32_t)dx->perf.mod_wheel)) / 191;
     if (dx->lfo_delay_left == 0u) {
-        lfo = lfo_wave(dx);
+        lfo = ag_dsp_lfo_wave(dx->lfo_phase, dx->patch.lfo_wave);
     }
     for (i = 0; i < AG_DX7_OPS; i++) {
         int32_t hz = op_freq_hz_x100(dx, v, i);
@@ -465,7 +305,7 @@ static void refresh_steps(ag_dx7_t *dx, ag_dx7_voice_t *v)
         if (dx->perf.aftertouch > 0u) {
             hz += (hz * (int32_t)dx->perf.aftertouch) / (127 * 64);
         }
-        v->op[i].step = freq_to_step(hz, dx->rate);
+        v->op[i].step = ag_dsp_hz_to_step(hz, dx->rate);
     }
 }
 
@@ -498,7 +338,7 @@ static int32_t op_amp(const ag_dx7_t *dx, const ag_dx7_voice_t *v, int oi)
     }
     if (dx->lfo_delay_left == 0u && p->amp_mod_sens > 0u &&
         dx->patch.lfo_amd > 0u) {
-        int32_t lfo = lfo_wave(dx);
+        int32_t lfo = ag_dsp_lfo_wave(dx->lfo_phase, dx->patch.lfo_wave);
         int32_t amd;
         int32_t amd_depth = (int32_t)dx->patch.lfo_amd;
         /* Aftertouch boosts AMD */
@@ -562,7 +402,7 @@ static int32_t render_voice(ag_dx7_t *dx, ag_dx7_voice_t *v)
         int32_t s;
         uint8_t d;
         v->op[i].phase += v->op[i].step;
-        s = (int32_t)isin(v->op[i].phase + (uint32_t)mod[i]);
+        s = (int32_t)ag_dsp_sin(v->op[i].phase + (uint32_t)mod[i]);
         s = (s * amp) / 99;
         v->op[i].out = s;
         d = dest[i];
@@ -645,7 +485,7 @@ static void apply_level_scaling(ag_dx7_t *dx, ag_dx7_voice_t *v)
             int vs = (int)p->vel_sens;
             lvl = (lvl * (64 + (vel * vs) / 7)) / (64 + (100 * vs) / 7);
         }
-        lvl = clampi((int)lvl, 0, 99);
+        lvl = ag_clampi((int)lvl, 0, 99);
         /* Don't let scaling fully silence an operator that has output level. */
         if (p->out_level > 0) {
             int floor = (int)p->out_level / (dx->perf.audition ? 3 : 6);
@@ -663,7 +503,7 @@ static void apply_level_scaling(ag_dx7_t *dx, ag_dx7_voice_t *v)
 static void voice_clear(ag_dx7_voice_t *v)
 {
     int i;
-    mem_zero(v, sizeof(*v));
+    ag_dsp_zero(v, sizeof(*v));
     for (i = 0; i < AG_DX7_OPS; i++) {
         v->op[i].eg_stage = 4;
     }
@@ -705,8 +545,7 @@ static int alloc_voice(ag_dx7_t *dx, uint8_t note)
 
 void ag_dx7_init(ag_dx7_t *dx, uint32_t sample_rate)
 {
-    ensure_sin();
-    mem_zero(dx, sizeof(*dx));
+    ag_dsp_zero(dx, sizeof(*dx));
     dx->rate = sample_rate ? sample_rate : 22050u;
     perf_reset(&dx->perf);
     ag_dx7_load_patch(dx, ag_dx7_preset(0));
@@ -729,7 +568,7 @@ void ag_dx7_load_patch(ag_dx7_t *dx, const ag_dx7_patch_t *p)
     if (!p) {
         return;
     }
-    mem_copy(&dx->patch, p, sizeof(*p));
+    ag_dsp_copy(&dx->patch, p, sizeof(*p));
     if (dx->patch.algorithm >= AG_DX7_ALGS) {
         dx->patch.algorithm = 0;
     }
@@ -737,7 +576,7 @@ void ag_dx7_load_patch(ag_dx7_t *dx, const ag_dx7_patch_t *p)
         dx->patch.feedback = 7;
     }
     hz_x100 = (int32_t)dx->patch.lfo_speed * 20;
-    dx->lfo_step = freq_to_step(hz_x100, dx->rate);
+    dx->lfo_step = ag_dsp_hz_to_step(hz_x100, dx->rate);
     dx->perf.op_enable = 0x3fu;
     dx->perf.carrier_mute = 0;
     ag_dx7_reset(dx);
@@ -759,7 +598,7 @@ void ag_dx7_set_op_level(ag_dx7_t *dx, int op, uint8_t level)
     if (op < 0 || op >= AG_DX7_OPS) {
         return;
     }
-    dx->patch.op[op].out_level = (uint8_t)clampi((int)level, 0, 99);
+    dx->patch.op[op].out_level = (uint8_t)ag_clampi((int)level, 0, 99);
     for (vi = 0; vi < AG_DX7_VOICES; vi++) {
         if (dx->voice[vi].active) {
             apply_level_scaling(dx, &dx->voice[vi]);
@@ -810,24 +649,24 @@ void ag_dx7_mute_carriers(ag_dx7_t *dx, int mute)
 
 void ag_dx7_set_mod_wheel(ag_dx7_t *dx, uint8_t v)
 {
-    dx->perf.mod_wheel = (uint8_t)clampi((int)v, 0, 127);
+    dx->perf.mod_wheel = (uint8_t)ag_clampi((int)v, 0, 127);
 }
 
 void ag_dx7_set_aftertouch(ag_dx7_t *dx, uint8_t v)
 {
-    dx->perf.aftertouch = (uint8_t)clampi((int)v, 0, 127);
+    dx->perf.aftertouch = (uint8_t)ag_clampi((int)v, 0, 127);
 }
 
 void ag_dx7_set_porta(ag_dx7_t *dx, int on, uint8_t time)
 {
     dx->perf.porta_on = on ? 1u : 0u;
-    dx->perf.porta_time = (uint8_t)clampi((int)time, 0, 99);
+    dx->perf.porta_time = (uint8_t)ag_clampi((int)time, 0, 99);
 }
 
 void ag_dx7_set_unison(ag_dx7_t *dx, uint8_t voices, uint8_t detune)
 {
-    dx->perf.unison = (uint8_t)clampi((int)voices, 1, 4);
-    dx->perf.unison_detune = (uint8_t)clampi((int)detune, 0, 99);
+    dx->perf.unison = (uint8_t)ag_clampi((int)voices, 1, 4);
+    dx->perf.unison_detune = (uint8_t)ag_clampi((int)detune, 0, 99);
 }
 
 void ag_dx7_set_audition(ag_dx7_t *dx, int on)
@@ -901,7 +740,7 @@ static int note_with_transpose(const ag_dx7_t *dx, int note)
     if (tr > 48) {
         tr = 48;
     }
-    return clampi(note + (tr - 24), 0, 127);
+    return ag_clampi(note + (tr - 24), 0, 127);
 }
 
 void ag_dx7_note_on(ag_dx7_t *dx, uint8_t note, uint8_t vel)
@@ -912,9 +751,9 @@ void ag_dx7_note_on(ag_dx7_t *dx, uint8_t note, uint8_t vel)
     int play;
 
     /* Keep MIDI note for note_off match; pitch uses patch transpose. */
-    note = (uint8_t)clampi((int)note, 0, 127);
+    note = (uint8_t)ag_clampi((int)note, 0, 127);
     play = note_with_transpose(dx, (int)note);
-    hz = note_hz_x100(play);
+    hz = ag_dsp_note_hz_x100(play);
 
     for (i = 0; i < AG_DX7_VOICES; i++) {
         if (dx->voice[i].active && dx->voice[i].gate) {
@@ -956,7 +795,7 @@ void ag_dx7_note_on(ag_dx7_t *dx, uint8_t note, uint8_t vel)
 void ag_dx7_note_off(ag_dx7_t *dx, uint8_t note)
 {
     int i;
-    uint8_t n = (uint8_t)clampi((int)note, 0, 127);
+    uint8_t n = (uint8_t)ag_clampi((int)note, 0, 127);
 
     for (i = 0; i < AG_DX7_VOICES; i++) {
         ag_dx7_voice_t *v = &dx->voice[i];
@@ -1005,7 +844,7 @@ void ag_dx7_unpack_packed(const uint8_t packed[AG_DX7_PACKED_VOICE],
     if (!packed || !unpack) {
         return;
     }
-    mem_zero(unpack, AG_DX7_SYX_VOICE);
+    ag_dsp_zero(unpack, AG_DX7_SYX_VOICE);
     /* Packed layout: OP6..OP1 × 17 bytes (Dexed Cartridge::unpackProgram). */
     for (op = 0; op < AG_DX7_OPS; op++) {
         const uint8_t *b = packed + op * 17;
@@ -1069,7 +908,7 @@ int ag_dx7_patch_from_sysex(ag_dx7_patch_t *out, const uint8_t *data)
     if (!out || !data) {
         return -1;
     }
-    mem_zero(out, sizeof(*out));
+    ag_dsp_zero(out, sizeof(*out));
     /* SysEx order OP6..OP1 → engine op[5]..op[0] */
     for (oi = 0; oi < AG_DX7_OPS; oi++) {
         ag_dx7_op_patch_t *o = &out->op[AG_DX7_OPS - 1 - oi];
@@ -1167,13 +1006,13 @@ static void pack_155_to_128(const uint8_t *src, uint8_t *bulk)
             (uint8_t)((src[up + 17] & 1u) | ((src[up + 18] & 31u) << 1));
         bulk[pp + 16] = src[up + 19];
     }
-    mem_copy(bulk + 102, src + 126, 9);
+    ag_dsp_copy(bulk + 102, src + 126, 9);
     bulk[111] = (uint8_t)((src[135] & 7u) | ((src[136] & 1u) << 3));
-    mem_copy(bulk + 112, src + 137, 4);
+    ag_dsp_copy(bulk + 112, src + 137, 4);
     bulk[116] = (uint8_t)((src[141] & 1u) | ((src[142] & 7u) << 1) |
                           ((src[143] & 7u) << 4));
     bulk[117] = src[144];
-    mem_copy(bulk + 118, src + 145, 10);
+    ag_dsp_copy(bulk + 118, src + 145, 10);
 }
 
 int ag_dx7_syx_parse_bank(const uint8_t *data, int len,
@@ -1192,7 +1031,7 @@ int ag_dx7_syx_parse_bank(const uint8_t *data, int len,
             const uint8_t *body = data + i + 6;
             int v;
             for (v = 0; v < AG_DX7_BANK_VOICES && n < max_voices; v++) {
-                mem_copy(packed[n], body + v * 128, 128);
+                ag_dsp_copy(packed[n], body + v * 128, 128);
                 n++;
             }
             return n;
@@ -1204,7 +1043,7 @@ int ag_dx7_syx_parse_bank(const uint8_t *data, int len,
         if (data[i] == 0xf0u && data[i + 1] == 0x43u &&
             (data[i + 3] == 0x00u) && i + 6 + 155 <= len) {
             uint8_t u[AG_DX7_SYX_VOICE];
-            mem_copy(u, data + i + 6, AG_DX7_SYX_VOICE);
+            ag_dsp_copy(u, data + i + 6, AG_DX7_SYX_VOICE);
             pack_155_to_128(u, packed[0]);
             return 1;
         }
@@ -1214,7 +1053,7 @@ int ag_dx7_syx_parse_bank(const uint8_t *data, int len,
     if (len >= 4096) {
         int v;
         for (v = 0; v < AG_DX7_BANK_VOICES && n < max_voices; v++) {
-            mem_copy(packed[n], data + v * 128, 128);
+            ag_dsp_copy(packed[n], data + v * 128, 128);
             n++;
         }
         return n;
@@ -1228,7 +1067,7 @@ int ag_dx7_syx_parse_bank(const uint8_t *data, int len,
 
     /* Raw single packed voice */
     if (len >= AG_DX7_PACKED_VOICE) {
-        mem_copy(packed[0], data, AG_DX7_PACKED_VOICE);
+        ag_dsp_copy(packed[0], data, AG_DX7_PACKED_VOICE);
         return 1;
     }
     return -1;
@@ -1288,7 +1127,7 @@ void ag_dx7_render(ag_dx7_t *dx, int16_t *pcm, int32_t frames)
 static void op_init(ag_dx7_op_patch_t *o, uint8_t lvl, uint8_t coarse,
                     uint8_t fine)
 {
-    mem_zero(o, sizeof(*o));
+    ag_dsp_zero(o, sizeof(*o));
     o->rate[0] = 80;
     o->rate[1] = 40;
     o->rate[2] = 30;
@@ -1316,7 +1155,7 @@ static ag_dx7_patch_t make_init(void)
 {
     ag_dx7_patch_t p;
     int i;
-    mem_zero(&p, sizeof(p));
+    ag_dsp_zero(&p, sizeof(p));
     for (i = 0; i < AG_DX7_OPS; i++) {
         op_init(&p.op[i], 0, 1, 0);
     }

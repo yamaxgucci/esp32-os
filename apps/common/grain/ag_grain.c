@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 #include "ag_grain.h"
+#include "ag_dsp.h"
 
 #define WIN_BITS 8
 #define WIN_LEN  (1 << WIN_BITS)
@@ -11,24 +12,6 @@ static uint8_t s_hann[WIN_LEN];
 static uint8_t s_tri[WIN_LEN];
 static int     s_win_ready;
 
-static void mem_zero(void *p, unsigned n)
-{
-    unsigned char *d = (unsigned char *)p;
-    while (n--) {
-        *d++ = 0;
-    }
-}
-
-static int clampi(int v, int lo, int hi)
-{
-    if (v < lo) {
-        return lo;
-    }
-    if (v > hi) {
-        return hi;
-    }
-    return v;
-}
 
 static void ensure_win(void)
 {
@@ -69,42 +52,14 @@ static void ensure_win(void)
 
 static uint32_t rng_next(ag_grain_t *g)
 {
-    uint32_t x = g->rng;
-    x ^= x << 13;
-    x ^= x >> 17;
-    x ^= x << 5;
-    if (x == 0u) {
-        x = 0xA5A5A5A5u;
-    }
-    g->rng = x;
-    return x;
-}
-
-static int32_t midi_hz_x100(int note)
-{
-    /* A4=440Hz note 69; small LUT around C3..C6 via power-of-two approx. */
-    static const int32_t k_cents[12] = {
-        10000, 10595, 11225, 11892, 12599, 13348,
-        14142, 14983, 15874, 16818, 17818, 18877
-    };
-    int n = clampi(note, 0, 127);
-    int oct = (n / 12) - 5; /* relative to C4=60 → oct 0 at C4… use C5=72 */
-    int pc = n % 12;
-    /* Base: C5 = 523.25 Hz → use C4 = 261.63 ≈ 26163 */
-    int32_t hz = (26163 * k_cents[pc]) / 10000;
-    if (oct > 0) {
-        hz <<= oct;
-    } else if (oct < 0) {
-        hz >>= -oct;
-    }
-    return hz; /* already x100 */
+    return ag_dsp_rng(&g->rng);
 }
 
 /* Q16 step: (buf_rate / out_rate) * (hz(note+semis) / hz(C4)). */
 static uint32_t pitch_step(ag_grain_t *g, int note, int semis, int cents_spr)
 {
-    int32_t note_hz = midi_hz_x100(note + semis);
-    int32_t ref_hz = midi_hz_x100(60); /* C4 */
+    int32_t note_hz = ag_dsp_note_hz_x100(note + semis);
+    int32_t ref_hz = ag_dsp_note_hz_x100(60); /* C4 */
     uint32_t br = g->buf.rate ? g->buf.rate : g->rate;
     int64_t s;
 
@@ -257,7 +212,7 @@ static void spawn_grain(ag_grain_t *g, int vi)
         int32_t d =
             (int32_t)(rng_next(g) % (uint32_t)(g->params.pan_spr * 2u + 1u)) -
             (int32_t)g->params.pan_spr;
-        pan = (uint8_t)clampi(64 + d, 0, 128);
+        pan = (uint8_t)ag_clampi(64 + d, 0, 128);
     }
     gr->pan_l = (uint8_t)(128u - pan);
     gr->pan_r = pan;
@@ -278,53 +233,20 @@ static void spawn_grain(ag_grain_t *g, int vi)
 
 static void eg_tick(ag_grain_t *g, ag_grain_voice_t *v)
 {
-    int32_t target;
-    int32_t rate;
-    switch (v->eg_stage) {
-    case 0: /* attack */
-        rate = 1 + ((int32_t)(128 - g->params.attack) * 8);
-        v->eg += rate;
-        if (v->eg >= 256) {
-            v->eg = 256;
-            v->eg_stage = 1;
-        }
-        break;
-    case 1: /* decay → sustain */
-        target = ((int32_t)g->params.sustain * 256) / 127;
-        rate = 1 + ((int32_t)(128 - g->params.decay) * 4);
-        if (v->eg > target) {
-            v->eg -= rate;
-            if (v->eg <= target) {
-                v->eg = target;
-                v->eg_stage = 2;
-            }
-        } else {
-            v->eg_stage = 2;
-        }
-        break;
-    case 2: /* sustain */
-        if (!v->gate) {
-            v->eg_stage = 3;
-        }
-        break;
-    case 3: /* release */
-        rate = 1 + ((int32_t)(128 - g->params.release) * 4);
-        v->eg -= rate;
-        if (v->eg <= 0) {
-            v->eg = 0;
-            v->eg_stage = 4;
-            v->active = 0;
-        }
-        break;
-    default:
+    ag_dsp_adsr_t e;
+    e.stage = v->eg_stage;
+    e.level = v->eg;
+    if (!ag_dsp_adsr_tick(&e, g->params.attack, g->params.decay,
+                          g->params.sustain, g->params.release, v->gate)) {
         v->active = 0;
-        break;
     }
+    v->eg_stage = e.stage;
+    v->eg = e.level;
 }
 
 void ag_grain_init(ag_grain_t *g, uint32_t out_rate)
 {
-    mem_zero(g, sizeof(*g));
+    ag_dsp_zero(g, sizeof(*g));
     g->rate = out_rate ? out_rate : 22050u;
     g->rng = 0xC0FFEEu ^ out_rate;
     ensure_win();
@@ -336,7 +258,7 @@ void ag_grain_reset(ag_grain_t *g)
     uint32_t rate = g->rate;
     ag_grain_buf_t buf = g->buf;
     ag_grain_params_t p = g->params;
-    mem_zero(g, sizeof(*g));
+    ag_dsp_zero(g, sizeof(*g));
     g->rate = rate;
     g->buf = buf;
     g->params = p;
@@ -364,7 +286,7 @@ void ag_grain_set_defaults(ag_grain_t *g)
 void ag_grain_buf_clear(ag_grain_t *g)
 {
     /* Caller frees owned sample memory; engine only drops the view. */
-    mem_zero(&g->buf, sizeof(g->buf));
+    ag_dsp_zero(&g->buf, sizeof(g->buf));
 }
 
 int ag_grain_buf_set(ag_grain_t *g, int16_t *data, uint32_t frames,

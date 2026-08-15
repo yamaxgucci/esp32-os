@@ -9,11 +9,13 @@ Engine: [`apps/common/ir`](../common/ir). WAV: [`apps/common/wav`](../common/wav
 
 ```
 python tools/mkaxe.py --arch xtensa --gcc xtensa-esp32s3-elf-gcc `
-  --include sdk/include --include apps/common --include apps/common/ir `
+  --include sdk/include --include apps/common --include apps/common/dsp `
+  --include apps/common/pcm --include apps/common/ir `
   --include apps/common/wav --include apps/common/libc `
   --cflags "-Os -ffunction-sections -fdata-sections -fno-builtin" `
   -o build/apps/IRFX.AXE `
-  apps/irfx/irfx.c apps/common/ir/ag_ir.c apps/common/ir/ag_fft.c `
+  apps/irfx/irfx.c apps/common/dsp/ag_dsp.c apps/common/pcm/ag_pcm.c `
+  apps/common/ir/ag_ir.c apps/common/ir/ag_fft.c `
   apps/common/wav/ag_wav.c apps/common/libc/libc_shim.c
 ```
 
