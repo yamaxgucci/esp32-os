@@ -17,6 +17,7 @@
 #include "ag_fm.h"
 #include "ag_grain.h"
 #include "ag_ir.h"
+#include "ag_smp.h"
 #include "ag_synth.h"
 
 #define RATE 22050u
@@ -320,6 +321,53 @@ static void render_ir_hall(const char *path)
     free(pcm);
 }
 
+static void render_smp(const char *path, int preset, uint8_t note)
+{
+    ag_smp_t     s;
+    ag_smp_zone_t z;
+    uint32_t     n = ag_smp_preset_frames(preset, RATE);
+    int16_t     *rom = (int16_t *)calloc(n, sizeof(int16_t));
+    uint32_t     hold = RATE;
+    uint32_t     tail = RATE / 2u;
+    uint32_t     frames = hold + tail;
+    int16_t     *pcm = alloc_pcm(frames);
+    uint32_t     i;
+
+    if (rom == NULL || pcm == NULL) {
+        free(rom);
+        free(pcm);
+        return;
+    }
+    if (ag_smp_fill_preset(preset, rom, n, RATE, &z) != 0) {
+        free(rom);
+        free(pcm);
+        return;
+    }
+    ag_smp_init(&s, RATE);
+    ag_smp_set_zone(&s, &z);
+    if (preset == AG_SMP_ORGAN) {
+        ag_smp_set_adsr(&s, 8, 20, 120, 30);
+    } else if (preset == AG_SMP_BASS) {
+        ag_smp_set_adsr(&s, 2, 50, 40, 40);
+    } else {
+        ag_smp_set_adsr(&s, 2, 70, 20, 50);
+    }
+    ag_smp_note_on(&s, note, 110);
+    for (i = 0; i < frames; i += 256u) {
+        uint32_t nfr = 256u;
+        if (i + nfr > frames) {
+            nfr = frames - i;
+        }
+        if (i == hold) {
+            ag_smp_note_off(&s, note);
+        }
+        ag_smp_render(&s, pcm + (int32_t)i * 2, (int32_t)nfr);
+    }
+    write_wav(path, pcm, frames);
+    free(pcm);
+    free(rom);
+}
+
 int main(int argc, char **argv)
 {
     const char *dir = "build/listen";
@@ -347,5 +395,11 @@ int main(int argc, char **argv)
     render_tube_cab(path);
     snprintf(path, sizeof(path), "%s/ir_hall.wav", dir);
     render_ir_hall(path);
+    snprintf(path, sizeof(path), "%s/smp_organ.wav", dir);
+    render_smp(path, AG_SMP_ORGAN, 60);
+    snprintf(path, sizeof(path), "%s/smp_piano.wav", dir);
+    render_smp(path, AG_SMP_PIANO, 64);
+    snprintf(path, sizeof(path), "%s/smp_bass.wav", dir);
+    render_smp(path, AG_SMP_BASS, 40);
     return 0;
 }
