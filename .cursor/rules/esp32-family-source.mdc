@@ -1,0 +1,22 @@
+---
+description: One source tree for the ESP32 family — rebuild per target, do not harden S3-only assumptions
+alwaysApply: true
+---
+
+# ESP32 family: source-level portability
+
+Product target today is **ESP32-S3**. The kernel, apps, and Argon CC stay **one tree** for the whole Espressif family. A different chip is a rebuild (`idf.py set-target`, `mkaxe.py --arch xtensa|riscv32`), not a fork and not one binary. Pico / Pi / Luckfox / x86 are out of scope.
+
+Do not start a multi-target port unless asked. When a change already touches the kernel, ABI, CC, or app build, do not make the S3/Xtensa knot worse.
+
+- Branch on **capability** (`SOC_*`, `ag_platform()`, `full`/`lite`/`nano`, core count, executable PSRAM, USB host) — not on `CONFIG_IDF_TARGET_ESP32S3` or chip names in app logic.
+- New `<xtensa/...>` or a hard `xtensa` CMake require: wrap with `#ifdef __XTENSA__` (RISC-V C3/C6/P4 must still be thinkable).
+- A feature missing on part of the family compiles out or degrades; it must not break the build.
+- Same app `.c` for every target; ISA is the toolchain. An `.AXE` is native — rebuild it, do not expect Xtensa images on RISC-V.
+- Argon CC: one frontend; Xtensa vs RISC-V are backends.
+- `BOARD.CFG` selects a board for **one** SoC. It is not a chip switch.
+
+```c
+/* bad */  #if CONFIG_IDF_TARGET_ESP32S3
+/* good */ if (ag_platform()->psram_executable)
+```
