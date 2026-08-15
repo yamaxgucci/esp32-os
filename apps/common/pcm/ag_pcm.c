@@ -253,6 +253,10 @@ void ag_pcm_pace_wait(ag_pcm_t *o)
     if (o == 0) {
         return;
     }
+    /* File capture: write as fast as the renderer can; no wall-clock sleep. */
+    if (o->sink == AG_PCM_SINK_WAV) {
+        return;
+    }
     now = ag_micros();
     if (now <= o->next_due) {
         for (;;) {

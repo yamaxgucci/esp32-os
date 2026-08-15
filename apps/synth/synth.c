@@ -16,12 +16,13 @@
 AG_APP_SIZED("SYNTH", "0.1", "argon", AG_AXE_NEEDS_AUDIO, 10 * 1024, 512 * 1024);
 
 #define RATE  22050u
-#define CHUNK 441
+#define CHUNK AG_IR_BLOCK
 
 static ag_synth_t s_s;
 static ag_pcm_t   s_out;
 static ag_fx_t    s_fx;
 static ag_ir_t    s_ir;
+static ag_handle_t s_midi_fd = -1;
 static int        s_fx_ok;
 static int        s_ir_ok;
 static int        s_fx_on;
@@ -30,9 +31,9 @@ static int        s_cab = 3;
 static int16_t    s_pcm[CHUNK * 2];
 static int16_t    s_ir_mono[AG_IR_BLOCK];
 static int16_t    s_ir_st[AG_IR_BLOCK * 2];
-static uint32_t   s_ir_fill;
 static uint8_t    s_held[128];
 static int        s_running = 1;
+static uint32_t   s_wav_until;
 static int        s_dirty = 1;
 static uint32_t   s_ui_ms;
 
@@ -59,45 +60,56 @@ static int piano_note(int key)
     return -1;
 }
 
-static void ir_flush_block(void)
-{
-    uint32_t i;
-    if (!s_ir_ok) {
-        return;
-    }
-    ag_ir_process_block(&s_ir, s_ir_mono, s_ir_st);
-    /* last block is applied in-place on next write via copy-back */
-    (void)i;
-}
-
 static void apply_ir(int16_t *stereo, int32_t frames)
 {
     int32_t i;
-    if (!s_ir_ok || !s_ir_on) {
+    if (!s_ir_ok || !s_ir_on || frames != (int32_t)AG_IR_BLOCK) {
         return;
     }
     for (i = 0; i < frames; i++) {
         int32_t m = ((int32_t)stereo[i * 2] + (int32_t)stereo[i * 2 + 1]) >> 1;
-        s_ir_mono[s_ir_fill++] = (int16_t)m;
-        if (s_ir_fill >= AG_IR_BLOCK) {
-            uint32_t k;
-            ag_ir_process_block(&s_ir, s_ir_mono, s_ir_st);
-            /* overwrite this frame's already-written samples is awkward;
-             * mix the finished block into a 1-block delay (acceptable). */
-            for (k = 0; k < AG_IR_BLOCK && (i + 1) > (int32_t)k; k++) {
-                /* apply to current chunk tail when possible */
-            }
-            s_ir_fill = 0;
-            /* store wet over the just-filled region by delaying one block:
-             * replace upcoming samples — for demo, write wet into stereo now
-             * for the previous 256 frames ending at i. */
-            if (i + 1 >= (int32_t)AG_IR_BLOCK) {
-                int32_t base = i + 1 - (int32_t)AG_IR_BLOCK;
-                for (k = 0; k < AG_IR_BLOCK; k++) {
-                    stereo[(base + (int32_t)k) * 2] = s_ir_st[k * 2];
-                    stereo[(base + (int32_t)k) * 2 + 1] = s_ir_st[k * 2 + 1];
-                }
-            }
+        s_ir_mono[i] = (int16_t)m;
+    }
+    ag_ir_process_block(&s_ir, s_ir_mono, s_ir_st);
+    for (i = 0; i < frames; i++) {
+        stereo[i * 2] = s_ir_st[i * 2];
+        stereo[i * 2 + 1] = s_ir_st[i * 2 + 1];
+    }
+}
+
+static void open_midivirt(void)
+{
+    s_midi_fd = ag_dev_open("/dev/midivirt");
+    if (s_midi_fd >= 0) {
+        ag_printf("synth: MIDI-in = /dev/midivirt\n");
+    }
+}
+
+static void pump_midivirt(void)
+{
+    uint8_t buf[64];
+    int32_t n, i;
+    if (s_midi_fd < 0) {
+        return;
+    }
+    n = ag_dev_read(s_midi_fd, buf, sizeof(buf));
+    if (n <= 0) {
+        return;
+    }
+    for (i = 0; i + 3 < n; i += 4) {
+        uint8_t st = buf[i];
+        uint8_t d1 = buf[i + 1];
+        uint8_t d2 = buf[i + 2];
+        uint8_t hi = (uint8_t)(st & 0xf0u);
+        if (hi == 0x90u && d2 > 0u) {
+            s_held[d1 & 127u] = 1;
+            ag_synth_note_on(&s_s, d1, d2);
+        } else if (hi == 0x80u || (hi == 0x90u && d2 == 0u)) {
+            s_held[d1 & 127u] = 0;
+            ag_synth_note_off(&s_s, d1);
+        } else if (hi == 0xb0u && d1 == 123u) {
+            ag_synth_all_notes_off(&s_s);
+            memset(s_held, 0, sizeof(s_held));
         }
     }
 }
@@ -238,6 +250,22 @@ int ag_main(int argc, char **argv)
     }
     ag_pcm_set_chunk(&s_out, CHUNK);
     ag_printf("synth: sound = %s @ %u Hz\n", s_out.path, (unsigned)RATE);
+    {
+        const char *p = s_out.path;
+        int n = 0;
+        while (p[n]) {
+            n++;
+        }
+        if (n > 4 && (p[n - 1] == 'v' || p[n - 1] == 'V')) {
+            s_wav_until = ag_millis() + 4500u;
+            ag_synth_set(&s_s, AG_SYNTH_P_DRIVE, 56);
+            ag_synth_set(&s_s, AG_SYNTH_P_DIST_MODEL, AG_DIST_TUBE);
+            s_ir_on = 1;
+            ag_synth_note_on(&s_s, 64, 110);
+        } else {
+            open_midivirt();
+        }
+    }
 
     if (ag_fx_init(&s_fx, RATE) == 0) {
         s_fx_ok = 1;
@@ -256,10 +284,15 @@ int ag_main(int argc, char **argv)
 
     while (s_running) {
         ag_time_t t0;
+        if (s_wav_until != 0u && (int32_t)(ag_millis() - s_wav_until) >= 0) {
+            break;
+        }
         while (ag_poll_event(&ev, 0)) {
             if (ev.type == AG_EV_QUIT) {
-                s_running = 0;
-                break;
+                if (s_wav_until == 0u) {
+                    s_running = 0;
+                    break;
+                }
             }
             if (ev.type == AG_EV_KEY_DOWN || ev.type == AG_EV_KEY_UP) {
                 handle_key((int)ev.key.keycode, ev.type == AG_EV_KEY_DOWN,
@@ -270,6 +303,7 @@ int ag_main(int argc, char **argv)
             break;
         }
 
+        pump_midivirt();
         t0 = ag_micros();
         ag_synth_render(&s_s, s_pcm, (int32_t)CHUNK);
         if (s_fx_ok && s_fx_on) {
@@ -297,9 +331,12 @@ int ag_main(int argc, char **argv)
     if (s_ir_ok) {
         ag_ir_free(&s_ir);
     }
+    if (s_midi_fd >= 0) {
+        (void)ag_dev_close(s_midi_fd);
+        s_midi_fd = -1;
+    }
     ag_pcm_close(&s_out);
     ag_cursor(true);
     ag_cls();
-    (void)ir_flush_block;
     return 0;
 }

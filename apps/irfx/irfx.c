@@ -50,6 +50,7 @@ static char         s_audio_arg[AG_PATH_MAX];
 static int  s_src = SRC_CLICK;
 static int  s_preset = 1;
 static int  s_running = 1;
+static uint32_t s_wav_until;
 static int  s_dirty = 1;
 static int  s_auto_click = 1;
 static uint32_t s_click_period = RATE * 3u / 2u; /* 1.5 s */
@@ -299,6 +300,16 @@ static int open_sink(void)
     }
     ag_pcm_set_chunk(&s_out, CHUNK);
     ag_printf("irfx: sound = %s @ %u Hz\n", s_out.path, (unsigned)RATE);
+    {
+        const char *p = s_out.path;
+        int n = 0;
+        while (p[n]) {
+            n++;
+        }
+        if (n > 4 && (p[n - 1] == 'v' || p[n - 1] == 'V')) {
+            s_wav_until = ag_millis() + 4500u;
+        }
+    }
     return 0;
 }
 
@@ -485,7 +496,13 @@ static int parse_args(int argc, char **argv)
             }
         }
         if (ends_with_ci(a, ".wav")) {
-            /* First wav = IR, second = dry (or IR if path has "ir") */
+            ag_handle_t fd = ag_open(a, AG_O_RDONLY);
+            if (fd < 0) {
+                ag_audio_out_copy(s_audio_arg, sizeof(s_audio_arg), a);
+                continue;
+            }
+            (void)ag_close(fd);
+            /* First existing wav = IR, second = dry */
             if (s_ir_path[0] == '\0') {
                 size_t n = 0;
                 while (a[n] && n + 1u < sizeof(s_ir_path)) {
@@ -551,11 +568,16 @@ int ag_main(int argc, char **argv)
     ag_pcm_pace_start(&s_out);
     while (s_running) {
         ag_time_t loop0 = ag_micros();
+        if (s_wav_until != 0u && (int32_t)(ag_millis() - s_wav_until) >= 0) {
+            break;
+        }
 
         while (ag_poll_event(&ev, 0)) {
             if (ev.type == AG_EV_QUIT) {
-                s_running = 0;
-                break;
+                if (s_wav_until == 0u) {
+                    s_running = 0;
+                    break;
+                }
             }
             if (ev.type == AG_EV_KEY_DOWN) {
                 handle_key((int)ev.key.keycode, ev.key.unicode);

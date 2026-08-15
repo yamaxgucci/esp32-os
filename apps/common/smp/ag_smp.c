@@ -15,7 +15,7 @@ void ag_smp_init(ag_smp_t *s, uint32_t out_rate)
     s->decay = 40;
     s->sustain = 100;
     s->release = 36;
-    s->level = 110;
+    s->level = 127;
     s->zone.root = 60;
 }
 
@@ -51,18 +51,41 @@ uint32_t ag_smp_preset_frames(int preset, uint32_t rate)
         rate = 22050u;
     }
     if (preset == AG_SMP_ORGAN) {
-        return 2048u;
+        uint32_t c4 = rate / 262u;
+        if (c4 < 8u) {
+            c4 = 8u;
+        }
+        return c4 * 8u;
     }
     if (preset == AG_SMP_BASS) {
-        return (rate * 3u) / 4u;
+        return rate; /* 1 s */
     }
     return (rate * 5u) / 4u; /* piano */
 }
 
 static int32_t harm(uint32_t i, uint32_t period, int32_t amp)
 {
-    uint32_t ph = (i * 65536u) / (period ? period : 1u);
-    return ((int32_t)ag_dsp_sin(ph << 16) * amp) >> 15;
+    uint32_t ph;
+    if (period < 2u) {
+        period = 2u;
+    }
+    ph = (uint32_t)(((uint64_t)i << 32) / (uint64_t)period);
+    return ((int32_t)ag_dsp_sin(ph) * amp) >> 15;
+}
+
+static void normalize(int16_t *dst, uint32_t n, int32_t peak)
+{
+    uint32_t i;
+    int32_t  m = 1;
+    for (i = 0; i < n; i++) {
+        int32_t a = dst[i] < 0 ? -(int32_t)dst[i] : (int32_t)dst[i];
+        if (a > m) {
+            m = a;
+        }
+    }
+    for (i = 0; i < n; i++) {
+        dst[i] = (int16_t)(((int32_t)dst[i] * peak) / m);
+    }
 }
 
 int ag_smp_fill_preset(int preset, int16_t *dst, uint32_t cap, uint32_t rate,
@@ -70,9 +93,13 @@ int ag_smp_fill_preset(int preset, int16_t *dst, uint32_t cap, uint32_t rate,
 {
     uint32_t n = ag_smp_preset_frames(preset, rate);
     uint32_t i;
+    uint32_t c4 = rate / 262u; /* ~C4 cycle */
 
     if (dst == 0 || cap < n || rate < 1u) {
         return -1;
+    }
+    if (c4 < 8u) {
+        c4 = 8u;
     }
     if (preset < 0 || preset >= AG_SMP_NPRESETS) {
         preset = AG_SMP_ORGAN;
@@ -80,28 +107,43 @@ int ag_smp_fill_preset(int preset, int16_t *dst, uint32_t cap, uint32_t rate,
     for (i = 0; i < n; i++) {
         int32_t acc = 0;
         if (preset == AG_SMP_ORGAN) {
-            /* Looped drawbar-ish: 1 + 2 + 3 + 4 + 6 */
-            acc = harm(i, n, 18000) + harm(i, n / 2u, 9000) +
-                  harm(i, n / 3u, 5000) + harm(i, n / 4u, 3500) +
-                  harm(i, n / 6u, 2500);
+            acc = harm(i, c4, 14000) + harm(i, c4 / 2u, 9000) +
+                  harm(i, c4 / 3u, 6000) + harm(i, c4 / 4u, 4500) +
+                  harm(i, c4 / 6u, 3000) + harm(i, c4 / 8u, 2000);
         } else if (preset == AG_SMP_BASS) {
-            uint32_t per = rate / 82u; /* ~E2 */
-            int32_t env = (int32_t)((n - i) * 28000u / n);
-            acc = harm(i, per, env) + harm(i, per / 2u, env / 3);
+            uint32_t per = rate / 131u; /* C3, laptop-audible */
+            int32_t  env = (int32_t)((n - i) * 20000u / n);
+            int32_t  click = 0;
+            if (i < 80u) {
+                click = (int32_t)(((80u - i) * 8000u) / 80u);
+                if ((i & 1u) != 0u) {
+                    click = -click;
+                }
+            }
+            acc = harm(i, per, env) + harm(i, per / 2u, env / 2) +
+                  harm(i, per / 3u, env / 3) + harm(i, per / 4u, env / 4) +
+                  click;
         } else {
-            uint32_t per = rate / 261u; /* ~C4 */
-            int32_t env = (int32_t)((n - i) * (n - i) / n);
-            env = (env * 24000) / (int32_t)n;
-            acc = harm(i, per, env) + harm(i, (per * 2u) / 3u, env / 4) +
-                  harm(i, per / 2u, env / 5);
+            int32_t env = (int32_t)((n - i) * 26000u / n);
+            if (i < n / 8u) {
+                env = 26000;
+            }
+            acc = harm(i, c4, env) + harm(i, c4 / 2u, env / 2) +
+                  harm(i, c4 / 3u, env / 3) + harm(i, c4 / 4u, env / 4) +
+                  harm(i, c4 / 5u, env / 6);
+            if (i < 120u) {
+                int32_t hammer = (int32_t)(((120u - i) * 12000u) / 120u);
+                acc += ((int32_t)ag_dsp_sin((i * 19u) << 24) * hammer) >> 15;
+            }
         }
         dst[i] = ag_sat16(acc);
     }
+    normalize(dst, n, 24000);
     if (out != 0) {
         out->data = dst;
         out->frames = n;
         out->rate = rate;
-        out->root = (preset == AG_SMP_BASS) ? 40u : 60u;
+        out->root = (preset == AG_SMP_BASS) ? 48u : 60u;
         if (preset == AG_SMP_ORGAN) {
             out->loop_start = 0;
             out->loop_end = n;

@@ -87,6 +87,7 @@ static char     s_audio_arg[AG_PATH_MAX];
 static int      s_send_err_reported;
 static uint32_t s_loop_us;
 static uint32_t s_ui_ms;
+static uint32_t s_wav_until;
 
 typedef struct {
     int key;
@@ -492,6 +493,10 @@ static int parse_sink_arg(const char *arg)
         ag_audio_out_copy(s_audio_arg, sizeof(s_audio_arg), arg);
         return 0;
     }
+    if (ends_with_ci(arg, ".wav")) {
+        ag_audio_out_copy(s_audio_arg, sizeof(s_audio_arg), arg);
+        return 0;
+    }
     if (ends_with_syx(arg)) {
         path_copy(s_bank_path, arg, SYX_PATH_LEN);
         return 0;
@@ -745,6 +750,16 @@ static int open_sink(void)
     }
     ag_pcm_set_chunk(&s_out, CHUNK);
     ag_printf("dx7: sound = %s @ %u Hz\n", s_out.path, (unsigned)RATE);
+    {
+        const char *p = s_out.path;
+        int n = 0;
+        while (p[n]) {
+            n++;
+        }
+        if (n > 4 && (p[n - 1] == 'v' || p[n - 1] == 'V')) {
+            s_wav_until = ag_millis() + 4500u;
+        }
+    }
     return 0;
 }
 
@@ -1393,34 +1408,54 @@ int ag_main(int argc, char **argv)
 
     ag_dx7_init(&s_dx, RATE);
     ag_mid_init(&s_mid);
-    open_midivirt();
+    if (s_wav_until == 0u) {
+        open_midivirt();
+        console_enable_key_events();
+    }
     if (s_fx_want != FX_OFF) {
         (void)fx_set_mode(s_fx_want);
     }
-    console_enable_key_events();
     load_preset(0);
     if (s_bank_path[0] != '\0') {
         if (load_syx_file(s_bank_path) != 0) {
             ag_printf("dx7: continuing with builtin presets\n");
         }
     } else {
-        scan_syx_dir("h:");
-        scan_syx_dir("h:\\dx7");
-        if (s_syx_n > 0) {
-            s_syx_i = 0;
-            (void)load_syx_file(s_syx_list[0]);
+        const char *p = s_out.path;
+        int n = 0;
+        while (p[n]) {
+            n++;
+        }
+        if (!(n > 4 && (p[n - 1] == 'v' || p[n - 1] == 'V'))) {
+            scan_syx_dir("h:");
+            scan_syx_dir("h:\\dx7");
+            if (s_syx_n > 0) {
+                s_syx_i = 0;
+                (void)load_syx_file(s_syx_list[0]);
+            }
         }
     }
     load_mid_if_requested();
-    draw_ui();
+    if (s_wav_until != 0u) {
+        s_wav_until = ag_millis() + 4500u;
+        voice_note_on(64, 110);
+    } else {
+        draw_ui();
+    }
     s_ui_ms = ag_millis();
     ag_pcm_pace_start(&s_out);
 
     for (;;) {
         ag_time_t loop0 = ag_micros();
+        if (s_wav_until != 0u && (int32_t)(ag_millis() - s_wav_until) >= 0) {
+            goto done;
+        }
 
         while (ag_poll_event(&ev, 0)) {
             if (ev.type == AG_EV_QUIT) {
+                if (s_wav_until != 0u) {
+                    continue;
+                }
                 if (ag_focused()) {
                     goto done;
                 }
