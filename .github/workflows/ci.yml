@@ -1,4 +1,4 @@
-# Local equivalent: argon check (host tests + idf.py build).
+# Local equivalent: argon check (host tests + idf.py build + argon apps).
 name: CI
 
 on:
@@ -41,3 +41,19 @@ jobs:
           esp_idf_version: v5.5.5
           target: esp32s3
           command: idf.py build
+
+  apps:
+    # Applications link separately from the firmware, so a green firmware
+    # build says nothing about them.  Without this, a change under
+    # apps/common could break every .AXE in the tree unnoticed.
+    name: Applications (.AXE / .SYS)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build every image in tools/apps.json
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v5.5.5
+          target: esp32s3
+          command: python tools/build_apps.py --warnings

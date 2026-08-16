@@ -1,10 +1,8 @@
 /*
- * Host smoke: render ag_synth to a WAV (no Argon runtime).
- *   gcc -O2 -o build/synth_smoke tools/synth_smoke.c \
- *       apps/common/dsp/ag_dsp.c apps/common/synth/ag_osc.c \
- *       apps/common/synth/ag_filt.c apps/common/synth/ag_dist.c \
- *       apps/common/synth/ag_fmx.c apps/common/synth/ag_synth.c \
- *       -I apps/common/dsp -I apps/common/synth
+ * Host smoke: render ag_synth to build/synth_smoke.wav (no Argon runtime).
+ *
+ * Built by host-tests/CMakeLists.txt, so `argon tests` produces
+ * build-host/synth_smoke(.exe).  Assertions live in host-tests/test_dsp.c.
  */
 #include <stdint.h>
 #include <stdio.h>

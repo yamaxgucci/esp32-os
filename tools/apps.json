@@ -1,0 +1,124 @@
+{
+  "_comment": [
+    "Every .AXE / .SYS image in the tree and how to build it.",
+    "",
+    "This file exists because the build commands used to live only in the",
+    "app READMEs, one hand-written mkaxe line each: nothing compiled them, so",
+    "a change under apps/common could break half a dozen applications and",
+    "`argon check` would still pass.  `argon apps` builds this list; CI runs",
+    "the `core` group on every push.",
+    "",
+    "group: 'core' is built by default and by CI.  'big' is the vendored",
+    "emulators and LVGL - minutes to compile - and needs `argon apps -All`.",
+    "",
+    "Defaults applied to every entry: --arch xtensa, --gcc",
+    "xtensa-esp32s3-elf-gcc, --include sdk/include, and the cflags below",
+    "unless the entry overrides them."
+  ],
+  "defaults": {
+    "arch": "xtensa",
+    "gcc": "xtensa-esp32s3-elf-gcc",
+    "include": ["sdk/include"],
+    "cflags": "-Os -ffunction-sections -fdata-sections"
+  },
+  "apps": [
+    { "out": "HELLO.AXE", "group": "core", "src": ["apps/hello/hello.c"] },
+    { "out": "DISK.AXE", "group": "core", "src": ["apps/disk/disk.c"] },
+    { "out": "DEVS.AXE", "group": "core", "src": ["apps/devs/devs.c"] },
+    { "out": "SPIN.AXE", "group": "core", "src": ["apps/spin/spin.c"] },
+    { "out": "LEAK.AXE", "group": "core", "src": ["apps/leak/leak.c"] },
+    { "out": "THREADS.AXE", "group": "core", "src": ["apps/threads/threads.c"] },
+    { "out": "CRASH.AXE", "group": "core", "src": ["apps/crash/crash.c"] },
+    { "out": "EDIT.AXE", "group": "core", "src": ["apps/edit/edit.c"] },
+    { "out": "GFXDEMO.AXE", "group": "core", "src": ["apps/gfxdemo/gfxdemo.c"] },
+    {
+      "out": "GFXBENCH.AXE", "group": "core",
+      "_note": "native backend only; the LVGL twins are in apps/gfxbench/build.py",
+      "include": ["apps/common/libc", "apps/gfxbench"],
+      "cflags": "-Os -ffunction-sections -fdata-sections -fno-builtin -Wno-unused -Wno-sign-compare",
+      "src": ["apps/gfxbench/gfxbench.c", "apps/gfxbench/native_draw.c",
+              "apps/common/libc/libc_shim.c"]
+    },
+    { "out": "FBCON.AXE", "group": "core", "src": ["apps/fbcon/fbcon.c"] },
+    { "out": "WHOAMI.AXE", "group": "core", "src": ["apps/whoami/whoami.c"] },
+    { "out": "ZIP.AXE", "group": "core", "src": ["apps/zip/zip.c"] },
+
+    { "out": "ECHO.SYS", "group": "core", "src": ["apps/echo/echo.c"] },
+    { "out": "PCMVIRT.SYS", "group": "core", "src": ["apps/pcmvirt/pcmvirt.c"] },
+    { "out": "KBDVIRT.SYS", "group": "core", "src": ["apps/kbdvirt/kbdvirt.c"] },
+    { "out": "MOUSEVIRT.SYS", "group": "core", "src": ["apps/mousevirt/mousevirt.c"] },
+    { "out": "MIDIVIRT.SYS", "group": "core", "src": ["apps/midivirt/midivirt.c"] },
+
+    {
+      "out": "CC.AXE", "group": "core",
+      "include": ["apps/cc"],
+      "src": ["apps/cc/cc_main.c", "apps/cc/cc_compile.c"]
+    },
+    {
+      "out": "FM.AXE", "group": "core",
+      "include": ["apps/fm"],
+      "src": ["apps/fm/fm.c", "apps/fm/fmops.c", "apps/fm/fm_ui_text.c"]
+    },
+    {
+      "out": "GFXFM.AXE", "group": "core",
+      "include": ["apps/fm"],
+      "cflags": "-Os -ffunction-sections -fdata-sections -DFM_GFX_BUILD",
+      "src": ["apps/gfxfm/gfxfm_app.c", "apps/gfxfm/fm_ui_gfx.c",
+              "apps/fm/fm.c", "apps/fm/fmops.c"]
+    },
+    {
+      "out": "AMP.AXE", "group": "core",
+      "include": ["apps/common", "apps/common/mp3", "apps/common/libc",
+                  "third_party/minimp3"],
+      "cflags": "-Os -ffunction-sections -fdata-sections -fno-builtin -DMINIMP3_NO_SIMD",
+      "src": ["apps/amp/amp.c", "apps/amp/amp_cmds.c", "apps/amp/amp_ui.c",
+              "apps/amp/amp_input.c", "apps/amp/amp_skin.c", "apps/amp/amp_eq.c",
+              "apps/amp/amp_playlist.c", "apps/common/mp3/ag_mp3.c",
+              "apps/common/libc/libc_shim.c"]
+    },
+    {
+      "out": "DX7.AXE", "group": "core",
+      "include": ["apps/common", "apps/common/dsp", "apps/common/pcm",
+                  "apps/common/dx7", "apps/common/fx", "apps/common/libc"],
+      "cflags": "-Os -ffunction-sections -fdata-sections -fno-builtin",
+      "src": ["apps/dx7/dx7.c", "apps/common/dsp/ag_dsp.c",
+              "apps/common/pcm/ag_pcm.c", "apps/common/dx7/ag_dx7.c",
+              "apps/common/dx7/ag_mid.c", "apps/common/fx/ag_fx.c",
+              "apps/common/libc/libc_shim.c"]
+    },
+    {
+      "out": "GRAIN.AXE", "group": "core",
+      "include": ["apps/common", "apps/common/dsp", "apps/common/pcm",
+                  "apps/common/grain", "apps/common/wav", "apps/common/fx",
+                  "apps/common/libc"],
+      "cflags": "-Os -ffunction-sections -fdata-sections -fno-builtin",
+      "src": ["apps/grain/grain.c", "apps/common/dsp/ag_dsp.c",
+              "apps/common/pcm/ag_pcm.c", "apps/common/grain/ag_grain.c",
+              "apps/common/wav/ag_wav.c", "apps/common/fx/ag_fx.c",
+              "apps/common/libc/libc_shim.c"]
+    },
+    {
+      "out": "IRFX.AXE", "group": "core",
+      "include": ["apps/common", "apps/common/dsp", "apps/common/pcm",
+                  "apps/common/ir", "apps/common/wav", "apps/common/libc"],
+      "cflags": "-Os -ffunction-sections -fdata-sections -fno-builtin",
+      "src": ["apps/irfx/irfx.c", "apps/common/dsp/ag_dsp.c",
+              "apps/common/pcm/ag_pcm.c", "apps/common/ir/ag_ir.c",
+              "apps/common/ir/ag_fft.c", "apps/common/wav/ag_wav.c",
+              "apps/common/libc/libc_shim.c"]
+    },
+    {
+      "out": "SYNTH.AXE", "group": "core",
+      "include": ["apps/common", "apps/common/dsp", "apps/common/pcm",
+                  "apps/common/synth", "apps/common/fx", "apps/common/ir",
+                  "apps/common/libc"],
+      "cflags": "-Os -ffunction-sections -fdata-sections -fno-builtin",
+      "src": ["apps/synth/synth.c", "apps/common/dsp/ag_dsp.c",
+              "apps/common/pcm/ag_pcm.c", "apps/common/synth/ag_osc.c",
+              "apps/common/synth/ag_filt.c", "apps/common/synth/ag_dist.c",
+              "apps/common/synth/ag_fmx.c", "apps/common/synth/ag_synth.c",
+              "apps/common/fx/ag_fx.c", "apps/common/ir/ag_ir.c",
+              "apps/common/ir/ag_fft.c", "apps/common/libc/libc_shim.c"]
+    }
+  ]
+}

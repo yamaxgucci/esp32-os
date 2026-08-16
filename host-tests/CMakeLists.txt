@@ -40,11 +40,30 @@ set(ARGON_PORTABLE_SRCS
     "${ARGON_ROOT}/components/argon_kernel/src/loader/axesig.c"
     "${ARGON_ROOT}/components/argon_kernel/src/loader/probe.c")
 
+# The shared audio DSP layer is userspace, not kernel, but it is plain
+# fixed-point C with no device I/O - so it runs on the host, and it is the
+# part of the tree where a wrong constant is silent until somebody listens.
+set(ARGON_DSP_SRCS
+    "${ARGON_ROOT}/apps/common/dsp/ag_dsp.c"
+    "${ARGON_ROOT}/apps/common/synth/ag_osc.c"
+    "${ARGON_ROOT}/apps/common/synth/ag_filt.c"
+    "${ARGON_ROOT}/apps/common/synth/ag_dist.c"
+    "${ARGON_ROOT}/apps/common/synth/ag_fmx.c"
+    "${ARGON_ROOT}/apps/common/synth/ag_synth.c"
+    "${ARGON_ROOT}/apps/common/smp/ag_smp.c"
+    "${ARGON_ROOT}/apps/common/grain/ag_grain.c"
+    "${ARGON_ROOT}/apps/common/ir/ag_ir.c"
+    "${ARGON_ROOT}/apps/common/ir/ag_fft.c")
+
 set(ARGON_INCLUDES
     "${CMAKE_CURRENT_LIST_DIR}"
     "${ARGON_ROOT}/sdk/include"
     "${ARGON_ROOT}/components/argon_kernel/include"
-    "${ARGON_ROOT}/apps/cc")
+    "${ARGON_ROOT}/apps/cc"
+    "${ARGON_ROOT}/apps/common/dsp"
+    "${ARGON_ROOT}/apps/common/synth"
+    "${ARGON_ROOT}/apps/common/smp"
+    "${ARGON_ROOT}/apps/common/grain")
 
 # Predictable paths for the scripts that invoke these.
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
@@ -71,11 +90,19 @@ add_executable(argon_tests
     test_probe.c
     test_cc.c
     test_draw.c
+    test_dsp.c
     "${ARGON_ROOT}/apps/cc/cc_compile.c"
     "${ARGON_ROOT}/components/argon_kernel/src/dev/draw.c"
+    ${ARGON_DSP_SRCS}
     ${ARGON_PORTABLE_SRCS})
 
-target_include_directories(argon_tests PRIVATE ${ARGON_INCLUDES})
+# host_stub first, for the same reason as the smoke tools below: ag_ir asks
+# the kernel for memory, and there is no kernel here.
+target_include_directories(argon_tests BEFORE PRIVATE
+    "${ARGON_ROOT}/tools/host_stub")
+target_include_directories(argon_tests PRIVATE
+    ${ARGON_INCLUDES}
+    "${ARGON_ROOT}/apps/common/ir")
 if(NOT MSVC)
     target_link_libraries(argon_tests PRIVATE m)
 endif()
@@ -95,7 +122,34 @@ add_executable(vtdump
 
 target_include_directories(vtdump PRIVATE ${ARGON_INCLUDES})
 
-foreach(target argon_tests vtdump)
+# Listening files.  Not tests - ears catch things numbers do not - but they
+# are built here so the engines they render cannot quietly stop compiling.
+# Run build-host/engine_smoke to write build/listen/*.wav.
+add_executable(engine_smoke
+    "${ARGON_ROOT}/tools/engine_smoke.c"
+    "${ARGON_ROOT}/apps/common/dx7/ag_dx7.c"
+    "${ARGON_ROOT}/apps/common/fm/ag_fm.c"
+    ${ARGON_DSP_SRCS})
+
+add_executable(synth_smoke
+    "${ARGON_ROOT}/tools/synth_smoke.c"
+    ${ARGON_DSP_SRCS})
+
+foreach(smoke engine_smoke synth_smoke)
+    # host_stub first: it supplies the ag_malloc/ag_free that ag_ir and ag_fx
+    # would otherwise take from the real syscall table, which has no kernel
+    # behind it here.
+    target_include_directories(${smoke} BEFORE PRIVATE
+        "${ARGON_ROOT}/tools/host_stub")
+    target_include_directories(${smoke} PRIVATE
+        ${ARGON_INCLUDES}
+        "${ARGON_ROOT}/apps/common/dx7"
+        "${ARGON_ROOT}/apps/common/fm"
+        "${ARGON_ROOT}/apps/common/fx"
+        "${ARGON_ROOT}/apps/common/ir")
+endforeach()
+
+foreach(target argon_tests vtdump engine_smoke synth_smoke)
     if(MSVC)
         target_compile_definitions(${target} PRIVATE _CRT_SECURE_NO_WARNINGS)
         target_compile_options(${target} PRIVATE /W4)

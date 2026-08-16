@@ -111,10 +111,19 @@ function Build-HostTools {
         throw 'No host C compiler on PATH. Set ARGON_HOST_CC_BIN in tools\local-env.ps1.'
     }
 
-    cmake -S host-tests -B build-host -G Ninja | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw 'CMake configure failed.' }
-    cmake --build build-host | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw 'Host build failed.' }
+    # Quiet when it works, but print what the compiler said when it does not:
+    # swallowing this turned every host build error into the bare words
+    # 'Host build failed.'
+    $log = cmake -S host-tests -B build-host -G Ninja 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        $log | Write-Host
+        throw 'CMake configure failed.'
+    }
+    $log = cmake --build build-host 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        $log | Write-Host
+        throw 'Host build failed.'
+    }
 }
 
 switch ($Command.ToLowerInvariant()) {
@@ -321,9 +330,33 @@ switch ($Command.ToLowerInvariant()) {
             exit $LASTEXITCODE
         }
 
+        # Applications are a separate link, so the firmware building says
+        # nothing about them: a change under apps\common can break half a
+        # dozen .AXE images and leave this gate green.  Build them too.
         Write-Host ''
-        Write-Host 'check: OK (host tests + firmware build)'
+        Write-Host '== applications =='
+        & python (Join-Path $PSScriptRoot 'build_apps.py') --warnings
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host 'check: application build failed.'
+            exit $LASTEXITCODE
+        }
+
+        Write-Host ''
+        Write-Host 'check: OK (host tests + firmware + apps)'
         exit 0
+    }
+
+    'apps' {
+        # Build the .AXE / .SYS images listed in tools\apps.json.
+        Initialize-Environment
+        $argv = @()
+        $all = $false
+        foreach ($a in $Rest) {
+            if ($a -ieq '-All') { $all = $true } else { $argv += $a }
+        }
+        if ($all) { $argv = @('--group', 'all') + $argv }
+        & python (Join-Path $PSScriptRoot 'build_apps.py') @argv
+        exit $LASTEXITCODE
     }
 
     'flash' {
