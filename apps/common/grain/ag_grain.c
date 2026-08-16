@@ -231,17 +231,15 @@ static void spawn_grain(ag_grain_t *g, int vi)
     }
 }
 
-static void eg_tick(ag_grain_t *g, ag_grain_voice_t *v)
+/* One tick per render block: n says how many samples that block covers, so
+ * the envelope keeps its timing whatever buffer size the caller uses. */
+static void eg_tick(ag_grain_t *g, ag_grain_voice_t *v, uint32_t frames)
 {
-    ag_dsp_adsr_t e;
-    e.stage = v->eg_stage;
-    e.level = v->eg;
-    if (!ag_dsp_adsr_tick(&e, g->params.attack, g->params.decay,
-                          g->params.sustain, g->params.release, v->gate)) {
+    if (!ag_dsp_adsr_tick_n(&v->env, g->params.attack, g->params.decay,
+                            g->params.sustain, g->params.release, v->gate,
+                            frames)) {
         v->active = 0;
     }
-    v->eg_stage = e.stage;
-    v->eg = e.level;
 }
 
 void ag_grain_init(ag_grain_t *g, uint32_t out_rate)
@@ -335,7 +333,8 @@ void ag_grain_freeze(ag_grain_t *g, int on)
 void ag_grain_note_on(ag_grain_t *g, uint8_t note, uint8_t vel)
 {
     int i, slot = -1;
-    uint32_t oldest = 0;
+    /* age is the note-on sequence number, so the oldest voice is the lowest. */
+    uint32_t oldest = 0xffffffffu;
     int oldest_i = 0;
 
     if (vel == 0u) {
@@ -352,7 +351,7 @@ void ag_grain_note_on(ag_grain_t *g, uint8_t note, uint8_t vel)
             slot = i;
             break;
         }
-        if (g->voice[i].age >= oldest) {
+        if (g->voice[i].age < oldest) {
             oldest = g->voice[i].age;
             oldest_i = i;
         }
@@ -365,8 +364,8 @@ void ag_grain_note_on(ag_grain_t *g, uint8_t note, uint8_t vel)
     g->voice[slot].vel = vel;
     g->voice[slot].gate = 1;
     g->voice[slot].active = 1;
-    g->voice[slot].eg_stage = 0;
-    g->voice[slot].eg = 0;
+    ag_dsp_adsr_set_rate(&g->voice[slot].env, g->rate);
+    ag_dsp_adsr_on(&g->voice[slot].env);
     g->voice[slot].spawn_left = 0;
     g->voice[slot].age = g->age_seq;
     spawn_grain(g, slot);
@@ -378,9 +377,7 @@ void ag_grain_note_off(ag_grain_t *g, uint8_t note)
     for (i = 0; i < AG_GRAIN_VOICES; i++) {
         if (g->voice[i].active && g->voice[i].note == note) {
             g->voice[i].gate = 0;
-            if (g->voice[i].eg_stage < 3u) {
-                g->voice[i].eg_stage = 3;
-            }
+            ag_dsp_adsr_off(&g->voice[i].env);
         }
     }
 }
@@ -390,7 +387,7 @@ void ag_grain_all_notes_off(ag_grain_t *g)
     int i;
     for (i = 0; i < AG_GRAIN_VOICES; i++) {
         g->voice[i].gate = 0;
-        g->voice[i].eg_stage = 3;
+        ag_dsp_adsr_off(&g->voice[i].env);
     }
 }
 
@@ -411,11 +408,11 @@ void ag_grain_render(ag_grain_t *g, int16_t *stereo, int32_t frames)
         if (!v->active) {
             continue;
         }
-        eg_tick(g, v);
+        eg_tick(g, v, (uint32_t)frames);
         if (!v->active) {
             continue;
         }
-        if (v->gate || v->eg_stage < 3u) {
+        if (v->gate || v->env.stage < 3u) {
             uint32_t left = (uint32_t)frames;
             while (left > 0u) {
                 if (v->spawn_left == 0u) {
@@ -466,7 +463,7 @@ void ag_grain_render(ag_grain_t *g, int16_t *stereo, int32_t frames)
             }
             smp = g->buf.data[idx];
             egain = env_gain(g->params.texture, gr->i, gr->len);
-            env = ((int32_t)egain * gr->amp * v->eg) >> 16; /* ~0..256 */
+            env = ((int32_t)egain * gr->amp * v->env.level) >> 16; /* ~0..256 */
             out = ((int32_t)smp * env) >> 8;
             l = (out * (int32_t)gr->pan_l) >> 7;
             r = (out * (int32_t)gr->pan_r) >> 7;

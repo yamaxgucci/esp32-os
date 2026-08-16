@@ -24,9 +24,19 @@ typedef struct ag_dsp_delay {
     uint32_t w;
 } ag_dsp_delay_t;
 
+/*
+ * Linear ADSR.  Segment lengths are milliseconds, not ticks, because the
+ * same envelope is driven per sample by the synths and once per block by
+ * ag_grain: a per-tick increment would make an attack 256 times shorter in
+ * one caller than the other, and would drift with the block size.
+ */
+#define AG_DSP_ADSR_FULL (256 << 16) /* acc at level 256 */
+
 typedef struct ag_dsp_adsr {
-    uint8_t stage; /* 0A 1D 2S 3R 4off */
-    int32_t level; /* 0..256 */
+    uint8_t  stage; /* 0A 1D 2S 3R 4off */
+    int32_t  level; /* 0..256 */
+    int32_t  acc;   /* level << 16 */
+    uint32_t rate;  /* ticks per second; 0 = 22050 */
 } ag_dsp_adsr_t;
 
 typedef struct ag_dsp_lfo {
@@ -80,14 +90,29 @@ void     ag_dsp_delay_reset(ag_dsp_delay_t *d, int16_t *buf, uint32_t cap);
 void     ag_dsp_delay_write(ag_dsp_delay_t *d, int16_t s);
 int16_t  ag_dsp_delay_tap(const ag_dsp_delay_t *d, uint32_t delay);
 
-/* First inactive slot, else oldest (largest age). active[i] != 0 if live. */
-int      ag_dsp_voice_steal(const uint32_t *ages, const uint8_t *active, int n);
+/*
+ * First inactive slot, else the oldest voice.  born[] is the note-on sequence
+ * number the caller stamped (`++seq`), so the oldest voice is the *smallest*
+ * one — reading it the other way round steals the note just played.
+ */
+int      ag_dsp_voice_steal(const uint32_t *born, const uint8_t *active, int n);
 
-/* Linear ADSR 0..256; a/d/s/r are 0..127 like grain. Returns 1 if sounding. */
+/*
+ * Linear ADSR, level 0..256; a/d/s/r are 0..127.  A/D/R map to milliseconds
+ * (attack 1..3000, decay 2..4000, release 3..5000), S is the level.  Tell the
+ * envelope how often it will be ticked before using it, then tick it once per
+ * sample, or once per block with n = frames in that block.  Returns 1 while
+ * the voice is still sounding.
+ */
+void     ag_dsp_adsr_set_rate(ag_dsp_adsr_t *e, uint32_t ticks_per_sec);
 void     ag_dsp_adsr_on(ag_dsp_adsr_t *e);
 void     ag_dsp_adsr_off(ag_dsp_adsr_t *e);
+int      ag_dsp_adsr_tick_n(ag_dsp_adsr_t *e, uint8_t a, uint8_t d, uint8_t s,
+                            uint8_t r, int gate, uint32_t n);
 int      ag_dsp_adsr_tick(ag_dsp_adsr_t *e, uint8_t a, uint8_t d, uint8_t s,
                           uint8_t r, int gate);
+/* Segment length in ms for a 0..127 knob — the curve the envelope uses. */
+int32_t  ag_dsp_adsr_seg_ms(uint8_t p, int32_t lo_ms, int32_t hi_ms);
 
 int32_t  ag_dsp_lfo_wave(uint32_t phase, uint8_t wave); /* -32768..32767 */
 void     ag_dsp_lfo_set_hz_x100(ag_dsp_lfo_t *l, int32_t hz_x100, uint32_t rate);

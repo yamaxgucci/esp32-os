@@ -203,6 +203,8 @@ void ag_synth_note_on(ag_synth_t *s, uint8_t note, uint8_t vel)
     v->noise.wave = AG_OSC_NOISE;
     ag_filt_reset(&v->filt);
     ag_dist_reset(&v->dist);
+    ag_dsp_adsr_set_rate(&v->amp, s->rate); /* both ticked per sample */
+    ag_dsp_adsr_set_rate(&v->feg, s->rate);
     ag_dsp_adsr_on(&v->amp);
     ag_dsp_adsr_on(&v->feg);
     ag_fmx_set_n(&v->fmx, (int)s->base[AG_SYNTH_P_FM_OPS]);
@@ -373,16 +375,8 @@ void ag_synth_render(ag_synth_t *s, int16_t *stereo, int32_t frames)
 {
     int32_t i, vi;
     int32_t lfo1 = 0, lfo2 = 0;
-    int32_t eff[AG_SYNTH_VOICES][AG_SYNTH_P_N];
     if (s == 0 || stereo == 0 || frames <= 0) {
         return;
-    }
-    ag_dsp_zero(eff, sizeof(eff));
-    for (vi = 0; vi < AG_SYNTH_VOICES; vi++) {
-        int p;
-        for (p = 0; p < AG_SYNTH_P_N; p++) {
-            eff[vi][p] = s->base[p];
-        }
     }
     for (i = 0; i < frames; i++) {
         int32_t acc = 0;
@@ -392,14 +386,14 @@ void ag_synth_render(ag_synth_t *s, int16_t *stereo, int32_t frames)
             lfo2 = ag_dsp_lfo_tick(&s->lfo2);
             for (vi = 0; vi < AG_SYNTH_VOICES; vi++) {
                 if (s->voice[vi].active) {
-                    apply_mods(s, &s->voice[vi], eff[vi], lfo1, lfo2);
+                    apply_mods(s, &s->voice[vi], s->voice[vi].eff, lfo1, lfo2);
                 }
             }
         }
         s->ctrl_left--;
         for (vi = 0; vi < AG_SYNTH_VOICES; vi++) {
             if (s->voice[vi].active) {
-                acc += render_voice(s, &s->voice[vi], eff[vi]);
+                acc += render_voice(s, &s->voice[vi], s->voice[vi].eff);
             }
         }
         acc >>= 2;
