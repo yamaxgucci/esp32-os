@@ -86,6 +86,10 @@ typedef struct ag_synth_voice {
     ag_fmx_t      fmx;
     ag_dsp_adsr_t amp;
     ag_dsp_adsr_t feg;
+    /* Modulated parameter values.  Lives here, not on the render stack: the
+     * control tick is slower than one render call, so a per-call array would
+     * snap every parameter back to its unmodulated value at each buffer. */
+    int32_t       eff[AG_SYNTH_P_N];
 } ag_synth_voice_t;
 
 typedef struct ag_synth {

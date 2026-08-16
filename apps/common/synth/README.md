@@ -9,7 +9,18 @@ Userspace fixed-point synth on [`ag_dsp`](../dsp). No `libm`.
 - VA: osc2 can PM osc1 (`FM_INDEX`); LFO → `OSC2_TUNE` / `FM_INDEX` modulates the modulator
 - FM: 3-op stack, `FM_INDEX` = last link, `FM_INDEX2` = mod-of-mod
 
-Demo: [`apps/synth`](../../synth) (`SYNTH.AXE`). Host listen file:
-`tools/synth_smoke.c` → `build/synth_smoke.wav`.
+Routing depth in `ag_fmx` is a **phase offset in 1/65536 of a cycle**, shifted
+into the 32-bit operator phase before use — at depth 64 a full-scale modulator
+bends the carrier by about 1.2 radians. Adding a raw sample to the phase
+instead moves it by a millionth of a cycle and produces no sideband at all,
+which is what the engine used to do.
+
+Demo: [`apps/synth`](../../synth) (`SYNTH.AXE`).
+
+Listen: `build-host/synth_smoke.exe` writes `build/synth_smoke.wav`;
+`build-host/engine_smoke.exe` writes `build/listen/*.wav` for every engine.
+Both are built by `argon tests` — they are not tests, but they must not stop
+compiling. What *is* asserted lives in
+[`host-tests/test_dsp.c`](../../../host-tests/test_dsp.c).
 
 Apache-2.0.

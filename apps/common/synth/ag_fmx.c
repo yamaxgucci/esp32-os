@@ -61,6 +61,8 @@ void ag_fmx_set_hz(ag_fmx_t *f, int32_t hz_x100, uint32_t rate)
     for (i = 0; i < (int)f->n_ops; i++) {
         int32_t hz = (hz_x100 * (int32_t)f->op[i].ratio_x2) / 2;
         f->op[i].step = ag_dsp_hz_to_step(hz, rate);
+        /* Operator EGs are ticked per sample, so that is their tick rate. */
+        ag_dsp_adsr_set_rate(&f->op[i].eg, rate);
     }
 }
 
@@ -104,16 +106,22 @@ int32_t ag_fmx_tick(ag_fmx_t *f, uint8_t a, uint8_t d, uint8_t s, uint8_t r,
         int32_t samp;
         int32_t amp;
         ag_dsp_adsr_tick(&f->op[i].eg, a, d, s, r, gate);
+        /*
+         * mod is a phase offset in 1/65536 of a cycle, not in phase units:
+         * op->phase counts a whole cycle as 2^32, so adding a raw sample to
+         * it moves the phase by about a millionth of a cycle and no sideband
+         * is produced at all.  At depth 64 a full-scale modulator is ~1.2 rad.
+         */
         for (j = 0; j < n; j++) {
             unsigned dep = f->route[j][i];
             if (dep > 0u) {
-                mod += (f->op[j].out * (int32_t)dep) >> 6;
+                mod += (f->op[j].out * (int32_t)dep) >> 7;
             }
         }
         if (i == 0 && f->fb > 0u) {
-            mod += (f->fb_mem * (int32_t)f->fb) >> 6;
+            mod += (f->fb_mem * (int32_t)f->fb) >> 7;
         }
-        samp = ag_dsp_sin(f->op[i].phase + (uint32_t)mod);
+        samp = ag_dsp_sin(f->op[i].phase + ((uint32_t)mod << 16));
         amp = (f->op[i].eg.level * (int32_t)f->op[i].level) >> 7;
         f->op[i].out = (samp * amp) >> 8;
         f->op[i].phase += f->op[i].step;

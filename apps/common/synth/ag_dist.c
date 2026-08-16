@@ -109,12 +109,13 @@ int32_t ag_dist_tick(ag_dist_t *d, int32_t in)
     d->env += ((env_t - d->env) * 2) >> 7;
     bias -= (d->env * (int32_t)d->sag) >> 10;
     x += bias;
-    if (x > 32767) {
-        x = 32767;
-    }
-    if (x < -32767) {
-        x = -32767;
-    }
+    /*
+     * Bound the drive stage, but leave headroom above full scale: clamping to
+     * ±32767 here would hand the wavefolder a signal that is already inside
+     * its range, and it would never fold.  Every model below handles its own
+     * out-of-range input.
+     */
+    x = ag_clampi(x, -4 * 32767, 4 * 32767);
 
     switch (d->model) {
     case AG_DIST_TUBE:
@@ -135,7 +136,7 @@ int32_t ag_dist_tick(ag_dist_t *d, int32_t in)
         y = x;
         break;
     case AG_DIST_CRUSH:
-        y = (x >> 4) << 4;
+        y = ag_clampi((x >> 4) << 4, -32767, 32767);
         break;
     default:
         y = lut_lookup(s_jfet, x);

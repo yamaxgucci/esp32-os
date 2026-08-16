@@ -8,6 +8,8 @@
 
 #include <stdint.h>
 
+#include "ag_dsp.h"
+
 #define AG_GRAIN_VOICES 8
 #define AG_GRAIN_POOL   48
 #define AG_GRAIN_VIZ    48
@@ -62,8 +64,7 @@ typedef struct ag_grain_voice {
     uint8_t  vel;
     uint8_t  gate;
     uint8_t  active;
-    uint8_t  eg_stage; /* 0A 1D 2S 3R 4off */
-    int32_t  eg;       /* 0..256 */
+    ag_dsp_adsr_t env; /* ticked once per render block, n = frames */
     uint32_t spawn_left;
     uint32_t age;
 } ag_grain_voice_t;

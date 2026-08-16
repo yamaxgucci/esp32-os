@@ -209,6 +209,7 @@ void ag_smp_note_on(ag_smp_t *s, uint8_t note, uint8_t vel)
     v->pos = 0;
     v->step = pitch_step(s, (int)note);
     v->age = ++s->age_seq;
+    ag_dsp_adsr_set_rate(&v->amp, s->rate); /* ticked per sample below */
     ag_dsp_adsr_on(&v->amp);
 }
 

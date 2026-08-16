@@ -109,9 +109,9 @@ int32_t ag_osc_tick(ag_osc_t *o)
     case AG_OSC_TRI: {
         uint32_t x = t;
         if (x < 32768u) {
-            s = ((int32_t)x * 2) - 32767;
+            s = ((int32_t)x * 2) - 32768;
         } else {
-            s = 98301 - ((int32_t)x * 2);
+            s = 98303 - ((int32_t)x * 2);
         }
         break;
     }
@@ -161,8 +161,10 @@ int32_t ag_osc_tick(ag_osc_t *o)
         }
         break;
     }
-    default: /* saw */
-        s = ((int32_t)t * 2) - 32767;
+    default: /* saw: t is the full 16-bit ramp, so one unit of t is one unit
+              * of output — doubling it would put a full-scale DC step on the
+              * wave and clip the top half away. */
+        s = (int32_t)t - 32768;
         s -= polyblep_q15(t, dt);
         break;
     }

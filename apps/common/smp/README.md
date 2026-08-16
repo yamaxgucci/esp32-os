@@ -6,4 +6,9 @@
 кладёт вызывающий (`ag_wav` + `ag_smp_set_zone`). Встроенные пресеты —
 синтетические (орган с петлёй, пианино, бас), чужих сэмплов в дереве нет.
 
-Host: `tools/engine_smoke.c` пишет `build/listen/smp_*.wav`.
+Огибающая — общая `ag_dsp_adsr_t`, тикается **на каждый сэмпл**, поэтому
+`ag_dsp_adsr_set_rate` вызывается в `ag_smp_note_on`. См.
+[`ag_dsp`](../dsp/README.md).
+
+Host: `build-host/engine_smoke.exe` пишет `build/listen/smp_*.wav`
+(собирается вместе с host-тестами).
