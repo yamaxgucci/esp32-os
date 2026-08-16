@@ -12,7 +12,7 @@
 #include <argon/keys.h>
 #include <argon/log.h>
 
-#include "esp_timer.h"
+#include <argon/port/time.h>
 
 #define AG_INPUT_PADS 2
 
@@ -22,7 +22,7 @@ static ag_device_t *s_joy;
 
 static uint32_t now_ms(void)
 {
-    return (uint32_t)(esp_timer_get_time() / 1000);
+    return (uint32_t)(ag_port_us() / 1000);
 }
 
 void ag_input_push_pad(const uint8_t *blob, size_t len)

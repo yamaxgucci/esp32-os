@@ -59,6 +59,13 @@ set(ARGON_INCLUDES
     "${CMAKE_CURRENT_LIST_DIR}"
     "${ARGON_ROOT}/sdk/include"
     "${ARGON_ROOT}/components/argon_kernel/include"
+    # The port contract, answered by the `bare` port.  These sources are the
+    # ones that need nothing from the machine, so the only headers they reach
+    # for are the ones `bare` already implements in full; anything that needed
+    # a scheduler or an allocator would stop here with a readable #error rather
+    # than by failing to link.
+    "${ARGON_ROOT}/components/argon_port/include"
+    "${ARGON_ROOT}/components/argon_port/bare"
     "${ARGON_ROOT}/apps/cc"
     "${ARGON_ROOT}/apps/common/dsp"
     "${ARGON_ROOT}/apps/common/synth"

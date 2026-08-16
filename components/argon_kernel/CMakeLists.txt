@@ -44,7 +44,6 @@ set(ARGON_KERNEL_SRCS
     "src/proc/proc.c"
     "src/proc/session.c"
     "src/proc/threads.c"
-    "src/proc/fault.c"
     "src/proc/supervisor.c"
     "src/shell/lineedit.c"
     "src/shell/shell_path.c"
@@ -68,7 +67,7 @@ idf_component_register(
     SRCS ${ARGON_KERNEL_SRCS}
     INCLUDE_DIRS "include"
     PRIV_INCLUDE_DIRS "src"
-    REQUIRES argon_abi
+    REQUIRES argon_abi argon_port
     PRIV_REQUIRES esp_psram esp_timer esp_partition nvs_flash spi_flash
                   esp_system esp_hw_support esp_driver_uart log
                   fatfs wear_levelling vfs sdmmc esp_driver_sdmmc
@@ -78,10 +77,6 @@ idf_component_register(
                   # api->io: buses and pins straight through to the chip.
                   # esp_adc is deliberately absent - see ARGON_ENABLE_ADC.
                   esp_driver_i2c esp_driver_ledc
-                  # Virtual RGB panel under Espressif QEMU (no-op on hardware).
-                  esp_lcd espressif__esp_lcd_qemu_rgb
-                  # api->net: OpenEth + lwIP sockets (QEMU today).
-                  esp_eth esp_netif esp_event nvs_flash
                   # xtensa: the exception table the fault handler installs into
                   xtensa)
 

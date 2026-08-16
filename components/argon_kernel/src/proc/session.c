@@ -16,10 +16,9 @@
 
 #include "proc/supervisor.h"
 
-#include "esp_heap_caps.h"
-#include "esp_timer.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
+#include <argon/port/mem.h>
+#include <argon/port/time.h>
+#include <argon/port/task.h>
 
 #define AG_BREAKIN_DOUBLE_US 1000000ll
 
@@ -62,24 +61,24 @@ static ag_pid_t slot_pid(int slot)
 void ag_session_init(void)
 {
     if (s_slots == NULL) {
-        s_slots = (slot_t *)heap_caps_calloc(
+        s_slots = (slot_t *)ag_port_calloc(
             AG_SESSION_SLOTS, sizeof(slot_t),
-            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            AG_MEM_SLOW | AG_MEM_BYTE);
     }
     if (s_sys == NULL) {
-        s_sys = (slot_t *)heap_caps_calloc(1, sizeof(slot_t),
-                                           MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        s_sys = (slot_t *)ag_port_calloc(1, sizeof(slot_t),
+                                           AG_MEM_SLOW | AG_MEM_BYTE);
     }
     if (s_slots == NULL || s_sys == NULL) {
         /* Last resort: internal DRAM (boot must not proceed half-init). */
         if (s_slots == NULL) {
-            s_slots = (slot_t *)heap_caps_calloc(
+            s_slots = (slot_t *)ag_port_calloc(
                 AG_SESSION_SLOTS, sizeof(slot_t),
-                MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+                AG_MEM_FAST | AG_MEM_BYTE);
         }
         if (s_sys == NULL) {
-            s_sys = (slot_t *)heap_caps_calloc(
-                1, sizeof(slot_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+            s_sys = (slot_t *)ag_port_calloc(
+                1, sizeof(slot_t), AG_MEM_FAST | AG_MEM_BYTE);
         }
     }
     if (s_slots == NULL || s_sys == NULL) {
@@ -389,7 +388,7 @@ ag_err_t ag_session_focus(int slot)
 
 bool ag_session_enter_system(void)
 {
-    const int64_t now = esp_timer_get_time();
+    const int64_t now = ag_port_us();
     const bool second =
         (s_focused == AG_SESSION_SYSTEM) && (s_last_breakin_us != 0) &&
         (now - s_last_breakin_us) < AG_BREAKIN_DOUBLE_US &&
@@ -447,7 +446,7 @@ ag_err_t ag_session_alt_tab(void)
                  s_slots[next].name[0] ? s_slots[next].name : "app");
     }
     ag_display_show_overlay(label);
-    vTaskDelay(pdMS_TO_TICKS(350));
+    ag_port_task_delay(ag_port_ms_to_ticks(350));
 
     return ag_session_focus(next);
 }

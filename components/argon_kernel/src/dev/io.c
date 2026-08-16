@@ -24,62 +24,37 @@
 #include <argon/log.h>
 #include <argon/proc.h>
 
-#include "driver/gpio.h"
-#include "driver/i2c_master.h"
-#include "driver/ledc.h"
-#include "driver/spi_master.h"
-#include "driver/uart.h"
-#if CONFIG_ARGON_ENABLE_ADC
-#include "esp_adc/adc_oneshot.h"
-#endif
-#include "esp_heap_caps.h"
-#include "esp_log.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/semphr.h"
-#include "hal/gpio_types.h"
-#include "sdkconfig.h"
-#include "soc/soc_caps.h"
-#include "soc/uart_pins.h"
+#include <argon/port/io.h>
+#include <argon/port/mem.h>
+#include <argon/port/sync.h>
+#include <argon/port/task.h>
+#include <argon/port/uart.h>
 
-#define AG_IO_PWM_CHANNELS 8
 #define AG_IO_UART_RX_BUF 1024
 
 /*
- * The longest single SPI transfer.  It is the size of the bounce buffer, and
- * the bounce buffer exists because an application's data lives in PSRAM while
- * the DMA engine wants internal memory - so every transfer is copied through
- * one, and the limit is what one costs.
- *
- * A caller with more to send splits it, and a chip that cannot have its chip
- * select go down between the parts is driven with cs = -1, holding the select
- * itself.  Both are said out loud in the API reference, because a silent limit
- * looks like a driver that works until the day somebody sends a whole frame.
+ * A caller with more to send than AG_PORT_SPI_MAX_XFER splits it, and a chip
+ * that cannot have its chip select go down between the parts is driven with
+ * cs = -1, holding the select itself.  Both are said out loud in the API
+ * reference, because a silent limit looks like a driver that works until the
+ * day somebody sends a whole frame.
  */
-#define AG_IO_SPI_MAX_XFER 1024
 
-/* ADC1 channel N is GPIO N+1 on the S3; other targets differ and say so. */
-#if CONFIG_IDF_TARGET_ESP32S3
-#define AG_IO_ADC1_FIRST_GPIO 1
-#else
-#define AG_IO_ADC1_FIRST_GPIO (-1)
-#endif
-
-static SemaphoreHandle_t s_lock;
-static bool              s_isr_service;
+static ag_port_mutex_t s_lock;
 
 /* ---------------------------------------------------------------------- */
 
 static void lock(void)
 {
     if (s_lock != NULL) {
-        xSemaphoreTakeRecursive(s_lock, portMAX_DELAY);
+        ag_port_mutex_take_recursive(s_lock, AG_PORT_FOREVER);
     }
 }
 
 static void unlock(void)
 {
     if (s_lock != NULL) {
-        xSemaphoreGiveRecursive(s_lock);
+        ag_port_mutex_give_recursive(s_lock);
     }
 }
 
@@ -89,24 +64,6 @@ static ag_pid_t caller(void) { return ag_proc_self(); }
 static bool valid_pin(int pin)
 {
     return pin >= 0 && pin < ag_io_pin_count();
-}
-
-/*
- * Every ESP-IDF failure becomes one of ours, because an application cannot do
- * anything with an esp_err_t and the ABI promises it will never see one.
- */
-static ag_err_t from_esp(esp_err_t err)
-{
-    switch (err) {
-    case ESP_OK:                 return AG_OK;
-    case ESP_ERR_INVALID_ARG:    return -AG_EINVAL;
-    case ESP_ERR_INVALID_STATE:  return -AG_EBUSY;
-    case ESP_ERR_NO_MEM:         return -AG_ENOMEM;
-    case ESP_ERR_TIMEOUT:        return -AG_ETIMEDOUT;
-    case ESP_ERR_NOT_FOUND:      return -AG_ENODEV;
-    case ESP_ERR_NOT_SUPPORTED:  return -AG_ENOTSUP;
-    default:                     return -AG_EIO;
-    }
 }
 
 /* ---------------------------------------------------------------------- */
@@ -166,36 +123,18 @@ static ag_err_t reserve_bus_pins(const int16_t *pins, unsigned count,
  */
 static void reserve_system_pins(void)
 {
-#if CONFIG_IDF_TARGET_ESP32S3
-    /* SPI0/1 to the flash chip: 26 SPICS1, 27 SPIHD, 28 SPIWP, 29 SPICS0,
-     * 30 SPICLK, 31 SPIQ, 32 SPID. */
-    reserve_range(26, 32, "flash");
-#if CONFIG_SPIRAM_MODE_OCT
-    /* Octal PSRAM takes four more data lines and its own chip select. */
-    reserve_range(33, 37, "psram");
-#endif
-#endif
+    /* Flash, PSRAM - whatever this machine reaches its own code through. */
+    const ag_port_pin_range_t *ranges = NULL;
+    const unsigned             count = ag_port_reserved_pins(&ranges);
+    for (unsigned i = 0; i < count; i++) {
+        if (ranges[i].why != NULL) {
+            reserve_range(ranges[i].first, ranges[i].last, ranges[i].why);
+        }
+    }
 
-    /*
-     * The console's own pins.  ESP-IDF only defines the CONFIG_ symbols when
-     * the pins were customised; with the defaults it uses U0TXD_GPIO_NUM, and
-     * a build that looked only at the CONFIG_ symbols left the pins the system
-     * is talking over free for anybody to take - which showed up as an empty
-     * pair of rows in `io` and would have shown up on a board as a console that
-     * went silent.
-     */
-    int console_tx = U0TXD_GPIO_NUM;
-    int console_rx = U0RXD_GPIO_NUM;
-#if defined(CONFIG_ESP_CONSOLE_UART_CUSTOM)
-    if (CONFIG_ESP_CONSOLE_UART_TX_GPIO >= 0) {
-        console_tx = CONFIG_ESP_CONSOLE_UART_TX_GPIO;
-    }
-    if (CONFIG_ESP_CONSOLE_UART_RX_GPIO >= 0) {
-        console_rx = CONFIG_ESP_CONSOLE_UART_RX_GPIO;
-    }
-#endif
-    reserve_pin(console_tx, "console tx");
-    reserve_pin(console_rx, "console rx");
+    /* The console's own pins: taking one is a board that goes silent. */
+    reserve_pin(AG_PORT_UART_CONSOLE_TX, "console tx");
+    reserve_pin(AG_PORT_UART_CONSOLE_RX, "console rx");
 
     const ag_board_sd_t *sd = &ag_board()->sd;
     if (sd->kind == AG_SD_SDMMC) {
@@ -243,39 +182,6 @@ static ag_err_t io_gpio_config(int pin, int mode)
         return -AG_EINVAL;
     }
 
-    gpio_config_t cfg = {
-        .pin_bit_mask = 1ULL << (unsigned)pin,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    switch (mode) {
-    case AG_GPIO_IN:
-        cfg.mode = GPIO_MODE_INPUT;
-        break;
-    /*
-     * Outputs keep their input buffer on, so that reading a pin tells you what
-     * is on the line.  For a push-pull output that is a free confirmation of
-     * what was written; for an open-drain one it is the whole point, because
-     * the line is only low when nobody is holding it up - which is how I2C and
-     * 1-Wire are read at all.
-     */
-    case AG_GPIO_OUT:
-        cfg.mode = GPIO_MODE_INPUT_OUTPUT;
-        break;
-    case AG_GPIO_OUT_OD:
-        cfg.mode = GPIO_MODE_INPUT_OUTPUT_OD;
-        break;
-    case AG_GPIO_IN_PULLUP:
-        cfg.mode = GPIO_MODE_INPUT;
-        cfg.pull_up_en = GPIO_PULLUP_ENABLE;
-        break;
-    case AG_GPIO_IN_PULLDOWN:
-        cfg.mode = GPIO_MODE_INPUT;
-        cfg.pull_down_en = GPIO_PULLDOWN_ENABLE;
-        break;
-    default:
-        break;
-    }
-
     lock();
     ag_err_t err = ag_io_claim(pin, caller(), mode_reason(mode));
     if (err != AG_OK) {
@@ -283,7 +189,7 @@ static ag_err_t io_gpio_config(int pin, int mode)
         return err;
     }
 
-    err = from_esp(gpio_config(&cfg));
+    err = ag_port_gpio_config(pin, mode);
     if (err != AG_OK) {
         /* The claim goes back: a pin that could not be configured is not
          * held by anybody, and leaving it held would lose it until reboot. */
@@ -297,7 +203,7 @@ static void io_gpio_write(int pin, int level)
 {
     lock();
     if (valid_pin(pin) && ag_io_held_by(pin, caller())) {
-        (void)gpio_set_level((gpio_num_t)pin, (level != 0) ? 1 : 0);
+        ag_port_gpio_write(pin, level);
     }
     unlock();
 }
@@ -312,7 +218,7 @@ static int io_gpio_read(int pin)
     if (!valid_pin(pin)) {
         return -AG_ERANGE;
     }
-    return gpio_get_level((gpio_num_t)pin);
+    return ag_port_gpio_read(pin);
 }
 
 static ag_err_t io_gpio_isr(int pin, int edge, ag_isr_fn fn, void *arg)
@@ -332,26 +238,7 @@ static ag_err_t io_gpio_isr(int pin, int edge, ag_isr_fn fn, void *arg)
         return -AG_EPERM;
     }
 
-    if (!s_isr_service) {
-        const esp_err_t installed = gpio_install_isr_service(0);
-        if (installed != ESP_OK && installed != ESP_ERR_INVALID_STATE) {
-            unlock();
-            return from_esp(installed);
-        }
-        s_isr_service = true;
-    }
-
-    gpio_int_type_t type = GPIO_INTR_ANYEDGE;
-    if (edge == AG_EDGE_RISING) {
-        type = GPIO_INTR_POSEDGE;
-    } else if (edge == AG_EDGE_FALLING) {
-        type = GPIO_INTR_NEGEDGE;
-    }
-
-    ag_err_t err = from_esp(gpio_set_intr_type((gpio_num_t)pin, type));
-    if (err == AG_OK) {
-        err = from_esp(gpio_isr_handler_add((gpio_num_t)pin, fn, arg));
-    }
+    const ag_err_t err = ag_port_gpio_isr_attach(pin, edge, fn, arg);
     if (err == AG_OK) {
         (void)ag_io_set_isr(pin, caller(), true);
         ag_log(AG_LOG_DEBUG, "io", "pid %u took the interrupt on pin %d",
@@ -372,8 +259,7 @@ static ag_err_t io_gpio_isr_clear(int pin)
         unlock();
         return -AG_EPERM;
     }
-    (void)gpio_isr_handler_remove((gpio_num_t)pin);
-    (void)gpio_set_intr_type((gpio_num_t)pin, GPIO_INTR_DISABLE);
+    ag_port_gpio_isr_detach(pin);
     (void)ag_io_set_isr(pin, caller(), false);
     unlock();
     return AG_OK;
@@ -384,11 +270,8 @@ static ag_err_t io_gpio_isr_clear(int pin)
 /* ---------------------------------------------------------------------- */
 
 typedef struct {
-    i2c_master_bus_handle_t bus;
-    i2c_master_dev_handle_t dev;
-    uint8_t                 dev_addr;
-    bool                    up;
-    bool                    warned; /* said "no pins" once already          */
+    bool up;
+    bool warned; /* said "no pins" once already                            */
 } i2c_state_t;
 
 static i2c_state_t s_i2c[AG_I2C_BUSES];
@@ -429,16 +312,7 @@ static ag_err_t i2c_bring_up(int bus)
         return err;
     }
 
-    const i2c_master_bus_config_t bus_cfg = {
-        .i2c_port = bus,
-        .sda_io_num = (gpio_num_t)cfg->sda,
-        .scl_io_num = (gpio_num_t)cfg->scl,
-        .clk_source = I2C_CLK_SRC_DEFAULT,
-        .glitch_ignore_cnt = 7,
-        .flags = {.enable_internal_pullup = cfg->pullups},
-    };
-
-    err = from_esp(i2c_new_master_bus(&bus_cfg, &s_i2c[bus].bus));
+    err = ag_port_i2c_open(bus, cfg->sda, cfg->scl, cfg->khz, cfg->pullups);
     if (err != AG_OK) {
         return err;
     }
@@ -446,44 +320,6 @@ static ag_err_t i2c_bring_up(int bus)
     s_i2c[bus].up = true;
     ag_log(AG_LOG_INFO, "io", "i2c%d up on sda=%d scl=%d at %u kHz", bus,
            cfg->sda, cfg->scl, (unsigned)cfg->khz);
-    return AG_OK;
-}
-
-/*
- * One cached device handle per bus.  The new ESP-IDF driver wants a handle per
- * address, and this API is per transaction, so something has to bridge the two:
- * a cache of one is enough because a driver talks to its own chip in a run, and
- * changing address costs one allocation rather than one per byte.
- */
-static ag_err_t i2c_device(int bus, uint8_t addr, i2c_master_dev_handle_t *out)
-{
-    ag_err_t err = i2c_bring_up(bus);
-    if (err != AG_OK) {
-        return err;
-    }
-
-    if (s_i2c[bus].dev != NULL && s_i2c[bus].dev_addr == addr) {
-        *out = s_i2c[bus].dev;
-        return AG_OK;
-    }
-    if (s_i2c[bus].dev != NULL) {
-        (void)i2c_master_bus_rm_device(s_i2c[bus].dev);
-        s_i2c[bus].dev = NULL;
-    }
-
-    const i2c_device_config_t dev_cfg = {
-        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-        .device_address = addr,
-        .scl_speed_hz = ag_board()->i2c[bus].khz * 1000u,
-    };
-    err = from_esp(
-        i2c_master_bus_add_device(s_i2c[bus].bus, &dev_cfg, &s_i2c[bus].dev));
-    if (err != AG_OK) {
-        return err;
-    }
-
-    s_i2c[bus].dev_addr = addr;
-    *out = s_i2c[bus].dev;
     return AG_OK;
 }
 
@@ -495,10 +331,9 @@ static ag_err_t io_i2c_write(int bus, uint8_t addr, const void *buf, size_t len,
     }
 
     lock();
-    i2c_master_dev_handle_t dev = NULL;
-    ag_err_t                err = i2c_device(bus, addr, &dev);
+    ag_err_t err = i2c_bring_up(bus);
     if (err == AG_OK) {
-        err = from_esp(i2c_master_transmit(dev, buf, len, (int)timeout_ms));
+        err = ag_port_i2c_write(bus, addr, buf, len, timeout_ms);
     }
     unlock();
     return err;
@@ -512,10 +347,9 @@ static ag_err_t io_i2c_read(int bus, uint8_t addr, void *buf, size_t len,
     }
 
     lock();
-    i2c_master_dev_handle_t dev = NULL;
-    ag_err_t                err = i2c_device(bus, addr, &dev);
+    ag_err_t err = i2c_bring_up(bus);
     if (err == AG_OK) {
-        err = from_esp(i2c_master_receive(dev, buf, len, (int)timeout_ms));
+        err = ag_port_i2c_read(bus, addr, buf, len, timeout_ms);
     }
     unlock();
     return err;
@@ -530,11 +364,9 @@ static ag_err_t io_i2c_wrrd(int bus, uint8_t addr, const void *wbuf,
     }
 
     lock();
-    i2c_master_dev_handle_t dev = NULL;
-    ag_err_t                err = i2c_device(bus, addr, &dev);
+    ag_err_t err = i2c_bring_up(bus);
     if (err == AG_OK) {
-        err = from_esp(i2c_master_transmit_receive(dev, wbuf, wlen, rbuf, rlen,
-                                                   (int)timeout_ms));
+        err = ag_port_i2c_wrrd(bus, addr, wbuf, wlen, rbuf, rlen, timeout_ms);
     }
     unlock();
     return err;
@@ -558,27 +390,9 @@ static ag_err_t io_i2c_probe(int bus, uint8_t addr)
     lock();
     ag_err_t err = i2c_bring_up(bus);
     if (err == AG_OK) {
-        /*
-         * Silence the driver for the duration.  An address with nothing on it
-         * times out, and the driver logs that as an error - which is right when
-         * a driver is talking to a chip it expects to be there, and wrong a
-         * hundred and twelve times over when the whole point is to find out
-         * which addresses are empty.  A scan of an empty bus filled the screen
-         * with ESP-IDF error text and buried its own result.
-         */
-        const esp_log_level_t was = esp_log_level_get("i2c.master");
-        esp_log_level_set("i2c.master", ESP_LOG_NONE);
-
         /* 10 ms: a chip that is there answers in microseconds, and this is
          * multiplied by every address a scan asks about. */
-        const esp_err_t rc = i2c_master_probe(s_i2c[bus].bus, addr, 10);
-
-        esp_log_level_set("i2c.master", was);
-
-        err = (rc == ESP_OK) ? AG_OK
-                             : ((rc == ESP_ERR_NOT_FOUND || rc == ESP_ERR_TIMEOUT)
-                                    ? -AG_ENOENT
-                                    : from_esp(rc));
+        err = ag_port_i2c_probe(bus, addr, 10);
     }
     unlock();
     return err;
@@ -589,10 +403,8 @@ static ag_err_t io_i2c_probe(int bus, uint8_t addr)
 /* ---------------------------------------------------------------------- */
 
 typedef struct {
-    spi_device_handle_t dev;
-    int                 dev_cs;
-    uint8_t            *bounce; /* tx half then rx half, internal and DMA-able */
-    bool                up;
+    int  cs;  /* the chip select this bus is set up for, AG_PIN_NONE if none */
+    bool up;
 } spi_state_t;
 
 static spi_state_t s_spi[AG_SPI_BUSES];
@@ -627,80 +439,43 @@ static ag_err_t spi_bring_up(int bus)
         return claimed;
     }
 
-    const spi_bus_config_t bus_cfg = {
-        .mosi_io_num = cfg->mosi,
-        .miso_io_num = cfg->miso,
-        .sclk_io_num = cfg->sck,
-        .quadwp_io_num = -1,
-        .quadhd_io_num = -1,
-        .max_transfer_sz = AG_IO_SPI_MAX_XFER,
-    };
-
-    const esp_err_t rc = spi_bus_initialize(AG_SPI_HOST_OF(bus), &bus_cfg,
-                                            SPI_DMA_CH_AUTO);
-    /* Somebody else may already own it - the card on SPI, for one. */
-    if (rc != ESP_OK && rc != ESP_ERR_INVALID_STATE) {
-        return from_esp(rc);
-    }
-
-    s_spi[idx].bounce = heap_caps_malloc(2u * AG_IO_SPI_MAX_XFER,
-                                         MALLOC_CAP_DMA);
-    if (s_spi[idx].bounce == NULL) {
-        (void)spi_bus_free(AG_SPI_HOST_OF(bus));
-        return -AG_ENOMEM;
+    const ag_err_t rc =
+        ag_port_spi_open(bus, cfg->sck, cfg->mosi, cfg->miso, cfg->khz);
+    if (rc != AG_OK) {
+        return rc;
     }
 
     s_spi[idx].up = true;
-    s_spi[idx].dev_cs = AG_PIN_NONE;
+    s_spi[idx].cs = AG_PIN_NONE;
     ag_log(AG_LOG_INFO, "io", "spi%d up on sck=%d mosi=%d miso=%d at %u kHz",
            bus, cfg->sck, cfg->mosi, cfg->miso, (unsigned)cfg->khz);
     return AG_OK;
 }
 
-static ag_err_t spi_device_for(int bus, int cs, spi_device_handle_t *out)
+/*
+ * The chip select is a pin like any other, and the process talking to that chip
+ * owns it.  Taken once, when the bus is first pointed at a new select: the port
+ * caches the device behind it, and reserving on every transfer would be a lock
+ * and a lookup on a path that is otherwise two memcpys.
+ */
+static ag_err_t spi_take_cs(int bus, int cs)
 {
-    ag_err_t err = spi_bring_up(bus);
-    if (err != AG_OK) {
-        return err;
-    }
-
     const int idx = spi_index(bus);
-    if (s_spi[idx].dev != NULL && s_spi[idx].dev_cs == cs) {
-        *out = s_spi[idx].dev;
+
+    if (s_spi[idx].cs == cs) {
         return AG_OK;
     }
-    if (s_spi[idx].dev != NULL) {
-        (void)spi_bus_remove_device(s_spi[idx].dev);
-        s_spi[idx].dev = NULL;
-        s_spi[idx].dev_cs = AG_PIN_NONE;
-    }
-
     if (cs >= 0) {
         char why[AG_IO_REASON_MAX];
         snprintf(why, sizeof(why), "spi%d cs", bus);
 
-        const int16_t cs_pin = (int16_t)cs;
-        err = reserve_bus_pins(&cs_pin, 1, why);
+        const int16_t  cs_pin = (int16_t)cs;
+        const ag_err_t err = reserve_bus_pins(&cs_pin, 1, why);
         if (err != AG_OK) {
             return err;
         }
     }
-
-    const spi_device_interface_config_t dev_cfg = {
-        .clock_speed_hz = (int)(ag_board()->spi[idx].khz * 1000u),
-        .mode = 0,
-        .spics_io_num = cs,
-        .queue_size = 1,
-    };
-
-    err = from_esp(spi_bus_add_device(AG_SPI_HOST_OF(bus), &dev_cfg,
-                                      &s_spi[idx].dev));
-    if (err != AG_OK) {
-        return err;
-    }
-
-    s_spi[idx].dev_cs = cs;
-    *out = s_spi[idx].dev;
+    s_spi[idx].cs = cs;
     return AG_OK;
 }
 
@@ -712,7 +487,7 @@ static ag_err_t spi_device_for(int bus, int cs, spi_device_handle_t *out)
 static ag_err_t io_spi_xfer(int bus, int cs, const void *tx, void *rx,
                             size_t len)
 {
-    if (len == 0 || len > AG_IO_SPI_MAX_XFER) {
+    if (len == 0 || len > AG_PORT_SPI_MAX_XFER) {
         return -AG_EINVAL;
     }
     if (tx == NULL && rx == NULL) {
@@ -720,36 +495,12 @@ static ag_err_t io_spi_xfer(int bus, int cs, const void *tx, void *rx,
     }
 
     lock();
-    spi_device_handle_t dev = NULL;
-    ag_err_t            err = spi_device_for(bus, cs, &dev);
-    if (err != AG_OK) {
-        unlock();
-        return err;
+    ag_err_t err = spi_bring_up(bus);
+    if (err == AG_OK) {
+        err = spi_take_cs(bus, cs);
     }
-
-    /*
-     * Through the bounce buffer, always.  The caller's data is in PSRAM and the
-     * DMA engine wants internal memory; deciding case by case would mean two
-     * paths, one of which is exercised only on the board nobody has.
-     */
-    uint8_t *const out = s_spi[spi_index(bus)].bounce;
-    uint8_t *const in = out + AG_IO_SPI_MAX_XFER;
-
-    if (tx != NULL) {
-        memcpy(out, tx, len);
-    } else {
-        memset(out, 0, len);
-    }
-
-    spi_transaction_t t = {
-        .length = len * 8u,
-        .tx_buffer = out,
-        .rx_buffer = (rx != NULL) ? in : NULL,
-    };
-    err = from_esp(spi_device_transmit(dev, &t));
-
-    if (err == AG_OK && rx != NULL) {
-        memcpy(rx, in, len);
+    if (err == AG_OK) {
+        err = ag_port_spi_xfer(bus, cs, tx, rx, len);
     }
     unlock();
     return err;
@@ -761,7 +512,7 @@ static ag_err_t io_spi_xfer(int bus, int cs, const void *tx, void *rx,
 
 static bool s_uart_up[AG_UART_PORTS];
 
-static ag_err_t uart_bring_up(int port, const uart_config_t *want)
+static ag_err_t uart_bring_up(int port, const ag_port_uart_cfg_t *want)
 {
     if (port < 0 || port >= AG_UART_PORTS) {
         return -AG_ERANGE;
@@ -770,7 +521,7 @@ static ag_err_t uart_bring_up(int port, const uart_config_t *want)
      * UART0 is how the system is talking to whoever is asking.  Handing it out
      * would end the conversation, and the caller would never see the error.
      */
-    if (port == CONFIG_ESP_CONSOLE_UART_NUM) {
+    if (port == AG_PORT_UART_CONSOLE) {
         return -AG_EBUSY;
     }
 
@@ -782,13 +533,11 @@ static ag_err_t uart_bring_up(int port, const uart_config_t *want)
         return -AG_ENODEV;
     }
 
-    uart_config_t uart_cfg = {
-        .baud_rate = (int)cfg->baud,
-        .data_bits = UART_DATA_8_BITS,
-        .parity = UART_PARITY_DISABLE,
-        .stop_bits = UART_STOP_BITS_1,
-        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
-        .source_clk = UART_SCLK_DEFAULT,
+    ag_port_uart_cfg_t uart_cfg = {
+        .baud = cfg->baud,
+        .data_bits = 8,
+        .parity = 0,
+        .stop_bits = 1,
     };
     if (want != NULL) {
         uart_cfg = *want;
@@ -804,18 +553,18 @@ static ag_err_t uart_bring_up(int port, const uart_config_t *want)
             return taken;
         }
 
-        const esp_err_t rc = uart_driver_install(port, AG_IO_UART_RX_BUF,
-                                                 AG_IO_UART_RX_BUF, 0, NULL, 0);
-        if (rc != ESP_OK && rc != ESP_ERR_INVALID_STATE) {
-            return from_esp(rc);
+        const ag_err_t rc = ag_port_uart_open(port, &uart_cfg,
+                                              AG_IO_UART_RX_BUF,
+                                              AG_IO_UART_RX_BUF);
+        if (rc != AG_OK) {
+            return rc;
         }
         s_uart_up[port] = true;
     }
 
-    ag_err_t err = from_esp(uart_param_config(port, &uart_cfg));
+    ag_err_t err = ag_port_uart_config(port, &uart_cfg);
     if (err == AG_OK) {
-        err = from_esp(uart_set_pin(port, cfg->tx, cfg->rx, UART_PIN_NO_CHANGE,
-                                    UART_PIN_NO_CHANGE));
+        err = ag_port_uart_pins(port, cfg->tx, cfg->rx);
     }
     return err;
 }
@@ -830,15 +579,11 @@ static ag_err_t io_uart_config(int port, uint32_t baud, int databits,
         return -AG_EINVAL;
     }
 
-    uart_config_t cfg = {
-        .baud_rate = (int)baud,
-        .data_bits = (uart_word_length_t)(UART_DATA_5_BITS + (databits - 5)),
-        .parity = (parity == 0)   ? UART_PARITY_DISABLE
-                  : (parity == 1) ? UART_PARITY_ODD
-                                  : UART_PARITY_EVEN,
-        .stop_bits = (stopbits == 1) ? UART_STOP_BITS_1 : UART_STOP_BITS_2,
-        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
-        .source_clk = UART_SCLK_DEFAULT,
+    const ag_port_uart_cfg_t cfg = {
+        .baud = baud,
+        .data_bits = (uint8_t)databits,
+        .parity = (uint8_t)parity,
+        .stop_bits = (uint8_t)stopbits,
     };
 
     lock();
@@ -857,7 +602,7 @@ static int32_t io_uart_write(int port, const void *buf, size_t len)
     ag_err_t err = uart_bring_up(port, NULL);
     int32_t  n = err;
     if (err == AG_OK) {
-        n = (int32_t)uart_write_bytes(port, buf, len);
+        n = ag_port_uart_write(port, buf, len);
         if (n < 0) {
             n = -AG_EIO;
         }
@@ -885,8 +630,8 @@ static int32_t io_uart_read(int port, void *buf, size_t len,
      * the io lock while waiting would stop every other pin and bus in the
      * system for as long as nothing arrives.
      */
-    const int n = uart_read_bytes(port, buf, len, pdMS_TO_TICKS(timeout_ms));
-    return (n < 0) ? -AG_EIO : (int32_t)n;
+    const int32_t n = ag_port_uart_read(port, buf, len, timeout_ms);
+    return (n < 0) ? -AG_EIO : n;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -894,73 +639,40 @@ static int32_t io_uart_read(int port, void *buf, size_t len,
 /* ---------------------------------------------------------------------- */
 
 /*
- * Off unless CONFIG_ARGON_ENABLE_ADC, and the reason is in the Kconfig help:
- * linking esp_adc runs a constructor before app_main that stops the boot under
- * QEMU.  With the option off, io->adc_read is NULL rather than a stub that
- * fails - an application asks with AG_HAS and adapts, which is what the whole
+ * Present only when the port says it has one, and on this port that is a build
+ * option that is off by default - the reason is in argon/port/impl/io.h and it
+ * is a good one.  With no ADC, io->adc_read is NULL rather than a stub that
+ * fails: an application asks with AG_HAS and adapts, which is what the whole
  * feature-probing convention is for.
  */
-#if CONFIG_ARGON_ENABLE_ADC
-
-static adc_oneshot_unit_handle_t s_adc1;
-static bool                      s_adc_chan[SOC_ADC_MAX_CHANNEL_NUM];
+#if AG_PORT_HAS_ADC
 
 static int32_t io_adc_read(int channel)
 {
-    if (AG_IO_ADC1_FIRST_GPIO < 0) {
+    if (AG_PORT_ADC_FIRST_GPIO < 0) {
         return -AG_ENOTSUP;
     }
-    if (channel < 0 || channel >= SOC_ADC_MAX_CHANNEL_NUM) {
+    if (channel < 0 || channel >= AG_PORT_ADC_CHANNELS) {
         return -AG_ERANGE;
     }
 
     lock();
 
-    if (s_adc1 == NULL) {
-        const adc_oneshot_unit_init_cfg_t init = {
-            .unit_id = ADC_UNIT_1,
-            .ulp_mode = ADC_ULP_MODE_DISABLE,
-        };
-        const ag_err_t err = from_esp(adc_oneshot_new_unit(&init, &s_adc1));
-        if (err != AG_OK) {
-            unlock();
-            return err;
-        }
-    }
-
     /* The pin belongs to whoever measures on it, so that two processes do not
      * fight over the attenuation setting of one channel. */
-    const int    pin = AG_IO_ADC1_FIRST_GPIO + channel;
-    ag_err_t err = ag_io_claim(pin, caller(), "adc");
+    const int      pin = AG_PORT_ADC_FIRST_GPIO + channel;
+    const ag_err_t err = ag_io_claim(pin, caller(), "adc");
     if (err != AG_OK) {
         unlock();
         return err;
     }
 
-    if (!s_adc_chan[channel]) {
-        const adc_oneshot_chan_cfg_t chan = {
-            .bitwidth = ADC_BITWIDTH_DEFAULT,
-            /* The widest range: measuring a 3.3 V rail at 0 dB reads full
-             * scale and says nothing, which is the mistake everybody makes. */
-            .atten = ADC_ATTEN_DB_12,
-        };
-        err = from_esp(
-            adc_oneshot_config_channel(s_adc1, (adc_channel_t)channel, &chan));
-        if (err != AG_OK) {
-            unlock();
-            return err;
-        }
-        s_adc_chan[channel] = true;
-    }
-
-    int      raw = 0;
-    ag_err_t rc = from_esp(
-        adc_oneshot_read(s_adc1, (adc_channel_t)channel, &raw));
+    const int32_t raw = ag_port_adc_read(channel);
     unlock();
-    return (rc == AG_OK) ? (int32_t)raw : rc;
+    return raw;
 }
 
-#endif /* CONFIG_ARGON_ENABLE_ADC */
+#endif /* AG_PORT_HAS_ADC */
 
 /* ---------------------------------------------------------------------- */
 /* PWM                                                                    */
@@ -972,11 +684,11 @@ typedef struct {
     bool     used;
 } pwm_channel_t;
 
-static pwm_channel_t s_pwm[AG_IO_PWM_CHANNELS];
+static pwm_channel_t s_pwm[AG_PORT_PWM_CHANNELS];
 
 static int pwm_find(int pin)
 {
-    for (int i = 0; i < AG_IO_PWM_CHANNELS; i++) {
+    for (int i = 0; i < AG_PORT_PWM_CHANNELS; i++) {
         if (s_pwm[i].used && s_pwm[i].pin == pin) {
             return i;
         }
@@ -991,7 +703,7 @@ static void pwm_drop(int pin)
     if (ch < 0) {
         return;
     }
-    (void)ledc_stop(LEDC_LOW_SPEED_MODE, (ledc_channel_t)ch, 0);
+    ag_port_pwm_stop(ch);
     memset(&s_pwm[ch], 0, sizeof(s_pwm[ch]));
 }
 
@@ -1010,7 +722,7 @@ static ag_err_t io_pwm_config(int pin, uint32_t freq_hz, uint8_t bits)
 
     int ch = pwm_find(pin);
     if (ch < 0) {
-        for (int i = 0; i < AG_IO_PWM_CHANNELS; i++) {
+        for (int i = 0; i < AG_PORT_PWM_CHANNELS; i++) {
             if (!s_pwm[i].used) {
                 ch = i;
                 break;
@@ -1022,33 +734,7 @@ static ag_err_t io_pwm_config(int pin, uint32_t freq_hz, uint8_t bits)
         return -AG_ENFILE; /* every channel is driving something else */
     }
 
-    /*
-     * One timer per channel, so that two pins can run at different rates.  The
-     * chip has four; beyond that, channels share and the last frequency wins -
-     * which is a limit worth knowing rather than hiding.
-     */
-    const ledc_timer_t     timer = (ledc_timer_t)(ch % LEDC_TIMER_MAX);
-    const ledc_timer_config_t tcfg = {
-        .speed_mode = LEDC_LOW_SPEED_MODE,
-        .timer_num = timer,
-        .duty_resolution = (ledc_timer_bit_t)bits,
-        .freq_hz = freq_hz,
-        .clk_cfg = LEDC_AUTO_CLK,
-    };
-    err = from_esp(ledc_timer_config(&tcfg));
-
-    if (err == AG_OK) {
-        const ledc_channel_config_t ccfg = {
-            .gpio_num = pin,
-            .speed_mode = LEDC_LOW_SPEED_MODE,
-            .channel = (ledc_channel_t)ch,
-            .timer_sel = timer,
-            .duty = 0,
-            .hpoint = 0,
-        };
-        err = from_esp(ledc_channel_config(&ccfg));
-    }
-
+    err = ag_port_pwm_config(ch, pin, freq_hz, bits);
     if (err == AG_OK) {
         s_pwm[ch].used = true;
         s_pwm[ch].pin = pin;
@@ -1079,12 +765,7 @@ static ag_err_t io_pwm_set(int pin, uint32_t duty)
         duty = max;
     }
 
-    ag_err_t err = from_esp(
-        ledc_set_duty(LEDC_LOW_SPEED_MODE, (ledc_channel_t)ch, duty));
-    if (err == AG_OK) {
-        err = from_esp(ledc_update_duty(LEDC_LOW_SPEED_MODE,
-                                        (ledc_channel_t)ch));
-    }
+    const ag_err_t err = ag_port_pwm_set(ch, duty);
     unlock();
     return err;
 }
@@ -1103,13 +784,12 @@ static void release_pin(int pin, bool had_isr, void *ctx)
     (void)ctx;
 
     if (had_isr) {
-        (void)gpio_isr_handler_remove((gpio_num_t)pin);
-        (void)gpio_set_intr_type((gpio_num_t)pin, GPIO_INTR_DISABLE);
+        ag_port_gpio_isr_detach(pin);
     }
     pwm_drop(pin);
     /* Back to a high-impedance input: an output left driving is a pin fighting
      * whatever is connected to it. */
-    (void)gpio_reset_pin((gpio_num_t)pin);
+    ag_port_gpio_reset(pin);
 }
 
 uint32_t ag_io_reclaim(ag_pid_t pid)
@@ -1142,7 +822,7 @@ const ag_io_api_t ag_io_api_table = {
     .uart_write = io_uart_write,
     .uart_read = io_uart_read,
     .uart_config = io_uart_config,
-#if CONFIG_ARGON_ENABLE_ADC
+#if AG_PORT_HAS_ADC
     .adc_read = io_adc_read,
 #else
     .adc_read = NULL,
@@ -1154,13 +834,13 @@ const ag_io_api_t ag_io_api_table = {
 ag_err_t ag_io_init(void)
 {
     if (s_lock == NULL) {
-        s_lock = xSemaphoreCreateRecursiveMutex();
+        s_lock = ag_port_mutex_new_recursive();
         if (s_lock == NULL) {
             return -AG_ENOMEM;
         }
     }
 
-    const ag_err_t err = ag_io_claims_init(SOC_GPIO_PIN_COUNT);
+    const ag_err_t err = ag_io_claims_init(AG_PORT_GPIO_PINS);
     if (err != AG_OK) {
         return err;
     }

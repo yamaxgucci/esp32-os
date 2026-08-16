@@ -11,12 +11,10 @@
 #include <argon/codepage.h>
 #include <argon/display.h>
 
-#include "esp_heap_caps.h"
-#include "esp_timer.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/queue.h"
-#include "freertos/semphr.h"
-#include "freertos/task.h"
+#include <argon/port/mem.h>
+#include <argon/port/time.h>
+#include <argon/port/sync.h>
+#include <argon/port/task.h>
 
 /*
  * A lone ESC only becomes the Escape key once nothing follows it.  30 ms is
@@ -71,9 +69,9 @@ typedef struct {
 
 static ag_screen_t        s_screen;
 static ag_con_endpoint_t  s_endpoints[AG_CON_MAX_ENDPOINTS];
-static SemaphoreHandle_t  s_lock;
-static QueueHandle_t      s_events;
-static TaskHandle_t       s_task;
+static ag_port_mutex_t         s_lock;
+static ag_port_queue_t s_events;
+static ag_port_task_t       s_task;
 static bool               s_ready;
 static ag_con_sink_fn     s_redirect;
 static void              *s_redirect_ctx;
@@ -90,19 +88,19 @@ static uint32_t s_key_stamp[256];
 
 /* ---------------------------------------------------------------------- */
 
-static uint32_t now_ms(void) { return (uint32_t)(esp_timer_get_time() / 1000); }
+static uint32_t now_ms(void) { return (uint32_t)(ag_port_us() / 1000); }
 
 void ag_console_lock(void)
 {
     if (s_lock != NULL) {
-        xSemaphoreTakeRecursive(s_lock, portMAX_DELAY);
+        ag_port_mutex_take_recursive(s_lock, AG_PORT_FOREVER);
     }
 }
 
 void ag_console_unlock(void)
 {
     if (s_lock != NULL) {
-        xSemaphoreGiveRecursive(s_lock);
+        ag_port_mutex_give_recursive(s_lock);
     }
 }
 
@@ -113,7 +111,7 @@ void *ag_console_lock_holder(void)
     if (s_lock == NULL) {
         return NULL;
     }
-    return (void *)xSemaphoreGetMutexHolder(s_lock);
+    return (void *)ag_port_mutex_holder(s_lock);
 }
 
 ag_screen_t *ag_console_screen(void) { return &s_screen; }
@@ -273,7 +271,7 @@ void ag_console_restore_tty(void)
 static void publish(const ag_event_t *ev)
 {
     ag_event_t stamped = *ev;
-    stamped.ts = (ag_time_t)esp_timer_get_time();
+    stamped.ts = (ag_time_t)ag_port_us();
 
     /*
      * The supervisor gets first look.  It must be quick - this runs on the
@@ -307,7 +305,7 @@ static void publish(const ag_event_t *ev)
      * This should not happen: pump_endpoint only reads what the queue can
      * hold.  The counter exists so that if it ever does, it is visible.
      */
-    if (xQueueSend(s_events, &stamped, 0) != pdTRUE) {
+    if (!ag_port_queue_send(s_events, &stamped, 0)) {
         s_dropped_events++;
     }
 }
@@ -315,7 +313,7 @@ static void publish(const ag_event_t *ev)
 /* Tells the sender to stop while the queue is filling, and to go on once it has
  * drained.  Two thresholds rather than one, so a queue hovering at the limit does
  * not turn into a stream of XOFF and XON. */
-static void update_flow(ag_con_endpoint_t *ep, UBaseType_t space)
+static void update_flow(ag_con_endpoint_t *ep, uint32_t space)
 {
     if (ep->transport->write == NULL) {
         return;
@@ -348,7 +346,7 @@ static int32_t pump_endpoint(ag_con_endpoint_t *ep)
      * transport's own buffer, which is where it is safe - and the sender is told
      * to stop before that buffer is the only thing holding the line.
      */
-    const UBaseType_t space = uxQueueSpacesAvailable(s_events);
+    const uint32_t space = ag_port_queue_space(s_events);
     update_flow(ep, space);
     if (space == 0) {
         return 0;
@@ -384,7 +382,7 @@ void ag_console_flush_input(void)
         return;
     }
     ag_event_t drop;
-    while (xQueueReceive(s_events, &drop, 0) == pdTRUE) {
+    while (ag_port_queue_recv(s_events, &drop, 0)) {
     }
     memset(s_key_down, 0, sizeof(s_key_down));
 }
@@ -408,10 +406,10 @@ bool ag_console_read_event(ag_event_t *ev, uint32_t timeout_ms)
     if (!s_ready || ev == NULL) {
         return false;
     }
-    const TickType_t ticks = (timeout_ms == UINT32_MAX)
-                                 ? portMAX_DELAY
-                                 : pdMS_TO_TICKS(timeout_ms);
-    return xQueueReceive(s_events, ev, ticks) == pdTRUE;
+    const ag_port_ticks_t ticks = (timeout_ms == UINT32_MAX)
+                                 ? AG_PORT_FOREVER
+                                 : ag_port_ms_to_ticks(timeout_ms);
+    return ag_port_queue_recv(s_events, ev, ticks);
 }
 
 bool ag_console_key_pressed(uint16_t keycode)
@@ -443,7 +441,7 @@ bool ag_console_peek_event(ag_event_t *ev)
 
     /* A caller that only wants the answer still needs somewhere for the copy. */
     ag_event_t scratch;
-    return xQueuePeek(s_events, (ev != NULL) ? ev : &scratch, 0) == pdTRUE;
+    return ag_port_queue_peek(s_events, (ev != NULL) ? ev : &scratch, 0);
 }
 
 int32_t ag_console_getch(uint32_t timeout_ms)
@@ -573,7 +571,7 @@ static void console_task(void *arg)
         render_all();
         ag_console_unlock();
 
-        vTaskDelay(pdMS_TO_TICKS(AG_CON_TICK_MS));
+        ag_port_task_delay(ag_port_ms_to_ticks(AG_CON_TICK_MS));
     }
 }
 
@@ -584,21 +582,21 @@ ag_err_t ag_console_init(uint16_t cols, uint16_t rows)
     }
 
     const size_t need = ag_screen_memsize(cols, rows);
-    void *mem = heap_caps_malloc(need, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    void *mem = ag_port_alloc(need, AG_MEM_FAST | AG_MEM_BYTE);
     if (mem == NULL) {
         return -AG_ENOMEM;
     }
 
     const ag_err_t err = ag_screen_init(&s_screen, mem, need, cols, rows);
     if (err != AG_OK) {
-        heap_caps_free(mem);
+        ag_port_free(mem);
         return err;
     }
 
-    s_lock = xSemaphoreCreateRecursiveMutex();
-    s_events = xQueueCreate(AG_CON_EVENT_QUEUE, sizeof(ag_event_t));
+    s_lock = ag_port_mutex_new_recursive();
+    s_events = ag_port_queue_new(AG_CON_EVENT_QUEUE, sizeof(ag_event_t));
     if (s_lock == NULL || s_events == NULL) {
-        heap_caps_free(mem);
+        ag_port_free(mem);
         return -AG_ENOMEM;
     }
 
@@ -608,10 +606,10 @@ ag_err_t ag_console_init(uint16_t cols, uint16_t rows)
      * The console task lives on the system core: the application core is
      * meant to stay free for the application.
      */
-    if (xTaskCreatePinnedToCore(console_task, "ag_con", 3072, NULL, 10, &s_task,
-                                0) != pdPASS) {
+    if (!ag_port_task_create(console_task, "ag_con", 3072, NULL, 10, 0, 0,
+                             &s_task)) {
         s_ready = false;
-        heap_caps_free(mem);
+        ag_port_free(mem);
         return -AG_ENOMEM;
     }
 

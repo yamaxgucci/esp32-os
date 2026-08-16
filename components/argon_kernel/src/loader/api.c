@@ -32,12 +32,10 @@
 #include <argon/shell.h>
 #include <argon/vfs.h>
 
-#include "sdkconfig.h"
+#include <argon/port/config.h>
 
-#include "esp_heap_caps.h"
-#include "esp_timer.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
+#include <argon/port/time.h>
+#include <argon/port/task.h>
 
 #include "dev/io.h"
 
@@ -526,17 +524,17 @@ static const ag_fs_api_t k_fs = {
 /* time                                                                   */
 /* ---------------------------------------------------------------------- */
 
-static ag_time_t api_us(void) { return (ag_time_t)esp_timer_get_time(); }
-static uint32_t api_ms(void) { return (uint32_t)(esp_timer_get_time() / 1000); }
-static uint64_t api_cycles(void) { return (uint64_t)esp_timer_get_time(); }
+static ag_time_t api_us(void) { return (ag_time_t)ag_port_us(); }
+static uint32_t api_ms(void) { return (uint32_t)(ag_port_us() / 1000); }
+static uint64_t api_cycles(void) { return (uint64_t)ag_port_us(); }
 
-static void api_delay_ms(uint32_t ms) { vTaskDelay(pdMS_TO_TICKS(ms)); }
+static void api_delay_ms(uint32_t ms) { ag_port_task_delay(ag_port_ms_to_ticks(ms)); }
 
 static void api_delay_us(uint32_t us)
 {
     /* Busy-wait: below a tick there is nothing to yield to. */
-    const int64_t until = esp_timer_get_time() + (int64_t)us;
-    while (esp_timer_get_time() < until) {
+    const int64_t until = ag_port_us() + (int64_t)us;
+    while (ag_port_us() < until) {
     }
 }
 
@@ -601,7 +599,7 @@ static bool api_inp_poll(ag_event_t *out, uint32_t timeout_ms)
         uint32_t left = timeout_ms;
         while (left > 0u) {
             const uint32_t step = left > 50u ? 50u : left;
-            vTaskDelay(pdMS_TO_TICKS(step < 1u ? 1u : step));
+            ag_port_task_delay(ag_port_ms_to_ticks(step < 1u ? 1u : step));
             left -= step;
             if (ag_proc_take_focus_event(out)) {
                 return true;

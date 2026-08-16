@@ -14,7 +14,7 @@
 #include <argon/log.h>
 #include <argon/vfs.h>
 
-#include "esp_heap_caps.h"
+#include <argon/port/mem.h>
 
 /*
  * One buffer holds every configuration file, laid end to end.  4 KB is a lot of
@@ -76,11 +76,11 @@ static ag_err_t load_one(const char *path, const char *label)
 ag_err_t ag_sysconfig_init(void)
 {
     if (s_text == NULL) {
-        s_text = (char *)heap_caps_malloc(AG_CFG_TEXT_BYTES,
-                                          MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        s_text = (char *)ag_port_alloc(AG_CFG_TEXT_BYTES,
+                                       AG_MEM_SLOW | AG_MEM_BYTE);
         if (s_text == NULL) {
-            s_text = (char *)heap_caps_malloc(
-                AG_CFG_TEXT_BYTES, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+            s_text = (char *)ag_port_alloc(AG_CFG_TEXT_BYTES,
+                                           AG_MEM_FAST | AG_MEM_BYTE);
         }
         if (s_text == NULL) {
             return -AG_ENOMEM;

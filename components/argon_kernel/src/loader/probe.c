@@ -8,7 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#ifdef CONFIG_IDF_TARGET
+#ifndef AG_HOST
 #include <argon/cfg.h>
 #include <argon/loader.h>
 #include <argon/log.h>
@@ -132,7 +132,7 @@ ag_err_t ag_probe_parse(const char *line, ag_probe_entry_t *out)
     return AG_OK;
 }
 
-#ifdef CONFIG_IDF_TARGET
+#ifndef AG_HOST
 
 static bool path_already_loaded(const char *path)
 {

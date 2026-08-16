@@ -10,7 +10,7 @@
 
 #include <argon/path.h>
 
-#include "sdkconfig.h"
+#include <argon/port/config.h>
 
 static ag_board_t s_board;
 

@@ -21,17 +21,12 @@
 #include <argon/shell.h>
 #include <argon/vfs.h>
 
-#include "esp_heap_caps.h"
-#include "esp_timer.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/queue.h"
-#include "freertos/semphr.h"
-#include "freertos/task.h"
-#include "multi_heap.h"
-#include "sdkconfig.h"
-#if CONFIG_SPIRAM
-#include "esp_private/freertos_idf_additions_priv.h"
-#endif
+#include <argon/port/config.h>
+#include <argon/port/fault.h>
+#include <argon/port/mem.h>
+#include <argon/port/sync.h>
+#include <argon/port/task.h>
+#include <argon/port/time.h>
 
 #include "dev/io.h"
 #include "fs/storage.h"
@@ -52,7 +47,7 @@
 #define AG_PROC_KILL_GRACE_MS 500
 
 static proc_t            s_procs[AG_PROC_MAX];
-static SemaphoreHandle_t s_lock;
+static ag_port_mutex_t        s_lock;
 static ag_pid_t          s_next_pid = 1;
 static ag_pid_t          s_foreground = AG_PID_KERNEL;
 
@@ -61,21 +56,21 @@ static ag_pid_t          s_foreground = AG_PID_KERNEL;
 static void lock(void)
 {
     if (s_lock != NULL) {
-        xSemaphoreTakeRecursive(s_lock, portMAX_DELAY);
+        ag_port_mutex_take_recursive(s_lock, AG_PORT_FOREVER);
     }
 }
 
 static void unlock(void)
 {
     if (s_lock != NULL) {
-        xSemaphoreGiveRecursive(s_lock);
+        ag_port_mutex_give_recursive(s_lock);
     }
 }
 
 void ag_proc_table_lock(void) { lock(); }
 void ag_proc_table_unlock(void) { unlock(); }
 
-static uint32_t now_ms(void) { return (uint32_t)(esp_timer_get_time() / 1000); }
+static uint32_t now_ms(void) { return (uint32_t)(ag_port_us() / 1000); }
 
 /* Truncating copy: a name or a path from a file is never allowed to run over. */
 static void set_string(char *dst, size_t len, const char *src)
@@ -108,7 +103,7 @@ static void set_string(char *dst, size_t len, const char *src)
  */
 static proc_t *current(void)
 {
-    const TaskHandle_t me = xTaskGetCurrentTaskHandle();
+    const ag_port_task_t me = ag_port_task_self();
 
     for (uint32_t i = 0; i < AG_PROC_MAX; i++) {
         if (s_procs[i].used && s_procs[i].task == me) {
@@ -179,14 +174,14 @@ static ag_err_t heap_create(proc_t *p, uint32_t requested)
     }
 
     for (;;) {
-        void *mem = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        void *mem = ag_port_alloc(size, AG_MEM_SLOW | AG_MEM_BYTE);
         if (mem == NULL) {
-            mem = heap_caps_malloc(size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+            mem = ag_port_alloc(size, AG_MEM_FAST | AG_MEM_BYTE);
         }
         if (mem != NULL) {
-            p->heap = multi_heap_register(mem, size);
+            p->heap = ag_port_heap_register(mem, size);
             if (p->heap == NULL) {
-                heap_caps_free(mem);
+                ag_port_free(mem);
                 return -AG_ENOMEM;
             }
             p->heap_mem = mem;
@@ -242,7 +237,7 @@ static void release_resource(ag_res_type_t type, void *ref, uint32_t extra,
     switch (type) {
     case AG_RES_MEM:
         /* Memory outside the arena: fast, DMA or executable. */
-        heap_caps_free(ref);
+        ag_port_free(ref);
         break;
     case AG_RES_FILE:
         (void)ag_vfs_close((ag_handle_t)(intptr_t)ref);
@@ -252,10 +247,10 @@ static void release_resource(ag_res_type_t type, void *ref, uint32_t extra,
         break;
     case AG_RES_MUTEX:
     case AG_RES_SEM:
-        vSemaphoreDelete((SemaphoreHandle_t)ref);
+        ag_port_sem_free((ag_port_sem_t)ref);
         break;
     case AG_RES_QUEUE:
-        vQueueDelete((QueueHandle_t)ref);
+        ag_port_queue_free((ag_queue_t)ref);
         break;
     default:
         ag_log(AG_LOG_WARN, "proc", "%s: no way to release a %s yet", p->name,
@@ -305,10 +300,10 @@ static void reap(proc_t *p)
     ag_loader_unload(&p->app);
 
     if (p->heap_mem != NULL) {
-        heap_caps_free(p->heap_mem);
+        ag_port_free(p->heap_mem);
     }
     if (p->done != NULL) {
-        vSemaphoreDelete(p->done);
+        ag_port_sem_free(p->done);
     }
     if (s_foreground == p->pid) {
         /* Back to whoever had it, if they are still there. */
@@ -334,7 +329,7 @@ static void console_restore(void)
  * syscall: it costs nothing per call, and the answer is the truth rather than a
  * flag that some path forgot to set.
  */
-static bool holds_kernel_lock(TaskHandle_t task)
+static bool holds_kernel_lock(ag_port_task_t task)
 {
     if (task == NULL) {
         return false;
@@ -344,7 +339,7 @@ static bool holds_kernel_lock(TaskHandle_t task)
            ag_hostfs_rpc_holder() == (void *)task;
 }
 
-bool ag_proc_task_in_kernel(TaskHandle_t task)
+bool ag_proc_task_in_kernel(ag_port_task_t task)
 {
     return holds_kernel_lock(task);
 }
@@ -363,7 +358,7 @@ bool ag_proc_note_fault(uint32_t cause, uint32_t pc, uint32_t vaddr, uint32_t sp
     if (p->fault.pending) {
         return false; /* faulting while being unwound: let it go to the panic */
     }
-    if (holds_kernel_lock(xTaskGetCurrentTaskHandle())) {
+    if (holds_kernel_lock(ag_port_task_self())) {
         return false; /* unwinding would leave a kernel lock held forever */
     }
 
@@ -422,9 +417,9 @@ static void crash_record(proc_t *p, const char *reason)
     size_t         used = 0;
 
     if (p->heap != NULL) {
-        multi_heap_info_t info;
-        multi_heap_get_info(p->heap, &info);
-        used = info.total_allocated_bytes;
+        ag_port_heap_info_t info;
+        ag_port_heap_info(p->heap, &info);
+        used = info.allocated;
     }
 
     ag_log(AG_LOG_ERROR, "proc", "%s (pid %u) killed: %s", p->name,
@@ -468,11 +463,11 @@ static void crash_record(proc_t *p, const char *reason)
     const uintptr_t code_end = code + p->app.header.code.size;
 
     ag_log(AG_LOG_ERROR, "proc", "  %s at pc %08x, address %08x, sp %08x",
-           ag_fault_cause_name(p->fault.cause), (unsigned)p->fault.pc,
+           ag_port_fault_cause_name(p->fault.cause), (unsigned)p->fault.pc,
            (unsigned)p->fault.vaddr, (unsigned)p->fault.sp);
 
     crash_printf("  %s at pc %08x, address %08x, sp %08x\n",
-                 ag_fault_cause_name(p->fault.cause), (unsigned)p->fault.pc,
+                 ag_port_fault_cause_name(p->fault.cause), (unsigned)p->fault.pc,
                  (unsigned)p->fault.vaddr, (unsigned)p->fault.sp);
 
     if (p->fault.pc >= code && p->fault.pc < code_end) {
@@ -494,38 +489,31 @@ static void crash_record(proc_t *p, const char *reason)
 /* Starting a process                                                     */
 /* ---------------------------------------------------------------------- */
 
-BaseType_t ag_proc_task_create(TaskFunction_t fn, const char *name,
-                               uint32_t stack_bytes, void *arg,
-                               UBaseType_t prio, BaseType_t core,
-                               TaskHandle_t *out)
+bool ag_proc_task_create(ag_port_task_fn fn, const char *name,
+                         uint32_t stack_bytes, void *arg, unsigned prio,
+                         int core, ag_port_task_t *out)
 {
-#if CONFIG_SPIRAM && CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM
+#if AG_PORT_TASK_STACK_CAPS
     /*
-     * prvTaskCreateDynamic* (not xTaskCreate*WithCaps): stack can live in
-     * PSRAM, but the task still tears down with ordinary vTaskDelete — which
-     * is what every process/thread exit path already uses.
-     *
-     * Caveat (ESP-IDF): a PSRAM stack must not run while the flash cache is
-     * disabled.  Argon apps talk to HostFS/SD; keep flash erase/write off the
-     * app task if that ever changes.
+     * Internal SRAM first, PSRAM only if there is not enough of it.  Which of
+     * the two it landed in is worth a line in the log: a task whose stack is in
+     * PSRAM cannot run while the flash cache is disabled, so if that ever
+     * becomes a problem the evidence is already in the journal.
      */
-    BaseType_t ok = prvTaskCreateDynamicPinnedToCoreWithCaps(
-        fn, name, stack_bytes, arg, prio, core,
-        MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT, out);
-    if (ok == pdPASS) {
-        return ok;
+    if (ag_port_task_create(fn, name, stack_bytes, arg, prio, core,
+                            AG_MEM_FAST | AG_MEM_BYTE, out)) {
+        return true;
     }
-    ok = prvTaskCreateDynamicPinnedToCoreWithCaps(
-        fn, name, stack_bytes, arg, prio, core,
-        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT, out);
-    if (ok == pdPASS) {
+    if (ag_port_task_create(fn, name, stack_bytes, arg, prio, core,
+                            AG_MEM_SLOW | AG_MEM_BYTE, out)) {
         ag_log(AG_LOG_INFO, "proc",
                "%s: task stack in PSRAM (%u bytes; internal SRAM was short)",
                name != NULL ? name : "?", (unsigned)stack_bytes);
+        return true;
     }
-    return ok;
+    return false;
 #else
-    return xTaskCreatePinnedToCore(fn, name, stack_bytes, arg, prio, out, core);
+    return ag_port_task_create(fn, name, stack_bytes, arg, prio, core, 0, out);
 #endif
 }
 
@@ -548,8 +536,8 @@ static uint32_t stack_bytes_for(const ag_axe_header_t *header)
     return clamp_stack_bytes(header->stack_size);
 }
 
-/* FreeRTOS priorities below AG_SUP_PRIORITY (15). */
-static UBaseType_t freertos_prio_for(uint8_t sched_class)
+/* Scheduler priorities, all below AG_SUP_PRIORITY (15). */
+static unsigned prio_for(uint8_t sched_class)
 {
     switch (sched_class) {
     case AG_PRIO_LOW:
@@ -567,7 +555,7 @@ static void apply_task_priority(proc_t *p)
     if (p == NULL || p->task == NULL) {
         return;
     }
-    vTaskPrioritySet(p->task, freertos_prio_for(p->sched_class));
+    ag_port_task_prio_set(p->task, prio_for(p->sched_class));
 }
 
 static void name_from_path(char *dst, size_t dst_len, const char *path)
@@ -734,7 +722,7 @@ static void proc_task(void *arg)
      * any of the application runs: exit() and the current-process lookup both
      * compare against it.
      */
-    p->task = xTaskGetCurrentTaskHandle();
+    p->task = ag_port_task_self();
     p->heartbeat_ms = now_ms();
     apply_task_priority(p);
 
@@ -746,9 +734,9 @@ static void proc_task(void *arg)
             p->state = AG_PS_ZOMBIE;
             ag_log(AG_LOG_ERROR, "proc", "%s (pid %u) failed to load: %d",
                    p->name, (unsigned)p->pid, (int)load_err);
-            SemaphoreHandle_t done_fail = p->done;
-            xSemaphoreGive(done_fail);
-            vTaskDelete(NULL);
+            ag_port_sem_t done_fail = p->done;
+            ag_port_sem_give(done_fail);
+            ag_port_task_delete(NULL);
             return;
         }
         apply_task_priority(p);
@@ -771,9 +759,9 @@ static void proc_task(void *arg)
     if (entry == NULL) {
         p->exit_code = (int32_t)-AG_EINVAL;
         p->state = AG_PS_ZOMBIE;
-        SemaphoreHandle_t done_bad = p->done;
-        xSemaphoreGive(done_bad);
-        vTaskDelete(NULL);
+        ag_port_sem_t done_bad = p->done;
+        ag_port_sem_give(done_bad);
+        ag_port_task_delete(NULL);
         return;
     }
 
@@ -782,7 +770,7 @@ static void proc_task(void *arg)
     }
     /* else: came back through ag_proc_exit, which set exit_code already */
 
-    p->stack_unused = (uint32_t)uxTaskGetStackHighWaterMark(NULL);
+    p->stack_unused = (uint32_t)ag_port_task_stack_unused(NULL);
     p->state = AG_PS_ZOMBIE;
 
     ag_log(AG_LOG_INFO, "proc", "%s (pid %u) returned %d, %u stack bytes unused",
@@ -790,9 +778,9 @@ static void proc_task(void *arg)
            (unsigned)p->stack_unused);
 
     /* Nothing may touch the process after this: whoever waits for it owns it. */
-    SemaphoreHandle_t done = p->done;
-    xSemaphoreGive(done);
-    vTaskDelete(NULL);
+    ag_port_sem_t done = p->done;
+    ag_port_sem_give(done);
+    ag_port_task_delete(NULL);
 }
 
 static proc_t *free_slot(void)
@@ -811,7 +799,7 @@ static proc_t *free_slot(void)
  */
 static ag_err_t spawn_common(proc_t *p, uint32_t flags, ag_pid_t *out_pid)
 {
-    p->done = xSemaphoreCreateBinary();
+    p->done = ag_port_sem_new_binary();
     if (p->done == NULL) {
         return -AG_ENOMEM;
     }
@@ -827,14 +815,11 @@ static ag_err_t spawn_common(proc_t *p, uint32_t flags, ag_pid_t *out_pid)
      * App core for interactive starts; system core for background.  Priority
      * comes from sched_class (applied inside proc_task); create uses normal.
      */
-    const BaseType_t core =
-        background ? (BaseType_t)0 : (BaseType_t)ag_sysinfo()->app_core;
-    const UBaseType_t prio = freertos_prio_for(p->sched_class);
+    const int      core = background ? 0 : (int)ag_sysinfo()->app_core;
+    const unsigned prio = prio_for(p->sched_class);
 
-    const BaseType_t created =
-        ag_proc_task_create(proc_task, p->name, p->stack_bytes, p, prio, core,
-                            NULL);
-    if (created != pdPASS) {
+    if (!ag_proc_task_create(proc_task, p->name, p->stack_bytes, p, prio, core,
+                             NULL)) {
         /*
          * Tried internal SRAM, then PSRAM (when enabled).  Failure here means
          * both are exhausted or the TCB (always internal) could not be taken.
@@ -846,7 +831,7 @@ static ag_err_t spawn_common(proc_t *p, uint32_t flags, ag_pid_t *out_pid)
         if (s_foreground == p->pid) {
             s_foreground = p->prev_foreground;
         }
-        vSemaphoreDelete(p->done);
+        ag_port_sem_free(p->done);
         p->done = NULL;
         return -AG_ENOMEM;
     }
@@ -891,7 +876,7 @@ ag_err_t ag_proc_spawn(const char *path, int argc, char **argv, uint32_t flags,
     p->used = true;
     p->pid = s_next_pid++;
     p->flags = flags;
-    p->started = (ag_time_t)esp_timer_get_time();
+    p->started = (ag_time_t)ag_port_us();
     p->sched_class = (uint8_t)AG_PRIO_NORMAL;
     p->load_pending = true;
     ag_reslist_init(&p->res, p->res_slots, AG_PROC_RES_MAX);
@@ -944,7 +929,7 @@ ag_err_t ag_proc_spawn_builtin(const char *name, ag_proc_entry_fn entry,
     p->used = true;
     p->pid = s_next_pid++;
     p->flags = flags;
-    p->started = (ag_time_t)esp_timer_get_time();
+    p->started = (ag_time_t)ag_port_us();
     p->sched_class = (uint8_t)AG_PRIO_NORMAL;
     p->load_pending = false;
     p->app.binding.entry = (void *)entry;
@@ -972,7 +957,7 @@ ag_err_t ag_proc_spawn_builtin(const char *name, ag_proc_entry_fn entry,
     err = spawn_common(p, flags, out_pid);
     if (err != AG_OK) {
         if (p->heap_mem != NULL) {
-            heap_caps_free(p->heap_mem);
+            ag_port_free(p->heap_mem);
         }
         memset(p, 0, sizeof(*p));
         unlock();
@@ -1006,7 +991,7 @@ ag_err_t ag_proc_wait(ag_pid_t pid, int32_t *exit_code, uint32_t timeout_ms)
         unlock();
         return -AG_ENOENT;
     }
-    SemaphoreHandle_t done = p->done;
+    ag_port_sem_t done = p->done;
     /*
      * Said out loud, because the supervisor collects what nobody is waiting for
      * and must not take this token out from under us: a stolen token is a wait
@@ -1019,10 +1004,10 @@ ag_err_t ag_proc_wait(ag_pid_t pid, int32_t *exit_code, uint32_t timeout_ms)
         return -AG_EINVAL;
     }
 
-    const TickType_t ticks = (timeout_ms == UINT32_MAX)
-                                 ? portMAX_DELAY
-                                 : pdMS_TO_TICKS(timeout_ms);
-    if (xSemaphoreTake(done, ticks) != pdTRUE) {
+    const ag_port_ticks_t ticks = (timeout_ms == UINT32_MAX)
+                                 ? AG_PORT_FOREVER
+                                 : ag_port_ms_to_ticks(timeout_ms);
+    if (!ag_port_sem_take(done, ticks)) {
         lock();
         p = by_pid(pid);
         if (p != NULL) {
@@ -1079,7 +1064,7 @@ ag_err_t ag_proc_kill(ag_pid_t pid, const char *reason)
         return AG_OK;
     }
 
-    const TaskHandle_t task = p->task;
+    const ag_port_task_t task = p->task;
     p->killed = true;
     p->signalled = true; /* ask first, in case it is listening */
     unlock();
@@ -1093,7 +1078,7 @@ ag_err_t ag_proc_kill(ag_pid_t pid, const char *reason)
         if (!holds_kernel_lock(task)) {
             break;
         }
-        vTaskDelay(pdMS_TO_TICKS(10));
+        ag_port_task_delay(ag_port_ms_to_ticks(10));
     }
 
     lock();
@@ -1123,7 +1108,7 @@ ag_err_t ag_proc_kill(ag_pid_t pid, const char *reason)
 
     crash_record(p, reason);
 
-    vTaskDelete(task);
+    ag_port_task_delete(task);
     p->task = NULL;
     p->exit_code = -AG_EKILLED;
     p->state = AG_PS_ZOMBIE;
@@ -1133,7 +1118,7 @@ ag_err_t ag_proc_kill(ag_pid_t pid, const char *reason)
      * waiting, the killer does it here and now, so that ps right after a kill
      * shows the truth rather than a corpse the supervisor has not swept up yet.
      */
-    SemaphoreHandle_t done = p->done;
+    ag_port_sem_t done = p->done;
     const bool        waited_for = p->has_waiter;
     if (!waited_for) {
         reap(p);
@@ -1143,7 +1128,7 @@ ag_err_t ag_proc_kill(ag_pid_t pid, const char *reason)
     console_restore();
 
     if (waited_for && done != NULL) {
-        xSemaphoreGive(done);
+        ag_port_sem_give(done);
     }
     return AG_OK;
 }
@@ -1286,23 +1271,23 @@ void *ag_proc_alloc(size_t bytes, uint32_t caps)
      */
     const uint32_t special = AG_MEM_FAST | AG_MEM_DMA | AG_MEM_EXEC;
     if (p == NULL || (caps & special) != 0) {
-        uint32_t want = MALLOC_CAP_8BIT;
+        uint32_t want = AG_MEM_BYTE;
         if (caps & AG_MEM_FAST) {
-            want |= MALLOC_CAP_INTERNAL;
+            want |= AG_MEM_FAST;
         }
         if (caps & AG_MEM_DMA) {
-            want |= MALLOC_CAP_DMA;
+            want |= AG_MEM_DMA;
         }
         if (caps & AG_MEM_EXEC) {
-            want |= MALLOC_CAP_EXEC;
+            want |= AG_MEM_EXEC;
         }
         if ((caps & special) == 0) {
-            want |= MALLOC_CAP_SPIRAM;
+            want |= AG_MEM_SLOW;
         }
 
-        void *ptr = heap_caps_malloc(bytes, want);
-        if (ptr == NULL && (want & MALLOC_CAP_SPIRAM)) {
-            ptr = heap_caps_malloc(bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        void *ptr = ag_port_alloc(bytes, want);
+        if (ptr == NULL && (want & AG_MEM_SLOW)) {
+            ptr = ag_port_alloc(bytes, AG_MEM_FAST | AG_MEM_BYTE);
         }
         if (ptr == NULL) {
             return NULL;
@@ -1314,7 +1299,7 @@ void *ag_proc_alloc(size_t bytes, uint32_t caps)
                 ag_log(AG_LOG_WARN, "proc",
                        "%s holds %u resources already; allocation refused",
                        p->name, (unsigned)ag_reslist_count(&p->res));
-                heap_caps_free(ptr);
+                ag_port_free(ptr);
                 return NULL;
             }
         }
@@ -1328,7 +1313,7 @@ void *ag_proc_alloc(size_t bytes, uint32_t caps)
         return NULL;
     }
 
-    void *ptr = multi_heap_malloc(p->heap, bytes);
+    void *ptr = ag_port_heap_alloc(p->heap, bytes);
     if (ptr != NULL && (caps & AG_MEM_ZERO)) {
         memset(ptr, 0, bytes);
     }
@@ -1343,16 +1328,16 @@ void *ag_proc_realloc(void *ptr, size_t bytes)
         return ag_proc_alloc(bytes, 0);
     }
     if (p == NULL) {
-        return heap_caps_realloc(ptr, bytes, MALLOC_CAP_8BIT);
+        return ag_port_realloc(ptr, bytes, AG_MEM_BYTE);
     }
 
     if (in_heap(p, ptr)) {
-        return multi_heap_realloc(p->heap, ptr, bytes);
+        return ag_port_heap_realloc(p->heap, ptr, bytes);
     }
 
     uint32_t old = 0;
     if (ag_reslist_remove(&p->res, AG_RES_MEM, ptr, &old)) {
-        void *moved = heap_caps_realloc(ptr, bytes, MALLOC_CAP_8BIT);
+        void *moved = ag_port_realloc(ptr, bytes, AG_MEM_BYTE);
         /* Whatever happened, what the process holds now has to be recorded. */
         if (ag_reslist_add(&p->res, AG_RES_MEM, (moved != NULL) ? moved : ptr,
                            (moved != NULL) ? (uint32_t)bytes : old) != AG_OK) {
@@ -1375,16 +1360,16 @@ void ag_proc_free(void *ptr)
 
     proc_t *p = current();
     if (p == NULL) {
-        heap_caps_free(ptr);
+        ag_port_free(ptr);
         return;
     }
 
     if (in_heap(p, ptr)) {
-        multi_heap_free(p->heap, ptr);
+        ag_port_heap_free(p->heap, ptr);
         return;
     }
     if (ag_reslist_remove(&p->res, AG_RES_MEM, ptr, NULL)) {
-        heap_caps_free(ptr);
+        ag_port_free(ptr);
         return;
     }
 
@@ -1405,9 +1390,9 @@ size_t ag_proc_usable_size(const void *ptr)
 
     proc_t *p = current();
     if (p != NULL && in_heap(p, ptr)) {
-        return multi_heap_get_allocated_size(p->heap, (void *)ptr);
+        return ag_port_heap_alloc_size(p->heap, (void *)ptr);
     }
-    return heap_caps_get_allocated_size((void *)ptr);
+    return ag_port_alloc_size((void *)ptr);
 }
 
 void ag_proc_meminfo(ag_meminfo_t *out)
@@ -1420,19 +1405,19 @@ void ag_proc_meminfo(ag_meminfo_t *out)
     const proc_t *p = current();
 
     if (p != NULL && p->heap != NULL) {
-        multi_heap_info_t info;
-        multi_heap_get_info(p->heap, &info);
+        ag_port_heap_info_t info;
+        ag_port_heap_info(p->heap, &info);
         out->arena_total = p->heap_size;
-        out->arena_free = info.total_free_bytes;
-        out->arena_largest = info.largest_free_block;
+        out->arena_free = info.free_bytes;
+        out->arena_largest = info.largest_free;
     } else {
         /* The kernel's own view: there is no process arena to report. */
-        out->arena_total = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
-        out->arena_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-        out->arena_largest = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+        out->arena_total = ag_port_mem_total(AG_MEM_SLOW);
+        out->arena_free = ag_port_mem_free(AG_MEM_SLOW);
+        out->arena_largest = ag_port_mem_largest(AG_MEM_SLOW);
     }
 
-    out->fast_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    out->fast_free = ag_port_mem_free(AG_MEM_FAST);
     out->system_free = out->fast_free;
 }
 
@@ -1481,7 +1466,7 @@ void ag_proc_fault_exit(void)
 
     if (p == NULL) {
         /* Cannot happen: the handler only diverts application tasks. */
-        vTaskDelete(NULL);
+        ag_port_task_delete(NULL);
         return;
     }
 
@@ -1489,7 +1474,7 @@ void ag_proc_fault_exit(void)
     p->killed = true;
     p->exit_code = -AG_EKILLED;
 
-    if (xTaskGetCurrentTaskHandle() == p->task) {
+    if (ag_port_task_self() == p->task) {
         /* The main task can unwind to where it was started from. */
         longjmp(p->exit_jump, 1);
     }
@@ -1505,7 +1490,7 @@ void ag_proc_fault_exit(void)
      */
     ag_thread_mark_self_finished();
     ag_supervisor_kill_request(p->pid);
-    vTaskDelete(NULL);
+    ag_port_task_delete(NULL);
 }
 
 bool ag_proc_interrupted(void)
@@ -1560,7 +1545,7 @@ bool ag_proc_take_focus_event(ag_event_t *out)
     p->focus_ev = 0;
     memset(out, 0, sizeof(*out));
     out->type = (kind == 1u) ? AG_EV_FOCUS_GAINED : AG_EV_FOCUS_LOST;
-    out->ts = (ag_time_t)esp_timer_get_time();
+    out->ts = (ag_time_t)ag_port_us();
     return true;
 }
 
@@ -1628,7 +1613,7 @@ ag_err_t ag_proc_init(void)
         return AG_OK;
     }
 
-    s_lock = xSemaphoreCreateRecursiveMutex();
+    s_lock = ag_port_mutex_new_recursive();
     if (s_lock == NULL) {
         return -AG_ENOMEM;
     }
