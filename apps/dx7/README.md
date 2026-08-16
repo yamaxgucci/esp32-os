@@ -8,6 +8,10 @@ bit-exact / SysEx-complete. Engine: [`apps/common/dx7`](../common/dx7).
 
 ## Build
 
+Normally just `argon apps` (or `argon apps --only DX7.AXE`) — the
+authoritative build line for this image lives in [`tools/apps.json`](../../tools/apps.json)
+and is compiled by CI. The command below is the same thing, spelled out:
+
 ```
 python tools/mkaxe.py --arch xtensa --gcc xtensa-esp32s3-elf-gcc `
   --include sdk/include --include apps/common --include apps/common/dsp `

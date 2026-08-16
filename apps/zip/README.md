@@ -5,6 +5,10 @@ Full archiver as a loadable `.AXE`. The shell builtin `unzip` lists and extracts
 
 ## Build
 
+Normally just `argon apps` (or `argon apps --only ZIP.AXE`) — the
+authoritative build line for this image lives in [`tools/apps.json`](../../tools/apps.json)
+and is compiled by CI. The command below is the same thing, spelled out:
+
 ```
 python tools/mkaxe.py --arch xtensa --gcc xtensa-esp32s3-elf-gcc `
   --include sdk/include `

@@ -5,6 +5,10 @@ soft RGB565 framebuffer (`ag_gfx_*`) instead of the text console.
 
 ## Build
 
+Normally just `argon apps` (or `argon apps --only GFXFM.AXE`) — the
+authoritative build line for this image lives in [`tools/apps.json`](../../tools/apps.json)
+and is compiled by CI. The command below is the same thing, spelled out:
+
 ```bat
 python tools/mkaxe.py --arch xtensa --gcc xtensa-esp32s3-elf-gcc ^
     --include sdk/include --include apps/fm ^

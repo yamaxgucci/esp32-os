@@ -9,6 +9,10 @@ Engine: [`apps/common/grain`](../common/grain). WAV: [`apps/common/wav`](../comm
 
 ## Build
 
+Normally just `argon apps` (or `argon apps --only GRAIN.AXE`) — the
+authoritative build line for this image lives in [`tools/apps.json`](../../tools/apps.json)
+and is compiled by CI. The command below is the same thing, spelled out:
+
 ```
 python tools/mkaxe.py --arch xtensa --gcc xtensa-esp32s3-elf-gcc `
   --include sdk/include --include apps/common --include apps/common/dsp `
