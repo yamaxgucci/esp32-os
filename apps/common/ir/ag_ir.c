@@ -149,10 +149,80 @@ static void normalize_peak(int16_t *x, uint32_t n, int32_t target_peak)
     }
 }
 
+static uint32_t isqrt64(uint64_t v)
+{
+    uint64_t rem = v;
+    uint64_t root = 0;
+    uint64_t bit = 1ull << 62;
+    while (bit > rem) {
+        bit >>= 2;
+    }
+    while (bit != 0ull) {
+        if (rem >= root + bit) {
+            rem -= root + bit;
+            root = (root >> 1) + bit;
+        } else {
+            root >>= 1;
+        }
+        bit >>= 2;
+    }
+    return (uint32_t)root;
+}
+
+/*
+ * Scale the IR by its energy, not its peak.
+ *
+ * The gain a convolution applies is sqrt(sum h^2), not max|h|: a 500 ms noise
+ * tail carries hundreds of times the energy of a 20 ms cabinet with the same
+ * peak sample.  Peak-normalising both left the long ones running the output
+ * into the rail on every sample - the wet signal stopped depending on the
+ * input level at all, which is the one thing a linear filter must never do.
+ */
+#define AG_IR_ENERGY 16384 /* sqrt(sum h^2): wet lands ~6..12 dB under dry */
+
+static void normalize_energy(int16_t *x, uint32_t n, int32_t target)
+{
+    uint64_t e2 = 0;
+    uint32_t i, rms;
+    for (i = 0; i < n; i++) {
+        const int32_t v = x[i];
+        e2 += (uint64_t)(v * v);
+    }
+    rms = isqrt64(e2);
+    if (rms < 1u) {
+        return;
+    }
+    for (i = 0; i < n; i++) {
+        x[i] = ag_sat16((int32_t)(((int64_t)x[i] * target) / (int64_t)rms));
+    }
+    /* No single tap at the rail either, whatever the energy scaling did. */
+    normalize_peak(x, n, 32000);
+}
+
+/* Forward FFT of partition p of mono[] into re/im. */
+static int part_fft(const int16_t *mono, uint32_t frames, uint32_t p,
+                    int32_t *re, int32_t *im)
+{
+    const uint32_t off = p * AG_IR_BLOCK;
+    uint32_t       i;
+
+    for (i = 0; i < AG_IR_FFT; i++) {
+        re[i] = 0;
+        im[i] = 0;
+    }
+    for (i = 0; i < AG_IR_BLOCK; i++) {
+        const uint32_t idx = off + i;
+        re[i] = (idx < frames) ? (int32_t)mono[idx] : 0;
+    }
+    return ag_fft_cplx_i32(re, im, (int)AG_IR_FFT, 1);
+}
+
 static int build_partitions(ag_ir_t *ir, int16_t *mono, uint32_t frames)
 {
     uint32_t parts, p, i;
     uint32_t bytes;
+    int32_t  biggest = 1;
+    uint8_t  shift = 0;
     static int32_t re[AG_IR_FFT];
     static int32_t im[AG_IR_FFT];
 
@@ -165,6 +235,27 @@ static int build_partitions(ag_ir_t *ir, int16_t *mono, uint32_t frames)
         parts = 1u;
     }
 
+    /* Pass one: how big do the bins actually get for this IR? */
+    for (p = 0; p < parts; p++) {
+        if (part_fft(mono, frames, p, re, im) != 0) {
+            return -1;
+        }
+        for (i = 0; i < AG_IR_FFT; i++) {
+            const int32_t a = re[i] < 0 ? -re[i] : re[i];
+            const int32_t b = im[i] < 0 ? -im[i] : im[i];
+            if (a > biggest) {
+                biggest = a;
+            }
+            if (b > biggest) {
+                biggest = b;
+            }
+        }
+    }
+    while (biggest > 30000 && shift < 15u) {
+        biggest >>= 1;
+        shift++;
+    }
+
     bytes = parts * AG_IR_FFT * 2u * (uint32_t)sizeof(int16_t);
     ir->H = (int16_t *)ag_malloc(bytes);
     ir->X = (int16_t *)ag_malloc(bytes);
@@ -175,25 +266,20 @@ static int build_partitions(ag_ir_t *ir, int16_t *mono, uint32_t frames)
     memset(ir->H, 0, bytes);
     memset(ir->X, 0, bytes);
 
+    /* Pass two: store, using the whole of int16. */
     for (p = 0; p < parts; p++) {
-        uint32_t off = p * AG_IR_BLOCK;
         int16_t *Hp = ir->H + p * AG_IR_FFT * 2u;
-        memset(re, 0, sizeof(re));
-        memset(im, 0, sizeof(im));
-        for (i = 0; i < AG_IR_BLOCK; i++) {
-            uint32_t idx = off + i;
-            re[i] = (idx < frames) ? (int32_t)mono[idx] : 0;
-        }
-        if (ag_fft_cplx_i32(re, im, (int)AG_IR_FFT, 1) != 0) {
+        if (part_fft(mono, frames, p, re, im) != 0) {
             free_spectra(ir);
             return -1;
         }
         for (i = 0; i < AG_IR_FFT; i++) {
-            Hp[i * 2u] = ag_sat16(re[i] >> 9);
-            Hp[i * 2u + 1u] = ag_sat16(im[i] >> 9);
+            Hp[i * 2u] = ag_sat16(re[i] >> shift);
+            Hp[i * 2u + 1u] = ag_sat16(im[i] >> shift);
         }
     }
 
+    ir->h_shift = shift;
     ir->parts = parts;
     ir->ir_frames = frames;
     ir->ready = 1;
@@ -217,7 +303,7 @@ int ag_ir_load(ag_ir_t *ir, const int16_t *mono, uint32_t frames, uint32_t src_r
     if (tmp == NULL) {
         return -1;
     }
-    normalize_peak(tmp, n, 12000);
+    normalize_energy(tmp, n, AG_IR_ENERGY);
     rc = build_partitions(ir, tmp, n);
     ag_free(tmp);
     return rc;
@@ -229,6 +315,16 @@ static int16_t rnd16(void)
 {
     s_rng = s_rng * 1664525u + 1013904223u;
     return (int16_t)((int32_t)(s_rng >> 16) - 32768);
+}
+
+/*
+ * Reseed per load.  The generator is file-scope, so without this the same
+ * preset built a different room every time it was selected - the reverb
+ * changed under the player, and no rendering of it could be reproduced.
+ */
+static void rnd_seed(int preset)
+{
+    s_rng = 0xA5F1523Du + (uint32_t)preset * 0x9E3779B9u;
 }
 
 int ag_ir_load_preset(ag_ir_t *ir, int preset)
@@ -247,6 +343,7 @@ int ag_ir_load_preset(ag_ir_t *ir, int preset)
     if (preset > 4) {
         preset = 4;
     }
+    rnd_seed(preset);
 
     n = ir_max_frames(ir->rate);
     buf = (int16_t *)ag_malloc(sizeof(int16_t) * n);
@@ -275,7 +372,7 @@ int ag_ir_load_preset(ag_ir_t *ir, int preset)
             buf[i] = ag_sat16(lp);
         }
         n = cab_n;
-        normalize_peak(buf, n, 14000);
+        normalize_energy(buf, n, AG_IR_ENERGY);
         rc = build_partitions(ir, buf, n);
         ag_free(buf);
         return rc;
@@ -312,7 +409,7 @@ int ag_ir_load_preset(ag_ir_t *ir, int preset)
         }
     }
 
-    normalize_peak(buf, n, 12000);
+    normalize_energy(buf, n, AG_IR_ENERGY);
     rc = build_partitions(ir, buf, n);
     ag_free(buf);
     return rc;
@@ -368,8 +465,10 @@ void ag_ir_process_block(ag_ir_t *ir, const int16_t *mono_in, int16_t *stereo_ou
             int32_t xii = Xp[i * 2u + 1u];
             int32_t hr = Hp[i * 2u];
             int32_t hi = Hp[i * 2u + 1u];
-            yre[i] += (xr * hr - xii * hi) >> 15;
-            yim[i] += (xr * hi + xii * hr) >> 15;
+            /* Round, not truncate: an arithmetic shift floors, and the bias
+             * would add up over every partition into a DC step. */
+            yre[i] += (xr * hr - xii * hi + 16384) >> 15;
+            yim[i] += (xr * hi + xii * hr + 16384) >> 15;
         }
     }
 
@@ -380,16 +479,18 @@ void ag_ir_process_block(ag_ir_t *ir, const int16_t *mono_in, int16_t *stereo_ou
     (void)ag_fft_cplx_i32(re, im, (int)AG_IR_FFT, 0);
 
     /*
-     * X,H each scaled /512; unnormalized IFFT(X*H) ≈ (x⋆h)/512.
-     * <<9 restores ≈ circular/linear OLA convolution.
+     * X is scaled /512 and H by 2^h_shift; the unnormalized inverse puts the
+     * 512 back, so what comes out is (x*h) / (2^h_shift * 32768).  Shifting
+     * left by h_shift leaves (x*h)/32768 - the IR read as Q15 gains, which is
+     * what normalize_energy set it up to be.
      */
     for (i = 0; i < AG_IR_BLOCK; i++) {
-        int32_t wet = (re[i] << 9) + (int32_t)ir->overlap[i];
+        int32_t wet = (re[i] << ir->h_shift) + (int32_t)ir->overlap[i];
         int32_t dry = (int32_t)mono_in[i];
         int32_t m;
         wet = (wet * (int32_t)ir->gain) >> 6;
         wet = ag_sat16(wet);
-        ir->overlap[i] = ag_sat16(re[i + AG_IR_BLOCK] << 9);
+        ir->overlap[i] = ag_sat16(re[i + AG_IR_BLOCK] << ir->h_shift);
         m = dry + (((wet - dry) * (int32_t)ir->wet) >> 7);
         m = ag_sat16(m);
         stereo_out[i * 2u] = (int16_t)m;
