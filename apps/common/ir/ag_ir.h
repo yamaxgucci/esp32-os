@@ -21,9 +21,17 @@ typedef struct ag_ir {
     uint8_t  wet;  /* 0..127 */
     uint8_t  gain; /* 0..127; 64 ≈ unity after IR normalize */
 
-    int16_t *H; /* parts * FFT * 2 (re,im) Q15-scaled */
+    int16_t *H; /* parts * FFT * 2 (re,im), scaled down by 2^h_shift */
     int16_t *X; /* input spectrum delay line */
     uint32_t x_pos;
+    /*
+     * How far H had to be shifted right to fit int16, picked from the IR that
+     * was actually loaded and undone again on the output.  A fixed shift
+     * cannot work for both a 20 ms cabinet and a 500 ms tail: one overflows
+     * the bins, the other leaves them near zero and the convolution turns
+     * into rounding noise.
+     */
+    uint8_t  h_shift;
 
     int16_t overlap[AG_IR_BLOCK];
 } ag_ir_t;
