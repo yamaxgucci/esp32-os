@@ -368,6 +368,52 @@ static void render_smp(const char *path, int preset, uint8_t note)
     free(rom);
 }
 
+static void render_wavetable(const char *path)
+{
+    /* Pretend a recorded WAV note, then cut one cycle — same path as a file. */
+    enum { PCM_N = 22050 };
+    int16_t   pcm_note[PCM_N];
+    int16_t   cycle[1024];
+    ag_synth_t s;
+    uint32_t   hold = RATE;
+    uint32_t   tail = RATE / 2u;
+    uint32_t   frames = hold + tail;
+    int16_t   *out = alloc_pcm(frames);
+    uint32_t   i, n;
+
+    if (out == NULL) {
+        return;
+    }
+    for (i = 0; i < PCM_N; i++) {
+        uint32_t ph = (uint32_t)(((uint64_t)i << 32) / (uint64_t)(RATE / 262u));
+        int32_t  acc = (int32_t)ag_dsp_sin(ph) +
+                      ((int32_t)ag_dsp_sin(ph * 2u) * 3) / 4 +
+                      ((int32_t)ag_dsp_sin(ph * 3u) / 2) +
+                      ((int32_t)ag_dsp_sin(ph * 5u) / 3);
+        pcm_note[i] = ag_sat16(acc);
+    }
+    n = ag_osc_cycle_from_pcm(cycle, 1024u, pcm_note, PCM_N, RATE, 60);
+    ag_synth_init(&s, RATE);
+    ag_synth_set_wavetable(&s, cycle, n);
+    ag_synth_set(&s, AG_SYNTH_P_WAVE1, AG_OSC_WT);
+    ag_synth_set(&s, AG_SYNTH_P_WAVE2, AG_OSC_WT);
+    ag_synth_set(&s, AG_SYNTH_P_CUTOFF, 100);
+    ag_synth_set(&s, AG_SYNTH_P_DRIVE, 0);
+    ag_synth_note_on(&s, 60, 110);
+    for (i = 0; i < frames; i += 256u) {
+        uint32_t nfr = 256u;
+        if (i + nfr > frames) {
+            nfr = frames - i;
+        }
+        if (i == hold) {
+            ag_synth_note_off(&s, 60);
+        }
+        ag_synth_render(&s, out + (int32_t)i * 2, (int32_t)nfr);
+    }
+    write_wav(path, out, frames);
+    free(out);
+}
+
 int main(int argc, char **argv)
 {
     const char *dir = "build/listen";
@@ -401,5 +447,7 @@ int main(int argc, char **argv)
     render_smp(path, AG_SMP_PIANO, 67);
     snprintf(path, sizeof(path), "%s/smp_bass.wav", dir);
     render_smp(path, AG_SMP_BASS, 52);
+    snprintf(path, sizeof(path), "%s/osc_wavetable.wav", dir);
+    render_wavetable(path);
     return 0;
 }
