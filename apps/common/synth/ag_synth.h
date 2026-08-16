@@ -48,6 +48,8 @@ enum {
     AG_SYNTH_P_FM_OPS,
     AG_SYNTH_P_ENGINE,
     AG_SYNTH_P_DIST_MODEL,
+    AG_SYNTH_P_OSC2_TUNE, /* 64 = 1× carrier; LFO here wiggles the modulator */
+    AG_SYNTH_P_FM_INDEX2, /* first stack link: mod-of-mod → modulator */
     AG_SYNTH_P_N
 };
 

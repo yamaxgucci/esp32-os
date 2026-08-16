@@ -368,6 +368,101 @@ static void render_smp(const char *path, int preset, uint8_t note)
     free(rom);
 }
 
+static void render_synth_clip(const char *path, void (*setup)(ag_synth_t *),
+                              uint8_t note)
+{
+    ag_synth_t s;
+    uint32_t   hold = RATE;
+    uint32_t   tail = RATE / 3u;
+    uint32_t   frames = hold + tail;
+    int16_t   *pcm = alloc_pcm(frames);
+    uint32_t   i;
+
+    if (pcm == NULL) {
+        return;
+    }
+    ag_synth_init(&s, RATE);
+    setup(&s);
+    ag_synth_note_on(&s, note, 110);
+    for (i = 0; i < frames; i += 256u) {
+        uint32_t n = 256u;
+        if (i + n > frames) {
+            n = frames - i;
+        }
+        if (i == hold) {
+            ag_synth_note_off(&s, note);
+        }
+        ag_synth_render(&s, pcm + (int32_t)i * 2, (int32_t)n);
+    }
+    write_wav(path, pcm, frames);
+    free(pcm);
+}
+
+static void setup_lfo_cutoff(ag_synth_t *s)
+{
+    ag_synth_set(s, AG_SYNTH_P_WAVE1, AG_OSC_SAW);
+    ag_synth_set(s, AG_SYNTH_P_CUTOFF, 72);
+    ag_synth_set(s, AG_SYNTH_P_RESO, 70);
+    ag_synth_set(s, AG_SYNTH_P_LFO_RATE, 48);
+    ag_synth_mod_bind(s, AG_SYNTH_SRC_LFO1, AG_SYNTH_P_CUTOFF, 90);
+}
+
+static void setup_lfo_pwm(ag_synth_t *s)
+{
+    ag_synth_set(s, AG_SYNTH_P_WAVE1, AG_OSC_SQR);
+    ag_synth_set(s, AG_SYNTH_P_OSC_MIX, 0);
+    ag_synth_set(s, AG_SYNTH_P_PWM, 64);
+    ag_synth_set(s, AG_SYNTH_P_CUTOFF, 110);
+    ag_synth_set(s, AG_SYNTH_P_LFO_RATE, 36);
+    ag_synth_mod_bind(s, AG_SYNTH_SRC_LFO1, AG_SYNTH_P_PWM, 100);
+}
+
+static void setup_va_pm(ag_synth_t *s)
+{
+    ag_synth_set(s, AG_SYNTH_P_WAVE1, AG_OSC_SIN);
+    ag_synth_set(s, AG_SYNTH_P_WAVE2, AG_OSC_SIN);
+    ag_synth_set(s, AG_SYNTH_P_OSC_MIX, 0); /* carrier only — hear PM */
+    ag_synth_set(s, AG_SYNTH_P_OSC2_TUNE, 127); /* ~2× */
+    ag_synth_set(s, AG_SYNTH_P_FM_INDEX, 72);
+    ag_synth_set(s, AG_SYNTH_P_CUTOFF, 120);
+}
+
+static void setup_va_pm_lfo_index(ag_synth_t *s)
+{
+    setup_va_pm(s);
+    ag_synth_set(s, AG_SYNTH_P_FM_INDEX, 36);
+    ag_synth_set(s, AG_SYNTH_P_LFO_RATE, 44);
+    ag_synth_mod_bind(s, AG_SYNTH_SRC_LFO1, AG_SYNTH_P_FM_INDEX, 110);
+}
+
+static void setup_va_pm_lfo_modosc(ag_synth_t *s)
+{
+    setup_va_pm(s);
+    ag_synth_set(s, AG_SYNTH_P_OSC2_TUNE, 64);
+    ag_synth_set(s, AG_SYNTH_P_FM_INDEX, 80);
+    ag_synth_set(s, AG_SYNTH_P_LFO_RATE, 40);
+    /* LFO wobbles the modulator's ratio — modulation of the modulator. */
+    ag_synth_mod_bind(s, AG_SYNTH_SRC_LFO1, AG_SYNTH_P_OSC2_TUNE, 80);
+}
+
+static void setup_fm_stack(ag_synth_t *s)
+{
+    ag_synth_set(s, AG_SYNTH_P_ENGINE, AG_SYNTH_FM);
+    ag_synth_set(s, AG_SYNTH_P_FM_OPS, 3);
+    ag_synth_set(s, AG_SYNTH_P_FM_INDEX, 90);
+    ag_synth_set(s, AG_SYNTH_P_FM_INDEX2, 0); /* 2-op: no mod-of-mod */
+    ag_synth_set(s, AG_SYNTH_P_CUTOFF, 120);
+}
+
+static void setup_fm_modofmod(ag_synth_t *s)
+{
+    setup_fm_stack(s);
+    ag_synth_set(s, AG_SYNTH_P_FM_INDEX, 60);
+    ag_synth_set(s, AG_SYNTH_P_FM_INDEX2, 16);
+    ag_synth_set(s, AG_SYNTH_P_LFO_RATE, 52);
+    ag_synth_mod_bind(s, AG_SYNTH_SRC_LFO1, AG_SYNTH_P_FM_INDEX2, 140);
+}
+
 static void render_wavetable(const char *path)
 {
     /* Pretend a recorded WAV note, then cut one cycle — same path as a file. */
@@ -449,5 +544,19 @@ int main(int argc, char **argv)
     render_smp(path, AG_SMP_BASS, 52);
     snprintf(path, sizeof(path), "%s/osc_wavetable.wav", dir);
     render_wavetable(path);
+    snprintf(path, sizeof(path), "%s/mod_lfo_cutoff.wav", dir);
+    render_synth_clip(path, setup_lfo_cutoff, 60);
+    snprintf(path, sizeof(path), "%s/mod_lfo_pwm.wav", dir);
+    render_synth_clip(path, setup_lfo_pwm, 52);
+    snprintf(path, sizeof(path), "%s/mod_va_pm.wav", dir);
+    render_synth_clip(path, setup_va_pm, 60);
+    snprintf(path, sizeof(path), "%s/mod_va_pm_lfo_index.wav", dir);
+    render_synth_clip(path, setup_va_pm_lfo_index, 60);
+    snprintf(path, sizeof(path), "%s/mod_va_modosc.wav", dir);
+    render_synth_clip(path, setup_va_pm_lfo_modosc, 60);
+    snprintf(path, sizeof(path), "%s/mod_fm_stack.wav", dir);
+    render_synth_clip(path, setup_fm_stack, 64);
+    snprintf(path, sizeof(path), "%s/mod_fm_modofmod.wav", dir);
+    render_synth_clip(path, setup_fm_modofmod, 64);
     return 0;
 }

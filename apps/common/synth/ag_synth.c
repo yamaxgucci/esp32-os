@@ -5,11 +5,12 @@
 #include "ag_synth.h"
 
 static const int32_t k_pmin[AG_SYNTH_P_N] = {
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0,
+    1, 0
 };
 static const int32_t k_pmax[AG_SYNTH_P_N] = {
     127, 127, 127, 127, 127, 127, 127, 5, 5, 127, 127, 127, 127, 127,
-    127, 127, 127, 127, 127, 127, 4, 127, 8, 1, 4
+    127, 127, 127, 127, 127, 127, 4, 127, 8, 1, 4, 127, 127
 };
 
 static int32_t clamp_param(uint16_t id, int32_t v)
@@ -46,9 +47,11 @@ void ag_synth_init(ag_synth_t *s, uint32_t rate)
     s->base[AG_SYNTH_P_FILT_R] = 40;
     s->base[AG_SYNTH_P_FILT_AMT] = 60;
     s->base[AG_SYNTH_P_LFO_RATE] = 40;
-    s->base[AG_SYNTH_P_FM_INDEX] = 70;
+    s->base[AG_SYNTH_P_FM_INDEX] = 0; /* VA: no PM until set; FM path fills this */
     s->base[AG_SYNTH_P_FM_OPS] = 4;
     s->base[AG_SYNTH_P_ENGINE] = AG_SYNTH_VA;
+    s->base[AG_SYNTH_P_OSC2_TUNE] = 64;
+    s->base[AG_SYNTH_P_FM_INDEX2] = 70;
     s->lfo1.wave = AG_DSP_LFO_TRI;
     s->lfo2.wave = AG_DSP_LFO_SIN;
     ag_dsp_lfo_set_hz_x100(&s->lfo1, 40 * 8, s->rate); /* ~3.2 Hz */
@@ -76,6 +79,10 @@ void ag_synth_set(ag_synth_t *s, uint16_t param, int32_t value)
     }
     if (param == AG_SYNTH_P_LFO_WAVE) {
         s->lfo1.wave = (uint8_t)s->base[param];
+    }
+    if (param == AG_SYNTH_P_ENGINE && s->base[param] == AG_SYNTH_FM &&
+        s->base[AG_SYNTH_P_FM_INDEX] == 0) {
+        s->base[AG_SYNTH_P_FM_INDEX] = 70;
     }
     if (param == AG_SYNTH_P_FM_OPS) {
         int i;
@@ -182,7 +189,11 @@ void ag_synth_note_on(ag_synth_t *s, uint8_t note, uint8_t vel)
     v->age = ++s->age_seq;
     hz = ag_dsp_note_hz_x100((int)note);
     ag_osc_set_hz_x100(&v->osc1, hz, s->rate);
-    ag_osc_set_hz_x100(&v->osc2, hz + hz / 200, s->rate); /* light detune */
+    {
+        int32_t tune = s->base[AG_SYNTH_P_OSC2_TUNE];
+        int32_t hz2 = (hz * (tune > 0 ? tune : 64)) / 64;
+        ag_osc_set_hz_x100(&v->osc2, hz2, s->rate);
+    }
     v->osc1.wave = (uint8_t)s->base[AG_SYNTH_P_WAVE1];
     v->osc2.wave = (uint8_t)s->base[AG_SYNTH_P_WAVE2];
     v->osc1.pwm = (uint8_t)s->base[AG_SYNTH_P_PWM];
@@ -195,7 +206,16 @@ void ag_synth_note_on(ag_synth_t *s, uint8_t note, uint8_t vel)
     ag_dsp_adsr_on(&v->amp);
     ag_dsp_adsr_on(&v->feg);
     ag_fmx_set_n(&v->fmx, (int)s->base[AG_SYNTH_P_FM_OPS]);
-    v->fmx.route[0][1] = (uint8_t)s->base[AG_SYNTH_P_FM_INDEX];
+    ag_fmx_algo_stack(&v->fmx);
+    {
+        int n = (int)v->fmx.n_ops;
+        if (n >= 2) {
+            v->fmx.route[n - 2][n - 1] = (uint8_t)s->base[AG_SYNTH_P_FM_INDEX];
+        }
+        if (n >= 3) {
+            v->fmx.route[0][1] = (uint8_t)s->base[AG_SYNTH_P_FM_INDEX2];
+        }
+    }
     ag_fmx_set_hz(&v->fmx, hz, s->rate);
     ag_fmx_note_on(&v->fmx);
     s->ctrl_left = 0;
@@ -293,13 +313,19 @@ static int32_t render_voice(ag_synth_t *s, ag_synth_voice_t *v, int32_t *eff)
         return 0;
     }
     if (eff[AG_SYNTH_P_ENGINE] == AG_SYNTH_FM) {
-        v->fmx.route[0][1] = (uint8_t)eff[AG_SYNTH_P_FM_INDEX];
+        int n = (int)v->fmx.n_ops;
+        if (n >= 2) {
+            v->fmx.route[n - 2][n - 1] = (uint8_t)eff[AG_SYNTH_P_FM_INDEX];
+        }
+        if (n >= 3) {
+            v->fmx.route[0][1] = (uint8_t)eff[AG_SYNTH_P_FM_INDEX2];
+        }
         mix = ag_fmx_tick(&v->fmx, (uint8_t)eff[AG_SYNTH_P_AMP_A],
                           (uint8_t)eff[AG_SYNTH_P_AMP_D],
                           (uint8_t)eff[AG_SYNTH_P_AMP_S],
                           (uint8_t)eff[AG_SYNTH_P_AMP_R], v->gate);
     } else {
-        int32_t a, b, n, m;
+        int32_t a, b, n, m, hz, tune;
         v->osc1.wave = (uint8_t)eff[AG_SYNTH_P_WAVE1];
         v->osc2.wave = (uint8_t)eff[AG_SYNTH_P_WAVE2];
         v->osc1.pwm = (uint8_t)eff[AG_SYNTH_P_PWM];
@@ -308,8 +334,16 @@ static int32_t render_voice(ag_synth_t *s, ag_synth_voice_t *v, int32_t *eff)
             ag_osc_set_table(&v->osc1, s->wt, s->wt_n);
             ag_osc_set_table(&v->osc2, s->wt, s->wt_n);
         }
-        a = ag_osc_tick(&v->osc1);
+        hz = ag_dsp_note_hz_x100((int)v->note);
+        tune = eff[AG_SYNTH_P_OSC2_TUNE];
+        ag_osc_set_hz_x100(&v->osc2, (hz * (tune > 0 ? tune : 64)) / 64, s->rate);
         b = ag_osc_tick(&v->osc2);
+        if (eff[AG_SYNTH_P_FM_INDEX] > 0) {
+            int32_t pm = (b * (int32_t)eff[AG_SYNTH_P_FM_INDEX]) >> 6;
+            a = ag_osc_tick_pm(&v->osc1, pm);
+        } else {
+            a = ag_osc_tick(&v->osc1);
+        }
         n = 0;
         if (eff[AG_SYNTH_P_NOISE] > 0) {
             n = (ag_osc_tick(&v->noise) * (int32_t)eff[AG_SYNTH_P_NOISE]) >> 7;

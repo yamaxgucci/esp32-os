@@ -37,5 +37,7 @@ uint32_t ag_osc_cycle_from_pcm(int16_t *dst, uint32_t cap, const int16_t *pcm,
                                uint32_t frames, uint32_t src_rate, int root);
 
 int32_t ag_osc_tick(ag_osc_t *o); /* -32767..32767 */
+/* Same, but add pm (Q15, ±32767 ≈ ±½ cycle) to phase for this sample. */
+int32_t ag_osc_tick_pm(ag_osc_t *o, int32_t pm);
 
 #endif
