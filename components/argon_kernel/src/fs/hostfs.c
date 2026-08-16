@@ -28,6 +28,10 @@
 /* Large WRITE + PADPUSH needs headroom: one 4 KiB RPC at 115200 is ~0.4 s. */
 #define HSFS_RPC_TIMEOUT_MS 30000
 #define HSFS_PING_TIMEOUT_MS 250
+/* On the boot path only: a helper that is already listening answers in single
+ * digit milliseconds over a local socket, and a board with no helper must not
+ * pay more than this.  Slow starts are picked up by the retry task instead. */
+#define HSFS_BOOT_PING_MS    100
 #define HSFS_HELPER_WAIT_MS  3000
 /* Cap each uart_write so pump_rx_during_tx can drain PADPUSH between slices. */
 #define HSFS_TX_SLICE       128
@@ -53,6 +57,7 @@ static uint16_t          s_seq;
 static uint8_t  s_pad[AG_PAD_BYTES];
 static uint32_t s_pad_ms; /* esp_timer ms of last PADPUSH; 0 = never */
 static TaskHandle_t s_pad_task;
+static TaskHandle_t s_wait_task; /* off-boot retry while the helper appears */
 
 /* One-header lookaside: pad_drain must not eat a real RPC response. */
 static hsfs_hdr_t s_held_hdr;
@@ -499,9 +504,12 @@ static ag_err_t hs_readdir(void *ctx, void *dir, ag_dirent_t *out)
     }
     char     name[HSFS_MAX_NAME + 1];
     uint32_t mode = 0;
+    uint32_t size32 = 0;
     uint32_t nlen = 0;
+    /* a1 carries the size: without it `dir h:\` printed 0 bytes for every
+     * file on the host share.  An older helper leaves it zero, as before. */
     const ag_err_t err =
-        rpc(HSFS_OP_READDIR, d->host_h, 0, NULL, NULL, 0, &mode, NULL, name,
+        rpc(HSFS_OP_READDIR, d->host_h, 0, NULL, NULL, 0, &mode, &size32, name,
             sizeof(name) - 1, &nlen, HSFS_RPC_TIMEOUT_MS);
     if (err != AG_OK) {
         return err;
@@ -517,6 +525,7 @@ static ag_err_t hs_readdir(void *ctx, void *dir, ag_dirent_t *out)
     memcpy(out->name, name, nlen);
     out->name[nlen] = '\0';
     out->st.attr = (mode & HSFS_MODE_DIR) != 0 ? AG_A_DIR : 0;
+    out->st.size = (mode & HSFS_MODE_DIR) != 0 ? 0u : size32;
     return AG_OK;
 }
 
@@ -759,6 +768,60 @@ static const ag_fs_ops_t k_ops = {
     .info = hs_info,
 };
 
+/* One PING; mounts /host and starts the pad drain when the helper answers. */
+static ag_err_t hostfs_probe_once(uint32_t timeout_ms)
+{
+    uint32_t pong = 0;
+    ag_err_t err;
+
+    if (s_mounted) {
+        return AG_OK;
+    }
+    err = rpc(HSFS_OP_PING, 0, 0, NULL, NULL, 0, &pong, NULL, NULL, 0, NULL,
+              timeout_ms);
+    if (err != AG_OK) {
+        return -AG_ENODEV;
+    }
+
+    err = ag_vfs_mount("/host", &k_ops, NULL, 0);
+    if (err != AG_OK) {
+        ag_log(AG_LOG_ERROR, "hostfs", "mount /host failed (%d)", (int)err);
+        return err;
+    }
+    s_mounted = true;
+    if (s_pad_task == NULL) {
+        (void)xTaskCreatePinnedToCore(pad_drain_task, "ag_hpad", 2048, NULL, 5,
+                                      &s_pad_task, 0);
+    }
+    ag_log(AG_LOG_INFO, "hostfs", "H: → /host (live host folder)");
+    return AG_OK;
+}
+
+/*
+ * After guest `reboot`, QEMU may drop and reopen the UART1 TCP link, so a
+ * reconnecting hostfsd can miss the first PING.  Keep asking - off the boot
+ * path, because a host helper is optional and a board that has none must not
+ * pay for the wait: on real hardware there is never one.
+ */
+static void hostfs_wait_task(void *arg)
+{
+    const int64_t deadline =
+        esp_timer_get_time() + (int64_t)HSFS_HELPER_WAIT_MS * 1000;
+
+    (void)arg;
+    while (!s_mounted && esp_timer_get_time() < deadline) {
+        if (hostfs_probe_once(HSFS_PING_TIMEOUT_MS) == AG_OK) {
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    if (!s_mounted) {
+        ag_log(AG_LOG_INFO, "hostfs", "no host helper on UART1 (skip H:)");
+    }
+    s_wait_task = NULL;
+    vTaskDelete(NULL);
+}
+
 ag_err_t ag_hostfs_try_mount(void)
 {
     if (s_mounted) {
@@ -775,55 +838,17 @@ ag_err_t ag_hostfs_try_mount(void)
         return -AG_ENODEV;
     }
 
-    /*
-     * After guest `reboot`, QEMU may drop/reopen the UART1 TCP link.  Retry
-     * for a few seconds so a reconnecting hostfsd is not missed on the first
-     * PING.  Without -HostFs this is just boot delay, so keep it short.
-     */
-    {
-        uint32_t      pong = 0;
-        ag_err_t      ping = -AG_ENODEV;
-        const int64_t deadline =
-            esp_timer_get_time() + (int64_t)HSFS_HELPER_WAIT_MS * 1000;
-
-        while (esp_timer_get_time() < deadline) {
-            int64_t  left_us = deadline - esp_timer_get_time();
-            uint32_t to_ms;
-
-            if (left_us <= 0) {
-                break;
-            }
-            to_ms = (uint32_t)(left_us / 1000);
-            if (to_ms < 1u) {
-                to_ms = 1u;
-            }
-            if (to_ms > HSFS_PING_TIMEOUT_MS) {
-                to_ms = HSFS_PING_TIMEOUT_MS;
-            }
-            ping = rpc(HSFS_OP_PING, 0, 0, NULL, NULL, 0, &pong, NULL, NULL, 0,
-                       NULL, to_ms);
-            if (ping == AG_OK) {
-                break;
-            }
-        }
-        if (ping != AG_OK) {
-            ag_log(AG_LOG_INFO, "hostfs", "no host helper on UART1 (skip H:)");
-            return -AG_ENODEV;
-        }
+    /* Answered straight away: mount now, so H: is there for AUTOEXEC. */
+    if (hostfs_probe_once(HSFS_BOOT_PING_MS) == AG_OK) {
+        return AG_OK;
     }
 
-    const ag_err_t m = ag_vfs_mount("/host", &k_ops, NULL, 0);
-    if (m != AG_OK) {
-        ag_log(AG_LOG_ERROR, "hostfs", "mount /host failed (%d)", (int)m);
-        return m;
+    /* Nobody yet.  Keep trying in the background and let boot carry on. */
+    if (s_wait_task == NULL) {
+        (void)xTaskCreatePinnedToCore(hostfs_wait_task, "ag_hwait", 3072, NULL,
+                                      4, &s_wait_task, 0);
     }
-    s_mounted = true;
-    if (s_pad_task == NULL) {
-        (void)xTaskCreatePinnedToCore(pad_drain_task, "ag_hpad", 2048, NULL, 5,
-                                      &s_pad_task, 0);
-    }
-    ag_log(AG_LOG_INFO, "hostfs", "H: → /host (live host folder)");
-    return AG_OK;
+    return -AG_ENODEV;
 }
 
 bool ag_hostfs_mounted(void) { return s_mounted; }

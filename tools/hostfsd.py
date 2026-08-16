@@ -311,8 +311,18 @@ class Session:
             name = ent.name.encode("utf-8", errors="surrogateescape")
             if len(name) > 255:
                 name = name[:255]
-            mode = MODE_DIR if ent.is_dir(follow_symlinks=False) else 0
-            send_resp(conn, op, seq, AG_OK, a0=mode, data=name, lock=lock)
+            is_dir = ent.is_dir(follow_symlinks=False)
+            mode = MODE_DIR if is_dir else 0
+            # a1 = size, so `dir h:\` in the guest can print one.  It used to
+            # go out empty and every file on the share showed as 0 bytes.
+            size = 0
+            if not is_dir:
+                try:
+                    size = min(ent.stat(follow_symlinks=False).st_size, 0xFFFFFFFF)
+                except OSError:
+                    size = 0
+            send_resp(conn, op, seq, AG_OK, a0=mode, a1=int(size), data=name,
+                      lock=lock)
             return
 
         if op == OP_CLOSEDIR:
