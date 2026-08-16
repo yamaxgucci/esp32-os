@@ -97,6 +97,8 @@ typedef struct ag_synth {
     uint8_t          at;
     uint32_t         age_seq;
     uint32_t         ctrl_left;
+    const int16_t   *wt;
+    uint32_t         wt_n;
 } ag_synth_t;
 
 void ag_synth_init(ag_synth_t *s, uint32_t rate);
@@ -111,6 +113,7 @@ void ag_synth_all_notes_off(ag_synth_t *s);
 void ag_synth_set_mw(ag_synth_t *s, uint8_t v);
 void ag_synth_set_at(ag_synth_t *s, uint8_t v);
 
+void ag_synth_set_wavetable(ag_synth_t *s, const int16_t *data, uint32_t frames);
 void ag_synth_render(ag_synth_t *s, int16_t *stereo, int32_t frames);
 
 #endif

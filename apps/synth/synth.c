@@ -29,6 +29,7 @@ static int        s_fx_on;
 static int        s_ir_on;
 static int        s_cab = 3;
 static int16_t    s_pcm[CHUNK * 2];
+static int16_t    s_wt[1024];
 static int16_t    s_ir_mono[AG_IR_BLOCK];
 static int16_t    s_ir_st[AG_IR_BLOCK * 2];
 static uint8_t    s_held[128];
@@ -138,7 +139,7 @@ static void draw_ui(void)
     ag_printf("fx %s  cab %s (preset %d)  load %u%%  late %u\n",
               s_fx_on ? "on" : "off", s_ir_on ? "on" : "off", s_cab,
               (unsigned)s_out.load_pct, (unsigned)s_out.late);
-    ag_printf("Z-M / Q-I notes  [ ] cut  - = reso  1-5 wave\n");
+    ag_printf("Z-M / Q-I notes  [ ] cut  - = reso  1-6 wave (6=wavetable)\n");
     ag_printf("D drive  T tube/jfet  F VA/FM  O ops  L LFO->cut\n");
     ag_printf("X fx  I cab  C cab preset  Space panic  Esc quit\n");
     s_dirty = 0;
@@ -190,7 +191,7 @@ static void handle_key(int key, int down, int ch)
         nudge(AG_SYNTH_P_RESO, -4);
     } else if (ch == '=' || key == '=') {
         nudge(AG_SYNTH_P_RESO, 4);
-    } else if (ch >= '1' && ch <= '5') {
+    } else if (ch >= '1' && ch <= '6') {
         ag_synth_set(&s_s, AG_SYNTH_P_WAVE1, ch - '1');
         s_dirty = 1;
     } else if (ch == 'd' || ch == 'D') {
@@ -244,6 +245,18 @@ int ag_main(int argc, char **argv)
     }
 
     ag_synth_init(&s_s, RATE);
+    {
+        uint32_t k;
+        for (k = 0; k < 1024u; k++) {
+            uint32_t ph = k * (1u << 22);
+            int32_t  acc = (int32_t)ag_dsp_sin(ph) +
+                          ((int32_t)ag_dsp_sin(ph * 2u) / 2) +
+                          ((int32_t)ag_dsp_sin(ph * 3u) / 3) +
+                          ((int32_t)ag_dsp_sin(ph * 4u) / 4);
+            s_wt[k] = ag_sat16(acc);
+        }
+        ag_synth_set_wavetable(&s_s, s_wt, 1024u);
+    }
     if (ag_pcm_open(&s_out, sink, RATE, 2) != 0) {
         ag_printf("synth: no audio sink\n");
         return 1;

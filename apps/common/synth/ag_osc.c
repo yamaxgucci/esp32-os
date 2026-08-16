@@ -14,6 +14,62 @@ void ag_osc_set_hz_x100(ag_osc_t *o, int32_t hz_x100, uint32_t rate)
     o->step = ag_dsp_hz_to_step(hz_x100, rate);
 }
 
+void ag_osc_set_table(ag_osc_t *o, const int16_t *data, uint32_t frames)
+{
+    if (o == 0) {
+        return;
+    }
+    if (data == 0 || frames < 2u) {
+        o->wt = 0;
+        o->wt_n = 0;
+        return;
+    }
+    o->wt = data;
+    o->wt_n = frames;
+}
+
+uint32_t ag_osc_cycle_from_pcm(int16_t *dst, uint32_t cap, const int16_t *pcm,
+                               uint32_t frames, uint32_t src_rate, int root)
+{
+    int32_t  hz;
+    uint32_t period, i, n;
+
+    if (dst == 0 || cap < 2u || pcm == 0 || frames < 2u) {
+        return 0;
+    }
+    hz = ag_dsp_note_hz_x100(root);
+    if (hz < 100) {
+        hz = 100;
+    }
+    if (src_rate < 1u) {
+        src_rate = 22050u;
+    }
+    period = (uint32_t)(((int64_t)src_rate * 100) / (int64_t)hz);
+    if (period < 2u) {
+        period = 2u;
+    }
+    if (period > frames) {
+        period = frames;
+    }
+    n = cap;
+    if (n > 2048u) {
+        n = 2048u;
+    }
+    for (i = 0; i < n; i++) {
+        uint64_t pos = ((uint64_t)i * (uint64_t)period << 16) / (uint64_t)n;
+        uint32_t idx = (uint32_t)(pos >> 16);
+        uint32_t frac = (uint32_t)(pos & 0xffffu);
+        int32_t  a, b;
+        if (idx >= frames) {
+            idx = frames - 1u;
+        }
+        a = pcm[idx];
+        b = (idx + 1u < frames) ? pcm[idx + 1u] : pcm[0];
+        dst[i] = (int16_t)(a + (int32_t)(((int64_t)(b - a) * frac) >> 16));
+    }
+    return n;
+}
+
 /* PolyBLEP residual in Q15. t and dt are Q16 (0..65536 = 0..1). */
 static int32_t polyblep_q15(uint32_t t_q16, uint32_t dt_q16)
 {
@@ -65,6 +121,25 @@ int32_t ag_osc_tick(ag_osc_t *o)
         }
         s = (int32_t)(int16_t)(ag_dsp_rng(&o->rng) >> 16);
         break;
+    case AG_OSC_WT: {
+        uint32_t n = o->wt_n;
+        const int16_t *tab = o->wt;
+        if (tab == 0 || n < 2u) {
+            s = ag_dsp_sin(o->phase);
+            break;
+        }
+        {
+            uint64_t pos = ((uint64_t)o->phase * (uint64_t)n);
+            uint32_t idx = (uint32_t)(pos >> 32);
+            uint32_t frac = (uint32_t)((pos >> 16) & 0xffffu);
+            int32_t  a, b;
+            idx %= n;
+            a = tab[idx];
+            b = tab[(idx + 1u) % n];
+            s = a + (int32_t)(((int64_t)(b - a) * (int64_t)frac) >> 16);
+        }
+        break;
+    }
     case AG_OSC_SQR: {
         uint32_t pw = 32768u;
         if (o->pwm < 64u) {

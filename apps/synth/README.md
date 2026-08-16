@@ -26,5 +26,5 @@ python tools/mkaxe.py --arch xtensa --gcc xtensa-esp32s3-elf-gcc `
 `run h:\synth.axe pcmvirt` after `drv install h:\pcmvirt.sys`.
 Host: `tools\pcmplay.py --reconnect` or `--record build\pcm_capture.wav`.
 
-Keys: Z–M / Q–I notes, `[ ]` cutoff, `- =` reso, `1–5` wave, `D` drive,
+Keys: Z–M / Q–I notes, `[ ]` cutoff, `- =` reso, `1–6` wave (`6` = wavetable), `D` drive,
 `T` tube/JFET, `F` VA/FM, `O` op count, `L` LFO→cutoff, `X` FX, `I` cab.

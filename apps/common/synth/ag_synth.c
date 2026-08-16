@@ -8,7 +8,7 @@ static const int32_t k_pmin[AG_SYNTH_P_N] = {
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0
 };
 static const int32_t k_pmax[AG_SYNTH_P_N] = {
-    127, 127, 127, 127, 127, 127, 127, 4, 4, 127, 127, 127, 127, 127,
+    127, 127, 127, 127, 127, 127, 127, 5, 5, 127, 127, 127, 127, 127,
     127, 127, 127, 127, 127, 127, 4, 127, 8, 1, 4
 };
 
@@ -83,6 +83,20 @@ void ag_synth_set(ag_synth_t *s, uint16_t param, int32_t value)
             ag_fmx_set_n(&s->voice[i].fmx, (int)s->base[param]);
             ag_fmx_algo_stack(&s->voice[i].fmx);
         }
+    }
+}
+
+void ag_synth_set_wavetable(ag_synth_t *s, const int16_t *data, uint32_t frames)
+{
+    int i;
+    if (s == 0) {
+        return;
+    }
+    s->wt = (data != 0 && frames >= 2u) ? data : 0;
+    s->wt_n = s->wt ? frames : 0u;
+    for (i = 0; i < AG_SYNTH_VOICES; i++) {
+        ag_osc_set_table(&s->voice[i].osc1, s->wt, s->wt_n);
+        ag_osc_set_table(&s->voice[i].osc2, s->wt, s->wt_n);
     }
 }
 
@@ -173,6 +187,8 @@ void ag_synth_note_on(ag_synth_t *s, uint8_t note, uint8_t vel)
     v->osc2.wave = (uint8_t)s->base[AG_SYNTH_P_WAVE2];
     v->osc1.pwm = (uint8_t)s->base[AG_SYNTH_P_PWM];
     v->osc2.pwm = (uint8_t)s->base[AG_SYNTH_P_PWM];
+    ag_osc_set_table(&v->osc1, s->wt, s->wt_n);
+    ag_osc_set_table(&v->osc2, s->wt, s->wt_n);
     v->noise.wave = AG_OSC_NOISE;
     ag_filt_reset(&v->filt);
     ag_dist_reset(&v->dist);
@@ -288,6 +304,10 @@ static int32_t render_voice(ag_synth_t *s, ag_synth_voice_t *v, int32_t *eff)
         v->osc2.wave = (uint8_t)eff[AG_SYNTH_P_WAVE2];
         v->osc1.pwm = (uint8_t)eff[AG_SYNTH_P_PWM];
         v->osc2.pwm = (uint8_t)eff[AG_SYNTH_P_PWM];
+        if (v->osc1.wt != s->wt) {
+            ag_osc_set_table(&v->osc1, s->wt, s->wt_n);
+            ag_osc_set_table(&v->osc2, s->wt, s->wt_n);
+        }
         a = ag_osc_tick(&v->osc1);
         b = ag_osc_tick(&v->osc2);
         n = 0;
