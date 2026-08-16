@@ -169,3 +169,17 @@ int32_t ag_osc_tick(ag_osc_t *o)
     o->phase += o->step;
     return s;
 }
+
+int32_t ag_osc_tick_pm(ag_osc_t *o, int32_t pm)
+{
+    uint32_t ph;
+    int32_t  s;
+    if (o == 0) {
+        return 0;
+    }
+    ph = o->phase;
+    o->phase = ph + ((uint32_t)pm << 16);
+    s = ag_osc_tick(o);
+    o->phase = ph + o->step;
+    return s;
+}
