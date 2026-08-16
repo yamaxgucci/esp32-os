@@ -158,6 +158,10 @@ It is a reimplementation for Mini-C, not a compile of host
 
 Same virt devices as host DX7 (not mute `ag_audio_*` → pcmnull):
 
+Normally just `argon apps` (or `argon apps --only CC.AXE`) — the
+authoritative build line for this image lives in [`tools/apps.json`](../../tools/apps.json)
+and is compiled by CI. The command below is the same thing, spelled out:
+
 ```powershell
 .\argon.cmd run -Gfx -HostFs build\sd_card
 # guest:

@@ -120,7 +120,10 @@ file.
 
 ## Target hardware
 
-Primary: **ESP32-S3** with at least 4 MB PSRAM and 8 MB flash.
+Primary: **ESP32-S3** with 8 or 16 MB PSRAM and 8 MB flash. A 32 MB PSRAM
+module does not work — the S3 maps flash and PSRAM through one 32 MB window,
+and at 32 MB the partition table stops being visible; see the traps section of
+[docs/05-status.md](docs/05-status.md).
 Planned: ESP32-P4. Reduced profiles for ESP32 / C3 / C6.
 
 ## Building and running
@@ -135,6 +138,8 @@ argon test ver mem       boot in QEMU, type commands, print the screen
 argon test -Put "build\HELLO.AXE=t:\hello.axe" "run t:\hello.axe"
                          the same, with a file copied into the guest first
 argon tests              host unit tests, no hardware needed
+argon apps               build every .AXE / .SYS in tools/apps.json
+argon check              all of the above: tests, firmware, applications
 argon flash -port COM5   flash a real board and open the monitor
 ```
 
@@ -148,6 +153,10 @@ build, because it is a separate binary with its own link layout:
 python tools/mkaxe.py --arch xtensa --gcc xtensa-esp32s3-elf-gcc \
     --include sdk/include -o HELLO.AXE apps/hello/hello.c
 ```
+
+Every application in the tree is listed in `tools/apps.json` and built by
+`argon apps`, which `argon check` and CI run — a separate link is a separate
+thing to break, and a green firmware build says nothing about it.
 
 Machine specific paths (where ESP-IDF and a host compiler live) go in
 `tools\local-env.ps1`, which is not committed; `tools\idf-env.ps1` guesses the

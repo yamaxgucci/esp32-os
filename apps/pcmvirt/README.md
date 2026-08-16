@@ -11,6 +11,10 @@ Canonical output paths (see [`docs/user/03-host-share.md`](../../docs/user/03-ho
 
 ## Build
 
+Normally just `argon apps` (or `argon apps --only PCMVIRT.SYS`) — the
+authoritative build line for this image lives in [`tools/apps.json`](../../tools/apps.json)
+and is compiled by CI. The command below is the same thing, spelled out:
+
 ```
 python tools/mkaxe.py --arch xtensa --gcc xtensa-esp32s3-elf-gcc `
   --include sdk/include -o build\apps\PCMVIRT.SYS apps/pcmvirt/pcmvirt.c

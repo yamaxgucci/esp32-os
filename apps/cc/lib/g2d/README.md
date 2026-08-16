@@ -35,8 +35,8 @@ Helpers to build atlases in Mini-C:
 
 ## Examples
 
-- [`../examples/tile_demo.c`](../examples/tile_demo.c) — scroll + sprite smoke
-- [`../examples/wetspot.c`](../examples/wetspot.c) — Wetspot-like acceptance game
+- [`../../examples/tile_demo.c`](../../examples/tile_demo.c) — scroll + sprite smoke
+- [`../../examples/wetspot.c`](../../examples/wetspot.c) — Wetspot-like acceptance game
 
 ```text
 run h:\cc.axe h:\tile_demo.c h:\tile_demo.axe

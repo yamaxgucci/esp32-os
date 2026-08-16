@@ -11,6 +11,10 @@ regenerate / stage with `python tools/skin2rgb565.py`.
 
 ## Build
 
+Normally just `argon apps` (or `argon apps --only AMP.AXE`) — the
+authoritative build line for this image lives in [`tools/apps.json`](../../tools/apps.json)
+and is compiled by CI. The command below is the same thing, spelled out:
+
 ```
 python tools/skin2rgb565.py
 
