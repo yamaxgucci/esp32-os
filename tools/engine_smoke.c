@@ -1,6 +1,10 @@
 /*
- * Host listen files for rewritten engines + tube/cabinet.
- *   gcc -O2 -o build/engine_smoke tools/engine_smoke.c ...
+ * Host listen files for the audio engines: writes build/listen/*.wav.
+ *
+ * Built by host-tests/CMakeLists.txt, so `argon tests` produces
+ * build-host/engine_smoke(.exe) — run it to refresh the WAVs.  It is not a
+ * test: what can be asserted is asserted in host-tests/test_dsp.c, and this
+ * exists for the things only ears catch.
  */
 #include <stdint.h>
 #include <stdio.h>
