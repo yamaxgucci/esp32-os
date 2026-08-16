@@ -1,0 +1,75 @@
+/*
+ * ArgonOS port contract - a network, when there is one.
+ *
+ * Deliberately small and deliberately TCP-shaped.  ArgonOS does not want a
+ * socket layer of its own: what it wants is a stream to the other end and a way
+ * to say who it is.  Everything above that - which process owns a connection,
+ * what happens to it when that process dies, how a handle is numbered - is in
+ * src/net/net.c and is the same on every port.
+ *
+ * The port hands back plain descriptors and the kernel wraps them.  That is the
+ * whole division: a port never sees an ag_handle_t, and the kernel never sees a
+ * struct sockaddr.
+ *
+ * What a port must supply:
+ *
+ *   ag_err_t ag_port_net_start(void)
+ *   bool     ag_port_net_ready(void)
+ *   ag_err_t ag_port_net_ifaddr(uint32_t *addr)
+ *   void     ag_port_net_on_ready(ag_port_net_ready_fn fn)
+ *
+ *   int      ag_port_net_listen(uint16_t port)
+ *   int      ag_port_net_accept(int lfd, uint32_t timeout_ms)
+ *   int      ag_port_net_connect(uint32_t addr, uint16_t port,
+ *                                uint32_t timeout_ms)
+ *   int32_t  ag_port_net_send(int fd, const void *buf, size_t len)
+ *   int32_t  ag_port_net_recv(int fd, void *buf, size_t len)
+ *   void     ag_port_net_close(int fd)
+ *   ag_err_t ag_port_net_nonblock(int fd, bool on)
+ *
+ * Contract, not advice:
+ *
+ * - start() returns as soon as the interface is up.  It does not wait for an
+ *   address: DHCP takes as long as it takes, and boot does not.  ready() is how
+ *   anybody finds out, and the kernel does the waiting.
+ * - The descriptors are the port's own numbering and mean nothing to the caller
+ *   beyond "non-negative is a socket".  A negative return is an -AG_E* code.
+ * - accept() with timeout_ms == 0 returns -AG_EAGAIN rather than blocking, and
+ *   with UINT32_MAX blocks forever.  Those have to be separate answers: on lwIP
+ *   a zero receive timeout means "wait forever", and taking that shortcut hung a
+ *   driver until a program on the development machine happened to connect.
+ * - ifaddr() gives host-order IPv4.
+ * - on_ready() exists so the address can be printed the moment it arrives.
+ *   That is not decoration: nobody can use the network without knowing what
+ *   the board is called, the address arrives long after boot has moved on, and
+ *   nothing polls for it.  Registered before start(); called once, from
+ *   whatever context the address arrives in, so the kernel keeps it short.
+ *
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
+ */
+#ifndef ARGON_PORT_NET_H
+#define ARGON_PORT_NET_H
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#include <argon/abi.h>
+
+/* Host-order IPv4, all three. */
+typedef void (*ag_port_net_ready_fn)(uint32_t addr, uint32_t mask, uint32_t gw);
+
+ag_err_t ag_port_net_start(void);
+bool     ag_port_net_ready(void);
+ag_err_t ag_port_net_ifaddr(uint32_t *addr);
+void     ag_port_net_on_ready(ag_port_net_ready_fn fn);
+
+int     ag_port_net_listen(uint16_t port);
+int     ag_port_net_accept(int lfd, uint32_t timeout_ms);
+int     ag_port_net_connect(uint32_t addr, uint16_t port, uint32_t timeout_ms);
+int32_t ag_port_net_send(int fd, const void *buf, size_t len);
+int32_t ag_port_net_recv(int fd, void *buf, size_t len);
+void    ag_port_net_close(int fd);
+ag_err_t ag_port_net_nonblock(int fd, bool on);
+
+#endif /* ARGON_PORT_NET_H */

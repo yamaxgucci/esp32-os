@@ -16,10 +16,9 @@
 #include <argon/path.h>
 #include <argon/proc.h>
 
-#include "freertos/FreeRTOS.h"
-#include "freertos/semphr.h"
-#include "freertos/task.h"
-#include "multi_heap.h"
+#include <argon/port/mem.h>
+#include <argon/port/sync.h>
+#include <argon/port/task.h>
 
 /* Bounds on what one process may hold.  A bound that is reached is a diagnosable
  * event; an unbounded list is a leak with extra steps (see argon/reslist.h). */
@@ -48,8 +47,8 @@ typedef struct {
     uint32_t        flags;
 
     ag_loaded_app_t   app;
-    TaskHandle_t      task;
-    SemaphoreHandle_t done;
+    ag_port_task_t      task;
+    ag_port_sem_t   done;
     int32_t           exit_code;
     bool              killed;
     bool              has_waiter; /* somebody is in ag_proc_wait for it      */
@@ -66,7 +65,7 @@ typedef struct {
     bool load_pending;
 
     void               *heap_mem;
-    multi_heap_handle_t heap;
+    ag_port_heap_t heap;
     size_t              heap_size;
 
     ag_res_t     res_slots[AG_PROC_RES_MAX];
@@ -103,14 +102,14 @@ void ag_proc_table_lock(void);
 void ag_proc_table_unlock(void);
 
 /*
- * Create a process/thread FreeRTOS task.  Tries an internal-SRAM stack first,
- * then PSRAM when CONFIG_SPIRAM allows it — same self-delete semantics as
- * xTaskCreatePinnedToCore (use plain vTaskDelete).
+ * Create the task behind a process or a thread.  Tries an internal-SRAM stack
+ * first and PSRAM only if the port can place stacks and SRAM is short — same
+ * self-delete semantics as ag_port_task_create, which is to say a task that
+ * ends itself with ag_port_task_delete(NULL).
  */
-BaseType_t ag_proc_task_create(TaskFunction_t fn, const char *name,
-                               uint32_t stack_bytes, void *arg,
-                               UBaseType_t prio, BaseType_t core,
-                               TaskHandle_t *out);
+bool ag_proc_task_create(ag_port_task_fn fn, const char *name,
+                         uint32_t stack_bytes, void *arg, unsigned prio,
+                         int core, ag_port_task_t *out);
 
 /* ---------------------------------------------------------------------- */
 /* Threads (threads.c)                                                    */
@@ -123,14 +122,14 @@ BaseType_t ag_proc_task_create(TaskFunction_t fn, const char *name,
  * released while these are still being used to stop the threads.
  */
 typedef struct {
-    TaskHandle_t  task;
+    ag_port_task_t  task;
     void        (*fn)(void *);
     void         *arg;
     volatile bool finished;
 } ag_thread_rec_t;
 
 /* True when this record is that task; how a thread finds its own process. */
-bool ag_thread_owns(const void *record, TaskHandle_t task);
+bool ag_thread_owns(const void *record, ag_port_task_t task);
 
 /* Stops the thread if it is still running and frees the record. */
 void ag_thread_release(void *record);
@@ -144,21 +143,22 @@ void ag_thread_release(void *record);
 void ag_thread_mark_self_finished(void);
 
 /* ---------------------------------------------------------------------- */
-/* Faults (fault.c)                                                       */
+/* Faults                                                                 */
 /* ---------------------------------------------------------------------- */
 
-/* Installs the exception handlers, on every core.  Part of the supervisor. */
-ag_err_t ag_fault_init(void);
-
-/* "store to a prohibited address", "illegal instruction" - for the record. */
-const char *ag_fault_cause_name(uint32_t cause);
+/*
+ * Catching one is the port's job (argon/port/fault.h) because it is the most
+ * architecture-bound thing the system does.  What belongs here is the other two
+ * halves of the arrangement: what to write down when it happens, and where the
+ * faulting task lands afterwards.  The supervisor hands both to the port.
+ */
 
 /*
  * True while this task is inside the kernel holding a lock the rest of the system
  * needs.  A process in that state cannot be unwound or deleted: the lock would
  * stay held.
  */
-bool ag_proc_task_in_kernel(TaskHandle_t task);
+bool ag_proc_task_in_kernel(ag_port_task_t task);
 
 /*
  * Called from an exception context: writes down what happened and nothing else.

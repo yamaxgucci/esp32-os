@@ -25,13 +25,13 @@
 #include <argon/net.h>
 #include <argon/vfs.h>
 
-#include "freertos/FreeRTOS.h"
-#include "freertos/semphr.h"
+#include <argon/port/sync.h>
+#include <argon/port/task.h>
 
 #include "dev/io.h"
 #include "fs/storage.h"
 
-static SemaphoreHandle_t s_dev_mutex;
+static ag_port_mutex_t s_dev_mutex;
 
 /*
  * Recursive, because a device operation is entitled to ask the registry about
@@ -41,13 +41,13 @@ static SemaphoreHandle_t s_dev_mutex;
 static void dev_lock(void *ctx)
 {
     (void)ctx;
-    xSemaphoreTakeRecursive(s_dev_mutex, portMAX_DELAY);
+    ag_port_mutex_take_recursive(s_dev_mutex, AG_PORT_FOREVER);
 }
 
 static void dev_unlock(void *ctx)
 {
     (void)ctx;
-    xSemaphoreGiveRecursive(s_dev_mutex);
+    ag_port_mutex_give_recursive(s_dev_mutex);
 }
 
 /* ---------------------------------------------------------------------- */
@@ -206,7 +206,7 @@ static void register_builtin(const char *name, ag_dev_class_t cls,
 ag_err_t ag_devices_init(void)
 {
     if (s_dev_mutex == NULL) {
-        s_dev_mutex = xSemaphoreCreateRecursiveMutex();
+        s_dev_mutex = ag_port_mutex_new_recursive();
         if (s_dev_mutex == NULL) {
             return -AG_ENOMEM;
         }

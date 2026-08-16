@@ -29,11 +29,10 @@
 #include <argon/shell_path.h>
 #include <argon/vfs.h>
 
-#include "esp_heap_caps.h"
-#include "esp_system.h"
-#include "esp_timer.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
+#include <argon/port/mem.h>
+#include <argon/port/sys.h>
+#include <argon/port/task.h>
+#include <argon/port/time.h>
 
 #include "boot/platform.h"
 #include "core/sysconfig.h"
@@ -269,11 +268,11 @@ static int cmd_mem(int argc, char **argv)
     (void)argc;
     (void)argv;
 
-    const size_t int_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
-    const size_t int_total = heap_caps_get_total_size(MALLOC_CAP_INTERNAL);
-    const size_t int_block = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
-    const size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-    const size_t psram_total = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
+    const size_t int_free = ag_port_mem_free(AG_MEM_FAST);
+    const size_t int_total = ag_port_mem_total(AG_MEM_FAST);
+    const size_t int_block = ag_port_mem_largest(AG_MEM_FAST);
+    const size_t psram_free = ag_port_mem_free(AG_MEM_SLOW);
+    const size_t psram_total = ag_port_mem_total(AG_MEM_SLOW);
 
     ag_console_printf("                 total        free     largest\n");
     ag_console_printf("  internal  %8u KB  %8u KB  %8u KB\n",
@@ -291,8 +290,9 @@ static int cmd_mem(int argc, char **argv)
 
     /*
      * The arena is the honest answer to "how much executable memory is there":
-     * MALLOC_CAP_EXEC reports zero on this chip because ESP-IDF gives none of
-     * that memory to the heap, which is why the arena is reserved at link time.
+     * asking the port for AG_MEM_EXEC reports zero on this chip, because the
+     * layer below gives none of that memory to the heap - which is exactly why
+     * the arena is reserved at link time.
      */
     ag_console_printf("  %u KB reserved for application code (%s)\n",
                       (unsigned)(ag_loader_arena_size() / 1024),
@@ -392,7 +392,7 @@ static int cmd_uptime(int argc, char **argv)
     (void)argc;
     (void)argv;
 
-    const uint64_t us = (uint64_t)esp_timer_get_time();
+    const uint64_t us = (uint64_t)ag_port_us();
     const uint32_t total_s = (uint32_t)(us / 1000000u);
 
     ag_console_printf("up %u:%02u:%02u.%03u\n", (unsigned)(total_s / 3600u),
@@ -675,7 +675,7 @@ static int cmd_reboot(int argc, char **argv)
 
     ag_console_puts("restarting...\n");
     ag_console_sync();
-    esp_restart();
+    ag_port_restart();
     return 0;
 }
 
@@ -2123,7 +2123,7 @@ void ag_shell_run(void)
     for (;;) {
         /* App in the focused slot owns the keyboard; shell waits. */
         while (!ag_session_shell_owns_keyboard()) {
-            vTaskDelay(pdMS_TO_TICKS(50));
+            ag_port_task_delay(ag_port_ms_to_ticks(50));
         }
 
         sync_cwd_from_session();

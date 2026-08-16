@@ -14,14 +14,13 @@
 #include <argon/proc.h>
 #include <argon/vfs.h>
 
-#include "driver/uart.h"
-#include "esp_timer.h"
-#include "esp_heap_caps.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/semphr.h"
-#include "freertos/task.h"
+#include <argon/port/mem.h>
+#include <argon/port/sync.h>
+#include <argon/port/task.h>
+#include <argon/port/time.h>
+#include <argon/port/uart.h>
 
-#define HSFS_UART           UART_NUM_1
+#define HSFS_UART           1
 #define HSFS_UART_BAUD      115200
 #define HSFS_RX_BUF         (64 * 1024)
 #define HSFS_TX_BUF         (16 * 1024)
@@ -48,16 +47,16 @@ typedef struct {
     uint32_t host_h;
 } hsfs_dir_t;
 
-static SemaphoreHandle_t s_rpc_mu;
-static TaskHandle_t      s_rpc_holder;
+static ag_port_mutex_t s_rpc_mu;
+static ag_port_task_t      s_rpc_holder;
 static bool              s_uart_up;
 static bool              s_mounted;
 static uint16_t          s_seq;
 
 static uint8_t  s_pad[AG_PAD_BYTES];
-static uint32_t s_pad_ms; /* esp_timer ms of last PADPUSH; 0 = never */
-static TaskHandle_t s_pad_task;
-static TaskHandle_t s_wait_task; /* off-boot retry while the helper appears */
+static uint32_t s_pad_ms; /* uptime ms of the last PADPUSH; 0 = never */
+static ag_port_task_t s_pad_task;
+static ag_port_task_t s_wait_task; /* off-boot retry while the helper appears */
 
 /* One-header lookaside: pad_drain must not eat a real RPC response. */
 static hsfs_hdr_t s_held_hdr;
@@ -69,7 +68,7 @@ static bool drain_bytes(uint32_t len, uint32_t timeout_ms);
 
 static uint32_t now_ms(void)
 {
-    return (uint32_t)(esp_timer_get_time() / 1000);
+    return (uint32_t)(ag_port_us() / 1000);
 }
 
 static bool is_pad_rel(const char *rel)
@@ -135,9 +134,9 @@ static bool ingest_padpush_locked(const hsfs_hdr_t *hdr, uint32_t timeout_ms)
 
 static void *hsfs_alloc(size_t n)
 {
-    void *p = heap_caps_malloc(n, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    void *p = ag_port_alloc(n, AG_MEM_FAST | AG_MEM_BYTE);
     if (p == NULL) {
-        p = heap_caps_malloc(n, MALLOC_CAP_8BIT);
+        p = ag_port_alloc(n, AG_MEM_BYTE);
     }
     return p;
 }
@@ -147,30 +146,21 @@ static bool uart_open(void)
     if (s_uart_up) {
         return true;
     }
-    const uart_config_t cfg = {
-        .baud_rate = HSFS_UART_BAUD,
-        .data_bits = UART_DATA_8_BITS,
-        .parity = UART_PARITY_DISABLE,
-        .stop_bits = UART_STOP_BITS_1,
-        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
-        .source_clk = UART_SCLK_DEFAULT,
+    const ag_port_uart_cfg_t cfg = {
+        .baud = HSFS_UART_BAUD,
+        .data_bits = 8,
+        .parity = 0,
+        .stop_bits = 1,
     };
-    {
-        const esp_err_t rc =
-            uart_driver_install(HSFS_UART, HSFS_RX_BUF, HSFS_TX_BUF, 0, NULL, 0);
-        if (rc != ESP_OK && rc != ESP_ERR_INVALID_STATE) {
-            return false;
-        }
-    }
-    if (uart_param_config(HSFS_UART, &cfg) != ESP_OK) {
+    if (ag_port_uart_open(HSFS_UART, &cfg, HSFS_RX_BUF, HSFS_TX_BUF) != AG_OK) {
         return false;
     }
     /* QEMU UART1 needs no GPIOs; on hardware set pins via BOARD.CFG later. */
-    if (uart_set_pin(HSFS_UART, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE,
-                     UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE) != ESP_OK) {
+    if (ag_port_uart_pins(HSFS_UART, AG_PORT_UART_PIN_KEEP,
+                          AG_PORT_UART_PIN_KEEP) != AG_OK) {
         return false;
     }
-    (void)uart_flush(HSFS_UART);
+    (void)ag_port_uart_flush(HSFS_UART);
     s_uart_up = true;
     return true;
 }
@@ -189,9 +179,8 @@ static void pump_rx_during_tx(void)
         if (s_held_hdr_valid) {
             return;
         }
-        size_t avail = 0;
-        if (uart_get_buffered_data_len(HSFS_UART, &avail) != ESP_OK ||
-            avail < sizeof(hsfs_hdr_t)) {
+        const int32_t avail = ag_port_uart_pending(HSFS_UART);
+        if (avail < (int32_t)sizeof(hsfs_hdr_t)) {
             return;
         }
         hsfs_hdr_t hdr;
@@ -218,7 +207,7 @@ static bool write_all(const void *buf, size_t len)
     while (left > 0) {
         pump_rx_during_tx();
         const size_t chunk = left > HSFS_TX_SLICE ? HSFS_TX_SLICE : left;
-        const int n = uart_write_bytes(HSFS_UART, p, chunk);
+        const int32_t n = ag_port_uart_write(HSFS_UART, p, chunk);
         if (n <= 0) {
             return false;
         }
@@ -230,24 +219,23 @@ static bool write_all(const void *buf, size_t len)
 
 static bool read_all(void *buf, size_t len, uint32_t timeout_ms)
 {
-    uint8_t *p = (uint8_t *)buf;
-    size_t   left = len;
-    const TickType_t deadline =
-        xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
+    uint8_t       *p = (uint8_t *)buf;
+    size_t         left = len;
+    const uint32_t deadline = now_ms() + timeout_ms;
     while (left > 0) {
         if (ag_proc_stopping()) {
             return false;
         }
-        const TickType_t now = xTaskGetTickCount();
+        const uint32_t now = now_ms();
         if (now >= deadline) {
             return false;
         }
-        TickType_t slice = deadline - now;
+        uint32_t slice = deadline - now;
         /* Cap slices so kill/stop is noticed within ~50 ms. */
-        if (slice > pdMS_TO_TICKS(50)) {
-            slice = pdMS_TO_TICKS(50);
+        if (slice > 50u) {
+            slice = 50u;
         }
-        const int n = uart_read_bytes(HSFS_UART, p, left, slice);
+        const int32_t n = ag_port_uart_read(HSFS_UART, p, left, slice);
         if (n < 0) {
             return false;
         }
@@ -302,8 +290,8 @@ static ag_err_t rpc(uint16_t op, uint32_t a0, uint32_t a1, const char *path,
         return -AG_ERANGE;
     }
 
-    xSemaphoreTake(s_rpc_mu, portMAX_DELAY);
-    s_rpc_holder = xTaskGetCurrentTaskHandle();
+    ag_port_mutex_take(s_rpc_mu, AG_PORT_FOREVER);
+    s_rpc_holder = ag_port_task_self();
 
     const uint16_t seq = ++s_seq;
     hsfs_hdr_t     req = {
@@ -389,7 +377,7 @@ done:
         err = -AG_EINTR;
     }
     s_rpc_holder = NULL;
-    xSemaphoreGive(s_rpc_mu);
+    ag_port_mutex_give(s_rpc_mu);
     return err;
 }
 
@@ -404,14 +392,12 @@ static void pad_drain_once(void)
     if (!s_uart_up || s_rpc_mu == NULL) {
         return;
     }
-    if (xSemaphoreTake(s_rpc_mu, 0) != pdTRUE) {
+    if (!ag_port_mutex_take(s_rpc_mu, 0)) {
         return;
     }
     for (;;) {
-        size_t avail = 0;
         if (!s_held_hdr_valid) {
-            if (uart_get_buffered_data_len(HSFS_UART, &avail) != ESP_OK ||
-                avail < sizeof(hsfs_hdr_t)) {
+            if (ag_port_uart_pending(HSFS_UART) < (int32_t)sizeof(hsfs_hdr_t)) {
                 break;
             }
         }
@@ -429,7 +415,7 @@ static void pad_drain_once(void)
             break;
         }
     }
-    xSemaphoreGive(s_rpc_mu);
+    ag_port_mutex_give(s_rpc_mu);
 }
 
 static void pad_drain_task(void *arg)
@@ -437,10 +423,10 @@ static void pad_drain_task(void *arg)
     (void)arg;
     while (s_mounted) {
         pad_drain_once();
-        vTaskDelay(pdMS_TO_TICKS(4));
+        ag_port_task_delay(ag_port_ms_to_ticks(4));
     }
     s_pad_task = NULL;
-    vTaskDelete(NULL);
+    ag_port_task_delete(NULL);
 }
 
 /* ---- VFS ops ----------------------------------------------------------- */
@@ -790,8 +776,8 @@ static ag_err_t hostfs_probe_once(uint32_t timeout_ms)
     }
     s_mounted = true;
     if (s_pad_task == NULL) {
-        (void)xTaskCreatePinnedToCore(pad_drain_task, "ag_hpad", 2048, NULL, 5,
-                                      &s_pad_task, 0);
+        (void)ag_port_task_create(pad_drain_task, "ag_hpad", 2048, NULL, 5, 0,
+                                  0, &s_pad_task);
     }
     ag_log(AG_LOG_INFO, "hostfs", "H: → /host (live host folder)");
     return AG_OK;
@@ -806,20 +792,20 @@ static ag_err_t hostfs_probe_once(uint32_t timeout_ms)
 static void hostfs_wait_task(void *arg)
 {
     const int64_t deadline =
-        esp_timer_get_time() + (int64_t)HSFS_HELPER_WAIT_MS * 1000;
+        ag_port_us() + (int64_t)HSFS_HELPER_WAIT_MS * 1000;
 
     (void)arg;
-    while (!s_mounted && esp_timer_get_time() < deadline) {
+    while (!s_mounted && ag_port_us() < deadline) {
         if (hostfs_probe_once(HSFS_PING_TIMEOUT_MS) == AG_OK) {
             break;
         }
-        vTaskDelay(pdMS_TO_TICKS(50));
+        ag_port_task_delay(ag_port_ms_to_ticks(50));
     }
     if (!s_mounted) {
         ag_log(AG_LOG_INFO, "hostfs", "no host helper on UART1 (skip H:)");
     }
     s_wait_task = NULL;
-    vTaskDelete(NULL);
+    ag_port_task_delete(NULL);
 }
 
 ag_err_t ag_hostfs_try_mount(void)
@@ -828,7 +814,7 @@ ag_err_t ag_hostfs_try_mount(void)
         return AG_OK;
     }
     if (s_rpc_mu == NULL) {
-        s_rpc_mu = xSemaphoreCreateMutex();
+        s_rpc_mu = ag_port_mutex_new();
         if (s_rpc_mu == NULL) {
             return -AG_ENOMEM;
         }
@@ -845,8 +831,8 @@ ag_err_t ag_hostfs_try_mount(void)
 
     /* Nobody yet.  Keep trying in the background and let boot carry on. */
     if (s_wait_task == NULL) {
-        (void)xTaskCreatePinnedToCore(hostfs_wait_task, "ag_hwait", 3072, NULL,
-                                      4, &s_wait_task, 0);
+        (void)ag_port_task_create(hostfs_wait_task, "ag_hwait", 3072, NULL, 4,
+                                  0, 0, &s_wait_task);
     }
     return -AG_ENODEV;
 }

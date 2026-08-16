@@ -13,7 +13,7 @@
 
 #include <string.h>
 
-#include "esp_heap_caps.h"
+#include <argon/port/mem.h>
 
 #include "argon/board.h"
 #include "argon/device.h"
@@ -510,9 +510,9 @@ static const ag_dev_ops_t k_mix_ops = {
 
 static void *pcmmix_alloc(size_t n)
 {
-    void *p = heap_caps_malloc(n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    void *p = ag_port_alloc(n, AG_MEM_SLOW | AG_MEM_BYTE);
     if (p == NULL) {
-        p = heap_caps_malloc(n, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        p = ag_port_alloc(n, AG_MEM_FAST | AG_MEM_BYTE);
     }
     return p;
 }
@@ -537,9 +537,9 @@ ag_err_t ag_pcmmix_init(void)
     s_st->mix_scratch = (int16_t *)pcmmix_alloc(scratch_bytes);
     s_ring_pool = (uint8_t *)pcmmix_alloc(pool_bytes);
     if (s_st->mix_scratch == NULL || s_ring_pool == NULL) {
-        heap_caps_free(s_st->mix_scratch);
-        heap_caps_free(s_ring_pool);
-        heap_caps_free(s_st);
+        ag_port_free(s_st->mix_scratch);
+        ag_port_free(s_ring_pool);
+        ag_port_free(s_st);
         s_st = NULL;
         s_ring_pool = NULL;
         return -AG_ENOMEM;
@@ -559,9 +559,9 @@ ag_err_t ag_pcmmix_init(void)
     desc.priv = s_st;
     err = ag_dev_register(&desc, &s_dev);
     if (err != AG_OK) {
-        heap_caps_free(s_st->mix_scratch);
-        heap_caps_free(s_ring_pool);
-        heap_caps_free(s_st);
+        ag_port_free(s_st->mix_scratch);
+        ag_port_free(s_ring_pool);
+        ag_port_free(s_st);
         s_st = NULL;
         s_ring_pool = NULL;
         return err;

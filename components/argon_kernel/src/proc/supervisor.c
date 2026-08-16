@@ -26,8 +26,8 @@
 
 #include "proc/proc_internal.h"
 
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
+#include <argon/port/fault.h>
+#include <argon/port/task.h>
 
 /*
  * Above the shell and any application, below ESP-IDF's own service tasks (the
@@ -46,7 +46,7 @@
 /* Nothing needs doing most of the time; a wake-up also collects zombies. */
 #define AG_SUP_TICK_MS 250
 
-static TaskHandle_t      s_task;
+static ag_port_task_t      s_task;
 static volatile bool     s_stop_request;
 static volatile bool     s_interrupt_request;
 static volatile bool     s_shell_interrupt;
@@ -59,7 +59,7 @@ void ag_supervisor_kill_request(ag_pid_t pid)
 {
     s_kill_request = pid;
     if (s_task != NULL) {
-        xTaskNotifyGive(s_task);
+        ag_port_notify_give(s_task);
     }
 }
 
@@ -68,7 +68,7 @@ static void request_soft_interrupt(ag_event_t *ev)
     if (ag_proc_foreground() != AG_PID_KERNEL) {
         s_interrupt_request = true;
         if (s_task != NULL) {
-            xTaskNotifyGive(s_task);
+            ag_port_notify_give(s_task);
         }
         ev->type = AG_EV_QUIT;
     } else {
@@ -101,7 +101,7 @@ static bool hotkeys(ag_event_t *ev)
     if (ctrl_alt_del || ctrl_backslash) {
         s_stop_request = true;
         if (s_task != NULL) {
-            xTaskNotifyGive(s_task);
+            ag_port_notify_give(s_task);
         }
         return true;
     }
@@ -111,14 +111,14 @@ static bool hotkeys(ag_event_t *ev)
         if (key >= AG_KEY_1 && key <= AG_KEY_4) {
             s_focus_slot_request = (int)(key - AG_KEY_1);
             if (s_task != NULL) {
-                xTaskNotifyGive(s_task);
+                ag_port_notify_give(s_task);
             }
             return true;
         }
         if (key == AG_KEY_TAB) {
             s_alt_tab_request = true;
             if (s_task != NULL) {
-                xTaskNotifyGive(s_task);
+                ag_port_notify_give(s_task);
             }
             return true;
         }
@@ -220,7 +220,7 @@ static void supervisor_task(void *arg)
 
     for (;;) {
         /* Woken by a hotkey, or on the tick to collect what has finished. */
-        (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(AG_SUP_TICK_MS));
+        ag_port_notify_take(true, ag_port_ms_to_ticks(AG_SUP_TICK_MS));
 
         if (s_interrupt_request) {
             s_interrupt_request = false;
@@ -304,7 +304,7 @@ ag_err_t ag_supervisor_init(void)
      * Before any application can run: from here on a fault in one costs that
      * application rather than the machine.
      */
-    err = ag_fault_init();
+    err = ag_port_fault_init(ag_proc_note_fault, ag_proc_fault_exit);
     if (err != AG_OK) {
         ag_log(AG_LOG_WARN, "supervisor",
                "faults will not be caught (%d): an application that faults takes "
@@ -312,8 +312,8 @@ ag_err_t ag_supervisor_init(void)
                (int)err);
     }
 
-    if (xTaskCreatePinnedToCore(supervisor_task, "ag_super", AG_SUP_STACK, NULL,
-                                AG_SUP_PRIORITY, &s_task, 0) != pdPASS) {
+    if (!ag_port_task_create(supervisor_task, "ag_super", AG_SUP_STACK, NULL,
+                             AG_SUP_PRIORITY, 0, 0, &s_task)) {
         return -AG_ENOMEM;
     }
 

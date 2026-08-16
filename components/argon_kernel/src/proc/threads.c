@@ -22,11 +22,9 @@
 #include <argon/kernel.h>
 #include <argon/log.h>
 
-#include "esp_heap_caps.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/queue.h"
-#include "freertos/semphr.h"
-#include "freertos/task.h"
+#include <argon/port/mem.h>
+#include <argon/port/sync.h>
+#include <argon/port/task.h>
 
 /*
  * Bounds, and why these ones.  A thread costs a stack (internal SRAM first,
@@ -49,7 +47,7 @@ static uint32_t thread_count(const proc_t *p)
     return ag_reslist_count_of(&p->res, AG_RES_THREAD);
 }
 
-bool ag_thread_owns(const void *record, TaskHandle_t task)
+bool ag_thread_owns(const void *record, ag_port_task_t task)
 {
     const ag_thread_rec_t *rec = (const ag_thread_rec_t *)record;
     return rec != NULL && rec->task == task;
@@ -67,9 +65,9 @@ void ag_thread_release(void *record)
      * handle is stale and must not be deleted twice.
      */
     if (!rec->finished && rec->task != NULL) {
-        vTaskDelete(rec->task);
+        ag_port_task_delete(rec->task);
     }
-    heap_caps_free(rec);
+    ag_port_free(rec);
 }
 
 /*
@@ -92,7 +90,7 @@ static void thread_entry(void *arg)
      * race with a joiner reading the flag.
      */
     rec->finished = true;
-    vTaskDelete(NULL);
+    ag_port_task_delete(NULL);
 }
 
 static ag_thread_t api_create(void (*fn)(void *), void *arg, const char *name,
@@ -138,8 +136,8 @@ static ag_thread_t api_create(void (*fn)(void *), void *arg, const char *name,
      * arena is released while these records are still being used to stop the
      * threads that were allocating from it.
      */
-    ag_thread_rec_t *rec = (ag_thread_rec_t *)heap_caps_calloc(
-        1, sizeof(*rec), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    ag_thread_rec_t *rec = (ag_thread_rec_t *)ag_port_calloc(
+        1, sizeof(*rec), AG_MEM_FAST | AG_MEM_BYTE);
     if (rec == NULL) {
         ag_proc_table_unlock();
         return NULL;
@@ -152,28 +150,28 @@ static ag_thread_t api_create(void (*fn)(void *), void *arg, const char *name,
     if (ag_reslist_add(&p->res, AG_RES_THREAD, rec, (uint32_t)want) != AG_OK) {
         ag_log(AG_LOG_WARN, "proc", "%s holds too many resources for a thread",
                p->name);
-        heap_caps_free(rec);
+        ag_port_free(rec);
         ag_proc_table_unlock();
         return NULL;
     }
 
-    BaseType_t core;
+    int core;
     if (flags & AG_THREAD_ANY_CORE) {
-        core = tskNO_AFFINITY;
+        core = AG_PORT_ANY_CORE;
     } else if (flags & AG_THREAD_SYS_CORE) {
         core = 0;
     } else {
-        core = (BaseType_t)ag_sysinfo()->app_core;
+        core = (int)ag_sysinfo()->app_core;
     }
 
     char label[16];
     snprintf(label, sizeof(label), "%.11s/t", (name != NULL) ? name : p->name);
 
-    TaskHandle_t task = NULL;
-    if (ag_proc_task_create(thread_entry, label, (uint32_t)want, rec,
-                            (UBaseType_t)prio, core, &task) != pdPASS) {
+    ag_port_task_t task = NULL;
+    if (!ag_proc_task_create(thread_entry, label, (uint32_t)want, rec,
+                             (unsigned)prio, core, &task)) {
         (void)ag_reslist_remove(&p->res, AG_RES_THREAD, rec, NULL);
-        heap_caps_free(rec);
+        ag_port_free(rec);
         ag_proc_table_unlock();
         ag_log(AG_LOG_WARN, "proc", "%s: no memory for a %u byte thread stack",
                p->name, (unsigned)want);
@@ -195,7 +193,7 @@ static ag_thread_t api_create(void (*fn)(void *), void *arg, const char *name,
 void ag_thread_mark_self_finished(void)
 {
     proc_t *p = ag_proc_current();
-    const TaskHandle_t me = xTaskGetCurrentTaskHandle();
+    const ag_port_task_t me = ag_port_task_self();
 
     if (p == NULL) {
         return;
@@ -217,7 +215,7 @@ static void api_exit(void)
      * simply returned takes.
      */
     ag_thread_mark_self_finished();
-    vTaskDelete(NULL);
+    ag_port_task_delete(NULL);
 }
 
 /*
@@ -241,18 +239,18 @@ static ag_err_t api_join(ag_thread_t t, uint32_t timeout_ms)
         if (timeout_ms != UINT32_MAX && waited >= timeout_ms) {
             return -AG_ETIMEDOUT;
         }
-        vTaskDelay(pdMS_TO_TICKS(10));
+        ag_port_task_delay(ag_port_ms_to_ticks(10));
     }
 }
 
 static void api_yield(void) { taskYIELD(); }
 
-static void api_sleep_ms(uint32_t ms) { vTaskDelay(pdMS_TO_TICKS(ms)); }
+static void api_sleep_ms(uint32_t ms) { ag_port_task_delay(ag_port_ms_to_ticks(ms)); }
 
 static ag_thread_t api_self(void)
 {
     proc_t *p = ag_proc_current();
-    const TaskHandle_t me = xTaskGetCurrentTaskHandle();
+    const ag_port_task_t me = ag_port_task_self();
 
     if (p != NULL) {
         for (uint32_t i = 0; i < AG_PROC_RES_MAX; i++) {
@@ -324,11 +322,11 @@ static bool forget(ag_res_type_t type, void *object)
 
 static ag_mutex_t api_mutex_create(void)
 {
-    SemaphoreHandle_t m = xSemaphoreCreateMutex();
-    void             *kept = keep(AG_RES_MUTEX, m);
+    ag_port_mutex_t m = ag_port_mutex_new();
+    void           *kept = keep(AG_RES_MUTEX, m);
 
     if (kept == NULL && m != NULL) {
-        vSemaphoreDelete(m);
+        ag_port_mutex_free(m);
     }
     return (ag_mutex_t)kept;
 }
@@ -336,7 +334,7 @@ static ag_mutex_t api_mutex_create(void)
 static void api_mutex_delete(ag_mutex_t m)
 {
     if (forget(AG_RES_MUTEX, m)) {
-        vSemaphoreDelete((SemaphoreHandle_t)m);
+        ag_port_mutex_free((ag_port_mutex_t)m);
     }
 }
 
@@ -345,16 +343,16 @@ static bool api_mutex_lock(ag_mutex_t m, uint32_t timeout_ms)
     if (m == NULL) {
         return false;
     }
-    const TickType_t ticks = (timeout_ms == UINT32_MAX)
-                                 ? portMAX_DELAY
-                                 : pdMS_TO_TICKS(timeout_ms);
-    return xSemaphoreTake((SemaphoreHandle_t)m, ticks) == pdTRUE;
+    const ag_port_ticks_t ticks = (timeout_ms == UINT32_MAX)
+                                      ? AG_PORT_FOREVER
+                                      : ag_port_ms_to_ticks(timeout_ms);
+    return ag_port_mutex_take((ag_port_mutex_t)m, ticks);
 }
 
 static void api_mutex_unlock(ag_mutex_t m)
 {
     if (m != NULL) {
-        (void)xSemaphoreGive((SemaphoreHandle_t)m);
+        (void)ag_port_mutex_give((ag_port_mutex_t)m);
     }
 }
 
@@ -367,11 +365,11 @@ static ag_sem_t api_sem_create(uint32_t initial, uint32_t max)
         initial = max;
     }
 
-    SemaphoreHandle_t s = xSemaphoreCreateCounting(max, initial);
-    void             *kept = keep(AG_RES_SEM, s);
+    ag_port_sem_t s = ag_port_sem_new_counting(max, initial);
+    void         *kept = keep(AG_RES_SEM, s);
 
     if (kept == NULL && s != NULL) {
-        vSemaphoreDelete(s);
+        ag_port_sem_free(s);
     }
     return (ag_sem_t)kept;
 }
@@ -379,7 +377,7 @@ static ag_sem_t api_sem_create(uint32_t initial, uint32_t max)
 static void api_sem_delete(ag_sem_t s)
 {
     if (forget(AG_RES_SEM, s)) {
-        vSemaphoreDelete((SemaphoreHandle_t)s);
+        ag_port_sem_free((ag_port_sem_t)s);
     }
 }
 
@@ -388,16 +386,16 @@ static bool api_sem_take(ag_sem_t s, uint32_t timeout_ms)
     if (s == NULL) {
         return false;
     }
-    const TickType_t ticks = (timeout_ms == UINT32_MAX)
-                                 ? portMAX_DELAY
-                                 : pdMS_TO_TICKS(timeout_ms);
-    return xSemaphoreTake((SemaphoreHandle_t)s, ticks) == pdTRUE;
+    const ag_port_ticks_t ticks = (timeout_ms == UINT32_MAX)
+                                      ? AG_PORT_FOREVER
+                                      : ag_port_ms_to_ticks(timeout_ms);
+    return ag_port_sem_take((ag_port_sem_t)s, ticks);
 }
 
 static void api_sem_give(ag_sem_t s)
 {
     if (s != NULL) {
-        (void)xSemaphoreGive((SemaphoreHandle_t)s);
+        (void)ag_port_sem_give((ag_port_sem_t)s);
     }
 }
 
@@ -407,11 +405,11 @@ static ag_queue_t api_queue_create(uint32_t items, size_t item_size)
         return NULL;
     }
 
-    QueueHandle_t q = xQueueCreate(items, item_size);
-    void         *kept = keep(AG_RES_QUEUE, q);
+    ag_port_queue_t q = ag_port_queue_new(items, (uint32_t)item_size);
+    void           *kept = keep(AG_RES_QUEUE, q);
 
     if (kept == NULL && q != NULL) {
-        vQueueDelete(q);
+        ag_port_queue_free(q);
     }
     return (ag_queue_t)kept;
 }
@@ -419,7 +417,7 @@ static ag_queue_t api_queue_create(uint32_t items, size_t item_size)
 static void api_queue_delete(ag_queue_t q)
 {
     if (forget(AG_RES_QUEUE, q)) {
-        vQueueDelete((QueueHandle_t)q);
+        ag_port_queue_free((ag_port_queue_t)q);
     }
 }
 
@@ -428,10 +426,10 @@ static bool api_queue_send(ag_queue_t q, const void *item, uint32_t timeout_ms)
     if (q == NULL || item == NULL) {
         return false;
     }
-    const TickType_t ticks = (timeout_ms == UINT32_MAX)
-                                 ? portMAX_DELAY
-                                 : pdMS_TO_TICKS(timeout_ms);
-    return xQueueSend((QueueHandle_t)q, item, ticks) == pdTRUE;
+    const ag_port_ticks_t ticks = (timeout_ms == UINT32_MAX)
+                                      ? AG_PORT_FOREVER
+                                      : ag_port_ms_to_ticks(timeout_ms);
+    return ag_port_queue_send((ag_port_queue_t)q, item, ticks);
 }
 
 static bool api_queue_recv(ag_queue_t q, void *item, uint32_t timeout_ms)
@@ -439,10 +437,10 @@ static bool api_queue_recv(ag_queue_t q, void *item, uint32_t timeout_ms)
     if (q == NULL || item == NULL) {
         return false;
     }
-    const TickType_t ticks = (timeout_ms == UINT32_MAX)
-                                 ? portMAX_DELAY
-                                 : pdMS_TO_TICKS(timeout_ms);
-    return xQueueReceive((QueueHandle_t)q, item, ticks) == pdTRUE;
+    const ag_port_ticks_t ticks = (timeout_ms == UINT32_MAX)
+                                      ? AG_PORT_FOREVER
+                                      : ag_port_ms_to_ticks(timeout_ms);
+    return ag_port_queue_recv((ag_port_queue_t)q, item, ticks);
 }
 
 /*
@@ -452,8 +450,8 @@ static bool api_queue_recv(ag_queue_t q, void *item, uint32_t timeout_ms)
  * Interrupts keep running: this is not a way to talk to hardware, it is a way to
  * finish a short piece of work without being switched out.
  */
-static void api_critical_enter(void) { vTaskSuspendAll(); }
-static void api_critical_exit(void) { (void)xTaskResumeAll(); }
+static void api_critical_enter(void) { ag_port_sched_lock(); }
+static void api_critical_exit(void) { ag_port_sched_unlock(); }
 
 const ag_task_api_t ag_task_api_table = {
     .size = sizeof(ag_task_api_t),

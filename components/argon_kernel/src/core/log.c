@@ -10,10 +10,10 @@
 
 #include <argon/console.h>
 
-#include "esp_log.h"
-#include "esp_timer.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/semphr.h"
+#include <argon/port/log.h>
+#include <argon/port/time.h>
+#include <argon/port/sync.h>
+#include <argon/port/task.h>
 
 /*
  * Static storage, in internal RAM, available before any allocator has run.  4 KB
@@ -39,19 +39,19 @@ static bool         s_ready;
  * Taken only when it exists: the first messages of the boot arrive before any
  * allocator has run, and losing those is not an option.
  */
-static SemaphoreHandle_t s_lock;
+static ag_port_mutex_t s_lock;
 
 static void log_lock(void)
 {
     if (s_lock != NULL) {
-        xSemaphoreTakeRecursive(s_lock, portMAX_DELAY);
+        ag_port_mutex_take_recursive(s_lock, AG_PORT_FOREVER);
     }
 }
 
 static void log_unlock(void)
 {
     if (s_lock != NULL) {
-        xSemaphoreGiveRecursive(s_lock);
+        ag_port_mutex_give_recursive(s_lock);
     }
 }
 
@@ -104,7 +104,7 @@ static void app_flush_line(ag_pid_t pid, const char *name, const char *body,
 {
     char line[AG_JOURNAL_LINE_MAX];
     const char *tag = (name != NULL && name[0] != '\0') ? name : "app";
-    const uint32_t ms = (uint32_t)(esp_timer_get_time() / 1000);
+    const uint32_t ms = (uint32_t)(ag_port_us() / 1000);
     int n = snprintf(line, sizeof(line), "I (%u) app/%s:%u: ", (unsigned)ms,
                      tag, (unsigned)pid);
     if (n < 0) {
@@ -193,13 +193,13 @@ ag_err_t ag_log_init(void)
         return err;
     }
 
-    s_lock = xSemaphoreCreateRecursiveMutex();
+    s_lock = ag_port_mutex_new_recursive();
     if (s_lock == NULL) {
         return -AG_ENOMEM;
     }
 
     s_ready = true;
-    esp_log_set_vprintf(log_vprintf);
+    ag_port_log_redirect(log_vprintf);
     return AG_OK;
 }
 
@@ -213,7 +213,7 @@ void ag_vlog(ag_log_level_t level, const char *tag, const char *fmt,
     }
 
     const char mark = (level < sizeof(k_mark)) ? k_mark[level] : '?';
-    const uint32_t ms = (uint32_t)(esp_timer_get_time() / 1000);
+    const uint32_t ms = (uint32_t)(ag_port_us() / 1000);
 
     /* One line, whoever else is logging at the same time. */
     log_lock();

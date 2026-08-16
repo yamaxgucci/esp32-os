@@ -9,7 +9,7 @@
 
 #include <argon/codepage.h>
 
-#include "sdkconfig.h"
+#include <argon/port/config.h>
 
 #ifndef CONFIG_ARGON_CONSOLE_KEY_EVENTS
 #define CONFIG_ARGON_CONSOLE_KEY_EVENTS 0

@@ -1,5 +1,6 @@
 /*
- * ArgonOS - catching a fault and blaming the right process.
+ * ArgonOS port: ESP-IDF / Xtensa - catching a fault and blaming the right
+ * process.
  *
  * Without an MMU a wild pointer can reach anything, and that is a deliberate
  * trade [Т-12].  What is not acceptable is the consequence: an application that
@@ -35,7 +36,7 @@
  *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
-#include "proc/proc_internal.h"
+#include <argon/port/fault.h>
 
 #include <xtensa/corebits.h>
 
@@ -43,6 +44,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "xtensa_api.h"
+
+#include <argon/port/task.h>
 
 /*
  * The causes worth taking over: the ones that mean the program is wrong.
@@ -77,7 +80,10 @@ static xt_exc_handler s_chain[AG_FAULT_CAUSE_MAX];
 static bool           s_chain_saved;
 static bool           s_installed;
 
-const char *ag_fault_cause_name(uint32_t cause)
+static ag_port_fault_note_fn    s_note;
+static ag_port_fault_recover_fn s_recover;
+
+const char *ag_port_fault_cause_name(uint32_t cause)
 {
     switch (cause) {
     case EXCCAUSE_ILLEGAL:               return "illegal instruction";
@@ -109,15 +115,15 @@ void ag_fault_trampoline(void);
 
 void ag_fault_trampoline(void)
 {
-    ag_proc_fault_exit();
+    s_recover();
 
     /*
-     * Unreachable: fault_exit does not return.  If it somehow did, going back to
+     * Unreachable: recover does not return.  If it somehow did, going back to
      * the instruction that faulted would loop forever, so stop here instead and
      * let the watchdog have it.
      */
     for (;;) {
-        vTaskDelay(portMAX_DELAY);
+        ag_port_task_delay(AG_PORT_FOREVER);
     }
 }
 
@@ -127,11 +133,11 @@ static void fault_handler(XtExcFrame *frame)
 
     /*
      * Nothing here locks, logs or allocates: this is an exception context, and
-     * the process layer's note_fault is written to the same rule.  It answers
-     * whether this fault belongs to a recoverable application.
+     * the note callback is written to the same rule.  It answers whether this
+     * fault belongs to a recoverable application.
      */
-    if (ag_proc_note_fault(cause, (uint32_t)frame->pc, (uint32_t)frame->excvaddr,
-                           (uint32_t)frame->a1)) {
+    if (s_note(cause, (uint32_t)frame->pc, (uint32_t)frame->excvaddr,
+               (uint32_t)frame->a1)) {
         frame->pc = (long)&ag_fault_trampoline;
         return;
     }
@@ -157,11 +163,19 @@ static void install_here(void *arg)
     }
 }
 
-ag_err_t ag_fault_init(void)
+ag_err_t ag_port_fault_init(ag_port_fault_note_fn note,
+                            ag_port_fault_recover_fn recover)
 {
+    if (note == NULL || recover == NULL) {
+        return -AG_EINVAL;
+    }
     if (s_installed) {
         return AG_OK;
     }
+
+    /* Set before any handler can run, which is the moment install_here returns. */
+    s_note = note;
+    s_recover = recover;
 
     install_here(NULL);
     s_chain_saved = true; /* the other core's table holds the same handlers */

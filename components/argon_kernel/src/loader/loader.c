@@ -19,7 +19,7 @@
 #include <argon/proc.h>
 #include <argon/vfs.h>
 
-#include "esp_heap_caps.h"
+#include <argon/port/mem.h>
 #include "loader/appfs.h"
 
 /*
@@ -47,12 +47,12 @@ static ag_err_t read_whole(const char *path, const char *cwd, uint8_t **out,
     }
     ag_vfs_seek(h, 0, AG_SEEK_SET);
 
-    uint8_t *buf = (uint8_t *)heap_caps_malloc((size_t)size,
-                                               MALLOC_CAP_SPIRAM |
-                                                   MALLOC_CAP_8BIT);
+    uint8_t *buf = (uint8_t *)ag_port_alloc((size_t)size,
+                                               AG_MEM_SLOW |
+                                                   AG_MEM_BYTE);
     if (buf == NULL) {
-        buf = (uint8_t *)heap_caps_malloc((size_t)size,
-                                          MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        buf = (uint8_t *)ag_port_alloc((size_t)size,
+                                          AG_MEM_FAST | AG_MEM_BYTE);
     }
     if (buf == NULL) {
         ag_vfs_close(h);
@@ -63,7 +63,7 @@ static ag_err_t read_whole(const char *path, const char *cwd, uint8_t **out,
     while (got < (size_t)size) {
         const int32_t n = ag_vfs_read(h, buf + got, (size_t)size - got);
         if (n <= 0) {
-            heap_caps_free(buf);
+            ag_port_free(buf);
             ag_vfs_close(h);
             return (n < 0) ? n : -AG_EFORMAT;
         }
@@ -164,22 +164,22 @@ static void copy_image(void *dst, const void *src, size_t bytes)
 
 static void *data_alloc(size_t bytes)
 {
-    void *p = heap_caps_aligned_alloc(16, bytes,
-                                      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    void *p = ag_port_alloc_aligned(16, bytes,
+                                      AG_MEM_SLOW | AG_MEM_BYTE);
     if (p == NULL) {
-        p = heap_caps_aligned_alloc(16, bytes,
-                                    MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        p = ag_port_alloc_aligned(16, bytes,
+                                    AG_MEM_FAST | AG_MEM_BYTE);
     }
     return p;
 }
 
 static void *scratch_alloc(size_t bytes)
 {
-    void *p = heap_caps_aligned_alloc(16, bytes,
-                                      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    void *p = ag_port_alloc_aligned(16, bytes,
+                                      AG_MEM_SLOW | AG_MEM_BYTE);
     if (p == NULL) {
-        p = heap_caps_aligned_alloc(16, bytes,
-                                    MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        p = ag_port_alloc_aligned(16, bytes,
+                                    AG_MEM_FAST | AG_MEM_BYTE);
     }
     return p;
 }
@@ -187,11 +187,11 @@ static void *scratch_alloc(size_t bytes)
 static void release_image(ag_loaded_app_t *app)
 {
     if (app->data_owned != NULL) {
-        heap_caps_free(app->data_owned);
+        ag_port_free(app->data_owned);
         app->data_owned = NULL;
     }
     if (app->code_scratch != NULL) {
-        heap_caps_free(app->code_scratch);
+        ag_port_free(app->code_scratch);
         app->code_scratch = NULL;
     }
     if (app->xip_slot != NULL) {
@@ -281,7 +281,7 @@ static ag_err_t place_xip(const ag_axe_header_t *header, ag_loaded_app_t *out)
     if (header->data.size > 0) {
         data = data_alloc(header->data.size);
         if (data == NULL) {
-            heap_caps_free(scratch);
+            ag_port_free(scratch);
             ag_appfs_release(slot);
             return -AG_ENOMEM;
         }
@@ -363,21 +363,21 @@ ag_err_t ag_loader_load(const char *path, const char *cwd,
     err = ag_axe_validate(header, file_size, ag_axe_native_arch(),
                           AG_ABI_MAJOR, AG_ABI_MINOR);
     if (err != AG_OK) {
-        heap_caps_free(file);
+        ag_port_free(file);
         return err;
     }
     err = ag_axe_check_sig(file, file_size);
     if (err != AG_OK) {
         ag_log(AG_LOG_ERROR, "loader", "%s: bad signature (%d)", path,
                (int)err);
-        heap_caps_free(file);
+        ag_port_free(file);
         return err;
     }
 
     out->header = *header;
     err = place_image(header, out);
     if (err != AG_OK) {
-        heap_caps_free(file);
+        ag_port_free(file);
         memset(out, 0, sizeof(*out));
         return err;
     }
@@ -394,7 +394,7 @@ ag_err_t ag_loader_load(const char *path, const char *cwd,
     err = ag_axe_apply(&out->header, &out->place,
                        (const uint32_t *)(file + header->reloc_offset),
                        header->reloc_count, &out->binding);
-    heap_caps_free(file);
+    ag_port_free(file);
 
     if (err != AG_OK) {
         release_image(out);
@@ -431,7 +431,7 @@ ag_err_t ag_loader_load(const char *path, const char *cwd,
         }
 
         /* Scratch is no longer needed; execution uses the mmap. */
-        heap_caps_free(out->code_scratch);
+        ag_port_free(out->code_scratch);
         out->code_scratch = NULL;
         out->place.code_writable = NULL;
 

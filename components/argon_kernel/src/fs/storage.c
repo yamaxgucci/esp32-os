@@ -15,16 +15,11 @@
 #include <argon/ramfs.h>
 #include <argon/vfs.h>
 
-#include "driver/sdmmc_host.h"
-#include "driver/sdspi_host.h"
-#include "driver/spi_common.h"
-#include "esp_heap_caps.h"
-#include "esp_littlefs.h"
-#include "esp_partition.h"
-#include "esp_vfs_fat.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/semphr.h"
-#include "sdmmc_cmd.h"
+#include <argon/port/flash.h>
+#include <argon/port/mem.h>
+#include <argon/port/storage.h>
+#include <argon/port/sync.h>
+#include <argon/port/task.h>
 
 #include "boot/platform.h"
 #include "fs/idfvfs.h"
@@ -37,29 +32,28 @@
 #define AG_TMP_BUDGET_PSRAM (4u * 1024u * 1024u)
 #define AG_TMP_BUDGET_SRAM (32u * 1024u)
 
-/* Where ESP-IDF mounts each filesystem, before we re-expose it. */
+/* Where the port mounts each filesystem, before we re-expose it. */
 #define AG_SYS_BASE_PATH "/flash"
 #define AG_SYS_PARTITION "sysfs"
 
 #define AG_SD_BASE_PATH "/sdcard"
-#define AG_SD_MAX_FILES 8
 
-static SemaphoreHandle_t s_vfs_mutex;
-static ag_ramfs_t       *s_tmpfs;
-static ag_idfvfs_t      *s_sysfs;
-static ag_idfvfs_t      *s_sdfs;
-static sdmmc_card_t     *s_sd_card;
+static ag_port_mutex_t s_vfs_mutex;
+static ag_ramfs_t     *s_tmpfs;
+static ag_idfvfs_t    *s_sysfs;
+static ag_idfvfs_t    *s_sdfs;
+static ag_port_sd_t    s_sd_card;
 
 static void vfs_lock(void *ctx)
 {
     (void)ctx;
-    xSemaphoreTakeRecursive(s_vfs_mutex, portMAX_DELAY);
+    ag_port_mutex_take_recursive(s_vfs_mutex, AG_PORT_FOREVER);
 }
 
 static void vfs_unlock(void *ctx)
 {
     (void)ctx;
-    xSemaphoreGiveRecursive(s_vfs_mutex);
+    ag_port_mutex_give_recursive(s_vfs_mutex);
 }
 
 void *ag_storage_vfs_lock_holder(void)
@@ -67,7 +61,7 @@ void *ag_storage_vfs_lock_holder(void)
     if (s_vfs_mutex == NULL) {
         return NULL;
     }
-    return (void *)xSemaphoreGetMutexHolder(s_vfs_mutex);
+    return (void *)ag_port_mutex_holder(s_vfs_mutex);
 }
 
 static uint64_t now_unix(void)
@@ -83,29 +77,28 @@ static uint64_t now_unix(void)
 /* Prefer PSRAM so that a large /tmp does not eat the scarce internal RAM. */
 static void *tmp_alloc(size_t bytes)
 {
-    void *p = heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    void *p = ag_port_alloc(bytes, AG_MEM_SLOW | AG_MEM_BYTE);
     if (p == NULL) {
-        p = heap_caps_malloc(bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        p = ag_port_alloc(bytes, AG_MEM_FAST | AG_MEM_BYTE);
     }
     return p;
 }
 
-static void tmp_free(void *ptr) { heap_caps_free(ptr); }
+static void tmp_free(void *ptr) { ag_port_free(ptr); }
 
 static ag_err_t sys_space(void *ctx, uint64_t *total, uint64_t *available)
 {
     (void)ctx;
-    size_t bytes_total = 0;
-    size_t bytes_used = 0;
+    uint64_t bytes_total = 0;
+    uint64_t bytes_used = 0;
 
-    if (esp_littlefs_info(AG_SYS_PARTITION, &bytes_total, &bytes_used) !=
-        ESP_OK) {
-        return -AG_EIO;
+    const ag_err_t err =
+        ag_port_sysfs_space(AG_SYS_PARTITION, &bytes_total, &bytes_used);
+    if (err != AG_OK) {
+        return err;
     }
-    *total = (uint64_t)bytes_total;
-    *available = (bytes_used < bytes_total)
-                     ? (uint64_t)(bytes_total - bytes_used)
-                     : 0;
+    *total = bytes_total;
+    *available = (bytes_used < bytes_total) ? (bytes_total - bytes_used) : 0;
     return AG_OK;
 }
 
@@ -120,21 +113,15 @@ static ag_err_t sys_space(void *ctx, uint64_t *total, uint64_t *available)
  */
 static ag_err_t mount_internal_flash(void)
 {
-    const esp_vfs_littlefs_conf_t cfg = {
-        .base_path = AG_SYS_BASE_PATH,
-        .partition_label = AG_SYS_PARTITION,
-        .format_if_mount_failed = true,
-        .dont_mount = false,
-    };
-
-    if (esp_vfs_littlefs_register(&cfg) != ESP_OK) {
-        return -AG_EIO;
+    ag_err_t err =
+        ag_port_sysfs_mount(AG_SYS_PARTITION, AG_SYS_BASE_PATH, true);
+    if (err != AG_OK) {
+        return err;
     }
 
-    ag_err_t err = ag_idfvfs_create(AG_SYS_BASE_PATH, "lfs", sys_space, NULL,
-                                    &s_sysfs);
+    err = ag_idfvfs_create(AG_SYS_BASE_PATH, "lfs", sys_space, NULL, &s_sysfs);
     if (err != AG_OK) {
-        (void)esp_vfs_littlefs_unregister(AG_SYS_PARTITION);
+        (void)ag_port_sysfs_unmount(AG_SYS_PARTITION);
         return err;
     }
 
@@ -142,7 +129,7 @@ static ag_err_t mount_internal_flash(void)
     if (err != AG_OK) {
         ag_idfvfs_destroy(s_sysfs);
         s_sysfs = NULL;
-        (void)esp_vfs_littlefs_unregister(AG_SYS_PARTITION);
+        (void)ag_port_sysfs_unmount(AG_SYS_PARTITION);
         return err;
     }
     return AG_OK;
@@ -155,89 +142,33 @@ static ag_err_t mount_internal_flash(void)
 static ag_err_t sd_space(void *ctx, uint64_t *total, uint64_t *available)
 {
     (void)ctx;
-    uint64_t bytes_total = 0;
-    uint64_t bytes_free = 0;
-
-    if (esp_vfs_fat_info(AG_SD_BASE_PATH, &bytes_total, &bytes_free) != ESP_OK) {
-        return -AG_EIO;
-    }
-    *total = bytes_total;
-    *available = bytes_free;
-    return AG_OK;
+    return ag_port_media_space(AG_SD_BASE_PATH, total, available);
 }
 
 /*
- * A card is somebody's data.  Formatting happens only when the operator asks
- * for it by name, never as a way to recover from a failed mount.  That is the
- * opposite of the choice made for internal flash, where a blank partition has
- * nothing on it to lose.
+ * The board file describes the card the way the schematic does; the port wants
+ * the same facts in its own struct.  Ten lines of copying is the price of the
+ * kernel not knowing which chip it is on.
  */
-static esp_vfs_fat_mount_config_t sd_mount_config(bool allow_format)
+static void sd_cfg_from_board(const ag_board_sd_t *sd, ag_port_sd_cfg_t *out)
 {
-    const esp_vfs_fat_mount_config_t cfg = {
-        .max_files = AG_SD_MAX_FILES,
-        .format_if_mount_failed = allow_format,
-        .allocation_unit_size = 16 * 1024,
-    };
-    return cfg;
-}
-
-static esp_err_t mount_sd_sdmmc(const ag_board_sd_t *sd, bool allow_format)
-{
-    sdmmc_host_t host = SDMMC_HOST_DEFAULT();
-    host.max_freq_khz = (int)sd->max_khz;
-
-    sdmmc_slot_config_t slot = SDMMC_SLOT_CONFIG_DEFAULT();
-    slot.width = sd->width;
-    /* Boards rarely fit the external pull-ups the SD specification asks for. */
-    slot.flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
-
-#ifdef SOC_SDMMC_USE_GPIO_MATRIX
-    slot.clk = sd->clk;
-    slot.cmd = sd->cmd;
-    slot.d0 = sd->d0;
-    if (sd->width == 4) {
-        slot.d1 = sd->d1;
-        slot.d2 = sd->d2;
-        slot.d3 = sd->d3;
-    }
-#endif
-
-    const esp_vfs_fat_mount_config_t cfg = sd_mount_config(allow_format);
-    return esp_vfs_fat_sdmmc_mount(AG_SD_BASE_PATH, &host, &slot, &cfg,
-                                   &s_sd_card);
-}
-
-static esp_err_t mount_sd_spi(const ag_board_sd_t *sd, bool allow_format)
-{
-    sdmmc_host_t host = SDSPI_HOST_DEFAULT();
-    /* sd.spi_host is the chip's number, as the schematic writes it. */
-    host.slot = AG_SPI_HOST_OF((int)sd->spi_host);
-    host.max_freq_khz = (int)sd->max_khz;
-
-    const spi_bus_config_t bus = {
-        .mosi_io_num = sd->mosi,
-        .miso_io_num = sd->miso,
-        .sclk_io_num = sd->sck,
-        .quadwp_io_num = -1,
-        .quadhd_io_num = -1,
-        .max_transfer_sz = 4096,
-    };
-
-    esp_err_t err = spi_bus_initialize((spi_host_device_t)host.slot, &bus,
-                                       SPI_DMA_CH_AUTO);
-    /* Somebody else may already own the bus, which is fine. */
-    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
-        return err;
-    }
-
-    sdspi_device_config_t device = SDSPI_DEVICE_CONFIG_DEFAULT();
-    device.gpio_cs = sd->cs;
-    device.host_id = (spi_host_device_t)host.slot;
-
-    const esp_vfs_fat_mount_config_t cfg = sd_mount_config(allow_format);
-    return esp_vfs_fat_sdspi_mount(AG_SD_BASE_PATH, &host, &device, &cfg,
-                                   &s_sd_card);
+    memset(out, 0, sizeof(*out));
+    out->kind = (sd->kind == AG_SD_SDMMC) ? AG_PORT_SD_NATIVE
+                : (sd->kind == AG_SD_SPI) ? AG_PORT_SD_SPI
+                                          : AG_PORT_SD_NONE;
+    out->width = sd->width;
+    out->max_khz = sd->max_khz;
+    out->clk = sd->clk;
+    out->cmd = sd->cmd;
+    out->d0 = sd->d0;
+    out->d1 = sd->d1;
+    out->d2 = sd->d2;
+    out->d3 = sd->d3;
+    out->sck = sd->sck;
+    out->mosi = sd->mosi;
+    out->miso = sd->miso;
+    out->cs = sd->cs;
+    out->spi_host = (uint8_t)sd->spi_host;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -260,20 +191,21 @@ static uint8_t     *s_sd_bounce; /* one sector, DMA capable                */
 
 static uint64_t flash_size(ag_device_t *dev)
 {
-    return ((const esp_partition_t *)dev->priv)->size;
+    return ag_port_part_size((ag_port_part_t)dev->priv);
 }
 
 static int32_t flash_read(ag_device_t *dev, void *buf, size_t len, uint64_t off)
 {
-    const esp_partition_t *part = (const esp_partition_t *)dev->priv;
+    const ag_port_part_t part = (ag_port_part_t)dev->priv;
+    const uint64_t       size = ag_port_part_size(part);
 
-    if (off >= part->size) {
+    if (off >= size) {
         return 0;
     }
-    if (off + len > part->size) {
-        len = (size_t)(part->size - off);
+    if (off + len > size) {
+        len = (size_t)(size - off);
     }
-    if (esp_partition_read(part, (size_t)off, buf, len) != ESP_OK) {
+    if (ag_port_part_read(part, off, buf, len) != AG_OK) {
         return -AG_EIO;
     }
     return (int32_t)len;
@@ -282,7 +214,7 @@ static int32_t flash_read(ag_device_t *dev, void *buf, size_t len, uint64_t off)
 static ag_err_t flash_ioctl(ag_device_t *dev, uint32_t cmd, void *arg,
                             size_t arglen)
 {
-    const esp_partition_t *part = (const esp_partition_t *)dev->priv;
+    const ag_port_part_t part = (ag_port_part_t)dev->priv;
 
     if (cmd != AG_IOC_GEOMETRY) {
         return -AG_ENOTSUP;
@@ -292,11 +224,11 @@ static ag_err_t flash_ioctl(ag_device_t *dev, uint32_t cmd, void *arg,
     }
 
     /* The erase block, not the read granularity: it is what a write costs. */
-    const uint32_t erase = (part->erase_size > 0) ? part->erase_size : 4096u;
+    const uint32_t erase = ag_port_part_erase_size(part);
 
     ag_geometry_t *geo = (ag_geometry_t *)arg;
     geo->sector_size = erase;
-    geo->sectors = part->size / erase;
+    geo->sectors = ag_port_part_size(part) / erase;
     return AG_OK;
 }
 
@@ -306,15 +238,10 @@ static const ag_dev_ops_t k_flash_ops = {
     .size = flash_size,
 };
 
-static uint64_t sd_sector_size(const sdmmc_card_t *card)
-{
-    return (card->csd.sector_size > 0) ? (uint64_t)card->csd.sector_size : 512u;
-}
-
 static uint64_t sd_dev_size(ag_device_t *dev)
 {
-    const sdmmc_card_t *card = (const sdmmc_card_t *)dev->priv;
-    return (uint64_t)card->csd.capacity * sd_sector_size(card);
+    const ag_port_sd_t card = (ag_port_sd_t)dev->priv;
+    return ag_port_sd_sectors(card) * ag_port_sd_sector_size(card);
 }
 
 /*
@@ -326,9 +253,9 @@ static uint64_t sd_dev_size(ag_device_t *dev)
 static int32_t sd_dev_read(ag_device_t *dev, void *buf, size_t len,
                            uint64_t off)
 {
-    sdmmc_card_t  *card = (sdmmc_card_t *)dev->priv;
-    const uint64_t ss = sd_sector_size(card);
-    const uint64_t total = (uint64_t)card->csd.capacity * ss;
+    const ag_port_sd_t card = (ag_port_sd_t)dev->priv;
+    const uint64_t     ss = ag_port_sd_sector_size(card);
+    const uint64_t     total = ag_port_sd_sectors(card) * ss;
 
     if (s_sd_bounce == NULL) {
         return -AG_ENOMEM;
@@ -351,8 +278,7 @@ static int32_t sd_dev_read(ag_device_t *dev, void *buf, size_t len,
             chunk = len - done;
         }
 
-        if (sdmmc_read_sectors(card, s_sd_bounce, (size_t)sector, 1) !=
-            ESP_OK) {
+        if (ag_port_sd_read_sectors(card, sector, s_sd_bounce, 1) != AG_OK) {
             /* Partial success is still success: say how much arrived. */
             return (done > 0) ? (int32_t)done : -AG_EIO;
         }
@@ -365,7 +291,7 @@ static int32_t sd_dev_read(ag_device_t *dev, void *buf, size_t len,
 static ag_err_t sd_dev_ioctl(ag_device_t *dev, uint32_t cmd, void *arg,
                              size_t arglen)
 {
-    const sdmmc_card_t *card = (const sdmmc_card_t *)dev->priv;
+    const ag_port_sd_t card = (ag_port_sd_t)dev->priv;
 
     if (cmd != AG_IOC_GEOMETRY) {
         return -AG_ENOTSUP;
@@ -375,8 +301,8 @@ static ag_err_t sd_dev_ioctl(ag_device_t *dev, uint32_t cmd, void *arg,
     }
 
     ag_geometry_t *geo = (ag_geometry_t *)arg;
-    geo->sector_size = (uint32_t)sd_sector_size(card);
-    geo->sectors = card->csd.capacity;
+    geo->sector_size = ag_port_sd_sector_size(card);
+    geo->sectors = (uint32_t)ag_port_sd_sectors(card);
     return AG_OK;
 }
 
@@ -392,8 +318,7 @@ void ag_storage_register_devices(void)
         return;
     }
 
-    const esp_partition_t *part = esp_partition_find_first(
-        ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, AG_SYS_PARTITION);
+    const ag_port_part_t part = ag_port_part_find(AG_SYS_PARTITION);
     if (part == NULL) {
         return;
     }
@@ -416,8 +341,8 @@ static void sd_register_device(void)
     }
 
     if (s_sd_bounce == NULL) {
-        s_sd_bounce = heap_caps_malloc((size_t)sd_sector_size(s_sd_card),
-                                       MALLOC_CAP_DMA);
+        s_sd_bounce = ag_port_alloc(ag_port_sd_sector_size(s_sd_card),
+                                    AG_MEM_DMA);
         if (s_sd_bounce == NULL) {
             ag_log(AG_LOG_WARN, "dev", "no DMA buffer for sd0");
             return;
@@ -461,11 +386,17 @@ static void unmount_media(void)
         s_sdfs = NULL;
     }
     if (s_sd_card != NULL) {
-        (void)esp_vfs_fat_sdcard_unmount(AG_SD_BASE_PATH, s_sd_card);
+        (void)ag_port_sd_unmount(AG_SD_BASE_PATH, s_sd_card);
         s_sd_card = NULL;
     }
 }
 
+/*
+ * A card is somebody's data.  allow_format is true only when the operator asked
+ * for it by name, never as a way to recover from a failed mount.  That is the
+ * opposite of the choice made for internal flash, where a blank partition has
+ * nothing on it to lose.
+ */
 static ag_err_t mount_media(bool allow_format)
 {
     const ag_board_sd_t *sd = &ag_board()->sd;
@@ -474,10 +405,12 @@ static ag_err_t mount_media(bool allow_format)
         return -AG_ENODEV;
     }
 
-    const esp_err_t err = (sd->kind == AG_SD_SDMMC)
-                              ? mount_sd_sdmmc(sd, allow_format)
-                              : mount_sd_spi(sd, allow_format);
-    if (err != ESP_OK) {
+    ag_port_sd_cfg_t cfg;
+    sd_cfg_from_board(sd, &cfg);
+
+    const ag_err_t err =
+        ag_port_sd_mount(&cfg, AG_SD_BASE_PATH, allow_format, &s_sd_card);
+    if (err != AG_OK) {
         return -AG_EIO;
     }
 
@@ -492,7 +425,7 @@ static ag_err_t mount_media(bool allow_format)
     }
 
     if (rc != AG_OK) {
-        (void)esp_vfs_fat_sdcard_unmount(AG_SD_BASE_PATH, s_sd_card);
+        (void)ag_port_sd_unmount(AG_SD_BASE_PATH, s_sd_card);
         s_sd_card = NULL;
         return rc;
     }
@@ -524,7 +457,7 @@ bool ag_storage_media_present(void) { return s_sd_card != NULL; }
 ag_err_t ag_storage_init(void)
 {
     if (s_vfs_mutex == NULL) {
-        s_vfs_mutex = xSemaphoreCreateRecursiveMutex();
+        s_vfs_mutex = ag_port_mutex_new_recursive();
         if (s_vfs_mutex == NULL) {
             return -AG_ENOMEM;
         }

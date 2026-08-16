@@ -16,7 +16,7 @@
 #include <argon/shell.h>
 #include <argon/vfs.h>
 
-#include "esp_heap_caps.h"
+#include <argon/port/mem.h>
 
 #include "miniz.h"
 
@@ -30,9 +30,9 @@ static void *ag_mz_alloc(void *opaque, size_t items, size_t size)
 {
     (void)opaque;
     const size_t n = items * size;
-    void *p = heap_caps_malloc(n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    void *p = ag_port_alloc(n, AG_MEM_SLOW | AG_MEM_BYTE);
     if (p == NULL) {
-        p = heap_caps_malloc(n, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        p = ag_port_alloc(n, AG_MEM_FAST | AG_MEM_BYTE);
     }
     return p;
 }
@@ -40,16 +40,16 @@ static void *ag_mz_alloc(void *opaque, size_t items, size_t size)
 static void ag_mz_free(void *opaque, void *addr)
 {
     (void)opaque;
-    heap_caps_free(addr);
+    ag_port_free(addr);
 }
 
 static void *ag_mz_realloc(void *opaque, void *addr, size_t items, size_t size)
 {
     (void)opaque;
     const size_t n = items * size;
-    void *p = heap_caps_realloc(addr, n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    void *p = ag_port_realloc(addr, n, AG_MEM_SLOW | AG_MEM_BYTE);
     if (p == NULL && n > 0) {
-        p = heap_caps_realloc(addr, n, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        p = ag_port_realloc(addr, n, AG_MEM_FAST | AG_MEM_BYTE);
     }
     return p;
 }

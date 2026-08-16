@@ -21,11 +21,10 @@
 #include <argon/recovery.h>
 #include <argon/shell.h>
 
-#include "esp_log.h"
-#include "esp_timer.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "sdkconfig.h"
+#include <argon/port/time.h>
+#include <argon/port/task.h>
+#include <argon/port/uart.h>
+#include <argon/port/config.h>
 
 #include "boot/platform.h"
 #include "console/uart_console.h"
@@ -119,8 +118,8 @@ static ag_err_t stage_console(void)
         return err;
     }
 
-    AG_TRACE("attaching uart%d\n", CONFIG_ESP_CONSOLE_UART_NUM);
-    err = ag_uart_console_attach(CONFIG_ESP_CONSOLE_UART_NUM, 115200);
+    AG_TRACE("attaching uart%d\n", AG_PORT_UART_CONSOLE);
+    err = ag_uart_console_attach(AG_PORT_UART_CONSOLE, 115200);
     if (err != AG_OK) {
         return err;
     }
@@ -199,7 +198,7 @@ static void print_summary(void)
 void ag_kernel_main(void)
 {
     AG_TRACE("kernel entry\n");
-    const int64_t t0 = esp_timer_get_time();
+    const int64_t t0 = ag_port_us();
 
     memset(&s_report, 0, sizeof(s_report));
 
@@ -214,9 +213,9 @@ void ag_kernel_main(void)
             continue;
         }
 
-        const int64_t ts = esp_timer_get_time();
+        const int64_t ts = ag_port_us();
         const ag_err_t err = st->fn();
-        s_report.stage_us[i] = (uint32_t)(esp_timer_get_time() - ts);
+        s_report.stage_us[i] = (uint32_t)(ag_port_us() - ts);
         s_report.stage_result[i] = err;
 
         if (err != AG_OK) {
@@ -237,13 +236,13 @@ void ag_kernel_main(void)
         }
     }
 
-    s_report.boot_us = (uint32_t)(esp_timer_get_time() - t0);
+    s_report.boot_us = (uint32_t)(ag_port_us() - t0);
     print_summary();
 
     if (fatal_failure) {
         /* Keep the board alive so the failure can be read off the console. */
         for (;;) {
-            vTaskDelay(pdMS_TO_TICKS(1000));
+            ag_port_task_delay(ag_port_ms_to_ticks(1000));
         }
     }
 

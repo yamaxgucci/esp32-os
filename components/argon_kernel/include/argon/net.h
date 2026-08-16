@@ -7,7 +7,7 @@
 #define ARGON_NET_H
 
 #include <argon/abi.h>
-#include "sdkconfig.h"
+#include <argon/port/config.h>
 
 #ifdef __cplusplus
 extern "C" {

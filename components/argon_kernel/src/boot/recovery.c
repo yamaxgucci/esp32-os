@@ -11,9 +11,9 @@
 #include <argon/log.h>
 #include <argon/vfs.h>
 
+#include <argon/port/sys.h>
+
 #include "core/sysconfig.h"
-#include "esp_system.h"
-#include "esp_attr.h"
 
 #ifndef AG_BOOT_RECOVERY_DEFAULT_AFTER
 #define AG_BOOT_RECOVERY_DEFAULT_AFTER 3u
@@ -26,20 +26,15 @@ typedef struct {
 
 #define AG_BOOT_COUNTER_MAGIC 0xA60C071Cu
 
-static RTC_NOINIT_ATTR ag_boot_counter_t s_counter;
+static AG_PORT_NOINIT ag_boot_counter_t s_counter;
 static bool         s_recovery;
 static const char  *s_reason = "";
 static bool         s_begun;
 
-static bool reset_is_unclean(esp_reset_reason_t rr)
+static bool reset_is_unclean(ag_reset_t rr)
 {
-    switch (rr) {
-    case ESP_RST_POWERON:
-    case ESP_RST_SW: /* esp_restart / shell reboot — intentional */
-        return false;
-    default:
-        return true;
-    }
+    /* A cold start and a deliberate `reboot` are both clean; nothing else is. */
+    return rr == AG_RESET_OTHER;
 }
 
 static bool marker_present(void)
@@ -63,16 +58,16 @@ void ag_boot_recovery_begin(void)
         s_counter.attempts = 0;
     }
 
-    const esp_reset_reason_t rr = esp_reset_reason();
+    const ag_reset_t rr = ag_port_reset_reason();
     if (reset_is_unclean(rr)) {
         if (s_counter.attempts < 1000u) {
             s_counter.attempts++;
         }
-    } else if (rr == ESP_RST_POWERON) {
+    } else if (rr == AG_RESET_POWERON) {
         /* Cold power-on: start a fresh streak. */
         s_counter.attempts = 0;
     }
-    /* ESP_RST_SW keeps the counter until the shell clears it. */
+    /* A deliberate restart keeps the counter until the shell clears it. */
 
     unsigned threshold = AG_BOOT_RECOVERY_DEFAULT_AFTER;
     const ag_cfg_t *cfg = ag_sysconfig();

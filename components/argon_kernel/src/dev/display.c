@@ -25,13 +25,11 @@
 #include <argon/vfs.h>
 
 #include "dev/font8x16.h"
-#include "esp_heap_caps.h"
-#include "esp_lcd_panel_ops.h"
-#include "esp_lcd_qemu_rgb.h"
-#include "esp_timer.h"
+#include <argon/port/mem.h>
+#include <argon/port/panel.h>
+#include <argon/port/time.h>
 
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
+#include <argon/port/task.h>
 
 /* Match the text console: 80×25 cells at 8×16 px. */
 #define AG_DISPLAY_DEFAULT_W 640
@@ -74,10 +72,10 @@ static bool      s_front_owned; /* false when front is QEMU's dedicated FB */
 static uint32_t  s_console_gen;
 static int16_t   s_caret_col = -1; /* last inverted console cell, or -1 */
 static int16_t   s_caret_row = -1;
-static int32_t   s_qemu_y0; /* last kicked row range, exclusive y1     */
-static int32_t   s_qemu_y1;
+
+
 static ag_device_t *s_dev;
-static esp_lcd_panel_handle_t s_qemu_panel; /* NULL on real hardware */
+static bool      s_panel; /* false when this machine has no panel     */
 
 static size_t fb_bytes(void)
 {
@@ -87,99 +85,29 @@ static size_t fb_bytes(void)
 /* ---------------------------------------------------------------------- */
 
 /*
- * QEMU RGB MMIO (see espressif/qemu hw/display/esp_rgb.c).  Do NOT call
- * esp_lcd_rgb_qemu_refresh: it busy-waits on UPDATE_STATUS.ENA, and that bit
- * only clears from QEMU's display thread — a guest spin (no yield) deadlocks
- * SMS/console.  Do not wait on every kick: that capped gfx at ~32 fps.  Wait
- * only when the new region does not cover the in-flight one.
- */
-enum {
-    RGB_MMIO_UPDATE_FROM = 0x08u / 4u,
-    RGB_MMIO_UPDATE_TO = 0x0cu / 4u,
-    RGB_MMIO_UPDATE_CONTENT = 0x10u / 4u,
-    RGB_MMIO_UPDATE_STATUS = 0x14u / 4u,
-};
-
-/*
  * Present rows y .. y+h of the framebuffer.
  *
- * Rows, not rectangles, and that is the whole point: UPDATE_CONTENT is a
- * *tightly packed* bitmap of exactly the region being updated - the same
- * contract as esp_lcd_panel_draw_bitmap, whose caller always hands over a
- * standalone w*h buffer.  A framebuffer is only tightly packed when the region
- * spans full rows; for anything narrower QEMU would read w*h pixels straight
- * from the pointer and paint the top-left corner of the frame into the region.
- * That is not theoretical - it looked like the console text reappearing in the
- * middle of the screen in diagonal bands.
+ * Rows, not rectangles, and that is the whole point: a panel is handed a
+ * *tightly packed* bitmap of exactly the region being updated, and a
+ * framebuffer is only tightly packed when the region spans full rows.  For
+ * anything narrower the panel reads w*h pixels straight from the pointer and
+ * paints the top-left corner of the frame into the region - which is not
+ * theoretical, it looked like console text reappearing in the middle of the
+ * screen in diagonal bands.
  *
  * A caller that touched a narrow rectangle therefore still gets its rows
  * presented whole.  The extra columns cost nothing on this side: they are read
- * by QEMU's display thread, while the copy the guest pays for stays narrow.
+ * by the panel, while the copy the guest pays for stays narrow.
  */
-static void qemu_wait_idle(void)
+static void panel_present_rows(int32_t y, int32_t h)
 {
-    volatile uint32_t *const rgb = (volatile uint32_t *)0x21000000u;
-    const int64_t deadline = esp_timer_get_time() + 50000; /* 50 ms */
-    int yields = 0;
-    while ((rgb[RGB_MMIO_UPDATE_STATUS] & 1u) != 0) {
-        if (esp_timer_get_time() >= deadline) {
-            break;
-        }
-        if (yields < 8) {
-            taskYIELD();
-            yields++;
-        } else {
-            vTaskDelay(1);
-        }
-    }
-}
-
-static void qemu_present_rows(int32_t y, int32_t h)
-{
-    if (s_qemu_panel == NULL || s_front == NULL || s_w == 0 || s_h == 0) {
+    if (!s_panel || s_front == NULL || s_w == 0 || s_h == 0) {
         return;
     }
-    if (y < 0) {
-        h += y;
-        y = 0;
-    }
-    if (y + h > (int32_t)s_h) {
-        h = (int32_t)s_h - y;
-    }
-    if (h <= 0) {
-        return;
-    }
-
-    volatile uint32_t *const rgb = (volatile uint32_t *)0x21000000u;
-    /*
-     * Replacing an in-flight *larger* blit with a smaller one leaves stale
-     * rows in the SDL window (dirty gfxbench on top of the loading banner).
-     * Same-or-larger kicks may overwrite: dropping a full frame is how ~130
-     * fps full-redraw stays possible.
-     */
-    if ((rgb[RGB_MMIO_UPDATE_STATUS] & 1u) != 0) {
-        const bool covers = (y <= s_qemu_y0) && ((y + h) >= s_qemu_y1);
-        if (!covers) {
-            qemu_wait_idle();
-        }
-    }
-
-    /* X in the high half, Y in the low one, per rgb_qemu_dev_t. Ends are
-     * exclusive. */
-    rgb[RGB_MMIO_UPDATE_FROM] = (uint32_t)y;
-    rgb[RGB_MMIO_UPDATE_TO] = ((uint32_t)s_w << 16) | (uint32_t)(y + h);
-    rgb[RGB_MMIO_UPDATE_CONTENT] =
-        (uint32_t)(uintptr_t)((const uint8_t *)s_front + (size_t)y * s_stride);
-    rgb[RGB_MMIO_UPDATE_STATUS] = 1u; /* ENA; QEMU clears asynchronously */
-    s_qemu_y0 = y;
-    s_qemu_y1 = y + h;
-    taskYIELD();
+    ag_port_panel_present(y, h);
 }
 
-static void qemu_present(void)
-{
-    qemu_present_rows(0, (int32_t)s_h);
-}
+static void panel_present(void) { panel_present_rows(0, (int32_t)s_h); }
 
 /*
  * Copy draw → front within a rectangle, then present the rows it touched.
@@ -188,7 +116,7 @@ static void qemu_present(void)
  *
  * The rectangle is what makes an emulator affordable: a 320x224 frame is 140 KB
  * to copy against 500 KB for a full 640x400 frame, and this copy is CPU, not
- * DMA.  Only the copy narrows, though - see qemu_present_rows for why the
+ * DMA.  Only the copy narrows, though - see panel_present_rows for why the
  * presented region cannot.
  */
 static void present_rect_to_front(int32_t x, int32_t y, int32_t w, int32_t h)
@@ -211,7 +139,7 @@ static void present_rect_to_front(int32_t x, int32_t y, int32_t w, int32_t h)
         h = (int32_t)s_h - y;
     }
     if (w <= 0 || h <= 0) {
-        qemu_present();
+        panel_present();
         return;
     }
 
@@ -231,7 +159,7 @@ static void present_rect_to_front(int32_t x, int32_t y, int32_t w, int32_t h)
             }
         }
     }
-    qemu_present_rows(y, h);
+    panel_present_rows(y, h);
 }
 
 /* Copy draw → front (full frame). No-op when drawing already targets front. */
@@ -243,33 +171,18 @@ static void present_draw_to_front(void)
     if (s_draw != s_front) {
         memcpy(s_front, s_draw, fb_bytes());
     }
-    qemu_present();
+    panel_present();
 }
 
-/* On success, *out_fb is QEMU's dedicated RGB565 buffer (do not free). */
-static bool qemu_try_attach(uint16_t w, uint16_t h, uint16_t **out_fb)
+/* On success, *out_fb is the panel's own RGB565 buffer (do not free). */
+static bool panel_try_attach(uint16_t w, uint16_t h, uint16_t **out_fb)
 {
-    const esp_lcd_rgb_qemu_config_t cfg = {
-        .width = w,
-        .height = h,
-        .bpp = RGB_QEMU_BPP_16,
-    };
-    esp_lcd_panel_handle_t panel = NULL;
-    if (esp_lcd_new_rgb_qemu(&cfg, &panel) != ESP_OK || panel == NULL) {
+    void *fb = NULL;
+    if (!ag_port_panel_open(w, h, &fb)) {
         return false;
     }
-    (void)esp_lcd_panel_reset(panel);
-    (void)esp_lcd_panel_init(panel);
-
-    void *qfb = NULL;
-    if (esp_lcd_rgb_qemu_get_frame_buffer(panel, &qfb) != ESP_OK ||
-        qfb == NULL) {
-        (void)esp_lcd_panel_del(panel);
-        return false;
-    }
-
-    s_qemu_panel = panel;
-    *out_fb = (uint16_t *)qfb;
+    s_panel = true;
+    *out_fb = (uint16_t *)fb;
     return true;
 }
 
@@ -541,7 +454,7 @@ static void gfx_swap(void)
  * Clear the draw surface (and the front buffer in memory when double-buffered)
  * so a later partial flush does not leave console trash in the margins.
  *
- * Do NOT call qemu_present() here: apps that clear→draw→flush every frame
+ * Do NOT call panel_present() here: apps that clear→draw→flush every frame
  * (GRAIN, AMP, …) would flash a blank frame between clear and flush.  The next
  * flush/swap is what pushes pixels to the host display.
  */
@@ -960,7 +873,7 @@ void ag_display_show_overlay(const char *label)
         }
     }
     s_draw = s_front;
-    qemu_present();
+    panel_present();
 }
 
 static void paint_console_cell(const ag_screen_t *screen, uint16_t col,
@@ -995,7 +908,7 @@ void ag_display_render_console(const ag_screen_t *screen)
     const bool want_caret = screen->cursor_visible;
     const bool lit =
         want_caret &&
-        (((uint64_t)esp_timer_get_time() / 530000ull) % 2ull == 0ull);
+        (((uint64_t)ag_port_us() / 530000ull) % 2ull == 0ull);
 
     if (!dirty && !want_caret && s_caret_col < 0) {
         return;
@@ -1045,9 +958,9 @@ void ag_display_render_console(const ag_screen_t *screen)
     }
 
     if (dirty) {
-        qemu_present();
+        panel_present();
     } else if (carety0 >= 0) {
-        qemu_present_rows(carety0, carety1 - carety0);
+        panel_present_rows(carety0, carety1 - carety0);
     }
 }
 
@@ -1149,12 +1062,12 @@ ag_err_t ag_display_init(void)
     bool      owned = false;
 
     /* Prefer QEMU's dedicated FB so flush/refresh stays address-valid. */
-    if (!qemu_try_attach(w, h, &front)) {
-        front = (uint16_t *)heap_caps_malloc(
-            bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!panel_try_attach(w, h, &front)) {
+        front = (uint16_t *)ag_port_alloc(
+            bytes, AG_MEM_SLOW | AG_MEM_BYTE);
         if (front == NULL) {
-            front = (uint16_t *)heap_caps_malloc(
-                bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+            front = (uint16_t *)ag_port_alloc(
+                bytes, AG_MEM_FAST | AG_MEM_BYTE);
         }
         if (front == NULL) {
             ag_log(AG_LOG_ERROR, "display", "no memory for %ux%u framebuffer",
@@ -1164,19 +1077,19 @@ ag_err_t ag_display_init(void)
         owned = true;
     }
 
-    uint16_t *back = (uint16_t *)heap_caps_malloc(
-        bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    uint16_t *back = (uint16_t *)ag_port_alloc(
+        bytes, AG_MEM_SLOW | AG_MEM_BYTE);
     if (back == NULL) {
-        back = (uint16_t *)heap_caps_malloc(
-            bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        back = (uint16_t *)ag_port_alloc(
+            bytes, AG_MEM_FAST | AG_MEM_BYTE);
     }
     /* Back buffer optional: without it we stay single-buffered (direct). */
 
-    uint16_t *snap = (uint16_t *)heap_caps_malloc(
-        bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    uint16_t *snap = (uint16_t *)ag_port_alloc(
+        bytes, AG_MEM_SLOW | AG_MEM_BYTE);
     if (snap == NULL) {
-        snap = (uint16_t *)heap_caps_malloc(
-            bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        snap = (uint16_t *)ag_port_alloc(
+            bytes, AG_MEM_FAST | AG_MEM_BYTE);
     }
     /* Snapshot is optional: gfxdump then falls back to the live buffer. */
 
@@ -1208,13 +1121,13 @@ ag_err_t ag_display_init(void)
     const ag_err_t err = ag_dev_register(&desc, &s_dev);
     if (err != AG_OK) {
         if (owned) {
-            heap_caps_free(front);
+            ag_port_free(front);
         }
         if (back != NULL) {
-            heap_caps_free(back);
+            ag_port_free(back);
         }
         if (snap != NULL) {
-            heap_caps_free(snap);
+            ag_port_free(snap);
         }
         s_front = NULL;
         s_back = NULL;
@@ -1224,12 +1137,12 @@ ag_err_t ag_display_init(void)
     }
 
     s_ready = true;
-    if (s_qemu_panel != NULL) {
+    if (s_panel) {
         ag_log(AG_LOG_INFO, "display",
                "soft %ux%u RGB565 (%u KB)%s as fb0 + QEMU RGB window",
                (unsigned)w, (unsigned)h, (unsigned)(bytes / 1024u),
                back != NULL ? " + back" : "");
-        qemu_present();
+        panel_present();
     } else {
         ag_log(AG_LOG_INFO, "display", "soft %ux%u RGB565 (%u KB)%s as fb0",
                (unsigned)w, (unsigned)h, (unsigned)(bytes / 1024u),
