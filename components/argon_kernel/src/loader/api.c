@@ -526,7 +526,15 @@ static const ag_fs_api_t k_fs = {
 
 static ag_time_t api_us(void) { return (ag_time_t)ag_port_us(); }
 static uint32_t api_ms(void) { return (uint32_t)(ag_port_us() / 1000); }
-static uint64_t api_cycles(void) { return (uint64_t)ag_port_us(); }
+/*
+ * Real CPU cycles, not microseconds.  This used to return ag_port_us()
+ * - the same number as api_us() - which made the entry useless for exactly the
+ * job it exists for: costing a DSP inner loop, where a microsecond is 240
+ * cycles and the whole question is how many of them one sample costs.  The
+ * counter is per-core and wraps every ~18 s at 240 MHz; callers measure
+ * differences, so the wrap is theirs to handle.
+ */
+static uint64_t api_cycles(void) { return (uint64_t)ag_port_cycles(); }
 
 static void api_delay_ms(uint32_t ms) { ag_port_task_delay(ag_port_ms_to_ticks(ms)); }
 

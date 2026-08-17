@@ -1,7 +1,7 @@
 /*
  * IRFX — impulse-response / convolution FX for ArgonOS.
  *
- * Partitioned FFT convolution, ≤500 ms mono IR @ 22.05 kHz.
+ * Partitioned FFT convolution, ≤1 s mono IR @ 22.05 kHz.
  * Dry: clicks / noise bursts / optional WAV. Sink: pcmvirt|pcmnull|…
  *
  *   python tools/mkaxe.py --arch xtensa --gcc xtensa-esp32s3-elf-gcc `
@@ -451,7 +451,7 @@ static void handle_key(int key, uint32_t uni)
         if (s_ir.wet < 123u) {
             ag_ir_set_wet(&s_ir, (uint8_t)(s_ir.wet + 4u));
         } else {
-            ag_ir_set_wet(&s_ir, 127);
+            ag_ir_set_wet(&s_ir, AG_IR_WET_MAX);
         }
         s_dirty = 1;
         return;

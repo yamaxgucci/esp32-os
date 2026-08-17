@@ -521,10 +521,36 @@ long ftell(FILE *f)
     return (long)p;
 }
 
+/*
+ * A word at a time when the alignment allows it.
+ *
+ * These were both a byte at a time, which on a 32-bit core is four
+ * instructions per byte and is fine until something calls them in an audio
+ * loop.  Measured: the IR convolution zeroes four buffers of two kilobytes per
+ * block of 256 samples, and that alone was a hundred and thirty instructions
+ * per audio sample - a fifth of what the whole cabinet cost - spent storing
+ * zeros one byte at a time.
+ *
+ * The head and tail loops are what keeps it correct for any pointer: only the
+ * middle runs as words, and only when both ends agree on their offset.
+ */
 void *memcpy(void *dst, const void *src, size_t n)
 {
     unsigned char       *d = (unsigned char *)dst;
     const unsigned char *s = (const unsigned char *)src;
+
+    if ((((uintptr_t)d ^ (uintptr_t)s) & 3u) == 0u) {
+        while (n > 0u && (((uintptr_t)d & 3u) != 0u)) {
+            *d++ = *s++;
+            n--;
+        }
+        while (n >= 4u) {
+            *(uint32_t *)d = *(const uint32_t *)s;
+            d += 4;
+            s += 4;
+            n -= 4u;
+        }
+    }
     while (n--) {
         *d++ = *s++;
     }
@@ -551,9 +577,23 @@ void *memmove(void *dst, const void *src, size_t n)
 
 void *memset(void *dst, int c, size_t n)
 {
-    unsigned char *d = (unsigned char *)dst;
+    unsigned char      *d = (unsigned char *)dst;
+    const unsigned char b = (unsigned char)c;
+
+    while (n > 0u && (((uintptr_t)d & 3u) != 0u)) {
+        *d++ = b;
+        n--;
+    }
+    if (n >= 4u) {
+        const uint32_t w = 0x01010101u * (uint32_t)b;
+        while (n >= 4u) {
+            *(uint32_t *)d = w;
+            d += 4;
+            n -= 4u;
+        }
+    }
     while (n--) {
-        *d++ = (unsigned char)c;
+        *d++ = b;
     }
     return dst;
 }

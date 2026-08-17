@@ -305,6 +305,14 @@ function Get-QemuMachineArgs {
     param([string]$EfusePath)
     return @(
         '-M', 'esp32s3'
+        # QEMU reserves a 1 GB JIT buffer by default on a 64-bit host, and it
+        # reserves it as committed memory.  On a 16 GB machine with the IDF
+        # toolchain and an editor already resident that request fails outright -
+        # "allocate 1073741824 bytes for jit buffer" - and the only symptom the
+        # test harness sees is "could not connect to QEMU serial", which reads
+        # like a port problem and is not one.  A guest this size never fills
+        # 64 MB of translated code.
+        '-accel', 'tcg,tb-size=64'
         # 8 MB, matching an N16R8 module.  Not a detail: the S3 reaches flash
         # and PSRAM through one 32 MB window on the data bus, so 32 MB of PSRAM
         # leaves no address space to map flash into, and esp_partition - which

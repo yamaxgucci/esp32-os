@@ -7,6 +7,21 @@
 
 #include <stdint.h>
 
+/*
+ * These helpers sit inside per-sample and per-bin loops, so "inline" here has
+ * to mean it.  At -Os gcc reads plain `inline` as a hint and declines: on
+ * Xtensa a windowed call is one instruction at the call site and the saturate
+ * is four, so calling really is smaller - and it turned the convolution's
+ * spectrum store into two calls per bin, a thousand calls per block.
+ */
+#if defined(__GNUC__)
+#define AG_DSP_INLINE static inline __attribute__((always_inline))
+#elif defined(_MSC_VER)
+#define AG_DSP_INLINE static __forceinline
+#else
+#define AG_DSP_INLINE static inline
+#endif
+
 #define AG_DSP_SIN_BITS    10
 #define AG_DSP_SIN_LEN     (1 << AG_DSP_SIN_BITS)
 #define AG_DSP_SIN_MASK    (AG_DSP_SIN_LEN - 1)
@@ -45,7 +60,7 @@ typedef struct ag_dsp_lfo {
     uint8_t  wave;
 } ag_dsp_lfo_t;
 
-static inline int16_t ag_sat16(int32_t x)
+AG_DSP_INLINE int16_t ag_sat16(int32_t x)
 {
     if (x > 32767) {
         return 32767;
@@ -56,7 +71,7 @@ static inline int16_t ag_sat16(int32_t x)
     return (int16_t)x;
 }
 
-static inline int ag_clampi(int v, int lo, int hi)
+AG_DSP_INLINE int ag_clampi(int v, int lo, int hi)
 {
     if (v < lo) {
         return lo;
@@ -67,13 +82,13 @@ static inline int ag_clampi(int v, int lo, int hi)
     return v;
 }
 
-static inline int32_t ag_dsp_mul_q15(int32_t a, int32_t b)
+AG_DSP_INLINE int32_t ag_dsp_mul_q15(int32_t a, int32_t b)
 {
     return (int32_t)(((int64_t)a * (int64_t)b) >> 15);
 }
 
 /* mix 0..127 → dry*(127-mix)+wet*mix >> 7 */
-static inline int32_t ag_dsp_mix127(int32_t dry, int32_t wet, unsigned mix)
+AG_DSP_INLINE int32_t ag_dsp_mix127(int32_t dry, int32_t wet, unsigned mix)
 {
     unsigned m = mix > 127u ? 127u : mix;
     return (dry * (int32_t)(127u - m) + wet * (int32_t)m) >> 7;

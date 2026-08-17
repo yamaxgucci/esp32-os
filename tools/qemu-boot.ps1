@@ -35,7 +35,21 @@ param(
     [string]$HostFs = '',
     [int]$HostFsPort = 5557,
     [switch]$NoNet,
-    [int]$NetPort = 5558
+    [int]$NetPort = 5558,
+    # Tie virtual time to instructions retired instead of to host time.
+    #
+    # Without this, neither clock the guest can read means anything about the
+    # chip: esp_timer follows host wall time, and CCOUNT is that same virtual
+    # clock rescaled by the core frequency QEMU models (40 MHz, not 240), so
+    # "cycles" is just microseconds times forty.  Measured on a DSP inner loop
+    # that reports 0.1 cycles per iteration - a number no processor can produce.
+    #
+    # With -icount shift=0 one guest instruction advances virtual time by one
+    # nanosecond, so ag_micros() * 1000 is the instruction count, exactly and
+    # repeatably, whatever else the host is doing.  That is not cycles either -
+    # it ignores stalls, the cache and PSRAM latency - but it is a floor that
+    # belongs to the guest rather than to this PC.
+    [switch]$Icount
 )
 
 $ErrorActionPreference = 'Stop'
@@ -102,6 +116,17 @@ $qemuArgs = (Get-QemuMachineArgs -EfusePath $efuse) + @(
     '-monitor', 'none'
     '-serial', "tcp:127.0.0.1:$Port,server=on,wait=on"
 )
+
+if ($Icount) {
+    # Deliberately without sleep=off.  It looks like the right switch - stop
+    # QEMU pacing itself to the wall clock and let the benchmark run flat out -
+    # and it makes things about ten times slower, because with sleep=off an
+    # idle guest is no longer free: every millisecond a FreeRTOS task spends in
+    # vTaskDelay becomes a million emulated instructions of the idle loop, and
+    # the console and HostFS tasks delay constantly.  Measured on the same
+    # workload: one minute with the default, still running after eleven without.
+    $qemuArgs += @('-icount', 'shift=0')
+}
 
 if (-not $NoNet) {
     $qemuArgs += Get-QemuNetArgs -HostPort $NetPort -GuestPort $NetPort

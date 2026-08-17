@@ -493,6 +493,12 @@ static inline bool ag_queue_recv(ag_queue_t q, void *item, uint32_t timeout_ms)
 /* ---- time --------------------------------------------------------------- */
 
 static inline ag_time_t ag_micros(void) { return g_ag_api->time->us(); }
+/*
+ * CPU cycles of the core this runs on, 32-bit and wrapping every ~18 s at
+ * 240 MHz.  Use it for inner loops that a microsecond is too coarse to see;
+ * measure differences and keep the window short.
+ */
+static inline uint64_t ag_cycles(void) { return g_ag_api->time->cycles(); }
 static inline uint32_t ag_millis(void) { return g_ag_api->time->ms(); }
 static inline void ag_delay(uint32_t ms) { g_ag_api->time->delay_ms(ms); }
 static inline void ag_delay_us(uint32_t us) { g_ag_api->time->delay_us(us); }
