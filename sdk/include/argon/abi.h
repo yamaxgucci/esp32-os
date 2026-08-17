@@ -823,7 +823,7 @@ typedef struct ag_time_api {
 
     ag_time_t (*us)(void);  /* microseconds since boot                     */
     uint32_t (*ms)(void);   /* milliseconds since boot                     */
-    uint64_t (*cycles)(void);
+    uint64_t (*cycles)(void); /* CPU cycles of the calling core, 32-bit wrap  */
 
     void (*delay_ms)(uint32_t ms);
     void (*delay_us)(uint32_t us); /* busy-wait below ~1 ms                */

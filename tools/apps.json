@@ -39,6 +39,19 @@
       "src": ["apps/gfxbench/gfxbench.c", "apps/gfxbench/native_draw.c",
               "apps/common/libc/libc_shim.c"]
     },
+    {
+      "out": "CKTBENCH.AXE", "group": "core",
+      "include": ["apps/common", "apps/common/ckt", "apps/common/dsp",
+                  "apps/common/fx", "apps/common/ir", "apps/common/libc",
+                  "apps/cktbench"],
+      "cflags": "-Os -ffunction-sections -fdata-sections -fno-builtin",
+      "src": ["apps/cktbench/cktbench.c", "apps/cktbench/ckt_circuits.c",
+              "apps/common/ckt/ag_mathf.c", "apps/common/ckt/ag_ckt.c",
+              "apps/common/ckt/ag_stage.c", "apps/common/dsp/ag_dsp.c",
+              "apps/common/fx/ag_fx.c",
+              "apps/common/ir/ag_ir.c", "apps/common/ir/ag_fft.c",
+              "apps/common/libc/libc_shim.c"]
+    },
     { "out": "FBCON.AXE", "group": "core", "src": ["apps/fbcon/fbcon.c"] },
     { "out": "WHOAMI.AXE", "group": "core", "src": ["apps/whoami/whoami.c"] },
     { "out": "ZIP.AXE", "group": "core", "src": ["apps/zip/zip.c"] },

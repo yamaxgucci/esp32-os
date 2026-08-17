@@ -25,6 +25,14 @@ tools/local-env.ps1
 # Fetched by apps/gfxbench/build.py (LVGL v9.3.0). Not vendored.
 third_party/lvgl/
 
+# Reference recordings, cabinet impulses and NAM captures: third party, and
+# 177 MB of them. assets/audio/guitar-di/README.md says what each one is, where
+# it came from and what its noise floor measures, which is the part worth
+# keeping in the repository.
+assets/**/*.wav
+assets/**/*.nam
+assets/**/*.pk
+
 # Python bytecode from the host tools
 __pycache__/
 

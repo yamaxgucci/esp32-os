@@ -16,6 +16,7 @@
 #include <stdlib.h>
 
 #include "ag_dsp.h"
+#include "ag_fft.h"
 #include "ag_fmx.h"
 #include "ag_ir.h"
 #include "ag_osc.h"
@@ -463,8 +464,71 @@ static void test_ir_repeatable(void)
     AG_CHECK(a == b);
 }
 
+/*
+ * The real-input transforms have to agree with the complex ones they replaced,
+ * because the convolution's whole scaling scheme is written in terms of what
+ * the complex pair produced.  A tolerance rather than an equality: the two
+ * take different numbers of rounding steps to the same answer, and the real
+ * one takes fewer.
+ *
+ * Also the round trip, which is the property the convolution actually leans
+ * on: transform, transform back, get n times what went in.
+ */
+static void test_fft_real_matches_complex(void)
+{
+    enum { N = 512 };
+    static int32_t ar[N], ai[N], br[N], bi[N], x[N];
+    uint32_t       rng = 1u;
+    int            i, trial;
+
+    for (trial = 0; trial < 8; trial++) {
+        double worst = 0.0, mag = 1.0;
+        for (i = 0; i < N; i++) {
+            rng = rng * 1664525u + 1013904223u;
+            /* Half a block of signal, half zero pad: what the engine sends. */
+            x[i] = (i < N / 2) ? (((int32_t)(rng >> 18) - 8192) << trial) : 0;
+        }
+        for (i = 0; i < N; i++) {
+            ar[i] = x[i];
+            ai[i] = 0;
+            br[i] = x[i];
+            bi[i] = 0x5A5A5A; /* must be overwritten, not read */
+        }
+        AG_CHECK_INT(ag_fft_cplx_i32(ar, ai, N, 1), 0);
+        AG_CHECK_INT(ag_fft_real_fwd(br, bi, N), 0);
+        for (i = 0; i < N; i++) {
+            const double dr = (double)ar[i] - br[i];
+            const double di = (double)ai[i] - bi[i];
+            const double d = (dr < 0 ? -dr : dr) + (di < 0 ? -di : di);
+            const double m = (ar[i] < 0 ? -(double)ar[i] : ar[i]) +
+                             (ai[i] < 0 ? -(double)ai[i] : ai[i]);
+            if (d > worst) worst = d;
+            if (m > mag) mag = m;
+        }
+        /* Rounding only: a thousandth of the biggest bin, not a wrong answer. */
+        AG_CHECK(worst < mag / 1000.0);
+
+        /*
+         * Round trip, on the quietest case only.  The inverse of an
+         * unnormalized spectrum can reach the sum of its bins, and the engine
+         * keeps that sum inside int32 by scaling first - a test that skipped
+         * the scaling would be measuring overflow, not the transform.
+         */
+        if (trial == 0) {
+            AG_CHECK_INT(ag_fft_real_inv(br, bi, N), 0);
+            for (i = 0; i < N; i++) {
+                const double want = (double)x[i] * N;
+                const double got = br[i];
+                const double d = want > got ? want - got : got - want;
+                AG_CHECK(d < (double)N * 64.0);
+            }
+        }
+    }
+}
+
 void run_dsp_tests(void)
 {
+    test_fft_real_matches_complex();
     test_osc_range();
     test_osc_saw_scaling();
     test_lfo_rate();

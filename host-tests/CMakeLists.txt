@@ -53,7 +53,13 @@ set(ARGON_DSP_SRCS
     "${ARGON_ROOT}/apps/common/smp/ag_smp.c"
     "${ARGON_ROOT}/apps/common/grain/ag_grain.c"
     "${ARGON_ROOT}/apps/common/ir/ag_ir.c"
-    "${ARGON_ROOT}/apps/common/ir/ag_fft.c")
+    "${ARGON_ROOT}/apps/common/ir/ag_fft.c"
+    "${ARGON_ROOT}/apps/common/ckt/ag_mathf.c"
+    "${ARGON_ROOT}/apps/common/ckt/ag_ckt.c"
+    "${ARGON_ROOT}/apps/common/ckt/ag_stage.c"
+    # The benchmark's netlists: the host tests check that they are circuits
+    # before the guest bench reports what they cost.
+    "${ARGON_ROOT}/apps/cktbench/ckt_circuits.c")
 
 set(ARGON_INCLUDES
     "${CMAKE_CURRENT_LIST_DIR}"
@@ -70,7 +76,9 @@ set(ARGON_INCLUDES
     "${ARGON_ROOT}/apps/common/dsp"
     "${ARGON_ROOT}/apps/common/synth"
     "${ARGON_ROOT}/apps/common/smp"
-    "${ARGON_ROOT}/apps/common/grain")
+    "${ARGON_ROOT}/apps/common/grain"
+    "${ARGON_ROOT}/apps/common/ckt"
+    "${ARGON_ROOT}/apps/cktbench")
 
 # Predictable paths for the scripts that invoke these.
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
@@ -98,6 +106,7 @@ add_executable(argon_tests
     test_cc.c
     test_draw.c
     test_dsp.c
+    test_ckt.c
     "${ARGON_ROOT}/apps/cc/cc_compile.c"
     "${ARGON_ROOT}/components/argon_kernel/src/dev/draw.c"
     ${ARGON_DSP_SRCS}
@@ -142,7 +151,55 @@ add_executable(synth_smoke
     "${ARGON_ROOT}/tools/synth_smoke.c"
     ${ARGON_DSP_SRCS})
 
-foreach(smoke engine_smoke synth_smoke)
+# The circuit solver, rendered so it can be heard - including the same preamp
+# with and without oversampling, which is the one difference no peak or RMS
+# measurement in test_ckt.c can show.
+add_executable(ckt_smoke
+    "${ARGON_ROOT}/tools/ckt_smoke.c"
+    ${ARGON_DSP_SRCS})
+
+# Runs a real recording through the amplifier model and the reverb.  Takes a
+# wav on the command line, so it is a tool rather than a fixed render.
+add_executable(ckt_play
+    "${ARGON_ROOT}/tools/ckt_play.c"
+    ${ARGON_DSP_SRCS})
+
+# Measures the convolution engine against the same convolution in double
+# precision.  A tool rather than a test because it needs a recording, but the
+# number it prints is the one that says whether the IR is clean.
+add_executable(ir_check
+    "${ARGON_ROOT}/tools/ir_check.c"
+    ${ARGON_DSP_SRCS})
+# Add AG_IR_TRACE=1 here to make ag_ir print each block's working scales.  Off
+# by default because it is pages of output; on when a number in ir_check moves
+# and the question is which shift moved it.
+
+# The same amplifier with every compromise removed: double precision, no
+# tables, no antialiasing trick, Newton to 1e-12, long filters.  Slow on
+# purpose - it exists to say whether an artefact belongs to the circuit or to
+# the arithmetic that runs it cheaply.
+add_executable(ckt_exact "${ARGON_ROOT}/tools/ckt_exact.c")
+if(NOT MSVC)
+    target_link_libraries(ckt_exact PRIVATE m)
+endif()
+
+# The NAM captures are 48 kHz and everything else here is 44.1.  A resampler
+# that coloured the top octave would ruin a test about a high-frequency buzz,
+# so this one is a ten-thousand-tap polyphase sinc.
+add_executable(wavrate "${ARGON_ROOT}/tools/wavrate.c")
+if(NOT MSVC)
+    target_link_libraries(wavrate PRIVATE m)
+endif()
+
+# Two renders, one knob apart: says whether a change is audible before anyone
+# has to listen to it.
+add_executable(wavdiff "${ARGON_ROOT}/tools/wavdiff.c")
+target_include_directories(wavdiff PRIVATE ${ARGON_INCLUDES})
+if(NOT MSVC)
+    target_link_libraries(wavdiff PRIVATE m)
+endif()
+
+foreach(smoke engine_smoke synth_smoke ckt_smoke ckt_play ir_check)
     # host_stub first: it supplies the ag_malloc/ag_free that ag_ir and ag_fx
     # would otherwise take from the real syscall table, which has no kernel
     # behind it here.
@@ -156,7 +213,8 @@ foreach(smoke engine_smoke synth_smoke)
         "${ARGON_ROOT}/apps/common/ir")
 endforeach()
 
-foreach(target argon_tests vtdump engine_smoke synth_smoke)
+foreach(target argon_tests vtdump engine_smoke synth_smoke ckt_smoke ckt_play
+        ir_check wavdiff wavrate ckt_exact)
     if(MSVC)
         target_compile_definitions(${target} PRIVATE _CRT_SECURE_NO_WARNINGS)
         target_compile_options(${target} PRIVATE /W4)

@@ -1,6 +1,6 @@
 # IRFX — impulse-response / convolution FX
 
-Console app: partitioned FFT convolution, **≤500 ms** mono IR @ 22.05 kHz.
+Console app: partitioned FFT convolution, **≤1 s** mono IR @ 22.05 kHz.
 Built-in room/hall/spring presets, optional IR + dry WAV from HostFS.
 
 Engine: [`apps/common/ir`](../common/ir). WAV: [`apps/common/wav`](../common/wav).

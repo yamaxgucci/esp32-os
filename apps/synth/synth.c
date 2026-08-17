@@ -285,9 +285,14 @@ int ag_main(int argc, char **argv)
         ag_fx_set_defaults(&s_fx);
         s_fx.master_wet = 50;
     }
+    /*
+     * No ag_ir_set_wet here: s_cab is a cabinet, ag_ir_load_preset takes those
+     * fully wet, and the 90 of 128 that used to be set here let a third of the
+     * dry signal past the cabinet with its top end intact.  The 'c' key
+     * reloads the preset and would not have restored the 90 anyway.
+     */
     if (ag_ir_init(&s_ir, RATE) == 0 && ag_ir_load_preset(&s_ir, s_cab) == 0) {
         s_ir_ok = 1;
-        ag_ir_set_wet(&s_ir, 90);
     }
 
     ag_cursor(false);
