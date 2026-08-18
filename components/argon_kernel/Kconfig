@@ -81,4 +81,20 @@ menu "ArgonOS"
             before flashing hardware.  A failed bring-up is non-fatal; the
             table stays present but ready() stays false.
 
+    config ARGON_ENABLE_HOSTFS
+        bool "HostFS (H:, live host folder over UART1)"
+        default y
+        help
+            Mounts a folder on the development machine as drive H: by talking
+            to tools/hostfsd.py over UART1.  It is how applications, ROMs and
+            pad input reach the guest under QEMU, and it is the reason the
+            emulator is a usable development environment at all.
+
+            There is no host helper on a real board, and there never will be.
+            Leaving this on there costs 80 KB of DRAM for the UART buffers,
+            allocated whether the helper answers or not, plus 100 ms of every
+            boot on a PING nobody replies to (trap 29).  On a chip with no
+            PSRAM that is a large fraction of the memory an application was
+            going to get, so hardware targets turn it off.
+
 endmenu

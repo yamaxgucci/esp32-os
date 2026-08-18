@@ -649,18 +649,20 @@ static int32_t io_uart_read(int port, void *buf, size_t len,
 
 static int32_t io_adc_read(int channel)
 {
-    if (AG_PORT_ADC_FIRST_GPIO < 0) {
-        return -AG_ENOTSUP;
-    }
     if (channel < 0 || channel >= AG_PORT_ADC_CHANNELS) {
         return -AG_ERANGE;
+    }
+
+    /* The channel exists in the silicon but reaches no pin on this target. */
+    const int pin = AG_PORT_ADC_GPIO(channel);
+    if (pin < 0) {
+        return -AG_ENOTSUP;
     }
 
     lock();
 
     /* The pin belongs to whoever measures on it, so that two processes do not
      * fight over the attenuation setting of one channel. */
-    const int      pin = AG_PORT_ADC_FIRST_GPIO + channel;
     const ag_err_t err = ag_io_claim(pin, caller(), "adc");
     if (err != AG_OK) {
         unlock();

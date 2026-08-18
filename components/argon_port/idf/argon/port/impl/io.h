@@ -38,11 +38,31 @@
 #define AG_PORT_ADC_CHANNELS 0
 #endif
 
-/* ADC1 channel N is GPIO N+1 on the S3; other targets differ and say so. */
+/*
+ * Which pin an ADC1 channel measures.
+ *
+ * A mapping rather than a base pin, because the two targets disagree about the
+ * shape of the answer: on the S3 channel N is GPIO N+1, and on the original
+ * ESP32 the eight channels are scattered over two banks in an order nobody
+ * would guess.  The pin has to be known and not merely the channel, because
+ * whoever measures claims the pin, so that two processes cannot fight over one
+ * channel's attenuation.
+ *
+ * -1 means "this channel does not reach a pin here", and that is also the
+ * answer for a target this port has not been told about: measuring the wrong
+ * pin is worse than not measuring.
+ */
 #if CONFIG_IDF_TARGET_ESP32S3
-#define AG_PORT_ADC_FIRST_GPIO 1
+#define AG_PORT_ADC_GPIO(ch) (((ch) >= 0 && (ch) < 10) ? ((ch) + 1) : -1)
+#elif CONFIG_IDF_TARGET_ESP32
+/* ADC2 is unusable while Wi-Fi runs, so only ADC1 is offered: channels 0..7
+ * are GPIO 36, 37, 38, 39, 32, 33, 34, 35 - and 37 and 38 are not bonded out
+ * on a WROOM module, which is the board's business rather than the port's. */
+#define AG_PORT_ADC_GPIO(ch) \
+    (((ch) >= 0 && (ch) < 4) ? (36 + (ch))    \
+                             : (((ch) >= 4 && (ch) < 8) ? (28 + (ch)) : -1))
 #else
-#define AG_PORT_ADC_FIRST_GPIO (-1)
+#define AG_PORT_ADC_GPIO(ch) (-1)
 #endif
 
 #endif /* ARGON_PORT_IMPL_IO_H */

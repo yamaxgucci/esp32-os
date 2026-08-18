@@ -15,6 +15,7 @@
 #include <argon/ramfs.h>
 #include <argon/vfs.h>
 
+#include <argon/port/config.h>
 #include <argon/port/flash.h>
 #include <argon/port/mem.h>
 #include <argon/port/storage.h>
@@ -436,13 +437,28 @@ static ag_err_t mount_media(bool allow_format)
     return AG_OK;
 }
 
+/*
+ * H: is a development convenience with a real price on a board.
+ *
+ * The helper lives on the machine at the other end of UART1 and exists only
+ * under QEMU; on silicon nothing ever answers.  The cost of asking is not the
+ * PING - that is 100 ms, and trap 29 already moved the waiting off the boot
+ * path - it is the 80 KB of DRAM the UART driver reserves for its buffers
+ * before anyone has answered.  On a part with no PSRAM that is most of what an
+ * application was going to be given, so a hardware build says no here and the
+ * code below is never reached.
+ */
+#if CONFIG_ARGON_ENABLE_HOSTFS
 ag_err_t ag_storage_mount_hostfs(void) { return ag_hostfs_try_mount(); }
+#else
+ag_err_t ag_storage_mount_hostfs(void) { return -AG_ENODEV; }
+#endif
 
 ag_err_t ag_storage_mount_media(void)
 {
     const ag_err_t sd = mount_media(false);
     /* Host helper optional: no answer → no H:, boot continues. */
-    (void)ag_hostfs_try_mount();
+    (void)ag_storage_mount_hostfs();
     return sd;
 }
 

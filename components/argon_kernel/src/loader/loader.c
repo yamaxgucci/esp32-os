@@ -149,17 +149,54 @@ bool ag_loader_arena_busy(void)
     return ag_arena_blocks(&s_code) > 0;
 }
 
+/*
+ * Placing an image into the code arena, which is instruction memory.
+ *
+ * Every store here is an aligned 32-bit word, and that is a requirement, not a
+ * speed trick.  On the original ESP32 the arena lives in SRAM0, reached only
+ * through the instruction bus, and that bus does not do byte or half-word
+ * accesses: a single-byte store raises LoadStoreError.  memcpy ends an odd
+ * length with exactly those stores, so the obvious fallback would fault on a
+ * ragged image and be invisible on every image whose length happened to be a
+ * multiple of four.  (The S3 has no such restriction, which is why this went
+ * unnoticed - the same reason MALLOC_CAP_EXEC reports zero on the ESP32, trap
+ * 3.)  The source is an ordinary buffer and may be read any way at all.
+ *
+ * The tail is read-modify-written: arena blocks are 16-aligned, so the word
+ * holding a ragged end is inside the arena and its spare bytes belong to no
+ * one.
+ */
 static void copy_image(void *dst, const void *src, size_t bytes)
 {
-    if ((((uintptr_t)dst | (uintptr_t)src | (uintptr_t)bytes) & 3u) == 0) {
-        uint32_t       *d = (uint32_t *)dst;
-        const uint32_t *s = (const uint32_t *)src;
-        for (size_t i = 0; i < bytes / 4u; i++) {
-            d[i] = s[i];
+    uint32_t      *d = (uint32_t *)dst; /* arena blocks are 16-aligned */
+    const uint8_t *s = (const uint8_t *)src;
+    const size_t   words = bytes / 4u;
+
+    if (((uintptr_t)s & 3u) == 0) {
+        const uint32_t *sw = (const uint32_t *)src;
+        for (size_t i = 0; i < words; i++) {
+            d[i] = sw[i];
         }
-        return;
+    } else {
+        for (size_t i = 0; i < words; i++) {
+            uint32_t w;
+            memcpy(&w, s + i * 4u, sizeof(w));
+            d[i] = w;
+        }
     }
-    memcpy(dst, src, bytes);
+
+    const size_t tail = bytes & 3u;
+    if (tail != 0) {
+        uint32_t w = d[words];
+        uint8_t  b[4];
+
+        memcpy(b, &w, sizeof(b));
+        for (size_t i = 0; i < tail; i++) {
+            b[i] = s[words * 4u + i];
+        }
+        memcpy(&w, b, sizeof(w));
+        d[words] = w;
+    }
 }
 
 static void *data_alloc(size_t bytes)

@@ -16,7 +16,8 @@ file(TO_CMAKE_PATH "$ENV{IDF_PATH}/components/fatfs" FATFS_IDF)
 set(FF_IN  "${FATFS_IDF}/src/ff.c")
 set(FF_OUT "${CMAKE_CURRENT_BINARY_DIR}/ff_argon.c")
 
-file(COPY "${FATFS_IDF}/Kconfig" DESTINATION "${CMAKE_CURRENT_SOURCE_DIR}")
+# The Kconfig this component needs is copied by the root CMakeLists, which runs
+# before the Kconfig generator does.  It cannot be copied from here.
 
 get_filename_component(_argon_root "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUTE)
 file(TO_CMAKE_PATH "${_argon_root}/tools/patch_fatfs_bpb.py" _ff_patch)
