@@ -778,12 +778,31 @@ void ag_ir_process_block(ag_ir_t *ir, const int16_t *mono_in, int16_t *stereo_ou
      * The shift is usually to the right now, which is the whole point: the
      * result arrives with bits to spare and rounds down to the output word
      * instead of arriving short and being multiplied up into steps.
+     *
+     * AG_IR_TAIL_BITS on the end of it stops the shift short of the output
+     * word, so what this loop works in is finer than what it emits: the tail
+     * is held over at that finer scale and the rounding happens once, at the
+     * end, instead of once here and once again on the way back in.
      */
     {
-        int osh = (int)ir->h_shift - (int)ir->h_pre + xref +
-                  (int)ir->p_shift - ygain - 24;
+        const int base = (int)ir->h_shift - (int)ir->h_pre + xref +
+                         (int)ir->p_shift - ygain - 24;
+        /*
+         * As many tail bits as the scale has room for, which in practice is
+         * all of them: `base` runs about -13 to -26 on real material.  Taking
+         * the minimum rather than AG_IR_TAIL_BITS outright is what keeps the
+         * shift below a right shift whenever there were bits to take, so the
+         * tail costs no widening: a right shift of a value the inverse has
+         * already bounded to 2^29 stays inside int32 on its own.
+         */
+        uint32_t tail = base < 0 ? (uint32_t)(-base) : 0u;
         uint32_t lsh, rsh;
-        int32_t  rnd;
+        int      osh;
+        int32_t  rnd, thalf;
+        if (tail > (uint32_t)AG_IR_TAIL_BITS) {
+            tail = (uint32_t)AG_IR_TAIL_BITS;
+        }
+        osh = base + (int)tail; /* <= 0 whenever there were tail bits to take */
         /* Only reachable on a block that is already silence either way, but a
          * shift wider than the word is undefined and would not stay quiet. */
         if (osh > 24) {
@@ -795,15 +814,34 @@ void ag_ir_process_block(ag_ir_t *ir, const int16_t *mono_in, int16_t *stereo_ou
         lsh = osh > 0 ? (uint32_t)osh : 0u;
         rsh = osh < 0 ? (uint32_t)(-osh) : 0u;
         rnd = rsh > 0u ? ((int32_t)1 << (rsh - 1u)) : 0;
+        thalf = tail > 0u ? ((int32_t)1 << (tail - 1u)) : 0;
         for (i = 0; i < AG_IR_BLOCK; i++) {
-            int32_t wet = (((re[i] << lsh) + rnd) >> rsh) + ir->overlap[i];
+            int32_t fine = (((re[i] << lsh) + rnd) >> rsh) + ir->overlap[i];
             int32_t dry = (int32_t)mono_in[i];
-            int32_t m;
+            int32_t wet, m;
             ir->overlap[i] = ((re[i + AG_IR_BLOCK] << lsh) + rnd) >> rsh;
-            /* Rounded, not floored: these two shifts ran on every sample, so
-             * their half-a-bit each showed up as a DC step in the output. */
-            wet = (wet * (int32_t)ir->gain + 32) >> 6;
-            wet = ag_sat16(wet);
+            /*
+             * The gain applied before the rounding, and the whole of it
+             * rounded once.  Written the other way round - round to the output
+             * word, then apply gain - the tail was carried from block to block
+             * already rounded, so every sample of the second half of every
+             * convolution arrived with half a bit of noise on it that nothing
+             * downstream could remove.  Flat across the spectrum, and
+             * therefore loudest exactly where a cabinet is quietest.
+             *
+             * Clamped first, and only so that the multiply stays inside int32:
+             * 2^24 is twice full scale at the tail's own resolution, and
+             * anything past it saturates below in any case.
+             */
+            if (fine > AG_IR_FINE_MAX) {
+                fine = AG_IR_FINE_MAX;
+            } else if (fine < -AG_IR_FINE_MAX) {
+                fine = -AG_IR_FINE_MAX;
+            }
+            /* Rounded, not floored, for the reason the output shift is: this
+             * ran on every sample, so its half-a-bit was a DC step. */
+            fine = (fine * (int32_t)ir->gain + 32) >> 6;
+            wet = ag_sat16((fine + thalf) >> tail);
             m = dry + (((wet - dry) * (int32_t)ir->wet + 64) >> 7);
             m = ag_sat16(m);
             stereo_out[i * 2u] = (int16_t)m;
@@ -825,8 +863,11 @@ void ag_ir_process_block(ag_ir_t *ir, const int16_t *mono_in, int16_t *stereo_ou
                 omax = b;
             }
         }
+        /* `base` rather than the shift the loop used: the shift is base plus
+         * whatever tail bits base left room for, so base is the number that
+         * says whether the scaling arrived where it was supposed to. */
         printf("      trace: pre %2d net %3d xref %3d | h_pre %2u h_shift %2u "
-               "p_shift %u | ymax %10d ygain %3d | ifft max %10d osh %3d\n",
+               "p_shift %u | ymax %10d ygain %3d | ifft max %10d base %3d\n",
                pre, (int)ir->x_sh[ir->x_pos], xref, ir->h_pre, ir->h_shift,
                ir->p_shift, ymax, ygain, omax,
                (int)ir->h_shift - (int)ir->h_pre + xref + (int)ir->p_shift -
