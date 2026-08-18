@@ -144,6 +144,43 @@ ag_err_t ag_port_wifi_start(void)
     return AG_OK;
 }
 
+/*
+ * Off, and giving the memory back.
+ *
+ * This is what makes both radios possible on a chip that cannot afford both:
+ * linked is cheap, running is not.  esp_wifi_deinit releases the buffers, the
+ * task stacks and the driver state - about forty kilobytes - and what is left
+ * is the code in flash, which costs no RAM at all.  The netif and the event
+ * loop stay: they belong to whatever link is up next, and rebuilding them is
+ * where the ordering bugs live.
+ */
+ag_err_t ag_port_wifi_stop(void)
+{
+    if (s_state == AG_WIFI_OFF) {
+        return AG_OK;
+    }
+    s_want_join = false;
+    s_ssid[0] = '\0';
+    s_pass[0] = '\0';
+
+    (void)esp_wifi_disconnect();
+    ag_port_net_link_down();
+    (void)esp_wifi_stop();
+    if (esp_wifi_deinit() != ESP_OK) {
+        return -AG_EIO;
+    }
+    if (s_sta_netif != NULL) {
+        esp_netif_destroy_default_wifi(s_sta_netif);
+        s_sta_netif = NULL;
+        ag_port_net_set_netif(NULL);
+    }
+
+    s_state = AG_WIFI_OFF;
+    s_attempts = 0;
+    s_last_reason = 0;
+    return AG_OK;
+}
+
 ag_err_t ag_port_wifi_scan(ag_port_wifi_ap_t *out, uint32_t max,
                            uint32_t *found)
 {

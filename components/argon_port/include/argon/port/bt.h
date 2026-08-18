@@ -92,6 +92,7 @@ typedef void (*ag_port_bt_report_fn)(ag_bt_usage_t usage, uint8_t report_id,
 #if AG_PORT_HAS_BT
 
 ag_err_t ag_port_bt_start(void);
+ag_err_t ag_port_bt_stop(void);
 ag_err_t ag_port_bt_scan(ag_port_bt_dev_t *out, uint32_t max, uint32_t *found,
                          uint32_t seconds);
 ag_err_t ag_port_bt_open(const uint8_t addr[6], int addr_type);

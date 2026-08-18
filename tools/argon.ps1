@@ -45,7 +45,8 @@ ArgonOS
   argon check              local CI: host tests, then firmware build
   argon target             which chip the firmware is built for
   argon target esp32       switch to the board on the desk (docs\09-esp32-cyd.md);
-                           esp32s3 switches back.  Either way: full rebuild
+                           esp32-dsp = no radios, big arena; esp32s3 switches
+                           back.  Any of them: full rebuild
   argon flash -port COM5   flash a real board and open the monitor
   argon monitor -port COM5 open the serial monitor on a real board
   argon clean              remove the firmware build directory
@@ -153,23 +154,24 @@ switch ($Command.ToLowerInvariant()) {
                 if ($line) { $cur = $line.Matches[0].Groups[1].Value }
                 $ble = Select-String -Path 'sdkconfig' -Pattern '^CONFIG_ARGON_ENABLE_BLE=y$' |
                        Select-Object -First 1
-                if ($ble) { $cur = "$cur (BLE, no Wi-Fi)" }
+                if (-not $ble) { $cur = "$cur (no radios)" }
             }
             Write-Host "current target: $cur"
             Write-Host 'known targets:  esp32s3 (primary, QEMU)'
-            Write-Host '                esp32       hardware, Wi-Fi'
-            Write-Host '                esp32-ble   hardware, Bluetooth instead'
+            Write-Host '                esp32       hardware: Wi-Fi and Bluetooth'
+            Write-Host '                esp32-dsp   hardware: neither, 48 KB arena'
             exit 0
         }
 
-        # The two radios do not fit together on this chip, so the Bluetooth
-        # build is a second set of defaults layered on the first rather than a
-        # switch inside one.  IDF keeps SDKCONFIG_DEFAULTS in the build cache,
-        # so `argon build` afterwards uses the same list.
+        # Variants of one chip are extra defaults layered on its own, rather
+        # than switches inside one file: what differs between them is not a
+        # feature but how the 128 KB of instruction RAM is divided.  IDF keeps
+        # SDKCONFIG_DEFAULTS in the build cache, so `argon build` afterwards
+        # uses the same list.
         $defaults = ''
         switch ($chip) {
             'esp32'     { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32' }
-            'esp32-ble' { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32;sdkconfig.esp32.ble'
+            'esp32-dsp' { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32;sdkconfig.esp32.dsp'
                           $chip = 'esp32' }
             'esp32s3'   { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32s3' }
             default {

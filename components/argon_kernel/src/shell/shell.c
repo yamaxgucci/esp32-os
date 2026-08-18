@@ -1696,6 +1696,31 @@ static int cmd_wifi(int argc, char **argv)
         return wifi_status();
     }
 
+    /*
+     * On and off mean started and stopped, not associated and disassociated.
+     * The distinction matters on this chip more than the wording suggests:
+     * a stopped radio gives back about seventy kilobytes, which is the
+     * difference between a board that can run an application and one that
+     * cannot.  Both radios are in every image; only one usually runs.
+     */
+    if (ag_path_icmp(argv[1], "on") == 0) {
+        const ag_err_t err = ag_net_init();
+        if (err != AG_OK) {
+            ag_console_printf("wifi on: %s\n",
+                              ag_loader_api()->sys->strerror(err));
+            return 1;
+        }
+        const char *ssid = ag_cfg_get(ag_sysconfig(), "wifi.ssid", NULL);
+        if (ssid != NULL && ssid[0] != '\0') {
+            (void)ag_port_wifi_connect(
+                ssid, ag_cfg_get(ag_sysconfig(), "wifi.pass", ""));
+            ag_console_printf("radio on, joining %s\n", ssid);
+        } else {
+            ag_console_puts("radio on\n");
+        }
+        return 0;
+    }
+
     if (ag_path_icmp(argv[1], "scan") == 0) {
         return wifi_scan();
     }
@@ -1730,22 +1755,27 @@ static int cmd_wifi(int argc, char **argv)
         return 0;
     }
 
-    if (ag_path_icmp(argv[1], "off") == 0 ||
-        ag_path_icmp(argv[1], "forget") == 0) {
-        (void)ag_port_wifi_disconnect();
-        if (ag_path_icmp(argv[1], "forget") == 0) {
-            const ag_err_t cerr = cfg_ensure_wifi(NULL, NULL);
-            if (cerr != AG_OK) {
-                ag_console_printf("SYSTEM.CFG: %d\n", (int)cerr);
-            }
-            ag_console_puts("forgotten\n");
-        } else {
-            ag_console_puts("disconnected\n");
-        }
+    if (ag_path_icmp(argv[1], "off") == 0) {
+        const size_t before = ag_port_mem_free(AG_MEM_FAST);
+        (void)ag_port_wifi_stop();
+        const size_t after = ag_port_mem_free(AG_MEM_FAST);
+        ag_console_printf("radio off, %u KB back\n",
+                          (unsigned)((after - before) / 1024u));
         return 0;
     }
 
-    ag_console_puts("usage: wifi [scan | connect <ssid> [pass] | off | forget]\n");
+    if (ag_path_icmp(argv[1], "forget") == 0) {
+        (void)ag_port_wifi_disconnect();
+        const ag_err_t cerr = cfg_ensure_wifi(NULL, NULL);
+        if (cerr != AG_OK) {
+            ag_console_printf("SYSTEM.CFG: %d\n", (int)cerr);
+        }
+        ag_console_puts("forgotten\n");
+        return 0;
+    }
+
+    ag_console_puts(
+        "usage: wifi [on | off | scan | connect <ssid> [pass] | forget]\n");
     return 1;
 }
 
@@ -1808,8 +1838,40 @@ static int cmd_bt(int argc, char **argv)
         return 0;
     }
 
+    if (ag_path_icmp(argv[1], "on") == 0) {
+        const ag_err_t err = ag_port_bt_start();
+        if (err != AG_OK) {
+            ag_console_printf("bt on: %s\n",
+                              ag_loader_api()->sys->strerror(err));
+            return 1;
+        }
+        (void)ag_btinput_init();
+        ag_console_puts("radio on\n");
+        return 0;
+    }
+
+    if (ag_path_icmp(argv[1], "off") == 0) {
+        const size_t before = ag_port_mem_free(AG_MEM_FAST);
+        (void)ag_port_bt_stop();
+        const size_t after = ag_port_mem_free(AG_MEM_FAST);
+        ag_console_printf("radio off, %u KB back\n",
+                          (unsigned)((after - before) / 1024u));
+        return 0;
+    }
+
     if (ag_path_icmp(argv[1], "scan") == 0) {
         uint32_t found = 0;
+        if (ag_port_bt_status(&st) == AG_OK && st.state == AG_BT_OFF) {
+            /* Starting it here rather than refusing: `bt scan` on a board with
+             * the radio off is a request for the radio, not a mistake. */
+            const ag_err_t serr = ag_port_bt_start();
+            if (serr != AG_OK) {
+                ag_console_printf("bt: %s\n",
+                                  ag_loader_api()->sys->strerror(serr));
+                return 1;
+            }
+            (void)ag_btinput_init();
+        }
         ag_console_puts("scanning...\n");
         const ag_err_t err = ag_port_bt_scan(s_bt_seen, 8, &found, 5);
         if (err != AG_OK) {
@@ -1864,9 +1926,23 @@ static int cmd_bt(int argc, char **argv)
                 snprintf(label, sizeof(label), "%02x:%02x:%02x:%02x:%02x:%02x",
                          a[0], a[1], a[2], a[3], a[4], a[5]);
             }
+            /*
+             * Address types 1 and 3 are random - which is to say private.
+             * Phones, laptops and watches rotate theirs every few minutes so
+             * that they cannot be followed around, and each new one looks like
+             * a new device to anybody listening, including this.  That is why
+             * a scan finds more things than a person can see in the room, and
+             * why the same thing can be on the list twice.
+             */
+            const bool rnd = (s_bt_seen[i].addr_type & 1) != 0;
             ag_console_printf("  %u %-17s %4d %s\n", (unsigned)(i + 1), label,
                               (int)s_bt_seen[i].rssi,
-                              s_bt_seen[i].hid ? "keyboard/mouse" : "");
+                              s_bt_seen[i].hid ? "keyboard" : (rnd ? "private"
+                                                                   : ""));
+        }
+        if (found > s_bt_seen_n) {
+            ag_console_printf("%u more heard, not shown\n",
+                              (unsigned)(found - s_bt_seen_n));
         }
         ag_console_puts("bt open <#>  to pair with one\n");
         return 0;
@@ -1914,6 +1990,13 @@ static int cmd_bt(int argc, char **argv)
         (void)ag_port_bt_close();
         ag_console_puts("closed\n");
         return 0;
+    }
+
+    if (ag_path_icmp(argv[1], "open") != 0 &&
+        ag_path_icmp(argv[1], "forget") != 0) {
+        ag_console_puts(
+            "usage: bt [on | off | scan | open <#|addr> | close | forget]\n");
+        return 1;
     }
 
     if (ag_path_icmp(argv[1], "forget") == 0) {
@@ -2316,10 +2399,11 @@ static const ag_command_t k_commands[] = {
      "modules: list, load, install to C:, unload, I2C probe", cmd_drv},
     {"io", "[pin [mode]] | i2c <bus> | adc [ch]", "pins and buses", cmd_io},
 #if AG_PORT_HAS_WIFI
-    {"wifi", "[scan|connect <ssid> [pass]|off|forget]", "the radio", cmd_wifi},
+    {"wifi", "[on|off|scan|connect <ssid> [pass]|forget]", "the radio",
+     cmd_wifi},
 #endif
 #if AG_PORT_HAS_BT
-    {"bt", "[scan|open <#|addr>|close|forget]", "bluetooth input", cmd_bt},
+    {"bt", "[on|off|scan|open <#|addr>|close|forget]", "bluetooth input", cmd_bt},
 #endif
     {"ps", "", "list running applications", cmd_ps},
     {"prio", "<slot|pid> [low|normal|high]", "show or set process priority",
