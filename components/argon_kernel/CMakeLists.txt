@@ -21,6 +21,7 @@ set(ARGON_KERNEL_SRCS
     "src/dev/devfs.c"
     "src/dev/devices.c"
     "src/dev/display.c"
+    "src/dev/textpanel.c"
     "src/dev/audio.c"
     "src/dev/pcmmix.c"
     "src/dev/draw.c"

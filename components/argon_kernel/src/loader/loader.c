@@ -260,6 +260,12 @@ static ag_err_t place_arena(const ag_axe_header_t *header, ag_loaded_app_t *out)
 
     void *code = ag_arena_alloc(&s_code, code_bytes, 16);
     if (code == NULL) {
+        ag_log(AG_LOG_ERROR, "loader",
+               "%u bytes of code will not fit the arena: %u of %u free, "
+               "largest block %u",
+               (unsigned)code_bytes, (unsigned)ag_arena_free_bytes(&s_code),
+               (unsigned)sizeof(s_arena),
+               (unsigned)ag_arena_largest_free(&s_code, 16));
         return -AG_ENOMEM;
     }
 
@@ -280,6 +286,21 @@ static ag_err_t place_arena(const ag_axe_header_t *header, ag_loaded_app_t *out)
 
     void *data = data_alloc(header->data.size);
     if (data == NULL) {
+        /*
+         * Said here, with the numbers of the allocation that actually failed.
+         * Both failures in this function used to arrive at the caller as a
+         * bare -AG_ENOMEM and be reported as "the code will not fit the
+         * arena", which on the first board with no PSRAM sent the search to
+         * the arena - the one thing that had room to spare.  The data part
+         * does not come out of the arena at all.
+         */
+        ag_log(AG_LOG_ERROR, "loader",
+               "%u bytes of data will not fit: %u free outside the arena, "
+               "largest block %u",
+               (unsigned)header->data.size,
+               (unsigned)(ag_port_mem_free(AG_MEM_SLOW) +
+                          ag_port_mem_free(AG_MEM_FAST)),
+               (unsigned)ag_port_mem_largest(AG_MEM_FAST));
         (void)ag_arena_free(&s_code, code);
         memset(&out->place, 0, sizeof(out->place));
         return -AG_ENOMEM;
@@ -346,16 +367,9 @@ static ag_err_t place_image(const ag_axe_header_t *header, ag_loaded_app_t *out)
                    : (size_t)header->code.size;
 
     if (ag_arena_largest_free(&s_code, 16) >= want) {
-        const ag_err_t err = place_arena(header, out);
-        if (err == -AG_ENOMEM) {
-            ag_log(AG_LOG_ERROR, "loader",
-                   "%u bytes will not fit the arena: %u of %u bytes free, "
-                   "largest block %u",
-                   (unsigned)want, (unsigned)ag_arena_free_bytes(&s_code),
-                   (unsigned)sizeof(s_arena),
-                   (unsigned)ag_arena_largest_free(&s_code, 16));
-        }
-        return err;
+        /* place_arena says which of its two allocations failed; there is no
+         * one sentence that covers both, and guessing produced the wrong one. */
+        return place_arena(header, out);
     }
 
     if (contiguous) {

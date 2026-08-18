@@ -135,15 +135,31 @@ int ag_cmd_dir(int argc, char **argv)
     uint64_t bytes = 0;
     ag_dirent_t ent;
 
+    /*
+     * The name column is as wide as the screen allows, not 32.  A line of
+     * 32 + 1 + 8 is 41 characters, which on a forty column console - the
+     * width of the panel soldered to a small board - wraps the last digit of
+     * every size onto a line of its own.  Nine columns are kept for the size
+     * and one for the gap; on an eighty column screen this is the old layout.
+     */
+    const ag_screen_t *screen = ag_console_screen();
+    int namew = (screen != NULL) ? (int)screen->cols - 10 : 32;
+    if (namew > 32) {
+        namew = 32;
+    }
+    if (namew < 12) {
+        namew = 12;
+    }
+
     while (ag_vfs_readdir(d, &ent) == AG_OK) {
         if (!ag_path_match(pattern, ent.name)) {
             continue;
         }
         if (ent.st.attr & AG_A_DIR) {
-            ag_console_printf("%-32s   <DIR>\n", ent.name);
+            ag_console_printf("%-*s   <DIR>\n", namew, ent.name);
             dirs++;
         } else {
-            ag_console_printf("%-32s %8u\n", ent.name,
+            ag_console_printf("%-*s %8u\n", namew, ent.name,
                               (unsigned)ent.st.size);
             files++;
             bytes += ent.st.size;

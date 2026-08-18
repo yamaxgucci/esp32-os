@@ -169,6 +169,30 @@ static ag_err_t heap_create(proc_t *p, uint32_t requested)
     size_t     size = required ? requested
                                : (size_t)CONFIG_ARGON_APP_HEAP_KB * 1024u;
 
+    /*
+     * A default is a guess, and this one is a guess about a machine with PSRAM:
+     * a megabyte out of eight is nothing, a megabyte out of a quarter of one is
+     * the machine.  The halving below only reacts to an allocation that fails,
+     * and taking 128 KB of the 232 KB a board without PSRAM has does not fail -
+     * it succeeds, and then the image's own data has nowhere to go.  That is
+     * how it presented: an application refused with -AG_ENOMEM while `mem`
+     * showed plenty free.
+     *
+     * So the default is also capped at a quarter of the pool it comes out of.
+     * On the S3 that quarter is megabytes and this line does nothing.  An image
+     * that asked for a size is not touched: it gets what it asked for or it
+     * does not start.
+     */
+    if (!required) {
+        size_t pool = ag_port_mem_free(AG_MEM_SLOW);
+        if (pool == 0) {
+            pool = ag_port_mem_free(AG_MEM_FAST);
+        }
+        if (size > pool / 4u) {
+            size = pool / 4u;
+        }
+    }
+
     if (size < AG_PROC_HEAP_MIN) {
         size = AG_PROC_HEAP_MIN;
     }

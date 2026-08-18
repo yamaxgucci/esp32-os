@@ -51,3 +51,10 @@ CONFIG_ARGON_ENABLE_HOSTFS=n
 CONFIG_ARGON_ENABLE_ADC=y
 
 CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+
+# Forty columns, because the screen soldered to this board is 320 pixels wide
+# and the system draws 8-pixel cells: forty by thirty is what fits, and the
+# console has to be what fits or half of every line is off the glass.  The
+# serial console shows the same grid - it is one screen, rendered twice.
+CONFIG_ARGON_CONSOLE_COLS=40
+CONFIG_ARGON_CONSOLE_ROWS=25

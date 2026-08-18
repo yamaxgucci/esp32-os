@@ -72,9 +72,11 @@ extern "C" {
  * 0.26 appended blit_src_rect / blit_scaled / blit_tiled (nearest RGB565 on
  *      the bound source) and poly_uv / poly_fill_tex (bilinear UV on quads,
  *      affine triangles otherwise).
+ * 0.27 appended text_info / text_row / text_cursor to ag_display_ops_t: the
+ *      console as characters, for a panel a framebuffer will not fit on.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 26u
+#define AG_ABI_MINOR 27u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -580,6 +582,16 @@ typedef struct ag_gfx_api {
 } ag_gfx_api_t;
 
 /*
+ * One cell of the text console: the byte on the screen and its colours, high
+ * nibble background, low nibble foreground, as they have been since CGA.  What
+ * the byte means is the code page's business (con->codepage).
+ */
+typedef struct {
+    uint8_t ch;
+    uint8_t attr;
+} ag_textcell_t;
+
+/*
  * Class vtable for AG_DEV_DISPLAY devices, returned by dev->ops(h).
  * Compact subset of ag_gfx_api_t keyed by the open handle — for drivers that
  * publish a panel as /dev/name rather than (or as well as) the global gfx
@@ -595,6 +607,34 @@ typedef struct ag_display_ops {
     void (*flush)(ag_handle_t h, uint16_t x, uint16_t y, uint16_t w,
                   uint16_t hgt);
     void (*swap)(ag_handle_t h);
+
+    /*
+     * ABI 0.27: the console as characters rather than as pixels.
+     *
+     * A panel on a chip with no PSRAM does not get a framebuffer: 320x240 in
+     * RGB565 is 150 KB, and the largest block of memory this class of board
+     * has free is around a hundred.  The whole of acquire/flush/swap above
+     * assumes a surface that does not exist there.  So the kernel sends the
+     * console the other way - as the cells that changed - and the driver
+     * turns them into pixels a row at a time, with a buffer the size of one
+     * row of text and no more.
+     *
+     * The kernel calls these from the console tick, on the console task, with
+     * `h` set to zero: it holds the device, not an open handle.  A driver that
+     * has a framebuffer leaves all three NULL and gets the pixel path instead.
+     *
+     * text_info answers how many cells fit; the console is resized to that at
+     * boot when the board asks for it.  text_row is called for rows that
+     * changed, with `count` cells starting at column zero.  text_cursor moves
+     * the caret and is called only when it has moved or blinked - it carries
+     * the cell underneath, because a caret drawn as a blank would rub out the
+     * character it is standing on and the driver has nowhere to look it up.
+     */
+    ag_err_t (*text_info)(ag_handle_t h, uint16_t *cols, uint16_t *rows);
+    void (*text_row)(ag_handle_t h, uint16_t row, const ag_textcell_t *cells,
+                     uint16_t count);
+    void (*text_cursor)(ag_handle_t h, uint16_t col, uint16_t row,
+                        ag_textcell_t under, bool visible);
 } ag_display_ops_t;
 
 /* ------------------------------------------------------------------------ */
