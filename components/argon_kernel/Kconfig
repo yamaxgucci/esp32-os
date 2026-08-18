@@ -76,10 +76,52 @@ menu "ArgonOS"
             Ethernet MAC that Espressif QEMU emulates.  That is the path for
             streaming PCM to a Windows host without the UART bottleneck.
 
-            OpenEth does not exist on a real chip: leave this on for QEMU
-            development, and turn it off (or replace the link with Wi-Fi)
-            before flashing hardware.  A failed bring-up is non-fatal; the
-            table stays present but ready() stays false.
+            OpenEth does not exist on a real chip and the radio does not exist
+            in QEMU, so which link is built is a second option below.  A failed
+            bring-up is non-fatal either way; the table stays present but
+            ready() stays false.
+
+    config ARGON_NET_WIFI
+        bool "...over the radio instead of OpenEth"
+        depends on ARGON_ENABLE_NET
+        default n
+        select ESP_WIFI_ENABLED
+        help
+            Brings the network up on Wi-Fi, station mode, instead of the
+            OpenCores Ethernet MAC that Espressif's QEMU emulates.  Above the
+            port nothing changes: the same api->net, the same sockets, the same
+            address printed by the same line.
+
+            It is not the default because it cannot be verified in QEMU, which
+            models no radio at all - a build with this on boots on hardware and
+            has no network in the emulator.  It also costs: the Wi-Fi stack is
+            tens of kilobytes of RAM on a chip whose whole internal memory is
+            320, and every one of them is taken whether a network is joined or
+            not.
+
+            Which network to join comes from [wifi] in SYSTEM.CFG or from the
+            `wifi` command; the radio starts joined to nothing.
+
+    config ARGON_ENABLE_BLE
+        bool "Bluetooth Low Energy (input devices)"
+        depends on !ARGON_NET_WIFI
+        default n
+        select BT_ENABLED
+        select BT_NIMBLE_ENABLED
+        help
+            The host side of BLE, so that a keyboard or a mouse can be attached
+            to a board whose chip has no USB - which the original ESP32 has
+            not, at all.  `bt` scans and pairs; a keyboard's reports arrive as
+            ordinary console events, so the shell, the editor and the file
+            manager do not know the difference.
+
+            It cannot be built together with Wi-Fi, and that is arithmetic
+            rather than policy: with both stacks linked, the 128 KB of
+            instruction RAM this chip has is 99.5% full and the general heap
+            drops below what one application needs.  Pick the one the board is
+            for.  A board that needs both wants an S3 with PSRAM.
+
+            Also not verifiable in QEMU, which models no radio.
 
     config ARGON_CONSOLE_COLS
         int "Console width, characters"

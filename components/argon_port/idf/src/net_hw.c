@@ -1,5 +1,11 @@
 /*
- * ArgonOS port: ESP-IDF - OpenEth under QEMU, and lwIP sockets.
+ * ArgonOS port: ESP-IDF - the address and the sockets, over whichever link.
+ *
+ * Two links exist: OpenEth, which is a device QEMU emulates and no chip has,
+ * and the radio, which every ESP32 has and QEMU does not model.  They differ
+ * only in how the interface is brought up; from DHCP onwards - the address,
+ * the sockets, the whole of ag_port_net_* below - there is one path.  The
+ * radio itself is wifi_hw.c.
  *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
@@ -8,6 +14,7 @@
 #if CONFIG_ARGON_ENABLE_NET
 
 #include <argon/port/net.h>
+#include <argon/port/wifi.h>
 
 #include <errno.h>
 #include <fcntl.h>
@@ -15,19 +22,39 @@
 #include <sys/time.h>
 #include <unistd.h>
 
-#include "esp_eth.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "lwip/sockets.h"
 #include "nvs_flash.h"
 
-static esp_netif_t                *s_netif;
+#include "net_hw.h"
+
+#if !AG_PORT_HAS_WIFI
+#include "esp_eth.h"
+#endif
+
+static esp_netif_t         *s_netif;
+static volatile bool        s_got_ip;
+static esp_ip4_addr_t       s_ip;
+static ag_port_net_ready_fn s_on_ready;
+
+#if !AG_PORT_HAS_WIFI
 static esp_eth_handle_t            s_eth;
 static esp_eth_netif_glue_handle_t s_glue;
-static volatile bool               s_got_ip;
-static esp_ip4_addr_t              s_ip;
-static ag_port_net_ready_fn        s_on_ready;
+#endif
+
+void ag_port_net_set_netif(esp_netif_t *netif) { s_netif = netif; }
+
+void ag_port_net_link_down(void)
+{
+    /*
+     * An address outlives the link that carried it unless somebody says
+     * otherwise, and ready() would keep answering yes to a machine with no
+     * network - which is the answer everything above here acts on.
+     */
+    s_got_ip = false;
+}
 
 static ag_err_t map_errno(int e)
 {
@@ -80,7 +107,8 @@ static void on_got_ip(void *arg, esp_event_base_t base, int32_t id, void *data)
 
 void ag_port_net_on_ready(ag_port_net_ready_fn fn) { s_on_ready = fn; }
 
-ag_err_t ag_port_net_start(void)
+/* Everything both links need before either can be brought up. */
+static ag_err_t common_start(void)
 {
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES ||
@@ -88,7 +116,8 @@ ag_err_t ag_port_net_start(void)
         (void)nvs_flash_erase();
         err = nvs_flash_init();
     }
-    /* Carry on either way: DHCP does not strictly need NVS. */
+    /* Carry on either way for Ethernet: DHCP does not strictly need NVS.  The
+     * radio does - it keeps its calibration there - and says so itself. */
 
     if (esp_netif_init() != ESP_OK) {
         return -AG_EIO;
@@ -98,6 +127,44 @@ ag_err_t ag_port_net_start(void)
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
         return -AG_EIO;
     }
+
+    /*
+     * ESP-IDF also logs GOT_IP under this tag.  The kernel's own line is
+     * enough; the duplicate used to glue itself to the shell prompt.
+     */
+    esp_log_level_set("esp_netif_handlers", ESP_LOG_WARN);
+    return AG_OK;
+}
+
+#if AG_PORT_HAS_WIFI
+
+ag_err_t ag_port_net_start(void)
+{
+    const ag_err_t err = common_start();
+    if (err != AG_OK) {
+        return err;
+    }
+
+    (void)esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &on_got_ip,
+                                     NULL);
+    /*
+     * The radio comes up and joins nothing.  Which network to join is a
+     * decision made from configuration, above this layer, and a board that
+     * joins something before anyone has asked is a board that cannot be used
+     * to find out why it will not join.
+     */
+    return ag_port_wifi_start();
+}
+
+#else
+
+ag_err_t ag_port_net_start(void)
+{
+    const ag_err_t cerr = common_start();
+    if (cerr != AG_OK) {
+        return cerr;
+    }
+    esp_err_t err;
 
     esp_netif_config_t cfg = ESP_NETIF_DEFAULT_ETH();
     s_netif = esp_netif_new(&cfg);
@@ -128,17 +195,14 @@ ag_err_t ag_port_net_start(void)
 
     (void)esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_GOT_IP, &on_got_ip,
                                      NULL);
-    /*
-     * ESP-IDF also logs GOT_IP under this tag.  The kernel's own line is
-     * enough; the duplicate used to glue itself to the shell prompt.
-     */
-    esp_log_level_set("esp_netif_handlers", ESP_LOG_WARN);
 
     if (esp_eth_start(s_eth) != ESP_OK) {
         return -AG_EIO;
     }
     return AG_OK;
 }
+
+#endif /* AG_PORT_HAS_WIFI */
 
 bool ag_port_net_ready(void) { return s_got_ip; }
 

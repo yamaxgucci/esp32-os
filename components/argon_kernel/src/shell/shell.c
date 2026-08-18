@@ -29,8 +29,13 @@
 #include <argon/shell_path.h>
 #include <argon/vfs.h>
 
+#include <argon/btinput.h>
+#include <argon/net.h>
+#include <argon/port/bt.h>
 #include <argon/port/io.h>
 #include <argon/port/mem.h>
+#include <argon/port/net.h>
+#include <argon/port/wifi.h>
 #include <argon/port/sys.h>
 #include <argon/port/task.h>
 #include <argon/port/time.h>
@@ -937,6 +942,148 @@ static int cfg_has_device_line(const char *text, const char *dos_path)
     return 0;
 }
 
+#if AG_PORT_HAS_WIFI || AG_PORT_HAS_BT
+
+/* Case-insensitive compare of a fixed length; the section name in the file may
+ * be in any case and there is no such helper in argon/path.h. */
+static int ag_path_icmpn_local(const char *a, const char *b, size_t n)
+{
+    for (size_t i = 0; i < n; i++) {
+        char ca = a[i];
+        char cb = b[i];
+        if (ca >= 'A' && ca <= 'Z') {
+            ca = (char)(ca - 'A' + 'a');
+        }
+        if (cb >= 'A' && cb <= 'Z') {
+            cb = (char)(cb - 'A' + 'a');
+        }
+        if (ca != cb) {
+            return (int)((unsigned char)ca) - (int)((unsigned char)cb);
+        }
+    }
+    return 0;
+}
+
+/* One hex digit, or -1.  Bluetooth addresses arrive as text. */
+static int hex_digit(char c)
+{
+    if (c >= '0' && c <= '9') {
+        return c - '0';
+    }
+    if (c >= 'a' && c <= 'f') {
+        return c - 'a' + 10;
+    }
+    if (c >= 'A' && c <= 'F') {
+        return c - 'A' + 10;
+    }
+    return -1;
+}
+
+/*
+ * Replace one section of SYSTEM.CFG, or remove it when `body` is NULL.
+ *
+ * Rewritten rather than appended to, unlike [modules]: a second `device =`
+ * line is another module to load, and a second `ssid =` line is a
+ * contradiction about the same thing.  Sections other than the named one are
+ * copied through untouched, including the ones this system does not know
+ * about - a config file is not only ours to keep.
+ */
+static ag_err_t cfg_replace_section(const char *section, const char *body)
+{
+    char        text[DRV_CFG_MAX];
+    char        out[DRV_CFG_MAX];
+    size_t      used = 0;
+    size_t      len = 0;
+    ag_handle_t h = ag_vfs_open(DRV_CFG_PATH, NULL, AG_O_RDONLY);
+
+    if (h >= 0) {
+        const int32_t n = ag_vfs_read(h, text, sizeof(text) - 1u);
+        ag_vfs_close(h);
+        if (n < 0) {
+            return (ag_err_t)n;
+        }
+        used = (size_t)n;
+    }
+    text[used] = '\0';
+
+    const size_t seclen = strlen(section);
+    bool         drop = false;
+    const char  *p = text;
+    while (p < text + used) {
+        const char  *eol = strchr(p, '\n');
+        const size_t line = (eol != NULL) ? (size_t)(eol - p) + 1u
+                                          : (size_t)(text + used - p);
+        const char  *s = p;
+        while (*s == ' ' || *s == '\t') {
+            s++;
+        }
+        if (*s == '[') {
+            const char *close = strchr(s, ']');
+            drop = (close != NULL) && ((size_t)(close - s) == seclen + 1u) &&
+                   (ag_path_icmpn_local(s + 1, section, seclen) == 0);
+        }
+        if (!drop) {
+            if (len + line >= sizeof(out)) {
+                return -AG_ENOSPC;
+            }
+            memcpy(out + len, p, line);
+            len += line;
+        }
+        if (eol == NULL) {
+            break;
+        }
+        p = eol + 1;
+    }
+
+    if (body != NULL && body[0] != '\0') {
+        if (len > 0 && out[len - 1u] != '\n') {
+            out[len++] = '\n';
+        }
+        const int n = snprintf(out + len, sizeof(out) - len, "[%s]\n%s",
+                               section, body);
+        if (n < 0 || (size_t)n >= sizeof(out) - len) {
+            return -AG_ENOSPC;
+        }
+        len += (size_t)n;
+    }
+
+    h = ag_vfs_open(DRV_CFG_PATH, NULL, AG_O_WRONLY | AG_O_CREATE | AG_O_TRUNC);
+    if (h < 0) {
+        return (ag_err_t)h;
+    }
+    const int32_t w = ag_vfs_write(h, out, len);
+    (void)ag_vfs_close(h);
+    return (w < 0) ? (ag_err_t)w : AG_OK;
+}
+
+#endif /* AG_PORT_HAS_WIFI || AG_PORT_HAS_BT */
+
+#if AG_PORT_HAS_WIFI
+static ag_err_t cfg_ensure_wifi(const char *ssid, const char *pass)
+{
+    if (ssid == NULL || ssid[0] == '\0') {
+        return cfg_replace_section("wifi", NULL);
+    }
+    char body[160];
+    snprintf(body, sizeof(body), "ssid = %s\npass = %s\n", ssid,
+             (pass != NULL) ? pass : "");
+    return cfg_replace_section("wifi", body);
+}
+#endif
+
+#if AG_PORT_HAS_BT
+static ag_err_t cfg_ensure_bt(const char *addr, int addr_type)
+{
+    if (addr == NULL || addr[0] == '\0') {
+        return cfg_replace_section("bt", NULL);
+    }
+    char body[96];
+    snprintf(body, sizeof(body), "keyboard = %s\ntype = %d\n", addr,
+             addr_type);
+    return cfg_replace_section("bt", body);
+}
+#endif
+
 static ag_err_t cfg_ensure_device(const char *dos_path)
 {
     char        text[DRV_CFG_MAX];
@@ -1447,6 +1594,341 @@ static void io_show_pin(int pin)
  * because the moment you need them is before anything has been copied onto the
  * board - see docs/user/02-board-setup.md.
  */
+#if AG_PORT_HAS_WIFI
+
+static const char *wifi_auth_name(ag_wifi_auth_t a)
+{
+    switch (a) {
+    case AG_WIFI_OPEN:       return "open";
+    case AG_WIFI_WEP:        return "WEP";
+    case AG_WIFI_WPA:        return "WPA";
+    case AG_WIFI_WPA2:       return "WPA2";
+    case AG_WIFI_WPA3:       return "WPA3";
+    case AG_WIFI_ENTERPRISE: return "802.1X";
+    default:                 return "?";
+    }
+}
+
+static const char *wifi_state_name(ag_wifi_state_t s)
+{
+    switch (s) {
+    case AG_WIFI_OFF:     return "off";
+    case AG_WIFI_IDLE:    return "on, not joined";
+    case AG_WIFI_JOINING: return "joining";
+    default:              return "joined";
+    }
+}
+
+static int wifi_status(void)
+{
+    ag_port_wifi_status_t st;
+    const ag_err_t        err = ag_port_wifi_status(&st);
+    if (err != AG_OK) {
+        ag_console_printf("wifi: %s\n", ag_loader_api()->sys->strerror(err));
+        return 1;
+    }
+
+    ag_console_printf("radio %s\n", wifi_state_name(st.state));
+    if (st.ssid[0] != '\0') {
+        ag_console_printf("ssid %s", st.ssid);
+        if (st.state == AG_WIFI_JOINED) {
+            ag_console_printf(", %d dBm, channel %u", (int)st.rssi,
+                              (unsigned)st.channel);
+        }
+        ag_console_puts("\n");
+    }
+    if (st.state != AG_WIFI_JOINED && st.last_reason != 0) {
+        ag_console_printf("last failure: %s\n",
+                          ag_port_wifi_reason(st.last_reason));
+    }
+    if (st.attempts > 1u) {
+        ag_console_printf("%u attempts\n", (unsigned)st.attempts);
+    }
+
+    uint32_t addr = 0;
+    if (ag_net_ready() && ag_port_net_ifaddr(&addr) == AG_OK) {
+        ag_console_printf("address %u.%u.%u.%u\n", (unsigned)(addr >> 24),
+                          (unsigned)((addr >> 16) & 0xffu),
+                          (unsigned)((addr >> 8) & 0xffu),
+                          (unsigned)(addr & 0xffu));
+    } else if (st.state == AG_WIFI_JOINED) {
+        ag_console_puts("no address yet (DHCP)\n");
+    }
+    return 0;
+}
+
+static int wifi_scan(void)
+{
+    /* Sixteen is what the port returns at most, and more than fits a screen. */
+    ag_port_wifi_ap_t aps[16];
+    uint32_t          found = 0;
+
+    ag_console_puts("scanning...\n");
+    const ag_err_t err = ag_port_wifi_scan(aps, 16, &found);
+    if (err != AG_OK) {
+        ag_console_printf("scan: %s\n", ag_loader_api()->sys->strerror(err));
+        return 1;
+    }
+
+    const bool narrow = narrow_screen();
+    ag_console_puts(narrow ? "ssid              ch  dBm auth\n"
+                           : "ssid                              ch   dBm  auth\n");
+
+    const uint32_t shown = (found < 16u) ? found : 16u;
+    for (uint32_t i = 0; i < shown; i++) {
+        ag_console_printf(narrow ? "%-17s %2u %4d %s\n"
+                                 : "%-33s %2u  %4d  %s\n",
+                          aps[i].ssid[0] != '\0' ? aps[i].ssid : "(hidden)",
+                          (unsigned)aps[i].channel, (int)aps[i].rssi,
+                          wifi_auth_name(aps[i].auth));
+    }
+    if (found > shown) {
+        ag_console_printf("%u more not shown\n", (unsigned)(found - shown));
+    } else if (found == 0) {
+        ag_console_puts("nothing in range\n");
+    }
+    return 0;
+}
+
+static int cmd_wifi(int argc, char **argv)
+{
+    if (argc < 2) {
+        return wifi_status();
+    }
+
+    if (ag_path_icmp(argv[1], "scan") == 0) {
+        return wifi_scan();
+    }
+
+    if (ag_path_icmp(argv[1], "connect") == 0) {
+        if (argc < 3) {
+            ag_console_puts("usage: wifi connect <ssid> [password]\n");
+            ag_console_puts("  the network is remembered in SYSTEM.CFG, in "
+                            "clear text\n");
+            return 1;
+        }
+        const char *ssid = argv[2];
+        const char *pass = (argc > 3) ? argv[3] : "";
+
+        const ag_err_t err = ag_port_wifi_connect(ssid, pass);
+        if (err != AG_OK) {
+            ag_console_printf("wifi connect: %s\n",
+                              ag_loader_api()->sys->strerror(err));
+            return 1;
+        }
+        /*
+         * Written down as well as attempted, because a board that has to be
+         * told its network again after every power cut is a board that has to
+         * have a keyboard attached to it.  Clear text, and said out loud
+         * above: the flash of a device somebody can pick up is not a secret.
+         */
+        const ag_err_t cerr = cfg_ensure_wifi(ssid, pass);
+        if (cerr != AG_OK) {
+            ag_console_printf("SYSTEM.CFG: %d (joining anyway)\n", (int)cerr);
+        }
+        ag_console_printf("joining %s...\n", ssid);
+        return 0;
+    }
+
+    if (ag_path_icmp(argv[1], "off") == 0 ||
+        ag_path_icmp(argv[1], "forget") == 0) {
+        (void)ag_port_wifi_disconnect();
+        if (ag_path_icmp(argv[1], "forget") == 0) {
+            const ag_err_t cerr = cfg_ensure_wifi(NULL, NULL);
+            if (cerr != AG_OK) {
+                ag_console_printf("SYSTEM.CFG: %d\n", (int)cerr);
+            }
+            ag_console_puts("forgotten\n");
+        } else {
+            ag_console_puts("disconnected\n");
+        }
+        return 0;
+    }
+
+    ag_console_puts("usage: wifi [scan | connect <ssid> [pass] | off | forget]\n");
+    return 1;
+}
+
+#endif /* AG_PORT_HAS_WIFI */
+
+#if AG_PORT_HAS_BT
+
+static void bt_print_addr(const uint8_t a[6])
+{
+    ag_console_printf("%02x:%02x:%02x:%02x:%02x:%02x", a[0], a[1], a[2], a[3],
+                      a[4], a[5]);
+}
+
+static bool bt_parse_addr(const char *s, uint8_t out[6])
+{
+    int n = 0;
+    for (; *s != '\0' && n < 6; s++) {
+        int hi, lo;
+        if (*s == ':' || *s == '-') {
+            continue;
+        }
+        hi = hex_digit(*s);
+        lo = (s[1] != '\0') ? hex_digit(s[1]) : -1;
+        if (hi < 0 || lo < 0) {
+            return false;
+        }
+        out[n++] = (uint8_t)((hi << 4) | lo);
+        s++;
+    }
+    return n == 6;
+}
+
+/* The scan list is kept so that `bt open 3` can mean the third line of it. */
+static ag_port_bt_dev_t s_bt_seen[8];
+static uint32_t         s_bt_seen_n;
+
+static int cmd_bt(int argc, char **argv)
+{
+    ag_port_bt_status_t st;
+
+    if (argc < 2) {
+        if (ag_port_bt_status(&st) != AG_OK) {
+            ag_console_puts("bt: no radio in this build\n");
+            return 1;
+        }
+        switch (st.state) {
+        case AG_BT_OFF:      ag_console_puts("radio off\n"); break;
+        case AG_BT_SCANNING: ag_console_puts("scanning\n"); break;
+        case AG_BT_OPENING:  ag_console_puts("connecting\n"); break;
+        case AG_BT_OPEN:
+            ag_console_printf("%s connected, %u reports\n",
+                              st.name[0] != '\0' ? st.name : "device",
+                              (unsigned)st.reports);
+            ag_console_puts("  ");
+            bt_print_addr(st.addr);
+            ag_console_puts("\n");
+            break;
+        default: ag_console_puts("radio on, nothing paired\n"); break;
+        }
+        return 0;
+    }
+
+    if (ag_path_icmp(argv[1], "scan") == 0) {
+        uint32_t found = 0;
+        ag_console_puts("scanning...\n");
+        const ag_err_t err = ag_port_bt_scan(s_bt_seen, 8, &found, 5);
+        if (err != AG_OK) {
+            ag_console_printf("bt scan: %s\n",
+                              ag_loader_api()->sys->strerror(err));
+            return 1;
+        }
+        s_bt_seen_n = (found < 8u) ? found : 8u;
+        if (s_bt_seen_n == 0) {
+            ag_console_puts("nothing advertising\n");
+            return 0;
+        }
+
+        /*
+         * Keyboards first, then by signal.  What a person is looking for in
+         * this list is the thing they are holding, and it is the strongest
+         * one that says it is a keyboard.
+         */
+        for (uint32_t i = 1; i < s_bt_seen_n; i++) {
+            const ag_port_bt_dev_t key = s_bt_seen[i];
+            uint32_t               j = i;
+            while (j > 0) {
+                const ag_port_bt_dev_t *prev = &s_bt_seen[j - 1];
+                const bool better = (key.hid && !prev->hid) ||
+                                    (key.hid == prev->hid &&
+                                     key.rssi > prev->rssi);
+                if (!better) {
+                    break;
+                }
+                s_bt_seen[j] = *prev;
+                j--;
+            }
+            s_bt_seen[j] = key;
+        }
+        ag_console_puts("  # name              dBm what\n");
+        for (uint32_t i = 0; i < s_bt_seen_n; i++) {
+            /*
+             * Most of what a scan hears is nameless on purpose - beacons, and
+             * phones that only say who they are while their Bluetooth screen
+             * is open.  The address is then the only handle there is, and a
+             * line saying "(no name)" eight times is not a list.
+             */
+            char label[AG_BT_NAME_MAX + 1];
+            if (s_bt_seen[i].name[0] != '\0') {
+                /* Copied rather than printed: the compiler cannot see that
+                 * the source is the same size and terminated, and a warning
+                 * that cannot be proved wrong is a warning worth avoiding. */
+                memcpy(label, s_bt_seen[i].name, sizeof(label) - 1u);
+                label[sizeof(label) - 1u] = '\0';
+            } else {
+                const uint8_t *a = s_bt_seen[i].addr;
+                snprintf(label, sizeof(label), "%02x:%02x:%02x:%02x:%02x:%02x",
+                         a[0], a[1], a[2], a[3], a[4], a[5]);
+            }
+            ag_console_printf("  %u %-17s %4d %s\n", (unsigned)(i + 1), label,
+                              (int)s_bt_seen[i].rssi,
+                              s_bt_seen[i].hid ? "keyboard/mouse" : "");
+        }
+        ag_console_puts("bt open <#>  to pair with one\n");
+        return 0;
+    }
+
+    if (ag_path_icmp(argv[1], "open") == 0) {
+        if (argc < 3) {
+            ag_console_puts("usage: bt open <# from scan | address>\n");
+            return 1;
+        }
+        uint8_t addr[6];
+        int     type = 0;
+
+        const int idx = atoi(argv[2]);
+        if (idx >= 1 && (uint32_t)idx <= s_bt_seen_n) {
+            memcpy(addr, s_bt_seen[idx - 1].addr, sizeof(addr));
+            type = s_bt_seen[idx - 1].addr_type;
+        } else if (!bt_parse_addr(argv[2], addr)) {
+            ag_console_puts("bt open: not a number from the last scan, and "
+                            "not an address\n");
+            return 1;
+        }
+
+        const ag_err_t err = ag_port_bt_open(addr, type);
+        if (err != AG_OK) {
+            ag_console_printf("bt open: %s\n",
+                              ag_loader_api()->sys->strerror(err));
+            return 1;
+        }
+        ag_console_puts("connecting; `bt` says when it is up\n");
+        /*
+         * Remembered here rather than after the connection succeeds, because
+         * what is being remembered is the intent: this is the keyboard this
+         * board is meant to have, and the boot after next should look for it
+         * whether or not it answered today.
+         */
+        char text[32];
+        snprintf(text, sizeof(text), "%02x:%02x:%02x:%02x:%02x:%02x", addr[0],
+                 addr[1], addr[2], addr[3], addr[4], addr[5]);
+        (void)cfg_ensure_bt(text, type);
+        return 0;
+    }
+
+    if (ag_path_icmp(argv[1], "close") == 0) {
+        (void)ag_port_bt_close();
+        ag_console_puts("closed\n");
+        return 0;
+    }
+
+    if (ag_path_icmp(argv[1], "forget") == 0) {
+        (void)ag_port_bt_close();
+        (void)cfg_ensure_bt(NULL, 0);
+        ag_console_puts("forgotten\n");
+        return 0;
+    }
+
+    ag_console_puts("usage: bt [scan | open <#|addr> | close | forget]\n");
+    return 1;
+}
+
+#endif /* AG_PORT_HAS_BT */
+
 static int cmd_io(int argc, char **argv)
 {
     const ag_io_api_t *io = ag_loader_api()->io;
@@ -1833,6 +2315,12 @@ static const ag_command_t k_commands[] = {
     {"drv", "[load|unload|install|uninstall|probe]",
      "modules: list, load, install to C:, unload, I2C probe", cmd_drv},
     {"io", "[pin [mode]] | i2c <bus> | adc [ch]", "pins and buses", cmd_io},
+#if AG_PORT_HAS_WIFI
+    {"wifi", "[scan|connect <ssid> [pass]|off|forget]", "the radio", cmd_wifi},
+#endif
+#if AG_PORT_HAS_BT
+    {"bt", "[scan|open <#|addr>|close|forget]", "bluetooth input", cmd_bt},
+#endif
     {"ps", "", "list running applications", cmd_ps},
     {"prio", "<slot|pid> [low|normal|high]", "show or set process priority",
      cmd_prio},
