@@ -112,13 +112,22 @@ static void on_ready(uint32_t addr, uint32_t mask, uint32_t gw)
 
 ag_err_t ag_net_init(void)
 {
-    s_lock = ag_port_mutex_new();
+    /*
+     * Callable more than once, because on a board with a radio the network is
+     * not only started at boot: it is turned on and off from the shell, since
+     * a radio that is running costs tens of kilobytes and a radio that is
+     * merely linked costs none.  The socket table is only rebuilt the first
+     * time; doing it again would forget sockets somebody still holds.
+     */
     if (s_lock == NULL) {
-        return -AG_ENOMEM;
-    }
-    for (int i = 0; i < AG_NET_MAX_SOCK; i++) {
-        s_fds[i] = -1;
-        s_in_use[i] = false;
+        s_lock = ag_port_mutex_new();
+        if (s_lock == NULL) {
+            return -AG_ENOMEM;
+        }
+        for (int i = 0; i < AG_NET_MAX_SOCK; i++) {
+            s_fds[i] = -1;
+            s_in_use[i] = false;
+        }
     }
 
     ag_port_net_on_ready(on_ready);

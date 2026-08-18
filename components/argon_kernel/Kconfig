@@ -104,7 +104,6 @@ menu "ArgonOS"
 
     config ARGON_ENABLE_BLE
         bool "Bluetooth Low Energy (input devices)"
-        depends on !ARGON_NET_WIFI
         default n
         select BT_ENABLED
         select BT_NIMBLE_ENABLED

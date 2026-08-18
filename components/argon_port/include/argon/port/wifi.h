@@ -87,6 +87,7 @@ typedef struct {
 #if AG_PORT_HAS_WIFI
 
 ag_err_t ag_port_wifi_start(void);
+ag_err_t ag_port_wifi_stop(void);
 ag_err_t ag_port_wifi_scan(ag_port_wifi_ap_t *out, uint32_t max,
                            uint32_t *found);
 ag_err_t ag_port_wifi_connect(const char *ssid, const char *pass);

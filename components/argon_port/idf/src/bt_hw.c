@@ -314,6 +314,37 @@ ag_err_t ag_port_bt_start(void)
     return AG_OK;
 }
 
+/*
+ * Off, and giving the memory back - the other half of what makes both radios
+ * possible on this chip.  The controller alone holds tens of kilobytes while
+ * it is enabled and none of it once it is not, which is the difference between
+ * "linked" and "running" and the reason both can be in one image.
+ */
+ag_err_t ag_port_bt_stop(void)
+{
+    if (s_state == AG_BT_OFF) {
+        return AG_OK;
+    }
+    if (s_dev != NULL) {
+        (void)esp_hidh_dev_close(s_dev);
+        s_dev = NULL;
+    }
+    (void)ble_gap_disc_cancel();
+    (void)esp_hidh_deinit();
+
+    /* Order matters and is the reverse of start: host, then controller. */
+    (void)nimble_port_stop();
+    (void)esp_nimble_deinit();
+    (void)esp_bt_controller_disable();
+    (void)esp_bt_controller_deinit();
+
+    s_state = AG_BT_OFF;
+    s_seen_n = 0;
+    s_reports = 0;
+    s_dev_name[0] = '\0';
+    return AG_OK;
+}
+
 ag_err_t ag_port_bt_scan(ag_port_bt_dev_t *out, uint32_t max, uint32_t *found,
                          uint32_t seconds)
 {

@@ -23,29 +23,54 @@ CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 
 # The code arena is instruction RAM, and on this chip that is SRAM0: 128 KB in
 # total, shared with every IRAM-resident routine ESP-IDF puts there.  192 KB
-# (the S3 figure) does not exist here at all.  The kernel links at ~68 KB of
-# IRAM without the arena, so ~56 KB is the ceiling and 48 leaves a margin.
+# (the S3 figure) does not exist here at all.
 #
-# 40 rather than 32 for one reason: CKTBENCH is 36 KB of code, and the whole
-# point of running it here is to time the circuit solver against a real cycle
-# counter.  Below 36 KB it relocates into appfs and executes XIP through the
-# flash cache instead, which is a different measurement - a fair one to make
-# deliberately, not one to make by accident.
+# Eight, and it is the radios that decide it.  This number went 48 -> 40 -> 8
+# as Wi-Fi and then Bluetooth were linked in, and the arena is what had to give
+# because nothing else in that instruction RAM is optional.  It is also the
+# thing no other firmware on this chip has: a slice of IRAM held in reserve so
+# that an application image can be both written and executed in place.  A
+# larger image is not refused - it relocates into the appfs partition and runs
+# from flash instead, through the cache, which works and is slower.
 #
-# It was 48 until the radio arrived and asked for the last 2 KB of IRAM.  That
-# is what this number is: whatever is left of 128 KB after the kernel, the
-# radio, and the parts of both that have to execute from RAM.
-CONFIG_ARGON_APP_ARENA_KB=40
+# For measuring rather than for using the board, `argon target esp32-dsp`
+# builds the same system with no radios and a 48 KB arena, which is what
+# CKTBENCH wants: 36 KB of code, timed from RAM rather than through the cache.
+CONFIG_ARGON_APP_ARENA_KB=8
 
-# The network, over the radio rather than over the OpenCores Ethernet MAC that
-# only QEMU has.  Everything above the port is unchanged; what changes is that
-# this build has no network in the emulator and a real one on the board.
+# Both radios, in one image.
 #
-# Wi-Fi and Bluetooth cannot both be here - see sdkconfig.esp32.ble, which is
-# the other half of that sentence and the other build of this board.
+# They were two builds for half a day, on the strength of a link failure that
+# turned out to be the arena above rather than the radios.  Linked, they cost
+# flash and about 25 KB of static RAM; *running*, Wi-Fi costs ~37 KB and
+# Bluetooth ~54, and both at once leave 11 KB free, which is not a machine.  So
+# neither starts unless something asks: [wifi] ssid or [bt] keyboard in
+# SYSTEM.CFG, or `wifi on` / `bt on` at the prompt, and `off` gives it back.
 CONFIG_ARGON_ENABLE_NET=y
 CONFIG_ARGON_NET_WIFI=y
+CONFIG_ARGON_ENABLE_BLE=y
 CONFIG_ETH_USE_OPENETH=n
+
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+# BLE only, and NimBLE rather than Bluedroid: the controller's classic half is
+# handed back at start (about 30 KB), and NimBLE is roughly half of Bluedroid.
+CONFIG_BTDM_CTRL_MODE_BLE_ONLY=y
+CONFIG_BTDM_CTRL_MODE_BR_EDR_ONLY=n
+CONFIG_BTDM_CTRL_MODE_BTDM=n
+CONFIG_BT_NIMBLE_ROLE_CENTRAL=y
+CONFIG_BT_NIMBLE_ROLE_OBSERVER=y
+# Peripheral is on, and not by choice: the whole of ESP-IDF's NimBLE HID *host*
+# is behind BT_NIMBLE_HID_SERVICE, whose menu depends on the GATT *server*.
+CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
+CONFIG_BT_NIMBLE_ROLE_BROADCASTER=n
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
+CONFIG_BT_NIMBLE_GATT_SERVER=y
+CONFIG_BT_NIMBLE_HID_SERVICE=y
+# A keyboard is bonded once and remembered.  Without this it asks to be paired
+# again after every power cut - and pairing is done from a keyboard.
+CONFIG_BT_NIMBLE_NVS_PERSIST=y
+CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y
 
 # The radio's buffers, sized for a chip whose whole internal memory is 320 KB.
 # The defaults assume a part with PSRAM: static rx 10 and dynamic rx 32 alone
