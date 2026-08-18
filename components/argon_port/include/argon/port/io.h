@@ -26,7 +26,9 @@
  *   AG_PORT_SPI_MAX_XFER   the longest single SPI transfer
  *   AG_PORT_HAS_ADC        1 if analogue input is built in this configuration
  *   AG_PORT_ADC_CHANNELS   how many analogue channels
- *   AG_PORT_ADC_FIRST_GPIO the pin of ADC channel 0, or -1 when not mappable
+ *   AG_PORT_ADC_GPIO(ch)   the pin channel `ch` measures, or -1 if it reaches
+ *                          none here - the caller claims that pin, so a port
+ *                          that cannot name it must say -1 rather than guess
  *
  *   unsigned ag_port_reserved_pins(const ag_port_pin_range_t **out)
  *

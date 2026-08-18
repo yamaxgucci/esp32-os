@@ -1,0 +1,53 @@
+# ArgonOS - original ESP32 (Xtensa LX6), the hardware-only target.
+#
+# The primary platform is the S3; this target exists because the first real
+# board in the project's hands is an ESP32-2432S028R ("cheap yellow display"):
+# WROOM-32, 4 MB flash, NO PSRAM, ILI9341 240x320 on SPI, XPT2046 touch, SD on
+# SPI, speaker on the built-in DAC.  Everything QEMU cannot answer - the level
+# on a pin, a real bus transaction, a real cycle count - is answered here.
+#
+# What this target cannot do, and that is not a defect of the config: no PSRAM
+# means no spike S-1 (execution from PSRAM), no megabyte .bss, and profile
+# `lite` rather than `full`.  See docs/09-esp32-cyd.md.
+
+CONFIG_IDF_TARGET="esp32"
+
+# WROOM-32: 4 MB, DIO.  The 8 MB table does not fit - appfs would start past
+# the end of the chip - so this target brings its own.
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_4mb.csv"
+
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+
+# The code arena is instruction RAM, and on this chip that is SRAM0: 128 KB in
+# total, shared with every IRAM-resident routine ESP-IDF puts there.  192 KB
+# (the S3 figure) does not exist here at all.  The kernel links at ~68 KB of
+# IRAM without the arena, so ~56 KB is the ceiling and 48 leaves a margin.
+#
+# 48 rather than 32 for one reason: CKTBENCH is 36 KB of code, and the whole
+# point of running it here is to time the circuit solver against a real cycle
+# counter.  Below 36 KB it relocates into appfs and executes XIP through the
+# flash cache instead, which is a different measurement - a fair one to make
+# deliberately, not one to make by accident.
+CONFIG_ARGON_APP_ARENA_KB=48
+
+# OpenCores Ethernet is a QEMU device.  On silicon the bring-up fails anyway,
+# but the lwIP stack behind it costs tens of kilobytes of a 320 KB budget
+# before it does, so the whole subsystem stays out of this image.
+CONFIG_ARGON_ENABLE_NET=n
+CONFIG_ETH_USE_OPENETH=n
+
+# The host helper on UART1 does not exist on a board and never will; leaving
+# HostFS in would spend 80 KB of DRAM on its buffers and 100 ms of every boot
+# on a PING nobody answers.
+CONFIG_ARGON_ENABLE_HOSTFS=n
+
+# Analogue input, off everywhere else because linking esp_adc stops the boot
+# under QEMU (trap 26).  This target is not verified under QEMU - it is the one
+# place the ADC can finally be tried, and the board has a light sensor wired to
+# GPIO34 to try it on.
+CONFIG_ARGON_ENABLE_ADC=y
+
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y

@@ -62,6 +62,18 @@ unsigned ag_port_reserved_pins(const ag_port_pin_range_t **out)
         /* Octal PSRAM takes four more data lines and its own chip select. */
         {33, 37, "psram"},
 #endif
+#elif CONFIG_IDF_TARGET_ESP32
+        /*
+         * SPI0/1 to the flash chip: 6 SPICLK, 7 SPIQ, 8 SPID, 9 SPIHD,
+         * 10 SPIWP, 11 SPICS0.  On a WROOM module these are inside the can and
+         * a single output configured on one of them stops the chip fetching
+         * instructions - the failure looks like a board that died halfway
+         * through printing a line, with nothing in the log to say why.
+         *
+         * Boards using the same module with octal PSRAM take 16 and 17 as well;
+         * this project has no such board, so nothing here pretends to know.
+         */
+        {6, 11, "flash"},
 #else
         {0, -1, NULL}, /* nothing known for this target */
 #endif
@@ -494,11 +506,11 @@ static bool                      s_adc_chan[AG_PORT_ADC_CHANNELS];
 
 int32_t ag_port_adc_read(int channel)
 {
-    if (AG_PORT_ADC_FIRST_GPIO < 0) {
-        return -AG_ENOTSUP;
-    }
     if (channel < 0 || channel >= AG_PORT_ADC_CHANNELS) {
         return -AG_ERANGE;
+    }
+    if (AG_PORT_ADC_GPIO(channel) < 0) {
+        return -AG_ENOTSUP;
     }
 
     if (s_adc1 == NULL) {

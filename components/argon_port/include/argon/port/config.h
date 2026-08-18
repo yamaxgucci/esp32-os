@@ -16,6 +16,7 @@
  *   CONFIG_ARGON_APP_STACK_KB       default process stack
  *   CONFIG_ARGON_CONSOLE_KEY_EVENTS console event queue depth
  *   CONFIG_ARGON_ENABLE_ADC         link analogue input (see io.h for why not)
+ *   CONFIG_ARGON_ENABLE_HOSTFS      mount H: from a host helper on UART1
  *   CONFIG_ARGON_ENABLE_NET         build the network subsystem
  *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later

@@ -1,0 +1,14 @@
+# ArgonOS partition table - 4 MB flash (WROOM-32 and the boards built on it).
+#
+# Same layout as partitions.csv, scaled down: sysfs is C: (littlefs, holds
+# BOARD.CFG, SYSTEM.CFG and the log), appfs is the raw slot area the loader
+# erases, programs and mmap()s itself for flash XIP - subtype 0x40, not a
+# filesystem.  The firmware is ~730 KB today, so 1.9 MB of app partition leaves
+# room to grow without touching this file.
+#
+# Name,     Type, SubType,  Offset,   Size,     Flags
+nvs,        data, nvs,      0x9000,   0x6000,
+phy_init,   data, phy,      0xf000,   0x1000,
+factory,    app,  factory,  0x10000,  0x1F0000,
+sysfs,      data, littlefs, 0x200000, 0x80000,
+appfs,      data, 0x40,     0x280000, 0x180000,

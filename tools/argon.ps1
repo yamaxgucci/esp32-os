@@ -43,6 +43,9 @@ ArgonOS
   argon test -cp 866 ...   the same, when the screen is in another code page
   argon tests              host unit tests (needs a host C compiler)
   argon check              local CI: host tests, then firmware build
+  argon target             which chip the firmware is built for
+  argon target esp32       switch to the board on the desk (docs\09-esp32-cyd.md);
+                           esp32s3 switches back.  Either way: full rebuild
   argon flash -port COM5   flash a real board and open the monitor
   argon monitor -port COM5 open the serial monitor on a real board
   argon clean              remove the firmware build directory
@@ -131,6 +134,34 @@ switch ($Command.ToLowerInvariant()) {
     'build' {
         Initialize-Environment
         & idf.py build @Rest
+        exit $LASTEXITCODE
+    }
+
+    'target' {
+        # Which chip the firmware is for.  Two exist: esp32s3 is the primary
+        # platform and the only one QEMU runs, esp32 is the board on the desk
+        # (docs\09-esp32-cyd.md).  Each target picks up sdkconfig.defaults plus
+        # sdkconfig.defaults.<chip>, and set-target discards the generated
+        # sdkconfig, so switching is a full rebuild either way.
+        Initialize-Environment
+        $chip = if ($Rest.Count -ge 1) { $Rest[0] } else { '' }
+        if ($chip -eq '') {
+            $cur = '(none - run argon target <chip>)'
+            if (Test-Path 'sdkconfig') {
+                $line = Select-String -Path 'sdkconfig' -Pattern '^CONFIG_IDF_TARGET="(.+)"$' |
+                        Select-Object -First 1
+                if ($line) { $cur = $line.Matches[0].Groups[1].Value }
+            }
+            Write-Host "current target: $cur"
+            Write-Host 'known targets:  esp32s3 (primary, QEMU), esp32 (hardware)'
+            exit 0
+        }
+        if ($chip -notin @('esp32', 'esp32s3')) {
+            Write-Host "argon target: no defaults for '$chip'."
+            Write-Host 'Add sdkconfig.defaults.<chip> before building for it.'
+            exit 1
+        }
+        & idf.py set-target $chip
         exit $LASTEXITCODE
     }
 

@@ -30,7 +30,7 @@ def load_manifest():
         return json.load(f)
 
 
-def command_for(app, defaults, extra_cflags):
+def command_for(app, defaults, extra_cflags, gcc=None):
     include = list(defaults.get("include", [])) + list(app.get("include", []))
     cflags = app.get("cflags", defaults.get("cflags", ""))
     if extra_cflags:
@@ -38,7 +38,7 @@ def command_for(app, defaults, extra_cflags):
 
     cmd = [sys.executable, MKAXE,
            "--arch", app.get("arch", defaults["arch"]),
-           "--gcc", app.get("gcc", defaults["gcc"])]
+           "--gcc", gcc or app.get("gcc", defaults["gcc"])]
     for inc in include:
         cmd += ["--include", inc]
     if cflags:
@@ -58,6 +58,11 @@ def main():
     ap.add_argument("--warnings", action="store_true",
                     help="append -Wall -Wextra to every image")
     ap.add_argument("--list", action="store_true", help="print the list and stop")
+    ap.add_argument("--gcc", default=None,
+                    help="compiler for every image, overriding tools/apps.json "
+                         "(xtensa-esp32-elf-gcc for the original ESP32; the "
+                         "manifest names the S3 one, and an S3 image loaded on "
+                         "an ESP32 is a fault at the entry point, not a refusal)")
     args = ap.parse_args()
 
     manifest = load_manifest()
@@ -92,7 +97,8 @@ def main():
     for i, app in enumerate(apps, 1):
         name = app["out"]
         print(f"[{i}/{len(apps)}] {name}", flush=True)
-        proc = subprocess.run(command_for(app, defaults, extra), cwd=ROOT)
+        proc = subprocess.run(command_for(app, defaults, extra, args.gcc),
+                              cwd=ROOT)
         if proc.returncode != 0:
             failed.append(name)
 

@@ -60,7 +60,16 @@ int ckt_build_preamp(ag_ckt_t *k, float fs, int stages, float bypass_uf);
  * over eight unknowns instead of twenty-eight - which is also, incidentally,
  * an order of magnitude cheaper, because the solve is cubic in that number.
  */
+/*
+ * Eight, because the tables are what cost memory and eight of them assume a
+ * machine with PSRAM.  Overridable for one that has none: the ESP32 board this
+ * project measures on has 320 KB of internal RAM in total, and the baked
+ * tables alone are 70 KB per stage at the default resolution.  Three stages at
+ * CKT_BAKE_N1=128 is the amplifier this benchmark exists to time, and it fits.
+ */
+#ifndef CKT_MAX_CHAIN
 #define CKT_MAX_CHAIN 8
+#endif
 
 typedef struct ckt_chain {
     ag_ckt_t stage[CKT_MAX_CHAIN];

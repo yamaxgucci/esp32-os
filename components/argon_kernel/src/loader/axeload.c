@@ -272,10 +272,22 @@ ag_err_t ag_axe_apply(const ag_axe_header_t *header,
             return -AG_EFORMAT;
         }
 
-        uint32_t word;
-        memcpy(&word, part + at, sizeof(word));
+        /*
+         * A word, addressed as a word.  AG_AXE_R_OFFSET masks off the two flag
+         * bits, so `at` is a multiple of four, and both parts start 16-aligned;
+         * the cast is therefore sound - and it has to be made, because when the
+         * code part is the arena it is instruction memory.  On the original
+         * ESP32 that memory answers only to aligned 32-bit accesses, and a
+         * four-byte memcpy through a uint8_t * is compiled as four byte
+         * accesses on a machine with no unaligned loads.  It would fault here,
+         * inside relocation, on the first application the board ever loaded.
+         */
+        uint32_t *const slot = (uint32_t *)(void *)(part + at);
+        uint32_t        word;
+
+        memcpy(&word, slot, sizeof(word));
         word += to_data ? data_bias : code_bias;
-        memcpy(part + at, &word, sizeof(word));
+        memcpy(slot, &word, sizeof(word));
     }
 
     out->code_base = (uintptr_t)code_final;
