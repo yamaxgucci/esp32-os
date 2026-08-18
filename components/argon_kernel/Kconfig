@@ -81,6 +81,28 @@ menu "ArgonOS"
             before flashing hardware.  A failed bring-up is non-fatal; the
             table stays present but ready() stays false.
 
+    config ARGON_CONSOLE_COLS
+        int "Console width, characters"
+        range 20 240
+        default 80
+
+    config ARGON_CONSOLE_ROWS
+        int "Console height, characters"
+        range 10 128
+        default 25
+        help
+            The text screen every endpoint renders: the serial console, the
+            local framebuffer and a panel driver all show this one grid.
+
+            Eighty by twenty-five unless the board's own screen cannot hold it.
+            The system draws 8x8 cells on a panel, so a 320x240 display holds
+            forty by thirty, and a console wider than the only screen attached
+            to the machine is one whose right-hand half nobody ever sees.
+
+            Not a runtime setting, and not in BOARD.CFG: the console is built
+            three stages before any file has been read, and everything printed
+            during those stages would be lost by rebuilding it afterwards.
+
     config ARGON_ENABLE_HOSTFS
         bool "HostFS (H:, live host folder over UART1)"
         default y

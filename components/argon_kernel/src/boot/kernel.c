@@ -33,8 +33,28 @@
 #include "fs/storage.h"
 #include "proc/supervisor.h"
 
-#define AG_CONSOLE_COLS 80
-#define AG_CONSOLE_ROWS 25
+/*
+ * Eighty by twenty-five, unless the board says otherwise.
+ *
+ * It is a build option rather than a line in BOARD.CFG because of when it is
+ * needed: the console exists three stages before anything has read a file off
+ * the flash, and a console that has to be rebuilt later is a console whose
+ * first three stages of output went somewhere else.
+ *
+ * The board that wants it smaller is one whose only screen is the panel
+ * soldered to it: 320 pixels hold forty of the 8-pixel cells this system
+ * draws, and forty columns that are all visible beat eighty of which half are
+ * off the glass.  That was the choice on the original PC too, and for the same
+ * reason.
+ */
+#ifndef CONFIG_ARGON_CONSOLE_COLS
+#define CONFIG_ARGON_CONSOLE_COLS 80
+#endif
+#ifndef CONFIG_ARGON_CONSOLE_ROWS
+#define CONFIG_ARGON_CONSOLE_ROWS 25
+#endif
+#define AG_CONSOLE_COLS CONFIG_ARGON_CONSOLE_COLS
+#define AG_CONSOLE_ROWS CONFIG_ARGON_CONSOLE_ROWS
 
 /*
  * Early boot tracing writes straight to the raw console, bypassing everything

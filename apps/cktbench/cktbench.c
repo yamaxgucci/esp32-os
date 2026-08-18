@@ -48,10 +48,21 @@
 #include "ag_mathf.h"
 #include "ckt_circuits.h"
 
-/* A megabyte of heap: the fx sweep loads a one-second impulse, which is 87
+/*
+ * A megabyte of heap: the fx sweep loads a one-second impulse, which is 87
  * partitions, and the two spectra for those are 348 KB before the impulse
- * itself and the resampling buffer. */
-AG_APP_SIZED("CKTBENCH", "0.3", "argon", 0, 16 * 1024, 1024 * 1024);
+ * itself and the resampling buffer.
+ *
+ * A requested size is a requirement, not a preference - a process that asks
+ * refuses to start rather than start short - so on a board with no PSRAM this
+ * number is the whole reason the benchmark will not load.  Overridable for
+ * that case: the fx and ir modes then have nothing to work with and say so,
+ * and the circuit modes, which allocate nothing, run.
+ */
+#ifndef CKT_HEAP_KB
+#define CKT_HEAP_KB 1024
+#endif
+AG_APP_SIZED("CKTBENCH", "0.3", "argon", 0, 16 * 1024, CKT_HEAP_KB * 1024);
 
 /*
  * Each probe runs BENCH_N iterations, BENCH_REPS times, and the smallest block

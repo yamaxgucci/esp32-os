@@ -10,6 +10,7 @@
 
 #include <argon/codepage.h>
 #include <argon/display.h>
+#include <argon/textpanel.h>
 
 #include <argon/port/mem.h>
 #include <argon/port/time.h>
@@ -143,6 +144,8 @@ static void render_all(void)
     }
     /* Soft (or panel) local fb, while graphics mode has not taken it over. */
     ag_display_render_console(&s_screen);
+    /* A panel with no framebuffer takes the same screen as characters. */
+    ag_textpanel_render(&s_screen);
     ag_screen_clear_dirty(&s_screen);
 }
 

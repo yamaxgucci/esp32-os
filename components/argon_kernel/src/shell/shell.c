@@ -29,6 +29,7 @@
 #include <argon/shell_path.h>
 #include <argon/vfs.h>
 
+#include <argon/port/io.h>
 #include <argon/port/mem.h>
 #include <argon/port/sys.h>
 #include <argon/port/task.h>
@@ -241,6 +242,8 @@ static void live_restore(void *ctx)
 /* Defined after the table it walks. */
 static int cmd_help(int argc, char **argv);
 
+static bool narrow_screen(void);
+
 static int cmd_ver(int argc, char **argv)
 {
     (void)argc;
@@ -250,17 +253,42 @@ static int cmd_ver(int argc, char **argv)
     const ag_platform_t *pl = ag_platform();
 
     ag_console_printf("%s %s (%s)\n", si->os_name, si->os_version, si->build);
-    ag_console_printf("%s rev %u, %u cores at %u MHz, profile %s\n", si->chip,
-                      (unsigned)pl->chip_revision, (unsigned)si->cpu_cores,
-                      (unsigned)(si->cpu_hz / 1000000u), si->profile);
-    /* The board name comes from the board layer, which is where it is decided. */
-    ag_console_printf("board %s, ABI %u.%u, application core %u\n",
-                      ag_board()->name, si->abi_major, si->abi_minor,
-                      si->app_core);
+    if (narrow_screen()) {
+        ag_console_printf("%s rev %u, %ux%u MHz, %s\n", si->chip,
+                          (unsigned)pl->chip_revision, (unsigned)si->cpu_cores,
+                          (unsigned)(si->cpu_hz / 1000000u), si->profile);
+        ag_console_printf("%s, ABI %u.%u, app core %u\n", ag_board()->name,
+                          si->abi_major, si->abi_minor, si->app_core);
+    } else {
+        ag_console_printf("%s rev %u, %u cores at %u MHz, profile %s\n",
+                          si->chip, (unsigned)pl->chip_revision,
+                          (unsigned)si->cpu_cores,
+                          (unsigned)(si->cpu_hz / 1000000u), si->profile);
+        /* The board name comes from the board layer: that is where it is
+         * decided. */
+        ag_console_printf("board %s, ABI %u.%u, application core %u\n",
+                          ag_board()->name, si->abi_major, si->abi_minor,
+                          si->app_core);
+    }
     if (ag_sysconfig_sources()[0] != '\0') {
         ag_console_printf("configured by %s\n", ag_sysconfig_sources());
     }
     return 0;
+}
+
+/*
+ * Is this a narrow screen?
+ *
+ * The console is eighty columns unless the board's own display cannot hold
+ * eighty: 320 pixels across at 8 pixels a cell is forty.  A table laid out for
+ * eighty does not become a narrower table there - it becomes every line split
+ * in two, with the tail of each one starting the next, which is harder to read
+ * than no table at all.  So the commands that print lists ask.
+ */
+static bool narrow_screen(void)
+{
+    const ag_screen_t *s = ag_console_screen();
+    return s == NULL || s->cols < 60;
 }
 
 static int cmd_mem(int argc, char **argv)
@@ -274,16 +302,32 @@ static int cmd_mem(int argc, char **argv)
     const size_t psram_free = ag_port_mem_free(AG_MEM_SLOW);
     const size_t psram_total = ag_port_mem_total(AG_MEM_SLOW);
 
-    ag_console_printf("                 total        free     largest\n");
-    ag_console_printf("  internal  %8u KB  %8u KB  %8u KB\n",
-                      (unsigned)(int_total / 1024), (unsigned)(int_free / 1024),
-                      (unsigned)(int_block / 1024));
-    if (psram_total > 0) {
-        ag_console_printf("  extended  %8u KB  %8u KB\n",
-                          (unsigned)(psram_total / 1024),
-                          (unsigned)(psram_free / 1024));
+    if (narrow_screen()) {
+        ag_console_printf("           total    free largest\n");
+        ag_console_printf("internal %5uK  %5uK  %5uK\n",
+                          (unsigned)(int_total / 1024),
+                          (unsigned)(int_free / 1024),
+                          (unsigned)(int_block / 1024));
+        if (psram_total > 0) {
+            ag_console_printf("extended %5uK  %5uK\n",
+                              (unsigned)(psram_total / 1024),
+                              (unsigned)(psram_free / 1024));
+        } else {
+            ag_console_puts("extended  none\n");
+        }
     } else {
-        ag_console_puts("  extended         none\n");
+        ag_console_printf("                 total        free     largest\n");
+        ag_console_printf("  internal  %8u KB  %8u KB  %8u KB\n",
+                          (unsigned)(int_total / 1024),
+                          (unsigned)(int_free / 1024),
+                          (unsigned)(int_block / 1024));
+        if (psram_total > 0) {
+            ag_console_printf("  extended  %8u KB  %8u KB\n",
+                              (unsigned)(psram_total / 1024),
+                              (unsigned)(psram_free / 1024));
+        } else {
+            ag_console_puts("  extended         none\n");
+        }
     }
     ag_console_printf("\n  %u KB used by the system\n",
                       (unsigned)((int_total - int_free) / 1024));
@@ -294,7 +338,9 @@ static int cmd_mem(int argc, char **argv)
      * layer below gives none of that memory to the heap - which is exactly why
      * the arena is reserved at link time.
      */
-    ag_console_printf("  %u KB reserved for application code (%s)\n",
+    ag_console_printf(narrow_screen()
+                          ? "  %uK code arena (%s)\n"
+                          : "  %u KB reserved for application code (%s)\n",
                       (unsigned)(ag_loader_arena_size() / 1024),
                       ag_loader_arena_busy() ? "in use" : "free");
 
@@ -783,13 +829,24 @@ static int cmd_dev(int argc, char **argv)
         return 0;
     }
 
-    ag_console_puts("name      class     driver      size       flags\n");
+    const bool narrow = narrow_screen();
+
+    ag_console_puts(narrow ? "name     class    driver\n"
+                           : "name      class     driver      size       flags\n");
 
     uint32_t shown = 0;
     for (uint32_t i = 0;; i++) {
         ag_devinfo_t info;
         if (ag_dev_info(i, AG_DEV_ANY, &info) != AG_OK) {
             break;
+        }
+
+        if (narrow) {
+            /* Size and flags are one `dev <name>` away, and that fits. */
+            ag_console_printf("%-8s %-8s %s\n", info.name,
+                              ag_dev_class_name(info.cls), info.driver);
+            shown++;
+            continue;
         }
 
         char size[16];
@@ -1421,6 +1478,42 @@ static int cmd_io(int argc, char **argv)
         return 0;
     }
 
+    /*
+     * Analogue input.  A separate word rather than a mode of `io <pin>`,
+     * because what is asked for is a channel and not a pin: which pin a
+     * channel measures is the chip's business, and the two numbers are the
+     * same only by accident and only on some parts.  Without an argument it
+     * reads every channel the chip has, which is what somebody looking for
+     * where a sensor is actually wired wants.
+     */
+    if (argc >= 2 && ag_path_icmp(argv[1], "adc") == 0) {
+        if (!AG_HAS(io, adc_read)) {
+            ag_console_puts("this build has no analogue input "
+                            "(CONFIG_ARGON_ENABLE_ADC)\n");
+            return 1;
+        }
+        const int first = (argc >= 3) ? atoi(argv[2]) : 0;
+        const int last = (argc >= 3) ? first : AG_PORT_ADC_CHANNELS - 1;
+
+        for (int ch = first; ch <= last; ch++) {
+            const int32_t raw = io->adc_read(ch);
+            if (raw == -AG_ENOTSUP) {
+                if (argc >= 3) {
+                    ag_console_printf("adc %d: no pin on this chip\n", ch);
+                }
+                continue; /* in a sweep, a channel that goes nowhere is noise */
+            }
+            if (raw < 0) {
+                ag_console_printf("adc %d: %s\n", ch,
+                                  ag_loader_api()->sys->strerror((ag_err_t)raw));
+                continue;
+            }
+            ag_console_printf("adc %d (pin %d): %d\n", ch,
+                              AG_PORT_ADC_GPIO(ch), (int)raw);
+        }
+        return 0;
+    }
+
     if (argc >= 2) {
         const int pin = atoi(argv[1]);
 
@@ -1739,7 +1832,7 @@ static const ag_command_t k_commands[] = {
     {"dev", "[name]", "list devices, or describe one", cmd_dev},
     {"drv", "[load|unload|install|uninstall|probe]",
      "modules: list, load, install to C:, unload, I2C probe", cmd_drv},
-    {"io", "[pin [mode]] | i2c <bus>", "pins and buses", cmd_io},
+    {"io", "[pin [mode]] | i2c <bus> | adc [ch]", "pins and buses", cmd_io},
     {"ps", "", "list running applications", cmd_ps},
     {"prio", "<slot|pid> [low|normal|high]", "show or set process priority",
      cmd_prio},
