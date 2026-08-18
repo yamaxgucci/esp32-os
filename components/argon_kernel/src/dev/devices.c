@@ -25,9 +25,15 @@
 #include <argon/net.h>
 #include <argon/vfs.h>
 
+#include <stdio.h>
+
+#include <argon/btinput.h>
+#include <argon/port/bt.h>
 #include <argon/port/sync.h>
 #include <argon/port/task.h>
+#include <argon/port/wifi.h>
 
+#include "core/sysconfig.h"
 #include "dev/io.h"
 #include "fs/storage.h"
 
@@ -274,6 +280,67 @@ ag_err_t ag_devices_init(void)
     if (err != AG_OK && err != -AG_ENOSYS) {
         ag_log(AG_LOG_WARN, "dev", "net init failed (%d)", (int)err);
     }
+
+#if AG_PORT_HAS_WIFI
+    /*
+     * The radio is on and joined to nothing; this is where it is told what to
+     * join.  Configuration comes from SYSTEM.CFG, which was read two stages
+     * ago, so a board that has been told once comes up on its network without
+     * anyone attaching a console to it - which is the whole point of a board
+     * with a radio.
+     *
+     * Not fatal, and not waited for: association takes seconds and DHCP takes
+     * longer than boot does.  `wifi` says how it went.
+     */
+    if (err == AG_OK) {
+        const char *ssid = ag_cfg_get(ag_sysconfig(), "wifi.ssid", NULL);
+        if (ssid != NULL && ssid[0] != '\0') {
+            const char *pass = ag_cfg_get(ag_sysconfig(), "wifi.pass", "");
+            const ag_err_t werr = ag_port_wifi_connect(ssid, pass);
+            if (werr == AG_OK) {
+                ag_log(AG_LOG_INFO, "wifi", "joining %s", ssid);
+            } else {
+                ag_log(AG_LOG_WARN, "wifi", "%s: %d", ssid, (int)werr);
+            }
+        }
+    }
+#endif
+
+#if AG_PORT_HAS_BT
+    /*
+     * The radio, and then the keyboard it was told about last time.  This is
+     * the only way a board with this chip can have a keyboard at all - there
+     * is no USB on it - so the boot path pays for it: about half a second,
+     * spent once, against a machine that otherwise cannot be typed on without
+     * a cable to another computer.
+     */
+    const ag_err_t bterr = ag_port_bt_start();
+    if (bterr != AG_OK) {
+        ag_log(AG_LOG_WARN, "bt", "radio did not start (%d)", (int)bterr);
+    } else {
+        (void)ag_btinput_init();
+
+        const char *kbd = ag_cfg_get(ag_sysconfig(), "bt.keyboard", NULL);
+        if (kbd != NULL && kbd[0] != '\0') {
+            uint8_t addr[6];
+            unsigned b[6];
+            if (sscanf(kbd, "%x:%x:%x:%x:%x:%x", &b[0], &b[1], &b[2], &b[3],
+                       &b[4], &b[5]) == 6) {
+                for (int i = 0; i < 6; i++) {
+                    addr[i] = (uint8_t)b[i];
+                }
+                const int type = (int)ag_cfg_get_int(ag_sysconfig(), "bt.type",
+                                                     0);
+                if (ag_port_bt_open(addr, type) == AG_OK) {
+                    ag_log(AG_LOG_INFO, "bt", "looking for %s", kbd);
+                }
+            } else {
+                ag_log(AG_LOG_WARN, "bt", "bt.keyboard is not an address: %s",
+                       kbd);
+            }
+        }
+    }
+#endif
 
     ag_log(AG_LOG_INFO, "dev", "%u devices", (unsigned)ag_dev_count());
     return AG_OK;

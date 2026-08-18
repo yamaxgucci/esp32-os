@@ -151,17 +151,35 @@ switch ($Command.ToLowerInvariant()) {
                 $line = Select-String -Path 'sdkconfig' -Pattern '^CONFIG_IDF_TARGET="(.+)"$' |
                         Select-Object -First 1
                 if ($line) { $cur = $line.Matches[0].Groups[1].Value }
+                $ble = Select-String -Path 'sdkconfig' -Pattern '^CONFIG_ARGON_ENABLE_BLE=y$' |
+                       Select-Object -First 1
+                if ($ble) { $cur = "$cur (BLE, no Wi-Fi)" }
             }
             Write-Host "current target: $cur"
-            Write-Host 'known targets:  esp32s3 (primary, QEMU), esp32 (hardware)'
+            Write-Host 'known targets:  esp32s3 (primary, QEMU)'
+            Write-Host '                esp32       hardware, Wi-Fi'
+            Write-Host '                esp32-ble   hardware, Bluetooth instead'
             exit 0
         }
-        if ($chip -notin @('esp32', 'esp32s3')) {
-            Write-Host "argon target: no defaults for '$chip'."
-            Write-Host 'Add sdkconfig.defaults.<chip> before building for it.'
-            exit 1
+
+        # The two radios do not fit together on this chip, so the Bluetooth
+        # build is a second set of defaults layered on the first rather than a
+        # switch inside one.  IDF keeps SDKCONFIG_DEFAULTS in the build cache,
+        # so `argon build` afterwards uses the same list.
+        $defaults = ''
+        switch ($chip) {
+            'esp32'     { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32' }
+            'esp32-ble' { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32;sdkconfig.esp32.ble'
+                          $chip = 'esp32' }
+            'esp32s3'   { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32s3' }
+            default {
+                Write-Host "argon target: no defaults for '$chip'."
+                Write-Host 'Add sdkconfig.defaults.<chip> before building for it.'
+                exit 1
+            }
         }
-        & idf.py set-target $chip
+        Remove-Item 'sdkconfig' -ErrorAction SilentlyContinue
+        & idf.py -D "SDKCONFIG_DEFAULTS=$defaults" set-target $chip
         exit $LASTEXITCODE
     }
 

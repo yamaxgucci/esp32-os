@@ -26,18 +26,49 @@ CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 # (the S3 figure) does not exist here at all.  The kernel links at ~68 KB of
 # IRAM without the arena, so ~56 KB is the ceiling and 48 leaves a margin.
 #
-# 48 rather than 32 for one reason: CKTBENCH is 36 KB of code, and the whole
+# 40 rather than 32 for one reason: CKTBENCH is 36 KB of code, and the whole
 # point of running it here is to time the circuit solver against a real cycle
 # counter.  Below 36 KB it relocates into appfs and executes XIP through the
 # flash cache instead, which is a different measurement - a fair one to make
 # deliberately, not one to make by accident.
-CONFIG_ARGON_APP_ARENA_KB=48
+#
+# It was 48 until the radio arrived and asked for the last 2 KB of IRAM.  That
+# is what this number is: whatever is left of 128 KB after the kernel, the
+# radio, and the parts of both that have to execute from RAM.
+CONFIG_ARGON_APP_ARENA_KB=40
 
-# OpenCores Ethernet is a QEMU device.  On silicon the bring-up fails anyway,
-# but the lwIP stack behind it costs tens of kilobytes of a 320 KB budget
-# before it does, so the whole subsystem stays out of this image.
-CONFIG_ARGON_ENABLE_NET=n
+# The network, over the radio rather than over the OpenCores Ethernet MAC that
+# only QEMU has.  Everything above the port is unchanged; what changes is that
+# this build has no network in the emulator and a real one on the board.
+#
+# Wi-Fi and Bluetooth cannot both be here - see sdkconfig.esp32.ble, which is
+# the other half of that sentence and the other build of this board.
+CONFIG_ARGON_ENABLE_NET=y
+CONFIG_ARGON_NET_WIFI=y
 CONFIG_ETH_USE_OPENETH=n
+
+# The radio's buffers, sized for a chip whose whole internal memory is 320 KB.
+# The defaults assume a part with PSRAM: static rx 10 and dynamic rx 32 alone
+# are more than twenty kilobytes.  These are enough for a console, a file
+# transfer and a PCM stream, and are the first thing to raise if throughput
+# matters more than free memory.
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=4
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=16
+CONFIG_ESP_WIFI_TX_BUFFER_TYPE=1
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=16
+CONFIG_ESP_WIFI_AMPDU_TX_ENABLED=n
+CONFIG_ESP_WIFI_AMPDU_RX_ENABLED=n
+
+# The radio's hot paths stay in flash rather than being copied into IRAM.
+#
+# Not a preference: with them in IRAM the image does not link at all, because
+# IRAM on this chip is 128 KB, the kernel and the code arena already hold most
+# of it, and these two options ask for about 28 KB more.  They buy throughput
+# by keeping the receive path out of the flash cache; what they cost here is
+# the ability to build.  If the arena is ever cut back, this is the first place
+# to spend the room.
+CONFIG_ESP_WIFI_IRAM_OPT=n
+CONFIG_ESP_WIFI_RX_IRAM_OPT=n
 
 # The host helper on UART1 does not exist on a board and never will; leaving
 # HostFS in would spend 80 KB of DRAM on its buffers and 100 ms of every boot

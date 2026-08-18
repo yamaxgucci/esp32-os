@@ -37,8 +37,13 @@ idf_component_register(
              esp_driver_gpio esp_driver_i2c esp_driver_ledc
              # the virtual RGB panel under Espressif QEMU (absent on hardware)
              esp_lcd espressif__esp_lcd_qemu_rgb
-             # OpenEth + lwIP sockets (QEMU today)
-             esp_eth esp_netif esp_event nvs_flash lwip)
+             # the link, whichever it is, and lwIP sockets above it:
+             # esp_eth is OpenEth under QEMU, esp_wifi is the radio on silicon
+             esp_eth esp_wifi esp_netif esp_event nvs_flash lwip
+             # BLE, for the keyboard a chip with no USB cannot have any other
+             # way.  Mutually exclusive with Wi-Fi at run time on this part;
+             # see ARGON_ENABLE_BLE in argon_kernel.
+             bt esp_hid)
 
 # Analogue input, off by default: linking esp_adc runs a constructor that stops
 # the boot under QEMU, and QEMU is how this system is verified.
