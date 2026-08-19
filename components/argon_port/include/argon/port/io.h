@@ -45,6 +45,11 @@
  *
  *   ag_err_t ag_port_spi_open(int bus, int sck, int mosi, int miso,
  *                             uint32_t khz)
+ *   ag_err_t ag_port_spi_set_khz(int bus, int cs, uint32_t khz)
+ *       The speed for one chip on the bus, overriding the bus default.  A bus
+ *       has one set of wires and several chips, and they rarely agree: a panel
+ *       takes 40 MHz and the touch controller beside it on the same three
+ *       wires will not answer above two.
  *   ag_err_t ag_port_spi_xfer(int bus, int cs, const void *tx, void *rx,
  *                             size_t len)
  *
@@ -121,6 +126,7 @@ ag_err_t ag_port_i2c_wrrd(int bus, uint8_t addr, const void *wbuf, size_t wlen,
 ag_err_t ag_port_i2c_probe(int bus, uint8_t addr, uint32_t timeout_ms);
 
 ag_err_t ag_port_spi_open(int bus, int sck, int mosi, int miso, uint32_t khz);
+ag_err_t ag_port_spi_set_khz(int bus, int cs, uint32_t khz);
 ag_err_t ag_port_spi_xfer(int bus, int cs, const void *tx, void *rx,
                           size_t len);
 

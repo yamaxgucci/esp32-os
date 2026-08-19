@@ -917,13 +917,24 @@ static int cfg_has_device_line(const char *text, const char *dos_path)
             eq = strchr(s, '=');
             if (eq != NULL) {
                 char *key = s;
-                char *val;
+                /*
+                 * Where the value starts, taken before anything moves.  It
+                 * used to be computed as eq + 1 *after* the loop below had
+                 * walked eq backwards over the spaces in front of the '=', so
+                 * for the one spelling this file is actually written in -
+                 * `device = path`, with spaces - it pointed at the byte that
+                 * had just been set to nul.  Every value read as empty, no
+                 * line ever matched, and `drv install` of a driver that was
+                 * already installed added it again: SYSTEM.CFG grew a second
+                 * copy of the same module and loaded it twice on every boot.
+                 */
+                char *val = eq + 1;
+
                 *eq = '\0';
                 while (eq > key && (eq[-1] == ' ' || eq[-1] == '\t')) {
                     eq--;
                     *eq = '\0';
                 }
-                val = eq + 1;
                 while (*val == ' ' || *val == '\t') {
                     val++;
                 }
@@ -1199,13 +1210,24 @@ static ag_err_t cfg_remove_device(const char *dos_path)
             eq = strchr(s, '=');
             if (eq != NULL) {
                 char *key = s;
-                char *val;
+                /*
+                 * Where the value starts, taken before anything moves.  It
+                 * used to be computed as eq + 1 *after* the loop below had
+                 * walked eq backwards over the spaces in front of the '=', so
+                 * for the one spelling this file is actually written in -
+                 * `device = path`, with spaces - it pointed at the byte that
+                 * had just been set to nul.  Every value read as empty, no
+                 * line ever matched, and `drv install` of a driver that was
+                 * already installed added it again: SYSTEM.CFG grew a second
+                 * copy of the same module and loaded it twice on every boot.
+                 */
+                char *val = eq + 1;
+
                 *eq = '\0';
                 while (eq > key && (eq[-1] == ' ' || eq[-1] == '\t')) {
                     eq--;
                     *eq = '\0';
                 }
-                val = eq + 1;
                 while (*val == ' ' || *val == '\t') {
                     val++;
                 }

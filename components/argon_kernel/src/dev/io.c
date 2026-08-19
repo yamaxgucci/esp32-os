@@ -484,6 +484,29 @@ static ag_err_t spi_take_cs(int bus, int cs)
  * means the caller drives the chip select itself - a chip that needs it held
  * across several transfers cannot let the peripheral toggle it.
  */
+/*
+ * The clock for one chip on a bus that has several.  Bringing the bus up here
+ * as well, because a speed set before the bus exists would be forgotten: the
+ * bus comes up on first use, and this is a first use.
+ */
+static ag_err_t io_spi_config(int bus, int cs, uint32_t khz)
+{
+    if (khz == 0) {
+        return -AG_EINVAL;
+    }
+
+    lock();
+    ag_err_t err = spi_bring_up(bus);
+    if (err == AG_OK) {
+        err = spi_take_cs(bus, cs);
+    }
+    if (err == AG_OK) {
+        err = ag_port_spi_set_khz(bus, cs, khz);
+    }
+    unlock();
+    return err;
+}
+
 static ag_err_t io_spi_xfer(int bus, int cs, const void *tx, void *rx,
                             size_t len)
 {
@@ -831,6 +854,7 @@ const ag_io_api_t ag_io_api_table = {
 #endif
     .pwm_config = io_pwm_config,
     .pwm_set = io_pwm_set,
+    .spi_config = io_spi_config,
 };
 
 ag_err_t ag_io_init(void)

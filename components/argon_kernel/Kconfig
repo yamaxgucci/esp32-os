@@ -102,6 +102,20 @@ menu "ArgonOS"
             Which network to join comes from [wifi] in SYSTEM.CFG or from the
             `wifi` command; the radio starts joined to nothing.
 
+    config ARGON_BOARD_PROBE
+        bool "Board probe instead of the system"
+        default n
+        help
+            Builds an image that talks to one peripheral and nothing else: no
+            scheduler, no console task, no drivers, no pin table.  It runs from
+            app_main and never starts the kernel.
+
+            For the case where a peripheral answers nothing and there are four
+            possible reasons at once - the wiring, the driver, the way the
+            kernel polls it, and the claims on its pins.  This removes three of
+            them in one flash.  What it probes is in main/probe.c and is
+            expected to be edited; it is a bring-up tool, not a feature.
+
     config ARGON_ENABLE_BLE
         bool "Bluetooth Low Energy (input devices)"
         default n

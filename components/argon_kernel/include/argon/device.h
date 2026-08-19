@@ -97,6 +97,23 @@ typedef struct {
 ag_err_t ag_dev_init(const ag_dev_lock_t *lock);
 
 /*
+ * Hold the registry across a call into a driver.
+ *
+ * Not for ordinary use: the registry takes this lock itself for everything it
+ * does.  It is here for the one caller that reaches *past* the registry - the
+ * kernel calling a class vtable (a panel's text_row, a touchscreen's poll) -
+ * because the memory that vtable points into belongs to a loadable module, and
+ * `drv unload` frees it.  Unloading while the console task was inside a
+ * driver's poll took the board down with an interrupt watchdog timeout: the
+ * task was executing an arena that had just been handed back.
+ *
+ * Module unload takes the same lock, so the two cannot overlap.  Both sides
+ * hold it for microseconds.
+ */
+void ag_dev_lock_hold(void);
+void ag_dev_lock_release(void);
+
+/*
  * Adds a device.  -AG_EEXIST for a name already taken, -AG_EINVAL for a name
  * that is empty, too long or contains a path separator, -AG_ENFILE when the
  * table is full.  The descriptor is copied; `out` may be NULL.

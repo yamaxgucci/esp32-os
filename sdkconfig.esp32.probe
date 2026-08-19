@@ -1,0 +1,10 @@
+# Board bring-up: the probe in main/probe.c runs instead of the system.
+# `argon target esp32-probe`; see ARGON_BOARD_PROBE in the kernel Kconfig.
+CONFIG_ARGON_BOARD_PROBE=y
+
+# Nothing else is running, so nothing else needs room.
+CONFIG_ARGON_ENABLE_NET=n
+CONFIG_ARGON_NET_WIFI=n
+CONFIG_ARGON_ENABLE_BLE=n
+CONFIG_BT_ENABLED=n
+CONFIG_ARGON_APP_ARENA_KB=4
