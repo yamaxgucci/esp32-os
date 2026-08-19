@@ -17,6 +17,12 @@
  *                      each a different colour, so a mirrored or rotated
  *                      surface shows up as the wrong corner being red.
  *
+ *   gfxpix own [s]     the same picture, but 160x144 in the application's own
+ *                      memory, handed to the panel sixteen rows at a time
+ *                      (gfx->present).  What an emulator has to do, and what
+ *                      the system's surface cannot do for it: the shape is
+ *                      wrong and the memory is wanted elsewhere.
+ *
  *   gfxpix cycle [n]   the whole surface, one flat colour at a time, changing
  *                      every second, n times.  For telling "there was no
  *                      picture" apart from "the panel went black" and from "the
@@ -39,7 +45,7 @@
 #include <argon/argon.h>
 #include <argon/keys.h>
 
-AG_APP("GFXPIX", "1.2", "argon", AG_AXE_NEEDS_GFX);
+AG_APP("GFXPIX", "1.3", "argon", AG_AXE_NEEDS_GFX);
 
 /* Digits, by hand: the SDK has no atoi and two arguments are not a reason to
  * want one. */
@@ -93,16 +99,95 @@ static void draw_scene(uint16_t w, uint16_t h)
     ag_gfx_fill_rect((int16_t)(w - qw), (int16_t)(h - qh), qw, qh, 0x00FFFFFFu);
 }
 
+/*
+ * The other way round: pixels the application owns, handed straight to the
+ * panel (gfx->present, ABI 0.31).
+ *
+ * A Game Boy screen is 160x144 and the system's surface on this board is
+ * 160x120 - the wrong shape, and 37 KB that an emulator would rather spend on a
+ * cartridge.  So this draws the same kind of picture into a buffer of its own,
+ * sixteen rows at a time, which is exactly the shape an emulator's scanline
+ * renderer produces.
+ *
+ * Sixteen rows and not one: a present costs a window command and a transfer
+ * whatever its height, and 144 of those per frame is most of a frame's time
+ * spent on overhead.  Nine is nothing.
+ */
+#define OWN_W 160
+#define OWN_H 144
+#define OWN_BAND 16
+
+static uint16_t s_band[OWN_W * OWN_BAND];
+
+static uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b)
+{
+    return (uint16_t)(((r & 0xf8u) << 8) | ((g & 0xfcu) << 3) | (b >> 3));
+}
+
+static int own_picture(void)
+{
+    /* A circle, two diagonals and a border - the same test as the framebuffer
+     * path, so the two can be compared by eye. */
+    const int cx = OWN_W / 2, cy = OWN_H / 2;
+    const int r = (OWN_W < OWN_H ? OWN_W : OWN_H) / 2 - 2;
+
+    for (int y0 = 0; y0 < OWN_H; y0 += OWN_BAND) {
+        const int rows = (OWN_H - y0 < OWN_BAND) ? (OWN_H - y0) : OWN_BAND;
+
+        for (int row = 0; row < rows; row++) {
+            const int y = y0 + row;
+            for (int x = 0; x < OWN_W; x++) {
+                const int dx = x - cx, dy = y - cy;
+                uint16_t  c;
+
+                if (x == 0 || y == 0 || x == OWN_W - 1 || y == OWN_H - 1) {
+                    c = rgb565(255, 255, 255);
+                } else if (x * OWN_H == y * OWN_W ||
+                           (OWN_W - 1 - x) * OWN_H == y * OWN_W) {
+                    c = rgb565(255, 255, 255);
+                } else if (dx * dx + dy * dy <= r * r) {
+                    c = rgb565(224, 192, 64);
+                } else {
+                    c = rgb565(0, 0, 128);
+                }
+                s_band[row * OWN_W + x] = c;
+            }
+        }
+
+        const ag_blit_t b = {
+            .px = s_band,
+            .stride = OWN_W * sizeof(uint16_t),
+            .surf_w = OWN_W,
+            .surf_h = OWN_H,
+            .x = 0,
+            .y = (uint16_t)y0,
+            .w = OWN_W,
+            .h = (uint16_t)rows,
+        };
+        const ag_err_t err = ag_gfx_present(&b);
+        if (err != AG_OK) {
+            ag_printf("present at y=%d: %s\n", y0, ag_strerror(err));
+            return 1;
+        }
+    }
+    return 0;
+}
+
 int ag_main(int argc, char **argv)
 {
     ag_gfxinfo_t info;
     uint32_t     hold_s = 0;
     int          cycle = 0;
 
+    int own = 0;
+
     if (argc >= 2 && argv[1] != NULL) {
         if (argv[1][0] == 'c' || argv[1][0] == 'C') {
             cycle = 1;
             hold_s = (argc >= 3) ? number(argv[2]) : 60u;
+        } else if (argv[1][0] == 'o' || argv[1][0] == 'O') {
+            own = 1;
+            hold_s = (argc >= 3) ? number(argv[2]) : 30u;
         } else {
             hold_s = number(argv[1]);
         }
@@ -124,6 +209,25 @@ int ag_main(int argc, char **argv)
 
     const uint16_t w = info.width;
     const uint16_t h = info.height;
+
+    if (own) {
+        if (!AG_HAS(ag_api()->gfx, present)) {
+            ag_printf("this kernel has no gfx->present (ABI < 0.31)\n");
+            ag_gfx_release();
+            return 1;
+        }
+        const ag_time_t t0 = ag_micros();
+        const int       bad = own_picture();
+        const ag_time_t t1 = ag_micros();
+        ag_printf("2 own %dx%d in %u us%s\n", OWN_W, OWN_H,
+                  (unsigned)(t1 - t0), bad ? " (failed)" : "");
+        if (hold_s != 0) {
+            ag_delay(hold_s * 1000u);
+        }
+        ag_gfx_release();
+        ag_printf("3 held %u s\n", (unsigned)hold_s);
+        return bad;
+    }
 
     if (cycle) {
         static const uint32_t k_rgb[4] = {0x00FF0000u, 0x0000FF00u,

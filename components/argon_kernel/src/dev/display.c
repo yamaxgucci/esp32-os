@@ -60,6 +60,22 @@ static const uint16_t k_cga565[16] = {
 static uint16_t *s_front; /* presented: QEMU FB or owned PSRAM          */
 static uint16_t *s_back;  /* draw target while acquired; NULL = single */
 static uint16_t *s_draw;  /* s_back while acquired with DB, else front */
+
+/*
+ * No surface of our own: the panel is driven by a loadable driver and every
+ * application brings its own pixels (gfx->present, ABI 0.31).
+ *
+ * [display] driver = panel.  For a machine where a shared framebuffer is a
+ * luxury rather than a given - 320x240 in RGB565 is 150 KB and this board has
+ * 320 KB of SRAM in total - and where the applications that want the screen
+ * want it in their own shape anyway.
+ *
+ * s_front stays NULL, which is what makes this safe rather than delicate: every
+ * drawing primitive goes through draw_surf() and every one of them refuses a
+ * surface whose pixels are NULL, so the whole soft renderer becomes a no-op
+ * without a single extra test.
+ */
+static bool s_surfaceless;
 static uint16_t *s_snap;  /* last released graphics frame, for gfxdump */
 static uint16_t  s_w;
 static uint16_t  s_h;
@@ -113,9 +129,18 @@ static size_t fb_bytes(void)
  * gives: the driver is loadable and a remembered pointer outlives it by
  * exactly one frame.
  */
-static void driver_present_rect(int32_t x, int32_t y, int32_t w, int32_t h)
+/*
+ * Hand one rectangle of pixels to whichever display driver can show them.
+ *
+ * The registry is held across the call because the vtable lives in a loadable
+ * module's arena, and holding it is also what tells the io layer that the pins
+ * being written belong to the system rather than to whoever called in - see
+ * caller() in src/dev/io.c, which is where a whole frame once went into a single
+ * character cell for want of exactly this.
+ */
+static void driver_present_blit(const ag_blit_t *b)
 {
-    if (s_front == NULL || !s_acquired || w <= 0 || h <= 0) {
+    if (b == NULL || b->px == NULL || b->w == 0 || b->h == 0) {
         return;
     }
 
@@ -130,22 +155,63 @@ static void driver_present_rect(int32_t x, int32_t y, int32_t w, int32_t h)
             continue;
         }
         const ag_display_ops_t *ops = (const ag_display_ops_t *)dev->class_ops;
-        if (!AG_HAS(ops, blit_rect)) {
+        if (!AG_HAS(ops, blit_rect) || ops->blit_rect == NULL) {
             continue;
         }
-        const ag_blit_t b = {
-            .px = s_front,
-            .stride = s_stride,
-            .surf_w = s_w,
-            .surf_h = s_h,
-            .x = (uint16_t)x,
-            .y = (uint16_t)y,
-            .w = (uint16_t)w,
-            .h = (uint16_t)h,
-        };
-        ops->blit_rect(0, &b);
+        ops->blit_rect(0, b);
     }
     ag_dev_lock_release();
+}
+
+/* The panel's own size, for a system that has no surface of its own to size. */
+static bool panel_size(uint16_t *w, uint16_t *h)
+{
+    bool found = false;
+
+    ag_dev_lock_hold();
+    for (uint32_t i = 0; !found; i++) {
+        ag_devinfo_t info;
+        if (ag_dev_info(i, AG_DEV_DISPLAY, &info) != AG_OK) {
+            break;
+        }
+        ag_device_t *dev = ag_dev_find(info.name);
+        if (dev == NULL || dev->class_ops == NULL) {
+            continue;
+        }
+        const ag_display_ops_t *ops = (const ag_display_ops_t *)dev->class_ops;
+        if (ops->info == NULL) {
+            continue;
+        }
+        ag_gfxinfo_t gi;
+        if (ops->info(0, &gi) != AG_OK || gi.width == 0 || gi.height == 0) {
+            continue;
+        }
+        *w = gi.width;
+        *h = gi.height;
+        found = true;
+    }
+    ag_dev_lock_release();
+    return found;
+}
+
+static void driver_present_rect(int32_t x, int32_t y, int32_t w, int32_t h)
+{
+    if (s_front == NULL || !s_acquired || w <= 0 || h <= 0) {
+        return;
+    }
+    /* The rectangle's own origin, not the framebuffer's - see ag_blit_t. */
+    const ag_blit_t b = {
+        .px = (const uint8_t *)s_front + (size_t)y * s_stride +
+              (size_t)x * sizeof(uint16_t),
+        .stride = s_stride,
+        .surf_w = s_w,
+        .surf_h = s_h,
+        .x = (uint16_t)x,
+        .y = (uint16_t)y,
+        .w = (uint16_t)w,
+        .h = (uint16_t)h,
+    };
+    driver_present_blit(&b);
 }
 
 static void panel_present_rect(int32_t x, int32_t y, int32_t w, int32_t h)
@@ -432,11 +498,42 @@ static bool gfx_may_present(void)
 
 static ag_err_t gfx_acquire(ag_gfxinfo_t *out)
 {
-    if (!s_ready || s_front == NULL) {
+    if (!s_ready) {
         return -AG_ENODEV;
     }
     if (s_acquired) {
         return -AG_EBUSY;
+    }
+
+    if (s_surfaceless) {
+        /*
+         * The size is the panel's, and it is asked for here rather than at boot
+         * because at boot the driver that knows it has not been loaded yet.
+         */
+        uint16_t pw = 0, ph = 0;
+        if (!panel_size(&pw, &ph)) {
+            return -AG_ENODEV;
+        }
+        s_w = pw;
+        s_h = ph;
+        s_stride = (uint32_t)pw * sizeof(uint16_t);
+        s_acquired = true;
+        s_owner = ag_proc_self();
+        s_draw = NULL;
+        if (out != NULL) {
+            out->width = pw;
+            out->height = ph;
+            out->fmt = AG_PIX_RGB565;
+            out->stride = s_stride;
+            out->fb = NULL; /* there is none: use gfx->present */
+            out->double_buf = false;
+            out->direct = true;
+        }
+        return AG_OK;
+    }
+
+    if (s_front == NULL) {
+        return -AG_ENODEV;
     }
     s_acquired = true;
     s_owner = ag_proc_self();
@@ -467,6 +564,19 @@ static ag_err_t gfx_acquire(ag_gfxinfo_t *out)
 static void gfx_release(void)
 {
     if (!s_acquired) {
+        return;
+    }
+    if (s_surfaceless) {
+        s_acquired = false;
+        s_owner = AG_PID_KERNEL;
+        /* The panel still has the application's last frame on it; the console
+         * takes it back the same way it does after a framebuffer app. */
+        s_console_gen = 0;
+        if (ag_console_ready()) {
+            ag_console_lock();
+            ag_screen_mark_all_dirty(ag_console_screen());
+            ag_console_unlock();
+        }
         return;
     }
     /* Show the last drawn frame and keep a snapshot for gfxdump / Alt-Tab. */
@@ -505,6 +615,44 @@ static void gfx_swap(void)
         return;
     }
     present_draw_to_front();
+}
+
+/*
+ * The caller's own pixels (ABI 0.31).
+ *
+ * Nothing is copied and nothing is kept: the rectangle goes to the panel and
+ * this returns when it has been sent.  There is no system surface involved even
+ * when one exists, which is the whole point - an application whose picture is a
+ * different shape from the system's should not have to pay for both.
+ *
+ * Clipped to the surface the caller declares, because a rectangle outside it is
+ * a mistake in the caller and a panel full of somebody else's memory here.
+ */
+static ag_err_t gfx_present(const ag_blit_t *in)
+{
+    if (in == NULL || in->px == NULL || in->surf_w == 0 || in->surf_h == 0) {
+        return -AG_EINVAL;
+    }
+    if (!gfx_may_present()) {
+        return -AG_EPERM;
+    }
+
+    ag_blit_t b = *in;
+    if (b.x >= b.surf_w || b.y >= b.surf_h) {
+        return -AG_EINVAL;
+    }
+    if (b.w == 0 || b.w > (uint16_t)(b.surf_w - b.x)) {
+        b.w = (uint16_t)(b.surf_w - b.x);
+    }
+    if (b.h == 0 || b.h > (uint16_t)(b.surf_h - b.y)) {
+        b.h = (uint16_t)(b.surf_h - b.y);
+    }
+    if (b.stride < (uint32_t)b.surf_w * sizeof(uint16_t)) {
+        return -AG_EINVAL;
+    }
+
+    driver_present_blit(&b);
+    return AG_OK;
 }
 
 /*
@@ -868,6 +1016,7 @@ const ag_gfx_api_t ag_gfx_api_table = {
     .acquire = gfx_acquire,
     .release = gfx_release,
     .flush = gfx_flush,
+    .present = gfx_present,
     .swap = gfx_swap,
     .clear = gfx_clear,
     .fill_rect = gfx_fill_rect,
@@ -1099,6 +1248,19 @@ ag_err_t ag_display_init(void)
 
     if (driver[0] == '\0' || ag_path_icmp(driver, "none") == 0) {
         ag_log(AG_LOG_INFO, "display", "disabled (display.driver=none)");
+        return AG_OK;
+    }
+
+    /*
+     * No surface at all, and the panel driver does the showing.  Nothing is
+     * allocated and nothing is registered: fb0 would be a display device with
+     * no display in it.
+     */
+    if (ag_path_icmp(driver, "panel") == 0) {
+        s_surfaceless = true;
+        s_ready = true;
+        ag_log(AG_LOG_INFO, "display",
+               "no system surface; applications bring their own (present)");
         return AG_OK;
     }
 

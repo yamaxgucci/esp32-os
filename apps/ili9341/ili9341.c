@@ -334,8 +334,9 @@ static void lcd_blit_rect(ag_handle_t h, const ag_blit_t *b)
     window(x0, y0, (uint16_t)(x0 + out_w - 1),
            (uint16_t)(y0 + hgt * s_scale - 1));
 
-    const uint8_t *src = (const uint8_t *)b->px + (size_t)y * b->stride +
-                         (size_t)x * sizeof(uint16_t);
+    /* px is the rectangle's own first pixel (ABI 0.30), so there is nothing
+     * to offset: x and y say where it goes, not where it came from. */
+    const uint8_t *src = (const uint8_t *)b->px;
     for (uint16_t row = 0; row < hgt; row++) {
         const uint16_t *in = (const uint16_t *)(const void *)src;
         uint16_t        o = 0;

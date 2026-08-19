@@ -61,7 +61,7 @@ def read_config(sdkconfig, key, default):
     return default
 
 
-def stage(board_dir, apps_dir, out_dir):
+def stage(board_dir, apps_dir, out_dir, display=None):
     """Assemble what belongs on C:, from the board pack and the built images."""
     os.makedirs(out_dir, exist_ok=True)
     staged = []
@@ -72,6 +72,15 @@ def stage(board_dir, apps_dir, out_dir):
             raise SystemExit(f"mksysfs: {src} is missing")
         shutil.copy2(src, os.path.join(out_dir, name))
         staged.append(name)
+
+    # SYSTEM.CFG is read after BOARD.CFG and wins, so the override goes there
+    # rather than editing the board's own description of its hardware.
+    if display is not None:
+        with open(os.path.join(out_dir, "SYSTEM.CFG"), "a",
+                  encoding="utf-8") as f:
+            f.write("\n; Added by mksysfs --display\n"
+                    "[display]\n"
+                    f"driver = {display}\n")
 
     # Drivers, under the names SYSTEM.CFG spells: lower case, because that is
     # what `drv install` writes and littlefs does not fold case.
@@ -106,6 +115,13 @@ def main():
                     default=os.path.join(ROOT, "partitions_4mb.csv"))
     ap.add_argument("--sdkconfig", default=os.path.join(ROOT, "sdkconfig"))
     ap.add_argument("--out", default=os.path.join(ROOT, "build", "sysfs.bin"))
+    ap.add_argument("--display", choices=("soft", "panel", "none"),
+                    help="override [display] driver in the staged SYSTEM.CFG.  "
+                         "`soft` is a framebuffer the system owns and shares; "
+                         "`panel` is none at all, with applications bringing "
+                         "their own pixels (gfx->present) - which on this board "
+                         "is 37 KB of a 320 KB machine handed back; `none` is no "
+                         "graphics whatsoever")
     ap.add_argument("--flash", action="store_true",
                     help="write the image to the board as well")
     ap.add_argument("-p", "--port", help="serial port, for --flash")
@@ -117,7 +133,7 @@ def main():
 
     staged_dir = tempfile.mkdtemp(prefix="argon-sysfs-")
     try:
-        staged = stage(args.board, args.apps, staged_dir)
+        staged = stage(args.board, args.apps, staged_dir, args.display)
         os.makedirs(os.path.dirname(args.out), exist_ok=True)
 
         # The component's own tool, invoked the way its CMake does: block size
@@ -132,7 +148,8 @@ def main():
             raise SystemExit("mksysfs: littlefs-python is missing.  "
                              "pip install littlefs-python")
 
-        print(f"mksysfs: {args.out}  {size} bytes at 0x{offset:x}")
+        print(f"mksysfs: {args.out}  {size} bytes at 0x{offset:x}"
+              + (f"  [display] driver = {args.display}" if args.display else ""))
         for name in staged:
             print(f"  C:\\{name}")
     finally:

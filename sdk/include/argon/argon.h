@@ -532,6 +532,16 @@ static inline ag_err_t ag_gfx_acquire(ag_gfxinfo_t *o)
 {
     return g_ag_api->gfx->acquire(o);
 }
+/*
+ * Put pixels the caller owns on the panel.  See gfx->present in abi.h; use
+ * AG_HAS(ag_api()->gfx, present) before calling, because a kernel older than
+ * ABI 0.31 has no such entry.
+ */
+static inline ag_err_t ag_gfx_present(const ag_blit_t *b)
+{
+    return g_ag_api->gfx->present(b);
+}
+
 static inline void ag_gfx_release(void) { g_ag_api->gfx->release(); }
 static inline void ag_gfx_flush(uint16_t x, uint16_t y, uint16_t w, uint16_t h)
 {
