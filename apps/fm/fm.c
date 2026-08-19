@@ -730,6 +730,87 @@ static void choose_drive(int which)
     fm_message("");
 }
 
+/*
+ * A tap, in console cells.
+ *
+ * The touchscreen reports cells rather than pixels (ag_input_ops_t, ABI 0.28),
+ * which is why nothing here knows about pixels either - the same code answers a
+ * mouse click arriving over a serial terminal, and did before there was a
+ * touchscreen to test it with.
+ *
+ * The rules are the ones a hand expects and they are not the ones a mouse
+ * expects: there is no hover, no second button and no reliable double tap on a
+ * resistive panel pressed with a stylus.  So one tap does the obvious thing at
+ * each place, and the only two-step gesture is tapping what is already under
+ * the cursor - which is how a directory gets opened.
+ *
+ * Returns true when the whole screen has to be redrawn rather than just the
+ * cursor.
+ */
+static bool fm_tap(int col, int row, bool *quit)
+{
+    /* The key bar: eight columns per label, as draw_keys lays them out. */
+    if (row == FM_ROW_KEYS) {
+        switch (col / 8) {
+        case 0: fm_help(); return true;
+        case 1: (void)fm_reload(fm_active()); fm_message("reloaded"); return true;
+        case 2: fm_view(); return true;
+        case 3: fm_edit(); return true;
+        case 4: fm_copy(); return true;
+        case 5: fm_move(); return true;
+        case 6: fm_mkdir(); return true;
+        case 7: fm_delete(); return true;
+        case 9: *quit = true; return false;
+        default: return false;
+        }
+    }
+
+    for (int which = 0; which < 2; which++) {
+        const int x0 = g_lay.panel_x[which];
+        const int y0 = g_lay.panel_y[which];
+        if (col < x0 || col >= x0 + FM_PANEL_W) {
+            continue;
+        }
+        if (row < y0 || row >= y0 + FM_PANEL_ROWS) {
+            continue;
+        }
+
+        fm_panel_t *p = &g_panel[which];
+
+        /* The top border carries the path; tapping it means "this panel". */
+        if (row == y0 || row == y0 + FM_PANEL_ROWS - 1) {
+            if (which != g_active) {
+                g_active = which;
+                (void)ag_chdir(fm_active()->path);
+                return true;
+            }
+            return false;
+        }
+
+        const int index = p->top + (row - y0 - 1);
+        if (index < 0 || index >= p->count) {
+            return false;
+        }
+
+        if (which != g_active) {
+            /* Reaching into the other panel selects there and makes it the one
+             * a program would be started from - the same rule Tab follows. */
+            g_active = which;
+            p->cursor = index;
+            (void)ag_chdir(p->path);
+            return true;
+        }
+        if (index == p->cursor) {
+            enter_current();
+            return true;
+        }
+        p->cursor = index;
+        return false; /* the cursor moved and nothing else did */
+    }
+
+    return false;
+}
+
 int FM_ENTRY(int argc, char **argv)
 {
     /*
@@ -821,6 +902,7 @@ int FM_ENTRY(int argc, char **argv)
     fm_message("F1 for the keys");
     fm_ui_present();
 
+
     bool running = true;
     while (running) {
         if (ag_interrupted()) {
@@ -859,6 +941,21 @@ int FM_ENTRY(int argc, char **argv)
             exit_why = "QUIT while focused";
             break;
         }
+        if (ag_focused() && ev.type == AG_EV_POINTER_DOWN) {
+            bool quit = false;
+            const bool full = fm_tap(ev.ptr.x, ev.ptr.y, &quit);
+            if (quit) {
+                exit_why = "tapped 10Quit";
+                break;
+            }
+            if (full) {
+                fm_draw_all();
+            } else {
+                fm_draw_light();
+            }
+            continue;
+        }
+
         if (!ag_focused() || ev.type != AG_EV_KEY_DOWN) {
             continue;
         }
