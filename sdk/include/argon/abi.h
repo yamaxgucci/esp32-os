@@ -80,9 +80,11 @@ extern "C" {
  * 0.30 appended blit_rect to ag_display_ops_t: a rectangle of pixels the
  *      kernel owns, for a panel whose glass is larger than any framebuffer
  *      the machine driving it can afford.
+ * 0.31 appended gfx->present: an application's own pixels on the panel, for a
+ *      machine where the system framebuffer is absent or the wrong shape.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 30u
+#define AG_ABI_MINOR 31u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -500,6 +502,39 @@ typedef struct {
     int16_t y;
 } ag_point_t;
 
+/*
+ * A rectangle of somebody else's pixels (ABI 0.30).
+ *
+ * The memory belongs to the caller and outlives the call; the driver reads from
+ * it and returns.  Format is RGB565 in the machine's own byte order, which on
+ * every part this runs on is little endian - a panel that wants the other order
+ * swaps as it sends, because it is streaming the bytes anyway.
+ *
+ * `px` is the first pixel *of the rectangle*, not of the surface.
+ *
+ * That is worth being exact about, because the obvious alternative - the corner
+ * of the whole picture, with x and y as an offset into it - quietly requires the
+ * caller to hold the whole picture in memory.  A renderer that produces sixteen
+ * rows at a time, which is what an emulator's scanline loop produces and what
+ * fits on a machine like this, has no such corner to point at.  With the
+ * rectangle's own origin it hands over the band it just filled and says where
+ * on the screen it goes.
+ *
+ * Both the whole surface and the changed part are described, because a driver
+ * cannot place the one without knowing the other: a screen 320 pixels wide
+ * showing a surface of 160 has a choice to make about scale and margins, and it
+ * has to make the same choice for every rectangle or the picture tears itself
+ * apart.  So surf_w/surf_h are the picture, x/y/w/h are the part, and px is
+ * where that part's pixels actually are.
+ */
+typedef struct {
+    const void *px;     /* first pixel of the rectangle, RGB565              */
+    uint32_t    stride; /* bytes between rows of px                          */
+    uint16_t    surf_w; /* the whole picture, for placement                  */
+    uint16_t    surf_h;
+    uint16_t    x, y, w, h; /* where the rectangle is in it, and how big     */
+} ag_blit_t;
+
 typedef struct ag_gfx_api {
     uint32_t size;
 
@@ -585,6 +620,33 @@ typedef struct ag_gfx_api {
      */
     void (*poly_uv)(int16_t u, int16_t v);
     void (*poly_fill_tex)(void);
+
+    /*
+     * ABI 0.31: the application's own pixels, straight onto the panel.
+     *
+     * acquire() hands out the system's framebuffer - one surface, shared by
+     * every application, sized once at boot for all of them.  That is the right
+     * arrangement until the surface is a fifth of all the memory there is: an
+     * emulator with a 160x144 screen, sixteen kilobytes of video memory and a
+     * cartridge to hold cannot pay for the system's surface as well as its own,
+     * and the system's is the one it cannot use.
+     *
+     * So it may bring its own.  The caller owns the memory, says how big the
+     * whole picture is and which part of it changed; the panel driver places
+     * it, at whole-number scale, centred (see blit_rect in ag_display_ops_t).
+     * Nothing is copied on the way - the pixels go from the caller's buffer to
+     * the panel - so the buffer must not be a stack local that has gone by the
+     * time this returns, and it does not return until they are sent.
+     *
+     * The display still has to be acquired: this says who owns the pixels, not
+     * who owns the screen.  Where the system has no surface at all
+     * ([display] driver = panel), acquire() still works and reports fb = NULL
+     * with the panel's own size, and this is then the only way to draw.
+     *
+     * -AG_ENODEV when nothing can show it, -AG_EPERM when the display belongs
+     * to somebody else.
+     */
+    ag_err_t (*present)(const ag_blit_t *b);
 } ag_gfx_api_t;
 
 /*
@@ -620,28 +682,6 @@ typedef struct {
     uint8_t ch;
     uint8_t attr;
 } ag_textcell_t;
-
-/*
- * A rectangle of somebody else's pixels (ABI 0.30).
- *
- * The surface belongs to the caller and outlives the call; the driver reads
- * from it and returns.  Format is RGB565 in the machine's own byte order,
- * which on every part this runs on is little endian - a panel that wants the
- * other order swaps as it sends, because it is streaming the bytes anyway.
- *
- * Both the whole surface and the changed part are given, because a driver
- * cannot place the one without knowing the other: a screen 320 pixels wide
- * showing a surface of 160 has a choice to make about scale and margins, and
- * it has to make the same choice for every rectangle or the picture tears
- * itself apart.
- */
-typedef struct {
-    const void *px;     /* top-left of the surface, RGB565                   */
-    uint32_t    stride; /* bytes between rows of px                          */
-    uint16_t    surf_w;
-    uint16_t    surf_h;
-    uint16_t    x, y, w, h; /* the changed part, in surface pixels           */
-} ag_blit_t;
 
 /*
  * Class vtable for AG_DEV_DISPLAY devices, returned by dev->ops(h).

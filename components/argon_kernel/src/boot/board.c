@@ -217,6 +217,13 @@ ag_err_t ag_board_apply_config(const ag_cfg_t *cfg)
 
     apply_bus_config(cfg);
 
+    /*
+     * display.driver is one of three words and they are not variations on a
+     * theme: `soft` is a framebuffer the system owns and shares, `panel` is no
+     * framebuffer at all with applications bringing their own pixels, and `none`
+     * is no graphics whatsoever.  On a board with 320 KB of SRAM the difference
+     * between the first two is a fifth of the machine.
+     */
     const char *disp = ag_cfg_get(cfg, "display.driver", NULL);
     if (disp != NULL && disp[0] != '\0') {
         snprintf(s_board.display.driver, sizeof(s_board.display.driver), "%s",
