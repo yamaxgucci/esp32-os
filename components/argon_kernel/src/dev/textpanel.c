@@ -88,8 +88,35 @@ void ag_inputpoll_tick(void)
         }
         ag_dev_lock_release();
 
+        /*
+         * Clamped to the screen, because the driver cannot know where it
+         * ends.  A panel holds a whole number of cells and the console is
+         * whatever fits the system: 320x240 is forty by thirty, the console is
+         * forty by twenty-five, and the last five rows of glass are below the
+         * bottom of the screen.  A tap there is still a tap and belongs to the
+         * nearest row rather than to nowhere.
+         */
+        const ag_screen_t *screen = ag_console_screen();
         for (int32_t e = 0; e < n && e < 4; e++) {
-            (void)ag_console_inject_event(&evs[e]);
+            ag_event_t *ev = &evs[e];
+            if (screen != NULL &&
+                (ev->type == AG_EV_POINTER_DOWN ||
+                 ev->type == AG_EV_POINTER_UP ||
+                 ev->type == AG_EV_POINTER_MOVE)) {
+                if (ev->ptr.x < 0) {
+                    ev->ptr.x = 0;
+                }
+                if (ev->ptr.y < 0) {
+                    ev->ptr.y = 0;
+                }
+                if (ev->ptr.x >= (int16_t)screen->cols) {
+                    ev->ptr.x = (int16_t)(screen->cols - 1);
+                }
+                if (ev->ptr.y >= (int16_t)screen->rows) {
+                    ev->ptr.y = (int16_t)(screen->rows - 1);
+                }
+            }
+            (void)ag_console_inject_event(ev);
         }
     }
 }
