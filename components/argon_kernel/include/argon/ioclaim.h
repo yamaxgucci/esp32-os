@@ -115,6 +115,18 @@ uint32_t ag_io_release_owner(ag_pid_t owner, ag_io_release_fn release,
 /* -AG_ERANGE for a pin the chip does not have. */
 ag_err_t ag_io_pin_info(int pin, ag_pin_info_t *out);
 
+/*
+ * How many pin writes were dropped because whoever made them did not hold the
+ * pin, and the last of them.
+ *
+ * A permission check with no else branch is a silence, and this one was: a
+ * driver writing to its own line had the write discarded because the claim was
+ * the kernel's while the call arrived on an application's task, and nothing
+ * anywhere said so.  `io` prints these numbers; io.c explains why they are
+ * counted rather than logged.
+ */
+uint32_t ag_io_refused(int *pin, ag_pid_t *pid);
+
 /* How many pins are reserved or held, for `io` and for leak checks. */
 uint32_t ag_io_claimed_count(void);
 
