@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <argon/audio.h>
 #include <argon/board.h>
 #include <argon/cmdline.h>
 #include <argon/codepage.h>
@@ -2408,6 +2409,118 @@ static int cmd_fg(int argc, char **argv)
     return 0;
 }
 
+/*
+ * A tone, for finding out whether this machine can make a sound at all.
+ *
+ * /dev/pcm0 exists only where the port has an output (argon/port/audio.h), so
+ * on a board with nothing wired up this says so, rather than playing into a
+ * sink that discards it - which is the whole question being asked.
+ */
+
+/*
+ * A sine without a table and without floating point.
+ *
+ * Phase runs 0..65535 over one turn and the curve is the parabola 4x(1-|x|),
+ * which follows a sine to within about four percent.  That is a distortion
+ * floor near -25 dB, and what it feeds is an eight-bit converter whose own
+ * floor is -48 dB and a speaker the size of a coin.
+ */
+static int16_t beep_sine(uint16_t phase)
+{
+    const int32_t t = (int32_t)phase - 32768;
+    const int32_t a = (t < 0) ? -t : t;
+    const int32_t y = (t * (32768 - a)) >> 13;
+    return (int16_t)(y > 32767 ? 32767 : y);
+}
+
+static int cmd_beep(int argc, char **argv)
+{
+    unsigned hz = 880u;
+    unsigned ms = 300u;
+
+    if (argc > 1) {
+        hz = (unsigned)strtoul(argv[1], NULL, 10);
+    }
+    if (argc > 2) {
+        ms = (unsigned)strtoul(argv[2], NULL, 10);
+    }
+    if (hz < 30u || hz > 8000u || ms == 0u || ms > 10000u) {
+        ag_console_printf("usage: beep [hz 30..8000] [ms 1..10000]\n");
+        return 1;
+    }
+
+    ag_device_t *dev = ag_dev_find("pcm0");
+    if (dev == NULL) {
+        ag_console_printf(
+            "no sound output on this machine (/dev/pcm0 is absent)\n");
+        return 1;
+    }
+
+    ag_err_t err = ag_dev_open(dev, AG_O_WRONLY);
+    if (err != AG_OK) {
+        ag_console_printf("pcm0: %d\n", (int)err);
+        return 1;
+    }
+
+    const uint32_t rate = 22050u;
+    ag_audio_fmt_t fmt = {rate, 1u, 16u};
+    err = ag_dev_ioctl(dev, AG_IOC_AUDIO_SETFMT, &fmt, sizeof(fmt));
+    if (err != AG_OK) {
+        (void)ag_dev_close(dev);
+        ag_console_printf("pcm0 setfmt: %d\n", (int)err);
+        return 1;
+    }
+
+    const uint32_t total = (rate * ms) / 1000u;
+    /* Phase advances by a whole turn every rate/hz samples, and a turn is
+     * 65536, so this is the step per sample. */
+    const uint16_t step = (uint16_t)(((uint64_t)hz << 16) / rate);
+    /* Five milliseconds of fade at each end, or a tenth of the tone if it is
+     * shorter than that: without it the start and the stop are clicks of
+     * their own and the tone is not what is being heard. */
+    uint32_t ramp = rate / 200u;
+    if (ramp > total / 10u) {
+        ramp = total / 10u;
+    }
+
+    int16_t  buf[128];
+    uint16_t phase = 0;
+    uint32_t sent = 0;
+
+    while (sent < total) {
+        uint32_t n = total - sent;
+        if (n > (uint32_t)(sizeof(buf) / sizeof(buf[0]))) {
+            n = (uint32_t)(sizeof(buf) / sizeof(buf[0]));
+        }
+        for (uint32_t i = 0; i < n; i++) {
+            const int32_t  v = beep_sine(phase);
+            const uint32_t at = sent + i;
+            int32_t        gain = 192; /* of 256: room under the rails */
+
+            phase = (uint16_t)(phase + step);
+            if (ramp != 0u) {
+                if (at < ramp) {
+                    gain = (int32_t)((192u * at) / ramp);
+                } else if (at + ramp > total) {
+                    gain = (int32_t)((192u * (total - at)) / ramp);
+                }
+            }
+            buf[i] = (int16_t)((v * gain) >> 8);
+        }
+        const int32_t wrote =
+            ag_dev_write(dev, buf, (size_t)n * sizeof(int16_t), 0);
+        if (wrote <= 0) {
+            ag_console_printf("pcm0 write: %d\n", (int)wrote);
+            break;
+        }
+        sent += n;
+    }
+
+    (void)ag_dev_close(dev);
+    ag_console_printf("%u Hz for %u ms on /dev/pcm0\n", hz, ms);
+    return 0;
+}
+
 static const ag_command_t k_commands[] = {
     {"help", "", "list these commands", cmd_help},
     {"ver", "", "version and hardware", cmd_ver},
@@ -2427,6 +2540,7 @@ static const ag_command_t k_commands[] = {
     {"drv", "[load|unload|install|uninstall|probe]",
      "modules: list, load, install to C:, unload, I2C probe", cmd_drv},
     {"io", "[pin [mode]] | i2c <bus> | adc [ch]", "pins and buses", cmd_io},
+    {"beep", "[hz] [ms]", "a tone on /dev/pcm0", cmd_beep},
 #if AG_PORT_HAS_WIFI
     {"wifi", "[on|off|scan|connect <ssid> [pass]|forget]", "the radio",
      cmd_wifi},

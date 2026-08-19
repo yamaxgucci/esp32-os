@@ -25,6 +25,7 @@ set(ARGON_KERNEL_SRCS
     "src/dev/btinput.c"
     "src/dev/audio.c"
     "src/dev/pcmmix.c"
+    "src/dev/pcmhw.c"
     "src/dev/draw.c"
     "src/dev/font8x16.c"
     "src/dev/ioclaim.c"

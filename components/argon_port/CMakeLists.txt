@@ -52,6 +52,14 @@ if(CONFIG_ARGON_ENABLE_ADC)
     target_link_libraries(${COMPONENT_LIB} PRIVATE ${adc_lib})
 endif()
 
+# Sound, off by default for the same shape of reason: the converters this uses
+# exist on the original ESP32 only, and QEMU models neither them nor their DMA.
+# See ARGON_ENABLE_AUDIO in argon_kernel.
+if(CONFIG_ARGON_ENABLE_AUDIO)
+    idf_component_get_property(dac_lib esp_driver_dac COMPONENT_LIB)
+    target_link_libraries(${COMPONENT_LIB} PRIVATE ${dac_lib})
+endif()
+
 if(ARGON_PORT_SRCS)
     target_compile_options(${COMPONENT_LIB} PRIVATE
         -Wall -Wextra -Werror=implicit-function-declaration
