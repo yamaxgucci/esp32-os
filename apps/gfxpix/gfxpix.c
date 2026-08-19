@@ -6,24 +6,30 @@
  * surface is 160x120: when it stops, the question "did the pixels reach the
  * glass" is tangled up with a dozen clipping paths it also just walked.
  *
- * Two modes, and the second exists because of how the first failed.
+ * Two modes, and both exist because of how a previous one was ambiguous.
  *
- *   gfxpix [seconds]   four corner squares and a word, held.  Says whether the
- *                      surface reaches the glass the right way round: a
- *                      mirrored or rotated panel shows up as the wrong corner
- *                      being red.
+ *   gfxpix [seconds]   a circle, a diagonal and four corner squares, held.
+ *
+ *                      The circle is the point: a text mode cannot draw one.
+ *                      Anybody glancing at the board can say "graphics" or
+ *                      "characters" without knowing anything else, and half a
+ *                      circle says half the frame arrived.  The corners are
+ *                      each a different colour, so a mirrored or rotated
+ *                      surface shows up as the wrong corner being red.
  *
  *   gfxpix cycle [n]   the whole surface, one flat colour at a time, changing
- *                      every second, n times.  For when "there was no picture"
- *                      has to be told apart from "the panel went black" and
- *                      from "the console text stayed" - three different faults
- *                      that look alike to somebody glancing at a board.  A flat
- *                      colour that changes cannot be mistaken for any of them.
+ *                      every second, n times.  For telling "there was no
+ *                      picture" apart from "the panel went black" and from "the
+ *                      console text stayed" - three different faults that look
+ *                      alike at a glance.
  *
- * Every step prints, and the flushes are timed: a whole 320x240 frame over SPI
- * is tens of milliseconds, while a flush that reached no driver at all is tens
- * of microseconds.  That number says whether the pixels were sent without
- * anybody having to watch the board.
+ * Every step prints, and the flushes are timed, which says whether the pixels
+ * were sent without anybody watching the board: a whole 320x240 frame over SPI
+ * is tens of milliseconds and a flush that reached no driver is tens of
+ * microseconds.  Careful with the converse - equal time does *not* mean the
+ * frame landed where it should.  Three hundred small SPI transactions cost the
+ * same as three hundred large ones, and a whole frame once went into a single
+ * 8x8 character cell in exactly the same 55 ms as a correct one.
  *
  *   python tools/mkaxe.py --arch xtensa --gcc xtensa-esp32-elf-gcc \
  *       --include sdk/include -o build/apps/GFXPIX.AXE apps/gfxpix/gfxpix.c
@@ -33,7 +39,7 @@
 #include <argon/argon.h>
 #include <argon/keys.h>
 
-AG_APP("GFXPIX", "1.1", "argon", AG_AXE_NEEDS_GFX);
+AG_APP("GFXPIX", "1.2", "argon", AG_AXE_NEEDS_GFX);
 
 /* Digits, by hand: the SDK has no atoi and two arguments are not a reason to
  * want one. */
@@ -50,7 +56,6 @@ static uint32_t number(const char *s)
     return v;
 }
 
-/* Flat fill, flushed and timed. */
 static void show_flat(uint16_t w, uint16_t h, uint32_t rgb, const char *name)
 {
     const ag_time_t t0 = ag_micros();
@@ -58,6 +63,34 @@ static void show_flat(uint16_t w, uint16_t h, uint32_t rgb, const char *name)
     ag_gfx_flush(0, 0, w, h);
     const ag_time_t t1 = ag_micros();
     ag_printf("%s in %u us\n", name, (unsigned)(t1 - t0));
+}
+
+static void draw_scene(uint16_t w, uint16_t h)
+{
+    const uint16_t qw = (uint16_t)(w / 5);
+    const uint16_t qh = (uint16_t)(h / 5);
+
+    ag_gfx_clear(0x00000080u); /* navy, so an untouched panel is obvious */
+
+    /* The whole point of this picture: characters cannot be round. */
+    {
+        const uint16_t r = (uint16_t)(((w < h) ? h : w) / 2u - 2u);
+        const uint16_t rr = (uint16_t)(((w < h) ? w : h) / 2u - 2u);
+        ag_gfx_fill_circle((int16_t)(w / 2), (int16_t)(h / 2),
+                           (rr < r) ? rr : r, 0x00E0C040u);
+        ag_gfx_circle((int16_t)(w / 2), (int16_t)(h / 2),
+                      (uint16_t)(((rr < r) ? rr : r) - 3u), 0x00202020u);
+    }
+
+    /* Two diagonals: a broken window or a wrong stride bends them. */
+    ag_gfx_line(0, 0, (int16_t)(w - 1), (int16_t)(h - 1), 0x00FFFFFFu);
+    ag_gfx_line(0, (int16_t)(h - 1), (int16_t)(w - 1), 0, 0x00FFFFFFu);
+
+    /* One corner each, so a mirrored or rotated surface shows up as such. */
+    ag_gfx_fill_rect(0, 0, qw, qh, 0x00FF0000u);
+    ag_gfx_fill_rect((int16_t)(w - qw), 0, qw, qh, 0x0000FF00u);
+    ag_gfx_fill_rect(0, (int16_t)(h - qh), qw, qh, 0x00FFFF00u);
+    ag_gfx_fill_rect((int16_t)(w - qw), (int16_t)(h - qh), qw, qh, 0x00FFFFFFu);
 }
 
 int ag_main(int argc, char **argv)
@@ -107,37 +140,26 @@ int ag_main(int argc, char **argv)
         return 0;
     }
 
-    ag_gfx_clear(0x00000080u); /* navy, so an untouched panel is obvious */
-    ag_printf("2 cleared\n");
-
-    /* One corner each, so a mirrored or rotated surface shows up as such. */
-    ag_gfx_fill_rect(0, 0, (uint16_t)(w / 4), (uint16_t)(h / 4), 0x00FF0000u);
-    ag_gfx_fill_rect((int16_t)(w - w / 4), 0, (uint16_t)(w / 4),
-                     (uint16_t)(h / 4), 0x0000FF00u);
-    ag_gfx_fill_rect(0, (int16_t)(h - h / 4), (uint16_t)(w / 4),
-                     (uint16_t)(h / 4), 0x00FFFF00u);
-    ag_gfx_fill_rect((int16_t)(w - w / 4), (int16_t)(h - h / 4),
-                     (uint16_t)(w / 4), (uint16_t)(h / 4), 0x00FFFFFFu);
-    ag_printf("3 corners\n");
-
-    (void)ag_gfx_text(4, (int16_t)(h / 2 - 8), "GFXPIX", 0x00FFFFFFu,
-                      0x00000080u);
-    ag_printf("4 text\n");
+    draw_scene(w, h);
+    ag_printf("2 drawn\n");
 
     {
         const ag_time_t t0 = ag_micros();
         ag_gfx_flush(0, 0, w, h);
         const ag_time_t t1 = ag_micros();
-        ag_gfx_flush(0, 0, w, h);
-        const ag_time_t t2 = ag_micros();
-        ag_printf("5 flushed: first %u us, second %u us\n",
-                  (unsigned)(t1 - t0), (unsigned)(t2 - t1));
+        ag_printf("3 flushed in %u us\n", (unsigned)(t1 - t0));
     }
 
+    /*
+     * Nothing is printed while it is held.  Printing scrolls the console, and
+     * although the panel is not repainted while an application owns it, the
+     * scroll is waiting to appear the moment it lets go - which is what made
+     * the last run look like "the bottom half is green".
+     */
     if (hold_s != 0) {
         ag_delay(hold_s * 1000u);
-        ag_printf("6 held %u s\n", (unsigned)hold_s);
         ag_gfx_release();
+        ag_printf("4 held %u s\n", (unsigned)hold_s);
         return 0;
     }
 
