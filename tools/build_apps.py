@@ -24,6 +24,35 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MANIFEST = os.path.join(ROOT, "tools", "apps.json")
 MKAXE = os.path.join(ROOT, "tools", "mkaxe.py")
 
+# Which compiler belongs to which chip.
+#
+# This is not a preference.  The two Xtensa cores are not the same instruction
+# set: the S3 is an LX7 and the original ESP32 an LX6, and GCC for the S3 emits
+# LX7 instructions the older core does not have - SALTU, for one, which is what
+# it lowers a plain `a < b` value into.  Such an image loads, relocates, runs,
+# and dies the moment it reaches that instruction, with EXCCAUSE 0 and a PC in
+# the middle of what disassembles - under the ESP32's own objdump, which does
+# not know the opcode - as something from the floating point unit.
+#
+# Nothing about that says "wrong compiler", which is why it cost a day.  So the
+# compiler is chosen from the target the firmware is built for, and printed.
+GCC_FOR_TARGET = {
+    "esp32": "xtensa-esp32-elf-gcc",
+    "esp32s3": "xtensa-esp32s3-elf-gcc",
+}
+
+
+def target_from_sdkconfig():
+    """The chip the current build is for, or None if there is no build yet."""
+    try:
+        with open(os.path.join(ROOT, "sdkconfig"), encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("CONFIG_IDF_TARGET="):
+                    return line.split("=", 1)[1].strip().strip('"')
+    except OSError:
+        pass
+    return None
+
 
 def load_manifest():
     with open(MANIFEST, encoding="utf-8") as f:
@@ -59,15 +88,28 @@ def main():
                     help="append -Wall -Wextra to every image")
     ap.add_argument("--list", action="store_true", help="print the list and stop")
     ap.add_argument("--gcc", default=None,
-                    help="compiler for every image, overriding tools/apps.json "
-                         "(xtensa-esp32-elf-gcc for the original ESP32; the "
-                         "manifest names the S3 one, and an S3 image loaded on "
-                         "an ESP32 is a fault at the entry point, not a refusal)")
+                    help="compiler for every image, overriding both the target "
+                         "and tools/apps.json.  Rarely wanted: the default now "
+                         "follows CONFIG_IDF_TARGET, and building for the wrong "
+                         "core is an illegal instruction at run time, not a "
+                         "refusal at build time (see GCC_FOR_TARGET)")
     args = ap.parse_args()
 
     manifest = load_manifest()
     defaults = manifest["defaults"]
     apps = manifest["apps"]
+
+    # The manifest names a compiler, but the chip decides, and the chip is
+    # whatever `argon target` last configured.  An explicit --gcc still wins.
+    gcc = args.gcc
+    if gcc is None:
+        target = target_from_sdkconfig()
+        gcc = GCC_FOR_TARGET.get(target)
+        if gcc is None and target is not None:
+            print(f"build_apps: unknown target '{target}', using the manifest's "
+                  f"{defaults['gcc']}")
+    if gcc is None:
+        gcc = defaults["gcc"]
 
     if args.only:
         wanted = {name.upper() for name in args.only}
@@ -97,7 +139,7 @@ def main():
     for i, app in enumerate(apps, 1):
         name = app["out"]
         print(f"[{i}/{len(apps)}] {name}", flush=True)
-        proc = subprocess.run(command_for(app, defaults, extra, args.gcc),
+        proc = subprocess.run(command_for(app, defaults, extra, gcc),
                               cwd=ROOT)
         if proc.returncode != 0:
             failed.append(name)
@@ -105,9 +147,10 @@ def main():
     took = time.time() - started
     if failed:
         print(f"\napps: {len(failed)} of {len(apps)} FAILED "
-              f"({', '.join(failed)}) in {took:.0f}s", file=sys.stderr)
+              f"({', '.join(failed)}) with {gcc} in {took:.0f}s",
+              file=sys.stderr)
         return 1
-    print(f"\napps: {len(apps)} images built in {took:.0f}s")
+    print(f"\napps: {len(apps)} images built by {gcc} in {took:.0f}s")
     return 0
 
 
