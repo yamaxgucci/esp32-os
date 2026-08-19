@@ -224,11 +224,47 @@ static ag_err_t io_gpio_config(int pin, int mode)
     return err;
 }
 
+/*
+ * Refused writes, counted.
+ *
+ * A permission check with no else branch is not a permission check; it is a
+ * silence.  This one cost a day: a driver's writes to its own data/command line
+ * were dropped because the claim belonged to the kernel and the call arrived on
+ * an application's task, and the only symptom anywhere in the system was a
+ * picture in the wrong place.
+ *
+ * Logging from here is not allowed - the caller may be a driver, holding the
+ * device registry, and the console task takes the console first and the
+ * registry second, so reaching for the console here closes a ring.  So the
+ * refusal is remembered and `io` prints it.  One line at the bottom of a table
+ * somebody looks at anyway is worth more than a message nobody can print.
+ */
+static struct {
+    uint32_t count;
+    int16_t  pin;
+    ag_pid_t pid;
+} s_refused = {0, -1, 0};
+
+uint32_t ag_io_refused(int *pin, ag_pid_t *pid)
+{
+    if (pin != NULL) {
+        *pin = s_refused.pin;
+    }
+    if (pid != NULL) {
+        *pid = s_refused.pid;
+    }
+    return s_refused.count;
+}
+
 static void io_gpio_write(int pin, int level)
 {
     lock();
     if (valid_pin(pin) && ag_io_held_by(pin, caller())) {
         ag_port_gpio_write(pin, level);
+    } else if (valid_pin(pin)) {
+        s_refused.count++;
+        s_refused.pin = (int16_t)pin;
+        s_refused.pid = caller();
     }
     unlock();
 }

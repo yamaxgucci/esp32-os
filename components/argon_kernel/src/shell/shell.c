@@ -2151,6 +2151,22 @@ static int cmd_io(int argc, char **argv)
     /* The free ones are not listed - there are forty of them and they all say
      * the same thing - but the count is what tells you there is room. */
     ag_console_printf("%u of %d pins free\n", (unsigned)(pins - shown), pins);
+
+    /*
+     * And what was refused.  A dropped write leaves no other trace anywhere in
+     * the system: the API returns nothing, the pin does not move, and whatever
+     * was being driven simply misbehaves.  This line is where that becomes
+     * visible.
+     */
+    int      bad_pin = -1;
+    ag_pid_t bad_pid = 0;
+    const uint32_t refused = ag_io_refused(&bad_pin, &bad_pid);
+    if (refused != 0) {
+        ag_console_printf("%u write%s refused - last pin %d by pid %u "
+                          "(not its claim)\n",
+                          (unsigned)refused, (refused == 1u) ? "" : "s",
+                          bad_pin, (unsigned)bad_pid);
+    }
     return 0;
 }
 
