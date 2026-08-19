@@ -93,7 +93,7 @@ bool fm_ask(const char *prompt, char *buf, size_t len)
 
 bool fm_confirm(const char *question)
 {
-    char line[FM_COLS];
+    char line[FM_LINE_MAX];
 
     ag_strlcpy(line, question, sizeof(line));
     ag_strlcat(line, "  [y/N]", sizeof(line));
@@ -195,7 +195,7 @@ void fm_view(void)
     bool      viewing = true;
 
     while (viewing) {
-        char header[FM_COLS];
+        char header[FM_LINE_MAX];
         char number[24];
         ag_strlcpy(header, " ", sizeof(header));
         ag_strlcat(header, e->name, sizeof(header));
@@ -216,7 +216,7 @@ void fm_view(void)
 
         for (int row = 0; row < rows; row++) {
             const int index = top + row;
-            char      out[FM_COLS + 1];
+            char      out[FM_LINE_MAX];
             int       n = 0;
 
             if (index < line_count) {
@@ -424,8 +424,8 @@ static void copy_progress(const char *label, uint64_t done, uint64_t total)
     const int y = FM_COPY_DLG_Y;
     const int inner = w - 4;
     char      number[24];
-    char      title[FM_COLS];
-    char      status[FM_COLS];
+    char      title[FM_LINE_MAX];
+    char      status[FM_LINE_MAX];
 
     fm_ui_fill(x, y, w, h, ' ', FM_ATTR_DIALOG);
     fm_frame(x, y, w, h, FM_ATTR_DIALOG);
@@ -609,7 +609,7 @@ void fm_copy(void)
     char answer[AG_PATH_MAX];
     ag_strlcpy(answer, fm_other()->path, sizeof(answer));
 
-    char prompt[FM_COLS];
+    char prompt[FM_LINE_MAX];
     ag_strlcpy(prompt, "Copy ", sizeof(prompt));
     ag_strlcat(prompt, e->name, sizeof(prompt));
     ag_strlcat(prompt, " to:", sizeof(prompt));
@@ -656,7 +656,7 @@ void fm_move(void)
     char answer[AG_PATH_MAX];
     ag_strlcpy(answer, fm_other()->path, sizeof(answer));
 
-    char prompt[FM_COLS];
+    char prompt[FM_LINE_MAX];
     ag_strlcpy(prompt, "Move or rename ", sizeof(prompt));
     ag_strlcat(prompt, e->name, sizeof(prompt));
     ag_strlcat(prompt, " to:", sizeof(prompt));
@@ -678,7 +678,7 @@ void fm_move(void)
      * two.  Rather than explain that, offer the thing the user meant.
      */
     if (err != AG_OK && !e->is_dir) {
-        char question[FM_COLS];
+        char question[FM_LINE_MAX];
         ag_strlcpy(question, "Cannot rename across drives (", sizeof(question));
         ag_strlcat(question, ag_strerror(err), sizeof(question));
         ag_strlcat(question, "). Copy and delete instead?", sizeof(question));
@@ -733,7 +733,7 @@ void fm_delete(void)
         return;
     }
 
-    char question[FM_COLS];
+    char question[FM_LINE_MAX];
     ag_strlcpy(question, "Delete ", sizeof(question));
     ag_strlcat(question, e->is_dir ? "directory " : "", sizeof(question));
     ag_strlcat(question, e->name, sizeof(question));
@@ -791,7 +791,7 @@ void fm_run(const fm_entry_t *entry)
     const char *argv[1] = {path};
     const int32_t status = ag_exec(path, 1, argv);
 
-    char note[FM_COLS];
+    char note[FM_LINE_MAX];
     char number[24];
     ag_strlcpy(note, entry->name, sizeof(note));
     ag_strlcat(note, " finished with ", sizeof(note));

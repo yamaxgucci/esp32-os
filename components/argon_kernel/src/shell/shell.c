@@ -2187,7 +2187,14 @@ static int cmd_fm(int argc, char **argv)
     const ag_err_t err = ag_proc_spawn_builtin(
         "FM", ag_fm_main, argc, argv,
         (uint32_t)AG_SPAWN_BACKGROUND | (uint32_t)AG_SPAWN_NO_SESSION,
-        8u * 1024u, 256u * 1024u, &pid);
+        /*
+         * The default arena rather than a quarter of a megabyte.  A fixed
+         * request is a refusal to start on any machine that does not have it,
+         * and this board has 93 KB free in total: `fm` answered "asked for a
+         * 256 KB arena; there is none".  The panels now take what they are
+         * given and show fewer names when that is less.
+         */
+        8u * 1024u, 0u, &pid);
     if (err != AG_OK) {
         ag_console_printf("fm: could not start (%d)\n", (int)err);
         return 1;
