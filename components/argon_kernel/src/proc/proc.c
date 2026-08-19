@@ -35,6 +35,14 @@
 /* Stack, in bytes, and the arena an application allocates from. */
 #define AG_PROC_STACK_MIN (2u * 1024u)
 #define AG_PROC_STACK_MAX (64u * 1024u)
+
+/*
+ * The floor for an image that names its own stack.  The load runs on the
+ * process's own task - it opens a file, walks a filesystem and relocates - so
+ * the number an application would be happy with is not necessarily one it can
+ * be loaded on.
+ */
+#define AG_PROC_LOAD_STACK_MIN (8u * 1024u)
 #ifndef CONFIG_ARGON_APP_STACK_KB
 #define CONFIG_ARGON_APP_STACK_KB 16
 #endif
@@ -647,6 +655,18 @@ ag_err_t ag_proc_set_priority(ag_pid_t pid, ag_proc_prio_t prio)
  */
 static ag_err_t proc_finish_load(proc_t *p)
 {
+    /*
+     * What is left before the image is read.
+     *
+     * The stack and the session's screens are already taken by the time this
+     * runs, and on a small machine that is most of the difference between what
+     * `mem` shows at a prompt and what a load actually has to work with.  It was
+     * fifty kilobytes here, and looking for it in the wrong place cost an hour.
+     */
+    ag_log(AG_LOG_INFO, "proc", "%s: loading with %u free, largest %u",
+           p->name, (unsigned)ag_port_mem_free(AG_MEM_FAST | AG_MEM_BYTE),
+           (unsigned)ag_port_mem_largest(AG_MEM_FAST | AG_MEM_BYTE));
+
     ag_err_t err = ag_loader_load(p->path, p->cwd, &p->app);
     if (err != AG_OK) {
         ag_log(AG_LOG_ERROR, "proc", "pid %u: load %s failed (%d)",
@@ -917,8 +937,31 @@ ag_err_t ag_proc_spawn(const char *path, int argc, char **argv, uint32_t flags,
         return err;
     }
 
-    /* Sized for load + typical app; header may ask for less after load. */
-    p->stack_bytes = clamp_stack_bytes(0);
+    /*
+     * What the image asks for, read before the task exists.
+     *
+     * A stack cannot be resized once a task is running on it, so the number has
+     * to come from somewhere before then, and the only honest source is the
+     * image.  A failure to read it here is not fatal - the default is a working
+     * answer and the real load will report the same problem properly - so the
+     * header is a hint at this point and nothing more.
+     */
+    {
+        ag_axe_header_t peek;
+        uint32_t        want = 0;
+        if (ag_loader_peek(p->path, p->cwd, &peek) == AG_OK) {
+            want = peek.stack_size;
+        }
+        /*
+         * Never below what loading itself needs: the image is read on this very
+         * task, through the filesystem, and an image that asks for two
+         * kilobytes would overflow before its first instruction ran.
+         */
+        if (want != 0 && want < AG_PROC_LOAD_STACK_MIN) {
+            want = AG_PROC_LOAD_STACK_MIN;
+        }
+        p->stack_bytes = clamp_stack_bytes(want);
+    }
 
     err = spawn_common(p, flags, out_pid);
     if (err != AG_OK) {

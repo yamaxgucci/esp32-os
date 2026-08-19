@@ -61,7 +61,7 @@ def read_config(sdkconfig, key, default):
     return default
 
 
-def stage(board_dir, apps_dir, out_dir, display=None):
+def stage(board_dir, apps_dir, out_dir, display=None, extra=()):
     """Assemble what belongs on C:, from the board pack and the built images."""
     os.makedirs(out_dir, exist_ok=True)
     staged = []
@@ -101,6 +101,15 @@ def stage(board_dir, apps_dir, out_dir, display=None):
         shutil.copy2(src, os.path.join(drv_dir, image.lower()))
         staged.append("drv/" + image.lower())
 
+    for spec in extra:
+        host, _, name = spec.partition("=")
+        if not name:
+            name = os.path.basename(host)
+        if not os.path.isfile(host):
+            raise SystemExit(f"mksysfs: {host} is missing")
+        shutil.copy2(host, os.path.join(out_dir, name))
+        staged.append(name)
+
     return staged
 
 
@@ -122,6 +131,12 @@ def main():
                          "their own pixels (gfx->present) - which on this board "
                          "is 37 KB of a 320 KB machine handed back; `none` is no "
                          "graphics whatsoever")
+    ap.add_argument("--add", action="append", default=[], metavar="HOST[=NAME]",
+                    help="put another file on C: as well, repeatable.  For "
+                         "anything big enough that sending it through the "
+                         "console would be a wait - a cartridge, an "
+                         "application - since this goes in with the same "
+                         "esptool run as the firmware")
     ap.add_argument("--flash", action="store_true",
                     help="write the image to the board as well")
     ap.add_argument("-p", "--port", help="serial port, for --flash")
@@ -133,7 +148,8 @@ def main():
 
     staged_dir = tempfile.mkdtemp(prefix="argon-sysfs-")
     try:
-        staged = stage(args.board, args.apps, staged_dir, args.display)
+        staged = stage(args.board, args.apps, staged_dir, args.display,
+                       args.add)
         os.makedirs(os.path.dirname(args.out), exist_ok=True)
 
         # The component's own tool, invoked the way its CMake does: block size

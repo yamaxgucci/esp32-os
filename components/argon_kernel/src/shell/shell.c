@@ -308,12 +308,31 @@ static int cmd_mem(int argc, char **argv)
     const size_t psram_free = ag_port_mem_free(AG_MEM_SLOW);
     const size_t psram_total = ag_port_mem_total(AG_MEM_SLOW);
 
+    /*
+     * And the same question asked the way an image asks it.
+     *
+     * "Internal" counts everything the chip has of its own, including memory
+     * that can only be reached a word at a time.  An application's data, an
+     * emulator's video memory, a filename - all of that is bytes, and on the
+     * original ESP32 the two numbers are not the same at all: a board can show
+     * seventy kilobytes free and refuse a twenty-five kilobyte image, which is
+     * exactly what happened here and cost an afternoon of looking at the wrong
+     * figure.
+     */
+    const size_t byte_free = ag_port_mem_free(AG_MEM_FAST | AG_MEM_BYTE);
+    const size_t byte_total = ag_port_mem_total(AG_MEM_FAST | AG_MEM_BYTE);
+    const size_t byte_block = ag_port_mem_largest(AG_MEM_FAST | AG_MEM_BYTE);
+
     if (narrow_screen()) {
         ag_console_printf("           total    free largest\n");
         ag_console_printf("internal %5uK  %5uK  %5uK\n",
                           (unsigned)(int_total / 1024),
                           (unsigned)(int_free / 1024),
                           (unsigned)(int_block / 1024));
+        ag_console_printf("bytes    %5uK  %5uK  %5uK\n",
+                          (unsigned)(byte_total / 1024),
+                          (unsigned)(byte_free / 1024),
+                          (unsigned)(byte_block / 1024));
         if (psram_total > 0) {
             ag_console_printf("extended %5uK  %5uK\n",
                               (unsigned)(psram_total / 1024),
@@ -327,6 +346,10 @@ static int cmd_mem(int argc, char **argv)
                           (unsigned)(int_total / 1024),
                           (unsigned)(int_free / 1024),
                           (unsigned)(int_block / 1024));
+        ag_console_printf("  bytes     %8u KB  %8u KB  %8u KB\n",
+                          (unsigned)(byte_total / 1024),
+                          (unsigned)(byte_free / 1024),
+                          (unsigned)(byte_block / 1024));
         if (psram_total > 0) {
             ag_console_printf("  extended  %8u KB  %8u KB\n",
                               (unsigned)(psram_total / 1024),

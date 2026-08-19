@@ -41,6 +41,14 @@ typedef struct {
 ag_err_t ag_loader_load(const char *path, const char *cwd,
                         ag_loaded_app_t *out);
 
+/*
+ * Just the header, validated, without placing or relocating anything.  For a
+ * caller that has to size something before the image can be loaded - the stack
+ * it will run on, the arena it asked for.
+ */
+ag_err_t ag_loader_peek(const char *path, const char *cwd,
+                        ag_axe_header_t *out);
+
 void ag_loader_unload(ag_loaded_app_t *app);
 
 /*
