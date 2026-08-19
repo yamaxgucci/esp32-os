@@ -10,6 +10,7 @@
 #include <argon/abi.h>
 #include <argon/console.h>
 #include <argon/device.h>
+#include <argon/display.h>
 #include <argon/log.h>
 
 #include <argon/port/time.h>
@@ -40,7 +41,7 @@ static const ag_display_ops_t *panel_ops(ag_device_t **out_dev)
          * built against an older ABI has no text_row field at all, and reading
          * one would be reading whatever follows its structure in memory.
          */
-        if (ops->size < sizeof(ag_display_ops_t) || ops->text_row == NULL) {
+        if (!AG_HAS(ops, text_row)) {
             continue;
         }
         if (out_dev != NULL) {
@@ -146,6 +147,17 @@ static void render_locked(const ag_screen_t *screen)
     static ag_textcell_t s_row[AG_SCREEN_MAX_COLS];
 
     if (screen == NULL) {
+        return;
+    }
+
+    /*
+     * While an application holds the display the panel is showing its pixels,
+     * and a console row painted over them is a band of text through the middle
+     * of somebody's picture.  Releasing marks the whole screen dirty, so
+     * nothing has to be remembered here about what was missed.
+     */
+    if (ag_display_acquired()) {
+        s_seen = NULL; /* the panel is not ours; owe it a full repaint */
         return;
     }
 

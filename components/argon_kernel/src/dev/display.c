@@ -99,12 +99,69 @@ static size_t fb_bytes(void)
  * presented whole.  The extra columns cost nothing on this side: they are read
  * by the panel, while the copy the guest pays for stays narrow.
  */
-static void panel_present_rows(int32_t y, int32_t h)
+/*
+ * The other kind of panel: one that has no framebuffer and is driven by a
+ * loadable module (ABI 0.30, ag_display_ops_t::blit_rect).
+ *
+ * Only while an application holds the display.  The rest of the time such a
+ * panel is showing the console, which reaches it as characters by a different
+ * road entirely (src/dev/textpanel.c) - pushing this surface at it as well
+ * would be two things drawing the same glass, and the smaller one would win
+ * every tenth of a second.
+ *
+ * The device is looked up rather than remembered for the reason textpanel.c
+ * gives: the driver is loadable and a remembered pointer outlives it by
+ * exactly one frame.
+ */
+static void driver_present_rect(int32_t x, int32_t y, int32_t w, int32_t h)
 {
-    if (!s_panel || s_front == NULL || s_w == 0 || s_h == 0) {
+    if (s_front == NULL || !s_acquired || w <= 0 || h <= 0) {
         return;
     }
-    ag_port_panel_present(y, h);
+
+    ag_dev_lock_hold();
+    for (uint32_t i = 0;; i++) {
+        ag_devinfo_t info;
+        if (ag_dev_info(i, AG_DEV_DISPLAY, &info) != AG_OK) {
+            break;
+        }
+        ag_device_t *dev = ag_dev_find(info.name);
+        if (dev == NULL || dev->class_ops == NULL) {
+            continue;
+        }
+        const ag_display_ops_t *ops = (const ag_display_ops_t *)dev->class_ops;
+        if (!AG_HAS(ops, blit_rect)) {
+            continue;
+        }
+        const ag_blit_t b = {
+            .px = s_front,
+            .stride = s_stride,
+            .surf_w = s_w,
+            .surf_h = s_h,
+            .x = (uint16_t)x,
+            .y = (uint16_t)y,
+            .w = (uint16_t)w,
+            .h = (uint16_t)h,
+        };
+        ops->blit_rect(0, &b);
+    }
+    ag_dev_lock_release();
+}
+
+static void panel_present_rect(int32_t x, int32_t y, int32_t w, int32_t h)
+{
+    if (s_front == NULL || s_w == 0 || s_h == 0) {
+        return;
+    }
+    if (s_panel) {
+        ag_port_panel_present(y, h);
+    }
+    driver_present_rect(x, y, w, h);
+}
+
+static void panel_present_rows(int32_t y, int32_t h)
+{
+    panel_present_rect(0, y, (int32_t)s_w, h);
 }
 
 static void panel_present(void) { panel_present_rows(0, (int32_t)s_h); }
@@ -159,7 +216,7 @@ static void present_rect_to_front(int32_t x, int32_t y, int32_t w, int32_t h)
             }
         }
     }
-    panel_present_rows(y, h);
+    panel_present_rect(x, y, w, h);
 }
 
 /* Copy draw → front (full frame). No-op when drawing already targets front. */
@@ -1026,6 +1083,15 @@ ag_err_t ag_display_dump_ppm(const char *path, const char *cwd, bool live)
     return AG_OK;
 }
 
+/*
+ * What has to be left over after the framebuffers.
+ *
+ * Enough for the shell, a process arena and a driver or two - which on the
+ * boards where this matters is most of what is there.  On a machine with room
+ * to spare the test always passes and nothing changes.
+ */
+#define AG_DISPLAY_SPARE (48u * 1024u)
+
 ag_err_t ag_display_init(void)
 {
     const ag_board_t *board = ag_board();
@@ -1077,21 +1143,36 @@ ag_err_t ag_display_init(void)
         owned = true;
     }
 
-    uint16_t *back = (uint16_t *)ag_port_alloc(
-        bytes, AG_MEM_SLOW | AG_MEM_BYTE);
-    if (back == NULL) {
-        back = (uint16_t *)ag_port_alloc(
-            bytes, AG_MEM_FAST | AG_MEM_BYTE);
-    }
-    /* Back buffer optional: without it we stay single-buffered (direct). */
+    /*
+     * Back buffer and snapshot are each another whole framebuffer.
+     *
+     * All three or one, and the decision is made once: on a board where a
+     * single surface is already a third of the free heap, taking three of them
+     * does not merely leave the application short - it leaves the *system*
+     * short, and the way that shows up is the SD card failing to mount two
+     * boot stages later with a memory error nobody would connect to graphics.
+     * Measured on the 2.4 inch ESP32 board: 160x120 is 37 KB, three of those
+     * is 112, and the card needs what is left.
+     *
+     * Everything below copes with having only the front buffer: no back means
+     * single-buffered - which for a panel driven over SPI is what it was
+     * anyway, since the pixels are pushed rather than pointed at - and no
+     * snapshot means gfxdump reads the live surface.
+     */
+    uint16_t *back = NULL;
+    uint16_t *snap = NULL;
 
-    uint16_t *snap = (uint16_t *)ag_port_alloc(
-        bytes, AG_MEM_SLOW | AG_MEM_BYTE);
-    if (snap == NULL) {
-        snap = (uint16_t *)ag_port_alloc(
-            bytes, AG_MEM_FAST | AG_MEM_BYTE);
+    if (ag_port_mem_free(AG_MEM_FAST | AG_MEM_BYTE) >=
+        2u * bytes + AG_DISPLAY_SPARE) {
+        back = (uint16_t *)ag_port_alloc(bytes, AG_MEM_SLOW | AG_MEM_BYTE);
+        if (back == NULL) {
+            back = (uint16_t *)ag_port_alloc(bytes, AG_MEM_FAST | AG_MEM_BYTE);
+        }
+        snap = (uint16_t *)ag_port_alloc(bytes, AG_MEM_SLOW | AG_MEM_BYTE);
+        if (snap == NULL) {
+            snap = (uint16_t *)ag_port_alloc(bytes, AG_MEM_FAST | AG_MEM_BYTE);
+        }
     }
-    /* Snapshot is optional: gfxdump then falls back to the live buffer. */
 
     memset(front, 0, bytes);
     if (back != NULL) {
