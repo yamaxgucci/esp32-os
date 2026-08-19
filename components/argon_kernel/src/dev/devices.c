@@ -56,6 +56,25 @@ static void dev_unlock(void *ctx)
     ag_port_mutex_give_recursive(s_dev_mutex);
 }
 
+/*
+ * Is this task inside the registry - and therefore, in practice, inside a
+ * driver?
+ *
+ * The registry is held across every call into a loadable module's class vtable,
+ * and it is held for nothing else that lasts (see ag_dev_lock_hold in the
+ * header).  So "this task holds it" is the same question as "the code running
+ * here belongs to the system rather than to whoever called in", and that is the
+ * question the pin claims need answered - see caller() in src/dev/io.c.
+ *
+ * Ownership of a recursive mutex is per task, so no state has to be invented
+ * for this and nothing has to be reset on a fault.
+ */
+bool ag_dev_in_driver(void)
+{
+    return s_dev_mutex != NULL &&
+           ag_port_mutex_holder(s_dev_mutex) == ag_port_task_self();
+}
+
 /* ---------------------------------------------------------------------- */
 /* null - everything written to it is gone, and there is nothing to read   */
 /* ---------------------------------------------------------------------- */
