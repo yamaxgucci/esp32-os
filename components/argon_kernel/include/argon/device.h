@@ -97,6 +97,13 @@ typedef struct {
 ag_err_t ag_dev_init(const ag_dev_lock_t *lock);
 
 /*
+ * True when the calling task is inside the registry, which is where a loadable
+ * driver's code runs.  The io layer asks this before deciding whose pin claim a
+ * write should be checked against; see caller() in src/dev/io.c.
+ */
+bool ag_dev_in_driver(void);
+
+/*
  * Hold the registry across a call into a driver.
  *
  * Not for ordinary use: the registry takes this lock itself for everything it

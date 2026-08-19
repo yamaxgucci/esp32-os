@@ -59,7 +59,32 @@ static void unlock(void)
 }
 
 /* Whoever is calling: a process, or the kernel when nothing is loaded. */
-static ag_pid_t caller(void) { return ag_proc_self(); }
+/*
+ * Whose claim a pin operation is checked against.
+ *
+ * Normally the process doing it.  But a loadable driver claims its pins when it
+ * loads - on the kernel's task, because that is who loads modules - and is then
+ * called from whatever task happens to need it: the console task for the
+ * console, an application's task the moment that application takes the display.
+ * Checked against the application, the claim does not match, and io_gpio_write
+ * *silently does nothing*.
+ *
+ * What that looked like: the panel driver's text path worked perfectly (console
+ * task, kernel identity) while its pixel path put a whole 320x240 frame into a
+ * single 8x8 character cell.  The chip select line is toggled by the SPI
+ * peripheral, so the pixel bytes went out; the DC line is a plain GPIO, so the
+ * three command bytes that set the address window did not - they went into the
+ * panel as pixels, and the frame landed in whatever window the text path had
+ * left behind, which was the caret.  Nothing failed, nothing was logged, and
+ * the picture was one blinking square inside a line of text.
+ *
+ * A .SYS is not a process; it is system code the kernel called.  Its claims are
+ * the kernel's and so are its writes, whoever asked.
+ */
+static ag_pid_t caller(void)
+{
+    return ag_dev_in_driver() ? AG_PID_KERNEL : ag_proc_self();
+}
 
 static bool valid_pin(int pin)
 {
