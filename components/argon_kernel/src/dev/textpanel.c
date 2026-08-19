@@ -8,7 +8,9 @@
 #include <string.h>
 
 #include <argon/abi.h>
+#include <argon/console.h>
 #include <argon/device.h>
+#include <argon/log.h>
 
 #include <argon/port/time.h>
 
@@ -48,6 +50,50 @@ static const ag_display_ops_t *panel_ops(ag_device_t **out_dev)
     }
 }
 
+/*
+ * Input devices that have to be asked rather than waited for.
+ *
+ * Here rather than in a file of its own because it is the same three lines of
+ * registry walk as the panel above, on the same tick, for the same reason: a
+ * loadable driver cannot own a task, so the kernel does the asking.
+ */
+void ag_inputpoll_tick(void)
+{
+    for (uint32_t i = 0;; i++) {
+        ag_devinfo_t info;
+        if (ag_dev_info(i, AG_DEV_INPUT, &info) != AG_OK) {
+            return;
+        }
+
+        ag_event_t evs[4];
+        int32_t    n = 0;
+
+        /*
+         * The lookup and the call are one operation, under the registry's own
+         * lock, because what is being called lives in a loadable module's
+         * arena: between finding the vtable and calling it, `drv unload` can
+         * free it.  Module unload takes this lock too.
+         */
+        ag_dev_lock_hold();
+        ag_device_t *dev = ag_dev_find(info.name);
+        if (dev != NULL && dev->class_ops != NULL) {
+            const ag_input_ops_t *ops =
+                (const ag_input_ops_t *)dev->class_ops;
+            if (ops->size >= sizeof(ag_input_ops_t) && ops->poll != NULL) {
+                /* Four is a finger's worth of movement in ten milliseconds; a
+                 * driver with more to say is asked again on the next tick
+                 * rather than being allowed to hold the console task. */
+                n = ops->poll(0, evs, 4);
+            }
+        }
+        ag_dev_lock_release();
+
+        for (int32_t e = 0; e < n && e < 4; e++) {
+            (void)ag_console_inject_event(&evs[e]);
+        }
+    }
+}
+
 ag_err_t ag_textpanel_geometry(uint16_t *cols, uint16_t *rows)
 {
     const ag_display_ops_t *ops = panel_ops(NULL);
@@ -57,7 +103,8 @@ ag_err_t ag_textpanel_geometry(uint16_t *cols, uint16_t *rows)
     return ops->text_info(0, cols, rows);
 }
 
-void ag_textpanel_render(const ag_screen_t *screen)
+/* Called with the device registry held; see ag_textpanel_render below. */
+static void render_locked(const ag_screen_t *screen)
 {
     static const ag_display_ops_t *s_seen;
     static uint16_t                s_caret_col = 0xffffu;
@@ -169,4 +216,18 @@ void ag_textpanel_render(const ag_screen_t *screen)
     s_caret_col = cx;
     s_caret_row = cy;
     s_caret_lit = lit;
+}
+
+void ag_textpanel_render(const ag_screen_t *screen)
+{
+    /*
+     * The whole repaint is one operation as far as the registry is concerned,
+     * for the same reason the input poll is: every call in it lands in a
+     * loadable module's arena, and unloading that module halfway through is
+     * executing memory that has been handed back.  A full repaint is a couple
+     * of milliseconds and an unload waits that long.
+     */
+    ag_dev_lock_hold();
+    render_locked(screen);
+    ag_dev_lock_release();
 }

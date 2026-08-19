@@ -74,9 +74,12 @@ extern "C" {
  *      affine triangles otherwise).
  * 0.27 appended text_info / text_row / text_cursor to ag_display_ops_t: the
  *      console as characters, for a panel a framebuffer will not fit on.
+ * 0.28 defined ag_input_ops_t: an AG_DEV_INPUT driver the kernel polls for
+ *      events, for hardware that has to be asked rather than interrupting.
+ * 0.29 appended io->spi_config: the clock for one chip on a shared bus.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 27u
+#define AG_ABI_MINOR 29u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -582,6 +585,30 @@ typedef struct ag_gfx_api {
 } ag_gfx_api_t;
 
 /*
+ * Class vtable for AG_DEV_INPUT devices that have to be asked (ABI 0.28).
+ *
+ * A touchscreen on a slow bus does not interrupt with an event; it holds a
+ * voltage, and somebody has to read it.  Doing that from the driver would need
+ * a task inside a loadable module - the one thing a .SYS has no way to own -
+ * so the kernel asks instead, from the console tick it already runs.
+ *
+ * poll() fills at most `max` events and returns how many, or a negative error.
+ * Zero is the normal answer and must be cheap: it is called ten times a second
+ * forever.  The events go into the same queue the terminal decoder feeds, so
+ * nothing above can tell a finger from a mouse on the other end of a cable.
+ *
+ * Coordinates are console cells, like the terminal's mouse reports, because
+ * what is on this kind of screen is the console.  A driver for a panel with a
+ * framebuffer under it would want pixels; there is no such panel yet, and
+ * inventing the second convention before there is something to point at is how
+ * both end up wrong.
+ */
+typedef struct ag_input_ops {
+    uint32_t size;
+    int32_t (*poll)(ag_handle_t h, ag_event_t *out, uint32_t max);
+} ag_input_ops_t;
+
+/*
  * One cell of the text console: the byte on the screen and its colours, high
  * nibble background, low nibble foreground, as they have been since CGA.  What
  * the byte means is the code page's business (con->codepage).
@@ -842,6 +869,15 @@ typedef struct ag_io_api {
     int32_t (*adc_read)(int channel);
     ag_err_t (*pwm_config)(int pin, uint32_t freq_hz, uint8_t resolution_bits);
     ag_err_t (*pwm_set)(int pin, uint32_t duty);
+
+    /*
+     * ABI 0.29: the clock for one chip select, overriding the bus speed from
+     * BOARD.CFG.  A bus is a set of wires and the chips on it rarely agree
+     * about speed: this board's panel takes 40 MHz and the touch controller
+     * sharing those same three wires stops answering above about two.  Set it
+     * once, before the first transfer to that chip.
+     */
+    ag_err_t (*spi_config)(int bus, int cs, uint32_t khz);
 } ag_io_api_t;
 
 /* ------------------------------------------------------------------------ */

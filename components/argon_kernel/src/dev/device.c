@@ -29,6 +29,11 @@ static void unlock(void)
     }
 }
 
+/* The registry's own lock, for the caller that reaches past the registry into
+ * a driver's class vtable.  See the header for why that needs one. */
+void ag_dev_lock_hold(void) { lock(); }
+void ag_dev_lock_release(void) { unlock(); }
+
 ag_err_t ag_dev_init(const ag_dev_lock_t *lock_iface)
 {
     memset(s_devices, 0, sizeof(s_devices));

@@ -69,7 +69,19 @@ static ag_err_t full_path(const ag_idfvfs_t *fs, const char *rel, char *out,
     const bool root = (rel == NULL) || (rel[0] == '\0') ||
                       (rel[0] == '/' && rel[1] == '\0');
 
-    const int n = root ? snprintf(out, outlen, "%s", fs->base)
+    /*
+     * The root keeps its slash: "/sys/" and not "/sys".
+     *
+     * ESP-IDF's VFS hands the driver whatever is left after the mount point,
+     * so the bare mount point arrives as an empty string - and an empty string
+     * is not a directory.  On the flash filesystem that came back as a
+     * directory with nothing in it, which is indistinguishable from an empty
+     * disk: `dir c:\` listed no files on a volume that had BOARD.CFG,
+     * SYSTEM.CFG and a drv folder on it, while `dir c:\drv` and `type
+     * c:\board.cfg` both worked.  With the slash the remainder is "/", which
+     * is the root.
+     */
+    const int n = root ? snprintf(out, outlen, "%s/", fs->base)
                        : snprintf(out, outlen, "%s%s", fs->base, rel);
 
     if (n < 0 || (size_t)n >= outlen) {
@@ -320,15 +332,27 @@ static ag_err_t idf_open(void *ctx, const char *rel, uint32_t flags, void **out)
     }
 
     /*
-     * CREATE must still fold *parent* directories (c:\drv vs leftover
-     * c:\DRV on littlefs).  The leaf stays as typed so a new file is not
-     * silently redirected onto a case-only sibling.
+     * The same fold on create as on open, and the leaf too.
+     *
+     * It used to fold only the parent directories, so that a new file was
+     * "not silently redirected onto a case-only sibling".  On a system whose
+     * paths are case-insensitive that reasoning is backwards: there is no such
+     * thing as a case-only sibling here, because C:\SYSTEM.CFG and
+     * c:\system.cfg are one name.  Creating the second spelling made a second
+     * file on littlefs, which does distinguish them, and then `dir` showed two
+     * files with the same name while every other command reached whichever
+     * one the case-insensitive lookup happened to find first.  It cost an hour
+     * and a config file that was read by the boot and not by `type`.
+     *
+     * fixup_case leaves the path exactly as typed when nothing matches, which
+     * is what makes a genuinely new file keep its own spelling.  The parents
+     * are folded first and separately, because a leaf that does not exist yet
+     * makes fixup_case give up on the whole path - directories included.
      */
     if ((flags & AG_O_CREATE) != 0) {
         (void)fixup_parents(fs, path, sizeof(path));
-    } else {
-        (void)fixup_case(fs, path, sizeof(path), false);
     }
+    (void)fixup_case(fs, path, sizeof(path), false);
 
     /*
      * FAT will happily open a directory, and then every read fails in a

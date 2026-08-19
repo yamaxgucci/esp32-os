@@ -41,6 +41,9 @@ ag_err_t ag_textpanel_geometry(uint16_t *cols, uint16_t *rows);
  */
 void ag_textpanel_render(const ag_screen_t *screen);
 
+/* Drains input devices that must be polled; same tick, same reason. */
+void ag_inputpoll_tick(void);
+
 #ifdef __cplusplus
 }
 #endif

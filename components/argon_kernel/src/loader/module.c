@@ -95,9 +95,22 @@ static void drop_module(module_t *m)
         m->fini = NULL;
         fini();
     }
+
+    /*
+     * The registry is held across the revoke *and* the unload, because the
+     * kernel calls into a driver's class vtable without going through a
+     * handle: a panel's text_row and a touchscreen's poll are called straight
+     * off dev->class_ops, from the console task, ten times a second.  Freeing
+     * the arena those point into while that call is in flight is executing
+     * memory that has just been given back - which took the board down with an
+     * interrupt watchdog timeout the first time a driver was unloaded while it
+     * was being polled.  Whoever calls a class op takes the same lock.
+     */
+    ag_dev_lock_hold();
     (void)ag_dev_revoke_owner(m);
     ag_loader_unload(&m->app);
     memset(m, 0, sizeof(*m));
+    ag_dev_lock_release();
 }
 
 ag_err_t ag_module_load_hinted(const char *path, const char *cwd,

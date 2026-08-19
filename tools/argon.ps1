@@ -173,6 +173,8 @@ switch ($Command.ToLowerInvariant()) {
             'esp32'     { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32' }
             'esp32-dsp' { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32;sdkconfig.esp32.dsp'
                           $chip = 'esp32' }
+            'esp32-probe' { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32;sdkconfig.esp32.probe'
+                            $chip = 'esp32' }
             'esp32s3'   { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32s3' }
             default {
                 Write-Host "argon target: no defaults for '$chip'."

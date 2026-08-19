@@ -146,6 +146,7 @@ static void render_all(void)
     ag_display_render_console(&s_screen);
     /* A panel with no framebuffer takes the same screen as characters. */
     ag_textpanel_render(&s_screen);
+    ag_inputpoll_tick();
     ag_screen_clear_dirty(&s_screen);
 }
 
