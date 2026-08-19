@@ -77,7 +77,7 @@ void fm_message(const char *text)
 
 void fm_error(const char *what, ag_err_t err)
 {
-    char line[FM_COLS];
+    char line[FM_LINE_MAX];
 
     ag_strlcpy(line, (what != NULL) ? what : "failed", sizeof(line));
     ag_strlcat(line, ": ", sizeof(line));
@@ -254,7 +254,7 @@ ag_err_t fm_read_panel(fm_panel_t *p, const char *path)
 
     ag_dirent_t de;
     while (ag_readdir(dir, &de) == AG_OK) {
-        if (p->count >= FM_MAX_ENTRIES) {
+        if (p->count >= p->capacity) {
             p->truncated++;
             continue;
         }
@@ -333,15 +333,80 @@ static void size_text(const fm_entry_t *e, char *out, size_t len)
     ag_strlcpy(out, ag_utoa(e->size, buf, sizeof(buf), 8, true), len);
 }
 
+fm_layout_t g_lay;
+
+/*
+ * Two panels, and where they go.
+ *
+ * Side by side while there is room for two readable ones - forty columns each
+ * is the width this was designed around - and one above the other when there
+ * is not.  Stacking rather than dropping a panel: a file manager with one
+ * panel is a directory listing, and the whole point of the shape is having
+ * two places at once.
+ *
+ * The rows below the panels are the same in both layouts, because they are
+ * what the keyboard needs: what the cursor is on, what was asked, and the key
+ * bar.  On a short screen the detail line is the one that goes - it repeats
+ * what the cursor is already showing.
+ */
+void fm_layout_init(void)
+{
+    ag_coninfo_t info;
+    ag_api()->con->info(&info);
+
+    g_lay.cols = (info.cols > 0) ? (int)info.cols : 80;
+    g_lay.rows = (info.rows > 0) ? (int)info.rows : 25;
+    if (g_lay.cols > FM_LINE_MAX - 1) {
+        g_lay.cols = FM_LINE_MAX - 1;
+    }
+
+    g_lay.stacked = (g_lay.cols < 60);
+
+    if (!g_lay.stacked) {
+        g_lay.panel_w = g_lay.cols / 2;
+        g_lay.panel_h = g_lay.rows - 4;
+        g_lay.panel_x[0] = 0;
+        g_lay.panel_x[1] = g_lay.panel_w;
+        g_lay.panel_y[0] = 0;
+        g_lay.panel_y[1] = 0;
+
+        g_lay.row_detail = g_lay.panel_h;
+        g_lay.row_message = g_lay.panel_h + 1;
+        g_lay.row_keys = g_lay.panel_h + 2;
+        g_lay.row_status = g_lay.panel_h + 3;
+    } else {
+        /* Three rows of chrome, and whatever is left split in two. */
+        const int chrome = 3;
+        g_lay.panel_w = g_lay.cols;
+        g_lay.panel_h = (g_lay.rows - chrome) / 2;
+        g_lay.panel_x[0] = 0;
+        g_lay.panel_x[1] = 0;
+        g_lay.panel_y[0] = 0;
+        g_lay.panel_y[1] = g_lay.panel_h;
+
+        const int after = g_lay.panel_h * 2;
+        g_lay.row_detail = -1; /* no room, and the cursor line says it anyway */
+        g_lay.row_message = after;
+        g_lay.row_keys = after + 1;
+        g_lay.row_status = after + 2;
+    }
+
+    g_lay.visible = g_lay.panel_h - 2;
+    if (g_lay.visible < 1) {
+        g_lay.visible = 1;
+    }
+}
+
 void fm_draw_panel(int which)
 {
     fm_panel_t *p = &g_panel[which];
-    const int   x = which * FM_PANEL_W;
+    const int   x = g_lay.panel_x[which];
+    const int   y0 = g_lay.panel_y[which];
     const bool  active = (which == g_active);
 
     scroll_into_view(p);
 
-    fm_frame(x, 0, FM_PANEL_W, FM_PANEL_ROWS, FM_ATTR_FRAME);
+    fm_frame(x, y0, FM_PANEL_W, FM_PANEL_ROWS, FM_ATTR_FRAME);
 
     /* The path in the top border, tail first when it does not fit: the end of a
      * path says where you are, the start says which drive. */
@@ -350,7 +415,7 @@ void fm_draw_panel(int which)
 
     const int room = FM_PANEL_W - 4;
     const int len = (int)strlen(shown);
-    char      header[FM_PANEL_W];
+    char      header[FM_LINE_MAX];
     ag_strlcpy(header, " ", sizeof(header));
     if (len > room) {
         ag_strlcat(header, "...", sizeof(header));
@@ -359,11 +424,11 @@ void fm_draw_panel(int which)
         ag_strlcat(header, shown, sizeof(header));
     }
     ag_strlcat(header, " ", sizeof(header));
-    fm_put(x + 1, 0, header, active ? FM_ATTR_CURSOR : FM_ATTR_FRAME);
+    fm_put(x + 1, y0, header, active ? FM_ATTR_CURSOR : FM_ATTR_FRAME);
 
     for (int row = 0; row < FM_VISIBLE; row++) {
         const int index = p->top + row;
-        const int y = row + 1;
+        const int y = y0 + row + 1;
 
         if (index >= p->count) {
             fm_put_clipped(x + 1, y, FM_PANEL_W - 2, "", FM_ATTR_PANEL);
@@ -384,7 +449,7 @@ void fm_draw_panel(int which)
         }
 
         /* name field, then the size field right up against the border */
-        char line[FM_PANEL_W];
+        char line[FM_LINE_MAX];
         char size[16];
         size_text(e, size, sizeof(size));
 
@@ -400,7 +465,7 @@ void fm_draw_panel(int which)
     }
 
     /* Totals in the bottom border. */
-    char totals[FM_PANEL_W];
+    char totals[FM_LINE_MAX];
     char count[24];
     char bytes[24];
     ag_strlcpy(totals, " ", sizeof(totals));
@@ -411,19 +476,25 @@ void fm_draw_panel(int which)
     ag_strlcat(totals, ag_utoa(p->total_bytes, bytes, sizeof(bytes), 0, true),
                sizeof(totals));
     ag_strlcat(totals, " bytes ", sizeof(totals));
-    fm_put(x + 2, FM_PANEL_ROWS - 1, totals, FM_ATTR_FRAME);
+    fm_put(x + 2, y0 + FM_PANEL_ROWS - 1, totals, FM_ATTR_FRAME);
 }
 
 void fm_draw_detail(void)
 {
     const fm_entry_t *e = fm_current();
 
+    /* Stacked layout has no room for it, and loses least by giving it up: the
+     * cursor bar already shows the name it would repeat. */
+    if (FM_ROW_DETAIL < 0) {
+        return;
+    }
+
     fm_clear_row(FM_ROW_DETAIL, FM_ATTR_STATUS);
     if (e == NULL) {
         return;
     }
 
-    char line[FM_COLS];
+    char line[FM_LINE_MAX];
     char full[AG_PATH_MAX];
     char shown[AG_PATH_MAX];
 
@@ -465,7 +536,7 @@ static uint32_t s_last_redraw_us;
 
 static void draw_status(void)
 {
-    char line[FM_COLS];
+    char line[FM_LINE_MAX];
     char number[24];
 
     ag_strlcpy(line, "ArgonOS file manager   arena ", sizeof(line));
@@ -666,13 +737,31 @@ int FM_ENTRY(int argc, char **argv)
      * point of having one: 512 entries a panel is a quarter of a megabyte, and
      * when this process ends it all goes back without anybody freeing it.
      */
+    /* Before anything is drawn or measured against a width. */
+    fm_layout_init();
+
     g_active = 0;
     for (int i = 0; i < 2; i++) {
         /* Cleared rather than assumed empty: as a built-in this runs more than
          * once, and what the last run left behind is not a starting state. */
         memset(&g_panel[i], 0, sizeof(g_panel[i]));
-        g_panel[i].entries =
-            (fm_entry_t *)ag_malloc(sizeof(fm_entry_t) * FM_MAX_ENTRIES);
+
+        /*
+         * As many entries as the machine will give, halving down from the
+         * ceiling.  512 a panel is 45 KB a panel, which is nothing on a board
+         * with PSRAM and more than the whole free heap on one without - and a
+         * file manager that refuses to start is worse than one that shows the
+         * first sixty-four names and says so, which it already does for a
+         * directory larger than it can hold.
+         */
+        for (int want = FM_MAX_ENTRIES; want >= 32; want /= 2) {
+            g_panel[i].entries =
+                (fm_entry_t *)ag_malloc(sizeof(fm_entry_t) * (size_t)want);
+            if (g_panel[i].entries != NULL) {
+                g_panel[i].capacity = want;
+                break;
+            }
+        }
         if (g_panel[i].entries == NULL) {
             ag_free(g_panel[0].entries);
             ag_print("not enough memory for the panels\n");
