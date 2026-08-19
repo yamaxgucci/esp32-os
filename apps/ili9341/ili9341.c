@@ -32,7 +32,7 @@
 
 #include "font8x8.h"
 
-AG_DRV("ILI9341", "0.3", "argon");
+AG_DRV("ILI9341", "0.4", "argon");
 
 /*
  * The board this was written on: an ESP32-2432S024, whose panel is on SPI2
@@ -72,15 +72,32 @@ static void cmd(uint8_t c)
     (void)io->spi_xfer(LCD_BUS, LCD_CS, &c, NULL, 1);
 }
 
+/*
+ * How much the port will take in one transfer, found by asking.
+ *
+ * There is a limit - the SPI layer copies through a bounce buffer of its own -
+ * and the ABI does not publish it, so this starts optimistic and halves on the
+ * first refusal.  The number matters more than it looks: a transfer costs about
+ * seventy microseconds of setup whatever its size, and a frame of 160x144 sent
+ * as three hundred and twenty byte rows is two hundred and sixteen of those,
+ * which is sixteen milliseconds of a thirty-two millisecond frame spent on
+ * overhead rather than on pixels.
+ */
+static size_t s_chunk = 4096;
+
 static void data(const void *buf, size_t len)
 {
     const uint8_t *p = (const uint8_t *)buf;
     io->gpio_write(LCD_DC, 1);
     while (len > 0) {
-        /* The port's SPI bounce buffer bounds one transfer; 512 keeps a whole
-         * number of pixels in each and leaves the limit room to shrink. */
-        const size_t chunk = (len > 512) ? 512 : len;
-        if (io->spi_xfer(LCD_BUS, LCD_CS, p, NULL, chunk) != AG_OK) {
+        const size_t chunk = (len > s_chunk) ? s_chunk : len;
+        const ag_err_t err = io->spi_xfer(LCD_BUS, LCD_CS, p, NULL, chunk);
+        if (err == -AG_EINVAL && s_chunk > 64u) {
+            /* Too large for this port; halve and try the same bytes again. */
+            s_chunk /= 2u;
+            continue;
+        }
+        if (err != AG_OK) {
             return;
         }
         p += chunk;
@@ -96,6 +113,24 @@ static void cmd_data(uint8_t c, const void *buf, size_t len)
     }
 }
 
+/*
+ * The last window set, and where writing has got to inside it.
+ *
+ * The controller walks its own window and wraps to the next row by itself, so a
+ * rectangle that continues exactly where the previous one stopped needs no new
+ * window at all.  A frame arriving as eighteen bands then costs one window
+ * instead of eighteen, and a window is five transfers - three commands and two
+ * pairs of coordinates - which came to nearly seven milliseconds a frame.
+ *
+ * Anything that breaks the sequence (a different column range, a jump, the
+ * console's text path, a wipe) sets a window and the tracking starts again.
+ */
+static uint16_t s_win_x0, s_win_x1, s_win_y1;
+static uint16_t s_win_next; /* the row the controller will write next */
+static bool     s_win_live;
+
+static void window_forget(void) { s_win_live = false; }
+
 static void window(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1)
 {
     const uint8_t ca[4] = {(uint8_t)(x0 >> 8), (uint8_t)x0,
@@ -105,6 +140,37 @@ static void window(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1)
     cmd_data(0x2a, ca, sizeof(ca));
     cmd_data(0x2b, pa, sizeof(pa));
     cmd(0x2c);
+
+    s_win_x0 = x0;
+    s_win_x1 = x1;
+    s_win_y1 = y1;
+    s_win_next = y0;
+    s_win_live = true;
+}
+
+/*
+ * A window for rows y0..y1 of columns x0..x1, unless the controller is already
+ * pointing exactly there.
+ */
+static void window_for(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1)
+{
+    if (s_win_live && x0 == s_win_x0 && x1 == s_win_x1 && y0 == s_win_next &&
+        y1 <= s_win_y1) {
+        return;
+    }
+    window(x0, y0, x1, y1);
+}
+
+/* Rows just written, so the next call can tell whether it continues them. */
+static void window_advance(uint16_t rows)
+{
+    if (!s_win_live) {
+        return;
+    }
+    s_win_next = (uint16_t)(s_win_next + rows);
+    if (s_win_next > s_win_y1) {
+        s_win_live = false; /* the window is full; the next write must set one */
+    }
 }
 
 /* ---- colour ------------------------------------------------------------ */
@@ -156,6 +222,9 @@ static void push_row(uint16_t row)
     }
     window(0, y0, LCD_W - 1, (uint16_t)(y0 + CELL_H - 1));
     data(s_row, sizeof(s_row));
+    /* The console has moved the controller; a following blit must set its own
+     * window rather than assume it is still where it left off. */
+    window_forget();
 }
 
 /* ---- the class vtable -------------------------------------------------- */
@@ -234,7 +303,9 @@ static void lcd_text_cursor(ag_handle_t h, uint16_t col, uint16_t row,
     for (uint32_t y = 0; y < CELL_H; y++) {
         data(&s_row[y * LCD_W], CELL_W * sizeof(uint16_t));
     }
+    window_forget();
 }
+
 
 /* ---- pixels ------------------------------------------------------------ */
 
@@ -264,6 +335,7 @@ static void clear_panel(void)
     for (uint16_t band = 0; band < LCD_H / CELL_H; band++) {
         data(s_row, sizeof(s_row));
     }
+    window_forget();
 }
 
 /* Works out the placement, and wipes the glass when it has changed. */
@@ -331,27 +403,62 @@ static void lcd_blit_rect(ag_handle_t h, const ag_blit_t *b)
      * frame instead of four per line is most of the difference between a
      * picture that moves and one that crawls.
      */
-    window(x0, y0, (uint16_t)(x0 + out_w - 1),
-           (uint16_t)(y0 + hgt * s_scale - 1));
+    /*
+     * One window for as long as the writes keep following on, and as many rows
+     * per transfer as the row buffer holds.
+     *
+     * Both are about the same thing: a transfer costs about seventy microseconds
+     * whatever it carries, and a window costs five transfers.  A 160x144 frame
+     * arriving as eighteen bands used to be two hundred and sixteen transfers
+     * and eighteen windows - twenty-five milliseconds of a thirty-two
+     * millisecond frame, nearly all of it setup.  Sent this way it is a few
+     * dozen transfers and one window.
+     */
+    window_for(x0, y0, (uint16_t)(x0 + out_w - 1),
+               (uint16_t)(y0 + hgt * s_scale - 1));
 
-    /* px is the rectangle's own first pixel (ABI 0.30), so there is nothing
-     * to offset: x and y say where it goes, not where it came from. */
+    /* Output rows that fit the row buffer at this width; never zero. */
+    uint16_t cap = (uint16_t)((sizeof(s_row) / sizeof(s_row[0])) / out_w);
+    if (cap == 0) {
+        cap = 1;
+    }
+
     const uint8_t *src = (const uint8_t *)b->px;
+    uint16_t       held = 0;
+
     for (uint16_t row = 0; row < hgt; row++) {
         const uint16_t *in = (const uint16_t *)(const void *)src;
-        uint16_t        o = 0;
-        for (uint16_t i = 0; i < w; i++) {
-            const uint16_t px = swap16(in[i]);
-            for (uint16_t k = 0; k < s_scale; k++) {
-                s_row[o++] = px;
-            }
-        }
+
+        /*
+         * Once per copy of this row, because at a scale above one the same row
+         * goes out twice.  Expanded again rather than copied: the copy would
+         * have to survive a flush in between, and expanding is the same walk.
+         */
         for (uint16_t k = 0; k < s_scale; k++) {
-            data(s_row, (size_t)out_w * sizeof(uint16_t));
+            if (held == cap) {
+                data(s_row, (size_t)held * out_w * sizeof(uint16_t));
+                window_advance(held);
+                held = 0;
+            }
+            uint16_t *out = &s_row[(size_t)held * out_w];
+            uint16_t  o = 0;
+            for (uint16_t i = 0; i < w; i++) {
+                const uint16_t px = swap16(in[i]);
+                for (uint16_t j = 0; j < s_scale; j++) {
+                    out[o++] = px;
+                }
+            }
+            held++;
         }
         src += b->stride;
     }
+
+    if (held != 0) {
+        data(s_row, (size_t)held * out_w * sizeof(uint16_t));
+        window_advance(held);
+    }
 }
+
 
 static const ag_display_ops_t k_display_ops = {
     .size = sizeof(ag_display_ops_t),

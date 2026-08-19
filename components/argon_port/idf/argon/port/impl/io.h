@@ -21,7 +21,17 @@
  * the DMA engine wants internal memory, so every transfer is copied through one
  * - and this limit is what one costs.
  */
-#define AG_PORT_SPI_MAX_XFER 1024
+/*
+ * The largest single transfer io->spi_xfer will take.
+ *
+ * Not the same thing as the bounce buffer any more (see AG_PORT_SPI_BOUNCE in
+ * io_hw.c): a caller whose buffer is already fit for DMA is handed to the
+ * peripheral directly and can be any size up to this, while one that needs
+ * copying is copied a bounce-buffer at a time.  The number is large because a
+ * transfer costs the same setup whatever it carries, and a panel being fed a
+ * frame cares about nothing else.
+ */
+#define AG_PORT_SPI_MAX_XFER 8192
 
 /*
  * Analogue input, off by default, and the reason is in the Kconfig help:

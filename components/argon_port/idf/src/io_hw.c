@@ -16,6 +16,17 @@
 #include "driver/ledc.h"
 #include "driver/spi_master.h"
 #include "esp_log.h"
+#include "esp_memory_utils.h"
+
+/*
+ * The copy buffer for callers whose memory the DMA engine cannot read.
+ *
+ * A kilobyte each way, and deliberately not the same as
+ * AG_PORT_SPI_MAX_XFER: making them equal meant that raising the transfer
+ * limit - which is what a display wants - also raised the fixed cost of every
+ * bus that comes up, on a board where eight kilobytes is real money.
+ */
+#define AG_PORT_SPI_BOUNCE 1024
 #include "hal/gpio_types.h"
 
 #if AG_PORT_HAS_ADC
@@ -368,7 +379,7 @@ ag_err_t ag_port_spi_open(int bus, int sck, int mosi, int miso, uint32_t khz)
         return from_esp(rc);
     }
 
-    s_spi[bus].bounce = ag_port_alloc(2u * AG_PORT_SPI_MAX_XFER, AG_MEM_DMA);
+    s_spi[bus].bounce = ag_port_alloc(2u * AG_PORT_SPI_BOUNCE, AG_MEM_DMA);
     if (s_spi[bus].bounce == NULL) {
         (void)spi_bus_free(AG_PORT_SPI_HOST_OF(bus));
         return -AG_ENOMEM;
@@ -479,12 +490,53 @@ ag_err_t ag_port_spi_xfer(int bus, int cs, const void *tx, void *rx, size_t len)
     }
 
     /*
-     * Through the bounce buffer, always.  The caller's data is in PSRAM and the
-     * DMA engine wants internal memory; deciding case by case would mean two
-     * paths, one of which is exercised only on the board nobody has.
+     * Straight from the caller's buffer when the DMA engine can read it.
+     *
+     * The bounce buffer exists for memory DMA cannot reach - PSRAM, or a stack
+     * in some ports - and copying through it unconditionally was the simple
+     * choice.  It also capped every transfer at the bounce size, which on the
+     * display path meant three transfers where one would do, and a transfer
+     * costs the same setup whatever it carries.
+     *
+     * A write-only transfer from DMA-capable memory needs neither the copy nor
+     * the cap.  Anything else still goes through the bounce, in pieces.
      */
+    if (rx == NULL && tx != NULL && esp_ptr_dma_capable(tx)) {
+        spi_transaction_t direct = {
+            .length = len * 8u,
+            .tx_buffer = tx,
+            .rx_buffer = NULL,
+        };
+        return from_esp(spi_device_polling_transmit(dev, &direct));
+    }
+
+    if (len > AG_PORT_SPI_BOUNCE) {
+        /*
+         * Has to be copied, so it goes a bounce-buffer at a time.  Only for a
+         * write: chopping a transfer that also reads would drop chip select
+         * between the halves, and a chip being read mid-command would not
+         * survive that.
+         */
+        if (rx != NULL) {
+            return -AG_EINVAL;
+        }
+        const uint8_t *p = (const uint8_t *)tx;
+        size_t         left = len;
+        while (left > 0) {
+            const size_t n = (left > AG_PORT_SPI_BOUNCE) ? AG_PORT_SPI_BOUNCE
+                                                         : left;
+            const ag_err_t e = ag_port_spi_xfer(bus, cs, p, NULL, n);
+            if (e != AG_OK) {
+                return e;
+            }
+            p += n;
+            left -= n;
+        }
+        return AG_OK;
+    }
+
     uint8_t *const out = s_spi[bus].bounce;
-    uint8_t *const in = out + AG_PORT_SPI_MAX_XFER;
+    uint8_t *const in = out + AG_PORT_SPI_BOUNCE;
 
     if (tx != NULL) {
         memcpy(out, tx, len);
@@ -497,7 +549,23 @@ ag_err_t ag_port_spi_xfer(int bus, int cs, const void *tx, void *rx, size_t len)
         .tx_buffer = out,
         .rx_buffer = (rx != NULL) ? in : NULL,
     };
-    err = from_esp(spi_device_transmit(dev, &t));
+    /*
+     * Polled, not queued.
+     *
+     * spi_device_transmit hands the transfer to the driver's queue, waits on a
+     * semaphore and is woken by the interrupt at the end.  That is the right
+     * shape for a transfer long enough to be worth sleeping through, and the
+     * wrong one for the traffic that actually goes over this bus: a panel being
+     * fed a frame in kilobyte pieces.  Measured on the display path, the queued
+     * version cost about two hundred and twenty microseconds of setup per
+     * transfer against two hundred of clock - so half the time on the wire was
+     * not on the wire at all.
+     *
+     * Polling spins for the duration instead, which is exactly what a caller
+     * pushing pixels wants: it has nothing else to do until they are sent, and
+     * the bus is held for less time overall.
+     */
+    err = from_esp(spi_device_polling_transmit(dev, &t));
 
     if (err == AG_OK && rx != NULL) {
         memcpy(rx, in, len);
