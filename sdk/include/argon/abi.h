@@ -77,9 +77,12 @@ extern "C" {
  * 0.28 defined ag_input_ops_t: an AG_DEV_INPUT driver the kernel polls for
  *      events, for hardware that has to be asked rather than interrupting.
  * 0.29 appended io->spi_config: the clock for one chip on a shared bus.
+ * 0.30 appended blit_rect to ag_display_ops_t: a rectangle of pixels the
+ *      kernel owns, for a panel whose glass is larger than any framebuffer
+ *      the machine driving it can afford.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 29u
+#define AG_ABI_MINOR 30u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -619,6 +622,28 @@ typedef struct {
 } ag_textcell_t;
 
 /*
+ * A rectangle of somebody else's pixels (ABI 0.30).
+ *
+ * The surface belongs to the caller and outlives the call; the driver reads
+ * from it and returns.  Format is RGB565 in the machine's own byte order,
+ * which on every part this runs on is little endian - a panel that wants the
+ * other order swaps as it sends, because it is streaming the bytes anyway.
+ *
+ * Both the whole surface and the changed part are given, because a driver
+ * cannot place the one without knowing the other: a screen 320 pixels wide
+ * showing a surface of 160 has a choice to make about scale and margins, and
+ * it has to make the same choice for every rectangle or the picture tears
+ * itself apart.
+ */
+typedef struct {
+    const void *px;     /* top-left of the surface, RGB565                   */
+    uint32_t    stride; /* bytes between rows of px                          */
+    uint16_t    surf_w;
+    uint16_t    surf_h;
+    uint16_t    x, y, w, h; /* the changed part, in surface pixels           */
+} ag_blit_t;
+
+/*
  * Class vtable for AG_DEV_DISPLAY devices, returned by dev->ops(h).
  * Compact subset of ag_gfx_api_t keyed by the open handle — for drivers that
  * publish a panel as /dev/name rather than (or as well as) the global gfx
@@ -662,6 +687,21 @@ typedef struct ag_display_ops {
                      uint16_t count);
     void (*text_cursor)(ag_handle_t h, uint16_t col, uint16_t row,
                         ag_textcell_t under, bool visible);
+
+    /*
+     * ABI 0.30: pixels, for the same kind of panel as text_row above.
+     *
+     * acquire/flush/swap hand a driver a framebuffer it owns.  This is the
+     * other way round and for the other kind of machine: the kernel owns the
+     * surface - as large as its heap will bear, which here is a quarter of the
+     * glass - and the driver is told which part of it changed.  The driver
+     * decides how that surface lands on the panel; scaling it by a whole
+     * number and centring what is left is what the one in tree does.
+     *
+     * Called on the task that flushed, with `h` zero and the device registry
+     * held.  A driver with a framebuffer of its own leaves this NULL.
+     */
+    void (*blit_rect)(ag_handle_t h, const ag_blit_t *b);
 } ag_display_ops_t;
 
 /* ------------------------------------------------------------------------ */

@@ -32,7 +32,7 @@
 
 #include "font8x8.h"
 
-AG_DRV("ILI9341", "0.1", "argon");
+AG_DRV("ILI9341", "0.3", "argon");
 
 /*
  * The board this was written on: an ESP32-2432S024, whose panel is on SPI2
@@ -236,6 +236,115 @@ static void lcd_text_cursor(ag_handle_t h, uint16_t col, uint16_t row,
     }
 }
 
+/* ---- pixels ------------------------------------------------------------ */
+
+/*
+ * A surface the kernel owns, put on glass that is bigger than it (ABI 0.30).
+ *
+ * This board has 320x240 in front of it and about sixty kilobytes it can hand
+ * out in one piece; a framebuffer of that size is a hundred and fifty.  So the
+ * surface is smaller than the panel and something has to decide what to do
+ * with the difference.  Here: scale it by the largest whole number that still
+ * fits and centre what is left, which for the 160x120 the system asks for is
+ * exactly two and no margin at all.
+ *
+ * A whole number and not a fraction, because the alternative is a resampler
+ * and a line of pixels that changes width as it crosses the screen.  Doubling
+ * is a copy.
+ */
+static uint16_t s_surf_w, s_surf_h;
+static uint16_t s_scale, s_off_x, s_off_y;
+
+static void clear_panel(void)
+{
+    for (size_t i = 0; i < sizeof(s_row) / sizeof(s_row[0]); i++) {
+        s_row[i] = 0;
+    }
+    window(0, 0, LCD_W - 1, LCD_H - 1);
+    for (uint16_t band = 0; band < LCD_H / CELL_H; band++) {
+        data(s_row, sizeof(s_row));
+    }
+}
+
+/* Works out the placement, and wipes the glass when it has changed. */
+static void fit_surface(uint16_t w, uint16_t h)
+{
+    if (w == s_surf_w && h == s_surf_h) {
+        return;
+    }
+    uint16_t sx = (uint16_t)(w ? LCD_W / w : 1);
+    uint16_t sy = (uint16_t)(h ? LCD_H / h : 1);
+    uint16_t sc = (sx < sy) ? sx : sy;
+    if (sc == 0) {
+        sc = 1; /* a surface larger than the glass: show its top-left corner */
+    }
+
+    s_surf_w = w;
+    s_surf_h = h;
+    s_scale = sc;
+    const uint16_t used_w = (uint16_t)(w * sc);
+    const uint16_t used_h = (uint16_t)(h * sc);
+    s_off_x = (used_w < LCD_W) ? (uint16_t)((LCD_W - used_w) / 2u) : 0u;
+    s_off_y = (used_h < LCD_H) ? (uint16_t)((LCD_H - used_h) / 2u) : 0u;
+
+    /* The margins are ours and they still have the console on them. */
+    clear_panel();
+}
+
+static void lcd_blit_rect(ag_handle_t h, const ag_blit_t *b)
+{
+    (void)h;
+    if (!s_up || b == NULL || b->px == NULL || b->w == 0 || b->h == 0) {
+        return;
+    }
+
+    fit_surface(b->surf_w, b->surf_h);
+
+    /* Clip to what the glass can actually show at this scale. */
+    uint16_t x = b->x, y = b->y, w = b->w, hgt = b->h;
+    const uint16_t max_w = (uint16_t)((LCD_W - s_off_x) / s_scale);
+    const uint16_t max_h = (uint16_t)((LCD_H - s_off_y) / s_scale);
+    if (x >= max_w || y >= max_h) {
+        return;
+    }
+    if (x + w > max_w) {
+        w = (uint16_t)(max_w - x);
+    }
+    if (y + hgt > max_h) {
+        hgt = (uint16_t)(max_h - y);
+    }
+
+    const uint16_t out_w = (uint16_t)(w * s_scale);
+    const uint16_t x0 = (uint16_t)(s_off_x + x * s_scale);
+    const uint16_t y0 = (uint16_t)(s_off_y + y * s_scale);
+
+    /*
+     * One window for the whole rectangle: the controller walks it itself, so
+     * every row after the first is pixels and nothing else.  Four commands per
+     * frame instead of four per line is most of the difference between a
+     * picture that moves and one that crawls.
+     */
+    window(x0, y0, (uint16_t)(x0 + out_w - 1),
+           (uint16_t)(y0 + hgt * s_scale - 1));
+
+    const uint8_t *src = (const uint8_t *)b->px + (size_t)y * b->stride +
+                         (size_t)x * sizeof(uint16_t);
+    for (uint16_t row = 0; row < hgt; row++) {
+        const uint16_t *in = (const uint16_t *)(const void *)src;
+        uint16_t        o = 0;
+        for (uint16_t i = 0; i < w; i++) {
+            const uint16_t px = swap16(in[i]);
+            for (uint16_t k = 0; k < s_scale; k++) {
+                s_row[o++] = px;
+            }
+        }
+        for (uint16_t k = 0; k < s_scale; k++) {
+            data(s_row, (size_t)out_w * sizeof(uint16_t));
+        }
+        src += b->stride;
+    }
+}
+
 static const ag_display_ops_t k_display_ops = {
     .size = sizeof(ag_display_ops_t),
     .info = lcd_info,
@@ -246,6 +355,7 @@ static const ag_display_ops_t k_display_ops = {
     .text_info = lcd_text_info,
     .text_row = lcd_text_row,
     .text_cursor = lcd_text_cursor,
+    .blit_rect = lcd_blit_rect,
 };
 
 /*
@@ -299,13 +409,7 @@ static bool panel_init(void)
     /* Black, everywhere, before the backlight comes on: whatever the panel
      * was showing is not ours and must not be handed to the user as if it
      * were. */
-    for (uint32_t i = 0; i < LCD_W * CELL_H; i++) {
-        s_row[i] = 0;
-    }
-    window(0, 0, LCD_W - 1, LCD_H - 1);
-    for (uint32_t band = 0; band < LCD_H / CELL_H; band++) {
-        data(s_row, sizeof(s_row));
-    }
+    clear_panel();
 
     io->gpio_write(LCD_BL, 1);
     return true;
