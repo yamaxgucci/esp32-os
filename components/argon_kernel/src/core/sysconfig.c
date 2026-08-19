@@ -24,10 +24,11 @@
  * pointers into it, so it has to stay.
  *
  * 4 KB is a great deal of configuration and almost no documentation, which is
- * why comment lines are dropped on the way in (strip_comments below): the board
- * pack in tree is 3.6 KB of which 300 bytes are settings.  Running out is
- * reported rather than silently truncating - a half-read config file is worse
- * than none, and it is worse still when nothing says so.
+ * why comment lines never get here: load_one reads a line at a time and keeps
+ * only what the parser needs.  The board pack in tree is over four kilobytes of
+ * which some three hundred bytes are settings, so it would not otherwise fit at
+ * all.  Running out is reported rather than silently truncating - a half-read
+ * config file is worse than none, and it is worse still when nothing says so.
  */
 #define AG_CFG_TEXT_BYTES 4096
 
@@ -47,49 +48,58 @@ static void note_source(const char *name)
 }
 
 /*
- * Drops comment and blank lines in place, returning the length that is left.
- *
- * The parser keeps its entries as pointers into this text, so whatever is read
- * has to stay resident - and a configuration file that explains itself is
- * mostly explanation.  The board pack in tree is three and a half kilobytes of
- * which perhaps three hundred bytes are settings; keeping the rest would mean
- * the budget below is spent on prose, and the file after it gets truncated.
- *
- * Which is exactly what happened: BOARD.CFG left four hundred bytes for
- * SYSTEM.CFG, SYSTEM.CFG was five hundred and fifty with its [modules] section
- * at the end, and the board booted with no drivers and nothing to say about it.
+ * Longest line a configuration file may have.  A section header, a key and a
+ * path fit comfortably; a comment does not have to, because comments never
+ * reach here.
  */
-static size_t strip_comments(char *text, size_t len)
+#define AG_CFG_LINE_MAX 160
+
+typedef struct {
+    char  *out;      /* where kept lines go: into the shared text buffer */
+    size_t room;     /* how much of it is left                          */
+    size_t used;
+    char   line[AG_CFG_LINE_MAX];
+    size_t line_len;
+    bool   overflow;  /* a kept line did not fit in the shared buffer   */
+    bool   long_line; /* a line was longer than AG_CFG_LINE_MAX         */
+} cfg_sink_t;
+
+/*
+ * One finished line, kept or dropped.
+ *
+ * Comments and blank lines are dropped here rather than after the whole file is
+ * read, and that is the difference between "a configuration file may be as long
+ * as it likes" and "4 KB, comments included".  The parser keeps its entries as
+ * pointers into the shared buffer, so whatever is kept has to stay resident -
+ * but there is no reason for the prose to stay with it, and the board pack in
+ * tree is four kilobytes of which some three hundred bytes are settings.
+ *
+ * Reading first and stripping afterwards was the previous shape, and it failed
+ * the moment BOARD.CFG grew past the buffer: the read was truncated before
+ * anything could be dropped.
+ */
+static void sink_line(cfg_sink_t *sk)
 {
-    size_t out = 0;
-    size_t i = 0;
-
-    while (i < len) {
-        /* One line, [i, eol). */
-        size_t eol = i;
-        while (eol < len && text[eol] != '\n') {
-            eol++;
-        }
-
-        size_t first = i;
-        while (first < eol && (text[first] == ' ' || text[first] == '\t' ||
-                               text[first] == '\r')) {
-            first++;
-        }
-        const bool keep = (first < eol && text[first] != ';' &&
-                           text[first] != '#');
-        if (keep) {
-            const size_t n = eol - i;
-            if (out != i) {
-                memmove(text + out, text + i, n);
-            }
-            out += n;
-            text[out++] = '\n';
-        }
-
-        i = (eol < len) ? eol + 1 : len;
+    size_t first = 0;
+    while (first < sk->line_len &&
+           (sk->line[first] == ' ' || sk->line[first] == '\t' ||
+            sk->line[first] == '\r')) {
+        first++;
     }
-    return out;
+
+    const bool keep = (first < sk->line_len && sk->line[first] != ';' &&
+                       sk->line[first] != '#');
+    if (keep) {
+        const size_t n = sk->line_len - first;
+        if (sk->used + n + 1u < sk->room) {
+            memcpy(sk->out + sk->used, sk->line + first, n);
+            sk->used += n;
+            sk->out[sk->used++] = '\n';
+        } else {
+            sk->overflow = true;
+        }
+    }
+    sk->line_len = 0;
 }
 
 /*
@@ -103,42 +113,50 @@ static ag_err_t load_one(const char *path, const char *label)
         return h;
     }
 
-    char  *dst = s_text + s_text_used;
-    size_t room = AG_CFG_TEXT_BYTES - s_text_used;
-    if (room < 2) {
+    cfg_sink_t sk = {0};
+    sk.out = s_text + s_text_used;
+    sk.room = AG_CFG_TEXT_BYTES - s_text_used;
+    if (sk.room < 2) {
         ag_vfs_close(h);
-        ag_log(AG_LOG_WARN, TAG, "%s: no room left for it (%u bytes of %u used)",
+        ag_log(AG_LOG_WARN, TAG, "%s: no room left for it (%u of %u used)",
                label, (unsigned)s_text_used, (unsigned)AG_CFG_TEXT_BYTES);
         return -AG_ENOSPC;
     }
 
-    /* Leave a byte for the terminator the parser needs. */
-    const int32_t n = ag_vfs_read(h, dst, room - 1);
+    char chunk[128];
+    for (;;) {
+        const int32_t n = ag_vfs_read(h, chunk, sizeof(chunk));
+        if (n <= 0) {
+            break;
+        }
+        for (int32_t i = 0; i < n; i++) {
+            const char c = chunk[i];
+            if (c == '\n') {
+                sink_line(&sk);
+            } else if (sk.line_len + 1u < sizeof(sk.line)) {
+                sk.line[sk.line_len++] = c;
+            } else {
+                sk.long_line = true;
+            }
+        }
+    }
+    sink_line(&sk); /* a last line with no newline after it */
     ag_vfs_close(h);
 
-    if (n < 0) {
-        return n;
-    }
-    /*
-     * A read that exactly filled the room is a file that may have more to it,
-     * and the part that was lost is the end - which in a file people write by
-     * hand is the part they added last.  Say so: it is the difference between
-     * "the driver did not load" and an afternoon.
-     */
-    const bool maybe_truncated = ((size_t)n == room - 1);
+    sk.out[sk.used] = '\0';
+    s_text_used += sk.used + 1;
 
-    dst[n] = '\0';
-    const size_t kept = strip_comments(dst, (size_t)n);
-    dst[kept] = '\0';
-    s_text_used += kept + 1;
-
-    if (maybe_truncated) {
+    if (sk.overflow) {
         ag_log(AG_LOG_WARN, TAG,
-               "%s: read only %u bytes - the rest did not fit and is ignored",
-               label, (unsigned)n);
+               "%s: settings past %u bytes are ignored - the buffer is full",
+               label, (unsigned)sk.used);
+    }
+    if (sk.long_line) {
+        ag_log(AG_LOG_WARN, TAG, "%s: a line over %u characters was cut",
+               label, (unsigned)AG_CFG_LINE_MAX);
     }
 
-    const ag_err_t err = ag_cfg_parse(dst, &s_cfg);
+    const ag_err_t err = ag_cfg_parse(sk.out, &s_cfg);
     if (err == AG_OK) {
         note_source(label);
     }
