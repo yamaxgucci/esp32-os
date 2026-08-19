@@ -28,14 +28,34 @@ AG_APP("TOUCH", "0.1", "argon", 0);
  * screen is now really ours.  Two hours went into a blank screen that was
  * blamed on the touchscreen driver.
  */
-static void repaint(const ag_coninfo_t *info)
+/*
+ * The screen is the only thing the person holding the stylus is looking at, so
+ * the instructions live on it.  Saying them anywhere else - a terminal on
+ * another machine, a message in a chat window - means they arrive after the
+ * moment they were about to describe.
+ */
+static const char *k_steps[] = {
+    "1. DRAG LEFT -> RIGHT ALONG THE TOP",
+    "2. NOW DRAG TOP -> BOTTOM, LEFT SIDE",
+    "3. TAP THE FOUR CORNERS",
+    "DONE - PRESS ESC",
+};
+
+static void repaint(const ag_coninfo_t *info, unsigned step)
 {
     /* The header only: the marks left by a finger are the record of what
      * happened and must survive a redraw. */
+    const unsigned last = (unsigned)(sizeof(k_steps) / sizeof(k_steps[0]) - 1u);
+    const unsigned s = (step > last) ? last : step;
+
     ag_color(AG_LGRAY, AG_BLACK);
     ag_gotoxy(0, 0);
-    ag_printf("touch: %ux%u cells. Esc to stop.", (unsigned)info->cols,
+    ag_printf("touch %ux%u  esc=stop      ", (unsigned)info->cols,
               (unsigned)info->rows);
+    ag_color(AG_YELLOW, AG_BLACK);
+    ag_gotoxy(0, 1);
+    ag_printf("%-38s", k_steps[s]);
+    ag_color(AG_LGRAY, AG_BLACK);
 }
 
 int ag_main(int argc, char **argv)
@@ -49,10 +69,16 @@ int ag_main(int argc, char **argv)
     uint32_t moves = 0;
     bool     running = true;
 
+    /*
+     * A step ends after this many strokes.  The point is not to count
+     * accurately: it is to move the instruction on by itself, so that whoever
+     * is holding the stylus never has to look away from the screen.
+     */
+    unsigned step = 0;
+    unsigned strokes = 0;
+
     ag_cls();
-    repaint(&info);
-    ag_gotoxy(0, 2);
-    ag_printf("waiting for a finger");
+    repaint(&info, step);
 
     uint32_t idle = 0;
 
@@ -71,7 +97,7 @@ int ag_main(int argc, char **argv)
              */
             if (++idle >= 5) {
                 idle = 0;
-                repaint(&info);
+                repaint(&info, step);
             }
             continue;
         }
@@ -79,7 +105,7 @@ int ag_main(int argc, char **argv)
 
         switch (ev.type) {
         case AG_EV_FOCUS_GAINED:
-            repaint(&info);
+            repaint(&info, step);
             break;
 
         case AG_EV_KEY_DOWN:
@@ -118,6 +144,14 @@ int ag_main(int argc, char **argv)
             ag_color(AG_LGRAY, AG_BLACK);
             ag_printf("up   at %d,%d   taps %u moves %u    ", (int)ev.ptr.x,
                       (int)ev.ptr.y, (unsigned)taps, (unsigned)moves);
+            /* A stroke is a press and its release; three of them move the
+             * instruction on and clear the screen for the next one. */
+            if (++strokes >= 3u) {
+                strokes = 0;
+                step++;
+                ag_cls();
+                repaint(&info, step);
+            }
             break;
 
         default:

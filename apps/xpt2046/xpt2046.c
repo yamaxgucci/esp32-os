@@ -125,6 +125,17 @@ static uint16_t pressure(uint16_t x, uint16_t z1, uint16_t z2)
     return (z < 0) ? 0 : (uint16_t)z;
 }
 
+/*
+ * Which way each axis runs, relative to the picture on the glass.
+ *
+ * Both of them backwards here, and that is one fact about how this panel was
+ * assembled rather than two: the controller's origin is at the corner opposite
+ * the one the display driver calls (0,0).  Measured, not derived - a drag left
+ * to right along the top came back as column 39 down to 11 on row 28 of 29.
+ */
+#define FLIP_X 1
+#define FLIP_Y 1
+
 static int16_t to_cell(uint16_t raw, int span, int cell)
 {
     int v = (int)raw;
@@ -184,13 +195,23 @@ static int32_t touch_poll(ag_handle_t h, ag_event_t *out, uint32_t max)
     }
 
     /*
-     * The panel is mounted landscape (MADCTL 0x40 in the display driver), so
-     * the controller's y runs along the screen's x.  Getting this wrong is the
-     * failure everybody has once: the pointer moves at right angles to the
-     * finger.
+     * Which raw axis is the screen's across.
+     *
+     * The panel is mounted landscape (MADCTL 0x40 in the display driver) and
+     * the controller is not, so one of the two is turned relative to the
+     * other - but which way is a fact about how the glass was glued on, not
+     * something to reason out.  It was reasoned out first, wrongly: a stylus
+     * drawn horizontally left a vertical line.
      */
-    const int16_t col = to_cell(ry, PANEL_W, CELL_W);
-    const int16_t row = to_cell(rx, PANEL_H, CELL_H);
+    int16_t col = to_cell(rx, PANEL_W, CELL_W);
+    int16_t row = to_cell(ry, PANEL_H, CELL_H);
+
+#if FLIP_X
+    col = (int16_t)(COLS - 1 - col);
+#endif
+#if FLIP_Y
+    row = (int16_t)(ROWS - 1 - row);
+#endif
 
     if (!s_state.down) {
         s_state.down = true;
