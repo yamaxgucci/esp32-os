@@ -2,7 +2,8 @@
  * ArgonOS GB - a Game Boy, on a board with 320 KB of memory in total.
  *
  *   gb a:\dmg-acid2.gb          run it until Esc
- *   gb a:\game.gb stats         and print frames per second every two seconds
+ *   gb a:\game.gb fps60         draw every frame; the board then runs 8% slow
+ *   gb a:\game.gb stats         report rate and where the time goes
  *
  * The emulator is Peanut-GB (MIT, see peanut_gb.h and LICENSE.peanut-gb); this
  * file is the ArgonOS half of it: the cartridge, the screen, the buttons and
@@ -399,6 +400,14 @@ static struct gb_s s_gb;
 int ag_main(int argc, char **argv)
 {
     bool stats = false;
+    /*
+     * Every other frame by default, because the board cannot draw sixty and
+     * keep time, and of the two it is keeping time that a player feels.  Drawn
+     * sixty it manages fifty-five and every game runs eight per cent slow;
+     * drawn thirty it runs at exactly its own speed.  `fps60` asks for the other
+     * trade.
+     */
+    bool        skip = true;
     const char *path = NULL;
 
     for (int i = 1; i < argc; i++) {
@@ -407,12 +416,15 @@ int ag_main(int argc, char **argv)
         }
         if (argv[i][0] == 's' || argv[i][0] == 'S') {
             stats = true;
+        } else if (argv[i][0] == 'f' || argv[i][0] == 'F') {
+            /* fps30 / fps60: how often to draw, not how fast to run. */
+            skip = (argv[i][3] != '6');
         } else if (path == NULL) {
             path = argv[i];
         }
     }
     if (path == NULL) {
-        ag_printf("usage: gb <cartridge.gb> [stats]\n");
+        ag_printf("usage: gb <cartridge.gb> [fps30|fps60] [stats]\n");
         return 1;
     }
 
@@ -441,8 +453,24 @@ int ag_main(int argc, char **argv)
         ag_printf("gb: display: %s\n", ag_strerror(gerr));
         return 1;
     }
-    ag_printf("gb: %ux%u panel, picture 160x144 centred; Esc quits\n",
-              (unsigned)info.width, (unsigned)info.height);
+    /*
+     * Drawing every other frame, when asked.
+     *
+     * The emulator runs every frame either way - a Game Boy game keeps its own
+     * time and skipping emulation would slow the game down, which is the thing
+     * being avoided.  What is skipped is the *rendering*, and with it the twelve
+     * milliseconds of panel: at sixty frames drawn the board manages fifty-five,
+     * so the game runs eight per cent slow, and at thirty drawn there is room to
+     * spare and it runs at exactly its own speed.
+     *
+     * Thirty updates a second on a screen is not a compromise anybody notices;
+     * a game running slow is.
+     */
+    s_gb.direct.frame_skip = skip;
+
+    ag_printf("gb: %ux%u panel, picture 160x144 centred, drawing every %s "
+              "frame; Esc quits\n", (unsigned)info.width,
+              (unsigned)info.height, skip ? "other" : "");
 
     keys_apply();
 
@@ -499,19 +527,41 @@ int ag_main(int argc, char **argv)
 
         if (stats && ag_millis() - stat_at >= 2000u) {
             const uint32_t ms = ag_millis() - stat_at;
-            ag_printf("gb: %u fps, emu %u us, show %u us per frame\n",
+            const uint32_t n = stat_frames ? stat_frames : 1u;
+            /*
+             * Per cent of real time, which is the only figure a player feels:
+             * a hundred means the game is running at its own speed, whatever
+             * the screen is doing.
+             */
+            const uint32_t realtime = (uint32_t)(((uint64_t)stat_frames *
+                                                  frame_us) / (ms * 10u));
+            ag_printf("gb: %u fps, %u%% of real time, emu %u us, show %u us "
+                      "per frame\n",
                       (unsigned)(stat_frames * 1000u / ms),
-                      (unsigned)(emu_us / (stat_frames ? stat_frames : 1u)),
-                      (unsigned)(s_present_us /
-                                 (stat_frames ? stat_frames : 1u)));
+                      (unsigned)realtime, (unsigned)(emu_us / n),
+                      (unsigned)(s_present_us / n));
             stat_at = ag_millis();
             stat_frames = 0;
             emu_us = 0;
             s_present_us = 0;
         }
 
-        /* Sleep only if there is time left; never try to catch up by running
-         * two frames back to back, which turns a slow board into a jerky one. */
+        /*
+         * Wait out the rest of the frame.
+         *
+         * Whole milliseconds, and no spinning for the remainder - which was
+         * tried, on the reasoning that a frame is also a clock and a two per
+         * cent error in it will be audible once there is sound.  Measured, it
+         * was worse: fifty-seven frames a second against fifty-eight, because
+         * the spin keeps the processor from the tasks that share it and they
+         * take their time back afterwards.  Left as it is until there is sound
+         * to say otherwise.
+         *
+         * The target accumulates rather than restarting from now, so a frame
+         * that ran long is paid for by the next sleep being shorter, and the
+         * average holds.  Falling behind resets it: catching up by running two
+         * frames back to back turns a slow board into a jerky one.
+         */
         next += frame_us;
         const uint64_t now = ag_micros();
         if (next > now) {
