@@ -233,6 +233,14 @@ ag_err_t ag_audio_init(void)
     (void)apply_fmt(NULL);
     ag_log(AG_LOG_INFO, TAG, "pcmnull ready (mute; load .SYS for virt/I2S)");
     {
+        /*
+         * The real output first, so the mixer finds it: pcmmix picks its sink
+         * when it starts and pcm0 has to exist by then.
+         */
+        const ag_err_t hw_err = ag_pcmhw_init();
+        if (hw_err != AG_OK) {
+            return hw_err;
+        }
         const ag_err_t mix_err = ag_pcmmix_init();
         if (mix_err != AG_OK) {
             return mix_err;

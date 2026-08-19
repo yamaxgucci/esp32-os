@@ -53,6 +53,22 @@ menu "ArgonOS"
             out and io->adc_read is NULL.  Turn this on for a real board, where
             the calibration works, and expect QEMU to stop booting.
 
+    config ARGON_ENABLE_AUDIO
+        bool "Sound output hardware (/dev/pcm0)"
+        default n
+        help
+            Links the machine's own PCM output and registers /dev/pcm0, which
+            is what `--out audio` and audio_out=i2s in a config already mean.
+
+            Off by default because most targets have nothing to link: the
+            original ESP32 has a pair of 8-bit converters on fixed pins and the
+            ESP32-S3 has none at all, and QEMU models neither.  With this off
+            the only sink is the mute /dev/pcmnull and every program that plays
+            sound still runs.
+
+            What it costs when something is playing is about four kilobytes of
+            DMA buffers, taken on the first write and given back on close.
+
     config ARGON_CONSOLE_KEY_EVENTS
         bool "Request key-up events from the terminal"
         default n

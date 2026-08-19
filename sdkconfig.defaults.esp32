@@ -106,6 +106,12 @@ CONFIG_ARGON_ENABLE_HOSTFS=n
 # GPIO34 to try it on.
 CONFIG_ARGON_ENABLE_ADC=y
 
+# Sound.  This part has two 8-bit converters of its own and this board wires
+# GPIO26 - the second of them - to an amplifier and a speaker, which is the
+# only way it can make a noise: there is no codec and no USB.  Off everywhere
+# else because the S3 has no converters and QEMU has no DMA for them.
+CONFIG_ARGON_ENABLE_AUDIO=y
+
 CONFIG_ESP_CONSOLE_UART_DEFAULT=y
 
 # Forty columns, because the screen soldered to this board is 320 pixels wide
