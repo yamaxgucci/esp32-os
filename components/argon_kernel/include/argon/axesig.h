@@ -7,6 +7,8 @@
 #define ARGON_AXESIG_H
 
 #include <argon/abi.h>
+#include <argon/axe.h>
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -29,6 +31,16 @@ extern "C" {
  * bad tag or unknown key is rejected.
  */
 ag_err_t ag_axe_check_sig(const void *file, size_t file_bytes);
+
+/*
+ * Whether this image carries a signature at all.
+ *
+ * The loader asks before it decides how to read the file: verifying a signature
+ * means hashing every byte in order, which needs the whole file in memory, and
+ * an unsigned image can be streamed into place instead.  Signing is optional,
+ * so on a small machine the common case is the cheap one.
+ */
+bool ag_axe_is_signed(const ag_axe_header_t *h);
 
 /*
  * Writes algo/key_id/tag into the file's reserved field (mutates in place).

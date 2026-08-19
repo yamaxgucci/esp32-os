@@ -243,6 +243,11 @@ static bool tag_equal(const uint8_t *a, const uint8_t *b, size_t n)
     return diff == 0;
 }
 
+bool ag_axe_is_signed(const ag_axe_header_t *h)
+{
+    return h != NULL && !reserved_is_unsigned(h);
+}
+
 ag_err_t ag_axe_check_sig(const void *file, size_t file_bytes)
 {
     if (file == NULL) {

@@ -81,6 +81,13 @@
               "apps/sms/core/sound/sn76489.c"]
     },
 
+    {
+      "out": "GB.AXE", "group": "board",
+      "include": ["apps/common", "apps/common/libc", "apps/gb"],
+      "cflags": "-Os -ffunction-sections -fdata-sections -fno-builtin -DENABLE_SOUND=0 -DENABLE_LCD=1 -DPEANUT_GB_12_COLOUR=0 -DPEANUT_GB_HIGH_LCD_ACCURACY=0 -Wno-unused -Wno-sign-compare",
+      "src": ["apps/gb/gb_main.c", "apps/common/libc/libc_shim.c"]
+    },
+
     { "out": "GFXPIX.AXE", "group": "board", "src": ["apps/gfxpix/gfxpix.c"] },
     { "out": "ILI9341.SYS", "group": "board", "src": ["apps/ili9341/ili9341.c"] },
     { "out": "XPT2046.SYS", "group": "board", "src": ["apps/xpt2046/xpt2046.c"] },

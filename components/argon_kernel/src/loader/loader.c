@@ -329,20 +329,34 @@ static ag_err_t place_xip(const ag_axe_header_t *header, ag_loaded_app_t *out)
         return err;
     }
 
-    void *scratch = scratch_alloc(header->code.size);
-    if (scratch == NULL) {
-        ag_appfs_release(slot);
-        return -AG_ENOMEM;
-    }
-
+    /*
+     * Data first, scratch second, and the order is the point.
+     *
+     * The scratch is freed as soon as the code has been written to flash, while
+     * the data stays for as long as the process does.  Taking the scratch first
+     * puts the long-lived block above the short-lived one, so when the scratch
+     * goes it leaves a hole with allocations on both sides - and the largest free
+     * block afterwards is that hole rather than the whole remainder.
+     *
+     * Measured: an application whose arena request of 33 KB was refused with
+     * 35 KB free, because the free memory was in two pieces of twenty-two and
+     * thirteen.  Reversed, the scratch sits between the data and the free tail
+     * and merges into it when released.
+     */
     void *data = NULL;
     if (header->data.size > 0) {
         data = data_alloc(header->data.size);
         if (data == NULL) {
-            ag_port_free(scratch);
             ag_appfs_release(slot);
             return -AG_ENOMEM;
         }
+    }
+
+    void *scratch = scratch_alloc(header->code.size);
+    if (scratch == NULL) {
+        ag_port_free(data);
+        ag_appfs_release(slot);
+        return -AG_ENOMEM;
     }
 
     out->place.code = exec;
@@ -380,29 +394,172 @@ static ag_err_t place_image(const ag_axe_header_t *header, ag_loaded_app_t *out)
         return -AG_ENOMEM;
     }
 
+    /*
+     * Both budgets, because flash XIP moves the problem from one to the other:
+     * the code no longer needs the arena, and instead needs a scratch buffer of
+     * its own size in ordinary memory, alongside the image's data.  On a machine
+     * where those two together are most of the heap, the number that matters is
+     * this one and it is worth printing before the attempt rather than after.
+     */
     ag_log(AG_LOG_INFO, "loader",
-           "%u bytes of code exceed the arena (%u free); using flash XIP",
+           "%u bytes of code exceed the arena (%u free); flash XIP needs "
+           "%u scratch + %u data, heap has %u free, largest %u",
            (unsigned)header->code.size,
-           (unsigned)ag_arena_largest_free(&s_code, 16));
+           (unsigned)ag_arena_largest_free(&s_code, 16),
+           (unsigned)header->code.size, (unsigned)header->data.size,
+           (unsigned)ag_port_mem_free(AG_MEM_FAST | AG_MEM_BYTE),
+           (unsigned)ag_port_mem_largest(AG_MEM_FAST | AG_MEM_BYTE));
 
     const ag_err_t err = place_xip(header, out);
     if (err != AG_OK) {
+        /*
+         * The heap, not the arena.  Flash XIP has already given up on the arena
+         * by the time it is tried, and what it needs instead is ordinary memory:
+         * a scratch buffer the size of the code, to relocate in before writing
+         * to flash, plus the image's data.  Reporting the arena here sent me
+         * looking at the wrong number entirely.
+         */
         ag_log(AG_LOG_ERROR, "loader",
-               "flash XIP placement failed (%d); arena free %u, largest %u",
-               (int)err, (unsigned)ag_arena_free_bytes(&s_code),
-               (unsigned)ag_arena_largest_free(&s_code, 16));
+               "flash XIP placement failed (%d); needed %u scratch + %u data, "
+               "heap has %u free, largest %u",
+               (int)err, (unsigned)header->code.size,
+               (unsigned)header->data.size,
+               (unsigned)ag_port_mem_free(AG_MEM_FAST | AG_MEM_BYTE),
+               (unsigned)ag_port_mem_largest(AG_MEM_FAST | AG_MEM_BYTE));
     }
     return err;
 }
 
-ag_err_t ag_loader_load(const char *path, const char *cwd,
-                        ag_loaded_app_t *out)
+/*
+ * Reads exactly `bytes` from `at` in the file.
+ *
+ * Short reads are an error rather than something to retry around: the sizes come
+ * from the image's own header, so a read that stops early means the file does
+ * not match what it says about itself.
+ */
+static ag_err_t read_at(ag_handle_t h, uint64_t at, void *dst, size_t bytes)
 {
-    if (path == NULL || out == NULL) {
-        return -AG_EINVAL;
+    if (ag_vfs_seek(h, (int64_t)at, AG_SEEK_SET) < 0) {
+        return -AG_EFORMAT;
     }
-    memset(out, 0, sizeof(*out));
+    uint8_t *p = (uint8_t *)dst;
+    size_t   got = 0;
+    while (got < bytes) {
+        const int32_t n = ag_vfs_read(h, p + got, bytes - got);
+        if (n <= 0) {
+            return (n < 0) ? (ag_err_t)n : -AG_EFORMAT;
+        }
+        got += (size_t)n;
+    }
+    return AG_OK;
+}
 
+/*
+ * The code part, from the file into its place, a chunk at a time.
+ *
+ * Through copy_image rather than straight into the destination because the
+ * destination may be the IRAM arena, which accepts only aligned 32-bit stores -
+ * see copy_image.  Chunks are a multiple of four so that only the very last one
+ * can have a tail, which is the one case copy_image handles by reading a word,
+ * changing part of it and writing it back.
+ */
+static ag_err_t stream_code(ag_handle_t h, const ag_axe_part_t *part, void *dst)
+{
+    uint8_t  buf[512];
+    uint8_t *out = (uint8_t *)dst;
+    size_t   done = 0;
+
+    if (ag_vfs_seek(h, (int64_t)part->offset, AG_SEEK_SET) < 0) {
+        return -AG_EFORMAT;
+    }
+    while (done < part->file_size) {
+        size_t want = part->file_size - done;
+        if (want > sizeof(buf)) {
+            want = sizeof(buf);
+        }
+        size_t got = 0;
+        while (got < want) {
+            const int32_t n = ag_vfs_read(h, buf + got, want - got);
+            if (n <= 0) {
+                return (n < 0) ? (ag_err_t)n : -AG_EFORMAT;
+            }
+            got += (size_t)n;
+        }
+        copy_image(out + done, buf, want);
+        done += want;
+    }
+    return AG_OK;
+}
+
+/*
+ * Loads an image without ever holding the whole file.
+ *
+ * The obvious way - read the file, then place it, then copy out of it - keeps
+ * three copies of the image alive at the same time: the file, the code (or, for
+ * flash execution, a scratch buffer the size of the code) and the data.  On a
+ * machine with room that costs nothing worth naming.  On a board with sixty
+ * kilobytes of byte-addressable memory free it is the difference between loading
+ * and not: a twenty-five kilobyte application needed seventy-five, and every
+ * number in the failure was about the wrong thing.
+ *
+ * Read in the order the parts sit in the file and nothing is held twice.  What
+ * still has to be held whole is the relocation table, because relocations are
+ * applied after both parts are in place and in no particular order - but that is
+ * four bytes each, under two kilobytes for the largest image here.
+ *
+ * A signed image takes the older path: verifying a signature means hashing every
+ * byte, and hashing what has already been scattered into two places is a
+ * different piece of work.  Signing is optional and rare; running out of memory
+ * is neither.
+ */
+static ag_err_t load_streamed(ag_handle_t h, const ag_axe_header_t *header,
+                              ag_loaded_app_t *out)
+{
+    out->header = *header;
+
+    ag_err_t err = place_image(header, out);
+    if (err != AG_OK) {
+        memset(out, 0, sizeof(*out));
+        return err;
+    }
+
+    void *code_dst = (out->place.code_writable != NULL)
+                         ? out->place.code_writable
+                         : out->place.code;
+    err = stream_code(h, &header->code, code_dst);
+    if (err == AG_OK && header->data.file_size > 0) {
+        err = read_at(h, header->data.offset, out->place.data,
+                      header->data.file_size);
+    }
+
+    uint32_t *rel = NULL;
+    if (err == AG_OK && header->reloc_count > 0) {
+        const size_t bytes = (size_t)header->reloc_count * sizeof(uint32_t);
+        rel = (uint32_t *)ag_port_alloc(bytes, AG_MEM_FAST | AG_MEM_BYTE);
+        if (rel == NULL) {
+            err = -AG_ENOMEM;
+        } else {
+            err = read_at(h, header->reloc_offset, rel, bytes);
+        }
+    }
+
+    if (err == AG_OK) {
+        err = ag_axe_apply(&out->header, &out->place, rel,
+                           header->reloc_count, &out->binding);
+    }
+    ag_port_free(rel);
+
+    if (err != AG_OK) {
+        release_image(out);
+        memset(out, 0, sizeof(*out));
+    }
+    return err;
+}
+
+/* The older path, for an image whose signature has to be checked. */
+static ag_err_t load_whole(const char *path, const char *cwd,
+                           const ag_axe_header_t *header, ag_loaded_app_t *out)
+{
     uint8_t *file = NULL;
     size_t   file_size = 0;
     ag_err_t err = read_whole(path, cwd, &file, &file_size);
@@ -410,13 +567,6 @@ ag_err_t ag_loader_load(const char *path, const char *cwd,
         return err;
     }
 
-    const ag_axe_header_t *header = (const ag_axe_header_t *)file;
-    err = ag_axe_validate(header, file_size, ag_axe_native_arch(),
-                          AG_ABI_MAJOR, AG_ABI_MINOR);
-    if (err != AG_OK) {
-        ag_port_free(file);
-        return err;
-    }
     err = ag_axe_check_sig(file, file_size);
     if (err != AG_OK) {
         ag_log(AG_LOG_ERROR, "loader", "%s: bad signature (%d)", path,
@@ -433,9 +583,9 @@ ag_err_t ag_loader_load(const char *path, const char *cwd,
         return err;
     }
 
-    /* Copy into the writable view of each part. */
-    void *code_dst = (out->place.code_writable != NULL) ? out->place.code_writable
-                                                         : out->place.code;
+    void *code_dst = (out->place.code_writable != NULL)
+                         ? out->place.code_writable
+                         : out->place.code;
     copy_image(code_dst, file + header->code.offset, header->code.file_size);
     if (header->data.file_size > 0) {
         memcpy(out->place.data, file + header->data.offset,
@@ -450,14 +600,103 @@ ag_err_t ag_loader_load(const char *path, const char *cwd,
     if (err != AG_OK) {
         release_image(out);
         memset(out, 0, sizeof(*out));
+    }
+    return err;
+}
+
+/*
+ * The header alone, without loading anything.
+ *
+ * The stack an image runs on has to be decided before the task that loads it
+ * exists, which is a chicken and egg only if the header cannot be read
+ * separately.  It can: it is the first hundred and something bytes of the file.
+ *
+ * Until this existed the task was created with the kernel default and the
+ * header's request was merely *warned* about after the fact - so an image asking
+ * for more stack quietly ran with less, and one asking for less quietly paid for
+ * more.  On a board where eight kilobytes is the difference between an
+ * application starting and not, the second half of that mattered too.
+ */
+ag_err_t ag_loader_peek(const char *path, const char *cwd,
+                        ag_axe_header_t *out)
+{
+    if (path == NULL || out == NULL) {
+        return -AG_EINVAL;
+    }
+
+    const ag_handle_t h = ag_vfs_open(path, cwd, AG_O_RDONLY);
+    if (h < 0) {
+        return h;
+    }
+
+    const int64_t size = ag_vfs_seek(h, 0, AG_SEEK_END);
+    if (size < (int64_t)sizeof(*out) || size > (int64_t)AG_LOADER_MAX_FILE) {
+        ag_vfs_close(h);
+        return -AG_EFORMAT;
+    }
+
+    const ag_err_t err = read_at(h, 0, out, sizeof(*out));
+    ag_vfs_close(h);
+    if (err != AG_OK) {
         return err;
     }
+    return ag_axe_validate(out, (size_t)size, ag_axe_native_arch(),
+                           AG_ABI_MAJOR, AG_ABI_MINOR);
+}
+
+ag_err_t ag_loader_load(const char *path, const char *cwd,
+                        ag_loaded_app_t *out)
+{
+    if (path == NULL || out == NULL) {
+        return -AG_EINVAL;
+    }
+    memset(out, 0, sizeof(*out));
+
+    const ag_handle_t h = ag_vfs_open(path, cwd, AG_O_RDONLY);
+    if (h < 0) {
+        return h;
+    }
+
+    const int64_t size = ag_vfs_seek(h, 0, AG_SEEK_END);
+    if (size < (int64_t)sizeof(ag_axe_header_t) ||
+        size > (int64_t)AG_LOADER_MAX_FILE) {
+        ag_vfs_close(h);
+        return -AG_EFORMAT;
+    }
+
+    ag_axe_header_t header;
+    ag_err_t err = read_at(h, 0, &header, sizeof(header));
+    if (err != AG_OK) {
+        ag_vfs_close(h);
+        return err;
+    }
+
+    err = ag_axe_validate(&header, (size_t)size, ag_axe_native_arch(),
+                          AG_ABI_MAJOR, AG_ABI_MINOR);
+    if (err != AG_OK) {
+        ag_vfs_close(h);
+        return err;
+    }
+
+    if (ag_axe_is_signed(&header)) {
+        ag_vfs_close(h);
+        err = load_whole(path, cwd, &header, out);
+    } else {
+        err = load_streamed(h, &header, out);
+        ag_vfs_close(h);
+    }
+    if (err != AG_OK) {
+        return err;
+    }
+
+    const ag_axe_header_t *const hdr = &out->header;
+    (void)hdr;
 
     ag_axe_bind_api(&out->binding, ag_loader_api());
 
     if (out->code_from_xip) {
         err = ag_appfs_program((ag_appfs_slot_t *)out->xip_slot,
-                               out->code_scratch, header->code.size);
+                               out->code_scratch, out->header.code.size);
         if (err != AG_OK) {
             release_image(out);
             memset(out, 0, sizeof(*out));
@@ -489,16 +728,16 @@ ag_err_t ag_loader_load(const char *path, const char *cwd,
         /* Entry was computed against the predicted address; still valid. */
         ag_log(AG_LOG_INFO, "loader",
                "%s: %s v%s, code %u B XIP at %p, data %u B at %p, %u relocations",
-               header->name, ag_axe_arch_name((ag_axe_arch_t)header->arch),
-               header->version, (unsigned)header->code.size, out->place.code,
-               (unsigned)header->data.size, out->place.data,
+               out->header.name, ag_axe_arch_name((ag_axe_arch_t)out->header.arch),
+               out->header.version, (unsigned)out->header.code.size, out->place.code,
+               (unsigned)out->header.data.size, out->place.data,
                (unsigned)out->binding.relocated);
     } else {
         ag_log(AG_LOG_INFO, "loader",
                "%s: %s v%s, code %u B at %p, data %u B at %p, %u relocations",
-               header->name, ag_axe_arch_name((ag_axe_arch_t)header->arch),
-               header->version, (unsigned)header->code.size, out->place.code,
-               (unsigned)header->data.size, out->place.data,
+               out->header.name, ag_axe_arch_name((ag_axe_arch_t)out->header.arch),
+               out->header.version, (unsigned)out->header.code.size, out->place.code,
+               (unsigned)out->header.data.size, out->place.data,
                (unsigned)out->binding.relocated);
     }
 
