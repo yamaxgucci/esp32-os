@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ArgonOS - ILI9341 panel driver (.SYS).
  *
  *   drv install a:\ili9341.sys
@@ -287,9 +287,17 @@ static void fit_surface(uint16_t w, uint16_t h)
     s_off_x = (used_w < LCD_W) ? (uint16_t)((LCD_W - used_w) / 2u) : 0u;
     s_off_y = (used_h < LCD_H) ? (uint16_t)((LCD_H - used_h) / 2u) : 0u;
 
-    /* The margins are ours and they still have the console on them. */
+    /*
+     * The margins are ours and they still have the console on them.
+     *
+     * Nothing is printed here, and that is a rule rather than a preference:
+     * see the note on blit_rect in argon/abi.h.  A print from inside this call
+     * deadlocks the board, and it took a run that stopped between "text" and
+     * "flushed" to find out.
+     */
     clear_panel();
 }
+
 
 static void lcd_blit_rect(ag_handle_t h, const ag_blit_t *b)
 {
@@ -297,7 +305,6 @@ static void lcd_blit_rect(ag_handle_t h, const ag_blit_t *b)
     if (!s_up || b == NULL || b->px == NULL || b->w == 0 || b->h == 0) {
         return;
     }
-
     fit_surface(b->surf_w, b->surf_h);
 
     /* Clip to what the glass can actually show at this scale. */

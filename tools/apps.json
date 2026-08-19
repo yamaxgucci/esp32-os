@@ -62,6 +62,7 @@
     { "out": "MOUSEVIRT.SYS", "group": "core", "src": ["apps/mousevirt/mousevirt.c"] },
     { "out": "MIDIVIRT.SYS", "group": "core", "src": ["apps/midivirt/midivirt.c"] },
 
+    { "out": "GFXPIX.AXE", "group": "board", "src": ["apps/gfxpix/gfxpix.c"] },
     { "out": "ILI9341.SYS", "group": "board", "src": ["apps/ili9341/ili9341.c"] },
     { "out": "XPT2046.SYS", "group": "board", "src": ["apps/xpt2046/xpt2046.c"] },
 

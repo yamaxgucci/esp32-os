@@ -700,6 +700,12 @@ typedef struct ag_display_ops {
      *
      * Called on the task that flushed, with `h` zero and the device registry
      * held.  A driver with a framebuffer of its own leaves this NULL.
+     *
+     * Must not print, and neither must text_row or text_cursor above.  The
+     * registry is held here, while the console task takes the console first
+     * and the registry second - so a driver that reaches for the console from
+     * inside one of these closes the ring and stops the machine.  A driver
+     * with something to say says it from ag_driver_init.
      */
     void (*blit_rect)(ag_handle_t h, const ag_blit_t *b);
 } ag_display_ops_t;

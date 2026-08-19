@@ -5,6 +5,7 @@
  */
 #include "core/sysconfig.h"
 
+#include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -16,10 +17,17 @@
 
 #include <argon/port/mem.h>
 
+#define TAG "cfg"
+
 /*
- * One buffer holds every configuration file, laid end to end.  4 KB is a lot of
- * configuration; running out is reported rather than silently truncating, since
- * a half-read config file is worse than none.
+ * One buffer holds every configuration file, laid end to end - the parser keeps
+ * pointers into it, so it has to stay.
+ *
+ * 4 KB is a great deal of configuration and almost no documentation, which is
+ * why comment lines are dropped on the way in (strip_comments below): the board
+ * pack in tree is 3.6 KB of which 300 bytes are settings.  Running out is
+ * reported rather than silently truncating - a half-read config file is worse
+ * than none, and it is worse still when nothing says so.
  */
 #define AG_CFG_TEXT_BYTES 4096
 
@@ -39,6 +47,52 @@ static void note_source(const char *name)
 }
 
 /*
+ * Drops comment and blank lines in place, returning the length that is left.
+ *
+ * The parser keeps its entries as pointers into this text, so whatever is read
+ * has to stay resident - and a configuration file that explains itself is
+ * mostly explanation.  The board pack in tree is three and a half kilobytes of
+ * which perhaps three hundred bytes are settings; keeping the rest would mean
+ * the budget below is spent on prose, and the file after it gets truncated.
+ *
+ * Which is exactly what happened: BOARD.CFG left four hundred bytes for
+ * SYSTEM.CFG, SYSTEM.CFG was five hundred and fifty with its [modules] section
+ * at the end, and the board booted with no drivers and nothing to say about it.
+ */
+static size_t strip_comments(char *text, size_t len)
+{
+    size_t out = 0;
+    size_t i = 0;
+
+    while (i < len) {
+        /* One line, [i, eol). */
+        size_t eol = i;
+        while (eol < len && text[eol] != '\n') {
+            eol++;
+        }
+
+        size_t first = i;
+        while (first < eol && (text[first] == ' ' || text[first] == '\t' ||
+                               text[first] == '\r')) {
+            first++;
+        }
+        const bool keep = (first < eol && text[first] != ';' &&
+                           text[first] != '#');
+        if (keep) {
+            const size_t n = eol - i;
+            if (out != i) {
+                memmove(text + out, text + i, n);
+            }
+            out += n;
+            text[out++] = '\n';
+        }
+
+        i = (eol < len) ? eol + 1 : len;
+    }
+    return out;
+}
+
+/*
  * Appends a file to the shared buffer and parses it.  Returns -AG_ENOENT when
  * the file is simply not there, which is the common case and not a problem.
  */
@@ -53,6 +107,8 @@ static ag_err_t load_one(const char *path, const char *label)
     size_t room = AG_CFG_TEXT_BYTES - s_text_used;
     if (room < 2) {
         ag_vfs_close(h);
+        ag_log(AG_LOG_WARN, TAG, "%s: no room left for it (%u bytes of %u used)",
+               label, (unsigned)s_text_used, (unsigned)AG_CFG_TEXT_BYTES);
         return -AG_ENOSPC;
     }
 
@@ -63,8 +119,24 @@ static ag_err_t load_one(const char *path, const char *label)
     if (n < 0) {
         return n;
     }
+    /*
+     * A read that exactly filled the room is a file that may have more to it,
+     * and the part that was lost is the end - which in a file people write by
+     * hand is the part they added last.  Say so: it is the difference between
+     * "the driver did not load" and an afternoon.
+     */
+    const bool maybe_truncated = ((size_t)n == room - 1);
+
     dst[n] = '\0';
-    s_text_used += (size_t)n + 1;
+    const size_t kept = strip_comments(dst, (size_t)n);
+    dst[kept] = '\0';
+    s_text_used += kept + 1;
+
+    if (maybe_truncated) {
+        ag_log(AG_LOG_WARN, TAG,
+               "%s: read only %u bytes - the rest did not fit and is ignored",
+               label, (unsigned)n);
+    }
 
     const ag_err_t err = ag_cfg_parse(dst, &s_cfg);
     if (err == AG_OK) {
