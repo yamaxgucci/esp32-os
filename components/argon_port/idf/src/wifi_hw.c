@@ -34,6 +34,10 @@ static volatile uint32_t        s_attempts;
 static volatile int             s_last_reason;
 static volatile bool            s_scanning;
 static volatile bool            s_want_join;
+/* One particular access point, when the caller named one.  Kept because the
+ * retry has to ask for the same thing the first attempt did. */
+static uint8_t                  s_bssid[6];
+static volatile bool            s_bssid_set;
 static esp_netif_t             *s_sta_netif;
 
 static ag_wifi_auth_t map_auth(wifi_auth_mode_t m)
@@ -162,6 +166,7 @@ ag_err_t ag_port_wifi_stop(void)
     s_want_join = false;
     s_ssid[0] = '\0';
     s_pass[0] = '\0';
+    s_bssid_set = false;
 
     (void)esp_wifi_disconnect();
     ag_port_net_link_down();
@@ -243,7 +248,8 @@ ag_err_t ag_port_wifi_scan(ag_port_wifi_ap_t *out, uint32_t max,
     return AG_OK;
 }
 
-ag_err_t ag_port_wifi_connect(const char *ssid, const char *pass)
+ag_err_t ag_port_wifi_connect(const char *ssid, const char *pass,
+                              const uint8_t *bssid)
 {
     if (s_state == AG_WIFI_OFF) {
         return -AG_ENODEV;
@@ -252,8 +258,27 @@ ag_err_t ag_port_wifi_connect(const char *ssid, const char *pass)
         return -AG_EINVAL;
     }
 
+    /*
+     * An empty key means "the one you already have", when the network is the
+     * same one.  That is what makes it possible to change *which access point*
+     * without the key being typed again - and on a board whose screen is in a
+     * room with people in it, not typing it again is the point.
+     *
+     * Safe for an open network: there the radio has no key either, and an empty
+     * one is what it keeps.
+     */
+    const bool same_net = (strcmp(s_ssid, ssid) == 0);
+    const bool keep_key = same_net && (pass == NULL || pass[0] == '\0') &&
+                          (s_pass[0] != '\0');
+
     snprintf(s_ssid, sizeof(s_ssid), "%s", ssid);
-    snprintf(s_pass, sizeof(s_pass), "%s", (pass != NULL) ? pass : "");
+    if (!keep_key) {
+        snprintf(s_pass, sizeof(s_pass), "%s", (pass != NULL) ? pass : "");
+    }
+    s_bssid_set = (bssid != NULL);
+    if (bssid != NULL) {
+        memcpy(s_bssid, bssid, sizeof(s_bssid));
+    }
 
     wifi_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
@@ -271,6 +296,17 @@ ag_err_t ag_port_wifi_connect(const char *ssid, const char *pass)
      * why, is worse than one that joins an open network it was told to join.
      */
     cfg.sta.threshold.authmode = WIFI_AUTH_OPEN;
+
+    /*
+     * Pinned or not.  With bssid_set the driver will associate with that one
+     * access point and nothing else - including on every retry, which is the
+     * point: a board pinned to the strong box next door must not drift back to
+     * the weak one two rooms away the first time the link stutters.
+     */
+    if (s_bssid_set) {
+        cfg.sta.bssid_set = true;
+        memcpy(cfg.sta.bssid, s_bssid, sizeof(cfg.sta.bssid));
+    }
 
     if (esp_wifi_set_config(WIFI_IF_STA, &cfg) != ESP_OK) {
         return -AG_EINVAL;
@@ -292,6 +328,7 @@ ag_err_t ag_port_wifi_connect(const char *ssid, const char *pass)
 
 ag_err_t ag_port_wifi_disconnect(void)
 {
+    s_bssid_set = false;
     if (s_state == AG_WIFI_OFF) {
         return -AG_ENODEV;
     }
@@ -314,13 +351,19 @@ ag_err_t ag_port_wifi_status(ag_port_wifi_status_t *out)
     out->attempts = s_attempts;
     out->last_reason = s_last_reason;
     snprintf(out->ssid, sizeof(out->ssid), "%s", s_ssid);
+    out->pinned = s_bssid_set;
 
     if (s_state == AG_WIFI_JOINED) {
         wifi_ap_record_t rec;
         if (esp_wifi_sta_get_ap_info(&rec) == ESP_OK) {
             out->rssi = rec.rssi;
             out->channel = rec.primary;
+            /* Which box answered, which is not the same question as which
+             * network: two of them can share one name. */
+            memcpy(out->bssid, rec.bssid, sizeof(out->bssid));
         }
+    } else if (s_bssid_set) {
+        memcpy(out->bssid, s_bssid, sizeof(out->bssid));
     }
     return AG_OK;
 }

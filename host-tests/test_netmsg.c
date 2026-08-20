@@ -44,6 +44,41 @@ static void test_ipv4(void)
     AG_CHECK_STR(buf, "0.0.0.0");
 }
 
+static void test_mac(void)
+{
+    uint8_t mac[6];
+
+    AG_CHECK(ag_mac_parse("04:b2:47:9b:b6:0c", mac));
+    AG_CHECK_INT(mac[0], 0x04);
+    AG_CHECK_INT(mac[1], 0xb2);
+    AG_CHECK_INT(mac[5], 0x0c);
+
+    /* Upper case, and the dashes Windows prints. */
+    AG_CHECK(ag_mac_parse("E8-F6-54-14-F0-E4", mac));
+    AG_CHECK_INT(mac[0], 0xe8);
+    AG_CHECK_INT(mac[5], 0xe4);
+
+    /* And the ways it is not an address.  Half of one is not one. */
+    AG_CHECK(!ag_mac_parse("04:b2:47:9b:b6", mac));
+    AG_CHECK(!ag_mac_parse("04:b2:47:9b:b6:0c:11", mac));
+    AG_CHECK(!ag_mac_parse("04:b2:47:9b:b6:0", mac));
+    AG_CHECK(!ag_mac_parse("04b2479bb60c", mac));
+    AG_CHECK(!ag_mac_parse("zz:b2:47:9b:b6:0c", mac));
+    AG_CHECK(!ag_mac_parse("", mac));
+
+    /* Round trip, in the spelling the shell prints and SYSTEM.CFG keeps. */
+    char           text[18];
+    const uint8_t  known[6] = {0x04, 0xb2, 0x47, 0x9b, 0xb6, 0x0c};
+    AG_CHECK_INT(ag_mac_str(known, text, sizeof(text)), 17);
+    AG_CHECK_STR(text, "04:b2:47:9b:b6:0c");
+    AG_CHECK(ag_mac_parse(text, mac));
+    AG_CHECK_INT(memcmp(mac, known, sizeof(known)), 0);
+
+    /* One byte short writes nothing rather than half an address. */
+    char small[17];
+    AG_CHECK_INT(ag_mac_str(known, small, sizeof(small)), 0);
+}
+
 static void test_url(void)
 {
     ag_url_t u;
@@ -387,6 +422,7 @@ static void test_ftp(void)
 void run_netmsg_tests(void)
 {
     test_ipv4();
+    test_mac();
     test_url();
     test_http_header_end();
     test_http_response();

@@ -155,6 +155,66 @@ bool ag_ipv4_parse(const char *text, uint32_t *addr_out)
     return true;
 }
 
+static int hex_digit(char c)
+{
+    if (c >= '0' && c <= '9') {
+        return c - '0';
+    }
+    if (c >= 'a' && c <= 'f') {
+        return 10 + (c - 'a');
+    }
+    if (c >= 'A' && c <= 'F') {
+        return 10 + (c - 'A');
+    }
+    return -1;
+}
+
+bool ag_mac_parse(const char *text, uint8_t out[6])
+{
+    if (text == NULL || out == NULL) {
+        return false;
+    }
+
+    const char *p = text;
+    for (int i = 0; i < 6; i++) {
+        if (i > 0) {
+            if (*p != ':' && *p != '-') {
+                return false;
+            }
+            p++;
+        }
+        const int hi = hex_digit(p[0]);
+        const int lo = (hi >= 0) ? hex_digit(p[1]) : -1;
+        if (hi < 0 || lo < 0) {
+            return false;
+        }
+        out[i] = (uint8_t)((hi << 4) | lo);
+        p += 2;
+    }
+    /* Nothing after the sixth pair: "aa:bb:cc:dd:ee:ff:00" is not an address
+     * with a spare byte, it is a typing mistake. */
+    return *p == '\0';
+}
+
+int ag_mac_str(const uint8_t mac[6], char *buf, size_t len)
+{
+    static const char k_hex[] = "0123456789abcdef";
+
+    if (buf == NULL || mac == NULL || len < 18) {
+        return 0;
+    }
+    int pos = 0;
+    for (int i = 0; i < 6; i++) {
+        if (i > 0) {
+            buf[pos++] = ':';
+        }
+        buf[pos++] = k_hex[(mac[i] >> 4) & 0x0fu];
+        buf[pos++] = k_hex[mac[i] & 0x0fu];
+    }
+    buf[pos] = '\0';
+    return pos;
+}
+
 int ag_ipv4_str(uint32_t addr, char *buf, size_t len)
 {
     if (buf == NULL || len < 8) {

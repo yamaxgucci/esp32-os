@@ -56,6 +56,17 @@ bool ag_ipv4_parse(const char *text, uint32_t *addr_out);
 int ag_ipv4_str(uint32_t addr, char *buf, size_t len);
 
 /*
+ * Six bytes from "aa:bb:cc:dd:ee:ff", either case, and dashes accepted because
+ * that is how Windows writes them.  False for anything else - a short one
+ * included, since half a hardware address is not a hardware address.
+ */
+bool ag_mac_parse(const char *text, uint8_t out[6]);
+
+/* Six bytes into `buf` as lower-case colon-separated pairs.  Wants 18 bytes;
+ * returns the length written, or 0 when it does not fit. */
+int ag_mac_str(const uint8_t mac[6], char *buf, size_t len);
+
+/*
  * "http://user:pass@host:port/path" and the same with ftp.  A scheme is
  * required: guessing http for a bare host looks helpful right up to the point
  * where a typed "ftp.example.com/x" silently talks to the wrong server.

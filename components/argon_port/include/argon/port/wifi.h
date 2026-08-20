@@ -12,7 +12,8 @@
  *   ag_err_t ag_port_wifi_start(void)
  *   ag_err_t ag_port_wifi_scan(ag_port_wifi_ap_t *out, uint32_t max,
  *                              uint32_t *found)
- *   ag_err_t ag_port_wifi_connect(const char *ssid, const char *pass)
+ *   ag_err_t ag_port_wifi_connect(const char *ssid, const char *pass,
+ *                                 const uint8_t *bssid)
  *   ag_err_t ag_port_wifi_disconnect(void)
  *   ag_err_t ag_port_wifi_status(ag_port_wifi_status_t *out)
  *
@@ -25,6 +26,19 @@
  *   succeeded: association takes seconds and DHCP takes longer.  ag_port_net_
  *   ready() is still the answer to "is there a network", and status() says how
  *   far along the radio is.
+ * - connect() joins a *network*: bssid NULL means any access point answering to
+ *   that name, which is what a network with more than one of them is for, and
+ *   the radio is then free to take the best.  A caller that passes six bytes is
+ *   asking for one particular access point and nothing else - worth having,
+ *   because "the network" can mean two boxes on two channels with thirty
+ *   decibels between them, and then which one the board took is the difference
+ *   between a link that works and a link that half works.  It is not the
+ *   default: a pinned board whose access point is switched off stays off the
+ *   network rather than joining the other one.
+ * - An empty pass, for the network the radio is already set to, means the key
+ *   it already has rather than no key.  That is what lets a caller change the
+ *   access point without the key passing through a console again; an open
+ *   network is unaffected, having no key either way.
  * - A connection that drops is the port's business to retry.  Above this layer
  *   there is no state machine for it, and there should not be: the reason it
  *   dropped is a radio fact.
@@ -78,6 +92,8 @@ typedef enum {
 typedef struct {
     ag_wifi_state_t state;
     char            ssid[AG_WIFI_SSID_MAX + 1]; /* joined or being joined  */
+    uint8_t         bssid[6];   /* the access point actually joined, or 0s  */
+    bool            pinned;     /* this access point was asked for by name  */
     int8_t          rssi;
     uint8_t         channel;
     uint32_t        attempts;   /* association attempts since the last join */
@@ -90,7 +106,8 @@ ag_err_t ag_port_wifi_start(void);
 ag_err_t ag_port_wifi_stop(void);
 ag_err_t ag_port_wifi_scan(ag_port_wifi_ap_t *out, uint32_t max,
                            uint32_t *found);
-ag_err_t ag_port_wifi_connect(const char *ssid, const char *pass);
+ag_err_t ag_port_wifi_connect(const char *ssid, const char *pass,
+                              const uint8_t *bssid);
 ag_err_t ag_port_wifi_disconnect(void);
 ag_err_t ag_port_wifi_status(ag_port_wifi_status_t *out);
 
