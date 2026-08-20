@@ -18,6 +18,7 @@ int ag_cmd_mkdir(int argc, char **argv);
 int ag_cmd_rmdir(int argc, char **argv);
 int ag_cmd_rename(int argc, char **argv);
 int ag_cmd_mount(int argc, char **argv);
+int ag_cmd_eject(int argc, char **argv);
 int ag_cmd_hexdump(int argc, char **argv);
 int ag_cmd_format(int argc, char **argv);
 int ag_cmd_recv(int argc, char **argv);

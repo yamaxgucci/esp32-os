@@ -454,6 +454,15 @@ ag_err_t ag_storage_mount_hostfs(void) { return ag_hostfs_try_mount(); }
 ag_err_t ag_storage_mount_hostfs(void) { return -AG_ENODEV; }
 #endif
 
+ag_err_t ag_storage_eject_media(void)
+{
+    if (s_sd_card == NULL && s_sdfs == NULL) {
+        return -AG_ENODEV;
+    }
+    unmount_media();
+    return AG_OK;
+}
+
 ag_err_t ag_storage_mount_media(void)
 {
     const ag_err_t sd = mount_media(false);
