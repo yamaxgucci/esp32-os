@@ -13,6 +13,7 @@
 #include <argon/display.h>
 #include <argon/log.h>
 
+#include <argon/port/mem.h>
 #include <argon/port/time.h>
 
 /*
@@ -143,8 +144,16 @@ static void render_locked(const ag_screen_t *screen)
      * by pointer because ag_cell_t is the kernel's type and ag_textcell_t is
      * the ABI's: they have the same shape today, and a driver compiled against
      * the ABI must not depend on that staying true.
+     *
+     * Asked for on the first repaint rather than reserved, and sized to the
+     * panel that actually turned up rather than to the widest console the system
+     * allows.  As a static array it was four hundred and eighty bytes held on
+     * every machine, including the ones with no such panel - and that is not an
+     * abstraction: it is what put the S3 firmware over the end of its data
+     * segment and stopped it linking.  Forty columns of glass need eighty bytes.
      */
-    static ag_textcell_t s_row[AG_SCREEN_MAX_COLS];
+    static ag_textcell_t *s_row;
+    static uint16_t       s_row_cols;
 
     if (screen == NULL) {
         return;
@@ -197,6 +206,17 @@ static void render_locked(const ag_screen_t *screen)
     }
     if (cols > AG_SCREEN_MAX_COLS) {
         cols = AG_SCREEN_MAX_COLS;
+    }
+
+    if (s_row == NULL || s_row_cols < cols) {
+        ag_textcell_t *grown = (ag_textcell_t *)ag_port_alloc(
+            (size_t)cols * sizeof(ag_textcell_t), AG_MEM_FAST | AG_MEM_BYTE);
+        if (grown == NULL) {
+            return; /* nothing to repaint through; the next tick tries again */
+        }
+        ag_port_free(s_row);
+        s_row = grown;
+        s_row_cols = cols;
     }
 
     for (uint16_t y = 0; y < rows; y++) {
