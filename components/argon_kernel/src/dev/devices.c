@@ -22,6 +22,7 @@
 #include <argon/input.h>
 #include <argon/keys.h>
 #include <argon/log.h>
+#include <argon/netmsg.h>
 #include <argon/net.h>
 #include <argon/vfs.h>
 
@@ -330,10 +331,23 @@ ag_err_t ag_devices_init(void)
      * longer than boot does.  `wifi` says how it went.
      */
     if (want_net && err == AG_OK) {
-        const char    *pass = ag_cfg_get(ag_sysconfig(), "wifi.pass", "");
-        const ag_err_t werr = ag_port_wifi_connect(ssid, pass);
+        const char *pass = ag_cfg_get(ag_sysconfig(), "wifi.pass", "");
+
+        /*
+         * An access point, when the configuration names one.  A board told to
+         * use a particular box has to keep using it across a power cut, or the
+         * telling was pointless: the radio's own choice is what was being
+         * overridden.
+         */
+        uint8_t     bssid[6];
+        const char *pinned = ag_cfg_get(ag_sysconfig(), "wifi.bssid", NULL);
+        const bool  have_pin = (pinned != NULL) && ag_mac_parse(pinned, bssid);
+
+        const ag_err_t werr =
+            ag_port_wifi_connect(ssid, pass, have_pin ? bssid : NULL);
         if (werr == AG_OK) {
-            ag_log(AG_LOG_INFO, "wifi", "joining %s", ssid);
+            ag_log(AG_LOG_INFO, "wifi", "joining %s%s", ssid,
+                   have_pin ? " (pinned)" : "");
         } else {
             ag_log(AG_LOG_WARN, "wifi", "%s: %d", ssid, (int)werr);
         }

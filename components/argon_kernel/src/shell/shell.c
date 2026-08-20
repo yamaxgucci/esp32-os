@@ -23,6 +23,7 @@
 #include <argon/loader.h>
 #include <argon/log.h>
 #include <argon/module.h>
+#include <argon/netmsg.h>
 #include <argon/path.h>
 #include <argon/probe.h>
 #include <argon/proc.h>
@@ -1126,14 +1127,29 @@ static ag_err_t cfg_replace_section(const char *section, const char *body)
 #endif /* AG_PORT_HAS_WIFI || AG_PORT_HAS_BT */
 
 #if AG_PORT_HAS_WIFI
-static ag_err_t cfg_ensure_wifi(const char *ssid, const char *pass)
+static ag_err_t cfg_ensure_wifi(const char *ssid, const char *pass,
+                                const uint8_t *bssid)
 {
     if (ssid == NULL || ssid[0] == '\0') {
         return cfg_replace_section("wifi", NULL);
     }
-    char body[160];
-    snprintf(body, sizeof(body), "ssid = %s\npass = %s\n", ssid,
-             (pass != NULL) ? pass : "");
+
+    /*
+     * The access point is written down when one was named, because a board that
+     * has to be told again after every power cut has not been told.  Absent
+     * means what it has always meant: join the network, whichever box answers.
+     */
+    char pinned[32] = ""; /* "bssid = aa:bb:cc:dd:ee:ff\n" and a terminator */
+    if (bssid != NULL) {
+        char text[18];
+        if (ag_mac_str(bssid, text, sizeof(text)) > 0) {
+            snprintf(pinned, sizeof(pinned), "bssid = %s\n", text);
+        }
+    }
+
+    char body[200];
+    snprintf(body, sizeof(body), "ssid = %s\npass = %s\n%s", ssid,
+             (pass != NULL) ? pass : "", pinned);
     return cfg_replace_section("wifi", body);
 }
 #endif
@@ -1715,6 +1731,22 @@ static int wifi_status(void)
         }
         ag_console_puts("\n");
     }
+
+    /*
+     * Which access point, printed whenever there is one to print.  With two
+     * boxes answering to one name - and that is the usual arrangement in a flat
+     * - "joined" says nothing about whether the link is any good, and this is
+     * the line that does.
+     */
+    static const uint8_t k_no_ap[6] = {0};
+    if (memcmp(st.bssid, k_no_ap, sizeof(k_no_ap)) != 0) {
+        char text[18];
+        (void)ag_mac_str(st.bssid, text, sizeof(text));
+        ag_console_printf("access point %s%s\n", text,
+                          st.pinned ? " (pinned)" : "");
+    } else if (st.pinned) {
+        ag_console_puts("pinned to an access point that has not answered\n");
+    }
     if (st.state != AG_WIFI_JOINED && st.last_reason != 0) {
         ag_console_printf("last failure: %s\n",
                           ag_port_wifi_reason(st.last_reason));
@@ -1751,6 +1783,7 @@ static int wifi_status(void)
 #define WIFI_SCAN_MAX 16
 
 static char   (*s_scan_names)[AG_WIFI_SSID_MAX + 1];
+static uint8_t (*s_scan_bssid)[6];
 static uint32_t s_scan_count;
 
 static int wifi_scan(void)
@@ -1788,6 +1821,10 @@ static int wifi_scan(void)
         s_scan_names = ag_port_alloc(
             (size_t)WIFI_SCAN_MAX * (AG_WIFI_SSID_MAX + 1u),
             AG_MEM_FAST | AG_MEM_BYTE);
+    }
+    if (s_scan_bssid == NULL && shown != 0u) {
+        s_scan_bssid = ag_port_alloc((size_t)WIFI_SCAN_MAX * 6u,
+                                     AG_MEM_FAST | AG_MEM_BYTE);
     }
     s_scan_count = 0;
 
@@ -1829,6 +1866,9 @@ static int wifi_scan(void)
             snprintf(s_scan_names[i], AG_WIFI_SSID_MAX + 1u, "%.32s", aps[i].ssid);
             s_scan_count = i + 1u;
         }
+        if (s_scan_bssid != NULL) {
+            memcpy(s_scan_bssid[i], aps[i].bssid, 6u);
+        }
     }
 
     if (found > shown) {
@@ -1847,8 +1887,16 @@ static int wifi_scan(void)
  * Returns the argument unchanged when it is not a number, so a name that happens
  * to start with a digit still works.
  */
-static const char *wifi_named(const char *arg)
+/*
+ * A name, and which line of the last scan it came from (0 when the caller
+ * typed a name rather than a number - there is then no one access point to
+ * speak of, only a network).
+ */
+static const char *wifi_named_line(const char *arg, uint32_t *line_out)
 {
+    if (line_out != NULL) {
+        *line_out = 0;
+    }
     const char *digits = (arg[0] == '#') ? arg + 1 : arg;
     if (digits[0] < '1' || digits[0] > '9') {
         return arg;
@@ -1866,7 +1914,15 @@ static const char *wifi_named(const char *arg)
         return NULL;
     }
     ag_console_printf("#%u is \"%s\"\n", (unsigned)n, s_scan_names[n - 1u]);
+    if (line_out != NULL) {
+        *line_out = n;
+    }
     return s_scan_names[n - 1u];
+}
+
+static const char *wifi_named(const char *arg)
+{
+    return wifi_named_line(arg, NULL);
 }
 
 static int cmd_wifi(int argc, char **argv)
@@ -1918,9 +1974,18 @@ static int cmd_wifi(int argc, char **argv)
 
         const char *ssid = ag_cfg_get(ag_sysconfig(), "wifi.ssid", NULL);
         if (ssid != NULL && ssid[0] != '\0') {
+            /* Including the access point, if one was pinned: `wifi on` has to
+             * mean the same thing as a boot with the same configuration. */
+            uint8_t     bssid[6];
+            const char *pinned = ag_cfg_get(ag_sysconfig(), "wifi.bssid", NULL);
+            const bool  have_pin =
+                (pinned != NULL) && ag_mac_parse(pinned, bssid);
+
             (void)ag_port_wifi_connect(
-                ssid, ag_cfg_get(ag_sysconfig(), "wifi.pass", ""));
-            ag_console_printf("joining %s\n", ssid);
+                ssid, ag_cfg_get(ag_sysconfig(), "wifi.pass", ""),
+                have_pin ? bssid : NULL);
+            ag_console_printf("joining %s%s\n", ssid,
+                              have_pin ? " (pinned)" : "");
         }
         return 0;
     }
@@ -1931,19 +1996,78 @@ static int cmd_wifi(int argc, char **argv)
 
     if (ag_path_icmp(argv[1], "connect") == 0) {
         if (argc < 3) {
-            ag_console_puts("usage: wifi connect <#number|ssid> [password]\n");
+            ag_console_puts(
+                "usage: wifi connect <#number|ssid> [password] [/ap]\n");
             ag_console_puts("  #number is a line from the last `wifi scan`\n");
+            ag_console_puts("  /ap  join that access point and no other\n");
+            ag_console_puts("  no password: the one in SYSTEM.CFG, if the "
+                            "network is the same\n");
             ag_console_puts("  the network is remembered in SYSTEM.CFG, in "
                             "clear text\n");
             return 1;
         }
-        const char *ssid = wifi_named(argv[2]);
+
+        /*
+         * /ap pins the association to one access point.
+         *
+         * The default is the network, and that is the right default: a name
+         * with two boxes behind it is one network, and letting the radio take
+         * whichever is better is the whole point of that arrangement.  But
+         * "better" is the radio's opinion, and on this desk it chose the box
+         * two rooms away at -77 dBm over the one next door at -42 - so there
+         * has to be a way to say which, and it has to be a way that survives a
+         * power cut.  It only means anything with a scan line: a bare name says
+         * nothing about which box answers to it.
+         */
+        bool want_pin = false;
+        int  positional = 0;
+        const char *args[2] = {NULL, NULL};
+        for (int i = 2; i < argc; i++) {
+            if (ag_path_icmp(argv[i], "/ap") == 0) {
+                want_pin = true;
+            } else if (positional < 2) {
+                args[positional++] = argv[i];
+            }
+        }
+        if (args[0] == NULL) {
+            ag_console_puts("wifi connect: which network?\n");
+            return 1;
+        }
+
+        uint32_t    line = 0;
+        const char *ssid = wifi_named_line(args[0], &line);
         if (ssid == NULL) {
             return 1;
         }
-        const char *pass = (argc > 3) ? argv[3] : "";
 
-        const ag_err_t err = ag_port_wifi_connect(ssid, pass);
+        const uint8_t *bssid = NULL;
+        if (want_pin) {
+            if (line == 0u || s_scan_bssid == NULL) {
+                ag_console_puts("/ap needs a #number from `wifi scan`: a name "
+                                "alone does not\n  say which access point\n");
+                return 1;
+            }
+            bssid = s_scan_bssid[line - 1u];
+        }
+
+        /*
+         * No password given means the one already written down, and only when
+         * the network is the same one.  That is not a shortcut for typing: it
+         * is how the access point can be changed without the key being said
+         * out loud again, on a screen, in a room with people in it.
+         */
+        const char *pass = args[1];
+        if (pass == NULL) {
+            const char *known = ag_cfg_get(ag_sysconfig(), "wifi.ssid", NULL);
+            if (known != NULL && ag_path_icmp(known, ssid) == 0) {
+                pass = ag_cfg_get(ag_sysconfig(), "wifi.pass", "");
+                ag_console_puts("using the key in SYSTEM.CFG\n");
+            } else {
+                pass = "";
+            }
+        }
+
+        const ag_err_t err = ag_port_wifi_connect(ssid, pass, bssid);
         if (err != AG_OK) {
             ag_console_printf("wifi connect: %s\n",
                               ag_loader_api()->sys->strerror(err));
@@ -1955,11 +2079,17 @@ static int cmd_wifi(int argc, char **argv)
          * have a keyboard attached to it.  Clear text, and said out loud
          * above: the flash of a device somebody can pick up is not a secret.
          */
-        const ag_err_t cerr = cfg_ensure_wifi(ssid, pass);
+        const ag_err_t cerr = cfg_ensure_wifi(ssid, pass, bssid);
         if (cerr != AG_OK) {
             ag_console_printf("SYSTEM.CFG: %d (joining anyway)\n", (int)cerr);
         }
-        ag_console_printf("joining %s...\n", ssid);
+        if (bssid != NULL) {
+            char text[18];
+            (void)ag_mac_str(bssid, text, sizeof(text));
+            ag_console_printf("joining %s at %s...\n", ssid, text);
+        } else {
+            ag_console_printf("joining %s...\n", ssid);
+        }
         return 0;
     }
 
@@ -1974,11 +2104,18 @@ static int cmd_wifi(int argc, char **argv)
 
     if (ag_path_icmp(argv[1], "forget") == 0) {
         (void)ag_port_wifi_disconnect();
-        const ag_err_t cerr = cfg_ensure_wifi(NULL, NULL);
+        const ag_err_t cerr = cfg_ensure_wifi(NULL, NULL, NULL);
         if (cerr != AG_OK) {
             ag_console_printf("SYSTEM.CFG: %d\n", (int)cerr);
         }
-        ag_console_puts("forgotten\n");
+        /*
+         * Said out loud, because it is not obvious and it costs something: the
+         * key goes too, and the next `wifi connect` needs it typed again.  A
+         * scan does not need this command - the radio can scan perfectly well
+         * once it is joined, and only refuses while an attempt is in flight.
+         */
+        ag_console_puts("forgotten - the network, the key and the access "
+                        "point\n");
         return 0;
     }
 
