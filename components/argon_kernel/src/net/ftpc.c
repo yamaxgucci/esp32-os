@@ -84,6 +84,14 @@ static int ftp_reply(ftp_t *f)
             ag_console_puts("the server closed the connection\n");
             return -1;
         }
+        if (err == -AG_ETIMEDOUT) {
+            ag_console_puts("the server said nothing for fifteen seconds\n");
+            return -1;
+        }
+        if (err == -AG_EINTR) {
+            ag_console_puts("^C\n");
+            return -1;
+        }
         if (err != AG_OK && err != -AG_ERANGE) {
             return -1;
         }
@@ -181,7 +189,10 @@ static int ftp_data_open(ftp_t *f)
     if (dfd < 0) {
         ag_console_printf("data connection refused on port %u\n",
                           (unsigned)port);
+        return dfd;
     }
+    /* Non-blocking like every other socket here; netio does the waiting. */
+    (void)ag_port_net_nonblock(dfd, true);
     return dfd;
 }
 
@@ -253,7 +264,8 @@ static ag_err_t ftp_get(ftp_t *f, const char *remote, const char *dest)
     uint64_t got = 0;
     ag_err_t err = AG_OK;
     for (;;) {
-        const int32_t got_now = ag_port_net_recv(dfd, f->data, FTP_DATA_BUF);
+        const int32_t got_now =
+            ag_netio_recv(dfd, f->data, FTP_DATA_BUF, AG_NETIO_TIMEOUT_MS);
         if (got_now < 0) {
             err = (ag_err_t)got_now;
             break;
@@ -437,7 +449,8 @@ static ag_err_t ftp_begin(ftp_t *f, const ag_url_t *u, const char *cwd)
     f->ctl = -1;
     f->cwd = cwd;
 
-    f->mem = ag_port_alloc(FTP_CTL_BUF + FTP_DATA_BUF, AG_MEM_FAST);
+    f->mem = ag_port_alloc(FTP_CTL_BUF + FTP_DATA_BUF,
+                           AG_MEM_FAST | AG_MEM_BYTE);
     if (f->mem == NULL) {
         ag_console_puts("not enough memory for a transfer\n");
         return -AG_ENOMEM;
@@ -468,6 +481,7 @@ static ag_err_t ftp_begin(ftp_t *f, const ag_url_t *u, const char *cwd)
     }
     ag_console_puts("connected\n");
 
+    (void)ag_port_net_nonblock(f->ctl, true);
     ag_netio_init(&f->rdr, f->ctl, f->ctlbuf, FTP_CTL_BUF, 0);
 
     if (ftp_reply(f) != 220) {

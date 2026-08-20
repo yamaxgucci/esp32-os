@@ -42,8 +42,10 @@ ArgonOS
   argon test [-Send ...]   automated boot test; prints the resulting screen
   argon test -cp 866 ...   the same, when the screen is in another code page
   argon tests              host unit tests (needs a host C compiler)
-  argon nettest            wget / httpd / ftp in QEMU against tools
-etfixture.py
+  argon nettest            wget / httpd / ftp in QEMU against
+                           tools\netfixture.py (37 checks)
+  argon boardnet -port COM3   the same on the real board, over Wi-Fi;
+                           add -big for a speed number (14 checks)
   python tools/netfixture.py serve   the same servers, to try things by hand
   argon check              local CI: host tests, then firmware build
   argon target             which chip the firmware is built for
@@ -359,6 +361,30 @@ switch ($Command.ToLowerInvariant()) {
         & cmd /c "build-host\vtdump.exe 80 25 $codepage < build\qemu-boot.log"
         [Console]::OutputEncoding = $wasOut
         exit $bootStatus
+    }
+
+    'boardnet' {
+        # The network on the real board: the half `nettest` cannot do, because
+        # it needs a radio and a router.  Wants the board on a serial port.
+        Initialize-Environment
+        $rest = @()
+        $port = ''
+        for ($i = 0; $i -lt $Rest.Count; $i++) {
+            if ($Rest[$i] -match '^-{1,2}(port|p)$') {
+                $port = $Rest[$i + 1]
+                $i++
+            } elseif ($Rest[$i] -match '^-{1,2}big$') {
+                $rest += '--big'
+            } else {
+                $rest += $Rest[$i]
+            }
+        }
+        if (-not $port) {
+            Write-Host 'usage: argon boardnet -port COM3 [-big]'
+            exit 1
+        }
+        & python (Join-Path $PSScriptRoot 'boardnet.py') '-p' $port '--quiet' @rest
+        exit $LASTEXITCODE
     }
 
     'nettest' {

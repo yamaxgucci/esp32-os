@@ -1760,6 +1760,23 @@ static int wifi_scan(void)
 
     ag_console_puts("scanning...\n");
     const ag_err_t err = ag_port_wifi_scan(aps, WIFI_SCAN_MAX, &found);
+    if (err == -AG_EBUSY) {
+        /*
+         * The radio cannot scan and associate at once, and a board that has
+         * been told a network it cannot join retries for ever - so "busy" is
+         * the answer every time, which reads as a broken command.  Say which
+         * of the two it is and what stops it.
+         */
+        ag_port_wifi_status_t st;
+        if (ag_port_wifi_status(&st) == AG_OK && st.ssid[0] != '\0') {
+            ag_console_printf("busy joining %s\n", st.ssid);
+        } else {
+            ag_console_puts("the radio is busy\n");
+        }
+        ag_console_puts("  `wifi` for the reason, `wifi forget` to stop and "
+                        "scan\n");
+        return 1;
+    }
     if (err != AG_OK) {
         ag_console_printf("scan: %s\n", ag_loader_api()->sys->strerror(err));
         return 1;
