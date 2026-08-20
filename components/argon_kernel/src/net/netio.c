@@ -95,7 +95,7 @@ ag_err_t ag_netio_send_all(int fd, const void *buf, size_t len)
 
 ag_err_t ag_netio_sendf(int fd, const char *fmt, ...)
 {
-    char    line[288];
+    char    line[512];
     va_list ap;
 
     va_start(ap, fmt);

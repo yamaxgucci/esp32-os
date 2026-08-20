@@ -107,10 +107,20 @@ typedef struct {
 ag_err_t ag_http_parse_response(const char *hdr, size_t len,
                                 ag_http_resp_t *out);
 
+/* Long enough for "multipart/form-data; boundary=..." as browsers send it. */
+#define AG_HTTP_CTYPE_MAX 128
+/* RFC 2046 caps a boundary at 70 characters. */
+#define AG_HTTP_BOUNDARY_MAX 70
+
 typedef struct {
     char method[8];                     /* upper case, as it arrived       */
     char target[AG_URL_PATH_MAX + 1];   /* percent-decoded, query removed  */
     bool keep_alive;
+
+    /* What a body, if any, is and how long.  Empty and zero for a GET. */
+    char     content_type[AG_HTTP_CTYPE_MAX + 1];
+    uint64_t content_length;
+    bool     have_length;
 } ag_http_req_t;
 
 /*
@@ -121,6 +131,29 @@ typedef struct {
  */
 ag_err_t ag_http_parse_request(const char *hdr, size_t len,
                                ag_http_req_t *out);
+
+/*
+ * The boundary out of "multipart/form-data; boundary=----WebKitFormBoundary".
+ *
+ * False when the type is not multipart or names no boundary - both of which a
+ * server must refuse rather than guess at, because without the boundary there
+ * is no way to know where the file ends.
+ */
+bool ag_http_boundary(const char *content_type, char *out, size_t len);
+
+/*
+ * The filename out of one part's headers:
+ *
+ *   Content-Disposition: form-data; name="file"; filename="holiday.jpg"
+ *
+ * Answers the *base* name.  Some browsers - and every phone that has ever sent
+ * a photo from a gallery - put a whole path in there, and a server that joined
+ * that to its root would write wherever the client said.  Parts with no
+ * filename (an ordinary form field) answer false, as do names that cannot be
+ * written: empty, "." and "..", or anything with a separator left in it.
+ */
+bool ag_http_part_filename(const char *headers, size_t len, char *out,
+                           size_t out_len);
 
 /*
  * True when a decoded target can be joined to a document root and stay inside

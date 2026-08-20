@@ -135,8 +135,8 @@ try {
         -QuietMs 2000 -LogPath 'build\nettest-serve.log' -Send @(
         'net wait'
         "wget http://10.0.2.2:$httpPort/data.bin t:\data.bin"
-        "httpd $guestPort t:\"
-        '=405'          # the prober's last question; then we may stop the server
+        "httpd $guestPort t:\ /w"
+        '=- /up.bin'    # the prober's last question; then we may stop the server
         '~\x03'
         'dir t:\'
     ) | Out-Null
@@ -149,6 +149,7 @@ try {
     $t = Transcript 'build\nettest-serve.log'
     Check $t 'saved T:\data.bin' 'http-32k-fetch'
     Check $t 'data.bin -> 200, 32768 bytes' 'httpd-served-32k'
+    Check $t '+ up.bin, 9000 bytes' 'httpd-logged-the-upload'
     Check $t 'stopped' 'httpd-stops-on-ctrl-c'
 
     if (Test-Path $probeOut) {
