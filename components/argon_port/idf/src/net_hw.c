@@ -20,7 +20,6 @@
 #include <fcntl.h>
 #include <string.h>
 #include <sys/time.h>
-#include <unistd.h>
 
 #include "esp_event.h"
 #include "esp_log.h"
@@ -219,15 +218,29 @@ ag_err_t ag_port_net_ifaddr(uint32_t *addr)
     return AG_OK;
 }
 
+/*
+ * Everything below talks to lwIP by its own names - lwip_socket, lwip_recv,
+ * lwip_fcntl - and never through the POSIX ones.
+ *
+ * That is not pedantry, it is a bug that cost an afternoon on the board.  In
+ * this build `recv` and `send` link straight to lwIP, but `fcntl` links to
+ * newlib's, which knows nothing about sockets: it answered 0 and did nothing,
+ * so a socket this code believed was non-blocking was still blocking, and a
+ * read of it never came back.  `select` meanwhile went through ESP-IDF's VFS
+ * and answered "readable" for a descriptor lwIP was still holding shut.
+ *
+ * One descriptor cannot belong to two layers.  These are lwIP's descriptors,
+ * so every call on them is lwIP's.
+ */
 int ag_port_net_listen(uint16_t port)
 {
-    const int fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    const int fd = lwip_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (fd < 0) {
         return (int)map_errno(errno);
     }
 
     int yes = 1;
-    (void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+    (void)lwip_setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
 
     struct sockaddr_in sa;
     memset(&sa, 0, sizeof(sa));
@@ -235,14 +248,14 @@ int ag_port_net_listen(uint16_t port)
     sa.sin_addr.s_addr = htonl(INADDR_ANY);
     sa.sin_port = htons(port);
 
-    if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
+    if (lwip_bind(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
         const ag_err_t e = map_errno(errno);
-        close(fd);
+        lwip_close(fd);
         return (int)e;
     }
-    if (listen(fd, 4) != 0) {
+    if (lwip_listen(fd, 4) != 0) {
         const ag_err_t e = map_errno(errno);
-        close(fd);
+        lwip_close(fd);
         return (int)e;
     }
     return fd;
@@ -268,7 +281,7 @@ int ag_port_net_accept(int lfd, uint32_t timeout_ms)
         tv.tv_sec = (time_t)(timeout_ms / 1000u);
         tv.tv_usec = (suseconds_t)((timeout_ms % 1000u) * 1000u);
 
-        const int pr = select(lfd + 1, &rfds, NULL, NULL, &tv);
+        const int pr = lwip_select(lfd + 1, &rfds, NULL, NULL, &tv);
         if (pr < 0) {
             return (int)map_errno(errno);
         }
@@ -279,19 +292,19 @@ int ag_port_net_accept(int lfd, uint32_t timeout_ms)
 
     struct sockaddr_in peer;
     socklen_t          plen = sizeof(peer);
-    const int          cfd = accept(lfd, (struct sockaddr *)&peer, &plen);
+    const int          cfd = lwip_accept(lfd, (struct sockaddr *)&peer, &plen);
     if (cfd < 0) {
         return (int)map_errno(errno);
     }
 
     int yes = 1;
-    (void)setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
+    (void)lwip_setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
     return cfd;
 }
 
 int ag_port_net_connect(uint32_t addr, uint16_t port, uint32_t timeout_ms)
 {
-    const int fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    const int fd = lwip_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (fd < 0) {
         return (int)map_errno(errno);
     }
@@ -300,8 +313,8 @@ int ag_port_net_connect(uint32_t addr, uint16_t port, uint32_t timeout_ms)
         struct timeval tv;
         tv.tv_sec = (time_t)(timeout_ms / 1000u);
         tv.tv_usec = (suseconds_t)((timeout_ms % 1000u) * 1000u);
-        (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        (void)lwip_setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        (void)lwip_setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     }
 
     struct sockaddr_in sa;
@@ -310,9 +323,9 @@ int ag_port_net_connect(uint32_t addr, uint16_t port, uint32_t timeout_ms)
     sa.sin_addr.s_addr = htonl(addr);
     sa.sin_port = htons(port);
 
-    if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
+    if (lwip_connect(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
         const ag_err_t e = map_errno(errno);
-        close(fd);
+        lwip_close(fd);
         return (int)e;
     }
     return fd;
@@ -323,7 +336,7 @@ int32_t ag_port_net_send(int fd, const void *buf, size_t len)
     if (fd < 0) {
         return -AG_EBADF;
     }
-    const int n = (int)send(fd, buf, len, 0);
+    const int n = (int)lwip_send(fd, buf, len, 0);
     return (n < 0) ? (int32_t)map_errno(errno) : (int32_t)n;
 }
 
@@ -332,14 +345,14 @@ int32_t ag_port_net_recv(int fd, void *buf, size_t len)
     if (fd < 0) {
         return -AG_EBADF;
     }
-    const int n = (int)recv(fd, buf, len, 0);
+    const int n = (int)lwip_recv(fd, buf, len, 0);
     return (n < 0) ? (int32_t)map_errno(errno) : (int32_t)n;
 }
 
 void ag_port_net_close(int fd)
 {
     if (fd >= 0) {
-        (void)close(fd);
+        (void)lwip_close(fd);
     }
 }
 
@@ -392,17 +405,48 @@ ag_err_t ag_port_net_resolve(const char *host, uint32_t *addr)
     return err;
 }
 
+int32_t ag_port_net_recv_now(int fd, void *buf, size_t len)
+{
+    if (fd < 0) {
+        return -AG_EBADF;
+    }
+    const int n = (int)lwip_recv(fd, buf, len, MSG_DONTWAIT);
+    return (n < 0) ? (int32_t)map_errno(errno) : (int32_t)n;
+}
+
+int ag_port_net_wait_readable(int fd, uint32_t timeout_ms)
+{
+    if (fd < 0) {
+        return -AG_EBADF;
+    }
+
+    fd_set         rfds;
+    struct timeval tv;
+
+    FD_ZERO(&rfds);
+    FD_SET(fd, &rfds);
+    tv.tv_sec = (time_t)(timeout_ms / 1000u);
+    tv.tv_usec = (suseconds_t)((timeout_ms % 1000u) * 1000u);
+
+    const int n = lwip_select(fd + 1, &rfds, NULL, NULL,
+                         (timeout_ms == UINT32_MAX) ? NULL : &tv);
+    if (n < 0) {
+        return (int)map_errno(errno);
+    }
+    return (n > 0) ? 1 : 0;
+}
+
 ag_err_t ag_port_net_nonblock(int fd, bool on)
 {
     if (fd < 0) {
         return -AG_EBADF;
     }
-    const int flags = fcntl(fd, F_GETFL, 0);
+    const int flags = lwip_fcntl(fd, F_GETFL, 0);
     if (flags < 0) {
         return map_errno(errno);
     }
     const int next = on ? (flags | O_NONBLOCK) : (flags & ~O_NONBLOCK);
-    if (fcntl(fd, F_SETFL, next) < 0) {
+    if (lwip_fcntl(fd, F_SETFL, next) < 0) {
         return map_errno(errno);
     }
     return AG_OK;

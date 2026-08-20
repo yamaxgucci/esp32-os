@@ -67,52 +67,25 @@ typedef struct {
 /* ---------------------------------------------------------------------- */
 
 /*
- * Send and receive that cannot wedge the board.
- *
- * The socket is non-blocking, so a client that stops reading halfway through a
- * file costs this server a deadline rather than a reboot.  The port's own
- * timeouts would not do: they are set at connect time, and this socket arrived
- * from accept.
+ * Send and receive that cannot wedge the board: the socket is non-blocking and
+ * netio waits against a deadline, so a client that stops reading halfway
+ * through a file costs this server a timeout rather than a reset.  The port's
+ * own timeouts would not do anyway - they are set at connect time, and this
+ * socket arrived from accept.
  */
 static ag_err_t send_all(int fd, const void *buf, size_t len)
 {
-    const uint8_t *p = (const uint8_t *)buf;
-    size_t         left = len;
-    const int64_t  deadline = ag_port_us() + (int64_t)HTTPD_SEND_MS * 1000;
-
-    while (left > 0) {
-        const int32_t n = ag_port_net_send(fd, p, left);
-        if (n == -AG_EAGAIN) {
-            if (ag_port_us() > deadline || ag_shell_interrupted()) {
-                return -AG_ETIMEDOUT;
-            }
-            ag_port_task_delay(ag_port_ms_to_ticks(5));
-            continue;
-        }
-        if (n <= 0) {
-            return (n < 0) ? (ag_err_t)n : -AG_EIO;
-        }
-        p += (size_t)n;
-        left -= (size_t)n;
-    }
-    return AG_OK;
+    return ag_netio_send(fd, buf, len, HTTPD_SEND_MS);
 }
 
 /* The request header block, or nothing.  Returns its length. */
 static int32_t recv_request(int fd, char *hdr, size_t cap, size_t *end_out)
 {
-    size_t        have = 0;
-    const int64_t deadline = ag_port_us() + (int64_t)HTTPD_REQUEST_MS * 1000;
+    size_t have = 0;
 
     for (;;) {
-        const int32_t n = ag_port_net_recv(fd, hdr + have, cap - have);
-        if (n == -AG_EAGAIN) {
-            if (ag_port_us() > deadline || ag_shell_interrupted()) {
-                return -AG_ETIMEDOUT;
-            }
-            ag_port_task_delay(ag_port_ms_to_ticks(5));
-            continue;
-        }
+        const int32_t n =
+            ag_netio_recv(fd, hdr + have, cap - have, HTTPD_REQUEST_MS);
         if (n < 0) {
             return n;
         }
@@ -388,7 +361,8 @@ static void serve_one(int fd, const char *root, httpd_bufs_t *b)
 ag_err_t ag_httpd_run(uint16_t port, const char *root)
 {
     httpd_bufs_t b;
-    b.mem = ag_port_alloc(HTTPD_HDR_MAX + HTTPD_FILE_BUF, AG_MEM_FAST);
+    b.mem = ag_port_alloc(HTTPD_HDR_MAX + HTTPD_FILE_BUF,
+                          AG_MEM_FAST | AG_MEM_BYTE);
     if (b.mem == NULL) {
         ag_console_puts("not enough memory to serve\n");
         return -AG_ENOMEM;

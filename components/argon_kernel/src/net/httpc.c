@@ -69,7 +69,16 @@ typedef struct {
 
 static bool bufs_alloc(http_bufs_t *b)
 {
-    b->mem = ag_port_alloc(HTTP_HDR_MAX + HTTP_BODY_BUF, AG_MEM_FAST);
+    /*
+     * AG_MEM_BYTE is not decoration.  Without it the allocator may answer from
+     * memory that is only reachable as instructions - on this chip that is a
+     * six-kilobyte block at 0x4009xxxx - and a socket copying a reply into it
+     * does not fail, it stops: the task never comes back out of recv.  Two
+     * hours of the board's first afternoon went into that one, and the fix is
+     * this flag.  Anything a driver or a stack writes bytes into needs it.
+     */
+    b->mem = ag_port_alloc(HTTP_HDR_MAX + HTTP_BODY_BUF,
+                           AG_MEM_FAST | AG_MEM_BYTE);
     if (b->mem == NULL) {
         return false;
     }
@@ -248,6 +257,14 @@ static ag_err_t request_once(const ag_url_t *u, const char *dest,
     ag_console_puts("connected\n");
 
     /*
+     * From here the socket never blocks and netio does the waiting.  On this
+     * hardware a blocking read of a fresh connection does not return at all -
+     * see net/netio.h - and even where it does, a command that cannot be
+     * interrupted while it waits is a board that has to be reset.
+     */
+    (void)ag_port_net_nonblock(fd, true);
+
+    /*
      * Host: carries the port when it is not the default, because a server
      * behind a name-based virtual host answers a bare name with the wrong
      * site.  Connection: close is what makes a body with no length finite.
@@ -270,28 +287,41 @@ static ag_err_t request_once(const ag_url_t *u, const char *dest,
         return err;
     }
 
-    /* The header block, and whatever body arrived stuck to the back of it. */
+    /*
+     * The header, read through the same buffered reader the body will use.
+     *
+     * A byte at a time, which sounds worse than it is: the reader is doing the
+     * receiving, so this is a copy out of its buffer, not a syscall each time.
+     * The point is that the first byte of the body stays in the reader instead
+     * of being read into the header buffer and copied back - and that is where
+     * a fetch loses the first kilobyte of a file if it gets it wrong.
+     */
+    ag_netio_t rdr;
+    ag_netio_init(&rdr, fd, b->body, HTTP_BODY_BUF, 0);
+
     size_t have = 0;
-    size_t end = 0;
-    while (end == 0) {
+    while (ag_http_header_end(b->hdr, have) == 0) {
         if (have == HTTP_HDR_MAX) {
             ag_console_puts("the reply header is too long for this system\n");
             ag_port_net_close(fd);
             return -AG_ERANGE;
         }
-        const int32_t n =
-            ag_port_net_recv(fd, b->hdr + have, HTTP_HDR_MAX - have);
+        const int32_t n = ag_netio_read(&rdr, b->hdr + have, 1);
         if (n < 0) {
             /*
              * Named, because the commonest version of this is a server that
              * accepted the connection and then said nothing at all - and a
-             * command that comes back after fifteen seconds with no message
+             * command that comes back fifteen seconds later with no message
              * looks like a command that did nothing.
              */
-            ag_console_puts(
-                (n == -AG_EAGAIN || n == -AG_ETIMEDOUT)
-                    ? "no reply within fifteen seconds\n"
-                    : "the connection failed while waiting for the reply\n");
+            if (n == -AG_ETIMEDOUT) {
+                ag_console_puts("no reply within fifteen seconds\n");
+            } else if (n == -AG_EINTR) {
+                ag_console_puts("^C\n");
+            } else {
+                ag_console_puts(
+                    "the connection failed while waiting for the reply\n");
+            }
             ag_port_net_close(fd);
             return (ag_err_t)n;
         }
@@ -301,8 +331,8 @@ static ag_err_t request_once(const ag_url_t *u, const char *dest,
             return -AG_EIO;
         }
         have += (size_t)n;
-        end = ag_http_header_end(b->hdr, have);
     }
+    const size_t end = have;
 
     ag_http_resp_t resp;
     err = ag_http_parse_response(b->hdr, end, &resp);
@@ -360,13 +390,6 @@ static ag_err_t request_once(const ag_url_t *u, const char *dest,
         ag_console_printf(", %s", resp.type);
     }
     ag_console_puts("\n");
-
-    /* The body bytes that came with the header start the file. */
-    const size_t carried = have - end;
-    memcpy(b->body, b->hdr + end, carried);
-
-    ag_netio_t rdr;
-    ag_netio_init(&rdr, fd, b->body, HTTP_BODY_BUF, carried);
 
     ag_progress_t prog;
     ag_progress_start(&prog, resp.have_length ? resp.length : 0);
