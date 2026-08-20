@@ -23,6 +23,32 @@
 #define AG_PORT_NOINIT      RTC_NOINIT_ATTR
 #define AG_PORT_TARGET_NAME CONFIG_IDF_TARGET
 
+/*
+ * The chip's own account of why it started, in words.
+ *
+ * Every one of these means something different to whoever is holding the board:
+ * a brownout is a power supply or a radio drawing more than the regulator will
+ * give, a task watchdog is code that stopped yielding, a panic is a fault that
+ * was reported before the reset.  Collapsing them into "something went wrong"
+ * is right for the recovery counter and useless for a person.
+ */
+static inline const char *ag_port_reset_name(void)
+{
+    switch (esp_reset_reason()) {
+    case ESP_RST_POWERON:  return "power-on";
+    case ESP_RST_EXT:      return "external reset";
+    case ESP_RST_SW:       return "software restart";
+    case ESP_RST_PANIC:    return "panic";
+    case ESP_RST_INT_WDT:  return "interrupt watchdog";
+    case ESP_RST_TASK_WDT: return "task watchdog";
+    case ESP_RST_WDT:      return "watchdog";
+    case ESP_RST_DEEPSLEEP:return "deep sleep";
+    case ESP_RST_BROWNOUT: return "brownout - the supply sagged";
+    case ESP_RST_SDIO:     return "sdio";
+    default:               return "unknown";
+    }
+}
+
 static inline ag_reset_t ag_port_reset_reason(void)
 {
     switch (esp_reset_reason()) {

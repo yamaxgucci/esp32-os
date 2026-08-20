@@ -1703,37 +1703,121 @@ static int wifi_status(void)
     return 0;
 }
 
+/*
+ * What the last scan found, so that connecting can name a number.
+ *
+ * An SSID can be thirty-two characters and often is; typing one to join a
+ * network one has just been shown is work the machine should be doing.  So the
+ * names are kept and `wifi connect #3` means the third line of the last scan.
+ *
+ * On the heap, asked for the first time anything scans.  Sixteen names is half a
+ * kilobyte, and half a kilobyte of static data is more than the S3 firmware has
+ * left in its data segment - which is the fourth time on this branch that
+ * reserving memory for a possibility turned out to be the expensive way to do
+ * it.  A machine that never scans pays two pointers.
+ */
+#define WIFI_SCAN_MAX 16
+
+static char   (*s_scan_names)[AG_WIFI_SSID_MAX + 1];
+static uint32_t s_scan_count;
+
 static int wifi_scan(void)
 {
-    /* Sixteen is what the port returns at most, and more than fits a screen. */
-    ag_port_wifi_ap_t aps[16];
+    ag_port_wifi_ap_t aps[WIFI_SCAN_MAX];
     uint32_t          found = 0;
 
     ag_console_puts("scanning...\n");
-    const ag_err_t err = ag_port_wifi_scan(aps, 16, &found);
+    const ag_err_t err = ag_port_wifi_scan(aps, WIFI_SCAN_MAX, &found);
     if (err != AG_OK) {
         ag_console_printf("scan: %s\n", ag_loader_api()->sys->strerror(err));
         return 1;
     }
 
-    const bool narrow = narrow_screen();
-    ag_console_puts(narrow ? "ssid              ch  dBm auth\n"
-                           : "ssid                              ch   dBm  auth\n");
+    const uint32_t shown = (found < WIFI_SCAN_MAX) ? found : WIFI_SCAN_MAX;
 
-    const uint32_t shown = (found < 16u) ? found : 16u;
+    if (s_scan_names == NULL && shown != 0u) {
+        s_scan_names = ag_port_alloc(
+            (size_t)WIFI_SCAN_MAX * (AG_WIFI_SSID_MAX + 1u),
+            AG_MEM_FAST | AG_MEM_BYTE);
+    }
+    s_scan_count = 0;
+
+    const bool narrow = narrow_screen();
+    ag_console_puts(narrow ? "  # ssid            ch  dBm auth\n"
+                           : "  # ssid                             ch   dBm  auth\n");
+
     for (uint32_t i = 0; i < shown; i++) {
-        ag_console_printf(narrow ? "%-17s %2u %4d %s\n"
-                                 : "%-33s %2u  %4d  %s\n",
-                          aps[i].ssid[0] != '\0' ? aps[i].ssid : "(hidden)",
+        const char *name = aps[i].ssid[0] != '\0' ? aps[i].ssid : "(hidden)";
+
+        /*
+         * Two lines with one name is not a fault and it is the usual case: an
+         * access point with two radios, or two access points serving the same
+         * network.  You join the network and the chip picks whichever it hears
+         * best, so either number does the same thing - but showing the tail of
+         * the hardware address for those lines says *why* there are two, which
+         * is the part that otherwise looks like a bug.
+         */
+        bool dup = false;
+        for (uint32_t j = 0; j < shown && !dup; j++) {
+            if (j != i && ag_path_icmp(aps[j].ssid, aps[i].ssid) == 0) {
+                dup = true;
+            }
+        }
+
+        ag_console_printf(narrow ? "%3u %-15s %2u %4d %s"
+                                 : "%3u %-32s %2u  %4d  %s",
+                          (unsigned)(i + 1u), name,
                           (unsigned)aps[i].channel, (int)aps[i].rssi,
                           wifi_auth_name(aps[i].auth));
+        if (dup) {
+            ag_console_printf(" %02x%02x%02x", (unsigned)aps[i].bssid[3],
+                              (unsigned)aps[i].bssid[4],
+                              (unsigned)aps[i].bssid[5]);
+        }
+        ag_console_puts("\n");
+
+        if (s_scan_names != NULL) {
+            snprintf(s_scan_names[i], AG_WIFI_SSID_MAX + 1u, "%.32s", aps[i].ssid);
+            s_scan_count = i + 1u;
+        }
     }
+
     if (found > shown) {
         ag_console_printf("%u more not shown\n", (unsigned)(found - shown));
     } else if (found == 0) {
         ag_console_puts("nothing in range\n");
+    } else {
+        ag_console_puts("join one with: wifi connect #<number> [password]\n");
     }
     return 0;
+}
+
+/*
+ * "#3", or "3", into the name the third line of the last scan carried.
+ *
+ * Returns the argument unchanged when it is not a number, so a name that happens
+ * to start with a digit still works.
+ */
+static const char *wifi_named(const char *arg)
+{
+    const char *digits = (arg[0] == '#') ? arg + 1 : arg;
+    if (digits[0] < '1' || digits[0] > '9') {
+        return arg;
+    }
+    for (const char *p = digits; *p != '\0'; p++) {
+        if (*p < '0' || *p > '9') {
+            return arg; /* "5GHz-Guest" is a name, not a number */
+        }
+    }
+
+    const uint32_t n = (uint32_t)atoi(digits);
+    if (s_scan_names == NULL || n == 0u || n > s_scan_count) {
+        ag_console_printf("no #%u in the last scan; run `wifi scan` first\n",
+                          (unsigned)n);
+        return NULL;
+    }
+    ag_console_printf("#%u is \"%s\"\n", (unsigned)n, s_scan_names[n - 1u]);
+    return s_scan_names[n - 1u];
 }
 
 static int cmd_wifi(int argc, char **argv)
@@ -1750,19 +1834,44 @@ static int cmd_wifi(int argc, char **argv)
      * cannot.  Both radios are in every image; only one usually runs.
      */
     if (ag_path_icmp(argv[1], "on") == 0) {
+        const size_t before = ag_port_mem_free(AG_MEM_FAST);
+
         const ag_err_t err = ag_net_init();
         if (err != AG_OK) {
             ag_console_printf("wifi on: %s\n",
                               ag_loader_api()->sys->strerror(err));
             return 1;
         }
+
+        /*
+         * What it cost and what is left, every time.
+         *
+         * The radio takes about seventy kilobytes to start and more again to
+         * associate and take a lease, and the parts of that which fail do not
+         * fail politely: an allocation refused inside the Wi-Fi stack or lwIP
+         * ends in abort(), which on this chip is a reset.  From the outside that
+         * looks like the board restarting when a password is typed - a password
+         * problem, and it is not one.
+         *
+         * So the numbers are printed rather than left to be guessed, and a
+         * margin too thin to associate in says so before anyone tries.
+         */
+        const size_t after = ag_port_mem_free(AG_MEM_FAST);
+        ag_console_printf("radio on: took %u KB, %u KB free\n",
+                          (unsigned)((before - after) / 1024u),
+                          (unsigned)(after / 1024u));
+        if (after < 24u * 1024u) {
+            ag_console_puts(
+                "  that is thin: association and DHCP want ~16 KB more.\n"
+                "  if the board resets while joining, this is why - stop what\n"
+                "  else is running, or use a build with less in it.\n");
+        }
+
         const char *ssid = ag_cfg_get(ag_sysconfig(), "wifi.ssid", NULL);
         if (ssid != NULL && ssid[0] != '\0') {
             (void)ag_port_wifi_connect(
                 ssid, ag_cfg_get(ag_sysconfig(), "wifi.pass", ""));
-            ag_console_printf("radio on, joining %s\n", ssid);
-        } else {
-            ag_console_puts("radio on\n");
+            ag_console_printf("joining %s\n", ssid);
         }
         return 0;
     }
@@ -1773,12 +1882,16 @@ static int cmd_wifi(int argc, char **argv)
 
     if (ag_path_icmp(argv[1], "connect") == 0) {
         if (argc < 3) {
-            ag_console_puts("usage: wifi connect <ssid> [password]\n");
+            ag_console_puts("usage: wifi connect <#number|ssid> [password]\n");
+            ag_console_puts("  #number is a line from the last `wifi scan`\n");
             ag_console_puts("  the network is remembered in SYSTEM.CFG, in "
                             "clear text\n");
             return 1;
         }
-        const char *ssid = argv[2];
+        const char *ssid = wifi_named(argv[2]);
+        if (ssid == NULL) {
+            return 1;
+        }
         const char *pass = (argc > 3) ? argv[3] : "";
 
         const ag_err_t err = ag_port_wifi_connect(ssid, pass);
@@ -2581,7 +2694,7 @@ static const ag_command_t k_commands[] = {
     {"io", "[pin [mode]] | i2c <bus> | adc [ch]", "pins and buses", cmd_io},
     {"beep", "[hz] [ms]", "a tone on /dev/pcm0", cmd_beep},
 #if AG_PORT_HAS_WIFI
-    {"wifi", "[on|off|scan|connect <ssid> [pass]|forget]", "the radio",
+    {"wifi", "[on|off|scan|connect <#n|ssid> [pass]|forget]", "the radio",
      cmd_wifi},
 #endif
 #if AG_PORT_HAS_BT
