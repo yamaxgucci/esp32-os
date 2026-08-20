@@ -1023,18 +1023,45 @@ static int hex_digit(char c)
  * copied through untouched, including the ones this system does not know
  * about - a config file is not only ours to keep.
  */
+/*
+ * Rewrites one section of SYSTEM.CFG, keeping the rest as it stands.
+ *
+ * The two buffers come from the heap, and that is a fix rather than a taste.
+ * As stack arrays they were four kilobytes each in a task with twelve, and the
+ * shell reaches this function several frames deep: `wifi connect` remembers the
+ * network here, and remembering it overflowed the stack of the task the shell
+ * runs in.
+ *
+ * What that looked like from outside was a board that restarts when a Wi-Fi
+ * password is typed - so the password was the suspect, then the memory the radio
+ * takes, and neither had anything to do with it.  What said otherwise was one
+ * line the chip prints and nobody had been reading:
+ *
+ *     ***ERROR*** A stack overflow in task main has been detected.
+ *
+ * Rewriting a configuration file happens when somebody types a command, so a
+ * heap allocation and a free cost nothing that matters, and eight kilobytes of
+ * stack in a twelve kilobyte task was never going to be safe for long.
+ */
 static ag_err_t cfg_replace_section(const char *section, const char *body)
 {
-    char        text[DRV_CFG_MAX];
-    char        out[DRV_CFG_MAX];
     size_t      used = 0;
     size_t      len = 0;
+
+    char *const text = (char *)ag_port_alloc(DRV_CFG_MAX * 2u,
+                                             AG_MEM_FAST | AG_MEM_BYTE);
+    if (text == NULL) {
+        return -AG_ENOMEM;
+    }
+    char *const out = text + DRV_CFG_MAX;
+
     ag_handle_t h = ag_vfs_open(DRV_CFG_PATH, NULL, AG_O_RDONLY);
 
     if (h >= 0) {
-        const int32_t n = ag_vfs_read(h, text, sizeof(text) - 1u);
+        const int32_t n = ag_vfs_read(h, text, DRV_CFG_MAX - 1u);
         ag_vfs_close(h);
         if (n < 0) {
+            ag_port_free(text);
             return (ag_err_t)n;
         }
         used = (size_t)n;
@@ -1058,7 +1085,8 @@ static ag_err_t cfg_replace_section(const char *section, const char *body)
                    (ag_path_icmpn_local(s + 1, section, seclen) == 0);
         }
         if (!drop) {
-            if (len + line >= sizeof(out)) {
+            if (len + line >= DRV_CFG_MAX) {
+                ag_port_free(text);
                 return -AG_ENOSPC;
             }
             memcpy(out + len, p, line);
@@ -1074,9 +1102,10 @@ static ag_err_t cfg_replace_section(const char *section, const char *body)
         if (len > 0 && out[len - 1u] != '\n') {
             out[len++] = '\n';
         }
-        const int n = snprintf(out + len, sizeof(out) - len, "[%s]\n%s",
+        const int n = snprintf(out + len, DRV_CFG_MAX - len, "[%s]\n%s",
                                section, body);
-        if (n < 0 || (size_t)n >= sizeof(out) - len) {
+        if (n < 0 || (size_t)n >= DRV_CFG_MAX - len) {
+            ag_port_free(text);
             return -AG_ENOSPC;
         }
         len += (size_t)n;
@@ -1084,10 +1113,12 @@ static ag_err_t cfg_replace_section(const char *section, const char *body)
 
     h = ag_vfs_open(DRV_CFG_PATH, NULL, AG_O_WRONLY | AG_O_CREATE | AG_O_TRUNC);
     if (h < 0) {
+        ag_port_free(text);
         return (ag_err_t)h;
     }
     const int32_t w = ag_vfs_write(h, out, len);
     (void)ag_vfs_close(h);
+    ag_port_free(text);
     return (w < 0) ? (ag_err_t)w : AG_OK;
 }
 
