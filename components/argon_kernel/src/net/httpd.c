@@ -468,7 +468,18 @@ static int serve_upload(int fd, const char *dir, const char *target,
         const int64_t n = recv_part(&rdr, named ? path : NULL, delim, dlen, win,
                                     cap, &have, &last);
         if (n < 0) {
-            /* Half a file is on the card and the operator should hear it. */
+            /*
+             * Half a file is on the card and the operator should hear it - and
+             * hear *why*, because "out of memory" is the one that means the
+             * board is being asked for more connections than it has, and no
+             * amount of retrying will change that.
+             */
+            if (n == -AG_ENOMEM) {
+                ag_console_printf("  upload %s: out of memory\n",
+                                  named ? name : "(field)");
+                reply_status(fd, 503, true);
+                return 503;
+            }
             ag_console_printf("  upload %s stopped short (%d)\n",
                               named ? name : "(field)", (int)n);
             reply_status(fd, 400, true);
@@ -641,9 +652,14 @@ static void serve_one(int fd, const char *root, httpd_bufs_t *b, bool writable)
          * field and fits in what already arrived; a POST to a file that says
          * anything else is not something this server does.
          */
+        /*
+         * Bounded, because the buffer is not a string: it holds whatever the
+         * client sent and nothing put a terminator after it.  strstr here read
+         * past the end of the allocation for as long as it took to find a zero
+         * byte - which is a fault waiting for the wrong heap layout.
+         */
         if (body_len > 0 && body_len < 64 &&
-            memchr(body, 'd', body_len) != NULL &&
-            strstr((const char *)b->hdr + end, "delete") != NULL) {
+            find_bytes(body, body_len, (const uint8_t *)"delete", 6) >= 0) {
             const ag_err_t derr = ag_vfs_unlink(path, NULL);
             if (derr != AG_OK) {
                 reply_status(fd, 403, true);

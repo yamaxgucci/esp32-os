@@ -253,7 +253,19 @@ int ag_port_net_listen(uint16_t port)
         lwip_close(fd);
         return (int)e;
     }
-    if (lwip_listen(fd, 4) != 0) {
+    /*
+     * Two waiting, not four.
+     *
+     * The queue is not free: every connection in it is established, and an
+     * established connection is allowed a receive window's worth of memory in
+     * flight - on this chip that is thousands of bytes each, out of a heap with
+     * thirty-odd kilobytes in it.  A browser opens six connections to one page
+     * whether or not it has six things to ask for, and six of them pushing data
+     * ran the board out of memory and killed it.  Nothing here can serve more
+     * than one at a time anyway, so the rest are better refused at once - a
+     * refused connection is retried, a dead board is not.
+     */
+    if (lwip_listen(fd, 2) != 0) {
         const ag_err_t e = map_errno(errno);
         lwip_close(fd);
         return (int)e;
