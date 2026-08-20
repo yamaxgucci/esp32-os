@@ -18,6 +18,14 @@
  *   AG_PORT_TARGET_NAME     string, e.g. "esp32s3" - printed by `ver`
  *
  *   ag_reset_t ag_port_reset_reason(void)
+ *   const char *ag_port_reset_name(void)
+ *
+ * reset_reason answers the one question the boot logic asks - was this clean -
+ * and deliberately answers nothing else, because three cases are all the policy
+ * needs.  reset_name answers the question a person asks, which is a different
+ * one: "prochee" covers a panic, a watchdog and a supply that sagged, and those
+ * call for entirely different next steps.  A name costs nothing and turns a
+ * board that "seems to have restarted" into a board that says why.
  *   void       ag_port_restart(void)         does not return
  *
  *   uint8_t  ag_port_cpu_cores(void)
