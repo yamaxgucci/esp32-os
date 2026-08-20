@@ -42,6 +42,9 @@ ArgonOS
   argon test [-Send ...]   automated boot test; prints the resulting screen
   argon test -cp 866 ...   the same, when the screen is in another code page
   argon tests              host unit tests (needs a host C compiler)
+  argon nettest            wget / httpd / ftp in QEMU against tools
+etfixture.py
+  python tools/netfixture.py serve   the same servers, to try things by hand
   argon check              local CI: host tests, then firmware build
   argon target             which chip the firmware is built for
   argon target esp32       switch to the board on the desk (docs\09-esp32-cyd.md);
@@ -356,6 +359,14 @@ switch ($Command.ToLowerInvariant()) {
         & cmd /c "build-host\vtdump.exe 80 25 $codepage < build\qemu-boot.log"
         [Console]::OutputEncoding = $wasOut
         exit $bootStatus
+    }
+
+    'nettest' {
+        # The network in the emulator, against servers this PC runs.  Not part
+        # of `check`: it wants two ports and a Python that can bind them, and a
+        # firewall prompt is not a test failure.
+        & (Join-Path $PSScriptRoot 'nettest.ps1') @Rest
+        exit $LASTEXITCODE
     }
 
     'tests' {

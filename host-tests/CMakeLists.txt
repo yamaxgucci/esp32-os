@@ -38,7 +38,8 @@ set(ARGON_PORTABLE_SRCS
     "${ARGON_ROOT}/components/argon_kernel/src/core/arena.c"
     "${ARGON_ROOT}/components/argon_kernel/src/loader/axeload.c"
     "${ARGON_ROOT}/components/argon_kernel/src/loader/axesig.c"
-    "${ARGON_ROOT}/components/argon_kernel/src/loader/probe.c")
+    "${ARGON_ROOT}/components/argon_kernel/src/loader/probe.c"
+    "${ARGON_ROOT}/components/argon_kernel/src/net/netmsg.c")
 
 # The shared audio DSP layer is userspace, not kernel, but it is plain
 # fixed-point C with no device I/O - so it runs on the host, and it is the
@@ -107,6 +108,7 @@ add_executable(argon_tests
     test_draw.c
     test_dsp.c
     test_ckt.c
+    test_netmsg.c
     "${ARGON_ROOT}/apps/cc/cc_compile.c"
     "${ARGON_ROOT}/components/argon_kernel/src/dev/draw.c"
     ${ARGON_DSP_SRCS}

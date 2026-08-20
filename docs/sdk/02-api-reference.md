@@ -69,7 +69,7 @@ if (AG_HAS(ag_api()->inp, key_pressed)) { ... }   /* есть ли вызов в
 | [`io`](#io--железо-напрямую) | ⚠ | GPIO, прерывания, I2C, SPI, UART, PWM; `adc_read` — `NULL` без `CONFIG_ARGON_ENABLE_ADC` |
 | [`gfx`](#gfx--графика) | ✅ | soft RGB565 framebuffer; панели SPI — позже |
 | `cfg` | ⬜ `NULL` | доступ к `SYSTEM.CFG` из приложения |
-| `net` | ✅ 0.12 | TCP listen/accept/connect/send/recv (OpenEth в QEMU; `ARGON_ENABLE_NET`) |
+| `net` | ✅ 0.12, `resolve` 0.33 | TCP listen/accept/connect/send/recv, `set_nonblock`, `resolve` (имя или дотированный квартет в адрес). OpenEth в QEMU, Wi-Fi на плате; `ARGON_ENABLE_NET`. Что этим уже сделано в самой системе — [`10-network.md`](../10-network.md) |
 
 ## Версии и проверка возможностей
 

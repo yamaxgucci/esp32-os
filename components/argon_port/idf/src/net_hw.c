@@ -25,6 +25,7 @@
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"
+#include "lwip/netdb.h"
 #include "lwip/sockets.h"
 #include "nvs_flash.h"
 
@@ -340,6 +341,55 @@ void ag_port_net_close(int fd)
     if (fd >= 0) {
         (void)close(fd);
     }
+}
+
+/*
+ * A name into an address, over whichever interface has the lease.
+ *
+ * getaddrinfo() rather than lwIP's dns_gethostbyname(): the latter must be
+ * called from the TCP/IP task and this is called from the shell.  The wrapper
+ * in netdb.h does that hop, and it is the only reason to prefer a POSIX call
+ * inside this port.
+ *
+ * The timeout is lwIP's own (DNS_MAX_RETRIES against the servers DHCP gave us),
+ * which is why the contract does not offer one.  Refusing to ask before there
+ * is an address is not an optimisation: without a lease there is no server to
+ * ask, and the resolver would spend its full retry budget finding that out.
+ */
+ag_err_t ag_port_net_resolve(const char *host, uint32_t *addr)
+{
+    if (host == NULL || addr == NULL || host[0] == '\0') {
+        return -AG_EINVAL;
+    }
+    if (!s_got_ip) {
+        return -AG_EAGAIN;
+    }
+
+    const struct addrinfo hints = {
+        .ai_family = AF_INET,
+        .ai_socktype = SOCK_STREAM,
+    };
+    struct addrinfo *res = NULL;
+
+    if (getaddrinfo(host, NULL, &hints, &res) != 0 || res == NULL) {
+        if (res != NULL) {
+            freeaddrinfo(res);
+        }
+        return -AG_ENOENT;
+    }
+
+    ag_err_t err = -AG_ENOENT;
+    for (const struct addrinfo *ai = res; ai != NULL; ai = ai->ai_next) {
+        if (ai->ai_family != AF_INET || ai->ai_addr == NULL) {
+            continue;
+        }
+        const struct sockaddr_in *sa = (const struct sockaddr_in *)ai->ai_addr;
+        *addr = ntohl(sa->sin_addr.s_addr);
+        err = AG_OK;
+        break;
+    }
+    freeaddrinfo(res);
+    return err;
 }
 
 ag_err_t ag_port_net_nonblock(int fd, bool on)

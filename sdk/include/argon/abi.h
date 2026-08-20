@@ -84,9 +84,12 @@ extern "C" {
  *      machine where the system framebuffer is absent or the wrong shape.
  * 0.32 appended fs->map / fs->unmap: a file's bytes at an address, read only,
  *      staged into flash - for data too big to hold and too fixed to need to.
+ * 0.33 appended net->resolve: a name into an address.  Without it every
+ *      connect() in an application needs a dotted quad, which is not how
+ *      anything on a network is written down.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 32u
+#define AG_ABI_MINOR 33u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -1193,6 +1196,17 @@ typedef struct ag_net_api {
 
     /* ABI 0.13: O_NONBLOCK.  send/recv then return -AG_EAGAIN instead of stalling. */
     ag_err_t (*set_nonblock)(ag_handle_t sock, bool on);
+
+    /*
+     * ABI 0.33: a name into a host-order IPv4 address.  A dotted quad is
+     * answered without asking anything, so this is also the way to read one.
+     *
+     * Blocks for as long as the resolver takes - seconds, when a server is
+     * slow - and there is no timeout to pass, because the stack that owns the
+     * resolver does not offer one.  -AG_ENOENT for a name that does not
+     * resolve, -AG_EAGAIN before the interface has an address of its own.
+     */
+    ag_err_t (*resolve)(const char *host, uint32_t *addr_out);
 } ag_net_api_t;
 
 /* ------------------------------------------------------------------------ */

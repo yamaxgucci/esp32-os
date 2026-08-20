@@ -45,6 +45,7 @@
 #include "core/sysconfig.h"
 #include "proc/supervisor.h"
 #include "shell/cmd_fs.h"
+#include "shell/cmd_net.h"
 #include "shell/cmd_unzip.h"
 
 typedef struct {
@@ -2727,6 +2728,15 @@ static const ag_command_t k_commands[] = {
 #if AG_PORT_HAS_WIFI
     {"wifi", "[on|off|scan|connect <#n|ssid> [pass]|forget]", "the radio",
      cmd_wifi},
+#endif
+#if AG_HAS_NET
+    {"net", "[wait|resolve <name>]", "address, waiting, and names into addresses",
+     ag_cmd_net},
+    {"wget", "<url> [file]", "fetch a file over http or ftp",
+     ag_cmd_wget},
+    {"ftp", "<host> [user] [pass]", "file transfer session", ag_cmd_ftp},
+    {"httpd", "[port] [dir]", "serve a directory until Ctrl+C",
+     ag_cmd_httpd},
 #endif
 #if AG_PORT_HAS_BT
     {"bt", "[on|off|scan|open <#|addr>|close|forget]", "bluetooth input", cmd_bt},

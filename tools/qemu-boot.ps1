@@ -157,6 +157,10 @@ $stream = $null
 $found = $false
 # Set when the guest sends XOFF, cleared on XON: see Read-Available.
 $script:paused = $false
+# How much had arrived when the last thing was sent.  '=' items search only
+# after this: a reply that came back before the wait started is still that
+# send's reply, and counting occurrences instead missed exactly those.
+$script:sendMark = 0
 
 try {
     # QEMU listens before it starts executing, but not before it starts.
@@ -212,6 +216,7 @@ try {
     function Send-Line {
         param([string]$Text)
         $bytes = [System.Text.Encoding]::ASCII.GetBytes($Text + "`r")
+        $script:sendMark = $text.Length
         $stream.Write($bytes, 0, $bytes.Length)
         $stream.Flush()
     }
@@ -351,9 +356,30 @@ try {
                     }
                 }
                 $bytes = $out.ToArray()
+                $script:sendMark = $text.Length
                 $stream.Write($bytes, 0, $bytes.Length)
                 $stream.Flush()
                 Start-Sleep -Milliseconds 300
+                $seen = Read-Available
+                continue
+            }
+            # Wait for text rather than sending anything: '=' items exist for
+            # a command that finishes when something else is done - a server in
+            # the guest answering the last request a host-side prober makes.
+            if ($cmd.StartsWith('=')) {
+                $needle = $cmd.Substring(1)
+                $mark = $script:sendMark
+                $deadline = (Get-Date).AddSeconds($TimeoutSec)
+                $ok = $false
+                while ((Get-Date) -lt $deadline) {
+                    [void](Read-Available)
+                    if ($text.ToString().IndexOf($needle, $mark) -ge 0) {
+                        $ok = $true
+                        break
+                    }
+                    Start-Sleep -Milliseconds 100
+                }
+                if (-not $ok) { Write-Host "warning: '$needle' never appeared" }
                 $seen = Read-Available
                 continue
             }
@@ -370,6 +396,40 @@ try {
                     if ((Count-Of ': no space left') -gt $wasErr) { break }
                     Start-Sleep -Milliseconds 200
                 }
+                $seen = Read-Available
+            } elseif ($cmd -match '(?i)^wget\s') {
+                # A transfer prints one line when it is done and a different
+                # one when it is not; the prompt cannot be used, because the
+                # progress line scrolls the screen and redraws the prompts
+                # already on it - which looked exactly like a finished fetch
+                # and cut the next command into the running one.
+                # The ways it can end, each printed once.  Not ': ' or the
+                # prompt: log lines and redraws both contain those.
+                $endings = @('saved ', 'no answer', 'Not Found', 'cannot be',
+                             'no reply within', 'not http', 'too many redirects',
+                             'this system speaks', 'holds the')
+                $was = @{}
+                foreach ($e in $endings) { $was[$e] = Count-Of $e }
+                Send-Line $cmd
+                $deadline = (Get-Date).AddSeconds($TimeoutSec)
+                while ((Get-Date) -lt $deadline) {
+                    [void](Read-Available)
+                    $done = $false
+                    foreach ($e in $endings) {
+                        if ((Count-Of $e) -gt $was[$e]) { $done = $true; break }
+                    }
+                    if ($done) { break }
+                    Start-Sleep -Milliseconds 200
+                }
+                $seen = Read-Available
+            } elseif ($cmd -match '(?i)^httpd\s') {
+                # Serves until Ctrl+C, so there is no prompt to wait for and
+                # nothing to wait for it with: what follows in the list is
+                # what stops it.
+                $wasUp = Count-Of 'Ctrl+C to stop'
+                Send-Line $cmd
+                [void](Wait-Text -Needle 'Ctrl+C to stop' -Was $wasUp `
+                                 -Seconds $TimeoutSec)
                 $seen = Read-Available
             } elseif ($cmd -match '(?i)^run\s') {
                 $wasRet = Count-Of 'returned '

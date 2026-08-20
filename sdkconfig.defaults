@@ -43,11 +43,36 @@ CONFIG_LOG_COLORS=n
 # QEMU OpenEth + api->net (see ARGON_ENABLE_NET).  Not for real silicon.
 CONFIG_ARGON_ENABLE_NET=y
 CONFIG_ETH_USE_OPENETH=y
-# Keep the Ethernet path lean: MD still needs a 32 KB internal stack, and the
-# largest free DRAM block after a default lwIP bring-up was only ~31 KB.
-CONFIG_ETH_OPENETH_DMA_RX_BUFFER_NUM=2
+# Eight receive buffers, and this number was found the hard way.
+#
+# It was two, to keep DRAM for the Mega Drive's 32 KB internal stack.  Two is
+# enough for one connection at a time, which is all anything here did until FTP
+# - and FTP has two: a control connection and a transfer, receiving at once.
+# With two buffers the emulated MAC drops a frame ("RX frame dropped"), and
+# after that drop *nothing* is received again: the next recv() never returns,
+# not even with a receive timeout set, because the wait is inside lwIP's core
+# lock rather than on the socket.  A transfer that stops forever, a dropped
+# frame in the log, and a timeout that does not fire - one cause, and it is
+# here.  Eight buffers is 12.8 KB of DRAM and it does not happen.
+#
+# OpenEth is QEMU only; on a board this line means nothing at all.
+CONFIG_ETH_OPENETH_DMA_RX_BUFFER_NUM=8
 CONFIG_ETH_OPENETH_DMA_TX_BUFFER_NUM=1
 # pcmvirt+midivirt+mousevirt each need listen(+conn); 4 left no room for pcmplay.
 CONFIG_LWIP_MAX_SOCKETS=12
 CONFIG_LWIP_TCP_SND_BUF_DEFAULT=2880
 CONFIG_LWIP_TCP_WND_DEFAULT=2880
+
+# No IPv6 anywhere in this system.
+#
+# The port contract is IPv4 and says so in one word: ag_port_net_connect takes a
+# uint32_t.  Everything above it - the sockets, the fetch, the server, the file
+# transfer - is written in host-order 32-bit addresses, so lwIP's IPv6 half is
+# several kilobytes of static tables (neighbour cache, multicast memberships,
+# reassembly) for a protocol nothing here can express.
+#
+# Turned off when name resolution was linked in and lwIP's DNS table - 1184
+# bytes of it - would not fit in the S3's data segment.  The arena leaves that
+# segment with about a kilobyte to spare, and the choice was between a smaller
+# arena and a stack that carries what it cannot use.
+CONFIG_LWIP_IPV6=n
