@@ -217,18 +217,20 @@ def main() -> int:
     b.pump(3.0)
     note("Ctrl+C to stop" in strip(b.text), "httpd-started")
 
-    # Three attempts, because the first one after a long download has been seen
-    # to time out on this network while the next one works - see the note in
-    # docs/09-esp32-cyd.md.  A retry is worth recording, not hiding.
+    # Six attempts over half a minute.  On the network this was written on, a
+    # connection *to* the board gets through most of the time and sometimes not
+    # at all, while everything the board starts itself is reliable - see the
+    # note in docs/09-esp32-cyd.md.  The retries are counted and printed rather
+    # than hidden: a test that quietly retries is a test that stops measuring.
     reply = b""
     attempts = 0
-    for attempt in range(3):
+    for attempt in range(6):
         attempts = attempt + 1
         try:
             reply = ask(board_ip, args.serve_port, "/page.htm", timeout=10)
             break
         except OSError as exc:
-            if attempt == 2:
+            if attempt == 5:
                 note(False, "httpd-reachable", str(exc))
             else:
                 time.sleep(5)
