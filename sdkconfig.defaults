@@ -60,8 +60,27 @@ CONFIG_ETH_OPENETH_DMA_RX_BUFFER_NUM=8
 CONFIG_ETH_OPENETH_DMA_TX_BUFFER_NUM=1
 # pcmvirt+midivirt+mousevirt each need listen(+conn); 4 left no room for pcmplay.
 CONFIG_LWIP_MAX_SOCKETS=12
-CONFIG_LWIP_TCP_SND_BUF_DEFAULT=2880
-CONFIG_LWIP_TCP_WND_DEFAULT=2880
+
+# The receive window, and why it is not two segments any more.
+#
+# A download from a server three hundred milliseconds away ran at 7 KB/s, and
+# it was not the radio (the same file took the same time on an access point
+# thirty decibels stronger) and not the card (the same bytes copy on it in 1.4
+# seconds).  It was arithmetic: a window of 2880 bytes divided by an RTT of
+# 281 ms is 10 KB/s, and that is the whole speed.  The same file reaches this
+# PC at 275 KB/s, so the far end had plenty to give.
+#
+# Doubling it doubles the transfer, exactly, and that is how this was checked -
+# 725 946 bytes: 101.7 s at 2880, 49.8 s at 5760, 23.3 s at 11520.  Eight
+# segments is where it stops here: the window comes out of the lwIP heap while
+# a connection is open rather than out of the data segment, and the board's
+# free memory does not move (35 KB free, 25 KB largest with the card mounted) -
+# but 25 KB is the largest block there is, and a window is not the thing to
+# spend it on.
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=11520
+CONFIG_LWIP_TCP_WND_DEFAULT=11520
+# At least window/MSS, or segments are dropped and re-sent for no reason.
+CONFIG_LWIP_TCP_RECVMBOX_SIZE=12
 
 # No IPv6 anywhere in this system.
 #

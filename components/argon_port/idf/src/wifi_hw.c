@@ -38,6 +38,9 @@ static volatile bool            s_want_join;
  * retry has to ask for the same thing the first attempt did. */
 static uint8_t                  s_bssid[6];
 static volatile bool            s_bssid_set;
+/* Set while a deliberate change of network or access point is under way, so
+ * that the disconnect it starts is not treated as one to recover from. */
+static volatile bool            s_switching;
 static esp_netif_t             *s_sta_netif;
 
 static ag_wifi_auth_t map_auth(wifi_auth_mode_t m)
@@ -89,7 +92,7 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id,
             s_last_reason = ev->reason;
         }
         ag_port_net_link_down();
-        if (s_want_join && !s_scanning) {
+        if (s_want_join && !s_scanning && !s_switching) {
             s_state = AG_WIFI_JOINING;
             s_attempts++;
             (void)esp_wifi_connect();
@@ -259,6 +262,23 @@ ag_err_t ag_port_wifi_connect(const char *ssid, const char *pass,
     }
 
     /*
+     * Let go of the current access point first.
+     *
+     * The driver refuses outright otherwise - "sta is connected, disconnect
+     * before connecting to new ap" - and the refusal is a log line, not an
+     * error return, so from up here the command looks as if it worked and the
+     * board stays where it was.  That is exactly how the first attempt at
+     * pinning to a nearer access point did nothing at all.
+     *
+     * The disconnect this causes is ours, so the retry in the event handler is
+     * held off until the new association has been asked for.
+     */
+    if (s_state == AG_WIFI_JOINED || s_state == AG_WIFI_JOINING) {
+        s_switching = true;
+        (void)esp_wifi_disconnect();
+    }
+
+    /*
      * An empty key means "the one you already have", when the network is the
      * same one.  That is what makes it possible to change *which access point*
      * without the key being typed again - and on a board whose screen is in a
@@ -309,6 +329,7 @@ ag_err_t ag_port_wifi_connect(const char *ssid, const char *pass,
     }
 
     if (esp_wifi_set_config(WIFI_IF_STA, &cfg) != ESP_OK) {
+        s_switching = false;
         return -AG_EINVAL;
     }
 
@@ -318,6 +339,15 @@ ag_err_t ag_port_wifi_connect(const char *ssid, const char *pass,
     s_state = AG_WIFI_JOINING;
 
     const esp_err_t err = esp_wifi_connect();
+
+    /*
+     * The new attempt is in flight, so a disconnect from here on is a real one
+     * and the handler may recover from it again.  A late event from the
+     * disconnect above finds this clear and retries - which is harmless, since
+     * what it retries is the configuration just installed.
+     */
+    s_switching = false;
+
     if (err != ESP_OK && err != ESP_ERR_WIFI_CONN) {
         s_state = AG_WIFI_IDLE;
         s_want_join = false;
