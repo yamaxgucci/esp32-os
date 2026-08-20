@@ -34,6 +34,20 @@ code into an application, does make that combined work subject to the GPL.
 The firmware builds on **ESP-IDF**, which is Apache-2.0. Apache-2.0 is
 compatible with GPL-3.0 and not with GPL-2.0 alone.
 
+## Ported code, and where it came from
+
+`tools/nam.c`, `tools/nam.h` and `tools/nam_run.c` play the NAM/TONE3000 amplifier
+captures the valve model is measured against. The algorithm, the parameter layout
+and the buffering scheme are those of **Neural Amp Modeler** and of
+**nlpodyssey/waveny** (with the newer-schema additions from a local fork of the
+latter), both **Apache-2.0**; the C here is a port rather than a copy, written
+loop-for-loop so that a render can be checked against the original bit for bit.
+Kept under `tools/`, so it is Apache-2.0 like the rest of that directory, and the
+files say so in their headers.
+
+The capture files themselves (`assets/**/*.nam`) are third-party work by the people
+who made them and are **not** in the repository - `.gitignore` excludes them.
+
 ## SPDX
 
 Source files carry `SPDX-License-Identifier` headers matching the table above.

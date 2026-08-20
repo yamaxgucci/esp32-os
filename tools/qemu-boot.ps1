@@ -126,6 +126,19 @@ if ($Icount) {
     # the console and HostFS tasks delay constantly.  Measured on the same
     # workload: one minute with the default, still running after eleven without.
     $qemuArgs += @('-icount', 'shift=0')
+    # And the waits have to be scaled with it, or the run fails for the one
+    # reason that has nothing to do with what is being measured.
+    #
+    # -icount shift=0 makes the emulator about an order of magnitude slower, and
+    # every deadline in this script came from the same fixed 60 s: the boot, the
+    # prompt, each command.  A boot that takes five seconds normally takes fifty
+    # under icount, which fits inside 60 on an idle machine and does not on a busy
+    # one - so the same command passed in the morning and stopped at
+    # "marker NOT seen within 60s" in the evening, with a transcript that ends in
+    # the middle of the IDF banner and looks exactly like a firmware hang.  It is
+    # not one: the same firmware boots fine without -Icount.
+    $TimeoutSec = $TimeoutSec * 10
+    Write-Host "icount: waits scaled to ${TimeoutSec}s (the emulator is ~10x slower)"
 }
 
 if (-not $NoNet) {

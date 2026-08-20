@@ -568,7 +568,7 @@ static void test_linear_fast_path(void)
     ag_ckt_tick(k, 1.0f, 2);
     AG_CHECK_INT(k->iters_last, 1);
 
-    AG_CHECK(ckt_build_tonestack(k, FS) == 4);
+    AG_CHECK(ckt_build_tonestack(k, FS) == 6);
     AG_CHECK_INT(k->linear, 1);
 
     /* And a circuit with a device in it must not take the fast path. */

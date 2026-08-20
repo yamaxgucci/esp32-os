@@ -671,12 +671,24 @@ int ckt_build_rc(ag_ckt_t *k, float fs)
 }
 
 /*
- * The classic passive stack, controls at noon:
+ * The classic passive stack, controls at noon.
  *
- *   in -1- 250n -2- treble pot -3- bass/mid to ground
+ *   1  in          2  the slope node, where the bass and mid capacitors hang
+ *   3  the top of the treble pot, behind its capacitor
+ *   6  the treble pot's wiper - the output
+ *   4  the bass node, which is also the bottom of the treble pot
+ *   5  the mid node
  *
- * Node 2 is the treble cap junction, 3 the wiper, 4 the bass node, 5 the mid
- * node.  Values are the Marshall set (250 pF treble, 22 nF bass, 22 nF mid).
+ * **The wiper used to be missing.**  Both halves of the treble pot were stamped
+ * between nodes 3 and 4, which is not a pot at all - it is one 62.5 k resistor,
+ * with the output taken from the bass node, and a network with no treble control
+ * in it.  It cost nothing here, because this netlist exists to be *timed* and
+ * nobody had looked at its response; it cost something the day its response was
+ * measured and quoted as "the real tone stack at noon".  See ag_tone.c in
+ * apps/common/tube, which is the same network built to be run.
+ *
+ * Note for the timing: this is a six-node solve now rather than five, so the
+ * `parts` row for the tone stack is a little dearer than the one last measured.
  */
 int ckt_build_tonestack(ag_ckt_t *k, float fs)
 {
@@ -690,10 +702,11 @@ int ckt_build_tonestack(ag_ckt_t *k, float fs)
     if (ag_ckt_add_c(k, 1, 3, 250.0e-12f) != 0) { /* treble cap */
         return 0;
     }
-    if (ag_ckt_add_r(k, 3, 4, 125.0e3f) != 0) { /* treble pot, half */
+    /* The treble pot, at noon: cap side to the wiper, wiper to the bass node. */
+    if (ag_ckt_add_r(k, 3, 6, 125.0e3f) != 0) {
         return 0;
     }
-    if (ag_ckt_add_r(k, 4, 3, 125.0e3f) != 0) {
+    if (ag_ckt_add_r(k, 6, 4, 125.0e3f) != 0) {
         return 0;
     }
     if (ag_ckt_add_c(k, 2, 4, 22.0e-9f) != 0) { /* bass cap */
@@ -708,11 +721,11 @@ int ckt_build_tonestack(ag_ckt_t *k, float fs)
     if (ag_ckt_add_r(k, 5, 0, 12.5e3f) != 0) { /* mid pot */
         return 0;
     }
-    if (ag_ckt_add_r(k, 4, 0, 1.0e6f) != 0) { /* load */
+    if (ag_ckt_add_r(k, 6, 0, 1.0e6f) != 0) { /* load, on the wiper */
         return 0;
     }
     if (ag_ckt_build(k) != 0) {
         return 0;
     }
-    return 4;
+    return 6;
 }
