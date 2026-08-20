@@ -194,6 +194,26 @@ static void palette_init(void)
 static uint32_t s_present_us;
 static uint32_t s_frames;
 
+/*
+ * How often the panel is fed, in rendered frames.
+ *
+ * The picture's size decides this and the driver decides the size, so neither
+ * the emulator nor whoever typed the command can know the right number in
+ * advance: a Game Boy screen at one to one is six milliseconds of SPI, and the
+ * same screen stretched to the full height of the glass is twenty-two.  At one
+ * to one there is room to feed the panel every rendered frame; stretched, there
+ * is not, and feeding it anyway leaves the game running at two thirds speed.
+ *
+ * So it is measured instead.  Every two seconds the emulator knows what
+ * fraction of real time it managed; below ninety-seven per cent it shows one
+ * frame less often, and it only goes back the other way after two windows of
+ * keeping up completely.  The picture settles within a few seconds of starting
+ * and the game keeps its own time, which is the thing that matters.
+ */
+static uint32_t s_show_every = 1u; /* present one rendered frame in this many */
+static uint32_t s_rendered;        /* rendered frames, for the counting */
+static bool     s_show_this_one = true;
+
 static void band_out(uint16_t y0, uint16_t rows)
 {
     const ag_blit_t b = {
@@ -223,6 +243,25 @@ static void draw_line(struct gb_s *gb, const uint8_t *pixels,
                       const uint_fast8_t line)
 {
     (void)gb;
+
+    /*
+     * Line zero is a rendered frame beginning, and it is the only honest place
+     * to count them.
+     *
+     * Counting emulated frames instead - which is what this did first - goes
+     * wrong quietly: the emulator renders every other frame, so a count that
+     * advances on every frame is in step with the renderer only by luck.  It was
+     * out of step, `show one in two` selected the frames that were never drawn,
+     * and the panel got nothing at all while the numbers said a hundred per cent
+     * of real time.  It was: there was no picture to pay for.
+     */
+    if (line == 0u) {
+        s_show_this_one = ((s_rendered % s_show_every) == 0u);
+        s_rendered++;
+    }
+    if (!s_show_this_one) {
+        return;
+    }
 
     const uint16_t row = (uint16_t)(line % BAND);
     uint16_t      *out = &s_band[(size_t)row * LCD_WIDTH];
@@ -619,7 +658,7 @@ int ag_main(int argc, char **argv)
         s_frames++;
         stat_frames++;
 
-        if (stats && ag_millis() - stat_at >= 2000u) {
+        if (ag_millis() - stat_at >= 2000u) {
             const uint32_t ms = ag_millis() - stat_at;
             const uint32_t n = stat_frames ? stat_frames : 1u;
             /*
@@ -629,11 +668,42 @@ int ag_main(int argc, char **argv)
              */
             const uint32_t realtime = (uint32_t)(((uint64_t)stat_frames *
                                                   frame_us) / (ms * 10u));
-            ag_printf("gb: %u fps, %u%% of real time, emu %u us, show %u us "
-                      "per frame\n",
-                      (unsigned)(stat_frames * 1000u / ms),
-                      (unsigned)realtime, (unsigned)(emu_us / n),
-                      (unsigned)(s_present_us / n));
+            if (stats) {
+                ag_printf("gb: %u fps, %u%% of real time, emu %u us, show %u us "
+                          "per frame, showing 1 in %u\n",
+                          (unsigned)(stat_frames * 1000u / ms),
+                          (unsigned)realtime, (unsigned)(emu_us / n),
+                          (unsigned)(s_present_us / n),
+                          (unsigned)s_show_every);
+            }
+
+            /* Slower than real: show less.  Comfortably real twice over: try
+             * showing more again. */
+            static uint32_t kept_up;
+            static uint32_t patience = 2u; /* good windows before trying again */
+            if (realtime < 97u && s_show_every < 3u) {
+                s_show_every++;
+                kept_up = 0;
+                /*
+                 * That rate has now been tried and failed, so wait longer before
+                 * trying it again.  Without this the emulator finds it keeps up,
+                 * shows more, falls behind, shows less - a visible stumble every
+                 * six seconds, for ever.  Doubling the wait each time settles it
+                 * within a few tries and still lets a game that quietens down
+                 * get its smoother picture back.
+                 */
+                if (patience < 64u) {
+                    patience *= 2u;
+                }
+            } else if (realtime >= 100u) {
+                kept_up++;
+                if (kept_up >= patience && s_show_every > 1u) {
+                    s_show_every--;
+                    kept_up = 0;
+                }
+            } else {
+                kept_up = 0;
+            }
             stat_at = ag_millis();
             stat_frames = 0;
             emu_us = 0;
@@ -663,7 +733,18 @@ int ag_main(int argc, char **argv)
             if (wait > 1000u) {
                 ag_delay(wait / 1000u);
             }
-        } else {
+        } else if (now - next > 2u * frame_us) {
+            /*
+             * Far enough behind that catching up is not going to happen; start
+             * again from here rather than run frames back to back.
+             *
+             * Two frames of slack rather than none, and that is the whole point:
+             * with the picture shown once every three frames, one frame in three
+             * costs twenty-one milliseconds and the other two cost ten.  Resetting
+             * on any overrun threw away the credit the cheap frames had earned, so
+             * the average came out at the cost of the expensive one - eighty-five
+             * per cent of real time instead of the hundred the average allows.
+             */
             next = now;
         }
     }

@@ -32,7 +32,7 @@
 
 #include "font8x8.h"
 
-AG_DRV("ILI9341", "0.4", "argon");
+AG_DRV("ILI9341", "0.5", "argon");
 
 /*
  * The board this was written on: an ESP32-2432S024, whose panel is on SPI2
@@ -319,12 +319,44 @@ static void lcd_text_cursor(ag_handle_t h, uint16_t col, uint16_t row,
  * fits and centre what is left, which for the 160x120 the system asks for is
  * exactly two and no margin at all.
  *
- * A whole number and not a fraction, because the alternative is a resampler
- * and a line of pixels that changes width as it crosses the screen.  Doubling
- * is a copy.
+ * Nearest neighbour at an exact ratio - see s_num below for why a whole number
+ * turned out not to be enough.
  */
 static uint16_t s_surf_w, s_surf_h;
-static uint16_t s_scale, s_off_x, s_off_y;
+
+/*
+ * The picture's size on the glass, as a ratio rather than a whole number.
+ *
+ * Whole numbers were the first answer and they are not enough.  A Game Boy is
+ * 160x144 and this panel is 320x240: twice over is 320x288, which is taller than
+ * the glass, so the only whole number that fits is one - a small picture in the
+ * middle of a large screen, using a fifth of it.
+ *
+ * The ratio that fits is 240/144, five thirds, and it is exact: five output rows
+ * for every three source rows, chosen per row by integer arithmetic.  That is
+ * nearest neighbour, not interpolation - no pixel is averaged with its
+ * neighbours, so nothing is blurred and nothing has to be computed twice.  What
+ * it costs is that rows come in a repeating pattern of two, two, one rather than
+ * all being the same height, which at this size is not visible and at any size
+ * is what every console upscaler has always done.
+ *
+ * The same ratio is used for both axes, so a circle stays a circle.  Filling the
+ * screen edge to edge would mean two across and five thirds down, and a picture
+ * a fifth wider than it is meant to be; twenty-seven pixels of margin either
+ * side is the better trade.
+ */
+static uint32_t s_num = 1, s_den = 1; /* the scale, num/den */
+static uint16_t s_out_w, s_out_h;     /* the picture on the glass */
+static uint16_t s_off_x, s_off_y;     /* where it starts */
+
+/*
+ * Which source column each output column comes from.
+ *
+ * Worked out once per surface rather than per pixel: the map is a divide per
+ * entry and the inner loop is a lookup, where doing it directly would be a
+ * divide per pixel - some eighty thousand a frame.
+ */
+static uint16_t s_colmap[LCD_W];
 
 static void clear_panel(void)
 {
@@ -344,20 +376,44 @@ static void fit_surface(uint16_t w, uint16_t h)
     if (w == s_surf_w && h == s_surf_h) {
         return;
     }
-    uint16_t sx = (uint16_t)(w ? LCD_W / w : 1);
-    uint16_t sy = (uint16_t)(h ? LCD_H / h : 1);
-    uint16_t sc = (sx < sy) ? sx : sy;
-    if (sc == 0) {
-        sc = 1; /* a surface larger than the glass: show its top-left corner */
+    if (w == 0 || h == 0) {
+        return;
     }
 
     s_surf_w = w;
     s_surf_h = h;
-    s_scale = sc;
-    const uint16_t used_w = (uint16_t)(w * sc);
-    const uint16_t used_h = (uint16_t)(h * sc);
-    s_off_x = (used_w < LCD_W) ? (uint16_t)((LCD_W - used_w) / 2u) : 0u;
-    s_off_y = (used_h < LCD_H) ? (uint16_t)((LCD_H - used_h) / 2u) : 0u;
+
+    /*
+     * The larger scale that still fits, as an exact ratio: whichever of
+     * LCD_W/w and LCD_H/h is the smaller.  Compared by cross-multiplying so
+     * there is no division and no rounding in the comparison itself.
+     */
+    if ((uint32_t)LCD_W * h <= (uint32_t)LCD_H * w) {
+        s_num = LCD_W;
+        s_den = w;
+    } else {
+        s_num = LCD_H;
+        s_den = h;
+    }
+
+    s_out_w = (uint16_t)(((uint32_t)w * s_num) / s_den);
+    s_out_h = (uint16_t)(((uint32_t)h * s_num) / s_den);
+    if (s_out_w > LCD_W) {
+        s_out_w = LCD_W;
+    }
+    if (s_out_h > LCD_H) {
+        s_out_h = LCD_H;
+    }
+    s_off_x = (uint16_t)((LCD_W - s_out_w) / 2u);
+    s_off_y = (uint16_t)((LCD_H - s_out_h) / 2u);
+
+    for (uint16_t i = 0; i < s_out_w; i++) {
+        uint32_t c = ((uint32_t)i * s_den) / s_num;
+        if (c >= w) {
+            c = w - 1u;
+        }
+        s_colmap[i] = (uint16_t)c;
+    }
 
     /*
      * The margins are ours and they still have the console on them.
@@ -370,7 +426,6 @@ static void fit_surface(uint16_t w, uint16_t h)
     clear_panel();
 }
 
-
 static void lcd_blit_rect(ag_handle_t h, const ag_blit_t *b)
 {
     (void)h;
@@ -378,87 +433,79 @@ static void lcd_blit_rect(ag_handle_t h, const ag_blit_t *b)
         return;
     }
     fit_surface(b->surf_w, b->surf_h);
-
-    /* Clip to what the glass can actually show at this scale. */
-    uint16_t x = b->x, y = b->y, w = b->w, hgt = b->h;
-    const uint16_t max_w = (uint16_t)((LCD_W - s_off_x) / s_scale);
-    const uint16_t max_h = (uint16_t)((LCD_H - s_off_y) / s_scale);
-    if (x >= max_w || y >= max_h) {
+    if (s_out_w == 0 || s_out_h == 0) {
         return;
     }
-    if (x + w > max_w) {
-        w = (uint16_t)(max_w - x);
-    }
-    if (y + hgt > max_h) {
-        hgt = (uint16_t)(max_h - y);
+
+    const uint16_t x = b->x, y = b->y, w = b->w, hgt = b->h;
+    if (x >= s_surf_w || y >= s_surf_h) {
+        return;
     }
 
-    const uint16_t out_w = (uint16_t)(w * s_scale);
-    const uint16_t x0 = (uint16_t)(s_off_x + x * s_scale);
-    const uint16_t y0 = (uint16_t)(s_off_y + y * s_scale);
-
     /*
-     * One window for the whole rectangle: the controller walks it itself, so
-     * every row after the first is pixels and nothing else.  Four commands per
-     * frame instead of four per line is most of the difference between a
-     * picture that moves and one that crawls.
-     */
-    /*
-     * One window for as long as the writes keep following on, and as many rows
-     * per transfer as the row buffer holds.
+     * The rectangle in output rows and columns.
      *
-     * Both are about the same thing: a transfer costs about seventy microseconds
-     * whatever it carries, and a window costs five transfers.  A 160x144 frame
-     * arriving as eighteen bands used to be two hundred and sixteen transfers
-     * and eighteen windows - twenty-five milliseconds of a thirty-two
-     * millisecond frame, nearly all of it setup.  Sent this way it is a few
-     * dozen transfers and one window.
+     * Floor division at both ends, which is what makes consecutive rectangles
+     * meet exactly: the end of one is the start of the next, so a frame arriving
+     * as a run of bands covers every row once and none twice.
      */
-    window_for(x0, y0, (uint16_t)(x0 + out_w - 1),
-               (uint16_t)(y0 + hgt * s_scale - 1));
+    const uint16_t ox0 = (uint16_t)(((uint32_t)x * s_num) / s_den);
+    const uint16_t oy0 = (uint16_t)(((uint32_t)y * s_num) / s_den);
+    uint16_t       ox1 = (uint16_t)((((uint32_t)x + w) * s_num) / s_den);
+    uint16_t       oy1 = (uint16_t)((((uint32_t)y + hgt) * s_num) / s_den);
+    if (ox1 > s_out_w) {
+        ox1 = s_out_w;
+    }
+    if (oy1 > s_out_h) {
+        oy1 = s_out_h;
+    }
+    if (ox1 <= ox0 || oy1 <= oy0) {
+        return;
+    }
+    const uint16_t ow = (uint16_t)(ox1 - ox0);
+
+    window_for((uint16_t)(s_off_x + ox0), (uint16_t)(s_off_y + oy0),
+               (uint16_t)(s_off_x + ox1 - 1), (uint16_t)(s_off_y + oy1 - 1));
 
     /* Output rows that fit the row buffer at this width; never zero. */
-    uint16_t cap = (uint16_t)((sizeof(s_row) / sizeof(s_row[0])) / out_w);
+    uint16_t cap = (uint16_t)((sizeof(s_row) / sizeof(s_row[0])) / ow);
     if (cap == 0) {
         cap = 1;
     }
 
-    const uint8_t *src = (const uint8_t *)b->px;
-    uint16_t       held = 0;
+    const uint8_t *const src = (const uint8_t *)b->px;
+    uint16_t             held = 0;
 
-    for (uint16_t row = 0; row < hgt; row++) {
-        const uint16_t *in = (const uint16_t *)(const void *)src;
-
-        /*
-         * Once per copy of this row, because at a scale above one the same row
-         * goes out twice.  Expanded again rather than copied: the copy would
-         * have to survive a flush in between, and expanding is the same walk.
-         */
-        for (uint16_t k = 0; k < s_scale; k++) {
-            if (held == cap) {
-                data(s_row, (size_t)held * out_w * sizeof(uint16_t));
-                window_advance(held);
-                held = 0;
-            }
-            uint16_t *out = &s_row[(size_t)held * out_w];
-            uint16_t  o = 0;
-            for (uint16_t i = 0; i < w; i++) {
-                const uint16_t px = swap16(in[i]);
-                for (uint16_t j = 0; j < s_scale; j++) {
-                    out[o++] = px;
-                }
-            }
-            held++;
+    for (uint16_t j = oy0; j < oy1; j++) {
+        /* Which source row this output row draws from, and where it is in the
+         * rectangle we were handed. */
+        uint32_t srow = ((uint32_t)j * s_den) / s_num;
+        if (srow < y) {
+            srow = y;
         }
-        src += b->stride;
+        if (srow >= (uint32_t)y + hgt) {
+            srow = (uint32_t)y + hgt - 1u;
+        }
+        const uint16_t *in = (const uint16_t *)(const void *)
+            (src + (size_t)(srow - y) * b->stride);
+
+        if (held == cap) {
+            data(s_row, (size_t)held * ow * sizeof(uint16_t));
+            window_advance(held);
+            held = 0;
+        }
+        uint16_t *out = &s_row[(size_t)held * ow];
+        for (uint16_t i = 0; i < ow; i++) {
+            out[i] = swap16(in[s_colmap[ox0 + i] - x]);
+        }
+        held++;
     }
 
     if (held != 0) {
-        data(s_row, (size_t)held * out_w * sizeof(uint16_t));
+        data(s_row, (size_t)held * ow * sizeof(uint16_t));
         window_advance(held);
     }
 }
-
 
 static const ag_display_ops_t k_display_ops = {
     .size = sizeof(ag_display_ops_t),
