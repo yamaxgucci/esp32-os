@@ -27,6 +27,17 @@
 
 #include <argon/port/audio.h>
 
+/*
+ * Nothing at all where the build has no output.
+ *
+ * ag_port_audio_present() already answers false there and pcm0 is never
+ * registered, but the format, the device pointer and the counters were held
+ * regardless - thirty bytes of a data segment that, on the S3, has about twenty
+ * to spare.  Small, and the third time this branch spent memory on a possibility
+ * rather than a thing.
+ */
+#if CONFIG_ARGON_ENABLE_AUDIO
+
 #define TAG "pcm0"
 
 static ag_device_t    *s_dev;
@@ -205,3 +216,12 @@ ag_err_t ag_pcmhw_init(void)
            (unsigned)s_fmt.rate);
     return AG_OK;
 }
+#else /* !CONFIG_ARGON_ENABLE_AUDIO */
+
+ag_err_t ag_pcmhw_init(void)
+{
+    return AG_OK; /* nothing to register, and that is not a failure */
+}
+
+#endif
+
