@@ -35,6 +35,8 @@
 #include <argon/log.h>
 #include <argon/vfs.h>
 
+#include <argon/port/mem.h>
+
 #include "loader/appfs.h"
 
 #define TAG "filemap"
@@ -64,7 +66,29 @@ typedef struct {
     char             path[AG_PATH_MAX];
 } entry_t;
 
-static entry_t s_map[AG_FILEMAP_MAX];
+/*
+ * Asked for when something first maps a file, not reserved for the possibility.
+ *
+ * Four entries with a path in each is a kilobyte of static memory, held on every
+ * machine whether anything is ever mapped or not - and the S3 build has less
+ * than that to spare: adding it as a static array put `.dram0.bss` over the end
+ * of its segment by sixteen hundred bytes and the firmware would not link.
+ *
+ * Which is the right lesson rather than an annoyance.  A table for a feature
+ * most programs never use belongs on the heap, where a machine that does not use
+ * it pays a pointer.
+ */
+static entry_t *s_map;
+
+static ag_err_t table_ready(void)
+{
+    if (s_map != NULL) {
+        return AG_OK;
+    }
+    s_map = (entry_t *)ag_port_calloc(AG_FILEMAP_MAX, sizeof(entry_t),
+                                      AG_MEM_FAST | AG_MEM_BYTE);
+    return (s_map != NULL) ? AG_OK : -AG_ENOMEM;
+}
 
 /*
  * Staged copies outlive the process that asked for them, on purpose.
@@ -90,6 +114,9 @@ static bool same_source(const entry_t *e, const char *path, const ag_stat_t *st)
 
 static entry_t *cached(const char *path, const ag_stat_t *st)
 {
+    if (s_map == NULL) {
+        return NULL;
+    }
     for (int i = 0; i < AG_FILEMAP_MAX; i++) {
         if (same_source(&s_map[i], path, st)) {
             return &s_map[i];
@@ -125,6 +152,9 @@ static entry_t *free_entry(void)
 
 static entry_t *entry_for(const void *ptr)
 {
+    if (s_map == NULL) {
+        return NULL;
+    }
     for (int i = 0; i < AG_FILEMAP_MAX; i++) {
         if (s_map[i].used && s_map[i].ptr == ptr) {
             return &s_map[i];
@@ -147,6 +177,11 @@ ag_err_t ag_filemap_open(const char *path, const char *cwd, const void **out,
     }
     if (st.size == 0) {
         return -AG_EINVAL;
+    }
+
+    err = table_ready();
+    if (err != AG_OK) {
+        return err;
     }
 
     entry_t *hit = cached(path, &st);
@@ -253,6 +288,9 @@ ag_err_t ag_filemap_close(const void *ptr)
 uint32_t ag_filemap_release_all(void)
 {
     uint32_t freed = 0;
+    if (s_map == NULL) {
+        return 0;
+    }
     for (int i = 0; i < AG_FILEMAP_MAX; i++) {
         if (s_map[i].used) {
             ag_appfs_release(s_map[i].slot);
@@ -266,6 +304,9 @@ uint32_t ag_filemap_release_all(void)
 uint32_t ag_filemap_forget(void)
 {
     uint32_t dropped = 0;
+    if (s_map == NULL) {
+        return 0;
+    }
     for (int i = 0; i < AG_FILEMAP_MAX; i++) {
         if (s_map[i].used && s_map[i].refs == 0u) {
             ag_appfs_release(s_map[i].slot);
