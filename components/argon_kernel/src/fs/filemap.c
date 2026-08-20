@@ -16,8 +16,10 @@
  * ----------------
  *
  * Not demand paging: the file is copied into flash first, in full, and the copy
- * takes as long as writing that much flash takes.  Not a cache: a second run
- * copies it again.  Not writable, and not a way to make a filesystem mappable -
+ * takes as long as writing that much flash takes - four seconds for half a
+ * megabyte.  It is paid once per boot, not once per run: a staged copy outlives
+ * the process and a later request for the same file is handed it.  Not writable,
+ * and not a way to make a filesystem mappable -
  * littlefs and FAT scatter a file across blocks and neither can be mapped in
  * place, which is precisely why the copy exists.
  *
@@ -57,14 +59,64 @@ typedef struct {
     ag_appfs_slot_t *slot;
     const void      *ptr;
     uint64_t         len;
+    uint32_t         refs;  /* holders; an entry in use is not evicted */
+    uint64_t         mtime; /* with size and name, what identifies the source */
+    char             path[AG_PATH_MAX];
 } entry_t;
 
 static entry_t s_map[AG_FILEMAP_MAX];
 
+/*
+ * Staged copies outlive the process that asked for them, on purpose.
+ *
+ * Copying half a megabyte into flash takes four seconds and wears the part a
+ * little.  Doing it again every time the same cartridge is started would be
+ * both, for nothing: the bytes are already there and they have not changed.
+ *
+ * So an entry stays after the last holder lets go, and a later request for the
+ * same file - same name, same size, same modification time - is handed the
+ * mapping that already exists.  That is the same identity a build system trusts,
+ * and it is wrong in the same rare way: a file rewritten within the resolution
+ * of its timestamp and to exactly the same length looks unchanged.
+ *
+ * The cache lasts a boot.  Nothing is remembered in flash about what is staged
+ * there, so the first run after power-up pays the copy once.
+ */
+static bool same_source(const entry_t *e, const char *path, const ag_stat_t *st)
+{
+    return e->used && e->len == st->size && e->mtime == st->mtime &&
+           strncmp(e->path, path, sizeof(e->path)) == 0;
+}
+
+static entry_t *cached(const char *path, const ag_stat_t *st)
+{
+    for (int i = 0; i < AG_FILEMAP_MAX; i++) {
+        if (same_source(&s_map[i], path, st)) {
+            return &s_map[i];
+        }
+    }
+    return NULL;
+}
+
+/*
+ * A slot to stage into: an unused one, or the flash of an entry nobody holds.
+ *
+ * Evicting one that is still mapped would leave whoever holds it reading an
+ * address that has become something else, which is worse than refusing.
+ */
 static entry_t *free_entry(void)
 {
     for (int i = 0; i < AG_FILEMAP_MAX; i++) {
         if (!s_map[i].used) {
+            return &s_map[i];
+        }
+    }
+    for (int i = 0; i < AG_FILEMAP_MAX; i++) {
+        if (s_map[i].refs == 0u) {
+            ag_log(AG_LOG_INFO, TAG, "dropping staged %s to make room",
+                   s_map[i].path);
+            ag_appfs_release(s_map[i].slot);
+            memset(&s_map[i], 0, sizeof(s_map[i]));
             return &s_map[i];
         }
     }
@@ -88,11 +140,6 @@ ag_err_t ag_filemap_open(const char *path, const char *cwd, const void **out,
         return -AG_EINVAL;
     }
 
-    entry_t *e = free_entry();
-    if (e == NULL) {
-        return -AG_ENFILE;
-    }
-
     ag_stat_t st;
     ag_err_t  err = ag_vfs_stat(path, cwd, &st);
     if (err != AG_OK) {
@@ -100,6 +147,23 @@ ag_err_t ag_filemap_open(const char *path, const char *cwd, const void **out,
     }
     if (st.size == 0) {
         return -AG_EINVAL;
+    }
+
+    entry_t *hit = cached(path, &st);
+    if (hit != NULL) {
+        hit->refs++;
+        *out = hit->ptr;
+        if (out_len != NULL) {
+            *out_len = hit->len;
+        }
+        ag_log(AG_LOG_INFO, TAG, "%s: already staged, mapped at %p", path,
+               hit->ptr);
+        return AG_OK;
+    }
+
+    entry_t *e = free_entry();
+    if (e == NULL) {
+        return -AG_ENFILE;
     }
 
     ag_appfs_slot_t *slot = NULL;
@@ -152,6 +216,16 @@ ag_err_t ag_filemap_open(const char *path, const char *cwd, const void **out,
     e->slot = slot;
     e->ptr = ptr;
     e->len = st.size;
+    e->refs = 1u;
+    e->mtime = st.mtime;
+    {
+        size_t i = 0;
+        while (path[i] != '\0' && i + 1u < sizeof(e->path)) {
+            e->path[i] = path[i];
+            i++;
+        }
+        e->path[i] = '\0';
+    }
 
     *out = ptr;
     if (out_len != NULL) {
@@ -168,8 +242,11 @@ ag_err_t ag_filemap_close(const void *ptr)
     if (e == NULL) {
         return -AG_ENOENT;
     }
-    ag_appfs_release(e->slot);
-    memset(e, 0, sizeof(*e));
+    if (e->refs > 0u) {
+        e->refs--;
+    }
+    /* The staged copy stays: see the note above same_source.  It is given back
+     * only when the room is wanted for something else. */
     return AG_OK;
 }
 
@@ -184,4 +261,17 @@ uint32_t ag_filemap_release_all(void)
         }
     }
     return freed;
+}
+
+uint32_t ag_filemap_forget(void)
+{
+    uint32_t dropped = 0;
+    for (int i = 0; i < AG_FILEMAP_MAX; i++) {
+        if (s_map[i].used && s_map[i].refs == 0u) {
+            ag_appfs_release(s_map[i].slot);
+            memset(&s_map[i], 0, sizeof(s_map[i]));
+            dropped++;
+        }
+    }
+    return dropped;
 }
