@@ -114,11 +114,34 @@ static esp_err_t mount_spi(const ag_port_sd_cfg_t *sd, const char *base,
         .max_transfer_sz = 4096,
     };
 
-    esp_err_t err = spi_bus_initialize((spi_host_device_t)host.slot, &bus,
-                                       SPI_DMA_CH_AUTO);
-    /* Somebody else may already own the bus, which is fine. */
-    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
-        return err;
+    /*
+     * Remembered, because asking twice is not free of consequence.
+     *
+     * A second spi_bus_initialize on a live bus returns ESP_ERR_INVALID_STATE,
+     * which is harmless and handled below - but ESP-IDF logs it as an error on
+     * the way out, and that line lands on the console every time a card is
+     * mounted again after `eject`.  A red line that means nothing is worse than
+     * no line: it trains whoever is watching to ignore the ones that matter.
+     *
+     * The bus stays up across an unmount on purpose - the card is what left, not
+     * the wires - so this only skips work already done.
+     */
+    static bool s_bus_up[SPI_HOST_MAX];
+    esp_err_t   err = ESP_OK;
+
+    if (host.slot >= 0 && host.slot < SPI_HOST_MAX && s_bus_up[host.slot]) {
+        err = ESP_OK;
+    } else {
+        err = spi_bus_initialize((spi_host_device_t)host.slot, &bus,
+                                 SPI_DMA_CH_AUTO);
+        /* Somebody else may already own the bus, which is fine. */
+        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+            return err;
+        }
+        if (host.slot >= 0 && host.slot < SPI_HOST_MAX) {
+            s_bus_up[host.slot] = true;
+        }
+        err = ESP_OK;
     }
 
     sdspi_device_config_t device = SDSPI_DEVICE_CONFIG_DEFAULT();
