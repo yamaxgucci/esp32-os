@@ -26,8 +26,17 @@ ag_err_t ag_filemap_open(const char *path, const char *cwd, const void **out,
 /* Gives back one mapping, by the pointer it handed out. */
 ag_err_t ag_filemap_close(const void *ptr);
 
-/* Every mapping, for process teardown.  Returns how many there were. */
+/* Every mapping, held or not, for shutdown.  Returns how many there were. */
 uint32_t ag_filemap_release_all(void);
+
+/*
+ * Gives back the flash of every staged copy nobody is holding.
+ *
+ * A staged copy is kept after its last holder lets go, so that starting the same
+ * cartridge again does not spend four seconds and a flash erase repeating work
+ * already done.  This is how that room is asked for back.
+ */
+uint32_t ag_filemap_forget(void);
 
 #ifdef __cplusplus
 }

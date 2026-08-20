@@ -670,6 +670,11 @@ int ag_main(int argc, char **argv)
 
     ag_gfx_release();
     save_store();
+    /* Let the cartridge go: the kernel keeps the staged copy for the next run,
+     * but it may only reuse the flash for something else once nobody holds it. */
+    if (s_rom != NULL) {
+        (void)ag_unmap(s_rom);
+    }
     ag_printf("gb: %u frames\n", (unsigned)s_frames);
     return 0;
 }
