@@ -30,6 +30,7 @@ void run_cc_tests(void);
 void run_draw_tests(void);
 void run_dsp_tests(void);
 void run_ckt_tests(void);
+void run_netmsg_tests(void);
 
 int main(void)
 {
@@ -55,6 +56,7 @@ int main(void)
     run_draw_tests();
     run_dsp_tests();
     run_ckt_tests();
+    run_netmsg_tests();
 
     printf("%d checks, %d failures\n", ag_test_checks, ag_test_failures);
     return ag_test_failures == 0 ? 0 : 1;

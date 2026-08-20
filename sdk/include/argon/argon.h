@@ -772,7 +772,7 @@ static inline int32_t ag_btnp(int pad, int id)
                                                     : 0;
 }
 
-/* ---- net (ABI 0.12; NULL when the build has no networking) -------------- */
+/* ---- net (ABI 0.12, resolve 0.33; NULL without networking) ------------- */
 
 static inline bool ag_net_is_ready(void)
 {
@@ -851,6 +851,19 @@ static inline ag_err_t ag_net_set_nonblock(ag_handle_t sock, bool on)
         return -AG_ENOSYS;
     }
     return g_ag_api->net->set_nonblock(sock, on);
+}
+
+/*
+ * A name into a host-order address (ABI 0.33).  A dotted quad is answered
+ * without asking anybody, so this is also how one is read.  Blocks for as long
+ * as the resolver takes - seconds, when a server is slow.
+ */
+static inline ag_err_t ag_net_resolve(const char *host, uint32_t *addr_out)
+{
+    if (g_ag_api->net == NULL || g_ag_api->net->resolve == NULL) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->net->resolve(host, addr_out);
 }
 
 #ifdef __cplusplus

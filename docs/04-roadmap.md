@@ -687,6 +687,20 @@ BIOS: все контроллеры SoC и все шины. Всё, что по�
 Wi-Fi STA/AP, Ethernet, сокеты, DNS/SNTP, telnet-консоль, FTP/HTTP к SD,
 MQTT, Modbus TCP, OTA. Подтаблица `api->net` перестаёт быть NULL.
 
+Сделано (20 августа 2026), разбор — [10-network.md](10-network.md):
+
+* сокеты TCP и `api->net` (не NULL с ABI 0.12), Wi-Fi STA на плате, Ethernet
+  (OpenEth) в QEMU;
+* **имена**: `ag_port_net_resolve` в контракте порта и `net->resolve` в ABI 0.33;
+* **`wget`** — HTTP и FTP, chunked, тело без длины, перенаправления;
+* **`httpd`** — каталог по HTTP, одно соединение за раз;
+* **`ftp`** — сессия и одиночная выкачка, пассивный режим, двоичный;
+* **`net`** — адрес, ожидание DHCP для скриптов, разрешение имён;
+* проверка: 181 проверка текста протоколов на хосте, 37 в QEMU (`argon nettest`).
+
+Осталось: Wi-Fi AP, TLS (и с ним `https`), SNTP, telnet-консоль вторым
+endpoint, MQTT, Modbus TCP, OTA.
+
 ## Фаза 6 — «промышленная готовность»
 
 Бенчмарки и бюджеты (§10 архитектуры) в CI, стресс-тесты, документация SDK

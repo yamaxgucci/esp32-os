@@ -26,6 +26,7 @@
  *   int32_t  ag_port_net_recv(int fd, void *buf, size_t len)
  *   void     ag_port_net_close(int fd)
  *   ag_err_t ag_port_net_nonblock(int fd, bool on)
+ *   ag_err_t ag_port_net_resolve(const char *host, uint32_t *addr)
  *
  * Contract, not advice:
  *
@@ -39,6 +40,15 @@
  *   a zero receive timeout means "wait forever", and taking that shortcut hung a
  *   driver until a program on the development machine happened to connect.
  * - ifaddr() gives host-order IPv4.
+ * - resolve() is the one thing above sockets that a port has to answer, and it
+ *   is here rather than in the kernel because the resolver belongs to the stack
+ *   that owns the interface: it is the DHCP lease that says which server to
+ *   ask.  A dotted quad never reaches it - the kernel reads those itself, so a
+ *   board with no name service can still be told where to connect.
+ * - resolve() blocks, and the length of the block is the resolver's, not the
+ *   caller's: a few seconds when the server is slow, longer when a stack
+ *   retries.  There is no timeout argument because there is nothing honest to
+ *   put in it - lwIP's resolver does not take one.
  * - on_ready() exists so the address can be printed the moment it arrives.
  *   That is not decoration: nobody can use the network without knowing what
  *   the board is called, the address arrives long after boot has moved on, and
@@ -71,5 +81,9 @@ int32_t ag_port_net_send(int fd, const void *buf, size_t len);
 int32_t ag_port_net_recv(int fd, void *buf, size_t len);
 void    ag_port_net_close(int fd);
 ag_err_t ag_port_net_nonblock(int fd, bool on);
+
+/* Host-order IPv4 for a name.  -AG_ENOENT when the name does not resolve,
+ * -AG_EAGAIN before there is a network to ask over. */
+ag_err_t ag_port_net_resolve(const char *host, uint32_t *addr);
 
 #endif /* ARGON_PORT_NET_H */

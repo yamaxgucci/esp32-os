@@ -56,6 +56,16 @@ Xtensa `.AXE` applications or loadable `.SYS` drivers without a host toolchain:
 edit on the board (or over HostFS), compile, `run` / `drv load`. Details and
 the language subset are in [apps/cc/README.md](apps/cc/README.md).
 
+The network is now something you can use rather than something the drivers
+talk over: `net`, `wget`, `httpd` and `ftp` are commands of the system, so a
+board whose card is empty can fetch what belongs on it. HTTP and FTP, name
+resolution through `net->resolve` (ABI 0.33), and no TLS - an `https` URL is
+refused by the URL parser rather than quietly fetched over port 80, because
+mbedTLS wants tens of kilobytes this chip does not have. Verified end to end in
+the emulator against servers on the development machine (`argon nettest`),
+including 32 KB fetched into the guest and served back out of it byte for byte.
+Details: [docs/10-network.md](docs/10-network.md).
+
 What is still thin on real hardware is the panel/keyboard side; in QEMU soft
 gfx, HostFS, OpenEth, and loadable `.SYS` modules already work. An
 application's *code* that must live in the IRAM arena is size-capped; its data
@@ -75,8 +85,9 @@ goes from an empty file to a running program; the rest of the contract is in
 [04-axe-format.md](docs/sdk/04-axe-format.md).
 On the OS itself, use Argon CC as above. Using the machine rather than
 programming it: [docs/user/01-shell.md](docs/user/01-shell.md),
-[docs/user/02-board-setup.md](docs/user/02-board-setup.md), and
-[docs/user/03-host-share.md](docs/user/03-host-share.md) (QEMU folder sync).
+[docs/user/02-board-setup.md](docs/user/02-board-setup.md),
+[docs/user/03-host-share.md](docs/user/03-host-share.md) (QEMU folder sync) and
+[docs/user/04-network.md](docs/user/04-network.md) (fetching and serving files).
 The SDK docs are in
 Russian, like the rest of the design notes.
 

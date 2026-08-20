@@ -15,6 +15,7 @@
 
 #include <argon/log.h>
 #include <argon/net.h>
+#include <argon/netmsg.h>
 
 #include <argon/port/net.h>
 #include <argon/port/sync.h>
@@ -168,6 +169,31 @@ static ag_err_t api_wait_ready(uint32_t timeout_ms)
     return AG_OK;
 }
 
+/*
+ * A dotted quad is read here and a name is passed down.
+ *
+ * Not a shortcut: a board on a network with no name service, or none yet, can
+ * still be told exactly where to connect, and the answer does not depend on a
+ * lease.  It also means every caller in the system - the fetch, the file
+ * transfer, an application - takes "the host" in one form and never has to ask
+ * which kind it has.
+ */
+ag_err_t ag_net_lookup(const char *host, uint32_t *addr_out)
+{
+    if (host == NULL || addr_out == NULL) {
+        return -AG_EINVAL;
+    }
+    if (ag_ipv4_parse(host, addr_out)) {
+        return AG_OK;
+    }
+    return ag_port_net_resolve(host, addr_out);
+}
+
+static ag_err_t api_resolve(const char *host, uint32_t *addr_out)
+{
+    return ag_net_lookup(host, addr_out);
+}
+
 static ag_handle_t api_tcp_listen(uint16_t port)
 {
     return adopt_fd(ag_port_net_listen(port));
@@ -252,6 +278,7 @@ const ag_net_api_t ag_net_api_impl = {
     .recv = api_recv,
     .close = api_close,
     .set_nonblock = api_set_nonblock,
+    .resolve = api_resolve,
 };
 
 const ag_net_api_t *ag_net_api_table(void) { return &ag_net_api_impl; }
