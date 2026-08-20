@@ -74,6 +74,24 @@
  * between visitors. */
 #define HTTPD_ACCEPT_MS 200
 
+/*
+ * Below this much free memory, the next visitor is turned away at the door.
+ *
+ * Not a nicety.  A connection costs a receive window's worth of memory that the
+ * far end may fill at any moment, and when an allocation fails *inside* lwIP or
+ * the Wi-Fi driver they do not return an error - they abort, and on this chip
+ * that is a dead board.  Our own allocations answer 503 and carry on; theirs do
+ * not give us the chance.  So the server stops accepting while there is still
+ * room for the connections it already has, which is the only way to stay on the
+ * safe side of a limit that is not ours to enforce.
+ *
+ * Sixteen kilobytes is measured, not guessed: a board with the radio up and the
+ * card mounted has about thirty-five free, one connection in flight peaks at
+ * eight to ten, and the queue may hold two more.  Turning away at sixteen keeps
+ * what is already accepted able to finish.
+ */
+#define HTTPD_MEM_FLOOR (16u * 1024u)
+
 typedef struct {
     char    *hdr;  /* HTTPD_HDR_MAX                                       */
     uint8_t *file; /* HTTPD_FILE_BUF                                      */
@@ -783,6 +801,9 @@ ag_err_t ag_httpd_run(uint16_t port, const char *root, bool writable)
                       (unsigned)port);
     ag_console_printf("%s\n", writable ? "browsers may send and delete files"
                                         : "read only (add /w to accept files)");
+    ag_console_printf("%u KB free; visitors are refused below %u KB\n",
+                      (unsigned)(ag_port_mem_free(AG_MEM_BYTE) / 1024u),
+                      (unsigned)(HTTPD_MEM_FLOOR / 1024u));
     ag_console_puts("Ctrl+C to stop\n");
 
     ag_shell_clear_interrupted();
@@ -795,6 +816,19 @@ ag_err_t ag_httpd_run(uint16_t port, const char *root, bool writable)
         if (cfd < 0) {
             ag_console_printf("accept: %d\n", cfd);
             break;
+        }
+
+        /*
+         * The doorman.  A visitor turned away here gets a closed connection,
+         * which every browser retries; one let in when there is no memory left
+         * gets a board that stops existing.
+         */
+        const size_t free_now = ag_port_mem_free(AG_MEM_BYTE);
+        if (free_now < HTTPD_MEM_FLOOR) {
+            ag_port_net_close(cfd);
+            ag_console_printf("  busy: %u KB free, connection refused\n",
+                              (unsigned)(free_now / 1024u));
+            continue;
         }
 
         /* Non-blocking for the reasons in send_all above. */

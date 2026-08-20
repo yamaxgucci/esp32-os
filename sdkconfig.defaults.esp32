@@ -72,24 +72,6 @@ CONFIG_BT_NIMBLE_HID_SERVICE=y
 CONFIG_BT_NIMBLE_NVS_PERSIST=y
 CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y
 
-# The receive window, smaller here than everywhere else, and this is why.
-#
-# The window is *per connection*, and a browser is not one connection: it opens
-# several, and each of them is allowed to have that much data in flight towards
-# this board.  With 11520 (what the S3 and QEMU use, and what makes a download
-# from a distant server four times faster) four connections uploading at once
-# ran the heap out - and an allocation refused inside lwIP or the Wi-Fi driver
-# does not fail politely, it aborts, which on this chip is a dead board.  That
-# is exactly what happened the first time somebody pointed a real browser at
-# `httpd`: the page was slow, the upload stopped, and the machine was gone.
-#
-# 5760 is four segments: half the window, half the memory, and a download from
-# a long round trip is still twice what two segments gave.  A board with 35 KB
-# free and a browser at the other end does not get to have both.
-CONFIG_LWIP_TCP_SND_BUF_DEFAULT=5760
-CONFIG_LWIP_TCP_WND_DEFAULT=5760
-CONFIG_LWIP_TCP_RECVMBOX_SIZE=8
-
 # A panic reboots rather than halting.
 #
 # Halting is right on a desk with a console attached: the message stays on the
