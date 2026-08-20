@@ -272,6 +272,111 @@ static void test_http_request(void)
                  -AG_EFORMAT);
 }
 
+static void test_multipart(void)
+{
+    char b[AG_HTTP_BOUNDARY_MAX + 1];
+
+    /* What browsers actually send. */
+    AG_CHECK(ag_http_boundary(
+        "multipart/form-data; boundary=----WebKitFormBoundaryABC123", b,
+        sizeof(b)));
+    AG_CHECK_STR(b, "----WebKitFormBoundaryABC123");
+
+    AG_CHECK(ag_http_boundary(
+        "multipart/form-data; charset=utf-8; boundary=\"x y z\"", b,
+        sizeof(b)));
+    AG_CHECK_STR(b, "x y z");
+
+    /* And what is not an upload, or is one without a way to find the end. */
+    AG_CHECK(!ag_http_boundary("application/x-www-form-urlencoded", b,
+                               sizeof(b)));
+    AG_CHECK(!ag_http_boundary("multipart/form-data", b, sizeof(b)));
+    AG_CHECK(!ag_http_boundary("multipart/form-data; boundary=", b, sizeof(b)));
+    AG_CHECK(!ag_http_boundary("", b, sizeof(b)));
+
+    /* A parameter whose name merely ends in the one being looked for. */
+    AG_CHECK(!ag_http_boundary("multipart/form-data; notboundary=zz", b,
+                               sizeof(b)));
+
+    char name[65];
+    const char *part =
+        "Content-Disposition: form-data; name=\"f\"; filename=\"holiday.jpg\"\r\n"
+        "Content-Type: image/jpeg\r\n"
+        "\r\n";
+    AG_CHECK(ag_http_part_filename(part, strlen(part), name, sizeof(name)));
+    AG_CHECK_STR(name, "holiday.jpg");
+
+    /* A space in a quoted name is part of the name. */
+    const char *spaced =
+        "Content-Disposition: form-data; name=\"f\"; filename=\"my file.txt\"\r\n"
+        "\r\n";
+    AG_CHECK(ag_http_part_filename(spaced, strlen(spaced), name, sizeof(name)));
+    AG_CHECK_STR(name, "my file.txt");
+
+    /*
+     * A path is not a name.  Both spellings, because a phone sends the first
+     * and an old Windows browser sends the second - and a server that joined
+     * either to its root would write wherever the client said.
+     */
+    const char *pathy =
+        "Content-Disposition: form-data; name=\"f\"; "
+        "filename=\"/etc/passwd\"\r\n\r\n";
+    AG_CHECK(ag_http_part_filename(pathy, strlen(pathy), name, sizeof(name)));
+    AG_CHECK_STR(name, "passwd");
+
+    const char *winpath =
+        "Content-Disposition: form-data; name=\"f\"; "
+        "filename=\"C:\\Users\\max\\a.txt\"\r\n\r\n";
+    AG_CHECK(ag_http_part_filename(winpath, strlen(winpath), name,
+                                   sizeof(name)));
+    AG_CHECK_STR(name, "a.txt");
+
+    const char *dots =
+        "Content-Disposition: form-data; name=\"f\"; "
+        "filename=\"../../boot.cfg\"\r\n\r\n";
+    AG_CHECK(ag_http_part_filename(dots, strlen(dots), name, sizeof(name)));
+    AG_CHECK_STR(name, "boot.cfg");
+
+    /* Nothing to write: an ordinary form field, and an empty name. */
+    const char *field =
+        "Content-Disposition: form-data; name=\"delete\"\r\n\r\n";
+    AG_CHECK(!ag_http_part_filename(field, strlen(field), name, sizeof(name)));
+
+    const char *empty =
+        "Content-Disposition: form-data; name=\"f\"; filename=\"\"\r\n\r\n";
+    AG_CHECK(!ag_http_part_filename(empty, strlen(empty), name, sizeof(name)));
+
+    const char *dotdot =
+        "Content-Disposition: form-data; name=\"f\"; filename=\"..\"\r\n\r\n";
+    AG_CHECK(!ag_http_part_filename(dotdot, strlen(dotdot), name,
+                                    sizeof(name)));
+}
+
+static void test_post_request(void)
+{
+    ag_http_req_t req;
+    const char   *post =
+        "POST /photos/ HTTP/1.1\r\n"
+        "Host: 192.168.1.5\r\n"
+        "Content-Type: multipart/form-data; boundary=--x\r\n"
+        "Content-Length: 12345\r\n"
+        "\r\n";
+
+    AG_CHECK_INT(ag_http_parse_request(post, strlen(post), &req), AG_OK);
+    AG_CHECK_STR(req.method, "POST");
+    AG_CHECK_STR(req.target, "/photos/");
+    AG_CHECK(req.have_length);
+    AG_CHECK_INT((long)req.content_length, 12345);
+    AG_CHECK_STR(req.content_type, "multipart/form-data; boundary=--x");
+
+    /* A GET carries neither, and must not look as if it does. */
+    const char *get = "GET /a.txt HTTP/1.1\r\nHost: x\r\n\r\n";
+    AG_CHECK_INT(ag_http_parse_request(get, strlen(get), &req), AG_OK);
+    AG_CHECK(!req.have_length);
+    AG_CHECK_INT((long)req.content_length, 0);
+    AG_CHECK_STR(req.content_type, "");
+}
+
 static void test_target_safe(void)
 {
     AG_CHECK(ag_http_target_safe("/"));
@@ -427,6 +532,8 @@ void run_netmsg_tests(void)
     test_http_header_end();
     test_http_response();
     test_http_request();
+    test_multipart();
+    test_post_request();
     test_target_safe();
     test_chunk_and_pct();
     test_pct_encode();

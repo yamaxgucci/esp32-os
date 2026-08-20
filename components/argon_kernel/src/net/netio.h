@@ -64,8 +64,13 @@ ag_err_t ag_netio_send(int fd, const void *buf, size_t len,
 /* ag_netio_send with AG_NETIO_TIMEOUT_MS, which is what the clients want. */
 ag_err_t ag_netio_send_all(int fd, const void *buf, size_t len);
 
-/* A formatted control line.  Bounded at 288 bytes - these are request lines
- * and FTP commands, not bodies. */
+/*
+ * A formatted control line.  Bounded, and the bound is a real limit: a line
+ * that does not fit is refused rather than sent short, because half a request
+ * line asks for the wrong thing and half a table row is a broken page.  Five
+ * hundred is what the widest of them needs - a listing row carries a name
+ * twice, once percent-encoded, and a name here can be sixty-four characters.
+ */
 ag_err_t ag_netio_sendf(int fd, const char *fmt, ...)
     __attribute__((format(printf, 2, 3)));
 

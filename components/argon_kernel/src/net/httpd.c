@@ -21,6 +21,19 @@
  * - Accept a request larger than one kilobyte of headers.  A request that big
  *   is not from a person, and answering it would mean holding it.
  *
+ * Writing is off unless it is asked for (`httpd 80 a:\ /w`).  With it on the
+ * page carries a file picker and a delete button per row, and that is the whole
+ * feature: a phone and a laptop that cannot see each other's disks can both see
+ * this card.  Off is the default because a server that takes files from anyone
+ * who can reach it is a decision, not a convenience - there is no password
+ * here, and the network is whatever network the board is on.
+ *
+ * Both are ordinary HTML forms.  No JavaScript: a file picker and a submit
+ * button are older than this project and work in every browser a phone has ever
+ * had.  The cost is that the server has to read multipart/form-data, which is
+ * done streaming - the body is as large as the file, and the file is the reason
+ * somebody bought a card.
+ *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #include <argon/port/config.h>
@@ -53,6 +66,9 @@
  * on purpose: this server can only talk to one of them at a time. */
 #define HTTPD_REQUEST_MS 5000
 #define HTTPD_SEND_MS 10000
+/* A body comes from a phone over a radio; it is allowed to take longer than a
+ * request header, and a pause in the middle of a photo is not a failure. */
+#define HTTPD_UPLOAD_MS 20000
 
 /* Long enough that Ctrl+C is felt at once, short enough that the loop is idle
  * between visitors. */
@@ -135,7 +151,7 @@ static void reply_status(int fd, int status, bool with_body)
  * client where the body ends - which is exactly what HTTP/1.0 did.
  */
 static ag_err_t serve_listing(int fd, const char *path, const char *target,
-                              bool head_only)
+                              bool head_only, bool writable)
 {
     const ag_handle_t dir = ag_vfs_opendir(path, NULL);
     if (dir < 0) {
@@ -145,21 +161,54 @@ static ag_err_t serve_listing(int fd, const char *path, const char *target,
 
     ag_err_t err = ag_netio_sendf(fd,
                                   "HTTP/1.1 200 OK\r\nServer: ArgonOS\r\n"
-                                  "Content-Type: text/html\r\n"
+                                  "Content-Type: text/html; charset=utf-8\r\n"
                                   "Connection: close\r\n\r\n");
     if (err == AG_OK && !head_only) {
-        err = ag_netio_sendf(fd,
-                             "<html><head><title>%s</title></head><body>"
-                             "<h2>%s</h2><pre>\r\n",
-                             target, target);
+        /*
+         * Sent as a constant rather than formatted: it is longer than one
+         * formatted line may be, and there is nothing in it to fill in.  The
+         * viewport line is the difference between a page a phone can use and
+         * one it lays out at desktop width and then shrinks to nothing.
+         */
+        static const char k_head[] =
+            "<!doctype html><html><head><meta charset=\"utf-8\">"
+            "<meta name=\"viewport\" content=\"width=device-width,"
+            "initial-scale=1\"><style>"
+            "body{font:16px sans-serif;margin:1em;max-width:44em}"
+            "table{border-collapse:collapse;width:100%}"
+            "td{padding:.45em .6em;border-bottom:1px solid #ddd}"
+            "td.s{text-align:right;color:#666;white-space:nowrap}"
+            "button{font:inherit;padding:.2em .7em}"
+            "form.u{margin:1em 0;padding:.8em;background:#f2f2f2}"
+            "form.d{display:inline;margin:0}"
+            "</style><title>";
+        err = send_all(fd, k_head, sizeof(k_head) - 1);
+        if (err == AG_OK) {
+            err = ag_netio_sendf(fd, "%s", target);
+        }
+        if (err == AG_OK) {
+            err = ag_netio_sendf(fd, "</title></head><body><h2>%s</h2>",
+                                 target);
+        }
     }
     if (err != AG_OK || head_only) {
         ag_vfs_closedir(dir);
         return err;
     }
 
-    if (strcmp(target, "/") != 0) {
-        err = ag_netio_sendf(fd, "<a href=\"../\">../</a>\r\n");
+    if (writable) {
+        err = ag_netio_sendf(fd,
+                             "<form class=\"u\" method=\"post\" "
+                             "enctype=\"multipart/form-data\" action=\"\">"
+                             "<input type=\"file\" name=\"f\" multiple> "
+                             "<button>send</button></form>");
+    }
+    if (err == AG_OK) {
+        err = ag_netio_sendf(fd, "<table>");
+    }
+    if (err == AG_OK && strcmp(target, "/") != 0) {
+        err = ag_netio_sendf(fd, "<tr><td><a href=\"../\">../</a></td>"
+                                 "<td class=\"s\"></td><td></td></tr>");
     }
 
     ag_dirent_t ent;
@@ -172,11 +221,32 @@ static ag_err_t serve_listing(int fd, const char *path, const char *target,
         }
 
         if (is_dir) {
-            err = ag_netio_sendf(fd, "<a href=\"%s/\">%s/</a>\r\n", href,
-                                 ent.name);
-        } else {
-            err = ag_netio_sendf(fd, "<a href=\"%s\">%s</a>  %u\r\n", href,
-                                 ent.name, (unsigned)ent.st.size);
+            err = ag_netio_sendf(fd,
+                                 "<tr><td><a href=\"%s/\">%s/</a></td>"
+                                 "<td class=\"s\"></td><td></td></tr>",
+                                 href, ent.name);
+            continue;
+        }
+
+        err = ag_netio_sendf(fd,
+                             "<tr><td><a href=\"%s\">%s</a></td>"
+                             "<td class=\"s\">%u</td><td>",
+                             href, ent.name, (unsigned)ent.st.size);
+        if (err == AG_OK && writable) {
+            /*
+             * A form rather than a link, and that is not decoration: a link is
+             * something a browser may follow by itself - to preview it, to
+             * warm its cache - and this one deletes a file.
+             */
+            err = ag_netio_sendf(fd,
+                                 "<form class=\"d\" method=\"post\" "
+                                 "action=\"%s\"><input type=\"hidden\" "
+                                 "name=\"delete\" value=\"1\">"
+                                 "<button>delete</button></form>",
+                                 href);
+        }
+        if (err == AG_OK) {
+            err = ag_netio_sendf(fd, "</td></tr>");
         }
         if (ag_shell_interrupted()) {
             break;
@@ -185,9 +255,251 @@ static ag_err_t serve_listing(int fd, const char *path, const char *target,
     ag_vfs_closedir(dir);
 
     if (err == AG_OK) {
-        err = ag_netio_sendf(fd, "</pre></body></html>\r\n");
+        err = ag_netio_sendf(fd, "</table>%s</body></html>",
+                             writable ? "" : "<p>read only</p>");
     }
     return err;
+}
+
+/* ---------------------------------------------------------------------- */
+/* Taking a file in                                                       */
+/* ---------------------------------------------------------------------- */
+
+/* Where in `hay` (n bytes) `needle` (m bytes) starts, or -1. */
+static int find_bytes(const uint8_t *hay, size_t n, const uint8_t *needle,
+                      size_t m)
+{
+    if (m == 0 || n < m) {
+        return -1;
+    }
+    for (size_t i = 0; i + m <= n; i++) {
+        if (hay[i] == needle[0] && memcmp(hay + i, needle, m) == 0) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+/*
+ * One part's body, to a file or to nowhere.
+ *
+ * Everything up to the next delimiter is the file.  Written with a sliding
+ * window rather than by reading the body first: the body is as big as the file.
+ * The window keeps the last delimiter-length bytes back before flushing,
+ * because a delimiter can be split across two reads, and a file that lost four
+ * bytes at a block boundary is a file that is quietly wrong.
+ *
+ * `have` is what is already in the window on entry and what is left over on
+ * exit - the next part starts there.
+ */
+static int64_t recv_part(ag_netio_t *r, const char *path, const uint8_t *delim,
+                         size_t dlen, uint8_t *win, size_t cap, size_t *have,
+                         bool *last)
+{
+    ag_handle_t out = -1;
+    if (path != NULL) {
+        out = ag_vfs_open(path, NULL, AG_O_WRONLY | AG_O_CREATE | AG_O_TRUNC);
+        if (out < 0) {
+            return (int64_t)out;
+        }
+    }
+
+    int64_t  written = 0;
+    ag_err_t err = AG_OK;
+    *last = true;
+
+    for (;;) {
+        const int at = find_bytes(win, *have, delim, dlen);
+        if (at >= 0) {
+            if (at > 0 && out >= 0 &&
+                ag_vfs_write(out, win, (size_t)at) != (int32_t)at) {
+                err = -AG_EIO;
+                break;
+            }
+            written += at;
+
+            /* Two bytes after the delimiter say whether the body ends here:
+             * "--" is the last one, CRLF means another part follows. */
+            size_t after = (size_t)at + dlen;
+            while ((*have - after) < 2 && *have < cap) {
+                const int32_t n = ag_netio_read(r, win + *have, cap - *have);
+                if (n <= 0) {
+                    break;
+                }
+                *have += (size_t)n;
+            }
+            if ((*have - after) >= 2) {
+                *last = (win[after] == '-' && win[after + 1] == '-');
+                after += 2;
+            }
+            memmove(win, win + after, *have - after);
+            *have -= after;
+            break;
+        }
+
+        /* No delimiter in sight: all but the tail is certainly file. */
+        if (*have > dlen) {
+            const size_t flush = *have - (dlen - 1);
+            if (out >= 0 &&
+                ag_vfs_write(out, win, flush) != (int32_t)flush) {
+                err = -AG_EIO;
+                break;
+            }
+            written += (int64_t)flush;
+            memmove(win, win + flush, *have - flush);
+            *have -= flush;
+        }
+
+        const int32_t n = ag_netio_read(r, win + *have, cap - *have);
+        if (n < 0) {
+            err = (ag_err_t)n;
+            break;
+        }
+        if (n == 0) {
+            /* The client stopped mid-file.  What arrived is written, and the
+             * caller says so rather than pretending the file is complete. */
+            if (*have > 0 && out >= 0) {
+                (void)ag_vfs_write(out, win, *have);
+                written += (int64_t)*have;
+                *have = 0;
+            }
+            err = -AG_EIO;
+            break;
+        }
+        *have += (size_t)n;
+    }
+
+    if (out >= 0) {
+        ag_vfs_close(out);
+    }
+    return (err != AG_OK) ? (int64_t)err : written;
+}
+
+/*
+ * A whole multipart body: every part with a filename becomes a file in `dir`,
+ * everything else is read and thrown away (a form field this server has no use
+ * for is not a reason to refuse the upload).
+ */
+static int serve_upload(int fd, const char *dir, const char *target,
+                        const ag_http_req_t *req, httpd_bufs_t *b,
+                        const uint8_t *body, size_t body_len)
+{
+    char boundary[AG_HTTP_BOUNDARY_MAX + 1];
+    if (!ag_http_boundary(req->content_type, boundary, sizeof(boundary))) {
+        reply_status(fd, 400, true);
+        ag_console_puts("  upload without a boundary -> 400\n");
+        return 400;
+    }
+
+    /*
+     * The delimiter carries the CRLF that ends the part before it.  The very
+     * first one has no part before it, so the window is seeded with a CRLF and
+     * every delimiter then looks the same - which is one loop instead of two.
+     */
+    uint8_t delim[4 + AG_HTTP_BOUNDARY_MAX + 1];
+    delim[0] = '\r';
+    delim[1] = '\n';
+    delim[2] = '-';
+    delim[3] = '-';
+    const size_t blen = strlen(boundary);
+    memcpy(delim + 4, boundary, blen);
+    const size_t dlen = 4 + blen;
+
+    /* The reader owns the file buffer and starts with whatever arrived stuck
+     * to the back of the request header. */
+    memcpy(b->file, body, body_len);
+    ag_netio_t rdr;
+    ag_netio_init(&rdr, fd, b->file, HTTPD_FILE_BUF, body_len);
+    rdr.timeout_ms = HTTPD_UPLOAD_MS;
+
+    /* The window is the header buffer, which has done its job by now. */
+    uint8_t     *win = (uint8_t *)b->hdr;
+    const size_t cap = HTTPD_HDR_MAX;
+    size_t       have = 2;
+    win[0] = '\r';
+    win[1] = '\n';
+
+    int      files = 0;
+    uint64_t bytes = 0;
+    bool     last = false;
+
+    /* Everything before the first delimiter is preamble, and goes nowhere. */
+    int64_t skipped = recv_part(&rdr, NULL, delim, dlen, win, cap, &have,
+                                &last);
+    if (skipped < 0) {
+        reply_status(fd, 400, true);
+        ag_console_puts("  upload: no first boundary -> 400\n");
+        return 400;
+    }
+
+    while (!last) {
+        /* This part's headers, up to the blank line. */
+        size_t hend = 0;
+        for (;;) {
+            hend = ag_http_header_end((const char *)win, have);
+            if (hend != 0 || have == cap) {
+                break;
+            }
+            const int32_t n = ag_netio_read(&rdr, win + have, cap - have);
+            if (n <= 0) {
+                break;
+            }
+            have += (size_t)n;
+        }
+        if (hend == 0) {
+            reply_status(fd, 400, true);
+            ag_console_puts("  upload: a part without headers -> 400\n");
+            return 400;
+        }
+
+        char       name[AG_NAME_MAX + 1];
+        const bool named =
+            ag_http_part_filename((const char *)win, hend, name, sizeof(name));
+
+        memmove(win, win + hend, have - hend);
+        have -= hend;
+
+        char path[AG_PATH_MAX];
+        if (named && ag_path_join(dir, name, path, sizeof(path)) != AG_OK) {
+            reply_status(fd, 414, true);
+            return 414;
+        }
+
+        const int64_t n = recv_part(&rdr, named ? path : NULL, delim, dlen, win,
+                                    cap, &have, &last);
+        if (n < 0) {
+            /* Half a file is on the card and the operator should hear it. */
+            ag_console_printf("  upload %s stopped short (%d)\n",
+                              named ? name : "(field)", (int)n);
+            reply_status(fd, 400, true);
+            return 400;
+        }
+        if (named) {
+            files++;
+            bytes += (uint64_t)n;
+            ag_console_printf("  + %s, %u bytes\n", name, (unsigned)n);
+        }
+    }
+
+    if (files == 0) {
+        reply_status(fd, 400, true);
+        ag_console_puts("  upload with no file in it -> 400\n");
+        return 400;
+    }
+
+    /*
+     * See Other, so that the browser asks for the listing with a GET.  A page
+     * that answered the POST directly would be re-posted by every reload, and
+     * the reload button is the first thing anybody presses.
+     */
+    (void)ag_netio_sendf(fd,
+                         "HTTP/1.1 303 See Other\r\nServer: ArgonOS\r\n"
+                         "Location: %s\r\nContent-Length: 0\r\n"
+                         "Connection: close\r\n\r\n",
+                         target);
+    ag_console_printf("  %s -> 303, %d file(s), %u bytes\n", target, files,
+                      (unsigned)bytes);
+    return 303;
 }
 
 static ag_err_t serve_file(int fd, const char *path, httpd_bufs_t *b,
@@ -237,7 +549,7 @@ static ag_err_t serve_file(int fd, const char *path, httpd_bufs_t *b,
 /* ---------------------------------------------------------------------- */
 
 /* One request, then the connection is closed.  See the file's header. */
-static void serve_one(int fd, const char *root, httpd_bufs_t *b)
+static void serve_one(int fd, const char *root, httpd_bufs_t *b, bool writable)
 {
     size_t        end = 0;
     const int32_t have = recv_request(fd, b->hdr, HTTPD_HDR_MAX, &end);
@@ -257,9 +569,25 @@ static void serve_one(int fd, const char *root, httpd_bufs_t *b)
 
     const bool is_get = strcmp(req.method, "GET") == 0;
     const bool is_head = strcmp(req.method, "HEAD") == 0;
-    if (!is_get && !is_head) {
+    const bool is_post = strcmp(req.method, "POST") == 0;
+    if (!is_get && !is_head && !is_post) {
         reply_status(fd, 405, true);
         ag_console_printf("  %s -> 405\n", req.method);
+        return;
+    }
+    if (is_post && !writable) {
+        /*
+         * Not 403: nothing about this request was wrong, the server was simply
+         * not started with `/w`.  405 with the methods it does have is what
+         * tells a person which of the two to change.
+         */
+        (void)ag_netio_sendf(
+            fd,
+            "HTTP/1.1 405 Method Not Allowed\r\nServer: ArgonOS\r\n"
+            "Allow: GET, HEAD\r\nContent-Type: text/html\r\n"
+            "Content-Length: 46\r\nConnection: close\r\n\r\n"
+            "<html><body>read only (httpd /w)</body></html>");
+        ag_console_printf("  %s -> 405 (read only)\n", req.target);
         return;
     }
 
@@ -298,6 +626,55 @@ static void serve_one(int fd, const char *root, httpd_bufs_t *b)
     ag_err_t err = AG_OK;
     int      status = 200;
 
+    if (is_post) {
+        const uint8_t *body = (const uint8_t *)b->hdr + end;
+        const size_t   body_len = (size_t)have - end;
+
+        if ((st.attr & AG_A_DIR) != 0) {
+            /* A file arriving into the directory it was posted to. */
+            (void)serve_upload(fd, path, req.target, &req, b, body, body_len);
+            return;
+        }
+
+        /*
+         * A file, posted to with "delete=1", goes away.  The body is a form
+         * field and fits in what already arrived; a POST to a file that says
+         * anything else is not something this server does.
+         */
+        if (body_len > 0 && body_len < 64 &&
+            memchr(body, 'd', body_len) != NULL &&
+            strstr((const char *)b->hdr + end, "delete") != NULL) {
+            const ag_err_t derr = ag_vfs_unlink(path, NULL);
+            if (derr != AG_OK) {
+                reply_status(fd, 403, true);
+                ag_console_printf("  delete %s -> 403 (%d)\n", req.target,
+                                  (int)derr);
+                return;
+            }
+
+            /* Back to the directory the file was in, by See Other for the
+             * same reason the upload uses it: a reload must not repeat this. */
+            char up[AG_URL_PATH_MAX + 1];
+            snprintf(up, sizeof(up), "%s", req.target);
+            char *slash = strrchr(up, '/');
+            if (slash != NULL) {
+                slash[1] = '\0';
+            }
+            (void)ag_netio_sendf(fd,
+                                 "HTTP/1.1 303 See Other\r\n"
+                                 "Server: ArgonOS\r\nLocation: %s\r\n"
+                                 "Content-Length: 0\r\nConnection: close"
+                                 "\r\n\r\n",
+                                 up);
+            ag_console_printf("  - %s\n", req.target);
+            return;
+        }
+
+        reply_status(fd, 400, true);
+        ag_console_printf("  %s -> 400 (post of nothing)\n", req.target);
+        return;
+    }
+
     if ((st.attr & AG_A_DIR) != 0) {
         /*
          * A directory answers with its index page when it has one, because
@@ -334,7 +711,7 @@ static void serve_one(int fd, const char *root, httpd_bufs_t *b)
                     req.target);
                 status = 301;
             } else {
-                err = serve_listing(fd, path, req.target, is_head);
+                err = serve_listing(fd, path, req.target, is_head, writable);
             }
         }
     } else {
@@ -358,7 +735,7 @@ static void serve_one(int fd, const char *root, httpd_bufs_t *b)
     }
 }
 
-ag_err_t ag_httpd_run(uint16_t port, const char *root)
+ag_err_t ag_httpd_run(uint16_t port, const char *root, bool writable)
 {
     httpd_bufs_t b;
     b.mem = ag_port_alloc(HTTPD_HDR_MAX + HTTPD_FILE_BUF,
@@ -388,6 +765,8 @@ ag_err_t ag_httpd_run(uint16_t port, const char *root)
     ag_shell_dos_path(root, shown, sizeof(shown));
     ag_console_printf("serving %s at http://%s:%u/\n", shown, ip,
                       (unsigned)port);
+    ag_console_printf("%s\n", writable ? "browsers may send and delete files"
+                                        : "read only (add /w to accept files)");
     ag_console_puts("Ctrl+C to stop\n");
 
     ag_shell_clear_interrupted();
@@ -404,7 +783,7 @@ ag_err_t ag_httpd_run(uint16_t port, const char *root)
 
         /* Non-blocking for the reasons in send_all above. */
         (void)ag_port_net_nonblock(cfd, true);
-        serve_one(cfd, root, &b);
+        serve_one(cfd, root, &b, writable);
         ag_port_net_close(cfd);
     }
 

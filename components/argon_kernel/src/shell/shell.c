@@ -2889,7 +2889,7 @@ static const ag_command_t k_commands[] = {
     {"wget", "<url> [file]", "fetch a file over http or ftp",
      ag_cmd_wget},
     {"ftp", "<host> [user] [pass]", "file transfer session", ag_cmd_ftp},
-    {"httpd", "[port] [dir]", "serve a directory until Ctrl+C",
+    {"httpd", "[port] [dir] [/w]", "serve a directory (/w: accept files)",
      ag_cmd_httpd},
 #endif
 #if AG_PORT_HAS_BT

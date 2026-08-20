@@ -619,9 +619,145 @@ ag_err_t ag_http_parse_request(const char *hdr, size_t len,
             } else if (ihas(value, "keep-alive")) {
                 out->keep_alive = true;
             }
+        } else if (name_is(name, name_len, "content-type")) {
+            (void)copy_n(out->content_type, sizeof(out->content_type), value,
+                         strlen(value));
+        } else if (name_is(name, name_len, "content-length")) {
+            uint64_t n = 0;
+            if (parse_u64(value, strlen(value), &n)) {
+                out->content_length = n;
+                out->have_length = true;
+            }
         }
     }
     return AG_OK;
+}
+
+/* ---------------------------------------------------------------------- */
+
+/* The value of a parameter in a header: `; name=value` or `; name="value"`. */
+static bool param_value(const char *text, const char *name, char *out,
+                        size_t len)
+{
+    const size_t name_len = strlen(name);
+
+    for (const char *p = text; *p != '\0'; p++) {
+        if (!ipre(p, name)) {
+            continue;
+        }
+        /* The name has to start a parameter, not end another one's value. */
+        if (p != text) {
+            const char before = p[-1];
+            if (before != ' ' && before != ';' && before != '\t') {
+                continue;
+            }
+        }
+        const char *v = p + name_len;
+        while (*v == ' ') {
+            v++;
+        }
+        if (*v != '=') {
+            continue;
+        }
+        v++;
+        while (*v == ' ') {
+            v++;
+        }
+
+        const char stop = (*v == '"') ? '"' : ';';
+        if (*v == '"') {
+            v++;
+        }
+        size_t n = 0;
+        while (v[n] != '\0' && v[n] != stop && v[n] != '\r' && v[n] != '\n') {
+            n++;
+        }
+        /* An unquoted value also ends at whitespace; a quoted one does not,
+         * because a filename with a space in it is an ordinary filename. */
+        if (stop == ';') {
+            size_t m = 0;
+            while (m < n && v[m] != ' ' && v[m] != '\t') {
+                m++;
+            }
+            n = m;
+        }
+        return copy_n(out, len, v, n);
+    }
+    return false;
+}
+
+bool ag_http_boundary(const char *content_type, char *out, size_t len)
+{
+    if (content_type == NULL || out == NULL || len == 0) {
+        return false;
+    }
+    out[0] = '\0';
+    if (!ipre(content_type, "multipart/form-data")) {
+        return false;
+    }
+    if (!param_value(content_type, "boundary", out, len)) {
+        return false;
+    }
+    return out[0] != '\0';
+}
+
+bool ag_http_part_filename(const char *headers, size_t len, char *out,
+                           size_t out_len)
+{
+    if (headers == NULL || out == NULL || out_len == 0) {
+        return false;
+    }
+    out[0] = '\0';
+
+    const char *end = headers + len;
+    const char *line = NULL;
+    size_t      line_len = 0;
+    const char *p = headers;
+    char        value[288];
+    bool        found = false;
+
+    while ((p = next_line(p, end, &line, &line_len)) != NULL) {
+        if (line_len == 0) {
+            break;
+        }
+        const char *name = NULL;
+        size_t      name_len = 0;
+        if (!split_header(line, line_len, &name, &name_len, value,
+                          sizeof(value))) {
+            continue;
+        }
+        if (name_is(name, name_len, "content-disposition") &&
+            param_value(value, "filename", out, out_len)) {
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        return false;
+    }
+
+    /* Whatever the client called it, only the last component is a name here. */
+    const char *base = out;
+    for (const char *q = out; *q != '\0'; q++) {
+        if (*q == '/' || *q == '\\' || *q == ':') {
+            base = q + 1;
+        }
+    }
+    if (base != out) {
+        memmove(out, base, strlen(base) + 1);
+    }
+
+    if (out[0] == '\0' || strcmp(out, ".") == 0 || strcmp(out, "..") == 0) {
+        out[0] = '\0';
+        return false;
+    }
+    for (const char *q = out; *q != '\0'; q++) {
+        if ((unsigned char)*q < 0x20u || *q == 0x7f) {
+            out[0] = '\0';
+            return false;
+        }
+    }
+    return true;
 }
 
 bool ag_http_target_safe(const char *target)

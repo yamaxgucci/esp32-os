@@ -456,6 +456,47 @@ def probe(port: int, compare: Path | None, out_path: Path,
     note(head.startswith(b"HTTP/1.1 405"), "httpd-refuses-put",
          head.split(b"\r\n")[0].decode("latin-1"))
 
+    # ---- sending a file the way a browser does --------------------------
+    #
+    # A real multipart body, boundary and all, with the file split across the
+    # server's read buffer several times over - which is the only part of this
+    # that is hard, and the part a small body would not exercise.
+    sent = bytes((i * 7 + 3) & 0xFF for i in range(9000))
+    boundary = b"----argonTestBoundary9k"
+    body = (b"--" + boundary + b"\r\n"
+            b'Content-Disposition: form-data; name="f"; filename="up.bin"\r\n'
+            b"Content-Type: application/octet-stream\r\n\r\n" + sent +
+            b"\r\n--" + boundary + b"--\r\n")
+    request = (b"POST / HTTP/1.0\r\nHost: argon\r\n"
+               b"Content-Type: multipart/form-data; boundary=" + boundary +
+               b"\r\nContent-Length: " + str(len(body)).encode() +
+               b"\r\n\r\n" + body)
+    head, _ = split_reply(ask(port, request, timeout=40))
+    note(head.startswith(b"HTTP/1.1 303"), "httpd-upload-accepted",
+         head.split(b"\r\n")[0].decode("latin-1"))
+
+    head, back = split_reply(ask(port, b"GET /up.bin HTTP/1.0\r\n\r\n",
+                                 timeout=40))
+    note(back == sent, "httpd-upload-bytes-match",
+         "%d bytes back, %d sent" % (len(back), len(sent)))
+
+    head, body2 = split_reply(ask(port, b"GET / HTTP/1.0\r\n\r\n"))
+    note(b"up.bin" in body2, "httpd-upload-listed")
+
+    # ---- and taking it away again ---------------------------------------
+    form = b"delete=1"
+    request = (b"POST /up.bin HTTP/1.0\r\nHost: argon\r\n"
+               b"Content-Type: application/x-www-form-urlencoded\r\n"
+               b"Content-Length: " + str(len(form)).encode() + b"\r\n\r\n" +
+               form)
+    head, _ = split_reply(ask(port, request))
+    note(head.startswith(b"HTTP/1.1 303"), "httpd-delete-accepted",
+         head.split(b"\r\n")[0].decode("latin-1"))
+
+    head, _ = split_reply(ask(port, b"GET /up.bin HTTP/1.0\r\n\r\n"))
+    note(head.startswith(b"HTTP/1.1 404"), "httpd-delete-took-effect",
+         head.split(b"\r\n")[0].decode("latin-1"))
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text("\n".join(results) + "\n", encoding="utf-8")
     return 0 if all(r.startswith("PASS") for r in results) else 1
