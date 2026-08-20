@@ -192,6 +192,20 @@ static inline int64_t ag_seek(ag_handle_t h, int64_t off, int whence)
 {
     return g_ag_api->fs->seek(h, off, whence);
 }
+/*
+ * A file at an address, read only (ABI 0.32).  Ask with
+ * AG_HAS(ag_api()->fs, map) first: an older kernel has no such entry.
+ */
+static inline ag_err_t ag_map(const char *p, const void **out, uint64_t *len)
+{
+    return g_ag_api->fs->map(p, out, len);
+}
+
+static inline ag_err_t ag_unmap(const void *p)
+{
+    return g_ag_api->fs->unmap(p);
+}
+
 static inline ag_err_t ag_stat(const char *p, ag_stat_t *o)
 {
     return g_ag_api->fs->stat(p, o);

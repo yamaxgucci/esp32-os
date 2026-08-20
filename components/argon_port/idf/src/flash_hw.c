@@ -88,6 +88,24 @@ ag_err_t ag_port_part_map_exec(ag_port_part_t p, uint64_t off, size_t len,
     return AG_OK;
 }
 
+ag_err_t ag_port_part_map_data(ag_port_part_t p, uint64_t off, size_t len,
+                               const void **addr, ag_port_map_t *out)
+{
+    if (p == NULL || addr == NULL || out == NULL) {
+        return -AG_EINVAL;
+    }
+
+    esp_partition_mmap_handle_t h = 0;
+    const esp_err_t             e =
+        esp_partition_mmap((const esp_partition_t *)p, (size_t)off, len,
+                           ESP_PARTITION_MMAP_DATA, addr, &h);
+    if (e != ESP_OK) {
+        return from_esp(e);
+    }
+    *out = (ag_port_map_t)h;
+    return AG_OK;
+}
+
 void ag_port_part_unmap(ag_port_map_t h)
 {
     if (h != 0) {

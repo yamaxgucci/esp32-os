@@ -20,20 +20,20 @@
  *
  * Everything lives in this file's uninitialised data, one block, no allocator:
  *
- *   cartridge          32 KB   the ROM, whole, because a 32 KB cartridge has
- *                              no bank switching to do
  *   struct gb_s      ~16.5 KB  video memory 8, work memory 8, sprites, ports
- *   band buffer         5 KB   sixteen scanlines on their way to the panel
- *                    -------
- *                     ~54 KB   of the 64 KB largest free block
+ *   band buffer         2.5 KB  eight scanlines on their way to the panel
+ *   battery RAM         8 KB    the cartridge's own, from the arena
+ *   the cartridge       0       mapped out of flash, whatever its size
  *
  * The process arena is not used at all, and that is deliberate: a default arena
  * is capped at a quarter of the pool it comes from, and a named size is refused
  * outright when it cannot be had.  Uninitialised data is one allocation the
  * loader makes before anything runs, and it either loads or it says why.
  *
- * Larger cartridges need the ROM somewhere other than RAM - the flash `appfs`
- * partition, mapped - which is a real next step rather than a hard limit.
+ * Cartridge size is no longer a limit: the ROM is staged into the flash `appfs`
+ * partition and mapped (fs->map), so half a megabyte of Zelda costs the same
+ * memory as nothing at all.  What it costs instead is a few seconds of flash
+ * writing at startup, once per run.
  *
  * The screen
  * ----------
@@ -69,36 +69,33 @@
  *
  *   byte-addressable free            62 KB, largest block 56
  *   image data (state + band)        22 KB   uninitialised, one block
- *   arena (the cartridge)            33 KB   asked for after the load
+ *   arena (the cartridge's own RAM)  10 KB   asked for after the load
+ *   the cartridge itself              0      mapped out of flash
  *
  * A named arena is refused outright when it cannot be had, which is why these
  * are worth being exact about: too large a number here is not a slow program,
  * it is one that does not start.
  */
-AG_APP_SIZED("GB", "1.0", "argon", AG_AXE_NEEDS_GFX, 8 * 1024, 33 * 1024);
+AG_APP_SIZED("GB", "1.1", "argon", AG_AXE_NEEDS_GFX, 8 * 1024, 10 * 1024);
 
 /* ---- the cartridge ----------------------------------------------------- */
 
-#define ROM_MAX (32u * 1024u)
-
 /*
- * The cartridge is asked for at run time, not declared here, and the reason is
- * arithmetic rather than taste.
+ * The cartridge is not in memory at all: it is mapped out of flash (fs->map,
+ * ABI 0.32) and read through the same cache the processor uses for its own code.
  *
- * An image whose code does not fit the IRAM arena is executed from flash
- * instead, and to get it there the loader builds the relocated code in a scratch
- * buffer the size of the code - 22 KB here - writes it, and frees the scratch.
- * That scratch is live at the same time as the image's uninitialised data.  With
- * the cartridge in that data the two came to 80 KB against 76 free, and the load
- * failed before main ever ran.
+ * It used to be a thirty-two kilobyte array in this file's uninitialised data,
+ * which is what the largest single block on this board would hold - and which
+ * meant cartridges with no bank switching and nothing else.  A real game is
+ * half a megabyte.  Mapped, the size stops mattering: half a megabyte costs the
+ * same nothing as thirty-two kilobytes, and what is left of memory goes to the
+ * emulator's own state and to the cartridge's battery-backed RAM.
  *
- * Out here it is 32 KB asked for after the scratch has gone, which fits with
- * room to spare.  The arena is named in AG_APP_SIZED above: a named size is
- * refused outright when it cannot be had, which is the answer wanted - better a
- * clear refusal at load than a cartridge that half fits.
+ * Peanut-GB asks for absolute addresses - it does the bank arithmetic itself -
+ * so the whole file being one flat pointer is exactly the shape it wants.
  */
-static uint8_t *s_rom;
-static uint32_t s_rom_len;
+static const uint8_t *s_rom;
+static uint32_t       s_rom_len;
 
 static uint8_t rom_read(struct gb_s *gb, const uint_fast32_t addr)
 {
@@ -107,23 +104,35 @@ static uint8_t rom_read(struct gb_s *gb, const uint_fast32_t addr)
 }
 
 /*
- * A cartridge with battery-backed memory in it is refused before it gets here
- * (see main), so these two exist to satisfy the emulator's vtable and to be
- * honest about it rather than to pretend there is memory.
+ * The cartridge's own memory, and the save file that outlives the run.
+ *
+ * Battery-backed RAM is what a Game Boy game keeps its progress in, so this is
+ * not an optional refinement: without it Zelda starts from the beginning every
+ * time.  Eight kilobytes covers every MBC1 and MBC3 cartridge; the few that ask
+ * for more are refused with a word about why rather than run and lose the save.
  */
+#define CART_RAM_MAX (8u * 1024u)
+
+static uint8_t *s_cart_ram;
+static uint32_t s_cart_ram_len;
+static char     s_save_path[AG_PATH_MAX];
+static bool     s_ram_dirty;
+
 static uint8_t cart_ram_read(struct gb_s *gb, const uint_fast32_t addr)
 {
     (void)gb;
-    (void)addr;
-    return 0xffu;
+    return (s_cart_ram != NULL && addr < s_cart_ram_len) ? s_cart_ram[addr]
+                                                         : 0xffu;
 }
 
 static void cart_ram_write(struct gb_s *gb, const uint_fast32_t addr,
                            const uint8_t val)
 {
     (void)gb;
-    (void)addr;
-    (void)val;
+    if (s_cart_ram != NULL && addr < s_cart_ram_len) {
+        s_cart_ram[addr] = val;
+        s_ram_dirty = true;
+    }
 }
 
 static const char *k_gb_error[] = {
@@ -314,68 +323,109 @@ static uint8_t cell_to_button(int col, int row)
 
 /* ---- the cartridge on disk --------------------------------------------- */
 
-static int rom_load(const char *path)
+/* "a:\zelda.gb" -> "a:\zelda.sav", in place. */
+static void save_path_of(const char *rom, char *out, size_t len)
 {
-    ag_stat_t st;
-    const ag_err_t serr = ag_stat(path, &st);
-    if (serr != AG_OK) {
-        ag_printf("gb: %s: %s\n", path, ag_strerror(serr));
-        return 1;
+    size_t n = 0;
+    while (rom[n] != '\0' && n + 5u < len) {
+        out[n] = rom[n];
+        n++;
     }
-    if (st.size < 0x150u) {
-        ag_printf("gb: %s is %u bytes - too short to be a cartridge\n", path,
-                  (unsigned)st.size);
-        return 1;
-    }
-    if (st.size > ROM_MAX) {
-        ag_printf("gb: %s is %u KB; this build holds the whole cartridge in "
-                  "memory and stops at %u\n", path,
-                  (unsigned)(st.size / 1024u), (unsigned)(ROM_MAX / 1024u));
-        return 1;
-    }
-
-    s_rom = (uint8_t *)ag_malloc((size_t)st.size);
-    if (s_rom == NULL) {
-        ag_printf("gb: no room for a %u KB cartridge in the arena\n",
-                  (unsigned)(st.size / 1024u));
-        return 1;
-    }
-
-    const ag_handle_t h = ag_open(path, AG_O_RDONLY);
-    if (h < 0) {
-        ag_printf("gb: %s: %s\n", path, ag_strerror((ag_err_t)h));
-        return 1;
-    }
-
-    s_rom_len = 0;
-    while (s_rom_len < (uint32_t)st.size) {
-        const int32_t n = ag_read(h, s_rom + s_rom_len,
-                                  (size_t)st.size - s_rom_len);
-        if (n < 0) {
-            ag_printf("gb: read: %s\n", ag_strerror((ag_err_t)n));
-            (void)ag_close(h);
-            return 1;
-        }
-        if (n == 0) {
+    /* Back up over the extension, if there is one in the last component. */
+    size_t cut = n;
+    for (size_t i = n; i > 0; i--) {
+        const char c = out[i - 1];
+        if (c == '\\' || c == '/') {
             break;
         }
-        s_rom_len += (uint32_t)n;
+        if (c == '.') {
+            cut = i - 1;
+            break;
+        }
+    }
+    out[cut] = '\0';
+    /* Append by hand: the SDK has no strlcat and this is the only place. */
+    size_t k = cut;
+    const char *ext = ".sav";
+    for (int i = 0; ext[i] != 0 && k + 1u < len; i++) {
+        out[k++] = ext[i];
+    }
+    out[k] = 0;
+}
+
+static void save_load(void)
+{
+    if (s_cart_ram == NULL) {
+        return;
+    }
+    const ag_handle_t h = ag_open(s_save_path, AG_O_RDONLY);
+    if (h < 0) {
+        return; /* no save yet, which is not a problem */
+    }
+    uint32_t got = 0;
+    while (got < s_cart_ram_len) {
+        const int32_t n = ag_read(h, s_cart_ram + got, s_cart_ram_len - got);
+        if (n <= 0) {
+            break;
+        }
+        got += (uint32_t)n;
     }
     (void)ag_close(h);
+    ag_printf("gb: %u bytes of save read from %s\n", (unsigned)got,
+              s_save_path);
+}
 
-    if (s_rom_len != (uint32_t)st.size) {
-        ag_printf("gb: %s: read %u of %u bytes\n", path, (unsigned)s_rom_len,
-                  (unsigned)st.size);
+static void save_store(void)
+{
+    if (s_cart_ram == NULL || !s_ram_dirty) {
+        return;
+    }
+    const ag_handle_t h =
+        ag_open(s_save_path, AG_O_WRONLY | AG_O_CREATE | AG_O_TRUNC);
+    if (h < 0) {
+        ag_printf("gb: cannot write %s: %s\n", s_save_path,
+                  ag_strerror((ag_err_t)h));
+        return;
+    }
+    uint32_t put = 0;
+    while (put < s_cart_ram_len) {
+        const int32_t n = ag_write(h, s_cart_ram + put, s_cart_ram_len - put);
+        if (n <= 0) {
+            break;
+        }
+        put += (uint32_t)n;
+    }
+    (void)ag_close(h);
+    ag_printf("gb: %u bytes of save written to %s\n", (unsigned)put,
+              s_save_path);
+}
+
+static int rom_load(const char *path)
+{
+    if (!AG_HAS(ag_api()->fs, map)) {
+        ag_printf("gb: this kernel cannot map a file (needs ABI 0.32)\n");
         return 1;
     }
 
-    /* Cartridge type 0 is ROM and nothing else, which is what fits. */
-    const uint8_t mbc = s_rom[0x147];
-    if (mbc != 0x00u) {
-        ag_printf("gb: cartridge type %02x needs a bank controller; this build "
-                  "runs type 00 (ROM only)\n", (unsigned)mbc);
+    uint64_t       len = 0;
+    const void    *ptr = NULL;
+    const ag_time_t t0 = ag_micros();
+    const ag_err_t err = ag_map(path, &ptr, &len);
+    if (err != AG_OK) {
+        ag_printf("gb: %s: %s\n", path, ag_strerror(err));
         return 1;
     }
+    const uint32_t staged_ms = (uint32_t)((ag_micros() - t0) / 1000u);
+
+    if (len < 0x150u) {
+        ag_printf("gb: %s is %u bytes - too short to be a cartridge\n", path,
+                  (unsigned)len);
+        (void)ag_unmap(ptr);
+        return 1;
+    }
+
+    s_rom = (const uint8_t *)ptr;
+    s_rom_len = (uint32_t)len;
 
     char title[17];
     for (int i = 0; i < 16; i++) {
@@ -383,8 +433,49 @@ static int rom_load(const char *path)
         title[i] = (c >= 0x20u && c < 0x7fu) ? (char)c : ' ';
     }
     title[16] = '\0';
-    ag_printf("gb: %s  %u KB  \"%s\"\n", path, (unsigned)(s_rom_len / 1024u),
-              title);
+    ag_printf("gb: \"%s\"  %u KB  type %02x  staged in %u ms\n", title,
+              (unsigned)(len / 1024u), (unsigned)s_rom[0x147],
+              (unsigned)staged_ms);
+    return 0;
+}
+
+/*
+ * The cartridge's RAM, sized from the header the way the hardware would be.
+ *
+ * Peanut-GB works out the same numbers itself and asks for them through the
+ * callbacks; this only has to provide memory that matches, and to refuse a
+ * cartridge whose memory will not fit rather than quietly give it less and lose
+ * whatever it writes past the end.
+ */
+static int cart_ram_setup(const char *rom_path)
+{
+    static const uint32_t k_sizes[6] = {
+        0u, 2u * 1024u, 8u * 1024u, 32u * 1024u, 128u * 1024u, 64u * 1024u,
+    };
+    const uint8_t code = s_rom[0x149];
+    const uint32_t want = (code < 6u) ? k_sizes[code] : 0u;
+
+    if (want == 0u) {
+        return 0; /* nothing to keep */
+    }
+    if (want > CART_RAM_MAX) {
+        ag_printf("gb: cartridge wants %u KB of battery RAM; this build holds "
+                  "%u\n", (unsigned)(want / 1024u),
+                  (unsigned)(CART_RAM_MAX / 1024u));
+        return 1;
+    }
+
+    s_cart_ram = (uint8_t *)ag_malloc(want);
+    if (s_cart_ram == NULL) {
+        ag_printf("gb: no room for %u KB of battery RAM\n",
+                  (unsigned)(want / 1024u));
+        return 1;
+    }
+    memset(s_cart_ram, 0, want);
+    s_cart_ram_len = want;
+
+    save_path_of(rom_path, s_save_path, sizeof(s_save_path));
+    save_load();
     return 0;
 }
 
@@ -442,6 +533,9 @@ int ag_main(int argc, char **argv)
         gb_init(&s_gb, rom_read, cart_ram_read, cart_ram_write, gb_err, NULL);
     if (err != GB_INIT_NO_ERROR) {
         ag_printf("gb: init failed (%d)\n", (int)err);
+        return 1;
+    }
+    if (cart_ram_setup(path) != 0) {
         return 1;
     }
     palette_init();
@@ -575,6 +669,7 @@ int ag_main(int argc, char **argv)
     }
 
     ag_gfx_release();
+    save_store();
     ag_printf("gb: %u frames\n", (unsigned)s_frames);
     return 0;
 }

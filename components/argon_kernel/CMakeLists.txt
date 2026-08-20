@@ -34,6 +34,7 @@ set(ARGON_KERNEL_SRCS
     "src/fs/vfs.c"
     "src/fs/ramfs.c"
     "src/fs/idfvfs.c"
+    "src/fs/filemap.c"
     "src/fs/storage.c"
     "src/fs/hostfs.c"
     "src/loader/axeload.c"
