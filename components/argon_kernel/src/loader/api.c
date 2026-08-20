@@ -30,6 +30,7 @@
 #include <argon/net.h>
 #include <argon/proc.h>
 #include <argon/shell.h>
+#include <argon/filemap.h>
 #include <argon/vfs.h>
 
 #include <argon/port/config.h>
@@ -498,6 +499,20 @@ static ag_err_t api_mountinfo(const char *mount, ag_fsinfo_t *out)
     }
 }
 
+/*
+ * A file mapped where it can be read as bytes.  The path is resolved against
+ * the calling process's own directory, like every other fs call here.
+ */
+static ag_err_t api_map(const char *path, const void **out, uint64_t *out_len)
+{
+    return ag_filemap_open(path, ag_proc_cwd(), out, out_len);
+}
+
+static ag_err_t api_unmap(const void *ptr)
+{
+    return ag_filemap_close(ptr);
+}
+
 static const ag_fs_api_t k_fs = {
     .size = sizeof(ag_fs_api_t),
     .open = api_open,
@@ -518,6 +533,8 @@ static const ag_fs_api_t k_fs = {
     .getcwd = api_getcwd,
     .chdir = api_chdir,
     .mountinfo = api_mountinfo,
+    .map = api_map,
+    .unmap = api_unmap,
 };
 
 /* ---------------------------------------------------------------------- */

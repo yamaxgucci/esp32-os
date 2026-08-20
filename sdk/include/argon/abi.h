@@ -82,9 +82,11 @@ extern "C" {
  *      the machine driving it can afford.
  * 0.31 appended gfx->present: an application's own pixels on the panel, for a
  *      machine where the system framebuffer is absent or the wrong shape.
+ * 0.32 appended fs->map / fs->unmap: a file's bytes at an address, read only,
+ *      staged into flash - for data too big to hold and too fixed to need to.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 31u
+#define AG_ABI_MINOR 32u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -303,6 +305,29 @@ typedef struct ag_fs_api {
     ag_err_t (*chdir)(const char *path);
 
     ag_err_t (*mountinfo)(const char *mount, ag_fsinfo_t *out);
+
+    /*
+     * ABI 0.32: a file's bytes at an address, read only.
+     *
+     * For data that is too big to hold in memory and never changes: a cartridge,
+     * a font, a table of impulse responses.  The bytes are staged into flash and
+     * mapped where the processor's own cache fetches them, so the cost in memory
+     * is nothing - which on a board with sixty kilobytes free is the difference
+     * between running a half-megabyte cartridge and not.
+     *
+     * Read only.  Writing through the pointer faults; it does not change
+     * anything and it does not touch the file.
+     *
+     * Not free and not lazy: map() copies the whole file into flash before it
+     * returns, so it costs as long as writing that much flash and wears it a
+     * little.  Worth it for something read a great many times, not for a
+     * configuration file.  A second call after unmap copies again.
+     *
+     * -AG_ENFILE when too many mappings are live, -AG_ENOSPC when the flash area
+     * cannot hold it, -AG_ENOSYS on a machine with nowhere to stage it.
+     */
+    ag_err_t (*map)(const char *path, const void **out, uint64_t *out_len);
+    ag_err_t (*unmap)(const void *ptr);
 } ag_fs_api_t;
 
 /* ------------------------------------------------------------------------ */

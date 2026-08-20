@@ -42,6 +42,24 @@ ag_err_t ag_appfs_program(ag_appfs_slot_t *slot, const void *data, size_t bytes)
 ag_err_t ag_appfs_mmap(ag_appfs_slot_t *slot, const void **out_ptr);
 
 /* Unmaps (if mapped) and frees the reservation. */
+/*
+ * The same slots, for bytes that are read rather than run.
+ *
+ * A cartridge, a font, a table of impulse responses: data too big to keep in
+ * memory, unchanging, and wanted at an address.  Flash holds it and the cache
+ * fetches it, exactly as it does for code - the only difference is which bus the
+ * range is mapped into, and on this class of part that difference is absolute:
+ * an instruction-bus address cannot be read as bytes.
+ *
+ * reserve_data skips the address prediction that reserve does, because nothing
+ * has to be relocated against it.  program_at exists because the file may be
+ * half a megabyte and there is nowhere to hold that while writing it.
+ */
+ag_err_t ag_appfs_reserve_data(size_t bytes, ag_appfs_slot_t **out_slot);
+ag_err_t ag_appfs_program_at(ag_appfs_slot_t *slot, size_t off,
+                             const void *data, size_t bytes);
+ag_err_t ag_appfs_mmap_data(ag_appfs_slot_t *slot, const void **out_ptr);
+
 void ag_appfs_release(ag_appfs_slot_t *slot);
 
 #ifdef __cplusplus

@@ -29,6 +29,8 @@
  *
  *   ag_err_t ag_port_part_map_exec(ag_port_part_t p, uint64_t off, size_t len,
  *                                  const void **addr, ag_port_map_t *out)
+ *   ag_err_t ag_port_part_map_data(ag_port_part_t p, uint64_t off, size_t len,
+ *                                  const void **addr, ag_port_map_t *out)
  *   void     ag_port_part_unmap(ag_port_map_t h)
  *
  * Contract, not advice:
@@ -73,6 +75,20 @@ ag_err_t ag_port_part_read(ag_port_part_t p, uint64_t off, void *buf,
                            size_t len);
 ag_err_t ag_port_part_write(ag_port_part_t p, uint64_t off, const void *buf,
                             size_t len);
+
+/*
+ * The same flash, in the data address space instead of the instruction one.
+ *
+ * map_exec puts a range where the processor can fetch from it, which is what
+ * code needs and what data cannot use: on this class of part an instruction-bus
+ * address cannot be read as bytes at all.  A cartridge, a font, a table of
+ * samples - anything the program reads rather than runs - wants this one.
+ *
+ * Read only, and free of charge in memory: the bytes stay in flash and go
+ * through the same cache the processor's own code does.
+ */
+ag_err_t ag_port_part_map_data(ag_port_part_t p, uint64_t off, size_t len,
+                               const void **addr, ag_port_map_t *out);
 ag_err_t ag_port_part_erase(ag_port_part_t p, uint64_t off, size_t len);
 
 ag_err_t ag_port_part_map_exec(ag_port_part_t p, uint64_t off, size_t len,
