@@ -28,6 +28,7 @@
 #include <argon/log.h>
 #include <argon/module.h>
 #include <argon/net.h>
+#include <argon/power.h>
 #include <argon/proc.h>
 #include <argon/shell.h>
 #include <argon/filemap.h>
@@ -843,6 +844,37 @@ static ag_err_t api_kill(ag_pid_t pid)
     return ag_proc_kill(pid, "killed by another process");
 }
 
+/* ---------------------------------------------------------------------- */
+
+/*
+ * The pid is taken here rather than passed in, for the same reason it is in
+ * every other subtable: an application cannot answer on somebody else's
+ * behalf, and a call that took a pid would have to be checked for exactly
+ * that.
+ */
+static ag_err_t api_power_status(ag_power_status_t *out)
+{
+    return ag_power_poll(ag_proc_self(), (uint32_t)(ag_port_us() / 1000), out,
+                         ag_powerctl_cpu_mhz());
+}
+
+static ag_err_t api_power_answer(ag_power_answer_t a, const char *why)
+{
+    return ag_power_reply(ag_proc_self(), a, why);
+}
+
+static ag_err_t api_power_hold(bool on, const char *why)
+{
+    return ag_power_set_hold(ag_proc_self(), on, why);
+}
+
+static const ag_power_api_t k_power = {
+    .size = sizeof(ag_power_api_t),
+    .status = api_power_status,
+    .answer = api_power_answer,
+    .hold = api_power_hold,
+};
+
 static const ag_proc_api_t k_proc = {
     .size = sizeof(ag_proc_api_t),
     .exec = api_exec,
@@ -888,6 +920,7 @@ static const ag_api_t k_api = {
     .net = NULL,
 #endif
     .audio = &ag_audio_api_table,
+    .power = &k_power,
 };
 
 const ag_api_t *ag_loader_api(void) { return &k_api; }

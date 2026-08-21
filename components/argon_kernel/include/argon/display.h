@@ -43,6 +43,21 @@ void ag_display_force_release(void);
 /* Present the last snap with a one-line label (Alt-Tab overlay). */
 void ag_display_show_overlay(const char *label);
 
+/*
+ * The screen, off.  Nothing is sent to the panel while it is off - a dark
+ * panel that is still being written to costs the bus traffic and the copy for
+ * a picture nobody can see - and the soft backlight, where a machine has one,
+ * goes with it.  Turning it back on repaints in full: the console clears what
+ * changed at the end of every tick, so the rows missed while it was off are
+ * not recoverable and are not worth remembering.
+ *
+ * The panel's own light is not here.  It is on a pin that belongs to a
+ * loadable driver, and it is reached with AG_IOC_DISPLAY_BACKLIGHT; see
+ * src/core/powerctl.c, which calls both.
+ */
+void ag_display_power(bool on);
+bool ag_display_powered(void);
+
 /* The gfx subtable wired into ag_api_t.  acquire fails until init succeeds. */
 extern const ag_gfx_api_t ag_gfx_api_table;
 

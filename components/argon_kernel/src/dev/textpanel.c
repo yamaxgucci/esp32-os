@@ -133,6 +133,24 @@ ag_err_t ag_textpanel_geometry(uint16_t *cols, uint16_t *rows)
 }
 
 /* Called with the device registry held; see ag_textpanel_render below. */
+/*
+ * Off while the screen is off; and the first repaint after it comes back is a
+ * full one, which is what s_seen == NULL means to render_locked below.
+ */
+static bool s_enabled = true;
+static bool s_owe_full;
+
+void ag_textpanel_enable(bool on)
+{
+    if (on == s_enabled) {
+        return;
+    }
+    s_enabled = on;
+    if (on) {
+        s_owe_full = true;
+    }
+}
+
 static void render_locked(const ag_screen_t *screen)
 {
     static const ag_display_ops_t *s_seen;
@@ -155,7 +173,7 @@ static void render_locked(const ag_screen_t *screen)
     static ag_textcell_t *s_row;
     static uint16_t       s_row_cols;
 
-    if (screen == NULL) {
+    if (screen == NULL || !s_enabled) {
         return;
     }
 
@@ -183,8 +201,9 @@ static void render_locked(const ag_screen_t *screen)
      * whole screen.  The same applies when a driver is replaced: `drv install`
      * over a running one is a different panel as far as this is concerned.
      */
-    const bool full = (ops != s_seen);
+    const bool full = (ops != s_seen) || s_owe_full;
     if (full) {
+        s_owe_full = false;
         s_seen = ops;
         s_caret_col = 0xffffu;
         s_caret_row = 0xffffu;

@@ -87,9 +87,13 @@ extern "C" {
  * 0.33 appended net->resolve: a name into an address.  Without it every
  *      connect() in an application needs a dotted quad, which is not how
  *      anything on a network is written down.
+ * 0.34 made api->power stop being NULL: what the machine is set to, and a
+ *      transition an application is told about before it happens.  With
+ *      AG_IOC_DISPLAY_BACKLIGHT beside it, for the panel driver that owns the
+ *      pin the light is on.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 33u
+#define AG_ABI_MINOR 34u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -830,6 +834,18 @@ enum ag_ioctl_cmd {
     AG_IOC_GEOMETRY = AG_IOC(AG_DEV_STORAGE, 1), /* arg: ag_geometry_t      */
 
     /* PCM devices (/dev/pcmnull, loadable pcmvirt, …): arg ag_audio_fmt_t */
+    /*
+     * ABI 0.34: arg is a uint8_t, 0..100 - how bright the panel should be.
+     * Zero means off, and off means as dark as this board can be made: on a
+     * hand-held with a lit screen the backlight is the largest single load
+     * there is, larger than the processor at full speed, so this is the one
+     * call in the power path whose effect a person can see.
+     *
+     * A driver whose panel has no controllable light answers -AG_ENOTSUP,
+     * which is not an error - it is the answer.
+     */
+    AG_IOC_DISPLAY_BACKLIGHT = AG_IOC(AG_DEV_DISPLAY, 1),
+
     AG_IOC_AUDIO_GETFMT = AG_IOC(AG_DEV_AUDIO, 1),
     AG_IOC_AUDIO_SETFMT = AG_IOC(AG_DEV_AUDIO, 2),
     /* Optional: arg ag_audio_stats_t (pcmvirt/pcmmix; pcmnull returns zeros). */
@@ -1254,6 +1270,105 @@ typedef struct ag_audio_api {
 } ag_audio_api_t;
 
 /* ------------------------------------------------------------------------ */
+/* power - how hard the machine is being driven, and who gets told          */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * ArgonOS does not save power behind an application's back.
+ *
+ * The model is the one the rest of this system uses: the application owns the
+ * machine, and the machine does not quietly change underneath it.  So a change
+ * of mode happens in two steps - the system says what it is about to do, every
+ * application that cares gets a moment to answer, and then it happens.  What
+ * to do about it is the application's own decision: carry on more slowly, stop
+ * what it was doing, or say that it cannot and let a person decide.
+ *
+ * What an application must not be able to do is stop the machine saving power
+ * for ever by not answering.  So the grace period is short, silence counts as
+ * consent, and the one answer that does block - AG_POWER_HOLD - blocks a
+ * command rather than the system: `power eco /force` overrides it, and says
+ * whose hold it overrode.
+ */
+
+typedef enum {
+    AG_POWER_FULL = 0, /* the clock at its maximum, the screen lit         */
+    AG_POWER_ECO,      /* the clock pinned lower                           */
+    AG_POWER_DOZE,     /* the clock pinned lower and the screen dark       */
+} ag_power_mode_t;
+
+typedef enum {
+    AG_POWER_ANSWER_NONE = 0, /* has not answered this transition           */
+    AG_POWER_OK,              /* carrying on regardless                     */
+    AG_POWER_PARKED,          /* stopped whatever needed the clock          */
+    AG_POWER_HOLD,            /* cannot run like that; refuse unless forced */
+} ag_power_answer_t;
+
+/*
+ * Long enough for a sentence a person can act on ("22 kHz tract, 87% of a
+ * core"), short enough that one row per process fits in the internal memory
+ * this class of machine has left over.  Anything longer is truncated rather
+ * than refused.
+ */
+#define AG_POWER_WHY_MAX 32
+
+typedef struct {
+    uint8_t mode;    /* ag_power_mode_t - what the machine is now          */
+    uint8_t pending; /* what it is about to be; == mode when nothing is    */
+    bool    screen_on;
+    bool    pending_screen_on;
+
+    /*
+     * cpu_mhz is read from the machine each time and is the only field here
+     * that is not a setting: where scaling is available it moves on its own
+     * between the two numbers below.  min == max means the clock is pinned.
+     */
+    uint32_t cpu_mhz;
+    uint32_t cpu_min_mhz;
+    uint32_t cpu_max_mhz;
+
+    /*
+     * What the band will be if the pending transition goes through - the
+     * numbers, not just the name of the mode, because the number is what an
+     * application needs in order to answer.  A synthesiser that measured its
+     * own load knows whether it fits in eighty megahertz; "eco" tells it
+     * nothing.  Equal to the fields above when nothing is pending.
+     */
+    uint32_t pending_cpu_min_mhz;
+    uint32_t pending_cpu_max_mhz;
+
+    /*
+     * Milliseconds left to answer, zero when nothing is pending.  An
+     * application polling once a frame has tens of frames to decide in; one
+     * that never polls at all keeps running exactly as it does today, and the
+     * transition happens without it.
+     */
+    uint32_t grace_ms;
+} ag_power_status_t;
+
+typedef struct ag_power_api {
+    uint32_t size;
+
+    /* Cheap; meant to be called once round an application's own loop. */
+    ag_err_t (*status)(ag_power_status_t *out);
+
+    /*
+     * Answer the pending transition.  `why` is for AG_POWER_HOLD and is what
+     * the person at the console is shown; NULL otherwise.  -AG_ENOENT when
+     * nothing is pending, which is the normal answer to a late poll.
+     */
+    ag_err_t (*answer)(ag_power_answer_t a, const char *why);
+
+    /*
+     * A standing hold, for an application that would rather say once than
+     * answer every time - a realtime audio path is the case this exists for.
+     * It goes when the process does, like every other resource, so an
+     * application that crashes cannot leave the machine pinned at full speed
+     * for ever.
+     */
+    ag_err_t (*hold)(bool on, const char *why);
+} ag_power_api_t;
+
+/* ------------------------------------------------------------------------ */
 /* Root table                                                               */
 /* ------------------------------------------------------------------------ */
 
@@ -1280,6 +1395,9 @@ typedef struct ag_api {
 
     /* ABI 0.14+: PCM out (built-in pcmnull; virt/I2S via .SYS). */
     const ag_audio_api_t *audio;
+
+    /* ABI 0.34+: the clock, the screen, and being told before they change. */
+    const ag_power_api_t *power;
 } ag_api_t;
 
 /* ------------------------------------------------------------------------ */
