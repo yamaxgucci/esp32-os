@@ -308,7 +308,16 @@ ag_err_t ag_devices_init(void)
      */
 #if AG_PORT_HAS_WIFI
     const char *ssid = ag_cfg_get(ag_sysconfig(), "wifi.ssid", NULL);
-    const bool  want_net = (ssid != NULL && ssid[0] != '\0');
+    const bool  want_sta = (ssid != NULL && ssid[0] != '\0');
+#if AG_PORT_WIFI_HAS_AP
+    /* A board can be told to offer a network without joining one, so the point
+     * is reason enough to start the radio even when no [wifi] is configured. */
+    const char *ap_ssid = ag_cfg_get(ag_sysconfig(), "ap.ssid", NULL);
+    const bool  want_ap = (ap_ssid != NULL && ap_ssid[0] != '\0');
+#else
+    const bool want_ap = false;
+#endif
+    const bool  want_net = want_sta || want_ap;
 #else
     const bool want_net = true; /* a cable has nothing to configure */
 #endif
@@ -330,7 +339,7 @@ ag_err_t ag_devices_init(void)
      * Not fatal, and not waited for: association takes seconds and DHCP takes
      * longer than boot does.  `wifi` says how it went.
      */
-    if (want_net && err == AG_OK) {
+    if (want_sta && err == AG_OK) {
         const char *pass = ag_cfg_get(ag_sysconfig(), "wifi.pass", "");
 
         /*
@@ -350,6 +359,33 @@ ag_err_t ag_devices_init(void)
                    have_pin ? " (pinned)" : "");
         } else {
             ag_log(AG_LOG_WARN, "wifi", "%s: %d", ssid, (int)werr);
+        }
+    }
+#endif
+
+#if AG_PORT_WIFI_HAS_AP
+    /*
+     * The point the board offers, when [ap] names one.  Same rule as the
+     * network it joins: configured once, up at every boot with no console
+     * attached - which is what a fixed-name point is for.
+     */
+    if (want_ap && err == AG_OK) {
+        const char *ap_pass = ag_cfg_get(ag_sysconfig(), "ap.pass", "");
+        const char *ap_ch = ag_cfg_get(ag_sysconfig(), "ap.channel", "0");
+        const char *ap_hid = ag_cfg_get(ag_sysconfig(), "ap.hidden", "0");
+
+        unsigned channel = 0;
+        for (const char *p = ap_ch; p != NULL && *p >= '0' && *p <= '9'; p++) {
+            channel = channel * 10u + (unsigned)(*p - '0');
+        }
+        const bool hidden = (ap_hid != NULL && ap_hid[0] == '1');
+
+        const ag_err_t aerr = ag_port_wifi_ap_start(
+            ap_ssid, ap_pass, (uint8_t)(channel > 13u ? 0u : channel), hidden);
+        if (aerr == AG_OK) {
+            ag_log(AG_LOG_INFO, "wifi", "access point %s", ap_ssid);
+        } else {
+            ag_log(AG_LOG_WARN, "wifi", "ap %s: %d", ap_ssid, (int)aerr);
         }
     }
 #endif

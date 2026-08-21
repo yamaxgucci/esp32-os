@@ -34,6 +34,7 @@
 #include <argon/btinput.h>
 #include <argon/net.h>
 #include <argon/port/bt.h>
+#include <argon/port/ble.h>
 #include <argon/port/io.h>
 #include <argon/port/mem.h>
 #include <argon/port/net.h>
@@ -46,6 +47,8 @@
 #include "core/sysconfig.h"
 #include "proc/supervisor.h"
 #include "shell/cmd_fs.h"
+#include "net/espnow.h"
+#include "net/wifimon.h"
 #include "shell/cmd_net.h"
 #include "shell/cmd_unzip.h"
 
@@ -1154,6 +1157,28 @@ static ag_err_t cfg_ensure_wifi(const char *ssid, const char *pass,
 }
 #endif
 
+#if AG_PORT_WIFI_HAS_AP
+/*
+ * The point's own section, [ap], kept apart from [wifi] on purpose: the two are
+ * written independently - a board can be told to run a point without touching
+ * the network it joins, and the reverse - and cfg_replace_section rewrites a
+ * whole section at a time.  One section for both would mean each write had to
+ * carry the other's keys or lose them.
+ */
+static ag_err_t cfg_ensure_ap(const char *ssid, const char *pass,
+                              unsigned channel, bool hidden)
+{
+    if (ssid == NULL || ssid[0] == '\0') {
+        return cfg_replace_section("ap", NULL);
+    }
+    char body[200];
+    snprintf(body, sizeof(body),
+             "ssid = %s\npass = %s\nchannel = %u\nhidden = %d\n", ssid,
+             (pass != NULL) ? pass : "", channel, hidden ? 1 : 0);
+    return cfg_replace_section("ap", body);
+}
+#endif
+
 #if AG_PORT_HAS_BT
 static ag_err_t cfg_ensure_bt(const char *addr, int addr_type)
 {
@@ -1764,6 +1789,26 @@ static int wifi_status(void)
     } else if (st.state == AG_WIFI_JOINED) {
         ag_console_puts("no address yet (DHCP)\n");
     }
+
+#if AG_PORT_WIFI_HAS_AP
+    /*
+     * The other direction, when the board is offering a network as well as (or
+     * instead of) using one.  Its address is fixed and does not come from DHCP,
+     * so the line above says nothing about it - this is the one that does.
+     */
+    ag_port_wifi_ap_status_t ap;
+    if (ag_port_wifi_ap_status(&ap) == AG_OK && ap.on) {
+        ag_console_printf("access point \"%s\"%s%s, channel %u\n", ap.ssid,
+                          ap.secured ? "" : " (open)",
+                          ap.hidden ? " (hidden)" : "", (unsigned)ap.channel);
+        ag_console_printf("  at %u.%u.%u.%u, %u client%s\n",
+                          (unsigned)(ap.ip >> 24),
+                          (unsigned)((ap.ip >> 16) & 0xffu),
+                          (unsigned)((ap.ip >> 8) & 0xffu),
+                          (unsigned)(ap.ip & 0xffu), (unsigned)ap.clients,
+                          (ap.clients == 1u) ? "" : "s");
+    }
+#endif
     return 0;
 }
 
@@ -1918,11 +1963,6 @@ static const char *wifi_named_line(const char *arg, uint32_t *line_out)
         *line_out = n;
     }
     return s_scan_names[n - 1u];
-}
-
-static const char *wifi_named(const char *arg)
-{
-    return wifi_named_line(arg, NULL);
 }
 
 static int cmd_wifi(int argc, char **argv)
@@ -2093,6 +2133,119 @@ static int cmd_wifi(int argc, char **argv)
         return 0;
     }
 
+    if (ag_path_icmp(argv[1], "ap") == 0) {
+#if !AG_PORT_WIFI_HAS_AP
+        ag_console_puts("this build has no access point "
+                        "(ARGON_NET_WIFI_AP is off)\n");
+        return 1;
+#else
+        /* Bare `wifi ap` is a question, answered by the same status the radio
+         * gives to `wifi`. */
+        if (argc < 3) {
+            return wifi_status();
+        }
+
+        if (ag_path_icmp(argv[2], "off") == 0) {
+            const ag_err_t err = ag_port_wifi_ap_stop();
+            if (err != AG_OK) {
+                ag_console_printf("wifi ap off: %s\n",
+                                  ag_loader_api()->sys->strerror(err));
+                return 1;
+            }
+            (void)cfg_ensure_ap(NULL, NULL, 0, false);
+            ag_console_puts("access point off\n");
+            return 0;
+        }
+
+        /*
+         * wifi ap <ssid> [pass] [/ch N] [/hidden].  No key is an open point,
+         * and the port refuses one to seven characters rather than making a
+         * short key into an open network nobody meant.
+         */
+        const char *ssid = NULL;
+        const char *pass = NULL;
+        unsigned    channel = 0;
+        bool        hidden = false;
+        int         positional = 0;
+        for (int i = 2; i < argc; i++) {
+            if (ag_path_icmp(argv[i], "/hidden") == 0) {
+                hidden = true;
+            } else if (ag_path_icmp(argv[i], "/ch") == 0 && i + 1 < argc) {
+                channel = (unsigned)atoi(argv[++i]);
+            } else if (positional == 0) {
+                ssid = argv[i];
+                positional++;
+            } else if (positional == 1) {
+                pass = argv[i];
+                positional++;
+            }
+        }
+        if (ssid == NULL) {
+            ag_console_puts(
+                "usage: wifi ap <ssid> [password] [/ch 1..13] [/hidden]\n");
+            ag_console_puts("  no password: an open network, said so here\n");
+            ag_console_puts("  wifi ap off: stop offering one\n");
+            return 1;
+        }
+        if (channel > 13u) {
+            ag_console_puts("channel is 1 to 13\n");
+            return 1;
+        }
+
+        /*
+         * The point needs the radio, so bring it up if it is not - the same
+         * bring-up and the same accounting as `wifi on`, because starting a
+         * point is one of the two things that first spends the radio's memory.
+         */
+        ag_port_wifi_status_t st;
+        if (ag_port_wifi_status(&st) != AG_OK || st.state == AG_WIFI_OFF) {
+            const size_t   before = ag_port_mem_free(AG_MEM_FAST);
+            const ag_err_t nerr = ag_net_init();
+            if (nerr != AG_OK) {
+                ag_console_printf("wifi ap: %s\n",
+                                  ag_loader_api()->sys->strerror(nerr));
+                return 1;
+            }
+            const size_t after = ag_port_mem_free(AG_MEM_FAST);
+            ag_console_printf("radio on: took %u KB, %u KB free\n",
+                              (unsigned)((before - after) / 1024u),
+                              (unsigned)(after / 1024u));
+        }
+
+        const ag_err_t err =
+            ag_port_wifi_ap_start(ssid, pass, (uint8_t)channel, hidden);
+        if (err == -AG_EINVAL && pass != NULL && pass[0] != '\0') {
+            ag_console_puts(
+                "a key is 8 to 63 characters; a shorter one is refused, so an\n"
+                "  open point is never started by mistake\n");
+            return 1;
+        }
+        if (err != AG_OK) {
+            ag_console_printf("wifi ap: %s\n",
+                              ag_loader_api()->sys->strerror(err));
+            return 1;
+        }
+
+        /* Written down so a board offers the same point after a power cut
+         * without a console attached - the whole point of a fixed name. */
+        (void)cfg_ensure_ap(ssid, pass, channel, hidden);
+
+        ag_port_wifi_ap_status_t ap;
+        if (ag_port_wifi_ap_status(&ap) == AG_OK && ap.on) {
+            ag_console_printf("access point \"%s\"%s up on channel %u\n",
+                              ap.ssid, ap.secured ? "" : " (open)",
+                              (unsigned)ap.channel);
+            ag_console_printf(
+                "  join it and open  http://%u.%u.%u.%u/  - try  httpd 80 a:\\\n",
+                (unsigned)(ap.ip >> 24), (unsigned)((ap.ip >> 16) & 0xffu),
+                (unsigned)((ap.ip >> 8) & 0xffu), (unsigned)(ap.ip & 0xffu));
+        } else {
+            ag_console_puts("access point up\n");
+        }
+        return 0;
+#endif /* AG_PORT_WIFI_HAS_AP */
+    }
+
     if (ag_path_icmp(argv[1], "off") == 0) {
         const size_t before = ag_port_mem_free(AG_MEM_FAST);
         (void)ag_port_wifi_stop();
@@ -2120,11 +2273,732 @@ static int cmd_wifi(int argc, char **argv)
     }
 
     ag_console_puts(
-        "usage: wifi [on | off | scan | connect <ssid> [pass] | forget]\n");
+        "usage: wifi [on | off | scan | connect <ssid> [pass] | forget"
+#if AG_PORT_WIFI_HAS_AP
+        "\n             | ap <ssid> [pass] [/ch N] [/hidden] | ap off"
+#endif
+        "]\n");
     return 1;
 }
 
 #endif /* AG_PORT_HAS_WIFI */
+
+#if AG_PORT_HAS_ESPNOW
+
+/* "bcast"/"all"/ff:ff:ff:ff:ff:ff -> broadcast; else parse aa:bb:cc:dd:ee:ff. */
+static bool espnow_parse_mac(const char *s, uint8_t out[6])
+{
+    if (ag_path_icmp(s, "bcast") == 0 || ag_path_icmp(s, "all") == 0) {
+        memset(out, 0xff, 6);
+        return true;
+    }
+    return ag_mac_parse(s, out);
+}
+
+static void espnow_print_payload(const uint8_t *data, uint32_t len)
+{
+    /* Text when it is text, so a message reads as one; a dot for the bytes that
+     * are not, so binary is visible without a hex dump nobody asked for. */
+    for (uint32_t i = 0; i < len; i++) {
+        const uint8_t c = data[i];
+        ag_console_printf("%c", (c >= 0x20 && c < 0x7f) ? (char)c : '.');
+    }
+}
+
+static int espnow_status(void)
+{
+    if (!ag_espnow_running()) {
+        ag_console_puts("espnow off\n");
+        return 0;
+    }
+    ag_console_puts("espnow on\n");
+
+    uint8_t mac[6];
+    if (ag_espnow_self(mac) == AG_OK) {
+        char text[18];
+        (void)ag_mac_str(mac, text, sizeof(text));
+        ag_console_printf("self %s\n", text);
+    }
+    const uint32_t dropped = ag_espnow_dropped();
+    if (dropped > 0u) {
+        ag_console_printf("%u datagram%s dropped (queue was full)\n",
+                          (unsigned)dropped, (dropped == 1u) ? "" : "s");
+    }
+    return 0;
+}
+
+static int cmd_espnow(int argc, char **argv)
+{
+    if (argc < 2) {
+        return espnow_status();
+    }
+
+    if (ag_path_icmp(argv[1], "on") == 0) {
+        /* The radio first, if it is not up - same bring-up and accounting as
+         * `wifi on`, because ESP-NOW rides the same transceiver. */
+        if (!ag_espnow_running()) {
+            ag_port_wifi_status_t st;
+            if (ag_port_wifi_status(&st) != AG_OK || st.state == AG_WIFI_OFF) {
+                const size_t   before = ag_port_mem_free(AG_MEM_FAST);
+                const ag_err_t nerr = ag_net_init();
+                if (nerr != AG_OK) {
+                    ag_console_printf("espnow on: %s\n",
+                                      ag_loader_api()->sys->strerror(nerr));
+                    return 1;
+                }
+                const size_t after = ag_port_mem_free(AG_MEM_FAST);
+                ag_console_printf("radio on: took %u KB, %u KB free\n",
+                                  (unsigned)((before - after) / 1024u),
+                                  (unsigned)(after / 1024u));
+            }
+        }
+        const ag_err_t err = ag_espnow_start();
+        if (err != AG_OK) {
+            ag_console_printf("espnow on: %s\n",
+                              ag_loader_api()->sys->strerror(err));
+            return 1;
+        }
+        return espnow_status();
+    }
+
+    if (ag_path_icmp(argv[1], "off") == 0) {
+        ag_espnow_stop();
+        ag_console_puts("espnow off\n");
+        return 0;
+    }
+
+    if (!ag_espnow_running()) {
+        ag_console_puts("espnow is off - `espnow on` first\n");
+        return 1;
+    }
+
+    if (ag_path_icmp(argv[1], "peer") == 0) {
+        if (argc >= 4 && ag_path_icmp(argv[2], "del") == 0) {
+            uint8_t mac[6];
+            if (!ag_mac_parse(argv[3], mac)) {
+                ag_console_puts("that is not a hardware address\n");
+                return 1;
+            }
+            const ag_err_t err = ag_espnow_peer_del(mac);
+            ag_console_puts((err == AG_OK) ? "peer removed\n"
+                                           : "no such peer\n");
+            return (err == AG_OK) ? 0 : 1;
+        }
+        if (argc < 3) {
+            ag_console_puts("usage: espnow peer <mac> [channel] [key]\n");
+            ag_console_puts("       espnow peer del <mac>\n");
+            ag_console_puts("  channel 0 = the one the radio is on now\n");
+            ag_console_puts("  key: a shared secret, up to 16 chars, both "
+                            "boards the same\n");
+            return 1;
+        }
+        uint8_t mac[6];
+        if (!ag_mac_parse(argv[2], mac)) {
+            ag_console_puts("that is not a hardware address\n");
+            return 1;
+        }
+        const unsigned channel = (argc > 3) ? (unsigned)atoi(argv[3]) : 0u;
+        if (channel > 13u) {
+            ag_console_puts("channel is 0 (current) or 1..13\n");
+            return 1;
+        }
+        uint8_t        key[AG_ESPNOW_KEY];
+        const uint8_t *keyp = NULL;
+        if (argc > 4) {
+            memset(key, 0, sizeof(key));
+            const size_t kl = strlen(argv[4]);
+            memcpy(key, argv[4], (kl < AG_ESPNOW_KEY) ? kl : AG_ESPNOW_KEY);
+            keyp = key;
+        }
+        const ag_err_t err = ag_espnow_peer_add(mac, (uint8_t)channel, keyp);
+        if (err != AG_OK) {
+            ag_console_printf("espnow peer: %s\n",
+                              ag_loader_api()->sys->strerror(err));
+            return 1;
+        }
+        ag_console_puts((keyp != NULL) ? "peer added (encrypted)\n"
+                                       : "peer added\n");
+        return 0;
+    }
+
+    if (ag_path_icmp(argv[1], "send") == 0) {
+        if (argc < 4) {
+            ag_console_puts("usage: espnow send <mac|bcast> <text...>\n");
+            return 1;
+        }
+        uint8_t mac[6];
+        if (!espnow_parse_mac(argv[2], mac)) {
+            ag_console_puts("that is not a hardware address (or `bcast`)\n");
+            return 1;
+        }
+        /* The rest of the line, joined with spaces, is the message. */
+        char   msg[AG_ESPNOW_MAX];
+        size_t n = 0;
+        for (int i = 3; i < argc && n < AG_ESPNOW_MAX; i++) {
+            if (i > 3 && n < AG_ESPNOW_MAX) {
+                msg[n++] = ' ';
+            }
+            const size_t room = (size_t)AG_ESPNOW_MAX - n;
+            const size_t al = strlen(argv[i]);
+            const size_t take = (al < room) ? al : room;
+            memcpy(msg + n, argv[i], take);
+            n += take;
+        }
+        const ag_err_t err = ag_espnow_send(mac, msg, (uint32_t)n);
+        if (err != AG_OK) {
+            ag_console_printf("espnow send: %s\n",
+                              ag_loader_api()->sys->strerror(err));
+            if (err == -AG_ENOENT) {
+                ag_console_puts("  add it first: espnow peer <mac> [channel]\n");
+            }
+            return 1;
+        }
+        ag_console_printf("sent %u bytes\n", (unsigned)n);
+        return 0;
+    }
+
+    if (ag_path_icmp(argv[1], "listen") == 0) {
+        const unsigned secs = (argc > 2) ? (unsigned)atoi(argv[2]) : 0u;
+        const int64_t  deadline =
+            (secs > 0u) ? (ag_port_us() + (int64_t)secs * 1000000) : 0;
+        ag_console_puts("listening (Ctrl+C to stop)...\n");
+
+        uint8_t  mac[6];
+        uint8_t  buf[AG_ESPNOW_MAX];
+        uint32_t len = 0;
+        for (;;) {
+            if (ag_shell_interrupted()) {
+                ag_console_puts("^C\n");
+                break;
+            }
+            while (ag_espnow_recv(mac, buf, sizeof(buf), &len)) {
+                char text[18];
+                (void)ag_mac_str(mac, text, sizeof(text));
+                ag_console_printf("%s (%u): ", text, (unsigned)len);
+                espnow_print_payload(buf, len);
+                ag_console_puts("\n");
+            }
+            if (secs > 0u && ag_port_us() > deadline) {
+                break;
+            }
+            ag_port_task_delay(ag_port_ms_to_ticks(50));
+        }
+        return 0;
+    }
+
+    ag_console_puts("usage: espnow [on | off | peer <mac> [ch] [key] | "
+                    "peer del <mac>\n"
+                    "              | send <mac|bcast> <text> | listen [secs]]\n");
+    return 1;
+}
+
+#endif /* AG_PORT_HAS_ESPNOW */
+
+#if AG_PORT_HAS_WIFIMON
+
+/* ---------------------------------------------------------------------- */
+/* mon - monitor mode and raw injection                                   */
+/* ---------------------------------------------------------------------- */
+
+#define MON_APS  32
+#define MON_STAS 32
+
+typedef struct {
+    uint8_t  bssid[6];
+    char     ssid[33];
+    uint8_t  channel;
+    int8_t   rssi;
+    uint32_t count;
+} mon_ap_t;
+
+typedef struct {
+    uint8_t  mac[6];
+    int8_t   rssi;
+    uint32_t count;
+} mon_sta_t;
+
+/* Radio up and promiscuous on, shared by every mon subcommand that captures or
+ * injects.  Injection wants promiscuous too, so it goes through here as well. */
+static int mon_ensure_on(void)
+{
+    if (!ag_wifimon_running()) {
+        ag_port_wifi_status_t st;
+        if (ag_port_wifi_status(&st) != AG_OK || st.state == AG_WIFI_OFF) {
+            const size_t   before = ag_port_mem_free(AG_MEM_FAST);
+            const ag_err_t nerr = ag_net_init();
+            if (nerr != AG_OK) {
+                ag_console_printf("mon: %s\n",
+                                  ag_loader_api()->sys->strerror(nerr));
+                return -1;
+            }
+            const size_t after = ag_port_mem_free(AG_MEM_FAST);
+            ag_console_printf("radio on: took %u KB, %u KB free\n",
+                              (unsigned)((before - after) / 1024u),
+                              (unsigned)(after / 1024u));
+        }
+        const ag_err_t err = ag_wifimon_start();
+        if (err != AG_OK) {
+            ag_console_printf("mon: %s\n",
+                              ag_loader_api()->sys->strerror(err));
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int mon_status(void)
+{
+    if (!ag_wifimon_running()) {
+        ag_console_puts("monitor off\n");
+        return 0;
+    }
+    uint32_t c[AG_WIFIMON_C_N];
+    ag_wifimon_counters(c);
+    ag_console_printf("monitor on, channel %u\n",
+                      (unsigned)ag_wifimon_channel_get());
+    ag_console_printf("frames %u  (mgmt %u, ctrl %u, data %u, misc %u)\n",
+                      (unsigned)c[AG_WIFIMON_C_TOTAL],
+                      (unsigned)c[AG_WIFIMON_C_MGMT],
+                      (unsigned)c[AG_WIFIMON_C_CTRL],
+                      (unsigned)c[AG_WIFIMON_C_DATA],
+                      (unsigned)c[AG_WIFIMON_C_MISC]);
+    const uint32_t d = ag_wifimon_dropped();
+    if (d > 0u) {
+        ag_console_printf("%u dropped (ring was full)\n", (unsigned)d);
+    }
+    return 0;
+}
+
+/* Find or add; returns 1 when the entry is new (so the caller prints it). */
+static int mon_ap_seen(mon_ap_t *aps, int *n, const uint8_t bssid[6],
+                       const char *ssid, uint8_t ch, int8_t rssi)
+{
+    for (int i = 0; i < *n; i++) {
+        if (memcmp(aps[i].bssid, bssid, 6) == 0) {
+            aps[i].rssi = rssi;
+            aps[i].channel = ch;
+            aps[i].count++;
+            if (aps[i].ssid[0] == '\0' && ssid[0] != '\0') {
+                snprintf(aps[i].ssid, sizeof(aps[i].ssid), "%s", ssid);
+            }
+            return 0;
+        }
+    }
+    if (*n >= MON_APS) {
+        return 0;
+    }
+    memcpy(aps[*n].bssid, bssid, 6);
+    snprintf(aps[*n].ssid, sizeof(aps[*n].ssid), "%s", ssid);
+    aps[*n].channel = ch;
+    aps[*n].rssi = rssi;
+    aps[*n].count = 1;
+    (*n)++;
+    return 1;
+}
+
+static int mon_sta_seen(mon_sta_t *stas, int *n, const uint8_t mac[6],
+                        int8_t rssi)
+{
+    for (int i = 0; i < *n; i++) {
+        if (memcmp(stas[i].mac, mac, 6) == 0) {
+            stas[i].rssi = rssi;
+            stas[i].count++;
+            return 0;
+        }
+    }
+    if (*n >= MON_STAS) {
+        return 0;
+    }
+    memcpy(stas[*n].mac, mac, 6);
+    stas[*n].rssi = rssi;
+    stas[*n].count = 1;
+    (*n)++;
+    return 1;
+}
+
+/* Pull what an 802.11 frame tells us about who is on the air, and print the
+ * ones we had not seen before. */
+static void mon_parse(mon_ap_t *aps, int *nap, mon_sta_t *stas, int *nsta,
+                      const uint8_t *f, uint32_t len, int8_t rssi, uint8_t ch)
+{
+    if (len < 1u) {
+        return;
+    }
+    const unsigned ftype = (f[0] >> 2) & 0x3u;
+    const unsigned sub = (f[0] >> 4) & 0xfu;
+
+    if (ftype == 0u && len >= 24u) { /* management */
+        const uint8_t *addr2 = f + 10;
+        const uint8_t *bssid = f + 16;
+        if (sub == 8u || sub == 5u) { /* beacon or probe response */
+            char ssid[33] = "";
+            if (len >= 38u && f[36] == 0u) {
+                unsigned sl = f[37];
+                if (sl > 32u) {
+                    sl = 32u;
+                }
+                if (38u + sl <= len) {
+                    memcpy(ssid, f + 38, sl);
+                    ssid[sl] = '\0';
+                }
+            }
+            if (mon_ap_seen(aps, nap, bssid, ssid, ch, rssi)) {
+                char text[18];
+                (void)ag_mac_str(bssid, text, sizeof(text));
+                ag_console_printf("AP  %s ch%2u %4d dBm  \"%s\"\n", text,
+                                  (unsigned)ch, (int)rssi,
+                                  ssid[0] ? ssid : "(hidden)");
+            }
+        } else { /* probe request, auth, assoc: addr2 is a station */
+            if (mon_sta_seen(stas, nsta, addr2, rssi)) {
+                char text[18];
+                (void)ag_mac_str(addr2, text, sizeof(text));
+                ag_console_printf("sta %s      %4d dBm\n", text, (int)rssi);
+            }
+        }
+    } else if (ftype == 2u && len >= 16u) { /* data */
+        /* Only when this board's transmitter is a station (ToDS, not FromDS)
+         * is addr2 a station rather than the access point. */
+        const bool to_ds = (f[1] & 0x01u) != 0u;
+        const bool from_ds = (f[1] & 0x02u) != 0u;
+        if (to_ds && !from_ds) {
+            const uint8_t *addr2 = f + 10;
+            if (mon_sta_seen(stas, nsta, addr2, rssi)) {
+                char text[18];
+                (void)ag_mac_str(addr2, text, sizeof(text));
+                ag_console_printf("sta %s      %4d dBm\n", text, (int)rssi);
+            }
+        }
+    }
+}
+
+/* mon watch / mon hop: the live view.  hop_ms == 0 means stay on one channel. */
+static int mon_watch(unsigned secs, unsigned hop_ms)
+{
+    if (mon_ensure_on() != 0) {
+        return 1;
+    }
+
+    mon_ap_t  *aps = ag_port_alloc(sizeof(mon_ap_t) * MON_APS,
+                                   AG_MEM_FAST | AG_MEM_BYTE);
+    mon_sta_t *stas = ag_port_alloc(sizeof(mon_sta_t) * MON_STAS,
+                                    AG_MEM_FAST | AG_MEM_BYTE);
+    if (aps == NULL || stas == NULL) {
+        ag_port_free(aps);
+        ag_port_free(stas);
+        ag_console_puts("mon: no memory for the tables\n");
+        return 1;
+    }
+    int nap = 0;
+    int nsta = 0;
+
+    if (hop_ms > 0u) {
+        ag_console_puts("hopping channels 1..13 (Ctrl+C to stop)...\n");
+    } else {
+        ag_console_printf("watching channel %u (Ctrl+C to stop)...\n",
+                          (unsigned)ag_wifimon_channel_get());
+    }
+
+    const int64_t deadline =
+        (secs > 0u) ? (ag_port_us() + (int64_t)secs * 1000000) : 0;
+    uint8_t  channel = (hop_ms > 0u) ? 1u : ag_wifimon_channel_get();
+    int64_t  next_hop = ag_port_us() + (int64_t)hop_ms * 1000;
+    if (hop_ms > 0u) {
+        (void)ag_wifimon_channel(channel);
+    }
+
+    uint8_t  buf[AG_WIFIMON_SNAP];
+    int8_t   rssi = 0;
+    uint8_t  ch = 0;
+    uint32_t full = 0;
+    uint32_t copied = 0;
+    for (;;) {
+        if (ag_shell_interrupted()) {
+            ag_console_puts("^C\n");
+            break;
+        }
+        while (ag_wifimon_drain(&rssi, &ch, &full, buf, sizeof(buf), &copied)) {
+            mon_parse(aps, &nap, stas, &nsta, buf, copied, rssi, ch);
+        }
+        if (hop_ms > 0u && ag_port_us() >= next_hop) {
+            channel = (channel >= 13u) ? 1u : (uint8_t)(channel + 1u);
+            (void)ag_wifimon_channel(channel);
+            next_hop = ag_port_us() + (int64_t)hop_ms * 1000;
+        }
+        if (secs > 0u && ag_port_us() > deadline) {
+            break;
+        }
+        ag_port_task_delay(ag_port_ms_to_ticks(30));
+    }
+
+    ag_console_printf("%d access point%s, %d station%s seen\n", nap,
+                      (nap == 1) ? "" : "s", nsta, (nsta == 1) ? "" : "s");
+    ag_port_free(aps);
+    ag_port_free(stas);
+    return 0;
+}
+
+static int mon_hex(const char *s, uint8_t *out, uint32_t cap, uint32_t *outlen)
+{
+    uint32_t n = 0;
+    while (*s != '\0') {
+        if (*s == ' ' || *s == ':' || *s == '-') {
+            s++;
+            continue;
+        }
+        const int hi = hex_digit(*s);
+        const int lo = (s[1] != '\0') ? hex_digit(s[1]) : -1;
+        if (hi < 0 || lo < 0) {
+            return -1;
+        }
+        if (n >= cap) {
+            return -1;
+        }
+        out[n++] = (uint8_t)((hi << 4) | lo);
+        s += 2;
+    }
+    *outlen = n;
+    return 0;
+}
+
+/* Injection frame builders.  These are the frames a person means when they say
+ * "deauth" or "beacon"; the port neither knows nor cares what they are, so the
+ * knowledge lives here, in the place a command was typed. */
+static uint32_t mon_build_deauth(uint8_t *b, const uint8_t dest[6],
+                                 const uint8_t bssid[6])
+{
+    uint32_t n = 0;
+    b[n++] = 0xc0; /* frame control: type mgmt, subtype deauthentication */
+    b[n++] = 0x00;
+    b[n++] = 0x00; /* duration */
+    b[n++] = 0x00;
+    memcpy(b + n, dest, 6);  n += 6; /* addr1: the one being kicked off   */
+    memcpy(b + n, bssid, 6); n += 6; /* addr2: from the access point       */
+    memcpy(b + n, bssid, 6); n += 6; /* addr3: bssid                       */
+    b[n++] = 0x00; /* sequence control */
+    b[n++] = 0x00;
+    b[n++] = 0x07; /* reason 7: class-3 frame from a nonassociated station */
+    b[n++] = 0x00;
+    return n;
+}
+
+static uint32_t mon_build_beacon(uint8_t *b, const char *ssid, uint8_t channel)
+{
+    uint32_t     n = 0;
+    const size_t sl = strlen(ssid);
+    const uint8_t slen = (sl > 32u) ? 32u : (uint8_t)sl;
+
+    b[n++] = 0x80; /* frame control: type mgmt, subtype beacon */
+    b[n++] = 0x00;
+    b[n++] = 0x00; /* duration */
+    b[n++] = 0x00;
+    memset(b + n, 0xff, 6); n += 6; /* addr1: broadcast                    */
+    /* addr2/addr3: a locally-administered address derived from the name, so
+     * two different names do not collide and none impersonates real hardware. */
+    uint8_t bssid[6] = {0x02, 0x00, 0x00, 0x00, 0x00, 0x00};
+    for (size_t i = 0; i < sl; i++) {
+        bssid[3 + (i % 3u)] ^= (uint8_t)ssid[i];
+    }
+    memcpy(b + n, bssid, 6); n += 6;
+    memcpy(b + n, bssid, 6); n += 6;
+    b[n++] = 0x00; /* sequence control */
+    b[n++] = 0x00;
+
+    /* fixed parameters: timestamp (8), beacon interval (2), capabilities (2) */
+    memset(b + n, 0, 8); n += 8;
+    b[n++] = 0x64; b[n++] = 0x00;      /* 100 TU */
+    b[n++] = 0x01; b[n++] = 0x04;      /* ESS, short-slot */
+
+    b[n++] = 0x00; b[n++] = slen;      /* tag 0: SSID */
+    memcpy(b + n, ssid, slen); n += slen;
+
+    b[n++] = 0x01; b[n++] = 0x04;      /* tag 1: supported rates */
+    b[n++] = 0x82; b[n++] = 0x84; b[n++] = 0x8b; b[n++] = 0x96;
+
+    b[n++] = 0x03; b[n++] = 0x01; b[n++] = channel; /* tag 3: DS (channel) */
+    return n;
+}
+
+static int cmd_mon(int argc, char **argv)
+{
+    if (argc < 2) {
+        return mon_status();
+    }
+
+    if (ag_path_icmp(argv[1], "off") == 0) {
+        ag_wifimon_stop();
+        ag_console_puts("monitor off\n");
+        return 0;
+    }
+
+    if (ag_path_icmp(argv[1], "on") == 0) {
+        if (mon_ensure_on() != 0) {
+            return 1;
+        }
+        if (argc > 2) {
+            const unsigned ch = (unsigned)atoi(argv[2]);
+            if (ch < 1u || ch > 14u) {
+                ag_console_puts("channel is 1..14\n");
+                return 1;
+            }
+            (void)ag_wifimon_channel((uint8_t)ch);
+        }
+        return mon_status();
+    }
+
+    if (ag_path_icmp(argv[1], "channel") == 0) {
+        if (argc < 3 || mon_ensure_on() != 0) {
+            if (argc < 3) {
+                ag_console_puts("usage: mon channel <1..14>\n");
+            }
+            return 1;
+        }
+        const unsigned ch = (unsigned)atoi(argv[2]);
+        if (ch < 1u || ch > 14u) {
+            ag_console_puts("channel is 1..14\n");
+            return 1;
+        }
+        const ag_err_t err = ag_wifimon_channel((uint8_t)ch);
+        ag_console_printf(err == AG_OK ? "channel %u\n" : "channel: failed\n",
+                          ch);
+        return (err == AG_OK) ? 0 : 1;
+    }
+
+    if (ag_path_icmp(argv[1], "filter") == 0) {
+        if (argc < 3) {
+            ag_console_puts("usage: mon filter <all|mgmt|ctrl|data>...\n");
+            return 1;
+        }
+        uint32_t mask = 0;
+        for (int i = 2; i < argc; i++) {
+            if (ag_path_icmp(argv[i], "all") == 0) {
+                mask |= AG_WIFIMON_ALL;
+            } else if (ag_path_icmp(argv[i], "mgmt") == 0) {
+                mask |= AG_WIFIMON_MGMT;
+            } else if (ag_path_icmp(argv[i], "ctrl") == 0) {
+                mask |= AG_WIFIMON_CTRL;
+            } else if (ag_path_icmp(argv[i], "data") == 0) {
+                mask |= AG_WIFIMON_DATA;
+            }
+        }
+        if (mon_ensure_on() != 0) {
+            return 1;
+        }
+        return (ag_wifimon_filter(mask) == AG_OK) ? 0 : 1;
+    }
+
+    if (ag_path_icmp(argv[1], "watch") == 0) {
+        const unsigned secs = (argc > 2) ? (unsigned)atoi(argv[2]) : 0u;
+        return mon_watch(secs, 0u);
+    }
+
+    if (ag_path_icmp(argv[1], "hop") == 0) {
+        const unsigned ms = (argc > 2) ? (unsigned)atoi(argv[2]) : 250u;
+        return mon_watch(0u, (ms < 50u) ? 50u : ms);
+    }
+
+    if (ag_path_icmp(argv[1], "tx") == 0) {
+        if (argc < 3) {
+            ag_console_puts("usage: mon tx <hex>   (a whole 802.11 frame, no "
+                            "FCS)\n");
+            return 1;
+        }
+        uint8_t *buf = ag_port_alloc(AG_WIFIMON_TX_MAX, AG_MEM_FAST | AG_MEM_BYTE);
+        if (buf == NULL) {
+            ag_console_puts("mon tx: no memory\n");
+            return 1;
+        }
+        uint32_t len = 0;
+        if (mon_hex(argv[2], buf, AG_WIFIMON_TX_MAX, &len) != 0 || len == 0u) {
+            ag_console_puts("that is not hex, or it is too long\n");
+            ag_port_free(buf);
+            return 1;
+        }
+        int rc = 1;
+        if (mon_ensure_on() == 0) {
+            const ag_err_t err = ag_wifimon_tx(buf, len);
+            if (err == AG_OK) {
+                ag_console_printf("injected %u bytes\n", (unsigned)len);
+                rc = 0;
+            } else {
+                ag_console_printf("mon tx: %s\n",
+                                  ag_loader_api()->sys->strerror(err));
+            }
+        }
+        ag_port_free(buf);
+        return rc;
+    }
+
+    if (ag_path_icmp(argv[1], "deauth") == 0) {
+        if (argc < 3) {
+            ag_console_puts("usage: mon deauth <ap-bssid> [station|bcast] "
+                            "[count]\n");
+            return 1;
+        }
+        uint8_t bssid[6];
+        if (!ag_mac_parse(argv[2], bssid)) {
+            ag_console_puts("that is not a hardware address\n");
+            return 1;
+        }
+        uint8_t dest[6];
+        memset(dest, 0xff, 6); /* broadcast: every client of that AP */
+        if (argc > 3 && ag_path_icmp(argv[3], "bcast") != 0) {
+            if (!ag_mac_parse(argv[3], dest)) {
+                ag_console_puts("that is not a station address (or `bcast`)\n");
+                return 1;
+            }
+        }
+        const int argn = (argc > 4) ? atoi(argv[4]) : 5;
+        const unsigned count = (argn < 1) ? 1u : (unsigned)argn;
+        if (mon_ensure_on() != 0) {
+            return 1;
+        }
+        uint8_t  frame[26];
+        const uint32_t flen = mon_build_deauth(frame, dest, bssid);
+        unsigned sent = 0;
+        for (unsigned i = 0; i < count; i++) {
+            if (ag_wifimon_tx(frame, flen) == AG_OK) {
+                sent++;
+            }
+        }
+        ag_console_printf("sent %u deauth frame%s\n", sent,
+                          (sent == 1u) ? "" : "s");
+        return (sent > 0u) ? 0 : 1;
+    }
+
+    if (ag_path_icmp(argv[1], "beacon") == 0) {
+        if (argc < 3) {
+            ag_console_puts("usage: mon beacon <ssid> [count]\n");
+            return 1;
+        }
+        const int argn = (argc > 3) ? atoi(argv[3]) : 1;
+        const unsigned count = (argn < 1) ? 1u : (unsigned)argn;
+        if (mon_ensure_on() != 0) {
+            return 1;
+        }
+        uint8_t        frame[128];
+        const uint32_t flen = mon_build_beacon(frame, argv[2],
+                                               ag_wifimon_channel_get());
+        unsigned sent = 0;
+        for (unsigned i = 0; i < count; i++) {
+            if (ag_wifimon_tx(frame, flen) == AG_OK) {
+                sent++;
+            }
+        }
+        ag_console_printf("sent %u beacon%s for \"%s\"\n", sent,
+                          (sent == 1u) ? "" : "s", argv[2]);
+        return (sent > 0u) ? 0 : 1;
+    }
+
+    ag_console_puts(
+        "usage: mon [on [ch] | off | channel <n> | filter <types>\n"
+        "           | watch [secs] | hop [ms]\n"
+        "           | tx <hex> | deauth <bssid> [sta|bcast] [n] | beacon "
+        "<ssid> [n]]\n");
+    return 1;
+}
+
+#endif /* AG_PORT_HAS_WIFIMON */
 
 #if AG_PORT_HAS_BT
 
@@ -2354,6 +3228,417 @@ static int cmd_bt(int argc, char **argv)
     ag_console_puts("usage: bt [scan | open <#|addr> | close | forget]\n");
     return 1;
 }
+
+#if AG_PORT_HAS_BLE_CENTRAL || AG_PORT_HAS_BLE_PERIPH
+
+/*
+ * `ble`: the board as a BLE central (scan / connect / read / write) and as a
+ * peripheral (advertise a small GATT server).  `bt` is the keyboard; this is
+ * everything else - what is out there, and being something others reach.
+ */
+
+/* Bring the radio up if it is off - `ble` with it off is a request for it. */
+static ag_err_t ble_ensure_radio(void)
+{
+    ag_port_bt_status_t st;
+    if (ag_port_bt_status(&st) == AG_OK && st.state == AG_BT_OFF) {
+        return ag_port_bt_start();
+    }
+    return AG_OK;
+}
+
+#if AG_PORT_HAS_BLE_CENTRAL
+/* The last scan is kept so `ble connect #3` can mean its third line, the same
+ * convenience `wifi connect #3` has. */
+#define BLE_LIST_MAX 16
+static struct {
+    uint8_t addr[6];
+    int     addr_type;
+    char    name[AG_BLE_NAME_MAX + 1];
+} s_ble_list[BLE_LIST_MAX];
+static uint32_t s_ble_list_n;
+
+static void ble_props_str(uint8_t p, char *out, size_t n)
+{
+    /* R read, W write, w write-without-response, N notify, I indicate. */
+    size_t k = 0;
+    if ((p & AG_BLE_PROP_READ) && k + 1u < n) out[k++] = 'R';
+    if ((p & AG_BLE_PROP_WRITE) && k + 1u < n) out[k++] = 'W';
+    if ((p & AG_BLE_PROP_WNORSP) && k + 1u < n) out[k++] = 'w';
+    if ((p & AG_BLE_PROP_NOTIFY) && k + 1u < n) out[k++] = 'N';
+    if ((p & AG_BLE_PROP_INDIC) && k + 1u < n) out[k++] = 'I';
+    out[k] = '\0';
+}
+
+static int ble_scan(void)
+{
+    const ag_err_t rerr = ble_ensure_radio();
+    if (rerr != AG_OK) {
+        ag_console_printf("ble: %s\n", ag_loader_api()->sys->strerror(rerr));
+        return 1;
+    }
+
+    ag_port_ble_dev_t *devs = ag_port_alloc(
+        sizeof(ag_port_ble_dev_t) * BLE_LIST_MAX, AG_MEM_FAST | AG_MEM_BYTE);
+    if (devs == NULL) {
+        ag_console_puts("ble: no memory\n");
+        return 1;
+    }
+
+    ag_console_puts("scanning...\n");
+    uint32_t       found = 0;
+    const ag_err_t err = ag_port_ble_scan(devs, BLE_LIST_MAX, &found, 5);
+    if (err != AG_OK) {
+        ag_console_printf("ble scan: %s\n",
+                          ag_loader_api()->sys->strerror(err));
+        ag_port_free(devs);
+        return 1;
+    }
+
+    const uint32_t shown = (found < BLE_LIST_MAX) ? found : BLE_LIST_MAX;
+    if (shown == 0u) {
+        ag_console_puts("nothing advertising\n");
+        s_ble_list_n = 0;
+        ag_port_free(devs);
+        return 0;
+    }
+
+    ag_console_puts("  #  address            dBm  conn  name / info\n");
+    s_ble_list_n = 0;
+    for (uint32_t i = 0; i < shown; i++) {
+        const ag_port_ble_dev_t *d = &devs[i];
+        char                     text[18];
+        (void)ag_mac_str(d->addr, text, sizeof(text));
+        ag_console_printf("%3u  %s %4d   %s   %s", (unsigned)(i + 1u), text,
+                          (int)d->rssi, d->connectable ? "y" : "n",
+                          (d->name[0] != '\0') ? d->name : "(no name)");
+        if (d->appearance != 0u) {
+            ag_console_printf(" [look %04x]", (unsigned)d->appearance);
+        }
+        if (d->company != 0xffffu) {
+            ag_console_printf(" [mfr %04x]", (unsigned)d->company);
+        }
+        for (uint8_t k = 0; k < d->n_uuids; k++) {
+            ag_console_printf(" %04x", (unsigned)d->uuids[k]);
+        }
+        ag_console_puts("\n");
+
+        memcpy(s_ble_list[i].addr, d->addr, 6);
+        s_ble_list[i].addr_type = d->addr_type;
+        snprintf(s_ble_list[i].name, sizeof(s_ble_list[i].name), "%s", d->name);
+        s_ble_list_n = i + 1u;
+    }
+    if (found > shown) {
+        ag_console_printf("%u more not shown\n", (unsigned)(found - shown));
+    }
+    ag_console_puts("connect one with: ble connect #<number>\n");
+    ag_port_free(devs);
+    return 0;
+}
+
+/* Discover services and characteristics of the open device and print them as a
+ * tree - each characteristic under the service whose handle range holds it. */
+static int ble_discover_print(void)
+{
+    const ag_err_t derr = ag_port_ble_discover(8000);
+    if (derr != AG_OK) {
+        ag_console_printf("discover: %s\n",
+                          ag_loader_api()->sys->strerror(derr));
+        return 1;
+    }
+
+    ag_ble_svc_t *svcs = ag_port_alloc(sizeof(ag_ble_svc_t) * 12u,
+                                       AG_MEM_FAST | AG_MEM_BYTE);
+    ag_ble_chr_t *chrs = ag_port_alloc(sizeof(ag_ble_chr_t) * 24u,
+                                       AG_MEM_FAST | AG_MEM_BYTE);
+    if (svcs == NULL || chrs == NULL) {
+        ag_port_free(svcs);
+        ag_port_free(chrs);
+        ag_console_puts("ble: no memory\n");
+        return 1;
+    }
+
+    const uint32_t nsvc = ag_port_ble_services(svcs, 12u);
+    const uint32_t nchr = ag_port_ble_chars(chrs, 24u);
+    const uint32_t nsvc_shown = (nsvc < 12u) ? nsvc : 12u;
+    const uint32_t nchr_shown = (nchr < 24u) ? nchr : 24u;
+
+    for (uint32_t i = 0; i < nsvc_shown; i++) {
+        ag_console_printf("service %s  [%04x-%04x]\n", svcs[i].uuid,
+                          (unsigned)svcs[i].start, (unsigned)svcs[i].end);
+        for (uint32_t j = 0; j < nchr_shown; j++) {
+            if (chrs[j].handle < svcs[i].start ||
+                chrs[j].handle > svcs[i].end) {
+                continue;
+            }
+            char props[8];
+            ble_props_str(chrs[j].props, props, sizeof(props));
+            ag_console_printf("  char %s  handle %04x  %s\n", chrs[j].uuid,
+                              (unsigned)chrs[j].handle, props);
+        }
+    }
+    ag_console_puts("read/write with: ble read <handle> | ble write <handle> "
+                    "<text>\n");
+    ag_port_free(svcs);
+    ag_port_free(chrs);
+    return 0;
+}
+
+static void ble_print_value(const uint8_t *v, uint32_t n)
+{
+    ag_console_printf("%u bytes:", (unsigned)n);
+    for (uint32_t i = 0; i < n; i++) {
+        ag_console_printf(" %02x", (unsigned)v[i]);
+    }
+    ag_console_puts("  \"");
+    for (uint32_t i = 0; i < n; i++) {
+        const uint8_t c = v[i];
+        ag_console_printf("%c", (c >= 0x20 && c < 0x7f) ? (char)c : '.');
+    }
+    ag_console_puts("\"\n");
+}
+#endif /* AG_PORT_HAS_BLE_CENTRAL (helpers) */
+
+static int cmd_ble(int argc, char **argv)
+{
+#if AG_PORT_HAS_BLE_PERIPH
+    if (argc >= 2 && ag_path_icmp(argv[1], "adv") == 0) {
+        if (ble_ensure_radio() != AG_OK) {
+            ag_console_puts("ble: the radio would not start\n");
+            return 1;
+        }
+        if (argc >= 3 && ag_path_icmp(argv[2], "off") == 0) {
+            (void)ag_port_ble_adv_stop();
+            ag_console_puts("advertising off\n");
+            return 0;
+        }
+        if (argc >= 3) {
+            const ag_err_t err = ag_port_ble_adv_start(argv[2]);
+            if (err != AG_OK) {
+                ag_console_printf("ble adv: %s\n",
+                                  ag_loader_api()->sys->strerror(err));
+                if (err == -AG_EIO) {
+                    ag_console_puts("  name may be too long for a 31-byte "
+                                    "advert; try shorter\n");
+                }
+                return 1;
+            }
+            ag_console_printf(
+                "advertising as \"%s\" (service fff0: read fff1, write fff2)\n",
+                argv[2]);
+            ag_console_puts("  connect from a phone/PC; `ble adv` shows what "
+                            "was written\n");
+            return 0;
+        }
+        /* bare `ble adv`: status, and the last thing a client wrote. */
+        ag_port_ble_adv_status_t ast;
+        if (ag_port_ble_adv_status(&ast) != AG_OK || !ast.advertising) {
+            ag_console_puts("not advertising - `ble adv <name>` to start\n");
+            return 0;
+        }
+        ag_console_printf("advertising%s, %u write%s received\n",
+                          ast.connected ? ", a client is connected" : "",
+                          (unsigned)ast.writes, (ast.writes == 1u) ? "" : "s");
+        if (ast.writes > 0u) {
+            uint8_t       buf[128];
+            const int32_t n = ag_port_ble_adv_last_write(buf, sizeof(buf));
+            if (n > 0) {
+                ag_console_printf("last write, %d bytes: \"", (int)n);
+                for (int32_t i = 0; i < n; i++) {
+                    const uint8_t c = buf[i];
+                    ag_console_printf("%c",
+                                      (c >= 0x20 && c < 0x7f) ? (char)c : '.');
+                }
+                ag_console_puts("\"\n");
+            }
+        }
+        return 0;
+    }
+
+    if (argc >= 2 && ag_path_icmp(argv[1], "midi") == 0) {
+        if (ble_ensure_radio() != AG_OK) {
+            ag_console_puts("ble: the radio would not start\n");
+            return 1;
+        }
+        if (argc >= 3 && ag_path_icmp(argv[2], "note") == 0) {
+            if (argc < 4) {
+                ag_console_puts("usage: ble midi note <0-127> [velocity]\n");
+                return 1;
+            }
+            const int note = atoi(argv[3]);
+            const int vel = (argc > 4) ? atoi(argv[4]) : 100;
+            if (note < 0 || note > 127) {
+                ag_console_puts("note is 0..127\n");
+                return 1;
+            }
+            const ag_err_t e =
+                ag_port_ble_midi_send(0x90u, (uint8_t)note, (uint8_t)vel);
+            if (e != AG_OK) {
+                ag_console_printf("ble midi note: %s\n",
+                                  ag_loader_api()->sys->strerror(e));
+                ag_console_puts("  is a MIDI app connected and listening?\n");
+                return 1;
+            }
+            ag_port_task_delay(ag_port_ms_to_ticks(300));
+            (void)ag_port_ble_midi_send(0x80u, (uint8_t)note, 0);
+            ag_console_printf("played note %d\n", note);
+            return 0;
+        }
+        /* `ble midi [name]`: advertise as a MIDI device. */
+        const char    *nm = (argc >= 3) ? argv[2] : "ArgMIDI";
+        const ag_err_t e = ag_port_ble_midi_advertise(nm);
+        if (e != AG_OK) {
+            ag_console_printf("ble midi: %s\n",
+                              ag_loader_api()->sys->strerror(e));
+            return 1;
+        }
+        ag_console_printf("advertising as MIDI device \"%s\"\n", nm);
+        ag_console_puts("  connect a MIDI app; `ble midi note <0-127>` tests "
+                        "it\n");
+        return 0;
+    }
+#endif /* AG_PORT_HAS_BLE_PERIPH */
+
+#if AG_PORT_HAS_BLE_CENTRAL
+    if (argc < 2 || ag_path_icmp(argv[1], "scan") == 0) {
+        return ble_scan();
+    }
+
+    if (ag_path_icmp(argv[1], "connect") == 0) {
+        if (argc < 3) {
+            ag_console_puts("usage: ble connect <#number|addr> [random]\n");
+            ag_console_puts("  #number is a line from the last `ble scan`\n");
+            return 1;
+        }
+        if (ble_ensure_radio() != AG_OK) {
+            ag_console_puts("ble: the radio would not start\n");
+            return 1;
+        }
+
+        uint8_t     addr[6];
+        int         addr_type = 0;
+        const char *a = argv[2];
+        const char *digits = (a[0] == '#') ? a + 1 : a;
+        bool        numeric = (digits[0] >= '1' && digits[0] <= '9');
+        for (const char *p = digits; numeric && *p != '\0'; p++) {
+            if (*p < '0' || *p > '9') {
+                numeric = false;
+            }
+        }
+        if (numeric) {
+            const uint32_t nfld = (uint32_t)atoi(digits);
+            if (s_ble_list_n == 0u || nfld == 0u || nfld > s_ble_list_n) {
+                ag_console_printf(
+                    "no #%u in the last scan; run `ble scan` first\n",
+                    (unsigned)nfld);
+                return 1;
+            }
+            memcpy(addr, s_ble_list[nfld - 1u].addr, 6);
+            addr_type = s_ble_list[nfld - 1u].addr_type;
+        } else if (!bt_parse_addr(argv[2], addr)) {
+            ag_console_puts("that is not a hardware address (or a #number)\n");
+            return 1;
+        } else if (argc > 3 && ag_path_icmp(argv[3], "random") == 0) {
+            addr_type = 1; /* BLE random address, what phones usually use */
+        }
+
+        ag_console_puts("connecting...\n");
+        const ag_err_t err = ag_port_ble_connect(addr, addr_type, 10000);
+        if (err != AG_OK) {
+            ag_console_printf("ble connect: %s\n",
+                              ag_loader_api()->sys->strerror(err));
+            return 1;
+        }
+        ag_console_puts("connected\n");
+        return ble_discover_print();
+    }
+
+    if (ag_path_icmp(argv[1], "disconnect") == 0) {
+        (void)ag_port_ble_disconnect();
+        ag_console_puts("disconnected\n");
+        return 0;
+    }
+
+    if (!ag_port_ble_connected()) {
+        ag_console_puts("not connected - `ble connect <#|addr>` first\n");
+        return 1;
+    }
+
+    if (ag_path_icmp(argv[1], "services") == 0) {
+        return ble_discover_print();
+    }
+
+    if (ag_path_icmp(argv[1], "read") == 0) {
+        if (argc < 3) {
+            ag_console_puts("usage: ble read <handle>   (e.g. 0x002a)\n");
+            return 1;
+        }
+        const unsigned long h = strtoul(argv[2], NULL, 0);
+        if (h == 0ul || h > 0xfffful) {
+            ag_console_puts("handle is 0x0001..0xffff (see `ble services`)\n");
+            return 1;
+        }
+        uint8_t       buf[AG_BLE_VAL_MAX];
+        const int32_t n = ag_port_ble_read((uint16_t)h, buf, sizeof(buf), 5000);
+        if (n < 0) {
+            ag_console_printf("ble read: %s\n",
+                              ag_loader_api()->sys->strerror((ag_err_t)n));
+            return 1;
+        }
+        ble_print_value(buf, (uint32_t)n);
+        return 0;
+    }
+
+    if (ag_path_icmp(argv[1], "write") == 0) {
+        if (argc < 4) {
+            ag_console_puts("usage: ble write <handle> <text...>\n");
+            return 1;
+        }
+        const unsigned long h = strtoul(argv[2], NULL, 0);
+        if (h == 0ul || h > 0xfffful) {
+            ag_console_puts("handle is 0x0001..0xffff (see `ble services`)\n");
+            return 1;
+        }
+        char   msg[AG_BLE_VAL_MAX];
+        size_t m = 0;
+        for (int i = 3; i < argc && m < sizeof(msg); i++) {
+            if (i > 3 && m < sizeof(msg)) {
+                msg[m++] = ' ';
+            }
+            const size_t room = sizeof(msg) - m;
+            const size_t al = strlen(argv[i]);
+            const size_t take = (al < room) ? al : room;
+            memcpy(msg + m, argv[i], take);
+            m += take;
+        }
+        const ag_err_t err =
+            ag_port_ble_write((uint16_t)h, msg, (uint32_t)m, true, 5000);
+        if (err != AG_OK) {
+            ag_console_printf("ble write: %s\n",
+                              ag_loader_api()->sys->strerror(err));
+            return 1;
+        }
+        ag_console_printf("wrote %u bytes\n", (unsigned)m);
+        return 0;
+    }
+
+    ag_console_puts("usage: ble [scan | connect <#|addr> [random] | services | "
+                    "read <handle> | write <handle> <text> | disconnect"
+#if AG_PORT_HAS_BLE_PERIPH
+                    " | adv <name> | adv off | midi [name] | midi note <n>"
+#endif
+                    "]\n");
+    return 1;
+#else  /* peripheral-only build: no central verbs */
+    (void)argc;
+    (void)argv;
+    ag_console_puts(
+        "usage: ble [adv <name> | adv off | midi [name] | midi note <n>]\n");
+    return 1;
+#endif /* AG_PORT_HAS_BLE_CENTRAL */
+}
+
+#endif /* AG_PORT_HAS_BLE_CENTRAL || AG_PORT_HAS_BLE_PERIPH */
 
 #endif /* AG_PORT_HAS_BT */
 
@@ -2880,8 +4165,16 @@ static const ag_command_t k_commands[] = {
     {"io", "[pin [mode]] | i2c <bus> | adc [ch]", "pins and buses", cmd_io},
     {"beep", "[hz] [ms]", "a tone on /dev/pcm0", cmd_beep},
 #if AG_PORT_HAS_WIFI
-    {"wifi", "[on|off|scan|connect <#n|ssid> [pass]|forget]", "the radio",
-     cmd_wifi},
+    {"wifi", "[on|off|scan|connect <#n|ssid> [pass]|ap <ssid> [pass]|forget]",
+     "the radio", cmd_wifi},
+#endif
+#if AG_PORT_HAS_ESPNOW
+    {"espnow", "[on|off|peer <mac> [ch]|send <mac|bcast> <text>|listen]",
+     "board-to-board, no access point", cmd_espnow},
+#endif
+#if AG_PORT_HAS_WIFIMON
+    {"mon", "[on|off|watch|hop|channel <n>|tx <hex>|deauth <bssid>|beacon]",
+     "watch the air and inject frames", cmd_mon},
 #endif
 #if AG_HAS_NET
     {"net", "[wait|resolve <name>]", "address, waiting, and names into addresses",
@@ -2894,6 +4187,10 @@ static const ag_command_t k_commands[] = {
 #endif
 #if AG_PORT_HAS_BT
     {"bt", "[on|off|scan|open <#|addr>|close|forget]", "bluetooth input", cmd_bt},
+#endif
+#if AG_PORT_HAS_BLE_CENTRAL || AG_PORT_HAS_BLE_PERIPH
+    {"ble", "[scan|connect|services|read|write|disconnect|adv <name>]",
+     "scan, talk to, or be a BLE device", cmd_ble},
 #endif
     {"ps", "", "list running applications", cmd_ps},
     {"prio", "<slot|pid> [low|normal|high]", "show or set process priority",

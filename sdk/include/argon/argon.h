@@ -730,6 +730,40 @@ static inline int32_t ag_audio_space(void)
     return g_ag_api->audio->space();
 }
 
+/* ---- BLE helpers (ABI 0.34) --------------------------------------------- */
+
+/* True when this build can be a BLE-MIDI device (api->ble present). */
+static inline bool ag_ble_available(void) { return g_ag_api->ble != NULL; }
+
+/* Advertise as a BLE-MIDI device; the radio is started if it was not. */
+static inline ag_err_t ag_ble_midi_advertise(const char *name)
+{
+    if (g_ag_api->ble == NULL) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->ble->midi_advertise(name);
+}
+/* One MIDI message: 0x90|ch note vel (on), 0x80|ch note vel (off). */
+static inline ag_err_t ag_ble_midi_send(uint8_t status, uint8_t d1, uint8_t d2)
+{
+    if (g_ag_api->ble == NULL) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->ble->midi_send(status, d1, d2);
+}
+/* True once a phone/PC is connected and listening for notes. */
+static inline bool ag_ble_midi_ready(void)
+{
+    return g_ag_api->ble != NULL && g_ag_api->ble->midi_ready();
+}
+static inline ag_err_t ag_ble_adv_stop(void)
+{
+    if (g_ag_api->ble == NULL) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->ble->adv_stop();
+}
+
 /* ---- input helpers ------------------------------------------------------ */
 
 static inline bool ag_key(uint16_t keycode)
