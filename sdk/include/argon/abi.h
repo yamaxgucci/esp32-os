@@ -87,9 +87,12 @@ extern "C" {
  * 0.33 appended net->resolve: a name into an address.  Without it every
  *      connect() in an application needs a dotted quad, which is not how
  *      anything on a network is written down.
+ * 0.34 added api->ble (NULL unless the build has the BLE peripheral): a small
+ *      BLE-MIDI surface - advertise as a MIDI device and send notes - so a
+ *      graphical app can be a MIDI controller a phone plays.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 33u
+#define AG_ABI_MINOR 34u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -1254,6 +1257,42 @@ typedef struct ag_audio_api {
 } ag_audio_api_t;
 
 /* ------------------------------------------------------------------------ */
+/* ble - Bluetooth Low Energy for applications (ABI 0.34)                   */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * Deliberately small: enough to be a BLE-MIDI controller, which is the first
+ * application that wanted the radio.  The board becomes a MIDI device a phone
+ * or PC connects to and plays; notes go out as the app sends them.  A general
+ * GATT surface for applications is a later, larger job.
+ */
+typedef struct ag_ble_api {
+    uint32_t size;
+
+    /*
+     * Advertise as a BLE-MIDI device under `name` (kept short - it shares a
+     * 31-byte advertisement with a 128-bit service UUID).  The radio is started
+     * if it was not.  Idempotent; call again to change the name.
+     */
+    ag_err_t (*midi_advertise)(const char *name);
+
+    /*
+     * One MIDI channel-voice message: `status` (0x90|channel for note-on,
+     * 0x80|channel for note-off), then two data bytes (note, velocity).  A
+     * note-on with velocity 0 is the customary note-off.  -AG_ENODEV until a
+     * client has connected and subscribed - there is nowhere to send until
+     * then, and midi_ready() says when that is.
+     */
+    ag_err_t (*midi_send)(uint8_t status, uint8_t data1, uint8_t data2);
+
+    /* True once a client is connected and listening for notes. */
+    bool (*midi_ready)(void);
+
+    /* Stop advertising and drop any client. */
+    ag_err_t (*adv_stop)(void);
+} ag_ble_api_t;
+
+/* ------------------------------------------------------------------------ */
 /* Root table                                                               */
 /* ------------------------------------------------------------------------ */
 
@@ -1280,6 +1319,11 @@ typedef struct ag_api {
 
     /* ABI 0.14+: PCM out (built-in pcmnull; virt/I2S via .SYS). */
     const ag_audio_api_t *audio;
+
+    /* ABI 0.34+: BLE for applications - NULL unless the build has the BLE
+     * peripheral (CONFIG_ARGON_BLE_PERIPHERAL).  Small on purpose: enough for a
+     * MIDI controller, not a general GATT toolkit. */
+    const ag_ble_api_t *ble;
 } ag_api_t;
 
 /* ------------------------------------------------------------------------ */

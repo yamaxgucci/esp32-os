@@ -118,6 +118,69 @@ menu "ArgonOS"
             Which network to join comes from [wifi] in SYSTEM.CFG or from the
             `wifi` command; the radio starts joined to nothing.
 
+    config ARGON_NET_WIFI_AP
+        bool "...and can run its own access point"
+        depends on ARGON_NET_WIFI
+        default y
+        help
+            Lets the board offer a network of its own, not only join one: a
+            fixed-name access point a phone connects to directly, so the card is
+            reachable in a browser with no router in between.  `wifi ap <name>
+            [key]` turns it on; [ap] in SYSTEM.CFG brings it up at boot.
+
+            On by default because it is cheap next to the radio it rides on -
+            the Wi-Fi stack is already linked once ARGON_NET_WIFI is set, and the
+            point adds a second netif and a DHCP server, a few kilobytes taken
+            only while the point is actually up.  Turn it off for a station-only
+            board that wants those kilobytes back at link time.
+
+            This chip has one radio: while the board is also joined to a network
+            the point is forced onto that network's channel, and `wifi` says
+            which channel it ended up on.
+
+    config ARGON_NET_ESPNOW
+        bool "...and can talk to another board with ESP-NOW"
+        depends on ARGON_NET_WIFI
+        default y
+        help
+            Board-to-board datagrams on the same radio, with no access point
+            and no association between them: two boards on one channel throw
+            short frames straight at each other's hardware address.  `espnow`
+            sends and listens; a sensor with no router in the room reaches its
+            sibling this way.
+
+            On by default and cheap - it is the Wi-Fi stack, already linked,
+            used a different way; the only cost of its own is a small receive
+            queue in the kernel, taken while `espnow` is on and given back when
+            it is off.  Turn it off for a board that has nothing to say to
+            another board.
+
+            Not verifiable in QEMU, which models no radio: it takes two real
+            boards on one channel.
+
+    config ARGON_NET_WIFI_MON
+        bool "...and can watch the air and inject raw frames"
+        depends on ARGON_NET_WIFI
+        default n
+        help
+            Monitor mode and raw 802.11 injection: the radio turned into a
+            receiver on one channel, handing up every frame it hears whether it
+            is addressed to this board or not, and a way to put frames of the
+            board's own making on the air.  `mon` watches, sweeps channels and
+            lists what it sees; `mon tx`/`deauth`/`beacon` inject.
+
+            Off by default, and unlike the access point and ESP-NOW that is a
+            decision, not thrift.  A board that joins and serves networks is a
+            participant; a board that listens to everyone's frames and forges
+            its own is a different kind of thing, and it should be that kind of
+            thing only because whoever built the image chose it - see the
+            security note in docs/04-roadmap.md, phase 6.  The capture ring is a
+            couple of kilobytes, taken only while `mon` is on.
+
+            Legitimate for testing a driver, measuring a channel, or security
+            work on networks you are allowed to touch.  Not verifiable in QEMU,
+            which models no radio.
+
     config ARGON_BOARD_PROBE
         bool "Board probe instead of the system"
         default n
@@ -144,13 +207,51 @@ menu "ArgonOS"
             ordinary console events, so the shell, the editor and the file
             manager do not know the difference.
 
-            It cannot be built together with Wi-Fi, and that is arithmetic
-            rather than policy: with both stacks linked, the 128 KB of
-            instruction RAM this chip has is 99.5% full and the general heap
-            drops below what one application needs.  Pick the one the board is
-            for.  A board that needs both wants an S3 with PSRAM.
+            It rides in the same image as Wi-Fi - both stacks are linked and
+            the board's own default (sdkconfig.defaults.esp32) enables both -
+            because code in flash costs no RAM until something runs it, and
+            neither radio starts until asked: `wifi on` / `bt on`, or a
+            [wifi]/[ap]/[bt] in SYSTEM.CFG, brings one up later.
+
+            What does not fit is running both at once.  With both radios up the
+            general heap drops to single-digit kilobytes (the memory table in
+            docs/09-esp32-cyd.md: ~11 KB free, largest block ~7), below what an
+            application needs - so the board runs one radio at a time.  A board
+            that genuinely needs both up together wants an S3 with PSRAM.
 
             Also not verifiable in QEMU, which models no radio.
+
+    config ARGON_BLE_CENTRAL
+        bool "General BLE central (scan/observe, and later GATT client)"
+        depends on ARGON_ENABLE_BLE
+        default y
+        help
+            Everything a BLE central does beyond attaching a keyboard.  `ble`
+            listens to what every device in range advertises and says what each
+            is - name, address, signal, whether it is connectable, its services,
+            its maker; and (added incrementally) connects to an arbitrary device
+            to read and write an arbitrary characteristic, not only HID.
+
+            On by default and cheap - it rides the NimBLE host the keyboard host
+            already starts, so it adds code but no second controller.  Turn it
+            off for a board that only ever wants a keyboard.
+
+            Not verifiable in QEMU, which models no radio.
+
+    config ARGON_BLE_PERIPHERAL
+        bool "BLE peripheral (the board is seen and connected to)"
+        depends on ARGON_ENABLE_BLE
+        default y
+        help
+            The other direction from central: the board advertises a name and
+            holds a small GATT server, so a phone or PC connects to it and reads
+            and writes a characteristic.  `ble adv <name>` starts it.
+
+            On by default; it registers one custom service in the NimBLE host
+            the keyboard already runs.  Turn it off for a board that should
+            never be connectable - a keyboard host that stays invisible.
+
+            Not verifiable in QEMU, which models no radio.
 
     config ARGON_CONSOLE_COLS
         int "Console width, characters"
