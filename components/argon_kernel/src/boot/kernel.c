@@ -180,10 +180,11 @@ static const ag_stage_desc_t s_stages[AG_STAGE_COUNT] = {
     [AG_STAGE_MEMORY]     = {"memory",     NULL,           false},
     [AG_STAGE_LOG]        = {"log",        ag_log_init,    false},
     [AG_STAGE_BOARD]      = {"board",      ag_board_init,  false},
-    [AG_STAGE_POWER]      = {"power",      ag_powerctl_init, false},
     [AG_STAGE_CONSOLE]    = {"console",    stage_console,  true},
     [AG_STAGE_STORAGE]    = {"storage",    ag_storage_init, false},
     [AG_STAGE_CONFIG]     = {"config",     ag_sysconfig_init, false},
+    /* After the configuration, because [power] lives in it. */
+    [AG_STAGE_POWER]      = {"power",      ag_powerctl_init, false},
     [AG_STAGE_DEVICES]    = {"devices",    ag_devices_init, false},
     [AG_STAGE_MEDIA]      = {"media",      ag_storage_mount_media, false},
     [AG_STAGE_MODULES]    = {"modules",    stage_modules,  false},

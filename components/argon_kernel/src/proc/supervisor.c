@@ -20,6 +20,7 @@
 #include <argon/journal.h>
 #include <argon/keys.h>
 #include <argon/log.h>
+#include <argon/power.h>
 #include <argon/proc.h>
 #include <argon/session.h>
 #include <argon/vfs.h>
@@ -253,6 +254,14 @@ static void supervisor_task(void *arg)
             s_kill_request = AG_PID_KERNEL;
             (void)ag_proc_kill(victim, "a thread of it faulted");
         }
+
+        /*
+         * The idle timer.  Here rather than on a timer of its own for the same
+         * reason as everything else on this tick: this task runs, four times a
+         * second, whatever an application is doing to the other core.  It is a
+         * comparison of two numbers until something has to change.
+         */
+        ag_powerctl_tick();
 
         /*
          * A process that promised to report progress and stopped.  Checked here

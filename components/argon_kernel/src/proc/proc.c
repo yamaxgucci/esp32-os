@@ -1011,6 +1011,19 @@ ag_err_t ag_proc_spawn_builtin(const char *name, ag_proc_entry_fn entry,
     set_string(p->name, sizeof(p->name), name);
     ag_reslist_init(&p->res, p->res_slots, AG_PROC_RES_MAX);
 
+    /*
+     * The system says this one is fit for any power mode, on its behalf.
+     *
+     * A built-in is the file manager, the editor, the shell's own tools: code
+     * in this tree, text on a screen, no deadline anywhere in it.  Left to the
+     * ordinary rule - answer or be ended - `power eco` would kill the file
+     * manager somebody is standing in front of, and teaching each of these
+     * loops to answer a question whose answer is always yes would be four
+     * copies of the same three lines.  Where the system wrote the program, the
+     * system can vouch for it.
+     */
+    (void)ag_power_declare(p->pid, AG_POWER_FIT_ANY, "system tool");
+
     const char *parent_cwd = ag_proc_cwd();
     set_string(p->cwd, sizeof(p->cwd), parent_cwd);
 

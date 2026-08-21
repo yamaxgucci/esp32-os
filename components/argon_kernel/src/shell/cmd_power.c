@@ -1,11 +1,17 @@
 /*
  * ArgonOS - `power`.
  *
- * Three things, and they are the three a person actually asks for: run slower,
- * put the screen out, and tell the applications so they can decide what to do
- * about it.  Everything it prints is read back from the machine rather than
- * remembered - the frequency above all, because a command that reports what it
- * asked for instead of what happened is worse than no command.
+ * Run slower, put the screen out, let the idle timer do both, and tell the
+ * applications either way.  Everything it prints is read back from the machine
+ * rather than remembered - the frequency above all, because a command that
+ * reports what it asked for instead of what happened is worse than no command.
+ *
+ * The one thing this command does that no other does: a mode a person asks for
+ * ends the applications that did not say they can live with it, and then this is
+ * where they are named.  It is not softened with a confirmation prompt.  What it
+ * replaces - an application left running at a third of its clock, failing in
+ * whatever way its arithmetic fails - is worse than a process that is gone and
+ * says so.
  *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
@@ -22,14 +28,6 @@
 #include <argon/port/power.h>
 #include <argon/port/time.h>
 
-/*
- * The default for `power eco` with no number.  Eighty megahertz is a third of
- * full speed and still a PLL setting, so the peripheral bus keeps a frequency
- * every driver in the tree has been run at.  Dropping to the crystal is a
- * bigger saving and a bigger risk, so it is available but not the default.
- */
-#define AG_POWER_ECO_DEFAULT_MHZ 80
-
 static uint32_t now_ms(void) { return (uint32_t)(ag_port_us() / 1000); }
 
 static const char *mode_name(ag_power_mode_t m)
@@ -42,13 +40,19 @@ static const char *mode_name(ag_power_mode_t m)
     }
 }
 
-static const char *answer_name(ag_power_answer_t a)
+static const char *row_state(const ag_power_watcher_t *w)
 {
-    switch (a) {
+    if (w->fitness == AG_POWER_FIT_ANY) {
+        return "fit for any mode";
+    }
+    if (w->fitness == AG_POWER_FIT_FULL_ONLY) {
+        return "needs the full clock";
+    }
+    switch (w->answer) {
     case AG_POWER_OK:     return "carrying on";
     case AG_POWER_PARKED: return "parked";
-    case AG_POWER_HOLD:   return "held";
-    default:              return "no answer";
+    case AG_POWER_UNFIT:  return "said it is not fit";
+    default:              return "has not answered";
     }
 }
 
@@ -84,9 +88,8 @@ static void print_watchers(void)
             any = true;
         }
         ag_console_printf("    pid %-3u %-12s %s", (unsigned)w.pid,
-                          name_of(w.pid),
-                          w.hold ? "holds the clock" : answer_name(w.answer));
-        if (!w.hold && !w.listening) {
+                          name_of(w.pid), row_state(&w));
+        if (w.fitness == AG_POWER_FIT_ASK && !w.listening) {
             ag_console_puts(" (not polling)");
         }
         if (w.why[0] != '\0') {
@@ -96,8 +99,24 @@ static void print_watchers(void)
     }
 
     if (!any) {
-        ag_console_puts("  applications: none is asking to be told\n");
+        ag_console_puts("  applications: none has said anything\n");
     }
+}
+
+static void print_auto(void)
+{
+    ag_power_auto_t a;
+    ag_powerctl_auto_get(&a);
+
+    if (!a.on) {
+        ag_console_puts("  idle timer: off (`power auto on`)\n");
+        return;
+    }
+    ag_console_printf("  idle timer: on - screen off after %u s, %u MHz after "
+                      "%u s; idle %u s now\n",
+                      (unsigned)a.screen_off_s, (unsigned)a.eco_mhz,
+                      (unsigned)a.eco_s,
+                      (unsigned)(ag_console_idle_ms() / 1000u));
 }
 
 static int status(void)
@@ -137,6 +156,7 @@ static int status(void)
                         "only where this machine can make it\n");
     }
 
+    print_auto();
     print_watchers();
     return 0;
 }
@@ -144,12 +164,13 @@ static int status(void)
 static void usage(void)
 {
     ag_console_puts("usage: power [full | eco [mhz] | doze [mhz] | "
-                    "screen on|off] [/force]\n");
-    ag_console_puts("  eco   pin the clock lower; default "
-                    "80 MHz\n");
+                    "screen on|off]\n");
+    ag_console_puts("       power auto [on|off] [screen_s] [eco_s]\n");
+    ag_console_puts("  eco   pin the clock lower; default 80 MHz\n");
     ag_console_puts("  doze  the same, and the screen off\n");
-    ag_console_puts("  /force  go ahead even if an application asked to keep "
-                    "the clock\n");
+    ag_console_puts("  an application that does not answer that it is fit for "
+                    "the new mode\n"
+                    "  is ended; `power auto` never ends anything\n");
 }
 
 /* One of the machine's own settings, or zero. */
@@ -170,75 +191,85 @@ static uint32_t step_or_zero(const char *word)
     return 0u;
 }
 
-static uint32_t eco_default(void)
+static int cmd_auto(int words, char **word)
 {
-    uint16_t       steps[AG_PORT_PWR_STEPS_MAX];
-    const uint32_t n = ag_powerctl_cpu_steps(steps, AG_PORT_PWR_STEPS_MAX);
-    if (n == 0u) {
-        return 0u;
+    ag_power_auto_t a;
+    ag_powerctl_auto_get(&a);
+
+    if (words < 2) {
+        print_auto();
+        return 0;
     }
-    for (uint32_t i = 0; i < n && i < AG_PORT_PWR_STEPS_MAX; i++) {
-        if (steps[i] == AG_POWER_ECO_DEFAULT_MHZ) {
-            return AG_POWER_ECO_DEFAULT_MHZ;
-        }
+    if (ag_path_icmp(word[1], "on") == 0) {
+        a.on = true;
+    } else if (ag_path_icmp(word[1], "off") == 0) {
+        a.on = false;
+    } else {
+        usage();
+        return 1;
     }
-    /* No 80 on this part: the lowest it has, which is the honest reading of
-     * "as slow as you can". */
-    const uint32_t last = (n < AG_PORT_PWR_STEPS_MAX) ? n : AG_PORT_PWR_STEPS_MAX;
-    return (uint32_t)steps[last - 1];
+
+    /* Seconds, and zero means never - which is how one half of the ladder is
+     * switched off without switching off the other. */
+    if (words > 2) {
+        a.screen_off_s = (uint32_t)strtol(word[2], NULL, 10);
+    }
+    if (words > 3) {
+        a.eco_s = (uint32_t)strtol(word[3], NULL, 10);
+    }
+
+    const ag_err_t err = ag_powerctl_auto_set(&a);
+    if (err != AG_OK) {
+        ag_console_printf("power auto: failed (%d)\n", (int)err);
+        return 1;
+    }
+    print_auto();
+    ag_console_puts("  (in SYSTEM.CFG as [power] auto / screen_off_s / eco_s "
+                    "to survive a reboot)\n");
+    return 0;
 }
 
-static int refused(ag_err_t err, const ag_power_target_t *want)
+static int report(const ag_power_ended_t *ended, uint32_t n,
+                  const ag_power_target_t *want)
 {
-    if (err == -AG_EPERM) {
-        ag_console_puts("power: an application is holding the clock:\n");
-        for (uint32_t i = 0;; i++) {
-            ag_power_watcher_t w;
-            if (!ag_power_watcher_at(i, now_ms(), &w)) {
-                break;
-            }
-            if (!w.hold && w.answer != AG_POWER_HOLD) {
-                continue;
-            }
-            ag_console_printf("  pid %u %s%s%s\n", (unsigned)w.pid,
-                              name_of(w.pid), w.why[0] != '\0' ? " - " : "",
-                              w.why);
-        }
-        ag_console_puts("  add /force to lower it anyway\n");
-        return 1;
+    /*
+     * Read back rather than assumed.  On a build without frequency scaling the
+     * mode changes and the clock does not, and saying so here - next to the
+     * command that was typed - is the difference between a system that looks
+     * broken and one that is understood.
+     */
+    ag_power_target_t got;
+    ag_power_current(&got);
+    if (got.cpu_max_mhz != want->cpu_max_mhz) {
+        ag_console_printf("power: the clock stayed at %u MHz - this build "
+                          "cannot move it (ARGON_ENABLE_PM)\n",
+                          (unsigned)got.cpu_max_mhz);
     }
-    if (err == -AG_ENOTSUP) {
-        ag_console_printf("power: this build cannot move the clock, so %u MHz "
-                          "is not available (ARGON_ENABLE_PM)\n",
-                          (unsigned)want->cpu_max_mhz);
-        return 1;
+
+    for (uint32_t i = 0; i < n; i++) {
+        ag_console_printf("power: ended %s (pid %u) - %s\n", ended[i].name,
+                          (unsigned)ended[i].pid,
+                          (ended[i].why[0] != '\0')
+                              ? ended[i].why
+                              : "did not answer that it is fit");
     }
-    if (err == -AG_EBUSY) {
-        ag_console_puts("power: a change is already in flight; try again\n");
-        return 1;
-    }
-    ag_console_printf("power: failed (%d)\n", (int)err);
-    return 1;
+    return 0;
 }
 
 int ag_cmd_power(int argc, char **argv)
 {
-    bool force = false;
-    int  words = 0;
-    char *word[3] = {NULL, NULL, NULL};
+    int   words = 0;
+    char *word[4] = {NULL, NULL, NULL, NULL};
 
-    for (int i = 1; i < argc; i++) {
-        if (ag_path_icmp(argv[i], "/force") == 0) {
-            force = true;
-            continue;
-        }
-        if (words < 3) {
-            word[words++] = argv[i];
-        }
+    for (int i = 1; i < argc && words < 4; i++) {
+        word[words++] = argv[i];
     }
 
     if (words == 0) {
         return status();
+    }
+    if (ag_path_icmp(word[0], "auto") == 0) {
+        return cmd_auto(words, word);
     }
 
     ag_power_target_t now;
@@ -246,23 +277,21 @@ int ag_cmd_power(int argc, char **argv)
     ag_power_target_t want = now;
 
     if (ag_path_icmp(word[0], "full") == 0) {
-        want.mode = AG_POWER_FULL;
-        want.cpu_min_mhz = 0u; /* filled below from the machine's maximum */
-        want.cpu_max_mhz = 0u;
-        want.screen_on = true;
-
         uint16_t       steps[AG_PORT_PWR_STEPS_MAX];
         const uint32_t n = ag_powerctl_cpu_steps(steps, AG_PORT_PWR_STEPS_MAX);
         if (n == 0u) {
             ag_console_puts("power: this machine reports no clock settings\n");
             return 1;
         }
+        want.mode = AG_POWER_FULL;
         want.cpu_min_mhz = steps[0];
         want.cpu_max_mhz = steps[0];
+        want.screen_on = true;
     } else if (ag_path_icmp(word[0], "eco") == 0 ||
                ag_path_icmp(word[0], "doze") == 0) {
         const bool doze = (ag_path_icmp(word[0], "doze") == 0);
-        uint32_t   mhz = (words > 1) ? step_or_zero(word[1]) : eco_default();
+        const uint32_t mhz =
+            (words > 1) ? step_or_zero(word[1]) : ag_powerctl_eco_default();
         if (mhz == 0u) {
             if (words > 1) {
                 ag_console_printf("power: %s is not one of this machine's "
@@ -292,9 +321,11 @@ int ag_cmd_power(int argc, char **argv)
             return 1;
         }
         /*
-         * The screen on its own does not change the mode: a dark screen at
-         * full speed is a legitimate thing to want, and calling it `doze`
-         * would be a lie in the one place a person looks to find out.
+         * The screen on its own does not change the mode: a dark screen at full
+         * speed is a legitimate thing to want, calling it `doze` would be a lie
+         * in the one place a person looks to find out - and, because nothing is
+         * ended without the mode going down, it is also the one way to darken a
+         * board without asking anything of what is running on it.
          */
     } else {
         usage();
@@ -310,24 +341,19 @@ int ag_cmd_power(int argc, char **argv)
         return 0;
     }
 
-    const ag_err_t err = ag_powerctl_apply(&want, force);
+    ag_power_ended_t ended[AG_PROC_MAX];
+    uint32_t         n_ended = 0;
+    const ag_err_t   err = ag_powerctl_apply(&want, AG_POWER_USER, ended,
+                                             AG_PROC_MAX, &n_ended);
     if (err != AG_OK) {
-        return refused(err, &want);
+        if (err == -AG_EBUSY) {
+            ag_console_puts("power: a change is already in flight; try again\n");
+        } else {
+            ag_console_printf("power: failed (%d)\n", (int)err);
+        }
+        return 1;
     }
 
-    /*
-     * Read back rather than assumed.  On a build without frequency scaling the
-     * mode changes and the clock does not, and saying so here - next to the
-     * command that was typed - is the difference between a system that looks
-     * broken and one that is understood.
-     */
-    ag_power_target_t got;
-    ag_power_current(&got);
-    if (got.cpu_max_mhz != want.cpu_max_mhz) {
-        ag_console_printf("power: the clock stayed at %u MHz - this build "
-                          "cannot move it (ARGON_ENABLE_PM)\n",
-                          (unsigned)got.cpu_max_mhz);
-    }
-
+    (void)report(ended, n_ended, &want);
     return status();
 }

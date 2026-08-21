@@ -863,16 +863,16 @@ static ag_err_t api_power_answer(ag_power_answer_t a, const char *why)
     return ag_power_reply(ag_proc_self(), a, why);
 }
 
-static ag_err_t api_power_hold(bool on, const char *why)
+static ag_err_t api_power_declare(ag_power_fitness_t fitness, const char *why)
 {
-    return ag_power_set_hold(ag_proc_self(), on, why);
+    return ag_power_declare(ag_proc_self(), fitness, why);
 }
 
 static const ag_power_api_t k_power = {
     .size = sizeof(ag_power_api_t),
     .status = api_power_status,
     .answer = api_power_answer,
-    .hold = api_power_hold,
+    .declare = api_power_declare,
 };
 
 static const ag_proc_api_t k_proc = {

@@ -869,23 +869,30 @@ static inline ag_err_t ag_net_resolve(const char *host, uint32_t *addr_out)
 /* ---- power helpers (ABI 0.34+) ------------------------------------------ */
 
 /*
- * Once round the loop is enough, and cheaper than it looks: this is a copy of
- * a small structure out of the kernel, with no lock and no work behind it.
+ * Once round the loop is enough, and cheaper than it looks: this is a copy of a
+ * small structure out of the kernel, with no lock and no work behind it.
  *
  * The pattern it is for:
  *
  *   ag_power_status_t p;
  *   if (ag_power_status(&p) == AG_OK && p.pending != p.mode) {
  *       if (p.pending_cpu_max_mhz < needed_mhz) {
- *           ag_power_answer(AG_POWER_HOLD, "22 kHz tract");
+ *           ag_power_answer(AG_POWER_UNFIT, "22 kHz tract");
  *       } else {
  *           ag_power_answer(AG_POWER_OK, NULL);
  *       }
  *   }
  *
- * An application that does none of this keeps working exactly as it does now.
- * The transition happens without it, which is the whole point: one program
- * that has stopped answering must not be able to keep a board at full power.
+ * On an automatic transition (p.cause == AG_POWER_AUTO) not answering costs
+ * nothing: it is advisory, and an application that knows nothing about power
+ * modes goes on exactly as it does now.
+ *
+ * On one a person typed (AG_POWER_USER) not answering is fatal - the process is
+ * ended when the grace period runs out.  That is the trade the system makes on
+ * purpose: an application left running at a third of its clock fails quietly,
+ * and quietly is the one way it must not fail.  A program that has nothing to
+ * decide says so once with ag_power_declare(AG_POWER_FIT_ANY, ...) and never
+ * thinks about it again.
  */
 static inline ag_err_t ag_power_status(ag_power_status_t *out)
 {
@@ -906,16 +913,19 @@ static inline ag_err_t ag_power_answer(ag_power_answer_t answer,
 }
 
 /*
- * Said once instead of answered every time.  It refuses a command to lower the
- * clock until it is dropped, `power ... /force` overrides it, and it goes when
- * this process does.
+ * Said once instead of answered every time, for the two kinds of program that
+ * never poll: AG_POWER_FIT_ANY for one that plainly does not care, and
+ * AG_POWER_FIT_FULL_ONLY for one that plainly does - a realtime path, which is
+ * then left alone by the idle timer and ended by a person's command rather than
+ * left to misbehave.  Goes when this process does.
  */
-static inline ag_err_t ag_power_hold(bool on, const char *why)
+static inline ag_err_t ag_power_declare(ag_power_fitness_t fitness,
+                                       const char *why)
 {
-    if (g_ag_api->power == NULL || g_ag_api->power->hold == NULL) {
+    if (g_ag_api->power == NULL || g_ag_api->power->declare == NULL) {
         return -AG_ENOSYS;
     }
-    return g_ag_api->power->hold(on, why);
+    return g_ag_api->power->declare(fitness, why);
 }
 
 #ifdef __cplusplus
