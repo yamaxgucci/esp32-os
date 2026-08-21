@@ -26,6 +26,7 @@
     { "out": "DISK.AXE", "group": "core", "src": ["apps/disk/disk.c"] },
     { "out": "DEVS.AXE", "group": "core", "src": ["apps/devs/devs.c"] },
     { "out": "SPIN.AXE", "group": "core", "src": ["apps/spin/spin.c"] },
+    { "out": "PWR.AXE", "group": "core", "src": ["apps/pwr/pwr.c"] },
     { "out": "LEAK.AXE", "group": "core", "src": ["apps/leak/leak.c"] },
     { "out": "THREADS.AXE", "group": "core", "src": ["apps/threads/threads.c"] },
     { "out": "CRASH.AXE", "group": "core", "src": ["apps/crash/crash.c"] },

@@ -47,6 +47,7 @@
 #include "proc/supervisor.h"
 #include "shell/cmd_fs.h"
 #include "shell/cmd_net.h"
+#include "shell/cmd_power.h"
 #include "shell/cmd_unzip.h"
 
 typedef struct {
@@ -2879,6 +2880,8 @@ static const ag_command_t k_commands[] = {
      "modules: list, load, install to C:, unload, I2C probe", cmd_drv},
     {"io", "[pin [mode]] | i2c <bus> | adc [ch]", "pins and buses", cmd_io},
     {"beep", "[hz] [ms]", "a tone on /dev/pcm0", cmd_beep},
+    {"power", "[full|eco [mhz]|doze [mhz]|screen on|off] [/force]",
+     "the clock and the screen, and telling applications", ag_cmd_power},
 #if AG_PORT_HAS_WIFI
     {"wifi", "[on|off|scan|connect <#n|ssid> [pass]|forget]", "the radio",
      cmd_wifi},

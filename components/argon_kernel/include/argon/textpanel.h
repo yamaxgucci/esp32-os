@@ -41,6 +41,14 @@ ag_err_t ag_textpanel_geometry(uint16_t *cols, uint16_t *rows);
  */
 void ag_textpanel_render(const ag_screen_t *screen);
 
+/*
+ * Stop sending rows to the panel, or start again.  Off is for a screen that
+ * has been switched off: the glass is dark, so the rows are bus traffic for
+ * nothing.  On owes the panel a full repaint, because the console clears its
+ * dirty set every tick and what was missed is gone.
+ */
+void ag_textpanel_enable(bool on);
+
 /* Drains input devices that must be polled; same tick, same reason. */
 void ag_inputpoll_tick(void);
 

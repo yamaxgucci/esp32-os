@@ -22,6 +22,7 @@ actually calls, because the kernel calls nothing else.
 | 11 | `src/storage_hw.c` | a power-fail-safe filesystem on flash, and FAT on a card | weeks |
 | 12 | `src/panel_hw.c` | optional — a display | — |
 | 13 | `src/net_hw.c` | optional — an interface and TCP | — |
+| 14 | `src/power_hw.c` | optional — moving the clock at run time.  Absent is a legal answer: `caps() == 0` and the system runs at one frequency | a day |
 
 Items 1–7 get to a prompt on a serial console. 8–11 get an operating system.
 

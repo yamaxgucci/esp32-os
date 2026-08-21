@@ -69,6 +69,43 @@ menu "ArgonOS"
             What it costs when something is playing is about four kilobytes of
             DMA buffers, taken on the first write and given back on close.
 
+    config ARGON_ENABLE_PM
+        bool "Frequency scaling (power eco)"
+        default n
+        select PM_ENABLE
+        help
+            Links ESP-IDF's power management, which is the only supported way
+            to change the processor's clock while the system is running.
+
+            With this off nothing about `power` disappears: the modes still
+            change, the screen still goes out, the applications are still told
+            and the journal still records it - the clock simply stays where it
+            is, and the command says so in as many words.
+
+            It does not fit everywhere.  On the ESP32-S3 image, enabling it
+            overflows the data segment by about a kilobyte: ESP-IDF's power
+            management keeps its locks and its scaling state in internal RAM,
+            and that image has none to spare.  The ESP32 image - the board with
+            a battery connector on it, which is the one that needs this - links
+            with room left.
+
+            Off by default for the same reason the ADC is: what it does cannot
+            be verified in the emulator.  QEMU models a clock tree that does
+            not change, so a build with this on is a build whose central claim
+            is untested until it is on a board with a meter on it.
+
+            It is also not free on hardware.  Lowering the processor's clock
+            lowers the peripheral bus with it, and every driver that talks to a
+            bus has to take a lock while it does so - ESP-IDF's drivers do, the
+            ones in this tree go through those, and anything that latched a
+            divider without asking talks at the wrong rate afterwards.  The
+            console is the one to watch: garbage on the serial port is the
+            failure this arrangement produces, and a board that cannot be
+            talked to cannot be told to speed up again.
+
+            Turn it on for a board, measure the milliamps at each setting, and
+            write the numbers down - see docs/11-power.md.
+
     config ARGON_CONSOLE_KEY_EVENTS
         bool "Request key-up events from the terminal"
         default n

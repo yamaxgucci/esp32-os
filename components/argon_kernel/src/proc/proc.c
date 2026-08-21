@@ -16,6 +16,7 @@
 #include <argon/kernel.h>
 #include <argon/lineedit.h>
 #include <argon/loader.h>
+#include <argon/power.h>
 #include <argon/log.h>
 #include <argon/path.h>
 #include <argon/shell.h>
@@ -306,6 +307,13 @@ static void reap(proc_t *p)
      * next edge on that pin, with nothing in the journal to say why.
      */
     const uint32_t pins = ag_io_reclaim(p->pid);
+
+    /*
+     * And whatever it asked of the clock.  A hold left behind by a process
+     * that is gone would pin the machine at full speed with nothing to show
+     * for it, and no way to find out whose hold it was.
+     */
+    ag_power_forget(p->pid);
 
     if (held > 0 || files > 0 || pins > 0) {
         ag_log(AG_LOG_INFO, "proc",

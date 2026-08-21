@@ -92,6 +92,7 @@ static int16_t   s_caret_row = -1;
 
 static ag_device_t *s_dev;
 static bool      s_panel; /* false when this machine has no panel     */
+static bool      s_screen_on = true; /* ag_display_power                  */
 
 static size_t fb_bytes(void)
 {
@@ -217,6 +218,15 @@ static void driver_present_rect(int32_t x, int32_t y, int32_t w, int32_t h)
 static void panel_present_rect(int32_t x, int32_t y, int32_t w, int32_t h)
 {
     if (s_front == NULL || s_w == 0 || s_h == 0) {
+        return;
+    }
+    /*
+     * One choke point for both paths - the panel this port opened and the
+     * driver that takes rectangles - so that "the screen is off" is one test
+     * rather than one per caller.  Drawing carries on into the framebuffer;
+     * only sending it anywhere stops.
+     */
+    if (!s_screen_on) {
         return;
     }
     if (s_panel) {
@@ -808,6 +818,20 @@ static void gfx_backlight(uint8_t percent)
 {
     (void)percent; /* soft display has no backlight */
 }
+
+void ag_display_power(bool on)
+{
+    if (on == s_screen_on) {
+        return;
+    }
+    s_screen_on = on;
+    if (on) {
+        /* The whole frame, because nothing recorded what was missed. */
+        panel_present();
+    }
+}
+
+bool ag_display_powered(void) { return s_screen_on; }
 
 static void gfx_pixel(int16_t x, int16_t y, uint32_t color)
 {

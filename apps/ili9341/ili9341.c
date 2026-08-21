@@ -521,10 +521,54 @@ static const ag_display_ops_t k_display_ops = {
 };
 
 /*
- * Nothing: a panel is not a stream of bytes, and `type d:\lcd0` should say so
- * rather than do something.  The class vtable above is the whole interface.
+ * The panel is not a stream of bytes, so read and write are absent: `type
+ * d:\lcd0` says so rather than doing something.  The one ioctl is the light.
+ *
+ * On this board the backlight is a transistor on a plain output, not a PWM
+ * channel, so any percentage above zero is "on".  A board of this family with
+ * the light on a channel of its own would set a duty here instead, and the
+ * kernel does not need to know which it is.
+ *
+ * The controller is put to sleep as well as darkened.  That is the larger half
+ * of the saving: the light is off either way, but a panel left scanning keeps
+ * its charge pumps and its oscillator running for a picture nobody can see.
+ * Waking it costs the datasheet's 120 ms and a cleared screen, because what is
+ * in its memory by then is a week old as far as the console is concerned.
  */
-static const ag_dev_ops_t k_dev_ops = {0};
+static ag_err_t lcd_ioctl(ag_device_t *dev, uint32_t code, void *arg,
+                          size_t arglen)
+{
+    (void)dev;
+
+    if (code != AG_IOC_DISPLAY_BACKLIGHT) {
+        return -AG_ENOTSUP;
+    }
+    if (arg == NULL || arglen < sizeof(uint8_t)) {
+        return -AG_EINVAL;
+    }
+    if (!s_up) {
+        return -AG_ENODEV;
+    }
+
+    const uint8_t percent = *(const uint8_t *)arg;
+    if (percent == 0u) {
+        io->gpio_write(LCD_BL, 0);
+        cmd(0x28); /* display off */
+        cmd(0x10); /* sleep in    */
+        return AG_OK;
+    }
+
+    cmd(0x11); /* sleep out */
+    ag_api()->time->delay_ms(120);
+    clear_panel();
+    cmd(0x29); /* display on */
+    io->gpio_write(LCD_BL, 1);
+    return AG_OK;
+}
+
+static const ag_dev_ops_t k_dev_ops = {
+    .ioctl = lcd_ioctl,
+};
 
 /* ---- bring-up ---------------------------------------------------------- */
 

@@ -18,6 +18,7 @@
 #include <argon/console.h>
 #include <argon/log.h>
 #include <argon/module.h>
+#include <argon/power.h>
 #include <argon/recovery.h>
 #include <argon/shell.h>
 
@@ -179,6 +180,7 @@ static const ag_stage_desc_t s_stages[AG_STAGE_COUNT] = {
     [AG_STAGE_MEMORY]     = {"memory",     NULL,           false},
     [AG_STAGE_LOG]        = {"log",        ag_log_init,    false},
     [AG_STAGE_BOARD]      = {"board",      ag_board_init,  false},
+    [AG_STAGE_POWER]      = {"power",      ag_powerctl_init, false},
     [AG_STAGE_CONSOLE]    = {"console",    stage_console,  true},
     [AG_STAGE_STORAGE]    = {"storage",    ag_storage_init, false},
     [AG_STAGE_CONFIG]     = {"config",     ag_sysconfig_init, false},

@@ -25,6 +25,11 @@ idf_component_register(
     # wherever the kernel includes them.
     REQUIRES argon_abi heap esp_timer freertos log esp_system esp_hw_support
              esp_common esp_psram
+             # the clock, for argon/port/power.h.  Present whether or not the
+             # build enables power management: with it off, esp_pm_configure
+             # is still there and still answers, which is how the port says
+             # this image cannot scale.
+             esp_pm
              # xtensa: the exception table fault_hw.c installs into
              xtensa
              # the serial ports everything talks over before there is anything else
