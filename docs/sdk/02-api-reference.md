@@ -70,12 +70,14 @@ if (AG_HAS(ag_api()->inp, key_pressed)) { ... }   /* есть ли вызов в
 | [`gfx`](#gfx--графика) | ✅ | soft RGB565 framebuffer; панели SPI — позже |
 | `cfg` | ⬜ `NULL` | доступ к `SYSTEM.CFG` из приложения |
 | `net` | ✅ 0.12, `resolve` 0.33 | TCP listen/accept/connect/send/recv, `set_nonblock`, `resolve` (имя или дотированный квартет в адрес). OpenEth в QEMU, Wi-Fi на плате; `ARGON_ENABLE_NET`. Что этим уже сделано в самой системе — [`10-network.md`](../10-network.md) |
+| `audio` | ✅ 0.14 | вывод PCM: `present`/`is_hw`/`open`/`close`/`write`/`space`. Встроенный `pcmnull`, I2S/virt через `.SYS` |
+| `ble` | ✅ 0.34, `NULL` без периферии | BLE для приложений, пока ровно столько, сколько нужно MIDI-контроллеру: `midi_advertise` (рекламировать плату как BLE-MIDI-устройство, радио поднимется само), `midi_send` (одно MIDI-сообщение статус+2 байта; `-AG_ENODEV`, пока никто не подключился), `midi_ready`, `adv_stop`. `NULL` без `CONFIG_ARGON_BLE_PERIPHERAL`. Общий GATT для приложений — позже |
 
 ## Версии и проверка возможностей
 
 ```c
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 10u
+#define AG_ABI_MINOR 34u
 ```
 
 * **minor + 1** — таблица выросла: новый вызов в конце подтаблицы, новая
