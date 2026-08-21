@@ -76,6 +76,15 @@ int  ag_console_vprintf(const char *fmt, va_list ap);
 bool ag_console_read_event(ag_event_t *ev, uint32_t timeout_ms);
 
 /*
+ * Milliseconds since anything arrived from a person - a key, a mouse report, a
+ * finger on a panel, a button on a pad.  What the idle timer in
+ * src/core/powerctl.c measures, and the only definition of "nobody is using
+ * this" the system has: output does not count, because a board printing to
+ * nobody is exactly the case worth saving power in.
+ */
+uint32_t ag_console_idle_ms(void);
+
+/*
  * Push an event into the console input queue (same path as VT decode).
  * Safe for POINTER, WHEEL, and KEY events from drivers.  Returns false if
  * not ready or the queue refused the event.

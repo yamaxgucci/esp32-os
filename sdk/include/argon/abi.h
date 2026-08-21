@@ -91,9 +91,14 @@ extern "C" {
  *      transition an application is told about before it happens.  With
  *      AG_IOC_DISPLAY_BACKLIGHT beside it, for the panel driver that owns the
  *      pin the light is on.
+ * 0.35 power: a transition now says who asked for it.  An automatic one is
+ *      advisory and harmless; one a person typed is an order, and a process
+ *      that does not answer that it is fit for the new mode is ended.
+ *      power->declare replaces power->hold, and the answer that used to veto
+ *      (HOLD) is now the admission that gets a process killed (UNFIT).
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 34u
+#define AG_ABI_MINOR 35u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -1274,20 +1279,30 @@ typedef struct ag_audio_api {
 /* ------------------------------------------------------------------------ */
 
 /*
- * ArgonOS does not save power behind an application's back.
+ * ArgonOS does not save power behind an application's back, and it does not let
+ * an application stop it either.  Which of those two matters more depends on
+ * who asked, so a transition carries that with it.
  *
- * The model is the one the rest of this system uses: the application owns the
- * machine, and the machine does not quietly change underneath it.  So a change
- * of mode happens in two steps - the system says what it is about to do, every
- * application that cares gets a moment to answer, and then it happens.  What
- * to do about it is the application's own decision: carry on more slowly, stop
- * what it was doing, or say that it cannot and let a person decide.
+ *   AG_POWER_AUTO - the system noticed nobody was using it.  Advisory: every
+ *                   application is told, nothing is required of any of them,
+ *                   and nothing is ended.  It also refuses to do the part that
+ *                   would break something - see AG_POWER_FIT_FULL_ONLY below -
+ *                   because saving power was never worth breaking work for.
  *
- * What an application must not be able to do is stop the machine saving power
- * for ever by not answering.  So the grace period is short, silence counts as
- * consent, and the one answer that does block - AG_POWER_HOLD - blocks a
- * command rather than the system: `power eco /force` overrides it, and says
- * whose hold it overrode.
+ *   AG_POWER_USER - a person typed it.  That is an order, not a proposal: an
+ *                   application has the grace period to answer that it is fit
+ *                   for the new mode, and one that does not is **ended**.
+ *
+ * The second rule sounds harsh and is the kind one.  The alternative is an
+ * application that goes on running at a third of the clock it was written for:
+ * an audio path that clicks, a controller that misses its deadline, a log with
+ * nothing in it to say why.  A process that is stopped, with a line in the
+ * journal naming it and its own reason, is a fault somebody can act on.
+ *
+ * So an application that means to survive `power eco` answers - which is one
+ * call in a loop it already has - or says once, with declare(), that any mode
+ * suits it.  An application that cannot work slowly says that instead, and is
+ * ended rather than left to misbehave.
  */
 
 typedef enum {
@@ -1297,11 +1312,34 @@ typedef enum {
 } ag_power_mode_t;
 
 typedef enum {
+    AG_POWER_AUTO = 0, /* the idle timer: advisory, kills nothing          */
+    AG_POWER_USER,     /* a person: mandatory, ends what cannot comply     */
+} ag_power_cause_t;
+
+typedef enum {
     AG_POWER_ANSWER_NONE = 0, /* has not answered this transition           */
-    AG_POWER_OK,              /* carrying on regardless                     */
-    AG_POWER_PARKED,          /* stopped whatever needed the clock          */
-    AG_POWER_HOLD,            /* cannot run like that; refuse unless forced */
+    AG_POWER_OK,              /* fit: carrying on                           */
+    AG_POWER_PARKED,          /* fit: stopped whatever needed the clock     */
+    AG_POWER_UNFIT,           /* not designed for it; end me instead        */
 } ag_power_answer_t;
+
+/*
+ * Said once instead of answered every time.  It survives until the process
+ * does, and it is what the two kinds of application that never poll should
+ * use: a tool that plainly does not care, and a realtime path that plainly
+ * does.
+ */
+typedef enum {
+    /* The default: I answer each transition myself.  On a transition a person
+     * asked for, no answer means not fit, and the process is ended. */
+    AG_POWER_FIT_ASK = 0,
+    /* Any mode suits me; stop asking.  Never ended for a mode change. */
+    AG_POWER_FIT_ANY,
+    /* I need the full clock.  An automatic transition then leaves the clock
+     * alone; one a person typed ends this process, and says whose reason it
+     * was. */
+    AG_POWER_FIT_FULL_ONLY,
+} ag_power_fitness_t;
 
 /*
  * Long enough for a sentence a person can act on ("22 kHz tract, 87% of a
@@ -1314,6 +1352,7 @@ typedef enum {
 typedef struct {
     uint8_t mode;    /* ag_power_mode_t - what the machine is now          */
     uint8_t pending; /* what it is about to be; == mode when nothing is    */
+    uint8_t cause;   /* ag_power_cause_t of the pending transition         */
     bool    screen_on;
     bool    pending_screen_on;
 
@@ -1338,9 +1377,9 @@ typedef struct {
 
     /*
      * Milliseconds left to answer, zero when nothing is pending.  An
-     * application polling once a frame has tens of frames to decide in; one
-     * that never polls at all keeps running exactly as it does today, and the
-     * transition happens without it.
+     * application polling once a frame has tens of frames to decide in.  On an
+     * AG_POWER_USER transition this is also how long it has to live if it does
+     * not answer.
      */
     uint32_t grace_ms;
 } ag_power_status_t;
@@ -1352,20 +1391,21 @@ typedef struct ag_power_api {
     ag_err_t (*status)(ag_power_status_t *out);
 
     /*
-     * Answer the pending transition.  `why` is for AG_POWER_HOLD and is what
+     * Answer the pending transition.  `why` is for AG_POWER_UNFIT and is what
      * the person at the console is shown; NULL otherwise.  -AG_ENOENT when
      * nothing is pending, which is the normal answer to a late poll.
      */
     ag_err_t (*answer)(ag_power_answer_t a, const char *why);
 
     /*
-     * A standing hold, for an application that would rather say once than
-     * answer every time - a realtime audio path is the case this exists for.
-     * It goes when the process does, like every other resource, so an
-     * application that crashes cannot leave the machine pinned at full speed
-     * for ever.
+     * A standing answer, for an application that would rather say once than
+     * answer every time.  `why` is shown by `power` and in the journal when a
+     * declaration of AG_POWER_FIT_FULL_ONLY costs this process its life.
+     *
+     * It goes when the process does, like every other resource, so a program
+     * that crashes cannot leave the machine pinned at full speed for ever.
      */
-    ag_err_t (*hold)(bool on, const char *why);
+    ag_err_t (*declare)(ag_power_fitness_t fitness, const char *why);
 } ag_power_api_t;
 
 /* ------------------------------------------------------------------------ */

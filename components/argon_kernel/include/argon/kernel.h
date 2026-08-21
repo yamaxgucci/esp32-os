@@ -28,10 +28,10 @@ typedef enum {
     AG_STAGE_MEMORY,       /* arenas, executable app-text arena          */
     AG_STAGE_LOG,          /* early log ring buffer                      */
     AG_STAGE_BOARD,        /* board pack selection, pin map              */
-    AG_STAGE_POWER,        /* the clock this machine has, and its modes   */
     AG_STAGE_CONSOLE,      /* virtual text screen + UART endpoint        */
     AG_STAGE_STORAGE,      /* littlefs /sys, ramfs /tmp                  */
     AG_STAGE_CONFIG,       /* SYSTEM.CFG                                 */
+    AG_STAGE_POWER,        /* the clock this machine has, and its modes   */
     AG_STAGE_DEVICES,      /* static drivers, device manager             */
     AG_STAGE_MEDIA,        /* SD card, FAT /sd                           */
     AG_STAGE_MODULES,      /* loadable .SYS drivers listed in the config */
