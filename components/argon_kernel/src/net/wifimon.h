@@ -26,22 +26,12 @@
 #include <argon/abi.h>
 
 /*
- * How much of each frame is kept.  A beacon's name lives in the first seventy
- * bytes or so (24 header + 12 fixed + the SSID tag), and the addresses that
- * identify any frame are in the first twenty-four - so a prefix this long is
- * everything the shell parses, at a fraction of the memory a full capture is.
+ * AG_WIFIMON_SNAP (how much of each frame is kept - a beacon's name lives in the
+ * first seventy bytes or so, and the addresses that identify any frame in the
+ * first twenty-four) and the AG_WIFIMON_C_* counter indices are the public ABI's
+ * (argon/abi.h) since 0.38, so the app-facing capture path and this one measure
+ * the same thing.
  */
-#define AG_WIFIMON_SNAP 128u
-
-/* Index into the counters array from ag_wifimon_counters(). */
-enum {
-    AG_WIFIMON_C_TOTAL = 0,
-    AG_WIFIMON_C_MGMT,
-    AG_WIFIMON_C_CTRL,
-    AG_WIFIMON_C_DATA,
-    AG_WIFIMON_C_MISC,
-    AG_WIFIMON_C_N
-};
 
 ag_err_t ag_wifimon_start(void);
 void     ag_wifimon_stop(void);

@@ -103,9 +103,20 @@ extern "C" {
  *      nothing else, taken by the system whenever no process has said it needs
  *      the full clock.  It renumbers ag_power_mode_t, which is why it is worth
  *      a line of its own: ECO and DOZE moved up by one.
+ * 0.38 radio, given to applications past the one thing BLE-MIDI already gave:
+ *      api->ble grows the general central and peripheral it always wrapped in
+ *      the shell - observe the air, connect to a device and read/write any
+ *      characteristic, or be a device a phone reads and writes (NULL entries
+ *      unless the build has CONFIG_ARGON_BLE_CENTRAL / _PERIPHERAL).  And a new
+ *      api->wifimon appears - promiscuous capture, channel, filter, and raw
+ *      802.11 injection - NULL unless CONFIG_ARGON_NET_WIFI_MON, which is off by
+ *      default: the frame-forging radio is a build-time choice, and the ABI slot
+ *      follows it.  Wi-Fi station/AP control and ESP-NOW stay shell-only on
+ *      purpose (see docs/04-roadmap.md): the link is the system's to raise, and
+ *      an application already has TCP, DNS and its own address over it.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 37u
+#define AG_ABI_MINOR 38u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -1286,11 +1297,70 @@ typedef struct ag_audio_api {
 /* ------------------------------------------------------------------------ */
 
 /*
- * Deliberately small: enough to be a BLE-MIDI controller, which is the first
- * application that wanted the radio.  The board becomes a MIDI device a phone
- * or PC connects to and plays; notes go out as the app sends them.  A general
- * GATT surface for applications is a later, larger job.
+ * BLE-MIDI was the first radio an application got (0.34), because a MIDI
+ * controller was the first application that wanted one.  0.38 gives it the rest,
+ * the same general central and peripheral the shell has driven and the board has
+ * proven end to end: observe what is in range, connect to a device and read or
+ * write any characteristic, or be a device a phone reads and writes.  The port
+ * carries all of it (argon/port/ble.h); this is the appended, feature-probed
+ * surface of it - entries are NULL where the build left a role out.
  */
+
+/* How much text a name, a UUID, or one characteristic value can be. */
+#define AG_BLE_NAME_MAX  31
+#define AG_BLE_UUIDS_MAX 6  /* 16-bit service UUIDs kept per advertised device */
+#define AG_BLE_UUID_STR  37 /* a UUID as text, 128-bit form + terminator       */
+#define AG_BLE_VAL_MAX   256 /* most of one characteristic value, bytes         */
+
+/* Characteristic properties, the bits GATT advertises about what you may do. */
+#define AG_BLE_PROP_READ   0x02
+#define AG_BLE_PROP_WNORSP 0x04 /* write without a response                    */
+#define AG_BLE_PROP_WRITE  0x08
+#define AG_BLE_PROP_NOTIFY 0x10
+#define AG_BLE_PROP_INDIC  0x20
+
+/* One discovered service: a range of handles and what it is. */
+typedef struct {
+    char     uuid[AG_BLE_UUID_STR];
+    uint16_t start; /* first handle of the service                             */
+    uint16_t end;   /* last handle of the service                              */
+} ag_ble_svc_t;
+
+/* One discovered characteristic.  `handle` is the value handle - the one
+ * read()/write() take, not the declaration. */
+typedef struct {
+    char     uuid[AG_BLE_UUID_STR];
+    uint16_t handle;
+    uint8_t  props; /* AG_BLE_PROP_* bitmask                                   */
+} ag_ble_chr_t;
+
+/*
+ * One device the observer saw, as much of it as the advertisement carried.  A
+ * field is zero when the advertisement did not have it: no name is an empty
+ * string, no appearance is 0, no manufacturer is company 0xffff.  addr_type is
+ * the port's own numbering; pass it back to connect() unchanged.
+ */
+typedef struct {
+    uint8_t  addr[6];
+    int      addr_type;
+    int8_t   rssi;
+    bool     connectable;
+    char     name[AG_BLE_NAME_MAX + 1];
+    uint16_t appearance;
+    uint8_t  flags;
+    uint8_t  n_uuids;
+    uint16_t uuids[AG_BLE_UUIDS_MAX];
+    uint16_t company;
+} ag_ble_dev_t;
+
+/* The peripheral's standing, from adv_status(). */
+typedef struct {
+    bool     advertising;
+    bool     connected; /* a client is connected right now                     */
+    uint32_t writes;    /* how many writes have arrived since adv_start        */
+    uint32_t read_len;  /* length of the value clients read                    */
+} ag_ble_adv_status_t;
+
 typedef struct ag_ble_api {
     uint32_t size;
 
@@ -1315,6 +1385,51 @@ typedef struct ag_ble_api {
 
     /* Stop advertising and drop any client. */
     ag_err_t (*adv_stop)(void);
+
+    /*
+     * ABI 0.38 - the peripheral, past MIDI: the board as a plain device a phone
+     * or PC connects to.  NULL unless the build has CONFIG_ARGON_BLE_PERIPHERAL.
+     * One custom service: a value clients read (adv_set_read sets it) and one
+     * they write (adv_last_write returns the most recent).  adv_start advertises
+     * connectably and forever - a client that leaves does not stop it - and
+     * starts the radio if it was off.
+     */
+    ag_err_t (*adv_start)(const char *name);
+    void     (*adv_set_read)(const void *data, uint32_t len);
+    int32_t  (*adv_last_write)(uint8_t *out, uint32_t max);
+    ag_err_t (*adv_status)(ag_ble_adv_status_t *out);
+
+    /*
+     * ABI 0.38 - the central: observe, then connect and talk.  NULL unless the
+     * build has CONFIG_ARGON_BLE_CENTRAL.  There is one radio, so one of these
+     * at a time: scan is -AG_EBUSY while connected, connect is -AG_EBUSY while
+     * scanning, and both are -AG_ENODEV with the radio off (scan/connect start
+     * it).  scan blocks for `seconds` (0 = a sensible default) - a scan is a
+     * listening window with nothing to return until it closes.
+     *
+     * connect blocks until the link is up or the attempt failed.  discover walks
+     * every service and characteristic into the tables services()/chars() read;
+     * it blocks a second or two on a device with many attributes.  read returns
+     * the bytes placed in `out` (truncated at the ATT MTU), write with
+     * with_response waits for the peer's acknowledgement - without, it returns
+     * once queued and a failure is silent, which is what "without a response"
+     * means.  A peer that drops the link is not hidden: connected() goes false
+     * and the next read/write is -AG_ENODEV.  Nothing here reconnects - the
+     * session is the application's to own.
+     */
+    ag_err_t (*scan)(ag_ble_dev_t *out, uint32_t max, uint32_t *found,
+                     uint32_t seconds);
+    ag_err_t (*connect)(const uint8_t addr[6], int addr_type,
+                        uint32_t timeout_ms);
+    ag_err_t (*disconnect)(void);
+    bool     (*connected)(void);
+    ag_err_t (*discover)(uint32_t timeout_ms);
+    uint32_t (*services)(ag_ble_svc_t *out, uint32_t max);
+    uint32_t (*chars)(ag_ble_chr_t *out, uint32_t max);
+    int32_t  (*read)(uint16_t handle, uint8_t *out, uint32_t max,
+                     uint32_t timeout_ms);
+    ag_err_t (*write)(uint16_t handle, const void *data, uint32_t len,
+                      bool with_response, uint32_t timeout_ms);
 } ag_ble_api_t;
 
 /* ------------------------------------------------------------------------ */
@@ -1481,6 +1596,91 @@ typedef struct ag_power_api {
 } ag_power_api_t;
 
 /* ------------------------------------------------------------------------ */
+/* wifimon - promiscuous capture and raw 802.11 injection (ABI 0.38)        */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * The radio on no network at all: turned to a channel, handing up every frame
+ * it carries, and putting frames of the application's own making into the air.
+ * This is the app-facing side of the same primitives the shell's `mon` uses -
+ * capture and inject, nothing that knows what a beacon or a deauth is.  What a
+ * frame means, and whether one ought to be sent, is the application's to decide,
+ * the way the shell decides it for a person.
+ *
+ * api->wifimon is NULL unless the build set CONFIG_ARGON_NET_WIFI_MON, which is
+ * off by default: a board that forges frames is a build-time choice, so the ABI
+ * slot is one too.  An application probes `if (ag_api()->wifimon)` and adapts.
+ */
+
+/* Which kinds of frame are handed up, a mask for filter(); they combine. */
+#define AG_WIFIMON_MGMT 0x1u /* beacons, probes, auth, deauth, assoc         */
+#define AG_WIFIMON_CTRL 0x2u /* RTS/CTS/ACK and the rest of the fabric       */
+#define AG_WIFIMON_DATA 0x4u /* the frames that actually carry something      */
+#define AG_WIFIMON_MISC 0x8u /* everything the radio could not classify       */
+#define AG_WIFIMON_ALL  0xfu
+
+#define AG_WIFIMON_TX_MAX 1500u /* the largest raw frame this layer injects    */
+#define AG_WIFIMON_SNAP   128u  /* how much of a frame recv() can hand back    */
+
+/* Index into the counters[] array from ag_wifimon_api_t.counters(). */
+enum {
+    AG_WIFIMON_C_TOTAL = 0,
+    AG_WIFIMON_C_MGMT,
+    AG_WIFIMON_C_CTRL,
+    AG_WIFIMON_C_DATA,
+    AG_WIFIMON_C_MISC,
+    AG_WIFIMON_C_N
+};
+
+/*
+ * What recv() reports about the frame it hands back, beside the bytes: how
+ * strong it was, which channel it came in on, and its real length on the air -
+ * which may be larger than the prefix recv() could copy (AG_WIFIMON_SNAP).
+ */
+typedef struct {
+    int8_t   rssi;
+    uint8_t  channel;
+    uint32_t length;
+} ag_wifimon_frame_t;
+
+typedef struct ag_wifimon_api {
+    uint32_t size;
+
+    /* Enter/leave promiscuous mode.  start() puts the radio on no network and
+     * needs it powered; a joined station leaves its network here. */
+    ag_err_t (*start)(void);
+    ag_err_t (*stop)(void);
+
+    /* The one channel the receiver hears; 1..14.  Sweep by setting each. */
+    ag_err_t (*channel)(uint8_t primary);
+    uint8_t  (*channel_get)(void);
+
+    /* Which frame types reach recv() at all; a mask of AG_WIFIMON_* bits. */
+    ag_err_t (*filter)(uint32_t mask);
+
+    /*
+     * Pop one captured frame into `buf` (up to `max`, at most AG_WIFIMON_SNAP
+     * bytes are kept per frame).  Returns the byte count, or -AG_EAGAIN when
+     * nothing arrived within timeout_ms (0 polls).  `meta`, when not NULL, gets
+     * the rssi/channel and the frame's real length.
+     */
+    int32_t (*recv)(void *buf, uint32_t max, ag_wifimon_frame_t *meta,
+                    uint32_t timeout_ms);
+
+    /*
+     * Put one raw frame on the current channel: a complete 802.11 frame without
+     * the trailing FCS, which the radio appends.  Returns when the frame is
+     * handed to the radio, not when anything received it.
+     */
+    ag_err_t (*tx_raw)(const void *frame, uint32_t len);
+
+    /* Running frame counts by type (AG_WIFIMON_C_* index it) and how many
+     * captured frames were dropped because the ring was full. */
+    void     (*counters)(uint32_t out[AG_WIFIMON_C_N]);
+    uint32_t (*dropped)(void);
+} ag_wifimon_api_t;
+
+/* ------------------------------------------------------------------------ */
 /* Root table                                                               */
 /* ------------------------------------------------------------------------ */
 
@@ -1515,6 +1715,10 @@ typedef struct ag_api {
 
     /* ABI 0.35+: the clock, the screen, and being told before they change. */
     const ag_power_api_t *power;
+
+    /* ABI 0.38+: promiscuous capture and raw 802.11 injection - NULL unless
+     * the build set CONFIG_ARGON_NET_WIFI_MON (off by default). */
+    const ag_wifimon_api_t *wifimon;
 } ag_api_t;
 
 /* ------------------------------------------------------------------------ */

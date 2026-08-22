@@ -40,8 +40,10 @@
 #include <argon/port/bt.h>
 #include <argon/port/time.h>
 #include <argon/port/task.h>
+#include <argon/port/wifi.h>
 
 #include "dev/io.h"
+#include "net/wifimon.h"
 
 /* ---------------------------------------------------------------------- */
 /* sys                                                                    */
@@ -909,20 +911,24 @@ static const ag_proc_api_t k_proc = {
  * application can then ask - if (ag_api()->net) - and adapt, which is what the
  * feature probing in the ABI is for.  gfx is live from 0.8 (soft framebuffer).
  */
-#if AG_PORT_HAS_BLE_PERIPH
+#if AG_PORT_HAS_BLE_PERIPH || AG_PORT_HAS_BLE_CENTRAL
 /*
- * BLE for applications, as much of it as a MIDI controller needs.  advertise
- * starts the radio if it was not already - an application should not have to
- * know that `bt on` is a separate step.
+ * BLE for applications.  Every entry that puts the radio on the air starts it
+ * first (ag_port_bt_start) and moves the bus where a radio needs it
+ * (ag_powerctl_bus_needed) - an application should not have to know that `bt on`
+ * is a separate step.  The rest are thin: the port carries the whole of it and
+ * the shell drives the same calls, so this is the append to the table that lets
+ * an .AXE reach what only the shell could before.  Entries a build left out
+ * (central or peripheral) stay NULL by designated-initialiser, and an
+ * application feature-probes with AG_HAS.
  */
+#if AG_PORT_HAS_BLE_PERIPH
 static ag_err_t api_ble_midi_advertise(const char *name)
 {
     const ag_err_t serr = ag_port_bt_start();
     if (serr != AG_OK) {
         return serr;
     }
-    /* An application can put the radio on the air without anybody
-     * typing anything; the bus has to be where a radio needs it first. */
     ag_powerctl_bus_needed();
     return ag_port_ble_midi_advertise(name);
 }
@@ -936,14 +942,193 @@ static bool api_ble_midi_ready(void) { return ag_port_ble_midi_ready(); }
 
 static ag_err_t api_ble_adv_stop(void) { return ag_port_ble_adv_stop(); }
 
+static ag_err_t api_ble_adv_start(const char *name)
+{
+    const ag_err_t serr = ag_port_bt_start();
+    if (serr != AG_OK) {
+        return serr;
+    }
+    ag_powerctl_bus_needed();
+    return ag_port_ble_adv_start(name);
+}
+
+static void api_ble_adv_set_read(const void *data, uint32_t len)
+{
+    ag_port_ble_adv_set_read(data, len);
+}
+
+static int32_t api_ble_adv_last_write(uint8_t *out, uint32_t max)
+{
+    return ag_port_ble_adv_last_write(out, max);
+}
+
+static ag_err_t api_ble_adv_status(ag_ble_adv_status_t *out)
+{
+    return ag_port_ble_adv_status(out);
+}
+#endif /* AG_PORT_HAS_BLE_PERIPH */
+
+#if AG_PORT_HAS_BLE_CENTRAL
+static ag_err_t api_ble_scan(ag_ble_dev_t *out, uint32_t max, uint32_t *found,
+                             uint32_t seconds)
+{
+    const ag_err_t serr = ag_port_bt_start();
+    if (serr != AG_OK) {
+        return serr;
+    }
+    ag_powerctl_bus_needed();
+    return ag_port_ble_scan(out, max, found, seconds);
+}
+
+static ag_err_t api_ble_connect(const uint8_t addr[6], int addr_type,
+                                uint32_t timeout_ms)
+{
+    const ag_err_t serr = ag_port_bt_start();
+    if (serr != AG_OK) {
+        return serr;
+    }
+    ag_powerctl_bus_needed();
+    return ag_port_ble_connect(addr, addr_type, timeout_ms);
+}
+
+static ag_err_t api_ble_disconnect(void) { return ag_port_ble_disconnect(); }
+static bool     api_ble_connected(void) { return ag_port_ble_connected(); }
+static ag_err_t api_ble_discover(uint32_t timeout_ms)
+{
+    return ag_port_ble_discover(timeout_ms);
+}
+static uint32_t api_ble_services(ag_ble_svc_t *out, uint32_t max)
+{
+    return ag_port_ble_services(out, max);
+}
+static uint32_t api_ble_chars(ag_ble_chr_t *out, uint32_t max)
+{
+    return ag_port_ble_chars(out, max);
+}
+static int32_t api_ble_read(uint16_t handle, uint8_t *out, uint32_t max,
+                            uint32_t timeout_ms)
+{
+    return ag_port_ble_read(handle, out, max, timeout_ms);
+}
+static ag_err_t api_ble_write(uint16_t handle, const void *data, uint32_t len,
+                              bool with_response, uint32_t timeout_ms)
+{
+    return ag_port_ble_write(handle, data, len, with_response, timeout_ms);
+}
+#endif /* AG_PORT_HAS_BLE_CENTRAL */
+
 static const ag_ble_api_t k_ble = {
     .size = sizeof(ag_ble_api_t),
+#if AG_PORT_HAS_BLE_PERIPH
     .midi_advertise = api_ble_midi_advertise,
     .midi_send = api_ble_midi_send,
     .midi_ready = api_ble_midi_ready,
     .adv_stop = api_ble_adv_stop,
+    .adv_start = api_ble_adv_start,
+    .adv_set_read = api_ble_adv_set_read,
+    .adv_last_write = api_ble_adv_last_write,
+    .adv_status = api_ble_adv_status,
+#endif
+#if AG_PORT_HAS_BLE_CENTRAL
+    .scan = api_ble_scan,
+    .connect = api_ble_connect,
+    .disconnect = api_ble_disconnect,
+    .connected = api_ble_connected,
+    .discover = api_ble_discover,
+    .services = api_ble_services,
+    .chars = api_ble_chars,
+    .read = api_ble_read,
+    .write = api_ble_write,
+#endif
 };
-#endif /* AG_PORT_HAS_BLE_PERIPH */
+#endif /* AG_PORT_HAS_BLE_PERIPH || AG_PORT_HAS_BLE_CENTRAL */
+
+#if AG_PORT_HAS_WIFIMON
+/*
+ * Monitor / raw injection for applications: the app-facing face of the same
+ * kernel ring and counters the shell's `mon` drains (src/net/wifimon.c).  recv
+ * waits up to timeout_ms for a frame rather than making every application write
+ * its own poll loop; everything else is a straight pass to the kernel layer,
+ * which is where the lock between the radio task and the caller already lives.
+ */
+static ag_err_t api_wm_start(void)
+{
+    ag_powerctl_bus_needed();
+    /*
+     * Promiscuous is a mode of a started radio, not a way to start one - so the
+     * radio has to be up first, exactly as the shell's `mon on` brings it up
+     * (src/shell/shell.c).  An application that only ever captures should not
+     * have to know that `wifi on` is a separate step.
+     */
+    ag_port_wifi_status_t st;
+    if (ag_port_wifi_status(&st) != AG_OK || st.state == AG_WIFI_OFF) {
+        const ag_err_t nerr = ag_net_init();
+        if (nerr != AG_OK) {
+            return nerr;
+        }
+    }
+    return ag_wifimon_start();
+}
+static ag_err_t api_wm_stop(void)
+{
+    ag_wifimon_stop();
+    return AG_OK;
+}
+static ag_err_t api_wm_channel(uint8_t primary)
+{
+    return ag_wifimon_channel(primary);
+}
+static uint8_t api_wm_channel_get(void) { return ag_wifimon_channel_get(); }
+static ag_err_t api_wm_filter(uint32_t mask) { return ag_wifimon_filter(mask); }
+
+static int32_t api_wm_recv(void *buf, uint32_t max, ag_wifimon_frame_t *meta,
+                           uint32_t timeout_ms)
+{
+    const int64_t until = (int64_t)ag_port_us() + (int64_t)timeout_ms * 1000;
+    for (;;) {
+        int8_t   rssi = 0;
+        uint8_t  channel = 0;
+        uint32_t full = 0;
+        uint32_t copied = 0;
+        if (ag_wifimon_drain(&rssi, &channel, &full, (uint8_t *)buf, max,
+                             &copied)) {
+            if (meta != NULL) {
+                meta->rssi = rssi;
+                meta->channel = channel;
+                meta->length = full;
+            }
+            return (int32_t)copied;
+        }
+        if ((int64_t)ag_port_us() >= until) {
+            return -AG_EAGAIN;
+        }
+        ag_port_task_delay(ag_port_ms_to_ticks(2));
+    }
+}
+
+static ag_err_t api_wm_tx(const void *frame, uint32_t len)
+{
+    return ag_wifimon_tx(frame, len);
+}
+static void api_wm_counters(uint32_t out[AG_WIFIMON_C_N])
+{
+    ag_wifimon_counters(out);
+}
+static uint32_t api_wm_dropped(void) { return ag_wifimon_dropped(); }
+
+static const ag_wifimon_api_t k_wifimon = {
+    .size = sizeof(ag_wifimon_api_t),
+    .start = api_wm_start,
+    .stop = api_wm_stop,
+    .channel = api_wm_channel,
+    .channel_get = api_wm_channel_get,
+    .filter = api_wm_filter,
+    .recv = api_wm_recv,
+    .tx_raw = api_wm_tx,
+    .counters = api_wm_counters,
+    .dropped = api_wm_dropped,
+};
+#endif /* AG_PORT_HAS_WIFIMON */
 
 static const ag_api_t k_api = {
     .size = sizeof(ag_api_t),
@@ -967,12 +1152,17 @@ static const ag_api_t k_api = {
     .net = NULL,
 #endif
     .audio = &ag_audio_api_table,
-#if AG_PORT_HAS_BLE_PERIPH
+#if AG_PORT_HAS_BLE_PERIPH || AG_PORT_HAS_BLE_CENTRAL
     .ble = &k_ble,
 #else
     .ble = NULL,
 #endif
     .power = &k_power,
+#if AG_PORT_HAS_WIFIMON
+    .wifimon = &k_wifimon,
+#else
+    .wifimon = NULL,
+#endif
 };
 
 const ag_api_t *ag_loader_api(void) { return &k_api; }

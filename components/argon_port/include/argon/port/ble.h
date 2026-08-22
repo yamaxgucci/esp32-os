@@ -85,50 +85,14 @@
 
 #include <argon/port/impl/ble.h>
 
-#define AG_BLE_NAME_MAX  31
-#define AG_BLE_UUIDS_MAX 6  /* 16-bit service UUIDs kept per device       */
-#define AG_BLE_UUID_STR  37 /* a UUID as text, 128-bit form + terminator  */
-#define AG_BLE_VAL_MAX   256 /* most of one characteristic value, bytes    */
-
-/* Characteristic properties, the bits GATT advertises about what you may do. */
-#define AG_BLE_PROP_READ   0x02
-#define AG_BLE_PROP_WNORSP 0x04 /* write without a response                */
-#define AG_BLE_PROP_WRITE  0x08
-#define AG_BLE_PROP_NOTIFY 0x10
-#define AG_BLE_PROP_INDIC  0x20
-
-/* One discovered service: a range of handles and what it is. */
-typedef struct {
-    char     uuid[AG_BLE_UUID_STR];
-    uint16_t start; /* first handle of the service                        */
-    uint16_t end;   /* last handle of the service                         */
-} ag_ble_svc_t;
-
-/* One discovered characteristic: the handle to read or write, and what it
- * allows.  `handle` is the value handle - the one read()/write() take. */
-typedef struct {
-    char     uuid[AG_BLE_UUID_STR];
-    uint16_t handle;
-    uint8_t  props; /* AG_BLE_PROP_* bitmask                               */
-} ag_ble_chr_t;
-
 /*
- * One device the observer saw, as much of it as the advertisement told.  A
- * field is zero when the advertisement did not carry it: no name is an empty
- * string, no appearance is 0, no manufacturer is company 0xffff.
+ * The observed-device, service and characteristic shapes, and the AG_BLE_*
+ * constants, are the public ABI's (argon/abi.h, included above) since 0.38 -
+ * an application talks GATT through the same structs the port fills.  The port
+ * keeps its historical name for the device record as an alias, so bt_hw.c and
+ * the shell need no change.
  */
-typedef struct {
-    uint8_t  addr[6];
-    int      addr_type;   /* the port's own numbering; pass back to connect() */
-    int8_t   rssi;
-    bool     connectable; /* the advertisement said you could connect          */
-    char     name[AG_BLE_NAME_MAX + 1];
-    uint16_t appearance;  /* BLE assigned-number appearance, 0 if absent        */
-    uint8_t  flags;       /* GAP advertising flags byte, 0 if absent            */
-    uint8_t  n_uuids;
-    uint16_t uuids[AG_BLE_UUIDS_MAX]; /* 16-bit service UUIDs advertised         */
-    uint16_t company;     /* manufacturer company id, 0xffff if none            */
-} ag_port_ble_dev_t;
+typedef ag_ble_dev_t ag_port_ble_dev_t;
 
 #if AG_PORT_HAS_BLE_CENTRAL
 
@@ -171,13 +135,11 @@ ag_err_t ag_port_ble_write(uint16_t handle, const void *data, uint32_t len,
  *   the board does with a write is the kernel's business, not the port's.
  * - One custom service, kept simple on purpose: this is "a phone can talk to
  *   the board", not a full profile.  A specific profile is a later, named job.
+ *
+ * The status shape is the public ABI's (ag_ble_adv_status_t, argon/abi.h) since
+ * 0.38; the port keeps its historical name as an alias.
  */
-typedef struct {
-    bool     advertising;
-    bool     connected;   /* a client is connected right now                 */
-    uint32_t writes;      /* how many writes have arrived since adv_start     */
-    uint32_t read_len;    /* length of the value clients read                 */
-} ag_port_ble_adv_status_t;
+typedef ag_ble_adv_status_t ag_port_ble_adv_status_t;
 
 #if AG_PORT_HAS_BLE_PERIPH
 

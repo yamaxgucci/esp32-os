@@ -64,14 +64,12 @@
 
 #include <argon/port/impl/wifimon.h>
 
-/* Which kinds of frame the driver hands up.  A mask; they combine. */
-#define AG_WIFIMON_MGMT 0x1u /* beacons, probes, auth, deauth, assoc     */
-#define AG_WIFIMON_CTRL 0x2u /* RTS/CTS/ACK and the rest of the fabric   */
-#define AG_WIFIMON_DATA 0x4u /* the frames that actually carry something */
-#define AG_WIFIMON_MISC 0x8u /* everything the radio could not classify  */
-#define AG_WIFIMON_ALL  0xfu
-
-#define AG_WIFIMON_TX_MAX 1500u /* a raw frame this layer will inject       */
+/*
+ * The frame-type mask bits (AG_WIFIMON_MGMT/CTRL/DATA/MISC/ALL) and
+ * AG_WIFIMON_TX_MAX are the public ABI's (argon/abi.h, included above) since
+ * 0.38 - an application filters and injects through the same numbers the port
+ * and shell use.
+ */
 
 /*
  * One captured frame: the whole 802.11 frame as it was on the air, plus the two
