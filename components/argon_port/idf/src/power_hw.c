@@ -22,6 +22,9 @@
 #include "esp_pm.h"
 #include "esp_private/esp_clk.h"
 
+#include <argon/port/bt.h>
+#include <argon/port/wifi.h>
+
 #if defined(CONFIG_ARGON_ENABLE_PM) && CONFIG_ARGON_ENABLE_PM
 #define AG_PM_BUILT 1
 #else
@@ -29,6 +32,14 @@
 #endif
 
 #define AG_CPU_MAX_MHZ CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ
+
+/* 40 on every part in this family, 26 on a few modules: whatever it is, it is
+ * the one setting where the peripheral bus moves with the processor. */
+#ifdef CONFIG_XTAL_FREQ
+#define AG_XTAL_MHZ CONFIG_XTAL_FREQ
+#else
+#define AG_XTAL_MHZ 40
+#endif
 
 #if AG_PM_BUILT
 static ag_err_t from_esp(esp_err_t err)
@@ -64,42 +75,110 @@ uint32_t ag_port_power_cpu_mhz(void)
 }
 
 /*
+ * Is a radio running?
+ *
+ * The one thing on this part that genuinely cannot live on a slower peripheral
+ * bus.  Everything else that divides off it - the panel, the card, I2C, the
+ * backlight's PWM - simply runs at half the rate and carries on; the radio has
+ * a hard requirement for 80 MHz, and giving it less is not a slower radio but a
+ * broken one, with nothing on the console to say so.
+ *
+ * Asked here rather than remembered above, because this is where the fact is.
+ */
+/*
+ * Off until an installation says otherwise: the step below the bus floor works
+ * as far as anybody has looked, and "as far as anybody has looked" is not the
+ * same as safe.  See ag_port_power_allow_crystal in the contract.
+ */
+static bool s_allow_crystal;
+
+void ag_port_power_allow_crystal(bool on) { s_allow_crystal = on; }
+
+static bool radio_on(void)
+{
+#if AG_PORT_HAS_WIFI
+    ag_port_wifi_status_t w;
+    if (ag_port_wifi_status(&w) == AG_OK && w.state != AG_WIFI_OFF) {
+        return true;
+    }
+#endif
+#if AG_PORT_HAS_BT
+    ag_port_bt_status_t b;
+    if (ag_port_bt_status(&b) == AG_OK && b.state != AG_BT_OFF) {
+        return true;
+    }
+#endif
+    return false;
+}
+
+/*
  * The clock tree of this family, not a range.  CPU_CLK comes off the PLL
- * divided by two, three or six - so the settings are 240, 160 and 80, and there
- * is nothing between them and nothing above them.  240 is the ceiling on both
- * the ESP32 and the S3: the PLL is 480 MHz and there is no divider of one for
- * the processor.  This part does not overclock, and a caller asking for 320 is
- * told -AG_EINVAL rather than given a number that looks like it worked.
+ * divided by two, three or six, or off the crystal directly - so the settings
+ * are 240, 160, 80 and 40, and there is nothing between them and nothing above
+ * them.  240 is the ceiling on both the ESP32 and the S3: the PLL is 480 MHz
+ * and there is no divider of one for the processor.  This part does not
+ * overclock, and a caller asking for 320 is told -AG_EINVAL rather than given a
+ * number that looks like it worked.
  *
- * The crystal - a fourth setting, 40 MHz - is deliberately not offered, and
- * that is a measurement rather than an opinion.  While the processor runs off
- * the PLL the peripheral bus stays at 80 MHz and every divider latched off it
- * still means what it meant; on the crystal the bus follows the processor down.
- * On the board (ESP32-2432S028R, 22 August 2026) `power eco 40` turned the
- * console into unreadable bytes inside one line and left it that way: the baud
- * rate was suddenly wrong, and a board that cannot be talked to cannot be told
- * to speed up again.  Only a reset came back.
+ * The crystal is the odd one and was nearly dropped.  While the processor runs
+ * off the PLL the peripheral bus stays at 80 MHz and every divider latched off
+ * it still means what it meant; on the crystal the bus follows the processor
+ * down.  On the board (22 August 2026) that turned the console into unreadable
+ * bytes inside one line and left it that way, because the serial port divides
+ * its baud rate out of that bus - and a board that cannot be talked to cannot
+ * be told to speed up again.
  *
- * It is not only the console - SPI and the card divide off the same bus - so
- * offering the step would mean reconfiguring every bus in the system on the way
- * down and on the way up.  That is a piece of work, not a constant, and until
- * somebody does it the honest list has three entries.
+ * That is fixed where it belonged: the console is now clocked from something
+ * that does not move (uart_hw.c).  What remains is a radio, which needs the bus
+ * at 80 and cannot be told otherwise, so the step is withheld while one is
+ * running rather than offered and then regretted.  Everything else on the bus
+ * gets slower and keeps working.
  */
 uint32_t ag_port_power_cpu_steps(uint16_t *out, uint32_t max)
 {
-    static const uint16_t k_steps[] = {240, 160, 80};
+    static const uint16_t k_steps[] = {240, 160, 80, AG_XTAL_MHZ};
+
+    const bool hold_bus = radio_on();
 
     uint32_t n = 0;
     for (unsigned i = 0; i < sizeof(k_steps) / sizeof(k_steps[0]); i++) {
-        if (k_steps[i] > (uint16_t)AG_CPU_MAX_MHZ) {
+        const uint16_t mhz = k_steps[i];
+        if (mhz > (uint16_t)AG_CPU_MAX_MHZ) {
             continue;
         }
+        if (mhz < 80u && (hold_bus || !s_allow_crystal)) {
+            continue; /* below the bus floor: asked for, and nothing on the
+                       * machine holding the bus where it is */
+        }
         if (out != NULL && n < max) {
-            out[n] = k_steps[i];
+            out[n] = mhz;
         }
         n++;
     }
     return n;
+}
+
+uint32_t ag_port_power_bus_floor_mhz(void)
+{
+    /*
+     * 80, and it is the same number on both parts in this family: CPU_CLK off
+     * the PLL at 240, 160 or 80 all leave APB_CLK at 80 MHz, and only the
+     * crystal setting takes it down with the processor.
+     */
+    return 80u;
+}
+
+const char *ag_port_power_note(void)
+{
+    if (!s_allow_crystal) {
+        return "40 MHz (the crystal) is off: it moves the peripheral bus, and "
+               "only the console has been made immune. [power] crystal = 1";
+    }
+    if (radio_on()) {
+        return "the radio holds the bus at 80 MHz; 40 is not offered while it "
+               "is on";
+    }
+    return NULL;
 }
 
 static bool is_step(uint32_t mhz)

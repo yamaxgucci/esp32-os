@@ -228,6 +228,14 @@ ag_err_t ag_powerctl_init(void)
     const char *when = ag_cfg_get(cfg, "power.cruise_when", "silence");
     s_auto.cruise_strict = (when != NULL) && (when[0] == 'd' || when[0] == 'D');
 
+    /*
+     * The one setting that moves the peripheral bus.  A key rather than a
+     * rebuild, so that trying it on a board is an edit and a reboot - and off
+     * by default, because what has been shown so far is that the console
+     * survives it, not that everything else does.
+     */
+    ag_port_power_allow_crystal(ag_cfg_get_bool(cfg, "power.crystal", false));
+
     s_last_demand_ms = 0u;
     return AG_OK;
 }
@@ -623,6 +631,43 @@ void ag_powerctl_declared(ag_power_fitness_t fitness)
         want.cpu_max_mhz = want.cpu_min_mhz;
         (void)apply_locked(&want, AG_POWER_AUTO, "a declaration", NULL, 0u,
                            NULL);
+    }
+    lock_give();
+}
+
+void ag_powerctl_bus_needed(void)
+{
+    /*
+     * Asked of the clock tree, not of the step list.  The list says what is
+     * safe *now*, and now the radio does not exist yet - the caller is one line
+     * away from starting it.  Sizing the raise from the list is how the first
+     * version of this quietly did nothing and let a radio come up on a 40 MHz
+     * bus, which is the failure it was written to prevent.
+     */
+    const uint32_t floor_mhz = ag_port_power_bus_floor_mhz();
+    if (floor_mhz == 0u) {
+        return;
+    }
+
+    if (!lock_take(AG_PORT_FOREVER)) {
+        return;
+    }
+
+    ag_power_target_t now;
+    ag_power_current(&now);
+    if (now.cpu_max_mhz < floor_mhz) {
+        ag_power_target_t want = now;
+        want.cpu_min_mhz = floor_mhz;
+        want.cpu_max_mhz = floor_mhz;
+        /* The mode is what the clock is: at the bus floor this is no longer
+         * eco, and calling it eco would be the printed frequency disagreeing
+         * with the printed name. */
+        want.mode = (floor_mhz >= cpu_max_mhz()) ? AG_POWER_FULL
+                                                 : AG_POWER_ECO;
+        ag_log(AG_LOG_WARN, "power",
+               "raising to %u MHz: something needs the peripheral bus",
+               (unsigned)floor_mhz);
+        (void)apply_locked(&want, AG_POWER_AUTO, "the bus", NULL, 0u, NULL);
     }
     lock_give();
 }

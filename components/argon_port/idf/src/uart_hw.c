@@ -49,7 +49,34 @@ static void fill(uart_config_t *out, const ag_port_uart_cfg_t *cfg)
     out->parity = k_parity[(cfg->parity <= 2) ? cfg->parity : 0];
     out->stop_bits = (cfg->stop_bits == 2) ? UART_STOP_BITS_2 : UART_STOP_BITS_1;
     out->flow_ctrl = UART_HW_FLOWCTRL_DISABLE;
+
+    /*
+     * Not the default clock, and this is the line that lets the processor slow
+     * down to the crystal.
+     *
+     * A UART divides its baud rate out of whatever it is clocked by.  The
+     * default is the peripheral bus, which on this family stays at 80 MHz while
+     * the processor runs off the PLL - and follows the processor down when it
+     * runs off the crystal.  A port set up for 115200 at 80 MHz then talks at
+     * half that, which arrives as unreadable bytes rather than as an error: on
+     * the board, `power eco 40` ended the conversation mid-line and only a reset
+     * brought it back.
+     *
+     * So the clock is chosen to be one that does not move.  On the S3 that is
+     * the crystal itself; on the ESP32 it is REF_TICK, a 1 MHz tick whose
+     * divider ESP-IDF re-programs on every frequency change for exactly this
+     * reason.  REF_TICK cannot divide down to fast baud rates, so anything
+     * above 115200 keeps the bus clock and keeps the old limitation with it -
+     * a file transfer at 921600 is not a thing to do at 40 MHz anyway.
+     */
+#if SOC_UART_SUPPORT_XTAL_CLK
+    out->source_clk = UART_SCLK_XTAL;
+#elif SOC_UART_SUPPORT_REF_TICK
+    out->source_clk =
+        (cfg->baud <= 115200u) ? UART_SCLK_REF_TICK : UART_SCLK_APB;
+#else
     out->source_clk = UART_SCLK_DEFAULT;
+#endif
 }
 
 ag_err_t ag_port_uart_open(int port, const ag_port_uart_cfg_t *cfg,

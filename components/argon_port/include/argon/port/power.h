@@ -13,6 +13,9 @@
  *   uint32_t ag_port_power_caps(void)
  *   uint32_t ag_port_power_cpu_mhz(void)
  *   uint32_t ag_port_power_cpu_steps(uint16_t *out, uint32_t max)
+ *   const char *ag_port_power_note(void)
+ *   uint32_t ag_port_power_bus_floor_mhz(void)
+ *   void ag_port_power_allow_crystal(bool on)
  *   ag_err_t ag_port_power_cpu_band(uint32_t min_mhz, uint32_t max_mhz)
  *
  * A port that cannot move its clock says so with caps() == 0 and answers
@@ -28,6 +31,12 @@
  *   megahertz, highest first, and returns how many there are - which may be
  *   more than `max`.  out[0] is the maximum, and on a part whose clock is
  *   fixed it is the only entry.
+ *
+ *   "Actually accept" means now, not in principle: the list may be shorter
+ *   while something on the machine needs the peripheral bus where it is.  A
+ *   caller that cached it would offer a setting that has since become a way to
+ *   break a radio, so nothing caches it - it is three comparisons.  note() says
+ *   in one line what is being withheld and why, or NULL when nothing is.
  *
  * - band() takes two of those numbers and nothing else.  A value that is not
  *   in the list is -AG_EINVAL rather than the nearest one that would have
@@ -53,11 +62,13 @@
  *   A port must not offer a step it cannot keep the console readable across - a
  *   system that cannot be talked to cannot be told to speed up again.
  *
- *   This is not hypothetical.  The ESP-IDF port offers 240, 160 and 80, where
- *   the bus stays where it is, and does not offer the crystal, where it does
- *   not: on the board that step ended the conversation mid-line and only a
- *   reset brought it back.  The list is the port's promise about what survives,
- *   not an inventory of what the silicon can be set to.
+ *   This is not hypothetical, and it is what the console has to be immune to
+ *   before the lowest step can be offered at all.  On the ESP-IDF port the
+ *   serial ports are clocked from something the processor's frequency does not
+ *   move, which is why that port offers the crystal step - and withholds it
+ *   while a radio is running, because a radio cannot be given a slower bus.
+ *   The list is the port's promise about what survives, not an inventory of
+ *   what the silicon can be set to.
  *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
@@ -88,5 +99,39 @@ uint32_t ag_port_power_cpu_mhz(void);
 uint32_t ag_port_power_cpu_steps(uint16_t *out, uint32_t max);
 
 ag_err_t ag_port_power_cpu_band(uint32_t min_mhz, uint32_t max_mhz);
+
+/* One line about what this machine is holding back right now, or NULL. */
+const char *ag_port_power_note(void);
+
+/*
+ * Offer the step below the bus floor, or stop offering it.
+ *
+ * There is exactly one such step on this family - the crystal - and it is the
+ * one where the peripheral bus follows the processor down.  The console was
+ * made immune to that (see uart_hw.c) and a session at 40 MHz then read
+ * perfectly on the board; what has not been shown is the rest of the machine,
+ * and the board wedged twice in that neighbourhood, once while starting a radio
+ * on the slowed bus and once with the console going deaf after the switch.
+ *
+ * So it is off unless somebody asks for it: `[power] crystal = 1` in
+ * SYSTEM.CFG, which is a decision an installation makes with a meter and a
+ * board in front of it, not a default.  Off is not "unsupported" - everything
+ * around it is written and tested - it is "not yet shown to be harmless".
+ */
+void ag_port_power_allow_crystal(bool on);
+
+/*
+ * The lowest setting at which the peripheral bus still runs at the rate it has
+ * at full speed - and therefore the lowest one at which everything that divides
+ * off that bus keeps meaning what it meant.  Zero on a machine where the bus
+ * never follows the processor.
+ *
+ * It is a fact about the clock tree, not about what is running: a caller asks
+ * it *before* starting something that cannot take a slower bus, when the answer
+ * cannot yet be deduced from anything else.  That is the whole reason it is
+ * separate from steps(), which reports what is safe right now and therefore
+ * still lists the low step until the radio actually exists.
+ */
+uint32_t ag_port_power_bus_floor_mhz(void);
 
 #endif /* ARGON_PORT_POWER_H */

@@ -159,6 +159,19 @@ static int status(void)
     }
     ag_console_puts(" MHz\n");
 
+    /*
+     * What the machine is holding back, in its own words.  The list above is
+     * what it accepts right now, and a step that has quietly gone missing is
+     * exactly the kind of thing a person should be told rather than left to
+     * notice.
+     */
+    {
+        const char *note = ag_port_power_note();
+        if (note != NULL) {
+            ag_console_printf("  held back: %s\n", note);
+        }
+    }
+
     if (!ag_powerctl_can_scale()) {
         /*
          * Said plainly, because everything else here works without it and the

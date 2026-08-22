@@ -292,6 +292,19 @@ uint32_t ag_powerctl_cruise_default(void);
  */
 void ag_powerctl_declared(ag_power_fitness_t fitness);
 
+/*
+ * Something that cannot live on a slowed peripheral bus is about to start - a
+ * radio is the case this exists for.  Raises the clock to where the bus is
+ * fixed, before it does, and does nothing when it is already there.
+ *
+ * It overrides a person's `power eco 40` and that is deliberate: the choice is
+ * between undoing a setting, visibly and in the journal, and a radio that
+ * receives nothing while everything on the console looks healthy.  The step is
+ * withheld from the list in the other direction too, so this only fires for a
+ * machine that was already down there when the radio was asked for.
+ */
+void ag_powerctl_bus_needed(void);
+
 /* Whether the clock can be moved at all in this build. */
 bool ag_powerctl_can_scale(void);
 
