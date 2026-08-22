@@ -15,6 +15,7 @@
 
 #include <argon/log.h>
 #include <argon/net.h>
+#include <argon/power.h>
 #include <argon/netmsg.h>
 
 #include <argon/port/net.h>
@@ -113,6 +114,10 @@ static void on_ready(uint32_t addr, uint32_t mask, uint32_t gw)
 
 ag_err_t ag_net_init(void)
 {
+    /* Before anything else: a radio on a bus somebody slowed down receives
+     * nothing, and looks healthy doing it. */
+    ag_powerctl_bus_needed();
+
     /*
      * Callable more than once, because on a board with a radio the network is
      * not only started at boot: it is turned on and off from the shell, since

@@ -22,6 +22,7 @@
 #include <argon/input.h>
 #include <argon/keys.h>
 #include <argon/log.h>
+#include <argon/power.h>
 #include <argon/netmsg.h>
 #include <argon/net.h>
 #include <argon/vfs.h>
@@ -363,6 +364,7 @@ ag_err_t ag_devices_init(void)
      */
     const char *kbd = ag_cfg_get(ag_sysconfig(), "bt.keyboard", NULL);
     if (kbd != NULL && kbd[0] != '\0') {
+        ag_powerctl_bus_needed();
         const ag_err_t bterr = ag_port_bt_start();
         if (bterr != AG_OK) {
             ag_log(AG_LOG_WARN, "bt", "radio did not start (%d)", (int)bterr);

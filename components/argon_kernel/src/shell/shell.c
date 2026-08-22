@@ -26,6 +26,7 @@
 #include <argon/netmsg.h>
 #include <argon/path.h>
 #include <argon/probe.h>
+#include <argon/power.h>
 #include <argon/proc.h>
 #include <argon/recovery.h>
 #include <argon/shell_path.h>
@@ -2185,6 +2186,7 @@ static int cmd_bt(int argc, char **argv)
     }
 
     if (ag_path_icmp(argv[1], "on") == 0) {
+        ag_powerctl_bus_needed();
         const ag_err_t err = ag_port_bt_start();
         if (err != AG_OK) {
             ag_console_printf("bt on: %s\n",
@@ -2210,6 +2212,7 @@ static int cmd_bt(int argc, char **argv)
         if (ag_port_bt_status(&st) == AG_OK && st.state == AG_BT_OFF) {
             /* Starting it here rather than refusing: `bt scan` on a board with
              * the radio off is a request for the radio, not a mistake. */
+            ag_powerctl_bus_needed();
             const ag_err_t serr = ag_port_bt_start();
             if (serr != AG_OK) {
                 ag_console_printf("bt: %s\n",
