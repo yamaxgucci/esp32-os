@@ -139,7 +139,7 @@ PSRAM, из неё живут данные приложений. `largest` — �
 ```
 C:\>power
 power: full, cpu 240 MHz (pinned 240), screen on
-  steps: 240 160 80 40 MHz
+  steps: 240 160 80 MHz
   idle timer: off (`power auto on`)
   applications:
     pid 1   AMP          needs the full clock - 22 kHz tract

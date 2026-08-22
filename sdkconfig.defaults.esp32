@@ -21,6 +21,17 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_4mb.csv"
 
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 
+# Frequency scaling, and this is the target where it belongs: the only one that
+# links with it (the S3 image overflows its data segment by about a kilobyte),
+# the only one with a battery connector on it, and the only one where the
+# milliamps can be measured at all.
+#
+# Verified on the board 22 August 2026: the machine cruises to 160 MHz by
+# itself at the prompt, `power eco` reaches 80, `esp_clk_cpu_freq` reports each
+# of them, and the console survives every step - which is why the port offers
+# 240/160/80 and not the crystal.  See docs/11-power.md.
+CONFIG_ARGON_ENABLE_PM=y
+
 # The code arena is instruction RAM, and on this chip that is SRAM0: 128 KB in
 # total, shared with every IRAM-resident routine ESP-IDF puts there.  192 KB
 # (the S3 figure) does not exist here at all.
