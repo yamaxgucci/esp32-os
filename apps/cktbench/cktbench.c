@@ -1054,6 +1054,15 @@ static uint32_t arg_u(int argc, char **argv, int idx, uint32_t def)
 
 int ag_main(int argc, char **argv)
 {
+    /*
+     * The system cruises at a lower clock while nothing says otherwise.  A
+     * benchmark must never be that quiet exception: a number measured at two
+     * thirds of the clock is not a slower number, it is a wrong one, and it
+     * ends up written down in a document.
+     */
+    (void)ag_power_declare(AG_POWER_FIT_FULL_ONLY,
+                           "a benchmark, not a workload");
+
     const char *mode = argc > 1 ? argv[1] : "prim";
     int         rc = 0;
 

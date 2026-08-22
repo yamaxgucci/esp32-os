@@ -311,6 +311,15 @@ static void report(const char *tag, uint32_t frames, uint64_t span_us,
 
 int ag_main(int argc, char **argv)
 {
+    /*
+     * The system cruises at a lower clock while nothing says otherwise.  A
+     * benchmark must never be that quiet exception: a number measured at two
+     * thirds of the clock is not a slower number, it is a wrong one, and it
+     * ends up written down in a document.
+     */
+    (void)ag_power_declare(AG_POWER_FIT_FULL_ONLY,
+                           "a benchmark, not a workload");
+
     ag_gfxinfo_t gi;
     gfxbench_layout_t lay;
     gfxbench_state_t st;

@@ -96,9 +96,13 @@ extern "C" {
  *      that does not answer that it is fit for the new mode is ended.
  *      power->declare replaces power->hold, and the answer that used to veto
  *      (HOLD) is now the admission that gets a process killed (UNFIT).
+ * 0.36 power: AG_POWER_CRUISE, a step down that costs a third of the speed and
+ *      nothing else, taken by the system whenever no process has said it needs
+ *      the full clock.  It renumbers ag_power_mode_t, which is why it is worth
+ *      a line of its own: ECO and DOZE moved up by one.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 35u
+#define AG_ABI_MINOR 36u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -1305,10 +1309,33 @@ typedef struct ag_audio_api {
  * ended rather than left to misbehave.
  */
 
+/*
+ * The ladder, and how much of the machine each rung gives up.  Ordered: a
+ * larger value is less machine, and the system compares them that way.
+ *
+ * The first step down is different in kind from the rest, and the difference is
+ * what makes it automatic.  On this family the processor runs from the PLL at
+ * 240, 160 or 80 MHz, and the peripheral bus stays at 80 MHz through all three:
+ * dropping to 160 changes how fast arithmetic happens and nothing else - no
+ * bus, no baud rate, no divider anywhere.  It costs a third of the speed, and
+ * what it can break is only work that was already close to the edge.
+ *
+ * So AG_POWER_CRUISE is taken on silence: unless some process has said it needs
+ * the full clock, the system assumes two thirds of it will do.  The lower rungs
+ * keep the opposite rule - there, silence is not consent and a person's command
+ * ends what has not answered - because a third of the clock is a different
+ * proposition, and because those rungs are only reached deliberately or after
+ * minutes of nobody touching the machine.
+ *
+ * A system that would rather be asked than assume can invert the first rule
+ * with [power] cruise_when = declared in SYSTEM.CFG, and then only processes
+ * that declared AG_POWER_FIT_ANY let the machine cruise.
+ */
 typedef enum {
     AG_POWER_FULL = 0, /* the clock at its maximum, the screen lit         */
-    AG_POWER_ECO,      /* the clock pinned lower                           */
-    AG_POWER_DOZE,     /* the clock pinned lower and the screen dark       */
+    AG_POWER_CRUISE,   /* a step down nobody objected to; 160 MHz here     */
+    AG_POWER_ECO,      /* the clock pinned low                             */
+    AG_POWER_DOZE,     /* the clock pinned low and the screen dark         */
 } ag_power_mode_t;
 
 typedef enum {
@@ -1401,6 +1428,12 @@ typedef struct ag_power_api {
      * A standing answer, for an application that would rather say once than
      * answer every time.  `why` is shown by `power` and in the journal when a
      * declaration of AG_POWER_FIT_FULL_ONLY costs this process its life.
+     *
+     * AG_POWER_FIT_FULL_ONLY takes effect before this call returns: if the
+     * system was cruising, the clock is back at its maximum by the time the
+     * application does anything else.  That is the point of declaring it in the
+     * first line of main rather than answering later - the first buffer is as
+     * real as the thousandth.
      *
      * It goes when the process does, like every other resource, so a program
      * that crashes cannot leave the machine pinned at full speed for ever.

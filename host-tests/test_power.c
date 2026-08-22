@@ -461,6 +461,67 @@ static void test_answer_without_polling(void)
     AG_CHECK(ag_power_fit(APP_B));
 }
 
+/*
+ * The ladder is compared with < and >, in the sweep and in the tick, so the
+ * order of these four is load-bearing rather than cosmetic.
+ */
+static void test_ladder_order(void)
+{
+    AG_CHECK(AG_POWER_FULL < AG_POWER_CRUISE);
+    AG_CHECK(AG_POWER_CRUISE < AG_POWER_ECO);
+    AG_CHECK(AG_POWER_ECO < AG_POWER_DOZE);
+}
+
+/*
+ * The distinction the first rung rests on: refusing out loud is not the same as
+ * saying nothing.  Cruising is entered on silence, so only an explicit refusal
+ * may end a process there - while lower down, everything unproven goes.
+ */
+static void test_refusal_is_not_silence(void)
+{
+    setup();
+    poll_at(APP_A, 1000); /* listening, will say nothing */
+    AG_CHECK_INT(ag_power_declare(APP_B, AG_POWER_FIT_FULL_ONLY, "22 kHz"),
+                 AG_OK);
+
+    const ag_power_target_t want = target(AG_POWER_CRUISE, 160u, true);
+    AG_CHECK_INT(ag_power_begin(&want, AG_POWER_USER, 1000, 0), AG_OK);
+    AG_CHECK_INT(ag_power_commit(NULL), AG_OK);
+
+    /* Neither is fit... */
+    AG_CHECK(!ag_power_fit(APP_A));
+    AG_CHECK(!ag_power_fit(APP_B));
+    /* ...but only one of them said so. */
+    AG_CHECK(!ag_power_refused(APP_A));
+    AG_CHECK(ag_power_refused(APP_B));
+    AG_CHECK_STR(ag_power_why(APP_B), "22 kHz");
+
+    /* An answer of UNFIT is a refusal too, for the one transition it answers. */
+    const ag_power_target_t eco = eco_target();
+    AG_CHECK_INT(ag_power_begin(&eco, AG_POWER_USER, 2000, 0), AG_OK);
+    AG_CHECK_INT(ag_power_reply(APP_A, AG_POWER_UNFIT, "mid-render"), AG_OK);
+    AG_CHECK_INT(ag_power_commit(NULL), AG_OK);
+    AG_CHECK(ag_power_refused(APP_A));
+
+    /* A process nobody has heard of refuses nothing: it is silent, not
+     * unwilling, and on the mild rung that is the difference between living
+     * and not. */
+    AG_CHECK(!ag_power_refused((ag_pid_t)7));
+    AG_CHECK_INT(ag_power_fitness_of((ag_pid_t)7), AG_POWER_FIT_ASK);
+}
+
+/* Saying "any mode suits me" is neither a refusal nor a demand. */
+static void test_fit_any_is_not_a_demand(void)
+{
+    setup();
+    AG_CHECK_INT(ag_power_declare(APP_A, AG_POWER_FIT_ANY, "nothing to decide"),
+                 AG_OK);
+    AG_CHECK_INT(ag_power_fitness_of(APP_A), AG_POWER_FIT_ANY);
+    AG_CHECK(!ag_power_refused(APP_A));
+    AG_CHECK(!ag_power_full_only_held());
+    AG_CHECK(ag_power_fit(APP_A));
+}
+
 void run_power_tests(void)
 {
     test_starts_at_full();
@@ -482,4 +543,7 @@ void run_power_tests(void)
     test_rejects_nonsense();
     test_millisecond_wrap();
     test_answer_without_polling();
+    test_ladder_order();
+    test_refusal_is_not_silence();
+    test_fit_any_is_not_a_demand();
 }

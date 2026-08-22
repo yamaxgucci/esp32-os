@@ -865,7 +865,16 @@ static ag_err_t api_power_answer(ag_power_answer_t a, const char *why)
 
 static ag_err_t api_power_declare(ag_power_fitness_t fitness, const char *why)
 {
-    return ag_power_declare(ag_proc_self(), fitness, why);
+    const ag_err_t err = ag_power_declare(ag_proc_self(), fitness, why);
+    if (err == AG_OK) {
+        /*
+         * "I need the full clock" has to be true by the time this returns, not
+         * by the next tick: the first buffer an audio path fills is as real as
+         * the thousandth.
+         */
+        ag_powerctl_declared(fitness);
+    }
+    return err;
 }
 
 static const ag_power_api_t k_power = {

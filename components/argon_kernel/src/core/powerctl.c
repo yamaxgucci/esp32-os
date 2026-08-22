@@ -46,6 +46,14 @@
 #define AG_POWER_AUTO_SCREEN_S 60
 #define AG_POWER_AUTO_ECO_S 300
 
+/*
+ * How long after the last process needed the full clock before the machine
+ * cruises again.  Five seconds is hysteresis, not politeness: a `.bat` that
+ * starts one program after another would otherwise flap between two clock
+ * settings, announcing each one, and the announcing is the expensive part.
+ */
+#define AG_POWER_CRUISE_S 5
+
 static bool            s_backlight_ok;
 static ag_power_auto_t s_auto;
 
@@ -73,6 +81,14 @@ static ag_port_mutex_t s_lock;
  */
 static bool s_auto_owns;
 
+/*
+ * When something last needed the full clock.  Read against AG_POWER_CRUISE_S;
+ * zero at boot means the machine starts cruising once that hold-off has passed
+ * since it came up, which is also the right answer - nothing has asked for
+ * anything yet.
+ */
+static uint32_t s_last_demand_ms;
+
 static uint32_t now_ms(void) { return (uint32_t)(ag_port_us() / 1000); }
 
 /* NULL means the mutex could not be made: carry on unserialised rather than
@@ -92,10 +108,11 @@ static void lock_give(void)
 static const char *mode_name(ag_power_mode_t m)
 {
     switch (m) {
-    case AG_POWER_FULL: return "full";
-    case AG_POWER_ECO:  return "eco";
-    case AG_POWER_DOZE: return "doze";
-    default:            return "?";
+    case AG_POWER_FULL:   return "full";
+    case AG_POWER_CRUISE: return "cruise";
+    case AG_POWER_ECO:    return "eco";
+    case AG_POWER_DOZE:   return "doze";
+    default:              return "?";
     }
 }
 
@@ -151,6 +168,20 @@ uint32_t ag_powerctl_eco_default(void)
     return (uint32_t)steps[last - 1];
 }
 
+uint32_t ag_powerctl_cruise_default(void)
+{
+    uint16_t       steps[AG_PORT_PWR_STEPS_MAX];
+    const uint32_t n = ag_port_power_cpu_steps(steps, AG_PORT_PWR_STEPS_MAX);
+    for (uint32_t i = 0; i < n && i < AG_PORT_PWR_STEPS_MAX; i++) {
+        if (steps[i] == 160u) {
+            return 160u;
+        }
+    }
+    /* No middle step: cruising would mean either full speed or a third of it,
+     * and a third of it is a decision, not a default. */
+    return 0u;
+}
+
 ag_err_t ag_powerctl_init(void)
 {
     if (s_lock == NULL) {
@@ -181,6 +212,23 @@ ag_err_t ag_powerctl_init(void)
         (uint32_t)ag_cfg_get_int(cfg, "power.eco_s", AG_POWER_AUTO_ECO_S);
     s_auto.eco_mhz = (uint32_t)ag_cfg_get_int(cfg, "power.eco_mhz",
                                               (int32_t)ag_powerctl_eco_default());
+
+    s_auto.cruise_mhz = (uint32_t)ag_cfg_get_int(
+        cfg, "power.cruise_mhz", (int32_t)ag_powerctl_cruise_default());
+    s_auto.cruise_s =
+        (uint32_t)ag_cfg_get_int(cfg, "power.cruise_s", AG_POWER_CRUISE_S);
+
+    /*
+     * `silence` is the default, and it is the whole point of this rung: a
+     * process that has said nothing is assumed to manage at 160 MHz, because
+     * two thirds of the speed and an unchanged peripheral bus break only work
+     * that was already at the edge.  `declared` inverts it for an installation
+     * that runs images it did not build.
+     */
+    const char *when = ag_cfg_get(cfg, "power.cruise_when", "silence");
+    s_auto.cruise_strict = (when != NULL) && (when[0] == 'd' || when[0] == 'D');
+
+    s_last_demand_ms = 0u;
     return AG_OK;
 }
 
@@ -300,7 +348,8 @@ static bool same_target(const ag_power_target_t *a, const ag_power_target_t *b)
  * The pids are collected before anything is killed: ag_proc_info walks used
  * slots, and ending one while walking would renumber the rest.
  */
-static uint32_t sweep(ag_power_mode_t mode, ag_power_ended_t *out, uint32_t max)
+static uint32_t sweep(ag_power_mode_t mode, bool refusers_only,
+                     ag_power_ended_t *out, uint32_t max)
 {
     ag_power_ended_t victims[AG_PROC_MAX];
     uint32_t         n = 0;
@@ -310,7 +359,19 @@ static uint32_t sweep(ag_power_mode_t mode, ag_power_ended_t *out, uint32_t max)
         if (ag_proc_info(i, &info) != AG_OK) {
             break;
         }
-        if (info.pid == AG_PID_KERNEL || ag_power_fit(info.pid)) {
+        if (info.pid == AG_PID_KERNEL) {
+            continue;
+        }
+        /*
+         * On the mild rung only an explicit refusal counts, because that rung
+         * is entered on silence in the first place: ending a process for not
+         * answering a question the system had already decided to answer on its
+         * behalf would be incoherent.  Lower down, silence is not consent and
+         * anything unproven goes.
+         */
+        const bool doomed = refusers_only ? ag_power_refused(info.pid)
+                                          : !ag_power_fit(info.pid);
+        if (!doomed) {
             continue;
         }
         /*
@@ -436,7 +497,7 @@ static ag_err_t apply_locked(const ag_power_target_t *want,
 
     uint32_t gone = 0;
     if (cause == AG_POWER_USER && applied.mode > prev.mode) {
-        gone = sweep(applied.mode, ended, max);
+        gone = sweep(applied.mode, applied.mode == AG_POWER_CRUISE, ended, max);
         if (n_ended != NULL) {
             *n_ended = gone;
         }
@@ -491,14 +552,76 @@ ag_err_t ag_powerctl_apply(const ag_power_target_t *want,
 
 /* ---------------------------------------------------------------------- */
 
-void ag_powerctl_tick(void)
+/*
+ * Is anything running that needs the full clock?
+ *
+ * Two readings of the same question, and which one is in force is an
+ * installation's decision (`[power] cruise_when`).
+ *
+ * `silence` - the default - asks only whether somebody has said so.  Nothing
+ * said means nothing needed: on this rung that is a safe assumption, because
+ * two thirds of the clock with an unmoved peripheral bus breaks only work that
+ * was already at the edge, and the handful of programs in this tree that are
+ * (the audio paths, the emulators, the benchmarks) say so in their first line.
+ *
+ * `declared` is for a machine running images somebody else built: there, only a
+ * process that declared AG_POWER_FIT_ANY lets the clock down, and an unknown
+ * image keeps the machine at full speed until it says otherwise.
+ */
+static bool demands_full(void)
 {
-    if (!s_auto.on) {
+    if (!s_auto.cruise_strict) {
+        return ag_power_full_only_held();
+    }
+
+    for (uint32_t i = 0; i < AG_PROC_MAX; i++) {
+        ag_procinfo_t info;
+        if (ag_proc_info(i, &info) != AG_OK) {
+            break;
+        }
+        if (info.pid == AG_PID_KERNEL || info.state == AG_PS_ZOMBIE) {
+            continue;
+        }
+        if (ag_power_fitness_of(info.pid) != AG_POWER_FIT_ANY) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void ag_powerctl_declared(ag_power_fitness_t fitness)
+{
+    if (fitness != AG_POWER_FIT_FULL_ONLY) {
         return;
     }
     /*
-     * Nought ticks: a command in flight means somebody is at the console
-     * deciding this by hand, and the next tick is a quarter of a second away.
+     * Not waiting for the lock: a transition already in flight will read the
+     * declaration when it decides, and the tick after it will see the hold-off.
+     * Blocking an application inside a declaration to wait for the shell is a
+     * worse trade than a quarter of a second at the wrong clock.
+     */
+    if (!lock_take(0)) {
+        return;
+    }
+    s_last_demand_ms = now_ms();
+
+    ag_power_target_t now;
+    ag_power_current(&now);
+    if (s_auto_owns && now.mode == AG_POWER_CRUISE) {
+        ag_power_target_t want = now;
+        want.mode = AG_POWER_FULL;
+        want.cpu_min_mhz = cpu_max_mhz();
+        want.cpu_max_mhz = want.cpu_min_mhz;
+        (void)apply_locked(&want, AG_POWER_AUTO, NULL, 0u, NULL);
+    }
+    lock_give();
+}
+
+void ag_powerctl_tick(void)
+{
+    /*
+     * Nought ticks: a transition in flight means somebody else is deciding
+     * this, and the next tick is a quarter of a second away.
      */
     if (!lock_take(0)) {
         return;
@@ -518,32 +641,51 @@ void ag_powerctl_tick(void)
         return;
     }
 
+    const uint32_t ms = now_ms();
     const uint32_t idle_ms = ag_console_idle_ms();
     const uint32_t max_mhz = cpu_max_mhz();
 
-    const bool screen_off = (s_auto.screen_off_s > 0u) &&
+    /*
+     * The first rung, and the only one that is not about time: cruise while
+     * nothing needs the speed.  The hold-off is measured from the last moment
+     * something did, so a program that ends does not put the machine back to
+     * 160 MHz before the next one has started.
+     */
+    if (demands_full()) {
+        s_last_demand_ms = ms;
+    }
+    const bool cruise = (s_auto.cruise_mhz > 0u) &&
+                        ((uint32_t)(ms - s_last_demand_ms) >=
+                         s_auto.cruise_s * 1000u);
+
+    /* The other two rungs are the idle timer's, and it can be switched off
+     * without taking cruising with it. */
+    const bool screen_off = s_auto.on && (s_auto.screen_off_s > 0u) &&
                             (idle_ms >= s_auto.screen_off_s * 1000u);
     /*
-     * The clock is only lowered while nothing has said it needs it.  An
-     * automatic saving that breaks an audio path is not a saving, and there is
-     * nobody at the console to be told that it happened - which is exactly the
-     * difference between this and the command.
+     * eco is the rung where a third of the clock is at stake, so it keeps the
+     * stricter rule whatever cruising is set to: nothing is lowered that far
+     * while any process has said it needs the machine.
      */
-    const bool eco = (s_auto.eco_s > 0u) &&
+    const bool eco = s_auto.on && (s_auto.eco_s > 0u) &&
                      (idle_ms >= s_auto.eco_s * 1000u) &&
                      !ag_power_full_only_held();
 
     ag_power_target_t want = now;
     want.screen_on = !screen_off;
-    want.cpu_min_mhz = eco ? s_auto.eco_mhz : max_mhz;
-    want.cpu_max_mhz = want.cpu_min_mhz;
     if (eco) {
+        want.cpu_min_mhz = s_auto.eco_mhz;
         want.mode = screen_off ? AG_POWER_DOZE : AG_POWER_ECO;
+    } else if (cruise) {
+        want.cpu_min_mhz = s_auto.cruise_mhz;
+        want.mode = AG_POWER_CRUISE;
     } else {
-        /* A dark screen at full speed is not a mode of its own: `doze` would
-         * be a lie in the one place a person looks to find out. */
+        want.cpu_min_mhz = max_mhz;
+        /* A dark screen at full speed is not a mode of its own: `doze` would be
+         * a lie in the one place a person looks to find out. */
         want.mode = AG_POWER_FULL;
     }
+    want.cpu_max_mhz = want.cpu_min_mhz;
 
     if (same_target(&want, &now)) {
         lock_give();
