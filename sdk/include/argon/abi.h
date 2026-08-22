@@ -87,22 +87,25 @@ extern "C" {
  * 0.33 appended net->resolve: a name into an address.  Without it every
  *      connect() in an application needs a dotted quad, which is not how
  *      anything on a network is written down.
- * 0.34 made api->power stop being NULL: what the machine is set to, and a
+ * 0.34 added api->ble (NULL unless the build has the BLE peripheral): a small
+ *      BLE-MIDI surface - advertise as a MIDI device and send notes - so a
+ *      graphical app can be a MIDI controller a phone plays.
+ * 0.35 made api->power stop being NULL: what the machine is set to, and a
  *      transition an application is told about before it happens.  With
  *      AG_IOC_DISPLAY_BACKLIGHT beside it, for the panel driver that owns the
  *      pin the light is on.
- * 0.35 power: a transition now says who asked for it.  An automatic one is
+ * 0.36 power: a transition now says who asked for it.  An automatic one is
  *      advisory and harmless; one a person typed is an order, and a process
  *      that does not answer that it is fit for the new mode is ended.
  *      power->declare replaces power->hold, and the answer that used to veto
  *      (HOLD) is now the admission that gets a process killed (UNFIT).
- * 0.36 power: AG_POWER_CRUISE, a step down that costs a third of the speed and
+ * 0.37 power: AG_POWER_CRUISE, a step down that costs a third of the speed and
  *      nothing else, taken by the system whenever no process has said it needs
  *      the full clock.  It renumbers ag_power_mode_t, which is why it is worth
  *      a line of its own: ECO and DOZE moved up by one.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 36u
+#define AG_ABI_MINOR 37u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -844,7 +847,7 @@ enum ag_ioctl_cmd {
 
     /* PCM devices (/dev/pcmnull, loadable pcmvirt, …): arg ag_audio_fmt_t */
     /*
-     * ABI 0.34: arg is a uint8_t, 0..100 - how bright the panel should be.
+     * ABI 0.35: arg is a uint8_t, 0..100 - how bright the panel should be.
      * Zero means off, and off means as dark as this board can be made: on a
      * hand-held with a lit screen the backlight is the largest single load
      * there is, larger than the processor at full speed, so this is the one
@@ -1279,6 +1282,42 @@ typedef struct ag_audio_api {
 } ag_audio_api_t;
 
 /* ------------------------------------------------------------------------ */
+/* ble - Bluetooth Low Energy for applications (ABI 0.34)                   */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * Deliberately small: enough to be a BLE-MIDI controller, which is the first
+ * application that wanted the radio.  The board becomes a MIDI device a phone
+ * or PC connects to and plays; notes go out as the app sends them.  A general
+ * GATT surface for applications is a later, larger job.
+ */
+typedef struct ag_ble_api {
+    uint32_t size;
+
+    /*
+     * Advertise as a BLE-MIDI device under `name` (kept short - it shares a
+     * 31-byte advertisement with a 128-bit service UUID).  The radio is started
+     * if it was not.  Idempotent; call again to change the name.
+     */
+    ag_err_t (*midi_advertise)(const char *name);
+
+    /*
+     * One MIDI channel-voice message: `status` (0x90|channel for note-on,
+     * 0x80|channel for note-off), then two data bytes (note, velocity).  A
+     * note-on with velocity 0 is the customary note-off.  -AG_ENODEV until a
+     * client has connected and subscribed - there is nowhere to send until
+     * then, and midi_ready() says when that is.
+     */
+    ag_err_t (*midi_send)(uint8_t status, uint8_t data1, uint8_t data2);
+
+    /* True once a client is connected and listening for notes. */
+    bool (*midi_ready)(void);
+
+    /* Stop advertising and drop any client. */
+    ag_err_t (*adv_stop)(void);
+} ag_ble_api_t;
+
+/* ------------------------------------------------------------------------ */
 /* power - how hard the machine is being driven, and who gets told          */
 /* ------------------------------------------------------------------------ */
 
@@ -1469,7 +1508,12 @@ typedef struct ag_api {
     /* ABI 0.14+: PCM out (built-in pcmnull; virt/I2S via .SYS). */
     const ag_audio_api_t *audio;
 
-    /* ABI 0.34+: the clock, the screen, and being told before they change. */
+    /* ABI 0.34+: BLE for applications - NULL unless the build has the BLE
+     * peripheral (CONFIG_ARGON_BLE_PERIPHERAL).  Small on purpose: enough for a
+     * MIDI controller, not a general GATT toolkit. */
+    const ag_ble_api_t *ble;
+
+    /* ABI 0.35+: the clock, the screen, and being told before they change. */
     const ag_power_api_t *power;
 } ag_api_t;
 

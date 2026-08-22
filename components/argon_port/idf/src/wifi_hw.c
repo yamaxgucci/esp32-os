@@ -23,6 +23,9 @@
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
+#if AG_PORT_WIFI_HAS_AP
+#include "lwip/inet.h" /* ntohl, for the point's own address in ap_status */
+#endif
 
 #include "net_hw.h"
 
@@ -42,6 +45,40 @@ static volatile bool            s_bssid_set;
  * that the disconnect it starts is not treated as one to recover from. */
 static volatile bool            s_switching;
 static esp_netif_t             *s_sta_netif;
+
+#if AG_PORT_WIFI_HAS_AP
+/*
+ * The access point half.  Its netif is made the first time a point is asked
+ * for and given back when the last one stops, because it is the netif and its
+ * DHCP server that cost the memory - the code is free once the radio is linked.
+ */
+static esp_netif_t     *s_ap_netif;
+static volatile bool    s_ap_on;
+static char             s_ap_ssid[AG_WIFI_SSID_MAX + 1];
+static volatile uint8_t s_ap_channel;
+static volatile bool    s_ap_hidden;
+static volatile bool    s_ap_secured;
+static volatile uint32_t s_ap_clients;
+
+/*
+ * The mode the one radio must be in for what is wanted right now.  There is a
+ * single transceiver, so "station" and "access point" are not two devices to
+ * turn on independently - they are one device told to do one thing, the other,
+ * or both, and every place that changes what is wanted has to say so here.
+ */
+static wifi_mode_t desired_mode(void)
+{
+    if (s_ap_on && s_want_join) {
+        return WIFI_MODE_APSTA;
+    }
+    if (s_ap_on) {
+        return WIFI_MODE_AP;
+    }
+    return WIFI_MODE_STA;
+}
+
+static esp_err_t apply_mode(void) { return esp_wifi_set_mode(desired_mode()); }
+#endif /* AG_PORT_WIFI_HAS_AP */
 
 static ag_wifi_auth_t map_auth(wifi_auth_mode_t m)
 {
@@ -101,6 +138,24 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id,
         }
         break;
     }
+
+#if AG_PORT_WIFI_HAS_AP
+    /*
+     * How many stations are on the point right now, kept by counting the ones
+     * that join and leave rather than asking the driver each time status is
+     * read.  The count is the one thing about a point that changes without
+     * anyone here doing anything, so it is the one thing worth an event.
+     */
+    case WIFI_EVENT_AP_STACONNECTED:
+        s_ap_clients++;
+        break;
+
+    case WIFI_EVENT_AP_STADISCONNECTED:
+        if (s_ap_clients > 0) {
+            s_ap_clients--;
+        }
+        break;
+#endif
 
     default:
         break;
@@ -171,6 +226,14 @@ ag_err_t ag_port_wifi_stop(void)
     s_pass[0] = '\0';
     s_bssid_set = false;
 
+#if AG_PORT_WIFI_HAS_AP
+    /* The point goes down with the radio, or its netif would outlive the driver
+     * that feeds it - a leak the next `wifi on` cannot undo. */
+    s_ap_on = false;
+    s_ap_clients = 0;
+    s_ap_ssid[0] = '\0';
+#endif
+
     (void)esp_wifi_disconnect();
     ag_port_net_link_down();
     (void)esp_wifi_stop();
@@ -182,6 +245,12 @@ ag_err_t ag_port_wifi_stop(void)
         s_sta_netif = NULL;
         ag_port_net_set_netif(NULL);
     }
+#if AG_PORT_WIFI_HAS_AP
+    if (s_ap_netif != NULL) {
+        esp_netif_destroy_default_wifi(s_ap_netif);
+        s_ap_netif = NULL;
+    }
+#endif
 
     s_state = AG_WIFI_OFF;
     s_attempts = 0;
@@ -277,6 +346,19 @@ ag_err_t ag_port_wifi_connect(const char *ssid, const char *pass,
         s_switching = true;
         (void)esp_wifi_disconnect();
     }
+
+#if AG_PORT_WIFI_HAS_AP
+    /*
+     * A point that is up stays up.  Joining a network while running one means
+     * both at once, and the mode has to say so before the station is configured
+     * below: ap_start with nothing joined left the radio in AP-only mode, and
+     * setting a station config in that mode is setting a station the radio is
+     * not in the mode to have.
+     */
+    if (s_ap_on) {
+        (void)esp_wifi_set_mode(WIFI_MODE_APSTA);
+    }
+#endif
 
     /*
      * An empty key means "the one you already have", when the network is the
@@ -418,5 +500,147 @@ const char *ag_port_wifi_reason(int reason)
         return "the radio gave up";
     }
 }
+
+#if AG_PORT_WIFI_HAS_AP
+
+/*
+ * Turn the point on, or change what it is.
+ *
+ * Calling it again with a different name or key reconfigures the running point
+ * rather than refusing: the netif is already there, the driver takes the new
+ * config, and clients reassociate.  That is why the netif is kept between calls
+ * and only the config is rewritten.
+ */
+ag_err_t ag_port_wifi_ap_start(const char *ssid, const char *pass,
+                               uint8_t channel, bool hidden)
+{
+    if (s_state == AG_WIFI_OFF) {
+        return -AG_ENODEV;
+    }
+    if (ssid == NULL || ssid[0] == '\0') {
+        return -AG_EINVAL;
+    }
+
+    const size_t plen =
+        (pass != NULL) ? strnlen(pass, AG_WIFI_PASS_MAX + 1u) : 0u;
+    const bool secured = (plen > 0u);
+    /*
+     * Eight is WPA2's floor and sixty-three its ceiling.  A key of one to seven
+     * characters is a mistake, not an open network, and turning it into one
+     * silently is how a point meant to be private ends up not being.
+     */
+    if (secured && (plen < 8u || plen > AG_WIFI_PASS_MAX)) {
+        return -AG_EINVAL;
+    }
+
+    const bool created_now = (s_ap_netif == NULL);
+    if (created_now) {
+        s_ap_netif = esp_netif_create_default_wifi_ap();
+        if (s_ap_netif == NULL) {
+            return -AG_ENOMEM;
+        }
+    }
+
+    wifi_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    /* Copied, not printed: ssid is a fixed field with a separate length and no
+     * terminator, exactly as the station side above. */
+    const size_t sl = strnlen(ssid, sizeof(cfg.ap.ssid));
+    memcpy(cfg.ap.ssid, ssid, sl);
+    cfg.ap.ssid_len = (uint8_t)sl;
+    cfg.ap.channel = (channel == 0u) ? 1u : channel;
+    cfg.ap.ssid_hidden = hidden ? 1 : 0;
+    /*
+     * Four at once.  Every associated station is a lease and a receive window's
+     * worth of memory in flight, and this chip has already been run out of heap
+     * by a browser opening six sockets - a point that lets ten devices on is a
+     * point that dies when they arrive.  Four is a phone, a laptop and room.
+     */
+    cfg.ap.max_connection = 4;
+    if (secured) {
+        memcpy(cfg.ap.password, pass, plen);
+        cfg.ap.authmode = WIFI_AUTH_WPA2_PSK;
+    } else {
+        cfg.ap.authmode = WIFI_AUTH_OPEN;
+    }
+
+    s_ap_on = true;
+    if (apply_mode() != ESP_OK ||
+        esp_wifi_set_config(WIFI_IF_AP, &cfg) != ESP_OK) {
+        /* Undo cleanly: a half-started point that reports itself on is worse
+         * than one that failed and said so. */
+        s_ap_on = false;
+        (void)apply_mode();
+        if (created_now) {
+            esp_netif_destroy_default_wifi(s_ap_netif);
+            s_ap_netif = NULL;
+        }
+        return -AG_EIO;
+    }
+
+    snprintf(s_ap_ssid, sizeof(s_ap_ssid), "%s", ssid);
+    s_ap_channel = cfg.ap.channel;
+    s_ap_hidden = hidden;
+    s_ap_secured = secured;
+    s_ap_clients = 0;
+    return AG_OK;
+}
+
+ag_err_t ag_port_wifi_ap_stop(void)
+{
+    if (!s_ap_on) {
+        return AG_OK;
+    }
+    s_ap_on = false;
+    (void)apply_mode(); /* back to station-only, or station if one is joined */
+
+    if (s_ap_netif != NULL) {
+        esp_netif_destroy_default_wifi(s_ap_netif);
+        s_ap_netif = NULL;
+    }
+    s_ap_clients = 0;
+    s_ap_ssid[0] = '\0';
+    return AG_OK;
+}
+
+ag_err_t ag_port_wifi_ap_status(ag_port_wifi_ap_status_t *out)
+{
+    if (out == NULL) {
+        return -AG_EINVAL;
+    }
+    memset(out, 0, sizeof(*out));
+    out->on = s_ap_on;
+    if (!s_ap_on) {
+        return AG_OK;
+    }
+
+    snprintf(out->ssid, sizeof(out->ssid), "%s", s_ap_ssid);
+    out->hidden = s_ap_hidden;
+    out->secured = s_ap_secured;
+    out->clients = s_ap_clients;
+
+    /*
+     * The channel it is really on, not the one that was asked for.  With a
+     * station associated the driver drags the point onto the station's channel,
+     * and asking the driver is the only way to know which that turned out to be.
+     */
+    uint8_t            primary = s_ap_channel;
+    wifi_second_chan_t second = WIFI_SECOND_CHAN_NONE;
+    if (esp_wifi_get_channel(&primary, &second) == ESP_OK && primary != 0u) {
+        out->channel = primary;
+    } else {
+        out->channel = s_ap_channel;
+    }
+
+    if (s_ap_netif != NULL) {
+        esp_netif_ip_info_t ip;
+        if (esp_netif_get_ip_info(s_ap_netif, &ip) == ESP_OK) {
+            out->ip = ntohl(ip.ip.addr);
+        }
+    }
+    return AG_OK;
+}
+
+#endif /* AG_PORT_WIFI_HAS_AP */
 
 #endif /* CONFIG_ARGON_NET_WIFI */

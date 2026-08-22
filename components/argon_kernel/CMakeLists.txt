@@ -47,6 +47,8 @@ set(ARGON_KERNEL_SRCS
     "src/loader/probe.c"
     "src/loader/api.c"
     "src/net/net.c"
+    "src/net/espnow.c"
+    "src/net/wifimon.c"
     "src/net/netmsg.c"
     "src/net/netio.c"
     "src/net/httpc.c"

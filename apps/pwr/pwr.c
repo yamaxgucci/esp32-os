@@ -33,10 +33,11 @@ AG_APP("PWR", "1.0", "argon", 0);
 static const char *mode_name(uint8_t mode)
 {
     switch (mode) {
-    case AG_POWER_FULL: return "full";
-    case AG_POWER_ECO:  return "eco";
-    case AG_POWER_DOZE: return "doze";
-    default:            return "?";
+    case AG_POWER_FULL:   return "full";
+    case AG_POWER_CRUISE: return "cruise";
+    case AG_POWER_ECO:    return "eco";
+    case AG_POWER_DOZE:   return "doze";
+    default:              return "?";
     }
 }
 
@@ -50,7 +51,7 @@ int ag_main(int argc, char **argv)
 
     ag_power_status_t probe;
     if (ag_power_status(&probe) == -AG_ENOSYS) {
-        ag_print("pwr: this system has no power subtable (ABI < 0.34)\n");
+        ag_print("pwr: this system has no power subtable (ABI < 0.35)\n");
         return 1;
     }
 

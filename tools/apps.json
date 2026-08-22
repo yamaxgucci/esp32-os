@@ -90,6 +90,7 @@
     },
 
     { "out": "GFXPIX.AXE", "group": "board", "src": ["apps/gfxpix/gfxpix.c"] },
+    { "out": "MIDIPAD.AXE", "group": "board", "src": ["apps/midipad/midipad.c"] },
     { "out": "ILI9341.SYS", "group": "board", "src": ["apps/ili9341/ili9341.c"] },
     { "out": "XPT2046.SYS", "group": "board", "src": ["apps/xpt2046/xpt2046.c"] },
 
