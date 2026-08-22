@@ -542,8 +542,6 @@ static ag_err_t apply_locked(const ag_power_target_t *want,
            applied.screen_on ? "on" : "off", (unsigned)parked,
            (unsigned)silent, (unsigned)declared, (unsigned)gone);
 
-    s_auto_owns = (cause == AG_POWER_AUTO) && (applied.mode > AG_POWER_FULL ||
-                                               !applied.screen_on);
     return AG_OK;
 }
 
@@ -747,6 +745,19 @@ void ag_powerctl_tick(void)
         return;
     }
 
-    (void)apply_locked(&want, AG_POWER_AUTO, "idle timer", NULL, 0u, NULL);
+    if (apply_locked(&want, AG_POWER_AUTO, "idle timer", NULL, 0u, NULL) ==
+        AG_OK) {
+        /*
+         * Only here.  The timer owns what the timer set, and nothing else -
+         * the other two automatic transitions are a declaration arriving and
+         * the bus being needed, and neither is a reason to start managing a
+         * machine somebody else set.
+         *
+         * Found on the board: `power eco 40`, then a radio, whose bus raise
+         * counted as the timer's doing - and the timer promptly carried on to
+         * 240, which is not what the person who pinned 40 asked for.
+         */
+        s_auto_owns = (want.mode > AG_POWER_FULL) || !want.screen_on;
+    }
     lock_give();
 }

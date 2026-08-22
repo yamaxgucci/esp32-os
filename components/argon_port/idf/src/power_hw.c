@@ -86,9 +86,10 @@ uint32_t ag_port_power_cpu_mhz(void)
  * Asked here rather than remembered above, because this is where the fact is.
  */
 /*
- * Off until an installation says otherwise: the step below the bus floor works
- * as far as anybody has looked, and "as far as anybody has looked" is not the
- * same as safe.  See ag_port_power_allow_crystal in the contract.
+ * Off until an installation says otherwise.  Not because it is broken - the
+ * board runs on it - but because what it buys has not been measured yet, and a
+ * default that trades an unmeasured saving for a slower bus is a decision
+ * nobody made.  See ag_port_power_allow_crystal in the contract.
  */
 static bool s_allow_crystal;
 
@@ -171,8 +172,8 @@ uint32_t ag_port_power_bus_floor_mhz(void)
 const char *ag_port_power_note(void)
 {
     if (!s_allow_crystal) {
-        return "40 MHz (the crystal) is off: it moves the peripheral bus, and "
-               "only the console has been made immune. [power] crystal = 1";
+        return "40 MHz (the crystal) is off: it halves the peripheral bus, and "
+               "what that saves is not measured yet. [power] crystal = 1";
     }
     if (radio_on()) {
         return "the radio holds the bus at 80 MHz; 40 is not offered while it "

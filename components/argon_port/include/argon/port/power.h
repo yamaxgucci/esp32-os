@@ -107,16 +107,21 @@ const char *ag_port_power_note(void);
  * Offer the step below the bus floor, or stop offering it.
  *
  * There is exactly one such step on this family - the crystal - and it is the
- * one where the peripheral bus follows the processor down.  The console was
- * made immune to that (see uart_hw.c) and a session at 40 MHz then read
- * perfectly on the board; what has not been shown is the rest of the machine,
- * and the board wedged twice in that neighbourhood, once while starting a radio
- * on the slowed bus and once with the console going deaf after the switch.
+ * one where the peripheral bus follows the processor down.  What that costs was
+ * settled on the board rather than argued about:
  *
- * So it is off unless somebody asks for it: `[power] crystal = 1` in
- * SYSTEM.CFG, which is a decision an installation makes with a meter and a
- * board in front of it, not a default.  Off is not "unsupported" - everything
- * around it is written and tested - it is "not yet shown to be harmless".
+ *   the console  - was fatal, and is fixed at the source: the serial ports are
+ *                  clocked from something the processor cannot move (uart_hw.c)
+ *   the card     - a directory listing off the SD reads fine at half the SPI
+ *                  clock, which is all halving it does
+ *   a radio      - genuinely cannot take it, and is handled in both directions:
+ *                  the step disappears from this list while one is running, and
+ *                  the system raises the clock before one starts
+ *
+ * It is still off unless an installation asks - `[power] crystal = 1` - and the
+ * reason is no longer doubt about whether it works.  It is that nobody has put
+ * a meter on it, so what the slower bus buys is unknown, and a default that
+ * trades something real for something unmeasured is a decision nobody made.
  */
 void ag_port_power_allow_crystal(bool on);
 
