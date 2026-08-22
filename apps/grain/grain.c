@@ -1024,6 +1024,15 @@ static int parse_arg(const char *a)
 
 int ag_main(int argc, char **argv)
 {
+    /*
+     * The system cruises at a lower clock while nothing says otherwise, and
+     * this does: the arithmetic below is paced by a wall clock and does not fit
+     * in two thirds of the speed.  Said in the first line rather than answered
+     * later, because the first buffer is as real as the thousandth.
+     */
+    (void)ag_power_declare(AG_POWER_FIT_FULL_ONLY,
+                           "granular audio in real time");
+
     ag_event_t ev;
     int i;
 

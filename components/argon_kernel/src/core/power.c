@@ -295,6 +295,22 @@ const char *ag_power_why(ag_pid_t pid)
     return (w != NULL) ? w->why : "";
 }
 
+ag_power_fitness_t ag_power_fitness_of(ag_pid_t pid)
+{
+    const watcher_t *w = find(pid);
+    return (w != NULL) ? w->fitness : AG_POWER_FIT_ASK;
+}
+
+bool ag_power_refused(ag_pid_t pid)
+{
+    const watcher_t *w = find(pid);
+    if (w == NULL) {
+        return false;
+    }
+    return w->fitness == AG_POWER_FIT_FULL_ONLY ||
+           w->answer == AG_POWER_UNFIT;
+}
+
 bool ag_power_full_only_held(void)
 {
     for (uint32_t i = 0; i < AG_POWER_WATCHERS; i++) {

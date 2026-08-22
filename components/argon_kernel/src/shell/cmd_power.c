@@ -33,10 +33,11 @@ static uint32_t now_ms(void) { return (uint32_t)(ag_port_us() / 1000); }
 static const char *mode_name(ag_power_mode_t m)
 {
     switch (m) {
-    case AG_POWER_FULL: return "full";
-    case AG_POWER_ECO:  return "eco";
-    case AG_POWER_DOZE: return "doze";
-    default:            return "?";
+    case AG_POWER_FULL:   return "full";
+    case AG_POWER_CRUISE: return "cruise";
+    case AG_POWER_ECO:    return "eco";
+    case AG_POWER_DOZE:   return "doze";
+    default:              return "?";
     }
 }
 
@@ -103,6 +104,22 @@ static void print_watchers(void)
     }
 }
 
+static void print_cruise(void)
+{
+    ag_power_auto_t a;
+    ag_powerctl_auto_get(&a);
+
+    if (a.cruise_mhz == 0u) {
+        ag_console_puts("  cruise: off - the clock stays at its maximum until "
+                        "asked otherwise\n");
+        return;
+    }
+    ag_console_printf("  cruise: %u MHz when %s\n", (unsigned)a.cruise_mhz,
+                      a.cruise_strict
+                          ? "every application has said any mode suits it"
+                          : "nobody has said it needs the full clock");
+}
+
 static void print_auto(void)
 {
     ag_power_auto_t a;
@@ -156,6 +173,7 @@ static int status(void)
                         "only where this machine can make it\n");
     }
 
+    print_cruise();
     print_auto();
     print_watchers();
     return 0;
@@ -163,14 +181,21 @@ static int status(void)
 
 static void usage(void)
 {
-    ag_console_puts("usage: power [full | eco [mhz] | doze [mhz] | "
-                    "screen on|off]\n");
+    ag_console_puts("usage: power [full | cruise [on|off] | eco [mhz] | "
+                    "doze [mhz] | screen on|off]\n");
+    ag_console_puts("       power cruise on|off|silence|declared\n");
     ag_console_puts("       power auto [on|off] [screen_s] [eco_s]\n");
-    ag_console_puts("  eco   pin the clock lower; default 80 MHz\n");
-    ag_console_puts("  doze  the same, and the screen off\n");
-    ag_console_puts("  an application that does not answer that it is fit for "
-                    "the new mode\n"
-                    "  is ended; `power auto` never ends anything\n");
+    ag_console_puts("  cruise  a step down (160 MHz) the system takes by "
+                    "itself while\n"
+                    "          nothing has said it needs the full clock; "
+                    "on|off configures that\n");
+    ag_console_puts("  eco     pin the clock lower; default 80 MHz\n");
+    ag_console_puts("  doze    the same, and the screen off\n");
+    ag_console_puts("  eco and doze end an application that does not answer "
+                    "that it is fit;\n"
+                    "  cruise ends only one that says outright that it is not; "
+                    "`power auto` never\n"
+                    "  ends anything\n");
 }
 
 /* One of the machine's own settings, or zero. */
@@ -229,6 +254,65 @@ static int cmd_auto(int words, char **word)
     return 0;
 }
 
+/*
+ * `power cruise on|off` configures the rung the system takes by itself; `power
+ * cruise` with nothing after it enters it now, like any other mode.  Turning it
+ * off while the machine is on it puts the clock back at once, because that is
+ * what somebody typing it wants to see happen.
+ */
+static int cmd_cruise(const char *word)
+{
+    ag_power_auto_t a;
+    ag_powerctl_auto_get(&a);
+
+    if (ag_path_icmp(word, "on") == 0) {
+        a.cruise_mhz = ag_powerctl_cruise_default();
+        if (a.cruise_mhz == 0u) {
+            ag_console_puts("power: this part has no middle clock setting to "
+                            "cruise at\n");
+            return 1;
+        }
+    } else if (ag_path_icmp(word, "off") == 0) {
+        a.cruise_mhz = 0u;
+    } else if (ag_path_icmp(word, "silence") == 0) {
+        a.cruise_strict = false;
+    } else if (ag_path_icmp(word, "declared") == 0) {
+        /*
+         * Here as well as in SYSTEM.CFG because the difference is invisible
+         * until something is running, and the person who wants to see it is
+         * standing at the console with something running.
+         */
+        a.cruise_strict = true;
+    } else {
+        usage();
+        return 1;
+    }
+
+    const ag_err_t err = ag_powerctl_auto_set(&a);
+    if (err != AG_OK) {
+        ag_console_printf("power cruise: failed (%d)\n", (int)err);
+        return 1;
+    }
+
+    if (a.cruise_mhz == 0u && ag_power_mode() == AG_POWER_CRUISE) {
+        ag_power_target_t want;
+        ag_power_current(&want);
+        uint16_t       steps[AG_PORT_PWR_STEPS_MAX];
+        const uint32_t n = ag_powerctl_cpu_steps(steps, AG_PORT_PWR_STEPS_MAX);
+        if (n > 0u) {
+            want.mode = AG_POWER_FULL;
+            want.cpu_min_mhz = steps[0];
+            want.cpu_max_mhz = steps[0];
+            (void)ag_powerctl_apply(&want, AG_POWER_USER, NULL, 0u, NULL);
+        }
+    }
+
+    print_cruise();
+    ag_console_puts("  (in SYSTEM.CFG as [power] cruise_mhz / cruise_when to "
+                    "survive a reboot)\n");
+    return 0;
+}
+
 static int report(const ag_power_ended_t *ended, uint32_t n,
                   const ag_power_target_t *want)
 {
@@ -271,6 +355,9 @@ int ag_cmd_power(int argc, char **argv)
     if (ag_path_icmp(word[0], "auto") == 0) {
         return cmd_auto(words, word);
     }
+    if (ag_path_icmp(word[0], "cruise") == 0 && words > 1) {
+        return cmd_cruise(word[1]);
+    }
 
     ag_power_target_t now;
     ag_power_current(&now);
@@ -287,6 +374,19 @@ int ag_cmd_power(int argc, char **argv)
         want.cpu_min_mhz = steps[0];
         want.cpu_max_mhz = steps[0];
         want.screen_on = true;
+    } else if (ag_path_icmp(word[0], "cruise") == 0) {
+        ag_power_auto_t a;
+        ag_powerctl_auto_get(&a);
+        const uint32_t mhz =
+            (a.cruise_mhz > 0u) ? a.cruise_mhz : ag_powerctl_cruise_default();
+        if (mhz == 0u) {
+            ag_console_puts("power: this part has no middle clock setting to "
+                            "cruise at\n");
+            return 1;
+        }
+        want.mode = AG_POWER_CRUISE;
+        want.cpu_min_mhz = mhz;
+        want.cpu_max_mhz = mhz;
     } else if (ag_path_icmp(word[0], "eco") == 0 ||
                ag_path_icmp(word[0], "doze") == 0) {
         const bool doze = (ag_path_icmp(word[0], "doze") == 0);

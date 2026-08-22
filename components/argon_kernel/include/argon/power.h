@@ -162,11 +162,28 @@ bool ag_power_fit(ag_pid_t pid);
 const char *ag_power_why(ag_pid_t pid);
 
 /*
- * Is any process saying it needs the full clock?  The idle timer asks before
- * it lowers anything: automatic saving is not worth breaking work for, and
+ * Is any process saying it needs the full clock?  Asked before anything is
+ * lowered automatically: saving power is not worth breaking work for, and
  * there is nobody at the console to be told that it did.
  */
 bool ag_power_full_only_held(void);
+
+/*
+ * What one process has said about itself, standing.  AG_POWER_FIT_ASK for a
+ * process that has said nothing, which is also the answer for one this table
+ * has never heard of - the two are the same thing seen from here.
+ */
+ag_power_fitness_t ag_power_fitness_of(ag_pid_t pid);
+
+/*
+ * Did this process say, in so many words, that it cannot live with the new
+ * mode?  Declared AG_POWER_FIT_FULL_ONLY, or answered AG_POWER_UNFIT.
+ *
+ * Different from !ag_power_fit() by exactly the silent ones, and that is the
+ * whole distinction between the first rung of the ladder and the rest: on the
+ * step that costs a third of the speed, only an explicit refusal counts.
+ */
+bool ag_power_refused(ag_pid_t pid);
 
 uint32_t ag_power_watcher_count(void);
 bool     ag_power_watcher_at(uint32_t index, uint32_t now_ms,
@@ -192,12 +209,33 @@ typedef struct {
     char     why[AG_POWER_WHY_MAX]; /* its own words, or empty if it said none */
 } ag_power_ended_t;
 
-/* How the idle timer is set up.  Zero seconds means "never, by itself". */
+/*
+ * What the system does about the clock without being asked.
+ *
+ * Two independent things live here, and they are independent on purpose.
+ *
+ * The idle timer (`on`, the two timeouts) is about nobody being there: it puts
+ * the screen out and, after minutes, drops to `eco_mhz`.  Off by default - a
+ * machine that darkens itself after a minute is a pleasant laptop and an
+ * alarming instrument, and which of the two this is belongs to whoever
+ * installed it.
+ *
+ * Cruising (`cruise_mhz`) is not about idleness at all: it is about nobody
+ * needing the speed.  It costs a third of it and, on this family, nothing else
+ * - the peripheral bus does not move between 240, 160 and 80 - so it is on by
+ * default and taken on silence.  A system that would rather be asked sets
+ * `cruise_strict`, and then only processes that declared AG_POWER_FIT_ANY let
+ * the machine cruise.
+ */
 typedef struct {
-    bool     on;
-    uint32_t screen_off_s;
-    uint32_t eco_s;
+    bool     on;           /* the idle timer: screen, then eco             */
+    uint32_t screen_off_s; /* 0 = never                                    */
+    uint32_t eco_s;        /* 0 = never                                    */
     uint32_t eco_mhz;
+
+    uint32_t cruise_mhz;   /* 0 = never cruise                             */
+    uint32_t cruise_s;     /* hold-off after the last process needed full  */
+    bool     cruise_strict;
 } ag_power_auto_t;
 
 ag_err_t ag_powerctl_init(void);
@@ -237,6 +275,22 @@ uint32_t ag_powerctl_cpu_steps(uint16_t *out, uint32_t max);
 /* What `power eco` with no number means on this part.  Zero if it has no
  * settings at all to choose from. */
 uint32_t ag_powerctl_eco_default(void);
+
+/* And what cruising means: 160 MHz where the part has it, otherwise nothing -
+ * a machine with no middle step does not cruise. */
+uint32_t ag_powerctl_cruise_default(void);
+
+/*
+ * An application has just declared its fitness.  A declaration of
+ * AG_POWER_FIT_FULL_ONLY takes the machine off cruise before the call that made
+ * it returns - the first buffer an audio path fills is as real as the
+ * thousandth, and waiting a quarter of a second for the next tick would put a
+ * click in it.
+ *
+ * Anything else is noted and nothing happens: coming back down is the tick's
+ * business, after the hold-off.
+ */
+void ag_powerctl_declared(ag_power_fitness_t fitness);
 
 /* Whether the clock can be moved at all in this build. */
 bool ag_powerctl_can_scale(void);
