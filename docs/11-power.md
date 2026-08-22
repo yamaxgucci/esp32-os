@@ -91,7 +91,7 @@
 | Порт | [`argon/port/power.h`](../components/argon_port/include/argon/port/power.h), [`idf/src/power_hw.c`](../components/argon_port/idf/src/power_hw.c) | `caps`, `cpu_mhz` (живое чтение), `cpu_steps`, `cpu_band` |
 | Таблица | [`src/core/power.c`](../components/argon_kernel/src/core/power.c) | кто слушает, что ответил, кто объявил что; вердикт `ag_power_fit`. Без часов, экрана, журнала и планировщика |
 | Машина | [`src/core/powerctl.c`](../components/argon_kernel/src/core/powerctl.c) | объявить → подождать → зафиксировать → применить → **снять неподходящих**; таймер простоя; строка в журнал |
-| ABI | [`sdk/include/argon/abi.h`](../sdk/include/argon/abi.h) | **0.36**: `AG_POWER_CRUISE`; **0.35**: `api->power` (`status`/`answer`/`declare`), `ag_power_cause_t`, `ag_power_fitness_t`, `AG_IOC_DISPLAY_BACKLIGHT` |
+| ABI | [`sdk/include/argon/abi.h`](../sdk/include/argon/abi.h) | **0.37**: `AG_POWER_CRUISE`; **0.36**: снятие неподтвердившихся; **0.35**: `api->power` (`status`/`answer`/`declare`), `ag_power_cause_t`, `ag_power_fitness_t`, `AG_IOC_DISPLAY_BACKLIGHT` |
 | Обёртки SDK | [`sdk/include/argon/argon.h`](../sdk/include/argon/argon.h) | `ag_power_status`, `ag_power_answer`, `ag_power_declare` |
 | Простой | `src/console/console.c` | `ag_console_idle_ms()` — одна строка в `publish()`, потому что весь ввод идёт через неё |
 | Тик | `src/proc/supervisor.c` | `ag_powerctl_tick()` четыре раза в секунду |

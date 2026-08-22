@@ -36,6 +36,8 @@
 
 #include <argon/port/config.h>
 
+#include <argon/port/ble.h>
+#include <argon/port/bt.h>
 #include <argon/port/time.h>
 #include <argon/port/task.h>
 
@@ -907,6 +909,42 @@ static const ag_proc_api_t k_proc = {
  * application can then ask - if (ag_api()->net) - and adapt, which is what the
  * feature probing in the ABI is for.  gfx is live from 0.8 (soft framebuffer).
  */
+#if AG_PORT_HAS_BLE_PERIPH
+/*
+ * BLE for applications, as much of it as a MIDI controller needs.  advertise
+ * starts the radio if it was not already - an application should not have to
+ * know that `bt on` is a separate step.
+ */
+static ag_err_t api_ble_midi_advertise(const char *name)
+{
+    const ag_err_t serr = ag_port_bt_start();
+    if (serr != AG_OK) {
+        return serr;
+    }
+    /* An application can put the radio on the air without anybody
+     * typing anything; the bus has to be where a radio needs it first. */
+    ag_powerctl_bus_needed();
+    return ag_port_ble_midi_advertise(name);
+}
+
+static ag_err_t api_ble_midi_send(uint8_t status, uint8_t d1, uint8_t d2)
+{
+    return ag_port_ble_midi_send(status, d1, d2);
+}
+
+static bool api_ble_midi_ready(void) { return ag_port_ble_midi_ready(); }
+
+static ag_err_t api_ble_adv_stop(void) { return ag_port_ble_adv_stop(); }
+
+static const ag_ble_api_t k_ble = {
+    .size = sizeof(ag_ble_api_t),
+    .midi_advertise = api_ble_midi_advertise,
+    .midi_send = api_ble_midi_send,
+    .midi_ready = api_ble_midi_ready,
+    .adv_stop = api_ble_adv_stop,
+};
+#endif /* AG_PORT_HAS_BLE_PERIPH */
+
 static const ag_api_t k_api = {
     .size = sizeof(ag_api_t),
     .abi_major = AG_ABI_MAJOR,
@@ -929,6 +967,11 @@ static const ag_api_t k_api = {
     .net = NULL,
 #endif
     .audio = &ag_audio_api_table,
+#if AG_PORT_HAS_BLE_PERIPH
+    .ble = &k_ble,
+#else
+    .ble = NULL,
+#endif
     .power = &k_power,
 };
 

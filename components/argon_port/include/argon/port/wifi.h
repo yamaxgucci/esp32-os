@@ -100,6 +100,23 @@ typedef struct {
     int             last_reason; /* the port's own disconnect reason code   */
 } ag_port_wifi_status_t;
 
+/*
+ * What the access point half is doing, when the board is running one.  Separate
+ * from the station status above because the two are answers to different
+ * questions - "which network did I join" against "what network am I offering" -
+ * and on this chip a board can be doing both at once.
+ */
+typedef struct {
+    bool     on;                        /* the point is up                  */
+    char     ssid[AG_WIFI_SSID_MAX + 1];/* the name it is broadcasting      */
+    uint8_t  channel;                   /* the one it is actually on        */
+    bool     hidden;                    /* not naming itself in the beacon  */
+    bool     secured;                   /* WPA2 with a key, not open         */
+    uint32_t clients;                   /* stations associated right now    */
+    uint32_t ip;                        /* the board's own address on it,
+                                         * host-order IPv4 (192.168.4.1)     */
+} ag_port_wifi_ap_status_t;
+
 #if AG_PORT_HAS_WIFI
 
 ag_err_t ag_port_wifi_start(void);
@@ -113,6 +130,53 @@ ag_err_t ag_port_wifi_status(ag_port_wifi_status_t *out);
 
 /* Human text for a disconnect reason, for the one line that reports it. */
 const char *ag_port_wifi_reason(int reason);
+
+/*
+ * The other direction: a network this board offers, not one it joins.
+ *
+ * The file this contract opens by saying the radio is a machine that joins a
+ * network "so that the network exists at all".  That is still the reason the
+ * station half is the important one - but it is not the only thing a radio can
+ * do, and a board with no other network in reach can make one: a phone joins
+ * it, opens the card in a browser, and no router was involved.  That is a
+ * service the machine offers, in the same sense a socket it listens on is, and
+ * this is where the machine offers it.
+ *
+ * Available only when the build asked for it (AG_PORT_WIFI_HAS_AP): running a
+ * point is a second netif and a DHCP server, a few kilobytes a board that only
+ * joins networks has no reason to spend.  See argon/port/impl/wifi.h.
+ *
+ * Contract, not advice:
+ *
+ * - ap_start() needs the radio already started (ag_port_wifi_start, which
+ *   ag_port_net_start does): it turns the point on, it does not turn the radio
+ *   on.  -AG_ENODEV when the radio is off.
+ * - The point and a joined network coexist, because a board that serves a page
+ *   is often a board that also fetched it.  But this chip has one radio: while
+ *   the station is associated the point is forced onto the station's channel,
+ *   whatever channel was asked for, and there is nothing the driver can do about
+ *   it but say so.  ap_status() reports the channel it ended up on.
+ * - An empty pass is an open network - deliberately, and the caller was told.
+ *   A key means WPA2, and a key is eight to sixty-three characters: shorter is
+ *   -AG_EINVAL rather than an open point nobody meant to run.
+ * - channel 0 means "pick one" (1); otherwise 1..13, and out of range is the
+ *   driver's to clamp, not to refuse.
+ * - The board's own address on the point is fixed (192.168.4.1) and does not
+ *   arrive by DHCP - the board is the thing handing leases out.  So
+ *   ag_port_net_ready(), which answers "did DHCP give me an address", stays
+ *   false for an AP-only board, and that is correct: it has an address, it did
+ *   not lease one.  ap_status() carries that address.
+ * - ap_stop() gives the netif and its buffers back.  Stopping the radio
+ *   (ag_port_wifi_stop) stops the point too; it does not leak.
+ */
+#if AG_PORT_WIFI_HAS_AP
+
+ag_err_t ag_port_wifi_ap_start(const char *ssid, const char *pass,
+                               uint8_t channel, bool hidden);
+ag_err_t ag_port_wifi_ap_stop(void);
+ag_err_t ag_port_wifi_ap_status(ag_port_wifi_ap_status_t *out);
+
+#endif /* AG_PORT_WIFI_HAS_AP */
 
 #endif /* AG_PORT_HAS_WIFI */
 
