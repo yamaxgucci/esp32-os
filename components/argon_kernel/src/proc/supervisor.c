@@ -38,11 +38,31 @@
 #define AG_SUP_PRIORITY 15
 
 /*
- * 4 KB: the deepest thing it does is write a crash record, which is a filesystem
- * call with a line buffer on this stack.  A supervisor that overflows its own
- * stack while reporting somebody else's failure would be a poor joke.
+ * 6 KB, and the two extra kilobytes were bought on the board.
+ *
+ * It used to be 4 KB, sized for the deepest thing this task did: writing a
+ * crash record, which is a filesystem call with a line buffer on this stack.
+ * Then it gained the power tick, which formats a journal line of its own, and
+ * on the ESP32 (22 August 2026) the first `power eco` that ended an application
+ * finished with
+ *
+ *     ***ERROR*** A stack overflow in task ag_super has been detected
+ *
+ * and a reset.  The emulator never showed it: there the same code path runs on
+ * the shell's twelve kilobytes, and the tick only ever logged.
+ *
+ * A supervisor that overflows its own stack while reporting somebody else's
+ * failure is a poor joke, so the margin is now watched as well as raised - see
+ * AG_SUP_STACK_FLOOR.
  */
-#define AG_SUP_STACK 4096
+#define AG_SUP_STACK 6144
+
+/*
+ * Below this much free, say so.  A task whose stack use is creeping up should
+ * arrive as a line in the journal rather than as a reset - which is exactly
+ * what the last kilobyte of this one cost to find out.
+ */
+#define AG_SUP_STACK_FLOOR 768
 
 /* Nothing needs doing most of the time; a wake-up also collects zombies. */
 #define AG_SUP_TICK_MS 250
@@ -262,6 +282,22 @@ static void supervisor_task(void *arg)
          * comparison of two numbers until something has to change.
          */
         ag_powerctl_tick();
+
+        /*
+         * How close that came.  Reported once, at the low-water mark, because
+         * the interesting event is the margin shrinking and not its value on
+         * any particular tick.
+         */
+        {
+            static uint32_t s_stack_reported = 0xffffffffu;
+            const uint32_t  left = ag_port_task_stack_unused(NULL);
+            if (left < AG_SUP_STACK_FLOOR && left < s_stack_reported) {
+                s_stack_reported = left;
+                ag_log(AG_LOG_WARN, "supervisor",
+                       "%u bytes of stack left of %u; raise AG_SUP_STACK",
+                       (unsigned)left, (unsigned)AG_SUP_STACK);
+            }
+        }
 
         /*
          * A process that promised to report progress and stopped.  Checked here

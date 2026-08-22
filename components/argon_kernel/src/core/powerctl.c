@@ -418,9 +418,17 @@ static uint32_t sweep(ag_power_mode_t mode, bool refusers_only,
     return n;
 }
 
+/*
+ * `by` is what the journal calls whoever started this.  The cause says what the
+ * transition is allowed to do; this says who asked, and they are not the same
+ * question - a raise triggered by an application declaring that it needs the
+ * clock is advisory like the timer's, and reading "full by idle timer" when no
+ * timer was involved sends the next person looking in the wrong place.
+ */
 static ag_err_t apply_locked(const ag_power_target_t *want,
-                            ag_power_cause_t cause, ag_power_ended_t *ended,
-                            uint32_t max, uint32_t *n_ended)
+                            ag_power_cause_t cause, const char *by,
+                            ag_power_ended_t *ended, uint32_t max,
+                            uint32_t *n_ended)
 {
 
     ag_power_target_t prev;
@@ -521,8 +529,7 @@ static ag_err_t apply_locked(const ag_power_target_t *want,
     ag_log(AG_LOG_INFO, "power",
            "%s by %s: cpu %u-%u MHz, screen %s (%u parked, %u silent, "
            "%u declared, %u ended)",
-           mode_name(applied.mode),
-           (cause == AG_POWER_USER) ? "command" : "idle timer",
+           mode_name(applied.mode), by,
            (unsigned)applied.cpu_min_mhz, (unsigned)applied.cpu_max_mhz,
            applied.screen_on ? "on" : "off", (unsigned)parked,
            (unsigned)silent, (unsigned)declared, (unsigned)gone);
@@ -545,7 +552,9 @@ ag_err_t ag_powerctl_apply(const ag_power_target_t *want,
     if (!lock_take(AG_PORT_FOREVER)) {
         return -AG_EBUSY;
     }
-    const ag_err_t err = apply_locked(want, cause, ended, max, n_ended);
+    const ag_err_t err = apply_locked(
+        want, cause, (cause == AG_POWER_USER) ? "command" : "idle timer", ended,
+        max, n_ended);
     lock_give();
     return err;
 }
@@ -612,7 +621,8 @@ void ag_powerctl_declared(ag_power_fitness_t fitness)
         want.mode = AG_POWER_FULL;
         want.cpu_min_mhz = cpu_max_mhz();
         want.cpu_max_mhz = want.cpu_min_mhz;
-        (void)apply_locked(&want, AG_POWER_AUTO, NULL, 0u, NULL);
+        (void)apply_locked(&want, AG_POWER_AUTO, "a declaration", NULL, 0u,
+                           NULL);
     }
     lock_give();
 }
@@ -692,6 +702,6 @@ void ag_powerctl_tick(void)
         return;
     }
 
-    (void)apply_locked(&want, AG_POWER_AUTO, NULL, 0u, NULL);
+    (void)apply_locked(&want, AG_POWER_AUTO, "idle timer", NULL, 0u, NULL);
     lock_give();
 }

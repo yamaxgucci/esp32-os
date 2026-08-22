@@ -50,9 +50,14 @@
  *   that latched a divider off that bus keeps its divider: a serial port set
  *   up for 115200 baud at one bus frequency talks at another when the bus
  *   moves, which arrives as garbage on the console rather than as an error.
- *   A port that cannot keep its console readable across the change must not
- *   claim AG_PORT_PWR_CPU_BAND - a system that cannot be talked to cannot be
- *   told to speed up again.
+ *   A port must not offer a step it cannot keep the console readable across - a
+ *   system that cannot be talked to cannot be told to speed up again.
+ *
+ *   This is not hypothetical.  The ESP-IDF port offers 240, 160 and 80, where
+ *   the bus stays where it is, and does not offer the crystal, where it does
+ *   not: on the board that step ended the conversation mid-line and only a
+ *   reset brought it back.  The list is the port's promise about what survives,
+ *   not an inventory of what the silicon can be set to.
  *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
