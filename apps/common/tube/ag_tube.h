@@ -101,6 +101,26 @@
  * Keeping them beside the resistors is what stops the filters from becoming
  * numbers somebody dialled in.
  */
+/*
+ * What kind of thing this stage is.
+ *
+ * Zero is a triode, so a spec that predates this field is still a valve.  The
+ * pedal kind is an antiparallel diode pair across the feedback resistor of a
+ * non-inverting op-amp stage - a Tube Screamer - and it uses `ri`, `ci`, `rf` and
+ * the two diode numbers instead of the plate and cathode.
+ */
+typedef enum ag_tube_kind {
+    AG_TUBE_TRIODE = 0,
+    AG_TUBE_TS_FEEDBACK = 1,
+    /*
+     * No curve at all: the stage is its filters and its gain and nothing else.
+     * Nothing switches on this - bake_all skips a stage marked linear in
+     * ag_amp_cfg_t before it ever looks at the kind - and it is here so that a
+     * spec for such a stage does not have to claim to be a triode.
+     */
+    AG_TUBE_LINEAR = 2
+} ag_tube_kind_t;
+
 typedef struct ag_tube_spec {
     float rsrc;    /* output impedance of whatever drives this stage       */
     float rgrid;   /* grid leak                                            */
@@ -113,7 +133,22 @@ typedef struct ag_tube_spec {
     float cload;   /* output coupling capacitor                            */
     float rload;   /* input impedance of whatever this stage drives        */
     ag_triode_model_t valve;
+    /* Zero for a valve; see ag_tube_kind_t. */
+    int   kind;
+    /* The pedal, and only the pedal: the input leg (resistor and the capacitor
+     * that makes the mid hump), the feedback resistor including the drive pot,
+     * and the diode's saturation current and n*Vt. */
+    float ri, ci, rf, dio_is, dio_nvt;
 } ag_tube_spec_t;
+
+/*
+ * An Ibanez TS9 Tube Screamer with all three knobs at noon, which is what the
+ * capture in assets/audio/guitar-di/Ibanez.nam was taken at - its own metadata says
+ * "Drive 5, Tone 5, Level 5".  Values from the published schematic; the drive pot
+ * is a 500k at half.
+ */
+/* index 0 the input buffer, 1 the clipping stage. */
+void ag_tube_spec_ts9(ag_tube_spec_t *out, int index);
 
 /* The published 12AX7 fit and the two JCM800 preamp stages, from the same
  * numbers as apps/cktbench/ckt_circuits.c - test_tube.c checks they agree. */
@@ -397,6 +432,22 @@ int ag_tube_attach(ag_tube_t *tb, const float *tab, const float *tabh,
 int ag_tube_bake_clipper(ag_tube_t *tb, ag_ckt_t *scratch, float rseries,
                          float vf, float gain_match, float *tab, float *tabh,
                          float *tabg, int n, float lo, float hi);
+
+/*
+ * The other pedal curve: an antiparallel pair across the **feedback** resistor of a
+ * non-inverting stage, which is what a Tube Screamer clips with.
+ *
+ * `ri` is the resistive part of the input leg, `rf` the feedback resistor plus the
+ * drive pot, `is` and `nvt` the diode's saturation current and n*Vt.  All four are
+ * real component values.  The frequency dependence of the input leg - the capacitor
+ * that makes the mid hump - is deliberately *not* in here: see the note on the
+ * implementation.  No ag_ckt needed; one unknown, solved directly.
+ *
+ * Returns 0 on success.
+ */
+int ag_tube_bake_ts(ag_tube_t *tb, float ri, float rf, float is, float nvt,
+                    float *tab, float *tabh, float *tabg, int n, float lo,
+                    float hi);
 
 /*
  * Mix two baked table sets into a third, at `b` from 0 (all of A) to 1 (all

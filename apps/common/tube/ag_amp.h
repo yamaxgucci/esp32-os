@@ -127,7 +127,16 @@ enum ag_amp_model_id {
     AG_AMP_MODEL_JCM800 = 0, /* two hot-rodded valves, no volume between them */
     AG_AMP_MODEL_BOGNER = 1, /* two stock valves with a volume between them */
     AG_AMP_MODEL_SLO = 2,    /* four valves, the third one cold */
-    AG_AMP_MODEL_N = 3
+    /*
+     * Not an amplifier at all: one op-amp stage that clips in its own feedback
+     * loop, which is what a Tube Screamer is.  It is here because everything this
+     * module does to a valve - bake a curve, put the stage's own filters around
+     * it, fit matching banks against a capture - is exactly what a pedal needs,
+     * and the only thing that had to be added was the curve.  It has one stage,
+     * no tone stack and no loudspeaker.
+     */
+    AG_AMP_MODEL_TS9 = 3,
+    AG_AMP_MODEL_N = 4
 };
 
 typedef struct ag_amp_cfg {
@@ -145,6 +154,26 @@ typedef struct ag_amp_cfg {
     float gain[AG_AMP_STAGES];
     /* No table: the stage is its filter block and its gain, and nothing else. */
     int   linear[AG_AMP_STAGES];
+    /*
+     * ITERATION 4 DOES NOT FIT AN IMPULSE FOR THIS MODEL
+     *
+     * It was called `no_speaker`, which claimed something about the device that
+     * this file has no way of knowing - whether a given capture has a loudspeaker
+     * in it is a measurement, and two ways of taking it disagreed on the TS9.
+     * What the flag controls is narrower and is a choice rather than a fact: the
+     * impulse-fitting steps are skipped, no cabinet goes on either side of the
+     * comparison, and the chain is matched bare.
+     *
+     * It says **nothing** about whether the preset carries a cabinet.  The walk's
+     * last step folds the output bank into the impulse for every model, so a
+     * preset always has one; what this changes is only whether iteration 4 also
+     * fitted one before that fold.
+     *
+     * What reads it: `match` and `iter4` skip the impulse, and `polish` sends our
+     * side through unity instead of one.
+     */
+    int   no_ir_fit;
+
     int   os;   /* 1, 2, 4 or 8 */
     int   adaa; /* antialiasing inside the curve; nearly free, so default on */
     /*
@@ -168,18 +197,6 @@ typedef struct ag_amp_cfg {
     /* Mirrors of gain[0] and gain[1], kept because every knob, tool argument and
      * note in this tree calls them that.  ag_amp_build copies them in. */
     float drive;
-    /*
-     * Between the stages, 1.0 being what the circuit does on its own.
-     *
-     * This is the control that cleans up, and the reason it exists is measured
-     * rather than theoretical.  A 2203 has no volume between V1a and V1b, so V1b
-     * is slammed at every setting: the chain lifts a recording's noise floor by
-     * 16 dB of compression, against 10 dB for the three-valve chain in
-     * apps/cktbench, whose tone stack throws away 15-20 dB before its last
-     * valve.  Six decibels of that difference is audible as hiss.  A Plexi has a
-     * pot here; a 2203 does not; g12 is that pot.
-     */
-    float g12;
     /*
      * V1b's input coupling capacitor, in farads; 0 keeps the 2.2 nF the netlist
      * has.
@@ -218,6 +235,35 @@ typedef struct ag_amp_cfg {
      * reports what it actually did, which is how this should be set. */
     float master;
 
+    /*
+     * How deep the top cut is, in dB, and zero means the old behaviour: a
+     * second-order low-pass at `top_hz`.  Non-zero makes it a first-order shelf
+     * of that depth instead, which is what a pedal's tone network actually is -
+     * six decibels an octave, not twelve.
+     */
+    float top_db;
+    /*
+     * A TOP CUT AT THE OUTPUT, WHICH IS A DIFFERENT COMPONENT FROM top_hz
+     *
+     * Same shape - a resistor into a capacitor, first order, and split into two
+     * shelves when it is deeper than 20 dB - and a different place in the chain:
+     * this one is built into the output block, after the last clipping stage,
+     * where a stompbox's tone control is soldered.  top_hz above is a valve
+     * amplifier's *input* rolloff and is built in front of the first valve.
+     *
+     * Two pairs of numbers rather than one pair plus a flag saying which end,
+     * because there is nothing for the matching layer to decide here: where a
+     * component sits is the schematic's business.  Each is built where it is, and
+     * a device with both sets both.
+     *
+     * That it matters at all is measured, on the TS9, with nothing else changed:
+     * described with top_hz - so in front of the diodes - it read 5.64 dB loud
+     * and 13.78 of swing error; in its own place, 2.03 and 1.89.  In front, the
+     * diodes are fed a signal that has already lost its top and the fizz they then
+     * make is never filtered by anything; behind, the pedal removes what it made.
+     */
+    float out_top_hz;
+    float out_top_db;
     /* The two voicing numbers.  Zero disables either. */
     float top_hz;
     float mid_hz, mid_db, mid_q;
@@ -261,7 +307,7 @@ typedef struct ag_amp_cfg {
      * valve is fed and therefore what kind of distortion it makes.
      *
      * What this is not allowed to be is a redistribution of the amplifier's own
-     * gain.  `gain[]`, `g12`, `drive` and every component value are the circuit
+     * gain.  `gain[]`, `drive` and every component value are the circuit
      * and stay where the schematic put them; a measured attempt to fix the gain
      * distribution by attenuating in front of the last valve with `gain[3]`
      * improved the knee and broke the model ordering, because a cut with no
@@ -416,7 +462,7 @@ typedef struct ag_amp {
     ag_os8_t       os;
     int            tab_n;
     /* What the build decided, so that it can be printed rather than assumed. */
-    float top_hz_used, mid_hz_used;
+    float top_hz_used, mid_hz_used, out_top_hz_used;
     float couple_hz[AG_AMP_STAGES];
     float shelf_hz[AG_AMP_STAGES], shelf_db[AG_AMP_STAGES];
     float load_hz;
@@ -457,6 +503,10 @@ const char *ag_amp_model_name(int model);
  * nobody has read gets no controls rather than borrowed ones.
  */
 int ag_amp_tone_spec(int model, ag_tone_spec_t *out);
+
+/* 1 if this model is a pedal: no loudspeaker anywhere, and its tone control is
+ * its own circuit.  See the note on the implementation - the usual 6.3 kHz test
+ * calls a Tube Screamer a loudspeaker. */
 
 /* The reverse, for a command line or an environment variable.  -1 if unknown. */
 int ag_amp_model_by_name(const char *s);
@@ -528,7 +578,7 @@ int ag_amp_build(ag_amp_t *a, ag_ckt_t *scratch, const ag_amp_cfg_t *cfg,
                  float *tab, int n, const float *probe, int probe_n);
 
 /*
- * Re-do only what a knob needs.  `drive`, `g12` and `master` are plain
+ * Re-do only what a knob needs.  `drive` and `master` are plain
  * multiplies and need nothing; the voicing numbers and `os` need the filters
  * designed again, which is microseconds.  Neither touches the curve.  Returns 0
  * on success.
@@ -596,13 +646,36 @@ uint32_t ag_amp_clamped(const ag_amp_t *a);
  * that loaded with a shifted config would play something else entirely - but the
  * version says *why* rather than leaving it as a size mismatch.
  */
-#define AG_AMP_PRESET_VER   2u
+/*
+ * 3: the cabinet impulse lives in the preset.  It is part of what a chain sounds
+ * like, and keeping it in a separate wav meant a preset could be copied while its
+ * loudspeaker stayed behind.
+ */
+#define AG_AMP_PRESET_VER   3u
 
-/* Bytes a preset with this shape occupies. */
-uint32_t ag_amp_preset_size(int n_stages, int tab_n);
+/*
+ * Bytes a preset with this shape occupies.  `ir_frames` may be zero: a device
+ * with no loudspeaker - a pedal - carries no impulse and says so.
+ */
+uint32_t ag_amp_preset_size(int n_stages, int tab_n, int ir_frames);
 
-/* Write `a` into `buf`.  Returns the bytes written, or 0 if it did not fit. */
-uint32_t ag_amp_preset_save(const ag_amp_t *a, void *buf, uint32_t cap);
+/*
+ * Write `a` into `buf`, with `ir` as its loudspeaker.  int16 because that is what
+ * `ag_ir_load` takes on the chip and what the impulse is on disk, so nothing is
+ * converted anywhere.  Pass NULL and 0 for a device that has none.  Returns the
+ * bytes written, or 0 if it did not fit.
+ */
+uint32_t ag_amp_preset_save(const ag_amp_t *a, const int16_t *ir,
+                            int ir_frames, uint32_t ir_rate, void *buf,
+                            uint32_t cap);
+
+/*
+ * The impulse a preset carries: a pointer into `buf`, valid as long as `buf` is,
+ * and NULL when the preset has none.  Separate from the load so that a caller
+ * who only wants the amplifier does not have to know about loudspeakers.
+ */
+const int16_t *ag_amp_preset_ir(const void *buf, uint32_t n, uint32_t *frames,
+                                uint32_t *rate);
 
 /*
  * Read a preset into `a`, with its tables copied into `tab` - which must hold

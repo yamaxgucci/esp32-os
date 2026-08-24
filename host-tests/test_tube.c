@@ -752,6 +752,14 @@ static void test_amp_chain(void)
         ag_amp_defaults(&cfg, TFS);
         cfg.os = 1;
         cfg.adaa = 0;
+        /*
+         * The matching layer out: the drive knob has to move the output whatever the
+         * voicing is, and with the walk's trims in front of every stage - +20 dB on
+         * the first of them on this model - a chain at drive 0.25 is already
+         * saturated and quadrupling the drive adds almost nothing.  That is a true
+         * statement about a slammed chain and not what this checks.
+         */
+        amp_no_voicing(&cfg);
         if (ag_amp_build(a, k, &cfg, tab, 0, probe, PROBE_N) == 0) {
             for (d = 0; d < 2; d++) {
                 double acc = 0.0;
@@ -880,7 +888,6 @@ static void test_stage_counts(void)
             }
             cfg.n_stages = 2;
             cfg.linear[1] = 1;
-            cfg.g12 = 1.0f;
             if (ag_amp_build(a, k, &cfg, tab, 0, probe, PROBE_N) == 0) {
                 for (i = 0; i < 2048; i++) {
                     two[i] = ag_amp_tick(a, probe[i]);
@@ -936,6 +943,9 @@ static void test_preset(void)
     ag_amp_cfg_t cfg;
     uint32_t     size, wrote;
     int          i, diff = 0;
+/* Short, because what is being tested is that the bytes survive, not a cabinet. */
+#define PRESET_IR_N 64
+    int16_t      ir_in[PRESET_IR_N];
 
     if (k == 0 || tabA == 0 || tabB == 0 || a == 0 || b == 0 || probe == 0) {
         AG_CHECK(0);
@@ -946,17 +956,44 @@ static void test_preset(void)
     cfg.os = 2;
     AG_CHECK_INT(ag_amp_build(a, k, &cfg, tabA, 0, probe, PROBE_N), 0);
 
-    size = ag_amp_preset_size(a->n, a->tab_n);
+    /*
+     * A short impulse with a recognisable shape, because the preset carries the
+     * loudspeaker now and a field that is written but never read back is a field
+     * that will one day be written wrong.
+     */
+    {
+        int q;
+        for (q = 0; q < PRESET_IR_N; q++) {
+            ir_in[q] = (int16_t)(q == 0 ? 32000 : (q * 37) % 4001 - 2000);
+        }
+    }
+    size = ag_amp_preset_size(a->n, a->tab_n, PRESET_IR_N);
     AG_CHECK(size > 0);
+    AG_CHECK(size > ag_amp_preset_size(a->n, a->tab_n, 0));
     blob = (uint8_t *)malloc(size);
     if (blob == 0) {
         AG_CHECK(0);
         goto done;
     }
     /* One byte short must fail rather than write past the end. */
-    AG_CHECK_INT(ag_amp_preset_save(a, blob, size - 1), 0);
-    wrote = ag_amp_preset_save(a, blob, size);
+    AG_CHECK_INT(ag_amp_preset_save(a, ir_in, PRESET_IR_N, 22050u, blob,
+                                    size - 1), 0);
+    wrote = ag_amp_preset_save(a, ir_in, PRESET_IR_N, 22050u, blob, size);
     AG_CHECK_INT(wrote, size);
+    {
+        uint32_t       fn2 = 0, fr = 0;
+        const int16_t *back = ag_amp_preset_ir(blob, size, &fn2, &fr);
+        int            q, bad = 0;
+        AG_CHECK(back != 0);
+        AG_CHECK_INT((int)fn2, PRESET_IR_N);
+        AG_CHECK_INT((int)fr, 22050);
+        for (q = 0; back != 0 && q < PRESET_IR_N; q++) {
+            if (back[q] != ir_in[q]) {
+                bad++;
+            }
+        }
+        AG_CHECK_INT(bad, 0);
+    }
 
     AG_CHECK_INT(ag_amp_preset_load(b, blob, size, tabB, TFS), 0);
     AG_CHECK_INT(b->n, a->n);
@@ -1503,8 +1540,18 @@ static void test_models(void)
      * the stock stages around it. */
     AG_CHECK(fabsf(a->tube[1].gain_bypassed) > fabsf(a->tube[0].gain_bypassed));
     AG_CHECK(fabsf(a->tube[1].gain_bypassed) > fabsf(a->tube[2].gain_bypassed));
-    /* And the gain pot at noon, like every other pot in this tree. */
-    AG_CHECK(a->gain[1] == 0.5f);
+    /*
+     * The interstage level lives in the trim now - the only place in front of
+     * the second valve, since g12 was removed rather than renamed.
+     *
+     * What is pinned is the structure, not the number: `gain[1]` is unity, so
+     * nothing else multiplies there, and the trim attenuates rather than boosts.
+     * The number itself is whatever the last walk fitted, and pinning it made
+     * this test fail the first time the walk was rerun - which is a test
+     * measuring the fit rather than the amplifier.
+     */
+    AG_CHECK(a->gain[1] == 1.0f);
+    AG_CHECK(a->vtrim[1] > 0.0f && a->vtrim[1] < 1.0f);
 
     /*
      * The SLO: four stages, the third one cold, and every attenuator between them
@@ -1583,7 +1630,11 @@ static void test_models(void)
      * between the stages is a multiplier any more - if this ever reads as
      * something other than a half, a divider has gone back into a constant.
      */
-    AG_CHECK(a->gain[1] == 0.5f);
+    /* The same structural check as on the bogner above, and for the same reason:
+     * the trim is alone in front of the second valve and it attenuates.  Its
+     * value is the walk's, so it is not pinned here. */
+    AG_CHECK(a->gain[1] == 1.0f);
+    AG_CHECK(a->vtrim[1] > 0.0f && a->vtrim[1] < 1.0f);
     AG_CHECK(a->gain[2] == 1.0f);
     AG_CHECK(a->gain[3] == 1.0f);
 
@@ -1914,7 +1965,7 @@ static void test_preset_models(void)
             AG_CHECK(0);
             continue;
         }
-        size = ag_amp_preset_size(a->n, a->tab_n);
+        size = ag_amp_preset_size(a->n, a->tab_n, 0);
         AG_CHECK(size > 0);
         free(blob);
         blob = (uint8_t *)malloc(size);
@@ -1922,8 +1973,11 @@ static void test_preset_models(void)
             AG_CHECK(0);
             continue;
         }
-        wrote = ag_amp_preset_save(a, blob, size);
+        wrote = ag_amp_preset_save(a, 0, 0, 0u, blob, size);
         AG_CHECK_INT((int)wrote, (int)size);
+        /* No loudspeaker in this one, and the accessor says so rather than
+         * handing back a pointer into the tables. */
+        AG_CHECK(ag_amp_preset_ir(blob, wrote, 0, 0) == 0);
         /* Loading needs no solver: that is the whole claim of the format. */
         AG_CHECK_INT(ag_amp_preset_load(b, blob, wrote, tabB, TFS), 0);
         AG_CHECK_INT(b->n, a->n);
@@ -2160,9 +2214,19 @@ static void test_couple_mul(void)
         ag_amp_cfg_t cfg;
         double       e = 0.0;
         int          b;
+        float pot;
         ag_amp_model(&cfg, AG_AMP_MODEL_BOGNER, TFS);
+        pot = cfg.vtrim[1];
         /* The voicing out of the way: this is about one high-pass corner. */
         amp_no_voicing(&cfg);
+        /*
+         * And the interstage level back in, because it is not voicing.  It used
+         * to be its own field and `amp_no_voicing` left it alone; now it shares
+         * the trim with the fitted level, so zeroing one zeroes both, and this
+         * test is about a coupling corner rather than about how hard the second
+         * valve is driven.
+         */
+        cfg.vtrim[1] = pot;
         cfg.mid_db = 0.0f;
         cfg.couple_mul[1] = muls[m]; /* the second stage, see the note above */
         if (ag_amp_build(a, k, &cfg, tab, 0, probe, PROBE_N) != 0) {
@@ -2218,8 +2282,11 @@ static void test_couple_mul(void)
         ag_amp_cfg_t cfg;
         double       e = 0.0;
         int          b;
+        float pot;
         ag_amp_model(&cfg, AG_AMP_MODEL_BOGNER, TFS);
+        pot = cfg.vtrim[1];
         amp_no_voicing(&cfg);
+        cfg.vtrim[1] = pot; /* not voicing: see the note in the sweep above */
         cfg.mid_db = 0.0f;
         cfg.couple_mul[1] = 0.0f;
         if (ag_amp_build(a, k, &cfg, tab, 0, probe, PROBE_N) == 0) {

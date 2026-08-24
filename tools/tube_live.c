@@ -552,12 +552,32 @@ static void solo_design(void)
  * preset is a reverb and not a cabinet: if the *fitted* impulse is missing, the
  * answer is to say so, not to put a hall into the comparison.
  */
-static int cab_load(const char *path, uint32_t rate, int primary)
+/*
+ * `irf` is the impulse, already in float at `irrate`, and this owns nothing: the
+ * caller frees it.  `label` is what to call it in the report - a file name, or
+ * the preset it came out of.
+ *
+ * Split out of cab_load so that a preset's cabinet, which arrives as int16 in
+ * memory, goes down exactly the same path as one read from a wav.  Two loaders
+ * would be two places for the staging arithmetic below to drift apart.
+ */
+static int cab_load_f(const float *irf_in, uint32_t irn_in, uint32_t irrate,
+                      uint32_t rate, int primary, const char *label)
 {
-    uint32_t irn = 0, irrate = 0;
+    uint32_t irn = irn_in;
     float   *irf = NULL;
     int      ok = -1;
+    const char *path = label;
 
+    if (irf_in != NULL && irn_in > 0u) {
+        irf = (float *)malloc(sizeof(float) * irn_in);
+        if (irf != NULL) {
+            uint32_t q;
+            for (q = 0; q < irn_in; q++) {
+                irf[q] = irf_in[q];
+            }
+        }
+    }
     g_ir = (ag_ir_t *)calloc(1, sizeof(ag_ir_t));
     g_fir = NULL;
     g_fhist = NULL;
@@ -572,7 +592,6 @@ static int cab_load(const char *path, uint32_t rate, int primary)
      * speaker passes - the note in tube_render.c has the whole story. */
     ag_ir_set_wet(g_ir, AG_IR_WET_MAX);
 
-    irf = path != NULL ? read_wav(path, &irn, &irrate) : NULL;
     if (irf != NULL) {
         /* 200 ms, for the reason measured in tube_render.c: past that an impulse
          * taken from a nonlinear model is the model's own noise floor, and
@@ -822,6 +841,91 @@ static void cab_restore(int i)
     g_cabi = i;
 }
 
+/* The wav front end: read one, hand it to the loader above. */
+static int cab_load(const char *path, uint32_t rate, int primary)
+{
+    uint32_t irn = 0, irrate = 0;
+    float   *irf = path != NULL ? read_wav(path, &irn, &irrate) : NULL;
+    int      rc;
+
+    rc = cab_load_f(irf, irn, irrate, rate, primary, path);
+    free(irf);
+    return rc;
+}
+
+/*
+ * THE CABINET OUT OF A PRESET
+ *
+ * A preset carries its loudspeaker, so this is where it is taken from: int16 in
+ * the file, because that is what `ag_ir_load` takes on the chip, converted to
+ * float here only because the loader above shares its staging arithmetic with the
+ * wav path.
+ *
+ * Returns 0 when a cabinet was loaded, 1 when the preset is readable and says it
+ * has **no** loudspeaker - which is an answer, not a failure - and -1 when there
+ * is no preset to read.
+ */
+static int cab_from_preset(const char *path, uint32_t rate, char *label,
+                           size_t label_n)
+{
+    FILE     *f = path != NULL ? fopen(path, "rb") : NULL;
+    uint8_t  *blob = NULL;
+    long      len = 0;
+    uint32_t  frames = 0, irrate = 0;
+    const int16_t *ir;
+    int       rc = -1;
+
+    if (f == NULL) {
+        return -1;
+    }
+    fseek(f, 0, SEEK_END);
+    len = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (len > 0) {
+        blob = (uint8_t *)malloc((size_t)len);
+    }
+    if (blob == NULL || fread(blob, 1, (size_t)len, f) != (size_t)len) {
+        free(blob);
+        fclose(f);
+        return -1;
+    }
+    fclose(f);
+    ir = ag_amp_preset_ir(blob, (uint32_t)len, &frames, &irrate);
+    if (ir == NULL || frames == 0u) {
+        /* Either the preset has no cabinet, or it is not a preset this build
+         * understands.  ag_amp_preset_ir checks the magic and the version, so
+         * the difference is worth reporting rather than papering over. */
+        uint32_t m = 0;
+        if ((uint32_t)len >= sizeof(uint32_t)) {
+            m = ((const uint32_t *)(const void *)blob)[0];
+        }
+        if (m == AG_AMP_PRESET_MAGIC) {
+            snprintf(label, label_n, "%s, which carries no cabinet", path);
+            rc = 1;
+        }
+        free(blob);
+        return rc;
+    }
+    {
+        float *fl = (float *)malloc(sizeof(float) * frames);
+        if (fl == NULL) {
+            free(blob);
+            return -1;
+        }
+        {
+            uint32_t q;
+            for (q = 0; q < frames; q++) {
+                fl[q] = (float)ir[q] / 32768.0f;
+            }
+        }
+        snprintf(label, label_n, "%s", path);
+        rc = cab_load_f(fl, frames, irrate, rate, 1, label) == 0 ? 0 : -1;
+        free(fl);
+    }
+    free(blob);
+    return rc;
+}
+
 /*
  * Both cabinets, at startup.
  *
@@ -839,8 +943,12 @@ static int cab_open(uint32_t rate)
 {
     const char *env = getenv("AG_CAB_IR");
     const char *fenv = getenv("AG_CAB_FIT");
+    const char *penv = getenv("AG_CAB_PRESET");
     char        pbuf[1024], fbuf[1024], rel[160];
+    char        plabel[1024];
     const char *path = NULL, *fpath = NULL;
+    /* 0 loaded from a preset, 1 the preset says there is no cabinet. */
+    int         from_preset = -1;
 
     g_mono = (int16_t *)malloc(sizeof(int16_t) * (size_t)BLK);
     g_st = (int16_t *)malloc(sizeof(int16_t) * (size_t)BLK * 2);
@@ -850,6 +958,32 @@ static int cab_open(uint32_t rate)
 
     if (env != NULL) {
         path = resolve(pbuf, sizeof(pbuf), env);
+    }
+    /*
+     * THEN THE PRESET, BEFORE ANY LOOSE FILE
+     *
+     * A preset carries its own loudspeaker, and that is the point of it carrying
+     * one: the preset says what this amplifier sounds like, so an `ir_*.wav` left
+     * behind by an experiment must not outrank it.  AG_CAB_IR still wins, because
+     * that is somebody asking for a particular speaker on purpose.
+     */
+    if (path == NULL) {
+        char        prel[200];
+        const char *ppath;
+        snprintf(prel, sizeof(prel), "build/listen/%s.preset",
+                 ag_amp_model_name(g_model));
+        ppath = penv != NULL ? resolve(pbuf, sizeof(pbuf), penv)
+                             : resolve(pbuf, sizeof(pbuf), prel);
+        plabel[0] = 0;
+        if (ppath != NULL) {
+            from_preset = cab_from_preset(ppath, rate, plabel, sizeof(plabel));
+        }
+        if (from_preset == 0) {
+            printf("  cabinet: from the preset %s\n", plabel);
+        } else if (from_preset == 1) {
+            printf("  cabinet: %s - so there is none, and 'c' has nothing to"
+                   " switch on\n", plabel);
+        }
     }
     /*
      * Then mode 1's impulse: the one fitted with the post bank still in.
@@ -867,7 +1001,7 @@ static int cab_open(uint32_t rate)
      * speaker, and an A/B whose two sides carry different loudspeakers is a
      * comparison of loudspeakers.
      */
-    if (path == NULL) {
+    if (path == NULL && from_preset < 0) {
         char rel0[200];
         snprintf(rel0, sizeof(rel0), "build/listen/ir_%s_bank.wav",
                  ag_amp_model_name(g_model));
@@ -878,18 +1012,24 @@ static int cab_open(uint32_t rate)
             path = resolve(pbuf, sizeof(pbuf), rel0);
         }
     }
-    if (path == NULL) {
+    if (path == NULL && from_preset < 0) {
         path = resolve(pbuf, sizeof(pbuf), AG_CAB_MATCHED);
     }
-    if (path == NULL) {
+    if (path == NULL && from_preset < 0) {
         path = resolve(pbuf, sizeof(pbuf), AG_CAB_FALLBACK);
     }
-    if (cab_load(path, rate, 1) != 0) {
+    if (from_preset < 0 && cab_load(path, rate, 1) != 0) {
         return -1;
     }
     cab_store(0);
     snprintf(g_cab[0].path, sizeof(g_cab[0].path), "%s",
-             path != NULL ? path : "ag_ir preset 4, which is not a cabinet");
+             from_preset == 0 ? plabel
+                              : (from_preset == 1
+                                     ? plabel
+                                     : (path != NULL
+                                            ? path
+                                            : "ag_ir preset 4, which is not a"
+                                              " cabinet")));
 
     snprintf(rel, sizeof(rel), "build/listen/ir_%s_fitted.wav",
              ag_amp_model_name(g_model));
@@ -923,6 +1063,9 @@ static int cab_open(uint32_t rate)
      * impulse happened to have no float path, that is its business and not the
      * shipping cabinet's. */
     g_cab_mode = g_fir != NULL ? 1 : 2;
+    if (from_preset == 1) {
+        g_cab_mode = 0; /* the preset says there is no loudspeaker */
+    }
     g_cab_want = g_cab_mode;
     return 0;
 }
@@ -1361,7 +1504,7 @@ static void help(void)
     printf("\n"
            "   q / a   drive          w / s   blend of the chosen stage\n"
            "   e / d   mid, dB        r / f   top cut, Hz\n"
-           "   t / g   g12            n / m   master\n"
+           "   t / g   trim 2 (dB)    n / m   master\n"
            "   [ / ]   volume, after the cabinet - changes nothing in the model\n"
            "   1 - 4   stages         x       which stage the blend knob turns\n"
            "   5 / 6   bass           7 / 8   mid        9 / \\   treble\n"
@@ -1385,9 +1528,9 @@ static void help(void)
 static void print_settings(void)
 {
     int i;
-    printf("\n  drive %.2f  g12 %.2f  master %.5f  mid %+.1f dB at %.0f Hz  top"
+    printf("\n  drive %.2f  trim2 %+.1f dB  master %.5f  mid %+.1f dB at %.0f Hz  top"
            " %.0f Hz\n",
-           (double)g_cfg.drive, (double)g_cfg.g12, (double)g_cfg.master,
+           (double)g_cfg.drive, (double)g_cfg.vtrim[1], (double)g_cfg.master,
            (double)g_cfg.mid_db, (double)g_cfg.mid_hz, (double)g_cfg.top_hz);
     if (g_cfg.tone_stack) {
         printf("  tone stack: bass %.2f  mid %.2f  treble %.2f  (0.5 is noon)\n",
@@ -1478,14 +1621,18 @@ static int key(int c)
         knobs();
         break;
     case 't':
-        g_cfg.g12 -= 0.02f;
-        if (g_cfg.g12 < 0.0f) {
-            g_cfg.g12 = 0.0f;
+        /* The interstage level, which used to be `g12` and is the same point
+         * in the chain: gain, bank and trim all sit in front of the second
+         * valve, so one of them is enough and the trim is the one the matching
+         * layer already fits. */
+        g_cfg.vtrim[1] -= 0.5f;
+        if (g_cfg.vtrim[1] < -40.0f) {
+            g_cfg.vtrim[1] = -40.0f;
         }
         knobs();
         break;
     case 'g':
-        g_cfg.g12 += 0.02f;
+        g_cfg.vtrim[1] += 0.5f;
         knobs();
         break;
     case 'e':
@@ -1649,7 +1796,7 @@ static int key(int c)
         if (g_cab_mode != 0) {
             g_cab_want = g_cab_mode;
             g_cab_mode = 0;
-        } else {
+        } else if (g_cab_want != 0) {
             cab_enter(g_cab_want);
         }
         break;
@@ -1780,8 +1927,8 @@ static void status(void)
     int  k;
 
     k = snprintf(line, sizeof(line),
-                 " dr %.2f g12 %.2f bl%d %.2f mid %+.1f top %5.0f %dx%s%s n%d %s",
-                 (double)g_cfg.drive, (double)g_cfg.g12, g_bstage + 1,
+                 " dr %.2f tr2 %+.1f bl%d %.2f mid %+.1f top %5.0f %dx%s%s n%d %s",
+                 (double)g_cfg.drive, (double)g_cfg.vtrim[1], g_bstage + 1,
                  (double)g_mix[g_n - 1][g_bstage], (double)g_cfg.mid_db,
                  (double)g_cfg.top_hz, g_cfg.os, g_cfg.adaa ? "+aa" : "",
                  g_cfg.blocking ? " blk" : "", g_n,
@@ -2256,8 +2403,8 @@ int main(int argc, char **argv)
         for (c = keys; *c != 0; c++) {
             (void)key((unsigned char)*c);
         }
-        printf("  keys \"%s\": drive %.2f g12 %.2f top %.0f mid %+.1f cab %d\n",
-               keys, (double)g_cfg.drive, (double)g_cfg.g12,
+        printf("  keys \"%s\": drive %.2f trim2 %+.1f top %.0f mid %+.1f cab %d\n",
+               keys, (double)g_cfg.drive, (double)g_cfg.vtrim[1],
                (double)g_cfg.top_hz, (double)g_cfg.mid_db, g_cab_mode);
     }
 

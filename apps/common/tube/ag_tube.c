@@ -773,7 +773,31 @@ void ag_tube_shelf(const ag_tube_t *tb, const ag_tube_spec_t *sp, float *f_zero,
 {
     float fz = 0.0f, d = 0.0f;
 
-    if (tb != 0 && sp != 0 && sp->ccath > 0.0f && sp->rcath > 0.0f) {
+    if (tb != 0 && sp != 0 && sp->kind == AG_TUBE_TS_FEEDBACK &&
+        sp->ri > 0.0f && sp->ci > 0.0f && sp->rf > 0.0f) {
+        /*
+         * A pedal's shelf is not a cathode bypass, it is the input leg.  The
+         * stage's gain is 1 + Rf/(Ri + 1/sCi), which is exactly a first-order
+         * shelf: a zero at 1/(2pi (Ri+Rf) Ci) and a pole at 1/(2pi Ri Ci).  The
+         * baked curve already carries the plateau gain 1 + Rf/Ri, so what the
+         * filter has to add is the cut below - hence a negative depth, the same
+         * sign convention the cathode shelf uses.
+         */
+        /*
+         * The zero, not the midpoint between the zero and the pole.
+         *
+         * ag_biq_shelf1 takes the frequency where the transition *starts* and
+         * reaches its plateau a factor 10^(db/20) higher - so handing it the
+         * geometric mean put the plateau at 5.6 kHz instead of 720 Hz and left
+         * everything above 100 Hz twenty to thirty-six decibels too quiet.  The
+         * pedal then never clipped at all: a listener said 'there is no
+         * overdrive, it is clean', and the resp mode showed the block at -20.5 dB at
+         * 700 Hz where it should have been at unity.
+         */
+        const float fz2 = 1.0f / (6.28318531f * (sp->ri + sp->rf) * sp->ci);
+        fz = fz2;
+        d = -8.6858896f * ag_logf((sp->ri + sp->rf) / sp->ri);
+    } else if (tb != 0 && sp != 0 && sp->ccath > 0.0f && sp->rcath > 0.0f) {
         const float gb = absf(tb->gain_bypassed);
         const float gu = absf(tb->gain_unbypassed);
         fz = 1.0f / (6.28318531f * sp->rcath * sp->ccath);
@@ -814,11 +838,104 @@ float ag_tube_load_hz(const ag_tube_spec_t *sp)
     return 1.0f / (6.28318531f * sp->cload * sp->rload);
 }
 
+void ag_tube_spec_ts9(ag_tube_spec_t *out, int index)
+{
+    if (out == 0) {
+        return;
+    }
+    ag_triode_model_12ax7(&out->valve); /* unused, but never left as garbage */
+    if (index == 0) {
+        /*
+         * Q1, THE INPUT BUFFER - AND IT CARRIES NO CURVE ON PURPOSE
+         *
+         * An emitter follower: a 2SC1815 biased at half the supply by a pair of
+         * 510k, 10k from emitter to ground, signal out at the emitter.  Its
+         * transfer is out = in - Vbe(Ie) and Vbe moves as n*Vt*ln(Ie), so at the
+         * 0.45 mA this sits at, a +-0.5 V swing moves the emitter current by
+         * about a fifth and Vbe by six millivolts: a straight line to within one
+         * percent of full swing.
+         *
+         * That is a reason to leave *this* device's curve out, not a licence to
+         * leave devices out.  The capture agrees, and says so in the one place it
+         * would show: its harmonics are H3 at -16 to -21 dB with H2 at -29 to
+         * -64, which is a pure antiparallel pair.  A follower's own distortion is
+         * second order, so a table here would add the one thing the measurement
+         * says is not in the pedal.
+         *
+         * What the stage does carry is its input network - 10k in series with
+         * 47 nF into the 255k the bias pair presents, so 12.8 Hz - and a block of
+         * its own in front of the clipper, which is what the matching layer
+         * gains by it.
+         */
+        out->kind = AG_TUBE_LINEAR;
+        out->ri = 0.0f;
+        out->ci = 0.0f;
+        out->rf = 0.0f;
+        out->dio_is = 0.0f;
+        out->dio_nvt = 0.0f;
+        out->rsrc = 10.0e3f;
+        out->ccouple = 47.0e-9f;
+        out->rgrid = 255.0e3f; /* 510k over 510k, the bias pair */
+        out->rstop = 0.0f;
+        out->vsupply = 0.0f;
+        out->rplate = 0.0f;
+        out->rcath = 0.0f;
+        out->ccath = 0.0f;
+        /* The coupling into the clipper is the clipper's own, below. */
+        out->cload = 0.0f;
+        out->rload = 0.0f;
+        return;
+    }
+    out->kind = AG_TUBE_TS_FEEDBACK;
+    /*
+     * The TS9's clipping stage, from the published schematic.
+     *
+     *   input leg   R4 4.7k in series with C3 47 nF to ground
+     *   feedback    R6 51k plus the 500k drive pot, at noon so 250k
+     *   diodes      two 1N4148 back to back across the feedback
+     *
+     * Is and n*Vt are the datasheet's: 2.5 nA and 26 mV times an emission
+     * coefficient of 1.9, which is the pair a 1N4148 is normally fitted with.
+     * Nothing here is tuned to the capture - that is what the matching banks are
+     * for, and it is the whole point of writing the resistors down.
+     */
+    out->ri = 4.7e3f;
+    out->ci = 47.0e-9f;
+    out->rf = 51.0e3f + 250.0e3f;
+    out->dio_is = 2.5e-9f;
+    out->dio_nvt = 0.0494f;
+    /* The valve fields have no meaning here, and a stage with no plate load has
+     * no supply either. */
+    out->rsrc = 10.0e3f;
+    out->rgrid = 510.0e3f;
+    out->rstop = 0.0f;
+    out->vsupply = 0.0f;
+    out->rplate = 0.0f;
+    out->rcath = 0.0f;
+    out->ccath = 0.0f;
+    /* The input capacitor, and the output one into whatever follows. */
+    out->ccouple = 47.0e-9f;
+    out->cload = 220.0e-9f;
+    out->rload = 10.0e3f;
+}
+
 void ag_tube_spec_jcm800(ag_tube_spec_t *out, int index)
 {
     if (out == 0) {
         return;
     }
+    /* A valve, and the pedal's fields mean nothing here.  Said out
+     * loud because these three were written before ag_tube_kind_t
+     * existed: an unset `kind` is whatever was on the caller's stack,
+     * and when it happened to read as the pedal, three stages of the
+     * bogner took their shelf from an input leg that does not exist -
+     * which test_tube caught as a shelf at the wrong frequency. */
+    out->kind = AG_TUBE_TRIODE;
+    out->ri = 0.0f;
+    out->ci = 0.0f;
+    out->rf = 0.0f;
+    out->dio_is = 0.0f;
+    out->dio_nvt = 0.0f;
     ag_triode_model_12ax7(&out->valve);
     out->vsupply = 330.0f;
     out->rcath = 820.0f;
@@ -910,6 +1027,18 @@ void ag_tube_spec_bogner(ag_tube_spec_t *out, int index)
     if (out == 0) {
         return;
     }
+    /* A valve, and the pedal's fields mean nothing here.  Said out
+     * loud because these three were written before ag_tube_kind_t
+     * existed: an unset `kind` is whatever was on the caller's stack,
+     * and when it happened to read as the pedal, three stages of the
+     * bogner took their shelf from an input leg that does not exist -
+     * which test_tube caught as a shelf at the wrong frequency. */
+    out->kind = AG_TUBE_TRIODE;
+    out->ri = 0.0f;
+    out->ci = 0.0f;
+    out->rf = 0.0f;
+    out->dio_is = 0.0f;
+    out->dio_nvt = 0.0f;
     ag_triode_model_12ax7(&out->valve);
     out->vsupply = 330.0f;
     out->ccath = 0.68e-6f;
@@ -1020,6 +1149,18 @@ void ag_tube_spec_slo(ag_tube_spec_t *out, int index)
     if (out == 0) {
         return;
     }
+    /* A valve, and the pedal's fields mean nothing here.  Said out
+     * loud because these three were written before ag_tube_kind_t
+     * existed: an unset `kind` is whatever was on the caller's stack,
+     * and when it happened to read as the pedal, three stages of the
+     * bogner took their shelf from an input leg that does not exist -
+     * which test_tube caught as a shelf at the wrong frequency. */
+    out->kind = AG_TUBE_TRIODE;
+    out->ri = 0.0f;
+    out->ci = 0.0f;
+    out->rf = 0.0f;
+    out->dio_is = 0.0f;
+    out->dio_nvt = 0.0f;
     ag_triode_model_12ax7(&out->valve);
     out->vsupply = 330.0f;
     /* The Soldano standard, on every stage but the cold one: 1k8 with a microfarad
@@ -1049,7 +1190,7 @@ void ag_tube_spec_slo(ag_tube_spec_t *out, int index)
          * driven from *is* most of the attenuation, and putting it here rather
          * than in a gain constant is the whole point.  518 k against the pot's
          * 500 k is a divider of 0.49 before the wiper is considered; the wiper at
-         * noon is the other half, and it lives in cfg.g12 until the pot is a
+         * noon is the other half, and it lives in the stage trim until the pot is a
          * live control.
          */
         out->rsrc = 518.0e3f;
@@ -1194,6 +1335,117 @@ int ag_tube_bake_clipper(ag_tube_t *tb, ag_ckt_t *scratch, float rseries,
     }
     tb->gain_bypassed = gain_match;
     tb->gain_unbypassed = gain_match;
+    return 0;
+}
+
+/*
+ * The curve of a pedal that clips **inside** its op-amp's feedback loop.
+ *
+ * `ag_tube_bake_clipper` above is the other kind: a resistor into an antiparallel
+ * pair to ground, which can only ever attenuate - a limiter.  A Tube Screamer puts
+ * the pair *across the feedback resistor* of a non-inverting stage, and that is a
+ * different animal: below the diodes' knee the stage has the full gain
+ * 1 + Rf/Ri, and as the diodes come on Rf collapses towards their dynamic
+ * resistance and the gain falls towards one.  Gain that folds down into unity, not
+ * a ceiling.
+ *
+ * WHY THIS IS SOLVED HERE RATHER THAN HANDED TO ag_ckt
+ *
+ * The op-amp holds its inverting input at the input voltage, so the current through
+ * the input leg is i = v/Ri and the output is v plus whatever voltage that current
+ * makes across the feedback branch.  Written as a netlist that needs a current
+ * source, and this solver has only voltage sources; faking one with a hundred
+ * megohms in front of a three-hundred-kilohm branch would put a badly conditioned
+ * matrix between us and an equation with one unknown.  So the one unknown is solved
+ * directly, from the same Shockley model the solver stamps:
+ *
+ *     u / Rf + 2 Is sinh(u / nVt) = v / Ri,     out = v + u
+ *
+ * Both terms are the real components: Rf is the drive pot plus its series resistor,
+ * Ri the input leg, Is and nVt the diode.  Nothing here is fitted.
+ *
+ * AND WHY THE FREQUENCY DEPENDENCE IS NOT IN HERE
+ *
+ * In the real pedal the input leg is a resistor in series with a capacitor, so Ri
+ * rises as the frequency falls and the gain with it - that is where a Tube
+ * Screamer's mid hump and bass cut come from, and at DC the capacitor blocks and
+ * the stage is unity.  A DC-baked curve of the whole thing would therefore be a
+ * straight line, which is why `Ri` here is the resistive part alone and the shelf
+ * that the capacitor makes belongs in the stage's filter block - the same split
+ * between a static curve and linear filters that every valve stage in this file
+ * already uses.
+ */
+int ag_tube_bake_ts(ag_tube_t *tb, float ri, float rf, float is, float nvt,
+                    float *tab, float *tabh, float *tabg, int n, float lo,
+                    float hi)
+{
+    float hmid;
+    int   i, i0;
+
+    if (tb == 0 || tab == 0 || n < 8 || hi <= lo || ri < 1.0f || rf < 1.0f ||
+        is <= 0.0f || nvt <= 0.0f) {
+        return -1;
+    }
+    if (ag_tube_attach(tb, tab, tabh, tabg, n, lo, hi) != 0) {
+        return -1;
+    }
+    for (i = 0; i < n; i++) {
+        const float v = lo + tb->step * (float)i;
+        const float av = v < 0.0f ? -v : v;
+        const float cur = av / ri;
+        /*
+         * Bisection, not Newton: sinh doubles its slope every nVt and a Newton
+         * step from the wrong side of that overshoots into an overflow.  Forty
+         * halvings of a bracket that starts wide enough for any real drive
+         * setting is exact to the last bit of a float, and this runs once per
+         * table point at bake time.
+         */
+        float ulo = 0.0f;
+        float uhi = nvt * 60.0f + cur * rf;
+        int   it;
+        for (it = 0; it < 40; it++) {
+            const float um = 0.5f * (ulo + uhi);
+            float       x = um / nvt;
+            float       sh;
+            if (x > 60.0f) {
+                x = 60.0f;
+            }
+            sh = 0.5f * (ag_expf(x) - ag_expf(-x));
+            if (um / rf + 2.0f * is * sh < cur) {
+                ulo = um;
+            } else {
+                uhi = um;
+            }
+        }
+        tab[i] = v < 0.0f ? -(av + 0.5f * (ulo + uhi))
+                          : (av + 0.5f * (ulo + uhi));
+    }
+    /* Zero at zero, exactly, for the same reason as the valve curve. */
+    i0 = (int)tb->zero_p;
+    if (i0 >= 0 && i0 < n) {
+        const float off = tab[i0];
+        for (i = 0; i < n; i++) {
+            tab[i] -= off;
+        }
+    }
+    if (tabh != 0) {
+        tabh[0] = 0.0f;
+        for (i = 1; i < n; i++) {
+            tabh[i] = tabh[i - 1] + (tab[i - 1] + tab[i]) * 0.5f;
+        }
+        hmid = tabh[n / 2];
+        for (i = 0; i < n; i++) {
+            tabh[i] -= hmid;
+        }
+    }
+    if (tabg != 0) { /* a diode has no grid to charge anything */
+        for (i = 0; i < n; i++) {
+            tabg[i] = 0.0f;
+        }
+    }
+    /* Small signal, with the diodes off: out = v (1 + Rf/Ri). */
+    tb->gain_bypassed = 1.0f + rf / ri;
+    tb->gain_unbypassed = tb->gain_bypassed;
     return 0;
 }
 
