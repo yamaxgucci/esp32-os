@@ -25,6 +25,15 @@
 #define AG_MEM_BYTE MALLOC_CAP_8BIT
 #define AG_MEM_DMA  MALLOC_CAP_DMA
 #define AG_MEM_EXEC MALLOC_CAP_EXEC
+/*
+ * Byte-accessible internal RAM that is NOT the DMA-capable DRAM the radio and
+ * peripherals fight over.  On the ESP32 this is the D/IRAM (SRAM1) region,
+ * dual-mapped and reachable byte-wise from the data bus, and it excludes the
+ * word-only pure-IRAM block.  A no-PSRAM board that must hold both an
+ * application and the Wi-Fi driver puts the application's writable memory here,
+ * so the driver's ~36 KB contiguous allocation still finds room in DRAM.
+ */
+#define AG_MEM_IRAM8 MALLOC_CAP_IRAM_8BIT
 
 typedef multi_heap_handle_t ag_port_heap_t;
 

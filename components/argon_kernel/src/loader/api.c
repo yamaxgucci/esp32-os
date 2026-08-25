@@ -43,6 +43,7 @@
 #include <argon/port/wifi.h>
 
 #include "dev/io.h"
+#include "net/espnow.h"
 #include "net/wifimon.h"
 
 /* ---------------------------------------------------------------------- */
@@ -952,6 +953,20 @@ static ag_err_t api_ble_adv_start(const char *name)
     return ag_port_ble_adv_start(name);
 }
 
+static ag_err_t api_ble_adv_raw(const uint8_t addr[6], const void *data,
+                                uint32_t len)
+{
+    /*
+     * The radio is the system's to raise (bt on), as it is for Wi-Fi.
+     * An application does not raise it here: on this chip the BLE
+     * bring-up is not safe from an application task, and the port
+     * answers -AG_ENODEV when the radio is off, which the caller
+     * surfaces as "run bt on first".
+     */
+    ag_powerctl_bus_needed();
+    return ag_port_ble_adv_raw(addr, (const uint8_t *)data, len);
+}
+
 static void api_ble_adv_set_read(const void *data, uint32_t len)
 {
     ag_port_ble_adv_set_read(data, len);
@@ -972,10 +987,13 @@ static ag_err_t api_ble_adv_status(ag_ble_adv_status_t *out)
 static ag_err_t api_ble_scan(ag_ble_dev_t *out, uint32_t max, uint32_t *found,
                              uint32_t seconds)
 {
-    const ag_err_t serr = ag_port_bt_start();
-    if (serr != AG_OK) {
-        return serr;
-    }
+    /*
+     * The radio is the system's to raise (bt on), as it is for Wi-Fi.
+     * An application does not raise it here: on this chip the BLE
+     * bring-up is not safe from an application task, and the port
+     * answers -AG_ENODEV when the radio is off, which the caller
+     * surfaces as "run bt on first".
+     */
     ag_powerctl_bus_needed();
     return ag_port_ble_scan(out, max, found, seconds);
 }
@@ -983,10 +1001,13 @@ static ag_err_t api_ble_scan(ag_ble_dev_t *out, uint32_t max, uint32_t *found,
 static ag_err_t api_ble_connect(const uint8_t addr[6], int addr_type,
                                 uint32_t timeout_ms)
 {
-    const ag_err_t serr = ag_port_bt_start();
-    if (serr != AG_OK) {
-        return serr;
-    }
+    /*
+     * The radio is the system's to raise (bt on), as it is for Wi-Fi.
+     * An application does not raise it here: on this chip the BLE
+     * bring-up is not safe from an application task, and the port
+     * answers -AG_ENODEV when the radio is off, which the caller
+     * surfaces as "run bt on first".
+     */
     ag_powerctl_bus_needed();
     return ag_port_ble_connect(addr, addr_type, timeout_ms);
 }
@@ -1039,6 +1060,9 @@ static const ag_ble_api_t k_ble = {
     .chars = api_ble_chars,
     .read = api_ble_read,
     .write = api_ble_write,
+#endif
+#if AG_PORT_HAS_BLE_PERIPH
+    .adv_raw = api_ble_adv_raw,
 #endif
 };
 #endif /* AG_PORT_HAS_BLE_PERIPH || AG_PORT_HAS_BLE_CENTRAL */
@@ -1130,6 +1154,207 @@ static const ag_wifimon_api_t k_wifimon = {
 };
 #endif /* AG_PORT_HAS_WIFIMON */
 
+#if AG_PORT_HAS_WIFI
+/*
+ * The rest of the radio for applications (ABI 0.39): station, access point and
+ * ESP-NOW.  Each call is a thin pass to the same port and kernel layer the
+ * shell's `wifi` and `espnow` commands drive (src/shell/shell.c), so an
+ * application and the prompt reach the radio through one implementation.  The
+ * only work done here is raising the radio when a call needs it and converting
+ * the port's structs into the ABI's - the ABI cannot name the GPL port types,
+ * so the two are kept field-for-field parallel and copied across.
+ */
+static ag_err_t api_wifi_radio_up(void)
+{
+    ag_powerctl_bus_needed();
+    ag_port_wifi_status_t st;
+    if (ag_port_wifi_status(&st) != AG_OK || st.state == AG_WIFI_OFF) {
+        return ag_net_init();
+    }
+    return AG_OK;
+}
+
+static ag_err_t api_wifi_start(void) { return api_wifi_radio_up(); }
+static ag_err_t api_wifi_stop(void) { return ag_port_wifi_stop(); }
+
+static ag_err_t api_wifi_scan(ag_wifi_ap_t *out, uint32_t max, uint32_t *found)
+{
+    if (out == NULL || max == 0u) {
+        return -AG_EINVAL;
+    }
+    const ag_err_t up = api_wifi_radio_up();
+    if (up != AG_OK) {
+        return up;
+    }
+    /*
+     * No heap here.  The port fills at most sixteen records from a stack buffer
+     * of its own, so a matching stack buffer converts them without an
+     * allocation - which matters because with the radio up and an application
+     * resident on this board, a few hundred spare bytes of heap is exactly what
+     * there is not, and a scan that failed only because the conversion buffer
+     * could not be allocated read as -AG_ENOMEM for a scan that would have
+     * worked.  `found` still reports every access point the radio heard.
+     */
+    ag_port_wifi_ap_t tmp[16];
+    uint32_t          cap = (max < 16u) ? max : 16u;
+    uint32_t          n = 0;
+    const ag_err_t    err = ag_port_wifi_scan(tmp, cap, &n);
+    if (err == AG_OK) {
+        const uint32_t copy = (n < cap) ? n : cap;
+        for (uint32_t i = 0; i < copy; i++) {
+            memcpy(out[i].ssid, tmp[i].ssid, sizeof(out[i].ssid));
+            memcpy(out[i].bssid, tmp[i].bssid, 6u);
+            out[i].rssi = tmp[i].rssi;
+            out[i].channel = tmp[i].channel;
+            out[i].auth = (uint8_t)tmp[i].auth;
+        }
+        if (found != NULL) {
+            *found = n;
+        }
+    }
+    return err;
+}
+
+static ag_err_t api_wifi_connect(const char *ssid, const char *pass,
+                                 const uint8_t bssid[6])
+{
+    ag_powerctl_bus_needed();
+    return ag_port_wifi_connect(ssid, pass, bssid);
+}
+
+static ag_err_t api_wifi_disconnect(void) { return ag_port_wifi_disconnect(); }
+
+static ag_err_t api_wifi_status(ag_wifi_status_t *out)
+{
+    if (out == NULL) {
+        return -AG_EINVAL;
+    }
+    ag_port_wifi_status_t st;
+    const ag_err_t        err = ag_port_wifi_status(&st);
+    if (err != AG_OK) {
+        return err;
+    }
+    memset(out, 0, sizeof(*out));
+    out->state = (uint8_t)st.state;
+    memcpy(out->ssid, st.ssid, sizeof(out->ssid));
+    memcpy(out->bssid, st.bssid, 6u);
+    out->pinned = st.pinned;
+    out->rssi = st.rssi;
+    out->channel = st.channel;
+    out->attempts = st.attempts;
+    out->last_reason = (int32_t)st.last_reason;
+    return AG_OK;
+}
+
+#if AG_PORT_WIFI_HAS_AP
+static ag_err_t api_wifi_ap_start(const char *ssid, const char *pass,
+                                  uint8_t channel, bool hidden)
+{
+    const ag_err_t up = api_wifi_radio_up();
+    if (up != AG_OK) {
+        return up;
+    }
+    return ag_port_wifi_ap_start(ssid, pass, channel, hidden);
+}
+static ag_err_t api_wifi_ap_stop(void) { return ag_port_wifi_ap_stop(); }
+static ag_err_t api_wifi_ap_status(ag_wifi_ap_status_t *out)
+{
+    if (out == NULL) {
+        return -AG_EINVAL;
+    }
+    ag_port_wifi_ap_status_t ap;
+    const ag_err_t           err = ag_port_wifi_ap_status(&ap);
+    if (err != AG_OK) {
+        return err;
+    }
+    memset(out, 0, sizeof(*out));
+    out->on = ap.on;
+    memcpy(out->ssid, ap.ssid, sizeof(out->ssid));
+    out->channel = ap.channel;
+    out->hidden = ap.hidden;
+    out->secured = ap.secured;
+    out->clients = ap.clients;
+    out->ip = ap.ip;
+    return AG_OK;
+}
+#endif /* AG_PORT_WIFI_HAS_AP */
+
+#if AG_PORT_HAS_ESPNOW
+static ag_err_t api_wifi_espnow_start(void)
+{
+    const ag_err_t up = api_wifi_radio_up();
+    if (up != AG_OK) {
+        return up;
+    }
+    return ag_espnow_start();
+}
+static ag_err_t api_wifi_espnow_stop(void)
+{
+    ag_espnow_stop();
+    return AG_OK;
+}
+static ag_err_t api_wifi_espnow_self(uint8_t out[6])
+{
+    return ag_espnow_self(out);
+}
+static ag_err_t api_wifi_espnow_peer_add(const uint8_t mac[6], uint8_t channel,
+                                         const uint8_t *key)
+{
+    return ag_espnow_peer_add(mac, channel, key);
+}
+static ag_err_t api_wifi_espnow_peer_del(const uint8_t mac[6])
+{
+    return ag_espnow_peer_del(mac);
+}
+static ag_err_t api_wifi_espnow_send(const uint8_t mac[6], const void *data,
+                                     uint32_t len)
+{
+    return ag_espnow_send(mac, data, len);
+}
+static int32_t api_wifi_espnow_recv(uint8_t mac[6], void *buf, uint32_t max,
+                                    uint32_t timeout_ms)
+{
+    const int64_t until = (int64_t)ag_port_us() + (int64_t)timeout_ms * 1000;
+    for (;;) {
+        uint32_t len = 0;
+        if (ag_espnow_recv(mac, (uint8_t *)buf, max, &len)) {
+            return (int32_t)len;
+        }
+        if ((int64_t)ag_port_us() >= until) {
+            return -AG_EAGAIN;
+        }
+        ag_port_task_delay(ag_port_ms_to_ticks(2));
+    }
+}
+static uint32_t api_wifi_espnow_dropped(void) { return ag_espnow_dropped(); }
+#endif /* AG_PORT_HAS_ESPNOW */
+
+static const ag_wifi_api_t k_wifi = {
+    .size = sizeof(ag_wifi_api_t),
+    .start = api_wifi_start,
+    .stop = api_wifi_stop,
+    .scan = api_wifi_scan,
+    .connect = api_wifi_connect,
+    .disconnect = api_wifi_disconnect,
+    .status = api_wifi_status,
+#if AG_PORT_WIFI_HAS_AP
+    .ap_start = api_wifi_ap_start,
+    .ap_stop = api_wifi_ap_stop,
+    .ap_status = api_wifi_ap_status,
+#endif
+#if AG_PORT_HAS_ESPNOW
+    .espnow_start = api_wifi_espnow_start,
+    .espnow_stop = api_wifi_espnow_stop,
+    .espnow_self = api_wifi_espnow_self,
+    .espnow_peer_add = api_wifi_espnow_peer_add,
+    .espnow_peer_del = api_wifi_espnow_peer_del,
+    .espnow_send = api_wifi_espnow_send,
+    .espnow_recv = api_wifi_espnow_recv,
+    .espnow_dropped = api_wifi_espnow_dropped,
+#endif
+};
+#endif /* AG_PORT_HAS_WIFI */
+
 static const ag_api_t k_api = {
     .size = sizeof(ag_api_t),
     .abi_major = AG_ABI_MAJOR,
@@ -1162,6 +1387,11 @@ static const ag_api_t k_api = {
     .wifimon = &k_wifimon,
 #else
     .wifimon = NULL,
+#endif
+#if AG_PORT_HAS_WIFI
+    .wifi = &k_wifi,
+#else
+    .wifi = NULL,
 #endif
 };
 

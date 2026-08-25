@@ -1284,6 +1284,60 @@ ag_err_t ag_port_ble_adv_stop(void)
     return AG_OK;
 }
 
+/*
+ * Raw advertising, for a spammer rather than a device: set a (spoofed) random
+ * address and a caller-built advertising payload, and broadcast it
+ * non-connectably.  Called in a tight loop with a different address and payload
+ * each time, this is what puts a rotating crowd of fake devices in the air - the
+ * BLE analog of wifimon's raw 802.11 injection.  addr NULL keeps the board's own
+ * address; a six-byte addr is forced to a static-random form (top two bits set).
+ * len is at most 31 (one legacy advertisement).
+ */
+ag_err_t ag_port_ble_adv_raw(const uint8_t addr[6], const uint8_t *data,
+                             uint32_t len)
+{
+    if (s_state == AG_BT_OFF) {
+        return -AG_ENODEV;
+    }
+    if (data == NULL || len == 0u || len > 31u) {
+        return -AG_EINVAL;
+    }
+    if (!wait_synced()) {
+        return -AG_ETIMEDOUT;
+    }
+
+    (void)ble_gap_adv_stop();
+
+    uint8_t own;
+    if (addr != NULL) {
+        uint8_t rnd[6];
+        memcpy(rnd, addr, 6);
+        rnd[5] |= 0xc0u; /* a static random address has its top two bits set */
+        if (ble_hs_id_set_rnd(rnd) != 0) {
+            return -AG_EIO;
+        }
+        own = BLE_OWN_ADDR_RANDOM;
+    } else if (ble_hs_id_infer_auto(0, &own) != 0) {
+        return -AG_EIO;
+    }
+
+    if (ble_gap_adv_set_data(data, (int)len) != 0) {
+        return -AG_EINVAL; /* payload rejected - usually longer than 31 bytes */
+    }
+
+    struct ble_gap_adv_params p;
+    memset(&p, 0, sizeof(p));
+    p.conn_mode = BLE_GAP_CONN_MODE_NON; /* spam is nothing to connect to */
+    p.disc_mode = BLE_GAP_DISC_MODE_GEN;
+    p.itvl_min = 0x20; /* ~20 ms: fast, so the pop-up appears at once */
+    p.itvl_max = 0x30;
+    s_adv_on = false; /* not the peripheral; nothing to re-arm on disconnect */
+    if (ble_gap_adv_start(own, NULL, BLE_HS_FOREVER, &p, NULL, NULL) != 0) {
+        return -AG_EIO;
+    }
+    return AG_OK;
+}
+
 ag_err_t ag_port_ble_adv_status(ag_port_ble_adv_status_t *out)
 {
     if (out == NULL) {

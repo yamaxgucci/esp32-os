@@ -733,6 +733,13 @@ static inline int32_t ag_audio_space(void)
 /* ---- BLE helpers (ABI 0.34) --------------------------------------------- */
 
 /* True when this build can be a BLE-MIDI device (api->ble present). */
+/*
+ * Note for applications on the ESP32: scan/connect/adv_raw use the radio
+ * but do not raise it - bring BLE up first (the shell's `bt on`, or
+ * [bt] in SYSTEM.CFG), exactly as Wi-Fi wants `wifi on` first.  Off, they
+ * answer -AG_ENODEV rather than trying an app-context bring-up the chip
+ * does not survive.  The peripheral (adv_start / midi) still raises it.
+ */
 static inline bool ag_ble_available(void) { return g_ag_api->ble != NULL; }
 
 /* Advertise as a BLE-MIDI device; the radio is started if it was not. */
@@ -878,6 +885,14 @@ static inline ag_err_t ag_ble_write(uint16_t handle, const void *data,
         return -AG_ENOSYS;
     }
     return g_ag_api->ble->write(handle, data, len, with_response, timeout_ms);
+}
+static inline ag_err_t ag_ble_adv_raw(const uint8_t addr[6], const void *data,
+                                      uint32_t len)
+{
+    if (!AG_HAS(g_ag_api->ble, adv_raw)) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->ble->adv_raw(addr, data, len);
 }
 
 /* ---- input helpers ------------------------------------------------------ */
@@ -1151,6 +1166,147 @@ static inline void ag_wifimon_counters(uint32_t out[AG_WIFIMON_C_N])
 static inline uint32_t ag_wifimon_dropped(void)
 {
     return (g_ag_api->wifimon == NULL) ? 0 : g_ag_api->wifimon->dropped();
+}
+
+/* ---- Wi-Fi station / access point / ESP-NOW (ABI 0.39) ------------------ */
+
+/*
+ * The radio as a network: find the networks in reach and join one, offer one of
+ * the board's own, or throw datagrams at another board.  api->wifi is NULL on a
+ * board with no radio (QEMU) - ask ag_wifi_available() first, or read -AG_ENOSYS
+ * back.  The access-point and ESP-NOW calls are further gated by their own build
+ * options: probe one with AG_HAS(ag_api()->wifi, ap_start) before relying on it,
+ * or take the -AG_ENOSYS these wrappers return when the slot is NULL.  Raising
+ * the radio costs a large contiguous slice of internal RAM, so a Wi-Fi tool is
+ * usually run after `wifi on` has already raised it (see the ABI note).
+ */
+static inline bool ag_wifi_available(void) { return g_ag_api->wifi != NULL; }
+
+static inline ag_err_t ag_wifi_start(void)
+{
+    if (g_ag_api->wifi == NULL) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->wifi->start();
+}
+static inline ag_err_t ag_wifi_stop(void)
+{
+    if (g_ag_api->wifi == NULL) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->wifi->stop();
+}
+static inline ag_err_t ag_wifi_scan(ag_wifi_ap_t *out, uint32_t max,
+                                    uint32_t *found)
+{
+    if (g_ag_api->wifi == NULL) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->wifi->scan(out, max, found);
+}
+static inline ag_err_t ag_wifi_connect(const char *ssid, const char *pass,
+                                       const uint8_t bssid[6])
+{
+    if (g_ag_api->wifi == NULL) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->wifi->connect(ssid, pass, bssid);
+}
+static inline ag_err_t ag_wifi_disconnect(void)
+{
+    if (g_ag_api->wifi == NULL) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->wifi->disconnect();
+}
+static inline ag_err_t ag_wifi_status(ag_wifi_status_t *out)
+{
+    if (g_ag_api->wifi == NULL) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->wifi->status(out);
+}
+static inline ag_err_t ag_wifi_ap_start(const char *ssid, const char *pass,
+                                        uint8_t channel, bool hidden)
+{
+    if (!AG_HAS(g_ag_api->wifi, ap_start)) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->wifi->ap_start(ssid, pass, channel, hidden);
+}
+static inline ag_err_t ag_wifi_ap_stop(void)
+{
+    if (!AG_HAS(g_ag_api->wifi, ap_stop)) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->wifi->ap_stop();
+}
+static inline ag_err_t ag_wifi_ap_status(ag_wifi_ap_status_t *out)
+{
+    if (!AG_HAS(g_ag_api->wifi, ap_status)) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->wifi->ap_status(out);
+}
+static inline ag_err_t ag_wifi_espnow_start(void)
+{
+    if (!AG_HAS(g_ag_api->wifi, espnow_start)) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->wifi->espnow_start();
+}
+static inline ag_err_t ag_wifi_espnow_stop(void)
+{
+    if (!AG_HAS(g_ag_api->wifi, espnow_stop)) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->wifi->espnow_stop();
+}
+static inline ag_err_t ag_wifi_espnow_self(uint8_t out[6])
+{
+    if (!AG_HAS(g_ag_api->wifi, espnow_self)) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->wifi->espnow_self(out);
+}
+static inline ag_err_t ag_wifi_espnow_peer_add(const uint8_t mac[6],
+                                               uint8_t channel,
+                                               const uint8_t *key)
+{
+    if (!AG_HAS(g_ag_api->wifi, espnow_peer_add)) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->wifi->espnow_peer_add(mac, channel, key);
+}
+static inline ag_err_t ag_wifi_espnow_peer_del(const uint8_t mac[6])
+{
+    if (!AG_HAS(g_ag_api->wifi, espnow_peer_del)) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->wifi->espnow_peer_del(mac);
+}
+static inline ag_err_t ag_wifi_espnow_send(const uint8_t mac[6],
+                                           const void *data, uint32_t len)
+{
+    if (!AG_HAS(g_ag_api->wifi, espnow_send)) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->wifi->espnow_send(mac, data, len);
+}
+static inline int32_t ag_wifi_espnow_recv(uint8_t mac[6], void *buf,
+                                          uint32_t max, uint32_t timeout_ms)
+{
+    if (!AG_HAS(g_ag_api->wifi, espnow_recv)) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->wifi->espnow_recv(mac, buf, max, timeout_ms);
+}
+static inline uint32_t ag_wifi_espnow_dropped(void)
+{
+    if (!AG_HAS(g_ag_api->wifi, espnow_dropped)) {
+        return 0;
+    }
+    return g_ag_api->wifi->espnow_dropped();
 }
 
 #ifdef __cplusplus

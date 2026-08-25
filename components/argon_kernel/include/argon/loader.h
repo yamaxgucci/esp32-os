@@ -32,6 +32,12 @@ typedef struct {
     void *code_scratch;
     void *xip_slot;
     bool  code_from_xip;
+    /*
+     * The chunked XIP path (a small rolling scratch instead of a code-size one)
+     * relocates and programs the appfs slot itself, so the orchestrator must not
+     * program it again - it only maps it.
+     */
+    bool  xip_programmed;
 } ag_loaded_app_t;
 
 /*

@@ -48,6 +48,7 @@ ARCHS = {"xtensa": 1, "riscv32": 2}
 # Must match enum ag_axe_flags in sdk/include/argon/abi.h.
 AG_AXE_DRIVER = 1 << 3
 AG_AXE_CONTIGUOUS = 1 << 5
+AG_AXE_WANT_XIP = 1 << 7  # app asked to run from flash even when code fits arena
 
 # Relocation entry bits, must match AG_AXE_R_* in axe.h.
 R_IN_DATA = 0x1

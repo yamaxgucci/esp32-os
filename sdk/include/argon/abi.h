@@ -114,9 +114,24 @@ extern "C" {
  *      follows it.  Wi-Fi station/AP control and ESP-NOW stay shell-only on
  *      purpose (see docs/04-roadmap.md): the link is the system's to raise, and
  *      an application already has TCP, DNS and its own address over it.
+ * 0.39 api->wifi: the rest of the radio, past capture and injection - the same
+ *      station, access point and ESP-NOW the shell drives, now an application's
+ *      to drive too.  0.38 held these back "on purpose"; a graphical Wi-Fi tool
+ *      is the application that changes the calculus, because it is the thing a
+ *      person points at the air with, and it cannot be one if raising the link
+ *      is somebody else's job.  Station (scan/connect/disconnect/status) is
+ *      present whenever the build has the radio (CONFIG_ARGON_NET_WIFI); the
+ *      access-point entries are NULL without CONFIG_ARGON_NET_WIFI_AP and the
+ *      ESP-NOW entries NULL without CONFIG_ARGON_NET_ESPNOW - probe with AG_HAS.
+ *      api->wifi itself is NULL on a board with no radio at all (QEMU).
+ * 0.40 ble->adv_raw: raw, non-connectable BLE advertising - a caller-built
+ *      payload under a spoofed random address, rebroadcast on every call.  It is
+ *      to BLE advertising what wifimon->tx_raw is to 802.11: the injection half
+ *      of the radio, for a tool that forges the advertisements a phone shows as
+ *      pairing pop-ups.  NULL without CONFIG_ARGON_BLE_PERIPHERAL.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 38u
+#define AG_ABI_MINOR 40u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -1430,6 +1445,16 @@ typedef struct ag_ble_api {
                      uint32_t timeout_ms);
     ag_err_t (*write)(uint16_t handle, const void *data, uint32_t len,
                       bool with_response, uint32_t timeout_ms);
+
+    /*
+     * ABI 0.40 - raw advertising injection (NULL without the peripheral build).
+     * addr is a six-byte address to spoof (forced to static-random), or NULL to
+     * keep the board's own; data/len is one legacy advertisement (<= 31 bytes),
+     * broadcast non-connectably.  Call it in a loop with a fresh address and
+     * payload to put a crowd of fake devices in the air.  The peripheral's
+     * adv_start and this share one advertising instance - use one at a time.
+     */
+    ag_err_t (*adv_raw)(const uint8_t addr[6], const void *data, uint32_t len);
 } ag_ble_api_t;
 
 /* ------------------------------------------------------------------------ */
@@ -1681,6 +1706,158 @@ typedef struct ag_wifimon_api {
 } ag_wifimon_api_t;
 
 /* ------------------------------------------------------------------------ */
+/* wifi - station, access point and ESP-NOW for applications (ABI 0.39)      */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * The radio as a network, not as raw air.  wifimon (above) is the receiver on
+ * one channel and the frame forge; this is the rest of what the shell's `wifi`
+ * and `espnow` do - find the networks in reach and join one, offer a network of
+ * the board's own, or throw datagrams straight at another board.  It is the same
+ * port underneath (argon/port/wifi.h, argon/port/espnow.h); this is the
+ * feature-probed, GPL-free face of it an application links against.
+ *
+ * One radio, so the usual exclusions hold and the port enforces them: a scan is
+ * -AG_EBUSY while an association is in flight, the access point is forced onto a
+ * joined station's channel, and ESP-NOW rides whatever channel the radio is on.
+ *
+ * Bringing the radio up costs a ~36 KB contiguous slice of internal RAM on a
+ * board with about sixty free, so an application that means to use the radio is
+ * usually launched after `wifi on` has already raised it - start() here is the
+ * same bring-up and will fail -AG_ENOMEM from inside a large resident app, the
+ * way it does for wifimon.  scan/connect/ap_start/espnow_start all raise the
+ * radio if it is down, so start() is only needed to raise it without doing
+ * anything else yet.
+ */
+
+#define AG_WIFI_SSID_MAX 32 /* an SSID is at most 32 bytes, not NUL-counted   */
+#define AG_WIFI_PASS_MAX 63 /* a WPA key is 8..63 characters                  */
+
+/* Security of a network, ag_wifi_ap_t.auth.  Ordered as the port orders it. */
+enum {
+    AG_WIFI_SEC_OPEN = 0,
+    AG_WIFI_SEC_WEP,
+    AG_WIFI_SEC_WPA,
+    AG_WIFI_SEC_WPA2,
+    AG_WIFI_SEC_WPA3,
+    AG_WIFI_SEC_ENTERPRISE,
+    AG_WIFI_SEC_OTHER,
+};
+
+/* Station link state, ag_wifi_status_t.state. */
+enum {
+    AG_WIFI_ST_OFF = 0,   /* radio not started                               */
+    AG_WIFI_ST_IDLE,      /* on, joined to nothing                           */
+    AG_WIFI_ST_JOINING,   /* association or DHCP in progress                 */
+    AG_WIFI_ST_JOINED,    /* associated; an address may still be coming      */
+};
+
+/* ESP-NOW limits, mirroring the port. */
+#define AG_WIFI_ESPNOW_MAX 250 /* one datagram's payload, bytes              */
+#define AG_WIFI_ESPNOW_KEY 16  /* an encryption key, exactly this many bytes */
+
+/* One network a scan found. */
+typedef struct {
+    char    ssid[AG_WIFI_SSID_MAX + 1];
+    uint8_t bssid[6];
+    int8_t  rssi;    /* dBm, negative                                        */
+    uint8_t channel;
+    uint8_t auth;    /* AG_WIFI_SEC_*                                         */
+} ag_wifi_ap_t;
+
+/* Where the station half stands.  The key is never reported. */
+typedef struct {
+    uint8_t  state;      /* AG_WIFI_ST_*                                     */
+    char     ssid[AG_WIFI_SSID_MAX + 1]; /* joined or being joined          */
+    uint8_t  bssid[6];   /* the access point actually joined, or zeros       */
+    bool     pinned;     /* this access point was asked for by name          */
+    int8_t   rssi;
+    uint8_t  channel;
+    uint32_t attempts;   /* association attempts since the last join         */
+    int32_t  last_reason;/* the port's own disconnect reason code            */
+} ag_wifi_status_t;
+
+/* What the access-point half is offering, when one is up. */
+typedef struct {
+    bool     on;
+    char     ssid[AG_WIFI_SSID_MAX + 1];
+    uint8_t  channel;
+    bool     hidden;
+    bool     secured;    /* WPA2 with a key, not open                        */
+    uint32_t clients;    /* stations associated right now                    */
+    uint32_t ip;         /* the board's own address on it, host-order IPv4   */
+} ag_wifi_ap_status_t;
+
+typedef struct ag_wifi_api {
+    uint32_t size;
+
+    /* ---- station ---- */
+
+    /* Power the radio on, joined to nothing.  Idempotent; -AG_ENOMEM when the
+     * ~36 KB the driver needs is not free (see the note above). */
+    ag_err_t (*start)(void);
+    /* Power the radio off and give its memory back. */
+    ag_err_t (*stop)(void);
+
+    /*
+     * Block a second or two and fill `out` with up to `max` networks; `found`
+     * gets the number seen, which may exceed `max`.  Raises the radio if it is
+     * down.  -AG_EBUSY while an association attempt is in flight.
+     */
+    ag_err_t (*scan)(ag_wifi_ap_t *out, uint32_t max, uint32_t *found);
+
+    /*
+     * Join a network.  Returns as soon as the attempt is made, not when it has
+     * succeeded - poll status() (or net->ready() for an address).  bssid NULL
+     * joins any access point of that name; six bytes pin one.  An empty pass
+     * for the network already set means the key already held, not no key.
+     */
+    ag_err_t (*connect)(const char *ssid, const char *pass,
+                        const uint8_t bssid[6]);
+    ag_err_t (*disconnect)(void);
+    ag_err_t (*status)(ag_wifi_status_t *out);
+
+    /* ---- access point (NULL unless CONFIG_ARGON_NET_WIFI_AP) ---- */
+
+    /*
+     * Offer a network of the board's own.  Raises the radio if it is down.  An
+     * empty pass is an open network; a key is 8..63 characters and shorter is
+     * -AG_EINVAL.  channel 0 picks one; while also joined to a network the
+     * point is forced onto that network's channel (ap_status reports which).
+     */
+    ag_err_t (*ap_start)(const char *ssid, const char *pass, uint8_t channel,
+                         bool hidden);
+    ag_err_t (*ap_stop)(void);
+    ag_err_t (*ap_status)(ag_wifi_ap_status_t *out);
+
+    /* ---- ESP-NOW (NULL unless CONFIG_ARGON_NET_ESPNOW) ---- */
+
+    /*
+     * Board-to-board datagrams, no network between them.  start() needs the
+     * radio up (it raises it) and adds the broadcast peer.  self() is the
+     * board's own address the other end must peer_add.  A frame is at most
+     * AG_WIFI_ESPNOW_MAX bytes; longer is -AG_EINVAL.  A destination must be a
+     * peer first (peer_add, or the broadcast peer).  peer_add channel 0 means
+     * the channel the radio is on; key NULL is an open peer, else exactly
+     * AG_WIFI_ESPNOW_KEY bytes.  recv() pops one waiting datagram into `buf`
+     * (its sender into `mac`), returning the byte count or -AG_EAGAIN when
+     * none arrived within timeout_ms (0 polls); dropped() is how many the ring
+     * had to discard.
+     */
+    ag_err_t (*espnow_start)(void);
+    ag_err_t (*espnow_stop)(void);
+    ag_err_t (*espnow_self)(uint8_t out[6]);
+    ag_err_t (*espnow_peer_add)(const uint8_t mac[6], uint8_t channel,
+                                const uint8_t *key);
+    ag_err_t (*espnow_peer_del)(const uint8_t mac[6]);
+    ag_err_t (*espnow_send)(const uint8_t mac[6], const void *data,
+                            uint32_t len);
+    int32_t  (*espnow_recv)(uint8_t mac[6], void *buf, uint32_t max,
+                            uint32_t timeout_ms);
+    uint32_t (*espnow_dropped)(void);
+} ag_wifi_api_t;
+
+/* ------------------------------------------------------------------------ */
 /* Root table                                                               */
 /* ------------------------------------------------------------------------ */
 
@@ -1719,6 +1896,11 @@ typedef struct ag_api {
     /* ABI 0.38+: promiscuous capture and raw 802.11 injection - NULL unless
      * the build set CONFIG_ARGON_NET_WIFI_MON (off by default). */
     const ag_wifimon_api_t *wifimon;
+
+    /* ABI 0.39+: station, access point and ESP-NOW - NULL on a board with no
+     * radio (CONFIG_ARGON_NET_WIFI off, e.g. QEMU).  Within it the AP and
+     * ESP-NOW entries are NULL unless their own build options are set. */
+    const ag_wifi_api_t *wifi;
 } ag_api_t;
 
 /* ------------------------------------------------------------------------ */
@@ -1741,6 +1923,26 @@ enum ag_axe_flags {
      */
     AG_AXE_CONTIGUOUS = 1u << 5,
     AG_AXE_NEEDS_AUDIO = 1u << 6, /* refuses to start without api->audio    */
+    /*
+     * Run from flash (XIP) even when the code would fit the IRAM arena.
+     *
+     * The loader's default is to place code in the arena when it fits and fall
+     * back to flash only when it does not - the arena is faster, so fitting is
+     * the good case.  An application sets this to invert that on purpose: it
+     * would rather leave the arena's internal SRAM free for something that
+     * cannot come from flash.  The board this matters on has one radio and
+     * sixty kilobytes of internal RAM: a Wi-Fi bring-up needs a ~36 KB
+     * contiguous slice of it, and code the loader parked in the arena would
+     * otherwise split the block the radio needs.  Sending that code to flash
+     * instead keeps the internal RAM whole.
+     *
+     * Honoured only for a non-contiguous image (xtensa): flash cannot host a
+     * contiguous image's data, so a contiguous one is placed in the arena
+     * regardless.  On a part where the code will not fit the arena anyway (the
+     * 8 KB arena on the original ESP32) the loader already chooses flash, and
+     * the flag then only makes that choice intentional rather than incidental.
+     */
+    AG_AXE_WANT_XIP = 1u << 7,
 };
 
 /*

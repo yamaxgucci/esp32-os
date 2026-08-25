@@ -199,24 +199,38 @@ static void copy_image(void *dst, const void *src, size_t bytes)
     }
 }
 
+/*
+ * An application's writable memory - its data part, its relocation scratch, and
+ * (in proc.c) its arena - does not need to be DMA-capable, but the radio's
+ * buffers do, and on a no-PSRAM board they are both carved from the same
+ * internal RAM.  Placed in the general internal heap, a resident application
+ * splits the one large DMA-capable region the Wi-Fi driver needs a ~36 KB
+ * contiguous slice of, and the driver then fails with ENOMEM even though far
+ * more than 36 KB is free.  So the order is: PSRAM first (an S3 puts all of this
+ * off-chip and the question never arises), then byte-accessible D/IRAM (which
+ * the DMA path does not use), and only then ordinary internal RAM as a last
+ * resort.  This keeps the DMA-capable DRAM whole for the radio.
+ */
 static void *data_alloc(size_t bytes)
 {
-    void *p = ag_port_alloc_aligned(16, bytes,
-                                      AG_MEM_SLOW | AG_MEM_BYTE);
+    void *p = ag_port_alloc_aligned(16, bytes, AG_MEM_SLOW | AG_MEM_BYTE);
     if (p == NULL) {
-        p = ag_port_alloc_aligned(16, bytes,
-                                    AG_MEM_FAST | AG_MEM_BYTE);
+        p = ag_port_alloc_aligned(16, bytes, AG_MEM_IRAM8);
+    }
+    if (p == NULL) {
+        p = ag_port_alloc_aligned(16, bytes, AG_MEM_FAST | AG_MEM_BYTE);
     }
     return p;
 }
 
 static void *scratch_alloc(size_t bytes)
 {
-    void *p = ag_port_alloc_aligned(16, bytes,
-                                      AG_MEM_SLOW | AG_MEM_BYTE);
+    void *p = ag_port_alloc_aligned(16, bytes, AG_MEM_SLOW | AG_MEM_BYTE);
     if (p == NULL) {
-        p = ag_port_alloc_aligned(16, bytes,
-                                    AG_MEM_FAST | AG_MEM_BYTE);
+        p = ag_port_alloc_aligned(16, bytes, AG_MEM_IRAM8);
+    }
+    if (p == NULL) {
+        p = ag_port_alloc_aligned(16, bytes, AG_MEM_FAST | AG_MEM_BYTE);
     }
     return p;
 }
@@ -352,22 +366,162 @@ static ag_err_t place_xip(const ag_axe_header_t *header, ag_loaded_app_t *out)
         }
     }
 
-    void *scratch = scratch_alloc(header->code.size);
-    if (scratch == NULL) {
-        ag_port_free(data);
-        ag_appfs_release(slot);
-        return -AG_ENOMEM;
-    }
-
+    /*
+     * No code-size scratch here any more: the streamed path (xip_load_chunked)
+     * relocates and programs the appfs slot a page at a time with a small
+     * rolling buffer, which is what lets a large image load when little
+     * contiguous memory is left - e.g. after the radio is already up.  The
+     * signed path (load_whole) still needs a whole-code buffer, so it allocates
+     * one for itself.
+     */
     out->place.code = exec;
     out->place.code_capacity = header->code.size;
-    out->place.code_writable = scratch;
+    out->place.code_writable = NULL;
     out->place.data = data;
     out->place.data_capacity = header->data.size;
     out->data_owned = data;
-    out->code_scratch = scratch;
+    out->code_scratch = NULL;
     out->xip_slot = slot;
     out->code_from_xip = true;
+    return AG_OK;
+}
+
+/*
+ * Chunked flash XIP: relocate and program the reserved appfs slot one page at a
+ * time.  Code relocations and the API-table binding for words in the code part
+ * are applied to each page before it is written; data relocations (and an
+ * api_slot that lives in the data part) are applied to the data buffer in RAM.
+ * The only transient buffer is one page, not the whole code, so the load fits in
+ * far less memory.
+ */
+#define AG_XIP_CHUNK 4096u
+
+static ag_err_t read_at(ag_handle_t h, uint64_t at, void *dst, size_t bytes);
+
+static ag_err_t xip_load_chunked(ag_handle_t h, const ag_axe_header_t *header,
+                                 ag_loaded_app_t *out)
+{
+    const uint32_t code_base = header->code.base;
+    const uint32_t data_base = header->data.base;
+    const uint32_t code_addr = (uint32_t)(uintptr_t)out->place.code;
+    const uint32_t data_bias =
+        (out->place.data != NULL)
+            ? (uint32_t)(uintptr_t)out->place.data - data_base
+            : 0u;
+    const uint32_t code_bias = code_addr - code_base;
+    const uint32_t api_val = (uint32_t)(uintptr_t)ag_loader_api();
+    const uint32_t api_at = header->api_slot;
+    const bool     api_in_code =
+        api_at >= code_base && api_at + 4u <= code_base + header->code.size;
+
+    uint32_t *rel = NULL;
+    if (header->reloc_count > 0) {
+        const size_t rbytes = (size_t)header->reloc_count * sizeof(uint32_t);
+        rel = (uint32_t *)ag_port_alloc(rbytes, AG_MEM_FAST | AG_MEM_BYTE);
+        if (rel == NULL) {
+            return -AG_ENOMEM;
+        }
+        const ag_err_t e = read_at(h, header->reloc_offset, rel, rbytes);
+        if (e != AG_OK) {
+            ag_port_free(rel);
+            return e;
+        }
+    }
+
+    uint8_t *buf = (uint8_t *)ag_port_alloc(AG_XIP_CHUNK, AG_MEM_FAST | AG_MEM_BYTE);
+    if (buf == NULL) {
+        ag_port_free(rel);
+        return -AG_ENOMEM;
+    }
+
+    /* Data part into RAM, its bss zeroed (data_alloc does not clear). */
+    ag_err_t err = AG_OK;
+    if (out->place.data != NULL && header->data.file_size > 0) {
+        err = read_at(h, header->data.offset, out->place.data,
+                      header->data.file_size);
+    }
+    if (err == AG_OK && out->place.data != NULL &&
+        header->data.size > header->data.file_size) {
+        memset((uint8_t *)out->place.data + header->data.file_size, 0,
+               header->data.size - header->data.file_size);
+    }
+
+    for (uint32_t off = 0; err == AG_OK && off < header->code.size;
+         off += AG_XIP_CHUNK) {
+        uint32_t n = header->code.size - off;
+        if (n > AG_XIP_CHUNK) {
+            n = AG_XIP_CHUNK;
+        }
+        uint32_t fn = 0;
+        if (off < header->code.file_size) {
+            fn = header->code.file_size - off;
+            if (fn > n) {
+                fn = n;
+            }
+            err = read_at(h, header->code.offset + off, buf, fn);
+            if (err != AG_OK) {
+                break;
+            }
+        }
+        if (fn < n) {
+            memset(buf + fn, 0, n - fn);
+        }
+        if (api_in_code && api_at >= code_base + off &&
+            api_at + 4u <= code_base + off + n) {
+            memcpy(buf + (api_at - code_base - off), &api_val, 4);
+        }
+        for (uint32_t i = 0; i < header->reloc_count; i++) {
+            const uint32_t entry = rel[i];
+            if (entry & AG_AXE_R_IN_DATA) {
+                continue; /* the word lives in the data part */
+            }
+            const uint32_t at = AG_AXE_R_OFFSET(entry);
+            if (at < off || at + 4u > off + n) {
+                continue;
+            }
+            uint32_t w;
+            memcpy(&w, buf + (at - off), 4);
+            w += (entry & AG_AXE_R_TO_DATA) ? data_bias : code_bias;
+            memcpy(buf + (at - off), &w, 4);
+        }
+        err = ag_appfs_program_at((ag_appfs_slot_t *)out->xip_slot, off, buf, n);
+    }
+    ag_port_free(buf);
+
+    if (err == AG_OK && out->place.data != NULL) {
+        for (uint32_t i = 0; i < header->reloc_count; i++) {
+            const uint32_t entry = rel[i];
+            if (!(entry & AG_AXE_R_IN_DATA)) {
+                continue;
+            }
+            const uint32_t at = AG_AXE_R_OFFSET(entry);
+            if (at + 4u > header->data.size) {
+                continue;
+            }
+            uint32_t w;
+            memcpy(&w, (uint8_t *)out->place.data + at, 4);
+            w += (entry & AG_AXE_R_TO_DATA) ? data_bias : code_bias;
+            memcpy((uint8_t *)out->place.data + at, &w, 4);
+        }
+        if (!api_in_code && api_at >= data_base &&
+            api_at + 4u <= data_base + header->data.size) {
+            memcpy((uint8_t *)out->place.data + (api_at - data_base), &api_val,
+                   4);
+        }
+    }
+    ag_port_free(rel);
+
+    if (err != AG_OK) {
+        return err;
+    }
+
+    /* Entry point in flash; API already bound above, so the orchestrator's
+     * bind (api_slot NULL) is a no-op and it must not program again. */
+    out->binding.entry =
+        (void *)(uintptr_t)(code_addr + (header->entry - code_base));
+    out->binding.api_slot = NULL;
+    out->binding.data_base = (uintptr_t)out->place.data;
+    out->xip_programmed = true;
     return AG_OK;
 }
 
@@ -376,14 +530,31 @@ static ag_err_t place_image(const ag_axe_header_t *header, ag_loaded_app_t *out)
     arena_ready();
 
     const bool contiguous = (header->flags & AG_AXE_CONTIGUOUS) != 0;
+    /*
+     * AG_AXE_WANT_XIP inverts the "arena when it fits" default: the application
+     * would rather run from flash and leave the arena's internal SRAM free for
+     * what cannot come from flash (a radio bring-up's ~36 KB contiguous block).
+     * Honoured only for a non-contiguous image - flash cannot host a contiguous
+     * image's data, so a contiguous one takes the arena regardless of the flag.
+     */
+    const bool want_xip =
+        (header->flags & AG_AXE_WANT_XIP) != 0 && !contiguous;
     const size_t want =
         contiguous ? (size_t)header->code.size + header->data.size
                    : (size_t)header->code.size;
 
-    if (ag_arena_largest_free(&s_code, 16) >= want) {
+    if (!want_xip && ag_arena_largest_free(&s_code, 16) >= want) {
         /* place_arena says which of its two allocations failed; there is no
          * one sentence that covers both, and guessing produced the wrong one. */
         return place_arena(header, out);
+    }
+
+    if (want_xip && ag_arena_largest_free(&s_code, 16) >= want) {
+        ag_log(AG_LOG_INFO, "loader",
+               "%u bytes of code would fit the arena (%u free) but the image "
+               "asked for flash XIP; honouring it",
+               (unsigned)header->code.size,
+               (unsigned)ag_arena_largest_free(&s_code, 16));
     }
 
     if (contiguous) {
@@ -401,14 +572,16 @@ static ag_err_t place_image(const ag_axe_header_t *header, ag_loaded_app_t *out)
      * where those two together are most of the heap, the number that matters is
      * this one and it is worth printing before the attempt rather than after.
      */
-    ag_log(AG_LOG_INFO, "loader",
-           "%u bytes of code exceed the arena (%u free); flash XIP needs "
-           "%u scratch + %u data, heap has %u free, largest %u",
-           (unsigned)header->code.size,
-           (unsigned)ag_arena_largest_free(&s_code, 16),
-           (unsigned)header->code.size, (unsigned)header->data.size,
-           (unsigned)ag_port_mem_free(AG_MEM_FAST | AG_MEM_BYTE),
-           (unsigned)ag_port_mem_largest(AG_MEM_FAST | AG_MEM_BYTE));
+    if (!want_xip) {
+        ag_log(AG_LOG_INFO, "loader",
+               "%u bytes of code exceed the arena (%u free); flash XIP needs "
+               "%u data, heap has %u free, largest %u",
+               (unsigned)header->code.size,
+               (unsigned)ag_arena_largest_free(&s_code, 16),
+               (unsigned)header->data.size,
+               (unsigned)ag_port_mem_free(AG_MEM_FAST | AG_MEM_BYTE),
+               (unsigned)ag_port_mem_largest(AG_MEM_FAST | AG_MEM_BYTE));
+    }
 
     const ag_err_t err = place_xip(header, out);
     if (err != AG_OK) {
@@ -523,6 +696,16 @@ static ag_err_t load_streamed(ag_handle_t h, const ag_axe_header_t *header,
         return err;
     }
 
+    /* Flash XIP loads a page at a time (small scratch); arena loads in place. */
+    if (out->code_from_xip) {
+        err = xip_load_chunked(h, header, out);
+        if (err != AG_OK) {
+            release_image(out);
+            memset(out, 0, sizeof(*out));
+        }
+        return err;
+    }
+
     void *code_dst = (out->place.code_writable != NULL)
                          ? out->place.code_writable
                          : out->place.code;
@@ -581,6 +764,24 @@ static ag_err_t load_whole(const char *path, const char *cwd,
         ag_port_free(file);
         memset(out, 0, sizeof(*out));
         return err;
+    }
+
+    /*
+     * The signed path relocates the whole image in memory (it has just held the
+     * whole file to hash it), so for flash XIP it needs a code-size scratch that
+     * place_xip no longer allocates - the chunked streamed path is what avoids
+     * that, and it cannot verify a signature.  Allocate the scratch here.
+     */
+    if (out->code_from_xip) {
+        void *scratch = scratch_alloc(header->code.size);
+        if (scratch == NULL) {
+            ag_port_free(file);
+            release_image(out);
+            memset(out, 0, sizeof(*out));
+            return -AG_ENOMEM;
+        }
+        out->place.code_writable = scratch;
+        out->code_scratch = scratch;
     }
 
     void *code_dst = (out->place.code_writable != NULL)
@@ -695,12 +896,16 @@ ag_err_t ag_loader_load(const char *path, const char *cwd,
     ag_axe_bind_api(&out->binding, ag_loader_api());
 
     if (out->code_from_xip) {
-        err = ag_appfs_program((ag_appfs_slot_t *)out->xip_slot,
-                               out->code_scratch, out->header.code.size);
-        if (err != AG_OK) {
-            release_image(out);
-            memset(out, 0, sizeof(*out));
-            return err;
+        /* The chunked streamed path has already relocated and programmed the
+         * slot; the signed whole-image path has not, so program it now. */
+        if (!out->xip_programmed) {
+            err = ag_appfs_program((ag_appfs_slot_t *)out->xip_slot,
+                                   out->code_scratch, out->header.code.size);
+            if (err != AG_OK) {
+                release_image(out);
+                memset(out, 0, sizeof(*out));
+                return err;
+            }
         }
 
         const void *mapped = NULL;

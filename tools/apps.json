@@ -33,6 +33,16 @@
     { "out": "EDIT.AXE", "group": "core", "src": ["apps/edit/edit.c"] },
     { "out": "GFXDEMO.AXE", "group": "core", "src": ["apps/gfxdemo/gfxdemo.c"] },
     {
+      "out": "MARAUDER.AXE", "group": "core",
+      "_note": "ESP32-Marauder port as a loadable .AXE (Maxim's requirement); UI via gfx->present bands, radio via api->wifimon. Needs the board (touch/display/radio); compiled here to keep it from rotting.",
+      "include": ["apps/marauder"],
+      "cflags": "-Os -ffunction-sections -fdata-sections -fno-builtin",
+      "src": ["apps/marauder/marauder.c", "apps/marauder/mrd_gfx.c",
+              "apps/marauder/mrd_menu.c", "apps/marauder/mrd_scan.c",
+              "apps/marauder/mrd_wifi.c", "apps/marauder/mrd_bt.c",
+              "apps/marauder/mrd_spam.c"]
+    },
+    {
       "out": "GFXBENCH.AXE", "group": "core",
       "_note": "native backend only; the LVGL twins are in apps/gfxbench/build.py",
       "include": ["apps/common/libc", "apps/gfxbench"],

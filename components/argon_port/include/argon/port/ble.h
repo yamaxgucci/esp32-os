@@ -145,6 +145,13 @@ typedef ag_ble_adv_status_t ag_port_ble_adv_status_t;
 
 ag_err_t ag_port_ble_adv_start(const char *name);
 ag_err_t ag_port_ble_adv_stop(void);
+
+/*
+ * Raw, non-connectable advertising for a spammer: a caller-built payload under a
+ * (spoofed) random address, rebroadcast on every call.  See bt_hw.c.
+ */
+ag_err_t ag_port_ble_adv_raw(const uint8_t addr[6], const uint8_t *data,
+                             uint32_t len);
 ag_err_t ag_port_ble_adv_status(ag_port_ble_adv_status_t *out);
 void     ag_port_ble_adv_set_read(const void *data, uint32_t len);
 int32_t  ag_port_ble_adv_last_write(uint8_t *out, uint32_t max);

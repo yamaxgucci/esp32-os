@@ -207,7 +207,13 @@ static ag_err_t heap_create(proc_t *p, uint32_t requested)
     }
 
     for (;;) {
+        /* PSRAM, then byte-accessible D/IRAM, then ordinary internal - so the
+         * arena does not carve the DMA-capable DRAM the radio needs whole (see
+         * data_alloc in src/loader/loader.c). */
         void *mem = ag_port_alloc(size, AG_MEM_SLOW | AG_MEM_BYTE);
+        if (mem == NULL) {
+            mem = ag_port_alloc(size, AG_MEM_IRAM8);
+        }
         if (mem == NULL) {
             mem = ag_port_alloc(size, AG_MEM_FAST | AG_MEM_BYTE);
         }
