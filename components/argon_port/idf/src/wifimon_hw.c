@@ -65,6 +65,15 @@ ag_err_t ag_port_wifi_mon_start(void)
     if (s_on) {
         return AG_OK;
     }
+    /*
+     * Turn power save off before going promiscuous, and this is the line the
+     * ESP32-S3 needs that the original ESP32 got away without.  A station that
+     * has started but joined nothing still sleeps its radio between beacons
+     * under the default min-modem power save, and a sleeping radio hears no
+     * frames - so `mon` counted zero on the S3 while the same code caught
+     * hundreds on the CYD.  A sniffer must keep the receiver on the whole time.
+     */
+    (void)esp_wifi_set_ps(WIFI_PS_NONE);
     if (esp_wifi_set_promiscuous(true) != ESP_OK) {
         return -AG_ENODEV; /* radio not started - nothing to listen on */
     }
@@ -88,6 +97,9 @@ ag_err_t ag_port_wifi_mon_stop(void)
     }
     (void)esp_wifi_set_promiscuous_rx_cb(NULL);
     (void)esp_wifi_set_promiscuous(false);
+    /* Hand power save back to the driver's default now that the receiver need
+     * not stay on: a station that goes on to associate should sleep normally. */
+    (void)esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
     s_on = false;
     return AG_OK;
 }

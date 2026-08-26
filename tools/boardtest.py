@@ -94,7 +94,16 @@ class Board:
         # XON/XOFF on, because the guest sends XOFF when its input buffer
         # fills and a sender that ignores it loses bytes *silently* - trap 17,
         # which arrived as a file that transferred cleanly and was wrong.
-        self.ser = serial.Serial(port, baud, timeout=0.05, xonxoff=True)
+        #
+        # write_timeout, because the other half of that story is a guest that
+        # asserts XOFF and never releases it - a recv left half-finished, a
+        # console wedged.  Without a timeout the host blocks in the kernel's
+        # WriteFile forever, and killing the process does not free the port
+        # because the I/O is still pending; the only cure is unplugging the
+        # cable.  With one, a stuck write raises after 30 s and the process
+        # exits, leaving the port openable so a reset can recover the board.
+        self.ser = serial.Serial(port, baud, timeout=0.05, xonxoff=True,
+                                 write_timeout=30)
         self.log = log
         self.echo = echo
         self.buf = bytearray()

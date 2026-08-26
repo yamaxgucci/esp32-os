@@ -23,6 +23,7 @@
 #include <string.h>
 
 #include "esp_bt.h"
+#include "soc/soc_caps.h"
 #include "esp_hidh.h"
 #include "esp_hidh_nimble.h"
 #include "esp_log.h"
@@ -334,10 +335,20 @@ ag_err_t ag_port_bt_start(void)
      * no use for classic at all: what it wants is a keyboard, and a modern
      * keyboard is BLE.
      */
+#if SOC_BT_CLASSIC_SUPPORTED
     (void)esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT);
+#endif
 
     esp_bt_controller_config_t cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+#if SOC_BT_CLASSIC_SUPPORTED
+    /*
+     * The original chip's controller is dual-mode and has to be told which
+     * half to run; the S3's is BLE-only and its config has no such field.  The
+     * cost of getting this wrong was a chip that would not link, not one that
+     * ran classic - so it is a compile-time fork on what the controller is.
+     */
     cfg.mode = ESP_BT_MODE_BLE;
+#endif
     if (esp_bt_controller_init(&cfg) != ESP_OK) {
         return -AG_ENOMEM;
     }

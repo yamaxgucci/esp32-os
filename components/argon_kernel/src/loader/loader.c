@@ -114,6 +114,62 @@ static void arena_ready(void)
     }
 }
 
+#if defined(CONFIG_ARGON_APP_ARENA_PSRAM)
+/*
+ * S-1: a second, larger arena that lives in PSRAM and is mapped into the
+ * instruction window, so code executes from it while the internal-SRAM arena
+ * above stays small and out of the radios' way.
+ *
+ * The allocator works on the writable (data-window) alias, because that is what
+ * it hands out and what the loader writes through; the exec alias is the same
+ * block seen through the instruction window, a fixed distance away, so the
+ * executable address of any allocation is (that allocation) + s_psram_bias.
+ */
+#include <argon/port/execmem.h>
+
+#ifndef CONFIG_ARGON_APP_ARENA_PSRAM_KB
+#define CONFIG_ARGON_APP_ARENA_PSRAM_KB 512
+#endif
+#define AG_PSRAM_ARENA_BYTES ((size_t)CONFIG_ARGON_APP_ARENA_PSRAM_KB * 1024u)
+
+static ag_arena_block_t s_psram_blocks[AG_LOADER_SLOTS];
+static ag_arena_t       s_psram;
+static uint8_t         *s_psram_write;   /* writable base (data window)    */
+static intptr_t         s_psram_bias;    /* exec = write + bias            */
+static ag_port_map_t    s_psram_map;
+static bool             s_psram_tried;
+
+/* True once the PSRAM arena is mapped and usable. */
+static bool psram_ready(void)
+{
+    if (s_psram.base != NULL) {
+        return true;
+    }
+    if (s_psram_tried) {
+        return false; /* asked once, the port said no */
+    }
+    s_psram_tried = true;
+
+    void        *exec = NULL;
+    void        *write = NULL;
+    const ag_err_t err =
+        ag_port_execmem_map(AG_PSRAM_ARENA_BYTES, &exec, &write, &s_psram_map);
+    if (err != AG_OK) {
+        ag_log(AG_LOG_WARN, "loader",
+               "PSRAM code arena unavailable (%d); using internal SRAM",
+               (int)err);
+        return false;
+    }
+    s_psram_write = (uint8_t *)write;
+    s_psram_bias = (intptr_t)((uint8_t *)exec - (uint8_t *)write);
+    ag_arena_init(&s_psram, write, AG_PSRAM_ARENA_BYTES, s_psram_blocks,
+                  AG_LOADER_SLOTS);
+    ag_log(AG_LOG_INFO, "loader", "PSRAM code arena: %u KB",
+           (unsigned)CONFIG_ARGON_APP_ARENA_PSRAM_KB);
+    return true;
+}
+#endif /* CONFIG_ARGON_APP_ARENA_PSRAM */
+
 size_t ag_loader_set_arena_kb(uint32_t kb)
 {
     if (s_code.base != NULL) {
@@ -249,6 +305,17 @@ static void release_image(ag_loaded_app_t *app)
         ag_appfs_release((ag_appfs_slot_t *)app->xip_slot);
         app->xip_slot = NULL;
     }
+#if defined(CONFIG_ARGON_APP_ARENA_PSRAM)
+    if (app->code_from_psram) {
+        /* The PSRAM arena tracks the writable alias, not the exec one; the
+         * whole-arena mapping stays for the next image. */
+        if (app->place.code_writable != NULL &&
+            !ag_arena_free(&s_psram, app->place.code_writable)) {
+            ag_log(AG_LOG_ERROR, "loader", "PSRAM arena does not own %p",
+                   app->place.code_writable);
+        }
+    } else
+#endif
     if (app->place.code != NULL && !app->code_from_xip) {
         if (!ag_arena_free(&s_code, app->place.code)) {
             ag_log(AG_LOG_ERROR, "loader", "arena does not own %p",
@@ -257,6 +324,7 @@ static void release_image(ag_loaded_app_t *app)
     }
     memset(&app->place, 0, sizeof(app->place));
     app->code_from_xip = false;
+    app->code_from_psram = false;
 }
 
 /*
@@ -325,6 +393,50 @@ static ag_err_t place_arena(const ag_axe_header_t *header, ag_loaded_app_t *out)
     out->data_owned = data;
     return AG_OK;
 }
+
+#if defined(CONFIG_ARGON_APP_ARENA_PSRAM)
+/*
+ * S-1: code in the PSRAM arena, data in ordinary PSRAM.
+ *
+ * The code block is written through its data-window address and executed
+ * through the instruction-window one; the loader's place struct carries both,
+ * so this only has to hand out the pair.  Split images only, for the same
+ * reason flash XIP is: a contiguous image's data sits inside the code block and
+ * would have to be written through an address the processor is fetching from.
+ */
+static ag_err_t place_psram(const ag_axe_header_t *header, ag_loaded_app_t *out)
+{
+    if ((header->flags & AG_AXE_CONTIGUOUS) != 0) {
+        return -AG_ENOTSUP;
+    }
+
+    void *writable = ag_arena_alloc(&s_psram, header->code.size, 16);
+    if (writable == NULL) {
+        return -AG_ENOMEM;
+    }
+
+    void *data = NULL;
+    if (header->data.size > 0) {
+        data = data_alloc(header->data.size);
+        if (data == NULL) {
+            (void)ag_arena_free(&s_psram, writable);
+            ag_log(AG_LOG_ERROR, "loader",
+                   "%u bytes of data will not fit outside the arena",
+                   (unsigned)header->data.size);
+            return -AG_ENOMEM;
+        }
+    }
+
+    out->place.code = (uint8_t *)writable + s_psram_bias; /* exec view */
+    out->place.code_capacity = header->code.size;
+    out->place.code_writable = writable;                  /* write view */
+    out->place.data = data;
+    out->place.data_capacity = header->data.size;
+    out->data_owned = data;
+    out->code_from_psram = true;
+    return AG_OK;
+}
+#endif /* CONFIG_ARGON_APP_ARENA_PSRAM */
 
 /*
  * R-1: relocate into PSRAM, program appfs, execute from flash XIP.
@@ -549,6 +661,25 @@ static ag_err_t place_image(const ag_axe_header_t *header, ag_loaded_app_t *out)
         return place_arena(header, out);
     }
 
+#if defined(CONFIG_ARGON_APP_ARENA_PSRAM)
+    /*
+     * S-1: the internal arena did not take it (on this board it is deliberately
+     * tiny, so that is the common case), so try the PSRAM arena before flash.
+     * PSRAM execution is slower than internal SRAM but far faster than flash for
+     * a working set that does not fit the cache, and it leaves the internal
+     * memory to the radios - which is the whole reason the arena moved.
+     */
+    if (!want_xip && !contiguous && psram_ready() &&
+        ag_arena_largest_free(&s_psram, 16) >= (size_t)header->code.size) {
+        const ag_err_t perr = place_psram(header, out);
+        if (perr == AG_OK) {
+            return AG_OK;
+        }
+        /* Out of PSRAM-arena or data memory: fall through to flash XIP, which
+         * needs neither. */
+    }
+#endif
+
     if (want_xip && ag_arena_largest_free(&s_code, 16) >= want) {
         ag_log(AG_LOG_INFO, "loader",
                "%u bytes of code would fit the arena (%u free) but the image "
@@ -731,6 +862,19 @@ static ag_err_t load_streamed(ag_handle_t h, const ag_axe_header_t *header,
                            header->reloc_count, &out->binding);
     }
     ag_port_free(rel);
+
+#if defined(CONFIG_ARGON_APP_ARENA_PSRAM)
+    /*
+     * The code was written and relocated through the data window; make it
+     * visible to the instruction fetch before anything jumps into it - push the
+     * data cache to PSRAM, drop the stale instruction cache.  Only for a
+     * PSRAM-placed image: the internal arena is already coherent, and flash XIP
+     * has its own path.
+     */
+    if (err == AG_OK && out->code_from_psram) {
+        ag_port_execmem_sync(out->place.code_writable, out->place.code_capacity);
+    }
+#endif
 
     if (err != AG_OK) {
         release_image(out);

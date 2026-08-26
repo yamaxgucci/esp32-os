@@ -24,6 +24,47 @@ menu "ArgonOS"
             allocated from extended memory (PSRAM), so statics and bss are not
             bounded by this number.
 
+    config ARGON_APP_ARENA_PSRAM
+        bool "Put the code arena in PSRAM (S-1)"
+        default n
+        help
+            Move the code arena out of internal SRAM and into PSRAM, mapped into
+            the instruction window so an application still executes from it.
+
+            This is the trade the ESP32-S3 alone can make.  Instruction RAM and
+            the DMA-capable data RAM are one physical SRAM, so on the primary
+            target the arena and the radios fight over the same ~330 KB and a
+            192 KB arena leaves no room for Wi-Fi and Bluetooth at once.  PSRAM
+            reaches the instruction bus on this chip, so the arena can live in
+            the 8 MB instead and the internal SRAM it held goes back to the
+            radios and the heap - ARGON_APP_ARENA_KB then costs PSRAM, not
+            internal memory, and can be far larger.
+
+            The cost is speed: PSRAM is an order slower than internal SRAM and
+            cached, so a hot inner loop (an emulator core, a DSP block) pays for
+            every cache miss.  Code that needs internal-SRAM speed will want a
+            hot-text split later; this is the coarse form that makes everything
+            fit.
+
+            Off by default and everywhere but the board that has been shown to
+            do it: it needs PSRAM that reaches the instruction bus, which QEMU
+            does not model and the original ESP32 does not have.  With it off,
+            the arena is the internal-SRAM buffer described above and nothing
+            changes.
+
+    config ARGON_APP_ARENA_PSRAM_KB
+        int "PSRAM code arena, KB"
+        depends on ARGON_APP_ARENA_PSRAM
+        range 64 8192
+        default 512
+        help
+            The size of the PSRAM code arena, used instead of ARGON_APP_ARENA_KB
+            when the arena is in PSRAM.  It costs PSRAM rather than internal
+            SRAM, so it can be large: the default holds the biggest images in
+            the tree several times over.  The internal-SRAM static buffer is not
+            linked at all in this mode, which is the point - the internal memory
+            it would have taken stays free for the radios.
+
     config ARGON_APP_STACK_KB
         int "Default application stack, KB"
         range 2 64

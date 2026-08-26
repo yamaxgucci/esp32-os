@@ -484,7 +484,16 @@ static ag_err_t spi_bring_up(int bus)
     }
 
     const ag_board_spi_t *cfg = &ag_board()->spi[idx];
-    if (cfg->sck < 0 || (cfg->mosi < 0 && cfg->miso < 0)) {
+    /*
+     * A bus needs a data line.  Whether it needs a clock is the board's
+     * answer, not ours: normally it does and leaving sck out is a typo, but a
+     * device driven by the shape of the signal rather than by clocked bits is
+     * wired to mosi alone - the addressable LED on a development board is
+     * three bits of SPI per bit of its own and has no clock input at all.  So
+     * a bus with no data line is undescribed, and a bus with no clock is
+     * allowed exactly when there is nothing to read back.
+     */
+    if ((cfg->mosi < 0 && cfg->miso < 0) || (cfg->sck < 0 && cfg->miso >= 0)) {
         ag_log(AG_LOG_WARN, "io",
                "spi%d has no pins; set spi%d.sck and spi%d.mosi in BOARD.CFG",
                bus, bus, bus);

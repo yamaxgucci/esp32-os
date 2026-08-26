@@ -3667,6 +3667,39 @@ static int cmd_io(int argc, char **argv)
         return 1;
     }
 
+    /*
+     * A free-running clock on a pin.  It exists for one job that comes up on
+     * every new board with a camera: an image sensor's SCCB (an I2C bus by
+     * another name) stays mute until its master clock is running, so scanning
+     * for it with `io i2c` first needs `io xclk` on the sensor's XCLK pin.  A
+     * sensor that answers only once the clock is on is a sensor that is wired
+     * and alive; one that stays silent with the clock on is a pinout or a
+     * conflict, which on this module usually means the camera shares a line
+     * with the octal PSRAM (GPIO 33..37) and cannot work with 8 MB fitted.
+     */
+    if (argc >= 3 && ag_path_icmp(argv[1], "xclk") == 0) {
+        const int      pin = atoi(argv[2]);
+        const uint32_t hz = (argc > 3) ? (uint32_t)strtoul(argv[3], NULL, 10)
+                                       : 20000000u;
+        if (io->pwm_config == NULL || io->pwm_set == NULL) {
+            ag_console_puts("this build has no PWM\n");
+            return 1;
+        }
+        /* Two bits of resolution: at 80 MHz that reaches 20 MHz, which is what
+         * an OV sensor wants, and the duty is half of the four counts. */
+        ag_err_t err = io->pwm_config(pin, hz, 2);
+        if (err == AG_OK) {
+            err = io->pwm_set(pin, 2);
+        }
+        if (err != AG_OK) {
+            ag_console_printf("xclk: %s\n",
+                              ag_loader_api()->sys->strerror(err));
+            return 1;
+        }
+        ag_console_printf("xclk %u Hz on pin %d\n", (unsigned)hz, pin);
+        return 0;
+    }
+
     if (argc >= 3 && ag_path_icmp(argv[1], "i2c") == 0) {
         const int bus = atoi(argv[2]);
         ag_console_printf("scanning i2c%d...\n", bus);
@@ -3689,6 +3722,54 @@ static int cmd_io(int argc, char **argv)
         ag_console_printf("%u device(s)\n", (unsigned)found);
         return 0;
     }
+    /*
+     * Raw bytes on a SPI bus, in hexadecimal.
+     *
+     * During bring-up the chip on the wires has no driver yet, and the first
+     * question anyone asks it is its identifier - a byte out, a byte back.
+     * Writing a driver to find out whether the chip is there at all is the
+     * wrong order of work; this is the same tool `io i2c` is, the bus before
+     * anything that understands what is on it.
+     *
+     * It is also the only way to drive a device whose protocol is a shape
+     * rather than a register.  The addressable LED soldered to a development
+     * board wants pulses a few hundred nanoseconds long, which no shell can
+     * bit-bang; as three bits of SPI per bit of its own it is nine bytes and
+     * no timing problem at all.
+     *
+     * Both directions move at once, because that is what SPI is, so what came
+     * back is printed.  All 0xff is a bus with nobody on it, and seeing that
+     * should not cost a driver.
+     */
+    if (argc >= 4 && ag_path_icmp(argv[1], "spi") == 0) {
+        const int bus = atoi(argv[2]);
+        uint8_t   tx[64];
+        uint8_t   rx[64];
+        size_t    n = 0;
+
+        for (int i = 3; i < argc; i++) {
+            if (n >= sizeof(tx)) {
+                ag_console_printf("io spi: at most %u bytes\n",
+                                  (unsigned)sizeof(tx));
+                return 1;
+            }
+            tx[n++] = (uint8_t)strtoul(argv[i], NULL, 16);
+        }
+
+        const ag_err_t err = io->spi_xfer(bus, -1, tx, rx, n);
+        if (err != AG_OK) {
+            ag_console_printf("spi%d: %s\n", bus,
+                              ag_loader_api()->sys->strerror(err));
+            return 1;
+        }
+        ag_console_printf("spi%d: %u bytes, back:", bus, (unsigned)n);
+        for (size_t k = 0; k < n; k++) {
+            ag_console_printf(" %02x", (unsigned)rx[k]);
+        }
+        ag_console_puts("\n");
+        return 0;
+    }
+
 
     /*
      * Analogue input.  A separate word rather than a mode of `io <pin>`,
@@ -4179,7 +4260,8 @@ static const ag_command_t k_commands[] = {
     {"dev", "[name]", "list devices, or describe one", cmd_dev},
     {"drv", "[load|unload|install|uninstall|probe]",
      "modules: list, load, install to C:, unload, I2C probe", cmd_drv},
-    {"io", "[pin [mode]] | i2c <bus> | adc [ch]", "pins and buses", cmd_io},
+    {"io", "[pin [mode]] | i2c <bus> | spi <bus> <hex...> | xclk <pin> [hz] | adc [ch]",
+     "pins and buses", cmd_io},
     {"beep", "[hz] [ms]", "a tone on /dev/pcm0", cmd_beep},
     {"power", "[full|eco|doze|screen on|off|auto on|off]",
      "the clock, the screen, and what applications make of it", ag_cmd_power},

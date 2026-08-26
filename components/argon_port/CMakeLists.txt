@@ -25,6 +25,9 @@ idf_component_register(
     # wherever the kernel includes them.
     REQUIRES argon_abi heap esp_timer freertos log esp_system esp_hw_support
              esp_common esp_psram
+             # esp_mmu_map / esp_cache_msync: mapping PSRAM into the instruction
+             # window for the code arena (execmem_hw.c, S-1)
+             esp_mm
              # the clock, for argon/port/power.h.  Present whether or not the
              # build enables power management: with it off, esp_pm_configure
              # is still there and still answers, which is how the port says

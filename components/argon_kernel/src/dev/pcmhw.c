@@ -194,15 +194,47 @@ static const ag_dev_ops_t k_pcm_ops = {
 
 ag_err_t ag_pcmhw_init(void)
 {
+    /*
+     * The board describes where the sound goes before the port is asked
+     * whether there is any.  On a chip whose converters are on fixed pins this
+     * changes nothing; on one that has none, it is the whole question - three
+     * pins in BOARD.CFG are the difference between a machine with an output
+     * and a machine without one, and neither the kernel nor the port is
+     * allowed to guess which pins those are.
+     */
+    const ag_board_audio_t   *a = &ag_board()->audio;
+    const ag_port_audio_pins_t pins = {
+        .bclk = a->bclk,
+        .ws = a->ws,
+        .dout = a->dout,
+        .mclk = a->mclk,
+        .rate = a->rate,
+    };
+    ag_port_audio_pins(&pins);
+
     if (!ag_port_audio_present()) {
         return AG_OK; /* no output on this machine; pcmnull stands alone */
     }
+
+    /*
+     * The pins are deliberately not reserved.
+     *
+     * A reservation in this system is permanent - ag_io_release refuses one,
+     * because "wait for it" and "you will never get this" have to be different
+     * answers.  That is right for the console and the card, which are in use
+     * from boot to power-off, and wrong for an output that is silent most of
+     * the time: the board on this desk has its addressable LED on the same
+     * wire as the word clock, and a pin reserved at boot would mean the light
+     * could never be turned off again.  The honest state - taken while the
+     * device is open, given back on close - does not exist yet, and inventing
+     * it in passing here would be the wrong place to invent it.
+     */
 
     default_fmt(&s_fmt);
 
     const ag_dev_desc_t desc = {
         .name = "pcm0",
-        .driver = "dac",
+        .driver = ag_port_audio_name(),
         .cls = AG_DEV_AUDIO,
         .flags = AG_DEVF_EXCLUSIVE | AG_DEVF_DMA,
         .ops = &k_pcm_ops,
@@ -212,8 +244,8 @@ ag_err_t ag_pcmhw_init(void)
     if (err != AG_OK) {
         return err;
     }
-    ag_log(AG_LOG_INFO, TAG, "pcm0 ready (%u Hz, opens on first write)",
-           (unsigned)s_fmt.rate);
+    ag_log(AG_LOG_INFO, TAG, "pcm0 ready (%s, %u Hz, opens on first write)",
+           ag_port_audio_name(), (unsigned)s_fmt.rate);
     return AG_OK;
 }
 #else /* !CONFIG_ARGON_ENABLE_AUDIO */

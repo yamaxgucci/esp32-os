@@ -38,6 +38,14 @@ typedef struct {
      * program it again - it only maps it.
      */
     bool  xip_programmed;
+
+    /*
+     * S-1: code placed in the PSRAM arena.  It is written through
+     * place.code_writable (the data window) and executed at place.code (the
+     * instruction window); the block is freed back to the PSRAM arena on
+     * release, and the whole-arena mapping stays for the next image.
+     */
+    bool  code_from_psram;
 } ag_loaded_app_t;
 
 /*

@@ -11,6 +11,8 @@
  *
  * What a port must supply:
  *
+ *   void    ag_port_audio_pins(const ag_port_audio_pins_t *pins)
+ *   const char *ag_port_audio_name(void)
  *   bool    ag_port_audio_present(void)
  *   bool    ag_port_audio_open(uint32_t rate, uint8_t channels)
  *   void    ag_port_audio_close(void)
@@ -41,6 +43,39 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+
+/*
+ * Where the sound comes out, when that is the board's decision and not the
+ * chip's.
+ *
+ * The original ESP32's converters are wired to two pins inside the part and
+ * cannot be anywhere else, so a port for that chip ignores this entirely.  A
+ * codec on I2S sits wherever whoever laid the board out put it, and the same
+ * firmware runs on boards that disagree - so the pins come from BOARD.CFG,
+ * they arrive before present() is asked, and on such a machine present()
+ * answers yes exactly when the board has said where.
+ *
+ * Called once, at the devices stage, whether or not the board said anything:
+ * a port that has no use for pins must still define this, and doing nothing is
+ * the correct implementation rather than a missing one.
+ */
+typedef struct {
+    int16_t  bclk;
+    int16_t  ws;
+    int16_t  dout;
+    int16_t  mclk; /* -1 when the codec makes its own clock, as most do */
+    uint32_t rate; /* the board's default; open() may still ask for another */
+} ag_port_audio_pins_t;
+
+void ag_port_audio_pins(const ag_port_audio_pins_t *pins);
+
+/*
+ * What the output is, in one word, for `dev` to print: "dac", "i2s", "none".
+ * The device table says who drives a device, and a codec listed as the chip's
+ * own converter is the kind of small lie that costs an hour on the day
+ * something is wrong with the sound.
+ */
+const char *ag_port_audio_name(void);
 
 bool    ag_port_audio_present(void);
 bool    ag_port_audio_open(uint32_t rate, uint8_t channels);

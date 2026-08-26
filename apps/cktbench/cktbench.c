@@ -492,7 +492,7 @@ static void sine_fill(void)
 
 static void bench_head(void)
 {
-    out("  circuit          unk  nl   iters  instr/smp ms/20ms  %core x8OS\n");
+    out("  circuit          unk  nl   iters  cyc/smp   ms/20ms  %core x8OS\n");
 }
 
 /*
@@ -537,7 +537,7 @@ static uint32_t bench_run(ag_ckt_t *k, int out_node, float amp, uint32_t settle,
                           uint32_t meas)
 {
     uint32_t  i;
-    ag_time_t t0, t1;
+    uint64_t c0, c1;
     volatile float sink = 0.0f;
     float     acc = 0.0f;
 
@@ -546,23 +546,31 @@ static uint32_t bench_run(ag_ckt_t *k, int out_node, float amp, uint32_t settle,
     }
 
     k->iters_total = 0;
-    t0 = ag_micros();
+    /*
+     * Real cycles, not wall-clock microseconds.  The percentages below are
+     * cycles-per-sample against the 5000 a 240 MHz core has at 48 kHz; the
+     * cycle counter gives that directly on the board, and under QEMU -icount it
+     * counts instructions instead - the floor the docs quote.  Measuring in us
+     * and scaling was right only under -icount and read about four times too
+     * high on real silicon, where a us is a us and not an instruction count.
+     */
+    c0 = ag_cycles();
     for (i = 0; i < meas; i++) {
         acc += ag_ckt_tick(k, amp * s_sine[i % SINE_N], out_node);
     }
-    t1 = ag_micros();
+    c1 = ag_cycles();
     sink = acc;
     (void)sink;
 
-    return meas ? (uint32_t)(((uint64_t)(t1 - t0) * 1000u) / meas) : 0u;
+    return meas ? (uint32_t)((c1 - c0) / meas) : 0u;
 }
 
 static void run_parts(uint32_t settle, uint32_t meas)
 {
     int out_node;
 
-    out("\nparts: one sample through one circuit, instructions retired.\n"
-        "unk is the size of the linear system, nl the number of devices that\n"
+    out("\nparts: one sample through one circuit, cycles retired (real on the board,\n"
+        "instructions under -icount).  unk is the size of the linear system, nl the number of devices that\n"
         "have to be re-linearised on every Newton pass.  %core is one 240 MHz\n"
         "core at 48 kHz; x4OS and x8OS are the same circuit oversampled, which\n"
         "an overdrive needs and a tone stack does not.\n\n");
@@ -655,7 +663,7 @@ static void run_ramp(int max_stages, uint32_t settle, uint32_t meas)
     for (s = 1; s <= max_stages; s++) {
         char     name[16];
         uint32_t i;
-        ag_time_t t0, t1;
+        uint64_t c0, c1;
         volatile float sink;
         float    acc = 0.0f;
         uint32_t instr;
@@ -668,14 +676,14 @@ static void run_ramp(int max_stages, uint32_t settle, uint32_t meas)
             acc += ckt_chain_tick(&s_chain, s_sine[i % SINE_N]);
         }
         ckt_chain_reset_stats(&s_chain);
-        t0 = ag_micros();
+        c0 = ag_cycles();
         for (i = 0; i < meas; i++) {
             acc += ckt_chain_tick(&s_chain, s_sine[i % SINE_N]);
         }
-        t1 = ag_micros();
+        c1 = ag_cycles();
         sink = acc;
         (void)sink;
-        instr = meas ? (uint32_t)(((uint64_t)(t1 - t0) * 1000u) / meas) : 0u;
+        instr = meas ? (uint32_t)((c1 - c0) / meas) : 0u;
 
         stage_name(name, s);
         {
@@ -719,7 +727,8 @@ static void run_baked(int max_stages, uint32_t meas, unsigned flags)
     for (s = 1; s <= max_stages; s++) {
         char           name[16];
         uint32_t       i, instr, bake_us;
-        ag_time_t      t0, t1;
+        uint64_t       c0, c1;
+        ag_time_t      t0, t1; /* still used for the one-off bake timing */
         volatile float sink;
         float          acc = 0.0f;
 
@@ -733,14 +742,14 @@ static void run_baked(int max_stages, uint32_t meas, unsigned flags)
         bake_us = (uint32_t)(t1 - t0);
 
         /* No settle: a baked chain starts at its operating point. */
-        t0 = ag_micros();
+        c0 = ag_cycles();
         for (i = 0; i < meas; i++) {
             acc += ckt_baked_chain_tick(&s_baked, s_sine[i % SINE_N]);
         }
-        t1 = ag_micros();
+        c1 = ag_cycles();
         sink = acc;
         (void)sink;
-        instr = meas ? (uint32_t)(((uint64_t)(t1 - t0) * 1000u) / meas) : 0u;
+        instr = meas ? (uint32_t)((c1 - c0) / meas) : 0u;
 
         stage_name(name, s);
         {

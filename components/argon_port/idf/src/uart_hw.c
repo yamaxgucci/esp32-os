@@ -11,6 +11,7 @@
 #include <argon/port/uart.h>
 
 #include "driver/uart.h"
+#include "esp_rom_uart.h"
 #include "freertos/FreeRTOS.h"
 
 static bool valid(int port)
@@ -105,6 +106,19 @@ ag_err_t ag_port_uart_config(int port, const ag_port_uart_cfg_t *cfg)
     if (!valid(port) || cfg == NULL) {
         return -AG_EINVAL;
     }
+
+    /*
+     * Let whatever is already going out finish before the port is
+     * reconfigured.  This is the console's take-over from the ROM/second-stage
+     * boot log on UART0: reprogramming the divider and line while a boot-log
+     * byte is still in the shift register wedges the port, and the system comes
+     * up silent - no banner, no prompt.  It is timing-sensitive, so it hid
+     * until an unrelated change to the image's layout (the PSRAM code arena)
+     * shifted the moment of the take-over and made it reproducible.  Draining
+     * first removes the race rather than the symptom; on a port with nothing in
+     * flight it returns at once.
+     */
+    esp_rom_uart_tx_wait_idle((uint8_t)port);
 
     uart_config_t hw;
     fill(&hw, cfg);
