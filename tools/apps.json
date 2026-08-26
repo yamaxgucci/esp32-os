@@ -70,6 +70,14 @@
     { "out": "ECHO.SYS", "group": "core", "src": ["apps/echo/echo.c"] },
     { "out": "GC2145.SYS", "group": "core", "include": ["apps/gc2145"], "src": ["apps/gc2145/gc2145.c"] },
     { "out": "CAM.AXE", "group": "core", "src": ["apps/cam/cam.c"] },
+    {
+      "out": "HTTPD.AXE", "group": "core",
+      "_note": "WIP: the file server as a loadable .AXE (moves httpd out of the firmware). The logic works (parse/serve over api->net verified in QEMU), but this image HANGS at load - a kernel loader bug: an .AXE this size that links netmsg.c faults/hangs before ag_main, independent of stack/heap/placement (a small build with the same code gc'd runs fine). Built here so it does not rot; NOT wired as the `httpd` command yet (that stays built-in). See the spawned card 'Fix .AXE loader hang'.",
+      "include": ["apps/common/libc", "components/argon_kernel/include"],
+      "src": ["apps/httpd/httpd.c",
+              "components/argon_kernel/src/net/netmsg.c",
+              "apps/common/libc/libc_shim.c"]
+    },
     { "out": "PCMVIRT.SYS", "group": "core", "src": ["apps/pcmvirt/pcmvirt.c"] },
     { "out": "KBDVIRT.SYS", "group": "core", "src": ["apps/kbdvirt/kbdvirt.c"] },
     { "out": "MOUSEVIRT.SYS", "group": "core", "src": ["apps/mousevirt/mousevirt.c"] },
