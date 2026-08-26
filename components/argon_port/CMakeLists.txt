@@ -28,6 +28,9 @@ idf_component_register(
              # esp_mmu_map / esp_cache_msync: mapping PSRAM into the instruction
              # window for the code arena (execmem_hw.c, S-1)
              esp_mm
+             # the DVP camera transport (camera_hw.c); IDF core, small, linked
+             # only when CONFIG_ARGON_ENABLE_CAMERA references it
+             esp_driver_cam
              # the clock, for argon/port/power.h.  Present whether or not the
              # build enables power management: with it off, esp_pm_configure
              # is still there and still answers, which is how the port says

@@ -129,9 +129,15 @@ extern "C" {
  *      to BLE advertising what wifimon->tx_raw is to 802.11: the injection half
  *      of the radio, for a tool that forges the advertisements a phone shows as
  *      pairing pop-ups.  NULL without CONFIG_ARGON_BLE_PERIPHERAL.
+ * 0.41 api->cam: the DVP capture engine (LCD_CAM + DMA) as a primitive a
+ *      loadable sensor driver drives, so the sensor's register tables live in a
+ *      .SYS rather than in the image.  The firmware carries only the thin
+ *      transport; the driver configures it with the sensor's pins/format and
+ *      pulls frames.  NULL without CONFIG_ARGON_ENABLE_CAMERA (off by default -
+ *      no camera in QEMU, and it is a board's peripheral, not the chip's).
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 40u
+#define AG_ABI_MINOR 41u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -1858,6 +1864,57 @@ typedef struct ag_wifi_api {
 } ag_wifi_api_t;
 
 /* ------------------------------------------------------------------------ */
+/* cam - a DVP image sensor's frames (ABI 0.41)                             */
+/* ------------------------------------------------------------------------ */
+/*
+ * The thin half of a camera: the chip's LCD_CAM peripheral and its DMA, which
+ * cannot be reached from a .SYS through io and so live in the image.  The other
+ * half - which sensor is on the wires, its register tables, its SCCB init - is
+ * a loadable driver that configures this transport and reads frames from it.
+ * That split keeps the sensor zoo out of the firmware: a new sensor is a new
+ * .SYS, not a rebuild.
+ */
+
+/* Pixel formats the transport delivers.  RGB565 is what a sensor without a
+ * JPEG engine (the GC2145 on the S3 CAM board) gives; the encoder, if any, is
+ * the application's, not the firmware's. */
+typedef enum {
+    AG_CAM_FMT_RGB565 = 0,
+} ag_cam_fmt_t;
+
+/* A sensor's DVP wiring, as the driver knows it.  Pin < 0 means "none". */
+typedef struct {
+    int16_t  xclk;      /* clock the chip drives out to the sensor           */
+    int16_t  pclk;      /* pixel clock the sensor drives back                */
+    int16_t  vsync;
+    int16_t  href;      /* also called DE, data enable                       */
+    int16_t  data[8];   /* D0..D7                                            */
+    uint32_t xclk_hz;   /* XCLK frequency, e.g. 20000000                     */
+} ag_cam_pins_t;
+
+typedef struct ag_cam_api {
+    uint32_t size;
+
+    /*
+     * Bring the transport up for a sensor already (or about to be) set to this
+     * format and size.  Allocates the frame buffer in PSRAM, generates XCLK,
+     * starts DMA.  The driver calls this once it has the sensor talking.
+     */
+    ag_err_t (*configure)(const ag_cam_pins_t *pins, ag_cam_fmt_t fmt,
+                          uint32_t width, uint32_t height);
+
+    /*
+     * One captured frame.  Blocks up to timeout_ms for the next one; the
+     * returned pointer is the PSRAM frame buffer and is valid until the next
+     * capture().  NULL on timeout or error; *len is the bytes received.
+     */
+    const uint8_t *(*capture)(size_t *len, uint32_t timeout_ms);
+
+    /* Stop DMA, free the buffer and the peripheral. */
+    void (*stop)(void);
+} ag_cam_api_t;
+
+/* ------------------------------------------------------------------------ */
 /* Root table                                                               */
 /* ------------------------------------------------------------------------ */
 
@@ -1901,6 +1958,10 @@ typedef struct ag_api {
      * radio (CONFIG_ARGON_NET_WIFI off, e.g. QEMU).  Within it the AP and
      * ESP-NOW entries are NULL unless their own build options are set. */
     const ag_wifi_api_t *wifi;
+
+    /* ABI 0.41+: the DVP camera transport - NULL without
+     * CONFIG_ARGON_ENABLE_CAMERA. */
+    const ag_cam_api_t *cam;
 } ag_api_t;
 
 /* ------------------------------------------------------------------------ */

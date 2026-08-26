@@ -68,6 +68,8 @@
     { "out": "ZIP.AXE", "group": "core", "src": ["apps/zip/zip.c"] },
 
     { "out": "ECHO.SYS", "group": "core", "src": ["apps/echo/echo.c"] },
+    { "out": "GC2145.SYS", "group": "core", "include": ["apps/gc2145"], "src": ["apps/gc2145/gc2145.c"] },
+    { "out": "CAM.AXE", "group": "core", "src": ["apps/cam/cam.c"] },
     { "out": "PCMVIRT.SYS", "group": "core", "src": ["apps/pcmvirt/pcmvirt.c"] },
     { "out": "KBDVIRT.SYS", "group": "core", "src": ["apps/kbdvirt/kbdvirt.c"] },
     { "out": "MOUSEVIRT.SYS", "group": "core", "src": ["apps/mousevirt/mousevirt.c"] },

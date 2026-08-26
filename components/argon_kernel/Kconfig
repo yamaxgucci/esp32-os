@@ -94,6 +94,20 @@ menu "ArgonOS"
             out and io->adc_read is NULL.  Turn this on for a real board, where
             the calibration works, and expect QEMU to stop booting.
 
+    config ARGON_ENABLE_CAMERA
+        bool "Camera transport (api->cam over DVP)"
+        default n
+        help
+            Links ESP-IDF's esp_cam_ctlr DVP driver (LCD_CAM + DMA) and exposes
+            it as api->cam - the thin, sensor-agnostic half of a camera.  The
+            sensor itself (its register tables, its SCCB init) is a loadable
+            .SYS that configures this transport and reads frames; the firmware
+            carries only the transport, so a new sensor is a new module, not a
+            rebuild.
+
+            Off by default and everywhere but the S3 CAM board: QEMU has no
+            camera, and it needs PSRAM for the frame buffer.
+
     config ARGON_ENABLE_AUDIO
         bool "Sound output hardware (/dev/pcm0)"
         default n

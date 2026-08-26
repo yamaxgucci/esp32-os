@@ -41,6 +41,7 @@
 #include <argon/port/time.h>
 #include <argon/port/task.h>
 #include <argon/port/wifi.h>
+#include <argon/port/camera.h>
 
 #include "dev/io.h"
 #include "net/espnow.h"
@@ -1355,6 +1356,16 @@ static const ag_wifi_api_t k_wifi = {
 };
 #endif /* AG_PORT_HAS_WIFI */
 
+#if defined(CONFIG_ARGON_ENABLE_CAMERA) && CONFIG_ARGON_ENABLE_CAMERA
+/* The DVP transport, straight from the port - the sensor driver is a .SYS. */
+static const ag_cam_api_t k_cam = {
+    .size = sizeof(ag_cam_api_t),
+    .configure = ag_port_cam_configure,
+    .capture = ag_port_cam_capture,
+    .stop = ag_port_cam_stop,
+};
+#endif
+
 static const ag_api_t k_api = {
     .size = sizeof(ag_api_t),
     .abi_major = AG_ABI_MAJOR,
@@ -1392,6 +1403,11 @@ static const ag_api_t k_api = {
     .wifi = &k_wifi,
 #else
     .wifi = NULL,
+#endif
+#if defined(CONFIG_ARGON_ENABLE_CAMERA) && CONFIG_ARGON_ENABLE_CAMERA
+    .cam = &k_cam,
+#else
+    .cam = NULL,
 #endif
 };
 

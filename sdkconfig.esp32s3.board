@@ -78,3 +78,7 @@ CONFIG_ARGON_APP_ARENA_KB=32
 CONFIG_ARGON_APP_ARENA_PSRAM=y
 CONFIG_ARGON_APP_ARENA_PSRAM_KB=512
 
+# Camera transport for the DVP GC2145 on this board (api->cam); the sensor
+# driver is a loadable .SYS (GC2145.SYS), so the firmware carries only the
+# thin LCD_CAM+DMA path.
+CONFIG_ARGON_ENABLE_CAMERA=y
