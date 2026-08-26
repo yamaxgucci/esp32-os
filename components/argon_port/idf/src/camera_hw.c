@@ -21,8 +21,10 @@
 #include "esp_cam_ctlr_dvp.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_rom_gpio.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "soc/gpio_sig_map.h"
 
 #define TAG "camera_hw"
 
@@ -36,11 +38,13 @@ static SemaphoreHandle_t    s_done;    /* given per completed frame, from ISR */
  * One in flight is enough for a still: capture() waits for it and reads it
  * before asking for the next.
  */
+static volatile uint32_t s_get, s_fin, s_last_size;
 static bool on_get_new_trans(esp_cam_ctlr_handle_t h, esp_cam_ctlr_trans_t *trans,
                              void *user_data)
 {
     (void)h;
     (void)user_data;
+    s_get++;
     trans->buffer = s_fb;
     trans->buflen = s_fb_len;
     return false;
@@ -58,6 +62,8 @@ static bool on_trans_finished(esp_cam_ctlr_handle_t h, esp_cam_ctlr_trans_t *tra
     (void)h;
     (void)trans;
     (void)user_data;
+    s_fin++;
+    s_last_size = (uint32_t)trans->received_size;
     BaseType_t woken = pdFALSE;
     if (s_done != NULL) {
         xSemaphoreGiveFromISR(s_done, &woken);
@@ -130,23 +136,30 @@ ag_err_t ag_port_cam_configure(const ag_cam_pins_t *pins, ag_cam_fmt_t fmt,
         return -AG_EIO;
     }
 
+    /*
+     * Undo the generic driver's hard VSYNC inversion.  esp_cam_ctlr_dvp binds
+     * the VSYNC pin with inv=true; this GC2145 (like esp32-camera's own ll_cam)
+     * wants it uninverted, and with the inversion the controller reads frame
+     * boundaries in the wrong phase and never completes a frame.  Re-bind the
+     * input signal with inv=false after the driver has set the pin up.
+     */
+#if defined(CAM_V_SYNC_IDX)
+    esp_rom_gpio_connect_in_signal((uint32_t)pins->vsync, CAM_V_SYNC_IDX, false);
+#endif
+
     const esp_cam_ctlr_evt_cbs_t cbs = {
         .on_get_new_trans = on_get_new_trans,
         .on_trans_finished = on_trans_finished,
     };
     (void)esp_cam_ctlr_register_event_callbacks(s_ctlr, &cbs, NULL);
 
-    /* Enabled but not started: each capture() starts a single frame and stops,
-     * so the buffer is not being overwritten while it is read (start_trans
-     * re-arms into the same buffer before the frame-done callback runs). */
-    if (esp_cam_ctlr_enable(s_ctlr) != ESP_OK) {
-        ESP_LOGW(TAG, "dvp enable failed");
-        (void)esp_cam_ctlr_del(s_ctlr);
-        s_ctlr = NULL;
-        heap_caps_free(s_fb);
-        s_fb = NULL;
-        return -AG_EIO;
-    }
+    /*
+     * Left created but not enabled.  The controller drives XCLK from creation,
+     * which the sensor needs for SCCB, but the DMA only cleanly delivers its
+     * first frame after an enable; a second frame never completes on this part.
+     * So capture() does a full enable/start/stop/disable cycle each time - the
+     * reliable first frame, every time.
+     */
 
     ESP_LOGI(TAG, "DVP up: %ux%u RGB565, XCLK %u Hz on pin %d",
              (unsigned)width, (unsigned)height,
@@ -159,17 +172,24 @@ const uint8_t *ag_port_cam_capture(size_t *len, uint32_t timeout_ms)
     if (s_ctlr == NULL || len == NULL) {
         return NULL;
     }
-    /* Single shot: start, wait for one completed frame, stop.  Draining first
-     * guards against a stale give from a prior capture. */
+    /* Full cycle for one clean frame: enable, start, wait, stop, disable. */
     (void)xSemaphoreTake(s_done, 0);
+    if (esp_cam_ctlr_enable(s_ctlr) != ESP_OK) {
+        ESP_LOGW(TAG, "dvp enable failed");
+        return NULL;
+    }
     if (esp_cam_ctlr_start(s_ctlr) != ESP_OK) {
         ESP_LOGW(TAG, "dvp start failed");
+        (void)esp_cam_ctlr_disable(s_ctlr);
         return NULL;
     }
     const BaseType_t ok = xSemaphoreTake(s_done, pdMS_TO_TICKS(timeout_ms));
     (void)esp_cam_ctlr_stop(s_ctlr);
+    (void)esp_cam_ctlr_disable(s_ctlr);
     if (ok != pdTRUE) {
-        ESP_LOGW(TAG, "no frame within %u ms", (unsigned)timeout_ms);
+        ESP_LOGW(TAG, "no frame in %u ms (get=%u fin=%u last=%u)",
+                 (unsigned)timeout_ms, (unsigned)s_get, (unsigned)s_fin,
+                 (unsigned)s_last_size);
         return NULL;
     }
     *len = s_fb_len;

@@ -49,12 +49,29 @@ int ag_main(int argc, char **argv)
         return 1;
     }
 
+    /* A path ending in .raw gets the frame bytes verbatim (for host analysis);
+     * anything else gets a PPM. */
+    size_t plen = 0;
+    while (path[plen]) {
+        plen++;
+    }
+    const int raw = plen >= 4 && path[plen - 3] == 'r' &&
+                    path[plen - 2] == 'a' && path[plen - 1] == 'w';
+
     const ag_handle_t f =
         ag_open(path, AG_O_WRONLY | AG_O_CREATE | AG_O_TRUNC);
     if (f < 0) {
         ag_printf("cam: cannot write %s (%d)\n", path, (int)f);
         ag_free(rgb565);
         return 1;
+    }
+
+    if (raw) {
+        ag_write(f, rgb565, npix * 2u);
+        ag_close(f);
+        ag_free(rgb565);
+        ag_printf("cam: %s, %u raw bytes\n", path, (unsigned)(npix * 2u));
+        return 0;
     }
 
     /* Fixed dimensions, so the P6 header is a constant - no formatting needed. */
@@ -69,10 +86,16 @@ int ag_main(int argc, char **argv)
     for (int y = 0; y < CAM_H; y++) {
         const uint8_t *src = rgb565 + (size_t)y * CAM_W * 2u;
         for (int x = 0; x < CAM_W; x++) {
-            const uint16_t p = (uint16_t)(src[x * 2] | (src[x * 2 + 1] << 8));
-            const uint8_t r5 = (p >> 11) & 0x1f;
+            /*
+             * The DVP delivers this GC2145's RGB565 byte-swapped and in BGR
+             * order (the hardware byte-swap is not available in 8-bit mode, so
+             * the fix is here): the pixel word is big-endian and blue is the
+             * high five bits.
+             */
+            const uint16_t p = (uint16_t)((src[x * 2] << 8) | src[x * 2 + 1]);
+            const uint8_t b5 = (p >> 11) & 0x1f;
             const uint8_t g6 = (p >> 5) & 0x3f;
-            const uint8_t b5 = p & 0x1f;
+            const uint8_t r5 = p & 0x1f;
             row[x * 3 + 0] = (uint8_t)((r5 << 3) | (r5 >> 2));
             row[x * 3 + 1] = (uint8_t)((g6 << 2) | (g6 >> 4));
             row[x * 3 + 2] = (uint8_t)((b5 << 3) | (b5 >> 2));
