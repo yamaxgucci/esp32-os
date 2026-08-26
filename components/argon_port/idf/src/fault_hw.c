@@ -41,6 +41,7 @@
 #include <xtensa/corebits.h>
 
 #include "esp_ipc.h"
+#include "esp_rom_sys.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "xtensa_api.h"
@@ -138,6 +139,18 @@ static void fault_handler(XtExcFrame *frame)
      */
     if (s_note(cause, (uint32_t)frame->pc, (uint32_t)frame->excvaddr,
                (uint32_t)frame->a1)) {
+        /*
+         * Say it here, from the exception itself, with esp_rom_printf - the one
+         * output that is safe in this context (it busy-writes UART0 through ROM,
+         * no lock, no heap, the same call the panic handler uses).  The tidy
+         * report comes later from a task context, but only if recovery gets
+         * there: an application that faulted by corrupting its own stack can
+         * take the unwind down with it, and then this line is the only record
+         * of where it died.
+         */
+        esp_rom_printf("\n[fault] app pc=0x%08x addr=0x%08x cause=%u (%s)\n",
+                       (uint32_t)frame->pc, (uint32_t)frame->excvaddr,
+                       (unsigned)cause, ag_port_fault_cause_name(cause));
         frame->pc = (long)&ag_fault_trampoline;
         return;
     }

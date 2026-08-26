@@ -468,16 +468,15 @@ static void crash_record(proc_t *p, const char *reason)
         used = info.allocated;
     }
 
-    ag_log(AG_LOG_ERROR, "proc", "%s (pid %u) killed: %s", p->name,
-           (unsigned)p->pid, (reason != NULL) ? reason : "no reason given");
-    ag_log(AG_LOG_ERROR, "proc",
-           "  %s for %u ms, %u B of a %u KB arena in use, %u resource(s) held, "
-           "%u file(s) open system-wide",
-           ag_proc_state_name(p->state), (unsigned)up_ms, (unsigned)used,
-           (unsigned)(p->heap_size / 1024u), (unsigned)ag_reslist_count(&p->res),
-           (unsigned)ag_vfs_open_count());
-
-    /* The same thing again, for the file the supervisor will write. */
+    /*
+     * Nothing here may lock.  crash_record runs from two places and one of them
+     * is the fault-recovery path (ag_proc_fault_exit), where the task was
+     * diverted mid-fault and the log mutex cannot be taken - doing so asserted
+     * inside FreeRTOS and turned a recoverable application fault into a dead
+     * board (a double fault / interrupt-watchdog reset).  So the record is built
+     * only into the lock-free crash buffer; the supervisor drains it to the
+     * console and to /sys/crash.log from a safe context (write_crash_record).
+     */
     s_crash_text[0] = '\0';
     crash_printf("%s (pid %u) killed at %u ms uptime: %s\n", p->name,
                  (unsigned)p->pid, (unsigned)now_ms(),
@@ -508,25 +507,14 @@ static void crash_record(proc_t *p, const char *reason)
     const uintptr_t code = (uintptr_t)p->app.place.code;
     const uintptr_t code_end = code + p->app.header.code.size;
 
-    ag_log(AG_LOG_ERROR, "proc", "  %s at pc %08x, address %08x, sp %08x",
-           ag_port_fault_cause_name(p->fault.cause), (unsigned)p->fault.pc,
-           (unsigned)p->fault.vaddr, (unsigned)p->fault.sp);
-
     crash_printf("  %s at pc %08x, address %08x, sp %08x\n",
                  ag_port_fault_cause_name(p->fault.cause), (unsigned)p->fault.pc,
                  (unsigned)p->fault.vaddr, (unsigned)p->fault.sp);
 
     if (p->fault.pc >= code && p->fault.pc < code_end) {
-        ag_log(AG_LOG_ERROR, "proc",
-               "  pc is offset 0x%x in %s's own code (%u bytes at %08x)",
-               (unsigned)(p->fault.pc - code), p->name,
-               (unsigned)p->app.header.code.size, (unsigned)code);
         crash_printf("  pc is offset 0x%x in its own code\n",
                      (unsigned)(p->fault.pc - code));
     } else {
-        ag_log(AG_LOG_ERROR, "proc",
-               "  pc is outside %s's code, which starts at %08x", p->name,
-               (unsigned)code);
         crash_printf("  pc is outside its own code\n");
     }
 }

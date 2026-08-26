@@ -187,6 +187,15 @@ static void write_crash_record(void)
     }
 
     /*
+     * Show it on the console, not only in the file.  crash_record itself can no
+     * longer do this: it runs on the fault-recovery path where taking the log
+     * mutex asserted inside FreeRTOS and reset the board (see proc.c).  The
+     * supervisor is a safe context, so the live report happens here instead.
+     */
+    ag_console_puts("\n--- crash ---\n");
+    ag_console_puts(text);
+
+    /*
      * Bounded rather than rotated: a system that crashes often must not fill its
      * own filesystem, and the recent records are the ones anybody reads.
      */
