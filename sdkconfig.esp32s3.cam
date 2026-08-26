@@ -1,0 +1,19 @@
+# ArgonOS - the S3 CAM board with the camera built into the image.
+#
+#   argon target esp32s3-cam
+#
+# A thin overlay on esp32s3-board: everything the board has (radios, ADC, the
+# PSRAM arena) stays, and only the camera changes hands.  The default board
+# image carries the thin DVP transport and loads GC2145.SYS for the sensor;
+# this one carries Espressif's esp32-camera whole - transport and every sensor
+# driver it knows - and brings /dev/cam0 up at boot with no module to load,
+# from BOARD.CFG's [camera] pins.  The two share the LCD_CAM peripheral and so
+# are mutually exclusive; turning the transport off is what lets the built-in
+# one on (Kconfig: CAMERA_BUILTIN depends on !ENABLE_CAMERA).
+#
+# The espressif/esp32-camera managed component is fetched only because this is
+# set (main/idf_component.yml gates it on CONFIG_ARGON_CAMERA_BUILTIN); a plain
+# esp32s3-board build never downloads it.
+
+CONFIG_ARGON_ENABLE_CAMERA=n
+CONFIG_ARGON_CAMERA_BUILTIN=y

@@ -51,7 +51,8 @@ ArgonOS
   argon target             which chip the firmware is built for
   argon target esp32       switch to the board on the desk (docs\09-esp32-cyd.md);
                            esp32-dsp = no radios, big arena; esp32s3 switches
-                           back.  esp32s3-board = the S3 on the desk, without
+                           back.  esp32s3-cam = esp32s3-board with the camera
+                           built into the image.  esp32s3-board = the S3 on the desk, without
                            the two lines that are for QEMU only.  Any: rebuild
   argon flash -port COM5   flash a real board and open the monitor
   argon monitor -port COM5 open the serial monitor on a real board
@@ -165,6 +166,7 @@ switch ($Command.ToLowerInvariant()) {
             Write-Host "current target: $cur"
             Write-Host 'known targets:  esp32s3 (primary, QEMU)'
             Write-Host '                esp32s3-board  the S3 on the desk: no OpenEth, no HostFS'
+            Write-Host '                esp32s3-cam    esp32s3-board + the camera built into the image'
             Write-Host '                esp32       hardware: Wi-Fi and Bluetooth'
             Write-Host '                esp32-dsp   hardware: neither, 48 KB arena'
             exit 0
@@ -185,6 +187,8 @@ switch ($Command.ToLowerInvariant()) {
             'esp32s3'   { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32s3' }
             'esp32s3-board' { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32s3;sdkconfig.esp32s3.board'
                               $chip = 'esp32s3' }
+            'esp32s3-cam' { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32s3;sdkconfig.esp32s3.board;sdkconfig.esp32s3.cam'
+                            $chip = 'esp32s3' }
             default {
                 Write-Host "argon target: no defaults for '$chip'."
                 Write-Host 'Add sdkconfig.defaults.<chip> before building for it.'

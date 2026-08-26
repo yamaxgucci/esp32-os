@@ -71,6 +71,16 @@ if(CONFIG_ARGON_ENABLE_AUDIO)
     target_link_libraries(${COMPONENT_LIB} PRIVATE ${dac_lib})
 endif()
 
+# The built-in camera (CONFIG_ARGON_CAMERA_BUILTIN): Espressif's esp32-camera,
+# pulled in only when the switch is set (main/idf_component.yml gates the
+# dependency on the same Kconfig).  Linking it here also puts esp_camera.h on
+# camera_builtin_hw.c's include path; that file compiles to nothing otherwise,
+# so the managed component is neither fetched nor referenced in a default build.
+if(CONFIG_ARGON_CAMERA_BUILTIN)
+    idf_component_get_property(cam_builtin_lib espressif__esp32-camera COMPONENT_LIB)
+    target_link_libraries(${COMPONENT_LIB} PRIVATE ${cam_builtin_lib})
+endif()
+
 if(ARGON_PORT_SRCS)
     target_compile_options(${COMPONENT_LIB} PRIVATE
         -Wall -Wextra -Werror=implicit-function-declaration

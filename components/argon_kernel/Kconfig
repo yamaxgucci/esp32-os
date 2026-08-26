@@ -96,6 +96,7 @@ menu "ArgonOS"
 
     config ARGON_ENABLE_CAMERA
         bool "Camera transport (api->cam over DVP)"
+        depends on !ARGON_CAMERA_BUILTIN
         default n
         help
             Links ESP-IDF's esp_cam_ctlr DVP driver (LCD_CAM + DMA) and exposes
@@ -107,6 +108,26 @@ menu "ArgonOS"
 
             Off by default and everywhere but the S3 CAM board: QEMU has no
             camera, and it needs PSRAM for the frame buffer.
+
+    config ARGON_CAMERA_BUILTIN
+        bool "Camera built into the image (esp32-camera, sensor zoo in firmware)"
+        default n
+        help
+            The other camera, the fat one: Espressif's esp32-camera component
+            compiled into the firmware, transport and every sensor driver it
+            knows, bringing /dev/cam0 up at boot with no module to load.  This
+            is the opposite trade to ARGON_ENABLE_CAMERA above - the whole zoo
+            (~100-150 KB, ~30 sensors) rides in the image, but any of those
+            sensors just works, and the picture path is the one Espressif
+            maintains.  For a fixed product that always has the same camera and
+            wants it turned on the instant it powers up.
+
+            Off by default: it pulls the espressif/esp32-camera managed
+            component (fetched only when this is set - see main/idf_component.yml)
+            and, like the transport above, needs PSRAM and the LCD_CAM the two
+            share, so the two are mutually exclusive.  Pins come from BOARD.CFG's
+            [camera] section.  QEMU has no camera; this is a real-board switch,
+            reachable as `argon target esp32s3-cam`.
 
     config ARGON_ENABLE_AUDIO
         bool "Sound output hardware (/dev/pcm0)"

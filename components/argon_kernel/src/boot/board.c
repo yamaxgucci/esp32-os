@@ -12,7 +12,40 @@
 
 #include <argon/port/config.h>
 
+#include "sdkconfig.h"
+
 static ag_board_t s_board;
+
+/*
+ * The camera wiring lives outside s_board and only exists when the image can
+ * use it (CONFIG_ARGON_CAMERA_BUILTIN).  Keeping it here rather than in
+ * ag_board_t means a build without a built-in camera - every QEMU build, where
+ * internal DRAM is already tight under the 192 KB arena - carries none of it.
+ */
+#if defined(CONFIG_ARGON_CAMERA_BUILTIN) && CONFIG_ARGON_CAMERA_BUILTIN
+static ag_board_camera_t s_camera;
+
+static void camera_defaults(void)
+{
+    s_camera.sensor[0] = '\0';
+    s_camera.xclk = AG_PIN_NONE;
+    s_camera.pclk = AG_PIN_NONE;
+    s_camera.vsync = AG_PIN_NONE;
+    s_camera.href = AG_PIN_NONE;
+    for (int i = 0; i < 8; i++) {
+        s_camera.data[i] = AG_PIN_NONE;
+    }
+    s_camera.sccb_sda = AG_PIN_NONE;
+    s_camera.sccb_scl = AG_PIN_NONE;
+    s_camera.pwdn = AG_PIN_NONE;
+    s_camera.reset = AG_PIN_NONE;
+    s_camera.xclk_hz = 20000000;
+}
+
+const ag_board_camera_t *ag_board_camera(void) { return &s_camera; }
+#else
+const ag_board_camera_t *ag_board_camera(void) { return NULL; }
+#endif
 
 /*
  * Generic defaults.  The SD pins are the assignment the original ESP32 used for
@@ -77,6 +110,10 @@ static void apply_generic_defaults(void)
     s_board.audio.dout = AG_PIN_NONE;
     s_board.audio.mclk = AG_PIN_NONE;
     s_board.audio.rate = 22050;
+
+#if defined(CONFIG_ARGON_CAMERA_BUILTIN) && CONFIG_ARGON_CAMERA_BUILTIN
+    camera_defaults();
+#endif
 }
 
 ag_err_t ag_board_init(void)
@@ -162,6 +199,35 @@ static void apply_bus_config(const ag_cfg_t *cfg)
         port->baud = cfg_rate(cfg, key, port->baud, 5000000);
     }
 }
+
+#if defined(CONFIG_ARGON_CAMERA_BUILTIN) && CONFIG_ARGON_CAMERA_BUILTIN
+/* The [camera] section, read only by the built-in camera path. */
+static void camera_apply(const ag_cfg_t *cfg)
+{
+    ag_board_camera_t *c = &s_camera;
+    const char *csens = ag_cfg_get(cfg, "camera.sensor", NULL);
+    if (csens != NULL && csens[0] != '\0') {
+        snprintf(c->sensor, sizeof(c->sensor), "%s", csens);
+    }
+    c->xclk = cfg_pin(cfg, "camera.xclk", c->xclk);
+    c->pclk = cfg_pin(cfg, "camera.pclk", c->pclk);
+    c->vsync = cfg_pin(cfg, "camera.vsync", c->vsync);
+    c->href = cfg_pin(cfg, "camera.href", c->href);
+    for (int i = 0; i < 8; i++) {
+        char key[16];
+        snprintf(key, sizeof(key), "camera.d%d", i);
+        c->data[i] = cfg_pin(cfg, key, c->data[i]);
+    }
+    c->sccb_sda = cfg_pin(cfg, "camera.sccb_sda", c->sccb_sda);
+    c->sccb_scl = cfg_pin(cfg, "camera.sccb_scl", c->sccb_scl);
+    c->pwdn = cfg_pin(cfg, "camera.pwdn", c->pwdn);
+    c->reset = cfg_pin(cfg, "camera.reset", c->reset);
+    const int32_t xh = ag_cfg_get_int(cfg, "camera.xclk_hz", (int32_t)c->xclk_hz);
+    if (xh >= 6000000 && xh <= 27000000) {
+        c->xclk_hz = (uint32_t)xh;
+    }
+}
+#endif
 
 ag_err_t ag_board_apply_config(const ag_cfg_t *cfg)
 {
@@ -256,6 +322,10 @@ ag_err_t ag_board_apply_config(const ag_cfg_t *cfg)
             s_board.audio.rate = (uint32_t)ar;
         }
     }
+
+#if defined(CONFIG_ARGON_CAMERA_BUILTIN) && CONFIG_ARGON_CAMERA_BUILTIN
+    camera_apply(cfg);
+#endif
 
     return AG_OK;
 }

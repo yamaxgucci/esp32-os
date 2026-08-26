@@ -16,3 +16,10 @@ dependencies:
   #   public: true
   espressif/esp_lcd_qemu_rgb: ^1.0.2
   joltwallet/littlefs: "^1.14.0"
+  # The whole camera in the image, sensor drivers and all - fetched only when
+  # CONFIG_ARGON_CAMERA_BUILTIN is set (argon target esp32s3-cam).  A default
+  # build never downloads it: see camera_builtin_hw.c and the port CMakeLists.
+  espressif/esp32-camera:
+    version: "^2.0.0"
+    rules:
+      - if: "$CONFIG{ARGON_CAMERA_BUILTIN} == True"

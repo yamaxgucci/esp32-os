@@ -18,6 +18,7 @@
 #include <argon/devfs.h>
 #include <argon/device.h>
 #include <argon/audio.h>
+#include <argon/camera.h>
 #include <argon/display.h>
 #include <argon/input.h>
 #include <argon/keys.h>
@@ -282,6 +283,14 @@ ag_err_t ag_devices_init(void)
 
     /* PCM out: I2S when BOARD.CFG pins are set, else discard stub. */
     err = ag_audio_init();
+    if (err != AG_OK) {
+        return err;
+    }
+
+    /* /dev/cam0 when the image carries the camera (CAMERA_BUILTIN) and
+     * BOARD.CFG wires one.  A no-op on every other build - there the sensor
+     * .SYS registers its own /dev/cam0 - so this call is unconditional. */
+    err = ag_camera_init();
     if (err != AG_OK) {
         return err;
     }

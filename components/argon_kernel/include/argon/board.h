@@ -132,6 +132,28 @@ typedef struct {
     uint32_t rate; /* default sample rate hint for pcmnull / drivers */
 } ag_board_audio_t;
 
+/*
+ * A parallel-bus (DVP) camera, for the build that carries the sensor drivers
+ * itself (CONFIG_ARGON_CAMERA_BUILTIN).  The loadable path does not read this -
+ * its sensor .SYS knows its own wiring - so every field here serves the
+ * in-image esp32-camera: it needs the SCCB pins and the power/reset lines that
+ * the transport ABI has no reason to carry.  All AG_PIN_NONE by default: a
+ * board with no [camera] section brings no camera up.
+ */
+typedef struct {
+    char     sensor[12]; /* hint only; esp32-camera probes the bus itself */
+    int16_t  xclk;
+    int16_t  pclk;
+    int16_t  vsync;
+    int16_t  href;       /* also DE */
+    int16_t  data[8];    /* D0..D7 */
+    int16_t  sccb_sda;   /* the sensor's I2C; often the same pins as [i2c0] */
+    int16_t  sccb_scl;
+    int16_t  pwdn;       /* power-down line, active high; AG_PIN_NONE if none */
+    int16_t  reset;      /* hardware reset, active low; AG_PIN_NONE if none  */
+    uint32_t xclk_hz;    /* clock out to the sensor, e.g. 20000000           */
+} ag_board_camera_t;
+
 typedef struct {
     char              name[24];
     ag_board_sd_t     sd;
@@ -154,6 +176,15 @@ ag_err_t ag_board_init(void);
 ag_err_t ag_board_apply_config(const ag_cfg_t *cfg);
 
 const ag_board_t *ag_board(void);
+
+/*
+ * The camera wiring, or NULL when this image has no built-in camera
+ * (CONFIG_ARGON_CAMERA_BUILTIN off).  Kept out of ag_board_t on purpose: only
+ * the built-in path reads it, so an image without one - every QEMU build, and
+ * the default board image whose camera is the loadable GC2145.SYS - carries not
+ * one byte of it.
+ */
+const ag_board_camera_t *ag_board_camera(void);
 
 #ifdef __cplusplus
 }
