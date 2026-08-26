@@ -15,9 +15,11 @@
 #include <argon/shell.h>
 #include <argon/vfs.h>
 
+#include <argon/port/mem.h>
+
 #include "fs/storage.h"
 
-/* Sized for one HostFS WRITE (HSFS_MAX_DATA). Buffer is static — not on stack. */
+/* Sized for one HostFS WRITE (HSFS_MAX_DATA). Heap, not static — see cp(). */
 #define AG_COPY_CHUNK 4096
 
 /* ---------------------------------------------------------------------- */
@@ -298,8 +300,22 @@ int ag_cmd_copy(int argc, char **argv)
         return 1;
     }
 
-    /* Static: 4 KiB on the shell stack was enough to corrupt the copy path. */
-    static uint8_t chunk[AG_COPY_CHUNK];
+    /*
+     * Off both the stack (4 KiB there was enough to corrupt the copy path) and
+     * static .bss (permanently reserved internal SRAM the S3 can no longer
+     * spare - see loader.c's arena).  PSRAM when there is any, internal only as
+     * a fallback; a copy buffer does not need the fast bus.
+     */
+    uint8_t *chunk = ag_port_alloc(AG_COPY_CHUNK, AG_MEM_SLOW | AG_MEM_BYTE);
+    if (chunk == NULL) {
+        chunk = ag_port_alloc(AG_COPY_CHUNK, AG_MEM_FAST | AG_MEM_BYTE);
+    }
+    if (chunk == NULL) {
+        ag_vfs_close(in);
+        ag_vfs_close(out);
+        print_error(dest, -AG_ENOMEM);
+        return 1;
+    }
     uint64_t total = 0;
     int32_t  n;
     int      status = 0;
@@ -347,6 +363,7 @@ int ag_cmd_copy(int argc, char **argv)
 
     ag_vfs_close(in);
     ag_vfs_close(out);
+    ag_port_free(chunk);
 
     if (status == 0) {
         ag_console_printf("        1 file(s) copied, %u bytes\n",

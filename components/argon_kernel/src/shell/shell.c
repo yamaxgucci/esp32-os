@@ -1370,7 +1370,6 @@ static ag_err_t cfg_remove_device(const char *dos_path)
 
 static ag_err_t drv_copy_file(const char *src_abs, const char *dst_abs)
 {
-    static uint8_t chunk[DRV_COPY_CHUNK];
     ag_handle_t    in;
     ag_handle_t    out;
     int32_t        n;
@@ -1384,6 +1383,19 @@ static ag_err_t drv_copy_file(const char *src_abs, const char *dst_abs)
         ag_vfs_close(in);
         return (ag_err_t)out;
     }
+
+    /* Heap, not static .bss: internal SRAM on the S3 is too tight to reserve a
+     * copy buffer permanently (see loader.c's arena).  PSRAM, then internal. */
+    uint8_t *chunk = ag_port_alloc(DRV_COPY_CHUNK, AG_MEM_SLOW | AG_MEM_BYTE);
+    if (chunk == NULL) {
+        chunk = ag_port_alloc(DRV_COPY_CHUNK, AG_MEM_FAST | AG_MEM_BYTE);
+    }
+    if (chunk == NULL) {
+        ag_vfs_close(in);
+        ag_vfs_close(out);
+        return -AG_ENOMEM;
+    }
+
     while ((n = ag_vfs_read(in, chunk, sizeof(chunk))) > 0) {
         size_t left = (size_t)n;
         size_t off = 0;
@@ -1392,11 +1404,13 @@ static ag_err_t drv_copy_file(const char *src_abs, const char *dst_abs)
             if (w < 0) {
                 ag_vfs_close(in);
                 ag_vfs_close(out);
+                ag_port_free(chunk);
                 return (ag_err_t)w;
             }
             if (w == 0) {
                 ag_vfs_close(in);
                 ag_vfs_close(out);
+                ag_port_free(chunk);
                 return -AG_ENOSPC;
             }
             off += (size_t)w;
@@ -1405,6 +1419,7 @@ static ag_err_t drv_copy_file(const char *src_abs, const char *dst_abs)
     }
     ag_vfs_close(in);
     ag_vfs_close(out);
+    ag_port_free(chunk);
     return (n < 0) ? (ag_err_t)n : AG_OK;
 }
 

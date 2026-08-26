@@ -264,7 +264,18 @@ static int extract_one(mz_zip_archive *zip, mz_uint index,
         return 1;
     }
 
-    static uint8_t chunk[AG_UNZIP_CHUNK];
+    /* Heap, not static .bss: the S3 cannot spare permanently-reserved internal
+     * SRAM (see loader.c's arena).  PSRAM first, internal only as a fallback. */
+    uint8_t *chunk = ag_port_alloc(AG_UNZIP_CHUNK, AG_MEM_SLOW | AG_MEM_BYTE);
+    if (chunk == NULL) {
+        chunk = ag_port_alloc(AG_UNZIP_CHUNK, AG_MEM_FAST | AG_MEM_BYTE);
+    }
+    if (chunk == NULL) {
+        (void)mz_zip_reader_extract_iter_free(iter);
+        ag_vfs_close(out);
+        print_err("unzip", "out of memory");
+        return 1;
+    }
     int rc = 0;
     for (;;) {
         if (ag_shell_interrupted()) {
@@ -296,6 +307,7 @@ static int extract_one(mz_zip_archive *zip, mz_uint index,
         print_err("unzip", "extract failed");
         rc = 1;
     }
+    ag_port_free(chunk);
     ag_vfs_close(out);
     if (rc == 0) {
         ag_console_printf("  %s\n", rel);
