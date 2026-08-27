@@ -383,6 +383,20 @@ def main():
     )
     args = ap.parse_args()
 
+    # An .AXE is freestanding: it links -nostdlib and carries its own libc
+    # (apps/common/libc). Without this, the compiler recognises the standard
+    # idioms - and rewrites the shim's own `while (s[n]) n++` into a *call to
+    # strlen*, i.e. the very function being compiled, which then recurses until
+    # the stack is gone. The same trap waits for any hand-written memcpy/memset.
+    # It cost a long hunt: an application would load, run, and then die deep
+    # inside string handling with no fault, because the recursion overflowed the
+    # stack rather than faulting cleanly. -fno-builtin is not an optimisation
+    # choice here, it is a correctness requirement for a libc that implements
+    # itself. (The apps that already spell it out in tools/apps.json were
+    # written after paying this once; this makes it the default so the next one
+    # does not.)
+    args.cflags += " -fno-builtin"
+
     if args.arch == "xtensa":
         # Long calls: the linker cannot shorten a call whose target moves.
         args.cflags += " -mlongcalls"

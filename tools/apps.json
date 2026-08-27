@@ -72,7 +72,7 @@
     { "out": "CAM.AXE", "group": "core", "src": ["apps/cam/cam.c"] },
     {
       "out": "HTTPD.AXE", "group": "core",
-      "_note": "WIP: the file server as a loadable .AXE (moves httpd out of the firmware). The logic works (parse/serve over api->net verified in QEMU), but this image HANGS at load - a kernel loader bug: an .AXE this size that links netmsg.c faults/hangs before ag_main, independent of stack/heap/placement (a small build with the same code gc'd runs fine). Built here so it does not rot; NOT wired as the `httpd` command yet (that stays built-in). See the spawned card 'Fix .AXE loader hang'.",
+      "_note": "The file server as a loadable .AXE (moves httpd out of the firmware). Full serve path (GET 32K byte-exact, listing, HEAD, 404, path-traversal 403, multipart upload + delete) verified in QEMU against tools/netfixture.py. It was NOT a loader bug: mkaxe compiled the shim without -fno-builtin, so the compiler rewrote libc_shim's own strlen loop into a call to strlen and it recursed the stack away deep in netmsg's header parse - the crash moved with every code change because it was a stack overflow, not a relocation. mkaxe now passes -fno-builtin for every .AXE. NOT wired as the `httpd` command yet (that stays built-in); wiring it needs shell.path set so PATH resolves HTTPD.AXE.",
       "include": ["apps/common/libc", "components/argon_kernel/include"],
       "src": ["apps/httpd/httpd.c",
               "components/argon_kernel/src/net/netmsg.c",
