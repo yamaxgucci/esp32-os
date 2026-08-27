@@ -1,5 +1,5 @@
 /*
- * ArgonOS - net, wget, httpd, ftp.
+ * ArgonOS - net, wget, ftp.  (httpd left the firmware; it is HTTPD.AXE now.)
  *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
@@ -207,65 +207,6 @@ int ag_cmd_wget(int argc, char **argv)
     ag_shell_dos_path(dest, shown, sizeof(shown));
     ag_console_printf("saved %s\n", shown);
     return 0;
-}
-
-/* ---------------------------------------------------------------------- */
-/* httpd                                                                  */
-/* ---------------------------------------------------------------------- */
-
-int ag_cmd_httpd(int argc, char **argv)
-{
-    uint16_t    port = 80;
-    const char *root_arg = ".";
-    bool        writable = false;
-
-    /*
-     * /w is a switch rather than the default, and it is spelled out in the
-     * usage: with it, anybody who can reach this board can put a file on the
-     * card and take one off it.  On a home network that is the point; there is
-     * no password here, so it should never happen by accident.
-     */
-    int  positional = 0;
-    const char *args[2] = {NULL, NULL};
-    for (int i = 1; i < argc; i++) {
-        if (ag_path_icmp(argv[i], "/w") == 0) {
-            writable = true;
-        } else if (positional < 2) {
-            args[positional++] = argv[i];
-        }
-    }
-
-    int next = 0;
-    if (args[next] != NULL && args[next][0] >= '0' && args[next][0] <= '9') {
-        const long v = strtol(args[next], NULL, 10);
-        if (v < 1 || v > 65535) {
-            ag_console_puts("usage: httpd [port] [directory] [/w]\n");
-            ag_console_puts("  /w  let browsers send files here and delete "
-                            "them\n");
-            return 1;
-        }
-        port = (uint16_t)v;
-        next++;
-    }
-    if (next < 2 && args[next] != NULL) {
-        root_arg = args[next];
-    }
-
-    char           root[AG_PATH_MAX];
-    const ag_err_t perr =
-        ag_path_resolve(root_arg, ag_shell_cwd(), root, sizeof(root));
-    if (perr != AG_OK) {
-        ag_console_printf("%s: %s\n", root_arg, strerr(perr));
-        return 1;
-    }
-
-    ag_stat_t st;
-    if (ag_vfs_stat(root, NULL, &st) != AG_OK || (st.attr & AG_A_DIR) == 0) {
-        ag_console_printf("%s: not a directory\n", root_arg);
-        return 1;
-    }
-
-    return (ag_httpd_run(port, root, writable) == AG_OK) ? 0 : 1;
 }
 
 /* ---------------------------------------------------------------------- */

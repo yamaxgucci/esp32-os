@@ -4298,8 +4298,7 @@ static const ag_command_t k_commands[] = {
     {"wget", "<url> [file]", "fetch a file over http or ftp",
      ag_cmd_wget},
     {"ftp", "<host> [user] [pass]", "file transfer session", ag_cmd_ftp},
-    {"httpd", "[port] [dir] [/w]", "serve a directory (/w: accept files)",
-     ag_cmd_httpd},
+    /* httpd is a loadable app now (HTTPD.AXE), not a built-in - run it by name. */
 #endif
 #if AG_PORT_HAS_BT
     {"bt", "[on|off|scan|open <#|addr>|close|forget]", "bluetooth input", cmd_bt},

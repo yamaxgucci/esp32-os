@@ -53,7 +53,6 @@ set(ARGON_KERNEL_SRCS
     "src/net/netmsg.c"
     "src/net/netio.c"
     "src/net/httpc.c"
-    "src/net/httpd.c"
     "src/net/ftpc.c"
     "src/proc/proc.c"
     "src/proc/session.c"

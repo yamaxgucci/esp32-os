@@ -17,10 +17,10 @@
 | Текст протоколов | `src/net/netmsg.c`, `include/argon/netmsg.h` | URL, заголовки HTTP, ответы FTP — без единого сокета |
 | Плита | `src/net/netio.c` | буферизованное чтение строк и байт, строка прогресса |
 | Клиент HTTP | `src/net/httpc.c` | `ag_http_fetch()` |
-| Сервер HTTP | `src/net/httpd.c` | `ag_httpd_run()` |
+| Сервер HTTP | `apps/httpd/httpd.c` | загружаемый **HTTPD.AXE** (не в ядре); `run a:\httpd.axe [порт] [каталог] [/w]` |
 | Клиент FTP | `src/net/ftpc.c` | сессия и одиночная выкачка |
-| Команды | `src/shell/cmd_net.c` | `net`, `wget`, `ftp`, `httpd` |
-| Проверка | `host-tests/test_netmsg.c`, `tools/netfixture.py`, `tools/nettest.ps1` | 181 проверка на хосте, 37 в QEMU |
+| Команды | `src/shell/cmd_net.c` | `net`, `wget`, `ftp` (httpd вынесен в HTTPD.AXE) |
+| Проверка | `host-tests/test_netmsg.c`, `tools/netfixture.py`, `tools/nettest.ps1` | 181 проверка на хосте, 43 в QEMU |
 
 ## Решения
 
@@ -287,7 +287,7 @@ Channel: 36
 
 ## Файловый сервер: обмен файлами через браузер
 
-`httpd 80 a:\ /w` — и карта платы открыта в браузере телефона: список файлов,
+`run a:\httpd.axe 80 a:\ /w` — и карта платы открыта в браузере телефона: список файлов,
 кнопка «выбрать файл», кнопка удаления в каждой строке. Ровно та задача, ради
 которой обычно поднимают шару между телефоном и ноутбуком, только без шары.
 

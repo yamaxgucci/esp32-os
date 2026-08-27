@@ -72,7 +72,7 @@
     { "out": "CAM.AXE", "group": "core", "src": ["apps/cam/cam.c"] },
     {
       "out": "HTTPD.AXE", "group": "core",
-      "_note": "The file server as a loadable .AXE (moves httpd out of the firmware). Full serve path (GET 32K byte-exact, listing, HEAD, 404, path-traversal 403, multipart upload + delete) verified in QEMU against tools/netfixture.py. It was NOT a loader bug: mkaxe compiled the shim without -fno-builtin, so the compiler rewrote libc_shim's own strlen loop into a call to strlen and it recursed the stack away deep in netmsg's header parse - the crash moved with every code change because it was a stack overflow, not a relocation. mkaxe now passes -fno-builtin for every .AXE. NOT wired as the `httpd` command yet (that stays built-in); wiring it needs shell.path set so PATH resolves HTTPD.AXE.",
+      "_note": "The file server, now a loadable .AXE instead of a built-in command - httpd is out of the firmware. Run it by name: `run httpd.axe [port] [dir] [/w]` (Maxim does not want it re-mapped to a bare `httpd` command). Full serve path (GET 32K byte-exact, listing, HEAD, 404, path-traversal 403, multipart upload + delete) verified in QEMU against tools/netfixture.py, and it drives tools/nettest.ps1's pass-2. Build gotcha it cost: mkaxe used to compile the shim without -fno-builtin, so GCC rewrote libc_shim's own strlen loop into a call to strlen and recursed the stack away deep in netmsg's header parse; mkaxe now passes -fno-builtin for every .AXE.",
       "include": ["apps/common/libc", "components/argon_kernel/include"],
       "src": ["apps/httpd/httpd.c",
               "components/argon_kernel/src/net/netmsg.c",

@@ -125,6 +125,12 @@ try {
     # -------------------------------------------------------------- server ---
 
     Write-Host "`n== pass 2: serving ==" -ForegroundColor Cyan
+
+    # httpd is a loadable app now, not a built-in: build it and mount build\apps
+    # into the guest as H:, so pass 2 runs the same HTTPD.AXE users would.
+    & python (Join-Path $PSScriptRoot 'build_apps.py') --only HTTPD.AXE | Out-Null
+    if (-not (Test-Path 'build\apps\HTTPD.AXE')) { throw 'HTTPD.AXE did not build.' }
+
     Remove-Item -Force $probeOut -ErrorAction SilentlyContinue
     $probe = Start-Process -FilePath $python -WindowStyle Hidden -PassThru `
         -ArgumentList ("tools\netfixture.py probe --port $guestPort " +
@@ -132,10 +138,11 @@ try {
         -RedirectStandardOutput 'build\probe.log' -RedirectStandardError 'build\probe.err'
 
     & (Join-Path $PSScriptRoot 'qemu-boot.ps1') -TimeoutSec $TimeoutSec `
-        -QuietMs 2000 -LogPath 'build\nettest-serve.log' -Send @(
+        -QuietMs 2000 -LogPath 'build\nettest-serve.log' -HostFs 'build\apps' `
+        -Send @(
         'net wait'
         "wget http://10.0.2.2:$httpPort/data.bin t:\data.bin"
-        "httpd $guestPort t:\ /w"
+        "run h:\httpd.axe $guestPort t:\ /w"
         '=- /up.bin'    # the prober's last question; then we may stop the server
         '~\x03'
         'dir t:\'
