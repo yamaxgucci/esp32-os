@@ -94,6 +94,16 @@ if(CONFIG_ARGON_PANEL_QEMU)
     target_link_libraries(${COMPONENT_LIB} PRIVATE ${qemu_rgb_lib})
 endif()
 
+# USB host (CONFIG_ARGON_USB_HOST): the OTG peripheral as a host, for a wired
+# HID keyboard (usb_hw.c).  Linked conditionally like esp_adc so a build without
+# it neither references the component nor puts usb/usb_host.h on the path; the
+# Kconfig option depends on SOC_USB_OTG_SUPPORTED, so it is off on chips (and in
+# QEMU) that have no host to bring up.
+if(CONFIG_ARGON_USB_HOST)
+    idf_component_get_property(usb_lib usb COMPONENT_LIB)
+    target_link_libraries(${COMPONENT_LIB} PRIVATE ${usb_lib})
+endif()
+
 # The built-in camera (CONFIG_ARGON_CAMERA_BUILTIN): Espressif's esp32-camera,
 # pulled in only when the switch is set (main/idf_component.yml gates the
 # dependency on the same Kconfig).  Linking it here also puts esp_camera.h on

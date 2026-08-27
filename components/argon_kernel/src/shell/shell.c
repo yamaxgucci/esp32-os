@@ -33,12 +33,14 @@
 #include <argon/vfs.h>
 
 #include <argon/btinput.h>
+#include <argon/usbinput.h>
 #include <time.h>
 
 #include <argon/net.h>
 #include "console/telnet_console.h"
 #include <argon/port/bt.h>
 #include <argon/port/ble.h>
+#include <argon/port/usb.h>
 #include <argon/port/io.h>
 #include <argon/port/mem.h>
 #include <argon/port/net.h>
@@ -3744,6 +3746,54 @@ static int cmd_ble(int argc, char **argv)
 
 #endif /* AG_PORT_HAS_BT */
 
+#if AG_PORT_HAS_USB_HID
+static int cmd_usb(int argc, char **argv)
+{
+    ag_port_usb_status_t st;
+
+    if (argc >= 2 && ag_path_icmp(argv[1], "off") == 0) {
+        const size_t before = ag_port_mem_free(AG_MEM_FAST);
+        (void)ag_port_usb_stop();
+        const size_t after = ag_port_mem_free(AG_MEM_FAST);
+        ag_console_printf("usb host off, %u KB back\n",
+                          (unsigned)((after - before) / 1024u));
+        return 0;
+    }
+
+    if (argc >= 2 && ag_path_icmp(argv[1], "on") == 0) {
+        const ag_err_t err = ag_port_usb_start();
+        if (err != AG_OK) {
+            ag_console_printf("usb on: %s\n",
+                              ag_loader_api()->sys->strerror(err));
+            return 1;
+        }
+        (void)ag_usbinput_init();
+        ag_console_puts("usb host up\n");
+        return 0;
+    }
+
+    if (ag_port_usb_status(&st) != AG_OK) {
+        ag_console_puts("usb: no host in this build\n");
+        return 1;
+    }
+    switch (st.state) {
+    case AG_USB_OFF:
+        ag_console_puts("host off\n");
+        break;
+    case AG_USB_IDLE:
+        ag_console_puts("host up, nothing plugged in\n");
+        break;
+    case AG_USB_OPEN:
+        ag_console_printf("keyboard %04x:%04x, %u reports\n", st.vid, st.pid,
+                          (unsigned)st.reports);
+        break;
+    default:
+        break;
+    }
+    return 0;
+}
+#endif /* AG_PORT_HAS_USB_HID */
+
 static int cmd_io(int argc, char **argv)
 {
     const ag_io_api_t *io = ag_loader_api()->io;
@@ -4373,6 +4423,9 @@ static const ag_command_t k_commands[] = {
 #if defined(CONFIG_ARGON_NET_TELNET) && CONFIG_ARGON_NET_TELNET
     {"telnet", "[on [port]|off]", "the console over TCP :23", cmd_telnet},
 #endif
+#endif
+#if AG_PORT_HAS_USB_HID
+    {"usb", "[on|off]", "usb keyboard host", cmd_usb},
 #endif
 #if AG_PORT_HAS_BT
     {"bt", "[on|off|scan|open <#|addr>|close|forget]", "bluetooth input", cmd_bt},

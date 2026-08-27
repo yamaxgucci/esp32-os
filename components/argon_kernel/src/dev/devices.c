@@ -31,9 +31,11 @@
 #include <stdio.h>
 
 #include <argon/btinput.h>
+#include <argon/usbinput.h>
 #include <argon/port/bt.h>
 #include <argon/port/sync.h>
 #include <argon/port/task.h>
+#include <argon/port/usb.h>
 #include <argon/port/wifi.h>
 
 #include "core/sysconfig.h"
@@ -432,6 +434,27 @@ ag_err_t ag_devices_init(void)
                 ag_log(AG_LOG_WARN, "bt", "bt.keyboard is not an address: %s",
                        kbd);
             }
+        }
+    }
+#endif
+
+#if AG_PORT_HAS_USB_HID
+    /*
+     * The wired keyboard.  Unlike the radio, there is nothing to name and no
+     * pairing: USB announces a device when it is plugged in, so the host is
+     * simply brought up and left waiting.  Started at boot when the image has
+     * it compiled in - a keyboard is basic input, and a board that built the
+     * host in wants it usable at the prompt without a command first.  Opt-out
+     * with [usb] host = 0 in SYSTEM.CFG for a board that would rather not spend
+     * the two tasks until asked (`usb on`).
+     */
+    if (ag_cfg_get_int(ag_sysconfig(), "usb.host", 1) != 0) {
+        const ag_err_t uerr = ag_port_usb_start();
+        if (uerr != AG_OK) {
+            ag_log(AG_LOG_WARN, "usb", "host did not start (%d)", (int)uerr);
+        } else {
+            (void)ag_usbinput_init();
+            ag_log(AG_LOG_INFO, "usb", "host up, waiting for a keyboard");
         }
     }
 #endif

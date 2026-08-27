@@ -439,6 +439,28 @@ menu "ArgonOS"
 
             Not verifiable in QEMU, which models no radio.
 
+    config ARGON_USB_HOST
+        bool "USB host: HID keyboard (boot protocol)"
+        depends on SOC_USB_OTG_SUPPORTED
+        default n
+        help
+            The USB-OTG peripheral as a host, so a wired keyboard plugged into
+            the board's OTG port is one everything above sees as ordinary
+            console events - the same path a Bluetooth keyboard takes, so the
+            shell, the editor and the file manager do not know the difference.
+
+            Boot protocol only, on purpose: the port asks the keyboard to speak
+            the fixed eight-byte report (modifiers, then keys) instead of
+            parsing an arbitrary report descriptor, which is most of what a full
+            HID stack is.  A keyboard is the whole point; a mouse is the same
+            report path when there is something on screen to point at.
+
+            The board must power the keyboard: host mode sources 5 V on the
+            OTG port's VBUS.  Off by default and only on the chips that have the
+            OTG peripheral (the S3 does, the original ESP32 does not).  Not
+            verifiable in QEMU, which models no USB host - the gate is the
+            board.
+
     config ARGON_CONSOLE_COLS
         int "Console width, characters"
         range 20 240

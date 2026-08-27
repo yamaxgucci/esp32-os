@@ -82,3 +82,12 @@ CONFIG_ARGON_APP_ARENA_PSRAM_KB=512
 # driver is a loadable .SYS (GC2145.SYS), so the firmware carries only the
 # thin LCD_CAM+DMA path.
 CONFIG_ARGON_ENABLE_CAMERA=y
+
+# USB host, for a wired keyboard on the OTG port.  This board has two USB-C
+# sockets: UART (the CH343 bridge, console and flash) and OTG (the native USB
+# on GPIO19/20).  The keyboard goes on OTG through a USB-C-to-USB-A adapter, and
+# the board powers it - host mode sources 5 V on that port's VBUS.  The console
+# stays on the UART port, so the two do not collide.  Boot protocol only; a
+# keyboard's reports become console events through the same parser a BLE
+# keyboard's do.  Not verifiable in QEMU (no USB host); the gate is the board.
+CONFIG_ARGON_USB_HOST=y
