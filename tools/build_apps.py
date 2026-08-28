@@ -36,9 +36,16 @@ MKAXE = os.path.join(ROOT, "tools", "mkaxe.py")
 #
 # Nothing about that says "wrong compiler", which is why it cost a day.  So the
 # compiler is chosen from the target the firmware is built for, and printed.
-GCC_FOR_TARGET = {
-    "esp32": "xtensa-esp32-elf-gcc",
-    "esp32s3": "xtensa-esp32s3-elf-gcc",
+#
+# The instruction set comes with it, because on the C6 they are not the same
+# instruction set at all: an image built for one and loaded on the other is
+# refused by the loader (the arch is in the .AXE header), which is at least an
+# honest failure - unlike the LX7-on-LX6 case above, which runs until it does
+# not.
+TOOLCHAIN_FOR_TARGET = {
+    "esp32":   ("xtensa", "xtensa-esp32-elf-gcc"),
+    "esp32s3": ("xtensa", "xtensa-esp32s3-elf-gcc"),
+    "esp32c6": ("riscv32", "riscv32-esp-elf-gcc"),
 }
 
 
@@ -59,15 +66,41 @@ def load_manifest():
         return json.load(f)
 
 
-def command_for(app, defaults, extra_cflags, gcc=None):
+def toolchain_for(app, defaults, target_pair, forced_gcc):
+    """Which (arch, gcc) builds this image.
+
+    Three sources, in this order, and the order is the whole point:
+
+      --gcc on the command line   wins over everything, and says so in its help.
+      the entry's own arch/gcc    an entry that names a compiler means it.  This
+                                  is how ST7789.SYS gets built for RISC-V while
+                                  the rest of the manifest is Xtensa: they are
+                                  not alternatives, they are different machines.
+      the target's pair           for every entry that named neither, the chip
+                                  `argon target` last configured decides.
+
+    Before the middle rule existed, the target's compiler overrode the entry's
+    and a RISC-V image was handed to an Xtensa GCC, which failed on -mcmodel.
+    """
+    named = "arch" in app or "gcc" in app
+    if named:
+        arch = app.get("arch", defaults["arch"])
+        gcc = app.get("gcc", defaults["gcc"])
+    elif target_pair is not None:
+        arch, gcc = target_pair
+    else:
+        arch, gcc = defaults["arch"], defaults["gcc"]
+    return arch, (forced_gcc or gcc)
+
+
+def command_for(app, defaults, extra_cflags, target_pair, forced_gcc):
     include = list(defaults.get("include", [])) + list(app.get("include", []))
     cflags = app.get("cflags", defaults.get("cflags", ""))
     if extra_cflags:
         cflags = (cflags + " " + extra_cflags).strip()
 
-    cmd = [sys.executable, MKAXE,
-           "--arch", app.get("arch", defaults["arch"]),
-           "--gcc", gcc or app.get("gcc", defaults["gcc"])]
+    arch, gcc = toolchain_for(app, defaults, target_pair, forced_gcc)
+    cmd = [sys.executable, MKAXE, "--arch", arch, "--gcc", gcc]
     for inc in include:
         cmd += ["--include", inc]
     if cflags:
@@ -92,24 +125,21 @@ def main():
                          "and tools/apps.json.  Rarely wanted: the default now "
                          "follows CONFIG_IDF_TARGET, and building for the wrong "
                          "core is an illegal instruction at run time, not a "
-                         "refusal at build time (see GCC_FOR_TARGET)")
+                         "refusal at build time (see TOOLCHAIN_FOR_TARGET)")
     args = ap.parse_args()
 
     manifest = load_manifest()
     defaults = manifest["defaults"]
     apps = manifest["apps"]
 
-    # The manifest names a compiler, but the chip decides, and the chip is
-    # whatever `argon target` last configured.  An explicit --gcc still wins.
-    gcc = args.gcc
-    if gcc is None:
-        target = target_from_sdkconfig()
-        gcc = GCC_FOR_TARGET.get(target)
-        if gcc is None and target is not None:
-            print(f"build_apps: unknown target '{target}', using the manifest's "
-                  f"{defaults['gcc']}")
-    if gcc is None:
-        gcc = defaults["gcc"]
+    # The manifest names a compiler, but the chip decides for every entry that
+    # did not name one itself.  The chip is whatever `argon target` last
+    # configured; an explicit --gcc still wins over both.
+    target = target_from_sdkconfig()
+    target_pair = TOOLCHAIN_FOR_TARGET.get(target)
+    if target_pair is None and target is not None and args.gcc is None:
+        print(f"build_apps: unknown target '{target}', using the manifest's "
+              f"{defaults['gcc']}")
 
     if args.only:
         wanted = {name.upper() for name in args.only}
@@ -139,18 +169,19 @@ def main():
     for i, app in enumerate(apps, 1):
         name = app["out"]
         print(f"[{i}/{len(apps)}] {name}", flush=True)
-        proc = subprocess.run(command_for(app, defaults, extra, gcc),
-                              cwd=ROOT)
+        proc = subprocess.run(
+            command_for(app, defaults, extra, target_pair, args.gcc), cwd=ROOT)
         if proc.returncode != 0:
             failed.append(name)
 
     took = time.time() - started
     if failed:
         print(f"\napps: {len(failed)} of {len(apps)} FAILED "
-              f"({', '.join(failed)}) with {gcc} in {took:.0f}s",
-              file=sys.stderr)
+              f"({', '.join(failed)}) for {target or 'no target'} "
+              f"in {took:.0f}s", file=sys.stderr)
         return 1
-    print(f"\napps: {len(apps)} images built by {gcc} in {took:.0f}s")
+    print(f"\napps: {len(apps)} images built for {target or 'no target'} "
+          f"in {took:.0f}s")
     return 0
 
 

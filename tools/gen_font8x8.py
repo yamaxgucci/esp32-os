@@ -14,7 +14,7 @@ solid block - 'B' comes out as a filled rectangle.  A console that does not fit
 is fixed by making the console forty columns wide, not by making the letters
 unreadable.
 
-    python tools/gen_font8x8.py           # writes apps/ili9341/font8x8.h
+    python tools/gen_font8x8.py           # writes apps/common/font8x8.h
 """
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SRC = ROOT / "components" / "argon_kernel" / "src" / "dev" / "font8x16.c"
-OUT = ROOT / "apps" / "ili9341" / "font8x8.h"
+OUT = ROOT / "apps" / "common" / "font8x8.h"
 
 GLYPHS = 256
 SRC_ROWS = 16

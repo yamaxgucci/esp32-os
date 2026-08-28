@@ -51,6 +51,7 @@ ArgonOS
   python tools/netfixture.py serve   the same servers, to try things by hand
   argon check              local CI: host tests, then firmware build
   argon target             which chip the firmware is built for
+  argon target esp32c6     the RISC-V board (docs\12-esp32-c6-lcd.md)
   argon target esp32       switch to the board on the desk (docs\09-esp32-cyd.md);
                            esp32-dsp = no radios, big arena; esp32s3 switches
                            back.  esp32s3-cam = esp32s3-board with the camera
@@ -172,6 +173,7 @@ switch ($Command.ToLowerInvariant()) {
             Write-Host '                esp32s3-zero   ESP32-S3-Zero: 4 MB flash, USB-JTAG console, I2S DAC, no display/SD'
             Write-Host '                esp32       hardware: Wi-Fi and Bluetooth'
             Write-Host '                esp32-dsp   hardware: neither, 48 KB arena'
+            Write-Host '                esp32c6     hardware: RISC-V, USB console, the C6-LCD-1.47'
             exit 0
         }
 
@@ -194,6 +196,7 @@ switch ($Command.ToLowerInvariant()) {
                             $chip = 'esp32s3' }
             'esp32s3-zero' { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32s3;sdkconfig.esp32s3.zero'
                              $chip = 'esp32s3' }
+            'esp32c6'   { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32c6' }
             default {
                 Write-Host "argon target: no defaults for '$chip'."
                 Write-Host 'Add sdkconfig.defaults.<chip> before building for it.'

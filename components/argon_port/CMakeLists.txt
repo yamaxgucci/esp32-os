@@ -18,6 +18,18 @@ endif()
 # subsystems that are genuinely machine-specific.
 file(GLOB ARGON_PORT_SRCS "${CMAKE_CURRENT_LIST_DIR}/${ARGON_PORT}/src/*.c")
 
+# The exception table fault_hw.c installs into is the one thing here that is
+# named after the instruction set rather than after the chip.  `xtensa` is a
+# component on the Xtensa parts and does not exist at all on the RISC-V ones
+# (C3, C6, H2, P4), where naming it fails the configure rather than the link.
+# RISC-V has no equivalent table, so fault_hw.c compiles there to a port that
+# answers -AG_ENOTSUP - which argon/port/fault.h allows in so many words.
+if(CONFIG_IDF_TARGET_ARCH_XTENSA)
+    set(ARGON_ARCH_REQUIRES xtensa)
+else()
+    set(ARGON_ARCH_REQUIRES "")
+endif()
+
 idf_component_register(
     SRCS ${ARGON_PORT_SRCS}
     INCLUDE_DIRS "include" "${ARGON_PORT}"
@@ -36,18 +48,20 @@ idf_component_register(
              # is still there and still answers, which is how the port says
              # this image cannot scale.
              esp_pm
-             # xtensa: the exception table fault_hw.c installs into
-             xtensa
-             # the serial ports everything talks over before there is anything else
-             esp_driver_uart
+             ${ARGON_ARCH_REQUIRES}
+             # the serial ports everything talks over before there is anything
+             # else - and, on a part whose Type-C socket goes straight to the
+             # chip, the USB device that is the console instead of a UART
+             esp_driver_uart esp_driver_usb_serial_jtag
              # flash partitions, and the two filesystems a board is born with
              esp_partition fatfs wear_levelling vfs sdmmc esp_driver_sdmmc
              esp_driver_sdspi esp_driver_spi joltwallet__littlefs
              # pins and buses straight through to the chip.  esp_adc is
              # deliberately absent - see ARGON_ENABLE_ADC in argon_kernel.
              esp_driver_gpio esp_driver_i2c esp_driver_ledc
-             # the virtual RGB panel under Espressif QEMU (absent on hardware)
-             esp_lcd espressif__esp_lcd_qemu_rgb
+             # the panel interface; the virtual RGB device itself is linked
+             # below, only when there is an emulator to show it (ARGON_PANEL_QEMU)
+             esp_lcd
              # the link, whichever it is, and lwIP sockets above it:
              # esp_eth is OpenEth under QEMU, esp_wifi is the radio on silicon
              esp_eth esp_wifi esp_netif esp_event nvs_flash lwip
@@ -69,6 +83,15 @@ endif()
 if(CONFIG_ARGON_ENABLE_AUDIO)
     idf_component_get_property(dac_lib esp_driver_dac COMPONENT_LIB)
     target_link_libraries(${COMPONENT_LIB} PRIVATE ${dac_lib})
+endif()
+
+# The virtual RGB panel (CONFIG_ARGON_PANEL_QEMU), on the same terms as the
+# camera below: named here rather than in REQUIRES so that a target with no
+# emulator neither fetches the managed component nor tries to compile it.  It
+# does not build for RISC-V - see the Kconfig entry.
+if(CONFIG_ARGON_PANEL_QEMU)
+    idf_component_get_property(qemu_rgb_lib espressif__esp_lcd_qemu_rgb COMPONENT_LIB)
+    target_link_libraries(${COMPONENT_LIB} PRIVATE ${qemu_rgb_lib})
 endif()
 
 # The built-in camera (CONFIG_ARGON_CAMERA_BUILTIN): Espressif's esp32-camera,

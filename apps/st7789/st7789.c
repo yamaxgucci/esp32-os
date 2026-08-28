@@ -1,29 +1,26 @@
-﻿/*
- * ArgonOS - ILI9341 panel driver (.SYS).
+/*
+ * ArgonOS - ST7789 panel driver (.SYS).
  *
- *   drv install a:\ili9341.sys
- *   dev                       -> lcd0  display  ILI9341
+ *   drv install c:\st7789.sys
+ *   dev                       -> lcd0  display  ST7789
  *
- * What it is for: the console, on the screen soldered to the board, with no
- * host attached.  It owns the panel from the moment it is loaded until it is
- * unloaded - the pins, the backlight and the initialisation - which is the
- * difference between a driver and the bring-up program that came before it
- * (apps/lcd).  That program drew a perfect frame and then exited, and exiting
- * gave the backlight pin back, and the screen went dark a millisecond later.
+ * The panel soldered to a Waveshare ESP32-C6-LCD-1.47: 1.47 inches, 172x320,
+ * driven landscape as 320x172.  Written from apps/ili9341/ili9341.c, which it
+ * follows closely on purpose - the console path, the window tracking, the
+ * scaler and the rules about what a driver may not do are that file's, and
+ * copying them wrongly here would be a second set of bugs to find.  What is
+ * genuinely different is written down where it happens: the offset, the
+ * inversion, the reset pin, and the bus this panel has to share.
  *
- * There is no framebuffer here, and that is the design rather than a
- * shortcut: 320x240 in RGB565 is 150 KB, this chip has no PSRAM, and the
- * largest single block of memory free after boot is about a hundred.  So the
- * kernel sends the console as characters (ag_display_ops_t text_row, ABI 0.27)
- * and this turns one row of them into pixels at a time, in a buffer of 5 KB.
- * A row costs one window command and 320x8 pixels over SPI - about two
- * milliseconds - and only rows that changed are sent at all.
+ * The first image in this tree built for RISC-V.  A .SYS carries its
+ * instruction set in its header, so this one is not interchangeable with
+ * ILI9341.SYS even though most of it is the same source.
  *
  * Build:
  *   python tools/gen_font8x8.py
- *   python tools/mkaxe.py --arch xtensa --gcc xtensa-esp32-elf-gcc \
+ *   python tools/mkaxe.py --arch riscv32 --gcc riscv32-esp-elf-gcc \
  *       --include sdk/include --include apps/common \
- *       -o build/apps/ILI9341.SYS apps/ili9341/ili9341.c
+ *       -o build/apps/ST7789.SYS apps/st7789/st7789.c
  *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
  */
@@ -32,31 +29,67 @@
 
 #include "font8x8.h"
 
-AG_DRV("ILI9341", "0.5", "argon");
+AG_DRV("ST7789", "0.1", "argon");
 
 /*
- * The board this was written on: an ESP32-2432S024, whose panel is on SPI2
- * with the pins in BOARD.CFG and whose control lines are these.  They are
- * constants because a driver cannot read BOARD.CFG - api->cfg is NULL - and
- * because a wrong guess here drives a pin that belongs to something else.
- * A board pack is the place this belongs when there is one; see
- * docs/03-board-config.md.
+ * The board this was written on, and the pins are constants for the same
+ * reason they are in the ILI9341 driver: a driver cannot read BOARD.CFG -
+ * api->cfg is NULL - and a wrong guess here drives a pin belonging to
+ * something else.  They are written down in boards/esp32-c6-lcd-1.47/BOARD.CFG
+ * as well, where a person looking for them will look first.
  *
- * Both numbers were found by looking rather than by reading: the 2.8 inch
- * board of the same family has its backlight on 21 and calls itself 240x320.
+ * The chip select is the whole of what separates this panel from the SD card:
+ * both are on SPI2, both share clock and data, and only 14 and 4 tell them
+ * apart.  The port keeps one SPI device per chip select with a clock of its
+ * own, so nothing here has to know the card exists - but it is why this driver
+ * must never drive the bus pins itself.
  */
 #define LCD_BUS      2
-#define LCD_CS      15
-#define LCD_DC       2
-#define LCD_BL      27
-#define LCD_MADCTL 0x40 /* landscape, and no BGR bit: this panel is RGB */
+#define LCD_CS      14
+#define LCD_DC      15
+#define LCD_RST     21
+#define LCD_BL      22
+
+/*
+ * Landscape, and which way up.
+ *
+ * MV turns the addressing on its side; MX or MY then decides which corner is
+ * the origin, which is to say which end of the board the first row is at.
+ * 0x60 is MV|MX and 0xA0 is MV|MY - the two landscapes, one the other's
+ * 180-degree rotation.
+ *
+ * 0x60 reads the right way up with the USB socket on the right, which is the
+ * board held as a phone is held in landscape and is what this was checked on.
+ * 0xA0 is the same screen for somebody who puts the cable out the other side;
+ * it is the only line to change, because the offset below is the same either
+ * way - the 172 rows sit centred in the controller's 240 (34 above, 34 below),
+ * so mirroring the axis does not move them.
+ *
+ * Bit 3 is left clear: this panel is RGB, not BGR.  A picture with the reds
+ * and blues exchanged is that bit and nothing else.
+ */
+#define LCD_MADCTL 0x60
+
 #define LCD_W      320
-#define LCD_H      240
+#define LCD_H      172
+
+/*
+ * Where the glass is inside the controller.
+ *
+ * The ST7789 addresses 240x320 whatever is attached to it; this panel is 172
+ * wide, centred, so the short axis starts 34 in.  Landscape puts the short
+ * axis on the rows, which is why the offset is on Y here and would be on X in
+ * portrait.  Getting this wrong does not look like an offset - it looks like a
+ * screen with a band of noise down one side and everything shifted, because
+ * the rows past the end still exist in memory and are simply not lit.
+ */
+#define LCD_X_OFF 0
+#define LCD_Y_OFF 34
 
 #define CELL_W AG_FONT8X8_W
 #define CELL_H AG_FONT8X8_H
 #define COLS   (LCD_W / CELL_W) /* 40 */
-#define ROWS   (LCD_H / CELL_H) /* 30 */
+#define ROWS   (LCD_H / CELL_H) /* 21, and four pixels at the bottom spare */
 
 /* One row of text, as pixels.  The only buffer this driver has. */
 static uint16_t s_row[LCD_W * CELL_H];
@@ -73,15 +106,10 @@ static void cmd(uint8_t c)
 }
 
 /*
- * How much the port will take in one transfer, found by asking.
- *
- * There is a limit - the SPI layer copies through a bounce buffer of its own -
- * and the ABI does not publish it, so this starts optimistic and halves on the
- * first refusal.  The number matters more than it looks: a transfer costs about
- * seventy microseconds of setup whatever its size, and a frame of 160x144 sent
- * as three hundred and twenty byte rows is two hundred and sixteen of those,
- * which is sixteen milliseconds of a thirty-two millisecond frame spent on
- * overhead rather than on pixels.
+ * How much the port will take in one transfer, found by asking.  See the note
+ * in ili9341.c: the limit is not published, so this starts optimistic and
+ * halves on the first refusal, and the number matters because a transfer costs
+ * about seventy microseconds of setup whatever its size.
  */
 static size_t s_chunk = 4096;
 
@@ -114,16 +142,10 @@ static void cmd_data(uint8_t c, const void *buf, size_t len)
 }
 
 /*
- * The last window set, and where writing has got to inside it.
- *
- * The controller walks its own window and wraps to the next row by itself, so a
- * rectangle that continues exactly where the previous one stopped needs no new
- * window at all.  A frame arriving as eighteen bands then costs one window
- * instead of eighteen, and a window is five transfers - three commands and two
- * pairs of coordinates - which came to nearly seven milliseconds a frame.
- *
- * Anything that breaks the sequence (a different column range, a jump, the
- * console's text path, a wipe) sets a window and the tracking starts again.
+ * The last window set, and where writing has got to inside it.  Same idea as
+ * the ILI9341 driver: the controller wraps to the next row by itself, so a
+ * rectangle continuing exactly where the last one stopped needs no new window,
+ * and a frame arriving as bands then costs one window instead of eighteen.
  */
 static uint16_t s_win_x0, s_win_x1, s_win_y1;
 static uint16_t s_win_next; /* the row the controller will write next */
@@ -133,10 +155,14 @@ static void window_forget(void) { s_win_live = false; }
 
 static void window(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1)
 {
-    const uint8_t ca[4] = {(uint8_t)(x0 >> 8), (uint8_t)x0,
-                           (uint8_t)(x1 >> 8), (uint8_t)x1};
-    const uint8_t pa[4] = {(uint8_t)(y0 >> 8), (uint8_t)y0,
-                           (uint8_t)(y1 >> 8), (uint8_t)y1};
+    const uint16_t cx0 = (uint16_t)(x0 + LCD_X_OFF);
+    const uint16_t cx1 = (uint16_t)(x1 + LCD_X_OFF);
+    const uint16_t cy0 = (uint16_t)(y0 + LCD_Y_OFF);
+    const uint16_t cy1 = (uint16_t)(y1 + LCD_Y_OFF);
+    const uint8_t  ca[4] = {(uint8_t)(cx0 >> 8), (uint8_t)cx0,
+                            (uint8_t)(cx1 >> 8), (uint8_t)cx1};
+    const uint8_t  pa[4] = {(uint8_t)(cy0 >> 8), (uint8_t)cy0,
+                            (uint8_t)(cy1 >> 8), (uint8_t)cy1};
     cmd_data(0x2a, ca, sizeof(ca));
     cmd_data(0x2b, pa, sizeof(pa));
     cmd(0x2c);
@@ -291,9 +317,9 @@ static void lcd_text_cursor(ag_handle_t h, uint16_t col, uint16_t row,
     }
     /*
      * One cell, into a one-cell window: the row buffer is what this driver
-     * sends, but sending a whole row here would blank the rest of the line
-     * the caret is standing on.  The character underneath comes with the
-     * call, so the caret can invert it instead of covering it.
+     * sends, but sending a whole row here would blank the rest of the line the
+     * caret is standing on.  The character underneath comes with the call, so
+     * the caret can invert it instead of covering it.
      */
     paint_cell_into_row(0, under.ch, under.attr, visible);
 
@@ -306,55 +332,34 @@ static void lcd_text_cursor(ag_handle_t h, uint16_t col, uint16_t row,
     window_forget();
 }
 
-
 /* ---- pixels ------------------------------------------------------------ */
 
 /*
- * A surface the kernel owns, put on glass that is bigger than it (ABI 0.30).
+ * A surface the kernel owns, put on glass that is a different size (ABI 0.30).
  *
- * This board has 320x240 in front of it and about sixty kilobytes it can hand
- * out in one piece; a framebuffer of that size is a hundred and fifty.  So the
- * surface is smaller than the panel and something has to decide what to do
- * with the difference.  Here: scale it by the largest whole number that still
- * fits and centre what is left, which for the 160x120 the system asks for is
- * exactly two and no margin at all.
- *
- * Nearest neighbour at an exact ratio - see s_num below for why a whole number
- * turned out not to be enough.
+ * The default here is 160x86 - half of 320x172 - because 110 KB of framebuffer
+ * out of this chip's 240 is more than the radio can spare.  At that size the
+ * scale is exactly two and the picture covers the glass edge to edge with no
+ * margin at all.  The arithmetic below is the ILI9341 driver's and handles any
+ * other size the board is configured for, at the largest exact ratio that fits.
  */
 static uint16_t s_surf_w, s_surf_h;
 
 /*
- * The picture's size on the glass, as a ratio rather than a whole number.
- *
- * Whole numbers were the first answer and they are not enough.  A Game Boy is
- * 160x144 and this panel is 320x240: twice over is 320x288, which is taller than
- * the glass, so the only whole number that fits is one - a small picture in the
- * middle of a large screen, using a fifth of it.
- *
- * The ratio that fits is 240/144, five thirds, and it is exact: five output rows
- * for every three source rows, chosen per row by integer arithmetic.  That is
- * nearest neighbour, not interpolation - no pixel is averaged with its
- * neighbours, so nothing is blurred and nothing has to be computed twice.  What
- * it costs is that rows come in a repeating pattern of two, two, one rather than
- * all being the same height, which at this size is not visible and at any size
- * is what every console upscaler has always done.
- *
- * The same ratio is used for both axes, so a circle stays a circle.  Filling the
- * screen edge to edge would mean two across and five thirds down, and a picture
- * a fifth wider than it is meant to be; twenty-seven pixels of margin either
- * side is the better trade.
+ * The picture's size on the glass, as a ratio rather than a whole number: at a
+ * whole number a 160x144 source on a 320x172 panel would only fit at 1:1, a
+ * small picture in the middle of a screen it nearly fills.  The ratio that fits
+ * is chosen per axis by cross-multiplying, and the same one is used for both so
+ * a circle stays a circle.  Nearest neighbour at an exact ratio: no pixel is
+ * averaged with its neighbours, so nothing is blurred.
  */
 static uint32_t s_num = 1, s_den = 1; /* the scale, num/den */
 static uint16_t s_out_w, s_out_h;     /* the picture on the glass */
 static uint16_t s_off_x, s_off_y;     /* where it starts */
 
 /*
- * Which source column each output column comes from.
- *
- * Worked out once per surface rather than per pixel: the map is a divide per
- * entry and the inner loop is a lookup, where doing it directly would be a
- * divide per pixel - some eighty thousand a frame.
+ * Which source column each output column comes from.  Worked out once per
+ * surface rather than per pixel: a divide per entry against a divide per pixel.
  */
 static uint16_t s_colmap[LCD_W];
 
@@ -364,8 +369,17 @@ static void clear_panel(void)
         s_row[i] = 0;
     }
     window(0, 0, LCD_W - 1, LCD_H - 1);
+    /*
+     * The buffer is eight rows tall and the panel is 172, which is not a
+     * multiple of eight: the last band would run four rows past the bottom of
+     * the window and the controller would wrap them onto the top.  So the
+     * whole bands go first and the remainder goes as its own short transfer.
+     */
     for (uint16_t band = 0; band < LCD_H / CELL_H; band++) {
         data(s_row, sizeof(s_row));
+    }
+    if ((LCD_H % CELL_H) != 0) {
+        data(s_row, (size_t)(LCD_H % CELL_H) * LCD_W * sizeof(uint16_t));
     }
     window_forget();
 }
@@ -420,8 +434,7 @@ static void fit_surface(uint16_t w, uint16_t h)
      *
      * Nothing is printed here, and that is a rule rather than a preference:
      * see the note on blit_rect in argon/abi.h.  A print from inside this call
-     * deadlocks the board, and it took a run that stopped between "text" and
-     * "flushed" to find out.
+     * deadlocks the board.
      */
     clear_panel();
 }
@@ -446,8 +459,8 @@ static void lcd_blit_rect(ag_handle_t h, const ag_blit_t *b)
      * The rectangle in output rows and columns.
      *
      * Floor division at both ends, which is what makes consecutive rectangles
-     * meet exactly: the end of one is the start of the next, so a frame arriving
-     * as a run of bands covers every row once and none twice.
+     * meet exactly: the end of one is the start of the next, so a frame
+     * arriving as a run of bands covers every row once and none twice.
      */
     const uint16_t ox0 = (uint16_t)(((uint32_t)x * s_num) / s_den);
     const uint16_t oy0 = (uint16_t)(((uint32_t)y * s_num) / s_den);
@@ -524,16 +537,11 @@ static const ag_display_ops_t k_display_ops = {
  * The panel is not a stream of bytes, so read and write are absent: `type
  * d:\lcd0` says so rather than doing something.  The one ioctl is the light.
  *
- * On this board the backlight is a transistor on a plain output, not a PWM
- * channel, so any percentage above zero is "on".  A board of this family with
- * the light on a channel of its own would set a duty here instead, and the
- * kernel does not need to know which it is.
- *
- * The controller is put to sleep as well as darkened.  That is the larger half
- * of the saving: the light is off either way, but a panel left scanning keeps
- * its charge pumps and its oscillator running for a picture nobody can see.
- * Waking it costs the datasheet's 120 ms and a cleared screen, because what is
- * in its memory by then is a week old as far as the console is concerned.
+ * The backlight here is a transistor on a plain output, not a PWM channel, so
+ * any percentage above zero is "on".  The controller is put to sleep as well as
+ * darkened: that is the larger half of the saving, because a panel left
+ * scanning keeps its charge pumps and its oscillator running for a picture
+ * nobody can see.  Waking it costs the datasheet's 120 ms and a cleared screen.
  */
 static ag_err_t lcd_ioctl(ag_device_t *dev, uint32_t code, void *arg,
                           size_t arglen)
@@ -574,47 +582,91 @@ static const ag_dev_ops_t k_dev_ops = {
 
 static bool panel_init(void)
 {
-    static const uint8_t pwctr1[] = {0x23};
-    static const uint8_t pwctr2[] = {0x10};
-    static const uint8_t vmctr1[] = {0x3e, 0x28};
-    static const uint8_t vmctr2[] = {0x86};
-    static const uint8_t pixfmt[] = {0x55};
-    static const uint8_t frmctr[] = {0x00, 0x18};
-    static const uint8_t dfunctr[] = {0x08, 0x82, 0x27};
-    static const uint8_t madctl[] = {LCD_MADCTL};
-    /* Whole panel scrolls, from row zero: undo what the last firmware set. */
-    static const uint8_t vscrdef[] = {0x00, 0x00, 0x01, 0x40, 0x00, 0x00};
-    static const uint8_t vscrsadd[] = {0x00, 0x00};
+    /*
+     * The ST7789's own defaults are usable and most of this is the datasheet's
+     * recommended set rather than anything discovered here.  The three lines
+     * that are not optional are marked.
+     */
+    static const uint8_t porctrl[] = {0x0c, 0x0c, 0x00, 0x33, 0x33};
+    static const uint8_t gctrl[]   = {0x35};
+    static const uint8_t vcoms[]   = {0x19};
+    static const uint8_t lcmctrl[] = {0x2c};
+    static const uint8_t vdvvrhen[] = {0x01};
+    static const uint8_t vrhs[]    = {0x12};
+    static const uint8_t vdvs[]    = {0x20};
+    static const uint8_t frctrl2[] = {0x0f};
+    static const uint8_t pwctrl1[] = {0xa4, 0xa1};
+    static const uint8_t pvgamctrl[] = {0xd0, 0x04, 0x0d, 0x11, 0x13, 0x2b,
+                                        0x3f, 0x54, 0x4c, 0x18, 0x0d, 0x0b,
+                                        0x1f, 0x23};
+    static const uint8_t nvgamctrl[] = {0xd0, 0x04, 0x0c, 0x11, 0x13, 0x2c,
+                                        0x3f, 0x44, 0x51, 0x2f, 0x1f, 0x1f,
+                                        0x20, 0x23};
+    static const uint8_t madctl[]  = {LCD_MADCTL};
+    static const uint8_t pixfmt[]  = {0x55}; /* 16 bits, and this one matters */
 
     if (io->gpio_config(LCD_DC, AG_GPIO_OUT) != AG_OK ||
+        io->gpio_config(LCD_RST, AG_GPIO_OUT) != AG_OK ||
         io->gpio_config(LCD_BL, AG_GPIO_OUT) != AG_OK) {
         return false;
     }
 
-    cmd(0x01);
+    /* Dark until there is something of ours to show. */
+    io->gpio_write(LCD_BL, 0);
+
+    /*
+     * A real reset line, which the ILI9341 board did not have.  Worth using:
+     * the panel comes out of it in a known state whatever the last firmware
+     * left in its registers, and this board ships with a factory demo that
+     * leaves plenty.
+     */
+    io->gpio_write(LCD_RST, 1);
+    ag_api()->time->delay_ms(10);
+    io->gpio_write(LCD_RST, 0);
+    ag_api()->time->delay_ms(10);
+    io->gpio_write(LCD_RST, 1);
+    ag_api()->time->delay_ms(120);
+
+    cmd(0x01); /* software reset as well, for the registers RST does not clear */
     ag_api()->time->delay_ms(150);
 
-    cmd_data(0xc0, pwctr1, sizeof(pwctr1));
-    cmd_data(0xc1, pwctr2, sizeof(pwctr2));
-    cmd_data(0xc5, vmctr1, sizeof(vmctr1));
-    cmd_data(0xc7, vmctr2, sizeof(vmctr2));
+    cmd(0x11); /* sleep out - nothing below this takes effect without it */
+    ag_api()->time->delay_ms(120);
+
     cmd_data(0x36, madctl, sizeof(madctl));
     cmd_data(0x3a, pixfmt, sizeof(pixfmt));
-    cmd_data(0xb1, frmctr, sizeof(frmctr));
-    cmd_data(0xb6, dfunctr, sizeof(dfunctr));
-    cmd(0x13);
-    cmd(0x20);
-    cmd_data(0x33, vscrdef, sizeof(vscrdef));
-    cmd_data(0x37, vscrsadd, sizeof(vscrsadd));
 
-    cmd(0x11);
-    ag_api()->time->delay_ms(120);
-    cmd(0x29);
+    cmd_data(0xb2, porctrl, sizeof(porctrl));
+    cmd_data(0xb7, gctrl, sizeof(gctrl));
+    cmd_data(0xbb, vcoms, sizeof(vcoms));
+    cmd_data(0xc0, lcmctrl, sizeof(lcmctrl));
+    cmd_data(0xc2, vdvvrhen, sizeof(vdvvrhen));
+    cmd_data(0xc3, vrhs, sizeof(vrhs));
+    cmd_data(0xc4, vdvs, sizeof(vdvs));
+    cmd_data(0xc6, frctrl2, sizeof(frctrl2));
+    cmd_data(0xd0, pwctrl1, sizeof(pwctrl1));
+    cmd_data(0xe0, pvgamctrl, sizeof(pvgamctrl));
+    cmd_data(0xe1, nvgamctrl, sizeof(nvgamctrl));
+
+    /*
+     * Inversion on, and it is not a preference.  This is a normally-black IPS
+     * panel wired the way every 172x320 module of this size is: without INVON
+     * every colour comes out as its complement - white text on a white screen,
+     * which reads as a backlight that came on over nothing.
+     */
+    cmd(0x21);
+    cmd(0x13); /* normal display mode (no partial, no idle) */
+
+    cmd(0x29); /* display on */
     ag_api()->time->delay_ms(20);
 
-    /* Black, everywhere, before the backlight comes on: whatever the panel
-     * was showing is not ours and must not be handed to the user as if it
-     * were. */
+    /*
+     * Black, everywhere, before the backlight comes on: whatever the panel was
+     * showing is not ours and must not be handed to the user as if it were.
+     * On this board that is exactly the case - what is in the controller's
+     * memory at this moment is the factory demo, or the noise it powered up
+     * with.
+     */
     clear_panel();
 
     io->gpio_write(LCD_BL, 1);
@@ -636,7 +688,7 @@ ag_err_t ag_driver_init(void)
 
     const ag_dev_add_t desc = {
         .name = "lcd0",
-        .driver = "ILI9341",
+        .driver = "ST7789",
         .cls = AG_DEV_DISPLAY,
         .ops = &k_dev_ops,
         .class_ops = &k_display_ops,
@@ -649,7 +701,7 @@ ag_err_t ag_driver_init(void)
         return err;
     }
 
-    ag_printf("ILI9341: %dx%d, %dx%d cells, backlight %d\n", LCD_W, LCD_H,
-              COLS, ROWS, LCD_BL);
+    ag_printf("ST7789: %dx%d, %dx%d cells, backlight %d\n", LCD_W, LCD_H, COLS,
+              ROWS, LCD_BL);
     return AG_OK;
 }

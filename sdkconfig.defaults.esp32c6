@@ -1,0 +1,128 @@
+# ArgonOS - ESP32-C6 (RISC-V), the Waveshare ESP32-C6-LCD-1.47 on the desk.
+#
+# The third chip this system builds for and the first that is not Xtensa.  What
+# that costs is one file: components/argon_port/idf/src/fault_hw.c, which has an
+# Xtensa half that catches an application's fault and a RISC-V half that says it
+# cannot.  Everything else above the port layer compiled for a new instruction
+# set without a line changing, which is what the port layer was for.
+#
+# The board: ESP32-C6-WROOM-1, 4 MB flash, 512 KB HP SRAM, no PSRAM.  ST7789
+# 172x320 and a microSD slot, both on SPI2 and sharing it (boards/esp32-c6-lcd-1.47).
+# The Type-C socket goes to the chip itself - there is no bridge chip on this
+# board at all - so the console is the built-in USB serial device and not a UART.
+#
+# QEMU does not run this target; everything here is verified on the board.
+
+CONFIG_IDF_TARGET="esp32c6"
+
+# 4 MB, and the same table the other 4 MB board uses: the 8 MB one would start
+# appfs past the end of the chip.
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_4mb.csv"
+
+# 160 MHz is this part's ceiling, not a choice.
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_160=y
+
+# The console, and the one line that makes this board usable at all.
+#
+# There is no CH340 and no CP2102 here: the USB-C socket is wired to GPIO 12 and
+# 13, which are the chip's own USB pins.  With the console left on UART0 the
+# system would be talking to GPIO 16 and 17 - two pads on a header - and the
+# cable in the socket would carry nothing.  See argon/port/impl/uart.h: the
+# device is offered above as one more serial port, the one after the last real
+# UART, and the console attaches to it by number like any other.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_ESP_CONSOLE_UART_DEFAULT=n
+
+# The code arena is plain SRAM here, and that is the pleasant surprise of this
+# part: instruction and data memory are one 512 KB block at one set of
+# addresses, so the arena is neither a scarce 128 KB of IRAM (the ESP32) nor a
+# window that has to be mapped (the S3).  64 KB is the default and it is taken
+# out of the same heap Wi-Fi wants; this is the first number to move if either
+# runs short.
+CONFIG_ARGON_APP_ARENA_KB=64
+
+# And the one line without which none of that is true.
+#
+# On the Xtensa parts "D/IRAM" is a property of the silicon: one physical SRAM
+# reachable from both buses, writable through one address and executable
+# through it too, which is what lets the loader write an image and then jump
+# into it.  On the RISC-V parts the same memory is one address space and the
+# separation is enforced instead - by the PMP, which ESP-IDF programs at start
+# to make everything below _iram_text_end read-and-execute and everything above
+# it read-and-write.  The code arena is .iram0.bss, which is above that line.
+#
+# So the image loaded, relocated, and died on the first instruction of it:
+#
+#   Guru Meditation Error: Core 0 panic'ed (Instruction access fault)
+#   MEPC : 0x4081fb08   MCAUSE : 0x00000001   MTVAL : 0x4081fb08
+#
+# - an address in the middle of the arena, which the loader had just finished
+# writing to without complaint.  Writable and not executable is precisely the
+# DRAM half of that split.
+#
+# Turning the split off puts one PMP entry over the whole of SRAM with all
+# three permissions, which is what this system wants and has always wanted:
+# ARGON_APP_ARENA_KB says in so many words that ESP-IDF hands out no memory
+# that is both writable and executable through one address, and the arena is
+# how ArgonOS gets some anyway.  It is a protection this design cannot keep -
+# see [T-12] on the no-MMU trade - and not one it silently loses.
+CONFIG_ESP_SYSTEM_PMP_IDRAM_SPLIT=n
+
+# Wi-Fi, and only Wi-Fi.
+#
+# The radio is a 802.11ax part and ESP-IDF's API for it is the same one the
+# other two targets use, so api->net needed nothing.  Bluetooth is deliberately
+# absent from this first image: the C6's controller is not the ESP32's, none of
+# the CONFIG_BTDM_* switches in sdkconfig.defaults.esp32 exist here, and adding
+# a radio nobody has asked for yet is a way to fail a bring-up for a reason that
+# has nothing to do with the board.
+CONFIG_ARGON_ENABLE_NET=y
+CONFIG_ARGON_NET_WIFI=y
+CONFIG_ARGON_ENABLE_BLE=n
+CONFIG_ETH_USE_OPENETH=n
+
+# Monitor mode and raw injection, as on the other radio board.
+CONFIG_ARGON_NET_WIFI_MON=y
+
+# Buffers sized for a part with 512 KB of internal memory and no PSRAM - the
+# same reasoning, and the same numbers, as the ESP32 target.
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=4
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=16
+CONFIG_ESP_WIFI_TX_BUFFER_TYPE=1
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=16
+CONFIG_ESP_WIFI_AMPDU_TX_ENABLED=n
+CONFIG_ESP_WIFI_AMPDU_RX_ENABLED=n
+
+# A panic reboots rather than halting, for the same reason as on the other
+# board: this one has no fault recovery at all (see fault_hw.c), so the panic
+# path is the only path, and a machine that comes back and says "reset: panic"
+# beats one that stops with nobody watching.
+CONFIG_ESP_SYSTEM_PANIC_PRINT_REBOOT=y
+CONFIG_ESP_SYSTEM_PANIC_PRINT_HALT=n
+
+# No host helper on UART1: there is no development machine on the other end of
+# a board, and HostFS would spend 80 KB of DRAM and 100 ms of every boot on a
+# PING nobody answers.
+CONFIG_ARGON_ENABLE_HOSTFS=n
+
+# No virtual panel: no QEMU runs this target, and the component that talks to
+# the emulated one does not compile for RISC-V.  The glass on this board is
+# reached the way a board's glass always is here - a loadable .SYS over SPI.
+CONFIG_ARGON_PANEL_QEMU=n
+
+# Neither of these exists on this part in the form the port wants: there are no
+# DACs at all (so no /dev/pcm0 the way the CYD makes a noise), and the ADC is
+# left off until something on the board needs measuring.
+CONFIG_ARGON_ENABLE_AUDIO=n
+CONFIG_ARGON_ENABLE_ADC=n
+
+# Forty by twenty-one, because that is what the glass is.  The panel is 172x320
+# and the system draws 8-pixel cells; landscape puts 320 pixels across, which is
+# forty columns, and 172 down, which is twenty-one rows with four pixels left
+# over.  The serial console shows the same grid - it is one screen, rendered
+# twice - so this number is what a terminal sees as well.
+CONFIG_ARGON_CONSOLE_COLS=40
+CONFIG_ARGON_CONSOLE_ROWS=21

@@ -148,7 +148,19 @@
 
     { "out": "GFXPIX.AXE", "group": "board", "src": ["apps/gfxpix/gfxpix.c"] },
     { "out": "MIDIPAD.AXE", "group": "board", "src": ["apps/midipad/midipad.c"] },
-    { "out": "ILI9341.SYS", "group": "board", "src": ["apps/ili9341/ili9341.c"] },
+    {
+      "out": "ILI9341.SYS", "group": "board",
+      "_note": "The panel on the CYD.  --include apps/common is font8x8.h, which is generated (tools/gen_font8x8.py) and shared with ST7789.SYS.",
+      "include": ["apps/common"],
+      "src": ["apps/ili9341/ili9341.c"]
+    },
+    {
+      "out": "ST7789.SYS", "group": "board",
+      "_note": "The panel on the ESP32-C6-LCD-1.47, and the first image in this file built for RISC-V - that board is a C6.  A .SYS carries its instruction set in its header; one built for xtensa is refused by the loader rather than run.",
+      "arch": "riscv32", "gcc": "riscv32-esp-elf-gcc",
+      "include": ["apps/common"],
+      "src": ["apps/st7789/st7789.c"]
+    },
     { "out": "XPT2046.SYS", "group": "board", "src": ["apps/xpt2046/xpt2046.c"] },
 
     {

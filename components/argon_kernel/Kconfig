@@ -196,10 +196,27 @@ menu "ArgonOS"
             play in QEMU should use HostFS PADPUSH instead - that path already
             has real level state from a Win32 keyboard hook.
 
+    config ARGON_PANEL_QEMU
+        bool "The virtual RGB panel Espressif's QEMU provides"
+        default y
+        help
+            ag_port_panel_open() on the framebuffer device QEMU emulates at
+            0x21000000.  It is how anything graphical is seen without a board,
+            and it is the only panel the port itself drives - a real one is a
+            loadable .SYS over the SPI primitive.
+
+            Off on a target that no emulator runs.  Not a saving: the component
+            that talks to it (espressif/esp_lcd_qemu_rgb) reaches for
+            soc/syscon_reg.h, which the RISC-V parts do not have, so a C6 image
+            with this on does not compile at all.  With it off, the dependency
+            is not even fetched (main/idf_component.yml), panel_hw.c answers
+            "no panel here", and the system comes up on the serial console the
+            way it does on any board without a screen driver loaded.
+
     config ARGON_ENABLE_NET
         bool "Networking (api->net)"
         default y
-        select ETH_USE_OPENETH
+        select ETH_USE_OPENETH if !ARGON_NET_WIFI
         help
             Brings up a thin socket API (api->net) and, for now, the OpenCores
             Ethernet MAC that Espressif QEMU emulates.  That is the path for
@@ -209,6 +226,15 @@ menu "ArgonOS"
             in QEMU, so which link is built is a second option below.  A failed
             bring-up is non-fatal either way; the table stays present but
             ready() stays false.
+
+            The condition on the select is not tidiness.  A `select` cannot be
+            turned off again by a line in sdkconfig.defaults, so with it
+            unconditional every radio build also compiled the QEMU Ethernet MAC
+            - which was invisible on the two Xtensa boards, because both of
+            those chips happen to have a real EMAC and the driver's register
+            base therefore exists.  The C6 has none, and the build stops in
+            somebody else's header on DR_REG_EMAC_BASE.  The link is one or the
+            other, so the select says so.
 
     config ARGON_NET_WIFI
         bool "...over the radio instead of OpenEth"

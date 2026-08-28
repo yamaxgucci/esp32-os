@@ -7,6 +7,7 @@
 
 #include "driver/sdmmc_host.h"
 #include "driver/sdspi_host.h"
+#include "soc/soc_caps.h"
 #include "driver/spi_common.h"
 #include "esp_littlefs.h"
 #include "esp_vfs_fat.h"
@@ -72,6 +73,16 @@ static esp_vfs_fat_mount_config_t mount_config(bool allow_format)
     return cfg;
 }
 
+/*
+ * The card on its own four-wire bus, on the parts that have one.
+ *
+ * Not every one does.  The C6 has no SDMMC host peripheral at all - the whole
+ * of driver/sdmmc_host.h is empty there - so a card on that board is on SPI or
+ * it is nowhere, and BOARD.CFG saying `interface = sdmmc` has to be an answer
+ * rather than a build failure.
+ */
+#if SOC_SDMMC_HOST_SUPPORTED
+
 static esp_err_t mount_native(const ag_port_sd_cfg_t *sd, const char *base,
                               bool allow_format, sdmmc_card_t **out)
 {
@@ -97,6 +108,20 @@ static esp_err_t mount_native(const ag_port_sd_cfg_t *sd, const char *base,
     const esp_vfs_fat_mount_config_t cfg = mount_config(allow_format);
     return esp_vfs_fat_sdmmc_mount(base, &host, &slot, &cfg, out);
 }
+
+#else /* !SOC_SDMMC_HOST_SUPPORTED */
+
+static esp_err_t mount_native(const ag_port_sd_cfg_t *sd, const char *base,
+                              bool allow_format, sdmmc_card_t **out)
+{
+    (void)sd;
+    (void)base;
+    (void)allow_format;
+    (void)out;
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
+#endif /* SOC_SDMMC_HOST_SUPPORTED */
 
 static esp_err_t mount_spi(const ag_port_sd_cfg_t *sd, const char *base,
                            bool allow_format, sdmmc_card_t **out)

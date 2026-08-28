@@ -78,6 +78,14 @@ set(ARGON_KERNEL_SRCS
     # Same dual-build idea as fm: shell command `edit`, also buildable as .AXE.
     "../../apps/edit/edit.c")
 
+# See components/argon_port/CMakeLists.txt: `xtensa` is not a component on the
+# RISC-V parts, and naming it there fails the configure rather than the link.
+if(CONFIG_IDF_TARGET_ARCH_XTENSA)
+    set(ARGON_ARCH_REQUIRES xtensa)
+else()
+    set(ARGON_ARCH_REQUIRES "")
+endif()
+
 idf_component_register(
     SRCS ${ARGON_KERNEL_SRCS}
     INCLUDE_DIRS "include"
@@ -92,8 +100,7 @@ idf_component_register(
                   # api->io: buses and pins straight through to the chip.
                   # esp_adc is deliberately absent - see ARGON_ENABLE_ADC.
                   esp_driver_i2c esp_driver_ledc
-                  # xtensa: the exception table the fault handler installs into
-                  xtensa)
+                  ${ARGON_ARCH_REQUIRES})
 
 # Analogue input, off by default: linking esp_adc runs a constructor that stops
 # the boot under QEMU, and QEMU is how this system is verified.  See Kconfig.
