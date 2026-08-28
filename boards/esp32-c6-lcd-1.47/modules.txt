@@ -1,0 +1,7 @@
+# What mksysfs puts under C:\drv\ for this board.  One line per image; the
+# names are the built .SYS in build/apps (argon apps --group board).
+#
+# ST7789 only.  There is no touch controller on this board - the 1.47" panel is
+# display-out and nothing else - so XPT2046.SYS, which the default list carries
+# for the CYD, would be a driver waiting on pins that answer nothing.
+ST7789.SYS

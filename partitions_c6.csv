@@ -1,0 +1,29 @@
+# ArgonOS partition table - 4 MB flash, ESP32-C6-LCD-1.47.
+#
+# The same four partitions as partitions_4mb.csv and the same total, with one
+# megabyte moved from appfs to sysfs.  The reason is the cartridge.
+#
+# C: is where a board keeps its own software, and on this board that has to
+# include the things an emulator maps: fs->map reads a file from any filesystem
+# and stages it into appfs, but the file has to be somewhere first, and getting
+# half a megabyte onto the SD card through the console's hex protocol is
+# twenty-four minutes.  Into C: it goes in the same esptool run as the firmware
+# (`mksysfs --add ... --flash`), which is seconds.  A Game Boy cartridge is up
+# to a megabyte; Zelda is exactly 512 KB, which is exactly what the 4 MB table's
+# sysfs is in total, so it did not fit by one byte of filesystem overhead.
+#
+# What it costs: appfs drops to 1 MB.  That is the raw slot area the loader
+# erases, programs and mmap()s - .AXE code too big for the arena, and staged
+# mappings.  The largest image in the tree is SMS at 80 KB of code, and one
+# staged cartridge is 512 KB, so a megabyte holds both with room over.
+#
+# The firmware is 1.69 MB with both radios linked, so 1.9 MB of app partition is
+# not the comfortable margin it is on the other 4 MB board.  Check `argon build`
+# output before adding anything large to the image.
+#
+# Name,     Type, SubType,  Offset,   Size,     Flags
+nvs,        data, nvs,      0x9000,   0x6000,
+phy_init,   data, phy,      0xf000,   0x1000,
+factory,    app,  factory,  0x10000,  0x1F0000,
+sysfs,      data, littlefs, 0x200000, 0x100000,
+appfs,      data, 0x40,     0x300000, 0x100000,

@@ -15,12 +15,15 @@
 
 CONFIG_IDF_TARGET="esp32c6"
 
-# 4 MB, and the same table the other 4 MB board uses: the 8 MB one would start
-# appfs past the end of the chip.
+# 4 MB, and a table of this board's own: the 8 MB one would start appfs past the
+# end of the chip, and the shared 4 MB one splits it 0.5/1.5 between sysfs and
+# appfs, which is the wrong way round here.  A cartridge has to reach C: before
+# it can be mapped, and a Game Boy cartridge is half a megabyte - exactly what
+# the shared table gives C: in total.  See partitions_c6.csv.
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
 CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
-CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_4mb.csv"
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_c6.csv"
 
 # 160 MHz is this part's ceiling, not a choice.
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_160=y

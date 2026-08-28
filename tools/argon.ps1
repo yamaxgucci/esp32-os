@@ -140,10 +140,56 @@ function Build-HostTools {
     }
 }
 
+# A defaults file newer than the generated sdkconfig, which does not mean what
+# anybody expects it to mean.
+#
+# ESP-IDF reads sdkconfig.defaults only for symbols sdkconfig does not already
+# carry.  Once sdkconfig exists, editing a defaults file changes nothing at all:
+# `argon build` happily rebuilds with the old value and says nothing.  This has
+# cost this project two separate afternoons - once on CONFIG_ETH_USE_OPENETH,
+# where a `=n` was ignored and a QEMU-only Ethernet MAC went on being compiled
+# for a chip that has no such registers, and once on
+# CONFIG_PARTITION_TABLE_CUSTOM_FILENAME, where the image kept the old layout
+# and a 1 MB filesystem was then written over a 512 KB partition, taking the
+# start of appfs with it.  Neither failure looked anything like its cause.
+#
+# `argon target <chip>` removes sdkconfig first, which is why switching targets
+# has always worked.  So this does not fix anything; it says which command to
+# run.
+function Warn-StaleSdkconfig {
+    if (-not (Test-Path 'sdkconfig')) { return }
+    $cfg = (Get-Item 'sdkconfig').LastWriteTimeUtc
+    # sdkconfig.<chip>.<variant> fragments are defaults too, by another name, so
+    # both patterns are collected.  @() because a single match is not an array
+    # and += on a bare FileInfo is a method-not-found at run time.
+    $newer = @(Get-ChildItem -File -ErrorAction SilentlyContinue |
+               Where-Object {
+                   ($_.Name -like 'sdkconfig.defaults*' -or
+                    $_.Name -match '^sdkconfig\.[a-z0-9]+\.[a-z0-9]+$') -and
+                   $_.LastWriteTimeUtc -gt $cfg
+               })
+    if (-not $newer) { return }
+
+    $target = '<chip>'
+    $line = Select-String -Path 'sdkconfig' -Pattern '^CONFIG_IDF_TARGET="(.+)"$' |
+            Select-Object -First 1
+    if ($line) { $target = $line.Matches[0].Groups[1].Value }
+
+    Write-Host ''
+    Write-Host 'WARNING: these are newer than sdkconfig, and this build will ignore them:' -ForegroundColor Yellow
+    foreach ($f in ($newer | Select-Object -Unique)) {
+        Write-Host ("  {0}" -f $f.Name) -ForegroundColor Yellow
+    }
+    Write-Host ('Defaults only apply to symbols sdkconfig does not already have.' +
+                " Run ``argon target $target`` first to start from them again.") -ForegroundColor Yellow
+    Write-Host ''
+}
+
 switch ($Command.ToLowerInvariant()) {
 
     'build' {
         Initialize-Environment
+        Warn-StaleSdkconfig
         & idf.py build @Rest
         exit $LASTEXITCODE
     }

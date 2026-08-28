@@ -145,6 +145,11 @@ def main():
 
     offset, size = read_partition(args.partitions, "sysfs")
     name_max = read_config(args.sdkconfig, "CONFIG_LITTLEFS_OBJ_NAME_LEN", "64")
+    # Which chip, from the same place name-max comes from.  It used to be the
+    # string "esp32" in the esptool line below, which was invisible while one
+    # board existed and became `This chip is ESP32-C6, not ESP32` the day a
+    # second one did.  Quoted in sdkconfig, hence the strip.
+    chip = read_config(args.sdkconfig, "CONFIG_IDF_TARGET", '"esp32"').strip('"')
 
     staged_dir = tempfile.mkdtemp(prefix="argon-sysfs-")
     try:
@@ -164,7 +169,7 @@ def main():
             raise SystemExit("mksysfs: littlefs-python is missing.  "
                              "pip install littlefs-python")
 
-        print(f"mksysfs: {args.out}  {size} bytes at 0x{offset:x}"
+        print(f"mksysfs: {args.out}  {size} bytes at 0x{offset:x}  ({chip})"
               + (f"  [display] driver = {args.display}" if args.display else ""))
         for name in staged:
             print(f"  C:\\{name}")
@@ -177,7 +182,7 @@ def main():
     if not args.port:
         raise SystemExit("mksysfs: --flash needs -p PORT")
 
-    flash = [sys.executable, "-m", "esptool", "--chip", "esp32",
+    flash = [sys.executable, "-m", "esptool", "--chip", chip,
              "-p", args.port, "-b", str(args.baud),
              "--before", "default_reset", "--after", "hard_reset",
              "write_flash", hex(offset), args.out]
