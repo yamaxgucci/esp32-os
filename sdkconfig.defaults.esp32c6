@@ -71,18 +71,40 @@ CONFIG_ARGON_APP_ARENA_KB=64
 # see [T-12] on the no-MMU trade - and not one it silently loses.
 CONFIG_ESP_SYSTEM_PMP_IDRAM_SPLIT=n
 
-# Wi-Fi, and only Wi-Fi.
+# Both radios, and the Bluetooth half is written differently here on purpose.
 #
-# The radio is a 802.11ax part and ESP-IDF's API for it is the same one the
-# other two targets use, so api->net needed nothing.  Bluetooth is deliberately
-# absent from this first image: the C6's controller is not the ESP32's, none of
-# the CONFIG_BTDM_* switches in sdkconfig.defaults.esp32 exist here, and adding
-# a radio nobody has asked for yet is a way to fail a bring-up for a reason that
-# has nothing to do with the board.
+# The Wi-Fi is 802.11ax and ESP-IDF's API for it is the one the other two
+# targets already use, so api->net needed nothing at all.
+#
+# Bluetooth is where the two families part.  The ESP32 has a combined BR/EDR +
+# BLE controller and a menu to pick a mode with (CONFIG_BTDM_CTRL_MODE_*); this
+# part has a BLE-only controller and none of those symbols exist.  Setting them
+# here would not be an error - kconfiglib shrugs at an unknown name - it would
+# just be four lines that do nothing, which is worse than absent because
+# somebody would later read them as configuration.  So the list is short:
+# enable the controller, enable NimBLE, and name the roles the system uses.
 CONFIG_ARGON_ENABLE_NET=y
 CONFIG_ARGON_NET_WIFI=y
-CONFIG_ARGON_ENABLE_BLE=n
 CONFIG_ETH_USE_OPENETH=n
+
+CONFIG_ARGON_ENABLE_BLE=y
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_NIMBLE_ROLE_CENTRAL=y
+CONFIG_BT_NIMBLE_ROLE_OBSERVER=y
+# Peripheral is on, and not by choice: the whole of ESP-IDF's NimBLE HID *host*
+# is behind BT_NIMBLE_HID_SERVICE, whose menu depends on the GATT *server*.
+CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
+CONFIG_BT_NIMBLE_ROLE_BROADCASTER=n
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
+CONFIG_BT_NIMBLE_GATT_SERVER=y
+CONFIG_BT_NIMBLE_HID_SERVICE=y
+# A keyboard is bonded once and remembered.  Without this it asks to be paired
+# again after every power cut - and pairing is done from a keyboard.
+CONFIG_BT_NIMBLE_NVS_PERSIST=y
+# One antenna, two radios: without this the two take turns badly rather than
+# politely, and it shows up as a scan that finds nothing while Wi-Fi is joined.
+CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y
 
 # Monitor mode and raw injection, as on the other radio board.
 CONFIG_ARGON_NET_WIFI_MON=y

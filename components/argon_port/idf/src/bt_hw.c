@@ -27,7 +27,15 @@
 #include "esp_hidh.h"
 #include "esp_hidh_nimble.h"
 #include "esp_log.h"
-#include "esp_nimble_hci.h"
+/*
+ * esp_nimble_hci.h is deliberately absent.  It was here, and it was never used:
+ * the one thing this file wants from that area is esp_nimble_init(), which is
+ * declared in nimble/nimble_port.h below.  The header exists on the parts whose
+ * controller talks to NimBLE over a VHCI shim (the ESP32, the S3) and does not
+ * exist at all on the ones where the host is linked straight to the controller
+ * - the C6 among them, where the build stopped on it.  An unused include that
+ * only some chips have is a portability trap and not a dependency.
+ */
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
