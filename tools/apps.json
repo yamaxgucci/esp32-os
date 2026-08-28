@@ -147,6 +147,8 @@
     },
 
     { "out": "GFXPIX.AXE", "group": "board", "src": ["apps/gfxpix/gfxpix.c"] },
+
+    { "out": "XIPBENCH.AXE", "src": ["apps/xipbench/xipbench.c"] },
     { "out": "MIDIPAD.AXE", "group": "board", "src": ["apps/midipad/midipad.c"] },
     {
       "out": "ILI9341.SYS", "group": "board",
