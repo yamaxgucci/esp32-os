@@ -180,10 +180,55 @@ typedef struct {
     int                    W, H;
 } mrd_view_t;
 
+/*
+ * How tall a menu button is on a surface this tall.
+ *
+ * It used to be MRD_BTN_H flat - 36 pixels, chosen against the 320x240 panel
+ * the upstream draws on.  On anything shorter the arithmetic is brutal: a
+ * 160x120 surface fits (120-20)/39 = 2 buttons, and the C6 board's 160x86 fits
+ * exactly one.  A menu showing one item is not a menu; it is a very slow way of
+ * reading a list.
+ *
+ * So the designed height is kept while four buttons still fit under the status
+ * bar, and below that the button shrinks to whatever divides the space four
+ * ways - with a floor at the font.  A 16-pixel glyph with a pixel of air above
+ * and below inside its frame is 20, and cropping the label to gain a row is not
+ * a trade worth making: the label is the entire content of the button.
+ *
+ * The gap closes first, before the button does.  Three pixels between buttons
+ * is decoration; on a short surface those pixels are a whole extra item.
+ */
+#define MRD_BTN_WANT_VISIBLE 4
+#define MRD_BTN_MIN_H (MRD_GLYPH_H * MRD_LABEL_SCALE + 4)
+
+static int btn_gap_for(int H)
+{
+    const int roomy = (H - MRD_STATUS_H) / (MRD_BTN_H + MRD_BTN_GAP);
+    return (roomy >= MRD_BTN_WANT_VISIBLE) ? MRD_BTN_GAP : 1;
+}
+
+static int btn_h_for(int H)
+{
+    const int gap = btn_gap_for(H);
+    if (gap == MRD_BTN_GAP) {
+        return MRD_BTN_H; /* room to spare: leave the upstream's proportions */
+    }
+    int h = (H - MRD_STATUS_H) / MRD_BTN_WANT_VISIBLE - gap;
+    if (h < MRD_BTN_MIN_H) {
+        h = MRD_BTN_MIN_H;
+    }
+    if (h > MRD_BTN_H) {
+        h = MRD_BTN_H;
+    }
+    return h;
+}
+
+static int btn_pitch(int H) { return btn_h_for(H) + btn_gap_for(H); }
+
 /* Buttons visible = however many fit under the status bar. */
 static int visible_count(int H)
 {
-    int n = (H - MRD_STATUS_H) / (MRD_BTN_H + MRD_BTN_GAP);
+    int n = (H - MRD_STATUS_H) / btn_pitch(H);
     return n < 1 ? 1 : n;
 }
 
@@ -194,12 +239,12 @@ static int list_width(int W, bool scrollbar)
 }
 
 /* The i-th visible button's rectangle (i is a slot 0..nvis-1). */
-static void slot_rect(int i, int listw, int *x, int *y, int *w, int *h)
+static void slot_rect(int i, int listw, int H, int *x, int *y, int *w, int *h)
 {
     *x = 3;
     *w = listw - 6;
-    *y = MRD_STATUS_H + MRD_BTN_GAP + i * (MRD_BTN_H + MRD_BTN_GAP);
-    *h = MRD_BTN_H;
+    *y = MRD_STATUS_H + btn_gap_for(H) + i * btn_pitch(H);
+    *h = btn_h_for(H);
 }
 
 /* The scrollbar thumb rectangle for the current view (only meaningful when
@@ -265,7 +310,7 @@ static void paint_menu(mrd_band_t *b, void *ctx)
             break;
         }
         int x, y, w, h;
-        slot_rect(i, listw, &x, &y, &w, &h);
+        slot_rect(i, listw, v->H, &x, &y, &w, &h);
 
         uint16_t color;
         bool     is_back, is_sub;
@@ -389,7 +434,7 @@ static int hit_button(const mrd_view_t *v, int px, int py, bool *back, int *seek
             break;
         }
         int x, y, w, h;
-        slot_rect(i, listw, &x, &y, &w, &h);
+        slot_rect(i, listw, v->H, &x, &y, &w, &h);
         if (px >= x && px < x + w && py >= y && py < y + h) {
             return bi;
         }
@@ -500,7 +545,7 @@ void mrd_menu_run(mrd_disp_t *d)
 
         int  activate = -2; /* -2 none, -1 back, >=0 button */
         bool quit = false;
-        const int pitch = MRD_BTN_H + MRD_BTN_GAP;
+        const int pitch = btn_pitch(v.H);
         int maxs = v.total - v.nvis;
         if (maxs < 0) {
             maxs = 0;
