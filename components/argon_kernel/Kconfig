@@ -294,6 +294,21 @@ menu "ArgonOS"
             work on networks you are allowed to touch.  Not verifiable in QEMU,
             which models no radio.
 
+    config ARGON_NET_SNTP
+        bool "SNTP time sync (date sync)"
+        depends on ARGON_ENABLE_NET
+        default y
+        help
+            Set the clock from a network time server.  `date sync [server]`
+            queries SNTP and sets the system time, after which `date` and an
+            application's ag_get_datetime return real time instead of seconds
+            since boot.  One-shot: it does not keep a client running.
+
+            Depends only on the socket API, not on the radio, so it is verified
+            in QEMU against an SNTP responder on the host (10.0.2.2:123) as well
+            as on a board over Wi-Fi.  Small - the SNTP client is a few hundred
+            bytes and runs only while a sync is in flight.
+
     config ARGON_BOARD_PROBE
         bool "Board probe instead of the system"
         default n
