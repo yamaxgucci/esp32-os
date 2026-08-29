@@ -6,8 +6,8 @@
  * Being written in milestones, each testable with a real `ssh` client:
  *   1. transport: version exchange + KEXINIT negotiation      done
  *   2. curve25519 key exchange, ecdsa host key, aes+hmac, NEWKEYS   done
- *   3. userauth (password)                                    <- here now
- *   4. a session channel wired to the console (like telnet)
+ *   3. userauth (password)                                    done
+ *   4. a session channel wired to the console (like telnet)   done
  *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */

@@ -11,14 +11,19 @@
  *     authenticated (encrypt-and-MAC, the MAC over the sequence number and the
  *     cleartext packet, RFC 4253 sec 6.4).
  *
- * At the end the encrypted channel is proven live by reading the client's
- * SERVICE_REQUEST and answering SERVICE_ACCEPT.  Authentication (a real login)
- * and the session channel are the next milestones; for now the connection stops
- * there.  A real `ssh -v` reaches "SSH2_MSG_NEWKEYS received" and then waits for
- * the userauth banner, which is the expected end of milestone 2.
+ * Milestone 3 adds password authentication (RFC 4252) and milestone 4 the
+ * session channel (RFC 4254): once a login succeeds the client opens a session,
+ * asks for a shell, and that channel is wired straight to the shared console -
+ * so `ssh root@board` lands at the same prompt as the UART or telnet.
  *
  * All the maths is behind argon/port/crypto.h - the kernel does the protocol,
  * the port does the primitives on mbedTLS.
+ *
+ * Flow control is deliberately simple: we advertise a large receive window and
+ * top it up as the client spends it, and we honour the client's window on our
+ * output but never block the console waiting for it - a shell's traffic never
+ * approaches a megabyte between the client's window updates, so nothing is lost
+ * in practice; a pathological flood of output could drop the overflow.
  *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
@@ -31,6 +36,7 @@
 #include <string.h>
 
 #include <argon/cfg.h>
+#include <argon/console.h>
 #include <argon/log.h>
 #include <argon/vfs.h>
 
@@ -38,6 +44,7 @@
 #include <argon/port/mem.h>
 #include <argon/port/net.h>
 #include <argon/port/random.h>
+#include <argon/port/sync.h>
 #include <argon/port/task.h>
 #include <argon/port/time.h>
 
@@ -58,8 +65,30 @@
 #define SSH_MSG_USERAUTH_REQUEST 50
 #define SSH_MSG_USERAUTH_FAILURE 51
 #define SSH_MSG_USERAUTH_SUCCESS 52
+#define SSH_MSG_GLOBAL_REQUEST   80
+#define SSH_MSG_REQUEST_SUCCESS  81
+#define SSH_MSG_REQUEST_FAILURE  82
+#define SSH_MSG_CHANNEL_OPEN              90
+#define SSH_MSG_CHANNEL_OPEN_CONFIRMATION 91
+#define SSH_MSG_CHANNEL_OPEN_FAILURE      92
+#define SSH_MSG_CHANNEL_WINDOW_ADJUST     93
+#define SSH_MSG_CHANNEL_DATA              94
+#define SSH_MSG_CHANNEL_EOF               96
+#define SSH_MSG_CHANNEL_CLOSE             97
+#define SSH_MSG_CHANNEL_REQUEST           98
+#define SSH_MSG_CHANNEL_SUCCESS           99
+#define SSH_MSG_CHANNEL_FAILURE          100
 
 #define SSH_MAX_AUTH_TRIES 6 /* before the connection is dropped */
+
+/* Channel flow control.  We advertise a large receive window and top it back up
+ * as the client spends it; our data chunks stay well under any client's maximum
+ * packet.  A shell's traffic is tiny, so this is generous rather than tuned. */
+#define SSH_WINDOW_INITIAL 0x100000u /* 1 MiB advertised to the client */
+#define SSH_WINDOW_LOW     0x080000u /* top up when it falls below here */
+#define SSH_OUR_MAX_PACKET 8192u
+#define SSH_DATA_CHUNK     1024u     /* bytes of console output per DATA packet */
+#define SSH_IN_RING        2048u     /* keystrokes waiting for the console */
 
 #define SSH_MAX_PACKET   4096 /* handshake and control packets are small */
 #define SSH_HOSTKEY_PATH "/sys/SSH_HOST.KEY"
@@ -123,6 +152,21 @@ typedef struct {
     uint8_t     msg[SSH_MAX_PACKET];
     uint8_t    *rx; /* internal DMA RAM, 4 + SSH_MAX_PACKET + 16 */
     uint8_t    *tx; /* internal DMA RAM, 4 + SSH_MAX_PACKET + 16 */
+
+    /* Session channel (M4).  The ssh_task drives the packet loop; the console
+     * task calls the transport write/read below.  send_lock serialises every
+     * write_packet across the two tasks; io_lock guards the input ring. */
+    bool            ch_open;
+    volatile bool   ch_gone; /* the channel has ended; the console must detach */
+    uint32_t        ch_peer; /* the client's channel number (our recipient)    */
+    uint32_t        send_window; /* bytes we may still send to the client      */
+    uint32_t        recv_window; /* bytes the client may still send us         */
+    ag_port_mutex_t send_lock;
+    ag_port_mutex_t io_lock;
+    size_t          in_head;
+    size_t          in_tail;
+    uint8_t         in_ring[SSH_IN_RING];
+    uint8_t         wpay[16 + SSH_DATA_CHUNK]; /* build one DATA payload (send_lock) */
 } ssh_conn_t;
 
 #define SSH_RECORD_BUF (4 + SSH_MAX_PACKET + 16)
@@ -233,6 +277,17 @@ static uint8_t rb_byte(rbuf_t *r)
         return 0;
     }
     return r->p[r->pos++];
+}
+
+static uint32_t rb_u32_read(rbuf_t *r)
+{
+    if (r->pos + 4 > r->len) {
+        r->err = true;
+        return 0;
+    }
+    const uint32_t v = rd_u32(r->p + r->pos);
+    r->pos += 4;
+    return v;
 }
 
 /* An SSH string: returns a pointer into the buffer and its length; advances. */
@@ -386,7 +441,8 @@ static int32_t read_packet(ssh_conn_t *c, uint8_t *out, size_t cap)
 }
 
 /* Send one packet.  Block size 8 in the clear, 16 once the cipher is on. */
-static ag_err_t write_packet(ssh_conn_t *c, const uint8_t *payload, size_t len)
+static ag_err_t write_packet_raw(ssh_conn_t *c, const uint8_t *payload,
+                                 size_t len)
 {
     const size_t block = c->enc_out ? 16 : 8;
     size_t       need = 4 + 1 + len;
@@ -424,6 +480,24 @@ static ag_err_t write_packet(ssh_conn_t *c, const uint8_t *payload, size_t len)
     }
     if (e == AG_OK) {
         c->seq_out++;
+    }
+    return e;
+}
+
+/*
+ * The public sender.  Once the session channel is up, the console task sends
+ * channel data while the ssh_task sends control packets, so every send is
+ * serialised here - the cipher counter and sequence number are single-writer.
+ * Before then send_lock is NULL and this is a straight call.
+ */
+static ag_err_t write_packet(ssh_conn_t *c, const uint8_t *payload, size_t len)
+{
+    if (c->send_lock != NULL) {
+        ag_port_mutex_take(c->send_lock, AG_PORT_FOREVER);
+    }
+    const ag_err_t e = write_packet_raw(c, payload, len);
+    if (c->send_lock != NULL) {
+        ag_port_mutex_give(c->send_lock);
     }
     return e;
 }
@@ -791,6 +865,294 @@ static bool do_userauth(ssh_conn_t *c)
     return false;
 }
 
+/* ---- the session channel ----------------------------------------------- */
+
+/* Small control packets: byte + one channel number. */
+static ag_err_t send_channel_u32(ssh_conn_t *c, uint8_t type, uint32_t chan)
+{
+    uint8_t b[8];
+    wbuf_t  w;
+    wb_init(&w, b, sizeof(b));
+    wb_byte(&w, type);
+    wb_u32(&w, chan);
+    return write_packet(c, b, w.len);
+}
+
+/*
+ * The console transport.  write() and read() are called on the console task;
+ * the ssh_task runs do_session() below at the same time.  send_lock serialises
+ * every write_packet across the two; io_lock guards the input ring.
+ */
+
+static int32_t ssh_ch_write(void *ctx, const char *data, size_t len)
+{
+    ssh_conn_t *c = (ssh_conn_t *)ctx;
+    if (!c->ch_open || c->ch_gone) {
+        return 0;
+    }
+    size_t off = 0;
+    while (off < len) {
+        ag_port_mutex_take(c->send_lock, AG_PORT_FOREVER);
+        size_t chunk = len - off;
+        if (chunk > SSH_DATA_CHUNK) {
+            chunk = SSH_DATA_CHUNK;
+        }
+        if (chunk > c->send_window) {
+            chunk = c->send_window; /* never overrun the client's window */
+        }
+        if (chunk == 0) {
+            ag_port_mutex_give(c->send_lock);
+            break; /* window spent; the rest is dropped (see file header note) */
+        }
+        wbuf_t w;
+        wb_init(&w, c->wpay, sizeof(c->wpay));
+        wb_byte(&w, SSH_MSG_CHANNEL_DATA);
+        wb_u32(&w, c->ch_peer);
+        wb_u32(&w, (uint32_t)chunk);
+        wb_bytes(&w, data + off, chunk);
+        const ag_err_t e = w.ovf ? -AG_ERANGE : write_packet_raw(c, c->wpay, w.len);
+        if (e == AG_OK) {
+            c->send_window -= (uint32_t)chunk;
+        }
+        ag_port_mutex_give(c->send_lock);
+        if (e != AG_OK) {
+            break;
+        }
+        off += chunk;
+    }
+    return (int32_t)off;
+}
+
+static int32_t ssh_ch_read(void *ctx, uint8_t *buf, size_t len)
+{
+    ssh_conn_t *c = (ssh_conn_t *)ctx;
+    if (c->ch_gone) {
+        return -1; /* the channel has ended: the console detaches us */
+    }
+    size_t n = 0;
+    ag_port_mutex_take(c->io_lock, AG_PORT_FOREVER);
+    while (n < len && c->in_tail != c->in_head) {
+        buf[n++] = c->in_ring[c->in_tail];
+        c->in_tail = (c->in_tail + 1) % SSH_IN_RING;
+    }
+    ag_port_mutex_give(c->io_lock);
+    return (int32_t)n; /* 0 means nothing right now, still alive */
+}
+
+static void ssh_ch_close(void *ctx)
+{
+    ssh_conn_t *c = (ssh_conn_t *)ctx;
+    c->ch_gone = true; /* the ssh_task owns the fd; just mark the channel */
+}
+
+static const ag_con_transport_t k_ssh_transport = {
+    .name = "ssh",
+    .write = ssh_ch_write,
+    .read = ssh_ch_read,
+    .close = ssh_ch_close,
+};
+
+/* CHANNEL_OPEN: only "session" is accepted, and only one at a time. */
+static void on_channel_open(ssh_conn_t *c, const uint8_t *pl, size_t len)
+{
+    rbuf_t r;
+    rb_init(&r, pl + 1, len - 1);
+    uint32_t       tl = 0;
+    const uint8_t *type = rb_string(&r, &tl);
+    const uint32_t peer = rb_u32_read(&r);
+    const uint32_t peer_win = rb_u32_read(&r);
+    (void)rb_u32_read(&r); /* peer max packet: we chunk well under it */
+    if (r.err) {
+        return;
+    }
+    const bool is_session = (tl == 7 && memcmp(type, "session", 7) == 0);
+    if (!is_session || c->ch_open) {
+        uint8_t b[32];
+        wbuf_t  w;
+        wb_init(&w, b, sizeof(b));
+        wb_byte(&w, SSH_MSG_CHANNEL_OPEN_FAILURE);
+        wb_u32(&w, peer);
+        wb_u32(&w, 1); /* SSH_OPEN_ADMINISTRATIVELY_PROHIBITED */
+        wb_cstr(&w, is_session ? "one session only" : "session only");
+        wb_cstr(&w, "");
+        (void)write_packet(c, b, w.len);
+        return;
+    }
+    c->ch_peer = peer;
+    c->send_window = peer_win;
+    c->ch_open = true;
+
+    uint8_t b[32];
+    wbuf_t  w;
+    wb_init(&w, b, sizeof(b));
+    wb_byte(&w, SSH_MSG_CHANNEL_OPEN_CONFIRMATION);
+    wb_u32(&w, peer);               /* recipient: the client's channel */
+    wb_u32(&w, 0);                  /* our channel number (only one)   */
+    wb_u32(&w, c->recv_window);     /* how much the client may send us */
+    wb_u32(&w, SSH_OUR_MAX_PACKET);
+    (void)write_packet(c, b, w.len);
+}
+
+/* CHANNEL_REQUEST: pty-req and window-change are accepted quietly; "shell" (or
+ * "exec") attaches the console.  Returns true once a shell is running. */
+static bool on_channel_request(ssh_conn_t *c, const uint8_t *pl, size_t len,
+                               bool *attached)
+{
+    rbuf_t r;
+    rb_init(&r, pl + 1, len - 1);
+    (void)rb_u32_read(&r); /* recipient channel: we have only one */
+    uint32_t       tl = 0;
+    const uint8_t *type = rb_string(&r, &tl);
+    const uint8_t  want_reply = rb_byte(&r);
+    if (r.err || !c->ch_open) {
+        return false;
+    }
+
+    bool ok = false;
+    bool start_shell = false;
+    if (tl == 7 && memcmp(type, "pty-req", 7) == 0) {
+        ok = true; /* the shared console has its own size; we accept the pty */
+    } else if (tl == 13 && memcmp(type, "window-change", 13) == 0) {
+        ok = true; /* size change: the console is not per-endpoint, so noted only */
+    } else if ((tl == 5 && memcmp(type, "shell", 5) == 0) ||
+               (tl == 4 && memcmp(type, "exec", 4) == 0)) {
+        ok = true;
+        start_shell = !*attached;
+    }
+
+    if (want_reply) {
+        (void)send_channel_u32(c, ok ? SSH_MSG_CHANNEL_SUCCESS
+                                     : SSH_MSG_CHANNEL_FAILURE,
+                               c->ch_peer);
+    }
+    if (start_shell) {
+        if (ag_console_attach(&k_ssh_transport, c) == AG_OK) {
+            *attached = true;
+            ag_log(AG_LOG_INFO, "ssh", "shell channel attached to the console");
+        }
+    }
+    return start_shell;
+}
+
+/* CHANNEL_DATA: the client's keystrokes go to the input ring, and its window is
+ * topped back up as it is spent. */
+static void on_channel_data(ssh_conn_t *c, const uint8_t *pl, size_t len)
+{
+    rbuf_t r;
+    rb_init(&r, pl + 1, len - 1);
+    (void)rb_u32_read(&r); /* recipient */
+    uint32_t       dl = 0;
+    const uint8_t *data = rb_string(&r, &dl);
+    if (r.err || !c->ch_open) {
+        return;
+    }
+
+    ag_port_mutex_take(c->io_lock, AG_PORT_FOREVER);
+    for (uint32_t i = 0; i < dl; i++) {
+        const size_t next = (c->in_head + 1) % SSH_IN_RING;
+        if (next == c->in_tail) {
+            break; /* ring full: drop (flow control should prevent this) */
+        }
+        c->in_ring[c->in_head] = data[i];
+        c->in_head = next;
+    }
+    ag_port_mutex_give(c->io_lock);
+
+    c->recv_window = (dl < c->recv_window) ? c->recv_window - dl : 0;
+    if (c->recv_window < SSH_WINDOW_LOW) {
+        const uint32_t add = SSH_WINDOW_INITIAL - c->recv_window;
+        uint8_t        b[16];
+        wbuf_t         w;
+        wb_init(&w, b, sizeof(b));
+        wb_byte(&w, SSH_MSG_CHANNEL_WINDOW_ADJUST);
+        wb_u32(&w, c->ch_peer);
+        wb_u32(&w, add);
+        if (write_packet(c, b, w.len) == AG_OK) {
+            c->recv_window += add;
+        }
+    }
+}
+
+/*
+ * The connection channel service (RFC 4254), entered once a login succeeds.
+ * Opens one session channel, wires it to the shared console, and pumps packets
+ * until the client closes it or the link drops.
+ */
+static void do_session(ssh_conn_t *c)
+{
+    bool attached = false;
+
+    c->send_lock = ag_port_mutex_new();
+    c->io_lock = ag_port_mutex_new();
+    if (c->send_lock == NULL || c->io_lock == NULL) {
+        ag_log(AG_LOG_ERROR, "ssh", "no memory for channel locks");
+        goto out;
+    }
+    c->recv_window = SSH_WINDOW_INITIAL;
+    c->in_head = 0;
+    c->in_tail = 0;
+
+    for (;;) {
+        const int32_t n = read_packet(c, c->msg, sizeof(c->msg));
+        if (n < 1) {
+            break; /* the client hung up or the link broke */
+        }
+        const uint8_t type = c->msg[0];
+        if (type == SSH_MSG_CHANNEL_DATA) {
+            on_channel_data(c, c->msg, (size_t)n);
+        } else if (type == SSH_MSG_CHANNEL_REQUEST) {
+            (void)on_channel_request(c, c->msg, (size_t)n, &attached);
+        } else if (type == SSH_MSG_CHANNEL_OPEN) {
+            on_channel_open(c, c->msg, (size_t)n);
+        } else if (type == SSH_MSG_CHANNEL_WINDOW_ADJUST) {
+            rbuf_t r;
+            rb_init(&r, c->msg + 1, (size_t)n - 1);
+            (void)rb_u32_read(&r);
+            const uint32_t add = rb_u32_read(&r);
+            if (!r.err) {
+                ag_port_mutex_take(c->send_lock, AG_PORT_FOREVER);
+                c->send_window += add;
+                ag_port_mutex_give(c->send_lock);
+            }
+        } else if (type == SSH_MSG_CHANNEL_EOF) {
+            /* The client will send no more; we may still be writing output. */
+        } else if (type == SSH_MSG_CHANNEL_CLOSE) {
+            if (c->ch_open) {
+                (void)send_channel_u32(c, SSH_MSG_CHANNEL_CLOSE, c->ch_peer);
+                c->ch_open = false;
+            }
+            break;
+        } else if (type == SSH_MSG_GLOBAL_REQUEST) {
+            rbuf_t r;
+            rb_init(&r, c->msg + 1, (size_t)n - 1);
+            uint32_t       nl = 0;
+            (void)rb_string(&r, &nl);
+            const uint8_t want_reply = rb_byte(&r);
+            if (!r.err && want_reply) {
+                const uint8_t f = SSH_MSG_REQUEST_FAILURE;
+                (void)write_packet(c, &f, 1);
+            }
+        } else if (type == SSH_MSG_DISCONNECT) {
+            break;
+        }
+        /* anything else: ignored, as the RFC allows for unknown channel refs */
+    }
+
+out:
+    c->ch_gone = true;
+    if (attached) {
+        ag_console_detach(c); /* on the console lock; no more write/read after */
+    }
+    if (c->send_lock != NULL) {
+        ag_port_mutex_free(c->send_lock);
+        c->send_lock = NULL;
+    }
+    if (c->io_lock != NULL) {
+        ag_port_mutex_free(c->io_lock);
+        c->io_lock = NULL;
+    }
+}
+
 /* ---- one connection ---------------------------------------------------- */
 
 static void handle_connection(ssh_conn_t *c)
@@ -860,11 +1222,9 @@ static void handle_connection(ssh_conn_t *c)
         return;
     }
 
-    /* Authenticate.  The session channel that a success opens onto is the next
-     * milestone; for now a logged-in connection stops here. */
+    /* Authenticate, then run the session channel: a shell over the console. */
     if (do_userauth(c)) {
-        ag_log(AG_LOG_INFO, "ssh",
-               "session authenticated; the shell channel is the next step");
+        do_session(c);
     }
 }
 
@@ -901,6 +1261,12 @@ static void conn_free(ssh_conn_t *c)
     }
     if (c->c_out != NULL) {
         ag_crypto_aes_ctr_free(c->c_out);
+    }
+    if (c->send_lock != NULL) {
+        ag_port_mutex_free(c->send_lock);
+    }
+    if (c->io_lock != NULL) {
+        ag_port_mutex_free(c->io_lock);
     }
     ag_port_free(c->rx);
     ag_port_free(c->tx);
