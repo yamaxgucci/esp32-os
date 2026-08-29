@@ -7,7 +7,7 @@ That was enough for C. C++ needs four things more, and they are here:
 |---|---|
 | `cxx_rt.cpp` | `ag_main`: runs the constructors, calls `ag_cxx_main`, runs the destructors. `operator new`/`delete` over the process arena. `__cxa_atexit`, the local-static guards, `__dso_handle`, `__cxa_pure_virtual` |
 | `cxx_throw.cpp` | `std::__throw_*` → panic. Link only with the STL, and **before** `-lstdc++` |
-| `cxx_hosted.c` | `pthread_mutex_*` over real ArgonOS mutexes, per-thread keys, `__getreent`. Link only with the STL |
+| `cxx_hosted.c` | `pthread_mutex_*` over real ArgonOS mutexes, per-thread keys, `pthread_once`, `__getreent`. Link only with the STL |
 | `ag_cxx.h` | The one-line contract: an app writes `ag_cxx_main`, not `ag_main` |
 
 ## Writing one
@@ -71,6 +71,11 @@ that works.
 shim's `strlen` as `strlen` and compiles it into a call to itself; the image
 loads, prints nothing, and hangs. This has now cost two people an afternoon.
 
+The shim also says so when it runs out of arena. A failed `malloc` is the
+quietest failure there is - a vendored engine checks the pointer, abandons
+whatever it was doing, and reports something unrelated three layers up - so the
+first one prints the size asked for and what was left.
+
 ## What is missing, and why
 
 **Exceptions.** Unwinding needs `.eh_frame` and a personality routine out of
@@ -87,8 +92,17 @@ in an arena measured in tens of kilobytes.
 **RTTI.** `-fno-rtti`, for the same kind of reason. `dynamic_cast` and
 `typeid` need typeinfo objects the linker cannot fold.
 
-**iostreams.** Not linked and not wanted: `std::cout` drags in the locale
-machinery, which is most of the size of libstdc++. Use `ag_printf`.
+**iostreams.** Not wanted: one `std::ofstream` anywhere in an image pulls in
+`fstream-inst.o`, and behind it `ios.o`, `locale_init.o`, `locale-inst.o`, the
+typeinfo objects and `__cxa_allocate_exception` - most of the size of
+libstdc++, and with it newlib's stdio and its string-to-number conversions,
+which collide with the shim's. Use `ag_printf`.
+
+It is not always avoidable: `apps/fallout` has to carry it, because Fallout 2
+uses `std::ofstream` in one file and `std::random_device` in another. Its
+`build.py` shows what that costs and how to link it anyway - link once, read
+which symbols collided, check that ours were defined first, and only then
+retry with `--allow-multiple-definition`.
 
 **Thread-safe statics across threads.** `__cxa_guard_acquire` does not lock -
 see the comment in `cxx_rt.cpp`. Statics initialised on the thread that starts

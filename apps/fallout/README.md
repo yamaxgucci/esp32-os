@@ -179,12 +179,21 @@ python apps/fallout/build.py --game 2 --arena-kb 12000
 ```
 
 ```
-argon sync build\fo2_card -SizeMB 1024
+argon sync build\fo2_card -SizeMB 1024 -Image build\fo2card.img
 ```
 
 ```
-argon test -Sd -Psram 16 "run a:\fallout2.axe"
+argon test -Sd -SdImage build\fo2card.img -Psram 16 "run a:\fallout2.axe"
 ```
+
+The game gets a card image of its own rather than the default
+`build\sdcard.img`. Not tidiness: the game runs for minutes, `argon sync` for
+anything else rewrites that file underneath the emulator, and the run then does
+nothing at all with no indication why. Half an hour went into a run that had
+had its card replaced mid-flight.
+
+`-Image` rather than `-Out`, which PowerShell binds to its own common
+parameters before the script sees it.
 
 Three things there are not decoration:
 

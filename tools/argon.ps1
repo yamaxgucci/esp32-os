@@ -232,7 +232,11 @@ switch ($Command.ToLowerInvariant()) {
         # idf-env often puts a working Python on PATH (avoids the Store stub).
         Initialize-Environment
         if ($Rest.Count -lt 1) {
-            Write-Host 'Usage: argon sync <host-folder> [-SizeMB 64] [-Out build\sdcard.img]'
+            # -Image, not -Out: PowerShell binds -Out to its own common
+            # parameters before this script sees it, and the error it gives is
+            # "AmbiguousParameter" with no hint that the option was ours.  -Out
+            # still works when it survives that far.
+            Write-Host 'Usage: argon sync <host-folder> [-SizeMB 64] [-Image build\sdcard.img]'
             exit 1
         }
         $dir = $Rest[0]
@@ -241,7 +245,8 @@ switch ($Command.ToLowerInvariant()) {
         for ($i = 1; $i -lt $Rest.Count; $i++) {
             if ($Rest[$i] -match '^(?i)-SizeMB$' -and ($i + 1) -lt $Rest.Count) {
                 $sizeMb = [int]$Rest[$i + 1]; $i++
-            } elseif ($Rest[$i] -match '^(?i)-Out$' -and ($i + 1) -lt $Rest.Count) {
+            } elseif ($Rest[$i] -match '^(?i)-(Out|Image)$' -and
+                      ($i + 1) -lt $Rest.Count) {
                 $out = $Rest[$i + 1]; $i++
             } elseif ($Rest[$i] -like '-*') {
                 throw "Unknown sync option: $($Rest[$i])"
