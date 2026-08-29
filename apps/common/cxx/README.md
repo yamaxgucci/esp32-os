@@ -104,6 +104,18 @@ uses `std::ofstream` in one file and `std::random_device` in another. Its
 which symbols collided, check that ours were defined first, and only then
 retry with `--allow-multiple-definition`.
 
+**A non-recursive mutex.** Every `pthread_mutex_t` here is recursive, because
+the attribute that would have said so does not survive: newlib's pthreads have
+no `pthread_mutexattr_settype`, so `std::recursive_mutex` arrives looking
+exactly like `std::mutex`. Taking it twice on one thread then stops the program
+- not fails, stops, with nothing in the log. Fallout 2's audio engine does
+exactly that, and the game reached its main menu, started the background music
+and went quiet. `CXXSTL` checks both kinds now.
+
+The direction is deliberate. A `std::mutex` that is recursive when it should
+not be fails to catch somebody's mistake; a `recursive_mutex` that is not
+recursive deadlocks.
+
 **Thread-safe statics across threads.** `__cxa_guard_acquire` does not lock -
 see the comment in `cxx_rt.cpp`. Statics initialised on the thread that starts
 the program, which is every port so far, are safe. If that is not true of

@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <map>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -76,6 +77,33 @@ extern "C" int ag_cxx_main(int argc, char **argv)
     lut["ac"] = 5;
     check("std::map", lut.size() == 3 && lut["hp"] == 30 &&
                           lut.find("none") == lut.end());
+
+    /*
+     * A recursive mutex has to be recursive.  It maps onto whatever
+     * apps/common/cxx gives it, and if that is an ordinary mutex then taking
+     * it twice on one thread does not fail - it stops, forever, with no
+     * message.  Fallout 2's audio engine takes one twice, which is how this
+     * came to be checked.
+     *
+     * If this line is where the test stops, that is the answer.
+     */
+    ag_print("std::recursive_mutex, taken twice");
+    {
+        std::recursive_mutex m;
+        std::lock_guard<std::recursive_mutex> a(m);
+        std::lock_guard<std::recursive_mutex> b(m);
+        ag_print("\r");
+        check("std::recursive_mutex", true);
+    }
+
+    /* And the plain one, which must at least lock and unlock. */
+    {
+        std::mutex m;
+        m.lock();
+        m.unlock();
+        check("std::mutex", m.try_lock());
+        m.unlock();
+    }
 
     ag_printf("\n%d failure(s)\n", s_failures);
     return s_failures == 0 ? 0 : 1;

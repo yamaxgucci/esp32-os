@@ -46,45 +46,76 @@ struct _reent *__getreent(void) { return &s_reent; }
 /* ---- mutexes ------------------------------------------------------------- */
 
 /*
- * pthread_mutex_t is a 32-bit word here and ag_mutex_t is a pointer, so the
- * handle lives in the word itself and no table is needed.
+ * Every mutex here is recursive, and that is the whole point.
+ *
+ * std::recursive_mutex is a pthread mutex with an attribute set, and the
+ * attribute is the part that does not survive: newlib's pthreads have no
+ * settype for us to honour, so a recursive mutex arrives looking exactly like
+ * an ordinary one.  Take it twice on one thread and the program stops.  Not
+ * fails - stops, with no message and nothing in the log.  Fallout 2's audio
+ * engine takes one twice, and the game reached its main menu, started the
+ * background music, and went quiet.
+ *
+ * Making every mutex recursive is the safe direction.  A std::mutex that is
+ * recursive when it should not be fails to catch a mistake; a recursive_mutex
+ * that is not deadlocks.  CXXSTL checks both.
+ *
+ * ag_mutex_t is a pointer and pthread_mutex_t is a 32-bit word, so the word
+ * holds a pointer to this instead - the count and the owner have to live
+ * somewhere.
  *
  * A statically initialised mutex arrives as _PTHREAD_MUTEX_INITIALIZER with no
- * call to pthread_mutex_init, so the handle has to be made on first use.  Two
- * threads reaching an untouched static mutex at the same instant would make two
- * of them and one would be lost; that is the one race left here, it needs a
- * compare-and-swap the ABI does not offer yet, and libstdc++ only uses such a
- * mutex from the locale machinery, which this image does not have.
+ * call to pthread_mutex_init, so it has to be made on first use.  Two threads
+ * reaching an untouched static mutex at the same instant would make two of
+ * them and one would be lost; that is the one race left here, and closing it
+ * needs a compare-and-swap the ABI does not offer yet.
  */
 #define AG_PTHREAD_UNSET ((pthread_mutex_t)0xFFFFFFFFu)
 
-static ag_mutex_t handle_of(pthread_mutex_t *m)
+typedef struct {
+    ag_mutex_t  m;
+    ag_thread_t owner;
+    uint32_t    depth;
+} ag_pmutex_t;
+
+static ag_thread_t this_thread(void);
+
+static ag_pmutex_t *body_of(pthread_mutex_t *m)
 {
-    if (*m == AG_PTHREAD_UNSET || *m == 0) {
-        ag_mutex_t created = ag_mutex_create();
-        if (created == NULL) {
-            return NULL;
-        }
-        *m = (pthread_mutex_t)(uintptr_t)created;
+    if (*m != AG_PTHREAD_UNSET && *m != 0) {
+        return (ag_pmutex_t *)(uintptr_t)*m;
     }
-    return (ag_mutex_t)(uintptr_t)*m;
+
+    ag_pmutex_t *p = (ag_pmutex_t *)ag_malloc(sizeof(*p));
+    if (p == NULL) {
+        return NULL;
+    }
+    p->m = ag_mutex_create();
+    p->owner = NULL;
+    p->depth = 0;
+    if (p->m == NULL) {
+        ag_free(p);
+        return NULL;
+    }
+    *m = (pthread_mutex_t)(uintptr_t)p;
+    return p;
 }
 
 int pthread_mutex_init(pthread_mutex_t *m, const pthread_mutexattr_t *attr)
 {
+    /* The attribute is ignored because there is only one kind here, and it is
+     * the stronger one. */
     (void)attr;
-    ag_mutex_t created = ag_mutex_create();
-    if (created == NULL) {
-        return ENOMEM;
-    }
-    *m = (pthread_mutex_t)(uintptr_t)created;
-    return 0;
+    *m = AG_PTHREAD_UNSET;
+    return body_of(m) != NULL ? 0 : ENOMEM;
 }
 
 int pthread_mutex_destroy(pthread_mutex_t *m)
 {
     if (*m != AG_PTHREAD_UNSET && *m != 0) {
-        ag_mutex_delete((ag_mutex_t)(uintptr_t)*m);
+        ag_pmutex_t *p = (ag_pmutex_t *)(uintptr_t)*m;
+        ag_mutex_delete(p->m);
+        ag_free(p);
     }
     *m = AG_PTHREAD_UNSET;
     return 0;
@@ -92,23 +123,40 @@ int pthread_mutex_destroy(pthread_mutex_t *m)
 
 int pthread_mutex_lock(pthread_mutex_t *m)
 {
-    ag_mutex_t h = handle_of(m);
-    if (h == NULL) {
+    ag_pmutex_t *p = body_of(m);
+    if (p == NULL) {
         return ENOMEM;
+    }
+    const ag_thread_t me = this_thread();
+    if (p->depth != 0 && p->owner == me) {
+        ++p->depth;
+        return 0;
     }
     /* Forever: a lock that gives up is not a lock, and the caller has no way
      * to report the failure anyway. */
-    ag_mutex_lock(h, UINT32_MAX);
+    ag_mutex_lock(p->m, UINT32_MAX);
+    p->owner = me;
+    p->depth = 1;
     return 0;
 }
 
 int pthread_mutex_trylock(pthread_mutex_t *m)
 {
-    ag_mutex_t h = handle_of(m);
-    if (h == NULL) {
+    ag_pmutex_t *p = body_of(m);
+    if (p == NULL) {
         return ENOMEM;
     }
-    return ag_mutex_lock(h, 0) ? 0 : EBUSY;
+    const ag_thread_t me = this_thread();
+    if (p->depth != 0 && p->owner == me) {
+        ++p->depth;
+        return 0;
+    }
+    if (!ag_mutex_lock(p->m, 0)) {
+        return EBUSY;
+    }
+    p->owner = me;
+    p->depth = 1;
+    return 0;
 }
 
 int pthread_mutex_unlock(pthread_mutex_t *m)
@@ -116,7 +164,15 @@ int pthread_mutex_unlock(pthread_mutex_t *m)
     if (*m == AG_PTHREAD_UNSET || *m == 0) {
         return EINVAL;
     }
-    ag_mutex_unlock((ag_mutex_t)(uintptr_t)*m);
+    ag_pmutex_t *p = (ag_pmutex_t *)(uintptr_t)*m;
+    if (p->depth == 0) {
+        return EPERM;
+    }
+    if (--p->depth != 0) {
+        return 0;
+    }
+    p->owner = NULL;
+    ag_mutex_unlock(p->m);
     return 0;
 }
 

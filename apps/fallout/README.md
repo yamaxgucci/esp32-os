@@ -5,10 +5,15 @@
 reverse-engineered Fallout 1 and 2 — as ArgonOS `.AXE` images. Compiled for the
 ESP32-S3, running from flash XIP with the data in PSRAM.
 
-**Fallout 2 plays its opening cinematic on an ESP32-S3.** 2502 frames of
-`intro.mve` at 640×480, none dropped. Everything before it works: the 326 MB
-`MASTER.DAT` is opened off a FAT32 card, its 23120-entry index parsed, the art
-and protos and scripts loaded, the audio device opened.
+**Fallout 2 reaches its main menu on an ESP32-S3, and sits there in its attract
+loop.** Both opening movies play - 2502 frames of `intro.mve` at 640×480, none
+dropped - then the menu comes up with its music, waits, times out, and plays
+the intro again, exactly as the game does on a desk. The 326 MB `MASTER.DAT` is
+opened off a FAT32 card, its 23120-entry index parsed, the art and protos and
+scripts loaded, the audio device opened at 22 kHz.
+
+What has not been done is play it: that needs input through the menu, and
+`KBDVIRT`/`MOUSEVIRT` are not wired into this port yet.
 
 | | Fallout 1 | Fallout 2 |
 |---|---|---|
@@ -264,25 +269,27 @@ Which says the board this wants is one with an RGB panel, and that the CYD -
 ## Where the memory goes, and why 8 MB is not enough
 
 `-memstat N` makes the port print the arena's use and its high-water mark every
-N milliseconds. Measured on the way through `gameInit` to the opening movies:
+N milliseconds. Through `gameInit`, both movies and the main menu:
 
 ```
-[mem] 6770 KB used of 12000, peak 6770, largest free block 4992 KB
+[mem] 6770 KB used of 12000   during gameInit
+[mem] 7312 KB used of 12000   sitting in the main menu
+[mem] 8043 KB used of 12000   peak, replaying the intro
 ```
 
-That is before a map has been loaded, so it is a floor rather than the peak of
-a game in progress. Against it:
+Still a floor: no map has been loaded. Against it:
 
 | | |
 |---|---|
 | the image's own data, almost all bss | 1867 KB |
-| what the game had taken by the movies | 6770 KB |
-| **needed** | **8637 KB** |
+| peak the game reached | 8043 KB |
+| **needed** | **9910 KB** |
 | free on a part with 8 MB of PSRAM | 8040 KB |
 
-Short by about 600 KB in QEMU - and by about 1200 KB on a board, because QEMU
-lends the emulated panel's own memory for the framebuffer and a real 640×480
-panel takes its 600 KB out of the same PSRAM.
+Short by about 1900 KB - and by 2500 on a board, because QEMU lends the
+emulated panel's own memory for the framebuffer and a real 640×480 panel takes
+its 600 KB out of the same PSRAM. On a 16 MB part it is 9910 of 16384, with
+room for a map.
 
 Inside the arena:
 
@@ -318,9 +325,10 @@ The plausible savings, with what each costs to get:
   block for each of the 30240 entry paths, so a quarter of that memory is
   allocator headers. One block for all of them would recover it.
 
-About 800 KB in total, against a gap of 1200. It does not close, and every
-metre of it is paid for in patches against somebody else's engine. **A 16 MB
-module is the answer**; `argon test -Psram 16` is the same choice in QEMU.
+About 800 KB in total, against a gap of 2500. It does not close, it is not
+close to closing, and every metre of it is paid for in patches against somebody
+else's engine. **A 16 MB module is the answer**; `argon test -Psram 16` is the
+same choice in QEMU.
 
 Each `.DAT` entry is a descriptor plus a separately allocated path, and the
 index is read entry by entry - about 150000 small reads for the two of them,

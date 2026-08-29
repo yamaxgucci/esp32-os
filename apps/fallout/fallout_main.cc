@@ -74,6 +74,7 @@ int main(int argc, char **argv);
 extern "C" void sdl_shim_screenshot(const char *path, int after_frames,
                                     int after_ms);
 extern "C" void sdl_shim_memstat(int every_ms);
+extern "C" void sdl_shim_screenshot_now(void);
 
 static bool same(const char *a, const char *b)
 {
@@ -143,5 +144,11 @@ extern "C" int ag_cxx_main(int argc, char **argv)
         sdl_shim_screenshot(shot, frames, shot_ms);
     }
     sdl_shim_memstat(memstat_ms);
-    return main(out, argv);
+
+    const int rc = main(out, argv);
+
+    /* Whatever was on screen when it stopped, if a screenshot was asked for
+     * and its moment never came. */
+    sdl_shim_screenshot_now();
+    return rc;
 }

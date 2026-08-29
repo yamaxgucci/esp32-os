@@ -26,6 +26,7 @@ extern "C" bool sdl_shim_display(ag_gfxinfo_t *out);
 extern "C" void sdl_shim_screenshot(const char *path, int after_frames,
                                     int after_ms);
 extern "C" void sdl_shim_memstat(int every_ms);
+extern "C" void sdl_shim_screenshot_now(void);
 
 extern "C" {
 
@@ -232,10 +233,30 @@ static uint32_t s_memstat_ms;
 static uint32_t s_memstat_next;
 static size_t s_arena_low = (size_t)-1;
 
+static void write_ppm(const char *path);
+
 void sdl_shim_memstat(int every_ms)
 {
     s_memstat_ms = (uint32_t)(every_ms > 0 ? every_ms : 0);
     s_memstat_next = 0;
+}
+
+/*
+ * The picture that was on the screen when the game stopped.
+ *
+ * A screenshot armed for a deadline or a frame count never happens if the game
+ * ends before either arrives, and then there is nothing to look at and no way
+ * to tell where it got to.  Called from ag_cxx_main once main has returned,
+ * while the display is still ours.
+ */
+void sdl_shim_screenshot_now(void)
+{
+    if (s_shot_path[0] == '\0' || (s_shot_after == 0 && s_shot_at_ms == 0)) {
+        return;
+    }
+    s_shot_after = 0;
+    s_shot_at_ms = 0;
+    write_ppm(s_shot_path);
 }
 
 static void memstat_service(void)
