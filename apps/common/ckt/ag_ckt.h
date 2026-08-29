@@ -21,7 +21,7 @@
  *
  * Node 0 is ground.  Nodes are numbered by the caller and need not be dense.
  *
- * SPDX-License-Identifier: Apache-2.0
+ * SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
  */
 #ifndef AG_CKT_H
 #define AG_CKT_H

@@ -42,6 +42,8 @@ ArgonOS
   argon test [-Send ...]   automated boot test; prints the resulting screen
   argon test -cp 866 ...   the same, when the screen is in another code page
   argon tests              host unit tests (needs a host C compiler)
+  argon match CAPTURE.nam  fit a model's voicing to a capture of the real
+                           amplifier and measure both; -Model bogner|slo|jcm800
   argon nettest            wget / httpd / ftp in QEMU against
                            tools\netfixture.py (37 checks)
   argon boardnet -port COM3   the same on the real board, over Wi-Fi;
@@ -406,6 +408,43 @@ switch ($Command.ToLowerInvariant()) {
     'tests' {
         Build-HostTools
         & ctest --test-dir build-host --output-on-failure
+        exit $LASTEXITCODE
+    }
+
+    'match' {
+        # The tone match: a capture of a real amplifier in, a fitted voicing out.
+        #
+        # A subcommand rather than a line in a notebook because it needs the host
+        # tools built and the model named, and naming the wrong model quietly
+        # fits one amplifier's voicing to another's capture - which measures fine
+        # and is wrong.  Everything else the tool decides for itself, including
+        # whether the capture has a loudspeaker in it.
+        Build-HostTools
+        $model = 'jcm800'
+        $di = 'build/listen/tube_di_22050.wav'
+        $cap = $null
+        # Not $rest: PowerShell variable names are case insensitive, so that would
+        # empty the $Rest this loop is reading.
+        $extra = @()
+        for ($i = 0; $i -lt $Rest.Count; $i++) {
+            $a = $Rest[$i]
+            if ($a -ieq '-Model') { $i++; $model = $Rest[$i] }
+            elseif ($a -ieq '-Di') { $i++; $di = $Rest[$i] }
+            elseif ($a -ieq '-Cab') { $i++; $env:AG_CAB_IR = $Rest[$i] }
+            elseif ($null -eq $cap) { $cap = $a }
+            else { $extra += $a }
+        }
+        if ($null -eq $cap) {
+            Write-Host 'usage: argon match <capture.nam> [-Model bogner] [-Di take.wav] [-Cab ir.wav] [iterations [drive [q]]]'
+            exit 2
+        }
+        if (-not (Test-Path $di)) {
+            Write-Host ("argon match: no take at {0}." -f $di)
+            Write-Host '  build-host\wavrate.exe build\listen\tube_di_22k.wav build\listen\tube_di_22050.wav 22050'
+            exit 1
+        }
+        $env:AG_MODEL = $model
+        & .\build-host\tube_render.exe match $cap $di @extra
         exit $LASTEXITCODE
     }
 

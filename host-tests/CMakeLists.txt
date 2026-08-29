@@ -61,7 +61,14 @@ set(ARGON_DSP_SRCS
     "${ARGON_ROOT}/apps/common/ckt/ag_stage.c"
     # The benchmark's netlists: the host tests check that they are circuits
     # before the guest bench reports what they cost.
-    "${ARGON_ROOT}/apps/cktbench/ckt_circuits.c")
+    "${ARGON_ROOT}/apps/cktbench/ckt_circuits.c"
+    # The one-dimensional valve model: static curves baked from the same solver,
+    # with the linear network moved out into sections around them.
+    "${ARGON_ROOT}/apps/common/tube/ag_tube.c"
+    "${ARGON_ROOT}/apps/common/tube/ag_biq.c"
+    "${ARGON_ROOT}/apps/common/tube/ag_os.c"
+    "${ARGON_ROOT}/apps/common/tube/ag_tone.c"
+    "${ARGON_ROOT}/apps/common/tube/ag_amp.c")
 
 set(ARGON_INCLUDES
     "${CMAKE_CURRENT_LIST_DIR}"
@@ -80,7 +87,18 @@ set(ARGON_INCLUDES
     "${ARGON_ROOT}/apps/common/smp"
     "${ARGON_ROOT}/apps/common/grain"
     "${ARGON_ROOT}/apps/common/ckt"
+    "${ARGON_ROOT}/apps/common/tube"
     "${ARGON_ROOT}/apps/cktbench")
+
+# The NAM player has to agree with the reference implementation to the last bit -
+# host tests check exactly that - so wherever it is compiled in, the compiler is
+# told not to contract a multiply and an add into one rounding step.  On x86-64
+# without FMA there is nothing to contract and this changes nothing; on a machine
+# where there is, it is the difference between a passing test and a mystery.
+if(NOT MSVC)
+    set_source_files_properties("${ARGON_ROOT}/tools/nam.c" PROPERTIES
+        COMPILE_OPTIONS "-ffp-contract=off")
+endif()
 
 # Predictable paths for the scripts that invoke these.
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
@@ -110,7 +128,10 @@ add_executable(argon_tests
     test_draw.c
     test_dsp.c
     test_ckt.c
+    test_tube.c
+    test_nam.c
     test_netmsg.c
+    "${ARGON_ROOT}/tools/nam.c"
     "${ARGON_ROOT}/apps/cc/cc_compile.c"
     "${ARGON_ROOT}/components/argon_kernel/src/dev/draw.c"
     ${ARGON_DSP_SRCS}
@@ -121,6 +142,7 @@ add_executable(argon_tests
 target_include_directories(argon_tests BEFORE PRIVATE
     "${ARGON_ROOT}/tools/host_stub")
 target_include_directories(argon_tests PRIVATE
+    "${ARGON_ROOT}/tools"
     ${ARGON_INCLUDES}
     "${ARGON_ROOT}/apps/common/ir")
 if(NOT MSVC)
@@ -131,6 +153,7 @@ endif()
 # the executable directly and running it through ctest.
 target_compile_definitions(argon_tests PRIVATE
     AG_FIXTURE_DIR="${CMAKE_CURRENT_LIST_DIR}/fixtures"
+    AG_TREE_ROOT="${ARGON_ROOT}"
     AG_HOST=1)
 
 # Renders a raw serial transcript into the screen it produces, using the
@@ -190,9 +213,98 @@ endif()
 # The NAM captures are 48 kHz and everything else here is 44.1.  A resampler
 # that coloured the top octave would ruin a test about a high-frequency buzz,
 # so this one is a ten-thousand-tap polyphase sinc.
-add_executable(wavrate "${ARGON_ROOT}/tools/wavrate.c")
+add_executable(wavrate
+    "${ARGON_ROOT}/tools/wavrate.c"
+    "${ARGON_ROOT}/tools/wavrate_core.c")
+target_include_directories(wavrate PRIVATE "${ARGON_ROOT}/tools")
 if(NOT MSVC)
     target_link_libraries(wavrate PRIVATE m)
+endif()
+
+# The one-dimensional valve model: prints the baked curves, the three filter
+# responses and what oversampling is worth, and renders a take through it.
+# It also plays the NAM captures itself now - the reference a fit is measured
+# against is made in memory rather than by three passes through files.
+add_executable(tube_render
+    "${ARGON_ROOT}/tools/tube_render.c"
+    "${ARGON_ROOT}/tools/nam.c"
+    "${ARGON_ROOT}/tools/wavrate_core.c"
+    "${ARGON_ROOT}/apps/common/tube/ag_tube.c"
+    "${ARGON_ROOT}/apps/common/tube/ag_biq.c"
+    "${ARGON_ROOT}/apps/common/tube/ag_os.c"
+    "${ARGON_ROOT}/apps/common/tube/ag_tone.c"
+    "${ARGON_ROOT}/apps/common/tube/ag_amp.c"
+    "${ARGON_ROOT}/apps/common/ckt/ag_ckt.c"
+    "${ARGON_ROOT}/apps/common/ckt/ag_mathf.c"
+    # The cabinet, because the chain ends there and the int16 boundary in front
+    # of it is a real place for a level to go wrong.
+    "${ARGON_ROOT}/apps/common/ir/ag_ir.c"
+    "${ARGON_ROOT}/apps/common/ir/ag_fft.c")
+# host_stub first: ag_ir asks the kernel for memory and there is no kernel here.
+target_include_directories(tube_render BEFORE PRIVATE
+    "${ARGON_ROOT}/tools/host_stub")
+target_include_directories(tube_render PRIVATE ${ARGON_INCLUDES}
+    "${ARGON_ROOT}/tools"
+    "${ARGON_ROOT}/apps/common/ir")
+if(NOT MSVC)
+    target_link_libraries(tube_render PRIVATE m)
+endif()
+
+# The same chain, but played at the sound card in a loop with the knobs live.
+# Windows only, because it talks to winmm; everything it drives is portable.
+if(WIN32)
+    add_executable(tube_live
+        "${ARGON_ROOT}/tools/tube_live.c"
+        # The capture, for the live reference: see g_ref_src in tube_live.c.
+        "${ARGON_ROOT}/tools/nam.c"
+        "${ARGON_ROOT}/apps/common/tube/ag_tube.c"
+        "${ARGON_ROOT}/apps/common/tube/ag_biq.c"
+        "${ARGON_ROOT}/apps/common/tube/ag_os.c"
+        "${ARGON_ROOT}/apps/common/tube/ag_tone.c"
+        "${ARGON_ROOT}/apps/common/tube/ag_amp.c"
+        "${ARGON_ROOT}/apps/common/ckt/ag_ckt.c"
+        "${ARGON_ROOT}/apps/common/ckt/ag_mathf.c"
+        "${ARGON_ROOT}/apps/common/ir/ag_ir.c"
+        "${ARGON_ROOT}/apps/common/ir/ag_fft.c")
+    target_include_directories(tube_live BEFORE PRIVATE
+        "${ARGON_ROOT}/tools/host_stub")
+    target_include_directories(tube_live PRIVATE ${ARGON_INCLUDES}
+        "${ARGON_ROOT}/apps/common/ir"
+        "${ARGON_ROOT}/tools")
+    # winmm for the old path, ole32/uuid for WASAPI - see the note above wa_open.
+    target_link_libraries(tube_live PRIVATE winmm ole32 uuid avrt)
+    # Optimised even though nothing else here is: the float cabinet is a direct
+    # 4410-tap convolution, about 100 M multiplies a second, and it has to keep
+    # up with the sound card rather than with a progress bar.  The tool prints
+    # its measured cost at startup, so this is checked rather than hoped.
+    if(MSVC)
+        target_compile_definitions(tube_live PRIVATE _CRT_SECURE_NO_WARNINGS)
+        target_compile_options(tube_live PRIVATE /W4 /O2)
+    else()
+        target_link_libraries(tube_live PRIVATE m)
+        target_compile_options(tube_live PRIVATE
+            -O2 -Wall -Wextra -Wno-unused-parameter)
+    endif()
+endif()
+
+# The NAM/TONE3000 captures every fitted voicing is measured against, played in
+# this tree rather than by a Go binary in a temporary directory.  Optimised for
+# the same reason tube_live is: it is 10 000 multiplies a sample and a take is
+# eight seconds long.
+add_executable(nam_run
+    "${ARGON_ROOT}/tools/nam_run.c"
+    "${ARGON_ROOT}/tools/nam.c")
+target_include_directories(nam_run PRIVATE "${ARGON_ROOT}/tools")
+if(MSVC)
+    target_compile_definitions(nam_run PRIVATE _CRT_SECURE_NO_WARNINGS)
+    target_compile_options(nam_run PRIVATE /W4 /O2)
+else()
+    target_link_libraries(nam_run PRIVATE m)
+    # No fast math and no FMA contraction, on purpose: this has to agree with a
+    # reference implementation to the last bit, and both of those change the
+    # order and the width of the arithmetic.  See the note in tools/nam.h.
+    target_compile_options(nam_run PRIVATE
+        -O2 -ffp-contract=off -Wall -Wextra -Wno-unused-parameter)
 endif()
 
 # Two renders, one knob apart: says whether a change is audible before anyone
@@ -218,7 +330,7 @@ foreach(smoke engine_smoke synth_smoke ckt_smoke ckt_play ir_check)
 endforeach()
 
 foreach(target argon_tests vtdump engine_smoke synth_smoke ckt_smoke ckt_play
-        ir_check wavdiff wavrate ckt_exact)
+        ir_check wavdiff wavrate ckt_exact tube_render)
     if(MSVC)
         target_compile_definitions(${target} PRIVATE _CRT_SECURE_NO_WARNINGS)
         target_compile_options(${target} PRIVATE /W4)

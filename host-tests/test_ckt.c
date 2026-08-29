@@ -19,7 +19,7 @@
  *    is the whole reason for preferring a circuit to a waveshaper - symmetric
  *    clipping is a fuzz box, not an amplifier.
  *
- * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
  */
 #include "test.h"
 
@@ -568,7 +568,7 @@ static void test_linear_fast_path(void)
     ag_ckt_tick(k, 1.0f, 2);
     AG_CHECK_INT(k->iters_last, 1);
 
-    AG_CHECK(ckt_build_tonestack(k, FS) == 4);
+    AG_CHECK(ckt_build_tonestack(k, FS) == 6);
     AG_CHECK_INT(k->linear, 1);
 
     /* And a circuit with a device in it must not take the fast path. */

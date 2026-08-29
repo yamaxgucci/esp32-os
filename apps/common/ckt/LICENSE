@@ -1,0 +1,13 @@
+The valve amplifier emulator is under the PolyForm Noncommercial License 1.0.0,
+not the Apache-2.0 that covers most of `apps/`.  The full text is in
+../../../LICENSE.PolyForm-Noncommercial-1.0.0 and the reasoning, along with the
+exact list of files, is in ../../../LICENSING.md.
+
+In short: use it for anything that is not commercial, including modifying it and
+sharing your changes.  Selling it, or selling something built on it, needs a
+separate licence from the copyright holder.
+
+The same applies to `apps/common/ckt/`, `apps/cktbench/`, `apps/tubebench/`,
+`tools/tube_render.c`, `tools/tube_live.c` and the two host tests that exercise
+them.  `tools/nam.c` and its neighbours are NOT covered: those are a port of
+Apache-2.0 work by other people and stay Apache-2.0.
