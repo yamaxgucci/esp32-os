@@ -36,6 +36,7 @@
 #include <time.h>
 
 #include <argon/net.h>
+#include <argon/ssh.h>
 #include "console/telnet_console.h"
 #include <argon/port/bt.h>
 #include <argon/port/ble.h>
@@ -553,6 +554,35 @@ static int cmd_telnet(int argc, char **argv)
     return 0;
 }
 #endif /* CONFIG_ARGON_NET_TELNET */
+
+#if defined(CONFIG_ARGON_NET_SSH) && CONFIG_ARGON_NET_SSH
+static int cmd_ssh(int argc, char **argv)
+{
+    if (argc >= 2 && ag_path_icmp(argv[1], "on") == 0) {
+        const uint16_t port = (argc >= 3) ? (uint16_t)atoi(argv[2]) : 0;
+        const ag_err_t err = ag_ssh_start(port);
+        if (err != AG_OK) {
+            ag_console_printf("ssh on: %s\n",
+                              ag_loader_api()->sys->strerror(err));
+            return 1;
+        }
+        ag_console_printf("ssh listening on port %u\n",
+                          (unsigned)ag_ssh_port());
+        return 0;
+    }
+    if (argc >= 2 && ag_path_icmp(argv[1], "off") == 0) {
+        ag_ssh_stop();
+        ag_console_puts("ssh off\n");
+        return 0;
+    }
+    if (ag_ssh_running()) {
+        ag_console_printf("ssh on, port %u\n", (unsigned)ag_ssh_port());
+    } else {
+        ag_console_puts("ssh off ('ssh on' to open the server on :22)\n");
+    }
+    return 0;
+}
+#endif /* CONFIG_ARGON_NET_SSH */
 
 static int cmd_color(int argc, char **argv)
 {
@@ -4372,6 +4402,9 @@ static const ag_command_t k_commands[] = {
     /* httpd is a loadable app now (HTTPD.AXE), not a built-in - run it by name. */
 #if defined(CONFIG_ARGON_NET_TELNET) && CONFIG_ARGON_NET_TELNET
     {"telnet", "[on [port]|off]", "the console over TCP :23", cmd_telnet},
+#endif
+#if defined(CONFIG_ARGON_NET_SSH) && CONFIG_ARGON_NET_SSH
+    {"ssh", "[on [port]|off]", "encrypted console on TCP :22", cmd_ssh},
 #endif
 #endif
 #if AG_PORT_HAS_BT
