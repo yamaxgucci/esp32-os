@@ -1,0 +1,46 @@
+# ArgonOS - ESP32-S3-Zero (Waveshare) board pack.
+#
+# ESP32-S3FH4R2: 4 MB quad flash, 2 MB quad PSRAM, native USB only (no
+# USB-to-UART bridge), no display, no SD card.  Sound is an external I2S DAC on
+# GPIOs named in BOARD.CFG (audio.bclk/ws/dout/mclk).
+#
+# Layered after sdkconfig.defaults.esp32s3, which assumes an N16R8 module
+# (8 MB flash, octal PSRAM, UART console); this trims it to what this chip has.
+
+# 4 MB flash and the matching partition table.  C: (sysfs, littlefs) holds
+# BOARD.CFG - there is no card on this board.
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=n
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_4mb.csv"
+
+# This module's PSRAM is quad, not the octal the primary target assumes.  It is
+# on because the bigger apps - DX7 and the like - ask for a ~192 KB arena that
+# only extended memory can give; a tone needs none of it, but there is no reason
+# to withhold 2 MB from a board that has it.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_QUAD=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_USE_CAPS_ALLOC=y
+
+# The code arena is internal SRAM, so it stays small: an app's code fits here
+# (DX7 is 29 KB) while its big heap comes from PSRAM.  192 KB here overflowed
+# DRAM once PSRAM's own management took its share.
+CONFIG_ARGON_APP_ARENA_KB=64
+
+# Take the real-radio network path, not the OpenCores-MAC one.  The primary
+# esp32s3 target is QEMU, where "networking" means the emulated OpenEth device
+# and the boot brings it up unconditionally; on real silicon that MAC does not
+# exist and ag_net_init() hangs waiting for it.  With ARGON_NET_WIFI set the net
+# layer uses the radio instead and starts nothing at boot unless [wifi]/[ap] in
+# BOARD.CFG (or `wifi on`) asks - so a headless audio board pays no RAM for it.
+CONFIG_ARGON_ENABLE_NET=y
+CONFIG_ARGON_NET_WIFI=y
+CONFIG_ARGON_NET_WIFI_AP=y
+
+# The only console this board exposes is the chip's native USB-Serial-JTAG:
+# there is no UART bridge, so UART0 would talk to unconnected pins.  The port's
+# console backend routes to the usb_serial_jtag driver when this is set (see
+# components/argon_port/idf/argon/port/impl/uart.h).
+# CONFIG_ESP_CONSOLE_UART_DEFAULT is not set
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y

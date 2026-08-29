@@ -988,15 +988,36 @@ float fabsf(float x)
     v.u &= ~0x80000000u;
     return v.f;
 }
-float  sinf(float x)
+/*
+ * A real sine, not the stub this used to be: it returned 0, which made every
+ * app that synthesises audio through it - a tone, DX7's operators - play dead
+ * silence, and cost an afternoon of chasing an I2S DAC that was working the
+ * whole time.  Range-reduce to [-pi, pi] with a correct floor (the shim's
+ * floorf truncates, wrong for negatives, so it is done inline here) and a
+ * 9th-order Taylor - accurate to a few thousandths across the range, which is
+ * more than a 16-bit converter resolves.
+ */
+float sinf(float x)
 {
-    (void)x;
-    return 0.0f;
+    const float pi = 3.14159265358979f;
+    const float twopi = 6.28318530717959f;
+
+    float k = (x + pi) / twopi;
+    int   ki = (int)k;
+    if (k < 0.0f && (float)ki != k) {
+        ki -= 1; /* floor toward negative infinity */
+    }
+    x -= twopi * (float)ki; /* x now in [-pi, pi) */
+
+    const float x2 = x * x;
+    return x * (1.0f + x2 * (-1.0f / 6.0f
+              + x2 * (1.0f / 120.0f
+              + x2 * (-1.0f / 5040.0f
+              + x2 * (1.0f / 362880.0f)))));
 }
 float cosf(float x)
 {
-    (void)x;
-    return 0.0f;
+    return sinf(x + 1.57079632679490f);
 }
 float powf(float x, float y)
 {

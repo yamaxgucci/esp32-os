@@ -298,7 +298,7 @@ bool ag_port_audio_open(uint32_t rate, uint8_t channels)
         return false;
     }
 
-    const i2s_std_config_t std = {
+    i2s_std_config_t std = {
         .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(rate),
         .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(
             I2S_DATA_BIT_WIDTH_16BIT,
@@ -316,6 +316,21 @@ bool ag_port_audio_open(uint32_t rate, uint8_t channels)
         },
     };
 
+    /*
+     * A DAC that is given an MCLK needs it exact.  The default I2S clock source
+     * is only approximate; a converter like the CS4344 counts MCLK against LRCK
+     * and stays in power-down until it sees a whole-number ratio, so an
+     * inexact MCLK reads as silence.  The APLL is there to make precise audio
+     * rates - use it whenever a board wires MCLK.  (Confirmed against a working
+     * AcidBox setup, use_apll = true, on this exact board and DAC.)  Boards with
+     * no MCLK pin - the CYD's analog amp - keep the default source.
+     */
+#if SOC_I2S_SUPPORTS_APLL
+    if (s_pins.mclk >= 0) {
+        std.clk_cfg.clk_src = I2S_CLK_SRC_APLL;
+    }
+#endif
+
     err = i2s_channel_init_std_mode(s_tx, &std);
     if (err == ESP_OK) {
         err = i2s_channel_enable(s_tx);
@@ -328,9 +343,9 @@ bool ag_port_audio_open(uint32_t rate, uint8_t channels)
     }
 
     s_channels = channels;
-    ESP_LOGI(TAG, "i2s out on bclk=%d ws=%d dout=%d, %u Hz, %u ch",
+    ESP_LOGI(TAG, "i2s out on bclk=%d ws=%d dout=%d mclk=%d, %u Hz, %u ch",
              (int)s_pins.bclk, (int)s_pins.ws, (int)s_pins.dout,
-             (unsigned)rate, (unsigned)channels);
+             (int)s_pins.mclk, (unsigned)rate, (unsigned)channels);
     return true;
 }
 

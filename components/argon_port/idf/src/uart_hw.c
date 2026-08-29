@@ -14,6 +14,22 @@
 #include "esp_rom_uart.h"
 #include "freertos/FreeRTOS.h"
 
+#ifdef AG_PORT_UART_JTAG
+/*
+ * The console pseudo-port on a board whose only console is the native
+ * USB-Serial-JTAG (see impl/uart.h).  It is not a UART at all, so every entry
+ * point below forks to the usb_serial_jtag driver for this one port number and
+ * leaves the real UART path untouched for the rest.
+ */
+#include "driver/usb_serial_jtag.h"
+
+static bool s_jtag_open;
+
+static bool is_jtag(int port) { return port == AG_PORT_UART_JTAG; }
+#else
+static bool is_jtag(int port) { (void)port; return false; }
+#endif
+
 static bool valid(int port)
 {
     return port >= 0 && port < AG_PORT_UART_PORTS;
@@ -87,6 +103,24 @@ ag_err_t ag_port_uart_open(int port, const ag_port_uart_cfg_t *cfg,
         return -AG_EINVAL;
     }
 
+#ifdef AG_PORT_UART_JTAG
+    if (is_jtag(port)) {
+        if (s_jtag_open) {
+            return AG_OK; /* already up: two subsystems may both want it */
+        }
+        usb_serial_jtag_driver_config_t jc = {
+            .rx_buffer_size = (int)(rx_bytes ? rx_bytes : 256u),
+            .tx_buffer_size = (int)(tx_bytes ? tx_bytes : 256u),
+        };
+        const esp_err_t rc = usb_serial_jtag_driver_install(&jc);
+        if (rc != ESP_OK && rc != ESP_ERR_INVALID_STATE) {
+            return from_esp(rc);
+        }
+        s_jtag_open = true;
+        return AG_OK;
+    }
+#endif
+
     if (!uart_is_driver_installed(port)) {
         /*
          * Already installed is not a failure: two subsystems may both want the
@@ -105,6 +139,11 @@ ag_err_t ag_port_uart_config(int port, const ag_port_uart_cfg_t *cfg)
 {
     if (!valid(port) || cfg == NULL) {
         return -AG_EINVAL;
+    }
+
+    /* USB-Serial-JTAG has no baud, parity or stop bits to set. */
+    if (is_jtag(port)) {
+        return AG_OK;
     }
 
     /*
@@ -130,12 +169,20 @@ ag_err_t ag_port_uart_pins(int port, int tx, int rx)
     if (!valid(port)) {
         return -AG_EINVAL;
     }
+    if (is_jtag(port)) {
+        return AG_OK; /* fixed on the USB pins; nothing to route */
+    }
     return from_esp(uart_set_pin(port, tx, rx, UART_PIN_NO_CHANGE,
                                  UART_PIN_NO_CHANGE));
 }
 
 bool ag_port_uart_is_open(int port)
 {
+#ifdef AG_PORT_UART_JTAG
+    if (is_jtag(port)) {
+        return s_jtag_open;
+    }
+#endif
     return valid(port) && uart_is_driver_installed(port);
 }
 
@@ -143,6 +190,9 @@ ag_err_t ag_port_uart_flush(int port)
 {
     if (!valid(port)) {
         return -AG_EINVAL;
+    }
+    if (is_jtag(port)) {
+        return AG_OK; /* write_bytes already hands bytes to the peripheral */
     }
     return from_esp(uart_flush(port));
 }
@@ -152,6 +202,15 @@ int32_t ag_port_uart_write(int port, const void *buf, size_t len)
     if (!valid(port) || buf == NULL) {
         return -AG_EINVAL;
     }
+#ifdef AG_PORT_UART_JTAG
+    if (is_jtag(port)) {
+        /* A bounded wait, so a board with nothing attached to its USB does not
+         * wedge the writer once the peripheral's buffer fills - the same way a
+         * UART with no listener drops into the void. */
+        const int n = usb_serial_jtag_write_bytes(buf, len, pdMS_TO_TICKS(100));
+        return (n < 0) ? 0 : (int32_t)n;
+    }
+#endif
     return (int32_t)uart_write_bytes(port, buf, len);
 }
 
@@ -160,6 +219,13 @@ int32_t ag_port_uart_read(int port, void *buf, size_t len, uint32_t timeout_ms)
     if (!valid(port) || buf == NULL) {
         return -AG_EINVAL;
     }
+#ifdef AG_PORT_UART_JTAG
+    if (is_jtag(port)) {
+        const int n = usb_serial_jtag_read_bytes(buf, len,
+                                                 pdMS_TO_TICKS(timeout_ms));
+        return (n < 0) ? 0 : (int32_t)n;
+    }
+#endif
     const int n = uart_read_bytes(port, buf, len, pdMS_TO_TICKS(timeout_ms));
     return (n < 0) ? 0 : (int32_t)n;
 }
@@ -168,6 +234,10 @@ int32_t ag_port_uart_pending(int port)
 {
     if (!valid(port)) {
         return -AG_EINVAL;
+    }
+    if (is_jtag(port)) {
+        /* No count to ask for; callers fall back to a timed read. */
+        return -AG_ENOTSUP;
     }
     size_t avail = 0;
     if (uart_get_buffered_data_len(port, &avail) != ESP_OK) {

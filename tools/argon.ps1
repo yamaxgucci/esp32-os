@@ -169,6 +169,7 @@ switch ($Command.ToLowerInvariant()) {
             Write-Host 'known targets:  esp32s3 (primary, QEMU)'
             Write-Host '                esp32s3-board  the S3 on the desk: no OpenEth, no HostFS'
             Write-Host '                esp32s3-cam    esp32s3-board + the camera built into the image'
+            Write-Host '                esp32s3-zero   ESP32-S3-Zero: 4 MB flash, USB-JTAG console, I2S DAC, no display/SD'
             Write-Host '                esp32       hardware: Wi-Fi and Bluetooth'
             Write-Host '                esp32-dsp   hardware: neither, 48 KB arena'
             exit 0
@@ -191,6 +192,8 @@ switch ($Command.ToLowerInvariant()) {
                               $chip = 'esp32s3' }
             'esp32s3-cam' { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32s3;sdkconfig.esp32s3.board;sdkconfig.esp32s3.cam'
                             $chip = 'esp32s3' }
+            'esp32s3-zero' { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32s3;sdkconfig.esp32s3.zero'
+                             $chip = 'esp32s3' }
             default {
                 Write-Host "argon target: no defaults for '$chip'."
                 Write-Host 'Add sdkconfig.defaults.<chip> before building for it.'
