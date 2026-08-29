@@ -54,7 +54,26 @@
 #include "ag_pcm.h"
 #include "ag_wav.h"
 
-AG_APP("STOMP", "1.0", "argon", AG_AXE_NEEDS_GFX);
+/*
+ * Not AG_AXE_NEEDS_GFX.  A pedal is a box with knobs and no screen, and the
+ * S3-Zero on the desk is exactly that: no display, sound out of a CS4344 on
+ * I2S.  With no panel this runs headless - the amplifier plays and the console
+ * is the only thing that says so.
+ */
+/*
+ * And a named arena, because the default one is not enough to hold what this
+ * needs at once: 96 KB of curves, the chain, the cabinet's buffers, and a take
+ * to play through them.  The default left a largest free block of 192 KB
+ * against a seven-second take of 308, so the take was loaded in part and the
+ * loop jumped in the middle of the phrase - which is what it sounded like.
+ *
+ * A size named here is required rather than preferred: a board that cannot give
+ * it refuses to start this, which is the right answer.  Half the S3-Zero's
+ * PSRAM: 512 KB was not enough, because by the time the take is read the
+ * curves and the chain have already taken their share and the largest free
+ * block was 264 KB against a 308 KB take.
+ */
+AG_APP_SIZED("STOMP", "1.0", "argon", 0, 12 * 1024, 1024 * 1024);
 
 #define ROW_KNOBS 3  /* three across; six knobs make two rows, three make one */
 #define TOP_H     26 /* the model's name */
@@ -84,7 +103,8 @@ enum { BROWSE_OFF, BROWSE_CAB, BROWSE_PRESET };
 #define RATE  22050u
 #define CHUNK AG_IR_BLOCK
 
-static ag_gfxinfo_t s_info; /* the display, held for as long as we run */
+static ag_gfxinfo_t s_info;  /* the display, held for as long as we run */
+static int          s_headless; /* no panel on this board: play, do not draw */
 
 /* The chain, when there is one.  Large enough to be worth the heap. */
 static ag_amp_t *s_amp;
@@ -100,10 +120,21 @@ static int          s_di_loop = 1; /* a file sink plays the take once */
 static int          s_take_done;
 static int16_t      s_mono[CHUNK];
 static int16_t      s_stereo[CHUNK * 2];
-static float        s_peak;    /* of the last block, for the meter */
+static float        s_peak;     /* of the last block at the converter */
+static float        s_amp_peak; /* and at the amplifier, before the cabinet */
+/* The output trim as a numerator over 64, so a block is one shift and no
+ * floating point: 64 is unity, 128 is +6 dB, 255 is +12. */
+static int          s_vol_num = 64;
+static uint32_t     s_out_clipped;
+static uint32_t     s_cab_ms;  /* how much of the impulse to keep, 0 = all */
 static uint32_t     s_hdr_ms;  /* when the meter was last redrawn */
 static uint32_t     s_clipped;
+static uint32_t     s_blocks;  /* blocks written since the sink opened */
+static uint32_t     s_short;   /* writes the sink would not take whole */
+static uint32_t     s_say_ms;  /* when the console last heard how it goes */
 static int          s_tab_n;   /* points the curve buffer is sized for */
+static int          s_tab_fast; /* and whether it got internal SRAM */
+static int          s_tab_stages; /* and for how many stages */
 static char         s_status[64]; /* one line about the sound, or empty */
 static ag_amp_cfg_t s_cfg;
 /* The configuration as the chain arrived with it.  The level knobs scale what
@@ -580,10 +611,12 @@ static struct {
 } s_dirty[DIRTY_MAX];
 static int s_ndirty;
 static int s_dirty_all;
+static int s_band; /* which band of a full repaint comes next */
 
 static void dirty_all(void)
 {
     s_dirty_all = 1;
+    s_band = 0;
     s_ndirty = 0;
 }
 
@@ -715,9 +748,49 @@ static void paint(void)
     paint_region(0, 0, (int)s_info.width, (int)s_info.height);
 }
 
+/*
+ * A whole screen, one band at a time.
+ *
+ * A full repaint is 15.9 ms on the board - measured, and longer than the 11.6 ms
+ * block it would have to fit inside, because the framebuffer is in PSRAM like
+ * everything else.  Painting it in one go while the audio is running means a
+ * block that arrives late however much slack there was beforehand.
+ *
+ * So a full repaint is a queue rather than an act: one band per present(), each
+ * a fraction of the height, each painted and flushed on its own.  The screen
+ * fills in over a few blocks and no single block pays for all of it.  Nothing
+ * moves in between, because a band is painted from the same state the last one
+ * was - it is one picture arriving in pieces, not several pictures.
+ */
+#define BANDS 8
+
 static void present(void)
 {
     int i;
+    if (s_headless) {
+        s_dirty_all = 0;
+        s_ndirty = 0;
+        return;
+    }
+    if (s_dirty_all && s_sound) {
+        const int h = (int)s_info.height;
+        const int band = (h + BANDS - 1) / BANDS;
+        const int y = s_band * band;
+        int       hh = band;
+        if (y + hh > h) {
+            hh = h - y;
+        }
+        if (hh > 0) {
+            paint_region(0, y, (int)s_info.width, hh);
+            ag_gfx_flush(0, (uint16_t)y, s_info.width, (uint16_t)hh);
+        }
+        if (++s_band >= BANDS) {
+            s_band = 0;
+            s_dirty_all = 0;
+        }
+        s_ndirty = 0;
+        return;
+    }
     if (s_dirty_all) {
         paint();
         ag_gfx_flush(0, 0, s_info.width, s_info.height);
@@ -756,7 +829,6 @@ static void draw(void)
  * audio callback works in, the drawing cannot share the callback's thread, and
  * no amount of tidying the drawing changes that.
  */
-#define BENCH_HZ    240000000u /* the core the numbers are converted against */
 #define BENCH_RATE  22050u
 #define BENCH_FPS   30u
 
@@ -775,19 +847,92 @@ static const char *pad18(const char *s)
     return p;
 }
 
+/*
+ * Microseconds, and what they mean against the two clocks that matter: a
+ * thirty-a-second redraw, and a sample of audio.
+ *
+ * It used to print instructions, which was true under QEMU with -icount shift=0
+ * and a plain lie on a board, where the same call reads a real clock.  One unit
+ * that both machines can honestly produce is better than a number that is only
+ * right on one of them and does not say which.
+ */
 static void bench_line(const char *label, uint64_t us, uint32_t n)
 {
-    const uint64_t instr = (us * 1000ull) / (n > 0 ? n : 1u);
-    const uint32_t us240 = (uint32_t)(instr / 240ull);
-    /* Percent of one core, in basis points, if this were done FPS times a
+    const uint32_t each = (uint32_t)(us / (n > 0 ? n : 1u));
+    /* Percent of the processor, in basis points, if this were done FPS times a
      * second - which is the pessimistic reading of "redraw on every event". */
-    const uint32_t bp =
-        (uint32_t)((instr * BENCH_FPS * 10000ull) / (uint64_t)BENCH_HZ);
+    const uint32_t bp = (uint32_t)(((uint64_t)each * BENCH_FPS * 10000ull) /
+                                   1000000ull);
     const uint32_t samples =
-        (uint32_t)((instr * BENCH_RATE) / (uint64_t)BENCH_HZ);
-    ag_printf("  %s %9u instr %6u.%03u ms  %3u.%02u%% at %u fps  %5u samples\n",
-              pad18(label), (unsigned)instr, us240 / 1000u, us240 % 1000u,
-              bp / 100u, bp % 100u, (unsigned)BENCH_FPS, samples);
+        (uint32_t)(((uint64_t)each * BENCH_RATE) / 1000000ull);
+    ag_printf("  %s %8u us  %3u.%02u%% at %u fps  %5u samples of audio\n",
+              pad18(label), (unsigned)each, bp / 100u, bp % 100u,
+              (unsigned)BENCH_FPS, samples);
+}
+
+/*
+ * What the chain costs in time, on whatever this is running on.
+ *
+ * The drawing bench above counts instructions because that is all QEMU can
+ * honestly give.  This one counts microseconds against the block it has to fit
+ * in - 256 frames at 22.05 kHz is 11.61 ms - because on a board the answer is
+ * not how many instructions there are but how long they take, and those two
+ * turned out to differ by a factor of two: the FPU's latency on a dependent
+ * chain and a table lookup that leaves the cache are both invisible to a
+ * counter of instructions.
+ *
+ * Each piece separately, so that "it does not fit" can be pointed at something.
+ */
+static void bench_audio(void)
+{
+    static const int oss[] = { 1, 2, 4 };
+    const uint32_t   blocks = 40;
+    const uint32_t   budget_us = (CHUNK * 1000000u) / RATE;
+    uint32_t         i, b, k;
+    ag_time_t        t0, t1;
+
+    ag_printf("stomp: what a block costs, against %u us of audio\n",
+              (unsigned)budget_us);
+
+    for (k = 0; k < sizeof(oss) / sizeof(oss[0]); k++) {
+        uint32_t us;
+        s_cfg.os = oss[k];
+        s_fit.os = s_cfg.os;
+        if (ag_amp_set_voicing(s_amp, &s_cfg) != 0) {
+            continue;
+        }
+        t0 = ag_micros();
+        for (b = 0; b < blocks; b++) {
+            for (i = 0; i < CHUNK; i++) {
+                /* A ramp through the curve rather than a constant, which the
+                 * compiler could hoist and the table would answer from one
+                 * cache line. */
+                const float x = (float)((int)(i * 37u % 2048u) - 1024) / 1024.0f;
+                s_mono[i] = (int16_t)(ag_amp_tick(s_amp, x) * 8192.0f);
+            }
+        }
+        t1 = ag_micros();
+        us = (uint32_t)((t1 - t0) / blocks);
+        ag_printf("  valves %dx%s %6u us  %3u%% of the block\n", oss[k],
+                  s_cfg.adaa ? " + adaa" : "        ", (unsigned)us,
+                  (unsigned)(us * 100u / budget_us));
+    }
+
+    if (s_ir_ready) {
+        uint32_t us;
+        t0 = ag_micros();
+        for (b = 0; b < blocks; b++) {
+            ag_ir_process_block(&s_ir, s_mono, s_stereo);
+        }
+        t1 = ag_micros();
+        us = (uint32_t)((t1 - t0) / blocks);
+        ag_printf("  cabinet %4u ms, %2u parts %6u us  %3u%% of the block\n",
+                  (unsigned)(s_ir.ir_frames * 1000u / RATE),
+                  (unsigned)s_ir.parts, (unsigned)us,
+                  (unsigned)(us * 100u / budget_us));
+    }
+    ag_printf("  the curves are in %s memory\n",
+              s_tab_fast ? "internal" : "extended");
 }
 
 static void bench(void)
@@ -871,8 +1016,8 @@ static void bench(void)
     ag_printf("stomp bench: %s, %d knobs, %ux%u, %u passes\n",
               ag_amp_model_name(s_model), ag_amp_pot_count(s_model),
               (unsigned)s_info.width, (unsigned)s_info.height, (unsigned)n);
-    ag_printf("  instructions under -icount; on the chip they can only be "
-              "larger\n");
+    ag_printf("  microseconds of this machine; under QEMU with -icount one of\n"
+              "  them is a thousand instructions and not a real one\n");
     bench_line("full paint", us_paint, n);
     bench_line("  of which clear", us_clear, n);
     bench_line("flush, whole", us_present, n);
@@ -914,17 +1059,64 @@ static void status(const char *s)
 }
 
 /* Big enough for `want` points per stage, kept across loads. */
-static int tab_reserve(int want)
+/*
+ * The curves, and where they live decides whether this plays at all.
+ *
+ * Every oversampled sample looks into these tables, four times over for two
+ * stages, and a lookup that misses the cache and goes to PSRAM costs hundreds
+ * of cycles - the same trap the flash-XIP measurement recorded: read-only
+ * tables that the inner loop walks cannot leave internal SRAM.  Measured on the
+ * S3-Zero with them in the process arena, which is PSRAM: 110% of the block
+ * budget and a late block almost every time.  So ask for internal memory first
+ * and only fall back to the arena, where it will run but not in time.
+ */
+static int tab_reserve(int want, int stages)
 {
-    const size_t floats = (size_t)AG_AMP_STAGES * 3u * (size_t)want;
-    if (s_tab != NULL && s_tab_n >= want) {
+    const size_t floats = (size_t)stages * 3u * (size_t)want;
+    const size_t bytes = floats * sizeof(float);
+    if (s_tab != NULL && s_tab_n >= want && s_tab_stages >= stages) {
         return 0;
     }
     if (s_tab != NULL) {
         ag_free(s_tab);
     }
-    s_tab = (float *)ag_malloc(floats * sizeof(float));
+    s_tab = (float *)ag_malloc_caps(bytes, AG_MEM_FAST);
+    s_tab_fast = s_tab != NULL;
+    if (s_tab == NULL) {
+        s_tab = (float *)ag_malloc(bytes);
+    }
     s_tab_n = (s_tab != NULL) ? want : 0;
+    s_tab_stages = (s_tab != NULL) ? stages : 0;
+    if (s_tab != NULL) {
+        ag_meminfo_t mem;
+        size_t       probe = 0;
+        ag_meminfo(&mem);
+        if (!s_tab_fast) {
+            /*
+             * The free figure is a sum across regions and says nothing about
+             * whether any one of them can hold this.  So ask: the largest block
+             * internal memory will actually give, found by halving.  A refusal
+             * over 151 KB free is a different problem from a refusal over 20,
+             * and only one of them is worth working around.
+             */
+            size_t try_bytes = bytes;
+            while (try_bytes >= 4096u) {
+                void *p = ag_malloc_caps(try_bytes, AG_MEM_FAST);
+                if (p != NULL) {
+                    ag_free(p);
+                    probe = try_bytes;
+                    break;
+                }
+                try_bytes -= 4096u;
+            }
+        }
+        ag_printf("stomp: %u KB of curves in %s memory (%u KB fast free, "
+                  "largest %u KB)\n",
+                  (unsigned)(bytes / 1024u),
+                  s_tab_fast ? "internal" : "extended",
+                  (unsigned)(mem.fast_free / 1024u),
+                  (unsigned)((s_tab_fast ? bytes : probe) / 1024u));
+    }
     return s_tab != NULL ? 0 : -1;
 }
 
@@ -1073,14 +1265,14 @@ static int amp_from_preset(const char *path)
 {
     uint32_t n = 0;
     void    *buf = read_all(path, &n);
-    int      tab_n, rc;
+    int      tab_n = 0, stages = 0, rc;
 
     if (buf == NULL) {
         status("preset: cannot read it");
         return -1;
     }
-    tab_n = ag_amp_preset_tab_n(buf, n);
-    if (tab_n < 8 || amp_reserve() != 0 || tab_reserve(tab_n) != 0) {
+    if (ag_amp_preset_shape(buf, n, &tab_n, &stages) != 0 || tab_n < 8 ||
+        stages < 1 || amp_reserve() != 0 || tab_reserve(tab_n, stages) != 0) {
         ag_free(buf);
         status("preset: not one this build reads");
         return -1;
@@ -1097,6 +1289,21 @@ static int amp_from_preset(const char *path)
         uint32_t       frames = 0, rate = 0;
         const int16_t *ir = ag_amp_preset_ir(buf, n, &frames, &rate);
         if (ir != NULL && frames > 0u) {
+            /*
+             * Shorter, when asked.  The convolution is partitioned in blocks of
+             * AG_IR_BLOCK, so its cost is proportional to the impulse's length
+             * and nothing else: 200 ms is eighteen partitions and 46 ms is
+             * four.  A loudspeaker's impulse is mostly over in a few tens of
+             * milliseconds and the rest is room; where the line should be drawn
+             * is a listening question, so this is a number rather than a
+             * decision taken here.
+             */
+            if (s_cab_ms > 0u) {
+                const uint32_t keep = s_cab_ms * rate / 1000u;
+                if (keep > 0u && keep < frames) {
+                    frames = keep;
+                }
+            }
             (void)cabinet_load(ir, frames, rate);
             (void)snprintf(s_cab, sizeof(s_cab), "%s", "from the preset");
         }
@@ -1123,7 +1330,9 @@ static int amp_from_model(int model)
     const int     probe_n = 4096;
     int           rc;
 
-    if (amp_reserve() != 0 || tab_reserve(AG_AMP_TAB_N) != 0) {
+    /* All the stages, because ag_amp_build fills whatever the model has and
+     * nothing has told us how many that is until it has run. */
+    if (amp_reserve() != 0 || tab_reserve(AG_AMP_TAB_N, AG_AMP_STAGES) != 0) {
         status("no room for the chain");
         return -1;
     }
@@ -1148,6 +1357,19 @@ static int amp_from_model(int model)
     adopt_amp();
     status("");
     return 0;
+}
+
+/* Digits, without pulling in a libc for one number. */
+static int atoi_small(const char *s)
+{
+    int n = 0;
+    if (s == NULL) {
+        return 0;
+    }
+    while (*s >= (char)0x30 && *s <= (char)0x39) {
+        n = n * 10 + (*s++ - 0x30);
+    }
+    return n;
 }
 
 /* One block: the take, through the valves, through the loudspeaker, out. */
@@ -1187,7 +1409,7 @@ static void audio_block(void)
         }
         s_mono[i] = (int16_t)v;
     }
-    s_peak = peak;
+    s_amp_peak = peak;
     if (s_ir_ready) {
         ag_ir_process_block(&s_ir, s_mono, s_stereo);
     } else {
@@ -1196,8 +1418,56 @@ static void audio_block(void)
             s_stereo[2 * i + 1] = s_mono[i];
         }
     }
+    /*
+     * The output trim, and the peak measured where it matters.
+     *
+     * The master is the amplifier's own control and sits in front of the
+     * loudspeaker; what leaves the converter is what comes out of the cabinet,
+     * and a cabinet is not a unity-gain thing.  This DAC has no amplifier after
+     * it either - line level is as loud as the board gets - so the last gain in
+     * the chain belongs here, where it can be turned without moving the
+     * amplifier's own setting off where it was measured.
+     */
+    {
+        int      hi = 0;
+        uint32_t n = CHUNK * 2u;
+        for (i = 0; i < n; i++) {
+            int v = s_stereo[i];
+            if (s_vol_num != 64) {
+                v = (v * s_vol_num) >> 6;
+                if (v > 32767) {
+                    v = 32767;
+                    s_out_clipped++;
+                } else if (v < -32768) {
+                    v = -32768;
+                    s_out_clipped++;
+                }
+                s_stereo[i] = (int16_t)v;
+            }
+            if (v < 0) {
+                v = -v;
+            }
+            if (v > hi) {
+                hi = v;
+            }
+        }
+        s_peak = (float)hi / 32768.0f;
+    }
     ag_pcm_mark_render(&s_out, (uint32_t)(ag_micros() - t0));
-    (void)ag_pcm_write(&s_out, s_stereo, (int32_t)CHUNK);
+    {
+        const int32_t wrote = ag_pcm_write(&s_out, s_stereo, (int32_t)CHUNK);
+        s_blocks++;
+        if (s_blocks == 1u) {
+            /* The first block is the one worth saying out loud: on a box with
+             * no screen it is the only evidence that the chain reached the
+             * converter at all, and a sink that refuses is silent otherwise. */
+            ag_printf("stomp: first block: %d of %u frames written\n",
+                      (int)wrote, (unsigned)CHUNK);
+        }
+        if (wrote < 0) {
+            s_short++; /* the sink refused it; frames and bytes differ by sink */
+        }
+    }
 }
 
 /* ---------------------------------------------------------------------- */
@@ -1499,10 +1769,34 @@ static void on_tap(int px, int py)
 static int sound_start(const char *sink, const char *di_path)
 {
     if (di_path != NULL && di_path[0] != '\0') {
-        if (ag_wav_load(di_path, &s_di) != 0) {
-            ag_printf("stomp: cannot read %s\n", di_path);
+        /*
+         * As much of the take as the arena will hold in one block, and no more.
+         * On the S3-Zero the largest free block is 192 KB against a seven-second
+         * take of 308 - and the take is played in a loop, so four seconds of it
+         * is a shorter loop rather than a failure.  A quarter of the block is
+         * left alone for what the cabinet and the sink still have to allocate.
+         */
+        ag_meminfo_t mem;
+        uint32_t     cap;
+        ag_meminfo(&mem);
+        cap = (uint32_t)((mem.arena_largest / 4u) * 3u / sizeof(int16_t));
+        if (ag_wav_load_max(di_path, &s_di, cap) != 0) {
+            /* Say which of the two it was.  "cannot read" over a file that is
+             * plainly there, on a board where the answer is either the memory
+             * or the filesystem, is a message that costs an hour. */
+            ag_stat_t st;
+            ag_meminfo(&mem);
+            ag_printf("stomp: cannot read %s (%u bytes on disk, arena %u free, "
+                      "largest %u)\n",
+                      di_path,
+                      ag_stat(di_path, &st) == AG_OK ? (unsigned)st.size : 0u,
+                      (unsigned)mem.arena_free, (unsigned)mem.arena_largest);
             return -1;
         }
+        ag_printf("stomp: take %s, %u frames, %u.%02u s of it\n",
+                  leaf(di_path), (unsigned)s_di.frames,
+                  (unsigned)(s_di.frames / RATE),
+                  (unsigned)((s_di.frames % RATE) * 100u / RATE));
         if (s_di.rate != RATE) {
             /* Not resampled: the chain is fitted at one rate and a take at
              * another would play at the wrong pitch while looking right. */
@@ -1532,6 +1826,7 @@ int ag_main(int argc, char **argv)
     const char *sink = NULL;
     const char *di_path = NULL;
     const char *preset = NULL;
+    int         want_os = 0;
     const char *set[AG_AMP_POT_N];
     int         n_set = 0;
 
@@ -1545,6 +1840,21 @@ int ag_main(int argc, char **argv)
             di_path = argv[++i];
         } else if (strcmp(argv[i], "out") == 0 && i + 1 < argc) {
             sink = argv[++i];
+        } else if (strcmp(argv[i], "cabms") == 0 && i + 1 < argc) {
+            s_cab_ms = (uint32_t)atoi_small(argv[++i]);
+        } else if (strcmp(argv[i], "vol") == 0 && i + 1 < argc) {
+            /* 0 to 10 on the output trim, 5 being unity, in the same steps a
+             * knob has: about 2.4 dB each, +12 at the top. */
+            static const short k_vol[11] = { 8, 12, 18, 27, 42, 64,
+                                             96, 144, 168, 208, 255 };
+            int v = atoi_small(argv[++i]);
+            s_vol_num = k_vol[v < 0 ? 0 : (v > 10 ? 10 : v)];
+        } else if (strcmp(argv[i], "os") == 0 && i + 1 < argc) {
+            /* The oversampling the chain runs at, over whatever the preset was
+             * baked with.  It is the largest single lever on what this costs -
+             * two valves at 4x are twice two valves at 2x - and on a board that
+             * cannot make its deadline it is the first thing to try. */
+            want_os = atoi_small(argv[++i]);
         } else if (strcmp(argv[i], "pot") == 0 && i + 1 < argc) {
             /* Kept and applied after the chain is loaded, because the preset
              * brings its own positions with it and would overwrite these. */
@@ -1562,11 +1872,29 @@ int ag_main(int argc, char **argv)
     /* Acquired once and kept: releasing between frames hands the panel back to
      * the console, which then writes its own lines over the amplifier. */
     if (ag_gfx_acquire(&s_info) != AG_OK) {
-        ag_printf("stomp: the display belongs to somebody else\n");
-        return 1;
+        /*
+         * No panel, or somebody else has it.  Either way there is still an
+         * amplifier to run: the box on the desk has no screen at all.
+         */
+        s_headless = 1;
+        s_info.width = 0;
+        s_info.height = 0;
+        ag_printf("stomp: no display - playing without one\n");
     }
     if (want_bench) {
-        bench(); /* releases the display itself, so the report is readable */
+        /*
+         * The screen if there is one, and the chain if a preset was named.  On
+         * the board the second is the interesting half: the emulator can only
+         * count instructions, and what a board answers is time.
+         */
+        if (preset != NULL && amp_from_preset(preset) == 0) {
+            bench_audio();
+        } else if (preset != NULL) {
+            ag_printf("stomp: no chain to measure\n");
+        }
+        if (!s_headless) {
+            bench(); /* releases the display itself, so the report is read */
+        }
         return 0;
     }
     ag_printf("stomp: %s, %d knobs, %ux%u\n", ag_amp_model_name(s_model),
@@ -1586,11 +1914,26 @@ int ag_main(int argc, char **argv)
             present();
             (void)amp_from_model(s_model);
         }
+        if (want_os > 0 && s_amp != NULL) {
+            /* ag_amp_set_voicing rather than set_knobs: the oversampling is the
+             * one setting whose state cannot survive the change, and nothing is
+             * playing yet, so clearing the filters costs nothing here. */
+            s_cfg.os = want_os;
+            s_fit.os = s_cfg.os;
+            if (ag_amp_set_voicing(s_amp, &s_cfg) == 0) {
+                ag_printf("stomp: oversampling %dx\n", want_os);
+            } else {
+                ag_printf("stomp: %dx is not an oversampling this chain has\n",
+                          want_os);
+            }
+        }
         for (i = 0; i < n_set; i++) {
             (void)pot_set(set[i]); /* after the chain, which brings its own */
         }
         if (sound_start(sink != NULL ? sink : "pcmnull", di_path) != 0) {
-            ag_gfx_release();
+            if (!s_headless) {
+                ag_gfx_release();
+            }
             return 1;
         }
         ag_printf("stomp: sound = %s @ %u Hz, %u frames a block\n", s_out.path,
@@ -1610,8 +1953,14 @@ int ag_main(int argc, char **argv)
         /*
          * With sound running the block is the clock and events are drained
          * between blocks; without it there is nothing to wait for but an event.
+         *
+         * Bounded, and that is not tidiness.  An unbounded drain hands the loop
+         * to whatever is posting: one device that reports continuously - a pad
+         * layer with nothing plugged into it will do - and the audio block below
+         * is never reached at all, which is a silence with no error in it.
          */
-        while (ag_poll_event(&ev, s_sound ? 0 : 100)) {
+        int drained = 0;
+        while (drained++ < 32 && ag_poll_event(&ev, s_sound ? 0 : 100)) {
             switch (ev.type) {
             case AG_EV_QUIT:
                 quit = 1;
@@ -1651,6 +2000,23 @@ int ag_main(int argc, char **argv)
                     s_hdr_ms = ms;
                     dirty(0, 0, (int)s_info.width, TOP_H);
                 }
+                /*
+                 * And the same numbers to the console, because on this board
+                 * the screen is a buffer nobody can see.  "It plays" and "it
+                 * plays without dropping blocks" are different claims, and only
+                 * the counters can tell them apart.
+                 */
+                if (ms - s_say_ms >= 2000u) {
+                    s_say_ms = ms;
+                    ag_pcm_poll_stats(&s_out);
+                    ag_printf("stomp: %u blocks, %u%% cpu, %u late, %u drop, "
+                              "amp %u%%, out %u%%%s\n",
+                              (unsigned)s_blocks, (unsigned)s_out.load_pct,
+                              (unsigned)s_out.late, (unsigned)s_out.drop,
+                              (unsigned)(s_amp_peak * 100.0f),
+                              (unsigned)(s_peak * 100.0f),
+                              s_out_clipped > 0u ? " CLIP" : "");
+                }
             }
             /*
              * The screen only when the block loop is ahead of the sink.  A full
@@ -1676,6 +2042,8 @@ int ag_main(int argc, char **argv)
     if (s_ir_ready) {
         ag_ir_free(&s_ir);
     }
-    ag_gfx_release();
+    if (!s_headless) {
+        ag_gfx_release();
+    }
     return 0;
 }

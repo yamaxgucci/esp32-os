@@ -16,7 +16,10 @@ have to select and then confirm.
 | `play take.wav` | a dry guitar at 22.05 kHz to run through it |
 | `out pcmvirt` | where the sound goes: `pcmvirt`, `pcmmix`, `pcmnull`, or a `.wav` |
 | `pot drive=8` | a knob, before anything is played |
-| `bench` | what the screen costs, and exit |
+| `os 2` | the oversampling, over whatever the preset was baked with |
+| `cabms 46` | keep only that much of the cabinet's impulse |
+| `vol 6` | the output trim after the cabinet, 5 being unity |
+| `bench` | what the screen and the chain cost, and exit |
 
 With no `play` and no `out` it is silent and only draws — which is the mode the
 screen was built and measured in.
@@ -154,6 +157,44 @@ any other.
 The output is clipped at the 16-bit rail and the count is printed on exit, the
 same convention `tube_render` writes its listening files with.  With the master
 at noon a hot DI runs into the rail; that is what the master is for.
+
+## On a board, where the answer is time
+
+The emulator can only count instructions.  A board answers in microseconds, and
+the two differ by about a factor of two — QEMU models neither the FPU's latency
+on a dependent chain nor a cache miss.  **Quote the board for anything about
+keeping up.**  `run c:\stomp.axe c:\<model>.preset bench` measures the chain
+against the block it has to fit in: 256 frames at 22.05 kHz is 11609 µs.
+
+Measured on a Waveshare ESP32-S3-Zero with a CS4344, jcm800, two stages:
+
+| | µs | of the block |
+| --- | ---: | ---: |
+| valves 1× + adaa | 1935 | 16% |
+| valves 2× + adaa | 4071 | 35% |
+| valves 4× + adaa | 7429 | 63% |
+| cabinet, 200 ms, 18 partitions | 4089 | 35% |
+| cabinet, 45 ms, 4 partitions | 1452 | 12% |
+| cabinet, 22 ms, 2 partitions | 1297 | 11% |
+
+Two things follow.
+
+**The cabinet costs what its impulse is long.**  The convolution is partitioned
+in blocks of `AG_IR_BLOCK`, so 200 ms is eighteen partitions and 46 ms is four.
+A loudspeaker's impulse is mostly over in a few tens of milliseconds and the
+rest is room — but truncating it changes what the matching walk fitted, so
+`cabms` is a number to be listened to and measured, not a default to be assumed.
+
+**Where the curve tables live decides whether it plays at all.**  Every
+oversampled sample reads them.  In PSRAM they cost the valves about 11% more
+than in internal SRAM, and 48 KB is what fits — which is why the tables are
+sized by the preset's real stage count rather than by `AG_AMP_STAGES`.  Getting
+them there needed a kernel fix: the ABI's capability bits and the port's are
+different numbers with the same names, so `ag_malloc_caps(n, AG_MEM_FAST)` was
+asking the heap for executable memory and being refused at every size.
+
+With the curves in internal SRAM and a 45 ms cabinet, **4× with antialiasing
+runs at 76% of the block** — 82–84% on the board including the screen, no drops.
 
 ## What is on the card
 

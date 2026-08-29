@@ -812,12 +812,19 @@ int   ag_amp_no_interstage_gain(ag_amp_t *a);
 uint32_t ag_amp_preset_size(int n_stages, int tab_n, int ir_frames);
 
 /*
- * The number of points the curves in this blob have, or -1 if it is not a
- * preset this build reads.  Ask before allocating: ag_amp_preset_load wants
- * AG_AMP_STAGES * 3 * tab_n floats and takes tab_n from the file, so a loader
- * that assumed AG_AMP_TAB_N would be written past by a preset baked with more.
+ * What shape the curves in this blob are: how many points each has and how many
+ * stages there are.  Returns 0, or -1 if it is not a preset this build reads.
+ *
+ * Ask before allocating, for two reasons.  ag_amp_preset_load takes tab_n from
+ * the file, so a loader that assumed AG_AMP_TAB_N would be written past by a
+ * preset baked with more.  And the load only fills the stages the preset has -
+ * so a two-stage chain needs `n_stages * 3 * tab_n` floats and not
+ * `AG_AMP_STAGES * 3 * tab_n`, which is the difference between 48 KB that fits
+ * in internal SRAM and 96 KB that does not.  Where those floats live decides
+ * whether the amplifier makes its deadline: every oversampled sample reads
+ * them.
  */
-int ag_amp_preset_tab_n(const void *buf, uint32_t n);
+int ag_amp_preset_shape(const void *buf, uint32_t n, int *tab_n, int *n_stages);
 
 /*
  * Write `a` into `buf`, with `ir` as its loudspeaker.  int16 because that is what

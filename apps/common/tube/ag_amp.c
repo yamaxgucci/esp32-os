@@ -2362,16 +2362,17 @@ static uint32_t preset_ir_off(uint32_t n_stages, uint32_t tab_n)
 }
 
 /*
- * How many points a preset's curves have, so that a loader can size the buffer
+ * What shape a preset's curves are, so that a loader can size the buffer
  * ag_amp_preset_load insists on before it calls it.
  *
- * Without this the contract cannot be met: the load wants
- * AG_AMP_STAGES * 3 * tab_n floats and takes tab_n from the file, so a caller
- * that guessed AG_AMP_TAB_N and met a preset baked with more would be told
- * nothing and would be written past.  A device that loads presets off a card
- * reads them from wherever the card came from.
+ * Without this the contract cannot be met: the load takes tab_n from the file,
+ * so a caller that guessed AG_AMP_TAB_N and met a preset baked with more would
+ * be told nothing and would be written past.  And the stage count is not
+ * decoration either - the load only fills the stages the preset has, so a
+ * two-stage chain needs 48 KB of floats where AG_AMP_STAGES would ask for 96,
+ * which is the difference between fitting in internal SRAM and not.
  */
-int ag_amp_preset_tab_n(const void *buf, uint32_t n)
+int ag_amp_preset_shape(const void *buf, uint32_t n, int *tab_n, int *n_stages)
 {
     const amp_preset_head_t *h = (const amp_preset_head_t *)buf;
     if (buf == 0 || n < sizeof(amp_preset_head_t)) {
@@ -2380,7 +2381,13 @@ int ag_amp_preset_tab_n(const void *buf, uint32_t n)
     if (h->magic != AG_AMP_PRESET_MAGIC || h->ver != AG_AMP_PRESET_VER) {
         return -1;
     }
-    return (int)h->tab_n;
+    if (tab_n != 0) {
+        *tab_n = (int)h->tab_n;
+    }
+    if (n_stages != 0) {
+        *n_stages = (int)h->n_stages;
+    }
+    return 0;
 }
 
 uint32_t ag_amp_preset_size(int n_stages, int tab_n, int ir_frames)

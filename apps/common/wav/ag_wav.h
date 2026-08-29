@@ -20,6 +20,18 @@ typedef struct ag_wav_pcm {
  */
 int ag_wav_load(const char *path, ag_wav_pcm_t *out);
 
+/*
+ * The same, stopping after `max_frames` (0 for the built-in 30-second cap).
+ *
+ * For a caller that would rather have the beginning of a file than nothing at
+ * all.  A board's arena is not a PC's: a seven-second take at 22.05 kHz is 308
+ * KB in one block, and the S3-Zero's largest free block is 192 - so the choice
+ * is between four seconds of the take and a failure that reads as "cannot read
+ * the file".  Ask for what fits and say so; a take that is played in a loop
+ * loses nothing by being shorter.
+ */
+int ag_wav_load_max(const char *path, ag_wav_pcm_t *out, uint32_t max_frames);
+
 void ag_wav_free(ag_wav_pcm_t *w);
 
 #endif /* AG_WAV_H */

@@ -157,27 +157,34 @@ class Board:
                 return True
         return False
 
-    def put(self, host_path, guest_path):
+    def put(self, host_path, guest_path, chunk_bytes=32):
         """Deliver a file through `recv`, the hex path documented in
         05-status.md.  Slow (two characters on the wire per byte, and the
         guest echoes them back) but it is the only path a board has before it
-        has a card, and it is the same one a person would use by hand."""
+        has a card, and it is the same one a person would use by hand.
+
+        The cost is a round trip per line, not the wire: this waits for each
+        line to come back before sending the next, so a 32-byte line means a
+        handshake every 32 bytes and 58 KB takes eight minutes.  `chunk_bytes`
+        raises that; the ceiling is the guest's line buffer, AG_LINE_MAX = 256,
+        which is 127 bytes of hex plus the terminator."""
         with open(host_path, "rb") as f:
             data = f.read()
+        if chunk_bytes < 1 or chunk_bytes > 127:
+            raise ValueError("chunk must be 1..127 bytes (AG_LINE_MAX is 256)")
 
         self.send(b"recv " + guest_path.encode("latin-1") + b"\r")
         if not self.wait_for(b"send hex", 5.0):
             raise RuntimeError(f"recv {guest_path}: the guest never asked for hex")
 
-        # 32 bytes a line: short enough that a lost line is cheap to see in the
-        # transcript, long enough that the per-line echo is not the whole cost.
-        for i in range(0, len(data), 32):
-            chunk = data[i:i + 32].hex().encode("ascii")
+        for i in range(0, len(data), chunk_bytes):
+            chunk = data[i:i + chunk_bytes].hex().encode("ascii")
             self.send(chunk + b"\r")
             # The handshake is the echo of the line itself.  Not a newline:
             # what comes back is a screen being redrawn, and the renderer
             # expresses the end of a line as a cursor move, not as \n.
-            if not self.wait_for(chunk[-8:], 5.0):
+
+            if not self.wait_for(chunk[-8:], 15.0):
                 raise RuntimeError(f"recv {guest_path}: stalled at byte {i}")
 
         self.send(b"END\r")
@@ -208,6 +215,10 @@ def main():
     ap.add_argument("--no-reset", action="store_true",
                     help="attach to a board that is already running")
     ap.add_argument("--quiet", action="store_true", help="do not echo the wire")
+    ap.add_argument("--chunk", type=int, default=32, metavar="N",
+                    help="bytes of payload per hex line during --put (1..127; "
+                         "32 is the old default, 112 is about four times "
+                         "faster because the cost is a round trip a line)")
     ap.add_argument("--put", action="append", default=[],
                     metavar="HOST=GUEST",
                     help="deliver a file through `recv` before the commands, "
@@ -245,7 +256,7 @@ def main():
             host, _, guest = spec.partition("=")
             if not guest:
                 sys.exit(f"boardtest: --put wants HOST=GUEST, got '{spec}'")
-            board.put(host, guest)
+            board.put(host, guest, args.chunk)
 
         failed = []
         for cmd in args.commands:

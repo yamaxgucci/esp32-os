@@ -1337,6 +1337,34 @@ ag_err_t ag_proc_info(uint32_t index, ag_procinfo_t *out)
 /* What the syscall table forwards here                                   */
 /* ---------------------------------------------------------------------- */
 
+/*
+ * An application's capability bits, which are not the port's.
+ *
+ * <argon/abi.h> gives an application AG_MEM_FAST = 1, AG_MEM_DMA = 2,
+ * AG_MEM_EXEC = 4.  The port names the same ideas after whatever its allocator
+ * already speaks, and on the IDF that is MALLOC_CAP_EXEC = 1, MALLOC_CAP_8BIT =
+ * 4, MALLOC_CAP_DMA = 8.  Both headers are in scope in this file and the port's
+ * macros win - the enumerators in abi.h are textually replaced before the
+ * compiler sees the enum, so it still compiles and every bare use of the name
+ * here means the port's number.
+ *
+ * Comparing an application's mask against those was reading one language as
+ * another, and it was silent.  `ag_malloc_caps(n, AG_MEM_FAST)` arrived as 1,
+ * matched the port's EXEC, and asked the heap for executable byte-addressable
+ * memory - a combination this chip has no region for - so the answer was NULL
+ * at every size, from 48 KB down to 4, while 151 KB of internal SRAM sat free.
+ * The application saw a refusal and fell back to PSRAM, where the curve tables
+ * an amplifier reads on every oversampled sample are worth about half its
+ * deadline.  AG_MEM_ZERO (8) read as the port's DMA had the same shape: memory
+ * that was asked to be zeroed and was not.
+ *
+ * So: translate at the boundary, and never compare the two vocabularies again.
+ */
+#define ABI_MEM_FAST    (1u << 0)
+#define ABI_MEM_DMA     (1u << 1)
+#define ABI_MEM_EXEC    (1u << 2)
+#define ABI_MEM_ZERO    (1u << 3)
+
 void *ag_proc_alloc(size_t bytes, uint32_t caps)
 {
     if (bytes == 0) {
@@ -1351,17 +1379,19 @@ void *ag_proc_alloc(size_t bytes, uint32_t caps)
      * down one by one - and if there is no room to write one down, the
      * allocation is refused rather than leaked past the end of the process.
      */
-    const uint32_t special = AG_MEM_FAST | AG_MEM_DMA | AG_MEM_EXEC;
+    const uint32_t special = ABI_MEM_FAST | ABI_MEM_DMA | ABI_MEM_EXEC;
     if (p == NULL || (caps & special) != 0) {
         uint32_t want = AG_MEM_BYTE;
-        if (caps & AG_MEM_FAST) {
+        if (caps & ABI_MEM_FAST) {
             want |= AG_MEM_FAST;
         }
-        if (caps & AG_MEM_DMA) {
+        if (caps & ABI_MEM_DMA) {
             want |= AG_MEM_DMA;
         }
-        if (caps & AG_MEM_EXEC) {
-            want |= AG_MEM_EXEC;
+        if (caps & ABI_MEM_EXEC) {
+            /* Executable memory is not byte-addressable everywhere, and asking
+             * for both is how a request finds no region at all. */
+            want = (want & ~(uint32_t)AG_MEM_BYTE) | AG_MEM_EXEC;
         }
         if ((caps & special) == 0) {
             want |= AG_MEM_SLOW;
@@ -1385,7 +1415,7 @@ void *ag_proc_alloc(size_t bytes, uint32_t caps)
                 return NULL;
             }
         }
-        if (caps & AG_MEM_ZERO) {
+        if (caps & ABI_MEM_ZERO) {
             memset(ptr, 0, bytes);
         }
         return ptr;
@@ -1396,7 +1426,7 @@ void *ag_proc_alloc(size_t bytes, uint32_t caps)
     }
 
     void *ptr = ag_port_heap_alloc(p->heap, bytes);
-    if (ptr != NULL && (caps & AG_MEM_ZERO)) {
+    if (ptr != NULL && (caps & ABI_MEM_ZERO)) {
         memset(ptr, 0, bytes);
     }
     return ptr;
