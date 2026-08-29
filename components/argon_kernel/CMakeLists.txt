@@ -19,6 +19,7 @@ set(ARGON_KERNEL_SRCS
     "src/console/vtin.c"
     "src/console/console.c"
     "src/console/uart_console.c"
+    "src/console/telnet_console.c"
     "src/dev/device.c"
     "src/dev/devfs.c"
     "src/dev/devices.c"

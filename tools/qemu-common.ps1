@@ -334,7 +334,9 @@ function Get-QemuNetArgs {
     param([int]$HostPort = 5558, [int]$GuestPort = 5558)
     $fwd = "hostfwd=tcp:127.0.0.1:{0}-:{1}" -f $HostPort, $GuestPort
     if ($HostPort -eq 5558 -and $GuestPort -eq 5558) {
-        $fwd = "hostfwd=tcp:127.0.0.1:5558-:5558,hostfwd=tcp:127.0.0.1:5559-:5559,hostfwd=tcp:127.0.0.1:5560-:5560,hostfwd=tcp:127.0.0.1:5561-:5561"
+        # 5558-5561: PCM / MIDI / mouse / kbd virt helpers.  2323->23: reach the
+        # guest's telnet console from the host (CONFIG_ARGON_NET_TELNET).
+        $fwd = "hostfwd=tcp:127.0.0.1:5558-:5558,hostfwd=tcp:127.0.0.1:5559-:5559,hostfwd=tcp:127.0.0.1:5560-:5560,hostfwd=tcp:127.0.0.1:5561-:5561,hostfwd=tcp:127.0.0.1:2323-:23"
     }
     return @(
         '-nic', ("user,model=open_eth,id=argon0,{0}" -f $fwd)

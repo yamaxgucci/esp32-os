@@ -309,6 +309,22 @@ menu "ArgonOS"
             as on a board over Wi-Fi.  Small - the SNTP client is a few hundred
             bytes and runs only while a sync is in flight.
 
+    config ARGON_NET_TELNET
+        bool "Telnet console on TCP :23"
+        depends on ARGON_ENABLE_NET
+        default y
+        help
+            A second way onto the console, over the network: `telnet on` opens a
+            TCP listener (port 23 by default) and every connection becomes a
+            console endpoint - the same shell, editor and file manager the UART
+            carries, over telnet, with the VT100 screen intact.  Up to two
+            sessions at once; the listener costs one small task while it is up.
+
+            It is the console, so it is a login with no login: anyone who can
+            reach the port has the shell.  Off unless `telnet on` (or [telnet]
+            in SYSTEM.CFG) asks - a board on an open network should not answer
+            on 23 by accident.  Verified in QEMU (hostfwd to :23).
+
     config ARGON_BOARD_PROBE
         bool "Board probe instead of the system"
         default n

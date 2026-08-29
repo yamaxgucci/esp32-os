@@ -36,6 +36,7 @@
 #include <time.h>
 
 #include <argon/net.h>
+#include "console/telnet_console.h"
 #include <argon/port/bt.h>
 #include <argon/port/ble.h>
 #include <argon/port/io.h>
@@ -523,6 +524,35 @@ static int cmd_date(int argc, char **argv)
     }
     return 0;
 }
+
+#if defined(CONFIG_ARGON_NET_TELNET) && CONFIG_ARGON_NET_TELNET
+static int cmd_telnet(int argc, char **argv)
+{
+    if (argc >= 2 && ag_path_icmp(argv[1], "on") == 0) {
+        const uint16_t port = (argc >= 3) ? (uint16_t)atoi(argv[2]) : 0;
+        const ag_err_t err = ag_telnet_start(port);
+        if (err != AG_OK) {
+            ag_console_printf("telnet on: %s\n",
+                              ag_loader_api()->sys->strerror(err));
+            return 1;
+        }
+        ag_console_printf("telnet listening on port %u\n",
+                          (unsigned)ag_telnet_port());
+        return 0;
+    }
+    if (argc >= 2 && ag_path_icmp(argv[1], "off") == 0) {
+        ag_telnet_stop();
+        ag_console_puts("telnet off\n");
+        return 0;
+    }
+    if (ag_telnet_running()) {
+        ag_console_printf("telnet on, port %u\n", (unsigned)ag_telnet_port());
+    } else {
+        ag_console_puts("telnet off ('telnet on' to open the console on :23)\n");
+    }
+    return 0;
+}
+#endif /* CONFIG_ARGON_NET_TELNET */
 
 static int cmd_color(int argc, char **argv)
 {
@@ -4340,6 +4370,9 @@ static const ag_command_t k_commands[] = {
      ag_cmd_wget},
     {"ftp", "<host> [user] [pass]", "file transfer session", ag_cmd_ftp},
     /* httpd is a loadable app now (HTTPD.AXE), not a built-in - run it by name. */
+#if defined(CONFIG_ARGON_NET_TELNET) && CONFIG_ARGON_NET_TELNET
+    {"telnet", "[on [port]|off]", "the console over TCP :23", cmd_telnet},
+#endif
 #endif
 #if AG_PORT_HAS_BT
     {"bt", "[on|off|scan|open <#|addr>|close|forget]", "bluetooth input", cmd_bt},
