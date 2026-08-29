@@ -33,7 +33,7 @@
  * linear-phase filter rings before the event, and pre-ringing in front of a
  * clipper adds an overshoot the circuit does not have.
  *
- * SPDX-License-Identifier: Apache-2.0
+ * SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
  */
 #ifndef AG_BIQ_H
 #define AG_BIQ_H

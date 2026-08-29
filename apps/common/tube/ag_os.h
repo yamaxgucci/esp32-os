@@ -29,7 +29,7 @@
  * 0.25 filtered at 42 kHz instead of 22, removed nothing, and measured 8 dB
  * *more* aliasing than no oversampling at all (rake 8 in docs/08).
  *
- * SPDX-License-Identifier: Apache-2.0
+ * SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
  */
 #ifndef AG_OS_H
 #define AG_OS_H

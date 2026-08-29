@@ -49,7 +49,7 @@
  * step with the first, and it wants the same host test that ag_stage has, the
  * fast path against the solver to a millivolt.
  *
- * SPDX-License-Identifier: Apache-2.0
+ * SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
  */
 #ifndef AG_TUBE_H
 #define AG_TUBE_H

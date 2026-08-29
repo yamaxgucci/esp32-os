@@ -22,7 +22,7 @@
  *    filters must be measured rather than assumed - a decimator with its corner
  *    in the wrong place measured 8 dB *more* aliasing than none at all.
  *
- * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
  */
 #include "test.h"
 

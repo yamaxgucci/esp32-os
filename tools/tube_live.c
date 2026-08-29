@@ -46,7 +46,7 @@
  * when the default take became a 44.1 kHz file the same six blocks became 35 ms
  * and the tool crackled.
  *
- * SPDX-License-Identifier: Apache-2.0
+ * SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
  */
 #include "nam.h"
 

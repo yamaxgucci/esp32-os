@@ -41,7 +41,7 @@
  * So the two knobs that are taste are named as taste, and the rest cannot be
  * turned without changing a component.
  *
- * SPDX-License-Identifier: Apache-2.0
+ * SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
  */
 #ifndef AG_AMP_H
 #define AG_AMP_H

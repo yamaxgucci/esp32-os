@@ -19,7 +19,7 @@
  *    is the whole reason for preferring a circuit to a waveshaper - symmetric
  *    clipping is a fuzz box, not an amplifier.
  *
- * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
  */
 #include "test.h"
 

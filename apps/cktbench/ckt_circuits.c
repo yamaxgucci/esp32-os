@@ -1,6 +1,6 @@
 /*
  * Netlists for the benchmark and for the host tests.
- * SPDX-License-Identifier: Apache-2.0
+ * SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
  */
 #include "ckt_circuits.h"
 

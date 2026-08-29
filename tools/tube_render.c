@@ -30,7 +30,7 @@
  * Built by host-tests/CMakeLists.txt, so `argon tests` produces
  * build-host/tube_render(.exe).
  *
- * SPDX-License-Identifier: Apache-2.0
+ * SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
  */
 #include <math.h>
 #include <stdint.h>
