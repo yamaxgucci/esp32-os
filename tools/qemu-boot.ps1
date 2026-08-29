@@ -36,6 +36,8 @@ param(
     [int]$HostFsPort = 5557,
     [switch]$NoNet,
     [int]$NetPort = 5558,
+    # PSRAM the emulated part carries: 8 (default, the smaller module) or 16.
+    [int]$Psram = 8,
     # Tie virtual time to instructions retired instead of to host time.
     #
     # Without this, neither clock the guest can read means anything about the
@@ -111,7 +113,7 @@ if ($HostFs) {
 # wait=on is essential: a TCP serial port with no peer throws its output away,
 # and the whole boot is over in a quarter of a second.  Without it the test
 # races the emulator and loses often enough to be useless.
-$qemuArgs = (Get-QemuMachineArgs -EfusePath $efuse) + @(
+$qemuArgs = (Get-QemuMachineArgs -EfusePath $efuse -PsramMb $Psram) + @(
     '-display', 'none'
     '-monitor', 'none'
     '-serial', "tcp:127.0.0.1:$Port,server=on,wait=on"

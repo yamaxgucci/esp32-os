@@ -1,8 +1,22 @@
-# Fallout (`FALLOUT.AXE`)
+# Fallout (`FALLOUT.AXE`, `FALLOUT2.AXE`)
 
-[fallout1-ce](https://github.com/alexbatalov/fallout1-ce) — Alexander Batalov's
-reverse-engineered Fallout 1 — as an ArgonOS `.AXE`. 128k lines of C++ compiled
-for the ESP32-S3, running from flash XIP with 1.8 MB of data in PSRAM.
+[fallout1-ce](https://github.com/alexbatalov/fallout1-ce) and
+[fallout2-ce](https://github.com/alexbatalov/fallout2-ce) — Alexander Batalov's
+reverse-engineered Fallout 1 and 2 — as ArgonOS `.AXE` images. Compiled for the
+ESP32-S3, running from flash XIP with the data in PSRAM.
+
+**Fallout 2 plays its opening cinematic on an ESP32-S3.** 2502 frames of
+`intro.mve` at 640×480, none dropped. Everything before it works: the 326 MB
+`MASTER.DAT` is opened off a FAT32 card, its 23120-entry index parsed, the art
+and protos and scripts loaded, the audio device opened.
+
+| | Fallout 1 | Fallout 2 |
+|---|---|---|
+| translation units compiled | 108 of 108 | 126 of 126 |
+| code, after `--gc-sections` | 453 KB | 761 KB |
+| data (mostly bss) | 1.82 MB | 1.91 MB |
+| extended memory asked for | 5.75 MB | 12 MB on a 16 MB part |
+| game data on the card | — | 562 MB |
 
 **Where it is.** The engine runs the whole of `game_init` and stops where the
 art data is not there:
@@ -154,19 +168,61 @@ through every frame. The engine registers one: the 40 ms sound fade. It
 therefore advances at the frame rate, which on a slower machine is a slower
 fade; the alternative is a fourth thread for something nobody hears.
 
-## The data
+## Running it
 
-`MASTER.DAT`, `CRITTER.DAT` and the `DATA` folder from a copy of the game, at
-the root of the card next to `FALLOUT.AXE`. Nobody else's to distribute, and
-the engine looks for them relative to where it was started.
+The game data is nobody's to distribute: supply your own. `MASTER.DAT`,
+`CRITTER.DAT` and the `DATA` folder go at the root of the card, beside the
+`.AXE` and `fallout2.cfg`.
 
-Until they are there, `apps/fallout/testdata` gets the engine through
-`game_init` on a database with nothing in it - see its README. That is how
-everything above was tested.
+```
+python apps/fallout/build.py --game 2 --arena-kb 12000
+```
 
-Once they are: 400 MB of `.DAT` over SPI, seeked rather than streamed. That is
-where the real performance question lives, and nothing measured so far says
-anything about it.
+```
+argon sync build\fo2_card -SizeMB 1024
+```
+
+```
+argon test -Sd -Psram 16 "run a:\fallout2.axe"
+```
+
+Three things there are not decoration:
+
+**`-SizeMB 1024`.** The game is 562 MB and a FAT16 image stops at 512, so this
+is a FAT32 card - `mkfatimg` picks the format by size. QEMU's SD model wants a
+power of two, so 700 MiB silently produces a machine that will not start.
+
+**`-Psram 16`.** The default emulated part has 8 MB, and Fallout 2 does not fit
+in it: `wmConfigInit` runs out while loading the encounter tables. 16 MB is the
+other size a real S3 module comes in, and 16 + 8 of flash still fits the 32 MB
+data-bus window.
+
+**`--arena-kb 12000`.** The process asks for its extended memory rather than
+taking the default quarter-of-what-is-free. See the comment on `AG_APP_SIZED`
+in `fallout_main.cc` - the two `.DAT` indices alone are 1.7 MB.
+
+`fallout2.cfg` matters too, for one line: `art_cache_size=1`. The stock value
+is 8, in megabytes, reserved whole at startup.
+
+## Where the memory goes
+
+| | |
+|---|---|
+| `MASTER.DAT` index, 23120 entries | ~1.3 MB |
+| `CRITTER.DAT` index, 7120 entries | ~0.4 MB |
+| art cache (`art_cache_size`) | 1 MB |
+| 640×480 screen buffer | 300 KB |
+
+Each `.DAT` entry is a descriptor plus a separately allocated path, and the
+index is read entry by entry - about 150000 small reads for the two of them,
+which is most of the ten seconds before the first frame.
+
+Running out does not announce itself in the engine: `dbaseOpen` stops reading
+entries at the first failed allocation and hands back the half-built table
+anyway, and the binary search over it then cannot find files that are
+demonstrably in the archive. `apps/common/libc` now prints the first failed
+`malloc` with the arena's state, which is what turned that into a one-line
+answer instead of an afternoon.
 
 ## Notes for whoever picks this up
 
@@ -186,3 +242,19 @@ anything about it.
   `debug_printf` is compiled out without it, and the engine then stops halfway
   in silence. An afternoon went into finding out that the silence was the build
   flag rather than a fault.
+- `%.4s` is a precision, and the shim's `snprintf` used to parse it and throw it
+  away. Fallout builds the name of a message file that way — `pro_%.4s.msg` of
+  `"items"` — so the engine asked the archive for `pro_items.msg`, was told
+  there was no such file, and reported that it could not load its prototypes.
+  Fixed in `apps/common/libc`, where it had been wrong for every port.
+- Fallout 2 uses `std::ofstream` in `display_monitor.cc` and `std::random_device`
+  in `sfall_arrays.cc`. Either one pulls in the whole of libstdc++'s iostreams
+  and locale, which then calls newlib's stdio and its string-to-number
+  conversions — the same names the libc shim defines. `build.py` links, sees
+  which symbols collide, checks that ours were defined first, and only then
+  retries with `--allow-multiple-definition`. A collision between two of our
+  own files still fails, which is the point.
+- Three engine files use `getenv`, `pow` and `sqrtf` without including the
+  header that declares them. That compiles against glibc and not against
+  newlib. `port/engine_prelude.h` is forced in front of every translation unit
+  with `-include`; the engine is vendored and is not ours to edit.

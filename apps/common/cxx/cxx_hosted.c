@@ -175,6 +175,27 @@ int pthread_cancel(pthread_t thread)
     return ENOSYS;
 }
 
+/*
+ * std::call_once, underneath.  The flag is a word the caller owns, and the
+ * contract is that the function runs exactly once however many threads arrive.
+ *
+ * Not locked, for the same reason the static guards above are not: a lock here
+ * needs an atomic the ABI does not expose.  The single-threaded case - which
+ * is every once-flag any port has reached so far, because they are all
+ * initialisation - is correct.
+ */
+int pthread_once(pthread_once_t *once, void (*fn)(void))
+{
+    if (once == NULL || fn == NULL) {
+        return EINVAL;
+    }
+    if (!once->init_executed) {
+        once->init_executed = 1;
+        fn();
+    }
+    return 0;
+}
+
 /* ---- thread-specific data ------------------------------------------------ */
 
 /*

@@ -20,7 +20,51 @@
  * image.  Ask for what fits internal memory, and find out what the engine
  * really needs from the "stack bytes unused" line the kernel prints on exit.
  */
-AG_APP("FALLOUT", "0.1", "argon", 0);
+/*
+ * Four megabytes of arena, asked for rather than taken.
+ *
+ * The default is a quarter of free extended memory, which here is about one and
+ * a half - and the .DAT index alone does not fit in that.  Fallout 2's
+ * master.dat has 23120 entries and critter.dat another 7120; each one is a
+ * descriptor and a separately allocated path, and the two indices together are
+ * a little over 1.7 MB before the game has drawn anything.  On top of that go
+ * the 640x480 screen buffer and the art cache.
+ *
+ * Running out does not announce itself: dbaseOpen stops reading entries at the
+ * first failed allocation and returns the half-built table anyway, and the
+ * binary search over it then cannot find fonts that are demonstrably in the
+ * archive.  That is what this number is here to prevent.
+ *
+ * On top of that goes the art cache, which the engine reserves whole at
+ * startup: art_cache_size in the .cfg is in megabytes and its default is
+ * eight.  Put 1 there - see apps/fallout/fallout2.cfg - or artInit fails and
+ * says only "cache_init failed in art_init".
+ *
+ * A named size is required rather than preferred, so the process is refused if
+ * it cannot be had.  With 8 MB of PSRAM and 1.9 MB of image data, five leaves
+ * about one spare.
+ */
+#ifndef AG_FALLOUT_GAME
+#define AG_FALLOUT_GAME 1
+#endif
+
+/*
+ * The number is a build option because the right one depends on the board.
+ * 5875 KB is what fits beside a 1.9 MB image on a part with 8 MB of PSRAM,
+ * which is what QEMU emulates and what the smaller S3 modules carry.  On a
+ * 16 MB module there is room for twice that, and Fallout 2 will take it:
+ *
+ *     python apps/fallout/build.py --arena-kb 12000
+ */
+#ifndef AG_FALLOUT_ARENA_KB
+#define AG_FALLOUT_ARENA_KB 5875
+#endif
+
+#if AG_FALLOUT_GAME == 2
+AG_APP_SIZED("FALLOUT2", "0.1", "argon", 0, 0, AG_FALLOUT_ARENA_KB * 1024);
+#else
+AG_APP_SIZED("FALLOUT", "0.1", "argon", 0, 0, AG_FALLOUT_ARENA_KB * 1024);
+#endif
 
 /* Defined by the engine.  Declared here rather than included: winmain.cc has
  * no header, and the signature is fixed by the language. */
@@ -61,7 +105,7 @@ static int to_int(const char *s)
  */
 extern "C" int ag_cxx_main(int argc, char **argv)
 {
-    ag_printf("FALLOUT - fallout1-ce on ArgonOS\n");
+    ag_printf("fallout%d-ce on ArgonOS\n", AG_FALLOUT_GAME);
 
     const char *shot = NULL;
     int frames = 1;

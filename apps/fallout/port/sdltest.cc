@@ -34,6 +34,15 @@ extern "C" bool sdl_shim_display(ag_gfxinfo_t *out);
 
 static int s_failures;
 
+static bool same(const char *a, const char *b)
+{
+    while (*a != '\0' && *a == *b) {
+        ++a;
+        ++b;
+    }
+    return *a == *b;
+}
+
 static void check(const char *what, bool ok)
 {
     ag_printf("%-38s %s\n", what, ok ? "ok" : "FAIL");
@@ -233,6 +242,23 @@ extern "C" int ag_cxx_main(int argc, char **argv)
 
         write_ppm(out, fb, w, h, (int)gi.stride);
     }
+
+    /* --- the formatter ---------------------------------------------------- */
+
+    /*
+     * Not SDL, and here anyway.  Fallout builds the name of a message file as
+     * "pro_%.4s.msg" of "items", and a snprintf that parses the precision and
+     * throws it away asks the archive for pro_items.msg - which is not in it.
+     * The engine then reports that it cannot load its prototypes, and the
+     * formatter is the last place anyone looks.
+     */
+    char fbuf[64];
+    snprintf(fbuf, sizeof(fbuf), "pro_%.4s%s", "items", ".msg");
+    check("snprintf honours %.4s", same(fbuf, "pro_item.msg"));
+    snprintf(fbuf, sizeof(fbuf), "[%8s][%-8s]", "ab", "cd");
+    check("snprintf pads and justifies", same(fbuf, "[      ab][cd      ]"));
+    snprintf(fbuf, sizeof(fbuf), "%.2s%.0s%s", "abcdef", "ghi", "!");
+    check("snprintf precision zero", same(fbuf, "ab!"));
 
     /* --- the resampler ---------------------------------------------------- */
 

@@ -74,4 +74,35 @@ int closedir(DIR *dir)
     return 0;
 }
 
+/*
+ * Two DOS extensions the map editor still uses.  In place, returning the same
+ * pointer, which is what every implementation that ever shipped did.
+ *
+ * ASCII only: the engine's own text is ASCII, and a case table for anything
+ * else would have to know a code page that the game does not tell anyone.
+ */
+char *strupr(char *s)
+{
+    if (s != NULL) {
+        for (char *p = s; *p != '\0'; ++p) {
+            if (*p >= 'a' && *p <= 'z') {
+                *p = (char)(*p - 'a' + 'A');
+            }
+        }
+    }
+    return s;
+}
+
+char *strlwr(char *s)
+{
+    if (s != NULL) {
+        for (char *p = s; *p != '\0'; ++p) {
+            if (*p >= 'A' && *p <= 'Z') {
+                *p = (char)(*p - 'A' + 'a');
+            }
+        }
+    }
+    return s;
+}
+
 }  // extern "C"

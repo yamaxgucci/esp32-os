@@ -34,6 +34,7 @@ third_party/fallout1-ce/
 third_party/fallout2-ce/
 third_party/adecode-src/
 third_party/fpattern-src/
+third_party/zlib-src/
 
 # Reference recordings, cabinet impulses and NAM captures: third party, and
 # 177 MB of them. assets/audio/guitar-di/README.md says what each one is, where

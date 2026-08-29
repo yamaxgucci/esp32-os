@@ -21,7 +21,9 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <sys/times.h>
 #include <time.h>
+#include <unistd.h>
 
 /* Where the standard three end and real files begin. */
 #define FD_BIAS 3
@@ -31,6 +33,73 @@ extern "C" {
 static ag_handle_t handle_of(int fd)
 {
     return (ag_handle_t)(fd - FD_BIAS);
+}
+
+/*
+ * The working directory.  Fallout 2 changes into each of its data directories
+ * to search them and changes back - xbaseOpen does it several times per file -
+ * so these are not decoration.
+ *
+ * ArgonOS has a current directory of its own, per process, which is what the
+ * shell prints in its prompt.  There is nothing to emulate.
+ */
+char *getcwd(char *buf, size_t size)
+{
+    if (buf == NULL || size == 0) {
+        errno = EINVAL;
+        return NULL;
+    }
+    if (ag_getcwd(buf, size) != AG_OK) {
+        errno = ERANGE;
+        return NULL;
+    }
+    return buf;
+}
+
+int chdir(const char *path)
+{
+    if (path == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (ag_chdir(path) != AG_OK) {
+        errno = ENOENT;
+        return -1;
+    }
+    return 0;
+}
+
+/*
+ * Four stubs newlib insists on having somewhere before it will link.
+ *
+ * They arrive with clock(), raise() and the random number seeding, none of
+ * which this program can do anything useful with: there is one process, it
+ * cannot signal itself, and the entropy it would be given is not entropy.  A
+ * failure return is the honest answer and the callers all check.
+ */
+int _getpid(void) { return 1; }
+
+int _kill(int pid, int sig)
+{
+    (void)pid;
+    (void)sig;
+    errno = EINVAL;
+    return -1;
+}
+
+clock_t _times(struct tms *buf)
+{
+    (void)buf;
+    errno = ENOSYS;
+    return (clock_t)-1;
+}
+
+int _getentropy(void *buf, size_t len)
+{
+    (void)buf;
+    (void)len;
+    errno = ENOSYS;
+    return -1;
 }
 
 int _open(const char *path, int flags, ...)

@@ -24,12 +24,34 @@ FILE *stdin = &s_stdin;
 FILE *stdout = &s_stdout;
 FILE *stderr = &s_stderr;
 
+/*
+ * A failed allocation is the quietest failure there is.  A vendored engine
+ * checks the pointer, gives up on whatever it was doing, and reports something
+ * unrelated three layers up - "Error: Loading proto message files!" when what
+ * actually happened is that the arena was full.  So the first one says so.
+ *
+ * Once, not every time: the caller usually keeps trying, and a program that
+ * has run out of memory does not need its console filled as well.
+ */
+static int s_malloc_failed;
+
 void *malloc(size_t n)
 {
     if (n == 0) {
         n = 1;
     }
-    return ag_malloc(n);
+    void *p = ag_malloc(n);
+    if (p == NULL && !s_malloc_failed) {
+        ag_meminfo_t mi;
+        s_malloc_failed = 1;
+        ag_meminfo(&mi);
+        ag_printf("malloc: out of arena asking for %u bytes; %u of %u KB free, "
+                  "largest block %u\n",
+                  (unsigned)n, (unsigned)(mi.arena_free / 1024u),
+                  (unsigned)(mi.arena_total / 1024u),
+                  (unsigned)mi.arena_largest);
+    }
+    return p;
 }
 
 void *calloc(size_t n, size_t sz)
@@ -135,17 +157,45 @@ static int fmt_out(char *buf, size_t n, size_t *pos, char c)
     return 1;
 }
 
-static int fmt_str(char *buf, size_t n, size_t *pos, const char *s)
+/*
+ * %s, with the width and precision that used to be parsed and thrown away.
+ *
+ * Precision on a string is a maximum, not a minimum: "%.4s" of "items" is
+ * "item".  Ignoring it does not look like a formatting bug when it happens -
+ * Fallout builds the name of a message file that way, so the engine asked the
+ * archive for pro_items.msg, was told there was no such file, and reported
+ * that it could not load its prototypes.  An afternoon, that one.
+ *
+ * Width is a minimum, padded with spaces, left-justified when the caller said
+ * '-'.  Zero padding is not honoured for strings, which is what C says.
+ */
+static int fmt_str(char *buf, size_t n, size_t *pos, const char *s, int width,
+                   int prec, int left)
 {
-    int c = 0;
+    int len = 0;
+    int i;
+
     if (s == NULL) {
         s = "(null)";
     }
-    while (*s) {
-        fmt_out(buf, n, pos, *s++);
-        c++;
+    while (s[len] != '\0' && (prec < 0 || len < prec)) {
+        len++;
     }
-    return c;
+
+    if (!left) {
+        for (i = len; i < width; i++) {
+            fmt_out(buf, n, pos, ' ');
+        }
+    }
+    for (i = 0; i < len; i++) {
+        fmt_out(buf, n, pos, s[i]);
+    }
+    if (left) {
+        for (i = len; i < width; i++) {
+            fmt_out(buf, n, pos, ' ');
+        }
+    }
+    return len > width ? len : width;
 }
 
 static int fmt_uint_field(char *buf, size_t n, size_t *pos, unsigned long v,
@@ -272,7 +322,8 @@ static int argon_vsnprintf(char *buf, size_t n, const char *fmt, va_list ap)
             }
             switch (*fmt) {
             case 's':
-                fmt_str(buf, n, &pos, va_arg(ap, const char *));
+                fmt_str(buf, n, &pos, va_arg(ap, const char *), width, prec,
+                        left);
                 break;
             case 'c':
                 fmt_out(buf, n, &pos, (char)va_arg(ap, int));
@@ -302,7 +353,7 @@ static int argon_vsnprintf(char *buf, size_t n, const char *fmt, va_list ap)
                                width, prec, zeropad, left);
                 break;
         case 'p':
-            fmt_str(buf, n, &pos, "0x");
+            fmt_str(buf, n, &pos, "0x", 0, -1, 0);
             fmt_uint(buf, n, &pos, (unsigned long)va_arg(ap, void *), 16, 0);
             break;
         case 'f':
