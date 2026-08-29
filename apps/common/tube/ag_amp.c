@@ -1216,7 +1216,8 @@ static float pot_db(float pos, float span_db)
     return ag_expf(d * (2.302585093f / 20.0f));
 }
 
-void ag_amp_pot_apply(struct ag_amp_cfg *cfg, int model)
+void ag_amp_pot_apply(struct ag_amp_cfg *cfg, const struct ag_amp_cfg *fitted,
+                      int model)
 {
     int n = 0, i;
     const uint8_t *t;
@@ -1224,19 +1225,31 @@ void ag_amp_pot_apply(struct ag_amp_cfg *cfg, int model)
     if (cfg == 0) {
         return;
     }
+    if (fitted == 0) {
+        fitted = cfg;
+    }
     t = pot_table(model, &n);
     for (i = 0; i < n; i++) {
         const float p = cfg->pot[t[i] < AG_AMP_POT_N ? t[i] : 0];
         switch (t[i]) {
         case AG_POT_DRIVE:
-            /* Twenty decibels either side of what the fit chose, which is the
-             * useful range of a preamp volume and no more. */
-            cfg->gain[0] = pot_db(p, 20.0f);
+            /*
+             * Twenty decibels either side of what the fit chose, which is the
+             * useful range of a preamp volume and no more.
+             *
+             * `drive`, not `gain[0]`: apply_cfg does `a->gain[0] = cfg.drive`
+             * every time it runs, so anything written to gain[0] here is
+             * overwritten before a sample goes through it.  Writing it was
+             * silent - the knob simply did nothing - and it stayed that way
+             * until two renders at different settings came back identical.
+             */
+            cfg->drive = fitted->drive * pot_db(p, 20.0f);
             break;
         case AG_POT_GAIN:
             /* The attenuator between the stages; gain[1] is where it lives, and
              * the header has said so since before it could be turned. */
-            cfg->gain[1] = pot_db(p, 20.0f);
+            cfg->gain[1] = (fitted->gain[1] > 0.0f ? fitted->gain[1] : 1.0f) *
+                           pot_db(p, 20.0f);
             break;
         case AG_POT_BASS:
             cfg->tone_bass = p;
@@ -1252,7 +1265,14 @@ void ag_amp_pot_apply(struct ag_amp_cfg *cfg, int model)
             cfg->tone_mid = p;
             break;
         case AG_POT_MASTER:
-            cfg->gain[AG_AMP_STAGES - 1] = pot_db(p, 20.0f);
+            /*
+             * `master` is what the chain multiplies by after everything else -
+             * units of output per volt at the last plate, which the walk set.
+             * The knob scales that rather than replacing it, so noon leaves the
+             * level the fit calibrated.  It used to write gain[AG_AMP_STAGES-1],
+             * which on a two-stage chain is a stage that is not there.
+             */
+            cfg->master = fitted->master * pot_db(p, 20.0f);
             break;
         default:
             break;
@@ -2339,6 +2359,28 @@ static uint32_t preset_ir_off(uint32_t n_stages, uint32_t tab_n)
 {
     return (uint32_t)sizeof(amp_preset_head_t) +
            n_stages * 3u * tab_n * (uint32_t)sizeof(float);
+}
+
+/*
+ * How many points a preset's curves have, so that a loader can size the buffer
+ * ag_amp_preset_load insists on before it calls it.
+ *
+ * Without this the contract cannot be met: the load wants
+ * AG_AMP_STAGES * 3 * tab_n floats and takes tab_n from the file, so a caller
+ * that guessed AG_AMP_TAB_N and met a preset baked with more would be told
+ * nothing and would be written past.  A device that loads presets off a card
+ * reads them from wherever the card came from.
+ */
+int ag_amp_preset_tab_n(const void *buf, uint32_t n)
+{
+    const amp_preset_head_t *h = (const amp_preset_head_t *)buf;
+    if (buf == 0 || n < sizeof(amp_preset_head_t)) {
+        return -1;
+    }
+    if (h->magic != AG_AMP_PRESET_MAGIC || h->ver != AG_AMP_PRESET_VER) {
+        return -1;
+    }
+    return (int)h->tab_n;
 }
 
 uint32_t ag_amp_preset_size(int n_stages, int tab_n, int ir_frames)

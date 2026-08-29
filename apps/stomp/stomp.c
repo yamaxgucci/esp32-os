@@ -49,6 +49,10 @@
 #include <string.h>
 
 #include "ag_amp.h"
+#include "ag_ckt.h"
+#include "ag_ir.h"
+#include "ag_pcm.h"
+#include "ag_wav.h"
 
 AG_APP("STOMP", "1.0", "argon", AG_AXE_NEEDS_GFX);
 
@@ -71,8 +75,41 @@ enum {
 
 enum { BROWSE_OFF, BROWSE_CAB, BROWSE_PRESET };
 
+/*
+ * The rate the chain is fitted and measured at, and the block everything moves
+ * in - AG_IR_BLOCK, because the cabinet's overlap-add works in exactly that and
+ * a second block size would mean a second buffer for no gain.  256 frames at
+ * 22.05 kHz is 11.6 ms.
+ */
+#define RATE  22050u
+#define CHUNK AG_IR_BLOCK
+
 static ag_gfxinfo_t s_info; /* the display, held for as long as we run */
+
+/* The chain, when there is one.  Large enough to be worth the heap. */
+static ag_amp_t *s_amp;
+static float    *s_tab;
+static ag_ir_t   s_ir;
+static int       s_ir_ready;
+
+static ag_pcm_t     s_out;
+static int          s_sound;   /* the sink is open */
+static ag_wav_pcm_t s_di;      /* what is being played through it */
+static uint32_t     s_di_at;
+static int          s_di_loop = 1; /* a file sink plays the take once */
+static int          s_take_done;
+static int16_t      s_mono[CHUNK];
+static int16_t      s_stereo[CHUNK * 2];
+static float        s_peak;    /* of the last block, for the meter */
+static uint32_t     s_hdr_ms;  /* when the meter was last redrawn */
+static uint32_t     s_clipped;
+static int          s_tab_n;   /* points the curve buffer is sized for */
+static char         s_status[64]; /* one line about the sound, or empty */
 static ag_amp_cfg_t s_cfg;
+/* The configuration as the chain arrived with it.  The level knobs scale what
+ * the fit calibrated, so the calibration has to live somewhere a knob does not
+ * write. */
+static ag_amp_cfg_t s_fit;
 static int          s_model = AG_AMP_MODEL_JCM800;
 static int          s_sel;     /* knobs, then cabinet, switch, preset */
 static int          s_editing; /* the slider is open on s_sel */
@@ -623,8 +660,30 @@ static void paint_region(int rx, int ry, int rw, int rh)
     ag_gfx_fill_rect((int16_t)rx, (int16_t)ry, (uint16_t)rw, (uint16_t)rh,
                      rgb(16, 17, 22));
     if (hits(rx, ry, rw, rh, 0, 0, sw, TOP_H)) {
+        char head[96];
         ag_gfx_text(6, 6, ag_amp_model_name(s_model), rgb(235, 235, 240),
                     AG_GFX_TRANS);
+        /* What the sound is doing, on the same line as what is playing it:
+         * the load is the number that says whether this box can keep up. */
+        if (s_status[0] != '\0') {
+            (void)snprintf(head, sizeof(head), "%s", s_status);
+        } else if (s_sound) {
+            const int meter = (int)(s_peak * 20.0f);
+            char      bar[24];
+            int       k;
+            for (k = 0; k < 20; k++) {
+                bar[k] = (k < meter) ? '=' : '.';
+            }
+            bar[20] = '\0';
+            (void)snprintf(head, sizeof(head), "%s  %s  %u%% cpu", s_out.path,
+                           bar, (unsigned)s_out.load_pct);
+        } else {
+            (void)snprintf(head, sizeof(head), "silent");
+        }
+        (void)ag_gfx_text_fit(120, 6, (uint16_t)(sw - 126), head,
+                              s_status[0] != '\0' ? rgb(240, 200, 130)
+                                                  : rgb(130, 138, 158),
+                              AG_GFX_TRANS);
     }
     for (i = 0; i < knob_n(); i++) {
         knob_box(i, &x, &y, &w, &h, sw, sh);
@@ -827,16 +886,344 @@ static void bench(void)
 }
 
 /* ---------------------------------------------------------------------- */
+/* The chain, and the sound it makes                                      */
+/* ---------------------------------------------------------------------- */
+
+/*
+ * A preset is the whole amplifier as bytes - component values, voicing, the
+ * baked curves and the loudspeaker - and loading one needs no circuit solver
+ * and no axis fitting.  That is the path a pedal is meant to take: the host
+ * bakes once, the box reads bytes and plays.
+ *
+ * The built-in models are the other path and are honest about costing more.
+ * `ag_amp_model` gives a configuration but not a curve, so playing one means
+ * `ag_amp_build`, and that is 212 M instructions - 882 ms at 240 MHz, measured
+ * by tubebench.  It happens with the sound stopped and the screen saying so,
+ * because a bake under a ringing note is not a knob, it is a gap.
+ */
+
+/* One line about the sound, on the screen and in the log both: the screen is
+ * where somebody playing looks, and the log is what a test can read. */
+static void status(const char *s)
+{
+    (void)snprintf(s_status, sizeof(s_status), "%s", s);
+    if (s[0] != 0) {
+        ag_printf("stomp: %s\n", s);
+    }
+    dirty_all();
+}
+
+/* Big enough for `want` points per stage, kept across loads. */
+static int tab_reserve(int want)
+{
+    const size_t floats = (size_t)AG_AMP_STAGES * 3u * (size_t)want;
+    if (s_tab != NULL && s_tab_n >= want) {
+        return 0;
+    }
+    if (s_tab != NULL) {
+        ag_free(s_tab);
+    }
+    s_tab = (float *)ag_malloc(floats * sizeof(float));
+    s_tab_n = (s_tab != NULL) ? want : 0;
+    return s_tab != NULL ? 0 : -1;
+}
+
+static int amp_reserve(void)
+{
+    if (s_amp == NULL) {
+        s_amp = (ag_amp_t *)ag_malloc(sizeof(ag_amp_t));
+        if (s_amp == NULL) {
+            return -1;
+        }
+        memset(s_amp, 0, sizeof(*s_amp));
+    }
+    return 0;
+}
+
+/* Positions into the chain, then the chain into the filters, without clearing
+ * them: a coefficient may change under a ringing note, a reset may not. */
+static void apply_knobs(void)
+{
+    ag_amp_pot_apply(&s_cfg, &s_fit, s_model);
+    if (s_amp != NULL) {
+        (void)ag_amp_set_knobs(s_amp, &s_cfg);
+    }
+}
+
+/* The whole file, since a preset is read once and is a hundred kilobytes. */
+static void *read_all(const char *path, uint32_t *out_n)
+{
+    ag_stat_t   st;
+    ag_handle_t f;
+    void       *buf;
+    int32_t     got;
+
+    if (ag_stat(path, &st) != AG_OK || st.size == 0u || st.size > (4u << 20)) {
+        return NULL;
+    }
+    buf = ag_malloc((size_t)st.size);
+    if (buf == NULL) {
+        return NULL;
+    }
+    f = ag_open(path, AG_O_RDONLY);
+    if (f < 0) {
+        ag_free(buf);
+        return NULL;
+    }
+    got = ag_read(f, buf, (size_t)st.size);
+    (void)ag_close(f);
+    if (got != (int32_t)st.size) {
+        ag_free(buf);
+        return NULL;
+    }
+    *out_n = (uint32_t)st.size;
+    return buf;
+}
+
+/* The cabinet: an impulse at whatever rate it was recorded at.  ag_ir resamples
+ * it to ours, so a 48 kHz cabinet off somebody else's card works. */
+static int cabinet_load(const int16_t *mono, uint32_t frames, uint32_t rate)
+{
+    if (!s_ir_ready) {
+        if (ag_ir_init(&s_ir, RATE) != 0) {
+            return -1;
+        }
+        s_ir_ready = 1;
+    }
+    if (ag_ir_load(&s_ir, mono, frames, rate) != 0) {
+        return -1;
+    }
+    ag_ir_set_bypass(&s_ir, !s_cab_on);
+    return 0;
+}
+
+static int cabinet_from_wav(const char *path)
+{
+    ag_wav_pcm_t w;
+    int          rc;
+    if (ag_wav_load(path, &w) != 0) {
+        return -1;
+    }
+    rc = cabinet_load(w.data, w.frames, w.rate);
+    ag_wav_free(&w);
+    return rc;
+}
+
+/*
+ * `pot treble=8` from the command line, so that a render can be made at a
+ * stated setting and two of them compared.  A knob that cannot be set without a
+ * finger cannot be tested, and "the knobs work" is a claim like any other.
+ */
+static int pot_set(const char *spec)
+{
+    const int n = ag_amp_pot_count(s_model);
+    char      name[16];
+    int       i, at = 0, v = 0, seen = 0;
+
+    while (spec[at] != '\0' && spec[at] != '=' && at < (int)sizeof(name) - 1) {
+        char c = spec[at];
+        if (c >= 'a' && c <= 'z') {
+            c = (char)(c - 32);
+        }
+        name[at] = c;
+        at++;
+    }
+    name[at] = '\0';
+    if (spec[at] != '=') {
+        return -1;
+    }
+    for (at++; spec[at] >= '0' && spec[at] <= '9'; at++) {
+        v = v * 10 + (spec[at] - '0');
+        seen = 1;
+    }
+    if (!seen || v > 10) {
+        return -1;
+    }
+    for (i = 0; i < n; i++) {
+        if (strcmp(ag_amp_pot_name(s_model, i), name) == 0) {
+            s_cfg.pot[ag_amp_pot_id(s_model, i)] = (float)v / 10.0f;
+            apply_knobs();
+            ag_printf("stomp: %s = %d\n", name, v);
+            return 0;
+        }
+    }
+    ag_printf("stomp: %s has no %s\n", ag_amp_model_name(s_model), name);
+    return -1;
+}
+
+/* Take the model, the knob set and the pot positions from a chain that is now
+ * loaded, so the screen and the sound agree about what is playing. */
+static void adopt_amp(void)
+{
+    int i;
+    s_model = s_amp->cfg.model;
+    s_cfg = s_amp->cfg;
+    s_fit = s_amp->cfg; /* before a knob has touched it */
+    for (i = 0; i < AG_AMP_POT_N; i++) {
+        s_cfg.pot[i] = 0.5f; /* noon, which is where the fit left it */
+    }
+    if (s_sel >= item_count()) {
+        s_sel = item_count() - 1;
+    }
+    apply_knobs();
+    dirty_all();
+}
+
+static int amp_from_preset(const char *path)
+{
+    uint32_t n = 0;
+    void    *buf = read_all(path, &n);
+    int      tab_n, rc;
+
+    if (buf == NULL) {
+        status("preset: cannot read it");
+        return -1;
+    }
+    tab_n = ag_amp_preset_tab_n(buf, n);
+    if (tab_n < 8 || amp_reserve() != 0 || tab_reserve(tab_n) != 0) {
+        ag_free(buf);
+        status("preset: not one this build reads");
+        return -1;
+    }
+    rc = ag_amp_preset_load(s_amp, buf, n, s_tab, (float)RATE);
+    if (rc != 0) {
+        ag_free(buf);
+        status("preset: refused");
+        return -1;
+    }
+    {
+        /* The loudspeaker travels inside the preset, so a chain cannot be
+         * copied while its cabinet stays behind. */
+        uint32_t       frames = 0, rate = 0;
+        const int16_t *ir = ag_amp_preset_ir(buf, n, &frames, &rate);
+        if (ir != NULL && frames > 0u) {
+            (void)cabinet_load(ir, frames, rate);
+            (void)snprintf(s_cab, sizeof(s_cab), "%s", "from the preset");
+        }
+    }
+    ag_free(buf);
+    ag_amp_reset(s_amp);
+    adopt_amp();
+    ag_printf("stomp: preset %s: %s, %d stages, %d points, cabinet %s\n",
+              leaf(path), ag_amp_model_name(s_model), s_amp->n, s_amp->tab_n,
+              s_ir_ready ? "yes" : "none");
+    status("");
+    return 0;
+}
+
+/*
+ * A built-in model, which has no baked curve until one is solved for.  Costs a
+ * preset load's worth of arithmetic and then some: measured at 882 ms.
+ */
+static int amp_from_model(int model)
+{
+    ag_ckt_t     *scratch;
+    ag_amp_cfg_t  cfg;
+    float        *probe;
+    const int     probe_n = 4096;
+    int           rc;
+
+    if (amp_reserve() != 0 || tab_reserve(AG_AMP_TAB_N) != 0) {
+        status("no room for the chain");
+        return -1;
+    }
+    ag_amp_model(&cfg, model, (float)RATE);
+    scratch = (ag_ckt_t *)ag_malloc(sizeof(ag_ckt_t));
+    probe = (float *)ag_malloc((size_t)probe_n * sizeof(float));
+    if (scratch == NULL || probe == NULL) {
+        ag_free(scratch);
+        ag_free(probe);
+        status("no room to bake it");
+        return -1;
+    }
+    ag_amp_probe_pluck(probe, probe_n, (float)RATE);
+    rc = ag_amp_build(s_amp, scratch, &cfg, s_tab, AG_AMP_TAB_N, probe, probe_n);
+    ag_free(scratch);
+    ag_free(probe);
+    if (rc != 0) {
+        status("the bake failed");
+        return -1;
+    }
+    ag_amp_reset(s_amp);
+    adopt_amp();
+    status("");
+    return 0;
+}
+
+/* One block: the take, through the valves, through the loudspeaker, out. */
+static void audio_block(void)
+{
+    const ag_time_t t0 = ag_micros();
+    uint32_t        i;
+    float           peak = 0.0f;
+
+    for (i = 0; i < CHUNK; i++) {
+        float x = 0.0f, y;
+        int   v;
+        if (s_di.data != NULL && s_di.frames > 0u && !s_take_done) {
+            x = (float)s_di.data[s_di_at] * (1.0f / 32768.0f);
+            if (++s_di_at >= s_di.frames) {
+                s_di_at = 0;
+                if (!s_di_loop) {
+                    /* Rendering to a file: the take is the length of the
+                     * job, and looping would write until the card filled. */
+                    s_take_done = 1;
+                }
+            }
+        }
+        y = (s_amp != NULL) ? ag_amp_tick(s_amp, x) : x;
+        if (y > peak) {
+            peak = y;
+        } else if (-y > peak) {
+            peak = -y;
+        }
+        v = (int)(y * 32767.0f + (y >= 0.0f ? 0.5f : -0.5f));
+        if (v > 32767) {
+            v = 32767;
+            s_clipped++;
+        } else if (v < -32768) {
+            v = -32768;
+            s_clipped++;
+        }
+        s_mono[i] = (int16_t)v;
+    }
+    s_peak = peak;
+    if (s_ir_ready) {
+        ag_ir_process_block(&s_ir, s_mono, s_stereo);
+    } else {
+        for (i = 0; i < CHUNK; i++) {
+            s_stereo[2 * i] = s_mono[i];
+            s_stereo[2 * i + 1] = s_mono[i];
+        }
+    }
+    ag_pcm_mark_render(&s_out, (uint32_t)(ag_micros() - t0));
+    (void)ag_pcm_write(&s_out, s_stereo, (int32_t)CHUNK);
+}
+
+/* ---------------------------------------------------------------------- */
 /* Doing something about it                                               */
 /* ---------------------------------------------------------------------- */
 
+/*
+ * A built-in model.  With no sound open this only lays the screen out - the
+ * knob set and the voicing - and costs nothing.  With sound open it has to be
+ * baked, which is most of a second, so the block loop is told to stop first and
+ * the screen says what is happening rather than appearing to hang.
+ */
 static void set_model(int m)
 {
     dirty_all(); /* the knob count changes, so nothing is where it was */
     s_model = m;
-    ag_amp_model(&s_cfg, s_model, 22050.0f);
-    ag_amp_pot_apply(&s_cfg, s_model);
     (void)snprintf(s_preset, sizeof(s_preset), "%s", ag_amp_model_name(m));
+    if (s_sound) {
+        status("baking the curves, about a second");
+        present();
+        (void)amp_from_model(m);
+        return;
+    }
+    ag_amp_model(&s_cfg, s_model, (float)RATE);
+    s_fit = s_cfg;
+    ag_amp_pot_apply(&s_cfg, &s_fit, s_model);
     if (s_sel >= item_count()) {
         s_sel = item_count() - 1;
     }
@@ -857,7 +1244,7 @@ static void nudge(int d)
         v = 10;
     }
     s_cfg.pot[id] = (float)v / 10.0f;
-    ag_amp_pot_apply(&s_cfg, s_model);
+    apply_knobs(); /* into the chain as well, under the note that is playing */
     dirty_item(s_sel);
     if (s_editing) {
         dirty_slider();
@@ -875,6 +1262,9 @@ static void activate(void)
         dirty_all();
     } else if (s_sel == n + 1) {
         s_cab_on = !s_cab_on;
+        if (s_ir_ready) {
+            ag_ir_set_bypass(&s_ir, !s_cab_on);
+        }
         dirty_item(n);     /* the name goes dim with the cabinet out */
         dirty_item(n + 1);
     } else {
@@ -917,14 +1307,25 @@ static void browse_enter(void)
     case ENT_NONE:
         s_cab[0] = '\0';
         s_cab_on = 0;
+        if (s_ir_ready) {
+            ag_ir_set_bypass(&s_ir, 1);
+        }
         break;
     default:
         join(next, sizeof(next), s_dir, s_names[s_bsel]);
         if (s_browse == BROWSE_CAB) {
-            (void)snprintf(s_cab, sizeof(s_cab), "%s", next);
             s_cab_on = 1;
+            if (cabinet_from_wav(next) != 0) {
+                status("that wav is not a cabinet this reads");
+            } else {
+                (void)snprintf(s_cab, sizeof(s_cab), "%s", next);
+            }
         } else {
-            (void)snprintf(s_preset, sizeof(s_preset), "%s", next);
+            /* A preset carries its own loudspeaker, its own knob set and its
+             * own curves: this is a different amplifier, not a setting. */
+            if (amp_from_preset(next) == 0) {
+                (void)snprintf(s_preset, sizeof(s_preset), "%s", next);
+            }
         }
         break;
     }
@@ -1090,10 +1491,49 @@ static void on_tap(int px, int py)
     }
 }
 
+/*
+ * Open the sink and load the take.  `sink` is what ag_pcm understands -
+ * pcmvirt, pcmmix, pcmnull, a /dev node, or a path ending in .wav, which writes
+ * a file that can be carried off the card and listened to.
+ */
+static int sound_start(const char *sink, const char *di_path)
+{
+    if (di_path != NULL && di_path[0] != '\0') {
+        if (ag_wav_load(di_path, &s_di) != 0) {
+            ag_printf("stomp: cannot read %s\n", di_path);
+            return -1;
+        }
+        if (s_di.rate != RATE) {
+            /* Not resampled: the chain is fitted at one rate and a take at
+             * another would play at the wrong pitch while looking right. */
+            ag_printf("stomp: %s is %u Hz, and the chain runs at %u\n", di_path,
+                      (unsigned)s_di.rate, (unsigned)RATE);
+            ag_wav_free(&s_di);
+            return -1;
+        }
+    }
+    if (ag_pcm_open(&s_out, sink, RATE, 2) != 0) {
+        ag_printf("stomp: no sink called %s\n", sink);
+        ag_wav_free(&s_di);
+        return -1;
+    }
+    ag_pcm_set_chunk(&s_out, CHUNK);
+    /* A file sink is a render, not a performance: the take is played once and
+     * then this stops, rather than filling the card with a loop. */
+    s_di_loop = !ends_with(s_out.path, ".wav");
+    s_sound = 1;
+    return 0;
+}
+
 int ag_main(int argc, char **argv)
 {
-    int quit = 0;
-    int i, want_bench = 0;
+    int         quit = 0;
+    int         i, want_bench = 0;
+    const char *sink = NULL;
+    const char *di_path = NULL;
+    const char *preset = NULL;
+    const char *set[AG_AMP_POT_N];
+    int         n_set = 0;
 
     for (i = 1; i < argc; i++) {
         const int m = ag_amp_model_by_name(argv[i]);
@@ -1101,6 +1541,20 @@ int ag_main(int argc, char **argv)
             s_model = m;
         } else if (strcmp(argv[i], "bench") == 0) {
             want_bench = 1;
+        } else if (strcmp(argv[i], "play") == 0 && i + 1 < argc) {
+            di_path = argv[++i];
+        } else if (strcmp(argv[i], "out") == 0 && i + 1 < argc) {
+            sink = argv[++i];
+        } else if (strcmp(argv[i], "pot") == 0 && i + 1 < argc) {
+            /* Kept and applied after the chain is loaded, because the preset
+             * brings its own positions with it and would overwrite these. */
+            if (n_set < (int)(sizeof(set) / sizeof(set[0]))) {
+                set[n_set++] = argv[++i];
+            } else {
+                i++;
+            }
+        } else if (ends_with(argv[i], ".preset")) {
+            preset = argv[i];
         }
     }
     set_model(s_model);
@@ -1118,38 +1572,109 @@ int ag_main(int argc, char **argv)
     ag_printf("stomp: %s, %d knobs, %ux%u\n", ag_amp_model_name(s_model),
               ag_amp_pot_count(s_model), (unsigned)s_info.width,
               (unsigned)s_info.height);
+
+    if (sink != NULL || di_path != NULL) {
+        draw(); /* the screen first: loading a preset takes a moment */
+        if (preset != NULL) {
+            status("loading the preset");
+            present();
+            if (amp_from_preset(preset) == 0) {
+                (void)snprintf(s_preset, sizeof(s_preset), "%s", preset);
+            }
+        } else {
+            status("baking the curves, about a second");
+            present();
+            (void)amp_from_model(s_model);
+        }
+        for (i = 0; i < n_set; i++) {
+            (void)pot_set(set[i]); /* after the chain, which brings its own */
+        }
+        if (sound_start(sink != NULL ? sink : "pcmnull", di_path) != 0) {
+            ag_gfx_release();
+            return 1;
+        }
+        ag_printf("stomp: sound = %s @ %u Hz, %u frames a block\n", s_out.path,
+                  (unsigned)RATE, (unsigned)CHUNK);
+    } else if (preset != NULL) {
+        (void)amp_from_preset(preset);
+        (void)snprintf(s_preset, sizeof(s_preset), "%s", preset);
+    }
     draw();
 
+    if (s_sound) {
+        ag_pcm_pace_start(&s_out);
+    }
     while (!quit) {
         ag_event_t ev;
-        if (!ag_poll_event(&ev, 100)) {
-            if (ag_interrupted()) {
+
+        /*
+         * With sound running the block is the clock and events are drained
+         * between blocks; without it there is nothing to wait for but an event.
+         */
+        while (ag_poll_event(&ev, s_sound ? 0 : 100)) {
+            switch (ev.type) {
+            case AG_EV_QUIT:
                 quit = 1;
+                break;
+            case AG_EV_FOCUS_GAINED:
+                draw(); /* somebody else had the panel: none of it is ours */
+                break;
+            case AG_EV_KEY_DOWN:
+                on_key(ev.key.keycode, &quit);
+                break;
+            case AG_EV_POINTER_DOWN:
+                on_tap(ev.ptr.x, ev.ptr.y);
+                break;
+            default:
+                break;
             }
-            continue;
+            if (quit) {
+                break;
+            }
         }
-        switch (ev.type) {
-        case AG_EV_QUIT:
-            quit = 1;
-            break;
-        case AG_EV_FOCUS_GAINED:
-            draw(); /* somebody else had the panel: none of it is ours */
-            break;
-        case AG_EV_KEY_DOWN:
-            on_key(ev.key.keycode, &quit);
-            break;
-        case AG_EV_POINTER_DOWN:
-            on_tap(ev.ptr.x, ev.ptr.y);
-            break;
-        default:
-            break;
-        }
-        /* Nothing marked, nothing painted: an event that changed no pixel
-         * costs no drawing at all. */
-        present();
         if (ag_interrupted()) {
             quit = 1;
         }
+        if (quit) {
+            break;
+        }
+        if (s_sound) {
+            audio_block();
+            if (s_take_done) {
+                quit = 1;
+            }
+            {
+                /* The meter and the load are only worth four times a
+                 * second, and marking the strip is what makes them move. */
+                const uint32_t ms = ag_millis();
+                if (ms - s_hdr_ms >= 250u) {
+                    s_hdr_ms = ms;
+                    dirty(0, 0, (int)s_info.width, TOP_H);
+                }
+            }
+            /*
+             * The screen only when the block loop is ahead of the sink.  A full
+             * paint is 4.3 ms and a block is 11.6, so this is not a formality:
+             * without it the first chooser opened would be a dropout.
+             */
+            if ((s_dirty_all || s_ndirty > 0) &&
+                ag_pcm_slack_us(&s_out) >= 6000) {
+                ag_pcm_poll_stats(&s_out);
+                present();
+            }
+            ag_pcm_pace_wait(&s_out);
+        } else {
+            present();
+        }
+    }
+    if (s_sound) {
+        ag_pcm_close(&s_out);
+        ag_printf("stomp: %u samples over the rail%s\n", (unsigned)s_clipped,
+                  s_clipped > 0u ? " - turn the master down" : "");
+    }
+    ag_wav_free(&s_di);
+    if (s_ir_ready) {
+        ag_ir_free(&s_ir);
     }
     ag_gfx_release();
     return 0;

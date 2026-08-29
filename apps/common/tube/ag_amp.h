@@ -149,6 +149,13 @@ typedef struct ag_amp_band {
  * master.  Call it after moving a position and before ag_amp_set_knobs; that
  * function takes a const configuration and does not reach into pot[] itself,
  * because the matching tools set the gains directly and must keep doing so.
+ *
+ * **`fitted` is the configuration as the fit left it, and it is not optional in
+ * spirit.**  The three level controls are *scales* on what the walk calibrated -
+ * the drive it chose, the interstage attenuator, the volts-per-unit master - so
+ * the fitted values have to come from somewhere that turning a knob does not
+ * overwrite.  Keep the configuration a preset arrived with and pass it here
+ * every time; passing `cfg` itself works once and compounds after that.
  */
 #define AG_AMP_POT_N 8
 
@@ -175,7 +182,8 @@ const char *ag_amp_pot_name(int model, int i);
  * is written where it is defined.
  */
 struct ag_amp_cfg;
-void ag_amp_pot_apply(struct ag_amp_cfg *cfg, int model);
+void ag_amp_pot_apply(struct ag_amp_cfg *cfg, const struct ag_amp_cfg *fitted,
+                      int model);
 
 /*
  * Which chain this is: the component values of every stage, the topology, and
@@ -777,6 +785,11 @@ int   ag_amp_no_interstage_gain(ag_amp_t *a);
  */
 #define AG_AMP_PRESET_MAGIC 0x50425541u /* "AUBP" */
 /*
+ * 5: `cfg.pot[]` was added - the positions of the controls the schematic has,
+ *    so that a preset carries where its knobs were as well as what its
+ *    components are.  Every version 4 blob is refused, which is right and was
+ *    seen at once: STOMP said "preset: refused" on the first one it met rather
+ *    than reading the drive out of the tail of the old struct.
  * 4: `cfg.interstage_db` was added - the config block is longer again, and the
  *    same `cfg_size` check refuses a version 3 blob rather than reading the new
  *    field out of the old one's tail.
@@ -790,13 +803,21 @@ int   ag_amp_no_interstage_gain(ag_amp_t *a);
  * like, and keeping it in a separate wav meant a preset could be copied while its
  * loudspeaker stayed behind.
  */
-#define AG_AMP_PRESET_VER   4u
+#define AG_AMP_PRESET_VER   5u
 
 /*
  * Bytes a preset with this shape occupies.  `ir_frames` may be zero: a device
  * with no loudspeaker - a pedal - carries no impulse and says so.
  */
 uint32_t ag_amp_preset_size(int n_stages, int tab_n, int ir_frames);
+
+/*
+ * The number of points the curves in this blob have, or -1 if it is not a
+ * preset this build reads.  Ask before allocating: ag_amp_preset_load wants
+ * AG_AMP_STAGES * 3 * tab_n floats and takes tab_n from the file, so a loader
+ * that assumed AG_AMP_TAB_N would be written past by a preset baked with more.
+ */
+int ag_amp_preset_tab_n(const void *buf, uint32_t n);
 
 /*
  * Write `a` into `buf`, with `ir` as its loudspeaker.  int16 because that is what
