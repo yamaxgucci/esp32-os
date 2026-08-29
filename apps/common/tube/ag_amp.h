@@ -105,8 +105,26 @@
  * grid current for each stage. */
 #define AG_AMP_TAB_FLOATS (AG_AMP_STAGES * 3 * AG_AMP_TAB_N)
 
-/* One band of either voicing bank.  db of 0 disables it. */
-#define AG_AMP_VOICE_N 7
+/*
+ * One band of either voicing bank.  db of 0 disables it.
+ *
+ * EIGHT, AND WHY THE EIGHTH IS AT 630 Hz
+ *
+ * The seven were octave-spaced - 100, 200, 400, 800, 1600, 3150, 5000 - and the
+ * objective they are fitted against measures third-octaves.  A bank that can
+ * only put a bump on octave centres cannot answer a measurement taken in thirds,
+ * and the widest place where it could not is between 400 and 800: with Q 1 the
+ * only way to lift 630 is to lift both neighbours and flatten the shape that was
+ * wanted.
+ *
+ * It was found by ear before it was found by measurement.  Turning the live
+ * tool's mid knob, +4 dB at 635 Hz took the even-to-odd balance on the slo from
+ * +9.6 dB to +3.4 - the difference between "another amplifier" and "this one" -
+ * while the magnitude fit called the same setting two tenths of a decibel worse.
+ * Both of the frequencies that turned out to matter, 630 and 1600, are
+ * third-octave centres.
+ */
+#define AG_AMP_VOICE_N 8
 typedef struct ag_amp_band {
     float hz, db, q;
 } ag_amp_band_t;
@@ -154,25 +172,7 @@ typedef struct ag_amp_cfg {
     float gain[AG_AMP_STAGES];
     /* No table: the stage is its filter block and its gain, and nothing else. */
     int   linear[AG_AMP_STAGES];
-    /*
-     * ITERATION 4 DOES NOT FIT AN IMPULSE FOR THIS MODEL
-     *
-     * It was called `no_speaker`, which claimed something about the device that
-     * this file has no way of knowing - whether a given capture has a loudspeaker
-     * in it is a measurement, and two ways of taking it disagreed on the TS9.
-     * What the flag controls is narrower and is a choice rather than a fact: the
-     * impulse-fitting steps are skipped, no cabinet goes on either side of the
-     * comparison, and the chain is matched bare.
-     *
-     * It says **nothing** about whether the preset carries a cabinet.  The walk's
-     * last step folds the output bank into the impulse for every model, so a
-     * preset always has one; what this changes is only whether iteration 4 also
-     * fitted one before that fold.
-     *
-     * What reads it: `match` and `iter4` skip the impulse, and `polish` sends our
-     * side through unity instead of one.
-     */
-    int   no_ir_fit;
+
 
     int   os;   /* 1, 2, 4 or 8 */
     int   adaa; /* antialiasing inside the curve; nearly free, so default on */
@@ -183,6 +183,20 @@ typedef struct ag_amp_cfg {
      * that their coupling capacitors differ by a factor of forty-five.
      */
     int blocking;
+    /*
+     * How much of the blocking to keep, from 0 to 1.  One is the capacitor as
+     * it is; a half puts half the grid's charge on it and so half the bias
+     * shift, with the same recovery time and the same linear response.
+     *
+     * IT IS NOT A COMPONENT.  Nothing on a schematic reads "half the grid
+     * current", and this is here so the effect can be turned down and listened
+     * to rather than only switched off - the two models that ship with blocking
+     * off lost something real along with the fault.  Zero is the same as
+     * `blocking = 0` and one is the same as the model without this field, so a
+     * config memset to zero still means what it always did once `blocking` is
+     * set.
+     */
+    float block_depth;
 
     /*
      * Volts at the first valve's source per unit of input, and the gain knob.
@@ -410,6 +424,21 @@ typedef struct ag_amp_cfg {
      * says "this amplifier behaves as if that capacitor were 1.5 nF, not 2.2".
      */
     float couple_mul[AG_AMP_STAGES];
+    /*
+     * How far the block between one plate and the next grid may exceed unity,
+     * in decibels.  Zero is the physical answer - a coupling capacitor, a grid
+     * leak and a pot are all passive, and the valve's own gain is in its curve -
+     * and ag_amp_no_interstage_gain takes the block down to it.
+     *
+     * It is a knob because being honest here costs the overdrive: with the block
+     * at unity this chain compresses 18.7 dB less than the capture does, since
+     * only one of its two valves clips and it can only be made to clip harder by
+     * being handed more than the plate in front of it can swing.  What that
+     * buys, and what it costs in the bias wander that is heard as a wrong note,
+     * is a measurement rather than an opinion - so the number is here to be
+     * moved and listened to.
+     */
+    float interstage_db;
 
     int tone_shelf;    /*
      * How much of the grid-current tail each axis keeps, as a fraction of the
@@ -458,6 +487,16 @@ typedef struct ag_amp {
      * where a 2203 has it.  Built only when cfg.tone_stack says so. */
     ag_tone_t      stack;
     int            stack_on;
+    /*
+     * Which valve the tone stack sits in front of, or `n` for the output.
+     *
+     * A 2203 has it between V1b and V2a, and a passive Marshall network loses
+     * about twenty decibels - so on a three-valve chain this is not decoration,
+     * it is what keeps the last grid off the end of its axis.  On two valves the
+     * stack has nothing after it but linear blocks, so it commutes and this is
+     * `n`.
+     */
+    int            stack_at;
     /* Three cascaded halfbands; 2x uses the first, 4x the first two. */
     ag_os8_t       os;
     int            tab_n;
@@ -471,6 +510,13 @@ typedef struct ag_amp {
     /* What the run saw. */
     float    peak_out;
     uint32_t samples;
+    /*
+     * Whatever left each stage, most recently.  A diagnostic tap and nothing
+     * else: it costs one store per stage per oversampled sample and it exists
+     * so that a line can be traced to the block that first has it, instead of
+     * being argued about from the far end of the chain.
+     */
+    float tap[AG_AMP_STAGES];
 } ag_amp_t;
 
 /* fs, two stages of a hot JCM800 front end, 4x with antialiasing, and the two
@@ -510,6 +556,20 @@ int ag_amp_tone_spec(int model, ag_tone_spec_t *out);
 
 /* The reverse, for a command line or an environment variable.  -1 if unknown. */
 int ag_amp_model_by_name(const char *s);
+
+/*
+ * The capture this model's voicing was fitted against, as a path under the
+ * tree, or NULL for a model that was never fitted to one.
+ *
+ * The pairing was written down only in the prose of each model's block - "a NAM
+ * capture of a Peavey 5150 on the red channel", with the filename in a command
+ * line further down - which is fine for a reader and no use to a tool that wants
+ * to run the reference.  Anything that needs to put the real amplifier next to
+ * this one asks here instead of carrying its own table, because two tables
+ * disagree eventually and the disagreement is silent: the wrong capture still
+ * plays, and it still sounds like an amplifier.
+ */
+const char *ag_amp_model_capture(int model);
 
 /*
  * Has this model's voicing been fitted against a capture of the amplifier it is
@@ -612,6 +672,26 @@ float ag_amp_tick(ag_amp_t *a, float x);
  * a claim. */
 uint32_t ag_amp_clamped(const ag_amp_t *a);
 
+/*
+ * How much gain there is between valve i-1's plate and valve i's grid, at the
+ * loudest frequency in the band a valve is handed: the coupling network, the
+ * fitted bank, the mid lift and the trim, all together, as a ratio.
+ *
+ * It should never be above one.  Everything in that path is passive - a coupling
+ * capacitor, a grid leak, a pot where there is one - and the valve's own gain
+ * and its grid divider are inside the baked curve, so nothing is left there that
+ * can amplify.  `ag_amp_no_interstage_gain` takes any excess back out of the
+ * trim, leaving every band's frequency, Q and relative decibels alone, and
+ * returns how many stages it had to correct.
+ *
+ * The reason this needs saying at all: every other block in the chain reads a
+ * ratio, so a boost in front of a valve and a cut after it score the same and
+ * the fit is free to invent one.  Blocking answers to volts instead, and that is
+ * where it shows - as a coupling capacitor charged past the supply rail.
+ */
+float ag_amp_interstage_gain(const ag_amp_t *a, int i);
+int   ag_amp_no_interstage_gain(ag_amp_t *a);
+
 /* ------------------------------------------------------------------------ */
 /* Presets: a chain as bytes                                                 */
 /* ------------------------------------------------------------------------ */
@@ -641,6 +721,9 @@ uint32_t ag_amp_clamped(const ag_amp_t *a);
  */
 #define AG_AMP_PRESET_MAGIC 0x50425541u /* "AUBP" */
 /*
+ * 4: `cfg.interstage_db` was added - the config block is longer again, and the
+ *    same `cfg_size` check refuses a version 3 blob rather than reading the new
+ *    field out of the old one's tail.
  * 2: `cfg.couple_mul` was added, so the config block is longer.  The loader
  * refuses anything that does not match `sizeof(ag_amp_cfg_t)` anyway - a preset
  * that loaded with a shifted config would play something else entirely - but the
@@ -651,7 +734,7 @@ uint32_t ag_amp_clamped(const ag_amp_t *a);
  * like, and keeping it in a separate wav meant a preset could be copied while its
  * loudspeaker stayed behind.
  */
-#define AG_AMP_PRESET_VER   3u
+#define AG_AMP_PRESET_VER   4u
 
 /*
  * Bytes a preset with this shape occupies.  `ir_frames` may be zero: a device

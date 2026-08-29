@@ -74,6 +74,14 @@ int nam_receptive_field(const nam_model_t *m);
  * resample - see tools/wavrate.c. */
 int nam_sample_rate(const nam_model_t *m);
 
+/*
+ * What the capture says it is: "amp", "pedal", "amp_cab", "full_rig" and the
+ * rest of TONE3000's list, or "" when the file carries no metadata.  Worth
+ * asking before measuring: whether there is a loudspeaker in a capture decides
+ * the whole of a match, and the ones that carry metadata say so outright.
+ */
+const char *nam_gear_type(const nam_model_t *m);
+
 const char *nam_err(void);
 
 #endif /* NAM_H */

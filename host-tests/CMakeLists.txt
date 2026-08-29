@@ -251,6 +251,8 @@ endif()
 if(WIN32)
     add_executable(tube_live
         "${ARGON_ROOT}/tools/tube_live.c"
+        # The capture, for the live reference: see g_ref_src in tube_live.c.
+        "${ARGON_ROOT}/tools/nam.c"
         "${ARGON_ROOT}/apps/common/tube/ag_tube.c"
         "${ARGON_ROOT}/apps/common/tube/ag_biq.c"
         "${ARGON_ROOT}/apps/common/tube/ag_os.c"
@@ -263,8 +265,10 @@ if(WIN32)
     target_include_directories(tube_live BEFORE PRIVATE
         "${ARGON_ROOT}/tools/host_stub")
     target_include_directories(tube_live PRIVATE ${ARGON_INCLUDES}
-        "${ARGON_ROOT}/apps/common/ir")
-    target_link_libraries(tube_live PRIVATE winmm)
+        "${ARGON_ROOT}/apps/common/ir"
+        "${ARGON_ROOT}/tools")
+    # winmm for the old path, ole32/uuid for WASAPI - see the note above wa_open.
+    target_link_libraries(tube_live PRIVATE winmm ole32 uuid avrt)
     # Optimised even though nothing else here is: the float cabinet is a direct
     # 4410-tap convolution, about 100 M multiplies a second, and it has to keep
     # up with the sound card rather than with a progress bar.  The tool prints

@@ -121,17 +121,70 @@ static void print_model(void)
 
 /* One config for the model this run is about.  Every mode goes through here so
  * that no mode can quietly stay on the default. */
-/*
- * Does iteration 4 fit this model an impulse?  Asked of the model's own config
- * rather than of the model *number*, so that the answer lives with the model and
- * every mode reads the same field.  See ag_amp_cfg_t.no_ir_fit for why it is not
- * a statement about loudspeakers.
- */
-static int mc_no_ir_fit(uint32_t fs);
+
+
 
 static void model_cfg(ag_amp_cfg_t *cfg, float fs)
 {
     ag_amp_model(cfg, g_model, fs);
+    /*
+     * AG_BLOCKING=0 takes the grid-current charging of the coupling capacitor
+     * out, for the one question it answers: how much of what sits *below* the
+     * guitar's lowest note this model is making.  A zeroed jcm800 measures 13 to
+     * 20 dB over the capture from 20 to 62 Hz and stops at 73, which is the shape
+     * a DC wandering under asymmetric clipping has.
+     *
+     * Here rather than in one mode: it was in `render` alone at first, and
+     * `pair` - the mode that writes the file anybody listens to - never saw it.
+     */
+    {
+        const char *b = getenv("AG_BLOCKING");
+        if (b != NULL) {
+            cfg->blocking = atoi(b);
+        }
+    }
+    /*
+     * AG_OS=8 - the oversampling, for every mode rather than for `alias` alone.
+     *
+     * Blocking is integrated with forward Euler at the oversampled rate, and
+     * `blk_k` is 1/(fs*C): at 2.2 nF and 88.2 kHz, one sample of grid current
+     * from the top of the table is tens of volts on the capacitor.  Doubling the
+     * rate halves the step, so a number that moves is the integrator's and a
+     * number that stays is the circuit's.  There is no cheaper way to tell those
+     * two apart, and the grid charge on this model reads 89.8 V.
+     */
+    /*
+     * AG_BARE=1 - the circuit with nothing fitted, the same state `walk.py
+     * reset` writes into the source: every stage's pre bank, every trim and the
+     * output bank at zero.  The mid lift and the top cut stay, because reset
+     * leaves them; the tone stack and the pedal's output network stay because
+     * they are components and not a fit.
+     */
+    if (getenv("AG_BARE") != NULL) {
+        int i, b;
+        for (i = 0; i < AG_AMP_STAGES; i++) {
+            cfg->vtrim[i] = 0.0f;
+            for (b = 0; b < AG_AMP_VOICE_N; b++) {
+                cfg->voice[i][b].db = 0.0f;
+            }
+        }
+        for (b = 0; b < AG_AMP_VOICE_N; b++) {
+            cfg->tone[b].db = 0.0f;
+        }
+        {
+            static int said_bare = 0;
+            if (said_bare++ == 0) {
+                printf("  AG_BARE: pre banks, trims and the output bank at"
+                       " zero\n");
+            }
+        }
+    }
+    {
+        const char *o = getenv("AG_OS");
+        if (o != NULL && atoi(o) > 0) {
+            cfg->os = atoi(o);
+        }
+    }
     /*
      * AG_COUPLE_MUL="1,4,8,8" - the per-stage coupling corners, as multiples of
      * the schematic's.  An environment variable for the same reason AG_TOP_HZ is
@@ -177,6 +230,114 @@ static void model_cfg(ag_amp_cfg_t *cfg, float fs)
             }
         }
     }
+    /*
+     * AG_VTRIM="0,-12" - the interstage trims in decibels, per stage.  For the
+     * one question `drive` cannot ask: whether the same overdrive can come from
+     * the first valve working harder and the second being handed less, which is
+     * the arrangement that does not charge V1b's coupling capacitor.
+     */
+    /*
+     * AG_STAGES=3 - how many valves the chain has, for every mode rather than
+     * for `render`'s eleventh positional argument alone.  The 2203 has a third
+     * gain stage after the tone stack and this model stops at two, which is
+     * where the missing compression is suspected to be.
+     */
+    /*
+     * The first valve's two component values, in model_cfg rather than in
+     * `render` alone, because the question they answer - whether the hot-rodded
+     * front end was a workaround for the missing third stage - has to be asked
+     * of `pair` and `quiet` too.
+     */
+    {
+        const char *e;
+        if (getenv("AG_V1A_STOCK") != NULL) {
+            cfg->rcath1 = 2700.0f;
+            cfg->rplate1 = 100.0e3f;
+        }
+        if ((e = getenv("AG_RCATH1")) != NULL) {
+            cfg->rcath1 = (float)atof(e);
+        }
+        if ((e = getenv("AG_RPLATE1")) != NULL) {
+            cfg->rplate1 = (float)atof(e);
+        }
+    }
+    /*
+     * AG_INTERSTAGE_DB=3 - how far the block in front of a valve may go past
+     * unity.  See cfg.interstage_db: zero is what a passive network can do, and
+     * being honest there costs the overdrive, so the price of a decibel or two
+     * is something to measure rather than argue about.
+     */
+    {
+        const char *e = getenv("AG_INTERSTAGE_DB");
+        if (e != NULL) {
+            cfg->interstage_db = (float)atof(e);
+        }
+    }
+    {
+        const char *e = getenv("AG_STAGES");
+        if (e != NULL && atoi(e) > 0) {
+            cfg->n_stages = atoi(e);
+        }
+    }
+    {
+        /*
+         * AG_LINEAR="2" - make a stage a multiply instead of a valve, for asking
+         * what its nonlinearity is worth.  It is also the nearest thing this
+         * chain has to a cathode follower: unity, huge headroom, and - the part
+         * that matters here - it does not invert, where a common-cathode stage
+         * does.  Even harmonics between two valves cancel only when the second
+         * sees the first upside down, so removing an inversion from the middle of
+         * a chain changes which way the evens add.
+         */
+        /*
+         * AG_BLOCK_DEPTH="0.3" - how much of the blocking to keep, 0 to 1.  See
+         * ag_amp_cfg_t.block_depth: it scales the bias shift and leaves the
+         * recovery time and the linear response alone, so what changes between
+         * two renders at two depths is the one thing being listened to.
+         */
+        const char *e = getenv("AG_BLOCK_DEPTH");
+        if (e != NULL) {
+            cfg->block_depth = (float)atof(e);
+            cfg->blocking = cfg->block_depth > 0.0f ? 1 : 0;
+            printf("  AG_BLOCK_DEPTH: %.2f\n", (double)cfg->block_depth);
+        }
+    }
+    {
+        const char *e = getenv("AG_LINEAR");
+        if (e != NULL) {
+            while (*e != 0) {
+                const int i = atoi(e);
+                if (i >= 0 && i < AG_AMP_STAGES) {
+                    cfg->linear[i] = 1;
+                    printf("  AG_LINEAR: stage %d is a multiply\n", i);
+                }
+                while (*e != 0 && *e != ',') {
+                    e++;
+                }
+                if (*e == ',') {
+                    e++;
+                }
+            }
+        }
+    }
+    {
+        const char *e = getenv("AG_VTRIM");
+        if (e != NULL) {
+            int i;
+            for (i = 0; i < AG_AMP_STAGES && *e != 0; i++) {
+                cfg->vtrim[i] = (float)atof(e);
+                while (*e != 0 && *e != ',') {
+                    e++;
+                }
+                if (*e == ',') {
+                    e++;
+                }
+            }
+            printf("  AG_VTRIM: %.2f %.2f %.2f %.2f dB\n",
+                   (double)cfg->vtrim[0], (double)cfg->vtrim[1],
+                   (double)cfg->vtrim[2], (double)cfg->vtrim[3]);
+        }
+    }
     {
         const char *e = getenv("AG_COUPLE_MUL");
         if (e != NULL) {
@@ -195,14 +356,129 @@ static void model_cfg(ag_amp_cfg_t *cfg, float fs)
                    (double)cfg->couple_mul[2], (double)cfg->couple_mul[3]);
         }
     }
+    /*
+     * THE KNOBS THAT WERE ONLY IN `render`
+     *
+     * These used to sit in mode_render, which meant that a setting found by
+     * turning something in tube_live could be reproduced by `render` and by
+     * nothing else.  `harm` builds its chain through this function, so it never
+     * saw them - and a whole afternoon's worth of "the mid bump does not change
+     * the harmonics" was really "the mid bump never reached the harmonics".
+     *
+     * A knob that only some commands honour is worse than no knob: the ones
+     * that ignore it answer confidently with the wrong setting.
+     */
+    /* The two voicing knobs tube_live has and this argument list does not.
+     * Environment rather than an eleventh positional argument, because they are
+     * for reproducing a listening report, not for everyday renders. */
+    {
+        const char *e;
+        if ((e = getenv("AG_TOP_HZ")) != NULL) {
+            cfg->top_hz = (float)atof(e);
+            printf("  AG_TOP_HZ: top cut %.0f Hz\n", (double)cfg->top_hz);
+        }
+        if ((e = getenv("AG_MID_DB")) != NULL) {
+            cfg->mid_db = (float)atof(e);
+            printf("  AG_MID_DB: mid %.1f dB\n", (double)cfg->mid_db);
+        }
+        /*
+         * Where that peak sits and how wide it is.  They arrived when tube_live
+         * grew the same two knobs: a setting found by turning something in the
+         * live tool is worth nothing until it can be measured here, and "+4 dB of
+         * mid" is a different filter at 400 Hz and at 1.6 kHz.
+         */
+        if ((e = getenv("AG_MID_HZ")) != NULL) {
+            cfg->mid_hz = (float)atof(e);
+            printf("  AG_MID_HZ: mid at %.0f Hz\n", (double)cfg->mid_hz);
+        }
+        /*
+         * AG_POST_DB="630:-4" - one band of the output bank, by frequency.
+         *
+         * For asking the one question the fitted banks cannot be asked from
+         * outside: what happens when a lift in front of the valves is undone
+         * behind them.  The pair cancels in magnitude and does not cancel in what
+         * the valve was given to distort, which is the whole difference between
+         * equalising a chain and driving it harder in one place.
+         */
+        if ((e = getenv("AG_POST_DB")) != NULL) {
+            const float hz = (float)atof(e);
+            const char *c = strchr(e, ':');
+            int         b;
+            for (b = 0; c != NULL && b < AG_AMP_VOICE_N; b++) {
+                if (cfg->tone[b].hz > hz * 0.97f &&
+                    cfg->tone[b].hz < hz * 1.03f) {
+                    cfg->tone[b].db = (float)atof(c + 1);
+                    printf("  AG_POST_DB: %.0f Hz %+.2f dB after the valves\n",
+                           (double)cfg->tone[b].hz, (double)cfg->tone[b].db);
+                }
+            }
+        }
+        if ((e = getenv("AG_MID_Q")) != NULL) {
+            cfg->mid_q = (float)atof(e);
+            printf("  AG_MID_Q: mid Q %.2f\n", (double)cfg->mid_q);
+        }
+        /*
+         * The divider in front of the third stage.
+         * On a three-valve chain this is the control that decides whether the
+         * last stage is a valve or a comparator: 150 V of plate swing reaches a
+         * grid that cuts off at -6 V, so what it is divided by is the whole
+         * character of the stage.  Named for the two stages it sits between.
+         */
+        if ((e = getenv("AG_G23")) != NULL) {
+            cfg->gain[2] = (float)atof(e);
+            printf("  AG_G23: %.3f into the third stage\n", (double)cfg->gain[2]);
+        }
+        /*
+         * The two fitted banks, off - which is how the bare nonlinearity is
+         * compared against ckt_exact, since that reference has no voicing.  Also
+         * the only way to ask how much of what is heard in a band is what the
+         * valves made and how much is what the fit did to it afterwards.
+         */
+        if (getenv("AG_TONE_SHELF") != NULL) {
+            cfg->tone_shelf = 1;
+            printf("  AG_TONE_SHELF: the tone stack's top bands as shelves\n");
+        }
+        if ((e = getenv("AG_TONE_Q")) != NULL) {
+            int b;
+            for (b = 0; b < AG_AMP_VOICE_N; b++) {
+                cfg->tone[b].q = (float)atof(e);
+            }
+            printf("  AG_TONE_Q: %.2f\n", atof(e));
+        }
+        if (getenv("AG_NO_TONE") != NULL) {
+            int b;
+            for (b = 0; b < AG_AMP_VOICE_N; b++) {
+                cfg->tone[b].db = 0.0f;
+            }
+            printf("  AG_NO_TONE: the post bank is off\n");
+        }
+        /*
+         * The first valve back to stock, which is the measurement that says
+         * whether the hash at 3-6 kHz is the circuit or the hot-rodding of it.
+         */
+        if (getenv("AG_V1A_STOCK") != NULL) {
+            cfg->rcath1 = 2700.0f;
+            cfg->rplate1 = 100.0e3f;
+            printf("  AG_V1A_STOCK: V1a at 2k7 / 100k instead of 820R / 220k\n");
+        }
+        if ((e = getenv("AG_RCATH1")) != NULL) {
+            cfg->rcath1 = (float)atof(e);
+        }
+        if ((e = getenv("AG_RPLATE1")) != NULL) {
+            cfg->rplate1 = (float)atof(e);
+        }
+        if (getenv("AG_NO_VOICE") != NULL) {
+            int b;
+            for (b = 0; b < AG_AMP_VOICE_N; b++) {
+                cfg->voice[0][b].db = 0.0f;
+            }
+            cfg->mid_db = 0.0f;
+            printf("  AG_NO_VOICE: the pre bank and the mid lift are off\n");
+        }
+    }
 }
 
-static int mc_no_ir_fit(uint32_t fs)
-{
-    ag_amp_cfg_t c;
-    model_cfg(&c, (float)fs);
-    return c.no_ir_fit;
-}
+
 #define PI   3.14159265358979
 
 /* ------------------------------------------------------------------------ */
@@ -1297,6 +1573,97 @@ static void spectrum_of(const float *x, int n, float rate, double *out)
     }
 }
 
+/*
+ * IS THERE A LOUDSPEAKER IN THIS CAPTURE?  ASK THE FILE.
+ *
+ * It decides the whole comparison, and for a year it was measured: the capture's
+ * third-octave spectrum at 6.3 kHz against 1 kHz, on a *music* take.  That is not
+ * a test for a loudspeaker.  A dry guitar is already 15 dB down at 6.3 kHz, so
+ * what it actually measures is whether the device adds treble - hot valve amps do
+ * and read high, a Tube Screamer does not and reads -22 dB, which the threshold
+ * called a speaker.  Three separate bugs came out of it in one day, the worst of
+ * them subtracting a cabinet from a reference that never had one.
+ *
+ * NAM and TONE3000 write `gear_type`, and the captures here that carry metadata
+ * say it plainly - `Ibanez.nam` is "pedal", down to "Drive 5, Tone 5, Level 5" in
+ * its name.  So: read it.  A capture with no metadata still gets measured, and
+ * the report says which of the two happened.
+ *
+ * Two answers.  Either the capture has a loudspeaker in it, and our impulse is
+ * that one and nothing goes on the reference; or it has not, and a standard
+ * cabinet goes on both sides - on the reference by convolution, on ours as the
+ * impulse.  A pedal is not a third case: it takes the same path as a head-only
+ * amplifier, because a Tube Screamer is played through a speaker like everything
+ * else and a preset carries one either way.
+ */
+#define CAB_UNKNOWN     (-1)
+#define CAB_IN_CAPTURE  1  /* a loudspeaker is baked into the capture */
+#define CAB_NEEDED      0  /* none in it: both sides get a standard one */
+
+static int cap_cab_kind(const char *path, const float *ref, uint32_t rn,
+                        uint32_t rate)
+{
+    static char last[512];
+    static int  cached = -2;
+    nam_model_t *m;
+    const char  *g;
+
+    if (path == NULL) {
+        return -1;
+    }
+    if (cached != -2 && strcmp(last, path) == 0) {
+        return cached;
+    }
+    m = nam_load(path, 0, 0);
+    g = m != NULL ? nam_gear_type(m) : "";
+    (void)snprintf(last, sizeof(last), "%s", path);
+    if (g != NULL && g[0] != 0) {
+        /*
+         * "amp_cab", "amp_pedal_cab", "full_rig" have a speaker in them.  Plain
+         * "pedal" has none and wants none.  Everything else is an amplifier
+         * without one, and needs a standard cabinet on both sides.  Matched on
+         * substrings rather than on the whole list, so a name this build has not
+         * seen still lands somewhere sensible.
+         */
+        cached = (strstr(g, "cab") != NULL || strstr(g, "rig") != NULL)
+                     ? CAB_IN_CAPTURE
+                     : CAB_NEEDED;
+        printf("  %s says gear_type \"%s\": %s\n", path, g,
+               cached == CAB_IN_CAPTURE
+                   ? "a loudspeaker is in the capture, so nothing is added to it"
+                   : "no loudspeaker in it, so a standard cabinet goes on both"
+                     " sides");
+    } else if (ref != NULL && rn > 8u) {
+        double sp[SPEC_N], e63 = -300.0, e1k = -300.0;
+        int    k;
+        spectrum_of(ref, (int)rn, (float)rate, sp);
+        for (k = 0; k < SPEC_N; k++) {
+            if (k_spec_f[k] == 6300.0f) {
+                e63 = sp[k];
+            }
+            if (k_spec_f[k] == 1000.0f) {
+                e1k = sp[k];
+            }
+        }
+        /* No metadata, so it is guessed - and an amplifier is the safe guess
+         * for a file that carries none, because a pedal capture that reads as
+         * head-only would then be given a speaker it never had, which is
+         * audible, while an amplifier denied one is unlistenable. */
+        cached = (e63 - e1k) < -8.0 ? CAB_IN_CAPTURE : CAB_NEEDED;
+        printf("  %s carries no gear_type, so this is a GUESS from the take:"
+               " %+.1f dB at\n  6.3 kHz, which reads as %s.  A take is a poor"
+               " witness for this - see cap_cab_kind.\n", path, e63 - e1k,
+               cached == CAB_IN_CAPTURE ? "a loudspeaker in the capture"
+                                        : "an amplifier without one");
+    } else {
+        cached = CAB_UNKNOWN;
+    }
+    if (m != NULL) {
+        nam_free(m);
+    }
+    return cached;
+}
+
 static void print_spec(const char *label, const double *s)
 {
     int i;
@@ -1982,6 +2349,58 @@ static void mode_fit(int argc, char **argv)
  * Printed as five-millisecond windows rather than described, because "it
  * compresses the attack" is a claim and decibels are not.
  */
+/*
+ * The most gain the network between valve i-1's plate and valve i's grid has,
+ * at any frequency a guitar reaches.
+ *
+ * That network is a coupling capacitor, a grid leak, and a pot where there is
+ * one: passive, all of it.  The valve's gain is in its curve and the grid
+ * divider is in the curve with it, because the curve is swept from the source.
+ * So there is nothing left here that can amplify and this number should not be
+ * positive.
+ *
+ * Everything else in the chain reads ratios, which is why a boost here costs
+ * nothing and gets fitted: raise the trim, lower the master, and no measurement
+ * moves.  The exception is blocking, which answers to volts rather than to a
+ * ratio - so this is the one number that decides whether a grid is being handed
+ * a swing its plate cannot make.
+ */
+static float chain_top_db(const ag_biq_chain_t *c, float fos)
+{
+    float best = -1.0e30f;
+    int   k;
+    for (k = 0; k <= 240; k++) {
+        /* 20 Hz to 10 kHz, logarithmically - the band the valve is handed. */
+        const float f = 20.0f * powf(500.0f, (float)k / 240.0f);
+        const float d = ag_biq_chain_mag_db(c, f, fos);
+        if (d > best) {
+            best = d;
+        }
+    }
+    return best;
+}
+
+/*
+ * The three parts, kept apart, because the total says nothing on its own.
+ *
+ * `pre` is the coupling network the schematic has and it is passive; `voice` is
+ * the bank the walk fitted, which is tone matching and is allowed to have gain
+ * as long as something downstream gives it back; the trim is a level.  The first
+ * version of this added all three and reported +20.93 dB, which is true and
+ * undiagnostic - two thirds of it turned out to be filters, not the trim.
+ */
+static void interstage_db(const ag_amp_t *a, int i, float fos, float *pre,
+                          float *voice, float *trim)
+{
+    *pre = *voice = *trim = 0.0f;
+    if (i < 1 || i >= a->n) {
+        return;
+    }
+    *pre = chain_top_db(&a->pre[i], fos);
+    *voice = chain_top_db(&a->voice[i], fos);
+    *trim = 20.0f * log10f(a->gain[i] * a->vtrim[i] + 1.0e-30f);
+}
+
 static void mode_attack(int argc, char **argv)
 {
     const int    n = (int)(RATE * 0.4f); /* 400 ms */
@@ -2659,8 +3078,6 @@ static int write_preset(const char *path, float fit_drive)
          * the flag wrote the pedal's preset empty while its impulse sat on disk
          * next to it.
          */
-        ag_amp_cfg_t probe_cfg;
-        model_cfg(&probe_cfg, RATE);
         {
             char     irp[256];
             uint32_t fn = 0, fr = 0;
@@ -2668,17 +3085,12 @@ static int write_preset(const char *path, float fit_drive)
             (void)snprintf(irp, sizeof(irp), "build/listen/ir_%s_bank.wav",
                            ag_amp_model_name(g_model));
             fir = read_wav(irp, &fn, &fr);
-            if (fir == NULL && !probe_cfg.no_ir_fit) {
-                printf("  %s is missing - run `match` first, or the preset would"
-                       " carry no cabinet\n", irp);
+            if (fir == NULL) {
+                printf("  %s is missing - run `match` first: every preset carries"
+                       " a cabinet\n", irp);
                 free(a);
                 return -1;
             }
-            if (fir == NULL) {
-                printf("  %s is missing and none was fitted for this model - the"
-                       " preset will carry no\n  cabinet, which is a state it"
-                       " has\n", irp);
-            } else {
             ir16 = (int16_t *)malloc(sizeof(int16_t) * (fn ? fn : 1u));
             if (ir16 == NULL) {
                 free(fir);
@@ -2701,7 +3113,6 @@ static int write_preset(const char *path, float fit_drive)
             free(fir);
             ir_n = (int)fn;
             ir_rate = fr;
-            }
         }
     }
     print_model();
@@ -3843,78 +4254,6 @@ static void mode_render(int argc, char **argv)
                " maximum and 0.5 the working setting\n",
                (double)cfg.drive);
     }
-    /* The two voicing knobs tube_live has and this argument list does not.
-     * Environment rather than an eleventh positional argument, because they are
-     * for reproducing a listening report, not for everyday renders. */
-    {
-        const char *e;
-        if ((e = getenv("AG_TOP_HZ")) != NULL) {
-            cfg.top_hz = (float)atof(e);
-            printf("  AG_TOP_HZ: top cut %.0f Hz\n", (double)cfg.top_hz);
-        }
-        if ((e = getenv("AG_MID_DB")) != NULL) {
-            cfg.mid_db = (float)atof(e);
-            printf("  AG_MID_DB: mid %.1f dB\n", (double)cfg.mid_db);
-        }
-        /*
-         * The divider in front of the third stage.
-         * On a three-valve chain this is the control that decides whether the
-         * last stage is a valve or a comparator: 150 V of plate swing reaches a
-         * grid that cuts off at -6 V, so what it is divided by is the whole
-         * character of the stage.  Named for the two stages it sits between.
-         */
-        if ((e = getenv("AG_G23")) != NULL) {
-            cfg.gain[2] = (float)atof(e);
-            printf("  AG_G23: %.3f into the third stage\n", (double)cfg.gain[2]);
-        }
-        /*
-         * The two fitted banks, off - which is how the bare nonlinearity is
-         * compared against ckt_exact, since that reference has no voicing.  Also
-         * the only way to ask how much of what is heard in a band is what the
-         * valves made and how much is what the fit did to it afterwards.
-         */
-        if (getenv("AG_TONE_SHELF") != NULL) {
-            cfg.tone_shelf = 1;
-            printf("  AG_TONE_SHELF: the tone stack's top bands as shelves\n");
-        }
-        if ((e = getenv("AG_TONE_Q")) != NULL) {
-            int b;
-            for (b = 0; b < AG_AMP_VOICE_N; b++) {
-                cfg.tone[b].q = (float)atof(e);
-            }
-            printf("  AG_TONE_Q: %.2f\n", atof(e));
-        }
-        if (getenv("AG_NO_TONE") != NULL) {
-            int b;
-            for (b = 0; b < AG_AMP_VOICE_N; b++) {
-                cfg.tone[b].db = 0.0f;
-            }
-            printf("  AG_NO_TONE: the post bank is off\n");
-        }
-        /*
-         * The first valve back to stock, which is the measurement that says
-         * whether the hash at 3-6 kHz is the circuit or the hot-rodding of it.
-         */
-        if (getenv("AG_V1A_STOCK") != NULL) {
-            cfg.rcath1 = 2700.0f;
-            cfg.rplate1 = 100.0e3f;
-            printf("  AG_V1A_STOCK: V1a at 2k7 / 100k instead of 820R / 220k\n");
-        }
-        if ((e = getenv("AG_RCATH1")) != NULL) {
-            cfg.rcath1 = (float)atof(e);
-        }
-        if ((e = getenv("AG_RPLATE1")) != NULL) {
-            cfg.rplate1 = (float)atof(e);
-        }
-        if (getenv("AG_NO_VOICE") != NULL) {
-            int b;
-            for (b = 0; b < AG_AMP_VOICE_N; b++) {
-                cfg.voice[0][b].db = 0.0f;
-            }
-            cfg.mid_db = 0.0f;
-            printf("  AG_NO_VOICE: the pre bank and the mid lift are off\n");
-        }
-    }
     /*
      * The axes are fitted to this recording, not to the synthetic probe.
      *
@@ -3949,8 +4288,130 @@ static void mode_render(int argc, char **argv)
     }
     printf("  %s: %u frames at %u Hz, drive %.2f, %dx%s\n", argv[2], frames, rate,
            (double)cfg.drive, cfg.os, cfg.adaa ? " + adaa" : "");
-    for (i = 0; i < frames; i++) {
-        out[i] = ag_amp_tick(a, in[i]);
+    /*
+     * AG_DUMP_VC writes each stage's grid charge beside the render, sampled once
+     * per output frame; the cut-off count below is kept either way, because how
+     * long a valve stays shut is not visible in anything downstream.
+     */
+    {
+        const int dump = getenv("AG_DUMP_VC") != NULL;
+        const int tap = getenv("AG_DUMP_TAP") != NULL;
+        float    *tp[AG_AMP_STAGES];
+        float    *vc[AG_AMP_STAGES];
+        uint32_t  prev[AG_AMP_STAGES], run[AG_AMP_STAGES], worst[AG_AMP_STAGES];
+        int       st;
+        for (st = 0; st < AG_AMP_STAGES; st++) {
+            vc[st] = dump ? (float *)malloc(sizeof(float) * frames) : NULL;
+            tp[st] = tap ? (float *)malloc(sizeof(float) * frames) : NULL;
+            prev[st] = a->tube[st].cut;
+            run[st] = worst[st] = 0;
+        }
+        for (i = 0; i < frames; i++) {
+            out[i] = ag_amp_tick(a, in[i]);
+            for (st = 0; st < a->n; st++) {
+                /* Every oversampled step of this frame below the axis: the
+                 * stage was shut for the whole frame, not just part of a
+                 * cycle. */
+                const uint32_t d = a->tube[st].cut - prev[st];
+                prev[st] = a->tube[st].cut;
+                if (vc[st] != NULL) {
+                    vc[st][i] = a->tube[st].vc;
+                }
+                if (tp[st] != NULL) {
+                    tp[st][i] = a->tap[st];
+                }
+                if (d >= (uint32_t)(cfg.os < 1 ? 1 : cfg.os)) {
+                    run[st]++;
+                    if (run[st] > worst[st]) {
+                        worst[st] = run[st];
+                    }
+                } else {
+                    run[st] = 0;
+                }
+            }
+        }
+        for (st = 0; st < a->n; st++) {
+            if (a->tube[st].t == 0 || a->tube[st].cut == 0) {
+                continue;
+            }
+            printf("  %s was cut off for %.1f%% of its lookups, and shut for a"
+                   " whole frame %.1f ms at a stretch\n", valve_name(st),
+                   100.0 * (double)a->tube[st].cut /
+                       (double)(a->tube[st].samples ? a->tube[st].samples : 1),
+                   1000.0 * (double)worst[st] / (double)rate);
+        }
+        if (tap) {
+            for (st = 0; st < a->n; st++) {
+                char  p[520];
+                int   c = 0, q;
+                float pk = 0.0f;
+                if (tp[st] == NULL) {
+                    continue;
+                }
+                while (argv[3][c] != '\0' && c < 500) {
+                    p[c] = argv[3][c];
+                    c++;
+                }
+                if (c > 4) {
+                    c -= 4;
+                }
+                p[c] = '_'; p[c + 1] = 't'; p[c + 2] = 'p';
+                p[c + 3] = (char)('0' + st);
+                p[c + 4] = '.'; p[c + 5] = 'w'; p[c + 6] = 'a'; p[c + 7] = 'v';
+                p[c + 8] = '\0';
+                for (q = 0; q < (int)frames; q++) {
+                    const float v = tp[st][q] < 0.0f ? -tp[st][q] : tp[st][q];
+                    if (v > pk) {
+                        pk = v;
+                    }
+                }
+                if (pk > 1e-9f) {
+                    for (q = 0; q < (int)frames; q++) {
+                        tp[st][q] *= 0.891f / pk;
+                    }
+                    (void)write_wav(p, tp[st], frames, rate);
+                    printf("  %s: output written to %s, full scale %.2f V\n",
+                           valve_name(st), p, (double)pk);
+                }
+                free(tp[st]);
+            }
+        }
+        if (dump) {
+            for (st = 0; st < a->n; st++) {
+                char  p[520];
+                int   c = 0, q;
+                float pk = 0.0f;
+                if (vc[st] == NULL) {
+                    continue;
+                }
+                while (argv[3][c] != '\0' && c < 500) {
+                    p[c] = argv[3][c];
+                    c++;
+                }
+                if (c > 4) {
+                    c -= 4;
+                }
+                p[c] = '_'; p[c + 1] = 'v'; p[c + 2] = 'c';
+                p[c + 3] = (char)('0' + st);
+                p[c + 4] = '.'; p[c + 5] = 'w'; p[c + 6] = 'a'; p[c + 7] = 'v';
+                p[c + 8] = '\0';
+                for (q = 0; q < (int)frames; q++) {
+                    const float v = vc[st][q] < 0.0f ? -vc[st][q] : vc[st][q];
+                    if (v > pk) {
+                        pk = v;
+                    }
+                }
+                if (pk > 1e-9f) {
+                    for (q = 0; q < (int)frames; q++) {
+                        vc[st][q] *= 0.891f / pk;
+                    }
+                    (void)write_wav(p, vc[st], frames, rate);
+                    printf("  %s: grid charge written to %s, full scale %.2f V\n",
+                           valve_name(st), p, (double)pk);
+                }
+                free(vc[st]);
+            }
+        }
     }
     printf("  peak out %.3f, clamped %lu of %lu lookups\n", (double)a->peak_out,
            (unsigned long)ag_amp_clamped(a),
@@ -3968,10 +4429,20 @@ static void mode_render(int argc, char **argv)
      * the table, which the clamped count above prices.
      */
     for (i = 0; i < (uint32_t)a->n; i++) {
-        printf("  %s saw %.3f..%.3f V of an axis of %.3f..%.3f\n",
+        float pre_db, voice_db, trim_db;
+        interstage_db(a, (int)i, cfg.fs * (float)cfg.os, &pre_db, &voice_db,
+                      &trim_db);
+        printf("  %s saw %.3f..%.3f V of an axis of %.3f..%.3f, grid charge to %.2f V\n",
                valve_name((int)i),
                (double)a->tube[i].seen_lo, (double)a->tube[i].seen_hi,
-               (double)a->tube[i].lo, (double)a->tube[i].hi);
+               (double)a->tube[i].lo, (double)a->tube[i].hi,
+               (double)a->tube[i].vc_peak);
+        if (i > 0) {
+            printf("       in front of it: coupling %+.2f dB, bank %+.2f dB, "
+                   "trim %+.2f dB, together %+.2f\n",
+                   (double)pre_db, (double)voice_db, (double)trim_db,
+                   (double)(pre_db + voice_db + trim_db));
+        }
     }
     (void)write_wav(argv[3], out, frames, rate);
 
@@ -5385,7 +5856,7 @@ static void mode_harm(int argc, char **argv)
             tilt = goertzel_db(cap_at + s, m, 6300.0, (double)rate) -
                    goertzel_db(cap_at + s, m, 1000.0, (double)rate);
         }
-        if (mc_no_ir_fit(rate)) {
+        if (0) {
             printf("  %s is matched with no cabinet on either side (the noise"
                    " burst reads\n  %+.1f dB at 6.3 kHz, which is its own tone"
                    " control)\n", ag_amp_model_name(g_model), tilt);
@@ -5394,7 +5865,7 @@ static void mode_harm(int argc, char **argv)
                    " 1 kHz, so it %s\n", tilt,
                    tilt < -8.0 ? "has a loudspeaker in it" : "is HEAD ONLY");
         }
-        if (tilt >= -8.0 && !mc_no_ir_fit(rate)) {
+        if (tilt >= -8.0 && !0) {
             char     cabp[256];
             uint32_t kn = 0, krate = 0;
             float   *k;
@@ -5448,7 +5919,18 @@ static void mode_harm(int argc, char **argv)
         imp = r;
     }
     {
-        float *dry = chain_render_dry(&shipped, probe, n, rate, 1);
+        /*
+         * AG_HARM_POST=1 keeps the output bank in.
+         *
+         * It is out by default and that is right for the question this ladder
+         * usually asks - what the valves *make* - but it makes one question
+         * unaskable.  A lift in front of the valves paid for by a cut behind them
+         * is a pair whose halves cancel in magnitude; delete the half behind and
+         * what is left is the half in front, which is not the thing being
+         * proposed.
+         */
+        const int keep_post = getenv("AG_HARM_POST") != NULL;
+        float *dry = chain_render_dry(&shipped, probe, n, rate, !keep_post);
         if (dry == NULL) {
             free(probe); free(cprobe); free(cap_out); free(cap_at); free(imp);
             return;
@@ -5456,8 +5938,8 @@ static void mode_harm(int argc, char **argv)
         if (imp != NULL) {
             ours = convolve_f(dry, n, imp, hn);
             free(dry);
-            printf("  ours through %s, post bank at zero - the same speaker as"
-                   " above\n", irp);
+            printf("  ours through %s, post bank %s - the same speaker as"
+                   " above\n", irp, keep_post ? "IN" : "at zero");
         } else {
             ours = dry;
             printf("  no %s, so ours is the bare chain\n", irp);
@@ -9640,6 +10122,379 @@ static double i2_wrms_q(const double *a, const double *b)
 }
 
 /*
+ * THE HARMONIC TERM: HOW MUCH OF EACH BAND IS ON THE PLAYED NOTES
+ *
+ * Everything else in this objective measures the *level* of a third-octave band.
+ * Two renders can agree on every one of those to a tenth of a decibel and still
+ * be plainly different amplifiers, which is what happened: a walk that improved
+ * the band levels was heard as clearly worse, and the difference Maxim described
+ * was "as if different harmonics", around 630 and 1700 Hz.
+ *
+ * The sweep in scratchpad/sweep.py put a number on it.  Of 336 combinations of
+ * band and measure, 34 ordered four known pairs the way the ear did, and the two
+ * families at the top were the energy sitting exactly on multiples of the played
+ * root, and the energy in the band that is *not* on a multiple.  Band level - the
+ * thing this objective already had - barely appeared.
+ *
+ * So: split each band's energy into the part on the partials and the part
+ * between them, both against the root's own level so that a chain which is
+ * merely louder in a band does not score as one that made more harmonic there.
+ *
+ * WHAT THE FIT CAN AND CANNOT DO WITH IT
+ *
+ * A bank in front of a valve decides what reaches the grid and therefore what
+ * gets distorted, so it moves both of these directly.  That is why they belong
+ * in the objective.
+ *
+ * THE OTHER FAMILY THE SWEEP FOUND IS ALSO REACHABLE, AND THE FIRST ARGUMENT
+ * AGAINST IT WAS WRONG
+ *
+ * That family is how fast a band decays, and it was left out here on the
+ * reasoning that a linear filter scales a band and cannot change the rate at
+ * which it dies away.  True of a filter *after* the valve and false of one in
+ * front of it, which is the half that matters: a band driven further into
+ * compression has its attack held down and its tail held up, so the note decays
+ * more slowly - that is what sustain is.  The pre banks and the interstage trims
+ * therefore do control it, one band at a time.
+ *
+ * It is not in the objective yet only because it is a second change, and two
+ * changes at once cannot be told apart by listening to the result.
+ */
+#define PT_MAX 4      /* chords used; the take has four */
+#define PT_FFT 32768  /* 1.5 s at 22.05 kHz, 0.67 Hz a bin */
+
+static uint32_t s_pt_n;
+static uint32_t s_pt_a[PT_MAX], s_pt_b[PT_MAX];
+static double   s_pt_f0[PT_MAX];
+static double   s_pt_ref_p[I2_N], s_pt_ref_b[I2_N];
+static int      s_pt_ready;
+
+/* The band a frequency falls in, or -1 outside the grid. */
+static int pt_band(double hz)
+{
+    int k;
+    for (k = 0; k < I2_N; k++) {
+        if (hz >= (double)k_i2_f[k] / 1.122 && hz < (double)k_i2_f[k] * 1.122) {
+            return k;
+        }
+    }
+    return -1;
+}
+
+/*
+ * The root of one chord, found rather than assumed.
+ *
+ * A hardcoded list of the take's notes would break the day the take changes, and
+ * it would break silently - the partials would be measured at the wrong places
+ * and the term would quietly become noise.  So the root is swept from 70 to 165
+ * Hz, which covers the bottom two strings, and scored by how much energy sits on
+ * its own multiples.
+ */
+static double pt_root(const double *mag, uint32_t half, double df)
+{
+    double best = -1.0, bestf = 0.0, f;
+    for (f = 70.0; f <= 165.0; f += 0.25) {
+        double e = 0.0;
+        int    h;
+        for (h = 1; h <= 8; h++) {
+            const uint32_t k = (uint32_t)(f * (double)h / df + 0.5);
+            if (k > 2u && k + 2u < half) {
+                double m = mag[k];
+                if (mag[k - 1] > m) {
+                    m = mag[k - 1];
+                }
+                if (mag[k + 1] > m) {
+                    m = mag[k + 1];
+                }
+                e += m;
+            }
+        }
+        if (e > best) {
+            best = e;
+            bestf = f;
+        }
+    }
+    return bestf;
+}
+
+/*
+ * Find the chords in the reference, once.  Same rule as everywhere else in this
+ * file: a run of windows above 26 dB under the loudest, longer than a quarter of
+ * a second.
+ */
+static void pt_find(const float *ref, uint32_t n, uint32_t rate)
+{
+    const uint32_t w = (uint32_t)(0.03 * (double)rate);
+    const uint32_t nw = w ? n / w : 0u;
+    double        *env = NULL;
+    double         peak = 0.0;
+    uint32_t       i;
+
+    s_pt_n = 0;
+    s_pt_ready = 0;
+    if (nw < 8u) {
+        return;
+    }
+    env = (double *)malloc(sizeof(double) * nw);
+    if (env == NULL) {
+        return;
+    }
+    for (i = 0; i < nw; i++) {
+        double acc = 0.0;
+        uint32_t j;
+        for (j = 0; j < w; j++) {
+            const double v = (double)ref[i * w + j];
+            acc += v * v;
+        }
+        env[i] = sqrt(acc / (double)w);
+        if (env[i] > peak) {
+            peak = env[i];
+        }
+    }
+    i = 0;
+    while (i < nw && s_pt_n < PT_MAX) {
+        if (env[i] <= peak * 0.0501) { /* -26 dB */
+            i++;
+            continue;
+        }
+        {
+            uint32_t j = i;
+            while (j < nw && env[j] > peak * 0.0501) {
+                j++;
+            }
+            if ((j - i) * w > (uint32_t)(0.25 * (double)rate)) {
+                s_pt_a[s_pt_n] = i * w;
+                s_pt_b[s_pt_n] = j * w < n ? j * w : n;
+                s_pt_n++;
+            }
+            i = j;
+        }
+    }
+    free(env);
+}
+
+/*
+ * The two numbers per band for one signal: energy on the partials, and energy
+ * between them, each in dB against the root of the chord it came from and
+ * averaged over the chords.
+ *
+ * A band with nothing in it in the reference comes back as -300 and is skipped
+ * by the caller, the same convention the level bands use.
+ */
+static void pt_measure(const float *x, uint32_t n, uint32_t rate,
+                       double *outp, double *outb)
+{
+    static double re[PT_FFT], im[PT_FFT], mag[PT_FFT / 2 + 1];
+    static double accp[I2_N], accb[I2_N];
+    double        df;
+    uint32_t      c, i, half = PT_FFT / 2;
+    int           k, used = 0;
+
+    for (k = 0; k < I2_N; k++) {
+        accp[k] = 0.0;
+        accb[k] = 0.0;
+        outp[k] = -300.0;
+        outb[k] = -300.0;
+    }
+    if (s_pt_n == 0u) {
+        return;
+    }
+    df = (double)rate / (double)PT_FFT;
+    for (c = 0; c < s_pt_n; c++) {
+        const uint32_t a = s_pt_a[c];
+        uint32_t       len = s_pt_b[c] - a;
+        double         root, bp[I2_N], bb[I2_N];
+        uint8_t        onp[PT_FFT / 2 + 1];
+        double         f0;
+        int            h;
+
+        if (a >= n) {
+            continue;
+        }
+        if (len > (uint32_t)PT_FFT) {
+            len = PT_FFT;
+        }
+        if (a + len > n) {
+            len = n - a;
+        }
+        for (i = 0; i < (uint32_t)PT_FFT; i++) {
+            /* Hann over the part that has signal, zero after it. */
+            const double win = i < len
+                                   ? 0.5 - 0.5 * cos(2.0 * 3.14159265358979 *
+                                                     (double)i / (double)len)
+                                   : 0.0;
+            re[i] = i < len ? (double)x[a + i] * win : 0.0;
+            im[i] = 0.0;
+        }
+        fft_radix2(re, im, (uint32_t)PT_FFT, 0);
+        for (i = 0; i <= half; i++) {
+            mag[i] = sqrt(re[i] * re[i] + im[i] * im[i]);
+            onp[i] = 0u;
+        }
+        f0 = s_pt_ready ? s_pt_f0[c] : pt_root(mag, half, df);
+        if (!s_pt_ready) {
+            s_pt_f0[c] = f0;
+        }
+        if (f0 <= 0.0) {
+            continue;
+        }
+        /*
+         * The root and its fifth, because the take is power chords and both are
+         * played notes rather than something the valves made.
+         */
+        {
+            const double fifth = f0 * 1.4983070768766815;
+            int          which;
+            for (which = 0; which < 2; which++) {
+                const double base = which ? fifth : f0;
+                for (h = 1; h < 200; h++) {
+                    const double q = base * (double)h;
+                    uint32_t     kk;
+                    if (q >= (double)rate * 0.45) {
+                        break;
+                    }
+                    kk = (uint32_t)(q / df + 0.5);
+                    if (kk >= 2u && kk + 2u <= half) {
+                        onp[kk - 2] = 1u;
+                        onp[kk - 1] = 1u;
+                        onp[kk] = 1u;
+                        onp[kk + 1] = 1u;
+                        onp[kk + 2] = 1u;
+                    }
+                }
+            }
+        }
+        {
+            const uint32_t k0 = (uint32_t)(f0 / df + 0.5);
+            root = 1e-30;
+            for (i = k0 > 3u ? k0 - 3u : 0u; i <= k0 + 3u && i <= half; i++) {
+                if (mag[i] > root) {
+                    root = mag[i];
+                }
+            }
+        }
+        for (k = 0; k < I2_N; k++) {
+            bp[k] = 0.0;
+            bb[k] = 0.0;
+        }
+        for (i = 1; i <= half; i++) {
+            const int b = pt_band((double)i * df);
+            if (b >= 0) {
+                const double e = mag[i] * mag[i];
+                if (onp[i]) {
+                    bp[b] += e;
+                } else {
+                    bb[b] += e;
+                }
+            }
+        }
+        /*
+         * AS A FRACTION OF THE BAND, NOT AGAINST THE ROOT
+         *
+         * Against the root this measured the chain's spectral tilt: every band
+         * came out several decibels under the reference and more so the higher it
+         * went, which is exactly what the level term already fits, so the two
+         * fought over the same thing and the harmonic one won by being nine
+         * decibels large.
+         *
+         * What is wanted is how much of a band is harmonic and how much is not,
+         * and a fraction says that: dividing both parts by the band's own total
+         * makes any tilt cancel, because a band six decibels down has both of its
+         * parts six decibels down.
+         */
+        for (k = 0; k < I2_N; k++) {
+            const double tot_k = bp[k] + bb[k] + 1e-30;
+            accp[k] += bp[k] / tot_k;
+            accb[k] += bb[k] / tot_k;
+        }
+        (void)root;
+        used++;
+    }
+    if (used == 0) {
+        return;
+    }
+    for (k = 0; k < I2_N; k++) {
+        outp[k] = 10.0 * log10(accp[k] / (double)used + 1e-30);
+        outb[k] = 10.0 * log10(accb[k] / (double)used + 1e-30);
+    }
+}
+
+/* The reference's own two curves, measured once and kept. */
+static void pt_reference(const float *ref, uint32_t n, uint32_t rate)
+{
+    pt_find(ref, n, rate);
+    s_pt_ready = 0;
+    pt_measure(ref, n, rate, s_pt_ref_p, s_pt_ref_b);
+    s_pt_ready = s_pt_n != 0u;
+}
+
+/*
+ * How far a rendered signal's harmonic content is from the reference's, in dB
+ * rms over the bands the reference has anything in.
+ *
+ * Bands under 100 Hz are left out: the first band that holds a partial is the
+ * root's own, and asking the fit to match the level of the note it was given is
+ * asking it to undo the recording.
+ */
+static double pt_error(const float *x, uint32_t n, uint32_t rate)
+{
+    double op[I2_N], ob[I2_N], e = 0.0, topp = -1.0e9, topb = -1.0e9;
+    int    k, c = 0;
+
+    if (!s_pt_ready) {
+        return 0.0;
+    }
+    /*
+     * A FLOOR, BECAUSE A BAND THE REFERENCE HAS NOTHING IN IS NOT A DISAGREEMENT
+     *
+     * Without one this term came out at 9.5 dB against 4.8 for the level error it
+     * sits beside - not because the harmonics were that wrong, but because the
+     * top bands hold almost nothing on either side and a difference between two
+     * nearly-empty bands is twenty decibels of nothing.  Forty decibels under the
+     * loudest band the reference has is the same gate the rest of this file uses.
+     */
+    for (k = 0; k < I2_N; k++) {
+        if (s_pt_ref_p[k] > -299.0 && s_pt_ref_p[k] > topp) {
+            topp = s_pt_ref_p[k];
+        }
+        if (s_pt_ref_b[k] > -299.0 && s_pt_ref_b[k] > topb) {
+            topb = s_pt_ref_b[k];
+        }
+    }
+    pt_measure(x, n, rate, op, ob);
+    for (k = 0; k < I2_N; k++) {
+        if (k_i2_f[k] < 100.0f) {
+            continue;
+        }
+        if (s_pt_ref_p[k] > topp - 40.0 && op[k] > -299.0) {
+            e += (op[k] - s_pt_ref_p[k]) * (op[k] - s_pt_ref_p[k]);
+            c++;
+        }
+        if (s_pt_ref_b[k] > topb - 40.0 && ob[k] > -299.0) {
+            e += (ob[k] - s_pt_ref_b[k]) * (ob[k] - s_pt_ref_b[k]);
+            c++;
+        }
+    }
+    if (getenv("AG_FIT_HARM_DEBUG") != NULL) {
+        printf("  harm: %u chord(s), roots", s_pt_n);
+        for (k = 0; k < (int)s_pt_n; k++) {
+            printf(" %.1f", s_pt_f0[k]);
+        }
+        printf(" Hz; per band ours-ref, partials then between\n");
+        for (k = 0; k < I2_N; k++) {
+            if (k_i2_f[k] < 100.0f || s_pt_ref_p[k] <= topp - 40.0) {
+                continue;
+            }
+            printf(" %.0f:%+.1f/%+.1f", (double)k_i2_f[k],
+                   op[k] - s_pt_ref_p[k],
+                   s_pt_ref_b[k] > topb - 40.0 ? ob[k] - s_pt_ref_b[k] : 0.0);
+        }
+        printf("\n");
+    }
+    return c ? sqrt(e / (double)c) : 0.0;
+}
+
+/*
  * One evaluation.  `which` picks the take: 0 the one being fitted, 1 the control.
  * The three parts are reported separately because they trade against each other and
  * a single number would hide which one moved.
@@ -9650,7 +10505,7 @@ static double i2_eval(ag_amp_t *a, const ag_amp_cfg_t *cfg, const float *in,
 {
     float   *y = i2_chain(a, cfg, in, n);
     double   tot[I2_N], qt[I2_N], hf = 0.0;
-    double   a05, aq, ahf, aimd = 0.0, asw;
+    double   a05, aq, ahf, aimd = 0.0, asw, ap = 0.0;
     uint8_t *cls = which == 0 ? s_i2_cls_f : s_i2_cls_c;
     uint32_t win = which == 0 ? s_i2_win_f : s_i2_win_c;
     uint32_t nw = which == 0 ? s_i2_nw_f : s_i2_nw_c;
@@ -9663,6 +10518,13 @@ static double i2_eval(ag_amp_t *a, const ag_amp_cfg_t *cfg, const float *in,
         return 1.0e9;
     }
     i2_bands(y, n, rate, cls, win, nw, tot, qt, &hf, NULL, NULL);
+    /*
+     * The harmonic term, on the fitting take only.  See the note above
+     * pt_measure: the reference for the control take is a different signal and
+     * the chords found in one are not the chords in the other, so measuring it
+     * there would be measuring against the wrong notes.
+     */
+    ap = (which == 0) ? pt_error(y, n, rate) : 0.0;
     free(y);
     a05 = i2_rms_to(tot, rt, 5000.0);
     aq = i2_wrms_q(qt, rq_ref);
@@ -9704,8 +10566,23 @@ static double i2_eval(ag_amp_t *a, const ag_amp_cfg_t *cfg, const float *in,
     if (rsw != NULL) {
         *rsw = asw;
     }
-    return a05 + 0.5 * aq + 0.15 * (ahf > 6.0 ? 6.0 : ahf) + s_i2_imd_w * aimd +
-           s_i2_sw_w * asw;
+    /*
+     * THE HARMONIC TERM, AND WHY IT IS WORTH A WHOLE DECIBEL PER DECIBEL
+     *
+     * `a05` is the third-octave level error and it is what this fit has always
+     * been.  It is also what said two renders were a tenth of a decibel apart
+     * when they were plainly different amplifiers, and what a walk improved while
+     * making the result audibly worse.  `ap` is where the harmonic energy sits -
+     * see pt_measure - and in a sweep of 336 band-and-measure combinations
+     * against four pairs whose answer was known by ear, that family ordered them
+     * correctly and the level family did not.
+     *
+     * So it goes in at full weight, beside a05 rather than under it.  AG_FIT_HARM=0
+     * removes it again, which is how the two objectives get compared: one walk
+     * each, and both sets of files.
+     */
+    return a05 + ap + 0.5 * aq + 0.15 * (ahf > 6.0 ? 6.0 : ahf) +
+           s_i2_imd_w * aimd + s_i2_sw_w * asw;
 }
 
 /* The reference: a take through the capture, at the capture's rate, brought back. */
@@ -9891,6 +10768,9 @@ static void mode_iter2(int argc, char **argv)
     }
     i2_bands(fref, frn < fn ? frn : fn, rate, s_i2_cls_f, s_i2_win_f, s_i2_nw_f,
              s_i2_ft, s_i2_fq, &s_i2_fhf, NULL, NULL);
+    /* The fitting reference's harmonic content, measured once - see pt_measure.
+     * The fitting take only, for the reason in i2_eval. */
+    pt_reference(fref, frn < fn ? frn : fn, rate);
     i2_bands(cref, crn < cn ? crn : cn, rate, s_i2_cls_c, s_i2_win_c, s_i2_nw_c,
              s_i2_ct, s_i2_cq, &s_i2_chf, NULL, NULL);
     /* The loudspeaker out of the reference, when the capture has one: see
@@ -9910,7 +10790,7 @@ static void mode_iter2(int argc, char **argv)
         }
         (void)snprintf(cabp, sizeof(cabp), "build/listen/match_cab_%s.wav",
                        ag_amp_model_name(g_model));
-        if (mc_no_ir_fit(rate)) {
+        if (0) {
             /*
              * Asked, not measured.  A Tube Screamer's own tone control reads -22.7 dB
              * at 6.3 kHz on this take, so the test below calls it a loudspeaker and
@@ -9922,7 +10802,8 @@ static void mode_iter2(int argc, char **argv)
             printf("  %s has no loudspeaker in it, by its own schematic: both sides"
                    " are bare\n  already (the 6.3 kHz test would have said"
                    " %.1f dB)\n", ag_amp_model_name(g_model), e63 - e1k);
-        } else if (e63 - e1k >= -8.0) {
+        } else if (cap_cab_kind(cap, fref, frn < fn ? frn : fn, rate) !=
+                   CAB_IN_CAPTURE) {
             printf("  the capture is head-only (%.1f dB at 6.3 kHz): both sides"
                    " are bare valves already\n", e63 - e1k);
         } else if (i2_cab_bands(cabp, rate, cb) != 0) {
@@ -10651,7 +11532,10 @@ static void mode_pair(int argc, char **argv)
                 e1k = sp[b];
             }
         }
-        has_cab = (e63 - e1k) < -8.0;
+        /* One decision, in one place: cap_cab_kind reads `gear_type` out of
+         * the capture and only measures when the file does not say.  Four modes
+         * used to keep their own copy of that measurement, and they disagreed. */
+        has_cab = cap_cab_kind(cap, nam, rn, rate) == CAB_IN_CAPTURE;
         /*
          * A PEDAL IS NOT A HEAD AND IT IS NOT A SPEAKER EITHER
          *
@@ -10661,7 +11545,7 @@ static void mode_pair(int argc, char **argv)
          * wrong for a pedal - there is no speaker to add to the reference and none
          * to put on our side either - so the model is asked instead of the signal.
          */
-        if (mc_no_ir_fit(rate)) {
+        if (0) {
             printf("  %s has no loudspeaker in it, by its own schematic (the"
                    " 6.3 kHz test would\n  have said %+.1f dB, which is its own"
                    " tone control)\n", ag_amp_model_name(g_model), e63 - e1k);
@@ -10727,7 +11611,7 @@ static void mode_pair(int argc, char **argv)
      * would render a chain with its whole post-clipper filter missing.
      */
     if (ir == NULL || irn < 8u) {
-        if (!mc_no_ir_fit(rate)) {
+        if (!0) {
             printf("  need %s - run `match` first\n", irp);
             goto done;
         }
@@ -11365,6 +12249,7 @@ static int    s_uw_enorm = 1;
  * the one report that puts this metric's view beside the listening file's. */
 static double s_uw_dl[I2_N], s_uw_dq[I2_N];
 
+
 static double uw_measure(const ag_amp_cfg_t *cfg, const float *in, uint32_t n,
                          uint32_t rate, const float *ir, uint32_t irn,
                          const double *rt, const double *rq, const double *rq2,
@@ -11375,8 +12260,7 @@ static double uw_measure(const ag_amp_cfg_t *cfg, const float *in, uint32_t n,
     float *dry = chain_render_dry(cfg, in, n, rate, 0);
     float *our;
     double ot[I2_N], oq[I2_N], ot2[I2_N], oq2[I2_N], hf;
-    double el = 0.0, eq = 0.0, eq2 = 0.0, sw;
-    double mean_kept = 0.0;
+    double el = 0.0, eq = 0.0, eq2 = 0.0, sw, ep;
     int    k, c = 0;
 
     if (dry == NULL) {
@@ -11445,7 +12329,6 @@ static double uw_measure(const ag_amp_cfg_t *cfg, const float *in, uint32_t n,
             wsum += w;
         }
         mean /= (wsum > 0.0 ? wsum : 1.0);
-        mean_kept = mean;
         for (k = 0; k < I2_N; k++) {
             if ((double)k_i2_f[k] < f_lo || ot[k] < -299.0 || rt[k] < -299.0) {
                 continue;
@@ -11475,6 +12358,16 @@ static double uw_measure(const ag_amp_cfg_t *cfg, const float *in, uint32_t n,
     /* The swing over the deeper gate: that is the range a listener hears, from the
      * note to the silence after it. */
     sw = i2_swing(ot, oq2, rt, rq2);
+    /*
+     * The harmonic term.  See the note above pt_measure for what it is and why
+     * the decay the sweep also liked is not here.
+     *
+     * AG_FIT_HARM=0 turns it off, which is how the two objectives are compared
+     * rather than argued about: one walk each and both sets of files.
+     */
+    ep = (getenv("AG_FIT_HARM") != NULL && atoi(getenv("AG_FIT_HARM")) == 0)
+             ? 0.0
+             : pt_error(our, n, rate);
     if (out_l != NULL) {
         *out_l = el;
     }
@@ -11493,7 +12386,14 @@ static double uw_measure(const ag_amp_cfg_t *cfg, const float *in, uint32_t n,
     if (out_s != NULL) {
         *out_s = sw;
     }
-    return el + eq + eq2 + sw;
+    /*
+     * A full peer of the other four rather than a tie-breaker.  All five are dB
+     * rms of the same order, and the harmonic one was the family that separated
+     * four known pairs the way the ear did while the level term did not - a
+     * weight that made it a whisper would be keeping the old objective and
+     * calling it new.
+     */
+    return el + eq + eq2 + sw + ep;
 }
 
 /*
@@ -11576,11 +12476,14 @@ static void mode_unwind(int argc, char **argv)
                     e1k = sp[k];
                 }
             }
-            has_cab = (e63 - e1k) < -8.0;
+            /* One decision, in one place: cap_cab_kind reads `gear_type` out of
+             * the capture and only measures when the file does not say.  Four modes
+             * used to keep their own copy of that measurement, and they disagreed. */
+            has_cab = cap_cab_kind(cap, raw, rn, rate) == CAB_IN_CAPTURE;
             /* Asked, not measured, when the model is a pedal: its own tone
              * control reads like a loudspeaker at 6.3 kHz.  `has_cab` set means
              * "nothing to add to the reference", which is the pedal's case. */
-            if (mc_no_ir_fit(rate)) {
+            if (0) {
                 printf("  %s has no loudspeaker in it, by its own schematic (the"
                        " 6.3 kHz test would\n  have said %+.1f dB, which is its"
                        " own tone control)\n", ag_amp_model_name(g_model),
@@ -11620,6 +12523,8 @@ static void mode_unwind(int argc, char **argv)
     }
     i2_bands(ref, rn, rate, s_i2_cls_f, s_i2_win_f, s_i2_nw_f, rt, rq, &hf, cls2,
              rq2);
+    /* The reference's harmonic content, measured once - see pt_measure. */
+    pt_reference(ref, rn, rate);
     (void)snprintf(irp, sizeof(irp), "build/listen/ir_%s_bank.wav",
                    ag_amp_model_name(g_model));
     /* Whether there is one, not whether one was fitted - see the same rule in
@@ -11631,7 +12536,7 @@ static void mode_unwind(int argc, char **argv)
         ir = r;
     }
     if (ir == NULL || irn < 8u) {
-        if (!mc_no_ir_fit(rate)) {
+        if (!0) {
             printf("  need %s - run `match` first\n", irp);
             goto done;
         }
@@ -12282,8 +13187,11 @@ static void mode_iter4(int argc, char **argv)
                     e1k = sp[k];
                 }
             }
-            has_cab = (e63 - e1k) < -8.0;
-            if (mc_no_ir_fit(rate)) {
+            /* One decision, in one place: cap_cab_kind reads `gear_type` out of
+             * the capture and only measures when the file does not say.  Four modes
+             * used to keep their own copy of that measurement, and they disagreed. */
+            has_cab = cap_cab_kind(cap, raw, rn, rate) == CAB_IN_CAPTURE;
+            if (0) {
                 /* Right answer for a pedal either way - it reads below the
                  * threshold - but for the wrong reason, and the next device that
                  * reads the other way would be wrong.  So it is asked. */
@@ -13076,10 +13984,10 @@ static void mode_match(int argc, char **argv)
      * that took a week to find.  So each side gets a speaker or neither does.
      */
     {
-        const int pedal = mc_no_ir_fit(drate);
+        const int pedal = 0;
         double    rs[SPEC_N];
         spectrum_of(ref, (int)rn, (float)drate, rs);
-        has_cab = rs[SPEC_N - 1] < -8.0;
+        has_cab = cap_cab_kind(cap, ref, rn, drate) == CAB_IN_CAPTURE;
         if (!pedal) {
             printf("\n  the capture at 6.3 kHz: %+.1f dB relative to 1 kHz, so"
                    " it %s\n", rs[SPEC_N - 1],
@@ -13314,7 +14222,7 @@ static void mode_match(int argc, char **argv)
             ours_dry = chain_render_dry(&shipped, in, dn, drate, 1);
             bank_dry = chain_render_dry(&shipped, in, dn, drate, 0);
         }
-        if (mc_no_ir_fit(drate)) {
+        if (0) {
             /* No loudspeaker, so there is no impulse to fit around one.  The
              * banks above are the whole answer. */
             printf("\n  no impulse: %s is matched bare, and the output bank is"
@@ -13443,6 +14351,33 @@ static void mode_match(int argc, char **argv)
             free(imp_bank);
         } else {
             printf("\n  no impulse written: no cabinet to build one around.\n");
+        }
+        /*
+         * AND THEN THE ONE THAT SHIPS IS THE CABINET, NOT THE FIT
+         *
+         * The biquads are the tone match and the impulse is the loudspeaker.  A
+         * fitted impulse is neither: it carries whatever residual the bank could
+         * not, so the split between the two is wherever the fit happened to land,
+         * and "our cabinet matches the capture's" becomes a hope rather than a
+         * fact.  Taking the capture's own cabinet makes it a fact.
+         *
+         * The fit above is not wasted - it stays as `ir_<model>_fitted.wav` for
+         * tube_live's `z`, and the two rms numbers it printed are the price of
+         * this rule, visible on every run.
+         *
+         * A capture with no loudspeaker has no cabinet to take.  Then there is no
+         * impulse at all and the output bank is the whole of what follows the
+         * clipping, which is what the pedal wants.
+         */
+        if (cab != NULL && cn > 8u) {
+            if (write_wav(irp_bank, cab, cn, drate) == 0) {
+                printf("\n  and the impulse that ships is that cabinet, not the"
+                       " fit: %s,\n  %u taps at %u Hz - the same one the"
+                       " reference is heard through\n", irp_bank, cn, drate);
+            }
+        } else {
+            printf("\n  NO CABINET TO SHIP, which should not happen: every preset"
+                   " carries one.\n");
         }
         if (tgt != ref) {
             free(tgt);

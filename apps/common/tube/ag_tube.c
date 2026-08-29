@@ -17,7 +17,8 @@ enum {
     TN_GRID = 4,  /* grid, behind the stopper                              */
     TN_PLATE = 5,
     TN_CATH = 6,
-    TN_LOADREF = 7 /* the far end of the AC load, held at the quiescent plate */
+    TN_LOADREF = 7, /* the far end of the AC load, held at the quiescent plate */
+    TN_GREF = 8     /* the far end of the grid leak; ground unless vgrid_ref  */
 };
 
 #define TUBE_SETTLE 12 /* Newton warm-up ticks before a number is believed  */
@@ -44,20 +45,76 @@ static float absf(float x) { return x < 0.0f ? -x : x; }
  * is the difference between the DC load line and the AC one, worth about 15%
  * of gain per stage and 30% over two, so it is not optional.
  */
+/*
+ * Which node this stage's signal comes off.  A common-cathode stage is read at
+ * the plate; a follower is read at the cathode.  Everything downstream of the
+ * solver - the sweep, the operating point, the small-signal gain - goes through
+ * here rather than naming a node, so that adding the follower did not mean
+ * writing a second solver.
+ */
+static int out_node(const ag_tube_spec_t *sp)
+{
+    return (sp != 0 && sp->kind == AG_TUBE_CF) ? TN_CATH : TN_PLATE;
+}
+
 static int build_dc(ag_ckt_t *k, const ag_tube_spec_t *sp, int bypass, float vk,
                     int load, float vpq)
 {
+    const int cf = (sp->kind == AG_TUBE_CF);
+    const int dcref = (sp->vgrid_ref != 0.0f);
+
     ag_ckt_init(k, 48000.0f); /* no capacitors here, so fs never gets used */
 
-    if (ag_ckt_add_vin(k, TN_SRC, 0) != 0 ||
-        ag_ckt_add_vdc(k, TN_B, 0, sp->vsupply) != 0 ||
-        ag_ckt_add_r(k, TN_SRC, TN_COUP, sp->rsrc) != 0 ||
-        ag_ckt_add_r(k, TN_COUP, 0, sp->rgrid) != 0 ||
-        ag_ckt_add_r(k, TN_COUP, TN_GRID, sp->rstop) != 0 ||
-        ag_ckt_add_r(k, TN_B, TN_PLATE, sp->rplate) != 0) {
+    if (ag_ckt_add_vdc(k, TN_B, 0, sp->vsupply) != 0) {
         return -1;
     }
-    if (bypass) {
+    /*
+     * The signal sits on top of whatever the grid leak returns to.
+     *
+     * For every stage behind a coupling capacitor that is ground, and this is the
+     * circuit it always was - down to the node numbering, because a solved
+     * operating point that moves is a model that changed.  A DC-coupled follower
+     * has no capacitor: its grid is tied to the previous plate, so it carries
+     * that plate's volts and the signal both, and the source has to be lifted to
+     * the same pedestal as the leak.  Referencing the leak alone would leave rsrc
+     * and rgrid as a divider and the follower would sit at eight volts instead of
+     * two hundred and thirty.
+     *
+     * The two cases are written out separately rather than as one circuit with a
+     * zero-volt source, because that source is not free: it puts two sources in
+     * series into the matrix, and with it in place every existing stage stopped
+     * converging - plate voltages came back in the millions.
+     */
+    if (dcref) {
+        if (ag_ckt_add_vdc(k, TN_GREF, 0, sp->vgrid_ref) != 0 ||
+            ag_ckt_add_vin(k, TN_SRC, TN_GREF) != 0 ||
+            ag_ckt_add_r(k, TN_SRC, TN_COUP, sp->rsrc) != 0 ||
+            ag_ckt_add_r(k, TN_COUP, TN_GREF, sp->rgrid) != 0 ||
+            ag_ckt_add_r(k, TN_COUP, TN_GRID, sp->rstop) != 0) {
+            return -1;
+        }
+    } else if (ag_ckt_add_vin(k, TN_SRC, 0) != 0 ||
+               ag_ckt_add_r(k, TN_SRC, TN_COUP, sp->rsrc) != 0 ||
+               ag_ckt_add_r(k, TN_COUP, 0, sp->rgrid) != 0 ||
+               ag_ckt_add_r(k, TN_COUP, TN_GRID, sp->rstop) != 0) {
+        return -1;
+    }
+    /*
+     * The plate resistor, or the absence of one.  A follower's plate goes to B+
+     * with nothing in the way, and the solver has no wire primitive - so the
+     * triode is attached to TN_B directly rather than through a resistor small
+     * enough to pretend.  A one-ohm stand-in would have worked and would also
+     * have been a number nobody could point at on a schematic.
+     */
+    if (!cf && ag_ckt_add_r(k, TN_B, TN_PLATE, sp->rplate) != 0) {
+        return -1;
+    }
+    /*
+     * A follower's cathode resistor is its output, so it is never replaced by the
+     * bypassed-cathode source: there is no capacitor across it to bypass, and
+     * holding that node would be holding the signal.
+     */
+    if (bypass && !cf) {
         if (ag_ckt_add_vdc(k, TN_CATH, 0, vk) != 0) {
             return -1;
         }
@@ -66,11 +123,12 @@ static int build_dc(ag_ckt_t *k, const ag_tube_spec_t *sp, int bypass, float vk,
             return -1;
         }
     }
-    if (ag_ckt_add_triode(k, TN_GRID, TN_PLATE, TN_CATH, &sp->valve) != 0) {
+    if (ag_ckt_add_triode(k, TN_GRID, cf ? TN_B : TN_PLATE, TN_CATH,
+                          &sp->valve) != 0) {
         return -1;
     }
     if (load) {
-        if (ag_ckt_add_r(k, TN_PLATE, TN_LOADREF, sp->rload) != 0 ||
+        if (ag_ckt_add_r(k, out_node(sp), TN_LOADREF, sp->rload) != 0 ||
             ag_ckt_add_vdc(k, TN_LOADREF, 0, vpq) != 0) {
             return -1;
         }
@@ -85,25 +143,27 @@ static float dc_at(ag_ckt_t *k, float vin, int node)
     return ag_ckt_tick(k, vin, node);
 }
 
-static void settle(ag_ckt_t *k, float vin)
+/* `node` is the stage's output node - see out_node.  It only decides which
+ * solution ag_ckt_tick hands back; the settling itself is the same either way. */
+static void settle(ag_ckt_t *k, float vin, int node)
 {
     int i;
     for (i = 0; i < TUBE_SETTLE; i++) {
-        (void)ag_ckt_tick(k, vin, TN_PLATE);
+        (void)ag_ckt_tick(k, vin, node);
     }
 }
 
 /* Small-signal gain at the operating point, by central difference.  One
  * millivolt: large enough that the difference is not float noise on a 130 V
  * node, small enough that the curve has not bent. */
-static float slope_at_bias(ag_ckt_t *k)
+static float slope_at_bias(ag_ckt_t *k, int node)
 {
     const float e = 1.0e-3f;
     float      up, dn;
-    settle(k, e);
-    up = dc_at(k, e, TN_PLATE);
-    settle(k, -e);
-    dn = dc_at(k, -e, TN_PLATE);
+    settle(k, e, node);
+    up = dc_at(k, e, node);
+    settle(k, -e, node);
+    dn = dc_at(k, -e, node);
     return (up - dn) / (2.0f * e);
 }
 
@@ -119,6 +179,7 @@ void ag_tube_init(ag_tube_t *tb)
     }
     tb->seen_lo = 1.0e30f;
     tb->seen_hi = -1.0e30f;
+    tb->cut = 0;
 }
 
 void ag_tube_reset(ag_tube_t *tb)
@@ -132,6 +193,7 @@ void ag_tube_reset(ag_tube_t *tb)
     tb->samples = 0;
     tb->seen_lo = 1.0e30f;
     tb->seen_hi = -1.0e30f;
+    tb->cut = 0;
     tb->vc = 0.0f;
     tb->vc_peak = 0.0f;
 }
@@ -147,7 +209,7 @@ int ag_tube_set_adaa(ag_tube_t *tb, int on)
 }
 
 int ag_tube_set_blocking(ag_tube_t *tb, const ag_tube_spec_t *sp, float fs,
-                         int on)
+                         int on, float depth)
 {
     if (tb == 0 || sp == 0 || fs <= 0.0f || (on && tb->g == 0)) {
         return 0;
@@ -162,7 +224,17 @@ int ag_tube_set_blocking(ag_tube_t *tb, const ag_tube_spec_t *sp, float fs,
         tb->block = 0;
         return 0;
     }
-    tb->blk_k = 1.0f / (fs * sp->ccouple);
+    if (depth <= 0.0f) {
+        tb->block = 0;
+        return 1;
+    }
+    /*
+     * The depth multiplies the charge and nothing else.  The leak and so the
+     * recovery time are untouched, which is the point: a shallower blocking that
+     * also recovered faster would be two changes at once and neither of them
+     * would be the one being listened to.
+     */
+    tb->blk_k = (depth > 1.0f ? 1.0f : depth) / (fs * sp->ccouple);
     tb->blk_g = 1.0f / (fs * sp->ccouple * sp->rgrid);
     tb->blk_decay = 1.0f / (1.0f + tb->blk_g);
     return 1;
@@ -190,7 +262,7 @@ int ag_tube_set_blocking(ag_tube_t *tb, const ag_tube_spec_t *sp, float fs,
  * moving, and where it stops moving is what "saturated" has to be measured
  * against.  Cut-off, at the other end, arrives within a few volts.
  */
-static void fit_range(ag_ckt_t *k, float tol, float *lo, float *hi)
+static void fit_range(ag_ckt_t *k, float tol, float *lo, float *hi, int node)
 {
     const int probe = TUBE_PROBE;
     float     v[TUBE_PROBE], u[TUBE_PROBE];
@@ -204,9 +276,9 @@ static void fit_range(ag_ckt_t *k, float tol, float *lo, float *hi)
                         : ag_expf(ag_logf(1.0f) + (t - 0.5f) * 2.0f *
                                                       ag_logf(4000.0f));
     }
-    settle(k, u[0]);
+    settle(k, u[0], node);
     for (i = 0; i < probe; i++) {
-        v[i] = dc_at(k, u[i], TN_PLATE);
+        v[i] = dc_at(k, u[i], node);
     }
     /*
      * The extremes as measured, not as assumed to be the two end points.
@@ -290,8 +362,9 @@ int ag_tube_bake(ag_tube_t *tb, ag_ckt_t *scratch, const ag_tube_spec_t *sp,
                  float *tab, float *tabh, float *tabg, int n, float lo, float hi,
                  float tol)
 {
-    float vk, vpq, hmid;
-    int   i;
+    float     vk, vpq, hmid;
+    int       i;
+    const int nd = out_node(sp);
 
     if (tb == 0 || scratch == 0 || sp == 0 || tab == 0 || n < 8) {
         return -1;
@@ -305,9 +378,15 @@ int ag_tube_bake(ag_tube_t *tb, ag_ckt_t *scratch, const ag_tube_spec_t *sp,
     if (build_dc(scratch, sp, 0, 0.0f, 0, 0.0f) != 0) {
         return -1;
     }
-    settle(scratch, 0.0f);
-    (void)dc_at(scratch, 0.0f, TN_PLATE);
-    vpq = scratch->x[TN_PLATE - 1];
+    settle(scratch, 0.0f, nd);
+    (void)dc_at(scratch, 0.0f, nd);
+    /*
+     * `vpq` is the quiescent voltage on whatever node this stage's signal comes
+     * off - the plate for a common-cathode stage, the cathode for a follower.
+     * It is the operating point the curve is measured against and the far end of
+     * the AC load is held at, so it has to follow the output and not the name.
+     */
+    vpq = scratch->x[nd - 1];
     vk = scratch->x[TN_CATH - 1];
     tb->vq_plate = vpq;
     tb->vq_cath = vk;
@@ -319,12 +398,12 @@ int ag_tube_bake(ag_tube_t *tb, ag_ckt_t *scratch, const ag_tube_spec_t *sp,
     if (build_dc(scratch, sp, 0, 0.0f, 1, vpq) != 0) {
         return -1;
     }
-    tb->gain_unbypassed = slope_at_bias(scratch);
+    tb->gain_unbypassed = slope_at_bias(scratch, nd);
 
     if (build_dc(scratch, sp, 1, vk, 1, vpq) != 0) {
         return -1;
     }
-    tb->gain_bypassed = slope_at_bias(scratch);
+    tb->gain_bypassed = slope_at_bias(scratch, nd);
 
     /*
      * Pass two: the curve itself, on the loaded stage - bypassed if it has a
@@ -344,7 +423,27 @@ int ag_tube_bake(ag_tube_t *tb, ag_ckt_t *scratch, const ag_tube_spec_t *sp,
         return -1;
     }
     if (hi <= lo) {
-        fit_range(scratch, tol, &lo, &hi);
+        if (sp->kind == AG_TUBE_CF) {
+            /*
+             * A follower's axis comes from its two rails rather than from
+             * fit_range, and it has to, because fit_range looks for two plateaux
+             * and a follower has one.  Going down it stays linear all the way to
+             * cut-off - there is nothing to find - and going up it runs out of
+             * plate voltage and flattens.  Asked to fit that, the search finds no
+             * lower plateau, falls through to its own +-5 V guard, and bakes a
+             * table a twentieth as wide as the stage in front of it swings.
+             *
+             * The two rails are the honest ends.  Down, the cathode can be pushed
+             * to ground and no further, which is `vq_cath` below where it sits.
+             * Up, it can approach B+, which is `vsupply - vq_cath` above.  Five
+             * per cent past each so that the ends of the table are real solved
+             * points and not the last thing before a wall.
+             */
+            lo = -1.05f * vk;
+            hi = 1.05f * (sp->vsupply - vk);
+        } else {
+            fit_range(scratch, tol, &lo, &hi, nd);
+        }
     }
     tb->n = n;
     tb->step = (hi - lo) / (float)(n - 1);
@@ -408,9 +507,9 @@ int ag_tube_bake(ag_tube_t *tb, ag_ckt_t *scratch, const ag_tube_spec_t *sp,
     }
 
     scratch->nonconverged = 0;
-    settle(scratch, lo);
+    settle(scratch, lo, nd);
     for (i = 0; i < n; i++) {
-        tab[i] = dc_at(scratch, lo + tb->step * (float)i, TN_PLATE) - vpq;
+        tab[i] = dc_at(scratch, lo + tb->step * (float)i, nd) - vpq;
         /*
          * The grid current at the same solved point, from the same valve.
          * Taken from the device rather than from the drop across the stopper:
@@ -421,8 +520,16 @@ int ag_tube_bake(ag_tube_t *tb, ag_ckt_t *scratch, const ag_tube_spec_t *sp,
         if (tabg != 0) {
             ag_triode_op_t op;
             const float    vk_now = scratch->x[TN_CATH - 1];
+            /*
+             * A follower has no plate node of its own - its plate is B+, and
+             * TN_PLATE is not in that circuit at all, so reading it would be
+             * reading whatever the solver left in an unused slot.
+             */
+            const float    vp_now = (sp->kind == AG_TUBE_CF)
+                                        ? sp->vsupply
+                                        : scratch->x[TN_PLATE - 1];
             ag_triode_eval(&sp->valve, scratch->x[TN_GRID - 1] - vk_now,
-                           scratch->x[TN_PLATE - 1] - vk_now, &op);
+                           vp_now - vk_now, &op);
             tabg[i] = op.ig;
         }
     }
@@ -661,6 +768,9 @@ static float tick_at(ag_tube_t *tb, float x, float p)
         tb->seen_hi = x;
     }
 
+    if (p <= 0.0f) {
+        tb->cut++;
+    }
     if (!tb->adaa) {
         if (p <= 0.0f || p >= (float)(tb->n - 1)) {
             tb->clamped++;
@@ -868,6 +978,10 @@ void ag_tube_spec_ts9(ag_tube_spec_t *out, int index)
          * gains by it.
          */
         out->kind = AG_TUBE_LINEAR;
+    /* Grounded grid leak, which is every stage in this tree but a
+     * follower.  Written out because an unset field here is whatever was on
+     * the caller's stack, and a stray pedestal moves the operating point. */
+    out->vgrid_ref = 0.0f;
         out->ri = 0.0f;
         out->ci = 0.0f;
         out->rf = 0.0f;
@@ -887,6 +1001,10 @@ void ag_tube_spec_ts9(ag_tube_spec_t *out, int index)
         return;
     }
     out->kind = AG_TUBE_TS_FEEDBACK;
+    /* Grounded grid leak, which is every stage in this tree but a
+     * follower.  Written out because an unset field here is whatever was on
+     * the caller's stack, and a stray pedestal moves the operating point. */
+    out->vgrid_ref = 0.0f;
     /*
      * The TS9's clipping stage, from the published schematic.
      *
@@ -931,6 +1049,10 @@ void ag_tube_spec_jcm800(ag_tube_spec_t *out, int index)
      * bogner took their shelf from an input leg that does not exist -
      * which test_tube caught as a shelf at the wrong frequency. */
     out->kind = AG_TUBE_TRIODE;
+    /* Grounded grid leak, which is every stage in this tree but a
+     * follower.  Written out because an unset field here is whatever was on
+     * the caller's stack, and a stray pedestal moves the operating point. */
+    out->vgrid_ref = 0.0f;
     out->ri = 0.0f;
     out->ci = 0.0f;
     out->rf = 0.0f;
@@ -979,49 +1101,6 @@ void ag_tube_spec_jcm800(ag_tube_spec_t *out, int index)
     }
 }
 
-/*
- * A Bogner crunch channel, built as what it is documented to be: a JCM800 2203
- * with three gain stages instead of two, a cathode follower, and a second valve
- * run much hotter than Marshall ran it.
- *
- * WHERE THIS COMES FROM, and it is a different kind of source again.  The Bogner
- * Ecstasy has no published schematic and the traced ones are photographs; the
- * **Shiva** does, and the amplifier's crunch channel is described in the places
- * that have both schematics as "a standard Marshall 2203 specification with some
- * modifications for higher gain: three gain stages plus a cathode follower, the
- * second gain stage much hotter than a standard 2203".  So the topology and the
- * base values are documented, and this file says which of the three departures
- * from a 2203 is an interpretation of that sentence rather than a number anybody
- * printed:
- *
- *   V1a  the stock 2203 front end: 100 k and 2k7 bypassed.  Documented.
- *   V1b  **220 k and 820 R** - "much hotter" turned into the two values that
- *        make a 12AX7 stage hotter, and the ones the 2203's own hot-rod uses
- *        (ag_tube_spec_jcm800 does exactly this to *its* first valve).  This is
- *        the interpretation.
- *   V2a  a third gain stage, back to 100 k and 2k7.  That the Shiva has one is
- *        documented; its values are not, so they are the amplifier's own standard.
- *
- * Everything else is a 2203: the 68 k stopper and 1 M leak at the input, 2.2 nF
- * interstage couplings against 470 k grid leaks, 0.68 uF across every cathode.
- * The 4.7 nF this model used to carry between the first two valves was invented -
- * argued for, measured, and still invented - and 2.2 nF is what the amplifier it
- * is derived from actually has.
- *
- * The **cathode follower is not modelled**, and what that costs is stated rather
- * than hidden: a follower is a buffer with a gain near one, so leaving it out
- * loses almost nothing in level, but it drives the tone stack from about a
- * kilohm instead of from a plate's forty-eight, and a passive network's response
- * depends on what drives it.  ag_amp_tone_spec sets the stack's source impedance
- * to 1 k for this model for that reason - the buffer is represented by its output
- * impedance, which is the only thing about it the rest of the chain can tell.
- *
- * WHY THREE STAGES.  Measured, on the capture this model is fitted to: 20 dB less
- * into the real amplifier comes back only 1.8 dB quieter, which is **18.2 dB of
- * compression** - within a decibel of the 5150's 18.9.  The two-valve version of
- * this model managed 4.0.  A crunch channel that a listener would call crunch is
- * still a very saturated amplifier, and two valves cannot get there.
- */
 void ag_tube_spec_bogner(ag_tube_spec_t *out, int index)
 {
     if (out == 0) {
@@ -1034,6 +1113,10 @@ void ag_tube_spec_bogner(ag_tube_spec_t *out, int index)
      * bogner took their shelf from an input leg that does not exist -
      * which test_tube caught as a shelf at the wrong frequency. */
     out->kind = AG_TUBE_TRIODE;
+    /* Grounded grid leak, which is every stage in this tree but a
+     * follower.  Written out because an unset field here is whatever was on
+     * the caller's stack, and a stray pedestal moves the operating point. */
+    out->vgrid_ref = 0.0f;
     out->ri = 0.0f;
     out->ci = 0.0f;
     out->rf = 0.0f;
@@ -1156,6 +1239,10 @@ void ag_tube_spec_slo(ag_tube_spec_t *out, int index)
      * bogner took their shelf from an input leg that does not exist -
      * which test_tube caught as a shelf at the wrong frequency. */
     out->kind = AG_TUBE_TRIODE;
+    /* Grounded grid leak, which is every stage in this tree but a
+     * follower.  Written out because an unset field here is whatever was on
+     * the caller's stack, and a stray pedestal moves the operating point. */
+    out->vgrid_ref = 0.0f;
     out->ri = 0.0f;
     out->ci = 0.0f;
     out->rf = 0.0f;
@@ -1294,7 +1381,7 @@ int ag_tube_bake_clipper(ag_tube_t *tb, ag_ckt_t *scratch, float rseries,
     if (ag_tube_attach(tb, tab, tabh, tabg, n, lo, hi) != 0) {
         return -1;
     }
-    settle(scratch, lo);
+    settle(scratch, lo, 2); /* the clipper is read at node 2 */
     for (i = 0; i < n; i++) {
         tab[i] = dc_at(scratch, lo + tb->step * (float)i, 2);
     }

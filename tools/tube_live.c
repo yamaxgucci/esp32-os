@@ -48,6 +48,8 @@
  *
  * SPDX-License-Identifier: Apache-2.0
  */
+#include "nam.h"
+
 #include <conio.h>
 #include <math.h>
 #include <stdint.h>
@@ -55,8 +57,17 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#define COBJMACROS
+#define INITGUID
 #include <windows.h>
 #include <mmsystem.h>
+#include <initguid.h>
+#include <mmdeviceapi.h>
+#include <audioclient.h>
+#include <functiondiscoverykeys_devpkey.h>
+#include <avrt.h>
+#include <ks.h>
+#include <ksmedia.h>
 /* For flush-to-zero.  See the note in main: a decaying convolution tail is what
  * makes an audio program slower when there is less to hear. */
 #include <xmmintrin.h>
@@ -302,26 +313,51 @@ static uint32_t g_pos;
  * expects.  Kept on its own loop position so switching does not restart the
  * phrase.  Fitted at drive 0.5, so that is where the comparison is fair.
  */
-#ifndef AG_REF_DEFAULT
-#define AG_REF_DEFAULT "build/listen/ref_mars_22k.wav"
-#endif
-static float   *g_ref;
-static uint32_t g_ref_frames;
-static uint32_t g_ref_pos;
 static int      g_ref_on;
 /*
- * What the reference is multiplied by so that `y` is a comparison and not a
+ * THE REAL AMPLIFIER, RUN LIVE
+ *
+ * The capture itself on the same take, block by block beside this chain, and
+ * 'y' swaps which of the two the card hears.  It used to be a file the walk had
+ * rendered; that is gone, because two kinds of reference meant a 'y' that
+ * sometimes did nothing - at a rate where the file would not load the key
+ * toggled a thing that was not there and the sound did not change.  One
+ * reference, always the same one, and it either plays or the tool says why not.
+ *
+ * It needs the capture's own rate: a model trained at 48 kHz fed 22.05 kHz
+ * material is a different model, and resampling inside the block would need a
+ * streaming resampler this tree does not have, plus a third source of difference
+ * between the two sides.  At the wrong rate the reference is refused out loud.
+ *
+ * The capture has no loudspeaker of its own - gear_type "amp" - so it goes
+ * through this chain's cabinet, the one out of the preset.  Both sides therefore
+ * hear the same speaker, which is what makes 'y' a question about the amplifier.
+ */
+static nam_model_t *g_nam;
+/*
+ * What the capture is multiplied by so that 'y' is a comparison and not a
  * volume test.
  *
- * A capture's output level is whatever the person who made it played at, and our
- * master knob is set to fill sixteen bits: measured on the three models, the
- * reference came in +2.2 dB, +0.8 dB and **-13.7 dB** against the chain it is
- * meant to be compared with.  Fourteen decibels of level difference is not a tone
- * comparison, it is a loudness comparison, and loudness wins every one of those.
- * Matched on rms over the first second of the take - the same material on both
- * sides - and printed.
+ * Measured rather than assumed, and it had to be learned: before it was
+ * measured the capture played ten decibels under the chain.  An A/B that also
+ * changes the loudness is answered by whichever side is louder, and ten
+ * decibels down reads as thin and far away - which is what a missing
+ * loudspeaker sounds like, so it got blamed on the cabinet.
  */
-static float    g_ref_gain = 1.0f;
+static float        g_nam_gain = 1.0f;
+/*
+ * Whether the capture follows the drive knob.
+ *
+ * Off - and it starts off - it plays the take as recorded and never changes,
+ * which is what aiming at it needs: the target has to hold still.  On, it gets
+ * the same input this chain gets, scaled by how far drive has moved from where
+ * the model was fitted, and then it answers a different question - not "does it
+ * sound the same" but "does it *react* the same".  At the fitted drive the two
+ * agree, which is also a check that the scaling is right.
+ */
+static int          g_ref_follow;
+static float        g_nam_in[AG_IR_BLOCK];
+static float        g_fit_drive = 1.0f;
 
 static ag_ckt_t *g_ckt;
 
@@ -476,7 +512,13 @@ static char  g_fit_rel[200] = "no fitted impulse was looked for yet";
  */
 static float *g_fir;      /* the impulse, resampled, reversed, level-matched */
 static int    g_fir_n;
-static float *g_fhist;    /* g_fir_n - 1 + BLK, newest sample last */
+/* g_fir_n - 1 + FHIST_SLACK + BLK; the live window starts at g_fpos. */
+#define FHIST_SLACK 8192
+/* Taps to keep of the float impulse, 0 for all of it; see cab_open. */
+static int      g_irtaps;
+static float   *g_fhist;
+static uint32_t g_fpos;
+static int      g_fslack;
 static int    g_cab_mode; /* 0 off, 1 float, 2 int16 through ag_ir */
 static int    g_cab_want = 1; /* which arithmetic 'c' brings back */
 
@@ -647,6 +689,38 @@ static int cab_load_f(const float *irf_in, uint32_t irn_in, uint32_t irrate,
             uint32_t fn = 0;
             g_fir = resample_ir(irf, irn, irrate, rate, &fn);
             g_fir_n = (int)fn;
+            /*
+             * SHORTER, WHEN SOMETHING HAS TO KEEP UP WITH A PLAYER
+             *
+             * The float cabinet is a direct convolution, so it costs one
+             * multiply-add per tap per sample: 8820 taps at 44.1 kHz is 389
+             * million a second, and on this machine that is three quarters of
+             * the audio a card asking every three milliseconds actually gets.
+             * The int16 path fits, but its block quantisation is audible as a
+             * buzz on a quiet signal - which is what a guitar is between notes.
+             *
+             * A cabinet does not need two hundred milliseconds of tail.  The
+             * useful part is the first twenty or thirty; what follows is the
+             * room the impulse was taken in, and cutting it costs a little of
+             * that and nothing of the speaker.  The last sixty-four taps fade
+             * out rather than stopping, because a hard cut is a rectangular
+             * window and rings.
+             *
+             * Only when asked for: file work keeps the whole impulse, because
+             * there is nothing to keep up with.
+             */
+            if (g_irtaps > 0 && g_fir_n > g_irtaps) {
+                int q;
+                for (q = 0; q < 64; q++) {
+                    const float w = (float)(63 - q) / 63.0f;
+                    g_fir[g_irtaps - 64 + q] *= w;
+                }
+                printf("  cabinet: impulse cut from %d taps to %d (%.0f ms)"
+                       " so that the float path fits a period\n",
+                       g_fir_n, g_irtaps,
+                       1000.0 * (double)g_irtaps / (double)rate);
+                g_fir_n = g_irtaps;
+            }
         }
         free(irf);
     }
@@ -717,7 +791,9 @@ static int cab_load_f(const float *irf_in, uint32_t irn_in, uint32_t irrate,
             }
             m = fpk > 1e-12f ? (float)g / fpk : 1.0f;
             rev = (float *)malloc(sizeof(float) * (size_t)g_fir_n);
-            g_fhist = (float *)calloc((size_t)(g_fir_n - 1 + BLK),
+            g_fslack = FHIST_SLACK;
+            g_fpos = 0;
+            g_fhist = (float *)calloc((size_t)(g_fir_n - 1 + FHIST_SLACK + BLK),
                                       sizeof(float));
             if (rev != NULL && g_fhist != NULL) {
                 for (j = 0; j < g_fir_n; j++) {
@@ -787,7 +863,9 @@ static int cab_load_f(const float *irf_in, uint32_t irn_in, uint32_t irrate,
                         printf(" "); /* the compiler may not drop the loop */
                     }
                     memset(g_fhist, 0,
-                           sizeof(float) * (size_t)(g_fir_n - 1 + BLK));
+                           sizeof(float) *
+                               (size_t)(g_fir_n - 1 + FHIST_SLACK + BLK));
+                    g_fpos = 0;
                     printf("  cabinet: float path %d taps, %.0f ms per second"
                            " of audio, the default; 'c' cycles float -> int16"
                            " -> off\n",
@@ -1100,6 +1178,440 @@ static int      g_minq = NBUF_MAX + 1;
 static double   g_worst_ms;
 static double   g_cost_frac; /* what the startup measurement said */
 
+/*
+ * A GUITAR, RATHER THAN A RECORDING
+ *
+ * The take is a file on a loop, which is right for comparing two settings on the
+ * same phrase and useless for the question a player actually has - how it
+ * answers the picking hand.  So the same winmm that feeds the card can be asked
+ * for the other direction, and an interface like a Valeton GP-5 appears as an
+ * ordinary capture device.
+ *
+ * WHAT THIS COSTS IN LATENCY, HONESTLY
+ *
+ * The output queue is sized for hiccups, not for playing: seventy milliseconds
+ * by default and twice that when the chain is expensive.  Add the capture side
+ * and a block of render and the round trip is that plus twenty or thirty more.
+ * That is fine for hearing what a knob does and too much to play tightly
+ * against a drummer.  `--latency <ms>` shortens both queues for someone willing
+ * to trade margin for feel, and the underrun counter at the end says whether the
+ * trade held.
+ *
+ * The samples arrive in whatever the device offers.  Mono is asked for first
+ * because a guitar input is one channel and there is no sense carrying two; a
+ * device that refuses is opened as stereo and the left channel taken.
+ */
+#define WI_RING (32 * (uint32_t)BLK)
+
+static HWAVEIN  g_wi;
+static WAVEHDR  g_ihdr[NBUF_MAX];
+static int16_t *g_ipcm[NBUF_MAX];
+static int      g_inbuf;
+static int      g_ich = 1;
+static float    g_ring[WI_RING];
+static uint32_t g_ring_w, g_ring_r;
+static uint32_t g_ring_max;   /* deepest the input backlog got, in samples */
+static uint32_t g_ring_trims; /* how often it had to be cut back */
+static float    g_in_peak;    /* loudest the instrument got, for clipping */
+static double   g_ring_frac;   /* where between two samples the reader is */
+static double   g_ring_target; /* the depth the buffering settles at */
+static double   g_ring_seen;   /* samples read while learning that depth */
+/*
+ * WHAT THE INSTRUMENT IS MULTIPLIED BY BEFORE THE CHAIN SEES IT
+ *
+ * The models are fitted against a take whose peak is around 0.77, and every
+ * trim, every bank and the drive itself assume something of that size arriving.
+ * A guitar into a line input is nowhere near it - measured here at 0.01 to 0.02,
+ * which is thirty to forty decibels down - and a chain given that plays almost
+ * clean: the sound Maxim described as "underprocessed", with a metallic edge
+ * that is the sixteen-bit quantisation of a signal using ten of its bits being
+ * amplified sixty decibels along with everything else.
+ *
+ * So there is a gain, and by default it is worked out rather than guessed: the
+ * peak over the first second, against the take's own peak.  --ingain takes a
+ * number of decibels instead, and '<' and '>' move it while playing.
+ */
+static float    g_in_gain = 1.0f;
+static float    g_in_gain_db;   /* what was asked for, 0 if automatic */
+/*
+ * OFF UNLESS ASKED FOR.
+ *
+ * An automatic level changes how hard the model is driven, which changes the
+ * overdrive - and a tool that quietly moves the thing being judged is worse than
+ * one that leaves it wrong.  `--ingain auto` turns it on; `--ingain <dB>` and
+ * '<' '>' set it by hand.
+ */
+static int      g_in_auto;
+static float    g_in_seen;      /* the loudest so far while measuring */
+static uint32_t g_in_learn;     /* unused now; the level comes from the peak */
+static double   g_in_said;      /* the last gain reported, to keep it quiet */
+static float    g_take_peak = 0.7f;
+/* One period of the device, in frames - set when the stream opens.  The reader
+ * needs it to know what depth to hold and the winmm path leaves it at zero. */
+static uint32_t g_period;
+static int      g_live;       /* playing the input rather than the take */
+static int      g_live_ok;    /* the device opened */
+static uint32_t g_starved;    /* blocks the input could not fill */
+
+static void wavein_list(void)
+{
+    const UINT n = waveInGetNumDevs();
+    UINT       i;
+    printf("  capture devices:\n");
+    if (n == 0u) {
+        printf("    none\n");
+        return;
+    }
+    for (i = 0; i < n; i++) {
+        WAVEINCAPSA c;
+        if (waveInGetDevCapsA(i, &c, sizeof(c)) == MMSYSERR_NOERROR) {
+            printf("    %u: %s\n", i, c.szPname);
+        }
+    }
+}
+
+static int wavein_open(uint32_t rate, int dev, int nbuf)
+{
+    WAVEFORMATEX wf;
+    int          i;
+    int          ch;
+
+    for (ch = 1; ch <= 2; ch++) {
+        memset(&wf, 0, sizeof(wf));
+        wf.wFormatTag = WAVE_FORMAT_PCM;
+        wf.nChannels = (WORD)ch;
+        wf.nSamplesPerSec = rate;
+        wf.wBitsPerSample = 16;
+        wf.nBlockAlign = (WORD)(2 * ch);
+        wf.nAvgBytesPerSec = rate * (uint32_t)(2 * ch);
+        if (waveInOpen(&g_wi, dev < 0 ? WAVE_MAPPER : (UINT)dev, &wf, 0, 0,
+                       CALLBACK_NULL) == MMSYSERR_NOERROR) {
+            g_ich = ch;
+            break;
+        }
+        g_wi = NULL;
+    }
+    if (g_wi == NULL) {
+        printf("  no capture device at %u Hz - the input needs the same rate as"
+               " the take; try a 48 kHz one\n", rate);
+        return -1;
+    }
+    g_inbuf = nbuf < 4 ? 4 : (nbuf > NBUF_MAX ? NBUF_MAX : nbuf);
+    for (i = 0; i < g_inbuf; i++) {
+        g_ipcm[i] = (int16_t *)calloc((size_t)BLK * (size_t)g_ich,
+                                      sizeof(int16_t));
+        if (g_ipcm[i] == NULL) {
+            return -1;
+        }
+        memset(&g_ihdr[i], 0, sizeof(g_ihdr[i]));
+        g_ihdr[i].lpData = (LPSTR)g_ipcm[i];
+        g_ihdr[i].dwBufferLength =
+            (DWORD)(BLK * g_ich * (int)sizeof(int16_t));
+        if (waveInPrepareHeader(g_wi, &g_ihdr[i], sizeof(g_ihdr[i])) !=
+                MMSYSERR_NOERROR ||
+            waveInAddBuffer(g_wi, &g_ihdr[i], sizeof(g_ihdr[i])) !=
+                MMSYSERR_NOERROR) {
+            return -1;
+        }
+    }
+    if (waveInStart(g_wi) != MMSYSERR_NOERROR) {
+        return -1;
+    }
+    g_live_ok = 1;
+    /*
+     * And it starts playing, rather than waiting to be switched on.  Asking for
+     * an input and then hearing the test loop is not a state anybody wanted - it
+     * reads as the input being broken.  'L' goes back to the take.
+     */
+    g_live = 1;
+    printf("  input: device %d, %s at %u Hz, %d blocks of %d - playing it now,"
+           " 'L' switches to the take\n",
+           dev, g_ich == 1 ? "mono" : "stereo, left channel", rate, g_inbuf,
+           BLK);
+    return 0;
+}
+
+/*
+ * Drain whatever the device has finished into the ring and hand the buffers
+ * back.  Called from the same loop that tops up the output, so nothing here
+ * blocks and nothing needs a callback thread.
+ */
+/*
+ * THE BACKLOG IS HELD SHORT, NOT MERELY PREVENTED FROM OVERFLOWING
+ *
+ * The ring used to be trimmed only when nearly full - eight thousand samples,
+ * a hundred and eighty milliseconds - so the input was free to run that far
+ * ahead of what was being played and stay there.  The output side measured
+ * three milliseconds and said so, and the delay a player actually felt was the
+ * backlog, which nothing was looking at.
+ *
+ * `keep` is the slack worth having: enough that a late drain does not leave the
+ * render with nothing, short enough not to be heard.  Anything past it is thrown
+ * away rather than played late, because a delay that grows and never shrinks is
+ * the one fault an instrument cannot be played through.
+ */
+static void ring_trim(uint32_t keep)
+{
+    const uint32_t have = g_ring_w - g_ring_r;
+    if (have > g_ring_max) {
+        g_ring_max = have;
+    }
+    /*
+     * Shed the surplus a sample at a time rather than jumping.
+     *
+     * A jump throws away everything it is over by, which is a hole in the middle
+     * of a note and is heard as a click - and with a loop serving 99% of the
+     * periods there is always a small surplus, so it clicked about three times a
+     * second.  One sample per drain is a discontinuity too small to hear and
+     * sheds a few hundred a second, which is more than the drift ever amounts
+     * to.  The jump stays as the far end of the net, for a real stall.
+     */
+    if (keep > 0u && have > keep) {
+        if (have > keep + keep) {
+            /* A real stall: take the whole backlog out at once and accept the
+             * discontinuity, because playing it late is worse. */
+            g_ring_r = g_ring_w - keep;
+        } else {
+            /*
+             * DROP THE SAMPLE WHERE THE SIGNAL IS QUIETEST, NOT THE NEXT ONE
+             *
+             * The two clock domains drift by a couple of hundred samples a
+             * second, so a sample has to be shed about that often - and a sample
+             * dropped in the middle of a loud waveform is a step, which at a
+             * hundred a second is heard as a crackle.  Dropped where the signal
+             * is near zero it is nothing at all.  Sixty-four samples is a
+             * millisecond and a half to look through, which always contains
+             * something quiet on anything a guitar plays.
+             */
+            uint32_t best = g_ring_r;
+            float    q = 1.0e9f;
+            uint32_t j;
+            for (j = 0; j < 64u && (g_ring_r + j) != g_ring_w; j++) {
+                const float v = g_ring[(g_ring_r + j) % WI_RING];
+                const float a = v < 0.0f ? -v : v;
+                if (a < q) {
+                    q = a;
+                    best = g_ring_r + j;
+                }
+            }
+            /* Close the gap by moving what is before the dropped sample up one,
+             * so the discontinuity is where the signal is smallest rather than
+             * at the read pointer. */
+            for (j = best; j != g_ring_r; j--) {
+                g_ring[j % WI_RING] = g_ring[(j - 1u) % WI_RING];
+            }
+            g_ring_r++;
+        }
+        g_ring_trims++;
+    }
+}
+
+static void wavein_poll(void)
+{
+    int i;
+    if (!g_live_ok) {
+        return;
+    }
+    for (i = 0; i < g_inbuf; i++) {
+        if ((g_ihdr[i].dwFlags & WHDR_DONE) == 0) {
+            continue;
+        }
+        {
+            const int16_t *p = g_ipcm[i];
+            int            k;
+            for (k = 0; k < BLK; k++) {
+                const uint32_t w = g_ring_w % WI_RING;
+                g_ring[w] = (float)p[k * g_ich] / 32768.0f;
+                g_ring_w++;
+            }
+        }
+        g_ihdr[i].dwFlags &= ~WHDR_DONE;
+        (void)waveInAddBuffer(g_wi, &g_ihdr[i], sizeof(g_ihdr[i]));
+    }
+    /*
+     * If the ring has run far ahead of what is being played - which happens
+     * after a stall, or when the tool spends a moment printing - throw the
+     * backlog away rather than play it late.  Latency that grows and never
+     * shrinks is the one fault a player notices immediately.
+     */
+    /*
+     * THE BACKLOG IS HELD SHORT, NOT MERELY PREVENTED FROM OVERFLOWING
+     *
+     * This used to trim only when the ring was nearly full - eight thousand
+     * samples, a hundred and eighty milliseconds - so the input was free to run
+     * that far ahead of what was being played and stay there.  The output side
+     * measured three milliseconds and reported it, and the latency a player
+     * actually felt was the backlog, which nothing was looking at.
+     *
+     * Two periods of slack: enough that a late drain does not leave the render
+     * with nothing, short enough that the ear cannot hear it.  Anything past
+     * that is thrown away rather than played late, because a delay that grows
+     * and never shrinks is the one fault an instrument cannot be played through.
+     */
+    /*
+     * A far net, the same as the exclusive path uses.
+     *
+     * This trimmed to two blocks while the winmm capture holds six, so it threw
+     * samples away on every call - the identical fault that was fixed for the
+     * exclusive path and left standing here, which is why --out 0 still sounded
+     * wrong after --out 1 was right.  The reader resamples now; the ring's depth
+     * is its business and not something to be cut back to a number chosen here.
+     */
+    ring_trim(WI_RING - (uint32_t)(2 * BLK));
+}
+
+/*
+ * ONE SAMPLE OF THE INPUT, AT WHATEVER RATE THE OUTPUT IS RUNNING
+ *
+ * THE TWO ENDS OF A USB INTERFACE DO NOT SHARE A CLOCK
+ *
+ * Measured on a Valeton GP-5: the capture side delivers 44099 samples a second
+ * and the render side asks for 43989.  A quarter of a per cent, which sounds
+ * like nothing and is a hundred and ten samples every second that have to go
+ * somewhere.  Dropping them is what a crackle *is* - and it is only audible
+ * while something is being played, because dropping a sample of silence costs
+ * nothing.  It was blamed on cables, on the emulator and on the loop before the
+ * counter that had been printing it all along was read properly.
+ *
+ * So the input is resampled rather than decimated: the read position moves by a
+ * fractional step, and what comes back is interpolated between neighbours.  The
+ * step is trimmed by how deep the ring is against where it should be, which is a
+ * slow loop with no knowledge of either clock - it does not need one, because
+ * the depth *is* the error.
+ *
+ * Cubic rather than linear.  Linear interpolation at a fractional delay that
+ * creeps is a comb filter whose notch creeps with it, and on a guitar that is a
+ * slow phasing; four points cost three more multiplies and have none of it.
+ */
+static float wavein_next(void)
+{
+    const uint32_t have = g_ring_w - g_ring_r;
+    double         step;
+    float          y0, y1, y2, y3, t, a, b, c;
+
+    if (have < 4u) {
+        g_starved++;
+        return 0.0f;
+    }
+    /*
+     * THE TARGET DEPTH IS LEARNED, NOT DECLARED
+     *
+     * It was one and a half periods, which is right for the exclusive path and
+     * wrong for winmm, whose capture holds six blocks of 256.  Three times the
+     * target with only half a per cent of authority means the correction sits
+     * against its stop for ever - a permanent half per cent of pitch, which is
+     * what "the sound is off" was.
+     *
+     * So the depth the buffering naturally settles at is measured over the first
+     * second and taken as the target after that.  The loop then only ever has to
+     * correct drift, which is what it is for; how deep the buffers are is the
+     * device's business and not an error to be fought.
+     */
+    if (g_ring_seen < 4u * (double)(g_period ? g_period : (uint32_t)BLK) * 8.0) {
+        g_ring_seen += 1.0;
+        g_ring_target += ((double)have - g_ring_target) * 0.001;
+        return g_ring[(g_ring_r++) % WI_RING] * g_in_gain;
+    }
+    /*
+     * A quarter of a per cent is the drift between the two ends of a USB
+     * interface; half a per cent of authority corrects it and is small enough
+     * that the correction cannot itself be heard as a pitch change.
+     */
+    {
+        /*
+         * With a floor of one period.  Learned on its own the target settled at
+         * a fifth of a millisecond on the exclusive path - the depth the ring
+         * happens to sit at when it is being drained as fast as it fills - and a
+         * reader held that close to the writer runs out on the first late drain.
+         * That showed as sixty empty reads a second, which is a click each.
+         */
+        const double floor_d = (double)(g_period ? g_period : (uint32_t)BLK);
+        double       tgt = g_ring_target > floor_d ? g_ring_target : floor_d;
+        step = 1.0 + 0.005 * (((double)have - tgt) / tgt);
+    }
+    if (step < 0.995) {
+        step = 0.995;
+    }
+    if (step > 1.005) {
+        step = 1.005;
+    }
+    /*
+     * The automatic level, settled once and then left alone.  A gain that kept
+     * tracking would be a compressor, and a compressor in front of an amplifier
+     * model is exactly the thing the model is supposed to be doing itself.
+     */
+    /*
+     * FROM THE LOUDEST NOTE SO FAR, AND ONLY EVER UPWARDS
+     *
+     * Measuring the first second and stopping was wrong in the obvious way:
+     * nobody is playing in the first second after starting the program, so it
+     * measured silence and left the gain at one.
+     *
+     * Taking the loudest thing heard so far and never coming down settles after
+     * the first few chords and then stays put.  An automatic gain that could
+     * also fall would be a compressor, and a compressor in front of an amplifier
+     * model is precisely the job the model is there to do.
+     */
+    if (g_in_auto) {
+        const float v = g_ring[g_ring_r % WI_RING];
+        const float a = v < 0.0f ? -v : v;
+        if (a > g_in_seen * 1.05f && a > 1.0e-4f) {
+            double db;
+            g_in_seen = a;
+            g_in_gain = g_take_peak / g_in_seen;
+            if (g_in_gain > 200.0f) {
+                g_in_gain = 200.0f;
+            }
+            if (g_in_gain < 1.0f) {
+                g_in_gain = 1.0f;
+            }
+            db = 20.0 * log10((double)g_in_gain);
+            /* Only when it moves by a decibel, so a rising level does not fill
+             * the console while somebody is warming up. */
+            if (db < g_in_said - 1.0 || db > g_in_said + 1.0) {
+                g_in_said = db;
+                printf("  input: loudest so far %.3f, so %+.1f dB to reach the"
+                       " take's %.2f - '<' '>' to set it by hand\n",
+                       (double)g_in_seen, db, (double)g_take_peak);
+            }
+        }
+    }
+    y0 = g_ring[(g_ring_r + 0u) % WI_RING];
+    y1 = g_ring[(g_ring_r + 1u) % WI_RING];
+    y2 = g_ring[(g_ring_r + 2u) % WI_RING];
+    y3 = g_ring[(g_ring_r + 3u) % WI_RING];
+    t = (float)g_ring_frac;
+    /* Catmull-Rom through y1 and y2, which is where the fraction lives. */
+    a = -0.5f * y0 + 1.5f * y1 - 1.5f * y2 + 0.5f * y3;
+    b = y0 - 2.5f * y1 + 2.0f * y2 - 0.5f * y3;
+    c = -0.5f * y0 + 0.5f * y2;
+    g_ring_frac += step;
+    while (g_ring_frac >= 1.0) {
+        g_ring_frac -= 1.0;
+        g_ring_r++;
+    }
+    return (((a * t + b) * t + c) * t + y1) * g_in_gain;
+}
+
+static void wavein_close(void)
+{
+    int i;
+    if (!g_live_ok) {
+        return;
+    }
+    waveInStop(g_wi);
+    waveInReset(g_wi);
+    for (i = 0; i < g_inbuf; i++) {
+        waveInUnprepareHeader(g_wi, &g_ihdr[i], sizeof(g_ihdr[i]));
+        free(g_ipcm[i]);
+    }
+    waveInClose(g_wi);
+    g_live_ok = 0;
+}
+
+/* Overridden by --latency; 0 keeps the built-in target. */
+static int g_lat_ms;
+
 static int wave_open(uint32_t rate)
 {
     WAVEFORMATEX wf;
@@ -1130,8 +1642,11 @@ static int wave_open(uint32_t rate)
      * missing when this was reported as torn audio.
      */
     {
-        uint32_t ms = (uint32_t)NBUF_MS;
-        if (g_cost_frac > 0.25) {
+        uint32_t ms = g_lat_ms > 0 ? (uint32_t)g_lat_ms : (uint32_t)NBUF_MS;
+        if (g_lat_ms > 0) {
+            printf("  latency: %u ms, as asked for - the underrun count at the"
+                   " end says whether it held\n", ms);
+        } else if (g_cost_frac > 0.25) {
             ms *= 2u;
             printf("  latency: %u ms rather than %d, because the chain costs"
                    " %.0f%% of realtime\n", ms, NBUF_MS, 100.0 * g_cost_frac);
@@ -1139,8 +1654,8 @@ static int wave_open(uint32_t rate)
         g_nbuf = (int)((ms * rate + (uint32_t)(1000 * BLK) - 1u) /
                        (uint32_t)(1000 * BLK));
     }
-    if (g_nbuf < 6) {
-        g_nbuf = 6;
+    if (g_nbuf < (g_lat_ms > 0 ? 3 : 6)) {
+        g_nbuf = g_lat_ms > 0 ? 3 : 6;
     }
     if (g_nbuf > NBUF_MAX) {
         g_nbuf = NBUF_MAX;
@@ -1238,47 +1753,301 @@ static int      g_rec_on, g_rec_seq;
  * what pushed the key map off the screen. */
 static int   g_meter;
 
-static void render(int16_t *pcm)
+/*
+ * THE CAPTURE AT ITS OWN RATE, WHATEVER THE SESSION IS RUNNING AT
+ *
+ * A NAM model is trained at one sample rate and is a different model at any
+ * other, so the live reference used to be refused whenever the take and the
+ * capture disagreed.  That made the one comparison worth having unavailable
+ * exactly when it was most wanted: the Valeton GP-5 is a 44.1 kHz interface and
+ * every capture in this tree is 48 kHz, so plugging a guitar in switched the
+ * reference off.
+ *
+ * So the model keeps its rate and the signal is carried to it and back: up on
+ * the way in, down on the way out, cubic both ways.  What that costs is one
+ * interpolation each way on the reference side only - the chain being compared
+ * against is untouched - and what it buys is being able to hear the amplifier
+ * and the model on the same note while playing.
+ *
+ * Cubic rather than linear for the reason in wavein_next: linear at a fractional
+ * delay that creeps is a comb whose notch creeps with it, and on a guitar that
+ * is heard as a slow phasing.
+ */
+#define RS_N 4096u
+
+static float    g_rs_in[RS_N];  /* what the chain was given, at the take's rate */
+static uint32_t g_rs_in_w;
+static double   g_rs_up;        /* read position into g_rs_in, take-rate units */
+static float    g_rs_out[RS_N]; /* what the model made, at the model's rate */
+static uint32_t g_rs_out_w;
+static double   g_rs_dn;        /* read position into g_rs_out, model-rate units */
+static int      g_rs_on;
+static uint32_t g_rs_calls, g_rs_samples;
+static uint64_t g_rs_ticks;   /* time inside the model itself */
+static uint64_t g_ref_ticks;  /* time in the whole reference branch */
+static uint64_t g_rs_worst;   /* the slowest single call into the model */
+
+/*
+ * A BUFFER IN FRONT OF THE MODEL, BECAUSE ITS COST IS NOT EVEN
+ *
+ * The capture averages 1.3 ms a period against three available, and every so
+ * often takes nine - three periods' work in one, and the card goes hungry for
+ * two of them.  That is what "it cannot keep up" was: not too much work, but too
+ * much of it arriving at once.
+ *
+ * So the reference is produced a little ahead of being played.  Pressing 'y'
+ * spends a few periods filling this buffer - the chain keeps playing meanwhile,
+ * so the switch takes about twenty milliseconds rather than being instant - and
+ * after that a slow call eats into the buffer instead of into the audio.
+ *
+ * It costs the reference twenty milliseconds of delay against the chain, which
+ * does not matter for comparing tone and would matter for playing.  Nothing is
+ * played through the reference: it is what the amplifier being copied sounds
+ * like, not an amplifier to use.
+ */
+#define REF_FIFO 4096u
+static float    g_ref_fifo[REF_FIFO];
+static uint32_t g_ref_fw, g_ref_fr;
+static uint32_t g_ref_prime; /* periods left to fill before it is heard */
+/* The take's own position while the reference primes, so the chain being played
+ * meanwhile does not fight the reference for the counter. */
+static uint32_t g_pos2;
+
+static float rs_cubic(const float *ring, double pos)
+{
+    const uint32_t i = (uint32_t)pos;
+    const float    t = (float)(pos - (double)i);
+    const float    y0 = ring[(i + 0u) % RS_N];
+    const float    y1 = ring[(i + 1u) % RS_N];
+    const float    y2 = ring[(i + 2u) % RS_N];
+    const float    y3 = ring[(i + 3u) % RS_N];
+    const float    a = -0.5f * y0 + 1.5f * y1 - 1.5f * y2 + 0.5f * y3;
+    const float    b = y0 - 2.5f * y1 + 2.0f * y2 - 0.5f * y3;
+    const float    c = -0.5f * y0 + 0.5f * y2;
+    return ((a * t + b) * t + c) * t + y1;
+}
+
+/*
+ * n samples of the capture's output at the take's rate, given n samples of what
+ * it should be fed.  Both ends of the resampling live here so that the caller
+ * sees an ordinary block-in block-out reference.
+ */
+static void nam_at_rate(const float *in, float *out, int n)
+{
+    static float up[RS_N], made[RS_N];
+    const double r_up = (double)nam_sample_rate(g_nam) / (double)g_rate;
+    const double r_dn = 1.0 / r_up;
+    int          k, m = 0;
+
+    for (k = 0; k < n; k++) {
+        g_rs_in[g_rs_in_w % RS_N] = in[k];
+        g_rs_in_w++;
+    }
+    /* Up, while there are four points to interpolate between. */
+    while (g_rs_up + 3.0 < (double)g_rs_in_w && m < (int)RS_N) {
+        up[m++] = rs_cubic(g_rs_in, g_rs_up);
+        g_rs_up += r_dn;
+    }
+    if (m > 0) {
+        LARGE_INTEGER qa, qb;
+        g_rs_calls++;
+        g_rs_samples += (uint32_t)m;
+        QueryPerformanceCounter(&qa);
+        nam_process(g_nam, up, made, m);
+        QueryPerformanceCounter(&qb);
+        {
+            const uint64_t d = (uint64_t)(qb.QuadPart - qa.QuadPart);
+            g_rs_ticks += d;
+            if (d > g_rs_worst) {
+                g_rs_worst = d;
+            }
+        }
+        for (k = 0; k < m; k++) {
+            g_rs_out[g_rs_out_w % RS_N] = made[k];
+            g_rs_out_w++;
+        }
+    }
+    /* And down, exactly n of them. */
+    for (k = 0; k < n; k++) {
+        if (g_rs_dn + 3.0 < (double)g_rs_out_w) {
+            out[k] = rs_cubic(g_rs_out, g_rs_dn);
+            g_rs_dn += r_up;
+        } else {
+            /* Only at the very start, before the first block has been through
+             * the model; after that the two rates keep each other fed. */
+            out[k] = 0.0f;
+        }
+    }
+    /*
+     * Keep the read positions inside the ring rather than letting them run to
+     * where a double loses samples: both are advanced by fractions for as long
+     * as the tool runs, and at 48 kHz a float index would be losing accuracy
+     * within the hour.
+     */
+    if (g_rs_up > (double)(4u * RS_N)) {
+        g_rs_up -= (double)RS_N;
+        g_rs_in_w -= RS_N;
+    }
+    if (g_rs_dn > (double)(4u * RS_N)) {
+        g_rs_dn -= (double)RS_N;
+        g_rs_out_w -= RS_N;
+    }
+}
+
+/*
+ * One block, and the caller says how long it is.
+ *
+ * It was always AG_IR_BLOCK, which is right when the card is fed from a queue
+ * of whole blocks.  On the instrument path it is not: the device asks for a
+ * period of 132 frames every three milliseconds, and rendering 256 of them at
+ * 64% of realtime takes 3.7 ms - longer than the period it has to fit in.  The
+ * card was left short by a third of its audio and the loop reported no fault,
+ * because every period it did serve was served on time.
+ *
+ * So the granularity follows the device.  `n` may be anything up to
+ * AG_IR_BLOCK, which is what the buffers here are sized for.
+ */
+static void render_n(int16_t *pcm, int n)
 {
     float y[AG_IR_BLOCK];
     int   k;
 
-    if (g_ref_on && g_ref != NULL) {
-        for (k = 0; k < BLK; k++) {
-            y[k] = g_ref[g_ref_pos] * g_ref_gain;
-            if (++g_ref_pos >= g_ref_frames) {
-                g_ref_pos = 0;
+    if (g_ref_on && g_nam != NULL) {
+        /*
+         * The capture, live.  It walks the take with the same position counter
+         * the chain uses, so switching sides with 'y' does not jump in the take -
+         * only one of the two is running at a time.
+         *
+         * The block here is the cabinet's, not NAM_BLOCK.  nam.h says the block
+         * length is part of the arithmetic, so this does not agree with the
+         * rendered file to the sample; it agrees to the ear, which is what a knob
+         * is turned by.
+         */
+        const float rel = g_ref_follow && g_fit_drive > 0.0f
+                              ? g_cfg.drive / g_fit_drive
+                              : 1.0f;
+        for (k = 0; k < n; k++) {
+            /*
+             * The guitar when there is one, exactly as the chain gets it.  This
+             * read the take unconditionally, so pressing 'y' while playing swapped
+             * the instrument for the recording - which is not a comparison of
+             * anything.
+             */
+            const float f = g_in[g_pos];
+            const float x = g_live ? wavein_next() : f;
+            if (++g_pos >= g_frames) {
+                g_pos = 0;
+            }
+            g_nam_in[k] = x * rel;
+        }
+        /*
+         * Through the rate carrier, which is a straight pass when the model and
+         * the take already agree - see nam_at_rate.
+         */
+        {
+            /*
+             * Into the buffer, in fewer and larger calls - see g_ref_fifo.
+             *
+             * The model averages a third of a period and every so often takes
+             * three of them at once, and a spike inside an audio callback is a
+             * hole in the sound.  Made a few periods ahead of being played, a
+             * slow call empties the buffer a little instead.
+             */
+            static float pend[4 * AG_IR_BLOCK];
+            static float made[4 * AG_IR_BLOCK];
+            static int   pend_n;
+            int          q;
+            for (q = 0; q < n && pend_n < (int)(4 * AG_IR_BLOCK); q++) {
+                pend[pend_n++] = g_nam_in[q];
+            }
+            if (pend_n >= 2 * n) {
+                LARGE_INTEGER ra, rb;
+                QueryPerformanceCounter(&ra);
+                nam_at_rate(pend, made, pend_n);
+                QueryPerformanceCounter(&rb);
+                g_ref_ticks += (uint64_t)(rb.QuadPart - ra.QuadPart);
+                for (q = 0; q < pend_n; q++) {
+                    g_ref_fifo[g_ref_fw % REF_FIFO] = made[q];
+                    g_ref_fw++;
+                }
+                pend_n = 0;
+            }
+        }
+        if (g_ref_prime > 0u) {
+            /*
+             * Still filling: the chain keeps playing, so pressing 'y' is a short
+             * fade rather than a gap.
+             */
+            g_ref_prime--;
+            for (k = 0; k < n; k++) {
+                const float x = g_in[g_pos2];
+                if (++g_pos2 >= g_frames) {
+                    g_pos2 = 0;
+                }
+                y[k] = g_bypass ? x : ag_amp_tick(amp(), x);
+            }
+        } else {
+            for (k = 0; k < n; k++) {
+                if (g_ref_fr == g_ref_fw) {
+                    /* Deeper than the buffer: hold rather than write a zero. */
+                    y[k] = k > 0 ? y[k - 1] : 0.0f;
+                    g_starved++;
+                } else {
+                    y[k] = g_ref_fifo[(g_ref_fr++) % REF_FIFO] * g_nam_gain;
+                }
             }
         }
     } else {
-        for (k = 0; k < BLK; k++) {
-            const float x = g_in[g_pos];
+        for (k = 0; k < n; k++) {
+            /*
+             * The guitar or the take.  The take's position keeps moving either
+             * way, so switching back with 'L' does not restart the phrase.
+             */
+            const float f = g_in[g_pos];
+            const float x = g_live ? wavein_next() : f;
             if (++g_pos >= g_frames) {
                 g_pos = 0;
             }
             y[k] = g_bypass ? x : ag_amp_tick(amp(), x);
         }
     }
-    for (k = 0; k < BLK; k++) {
+    for (k = 0; k < n; k++) {
         const float v = y[k] < 0.0f ? -y[k] : y[k];
         if (v > g_peak_amp) {
             g_peak_amp = v;
         }
     }
 
-    if (g_ref_on) {
-        /* the reference already went through a real cabinet */
-    } else if (g_cab_mode == 1 && g_fir != NULL) {
+    if (g_cab_mode == 1 && g_fir != NULL) {
         /*
          * The float cabinet: slide the block into the history and take one dot
          * product per sample.  Contiguous memory on both sides, so the compiler
          * vectorises it.
          */
         const int hist_n = g_fir_n - 1;
-        memmove(g_fhist, g_fhist + BLK, sizeof(float) * (size_t)hist_n);
-        memcpy(g_fhist + hist_n, y, sizeof(float) * (size_t)BLK);
-        for (k = 0; k < BLK; k++) {
-            const float *h = g_fhist + k;
+        /*
+         * THE HISTORY IS APPENDED TO, AND ONLY SHIFTED WHEN IT HAS TO BE
+         *
+         * It used to shift the whole tail down by `n` on every call.  That is
+         * `g_fir_n - 1` floats moved each time - 35 kB here - however few
+         * samples were asked for, so the cost per sample doubled when the block
+         * halved.  On the instrument path, where the device asks for 132 frames
+         * at a time rather than 256, that alone lost a quarter of the periods
+         * while the chain's own measured cost was a third of realtime and every
+         * period that was served was served on time.
+         *
+         * Now the new samples go after the ones already there and the shift
+         * happens once the slack is used up, which is every few thousand samples
+         * instead of every call.  The arithmetic below is unchanged: it still
+         * reads `g_fir_n` contiguous floats ending at the newest.
+         */
+        if (g_fpos + (uint32_t)n > (uint32_t)g_fslack) {
+            memmove(g_fhist, g_fhist + g_fpos, sizeof(float) * (size_t)hist_n);
+            g_fpos = 0;
+        }
+        memcpy(g_fhist + g_fpos + hist_n, y, sizeof(float) * (size_t)n);
+        for (k = 0; k < n; k++) {
+            const float *h = g_fhist + g_fpos + k;
             float        acc = 0.0f;
             int          j;
             for (j = 0; j < g_fir_n; j++) {
@@ -1286,6 +2055,7 @@ static void render(int16_t *pcm)
             }
             y[k] = acc;
         }
+        g_fpos += (uint32_t)n;
     } else if (g_cab_mode == 2 && g_ir != NULL) {
         /*
          * The staging into the convolution follows the signal, and this is a
@@ -1306,7 +2076,7 @@ static void render(int16_t *pcm)
          */
         float blk_pk = 1e-6f;
         float h;
-        for (k = 0; k < BLK; k++) {
+        for (k = 0; k < n; k++) {
             const float v = y[k] < 0.0f ? -y[k] : y[k];
             if (v > blk_pk) {
                 blk_pk = v;
@@ -1329,7 +2099,7 @@ static void render(int16_t *pcm)
             h = g_head; /* never quieter than the fixed staging run_cab uses */
         }
         g_head_auto = h;
-        for (k = 0; k < BLK; k++) {
+        for (k = 0; k < n; k++) {
             float v = y[k] * h * 32767.0f;
             if (v > 32767.0f) {
                 v = 32767.0f;
@@ -1341,7 +2111,7 @@ static void render(int16_t *pcm)
             g_mono[k] = (int16_t)v;
         }
         ag_ir_process_block(g_ir, g_mono, g_st);
-        for (k = 0; k < BLK; k++) {
+        for (k = 0; k < n; k++) {
             y[k] = (float)g_st[2 * k] / (32768.0f * h);
         }
     }
@@ -1352,8 +2122,8 @@ static void render(int16_t *pcm)
      * than the one the bank was fitted through, and an A/B that also changes the
      * loudness is answered by whichever side is louder.  See g_match.
      */
-    if (!g_ref_on && g_cab_mode != 0 && g_match != 1.0f) {
-        for (k = 0; k < BLK; k++) {
+    if (g_cab_mode != 0 && g_match != 1.0f) {
+        for (k = 0; k < n; k++) {
             y[k] *= g_match;
         }
     }
@@ -1372,7 +2142,7 @@ static void render(int16_t *pcm)
      * looking, on purpose.
      */
     if (g_rec_on && g_rec != NULL) {
-        for (k = 0; k < BLK && g_rec_n < g_rec_cap; k++) {
+        for (k = 0; k < n && g_rec_n < g_rec_cap; k++) {
             g_rec[g_rec_n++] = y[k];
         }
         if (g_rec_n >= g_rec_cap) {
@@ -1386,12 +2156,12 @@ static void render(int16_t *pcm)
      * listened to one third of an octave at a time.
      */
     if (g_solo) {
-        for (k = 0; k < BLK; k++) {
+        for (k = 0; k < n; k++) {
             y[k] = ag_biq_chain_tick(&g_solo_f, y[k]);
         }
     }
 
-    for (k = 0; k < BLK; k++) {
+    for (k = 0; k < n; k++) {
         float v = y[k] * g_vol;
         const float a = v < 0.0f ? -v : v;
         if (a > g_peak_out) {
@@ -1406,6 +2176,11 @@ static void render(int16_t *pcm)
         pcm[2 * k] = (int16_t)v;
         pcm[2 * k + 1] = pcm[2 * k];
     }
+}
+
+static void render(int16_t *pcm)
+{
+    render_n(pcm, BLK);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -1433,7 +2208,9 @@ static void cab_enter(int mode)
         g_cab_want = mode;
     }
     if (mode == 1 && g_fhist != NULL) {
-        memset(g_fhist, 0, sizeof(float) * (size_t)(g_fir_n - 1 + BLK));
+        memset(g_fhist, 0,
+               sizeof(float) * (size_t)(g_fir_n - 1 + FHIST_SLACK + BLK));
+        g_fpos = 0;
     } else if (mode == 2 && g_ir != NULL) {
         ag_ir_reset(g_ir);
         g_head_auto = g_head;
@@ -1477,8 +2254,60 @@ static void knobs(void)
     (void)ag_amp_set_knobs(amp(), &g_cfg);
 }
 
+/* Where the grid knob was when b switched it off, so that b is an A/B and not a
+ * way of losing a setting. */
+static float g_blk_was = 1.0f;
+
 /* Scale both fitted banks by g_bank, from the originals rather than from what
  * they are now - otherwise the knob would only ever go down. */
+/*
+ * DRIVE SHAPING: MORE HARMONIC IN ONE BAND, WITHOUT MOVING THE TONE
+ *
+ * One knob that lifts the mid filter in front of the valves and cuts the nearest
+ * band of the output bank by the same amount.  By magnitude the pair cancels;
+ * the valves saw the louder signal and made more harmonic out of it, and that
+ * part does not cancel.
+ *
+ * It exists because of what Maxim said about turning the plain mid knob up: the
+ * overdrive got nearer the capture's character and the tone moved with it, and
+ * the tone moving was not what he wanted.  Those are the two things a filter in
+ * front of a valve does at once, and this is how they come apart.
+ *
+ * No number picked it.  Four measurements were tried on the setting he chose by
+ * ear - the mean harmonic error, the even-to-odd balance, the error binned by
+ * where the harmonic lands, and how fast the harmonics grow with playing level -
+ * and every one of them ranked it below the setting he rejected, the last one
+ * also ranking the model he likes best worst of the three.  So this is a knob and
+ * not an objective term, and it stays that way until something measures right.
+ */
+static float g_shape_db;
+
+static void shape_apply(void)
+{
+    int b, best = -1;
+    float d = 1.0e9f;
+
+    for (b = 0; b < AG_AMP_VOICE_N; b++) {
+        const float f = g_tone0[b].hz;
+        const float e = f > g_cfg.mid_hz ? f / g_cfg.mid_hz : g_cfg.mid_hz / f;
+        if (f > 0.0f && e < d) {
+            d = e;
+            best = b;
+        }
+    }
+    for (b = 0; b < AG_AMP_VOICE_N; b++) {
+        g_cfg.tone[b].db = g_tone0[b].db * g_bank;
+    }
+    g_cfg.mid_db = g_mid_db0 * g_bank + g_shape_db;
+    if (best >= 0) {
+        g_cfg.tone[best].db -= g_shape_db;
+    }
+    knobs();
+    printf("  shaping %+.1f dB at %.0f Hz, paid back at %.0f Hz\n",
+           (double)g_shape_db, (double)g_cfg.mid_hz,
+           best >= 0 ? (double)g_tone0[best].hz : 0.0);
+}
+
 static void bank_apply(void)
 {
     int b;
@@ -1504,12 +2333,19 @@ static void help(void)
     printf("\n"
            "   q / a   drive          w / s   blend of the chosen stage\n"
            "   e / d   mid, dB        r / f   top cut, Hz\n"
+           "   E / D   which mid - the peak's frequency, a sixth of an octave\n"
+           "   R / F   how wide it is - the peak's Q, 0.3 to 4\n"
+           "   T / G   drive shaping: lift the same peak in front of the valves\n"
+           "           and pay it back after them, so the harmonics change and\n"
+           "           the tone does not\n"
            "   t / g   trim 2 (dB)    n / m   master\n"
            "   [ / ]   volume, after the cabinet - changes nothing in the model\n"
            "   1 - 4   stages         x       which stage the blend knob turns\n"
            "   5 / 6   bass           7 / 8   mid        9 / \\   treble\n"
            "           - the passive tone stack, if this model has one; 0.5 is noon\n"
-           "   b       blocking       c       cabinet in / out\n"
+           "   b       grid on / off  - / =   grid, 0 to 1: how much of the\n"
+           "           blocking - the bias walking under the playing\n"
+           "   c       cabinet in / out\n"
            "   i       cabinet arithmetic: float (PC) or int16 (the chip)\n"
            "   o       oversampling (clears the filters)\n"
            "   v       antialiasing   space   bypass, for A/B\n"
@@ -1520,7 +2356,10 @@ static void help(void)
            "           impulse for the remainder, or one impulse carrying all\n"
            "   0       record what is playing; again to write build/listen/live_recN.wav\n"
            "   u       peak meter, off by default so nothing redraws by itself\n"
-           "   y       the NAM reference of the same take, for A/B against the model\n"
+           "   L       the guitar instead of the take, when --in opened one\n"
+           "   y       the real amplifier in / out, for A/B against this chain\n"
+           "   Y       whether it follows the drive knob; off by default, so\n"
+           "           the thing being aimed at holds still\n"
            "   p       print the settings     h  this      ESC  quit\n"
            "\n");
 }
@@ -1551,8 +2390,9 @@ static void print_settings(void)
         printf(" %+.1f", (double)g_cfg.vtrim[i]);
     }
     printf(" dB of matching trim\n");
-    printf("  stages %d  os %dx  adaa %d  blocking %d  cab %d  blend", g_n,
-           g_cfg.os, g_cfg.adaa, g_cfg.blocking, g_cab_mode);
+    printf("  stages %d  os %dx  adaa %d  grid %.2f  cab %d  blend", g_n,
+           g_cfg.os, g_cfg.adaa,
+           g_cfg.blocking ? (double)g_cfg.block_depth : 0.0, g_cab_mode);
     for (i = 0; i < g_n; i++) {
         printf(" %.2f", (double)g_mix[g_n - 1][i]);
     }
@@ -1638,10 +2478,95 @@ static int key(int c)
     case 'e':
         g_cfg.mid_db -= 0.5f;
         knobs();
+        printf("  mid %+.1f dB at %.0f Hz, Q %.2f\n", (double)g_cfg.mid_db,
+               (double)g_cfg.mid_hz, (double)g_cfg.mid_q);
         break;
     case 'd':
         g_cfg.mid_db += 0.5f;
         knobs();
+        printf("  mid %+.1f dB at %.0f Hz, Q %.2f\n", (double)g_cfg.mid_db,
+               (double)g_cfg.mid_hz, (double)g_cfg.mid_q);
+        break;
+    /*
+     * WHICH middle, and how wide.
+     *
+     * `e` and `d` move one peaking filter up and down and say nothing about
+     * where it sits, which is only half a control: "more mids" is a different
+     * request at 400 Hz and at 1.6 kHz, and on a guitar the two are not even the
+     * same instrument.  So the frequency moves too, by a sixth of an octave a
+     * press - small enough to walk through the range and large enough to hear.
+     *
+     * The bottom stop is 80 Hz because below that this is not a middle any more,
+     * and the top is under half the rate so the peak stays a peak rather than
+     * folding into the corner of the band.
+     */
+    case 'E':
+    case 'D': {
+        const float step = (c == 'E') ? 1.0f / 1.122f : 1.122f;
+        float       lo = 80.0f;
+        float       hi = 0.45f * (float)g_rate;
+        g_cfg.mid_hz *= step;
+        if (g_cfg.mid_hz < lo) {
+            g_cfg.mid_hz = lo;
+        }
+        if (g_cfg.mid_hz > hi) {
+            g_cfg.mid_hz = hi;
+        }
+        knobs();
+        printf("  mid %+.1f dB at %.0f Hz, Q %.2f\n", (double)g_cfg.mid_db,
+               (double)g_cfg.mid_hz, (double)g_cfg.mid_q);
+        break;
+    }
+    /*
+     * And how wide it is.  A Q of 0.7 is most of an octave and 3 is a notch you
+     * can point at; both are useful here, because a matching filter is looking
+     * for the shape of a difference and that shape is sometimes broad tilt and
+     * sometimes one resonance.
+     */
+    case '<':
+    case '>': {
+        /* The instrument's level into the chain; see g_in_gain.  Touching it
+         * turns the automatic setting off, because a hand and a measurement
+         * fighting over one number is worse than either. */
+        const float d = (c == '>') ? 1.0f : -1.0f;
+        g_in_auto = 0;
+        g_in_learn = 0;
+        g_in_gain *= (float)pow(10.0, (double)d / 20.0);
+        if (g_in_gain < 0.01f) {
+            g_in_gain = 0.01f;
+        }
+        if (g_in_gain > 500.0f) {
+            g_in_gain = 500.0f;
+        }
+        printf("  input %+.1f dB\n", 20.0 * log10((double)g_in_gain));
+        break;
+    }
+    case 'T':
+        g_shape_db += 0.5f;
+        if (g_shape_db > 18.0f) {
+            g_shape_db = 18.0f;
+        }
+        shape_apply();
+        break;
+    case 'G':
+        g_shape_db -= 0.5f;
+        if (g_shape_db < -18.0f) {
+            g_shape_db = -18.0f;
+        }
+        shape_apply();
+        break;
+    case 'R':
+    case 'F':
+        g_cfg.mid_q += (c == 'R') ? 0.1f : -0.1f;
+        if (g_cfg.mid_q < 0.3f) {
+            g_cfg.mid_q = 0.3f;
+        }
+        if (g_cfg.mid_q > 4.0f) {
+            g_cfg.mid_q = 4.0f;
+        }
+        knobs();
+        printf("  mid %+.1f dB at %.0f Hz, Q %.2f\n", (double)g_cfg.mid_db,
+               (double)g_cfg.mid_hz, (double)g_cfg.mid_q);
         break;
     /*
      * The tone stack's three pots, which are the first controls in this tool
@@ -1784,8 +2709,39 @@ static int key(int c)
         reblend();
         break;
     case 'b':
-        g_cfg.blocking = !g_cfg.blocking;
+        if (g_cfg.blocking) {
+            g_blk_was = g_cfg.block_depth;
+            g_cfg.blocking = 0;
+        } else {
+            g_cfg.blocking = 1;
+            g_cfg.block_depth = g_blk_was > 0.0f ? g_blk_was : 1.0f;
+        }
         knobs();
+        break;
+    /*
+     * The grid, by twentieths.  Blocking has no knob on any amplifier and still
+     * changes the feel of one more than most of the knobs that do exist, and it
+     * was a switch here until it needed listening to in between.  What the
+     * fraction scales, and what it deliberately leaves alone, is in the note on
+     * ag_amp_cfg_t.block_depth.
+     */
+    case '-':
+        g_cfg.block_depth -= 0.05f;
+        if (g_cfg.block_depth < 0.0f) {
+            g_cfg.block_depth = 0.0f;
+        }
+        g_cfg.blocking = g_cfg.block_depth > 0.0f;
+        knobs();
+        printf("  grid %.2f\n", (double)g_cfg.block_depth);
+        break;
+    case '=':
+        g_cfg.block_depth += 0.05f;
+        if (g_cfg.block_depth > 1.0f) {
+            g_cfg.block_depth = 1.0f;
+        }
+        g_cfg.blocking = 1;
+        knobs();
+        printf("  grid %.2f\n", (double)g_cfg.block_depth);
         break;
     case 'v':
         g_cfg.adaa = !g_cfg.adaa;
@@ -1866,9 +2822,35 @@ static int key(int c)
         }
         bank_apply();
         break;
+    case 'L':
+        if (!g_live_ok) {
+            printf("  no input open - start with --in to pick a device, or"
+                   " --in list to see them\n");
+        } else {
+            g_live = !g_live;
+            g_ring_r = g_ring_w; /* start from now, not from the backlog */
+            printf("  %s\n", g_live ? "the guitar" : "the take");
+        }
+        break;
+    case 'Y':
+        g_ref_follow = !g_ref_follow;
+        printf("  the capture %s\n",
+               g_ref_follow ? "follows the drive knob"
+                            : "holds still, whatever the knobs do");
+        break;
     case 'y':
-        if (g_ref != NULL) {
+        if (g_nam == NULL) {
+            printf("  no reference here - see the line about the rate at"
+                   " startup\n");
+        } else {
             g_ref_on = !g_ref_on;
+            if (g_ref_on) {
+                /* Six periods of it made before it is heard - see g_ref_fifo. */
+                g_ref_prime = 6u;
+                g_ref_fr = g_ref_fw;
+                g_pos2 = g_pos;
+            }
+            printf("  %s\n", g_ref_on ? "the real amplifier" : "this chain");
         }
         break;
     case 'k':
@@ -1921,6 +2903,530 @@ static int key(int c)
  * moves on its own except the meter, which is why the meter is off unless it is
  * asked for.
  */
+/*
+ * WASAPI, EXCLUSIVE AND EVENT DRIVEN - THE ONLY WAY TO PLAY THROUGH THIS
+ *
+ * winmm is a compatibility layer over WASAPI's shared mode, and shared mode
+ * mixes: it holds its own buffers on top of whatever this tool asks for, and no
+ * amount of shortening the queue here reaches them.  Measured on this machine
+ * the card's own minimum period is three milliseconds and its default is ten,
+ * and a round trip through winmm is several times that - fine for turning a knob
+ * and hearing what it does, useless for picking a note and hearing it.
+ *
+ * Exclusive mode hands the device to one program and takes the mixer out of the
+ * path.  With an event to wake on rather than a queue to poll, the latency is
+ * the period plus what the render costs, and both are known numbers.
+ *
+ * WHAT IS TRADED FOR IT
+ *
+ * Nothing else can play while this holds the device - that is what exclusive
+ * means - and a device that will not accept the take's rate cannot be opened at
+ * all rather than being quietly resampled.  Both are the right way round for an
+ * instrument: silence is better than a hidden resampler in the monitoring path.
+ *
+ * If exclusive is refused - some devices only offer shared - it falls back to
+ * shared with the same event loop, which is still far better than winmm because
+ * the wake-up is an event rather than a poll, and says so.
+ */
+#define WA_STAGE (8 * (uint32_t)BLK)
+
+/*
+ * The two subformat GUIDs, written out rather than taken from ksmedia.h.
+ *
+ * mingw declares them but ships their definitions in a library this tool does
+ * not otherwise need, so linking against the header's names fails at the last
+ * step.  Both values are fixed by the format specification and have not moved
+ * since it was written.
+ */
+static const GUID k_wa_pcm = {
+    0x00000001, 0x0000, 0x0010,
+    { 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71 }
+};
+static const GUID k_wa_float = {
+    0x00000003, 0x0000, 0x0010,
+    { 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71 }
+};
+
+static IMMDeviceEnumerator *g_wa_en;
+static IAudioClient        *g_wa_rc, *g_wa_cc;
+static IAudioRenderClient  *g_wa_rs;
+static IAudioCaptureClient *g_wa_cs;
+static HANDLE               g_wa_rev, g_wa_cev;
+static UINT32               g_wa_rn, g_wa_cn;   /* frames a period */
+static int                  g_wa_rch, g_wa_cch; /* channels */
+static int                  g_wa_rfloat, g_wa_cfloat;
+static int                  g_wa_on;
+static int                  g_wa_excl;
+static double               g_wa_ms;
+static uint32_t             g_wa_periods;
+static uint32_t             g_wa_capframes; /* what the input actually delivered */
+static uint32_t             g_wa_nobuf;     /* GetBuffer refusals on the render side */
+/* render()'s blocks waiting to be handed to the card, interleaved stereo. */
+static int16_t              g_wa_stage[WA_STAGE * 2];
+static uint32_t             g_wa_sw, g_wa_sr;
+/* The deepest the staging buffer got: with the chain clocked by the input this
+ * is where the delay between playing a note and hearing it actually lives. */
+static uint32_t             g_stage_max;
+static uint32_t             g_stage_drops;
+
+static void wa_fmt(WAVEFORMATEXTENSIBLE *w, uint32_t rate, int ch, int as_float)
+{
+    memset(w, 0, sizeof(*w));
+    w->Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
+    w->Format.nChannels = (WORD)ch;
+    w->Format.nSamplesPerSec = rate;
+    w->Format.wBitsPerSample = (WORD)(as_float ? 32 : 16);
+    w->Format.nBlockAlign = (WORD)(ch * w->Format.wBitsPerSample / 8);
+    w->Format.nAvgBytesPerSec = rate * w->Format.nBlockAlign;
+    w->Format.cbSize = sizeof(*w) - sizeof(WAVEFORMATEX);
+    w->Samples.wValidBitsPerSample = w->Format.wBitsPerSample;
+    w->dwChannelMask = ch == 1 ? SPEAKER_FRONT_CENTER
+                               : (SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT);
+    w->SubFormat = as_float ? k_wa_float : k_wa_pcm;
+}
+
+static IMMDevice *wa_device(EDataFlow flow, int index)
+{
+    IMMDeviceCollection *col = NULL;
+    IMMDevice           *d = NULL;
+    UINT                 n = 0;
+
+    if (index < 0) {
+        if (FAILED(IMMDeviceEnumerator_GetDefaultAudioEndpoint(
+                g_wa_en, flow, eConsole, &d))) {
+            return NULL;
+        }
+        return d;
+    }
+    if (FAILED(IMMDeviceEnumerator_EnumAudioEndpoints(g_wa_en, flow,
+                                                      DEVICE_STATE_ACTIVE,
+                                                      &col))) {
+        return NULL;
+    }
+    IMMDeviceCollection_GetCount(col, &n);
+    if ((UINT)index < n) {
+        (void)IMMDeviceCollection_Item(col, (UINT)index, &d);
+    }
+    IMMDeviceCollection_Release(col);
+    return d;
+}
+
+static void wa_name(IMMDevice *d, char *out, int n)
+{
+    IPropertyStore *ps = NULL;
+    PROPVARIANT     v;
+    out[0] = 0;
+    if (FAILED(IMMDevice_OpenPropertyStore(d, STGM_READ, &ps))) {
+        return;
+    }
+    PropVariantInit(&v);
+    if (SUCCEEDED(IPropertyStore_GetValue(ps, &PKEY_Device_FriendlyName, &v)) &&
+        v.pwszVal != NULL) {
+        (void)WideCharToMultiByte(CP_UTF8, 0, v.pwszVal, -1, out, n, NULL, NULL);
+    }
+    PropVariantClear(&v);
+    IPropertyStore_Release(ps);
+}
+
+void wa_list(void)
+{
+    int      flow;
+    HRESULT  hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    (void)hr;
+    if (g_wa_en == NULL &&
+        FAILED(CoCreateInstance(&CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL,
+                                &IID_IMMDeviceEnumerator, (void **)&g_wa_en))) {
+        printf("  no audio enumerator\n");
+        return;
+    }
+    for (flow = 0; flow < 2; flow++) {
+        IMMDeviceCollection *col = NULL;
+        UINT                 n = 0, i;
+        printf("  %s:\n", flow == 0 ? "inputs (--in)" : "outputs (--out)");
+        if (FAILED(IMMDeviceEnumerator_EnumAudioEndpoints(
+                g_wa_en, flow == 0 ? eCapture : eRender, DEVICE_STATE_ACTIVE,
+                &col))) {
+            continue;
+        }
+        IMMDeviceCollection_GetCount(col, &n);
+        for (i = 0; i < n; i++) {
+            IMMDevice *d = NULL;
+            char       nm[256];
+            if (SUCCEEDED(IMMDeviceCollection_Item(col, i, &d))) {
+                wa_name(d, nm, (int)sizeof(nm));
+                printf("    %u: %s\n", i, nm);
+                IMMDevice_Release(d);
+            }
+        }
+        IMMDeviceCollection_Release(col);
+    }
+}
+
+/*
+ * One client, opened at the shortest period the device admits to.
+ *
+ * Exclusive mode is asked for with the format this tool wants rather than the
+ * device's mix format, because in exclusive there is no mixer to convert and a
+ * device that cannot do the rate has to say so here instead of somewhere later.
+ */
+static int wa_client(IMMDevice *dev, int render, uint32_t rate, int want_ch,
+                     double want_ms, IAudioClient **out, HANDLE *ev,
+                     UINT32 *frames, int *ch, int *as_float)
+{
+    IAudioClient         *ac = NULL;
+    WAVEFORMATEXTENSIBLE  w;
+    REFERENCE_TIME        def_p = 0, min_p = 0, per;
+    HRESULT               hr;
+    int                   fl, c, mode;
+
+    if (FAILED(IMMDevice_Activate(dev, &IID_IAudioClient, CLSCTX_ALL, NULL,
+                                  (void **)&ac))) {
+        return -1;
+    }
+    IAudioClient_GetDevicePeriod(ac, &def_p, &min_p);
+    per = want_ms > 0.0 ? (REFERENCE_TIME)(want_ms * 10000.0) : min_p;
+    if (per < min_p) {
+        per = min_p;
+    }
+    for (mode = 0; mode < 2; mode++) {
+        const AUDCLNT_SHAREMODE sm = mode == 0 ? AUDCLNT_SHAREMODE_EXCLUSIVE
+                                               : AUDCLNT_SHAREMODE_SHARED;
+        for (fl = 0; fl < 2; fl++) {
+            for (c = want_ch; c <= 2; c++) {
+                wa_fmt(&w, rate, c, fl);
+                hr = IAudioClient_IsFormatSupported(ac, sm, &w.Format, NULL);
+                if (hr != S_OK) {
+                    continue;
+                }
+                hr = IAudioClient_Initialize(
+                    ac, sm, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                    sm == AUDCLNT_SHAREMODE_EXCLUSIVE ? per : 0,
+                    sm == AUDCLNT_SHAREMODE_EXCLUSIVE ? per : 0, &w.Format,
+                    NULL);
+                if (hr == AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED) {
+                    /*
+                     * The device wants its own alignment.  Ask what it would
+                     * have used, throw this client away - an initialised client
+                     * cannot be initialised twice - and open a fresh one at that
+                     * size.  Skipping the reopen is the classic way to get
+                     * AUDCLNT_E_ALREADY_INITIALIZED and blame the driver.
+                     */
+                    UINT32 al = 0;
+                    IAudioClient_GetBufferSize(ac, &al);
+                    IAudioClient_Release(ac);
+                    ac = NULL;
+                    if (FAILED(IMMDevice_Activate(dev, &IID_IAudioClient,
+                                                  CLSCTX_ALL, NULL,
+                                                  (void **)&ac))) {
+                        return -1;
+                    }
+                    per = (REFERENCE_TIME)(10000.0 * 1000.0 * (double)al /
+                                               (double)rate +
+                                           0.5);
+                    hr = IAudioClient_Initialize(ac, sm,
+                                                 AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                                                 per, per, &w.Format, NULL);
+                }
+                if (SUCCEEDED(hr)) {
+                    *ev = CreateEventA(NULL, FALSE, FALSE, NULL);
+                    if (*ev == NULL ||
+                        FAILED(IAudioClient_SetEventHandle(ac, *ev))) {
+                        IAudioClient_Release(ac);
+                        return -1;
+                    }
+                    IAudioClient_GetBufferSize(ac, frames);
+                    *out = ac;
+                    *ch = c;
+                    *as_float = fl;
+                    g_wa_excl = (sm == AUDCLNT_SHAREMODE_EXCLUSIVE);
+                    g_wa_ms = 1000.0 * (double)*frames / (double)rate;
+                    return 0;
+                }
+            }
+        }
+    }
+    if (ac != NULL) {
+        IAudioClient_Release(ac);
+    }
+    (void)render;
+    return -1;
+}
+
+static int wa_open(uint32_t rate, int in_dev, int out_dev, double want_ms)
+{
+    IMMDevice *di = NULL, *dor = NULL;
+    char       nm[256];
+
+    (void)CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    if (g_wa_en == NULL &&
+        FAILED(CoCreateInstance(&CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL,
+                                &IID_IMMDeviceEnumerator, (void **)&g_wa_en))) {
+        printf("  no audio enumerator\n");
+        return -1;
+    }
+    dor = wa_device(eRender, out_dev);
+    di = wa_device(eCapture, in_dev);
+    if (dor == NULL) {
+        printf("  no output device %d\n", out_dev);
+        return -1;
+    }
+    if (wa_client(dor, 1, rate, 2, want_ms, &g_wa_rc, &g_wa_rev, &g_wa_rn,
+                  &g_wa_rch, &g_wa_rfloat) != 0) {
+        /*
+         * And say what it means, not only what happened.  This printed the
+         * reason and fell through to the old path, which had no input open - so
+         * the tool played the take, and a refused output looked like the live
+         * input being ignored.
+         */
+        printf("  the output will not open at %u Hz in exclusive mode, and"
+               " exclusive mode does not resample.\n"
+               "  Both ends have to be the same interface at its own rate: put"
+               " --out on the device\n"
+               "  that --in is on, with a take at that rate.\n",
+               rate);
+        return -1;
+    }
+    wa_name(dor, nm, (int)sizeof(nm));
+    printf("  out: %s, %s, %u frames a period (%.1f ms), %s\n", nm,
+           g_wa_excl ? "exclusive" : "shared", (unsigned)g_wa_rn, g_wa_ms,
+           g_wa_rfloat ? "float" : "16-bit");
+    if (di != NULL &&
+        wa_client(di, 0, rate, 1, want_ms, &g_wa_cc, &g_wa_cev, &g_wa_cn,
+                  &g_wa_cch, &g_wa_cfloat) == 0) {
+        wa_name(di, nm, (int)sizeof(nm));
+        printf("  in:  %s, %s, %u frames a period, %s\n", nm,
+               g_wa_excl ? "exclusive" : "shared", (unsigned)g_wa_cn,
+               g_wa_cfloat ? "float" : "16-bit");
+        if (SUCCEEDED(IAudioClient_GetService(g_wa_cc, &IID_IAudioCaptureClient,
+                                              (void **)&g_wa_cs))) {
+            g_live_ok = 1;
+            g_live = 1;
+        }
+    } else if (in_dev != -2) {
+        printf("  no input at %u Hz - playing the take\n", rate);
+    }
+    if (FAILED(IAudioClient_GetService(g_wa_rc, &IID_IAudioRenderClient,
+                                       (void **)&g_wa_rs))) {
+        return -1;
+    }
+    if (g_wa_cc != NULL) {
+        IAudioClient_Start(g_wa_cc);
+    }
+    IAudioClient_Start(g_wa_rc);
+    /*
+     * THE THREAD HAS TO BE TOLD IT IS AN AUDIO THREAD
+     *
+     * Without this the loop ran at three quarters of the device's rate on every
+     * model, every period and every cabinet - and a bare probe program doing
+     * nothing but filling a sine on the same two streams ran at the full rate.
+     * The difference was the work: about 1.3 ms of it inside a 3 ms period, at
+     * ordinary priority, is enough for the scheduler to take the thread away
+     * often enough to miss one period in four.  Nothing reports it as a fault,
+     * because every period that is served is served on time.
+     *
+     * MMCSS is what Windows offers for this, and "Pro Audio" is the task name
+     * meant for it.  timeBeginPeriod as well, for the same reason the winmm path
+     * has it.
+     */
+    {
+        DWORD idx = 0;
+        HANDLE h = AvSetMmThreadCharacteristicsA("Pro Audio", &idx);
+        (void)timeBeginPeriod(1);
+        if (h == NULL) {
+            printf("  note: could not raise the thread to Pro Audio priority;"
+                   " expect the odd dropout\n");
+        }
+    }
+    g_period = g_wa_rn;
+    /* A second of the instrument to measure its level over, if nobody said. */
+    if (g_in_auto) {
+        g_in_learn = rate;
+    }
+    g_wa_on = 1;
+    printf("  round trip: about %.0f ms, out and back - one period each way,"
+           " and the render is done a period at a time\n",
+           2.0 * g_wa_ms);
+    return 0;
+}
+
+/*
+ * THE CHAIN IS CLOCKED BY THE INPUT, NOT BY THE OUTPUT
+ *
+ * Rendering on demand from the output looked natural and quietly required a
+ * sample to be thrown away about a hundred times a second: the loop served
+ * 99.8% of the render periods, so the input ran ahead by the missing 0.2% and
+ * the surplus had to go somewhere.  Shedding it is audible - that is what the
+ * crackle was - and no amount of care about *where* to shed makes it right.
+ *
+ * Driven from the input there is nothing to shed.  Whatever arrives is rendered
+ * immediately and waits in the staging buffer; the output takes a period from it
+ * when the card asks.  Production equals consumption by construction, and the
+ * jitter between the two lives in the buffer instead of in the signal.
+ */
+static void wa_stage_render_all(void)
+{
+    static int16_t blk[2 * (uint32_t)BLK];
+    while (g_ring_w != g_ring_r) {
+        const uint32_t avail = g_ring_w - g_ring_r;
+        const uint32_t room = WA_STAGE - (g_wa_sw - g_wa_sr);
+        uint32_t       nn = avail > (uint32_t)BLK ? (uint32_t)BLK : avail;
+        uint32_t       k;
+        if (room < nn) {
+            /* The staging buffer is full: the output is not taking what is
+             * being made, which is a stall rather than drift.  Leave the rest in
+             * the ring; the far end of ring_trim will deal with it. */
+            break;
+        }
+        render_n(blk, (int)nn);
+        for (k = 0; k < nn; k++) {
+            const uint32_t w = (g_wa_sw % WA_STAGE) * 2u;
+            g_wa_stage[w] = blk[2 * k];
+            g_wa_stage[w + 1] = blk[2 * k + 1];
+            g_wa_sw++;
+        }
+        /*
+         * AND THE STAGING BUFFER IS CAPPED TOO
+         *
+         * Clocking the chain from the input took the backlog out of the ring and
+         * put it here instead: rendered audio waiting to be played, which is the
+         * same delay wearing a different hat.  It built to thirty-three
+         * milliseconds, all of it from the start, where the capture runs for a
+         * while before the render client asks for anything.
+         *
+         * Two periods is the most that is useful - one being played, one ready -
+         * and anything older than that is dropped rather than played late.  In
+         * steady running this never fires; it is the startup transient it is
+         * here for.
+         */
+        {
+            const uint32_t cap = 3u * (g_wa_rn ? g_wa_rn : (uint32_t)BLK);
+            const uint32_t depth = g_wa_sw - g_wa_sr;
+            if (depth > cap + cap) {
+                /* A stall: take it all out at once rather than play it late. */
+                g_wa_sr = g_wa_sw - cap;
+                g_stage_drops++;
+            } else if (depth > cap) {
+                /*
+                 * Over by a little, which is jitter rather than drift now that
+                 * the chain is clocked by the input.  Shedding a whole period of
+                 * it leaves a three millisecond hole; shedding one sample leaves
+                 * nothing anyone can hear, and the excess is gone within a few
+                 * periods anyway.
+                 */
+                g_wa_sr++;
+                g_stage_drops++;
+            }
+            if (g_wa_sw - g_wa_sr > g_stage_max) {
+                g_stage_max = g_wa_sw - g_wa_sr;
+            }
+        }
+    }
+}
+
+/* Everything the capture side has, into the same ring the winmm path used. */
+static void wa_drain(void)
+{
+    int guard = 64;
+    if (g_wa_cs == NULL) {
+        return;
+    }
+    /*
+     * GetBuffer directly, rather than asking GetNextPacketSize first.
+     *
+     * The packet-size call is a shared-mode idea: in exclusive mode it answers
+     * zero however much the device has, so a drain built on it reads nothing and
+     * the chain plays silence with the input meter showing starvation.  GetBuffer
+     * works in both modes and says AUDCLNT_S_BUFFER_EMPTY when there is nothing,
+     * which is the condition to stop on.
+     */
+    while (guard-- > 0) {
+        BYTE   *p = NULL;
+        UINT32  fr = 0;
+        DWORD   fg = 0;
+        HRESULT hr = IAudioCaptureClient_GetBuffer(g_wa_cs, &p, &fr, &fg, NULL,
+                                                   NULL);
+        if (hr != S_OK || fr == 0u) {
+            if (hr == S_OK) {
+                IAudioCaptureClient_ReleaseBuffer(g_wa_cs, 0);
+            }
+            break;
+        }
+        {
+            UINT32 i;
+            for (i = 0; i < fr; i++) {
+                float v = 0.0f;
+                if ((fg & AUDCLNT_BUFFERFLAGS_SILENT) == 0 && p != NULL) {
+                    v = g_wa_cfloat
+                            ? ((const float *)p)[i * (UINT32)g_wa_cch]
+                            : (float)((const int16_t *)p)[i * (UINT32)g_wa_cch] /
+                                  32768.0f;
+                }
+                const float a = v < 0.0f ? -v : v;
+                if (a > g_in_peak) {
+                    g_in_peak = a;
+                }
+                g_ring[g_ring_w % WI_RING] = v;
+                g_ring_w++;
+            }
+        }
+        g_wa_capframes += fr;
+        IAudioCaptureClient_ReleaseBuffer(g_wa_cs, fr);
+    }
+    /*
+     * Four periods, not two.  Two was tight enough that ordinary jitter pushed
+     * the backlog over it three times in six seconds, and every trim throws
+     * away the samples it is over by - which is a hole in the middle of a note.
+     * Four is twelve milliseconds here: still short enough to play through, and
+     * loose enough that the trim is a safety net rather than part of the sound.
+     */
+    /*
+     * The ring is left to the reader, which takes from it at a rate trimmed to
+     * hold it near its target - see wavein_next.  Nothing is rendered here any
+     * more: driving the chain from the input made production equal consumption
+     * on paper and left the two clocks to fight in the buffer, which came out as
+     * a hundred dropped samples a second.
+     *
+     * The trim stays as the far end of the net, for a stall the reader's half a
+     * per cent of authority cannot pull back.
+     */
+    ring_trim(WI_RING - (uint32_t)(2 * BLK));
+}
+
+/* Top the staging FIFO up to `need` frames, a render() block at a time. */
+static void wa_stage_fill(uint32_t need)
+{
+    static int16_t blk[2 * (uint32_t)BLK];
+    while (g_wa_sw - g_wa_sr < need) {
+        /*
+         * Exactly what is short, not a whole AG_IR_BLOCK.  See render_n: a full
+         * block does not fit in a three-millisecond period and the card goes
+         * hungry without anything here noticing.
+         */
+        const int m = (int)(need - (g_wa_sw - g_wa_sr));
+        const int nn = m > BLK ? BLK : m;
+        int       k;
+        render_n(blk, nn);
+        for (k = 0; k < nn; k++) {
+            const uint32_t w = (g_wa_sw % WA_STAGE) * 2u;
+            g_wa_stage[w] = blk[2 * k];
+            g_wa_stage[w + 1] = blk[2 * k + 1];
+            g_wa_sw++;
+        }
+    }
+}
+
+static void wa_close(void)
+{
+    if (!g_wa_on) {
+        return;
+    }
+    if (g_wa_cc != NULL) {
+        IAudioClient_Stop(g_wa_cc);
+    }
+    IAudioClient_Stop(g_wa_rc);
+    g_wa_on = 0;
+}
+
 static void status(void)
 {
     char line[128];
@@ -2101,6 +3607,10 @@ int main(int argc, char **argv)
 {
     const char *want = AG_DI_DEFAULT;
     const char *dump_path = NULL, *keys = NULL;
+    int         in_dev = -2;  /* -2 no input, -1 the default device */
+    int         out_dev = -1;
+    int         lat_ms = 0;   /* 0 means the built-in target */
+    int         use_wasapi = 0;
     double      dump_sec = 8.0;
     /* `--live N` plays for N seconds through the real audio path and then prints
      * the report and leaves.  It exists because the thing a listener complains
@@ -2123,6 +3633,37 @@ int main(int argc, char **argv)
             keys = argv[++i];
         } else if (strcmp(argv[i], "--live") == 0 && i + 1 < argc) {
             run_secs = atof(argv[++i]);
+        } else if (strcmp(argv[i], "--in") == 0 && i + 1 < argc) {
+            /*
+             * A guitar instead of the take.  "list" prints what Windows has and
+             * stops, because picking a capture device by guessing its number is
+             * how somebody ends up listening to a laptop microphone and blaming
+             * the amplifier model.
+             */
+            if (strcmp(argv[i + 1], "list") == 0) {
+                wa_list();
+                return 0;
+            }
+            in_dev = atoi(argv[++i]);
+            use_wasapi = 1;
+        } else if (strcmp(argv[i], "--out") == 0 && i + 1 < argc) {
+            out_dev = atoi(argv[++i]);
+            use_wasapi = 1;
+        } else if (strcmp(argv[i], "--api") == 0 && i + 1 < argc) {
+            use_wasapi = strcmp(argv[++i], "winmm") != 0;
+        } else if (strcmp(argv[i], "--ingain") == 0 && i + 1 < argc) {
+            if (strcmp(argv[i + 1], "auto") == 0) {
+                i++;
+                g_in_auto = 1;
+            } else {
+                g_in_gain_db = (float)atof(argv[++i]);
+                g_in_gain = (float)pow(10.0, (double)g_in_gain_db / 20.0);
+                g_in_auto = 0;
+            }
+        } else if (strcmp(argv[i], "--irtaps") == 0 && i + 1 < argc) {
+            g_irtaps = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--latency") == 0 && i + 1 < argc) {
+            lat_ms = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--model") == 0 && i + 1 < argc) {
             /*
              * An argument rather than a key, and that is a cost decision rather
@@ -2193,14 +3734,27 @@ int main(int argc, char **argv)
         printf("  no signal to play\n");
         return 1;
     }
+    /* Kept: it is what a live instrument's level is aimed at - see g_in_gain. */
+    g_take_peak = peak_of(g_in, g_frames);
     printf("  take: %s, %u frames at %u Hz, %.1f s, peak %.3f\n", path, g_frames,
-           g_rate, (double)g_frames / (double)g_rate, peak_of(g_in, g_frames));
+           g_rate, (double)g_frames / (double)g_rate, (double)g_take_peak);
 
     g_ckt = (ag_ckt_t *)malloc(sizeof(ag_ckt_t));
     if (g_ckt == NULL) {
         return 1;
     }
     ag_amp_model(&g_cfg, g_model, (float)g_rate);
+    /*
+     * A model that ships with the grid off carries a full `block_depth` anyway -
+     * the two fields are independent on purpose, so that switching blocking on
+     * in code gets the circuit and not a zero.  For a knob that is the wrong
+     * starting point: it would jump the whole way on its first twentieth.  So
+     * the knob's position is squared with the switch once, here, and after that
+     * both `-` `=` and `b` are simple.
+     */
+    if (!g_cfg.blocking) {
+        g_cfg.block_depth = 0.0f;
+    }
     printf("  model: %s, %s\n", ag_amp_model_name(g_model),
            ag_amp_model_fitted(g_model)
                ? "voicing fitted against a capture of the real amplifier"
@@ -2269,46 +3823,64 @@ int main(int argc, char **argv)
     g_bstage = g_n - 1;
 
     /*
-     * The reference, if it has been rendered.  Optional: everything works without
-     * it, there is just nothing to compare against.
+     * THE CAPTURE ITSELF, FOR THE LIVE REFERENCE
      *
-     * This model's own reference first, and the Marshall one only as a fallback.
-     * It used to be the Marshall render unconditionally, which meant that on the
-     * crunch and lead models the `y` key put a *different amplifier* in the chain
-     * and called it the reference - the one comparison in this program that has to
-     * be against the right thing.  `match` writes one per model, with the speaker
-     * on it when the capture had none.
+     * Cheap enough to be an option rather than a mode: 7.9x realtime on this
+     * machine against the chain's 2%, so both sides fit in a block with room to
+     * spare.  What it costs instead is the rate - see g_nam.
      */
     {
-        char        rbuf[1024], rel[200];
-        const char *rp = NULL;
-        uint32_t    rrate = 0;
+        const char *cp = ag_amp_model_capture(g_model);
+        char        cbuf[1024];
+        const char *cres = cp != NULL ? resolve(cbuf, sizeof(cbuf), cp) : NULL;
 
-        snprintf(rel, sizeof(rel), "build/listen/match_ref_%s_cab.wav",
-                 ag_amp_model_name(g_model));
-        rp = resolve(rbuf, sizeof(rbuf), rel);
-        if (rp == NULL) {
-            snprintf(rel, sizeof(rel), "build/listen/match_ref_%s.wav",
-                     ag_amp_model_name(g_model));
-            rp = resolve(rbuf, sizeof(rbuf), rel);
-        }
-        if (rp == NULL && g_model == AG_AMP_MODEL_JCM800) {
-            rp = resolve(rbuf, sizeof(rbuf), AG_REF_DEFAULT);
-        }
-        if (rp != NULL) {
-            g_ref = read_wav(rp, &g_ref_frames, &rrate);
-            if (g_ref != NULL && rrate != g_rate) {
-                free(g_ref);
-                g_ref = NULL;
-            }
-            if (g_ref != NULL) {
-                printf("  reference: %s, %.1f s - 'y' swaps the real amplifier"
-                       " in\n", rp, (double)g_ref_frames / (double)g_rate);
+        g_fit_drive = g_cfg.drive;
+        if (cres == NULL) {
+            printf("  no capture for this model, so 'Y' has only the render\n");
+        } else {
+            g_nam = nam_load(cres, 1, 0);
+            if (g_nam == NULL) {
+                printf("  %s: %s - 'Y' has only the render\n", cres, nam_err());
             } else {
-                printf("  reference: %s is %u Hz and this take is %u, so 'y' has"
-                       " nothing to play\n", rp, rrate, g_rate);
+                /*
+                 * A model trained at one rate stays at it and the signal is
+                 * carried to it and back - see nam_at_rate.  This used to refuse
+                 * the reference outright when the rates disagreed, which
+                 * switched it off exactly when an instrument was plugged in:
+                 * every capture in this tree is 48 kHz and the interface is
+                 * 44.1, so `y` did nothing on the one path where it mattered
+                 * most.
+                 */
+                if ((uint32_t)nam_sample_rate(g_nam) != g_rate) {
+                    g_rs_on = 1;
+                    printf("  capture: %s at %d Hz against a %u Hz take -"
+                           " carried both ways, cubic\n",
+                           cres, nam_sample_rate(g_nam), g_rate);
+                }
+                printf("  capture: %s, live - 'y' puts it in place of this"
+                       " chain, 'Y' makes it follow the drive\n", cres);
             }
         }
+    }
+
+    g_lat_ms = lat_ms;
+    /*
+     * The instrument path gets a shorter impulse unless one was asked for.
+     *
+     * 1024 taps is 23 ms here, which is the speaker and the first of its room.
+     * Measured against the card's rate: the whole 8820 taps fed it 74%, 4096 fed
+     * 93%, 2048 fed 99% and 1024 feeds all of it - and the last percent matters,
+     * because a loop that is one percent short lets the input run ahead and the
+     * backlog has to be shed, which is audible.  The
+     * alternative was the int16 convolution, which fits easily and buzzes on a
+     * quiet signal - and a guitar is a quiet signal between notes.
+     */
+    if (use_wasapi && g_irtaps == 0) {
+        g_irtaps = 1024;
+    }
+    /* The old capture path is winmm's; WASAPI opens its own further down. */
+    if (in_dev != -2 && !use_wasapi) {
+        (void)wavein_open(g_rate, in_dev, lat_ms > 0 ? 4 : 6);
     }
 
     if (cab_open(g_rate) != 0) {
@@ -2353,23 +3925,45 @@ int main(int argc, char **argv)
             frac = ((double)(clock() - t0) / (double)CLOCKS_PER_SEC);
             free(scratch);
             /*
-             * The reference, brought to the same rms as what was just rendered.
+             * The capture, brought to the same rms as what was just rendered.
              * Done here because this is the one place that has both: a second of
-             * this chain's output and a reference over the same second of the take.
+             * this chain's output and a second of the reference over the same
+             * material.
+             *
+             * A capture's level is whatever the person who made it played at,
+             * and our master is set to fill sixteen bits - measured on the three
+             * models the two sides were +2.2, +0.8 and -13.7 dB apart.  Fourteen
+             * decibels is not a tone comparison, it is a loudness comparison,
+             * and loudness wins every one of those.
              */
-            if (g_ref != NULL && g_ref_frames > 0) {
-                const uint32_t n = g_ref_frames < g_rate ? g_ref_frames : g_rate;
-                double         ref_sq = 0.0;
-                uint32_t       j;
-                for (j = 0; j < n; j++) {
-                    ref_sq += (double)g_ref[j] * (double)g_ref[j];
-                }
-                if (ref_sq > 1e-20 && chain_sq > 1e-20) {
-                    g_ref_gain = (float)sqrt((chain_sq / (double)(blocks * BLK)) /
-                                             (ref_sq / (double)n));
-                    printf("  reference: level matched %+.1f dB to the chain,"
-                           " so 'y' compares tone\n",
-                           20.0 * log10((double)g_ref_gain));
+            if (g_nam != NULL) {
+                const int save_on = g_ref_on;
+                double    nam_sq = 0.0;
+                int16_t  *sc2 = (int16_t *)malloc(sizeof(int16_t) * (size_t)BLK * 2);
+                if (sc2 != NULL) {
+                    g_ref_on = 1;
+                    g_pos = save_pos;
+                    for (b = 0; b < blocks; b++) {
+                        int j;
+                        render(sc2);
+                        for (j = 0; j < BLK; j++) {
+                            const double v = (double)sc2[2 * j] / 32768.0;
+                            nam_sq += v * v;
+                        }
+                    }
+                    free(sc2);
+                    g_ref_on = save_on;
+                    if (nam_sq > 1e-20 && chain_sq > 1e-20) {
+                        /*
+                         * nam_sq was measured with g_nam_gain already applied, so
+                         * the correction multiplies what is there rather than
+                         * replacing it.
+                         */
+                        g_nam_gain *= (float)sqrt(chain_sq / nam_sq);
+                        printf("  capture: level matched %+.1f dB to the chain,"
+                               " so 'y' compares tone\n",
+                               20.0 * log10((double)g_nam_gain));
+                    }
                 }
             }
             g_pos = save_pos;
@@ -2433,6 +4027,221 @@ int main(int argc, char **argv)
         return 0;
     }
 
+    /*
+     * THE LOW LATENCY PATH, WHEN THERE IS AN INSTRUMENT TO PLAY
+     *
+     * Taken whenever an input was asked for, because that is the only case where
+     * the latency is the point; a tool being used to turn knobs against a
+     * recording is better off on winmm, which shares the card with everything
+     * else on the machine.  --api winmm forces the old path back for comparison.
+     */
+    if (use_wasapi && wa_open(g_rate, in_dev, out_dev,
+                              lat_ms > 0 ? (double)lat_ms : 0.0) == 0) {
+        const clock_t   t0 = clock();
+        const ULONGLONG tw0 = GetTickCount64();
+        const uint32_t  st0 = g_starved;
+        int             kb = 0;
+        for (;;) {
+            /*
+             * Both events, not just the render one.
+             *
+             * An exclusive-mode capture client hands its buffer over when its
+             * own event fires and answers "empty" at any other moment, so a loop
+             * that only waits on the render side reads nothing at all - the
+             * chain plays silence and the starve counter says every sample.
+             */
+            const DWORD w = WaitForSingleObject(g_wa_rev, 200);
+            /*
+             * ONE EVENT TO WAIT ON, AND THE INPUT READ ON THE SAME BEAT
+             *
+             * Waiting on both events looked right and was not.
+             * WaitForMultipleObjects returns the *lowest* signalled index, so
+             * with both devices on the same period the two woke the loop in
+             * turn - and every wake-up that belonged to the capture side was a
+             * render period not served.  The card ended up fed 28 thousand
+             * frames a second instead of 44, which is a third of the audio
+             * simply missing.
+             *
+             * The two run at the same period, so a drain on each render wake
+             * collects exactly what one period delivered.  One clock, both
+             * directions.
+             */
+            /*
+             * Only when the capture side says it has something.
+             *
+             * An exclusive-mode capture GetBuffer does not return "empty" when
+             * the device has nothing ready - it waits for the next period.  
+             * Calling it unconditionally therefore cost a whole period on every
+             * pass, and the loop settled at exactly three quarters of the rate
+             * it needed on every model, every period size and every cabinet:
+             * too round a number for a shortage of processor, which is what it
+             * was mistaken for twice.
+             */
+            if (g_wa_cev != NULL &&
+                WaitForSingleObject(g_wa_cev, 0) == WAIT_OBJECT_0) {
+                wa_drain();
+            }
+            if (w == WAIT_OBJECT_0) {
+                UINT32        want = g_wa_rn, pad = 0;
+                BYTE         *p = NULL;
+                const clock_t tb = clock();
+                double        bms;
+                if (!g_wa_excl) {
+                    IAudioClient_GetCurrentPadding(g_wa_rc, &pad);
+                    want = g_wa_rn > pad ? g_wa_rn - pad : 0u;
+                }
+                if (want > 0u &&
+                    FAILED(IAudioRenderClient_GetBuffer(g_wa_rs, want, &p))) {
+                    g_wa_nobuf++;
+                    p = NULL;
+                }
+                if (want > 0u && p != NULL) {
+                    UINT32 i;
+                    int    c;
+                    /*
+                     * Whatever the input has made by now, and no more: the chain
+                     * is clocked by the output and the input is resampled to
+                     * match - see wavein_next.  If the staging buffer is short
+                     * the last sample is held rather than a zero written,
+                     * because a held sample is a moment of flatness and a zero
+                     * is a step.
+                     */
+                    wa_stage_fill(want);
+                    for (i = 0; i < want; i++) {
+                        const uint32_t r = (g_wa_sr % WA_STAGE) * 2u;
+                        if (g_wa_sr == g_wa_sw) {
+                            g_starved++;
+                            for (c = 0; c < g_wa_rch; c++) {
+                                const int16_t v =
+                                    g_wa_stage[((g_wa_sr - 1u) % WA_STAGE) * 2u +
+                                               (c ? 1 : 0)];
+                                if (g_wa_rfloat) {
+                                    ((float *)p)[i * (UINT32)g_wa_rch +
+                                                 (UINT32)c] =
+                                        (float)v / 32768.0f;
+                                } else {
+                                    ((int16_t *)p)[i * (UINT32)g_wa_rch +
+                                                   (UINT32)c] = v;
+                                }
+                            }
+                            continue;
+                        }
+                        for (c = 0; c < g_wa_rch; c++) {
+                            const int16_t v = g_wa_stage[r + (c ? 1 : 0)];
+                            if (g_wa_rfloat) {
+                                ((float *)p)[i * (UINT32)g_wa_rch + (UINT32)c] =
+                                    (float)v / 32768.0f;
+                            } else {
+                                ((int16_t *)p)[i * (UINT32)g_wa_rch +
+                                               (UINT32)c] = v;
+                            }
+                        }
+                        g_wa_sr++;
+                    }
+                    IAudioRenderClient_ReleaseBuffer(g_wa_rs, want, 0);
+                }
+                bms = 1000.0 * (double)(clock() - tb) /
+                      (double)CLOCKS_PER_SEC;
+                if (bms > g_worst_ms) {
+                    g_worst_ms = bms;
+                }
+                g_wa_periods++;
+            } else if (w == WAIT_TIMEOUT) {
+                /* The card stopped asking for audio.  A wake-up from the capture
+                 * event is not that, and counting it as one reported thousands
+                 * of dropouts on a path that had none. */
+                g_under++;
+            }
+            if (run_secs > 0.0 &&
+                (double)(clock() - t0) / (double)CLOCKS_PER_SEC > run_secs) {
+                break;
+            }
+            /*
+             * The keyboard, but not on every period.
+             *
+             * _kbhit goes through the console, and a console call costs enough
+             * that at three hundred periods a second it was the loop's largest
+             * expense: the card was served two hundred times a second instead of
+             * three hundred and thirty and went hungry by a third, with every
+             * period it did serve served on time and nothing reporting a fault.
+             * Twenty times a second is still faster than a hand.
+             */
+            if (++kb >= 16) {
+                kb = 0;
+                while (_kbhit()) {
+                    const int c = _getch();
+                    if (c == 0 || c == 224) {
+                        (void)_getch();
+                        continue;
+                    }
+                    if (key(c)) {
+                        wa_close();
+                        return 0;
+                    }
+                    status();
+                }
+            }
+        }
+        {
+            /*
+             * The one number that matters: what fraction of the audio the card
+             * asked for actually reached it.  Anything under a hundred is a
+             * dropout however tidy the rest of the report looks - which is how
+             * a quarter of the audio went missing for an afternoon while every
+             * other counter read zero.
+             */
+            const double secs = (double)(GetTickCount64() - tw0) / 1000.0;
+            const double fed =
+                secs > 0.0 ? 100.0 * (double)g_wa_periods * (double)g_wa_rn /
+                                 ((double)g_rate * secs)
+                           : 0.0;
+            printf("\n  the instrument path: %.0f%% of the audio the card asked"
+                   " for, %u periods of %.1f ms in %.1f s\n",
+                   fed, g_wa_periods, g_wa_ms, secs);
+            printf("  input %u frames, peak %.2f%s, %u starved, backlog at"
+                   " most %.1f ms (%.1f at the end), %u shed, staging at most"
+                   " %.1f ms (%u drops),"
+                   " worst render %.1f ms, %u waits timed out\n",
+                   g_wa_capframes, (double)g_in_peak,
+                   g_in_peak > 0.99f ? " - CLIPPING BEFORE US" : "",
+                   g_starved - st0,
+                   1000.0 * (double)g_ring_max / (double)g_rate,
+                   1000.0 * (double)(g_ring_w - g_ring_r) / (double)g_rate,
+                   g_ring_trims,
+                   1000.0 * (double)g_stage_max / (double)g_rate,
+                   g_stage_drops, g_worst_ms, g_under);
+            if (g_rs_calls > 0u) {
+                LARGE_INTEGER f;
+                QueryPerformanceFrequency(&f);
+                /*
+                 * The reference costs what it costs, and it is worth printing:
+                 * the model is a third of a period on average and takes three
+                 * of them now and then, which is why it is made ahead rather
+                 * than in the callback - see g_ref_fifo.
+                 */
+                printf("  reference: %u calls, %u samples, %.0f ms in the"
+                       " model, worst call %.2f ms against a %.1f ms period\n",
+                       g_rs_calls, g_rs_samples,
+                       1000.0 * (double)g_rs_ticks / (double)f.QuadPart,
+                       1000.0 * (double)g_rs_worst / (double)f.QuadPart,
+                       g_wa_ms);
+            }
+        }
+        wa_close();
+        return 0;
+    }
+
+    /*
+     * The instrument path was asked for and could not open.  Rather than play
+     * the take and look as though the input had been ignored, open the input on
+     * the old path and say what that costs.
+     */
+    if (use_wasapi && in_dev != -2) {
+        printf("  falling back on winmm for the instrument: the latency will be"
+               " tens of milliseconds rather than ten\n");
+        (void)wavein_open(g_rate, in_dev, lat_ms > 0 ? 4 : 6);
+    }
+
     if (wave_open(g_rate) != 0) {
         return 1;
     }
@@ -2485,6 +4294,9 @@ int main(int argc, char **argv)
          * card is running dry is how a keypress becomes audible as a
          * crackle rather than as the knob it was.
          */
+        /* Whatever the guitar has played since the last pass, before anything
+         * is rendered from it. */
+        wavein_poll();
         for (i = 0; i < g_nbuf; i++) {
             if ((g_hdr[i].dwFlags & WHDR_INQUEUE) == 0) {
                 const clock_t tb = clock();

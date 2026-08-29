@@ -118,7 +118,23 @@ typedef enum ag_tube_kind {
      * ag_amp_cfg_t before it ever looks at the kind - and it is here so that a
      * spec for such a stage does not have to claim to be a triode.
      */
-    AG_TUBE_LINEAR = 2
+    AG_TUBE_LINEAR = 2,
+    /*
+     * A cathode follower.  The same valve and the same solver, wired the other
+     * way round: the plate goes straight to B+, the cathode resistor is never
+     * bypassed because it *is* the output, and what the next stage sees is taken
+     * from the cathode instead of the plate.
+     *
+     * Two things about it matter to a chain rather than to a stage.  It does not
+     * invert - a common-cathode stage does - and its gain is a hair under one, so
+     * it is a buffer and not an amplifier.  And it clips in a way nothing else
+     * here does: the top is limited by grid current, which starts to flow as the
+     * grid catches up with its own cathode, and the bottom by the valve going
+     * into cutoff and leaving the cathode resistor to pull the node down on its
+     * own.  Those two limits are nothing like each other, which is why a follower
+     * is heard as a compression rather than as a fuzz.
+     */
+    AG_TUBE_CF = 3
 } ag_tube_kind_t;
 
 typedef struct ag_tube_spec {
@@ -132,6 +148,19 @@ typedef struct ag_tube_spec {
     float ccouple; /* input coupling capacitor                             */
     float cload;   /* output coupling capacitor                            */
     float rload;   /* input impedance of whatever this stage drives        */
+    /*
+     * What the grid leak returns to, in volts.  Zero - and so every stage
+     * written before this field existed - means ground, which is what a leak
+     * behind a coupling capacitor does.
+     *
+     * A cathode follower in a Marshall or a Soldano is not behind a coupling
+     * capacitor: its grid is tied straight to the previous plate, so it sits at
+     * that plate's quiescent voltage and its cathode follows a couple of volts
+     * under it.  That is the whole reason a follower has headroom - a grounded
+     * leak would self-bias it to about four volts, and four volts is less than
+     * the stage in front of it swings in the first millisecond.
+     */
+    float vgrid_ref;
     ag_triode_model_t valve;
     /* Zero for a valve; see ag_tube_kind_t. */
     int   kind;
@@ -237,6 +266,14 @@ typedef struct ag_tube {
      * enough" is a claim and a claim wants a number.
      */
     uint32_t clamped;
+    /*
+     * Of those, the ones off the *bottom* - where the valve is cut off and the
+     * curve is flat because it really is flat.  Kept apart from `clamped`
+     * because the two ends mean opposite things: the top is a stage saturating,
+     * which is what a driven valve does, and the bottom is a stage that has been
+     * switched off, which under blocking is a gate opening and closing.
+     */
+    uint32_t cut;
     uint32_t samples;
     float    seen_lo, seen_hi;
 
@@ -342,8 +379,10 @@ int ag_tube_set_adaa(ag_tube_t *tb, int on);
  * oversampled region, because the capacitor is charged by every sample that
  * passes through it.  Returns 0 if there is no grid table to switch on.
  */
+/* `depth` scales the charge the grid puts on the capacitor: 1 is the circuit,
+ * 0 is blocking off, and in between is neither - see ag_amp_cfg_t.block_depth. */
 int ag_tube_set_blocking(ag_tube_t *tb, const ag_tube_spec_t *sp, float fs,
-                         int on);
+                         int on, float depth);
 
 /* Forget the previous sample and clear the counters.  Not the curve. */
 void ag_tube_reset(ag_tube_t *tb);

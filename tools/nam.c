@@ -797,6 +797,9 @@ struct nam_model {
     int     max_frames;
     int     receptive;
     int     rate;
+    /* What the file says it is: amp, pedal, amp_cab, full_rig and so on.  Empty
+     * when the capture carries no metadata, which half of them do not. */
+    char    gear[32];
 };
 
 /*
@@ -880,6 +883,11 @@ void nam_process(nam_model_t *m, const float *in, float *out, int n)
 
 int nam_receptive_field(const nam_model_t *m) { return m->receptive; }
 int nam_sample_rate(const nam_model_t *m) { return m->rate; }
+
+const char *nam_gear_type(const nam_model_t *m)
+{
+    return m != 0 ? m->gear : "";
+}
 
 /* ------------------------------------------------------------------------ */
 /* loading                                                                   */
@@ -1143,6 +1151,7 @@ nam_model_t *nam_load(const char *path, int want_weights, int verbose)
     float       *weights = NULL;
     wstream_t    ws;
     int          model = -1, arch, layers, e, i;
+    char         gear[32];
     int          n_arrays = 0, params = 1, have = 0, rate = 0;
 
     g_err[0] = 0;
@@ -1181,6 +1190,27 @@ nam_model_t *nam_load(const char *path, int want_weights, int verbose)
         }
         rate = j_int(buf, j_get(buf, model, "sample_rate"));
         layers = j_get(buf, cfgo, "layers");
+    }
+    /*
+     * And what the capture says it is, from the metadata at the root - not from
+     * the submodel, which carries only its own date and loudness.  Copied rather
+     * than pointed at, because `buf` does not outlive this function.
+     */
+    gear[0] = 0;
+    {
+        const int md = j_get(buf, 0, "metadata");
+        const int gt = md >= 0 ? j_get(buf, md, "gear_type") : -1;
+        if (gt >= 0 && buf[gt] == '"') {
+            const int e2 = j_str_end(buf, gt);
+            int       len = e2 - gt - 2;
+            if (len > 0) {
+                if (len > (int)sizeof(gear) - 1) {
+                    len = (int)sizeof(gear) - 1;
+                }
+                memcpy(gear, buf + gt + 1, (size_t)len);
+                gear[len] = 0;
+            }
+        }
     }
     for (e = j_first(buf, layers); e >= 0; e = j_next(buf, e)) {
         if (n_arrays >= MAX_ARRAYS) {
@@ -1246,6 +1276,7 @@ nam_model_t *nam_load(const char *path, int want_weights, int verbose)
     m->n_arrays = n_arrays;
     m->max_frames = NAM_BLOCK;
     m->rate = rate;
+    memcpy(m->gear, gear, sizeof(m->gear));
     m->num_frames = -1;
     if (nm_alloc(&m->cond, cfg[0].cond_size, NAM_BLOCK) != 0 ||
         nm_alloc(&m->head[0], cfg[0].channels, NAM_BLOCK) != 0) {

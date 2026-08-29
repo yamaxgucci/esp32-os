@@ -81,6 +81,8 @@ void ag_amp_model(ag_amp_cfg_t *cfg, int model, float fs)
     cfg->os = 4;
     cfg->adaa = 1;
     cfg->blocking = 1;
+    /* Full, which is the circuit; see ag_amp_cfg_t.block_depth. */
+    cfg->block_depth = 1.0f;
 
     cfg->n_stages = 2; /* the JCM800 front end this is voiced for */
     /* Half, not one: one is the top of the range, not the middle of it. */
@@ -117,7 +119,6 @@ void ag_amp_model(ag_amp_cfg_t *cfg, int model, float fs)
     cfg->rcath1 = 0.0f;   /* the netlist's hot-rodded 820 R */
     cfg->rplate1 = 0.0f;  /* and its 220 k */
     cfg->tone_shelf = 0;  /* the fitted peaks, until the refit says otherwise */
-    cfg->no_ir_fit = 0;   /* iteration 4 fits an impulse, normally */
     cfg->out_top_hz = 0.0f; /* and has no tone control after its output stage */
     cfg->out_top_db = 0.0f;
     /*
@@ -140,7 +141,7 @@ void ag_amp_model(ag_amp_cfg_t *cfg, int model, float fs)
      * whatever the chain peaks at and `tube_render render` prints the value; it has
      * to be re-read after every refit, not once.
      */
-    cfg->master = 1.0f / 245.0f;
+    cfg->master = 1.0f / 135.0f;
 
     cfg->top_hz = 12000.0f; /* clamped to 0.45*fs, and the clamp is printed */
     cfg->mid_hz = 700.0f;
@@ -216,33 +217,33 @@ void ag_amp_model(ag_amp_cfg_t *cfg, int model, float fs)
          * that widens that is the tilt, and it wants gain at the *front*, which is
          * the one thing forbidden - so the tilt stays off and the narrow knee stays.
          */
-        /* From the walk: `iter`, `iter2`, then `polish` */
+        /* From the walk: `iter` then `iter2` */
         static const ag_amp_band_t pre[2][AG_AMP_VOICE_N] = {
             { /* stage 1 */
-                { 100.0f, -1.81f, 1.0f }, { 200.0f, -1.26f, 1.0f },
-                { 400.0f, -1.80f, 1.0f }, { 800.0f, -2.30f, 1.0f },
-                { 1600.0f, 2.39f, 1.0f }, { 3150.0f, -2.05f, 1.0f },
-                { 5000.0f, 0.89f, 1.0f }
+                { 100.0f, 1.50f, 1.0f }, { 200.0f, -5.75f, 1.0f },
+                { 400.0f, 2.00f, 1.0f }, { 0.0f, -3.75f, 1.0f },
+                { 800.0f, 1.50f, 1.0f }, { 1600.0f, 1.50f, 1.0f },
+                { 3150.0f, 1.50f, 1.0f }, { 5000.0f, 1.50f, 1.0f }
             },
             { /* stage 2 */
-                { 100.0f, -1.50f, 1.0f }, { 200.0f, -1.53f, 1.0f },
-                { 400.0f, 1.00f, 1.0f }, { 800.0f, 1.07f, 1.0f },
-                { 1600.0f, 0.25f, 1.0f }, { 3150.0f, 6.59f, 1.0f },
-                { 5000.0f, 7.25f, 1.0f }
+                { 100.0f, 2.25f, 1.0f }, { 200.0f, 1.50f, 1.0f },
+                { 400.0f, 3.75f, 1.0f }, { 0.0f, 0.00f, 1.0f },
+                { 800.0f, 2.75f, 1.0f }, { 1600.0f, 4.50f, 1.0f },
+                { 3150.0f, 3.00f, 1.0f }, { 5000.0f, 4.50f, 1.0f }
             }
         };
-        static const float vtrim[2] = { 2.94f, 9.44f };
+        static const float vtrim[2] = { 3.00f, 7.36f };
         /*
          * Iteration 3, fitted last.  Modes 1 and 2 measured the same 0.83 dB on the
          * first pass - one impulse alone does everything this bank does - so if the
          * firmware ever needs the cycles back, this is the block to drop.
          */
-        /* Iteration 3, then `polish`: the output bank, fitted last */
+        /* Iteration 3: the output bank, fitted last */
         static const ag_amp_band_t post[AG_AMP_VOICE_N] = {
-            { 100.0f, 4.24f, 1.0f }, { 200.0f, 1.57f, 1.0f },
-            { 400.0f, 4.56f, 1.0f }, { 800.0f, 2.15f, 1.0f },
-            { 1600.0f, 2.60f, 1.0f }, { 3150.0f, 3.92f, 1.0f },
-            { 5000.0f, 7.23f, 1.0f }
+            { 100.0f, -4.47f, 1.0f }, { 200.0f, 3.79f, 1.0f },
+            { 400.0f, -3.31f, 1.0f }, { 0.0f, 0.00f, 1.0f },
+            { 800.0f, -0.92f, 1.0f }, { 1600.0f, -1.57f, 1.0f },
+            { 3150.0f, 3.79f, 1.0f }, { 5000.0f, 5.40f, 1.0f }
         };
         int b, st;
         for (b = 0; b < AG_AMP_VOICE_N; b++) {
@@ -302,6 +303,69 @@ void ag_amp_model(ag_amp_cfg_t *cfg, int model, float fs)
     }
 
     if (model == AG_AMP_MODEL_JCM800) {
+        /*
+         * Twelve decibels of interstage gain the circuit cannot supply.
+         *
+         * A test, and it is written down as one.  Two valves and only the second
+         * of them clipping cannot reach this capture's compression honestly - at
+         * a ceiling of zero the gaps sit 15.4 dB under the amplifier's - and the
+         * only lever left inside the schematic is to hand V1b more than V1a's
+         * plate can swing.  Twelve is where the bias wander that is heard as a
+         * wrong note is still 0.89 V rms, five times under the 4.54 V of the
+         * answer Maxim called wrong.  See cfg.interstage_db.
+         */
+        cfg->interstage_db = 12.0f;
+        /*
+         * BLOCKING OFF ON THIS MODEL, AND IT IS A COMPROMISE RATHER THAN PHYSICS
+         *
+         * A real 2203's second valve does block, and switching it off here is
+         * not a claim that it does not.  It is two faults cancelling, and both
+         * halves are worth writing down because the day one of them is fixed
+         * this line has to come back.
+         *
+         * The fault it hides: with blocking on, the fundamental of every note
+         * carries a skirt ten to twenty hertz wide that the capture does not
+         * have.  Measured as the energy 10-20 Hz either side of the root against
+         * the root itself, over the four chords of the take:
+         *
+         *     the capture                        -23.2 dB
+         *     blocking off, any interstage level  -22.1 to -22.9
+         *     blocking on, interstage +0 dB       -20.6
+         *     blocking on, interstage +6 dB       -18.0
+         *     blocking on, interstage +12 dB      -15.3
+         *
+         * That skirt is a bias wandering with the playing - see AG_DUMP_VC - and
+         * it is what Maxim hears as a wrong note.  It was found by his own
+         * method: notch the played harmonics out of the capture and out of ours
+         * and listen to what is left.
+         *
+         * The fault it compensates for: `interstage_db` above.  Blocking only
+         * misbehaves because V1b's grid is handed twelve decibels more than
+         * V1a's plate can swing, and it is handed that because two valves with
+         * only one of them clipping cannot otherwise reach this amplifier's
+         * compression.  Put the interstage block back to unity and blocking is
+         * within 2.6 dB of the capture with it switched on.
+         *
+         * So: when the missing compression is found somewhere honest - the power
+         * stage is the standing candidate - both this line and the twelve
+         * decibels above it should go together.
+         *
+         * A QUARTER RATHER THAN NONE, AND THE SAME QUARTER ON ALL THREE
+         *
+         * Off is where this started, because at full depth blocking smeared the
+         * fundamental badly enough to be heard as a wrong note.  A quarter is not
+         * that: on the slo it is where the overdrive's character came nearest the
+         * capture, and it beats both ends on the even-to-odd balance - +5.2 dB
+         * against +10.7 with it off and +15.3 with it full.
+         *
+         * Every valve model in this file now carries the same figure, and every
+         * one of them had its banks fitted with it in place rather than added on
+         * top afterwards.  Three models that differ in what they model are three
+         * different experiments.  The ts9 has none of it for the one honest
+         * reason: a pedal has no grid to draw current.
+         */
+        cfg->blocking = 1;
+        cfg->block_depth = 0.25f;
         return;
     }
 
@@ -331,6 +395,55 @@ void ag_amp_model(ag_amp_cfg_t *cfg, int model, float fs)
      * same impulse sits on both sides of the comparison and cancels.
      */
     if (model == AG_AMP_MODEL_BOGNER) {
+        /*
+         * The input level this model's voicing is fitted at.  Its own line
+         * rather than the shared default above, because the level and the
+         * voicing belong together: a bank fitted at half drive is the wrong bank
+         * at full drive, and the two have to be able to move as a pair.
+         */
+        cfg->drive = 1.0f; /* the walked drive */
+        /*
+         * Twelve decibels the circuit cannot supply, the same allowance jcm800
+         * carries and for the same reason - see cfg.interstage_db.  Measured
+         * before it was given: every interstage block on this model sat at
+         * exactly 0.00 dB, pinned against the honest limit, which is the walk
+         * saying it wants more and being refused.  Raising the ceiling without
+         * walking again does nothing, because the trims underneath were fitted
+         * against the old one.
+         */
+        cfg->interstage_db = 12.0f;
+        /*
+         * Blocking off, the same compromise jcm800 carries - see the long note
+         * there, which applies here word for word.  What found it was the even
+         * harmonics.  Measured as H2's error minus H3's, over seven notes at
+         * three levels, against this model's own capture:
+         *
+         *                    blocking on   off
+         *     jcm800            +16.3 dB   +0.4
+         *     bogner            +17.2      +4.7
+         *     slo               +25.1     +23.2
+         *
+         * A capture and a model can be the same loudness in every third-octave
+         * band and still be different amplifiers, because the balance of even to
+         * odd is character rather than level - and grid current, which only ever
+         * flows one way, is an even-harmonic generator.  Switching it off takes
+         * the spread over the whole series from 12.3 dB to 7.6.
+         *
+         * The slo column is why this is a per-model line and not a global one:
+         * the same switch barely moves it, so something else makes its evens and
+         * that is still open.
+         *
+         * A QUARTER, NOT NONE
+         *
+         * Off was where the measurement pointed and a quarter is where the ear
+         * did: on the slo, a quarter of the blocking is what put the overdrive's
+         * character within reach of the capture, and it is better than either end
+         * by the balance too - +5.2 dB against +10.7 with it off and +15.3 with
+         * it full.  The same setting is used here, and the banks below were
+         * fitted with it in place rather than added on top afterwards.
+         */
+        cfg->blocking = 1;
+        cfg->block_depth = 0.25f;
         /*
          * Fitted, against a NAM capture of a **Bogner Ecstasy 101B** on the crunch
          * channel ("Bogner Ecstasy - Bright Crunchy Rock", modelled by
@@ -363,34 +476,34 @@ void ag_amp_model(ag_amp_cfg_t *cfg, int model, float fs)
          *                                   build/listen/di_gc2_22k.wav 40 0.5
          * and pass 0 iterations to score these numbers without moving them.
          */
-        /* From the walk: `iter`, `iter2`, then `polish` */
+        /* From the walk: `iter` then `iter2` */
         static const ag_amp_band_t pre[3][AG_AMP_VOICE_N] = {
             { /* stage 1 */
-                { 100.0f, -9.00f, 1.0f }, { 200.0f, 3.00f, 1.0f },
-                { 400.0f, -1.00f, 1.0f }, { 800.0f, -9.00f, 1.0f },
-                { 1600.0f, -3.50f, 1.0f }, { 3150.0f, -1.25f, 1.0f },
-                { 5000.0f, -9.00f, 1.0f }
+                { 100.0f, -5.16f, 1.0f }, { 200.0f, -2.66f, 1.0f },
+                { 400.0f, -0.66f, 1.0f }, { 0.0f, -2.91f, 1.0f },
+                { 800.0f, 0.34f, 1.0f }, { 1600.0f, -2.66f, 1.0f },
+                { 3150.0f, 1.34f, 1.0f }, { 5000.0f, -1.66f, 1.0f }
             },
             { /* stage 2 */
-                { 100.0f, -0.25f, 1.0f }, { 200.0f, 3.25f, 1.0f },
-                { 400.0f, -4.75f, 1.0f }, { 800.0f, 3.75f, 1.0f },
-                { 1600.0f, -4.25f, 1.0f }, { 3150.0f, 5.75f, 1.0f },
-                { 5000.0f, -3.75f, 1.0f }
+                { 100.0f, 4.75f, 1.0f }, { 200.0f, -2.75f, 1.0f },
+                { 400.0f, -7.75f, 1.0f }, { 0.0f, 0.00f, 1.0f },
+                { 800.0f, -8.75f, 1.0f }, { 1600.0f, -9.75f, 1.0f },
+                { 3150.0f, -10.25f, 1.0f }, { 5000.0f, -5.25f, 1.0f }
             },
             { /* stage 3 */
-                { 100.0f, 6.75f, 1.0f }, { 200.0f, 3.25f, 1.0f },
-                { 400.0f, 7.25f, 1.0f }, { 800.0f, 6.25f, 1.0f },
-                { 1600.0f, 0.25f, 1.0f }, { 3150.0f, 6.25f, 1.0f },
-                { 5000.0f, 1.25f, 1.0f }
+                { 100.0f, 3.00f, 1.0f }, { 200.0f, 0.00f, 1.0f },
+                { 400.0f, 3.25f, 1.0f }, { 0.0f, 0.00f, 1.0f },
+                { 800.0f, -0.75f, 1.0f }, { 1600.0f, -0.75f, 1.0f },
+                { 3150.0f, 9.25f, 1.0f }, { 5000.0f, 4.25f, 1.0f }
             }
         };
-        static const float vtrim[3] = { -21.42f, -3.42f, 14.58f };
-        /* Iteration 3, then `polish`: the output bank, fitted last */
+        static const float vtrim[3] = { -0.14f, 2.44f, 2.44f };
+        /* Iteration 3: the output bank, fitted last */
         static const ag_amp_band_t post[AG_AMP_VOICE_N] = {
-            { 100.0f, 10.87f, 1.0f }, { 200.0f, 0.62f, 1.0f },
-            { 400.0f, 4.20f, 1.0f }, { 800.0f, 0.69f, 1.0f },
-            { 1600.0f, 4.78f, 1.0f }, { 3150.0f, 1.81f, 1.0f },
-            { 5000.0f, 8.24f, 1.0f }
+            { 100.0f, 0.88f, 1.0f }, { 200.0f, 1.32f, 1.0f },
+            { 400.0f, -0.08f, 1.0f }, { 0.0f, 0.00f, 1.0f },
+            { 800.0f, 0.80f, 1.0f }, { 1600.0f, 0.89f, 1.0f },
+            { 3150.0f, 0.98f, 1.0f }, { 5000.0f, 1.50f, 1.0f }
         };
         int b, st;
         for (b = 0; b < AG_AMP_VOICE_N; b++) {
@@ -445,12 +558,46 @@ void ag_amp_model(ag_amp_cfg_t *cfg, int model, float fs)
          * a pick attack is sixteen decibels of peak, and the master is what takes
          * it back.
          */
-        cfg->master = 1.0f / 431.0f; /* from the walk */
+        cfg->master = 1.0f / 201.0f; /* from the walk */
         return;
     }
 
     /* AG_AMP_MODEL_SLO */
     {
+        /*
+         * The input level this model's voicing is fitted at.  Its own line
+         * rather than the shared default above, because the level and the
+         * voicing belong together: a bank fitted at half drive is the wrong bank
+         * at full drive, and the two have to be able to move as a pair.
+         */
+        cfg->drive = 1.0f; /* the walked drive */
+        /*
+         * No allowance here, and it was tried.  Every interstage block on this
+         * model sits pinned at exactly 0.00 dB, which is the walk asking for more
+         * and being refused - so twelve decibels were given and the model walked
+         * again, the same thing that helped jcm800 and the bogner.  It made this
+         * one worse: the gaps went from 5.21 dB to 7.45 at the deep gate.  Four
+         * valves apparently have enough places to put the work without borrowing
+         * any, and the answer is the one fitted at the honest limit.
+         */
+        /*
+         * A QUARTER OF THE BLOCKING, WHICH IS NOT A COMPONENT EITHER
+         *
+         * It was off here for a while, on the reasoning that switching it off
+         * fixed jcm800 and the bogner and did nothing measurable to this one -
+         * the even-to-odd balance went from +25.1 dB to +23.2 where jcm800 went
+         * from +16.3 to +0.4.  Then Maxim turned the live tool's grid knob and
+         * stopped at a quarter, which nothing in the objective had asked for and
+         * which is where the overdrive starts to have the capture's character.
+         *
+         * A quarter is not a capacitor and there is no schematic for it - see
+         * ag_amp_cfg_t.block_depth for what the fraction scales.  It is a knob
+         * set by ear, written down, and it stays until the thing it is standing
+         * in for is found.
+         *
+         */
+        cfg->blocking = 1;
+        cfg->block_depth = 0.25f;
         /*
          * Fitted, against a NAM capture of a **Peavey 5150** on the red channel
          * ("5150 RED GRINDR", modelled by cwolfbrandt, `gear_type` "amp" and so
@@ -540,34 +687,34 @@ void ag_amp_model(ag_amp_cfg_t *cfg, int model, float fs)
          * 22 dB at 6.3 kHz and the fitted impulse reproduces that within half a
          * decibel, so the excess is generated by the chain and survives the cut.
          */
-        /* From the walk: `iter`, `iter2`, then `polish` */
+        /* From the walk: `iter` then `iter2` */
         static const ag_amp_band_t pre[4][AG_AMP_VOICE_N] = {
             { /* stage 1 */
-                { 100.0f, 3.71f, 1.0f }, { 200.0f, 0.16f, 1.0f },
-                { 400.0f, 0.72f, 1.0f }, { 800.0f, 0.82f, 1.0f },
-                { 1600.0f, -3.62f, 1.0f }, { 3150.0f, -0.75f, 1.0f },
-                { 5000.0f, -1.38f, 1.0f }
+                { 100.0f, 2.06f, 1.0f }, { 200.0f, -2.44f, 1.0f },
+                { 400.0f, -0.94f, 1.0f }, { 0.0f, -3.19f, 1.0f },
+                { 800.0f, -0.94f, 1.0f }, { 1600.0f, 2.06f, 1.0f },
+                { 3150.0f, 2.06f, 1.0f }, { 5000.0f, 1.31f, 1.0f }
             },
             { /* stage 2 */
-                { 100.0f, 0.73f, 1.0f }, { 200.0f, 1.48f, 1.0f },
-                { 400.0f, 3.87f, 1.0f }, { 800.0f, 8.66f, 1.0f },
-                { 1600.0f, 9.56f, 1.0f }, { 3150.0f, 11.49f, 1.0f },
-                { 5000.0f, 0.36f, 1.0f }
+                { 100.0f, -2.25f, 1.0f }, { 200.0f, 1.50f, 1.0f },
+                { 400.0f, -2.25f, 1.0f }, { 0.0f, 0.00f, 1.0f },
+                { 800.0f, 0.75f, 1.0f }, { 1600.0f, 0.75f, 1.0f },
+                { 3150.0f, 1.75f, 1.0f }, { 5000.0f, -6.50f, 1.0f }
             },
             { /* stage 3 */
-                { 100.0f, -0.47f, 1.0f }, { 200.0f, -0.02f, 1.0f },
-                { 400.0f, -0.14f, 1.0f }, { 800.0f, 0.47f, 1.0f },
-                { 1600.0f, -0.03f, 1.0f }, { 3150.0f, 2.53f, 1.0f },
-                { 5000.0f, -6.93f, 1.0f }
+                { 100.0f, -3.00f, 1.0f }, { 200.0f, -1.00f, 1.0f },
+                { 400.0f, 2.00f, 1.0f }, { 0.0f, 0.00f, 1.0f },
+                { 800.0f, 1.00f, 1.0f }, { 1600.0f, 1.00f, 1.0f },
+                { 3150.0f, 1.00f, 1.0f }, { 5000.0f, 1.00f, 1.0f }
             },
             { /* stage 4 */
-                { 100.0f, -1.73f, 1.0f }, { 200.0f, -0.31f, 1.0f },
-                { 400.0f, 0.00f, 1.0f }, { 800.0f, -0.06f, 1.0f },
-                { 1600.0f, 7.08f, 1.0f }, { 3150.0f, -0.28f, 1.0f },
-                { 5000.0f, -3.70f, 1.0f }
+                { 100.0f, 2.53f, 1.0f }, { 200.0f, 0.03f, 1.0f },
+                { 400.0f, 2.03f, 1.0f }, { 0.0f, 3.28f, 1.0f },
+                { 800.0f, 2.03f, 1.0f }, { 1600.0f, 3.03f, 1.0f },
+                { 3150.0f, 2.03f, 1.0f }, { 5000.0f, -1.97f, 1.0f }
             }
         };
-        static const float vtrim[4] = { -14.67f, -11.01f, 3.53f, 12.28f };
+        static const float vtrim[4] = { 3.00f, 3.78f, 1.78f, -0.22f };
         /*
          * REFITTED WITH THE BASS CUT IN, AND THE SHAPE OF IT IS THE EVIDENCE
          *
@@ -605,12 +752,12 @@ void ag_amp_model(ag_amp_cfg_t *cfg, int model, float fs)
          * Reproduce with:
          *   AG_EVAL_DI=build/listen/e2_di_22050.wav          *   AG_MODEL=slo tube_render match assets/audio/guitar-di/5150red.nam          *                                  build/listen/tube_di_22050.wav 8
          */
-        /* Iteration 3, then `polish`: the output bank, fitted last */
+        /* Iteration 3: the output bank, fitted last */
         static const ag_amp_band_t post[AG_AMP_VOICE_N] = {
-            { 100.0f, -3.10f, 1.0f }, { 200.0f, 1.40f, 1.0f },
-            { 400.0f, -1.83f, 1.0f }, { 800.0f, -1.08f, 1.0f },
-            { 1600.0f, -1.16f, 1.0f }, { 3150.0f, 8.08f, 1.0f },
-            { 5000.0f, -2.21f, 1.0f }
+            { 100.0f, -2.85f, 1.0f }, { 200.0f, -0.74f, 1.0f },
+            { 400.0f, -3.41f, 1.0f }, { 0.0f, 0.00f, 1.0f },
+            { 800.0f, 0.76f, 1.0f }, { 1600.0f, 2.73f, 1.0f },
+            { 3150.0f, 4.13f, 1.0f }, { 5000.0f, 3.14f, 1.0f }
         };
         int b, st;
         for (b = 0; b < AG_AMP_VOICE_N; b++) {
@@ -682,9 +829,33 @@ void ag_amp_model(ag_amp_cfg_t *cfg, int model, float fs)
          * open work, and the knee table is the measurement to judge it by.
          */
         cfg->gain[3] = 1.0f;
-        /* TASTE, and less of it than either two-valve model has: four stages make
+        /*
+         * TASTE, and less of it than either two-valve model has: four stages make
          * their own upper midrange, so lifting what reaches the grids is asking a
-         * filter for what a valve is already supplying. */
+         * filter for what a valve is already supplying.
+         *
+         * A LIFT HERE IS NOT THE SAME REQUEST AS MORE HARMONICS HERE
+         *
+         * Maxim turned this in tube_live and found that +4 dB at 635 Hz brought
+         * the overdrive nearer the capture's character - and said, correctly,
+         * that the tone moves with it, which is not what he was after.  A filter
+         * in front of a valve does two things at once: the valve is given more at
+         * 635 Hz and makes more harmonic there, which is wanted, and 635 Hz comes
+         * out louder, which is not.
+         *
+         * They separate.  Lift in front of the valves and cut the same amount
+         * behind them, and the pair cancels in magnitude while the valve still
+         * saw the louder signal.  Measured on this model, +4 dB at 635 before
+         * against -4 dB at 630 after:
+         *
+         *     mid +2 dB at 800, nothing after   loud 3.29 dB   gaps 7.73
+         *     mid +4 dB at 635, nothing after        3.24           6.40
+         *     mid +4 dB at 635, -4 dB after          2.17           5.56
+         *
+         * So the lift stays where the fit put it until that pair is something the
+         * fit can ask for - a bank that may lift in front only if it pays for it
+         * behind is a different search, and it is the open work here.
+         */
         cfg->mid_hz = 800.0f;
         cfg->mid_db = 2.0f;
         cfg->mid_q = 0.9f;
@@ -764,7 +935,7 @@ void ag_amp_model(ag_amp_cfg_t *cfg, int model, float fs)
          * file clipped flat - `tube_render render` prints the master that would have
          * peaked at -1 dBFS, and that is where this number comes from every time.
          */
-        cfg->master = 1.0f / 117.0f; /* from the walk */
+        cfg->master = 1.0f / 135.0f; /* from the walk */
     }
     if (model == AG_AMP_MODEL_TS9) {
         /*
@@ -791,29 +962,19 @@ void ag_amp_model(ag_amp_cfg_t *cfg, int model, float fs)
          */
         cfg->n_stages = 2;
         /*
-         * ITERATION 4 DOES NOT FIT THIS ONE AN IMPULSE, AND THAT IS AN EAR'S
-         * ANSWER RATHER THAN A CLAIM ABOUT LOUDSPEAKERS
+         * A PEDAL IS NOT A SPECIAL CASE ABOUT LOUDSPEAKERS
          *
-         * Both were tried and both were listened to.  Matched *with* an impulse
-         * fitted against the capture the answer measures 0.75 loud, 0.90 in the
-         * note bodies, 0.85 of swing - better numbers - and Maxim's verdict was
-         * "опять мало перегруза".  Matched bare, with the whole post-clipper
-         * correction in the output bank, it measures 1.10 / 0.43 / 1.33 and he
-         * approved it.
+         * There was a flag here saying this device has none, and it was wrong in
+         * the way that matters.  Whether a *capture* has a speaker in it is
+         * stated by the capture - `Ibanez.nam` says gear_type "pedal" - and what
+         * our chain plays through is a separate question with the same answer for
+         * every model: a preset carries a cabinet.  If the nam had one, that one;
+         * if not, a standard one, put on the reference as well so that the two
+         * are heard through the same speaker.
          *
-         * The reason is visible in the two answers: fitting an impulse gives the
-         * fit a second place to put the same correction, and it spent it on
-         * treble the clipper was no longer making.  Iteration 4's own report
-         * showed the output bank asking for +17.97 dB at 5 kHz.
-         *
-         * The preset still carries a cabinet: the walk's last step folds this
-         * model's output bank into its impulse, which is exact - see the fold in
-         * rewalk.py, and cfg.no_ir_fit.
-         *
-         * The tone control at the output is a separate thing and stays a
-         * component value: cfg.out_top_hz below.
+         * Its tone control at the output is a real difference and stays:
+         * cfg.out_top_hz below.
          */
-        cfg->no_ir_fit = 1;
         /*
          * And the first of the two is linear.  Q1 is an emitter follower and at
          * guitar level its curve is a straight line to within a percent - the
@@ -884,26 +1045,26 @@ void ag_amp_model(ag_amp_cfg_t *cfg, int model, float fs)
         /* From the walk: `iter` then `iter2` */
         static const ag_amp_band_t pre[2][AG_AMP_VOICE_N] = {
             { /* stage 1 */
-                { 100.0f, 0.12f, 1.0f }, { 200.0f, -1.25f, 1.0f },
-                { 400.0f, -1.25f, 1.0f }, { 800.0f, -1.50f, 1.0f },
-                { 1600.0f, -0.50f, 1.0f }, { 3150.0f, -4.75f, 1.0f },
-                { 5000.0f, -0.94f, 1.0f }
+                { 100.0f, 1.00f, 1.0f }, { 200.0f, 3.00f, 1.0f },
+                { 400.0f, -2.50f, 1.0f }, { 0.0f, 0.00f, 1.0f },
+                { 800.0f, -4.50f, 1.0f }, { 1600.0f, -2.50f, 1.0f },
+                { 3150.0f, -2.50f, 1.0f }, { 5000.0f, 6.50f, 1.0f }
             },
             { /* stage 2 */
-                { 100.0f, 1.62f, 1.0f }, { 200.0f, -6.25f, 1.0f },
-                { 400.0f, -2.50f, 1.0f }, { 800.0f, -2.25f, 1.0f },
-                { 1600.0f, -3.25f, 1.0f }, { 3150.0f, -1.25f, 1.0f },
-                { 5000.0f, -0.31f, 1.0f }
+                { 100.0f, 2.00f, 1.0f }, { 200.0f, -7.00f, 1.0f },
+                { 400.0f, 1.75f, 1.0f }, { 0.0f, 0.00f, 1.0f },
+                { 800.0f, -2.25f, 1.0f }, { 1600.0f, -0.25f, 1.0f },
+                { 3150.0f, -2.25f, 1.0f }, { 5000.0f, -1.25f, 1.0f }
             }
         };
-        static const float vtrim[2] = { 2.84f, 3.96f };
+        static const float vtrim[2] = { 3.00f, 1.81f };
         /* Folded into the impulse: this filter is linear, so its impulse response is the same filter */
-        /* After `unwind`: pairs that undid each other, evened out */
+        /* Iteration 3: the output bank, fitted last */
         static const ag_amp_band_t post[AG_AMP_VOICE_N] = {
-            { 100.0f, 2.00f, 1.0f }, { 200.0f, 0.00f, 1.0f },
-            { 400.0f, 0.00f, 1.0f }, { 800.0f, -2.00f, 1.0f },
-            { 1600.0f, -1.00f, 1.0f }, { 3150.0f, 1.00f, 1.0f },
-            { 5000.0f, 2.00f, 1.0f }
+            { 100.0f, 0.54f, 1.0f }, { 200.0f, 1.06f, 1.0f },
+            { 400.0f, 0.33f, 1.0f }, { 0.0f, 0.00f, 1.0f },
+            { 800.0f, 0.44f, 1.0f }, { 1600.0f, -0.68f, 1.0f },
+            { 3150.0f, -0.55f, 1.0f }, { 5000.0f, -0.87f, 1.0f }
         };
         int b, st;
         for (b = 0; b < AG_AMP_VOICE_N; b++) {
@@ -938,6 +1099,30 @@ const char *ag_amp_model_name(int model)
         return "ts9";
     }
     return "?";
+}
+
+const char *ag_amp_model_capture(int model)
+{
+    /*
+     * One line per model, and each one is the file named in that model's own
+     * block - see the comment on the declaration for why this lives here rather
+     * than in whatever tool wanted it.
+     */
+    if (model == AG_AMP_MODEL_JCM800) {
+        return "assets/audio/guitar-di/Mars Gain 8.nam";
+    }
+    if (model == AG_AMP_MODEL_BOGNER) {
+        return "assets/audio/guitar-di/Bogner.nam";
+    }
+    if (model == AG_AMP_MODEL_SLO) {
+        /* A Soldano netlist against a Peavey capture, on purpose; the reason is
+         * in the slo block. */
+        return "assets/audio/guitar-di/5150red.nam";
+    }
+    if (model == AG_AMP_MODEL_TS9) {
+        return "assets/audio/guitar-di/Ibanez.nam";
+    }
+    return 0;
 }
 
 int ag_amp_model_by_name(const char *s)
@@ -1226,6 +1411,12 @@ static void design(ag_amp_t *a)
         a->latency_samples +=
             (float)AG_AMP_STAGES * 0.5f / (float)(a->cfg.os < 1 ? 1 : a->cfg.os);
     }
+    /*
+     * And last, because it needs the filters this function has just built: no
+     * gain between one plate and the next grid.  See ag_amp_interstage_db for
+     * why a fit invents one and why blocking is the only place it shows.
+     */
+    (void)ag_amp_no_interstage_gain(a);
 }
 
 void ag_amp_probe_pluck(float *buf, int n, float fs)
@@ -1404,8 +1595,22 @@ static int bake_all(ag_amp_t *a, ag_ckt_t *scratch, float *tab, int n,
         (void)ag_tube_set_adaa(&a->tube[i], a->cfg.adaa);
         /* The oversampled rate, because both valves live inside that region and
          * the capacitor is charged by every sample that passes through it. */
-        (void)ag_tube_set_blocking(&a->tube[i], &a->spec[i], fos,
-                                   a->cfg.blocking);
+        /*
+         * Per stage, so that the one responsible can be found.
+         *
+         * 0 is off everywhere and 1 is on everywhere, which is what every model
+         * asks for.  Anything larger is read as a bit per stage, and that exists
+         * for one measurement: the sidebands a few hertz from every harmonic are
+         * a slow wander of the operating point, and only a stage whose time
+         * constant is in the tens of milliseconds can make one.  V1a is 100 nF
+         * into 1 M, so 100 ms; V1b is 2.2 nF into 470 k, so one.
+         */
+        {
+            const int m = a->cfg.blocking;
+            const int on = m <= 1 ? m : ((m >> i) & 1);
+            (void)ag_tube_set_blocking(&a->tube[i], &a->spec[i], fos, on,
+                                       a->cfg.block_depth);
+        }
     }
     return 0;
 }
@@ -1684,7 +1889,8 @@ static int apply_cfg(ag_amp_t *a, const ag_amp_cfg_t *cfg, int keep)
          * sample, so changing the oversampling changes them. */
         (void)ag_tube_set_blocking(
             &a->tube[i], &a->spec[i],
-            a->cfg.fs * (float)(a->cfg.os < 1 ? 1 : a->cfg.os), a->cfg.blocking);
+            a->cfg.fs * (float)(a->cfg.os < 1 ? 1 : a->cfg.os), a->cfg.blocking,
+            a->cfg.block_depth);
         if (keep) {
             a->tube[i].vc = vc;
             a->tube[i].vc_peak = vcp;
@@ -1805,12 +2011,14 @@ static float run_stages(ag_amp_t *a, float v)
     if (a->tube[0].t != 0) {
         v = ag_tube_tick(&a->tube[0], v);
     }
+    a->tap[0] = v;
     for (i = 1; i < a->n; i++) {
         v = ag_biq_chain_tick(&a->pre[i], v) * a->gain[i];
         v = ag_biq_chain_tick(&a->voice[i], v) * a->vtrim[i];
         if (a->tube[i].t != 0) {
             v = ag_tube_tick(&a->tube[i], v);
         }
+        a->tap[i] = v;
     }
     return v;
 }
@@ -1873,6 +2081,60 @@ float ag_amp_tick(ag_amp_t *a, float x)
     }
     a->samples++;
     return y;
+}
+
+/* The most this chain has at any frequency a valve is handed. */
+static float chain_top_db(const ag_biq_chain_t *c, float rate)
+{
+    float best = -1.0e30f;
+    int   k;
+    for (k = 0; k <= 240; k++) {
+        /* 20 Hz to 10 kHz, logarithmically - the band a valve is handed. */
+        const float f = 20.0f * ag_powf(500.0f, (float)k / 240.0f);
+        const float d = ag_biq_chain_mag_db(c, f, rate);
+        if (d > best) {
+            best = d;
+        }
+    }
+    return best;
+}
+
+float ag_amp_interstage_gain(const ag_amp_t *a, int i)
+{
+    float rate;
+    if (a == 0 || i < 1 || i >= a->n) {
+        return 1.0f;
+    }
+    rate = a->cfg.fs * (float)(a->cfg.os > 0 ? a->cfg.os : 1);
+    return ag_powf(10.0f, (chain_top_db(&a->pre[i], rate) +
+                           chain_top_db(&a->voice[i], rate)) *
+                              (1.0f / 20.0f)) *
+           a->gain[i] * a->vtrim[i];
+}
+
+int ag_amp_no_interstage_gain(ag_amp_t *a)
+{
+    int n = 0, i;
+    if (a == 0) {
+        return 0;
+    }
+    {
+        /* Unity, unless the model asks for more - see cfg.interstage_db. */
+        const float ceil = a->cfg.interstage_db > 0.0f
+                               ? ag_powf(10.0f, a->cfg.interstage_db / 20.0f)
+                               : 1.0f;
+        for (i = 1; i < a->n; i++) {
+            const float top = ag_amp_interstage_gain(a, i);
+            /* A thousandth over, not exactly over: design() may run again
+             * without cfg being re-read, and an exact test would walk the trim
+             * down a rounding error at a time. */
+            if (top > ceil * 1.001f) {
+                a->vtrim[i] *= ceil / top;
+                n++;
+            }
+        }
+    }
+    return n;
 }
 
 uint32_t ag_amp_clamped(const ag_amp_t *a)
@@ -2096,7 +2358,8 @@ int ag_amp_preset_load(ag_amp_t *a, const void *buf, uint32_t n, float *tab,
         (void)ag_tube_set_adaa(&a->tube[i], a->cfg.adaa);
         (void)ag_tube_set_blocking(
             &a->tube[i], &a->spec[i],
-            a->cfg.fs * (float)(a->cfg.os < 1 ? 1 : a->cfg.os), a->cfg.blocking);
+            a->cfg.fs * (float)(a->cfg.os < 1 ? 1 : a->cfg.os), a->cfg.blocking,
+            a->cfg.block_depth);
     }
     ag_os8_init(&a->os);
     design(a);
