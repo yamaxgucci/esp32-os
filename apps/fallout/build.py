@@ -48,8 +48,14 @@ GXX = "xtensa-esp32s3-elf-g++"
 
 # -fpermissive: the engine is C compiled as C++ in places, and 1997 was
 # relaxed about it.  -w: it is not our code and the noise buries ours.
+#
+# -D_DEBUG is not about assertions.  The engine's own progress reporting -
+# debug_printf, which is how it says ">gsound_init" and "Failed on iso_init" -
+# is compiled out without it, and then a port that stops halfway stops
+# silently.  It is the difference between knowing where the engine got to and
+# guessing.  Turn it off when there is a reason to.
 CFLAGS = ("-Os -ffunction-sections -fdata-sections -fno-builtin -mlongcalls "
-          "-fno-exceptions -fno-rtti -std=c++17 -fpermissive -w")
+          "-fno-exceptions -fno-rtti -std=c++17 -fpermissive -w -D_DEBUG")
 
 # Files that only exist for a platform this is not.
 SKIP = (

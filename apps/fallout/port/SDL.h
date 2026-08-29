@@ -83,6 +83,7 @@ typedef struct SDL_Palette {
  * uses that macro.
  */
 #define SDL_PIXELFORMAT_INDEX8 0x13000801u
+#define SDL_PIXELFORMAT_RGB565 0x15151002u
 #define SDL_PIXELFORMAT_RGB888 0x16161804u
 #define SDL_BITSPERPIXEL(fmt) (((fmt) >> 8) & 0xFF)
 #define SDL_BYTESPERPIXEL(fmt) ((fmt) & 0xFF)
@@ -259,6 +260,8 @@ typedef enum SDL_Keymod {
     KMOD_RCTRL = 0x0080,
     KMOD_LALT = 0x0100,
     KMOD_RALT = 0x0200,
+    KMOD_LGUI = 0x0400,
+    KMOD_RGUI = 0x0800,
     KMOD_NUM = 0x1000,
     KMOD_CAPS = 0x2000,
     KMOD_SCROLL = 0x8000,

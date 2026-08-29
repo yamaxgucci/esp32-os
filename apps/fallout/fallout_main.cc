@@ -26,8 +26,60 @@ AG_APP("FALLOUT", "0.1", "argon", 0);
  * no header, and the signature is fixed by the language. */
 int main(int argc, char **argv);
 
+/* In port/sdl_shim.cc.  Not SDL: an automated run has no eyes. */
+extern "C" void sdl_shim_screenshot(const char *path, int after_frames);
+
+static bool same(const char *a, const char *b)
+{
+    while (*a != '\0' && *a == *b) {
+        ++a;
+        ++b;
+    }
+    return *a == *b;
+}
+
+static int to_int(const char *s)
+{
+    int v = 0;
+    while (*s >= '0' && *s <= '9') {
+        v = v * 10 + (*s - '0');
+        ++s;
+    }
+    return v;
+}
+
+/*
+ * Two options of our own, taken out of argv before the engine sees it.
+ *
+ * The engine parses argv itself and would object to anything it does not know,
+ * so they are removed rather than ignored.  Both exist for the same reason:
+ * there is no board yet, the test harness reads the text screen, and a game
+ * that has taken the display is not using the text screen.
+ *
+ *   -shot PATH     write the frame out as a PPM
+ *   -frames N      after this many presents (default 1)
+ */
 extern "C" int ag_cxx_main(int argc, char **argv)
 {
     ag_printf("FALLOUT - fallout1-ce on ArgonOS\n");
-    return main(argc, argv);
+
+    const char *shot = NULL;
+    int frames = 1;
+    int out = 0;
+
+    for (int i = 0; i < argc; ++i) {
+        if (same(argv[i], "-shot") && i + 1 < argc) {
+            shot = argv[++i];
+        } else if (same(argv[i], "-frames") && i + 1 < argc) {
+            frames = to_int(argv[++i]);
+        } else {
+            argv[out++] = argv[i];
+        }
+    }
+    argv[out] = NULL;
+
+    if (shot != NULL) {
+        sdl_shim_screenshot(shot, frames > 0 ? frames : 1);
+    }
+    return main(out, argv);
 }

@@ -21,6 +21,10 @@
 #include <argon/argon.h>
 #include <stdio.h>
 
+/* Declared where the port can see them; not part of SDL. */
+extern "C" bool sdl_shim_display(ag_gfxinfo_t *out);
+extern "C" void sdl_shim_screenshot(const char *path, int after_frames);
+
 extern "C" {
 
 /* ---- not written yet ----------------------------------------------------- */
@@ -83,6 +87,111 @@ struct SurfaceBlock {
     SDL_Color colors[256];
 };
 
+/* Defined with the timers at the end of the file; called from RenderPresent,
+ * which is the only point the game passes through every frame. */
+static void timers_service(void);
+
+/* The acquired display, and whether a surface has been given its memory. */
+static ag_gfxinfo_t s_gfx;
+static bool s_have_gfx;
+static bool s_fb_lent;
+
+/* What the last SDL_UpdateTexture was handed, for the panels that have no
+ * framebuffer of their own to have been drawn into. */
+static const void *s_frame_px;
+static int s_frame_pitch;
+
+/*
+ * Not SDL.  The display is acquired once and acquiring twice is -EBUSY, so
+ * anything else in the image that wants to know what it got has to ask here.
+ * SDLTEST is the caller; the engine never needs it.
+ */
+bool sdl_shim_display(ag_gfxinfo_t *out)
+{
+    if (!s_have_gfx || out == NULL) {
+        return false;
+    }
+    *out = s_gfx;
+    return true;
+}
+
+/*
+ * Not SDL either: a way to see what was drawn.
+ *
+ * An automated run has no eyes - the test harness reads the text screen, and
+ * the text screen is exactly what a game that has taken the display is not
+ * using.  So the frame can be written out as a PPM and looked at afterwards.
+ * This is how the port is checked at all until there is a board with a panel
+ * on it, and it stays useful after that: a screenshot of a wrong frame can be
+ * diffed, and a photograph cannot.
+ */
+static char s_shot_path[128];
+static int s_shot_after;
+static int s_present_count;
+
+void sdl_shim_screenshot(const char *path, int after_frames)
+{
+    if (path == NULL || after_frames <= 0) {
+        s_shot_after = 0;
+        return;
+    }
+    size_t i = 0;
+    while (path[i] != '\0' && i + 1 < sizeof(s_shot_path)) {
+        s_shot_path[i] = path[i];
+        ++i;
+    }
+    s_shot_path[i] = '\0';
+    s_shot_after = after_frames;
+    s_present_count = 0;
+}
+
+static void write_ppm(const char *path)
+{
+    if (!s_have_gfx || s_gfx.fb == NULL) {
+        return;
+    }
+
+    ag_handle_t f = ag_open(path, AG_O_WRONLY | AG_O_CREATE | AG_O_TRUNC);
+    if (f < 0) {
+        ag_printf("screenshot: cannot write %s\n", path);
+        return;
+    }
+
+    char header[64];
+    const int n = snprintf(header, sizeof(header), "P6\n%u %u\n255\n",
+                           (unsigned)s_gfx.width, (unsigned)s_gfx.height);
+    ag_write(f, header, (size_t)n);
+
+    /* A row at a time; the whole picture in 24-bit would be another megabyte
+     * of arena at the moment the game is using all of it. */
+    unsigned char *row = (unsigned char *)ag_malloc((size_t)s_gfx.width * 3u);
+    if (row == NULL) {
+        ag_close(f);
+        return;
+    }
+    for (unsigned y = 0; y < s_gfx.height; ++y) {
+        const Uint16 *src =
+            (const Uint16 *)((const unsigned char *)s_gfx.fb +
+                             (size_t)y * s_gfx.stride);
+        for (unsigned x = 0; x < s_gfx.width; ++x) {
+            const Uint16 p = src[x];
+            const unsigned r5 = (p >> 11) & 0x1Fu;
+            const unsigned g6 = (p >> 5) & 0x3Fu;
+            const unsigned b5 = p & 0x1Fu;
+            /* Replicate the high bits downwards, so full white comes back as
+             * 255 rather than 248. */
+            row[x * 3 + 0] = (unsigned char)((r5 << 3) | (r5 >> 2));
+            row[x * 3 + 1] = (unsigned char)((g6 << 2) | (g6 >> 4));
+            row[x * 3 + 2] = (unsigned char)((b5 << 3) | (b5 >> 2));
+        }
+        ag_write(f, row, (size_t)s_gfx.width * 3u);
+    }
+    ag_free(row);
+    ag_close(f);
+    ag_printf("screenshot: %s (%ux%u) after %d frame(s)\n", path,
+              (unsigned)s_gfx.width, (unsigned)s_gfx.height, s_present_count);
+}
+
 static SDL_Surface *make_surface(int w, int h, int depth, Uint32 format)
 {
     if (w <= 0 || h <= 0) {
@@ -90,7 +199,7 @@ static SDL_Surface *make_surface(int w, int h, int depth, Uint32 format)
     }
 
     const int bytes = depth / 8;
-    const int pitch = (w * bytes + 3) & ~3;
+    int pitch = (w * bytes + 3) & ~3;
 
     SurfaceBlock *block = (SurfaceBlock *)ag_malloc(sizeof(SurfaceBlock));
     if (block == NULL) {
@@ -98,10 +207,34 @@ static SDL_Surface *make_surface(int w, int h, int depth, Uint32 format)
     }
     memset(block, 0, sizeof(*block));
 
-    void *pixels = ag_malloc((size_t)pitch * (size_t)h);
+    /*
+     * The one surface that does not get memory of its own: the 16-bit one the
+     * engine presents, when it is exactly the shape of the panel.  Then it is
+     * the panel, and a frame costs a flush rather than a flush and a 614 KB
+     * copy through PSRAM.
+     *
+     * This is only reached because the engine asks the texture what format it
+     * is and builds its surface to match - see SDL_QueryTexture below, which
+     * answers RGB565 whatever it was asked for.  Without that question there
+     * would be a 32-bit surface here and a conversion every frame.
+     */
+    void *pixels = NULL;
+    int owns = 1;
+    if (depth == 16 && s_have_gfx && !s_fb_lent && s_gfx.fb != NULL &&
+        (int)s_gfx.width == w && (int)s_gfx.height == h &&
+        s_gfx.fmt == AG_PIX_RGB565) {
+        pixels = s_gfx.fb;
+        pitch = (int)s_gfx.stride;
+        owns = 0;
+        s_fb_lent = true;
+    }
+
     if (pixels == NULL) {
-        ag_free(block);
-        return NULL;
+        pixels = ag_malloc((size_t)pitch * (size_t)h);
+        if (pixels == NULL) {
+            ag_free(block);
+            return NULL;
+        }
     }
     memset(pixels, 0, (size_t)pitch * (size_t)h);
 
@@ -118,12 +251,18 @@ static SDL_Surface *make_surface(int w, int h, int depth, Uint32 format)
         block->format.Bmask = 0x000000FFu;
     }
 
+    if (depth == 16) {
+        block->format.Rmask = 0xF800u;
+        block->format.Gmask = 0x07E0u;
+        block->format.Bmask = 0x001Fu;
+    }
+
     block->surface.format = &block->format;
     block->surface.w = w;
     block->surface.h = h;
     block->surface.pitch = pitch;
     block->surface.pixels = pixels;
-    block->surface.owns_pixels = 1;
+    block->surface.owns_pixels = owns;
     return &block->surface;
 }
 
@@ -205,9 +344,16 @@ int SDL_SetPaletteColors(SDL_Palette *palette, const SDL_Color *colors,
 
 /*
  * The one blit the engine performs: the 8-bit game surface through its palette
- * into the 32-bit surface that gets presented.  SDL would pick a converter out
- * of a table; there is one case here, and anything else says so rather than
- * producing a picture that is subtly wrong.
+ * into the 16-bit surface that gets presented - which, when it is the shape of
+ * the panel, is the panel.  SDL would pick a converter out of a table; there
+ * is one case here, and anything else says so rather than producing a picture
+ * that is subtly wrong.
+ *
+ * The palette is turned into a table of RGB565 once per blit rather than per
+ * pixel: 256 conversions instead of 307200.  Rebuilding it every time rather
+ * than caching it is deliberate - the game fades the palette to black for
+ * every transition, so a cache would be invalidated on most frames anyway, and
+ * a stale one shows the wrong colours rather than failing.
  */
 int SDL_UpperBlit(SDL_Surface *src, const SDL_Rect *srcrect, SDL_Surface *dst,
                   SDL_Rect *dstrect)
@@ -216,13 +362,20 @@ int SDL_UpperBlit(SDL_Surface *src, const SDL_Rect *srcrect, SDL_Surface *dst,
         dst->format == NULL) {
         return -1;
     }
-    if (src->format->BitsPerPixel != 8 || dst->format->BitsPerPixel != 32) {
-        ag_panic("SDL blit: only 8-bit paletted to 32-bit is implemented");
+    if (src->format->BitsPerPixel != 8 || dst->format->BitsPerPixel != 16) {
+        ag_panic("SDL blit: only 8-bit paletted to RGB565 is implemented");
     }
 
     const SDL_Palette *pal = src->format->palette;
     if (pal == NULL) {
         return -1;
+    }
+
+    Uint16 lut[256];
+    for (int i = 0; i < 256 && i < pal->ncolors; ++i) {
+        const SDL_Color c = pal->colors[i];
+        lut[i] = (Uint16)(((c.r & 0xF8u) << 8) | ((c.g & 0xFCu) << 3) |
+                          (c.b >> 3));
     }
 
     int sx = srcrect ? srcrect->x : 0;
@@ -252,12 +405,12 @@ int SDL_UpperBlit(SDL_Surface *src, const SDL_Rect *srcrect, SDL_Surface *dst,
     }
 
     for (int y = 0; y < h; ++y) {
-        const Uint8 *s = (const Uint8 *)src->pixels + (size_t)(sy + y) * src->pitch + sx;
-        Uint32 *d = (Uint32 *)((Uint8 *)dst->pixels +
+        const Uint8 *s =
+            (const Uint8 *)src->pixels + (size_t)(sy + y) * src->pitch + sx;
+        Uint16 *d = (Uint16 *)((Uint8 *)dst->pixels +
                                (size_t)(dy + y) * dst->pitch) + dx;
         for (int x = 0; x < w; ++x) {
-            const SDL_Color c = pal->colors[s[x]];
-            d[x] = ((Uint32)c.r << 16) | ((Uint32)c.g << 8) | (Uint32)c.b;
+            d[x] = lut[s[x]];
         }
     }
     return 0;
@@ -392,7 +545,29 @@ int SDL_ShowSimpleMessageBox(Uint32 flags, const char *title,
     return 0;
 }
 
-/* ---- video: not written yet ---------------------------------------------- */
+/* ---- video --------------------------------------------------------------- */
+
+/*
+ * There is no window system, so there is no window: creating one takes the
+ * display away from the text console and that is all.  The pointer handed back
+ * is an address inside this file, because the engine only ever stores it and
+ * passes it back.
+ *
+ * The renderer and the texture are the same kind of nothing.  What makes the
+ * picture appear is the arrangement around them: the engine asks the texture
+ * its format, is told RGB565, builds a surface of that format, and that
+ * surface turns out to be the framebuffer itself.  By the time RenderPresent
+ * is called the pixels are already where the panel will read them, and all
+ * that is left is to say which part changed.
+ */
+static char s_window_token;
+static char s_renderer_token;
+
+struct SDL_Texture {
+    int w, h;
+};
+
+static SDL_Texture s_texture;
 
 SDL_Window *SDL_CreateWindow(const char *title, int x, int y, int w, int h,
                              Uint32 flags)
@@ -400,14 +575,43 @@ SDL_Window *SDL_CreateWindow(const char *title, int x, int y, int w, int h,
     (void)title;
     (void)x;
     (void)y;
-    (void)w;
-    (void)h;
     (void)flags;
-    TODO(SDL_CreateWindow);
-    return NULL;
+
+    if (!s_have_gfx) {
+        if (ag_gfx_acquire(&s_gfx) != AG_OK) {
+            ag_print("SDL: cannot take the display\n");
+            return NULL;
+        }
+        s_have_gfx = true;
+        ag_gfx_clear(0);
+        ag_gfx_flush(0, 0, s_gfx.width, s_gfx.height);
+        ag_printf("SDL: display %ux%u %s, %u bytes per row\n",
+                  (unsigned)s_gfx.width, (unsigned)s_gfx.height,
+                  s_gfx.fb != NULL ? "with a framebuffer" : "by present()",
+                  (unsigned)s_gfx.stride);
+    }
+
+    if ((int)s_gfx.width != w || (int)s_gfx.height != h) {
+        /* Not fatal: the presenting surface then gets memory of its own and
+         * RenderPresent copies the overlap.  Worth saying out loud, because
+         * the interface is bitmaps laid out for 640x480 and anything else
+         * loses part of it. */
+        ag_printf("SDL: game is %dx%d, panel is %ux%u; set [display] "
+                  "width/height in C:\\SYSTEM.CFG to match\n",
+                  w, h, (unsigned)s_gfx.width, (unsigned)s_gfx.height);
+    }
+    return (SDL_Window *)&s_window_token;
 }
 
-void SDL_DestroyWindow(SDL_Window *w) { (void)w; }
+void SDL_DestroyWindow(SDL_Window *w)
+{
+    (void)w;
+    if (s_have_gfx) {
+        ag_gfx_release();
+        s_have_gfx = false;
+        s_fb_lent = false;
+    }
+}
 
 void SDL_SetWindowTitle(SDL_Window *w, const char *title)
 {
@@ -420,8 +624,7 @@ SDL_Renderer *SDL_CreateRenderer(SDL_Window *w, int index, Uint32 flags)
     (void)w;
     (void)index;
     (void)flags;
-    TODO(SDL_CreateRenderer);
-    return NULL;
+    return (SDL_Renderer *)&s_renderer_token;
 }
 
 void SDL_DestroyRenderer(SDL_Renderer *r) { (void)r; }
@@ -434,6 +637,8 @@ int SDL_RenderSetLogicalSize(SDL_Renderer *r, int w, int h)
     return 0;
 }
 
+/* The framebuffer is fully painted every frame by the engine; clearing it here
+ * would be one wasted pass over 600 KB. */
 int SDL_RenderClear(SDL_Renderer *r)
 {
     (void)r;
@@ -450,10 +655,53 @@ int SDL_RenderCopy(SDL_Renderer *r, SDL_Texture *t, const SDL_Rect *s,
     return 0;
 }
 
+/*
+ * Three ways a frame reaches the panel, and which one applies is decided by
+ * what the display gave us rather than by a build option.
+ *
+ *   the surface is the framebuffer  - a flush, and nothing else;
+ *   there is a framebuffer, elsewhere - SDL_UpdateTexture copied into it, and
+ *                                       this flushes;
+ *   there is no framebuffer at all    - a panel that is scanned out by its own
+ *                                       driver, so hand it the rectangle.
+ *
+ * The third is the case a real panel takes; QEMU's soft display is the first.
+ */
 void SDL_RenderPresent(SDL_Renderer *r)
 {
     (void)r;
-    TODO(SDL_RenderPresent);
+    if (!s_have_gfx) {
+        return;
+    }
+
+    if (s_gfx.fb != NULL) {
+        ag_gfx_flush(0, 0, s_gfx.width, s_gfx.height);
+    } else if (s_frame_px != NULL && AG_HAS(g_ag_api->gfx, present)) {
+        const ag_blit_t b = {
+            .px = s_frame_px,
+            .stride = (uint32_t)s_frame_pitch,
+            .surf_w = s_gfx.width,
+            .surf_h = s_gfx.height,
+            .x = 0,
+            .y = 0,
+            .w = s_gfx.width,
+            .h = s_gfx.height,
+        };
+        ag_gfx_present(&b);
+    }
+
+    /* The engine's frame loop has no other place to be interrupted, and a
+     * process that never yields is a process the supervisor kills.  The
+     * timers are serviced from here for the same reason: it is the one point
+     * the game passes through every frame and nowhere else. */
+    timers_service();
+    ag_heartbeat();
+
+    ++s_present_count;
+    if (s_shot_after > 0 && s_present_count >= s_shot_after) {
+        s_shot_after = 0;
+        write_ppm(s_shot_path);
+    }
 }
 
 SDL_Texture *SDL_CreateTexture(SDL_Renderer *r, Uint32 format, int access,
@@ -462,69 +710,345 @@ SDL_Texture *SDL_CreateTexture(SDL_Renderer *r, Uint32 format, int access,
     (void)r;
     (void)format;
     (void)access;
-    (void)w;
-    (void)h;
-    TODO(SDL_CreateTexture);
-    return NULL;
+    s_texture.w = w;
+    s_texture.h = h;
+    return &s_texture;
 }
 
 void SDL_DestroyTexture(SDL_Texture *t) { (void)t; }
 
+/*
+ * The question that makes the whole arrangement work.  The engine asks what
+ * format its texture came out as and builds its presenting surface to match,
+ * so answering RGB565 - whatever format was asked for - is what puts the game
+ * one blit away from the panel instead of two.
+ */
 int SDL_QueryTexture(SDL_Texture *t, Uint32 *format, int *access, int *w,
                      int *h)
 {
-    (void)t;
-    (void)format;
-    (void)access;
-    (void)w;
-    (void)h;
-    return -1;
+    if (t == NULL) {
+        return -1;
+    }
+    if (format != NULL) {
+        *format = SDL_PIXELFORMAT_RGB565;
+    }
+    if (access != NULL) {
+        *access = SDL_TEXTUREACCESS_STREAMING;
+    }
+    if (w != NULL) {
+        *w = t->w;
+    }
+    if (h != NULL) {
+        *h = t->h;
+    }
+    return 0;
 }
 
+/*
+ * Nothing to update: when the presenting surface is the framebuffer, these are
+ * the same pixels.  When it is not - a panel of a different size - the copy
+ * happens here, clipped to the overlap, because this is the call that knows
+ * both the source pitch and that the frame is finished.
+ */
 int SDL_UpdateTexture(SDL_Texture *t, const SDL_Rect *rect, const void *pixels,
                       int pitch)
 {
-    (void)t;
     (void)rect;
-    (void)pixels;
-    (void)pitch;
+
+    s_frame_px = pixels;
+    s_frame_pitch = pitch;
+
+    if (!s_have_gfx || pixels == NULL || pixels == s_gfx.fb ||
+        s_gfx.fb == NULL) {
+        return 0;
+    }
+
+    int w = (int)s_gfx.width;
+    int h = (int)s_gfx.height;
+    if (t != NULL) {
+        if (t->w < w) {
+            w = t->w;
+        }
+        if (t->h < h) {
+            h = t->h;
+        }
+    }
+    for (int y = 0; y < h; ++y) {
+        memcpy((Uint8 *)s_gfx.fb + (size_t)y * s_gfx.stride,
+               (const Uint8 *)pixels + (size_t)y * pitch,
+               (size_t)w * sizeof(Uint16));
+    }
     return 0;
 }
 
-/* ---- events: not written yet --------------------------------------------- */
+/* ---- events -------------------------------------------------------------- */
+
+/*
+ * One queue, drained from ag_poll_event, which is where both the keyboard and
+ * the pointer arrive however they were produced - a real key, a KBDVIRT
+ * injection, a mouse packet from MOUSEVIRT.
+ *
+ * The queue is small on purpose.  Fallout polls once per frame and drains
+ * everything; a backlog longer than this means the game is not running, and
+ * dropping the oldest events then is better than growing without bound.
+ */
+#define SDL_QUEUE_LEN 64
+
+static SDL_Event s_queue[SDL_QUEUE_LEN];
+static int s_q_head;
+static int s_q_tail;
+
+/* Relative motion since the last SDL_GetRelativeMouseState, and the buttons
+ * as they are now.  Fallout reads movement this way and never asks for a
+ * position, because it keeps the cursor itself. */
+static int s_mouse_dx;
+static int s_mouse_dy;
+static Uint32 s_mouse_buttons;
+static int s_mouse_x = -1;
+static int s_mouse_y = -1;
+
+static void queue_push(const SDL_Event *e)
+{
+    const int next = (s_q_head + 1) % SDL_QUEUE_LEN;
+    if (next == s_q_tail) {
+        /* Full: drop the oldest.  A dropped key is better than a stuck one. */
+        s_q_tail = (s_q_tail + 1) % SDL_QUEUE_LEN;
+    }
+    s_queue[s_q_head] = *e;
+    s_q_head = next;
+}
+
+/*
+ * ArgonOS reports a key as a USB HID usage id, and an SDL scancode is a USB
+ * HID usage id - the tables are the same table.  So this is very nearly the
+ * identity, and the exceptions are the few places where the name Fallout uses
+ * is not the name at that number.
+ */
+static SDL_Scancode scancode_of(uint16_t hid)
+{
+    switch (hid) {
+    case 0x63: /* Keypad . — the game's tables call it KP_DECIMAL */
+        return SDL_SCANCODE_KP_DECIMAL;
+    case 0x67:
+        return SDL_SCANCODE_KP_EQUALS;
+    case 0x85:
+        return SDL_SCANCODE_KP_COMMA;
+    default:
+        break;
+    }
+    if (hid >= SDL_NUM_SCANCODES) {
+        return SDL_SCANCODE_UNKNOWN;
+    }
+    return (SDL_Scancode)hid;
+}
+
+static Uint16 mods_of(uint16_t ag)
+{
+    Uint16 out = 0;
+    if (ag & AG_MOD_SHIFT) {
+        out |= KMOD_LSHIFT;
+    }
+    if (ag & AG_MOD_CTRL) {
+        out |= KMOD_LCTRL;
+    }
+    if (ag & AG_MOD_ALT) {
+        out |= KMOD_LALT;
+    }
+    if (ag & AG_MOD_GUI) {
+        out |= KMOD_LGUI;
+    }
+    if (ag & AG_MOD_CAPS) {
+        out |= KMOD_CAPS;
+    }
+    if (ag & AG_MOD_NUM) {
+        out |= KMOD_NUM;
+    }
+    return out;
+}
+
+/*
+ * ArgonOS numbers the buttons left, right, middle; SDL numbers them left,
+ * middle, right.  Two bits change places, and getting it wrong makes the
+ * right mouse button - which is how Fallout switches cursor mode, so half the
+ * game - do nothing at all.
+ */
+static Uint32 buttons_of(uint8_t ag)
+{
+    Uint32 out = 0;
+    if (ag & 0x1u) {
+        out |= SDL_BUTTON(SDL_BUTTON_LEFT);
+    }
+    if (ag & 0x2u) {
+        out |= SDL_BUTTON(SDL_BUTTON_RIGHT);
+    }
+    if (ag & 0x4u) {
+        out |= SDL_BUTTON(SDL_BUTTON_MIDDLE);
+    }
+    return out;
+}
+
+static void pump(void)
+{
+    ag_event_t e;
+    while (ag_poll_event(&e, 0)) {
+        SDL_Event out;
+        memset(&out, 0, sizeof(out));
+        out.common.timestamp = (Uint32)ag_millis();
+
+        switch (e.type) {
+        case AG_EV_KEY_DOWN:
+        case AG_EV_KEY_UP: {
+            const SDL_Scancode sc = scancode_of(e.key.keycode);
+            if (sc == SDL_SCANCODE_UNKNOWN) {
+                continue;
+            }
+            out.type = (e.type == AG_EV_KEY_DOWN) ? SDL_KEYDOWN : SDL_KEYUP;
+            out.key.state =
+                (e.type == AG_EV_KEY_DOWN) ? SDL_PRESSED : SDL_RELEASED;
+            out.key.repeat = e.key.repeat ? 1 : 0;
+            out.key.keysym.scancode = sc;
+            out.key.keysym.mod = mods_of(e.key.mods);
+            queue_push(&out);
+            break;
+        }
+
+        case AG_EV_POINTER_DOWN:
+        case AG_EV_POINTER_UP:
+        case AG_EV_POINTER_MOVE: {
+            /*
+             * The pointer arrives in screen coordinates; the engine wants
+             * movement.  MOUSEVIRT leaves dx and dy at zero and sends where
+             * the host's cursor is, so the difference is taken here.  The
+             * first event only establishes the origin - without that the
+             * cursor would jump from the corner on the first move.
+             */
+            const int x = e.ptr.x;
+            const int y = e.ptr.y;
+            if (s_mouse_x >= 0) {
+                s_mouse_dx += (e.ptr.dx != 0) ? e.ptr.dx : (x - s_mouse_x);
+                s_mouse_dy += (e.ptr.dy != 0) ? e.ptr.dy : (y - s_mouse_y);
+            }
+            s_mouse_x = x;
+            s_mouse_y = y;
+            const Uint32 prev_buttons = s_mouse_buttons;
+            s_mouse_buttons = buttons_of(e.ptr.buttons);
+
+            if (e.type == AG_EV_POINTER_MOVE) {
+                out.type = SDL_MOUSEMOTION;
+                out.motion.x = x;
+                out.motion.y = y;
+                out.motion.state = s_mouse_buttons;
+            } else {
+                /*
+                 * ArgonOS reports the whole mask on an edge, not which button
+                 * made it, so the changed bit is found by difference.  Fallout
+                 * itself reads the mask and ignores this field - it is filled
+                 * in properly anyway, because an event that says LEFT when the
+                 * right button was pressed is a trap for whoever reads this
+                 * next.
+                 */
+                const Uint32 changed = s_mouse_buttons ^ prev_buttons;
+                out.type = (e.type == AG_EV_POINTER_DOWN) ? SDL_MOUSEBUTTONDOWN
+                                                          : SDL_MOUSEBUTTONUP;
+                out.button.state = (e.type == AG_EV_POINTER_DOWN) ? SDL_PRESSED
+                                                                  : SDL_RELEASED;
+                out.button.x = x;
+                out.button.y = y;
+                out.button.button =
+                    (changed & SDL_BUTTON(SDL_BUTTON_RIGHT))
+                        ? SDL_BUTTON_RIGHT
+                        : (changed & SDL_BUTTON(SDL_BUTTON_MIDDLE)
+                               ? SDL_BUTTON_MIDDLE
+                               : SDL_BUTTON_LEFT);
+                out.button.clicks = 1;
+            }
+            queue_push(&out);
+            break;
+        }
+
+        case AG_EV_WHEEL:
+            /* One axis, in dy, the way MOUSEVIRT sends it. */
+            out.type = SDL_MOUSEWHEEL;
+            out.wheel.x = e.ptr.dx;
+            out.wheel.y = e.ptr.dy;
+            queue_push(&out);
+            break;
+
+        case AG_EV_QUIT:
+            out.type = SDL_QUIT;
+            queue_push(&out);
+            break;
+
+        case AG_EV_FOCUS_GAINED:
+        case AG_EV_FOCUS_LOST:
+            out.type = SDL_WINDOWEVENT;
+            out.window.event = (e.type == AG_EV_FOCUS_GAINED)
+                                   ? SDL_WINDOWEVENT_FOCUS_GAINED
+                                   : SDL_WINDOWEVENT_FOCUS_LOST;
+            queue_push(&out);
+            break;
+
+        default:
+            break;
+        }
+    }
+}
 
 int SDL_PollEvent(SDL_Event *event)
 {
-    (void)event;
-    return 0;
+    pump();
+    if (s_q_tail == s_q_head) {
+        return 0;
+    }
+    if (event != NULL) {
+        *event = s_queue[s_q_tail];
+    }
+    s_q_tail = (s_q_tail + 1) % SDL_QUEUE_LEN;
+    return 1;
 }
 
-void SDL_PumpEvents(void) {}
+void SDL_PumpEvents(void) { pump(); }
 
 void SDL_FlushEvents(Uint32 minType, Uint32 maxType)
 {
+    /* The engine flushes to drop everything, never a range, so the range is
+     * checked and then ignored rather than half-implemented. */
     (void)minType;
     (void)maxType;
+    pump();
+    s_q_head = 0;
+    s_q_tail = 0;
 }
 
 Uint32 SDL_GetRelativeMouseState(int *x, int *y)
 {
+    pump();
     if (x != NULL) {
-        *x = 0;
+        *x = s_mouse_dx;
     }
     if (y != NULL) {
-        *y = 0;
+        *y = s_mouse_dy;
     }
-    return 0;
+    s_mouse_dx = 0;
+    s_mouse_dy = 0;
+    return s_mouse_buttons;
 }
 
+/*
+ * There is no cursor to capture and no window to leave, so relative mode is
+ * what this always was.  Reporting success matters: dxinput_mouse_init makes
+ * it the test for whether the mouse works at all.
+ */
 int SDL_SetRelativeMouseMode(SDL_bool enabled)
 {
     (void)enabled;
     return 0;
 }
 
-SDL_Keymod SDL_GetModState(void) { return KMOD_NONE; }
+SDL_Keymod SDL_GetModState(void)
+{
+    return (SDL_Keymod)mods_of(ag_mods());
+}
 
 int SDL_ShowCursor(int toggle)
 {
@@ -548,7 +1072,48 @@ void SDL_StartTextInput(void) {}
 
 void SDL_StopTextInput(void) {}
 
-/* ---- audio: not written yet ---------------------------------------------- */
+/* ---- audio --------------------------------------------------------------- */
+
+/*
+ * The engine wants what SDL gives it: a device that calls back for a block of
+ * samples whenever it needs one, and a resampler per sound so that a clip
+ * recorded at 8 kHz can be mixed with one at 22.
+ *
+ * ArgonOS's audio is the other shape - a queue that is written to, with
+ * ag_audio_space saying how much room is left.  So the callback is driven from
+ * a thread here: it asks the queue for room, calls the engine's mixer to fill
+ * a block, and writes it.  That thread is the audio device.
+ */
+#define AUDIO_FRAMES 1024
+#define AUDIO_CHANNELS 2
+
+static SDL_AudioSpec s_spec;
+static bool s_audio_open;
+static volatile bool s_audio_paused = true;
+static volatile bool s_audio_stop;
+static ag_thread_t s_audio_thread;
+static int16_t s_audio_block[AUDIO_FRAMES * AUDIO_CHANNELS];
+
+static void audio_thread(void *arg)
+{
+    (void)arg;
+    while (!s_audio_stop) {
+        if (s_audio_paused || s_spec.callback == NULL) {
+            ag_delay(10);
+            continue;
+        }
+        if (ag_audio_space() < AUDIO_FRAMES) {
+            /* Short: the queue drains in about 46 ms at 22 kHz, and sleeping
+             * a whole tick here is how a gap gets into the sound. */
+            ag_delay(2);
+            continue;
+        }
+        s_spec.callback(s_spec.userdata, (Uint8 *)s_audio_block,
+                        (int)sizeof(s_audio_block));
+        ag_audio_write(s_audio_block, AUDIO_FRAMES);
+    }
+    ag_thread_exit();
+}
 
 SDL_AudioDeviceID SDL_OpenAudioDevice(const char *device, int iscapture,
                                       const SDL_AudioSpec *desired,
@@ -556,81 +1121,311 @@ SDL_AudioDeviceID SDL_OpenAudioDevice(const char *device, int iscapture,
                                       int allowed_changes)
 {
     (void)device;
-    (void)iscapture;
     (void)allowed_changes;
-    /* Reporting the device as opened with the asked-for format keeps the
-     * engine's own mixer arithmetic honest while nothing is heard. */
-    if (obtained != NULL && desired != NULL) {
-        *obtained = *desired;
+    if (iscapture || desired == NULL) {
+        return 0;
+    }
+
+    s_spec = *desired;
+    /* What this port can actually produce, whatever was asked for.  The engine
+     * passes SDL_AUDIO_ALLOW_ANY_CHANGE and reads the answer back out of
+     * gAudioEngineSpec, so telling it the truth here is enough. */
+    s_spec.format = AUDIO_S16;
+    s_spec.channels = AUDIO_CHANNELS;
+    s_spec.samples = AUDIO_FRAMES;
+    s_spec.silence = 0;
+    s_spec.size = sizeof(s_audio_block);
+
+    ag_printf("SDL: audio %d Hz, %d channels, blocks of %d frames\n",
+              s_spec.freq, AUDIO_CHANNELS, AUDIO_FRAMES);
+
+    const ag_audio_fmt_t fmt = {
+        .rate = (uint32_t)s_spec.freq,
+        .channels = AUDIO_CHANNELS,
+        .bits = 16,
+    };
+    if (ag_audio_open(&fmt) != AG_OK) {
+        ag_print("SDL audio: no device (load PCMVIRT.SYS or an I2S driver)\n");
+        return 0;
+    }
+
+    s_audio_stop = false;
+    s_audio_paused = true;
+    s_audio_thread = ag_thread_create(audio_thread, NULL, "sdlaudio", 4096, 0, 0);
+    if (s_audio_thread == NULL) {
+        ag_audio_close();
+        return 0;
+    }
+
+    s_audio_open = true;
+    if (obtained != NULL) {
+        *obtained = s_spec;
     }
     return 1;
 }
 
-void SDL_CloseAudioDevice(SDL_AudioDeviceID dev) { (void)dev; }
+void SDL_CloseAudioDevice(SDL_AudioDeviceID dev)
+{
+    (void)dev;
+    if (!s_audio_open) {
+        return;
+    }
+    s_audio_stop = true;
+    ag_thread_join(s_audio_thread, 1000);
+    ag_audio_close();
+    s_audio_open = false;
+}
 
 void SDL_PauseAudioDevice(SDL_AudioDeviceID dev, int pause_on)
 {
     (void)dev;
-    (void)pause_on;
+    s_audio_paused = (pause_on != 0);
 }
 
+/*
+ * Add src into dst at volume/128, saturating.  Only the one format, because
+ * the device above only ever reports the one.
+ */
 void SDL_MixAudioFormat(Uint8 *dst, const Uint8 *src, SDL_AudioFormat format,
                         Uint32 len, int volume)
 {
-    (void)dst;
-    (void)src;
-    (void)format;
-    (void)len;
-    (void)volume;
+    if (dst == NULL || src == NULL || volume <= 0) {
+        return;
+    }
+    if (format != AUDIO_S16) {
+        ag_panic("SDL_MixAudioFormat: only signed 16-bit is implemented");
+    }
+
+    Sint16 *d = (Sint16 *)dst;
+    const Uint32 n = len / sizeof(Sint16);
+    for (Uint32 i = 0; i < n; ++i) {
+        Sint16 s;
+        memcpy(&s, src + i * sizeof(Sint16), sizeof(s));
+        int32_t v = (int32_t)d[i] + ((int32_t)s * volume) / SDL_MIX_MAXVOLUME;
+        if (v > 32767) {
+            v = 32767;
+        } else if (v < -32768) {
+            v = -32768;
+        }
+        d[i] = (Sint16)v;
+    }
 }
+
+/*
+ * The resampler.
+ *
+ * Fallout's sounds are recorded at whatever rate they were recorded at and
+ * mixed together at 22 kHz, so every voice goes through one of these.  Linear
+ * interpolation between the two input frames either side of the output
+ * instant: a quarter of the cost of anything better and, for speech and
+ * gunfire already limited to 8 or 11 kHz, below what the material shows.
+ *
+ * The engine hands over one source frame at a time and takes back whatever
+ * comes out, so the output has to be buffered - a frame in can be nought,
+ * one, two or three frames out depending on the ratio.
+ */
+#define STREAM_OUT_FRAMES 512
+#define PHASE_ONE 65536u
+
+struct SDL_AudioStream {
+    uint32_t step;   /* src frames per dst frame, 16.16 */
+    uint32_t phase;  /* where in the current input interval, 16.16 */
+    bool have_last;
+    Sint16 last[AUDIO_CHANNELS];
+    Uint8 src_channels;
+    SDL_AudioFormat src_format;
+
+    Sint16 out[STREAM_OUT_FRAMES * AUDIO_CHANNELS];
+    int head;
+    int tail;
+};
 
 SDL_AudioStream *SDL_NewAudioStream(SDL_AudioFormat src_format,
                                     Uint8 src_channels, int src_rate,
                                     SDL_AudioFormat dst_format,
                                     Uint8 dst_channels, int dst_rate)
 {
-    (void)src_format;
-    (void)src_channels;
-    (void)src_rate;
-    (void)dst_format;
-    (void)dst_channels;
-    (void)dst_rate;
-    return NULL;
+    if (src_rate <= 0 || dst_rate <= 0 || src_channels < 1 ||
+        src_channels > 2 || dst_channels != AUDIO_CHANNELS ||
+        dst_format != AUDIO_S16) {
+        return NULL;
+    }
+    if (src_format != AUDIO_S16 && src_format != AUDIO_S8 &&
+        src_format != AUDIO_U8) {
+        return NULL;
+    }
+
+    SDL_AudioStream *s = (SDL_AudioStream *)ag_malloc(sizeof(*s));
+    if (s == NULL) {
+        return NULL;
+    }
+    memset(s, 0, sizeof(*s));
+    s->step = (uint32_t)(((uint64_t)src_rate * PHASE_ONE) / (uint32_t)dst_rate);
+    s->src_channels = src_channels;
+    s->src_format = src_format;
+    return s;
 }
 
-int SDL_AudioStreamPut(SDL_AudioStream *stream, const void *buf, int len)
+static int stream_free_frames(const SDL_AudioStream *s)
 {
-    (void)stream;
-    (void)buf;
-    (void)len;
+    const int used = (s->head - s->tail + STREAM_OUT_FRAMES) % STREAM_OUT_FRAMES;
+    return STREAM_OUT_FRAMES - 1 - used;
+}
+
+static void stream_emit(SDL_AudioStream *s, const Sint16 *a, const Sint16 *b,
+                        uint32_t phase)
+{
+    if (stream_free_frames(s) <= 0) {
+        return; /* the consumer is behind; dropping is better than blocking */
+    }
+    Sint16 *dst = &s->out[s->head * AUDIO_CHANNELS];
+    for (int c = 0; c < AUDIO_CHANNELS; ++c) {
+        const int32_t lo = a[c];
+        const int32_t hi = b[c];
+        dst[c] = (Sint16)(lo + (((hi - lo) * (int32_t)phase) >> 16));
+    }
+    s->head = (s->head + 1) % STREAM_OUT_FRAMES;
+}
+
+int SDL_AudioStreamPut(SDL_AudioStream *s, const void *buf, int len)
+{
+    if (s == NULL || buf == NULL || len <= 0) {
+        return -1;
+    }
+
+    const int src_bytes = (s->src_format == AUDIO_S16 ? 2 : 1) * s->src_channels;
+    const int frames = len / src_bytes;
+    const Uint8 *p = (const Uint8 *)buf;
+
+    for (int i = 0; i < frames; ++i) {
+        Sint16 cur[AUDIO_CHANNELS];
+        for (int c = 0; c < AUDIO_CHANNELS; ++c) {
+            /* Mono is duplicated rather than panned: the engine does its own
+             * panning by volume, on two buffers. */
+            const int sc = (s->src_channels == 1) ? 0 : c;
+            if (s->src_format == AUDIO_S16) {
+                Sint16 v;
+                memcpy(&v, p + (size_t)sc * 2u, sizeof(v));
+                cur[c] = v;
+            } else if (s->src_format == AUDIO_S8) {
+                cur[c] = (Sint16)((Sint8)p[sc] * 256);
+            } else {
+                cur[c] = (Sint16)(((int)p[sc] - 128) * 256);
+            }
+        }
+        p += src_bytes;
+
+        if (!s->have_last) {
+            s->last[0] = cur[0];
+            s->last[1] = cur[1];
+            s->have_last = true;
+            continue;
+        }
+        while (s->phase < PHASE_ONE) {
+            stream_emit(s, s->last, cur, s->phase);
+            s->phase += s->step;
+        }
+        s->phase -= PHASE_ONE;
+        s->last[0] = cur[0];
+        s->last[1] = cur[1];
+    }
     return 0;
 }
 
-int SDL_AudioStreamGet(SDL_AudioStream *stream, void *buf, int len)
+int SDL_AudioStreamGet(SDL_AudioStream *s, void *buf, int len)
 {
-    (void)stream;
-    (void)buf;
-    (void)len;
-    return 0;
+    if (s == NULL || buf == NULL || len <= 0) {
+        return -1;
+    }
+
+    const int frame_bytes = (int)sizeof(Sint16) * AUDIO_CHANNELS;
+    int want = len / frame_bytes;
+    const int have = (s->head - s->tail + STREAM_OUT_FRAMES) % STREAM_OUT_FRAMES;
+    if (want > have) {
+        want = have;
+    }
+
+    Uint8 *out = (Uint8 *)buf;
+    for (int i = 0; i < want; ++i) {
+        memcpy(out, &s->out[s->tail * AUDIO_CHANNELS], (size_t)frame_bytes);
+        out += frame_bytes;
+        s->tail = (s->tail + 1) % STREAM_OUT_FRAMES;
+    }
+    return want * frame_bytes;
 }
 
-void SDL_FreeAudioStream(SDL_AudioStream *stream) { (void)stream; }
+void SDL_FreeAudioStream(SDL_AudioStream *s)
+{
+    if (s != NULL) {
+        ag_free(s);
+    }
+}
 
-/* ---- timers: not written yet --------------------------------------------- */
+/* ---- timers -------------------------------------------------------------- */
+
+/*
+ * One timer, because the engine registers one: the 40 ms tick that fades
+ * sounds out.  It is not a thread and not an interrupt - it is checked when
+ * the frame is presented, which is the only moment this port is certain to
+ * reach regularly.  A fade therefore advances at the frame rate rather than
+ * every 40 ms, which is a fade that takes longer on a slower machine; the
+ * alternative is a fourth thread for something nobody hears.
+ */
+#define SDL_TIMERS 4
+
+static struct {
+    bool used;
+    Uint32 interval;
+    Uint32 due;
+    SDL_TimerCallback fn;
+    void *param;
+} s_timers[SDL_TIMERS];
+
+static void timers_service(void)
+{
+    const Uint32 now = (Uint32)ag_millis();
+    for (int i = 0; i < SDL_TIMERS; ++i) {
+        if (!s_timers[i].used || (Sint32)(now - s_timers[i].due) < 0) {
+            continue;
+        }
+        const Uint32 next = s_timers[i].fn(s_timers[i].interval,
+                                           s_timers[i].param);
+        if (next == 0) {
+            s_timers[i].used = false;
+        } else {
+            s_timers[i].interval = next;
+            s_timers[i].due = now + next;
+        }
+    }
+}
 
 SDL_TimerID SDL_AddTimer(Uint32 interval, SDL_TimerCallback callback,
                          void *param)
 {
-    (void)interval;
-    (void)callback;
-    (void)param;
+    if (callback == NULL) {
+        return 0;
+    }
+    for (int i = 0; i < SDL_TIMERS; ++i) {
+        if (s_timers[i].used) {
+            continue;
+        }
+        s_timers[i].used = true;
+        s_timers[i].interval = interval;
+        s_timers[i].due = (Uint32)ag_millis() + interval;
+        s_timers[i].fn = callback;
+        s_timers[i].param = param;
+        return (SDL_TimerID)(i + 1);
+    }
     return 0;
 }
 
 SDL_bool SDL_RemoveTimer(SDL_TimerID id)
 {
-    (void)id;
-    return SDL_FALSE;
+    if (id == 0 || id > SDL_TIMERS || !s_timers[id - 1].used) {
+        return SDL_FALSE;
+    }
+    s_timers[id - 1].used = false;
+    return SDL_TRUE;
 }
 
 }  // extern "C"

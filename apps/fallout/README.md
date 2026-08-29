@@ -4,18 +4,31 @@
 reverse-engineered Fallout 1 — as an ArgonOS `.AXE`. 128k lines of C++ compiled
 for the ESP32-S3, running from flash XIP with 1.8 MB of data in PSRAM.
 
-**Where it is.** The engine reaches its own `main`, initialises, looks for the
-game data and says so when it is not there:
+**Where it is.** The engine runs the whole of `game_init` and stops where the
+art data is not there:
 
 ```
-FALLOUT - fallout1-ce on ArgonOS
-message: Could not find the master datafile. Please make sure the FALLOUT CD is
-in the drive and that you are running FALLOUT from the directory you installed it to.
+SDL: display 640x480 with a framebuffer, 1280 bytes per row
+Fade time is 956
+Fade steps are 43
+Chi squared is 18.75, P = 4000.00 at 0.05
+Sequence is random, 95% confidence.
+SDL: audio 22050 Hz, 2 channels, blocks of 1024 frames
+>gsound_init  >initMovie  >gmovie_init  >moviefx_init
+cache_init failed in art_init
+art_init failed in iso_init
+Failed on iso_init
 ```
 
-Everything up to that point works. Nothing after it does yet: the SDL shim
-still panics on `SDL_CreateWindow`, so there is no picture, no input and no
-sound. See **What is left** below.
+The window is opened, the display is acquired, the palette fade runs sixty
+frames at about 57 fps, the engine's own random number generator passes its
+chi-squared self-test, the audio device opens and the mixer thread starts.
+`iso_init` is where the missing art stops it.
+
+The shim is finished: video, input, audio, timers. What it has not been able
+to do is draw anything, because there is nothing to draw. **The next thing this
+needs is a copy of the game** - see **The data** below. Everything the shim can
+be shown to do without one, `SDLTEST.AXE` shows.
 
 ## Licensing
 
@@ -86,7 +99,8 @@ Measured, not estimated. `--survey` for the first four, the linker for the rest.
 | code in the image, after `--gc-sections` | **439 KB** |
 | data + bss | **1.73 MB** (287 KB stored, 1.45 MB zeroed) |
 | relocations | 5109 |
-| stack actually used, up to the data check | 4.6 KB of 16 KB |
+| stack actually used, through `game_init` | 4.8 KB of 16 KB |
+| frame rate of the engine's own palette fade, in QEMU | ~57 fps |
 
 439 KB of code does not fit the 192 KB arena, so the loader puts it in flash and
 executes it in place. That is automatic — the image asks for nothing. The data
@@ -98,27 +112,60 @@ Everything that had to give way gave way on this side: `port/SDL.h` is the SDL2
 subset the engine actually uses, `port/dirent.h` shadows the toolchain's so that
 `d_type` exists, and the rest is in `port/`.
 
-## What is left
+## What the shim does
 
-In the order it would have to be done.
+All of it is in `port/`, and `SDLTEST.AXE` is the test - it makes the same
+calls `svga.cc` makes, in the same order, then reads the framebuffer back and
+checks it by arithmetic rather than by eye.
 
-**Video.** `SDL_CreateWindow` and `SDL_RenderPresent` panic. The engine draws
-640×480 8-bit into a surface and blits it through a palette into a 32-bit one -
-that blit is written and works. What is missing is the last step: 32-bit surface
-to the ArgonOS framebuffer. `fb0` is RGB565 and 640×400 by default, so 480 rows
-need either a taller framebuffer or a viewport.
+**Video, without a copy per frame.** The engine asks its texture what format it
+came out as and builds its presenting surface to match. Answering RGB565 - not
+the 32-bit it asked for - means that surface can *be* the framebuffer: the
+game's 8-bit blit through the palette lands directly where the panel reads, and
+`SDL_RenderPresent` is a flush and nothing else. The palette is turned into a
+table of RGB565 once per blit, 256 conversions instead of 307200.
 
-**Input.** `SDL_PollEvent` returns nothing. Fallout is a mouse game end to end;
-`/dev/mouse0` and the keyboard both exist and the scancode table in `port/SDL.h`
-is already the shape `kb.cc` wants.
+The game is 640×480 and the default framebuffer is 640×400 (80×25 text cells).
+Put this in `C:\SYSTEM.CFG` and reboot, or the picture is copied and cropped
+instead:
 
-**Audio.** `SDL_OpenAudioDevice` reports success and is silent. The engine mixes
-its own voices and hands over one stream, so the work is one PCM sink plus a
-resampler for `SDL_AudioStream` - the sample rates in the game's own files vary
-per sound.
+```ini
+[display]
+width  = 640
+height = 480
+```
 
-**Then the data.** 400 MB of `.DAT` over SPI, seeked rather than streamed. That
-is where the real performance question lives, and nothing measured so far says
+**Input.** ArgonOS reports a key as a USB HID usage id and an SDL scancode *is*
+a USB HID usage id, so the translation is nearly the identity. The mouse needs
+more care: the engine wants relative movement, MOUSEVIRT sends absolute
+positions, and the difference is taken in the shim. ArgonOS numbers the buttons
+left/right/middle and SDL numbers them left/middle/right - two bits change
+places, and getting that wrong loses the right button, which is how Fallout
+switches cursor mode.
+
+**Audio.** SDL calls back for samples; ArgonOS is written to. So the callback is
+driven from a thread that asks `ag_audio_space` for room, calls the engine's
+mixer, and writes. `SDL_AudioStream` is a linear-interpolating resampler -
+every voice goes through one, because the game's sounds are recorded at
+whatever rate they were recorded at and mixed at 22 kHz.
+
+**Timers** are serviced from `SDL_RenderPresent`, the one point the game passes
+through every frame. The engine registers one: the 40 ms sound fade. It
+therefore advances at the frame rate, which on a slower machine is a slower
+fade; the alternative is a fourth thread for something nobody hears.
+
+## The data
+
+`MASTER.DAT`, `CRITTER.DAT` and the `DATA` folder from a copy of the game, at
+the root of the card next to `FALLOUT.AXE`. Nobody else's to distribute, and
+the engine looks for them relative to where it was started.
+
+Until they are there, `apps/fallout/testdata` gets the engine through
+`game_init` on a database with nothing in it - see its README. That is how
+everything above was tested.
+
+Once they are: 400 MB of `.DAT` over SPI, seeked rather than streamed. That is
+where the real performance question lives, and nothing measured so far says
 anything about it.
 
 ## Notes for whoever picks this up
@@ -135,3 +182,7 @@ anything about it.
   free in one piece put the stack in PSRAM, and the process faulted before its
   first instruction. `AG_APP` rather than `AG_APP_SIZED` until there is a
   measurement saying otherwise.
+- `build.py` compiles the engine with `-D_DEBUG`. That is not about assertions:
+  `debug_printf` is compiled out without it, and the engine then stops halfway
+  in silence. An afternoon went into finding out that the silence was the build
+  flag rather than a fault.
