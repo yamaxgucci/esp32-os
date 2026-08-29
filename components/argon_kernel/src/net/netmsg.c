@@ -7,6 +7,8 @@
 
 #include <string.h>
 
+#include <argon/port/config.h> /* CONFIG_ARGON_NET_TLS */
+
 /* ---------------------------------------------------------------------- */
 /* Small text helpers.  Written out rather than taken from <strings.h>:   */
 /* the case-insensitive comparisons there are spelled differently on      */
@@ -271,13 +273,18 @@ ag_err_t ag_url_parse(const char *text, ag_url_t *out)
         out->port = 80;
     } else if (strcmp(out->scheme, "ftp") == 0) {
         out->port = 21;
-    } else {
+    } else if (strcmp(out->scheme, "https") == 0) {
+#if defined(CONFIG_ARGON_NET_TLS) && CONFIG_ARGON_NET_TLS
+        out->port = 443;
+#else
         /*
-         * https lands here, and it is the reason this returns a distinct code:
-         * there is no TLS in this system, and quietly fetching an https URL
-         * over port 80 would send a password in clear for a caller who took
-         * care to ask for encryption.
+         * Without TLS in the build, refuse https rather than quietly fetch it
+         * over port 80 - that would send in clear what a caller asked to
+         * encrypt.
          */
+        return -AG_ENOTSUP;
+#endif
+    } else {
         return -AG_ENOTSUP;
     }
 

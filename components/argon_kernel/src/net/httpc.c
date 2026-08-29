@@ -2,11 +2,13 @@
  * ArgonOS - fetching a file over HTTP.
  *
  * The smallest thing that is honestly a client: one connection, one request,
- * the body straight to a file.  No keep-alive, no cache, no compression, and
- * no TLS - that last one is not an omission to be fixed cheaply.  mbedTLS
- * wants tens of kilobytes of RAM for its record buffers alone, and this chip
- * has under a hundred free with the radio up, so an https URL is refused by
- * the URL parser rather than half-supported here.
+ * the body straight to a file.  No keep-alive, no cache, no compression.
+ * https is supported when the build has TLS (CONFIG_ARGON_NET_TLS): the
+ * connection then comes from the TLS port instead of a plain socket, and the
+ * same buffered reader drives it by branching in one place (net/netio.c).
+ * mbedTLS is not free - tens of kilobytes of RAM for its record buffers - so
+ * TLS is a build option, and without it an https URL is refused by the URL
+ * parser rather than fetched in clear.
  *
  * What it does insist on:
  *
@@ -40,6 +42,9 @@
 
 #include <argon/port/mem.h>
 #include <argon/port/net.h>
+#include <argon/port/task.h>
+#include <argon/port/time.h>
+#include <argon/port/tls.h>
 
 #include "net/netio.h"
 
@@ -230,6 +235,60 @@ static ag_err_t redirect_url(const ag_url_t *from, const char *location,
  * One request.  Returns AG_OK with `next` empty when the file has been saved,
  * or AG_OK with `next` set when the server redirected.
  */
+/*
+ * The connection request_once talks over is either a plain fd or a TLS handle.
+ * These two helpers are the only places that care which; everywhere else the
+ * buffered reader (with rdr.tls set) hides the difference.
+ */
+static ag_err_t conn_send_all(int fd, void *tls, const void *buf, size_t len)
+{
+#if AG_PORT_HAS_TLS
+    if (tls != NULL) {
+        const uint8_t *p = (const uint8_t *)buf;
+        size_t         left = len;
+        const int64_t  deadline =
+            ag_port_us() + (int64_t)AG_NETIO_TIMEOUT_MS * 1000;
+        while (left > 0) {
+            const int32_t n = ag_port_tls_send((ag_port_tls_t)tls, p, left);
+            if (n == -AG_EAGAIN) {
+                if (ag_shell_interrupted()) {
+                    return -AG_EINTR;
+                }
+                if (ag_port_us() > deadline) {
+                    return -AG_ETIMEDOUT;
+                }
+                ag_port_task_delay(ag_port_ms_to_ticks(AG_NETIO_SLICE_MS));
+                continue;
+            }
+            if (n < 0) {
+                return (ag_err_t)n;
+            }
+            p += (size_t)n;
+            left -= (size_t)n;
+        }
+        return AG_OK;
+    }
+#else
+    (void)tls;
+#endif
+    return ag_netio_send_all(fd, buf, len);
+}
+
+static void conn_close(int fd, void *tls)
+{
+#if AG_PORT_HAS_TLS
+    if (tls != NULL) {
+        ag_port_tls_close((ag_port_tls_t)tls);
+        return;
+    }
+#else
+    (void)tls;
+#endif
+    if (fd >= 0) {
+        conn_close(fd, tls);
+    }
+}
+
 static ag_err_t request_once(const ag_url_t *u, const char *dest,
                              http_bufs_t *b, char *next, size_t next_len)
 {
@@ -249,41 +308,66 @@ static ag_err_t request_once(const ag_url_t *u, const char *dest,
     }
     ag_console_printf("%s:%u ... ", ip, (unsigned)u->port);
 
-    const int fd = ag_port_net_connect(addr, u->port, HTTP_CONNECT_MS);
-    if (fd < 0) {
-        ag_console_puts("no answer\n");
-        return (ag_err_t)fd;
+    int        fd = -1;
+    void      *tls = NULL;
+    const bool https = (strcmp(u->scheme, "https") == 0);
+    if (https) {
+#if AG_PORT_HAS_TLS
+        /* esp_tls resolves, connects and does the handshake, verifying the peer
+         * against the certificate bundle. */
+        tls = ag_port_tls_connect(u->host, u->port, HTTP_CONNECT_MS);
+        if (tls == NULL) {
+            ag_console_puts("no answer (or the certificate did not check out)\n");
+            return -AG_EIO;
+        }
+#else
+        ag_console_puts("no TLS in this build\n");
+        return -AG_ENOTSUP;
+#endif
+    } else {
+        fd = ag_port_net_connect(addr, u->port, HTTP_CONNECT_MS);
+        if (fd < 0) {
+            ag_console_puts("no answer\n");
+            return (ag_err_t)fd;
+        }
+        /*
+         * From here the socket never blocks and netio does the waiting.  On this
+         * hardware a blocking read of a fresh connection does not return at all
+         * - see net/netio.h - and even where it does, a command that cannot be
+         * interrupted while it waits is a board that has to be reset.  (The TLS
+         * connection is set non-blocking by the port after its handshake.)
+         */
+        (void)ag_port_net_nonblock(fd, true);
     }
     ag_console_puts("connected\n");
-
-    /*
-     * From here the socket never blocks and netio does the waiting.  On this
-     * hardware a blocking read of a fresh connection does not return at all -
-     * see net/netio.h - and even where it does, a command that cannot be
-     * interrupted while it waits is a board that has to be reset.
-     */
-    (void)ag_port_net_nonblock(fd, true);
 
     /*
      * Host: carries the port when it is not the default, because a server
      * behind a name-based virtual host answers a bare name with the wrong
      * site.  Connection: close is what makes a body with no length finite.
      */
-    if (u->port == 80) {
-        err = ag_netio_sendf(fd,
-                             "GET %s HTTP/1.1\r\nHost: %s\r\n"
-                             "User-Agent: " HTTP_AGENT "\r\n"
-                             "Accept: */*\r\nConnection: close\r\n\r\n",
-                             u->path, u->host);
+    char req[512];
+    int  rn;
+    if (u->port == 80 || u->port == 443) {
+        rn = snprintf(req, sizeof(req),
+                      "GET %s HTTP/1.1\r\nHost: %s\r\n"
+                      "User-Agent: " HTTP_AGENT "\r\n"
+                      "Accept: */*\r\nConnection: close\r\n\r\n",
+                      u->path, u->host);
     } else {
-        err = ag_netio_sendf(fd,
-                             "GET %s HTTP/1.1\r\nHost: %s:%u\r\n"
-                             "User-Agent: " HTTP_AGENT "\r\n"
-                             "Accept: */*\r\nConnection: close\r\n\r\n",
-                             u->path, u->host, (unsigned)u->port);
+        rn = snprintf(req, sizeof(req),
+                      "GET %s HTTP/1.1\r\nHost: %s:%u\r\n"
+                      "User-Agent: " HTTP_AGENT "\r\n"
+                      "Accept: */*\r\nConnection: close\r\n\r\n",
+                      u->path, u->host, (unsigned)u->port);
     }
+    if (rn < 0 || (size_t)rn >= sizeof(req)) {
+        conn_close(fd, tls);
+        return -AG_ERANGE;
+    }
+    err = conn_send_all(fd, tls, req, (size_t)rn);
     if (err != AG_OK) {
-        ag_port_net_close(fd);
+        conn_close(fd, tls);
         return err;
     }
 
@@ -298,12 +382,13 @@ static ag_err_t request_once(const ag_url_t *u, const char *dest,
      */
     ag_netio_t rdr;
     ag_netio_init(&rdr, fd, b->body, HTTP_BODY_BUF, 0);
+    rdr.tls = tls; /* NULL for http; the reader then branches to TLS on refill */
 
     size_t have = 0;
     while (ag_http_header_end(b->hdr, have) == 0) {
         if (have == HTTP_HDR_MAX) {
             ag_console_puts("the reply header is too long for this system\n");
-            ag_port_net_close(fd);
+            conn_close(fd, tls);
             return -AG_ERANGE;
         }
         const int32_t n = ag_netio_read(&rdr, b->hdr + have, 1);
@@ -322,12 +407,12 @@ static ag_err_t request_once(const ag_url_t *u, const char *dest,
                 ag_console_puts(
                     "the connection failed while waiting for the reply\n");
             }
-            ag_port_net_close(fd);
+            conn_close(fd, tls);
             return (ag_err_t)n;
         }
         if (n == 0) {
             ag_console_puts("the connection closed before the reply\n");
-            ag_port_net_close(fd);
+            conn_close(fd, tls);
             return -AG_EIO;
         }
         have += (size_t)n;
@@ -338,7 +423,7 @@ static ag_err_t request_once(const ag_url_t *u, const char *dest,
     err = ag_http_parse_response(b->hdr, end, &resp);
     if (err != AG_OK) {
         ag_console_puts("this is not an HTTP server\n");
-        ag_port_net_close(fd);
+        conn_close(fd, tls);
         return err;
     }
 
@@ -349,7 +434,7 @@ static ag_err_t request_once(const ag_url_t *u, const char *dest,
         if (err != AG_OK) {
             ag_console_puts("...to somewhere this system cannot express\n");
         }
-        ag_port_net_close(fd);
+        conn_close(fd, tls);
         return err;
     }
 
@@ -357,7 +442,7 @@ static ag_err_t request_once(const ag_url_t *u, const char *dest,
         const char *text = ag_http_status_text(resp.status);
         ag_console_printf("%d%s%s\n", resp.status, (text[0] != '\0') ? " " : "",
                           text);
-        ag_port_net_close(fd);
+        conn_close(fd, tls);
         /* Distinguishable, so that a script can tell "no such file" from "the
          * server is broken". */
         if (resp.status == 404 || resp.status == 410) {
@@ -377,7 +462,7 @@ static ag_err_t request_once(const ag_url_t *u, const char *dest,
         ag_vfs_open(dest, NULL, AG_O_WRONLY | AG_O_CREATE | AG_O_TRUNC);
     if (out < 0) {
         ag_console_printf("%s: cannot be written\n", dest);
-        ag_port_net_close(fd);
+        conn_close(fd, tls);
         return (ag_err_t)out;
     }
 
@@ -404,7 +489,7 @@ static ag_err_t request_once(const ag_url_t *u, const char *dest,
     ag_progress_done(&prog, total);
 
     ag_vfs_close(out);
-    ag_port_net_close(fd);
+    conn_close(fd, tls);
 
     if (err == -AG_EINTR) {
         /* Named the way the operator typed it, not the way the VFS spells it. */
@@ -464,10 +549,16 @@ ag_err_t ag_http_fetch(const char *url_text, const char *dest)
         }
         /*
          * A redirect that changes scheme lands here: ftp:// is a different
-         * conversation and https:// is one this system does not have.
+         * conversation.  https:// is fine when this build has TLS, and is the
+         * common case now that servers redirect http to it.
          */
-        if (strcmp(u.scheme, "http") != 0) {
-            ag_console_printf("%s: not http\n", current);
+        bool ok_scheme = (strcmp(u.scheme, "http") == 0);
+#if AG_PORT_HAS_TLS
+        ok_scheme = ok_scheme || (strcmp(u.scheme, "https") == 0);
+#endif
+        if (!ok_scheme) {
+            ag_console_printf("%s: not http%s\n", current,
+                              AG_PORT_HAS_TLS ? " or https" : "");
             err = -AG_ENOTSUP;
             break;
         }

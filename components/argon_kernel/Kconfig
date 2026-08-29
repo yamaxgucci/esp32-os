@@ -325,6 +325,22 @@ menu "ArgonOS"
             in SYSTEM.CFG) asks - a board on an open network should not answer
             on 23 by accident.  Verified in QEMU (hostfwd to :23).
 
+    config ARGON_NET_TLS
+        bool "TLS client (https for wget)"
+        depends on ARGON_ENABLE_NET
+        default y
+        select MBEDTLS_CERTIFICATE_BUNDLE
+        help
+            A TLS client over esp_tls, so `wget https://...` works and a redirect
+            from http to https is followed instead of refused.  The peer is
+            verified against the Mozilla root bundle mbedtls compiles in.
+
+            Not free: mbedTLS wants tens of kilobytes of RAM for its record
+            buffers, which on a chip with under a hundred free once the radio is
+            up is a real fraction - so it is a build option, and with it off an
+            https URL is refused rather than fetched in clear.  Verified in QEMU
+            over OpenEth+SLIRP against a real https server.
+
     config ARGON_BOARD_PROBE
         bool "Board probe instead of the system"
         default n

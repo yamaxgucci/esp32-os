@@ -18,6 +18,8 @@
 #include <argon/net.h>
 #include <argon/netmsg.h>
 #include <argon/path.h>
+
+#include <argon/port/tls.h> /* AG_PORT_HAS_TLS */
 #include <argon/shell.h>
 #include <argon/vfs.h>
 
@@ -152,16 +154,26 @@ int ag_cmd_wget(int argc, char **argv)
 {
     if (argc < 2) {
         ag_console_puts("usage: wget <url> [file]\n");
-        ag_console_puts("  http:// and ftp:// - there is no TLS in this "
-                        "system, so no https\n");
+#if AG_PORT_HAS_TLS
+        ag_console_puts("  http://, https:// and ftp://\n");
+#else
+        ag_console_puts("  http:// and ftp:// - no TLS in this build, so no "
+                        "https\n");
+#endif
         return 1;
     }
 
     ag_url_t       u;
     const ag_err_t uerr = ag_url_parse(argv[1], &u);
     if (uerr == -AG_ENOTSUP) {
-        ag_console_printf("%s: this system speaks http and ftp only\n",
+#if AG_PORT_HAS_TLS
+        ag_console_printf("%s: this system speaks http, https and ftp only\n",
                           argv[1]);
+#else
+        ag_console_printf("%s: this system speaks http and ftp only "
+                          "(no TLS for https)\n",
+                          argv[1]);
+#endif
         return 1;
     }
     if (uerr != AG_OK) {

@@ -81,6 +81,17 @@ if(CONFIG_ARGON_CAMERA_BUILTIN)
     target_link_libraries(${COMPONENT_LIB} PRIVATE ${cam_builtin_lib})
 endif()
 
+# TLS client (CONFIG_ARGON_NET_TLS): esp_tls + mbedtls, for https in wget
+# (tls_hw.c).  esp_crt_bundle (the root-certificate bundle) is part of the
+# mbedtls component.  Linked conditionally so a build without TLS neither pulls
+# mbedTLS's RAM nor puts its headers on the path; both build fine under QEMU.
+if(CONFIG_ARGON_NET_TLS)
+    idf_component_get_property(tls_lib esp-tls COMPONENT_LIB)
+    target_link_libraries(${COMPONENT_LIB} PRIVATE ${tls_lib})
+    idf_component_get_property(mbed_lib mbedtls COMPONENT_LIB)
+    target_link_libraries(${COMPONENT_LIB} PRIVATE ${mbed_lib})
+endif()
+
 if(ARGON_PORT_SRCS)
     target_compile_options(${COMPONENT_LIB} PRIVATE
         -Wall -Wextra -Werror=implicit-function-declaration

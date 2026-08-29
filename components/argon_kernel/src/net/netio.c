@@ -18,6 +18,7 @@
 #include <argon/port/net.h>
 #include <argon/port/task.h>
 #include <argon/port/time.h>
+#include <argon/port/tls.h>
 
 /* Everything in this file waits the same way; this is that way. */
 static bool wait_a_moment(int64_t deadline, ag_err_t *why)
@@ -58,6 +59,46 @@ int32_t ag_netio_recv(int fd, void *buf, size_t len, uint32_t timeout_ms)
             return (int32_t)why;
         }
     }
+}
+
+int32_t ag_netio_recv_tls(void *tls, void *buf, size_t len, uint32_t timeout_ms)
+{
+#if AG_PORT_HAS_TLS
+    ag_port_tls_t h = (ag_port_tls_t)tls;
+    const int64_t deadline = ag_port_us() + (int64_t)timeout_ms * 1000;
+
+    for (;;) {
+        /* Decrypted bytes can already be buffered inside TLS while the socket
+         * itself reads as not-ready (a whole record arrived in one packet), so
+         * take those before waiting on the socket. */
+        if (ag_port_tls_pending(h) > 0) {
+            const int32_t n = ag_port_tls_recv_now(h, buf, len);
+            if (n != -AG_EAGAIN) {
+                return n;
+            }
+        }
+        const int ready = ag_port_tls_wait_readable(h, AG_NETIO_SLICE_MS);
+        if (ready < 0) {
+            return (int32_t)ready;
+        }
+        if (ready > 0) {
+            const int32_t n = ag_port_tls_recv_now(h, buf, len);
+            if (n != -AG_EAGAIN) {
+                return n;
+            }
+        }
+        ag_err_t why = AG_OK;
+        if (!wait_a_moment(deadline, &why)) {
+            return (int32_t)why;
+        }
+    }
+#else
+    (void)tls;
+    (void)buf;
+    (void)len;
+    (void)timeout_ms;
+    return -AG_ENOTSUP; /* never reached: no reader carries a tls with TLS off */
+#endif
 }
 
 ag_err_t ag_netio_send(int fd, const void *buf, size_t len,
@@ -118,6 +159,7 @@ void ag_netio_init(ag_netio_t *r, int fd, uint8_t *buf, size_t cap,
                    size_t prefill)
 {
     r->fd = fd;
+    r->tls = NULL;
     r->buf = buf;
     r->cap = cap;
     r->have = (prefill > cap) ? cap : prefill;
@@ -139,7 +181,10 @@ static int32_t fill(ag_netio_t *r)
 
     r->pos = 0;
     r->have = 0;
-    const int32_t n = ag_netio_recv(r->fd, r->buf, r->cap, r->timeout_ms);
+    const int32_t n = (r->tls != NULL)
+                          ? ag_netio_recv_tls(r->tls, r->buf, r->cap,
+                                              r->timeout_ms)
+                          : ag_netio_recv(r->fd, r->buf, r->cap, r->timeout_ms);
     if (n < 0) {
         return n;
     }
