@@ -43,6 +43,10 @@ static void todo(const char *what)
 
 static Uint32 s_inited;
 
+/* Fallout 2 calls this instead of the per-subsystem form; the subsystems here
+ * cost nothing until they are used, so both are the same call. */
+int SDL_Init(Uint32 flags) { return SDL_InitSubSystem(flags); }
+
 int SDL_InitSubSystem(Uint32 flags)
 {
     s_inited |= flags;
@@ -807,6 +811,15 @@ static Uint32 s_mouse_buttons;
 static int s_mouse_x = -1;
 static int s_mouse_y = -1;
 
+/*
+ * The keyboard as a table of flags indexed by scancode - which is to say by
+ * HID usage id, since here they are the same number.  Kept from the same
+ * events the queue gets rather than asked of the system each time, because the
+ * ABI reports one key at a time and the caller wants a whole array to point
+ * at.  Fallout 2's sfall helpers read it; Fallout 1 never does.
+ */
+static Uint8 s_keystate[SDL_NUM_SCANCODES];
+
 static void queue_push(const SDL_Event *e)
 {
     const int next = (s_q_head + 1) % SDL_QUEUE_LEN;
@@ -821,14 +834,19 @@ static void queue_push(const SDL_Event *e)
 /*
  * ArgonOS reports a key as a USB HID usage id, and an SDL scancode is a USB
  * HID usage id - the tables are the same table.  So this is very nearly the
- * identity, and the exceptions are the few places where the name Fallout uses
- * is not the name at that number.
+ * identity, and the exceptions are the two keypad keys whose HID number is not
+ * where SDL's name for them ended up.
+ *
+ * The keypad full stop is deliberately not one of them.  It is HID 0x63, which
+ * is SDL_SCANCODE_KP_PERIOD, and Fallout 1's key tables look for KP_DECIMAL
+ * instead - so that key does nothing there.  It does nothing on a desktop
+ * either, for exactly the same reason, and making it work here would be this
+ * port disagreeing with SDL about what the hardware said.  Fallout 2 looks for
+ * KP_PERIOD and works.
  */
 static SDL_Scancode scancode_of(uint16_t hid)
 {
     switch (hid) {
-    case 0x63: /* Keypad . — the game's tables call it KP_DECIMAL */
-        return SDL_SCANCODE_KP_DECIMAL;
     case 0x67:
         return SDL_SCANCODE_KP_EQUALS;
     case 0x85:
@@ -908,6 +926,7 @@ static void pump(void)
             out.key.repeat = e.key.repeat ? 1 : 0;
             out.key.keysym.scancode = sc;
             out.key.keysym.mod = mods_of(e.key.mods);
+            s_keystate[sc] = (e.type == AG_EV_KEY_DOWN) ? 1 : 0;
             queue_push(&out);
             break;
         }
@@ -992,6 +1011,29 @@ static void pump(void)
             break;
         }
     }
+}
+
+/*
+ * Push an event in from outside.  Fallout 1 never does; Fallout 2 does, from
+ * its sfall keyboard helpers, which synthesise key presses for the hot keys a
+ * mod can bind.  It goes in the same queue as everything else.
+ */
+int SDL_PushEvent(SDL_Event *event)
+{
+    if (event == NULL) {
+        return -1;
+    }
+    queue_push(event);
+    return 1;
+}
+
+const Uint8 *SDL_GetKeyboardState(int *numkeys)
+{
+    pump();
+    if (numkeys != NULL) {
+        *numkeys = SDL_NUM_SCANCODES;
+    }
+    return s_keystate;
 }
 
 int SDL_PollEvent(SDL_Event *event)

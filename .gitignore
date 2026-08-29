@@ -31,6 +31,7 @@ third_party/lvgl/
 # like the rest. adecode and fpattern are MIT and are fetched with it rather
 # than separately.
 third_party/fallout1-ce/
+third_party/fallout2-ce/
 third_party/adecode-src/
 third_party/fpattern-src/
 

@@ -200,6 +200,7 @@ typedef enum SDL_Scancode {
     SDL_SCANCODE_INSERT = 73,
     SDL_SCANCODE_HOME = 74,
     SDL_SCANCODE_DELETE = 76,
+    SDL_SCANCODE_PAGEUP = 75,
     SDL_SCANCODE_END = 77,
     SDL_SCANCODE_PAGEDOWN = 78,
     SDL_SCANCODE_RIGHT = 79,
@@ -208,6 +209,8 @@ typedef enum SDL_Scancode {
     SDL_SCANCODE_UP = 82,
 
     SDL_SCANCODE_NUMLOCKCLEAR = 83,
+    SDL_SCANCODE_KP_PERIOD = 99,
+    SDL_SCANCODE_SYSREQ = 154,
     SDL_SCANCODE_KP_DIVIDE = 84,
     SDL_SCANCODE_KP_MULTIPLY = 85,
     SDL_SCANCODE_KP_MINUS = 86,
@@ -466,6 +469,7 @@ typedef Uint32 (*SDL_TimerCallback)(Uint32 interval, void *param);
 
 /* ---- the calls ----------------------------------------------------------- */
 
+int SDL_Init(Uint32 flags);
 int SDL_InitSubSystem(Uint32 flags);
 void SDL_QuitSubSystem(Uint32 flags);
 Uint32 SDL_WasInit(Uint32 flags);
@@ -510,6 +514,8 @@ int SDL_UpperBlit(SDL_Surface *src, const SDL_Rect *srcrect, SDL_Surface *dst,
 
 /* input */
 int SDL_PollEvent(SDL_Event *event);
+int SDL_PushEvent(SDL_Event *event);
+const Uint8 *SDL_GetKeyboardState(int *numkeys);
 void SDL_PumpEvents(void);
 void SDL_FlushEvents(Uint32 minType, Uint32 maxType);
 Uint32 SDL_GetRelativeMouseState(int *x, int *y);
