@@ -130,6 +130,54 @@ typedef struct ag_amp_band {
 } ag_amp_band_t;
 
 /*
+ * THE KNOBS THE SCHEMATIC HAS, AND ONLY THOSE
+ *
+ * A model says how many controls its amplifier actually has and what they are
+ * called, and anything with a screen asks rather than carrying a list of its
+ * own: the 2203 has five, the Shiva and the SLO have a gain pot as well, and the
+ * pedal has three and no tone stack at all.  A second list somewhere would be
+ * wrong the first time a model changed.
+ *
+ * Every position is 0 to 1 with **0.5 meaning noon**, which is where every
+ * capture was taken and where the voicing fit leaves them.  The fit never moves
+ * them - they are the player's controls, not the model's, and a knob that the
+ * matching walk could turn would be a knob fitted to a recording rather than one
+ * that plays.
+ *
+ * `ag_amp_pot_apply` is what turns positions into the things the chain actually
+ * uses - the drive, the tone stack's three, the interstage attenuator, the
+ * master.  Call it after moving a position and before ag_amp_set_knobs; that
+ * function takes a const configuration and does not reach into pot[] itself,
+ * because the matching tools set the gains directly and must keep doing so.
+ */
+#define AG_AMP_POT_N 8
+
+enum ag_amp_pot_id {
+    AG_POT_DRIVE = 0, /* what reaches the first grid */
+    AG_POT_GAIN,      /* the pot between two stages, on models that have one */
+    AG_POT_BASS,
+    AG_POT_MID,
+    AG_POT_TREBLE,
+    AG_POT_TONE,      /* the pedal's single tone control */
+    AG_POT_MASTER,
+    AG_POT_NONE
+};
+
+/* How many controls this model has, and the id and short label of each. */
+int         ag_amp_pot_count(int model);
+int         ag_amp_pot_id(int model, int i);
+const char *ag_amp_pot_name(int model, int i);
+
+/*
+ * Positions into the chain's own controls.  Feeding the result to
+ * ag_amp_set_knobs is a redesign of the filters and nothing more - no curve is
+ * rebaked and no state is cleared.  What it approximates, and what it does not,
+ * is written where it is defined.
+ */
+struct ag_amp_cfg;
+void ag_amp_pot_apply(struct ag_amp_cfg *cfg, int model);
+
+/*
  * Which chain this is: the component values of every stage, the topology, and
  * the voicing that goes with them.
  *
@@ -164,12 +212,19 @@ typedef struct ag_amp_cfg {
     int   model;
     /* 1 to AG_AMP_STAGES. */
     int   n_stages;
+
     /*
      * Gain into each stage, applied after that stage's filter block.  gain[0] is
      * the drive knob and gain[1] the interstage attenuator a Plexi has and a
      * 2203 does not; the rest default to unity.
      */
     float gain[AG_AMP_STAGES];
+
+    /*
+     * The player's knobs, 0 to 1, 0.5 at noon.  Written by whatever has the
+     * screen, read by ag_amp_pot_apply; see ag_amp_pot_count for the rules.
+     */
+    float pot[AG_AMP_POT_N];
     /* No table: the stage is its filter block and its gain, and nothing else. */
     int   linear[AG_AMP_STAGES];
 
@@ -570,6 +625,7 @@ int ag_amp_model_by_name(const char *s);
  * plays, and it still sounds like an amplifier.
  */
 const char *ag_amp_model_capture(int model);
+
 
 /*
  * Has this model's voicing been fitted against a capture of the amplifier it is

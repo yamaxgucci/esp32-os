@@ -87,6 +87,17 @@ void ag_amp_model(ag_amp_cfg_t *cfg, int model, float fs)
     cfg->n_stages = 2; /* the JCM800 front end this is voiced for */
     /* Half, not one: one is the top of the range, not the middle of it. */
     cfg->drive = 0.5f;
+    /*
+     * Every knob at noon, which is where the captures were taken and where the
+     * voicing fit leaves them.  A model's own block may move what noon *means* -
+     * see ag_amp_pot_apply - but not where the knob sits.
+     */
+    {
+        int p;
+        for (p = 0; p < AG_AMP_POT_N; p++) {
+            cfg->pot[p] = 0.5f;
+        }
+    }
     {
         int b;
         for (b = 0; b < AG_AMP_STAGES; b++) {
@@ -1099,6 +1110,154 @@ const char *ag_amp_model_name(int model)
         return "ts9";
     }
     return "?";
+}
+
+/*
+ * WHICH KNOBS EACH AMPLIFIER HAS
+ *
+ * One table, read by anything that draws them - see the note in ag_amp.h.  The
+ * differences are the schematics' own: the 2203 has no pot between its two
+ * valves, the Shiva and the SLO do, and the pedal has three controls and no tone
+ * stack, so the tone knob there is its own circuit rather than three of them.
+ */
+static const uint8_t k_pots_jcm800[] = { AG_POT_DRIVE, AG_POT_BASS, AG_POT_MID,
+                                         AG_POT_TREBLE, AG_POT_MASTER };
+static const uint8_t k_pots_gainamp[] = { AG_POT_DRIVE, AG_POT_GAIN,
+                                          AG_POT_BASS, AG_POT_MID,
+                                          AG_POT_TREBLE, AG_POT_MASTER };
+static const uint8_t k_pots_ts9[] = { AG_POT_DRIVE, AG_POT_TONE, AG_POT_MASTER };
+
+static const uint8_t *pot_table(int model, int *n)
+{
+    if (model == AG_AMP_MODEL_TS9) {
+        *n = (int)(sizeof(k_pots_ts9) / sizeof(k_pots_ts9[0]));
+        return k_pots_ts9;
+    }
+    if (model == AG_AMP_MODEL_BOGNER || model == AG_AMP_MODEL_SLO) {
+        *n = (int)(sizeof(k_pots_gainamp) / sizeof(k_pots_gainamp[0]));
+        return k_pots_gainamp;
+    }
+    *n = (int)(sizeof(k_pots_jcm800) / sizeof(k_pots_jcm800[0]));
+    return k_pots_jcm800;
+}
+
+int ag_amp_pot_count(int model)
+{
+    int n = 0;
+    (void)pot_table(model, &n);
+    return n;
+}
+
+int ag_amp_pot_id(int model, int i)
+{
+    int                  n = 0;
+    const uint8_t *const t = pot_table(model, &n);
+    return (i >= 0 && i < n) ? (int)t[i] : AG_POT_NONE;
+}
+
+const char *ag_amp_pot_name(int model, int i)
+{
+    /* Short on purpose: they go under a knob on a screen that is 320 wide. */
+    switch (ag_amp_pot_id(model, i)) {
+    case AG_POT_DRIVE:
+        return "DRIVE";
+    case AG_POT_GAIN:
+        return "GAIN";
+    case AG_POT_BASS:
+        return "BASS";
+    case AG_POT_MID:
+        return "MID";
+    case AG_POT_TREBLE:
+        return "TREB";
+    case AG_POT_TONE:
+        return "TONE";
+    case AG_POT_MASTER:
+        return "MASTER";
+    default:
+        return "";
+    }
+}
+
+/*
+ * POSITIONS INTO THE THINGS THE CHAIN USES
+ *
+ * Called from apply_cfg, so a knob moves without a rebake: everything here is a
+ * gain or a resistance in the tone network, and nothing touches a baked curve.
+ *
+ * THREE OF THESE ARE THE CIRCUIT.  THE OTHERS ARE NOT YET, AND MUST BE.
+ *
+ * Bass, middle and treble are real: they are resistances in the tone network,
+ * that network is solved as a network, and moving one changes the other two the
+ * way it does on the bench.  Nothing here approximates them.
+ *
+ * Drive, gain and master are levels here, and that is a stop-gap rather than an
+ * answer.  A pot between two valves changes two things - how much signal reaches
+ * the next grid, and the impedance that grid is driven from - and a level does
+ * only the first.  The second is what makes a gain control sound like one: the
+ * wiper impedance peaks in the middle of the sweep and falls at both ends, which
+ * moves the top corner and changes how the grid draws current, and that lives
+ * inside the baked curve because `rsrc` is in the circuit build_dc solves.
+ *
+ * It is reachable and the machinery is already here.  `ag_amp_blend_stage`
+ * re-mixes a 2048-point stage from two baked curves in about fifty thousand
+ * instructions - a fifth of a millisecond, measured, against a block of 11.6 -
+ * so a stage baked at both ends of the wiper's travel can be blended while
+ * somebody turns the knob, with the coupling corner recomputed from the wiper's
+ * own impedance alongside it.  That is the shape of the real thing, and until it
+ * is written these three are honest about being levels.
+ *
+ * Noon is unity everywhere: at 0.5 every one of these leaves the fitted value
+ * exactly as the walk set it, so a preset played with the knobs untouched is the
+ * preset that was measured.  The fit never moves them.
+ */
+static float pot_db(float pos, float span_db)
+{
+    const float d = (pos - 0.5f) * 2.0f * span_db;
+    return ag_expf(d * (2.302585093f / 20.0f));
+}
+
+void ag_amp_pot_apply(struct ag_amp_cfg *cfg, int model)
+{
+    int n = 0, i;
+    const uint8_t *t;
+
+    if (cfg == 0) {
+        return;
+    }
+    t = pot_table(model, &n);
+    for (i = 0; i < n; i++) {
+        const float p = cfg->pot[t[i] < AG_AMP_POT_N ? t[i] : 0];
+        switch (t[i]) {
+        case AG_POT_DRIVE:
+            /* Twenty decibels either side of what the fit chose, which is the
+             * useful range of a preamp volume and no more. */
+            cfg->gain[0] = pot_db(p, 20.0f);
+            break;
+        case AG_POT_GAIN:
+            /* The attenuator between the stages; gain[1] is where it lives, and
+             * the header has said so since before it could be turned. */
+            cfg->gain[1] = pot_db(p, 20.0f);
+            break;
+        case AG_POT_BASS:
+            cfg->tone_bass = p;
+            break;
+        case AG_POT_MID:
+            cfg->tone_mid = p;
+            break;
+        case AG_POT_TREBLE:
+            cfg->tone_treble = p;
+            break;
+        case AG_POT_TONE:
+            /* The pedal's one control: its own network, not three of them. */
+            cfg->tone_mid = p;
+            break;
+        case AG_POT_MASTER:
+            cfg->gain[AG_AMP_STAGES - 1] = pot_db(p, 20.0f);
+            break;
+        default:
+            break;
+        }
+    }
 }
 
 const char *ag_amp_model_capture(int model)

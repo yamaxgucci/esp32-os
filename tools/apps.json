@@ -64,6 +64,19 @@
               "apps/common/libc/libc_shim.c"]
     },
     {
+      "out": "STOMP.AXE", "group": "core",
+      "_note": "the amplifier with its knobs on a screen; the knob list comes from the model",
+      "include": ["apps/common", "apps/common/ckt", "apps/common/tube",
+                  "apps/common/libc", "apps/stomp"],
+      "cflags": "-Os -ffunction-sections -fdata-sections -fno-builtin",
+      "src": ["apps/stomp/stomp.c",
+              "apps/common/tube/ag_tube.c", "apps/common/tube/ag_biq.c",
+              "apps/common/tube/ag_os.c", "apps/common/tube/ag_amp.c",
+              "apps/common/tube/ag_tone.c",
+              "apps/common/ckt/ag_mathf.c", "apps/common/ckt/ag_ckt.c",
+              "apps/common/libc/libc_shim.c"]
+    },
+    {
       "out": "CKTBENCH.AXE", "group": "core",
       "include": ["apps/common", "apps/common/ckt", "apps/common/dsp",
                   "apps/common/fx", "apps/common/ir", "apps/common/libc",
