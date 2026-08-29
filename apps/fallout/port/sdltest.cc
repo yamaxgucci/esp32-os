@@ -243,6 +243,60 @@ extern "C" int ag_cxx_main(int argc, char **argv)
         write_ppm(out, fb, w, h, (int)gi.stride);
     }
 
+    /* --- what a frame costs ----------------------------------------------- */
+
+    /*
+     * The two things the port does per frame, timed separately, because on a
+     * board they are paid to different pieces of hardware: the blit is PSRAM
+     * bandwidth and CPU, the flush is the panel's bus.
+     *
+     * Read these carefully.  On a board they are the answer; in QEMU only the
+     * blit means anything, and even that is a floor - the emulator models
+     * neither the cache nor PSRAM latency, so a memory-bound loop comes out
+     * two or three times too fast.  `argon test -Icount` makes virtual time
+     * follow instructions retired, which is a better floor and still a floor.
+     *
+     * The flush numbers in QEMU are not about pixels at all.  The soft display
+     * shows the picture through a doorbell register: a full-screen kick may
+     * replace one already in flight and returns at once, while a smaller one
+     * has to wait for the window to finish or it would leave stale rows.  So
+     * in QEMU a partial flush is *slower* than a whole-screen one, by the
+     * length of that wait, and on a panel it is the other way round by the
+     * ratio of the areas.  See ag_port_panel_present in components/argon_port.
+     */
+    {
+        const int rounds = 10;
+
+        ag_time_t t0 = ag_micros();
+        for (int i = 0; i < rounds; ++i) {
+            SDL_BlitSurface(game, NULL, present, NULL);
+        }
+        const uint32_t blit_us = (uint32_t)((ag_micros() - t0) / rounds);
+
+        t0 = ag_micros();
+        for (int i = 0; i < rounds; ++i) {
+            ag_gfx_flush(0, 0, GAME_W, GAME_H);
+        }
+        const uint32_t full_us = (uint32_t)((ag_micros() - t0) / rounds);
+
+        t0 = ag_micros();
+        for (int i = 0; i < rounds; ++i) {
+            ag_gfx_flush(180, 200, 280, 80);
+        }
+        const uint32_t part_us = (uint32_t)((ag_micros() - t0) / rounds);
+
+        ag_printf("\nframe cost, %dx%d, %u KB per full screen:\n", GAME_W,
+                  GAME_H, (unsigned)(GAME_W * GAME_H * 2 / 1024));
+        ag_printf("  blit 8-bit through palette : %6u us   (CPU + PSRAM)\n",
+                  blit_us);
+        ag_printf("  flush whole screen         : %6u us   (panel bus)\n",
+                  full_us);
+        ag_printf("  flush 280x80 rectangle     : %6u us   (%u KB)\n", part_us,
+                  (unsigned)(280 * 80 * 2 / 1024));
+        ag_print("  in QEMU the blit is a floor and the flushes are a "
+                 "doorbell, not a bus\n\n");
+    }
+
     /* --- the formatter ---------------------------------------------------- */
 
     /*

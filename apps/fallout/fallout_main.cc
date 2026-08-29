@@ -71,7 +71,9 @@ AG_APP_SIZED("FALLOUT", "0.1", "argon", 0, 0, AG_FALLOUT_ARENA_KB * 1024);
 int main(int argc, char **argv);
 
 /* In port/sdl_shim.cc.  Not SDL: an automated run has no eyes. */
-extern "C" void sdl_shim_screenshot(const char *path, int after_frames);
+extern "C" void sdl_shim_screenshot(const char *path, int after_frames,
+                                    int after_ms);
+extern "C" void sdl_shim_memstat(int every_ms);
 
 static bool same(const char *a, const char *b)
 {
@@ -101,14 +103,22 @@ static int to_int(const char *s)
  * that has taken the display is not using the text screen.
  *
  *   -shot PATH     write the frame out as a PPM
- *   -frames N      after this many presents (default 1)
+ *   -frames N      after this many presents
+ *   -shotms N      or after this many milliseconds, whichever comes first
+ *   -memstat N     print arena use, and the peak so far, every N ms
+ *
+ * Prefer -shotms.  Counting frames means knowing how many the game draws
+ * before it reaches whatever you wanted to look at, and the two opening movies
+ * alone are five thousand of them.
  */
 extern "C" int ag_cxx_main(int argc, char **argv)
 {
     ag_printf("fallout%d-ce on ArgonOS\n", AG_FALLOUT_GAME);
 
     const char *shot = NULL;
-    int frames = 1;
+    int frames = 0;
+    int shot_ms = 0;
+    int memstat_ms = 0;
     int out = 0;
 
     for (int i = 0; i < argc; ++i) {
@@ -116,6 +126,10 @@ extern "C" int ag_cxx_main(int argc, char **argv)
             shot = argv[++i];
         } else if (same(argv[i], "-frames") && i + 1 < argc) {
             frames = to_int(argv[++i]);
+        } else if (same(argv[i], "-shotms") && i + 1 < argc) {
+            shot_ms = to_int(argv[++i]);
+        } else if (same(argv[i], "-memstat") && i + 1 < argc) {
+            memstat_ms = to_int(argv[++i]);
         } else {
             argv[out++] = argv[i];
         }
@@ -123,7 +137,11 @@ extern "C" int ag_cxx_main(int argc, char **argv)
     argv[out] = NULL;
 
     if (shot != NULL) {
-        sdl_shim_screenshot(shot, frames > 0 ? frames : 1);
+        if (frames <= 0 && shot_ms <= 0) {
+            frames = 1;
+        }
+        sdl_shim_screenshot(shot, frames, shot_ms);
     }
+    sdl_shim_memstat(memstat_ms);
     return main(out, argv);
 }

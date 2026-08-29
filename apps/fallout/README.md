@@ -213,14 +213,114 @@ in `fallout_main.cc` - the two `.DAT` indices alone are 1.7 MB.
 `fallout2.cfg` matters too, for one line: `art_cache_size=1`. The stock value
 is 8, in megabytes, reserved whole at startup.
 
-## Where the memory goes
+## What a frame will cost on a board
+
+QEMU cannot answer this and neither can `-Icount`: the emulator models neither
+the cache nor PSRAM latency, so an instruction count is a floor and not an
+estimate. `SDLTEST.AXE` prints the three numbers that matter and is the thing
+to run on a board when there is one. In QEMU it prints, for the record:
+
+```
+frame cost, 640x480, 600 KB per full screen:
+  blit 8-bit through palette :   4817 us   (CPU + PSRAM)
+  flush whole screen         :     48 us   (panel bus)
+  flush 280x80 rectangle     :   5079 us   (43 KB)
+```
+
+The blit is a floor - a real part pays cache misses and PSRAM latency that
+QEMU does not model. The flushes are not about pixels at all: the soft display
+shows the picture through a doorbell, a full-screen kick may replace one
+already in flight and returns immediately, and a smaller one has to wait for
+the window or it would leave stale rows. That is why the small rectangle is
+the slower of the two here and will be the faster of the two on a panel.
+
+What follows is arithmetic from the measured figures in
+[`docs/07-emulator-performance.md`](../../docs/07-emulator-performance.md).
+
+A full 640×480 screen is 614 KB in RGB565.
+
+**Our part, the blit.** The engine draws into an 8-bit surface; the port turns
+that into RGB565 through the palette. Full screen, that reads 307 KB and
+writes 614 KB - about 0.9 MB of PSRAM traffic, and at the 40-80 MB/s that
+octal PSRAM does on a copy, **12-23 ms**.
+
+**The panel.** On SPI at 80 MHz, 614 KB is about **60 ms** of bus time - the
+same document measures 14 ms for a 143 KB frame, and it scales. That is a
+ceiling of 16 frames a second before anything else happens. On an RGB panel,
+which scans the framebuffer itself, there is no transfer at all.
+
+Both costs are proportional to the area that changed, not to the screen:
+`GNW95_ShowRect` blits only what a window touched, and `SDL_RenderPresent`
+sends only the union of what was blitted since the last one. So:
+
+- **dialogue, inventory, the character sheet, turn-based combat** - small
+  rectangles, and the cost is a fraction of the above;
+- **scrolling the world** - the whole screen, every frame. Single digits on
+  SPI; on an RGB panel it is the 12-23 ms blit alone, so 40-80.
+
+Which says the board this wants is one with an RGB panel, and that the CYD -
+320×240 over SPI - is the wrong shape for it twice over.
+
+## Where the memory goes, and why 8 MB is not enough
+
+`-memstat N` makes the port print the arena's use and its high-water mark every
+N milliseconds. Measured on the way through `gameInit` to the opening movies:
+
+```
+[mem] 6770 KB used of 12000, peak 6770, largest free block 4992 KB
+```
+
+That is before a map has been loaded, so it is a floor rather than the peak of
+a game in progress. Against it:
+
+| | |
+|---|---|
+| the image's own data, almost all bss | 1867 KB |
+| what the game had taken by the movies | 6770 KB |
+| **needed** | **8637 KB** |
+| free on a part with 8 MB of PSRAM | 8040 KB |
+
+Short by about 600 KB in QEMU - and by about 1200 KB on a board, because QEMU
+lends the emulated panel's own memory for the framebuffer and a real 640×480
+panel takes its 600 KB out of the same PSRAM.
+
+Inside the arena:
 
 | | |
 |---|---|
 | `MASTER.DAT` index, 23120 entries | ~1.3 MB |
 | `CRITTER.DAT` index, 7120 entries | ~0.4 MB |
-| art cache (`art_cache_size`) | 1 MB |
-| 640×480 screen buffer | 300 KB |
+| art cache (`art_cache_size`, minimum 1) | 1 MB |
+| sound cache (`cache_size`) | 256 KB |
+| 640×480 screen buffer, and the 8-bit surface | 600 KB |
+
+And the largest fixed arrays in the image, which is what "optimise the engine"
+would have to mean:
+
+| bytes | |
+|---|---|
+| 480 000 | `gTileIntensity` - `int[3][40000]`, three map levels of 200×200 hexes |
+| 196 608 | three 256×256 colour tables (intensity, mix-add, mix-multiply) |
+| 162 752 | animation sequences and their state |
+| 160 000 | `gObjectListHeadByTile` - one pointer per hex |
+| 120 000 | `_square_data` |
+|  80 000 | two path-finding node lists |
+|  80 000 | `_script_dialog_msgs` |
+
+The plausible savings, with what each costs to get:
+
+- **192 KB, free**: `cache_size=64` in the `.cfg` instead of 256.
+- **240 KB, one line of engine**: `gTileIntensity` as `uint16_t`. Light is
+  clamped to 65536 on read and 65536 is one past what fits, so it would have to
+  saturate at 65535 - a difference nobody can see, in a vendored file we would
+  then have to patch on every update.
+- **250-370 KB, one function of engine**: `dbaseOpen` allocates a separate
+  block for each of the 30240 entry paths, so a quarter of that memory is
+  allocator headers. One block for all of them would recover it.
+
+About 800 KB in total, against a gap of 1200. It does not close, and every
+metre of it is paid for in patches against somebody else's engine. **A 16 MB
+module is the answer**; `argon test -Psram 16` is the same choice in QEMU.
 
 Each `.DAT` entry is a descriptor plus a separately allocated path, and the
 index is read entry by entry - about 150000 small reads for the two of them,

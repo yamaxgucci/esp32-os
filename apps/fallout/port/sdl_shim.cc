@@ -23,7 +23,9 @@
 
 /* Declared where the port can see them; not part of SDL. */
 extern "C" bool sdl_shim_display(ag_gfxinfo_t *out);
-extern "C" void sdl_shim_screenshot(const char *path, int after_frames);
+extern "C" void sdl_shim_screenshot(const char *path, int after_frames,
+                                    int after_ms);
+extern "C" void sdl_shim_memstat(int every_ms);
 
 extern "C" {
 
@@ -99,11 +101,66 @@ static void timers_service(void);
 static ag_gfxinfo_t s_gfx;
 static bool s_have_gfx;
 static bool s_fb_lent;
+static uint32_t s_gfx_since_ms; /* when it was taken, for -shotms */
 
 /* What the last SDL_UpdateTexture was handed, for the panels that have no
  * framebuffer of their own to have been drawn into. */
 static const void *s_frame_px;
 static int s_frame_pitch;
+
+/*
+ * What has changed since the last present, as one rectangle.
+ *
+ * The engine redraws in pieces - GNW95_ShowRect hands over exactly the part of
+ * the screen a window touched - and sending the whole 640x480 anyway costs
+ * 614 KB down the panel's bus for a change of a few hundred bytes.  In QEMU
+ * that is free and the waste is invisible; on a panel it is the difference
+ * between eight frames a second and a game.
+ *
+ * One rectangle rather than a list, deliberately.  Two distant changes then
+ * send the box that contains both, which is worse than sending two rectangles
+ * and much better than sending the screen; and a list needs a merge rule, a
+ * bound, and a decision about what to do when it overflows.  The bound is the
+ * thing: the engine has no limit on how many rectangles it touches between
+ * presents, so the list would have to collapse to this anyway.
+ *
+ * In QEMU this costs rather than saves, and knowingly.  The soft display shows
+ * a frame by ringing a doorbell, and a kick that does not cover the one still
+ * in flight has to wait for it or leave stale rows on screen - so a movie,
+ * which is letterboxed and therefore never covers a previous full-height
+ * kick, waits once a frame.  It costs 213 dropped frames out of 2333 in
+ * Fallout 2's credits.  A panel has no doorbell: there the saving is the ratio
+ * of the areas, and that is the machine this is for.
+ */
+static int s_dirty_x0, s_dirty_y0, s_dirty_x1, s_dirty_y1;
+
+/* Bumped whenever the palette is written; palette_lut watches it. */
+static uint32_t s_palette_gen = 1;
+
+static void dirty_none(void)
+{
+    s_dirty_x0 = s_dirty_y0 = 0x7FFF;
+    s_dirty_x1 = s_dirty_y1 = -1;
+}
+
+static void dirty_add(int x, int y, int w, int h)
+{
+    if (w <= 0 || h <= 0) {
+        return;
+    }
+    if (x < s_dirty_x0) {
+        s_dirty_x0 = x;
+    }
+    if (y < s_dirty_y0) {
+        s_dirty_y0 = y;
+    }
+    if (x + w > s_dirty_x1) {
+        s_dirty_x1 = x + w;
+    }
+    if (y + h > s_dirty_y1) {
+        s_dirty_y1 = y + h;
+    }
+}
 
 /*
  * Not SDL.  The display is acquired once and acquiring twice is -EBUSY, so
@@ -131,12 +188,24 @@ bool sdl_shim_display(ag_gfxinfo_t *out)
  */
 static char s_shot_path[128];
 static int s_shot_after;
+static uint32_t s_shot_at_ms;
 static int s_present_count;
 
-void sdl_shim_screenshot(const char *path, int after_frames)
+/*
+ * after_frames counts presents; after_ms is wall time since the display was
+ * taken.  Either may be zero, and whichever arrives first wins.
+ *
+ * Time is the one to reach for.  Counting frames means knowing how many the
+ * game will draw before it gets where you want it, and being wrong by fifty
+ * out of five thousand - which is what the two opening movies come to - means
+ * the picture is never taken and twenty-five minutes are spent finding that
+ * out.
+ */
+void sdl_shim_screenshot(const char *path, int after_frames, int after_ms)
 {
-    if (path == NULL || after_frames <= 0) {
+    if (path == NULL || (after_frames <= 0 && after_ms <= 0)) {
         s_shot_after = 0;
+        s_shot_at_ms = 0;
         return;
     }
     size_t i = 0;
@@ -146,7 +215,49 @@ void sdl_shim_screenshot(const char *path, int after_frames)
     }
     s_shot_path[i] = '\0';
     s_shot_after = after_frames;
+    s_shot_at_ms = (uint32_t)after_ms;
     s_present_count = 0;
+}
+
+/*
+ * How much of the arena the game is actually using, reported as it goes.
+ *
+ * The question this answers is whether the whole thing fits on a part with
+ * 8 MB of PSRAM rather than 16, and it cannot be answered by trying smaller
+ * arenas one at a time: each attempt is ten minutes and tells you only that
+ * this one was too small.  The low-water mark of free space is the answer, and
+ * it costs one call per present to keep.
+ */
+static uint32_t s_memstat_ms;
+static uint32_t s_memstat_next;
+static size_t s_arena_low = (size_t)-1;
+
+void sdl_shim_memstat(int every_ms)
+{
+    s_memstat_ms = (uint32_t)(every_ms > 0 ? every_ms : 0);
+    s_memstat_next = 0;
+}
+
+static void memstat_service(void)
+{
+    ag_meminfo_t mi;
+    ag_meminfo(&mi);
+    if (mi.arena_free < s_arena_low) {
+        s_arena_low = mi.arena_free;
+    }
+    if (s_memstat_ms == 0) {
+        return;
+    }
+    const uint32_t now = (uint32_t)ag_millis();
+    if (now < s_memstat_next) {
+        return;
+    }
+    s_memstat_next = now + s_memstat_ms;
+    ag_printf("[mem] %u KB used of %u, peak %u, largest free block %u KB\n",
+              (unsigned)((mi.arena_total - mi.arena_free) / 1024u),
+              (unsigned)(mi.arena_total / 1024u),
+              (unsigned)((mi.arena_total - s_arena_low) / 1024u),
+              (unsigned)(mi.arena_largest / 1024u));
 }
 
 static void write_ppm(const char *path)
@@ -343,7 +454,37 @@ int SDL_SetPaletteColors(SDL_Palette *palette, const SDL_Color *colors,
     for (int i = 0; i < ncolors; ++i) {
         palette->colors[firstcolor + i] = colors[i];
     }
+    ++s_palette_gen;
     return 0;
+}
+
+/*
+ * The palette as RGB565, built once and kept until the palette changes.
+ *
+ * It used to be rebuilt inside every blit - 256 conversions each time.  That
+ * is nothing against a full screen and everything against the mouse cursor,
+ * which is a few hundred pixels and is blitted every single frame: the table
+ * cost more than the picture.  A counter bumped by SDL_SetPaletteColors says
+ * when it is stale, so a fade still gets a fresh one per step, which is what a
+ * fade is.
+ */
+static const Uint16 *palette_lut(const SDL_Palette *pal)
+{
+    static Uint16 lut[256];
+    static uint32_t built_gen;
+    static const SDL_Palette *built_for;
+
+    if (built_gen != s_palette_gen || built_for != pal) {
+        const int n = pal->ncolors < 256 ? pal->ncolors : 256;
+        for (int i = 0; i < n; ++i) {
+            const SDL_Color c = pal->colors[i];
+            lut[i] = (Uint16)(((c.r & 0xF8u) << 8) | ((c.g & 0xFCu) << 3) |
+                              (c.b >> 3));
+        }
+        built_gen = s_palette_gen;
+        built_for = pal;
+    }
+    return lut;
 }
 
 /*
@@ -375,12 +516,7 @@ int SDL_UpperBlit(SDL_Surface *src, const SDL_Rect *srcrect, SDL_Surface *dst,
         return -1;
     }
 
-    Uint16 lut[256];
-    for (int i = 0; i < 256 && i < pal->ncolors; ++i) {
-        const SDL_Color c = pal->colors[i];
-        lut[i] = (Uint16)(((c.r & 0xF8u) << 8) | ((c.g & 0xFCu) << 3) |
-                          (c.b >> 3));
-    }
+    const Uint16 *lut = palette_lut(pal);
 
     int sx = srcrect ? srcrect->x : 0;
     int sy = srcrect ? srcrect->y : 0;
@@ -416,6 +552,13 @@ int SDL_UpperBlit(SDL_Surface *src, const SDL_Rect *srcrect, SDL_Surface *dst,
         for (int x = 0; x < w; ++x) {
             d[x] = lut[s[x]];
         }
+    }
+
+    /* Remember what changed, so that the present after it can send that and
+     * not the whole screen.  Only when this surface is the panel: a blit into
+     * a surface of our own is copied wholesale later anyway. */
+    if (dst->pixels == s_gfx.fb) {
+        dirty_add(dx, dy, w, h);
     }
     return 0;
 }
@@ -587,8 +730,10 @@ SDL_Window *SDL_CreateWindow(const char *title, int x, int y, int w, int h,
             return NULL;
         }
         s_have_gfx = true;
+        s_gfx_since_ms = (uint32_t)ag_millis();
         ag_gfx_clear(0);
         ag_gfx_flush(0, 0, s_gfx.width, s_gfx.height);
+        dirty_none();
         ag_printf("SDL: display %ux%u %s, %u bytes per row\n",
                   (unsigned)s_gfx.width, (unsigned)s_gfx.height,
                   s_gfx.fb != NULL ? "with a framebuffer" : "by present()",
@@ -679,7 +824,15 @@ void SDL_RenderPresent(SDL_Renderer *r)
     }
 
     if (s_gfx.fb != NULL) {
-        ag_gfx_flush(0, 0, s_gfx.width, s_gfx.height);
+        /* Only what was drawn into.  Nothing drawn means nothing to send -
+         * the engine presents on a timer as well as after a change, and a
+         * still screen should cost nothing. */
+        if (s_dirty_x1 > s_dirty_x0 && s_dirty_y1 > s_dirty_y0) {
+            ag_gfx_flush((uint16_t)s_dirty_x0, (uint16_t)s_dirty_y0,
+                         (uint16_t)(s_dirty_x1 - s_dirty_x0),
+                         (uint16_t)(s_dirty_y1 - s_dirty_y0));
+            dirty_none();
+        }
     } else if (s_frame_px != NULL && AG_HAS(g_ag_api->gfx, present)) {
         const ag_blit_t b = {
             .px = s_frame_px,
@@ -699,11 +852,15 @@ void SDL_RenderPresent(SDL_Renderer *r)
      * timers are serviced from here for the same reason: it is the one point
      * the game passes through every frame and nowhere else. */
     timers_service();
+    memstat_service();
     ag_heartbeat();
 
     ++s_present_count;
-    if (s_shot_after > 0 && s_present_count >= s_shot_after) {
+    if ((s_shot_after > 0 && s_present_count >= s_shot_after) ||
+        (s_shot_at_ms != 0 &&
+         (uint32_t)ag_millis() - s_gfx_since_ms >= s_shot_at_ms)) {
         s_shot_after = 0;
+        s_shot_at_ms = 0;
         write_ppm(s_shot_path);
     }
 }
