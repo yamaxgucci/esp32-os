@@ -1,0 +1,84 @@
+# ArgonOS - the ESP32-S3 board on the desk, as opposed to the one QEMU runs.
+#
+#   argon target esp32s3-board
+#
+# An overlay on sdkconfig.defaults.esp32s3, which is the primary target and is
+# also the only target the emulator runs.  What differs is the two things a
+# board has that the emulator does not - real radios and a card no host helper
+# stands in for - and the one thing the emulator has that a board must not use.
+#
+# HOSTFS talks to tools/hostfsd.py over UART1.  A board never has that helper:
+# it would cost 80 KB of DRAM and a slice of every boot for a drive that can
+# never mount.  Files reach the board over the console (`recv`) and off the
+# card.  Off.
+#
+# The radios go the other way - on.  The emulator has none, so the primary
+# target leaves them out; but the whole reason this chip is on the desk and the
+# ESP32-CYD is not is that here a radio and a full-size application fit at once.
+# With NET_WIFI set, the network layer takes the real-radio path and never
+# touches the OpenCores MAC (that code is the no-radio branch), so ENABLE_NET
+# is the socket API over Wi-Fi rather than over a device that is not there.  A
+# radio still starts only when something asks - [wifi]/[ap] in BOARD.CFG, or
+# `wifi on` / `bt on` - so a board told to do neither pays nothing at boot.
+#
+# Everything else - 8 MB octal PSRAM, 240 MHz, 32 KB of instruction cache, the
+# 192 KB arena - is left exactly as the emulator has it, so the numbers off
+# this board can be compared with the ones in the docs.
+
+CONFIG_ARGON_ENABLE_HOSTFS=n
+
+CONFIG_ARGON_ENABLE_NET=y
+CONFIG_ARGON_NET_WIFI=y
+CONFIG_ARGON_NET_WIFI_AP=y
+CONFIG_ARGON_NET_ESPNOW=y
+CONFIG_ARGON_NET_WIFI_MON=y
+
+CONFIG_ARGON_ENABLE_BLE=y
+CONFIG_ARGON_BLE_CENTRAL=y
+CONFIG_ARGON_BLE_PERIPHERAL=y
+
+# NimBLE, not Bluedroid: without these the S3 falls back to Bluedroid, whose
+# header esp_nimble_hci.h the port does not include and the build stops.  The
+# same block the ESP32-CYD target carries, minus the BTDM_CTRL_MODE lines,
+# which name the original chip's dual-mode controller - the S3's is BLE-only
+# already.  Peripheral is on because ESP-IDF puts the whole NimBLE HID host
+# behind the GATT server; NVS persist so a bonded keyboard is remembered
+# across a power cut, and coexistence so Wi-Fi and BLE share the one radio.
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_NIMBLE_ROLE_CENTRAL=y
+CONFIG_BT_NIMBLE_ROLE_OBSERVER=y
+CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
+CONFIG_BT_NIMBLE_ROLE_BROADCASTER=n
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
+CONFIG_BT_NIMBLE_GATT_SERVER=y
+CONFIG_BT_NIMBLE_HID_SERVICE=y
+CONFIG_BT_NIMBLE_NVS_PERSIST=y
+CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y
+
+# The photoresistor/ADC path: no work to enable, only a board to run it on -
+# esp_adc would not even let QEMU boot (pitfall 26), so the primary target
+# leaves it off.  Here it is real.
+CONFIG_ARGON_ENABLE_ADC=y
+
+# The code arena lives in PSRAM (S-1), which is the real answer to "a radio and
+# a full-size application at once".  On the S3 instruction RAM and the
+# DMA-capable data RAM are one physical SRAM, so an arena in internal memory and
+# the radios fight over the same ~330 KB - 192 KB of arena overflowed the link
+# by 75 KB with both radios on.  PSRAM reaches the instruction bus on this chip,
+# so the arena moves there: 512 KB of code space that costs PSRAM, not internal
+# memory, and the internal SRAM it used to hold goes to Wi-Fi and Bluetooth.
+#
+# A small internal arena stays as a fallback and for the odd image the PSRAM
+# path cannot take (a contiguous one - none are built for xtensa, but the code
+# still handles it).  The cost of the PSRAM arena is speed: an inner loop that
+# misses the cache pays PSRAM latency, so a hot-text split will come later; this
+# is the coarse form that makes everything fit.
+CONFIG_ARGON_APP_ARENA_KB=32
+CONFIG_ARGON_APP_ARENA_PSRAM=y
+CONFIG_ARGON_APP_ARENA_PSRAM_KB=512
+
+# Camera transport for the DVP GC2145 on this board (api->cam); the sensor
+# driver is a loadable .SYS (GC2145.SYS), so the firmware carries only the
+# thin LCD_CAM+DMA path.
+CONFIG_ARGON_ENABLE_CAMERA=y

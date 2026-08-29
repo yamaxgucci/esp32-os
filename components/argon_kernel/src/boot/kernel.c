@@ -18,6 +18,7 @@
 #include <argon/console.h>
 #include <argon/log.h>
 #include <argon/module.h>
+#include <argon/power.h>
 #include <argon/recovery.h>
 #include <argon/shell.h>
 
@@ -33,8 +34,28 @@
 #include "fs/storage.h"
 #include "proc/supervisor.h"
 
-#define AG_CONSOLE_COLS 80
-#define AG_CONSOLE_ROWS 25
+/*
+ * Eighty by twenty-five, unless the board says otherwise.
+ *
+ * It is a build option rather than a line in BOARD.CFG because of when it is
+ * needed: the console exists three stages before anything has read a file off
+ * the flash, and a console that has to be rebuilt later is a console whose
+ * first three stages of output went somewhere else.
+ *
+ * The board that wants it smaller is one whose only screen is the panel
+ * soldered to it: 320 pixels hold forty of the 8-pixel cells this system
+ * draws, and forty columns that are all visible beat eighty of which half are
+ * off the glass.  That was the choice on the original PC too, and for the same
+ * reason.
+ */
+#ifndef CONFIG_ARGON_CONSOLE_COLS
+#define CONFIG_ARGON_CONSOLE_COLS 80
+#endif
+#ifndef CONFIG_ARGON_CONSOLE_ROWS
+#define CONFIG_ARGON_CONSOLE_ROWS 25
+#endif
+#define AG_CONSOLE_COLS CONFIG_ARGON_CONSOLE_COLS
+#define AG_CONSOLE_ROWS CONFIG_ARGON_CONSOLE_ROWS
 
 /*
  * Early boot tracing writes straight to the raw console, bypassing everything
@@ -162,6 +183,8 @@ static const ag_stage_desc_t s_stages[AG_STAGE_COUNT] = {
     [AG_STAGE_CONSOLE]    = {"console",    stage_console,  true},
     [AG_STAGE_STORAGE]    = {"storage",    ag_storage_init, false},
     [AG_STAGE_CONFIG]     = {"config",     ag_sysconfig_init, false},
+    /* After the configuration, because [power] lives in it. */
+    [AG_STAGE_POWER]      = {"power",      ag_powerctl_init, false},
     [AG_STAGE_DEVICES]    = {"devices",    ag_devices_init, false},
     [AG_STAGE_MEDIA]      = {"media",      ag_storage_mount_media, false},
     [AG_STAGE_MODULES]    = {"modules",    stage_modules,  false},

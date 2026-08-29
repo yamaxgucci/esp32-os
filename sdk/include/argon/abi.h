@@ -72,9 +72,72 @@ extern "C" {
  * 0.26 appended blit_src_rect / blit_scaled / blit_tiled (nearest RGB565 on
  *      the bound source) and poly_uv / poly_fill_tex (bilinear UV on quads,
  *      affine triangles otherwise).
+ * 0.27 appended text_info / text_row / text_cursor to ag_display_ops_t: the
+ *      console as characters, for a panel a framebuffer will not fit on.
+ * 0.28 defined ag_input_ops_t: an AG_DEV_INPUT driver the kernel polls for
+ *      events, for hardware that has to be asked rather than interrupting.
+ * 0.29 appended io->spi_config: the clock for one chip on a shared bus.
+ * 0.30 appended blit_rect to ag_display_ops_t: a rectangle of pixels the
+ *      kernel owns, for a panel whose glass is larger than any framebuffer
+ *      the machine driving it can afford.
+ * 0.31 appended gfx->present: an application's own pixels on the panel, for a
+ *      machine where the system framebuffer is absent or the wrong shape.
+ * 0.32 appended fs->map / fs->unmap: a file's bytes at an address, read only,
+ *      staged into flash - for data too big to hold and too fixed to need to.
+ * 0.33 appended net->resolve: a name into an address.  Without it every
+ *      connect() in an application needs a dotted quad, which is not how
+ *      anything on a network is written down.
+ * 0.34 added api->ble (NULL unless the build has the BLE peripheral): a small
+ *      BLE-MIDI surface - advertise as a MIDI device and send notes - so a
+ *      graphical app can be a MIDI controller a phone plays.
+ * 0.35 made api->power stop being NULL: what the machine is set to, and a
+ *      transition an application is told about before it happens.  With
+ *      AG_IOC_DISPLAY_BACKLIGHT beside it, for the panel driver that owns the
+ *      pin the light is on.
+ * 0.36 power: a transition now says who asked for it.  An automatic one is
+ *      advisory and harmless; one a person typed is an order, and a process
+ *      that does not answer that it is fit for the new mode is ended.
+ *      power->declare replaces power->hold, and the answer that used to veto
+ *      (HOLD) is now the admission that gets a process killed (UNFIT).
+ * 0.37 power: AG_POWER_CRUISE, a step down that costs a third of the speed and
+ *      nothing else, taken by the system whenever no process has said it needs
+ *      the full clock.  It renumbers ag_power_mode_t, which is why it is worth
+ *      a line of its own: ECO and DOZE moved up by one.
+ * 0.38 radio, given to applications past the one thing BLE-MIDI already gave:
+ *      api->ble grows the general central and peripheral it always wrapped in
+ *      the shell - observe the air, connect to a device and read/write any
+ *      characteristic, or be a device a phone reads and writes (NULL entries
+ *      unless the build has CONFIG_ARGON_BLE_CENTRAL / _PERIPHERAL).  And a new
+ *      api->wifimon appears - promiscuous capture, channel, filter, and raw
+ *      802.11 injection - NULL unless CONFIG_ARGON_NET_WIFI_MON, which is off by
+ *      default: the frame-forging radio is a build-time choice, and the ABI slot
+ *      follows it.  Wi-Fi station/AP control and ESP-NOW stay shell-only on
+ *      purpose (see docs/04-roadmap.md): the link is the system's to raise, and
+ *      an application already has TCP, DNS and its own address over it.
+ * 0.39 api->wifi: the rest of the radio, past capture and injection - the same
+ *      station, access point and ESP-NOW the shell drives, now an application's
+ *      to drive too.  0.38 held these back "on purpose"; a graphical Wi-Fi tool
+ *      is the application that changes the calculus, because it is the thing a
+ *      person points at the air with, and it cannot be one if raising the link
+ *      is somebody else's job.  Station (scan/connect/disconnect/status) is
+ *      present whenever the build has the radio (CONFIG_ARGON_NET_WIFI); the
+ *      access-point entries are NULL without CONFIG_ARGON_NET_WIFI_AP and the
+ *      ESP-NOW entries NULL without CONFIG_ARGON_NET_ESPNOW - probe with AG_HAS.
+ *      api->wifi itself is NULL on a board with no radio at all (QEMU).
+ * 0.40 ble->adv_raw: raw, non-connectable BLE advertising - a caller-built
+ *      payload under a spoofed random address, rebroadcast on every call.  It is
+ *      to BLE advertising what wifimon->tx_raw is to 802.11: the injection half
+ *      of the radio, for a tool that forges the advertisements a phone shows as
+ *      pairing pop-ups.  NULL without CONFIG_ARGON_BLE_PERIPHERAL.
+ * 0.41 api->cam: the DVP capture engine (LCD_CAM + DMA) as a primitive a
+ *      loadable sensor driver drives, so the sensor's register tables live in a
+ *      .SYS rather than in the image.  The firmware carries only the thin
+ *      transport; the driver configures it with the sensor's pins/format and
+ *      pulls frames.  NULL without CONFIG_ARGON_ENABLE_CAMERA (off by default -
+ *      no camera in QEMU, and it is a board's peripheral, not the chip's).
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 26u
+#define AG_ABI_MINOR 41u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -293,6 +356,29 @@ typedef struct ag_fs_api {
     ag_err_t (*chdir)(const char *path);
 
     ag_err_t (*mountinfo)(const char *mount, ag_fsinfo_t *out);
+
+    /*
+     * ABI 0.32: a file's bytes at an address, read only.
+     *
+     * For data that is too big to hold in memory and never changes: a cartridge,
+     * a font, a table of impulse responses.  The bytes are staged into flash and
+     * mapped where the processor's own cache fetches them, so the cost in memory
+     * is nothing - which on a board with sixty kilobytes free is the difference
+     * between running a half-megabyte cartridge and not.
+     *
+     * Read only.  Writing through the pointer faults; it does not change
+     * anything and it does not touch the file.
+     *
+     * Not free and not lazy: map() copies the whole file into flash before it
+     * returns, so it costs as long as writing that much flash and wears it a
+     * little.  Worth it for something read a great many times, not for a
+     * configuration file.  A second call after unmap copies again.
+     *
+     * -AG_ENFILE when too many mappings are live, -AG_ENOSPC when the flash area
+     * cannot hold it, -AG_ENOSYS on a machine with nowhere to stage it.
+     */
+    ag_err_t (*map)(const char *path, const void **out, uint64_t *out_len);
+    ag_err_t (*unmap)(const void *ptr);
 } ag_fs_api_t;
 
 /* ------------------------------------------------------------------------ */
@@ -492,6 +578,39 @@ typedef struct {
     int16_t y;
 } ag_point_t;
 
+/*
+ * A rectangle of somebody else's pixels (ABI 0.30).
+ *
+ * The memory belongs to the caller and outlives the call; the driver reads from
+ * it and returns.  Format is RGB565 in the machine's own byte order, which on
+ * every part this runs on is little endian - a panel that wants the other order
+ * swaps as it sends, because it is streaming the bytes anyway.
+ *
+ * `px` is the first pixel *of the rectangle*, not of the surface.
+ *
+ * That is worth being exact about, because the obvious alternative - the corner
+ * of the whole picture, with x and y as an offset into it - quietly requires the
+ * caller to hold the whole picture in memory.  A renderer that produces sixteen
+ * rows at a time, which is what an emulator's scanline loop produces and what
+ * fits on a machine like this, has no such corner to point at.  With the
+ * rectangle's own origin it hands over the band it just filled and says where
+ * on the screen it goes.
+ *
+ * Both the whole surface and the changed part are described, because a driver
+ * cannot place the one without knowing the other: a screen 320 pixels wide
+ * showing a surface of 160 has a choice to make about scale and margins, and it
+ * has to make the same choice for every rectangle or the picture tears itself
+ * apart.  So surf_w/surf_h are the picture, x/y/w/h are the part, and px is
+ * where that part's pixels actually are.
+ */
+typedef struct {
+    const void *px;     /* first pixel of the rectangle, RGB565              */
+    uint32_t    stride; /* bytes between rows of px                          */
+    uint16_t    surf_w; /* the whole picture, for placement                  */
+    uint16_t    surf_h;
+    uint16_t    x, y, w, h; /* where the rectangle is in it, and how big     */
+} ag_blit_t;
+
 typedef struct ag_gfx_api {
     uint32_t size;
 
@@ -577,7 +696,68 @@ typedef struct ag_gfx_api {
      */
     void (*poly_uv)(int16_t u, int16_t v);
     void (*poly_fill_tex)(void);
+
+    /*
+     * ABI 0.31: the application's own pixels, straight onto the panel.
+     *
+     * acquire() hands out the system's framebuffer - one surface, shared by
+     * every application, sized once at boot for all of them.  That is the right
+     * arrangement until the surface is a fifth of all the memory there is: an
+     * emulator with a 160x144 screen, sixteen kilobytes of video memory and a
+     * cartridge to hold cannot pay for the system's surface as well as its own,
+     * and the system's is the one it cannot use.
+     *
+     * So it may bring its own.  The caller owns the memory, says how big the
+     * whole picture is and which part of it changed; the panel driver places
+     * it, at whole-number scale, centred (see blit_rect in ag_display_ops_t).
+     * Nothing is copied on the way - the pixels go from the caller's buffer to
+     * the panel - so the buffer must not be a stack local that has gone by the
+     * time this returns, and it does not return until they are sent.
+     *
+     * The display still has to be acquired: this says who owns the pixels, not
+     * who owns the screen.  Where the system has no surface at all
+     * ([display] driver = panel), acquire() still works and reports fb = NULL
+     * with the panel's own size, and this is then the only way to draw.
+     *
+     * -AG_ENODEV when nothing can show it, -AG_EPERM when the display belongs
+     * to somebody else.
+     */
+    ag_err_t (*present)(const ag_blit_t *b);
 } ag_gfx_api_t;
+
+/*
+ * Class vtable for AG_DEV_INPUT devices that have to be asked (ABI 0.28).
+ *
+ * A touchscreen on a slow bus does not interrupt with an event; it holds a
+ * voltage, and somebody has to read it.  Doing that from the driver would need
+ * a task inside a loadable module - the one thing a .SYS has no way to own -
+ * so the kernel asks instead, from the console tick it already runs.
+ *
+ * poll() fills at most `max` events and returns how many, or a negative error.
+ * Zero is the normal answer and must be cheap: it is called ten times a second
+ * forever.  The events go into the same queue the terminal decoder feeds, so
+ * nothing above can tell a finger from a mouse on the other end of a cable.
+ *
+ * Coordinates are console cells, like the terminal's mouse reports, because
+ * what is on this kind of screen is the console.  A driver for a panel with a
+ * framebuffer under it would want pixels; there is no such panel yet, and
+ * inventing the second convention before there is something to point at is how
+ * both end up wrong.
+ */
+typedef struct ag_input_ops {
+    uint32_t size;
+    int32_t (*poll)(ag_handle_t h, ag_event_t *out, uint32_t max);
+} ag_input_ops_t;
+
+/*
+ * One cell of the text console: the byte on the screen and its colours, high
+ * nibble background, low nibble foreground, as they have been since CGA.  What
+ * the byte means is the code page's business (con->codepage).
+ */
+typedef struct {
+    uint8_t ch;
+    uint8_t attr;
+} ag_textcell_t;
 
 /*
  * Class vtable for AG_DEV_DISPLAY devices, returned by dev->ops(h).
@@ -595,6 +775,55 @@ typedef struct ag_display_ops {
     void (*flush)(ag_handle_t h, uint16_t x, uint16_t y, uint16_t w,
                   uint16_t hgt);
     void (*swap)(ag_handle_t h);
+
+    /*
+     * ABI 0.27: the console as characters rather than as pixels.
+     *
+     * A panel on a chip with no PSRAM does not get a framebuffer: 320x240 in
+     * RGB565 is 150 KB, and the largest block of memory this class of board
+     * has free is around a hundred.  The whole of acquire/flush/swap above
+     * assumes a surface that does not exist there.  So the kernel sends the
+     * console the other way - as the cells that changed - and the driver
+     * turns them into pixels a row at a time, with a buffer the size of one
+     * row of text and no more.
+     *
+     * The kernel calls these from the console tick, on the console task, with
+     * `h` set to zero: it holds the device, not an open handle.  A driver that
+     * has a framebuffer leaves all three NULL and gets the pixel path instead.
+     *
+     * text_info answers how many cells fit; the console is resized to that at
+     * boot when the board asks for it.  text_row is called for rows that
+     * changed, with `count` cells starting at column zero.  text_cursor moves
+     * the caret and is called only when it has moved or blinked - it carries
+     * the cell underneath, because a caret drawn as a blank would rub out the
+     * character it is standing on and the driver has nowhere to look it up.
+     */
+    ag_err_t (*text_info)(ag_handle_t h, uint16_t *cols, uint16_t *rows);
+    void (*text_row)(ag_handle_t h, uint16_t row, const ag_textcell_t *cells,
+                     uint16_t count);
+    void (*text_cursor)(ag_handle_t h, uint16_t col, uint16_t row,
+                        ag_textcell_t under, bool visible);
+
+    /*
+     * ABI 0.30: pixels, for the same kind of panel as text_row above.
+     *
+     * acquire/flush/swap hand a driver a framebuffer it owns.  This is the
+     * other way round and for the other kind of machine: the kernel owns the
+     * surface - as large as its heap will bear, which here is a quarter of the
+     * glass - and the driver is told which part of it changed.  The driver
+     * decides how that surface lands on the panel; scaling it by a whole
+     * number and centring what is left is what the one in tree does.
+     *
+     * Called on the task that flushed, with `h` zero and the device registry
+     * held.  A driver with a framebuffer of its own leaves this NULL.
+     *
+     * Must not print, and neither must text_row or text_cursor above.  The
+     * registry is held here, while the console task takes the console first
+     * and the registry second - so a driver that reaches for the console from
+     * inside one of these closes the ring and stops the machine.  A driver
+     * with something to say says it from ag_driver_init.
+     */
+    void (*blit_rect)(ag_handle_t h, const ag_blit_t *b);
 } ag_display_ops_t;
 
 /* ------------------------------------------------------------------------ */
@@ -649,6 +878,18 @@ enum ag_ioctl_cmd {
     AG_IOC_GEOMETRY = AG_IOC(AG_DEV_STORAGE, 1), /* arg: ag_geometry_t      */
 
     /* PCM devices (/dev/pcmnull, loadable pcmvirt, …): arg ag_audio_fmt_t */
+    /*
+     * ABI 0.35: arg is a uint8_t, 0..100 - how bright the panel should be.
+     * Zero means off, and off means as dark as this board can be made: on a
+     * hand-held with a lit screen the backlight is the largest single load
+     * there is, larger than the processor at full speed, so this is the one
+     * call in the power path whose effect a person can see.
+     *
+     * A driver whose panel has no controllable light answers -AG_ENOTSUP,
+     * which is not an error - it is the answer.
+     */
+    AG_IOC_DISPLAY_BACKLIGHT = AG_IOC(AG_DEV_DISPLAY, 1),
+
     AG_IOC_AUDIO_GETFMT = AG_IOC(AG_DEV_AUDIO, 1),
     AG_IOC_AUDIO_SETFMT = AG_IOC(AG_DEV_AUDIO, 2),
     /* Optional: arg ag_audio_stats_t (pcmvirt/pcmmix; pcmnull returns zeros). */
@@ -802,6 +1043,15 @@ typedef struct ag_io_api {
     int32_t (*adc_read)(int channel);
     ag_err_t (*pwm_config)(int pin, uint32_t freq_hz, uint8_t resolution_bits);
     ag_err_t (*pwm_set)(int pin, uint32_t duty);
+
+    /*
+     * ABI 0.29: the clock for one chip select, overriding the bus speed from
+     * BOARD.CFG.  A bus is a set of wires and the chips on it rarely agree
+     * about speed: this board's panel takes 40 MHz and the touch controller
+     * sharing those same three wires stops answering above about two.  Set it
+     * once, before the first transfer to that chip.
+     */
+    ag_err_t (*spi_config)(int bus, int cs, uint32_t khz);
 } ag_io_api_t;
 
 /* ------------------------------------------------------------------------ */
@@ -1006,6 +1256,17 @@ typedef struct ag_net_api {
 
     /* ABI 0.13: O_NONBLOCK.  send/recv then return -AG_EAGAIN instead of stalling. */
     ag_err_t (*set_nonblock)(ag_handle_t sock, bool on);
+
+    /*
+     * ABI 0.33: a name into a host-order IPv4 address.  A dotted quad is
+     * answered without asking anything, so this is also the way to read one.
+     *
+     * Blocks for as long as the resolver takes - seconds, when a server is
+     * slow - and there is no timeout to pass, because the stack that owns the
+     * resolver does not offer one.  -AG_ENOENT for a name that does not
+     * resolve, -AG_EAGAIN before the interface has an address of its own.
+     */
+    ag_err_t (*resolve)(const char *host, uint32_t *addr_out);
 } ag_net_api_t;
 
 /* ------------------------------------------------------------------------ */
@@ -1053,6 +1314,607 @@ typedef struct ag_audio_api {
 } ag_audio_api_t;
 
 /* ------------------------------------------------------------------------ */
+/* ble - Bluetooth Low Energy for applications (ABI 0.34)                   */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * BLE-MIDI was the first radio an application got (0.34), because a MIDI
+ * controller was the first application that wanted one.  0.38 gives it the rest,
+ * the same general central and peripheral the shell has driven and the board has
+ * proven end to end: observe what is in range, connect to a device and read or
+ * write any characteristic, or be a device a phone reads and writes.  The port
+ * carries all of it (argon/port/ble.h); this is the appended, feature-probed
+ * surface of it - entries are NULL where the build left a role out.
+ */
+
+/* How much text a name, a UUID, or one characteristic value can be. */
+#define AG_BLE_NAME_MAX  31
+#define AG_BLE_UUIDS_MAX 6  /* 16-bit service UUIDs kept per advertised device */
+#define AG_BLE_UUID_STR  37 /* a UUID as text, 128-bit form + terminator       */
+#define AG_BLE_VAL_MAX   256 /* most of one characteristic value, bytes         */
+
+/* Characteristic properties, the bits GATT advertises about what you may do. */
+#define AG_BLE_PROP_READ   0x02
+#define AG_BLE_PROP_WNORSP 0x04 /* write without a response                    */
+#define AG_BLE_PROP_WRITE  0x08
+#define AG_BLE_PROP_NOTIFY 0x10
+#define AG_BLE_PROP_INDIC  0x20
+
+/* One discovered service: a range of handles and what it is. */
+typedef struct {
+    char     uuid[AG_BLE_UUID_STR];
+    uint16_t start; /* first handle of the service                             */
+    uint16_t end;   /* last handle of the service                              */
+} ag_ble_svc_t;
+
+/* One discovered characteristic.  `handle` is the value handle - the one
+ * read()/write() take, not the declaration. */
+typedef struct {
+    char     uuid[AG_BLE_UUID_STR];
+    uint16_t handle;
+    uint8_t  props; /* AG_BLE_PROP_* bitmask                                   */
+} ag_ble_chr_t;
+
+/*
+ * One device the observer saw, as much of it as the advertisement carried.  A
+ * field is zero when the advertisement did not have it: no name is an empty
+ * string, no appearance is 0, no manufacturer is company 0xffff.  addr_type is
+ * the port's own numbering; pass it back to connect() unchanged.
+ */
+typedef struct {
+    uint8_t  addr[6];
+    int      addr_type;
+    int8_t   rssi;
+    bool     connectable;
+    char     name[AG_BLE_NAME_MAX + 1];
+    uint16_t appearance;
+    uint8_t  flags;
+    uint8_t  n_uuids;
+    uint16_t uuids[AG_BLE_UUIDS_MAX];
+    uint16_t company;
+} ag_ble_dev_t;
+
+/* The peripheral's standing, from adv_status(). */
+typedef struct {
+    bool     advertising;
+    bool     connected; /* a client is connected right now                     */
+    uint32_t writes;    /* how many writes have arrived since adv_start        */
+    uint32_t read_len;  /* length of the value clients read                    */
+} ag_ble_adv_status_t;
+
+typedef struct ag_ble_api {
+    uint32_t size;
+
+    /*
+     * Advertise as a BLE-MIDI device under `name` (kept short - it shares a
+     * 31-byte advertisement with a 128-bit service UUID).  The radio is started
+     * if it was not.  Idempotent; call again to change the name.
+     */
+    ag_err_t (*midi_advertise)(const char *name);
+
+    /*
+     * One MIDI channel-voice message: `status` (0x90|channel for note-on,
+     * 0x80|channel for note-off), then two data bytes (note, velocity).  A
+     * note-on with velocity 0 is the customary note-off.  -AG_ENODEV until a
+     * client has connected and subscribed - there is nowhere to send until
+     * then, and midi_ready() says when that is.
+     */
+    ag_err_t (*midi_send)(uint8_t status, uint8_t data1, uint8_t data2);
+
+    /* True once a client is connected and listening for notes. */
+    bool (*midi_ready)(void);
+
+    /* Stop advertising and drop any client. */
+    ag_err_t (*adv_stop)(void);
+
+    /*
+     * ABI 0.38 - the peripheral, past MIDI: the board as a plain device a phone
+     * or PC connects to.  NULL unless the build has CONFIG_ARGON_BLE_PERIPHERAL.
+     * One custom service: a value clients read (adv_set_read sets it) and one
+     * they write (adv_last_write returns the most recent).  adv_start advertises
+     * connectably and forever - a client that leaves does not stop it - and
+     * starts the radio if it was off.
+     */
+    ag_err_t (*adv_start)(const char *name);
+    void     (*adv_set_read)(const void *data, uint32_t len);
+    int32_t  (*adv_last_write)(uint8_t *out, uint32_t max);
+    ag_err_t (*adv_status)(ag_ble_adv_status_t *out);
+
+    /*
+     * ABI 0.38 - the central: observe, then connect and talk.  NULL unless the
+     * build has CONFIG_ARGON_BLE_CENTRAL.  There is one radio, so one of these
+     * at a time: scan is -AG_EBUSY while connected, connect is -AG_EBUSY while
+     * scanning, and both are -AG_ENODEV with the radio off (scan/connect start
+     * it).  scan blocks for `seconds` (0 = a sensible default) - a scan is a
+     * listening window with nothing to return until it closes.
+     *
+     * connect blocks until the link is up or the attempt failed.  discover walks
+     * every service and characteristic into the tables services()/chars() read;
+     * it blocks a second or two on a device with many attributes.  read returns
+     * the bytes placed in `out` (truncated at the ATT MTU), write with
+     * with_response waits for the peer's acknowledgement - without, it returns
+     * once queued and a failure is silent, which is what "without a response"
+     * means.  A peer that drops the link is not hidden: connected() goes false
+     * and the next read/write is -AG_ENODEV.  Nothing here reconnects - the
+     * session is the application's to own.
+     */
+    ag_err_t (*scan)(ag_ble_dev_t *out, uint32_t max, uint32_t *found,
+                     uint32_t seconds);
+    ag_err_t (*connect)(const uint8_t addr[6], int addr_type,
+                        uint32_t timeout_ms);
+    ag_err_t (*disconnect)(void);
+    bool     (*connected)(void);
+    ag_err_t (*discover)(uint32_t timeout_ms);
+    uint32_t (*services)(ag_ble_svc_t *out, uint32_t max);
+    uint32_t (*chars)(ag_ble_chr_t *out, uint32_t max);
+    int32_t  (*read)(uint16_t handle, uint8_t *out, uint32_t max,
+                     uint32_t timeout_ms);
+    ag_err_t (*write)(uint16_t handle, const void *data, uint32_t len,
+                      bool with_response, uint32_t timeout_ms);
+
+    /*
+     * ABI 0.40 - raw advertising injection (NULL without the peripheral build).
+     * addr is a six-byte address to spoof (forced to static-random), or NULL to
+     * keep the board's own; data/len is one legacy advertisement (<= 31 bytes),
+     * broadcast non-connectably.  Call it in a loop with a fresh address and
+     * payload to put a crowd of fake devices in the air.  The peripheral's
+     * adv_start and this share one advertising instance - use one at a time.
+     */
+    ag_err_t (*adv_raw)(const uint8_t addr[6], const void *data, uint32_t len);
+} ag_ble_api_t;
+
+/* ------------------------------------------------------------------------ */
+/* power - how hard the machine is being driven, and who gets told          */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * ArgonOS does not save power behind an application's back, and it does not let
+ * an application stop it either.  Which of those two matters more depends on
+ * who asked, so a transition carries that with it.
+ *
+ *   AG_POWER_AUTO - the system noticed nobody was using it.  Advisory: every
+ *                   application is told, nothing is required of any of them,
+ *                   and nothing is ended.  It also refuses to do the part that
+ *                   would break something - see AG_POWER_FIT_FULL_ONLY below -
+ *                   because saving power was never worth breaking work for.
+ *
+ *   AG_POWER_USER - a person typed it.  That is an order, not a proposal: an
+ *                   application has the grace period to answer that it is fit
+ *                   for the new mode, and one that does not is **ended**.
+ *
+ * The second rule sounds harsh and is the kind one.  The alternative is an
+ * application that goes on running at a third of the clock it was written for:
+ * an audio path that clicks, a controller that misses its deadline, a log with
+ * nothing in it to say why.  A process that is stopped, with a line in the
+ * journal naming it and its own reason, is a fault somebody can act on.
+ *
+ * So an application that means to survive `power eco` answers - which is one
+ * call in a loop it already has - or says once, with declare(), that any mode
+ * suits it.  An application that cannot work slowly says that instead, and is
+ * ended rather than left to misbehave.
+ */
+
+/*
+ * The ladder, and how much of the machine each rung gives up.  Ordered: a
+ * larger value is less machine, and the system compares them that way.
+ *
+ * The first step down is different in kind from the rest, and the difference is
+ * what makes it automatic.  On this family the processor runs from the PLL at
+ * 240, 160 or 80 MHz, and the peripheral bus stays at 80 MHz through all three:
+ * dropping to 160 changes how fast arithmetic happens and nothing else - no
+ * bus, no baud rate, no divider anywhere.  It costs a third of the speed, and
+ * what it can break is only work that was already close to the edge.
+ *
+ * So AG_POWER_CRUISE is taken on silence: unless some process has said it needs
+ * the full clock, the system assumes two thirds of it will do.  The lower rungs
+ * keep the opposite rule - there, silence is not consent and a person's command
+ * ends what has not answered - because a third of the clock is a different
+ * proposition, and because those rungs are only reached deliberately or after
+ * minutes of nobody touching the machine.
+ *
+ * A system that would rather be asked than assume can invert the first rule
+ * with [power] cruise_when = declared in SYSTEM.CFG, and then only processes
+ * that declared AG_POWER_FIT_ANY let the machine cruise.
+ */
+typedef enum {
+    AG_POWER_FULL = 0, /* the clock at its maximum, the screen lit         */
+    AG_POWER_CRUISE,   /* a step down nobody objected to; 160 MHz here     */
+    AG_POWER_ECO,      /* the clock pinned low                             */
+    AG_POWER_DOZE,     /* the clock pinned low and the screen dark         */
+} ag_power_mode_t;
+
+typedef enum {
+    AG_POWER_AUTO = 0, /* the idle timer: advisory, kills nothing          */
+    AG_POWER_USER,     /* a person: mandatory, ends what cannot comply     */
+} ag_power_cause_t;
+
+typedef enum {
+    AG_POWER_ANSWER_NONE = 0, /* has not answered this transition           */
+    AG_POWER_OK,              /* fit: carrying on                           */
+    AG_POWER_PARKED,          /* fit: stopped whatever needed the clock     */
+    AG_POWER_UNFIT,           /* not designed for it; end me instead        */
+} ag_power_answer_t;
+
+/*
+ * Said once instead of answered every time.  It survives until the process
+ * does, and it is what the two kinds of application that never poll should
+ * use: a tool that plainly does not care, and a realtime path that plainly
+ * does.
+ */
+typedef enum {
+    /* The default: I answer each transition myself.  On a transition a person
+     * asked for, no answer means not fit, and the process is ended. */
+    AG_POWER_FIT_ASK = 0,
+    /* Any mode suits me; stop asking.  Never ended for a mode change. */
+    AG_POWER_FIT_ANY,
+    /* I need the full clock.  An automatic transition then leaves the clock
+     * alone; one a person typed ends this process, and says whose reason it
+     * was. */
+    AG_POWER_FIT_FULL_ONLY,
+} ag_power_fitness_t;
+
+/*
+ * Long enough for a sentence a person can act on ("22 kHz tract, 87% of a
+ * core"), short enough that one row per process fits in the internal memory
+ * this class of machine has left over.  Anything longer is truncated rather
+ * than refused.
+ */
+#define AG_POWER_WHY_MAX 32
+
+typedef struct {
+    uint8_t mode;    /* ag_power_mode_t - what the machine is now          */
+    uint8_t pending; /* what it is about to be; == mode when nothing is    */
+    uint8_t cause;   /* ag_power_cause_t of the pending transition         */
+    bool    screen_on;
+    bool    pending_screen_on;
+
+    /*
+     * cpu_mhz is read from the machine each time and is the only field here
+     * that is not a setting: where scaling is available it moves on its own
+     * between the two numbers below.  min == max means the clock is pinned.
+     */
+    uint32_t cpu_mhz;
+    uint32_t cpu_min_mhz;
+    uint32_t cpu_max_mhz;
+
+    /*
+     * What the band will be if the pending transition goes through - the
+     * numbers, not just the name of the mode, because the number is what an
+     * application needs in order to answer.  A synthesiser that measured its
+     * own load knows whether it fits in eighty megahertz; "eco" tells it
+     * nothing.  Equal to the fields above when nothing is pending.
+     */
+    uint32_t pending_cpu_min_mhz;
+    uint32_t pending_cpu_max_mhz;
+
+    /*
+     * Milliseconds left to answer, zero when nothing is pending.  An
+     * application polling once a frame has tens of frames to decide in.  On an
+     * AG_POWER_USER transition this is also how long it has to live if it does
+     * not answer.
+     */
+    uint32_t grace_ms;
+} ag_power_status_t;
+
+typedef struct ag_power_api {
+    uint32_t size;
+
+    /* Cheap; meant to be called once round an application's own loop. */
+    ag_err_t (*status)(ag_power_status_t *out);
+
+    /*
+     * Answer the pending transition.  `why` is for AG_POWER_UNFIT and is what
+     * the person at the console is shown; NULL otherwise.  -AG_ENOENT when
+     * nothing is pending, which is the normal answer to a late poll.
+     */
+    ag_err_t (*answer)(ag_power_answer_t a, const char *why);
+
+    /*
+     * A standing answer, for an application that would rather say once than
+     * answer every time.  `why` is shown by `power` and in the journal when a
+     * declaration of AG_POWER_FIT_FULL_ONLY costs this process its life.
+     *
+     * AG_POWER_FIT_FULL_ONLY takes effect before this call returns: if the
+     * system was cruising, the clock is back at its maximum by the time the
+     * application does anything else.  That is the point of declaring it in the
+     * first line of main rather than answering later - the first buffer is as
+     * real as the thousandth.
+     *
+     * It goes when the process does, like every other resource, so a program
+     * that crashes cannot leave the machine pinned at full speed for ever.
+     */
+    ag_err_t (*declare)(ag_power_fitness_t fitness, const char *why);
+} ag_power_api_t;
+
+/* ------------------------------------------------------------------------ */
+/* wifimon - promiscuous capture and raw 802.11 injection (ABI 0.38)        */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * The radio on no network at all: turned to a channel, handing up every frame
+ * it carries, and putting frames of the application's own making into the air.
+ * This is the app-facing side of the same primitives the shell's `mon` uses -
+ * capture and inject, nothing that knows what a beacon or a deauth is.  What a
+ * frame means, and whether one ought to be sent, is the application's to decide,
+ * the way the shell decides it for a person.
+ *
+ * api->wifimon is NULL unless the build set CONFIG_ARGON_NET_WIFI_MON, which is
+ * off by default: a board that forges frames is a build-time choice, so the ABI
+ * slot is one too.  An application probes `if (ag_api()->wifimon)` and adapts.
+ */
+
+/* Which kinds of frame are handed up, a mask for filter(); they combine. */
+#define AG_WIFIMON_MGMT 0x1u /* beacons, probes, auth, deauth, assoc         */
+#define AG_WIFIMON_CTRL 0x2u /* RTS/CTS/ACK and the rest of the fabric       */
+#define AG_WIFIMON_DATA 0x4u /* the frames that actually carry something      */
+#define AG_WIFIMON_MISC 0x8u /* everything the radio could not classify       */
+#define AG_WIFIMON_ALL  0xfu
+
+#define AG_WIFIMON_TX_MAX 1500u /* the largest raw frame this layer injects    */
+#define AG_WIFIMON_SNAP   128u  /* how much of a frame recv() can hand back    */
+
+/* Index into the counters[] array from ag_wifimon_api_t.counters(). */
+enum {
+    AG_WIFIMON_C_TOTAL = 0,
+    AG_WIFIMON_C_MGMT,
+    AG_WIFIMON_C_CTRL,
+    AG_WIFIMON_C_DATA,
+    AG_WIFIMON_C_MISC,
+    AG_WIFIMON_C_N
+};
+
+/*
+ * What recv() reports about the frame it hands back, beside the bytes: how
+ * strong it was, which channel it came in on, and its real length on the air -
+ * which may be larger than the prefix recv() could copy (AG_WIFIMON_SNAP).
+ */
+typedef struct {
+    int8_t   rssi;
+    uint8_t  channel;
+    uint32_t length;
+} ag_wifimon_frame_t;
+
+typedef struct ag_wifimon_api {
+    uint32_t size;
+
+    /* Enter/leave promiscuous mode.  start() puts the radio on no network and
+     * needs it powered; a joined station leaves its network here. */
+    ag_err_t (*start)(void);
+    ag_err_t (*stop)(void);
+
+    /* The one channel the receiver hears; 1..14.  Sweep by setting each. */
+    ag_err_t (*channel)(uint8_t primary);
+    uint8_t  (*channel_get)(void);
+
+    /* Which frame types reach recv() at all; a mask of AG_WIFIMON_* bits. */
+    ag_err_t (*filter)(uint32_t mask);
+
+    /*
+     * Pop one captured frame into `buf` (up to `max`, at most AG_WIFIMON_SNAP
+     * bytes are kept per frame).  Returns the byte count, or -AG_EAGAIN when
+     * nothing arrived within timeout_ms (0 polls).  `meta`, when not NULL, gets
+     * the rssi/channel and the frame's real length.
+     */
+    int32_t (*recv)(void *buf, uint32_t max, ag_wifimon_frame_t *meta,
+                    uint32_t timeout_ms);
+
+    /*
+     * Put one raw frame on the current channel: a complete 802.11 frame without
+     * the trailing FCS, which the radio appends.  Returns when the frame is
+     * handed to the radio, not when anything received it.
+     */
+    ag_err_t (*tx_raw)(const void *frame, uint32_t len);
+
+    /* Running frame counts by type (AG_WIFIMON_C_* index it) and how many
+     * captured frames were dropped because the ring was full. */
+    void     (*counters)(uint32_t out[AG_WIFIMON_C_N]);
+    uint32_t (*dropped)(void);
+} ag_wifimon_api_t;
+
+/* ------------------------------------------------------------------------ */
+/* wifi - station, access point and ESP-NOW for applications (ABI 0.39)      */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * The radio as a network, not as raw air.  wifimon (above) is the receiver on
+ * one channel and the frame forge; this is the rest of what the shell's `wifi`
+ * and `espnow` do - find the networks in reach and join one, offer a network of
+ * the board's own, or throw datagrams straight at another board.  It is the same
+ * port underneath (argon/port/wifi.h, argon/port/espnow.h); this is the
+ * feature-probed, GPL-free face of it an application links against.
+ *
+ * One radio, so the usual exclusions hold and the port enforces them: a scan is
+ * -AG_EBUSY while an association is in flight, the access point is forced onto a
+ * joined station's channel, and ESP-NOW rides whatever channel the radio is on.
+ *
+ * Bringing the radio up costs a ~36 KB contiguous slice of internal RAM on a
+ * board with about sixty free, so an application that means to use the radio is
+ * usually launched after `wifi on` has already raised it - start() here is the
+ * same bring-up and will fail -AG_ENOMEM from inside a large resident app, the
+ * way it does for wifimon.  scan/connect/ap_start/espnow_start all raise the
+ * radio if it is down, so start() is only needed to raise it without doing
+ * anything else yet.
+ */
+
+#define AG_WIFI_SSID_MAX 32 /* an SSID is at most 32 bytes, not NUL-counted   */
+#define AG_WIFI_PASS_MAX 63 /* a WPA key is 8..63 characters                  */
+
+/* Security of a network, ag_wifi_ap_t.auth.  Ordered as the port orders it. */
+enum {
+    AG_WIFI_SEC_OPEN = 0,
+    AG_WIFI_SEC_WEP,
+    AG_WIFI_SEC_WPA,
+    AG_WIFI_SEC_WPA2,
+    AG_WIFI_SEC_WPA3,
+    AG_WIFI_SEC_ENTERPRISE,
+    AG_WIFI_SEC_OTHER,
+};
+
+/* Station link state, ag_wifi_status_t.state. */
+enum {
+    AG_WIFI_ST_OFF = 0,   /* radio not started                               */
+    AG_WIFI_ST_IDLE,      /* on, joined to nothing                           */
+    AG_WIFI_ST_JOINING,   /* association or DHCP in progress                 */
+    AG_WIFI_ST_JOINED,    /* associated; an address may still be coming      */
+};
+
+/* ESP-NOW limits, mirroring the port. */
+#define AG_WIFI_ESPNOW_MAX 250 /* one datagram's payload, bytes              */
+#define AG_WIFI_ESPNOW_KEY 16  /* an encryption key, exactly this many bytes */
+
+/* One network a scan found. */
+typedef struct {
+    char    ssid[AG_WIFI_SSID_MAX + 1];
+    uint8_t bssid[6];
+    int8_t  rssi;    /* dBm, negative                                        */
+    uint8_t channel;
+    uint8_t auth;    /* AG_WIFI_SEC_*                                         */
+} ag_wifi_ap_t;
+
+/* Where the station half stands.  The key is never reported. */
+typedef struct {
+    uint8_t  state;      /* AG_WIFI_ST_*                                     */
+    char     ssid[AG_WIFI_SSID_MAX + 1]; /* joined or being joined          */
+    uint8_t  bssid[6];   /* the access point actually joined, or zeros       */
+    bool     pinned;     /* this access point was asked for by name          */
+    int8_t   rssi;
+    uint8_t  channel;
+    uint32_t attempts;   /* association attempts since the last join         */
+    int32_t  last_reason;/* the port's own disconnect reason code            */
+} ag_wifi_status_t;
+
+/* What the access-point half is offering, when one is up. */
+typedef struct {
+    bool     on;
+    char     ssid[AG_WIFI_SSID_MAX + 1];
+    uint8_t  channel;
+    bool     hidden;
+    bool     secured;    /* WPA2 with a key, not open                        */
+    uint32_t clients;    /* stations associated right now                    */
+    uint32_t ip;         /* the board's own address on it, host-order IPv4   */
+} ag_wifi_ap_status_t;
+
+typedef struct ag_wifi_api {
+    uint32_t size;
+
+    /* ---- station ---- */
+
+    /* Power the radio on, joined to nothing.  Idempotent; -AG_ENOMEM when the
+     * ~36 KB the driver needs is not free (see the note above). */
+    ag_err_t (*start)(void);
+    /* Power the radio off and give its memory back. */
+    ag_err_t (*stop)(void);
+
+    /*
+     * Block a second or two and fill `out` with up to `max` networks; `found`
+     * gets the number seen, which may exceed `max`.  Raises the radio if it is
+     * down.  -AG_EBUSY while an association attempt is in flight.
+     */
+    ag_err_t (*scan)(ag_wifi_ap_t *out, uint32_t max, uint32_t *found);
+
+    /*
+     * Join a network.  Returns as soon as the attempt is made, not when it has
+     * succeeded - poll status() (or net->ready() for an address).  bssid NULL
+     * joins any access point of that name; six bytes pin one.  An empty pass
+     * for the network already set means the key already held, not no key.
+     */
+    ag_err_t (*connect)(const char *ssid, const char *pass,
+                        const uint8_t bssid[6]);
+    ag_err_t (*disconnect)(void);
+    ag_err_t (*status)(ag_wifi_status_t *out);
+
+    /* ---- access point (NULL unless CONFIG_ARGON_NET_WIFI_AP) ---- */
+
+    /*
+     * Offer a network of the board's own.  Raises the radio if it is down.  An
+     * empty pass is an open network; a key is 8..63 characters and shorter is
+     * -AG_EINVAL.  channel 0 picks one; while also joined to a network the
+     * point is forced onto that network's channel (ap_status reports which).
+     */
+    ag_err_t (*ap_start)(const char *ssid, const char *pass, uint8_t channel,
+                         bool hidden);
+    ag_err_t (*ap_stop)(void);
+    ag_err_t (*ap_status)(ag_wifi_ap_status_t *out);
+
+    /* ---- ESP-NOW (NULL unless CONFIG_ARGON_NET_ESPNOW) ---- */
+
+    /*
+     * Board-to-board datagrams, no network between them.  start() needs the
+     * radio up (it raises it) and adds the broadcast peer.  self() is the
+     * board's own address the other end must peer_add.  A frame is at most
+     * AG_WIFI_ESPNOW_MAX bytes; longer is -AG_EINVAL.  A destination must be a
+     * peer first (peer_add, or the broadcast peer).  peer_add channel 0 means
+     * the channel the radio is on; key NULL is an open peer, else exactly
+     * AG_WIFI_ESPNOW_KEY bytes.  recv() pops one waiting datagram into `buf`
+     * (its sender into `mac`), returning the byte count or -AG_EAGAIN when
+     * none arrived within timeout_ms (0 polls); dropped() is how many the ring
+     * had to discard.
+     */
+    ag_err_t (*espnow_start)(void);
+    ag_err_t (*espnow_stop)(void);
+    ag_err_t (*espnow_self)(uint8_t out[6]);
+    ag_err_t (*espnow_peer_add)(const uint8_t mac[6], uint8_t channel,
+                                const uint8_t *key);
+    ag_err_t (*espnow_peer_del)(const uint8_t mac[6]);
+    ag_err_t (*espnow_send)(const uint8_t mac[6], const void *data,
+                            uint32_t len);
+    int32_t  (*espnow_recv)(uint8_t mac[6], void *buf, uint32_t max,
+                            uint32_t timeout_ms);
+    uint32_t (*espnow_dropped)(void);
+} ag_wifi_api_t;
+
+/* ------------------------------------------------------------------------ */
+/* cam - a DVP image sensor's frames (ABI 0.41)                             */
+/* ------------------------------------------------------------------------ */
+/*
+ * The thin half of a camera: the chip's LCD_CAM peripheral and its DMA, which
+ * cannot be reached from a .SYS through io and so live in the image.  The other
+ * half - which sensor is on the wires, its register tables, its SCCB init - is
+ * a loadable driver that configures this transport and reads frames from it.
+ * That split keeps the sensor zoo out of the firmware: a new sensor is a new
+ * .SYS, not a rebuild.
+ */
+
+/* Pixel formats the transport delivers.  RGB565 is what a sensor without a
+ * JPEG engine (the GC2145 on the S3 CAM board) gives; the encoder, if any, is
+ * the application's, not the firmware's. */
+typedef enum {
+    AG_CAM_FMT_RGB565 = 0,
+} ag_cam_fmt_t;
+
+/* A sensor's DVP wiring, as the driver knows it.  Pin < 0 means "none". */
+typedef struct {
+    int16_t  xclk;      /* clock the chip drives out to the sensor           */
+    int16_t  pclk;      /* pixel clock the sensor drives back                */
+    int16_t  vsync;
+    int16_t  href;      /* also called DE, data enable                       */
+    int16_t  data[8];   /* D0..D7                                            */
+    uint32_t xclk_hz;   /* XCLK frequency, e.g. 20000000                     */
+} ag_cam_pins_t;
+
+typedef struct ag_cam_api {
+    uint32_t size;
+
+    /*
+     * Bring the transport up for a sensor already (or about to be) set to this
+     * format and size.  Allocates the frame buffer in PSRAM, generates XCLK,
+     * starts DMA.  The driver calls this once it has the sensor talking.
+     */
+    ag_err_t (*configure)(const ag_cam_pins_t *pins, ag_cam_fmt_t fmt,
+                          uint32_t width, uint32_t height);
+
+    /*
+     * One captured frame.  Blocks up to timeout_ms for the next one; the
+     * returned pointer is the PSRAM frame buffer and is valid until the next
+     * capture().  NULL on timeout or error; *len is the bytes received.
+     */
+    const uint8_t *(*capture)(size_t *len, uint32_t timeout_ms);
+
+    /* Stop DMA, free the buffer and the peripheral. */
+    void (*stop)(void);
+} ag_cam_api_t;
+
+/* ------------------------------------------------------------------------ */
 /* Root table                                                               */
 /* ------------------------------------------------------------------------ */
 
@@ -1079,6 +1941,27 @@ typedef struct ag_api {
 
     /* ABI 0.14+: PCM out (built-in pcmnull; virt/I2S via .SYS). */
     const ag_audio_api_t *audio;
+
+    /* ABI 0.34+: BLE for applications - NULL unless the build has the BLE
+     * peripheral (CONFIG_ARGON_BLE_PERIPHERAL).  Small on purpose: enough for a
+     * MIDI controller, not a general GATT toolkit. */
+    const ag_ble_api_t *ble;
+
+    /* ABI 0.35+: the clock, the screen, and being told before they change. */
+    const ag_power_api_t *power;
+
+    /* ABI 0.38+: promiscuous capture and raw 802.11 injection - NULL unless
+     * the build set CONFIG_ARGON_NET_WIFI_MON (off by default). */
+    const ag_wifimon_api_t *wifimon;
+
+    /* ABI 0.39+: station, access point and ESP-NOW - NULL on a board with no
+     * radio (CONFIG_ARGON_NET_WIFI off, e.g. QEMU).  Within it the AP and
+     * ESP-NOW entries are NULL unless their own build options are set. */
+    const ag_wifi_api_t *wifi;
+
+    /* ABI 0.41+: the DVP camera transport - NULL without
+     * CONFIG_ARGON_ENABLE_CAMERA. */
+    const ag_cam_api_t *cam;
 } ag_api_t;
 
 /* ------------------------------------------------------------------------ */
@@ -1101,6 +1984,26 @@ enum ag_axe_flags {
      */
     AG_AXE_CONTIGUOUS = 1u << 5,
     AG_AXE_NEEDS_AUDIO = 1u << 6, /* refuses to start without api->audio    */
+    /*
+     * Run from flash (XIP) even when the code would fit the IRAM arena.
+     *
+     * The loader's default is to place code in the arena when it fits and fall
+     * back to flash only when it does not - the arena is faster, so fitting is
+     * the good case.  An application sets this to invert that on purpose: it
+     * would rather leave the arena's internal SRAM free for something that
+     * cannot come from flash.  The board this matters on has one radio and
+     * sixty kilobytes of internal RAM: a Wi-Fi bring-up needs a ~36 KB
+     * contiguous slice of it, and code the loader parked in the arena would
+     * otherwise split the block the radio needs.  Sending that code to flash
+     * instead keeps the internal RAM whole.
+     *
+     * Honoured only for a non-contiguous image (xtensa): flash cannot host a
+     * contiguous image's data, so a contiguous one is placed in the arena
+     * regardless.  On a part where the code will not fit the arena anyway (the
+     * 8 KB arena on the original ESP32) the loader already chooses flash, and
+     * the flag then only makes that choice intentional rather than incidental.
+     */
+    AG_AXE_WANT_XIP = 1u << 7,
 };
 
 /*

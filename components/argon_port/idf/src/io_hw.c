@@ -16,6 +16,17 @@
 #include "driver/ledc.h"
 #include "driver/spi_master.h"
 #include "esp_log.h"
+#include "esp_memory_utils.h"
+
+/*
+ * The copy buffer for callers whose memory the DMA engine cannot read.
+ *
+ * A kilobyte each way, and deliberately not the same as
+ * AG_PORT_SPI_MAX_XFER: making them equal meant that raising the transfer
+ * limit - which is what a display wants - also raised the fixed cost of every
+ * bus that comes up, on a board where eight kilobytes is real money.
+ */
+#define AG_PORT_SPI_BOUNCE 1024
 #include "hal/gpio_types.h"
 
 #if AG_PORT_HAS_ADC
@@ -310,12 +321,30 @@ ag_err_t ag_port_i2c_probe(int bus, uint8_t addr, uint32_t timeout_ms)
 /* SPI                                                                    */
 /* ---------------------------------------------------------------------- */
 
+/*
+ * Several chips on one bus, each with its own speed.
+ *
+ * There used to be one device per bus, swapped whenever the chip select
+ * changed.  That is fine while a bus has one chip on it and wrong the moment
+ * it has two, which is the normal case: this board hangs a 320x240 panel and a
+ * touch controller off the same three wires, and the panel wants 40 MHz while
+ * the controller will not answer above about two.  One speed for the bus means
+ * either a display that takes a second a frame or a touchscreen that returns
+ * noise.
+ */
+#define AG_PORT_SPI_DEVS 4
+
 typedef struct {
     spi_device_handle_t dev;
-    int                 dev_cs;
+    int                 cs;
     uint32_t            khz;
-    uint8_t            *bounce; /* tx half then rx half, internal and DMA-able */
-    bool                up;
+} spi_dev_t;
+
+typedef struct {
+    spi_dev_t devs[AG_PORT_SPI_DEVS];
+    uint32_t  khz; /* the bus default, for a chip nobody set a speed for */
+    uint8_t  *bounce; /* tx half then rx half, internal and DMA-able      */
+    bool      up;
 } spi_state_t;
 
 static spi_state_t s_spi[AG_PORT_SPI_SLOTS];
@@ -350,16 +379,56 @@ ag_err_t ag_port_spi_open(int bus, int sck, int mosi, int miso, uint32_t khz)
         return from_esp(rc);
     }
 
-    s_spi[bus].bounce = ag_port_alloc(2u * AG_PORT_SPI_MAX_XFER, AG_MEM_DMA);
+    s_spi[bus].bounce = ag_port_alloc(2u * AG_PORT_SPI_BOUNCE, AG_MEM_DMA);
     if (s_spi[bus].bounce == NULL) {
         (void)spi_bus_free(AG_PORT_SPI_HOST_OF(bus));
         return -AG_ENOMEM;
     }
 
     s_spi[bus].khz = khz;
-    s_spi[bus].dev_cs = -1;
+    for (int i = 0; i < AG_PORT_SPI_DEVS; i++) {
+        s_spi[bus].devs[i].cs = -1;
+    }
     s_spi[bus].up = true;
     return AG_OK;
+}
+
+ag_err_t ag_port_spi_set_khz(int bus, int cs, uint32_t khz)
+{
+    if (!spi_valid(bus)) {
+        return -AG_ERANGE;
+    }
+    if (!s_spi[bus].up) {
+        return -AG_ENODEV;
+    }
+
+    for (int i = 0; i < AG_PORT_SPI_DEVS; i++) {
+        spi_dev_t *d = &s_spi[bus].devs[i];
+        if (d->cs != cs) {
+            continue;
+        }
+        if (d->khz == khz) {
+            return AG_OK;
+        }
+        /* Speed is fixed when a device is created, so change it by throwing
+         * the device away; the next transfer builds one at the new speed. */
+        if (d->dev != NULL) {
+            (void)spi_bus_remove_device(d->dev);
+        }
+        d->dev = NULL;
+        d->cs = -1;
+        break;
+    }
+
+    for (int i = 0; i < AG_PORT_SPI_DEVS; i++) {
+        spi_dev_t *d = &s_spi[bus].devs[i];
+        if (d->cs < 0 && d->dev == NULL) {
+            d->cs = cs;
+            d->khz = khz;
+            return AG_OK;
+        }
+    }
+    return -AG_ENFILE;
 }
 
 static ag_err_t spi_device_for(int bus, int cs, spi_device_handle_t *out)
@@ -367,31 +436,44 @@ static ag_err_t spi_device_for(int bus, int cs, spi_device_handle_t *out)
     if (!spi_valid(bus) || !s_spi[bus].up) {
         return -AG_ENODEV;
     }
-    if (s_spi[bus].dev != NULL && s_spi[bus].dev_cs == cs) {
-        *out = s_spi[bus].dev;
-        return AG_OK;
+
+    spi_dev_t *free_slot = NULL;
+    for (int i = 0; i < AG_PORT_SPI_DEVS; i++) {
+        spi_dev_t *d = &s_spi[bus].devs[i];
+        if (d->cs == cs) {
+            if (d->dev != NULL) {
+                *out = d->dev;
+                return AG_OK;
+            }
+            free_slot = d; /* speed was set for it, device not built yet */
+            break;
+        }
+        if (free_slot == NULL && d->cs < 0 && d->dev == NULL) {
+            free_slot = d;
+        }
     }
-    if (s_spi[bus].dev != NULL) {
-        (void)spi_bus_remove_device(s_spi[bus].dev);
-        s_spi[bus].dev = NULL;
-        s_spi[bus].dev_cs = -1;
+    if (free_slot == NULL) {
+        return -AG_ENFILE;
     }
 
+    const uint32_t khz = (free_slot->khz != 0) ? free_slot->khz
+                                               : s_spi[bus].khz;
     const spi_device_interface_config_t cfg = {
-        .clock_speed_hz = (int)(s_spi[bus].khz * 1000u),
+        .clock_speed_hz = (int)(khz * 1000u),
         .mode = 0,
         .spics_io_num = cs,
         .queue_size = 1,
     };
 
     const ag_err_t err = from_esp(
-        spi_bus_add_device(AG_PORT_SPI_HOST_OF(bus), &cfg, &s_spi[bus].dev));
+        spi_bus_add_device(AG_PORT_SPI_HOST_OF(bus), &cfg, &free_slot->dev));
     if (err != AG_OK) {
         return err;
     }
 
-    s_spi[bus].dev_cs = cs;
-    *out = s_spi[bus].dev;
+    free_slot->cs = cs;
+    free_slot->khz = khz;
+    *out = free_slot->dev;
     return AG_OK;
 }
 
@@ -408,12 +490,53 @@ ag_err_t ag_port_spi_xfer(int bus, int cs, const void *tx, void *rx, size_t len)
     }
 
     /*
-     * Through the bounce buffer, always.  The caller's data is in PSRAM and the
-     * DMA engine wants internal memory; deciding case by case would mean two
-     * paths, one of which is exercised only on the board nobody has.
+     * Straight from the caller's buffer when the DMA engine can read it.
+     *
+     * The bounce buffer exists for memory DMA cannot reach - PSRAM, or a stack
+     * in some ports - and copying through it unconditionally was the simple
+     * choice.  It also capped every transfer at the bounce size, which on the
+     * display path meant three transfers where one would do, and a transfer
+     * costs the same setup whatever it carries.
+     *
+     * A write-only transfer from DMA-capable memory needs neither the copy nor
+     * the cap.  Anything else still goes through the bounce, in pieces.
      */
+    if (rx == NULL && tx != NULL && esp_ptr_dma_capable(tx)) {
+        spi_transaction_t direct = {
+            .length = len * 8u,
+            .tx_buffer = tx,
+            .rx_buffer = NULL,
+        };
+        return from_esp(spi_device_polling_transmit(dev, &direct));
+    }
+
+    if (len > AG_PORT_SPI_BOUNCE) {
+        /*
+         * Has to be copied, so it goes a bounce-buffer at a time.  Only for a
+         * write: chopping a transfer that also reads would drop chip select
+         * between the halves, and a chip being read mid-command would not
+         * survive that.
+         */
+        if (rx != NULL) {
+            return -AG_EINVAL;
+        }
+        const uint8_t *p = (const uint8_t *)tx;
+        size_t         left = len;
+        while (left > 0) {
+            const size_t n = (left > AG_PORT_SPI_BOUNCE) ? AG_PORT_SPI_BOUNCE
+                                                         : left;
+            const ag_err_t e = ag_port_spi_xfer(bus, cs, p, NULL, n);
+            if (e != AG_OK) {
+                return e;
+            }
+            p += n;
+            left -= n;
+        }
+        return AG_OK;
+    }
+
     uint8_t *const out = s_spi[bus].bounce;
-    uint8_t *const in = out + AG_PORT_SPI_MAX_XFER;
+    uint8_t *const in = out + AG_PORT_SPI_BOUNCE;
 
     if (tx != NULL) {
         memcpy(out, tx, len);
@@ -426,7 +549,23 @@ ag_err_t ag_port_spi_xfer(int bus, int cs, const void *tx, void *rx, size_t len)
         .tx_buffer = out,
         .rx_buffer = (rx != NULL) ? in : NULL,
     };
-    err = from_esp(spi_device_transmit(dev, &t));
+    /*
+     * Polled, not queued.
+     *
+     * spi_device_transmit hands the transfer to the driver's queue, waits on a
+     * semaphore and is woken by the interrupt at the end.  That is the right
+     * shape for a transfer long enough to be worth sleeping through, and the
+     * wrong one for the traffic that actually goes over this bus: a panel being
+     * fed a frame in kilobyte pieces.  Measured on the display path, the queued
+     * version cost about two hundred and twenty microseconds of setup per
+     * transfer against two hundred of clock - so half the time on the wire was
+     * not on the wire at all.
+     *
+     * Polling spins for the duration instead, which is exactly what a caller
+     * pushing pixels wants: it has nothing else to do until they are sent, and
+     * the bus is held for less time overall.
+     */
+    err = from_esp(spi_device_polling_transmit(dev, &t));
 
     if (err == AG_OK && rx != NULL) {
         memcpy(rx, in, len);

@@ -163,6 +163,105 @@ ag_err_t ag_appfs_reserve(size_t bytes, ag_appfs_slot_t **out_slot,
     return AG_OK;
 }
 
+ag_err_t ag_appfs_reserve_data(size_t bytes, ag_appfs_slot_t **out_slot)
+{
+    if (out_slot == NULL || bytes == 0) {
+        return -AG_EINVAL;
+    }
+    if (!ag_appfs_ready()) {
+        const ag_err_t err = ag_appfs_init();
+        if (err != AG_OK) {
+            return err;
+        }
+    }
+
+    ag_appfs_slot_t *slot = NULL;
+    for (int i = 0; i < AG_APPFS_SLOTS; i++) {
+        if (!s_slots[i].used) {
+            slot = &s_slots[i];
+            break;
+        }
+    }
+    if (slot == NULL) {
+        return -AG_ENFILE;
+    }
+
+    const size_t need = align_up(bytes, AG_APPFS_PAGE);
+    size_t       offset = 0;
+    ag_err_t     err = find_space(need, &offset);
+    if (err != AG_OK) {
+        return err;
+    }
+
+    err = ag_port_part_erase(s_part, offset, need);
+    if (err != AG_OK) {
+        ag_log(AG_LOG_ERROR, "appfs", "erase @%u+%u failed: %d",
+               (unsigned)offset, (unsigned)need, (int)err);
+        return -AG_EIO;
+    }
+
+    memset(slot, 0, sizeof(*slot));
+    slot->used = true;
+    slot->offset = offset;
+    slot->reserved = need;
+    slot->programmed = 0;
+
+    *out_slot = slot;
+    return AG_OK;
+}
+
+ag_err_t ag_appfs_program_at(ag_appfs_slot_t *slot, size_t off,
+                             const void *data, size_t bytes)
+{
+    if (slot == NULL || !slot->used || data == NULL || bytes == 0) {
+        return -AG_EINVAL;
+    }
+    if (off + bytes > slot->reserved) {
+        return -AG_EINVAL;
+    }
+    if (slot->mapped) {
+        return -AG_EBUSY;
+    }
+
+    const ag_err_t err =
+        ag_port_part_write(s_part, slot->offset + off, data, bytes);
+    if (err != AG_OK) {
+        ag_log(AG_LOG_ERROR, "appfs", "write @%u+%u failed: %d",
+               (unsigned)(slot->offset + off), (unsigned)bytes, (int)err);
+        return -AG_EIO;
+    }
+    if (off + bytes > slot->programmed) {
+        slot->programmed = off + bytes;
+    }
+    return AG_OK;
+}
+
+ag_err_t ag_appfs_mmap_data(ag_appfs_slot_t *slot, const void **out_ptr)
+{
+    if (slot == NULL || !slot->used || out_ptr == NULL) {
+        return -AG_EINVAL;
+    }
+    if (slot->mapped) {
+        *out_ptr = slot->mapped_ptr;
+        return AG_OK;
+    }
+
+    const void    *ptr = NULL;
+    ag_port_map_t  h = 0;
+    const ag_err_t err =
+        ag_port_part_map_data(s_part, slot->offset, slot->reserved, &ptr, &h);
+    if (err != AG_OK) {
+        ag_log(AG_LOG_ERROR, "appfs", "data mapping failed: %d", (int)err);
+        return -AG_ENOMEM;
+    }
+
+    slot->mapped = true;
+    slot->mmap = h;
+    slot->mapped_ptr = ptr;
+    *out_ptr = ptr;
+    return AG_OK;
+}
+
 ag_err_t ag_appfs_program(ag_appfs_slot_t *slot, const void *data, size_t bytes)
 {
     if (slot == NULL || !slot->used || data == NULL || bytes == 0) {

@@ -26,11 +26,22 @@
     { "out": "DISK.AXE", "group": "core", "src": ["apps/disk/disk.c"] },
     { "out": "DEVS.AXE", "group": "core", "src": ["apps/devs/devs.c"] },
     { "out": "SPIN.AXE", "group": "core", "src": ["apps/spin/spin.c"] },
+    { "out": "PWR.AXE", "group": "core", "src": ["apps/pwr/pwr.c"] },
     { "out": "LEAK.AXE", "group": "core", "src": ["apps/leak/leak.c"] },
     { "out": "THREADS.AXE", "group": "core", "src": ["apps/threads/threads.c"] },
     { "out": "CRASH.AXE", "group": "core", "src": ["apps/crash/crash.c"] },
     { "out": "EDIT.AXE", "group": "core", "src": ["apps/edit/edit.c"] },
     { "out": "GFXDEMO.AXE", "group": "core", "src": ["apps/gfxdemo/gfxdemo.c"] },
+    {
+      "out": "MARAUDER.AXE", "group": "core",
+      "_note": "ESP32-Marauder port as a loadable .AXE (Maxim's requirement); UI via gfx->present bands, radio via api->wifimon. Needs the board (touch/display/radio); compiled here to keep it from rotting.",
+      "include": ["apps/marauder"],
+      "cflags": "-Os -ffunction-sections -fdata-sections -fno-builtin",
+      "src": ["apps/marauder/marauder.c", "apps/marauder/mrd_gfx.c",
+              "apps/marauder/mrd_menu.c", "apps/marauder/mrd_scan.c",
+              "apps/marauder/mrd_wifi.c", "apps/marauder/mrd_bt.c",
+              "apps/marauder/mrd_spam.c"]
+    },
     {
       "out": "GFXBENCH.AXE", "group": "core",
       "_note": "native backend only; the LVGL twins are in apps/gfxbench/build.py",
@@ -70,10 +81,43 @@
     { "out": "ZIP.AXE", "group": "core", "src": ["apps/zip/zip.c"] },
 
     { "out": "ECHO.SYS", "group": "core", "src": ["apps/echo/echo.c"] },
+    { "out": "GC2145.SYS", "group": "core", "include": ["apps/gc2145"], "src": ["apps/gc2145/gc2145.c"] },
+    { "out": "CAM.AXE", "group": "core", "src": ["apps/cam/cam.c"] },
     { "out": "PCMVIRT.SYS", "group": "core", "src": ["apps/pcmvirt/pcmvirt.c"] },
     { "out": "KBDVIRT.SYS", "group": "core", "src": ["apps/kbdvirt/kbdvirt.c"] },
     { "out": "MOUSEVIRT.SYS", "group": "core", "src": ["apps/mousevirt/mousevirt.c"] },
     { "out": "MIDIVIRT.SYS", "group": "core", "src": ["apps/midivirt/midivirt.c"] },
+
+    {
+      "out": "SMS.AXE", "group": "big",
+      "include": ["apps/common", "apps/common/libc", "apps/sms/port",
+                  "apps/sms/core", "apps/sms/core/z80",
+                  "apps/sms/core/sound", "apps/common/fm", "apps/common/dsp"],
+      "cflags": "-Os -ffunction-sections -fdata-sections -fno-builtin -DLSB_FIRST -DNOZIP_SUPPORT -DUSE_Z80 -Wno-unused -Wno-sign-compare",
+      "src": ["apps/sms/sms_main.c", "apps/sms/sms_cfg.c",
+              "apps/common/libc/libc_shim.c", "apps/sms/port/platform.c",
+              "apps/sms/port/sound_wav.c", "apps/common/fm/ag_fm.c",
+              "apps/common/dsp/ag_dsp.c",
+              "apps/sms/core/loadrom.c", "apps/sms/core/memz80.c",
+              "apps/sms/core/pio.c", "apps/sms/core/render.c",
+              "apps/sms/core/sms.c", "apps/sms/core/system.c",
+              "apps/sms/core/tms.c", "apps/sms/core/vdp.c",
+              "apps/sms/core/z80/z80.c",
+              "apps/sms/core/sound/sound.c", "apps/sms/core/sound/fmintf.c",
+              "apps/sms/core/sound/sn76489.c"]
+    },
+
+    {
+      "out": "GB.AXE", "group": "board",
+      "include": ["apps/common", "apps/common/libc", "apps/gb"],
+      "cflags": "-Os -ffunction-sections -fdata-sections -fno-builtin -DENABLE_SOUND=0 -DENABLE_LCD=1 -DPEANUT_GB_12_COLOUR=0 -DPEANUT_GB_HIGH_LCD_ACCURACY=0 -Wno-unused -Wno-sign-compare",
+      "src": ["apps/gb/gb_main.c", "apps/common/libc/libc_shim.c"]
+    },
+
+    { "out": "GFXPIX.AXE", "group": "board", "src": ["apps/gfxpix/gfxpix.c"] },
+    { "out": "MIDIPAD.AXE", "group": "board", "src": ["apps/midipad/midipad.c"] },
+    { "out": "ILI9341.SYS", "group": "board", "src": ["apps/ili9341/ili9341.c"] },
+    { "out": "XPT2046.SYS", "group": "board", "src": ["apps/xpt2046/xpt2046.c"] },
 
     {
       "out": "CC.AXE", "group": "core",

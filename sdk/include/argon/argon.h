@@ -192,6 +192,20 @@ static inline int64_t ag_seek(ag_handle_t h, int64_t off, int whence)
 {
     return g_ag_api->fs->seek(h, off, whence);
 }
+/*
+ * A file at an address, read only (ABI 0.32).  Ask with
+ * AG_HAS(ag_api()->fs, map) first: an older kernel has no such entry.
+ */
+static inline ag_err_t ag_map(const char *p, const void **out, uint64_t *len)
+{
+    return g_ag_api->fs->map(p, out, len);
+}
+
+static inline ag_err_t ag_unmap(const void *p)
+{
+    return g_ag_api->fs->unmap(p);
+}
+
 static inline ag_err_t ag_stat(const char *p, ag_stat_t *o)
 {
     return g_ag_api->fs->stat(p, o);
@@ -532,6 +546,16 @@ static inline ag_err_t ag_gfx_acquire(ag_gfxinfo_t *o)
 {
     return g_ag_api->gfx->acquire(o);
 }
+/*
+ * Put pixels the caller owns on the panel.  See gfx->present in abi.h; use
+ * AG_HAS(ag_api()->gfx, present) before calling, because a kernel older than
+ * ABI 0.31 has no such entry.
+ */
+static inline ag_err_t ag_gfx_present(const ag_blit_t *b)
+{
+    return g_ag_api->gfx->present(b);
+}
+
 static inline void ag_gfx_release(void) { g_ag_api->gfx->release(); }
 static inline void ag_gfx_flush(uint16_t x, uint16_t y, uint16_t w, uint16_t h)
 {
@@ -706,6 +730,171 @@ static inline int32_t ag_audio_space(void)
     return g_ag_api->audio->space();
 }
 
+/* ---- BLE helpers (ABI 0.34) --------------------------------------------- */
+
+/* True when this build can be a BLE-MIDI device (api->ble present). */
+/*
+ * Note for applications on the ESP32: scan/connect/adv_raw use the radio
+ * but do not raise it - bring BLE up first (the shell's `bt on`, or
+ * [bt] in SYSTEM.CFG), exactly as Wi-Fi wants `wifi on` first.  Off, they
+ * answer -AG_ENODEV rather than trying an app-context bring-up the chip
+ * does not survive.  The peripheral (adv_start / midi) still raises it.
+ */
+static inline bool ag_ble_available(void) { return g_ag_api->ble != NULL; }
+
+/* Advertise as a BLE-MIDI device; the radio is started if it was not. */
+static inline ag_err_t ag_ble_midi_advertise(const char *name)
+{
+    if (g_ag_api->ble == NULL) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->ble->midi_advertise(name);
+}
+/* One MIDI message: 0x90|ch note vel (on), 0x80|ch note vel (off). */
+static inline ag_err_t ag_ble_midi_send(uint8_t status, uint8_t d1, uint8_t d2)
+{
+    if (g_ag_api->ble == NULL) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->ble->midi_send(status, d1, d2);
+}
+/* True once a phone/PC is connected and listening for notes. */
+static inline bool ag_ble_midi_ready(void)
+{
+    return g_ag_api->ble != NULL && g_ag_api->ble->midi_ready();
+}
+static inline ag_err_t ag_ble_adv_stop(void)
+{
+    if (g_ag_api->ble == NULL) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->ble->adv_stop();
+}
+
+/* ---- BLE general: peripheral (ABI 0.38) --------------------------------- */
+
+/*
+ * The board as a plain device a phone or PC reads and writes.  Present only
+ * when the build has the BLE peripheral; probe with AG_HAS(ag_api()->ble,
+ * adv_start) or just check the return for -AG_ENOSYS.  adv_start advertises
+ * connectably and forever, starting the radio if it was off; adv_set_read sets
+ * the value clients read, adv_last_write returns the most recent write, and
+ * adv_status reports whether anyone is connected and how many writes arrived.
+ */
+static inline ag_err_t ag_ble_adv_start(const char *name)
+{
+    if (!AG_HAS(g_ag_api->ble, adv_start)) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->ble->adv_start(name);
+}
+static inline void ag_ble_adv_set_read(const void *data, uint32_t len)
+{
+    if (AG_HAS(g_ag_api->ble, adv_set_read)) {
+        g_ag_api->ble->adv_set_read(data, len);
+    }
+}
+static inline int32_t ag_ble_adv_last_write(uint8_t *out, uint32_t max)
+{
+    if (!AG_HAS(g_ag_api->ble, adv_last_write)) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->ble->adv_last_write(out, max);
+}
+static inline ag_err_t ag_ble_adv_status(ag_ble_adv_status_t *out)
+{
+    if (!AG_HAS(g_ag_api->ble, adv_status)) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->ble->adv_status(out);
+}
+
+/* ---- BLE general: observer + GATT client (ABI 0.38) --------------------- */
+
+/*
+ * Observe what is in range, then connect to one device and read or write any
+ * characteristic.  Present only when the build has the BLE central; the same
+ * AG_HAS / -AG_ENOSYS rule applies.  One radio, so one at a time: scan is
+ * -AG_EBUSY while connected and connect is -AG_EBUSY while scanning.  scan
+ * blocks for `seconds` (0 = a sensible default) and fills up to `max` devices,
+ * writing how many to *found.  After connect, discover() fills the service and
+ * characteristic tables read by services()/chars(); a characteristic's handle
+ * is what read()/write() take.
+ */
+static inline ag_err_t ag_ble_scan(ag_ble_dev_t *out, uint32_t max,
+                                   uint32_t *found, uint32_t seconds)
+{
+    if (!AG_HAS(g_ag_api->ble, scan)) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->ble->scan(out, max, found, seconds);
+}
+static inline ag_err_t ag_ble_connect(const uint8_t addr[6], int addr_type,
+                                      uint32_t timeout_ms)
+{
+    if (!AG_HAS(g_ag_api->ble, connect)) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->ble->connect(addr, addr_type, timeout_ms);
+}
+static inline ag_err_t ag_ble_disconnect(void)
+{
+    if (!AG_HAS(g_ag_api->ble, disconnect)) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->ble->disconnect();
+}
+static inline bool ag_ble_connected(void)
+{
+    return AG_HAS(g_ag_api->ble, connected) && g_ag_api->ble->connected();
+}
+static inline ag_err_t ag_ble_discover(uint32_t timeout_ms)
+{
+    if (!AG_HAS(g_ag_api->ble, discover)) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->ble->discover(timeout_ms);
+}
+static inline uint32_t ag_ble_services(ag_ble_svc_t *out, uint32_t max)
+{
+    if (!AG_HAS(g_ag_api->ble, services)) {
+        return 0;
+    }
+    return g_ag_api->ble->services(out, max);
+}
+static inline uint32_t ag_ble_chars(ag_ble_chr_t *out, uint32_t max)
+{
+    if (!AG_HAS(g_ag_api->ble, chars)) {
+        return 0;
+    }
+    return g_ag_api->ble->chars(out, max);
+}
+static inline int32_t ag_ble_read(uint16_t handle, uint8_t *out, uint32_t max,
+                                  uint32_t timeout_ms)
+{
+    if (!AG_HAS(g_ag_api->ble, read)) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->ble->read(handle, out, max, timeout_ms);
+}
+static inline ag_err_t ag_ble_write(uint16_t handle, const void *data,
+                                    uint32_t len, bool with_response,
+                                    uint32_t timeout_ms)
+{
+    if (!AG_HAS(g_ag_api->ble, write)) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->ble->write(handle, data, len, with_response, timeout_ms);
+}
+static inline ag_err_t ag_ble_adv_raw(const uint8_t addr[6], const void *data,
+                                      uint32_t len)
+{
+    if (!AG_HAS(g_ag_api->ble, adv_raw)) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->ble->adv_raw(addr, data, len);
+}
+
 /* ---- input helpers ------------------------------------------------------ */
 
 static inline bool ag_key(uint16_t keycode)
@@ -748,7 +937,7 @@ static inline int32_t ag_btnp(int pad, int id)
                                                     : 0;
 }
 
-/* ---- net (ABI 0.12; NULL when the build has no networking) -------------- */
+/* ---- net (ABI 0.12, resolve 0.33; NULL without networking) ------------- */
 
 static inline bool ag_net_is_ready(void)
 {
@@ -827,6 +1016,297 @@ static inline ag_err_t ag_net_set_nonblock(ag_handle_t sock, bool on)
         return -AG_ENOSYS;
     }
     return g_ag_api->net->set_nonblock(sock, on);
+}
+
+/*
+ * A name into a host-order address (ABI 0.33).  A dotted quad is answered
+ * without asking anybody, so this is also how one is read.  Blocks for as long
+ * as the resolver takes - seconds, when a server is slow.
+ */
+static inline ag_err_t ag_net_resolve(const char *host, uint32_t *addr_out)
+{
+    if (g_ag_api->net == NULL || g_ag_api->net->resolve == NULL) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->net->resolve(host, addr_out);
+}
+
+/* ---- power helpers (ABI 0.35+) ------------------------------------------ */
+
+/*
+ * Once round the loop is enough, and cheaper than it looks: this is a copy of a
+ * small structure out of the kernel, with no lock and no work behind it.
+ *
+ * The pattern it is for:
+ *
+ *   ag_power_status_t p;
+ *   if (ag_power_status(&p) == AG_OK && p.pending != p.mode) {
+ *       if (p.pending_cpu_max_mhz < needed_mhz) {
+ *           ag_power_answer(AG_POWER_UNFIT, "22 kHz tract");
+ *       } else {
+ *           ag_power_answer(AG_POWER_OK, NULL);
+ *       }
+ *   }
+ *
+ * On an automatic transition (p.cause == AG_POWER_AUTO) not answering costs
+ * nothing: it is advisory, and an application that knows nothing about power
+ * modes goes on exactly as it does now.
+ *
+ * On one a person typed (AG_POWER_USER) not answering is fatal - the process is
+ * ended when the grace period runs out.  That is the trade the system makes on
+ * purpose: an application left running at a third of its clock fails quietly,
+ * and quietly is the one way it must not fail.  A program that has nothing to
+ * decide says so once with ag_power_declare(AG_POWER_FIT_ANY, ...) and never
+ * thinks about it again.
+ */
+static inline ag_err_t ag_power_status(ag_power_status_t *out)
+{
+    if (g_ag_api->power == NULL || g_ag_api->power->status == NULL) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->power->status(out);
+}
+
+/* AG_POWER_OK, AG_POWER_PARKED, or AG_POWER_HOLD with a reason to print. */
+static inline ag_err_t ag_power_answer(ag_power_answer_t answer,
+                                      const char *why)
+{
+    if (g_ag_api->power == NULL || g_ag_api->power->answer == NULL) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->power->answer(answer, why);
+}
+
+/*
+ * Said once instead of answered every time, for the two kinds of program that
+ * never poll: AG_POWER_FIT_ANY for one that plainly does not care, and
+ * AG_POWER_FIT_FULL_ONLY for one that plainly does - a realtime path, which is
+ * then left alone by the idle timer and ended by a person's command rather than
+ * left to misbehave.  Goes when this process does.
+ */
+static inline ag_err_t ag_power_declare(ag_power_fitness_t fitness,
+                                       const char *why)
+{
+    if (g_ag_api->power == NULL || g_ag_api->power->declare == NULL) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->power->declare(fitness, why);
+}
+
+/* ---- Wi-Fi monitor / raw injection (ABI 0.38) --------------------------- */
+
+/*
+ * The radio on no network: capture every frame on a channel, and inject frames
+ * of the application's own making.  api->wifimon is NULL unless the build set
+ * CONFIG_ARGON_NET_WIFI_MON (off by default) - ask ag_wifimon_available() first,
+ * or read -AG_ENOSYS back.  start() enters promiscuous mode (a joined station
+ * leaves its network); recv() waits up to timeout_ms (0 polls) for one frame,
+ * returning its byte count or -AG_EAGAIN, and fills `meta` with rssi/channel and
+ * the frame's real length; tx_raw() puts a complete 802.11 frame (no FCS) on the
+ * current channel.
+ */
+static inline bool ag_wifimon_available(void)
+{
+    return g_ag_api->wifimon != NULL;
+}
+static inline ag_err_t ag_wifimon_start(void)
+{
+    if (g_ag_api->wifimon == NULL) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->wifimon->start();
+}
+static inline ag_err_t ag_wifimon_stop(void)
+{
+    if (g_ag_api->wifimon == NULL) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->wifimon->stop();
+}
+static inline ag_err_t ag_wifimon_channel(uint8_t primary)
+{
+    if (g_ag_api->wifimon == NULL) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->wifimon->channel(primary);
+}
+static inline uint8_t ag_wifimon_channel_get(void)
+{
+    return (g_ag_api->wifimon == NULL) ? 0 : g_ag_api->wifimon->channel_get();
+}
+static inline ag_err_t ag_wifimon_filter(uint32_t mask)
+{
+    if (g_ag_api->wifimon == NULL) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->wifimon->filter(mask);
+}
+static inline int32_t ag_wifimon_recv(void *buf, uint32_t max,
+                                      ag_wifimon_frame_t *meta,
+                                      uint32_t timeout_ms)
+{
+    if (g_ag_api->wifimon == NULL) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->wifimon->recv(buf, max, meta, timeout_ms);
+}
+static inline ag_err_t ag_wifimon_tx(const void *frame, uint32_t len)
+{
+    if (g_ag_api->wifimon == NULL) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->wifimon->tx_raw(frame, len);
+}
+static inline void ag_wifimon_counters(uint32_t out[AG_WIFIMON_C_N])
+{
+    if (g_ag_api->wifimon != NULL) {
+        g_ag_api->wifimon->counters(out);
+    }
+}
+static inline uint32_t ag_wifimon_dropped(void)
+{
+    return (g_ag_api->wifimon == NULL) ? 0 : g_ag_api->wifimon->dropped();
+}
+
+/* ---- Wi-Fi station / access point / ESP-NOW (ABI 0.39) ------------------ */
+
+/*
+ * The radio as a network: find the networks in reach and join one, offer one of
+ * the board's own, or throw datagrams at another board.  api->wifi is NULL on a
+ * board with no radio (QEMU) - ask ag_wifi_available() first, or read -AG_ENOSYS
+ * back.  The access-point and ESP-NOW calls are further gated by their own build
+ * options: probe one with AG_HAS(ag_api()->wifi, ap_start) before relying on it,
+ * or take the -AG_ENOSYS these wrappers return when the slot is NULL.  Raising
+ * the radio costs a large contiguous slice of internal RAM, so a Wi-Fi tool is
+ * usually run after `wifi on` has already raised it (see the ABI note).
+ */
+static inline bool ag_wifi_available(void) { return g_ag_api->wifi != NULL; }
+
+static inline ag_err_t ag_wifi_start(void)
+{
+    if (g_ag_api->wifi == NULL) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->wifi->start();
+}
+static inline ag_err_t ag_wifi_stop(void)
+{
+    if (g_ag_api->wifi == NULL) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->wifi->stop();
+}
+static inline ag_err_t ag_wifi_scan(ag_wifi_ap_t *out, uint32_t max,
+                                    uint32_t *found)
+{
+    if (g_ag_api->wifi == NULL) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->wifi->scan(out, max, found);
+}
+static inline ag_err_t ag_wifi_connect(const char *ssid, const char *pass,
+                                       const uint8_t bssid[6])
+{
+    if (g_ag_api->wifi == NULL) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->wifi->connect(ssid, pass, bssid);
+}
+static inline ag_err_t ag_wifi_disconnect(void)
+{
+    if (g_ag_api->wifi == NULL) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->wifi->disconnect();
+}
+static inline ag_err_t ag_wifi_status(ag_wifi_status_t *out)
+{
+    if (g_ag_api->wifi == NULL) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->wifi->status(out);
+}
+static inline ag_err_t ag_wifi_ap_start(const char *ssid, const char *pass,
+                                        uint8_t channel, bool hidden)
+{
+    if (!AG_HAS(g_ag_api->wifi, ap_start)) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->wifi->ap_start(ssid, pass, channel, hidden);
+}
+static inline ag_err_t ag_wifi_ap_stop(void)
+{
+    if (!AG_HAS(g_ag_api->wifi, ap_stop)) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->wifi->ap_stop();
+}
+static inline ag_err_t ag_wifi_ap_status(ag_wifi_ap_status_t *out)
+{
+    if (!AG_HAS(g_ag_api->wifi, ap_status)) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->wifi->ap_status(out);
+}
+static inline ag_err_t ag_wifi_espnow_start(void)
+{
+    if (!AG_HAS(g_ag_api->wifi, espnow_start)) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->wifi->espnow_start();
+}
+static inline ag_err_t ag_wifi_espnow_stop(void)
+{
+    if (!AG_HAS(g_ag_api->wifi, espnow_stop)) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->wifi->espnow_stop();
+}
+static inline ag_err_t ag_wifi_espnow_self(uint8_t out[6])
+{
+    if (!AG_HAS(g_ag_api->wifi, espnow_self)) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->wifi->espnow_self(out);
+}
+static inline ag_err_t ag_wifi_espnow_peer_add(const uint8_t mac[6],
+                                               uint8_t channel,
+                                               const uint8_t *key)
+{
+    if (!AG_HAS(g_ag_api->wifi, espnow_peer_add)) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->wifi->espnow_peer_add(mac, channel, key);
+}
+static inline ag_err_t ag_wifi_espnow_peer_del(const uint8_t mac[6])
+{
+    if (!AG_HAS(g_ag_api->wifi, espnow_peer_del)) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->wifi->espnow_peer_del(mac);
+}
+static inline ag_err_t ag_wifi_espnow_send(const uint8_t mac[6],
+                                           const void *data, uint32_t len)
+{
+    if (!AG_HAS(g_ag_api->wifi, espnow_send)) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->wifi->espnow_send(mac, data, len);
+}
+static inline int32_t ag_wifi_espnow_recv(uint8_t mac[6], void *buf,
+                                          uint32_t max, uint32_t timeout_ms)
+{
+    if (!AG_HAS(g_ag_api->wifi, espnow_recv)) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->wifi->espnow_recv(mac, buf, max, timeout_ms);
+}
+static inline uint32_t ag_wifi_espnow_dropped(void)
+{
+    if (!AG_HAS(g_ag_api->wifi, espnow_dropped)) {
+        return 0;
+    }
+    return g_ag_api->wifi->espnow_dropped();
 }
 
 #ifdef __cplusplus

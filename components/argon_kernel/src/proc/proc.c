@@ -16,6 +16,7 @@
 #include <argon/kernel.h>
 #include <argon/lineedit.h>
 #include <argon/loader.h>
+#include <argon/power.h>
 #include <argon/log.h>
 #include <argon/path.h>
 #include <argon/shell.h>
@@ -35,6 +36,14 @@
 /* Stack, in bytes, and the arena an application allocates from. */
 #define AG_PROC_STACK_MIN (2u * 1024u)
 #define AG_PROC_STACK_MAX (64u * 1024u)
+
+/*
+ * The floor for an image that names its own stack.  The load runs on the
+ * process's own task - it opens a file, walks a filesystem and relocates - so
+ * the number an application would be happy with is not necessarily one it can
+ * be loaded on.
+ */
+#define AG_PROC_LOAD_STACK_MIN (8u * 1024u)
 #ifndef CONFIG_ARGON_APP_STACK_KB
 #define CONFIG_ARGON_APP_STACK_KB 16
 #endif
@@ -169,12 +178,42 @@ static ag_err_t heap_create(proc_t *p, uint32_t requested)
     size_t     size = required ? requested
                                : (size_t)CONFIG_ARGON_APP_HEAP_KB * 1024u;
 
+    /*
+     * A default is a guess, and this one is a guess about a machine with PSRAM:
+     * a megabyte out of eight is nothing, a megabyte out of a quarter of one is
+     * the machine.  The halving below only reacts to an allocation that fails,
+     * and taking 128 KB of the 232 KB a board without PSRAM has does not fail -
+     * it succeeds, and then the image's own data has nowhere to go.  That is
+     * how it presented: an application refused with -AG_ENOMEM while `mem`
+     * showed plenty free.
+     *
+     * So the default is also capped at a quarter of the pool it comes out of.
+     * On the S3 that quarter is megabytes and this line does nothing.  An image
+     * that asked for a size is not touched: it gets what it asked for or it
+     * does not start.
+     */
+    if (!required) {
+        size_t pool = ag_port_mem_free(AG_MEM_SLOW);
+        if (pool == 0) {
+            pool = ag_port_mem_free(AG_MEM_FAST);
+        }
+        if (size > pool / 4u) {
+            size = pool / 4u;
+        }
+    }
+
     if (size < AG_PROC_HEAP_MIN) {
         size = AG_PROC_HEAP_MIN;
     }
 
     for (;;) {
+        /* PSRAM, then byte-accessible D/IRAM, then ordinary internal - so the
+         * arena does not carve the DMA-capable DRAM the radio needs whole (see
+         * data_alloc in src/loader/loader.c). */
         void *mem = ag_port_alloc(size, AG_MEM_SLOW | AG_MEM_BYTE);
+        if (mem == NULL) {
+            mem = ag_port_alloc(size, AG_MEM_IRAM8);
+        }
         if (mem == NULL) {
             mem = ag_port_alloc(size, AG_MEM_FAST | AG_MEM_BYTE);
         }
@@ -274,6 +313,13 @@ static void reap(proc_t *p)
      * next edge on that pin, with nothing in the journal to say why.
      */
     const uint32_t pins = ag_io_reclaim(p->pid);
+
+    /*
+     * And whatever it asked of the clock.  A hold left behind by a process
+     * that is gone would pin the machine at full speed with nothing to show
+     * for it, and no way to find out whose hold it was.
+     */
+    ag_power_forget(p->pid);
 
     if (held > 0 || files > 0 || pins > 0) {
         ag_log(AG_LOG_INFO, "proc",
@@ -623,6 +669,18 @@ ag_err_t ag_proc_set_priority(ag_pid_t pid, ag_proc_prio_t prio)
  */
 static ag_err_t proc_finish_load(proc_t *p)
 {
+    /*
+     * What is left before the image is read.
+     *
+     * The stack and the session's screens are already taken by the time this
+     * runs, and on a small machine that is most of the difference between what
+     * `mem` shows at a prompt and what a load actually has to work with.  It was
+     * fifty kilobytes here, and looking for it in the wrong place cost an hour.
+     */
+    ag_log(AG_LOG_INFO, "proc", "%s: loading with %u free, largest %u",
+           p->name, (unsigned)ag_port_mem_free(AG_MEM_FAST | AG_MEM_BYTE),
+           (unsigned)ag_port_mem_largest(AG_MEM_FAST | AG_MEM_BYTE));
+
     ag_err_t err = ag_loader_load(p->path, p->cwd, &p->app);
     if (err != AG_OK) {
         ag_log(AG_LOG_ERROR, "proc", "pid %u: load %s failed (%d)",
@@ -893,8 +951,31 @@ ag_err_t ag_proc_spawn(const char *path, int argc, char **argv, uint32_t flags,
         return err;
     }
 
-    /* Sized for load + typical app; header may ask for less after load. */
-    p->stack_bytes = clamp_stack_bytes(0);
+    /*
+     * What the image asks for, read before the task exists.
+     *
+     * A stack cannot be resized once a task is running on it, so the number has
+     * to come from somewhere before then, and the only honest source is the
+     * image.  A failure to read it here is not fatal - the default is a working
+     * answer and the real load will report the same problem properly - so the
+     * header is a hint at this point and nothing more.
+     */
+    {
+        ag_axe_header_t peek;
+        uint32_t        want = 0;
+        if (ag_loader_peek(p->path, p->cwd, &peek) == AG_OK) {
+            want = peek.stack_size;
+        }
+        /*
+         * Never below what loading itself needs: the image is read on this very
+         * task, through the filesystem, and an image that asks for two
+         * kilobytes would overflow before its first instruction ran.
+         */
+        if (want != 0 && want < AG_PROC_LOAD_STACK_MIN) {
+            want = AG_PROC_LOAD_STACK_MIN;
+        }
+        p->stack_bytes = clamp_stack_bytes(want);
+    }
 
     err = spawn_common(p, flags, out_pid);
     if (err != AG_OK) {
@@ -935,6 +1016,19 @@ ag_err_t ag_proc_spawn_builtin(const char *name, ag_proc_entry_fn entry,
     p->app.binding.entry = (void *)entry;
     set_string(p->name, sizeof(p->name), name);
     ag_reslist_init(&p->res, p->res_slots, AG_PROC_RES_MAX);
+
+    /*
+     * The system says this one is fit for any power mode, on its behalf.
+     *
+     * A built-in is the file manager, the editor, the shell's own tools: code
+     * in this tree, text on a screen, no deadline anywhere in it.  Left to the
+     * ordinary rule - answer or be ended - `power eco` would kill the file
+     * manager somebody is standing in front of, and teaching each of these
+     * loops to answer a question whose answer is always yes would be four
+     * copies of the same three lines.  Where the system wrote the program, the
+     * system can vouch for it.
+     */
+    (void)ag_power_declare(p->pid, AG_POWER_FIT_ANY, "system tool");
 
     const char *parent_cwd = ag_proc_cwd();
     set_string(p->cwd, sizeof(p->cwd), parent_cwd);

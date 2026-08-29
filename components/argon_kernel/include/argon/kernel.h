@@ -31,6 +31,7 @@ typedef enum {
     AG_STAGE_CONSOLE,      /* virtual text screen + UART endpoint        */
     AG_STAGE_STORAGE,      /* littlefs /sys, ramfs /tmp                  */
     AG_STAGE_CONFIG,       /* SYSTEM.CFG                                 */
+    AG_STAGE_POWER,        /* the clock this machine has, and its modes   */
     AG_STAGE_DEVICES,      /* static drivers, device manager             */
     AG_STAGE_MEDIA,        /* SD card, FAT /sd                           */
     AG_STAGE_MODULES,      /* loadable .SYS drivers listed in the config */

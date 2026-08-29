@@ -59,7 +59,32 @@ static void unlock(void)
 }
 
 /* Whoever is calling: a process, or the kernel when nothing is loaded. */
-static ag_pid_t caller(void) { return ag_proc_self(); }
+/*
+ * Whose claim a pin operation is checked against.
+ *
+ * Normally the process doing it.  But a loadable driver claims its pins when it
+ * loads - on the kernel's task, because that is who loads modules - and is then
+ * called from whatever task happens to need it: the console task for the
+ * console, an application's task the moment that application takes the display.
+ * Checked against the application, the claim does not match, and io_gpio_write
+ * *silently does nothing*.
+ *
+ * What that looked like: the panel driver's text path worked perfectly (console
+ * task, kernel identity) while its pixel path put a whole 320x240 frame into a
+ * single 8x8 character cell.  The chip select line is toggled by the SPI
+ * peripheral, so the pixel bytes went out; the DC line is a plain GPIO, so the
+ * three command bytes that set the address window did not - they went into the
+ * panel as pixels, and the frame landed in whatever window the text path had
+ * left behind, which was the caret.  Nothing failed, nothing was logged, and
+ * the picture was one blinking square inside a line of text.
+ *
+ * A .SYS is not a process; it is system code the kernel called.  Its claims are
+ * the kernel's and so are its writes, whoever asked.
+ */
+static ag_pid_t caller(void)
+{
+    return ag_dev_in_driver() ? AG_PID_KERNEL : ag_proc_self();
+}
 
 static bool valid_pin(int pin)
 {
@@ -199,11 +224,47 @@ static ag_err_t io_gpio_config(int pin, int mode)
     return err;
 }
 
+/*
+ * Refused writes, counted.
+ *
+ * A permission check with no else branch is not a permission check; it is a
+ * silence.  This one cost a day: a driver's writes to its own data/command line
+ * were dropped because the claim belonged to the kernel and the call arrived on
+ * an application's task, and the only symptom anywhere in the system was a
+ * picture in the wrong place.
+ *
+ * Logging from here is not allowed - the caller may be a driver, holding the
+ * device registry, and the console task takes the console first and the
+ * registry second, so reaching for the console here closes a ring.  So the
+ * refusal is remembered and `io` prints it.  One line at the bottom of a table
+ * somebody looks at anyway is worth more than a message nobody can print.
+ */
+static struct {
+    uint32_t count;
+    int16_t  pin;
+    ag_pid_t pid;
+} s_refused = {0, -1, 0};
+
+uint32_t ag_io_refused(int *pin, ag_pid_t *pid)
+{
+    if (pin != NULL) {
+        *pin = s_refused.pin;
+    }
+    if (pid != NULL) {
+        *pid = s_refused.pid;
+    }
+    return s_refused.count;
+}
+
 static void io_gpio_write(int pin, int level)
 {
     lock();
     if (valid_pin(pin) && ag_io_held_by(pin, caller())) {
         ag_port_gpio_write(pin, level);
+    } else if (valid_pin(pin)) {
+        s_refused.count++;
+        s_refused.pin = (int16_t)pin;
+        s_refused.pid = caller();
     }
     unlock();
 }
@@ -423,7 +484,16 @@ static ag_err_t spi_bring_up(int bus)
     }
 
     const ag_board_spi_t *cfg = &ag_board()->spi[idx];
-    if (cfg->sck < 0 || (cfg->mosi < 0 && cfg->miso < 0)) {
+    /*
+     * A bus needs a data line.  Whether it needs a clock is the board's
+     * answer, not ours: normally it does and leaving sck out is a typo, but a
+     * device driven by the shape of the signal rather than by clocked bits is
+     * wired to mosi alone - the addressable LED on a development board is
+     * three bits of SPI per bit of its own and has no clock input at all.  So
+     * a bus with no data line is undescribed, and a bus with no clock is
+     * allowed exactly when there is nothing to read back.
+     */
+    if ((cfg->mosi < 0 && cfg->miso < 0) || (cfg->sck < 0 && cfg->miso >= 0)) {
         ag_log(AG_LOG_WARN, "io",
                "spi%d has no pins; set spi%d.sck and spi%d.mosi in BOARD.CFG",
                bus, bus, bus);
@@ -484,6 +554,29 @@ static ag_err_t spi_take_cs(int bus, int cs)
  * means the caller drives the chip select itself - a chip that needs it held
  * across several transfers cannot let the peripheral toggle it.
  */
+/*
+ * The clock for one chip on a bus that has several.  Bringing the bus up here
+ * as well, because a speed set before the bus exists would be forgotten: the
+ * bus comes up on first use, and this is a first use.
+ */
+static ag_err_t io_spi_config(int bus, int cs, uint32_t khz)
+{
+    if (khz == 0) {
+        return -AG_EINVAL;
+    }
+
+    lock();
+    ag_err_t err = spi_bring_up(bus);
+    if (err == AG_OK) {
+        err = spi_take_cs(bus, cs);
+    }
+    if (err == AG_OK) {
+        err = ag_port_spi_set_khz(bus, cs, khz);
+    }
+    unlock();
+    return err;
+}
+
 static ag_err_t io_spi_xfer(int bus, int cs, const void *tx, void *rx,
                             size_t len)
 {
@@ -831,6 +924,7 @@ const ag_io_api_t ag_io_api_table = {
 #endif
     .pwm_config = io_pwm_config,
     .pwm_set = io_pwm_set,
+    .spi_config = io_spi_config,
 };
 
 ag_err_t ag_io_init(void)

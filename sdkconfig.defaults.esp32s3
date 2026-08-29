@@ -40,6 +40,35 @@ CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB=y
 # app is running or not, so this is 128 KB the internal heap never sees.
 CONFIG_ARGON_APP_ARENA_KB=192
 
+# Memory protection off, because on this chip it protects against the loader.
+#
+# Espressif turns it on by default for the S3, and what it forbids is a data
+# store to an instruction-RAM address - which is exactly what placing an image
+# in the code arena is.  Every .AXE died the same way on the board: a cache
+# error with no cause the handler could name, at the first word copy_image
+# writes, whether the image was 392 bytes or 36 KB and whether the arena was
+# 48 KB or 192.
+#
+# This line belongs to the chip and not to the board, which is why it is here
+# rather than in sdkconfig.esp32s3.board: any real S3 walks into it, and the
+# emulator does not model the permission bits, so leaving the two targets
+# configured differently would mean the thing being measured is not the thing
+# being shipped.  The system's own model settles the trade: an application owns
+# the machine, and a machine that forbids writing the application into memory
+# cannot run one.  The D/IRAM arena is the only memory that is writable and
+# executable at once - see the comment over s_arena in loader.c.
+CONFIG_ESP_SYSTEM_MEMPROT_FEATURE=n
+
+# Sound, which on this chip means I2S and nothing else: the S3 has no
+# converters of its own, so the output is a codec on three pins somebody
+# soldered.  Built in even for the emulator, which has no I2S at all, because
+# the alternative is a driver that only one target compiles - and a build that
+# nothing builds is a build that rots (pitfall 30, and it cost four sound
+# paths).  It costs image space and no RAM: without [audio] pins in BOARD.CFG
+# present() answers no, /dev/pcm0 is never registered, and the machine keeps
+# the mute sink it had.
+CONFIG_ARGON_ENABLE_AUDIO=y
+
 # UART0 is the one console every board and QEMU agree on, and the ROM
 # bootloader already talks there, so early output is not split across two
 # devices.  USB-serial-JTAG becomes an additional console endpoint at runtime

@@ -44,10 +44,18 @@ ArgonOS
   argon tests              host unit tests (needs a host C compiler)
   argon match CAPTURE.nam  fit a model's voicing to a capture of the real
                            amplifier and measure both; -Model bogner|slo|jcm800
+  argon nettest            wget / httpd / ftp in QEMU against
+                           tools\netfixture.py (37 checks)
+  argon boardnet -port COM3   the same on the real board, over Wi-Fi;
+                           add -big for a speed number (14 checks)
+  python tools/netfixture.py serve   the same servers, to try things by hand
   argon check              local CI: host tests, then firmware build
   argon target             which chip the firmware is built for
   argon target esp32       switch to the board on the desk (docs\09-esp32-cyd.md);
-                           esp32s3 switches back.  Either way: full rebuild
+                           esp32-dsp = no radios, big arena; esp32s3 switches
+                           back.  esp32s3-cam = esp32s3-board with the camera
+                           built into the image.  esp32s3-board = the S3 on the desk, without
+                           the two lines that are for QEMU only.  Any: rebuild
   argon flash -port COM5   flash a real board and open the monitor
   argon monitor -port COM5 open the serial monitor on a real board
   argon clean              remove the firmware build directory
@@ -153,17 +161,44 @@ switch ($Command.ToLowerInvariant()) {
                 $line = Select-String -Path 'sdkconfig' -Pattern '^CONFIG_IDF_TARGET="(.+)"$' |
                         Select-Object -First 1
                 if ($line) { $cur = $line.Matches[0].Groups[1].Value }
+                $ble = Select-String -Path 'sdkconfig' -Pattern '^CONFIG_ARGON_ENABLE_BLE=y$' |
+                       Select-Object -First 1
+                if (-not $ble) { $cur = "$cur (no radios)" }
             }
             Write-Host "current target: $cur"
-            Write-Host 'known targets:  esp32s3 (primary, QEMU), esp32 (hardware)'
+            Write-Host 'known targets:  esp32s3 (primary, QEMU)'
+            Write-Host '                esp32s3-board  the S3 on the desk: no OpenEth, no HostFS'
+            Write-Host '                esp32s3-cam    esp32s3-board + the camera built into the image'
+            Write-Host '                esp32       hardware: Wi-Fi and Bluetooth'
+            Write-Host '                esp32-dsp   hardware: neither, 48 KB arena'
             exit 0
         }
-        if ($chip -notin @('esp32', 'esp32s3')) {
-            Write-Host "argon target: no defaults for '$chip'."
-            Write-Host 'Add sdkconfig.defaults.<chip> before building for it.'
-            exit 1
+
+        # Variants of one chip are extra defaults layered on its own, rather
+        # than switches inside one file: what differs between them is not a
+        # feature but how the 128 KB of instruction RAM is divided.  IDF keeps
+        # SDKCONFIG_DEFAULTS in the build cache, so `argon build` afterwards
+        # uses the same list.
+        $defaults = ''
+        switch ($chip) {
+            'esp32'     { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32' }
+            'esp32-dsp' { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32;sdkconfig.esp32.dsp'
+                          $chip = 'esp32' }
+            'esp32-probe' { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32;sdkconfig.esp32.probe'
+                            $chip = 'esp32' }
+            'esp32s3'   { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32s3' }
+            'esp32s3-board' { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32s3;sdkconfig.esp32s3.board'
+                              $chip = 'esp32s3' }
+            'esp32s3-cam' { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32s3;sdkconfig.esp32s3.board;sdkconfig.esp32s3.cam'
+                            $chip = 'esp32s3' }
+            default {
+                Write-Host "argon target: no defaults for '$chip'."
+                Write-Host 'Add sdkconfig.defaults.<chip> before building for it.'
+                exit 1
+            }
         }
-        & idf.py set-target $chip
+        Remove-Item 'sdkconfig' -ErrorAction SilentlyContinue
+        & idf.py -D "SDKCONFIG_DEFAULTS=$defaults" set-target $chip
         exit $LASTEXITCODE
     }
 
@@ -336,6 +371,38 @@ switch ($Command.ToLowerInvariant()) {
         & cmd /c "build-host\vtdump.exe 80 25 $codepage < build\qemu-boot.log"
         [Console]::OutputEncoding = $wasOut
         exit $bootStatus
+    }
+
+    'boardnet' {
+        # The network on the real board: the half `nettest` cannot do, because
+        # it needs a radio and a router.  Wants the board on a serial port.
+        Initialize-Environment
+        $rest = @()
+        $port = ''
+        for ($i = 0; $i -lt $Rest.Count; $i++) {
+            if ($Rest[$i] -match '^-{1,2}(port|p)$') {
+                $port = $Rest[$i + 1]
+                $i++
+            } elseif ($Rest[$i] -match '^-{1,2}big$') {
+                $rest += '--big'
+            } else {
+                $rest += $Rest[$i]
+            }
+        }
+        if (-not $port) {
+            Write-Host 'usage: argon boardnet -port COM3 [-big]'
+            exit 1
+        }
+        & python (Join-Path $PSScriptRoot 'boardnet.py') '-p' $port '--quiet' @rest
+        exit $LASTEXITCODE
+    }
+
+    'nettest' {
+        # The network in the emulator, against servers this PC runs.  Not part
+        # of `check`: it wants two ports and a Python that can bind them, and a
+        # firewall prompt is not a test failure.
+        & (Join-Path $PSScriptRoot 'nettest.ps1') @Rest
+        exit $LASTEXITCODE
     }
 
     'tests' {

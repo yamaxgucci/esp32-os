@@ -239,7 +239,7 @@ static void refusals(void)
  * can quietly break the machine it is running on.  Everything here is either a
  * read, which changes nothing, or a claim of a pin the system has said is free.
  */
-static void use_pins(void)
+static void use_pins(int pin)
 {
     const ag_io_api_t *io = ag_api()->io;
     if (io == NULL) {
@@ -248,22 +248,32 @@ static void use_pins(void)
     }
 
     /*
-     * The console's own pin.  Refused, and that refusal is the whole point of
-     * the pin table: an application that took it would end the conversation it
-     * is reporting over, and nobody would ever see why.
+     * A pin the system holds - the console's own, or the flash, or the card.
+     * It is looked for rather than named: this used to be pin 43, the S3's
+     * console TX, and on the first board that was not an S3 the number meant
+     * nothing and the check reported a failure of the pin table instead of a
+     * failure of its own assumption.
+     *
+     * Asked for as an input, because the point is the refusal.  A pin nobody
+     * owns answers AG_OK, and configuring it as an input drives nothing - the
+     * ones passed on the way are claimed, and come back when this process
+     * ends, which is the other thing this example is here to show.
      */
-    const ag_err_t console = io->gpio_config(43, AG_GPIO_OUT);
-    if (console != -AG_EACCES) {
-        ag_printf("  driving the console pin gave %d, wanted -AG_EACCES\n",
-                  (int)console);
-        s_failures++;
+    int system_pin = -1;
+    for (int p = 0; p < 64 && system_pin < 0; p++) {
+        if (io->gpio_config(p, AG_GPIO_IN) == -AG_EACCES) {
+            system_pin = p;
+        }
+    }
+    if (system_pin < 0) {
+        wrong("no pin at all is held by the system - the pin table is empty");
     } else {
-        ag_print("the console pin is refused, as it should be\n");
+        ag_printf("pin %d is the system's and is refused, as it should be\n",
+                  system_pin);
     }
 
     /* A pin that is nobody's.  Configure it, drive it, read it back. */
-    const int pin = 5;
-    ag_err_t  err = io->gpio_config(pin, AG_GPIO_OUT);
+    ag_err_t err = io->gpio_config(pin, AG_GPIO_OUT);
     if (err != AG_OK) {
         failed("gpio_config", err);
         return;
@@ -278,7 +288,7 @@ static void use_pins(void)
 
     /* Reading is allowed anywhere - it is how a wiring problem gets looked at
      * rather than guessed at - so a reserved pin still answers. */
-    if (io->gpio_read(43) < 0) {
+    if (system_pin >= 0 && io->gpio_read(system_pin) < 0) {
         wrong("reading a reserved pin should still work");
     }
     /* A pin the chip does not have is out of range, not a crash. */
@@ -292,7 +302,7 @@ static void use_pins(void)
      */
 }
 
-static void buses(void)
+static void buses(int adc_ch)
 {
     const ag_io_api_t *io = ag_api()->io;
     if (io == NULL) {
@@ -318,16 +328,47 @@ static void buses(void)
 
     /* The analogue input is a build option, so ask rather than assume. */
     if (AG_HAS(io, adc_read)) {
-        ag_printf("adc channel 0 reads %d\n", (int)io->adc_read(0));
+        const int32_t raw = io->adc_read(adc_ch);
+        if (raw == -AG_ENOTSUP) {
+            ag_printf("adc channel %d reaches no pin on this chip\n", adc_ch);
+        } else if (raw < 0) {
+            failed("adc_read", (ag_err_t)raw);
+        } else {
+            ag_printf("adc channel %d reads %d\n", adc_ch, (int)raw);
+        }
     } else {
         ag_print("no analogue input in this build\n");
     }
 }
 
+/* Small unsigned decimal; no libc here, and nothing needs more than this. */
+static int arg_int(const char *s, int fallback)
+{
+    if (s == NULL || *s == '\0') {
+        return fallback;
+    }
+    int v = 0;
+    for (const char *p = s; *p != '\0'; p++) {
+        if (*p < '0' || *p > '9') {
+            return fallback;
+        }
+        v = v * 10 + (*p - '0');
+    }
+    return v;
+}
+
+/*
+ *   run devs.axe [pin] [adc-channel]
+ *
+ * Both are arguments and not constants because this program is the one that
+ * gets run on a board nobody has run anything on before, and on such a board
+ * "pin 5" is a guess.  On the ESP32 display board pin 5 is the card's chip
+ * select and channel 6 is the light sensor: `run a:\devs.axe 22 6`.
+ */
 int ag_main(int argc, char **argv)
 {
-    (void)argc;
-    (void)argv;
+    const int pin = (argc > 1) ? arg_int(argv[1], 5) : 5;
+    const int adc_ch = (argc > 2) ? arg_int(argv[2], 0) : 0;
 
     if (!AG_HAS(ag_api()->dev, enumerate)) {
         ag_print("this build has no device manager\n");
@@ -342,8 +383,8 @@ int ag_main(int argc, char **argv)
     ask_flash();
     refusals();
     ag_print("\n");
-    use_pins();
-    buses();
+    use_pins(pin);
+    buses(adc_ch);
 
     ag_printf("\n%s\n", (s_failures == 0) ? "all checks passed"
                                           : "some checks failed");

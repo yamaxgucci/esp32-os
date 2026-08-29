@@ -1,5 +1,11 @@
 /*
- * ArgonOS port: ESP-IDF - OpenEth under QEMU, and lwIP sockets.
+ * ArgonOS port: ESP-IDF - the address and the sockets, over whichever link.
+ *
+ * Two links exist: OpenEth, which is a device QEMU emulates and no chip has,
+ * and the radio, which every ESP32 has and QEMU does not model.  They differ
+ * only in how the interface is brought up; from DHCP onwards - the address,
+ * the sockets, the whole of ag_port_net_* below - there is one path.  The
+ * radio itself is wifi_hw.c.
  *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
@@ -8,26 +14,47 @@
 #if CONFIG_ARGON_ENABLE_NET
 
 #include <argon/port/net.h>
+#include <argon/port/wifi.h>
 
 #include <errno.h>
 #include <fcntl.h>
 #include <string.h>
 #include <sys/time.h>
-#include <unistd.h>
 
-#include "esp_eth.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"
+#include "lwip/netdb.h"
 #include "lwip/sockets.h"
 #include "nvs_flash.h"
 
-static esp_netif_t                *s_netif;
+#include "net_hw.h"
+
+#if !AG_PORT_HAS_WIFI
+#include "esp_eth.h"
+#endif
+
+static esp_netif_t         *s_netif;
+static volatile bool        s_got_ip;
+static esp_ip4_addr_t       s_ip;
+static ag_port_net_ready_fn s_on_ready;
+
+#if !AG_PORT_HAS_WIFI
 static esp_eth_handle_t            s_eth;
 static esp_eth_netif_glue_handle_t s_glue;
-static volatile bool               s_got_ip;
-static esp_ip4_addr_t              s_ip;
-static ag_port_net_ready_fn        s_on_ready;
+#endif
+
+void ag_port_net_set_netif(esp_netif_t *netif) { s_netif = netif; }
+
+void ag_port_net_link_down(void)
+{
+    /*
+     * An address outlives the link that carried it unless somebody says
+     * otherwise, and ready() would keep answering yes to a machine with no
+     * network - which is the answer everything above here acts on.
+     */
+    s_got_ip = false;
+}
 
 static ag_err_t map_errno(int e)
 {
@@ -80,7 +107,8 @@ static void on_got_ip(void *arg, esp_event_base_t base, int32_t id, void *data)
 
 void ag_port_net_on_ready(ag_port_net_ready_fn fn) { s_on_ready = fn; }
 
-ag_err_t ag_port_net_start(void)
+/* Everything both links need before either can be brought up. */
+static ag_err_t common_start(void)
 {
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES ||
@@ -88,7 +116,8 @@ ag_err_t ag_port_net_start(void)
         (void)nvs_flash_erase();
         err = nvs_flash_init();
     }
-    /* Carry on either way: DHCP does not strictly need NVS. */
+    /* Carry on either way for Ethernet: DHCP does not strictly need NVS.  The
+     * radio does - it keeps its calibration there - and says so itself. */
 
     if (esp_netif_init() != ESP_OK) {
         return -AG_EIO;
@@ -98,6 +127,44 @@ ag_err_t ag_port_net_start(void)
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
         return -AG_EIO;
     }
+
+    /*
+     * ESP-IDF also logs GOT_IP under this tag.  The kernel's own line is
+     * enough; the duplicate used to glue itself to the shell prompt.
+     */
+    esp_log_level_set("esp_netif_handlers", ESP_LOG_WARN);
+    return AG_OK;
+}
+
+#if AG_PORT_HAS_WIFI
+
+ag_err_t ag_port_net_start(void)
+{
+    const ag_err_t err = common_start();
+    if (err != AG_OK) {
+        return err;
+    }
+
+    (void)esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &on_got_ip,
+                                     NULL);
+    /*
+     * The radio comes up and joins nothing.  Which network to join is a
+     * decision made from configuration, above this layer, and a board that
+     * joins something before anyone has asked is a board that cannot be used
+     * to find out why it will not join.
+     */
+    return ag_port_wifi_start();
+}
+
+#else
+
+ag_err_t ag_port_net_start(void)
+{
+    const ag_err_t cerr = common_start();
+    if (cerr != AG_OK) {
+        return cerr;
+    }
+    esp_err_t err;
 
     esp_netif_config_t cfg = ESP_NETIF_DEFAULT_ETH();
     s_netif = esp_netif_new(&cfg);
@@ -128,17 +195,14 @@ ag_err_t ag_port_net_start(void)
 
     (void)esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_GOT_IP, &on_got_ip,
                                      NULL);
-    /*
-     * ESP-IDF also logs GOT_IP under this tag.  The kernel's own line is
-     * enough; the duplicate used to glue itself to the shell prompt.
-     */
-    esp_log_level_set("esp_netif_handlers", ESP_LOG_WARN);
 
     if (esp_eth_start(s_eth) != ESP_OK) {
         return -AG_EIO;
     }
     return AG_OK;
 }
+
+#endif /* AG_PORT_HAS_WIFI */
 
 bool ag_port_net_ready(void) { return s_got_ip; }
 
@@ -154,15 +218,29 @@ ag_err_t ag_port_net_ifaddr(uint32_t *addr)
     return AG_OK;
 }
 
+/*
+ * Everything below talks to lwIP by its own names - lwip_socket, lwip_recv,
+ * lwip_fcntl - and never through the POSIX ones.
+ *
+ * That is not pedantry, it is a bug that cost an afternoon on the board.  In
+ * this build `recv` and `send` link straight to lwIP, but `fcntl` links to
+ * newlib's, which knows nothing about sockets: it answered 0 and did nothing,
+ * so a socket this code believed was non-blocking was still blocking, and a
+ * read of it never came back.  `select` meanwhile went through ESP-IDF's VFS
+ * and answered "readable" for a descriptor lwIP was still holding shut.
+ *
+ * One descriptor cannot belong to two layers.  These are lwIP's descriptors,
+ * so every call on them is lwIP's.
+ */
 int ag_port_net_listen(uint16_t port)
 {
-    const int fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    const int fd = lwip_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (fd < 0) {
         return (int)map_errno(errno);
     }
 
     int yes = 1;
-    (void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+    (void)lwip_setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
 
     struct sockaddr_in sa;
     memset(&sa, 0, sizeof(sa));
@@ -170,14 +248,26 @@ int ag_port_net_listen(uint16_t port)
     sa.sin_addr.s_addr = htonl(INADDR_ANY);
     sa.sin_port = htons(port);
 
-    if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
+    if (lwip_bind(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
         const ag_err_t e = map_errno(errno);
-        close(fd);
+        lwip_close(fd);
         return (int)e;
     }
-    if (listen(fd, 4) != 0) {
+    /*
+     * Two waiting, not four.
+     *
+     * The queue is not free: every connection in it is established, and an
+     * established connection is allowed a receive window's worth of memory in
+     * flight - on this chip that is thousands of bytes each, out of a heap with
+     * thirty-odd kilobytes in it.  A browser opens six connections to one page
+     * whether or not it has six things to ask for, and six of them pushing data
+     * ran the board out of memory and killed it.  Nothing here can serve more
+     * than one at a time anyway, so the rest are better refused at once - a
+     * refused connection is retried, a dead board is not.
+     */
+    if (lwip_listen(fd, 2) != 0) {
         const ag_err_t e = map_errno(errno);
-        close(fd);
+        lwip_close(fd);
         return (int)e;
     }
     return fd;
@@ -203,7 +293,7 @@ int ag_port_net_accept(int lfd, uint32_t timeout_ms)
         tv.tv_sec = (time_t)(timeout_ms / 1000u);
         tv.tv_usec = (suseconds_t)((timeout_ms % 1000u) * 1000u);
 
-        const int pr = select(lfd + 1, &rfds, NULL, NULL, &tv);
+        const int pr = lwip_select(lfd + 1, &rfds, NULL, NULL, &tv);
         if (pr < 0) {
             return (int)map_errno(errno);
         }
@@ -214,19 +304,19 @@ int ag_port_net_accept(int lfd, uint32_t timeout_ms)
 
     struct sockaddr_in peer;
     socklen_t          plen = sizeof(peer);
-    const int          cfd = accept(lfd, (struct sockaddr *)&peer, &plen);
+    const int          cfd = lwip_accept(lfd, (struct sockaddr *)&peer, &plen);
     if (cfd < 0) {
         return (int)map_errno(errno);
     }
 
     int yes = 1;
-    (void)setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
+    (void)lwip_setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
     return cfd;
 }
 
 int ag_port_net_connect(uint32_t addr, uint16_t port, uint32_t timeout_ms)
 {
-    const int fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    const int fd = lwip_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (fd < 0) {
         return (int)map_errno(errno);
     }
@@ -235,8 +325,8 @@ int ag_port_net_connect(uint32_t addr, uint16_t port, uint32_t timeout_ms)
         struct timeval tv;
         tv.tv_sec = (time_t)(timeout_ms / 1000u);
         tv.tv_usec = (suseconds_t)((timeout_ms % 1000u) * 1000u);
-        (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        (void)lwip_setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        (void)lwip_setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     }
 
     struct sockaddr_in sa;
@@ -245,9 +335,9 @@ int ag_port_net_connect(uint32_t addr, uint16_t port, uint32_t timeout_ms)
     sa.sin_addr.s_addr = htonl(addr);
     sa.sin_port = htons(port);
 
-    if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
+    if (lwip_connect(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
         const ag_err_t e = map_errno(errno);
-        close(fd);
+        lwip_close(fd);
         return (int)e;
     }
     return fd;
@@ -258,7 +348,7 @@ int32_t ag_port_net_send(int fd, const void *buf, size_t len)
     if (fd < 0) {
         return -AG_EBADF;
     }
-    const int n = (int)send(fd, buf, len, 0);
+    const int n = (int)lwip_send(fd, buf, len, 0);
     return (n < 0) ? (int32_t)map_errno(errno) : (int32_t)n;
 }
 
@@ -267,15 +357,95 @@ int32_t ag_port_net_recv(int fd, void *buf, size_t len)
     if (fd < 0) {
         return -AG_EBADF;
     }
-    const int n = (int)recv(fd, buf, len, 0);
+    const int n = (int)lwip_recv(fd, buf, len, 0);
     return (n < 0) ? (int32_t)map_errno(errno) : (int32_t)n;
 }
 
 void ag_port_net_close(int fd)
 {
     if (fd >= 0) {
-        (void)close(fd);
+        (void)lwip_close(fd);
     }
+}
+
+/*
+ * A name into an address, over whichever interface has the lease.
+ *
+ * getaddrinfo() rather than lwIP's dns_gethostbyname(): the latter must be
+ * called from the TCP/IP task and this is called from the shell.  The wrapper
+ * in netdb.h does that hop, and it is the only reason to prefer a POSIX call
+ * inside this port.
+ *
+ * The timeout is lwIP's own (DNS_MAX_RETRIES against the servers DHCP gave us),
+ * which is why the contract does not offer one.  Refusing to ask before there
+ * is an address is not an optimisation: without a lease there is no server to
+ * ask, and the resolver would spend its full retry budget finding that out.
+ */
+ag_err_t ag_port_net_resolve(const char *host, uint32_t *addr)
+{
+    if (host == NULL || addr == NULL || host[0] == '\0') {
+        return -AG_EINVAL;
+    }
+    if (!s_got_ip) {
+        return -AG_EAGAIN;
+    }
+
+    const struct addrinfo hints = {
+        .ai_family = AF_INET,
+        .ai_socktype = SOCK_STREAM,
+    };
+    struct addrinfo *res = NULL;
+
+    if (getaddrinfo(host, NULL, &hints, &res) != 0 || res == NULL) {
+        if (res != NULL) {
+            freeaddrinfo(res);
+        }
+        return -AG_ENOENT;
+    }
+
+    ag_err_t err = -AG_ENOENT;
+    for (const struct addrinfo *ai = res; ai != NULL; ai = ai->ai_next) {
+        if (ai->ai_family != AF_INET || ai->ai_addr == NULL) {
+            continue;
+        }
+        const struct sockaddr_in *sa = (const struct sockaddr_in *)ai->ai_addr;
+        *addr = ntohl(sa->sin_addr.s_addr);
+        err = AG_OK;
+        break;
+    }
+    freeaddrinfo(res);
+    return err;
+}
+
+int32_t ag_port_net_recv_now(int fd, void *buf, size_t len)
+{
+    if (fd < 0) {
+        return -AG_EBADF;
+    }
+    const int n = (int)lwip_recv(fd, buf, len, MSG_DONTWAIT);
+    return (n < 0) ? (int32_t)map_errno(errno) : (int32_t)n;
+}
+
+int ag_port_net_wait_readable(int fd, uint32_t timeout_ms)
+{
+    if (fd < 0) {
+        return -AG_EBADF;
+    }
+
+    fd_set         rfds;
+    struct timeval tv;
+
+    FD_ZERO(&rfds);
+    FD_SET(fd, &rfds);
+    tv.tv_sec = (time_t)(timeout_ms / 1000u);
+    tv.tv_usec = (suseconds_t)((timeout_ms % 1000u) * 1000u);
+
+    const int n = lwip_select(fd + 1, &rfds, NULL, NULL,
+                         (timeout_ms == UINT32_MAX) ? NULL : &tv);
+    if (n < 0) {
+        return (int)map_errno(errno);
+    }
+    return (n > 0) ? 1 : 0;
 }
 
 ag_err_t ag_port_net_nonblock(int fd, bool on)
@@ -283,12 +453,12 @@ ag_err_t ag_port_net_nonblock(int fd, bool on)
     if (fd < 0) {
         return -AG_EBADF;
     }
-    const int flags = fcntl(fd, F_GETFL, 0);
+    const int flags = lwip_fcntl(fd, F_GETFL, 0);
     if (flags < 0) {
         return map_errno(errno);
     }
     const int next = on ? (flags | O_NONBLOCK) : (flags & ~O_NONBLOCK);
-    if (fcntl(fd, F_SETFL, next) < 0) {
+    if (lwip_fcntl(fd, F_SETFL, next) < 0) {
         return map_errno(errno);
     }
     return AG_OK;

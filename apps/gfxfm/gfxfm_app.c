@@ -13,5 +13,17 @@
  */
 #include <argon/argon.h>
 
-/* Heap: two panels × 512 entries (same budget as text fm). */
-AG_APP_SIZED("GFXFM", "1.0", "argon", AG_AXE_NEEDS_GFX, 0, 512 * 1024);
+/*
+ * The default arena, not a named size.
+ *
+ * A named size is *required* - the loader refuses the application when it
+ * cannot be had - and half a megabyte cannot be had on a board with 320 KB of
+ * SRAM in total.  What that looked like was GFXFM starting and returning
+ * instantly with nothing printed, which is a poor way to say "there is not
+ * enough memory".
+ *
+ * The panels size themselves to what the arena will give (fm_read_panel halves
+ * its entry count until it fits), so asking for the default is not a compromise
+ * here: it is the thing that lets one image run on both machines.
+ */
+AG_APP("GFXFM", "1.0", "argon", AG_AXE_NEEDS_GFX);

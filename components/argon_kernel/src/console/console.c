@@ -10,6 +10,7 @@
 
 #include <argon/codepage.h>
 #include <argon/display.h>
+#include <argon/textpanel.h>
 
 #include <argon/port/mem.h>
 #include <argon/port/time.h>
@@ -143,6 +144,9 @@ static void render_all(void)
     }
     /* Soft (or panel) local fb, while graphics mode has not taken it over. */
     ag_display_render_console(&s_screen);
+    /* A panel with no framebuffer takes the same screen as characters. */
+    ag_textpanel_render(&s_screen);
+    ag_inputpoll_tick();
     ag_screen_clear_dirty(&s_screen);
 }
 
@@ -268,10 +272,25 @@ void ag_console_restore_tty(void)
 /* Input                                                                  */
 /* ---------------------------------------------------------------------- */
 
+/* When something last arrived from a person.  Zero at boot means "at boot",
+ * which is the right answer: the machine has been idle since it started. */
+static uint32_t s_last_input_ms;
+
 static void publish(const ag_event_t *ev)
 {
     ag_event_t stamped = *ev;
     stamped.ts = (ag_time_t)ag_port_us();
+
+    /*
+     * Somebody is there.  Recorded before the hotkey filter below, because
+     * Ctrl+C and Ctrl+\ are somebody being there as much as any other key -
+     * and this is the one clock the idle timer in src/core/powerctl.c has.
+     *
+     * Every kind of input arrives through here, including what a touchscreen
+     * driver and a pad injects, which is why it is one line rather than one per
+     * source.
+     */
+    s_last_input_ms = now_ms();
 
     /*
      * The supervisor gets first look.  It must be quick - this runs on the
@@ -399,6 +418,11 @@ bool ag_console_inject_event(const ag_event_t *ev)
     }
     publish(ev);
     return true;
+}
+
+uint32_t ag_console_idle_ms(void)
+{
+    return (uint32_t)(now_ms() - s_last_input_ms);
 }
 
 bool ag_console_read_event(ag_event_t *ev, uint32_t timeout_ms)

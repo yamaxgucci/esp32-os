@@ -24,6 +24,47 @@ menu "ArgonOS"
             allocated from extended memory (PSRAM), so statics and bss are not
             bounded by this number.
 
+    config ARGON_APP_ARENA_PSRAM
+        bool "Put the code arena in PSRAM (S-1)"
+        default n
+        help
+            Move the code arena out of internal SRAM and into PSRAM, mapped into
+            the instruction window so an application still executes from it.
+
+            This is the trade the ESP32-S3 alone can make.  Instruction RAM and
+            the DMA-capable data RAM are one physical SRAM, so on the primary
+            target the arena and the radios fight over the same ~330 KB and a
+            192 KB arena leaves no room for Wi-Fi and Bluetooth at once.  PSRAM
+            reaches the instruction bus on this chip, so the arena can live in
+            the 8 MB instead and the internal SRAM it held goes back to the
+            radios and the heap - ARGON_APP_ARENA_KB then costs PSRAM, not
+            internal memory, and can be far larger.
+
+            The cost is speed: PSRAM is an order slower than internal SRAM and
+            cached, so a hot inner loop (an emulator core, a DSP block) pays for
+            every cache miss.  Code that needs internal-SRAM speed will want a
+            hot-text split later; this is the coarse form that makes everything
+            fit.
+
+            Off by default and everywhere but the board that has been shown to
+            do it: it needs PSRAM that reaches the instruction bus, which QEMU
+            does not model and the original ESP32 does not have.  With it off,
+            the arena is the internal-SRAM buffer described above and nothing
+            changes.
+
+    config ARGON_APP_ARENA_PSRAM_KB
+        int "PSRAM code arena, KB"
+        depends on ARGON_APP_ARENA_PSRAM
+        range 64 8192
+        default 512
+        help
+            The size of the PSRAM code arena, used instead of ARGON_APP_ARENA_KB
+            when the arena is in PSRAM.  It costs PSRAM rather than internal
+            SRAM, so it can be large: the default holds the biggest images in
+            the tree several times over.  The internal-SRAM static buffer is not
+            linked at all in this mode, which is the point - the internal memory
+            it would have taken stays free for the radios.
+
     config ARGON_APP_STACK_KB
         int "Default application stack, KB"
         range 2 64
@@ -53,6 +94,94 @@ menu "ArgonOS"
             out and io->adc_read is NULL.  Turn this on for a real board, where
             the calibration works, and expect QEMU to stop booting.
 
+    config ARGON_ENABLE_CAMERA
+        bool "Camera transport (api->cam over DVP)"
+        depends on !ARGON_CAMERA_BUILTIN
+        default n
+        help
+            Links ESP-IDF's esp_cam_ctlr DVP driver (LCD_CAM + DMA) and exposes
+            it as api->cam - the thin, sensor-agnostic half of a camera.  The
+            sensor itself (its register tables, its SCCB init) is a loadable
+            .SYS that configures this transport and reads frames; the firmware
+            carries only the transport, so a new sensor is a new module, not a
+            rebuild.
+
+            Off by default and everywhere but the S3 CAM board: QEMU has no
+            camera, and it needs PSRAM for the frame buffer.
+
+    config ARGON_CAMERA_BUILTIN
+        bool "Camera built into the image (esp32-camera, sensor zoo in firmware)"
+        default n
+        help
+            The other camera, the fat one: Espressif's esp32-camera component
+            compiled into the firmware, transport and every sensor driver it
+            knows, bringing /dev/cam0 up at boot with no module to load.  This
+            is the opposite trade to ARGON_ENABLE_CAMERA above - the whole zoo
+            (~100-150 KB, ~30 sensors) rides in the image, but any of those
+            sensors just works, and the picture path is the one Espressif
+            maintains.  For a fixed product that always has the same camera and
+            wants it turned on the instant it powers up.
+
+            Off by default: it pulls the espressif/esp32-camera managed
+            component (fetched only when this is set - see main/idf_component.yml)
+            and, like the transport above, needs PSRAM and the LCD_CAM the two
+            share, so the two are mutually exclusive.  Pins come from BOARD.CFG's
+            [camera] section.  QEMU has no camera; this is a real-board switch,
+            reachable as `argon target esp32s3-cam`.
+
+    config ARGON_ENABLE_AUDIO
+        bool "Sound output hardware (/dev/pcm0)"
+        default n
+        help
+            Links the machine's own PCM output and registers /dev/pcm0, which
+            is what `--out audio` and audio_out=i2s in a config already mean.
+
+            Off by default because most targets have nothing to link: the
+            original ESP32 has a pair of 8-bit converters on fixed pins and the
+            ESP32-S3 has none at all, and QEMU models neither.  With this off
+            the only sink is the mute /dev/pcmnull and every program that plays
+            sound still runs.
+
+            What it costs when something is playing is about four kilobytes of
+            DMA buffers, taken on the first write and given back on close.
+
+    config ARGON_ENABLE_PM
+        bool "Frequency scaling (power eco)"
+        default n
+        select PM_ENABLE
+        help
+            Links ESP-IDF's power management, which is the only supported way
+            to change the processor's clock while the system is running.
+
+            With this off nothing about `power` disappears: the modes still
+            change, the screen still goes out, the applications are still told
+            and the journal still records it - the clock simply stays where it
+            is, and the command says so in as many words.
+
+            It does not fit everywhere.  On the ESP32-S3 image, enabling it
+            overflows the data segment by about a kilobyte: ESP-IDF's power
+            management keeps its locks and its scaling state in internal RAM,
+            and that image has none to spare.  The ESP32 image - the board with
+            a battery connector on it, which is the one that needs this - links
+            with room left.
+
+            Off by default for the same reason the ADC is: what it does cannot
+            be verified in the emulator.  QEMU models a clock tree that does
+            not change, so a build with this on is a build whose central claim
+            is untested until it is on a board with a meter on it.
+
+            It is also not free on hardware.  Lowering the processor's clock
+            lowers the peripheral bus with it, and every driver that talks to a
+            bus has to take a lock while it does so - ESP-IDF's drivers do, the
+            ones in this tree go through those, and anything that latched a
+            divider without asking talks at the wrong rate afterwards.  The
+            console is the one to watch: garbage on the serial port is the
+            failure this arrangement produces, and a board that cannot be
+            talked to cannot be told to speed up again.
+
+            Turn it on for a board, measure the milliamps at each setting, and
+            write the numbers down - see docs/11-power.md.
+
     config ARGON_CONSOLE_KEY_EVENTS
         bool "Request key-up events from the terminal"
         default n
@@ -76,10 +205,188 @@ menu "ArgonOS"
             Ethernet MAC that Espressif QEMU emulates.  That is the path for
             streaming PCM to a Windows host without the UART bottleneck.
 
-            OpenEth does not exist on a real chip: leave this on for QEMU
-            development, and turn it off (or replace the link with Wi-Fi)
-            before flashing hardware.  A failed bring-up is non-fatal; the
-            table stays present but ready() stays false.
+            OpenEth does not exist on a real chip and the radio does not exist
+            in QEMU, so which link is built is a second option below.  A failed
+            bring-up is non-fatal either way; the table stays present but
+            ready() stays false.
+
+    config ARGON_NET_WIFI
+        bool "...over the radio instead of OpenEth"
+        depends on ARGON_ENABLE_NET
+        default n
+        select ESP_WIFI_ENABLED
+        help
+            Brings the network up on Wi-Fi, station mode, instead of the
+            OpenCores Ethernet MAC that Espressif's QEMU emulates.  Above the
+            port nothing changes: the same api->net, the same sockets, the same
+            address printed by the same line.
+
+            It is not the default because it cannot be verified in QEMU, which
+            models no radio at all - a build with this on boots on hardware and
+            has no network in the emulator.  It also costs: the Wi-Fi stack is
+            tens of kilobytes of RAM on a chip whose whole internal memory is
+            320, and every one of them is taken whether a network is joined or
+            not.
+
+            Which network to join comes from [wifi] in SYSTEM.CFG or from the
+            `wifi` command; the radio starts joined to nothing.
+
+    config ARGON_NET_WIFI_AP
+        bool "...and can run its own access point"
+        depends on ARGON_NET_WIFI
+        default y
+        help
+            Lets the board offer a network of its own, not only join one: a
+            fixed-name access point a phone connects to directly, so the card is
+            reachable in a browser with no router in between.  `wifi ap <name>
+            [key]` turns it on; [ap] in SYSTEM.CFG brings it up at boot.
+
+            On by default because it is cheap next to the radio it rides on -
+            the Wi-Fi stack is already linked once ARGON_NET_WIFI is set, and the
+            point adds a second netif and a DHCP server, a few kilobytes taken
+            only while the point is actually up.  Turn it off for a station-only
+            board that wants those kilobytes back at link time.
+
+            This chip has one radio: while the board is also joined to a network
+            the point is forced onto that network's channel, and `wifi` says
+            which channel it ended up on.
+
+    config ARGON_NET_ESPNOW
+        bool "...and can talk to another board with ESP-NOW"
+        depends on ARGON_NET_WIFI
+        default y
+        help
+            Board-to-board datagrams on the same radio, with no access point
+            and no association between them: two boards on one channel throw
+            short frames straight at each other's hardware address.  `espnow`
+            sends and listens; a sensor with no router in the room reaches its
+            sibling this way.
+
+            On by default and cheap - it is the Wi-Fi stack, already linked,
+            used a different way; the only cost of its own is a small receive
+            queue in the kernel, taken while `espnow` is on and given back when
+            it is off.  Turn it off for a board that has nothing to say to
+            another board.
+
+            Not verifiable in QEMU, which models no radio: it takes two real
+            boards on one channel.
+
+    config ARGON_NET_WIFI_MON
+        bool "...and can watch the air and inject raw frames"
+        depends on ARGON_NET_WIFI
+        default n
+        help
+            Monitor mode and raw 802.11 injection: the radio turned into a
+            receiver on one channel, handing up every frame it hears whether it
+            is addressed to this board or not, and a way to put frames of the
+            board's own making on the air.  `mon` watches, sweeps channels and
+            lists what it sees; `mon tx`/`deauth`/`beacon` inject.
+
+            Off by default, and unlike the access point and ESP-NOW that is a
+            decision, not thrift.  A board that joins and serves networks is a
+            participant; a board that listens to everyone's frames and forges
+            its own is a different kind of thing, and it should be that kind of
+            thing only because whoever built the image chose it - see the
+            security note in docs/04-roadmap.md, phase 6.  The capture ring is a
+            couple of kilobytes, taken only while `mon` is on.
+
+            Legitimate for testing a driver, measuring a channel, or security
+            work on networks you are allowed to touch.  Not verifiable in QEMU,
+            which models no radio.
+
+    config ARGON_BOARD_PROBE
+        bool "Board probe instead of the system"
+        default n
+        help
+            Builds an image that talks to one peripheral and nothing else: no
+            scheduler, no console task, no drivers, no pin table.  It runs from
+            app_main and never starts the kernel.
+
+            For the case where a peripheral answers nothing and there are four
+            possible reasons at once - the wiring, the driver, the way the
+            kernel polls it, and the claims on its pins.  This removes three of
+            them in one flash.  What it probes is in main/probe.c and is
+            expected to be edited; it is a bring-up tool, not a feature.
+
+    config ARGON_ENABLE_BLE
+        bool "Bluetooth Low Energy (input devices)"
+        default n
+        select BT_ENABLED
+        select BT_NIMBLE_ENABLED
+        help
+            The host side of BLE, so that a keyboard or a mouse can be attached
+            to a board whose chip has no USB - which the original ESP32 has
+            not, at all.  `bt` scans and pairs; a keyboard's reports arrive as
+            ordinary console events, so the shell, the editor and the file
+            manager do not know the difference.
+
+            It rides in the same image as Wi-Fi - both stacks are linked and
+            the board's own default (sdkconfig.defaults.esp32) enables both -
+            because code in flash costs no RAM until something runs it, and
+            neither radio starts until asked: `wifi on` / `bt on`, or a
+            [wifi]/[ap]/[bt] in SYSTEM.CFG, brings one up later.
+
+            What does not fit is running both at once.  With both radios up the
+            general heap drops to single-digit kilobytes (the memory table in
+            docs/09-esp32-cyd.md: ~11 KB free, largest block ~7), below what an
+            application needs - so the board runs one radio at a time.  A board
+            that genuinely needs both up together wants an S3 with PSRAM.
+
+            Also not verifiable in QEMU, which models no radio.
+
+    config ARGON_BLE_CENTRAL
+        bool "General BLE central (scan/observe, and later GATT client)"
+        depends on ARGON_ENABLE_BLE
+        default y
+        help
+            Everything a BLE central does beyond attaching a keyboard.  `ble`
+            listens to what every device in range advertises and says what each
+            is - name, address, signal, whether it is connectable, its services,
+            its maker; and (added incrementally) connects to an arbitrary device
+            to read and write an arbitrary characteristic, not only HID.
+
+            On by default and cheap - it rides the NimBLE host the keyboard host
+            already starts, so it adds code but no second controller.  Turn it
+            off for a board that only ever wants a keyboard.
+
+            Not verifiable in QEMU, which models no radio.
+
+    config ARGON_BLE_PERIPHERAL
+        bool "BLE peripheral (the board is seen and connected to)"
+        depends on ARGON_ENABLE_BLE
+        default y
+        help
+            The other direction from central: the board advertises a name and
+            holds a small GATT server, so a phone or PC connects to it and reads
+            and writes a characteristic.  `ble adv <name>` starts it.
+
+            On by default; it registers one custom service in the NimBLE host
+            the keyboard already runs.  Turn it off for a board that should
+            never be connectable - a keyboard host that stays invisible.
+
+            Not verifiable in QEMU, which models no radio.
+
+    config ARGON_CONSOLE_COLS
+        int "Console width, characters"
+        range 20 240
+        default 80
+
+    config ARGON_CONSOLE_ROWS
+        int "Console height, characters"
+        range 10 128
+        default 25
+        help
+            The text screen every endpoint renders: the serial console, the
+            local framebuffer and a panel driver all show this one grid.
+
+            Eighty by twenty-five unless the board's own screen cannot hold it.
+            The system draws 8x8 cells on a panel, so a 320x240 display holds
+            forty by thirty, and a console wider than the only screen attached
+            to the machine is one whose right-hand half nobody ever sees.
+
+            Not a runtime setting, and not in BOARD.CFG: the console is built
+            three stages before any file has been read, and everything printed
+            during those stages would be lost by rebuilding it afterwards.
 
     config ARGON_ENABLE_HOSTFS
         bool "HostFS (H:, live host folder over UART1)"

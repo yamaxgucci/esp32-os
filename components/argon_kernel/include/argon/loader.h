@@ -32,6 +32,20 @@ typedef struct {
     void *code_scratch;
     void *xip_slot;
     bool  code_from_xip;
+    /*
+     * The chunked XIP path (a small rolling scratch instead of a code-size one)
+     * relocates and programs the appfs slot itself, so the orchestrator must not
+     * program it again - it only maps it.
+     */
+    bool  xip_programmed;
+
+    /*
+     * S-1: code placed in the PSRAM arena.  It is written through
+     * place.code_writable (the data window) and executed at place.code (the
+     * instruction window); the block is freed back to the PSRAM arena on
+     * release, and the whole-arena mapping stays for the next image.
+     */
+    bool  code_from_psram;
 } ag_loaded_app_t;
 
 /*
@@ -40,6 +54,14 @@ typedef struct {
  */
 ag_err_t ag_loader_load(const char *path, const char *cwd,
                         ag_loaded_app_t *out);
+
+/*
+ * Just the header, validated, without placing or relocating anything.  For a
+ * caller that has to size something before the image can be loaded - the stack
+ * it will run on, the arena it asked for.
+ */
+ag_err_t ag_loader_peek(const char *path, const char *cwd,
+                        ag_axe_header_t *out);
 
 void ag_loader_unload(ag_loaded_app_t *app);
 

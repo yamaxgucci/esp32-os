@@ -60,6 +60,22 @@ static const uint16_t k_cga565[16] = {
 static uint16_t *s_front; /* presented: QEMU FB or owned PSRAM          */
 static uint16_t *s_back;  /* draw target while acquired; NULL = single */
 static uint16_t *s_draw;  /* s_back while acquired with DB, else front */
+
+/*
+ * No surface of our own: the panel is driven by a loadable driver and every
+ * application brings its own pixels (gfx->present, ABI 0.31).
+ *
+ * [display] driver = panel.  For a machine where a shared framebuffer is a
+ * luxury rather than a given - 320x240 in RGB565 is 150 KB and this board has
+ * 320 KB of SRAM in total - and where the applications that want the screen
+ * want it in their own shape anyway.
+ *
+ * s_front stays NULL, which is what makes this safe rather than delicate: every
+ * drawing primitive goes through draw_surf() and every one of them refuses a
+ * surface whose pixels are NULL, so the whole soft renderer becomes a no-op
+ * without a single extra test.
+ */
+static bool s_surfaceless;
 static uint16_t *s_snap;  /* last released graphics frame, for gfxdump */
 static uint16_t  s_w;
 static uint16_t  s_h;
@@ -76,6 +92,7 @@ static int16_t   s_caret_row = -1;
 
 static ag_device_t *s_dev;
 static bool      s_panel; /* false when this machine has no panel     */
+static bool      s_screen_on = true; /* ag_display_power                  */
 
 static size_t fb_bytes(void)
 {
@@ -99,12 +116,128 @@ static size_t fb_bytes(void)
  * presented whole.  The extra columns cost nothing on this side: they are read
  * by the panel, while the copy the guest pays for stays narrow.
  */
-static void panel_present_rows(int32_t y, int32_t h)
+/*
+ * The other kind of panel: one that has no framebuffer and is driven by a
+ * loadable module (ABI 0.30, ag_display_ops_t::blit_rect).
+ *
+ * Only while an application holds the display.  The rest of the time such a
+ * panel is showing the console, which reaches it as characters by a different
+ * road entirely (src/dev/textpanel.c) - pushing this surface at it as well
+ * would be two things drawing the same glass, and the smaller one would win
+ * every tenth of a second.
+ *
+ * The device is looked up rather than remembered for the reason textpanel.c
+ * gives: the driver is loadable and a remembered pointer outlives it by
+ * exactly one frame.
+ */
+/*
+ * Hand one rectangle of pixels to whichever display driver can show them.
+ *
+ * The registry is held across the call because the vtable lives in a loadable
+ * module's arena, and holding it is also what tells the io layer that the pins
+ * being written belong to the system rather than to whoever called in - see
+ * caller() in src/dev/io.c, which is where a whole frame once went into a single
+ * character cell for want of exactly this.
+ */
+static void driver_present_blit(const ag_blit_t *b)
 {
-    if (!s_panel || s_front == NULL || s_w == 0 || s_h == 0) {
+    if (b == NULL || b->px == NULL || b->w == 0 || b->h == 0) {
         return;
     }
-    ag_port_panel_present(y, h);
+
+    ag_dev_lock_hold();
+    for (uint32_t i = 0;; i++) {
+        ag_devinfo_t info;
+        if (ag_dev_info(i, AG_DEV_DISPLAY, &info) != AG_OK) {
+            break;
+        }
+        ag_device_t *dev = ag_dev_find(info.name);
+        if (dev == NULL || dev->class_ops == NULL) {
+            continue;
+        }
+        const ag_display_ops_t *ops = (const ag_display_ops_t *)dev->class_ops;
+        if (!AG_HAS(ops, blit_rect) || ops->blit_rect == NULL) {
+            continue;
+        }
+        ops->blit_rect(0, b);
+    }
+    ag_dev_lock_release();
+}
+
+/* The panel's own size, for a system that has no surface of its own to size. */
+static bool panel_size(uint16_t *w, uint16_t *h)
+{
+    bool found = false;
+
+    ag_dev_lock_hold();
+    for (uint32_t i = 0; !found; i++) {
+        ag_devinfo_t info;
+        if (ag_dev_info(i, AG_DEV_DISPLAY, &info) != AG_OK) {
+            break;
+        }
+        ag_device_t *dev = ag_dev_find(info.name);
+        if (dev == NULL || dev->class_ops == NULL) {
+            continue;
+        }
+        const ag_display_ops_t *ops = (const ag_display_ops_t *)dev->class_ops;
+        if (ops->info == NULL) {
+            continue;
+        }
+        ag_gfxinfo_t gi;
+        if (ops->info(0, &gi) != AG_OK || gi.width == 0 || gi.height == 0) {
+            continue;
+        }
+        *w = gi.width;
+        *h = gi.height;
+        found = true;
+    }
+    ag_dev_lock_release();
+    return found;
+}
+
+static void driver_present_rect(int32_t x, int32_t y, int32_t w, int32_t h)
+{
+    if (s_front == NULL || !s_acquired || w <= 0 || h <= 0) {
+        return;
+    }
+    /* The rectangle's own origin, not the framebuffer's - see ag_blit_t. */
+    const ag_blit_t b = {
+        .px = (const uint8_t *)s_front + (size_t)y * s_stride +
+              (size_t)x * sizeof(uint16_t),
+        .stride = s_stride,
+        .surf_w = s_w,
+        .surf_h = s_h,
+        .x = (uint16_t)x,
+        .y = (uint16_t)y,
+        .w = (uint16_t)w,
+        .h = (uint16_t)h,
+    };
+    driver_present_blit(&b);
+}
+
+static void panel_present_rect(int32_t x, int32_t y, int32_t w, int32_t h)
+{
+    if (s_front == NULL || s_w == 0 || s_h == 0) {
+        return;
+    }
+    /*
+     * One choke point for both paths - the panel this port opened and the
+     * driver that takes rectangles - so that "the screen is off" is one test
+     * rather than one per caller.  Drawing carries on into the framebuffer;
+     * only sending it anywhere stops.
+     */
+    if (!s_screen_on) {
+        return;
+    }
+    if (s_panel) {
+        ag_port_panel_present(y, h);
+    }
+    driver_present_rect(x, y, w, h);
+}
+
+static void panel_present_rows(int32_t y, int32_t h)
+{
+    panel_present_rect(0, y, (int32_t)s_w, h);
 }
 
 static void panel_present(void) { panel_present_rows(0, (int32_t)s_h); }
@@ -159,7 +292,7 @@ static void present_rect_to_front(int32_t x, int32_t y, int32_t w, int32_t h)
             }
         }
     }
-    panel_present_rows(y, h);
+    panel_present_rect(x, y, w, h);
 }
 
 /* Copy draw → front (full frame). No-op when drawing already targets front. */
@@ -375,11 +508,42 @@ static bool gfx_may_present(void)
 
 static ag_err_t gfx_acquire(ag_gfxinfo_t *out)
 {
-    if (!s_ready || s_front == NULL) {
+    if (!s_ready) {
         return -AG_ENODEV;
     }
     if (s_acquired) {
         return -AG_EBUSY;
+    }
+
+    if (s_surfaceless) {
+        /*
+         * The size is the panel's, and it is asked for here rather than at boot
+         * because at boot the driver that knows it has not been loaded yet.
+         */
+        uint16_t pw = 0, ph = 0;
+        if (!panel_size(&pw, &ph)) {
+            return -AG_ENODEV;
+        }
+        s_w = pw;
+        s_h = ph;
+        s_stride = (uint32_t)pw * sizeof(uint16_t);
+        s_acquired = true;
+        s_owner = ag_proc_self();
+        s_draw = NULL;
+        if (out != NULL) {
+            out->width = pw;
+            out->height = ph;
+            out->fmt = AG_PIX_RGB565;
+            out->stride = s_stride;
+            out->fb = NULL; /* there is none: use gfx->present */
+            out->double_buf = false;
+            out->direct = true;
+        }
+        return AG_OK;
+    }
+
+    if (s_front == NULL) {
+        return -AG_ENODEV;
     }
     s_acquired = true;
     s_owner = ag_proc_self();
@@ -410,6 +574,19 @@ static ag_err_t gfx_acquire(ag_gfxinfo_t *out)
 static void gfx_release(void)
 {
     if (!s_acquired) {
+        return;
+    }
+    if (s_surfaceless) {
+        s_acquired = false;
+        s_owner = AG_PID_KERNEL;
+        /* The panel still has the application's last frame on it; the console
+         * takes it back the same way it does after a framebuffer app. */
+        s_console_gen = 0;
+        if (ag_console_ready()) {
+            ag_console_lock();
+            ag_screen_mark_all_dirty(ag_console_screen());
+            ag_console_unlock();
+        }
         return;
     }
     /* Show the last drawn frame and keep a snapshot for gfxdump / Alt-Tab. */
@@ -448,6 +625,44 @@ static void gfx_swap(void)
         return;
     }
     present_draw_to_front();
+}
+
+/*
+ * The caller's own pixels (ABI 0.31).
+ *
+ * Nothing is copied and nothing is kept: the rectangle goes to the panel and
+ * this returns when it has been sent.  There is no system surface involved even
+ * when one exists, which is the whole point - an application whose picture is a
+ * different shape from the system's should not have to pay for both.
+ *
+ * Clipped to the surface the caller declares, because a rectangle outside it is
+ * a mistake in the caller and a panel full of somebody else's memory here.
+ */
+static ag_err_t gfx_present(const ag_blit_t *in)
+{
+    if (in == NULL || in->px == NULL || in->surf_w == 0 || in->surf_h == 0) {
+        return -AG_EINVAL;
+    }
+    if (!gfx_may_present()) {
+        return -AG_EPERM;
+    }
+
+    ag_blit_t b = *in;
+    if (b.x >= b.surf_w || b.y >= b.surf_h) {
+        return -AG_EINVAL;
+    }
+    if (b.w == 0 || b.w > (uint16_t)(b.surf_w - b.x)) {
+        b.w = (uint16_t)(b.surf_w - b.x);
+    }
+    if (b.h == 0 || b.h > (uint16_t)(b.surf_h - b.y)) {
+        b.h = (uint16_t)(b.surf_h - b.y);
+    }
+    if (b.stride < (uint32_t)b.surf_w * sizeof(uint16_t)) {
+        return -AG_EINVAL;
+    }
+
+    driver_present_blit(&b);
+    return AG_OK;
 }
 
 /*
@@ -603,6 +818,20 @@ static void gfx_backlight(uint8_t percent)
 {
     (void)percent; /* soft display has no backlight */
 }
+
+void ag_display_power(bool on)
+{
+    if (on == s_screen_on) {
+        return;
+    }
+    s_screen_on = on;
+    if (on) {
+        /* The whole frame, because nothing recorded what was missed. */
+        panel_present();
+    }
+}
+
+bool ag_display_powered(void) { return s_screen_on; }
 
 static void gfx_pixel(int16_t x, int16_t y, uint32_t color)
 {
@@ -811,6 +1040,7 @@ const ag_gfx_api_t ag_gfx_api_table = {
     .acquire = gfx_acquire,
     .release = gfx_release,
     .flush = gfx_flush,
+    .present = gfx_present,
     .swap = gfx_swap,
     .clear = gfx_clear,
     .fill_rect = gfx_fill_rect,
@@ -1026,6 +1256,15 @@ ag_err_t ag_display_dump_ppm(const char *path, const char *cwd, bool live)
     return AG_OK;
 }
 
+/*
+ * What has to be left over after the framebuffers.
+ *
+ * Enough for the shell, a process arena and a driver or two - which on the
+ * boards where this matters is most of what is there.  On a machine with room
+ * to spare the test always passes and nothing changes.
+ */
+#define AG_DISPLAY_SPARE (48u * 1024u)
+
 ag_err_t ag_display_init(void)
 {
     const ag_board_t *board = ag_board();
@@ -1033,6 +1272,19 @@ ag_err_t ag_display_init(void)
 
     if (driver[0] == '\0' || ag_path_icmp(driver, "none") == 0) {
         ag_log(AG_LOG_INFO, "display", "disabled (display.driver=none)");
+        return AG_OK;
+    }
+
+    /*
+     * No surface at all, and the panel driver does the showing.  Nothing is
+     * allocated and nothing is registered: fb0 would be a display device with
+     * no display in it.
+     */
+    if (ag_path_icmp(driver, "panel") == 0) {
+        s_surfaceless = true;
+        s_ready = true;
+        ag_log(AG_LOG_INFO, "display",
+               "no system surface; applications bring their own (present)");
         return AG_OK;
     }
 
@@ -1077,21 +1329,36 @@ ag_err_t ag_display_init(void)
         owned = true;
     }
 
-    uint16_t *back = (uint16_t *)ag_port_alloc(
-        bytes, AG_MEM_SLOW | AG_MEM_BYTE);
-    if (back == NULL) {
-        back = (uint16_t *)ag_port_alloc(
-            bytes, AG_MEM_FAST | AG_MEM_BYTE);
-    }
-    /* Back buffer optional: without it we stay single-buffered (direct). */
+    /*
+     * Back buffer and snapshot are each another whole framebuffer.
+     *
+     * All three or one, and the decision is made once: on a board where a
+     * single surface is already a third of the free heap, taking three of them
+     * does not merely leave the application short - it leaves the *system*
+     * short, and the way that shows up is the SD card failing to mount two
+     * boot stages later with a memory error nobody would connect to graphics.
+     * Measured on the 2.4 inch ESP32 board: 160x120 is 37 KB, three of those
+     * is 112, and the card needs what is left.
+     *
+     * Everything below copes with having only the front buffer: no back means
+     * single-buffered - which for a panel driven over SPI is what it was
+     * anyway, since the pixels are pushed rather than pointed at - and no
+     * snapshot means gfxdump reads the live surface.
+     */
+    uint16_t *back = NULL;
+    uint16_t *snap = NULL;
 
-    uint16_t *snap = (uint16_t *)ag_port_alloc(
-        bytes, AG_MEM_SLOW | AG_MEM_BYTE);
-    if (snap == NULL) {
-        snap = (uint16_t *)ag_port_alloc(
-            bytes, AG_MEM_FAST | AG_MEM_BYTE);
+    if (ag_port_mem_free(AG_MEM_FAST | AG_MEM_BYTE) >=
+        2u * bytes + AG_DISPLAY_SPARE) {
+        back = (uint16_t *)ag_port_alloc(bytes, AG_MEM_SLOW | AG_MEM_BYTE);
+        if (back == NULL) {
+            back = (uint16_t *)ag_port_alloc(bytes, AG_MEM_FAST | AG_MEM_BYTE);
+        }
+        snap = (uint16_t *)ag_port_alloc(bytes, AG_MEM_SLOW | AG_MEM_BYTE);
+        if (snap == NULL) {
+            snap = (uint16_t *)ag_port_alloc(bytes, AG_MEM_FAST | AG_MEM_BYTE);
+        }
     }
-    /* Snapshot is optional: gfxdump then falls back to the live buffer. */
 
     memset(front, 0, bytes);
     if (back != NULL) {

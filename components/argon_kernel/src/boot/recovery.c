@@ -59,6 +59,19 @@ void ag_boot_recovery_begin(void)
     }
 
     const ag_reset_t rr = ag_port_reset_reason();
+
+    /*
+     * Said out loud, every boot.
+     *
+     * A board that restarts on its own tells nobody why: the reason is in a
+     * register that the next boot can read and then loses.  One line here is the
+     * difference between "it seems to have rebooted" and knowing whether the
+     * supply sagged, a task stopped yielding, or something faulted - and those
+     * are three unrelated repairs.
+     */
+    ag_log(rr == AG_RESET_POWERON ? AG_LOG_INFO : AG_LOG_WARN, "boot",
+           "reset: %s", ag_port_reset_name());
+
     if (reset_is_unclean(rr)) {
         if (s_counter.attempts < 1000u) {
             s_counter.attempts++;

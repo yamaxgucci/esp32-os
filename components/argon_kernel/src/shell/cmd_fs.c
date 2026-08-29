@@ -15,9 +15,11 @@
 #include <argon/shell.h>
 #include <argon/vfs.h>
 
+#include <argon/port/mem.h>
+
 #include "fs/storage.h"
 
-/* Sized for one HostFS WRITE (HSFS_MAX_DATA). Buffer is static — not on stack. */
+/* Sized for one HostFS WRITE (HSFS_MAX_DATA). Heap, not static — see cp(). */
 #define AG_COPY_CHUNK 4096
 
 /* ---------------------------------------------------------------------- */
@@ -135,15 +137,31 @@ int ag_cmd_dir(int argc, char **argv)
     uint64_t bytes = 0;
     ag_dirent_t ent;
 
+    /*
+     * The name column is as wide as the screen allows, not 32.  A line of
+     * 32 + 1 + 8 is 41 characters, which on a forty column console - the
+     * width of the panel soldered to a small board - wraps the last digit of
+     * every size onto a line of its own.  Nine columns are kept for the size
+     * and one for the gap; on an eighty column screen this is the old layout.
+     */
+    const ag_screen_t *screen = ag_console_screen();
+    int namew = (screen != NULL) ? (int)screen->cols - 10 : 32;
+    if (namew > 32) {
+        namew = 32;
+    }
+    if (namew < 12) {
+        namew = 12;
+    }
+
     while (ag_vfs_readdir(d, &ent) == AG_OK) {
         if (!ag_path_match(pattern, ent.name)) {
             continue;
         }
         if (ent.st.attr & AG_A_DIR) {
-            ag_console_printf("%-32s   <DIR>\n", ent.name);
+            ag_console_printf("%-*s   <DIR>\n", namew, ent.name);
             dirs++;
         } else {
-            ag_console_printf("%-32s %8u\n", ent.name,
+            ag_console_printf("%-*s %8u\n", namew, ent.name,
                               (unsigned)ent.st.size);
             files++;
             bytes += ent.st.size;
@@ -282,8 +300,22 @@ int ag_cmd_copy(int argc, char **argv)
         return 1;
     }
 
-    /* Static: 4 KiB on the shell stack was enough to corrupt the copy path. */
-    static uint8_t chunk[AG_COPY_CHUNK];
+    /*
+     * Off both the stack (4 KiB there was enough to corrupt the copy path) and
+     * static .bss (permanently reserved internal SRAM the S3 can no longer
+     * spare - see loader.c's arena).  PSRAM when there is any, internal only as
+     * a fallback; a copy buffer does not need the fast bus.
+     */
+    uint8_t *chunk = ag_port_alloc(AG_COPY_CHUNK, AG_MEM_SLOW | AG_MEM_BYTE);
+    if (chunk == NULL) {
+        chunk = ag_port_alloc(AG_COPY_CHUNK, AG_MEM_FAST | AG_MEM_BYTE);
+    }
+    if (chunk == NULL) {
+        ag_vfs_close(in);
+        ag_vfs_close(out);
+        print_error(dest, -AG_ENOMEM);
+        return 1;
+    }
     uint64_t total = 0;
     int32_t  n;
     int      status = 0;
@@ -331,6 +363,7 @@ int ag_cmd_copy(int argc, char **argv)
 
     ag_vfs_close(in);
     ag_vfs_close(out);
+    ag_port_free(chunk);
 
     if (status == 0) {
         ag_console_printf("        1 file(s) copied, %u bytes\n",
@@ -473,8 +506,61 @@ int ag_cmd_rename(int argc, char **argv)
     return 0;
 }
 
+/*
+ * Taking the card out and putting one back, without a reboot.
+ *
+ * Not a convenience.  The only other way onto the card is through the console,
+ * and the shell's `recv` echoes every byte as hex: half a megabyte takes about
+ * three minutes of scrolling numbers.  Pulled, filled on a computer and pushed
+ * back, the same file arrives in seconds - and half a megabyte is one Game Boy
+ * cartridge, so this is the difference between the board being usable and being
+ * demonstrated.
+ *
+ * `eject` first, always.  A card pulled while something is writing to it is a
+ * broken filesystem rather than an interrupted copy, and there is no line on
+ * this board to tell the system it has gone (sd.card_detect is not wired), so
+ * nothing can catch that afterwards.
+ */
+int ag_cmd_eject(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+
+    const ag_err_t err = ag_storage_eject_media();
+    if (err == -AG_ENODEV) {
+        ag_console_puts("no card mounted\n");
+        return 1;
+    }
+    if (err != AG_OK) {
+        ag_console_printf("eject: %d\n", (int)err);
+        return 1;
+    }
+    ag_console_puts("A: released - the card can come out now\n");
+    return 0;
+}
+
 int ag_cmd_mount(int argc, char **argv)
 {
+    /* `mount a:` remounts the card; with no argument this only lists. */
+    if (argc >= 2) {
+        const char *what = argv[1];
+        if (what[0] == 'a' || what[0] == 'A') {
+            const ag_err_t err = ag_storage_mount_media();
+            if (err != AG_OK) {
+                ag_console_printf(
+                    "mount a: failed (%d)\n"
+                    "  no card, or it needs its power cycled - a reset does not\n"
+                    "  power it, so one caught mid-command stays deaf until the\n"
+                    "  board is unplugged\n", (int)err);
+                return 1;
+            }
+            ag_console_puts("A: mounted\n");
+            return 0;
+        }
+        ag_console_puts("usage: mount [a:]\n");
+        return 1;
+    }
+
     (void)argc;
     (void)argv;
 

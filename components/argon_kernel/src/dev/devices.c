@@ -18,16 +18,25 @@
 #include <argon/devfs.h>
 #include <argon/device.h>
 #include <argon/audio.h>
+#include <argon/camera.h>
 #include <argon/display.h>
 #include <argon/input.h>
 #include <argon/keys.h>
 #include <argon/log.h>
+#include <argon/power.h>
+#include <argon/netmsg.h>
 #include <argon/net.h>
 #include <argon/vfs.h>
 
+#include <stdio.h>
+
+#include <argon/btinput.h>
+#include <argon/port/bt.h>
 #include <argon/port/sync.h>
 #include <argon/port/task.h>
+#include <argon/port/wifi.h>
 
+#include "core/sysconfig.h"
 #include "dev/io.h"
 #include "fs/storage.h"
 
@@ -48,6 +57,25 @@ static void dev_unlock(void *ctx)
 {
     (void)ctx;
     ag_port_mutex_give_recursive(s_dev_mutex);
+}
+
+/*
+ * Is this task inside the registry - and therefore, in practice, inside a
+ * driver?
+ *
+ * The registry is held across every call into a loadable module's class vtable,
+ * and it is held for nothing else that lasts (see ag_dev_lock_hold in the
+ * header).  So "this task holds it" is the same question as "the code running
+ * here belongs to the system rather than to whoever called in", and that is the
+ * question the pin claims need answered - see caller() in src/dev/io.c.
+ *
+ * Ownership of a recursive mutex is per task, so no state has to be invented
+ * for this and nothing has to be reset on a fault.
+ */
+bool ag_dev_in_driver(void)
+{
+    return s_dev_mutex != NULL &&
+           ag_port_mutex_holder(s_dev_mutex) == ag_port_task_self();
 }
 
 /* ---------------------------------------------------------------------- */
@@ -259,6 +287,14 @@ ag_err_t ag_devices_init(void)
         return err;
     }
 
+    /* /dev/cam0 when the image carries the camera (CAMERA_BUILTIN) and
+     * BOARD.CFG wires one.  A no-op on every other build - there the sensor
+     * .SYS registers its own /dev/cam0 - so this call is unconditional. */
+    err = ag_camera_init();
+    if (err != AG_OK) {
+        return err;
+    }
+
     /* Pad layer and /dev/joy0.  HostFS PADPUSH is one source into it. */
     err = ag_input_init();
     if (err != AG_OK) {
@@ -270,10 +306,135 @@ ag_err_t ag_devices_init(void)
      * api->net is still present when the build enables it; ready() stays
      * false until DHCP succeeds.
      */
-    err = ag_net_init();
-    if (err != AG_OK && err != -AG_ENOSYS) {
-        ag_log(AG_LOG_WARN, "dev", "net init failed (%d)", (int)err);
+    /*
+     * A radio is started because something asked for it, not because the chip
+     * has one.
+     *
+     * On a part with this much memory that is the difference between a machine
+     * that works and one that has 11 KB free: Wi-Fi costs about 70 KB while it
+     * runs and Bluetooth about 110, and a board told to do neither should pay
+     * for neither.  Both are in the image either way - code in flash is free -
+     * and `wifi on` / `bt on` start them later at the same price.
+     */
+#if AG_PORT_HAS_WIFI
+    const char *ssid = ag_cfg_get(ag_sysconfig(), "wifi.ssid", NULL);
+    const bool  want_sta = (ssid != NULL && ssid[0] != '\0');
+#if AG_PORT_WIFI_HAS_AP
+    /* A board can be told to offer a network without joining one, so the point
+     * is reason enough to start the radio even when no [wifi] is configured. */
+    const char *ap_ssid = ag_cfg_get(ag_sysconfig(), "ap.ssid", NULL);
+    const bool  want_ap = (ap_ssid != NULL && ap_ssid[0] != '\0');
+#else
+    const bool want_ap = false;
+#endif
+    const bool  want_net = want_sta || want_ap;
+#else
+    const bool want_net = true; /* a cable has nothing to configure */
+#endif
+
+    if (want_net) {
+        err = ag_net_init();
+        if (err != AG_OK && err != -AG_ENOSYS) {
+            ag_log(AG_LOG_WARN, "dev", "net init failed (%d)", (int)err);
+        }
     }
+
+#if AG_PORT_HAS_WIFI
+    /*
+     * The radio is on and joined to nothing; this is where it is told what to
+     * join.  Configuration was read two stages ago, so a board that has been
+     * told once comes up on its network without anyone attaching a console to
+     * it - which is the whole point of a board with a radio.
+     *
+     * Not fatal, and not waited for: association takes seconds and DHCP takes
+     * longer than boot does.  `wifi` says how it went.
+     */
+    if (want_sta && err == AG_OK) {
+        const char *pass = ag_cfg_get(ag_sysconfig(), "wifi.pass", "");
+
+        /*
+         * An access point, when the configuration names one.  A board told to
+         * use a particular box has to keep using it across a power cut, or the
+         * telling was pointless: the radio's own choice is what was being
+         * overridden.
+         */
+        uint8_t     bssid[6];
+        const char *pinned = ag_cfg_get(ag_sysconfig(), "wifi.bssid", NULL);
+        const bool  have_pin = (pinned != NULL) && ag_mac_parse(pinned, bssid);
+
+        const ag_err_t werr =
+            ag_port_wifi_connect(ssid, pass, have_pin ? bssid : NULL);
+        if (werr == AG_OK) {
+            ag_log(AG_LOG_INFO, "wifi", "joining %s%s", ssid,
+                   have_pin ? " (pinned)" : "");
+        } else {
+            ag_log(AG_LOG_WARN, "wifi", "%s: %d", ssid, (int)werr);
+        }
+    }
+#endif
+
+#if AG_PORT_WIFI_HAS_AP
+    /*
+     * The point the board offers, when [ap] names one.  Same rule as the
+     * network it joins: configured once, up at every boot with no console
+     * attached - which is what a fixed-name point is for.
+     */
+    if (want_ap && err == AG_OK) {
+        const char *ap_pass = ag_cfg_get(ag_sysconfig(), "ap.pass", "");
+        const char *ap_ch = ag_cfg_get(ag_sysconfig(), "ap.channel", "0");
+        const char *ap_hid = ag_cfg_get(ag_sysconfig(), "ap.hidden", "0");
+
+        unsigned channel = 0;
+        for (const char *p = ap_ch; p != NULL && *p >= '0' && *p <= '9'; p++) {
+            channel = channel * 10u + (unsigned)(*p - '0');
+        }
+        const bool hidden = (ap_hid != NULL && ap_hid[0] == '1');
+
+        const ag_err_t aerr = ag_port_wifi_ap_start(
+            ap_ssid, ap_pass, (uint8_t)(channel > 13u ? 0u : channel), hidden);
+        if (aerr == AG_OK) {
+            ag_log(AG_LOG_INFO, "wifi", "access point %s", ap_ssid);
+        } else {
+            ag_log(AG_LOG_WARN, "wifi", "ap %s: %d", ap_ssid, (int)aerr);
+        }
+    }
+#endif
+
+#if AG_PORT_HAS_BT
+    /*
+     * The same rule, and the same reason: started because a keyboard was named,
+     * not because the chip has a radio.  This is the only way a board with this
+     * chip can have a keyboard at all - there is no USB on it - and it costs
+     * about a third of a second of boot and a hundred kilobytes while it runs.
+     */
+    const char *kbd = ag_cfg_get(ag_sysconfig(), "bt.keyboard", NULL);
+    if (kbd != NULL && kbd[0] != '\0') {
+        ag_powerctl_bus_needed();
+        const ag_err_t bterr = ag_port_bt_start();
+        if (bterr != AG_OK) {
+            ag_log(AG_LOG_WARN, "bt", "radio did not start (%d)", (int)bterr);
+        } else {
+            (void)ag_btinput_init();
+
+            unsigned b[6];
+            if (sscanf(kbd, "%x:%x:%x:%x:%x:%x", &b[0], &b[1], &b[2], &b[3],
+                       &b[4], &b[5]) == 6) {
+                uint8_t addr[6];
+                for (int i = 0; i < 6; i++) {
+                    addr[i] = (uint8_t)b[i];
+                }
+                const int type =
+                    (int)ag_cfg_get_int(ag_sysconfig(), "bt.type", 0);
+                if (ag_port_bt_open(addr, type) == AG_OK) {
+                    ag_log(AG_LOG_INFO, "bt", "looking for %s", kbd);
+                }
+            } else {
+                ag_log(AG_LOG_WARN, "bt", "bt.keyboard is not an address: %s",
+                       kbd);
+            }
+        }
+    }
+#endif
 
     ag_log(AG_LOG_INFO, "dev", "%u devices", (unsigned)ag_dev_count());
     return AG_OK;

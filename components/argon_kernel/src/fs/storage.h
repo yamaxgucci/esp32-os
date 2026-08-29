@@ -19,6 +19,18 @@ ag_err_t ag_storage_init(void);
  */
 ag_err_t ag_storage_mount_media(void);
 
+/*
+ * Lets the card go, so it can be taken out.
+ *
+ * There is no line on this class of board that says a card has been removed, so
+ * the system cannot notice: it has to be told, before rather than after.  Open
+ * files are ejected rather than waited for - whatever is using the card must
+ * fail now, because the card is about to leave whether it likes it or not.
+ *
+ * -AG_ENODEV when nothing was mounted, which is not a failure worth a message.
+ */
+ag_err_t ag_storage_eject_media(void);
+
 /* Optional HostFS (H:) after media; no-op when the host helper is absent. */
 ag_err_t ag_storage_mount_hostfs(void);
 

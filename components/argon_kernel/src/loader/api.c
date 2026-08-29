@@ -28,16 +28,24 @@
 #include <argon/log.h>
 #include <argon/module.h>
 #include <argon/net.h>
+#include <argon/power.h>
 #include <argon/proc.h>
 #include <argon/shell.h>
+#include <argon/filemap.h>
 #include <argon/vfs.h>
 
 #include <argon/port/config.h>
 
+#include <argon/port/ble.h>
+#include <argon/port/bt.h>
 #include <argon/port/time.h>
 #include <argon/port/task.h>
+#include <argon/port/wifi.h>
+#include <argon/port/camera.h>
 
 #include "dev/io.h"
+#include "net/espnow.h"
+#include "net/wifimon.h"
 
 /* ---------------------------------------------------------------------- */
 /* sys                                                                    */
@@ -498,6 +506,20 @@ static ag_err_t api_mountinfo(const char *mount, ag_fsinfo_t *out)
     }
 }
 
+/*
+ * A file mapped where it can be read as bytes.  The path is resolved against
+ * the calling process's own directory, like every other fs call here.
+ */
+static ag_err_t api_map(const char *path, const void **out, uint64_t *out_len)
+{
+    return ag_filemap_open(path, ag_proc_cwd(), out, out_len);
+}
+
+static ag_err_t api_unmap(const void *ptr)
+{
+    return ag_filemap_close(ptr);
+}
+
 static const ag_fs_api_t k_fs = {
     .size = sizeof(ag_fs_api_t),
     .open = api_open,
@@ -518,6 +540,8 @@ static const ag_fs_api_t k_fs = {
     .getcwd = api_getcwd,
     .chdir = api_chdir,
     .mountinfo = api_mountinfo,
+    .map = api_map,
+    .unmap = api_unmap,
 };
 
 /* ---------------------------------------------------------------------- */
@@ -826,6 +850,46 @@ static ag_err_t api_kill(ag_pid_t pid)
     return ag_proc_kill(pid, "killed by another process");
 }
 
+/* ---------------------------------------------------------------------- */
+
+/*
+ * The pid is taken here rather than passed in, for the same reason it is in
+ * every other subtable: an application cannot answer on somebody else's
+ * behalf, and a call that took a pid would have to be checked for exactly
+ * that.
+ */
+static ag_err_t api_power_status(ag_power_status_t *out)
+{
+    return ag_power_poll(ag_proc_self(), (uint32_t)(ag_port_us() / 1000), out,
+                         ag_powerctl_cpu_mhz());
+}
+
+static ag_err_t api_power_answer(ag_power_answer_t a, const char *why)
+{
+    return ag_power_reply(ag_proc_self(), a, why);
+}
+
+static ag_err_t api_power_declare(ag_power_fitness_t fitness, const char *why)
+{
+    const ag_err_t err = ag_power_declare(ag_proc_self(), fitness, why);
+    if (err == AG_OK) {
+        /*
+         * "I need the full clock" has to be true by the time this returns, not
+         * by the next tick: the first buffer an audio path fills is as real as
+         * the thousandth.
+         */
+        ag_powerctl_declared(fitness);
+    }
+    return err;
+}
+
+static const ag_power_api_t k_power = {
+    .size = sizeof(ag_power_api_t),
+    .status = api_power_status,
+    .answer = api_power_answer,
+    .declare = api_power_declare,
+};
+
 static const ag_proc_api_t k_proc = {
     .size = sizeof(ag_proc_api_t),
     .exec = api_exec,
@@ -849,6 +913,459 @@ static const ag_proc_api_t k_proc = {
  * application can then ask - if (ag_api()->net) - and adapt, which is what the
  * feature probing in the ABI is for.  gfx is live from 0.8 (soft framebuffer).
  */
+#if AG_PORT_HAS_BLE_PERIPH || AG_PORT_HAS_BLE_CENTRAL
+/*
+ * BLE for applications.  Every entry that puts the radio on the air starts it
+ * first (ag_port_bt_start) and moves the bus where a radio needs it
+ * (ag_powerctl_bus_needed) - an application should not have to know that `bt on`
+ * is a separate step.  The rest are thin: the port carries the whole of it and
+ * the shell drives the same calls, so this is the append to the table that lets
+ * an .AXE reach what only the shell could before.  Entries a build left out
+ * (central or peripheral) stay NULL by designated-initialiser, and an
+ * application feature-probes with AG_HAS.
+ */
+#if AG_PORT_HAS_BLE_PERIPH
+static ag_err_t api_ble_midi_advertise(const char *name)
+{
+    const ag_err_t serr = ag_port_bt_start();
+    if (serr != AG_OK) {
+        return serr;
+    }
+    ag_powerctl_bus_needed();
+    return ag_port_ble_midi_advertise(name);
+}
+
+static ag_err_t api_ble_midi_send(uint8_t status, uint8_t d1, uint8_t d2)
+{
+    return ag_port_ble_midi_send(status, d1, d2);
+}
+
+static bool api_ble_midi_ready(void) { return ag_port_ble_midi_ready(); }
+
+static ag_err_t api_ble_adv_stop(void) { return ag_port_ble_adv_stop(); }
+
+static ag_err_t api_ble_adv_start(const char *name)
+{
+    const ag_err_t serr = ag_port_bt_start();
+    if (serr != AG_OK) {
+        return serr;
+    }
+    ag_powerctl_bus_needed();
+    return ag_port_ble_adv_start(name);
+}
+
+static ag_err_t api_ble_adv_raw(const uint8_t addr[6], const void *data,
+                                uint32_t len)
+{
+    /*
+     * The radio is the system's to raise (bt on), as it is for Wi-Fi.
+     * An application does not raise it here: on this chip the BLE
+     * bring-up is not safe from an application task, and the port
+     * answers -AG_ENODEV when the radio is off, which the caller
+     * surfaces as "run bt on first".
+     */
+    ag_powerctl_bus_needed();
+    return ag_port_ble_adv_raw(addr, (const uint8_t *)data, len);
+}
+
+static void api_ble_adv_set_read(const void *data, uint32_t len)
+{
+    ag_port_ble_adv_set_read(data, len);
+}
+
+static int32_t api_ble_adv_last_write(uint8_t *out, uint32_t max)
+{
+    return ag_port_ble_adv_last_write(out, max);
+}
+
+static ag_err_t api_ble_adv_status(ag_ble_adv_status_t *out)
+{
+    return ag_port_ble_adv_status(out);
+}
+#endif /* AG_PORT_HAS_BLE_PERIPH */
+
+#if AG_PORT_HAS_BLE_CENTRAL
+static ag_err_t api_ble_scan(ag_ble_dev_t *out, uint32_t max, uint32_t *found,
+                             uint32_t seconds)
+{
+    /*
+     * The radio is the system's to raise (bt on), as it is for Wi-Fi.
+     * An application does not raise it here: on this chip the BLE
+     * bring-up is not safe from an application task, and the port
+     * answers -AG_ENODEV when the radio is off, which the caller
+     * surfaces as "run bt on first".
+     */
+    ag_powerctl_bus_needed();
+    return ag_port_ble_scan(out, max, found, seconds);
+}
+
+static ag_err_t api_ble_connect(const uint8_t addr[6], int addr_type,
+                                uint32_t timeout_ms)
+{
+    /*
+     * The radio is the system's to raise (bt on), as it is for Wi-Fi.
+     * An application does not raise it here: on this chip the BLE
+     * bring-up is not safe from an application task, and the port
+     * answers -AG_ENODEV when the radio is off, which the caller
+     * surfaces as "run bt on first".
+     */
+    ag_powerctl_bus_needed();
+    return ag_port_ble_connect(addr, addr_type, timeout_ms);
+}
+
+static ag_err_t api_ble_disconnect(void) { return ag_port_ble_disconnect(); }
+static bool     api_ble_connected(void) { return ag_port_ble_connected(); }
+static ag_err_t api_ble_discover(uint32_t timeout_ms)
+{
+    return ag_port_ble_discover(timeout_ms);
+}
+static uint32_t api_ble_services(ag_ble_svc_t *out, uint32_t max)
+{
+    return ag_port_ble_services(out, max);
+}
+static uint32_t api_ble_chars(ag_ble_chr_t *out, uint32_t max)
+{
+    return ag_port_ble_chars(out, max);
+}
+static int32_t api_ble_read(uint16_t handle, uint8_t *out, uint32_t max,
+                            uint32_t timeout_ms)
+{
+    return ag_port_ble_read(handle, out, max, timeout_ms);
+}
+static ag_err_t api_ble_write(uint16_t handle, const void *data, uint32_t len,
+                              bool with_response, uint32_t timeout_ms)
+{
+    return ag_port_ble_write(handle, data, len, with_response, timeout_ms);
+}
+#endif /* AG_PORT_HAS_BLE_CENTRAL */
+
+static const ag_ble_api_t k_ble = {
+    .size = sizeof(ag_ble_api_t),
+#if AG_PORT_HAS_BLE_PERIPH
+    .midi_advertise = api_ble_midi_advertise,
+    .midi_send = api_ble_midi_send,
+    .midi_ready = api_ble_midi_ready,
+    .adv_stop = api_ble_adv_stop,
+    .adv_start = api_ble_adv_start,
+    .adv_set_read = api_ble_adv_set_read,
+    .adv_last_write = api_ble_adv_last_write,
+    .adv_status = api_ble_adv_status,
+#endif
+#if AG_PORT_HAS_BLE_CENTRAL
+    .scan = api_ble_scan,
+    .connect = api_ble_connect,
+    .disconnect = api_ble_disconnect,
+    .connected = api_ble_connected,
+    .discover = api_ble_discover,
+    .services = api_ble_services,
+    .chars = api_ble_chars,
+    .read = api_ble_read,
+    .write = api_ble_write,
+#endif
+#if AG_PORT_HAS_BLE_PERIPH
+    .adv_raw = api_ble_adv_raw,
+#endif
+};
+#endif /* AG_PORT_HAS_BLE_PERIPH || AG_PORT_HAS_BLE_CENTRAL */
+
+#if AG_PORT_HAS_WIFIMON
+/*
+ * Monitor / raw injection for applications: the app-facing face of the same
+ * kernel ring and counters the shell's `mon` drains (src/net/wifimon.c).  recv
+ * waits up to timeout_ms for a frame rather than making every application write
+ * its own poll loop; everything else is a straight pass to the kernel layer,
+ * which is where the lock between the radio task and the caller already lives.
+ */
+static ag_err_t api_wm_start(void)
+{
+    ag_powerctl_bus_needed();
+    /*
+     * Promiscuous is a mode of a started radio, not a way to start one - so the
+     * radio has to be up first, exactly as the shell's `mon on` brings it up
+     * (src/shell/shell.c).  An application that only ever captures should not
+     * have to know that `wifi on` is a separate step.
+     */
+    ag_port_wifi_status_t st;
+    if (ag_port_wifi_status(&st) != AG_OK || st.state == AG_WIFI_OFF) {
+        const ag_err_t nerr = ag_net_init();
+        if (nerr != AG_OK) {
+            return nerr;
+        }
+    }
+    return ag_wifimon_start();
+}
+static ag_err_t api_wm_stop(void)
+{
+    ag_wifimon_stop();
+    return AG_OK;
+}
+static ag_err_t api_wm_channel(uint8_t primary)
+{
+    return ag_wifimon_channel(primary);
+}
+static uint8_t api_wm_channel_get(void) { return ag_wifimon_channel_get(); }
+static ag_err_t api_wm_filter(uint32_t mask) { return ag_wifimon_filter(mask); }
+
+static int32_t api_wm_recv(void *buf, uint32_t max, ag_wifimon_frame_t *meta,
+                           uint32_t timeout_ms)
+{
+    const int64_t until = (int64_t)ag_port_us() + (int64_t)timeout_ms * 1000;
+    for (;;) {
+        int8_t   rssi = 0;
+        uint8_t  channel = 0;
+        uint32_t full = 0;
+        uint32_t copied = 0;
+        if (ag_wifimon_drain(&rssi, &channel, &full, (uint8_t *)buf, max,
+                             &copied)) {
+            if (meta != NULL) {
+                meta->rssi = rssi;
+                meta->channel = channel;
+                meta->length = full;
+            }
+            return (int32_t)copied;
+        }
+        if ((int64_t)ag_port_us() >= until) {
+            return -AG_EAGAIN;
+        }
+        ag_port_task_delay(ag_port_ms_to_ticks(2));
+    }
+}
+
+static ag_err_t api_wm_tx(const void *frame, uint32_t len)
+{
+    return ag_wifimon_tx(frame, len);
+}
+static void api_wm_counters(uint32_t out[AG_WIFIMON_C_N])
+{
+    ag_wifimon_counters(out);
+}
+static uint32_t api_wm_dropped(void) { return ag_wifimon_dropped(); }
+
+static const ag_wifimon_api_t k_wifimon = {
+    .size = sizeof(ag_wifimon_api_t),
+    .start = api_wm_start,
+    .stop = api_wm_stop,
+    .channel = api_wm_channel,
+    .channel_get = api_wm_channel_get,
+    .filter = api_wm_filter,
+    .recv = api_wm_recv,
+    .tx_raw = api_wm_tx,
+    .counters = api_wm_counters,
+    .dropped = api_wm_dropped,
+};
+#endif /* AG_PORT_HAS_WIFIMON */
+
+#if AG_PORT_HAS_WIFI
+/*
+ * The rest of the radio for applications (ABI 0.39): station, access point and
+ * ESP-NOW.  Each call is a thin pass to the same port and kernel layer the
+ * shell's `wifi` and `espnow` commands drive (src/shell/shell.c), so an
+ * application and the prompt reach the radio through one implementation.  The
+ * only work done here is raising the radio when a call needs it and converting
+ * the port's structs into the ABI's - the ABI cannot name the GPL port types,
+ * so the two are kept field-for-field parallel and copied across.
+ */
+static ag_err_t api_wifi_radio_up(void)
+{
+    ag_powerctl_bus_needed();
+    ag_port_wifi_status_t st;
+    if (ag_port_wifi_status(&st) != AG_OK || st.state == AG_WIFI_OFF) {
+        return ag_net_init();
+    }
+    return AG_OK;
+}
+
+static ag_err_t api_wifi_start(void) { return api_wifi_radio_up(); }
+static ag_err_t api_wifi_stop(void) { return ag_port_wifi_stop(); }
+
+static ag_err_t api_wifi_scan(ag_wifi_ap_t *out, uint32_t max, uint32_t *found)
+{
+    if (out == NULL || max == 0u) {
+        return -AG_EINVAL;
+    }
+    const ag_err_t up = api_wifi_radio_up();
+    if (up != AG_OK) {
+        return up;
+    }
+    /*
+     * No heap here.  The port fills at most sixteen records from a stack buffer
+     * of its own, so a matching stack buffer converts them without an
+     * allocation - which matters because with the radio up and an application
+     * resident on this board, a few hundred spare bytes of heap is exactly what
+     * there is not, and a scan that failed only because the conversion buffer
+     * could not be allocated read as -AG_ENOMEM for a scan that would have
+     * worked.  `found` still reports every access point the radio heard.
+     */
+    ag_port_wifi_ap_t tmp[16];
+    uint32_t          cap = (max < 16u) ? max : 16u;
+    uint32_t          n = 0;
+    const ag_err_t    err = ag_port_wifi_scan(tmp, cap, &n);
+    if (err == AG_OK) {
+        const uint32_t copy = (n < cap) ? n : cap;
+        for (uint32_t i = 0; i < copy; i++) {
+            memcpy(out[i].ssid, tmp[i].ssid, sizeof(out[i].ssid));
+            memcpy(out[i].bssid, tmp[i].bssid, 6u);
+            out[i].rssi = tmp[i].rssi;
+            out[i].channel = tmp[i].channel;
+            out[i].auth = (uint8_t)tmp[i].auth;
+        }
+        if (found != NULL) {
+            *found = n;
+        }
+    }
+    return err;
+}
+
+static ag_err_t api_wifi_connect(const char *ssid, const char *pass,
+                                 const uint8_t bssid[6])
+{
+    ag_powerctl_bus_needed();
+    return ag_port_wifi_connect(ssid, pass, bssid);
+}
+
+static ag_err_t api_wifi_disconnect(void) { return ag_port_wifi_disconnect(); }
+
+static ag_err_t api_wifi_status(ag_wifi_status_t *out)
+{
+    if (out == NULL) {
+        return -AG_EINVAL;
+    }
+    ag_port_wifi_status_t st;
+    const ag_err_t        err = ag_port_wifi_status(&st);
+    if (err != AG_OK) {
+        return err;
+    }
+    memset(out, 0, sizeof(*out));
+    out->state = (uint8_t)st.state;
+    memcpy(out->ssid, st.ssid, sizeof(out->ssid));
+    memcpy(out->bssid, st.bssid, 6u);
+    out->pinned = st.pinned;
+    out->rssi = st.rssi;
+    out->channel = st.channel;
+    out->attempts = st.attempts;
+    out->last_reason = (int32_t)st.last_reason;
+    return AG_OK;
+}
+
+#if AG_PORT_WIFI_HAS_AP
+static ag_err_t api_wifi_ap_start(const char *ssid, const char *pass,
+                                  uint8_t channel, bool hidden)
+{
+    const ag_err_t up = api_wifi_radio_up();
+    if (up != AG_OK) {
+        return up;
+    }
+    return ag_port_wifi_ap_start(ssid, pass, channel, hidden);
+}
+static ag_err_t api_wifi_ap_stop(void) { return ag_port_wifi_ap_stop(); }
+static ag_err_t api_wifi_ap_status(ag_wifi_ap_status_t *out)
+{
+    if (out == NULL) {
+        return -AG_EINVAL;
+    }
+    ag_port_wifi_ap_status_t ap;
+    const ag_err_t           err = ag_port_wifi_ap_status(&ap);
+    if (err != AG_OK) {
+        return err;
+    }
+    memset(out, 0, sizeof(*out));
+    out->on = ap.on;
+    memcpy(out->ssid, ap.ssid, sizeof(out->ssid));
+    out->channel = ap.channel;
+    out->hidden = ap.hidden;
+    out->secured = ap.secured;
+    out->clients = ap.clients;
+    out->ip = ap.ip;
+    return AG_OK;
+}
+#endif /* AG_PORT_WIFI_HAS_AP */
+
+#if AG_PORT_HAS_ESPNOW
+static ag_err_t api_wifi_espnow_start(void)
+{
+    const ag_err_t up = api_wifi_radio_up();
+    if (up != AG_OK) {
+        return up;
+    }
+    return ag_espnow_start();
+}
+static ag_err_t api_wifi_espnow_stop(void)
+{
+    ag_espnow_stop();
+    return AG_OK;
+}
+static ag_err_t api_wifi_espnow_self(uint8_t out[6])
+{
+    return ag_espnow_self(out);
+}
+static ag_err_t api_wifi_espnow_peer_add(const uint8_t mac[6], uint8_t channel,
+                                         const uint8_t *key)
+{
+    return ag_espnow_peer_add(mac, channel, key);
+}
+static ag_err_t api_wifi_espnow_peer_del(const uint8_t mac[6])
+{
+    return ag_espnow_peer_del(mac);
+}
+static ag_err_t api_wifi_espnow_send(const uint8_t mac[6], const void *data,
+                                     uint32_t len)
+{
+    return ag_espnow_send(mac, data, len);
+}
+static int32_t api_wifi_espnow_recv(uint8_t mac[6], void *buf, uint32_t max,
+                                    uint32_t timeout_ms)
+{
+    const int64_t until = (int64_t)ag_port_us() + (int64_t)timeout_ms * 1000;
+    for (;;) {
+        uint32_t len = 0;
+        if (ag_espnow_recv(mac, (uint8_t *)buf, max, &len)) {
+            return (int32_t)len;
+        }
+        if ((int64_t)ag_port_us() >= until) {
+            return -AG_EAGAIN;
+        }
+        ag_port_task_delay(ag_port_ms_to_ticks(2));
+    }
+}
+static uint32_t api_wifi_espnow_dropped(void) { return ag_espnow_dropped(); }
+#endif /* AG_PORT_HAS_ESPNOW */
+
+static const ag_wifi_api_t k_wifi = {
+    .size = sizeof(ag_wifi_api_t),
+    .start = api_wifi_start,
+    .stop = api_wifi_stop,
+    .scan = api_wifi_scan,
+    .connect = api_wifi_connect,
+    .disconnect = api_wifi_disconnect,
+    .status = api_wifi_status,
+#if AG_PORT_WIFI_HAS_AP
+    .ap_start = api_wifi_ap_start,
+    .ap_stop = api_wifi_ap_stop,
+    .ap_status = api_wifi_ap_status,
+#endif
+#if AG_PORT_HAS_ESPNOW
+    .espnow_start = api_wifi_espnow_start,
+    .espnow_stop = api_wifi_espnow_stop,
+    .espnow_self = api_wifi_espnow_self,
+    .espnow_peer_add = api_wifi_espnow_peer_add,
+    .espnow_peer_del = api_wifi_espnow_peer_del,
+    .espnow_send = api_wifi_espnow_send,
+    .espnow_recv = api_wifi_espnow_recv,
+    .espnow_dropped = api_wifi_espnow_dropped,
+#endif
+};
+#endif /* AG_PORT_HAS_WIFI */
+
+#if defined(CONFIG_ARGON_ENABLE_CAMERA) && CONFIG_ARGON_ENABLE_CAMERA
+/* The DVP transport, straight from the port - the sensor driver is a .SYS. */
+static const ag_cam_api_t k_cam = {
+    .size = sizeof(ag_cam_api_t),
+    .configure = ag_port_cam_configure,
+    .capture = ag_port_cam_capture,
+    .stop = ag_port_cam_stop,
+};
+#endif
+
 static const ag_api_t k_api = {
     .size = sizeof(ag_api_t),
     .abi_major = AG_ABI_MAJOR,
@@ -871,6 +1388,27 @@ static const ag_api_t k_api = {
     .net = NULL,
 #endif
     .audio = &ag_audio_api_table,
+#if AG_PORT_HAS_BLE_PERIPH || AG_PORT_HAS_BLE_CENTRAL
+    .ble = &k_ble,
+#else
+    .ble = NULL,
+#endif
+    .power = &k_power,
+#if AG_PORT_HAS_WIFIMON
+    .wifimon = &k_wifimon,
+#else
+    .wifimon = NULL,
+#endif
+#if AG_PORT_HAS_WIFI
+    .wifi = &k_wifi,
+#else
+    .wifi = NULL,
+#endif
+#if defined(CONFIG_ARGON_ENABLE_CAMERA) && CONFIG_ARGON_ENABLE_CAMERA
+    .cam = &k_cam,
+#else
+    .cam = NULL,
+#endif
 };
 
 const ag_api_t *ag_loader_api(void) { return &k_api; }
