@@ -7,8 +7,6 @@
 
 #include <string.h>
 
-#include <argon/port/config.h> /* CONFIG_ARGON_NET_TLS */
-
 /* ---------------------------------------------------------------------- */
 /* Small text helpers.  Written out rather than taken from <strings.h>:   */
 /* the case-insensitive comparisons there are spelled differently on      */
@@ -274,16 +272,14 @@ ag_err_t ag_url_parse(const char *text, ag_url_t *out)
     } else if (strcmp(out->scheme, "ftp") == 0) {
         out->port = 21;
     } else if (strcmp(out->scheme, "https") == 0) {
-#if defined(CONFIG_ARGON_NET_TLS) && CONFIG_ARGON_NET_TLS
-        out->port = 443;
-#else
         /*
-         * Without TLS in the build, refuse https rather than quietly fetch it
-         * over port 80 - that would send in clear what a caller asked to
-         * encrypt.
+         * Accepted here unconditionally (this file is also compiled into an
+         * .AXE, where the build-time TLS flag is not visible).  A build without
+         * TLS still refuses https before it can leak anything: the http client
+         * checks the scheme against AG_PORT_HAS_TLS and request_once has no
+         * plain-socket path for it.
          */
-        return -AG_ENOTSUP;
-#endif
+        out->port = 443;
     } else {
         return -AG_ENOTSUP;
     }

@@ -15,7 +15,9 @@
 #   chunked                          the third way, which is framed
 #   a redirect, absolute and relative
 #   404                              a failure that must not leave a file
-#   https                            refused, because there is no TLS here
+#   https + sntp                     the clock set from the network, then a
+#                                    certificate-validated fetch (pass 4, needs
+#                                    the internet)
 #   ftp                              two connections at once, and PASV
 #   httpd                            32 KB back out of the guest, byte for byte
 #   /../ and /%2e%2e/                refused twice, decoded and not
@@ -98,7 +100,6 @@ try {
         "wget http://10.0.2.2:$httpPort/moved.txt t:\m.txt"
         "wget http://10.0.2.2:$httpPort/relative t:\r.txt"
         "wget http://10.0.2.2:$httpPort/missing.txt t:\bad.txt"
-        'wget https://example.com/ t:\no.htm'
         "wget ftp://10.0.2.2:$ftpPort/hello.txt t:\f.txt"
         'type t:\f.txt'
         'dir t:\'
@@ -115,7 +116,6 @@ try {
     Check $t 'saved T:\r.txt' 'http-redirect-relative'
     Check $t '404 Not Found' 'http-404'
     Note (-not $t.Contains('saved T:\bad.txt')) 'http-404-leaves-no-file'
-    Check $t 'this system speaks http and ftp only' 'https-refused'
     Check $t '226 sent' 'ftp-transfer-complete'
     Check $t 'saved T:\f.txt' 'ftp-fetch'
     Check $t 'using the control address' 'ftp-ignores-pasv-address'
@@ -207,12 +207,18 @@ try {
     # --------------------------------------------------------------- names ---
 
     Write-Host "`n== pass 4: by name (needs the internet) ==" -ForegroundColor Cyan
+    # QuietMs is generous here: the TLS handshake is several seconds of silence
+    # (esp_tls does it without printing), and a shorter quiet window stops the
+    # capture before "Certificate validated" and the saved file appear.
     & (Join-Path $PSScriptRoot 'qemu-boot.ps1') -TimeoutSec $TimeoutSec `
-        -QuietMs 2000 -LogPath 'build\nettest-dns.log' -Send @(
+        -QuietMs 12000 -LogPath 'build\nettest-dns.log' -Send @(
         'net wait'
         'net resolve example.com'
         'net resolve no-such-host.invalid'
         'wget http://example.com/ t:\ex.htm'
+        'date sync'
+        'date'
+        'wget https://example.com/ t:\hs.htm'
     ) | Out-Null
 
     $t = Transcript 'build\nettest-dns.log'
@@ -220,6 +226,12 @@ try {
     if ($resolved) {
         Check $t 'saved T:\ex.htm' 'dns-fetch'
         Check $t 'no-such-host.invalid: not found' 'dns-negative'
+        # SNTP: after `date sync` the clock leaves 1970 for a 20xx date.
+        Note ($t -match '20\d\d-\d\d-\d\d \d\d:\d\d:\d\d UTC') 'sntp-clock-set'
+        # TLS: the peer's certificate checks out against the bundle, and https
+        # fetches the body (the clock must be set first, which it now is).
+        Check $t 'Certificate validated' 'https-cert-validated'
+        Check $t 'saved T:\hs.htm' 'https-fetch'
     } else {
         Write-Host 'SKIP dns - no resolver answered; not counted' -ForegroundColor Yellow
     }

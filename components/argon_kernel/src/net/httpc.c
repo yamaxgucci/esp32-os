@@ -285,7 +285,7 @@ static void conn_close(int fd, void *tls)
     (void)tls;
 #endif
     if (fd >= 0) {
-        conn_close(fd, tls);
+        ag_port_net_close(fd);
     }
 }
 
