@@ -19,6 +19,7 @@ long  labs(long x);
 int   atoi(const char *s);
 double atof(const char *s);
 long  strtol(const char *s, char **end, int base);
+unsigned long strtoul(const char *s, char **end, int base);
 char *strdup(const char *s);
 char *getenv(const char *name);
 int   system(const char *cmd);

@@ -865,6 +865,86 @@ long strtol(const char *s, char **end, int base)
     return v * sign;
 }
 
+/*
+ * The unsigned twin, needed because std::stoul and its neighbours live in the
+ * same libstdc++ member as the rest of std::string: without one here, newlib's
+ * comes in, and newlib's reaches for a per-thread reentrancy structure that
+ * this side of the world does not have.
+ *
+ * Like strtol above it does not report overflow through errno.  A caller that
+ * needs to tell 4294967296 from 0 has to check the digits itself.
+ */
+unsigned long strtoul(const char *s, char **end, int base)
+{
+    unsigned long v = 0;
+    int negate = 0;
+
+    if (s == NULL) {
+        if (end) {
+            *end = NULL;
+        }
+        return 0;
+    }
+    while (isspace((unsigned char)*s)) {
+        s++;
+    }
+    if (*s == '-') {
+        /* Standard, and surprising: a negated unsigned conversion is legal and
+         * wraps.  Ports parse -1 as a mask often enough to matter. */
+        negate = 1;
+        s++;
+    } else if (*s == '+') {
+        s++;
+    }
+    if (base == 0) {
+        if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
+            base = 16;
+            s += 2;
+        } else if (s[0] == '0') {
+            base = 8;
+        } else {
+            base = 10;
+        }
+    }
+    if (base == 16 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
+        s += 2;
+    }
+    for (;;) {
+        int  d;
+        char c = *s;
+        if (c >= '0' && c <= '9') {
+            d = c - '0';
+        } else if (c >= 'a' && c <= 'z') {
+            d = c - 'a' + 10;
+        } else if (c >= 'A' && c <= 'Z') {
+            d = c - 'A' + 10;
+        } else {
+            break;
+        }
+        if (d >= base) {
+            break;
+        }
+        v = v * (unsigned long)base + (unsigned long)d;
+        s++;
+    }
+    if (end) {
+        *end = (char *)s;
+    }
+    return negate ? (unsigned long)0 - v : v;
+}
+
+void *memchr(const void *p, int c, size_t n)
+{
+    const unsigned char *b = (const unsigned char *)p;
+    const unsigned char  want = (unsigned char)c;
+    for (size_t i = 0; i < n; ++i) {
+        if (b[i] == want) {
+            return (void *)(b + i);
+        }
+    }
+    return NULL;
+}
+
 int sscanf(const char *str, const char *fmt, ...)
 {
     va_list ap;

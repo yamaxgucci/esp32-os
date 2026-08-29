@@ -72,6 +72,14 @@ def command_for(app, defaults, extra_cflags, gcc=None):
         cmd += ["--include", inc]
     if cflags:
         cmd += ["--cflags", cflags]
+    if "cxxflags" in app:
+        cmd += ["--cxxflags", app["cxxflags"]]
+    # Archives beyond libgcc.  Only the STL images need one so far, and they
+    # need it named here rather than guessed: -lstdc++ pulls in code compiled
+    # for a hosted system, and which image is willing to carry that is a
+    # decision, not a default.
+    for lib in app.get("libs", []):
+        cmd += ["--libs", lib]
     cmd += ["-o", "build/apps/" + app["out"]]
     cmd += app["src"]
     return cmd
