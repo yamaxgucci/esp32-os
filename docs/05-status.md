@@ -18,7 +18,8 @@
 владеет машиной, ОС — тонкий слой сервисов. Не клон Linux, не «поделка»:
 целевое применение промышленное. Обоснование всех решений — в
 [00-architecture.md](00-architecture.md), план — в [04-roadmap.md](04-roadmap.md),
-конфигурация плат — в [03-board-config.md](03-board-config.md), бюджеты и затыки
+конфигурация плат — в [03-board-config.md](03-board-config.md), что где живёт в
+памяти — в [13-memory.md](13-memory.md), бюджеты и затыки
 realtime-эмуляции — в [07-emulator-performance.md](07-emulator-performance.md),
 что стоит симуляция аналоговых цепей — в
 [08-circuit-simulation.md](08-circuit-simulation.md), что умеет и чего стоит
