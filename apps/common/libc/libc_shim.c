@@ -55,7 +55,39 @@ void free(void *p)
     }
 }
 
-void exit(int code) { ag_exit(code); }
+/*
+ * atexit, and an exit that honours it.
+ *
+ * Both are here rather than left to newlib because newlib's version reaches
+ * for __on_exit_args and a registry the C++ runtime also wants; letting that
+ * object in means two exit paths over one process.  Thirty-two is more than
+ * any port has registered - the C++ statics go through __cxa_atexit in
+ * apps/common/cxx, not through here.
+ */
+#define ATEXIT_MAX 32
+
+static void (*s_atexit[ATEXIT_MAX])(void);
+static int s_atexit_count;
+
+int atexit(void (*fn)(void))
+{
+    if (fn == NULL || s_atexit_count >= ATEXIT_MAX) {
+        return -1;
+    }
+    s_atexit[s_atexit_count++] = fn;
+    return 0;
+}
+
+void exit(int code)
+{
+    while (s_atexit_count > 0) {
+        /* Decrement first: a handler that calls exit again must not run the
+         * same handler twice. */
+        s_atexit[--s_atexit_count]();
+    }
+    ag_exit(code);
+}
+
 void abort(void) { ag_panic("abort"); }
 
 /* What a failed assert() expands to.  Print where it happened, then panic. */
@@ -89,7 +121,9 @@ int atoi(const char *s)
 
 double atof(const char *s)
 {
-    return (double)atoi(s);
+    /* This used to be atoi in disguise, which read 0.75 as zero.  Nothing in
+     * the tree had a fractional constant to notice until a game engine did. */
+    return strtod(s, NULL);
 }
 
 static int fmt_out(char *buf, size_t n, size_t *pos, char c)
@@ -522,6 +556,129 @@ long ftell(FILE *f)
 }
 
 /*
+ * These three are here for a reason that is not obvious: without them the
+ * linker takes newlib's, and newlib's rewind lives in an object that also
+ * defines fseek and reaches for _fflush_r, which drags in newlib's fflush and
+ * fclose - and those collide with the ones above.  One missing function pulls
+ * a whole stdio in behind it.  Providing them keeps the archive closed.
+ */
+void rewind(FILE *f)
+{
+    if (f != NULL && f->h >= 0) {
+        ag_seek((ag_handle_t)f->h, 0, AG_SEEK_SET);
+        f->eof = 0;
+    }
+}
+
+int fputc(int c, FILE *f)
+{
+    unsigned char ch = (unsigned char)c;
+    return fwrite(&ch, 1, 1, f) == 1 ? (int)ch : -1;
+}
+
+int fputs(const char *s, FILE *f)
+{
+    size_t n;
+    if (s == NULL) {
+        return -1;
+    }
+    n = strlen(s);
+    return fwrite(s, 1, n, f) == n ? 0 : -1;
+}
+
+/*
+ * Enough of strtod for a configuration file: sign, digits, a point, more
+ * digits, and an exponent.  No hexadecimal float, no infinity, no NaN - none
+ * of which appear in a .cfg, and each of which is a corner where a
+ * hand-written parser goes quietly wrong.
+ *
+ * Accumulating in a double and scaling once at the end costs one rounding
+ * rather than one per digit.
+ */
+double strtod(const char *s, char **end)
+{
+    double mantissa = 0.0;
+    int    exponent = 0;
+    int    sign = 1;
+    int    digits = 0;
+    const char *start = s;
+
+    if (s == NULL) {
+        if (end) {
+            *end = NULL;
+        }
+        return 0.0;
+    }
+    while (isspace((unsigned char)*s)) {
+        s++;
+    }
+    if (*s == '-') {
+        sign = -1;
+        s++;
+    } else if (*s == '+') {
+        s++;
+    }
+    while (*s >= '0' && *s <= '9') {
+        mantissa = mantissa * 10.0 + (double)(*s - '0');
+        s++;
+        digits++;
+    }
+    if (*s == '.') {
+        s++;
+        while (*s >= '0' && *s <= '9') {
+            mantissa = mantissa * 10.0 + (double)(*s - '0');
+            exponent--;
+            s++;
+            digits++;
+        }
+    }
+    if (digits == 0) {
+        /* Nothing was consumed, so nothing was a number. */
+        if (end) {
+            *end = (char *)start;
+        }
+        return 0.0;
+    }
+    if (*s == 'e' || *s == 'E') {
+        const char *mark = s;
+        int         esign = 1;
+        int         evalue = 0;
+        int         edigits = 0;
+        s++;
+        if (*s == '-') {
+            esign = -1;
+            s++;
+        } else if (*s == '+') {
+            s++;
+        }
+        while (*s >= '0' && *s <= '9') {
+            evalue = evalue * 10 + (*s - '0');
+            s++;
+            edigits++;
+        }
+        if (edigits == 0) {
+            s = mark; /* an 'e' with no exponent is not part of the number */
+        } else {
+            exponent += esign * evalue;
+        }
+    }
+
+    while (exponent > 0) {
+        mantissa *= 10.0;
+        exponent--;
+    }
+    while (exponent < 0) {
+        mantissa /= 10.0;
+        exponent++;
+    }
+
+    if (end) {
+        *end = (char *)s;
+    }
+    return sign < 0 ? -mantissa : mantissa;
+}
+
+/*
  * A word at a time when the alignment allows it.
  *
  * These were both a byte at a time, which on a 32-bit core is four
@@ -705,6 +862,29 @@ int fgetc(FILE *f)
         return EOF;
     }
     return (int)c;
+}
+
+/*
+ * By seeking back a byte rather than keeping a pushback slot, which means the
+ * character that comes back is the one that was there - not the one handed in.
+ * Every caller in sight pushes back what it just read, which is what ungetc is
+ * for; a caller that pushes back something else would find this lying, and the
+ * fix then is a byte in FILE rather than a smarter seek.
+ *
+ * It is also here to keep newlib out: a single call to newlib's ungetc drags
+ * in its fflush, which drags in its stdio table, which then collides with
+ * three functions this file already defines.
+ */
+int ungetc(int c, FILE *f)
+{
+    if (f == NULL || f->h < 0 || c == EOF) {
+        return EOF;
+    }
+    if (ag_seek((ag_handle_t)f->h, -1, AG_SEEK_CUR) < 0) {
+        return EOF;
+    }
+    f->eof = 0;
+    return c;
 }
 
 char *fgets(char *s, int n, FILE *f)

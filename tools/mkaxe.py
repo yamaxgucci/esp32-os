@@ -121,14 +121,40 @@ def rodata_lines():
 
 
 def code_block(rodata_in_code):
-    """The part that gets executed.  Literals first: l32r only reaches back."""
+    """The part that gets executed.
+
+    The literals are interleaved with the code rather than gathered at the
+    front, and the single input specification is what does it: naming both in
+    one *( ) tells ld to lay the matching sections down in the order it reads
+    the objects, so each object's literal pool lands immediately before that
+    object's own text.
+
+    This matters because l32r - the only way an Xtensa instruction reaches a
+    32-bit constant - addresses backwards and no further than 256 KB.  With all
+    the literals first, that is the largest an image's code can be, and the
+    limit announces itself as `dangerous relocation: l32r: literal target out
+    of range` from somewhere inside libgcc's floating point.  Half a megabyte
+    of engine found it.  Interleaved, the distance is one object wide instead
+    of one image wide, and the ceiling is gone.
+
+    Backwards is still the direction, so an object's literals must precede its
+    text; they do, because .literal is named first.  ESP-IDF's own linker
+    scripts write the same line for the same reason.
+    """
     lines = ["  .image :", "  {",
-             "    *(.literal .literal.*)",
-             "    *(.text .text.*)",
+             # The two roots.  Nothing in the image refers to the entry point -
+             # the loader jumps to it from outside - so with --gc-sections the
+             # linker is entitled to throw it away, and does: a large image
+             # built with --gc-sections came out with no ag_main at all.  KEEP
+             # says otherwise.  Harmless when the pattern matches nothing,
+             # which is the case for whichever of the two this image is not.
+             "    KEEP(*(.literal.ag_main .text.ag_main "
+             ".literal.ag_driver_init .text.ag_driver_init))",
+             "    *(.literal .text .literal.* .text.*)",
              "    " + HOT_RODATA_INPUT]
     if rodata_in_code:
         lines += rodata_lines()
-    lines += ["    *(.ag_header)",
+    lines += ["    KEEP(*(.ag_header))",
               "    . = ALIGN(4);",
               "  }"]
     return "\n".join(lines) + "\n"

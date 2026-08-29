@@ -24,6 +24,7 @@
 #include <errno.h>
 #include <pthread.h>
 #include <reent.h>
+#include <string.h>
 
 /* ---- newlib's reentrancy ------------------------------------------------- */
 
@@ -116,6 +117,44 @@ int pthread_mutex_unlock(pthread_mutex_t *m)
         return EINVAL;
     }
     ag_mutex_unlock((ag_mutex_t)(uintptr_t)*m);
+    return 0;
+}
+
+/*
+ * The attribute object.  std::recursive_mutex builds one to ask for
+ * PTHREAD_MUTEX_RECURSIVE, and that request is the only thing anybody sets.
+ *
+ * It is remembered and not honoured: ag_mutex_create makes one kind of mutex,
+ * and taking it twice on one thread would deadlock.  Nothing in the ports so
+ * far actually re-enters one - the engine that asks builds it, locks it once
+ * per call and unlocks - so this is a hole with a name rather than a bug with
+ * a symptom.  Closing it means a recursive flag in the task ABI.
+ */
+int pthread_mutexattr_init(pthread_mutexattr_t *attr)
+{
+    if (attr == NULL) {
+        return EINVAL;
+    }
+    memset(attr, 0, sizeof(*attr));
+    attr->is_initialized = 1;
+    return 0;
+}
+
+int pthread_mutexattr_destroy(pthread_mutexattr_t *attr)
+{
+    if (attr == NULL) {
+        return EINVAL;
+    }
+    attr->is_initialized = 0;
+    return 0;
+}
+
+int pthread_mutexattr_settype(pthread_mutexattr_t *attr, int kind)
+{
+    if (attr == NULL) {
+        return EINVAL;
+    }
+    attr->recursive = (kind == PTHREAD_MUTEX_RECURSIVE) ? 1 : 0;
     return 0;
 }
 

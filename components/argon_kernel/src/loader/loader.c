@@ -526,10 +526,23 @@ static ag_err_t xip_load_chunked(ag_handle_t h, const ag_axe_header_t *header,
     const bool     api_in_code =
         api_at >= code_base && api_at + 4u <= code_base + header->code.size;
 
+    /*
+     * The relocation table, whole, and it grows with the image: a 449 KB
+     * application brought 5109 of them, which is 20 KB.  It used to be asked
+     * of internal SRAM, and that is the one budget flash XIP is chosen to
+     * avoid - the image only got this far because the arena could not hold it.
+     * With a 16 KB task stack already taken out of internal memory there were
+     * 15 KB left in one piece, and the load failed with -ENOMEM after the
+     * appfs slot had been reserved.
+     *
+     * scratch_alloc asks extended memory first, which is where a table this
+     * size belongs; it is read once and then walked per page, so its latency
+     * is not on any path that matters.
+     */
     uint32_t *rel = NULL;
     if (header->reloc_count > 0) {
         const size_t rbytes = (size_t)header->reloc_count * sizeof(uint32_t);
-        rel = (uint32_t *)ag_port_alloc(rbytes, AG_MEM_FAST | AG_MEM_BYTE);
+        rel = (uint32_t *)scratch_alloc(rbytes);
         if (rel == NULL) {
             return -AG_ENOMEM;
         }
