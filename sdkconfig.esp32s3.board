@@ -91,3 +91,29 @@ CONFIG_ARGON_ENABLE_CAMERA=y
 # keyboard's reports become console events through the same parser a BLE
 # keyboard's do.  Not verifiable in QEMU (no USB host); the gate is the board.
 CONFIG_ARGON_USB_HOST=y
+
+# See devices behind an external hub.  IDF leaves this off by default, so a
+# keyboard plugged into a hub (rather than straight onto the OTG port) enumerates
+# the hub and then nothing - the downstream port is never walked.  On here for
+# two reasons: a hub is a normal way to attach the keyboard, and a powered hub
+# supplies the keyboard's 5 V itself, which is the clean answer to the OTG port's
+# shared-VBUS current budget.
+CONFIG_USB_HOST_HUBS_SUPPORTED=y
+
+# USB host timing, tuned for a keyboard behind a passive hub on this board's OTG
+# port powered from the host PC.  The failure without these is an XFER error on
+# the first control transfer (usbh.c: "Dev 0 EP 0 Error", not STALL): the 5 V
+# rail dips on the hub+device inrush and the host resets the port and asks for
+# the descriptor before the device has settled.  The chip itself does not reset
+# (the brownout detector holds), so the fix is to wait longer at every step -
+# power-on-to-good, connection debounce, reset hold and reset recovery - and to
+# retry the downstream-port reset.  Cost: a second or two per enumeration, which
+# for a keyboard is nothing.
+CONFIG_USB_HOST_DEBOUNCE_DELAY_MS=500
+CONFIG_USB_HOST_RESET_HOLD_MS=50
+CONFIG_USB_HOST_RESET_RECOVERY_MS=200
+CONFIG_USB_HOST_SET_ADDR_RECOVERY_MS=50
+CONFIG_USB_HOST_EXT_PORT_RESET_ATTEMPTS=3
+CONFIG_USB_HOST_EXT_PORT_RESET_RECOVERY_DELAY_MS=200
+CONFIG_USB_HOST_EXT_PORT_CUSTOM_POWER_ON_DELAY_ENABLE=y
+CONFIG_USB_HOST_EXT_PORT_CUSTOM_POWER_ON_DELAY_MS=500
