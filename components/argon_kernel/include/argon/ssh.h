@@ -4,9 +4,9 @@
  * needs comes through argon/port.
  *
  * Being written in milestones, each testable with a real `ssh` client:
- *   1. transport: version exchange + KEXINIT negotiation      <- here now
- *   2. curve25519 key exchange, rsa host key, aes+hmac, NEWKEYS
- *   3. userauth (password)
+ *   1. transport: version exchange + KEXINIT negotiation      done
+ *   2. curve25519 key exchange, ecdsa host key, aes+hmac, NEWKEYS   done
+ *   3. userauth (password)                                    <- here now
  *   4. a session channel wired to the console (like telnet)
  *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
@@ -31,6 +31,17 @@ ag_err_t ag_ssh_start(uint16_t port);
 void     ag_ssh_stop(void);
 bool     ag_ssh_running(void);
 uint16_t ag_ssh_port(void);
+
+/*
+ * Set the login this server accepts, effective immediately (SYSTEM.CFG's
+ * ssh.user / ssh.pass are only read at boot).  A NULL or empty password leaves
+ * logins refused.  The shell's `ssh user` persists the same values for next
+ * boot.  Returns whether a usable (non-empty) password is now set.
+ */
+bool ag_ssh_set_cred(const char *user, const char *pass);
+
+/* Whether a login can currently succeed (a password is set live or in config). */
+bool ag_ssh_have_login(void);
 
 #endif /* CONFIG_ARGON_NET_SSH */
 

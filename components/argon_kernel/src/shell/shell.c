@@ -556,6 +556,10 @@ static int cmd_telnet(int argc, char **argv)
 #endif /* CONFIG_ARGON_NET_TELNET */
 
 #if defined(CONFIG_ARGON_NET_SSH) && CONFIG_ARGON_NET_SSH
+/* Defined further down with the other SYSTEM.CFG writers; `ssh user` persists
+ * the login through it. */
+static ag_err_t cfg_replace_section(const char *section, const char *body);
+
 static int cmd_ssh(int argc, char **argv)
 {
     if (argc >= 2 && ag_path_icmp(argv[1], "on") == 0) {
@@ -575,8 +579,33 @@ static int cmd_ssh(int argc, char **argv)
         ag_console_puts("ssh off\n");
         return 0;
     }
+    if (argc >= 2 && ag_path_icmp(argv[1], "user") == 0) {
+        if (argc < 3) {
+            ag_console_puts("usage: ssh user <name> [password]\n");
+            return 1;
+        }
+        const char *name = argv[2];
+        const char *pass = (argc >= 4) ? argv[3] : "";
+        const bool  usable = ag_ssh_set_cred(name, pass);
+        /* Persist for next boot; the live value above already took effect. */
+        char body[128];
+        snprintf(body, sizeof(body), "user = %s\npass = %s\n", name, pass);
+        const ag_err_t cerr = cfg_replace_section("ssh", body);
+        if (cerr != AG_OK) {
+            ag_console_printf("ssh user: set for now, but not saved (%s)\n",
+                              ag_loader_api()->sys->strerror(cerr));
+        }
+        if (usable) {
+            ag_console_printf("ssh login: %s (password set)\n", name);
+        } else {
+            ag_console_printf("ssh login: %s (no password - logins refused)\n",
+                              name);
+        }
+        return 0;
+    }
     if (ag_ssh_running()) {
-        ag_console_printf("ssh on, port %u\n", (unsigned)ag_ssh_port());
+        ag_console_printf("ssh on, port %u%s\n", (unsigned)ag_ssh_port(),
+                          ag_ssh_have_login() ? "" : " (no login set)");
     } else {
         ag_console_puts("ssh off ('ssh on' to open the server on :22)\n");
     }
@@ -1084,7 +1113,8 @@ static int cfg_has_device_line(const char *text, const char *dos_path)
     return 0;
 }
 
-#if AG_PORT_HAS_WIFI || AG_PORT_HAS_BT
+#if AG_PORT_HAS_WIFI || AG_PORT_HAS_BT || \
+    (defined(CONFIG_ARGON_NET_SSH) && CONFIG_ARGON_NET_SSH)
 
 /* Case-insensitive compare of a fixed length; the section name in the file may
  * be in any case and there is no such helper in argon/path.h. */
@@ -1229,7 +1259,7 @@ static ag_err_t cfg_replace_section(const char *section, const char *body)
     return (w < 0) ? (ag_err_t)w : AG_OK;
 }
 
-#endif /* AG_PORT_HAS_WIFI || AG_PORT_HAS_BT */
+#endif /* AG_PORT_HAS_WIFI || AG_PORT_HAS_BT || CONFIG_ARGON_NET_SSH */
 
 #if AG_PORT_HAS_WIFI
 static ag_err_t cfg_ensure_wifi(const char *ssid, const char *pass,
@@ -4404,7 +4434,8 @@ static const ag_command_t k_commands[] = {
     {"telnet", "[on [port]|off]", "the console over TCP :23", cmd_telnet},
 #endif
 #if defined(CONFIG_ARGON_NET_SSH) && CONFIG_ARGON_NET_SSH
-    {"ssh", "[on [port]|off]", "encrypted console on TCP :22", cmd_ssh},
+    {"ssh", "[on [port]|off|user <name> [pass]]",
+     "encrypted console on TCP :22", cmd_ssh},
 #endif
 #endif
 #if AG_PORT_HAS_BT

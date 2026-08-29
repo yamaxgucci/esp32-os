@@ -71,7 +71,14 @@ typedef struct ag_aes_ctr ag_aes_ctr_t;
 
 ag_aes_ctr_t *ag_crypto_aes_ctr_new(const uint8_t key[32], const uint8_t iv[16]);
 
-/* XOR the keystream over len bytes in place-safe fashion (in may equal out). */
+/*
+ * XOR the keystream over len bytes in place-safe fashion (in may equal out).
+ *
+ * The `in` and `out` buffers MUST be in DMA-reachable memory (AG_MEM_DMA -
+ * internal SRAM on this part), NOT PSRAM.  The AES here runs on the chip's
+ * accelerator, which reaches its buffers by DMA, and DMA cannot touch PSRAM:
+ * a call over a PSRAM buffer hangs the task with no error.
+ */
 void ag_crypto_aes_ctr_xcrypt(ag_aes_ctr_t *c, const uint8_t *in, uint8_t *out,
                               size_t len);
 

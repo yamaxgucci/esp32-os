@@ -26,31 +26,40 @@
 
 #if defined(CONFIG_ARGON_NET_SSH) && CONFIG_ARGON_NET_SSH
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include <argon/cfg.h>
 #include <argon/log.h>
 #include <argon/vfs.h>
 
 #include <argon/port/crypto.h>
+#include <argon/port/mem.h>
 #include <argon/port/net.h>
 #include <argon/port/random.h>
 #include <argon/port/task.h>
 #include <argon/port/time.h>
 
+#include "core/sysconfig.h"
 #include "net/netio.h"
 
 #define SSH_DEFAULT_PORT 22
 #define SSH_ACCEPT_MS    400
 #define SSH_VERSION      "SSH-2.0-ArgonOS_0.1"
 
-#define SSH_MSG_DISCONNECT      1
-#define SSH_MSG_SERVICE_REQUEST 5
-#define SSH_MSG_SERVICE_ACCEPT  6
-#define SSH_MSG_KEXINIT         20
-#define SSH_MSG_NEWKEYS         21
-#define SSH_MSG_KEX_ECDH_INIT   30
-#define SSH_MSG_KEX_ECDH_REPLY  31
+#define SSH_MSG_DISCONNECT       1
+#define SSH_MSG_SERVICE_REQUEST  5
+#define SSH_MSG_SERVICE_ACCEPT   6
+#define SSH_MSG_KEXINIT          20
+#define SSH_MSG_NEWKEYS          21
+#define SSH_MSG_KEX_ECDH_INIT    30
+#define SSH_MSG_KEX_ECDH_REPLY   31
+#define SSH_MSG_USERAUTH_REQUEST 50
+#define SSH_MSG_USERAUTH_FAILURE 51
+#define SSH_MSG_USERAUTH_SUCCESS 52
+
+#define SSH_MAX_AUTH_TRIES 6 /* before the connection is dropped */
 
 #define SSH_MAX_PACKET   4096 /* handshake and control packets are small */
 #define SSH_HOSTKEY_PATH "/sys/SSH_HOST.KEY"
@@ -62,6 +71,13 @@ static volatile bool  s_stop;
 static int            s_listen_fd = -1;
 static uint16_t       s_port;
 static ag_port_task_t s_task;
+
+/* Live credentials set with `ssh user` - they take effect at once, whereas
+ * ssh.user / ssh.pass in SYSTEM.CFG are only read at boot.  Empty means "fall
+ * back to the config"; a configured password that is also empty means no login
+ * is possible, which is the safe default for a freshly flashed board. */
+static char s_user[33];
+static char s_pass[65];
 
 /* The algorithms this server speaks - now all implemented below. */
 static const char *const NL_KEX = "curve25519-sha256";
@@ -93,14 +109,23 @@ typedef struct {
     uint8_t     mac_out[32];
     uint8_t     session_id[32];
 
-    /* record scratch: [0..3] holds the sequence number for the MAC, the packet
-     * follows at +4 so hmac covers seq||packet in one contiguous call.  rx/tx
-     * are the assembled packet; nbuf is the raw socket buffer netio reads into,
-     * kept separate so decrypting into rx never clobbers bytes still queued. */
+    /* nbuf is the raw socket buffer netio reads into; msg is one decoded payload
+     * at a time - both may live in PSRAM with the rest of this struct.
+     *
+     * rx/tx are the assembled packet the cipher works in place on, and they must
+     * NOT be in PSRAM: the ESP32-S3's AES accelerator (which mbedTLS uses) reads
+     * and writes its buffers by DMA, and the DMA engine cannot reach PSRAM - an
+     * AES call on a PSRAM buffer simply hangs.  So they are allocated separately
+     * from internal, DMA-reachable memory (see conn_alloc).  Layout: [0..3] is
+     * the sequence number for the MAC, the packet follows at +4, so the HMAC
+     * covers seq||packet in one contiguous call. */
     uint8_t     nbuf[SSH_MAX_PACKET];
-    uint8_t     rx[4 + SSH_MAX_PACKET + 16];
-    uint8_t     tx[4 + SSH_MAX_PACKET + 16];
+    uint8_t     msg[SSH_MAX_PACKET];
+    uint8_t    *rx; /* internal DMA RAM, 4 + SSH_MAX_PACKET + 16 */
+    uint8_t    *tx; /* internal DMA RAM, 4 + SSH_MAX_PACKET + 16 */
 } ssh_conn_t;
+
+#define SSH_RECORD_BUF (4 + SSH_MAX_PACKET + 16)
 
 /* ---- big-endian scalars ------------------------------------------------ */
 
@@ -182,6 +207,61 @@ static void wb_mpint(wbuf_t *w, const uint8_t *mag, size_t n)
         wb_byte(w, 0x00);
     }
     wb_bytes(w, mag + i, m);
+}
+
+/* ---- a bounds-checked buffer reader ------------------------------------ */
+
+typedef struct {
+    const uint8_t *p;
+    size_t         len;
+    size_t         pos;
+    bool           err;
+} rbuf_t;
+
+static void rb_init(rbuf_t *r, const uint8_t *p, size_t len)
+{
+    r->p = p;
+    r->len = len;
+    r->pos = 0;
+    r->err = false;
+}
+
+static uint8_t rb_byte(rbuf_t *r)
+{
+    if (r->pos + 1 > r->len) {
+        r->err = true;
+        return 0;
+    }
+    return r->p[r->pos++];
+}
+
+/* An SSH string: returns a pointer into the buffer and its length; advances. */
+static const uint8_t *rb_string(rbuf_t *r, uint32_t *out_len)
+{
+    if (r->pos + 4 > r->len) {
+        r->err = true;
+        return NULL;
+    }
+    const uint32_t n = rd_u32(r->p + r->pos);
+    r->pos += 4;
+    if (n > r->len - r->pos) {
+        r->err = true;
+        return NULL;
+    }
+    const uint8_t *s = r->p + r->pos;
+    r->pos += n;
+    *out_len = n;
+    return s;
+}
+
+/* Constant-time equality of an n-byte field against a C string of the same n. */
+static bool ct_eq(const uint8_t *a, const char *b, size_t n)
+{
+    uint8_t d = 0;
+    for (size_t i = 0; i < n; i++) {
+        d |= (uint8_t)(a[i] ^ (uint8_t)b[i]);
+    }
+    return d == 0;
 }
 
 /* ---- socket helpers ---------------------------------------------------- */
@@ -611,6 +691,106 @@ static ag_err_t do_kex(ssh_conn_t *c, const uint8_t *init_pl, size_t init_len)
     return AG_OK;
 }
 
+/* ---- authentication ---------------------------------------------------- */
+
+/* The expected login: the live credentials if set, else SYSTEM.CFG, else the
+ * defaults (user "root", no password - which refuses every login). */
+static const char *want_user(void)
+{
+    if (s_user[0] != '\0') {
+        return s_user;
+    }
+    return ag_cfg_get(ag_sysconfig(), "ssh.user", "root");
+}
+
+static const char *want_pass(void)
+{
+    if (s_pass[0] != '\0') {
+        return s_pass;
+    }
+    return ag_cfg_get(ag_sysconfig(), "ssh.pass", "");
+}
+
+static ag_err_t send_userauth_failure(ssh_conn_t *c)
+{
+    uint8_t buf[32];
+    wbuf_t  w;
+    wb_init(&w, buf, sizeof(buf));
+    wb_byte(&w, SSH_MSG_USERAUTH_FAILURE);
+    wb_cstr(&w, "password"); /* the methods that can still continue */
+    wb_byte(&w, 0);          /* partial success: no */
+    return write_packet(c, buf, w.len);
+}
+
+/*
+ * The userauth service (RFC 4252).  Answers requests until one succeeds or the
+ * tries run out.  "none" and unknown methods are refused with the password
+ * method offered; a correct password wins.  Returns true once authenticated.
+ */
+static bool do_userauth(ssh_conn_t *c)
+{
+    const char *user = want_user();
+    const char *pass = want_pass();
+    const size_t user_len = strlen(user);
+    const size_t pass_len = strlen(pass);
+    if (pass_len == 0) {
+        ag_log(AG_LOG_WARN, "ssh",
+               "no password set - refusing logins (set one: ssh user <name> <pass>)");
+    }
+
+    for (int tries = 0; tries < SSH_MAX_AUTH_TRIES; tries++) {
+        const int32_t n = read_packet(c, c->msg, sizeof(c->msg));
+        if (n < 1) {
+            return false;
+        }
+        if (c->msg[0] != SSH_MSG_USERAUTH_REQUEST) {
+            continue; /* not our business; ignore and keep waiting */
+        }
+
+        rbuf_t r;
+        rb_init(&r, c->msg + 1, (size_t)n - 1);
+        uint32_t ul = 0, sl = 0, ml = 0;
+        const uint8_t *u = rb_string(&r, &ul);
+        (void)rb_string(&r, &sl); /* service name: always "ssh-connection" */
+        const uint8_t *m = rb_string(&r, &ml);
+        if (r.err) {
+            return false;
+        }
+
+        if (ml == 8 && memcmp(m, "password", 8) == 0) {
+            const uint8_t change = rb_byte(&r);
+            uint32_t      pw_len = 0;
+            const uint8_t *pw = rb_string(&r, &pw_len);
+            if (r.err || change != 0) {
+                if (send_userauth_failure(c) != AG_OK) {
+                    return false;
+                }
+                continue;
+            }
+            const bool ok = pass_len > 0 && ul == user_len &&
+                            ct_eq(u, user, ul) && pw_len == pass_len &&
+                            ct_eq(pw, pass, pw_len);
+            if (ok) {
+                const uint8_t s = SSH_MSG_USERAUTH_SUCCESS;
+                if (write_packet(c, &s, 1) != AG_OK) {
+                    return false;
+                }
+                ag_log(AG_LOG_INFO, "ssh", "authenticated %.*s (password)",
+                       (int)ul, (const char *)u);
+                return true;
+            }
+            ag_log(AG_LOG_WARN, "ssh", "password rejected for %.*s", (int)ul,
+                   (const char *)u);
+        }
+
+        if (send_userauth_failure(c) != AG_OK) {
+            return false;
+        }
+    }
+    ag_log(AG_LOG_WARN, "ssh", "too many auth attempts; dropping");
+    return false;
+}
+
 /* ---- one connection ---------------------------------------------------- */
 
 static void handle_connection(ssh_conn_t *c)
@@ -640,45 +820,75 @@ static void handle_connection(ssh_conn_t *c)
     }
     c->i_c_len = (size_t)ni;
 
-    /* Client KEX_ECDH_INIT. */
-    uint8_t pl[SSH_MAX_PACKET];
-    const int32_t nk = read_packet(c, pl, sizeof(pl));
+    /* Client KEX_ECDH_INIT.  c->msg (heap) holds the payload so do_kex's deep
+     * mbedTLS calls do not share the task stack with a 4 KB buffer. */
+    const int32_t nk = read_packet(c, c->msg, sizeof(c->msg));
     if (nk < 1) {
         ag_log(AG_LOG_WARN, "ssh", "no KEX_ECDH_INIT");
         return;
     }
-    if (do_kex(c, pl, (size_t)nk) != AG_OK) {
+    if (do_kex(c, c->msg, (size_t)nk) != AG_OK) {
         ag_log(AG_LOG_WARN, "ssh", "key exchange failed");
         return;
     }
 
     /* Client NEWKEYS (still cleartext). */
-    const int32_t nn = read_packet(c, pl, sizeof(pl));
-    if (nn < 1 || pl[0] != SSH_MSG_NEWKEYS) {
+    const int32_t nn = read_packet(c, c->msg, sizeof(c->msg));
+    if (nn < 1 || c->msg[0] != SSH_MSG_NEWKEYS) {
         ag_log(AG_LOG_WARN, "ssh", "expected NEWKEYS");
         return;
     }
     c->enc_in = true;
 
     /* First encrypted packet: SERVICE_REQUEST.  Reading it proves the keys. */
-    const int32_t ns = read_packet(c, pl, sizeof(pl));
+    const int32_t ns = read_packet(c, c->msg, sizeof(c->msg));
     if (ns < 1) {
         ag_log(AG_LOG_WARN, "ssh", "no service request after NEWKEYS");
         return;
     }
-    if (pl[0] == SSH_MSG_SERVICE_REQUEST) {
-        uint8_t acc[64];
-        wbuf_t  w;
-        wb_init(&w, acc, sizeof(acc));
-        wb_byte(&w, SSH_MSG_SERVICE_ACCEPT);
-        wb_cstr(&w, "ssh-userauth");
-        (void)write_packet(c, acc, w.len);
-        ag_log(AG_LOG_INFO, "ssh",
-               "encrypted channel up (aes256-ctr); userauth is the next step");
-    } else {
-        ag_log(AG_LOG_INFO, "ssh", "encrypted packet type %u received",
-               (unsigned)pl[0]);
+    if (c->msg[0] != SSH_MSG_SERVICE_REQUEST) {
+        ag_log(AG_LOG_WARN, "ssh", "expected SERVICE_REQUEST, got msg %u",
+               (unsigned)c->msg[0]);
+        return;
     }
+    uint8_t acc[64];
+    wbuf_t  w;
+    wb_init(&w, acc, sizeof(acc));
+    wb_byte(&w, SSH_MSG_SERVICE_ACCEPT);
+    wb_cstr(&w, "ssh-userauth");
+    if (write_packet(c, acc, w.len) != AG_OK) {
+        return;
+    }
+
+    /* Authenticate.  The session channel that a success opens onto is the next
+     * milestone; for now a logged-in connection stops here. */
+    if (do_userauth(c)) {
+        ag_log(AG_LOG_INFO, "ssh",
+               "session authenticated; the shell channel is the next step");
+    }
+}
+
+/* The struct is ~13 KB, so it lives in PSRAM; the two cipher scratch buffers
+ * must be internal DMA RAM (see ssh_conn_t).  NULL if any part cannot be had. */
+static ssh_conn_t *conn_alloc(void)
+{
+    ssh_conn_t *c = ag_port_alloc(sizeof(*c), AG_MEM_SLOW | AG_MEM_BYTE);
+    if (c == NULL) {
+        c = ag_port_alloc(sizeof(*c), AG_MEM_FAST | AG_MEM_BYTE);
+    }
+    if (c == NULL) {
+        return NULL;
+    }
+    memset(c, 0, sizeof(*c));
+    c->rx = ag_port_alloc(SSH_RECORD_BUF, AG_MEM_DMA | AG_MEM_BYTE);
+    c->tx = ag_port_alloc(SSH_RECORD_BUF, AG_MEM_DMA | AG_MEM_BYTE);
+    if (c->rx == NULL || c->tx == NULL) {
+        ag_port_free(c->rx);
+        ag_port_free(c->tx);
+        ag_port_free(c);
+        return NULL;
+    }
+    return c;
 }
 
 static void conn_free(ssh_conn_t *c)
@@ -692,7 +902,9 @@ static void conn_free(ssh_conn_t *c)
     if (c->c_out != NULL) {
         ag_crypto_aes_ctr_free(c->c_out);
     }
-    free(c);
+    ag_port_free(c->rx);
+    ag_port_free(c->tx);
+    ag_port_free(c);
 }
 
 /* ---- listener task ----------------------------------------------------- */
@@ -705,11 +917,13 @@ static void ssh_task(void *arg)
         if (fd < 0) {
             continue;
         }
-        ssh_conn_t *c = calloc(1, sizeof(*c));
+        ssh_conn_t *c = conn_alloc();
         if (c != NULL) {
             c->fd = fd;
             handle_connection(c);
             conn_free(c);
+        } else {
+            ag_log(AG_LOG_ERROR, "ssh", "out of memory for a connection");
         }
         (void)ag_port_net_close(fd);
     }
@@ -737,8 +951,10 @@ ag_err_t ag_ssh_start(uint16_t port)
     s_port = port;
     s_stop = false;
     s_running = true;
-    /* A larger stack than telnet: the KEX arithmetic and mbedTLS want room. */
-    if (!ag_port_task_create(ssh_task, "ag_ssh", 12288, NULL, 6, 0, 0, &s_task)) {
+    /* A generous stack: the key exchange runs mbedTLS ECDSA and X25519, whose
+     * point arithmetic is several kilobytes deep.  The per-connection buffers
+     * live on the heap (ssh_conn_t) so this is headroom for the maths alone. */
+    if (!ag_port_task_create(ssh_task, "ag_ssh", 16384, NULL, 6, 0, 0, &s_task)) {
         (void)ag_port_net_close(s_listen_fd);
         s_listen_fd = -1;
         s_running = false;
@@ -758,6 +974,23 @@ void ag_ssh_stop(void)
         ag_port_task_delay(ag_port_ms_to_ticks(20));
     }
 }
+
+bool ag_ssh_set_cred(const char *user, const char *pass)
+{
+    if (user != NULL && user[0] != '\0') {
+        snprintf(s_user, sizeof(s_user), "%s", user);
+    } else {
+        s_user[0] = '\0';
+    }
+    if (pass != NULL) {
+        snprintf(s_pass, sizeof(s_pass), "%s", pass);
+    } else {
+        s_pass[0] = '\0';
+    }
+    return ag_ssh_have_login();
+}
+
+bool ag_ssh_have_login(void) { return want_pass()[0] != '\0'; }
 
 bool     ag_ssh_running(void) { return s_running; }
 uint16_t ag_ssh_port(void) { return s_running ? s_port : 0; }
