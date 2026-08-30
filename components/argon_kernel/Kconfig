@@ -420,6 +420,14 @@ menu "ArgonOS"
             on one GPIO, enough to read a DS18B20 temperature sensor.  Needs an
             external ~4.7k pull-up on the line.  Off by default.
 
+    config ARGON_RMT
+        bool "RMT (WS2812 / NeoPixel LEDs)"
+        default n
+        help
+            The `rmt ws2812` command: drive a chain of addressable WS2812 LEDs
+            on one GPIO through the RMT pulse generator.  Works with a board's
+            on-board addressable LED and needs no extra parts.  Off by default.
+
     config ARGON_BOARD_PROBE
         bool "Board probe instead of the system"
         default n

@@ -4496,6 +4496,9 @@ static const ag_command_t k_commands[] = {
 #if defined(CONFIG_ARGON_ONEWIRE) && CONFIG_ARGON_ONEWIRE
     {"onewire", "temp|rom <gpio>", "1-Wire / DS18B20", ag_cmd_onewire},
 #endif
+#if defined(CONFIG_ARGON_RMT) && CONFIG_ARGON_RMT
+    {"rmt", "ws2812 <gpio> <RRGGBB>…", "WS2812 LEDs via RMT", ag_cmd_rmt},
+#endif
     /* httpd is a loadable app now (HTTPD.AXE), not a built-in - run it by name. */
 #if defined(CONFIG_ARGON_NET_TELNET) && CONFIG_ARGON_NET_TELNET
     {"telnet", "[on [port]|off]", "the console over TCP :23", cmd_telnet},

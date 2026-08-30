@@ -149,6 +149,14 @@ if(CONFIG_ARGON_CAN)
     target_link_libraries(${COMPONENT_LIB} PRIVATE ${twai_lib})
 endif()
 
+# RMT (CONFIG_ARGON_RMT): the pulse generator that clocks out a WS2812 chain
+# (rmt_hw.c).  Linked conditionally so a build without it neither references the
+# driver nor puts driver/rmt_tx.h on the path.
+if(CONFIG_ARGON_RMT)
+    idf_component_get_property(rmt_lib esp_driver_rmt COMPONENT_LIB)
+    target_link_libraries(${COMPONENT_LIB} PRIVATE ${rmt_lib})
+endif()
+
 if(ARGON_PORT_SRCS)
     target_compile_options(${COMPONENT_LIB} PRIVATE
         -Wall -Wextra -Werror=implicit-function-declaration

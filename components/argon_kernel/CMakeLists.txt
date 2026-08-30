@@ -63,6 +63,7 @@ set(ARGON_KERNEL_SRCS
     "src/net/ota.c"
     "src/net/can.c"
     "src/net/onewire.c"
+    "src/net/rmt.c"
     "src/proc/proc.c"
     "src/proc/session.c"
     "src/proc/threads.c"
