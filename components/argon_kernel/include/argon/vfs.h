@@ -64,6 +64,12 @@ typedef struct {
 enum ag_mount_flags {
     AG_MOUNT_READONLY = 1u << 0,
     AG_MOUNT_REMOVABLE = 1u << 1,
+    /*
+     * The contents can change without the VFS being told: a device registry
+     * that grows when a driver loads, or a host directory somebody edits in
+     * another window.  Lookups that find nothing there are not remembered.
+     */
+    AG_MOUNT_VOLATILE = 1u << 2,
 };
 
 /*
@@ -138,6 +144,24 @@ uint32_t ag_vfs_close_owned_by(ag_pid_t pid);
 
 /* Number of handles currently open, for the shell and for leak checks. */
 uint32_t ag_vfs_open_count(void);
+
+/*
+ * Negative lookups.
+ *
+ * A name that is not there costs the same directory walk as one that is, and
+ * DOS-era programs search several directories for every file they open, so
+ * most of what a filesystem is asked is a question it will answer no to.  The
+ * VFS remembers those noes; see the block comment in vfs.c for how.
+ *
+ * Anything that could make a remembered name exist empties the table, so
+ * callers inside the VFS need not think about it.  This is for the two cases
+ * from outside: a backend whose namespace changed by itself (mount it
+ * AG_MOUNT_VOLATILE instead, if it always can), and the tests.
+ */
+void ag_vfs_forget_misses(void);
+
+/* Refusals served from memory, and entries currently held.  For tests. */
+void ag_vfs_miss_stats(uint32_t *hits, uint32_t *entries);
 
 /*
  * The backend's own object behind an open file handle, or NULL.

@@ -582,6 +582,16 @@ int ag_cmd_mount(int argc, char **argv)
                           (unsigned)mi.open_handles,
                           (mi.flags & AG_MOUNT_READONLY) ? "  read-only" : "");
     }
+
+    /*
+     * Names the filesystem was asked for and did not have to go looking for.
+     * Printed here because there is nowhere else it belongs and because a
+     * program that has gone slow on a card is usually one being told no.
+     */
+    uint32_t hits = 0, entries = 0;
+    ag_vfs_miss_stats(&hits, &entries);
+    ag_console_printf("\n%u lookup(s) refused from memory, %u name(s) held\n",
+                      (unsigned)hits, (unsigned)entries);
     return 0;
 }
 

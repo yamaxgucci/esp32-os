@@ -251,7 +251,8 @@ ag_err_t ag_devices_init(void)
     }
 
     ag_devfs_reset();
-    err = ag_vfs_mount("/dev", ag_devfs_ops(), NULL, 0);
+    /* Volatile: a driver loading adds a device the VFS was not told about. */
+    err = ag_vfs_mount("/dev", ag_devfs_ops(), NULL, AG_MOUNT_VOLATILE);
     if (err != AG_OK) {
         return err;
     }

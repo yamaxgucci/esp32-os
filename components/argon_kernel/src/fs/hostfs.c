@@ -769,7 +769,8 @@ static ag_err_t hostfs_probe_once(uint32_t timeout_ms)
         return -AG_ENODEV;
     }
 
-    err = ag_vfs_mount("/host", &k_ops, NULL, 0);
+    /* Volatile: the host owns this directory and edits it behind our back. */
+    err = ag_vfs_mount("/host", &k_ops, NULL, AG_MOUNT_VOLATILE);
     if (err != AG_OK) {
         ag_log(AG_LOG_ERROR, "hostfs", "mount /host failed (%d)", (int)err);
         return err;
