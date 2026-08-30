@@ -428,6 +428,14 @@ menu "ArgonOS"
             on one GPIO through the RMT pulse generator.  Works with a board's
             on-board addressable LED and needs no extra parts.  Off by default.
 
+    config ARGON_MCPWM
+        bool "MCPWM (complementary motor PWM)"
+        default n
+        help
+            The `mcpwm start`/`mcpwm stop` commands: a complementary PWM pair
+            with dead-time on two GPIOs, through the motor-control PWM
+            peripheral, for driving a half-bridge.  Off by default.
+
     config ARGON_BOARD_PROBE
         bool "Board probe instead of the system"
         default n

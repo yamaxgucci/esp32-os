@@ -157,6 +157,13 @@ if(CONFIG_ARGON_RMT)
     target_link_libraries(${COMPONENT_LIB} PRIVATE ${rmt_lib})
 endif()
 
+# MCPWM (CONFIG_ARGON_MCPWM): the motor-control PWM, for a complementary pair
+# with dead-time (mcpwm_hw.c).  Linked conditionally like the drivers above.
+if(CONFIG_ARGON_MCPWM)
+    idf_component_get_property(mcpwm_lib esp_driver_mcpwm COMPONENT_LIB)
+    target_link_libraries(${COMPONENT_LIB} PRIVATE ${mcpwm_lib})
+endif()
+
 if(ARGON_PORT_SRCS)
     target_compile_options(${COMPONENT_LIB} PRIVATE
         -Wall -Wextra -Werror=implicit-function-declaration
