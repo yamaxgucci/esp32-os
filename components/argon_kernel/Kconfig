@@ -386,6 +386,15 @@ menu "ArgonOS"
             `mqtt pub` and `mqtt sub` commands.  mqtts (MQTT over TLS) works
             when CONFIG_ARGON_NET_TLS is also on.  Off by default.
 
+    config ARGON_NET_MODBUS
+        bool "Modbus TCP client (master)"
+        depends on ARGON_ENABLE_NET
+        default n
+        help
+            A Modbus TCP master from scratch over the socket layer: the
+            `modbus read` and `modbus write` commands, for the holding and
+            input registers a PLC or sensor gateway exposes.  Off by default.
+
     config ARGON_BOARD_PROBE
         bool "Board probe instead of the system"
         default n

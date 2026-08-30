@@ -4483,6 +4483,10 @@ static const ag_command_t k_commands[] = {
     {"mqtt", "pub|sub <host> <topic> [msg] [/tls]", "MQTT publish/subscribe",
      ag_cmd_mqtt},
 #endif
+#if defined(CONFIG_ARGON_NET_MODBUS) && CONFIG_ARGON_NET_MODBUS
+    {"modbus", "read|write <host> <addr> [n|vals]", "Modbus TCP master",
+     ag_cmd_modbus},
+#endif
     /* httpd is a loadable app now (HTTPD.AXE), not a built-in - run it by name. */
 #if defined(CONFIG_ARGON_NET_TELNET) && CONFIG_ARGON_NET_TELNET
     {"telnet", "[on [port]|off]", "the console over TCP :23", cmd_telnet},

@@ -59,6 +59,7 @@ set(ARGON_KERNEL_SRCS
     "src/net/ftpc.c"
     "src/net/ssh.c"
     "src/net/mqtt.c"
+    "src/net/modbus.c"
     "src/proc/proc.c"
     "src/proc/session.c"
     "src/proc/threads.c"
