@@ -31,6 +31,7 @@ typedef struct FILE {
     int rcap;    /* bytes allocated, 0 if none */
     int rlen;    /* valid bytes in rbuf */
     int rpos;    /* cursor within rbuf */
+    int rahead;  /* how much the next fill may fetch; 0 after a seek */
 } FILE;
 
 extern FILE *stdin;

@@ -557,20 +557,32 @@ int fflush(FILE *f)
 }
 
 /*
- * How much is read ahead.  Four kilobytes, and measured rather than assumed.
+ * How much is read ahead.
  *
- * Sixteen was tried on the guess that a read costs mostly the call.  It is the
- * other way round: the calls fell by two and a half times and the time in the
- * filesystem doubled, taking Fallout 2 from 5.7 frames a second to 3.3.  The
- * cost is in the bytes, so reading ahead further only fetches what nobody asks
- * for.  Four is enough to take the per-call overhead off the byte-at-a-time
- * callers - fgets was one system call per character - without hauling a
- * kilobyte nobody wanted.
+ * Sixteen kilobytes was tried on the guess that a read costs mostly the call.
+ * It is the other way round: the calls fell by two and a half times and the
+ * time in the filesystem doubled, taking Fallout 2 from 5.7 frames a second to
+ * 3.3.  The cost is in the bytes.
  *
- * Every open file pays for it, which is why it is allocated on the first read
- * small enough to want one and never for a caller streaming something bigger.
+ * Which makes reading ahead by a fixed amount the wrong shape.  A caller that
+ * asks for a kilobyte and then seeks somewhere else - what reading one entry
+ * out of an archive looks like - has three quarters of a four-kilobyte fetch
+ * thrown away.
+ *
+ * So a fetch is as big as the request, rounded up to a sector, and then each
+ * fill that follows another without a seek between them may be twice the last.
+ * Reading a file through from the front reaches the full buffer in four fills
+ * and pays the per-call cost as rarely as a fixed four kilobytes ever did;
+ * seeking somewhere and taking a kilobyte fetches a kilobyte.  The floor is
+ * for the third kind of caller: fgets asks for one character at a time, and
+ * before any of this that was one system call per character.
+ *
+ * Every open file pays for the buffer, which is why it is allocated on the
+ * first read small enough to want one and never for a caller streaming
+ * something bigger.
  */
 #define FILE_RBUF 4096
+#define FILE_RFILL_MIN 512
 
 /*
  * What the filesystem costs, kept because "the engine is slow" is not a
@@ -667,11 +679,17 @@ static void read_drop(FILE *f)
     }
     f->rlen = 0;
     f->rpos = 0;
+    f->rahead = 0; /* wherever it lands next, start small again */
 }
 
-/* Fill the buffer from the current kernel position.  Returns bytes available,
- * 0 at end of file, -1 on error. */
-static int read_fill(FILE *f)
+/*
+ * Fill the buffer from the current kernel position.  Returns bytes available,
+ * 0 at end of file, -1 on error.
+ *
+ * `want` is what the caller is asking for, which is what gets fetched, rounded
+ * up to a sector so a request that straddles one does not cost two reads.
+ */
+static int read_fill(FILE *f, size_t want)
 {
     if (f->rbuf == NULL) {
         f->rbuf = (unsigned char *)malloc(FILE_RBUF);
@@ -680,11 +698,29 @@ static int read_fill(FILE *f)
         }
         f->rcap = FILE_RBUF;
     }
-    const int32_t n = timed_read((ag_handle_t)f->h, f->rbuf, (size_t)f->rcap);
+
+    size_t       fetch = (want + 511u) & ~(size_t)511u;
+    const size_t floor = (f->rahead > 0) ? (size_t)f->rahead : FILE_RFILL_MIN;
+    if (fetch < floor) {
+        fetch = floor;
+    }
+    if (fetch > (size_t)f->rcap) {
+        fetch = (size_t)f->rcap;
+    }
+
+    const int32_t n = timed_read((ag_handle_t)f->h, f->rbuf, fetch);
     if (n < 0) {
         f->err = 1;
         return -1;
     }
+    /*
+     * Each fill that follows another without a seek between may fetch twice as
+     * much.  A caller reading a file through from the front reaches the whole
+     * buffer in four fills and pays the per-call cost as rarely as it used to;
+     * a caller that seeks, takes a kilobyte and seeks again starts small every
+     * time and never fetches a page it will not look at.
+     */
+    f->rahead = (fetch * 2u > (size_t)f->rcap) ? f->rcap : (int)(fetch * 2u);
     f->rlen = (int)n;
     f->rpos = 0;
     return (int)n;
@@ -729,6 +765,7 @@ FILE *fopen(const char *path, const char *mode)
         f->rcap = 0;
         f->rlen = 0;
         f->rpos = 0;
+        f->rahead = 0;
         return f;
     }
 }
@@ -803,7 +840,7 @@ size_t fread(void *ptr, size_t size, size_t nmemb, FILE *f)
             continue;
         }
         {
-            const int n = read_fill(f);
+            const int n = read_fill(f, left);
             if (n < 0) {
                 /* Out of memory for a buffer, or a read error.  Fall back to
                  * reading straight through rather than failing. */
