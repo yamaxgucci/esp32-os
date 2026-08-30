@@ -128,6 +128,19 @@ if(CONFIG_ARGON_NET_TLS OR CONFIG_ARGON_NET_SSH)
     target_link_libraries(${COMPONENT_LIB} PRIVATE ${mbed_lib})
 endif()
 
+# Over-the-air update (CONFIG_ARGON_NET_OTA): esp_https_ota streams an image
+# into the spare app slot (ota_hw.c).  It pulls in esp_http_client and
+# app_update (esp_ota_ops); linked conditionally so a build without OTA carries
+# none of it.
+if(CONFIG_ARGON_NET_OTA)
+    idf_component_get_property(ota_lib esp_https_ota COMPONENT_LIB)
+    target_link_libraries(${COMPONENT_LIB} PRIVATE ${ota_lib})
+    idf_component_get_property(httpc_lib esp_http_client COMPONENT_LIB)
+    target_link_libraries(${COMPONENT_LIB} PRIVATE ${httpc_lib})
+    idf_component_get_property(appupd_lib app_update COMPONENT_LIB)
+    target_link_libraries(${COMPONENT_LIB} PRIVATE ${appupd_lib})
+endif()
+
 if(ARGON_PORT_SRCS)
     target_compile_options(${COMPONENT_LIB} PRIVATE
         -Wall -Wextra -Werror=implicit-function-declaration

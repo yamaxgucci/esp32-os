@@ -4487,6 +4487,9 @@ static const ag_command_t k_commands[] = {
     {"modbus", "read|write <host> <addr> [n|vals]", "Modbus TCP master",
      ag_cmd_modbus},
 #endif
+#if defined(CONFIG_ARGON_NET_OTA) && CONFIG_ARGON_NET_OTA
+    {"ota", "[<url> [/reboot]]", "update firmware over the network", ag_cmd_ota},
+#endif
     /* httpd is a loadable app now (HTTPD.AXE), not a built-in - run it by name. */
 #if defined(CONFIG_ARGON_NET_TELNET) && CONFIG_ARGON_NET_TELNET
     {"telnet", "[on [port]|off]", "the console over TCP :23", cmd_telnet},

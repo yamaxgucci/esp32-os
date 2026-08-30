@@ -395,6 +395,15 @@ menu "ArgonOS"
             `modbus read` and `modbus write` commands, for the holding and
             input registers a PLC or sensor gateway exposes.  Off by default.
 
+    config ARGON_NET_OTA
+        bool "Over-the-air firmware update"
+        depends on ARGON_ENABLE_NET
+        default n
+        help
+            The `ota <url>` command: pull a firmware image over http/https into
+            the spare app slot and boot it.  Needs a two-app-slot partition
+            table (see partitions.csv).  Off by default.
+
     config ARGON_BOARD_PROBE
         bool "Board probe instead of the system"
         default n
