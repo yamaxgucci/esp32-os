@@ -38,6 +38,7 @@
 #include <argon/cfg.h>
 #include <argon/console.h>
 #include <argon/log.h>
+#include <argon/shell.h>
 #include <argon/vfs.h>
 
 #include <argon/port/crypto.h>
@@ -158,6 +159,8 @@ typedef struct {
      * write_packet across the two tasks; io_lock guards the input ring. */
     bool            ch_open;
     volatile bool   ch_gone; /* the channel has ended; the console must detach */
+    bool            exec_pending; /* an exec request is waiting to run */
+    char            exec_cmd[256]; /* the command from an exec request */
     uint32_t        ch_peer; /* the client's channel number (our recipient)    */
     uint32_t        send_window; /* bytes we may still send to the client      */
     uint32_t        recv_window; /* bytes the client may still send us         */
@@ -993,8 +996,9 @@ static void on_channel_open(ssh_conn_t *c, const uint8_t *pl, size_t len)
     (void)write_packet(c, b, w.len);
 }
 
-/* CHANNEL_REQUEST: pty-req and window-change are accepted quietly; "shell" (or
- * "exec") attaches the console.  Returns true once a shell is running. */
+/* CHANNEL_REQUEST: pty-req and window-change are accepted quietly; "shell"
+ * attaches the shared console; "exec" captures the command to run once (handled
+ * back in do_session).  Returns true once a shell is attached. */
 static bool on_channel_request(ssh_conn_t *c, const uint8_t *pl, size_t len,
                                bool *attached)
 {
@@ -1014,10 +1018,21 @@ static bool on_channel_request(ssh_conn_t *c, const uint8_t *pl, size_t len,
         ok = true; /* the shared console has its own size; we accept the pty */
     } else if (tl == 13 && memcmp(type, "window-change", 13) == 0) {
         ok = true; /* size change: the console is not per-endpoint, so noted only */
-    } else if ((tl == 5 && memcmp(type, "shell", 5) == 0) ||
-               (tl == 4 && memcmp(type, "exec", 4) == 0)) {
+    } else if (tl == 5 && memcmp(type, "shell", 5) == 0) {
         ok = true;
         start_shell = !*attached;
+    } else if (tl == 4 && memcmp(type, "exec", 4) == 0) {
+        /* exec carries a command string; run it once, then the channel closes. */
+        uint32_t       cl = 0;
+        const uint8_t *cmd = rb_string(&r, &cl);
+        if (!r.err && !*attached) {
+            const size_t n =
+                (cl < sizeof(c->exec_cmd)) ? cl : sizeof(c->exec_cmd) - 1;
+            memcpy(c->exec_cmd, cmd, n);
+            c->exec_cmd[n] = '\0';
+            c->exec_pending = true;
+        }
+        ok = true;
     }
 
     if (want_reply) {
@@ -1078,6 +1093,35 @@ static void on_channel_data(ssh_conn_t *c, const uint8_t *pl, size_t len)
  * Opens one session channel, wires it to the shared console, and pumps packets
  * until the client closes it or the link drops.
  */
+/*
+ * Run one `exec` command and finish the channel.  The command's console output
+ * is redirected to this channel only (ssh_ch_write is a console sink), so
+ * `ssh host cmd` returns exactly that command's output; then the exit status is
+ * reported and the channel is closed.  The redirect is global for the brief run
+ * - fine for a headless server, where nothing else is watching the screen.
+ */
+static void run_exec(ssh_conn_t *c)
+{
+    ag_console_redirect(ssh_ch_write, c);
+    const int status = ag_shell_execute(c->exec_cmd);
+    ag_console_redirect(NULL, NULL);
+    ag_log(AG_LOG_INFO, "ssh", "exec '%s' -> %d", c->exec_cmd, status);
+
+    uint8_t b[64];
+    wbuf_t  w;
+    wb_init(&w, b, sizeof(b));
+    wb_byte(&w, SSH_MSG_CHANNEL_REQUEST);
+    wb_u32(&w, c->ch_peer);
+    wb_cstr(&w, "exit-status");
+    wb_byte(&w, 0); /* want_reply: no */
+    wb_u32(&w, (uint32_t)status);
+    (void)write_packet(c, b, w.len);
+
+    (void)send_channel_u32(c, SSH_MSG_CHANNEL_EOF, c->ch_peer);
+    (void)send_channel_u32(c, SSH_MSG_CHANNEL_CLOSE, c->ch_peer);
+    c->ch_open = false;
+}
+
 static void do_session(ssh_conn_t *c)
 {
     bool attached = false;
@@ -1102,6 +1146,10 @@ static void do_session(ssh_conn_t *c)
             on_channel_data(c, c->msg, (size_t)n);
         } else if (type == SSH_MSG_CHANNEL_REQUEST) {
             (void)on_channel_request(c, c->msg, (size_t)n, &attached);
+            if (c->exec_pending) {
+                run_exec(c); /* one-shot command; the channel is done after it */
+                break;
+            }
         } else if (type == SSH_MSG_CHANNEL_OPEN) {
             on_channel_open(c, c->msg, (size_t)n);
         } else if (type == SSH_MSG_CHANNEL_WINDOW_ADJUST) {
