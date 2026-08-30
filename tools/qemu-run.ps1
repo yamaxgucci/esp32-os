@@ -30,7 +30,10 @@ param(
     [switch]$NoNet,
     [int]$NetPort = 5558,
     # Spawn pcmplay + kbdvirt + mousevirt (--reconnect) like hostfsd; kill with QEMU.
-    [switch]$Virt
+    [switch]$Virt,
+    # PSRAM the emulated part carries: 8 (default, the smaller module) or 16.
+    # Fallout 2 needs 16; nothing else in the tree does.
+    [int]$Psram = 8
 )
 
 $ErrorActionPreference = 'Stop'
@@ -45,7 +48,7 @@ $qemu = Resolve-Qemu
 Update-FlashImage
 $efuse = Initialize-EfuseFile
 
-$qemuArgs = Get-QemuMachineArgs -EfusePath $efuse
+$qemuArgs = Get-QemuMachineArgs -EfusePath $efuse -PsramMb $Psram
 
 if (-not $NoNet) {
     $qemuArgs += Get-QemuNetArgs -HostPort $NetPort -GuestPort $NetPort

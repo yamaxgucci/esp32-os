@@ -65,6 +65,18 @@ Machine specific paths live in tools\local-env.ps1, which is not committed.
 }
 
 function Resolve-HostPython {
+    # A path given by hand wins over anything found by searching: on a machine
+    # where PATH leads to the Windows Store stub, the search below burns a
+    # process and prints "Python" to stderr before failing, which reads like a
+    # broken interpreter rather than an absent one.  tools\local-env.ps1 sets
+    # this; ARGON_PYTHON is its name there, IDF_PYTHON is what an IDF shell
+    # leaves behind.
+    foreach ($named in @($env:ARGON_PYTHON, $env:IDF_PYTHON)) {
+        if ($named -and (Test-Path -LiteralPath $named)) {
+            return @{ Exe = $named; Prefix = @() }
+        }
+    }
+
     # Prefer a real interpreter over the Windows Store stub (exit 9009).
     foreach ($name in @('python', 'python3', 'py')) {
         $cmd = Get-Command $name -ErrorAction SilentlyContinue
@@ -295,6 +307,9 @@ switch ($Command.ToLowerInvariant()) {
             } elseif ($a -match '^(?i)-SdImage$' -and ($i + 1) -lt $Rest.Count) {
                 $runOpts['SdImage'] = $Rest[$i + 1]
                 $i++
+            } elseif ($a -match '^(?i)-Psram$' -and ($i + 1) -lt $Rest.Count) {
+                $runOpts['Psram'] = [int]$Rest[$i + 1]
+                $i++
             } else {
                 throw "Unknown run option: $a"
             }
@@ -304,6 +319,13 @@ switch ($Command.ToLowerInvariant()) {
     }
 
     'virt' {
+        # local-env.ps1 is where the machine's real interpreter is named, and
+        # without it this command lands on the Store stub.  Sourced directly
+        # rather than through Initialize-Environment: the input helpers need
+        # Python and nothing else, and pulling in the whole IDF environment to
+        # start them takes seconds that a person is sitting through.
+        $localEnv = Join-Path $PSScriptRoot 'local-env.ps1'
+        if (Test-Path $localEnv) { . $localEnv }
         $py = Resolve-HostPython
         $script = Join-Path $PSScriptRoot 'virt.py'
         & $py.Exe @($py.Prefix) $script @Rest

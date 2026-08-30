@@ -98,6 +98,12 @@ struct SurfaceBlock {
  * which is the only point the game passes through every frame. */
 static void timers_service(void);
 
+/* Defined with the event pump; called once the display is ours. */
+static void input_devices_open(void);
+
+/* Reads the virtual input drivers so they pump their sockets; see the pump. */
+void sdl_shim_input_service(void);
+
 /* The acquired display, and whether a surface has been given its memory. */
 static ag_gfxinfo_t s_gfx;
 static bool s_have_gfx;
@@ -752,6 +758,7 @@ SDL_Window *SDL_CreateWindow(const char *title, int x, int y, int w, int h,
         }
         s_have_gfx = true;
         s_gfx_since_ms = (uint32_t)ag_millis();
+        input_devices_open();
         ag_gfx_clear(0);
         ag_gfx_flush(0, 0, s_gfx.width, s_gfx.height);
         dirty_none();
@@ -874,6 +881,10 @@ void SDL_RenderPresent(SDL_Renderer *r)
      * the game passes through every frame and nowhere else. */
     timers_service();
     memstat_service();
+    /* And the input drivers, which pump their sockets only when read.  A movie
+     * runs for minutes without the engine asking for a single event, and a
+     * driver unread for that long has lost its connection. */
+    sdl_shim_input_service();
     ag_heartbeat();
 
     ++s_present_count;
@@ -1083,8 +1094,57 @@ static Uint32 buttons_of(uint8_t ag)
     return out;
 }
 
+/*
+ * The virtual input drivers, opened only to be read.
+ *
+ * KBDVIRT and MOUSEVIRT carry the host's keyboard and mouse over TCP, and each
+ * of them pumps its socket inside its own read entry point - a driver on this
+ * system has no thread of its own, so being read *is* its service tick.  They
+ * also inject what arrives into the same queue ag_poll_event drains, which is
+ * where this port takes its events from.
+ *
+ * So the bytes returned here are deliberately thrown away: the events they
+ * describe arrive through the queue a moment later.  What the read is for is
+ * the pumping.  Without it the driver accepts the connection, never reads the
+ * socket, and the host's end is reset - which looks exactly like a keyboard
+ * that does not work, and was diagnosed as one for a while.
+ */
+static ag_handle_t s_kbd = -1;
+static ag_handle_t s_mouse = -1;
+
+static void input_devices_open(void)
+{
+    s_kbd = ag_dev_open("/dev/kbd0");
+    s_mouse = ag_dev_open("/dev/mouse0");
+    ag_printf("SDL: input %s%s%s\n",
+              s_kbd >= 0 ? "kbd0 " : "",
+              s_mouse >= 0 ? "mouse0" : "",
+              (s_kbd < 0 && s_mouse < 0) ? "none (drv install the .SYS files)"
+                                         : "");
+}
+
+void sdl_shim_input_service(void)
+{
+    /* Enough for a burst; anything beyond it is read on the next call. */
+    uint8_t drain[128];
+    if (s_kbd >= 0) {
+        (void)ag_dev_read(s_kbd, drain, sizeof(drain));
+    }
+    if (s_mouse >= 0) {
+        (void)ag_dev_read(s_mouse, drain, sizeof(drain));
+    }
+}
+
 static void pump(void)
 {
+    /*
+     * Also from SDL_RenderPresent, and that is the one that matters: the
+     * engine does not poll for events while a movie is running, and a driver
+     * that goes unread for five minutes has had its connection dropped long
+     * before anybody presses a key to skip it.
+     */
+    sdl_shim_input_service();
+
     ag_event_t e;
     while (ag_poll_event(&e, 0)) {
         SDL_Event out;
