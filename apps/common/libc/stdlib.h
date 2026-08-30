@@ -9,6 +9,15 @@
 #include <stdint.h>
 
 void *malloc(size_t n);
+
+/* The least the arena has ever had free, watched across big allocations that a
+ * once-a-frame sampler cannot see.  (size_t)-1 until one happens. */
+size_t ag_libc_arena_low(void);
+
+/* Print the first few allocations of half a megabyte or more, with the address
+ * they were asked from.  Off by default; for finding out who wants the block
+ * that will not fit. */
+void ag_libc_malloc_trace(int on);
 void *calloc(size_t n, size_t sz);
 void *realloc(void *p, size_t n);
 void  free(void *p);

@@ -169,6 +169,12 @@ function Write-Transcript {
                                    [System.Text.Encoding]::GetEncoding(28591))
 }
 
+# Emptied before the run, not only written after it.  Until the guest says
+# anything the file still held the *previous* run's transcript, and every check
+# made against it in the meantime - by a person or by a script waiting for a
+# marker - was answered about a run that had already finished.
+Write-Transcript
+
 $client = $null
 $stream = $null
 $found = $false

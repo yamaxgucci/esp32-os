@@ -1,0 +1,247 @@
+diff --git a/src/dfile.cc b/src/dfile.cc
+index a904861..e360509 100644
+--- a/src/dfile.cc
++++ b/src/dfile.cc
+@@ -9,6 +9,7 @@
+ 
+ #include <fpattern/fpattern.h>
+ 
++#include "dat_index.h"
+ #include "platform_compat.h"
+ 
+ namespace fallout {
+@@ -66,6 +67,25 @@ DBase* dbaseOpen(const char* filePath)
+     // Get file size, and reposition stream to read footer, which contains two
+     // 32-bits ints.
+     int fileSize = getFileSize(stream);
++
++    // ARGON: the index may already exist as a file next to the archive, in
++    // which case it is mapped out of flash and none of the reading below
++    // happens at all - no memory spent, and none of the ten seconds it takes
++    // to rebuild what cannot have changed.  See apps/fallout/port/dat_index.h.
++    {
++        FalloutDatIndex index;
++        if (falloutDatIndexMap(filePath, (unsigned int)fileSize, &index)) {
++            dbase->entries = (DBaseEntry*)index.entries;
++            dbase->pathBlob = (char*)index.pathBase;
++            dbase->entriesLength = index.count;
++            dbase->dataOffset = index.dataOffset;
++            dbase->indexMapping = (void*)index.base;
++            dbase->path = compat_strdup(filePath);
++            fclose(stream);
++            return dbase;
++        }
++    }
++
+     if (fseek(stream, fileSize - sizeof(int) * 2, SEEK_SET) != 0) {
+         goto err;
+     }
+@@ -101,8 +121,28 @@ DBase* dbaseOpen(const char* filePath)
+ 
+     memset(dbase->entries, 0, sizeof(*dbase->entries) * dbase->entriesLength);
+ 
++    // ARGON: one block for every path, sized exactly, instead of one malloc
++    // each.  The table says how big it has to be: the count, then one record
++    // per entry of four bytes of length, the path itself, and thirteen bytes
++    // of numbers.  A NUL per path is added on top, because the paths in the
++    // archive do not carry one - which is where the -16 rather than -17 comes
++    // from.  30240 allocations become two, and a quarter of that memory was
++    // allocator headers.
++    int pathBlobSize;
++    pathBlobSize = entriesDataSize - 4 - dbase->entriesLength * 16;
++    if (pathBlobSize <= 0 || pathBlobSize > entriesDataSize) {
++        goto err;
++    }
++
++    dbase->pathBlob = (char*)malloc((size_t)pathBlobSize);
++    if (dbase->pathBlob == nullptr) {
++        goto err;
++    }
++
+     // Read entries one by one, stopping on any error.
+     int entryIndex;
++    int pathBlobUsed;
++    pathBlobUsed = 0;
+     for (entryIndex = 0; entryIndex < dbase->entriesLength; entryIndex++) {
+         DBaseEntry* entry = &(dbase->entries[entryIndex]);
+ 
+@@ -111,20 +151,27 @@ DBase* dbaseOpen(const char* filePath)
+             break;
+         }
+ 
+-        entry->path = (char*)malloc(pathLength + 1);
+-        if (entry->path == nullptr) {
++        if (pathLength < 0 || pathLength + 1 > pathBlobSize - pathBlobUsed) {
+             break;
+         }
+ 
+-        if (fread(entry->path, pathLength, 1, stream) != 1) {
++        char* path = dbase->pathBlob + pathBlobUsed;
++        entry->pathOffset = (unsigned int)pathBlobUsed;
++        pathBlobUsed += pathLength + 1;
++
++        if (fread(path, pathLength, 1, stream) != 1) {
+             break;
+         }
+ 
+-        entry->path[pathLength] = '\0';
++        path[pathLength] = '\0';
+ 
+-        if (fread(&(entry->compressed), sizeof(entry->compressed), 1, stream) != 1) {
++        // One byte in the archive, four in the entry, so it cannot be read
++        // straight into the field any more.
++        unsigned char compressed;
++        if (fread(&compressed, sizeof(compressed), 1, stream) != 1) {
+             break;
+         }
++        entry->compressed = compressed;
+ 
+         if (fread(&(entry->uncompressedSize), sizeof(entry->uncompressedSize), 1, stream) != 1) {
+             break;
+@@ -176,15 +223,20 @@ bool dbaseClose(DBase* dbase)
+         curr = next;
+     }
+ 
+-    if (dbase->entries != nullptr) {
+-        for (int index = 0; index < dbase->entriesLength; index++) {
+-            DBaseEntry* entry = &(dbase->entries[index]);
+-            char* entryName = entry->path;
+-            if (entryName != nullptr) {
+-                free(entryName);
+-            }
++    // ARGON: when the index came out of flash, neither the table nor the
++    // paths were allocated and freeing them would be freeing a mapping.
++    if (dbase->indexMapping != nullptr) {
++        FalloutDatIndex index;
++        memset(&index, 0, sizeof(index));
++        index.base = dbase->indexMapping;
++        falloutDatIndexUnmap(&index);
++    } else {
++        if (dbase->pathBlob != nullptr) {
++            free(dbase->pathBlob);
++        }
++        if (dbase->entries != nullptr) {
++            free(dbase->entries);
+         }
+-        free(dbase->entries);
+     }
+ 
+     if (dbase->path != nullptr) {
+@@ -203,8 +255,9 @@ bool dbaseFindFirstEntry(DBase* dbase, DFileFindData* findFileData, const char*
+ {
+     for (int index = 0; index < dbase->entriesLength; index++) {
+         DBaseEntry* entry = &(dbase->entries[index]);
+-        if (fpattern_match(pattern, entry->path)) {
+-            strcpy(findFileData->fileName, entry->path);
++        const char* entryPath = dbaseEntryPath(dbase, entry);
++        if (fpattern_match(pattern, entryPath)) {
++            strcpy(findFileData->fileName, entryPath);
+             strcpy(findFileData->pattern, pattern);
+             findFileData->index = index;
+             return true;
+@@ -219,8 +272,9 @@ bool dbaseFindNextEntry(DBase* dbase, DFileFindData* findFileData)
+ {
+     for (int index = findFileData->index + 1; index < dbase->entriesLength; index++) {
+         DBaseEntry* entry = &(dbase->entries[index]);
+-        if (fpattern_match(findFileData->pattern, entry->path)) {
+-            strcpy(findFileData->fileName, entry->path);
++        const char* entryPath = dbaseEntryPath(dbase, entry);
++        if (fpattern_match(findFileData->pattern, entryPath)) {
++            strcpy(findFileData->fileName, entryPath);
+             findFileData->index = index;
+             return true;
+         }
+@@ -617,22 +671,39 @@ int dfileEof(DFile* stream)
+     return stream->flags & DFILE_EOF;
+ }
+ 
+-// The [bsearch] comparison callback, which is used to find [DBaseEntry] for
+-// specified [filePath].
++// ARGON: was a [bsearch] comparison callback.  A path now lives at an offset
++// into the dbase's block rather than in the entry, and bsearch gives the
++// callback no way to reach the dbase, so the search is written out.  It is the
++// same search over the same table: the archive stores its entries sorted, and
++// nothing here may reorder them.
+ //
+ // 0x4E5D70
+-static int dbaseFindEntryByFilePath(const void* a1, const void* a2)
++static DBaseEntry* dbaseFindEntryByFilePath(DBase* dbase, const char* filePath)
+ {
+-    const char* filePath = (const char*)a1;
+-    DBaseEntry* entry = (DBaseEntry*)a2;
++    int lo = 0;
++    int hi = dbase->entriesLength - 1;
++
++    while (lo <= hi) {
++        int mid = lo + (hi - lo) / 2;
++        DBaseEntry* entry = &(dbase->entries[mid]);
++        int cmp = compat_stricmp(filePath, dbaseEntryPath(dbase, entry));
++        if (cmp == 0) {
++            return entry;
++        }
++        if (cmp < 0) {
++            hi = mid - 1;
++        } else {
++            lo = mid + 1;
++        }
++    }
+ 
+-    return compat_stricmp(filePath, entry->path);
++    return nullptr;
+ }
+ 
+ // 0x4E5D9C
+ static DFile* dfileOpenInternal(DBase* dbase, const char* filePath, const char* mode, DFile* dfile)
+ {
+-    DBaseEntry* entry = (DBaseEntry*)bsearch(filePath, dbase->entries, dbase->entriesLength, sizeof(*dbase->entries), dbaseFindEntryByFilePath);
++    DBaseEntry* entry = dbaseFindEntryByFilePath(dbase, filePath);
+     if (entry == nullptr) {
+         goto err;
+     }
+diff --git a/src/dfile.h b/src/dfile.h
+index e4b8c6d..f0b26cf 100644
+--- a/src/dfile.h
++++ b/src/dfile.h
+@@ -29,16 +29,40 @@ typedef struct DBase {
+ 
+     // The head of linked list of open file handles.
+     DFile* dfileHead;
++
++    // ARGON: every entry path, NUL-terminated, in one block.  The original
++    // allocated each path separately: 30240 allocations for Fallout 2, a
++    // quarter of whose memory was allocator headers.
++    char* pathBlob;
++
++    // ARGON: non-null when [entries] and [pathBlob] point into a mapped .IDX
++    // file in flash rather than into memory, in which case neither is ours to
++    // free.  See apps/fallout/port/dat_index.h.
++    void* indexMapping;
+ } DBase;
+ 
+ typedef struct DBaseEntry {
+-    char* path;
+-    unsigned char compressed;
++    // ARGON: was char* path.  A byte offset into DBase::pathBlob instead, so
++    // that the whole table can be a file mapped at an address nobody knew when
++    // it was written.  Use dbaseEntryPath().
++    unsigned int pathOffset;
++
++    // ARGON: was unsigned char.  Widened so this struct is exactly the twenty
++    // bytes mkdatidx.py writes, with no padding to agree about.
++    unsigned int compressed;
++
+     int uncompressedSize;
+     int dataSize;
+     int dataOffset;
+ } DBaseEntry;
+ 
++// ARGON: where an entry's path actually is.
++static inline const char* dbaseEntryPath(const DBase* dbase,
++    const DBaseEntry* entry)
++{
++    return dbase->pathBlob + entry->pathOffset;
++}
++
+ // A handle to open entry in .DAT file.
+ typedef struct DFile {
+     DBase* dbase;

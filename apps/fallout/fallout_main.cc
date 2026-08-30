@@ -114,7 +114,11 @@ static int to_int(const char *s)
  */
 extern "C" int ag_cxx_main(int argc, char **argv)
 {
-    ag_printf("fallout%d-ce on ArgonOS\n", AG_FALLOUT_GAME);
+    /* argv[0] is not decoration here: sfall builds the path of ddraw.ini from
+     * it, by cutting at the last backslash, so a setting that appears to do
+     * nothing is usually a file the engine went looking for somewhere else. */
+    ag_printf("fallout%d-ce on ArgonOS, argv[0] = %s\n", AG_FALLOUT_GAME,
+              (argc > 0 && argv[0] != NULL) ? argv[0] : "(none)");
 
     const char *shot = NULL;
     int frames = 0;

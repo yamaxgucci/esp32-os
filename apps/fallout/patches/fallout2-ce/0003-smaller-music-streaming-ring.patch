@@ -1,0 +1,23 @@
+diff --git a/src/game_sound.cc b/src/game_sound.cc
+index 7ed4833..22e3845 100644
+--- a/src/game_sound.cc
++++ b/src/game_sound.cc
+@@ -225,7 +225,17 @@ int gameSoundInit()
+     soundSetMemoryProcs(internal_malloc, internal_realloc, internal_free);
+ 
+     // initialize direct sound
+-    if (soundInit(_detectDevices, 24, 0x8000, 0x8000, 22050) != 0) {
++    // ARGON: 8 buffers rather than 24.
++    //
++    // These are the streaming ring for background music: 24 sections of 32 KB
++    // is 786432 bytes, which at 22 kHz in stereo is nearly nine seconds of
++    // audio held in advance.  On a desk that is free; on a board with a six
++    // megabyte arena it is an eighth of everything the game has, and it is
++    // what stopped Fallout 2 fitting in 8 MB of PSRAM - the allocation failed
++    // while loading the main menu's own music.  Eight sections is three
++    // seconds, which is still more than a mixer that is serviced every frame
++    // can want.
++    if (soundInit(_detectDevices, 8, 0x8000, 0x8000, 22050) != 0) {
+         if (gGameSoundDebugEnabled) {
+             debugPrint("failed!\n");
+         }

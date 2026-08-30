@@ -5,49 +5,49 @@
 reverse-engineered Fallout 1 and 2 — as ArgonOS `.AXE` images. Compiled for the
 ESP32-S3, running from flash XIP with the data in PSRAM.
 
-**Fallout 2 reaches its main menu on an ESP32-S3, and sits there in its attract
-loop.** Both opening movies play - 2502 frames of `intro.mve` at 640×480, none
-dropped - then the menu comes up with its music, waits, times out, and plays
-the intro again, exactly as the game does on a desk. The 326 MB `MASTER.DAT` is
-opened off a FAT32 card, its 23120-entry index parsed, the art and protos and
-scripts loaded, the audio device opened at 22 kHz.
+**Fallout 2 runs on an ESP32-S3.** It opens the 326 MB `MASTER.DAT` off a FAT32
+card, reads its 23120-entry index out of flash, loads the art and protos and
+scripts, opens the audio at 22 kHz, comes up at its main menu with its music,
+takes a keypress, makes a character and stands on the map of the Temple of
+Trials. The opening movies play at 640×480 with no frames dropped when they are
+not skipped - 2502 of `intro.mve`.
 
-What has not been done is play it: that needs input through the menu, and
-`KBDVIRT`/`MOUSEVIRT` are not wired into this port yet.
+**In 8 MB of PSRAM**, with 606 KB to spare, measured rather than argued: see
+**Where the memory goes**.
+
+Input works: the port opens `/dev/kbd0` and `/dev/mouse0` and reads them every
+frame, `tools/inputplay.py` presses keys with nobody at the desk, and
+`run a:\sdltest.axe -input 45` is the ninety-second check that all of it still
+arrives.
 
 | | Fallout 1 | Fallout 2 |
 |---|---|---|
 | translation units compiled | 108 of 108 | 126 of 126 |
-| code, after `--gc-sections` | 453 KB | 761 KB |
-| data (mostly bss) | 1.82 MB | 1.91 MB |
-| extended memory asked for | 5.75 MB | 12 MB on a 16 MB part |
+| code, after `--gc-sections` | 453 KB | 745 KB |
+| data (mostly bss) | 1.82 MB | 1.87 MB |
+| extended memory asked for | 5.75 MB | 6100 KB |
 | game data on the card | — | 562 MB |
+| `.DAT` index, in flash rather than memory | — | 1331 KB |
 
-**Where it is.** The engine runs the whole of `game_init` and stops where the
-art data is not there:
+**Where it is.** With the archives on the card the engine runs the whole of
+`game_init`, opens its window, loads its music and reaches the main menu:
 
 ```
+fallout2-ce on ArgonOS, argv[0] = /sd/fallout2.axe
+sfall: ddraw.ini read
+fallout: master.IDX mapped, 23120 entries, 1012 KB in flash
+fallout: critter.IDX mapped, 7120 entries, 319 KB in flash
 SDL: display 640x480 with a framebuffer, 1280 bytes per row
-Fade time is 956
-Fade steps are 43
-Chi squared is 18.75, P = 4000.00 at 0.05
-Sequence is random, 95% confidence.
 SDL: audio 22050 Hz, 2 channels, blocks of 1024 frames
->gsound_init  >initMovie  >gmovie_init  >moviefx_init
-cache_init failed in art_init
-art_init failed in iso_init
-Failed on iso_init
+>gsound_init  >initMovie  >gmovie_init  >moviefx_init  >art_init
+>tile_init  >obj_init  >cycle_init  >proto_init  >scr_init
+Loading background sound file 07desert.acm... playing
+[mem] 5082 KB used of 6100, peak 5082 (5311 with transients)
 ```
 
-The window is opened, the display is acquired, the palette fade runs sixty
-frames at about 57 fps, the engine's own random number generator passes its
-chi-squared self-test, the audio device opens and the mixer thread starts.
-`iso_init` is where the missing art stops it.
-
-The shim is finished: video, input, audio, timers. What it has not been able
-to do is draw anything, because there is nothing to draw. **The next thing this
-needs is a copy of the game** - see **The data** below. Everything the shim can
-be shown to do without one, `SDLTEST.AXE` shows.
+Without the archives it stops at `cache_init failed in art_init`, which is
+`iso_init` finding no art; everything the shim can be shown to do without a
+copy of the game, `SDLTEST.AXE` shows.
 
 ## Licensing
 
@@ -69,14 +69,39 @@ the game.
 
 ## Build
 
-Needs `xtensa-esp32s3-elf-gcc` on PATH (IDF export).
+```
+argon fallout --game 2
+```
 
-```
-python apps/fallout/build.py
-```
+`argon` puts the IDF toolchain on PATH first, which `build.py` needs and which
+is three lines of PowerShell to get right by hand - and getting them wrong
+fails as `FileNotFoundError` out of `subprocess`, with no mention of a
+compiler.  `python apps/fallout/build.py` still works in a shell that already
+has `xtensa-esp32s3-elf-gcc` on PATH.
 
 First run clones the engine and its two dependencies (about 40 MB), then
 compiles 118 objects and links `FALLOUT.AXE` into `build/apps/`.
+
+### Our changes to the engine
+
+`third_party/` is a clone and is in `.gitignore`, so an edit made there is
+invisible to this repository and gone the moment anyone deletes it and fetches
+again.  The changes live in `apps/fallout/patches/<engine>/` instead, applied
+on every build and skipped when the tree already has them.  A patch that no
+longer applies stops the build and names the file - which is the point: the
+engine is somebody else's, it moves, and a change of ours that has quietly
+stopped taking effect is worse than one that fails loudly.
+
+```
+argon fallout --game 2 --rodata-in-code
+```
+
+Links the image's 97 KB of constants with the code, which is executed from
+flash, so they cost no PSRAM.  Off by default and worth thinking about before
+turning on: they then arrive over the same bus and through the same cache as
+the instructions, and 745 KB of code is already working that cache hard.  It
+buys memory with frame rate, and on this port the frame rate is the thing that
+was already tight.
 
 ```
 python apps/fallout/build.py --survey
@@ -109,7 +134,8 @@ The game data goes on the same card, next to the image: `MASTER.DAT`,
 
 ## What it costs
 
-Measured, not estimated. `--survey` for the first four, the linker for the rest.
+Measured, not estimated - `--survey` for the first four, the linker for the
+rest.  Fallout 1, which is the smaller of the two:
 
 | | |
 |---|---|
@@ -121,15 +147,22 @@ Measured, not estimated. `--survey` for the first four, the linker for the rest.
 | stack actually used, through `game_init` | 4.8 KB of 16 KB |
 | frame rate of the engine's own palette fade, in QEMU | ~57 fps |
 
-439 KB of code does not fit the 192 KB arena, so the loader puts it in flash and
-executes it in place. That is automatic — the image asks for nothing. The data
-goes to PSRAM, where 8 MB leaves room for the art cache the game has yet to
-allocate.
+Neither image's code fits the 192 KB arena, so the loader puts it in flash and
+executes it in place.  That is automatic - the image asks for nothing.  The
+data goes to PSRAM, and how much of it there has to be is
+**Where the memory goes** below.
 
-The engine source is **unmodified**. Not one patch, not one `#ifdef ARGON`.
-Everything that had to give way gave way on this side: `port/SDL.h` is the SDL2
-subset the engine actually uses, `port/dirent.h` shadows the toolchain's so that
-`d_type` exists, and the rest is in `port/`.
+The engine source was **unmodified** for the whole of the port: not one patch,
+not one `#ifdef ARGON`.  Everything that had to give way gave way on this side -
+`port/SDL.h` is the SDL2 subset the engine actually uses, `port/dirent.h`
+shadows the toolchain's so that `d_type` exists, and the rest is in `port/`.
+
+There are four patches now, all in `apps/fallout/patches/fallout2-ce/`, and not
+one of them is a portability fix.  Three are about a machine with six megabytes
+of arena - the `.DAT` index read from flash, a music buffer that held nine
+seconds in advance, and a map's ambience decoded whole into memory - and the
+fourth makes the engine say whether it found `ddraw.ini`.  Everything that
+*could* be done from outside still is.
 
 ## What the shim does
 
@@ -153,6 +186,27 @@ instead:
 width  = 640
 height = 480
 ```
+
+**`C:`, not the card.** The file is staged on the card for convenience and the
+display driver never looks there:
+
+```
+copy a:\system.cfg c:\system.cfg
+```
+
+then reboot. Naming the destination file rather than the directory is not
+style: a command given to `argon test` must not end in a backslash, because
+PowerShell escapes it into the next argument and the guest is handed the two
+glued together - which copies *something*, reports success, and leaves the
+panel the size it was.
+
+Getting the size wrong costs 600 KB rather than looking wrong: with a panel of
+another size the presenting surface cannot *be* the framebuffer, so the shim
+allocates its own 640×480 one out of the arena and copies into it every frame.
+Measured, this run against the last: 5594 KB at the main menu instead of 6202.
+The shim says which of the two happened at startup - "with a framebuffer"
+against a line naming both sizes - and `SDLTEST.AXE` prints `presenting surface
+is the panel`.
 
 **Input.** ArgonOS reports a key as a USB HID usage id and an SDL scancode *is*
 a USB HID usage id, so the translation is nearly the identity. The mouse needs
@@ -180,7 +234,15 @@ The game data is nobody's to distribute: supply your own. `MASTER.DAT`,
 `.AXE` and `fallout2.cfg`.
 
 ```
-python apps/fallout/build.py --game 2 --arena-kb 12000
+argon fallout --game 2
+```
+
+The archives' indices are computed once, on the host, and go on the card beside
+them. Skip this and the game still runs; it just spends 1.7 MB of the arena and
+ten seconds rebuilding them at every start.
+
+```
+python apps/fallout/tools/mkdatidx.py build\fo2_card\master.dat build\fo2_card\critter.dat
 ```
 
 ```
@@ -188,8 +250,35 @@ argon sync build\fo2_card -SizeMB 1024 -Image build\fo2card.img
 ```
 
 ```
-argon test -Sd -SdImage build\fo2card.img -Psram 16 "run a:\fallout2.axe"
+argon test -Sd -SdImage build\fo2card.img -Psram 8 "run a:\fallout2.axe"
 ```
+
+### Playing it without hands
+
+`drv install a:\kbdvirt.sys` and `a:\mousevirt.sys` first, then
+`tools/inputplay.py` presses the keys. Wait for the guest to reach the screen
+you mean to type at rather than counting seconds at it: `qemu-boot` writes its
+transcript as the run goes, so the log itself is the signal. The main menu
+announces itself by loading its music.
+
+```bash
+base=$(wc -c < build/fo2.log)
+until tail -c +$base build/fo2.log | grep -aq 07desert; do sleep 5; done
+python tools/inputplay.py --wait 120 "key n" "wait 25000" "key t"
+```
+
+From the current end of the file, and with `-LogPath` giving the run a log of
+its own.  Grepping the whole of a shared transcript finds the *previous* run's
+menu and fires at once, which puts every key into the loading screen.
+
+`n` is New Game and `t` takes a premade character; both are the engine's own
+shortcuts. **Not `esc` at the main menu** - there it means Exit, and a script
+that opens with a few hopeful escapes quits the game before it starts.
+
+Timing it instead of watching for it fails in a way worth knowing about: keys
+sent before the game opens `/dev/kbd0` are not lost any more, they are
+*delivered in a burst the moment it does* - which is during the loading screen,
+where they do nothing at all.
 
 The game gets a card image of its own rather than the default
 `build\sdcard.img`. Not tidiness: the game runs for minutes, `argon sync` for
@@ -206,14 +295,15 @@ Three things there are not decoration:
 is a FAT32 card - `mkfatimg` picks the format by size. QEMU's SD model wants a
 power of two, so 700 MiB silently produces a machine that will not start.
 
-**`-Psram 16`.** The default emulated part has 8 MB, and Fallout 2 does not fit
-in it: `wmConfigInit` runs out while loading the encounter tables. 16 MB is the
-other size a real S3 module comes in, and 16 + 8 of flash still fits the 32 MB
-data-bus window.
+**`-Psram 16`.** For measuring, not for playing.  A ceiling the game can reach
+is a ceiling that answers instead of the question: with 16 MB the high-water
+mark is the game's own, and `--arena-kb 12000` with it.  `-Psram 8` is the real
+target and what **Where the memory goes** is about.
 
-**`--arena-kb 12000`.** The process asks for its extended memory rather than
-taking the default quarter-of-what-is-free. See the comment on `AG_APP_SIZED`
-in `fallout_main.cc` - the two `.DAT` indices alone are 1.7 MB.
+**`--arena-kb`.** The process asks for its extended memory outright rather than
+taking the default quarter-of-what-is-free, and the number is what the
+measurement says it needs.  See the comment on `AG_APP_SIZED` in
+`fallout_main.cc`.
 
 `fallout2.cfg` matters too, for one line: `art_cache_size=1`. The stock value
 is 8, in megabytes, reserved whole at startup.
@@ -266,40 +356,96 @@ sends only the union of what was blitted since the last one. So:
 Which says the board this wants is one with an RGB panel, and that the CYD -
 320×240 over SPI - is the wrong shape for it twice over.
 
-## Where the memory goes, and why 8 MB is not enough
+## Where the memory goes
 
-`-memstat N` makes the port print the arena's use and its high-water mark every
-N milliseconds. Through `gameInit`, both movies and the main menu:
-
-```
-[mem] 6770 KB used of 12000   during gameInit
-[mem] 7312 KB used of 12000   sitting in the main menu
-[mem] 8043 KB used of 12000   peak, replaying the intro
-```
-
-Still a floor: no map has been loaded. Against it:
+**Fallout 2 fits in 8 MB of PSRAM.**  Measured, on `-Psram 8`, standing on a
+loaded map with no allocation failure anywhere in the run:
 
 | | |
 |---|---|
 | the image's own data, almost all bss | 1867 KB |
-| peak the game reached | 8043 KB |
-| **needed** | **9910 KB** |
+| the arena's high-water mark, transients included | 5567 KB |
+| **needed** | **7434 KB** |
 | free on a part with 8 MB of PSRAM | 8040 KB |
+| **spare** | **606 KB** |
 
-Short by about 1900 KB - and by 2500 on a board, because QEMU lends the
-emulated panel's own memory for the framebuffer and a real 640×480 panel takes
-its 600 KB out of the same PSRAM. On a 16 MB part it is 9910 of 16384, with
-room for a map.
-
-Inside the arena:
+It needed 9910 KB when this started.  Four things took 2476 KB off it:
 
 | | |
 |---|---|
-| `MASTER.DAT` index, 23120 entries | ~1.3 MB |
-| `CRITTER.DAT` index, 7120 entries | ~0.4 MB |
+| the `.DAT` index read from flash instead of built in memory | −1841 KB |
+| the panel set to 640×480, so the shim stops keeping its own copy of the frame | −608 KB |
+| the map's ambience streamed instead of decoded whole | −488 KB |
+| the music streaming ring, 24 buffers of 32 KB down to 8 | −512 KB |
+
+Only two of those were work.  The panel was a line in a configuration file that
+was on the card and not on `C:`, and it had been costing 600 KB for the whole
+port.  The ring was nine seconds of audio held in advance, on a machine with
+six megabytes.
+
+### How it was measured
+
+`-memstat N` makes the port print the arena's use every N milliseconds, with
+two high-water marks.  The first is what the game holds *between frames* - what
+it costs to stand somewhere.  The second counts the big transients as well, and
+that is the one the board has to be able to satisfy: an engine that reads a
+file into a buffer, copies it and frees it again still needs the buffer to
+exist.
+
+Sampling once a frame never sees those, and that is not a detail.  Before the
+ambience was streamed the two marks read 5610 and 6055 KB, and the 445 KB
+between them is exactly what decided the question.  A watcher that only looks
+between frames would have said the game fitted, and it did not.
+
+With `-Psram 16` and a large arena, so that no ceiling is in the way:
+
+| | between frames | with transients |
+|---|---|---|
+| through `gameInit` | 340 KB | 340 KB |
+| sitting in the main menu | 5082 KB | 5311 KB |
+| starting a new game, `elder.mve` playing | 5284 KB | 5386 KB |
+| standing in the Temple of Trials | 5610 KB | 6055 KB |
+
+Two things there are worth reading twice.
+
+The map costs almost nothing over the menu: what the game holds is the art
+cache and the protos, and it holds those whether or not a map is under them.
+
+And the jump to 6055 was not the map either - it arrived with `wind2.acm`, the
+Temple's ambience, which `map.cc` asked for with `SOUND_TYPE_MEMORY`: the whole
+file decoded into the arena, 510528 bytes in one block.  When that failed there
+were 548 KB free and the largest piece was 384 KB, so it was not short of
+memory so much as short of *contiguous* memory - and giving the arena another
+200 KB would have moved the wall rather than removed it.  Streaming it, which
+is what the main menu already does with a track of the same kind off the same
+card, costs the ring instead.
+
+### Finding out who wants a block
+
+`-memstat` also turns on a report of every allocation of half a megabyte or
+more, with the address it was asked from:
+
+```
+malloc: 1049616 bytes from 0x4290b359
+```
+
+A failed allocation says how many bytes it wanted and nothing about who wanted
+them, which in a vendored engine of 128000 lines is not a lead.  The loader
+prints where the code was mapped (`code 762652 B XIP at 0x428c0000`); link with
+`ARGON_FALLOUT_LDFLAGS=-Wl,-Map=build/fo2.map` and the difference is a function
+name.  Even without one, the sizes and their order against the engine's own
+progress printing usually name it - 1049616 is the art cache and nothing else
+is.
+
+### What is left in the arena
+
+| | |
+|---|---|
 | art cache (`art_cache_size`, minimum 1) | 1 MB |
-| sound cache (`cache_size`) | 256 KB |
-| 640×480 screen buffer, and the 8-bit surface | 600 KB |
+| the background sound streaming ring | 256 KB |
+| sound cache (`cache_size`) | 64 KB |
+| the 8-bit surface the game draws into | 300 KB |
+| protos, scripts, message files, the rest | the remainder |
 
 And the largest fixed arrays in the image, which is what "optimise the engine"
 would have to mean:
@@ -314,21 +460,38 @@ would have to mean:
 |  80 000 | two path-finding node lists |
 |  80 000 | `_script_dialog_msgs` |
 
-The plausible savings, with what each costs to get:
+### What is left, and what it costs
 
-- **192 KB, free**: `cache_size=64` in the `.cfg` instead of 256.
-- **240 KB, one line of engine**: `gTileIntensity` as `uint16_t`. Light is
-  clamped to 65536 on read and 65536 is one past what fits, so it would have to
-  saturate at 65535 - a difference nobody can see, in a vendored file we would
-  then have to patch on every update.
-- **250-370 KB, one function of engine**: `dbaseOpen` allocates a separate
-  block for each of the 30240 entry paths, so a quarter of that memory is
-  allocator headers. One block for all of them would recover it.
+- **97 KB, a build flag**: `--rodata-in-code`, above.  Buys memory with cache
+  pressure; not needed as things stand.
+- **240 KB, and it does not work**: `gTileIntensity` as `uint16_t`.  Light is
+  clamped to 65536 *on read*, and the stored value is a running sum:
+  `lightIncreaseTileIntensity` adds a source and `lightDecreaseTileIntensity`
+  takes it away again, so two lamps on one tile hold 131072 between them and
+  `lightGetTrueTileIntensity` hands that back unclamped.  Saturating at 65535
+  would be invisible until a light moved away, at which point the subtraction
+  would take a tile dark that should still be lit.  The array has to be as wide
+  as the sum, not as the answer.
+- **900 KB, when the machine is idle**: the attract loop.  `mainmenu.cc` waits
+  `gMainMenuScreensaverDelay` and plays `intro.mve`, whose player costs more
+  than anything the game does while it is being played.  Untested against the
+  606 KB above, which means the screensaver may not fit even though the game
+  does.
 
-About 800 KB in total, against a gap of 2500. **A 16 MB module is the
-answer**; `argon test -Psram 16` is the same choice in QEMU.
+### The caveats, plainly
 
-### Unless the read-only part moves to flash
+The 606 KB is spare on **one map**, in QEMU.  Three things are not in it:
+
+- **The panel.** QEMU lends the emulated display's own memory for the
+  framebuffer; a real 640×480 panel takes its 600 KB out of the same PSRAM,
+  which is very nearly all of the margin.  No cheap SPI panel is 640×480
+  anyway, so that is a different question from this one.
+- **The rest of the game.** One map has been stood on.  A city with more
+  critters, a longer ambience, a fight, an inventory screen - none of it has
+  been measured.
+- **The attract movie**, above.
+
+### The read-only part moves to flash
 
 ArgonOS can put a file at an address instead of in memory: `ag_map` stages it
 into the `appfs` partition and maps it into the data window, where the cache
@@ -336,36 +499,41 @@ that fetches instructions fetches it too. It costs no RAM at all. That is what
 `components/argon_kernel/src/fs/filemap.c` exists for, and it changes the
 arithmetic - for the one item big enough to matter.
 
-**The `.DAT` index, 1.7 MB.** 30240 entries of path, offset and size, built
-into the arena at every start by reading the archive - about 150000 small reads
-and ten seconds. For a given `MASTER.DAT` those bytes never change. Computed
-once on the host, written as a file and mapped, the binary search runs over
-flash and the arena never sees it. It would take the ten seconds off the start
-as well.
+**The `.DAT` index.** 30240 entries of path, offset and size, built into the
+arena at every start by reading the archive - about 150000 small reads and ten
+seconds. For a given `MASTER.DAT` those bytes never change, so they are
+computed once on the host and read where they lie:
 
-With that, and the constants moved to flash by `mkaxe --rodata code`, and the
-sound cache at 64:
+```
+python apps/fallout/tools/mkdatidx.py build/fo2_card/master.dat build/fo2_card/critter.dat
+```
 
-| | |
-|---|---|
-| gap on an 8 MB board | 2470 KB |
-| `.DAT` index mapped from flash | −1700 |
-| `.rodata` with the code, in flash | −97 |
-| sound cache 256 → 64 | −192 |
-| opening movies skipped | −730 |
-| | **fits, with ~250 KB over** |
+```
+master.dat -> master.IDX: 23120 entries, 1012 KB (1373 KB in the arena otherwise)
+critter.dat -> critter.IDX: 7120 entries, 319 KB (431 KB in the arena otherwise)
+```
 
-Two honest caveats. That 250 KB is not a margin: every number above the line
-was measured **before a map was loaded**, and a game in progress needs more.
-And the last row does not work yet - see `ddraw.ini`.
+The file is written in the layout the engine wants to read, not one that is
+convenient to write: the entry table is the `DBaseEntry` array verbatim, so the
+binary search runs over those bytes with nothing unpacked and nothing copied,
+and every offset counts from the start of the file, so it does not matter where
+the mapping lands. `dbaseOpen` looks for `<name>.IDX` beside the archive; the
+header carries the `.DAT`'s size, and an index that does not match its archive
+is refused with a line saying so rather than believed - a stale index describes
+files at offsets that are no longer there, and every read would come back as
+plausible rubbish.
 
-What it costs: a host tool to dump the index (`apps/fallout/tools` already
-parses it), a patch to `dbaseOpen` in a vendored engine, and room in `appfs`,
-which is 4032 KB and already holds 761 KB of XIP code.
+Without an `.IDX` the engine builds the table as before, but into **two**
+allocations rather than 30241: the table says exactly how many bytes all the
+paths need, so they go in one block, and a quarter of what the old way spent
+was allocator headers. It costs nothing to have and it is what happens on a
+card with no `.IDX` on it.
 
-Each `.DAT` entry is a descriptor plus a separately allocated path, and the
-index is read entry by entry - about 150000 small reads for the two of them,
-which is most of the ten seconds before the first frame.
+`apps/fallout/port/dat_index.{h,cc}` is the ArgonOS half; the engine side is
+twelve lines in `apps/fallout/patches/fallout2-ce/0001-dat-index-from-flash.patch`.
+Staging into flash is paid once per boot: 1331 KB of it, a few seconds, and
+`appfs` is 4032 KB against the 745 KB of XIP code `FALLOUT2.AXE` already puts
+there.
 
 Running out does not announce itself in the engine: `dbaseOpen` stops reading
 entries at the first failed allocation and hands back the half-built table

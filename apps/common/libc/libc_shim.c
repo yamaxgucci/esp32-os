@@ -35,12 +35,78 @@ FILE *stderr = &s_stderr;
  */
 static int s_malloc_failed;
 
+/*
+ * The lowest the arena has been, which is not what sampling it once a frame
+ * tells you.
+ *
+ * A big transient - the engine reading a whole file into a buffer, copying it
+ * somewhere and freeing it again - lives and dies between two frames, so a
+ * per-frame watcher never sees it and reports a high-water mark that is short
+ * by however large it was.  Fallout 2 decodes a map's ambience whole - half a
+ * megabyte, allocated and handed on between two frames - and the difference
+ * was what decided whether the game fitted in 8 MB of PSRAM.
+ *
+ * So the arena is sampled here as well, but only for allocations big enough to
+ * matter: ag_meminfo is a call and the engine makes thirty thousand small
+ * allocations before it draws anything.
+ */
+#define ARENA_WATCH_MIN (64u * 1024u)
+
+static size_t s_arena_low = (size_t)-1;
+
+size_t ag_libc_arena_low(void)
+{
+    return s_arena_low;
+}
+
+/*
+ * The big ones, named by where they were asked for.
+ *
+ * A failed allocation says how many bytes it wanted and nothing about who
+ * wanted them, and in a vendored engine of 128000 lines that is not a lead.
+ * The return address is, once it is run through the link map - and the ones
+ * before it say which phase the program was in.  Bounded, because a program
+ * that streams audio asks for large blocks forever.
+ *
+ * Off unless asked for: a program that allocates a megabyte on purpose should
+ * not have to explain itself on the console every time it runs.
+ */
+#define ARENA_REPORT_MIN (512u * 1024u)
+#define ARENA_REPORT_MAX 12
+
+static int s_big_reported;
+static int s_big_trace;
+
+void ag_libc_malloc_trace(int on)
+{
+    s_big_trace = on ? 1 : 0;
+}
+
+static void report_big(size_t n, void *ret, void *p)
+{
+    if (!s_big_trace || n < ARENA_REPORT_MIN ||
+        s_big_reported >= ARENA_REPORT_MAX) {
+        return;
+    }
+    s_big_reported++;
+    ag_printf("malloc: %u bytes from %p%s\n", (unsigned)n, ret,
+              (p == NULL) ? " FAILED" : "");
+}
+
 void *malloc(size_t n)
 {
     if (n == 0) {
         n = 1;
     }
     void *p = ag_malloc(n);
+    report_big(n, __builtin_return_address(0), p);
+    if (p != NULL && n >= ARENA_WATCH_MIN) {
+        ag_meminfo_t mi;
+        ag_meminfo(&mi);
+        if ((size_t)mi.arena_free < s_arena_low) {
+            s_arena_low = (size_t)mi.arena_free;
+        }
+    }
     if (p == NULL && !s_malloc_failed) {
         ag_meminfo_t mi;
         s_malloc_failed = 1;

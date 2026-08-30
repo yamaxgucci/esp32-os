@@ -108,9 +108,17 @@ CFLAGS = ("-Os -ffunction-sections -fdata-sections -fno-builtin -mlongcalls "
 # of CFLAGS because that is split on spaces and this path has some in it.
 PRELUDE = os.path.join(PORT, "engine_prelude.h")
 
+# Where the image's read-only constants go.  --rodata code puts them in the
+# part that is executed from flash, which takes them out of PSRAM; the cost is
+# that reading one is a cache miss away from the same bus the instructions come
+# over.  For 99 KB of Fallout's tables that is a trade worth having on an 8 MB
+# board and not worth having on a 16 MB one, so it is a flag rather than a
+# decision.  Set by main().
+RODATA_ARGS: list = []
+
 # How much of extended memory the process asks for.  See the comment on
 # AG_APP_SIZED in fallout_main.cc; --arena-kb overrides it.
-ARENA_KB = 5875
+ARENA_KB = 6100
 
 # Files that only exist for a platform this is not.
 SKIP = (
@@ -135,6 +143,43 @@ def fetch(no_fetch: bool) -> None:
         print("fetching %s" % name)
         subprocess.check_call(
             ["git", "clone", "--depth", "1", "--branch", branch, url, path])
+
+
+def patch() -> None:
+    """Apply our changes to the cloned engine, if they are not applied already.
+
+    third_party/ is a clone and is in .gitignore, so an edit made there is
+    invisible to this repository and lost the moment anyone deletes it and
+    fetches again.  The changes live here as patches instead, applied on every
+    build and skipped when the tree already has them.
+
+    A patch that no longer applies stops the build with the name of the file it
+    could not reach, which is the point: the engine is somebody else's and it
+    moves, and a change of ours that has silently stopped taking effect is
+    worse than one that fails loudly.
+    """
+    root = os.path.join(ROOT, "apps", "fallout", "patches", GAME["engine"])
+    if not os.path.isdir(root):
+        return
+    tree = tp(GAME["engine"])
+    for name in sorted(os.listdir(root)):
+        if not name.endswith(".patch"):
+            continue
+        full = os.path.join(root, name)
+        applied = subprocess.call(
+            ["git", "apply", "--reverse", "--check", full],
+            cwd=tree, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL) == 0
+        if applied:
+            continue
+        if subprocess.call(["git", "apply", "--check", full], cwd=tree,
+                           stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL) != 0:
+            raise SystemExit(
+                "fallout: %s neither applies to %s nor is already applied - "
+                "the engine has moved under it" % (rel(full), GAME["engine"]))
+        print("patching %s with %s" % (GAME["engine"], name))
+        subprocess.check_call(["git", "apply", full], cwd=tree)
 
 
 def engine_sources() -> list[str]:
@@ -251,6 +296,7 @@ def port_sources() -> list[str]:
         os.path.join(PORT, "sdl_shim.cc"),
         os.path.join(PORT, "platform.cc"),
         os.path.join(PORT, "posix_io.cc"),
+        os.path.join(PORT, "dat_index.cc"),
         os.path.join(FPATTERN, "src", "fpattern.c"),
         os.path.join(ROOT, "apps", "common", "cxx", "cxx_rt.cpp"),
         os.path.join(ROOT, "apps", "common", "cxx", "cxx_throw.cpp"),
@@ -379,7 +425,7 @@ def run_link(objects: list, output: str, extra: str) -> int:
            # arrived and collided with the shim.
            "--ldflags=-Wl,--gc-sections " + extra + " " +
            os.environ.get("ARGON_FALLOUT_LDFLAGS", ""),
-           "-o", output] + objects
+           "-o", output] + RODATA_ARGS + objects
     p = subprocess.run(cmd, capture_output=True, text=True)
     rc_output = p.stdout + p.stderr
     if p.returncode != 0:
@@ -403,6 +449,10 @@ def main() -> int:
                     help="extended memory the process asks for, in KB "
                          "(default %d, which is what fits beside the image on "
                          "8 MB of PSRAM)" % ARENA_KB)
+    ap.add_argument("--rodata-in-code", action="store_true",
+                    help="link the image's constants with the code, so they "
+                         "are read from flash instead of costing PSRAM "
+                         "(about 97 KB; see mkaxe --rodata)")
     ap.add_argument("--survey", action="store_true",
                     help="compile every file, report sizes, do not link")
     ap.add_argument("--no-fetch", action="store_true",
@@ -414,6 +464,8 @@ def main() -> int:
     GAME = GAMES[args.game]
     ENGINE = tp(GAME["engine"])
     ARENA_KB = args.arena_kb
+    if args.rodata_in_code:
+        RODATA_ARGS[:] = ["--rodata", "code"]
 
     # Separate object directories, or a switch between games would link one
     # engine's objects into the other's image and fail in ways that look like
@@ -423,6 +475,7 @@ def main() -> int:
                                          GAME["output"])
 
     fetch(args.no_fetch)
+    patch()
 
     if args.survey:
         return survey(objdir)

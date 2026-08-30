@@ -42,6 +42,10 @@ ArgonOS
   argon fallout [args]     build FALLOUT2.AXE (apps/fallout/build.py) with
                            the IDF toolchain on PATH; -game 1 for Fallout 1
   argon test [-Send ...]   automated boot test; prints the resulting screen
+                           (a guest command must not END in a backslash:
+                            PowerShell escapes it into the next argument and
+                            the guest sees the two glued together.  Write
+                            "copy a:\x.cfg c:\x.cfg", never "... c:\")
   argon test -cp 866 ...   the same, when the screen is in another code page
   argon tests              host unit tests (needs a host C compiler)
   argon nettest            wget / httpd / ftp in QEMU against

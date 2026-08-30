@@ -21,6 +21,11 @@
 #include <argon/argon.h>
 #include <stdio.h>
 
+/* apps/common/libc's watcher; its header is not on this build's include
+ * path, and the engine's stdlib.h is the toolchain's. */
+extern "C" size_t ag_libc_arena_low(void);
+extern "C" void ag_libc_malloc_trace(int on);
+
 /* Declared where the port can see them; not part of SDL. */
 extern "C" bool sdl_shim_display(ag_gfxinfo_t *out);
 extern "C" void sdl_shim_screenshot(const char *path, int after_frames,
@@ -245,6 +250,9 @@ void sdl_shim_memstat(int every_ms)
 {
     s_memstat_ms = (uint32_t)(every_ms > 0 ? every_ms : 0);
     s_memstat_next = 0;
+    /* Anyone watching the arena wants to know who asked for the block that did
+     * not fit, and that is off unless asked for. */
+    ag_libc_malloc_trace(every_ms > 0);
 }
 
 /*
@@ -280,10 +288,30 @@ static void memstat_service(void)
         return;
     }
     s_memstat_next = now + s_memstat_ms;
-    ag_printf("[mem] %u KB used of %u, peak %u, largest free block %u KB\n",
+    /*
+     * Two peaks, because they answer different questions.  The first is what
+     * the game holds between frames - what it costs to sit somewhere.  The
+     * second counts the big transients too, and that is the one the board has
+     * to satisfy: an engine that reads a file into a buffer, copies it and
+     * frees it again still needs the buffer to exist.  Sampling once a frame
+     * never sees those: in the Temple of Trials the two read 5610 and 6055 KB,
+     * and the 445 KB between them is what decided whether the game fitted in
+     * 8 MB.
+     */
+    const size_t   low = ag_libc_arena_low();
+    const unsigned frame_peak =
+        (unsigned)((mi.arena_total - s_arena_low) / 1024u);
+    /* Before the first big allocation there is nothing extra to report, and a
+     * zero there reads as "no transients ever", which is a different claim. */
+    const unsigned peak_alloc =
+        (low == (size_t)-1) ? frame_peak
+                            : (unsigned)((mi.arena_total - low) / 1024u);
+    ag_printf("[mem] %u KB used of %u, peak %u (%u with transients), "
+              "largest free block %u KB\n",
               (unsigned)((mi.arena_total - mi.arena_free) / 1024u),
               (unsigned)(mi.arena_total / 1024u),
-              (unsigned)((mi.arena_total - s_arena_low) / 1024u),
+              frame_peak,
+              peak_alloc,
               (unsigned)(mi.arena_largest / 1024u));
 }
 
