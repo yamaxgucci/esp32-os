@@ -4484,7 +4484,7 @@ static const ag_command_t k_commands[] = {
      ag_cmd_mqtt},
 #endif
 #if defined(CONFIG_ARGON_NET_MODBUS) && CONFIG_ARGON_NET_MODBUS
-    {"modbus", "read|write <host> <addr> [n|vals]", "Modbus TCP master",
+    {"modbus", "read|write <host>… | rtu <uart> <baud> …", "Modbus master (TCP+RTU)",
      ag_cmd_modbus},
 #endif
 #if defined(CONFIG_ARGON_NET_OTA) && CONFIG_ARGON_NET_OTA
