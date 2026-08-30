@@ -48,9 +48,14 @@
 ### Сеть сверх радио (фаза 5)
 
 5. ✅ **TLS** (`wget https://`), ✅ **SNTP** (`date sync`), ✅ **telnet-консоль**
-   на :23 — все три проверены end-to-end в QEMU (29 августа 2026). ⬜ Осталось:
-   **MQTT**, **Modbus TCP**, **OTA**. Радио-трек (Wi-Fi STA/AP/ESP-NOW/monitor,
-   BLE) закрыт на плате.
+   на :23, ✅ **SSH-сервер** (с нуля на mbedTLS: обмен ключами, ecdsa host-key,
+   aes256-ctr, пароль, канал-шелл — проверен в QEMU и на плате C6 по Wi-Fi),
+   ✅ **MQTT** (`mqtt pub`/`sub`, проверен против test.mosquitto.org),
+   ✅ **Modbus TCP** (`modbus read`/`write`, проверен против тест-сервера),
+   ✅ **OTA** (`ota <url>` через esp_https_ota; собран и грузится, сам
+   firmware-switch — на железе: QEMU esp32s3 не грузит двухслотовый раздел).
+   Фаза 5 закрыта. Радио-трек (Wi-Fi STA/AP/ESP-NOW/monitor, BLE) закрыт на
+   плате.
 
 ### Универсальная сборка и безопасность (фаза 4.5)
 
@@ -899,8 +904,9 @@ Wi-Fi **monitor / injection** — ловит эфир на плате (пров�
   решение, а не экономия — плата-инжектор кадров должна быть выбором сборщика
   (см. п. 7 фазы 6 про режим приёма и журнал). Разблокирует Marauder-класс.
 
-Осталось: MQTT, Modbus TCP, OTA (TLS/`https`, SNTP и telnet-консоль сделаны
-29 августа 2026, проверены в QEMU). Wi-Fi-трек радио закрыт (STA был; добавлены
+Фаза 5 закрыта (30 августа 2026): TLS/`https`, SNTP, telnet, SSH, MQTT, Modbus
+TCP, OTA — все проверены в QEMU, SSH ещё и на плате C6 по Wi-Fi (OTA-switch — на
+железе). Wi-Fi-трек радио закрыт (STA был; добавлены
 SoftAP, ESP-NOW, monitor/injection — все прошиты на CYD и проверены на плате
 21 августа 2026, ни одной паники; остались проверки, требующие человека —
 телефон, вторая плата).
@@ -972,7 +978,8 @@ SoftAP, ESP-NOW, monitor/injection — все прошиты на CYD и про�
 **Радио-трек фазы 5 закрыт**: Wi-Fi (STA, SoftAP, ESP-NOW, monitor/injection) и
 BLE (HID-клавиатура, наблюдатель, GATT-клиент, peripheral) — всё прошито на CYD и
 проверено на плате 21 августа 2026, ни одной паники. Нерадийное: ✅ TLS/`https`,
-✅ SNTP, ✅ telnet (29 августа 2026, QEMU). Осталось: MQTT, Modbus TCP, OTA.
+✅ SNTP, ✅ telnet, ✅ SSH, ✅ MQTT, ✅ Modbus TCP, ✅ OTA (30 августа 2026) —
+фаза 5 закрыта.
 
 ### Радио приложениям — ABI 0.38 (решено 22 августа 2026)
 
