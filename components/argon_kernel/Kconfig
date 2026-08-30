@@ -412,6 +412,14 @@ menu "ArgonOS"
             controller.  Needs a CAN transceiver on the tx/rx pins and another
             node on the bus.  Off by default.
 
+    config ARGON_ONEWIRE
+        bool "1-Wire (DS18B20 thermometer)"
+        default n
+        help
+            The `onewire temp`/`onewire rom` commands: a bit-banged 1-Wire bus
+            on one GPIO, enough to read a DS18B20 temperature sensor.  Needs an
+            external ~4.7k pull-up on the line.  Off by default.
+
     config ARGON_BOARD_PROBE
         bool "Board probe instead of the system"
         default n
