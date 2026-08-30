@@ -57,6 +57,7 @@ set(ARGON_KERNEL_SRCS
     "src/net/netio.c"
     "src/net/httpc.c"
     "src/net/ftpc.c"
+    "src/net/ssh.c"
     "src/proc/proc.c"
     "src/proc/session.c"
     "src/proc/threads.c"

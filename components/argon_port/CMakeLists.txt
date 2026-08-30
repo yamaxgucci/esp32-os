@@ -114,13 +114,16 @@ if(CONFIG_ARGON_CAMERA_BUILTIN)
     target_link_libraries(${COMPONENT_LIB} PRIVATE ${cam_builtin_lib})
 endif()
 
-# TLS client (CONFIG_ARGON_NET_TLS): esp_tls + mbedtls, for https in wget
-# (tls_hw.c).  esp_crt_bundle (the root-certificate bundle) is part of the
-# mbedtls component.  Linked conditionally so a build without TLS neither pulls
-# mbedTLS's RAM nor puts its headers on the path; both build fine under QEMU.
+# mbedTLS: the crypto both TLS and SSH stand on.  esp_tls (the https client in
+# tls_hw.c) is only needed for TLS; mbedtls itself (curves, ciphers, hashes -
+# used by tls_hw.c and crypto_hw.c) is linked whenever either is on.  Linked
+# conditionally so a build with neither pays for none of it; both build under
+# QEMU.  esp_crt_bundle, the root-certificate bundle, is part of mbedtls.
 if(CONFIG_ARGON_NET_TLS)
     idf_component_get_property(tls_lib esp-tls COMPONENT_LIB)
     target_link_libraries(${COMPONENT_LIB} PRIVATE ${tls_lib})
+endif()
+if(CONFIG_ARGON_NET_TLS OR CONFIG_ARGON_NET_SSH)
     idf_component_get_property(mbed_lib mbedtls COMPONENT_LIB)
     target_link_libraries(${COMPONENT_LIB} PRIVATE ${mbed_lib})
 endif()

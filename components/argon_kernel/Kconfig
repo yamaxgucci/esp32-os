@@ -367,6 +367,16 @@ menu "ArgonOS"
             https URL is refused rather than fetched in clear.  Verified in QEMU
             over OpenEth+SLIRP against a real https server.
 
+    config ARGON_NET_SSH
+        bool "SSH server (console over an encrypted channel)"
+        depends on ARGON_ENABLE_NET
+        default n
+        help
+            An SSH server built on mbedTLS primitives (no second crypto stack),
+            so the console can be reached the way telnet reaches it but
+            encrypted, with a standard `ssh` client.  Being built in milestones;
+            off by default while it is incomplete.  `ssh on` opens the listener.
+
     config ARGON_BOARD_PROBE
         bool "Board probe instead of the system"
         default n
