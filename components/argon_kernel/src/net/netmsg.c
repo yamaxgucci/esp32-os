@@ -271,13 +271,16 @@ ag_err_t ag_url_parse(const char *text, ag_url_t *out)
         out->port = 80;
     } else if (strcmp(out->scheme, "ftp") == 0) {
         out->port = 21;
-    } else {
+    } else if (strcmp(out->scheme, "https") == 0) {
         /*
-         * https lands here, and it is the reason this returns a distinct code:
-         * there is no TLS in this system, and quietly fetching an https URL
-         * over port 80 would send a password in clear for a caller who took
-         * care to ask for encryption.
+         * Accepted here unconditionally (this file is also compiled into an
+         * .AXE, where the build-time TLS flag is not visible).  A build without
+         * TLS still refuses https before it can leak anything: the http client
+         * checks the scheme against AG_PORT_HAS_TLS and request_once has no
+         * plain-socket path for it.
          */
+        out->port = 443;
+    } else {
         return -AG_ENOTSUP;
     }
 

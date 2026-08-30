@@ -78,6 +78,7 @@ ag_err_t ag_netio_sendf(int fd, const char *fmt, ...)
 
 typedef struct {
     int      fd;
+    void    *tls;  /* NULL for a plain socket; an ag_port_tls_t for https  */
     uint8_t *buf;
     size_t   cap;
     size_t   have; /* bytes in buf                                        */
@@ -85,6 +86,14 @@ typedef struct {
     bool     eof;
     uint32_t timeout_ms;
 } ag_netio_t;
+
+/*
+ * The TLS twin of ag_netio_recv: the same wait-then-read-without-blocking loop,
+ * over an ag_port_tls_t (passed as void* so this header need not pull in the
+ * TLS port).  Used by fill() when a reader is carrying a tls handle.
+ */
+int32_t ag_netio_recv_tls(void *tls, void *buf, size_t len,
+                          uint32_t timeout_ms);
 
 /*
  * `prefill` bytes at the front of `buf` are treated as already received - that

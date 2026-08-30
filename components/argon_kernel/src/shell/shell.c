@@ -33,12 +33,16 @@
 #include <argon/vfs.h>
 
 #include <argon/btinput.h>
+#include <time.h>
+
 #include <argon/net.h>
+#include "console/telnet_console.h"
 #include <argon/port/bt.h>
 #include <argon/port/ble.h>
 #include <argon/port/io.h>
 #include <argon/port/mem.h>
 #include <argon/port/net.h>
+#include <argon/port/sntp.h>
 #include <argon/port/wifi.h>
 #include <argon/port/sys.h>
 #include <argon/port/task.h>
@@ -483,6 +487,72 @@ static int cmd_uptime(int argc, char **argv)
                       (unsigned)((us / 1000u) % 1000u));
     return 0;
 }
+
+static int cmd_date(int argc, char **argv)
+{
+    if (argc >= 2 && ag_path_icmp(argv[1], "sync") == 0) {
+#if AG_PORT_HAS_SNTP
+        const char *server = (argc >= 3) ? argv[2] : NULL;
+        ag_console_puts("syncing time...\n");
+        const ag_err_t err = ag_port_sntp_sync(server, 10000);
+        if (err != AG_OK) {
+            ag_console_printf("date sync: %s\n",
+                              ag_loader_api()->sys->strerror(err));
+            return 1;
+        }
+#else
+        ag_console_puts("no SNTP in this build\n");
+        return 1;
+#endif
+    }
+
+    /* Show the wall clock.  UTC: there is no timezone database on the board,
+     * and a wrong offset is worse than an honest one. */
+    const time_t now = time(NULL);
+    struct tm    tm;
+    if (gmtime_r(&now, &tm) == NULL) {
+        ag_console_puts("date: clock unreadable\n");
+        return 1;
+    }
+    ag_console_printf("%04d-%02d-%02d %02d:%02d:%02d UTC\n", tm.tm_year + 1900,
+                      tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min,
+                      tm.tm_sec);
+    /* Before a sync the clock is seconds since 1970 plus uptime, i.e. still in
+     * 1970 - say so rather than let a 1970 date look like a bug. */
+    if (tm.tm_year + 1900 < 2000) {
+        ag_console_puts("(clock not set - `date sync` to set it from the network)\n");
+    }
+    return 0;
+}
+
+#if defined(CONFIG_ARGON_NET_TELNET) && CONFIG_ARGON_NET_TELNET
+static int cmd_telnet(int argc, char **argv)
+{
+    if (argc >= 2 && ag_path_icmp(argv[1], "on") == 0) {
+        const uint16_t port = (argc >= 3) ? (uint16_t)atoi(argv[2]) : 0;
+        const ag_err_t err = ag_telnet_start(port);
+        if (err != AG_OK) {
+            ag_console_printf("telnet on: %s\n",
+                              ag_loader_api()->sys->strerror(err));
+            return 1;
+        }
+        ag_console_printf("telnet listening on port %u\n",
+                          (unsigned)ag_telnet_port());
+        return 0;
+    }
+    if (argc >= 2 && ag_path_icmp(argv[1], "off") == 0) {
+        ag_telnet_stop();
+        ag_console_puts("telnet off\n");
+        return 0;
+    }
+    if (ag_telnet_running()) {
+        ag_console_printf("telnet on, port %u\n", (unsigned)ag_telnet_port());
+    } else {
+        ag_console_puts("telnet off ('telnet on' to open the console on :23)\n");
+    }
+    return 0;
+}
+#endif /* CONFIG_ARGON_NET_TELNET */
 
 static int cmd_color(int argc, char **argv)
 {
@@ -4265,6 +4335,7 @@ static const ag_command_t k_commands[] = {
      cmd_boot},
     {"log", "[-n N|clear]", "system journal", cmd_log},
     {"uptime", "", "time since reset", cmd_uptime},
+    {"date", "[sync [server]]", "show the clock, or set it from the network", cmd_date},
     {"cls", "", "clear the screen", cmd_cls},
     {"echo", "<text>", "print text", cmd_echo},
     {"color", "<fg> <bg>", "set text colours", cmd_color},
@@ -4299,6 +4370,9 @@ static const ag_command_t k_commands[] = {
      ag_cmd_wget},
     {"ftp", "<host> [user] [pass]", "file transfer session", ag_cmd_ftp},
     /* httpd is a loadable app now (HTTPD.AXE), not a built-in - run it by name. */
+#if defined(CONFIG_ARGON_NET_TELNET) && CONFIG_ARGON_NET_TELNET
+    {"telnet", "[on [port]|off]", "the console over TCP :23", cmd_telnet},
+#endif
 #endif
 #if AG_PORT_HAS_BT
     {"bt", "[on|off|scan|open <#|addr>|close|forget]", "bluetooth input", cmd_bt},
