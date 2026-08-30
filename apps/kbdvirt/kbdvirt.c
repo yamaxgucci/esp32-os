@@ -49,6 +49,7 @@ typedef struct {
     uint8_t      rx_buf[PKT_SIZE];
     uint8_t      rx_n;
     uint8_t      drop_stale;
+    ag_handle_t  last_accept_err;
 } kbdvirt_state_t;
 
 static kbdvirt_state_t s_st;
@@ -170,25 +171,75 @@ static void ensure_listen(kbdvirt_state_t *st)
     ag_log(AG_LOG_INFO, "kbdvirt", "listen :%u", (unsigned)KBDVIRT_PORT);
 }
 
+/*
+ * Take every connection that is waiting, not one per call.
+ *
+ * A host tool that retries while the guest boots leaves one queued connection
+ * per attempt, and QEMU's forwarding accepts them all whether or not anybody
+ * here ever will.  Taking one per read then works through a queue of corpses
+ * at a frame each while the live socket - always the last of them - waits its
+ * turn and its keys go nowhere.
+ *
+ * The newest peer is the real one, so the rest are closed as they come.
+ *
+ * This was not the bug that made the keyboard look dead - that was the drain
+ * below - but it is a real one and it is the same shape, so it is fixed here
+ * rather than left to be found the same way.
+ */
 static void try_accept(kbdvirt_state_t *st)
 {
     ag_handle_t peer;
+    int         spins = 0;
     ensure_listen(st);
     if (st->listen < 0) {
         return;
     }
-    peer = ag_tcp_accept(st->listen, 0u);
-    if (peer < 0) {
+    for (;;) {
+        peer = ag_tcp_accept(st->listen, 0u);
+        if (peer < 0) {
+            break;
+        }
+        /* Quietly: a line for each of forty corpses is not a diagnosis, and
+         * the count goes in the one line printed below. */
+        if (st->conn >= 0) {
+            (void)ag_net_close(st->conn);
+        }
+        st->conn = peer;
+        st->rx_n = 0;
+        if (++spins >= 64) {
+            break;
+        }
+    }
+    if (spins == 0) {
+        /*
+         * -EAGAIN is the ordinary answer - nobody is knocking - and it arrives
+         * sixty times a second, so it is not worth a line.  Anything else is
+         * the driver failing to take a connection that is there, which from
+         * the outside looks exactly like a keyboard that does not work, and
+         * left no trace at all until this line existed.  Once per code, so a
+         * standing fault does not fill the screen.
+         */
+        if (peer != (ag_handle_t)(-AG_EAGAIN) && peer != st->last_accept_err) {
+            st->last_accept_err = peer;
+            ag_log(AG_LOG_WARN, "kbdvirt", "accept refused: %d", (int)peer);
+        }
         return;
     }
-    if (st->conn >= 0) {
-        close_conn(st, "replaced by new peer");
-    }
-    st->conn = peer;
+    st->last_accept_err = 0;
     (void)ag_net_set_nonblock(st->conn, true);
-    drain_rx(st);
-    st->drop_stale = 1;
-    ag_log(AG_LOG_INFO, "kbdvirt", "host connected");
+    /*
+     * What this peer has already sent is kept, not dropped.
+     *
+     * It used to drain here and drop one more read besides, on the reasoning
+     * that a connection older than the app is stale.  It is the opposite: a
+     * driver on this system is serviced only while something reads it, so it
+     * does not accept until an app opens /dev/kbd0 - and everything the host
+     * sent while waiting for that is exactly what the host meant for this app.
+     * Draining it threw away every key pressed before the first frame, which
+     * is most of what a test presses, and left the pointer working because
+     * MOUSEVIRT never had the same idea.
+     */
+    ag_log(AG_LOG_INFO, "kbdvirt", "host connected (%d waiting)", spins);
 }
 
 static void recv_available(kbdvirt_state_t *st)
@@ -225,8 +276,14 @@ static ag_err_t kbd_open(ag_device_t *dev, uint32_t flags)
         return -AG_ENODEV;
     }
     ensure_listen(st);
+    /*
+     * A connection that was already open may still hold keys meant for the app
+     * that has just exited, and this one should not inherit them.  A
+     * connection accepted from here on cannot: nothing on it predates this
+     * open, so it is decided before try_accept rather than after.
+     */
+    st->drop_stale = (st->conn >= 0) ? 1u : 0u;
     try_accept(st);
-    st->drop_stale = 1;
     return AG_OK;
 }
 

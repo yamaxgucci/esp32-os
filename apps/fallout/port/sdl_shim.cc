@@ -1123,15 +1123,39 @@ static void input_devices_open(void)
                                          : "");
 }
 
+/*
+ * A device that cannot be read is silent, and silence here is exactly what a
+ * host with its hands off the keyboard looks like.  So each device says once
+ * that it has produced something, and says any error it gives - which is the
+ * difference between "input does not work" and knowing which half of it does
+ * not.  Not every read: during a game these run sixty times a second and the
+ * interesting fact is the first one, not the four hundredth.
+ */
+static void report_read(const char *what, ag_handle_t h, int32_t n)
+{
+    static bool    s_said[2];
+    static int32_t s_err[2];
+    const int      i = (h == s_kbd) ? 0 : 1;
+
+    if (n > 0 && !s_said[i]) {
+        s_said[i] = true;
+        ag_printf("SDL: %s is delivering events\n", what);
+    } else if (n < 0 && n != s_err[i]) {
+        s_err[i] = n;
+        ag_printf("SDL: %s read failed: %d\n", what, (int)n);
+    }
+}
+
 void sdl_shim_input_service(void)
 {
     /* Enough for a burst; anything beyond it is read on the next call. */
     uint8_t drain[128];
     if (s_kbd >= 0) {
-        (void)ag_dev_read(s_kbd, drain, sizeof(drain));
+        report_read("kbd0", s_kbd, ag_dev_read(s_kbd, drain, sizeof(drain)));
     }
     if (s_mouse >= 0) {
-        (void)ag_dev_read(s_mouse, drain, sizeof(drain));
+        report_read("mouse0", s_mouse,
+                    ag_dev_read(s_mouse, drain, sizeof(drain)));
     }
 }
 

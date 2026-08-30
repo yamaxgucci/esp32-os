@@ -21,6 +21,7 @@
 #include "ag_cxx.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 AG_APP("SDLTEST", "1.0", "argon", 0);
@@ -106,7 +107,24 @@ static void write_ppm(const char *path, const Uint16 *fb, int w, int h,
 
 extern "C" int ag_cxx_main(int argc, char **argv)
 {
-    const char *out = (argc > 1) ? argv[1] : "h:\\sdltest.ppm";
+    /*
+     * "-input SECONDS" turns the last section into a test of the host's
+     * keyboard and mouse rather than a check that the queue is empty.  It is
+     * opt-in because an automated run has nobody at the keys, and a test that
+     * waits twenty seconds for a person cannot go in a script - but with
+     * tools/inputplay.py driving it, nobody has to be there, and this is the
+     * cheap harness for the input path.  Fallout takes minutes to reach a
+     * screen that can be typed at; this takes seconds.
+     */
+    const char *out = "h:\\sdltest.ppm";
+    int         input_secs = 0;
+    for (int i = 1; i < argc; ++i) {
+        if (same(argv[i], "-input") && i + 1 < argc) {
+            input_secs = (int)strtol(argv[++i], NULL, 10);
+        } else if (argv[i][0] != '-') {
+            out = argv[i];
+        }
+    }
 
     ag_printf("SDLTEST - the SDL shim, without the engine\n\n");
 
@@ -387,6 +405,72 @@ extern "C" int ag_cxx_main(int argc, char **argv)
     SDL_GetRelativeMouseState(&mx, &my);
     check("relative mouse state resets", (SDL_GetRelativeMouseState(&mx, &my),
                                           mx == 0 && my == 0));
+
+    /* --- the input path, end to end --------------------------------------- */
+
+    /*
+     * The queue draining says the shim's plumbing is sound; it says nothing
+     * about whether a key pressed on the host arrives at all.  Between the two
+     * lies the whole of KBDVIRT, MOUSEVIRT, the sockets they listen on, and
+     * the fact that a driver here is serviced only while something reads it.
+     *
+     * This waits for one of each and names what it got, so that "input does
+     * not work" becomes four separate answers: no device, no connection, no
+     * event, or a wrong event.
+     */
+    if (input_secs > 0) {
+        bool got_down = false, got_up = false;
+        bool got_motion = false, got_button = false;
+        const ag_time_t deadline = ag_millis() + (ag_time_t)input_secs * 1000;
+
+        ag_printf("\nwaiting %d s for host input "
+                  "(tools/inputplay.py, or kbdvirt.py + mousevirt.py)\n",
+                  input_secs);
+
+        while (ag_millis() < deadline &&
+               !(got_down && got_up && got_motion && got_button)) {
+            SDL_Event e;
+            while (SDL_PollEvent(&e)) {
+                switch (e.type) {
+                case SDL_KEYDOWN:
+                    ag_printf("  key down  scancode %3d mod %04x\n",
+                              (int)e.key.keysym.scancode,
+                              (unsigned)e.key.keysym.mod);
+                    got_down = true;
+                    break;
+                case SDL_KEYUP:
+                    ag_printf("  key up    scancode %3d\n",
+                              (int)e.key.keysym.scancode);
+                    got_up = true;
+                    break;
+                case SDL_MOUSEMOTION:
+                    /* One line per motion event would be a page of them. */
+                    if (!got_motion) {
+                        ag_printf("  mouse at  %d,%d\n", e.motion.x,
+                                  e.motion.y);
+                    }
+                    got_motion = true;
+                    break;
+                case SDL_MOUSEBUTTONDOWN:
+                    ag_printf("  button %d  at %d,%d\n", (int)e.button.button,
+                              e.button.x, e.button.y);
+                    got_button = true;
+                    break;
+                default:
+                    break;
+                }
+            }
+            /* Where the drivers are serviced in a real frame, so service them
+             * the same way here rather than inventing a second path. */
+            SDL_RenderPresent(renderer);
+            ag_delay(16);
+        }
+
+        check("keyboard reaches the app (down)", got_down);
+        check("keyboard reaches the app (up)", got_up);
+        check("mouse motion reaches the app", got_motion);
+        check("mouse button reaches the app", got_button);
+    }
 
     /* Leave the picture up for a moment when a window is open, then give the
      * console its display back - otherwise the shell prints into a screen

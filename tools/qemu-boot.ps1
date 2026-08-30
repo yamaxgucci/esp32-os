@@ -154,6 +154,21 @@ $proc = Start-Process -FilePath $qemu -ArgumentList $qemuArgs -NoNewWindow `
     -PassThru -RedirectStandardOutput $qemuOut -RedirectStandardError "$qemuOut.err"
 
 $text = New-Object System.Text.StringBuilder
+$nextFlush = [datetime]::MinValue
+
+# Byte for byte, through Latin-1: every byte of the line was appended as the
+# character of the same number, and Latin-1 is the encoding that turns it back
+# into that byte.  WriteAllText's UTF-8 would encode anything above 0x7f as two
+# bytes, which was invisible while the guest only ever said ASCII and turned
+# every Cyrillic character into mojibake the moment it did not.
+function Write-Transcript {
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $LogPath) |
+        Out-Null
+    [System.IO.File]::WriteAllText((Join-Path (Get-Location) $LogPath),
+                                   $text.ToString(),
+                                   [System.Text.Encoding]::GetEncoding(28591))
+}
+
 $client = $null
 $stream = $null
 $found = $false
@@ -198,6 +213,17 @@ try {
                 [void]$keep.Append([char]$b)
             }
             [void]$text.Append($keep.ToString())
+        }
+        # Write what we have, at most once a second.
+        #
+        # The transcript used to appear only when the run ended, which is fine
+        # for a boot test that takes twenty seconds and useless for a game that
+        # takes fifteen minutes: for all of them there was no way to see what
+        # the guest was doing except to wait for it to stop.  A second's
+        # granularity costs nothing and makes `tail` work.
+        if ((Get-Date) -gt $script:nextFlush) {
+            $script:nextFlush = (Get-Date).AddSeconds(1)
+            Write-Transcript
         }
         $s = $text.ToString()
         $count = 0
@@ -466,17 +492,7 @@ try {
 
     # Written here, not after the try: a run that failed is the run whose
     # transcript is worth having, and a throw would have skipped it.
-    #
-    # Byte for byte, through Latin-1: every byte of the line was appended as the
-    # character of the same number, and Latin-1 is the encoding that turns it back
-    # into that byte.  WriteAllText's UTF-8 would encode anything above 0x7f as
-    # two bytes, which was invisible while the guest only ever said ASCII and
-    # turned every Cyrillic character into mojibake the moment it did not.
-    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $LogPath) |
-        Out-Null
-    [System.IO.File]::WriteAllText((Join-Path (Get-Location) $LogPath),
-                                   $text.ToString(),
-                                   [System.Text.Encoding]::GetEncoding(28591))
+    Write-Transcript
 }
 
 if ($found) {

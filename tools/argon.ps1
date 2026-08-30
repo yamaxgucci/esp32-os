@@ -39,6 +39,8 @@ ArgonOS
                            (FAT16 snapshot; then: argon run -Sd)
   argon get GUEST [OUT]    copy a file out of build\sdcard.img to the host
                            (e.g. argon get shot.ppm)
+  argon fallout [args]     build FALLOUT2.AXE (apps/fallout/build.py) with
+                           the IDF toolchain on PATH; -game 1 for Fallout 1
   argon test [-Send ...]   automated boot test; prints the resulting screen
   argon test -cp 866 ...   the same, when the screen is in another code page
   argon tests              host unit tests (needs a host C compiler)
@@ -238,6 +240,21 @@ switch ($Command.ToLowerInvariant()) {
         }
         Write-Host "Saved $out - open it with any image viewer (PPM)."
         exit 0
+    }
+
+    'fallout' {
+        # apps/fallout/build.py wants xtensa-esp32s3-elf-gcc on PATH, which is
+        # what Initialize-Environment is for.  Doing it by hand is three lines
+        # of PowerShell that have to be right, and getting them wrong fails as
+        # 'FileNotFoundError' from inside subprocess with no mention of a
+        # compiler.
+        Initialize-Environment
+        # Resolve-HostPython hands back the interpreter and the arguments it
+        # needs in front of a script ('py -3'), not a bare path.
+        $py = Resolve-HostPython
+        $script = Join-Path $PSScriptRoot '../apps/fallout/build.py'
+        & $py.Exe @($py.Prefix + @($script) + $Rest)
+        exit $LASTEXITCODE
     }
 
     'sync' {

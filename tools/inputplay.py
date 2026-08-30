@@ -86,18 +86,40 @@ class Guest:
         self.buttons = 0
 
     def _connect(self, port: int, what: str):
+        """A socket the guest is actually on the other end of.
+
+        QEMU's user-mode forwarding accepts the host's connection itself and
+        only then looks for a listener inside the guest.  So connect()
+        succeeding proves nothing: if the driver is not listening yet, the
+        first write is swallowed and the second gets a reset.  That is a
+        keyboard which appears to be attached and drops every key, and it is
+        worth the two extra packets here never to debug it again.
+
+        The probe is a packet of zeroes.  Both drivers check the type field
+        before doing anything with a packet, and zero is not a type either of
+        them has, so it is seen and discarded - it cannot press anything.
+        """
         deadline = time.monotonic() + self.wait_s
+        probe = bytes(8)
         while True:
+            s = None
             try:
                 s = socket.create_connection(("127.0.0.1", port), timeout=2)
                 s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                s.sendall(probe)
+                time.sleep(0.25)
+                s.sendall(probe)
                 print("inputplay: %s connected on %d" % (what, port))
                 return s
             except OSError:
+                if s is not None:
+                    s.close()
                 if time.monotonic() >= deadline:
                     raise SystemExit(
-                        "inputplay: nothing listening on %d after %.0f s; is "
-                        "%sVIRT.SYS installed in the guest?"
+                        "inputplay: nothing listening on %d after %.0f s. In "
+                        "the guest: `drv install a:\\%sVIRT.SYS`.  The driver "
+                        "opens its socket once the network has an address, so "
+                        "installing it before that waits for the lease."
                         % (port, self.wait_s, what.upper()))
                 time.sleep(0.5)
 
