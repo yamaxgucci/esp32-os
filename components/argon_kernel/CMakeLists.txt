@@ -61,6 +61,7 @@ set(ARGON_KERNEL_SRCS
     "src/net/mqtt.c"
     "src/net/modbus.c"
     "src/net/ota.c"
+    "src/net/can.c"
     "src/proc/proc.c"
     "src/proc/session.c"
     "src/proc/threads.c"

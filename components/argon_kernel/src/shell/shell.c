@@ -4490,6 +4490,9 @@ static const ag_command_t k_commands[] = {
 #if defined(CONFIG_ARGON_NET_OTA) && CONFIG_ARGON_NET_OTA
     {"ota", "[<url> [/reboot]]", "update firmware over the network", ag_cmd_ota},
 #endif
+#if defined(CONFIG_ARGON_CAN) && CONFIG_ARGON_CAN
+    {"can", "send|recv <tx> <rx> <kbps> …", "CAN (TWAI) bus", ag_cmd_can},
+#endif
     /* httpd is a loadable app now (HTTPD.AXE), not a built-in - run it by name. */
 #if defined(CONFIG_ARGON_NET_TELNET) && CONFIG_ARGON_NET_TELNET
     {"telnet", "[on [port]|off]", "the console over TCP :23", cmd_telnet},

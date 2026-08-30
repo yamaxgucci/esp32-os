@@ -141,6 +141,14 @@ if(CONFIG_ARGON_NET_OTA)
     target_link_libraries(${COMPONENT_LIB} PRIVATE ${appupd_lib})
 endif()
 
+# CAN (CONFIG_ARGON_CAN): the TWAI controller driver (can_hw.c).  Linked
+# conditionally so a build without CAN neither references it nor puts
+# driver/twai.h on the path.
+if(CONFIG_ARGON_CAN)
+    idf_component_get_property(twai_lib esp_driver_twai COMPONENT_LIB)
+    target_link_libraries(${COMPONENT_LIB} PRIVATE ${twai_lib})
+endif()
+
 if(ARGON_PORT_SRCS)
     target_compile_options(${COMPONENT_LIB} PRIVATE
         -Wall -Wextra -Werror=implicit-function-declaration

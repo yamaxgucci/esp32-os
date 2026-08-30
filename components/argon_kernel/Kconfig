@@ -404,6 +404,14 @@ menu "ArgonOS"
             the spare app slot and boot it.  Needs a two-app-slot partition
             table (see partitions.csv).  Off by default.
 
+    config ARGON_CAN
+        bool "CAN bus (TWAI controller)"
+        default n
+        help
+            The `can send`/`can recv` commands over the chip's TWAI (CAN)
+            controller.  Needs a CAN transceiver on the tx/rx pins and another
+            node on the bus.  Off by default.
+
     config ARGON_BOARD_PROBE
         bool "Board probe instead of the system"
         default n
