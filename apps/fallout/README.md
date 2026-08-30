@@ -325,10 +325,43 @@ The plausible savings, with what each costs to get:
   block for each of the 30240 entry paths, so a quarter of that memory is
   allocator headers. One block for all of them would recover it.
 
-About 800 KB in total, against a gap of 2500. It does not close, it is not
-close to closing, and every metre of it is paid for in patches against somebody
-else's engine. **A 16 MB module is the answer**; `argon test -Psram 16` is the
-same choice in QEMU.
+About 800 KB in total, against a gap of 2500. **A 16 MB module is the
+answer**; `argon test -Psram 16` is the same choice in QEMU.
+
+### Unless the read-only part moves to flash
+
+ArgonOS can put a file at an address instead of in memory: `ag_map` stages it
+into the `appfs` partition and maps it into the data window, where the cache
+that fetches instructions fetches it too. It costs no RAM at all. That is what
+`components/argon_kernel/src/fs/filemap.c` exists for, and it changes the
+arithmetic - for the one item big enough to matter.
+
+**The `.DAT` index, 1.7 MB.** 30240 entries of path, offset and size, built
+into the arena at every start by reading the archive - about 150000 small reads
+and ten seconds. For a given `MASTER.DAT` those bytes never change. Computed
+once on the host, written as a file and mapped, the binary search runs over
+flash and the arena never sees it. It would take the ten seconds off the start
+as well.
+
+With that, and the constants moved to flash by `mkaxe --rodata code`, and the
+sound cache at 64:
+
+| | |
+|---|---|
+| gap on an 8 MB board | 2470 KB |
+| `.DAT` index mapped from flash | −1700 |
+| `.rodata` with the code, in flash | −97 |
+| sound cache 256 → 64 | −192 |
+| opening movies skipped | −730 |
+| | **fits, with ~250 KB over** |
+
+Two honest caveats. That 250 KB is not a margin: every number above the line
+was measured **before a map was loaded**, and a game in progress needs more.
+And the last row does not work yet - see `ddraw.ini`.
+
+What it costs: a host tool to dump the index (`apps/fallout/tools` already
+parses it), a patch to `dbaseOpen` in a vendored engine, and room in `appfs`,
+which is 4032 KB and already holds 761 KB of XIP code.
 
 Each `.DAT` entry is a descriptor plus a separately allocated path, and the
 index is read entry by entry - about 150000 small reads for the two of them,
