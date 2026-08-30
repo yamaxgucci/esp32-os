@@ -412,9 +412,11 @@ still the filesystem - reads and seeks that do find something.
   in the VFS - remember what was not there, invalidate on create - would let
   the patch directories come back and would help every program that probes for
   a file.
-- **91 ms of reads and seeks per frame.** The read buffer is 4 KB; whether a
-  larger one pays depends on whether the cost is per call or per byte, and
-  that has not been measured.  `DISK.AXE` is the place for it.
+- **~100 ms of reads and seeks per frame**, and not by reading ahead further.
+  Sixteen kilobytes instead of four was tried: two and a half times fewer
+  calls, twice the time, 5.7 frames a second down to 3.3.  The cost is in the
+  bytes, not the call, so the lever is fetching *less* - which means the art
+  cache, now that the failed lookups no longer drown it.
 - **The art cache** is not the answer: 2 MB and 4 MB measure the same, and only
   1.45x better than 1 MB.  That was measured while the failed lookups still
   dominated, so it is worth measuring again now they are gone.

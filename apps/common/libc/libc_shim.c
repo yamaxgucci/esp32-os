@@ -557,9 +557,18 @@ int fflush(FILE *f)
 }
 
 /*
- * How much is read ahead.  Four kilobytes is eight FAT sectors and covers the
- * chunk sizes an engine actually asks for; larger would buy little and every
- * open file pays for it, and a game can hold a good many open at once.
+ * How much is read ahead.  Four kilobytes, and measured rather than assumed.
+ *
+ * Sixteen was tried on the guess that a read costs mostly the call.  It is the
+ * other way round: the calls fell by two and a half times and the time in the
+ * filesystem doubled, taking Fallout 2 from 5.7 frames a second to 3.3.  The
+ * cost is in the bytes, so reading ahead further only fetches what nobody asks
+ * for.  Four is enough to take the per-call overhead off the byte-at-a-time
+ * callers - fgets was one system call per character - without hauling a
+ * kilobyte nobody wanted.
+ *
+ * Every open file pays for it, which is why it is allocated on the first read
+ * small enough to want one and never for a caller streaming something bigger.
  */
 #define FILE_RBUF 4096
 
