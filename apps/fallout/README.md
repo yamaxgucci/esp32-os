@@ -210,6 +210,25 @@ The shim says which of the two happened at startup - "with a framebuffer"
 against a line naming both sizes - and `SDLTEST.AXE` prints `presenting surface
 is the panel`.
 
+**And a rebuild takes it away.** `C:` is littlefs in the firmware image, so
+building the firmware replaces it and the file is gone - and `argon test`
+builds the firmware before every run.  Change one line of the kernel and the
+next run is 608 KB poorer than the one before it, with nothing in the output
+saying so: the game prints `SDL: display 640x400` once among fifty lines of
+boot, and dies four screens later asking for a block of memory it would
+otherwise have had.
+
+So a measuring run after any source change is two runs.  The first puts the
+file back and costs half a minute:
+
+```
+argon test -Sd -SdImage build\fo2card.img -TimeoutSec 150 "copy a:\system.cfg c:\system.cfg" "type c:\system.cfg"
+```
+
+The second changes nothing, so nothing is rebuilt, so `C:` survives into it.
+`[mem]` right after `art_init` is the check that it worked: **343 KB with the
+panel, 951 KB without**.
+
 **Input.** ArgonOS reports a key as a USB HID usage id and an SDL scancode *is*
 a USB HID usage id, so the translation is nearly the identity. The mouse needs
 more care: the engine wants relative movement, MOUSEVIRT sends absolute
@@ -364,8 +383,9 @@ Which says the board this wants is one with an RGB panel, and that the CYD -
 
 ```
 [fps t=142414] 3.03 fps, 329483 us/frame: blit 78 (16 KB), flush 1 in 66 (8 KB),
-               engine 329339, io 211678 us (523 reads, 0 opens of which 0 found
-               nothing, 228 seeks, in the window)
+               engine 329339, io 211678 us (open 4102, seek 1210, read 206366)
+               (523 reads, 0 opens of which 0 found nothing, 228 seeks, in the
+               window)
 ```
 
 The blit is the game's picture converted through its palette, the flush is
@@ -374,6 +394,14 @@ filesystem's share is counted separately, because a frame waiting on a card is
 a different problem from a frame thinking.  Counts are totals over the window;
 times are per frame.  The guest's clock is in the line so the engine's own
 progress printing can be timed against it.
+
+The filesystem's share is split three ways, because those three have nothing in
+common to fix.  Time in `open` is the card being searched for a name and is
+what the VFS's negative cache is for; time in `seek` is the FAT being walked
+and is what fast seek was for; time in `read` is bytes, and the only lever on
+bytes is asking for fewer.  With one number there was no way to ask whether the
+lookups still cost anything after they were cached, which is what the split was
+added to answer.
 
 The first line it ever printed ended the search for a drawing problem: 3 ms of
 graphics in an 845 ms frame.  Nothing that follows would have been found by
@@ -407,25 +435,72 @@ the art cache measures 6.3, which is the same number and is the point of the
 next paragraph.  The remaining frame is 162 ms, of which 96 ms is still the
 filesystem - reads and seeks that do find something.
 
-### What is left to try
+### What the filesystem was asked for, and what the OS did about it
 
-- **The failed lookup should be cheap, not absent.** Emptying the patch
-  directories dodges the cost rather than removing it; a program that searches
-  two places for a file is doing something reasonable.  A negative-lookup cache
-  in the VFS - remember what was not there, invalidate on create - would let
-  the patch directories come back and would help every program that probes for
-  a file.
-- **~100 ms of reads and seeks per frame**, and not by reading ahead further.
-  Sixteen kilobytes instead of four was tried: two and a half times fewer
-  calls, twice the time, 5.7 frames a second down to 3.3.  The cost is in the
-  bytes, not the call, so the lever is fetching less.  What is being read 500
-  times a window with nothing moving on screen has not been established; the
-  next instrument is the name of the entry, taken somewhere safer than a printf
-  inside `fopen`.
-- **The art cache is not the answer**, and that is now settled rather than
-  suspected.  1 MB and 2 MB measure 6.2 and 6.3 frames a second with the failed
-  lookups gone; 2 MB and 4 MB measured the same as each other before.  It never
-  was the working set.
+Two things went into the OS rather than the game, because both are the
+filesystem being asked the wrong question rather than the game asking too
+often.
+
+**A lookup that finds nothing is remembered.**  On FAT it costs the same
+directory walk as one that finds something, and a program that searches a
+patch directory before an archive asks one for every sprite it draws.  The VFS
+keeps a table of names that were not there; an entry marked as a directory
+answers for everything below it, so one entry covers a whole missing tree - the
+reason the table is thirty-two entries and not thousands.  `mount` prints how
+many refusals came out of it.  See `components/argon_kernel/src/fs/vfs.c`; it
+helps any program that looks in more than one place, which is most DOS-era
+ones.
+
+It does nothing for the frame rate quoted above, and that is not a
+disappointment: `fallout2.cfg` empties the patch directories, so there are no
+failed lookups left in the shipping configuration to make cheap.  What it buys
+is that the workaround is no longer the only thing standing between the game
+and 56 directory walks a frame - and putting the directories back is now a
+question about memory rather than about speed.
+
+**Read-ahead is the size of the read, and ramps.**  A fixed four kilobytes
+throws three of them away when the caller takes a kilobyte out of the middle of
+an archive and seeks elsewhere, which is exactly what reading one entry looks
+like.  Each fill is now as big as the request and each fill that follows
+another without a seek between may double, so reading a file front to back
+still reaches four kilobytes in four fills.  `apps/common/libc/libc_shim.c`.
+
+**This one has not been measured in the game.**  It is right on the arithmetic
+and it passes the host tests, and that is all that can be said for it: every
+attempt to get a frame-rate number out of it ran into something else - a
+display setting that a rebuild had deleted, a main menu that swallows the
+keypress that starts a new game, and finally a run that reached the map and
+then drew nothing for thirteen minutes.  The last of those is unexplained and
+is the first thing to look at next.  The change is a commit of its own so that
+it can be taken back in one step.
+
+### What is left, and it is in the engine
+
+**The map's own tiles, read again every frame.**  Of the archive entries
+fetched while standing still, 83% are tiles: 197 distinct files
+and 3152 fetches, so each tile is read about sixteen times over a few seconds
+of standing still.  The engine has a cache for exactly this - `art_cache_size`,
+1 MB here - and it is not holding them.  Its own heap refuses blocks of 190 KB
+while that is going on, which is the shape of a cache being emptied by one
+large sprite and refilled by two hundred small ones.
+
+That is the next thing to look at, and unlike everything above it is inside
+somebody else's engine.
+
+- **Not by reading ahead further.** Sixteen kilobytes instead of four was
+  tried: two and a half times fewer calls, twice the time, 5.7 frames a second
+  down to 3.3.  The cost is in the bytes, not the call.
+- **Not the art cache's size.** 1 MB and 2 MB measure 6.2 and 6.3 frames a
+  second with the failed lookups gone; 2 MB and 4 MB measured the same as each
+  other before.  Whatever is wrong with it, it is not that it is small.
+
+One thing on the OS side has *not* been tried: the reads land wherever the
+archive entry is, so a fetch straddles sector boundaries at both ends and FatFs
+serves those two ends through its own 512-byte per-file cache rather than as
+part of the bulk transfer.  Rounding each fill down to a sector would make
+every transfer a whole number of sectors for at most 511 wasted bytes.  Whether
+that is worth anything depends on what a partial sector costs the SD layer,
+which has not been measured.
 
 ### QEMU is pessimistic in both directions
 
@@ -454,12 +529,41 @@ It needed 9910 KB when this started.  Four things took 2476 KB off it:
 | the `.DAT` index read from flash instead of built in memory | −1841 KB |
 | the panel set to 640×480, so the shim stops keeping its own copy of the frame | −608 KB |
 | the map's ambience streamed instead of decoded whole | −488 KB |
-| the music streaming ring, 24 buffers of 32 KB down to 8 | −512 KB |
+| the music streaming ring, 24 buffers of 32 KB down to 8 of 16 | −640 KB |
 
 Only two of those were work.  The panel was a line in a configuration file that
 was on the card and not on `C:`, and it had been costing 600 KB for the whole
 port.  The ring was nine seconds of audio held in advance, on a machine with
 six megabytes.
+
+### The ring came down twice, and the second time was not about audio
+
+Eight sections of 32 KB is 256 KB, and the whole of it is asked for as one
+block the moment a track starts.  The run that measured 6.2 frames a second
+ended by asking for it: standing on the Temple of Trials, the map's ambience
+changed, the arena had 499 KB free in no hole larger than 188 KB, and the
+engine does not survive being refused a track - it gives up and exits.
+
+Sixteen-kilobyte sections make it 128 KB, which is a hole the arena still has,
+and a second and a half of audio held in advance rather than three.
+
+The lesson is not about audio.  A quarter of a megabyte asked for *late*, on a
+heap that has been in use for five thousand kilobytes, is a coin toss; this one
+is a coin toss that ends the program.  `movie.cc` keeps a 200 KB copy of the
+last frame of a movie for the fade out of it, and is the same bug waiting.
+
+### The panel setting lives on `C:` and is worth 608 KB
+
+`SYSTEM.CFG` sets the framebuffer to 640×480 so that the shim can hand the
+engine the panel's own memory instead of keeping a copy of the frame.  It has
+to be on `C:` - internal flash - and littlefs reformats itself without asking
+whenever the partition does not mount.
+
+When that happens the game does not say so.  It says `SDL: display 640x400`,
+one line among fifty, and then dies four screens later asking for 256 KB it
+would otherwise have had.  An evening went into blaming a filesystem change for
+that.  `[mem]` after `art_init` tells them apart at a glance: 343 KB with the
+panel, 951 KB without.
 
 ### How it was measured
 
