@@ -157,12 +157,14 @@ not one `#ifdef ARGON`.  Everything that had to give way gave way on this side -
 `port/SDL.h` is the SDL2 subset the engine actually uses, `port/dirent.h`
 shadows the toolchain's so that `d_type` exists, and the rest is in `port/`.
 
-There are four patches now, all in `apps/fallout/patches/fallout2-ce/`, and not
+There are five patches now, all in `apps/fallout/patches/fallout2-ce/`, and not
 one of them is a portability fix.  Three are about a machine with six megabytes
 of arena - the `.DAT` index read from flash, a music buffer that held nine
-seconds in advance, and a map's ambience decoded whole into memory - and the
-fourth makes the engine say whether it found `ddraw.ini`.  Everything that
-*could* be done from outside still is.
+seconds in advance, and a map's ambience decoded whole into memory.  One is
+about a card rather than a disk: the archive was reopened for every file inside
+it.  The fifth makes the engine say whether it found `ddraw.ini`.  Everything
+that *could* be done from outside still is - the largest speed-up of all is a
+line in `fallout2.cfg`.
 
 ## What the shim does
 
@@ -355,6 +357,74 @@ sends only the union of what was blitted since the last one. So:
 
 Which says the board this wants is one with an RGB panel, and that the CYD -
 320×240 over SPI - is the wrong shape for it twice over.
+
+## What it spends its time on
+
+`-fps N` prints where a frame goes, every N milliseconds:
+
+```
+[fps t=142414] 3.03 fps, 329483 us/frame: blit 78 (16 KB), flush 1 in 66 (8 KB),
+               engine 329339, io 211678 us (523 reads, 0 opens of which 0 found
+               nothing, 228 seeks, in the window)
+```
+
+The blit is the game's picture converted through its palette, the flush is
+handing it to the display, and what is left is the engine - of which the
+filesystem's share is counted separately, because a frame waiting on a card is
+a different problem from a frame thinking.  Counts are totals over the window;
+times are per frame.  The guest's clock is in the line so the engine's own
+progress printing can be timed against it.
+
+The first line it ever printed ended the search for a drawing problem: 3 ms of
+graphics in an 845 ms frame.  Nothing that follows would have been found by
+looking at the renderer.
+
+### Loading a map: 225 seconds, then 15
+
+| | |
+|---|---|
+| `fread` with no buffer - `fgets` was one system call per character | −87% |
+| `CONFIG_FATFS_USE_FASTSEEK` - a seek walked the cluster chain from the start | |
+| the archive reopened for every entry inside it - dozens of opens a frame | −50% |
+
+The first is in `apps/common/libc`, the second in `sdkconfig.defaults`, the
+third in `apps/fallout/patches/fallout2-ce/0005-keep-the-archive-open.patch`.
+The first two help every program on the system, not this one.
+
+### Standing on a map: 835 ms a frame, then 158
+
+Ninety-nine per cent of the file opens in an in-game frame **found nothing**:
+56 per frame, 56 of them failures.  `master_patches` and `critter_patches`
+name a directory the engine searches before the archive so that a loose file
+can override one inside it; on a PC a lookup that fails is free, and on a FAT
+card it is a directory walk.  They are empty now - see `fallout2.cfg`, which
+says what that costs.
+
+That is 6.3 frames a second in QEMU, standing on the Temple of Trials, against
+0.03 when this started.  The remaining frame is 158 ms, of which 91 ms is
+still the filesystem - reads and seeks that do find something.
+
+### What is left to try
+
+- **The failed lookup should be cheap, not absent.** Emptying the patch
+  directories dodges the cost rather than removing it; a program that searches
+  two places for a file is doing something reasonable.  A negative-lookup cache
+  in the VFS - remember what was not there, invalidate on create - would let
+  the patch directories come back and would help every program that probes for
+  a file.
+- **91 ms of reads and seeks per frame.** The read buffer is 4 KB; whether a
+  larger one pays depends on whether the cost is per call or per byte, and
+  that has not been measured.  `DISK.AXE` is the place for it.
+- **The art cache** is not the answer: 2 MB and 4 MB measure the same, and only
+  1.45x better than 1 MB.  That was measured while the failed lookups still
+  dominated, so it is worth measuring again now they are gone.
+
+### QEMU is pessimistic in both directions
+
+It interprets Xtensa, so computation is slower than the chip; and its SD model
+reads about 2.7 MB/s where a real card in four-bit mode does eight or more.
+Both of the numbers above are floors for a board, not estimates of one, and
+nothing here has been measured on hardware.
 
 ## Where the memory goes
 
