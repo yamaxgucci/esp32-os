@@ -124,8 +124,22 @@ static void test_url(void)
     AG_CHECK_STR(u.user, "anonymous");
     AG_CHECK_STR(u.pass, "");
 
-    /* https is refused loudly rather than downgraded to port 80. */
-    AG_CHECK_INT(ag_url_parse("https://example.com/", &u), -AG_ENOTSUP);
+    /*
+     * https parses, and to 443 rather than to 80.
+     *
+     * It used to be refused here, and that assertion outlived the reason for
+     * it: the parser now accepts https unconditionally, because this file is
+     * also compiled into an .AXE where the build-time TLS flag is not visible.
+     * Refusal moved to where the flag *is* visible - the http client checks the
+     * scheme against AG_PORT_HAS_TLS, and request_once has no plain-socket path
+     * for it - so a build without TLS still refuses before anything can leak.
+     * What must never happen is the quiet downgrade to port 80, and that is
+     * what the port check below is guarding.
+     */
+    AG_CHECK_INT(ag_url_parse("https://example.com/", &u), AG_OK);
+    AG_CHECK_STR(u.scheme, "https");
+    AG_CHECK_INT(u.port, 443);
+
     AG_CHECK_INT(ag_url_parse("gopher://example.com/", &u), -AG_ENOTSUP);
     AG_CHECK_INT(ag_url_parse("http://[::1]/", &u), -AG_ENOTSUP);
 
