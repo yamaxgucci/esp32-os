@@ -25,12 +25,17 @@
  * path, and the engine's stdlib.h is the toolchain's. */
 extern "C" size_t ag_libc_arena_low(void);
 extern "C" void ag_libc_malloc_trace(int on);
+extern "C" void ag_libc_io_stats(uint64_t *us, uint32_t *reads,
+                                 uint32_t *opens, uint32_t *seeks);
+extern "C" void ag_libc_io_reset(void);
+extern "C" uint32_t ag_libc_io_misses(void);
 
 /* Declared where the port can see them; not part of SDL. */
 extern "C" bool sdl_shim_display(ag_gfxinfo_t *out);
 extern "C" void sdl_shim_screenshot(const char *path, int after_frames,
                                     int after_ms);
 extern "C" void sdl_shim_memstat(int every_ms);
+extern "C" void sdl_shim_fps(int every_ms);
 extern "C" void sdl_shim_screenshot_now(void);
 
 extern "C" {
@@ -253,6 +258,102 @@ void sdl_shim_memstat(int every_ms)
     /* Anyone watching the arena wants to know who asked for the block that did
      * not fit, and that is off unless asked for. */
     ag_libc_malloc_trace(every_ms > 0);
+}
+
+/*
+ * Where a frame goes.
+ *
+ * "It feels slow" is not a number and cannot be optimised.  These three are:
+ * the blit is the game's own picture converted through its palette, the flush
+ * is handing it to the display, and whatever is left is the engine thinking.
+ * Only one of the three is ours to make faster, and knowing which before
+ * touching anything is the whole point.
+ *
+ * The pixel counts go with them.  This port sends only the rectangle that
+ * changed, and how much that comes to per frame decides whether sending less
+ * is worth anything at all - in QEMU it is worse than useless, because the
+ * soft display takes a frame by ringing a doorbell and a partial kick has to
+ * wait for the one in flight.
+ *
+ * Off by default: timing every blit costs two clock reads per blit and the
+ * engine makes many small ones.
+ */
+static uint32_t s_fps_ms;
+static uint32_t s_fps_next;
+static uint32_t s_frames;
+static uint64_t s_blit_us;
+static uint64_t s_flush_us;
+static uint32_t s_flushes;
+static uint64_t s_flush_px;
+static uint64_t s_blit_px;
+static ag_time_t s_window_start_us;
+
+void sdl_shim_fps(int every_ms)
+{
+    s_fps_ms = (uint32_t)(every_ms > 0 ? every_ms : 0);
+    s_fps_next = 0;
+}
+
+static void fps_service(void)
+{
+    if (s_fps_ms == 0) {
+        return;
+    }
+    const uint32_t now = (uint32_t)ag_millis();
+    if (s_fps_next == 0) {
+        s_fps_next = now + s_fps_ms;
+        s_window_start_us = ag_micros();
+        return;
+    }
+    if (now < s_fps_next) {
+        return;
+    }
+
+    const uint64_t span_us = (uint64_t)(ag_micros() - s_window_start_us);
+    const uint32_t frames = s_frames;
+    if (frames > 0u && span_us > 0u) {
+        const uint64_t other_us =
+            (span_us > s_blit_us + s_flush_us) ? span_us - s_blit_us - s_flush_us
+                                               : 0u;
+        /* The guest's clock goes in the line: it is the only timestamp in the
+         * transcript that the engine's own printing can be measured against,
+         * and "how long did the map take" is a question about seconds. */
+        uint64_t io_us = 0;
+        uint32_t io_reads = 0, io_opens = 0, io_seeks = 0;
+        ag_libc_io_stats(&io_us, &io_reads, &io_opens, &io_seeks);
+        ag_printf("[fps t=%u] %u.%02u fps, %u us/frame: blit %u (%u KB), "
+                  "flush %u in %u (%u KB), engine %u, io %u us "
+                  "(%u reads, %u opens of which %u found nothing, %u seeks, "
+                  "in the window)\n",
+                  (unsigned)ag_millis(),
+                  (unsigned)((uint64_t)frames * 1000000u / span_us),
+                  (unsigned)(((uint64_t)frames * 100000000u / span_us) % 100u),
+                  (unsigned)(span_us / frames),
+                  (unsigned)(s_blit_us / frames),
+                  (unsigned)(s_blit_px * 2u / 1024u / frames),
+                  (unsigned)(s_flushes / frames),
+                  (unsigned)(s_flush_us / frames),
+                  (unsigned)(s_flush_px * 2u / 1024u / frames),
+                  (unsigned)(other_us / frames),
+                  (unsigned)(io_us / frames),
+                  /* Totals over the window, not per frame: a few reads across
+                   * ninety frames divide down to zero and read as "no I/O at
+                   * all" next to an I/O time that says otherwise. */
+                  (unsigned)io_reads,
+                  (unsigned)io_opens,
+                  (unsigned)ag_libc_io_misses(),
+                  (unsigned)io_seeks);
+    }
+
+    s_frames = 0;
+    s_blit_us = 0;
+    s_flush_us = 0;
+    s_flushes = 0;
+    s_flush_px = 0;
+    s_blit_px = 0;
+    ag_libc_io_reset();
+    s_window_start_us = ag_micros();
+    s_fps_next = now + s_fps_ms;
 }
 
 /*
@@ -599,6 +700,8 @@ int SDL_UpperBlit(SDL_Surface *src, const SDL_Rect *srcrect, SDL_Surface *dst,
         return 0;
     }
 
+    const ag_time_t blit_t0 = (s_fps_ms != 0u) ? ag_micros() : 0;
+
     for (int y = 0; y < h; ++y) {
         const Uint8 *s =
             (const Uint8 *)src->pixels + (size_t)(sy + y) * src->pitch + sx;
@@ -607,6 +710,11 @@ int SDL_UpperBlit(SDL_Surface *src, const SDL_Rect *srcrect, SDL_Surface *dst,
         for (int x = 0; x < w; ++x) {
             d[x] = lut[s[x]];
         }
+    }
+
+    if (s_fps_ms != 0u) {
+        s_blit_us += (uint64_t)(ag_micros() - blit_t0);
+        s_blit_px += (uint64_t)w * (uint64_t)h;
     }
 
     /* Remember what changed, so that the present after it can send that and
@@ -884,9 +992,16 @@ void SDL_RenderPresent(SDL_Renderer *r)
          * the engine presents on a timer as well as after a change, and a
          * still screen should cost nothing. */
         if (s_dirty_x1 > s_dirty_x0 && s_dirty_y1 > s_dirty_y0) {
+            const int fw = s_dirty_x1 - s_dirty_x0;
+            const int fh = s_dirty_y1 - s_dirty_y0;
+            const ag_time_t t0 = (s_fps_ms != 0u) ? ag_micros() : 0;
             ag_gfx_flush((uint16_t)s_dirty_x0, (uint16_t)s_dirty_y0,
-                         (uint16_t)(s_dirty_x1 - s_dirty_x0),
-                         (uint16_t)(s_dirty_y1 - s_dirty_y0));
+                         (uint16_t)fw, (uint16_t)fh);
+            if (s_fps_ms != 0u) {
+                s_flush_us += (uint64_t)(ag_micros() - t0);
+                s_flush_px += (uint64_t)fw * (uint64_t)fh;
+                s_flushes++;
+            }
             dirty_none();
         }
     } else if (s_frame_px != NULL && AG_HAS(g_ag_api->gfx, present)) {
@@ -909,6 +1024,8 @@ void SDL_RenderPresent(SDL_Renderer *r)
      * the game passes through every frame and nowhere else. */
     timers_service();
     memstat_service();
+    ++s_frames;
+    fps_service();
     /* And the input drivers, which pump their sockets only when read.  A movie
      * runs for minutes without the engine asking for a single event, and a
      * driver unread for that long has lost its connection. */

@@ -414,7 +414,12 @@ switch ($Command.ToLowerInvariant()) {
         # after being right on every earlier one.
         $wasOut = [Console]::OutputEncoding
         [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
-        & cmd /c "build-host\vtdump.exe 80 25 $codepage < build\qemu-boot.log"
+        # The log this run was told to write, not the default one.  Printing
+        # build\qemu-boot.log whatever -LogPath said shows the screen of some
+        # earlier run - confidently, and with nothing to say it has done so.
+        $screen = 'build\qemu-boot.log'
+        if ($opts.ContainsKey('logpath')) { $screen = $opts['logpath'] }
+        & cmd /c "build-host\vtdump.exe 80 25 $codepage < ""$screen"""
         [Console]::OutputEncoding = $wasOut
         exit $bootStatus
     }

@@ -74,6 +74,7 @@ int main(int argc, char **argv);
 extern "C" void sdl_shim_screenshot(const char *path, int after_frames,
                                     int after_ms);
 extern "C" void sdl_shim_memstat(int every_ms);
+extern "C" void sdl_shim_fps(int every_ms);
 extern "C" void sdl_shim_screenshot_now(void);
 
 static bool same(const char *a, const char *b)
@@ -107,6 +108,7 @@ static int to_int(const char *s)
  *   -frames N      after this many presents
  *   -shotms N      or after this many milliseconds, whichever comes first
  *   -memstat N     print arena use, and the peak so far, every N ms
+ *   -fps N         print the frame rate and where a frame goes, every N ms
  *
  * Prefer -shotms.  Counting frames means knowing how many the game draws
  * before it reaches whatever you wanted to look at, and the two opening movies
@@ -124,6 +126,7 @@ extern "C" int ag_cxx_main(int argc, char **argv)
     int frames = 0;
     int shot_ms = 0;
     int memstat_ms = 0;
+    int fps_ms = 0;
     int out = 0;
 
     for (int i = 0; i < argc; ++i) {
@@ -135,6 +138,8 @@ extern "C" int ag_cxx_main(int argc, char **argv)
             shot_ms = to_int(argv[++i]);
         } else if (same(argv[i], "-memstat") && i + 1 < argc) {
             memstat_ms = to_int(argv[++i]);
+        } else if (same(argv[i], "-fps") && i + 1 < argc) {
+            fps_ms = to_int(argv[++i]);
         } else {
             argv[out++] = argv[i];
         }
@@ -148,6 +153,7 @@ extern "C" int ag_cxx_main(int argc, char **argv)
         sdl_shim_screenshot(shot, frames, shot_ms);
     }
     sdl_shim_memstat(memstat_ms);
+    sdl_shim_fps(fps_ms);
 
     const int rc = main(out, argv);
 

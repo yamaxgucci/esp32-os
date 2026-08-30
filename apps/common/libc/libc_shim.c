@@ -556,6 +556,114 @@ int fflush(FILE *f)
     return 0;
 }
 
+/*
+ * How much is read ahead.  Four kilobytes is eight FAT sectors and covers the
+ * chunk sizes an engine actually asks for; larger would buy little and every
+ * open file pays for it, and a game can hold a good many open at once.
+ */
+#define FILE_RBUF 4096
+
+/*
+ * What the filesystem costs, kept because "the engine is slow" is not a
+ * finding.  A frame that spends its time in ag_read is a frame waiting on a
+ * card and a FAT driver, which is ours to make faster; a frame that spends it
+ * anywhere else is the program thinking, which is not.  Two clock reads per
+ * call, and buffering has already made the calls rare.
+ */
+static uint64_t s_io_us;
+static uint32_t s_io_reads;
+static uint32_t s_io_opens;
+static uint32_t s_io_seeks;
+
+/*
+ * Opens that found nothing, counted separately.
+ *
+ * A program that looks for a file in three places before the one it is in
+ * pays for two directory walks every time, and on FAT a directory walk is not
+ * cheap.  Nothing about that shows up as slow code or as bytes read, so it is
+ * invisible unless it is counted.
+ */
+static uint32_t s_io_misses;
+
+
+uint32_t ag_libc_io_misses(void)
+{
+    return s_io_misses;
+}
+
+void ag_libc_io_stats(uint64_t *us, uint32_t *reads, uint32_t *opens,
+                      uint32_t *seeks)
+{
+    if (us != NULL) {
+        *us = s_io_us;
+    }
+    if (reads != NULL) {
+        *reads = s_io_reads;
+    }
+    if (opens != NULL) {
+        *opens = s_io_opens;
+    }
+    if (seeks != NULL) {
+        *seeks = s_io_seeks;
+    }
+}
+
+void ag_libc_io_reset(void)
+{
+    s_io_us = 0;
+    s_io_reads = 0;
+    s_io_opens = 0;
+    s_io_seeks = 0;
+    s_io_misses = 0;
+}
+
+static int32_t timed_read(ag_handle_t h, void *buf, size_t len)
+{
+    const ag_time_t t0 = ag_micros();
+    const int32_t   n = ag_read(h, buf, len);
+    s_io_us += (uint64_t)(ag_micros() - t0);
+    s_io_reads++;
+    return n;
+}
+
+/*
+ * Give back what has been read ahead and not consumed.
+ *
+ * The kernel's position is past the end of the buffer, so anything that moves
+ * or uses the position directly - a seek, a write, a tell - has to put it back
+ * where the caller thinks it is first.
+ */
+static void read_drop(FILE *f)
+{
+    const int unread = f->rlen - f->rpos;
+    if (unread > 0) {
+        (void)ag_seek((ag_handle_t)f->h, -(int64_t)unread, AG_SEEK_CUR);
+    }
+    f->rlen = 0;
+    f->rpos = 0;
+}
+
+/* Fill the buffer from the current kernel position.  Returns bytes available,
+ * 0 at end of file, -1 on error. */
+static int read_fill(FILE *f)
+{
+    if (f->rbuf == NULL) {
+        f->rbuf = (unsigned char *)malloc(FILE_RBUF);
+        if (f->rbuf == NULL) {
+            return -1; /* no buffer: the caller reads unbuffered instead */
+        }
+        f->rcap = FILE_RBUF;
+    }
+    const int32_t n = timed_read((ag_handle_t)f->h, f->rbuf, (size_t)f->rcap);
+    if (n < 0) {
+        f->err = 1;
+        return -1;
+    }
+    f->rlen = (int)n;
+    f->rpos = 0;
+    return (int)n;
+}
+
 FILE *fopen(const char *path, const char *mode)
 {
     uint32_t flags = AG_O_RDONLY;
@@ -571,8 +679,12 @@ FILE *fopen(const char *path, const char *mode)
         flags = AG_O_RDWR;
     }
     {
+        const ag_time_t open_t0 = ag_micros();
         ag_handle_t h = ag_open(path, flags);
+        s_io_us += (uint64_t)(ag_micros() - open_t0);
+        s_io_opens++;
         if (h < 0) {
+            s_io_misses++;
             errno = ENOENT;
             return NULL;
         }
@@ -585,6 +697,10 @@ FILE *fopen(const char *path, const char *mode)
         f->h = (int)h;
         f->eof = 0;
         f->err = 0;
+        f->rbuf = NULL;
+        f->rcap = 0;
+        f->rlen = 0;
+        f->rpos = 0;
         return f;
     }
 }
@@ -594,6 +710,10 @@ int fclose(FILE *f)
     if (f == NULL || f->h < 0) {
         return 0;
     }
+    if (f->rbuf != NULL) {
+        free(f->rbuf);
+        f->rbuf = NULL;
+    }
     ag_close((ag_handle_t)f->h);
     free(f);
     return 0;
@@ -601,23 +721,85 @@ int fclose(FILE *f)
 
 size_t fread(void *ptr, size_t size, size_t nmemb, FILE *f)
 {
-    size_t  want, got = 0;
-    int32_t n;
+    size_t   want, got = 0;
+    uint8_t *out = (uint8_t *)ptr;
+
     if (f == NULL || ptr == NULL || size == 0) {
         return 0;
     }
     want = size * nmemb;
+
+    /* The console is not a file and has nothing to read ahead from. */
+    if (f->h < 0) {
+        while (got < want) {
+            const int32_t n = timed_read((ag_handle_t)f->h, out + got, want - got);
+            if (n < 0) {
+                f->err = 1;
+                break;
+            }
+            if (n == 0) {
+                f->eof = 1;
+                break;
+            }
+            got += (size_t)n;
+        }
+        return got / size;
+    }
+
+    /* Whatever is already in hand, first. */
+    {
+        const size_t have = (size_t)(f->rlen - f->rpos);
+        const size_t take = (have < want) ? have : want;
+        if (take > 0) {
+            memcpy(out, f->rbuf + f->rpos, take);
+            f->rpos += (int)take;
+            got += take;
+        }
+    }
+
     while (got < want) {
-        n = ag_read((ag_handle_t)f->h, (uint8_t *)ptr + got, want - got);
-        if (n < 0) {
-            f->err = 1;
-            break;
+        const size_t left = want - got;
+        /* A request the buffer could not hold goes straight to the kernel: no
+         * point copying a megabyte twice to save a call. */
+        if (left >= (size_t)FILE_RBUF) {
+            const int32_t n = timed_read((ag_handle_t)f->h, out + got, left);
+            if (n < 0) {
+                f->err = 1;
+                break;
+            }
+            if (n == 0) {
+                f->eof = 1;
+                break;
+            }
+            got += (size_t)n;
+            continue;
         }
-        if (n == 0) {
-            f->eof = 1;
-            break;
+        {
+            const int n = read_fill(f);
+            if (n < 0) {
+                /* Out of memory for a buffer, or a read error.  Fall back to
+                 * reading straight through rather than failing. */
+                const int32_t d = timed_read((ag_handle_t)f->h, out + got, left);
+                if (d <= 0) {
+                    if (d == 0) {
+                        f->eof = 1;
+                    }
+                    break;
+                }
+                got += (size_t)d;
+                continue;
+            }
+            if (n == 0) {
+                f->eof = 1;
+                break;
+            }
+            {
+                const size_t take = ((size_t)n < left) ? (size_t)n : left;
+                memcpy(out + got, f->rbuf, take);
+                f->rpos = (int)take;
+                got += take;
+            }
         }
-        got += (size_t)n;
     }
     return size ? got / size : 0;
 }
@@ -628,6 +810,10 @@ size_t fwrite(const void *ptr, size_t size, size_t nmemb, FILE *f)
     int32_t n;
     if (f == NULL || ptr == NULL || size == 0) {
         return 0;
+    }
+    if (f->h >= 0 && f->rlen > f->rpos) {
+        /* The kernel is ahead of where the caller thinks it is. */
+        read_drop(f);
     }
     want = size * nmemb;
     while (got < want) {
@@ -655,8 +841,16 @@ int fseek(FILE *f, long off, int whence)
     } else if (whence == SEEK_END) {
         ag_wh = AG_SEEK_END;
     }
-    if (ag_seek((ag_handle_t)f->h, off, ag_wh) < 0) {
-        return -1;
+    /* SEEK_CUR is relative to where the *caller* is, not to the kernel. */
+    read_drop(f);
+    {
+        const ag_time_t t0 = ag_micros();
+        const int64_t   r = ag_seek((ag_handle_t)f->h, off, ag_wh);
+        s_io_us += (uint64_t)(ag_micros() - t0);
+        s_io_seeks++;
+        if (r < 0) {
+            return -1;
+        }
     }
     f->eof = 0;
     return 0;
@@ -669,7 +863,11 @@ long ftell(FILE *f)
         return -1;
     }
     p = ag_seek((ag_handle_t)f->h, 0, AG_SEEK_CUR);
-    return (long)p;
+    if (p < 0) {
+        return -1;
+    }
+    /* Less whatever was read ahead and not yet handed out. */
+    return (long)(p - (int64_t)(f->rlen - f->rpos));
 }
 
 /*
@@ -682,6 +880,8 @@ long ftell(FILE *f)
 void rewind(FILE *f)
 {
     if (f != NULL && f->h >= 0) {
+        f->rlen = 0;
+        f->rpos = 0;
         ag_seek((ag_handle_t)f->h, 0, AG_SEEK_SET);
         f->eof = 0;
     }
@@ -997,6 +1197,14 @@ int ungetc(int c, FILE *f)
     if (f == NULL || f->h < 0 || c == EOF) {
         return EOF;
     }
+    /* Usually the byte is still in the buffer, and stepping back over it is
+     * both exact and free. */
+    if (f->rpos > 0) {
+        f->rpos--;
+        f->eof = 0;
+        return c;
+    }
+    read_drop(f);
     if (ag_seek((ag_handle_t)f->h, -1, AG_SEEK_CUR) < 0) {
         return EOF;
     }

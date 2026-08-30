@@ -161,12 +161,29 @@ $nextFlush = [datetime]::MinValue
 # into that byte.  WriteAllText's UTF-8 would encode anything above 0x7f as two
 # bytes, which was invisible while the guest only ever said ASCII and turned
 # every Cyrillic character into mojibake the moment it did not.
+#
+# One handle, opened for sharing, rather than WriteAllText each time.  The
+# transcript is now rewritten once a second and something is usually watching
+# it; WriteAllText opens the file exclusively, so a reader that happened to
+# have it open killed the run - which is a poor way to be told that somebody
+# was reading the log.
+$script:logStream = $null
+
 function Write-Transcript {
-    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $LogPath) |
-        Out-Null
-    [System.IO.File]::WriteAllText((Join-Path (Get-Location) $LogPath),
-                                   $text.ToString(),
-                                   [System.Text.Encoding]::GetEncoding(28591))
+    if ($null -eq $script:logStream) {
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $LogPath) |
+            Out-Null
+        $script:logStream = New-Object System.IO.FileStream(
+            (Join-Path (Get-Location) $LogPath),
+            [System.IO.FileMode]::Create,
+            [System.IO.FileAccess]::Write,
+            [System.IO.FileShare]::ReadWrite)
+    }
+    $bytes = [System.Text.Encoding]::GetEncoding(28591).GetBytes($text.ToString())
+    $script:logStream.Position = 0
+    $script:logStream.Write($bytes, 0, $bytes.Length)
+    $script:logStream.SetLength($bytes.Length)
+    $script:logStream.Flush()
 }
 
 # Emptied before the run, not only written after it.  Until the guest says
@@ -499,6 +516,10 @@ try {
     # Written here, not after the try: a run that failed is the run whose
     # transcript is worth having, and a throw would have skipped it.
     Write-Transcript
+    if ($null -ne $script:logStream) {
+        $script:logStream.Dispose()
+        $script:logStream = $null
+    }
 }
 
 if ($found) {

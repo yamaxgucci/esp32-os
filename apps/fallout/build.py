@@ -30,6 +30,7 @@ without needing the shim to be complete enough to link.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import subprocess
 import sys
@@ -146,40 +147,57 @@ def fetch(no_fetch: bool) -> None:
 
 
 def patch() -> None:
-    """Apply our changes to the cloned engine, if they are not applied already.
+    """Apply our changes to the cloned engine, once each.
 
     third_party/ is a clone and is in .gitignore, so an edit made there is
     invisible to this repository and lost the moment anyone deletes it and
     fetches again.  The changes live here as patches instead, applied on every
     build and skipped when the tree already has them.
 
-    A patch that no longer applies stops the build with the name of the file it
-    could not reach, which is the point: the engine is somebody else's and it
-    moves, and a change of ours that has silently stopped taking effect is
-    worse than one that fails loudly.
+    What "already has them" means is written down rather than guessed at.  The
+    first version of this asked git whether each patch would apply in reverse,
+    which is the usual trick and is wrong as soon as two patches touch the same
+    lines: applying the second changes the context the first would need to be
+    un-applied, and the build then decides the first was never applied and
+    refuses to go on.  So the names and hashes of what has been applied go in a
+    file beside the clone, which is exactly as durable as the clone is.
+
+    A patch that is not on the list and does not apply stops the build with the
+    file it could not reach, which is the point: the engine is somebody else's
+    and it moves, and a change of ours that has silently stopped taking effect
+    is worse than one that fails loudly.
     """
     root = os.path.join(ROOT, "apps", "fallout", "patches", GAME["engine"])
     if not os.path.isdir(root):
         return
     tree = tp(GAME["engine"])
+    stamp = os.path.join(tree, ".argon-patches")
+
+    applied = set()
+    if os.path.isfile(stamp):
+        with open(stamp, "r", encoding="utf-8") as f:
+            applied = {line.strip() for line in f if line.strip()}
+
     for name in sorted(os.listdir(root)):
         if not name.endswith(".patch"):
             continue
         full = os.path.join(root, name)
-        applied = subprocess.call(
-            ["git", "apply", "--reverse", "--check", full],
-            cwd=tree, stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL) == 0
-        if applied:
+        with open(full, "rb") as f:
+            mark = "%s %s" % (hashlib.sha1(f.read()).hexdigest()[:12], name)
+        if mark in applied:
             continue
         if subprocess.call(["git", "apply", "--check", full], cwd=tree,
                            stdout=subprocess.DEVNULL,
                            stderr=subprocess.DEVNULL) != 0:
             raise SystemExit(
-                "fallout: %s neither applies to %s nor is already applied - "
-                "the engine has moved under it" % (rel(full), GAME["engine"]))
+                "fallout: %s does not apply to %s.  Either the engine has "
+                "moved under it, or the clone has been patched by hand - "
+                "delete %s and build again to start clean."
+                % (rel(full), GAME["engine"], rel(tree)))
         print("patching %s with %s" % (GAME["engine"], name))
         subprocess.check_call(["git", "apply", full], cwd=tree)
+        with open(stamp, "a", encoding="utf-8") as f:
+            f.write(mark + "\n")
 
 
 def engine_sources() -> list[str]:
