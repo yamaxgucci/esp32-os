@@ -12,5 +12,6 @@
 int ag_cmd_net(int argc, char **argv);
 int ag_cmd_wget(int argc, char **argv);
 int ag_cmd_ftp(int argc, char **argv);
+int ag_cmd_mqtt(int argc, char **argv);
 
 #endif /* ARGON_CMD_NET_H */

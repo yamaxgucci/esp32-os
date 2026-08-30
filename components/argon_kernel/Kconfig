@@ -377,6 +377,15 @@ menu "ArgonOS"
             encrypted, with a standard `ssh` client.  Being built in milestones;
             off by default while it is incomplete.  `ssh on` opens the listener.
 
+    config ARGON_NET_MQTT
+        bool "MQTT client (publish/subscribe)"
+        depends on ARGON_ENABLE_NET
+        default n
+        help
+            A small MQTT 3.1.1 client from scratch over the socket layer: the
+            `mqtt pub` and `mqtt sub` commands.  mqtts (MQTT over TLS) works
+            when CONFIG_ARGON_NET_TLS is also on.  Off by default.
+
     config ARGON_BOARD_PROBE
         bool "Board probe instead of the system"
         default n

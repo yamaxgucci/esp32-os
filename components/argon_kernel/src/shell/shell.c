@@ -4479,6 +4479,10 @@ static const ag_command_t k_commands[] = {
     {"wget", "<url> [file]", "fetch a file over http or ftp",
      ag_cmd_wget},
     {"ftp", "<host> [user] [pass]", "file transfer session", ag_cmd_ftp},
+#if defined(CONFIG_ARGON_NET_MQTT) && CONFIG_ARGON_NET_MQTT
+    {"mqtt", "pub|sub <host> <topic> [msg] [/tls]", "MQTT publish/subscribe",
+     ag_cmd_mqtt},
+#endif
     /* httpd is a loadable app now (HTTPD.AXE), not a built-in - run it by name. */
 #if defined(CONFIG_ARGON_NET_TELNET) && CONFIG_ARGON_NET_TELNET
     {"telnet", "[on [port]|off]", "the console over TCP :23", cmd_telnet},
