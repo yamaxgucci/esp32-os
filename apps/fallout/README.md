@@ -400,9 +400,12 @@ can override one inside it; on a PC a lookup that fails is free, and on a FAT
 card it is a directory walk.  They are empty now - see `fallout2.cfg`, which
 says what that costs.
 
-That is 6.3 frames a second in QEMU, standing on the Temple of Trials, against
-0.03 when this started.  The remaining frame is 158 ms, of which 91 ms is
-still the filesystem - reads and seeks that do find something.
+That is **6.2 frames a second** in QEMU, standing on the Temple of Trials,
+against 0.03 when this started - measured in the configuration that would ship:
+`-Psram 8`, a 6100 KB arena and a 1 MB art cache.  Sixteen megabytes with twice
+the art cache measures 6.3, which is the same number and is the point of the
+next paragraph.  The remaining frame is 162 ms, of which 96 ms is still the
+filesystem - reads and seeks that do find something.
 
 ### What is left to try
 
@@ -415,11 +418,14 @@ still the filesystem - reads and seeks that do find something.
 - **~100 ms of reads and seeks per frame**, and not by reading ahead further.
   Sixteen kilobytes instead of four was tried: two and a half times fewer
   calls, twice the time, 5.7 frames a second down to 3.3.  The cost is in the
-  bytes, not the call, so the lever is fetching *less* - which means the art
-  cache, now that the failed lookups no longer drown it.
-- **The art cache** is not the answer: 2 MB and 4 MB measure the same, and only
-  1.45x better than 1 MB.  That was measured while the failed lookups still
-  dominated, so it is worth measuring again now they are gone.
+  bytes, not the call, so the lever is fetching less.  What is being read 500
+  times a window with nothing moving on screen has not been established; the
+  next instrument is the name of the entry, taken somewhere safer than a printf
+  inside `fopen`.
+- **The art cache is not the answer**, and that is now settled rather than
+  suspected.  1 MB and 2 MB measure 6.2 and 6.3 frames a second with the failed
+  lookups gone; 2 MB and 4 MB measured the same as each other before.  It never
+  was the working set.
 
 ### QEMU is pessimistic in both directions
 
