@@ -585,6 +585,15 @@ static uint32_t s_io_opens;
 static uint32_t s_io_seeks;
 
 /*
+ * And split by which of the three it was.  One number for the filesystem says
+ * a frame is waiting on the card; it does not say whether it is waiting to be
+ * told where a file is, to be moved inside one, or for bytes - and those three
+ * have nothing in common to fix.
+ */
+static uint64_t s_open_us;
+static uint64_t s_seek_us;
+
+/*
  * Opens that found nothing, counted separately.
  *
  * A program that looks for a file in three places before the one it is in
@@ -601,10 +610,16 @@ uint32_t ag_libc_io_misses(void)
 }
 
 void ag_libc_io_stats(uint64_t *us, uint32_t *reads, uint32_t *opens,
-                      uint32_t *seeks)
+                      uint32_t *seeks, uint64_t *open_us, uint64_t *seek_us)
 {
     if (us != NULL) {
         *us = s_io_us;
+    }
+    if (open_us != NULL) {
+        *open_us = s_open_us;
+    }
+    if (seek_us != NULL) {
+        *seek_us = s_seek_us;
     }
     if (reads != NULL) {
         *reads = s_io_reads;
@@ -624,6 +639,8 @@ void ag_libc_io_reset(void)
     s_io_opens = 0;
     s_io_seeks = 0;
     s_io_misses = 0;
+    s_open_us = 0;
+    s_seek_us = 0;
 }
 
 static int32_t timed_read(ag_handle_t h, void *buf, size_t len)
@@ -690,7 +707,9 @@ FILE *fopen(const char *path, const char *mode)
     {
         const ag_time_t open_t0 = ag_micros();
         ag_handle_t h = ag_open(path, flags);
-        s_io_us += (uint64_t)(ag_micros() - open_t0);
+        const uint64_t open_dt = (uint64_t)(ag_micros() - open_t0);
+        s_io_us += open_dt;
+        s_open_us += open_dt;
         s_io_opens++;
         if (h < 0) {
             s_io_misses++;
@@ -855,7 +874,9 @@ int fseek(FILE *f, long off, int whence)
     {
         const ag_time_t t0 = ag_micros();
         const int64_t   r = ag_seek((ag_handle_t)f->h, off, ag_wh);
-        s_io_us += (uint64_t)(ag_micros() - t0);
+        const uint64_t seek_dt = (uint64_t)(ag_micros() - t0);
+        s_io_us += seek_dt;
+        s_seek_us += seek_dt;
         s_io_seeks++;
         if (r < 0) {
             return -1;

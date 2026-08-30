@@ -26,7 +26,8 @@
 extern "C" size_t ag_libc_arena_low(void);
 extern "C" void ag_libc_malloc_trace(int on);
 extern "C" void ag_libc_io_stats(uint64_t *us, uint32_t *reads,
-                                 uint32_t *opens, uint32_t *seeks);
+                                 uint32_t *opens, uint32_t *seeks,
+                                 uint64_t *open_us, uint64_t *seek_us);
 extern "C" void ag_libc_io_reset(void);
 extern "C" uint32_t ag_libc_io_misses(void);
 
@@ -318,11 +319,13 @@ static void fps_service(void)
         /* The guest's clock goes in the line: it is the only timestamp in the
          * transcript that the engine's own printing can be measured against,
          * and "how long did the map take" is a question about seconds. */
-        uint64_t io_us = 0;
+        uint64_t io_us = 0, open_us = 0, seek_us = 0;
         uint32_t io_reads = 0, io_opens = 0, io_seeks = 0;
-        ag_libc_io_stats(&io_us, &io_reads, &io_opens, &io_seeks);
+        ag_libc_io_stats(&io_us, &io_reads, &io_opens, &io_seeks, &open_us,
+                         &seek_us);
         ag_printf("[fps t=%u] %u.%02u fps, %u us/frame: blit %u (%u KB), "
                   "flush %u in %u (%u KB), engine %u, io %u us "
+                  "(open %u, seek %u, read %u) "
                   "(%u reads, %u opens of which %u found nothing, %u seeks, "
                   "in the window)\n",
                   (unsigned)ag_millis(),
@@ -336,6 +339,9 @@ static void fps_service(void)
                   (unsigned)(s_flush_px * 2u / 1024u / frames),
                   (unsigned)(other_us / frames),
                   (unsigned)(io_us / frames),
+                  (unsigned)(open_us / frames),
+                  (unsigned)(seek_us / frames),
+                  (unsigned)((io_us - open_us - seek_us) / frames),
                   /* Totals over the window, not per frame: a few reads across
                    * ninety frames divide down to zero and read as "no I/O at
                    * all" next to an I/O time that says otherwise. */
