@@ -24,7 +24,8 @@
 /* apps/common/libc's watcher; its header is not on this build's include
  * path, and the engine's stdlib.h is the toolchain's. */
 extern "C" size_t ag_libc_arena_low(void);
-extern "C" void ag_libc_malloc_trace(int on);
+extern "C" void ag_libc_malloc_trace(size_t min_bytes,
+                                    int max_reports);
 extern "C" void ag_libc_io_stats(uint64_t *us, uint32_t *reads,
                                  uint32_t *opens, uint32_t *seeks,
                                  uint64_t *open_us, uint64_t *seek_us);
@@ -60,7 +61,8 @@ extern "C" unsigned ag_tiledist_gaveup = 0;
 extern "C" bool sdl_shim_display(ag_gfxinfo_t *out);
 extern "C" void sdl_shim_screenshot(const char *path, int after_frames,
                                     int after_ms);
-extern "C" void sdl_shim_memstat(int every_ms);
+extern "C" void sdl_shim_memstat(int every_ms, int trace_kb,
+                                 int trace_max);
 extern "C" void sdl_shim_fps(int every_ms);
 extern "C" void sdl_shim_screenshot_now(void);
 
@@ -277,13 +279,21 @@ static size_t s_arena_low = (size_t)-1;
 
 static void write_ppm(const char *path);
 
-void sdl_shim_memstat(int every_ms)
+static size_t s_trace_min;
+static int    s_trace_max;
+
+void sdl_shim_memstat(int every_ms, int trace_kb, int trace_max)
 {
     s_memstat_ms = (uint32_t)(every_ms > 0 ? every_ms : 0);
     s_memstat_next = 0;
     /* Anyone watching the arena wants to know who asked for the block that did
-     * not fit, and that is off unless asked for. */
-    ag_libc_malloc_trace(every_ms > 0);
+     * not fit, and that is off unless asked for.  Half a megabyte is too
+     * coarse for the question and every allocation is far too many; 32 KB and
+     * sixty-four reports name the ones that decide whether a map fits. */
+    s_trace_min = (size_t)(trace_kb > 0 ? trace_kb : 32) * 1024u;
+    s_trace_max = trace_max > 0 ? trace_max : 64;
+    ag_libc_malloc_trace(every_ms > 0 ? s_trace_min : 0,
+                         every_ms > 0 ? s_trace_max : 0);
 }
 
 /*
@@ -440,6 +450,12 @@ static void memstat_service(void)
         return;
     }
     s_memstat_next = now + s_memstat_ms;
+    /* The report budget is per window rather than per run.  A fixed budget is
+     * spent entirely on startup - the engine asks for six megabytes before it
+     * draws a frame - and the window that matters is always a later one.
+     * Resetting here means "up to N names between two [mem] lines", which is
+     * what a walk across a map wants. */
+    ag_libc_malloc_trace(s_trace_min, s_trace_max);
     /*
      * Two peaks, because they answer different questions.  The first is what
      * the game holds between frames - what it costs to sit somewhere.  The

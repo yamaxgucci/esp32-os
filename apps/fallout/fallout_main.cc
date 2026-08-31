@@ -73,7 +73,8 @@ int main(int argc, char **argv);
 /* In port/sdl_shim.cc.  Not SDL: an automated run has no eyes. */
 extern "C" void sdl_shim_screenshot(const char *path, int after_frames,
                                     int after_ms);
-extern "C" void sdl_shim_memstat(int every_ms);
+extern "C" void sdl_shim_memstat(int every_ms, int trace_kb,
+                                 int trace_max);
 extern "C" void sdl_shim_fps(int every_ms);
 extern "C" void sdl_shim_screenshot_now(void);
 
@@ -108,6 +109,8 @@ static int to_int(const char *s)
  *   -frames N      after this many presents
  *   -shotms N      or after this many milliseconds, whichever comes first
  *   -memstat N     print arena use, and the peak so far, every N ms
+ *   -mallocs KB N  with -memstat, name the first N allocations of KB
+ *                  or more (default 32 and 64)
  *   -fps N         print the frame rate and where a frame goes, every N ms
  *   -autostart     start a new game at once, premade character, no movie
  *
@@ -137,6 +140,8 @@ extern "C" int ag_cxx_main(int argc, char **argv)
     int frames = 0;
     int shot_ms = 0;
     int memstat_ms = 0;
+    int trace_kb = 0;
+    int trace_max = 0;
     int fps_ms = 0;
     int out = 0;
 
@@ -149,6 +154,9 @@ extern "C" int ag_cxx_main(int argc, char **argv)
             shot_ms = to_int(argv[++i]);
         } else if (same(argv[i], "-memstat") && i + 1 < argc) {
             memstat_ms = to_int(argv[++i]);
+        } else if (same(argv[i], "-mallocs") && i + 2 < argc) {
+            trace_kb = to_int(argv[++i]);
+            trace_max = to_int(argv[++i]);
         } else if (same(argv[i], "-fps") && i + 1 < argc) {
             fps_ms = to_int(argv[++i]);
         } else if (same(argv[i], "-autostart")) {
@@ -165,7 +173,7 @@ extern "C" int ag_cxx_main(int argc, char **argv)
         }
         sdl_shim_screenshot(shot, frames, shot_ms);
     }
-    sdl_shim_memstat(memstat_ms);
+    sdl_shim_memstat(memstat_ms, trace_kb, trace_max);
     sdl_shim_fps(fps_ms);
 
     const int rc = main(out, argv);

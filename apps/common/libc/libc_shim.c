@@ -71,33 +71,41 @@ size_t ag_libc_arena_low(void)
  * Off unless asked for: a program that allocates a megabyte on purpose should
  * not have to explain itself on the console every time it runs.
  */
-#define ARENA_REPORT_MIN (32u * 1024u)
-#define ARENA_REPORT_MAX 64
+static int    s_big_reported;
+static size_t s_big_min;
+static int    s_big_max;
 
-static int s_big_reported;
-static int s_big_trace;
-
-void ag_libc_malloc_trace(int on)
+/*
+ * Both the threshold and the cap are arguments rather than constants, because
+ * the block that will not fit is not always a big one.  The allocation that
+ * ended Fallout 2 on an 8 MB part was thirty-two kilobytes, and finding what
+ * had taken the other six megabytes meant watching every allocation an eighth
+ * that size - hundreds of them, not sixty-four.
+ */
+void ag_libc_malloc_trace(size_t min_bytes, int max_reports)
 {
-    s_big_trace = on ? 1 : 0;
+    s_big_min = min_bytes;
+    s_big_max = max_reports;
+    s_big_reported = 0;
 }
 
-static void report_big(size_t n, void *ret, void *ret2, void *ret3,
-                       void *p)
+static void report_big(size_t n, void *r0, void *r1, void *r2, void *r3,
+                       void *r4, void *p)
 {
-    if (!s_big_trace || n < ARENA_REPORT_MIN ||
-        s_big_reported >= ARENA_REPORT_MAX) {
+    if (s_big_min == 0 || n < s_big_min || s_big_reported >= s_big_max) {
         return;
     }
     s_big_reported++;
     /*
-     * Two return addresses, because one is not enough: a vendored
-     * engine calls its own internal_malloc, so the immediate caller is
-     * always the same wrapper and says nothing.  The frame above it is
-     * the code that wanted the memory.
+     * Five return addresses, because fewer are not enough.  A vendored engine
+     * reaches malloc through layers of its own: Fallout 2 goes
+     * caller -> internal_malloc -> the allocator registered with its memory
+     * manager -> a block wrapper -> malloc, so three frames name nothing but
+     * that plumbing.  Five reach the code that wanted the memory, and the
+     * ones below it say which layer it came through.
      */
-    ag_printf("malloc: %u bytes from %p %p %p%s\n", (unsigned)n, ret,
-              ret2, ret3, (p == NULL) ? " FAILED" : "");
+    ag_printf("malloc: %u bytes from %p %p %p %p %p%s\n", (unsigned)n,
+              r0, r1, r2, r3, r4, (p == NULL) ? " FAILED" : "");
 }
 
 void *malloc(size_t n)
@@ -107,7 +115,8 @@ void *malloc(size_t n)
     }
     void *p = ag_malloc(n);
     report_big(n, __builtin_return_address(0), __builtin_return_address(1),
-               __builtin_return_address(2), p);
+               __builtin_return_address(2), __builtin_return_address(3),
+               __builtin_return_address(4), p);
     if (p != NULL && n >= ARENA_WATCH_MIN) {
         ag_meminfo_t mi;
         ag_meminfo(&mi);
