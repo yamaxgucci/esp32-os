@@ -13,7 +13,9 @@ Trials. The opening movies play at 640×480 with no frames dropped when they are
 not skipped - 2502 of `intro.mve`.
 
 **In 8 MB of PSRAM**, with 606 KB to spare, measured rather than argued: see
-**Where the memory goes**.
+**Where the memory goes**.  Standing on the map it holds **27 frames a second**
+in QEMU, median of 210 three-second windows; it was 6.2 before two things that
+had nothing to do with drawing - see **What it spends its time on**.
 
 Input works: the port opens `/dev/kbd0` and `/dev/mouse0` and reads them every
 frame, `tools/inputplay.py` presses keys with nobody at the desk, and
@@ -403,9 +405,50 @@ bytes is asking for fewer.  With one number there was no way to ask whether the
 lookups still cost anything after they were cached, which is what the split was
 added to answer.
 
-The first line it ever printed ended the search for a drawing problem: 3 ms of
-graphics in an 845 ms frame.  Nothing that follows would have been found by
+A second line follows it with what the engine's own caches are doing:
+
+```
+[art t=451567] 0 read, 0 evicted, 0 flushed, largest 307303;
+               hexdist 42 calls, 1008 steps, 0 gave up
+```
+
+Read, evicted and flushed are the art cache, and they are three different bugs
+with three different fixes - a cache that is too small, an eviction policy that
+throws out more than it needs, and a whole cache emptied because one entry
+would not fit.  `hexdist` is the tile-distance walk: calls, tiles stepped, and
+walks that hit their bound.
+
+The first `-fps` line ever printed ended the search for a drawing problem: 3 ms
+of graphics in an 845 ms frame.  Nothing that follows would have been found by
 looking at the renderer.
+
+### Getting to a map, and finding out where it stopped
+
+**`-autostart`** starts a new game with the premade character, no main menu, no
+opening movie.  Everything about what the game costs while standing on a map
+has to reach a map first, and reaching one by sending keystrokes cost five
+minutes of movie per run and a menu that ignores the key for New Game while it
+is fading in - three runs of twenty minutes each never got there.  With it, a
+run reaches the map in about a minute of guest time.
+
+**A stall line.**  The engine asks for input in every loop it has, so a line
+printed from there says it is going round without drawing; silence says it is
+inside a call that has not returned.  Which of the two it was is what decided
+where to look next.
+
+**A debugger.**  `ARGON_QEMU_EXTRA=-s` puts a gdb stub on port 1234, and
+`build.py` keeps the intermediate ELF beside the `.AXE` so an address can be
+turned into a function name:
+
+```bash
+xtensa-esp-elf-gdb -ex 'file build/argonos.elf' -ex 'add-symbol-file build/apps/FALLOUT2.elf -s .image 0x428c0000 -s .dimage 0x3c0e5d50'
+```
+
+The two addresses are in the loader's own line in the boot log.  gdb's own
+register layout does not match this QEMU's, which is a nuisance and not a
+blocker: the stub speaks a simple enough protocol that forty samples of the
+program counter are twenty lines of Python, and `addr2line` does the rest.  A
+day of guessing at a hang ended in ten minutes that way.
 
 ### Loading a map: 225 seconds, then 15
 
@@ -432,8 +475,48 @@ That is **6.2 frames a second** in QEMU, standing on the Temple of Trials,
 against 0.03 when this started - measured in the configuration that would ship:
 `-Psram 8`, a 6100 KB arena and a 1 MB art cache.  Sixteen megabytes with twice
 the art cache measures 6.3, which is the same number and is the point of the
-next paragraph.  The remaining frame is 162 ms, of which 96 ms is still the
-filesystem - reads and seeks that do find something.
+next paragraph.  The remaining frame is 162 ms, of which 96 ms is the
+filesystem and 66 ms is the engine doing something nobody had looked at.
+
+### Standing on a map: 162 ms a frame, then 40
+
+Two more things, and neither of them was where anybody would have looked.
+
+**The distance between two tiles was atan2 in software doubles, once per tile
+stepped.**  Fallout asks how far one thing is from another constantly, and its
+answer walks the hex grid one tile at a time, deciding at each step which of
+six directions to take - with atan2, on doubles, on a chip that has neither.
+A distance of thirty tiles was thirty trips through `__ieee754_atan2` and
+friends.  With a debugger attached to the emulator, forty samples of the
+program counter out of forty landed inside that chain: it was the whole of the
+66 ms.  A table of tan(k degrees) and one 64-bit comparison per probe give the
+same integer - see
+`patches/fallout2-ce/0008-a-hex-distance-without-atan2.patch`, which also
+explains why "the same" is safe.  The walk had no bound either, and an
+unreachable target hung the machine; that is a bound now.
+
+**The mute audio device did not take a second to play a second.**
+`/dev/pcmnull` accepted whatever it was given at once and reported room for
+ever, so the mixer ran as fast as the processor allowed and the game streamed
+its music off the card six times faster than it played it: 1500 KB every three
+seconds to produce 264 KB of sound, and 18-24 ms of every frame.  That is what
+"it reads the card constantly while nothing moves" turned out to be.  The sink
+keeps a clock now, in `components/argon_kernel/src/dev/audio.c`.
+
+Standing still on the Temple of Trials, `-Psram 8`, over 210 three-second
+windows - ten minutes of guest time, one long run rather than a chosen sample:
+
+|                          | before | after |
+|--------------------------|--------|-------|
+| frame, median            | 162 ms | **37 ms** |
+| frames a second, median  | 6.2    | **27.0** (mean 26.1, max 30.6) |
+| windows under 10 fps     | all    | 1 of 210 |
+| filesystem, per frame    | 96 ms  | 0.6-8.8 ms |
+| read per three seconds   | 1500 KB | 60-500 KB |
+| the engine, minus the filesystem | 66 ms | 10-22 ms |
+
+Of the 37 ms, **24 is the display flush**, which has never been near the top
+before.
 
 ### What the filesystem was asked for, and what the OS did about it
 
@@ -466,33 +549,35 @@ another without a seek between may double, so reading a file front to back
 still reaches four kilobytes in four fills.  `apps/common/libc/libc_shim.c`.
 
 **This one has not been measured in the game.**  It is right on the arithmetic
-and it passes the host tests, and that is all that can be said for it: every
-attempt to get a frame-rate number out of it ran into something else - a
-display setting that a rebuild had deleted, a main menu that swallows the
-keypress that starts a new game, and finally a run that reached the map and
-then drew nothing for thirteen minutes.  The last of those is unexplained and
-is the first thing to look at next.  The change is a commit of its own so that
-it can be taken back in one step.
+and it passes the host tests, and that is all that can be said for it: the
+three runs that were meant to measure it each ran into something else, and by
+the time those were fixed the frame had changed shape enough that a comparison
+against the old number would not have meant anything.  The change is a commit
+of its own so that it can be taken back in one step.
 
-### What is left, and it is in the engine
+### What is left
 
-**The map's own tiles, read again every frame.**  Of the archive entries
-fetched while standing still, 83% are tiles: 197 distinct files
-and 3152 fetches, so each tile is read about sixteen times over a few seconds
-of standing still.  The engine has a cache for exactly this - `art_cache_size`,
-1 MB here - and it is not holding them.  Its own heap refuses blocks of 190 KB
-while that is going on, which is the shape of a cache being emptied by one
-large sprite and refilled by two hundred small ones.
+**The display flush, 24 ms of a 40 ms frame - and it is waiting, not working.**
+`ag_port_panel_present` kicks QEMU's RGB device and, when the new rectangle
+does not cover the one still in flight, waits for it.  That wait is the 24 ms:
+the game now produces frames faster than the display takes them.  Which is a
+good place to have arrived - the blit is 1.4 ms, the filesystem is under 9, and
+what is left is the panel's own rate.
 
-That is the next thing to look at, and unlike everything above it is inside
-somebody else's engine.
+**The art cache still churns, but it no longer empties.**  Standing still, one
+window in three fetches 20-80 entries and evicts 40-130; the other two fetch
+nothing.  No whole-cache flushes at all now.  The largest single entry is
+307 KB in a 1 MB cache, which is why one arrival can cost eighty evictions.
 
 - **Not by reading ahead further.** Sixteen kilobytes instead of four was
   tried: two and a half times fewer calls, twice the time, 5.7 frames a second
   down to 3.3.  The cost is in the bytes, not the call.
-- **Not the art cache's size.** 1 MB and 2 MB measure 6.2 and 6.3 frames a
-  second with the failed lookups gone; 2 MB and 4 MB measured the same as each
-  other before.  Whatever is wrong with it, it is not that it is small.
+- **Not the art cache's size.** 1 MB and 2 MB measured 6.2 and 6.3 frames a
+  second before any of this; 2 MB and 4 MB measured the same as each other.
+  Worth measuring again now that the frame has a different shape, but it has
+  never yet been the answer.
+- **Not the hex distance any more**: about 40 calls and 960 steps in a three
+  second window, and no walk has yet hit its bound.
 
 One thing on the OS side has *not* been tried: the reads land wherever the
 archive entry is, so a fetch straddles sector boundaries at both ends and FatFs
