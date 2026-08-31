@@ -127,7 +127,33 @@ Ruled out, with the reason:
   `mapLoad`; do not try a third time without first finding out *what* is still
   locked.
 
-## What is not known about the 837 KB
+## The 837 KB is most likely not transient at all
+
+Entering the Temple of Trials is not a map change.  In Fallout 2 the temple is
+one map, `ARTEMPLE.MAP`, with more than one elevation, and going inside changes
+elevation - the log carries one `OVERRIDE_MAP_START` for the whole run and never
+names a second map.  The failing allocation is 32 KB for `water1.ACM`, a sound
+of the level being entered.
+
+Which means the 837 KB is not a spike to be smoothed out.  The new elevation's
+objects, tiles and sounds are brought in and the previous elevation's are *not*
+released, because it is the same map and the player can walk back up.  It is the
+map's resident footprint growing as its levels are visited.
+
+Two things follow.  Freeing before loading has nothing to free, which is why
+flushing the art cache did nothing.  And the only lever is the baseline: every
+kilobyte taken out of bss or out of a cache is a kilobyte the second elevation
+can have.  The order of work below does not change; the expectation of what
+finishes the job does - 320 KB may not be enough, and how much is needed will
+only be known once a second elevation has actually been stood on.
+
+The cheap way to find out, and it is one run: sfall's `StartingMap` is read in
+`main.cc` right where `_main_load_new` is called, so putting the temple's inner
+level in `ddraw.ini` under `[Misc] StartingMap=` and starting with `-autostart`
+lands on it directly.  `[mem]` then gives its resident cost with nothing else
+resident, and the difference from 5542 KB is the real answer.
+
+## What else is not known about it
 
 It is inferred, not measured: standing still peaks at 5542 KB and the failure
 comes at about 6067 KB used, so a map change wants roughly that much more. What
