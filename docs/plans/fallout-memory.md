@@ -649,3 +649,25 @@ addresses because Fallout 2's own layers eat three.  What is missing is a way to
 reach a second map without a mouse - `StartingMap` starts on one but cannot
 change to one.  The cheap way is another debug key beside `KEY_F11`, calling
 `mapLoadByName` the way `_main_load_new` does.
+
+## A visual check, and one thing it turned up
+
+Patches 0016, 0018 and 0019 touch the engine's allocator, its lighting array and
+its object allocation, which is the sort of change that can leave a game running
+at the right frame rate and drawing the wrong thing.  So: `-shot h:\map.ppm
+-shotms 470000` with `-HostFs` pointing at a host folder writes the frame
+straight out of the guest.
+
+Arroyo village came out correct - full colour, correct lighting, the interface
+bar, the critters, the messages about passing the Temple of Trials.  82% of
+sampled pixels carry a colour cast, which is what a palette-mapped scene should
+look like.
+
+**A movie frame did not.**  An earlier shot at 330 s caught `intro.mve` playing
+and it was pure greyscale, with the letterboxing of a 640x320 movie in a 640x480
+window.  Greyscale is exactly the palette `directDrawInit` sets when it creates
+the surface - `colors[i] = {i, i, i}` - so the movie's own palette is not
+reaching the panel.  Nothing to do with today's patches; the map proves the
+palette machinery works, so this is the movie path specifically.  Worth a look in
+`movieBufferedImpl`/`movieDirectImpl` and whatever the port does with
+`MVE_setPalette`.
