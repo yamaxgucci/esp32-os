@@ -725,31 +725,54 @@ And the arena cannot be made bigger.  8007 KB of extended memory is free with
 the card mounted and the image's data takes 1812, but the arena has to be one
 block: 6150 is refused, and so are 6220 and 6360.  All three were tried.
 
+**And it does not take two megabytes.**  The setting is whole megabytes, which
+is far too coarse a dial here, so patch 0012 reads it in kilobytes above 16.
+1400 KB measures exactly like 2048 - nothing read, nothing evicted, nothing
+flushed - and costs 354 KB of arena rather than 1056.  That is the shipping
+value now.  The knee is somewhere between 1024 and 1400 and has not been
+narrowed further, because 1400 already leaves margin and each measurement is a
+ten-minute run.
+
 So the whole budget, on an 8 MB part:
 
 | | KB |
 |---|---|
 | image data, almost all bss | 1812 |
-| arena, standing still, 1 MB cache | 5254 |
+| arena, standing still, 1400 KB cache and the smaller ring | 5542 |
 | a map change, on top of that | 837 |
-| a second megabyte of art cache | 1024 |
-| **wanted** | **8927** |
+| **wanted** | **8191** |
 | the part has | 8007 |
-| **short by** | **920** |
+| **short by** | **184** |
 
-Where 920 KB could come from, largest first.  None of it is done:
+Which is a different problem from the 920 KB it looked like.  Measured in the
+configuration that ships: `-Psram 8`, arena 6100, cache 1400 KB, music ring
+4x16 KB - 27 frames a second, 558 KB of arena free at the high-water mark, and
+nothing read or evicted by the art cache once the map is up.  Where it can come
+from, largest first:
 
-| KB | |
-|---|---|
-| 320 | `gTileIntensity` is `int[3][40000]` in bss - three map levels of 200×200 hexes. Almost every map has one level. Allocating the levels a map actually has moves 480 KB of bss into 160 KB of arena. The type cannot be narrowed: the values are added and subtracted and pass 65536 before being clamped on read |
-| 128 | four 32 KB zlib windows, one per open archive stream. Patch 0005 keeps the archive open; how many streams are live at once has not been looked at |
-| 80 | `_square_data`, the same three-levels-for-one trick |
-| 64 | the music streaming ring, 128 KB down to 64 - a second and a half of audio in advance is already thin, so this one costs something |
+| KB | done | |
+|---|---|---|
+| 320 | no | `gTileIntensity` is `int[3][40000]` in bss - three map levels of 200×200 hexes. Almost every map has one level. Allocating the rows a map actually touches moves 480 KB of bss into 160 KB of arena. Narrowing the type is the other half of the same 320 and can be had as well: the values are added and subtracted and pass 65536 before being clamped on read, so they do not fit `uint16` as they are - but stored shifted down two bits they do, and two bits of a lighting value that ends up as one of sixty-four palette shades is not visible. Three lights overlapping one hex would then saturate |
+| 128 | no | four 32 KB zlib windows, one per open archive stream. Patch 0005 keeps the archive open; how many streams are live at once has not been looked at |
+| 80 | no | `_square_data`, the same three-levels-for-one trick |
+| 64 | **yes** | the music streaming ring, four sections of 16 KB rather than eight |
 
-That is 592 KB of the 920.  The rest would have to come out of the three
-640×480 8-bit buffers the engine keeps (900 KB between them), and the one that
-looked dead is not: `_screen_buffer` is guarded by a flag `gameInitWithOptions`
-passes as zero, so it was never allocated in the first place.
+The first line alone covers it.  What will not help: the three 640×480 8-bit
+buffers (900 KB between them) are the interface window's, the splash screen's -
+freed after startup - and a scratch buffer in `_GNW_win_refresh` that patch 0011
+does away with. And `_screen_buffer`, which looked dead and *is* dead, was
+never allocated: the flag `gameInitWithOptions` passes is zero.
+
+### The framebuffer is free here and will not be on a board
+
+The panel's 640×480 RGB565 buffer is 600 KB, and it does not come out of the
+8007 KB above: `esp_lcd_rgb_qemu` hands over memory the emulated device owns.
+On a real panel that buffer is PSRAM, so every figure here is 600 KB optimistic
+for hardware - which would put a map change 850 KB out of reach rather than
+250.  Halving the panel to 320×240 would give 450 KB of it back and is what the
+CYD would need anyway; the engine would keep drawing 640×480 into its own
+8-bit surface and the port's blit would take every second pixel.  Nothing about
+this has been measured on hardware.
 
 ### What is left in the arena
 

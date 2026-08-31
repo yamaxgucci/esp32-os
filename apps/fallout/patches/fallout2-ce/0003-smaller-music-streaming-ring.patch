@@ -1,13 +1,13 @@
 diff --git a/src/game_sound.cc b/src/game_sound.cc
-index 7ed4833..ae57f57 100644
+index 7ed4833..d772e41 100644
 --- a/src/game_sound.cc
 +++ b/src/game_sound.cc
-@@ -225,7 +225,26 @@ int gameSoundInit()
+@@ -225,7 +225,28 @@ int gameSoundInit()
      soundSetMemoryProcs(internal_malloc, internal_realloc, internal_free);
  
      // initialize direct sound
 -    if (soundInit(_detectDevices, 24, 0x8000, 0x8000, 22050) != 0) {
-+    // ARGON: 8 sections of 16 KB rather than 24 of 32.
++    // ARGON: four sections of 16 KB rather than twenty-four of 32.
 +    //
 +    // This is the streaming ring for background music, and the whole of it is
 +    // asked for as one block the moment a track starts.  The stock 24 x 32 KB
@@ -23,10 +23,12 @@ index 7ed4833..ae57f57 100644
 +    // asked for late, on a heap that has been in use for five thousand
 +    // kilobytes, is a coin toss - and this one ends the program.
 +    //
-+    // 128 KB is a hole the arena still has.  It is a second and a half of
-+    // audio held in advance instead of three, which is more than a mixer
-+    // refilled every frame needs.
-+    if (soundInit(_detectDevices, 8, 0x8000, 0x4000, 22050) != 0) {
++    // Four sections of 16 KB is 64 KB: three quarters of a second of audio
++    // held in advance rather than nine, and every kilobyte of the difference is
++    // a kilobyte the art cache can have instead.  A mixer refilled every frame,
++    // and a frame of forty milliseconds, does not need more.  It is thin while
++    // a map is loading - but nine seconds was thin there too.
++    if (soundInit(_detectDevices, 4, 0x8000, 0x4000, 22050) != 0) {
          if (gGameSoundDebugEnabled) {
              debugPrint("failed!\n");
          }
