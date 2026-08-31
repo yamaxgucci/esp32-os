@@ -109,6 +109,19 @@ static void report_big(size_t n, void *r0, void *r1, void *r2, void *r3,
 }
 
 /*
+ * The live-bytes profiler below is 768 KB of bss, which is 768 KB the arena
+ * cannot have: Fallout 2 asks for a 6100 KB arena and an 8 MB part has no room
+ * for both.  So it compiles to nothing unless the build asks for it -
+ * ARGON_LIBC_MALLOC_PROFILE=1, or -DAG_LIBC_MALLOC_PROFILE=1 by hand - and the
+ * two entry points stay, doing nothing, so callers need no guard of their own.
+ */
+#ifndef AG_LIBC_MALLOC_PROFILE
+#define AG_LIBC_MALLOC_PROFILE 0
+#endif
+
+#if AG_LIBC_MALLOC_PROFILE
+
+/*
  * What is still held, by call site.
  *
  * Naming the big allocations is enough when one of them is the problem.  It is
@@ -298,6 +311,32 @@ void ag_libc_malloc_profile_dump(int top)
                   s_sites[best].site);
     }
 }
+
+#else /* AG_LIBC_MALLOC_PROFILE */
+
+void ag_libc_malloc_profile(int on)
+{
+    (void)on;
+}
+
+void ag_libc_malloc_profile_dump(int top)
+{
+    (void)top;
+}
+
+static void prof_alloc(void *p, size_t n, void *site)
+{
+    (void)p;
+    (void)n;
+    (void)site;
+}
+
+static void prof_free(void *p)
+{
+    (void)p;
+}
+
+#endif /* AG_LIBC_MALLOC_PROFILE */
 
 void *malloc(size_t n)
 {

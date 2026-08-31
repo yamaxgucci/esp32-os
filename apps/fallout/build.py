@@ -132,7 +132,7 @@ RODATA_ARGS: list = []
 # 837 KB more, and 6091 does not fit in 6100 once the heap has any holes in it.
 # The only way out is to use less, not to ask for more; the list is in the
 # README under "What it would take to have room".
-ARENA_KB = 10000  # EXPERIMENT: 16 MB run only, revert to 6100
+ARENA_KB = 6100
 
 # Files that only exist for a platform this is not.
 SKIP = (
@@ -253,6 +253,13 @@ def compile_one(src: str, obj: str) -> subprocess.CompletedProcess:
         # The C flags are a subset; the C++-only ones would be rejected.
         cmd = [driver, "-c", "-Os", "-ffunction-sections", "-fdata-sections",
                "-fno-builtin", "-mlongcalls", "-w"]
+    # The libc shim's live-bytes profiler, off by default: its tables are 768 KB
+    # of bss, and on an 8 MB part that is 768 KB the 6100 KB arena cannot have -
+    # the app does not load at all.  Right for a diagnostic run, wrong for an
+    # image.  Set ARGON_LIBC_MALLOC_PROFILE=1 to get it.  After the branch
+    # above, which builds its own list and would drop anything added before it.
+    if os.environ.get("ARGON_LIBC_MALLOC_PROFILE") == "1":
+        cmd += ["-DAG_LIBC_MALLOC_PROFILE=1"]
     # fpattern refuses to compile until it is told which family of operating
     # system it is on, and there are only two.  DOS is the right answer twice
     # over: ArgonOS separates paths with a backslash and compares names without

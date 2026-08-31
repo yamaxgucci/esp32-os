@@ -105,6 +105,125 @@ not about playing comfortably.
 Watch the dirty rectangle: `dirty_add` is in panel coordinates, so halve it
 there rather than in two places.
 
+## The bounded script cache: it works, and it is not enough
+
+Patch 0014, `-scripts N`.  `scriptExecProc` loads a script's `Program` the first
+time that script runs, under `SCRIPT_FLAG_0x01`, and nothing unloads it while
+the map is up.  Everything that has to survive is in the `Script` struct, so a
+program can be dropped and reloaded: clear the flag and the next call loads it
+again, calls `scriptLocateProcs` to find the procedures, and runs the program's
+initialisation before the procedure it was asked for.
+
+The seam needed one addition.  `programFree` alone is not enough for a program
+that has run, because `runProgram` put it on `gInterpreterProgramListHead` and
+`_updatePrograms` walks that list every frame; `programListNodeFree` is static,
+so there was no way to undo it.  Patch 0014 adds `programDiscard`.  The trim
+itself runs from `mainLoop`, after `mapHandleTransition`, which is the one place
+per frame where no script is executing, and it skips any program that is
+waiting, stopped, in a critical section, already exited, or has a parent or
+child.
+
+Measured on Broken Hills, 16 MB and a 10000 KB arena so nothing fails:
+
+| | plateau | peak |
+|---|---|---|
+| no cap | 7680 KB | 8131 |
+| `-scripts 40` | **6802 KB** | 8131 |
+
+**878 KB back at the plateau, and nothing off the peak** - because the peak
+happens during the map load, before the count ever reaches the cap, and the
+trim only runs once a frame from the main loop.
+
+The caveat, stated rather than hidden: a Fallout script's file-scope variables
+live in the `Program`, so evicting one resets them.  Persistent state is meant
+to use `local_var`/`global_var` and every program is dropped on a map change in
+any case, so nothing can rely on them across visits - but something may rely on
+them within one.  That is why the default is 0, meaning no cap.
+
+## And Broken Hills still does not load on 8 MB
+
+The test that matters: arena 6100, `-Psram 8`, `-scripts 24`, and the art cache
+turned down.  Both attempts die the same way, during the map load, before the
+map's own script has printed anything:
+
+| art cache | free when it failed | what asked |
+|---|---|---|
+| 800 KB | 30 KB | 32768 bytes |
+| 600 KB | **8 KB** | 32768 bytes |
+
+Two things follow, and the second is the useful one.
+
+**The failing block is a zlib inflate window.**  32768 bytes, `zcalloc` <-
+`updatewindow` <- `inflate` <- `dfileReadCompressed`, one per compressed `.DAT`
+entry being read.  It is the straw, not the load: any 60 KB found elsewhere
+would let it through.
+
+**Turning the art cache down makes things worse.**  200 KB smaller left 22 KB
+*less* free at the moment of failure.  That is the `system:` fallback in
+`heap.cc:912` earning its keep: what will not fit in the cache goes to the arena
+in scattered blocks, so shrinking the cache does not shrink the demand, it just
+moves it somewhere with more overhead.  Together with the earlier run at 3000
+KB, which cost exactly its own extra size, **the art cache is not a lever in
+either direction.**  Leave it at 1400 and stop measuring it.
+
+## What is left, in the order it should be tried
+
+The load-time peak is now the whole problem: ~6100 KB against an arena of 6100,
+with the map's objects (1026 KB) and the fixed startup cost (about 4000 KB)
+inside it.
+
+1. **Enforce the script cap at load time, not once a frame.**  The trim recovers
+   878 KB and recovers it too late.  Calling it from `scriptExecProc` before a
+   new program is loaded would hold the line through the load, and needs a way
+   to know which programs are on the call stack - a depth counter around
+   `_executeProcedure` would do it.
+2. **The two unidentified single blocks, 310 KB and 200 KB.**  Both live from
+   startup to exit on every map.  The 310 KB one is 307216 bytes, which is
+   640x480 plus the engine's header; the trace is
+   `... <- gameInitWithOptions+0x256 <- falloutMain <- main`, and +0x256 is
+   `_initWindow(1, a4)` - so it is something inside `windowManagerInit` or the
+   video init proc, inlined.  It is **not** `_screen_buffer`: that needs
+   `a3 & 1` and `main.cc:274` passes `a4 = 0`.
+   **Build with `-g` before guessing again.**  addr2line without it named the
+   same address two different things on two runs, and the link map is no better
+   because it lists no static functions - it answered `mapLoadSaved+0x255` for
+   the frame that is certainly `memoryBlockMallocImpl`.
+3. **Objects, about 280 KB.**  7102 of them, allocated one at a time, so 113 KB
+   is the engine's 16-byte block header; a pool removes all of it.  Another
+   ~170 KB is in fields that do not need to be `int` (`rotation`, `frame`,
+   `elevation`, `lightDistance`, `lightIntensity`, `outline`).
+4. **The inflate windows.**  32 KB per compressed `.DAT` entry open for reading.
+   `windowBits` cannot go below what the data was deflated with, so the lever is
+   how many are open at once, which has never been counted.
+
+## How to instrument this
+
+`-memstat N` prints the arena every N ms and arms the rest.
+
+`-mallocs KB N` names the first N allocations of KB or more **per window**
+rather than per run, with five return addresses - the engine reaches malloc
+through `memoryBlockMallocImpl`, `internal_malloc`, the allocator registered
+with its memory manager and sometimes `internal_malloc_safe`, so three frames
+name nothing but plumbing.
+
+`-prof N` counts what is **still held** per call site and prints the N biggest.
+This is the one that answered the question: counting what was asked for measures
+churn and nothing else, because the engine asks for 37 MB in a three-second
+window and gives nearly all of it back.  Its tables are 768 KB of bss, which an
+8 MB part cannot spare on top of a 6100 KB arena - the app does not load at all
+- so it is off unless the build asks:
+
+```bash
+ARGON_LIBC_MALLOC_PROFILE=1 argon fallout --game 2 --rodata-in-code
+```
+
+To reproduce an 8 MB failure *with* the profiler, keep `ARENA_KB` at 6100 and
+run `-Psram 16`: the arena pressure is the same and the extra bss has somewhere
+to live.
+
+`-scripts N` caps resident script programs.  `-fps N` prints where a frame goes.
+`KEY_F11` (patch 0013) steps to the next elevation the map actually has.
+
 ## Already done, do not redo
 
 | | |

@@ -115,6 +115,10 @@ static int to_int(const char *s)
  *                  print the N biggest each window
  *   -fps N         print the frame rate and where a frame goes, every N ms
  *   -autostart     start a new game at once, premade character, no movie
+ *   -scripts N     keep at most N script programs resident; the engine
+ *                  reloads one when it runs again.  0, the default,
+ *                  keeps every script a map has ever run - which is
+ *                  1025 KB on the largest map in the game.
  *
  * -autostart is the one that made measuring possible.  Everything about
  * standing on a map has to reach a map first, and reaching one by sending
@@ -129,6 +133,9 @@ static int to_int(const char *s)
  */
 /* Read by the engine's main menu and character selector; see the patch. */
 extern "C" int ag_autostart = 0;
+
+/* Read by scriptsTrimPrograms(); see patches/fallout2-ce/0014. */
+extern "C" int ag_script_cache = 0;
 
 extern "C" int ag_cxx_main(int argc, char **argv)
 {
@@ -166,6 +173,8 @@ extern "C" int ag_cxx_main(int argc, char **argv)
             fps_ms = to_int(argv[++i]);
         } else if (same(argv[i], "-autostart")) {
             ag_autostart = 1;
+        } else if (same(argv[i], "-scripts") && i + 1 < argc) {
+            ag_script_cache = to_int(argv[++i]);
         } else {
             argv[out++] = argv[i];
         }
