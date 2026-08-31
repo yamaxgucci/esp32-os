@@ -31,6 +31,30 @@ extern "C" void ag_libc_io_stats(uint64_t *us, uint32_t *reads,
 extern "C" void ag_libc_io_reset(void);
 extern "C" uint32_t ag_libc_io_misses(void);
 
+/*
+ * What the art cache does, counted by the engine and printed by the port.
+ * "It reads the same two hundred files over and over" is an observation; these
+ * say whether the cache is too small, whether its eviction policy throws out
+ * more than it needs, or whether the whole thing is being emptied because one
+ * large entry would not fit.  See patches/fallout2-ce/0007.
+ *
+ * Defined here rather than beside the game's own main(): SDLTEST links this
+ * file without the engine, and would otherwise not link at all.
+ */
+extern "C" unsigned ag_cache_fetches = 0;
+extern "C" unsigned ag_cache_evicted = 0;
+extern "C" unsigned ag_cache_flushes = 0;
+extern "C" unsigned ag_cache_biggest = 0;
+
+/*
+ * And what the hex-grid distance costs.  It walks tile by tile, so the second
+ * of these is the work: it used to be one atan2 in software doubles per step.
+ * The third counts walks that gave up - see patches/fallout2-ce/0008.
+ */
+extern "C" unsigned ag_tiledist_calls = 0;
+extern "C" unsigned ag_tiledist_steps = 0;
+extern "C" unsigned ag_tiledist_gaveup = 0;
+
 /* Declared where the port can see them; not part of SDL. */
 extern "C" bool sdl_shim_display(ag_gfxinfo_t *out);
 extern "C" void sdl_shim_screenshot(const char *path, int after_frames,
@@ -295,6 +319,9 @@ void sdl_shim_fps(int every_ms)
     s_fps_next = 0;
 }
 
+static uint32_t s_last_present_ms;
+static uint32_t s_stall_next_ms;
+
 static void fps_service(void)
 {
     if (s_fps_ms == 0) {
@@ -349,7 +376,23 @@ static void fps_service(void)
                   (unsigned)io_opens,
                   (unsigned)ag_libc_io_misses(),
                   (unsigned)io_seeks);
+        /*
+         * On a line of its own.  The first one already wraps an eighty column
+         * console twice, and a number split across two rows is a number that
+         * has to be pieced together by hand every time it is read.
+         */
+        ag_printf("[art t=%u] %u read, %u evicted, %u flushed, largest %u; "
+                  "hexdist %u calls, %u steps, %u gave up\n",
+                  (unsigned)ag_millis(),
+                  ag_cache_fetches, ag_cache_evicted, ag_cache_flushes,
+                  ag_cache_biggest, ag_tiledist_calls, ag_tiledist_steps,
+                  ag_tiledist_gaveup);
     }
+    ag_tiledist_calls = 0;
+    ag_tiledist_steps = 0;
+    ag_cache_fetches = 0;
+    ag_cache_evicted = 0;
+    ag_cache_flushes = 0;
 
     s_frames = 0;
     s_blit_us = 0;
@@ -1031,6 +1074,8 @@ void SDL_RenderPresent(SDL_Renderer *r)
     timers_service();
     memstat_service();
     ++s_frames;
+    s_last_present_ms = (uint32_t)ag_millis();
+    s_stall_next_ms = 0u;
     fps_service();
     /* And the input drivers, which pump their sockets only when read.  A movie
      * runs for minutes without the engine asking for a single event, and a
@@ -1297,8 +1342,39 @@ static void report_read(const char *what, ag_handle_t h, int32_t n)
     }
 }
 
+/*
+ * A frame that never arrives looks the same from outside as a game that has
+ * stopped, and the two want different investigations.
+ *
+ * The engine asks for input in every loop it has - the main one, dialogue, the
+ * character editor, a movie - so a line printed from here says it is going
+ * round and not drawing.  Silence says it is inside a call that has not
+ * returned, which is a different bug and a different place to look.
+ */
+static void stall_service(void)
+{
+    const uint32_t now = (uint32_t)ag_millis();
+
+    if (s_last_present_ms == 0u) {
+        s_last_present_ms = now;
+        return;
+    }
+    const uint32_t since = now - s_last_present_ms;
+    if (since < 3000u) {
+        return;
+    }
+    if (s_stall_next_ms != 0u && (uint32_t)(now - s_stall_next_ms) > 0x80000000u) {
+        return;
+    }
+    s_stall_next_ms = now + 3000u;
+    ag_printf("[stall t=%u] no frame for %u ms, still asking for input\n",
+              (unsigned)now, (unsigned)since);
+}
+
 void sdl_shim_input_service(void)
 {
+    stall_service();
+
     /* Enough for a burst; anything beyond it is read on the next call. */
     uint8_t drain[128];
     if (s_kbd >= 0) {
@@ -1606,7 +1682,20 @@ SDL_AudioDeviceID SDL_OpenAudioDevice(const char *device, int iscapture,
 
     s_audio_stop = false;
     s_audio_paused = true;
-    s_audio_thread = ag_thread_create(audio_thread, NULL, "sdlaudio", 4096, 0, 0);
+    /*
+     * Sixteen kilobytes, not four.
+     *
+     * The thread's own work is small, but what it calls is not its own: the
+     * callback is the engine's mixer, which puts a kilobyte of scratch on the
+     * stack, walks every active sound buffer, takes a C++ lock on each and
+     * runs the resampler underneath.  Four kilobytes covered that while one
+     * track was playing and did not while a map was being entered with music,
+     * ambience and a critter's sounds all live - and what a mixing thread does
+     * when it runs off the end of its stack is not fail, it is corrupt
+     * whatever is next and stop the machine somewhere else entirely.
+     */
+    s_audio_thread = ag_thread_create(audio_thread, NULL, "sdlaudio", 16384, 0,
+                                      0);
     if (s_audio_thread == NULL) {
         ag_audio_close();
         return 0;

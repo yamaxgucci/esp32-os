@@ -109,11 +109,22 @@ static int to_int(const char *s)
  *   -shotms N      or after this many milliseconds, whichever comes first
  *   -memstat N     print arena use, and the peak so far, every N ms
  *   -fps N         print the frame rate and where a frame goes, every N ms
+ *   -autostart     start a new game at once, premade character, no movie
+ *
+ * -autostart is the one that made measuring possible.  Everything about
+ * standing on a map has to reach a map first, and reaching one by sending
+ * keys meant five minutes of opening movie per run and a main menu that
+ * ignores the key for New Game while it is fading in.  Three runs in a row
+ * spent twenty minutes each and never got there.  Two engine files know about
+ * it - see patches/fallout2-ce/0006.
  *
  * Prefer -shotms.  Counting frames means knowing how many the game draws
  * before it reaches whatever you wanted to look at, and the two opening movies
  * alone are five thousand of them.
  */
+/* Read by the engine's main menu and character selector; see the patch. */
+extern "C" int ag_autostart = 0;
+
 extern "C" int ag_cxx_main(int argc, char **argv)
 {
     /* argv[0] is not decoration here: sfall builds the path of ddraw.ini from
@@ -140,6 +151,8 @@ extern "C" int ag_cxx_main(int argc, char **argv)
             memstat_ms = to_int(argv[++i]);
         } else if (same(argv[i], "-fps") && i + 1 < argc) {
             fps_ms = to_int(argv[++i]);
+        } else if (same(argv[i], "-autostart")) {
+            ag_autostart = 1;
         } else {
             argv[out++] = argv[i];
         }
