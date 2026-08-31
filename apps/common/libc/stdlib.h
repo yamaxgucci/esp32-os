@@ -19,6 +19,13 @@ size_t ag_libc_arena_low(void);
  * for finding out who wants the block that will not fit, and who took the
  * memory it would have gone in. */
 void ag_libc_malloc_trace(size_t min_bytes, int max_reports);
+
+/* Count allocations by the call site four frames up, rather than printing
+ * them.  For memory that arrives as hundreds of small blocks, which naming
+ * the big ones cannot see.  _dump prints the top sites and clears the table,
+ * so each dump measures one window. */
+void ag_libc_malloc_profile(int on);
+void ag_libc_malloc_profile_dump(int top);
 void *calloc(size_t n, size_t sz);
 void *realloc(void *p, size_t n);
 void  free(void *p);

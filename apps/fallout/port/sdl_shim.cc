@@ -26,6 +26,8 @@
 extern "C" size_t ag_libc_arena_low(void);
 extern "C" void ag_libc_malloc_trace(size_t min_bytes,
                                     int max_reports);
+extern "C" void ag_libc_malloc_profile(int on);
+extern "C" void ag_libc_malloc_profile_dump(int top);
 extern "C" void ag_libc_io_stats(uint64_t *us, uint32_t *reads,
                                  uint32_t *opens, uint32_t *seeks,
                                  uint64_t *open_us, uint64_t *seek_us);
@@ -62,7 +64,7 @@ extern "C" bool sdl_shim_display(ag_gfxinfo_t *out);
 extern "C" void sdl_shim_screenshot(const char *path, int after_frames,
                                     int after_ms);
 extern "C" void sdl_shim_memstat(int every_ms, int trace_kb,
-                                 int trace_max);
+                                 int trace_max, int trace_prof);
 extern "C" void sdl_shim_fps(int every_ms);
 extern "C" void sdl_shim_screenshot_now(void);
 
@@ -281,8 +283,10 @@ static void write_ppm(const char *path);
 
 static size_t s_trace_min;
 static int    s_trace_max;
+static int    s_trace_prof;
 
-void sdl_shim_memstat(int every_ms, int trace_kb, int trace_max)
+void sdl_shim_memstat(int every_ms, int trace_kb, int trace_max,
+                      int trace_prof)
 {
     s_memstat_ms = (uint32_t)(every_ms > 0 ? every_ms : 0);
     s_memstat_next = 0;
@@ -294,6 +298,8 @@ void sdl_shim_memstat(int every_ms, int trace_kb, int trace_max)
     s_trace_max = trace_max > 0 ? trace_max : 64;
     ag_libc_malloc_trace(every_ms > 0 ? s_trace_min : 0,
                          every_ms > 0 ? s_trace_max : 0);
+    ag_libc_malloc_profile(every_ms > 0 && trace_prof > 0);
+    s_trace_prof = trace_prof;
 }
 
 /*
@@ -481,6 +487,7 @@ static void memstat_service(void)
               frame_peak,
               peak_alloc,
               (unsigned)(mi.arena_largest / 1024u));
+    ag_libc_malloc_profile_dump(s_trace_prof);
 }
 
 static void write_ppm(const char *path)

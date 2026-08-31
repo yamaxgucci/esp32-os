@@ -108,6 +108,197 @@ static void report_big(size_t n, void *r0, void *r1, void *r2, void *r3,
               r0, r1, r2, r3, r4, (p == NULL) ? " FAILED" : "");
 }
 
+/*
+ * What is still held, by call site.
+ *
+ * Naming the big allocations is enough when one of them is the problem.  It is
+ * no use when two megabytes arrive as four hundred blocks of five kilobytes,
+ * which is what visiting a new elevation of a Fallout 2 map costs.  And
+ * counting what is *asked for* is no use either: the engine opens and closes
+ * files all frame, so a three-second window on a quiet map asks for
+ * thirty-seven megabytes and gives them all back.  Churn drowns the answer.
+ *
+ * So this tracks what is still outstanding.  Every allocation of PROFILE_MIN
+ * or more goes in a table keyed by its pointer, remembering the call site four
+ * frames up - the engine's own caller rather than one of its allocator layers.
+ * free() and realloc() take it out again.  A dump is a snapshot of live bytes
+ * per site, so the difference between two snapshots is exactly what an action
+ * kept, with the churn cancelled out.
+ *
+ * The costs, so they are on the record rather than a surprise: 96 KB of table,
+ * a hash and a short probe on every allocation over the threshold, and blocks
+ * that arrive when the table is full are counted in a spill line rather than
+ * dropped - a total that does not add up is worse than a coarse one.
+ */
+#define PROFILE_LIVE  32768u         /* pointer slots, a power of two */
+#define PROFILE_SITES 192u
+#define PROFILE_MIN   512u
+#define PROFILE_PROBE 256u
+
+typedef struct {
+    void    *p;
+    void    *site;
+    uint32_t n;
+} prof_live_t;
+
+typedef struct {
+    void    *site;
+    uint32_t bytes;
+    uint32_t count;
+} prof_site_t;
+
+static prof_live_t s_live[PROFILE_LIVE];
+static prof_site_t s_sites[PROFILE_SITES];
+static uint32_t    s_prof_untracked;   /* live bytes the table could not hold */
+static uint32_t    s_prof_lost;        /* frees of blocks it never saw */
+static int         s_prof_on;
+
+void ag_libc_malloc_profile(int on)
+{
+    s_prof_on = on ? 1 : 0;
+}
+
+static unsigned prof_hash(void *p)
+{
+    /* The low bits of a heap pointer are alignment, so drop them first. */
+    uintptr_t v = (uintptr_t)p >> 4;
+    v *= 2654435761u;
+    return (unsigned)(v & (PROFILE_LIVE - 1u));
+}
+
+static prof_site_t *prof_site(void *site)
+{
+    unsigned i;
+
+    for (i = 0; i < PROFILE_SITES; ++i) {
+        if (s_sites[i].site == site) {
+            return &s_sites[i];
+        }
+        if (s_sites[i].site == NULL) {
+            s_sites[i].site = site;
+            return &s_sites[i];
+        }
+    }
+    return NULL;
+}
+
+static void prof_alloc(void *p, size_t n, void *site)
+{
+    unsigned h, i;
+
+    if (!s_prof_on || p == NULL || n < PROFILE_MIN) {
+        return;
+    }
+    h = prof_hash(p);
+    for (i = 0; i < PROFILE_PROBE; ++i) {
+        prof_live_t *slot = &s_live[(h + i) & (PROFILE_LIVE - 1u)];
+        if (slot->p == NULL) {
+            prof_site_t *st = prof_site(site);
+            slot->p = p;
+            slot->site = site;
+            slot->n = (uint32_t)n;
+            if (st != NULL) {
+                st->bytes += (uint32_t)n;
+                st->count++;
+            } else {
+                s_prof_untracked += (uint32_t)n;
+            }
+            return;
+        }
+    }
+    s_prof_untracked += (uint32_t)n;
+}
+
+static void prof_free(void *p)
+{
+    unsigned h, i;
+
+    if (!s_prof_on || p == NULL) {
+        return;
+    }
+    h = prof_hash(p);
+    for (i = 0; i < PROFILE_PROBE; ++i) {
+        prof_live_t *slot = &s_live[(h + i) & (PROFILE_LIVE - 1u)];
+        if (slot->p == p) {
+            prof_site_t *st = prof_site(slot->site);
+            if (st != NULL && st->bytes >= slot->n) {
+                st->bytes -= slot->n;
+                st->count--;
+            }
+            slot->p = NULL;
+            slot->site = NULL;
+            slot->n = 0;
+            return;
+        }
+        if (slot->p == NULL) {
+            break;      /* the probe run ends: it was never tracked */
+        }
+    }
+    s_prof_lost++;
+}
+
+void ag_libc_malloc_profile_dump(int top)
+{
+    unsigned i, j;
+    uint32_t total = 0;
+
+    if (!s_prof_on) {
+        return;
+    }
+    for (i = 0; i < PROFILE_SITES && s_sites[i].site != NULL; ++i) {
+        total += s_sites[i].bytes;
+    }
+    unsigned blocks = 0;
+    unsigned sites = 0;
+
+    for (i = 0; i < PROFILE_LIVE; ++i) {
+        if (s_live[i].p != NULL) {
+            blocks++;
+        }
+    }
+    for (i = 0; i < PROFILE_SITES && s_sites[i].site != NULL; ++i) {
+        sites++;
+    }
+    ag_printf("[prof] %u KB live in %u blocks from %u/%u sites",
+              total / 1024u, blocks, sites, (unsigned)PROFILE_SITES);
+    /* Cumulative, and it never comes down: a block the tables could not hold
+     * cannot be found again when it is freed.  It is here to say whether the
+     * tables were big enough, not as a figure to add to anything. */
+    if (s_prof_untracked != 0) {
+        ag_printf(", %u KB ever missed", s_prof_untracked / 1024u);
+    }
+    ag_printf("\n");
+    /* A selection sort over 64 entries, a few times a second: the point is not
+     * to need a qsort in a diagnostic.  Sites are never cleared - the table is
+     * a running picture and two snapshots subtract - so "already printed" is a
+     * local array rather than a mark in the table.  It has to be local for a
+     * second reason: ag_printf may allocate, and an allocation landing in a
+     * table that is halfway through being tagged would corrupt it. */
+    unsigned char done[PROFILE_SITES];
+    memset(done, 0, sizeof(done));
+    for (j = 0; j < (unsigned)top; ++j) {
+        unsigned best = PROFILE_SITES;
+        uint32_t bestb = 0;
+
+        for (i = 0; i < PROFILE_SITES && s_sites[i].site != NULL; ++i) {
+            if (done[i]) {
+                continue;
+            }
+            if (s_sites[i].bytes > bestb) {
+                bestb = s_sites[i].bytes;
+                best = i;
+            }
+        }
+        if (best == PROFILE_SITES) {
+            break;
+        }
+        done[best] = 1;
+        ag_printf("[prof]  %6u KB  %5u live  %p\n",
+                  s_sites[best].bytes / 1024u, s_sites[best].count,
+                  s_sites[best].site);
+    }
+}
+
 void *malloc(size_t n)
 {
     if (n == 0) {
@@ -117,6 +308,7 @@ void *malloc(size_t n)
     report_big(n, __builtin_return_address(0), __builtin_return_address(1),
                __builtin_return_address(2), __builtin_return_address(3),
                __builtin_return_address(4), p);
+    prof_alloc(p, n, __builtin_return_address(4));
     if (p != NULL && n >= ARENA_WATCH_MIN) {
         ag_meminfo_t mi;
         ag_meminfo(&mi);
@@ -149,13 +341,19 @@ void *calloc(size_t n, size_t sz)
 
 void *realloc(void *p, size_t n)
 {
+    void *q;
+
     /* Prefer the ABI realloc: it knows the old block size (multi_heap). */
-    return ag_realloc(p, n);
+    prof_free(p);
+    q = ag_realloc(p, n);
+    prof_alloc(q, n, __builtin_return_address(0));
+    return q;
 }
 
 void free(void *p)
 {
     if (p != NULL) {
+        prof_free(p);
         ag_free(p);
     }
 }

@@ -132,171 +132,123 @@ Ruled out, with the reason:
 
 ## What a map actually costs, measured
 
-Three maps, each started directly with sfall's `StartingMap` in `ddraw.ini`
-and `-autostart`, so each is weighed with nothing else ever resident.  16 MB of
-PSRAM and a 10000 KB arena for the runs, so nothing fails and the numbers are
-the demand rather than what happened to fit:
+Each map started directly with sfall's `StartingMap` in `ddraw.ini` and
+`-autostart`, so it is weighed with nothing else ever resident.  16 MB of PSRAM
+and a 10000 KB arena, so nothing fails and the numbers are the demand rather
+than what happened to fit.
 
-| map | file in `master.dat` | used, standing still | peak | with transients |
-|---|---|---|---|---|
-| `ARTEMPLE.MAP` | 93 KB | 5123 KB | 5502 | 5542 |
-| `ARVILLAG.MAP` | 216 KB | 5605 KB | 5639 | 5843 |
-| `BROKEN2.map` | 767 KB, the largest in the game | 5605 KB | 5639 | 5843 |
+**Read the whole run, not the first minute.**  Every map reports about 5605 KB
+the moment it finishes loading and then keeps growing for several minutes
+before it settles.  Two conclusions were drawn and then withdrawn because of
+this — see "Two wrong answers" below — so the number that matters is the
+plateau:
 
-Every map's header says which of the three elevations it actually holds - a
-*set* bit in `flags` means the level is **absent** (`_map_data_elev_flags` in
-`map.cc`, and the tile reads at 1417 and 1727 which run when the bit is clear).
-Decoded for all 155 maps in `master.dat` and `critter.dat`: **109 have one
-elevation, 26 have two, 20 have three.**  Broken Hills is the largest file in
-the game and one of the twenty.
+| map | elevations | file | just after loading | plateau | peak |
+|---|---|---|---|---|---|
+| `ARTEMPLE.MAP` | 1 | 93 KB | 5123 KB | **5123, flat** | 5493 |
+| `ARVILLAG.MAP` | 1 | 216 KB | 5605 KB | **~6205** | 6636 |
+| `BROKEN2.map` | 3 | 767 KB, the largest in the game | 5605 KB | **~7680** | 8131 |
 
-So of the three measured maps, two are one-elevation and one is three:
+Against an arena of 6100 KB:
 
-| map | elevations | file | used |
-|---|---|---|---|
-| `ARTEMPLE.MAP` | 1 | 93 KB | 5123 KB |
-| `ARVILLAG.MAP` | 1 | 216 KB | 5605 KB |
-| `BROKEN2.map` | 3 | 767 KB | 5605 KB |
+- the Temple of Trials fits, with 600 KB to spare, and never grows
+- **Arroyo village already does not**: 6636 KB at its peak
+- **Broken Hills needs 2 MB more than exists**
 
-**Neither the file size nor the elevation count predicts the cost.**  Two
-one-elevation maps differ by 482 KB; a three-elevation map eight times the file
-of the temple costs exactly what the one-elevation village costs, to the
-kilobyte.  Whatever the 482 KB is, it saturates: it is the same on a medium map
-and on the largest one.
+So it is not that the game is a little short on one transition.  Everywhere
+past the starting map is over the line, and the largest maps by 2 MB.
 
-What that bounds, which nothing before did:
+The growth is gradual, needs no input at all — `big.log` and `live.log` reach
+the same 8131 KB with nothing touched — and it **plateaus**, which is the shape
+of a working set filling rather than a leak.
 
-- the worst map measured needs **5843 KB** of the arena's 6100, started clean
-- **257 KB** is all the headroom there is
-- and the crash on walking into a new location came at 41 KB free, so an
-  in-game transition costs about **215 KB more** than starting on the same map
-  fresh.  That, and only that, is the gap to close.
+Every map's header says which of the three elevations it holds; a *set* bit in
+`flags` means the level is **absent** (`_map_data_elev_flags` in `map.cc`, and
+the tile reads at 1417 and 1727 which run when the bit is clear).  Decoded for
+all 155 maps in `master.dat` and `critter.dat`: **109 have one elevation, 26
+have two, 20 have three.**
 
-**What the 482 KB is has not been identified**, and it is the next thing to
-find out.  It is not objects (Broken Hills has several times the village's and
-costs the same), not tiles (those are 40 KB per elevation), and not the art
-cache (a fixed 1435 KB block).  A plateau reached by both a medium and the
-largest map looks like a cache filling to its limit - the sound effects cache
-and the script Programs are the two candidates.  `-mallocs 8 400` across the
-first minute on the village would name it.
+## Two wrong answers, and what was wrong with them
 
-### What this changes about the work
+Both came from reading a run too early, and both are kept here so the next
+person does not repeat them.
 
-- **`gTileIntensity` per elevation is worth much less than it looked.**  109 of
-  the 155 maps have one elevation, so it saves 320 KB on most of the game - but
-  the maps that need the memory are the twenty with three, where it saves
-  nothing.  Narrowing it to `int16` (item 1b) saves 240 KB on every map and is
-  the item to do first.
-- Nothing about the art cache helps.  At 1400 KB it evicts nothing standing
-  still and measures the same at 2 MB; it is 1435 KB of the 5123 baseline and
-  it is not what the last 215 KB is spent on.
+**"The size of a map does not matter."**  Broken Hills and Arroyo village both
+report 5605 KB after loading, and Broken Hills is eight times the file.  They
+diverge over the following minutes to 7680 and 6205.  A map's cost is not what
+it takes to load.
 
-## An elevation change costs two megabytes, once
+**"An elevation change costs 2058 KB."**  `KEY_F11` (patch 0013) steps the
+engine to the next elevation the map actually holds, and on Broken Hills the
+arena went from 5605 KB to 7663 within a minute of pressing it — twice, on two
+separate runs.  It was the climb, not the keypress: `big.log`, which never
+received an F11, reaches 8131 KB on its own.  The step may still cost
+something; nothing here measures it, because the thing being measured moves by
+2 MB while standing still.
 
-`KEY_F11` (patch 0013) steps the engine to the next elevation the map actually
-holds, through the same three calls its own same-map transition makes.  The
-first attempt measured nothing and the reason is worth keeping: it stepped
-`ARTEMPLE.MAP` from elevation 0 to 1 and the temple **has no elevation 1**.
-`elevationIsValid()` is only a range check against `ELEVATION_COUNT`; the header
-flags say whether a level exists.  The patch checks the flags now.
+A third, smaller correction: the first F11 attempt reported no change because
+it stepped `ARTEMPLE.MAP` from elevation 0 to 1 and the temple **has no
+elevation 1**.  `elevationIsValid()` is only a range check against
+`ELEVATION_COUNT`.  The patch reads the header flags now.
 
-On `BROKEN2.map`, which has three:
-
-| | used | peak | with transients |
-|---|---|---|---|
-| standing on elevation 0 | 5605 KB | 5639 | 5843 |
-| after stepping to elevation 1 | **7663 KB** | **8132** | **8293** |
-| after stepping to elevation 2 | 7688 KB | 8132 | 8293 |
-
-**The first elevation change costs 2058 KB and it does not come back.  The
-second costs 25 KB.**  That is the same saturating shape as the 482 KB between
-the temple and the village: something fills once and then stays, and the size
-of the map has nothing to do with it.
-
-8293 KB against an arena of 6100.  This is the whole problem, and it is more
-than twice what "184 KB short" said it was.
-
-One caveat on fidelity: F11 puts the dude on the *same tile index* on the new
-elevation, where a real exit grid would name a proper tile.  If that tile is
-outside the built area the renderer may be doing something a player would never
-provoke.  Worth confirming once by walking in with a mouse before treating 2058
-KB as the number.
-
-### Where it goes, so far
-
-Traced with `-mallocs 8 60` across the step, resolved to five frames: about
-824 KB of it is **sound**, and nothing else was named.
-
-| KB | frames |
-|---|---|
-| 228 | `_preloadBuffers` <- `soundLoad` <- `soundEffectLoad` |
-| 200 | `soundLoad` <- `backgroundSoundLoad` <- `_gsound_background_play_level_music` |
-| 126 | `soundLoad` <- `soundEffectLoad` <- `soundPlayFile` |
-| 126 | `soundLoad` <- `soundEffectLoad` <- `soundEffectLoadWithVolume` |
-| 80 | `_preloadBuffers` <- `soundLoad` <- `backgroundSoundLoad` |
-| 64 | two 32 KB zlib windows, `inflate` <- `dfileReadCompressed` |
-
-The sound effects cache is bounded - `game_sound.cc:272` passes
-`cache_size << 10` and the default is 448 KB - so that part cannot run away.
-The remaining ~1234 KB was below the 8 KB threshold or lost to the 60-report
-budget, and a run with `-mallocs 8 400` is what closes the arithmetic.
-
-### The art cache is not a cap - and it is not where the 2 MB goes
+## The art cache is not a cap, and a bigger one does not help
 
 `heap.cc:912` has a `system:` label.  When the art cache's own heap cannot find
-room - and it only looks in its free list and then tries to defragment, it never
-evicts - it prints its stats and calls `internal_malloc` **from the arena, with
-no limit**, marking the block `HEAP_BLOCK_STATE_SYSTEM`.  `heapPrintStats` has
-exactly one call site, that one, so every "Total free blocks:" line in a log is
-that fallback: **11 on the temple, 710 on Broken Hills, 206 in the minute after
-an elevation step.**
+room — and it only looks in its free list and then tries to defragment, it
+never evicts — it prints its stats and calls `internal_malloc` **from the
+arena, with no limit**, marking the block `HEAP_BLOCK_STATE_SYSTEM`.
+`heapPrintStats` has exactly one call site, that one, so every "Total free
+blocks:" line in a log is that fallback: **11 on the temple, 710 on Broken
+Hills.**
 
-So the cache's size is a target rather than a bound, and "1400 KB measures the
-same as 2 MB" was measured on the one map where the cache never fills.  That
-much is true and worth knowing.  It is still not the answer, which one run
-settled - `art_cache_size=3000` on Broken Hills, same step:
+That is a real mechanism for unbounded arena growth and it is the best
+candidate for the climb.  What it is not is something a bigger cache fixes —
+`art_cache_size=3000` instead of 1400 on Broken Hills:
 
-| art cache | standing on elevation 0 | after the step | the step cost | heap fallbacks |
-|---|---|---|---|---|
-| 1400 KB | 5605 KB used, 5843 with transients | 7664, 8290 | 2059 KB | 710 |
-| 3000 KB | 7210 KB used, 7443 with transients | 9280, 9904 | 2070 KB | 23 |
+| art cache | just after loading | plateau | heap fallbacks |
+|---|---|---|---|
+| 1400 KB | 5605 KB | ~7680, peak 8131 | 710 |
+| 3000 KB | 7210 KB | ~9280, peak 9739 | 23 |
 
-The two runs differ by 1605 KB standing still and 1614 KB after the step, which
-is the 1600 KB of extra cache and nothing else.  **A bigger cache costs its own
-size and changes nothing about the elevation change.**  The fallback firing is a
-symptom of a cache smaller than the working set, not the cause of the 2 MB.
+The two runs differ by 1605 KB after loading and 1608 at the plateau, which is
+the 1600 KB of extra cache and nothing else.  **A bigger cache costs its own
+size and changes the total by nothing** — even though it nearly stops the
+fallback firing.  Which is itself informative: whatever the climb is, it is not
+blocks a larger cache would have kept inside itself.
 
-Which turns the art cache the other way round: it should be as **small** as the
-frame rate tolerates, not as large as the arena allows.  1400 KB down to 800
-would be 600 KB back, and what it costs in frames has not been measured on a
-busy map - only on the temple, where it cannot cost anything.
+So the art cache should be as **small** as the frame rate tolerates, not as
+large as the arena allows.  1400 KB down to 800 is 600 KB back, and what that
+costs in frames has only ever been measured on the temple, where the cache
+cannot fill.
 
-### What the 2 MB is, as far as it is named
+## What the climb is: not yet known
 
-Traced across the step with `-mallocs 8 400`, five frames:
+Ruled out by measurement rather than by argument:
 
-| KB | n | frames |
+- **not the art cache's size** — see the table above
+- **not sound** — `sounds=0 music=0 speech=0` in `fallout2.cfg` and Broken
+  Hills still reaches 7783 KB instead of 8131, so sound is about 350 KB of it
+- **not the sound effects cache** — it is 64 KB in `fallout2.cfg`
+- **not a file being decoded whole** — both `backgroundSoundLoad` call sites
+  already ask for `SOUND_TYPE_STREAMING` after patch 0004
+
+Named so far, from the live-bytes profiler at the plateau (`-prof N`, which
+counts what is still outstanding per call site rather than what was asked for —
+the engine asks for 37 MB in a three-second window and gives nearly all of it
+back, and churn drowned the first version of this):
+
+| KB live | blocks | site |
 |---|---|---|
-| 213 | 5 | `_preloadBuffers` <- `soundLoad` <- `soundEffectLoad` |
-| 208 | 3 | `soundLoad` <- `backgroundSoundLoad` <- `mapLoad` |
-| 200 | 3 | `soundLoad` <- `backgroundSoundLoad` <- `_gsound_background_play_level_music` |
-| 220 | 16 | `gameMemoryMalloc` <- `internal_malloc_safe` <- `programCreateByPath` |
-| 153 | 5 | `soundLoad` <- `soundEffectLoad` <- `soundPlayFile` |
-| 144 | 2 | `soundContinue` <- `soundContinueAll` <- `cacheLock` |
-| 80 | 2 | `_preloadBuffers` <- `soundLoad` <- `backgroundSoundLoad` |
+| 1401 | 1 | `artInit` — the art cache heap |
+| 1288 | 35 | `memoryBlockReallocImpl` |
+| 420 | 17 | inside `gameInitWithOptions` |
+| 200 | 1 | a `constprop` clone near `_cleanupMovie`, unresolvable without `-g` |
+| 108 | 5 | `interfaceFontsInit` |
+| 105 | 12 | `isoInit` |
 
-About 850 KB of sound and 220 KB of script `Program`s, so **roughly half of the
-2058 KB is named and the rest is in allocations under 8 KB.**  Two things are
-already ruled out by the numbers rather than by argument: the sound *effects*
-cache is 64 KB in `fallout2.cfg`, so it is not that, and both background-sound
-call sites already ask for `SOUND_TYPE_STREAMING` (14) after patch 0004, so it
-is not a file being decoded whole either.  What is left in sound is decoders and
-rings, one per concurrent sound.
-
-The next measurement is a partition rather than a name: `sounds=0 music=0
-speech=0` in `fallout2.cfg` and the same step says how much of the 2058 KB is
-sound at all.  A threshold low enough to see the rest would print thousands of
-lines and still not add up, so bisecting by subsystem is the cheaper instrument.
+3608 KB of the 7685 in use, and the tables were saturating — 8192 pointer slots
+and 64 sites were not enough.  Widened to 32768 and 192, and the dump says how
+full they are now.  The run that uses them is what should close this.
 
 ## Where the baseline goes, measured
 
