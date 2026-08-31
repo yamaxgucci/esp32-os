@@ -241,25 +241,62 @@ The sound effects cache is bounded - `game_sound.cc:272` passes
 The remaining ~1234 KB was below the 8 KB threshold or lost to the 60-report
 budget, and a run with `-mallocs 8 400` is what closes the arithmetic.
 
-### The art cache is not a cap, and that is a real finding
+### The art cache is not a cap - and it is not where the 2 MB goes
 
 `heap.cc:912` has a `system:` label.  When the art cache's own heap cannot find
 room - and it only looks in its free list and then tries to defragment, it never
 evicts - it prints its stats and calls `internal_malloc` **from the arena, with
-no limit**, marking the block `HEAP_BLOCK_STATE_SYSTEM`.
+no limit**, marking the block `HEAP_BLOCK_STATE_SYSTEM`.  `heapPrintStats` has
+exactly one call site, that one, so every "Total free blocks:" line in a log is
+that fallback: **11 on the temple, 710 on Broken Hills, 206 in the minute after
+an elevation step.**
 
-`heapPrintStats` has exactly one call site, that one, so every "Total free
-blocks:" line in a log is the art heap failing to satisfy a request out of its
-own memory.  Counted: **11 lines on the temple, 710 on Broken Hills, 206 in the
-minute after an elevation step.**
+So the cache's size is a target rather than a bound, and "1400 KB measures the
+same as 2 MB" was measured on the one map where the cache never fills.  That
+much is true and worth knowing.  It is still not the answer, which one run
+settled - `art_cache_size=3000` on Broken Hills, same step:
 
-Two things follow.  The art cache's size is a target, not a bound, so "1400 KB
-measures the same as 2 MB" was measured on the one map where the cache never
-fills and says nothing about the rest of the game.  And it means Maxim's
-instinct - give the art more - is aimed at something real: memory the cache
-cannot fit spills into the arena in scattered blocks that nothing accounts for.
-What is not yet known is whether a bigger cache lowers the total or merely moves
-it, and that is one run: `art_cache_size=3000` on Broken Hills, same step.
+| art cache | standing on elevation 0 | after the step | the step cost | heap fallbacks |
+|---|---|---|---|---|
+| 1400 KB | 5605 KB used, 5843 with transients | 7664, 8290 | 2059 KB | 710 |
+| 3000 KB | 7210 KB used, 7443 with transients | 9280, 9904 | 2070 KB | 23 |
+
+The two runs differ by 1605 KB standing still and 1614 KB after the step, which
+is the 1600 KB of extra cache and nothing else.  **A bigger cache costs its own
+size and changes nothing about the elevation change.**  The fallback firing is a
+symptom of a cache smaller than the working set, not the cause of the 2 MB.
+
+Which turns the art cache the other way round: it should be as **small** as the
+frame rate tolerates, not as large as the arena allows.  1400 KB down to 800
+would be 600 KB back, and what it costs in frames has not been measured on a
+busy map - only on the temple, where it cannot cost anything.
+
+### What the 2 MB is, as far as it is named
+
+Traced across the step with `-mallocs 8 400`, five frames:
+
+| KB | n | frames |
+|---|---|---|
+| 213 | 5 | `_preloadBuffers` <- `soundLoad` <- `soundEffectLoad` |
+| 208 | 3 | `soundLoad` <- `backgroundSoundLoad` <- `mapLoad` |
+| 200 | 3 | `soundLoad` <- `backgroundSoundLoad` <- `_gsound_background_play_level_music` |
+| 220 | 16 | `gameMemoryMalloc` <- `internal_malloc_safe` <- `programCreateByPath` |
+| 153 | 5 | `soundLoad` <- `soundEffectLoad` <- `soundPlayFile` |
+| 144 | 2 | `soundContinue` <- `soundContinueAll` <- `cacheLock` |
+| 80 | 2 | `_preloadBuffers` <- `soundLoad` <- `backgroundSoundLoad` |
+
+About 850 KB of sound and 220 KB of script `Program`s, so **roughly half of the
+2058 KB is named and the rest is in allocations under 8 KB.**  Two things are
+already ruled out by the numbers rather than by argument: the sound *effects*
+cache is 64 KB in `fallout2.cfg`, so it is not that, and both background-sound
+call sites already ask for `SOUND_TYPE_STREAMING` (14) after patch 0004, so it
+is not a file being decoded whole either.  What is left in sound is decoders and
+rings, one per concurrent sound.
+
+The next measurement is a partition rather than a name: `sounds=0 music=0
+speech=0` in `fallout2.cfg` and the same step says how much of the 2058 KB is
+sound at all.  A threshold low enough to see the rest would print thousands of
+lines and still not add up, so bisecting by subsystem is the cheaper instrument.
 
 ## Where the baseline goes, measured
 
