@@ -120,18 +120,22 @@ RODATA_ARGS: list = []
 # How much of extended memory the process asks for.  See the comment on
 # AG_APP_SIZED in fallout_main.cc; --arena-kb overrides it.
 #
-# 6100 is not a round number chosen for looks, and it cannot be raised.  With
-# the card mounted an 8 MB part reports 8007 KB of extended memory free and the
-# image's own data takes 1812 of it, which suggests 6195 - but the arena has to
-# be one contiguous block, and 6150 is refused as flatly as 6360 is.  All three
-# were tried.  Whatever the data segment and the framebuffer leave behind is not
-# in one piece.
+# 6340 is not a round number chosen for looks, and the only way to raise it is
+# to make the image smaller.  The shell's own `mem` reports 8040 KB of extended
+# memory free with the card mounted; the loader takes the image's data out of
+# that and then wants the arena as one contiguous block.  With 1770 KB of data,
+# 6100 was accepted and 6300 refused.  Patch 0018 halves gTileIntensity, which
+# takes the data to 1536 KB, and 6340 is accepted.  So the ceiling is about
+# `8040 - data - fragmentation`, and bss is the dial: it is the same memory.
 #
-# That matters because the arena is nine kilobytes short of what a map change
-# needs: standing still it peaks at 5254 KB, entering the Temple of Trials wants
-# 837 KB more, and 6091 does not fit in 6100 once the heap has any holes in it.
-# The only way out is to use less, not to ask for more; the list is in the
-# README under "What it would take to have room".
+# Do not raise this without first taking something out of bss.  The largest
+# objects left there are gObjectListHeadByTile at 156 KB and _square_data at
+# 117 KB, and both are already tight - an array of pointers and one of packed
+# tile ids.
+#
+# What the arena has to hold, measured on the largest map in the game: about
+# 5200 KB before a map loads, and BROKEN2.MAP's seven thousand objects arrive as
+# 1136 KB in one step.  docs/plans/fallout-memory.md has the whole accounting.
 ARENA_KB = 6340
 
 # Files that only exist for a platform this is not.

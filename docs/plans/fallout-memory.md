@@ -4,27 +4,91 @@ Written 31 August 2026, branch `worktree-fallout-cxx`. Everything here is
 measured; the numbers are the point, and the READMEs they came from are
 `apps/fallout/README.md` under **What it would take to have room**.
 
-## Where it stands
+## Where it stands after the first four patches
 
-Shipping configuration — `-Psram 8`, arena 6100 KB (`apps/fallout/build.py`,
-`ARENA_KB`), art cache 1400 KB, music ring 4×16 KB:
+Shipping configuration is now `-Psram 8`, arena **6340** KB, art cache 1400 KB,
+music ring 4×16 KB, patches 0014-0016 and 0018.
+
+| map | before | now |
+|---|---|---|
+| Temple of Trials | 5123 KB, ran | runs, more room |
+| **Arroyo village** | plateau 6205, peak 6636 — **never loaded** | **5365 KB of 6340, 22 fps, and `vsuit.mve` plays over it (peak 6329)** |
+| **Broken Hills** | **died during the map load** | **loads** - its own `OVERRIDE_MAP_START` runs - then runs out at 6302 of 6340 |
+
+About 1300 KB recovered in total, and 240 KB of it turned into arena rather than
+into free space.
+
+### What each one was worth
 
 | | |
 |---|---|
-| frame rate standing on the Temple of Trials | 27 fps, median of 210 windows |
-| arena high-water on the temple, transients included | 5542 KB of 6100 |
-| the same on the worst map in the game | 5843 KB of 6100 |
-| art cache, standing still | reads nothing, evicts nothing |
-| **short by** | **215 KB**, and only during a change of map |
+| 0014, bounded script cache (`-scripts N`) | 878 KB on a map that has been sat on for a while |
+| 0015, stop keeping the last movie frame | 200 KB, on every map, unconditionally |
+| 0016, no guard header on every allocation | ~560 KB on a busy map; more on any map with many objects |
+| 0018, sixteen bits of light per tile | 240 KB of `bss`, which became 240 KB of arena |
 
-**The arena cannot be raised.** 8007 KB of extended memory is free with the
-card mounted and the image's data takes 1812, but the arena must be one block:
-6150, 6220 and 6360 are all refused. Do not spend runs on this again.
+## Broken Hills: what is still in the way
 
-**The framebuffer is free in QEMU and will not be on a board.** The panel's
-640×480 RGB565 buffer is 600 KB and comes from the emulated device
-(`esp_lcd_rgb_qemu_get_frame_buffer` in `components/argon_port/idf/src/panel_hw.c`).
-On hardware it is PSRAM, so every figure above is 600 KB optimistic there.
+The trajectory says it plainly.  Standing at the main menu the arena holds about
+5200 KB; the map load takes it to 6273 in a single step and it dies at 6302 of
+6340, on a 32 KB zlib inflate window.
+
+That step is **the map's objects**: 7102 of them, an `Object` and an
+`ObjectListNode` each, and after patch 0016 that is about 160 bytes a pair
+including the ABI allocator's own header and its rounding.  1136 KB, arriving
+all at once, on top of a 5200 KB floor.  Everything else on the old list is
+either done or measured as not mattering: the script cap never fires here (fewer
+than twelve programs are resident before the arena runs out), and the art cache
+cannot go down (a single art item is 505100 bytes).
+
+So Broken Hills needs a few hundred kilobytes more, and there are three places
+left with no risk in them:
+
+1. **Narrow `Object`.**  Nineteen `int`s, of which `rotation`, `frame`,
+   `elevation`, `lightDistance`, `lightIntensity` and `outline` do not need
+   thirty-two bits.  About 170 KB across 7102 objects.
+2. **Pool `Object` and `ObjectListNode`.**  They are all one size each, which is
+   what a free-list pool is for, and it removes the ABI allocator's per-block
+   header and rounding: about 142 KB.
+3. **The world map, 739 KB, resident from startup to exit.**  Still the largest
+   single item in the fixed cost.  It is **not** the tile array, which is one
+   block: the profiler counts 1585 blocks averaging 477 bytes, so it is the
+   message list and the encounter tables.  Those are needed when a random
+   encounter is rolled and when the world map is on screen, and at no other
+   time.  Worth a proper look before a line of it is written.
+
+1 and 2 together are about 310 KB, which would put Broken Hills at roughly 5990
+of 6340 - the whole game, with 350 KB to spare.
+
+## Loading only one elevation's objects: why not
+
+Tempting, because two thirds of Broken Hills' objects belong to elevations the
+player is not on, and it would be 750 KB.  It runs into the save:
+`_map_save_in_game` writes every object back so that a map keeps its state
+between visits, and an elevation that was never instantiated cannot be written.
+Keeping the raw file bytes to copy through instead only saves the difference
+between 112 bytes on disk and 144 in memory, which is not worth the machinery.
+
+Not impossible - but it is a different order of work from the three above, and
+those three are enough.
+
+## Two standing facts about the arena
+
+**It can be raised, and only by making the image smaller.**  The shell's `mem`
+says 8040 KB of extended memory is free before the app loads; the loader takes
+the image's data out of that and then wants the arena as one block.  With 1770
+KB of data a 6300 KB arena was refused and 6100 accepted; with patch 0018's 1536
+KB of data, 6340 is accepted.  So the ceiling is roughly
+`8040 - data - fragmentation`, and `bss` is the dial.  The largest objects in
+`bss` after 0018 are `gObjectListHeadByTile` at 156 KB and `_square_data` at
+117 KB, and both are already tight - pointers and packed tile ids.
+
+**The framebuffer is free in QEMU and will not be on a board.**  The panel's
+640x480 RGB565 buffer is 600 KB and comes from the emulated device
+(`esp_lcd_rgb_qemu_get_frame_buffer` in
+`components/argon_port/idf/src/panel_hw.c`).  On hardware it is PSRAM, so every
+figure here is 600 KB optimistic there - which is what makes the 320x240 panel
+item not optional.
 
 ## How to measure anything
 
