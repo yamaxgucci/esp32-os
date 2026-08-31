@@ -443,6 +443,12 @@ def run_link(objects: list, output: str, extra: str) -> int:
            # arrived and collided with the shim.
            "--ldflags=-Wl,--gc-sections " + extra + " " +
            os.environ.get("ARGON_FALLOUT_LDFLAGS", ""),
+           # The intermediate ELF, kept.  It is the only thing that can turn
+           # an address in a QEMU backtrace into a function name: the .AXE
+           # carries no symbols, and the image is half a megabyte of somebody
+           # else's engine.
+           "--keep-elf", os.path.join(ROOT, "build", "apps",
+                                      os.path.splitext(output)[0] + ".elf"),
            "-o", output] + RODATA_ARGS + objects
     p = subprocess.run(cmd, capture_output=True, text=True)
     rc_output = p.stdout + p.stderr

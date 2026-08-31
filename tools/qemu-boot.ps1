@@ -150,6 +150,13 @@ Get-Process qemu-system-xtensa -ErrorAction SilentlyContinue |
 # QEMU's own chatter goes to a file: it is not part of what the board said,
 # and PowerShell renders anything on stderr as an error.
 $qemuOut = 'build\qemu-emulator.log'
+# An escape hatch for debugging, and the only way to attach one: ARGON_QEMU_EXTRA
+# is split on spaces and appended, so `-s` puts a gdb stub on :1234 and `-S`
+# holds the machine until the debugger says go.
+if ($env:ARGON_QEMU_EXTRA) {
+    $qemuArgs += ($env:ARGON_QEMU_EXTRA -split ' ' | Where-Object { $_ -ne '' })
+}
+
 $proc = Start-Process -FilePath $qemu -ArgumentList $qemuArgs -NoNewWindow `
     -PassThru -RedirectStandardOutput $qemuOut -RedirectStandardError "$qemuOut.err"
 
