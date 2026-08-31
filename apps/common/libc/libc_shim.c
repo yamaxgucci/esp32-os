@@ -130,9 +130,9 @@ static void report_big(size_t n, void *r0, void *r1, void *r2, void *r3,
  * that arrive when the table is full are counted in a spill line rather than
  * dropped - a total that does not add up is worse than a coarse one.
  */
-#define PROFILE_LIVE  32768u         /* pointer slots, a power of two */
+#define PROFILE_LIVE  65536u         /* pointer slots, a power of two */
 #define PROFILE_SITES 192u
-#define PROFILE_MIN   512u
+#define PROFILE_MIN   96u
 #define PROFILE_PROBE 256u
 
 typedef struct {
@@ -346,7 +346,7 @@ void *realloc(void *p, size_t n)
     /* Prefer the ABI realloc: it knows the old block size (multi_heap). */
     prof_free(p);
     q = ag_realloc(p, n);
-    prof_alloc(q, n, __builtin_return_address(0));
+    prof_alloc(q, n, __builtin_return_address(3));
     return q;
 }
 

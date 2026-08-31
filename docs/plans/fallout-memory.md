@@ -221,34 +221,118 @@ large as the arena allows.  1400 KB down to 800 is 600 KB back, and what that
 costs in frames has only ever been measured on the temple, where the cache
 cannot fill.
 
-## What the climb is: not yet known
+## What the climb is: objects and scripts
 
-Ruled out by measurement rather than by argument:
+Answered, and confirmed by two runs that agree on everything else.  The
+live-bytes profiler (`-prof N`) counts what is still outstanding per call site
+rather than what was asked for — the engine asks for 37 MB in a three-second
+window and gives nearly all of it back, so counting requests measures churn and
+nothing else.  At the plateau, with `PROFILE_MIN` at 96 bytes:
 
-- **not the art cache's size** — see the table above
-- **not sound** — `sounds=0 music=0 speech=0` in `fallout2.cfg` and Broken
-  Hills still reaches 7783 KB instead of 8131, so sound is about 350 KB of it
-- **not the sound effects cache** — it is 64 KB in `fallout2.cfg`
-- **not a file being decoded whole** — both `backgroundSoundLoad` call sites
-  already ask for `SOUND_TYPE_STREAMING` after patch 0004
+| site | Temple of Trials | Broken Hills | difference |
+|---|---|---|---|
+| `artInit` — the art cache heap | 1401 KB | 1401 KB | 0 |
+| three sites inside `gameInitWithOptions` | 1172 KB, 487 blocks | 1172 KB, 487 | 0 |
+| one 640×480 buffer (see below) | 310 KB, 1 | 310 KB, 1 | 0 |
+| a block near `_cleanupMovie` | 200 KB, 1 | 200 KB, 1 | 0 |
+| `interfaceFontsInit` | 108 KB | 108 KB | 0 |
+| `protoInit` | 106 KB | 106 KB | 0 |
+| `isoInit` | 85 KB | 85 KB | 0 |
+| sound | 201 KB | 269 KB | +68 |
+| **`mapLoad` — the map's objects** | **81 KB, 567 blocks** | **1026 KB, 7102 blocks** | **+945** |
+| **`programCreateByPath` — scripts** | **not in the top 16** | **1025 KB, 160 blocks** | **+1025** |
+| total attributed | 4047 of 5330 | 6155 of 7681 | |
 
-Named so far, from the live-bytes profiler at the plateau (`-prof N`, which
-counts what is still outstanding per call site rather than what was asked for —
-the engine asks for 37 MB in a three-second window and gives nearly all of it
-back, and churn drowned the first version of this):
+**Two things scale with the map and nothing else does.**  1970 KB of the 2108 KB
+difference is objects and scripts.  Everything else is a fixed cost paid on
+every map, the Temple of Trials included.
 
-| KB live | blocks | site |
-|---|---|---|
-| 1401 | 1 | `artInit` — the art cache heap |
-| 1288 | 35 | `memoryBlockReallocImpl` |
-| 420 | 17 | inside `gameInitWithOptions` |
-| 200 | 1 | a `constprop` clone near `_cleanupMovie`, unresolvable without `-g` |
-| 108 | 5 | `interfaceFontsInit` |
-| 105 | 12 | `isoInit` |
+`mapLoad`'s blocks average 148 bytes, which is `sizeof(Object)` plus the
+engine's own 16-byte block header: 7102 objects on Broken Hills against 567 in
+the temple.  `objectLoadAll` (`object.cc:502`) reads the objects of **all three
+elevations** in one pass, so a three-elevation map pays for all of them at once.
 
-3608 KB of the 7685 in use, and the tables were saturating — 8192 pointer slots
-and 64 sites were not enough.  Widened to 32768 and 192, and the dump says how
-full they are now.  The run that uses them is what should close this.
+Scripts are the other half, and they are why the arena climbs for minutes after
+a map loads rather than arriving with it.  `scriptExecProc`
+(`scripts.cc:1275`) loads a script's `Program` **the first time that script
+runs**, guarded by `SCRIPT_FLAG_0x01`, and nothing unloads it while the map is
+up.  So the resident set grows as critters wake, doors get looked at and timers
+fire, and it settles once every script on the map has run once: 160 programs,
+6.4 KB each.
+
+## The plan, with the numbers behind it
+
+The gap: Broken Hills plateaus at 7680 KB and peaks at 8131 against an arena of
+6100.  About 1800 KB has to come out, and these four are where it is.
+
+### 1. A bounded script cache — up to 800 KB
+
+The biggest single item and the one with a clean seam.  A script's persistent
+state lives in its `Script` struct, not in its `Program`: `procs[]`, flags,
+owner, target, the lot.  `programFree` already exists and frees `data`,
+`dynamicStrings` and the stacks, and the reload path is complete — clear
+`SCRIPT_FLAG_0x01` and the next `scriptExecProc` reloads the program, calls
+`scriptLocateProcs` to re-find the procedures, and runs the program's
+initialisation before the procedure it was asked for.
+
+So: walk `gScriptLists` the way `scriptGetSid` does, count resident programs,
+and when the count is over a cap, free the programs that are not currently
+executing.  160 programs down to 40 is about 770 KB.
+
+The risk, stated rather than hidden: a Fallout script's file-scope variables
+live in the `Program`, so evicting one resets them.  Persistent state is meant
+to use `local_var`/`global_var`, and scripts are unloaded wholesale on a map
+change anyway, so nothing can rely on them across visits — but something might
+rely on them within one.  Worth a config switch rather than being
+unconditional.
+
+### 2. The art cache down, not up — 600 KB
+
+`art_cache_size=1400` is 1401 KB of the fixed cost, and a bigger one buys
+nothing (measured: see above).  800 KB gives 600 KB back.  What it costs in
+frames has only ever been measured on the temple, where the cache cannot fill,
+so this needs one `-fps` run on Broken Hills before and after.
+
+### 3. The 310 KB buffer, and the 200 KB one — up to 510 KB
+
+Both are single blocks, both are live on every map from startup to exit, and
+neither is identified.  The 310 KB one is 307216 bytes, which is 640×480 plus
+the engine's header — a whole screen.  It is **not** `_screen_buffer`: that is
+guarded by `a3 & 1` in `windowManagerInit` and `main.cc:274` passes `a4 = 0`.
+addr2line named it `gameInitWithOptions` in one run and `strParseStrFromFunc`
+in another, which means the symbol belongs to a cold or cloned section and
+cannot be trusted: the app is built without `-g`.  Link with
+`ARGON_FALLOUT_LDFLAGS=-Wl,-Map=build/fo2.map` and look the address up there,
+or build that one translation unit with `-g`.
+
+The 200 KB one resolves to a `constprop` clone near `_cleanupMovie` and is
+still live long after the movies have finished, which is either a movie buffer
+that is never freed or another bad symbol.  Same treatment.
+
+### 4. Objects, without changing when they load — about 280 KB
+
+Loading only the current elevation's objects would be worth 600 KB on a
+three-elevation map, and it runs into the save: `_map_save_in_game` writes
+every object back, so an elevation that was never instantiated cannot be
+written and the map would lose it.  Not impossible, but not cheap either.
+
+Cheaper and safe, for 7102 objects:
+
+- they are allocated one at a time, so **113 KB is the engine's 16-byte block
+  header**.  A slab or pool for `Object` recovers all of it.
+- the struct is nineteen `int`s and several are small: `rotation`, `frame`,
+  `elevation`, `lightDistance`, `lightIntensity`, `outline`.  Narrowing the
+  obvious ones is roughly another 170 KB.
+
+### Not on this list any more
+
+- **`gTileIntensity` and `_square_data`** are `bss`.  `bss` is in the app's
+  data segment, which the loader allocates separately from the arena, so
+  narrowing them does not give the arena a single byte.  They make the *image*
+  smaller, which matters for a different reason and on a different page.
+- **A bigger art cache.**  Measured; it costs its own size exactly.
+- **Anything about the map ambience or the effects cache.**  Already streamed,
+  already 64 KB.
 
 ## Where the baseline goes, measured
 
