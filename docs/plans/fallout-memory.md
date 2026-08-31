@@ -663,11 +663,33 @@ bar, the critters, the messages about passing the Temple of Trials.  82% of
 sampled pixels carry a colour cast, which is what a palette-mapped scene should
 look like.
 
-**A movie frame did not.**  An earlier shot at 330 s caught `intro.mve` playing
-and it was pure greyscale, with the letterboxing of a 640x320 movie in a 640x480
-window.  Greyscale is exactly the palette `directDrawInit` sets when it creates
-the surface - `colors[i] = {i, i, i}` - so the movie's own palette is not
-reaching the panel.  Nothing to do with today's patches; the map proves the
-palette machinery works, so this is the movie path specifically.  Worth a look in
-`movieBufferedImpl`/`movieDirectImpl` and whatever the port does with
-`MVE_setPalette`.
+**A movie frame did not.**  A shot at 330 s caught `intro.mve` and came out
+grey: 0.0% of sampled pixels have a channel spread over 6, and the largest
+spread in the whole frame is 4, which is RGB565 rounding.  That is the identity
+ramp `directDrawInit` installs when it creates the surface, `colors[i] = {i, i,
+i}`, and not a desaturated movie.
+
+What was ruled out, so the next person starts further along:
+
+- The screenshot is not lying about the screen.  `write_ppm` reads `s_gfx.fb`,
+  the panel framebuffer itself.
+- The engine's callback fires, and with real colour.  `movieSetPaletteEntriesImpl`
+  is called with `start=1 count=254`, and the entries carry warm browns -
+  `e60=20,15,9`, `e120=40,39,28` in the palette's own six-bit units.
+- The port receives colour and builds a colour table.  Sampling
+  `palette_lut` at rebuild gives `c60=184,156,40`, `c200=0,108,0` and others.
+- Nothing to do with this session's patches: the map screenshot is 82% coloured
+  through the same path.
+
+What is left, and it is an ordering hazard specific to the movie path.  In
+`movie_lib.cc`'s frame opcode the sequence is `palClrPalette` (black), then
+`sfShowFrame`, then `palSetPalette` (the real colours) - and `movieDirectImpl`
+calls `renderPresent()` itself, inside `sfShowFrame`.  In this port the palette
+is applied during the 8-bit-to-RGB565 blit and the presenting surface *is* the
+framebuffer, so a palette set after the present cannot change the frame already
+on the panel.  The game's normal frames set the palette and then draw, which is
+why they are fine.
+
+That predicts black rather than grey, so it is not the whole story.  The cheapest
+next step is not another headless bisection: run it in a window - `argon run -Sd`
+- and watch what the movies actually do.
