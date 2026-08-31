@@ -138,14 +138,14 @@ static void report_big(size_t n, void *r0, void *r1, void *r2, void *r3,
  * per site, so the difference between two snapshots is exactly what an action
  * kept, with the churn cancelled out.
  *
- * The costs, so they are on the record rather than a surprise: 96 KB of table,
+ * The costs, so they are on the record rather than a surprise: 3 MB of table,
  * a hash and a short probe on every allocation over the threshold, and blocks
  * that arrive when the table is full are counted in a spill line rather than
  * dropped - a total that does not add up is worse than a coarse one.
  */
-#define PROFILE_LIVE  65536u         /* pointer slots, a power of two */
-#define PROFILE_SITES 192u
-#define PROFILE_MIN   96u
+#define PROFILE_LIVE  262144u        /* pointer slots, a power of two */
+#define PROFILE_SITES 1024u
+#define PROFILE_MIN   16u
 #define PROFILE_PROBE 256u
 
 typedef struct {

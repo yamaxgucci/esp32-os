@@ -166,36 +166,6 @@ moves it somewhere with more overhead.  Together with the earlier run at 3000
 KB, which cost exactly its own extra size, **the art cache is not a lever in
 either direction.**  Leave it at 1400 and stop measuring it.
 
-## What is left, in the order it should be tried
-
-The load-time peak is now the whole problem: ~6100 KB against an arena of 6100,
-with the map's objects (1026 KB) and the fixed startup cost (about 4000 KB)
-inside it.
-
-1. **Enforce the script cap at load time, not once a frame.**  The trim recovers
-   878 KB and recovers it too late.  Calling it from `scriptExecProc` before a
-   new program is loaded would hold the line through the load, and needs a way
-   to know which programs are on the call stack - a depth counter around
-   `_executeProcedure` would do it.
-2. **The two unidentified single blocks, 310 KB and 200 KB.**  Both live from
-   startup to exit on every map.  The 310 KB one is 307216 bytes, which is
-   640x480 plus the engine's header; the trace is
-   `... <- gameInitWithOptions+0x256 <- falloutMain <- main`, and +0x256 is
-   `_initWindow(1, a4)` - so it is something inside `windowManagerInit` or the
-   video init proc, inlined.  It is **not** `_screen_buffer`: that needs
-   `a3 & 1` and `main.cc:274` passes `a4 = 0`.
-   **Build with `-g` before guessing again.**  addr2line without it named the
-   same address two different things on two runs, and the link map is no better
-   because it lists no static functions - it answered `mapLoadSaved+0x255` for
-   the frame that is certainly `memoryBlockMallocImpl`.
-3. **Objects, about 280 KB.**  7102 of them, allocated one at a time, so 113 KB
-   is the engine's 16-byte block header; a pool removes all of it.  Another
-   ~170 KB is in fields that do not need to be `int` (`rotation`, `frame`,
-   `elevation`, `lightDistance`, `lightIntensity`, `outline`).
-4. **The inflate windows.**  32 KB per compressed `.DAT` entry open for reading.
-   `windowBits` cannot go below what the data was deflated with, so the lever is
-   how many are open at once, which has never been counted.
-
 ## How to instrument this
 
 `-memstat N` prints the arena every N ms and arms the rest.
@@ -223,6 +193,119 @@ to live.
 
 `-scripts N` caps resident script programs.  `-fps N` prints where a frame goes.
 `KEY_F11` (patch 0013) steps to the next elevation the map actually has.
+
+## The complete accounting
+
+Broken Hills, arena 6100, `-scripts 24`, at the moment the load fails.  Built
+with `ARGON_FALLOUT_DEBUG=1` so `addr2line -i` names the inlined callee instead
+of `gameInitWithOptions`, which is where this engine puts every init routine:
+
+| KB live | blocks | site |
+|---|---|---|
+| 1192 | 14204 | `objectLoadAll` — `map.cc:922` |
+| 798 | 3726 | `wmWorldMap_init` — `game.cc:280` |
+| 602 | 5 | the art cache heap — `art.cc:151` |
+| 421 | 23 | `isoInit` — `game.cc:235` |
+| 363 | 14046 | `protoInit` — `game.cc:249` |
+| 310 | 1 | `directDrawInit` — the engine's 640×480 8-bit surface |
+| 300 | 5 | `falloutMain`, including `_main_load_new`'s loading window |
+| 209 | 7054 | `aiMessageListReloadIfNeeded` — `combat_ai.cc:3610` |
+| 146 | 5 | `cacheLock` — art that spilled out of the cache into the arena |
+| 108 | 5 | `interfaceFontsInit` |
+| 106 | 6 | `protoInit`, a second site |
+| 85 + 20 | 13 | `isoInit` |
+| 79 | 924 | `gameInitWithOptions` itself — `main.cc:274` |
+| 72 | 32 | `mapLoadByName` |
+| 64 | 1 | `mapLoad` — `map.cc:833` |
+| 55 | 1 | `aiMessageListInit` |
+| 51 | 2606 | `protoInit`, a third site |
+
+5397 KB of the ~5880 in use, in 47062 tracked blocks.
+
+**Read the block counts, not just the sizes.**  Three sites account for 35304 of
+those blocks: the objects, the prototypes and the AI messages.  Fallout 2's
+`internal_malloc` puts a 16-byte header on every one, and the ABI allocator
+underneath adds its own and rounds up — so on the order of **560 KB of that
+5397 is per-block overhead on tens of thousands of tiny allocations**, not data.
+The prototypes are the clearest case: 363 KB in 14046 blocks is 26 bytes each,
+which is mostly header.
+
+## The art cache has a floor, and it is not 600 KB
+
+The 8 MB run dies like this:
+
+```
+Heap Warning: Could not allocate block of 505100 bytes.
+Total free size: 505872        <- in four fragments
+Allocating block from system memory...
+malloc: out of arena asking for 505136 bytes; 222 of 6100 KB free
+fatal error: internal_malloc() failed in heap_find_free_block()!
+```
+
+**One art item is 505100 bytes.**  A 600 KB cache cannot hold it once the cache
+has any holes in it, so the request goes to the `system:` fallback, the arena
+has 222 KB, and the engine calls that fatal.  That is the mechanism behind the
+earlier oddity where turning the cache *down* left less free at the moment of
+failure, not more.
+
+So `art_cache_size` has a hard floor: comfortably more than the largest single
+`.FRM` the game will ask for, which is at least 505 KB.  1400 KB was a good
+choice.  **Do not lower it** - and there is nothing to win by raising it either
+(measured: 3000 KB costs exactly its own extra size).  This question is closed.
+
+## The levers, largest first
+
+1. **The world map: 798 KB, resident from startup to exit, on every map.**
+   `wmWorldMap_init` at `game.cc:280`, 3726 blocks.  The player looks at the
+   world map for a few seconds at a time; nothing needs its cities, its tile
+   descriptions and its encounter tables resident while walking around Broken
+   Hills.  Loading it when `wmWorldMap()` is entered and freeing it on the way
+   out is the single biggest item on this list, bigger than anything else
+   available.
+2. **The per-block overhead: on the order of 560 KB.**  A pool for the three
+   sites that make 35304 tiny allocations - `Object` and `ObjectListNode` in
+   `objectLoadAll`, the prototype lists in `protoInit`, the AI message lists -
+   removes the 16-byte engine header and the allocator's own from each.  All
+   three are long-lived and freed wholesale, which is exactly the shape a bump
+   allocator suits.
+3. **Scripts: 878 KB, already implemented.**  Patch 0014, `-scripts N`.  What is
+   missing is enforcing the cap *during* the map load rather than once a frame
+   from `mainLoop` - the peak happens before the count ever reaches the cap.
+4. **The last movie frame: 200 KB, done.**  Patch 0015.
+5. **Objects, narrower.**  On top of pooling them: `rotation`, `frame`,
+   `elevation`, `lightDistance`, `lightIntensity` and `outline` do not need to
+   be `int`.  About 170 KB across 7102 objects.
+6. **`isoInit`, 421 KB in 23 blocks.**  Not looked at yet; 23 blocks of ~18 KB
+   is worth one read of `map.cc:227` onwards.
+
+Together 1 and 2 are about 1350 KB, which is the size of the hole.
+
+## What reading the source settled that measuring could not
+
+Worth recording, because the balance went both ways today.
+
+Measuring was the only way to learn **how big** anything was, and it overturned
+three conclusions that reading had supported: `_screen_buffer` looked like 300 KB
+of dead allocation and is never allocated; an elevation change looked free in
+the code and appeared to cost 2 MB, which turned out to be the map filling up
+over minutes; and map size looked like it must dominate, while the largest map
+in the game costs the same as a medium one at the moment it finishes loading.
+
+Reading was the only way to learn **what** anything was, once a number pointed
+at it.  `_lastMovieBuffer` is the clean case: the profiler could say "200 KB
+from somewhere near `_cleanupMovie`" and no more, and five minutes in `movie.cc`
+showed it is written once and read nowhere, which made patch 0015 a two-line
+certainty instead of a guess.  Same for the 310 KB, which is
+`SDL_CreateRGBSurface(0, 640, 480, 8)` in `directDrawInit` and cannot go
+anywhere while the engine draws at 640×480.
+
+The tool that made the difference in between was `-g`.  Without debug info
+addr2line answers with whatever symbol owns the enclosing section, which for an
+inlined callee is the wrong function - it named one address `gameInitWithOptions`
+on one run and `strParseStrFromFunc` on the next.  The link map is no better: it
+lists no static functions, so its nearest-preceding answer for
+`memoryBlockMallocImpl` was `mapLoadSaved+0x255`.  With `ARGON_FALLOUT_DEBUG=1`
+every site above came out with a file and a line on the first try.
 
 ## Already done, do not redo
 

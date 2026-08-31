@@ -253,6 +253,15 @@ def compile_one(src: str, obj: str) -> subprocess.CompletedProcess:
         # The C flags are a subset; the C++-only ones would be rejected.
         cmd = [driver, "-c", "-Os", "-ffunction-sections", "-fdata-sections",
                "-fno-builtin", "-mlongcalls", "-w"]
+    # Debug info, for addr2line.  Without it addr2line answers with whatever
+    # symbol owns the enclosing section, which for an inlined callee or a
+    # constprop clone is the wrong function - and this engine inlines every
+    # init routine into gameInitWithOptions, which is exactly where the
+    # unexplained allocations are.  The image does not carry it: the packer
+    # copies the loadable sections and leaves the rest in the ELF, which is
+    # where addr2line reads it from.
+    if os.environ.get("ARGON_FALLOUT_DEBUG") == "1":
+        cmd += ["-g"]
     # The libc shim's live-bytes profiler, off by default: its tables are 768 KB
     # of bss, and on an 8 MB part that is 768 KB the 6100 KB arena cannot have -
     # the app does not load at all.  Right for a diagnostic run, wrong for an
