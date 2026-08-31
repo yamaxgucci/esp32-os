@@ -30,6 +30,7 @@ extern "C" void ag_libc_io_stats(uint64_t *us, uint32_t *reads,
                                  uint64_t *open_us, uint64_t *seek_us);
 extern "C" void ag_libc_io_reset(void);
 extern "C" uint32_t ag_libc_io_misses(void);
+extern "C" uint64_t ag_libc_io_bytes(void);
 
 /*
  * What the art cache does, counted by the engine and printed by the port.
@@ -352,7 +353,7 @@ static void fps_service(void)
                          &seek_us);
         ag_printf("[fps t=%u] %u.%02u fps, %u us/frame: blit %u (%u KB), "
                   "flush %u in %u (%u KB), engine %u, io %u us "
-                  "(open %u, seek %u, read %u) "
+                  "(open %u, seek %u, read %u; %u KB) "
                   "(%u reads, %u opens of which %u found nothing, %u seeks, "
                   "in the window)\n",
                   (unsigned)ag_millis(),
@@ -369,6 +370,7 @@ static void fps_service(void)
                   (unsigned)(open_us / frames),
                   (unsigned)(seek_us / frames),
                   (unsigned)((io_us - open_us - seek_us) / frames),
+                  (unsigned)(ag_libc_io_bytes() / 1024u),
                   /* Totals over the window, not per frame: a few reads across
                    * ninety frames divide down to zero and read as "no I/O at
                    * all" next to an I/O time that says otherwise. */

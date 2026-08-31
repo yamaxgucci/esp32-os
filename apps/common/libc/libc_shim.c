@@ -606,6 +606,14 @@ static uint64_t s_open_us;
 static uint64_t s_seek_us;
 
 /*
+ * And how many bytes came back.  Reads counted alone say nothing about a card:
+ * four hundred of them is a fortnight's work or a fifth of a second depending
+ * on how big each one was, and it was bytes that the read-ahead experiment
+ * turned out to be about.
+ */
+static uint64_t s_io_bytes;
+
+/*
  * Opens that found nothing, counted separately.
  *
  * A program that looks for a file in three places before the one it is in
@@ -619,6 +627,11 @@ static uint32_t s_io_misses;
 uint32_t ag_libc_io_misses(void)
 {
     return s_io_misses;
+}
+
+uint64_t ag_libc_io_bytes(void)
+{
+    return s_io_bytes;
 }
 
 void ag_libc_io_stats(uint64_t *us, uint32_t *reads, uint32_t *opens,
@@ -653,6 +666,7 @@ void ag_libc_io_reset(void)
     s_io_misses = 0;
     s_open_us = 0;
     s_seek_us = 0;
+    s_io_bytes = 0;
 }
 
 static int32_t timed_read(ag_handle_t h, void *buf, size_t len)
@@ -661,6 +675,9 @@ static int32_t timed_read(ag_handle_t h, void *buf, size_t len)
     const int32_t   n = ag_read(h, buf, len);
     s_io_us += (uint64_t)(ag_micros() - t0);
     s_io_reads++;
+    if (n > 0) {
+        s_io_bytes += (uint64_t)n;
+    }
     return n;
 }
 

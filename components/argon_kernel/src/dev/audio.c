@@ -15,13 +15,43 @@
 #include "argon/log.h"
 #include "argon/proc.h"
 
+#include <argon/port/time.h>
+
 #define TAG "audio"
+
+/*
+ * How far ahead of the sound a writer may get, in frames.  A real output has a
+ * buffer and so does this one; at 22 kHz, 4096 frames is 186 ms, which is more
+ * than any frame of any program here takes and small enough that stopping the
+ * program stops the sound.
+ */
+#define AG_PCMNULL_DEPTH 4096u
 
 static ag_device_t    *s_dev;
 static int            s_api_held; /* api->audio holds exclusive open */
 static int            s_fmt_set;
 static ag_audio_fmt_t s_fmt;
 static ag_pid_t       s_owner = AG_PID_KERNEL;
+
+/*
+ * The mute output still takes a second to play a second.
+ *
+ * It used to accept everything the instant it was offered and report 4096
+ * frames of room for ever, which is not a device - it is an infinitely fast
+ * one, and no such thing exists to be muted.  Programs pace themselves by the
+ * room their output reports, so against this one they ran their mixer as fast
+ * as the processor allowed.  Fallout 2 streams its music from the card, and
+ * with a null sink it read that music at 500 KB a second to play 88 KB of it -
+ * six times over, and eighteen milliseconds of every frame, on a machine where
+ * the frame was fifty.  Every measurement of anything with sound in it was
+ * wrong by that much.
+ *
+ * So the sink keeps a clock.  Frames written are counted, frames the sample
+ * rate says have been consumed since the device was opened are counted, and
+ * the room reported is the difference against a fixed depth.
+ */
+static uint64_t s_open_us;
+static uint64_t s_frames_written;
 
 static void default_fmt(ag_audio_fmt_t *out)
 {
@@ -166,7 +196,9 @@ static ag_err_t audio_open(const ag_audio_fmt_t *fmt)
         return err;
     }
     s_api_held = 1;
-    ag_log(AG_LOG_INFO, TAG, "pcmnull open %u Hz %u ch (discard)",
+    s_open_us = ag_port_us();
+    s_frames_written = 0;
+    ag_log(AG_LOG_INFO, TAG, "pcmnull open %u Hz %u ch (discard, paced)",
            (unsigned)s_fmt.rate, (unsigned)s_fmt.channels);
     return AG_OK;
 }
@@ -193,12 +225,26 @@ static int32_t audio_write_pcm(const int16_t *pcm, int32_t frames)
     if (n < 0) {
         return n;
     }
-    return (int32_t)((size_t)n / (sizeof(int16_t) * (size_t)s_fmt.channels));
+    n = (int32_t)((size_t)n / (sizeof(int16_t) * (size_t)s_fmt.channels));
+    s_frames_written += (uint64_t)n;
+    return n;
 }
 
 static int32_t audio_space(void)
 {
-    return s_api_held ? 4096 : 0;
+    if (!s_api_held || !s_fmt_set) {
+        return 0;
+    }
+    {
+        const uint64_t elapsed = ag_port_us() - s_open_us;
+        const uint64_t played = elapsed * (uint64_t)s_fmt.rate / 1000000u;
+        const uint64_t ahead =
+            (s_frames_written > played) ? s_frames_written - played : 0u;
+        if (ahead >= AG_PCMNULL_DEPTH) {
+            return 0;
+        }
+        return (int32_t)(AG_PCMNULL_DEPTH - ahead);
+    }
 }
 
 const ag_audio_api_t ag_audio_api_table = {
