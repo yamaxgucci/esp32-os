@@ -704,6 +704,53 @@ name.  Even without one, the sizes and their order against the engine's own
 progress printing usually name it - 1049616 is the art cache and nothing else
 is.
 
+### What it would take to have room
+
+Two things are now measured that were not before.
+
+**Two megabytes of art cache stops the tile thrash completely.**  Standing on
+the Temple of Trials with `art_cache_size=2`, every three-second window reads
+nothing, evicts nothing and flushes nothing - against one window in three
+fetching 20-80 entries and evicting 40-130 at 1 MB.  Four megabytes is not
+needed; two is the whole answer, and it is what makes the game feel smooth
+rather than merely fast.
+
+**A map change wants 837 KB more than standing still.**  The arena peaks at
+5254 KB on a loaded map (1 MB cache, transients included).  Entering the Temple
+asked for 32 KB when 41 KB was free in no hole larger than 31 KB - so the real
+demand is 6091 KB against an arena of 6100, and the engine exits when it is
+refused.
+
+And the arena cannot be made bigger.  8007 KB of extended memory is free with
+the card mounted and the image's data takes 1812, but the arena has to be one
+block: 6150 is refused, and so are 6220 and 6360.  All three were tried.
+
+So the whole budget, on an 8 MB part:
+
+| | KB |
+|---|---|
+| image data, almost all bss | 1812 |
+| arena, standing still, 1 MB cache | 5254 |
+| a map change, on top of that | 837 |
+| a second megabyte of art cache | 1024 |
+| **wanted** | **8927** |
+| the part has | 8007 |
+| **short by** | **920** |
+
+Where 920 KB could come from, largest first.  None of it is done:
+
+| KB | |
+|---|---|
+| 320 | `gTileIntensity` is `int[3][40000]` in bss - three map levels of 200×200 hexes. Almost every map has one level. Allocating the levels a map actually has moves 480 KB of bss into 160 KB of arena. The type cannot be narrowed: the values are added and subtracted and pass 65536 before being clamped on read |
+| 128 | four 32 KB zlib windows, one per open archive stream. Patch 0005 keeps the archive open; how many streams are live at once has not been looked at |
+| 80 | `_square_data`, the same three-levels-for-one trick |
+| 64 | the music streaming ring, 128 KB down to 64 - a second and a half of audio in advance is already thin, so this one costs something |
+
+That is 592 KB of the 920.  The rest would have to come out of the three
+640×480 8-bit buffers the engine keeps (900 KB between them), and the one that
+looked dead is not: `_screen_buffer` is guarded by a flag `gameInitWithOptions`
+passes as zero, so it was never allocated in the first place.
+
 ### What is left in the arena
 
 | | |

@@ -71,8 +71,8 @@ size_t ag_libc_arena_low(void)
  * Off unless asked for: a program that allocates a megabyte on purpose should
  * not have to explain itself on the console every time it runs.
  */
-#define ARENA_REPORT_MIN (512u * 1024u)
-#define ARENA_REPORT_MAX 12
+#define ARENA_REPORT_MIN (32u * 1024u)
+#define ARENA_REPORT_MAX 64
 
 static int s_big_reported;
 static int s_big_trace;
@@ -82,15 +82,22 @@ void ag_libc_malloc_trace(int on)
     s_big_trace = on ? 1 : 0;
 }
 
-static void report_big(size_t n, void *ret, void *p)
+static void report_big(size_t n, void *ret, void *ret2, void *ret3,
+                       void *p)
 {
     if (!s_big_trace || n < ARENA_REPORT_MIN ||
         s_big_reported >= ARENA_REPORT_MAX) {
         return;
     }
     s_big_reported++;
-    ag_printf("malloc: %u bytes from %p%s\n", (unsigned)n, ret,
-              (p == NULL) ? " FAILED" : "");
+    /*
+     * Two return addresses, because one is not enough: a vendored
+     * engine calls its own internal_malloc, so the immediate caller is
+     * always the same wrapper and says nothing.  The frame above it is
+     * the code that wanted the memory.
+     */
+    ag_printf("malloc: %u bytes from %p %p %p%s\n", (unsigned)n, ret,
+              ret2, ret3, (p == NULL) ? " FAILED" : "");
 }
 
 void *malloc(size_t n)
@@ -99,7 +106,8 @@ void *malloc(size_t n)
         n = 1;
     }
     void *p = ag_malloc(n);
-    report_big(n, __builtin_return_address(0), p);
+    report_big(n, __builtin_return_address(0), __builtin_return_address(1),
+               __builtin_return_address(2), p);
     if (p != NULL && n >= ARENA_WATCH_MIN) {
         ag_meminfo_t mi;
         ag_meminfo(&mi);

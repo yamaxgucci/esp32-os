@@ -245,7 +245,7 @@ def main() -> int:
     last_find = 0.0
 
     print(
-        f"kbdvirt → {args.host}:{args.port}  "
+        f"kbdvirt -> {args.host}:{args.port}  "
         f"(click QEMU RGB to capture; RCtrl toggles sticky; Ctrl+C=quit)",
         flush=True,
     )

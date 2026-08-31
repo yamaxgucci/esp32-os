@@ -490,7 +490,7 @@ def main() -> int:
     anti: AntiGrab | None = None
 
     print(
-        f"mousevirt → {args.host}:{args.port}  guest {args.width}x{args.height}  "
+        f"mousevirt -> {args.host}:{args.port}  guest {args.width}x{args.height}  "
         f"(RCtrl=pause, Esc/Ctrl+C=quit)",
         flush=True,
     )

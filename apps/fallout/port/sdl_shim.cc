@@ -1195,6 +1195,22 @@ static int s_q_tail;
 static int s_mouse_dx;
 static int s_mouse_dy;
 static Uint32 s_mouse_buttons;
+
+/*
+ * Buttons that have been down at any point since the engine last looked.
+ *
+ * Fallout reads the button *level*, once a frame, and works out presses and
+ * releases from how it changes.  Everything that has arrived from the driver
+ * since the last frame is drained in one go, so a press and its release both
+ * land between two reads and the level it sees never changes: the click did
+ * not happen.  At forty milliseconds a frame that is most clicks, and it is
+ * why the game could be pointed at but not told to do anything.
+ *
+ * So a button that goes down stays reported until it has been read once.  The
+ * engine then sees it down on one frame and up on the next, which is a click,
+ * which is what it was.
+ */
+static Uint32 s_mouse_latch;
 static int s_mouse_x = -1;
 static int s_mouse_y = -1;
 
@@ -1353,6 +1369,20 @@ static void report_read(const char *what, ag_handle_t h, int32_t n)
  * round and not drawing.  Silence says it is inside a call that has not
  * returned, which is a different bug and a different place to look.
  */
+/*
+ * How long the panel has been showing the same frame, in milliseconds.
+ *
+ * Read by the movie player, which cannot tell on its own that it has stopped
+ * working: see patches/fallout2-ce/0009.
+ */
+extern "C" unsigned ag_frame_stalled_ms(void)
+{
+    if (s_last_present_ms == 0u) {
+        return 0u;
+    }
+    return (unsigned)((uint32_t)ag_millis() - s_last_present_ms);
+}
+
 static void stall_service(void)
 {
     const uint32_t now = (uint32_t)ag_millis();
@@ -1442,6 +1472,7 @@ static void pump(void)
             s_mouse_y = y;
             const Uint32 prev_buttons = s_mouse_buttons;
             s_mouse_buttons = buttons_of(e.ptr.buttons);
+            s_mouse_latch |= s_mouse_buttons;
 
             if (e.type == AG_EV_POINTER_MOVE) {
                 out.type = SDL_MOUSEMOTION;
@@ -1564,7 +1595,9 @@ Uint32 SDL_GetRelativeMouseState(int *x, int *y)
     }
     s_mouse_dx = 0;
     s_mouse_dy = 0;
-    return s_mouse_buttons;
+    const Uint32 buttons = s_mouse_buttons | s_mouse_latch;
+    s_mouse_latch = 0;
+    return buttons;
 }
 
 /*

@@ -1,0 +1,64 @@
+diff --git a/src/main.cc b/src/main.cc
+index ee67a0a..4534fa4 100644
+--- a/src/main.cc
++++ b/src/main.cc
+@@ -82,7 +82,16 @@ int falloutMain(int argc, char** argv)
+     }
+ 
+     // SFALL: Allow to skip intro movies
+-    int skipOpeningMovies;
++    //
++    // ARGON: initialised.  configGetInt leaves the variable alone when it
++    // cannot answer, and this one was uninitialised - so whether the three
++    // opening movies played was decided by whatever had last been on the
++    // stack.  It came out both ways on the same build, which is how a run that
++    // reached the main menu in forty seconds and a run that sat on a black
++    // screen for two minutes were the same program.  game.cc reads the same
++    // key three lines from here and does initialise it; this is the one that
++    // did not.
++    int skipOpeningMovies = 0;
+     configGetInt(&gSfallConfig, SFALL_CONFIG_MISC_KEY, SFALL_CONFIG_SKIP_OPENING_MOVIES_KEY, &skipOpeningMovies);
+     if (skipOpeningMovies < 1) {
+         gameMoviePlay(MOVIE_IPLOGO, GAME_MOVIE_FADE_IN);
+diff --git a/src/movie.cc b/src/movie.cc
+index e7fc909..0929793 100644
+--- a/src/movie.cc
++++ b/src/movie.cc
+@@ -752,6 +752,12 @@ static int _movieStart(int win, char* filePath)
+     return 0;
+ }
+ 
++/*
++ * ARGON: how long since the port last put a frame on the panel.  Zero when a
++ * frame has just been shown.  See the note in _localMovieCallback.
++ */
++extern "C" unsigned ag_frame_stalled_ms(void);
++
+ // 0x487964
+ static bool _localMovieCallback()
+ {
+@@ -761,6 +767,24 @@ static bool _localMovieCallback()
+         _movieCallback();
+     }
+ 
++    /*
++     * ARGON: a movie that has not produced a frame in ten seconds is over.
++     *
++     * The player paces itself against its own audio, and it has been seen to
++     * stop producing frames altogether - a black screen for two and a half
++     * minutes, both cores busy, this callback being asked "should I stop?"
++     * three hundred times a second and answering no.  It is intermittent and
++     * inside the decoder, and until it is understood this turns it from a
++     * machine that has to be killed into a movie that was skipped.
++     *
++     * A real skip is a keypress and stays a keypress; ten seconds is far
++     * longer than the gap between frames of a movie that is merely slow (the
++     * slowest measured here is under two).
++     */
++    if (ag_frame_stalled_ms() > 10000u) {
++        return true;
++    }
++
+     return inputGetInput() != -1;
+ }
+ 

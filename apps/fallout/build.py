@@ -119,6 +119,19 @@ RODATA_ARGS: list = []
 
 # How much of extended memory the process asks for.  See the comment on
 # AG_APP_SIZED in fallout_main.cc; --arena-kb overrides it.
+#
+# 6100 is not a round number chosen for looks, and it cannot be raised.  With
+# the card mounted an 8 MB part reports 8007 KB of extended memory free and the
+# image's own data takes 1812 of it, which suggests 6195 - but the arena has to
+# be one contiguous block, and 6150 is refused as flatly as 6360 is.  All three
+# were tried.  Whatever the data segment and the framebuffer leave behind is not
+# in one piece.
+#
+# That matters because the arena is nine kilobytes short of what a map change
+# needs: standing still it peaks at 5254 KB, entering the Temple of Trials wants
+# 837 KB more, and 6091 does not fit in 6100 once the heap has any holes in it.
+# The only way out is to use less, not to ask for more; the list is in the
+# README under "What it would take to have room".
 ARENA_KB = 6100
 
 # Files that only exist for a platform this is not.
