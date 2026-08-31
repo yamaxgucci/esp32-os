@@ -4,73 +4,80 @@ Written 31 August 2026, branch `worktree-fallout-cxx`. Everything here is
 measured; the numbers are the point, and the READMEs they came from are
 `apps/fallout/README.md` under **What it would take to have room**.
 
-## Where it stands after the first four patches
+## Where it stands after five patches
 
-Shipping configuration is now `-Psram 8`, arena **6340** KB, art cache 1400 KB,
-music ring 4×16 KB, patches 0014-0016 and 0018.
+Shipping configuration is now `-Psram 8`, arena **6340** KB, art cache **1000**
+KB, music ring 4×16 KB, patches 0014-0016, 0018 and 0019.
 
-| map | before | now |
+| map | before any of this | now |
 |---|---|---|
-| Temple of Trials | 5123 KB, ran | runs, more room |
-| **Arroyo village** | plateau 6205, peak 6636 — **never loaded** | **5365 KB of 6340, 22 fps, and `vsuit.mve` plays over it (peak 6329)** |
-| **Broken Hills** | **died during the map load** | **loads** - its own `OVERRIDE_MAP_START` runs - then runs out at 6302 of 6340 |
+| Temple of Trials | 5123 KB, ran | runs, with room |
+| **Arroyo village** | plateau 6205, peak 6636 — **never loaded** | **runs at 22 fps, and `vsuit.mve` plays over it** |
+| **Broken Hills**, the largest map in the game | **died during its own map load** | **loads and runs at 19-20 fps**, high-water 5836 of 6340; dies on the *next* map transition |
 
-About 1300 KB recovered in total, and 240 KB of it turned into arena rather than
-into free space.
-
-### What each one was worth
+### What each change was worth
 
 | | |
 |---|---|
 | 0014, bounded script cache (`-scripts N`) | 878 KB on a map that has been sat on for a while |
 | 0015, stop keeping the last movie frame | 200 KB, on every map, unconditionally |
-| 0016, no guard header on every allocation | ~560 KB on a busy map; more on any map with many objects |
+| 0016, no guard header on every allocation | ~560 KB on a busy map |
 | 0018, sixteen bits of light per tile | 240 KB of `bss`, which became 240 KB of arena |
+| 0019, slabs for objects and list nodes | 62 KB, and less fragmentation |
+| art cache 1400 → 1000 | 404 KB |
 
-## Broken Hills: what is still in the way
+0019 is worth reporting honestly: the estimate was 190 KB and the measurement
+was 62.  The engine's own guard header was the expensive part and patch 0016 had
+already taken it; what a slab removes on top of that is only whatever the ABI
+allocator puts around a block, and that turns out to be about five bytes an
+allocation once rounding is counted.  It is still worth having for the
+fragmentation - 17 KB slabs instead of fourteen thousand small blocks - but it is
+not a lever to pull again elsewhere.
 
-The trajectory says it plainly.  Standing at the main menu the arena holds about
-5200 KB; the map load takes it to 6273 in a single step and it dies at 6302 of
-6340, on a 32 KB zlib inflate window.
+## What is left
 
-That step is **the map's objects**: 7102 of them, an `Object` and an
-`ObjectListNode` each, and after patch 0016 that is about 160 bytes a pair
-including the ABI allocator's own header and its rounding.  1136 KB, arriving
-all at once, on top of a 5200 KB floor.  Everything else on the old list is
-either done or measured as not mattering: the script cap never fires here (fewer
-than twelve programs are resident before the arena runs out), and the art cache
-cannot go down (a single art item is 505100 bytes).
+Broken Hills now dies during the map transition *out* of Broken Hills, in
+`_partyMemberPrepLoad` at the head of the next `mapLoad`, on a 32 KB inflate
+window with 32 KB free.  The last `[mem]` sample before it read 5836, so about
+470 KB arrives between two samples: a transition holds the outgoing map while
+the incoming one is being built.
 
-So Broken Hills needs a few hundred kilobytes more, and there are three places
-left with no risk in them:
+Two items, in order:
 
-1. **Narrow `Object`.**  Nineteen `int`s, of which `rotation`, `frame`,
+1. **The world map, 739 KB, resident from startup to exit on every map.**  Still
+   the largest single item in the fixed cost, and now the largest by a wide
+   margin.  It is **not** the tile array, which is one block: the profiler
+   counts 1585 blocks averaging 477 bytes, so it is the message list and the
+   encounter tables.  Neither is needed except when the world map is on screen
+   or an encounter is being rolled.  Nothing has been read yet - `wmConfigInit`
+   in `worldmap.cc` is where to start, and the profiler cannot split it further
+   without keying on a fifth stack frame.
+2. **Narrow `Object`.**  About 170 KB across 7102 objects: `rotation`, `frame`,
    `elevation`, `lightDistance`, `lightIntensity` and `outline` do not need
-   thirty-two bits.  About 170 KB across 7102 objects.
-2. **Pool `Object` and `ObjectListNode`.**  They are all one size each, which is
-   what a free-list pool is for, and it removes the ABI allocator's per-block
-   header and rounding: about 142 KB.
-3. **The world map, 739 KB, resident from startup to exit.**  Still the largest
-   single item in the fixed cost.  It is **not** the tile array, which is one
-   block: the profiler counts 1585 blocks averaging 477 bytes, so it is the
-   message list and the encounter tables.  Those are needed when a random
-   encounter is rolled and when the world map is on screen, and at no other
-   time.  Worth a proper look before a line of it is written.
+   thirty-two bits.  The catch, and it is the reason this was left until last:
+   `objectRead` and `objectWrite` read and write these fields directly with
+   `fileReadInt32(stream, &(obj->x))`, so every one needs a temporary.  Getting
+   that wrong corrupts saved maps silently.
 
-1 and 2 together are about 310 KB, which would put Broken Hills at roughly 5990
-of 6340 - the whole game, with 350 KB to spare.
+## Things measured and closed
 
-## Loading only one elevation's objects: why not
+Do not spend runs on these again.
 
-Tempting, because two thirds of Broken Hills' objects belong to elevations the
-player is not on, and it would be 750 KB.  It runs into the save:
-`_map_save_in_game` writes every object back so that a map keeps its state
-between visits, and an elevation that was never instantiated cannot be written.
-Keeping the raw file bytes to copy through instead only saves the difference
-between 112 bytes on disk and 144 in memory, which is not worth the machinery.
-
-Not impossible - but it is a different order of work from the three above, and
-those three are enough.
+- **A bigger art cache.**  3000 KB instead of 1400 costs exactly its own extra
+  size.  Nothing to win above ~1000 KB, and below ~800 the 505100-byte art item
+  cannot be held and the engine dies.
+- **Flushing the art cache**, before a map load or before a movie.  `cacheFlush`
+  frees entries inside the cache's own heap, and that heap is one arena block
+  allocated at startup and never shrunk, so it cannot return a byte to the
+  arena.  Written twice, thrown away twice.
+- **The script cap on Broken Hills.**  It never fires: fewer than twelve
+  programs are resident before the arena runs out.  It pays on a map that is
+  played for a while, not on one that is short of memory at the load.
+- **Loading one elevation's objects.**  Worth 750 KB and blocked by the save:
+  `_map_save_in_game` writes every object back, and an elevation that was never
+  instantiated cannot be written.
+- **`_screen_buffer`.**  Looks like 300 KB of dead allocation; never allocated,
+  because `main.cc:274` passes `a4 = 0` and `windowManagerInit` needs `a3 & 1`.
 
 ## Two standing facts about the arena
 
