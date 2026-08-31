@@ -15,7 +15,7 @@ Shipping configuration — `-Psram 8`, arena 6100 KB (`apps/fallout/build.py`,
 | arena high-water, transients included | 5542 KB of 6100 |
 | art cache, standing still | reads nothing, evicts nothing |
 | a map change wants, on top of standing still | 837 KB |
-| **short by** | **184 KB** before patch 0013, unknown after |
+| **short by** | **184 KB** on the arithmetic; the failure itself comes at 33 KB free |
 
 **The arena cannot be raised.** 8007 KB of extended memory is free with the
 card mounted and the image's data takes 1812, but the arena must be one block:
@@ -110,7 +110,6 @@ there rather than in two places.
 | `.DAT` index mapped from flash | patch 0001, −1841 KB |
 | the map's ambience streamed, not decoded whole | patch 0004, −488 KB |
 | art cache sized in kilobytes, set to 1400 | patches 0012, `fallout2.cfg` |
-| the old map's art flushed before the new one loads | patch 0013 |
 | `_GNW_win_refresh` fills the destination instead of a copy | patch 0011, −307 KB of transient, and it is what left black rectangles under the cursor |
 
 Ruled out, with the reason:
@@ -119,3 +118,25 @@ Ruled out, with the reason:
   was never allocated: the flag `gameInitWithOptions` passes is zero.
 - **A bigger arena.** See above.
 - **2 MB of art cache.** 1400 KB measures identically.
+- **Flushing the art cache before a map loads.** It sounds right - the old
+  map's tiles are dead weight and `artCacheFlush` exists and is never called
+  outside the death screen - and it changes nothing: with the flush as the first
+  statement of `mapLoad`, the failure comes at 33 KB free of 6100 instead of 41,
+  which is the same number twice. Whatever the cache is holding at that moment
+  is still referenced, so `cacheFlush` keeps it. Tried at both ends of
+  `mapLoad`; do not try a third time without first finding out *what* is still
+  locked.
+
+## What is not known about the 837 KB
+
+It is inferred, not measured: standing still peaks at 5542 KB and the failure
+comes at about 6067 KB used, so a map change wants roughly that much more. What
+it is spent on has not been broken down. `-memstat` cannot see it because the
+arena watcher only samples on allocations of 64 KB and up, and the allocation
+that fails is 32 KB.
+
+The way to find out: lower `ARENA_WATCH_MIN` in `apps/common/libc/libc_shim.c`
+for one run, keep the three-frame `report_big` trace, and walk into the temple.
+That gives every allocation over the threshold with the function that asked for
+it, across the transition. Until that is done, the 320 KB from `gTileIntensity`
+is a guess at whether it is enough.
