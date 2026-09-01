@@ -181,6 +181,13 @@ static int s_frame_pitch;
  */
 static int s_dirty_x0, s_dirty_y0, s_dirty_x1, s_dirty_y1;
 
+/*
+ * How much smaller the panel is than the picture, as a shift.  Zero when they
+ * are the same size, which is every case but a small board.  Set by
+ * make_surface when it lends the framebuffer out; read by the blit.
+ */
+static int s_panel_shift;
+
 /* Bumped whenever the palette is written; palette_lut watches it. */
 static uint32_t s_palette_gen = 1;
 
@@ -566,12 +573,48 @@ static SDL_Surface *make_surface(int w, int h, int depth, Uint32 format)
     void *pixels = NULL;
     int owns = 1;
     if (depth == 16 && s_have_gfx && !s_fb_lent && s_gfx.fb != NULL &&
-        (int)s_gfx.width == w && (int)s_gfx.height == h &&
         s_gfx.fmt == AG_PIX_RGB565) {
-        pixels = s_gfx.fb;
-        pitch = (int)s_gfx.stride;
-        owns = 0;
-        s_fb_lent = true;
+        /*
+         * The panel does not have to be the size of the picture.
+         *
+         * Fallout 2 draws 640x480 and will not do otherwise: its interface is
+         * bitmaps laid out for that, and asking the engine for less gets a
+         * refusal from artInit onwards.  A CYD is 320x240.  So the reduction
+         * happens on the way out - the engine keeps its 640x480 eight-bit
+         * surface, and the blit that turns it into RGB565 takes every second
+         * pixel of every second row.
+         *
+         * The surface is created at the panel's size rather than the engine's,
+         * which is what keeps it *being* the panel: a frame is still a flush
+         * and not a 614 KB copy.  The engine never reads this surface's width
+         * or height - only its pixels and its pitch, in renderPresent - so the
+         * difference stays inside this file.  Checked against svga.cc: the only
+         * other uses are as a blit destination and SDL_FreeSurface.
+         *
+         * Whole powers of two only.  Anything else needs a resampler, and a
+         * resampler is a frame's worth of arithmetic on a part with none to
+         * spare.
+         */
+        for (int shift = 0; shift <= 2; ++shift) {
+            if ((int)(s_gfx.width << shift) == w &&
+                (int)(s_gfx.height << shift) == h) {
+                w = (int)s_gfx.width;
+                h = (int)s_gfx.height;
+                pitch = (int)s_gfx.stride;
+                pixels = s_gfx.fb;
+                owns = 0;
+                s_fb_lent = true;
+                s_panel_shift = shift;
+                if (shift != 0) {
+                    ag_printf("SDL: panel %ux%u, picture %dx%d, "
+                              "reducing by %d\n",
+                              s_gfx.width, s_gfx.height,
+                              (int)(s_gfx.width << shift),
+                              (int)(s_gfx.height << shift), 1 << shift);
+                }
+                break;
+            }
+        }
     }
 
     if (pixels == NULL) {
@@ -764,38 +807,76 @@ int SDL_UpperBlit(SDL_Surface *src, const SDL_Rect *srcrect, SDL_Surface *dst,
     if (sy + h > src->h) {
         h = src->h - sy;
     }
-    if (dx + w > dst->w) {
-        w = dst->w - dx;
-    }
-    if (dy + h > dst->h) {
-        h = dst->h - dy;
-    }
     if (w <= 0 || h <= 0) {
         return 0;
     }
 
     const ag_time_t blit_t0 = (s_fps_ms != 0u) ? ag_micros() : 0;
 
-    for (int y = 0; y < h; ++y) {
-        const Uint8 *s =
-            (const Uint8 *)src->pixels + (size_t)(sy + y) * src->pitch + sx;
+    /*
+     * The reduction, when the panel is smaller than the picture.  The rectangle
+     * the caller gave is in the picture's coordinates, so it is divided down
+     * here and the destination is walked rather than the source: that way an
+     * odd left edge cannot drop the column next to it, and a rectangle one
+     * pixel wide still lands somewhere.  With shift zero this is the same loop
+     * as before, one shift and one add per pixel more.
+     */
+    const int shift = (dst->pixels == s_gfx.fb) ? s_panel_shift : 0;
+    const int step = 1 << shift;
+
+    int ddx = dx >> shift;
+    int ddy = dy >> shift;
+    int ddw = ((dx + w + step - 1) >> shift) - ddx;
+    int ddh = ((dy + h + step - 1) >> shift) - ddy;
+
+    /* The destination clamp, in the destination's own units - which is why it
+     * is here and not up with the source's. */
+    if (ddx < 0) {
+        ddw += ddx;
+        ddx = 0;
+    }
+    if (ddy < 0) {
+        ddh += ddy;
+        ddy = 0;
+    }
+    if (ddx + ddw > dst->w) {
+        ddw = dst->w - ddx;
+    }
+    if (ddy + ddh > dst->h) {
+        ddh = dst->h - ddy;
+    }
+    if (ddw <= 0 || ddh <= 0) {
+        return 0;
+    }
+
+    for (int y = 0; y < ddh; ++y) {
+        const int syy = sy + (((ddy + y) << shift) - dy);
+        if (syy < 0 || syy >= src->h) {
+            continue;
+        }
+        const Uint8 *s = (const Uint8 *)src->pixels + (size_t)syy * src->pitch;
         Uint16 *d = (Uint16 *)((Uint8 *)dst->pixels +
-                               (size_t)(dy + y) * dst->pitch) + dx;
-        for (int x = 0; x < w; ++x) {
-            d[x] = lut[s[x]];
+                               (size_t)(ddy + y) * dst->pitch) + ddx;
+        for (int x = 0; x < ddw; ++x) {
+            const int sxx = sx + (((ddx + x) << shift) - dx);
+            if (sxx < 0 || sxx >= src->w) {
+                continue;
+            }
+            d[x] = lut[s[sxx]];
         }
     }
 
     if (s_fps_ms != 0u) {
         s_blit_us += (uint64_t)(ag_micros() - blit_t0);
-        s_blit_px += (uint64_t)w * (uint64_t)h;
+        s_blit_px += (uint64_t)ddw * (uint64_t)ddh;
     }
 
     /* Remember what changed, so that the present after it can send that and
      * not the whole screen.  Only when this surface is the panel: a blit into
-     * a surface of our own is copied wholesale later anyway. */
+     * a surface of our own is copied wholesale later anyway.  In panel
+     * coordinates, which is what the flush wants. */
     if (dst->pixels == s_gfx.fb) {
-        dirty_add(dx, dy, w, h);
+        dirty_add(ddx, ddy, ddw, ddh);
     }
     return 0;
 }
@@ -1485,11 +1566,20 @@ static void pump(void)
              * first event only establishes the origin - without that the
              * cursor would jump from the corner on the first move.
              */
+            /*
+             * And scaled back up when the panel is smaller than the picture.
+             * The pointer arrives in the panel's pixels; the engine's cursor
+             * lives in the 640x480 one it draws, so on a half-size panel every
+             * movement would be half of what the hand did and the far corner
+             * would be out of reach.
+             */
             const int x = e.ptr.x;
             const int y = e.ptr.y;
             if (s_mouse_x >= 0) {
-                s_mouse_dx += (e.ptr.dx != 0) ? e.ptr.dx : (x - s_mouse_x);
-                s_mouse_dy += (e.ptr.dy != 0) ? e.ptr.dy : (y - s_mouse_y);
+                const int mdx = (e.ptr.dx != 0) ? e.ptr.dx : (x - s_mouse_x);
+                const int mdy = (e.ptr.dy != 0) ? e.ptr.dy : (y - s_mouse_y);
+                s_mouse_dx += mdx << s_panel_shift;
+                s_mouse_dy += mdy << s_panel_shift;
             }
             s_mouse_x = x;
             s_mouse_y = y;
@@ -1499,8 +1589,8 @@ static void pump(void)
 
             if (e.type == AG_EV_POINTER_MOVE) {
                 out.type = SDL_MOUSEMOTION;
-                out.motion.x = x;
-                out.motion.y = y;
+                out.motion.x = x << s_panel_shift;
+                out.motion.y = y << s_panel_shift;
                 out.motion.state = s_mouse_buttons;
             } else {
                 /*
