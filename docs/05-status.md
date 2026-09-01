@@ -77,7 +77,8 @@ argon apps --warnings    добавить -Wall -Wextra
 argon check              локальный CI: `tests` + прошивка + `apps`
                          (то же в GitHub Actions: `.github/workflows/ci.yml`)
 argon vt                 умеет ли эта консоль показывать экран
-argon flash -port COM5   прошить настоящую плату
+argon flash -port COM5   прошить настоящую плату и открыть monitor;
+                         -NoMonitor — прошить и вернуться, для скрипта
 argon target esp32c6     плата на RISC-V (docs\12-esp32-c6-lcd.md);
                          QEMU её не запускает — перед коммитом вернуться
                          на esp32s3 и прогнать argon check там

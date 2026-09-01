@@ -58,6 +58,7 @@ ArgonOS
                            built into the image.  esp32s3-board = the S3 on the desk, without
                            the two lines that are for QEMU only.  Any: rebuild
   argon flash -port COM5   flash a real board and open the monitor
+                           -NoMonitor: flash and return, for a script
   argon monitor -port COM5 open the serial monitor on a real board
   argon clean              remove the firmware build directory
   argon env                open a shell with the build environment loaded
@@ -584,15 +585,61 @@ switch ($Command.ToLowerInvariant()) {
         exit $LASTEXITCODE
     }
 
+    #
+    # Two things these had to learn, both found by trying to flash a board
+    # from a script rather than by hand.
+    #
+    # `-port COM5` is what `argon boardnet` takes and what this file's own help
+    # and half the documentation showed for flashing too - but flash and
+    # monitor hand their arguments straight to idf.py, whose option is `-p`.
+    # idf.py then reported `command "COM4" is not known to idf.py` and
+    # `ninja: error: unknown target 'COM4'`, which names neither the mistake
+    # nor the fix.  Rather than pick a winner between two spellings already in
+    # use, translate: both work here now.
+    #
+    # And `flash` always ran the monitor after it, which is right at a desk and
+    # impossible in a script - the monitor never returns, so an automated
+    # caller hangs until its timeout with the flash long since finished.
+    # -NoMonitor is that caller's form.  The monitor stays the default,
+    # because someone who typed `argon flash` by hand wants to see the board
+    # come up.
+    #
+    # Without argon at all, from the build directory, with the IDF python:
+    #
+    #   python -m esptool --chip <chip> -p <PORT> -b 460800 \
+    #       --before default_reset --after hard_reset write_flash "@flash_args"
+    #
+    # The accumulator below is NOT called $rest, and that is not a style
+    # choice: PowerShell variable names are case-insensitive, so `$rest = @()`
+    # empties the `$Rest` parameter it was meant to read, and the loop then
+    # walks nothing.  The symptom is the arguments silently vanishing - the
+    # port was still passed (idf.py has a default) and the monitor still
+    # started, so the only visible effect was that -NoMonitor did nothing.
     'flash' {
         Initialize-Environment
-        & idf.py @Rest flash monitor
+        $fwd = @()
+        $noMonitor = $false
+        foreach ($a in $Rest) {
+            if ($a -eq '-NoMonitor') { $noMonitor = $true }
+            elseif ($a -eq '-port' -or $a -eq '--port') { $fwd += '-p' }
+            else { $fwd += $a }
+        }
+        if ($noMonitor) {
+            & idf.py @fwd flash
+        } else {
+            & idf.py @fwd flash monitor
+        }
         exit $LASTEXITCODE
     }
 
     'monitor' {
         Initialize-Environment
-        & idf.py @Rest monitor
+        $fwd = @()
+        foreach ($a in $Rest) {
+            if ($a -eq '-port' -or $a -eq '--port') { $fwd += '-p' }
+            else { $fwd += $a }
+        }
+        & idf.py @fwd monitor
         exit $LASTEXITCODE
     }
 

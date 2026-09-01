@@ -152,6 +152,7 @@ argon tests              host unit tests, no hardware needed
 argon apps               build every .AXE / .SYS in tools/apps.json
 argon check              all of the above: tests, firmware, applications
 argon flash -port COM5   flash a real board and open the monitor
+argon flash -port COM5 -NoMonitor    flash and return, for a script
 ```
 
 `argon` is a batch file rather than a PowerShell script so that it works on a
