@@ -131,6 +131,7 @@ add_executable(argon_tests
     test_tube.c
     test_nam.c
     test_netmsg.c
+    test_rempix.c
     "${ARGON_ROOT}/tools/nam.c"
     "${ARGON_ROOT}/apps/cc/cc_compile.c"
     "${ARGON_ROOT}/components/argon_kernel/src/dev/draw.c"
