@@ -747,6 +747,24 @@ static void choose_drive(int which)
  * Returns true when the whole screen has to be redrawn rather than just the
  * cursor.
  */
+/*
+ * A pointer event's pixels, back to the column and row this screen is drawn in.
+ *
+ * Pointer events carry surface pixels as of ABI 0.42, because a pointer is a
+ * position and a mouse counts in something finer than a cell.  A text screen
+ * still thinks in cells - that is what it is - so the division happens here,
+ * with the cell size the console publishes.  cell_w of zero means there is no
+ * surface at all (a serial terminal and nothing else), and then the event is
+ * already counted in cells.
+ */
+static void tap_to_cell(int16_t px, int16_t py, int *col, int *row)
+{
+    ag_coninfo_t ci;
+    ag_coninfo(&ci);
+    *col = (ci.cell_w > 0) ? ((int)px / (int)ci.cell_w) : (int)px;
+    *row = (ci.cell_h > 0) ? ((int)py / (int)ci.cell_h) : (int)py;
+}
+
 static bool fm_tap(int col, int row, bool *quit)
 {
     /* The key bar: eight columns per label, as draw_keys lays them out. */
@@ -943,7 +961,9 @@ int FM_ENTRY(int argc, char **argv)
         }
         if (ag_focused() && ev.type == AG_EV_POINTER_DOWN) {
             bool quit = false;
-            const bool full = fm_tap(ev.ptr.x, ev.ptr.y, &quit);
+            int tc = 0, tr = 0;
+            tap_to_cell(ev.ptr.x, ev.ptr.y, &tc, &tr);
+            const bool full = fm_tap(tc, tr, &quit);
             if (quit) {
                 exit_why = "tapped 10Quit";
                 break;

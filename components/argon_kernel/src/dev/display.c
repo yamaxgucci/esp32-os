@@ -1077,6 +1077,20 @@ const ag_gfx_api_t ag_gfx_api_table = {
 
 bool ag_display_ready(void) { return s_ready; }
 
+bool ag_display_size(uint16_t *w, uint16_t *h)
+{
+    if (s_w == 0 || s_h == 0) {
+        return false;
+    }
+    if (w != NULL) {
+        *w = s_w;
+    }
+    if (h != NULL) {
+        *h = s_h;
+    }
+    return true;
+}
+
 bool ag_display_acquired(void) { return s_acquired; }
 
 ag_pid_t ag_display_owner(void) { return s_owner; }

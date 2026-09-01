@@ -287,16 +287,18 @@ int mrd_band_text(mrd_band_t *b, int x, int y, const char *s, uint16_t fg,
     return x - x0;
 }
 
+/*
+ * A tap, clamped to the screen.  It used to scale as well: a pointer event
+ * carried console cells and every screen in here had to multiply back up to
+ * pixels, which is why this is called from a dozen places.  As of ABI 0.42 the
+ * event already carries the surface's pixels, so all that is left is refusing
+ * a coordinate off the edge - kept as a function rather than removed from those
+ * dozen call sites, because a clamp at the boundary is worth having anyway.
+ */
 void mrd_touch_to_px(const mrd_disp_t *d, int16_t cx, int16_t cy, int *px,
                      int *py)
 {
-    int x = 0, y = 0;
-    if (d->cols > 0) {
-        x = (int)cx * (int)d->W / (int)d->cols;
-    }
-    if (d->rows > 0) {
-        y = (int)cy * (int)d->H / (int)d->rows;
-    }
+    int x = (int)cx, y = (int)cy;
     if (x < 0) {
         x = 0;
     } else if (x >= d->W) {

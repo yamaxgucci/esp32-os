@@ -4,6 +4,7 @@
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #include <argon/console.h>
+#include <argon/input.h>
 
 #include <stdio.h>
 #include <string.h>
@@ -408,6 +409,9 @@ static int32_t pump_endpoint(ag_con_endpoint_t *ep)
     for (int32_t i = 0; i < n; i++) {
         ag_event_t ev;
         if (ag_vtin_feed(&ep->in, chunk[i], &ev)) {
+            /* The decoder counts in cells because the terminal does; above
+             * here a pointer is measured in pixels (ABI 0.42). */
+            ag_input_to_pixels(&ev);
             publish(&ev);
         }
     }

@@ -353,6 +353,17 @@ static void api_coninfo(ag_coninfo_t *out)
     out->cur_y = sc->cur_y;
     out->attr = sc->attr;
     out->has_local_display = ag_display_ready();
+    /*
+     * The cell, in the pixels a pointer event uses.  Zero when there is no
+     * surface: a serial terminal is all there is, and it has no pixels.
+     */
+    out->cell_w = 0;
+    out->cell_h = 0;
+    uint16_t sw = 0, sh = 0;
+    if (ag_display_size(&sw, &sh) && sc->cols > 0 && sc->rows > 0) {
+        out->cell_w = (uint16_t)(sw / sc->cols);
+        out->cell_h = (uint16_t)(sh / sc->rows);
+    }
     ag_console_unlock();
 }
 

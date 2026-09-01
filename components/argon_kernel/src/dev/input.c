@@ -4,6 +4,8 @@
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #include <argon/input.h>
+#include <argon/screen.h>
+#include <argon/display.h>
 
 #include <string.h>
 
@@ -175,6 +177,54 @@ static const ag_dev_ops_t k_joy_ops = {
     .read = joy_read,
     .size = joy_size,
 };
+
+void ag_input_to_pixels(ag_event_t *ev)
+{
+    if (ev == NULL) {
+        return;
+    }
+    switch (ev->type) {
+    case AG_EV_POINTER_DOWN:
+    case AG_EV_POINTER_UP:
+    case AG_EV_POINTER_MOVE:
+    case AG_EV_WHEEL:
+        break;
+    default:
+        return;
+    }
+
+    uint16_t sw = 0, sh = 0;
+    if (!ag_display_size(&sw, &sh) || sw == 0 || sh == 0) {
+        return; /* nothing to scale to; the cells are all anybody has */
+    }
+    const ag_screen_t *sc = ag_console_screen();
+    if (sc == NULL || sc->cols == 0 || sc->rows == 0) {
+        return;
+    }
+
+    /*
+     * The middle of the cell, not its corner.  A tap reported as a corner puts
+     * the pointer on the boundary between two cells, and a graphical
+     * application that rounds the other way then reads the neighbour.
+     */
+    const int32_t cw = (int32_t)sw / (int32_t)sc->cols;
+    const int32_t ch = (int32_t)sh / (int32_t)sc->rows;
+    int32_t       x = (int32_t)ev->ptr.x * cw + cw / 2;
+    int32_t       y = (int32_t)ev->ptr.y * ch + ch / 2;
+
+    if (x < 0) {
+        x = 0;
+    } else if (x >= (int32_t)sw) {
+        x = (int32_t)sw - 1;
+    }
+    if (y < 0) {
+        y = 0;
+    } else if (y >= (int32_t)sh) {
+        y = (int32_t)sh - 1;
+    }
+    ev->ptr.x = (int16_t)x;
+    ev->ptr.y = (int16_t)y;
+}
 
 ag_err_t ag_input_init(void)
 {

@@ -11,6 +11,7 @@
 #include <argon/console.h>
 #include <argon/device.h>
 #include <argon/display.h>
+#include <argon/input.h>
 #include <argon/log.h>
 
 #include <argon/port/mem.h>
@@ -118,6 +119,10 @@ void ag_inputpoll_tick(void)
                     ev->ptr.y = (int16_t)(screen->rows - 1);
                 }
             }
+            /* An input driver's contract says cells; a pointer above here
+             * is pixels (ABI 0.42), so scale on the way in rather than asking
+             * every loadable driver to learn the surface size. */
+            ag_input_to_pixels(ev);
             (void)ag_console_inject_event(ev);
         }
     }
