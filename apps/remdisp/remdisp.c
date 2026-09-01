@@ -223,6 +223,63 @@ static bool prev_ready(uint32_t w, uint32_t h)
 }
 
 /*
+ * The far end asking to be told everything again.
+ *
+ * The receiver is a monitor, and a monitor gets switched off, unplugged and
+ * plugged back in while the machine driving it keeps running.  Nothing breaks
+ * when that happens - this link has no flow control, so a write completes
+ * whether anybody is listening or not - but coming back is the problem: the
+ * shadow says the far end already has this frame, so on a screen where nothing
+ * is moving nothing would ever be sent again and the glass would stay dark.
+ *
+ * So the receiver says one byte when it starts, and this drops the shadow.
+ * prev_ready then allocates a fresh one that is deliberately not cleared,
+ * which is exactly "disagrees with the far end" - the next frame goes out
+ * whole.  No new state, no new code path: the reconnect uses the same road as
+ * the first connection.
+ *
+ * Polled rather than waited for, with a zero timeout, from the two callbacks
+ * the kernel already makes often.  A driver cannot own a task.
+ *
+ * Which leaves one case out, and it is worth naming rather than discovering:
+ * while an application holds the display the kernel stops calling text_cursor,
+ * and it calls blit_rect only when that application draws.  An application
+ * holding a picture that never changes therefore never reads this, and a
+ * receiver that reconnects under one stays dark.  Measured, not assumed:
+ * gfxdemo paints once and waits, and a receiver started after it got nothing.
+ *
+ * It does not matter for what this is for - a game redraws, and the console
+ * repairs itself through the sweep below - so the fix is not made here.  What
+ * it would be: register a second device of class AG_DEV_INPUT whose poll()
+ * returns no events and services this instead.  The kernel calls that ten
+ * times a second regardless of who owns the screen, and it exists precisely
+ * because a loadable driver cannot own a task.
+ */
+#define FR_HELLO 'H'
+
+static void poll_far_end(void)
+{
+    uint8_t buf[16];
+    for (;;) {
+        const int32_t n = io->uart_read(LINK_PORT, buf, sizeof(buf), 0);
+        if (n <= 0) {
+            return;
+        }
+        for (int32_t i = 0; i < n; i++) {
+            if (buf[i] == (uint8_t)FR_HELLO) {
+                ag_free(s_prev);
+                s_prev = NULL;
+                s_prev_w = 0;
+                s_prev_h = 0;
+            }
+        }
+        if ((uint32_t)n < sizeof(buf)) {
+            return;
+        }
+    }
+}
+
+/*
  * Work space.  Static rather than automatic because these are kilobytes and the
  * task this runs on belongs to whoever flushed - an application's stack is not
  * the driver's to spend.  Safe as static because the kernel holds the device
@@ -475,6 +532,8 @@ static void rem_blit_rect(ag_handle_t h, const ag_blit_t *b)
         return;
     }
 
+    poll_far_end();
+
     const uint8_t *src = (const uint8_t *)b->px;
     const bool     track = prev_ready(b->surf_w, b->surf_h);
 
@@ -679,6 +738,7 @@ static void heal_a_few(void)
         return;
     }
     s_heal_at = now + HEAL_INTERVAL_US;
+    poll_far_end();
 
     for (uint32_t i = 0; i < HEAL_ROWS_PER_SWEEP; i++) {
         send_row((uint16_t)s_heal_next);

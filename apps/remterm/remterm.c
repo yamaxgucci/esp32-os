@@ -331,6 +331,18 @@ int ag_main(int argc, char **argv)
         return 1;
     }
 
+    /*
+     * One byte to say "I have just started; tell me everything".  Without it a
+     * monitor that was switched off and back on stays dark until something on
+     * the far end happens to change, because over there a shadow of the last
+     * frame says this end already has it.  It also removes any order of
+     * starting: the receiver may come up long after the sender.
+     */
+    {
+        const uint8_t hello = (uint8_t)'H';
+        (void)ag_uart_write(LINK_PORT, &hello, 1u);
+    }
+
     ag_coninfo_t con;
     ag_coninfo(&con);
 
