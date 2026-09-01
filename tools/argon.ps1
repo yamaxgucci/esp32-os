@@ -250,6 +250,42 @@ switch ($Command.ToLowerInvariant()) {
             }
         }
         Remove-Item 'sdkconfig' -ErrorAction SilentlyContinue
+
+        # set-target implies fullclean, and fullclean is shutil.rmtree over
+        # everything in build\ - so one read-only file anywhere under it stops
+        # the switch with WinError 5.  Not everything under build\ is IDF's: a
+        # git clone left there is enough, because a pack file is read-only by
+        # design and lives inside a hidden .git, which is why `attrib -R` on
+        # its own does not reach it.  IDF's own guard only looks for a .git
+        # directly in build\, not for one a level down.
+        #
+        # The second failure is worse than the first.  A half-cleaned build
+        # directory has no CMakeCache.txt left, and idf.py then refuses to touch
+        # it at all - "doesn't seem to be a CMake build directory" - so the next
+        # attempt fails differently and the only way out is deleting the
+        # directory by hand.  Do that here instead: fullclean empties it
+        # completely anyway (staged .AXE images and sd_card included), so
+        # removing it outright destroys nothing the switch was going to keep.
+        if (Test-Path 'build') {
+            $readonly = [IO.FileAttributes]::ReadOnly
+            # One walk, two jobs: drop the read-only bit so rmtree can finish,
+            # and name any clone on the way past.  A clone is the one thing
+            # under here that costs more than a rebuild to get back, and it is
+            # going either way - fullclean does not ask.
+            Get-ChildItem -Recurse -Force 'build' -ErrorAction SilentlyContinue |
+                ForEach-Object {
+                    if ($_.PSIsContainer -and $_.Name -eq '.git') {
+                        Write-Host "argon target: a git clone in the build directory is about to go - $($_.Parent.FullName)"
+                    }
+                    if ($_.Attributes -band $readonly) {
+                        $_.Attributes = $_.Attributes -band -bnot $readonly
+                    }
+                }
+            if (-not (Test-Path 'build\CMakeCache.txt')) {
+                Remove-Item -Recurse -Force 'build' -ErrorAction SilentlyContinue
+            }
+        }
+
         & idf.py -D "SDKCONFIG_DEFAULTS=$defaults" set-target $chip
         exit $LASTEXITCODE
     }
