@@ -1,0 +1,34 @@
+--- a/src/window_manager.cc
++++ b/src/window_manager.cc
+@@ -915,6 +915,31 @@
+                         continue;
+                     }
+ 
++                    // ARGON: and the other destination, for the same reason.
++                    //
++                    // The first version of this note fixed only the branch
++                    // that writes into a caller's buffer, and left this one -
++                    // which writes into _screen_buffer and is the branch that
++                    // actually runs, because _buffering is on for the whole
++                    // game.  A census of every allocation over 48 KB found it
++                    // immediately: 307200 bytes from _GNW_win_refresh, three
++                    // times, through _refresh_all and windowHide.  That is a
++                    // full screen taken and given back every time a window
++                    // closes, on a machine where the arena has 500 KB spare
++                    // when a map is loaded.
++                    //
++                    // _screen_buffer is already the right shape and already
++                    // paid for, so the fill goes straight into it.
++                    if (_buffering) {
++                        bufferFill(_screen_buffer
++                                       + v16->rect.top * (_scr_size.right - _scr_size.left + 1)
++                                       + v16->rect.left,
++                            width, height,
++                            _scr_size.right - _scr_size.left + 1, _bk_color);
++                        v16 = v16->next;
++                        continue;
++                    }
++
+                     unsigned char* buf = (unsigned char*)internal_malloc(width * height);
+                     if (buf != nullptr) {
+                         bufferFill(buf, width, height, width, _bk_color);

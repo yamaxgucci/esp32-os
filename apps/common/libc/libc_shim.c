@@ -118,9 +118,22 @@ static void report_big(size_t n, void *r0, void *r1, void *r2, void *r3,
      * manager -> a block wrapper -> malloc, so three frames name nothing but
      * that plumbing.  Five reach the code that wanted the memory, and the
      * ones below it say which layer it came through.
+     *
+     * To the log as well as the console, which the failure line below already
+     * did and this did not.  On a board the console is a cable to a machine
+     * that may not be listening; a census that only exists on a screen nobody
+     * is reading is a census that was not taken.  A run made to find out who
+     * takes six hundred kilobytes came back with the failure and none of the
+     * allocations that led to it.
      */
-    ag_printf("malloc: %u bytes from %p %p %p %p %p%s\n", (unsigned)n,
-              r0, r1, r2, r3, r4, (p == NULL) ? " FAILED" : "");
+    char line[160];
+    snprintf(line, sizeof(line),
+             "malloc: %u bytes from %p %p %p %p %p%s\n", (unsigned)n,
+             r0, r1, r2, r3, r4, (p == NULL) ? " FAILED" : "");
+    ag_print(line);
+    if (s_libc_log != NULL) {
+        s_libc_log(line);
+    }
 }
 
 /*
