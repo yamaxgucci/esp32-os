@@ -1,0 +1,115 @@
+--- a/src/dfile.cc
++++ b/src/dfile.cc
+@@ -38,6 +38,90 @@
+ // Specifies that [DFile] has unget compressed character.
+ #define DFILE_HAS_COMPRESSED_UNGETC (0x10)
+ 
++/*
++ * ARGON: zlib's blocks come out of a two-slot cache instead of the arena.
++ *
++ * Opening a compressed entry in a .DAT makes zlib allocate an inflate state
++ * and a 32 KB sliding window; closing it gives both back.  That is correct and
++ * it is also **2957 allocate-and-free cycles of 32768 bytes in a three-minute
++ * run**, counted on the board in the Den - about ninety megabytes of traffic
++ * through an arena of six.
++ *
++ * Nothing leaks.  What happens instead is worse to diagnose: the arena ends up
++ * a lattice of thirty-kilobyte holes with long-lived small blocks wedged
++ * between them, and every out-of-arena failure of that night read the same way
++ * - "36 of 6050 KB free, largest block 28672".  Plenty free, none of it in one
++ * piece, and the thing being asked for was always the next 32768-byte window.
++ *
++ * So the window and the state are kept rather than returned.  Two slots is one
++ * of each, which covers the one stream that is normally alive; a second stream
++ * allocates the ordinary way and gives it back the ordinary way.  It costs
++ * about 40 KB held for ever, against a churn that made the other six megabytes
++ * unusable.
++ *
++ * The exchange is atomic because the size header makes this a real allocator
++ * and because sound decoding in this port runs on a thread of its own.  Blocks
++ * below ZCACHE_MIN are not worth a slot - zlib asks for a handful of small
++ * ones and they do not fragment anything.
++ */
++#define ZCACHE_SLOTS 2
++#define ZCACHE_MIN   2048u
++#define ZCACHE_HDR   16u
++
++static void* gZCache[ZCACHE_SLOTS];
++
++static voidpf dfileZAlloc(voidpf opaque, uInt items, uInt size)
++{
++    (void)opaque;
++
++    const size_t want = (size_t)items * (size_t)size;
++    if (want >= ZCACHE_MIN) {
++        for (int i = 0; i < ZCACHE_SLOTS; i++) {
++            void* p = __atomic_exchange_n(&gZCache[i], (void*)nullptr,
++                                          __ATOMIC_ACQ_REL);
++            if (p == nullptr) {
++                continue;
++            }
++            if (*(size_t*)p == want) {
++                return (unsigned char*)p + ZCACHE_HDR;
++            }
++            // Wrong size: put it back where it was, or let it go if somebody
++            // filled the slot while we were looking.
++            void* old = __atomic_exchange_n(&gZCache[i], p, __ATOMIC_ACQ_REL);
++            if (old != nullptr) {
++                free(old);
++            }
++        }
++    }
++
++    unsigned char* p = (unsigned char*)malloc(want + ZCACHE_HDR);
++    if (p == nullptr) {
++        return Z_NULL;
++    }
++    *(size_t*)p = want;
++    return p + ZCACHE_HDR;
++}
++
++static void dfileZFree(voidpf opaque, voidpf address)
++{
++    (void)opaque;
++
++    if (address == nullptr) {
++        return;
++    }
++    void* p = (unsigned char*)address - ZCACHE_HDR;
++    if (*(size_t*)p >= ZCACHE_MIN) {
++        for (int i = 0; i < ZCACHE_SLOTS; i++) {
++            void* old = __atomic_exchange_n(&gZCache[i], p, __ATOMIC_ACQ_REL);
++            if (old == nullptr) {
++                return; // the slot was empty; this block stays for next time
++            }
++            p = old; // carry the one we displaced along to the next slot
++        }
++    }
++    free(p);
++}
++
+ static int dbaseFindEntryByFilePath(const void* a1, const void* a2);
+ static DFile* dfileOpenInternal(DBase* dbase, const char* filename, const char* mode, DFile* a4);
+ static int dfileReadCharInternal(DFile* stream);
+@@ -633,8 +717,8 @@
+         return 1;
+     }
+ 
+-    stream->decompressionStream->zalloc = Z_NULL;
+-    stream->decompressionStream->zfree = Z_NULL;
++    stream->decompressionStream->zalloc = dfileZAlloc;
++    stream->decompressionStream->zfree = dfileZFree;
+     stream->decompressionStream->opaque = Z_NULL;
+     stream->decompressionStream->next_in = stream->decompressionBuffer;
+     stream->decompressionStream->avail_in = 0;
+@@ -813,8 +897,8 @@
+             (void)inflateEnd(dfile->decompressionStream);
+         }
+ 
+-        dfile->decompressionStream->zalloc = Z_NULL;
+-        dfile->decompressionStream->zfree = Z_NULL;
++        dfile->decompressionStream->zalloc = dfileZAlloc;
++        dfile->decompressionStream->zfree = dfileZFree;
+         dfile->decompressionStream->opaque = Z_NULL;
+         dfile->decompressionStream->next_in = dfile->decompressionBuffer;
+         dfile->decompressionStream->avail_in = 0;
