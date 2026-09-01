@@ -378,6 +378,82 @@ lists no static functions, so its nearest-preceding answer for
 `memoryBlockMallocImpl` was `mapLoadSaved+0x255`.  With `ARGON_FALLOUT_DEBUG=1`
 every site above came out with a file and a line on the first try.
 
+
+## Since the first five patches: what changed and what was ruled out
+
+**0021 `-artcache N`**, and the reason it exists: the right cache size cannot be
+found by a run with `-autostart`, and it turned out it could not be found by any
+of mine. Every earlier measurement was made on the Temple of Trials, the
+smallest map in the game, where a cache over a megabyte reads nothing at all.
+On Arroyo village, `-autostart`, nobody at the keyboard:
+
+| cache | reads per 30 s window | evictions |
+|---|---|---|
+| 1400 KB | 615-732 | 630-729 |
+| 1800 KB | 54-195 | 48-178 |
+
+Maxim's own play session at 1400 had **10153 evictions and 18 full flushes** in
+it, and felt like five frames a second while the counter said twenty. The
+default is 1800 now, funded by 0020.
+
+**0022 releases the movie decoder's buffers.** MVE keeps three - the file record
+buffer and two frames - and for a 640x320 movie the two frames are 409600 bytes.
+A live-block census on Broken Hills, with the opening movies long finished,
+found 419 KB in three blocks still held by `movieMallocImpl`. `MVE_ReleaseMem`
+returns them through `_cleanupMovie`, by a path that depends on how the movie
+ended; 0022 asks for it in `gameMoviePlay` as well, where the game is done with
+the movie for certain. Idempotent, and verified: `movieMallocImpl` is gone from
+the census.
+
+**0023 counts what the art heap takes out of the arena, and the answer is
+nothing.** Three attempts to give BROKEN2.MAP more room - a smaller cache, 250
+KB from the world map, 419 KB of movie decoder - all ended at the same wall with
+the same twenty-odd kilobytes free, which looks exactly like something taking
+whatever it is given. The candidate was `heapFindFreeBlock`'s `system:` label.
+Measured on that map: **spilled 0 KB in 0 blocks**, right up to the failure. The
+hypothesis is dead and no behaviour was changed to chase it.
+
+The same patch stops the label printing 500 bytes of heap statistics on every
+failed probe rather than only when a block is taken - 710 of those on Broken
+Hills against 11 on the temple.
+
+### The tools, and they work on a board
+
+| flag | what it is for |
+|---|---|
+| `-hud` | frames, arena used and largest free block, drawn into the panel in a 3x5 font. The last is what decides whether a dialogue opens: its backdrop is 300 KB in one piece |
+| `-log PATH` | every diagnostic line and every engine error to a file. The shell's `>` cannot do it: `run` hands the process to the session and returns, and the redirection goes with it - measured |
+| `-artcache N` | the cache size, without rebuilding the card |
+| `-smooth` | average each 2x2 when the panel is smaller than the picture |
+| `-scripts N`, `-fps N`, `-memstat N`, `-mallocs KB N`, `-prof N` | as before |
+| `--psram 16` | build for the larger part: arena 12000 KB, nothing else changes |
+
+### 320x240
+
+Works. `C:\SYSTEM.CFG` with `width = 320`, `height = 240`, and the port says
+`SDL: panel 320x240, picture 640x480, reducing by 2`. The engine still draws
+640x480; the blit reduces. In QEMU the memory figure does not move because the
+framebuffer belongs to the emulated device, but **on hardware the panel is 150
+KB instead of 600.**
+
+`-smooth` is what makes the text readable. Picking the pixel of each 2x2 that
+differs most from the block average was tried first, on the reasoning that a
+light stroke on dark and a dark stroke on light would both survive - and
+measured worse against nearest-neighbour on the interface bar, because on a
+textured panel the outlier is a speck of background more often than a stroke.
+Averaging cannot lose a stroke, only dim one. 27.1 fps against 27.9.
+
+### Still open
+
+- **BROKEN2.MAP** runs out during play, and now for a plain reason: 7102 objects
+  at about 148 bytes. Narrowing `Object` is ~170 KB and touches `objectRead`
+  and `objectWrite`, which read those fields as int32 straight from the map
+  file.
+- **Movies play through the wrong palette** (grey). Narrowed: the callback
+  fires with real colour, the port builds a colour table from it, and the map
+  goes through the same path correctly. Next step is to watch it in a window
+  rather than bisect it headless.
+
 ## Already done, do not redo
 
 | | |
