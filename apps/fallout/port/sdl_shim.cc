@@ -216,11 +216,68 @@ void sdl_shim_scale_sharp(int on)
 }
 
 /*
+ * One to one, on a panel that cannot hold the whole picture.
+ *
+ * Reducing 640x480 to 320x240 takes Fallout's small font from eight pixels tall
+ * to four, and four pixels is not a letter - no resampling puts back what is not
+ * there, and averaging (the best of them) only keeps strokes from vanishing.
+ * So the other half of the answer is not to reduce at all: show a 320x240 window
+ * onto the picture, pixel for pixel, and let the player move it.
+ *
+ * F8 switches; the arrow keys move the window while it is on.  Both are taken
+ * by the port and never reach the engine, which is why F8 - the game uses F1 to
+ * F7, F10 and F12, and patch 0013 has F11.  The arrows are only swallowed while
+ * one to one is on, so they do whatever they normally do the rest of the time.
+ *
+ * The window does not follow the pointer.  It could be made to, but the port
+ * knows where the host's pointer is on the panel and not where the engine's
+ * cursor is on the picture, and a window that lurches on a twitch of the mouse
+ * while a dialogue is being read is worse than one that stays where it is put.
+ */
+static int s_one_to_one;      /* F8: showing the picture at its own size */
+
+/*
+ * The last thing blitted to the panel, so the view can be moved.
+ *
+ * Only the engine knows how to draw its picture, and it draws only what has
+ * changed - so moving the window leaves whatever was under it before.  The
+ * picture itself is still there in the eight-bit surface the engine composes
+ * into, and blitting the whole of that again is what a moved window needs.
+ * Kept as a pointer rather than a copy: it is the engine's surface, it does not
+ * move, and it is 300 KB.
+ */
+static SDL_Surface *s_panel_src;
+static SDL_Surface *s_panel_dst;
+static int s_pan_x;           /* the window's origin, in picture pixels */
+static int s_pan_y;
+
+/*
  * How much smaller the panel is than the picture, as a shift.  Zero when they
  * are the same size, which is every case but a small board.  Set by
  * make_surface when it lends the framebuffer out; read by the blit.
  */
 static int s_panel_shift;
+
+/* How far the window can go before it leaves the picture. */
+static void pan_clamp(void)
+{
+    const int maxx = (int)(s_gfx.width << s_panel_shift) - (int)s_gfx.width;
+    const int maxy = (int)(s_gfx.height << s_panel_shift) - (int)s_gfx.height;
+
+    if (s_pan_x > maxx) {
+        s_pan_x = maxx;
+    }
+    if (s_pan_y > maxy) {
+        s_pan_y = maxy;
+    }
+    if (s_pan_x < 0) {
+        s_pan_x = 0;
+    }
+    if (s_pan_y < 0) {
+        s_pan_y = 0;
+    }
+}
+
 
 
 /* ---- the session log -----------------------------------------------------
@@ -940,8 +997,15 @@ int SDL_UpperBlit(SDL_Surface *src, const SDL_Rect *srcrect, SDL_Surface *dst,
      * pixel wide still lands somewhere.  With shift zero this is the same loop
      * as before, one shift and one add per pixel more.
      */
-    const int shift = (dst->pixels == s_gfx.fb) ? s_panel_shift : 0;
+    const int to_panel = (dst->pixels == s_gfx.fb);
+    /* One to one is the reduction turned off and an offset turned on. */
+    const int shift = (to_panel && !s_one_to_one) ? s_panel_shift : 0;
+    const int panx = (to_panel && s_one_to_one) ? s_pan_x : 0;
+    const int pany = (to_panel && s_one_to_one) ? s_pan_y : 0;
     const int step = 1 << shift;
+
+    dx -= panx;
+    dy -= pany;
 
     int ddx = dx >> shift;
     int ddy = dy >> shift;
@@ -1050,8 +1114,28 @@ int SDL_UpperBlit(SDL_Surface *src, const SDL_Rect *srcrect, SDL_Surface *dst,
      * coordinates, which is what the flush wants. */
     if (dst->pixels == s_gfx.fb) {
         dirty_add(ddx, ddy, ddw, ddh);
+        s_panel_src = src;
+        s_panel_dst = dst;
     }
     return 0;
+}
+
+/*
+ * Draw the whole picture again, at whatever the view is now.
+ *
+ * Called when F8 or an arrow key moves the window.  It goes through the same
+ * blit rather than repeating it, so there is one place where the reduction and
+ * the offset are decided.
+ */
+static void panel_repaint(void)
+{
+    if (s_panel_src == NULL || s_panel_dst == NULL) {
+        return;
+    }
+
+    SDL_Rect srcrect = { 0, 0, s_panel_src->w, s_panel_src->h };
+    SDL_Rect dstrect = { 0, 0, 0, 0 };
+    SDL_UpperBlit(s_panel_src, &srcrect, s_panel_dst, &dstrect);
 }
 
 /* ---- time ---------------------------------------------------------------- */
@@ -1871,6 +1955,36 @@ static void pump(void)
             if (sc == SDL_SCANCODE_UNKNOWN) {
                 continue;
             }
+
+            /* The port's own keys, on a panel smaller than the picture. */
+            if (s_panel_shift != 0 && e.type == AG_EV_KEY_DOWN) {
+                if (sc == SDL_SCANCODE_F8) {
+                    s_one_to_one = !s_one_to_one;
+                    panel_repaint();
+                    ag_printf("panel: %s\n",
+                              s_one_to_one ? "one to one, arrows to move"
+                                           : "whole picture");
+                    continue;
+                }
+                if (s_one_to_one) {
+                    const int stepx = (int)s_gfx.width / 4;
+                    const int stepy = (int)s_gfx.height / 4;
+                    int moved = 1;
+
+                    switch (sc) {
+                    case SDL_SCANCODE_LEFT:  s_pan_x -= stepx; break;
+                    case SDL_SCANCODE_RIGHT: s_pan_x += stepx; break;
+                    case SDL_SCANCODE_UP:    s_pan_y -= stepy; break;
+                    case SDL_SCANCODE_DOWN:  s_pan_y += stepy; break;
+                    default: moved = 0; break;
+                    }
+                    if (moved) {
+                        pan_clamp();
+                        panel_repaint();
+                        continue;
+                    }
+                }
+            }
             out.type = (e.type == AG_EV_KEY_DOWN) ? SDL_KEYDOWN : SDL_KEYUP;
             out.key.state =
                 (e.type == AG_EV_KEY_DOWN) ? SDL_PRESSED : SDL_RELEASED;
@@ -1904,8 +2018,12 @@ static void pump(void)
             if (s_mouse_x >= 0) {
                 const int mdx = (e.ptr.dx != 0) ? e.ptr.dx : (x - s_mouse_x);
                 const int mdy = (e.ptr.dy != 0) ? e.ptr.dy : (y - s_mouse_y);
-                s_mouse_dx += mdx << s_panel_shift;
-                s_mouse_dy += mdy << s_panel_shift;
+                /* Not while one to one: there a panel pixel is a picture
+                 * pixel, and doubling would make the pointer skip every
+                 * second one. */
+                const int in_shift = s_one_to_one ? 0 : s_panel_shift;
+                s_mouse_dx += mdx << in_shift;
+                s_mouse_dy += mdy << in_shift;
             }
             s_mouse_x = x;
             s_mouse_y = y;
@@ -1915,8 +2033,10 @@ static void pump(void)
 
             if (e.type == AG_EV_POINTER_MOVE) {
                 out.type = SDL_MOUSEMOTION;
-                out.motion.x = x << s_panel_shift;
-                out.motion.y = y << s_panel_shift;
+                out.motion.x = s_one_to_one ? (x + s_pan_x)
+                                            : (x << s_panel_shift);
+                out.motion.y = s_one_to_one ? (y + s_pan_y)
+                                            : (y << s_panel_shift);
                 out.motion.state = s_mouse_buttons;
             } else {
                 /*
