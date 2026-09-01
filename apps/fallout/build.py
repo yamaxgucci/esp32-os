@@ -138,6 +138,17 @@ RODATA_ARGS: list = []
 # 1136 KB in one step.  docs/plans/fallout-memory.md has the whole accounting.
 ARENA_KB = 6340
 
+# What the arena becomes on the larger part.  8040 KB of extended memory free on
+# an 8 MB module; a 16 MB one reports 16232, and the image's data is the same
+# 1536 KB either way, so there is room for twice the arena and then some.  12000
+# is chosen with a margin rather than at the edge: the arena has to be one
+# contiguous block, and the edge is where that stops being true.
+#
+# Nothing else changes with the part.  The art cache stays at 1400 - measured,
+# and more is spent rather than used - and the script cap stays off.  A bigger
+# arena is the whole of the difference, which is why this is one flag.
+ARENA_KB_16MB = 12000
+
 # Files that only exist for a platform this is not.
 SKIP = (
     "src/platform/",
@@ -502,7 +513,11 @@ def main() -> int:
     ap.add_argument("--game", choices=("1", "2"), default="2",
                     help="which engine (default 2, the one whose data is at "
                          "hand)")
-    ap.add_argument("--arena-kb", type=int, default=ARENA_KB,
+    ap.add_argument("--psram", type=int, choices=(8, 16), default=8,
+                    help="the part this image is for; 16 gives the arena "
+                         "%d KB instead of %d.  Run it with the matching "
+                         "`argon run -Psram 16`." % (ARENA_KB_16MB, ARENA_KB))
+    ap.add_argument("--arena-kb", type=int, default=0,
                     help="extended memory the process asks for, in KB "
                          "(default %d, which is what fits beside the image on "
                          "8 MB of PSRAM)" % ARENA_KB)
@@ -520,7 +535,12 @@ def main() -> int:
 
     GAME = GAMES[args.game]
     ENGINE = tp(GAME["engine"])
-    ARENA_KB = args.arena_kb
+    # --arena-kb still wins, for the times when the question is what fits.
+    if args.arena_kb:
+        ARENA_KB = args.arena_kb
+    elif args.psram == 16:
+        ARENA_KB = ARENA_KB_16MB
+    print("fallout: %d MB part, %d KB arena" % (args.psram, ARENA_KB))
     if args.rodata_in_code:
         RODATA_ARGS[:] = ["--rodata", "code"]
 

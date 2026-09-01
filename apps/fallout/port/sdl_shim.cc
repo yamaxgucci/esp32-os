@@ -182,6 +182,29 @@ static int s_frame_pitch;
 static int s_dirty_x0, s_dirty_y0, s_dirty_x1, s_dirty_y1;
 
 /*
+ * Which pixel of a block survives the reduction.
+ *
+ * Nearest is every second pixel of every second row, which is right for a
+ * photograph and wrong for a font: a stroke one pixel wide survives half the
+ * time, and Fallout's interface is full of them.  Sharp keeps, out of each
+ * 2x2, the pixel that differs most from the block's average brightness - so a
+ * light stroke on dark and a dark stroke on light both come through, which
+ * matters because this game has both (the bottom bar is green on black, the
+ * character sheet is dark on tan).
+ *
+ * It costs four palette lookups and a dozen arithmetic operations per output
+ * pixel against one, on a quarter as many pixels: about the same total as the
+ * unreduced blit it replaces.  Off by default all the same, because a reduced
+ * panel is already a compromise and this is a second one.
+ */
+static int s_scale_sharp;
+
+void sdl_shim_scale_sharp(int on)
+{
+    s_scale_sharp = on ? 1 : 0;
+}
+
+/*
  * How much smaller the panel is than the picture, as a shift.  Zero when they
  * are the same size, which is every case but a small board.  Set by
  * make_surface when it lends the framebuffer out; read by the blit.
@@ -741,6 +764,15 @@ int SDL_SetPaletteColors(SDL_Palette *palette, const SDL_Color *colors,
  * when it is stale, so a fade still gets a fresh one per step, which is what a
  * fade is.
  */
+/*
+ * How bright each palette entry is, on the same schedule as the colour table.
+ *
+ * Only the reducing blit wants it, and only to decide which pixel of a block
+ * to keep.  Rec. 601 weights, rounded to 77/151/28 out of 256, on the eight-bit
+ * channels the palette carries.
+ */
+static Uint8 s_lum[256];
+
 static const Uint16 *palette_lut(const SDL_Palette *pal)
 {
     static Uint16 lut[256];
@@ -751,6 +783,8 @@ static const Uint16 *palette_lut(const SDL_Palette *pal)
         const int n = pal->ncolors < 256 ? pal->ncolors : 256;
         for (int i = 0; i < n; ++i) {
             const SDL_Color c = pal->colors[i];
+            s_lum[i] = (Uint8)(((unsigned)c.r * 77u + (unsigned)c.g * 151u +
+                                (unsigned)c.b * 28u) >> 8);
             lut[i] = (Uint16)(((c.r & 0xF8u) << 8) | ((c.g & 0xFCu) << 3) |
                               (c.b >> 3));
         }
@@ -862,7 +896,7 @@ int SDL_UpperBlit(SDL_Surface *src, const SDL_Rect *srcrect, SDL_Surface *dst,
                 d[x] = lut[s[x]];
             }
         }
-    } else {
+    } else if (!s_scale_sharp) {
         for (int y = 0; y < ddh; ++y) {
             const int syy = sy + (((ddy + y) << shift) - dy);
             if (syy < 0 || syy >= src->h) {
@@ -878,6 +912,72 @@ int SDL_UpperBlit(SDL_Surface *src, const SDL_Rect *srcrect, SDL_Surface *dst,
                     continue;
                 }
                 d[x] = lut[s[sxx]];
+            }
+        }
+    } else {
+        /* Two rows at a time, because the choice is made across a 2x2 block.
+         * Larger shifts still look at a 2x2 - sixteen samples for a quarter
+         * panel would cost more than the picture is worth. */
+        for (int y = 0; y < ddh; ++y) {
+            const int syy = sy + (((ddy + y) << shift) - dy);
+            if (syy < 0 || syy >= src->h) {
+                continue;
+            }
+            const int syy2 = (syy + 1 < src->h) ? (syy + 1) : syy;
+            const Uint8 *r0 =
+                (const Uint8 *)src->pixels + (size_t)syy * src->pitch;
+            const Uint8 *r1 =
+                (const Uint8 *)src->pixels + (size_t)syy2 * src->pitch;
+            Uint16 *d = (Uint16 *)((Uint8 *)dst->pixels +
+                                   (size_t)(ddy + y) * dst->pitch) + ddx;
+            for (int x = 0; x < ddw; ++x) {
+                const int sxx = sx + (((ddx + x) << shift) - dx);
+                if (sxx < 0 || sxx >= src->w) {
+                    continue;
+                }
+                const int sxx2 = (sxx + 1 < src->w) ? (sxx + 1) : sxx;
+
+                const Uint8 p0 = r0[sxx];
+                const Uint8 p1 = r0[sxx2];
+                const Uint8 p2 = r1[sxx];
+                const Uint8 p3 = r1[sxx2];
+
+                const int l0 = s_lum[p0];
+                const int l1 = s_lum[p1];
+                const int l2 = s_lum[p2];
+                const int l3 = s_lum[p3];
+                const int mean = (l0 + l1 + l2 + l3) >> 2;
+
+                int best = p0;
+                int bestd = l0 - mean;
+                if (bestd < 0) {
+                    bestd = -bestd;
+                }
+                int dd = l1 - mean;
+                if (dd < 0) {
+                    dd = -dd;
+                }
+                if (dd > bestd) {
+                    bestd = dd;
+                    best = p1;
+                }
+                dd = l2 - mean;
+                if (dd < 0) {
+                    dd = -dd;
+                }
+                if (dd > bestd) {
+                    bestd = dd;
+                    best = p2;
+                }
+                dd = l3 - mean;
+                if (dd < 0) {
+                    dd = -dd;
+                }
+                if (dd > bestd) {
+                    best = p3;
+                }
+
+                d[x] = lut[best];
             }
         }
     }

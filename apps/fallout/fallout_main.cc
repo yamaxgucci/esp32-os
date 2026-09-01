@@ -76,6 +76,7 @@ extern "C" void sdl_shim_screenshot(const char *path, int after_frames,
 extern "C" void sdl_shim_memstat(int every_ms, int trace_kb,
                                  int trace_max, int trace_prof);
 extern "C" void sdl_shim_fps(int every_ms);
+extern "C" void sdl_shim_scale_sharp(int on);
 extern "C" void sdl_shim_screenshot_now(void);
 
 static bool same(const char *a, const char *b)
@@ -115,6 +116,10 @@ static int to_int(const char *s)
  *                  print the N biggest each window
  *   -fps N         print the frame rate and where a frame goes, every N ms
  *   -autostart     start a new game at once, premade character, no movie
+ *   -sharp         when the panel is smaller than the picture, keep the
+ *                  pixel of each 2x2 that differs most from its average
+ *                  rather than the top-left one.  Thin strokes survive,
+ *                  which is most of what an interface is made of
  *   -scripts N     keep at most N script programs resident; the engine
  *                  reloads one when it runs again.  0, the default,
  *                  keeps every script a map has ever run - which is
@@ -152,6 +157,7 @@ extern "C" int ag_cxx_main(int argc, char **argv)
     int trace_kb = 0;
     int trace_max = 0;
     int trace_prof = 0;
+    int sharp = 0;
     int fps_ms = 0;
     int out = 0;
 
@@ -173,6 +179,8 @@ extern "C" int ag_cxx_main(int argc, char **argv)
             fps_ms = to_int(argv[++i]);
         } else if (same(argv[i], "-autostart")) {
             ag_autostart = 1;
+        } else if (same(argv[i], "-sharp")) {
+            sharp = 1;
         } else if (same(argv[i], "-scripts") && i + 1 < argc) {
             ag_script_cache = to_int(argv[++i]);
         } else {
@@ -189,6 +197,7 @@ extern "C" int ag_cxx_main(int argc, char **argv)
     }
     sdl_shim_memstat(memstat_ms, trace_kb, trace_max, trace_prof);
     sdl_shim_fps(fps_ms);
+    sdl_shim_scale_sharp(sharp);
 
     const int rc = main(out, argv);
 
