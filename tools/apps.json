@@ -240,6 +240,16 @@
       "out": "LINK.AXE", "group": "core",
       "_note": "The wire between two boards, measured. Sends 260-byte framed blocks with a sequence number and a checksum one way and counts ok/corrupt/lost/stray at the other end, so a line too fast for the wiring is told apart from a receiver that was not listening. Needs [uart1] tx/rx in BOARD.CFG on both ends. Build it once per chip - the CYD is an LX6, the S3 an LX7 - and note that this manifest only ever builds for CONFIG_IDF_TARGET, so the other image comes from a direct mkaxe call with --gcc xtensa-esp32-elf-gcc. 4 Mbaud = 400 067 B/s clean over 4 MB; docs/09-esp32-cyd.md has the table.",
       "src": ["apps/link/link.c"]
+    },
+    {
+      "out": "REMDISP.SYS", "group": "core",
+      "_note": "The screen of a machine that has none, sent down a wire to the board that does: a display device whose panel is UART1. Publishes ag_display_ops_t with blit_rect for pixels and text_row/text_cursor for the console, so ag_gfx_flush and ag_gfx_present reach it without any application knowing. Trims each band to the bounding box of what moved against a shadow of the last frame, then sends whichever is smallest of raw RGB565, PackBits, or palette-and-indices. Measured on the two boards at 4 Mbaud: 15 fps for a whole 320x240 frame every frame and 154 fps on dirty rectangles, 7.8x compression. Needs [uart1] tx/rx in BOARD.CFG; see docs/09-esp32-cyd.md.",
+      "src": ["apps/remdisp/remdisp.c"]
+    },
+    {
+      "out": "REMTERM.AXE", "group": "core",
+      "_note": "The other end of REMDISP.SYS: takes bands of pixels to the panel with ag_gfx_present and console rows into its own console, switching between the two as the traffic does. Built here for the S3 only to keep it compiling - the image that runs is the LX6 one for the CYD, from a direct mkaxe call with --gcc xtensa-esp32-elf-gcc.",
+      "src": ["apps/remterm/remterm.c"]
     }
   ]
 }
