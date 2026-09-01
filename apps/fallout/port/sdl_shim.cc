@@ -849,20 +849,36 @@ int SDL_UpperBlit(SDL_Surface *src, const SDL_Rect *srcrect, SDL_Surface *dst,
         return 0;
     }
 
-    for (int y = 0; y < ddh; ++y) {
-        const int syy = sy + (((ddy + y) << shift) - dy);
-        if (syy < 0 || syy >= src->h) {
-            continue;
+    if (shift == 0) {
+        /* The ordinary case, and the one that runs three hundred thousand
+         * times a frame: no arithmetic in the inner loop that was not there
+         * before the panel could be smaller. */
+        for (int y = 0; y < ddh; ++y) {
+            const Uint8 *s = (const Uint8 *)src->pixels +
+                             (size_t)(sy + y) * src->pitch + sx;
+            Uint16 *d = (Uint16 *)((Uint8 *)dst->pixels +
+                                   (size_t)(ddy + y) * dst->pitch) + ddx;
+            for (int x = 0; x < ddw; ++x) {
+                d[x] = lut[s[x]];
+            }
         }
-        const Uint8 *s = (const Uint8 *)src->pixels + (size_t)syy * src->pitch;
-        Uint16 *d = (Uint16 *)((Uint8 *)dst->pixels +
-                               (size_t)(ddy + y) * dst->pitch) + ddx;
-        for (int x = 0; x < ddw; ++x) {
-            const int sxx = sx + (((ddx + x) << shift) - dx);
-            if (sxx < 0 || sxx >= src->w) {
+    } else {
+        for (int y = 0; y < ddh; ++y) {
+            const int syy = sy + (((ddy + y) << shift) - dy);
+            if (syy < 0 || syy >= src->h) {
                 continue;
             }
-            d[x] = lut[s[sxx]];
+            const Uint8 *s =
+                (const Uint8 *)src->pixels + (size_t)syy * src->pitch;
+            Uint16 *d = (Uint16 *)((Uint8 *)dst->pixels +
+                                   (size_t)(ddy + y) * dst->pitch) + ddx;
+            for (int x = 0; x < ddw; ++x) {
+                const int sxx = sx + (((ddx + x) << shift) - dx);
+                if (sxx < 0 || sxx >= src->w) {
+                    continue;
+                }
+                d[x] = lut[s[sxx]];
+            }
         }
     }
 
