@@ -422,7 +422,7 @@ Hills against 11 on the temple.
 | flag | what it is for |
 |---|---|
 | `-hud` | frames, arena used and largest free block, drawn into the panel in a 3x5 font. The last is what decides whether a dialogue opens: its backdrop is 300 KB in one piece |
-| `-log PATH` | every diagnostic line and every engine error to a file. The shell's `>` cannot do it: `run` hands the process to the session and returns, and the redirection goes with it - measured |
+| `-log PATH` | every diagnostic line and every engine error to a file. The shell's `>` cannot do it: `run` hands the process to the session and returns, and the redirection goes with it - measured. **On a board point it at `c:\` or `a:\`**: `h:\` is QEMU's host folder and exists only with `-HostFs`, and pointing at it elsewhere produces no log and no complaint |
 | `-artcache N` | the cache size, without rebuilding the card |
 | `-smooth` | average each 2x2 when the panel is smaller than the picture |
 | `-scripts N`, `-fps N`, `-memstat N`, `-mallocs KB N`, `-prof N` | as before |

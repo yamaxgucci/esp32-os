@@ -122,7 +122,13 @@ static int to_int(const char *s)
  *                  to the console, including the engine's own errors and
  *                  the out-of-arena line.  The shell's `>` cannot do this
  *                  for a game: `run` hands the process to the session and
- *                  returns, and the redirection goes with it
+ *                  returns, and the redirection goes with it.
+ *
+ *                  On a board write it to the card or to C: - `-log c:\fo2.log`
+ *                  or `-log a:\fo2.log`.  H: is the host folder QEMU forwards
+ *                  and only exists when the emulator was started with -HostFs;
+ *                  pointing at it anywhere else quietly produces no log, which
+ *                  is how one session was lost
  *   -hud           three numbers in the corner of the panel: frames per
  *                  second, arena in use, largest free block - all in KB,
  *                  green while a full-screen buffer would still fit,
