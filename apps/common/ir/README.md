@@ -20,7 +20,7 @@ ag_ir_free(&ir);
 | Knob | Notes |
 |------|--------|
 | Block | `AG_IR_BLOCK` = 256 samples (~11.6 ms @ 22.05 kHz) |
-| FFT | 512-point int32, Q15 twiddles, real-input pair |
+| FFT | 512-point int32, Q30 twiddles, real-input pair |
 | Cap | `AG_IR_MAX_MS` = 1000 — longer WAVs are truncated. `AG_IR_PRESET_MS` = 500 fixes the synthetic reverbs regardless |
 | Wet | 0..`AG_IR_WET_MAX` (128). **Each load sets it**: `AG_IR_WET_REVERB` (100) for presets 0–2, `AG_IR_WET_MAX` for the cabinet presets and for anything `ag_ir_load` builds. Call `ag_ir_set_wet` *after* the load for a mix |
 | Gain | 0..127; 64 ≈ unity after the IR is normalised |
@@ -54,6 +54,17 @@ unwritten slot of `X` is skipped, so a cold engine does almost no work.
 That is 981 for the fixed part — of which 678 is the transform pair, against
 990 for the complex pair it replaced — plus **52 per partition**. The limit on
 IR length is the processor, not the memory: 348 KB sits in PSRAM unnoticed.
+
+Those figures predate the tail and the twiddles, and neither moved the numbers
+enough to remeasure the table. Counted from the ESP32-S3 disassembly: every
+function in `ag_fft.c` compiles to exactly the instruction count it did with
+Q15 twiddles — the multiply was already 32×32 into an `int64`, so only the
+table grew — and `mac_part`, which is the whole of the per-partition cost, is
+also unchanged. The output loop went from 52 instructions per sample to 63,
+which is 1% of the fixed part and 0.3% of a 500 ms IR. It would have been 104
+had the tail been carried in `int64`; taking only as many tail bits as the
+block's scale already had room for keeps every shift a right shift and the
+whole loop in `int32`.
 What `-icount` does not show is that those 348 KB are read every block, 30 MB/s
 out of external memory; only the board can say what that costs.
 
@@ -156,14 +167,16 @@ be there. Four now follow the signal instead:
 | Input spectrum → int16 | fixed `>> 9` | per block, recorded in `ir->x_sh` |
 | Partition product | `>> 15` | `ir->p_shift`, the least the partition count allows |
 | Spectrum into the inverse FFT | as it fell out | lifted per block, given back in the output shift |
+| Overlap-add tail | rounded to the output word | carried `AG_IR_TAIL_BITS` below it |
 
-The transform is the one worth explaining. It truncates a Q15
-product in every butterfly, so it injects about a unit of noise per stage and
-the following stages amplify it — roughly 6 LSB at the output, whatever went
-in. Against int16 taps whose rms is a few hundred that is 40 dB of noise on
-everything the convolution ever produces, and it does not go down when the
-music does. Lifting the input into the room int32 had spare moves it down by
-as much as the lift.
+Lifting the input into the room int32 had spare moves the transform's own
+rounding down by as much as the lift, and that is what the first five rows are
+for. The tail is the sixth and it is a different kind of mistake: the second
+half of every convolution is held over and added to the block after it, and
+rounding it to the output word on the way out and again on the way back in put
+half a bit of white noise on every sample of it. Flat across the spectrum, so
+loudest exactly where a loudspeaker is quietest. The tail was already `int32`
+and using fifteen of its bits.
 
 How far it can be lifted is not a guess. Every value anywhere in a radix-2
 transform is a sum of its inputs with unit coefficients, so nothing in it can
@@ -172,30 +185,81 @@ single pass. The first version used `max|x| * 512`, the worst case one bin can
 reach, and paid three bits on audio and ten on an impulse response for a case
 that does not occur.
 
-Measured against the same convolution in double precision, on a 30 s guitar
-DI through a 20 ms cabinet (`tools/ir_check.c`):
+## The twiddles
+
+The largest single thing between this engine and the convolution it claims to
+be was the twiddle table, and it was invisible for a long time because it is
+the one error that does not behave like the others. A Q15 twiddle is wrong by
+up to half a part in 32768, and that error is **multiplicative**: it scales
+whatever passes through the rotation. Lifting the data words does not move it,
+widening the accumulator does not move it, and it never shows up as a wrong
+level, a nonlinearity or a failure to be repeatable — so every test in the tree
+passed while it sat there.
+
+Q30 costs nothing. The multiply was already 32×32 into an `int64`, so a wider
+coefficient is the same instructions and 258 more bytes of table. Measured on
+the transform alone, against an answer known exactly — the transform of one
+sample at offset one is a pure rotation, so every bin must have the same
+magnitude — the spread across bins went from 70 units in 2^20 to one.
+[`host-tests/test_dsp.c`](../../../host-tests/test_dsp.c) asserts it, because
+nothing else would notice it coming back.
+
+## What it measures
+
+Against the same convolution in double precision, on a 30 s guitar DI
+(`build-host/ir_check <wav> <outdir> [ir.wav]`), through the synthetic 20 ms
+cabinet:
 
 | Input | Error before | Error now |
 |---|---:|---:|
-| 0 dB | −68.4 dBFS | −92.8 dBFS |
-| −20 dB | −84.0 dBFS | −96.7 dBFS |
-| −40 dB | −87.1 dBFS | −98.1 dBFS |
+| 0 dB | −92.8 dBFS | −100.8 dBFS |
+| −20 dB | −97.0 dBFS | −110.9 dBFS |
+| −40 dB | −98.8 dBFS | −116.9 dBFS |
 
-Worst single sample over the 30 s went from 194 LSB to 12.
+Worst single sample over the 30 s went from 10 LSB to 4.
+
+Through a measured 500 ms Marshall cabinet (`build/nam/imp_mars.wav`, 44
+partitions), which is the harder case and the one worth quoting, per band:
+
+| Band | Error/signal before | Error/signal now | Band level |
+|---|---:|---:|---:|
+| 0.1–0.5 kHz | −67.5 dB | −77.9 dB | −16.7 dBFS |
+| 0.5–2 kHz | −54.8 dB | −65.1 dB | −39.8 dBFS |
+| 2–4 kHz | −42.1 dB | −49.0 dB | −57.8 dBFS |
+| 4–6 kHz | −26.2 dB | −33.9 dB | −74.0 dBFS |
+| 6–10 kHz | −20.7 dB | −26.6 dB | −78.4 dBFS |
 
 ## Where it stops, and why it stops there
 
-At the int16 input spectrum. Cutting `X` by three bits costs 12 dB of
-accuracy; lifting the transforms further, or widening anything else, costs
-nothing — which is the measurement that says everything before it has stopped
-mattering. What is left is about 5 dB above the output word's own floor, and
-buying it back means `X` in int32: twice the memory (192 KB → 385 KB for a
-500 ms tail) and an int32 × int16 multiply in the innermost loop. Not worth
-five decibels under a signal 64 dB above them.
+Not at the output word. `ir_check` adds a known amount of noise to an *exact*
+convolution before forming the output word, which says what accuracy the engine
+is being asked for rather than what it delivers: 1 LSB of internal noise reads
+as −21.9 dB in the 4–6 kHz band, 1/64 LSB reads as −41.4 dB, and none at all
+reads as exactly zero. Six decibels per bit, all the way down. The output word
+is not a floor, because the reference rounds to it too.
+
+So the top-octave figures above are a statement about internal accuracy and
+nothing else. −34 dB in the 4–6 kHz band is about 1/12 LSB; −60 dB there would
+be about 1/570 LSB, nine bits below the word the result is written to. Reaching
+it means every stage carrying those nine bits, and the measurements say the
+stages have to move together — `H` exact on its own is worth 1.4 dB there, `X`
+exact 0.2 dB, and `H`, `X` and the accumulator all exact 12.8 dB. Whichever
+stage is coarsest sets the answer.
+
+Two of them are cheap and are done: the twiddles above, and the overlap tail.
+The rest is not. `X` and `H` in int32 is twice the PSRAM (348 KB → 696 KB for a
+1 s IR at 22 kHz) and twice the memory traffic in the innermost loop, which is
+already the engine's whole cost for a long IR. And it would land at about
+−43 dB, not −60, because the next wall behind it is the spectrum handed to the
+inverse transform: widening the accumulator past that point is provably free of
+effect, since `ygain` renormalises the spectrum to the inverse's 2^29 sum bound
+immediately afterwards and throws the extra bits away. Going further than −43
+means the inverse in wider arithmetic as well, or a deliberate noise shaping
+that spends the low end's 78 dB of margin on the top octaves.
 
 Linearity and the absence of full-scale steps are checked in
 [`host-tests/test_dsp.c`](../../../host-tests/test_dsp.c); the numbers above
-come from `build-host/ir_check <wav>`, which is a tool rather than a test
-because it needs a recording.
+come from `ir_check`, which is a tool rather than a test because it needs a
+recording.
 
 Used by [`apps/irfx`](../../irfx).

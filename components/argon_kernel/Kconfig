@@ -196,10 +196,27 @@ menu "ArgonOS"
             play in QEMU should use HostFS PADPUSH instead - that path already
             has real level state from a Win32 keyboard hook.
 
+    config ARGON_PANEL_QEMU
+        bool "The virtual RGB panel Espressif's QEMU provides"
+        default y
+        help
+            ag_port_panel_open() on the framebuffer device QEMU emulates at
+            0x21000000.  It is how anything graphical is seen without a board,
+            and it is the only panel the port itself drives - a real one is a
+            loadable .SYS over the SPI primitive.
+
+            Off on a target that no emulator runs.  Not a saving: the component
+            that talks to it (espressif/esp_lcd_qemu_rgb) reaches for
+            soc/syscon_reg.h, which the RISC-V parts do not have, so a C6 image
+            with this on does not compile at all.  With it off, the dependency
+            is not even fetched (main/idf_component.yml), panel_hw.c answers
+            "no panel here", and the system comes up on the serial console the
+            way it does on any board without a screen driver loaded.
+
     config ARGON_ENABLE_NET
         bool "Networking (api->net)"
         default y
-        select ETH_USE_OPENETH
+        select ETH_USE_OPENETH if !ARGON_NET_WIFI
         help
             Brings up a thin socket API (api->net) and, for now, the OpenCores
             Ethernet MAC that Espressif QEMU emulates.  That is the path for
@@ -209,6 +226,15 @@ menu "ArgonOS"
             in QEMU, so which link is built is a second option below.  A failed
             bring-up is non-fatal either way; the table stays present but
             ready() stays false.
+
+            The condition on the select is not tidiness.  A `select` cannot be
+            turned off again by a line in sdkconfig.defaults, so with it
+            unconditional every radio build also compiled the QEMU Ethernet MAC
+            - which was invisible on the two Xtensa boards, because both of
+            those chips happen to have a real EMAC and the driver's register
+            base therefore exists.  The C6 has none, and the build stops in
+            somebody else's header on DR_REG_EMAC_BASE.  The link is one or the
+            other, so the select says so.
 
     config ARGON_NET_WIFI
         bool "...over the radio instead of OpenEth"
@@ -294,6 +320,122 @@ menu "ArgonOS"
             work on networks you are allowed to touch.  Not verifiable in QEMU,
             which models no radio.
 
+    config ARGON_NET_SNTP
+        bool "SNTP time sync (date sync)"
+        depends on ARGON_ENABLE_NET
+        default y
+        help
+            Set the clock from a network time server.  `date sync [server]`
+            queries SNTP and sets the system time, after which `date` and an
+            application's ag_get_datetime return real time instead of seconds
+            since boot.  One-shot: it does not keep a client running.
+
+            Depends only on the socket API, not on the radio, so it is verified
+            in QEMU against an SNTP responder on the host (10.0.2.2:123) as well
+            as on a board over Wi-Fi.  Small - the SNTP client is a few hundred
+            bytes and runs only while a sync is in flight.
+
+    config ARGON_NET_TELNET
+        bool "Telnet console on TCP :23"
+        depends on ARGON_ENABLE_NET
+        default y
+        help
+            A second way onto the console, over the network: `telnet on` opens a
+            TCP listener (port 23 by default) and every connection becomes a
+            console endpoint - the same shell, editor and file manager the UART
+            carries, over telnet, with the VT100 screen intact.  Up to two
+            sessions at once; the listener costs one small task while it is up.
+
+            It is the console, so it is a login with no login: anyone who can
+            reach the port has the shell.  Off unless `telnet on` (or [telnet]
+            in SYSTEM.CFG) asks - a board on an open network should not answer
+            on 23 by accident.  Verified in QEMU (hostfwd to :23).
+
+    config ARGON_NET_TLS
+        bool "TLS client (https for wget)"
+        depends on ARGON_ENABLE_NET
+        default y
+        select MBEDTLS_CERTIFICATE_BUNDLE
+        help
+            A TLS client over esp_tls, so `wget https://...` works and a redirect
+            from http to https is followed instead of refused.  The peer is
+            verified against the Mozilla root bundle mbedtls compiles in.
+
+            Not free: mbedTLS wants tens of kilobytes of RAM for its record
+            buffers, which on a chip with under a hundred free once the radio is
+            up is a real fraction - so it is a build option, and with it off an
+            https URL is refused rather than fetched in clear.  Verified in QEMU
+            over OpenEth+SLIRP against a real https server.
+
+    config ARGON_NET_SSH
+        bool "SSH server (console over an encrypted channel)"
+        depends on ARGON_ENABLE_NET
+        default n
+        help
+            An SSH server built on mbedTLS primitives (no second crypto stack),
+            so the console can be reached the way telnet reaches it but
+            encrypted, with a standard `ssh` client.  Being built in milestones;
+            off by default while it is incomplete.  `ssh on` opens the listener.
+
+    config ARGON_NET_MQTT
+        bool "MQTT client (publish/subscribe)"
+        depends on ARGON_ENABLE_NET
+        default n
+        help
+            A small MQTT 3.1.1 client from scratch over the socket layer: the
+            `mqtt pub` and `mqtt sub` commands.  mqtts (MQTT over TLS) works
+            when CONFIG_ARGON_NET_TLS is also on.  Off by default.
+
+    config ARGON_NET_MODBUS
+        bool "Modbus TCP client (master)"
+        depends on ARGON_ENABLE_NET
+        default n
+        help
+            A Modbus TCP master from scratch over the socket layer: the
+            `modbus read` and `modbus write` commands, for the holding and
+            input registers a PLC or sensor gateway exposes.  Off by default.
+
+    config ARGON_NET_OTA
+        bool "Over-the-air firmware update"
+        depends on ARGON_ENABLE_NET
+        default n
+        help
+            The `ota <url>` command: pull a firmware image over http/https into
+            the spare app slot and boot it.  Needs a two-app-slot partition
+            table (see partitions.csv).  Off by default.
+
+    config ARGON_CAN
+        bool "CAN bus (TWAI controller)"
+        default n
+        help
+            The `can send`/`can recv` commands over the chip's TWAI (CAN)
+            controller.  Needs a CAN transceiver on the tx/rx pins and another
+            node on the bus.  Off by default.
+
+    config ARGON_ONEWIRE
+        bool "1-Wire (DS18B20 thermometer)"
+        default n
+        help
+            The `onewire temp`/`onewire rom` commands: a bit-banged 1-Wire bus
+            on one GPIO, enough to read a DS18B20 temperature sensor.  Needs an
+            external ~4.7k pull-up on the line.  Off by default.
+
+    config ARGON_RMT
+        bool "RMT (WS2812 / NeoPixel LEDs)"
+        default n
+        help
+            The `rmt ws2812` command: drive a chain of addressable WS2812 LEDs
+            on one GPIO through the RMT pulse generator.  Works with a board's
+            on-board addressable LED and needs no extra parts.  Off by default.
+
+    config ARGON_MCPWM
+        bool "MCPWM (complementary motor PWM)"
+        default n
+        help
+            The `mcpwm start`/`mcpwm stop` commands: a complementary PWM pair
+            with dead-time on two GPIOs, through the motor-control PWM
+            peripheral, for driving a half-bridge.  Off by default.
+
     config ARGON_BOARD_PROBE
         bool "Board probe instead of the system"
         default n
@@ -365,6 +507,28 @@ menu "ArgonOS"
             never be connectable - a keyboard host that stays invisible.
 
             Not verifiable in QEMU, which models no radio.
+
+    config ARGON_USB_HOST
+        bool "USB host: HID keyboard (boot protocol)"
+        depends on SOC_USB_OTG_SUPPORTED
+        default n
+        help
+            The USB-OTG peripheral as a host, so a wired keyboard plugged into
+            the board's OTG port is one everything above sees as ordinary
+            console events - the same path a Bluetooth keyboard takes, so the
+            shell, the editor and the file manager do not know the difference.
+
+            Boot protocol only, on purpose: the port asks the keyboard to speak
+            the fixed eight-byte report (modifiers, then keys) instead of
+            parsing an arbitrary report descriptor, which is most of what a full
+            HID stack is.  A keyboard is the whole point; a mouse is the same
+            report path when there is something on screen to point at.
+
+            The board must power the keyboard: host mode sources 5 V on the
+            OTG port's VBUS.  Off by default and only on the chips that have the
+            OTG peripheral (the S3 does, the original ESP32 does not).  Not
+            verifiable in QEMU, which models no USB host - the gate is the
+            board.
 
     config ARGON_CONSOLE_COLS
         int "Console width, characters"

@@ -41,7 +41,7 @@
  * in the linear part - tone, volume, the load - do not, and that is most of
  * them.
  *
- * SPDX-License-Identifier: Apache-2.0
+ * SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
  */
 #ifndef AG_STAGE_H
 #define AG_STAGE_H

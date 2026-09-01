@@ -526,9 +526,51 @@ static void test_fft_real_matches_complex(void)
     }
 }
 
+/*
+ * How good the twiddles are, measured against an answer known exactly.
+ *
+ * The transform of a single sample at offset one is a pure rotation: every bin
+ * has magnitude exactly the sample, and only the phase differs.  So any spread
+ * in |X[k]| is the twiddle table's own error and nothing else - no reference
+ * implementation, no libm, and no tolerance that has to be argued for.
+ *
+ * This is here because that error is what dominated the convolution engine's
+ * noise floor, and it is invisible in every other test: it is multiplicative,
+ * so it scales with the signal and never shows up as a wrong level, a
+ * nonlinearity, or a failure to be repeatable.  Q15 twiddles put about 90 units
+ * of spread on the amplitude below; Q30 put a hundredth of one.  Anything much
+ * above a few units means the table has been narrowed again.
+ */
+static void test_fft_twiddle_precision(void)
+{
+    enum { N = 512, AMP = 1 << 20 };
+    static int32_t re[N], im[N];
+    int            i;
+    int32_t        worst = 0;
+
+    for (i = 0; i < N; i++) {
+        re[i] = (i == 1) ? (int32_t)AMP : 0;
+        im[i] = 0;
+    }
+    AG_CHECK_INT(ag_fft_cplx_i32(re, im, N, 1), 0);
+    for (i = 0; i < N; i++) {
+        /* |X[k]| must be AMP for every k; compare the squares to stay in
+         * integers, then divide the difference back down by 2*AMP. */
+        const int64_t got = (int64_t)re[i] * re[i] + (int64_t)im[i] * im[i];
+        const int64_t want = (int64_t)AMP * AMP;
+        const int64_t d = got > want ? got - want : want - got;
+        const int32_t err = (int32_t)(d / (2 * (int64_t)AMP));
+        if (err > worst) {
+            worst = err;
+        }
+    }
+    AG_CHECK(worst < 8);
+}
+
 void run_dsp_tests(void)
 {
     test_fft_real_matches_complex();
+    test_fft_twiddle_precision();
     test_osc_range();
     test_osc_saw_scaling();
     test_lfo_rate();

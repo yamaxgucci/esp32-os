@@ -49,8 +49,18 @@
 
 #define AG_BT_NAME_MAX 31
 
+/*
+ * One HID input report.  `usage` is the port's classification of the device
+ * (keyboard, mouse, other) so the kernel can route without parsing.
+ */
+typedef enum {
+    AG_BT_USAGE_OTHER = 0,
+    AG_BT_USAGE_KEYBOARD,
+    AG_BT_USAGE_MOUSE,
+} ag_bt_usage_t;
+
 /* What the scan saw.  `hid` is a guess from the advertisement, and a good one:
- * a keyboard says so in its appearance and its service list. */
+ * a keyboard or a mouse says so in its appearance and its service list. */
 typedef struct {
     char    name[AG_BT_NAME_MAX + 1];
     uint8_t addr[6];
@@ -58,6 +68,14 @@ typedef struct {
     int8_t  rssi;
     bool    hid;
     bool    bonded; /* paired before, so open() will not ask again          */
+    /*
+     * Which kind, when the advertisement said: a device's appearance
+     * distinguishes a keyboard from a mouse and the scan already had to read it
+     * to set `hid` at all.  Kept because pairing two of them is the normal
+     * case, and a list that calls both "keyboard" makes the person guess.
+     * AG_BT_USAGE_OTHER when only the service list gave it away.
+     */
+    ag_bt_usage_t usage;
 } ag_port_bt_dev_t;
 
 typedef enum {
@@ -75,16 +93,6 @@ typedef struct {
     int8_t        rssi;
     uint32_t      reports; /* how many have arrived since it opened          */
 } ag_port_bt_status_t;
-
-/*
- * One HID input report.  `usage` is the port's classification of the device
- * (keyboard, mouse, other) so the kernel can route without parsing.
- */
-typedef enum {
-    AG_BT_USAGE_OTHER = 0,
-    AG_BT_USAGE_KEYBOARD,
-    AG_BT_USAGE_MOUSE,
-} ag_bt_usage_t;
 
 typedef void (*ag_port_bt_report_fn)(ag_bt_usage_t usage, uint8_t report_id,
                                      const uint8_t *data, uint32_t len);

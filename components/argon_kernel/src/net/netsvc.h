@@ -36,13 +36,6 @@ ag_err_t ag_http_fetch(const char *url, const char *dest);
  * connection at a time, on purpose: see the file.
  */
 /*
- * Serves `root` until Ctrl+C.  With `writable`, browsers may also send files
- * into it and delete them - see the head of httpd.c for why that is a switch
- * and not a default.
- */
-ag_err_t ag_httpd_run(uint16_t port, const char *root, bool writable);
-
-/*
  * An FTP session at the console: connects, logs in, and reads commands until
  * `bye`.  `cwd` is where local files are read and written.
  */

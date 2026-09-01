@@ -11,7 +11,13 @@
 
 int ag_cmd_net(int argc, char **argv);
 int ag_cmd_wget(int argc, char **argv);
-int ag_cmd_httpd(int argc, char **argv);
 int ag_cmd_ftp(int argc, char **argv);
+int ag_cmd_mqtt(int argc, char **argv);
+int ag_cmd_modbus(int argc, char **argv);
+int ag_cmd_ota(int argc, char **argv);
+int ag_cmd_can(int argc, char **argv);
+int ag_cmd_onewire(int argc, char **argv);
+int ag_cmd_rmt(int argc, char **argv);
+int ag_cmd_mcpwm(int argc, char **argv);
 
 #endif /* ARGON_CMD_NET_H */

@@ -4,6 +4,7 @@
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #include <argon/console.h>
+#include <argon/input.h>
 
 #include <stdio.h>
 #include <string.h>
@@ -349,6 +350,29 @@ static void update_flow(ag_con_endpoint_t *ep, uint32_t space)
     }
 }
 
+/*
+ * Release an endpoint: call its transport `close` (to shut a socket) and free
+ * the slot.  Under the console lock so it does not race attach or the render.
+ * The close hook is called after the slot is marked free, so a transport that
+ * frees its own ctx in close cannot have the console touch it again.
+ */
+static void detach_endpoint(ag_con_endpoint_t *ep)
+{
+    ag_console_lock();
+    if (!ep->used) {
+        ag_console_unlock();
+        return;
+    }
+    const ag_con_transport_t *t = ep->transport;
+    void                     *ctx = ep->ctx;
+    memset(ep, 0, sizeof(*ep)); /* clears `used` */
+    ag_console_unlock();
+
+    if (t->close != NULL) {
+        t->close(ctx);
+    }
+}
+
 /* Returns how many bytes were taken from the port, so the caller knows whether
  * there is more to do before it goes back to sleep. */
 static int32_t pump_endpoint(ag_con_endpoint_t *ep)
@@ -376,9 +400,18 @@ static int32_t pump_endpoint(ag_con_endpoint_t *ep)
     }
 
     const int32_t n = ep->transport->read(ep->ctx, chunk, want);
+    if (n < 0) {
+        /* The endpoint has gone (a telnet client hung up).  Detach it here, on
+         * the console task, so no other task races the endpoint array. */
+        detach_endpoint(ep);
+        return 0;
+    }
     for (int32_t i = 0; i < n; i++) {
         ag_event_t ev;
         if (ag_vtin_feed(&ep->in, chunk[i], &ev)) {
+            /* The decoder counts in cells because the terminal does; above
+             * here a pointer is measured in pixels (ABI 0.42). */
+            ag_input_to_pixels(&ev);
             publish(&ev);
         }
     }
@@ -668,4 +701,24 @@ ag_err_t ag_console_attach(const ag_con_transport_t *transport, void *ctx)
     ag_console_unlock();
 
     return -AG_ENFILE;
+}
+
+void ag_console_detach(void *ctx)
+{
+    ag_con_endpoint_t *found = NULL;
+
+    ag_console_lock();
+    for (int i = 0; i < AG_CON_MAX_ENDPOINTS; i++) {
+        if (s_endpoints[i].used && s_endpoints[i].ctx == ctx) {
+            found = &s_endpoints[i];
+            break;
+        }
+    }
+    ag_console_unlock();
+
+    /* detach_endpoint re-locks and re-checks `used`, so a concurrent detach of
+     * the same endpoint is harmless. */
+    if (found != NULL) {
+        detach_endpoint(found);
+    }
 }

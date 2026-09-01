@@ -152,6 +152,7 @@ argon tests              host unit tests, no hardware needed
 argon apps               build every .AXE / .SYS in tools/apps.json
 argon check              all of the above: tests, firmware, applications
 argon flash -port COM5   flash a real board and open the monitor
+argon flash -port COM5 -NoMonitor    flash and return, for a script
 ```
 
 `argon` is a batch file rather than a PowerShell script so that it works on a
@@ -185,6 +186,12 @@ Split licensing — details in [LICENSING.md](LICENSING.md):
 
 - **Kernel** (`components/argon_kernel/`, `main/`) and host-tests: **GPL-3.0-or-later** ([LICENSE](LICENSE))
 - **SDK** (`sdk/`), tools, and most apps: **Apache-2.0** ([LICENSE.Apache-2.0](LICENSE.Apache-2.0))
+- **The valve amplifier emulator** (`apps/common/tube/`, `apps/common/ckt/`,
+  `apps/cktbench/`, `apps/tubebench/`, `tools/tube_render.c`,
+  `tools/tube_live.c`): **PolyForm-Noncommercial-1.0.0**
+  ([LICENSE.PolyForm-Noncommercial-1.0.0](LICENSE.PolyForm-Noncommercial-1.0.0)) —
+  use and modify it freely for anything that is not commercial; selling it needs a
+  separate licence
 - Third-party trees keep their own licenses
 
 Applications that only use the public syscall ABI are not required to be GPL.

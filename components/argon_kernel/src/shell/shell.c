@@ -33,12 +33,20 @@
 #include <argon/vfs.h>
 
 #include <argon/btinput.h>
+#include <argon/usbinput.h>
+#include <time.h>
+
 #include <argon/net.h>
+#include <argon/ssh.h>
+#include "console/telnet_console.h"
 #include <argon/port/bt.h>
 #include <argon/port/ble.h>
+#include <argon/port/usb.h>
 #include <argon/port/io.h>
+#include <argon/hidptr.h>
 #include <argon/port/mem.h>
 #include <argon/port/net.h>
+#include <argon/port/sntp.h>
 #include <argon/port/wifi.h>
 #include <argon/port/sys.h>
 #include <argon/port/task.h>
@@ -469,6 +477,52 @@ static int cmd_boot(int argc, char **argv)
     return 0;
 }
 
+#if AG_PORT_HAS_BT || AG_PORT_HAS_USB_HID
+/*
+ * Where the pointer is, and how much has arrived.
+ *
+ * The whole reason this is a command: a pointing device proves itself only by
+ * its events, the events happen while a hand is on it, and on a machine whose
+ * screen is at the other end of a wire there is nobody watching. Catching the
+ * moment is the wrong instrument. A count that can be asked for afterwards is
+ * the right one - the same shape as `bt` saying how many reports a keyboard has
+ * sent.
+ *
+ * `reports` counts what a device sent, `events` what became an event for
+ * somebody to read. They differ when a report says nothing changed, and the
+ * difference between "the device is silent" and "the device talks and nothing
+ * listens" is exactly what one wants to know first.
+ */
+static int cmd_ptr(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+
+    int32_t  x = 0, y = 0;
+    uint8_t  buttons = 0;
+    uint32_t reports = 0, events = 0;
+    ag_hidptr_stats(&x, &y, &buttons, &reports, &events);
+
+    uint16_t sw = 0, sh = 0;
+    const bool have = ag_display_size(&sw, &sh);
+
+    ag_console_printf("pointer at %d,%d", (int)x, (int)y);
+    if (have) {
+        ag_console_printf(" of %ux%u", (unsigned)sw, (unsigned)sh);
+    }
+    ag_console_printf("  buttons %s%s%s\n",
+                      (buttons & 1u) ? "L" : "-",
+                      (buttons & 2u) ? "R" : "-",
+                      (buttons & 4u) ? "M" : "-");
+    ag_console_printf("%u reports, %u events\n", (unsigned)reports,
+                      (unsigned)events);
+    if (reports == 0) {
+        ag_console_puts("nothing has reported: check `log` for what attached\n");
+    }
+    return 0;
+}
+#endif
+
 static int cmd_uptime(int argc, char **argv)
 {
     (void)argc;
@@ -483,6 +537,130 @@ static int cmd_uptime(int argc, char **argv)
                       (unsigned)((us / 1000u) % 1000u));
     return 0;
 }
+
+static int cmd_date(int argc, char **argv)
+{
+    if (argc >= 2 && ag_path_icmp(argv[1], "sync") == 0) {
+#if AG_PORT_HAS_SNTP
+        const char *server = (argc >= 3) ? argv[2] : NULL;
+        ag_console_puts("syncing time...\n");
+        const ag_err_t err = ag_port_sntp_sync(server, 10000);
+        if (err != AG_OK) {
+            ag_console_printf("date sync: %s\n",
+                              ag_loader_api()->sys->strerror(err));
+            return 1;
+        }
+#else
+        ag_console_puts("no SNTP in this build\n");
+        return 1;
+#endif
+    }
+
+    /* Show the wall clock.  UTC: there is no timezone database on the board,
+     * and a wrong offset is worse than an honest one. */
+    const time_t now = time(NULL);
+    struct tm    tm;
+    if (gmtime_r(&now, &tm) == NULL) {
+        ag_console_puts("date: clock unreadable\n");
+        return 1;
+    }
+    ag_console_printf("%04d-%02d-%02d %02d:%02d:%02d UTC\n", tm.tm_year + 1900,
+                      tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min,
+                      tm.tm_sec);
+    /* Before a sync the clock is seconds since 1970 plus uptime, i.e. still in
+     * 1970 - say so rather than let a 1970 date look like a bug. */
+    if (tm.tm_year + 1900 < 2000) {
+        ag_console_puts("(clock not set - `date sync` to set it from the network)\n");
+    }
+    return 0;
+}
+
+#if defined(CONFIG_ARGON_NET_TELNET) && CONFIG_ARGON_NET_TELNET
+static int cmd_telnet(int argc, char **argv)
+{
+    if (argc >= 2 && ag_path_icmp(argv[1], "on") == 0) {
+        const uint16_t port = (argc >= 3) ? (uint16_t)atoi(argv[2]) : 0;
+        const ag_err_t err = ag_telnet_start(port);
+        if (err != AG_OK) {
+            ag_console_printf("telnet on: %s\n",
+                              ag_loader_api()->sys->strerror(err));
+            return 1;
+        }
+        ag_console_printf("telnet listening on port %u\n",
+                          (unsigned)ag_telnet_port());
+        return 0;
+    }
+    if (argc >= 2 && ag_path_icmp(argv[1], "off") == 0) {
+        ag_telnet_stop();
+        ag_console_puts("telnet off\n");
+        return 0;
+    }
+    if (ag_telnet_running()) {
+        ag_console_printf("telnet on, port %u\n", (unsigned)ag_telnet_port());
+    } else {
+        ag_console_puts("telnet off ('telnet on' to open the console on :23)\n");
+    }
+    return 0;
+}
+#endif /* CONFIG_ARGON_NET_TELNET */
+
+#if defined(CONFIG_ARGON_NET_SSH) && CONFIG_ARGON_NET_SSH
+/* Defined further down with the other SYSTEM.CFG writers; `ssh user` persists
+ * the login through it. */
+static ag_err_t cfg_replace_section(const char *section, const char *body);
+
+static int cmd_ssh(int argc, char **argv)
+{
+    if (argc >= 2 && ag_path_icmp(argv[1], "on") == 0) {
+        const uint16_t port = (argc >= 3) ? (uint16_t)atoi(argv[2]) : 0;
+        const ag_err_t err = ag_ssh_start(port);
+        if (err != AG_OK) {
+            ag_console_printf("ssh on: %s\n",
+                              ag_loader_api()->sys->strerror(err));
+            return 1;
+        }
+        ag_console_printf("ssh listening on port %u\n",
+                          (unsigned)ag_ssh_port());
+        return 0;
+    }
+    if (argc >= 2 && ag_path_icmp(argv[1], "off") == 0) {
+        ag_ssh_stop();
+        ag_console_puts("ssh off\n");
+        return 0;
+    }
+    if (argc >= 2 && ag_path_icmp(argv[1], "user") == 0) {
+        if (argc < 3) {
+            ag_console_puts("usage: ssh user <name> [password]\n");
+            return 1;
+        }
+        const char *name = argv[2];
+        const char *pass = (argc >= 4) ? argv[3] : "";
+        const bool  usable = ag_ssh_set_cred(name, pass);
+        /* Persist for next boot; the live value above already took effect. */
+        char body[128];
+        snprintf(body, sizeof(body), "user = %s\npass = %s\n", name, pass);
+        const ag_err_t cerr = cfg_replace_section("ssh", body);
+        if (cerr != AG_OK) {
+            ag_console_printf("ssh user: set for now, but not saved (%s)\n",
+                              ag_loader_api()->sys->strerror(cerr));
+        }
+        if (usable) {
+            ag_console_printf("ssh login: %s (password set)\n", name);
+        } else {
+            ag_console_printf("ssh login: %s (no password - logins refused)\n",
+                              name);
+        }
+        return 0;
+    }
+    if (ag_ssh_running()) {
+        ag_console_printf("ssh on, port %u%s\n", (unsigned)ag_ssh_port(),
+                          ag_ssh_have_login() ? "" : " (no login set)");
+    } else {
+        ag_console_puts("ssh off ('ssh on' to open the server on :22)\n");
+    }
+    return 0;
+}
+#endif /* CONFIG_ARGON_NET_SSH */
 
 static int cmd_color(int argc, char **argv)
 {
@@ -984,7 +1162,8 @@ static int cfg_has_device_line(const char *text, const char *dos_path)
     return 0;
 }
 
-#if AG_PORT_HAS_WIFI || AG_PORT_HAS_BT
+#if AG_PORT_HAS_WIFI || AG_PORT_HAS_BT || \
+    (defined(CONFIG_ARGON_NET_SSH) && CONFIG_ARGON_NET_SSH)
 
 /* Case-insensitive compare of a fixed length; the section name in the file may
  * be in any case and there is no such helper in argon/path.h. */
@@ -1129,7 +1308,7 @@ static ag_err_t cfg_replace_section(const char *section, const char *body)
     return (w < 0) ? (ag_err_t)w : AG_OK;
 }
 
-#endif /* AG_PORT_HAS_WIFI || AG_PORT_HAS_BT */
+#endif /* AG_PORT_HAS_WIFI || AG_PORT_HAS_BT || CONFIG_ARGON_NET_SSH */
 
 #if AG_PORT_HAS_WIFI
 static ag_err_t cfg_ensure_wifi(const char *ssid, const char *pass,
@@ -1194,28 +1373,46 @@ static ag_err_t cfg_ensure_bt(const char *addr, int addr_type)
 }
 #endif
 
+/*
+ * The buffer comes from the heap for the reason written out above
+ * cfg_replace_section: four kilobytes of stack in a task with twelve, reached
+ * several frames deep, and the only sign of it is one line the chip prints.
+ *
+ * That fix was made in one of the three functions in this file that had the
+ * same shape, and the other two were left - so `drv install` and
+ * `drv uninstall` went on overflowing until an uninstall halted the board.
+ * Same trap, same message, second time.
+ */
 static ag_err_t cfg_ensure_device(const char *dos_path)
 {
-    char        text[DRV_CFG_MAX];
     ag_handle_t h;
     int32_t     n;
     size_t      used = 0;
     char        add[192];
     size_t      add_len;
 
+    char *const text = (char *)ag_port_alloc(DRV_CFG_MAX,
+                                             AG_MEM_FAST | AG_MEM_BYTE);
+    if (text == NULL) {
+        return -AG_ENOMEM;
+    }
+
     h = ag_vfs_open(DRV_CFG_PATH, NULL, AG_O_RDONLY);
     if (h >= 0) {
-        n = ag_vfs_read(h, text, sizeof(text) - 1u);
+        n = ag_vfs_read(h, text, DRV_CFG_MAX - 1u);
         ag_vfs_close(h);
         if (n < 0) {
+            ag_port_free(text);
             return (ag_err_t)n;
         }
         used = (size_t)n;
         text[used] = '\0';
         if (cfg_has_device_line(text, dos_path)) {
+            ag_port_free(text);
             return AG_OK;
         }
     } else if (h != -AG_ENOENT) {
+        ag_port_free(text);
         return (ag_err_t)h;
     } else {
         text[0] = '\0';
@@ -1226,7 +1423,8 @@ static ag_err_t cfg_ensure_device(const char *dos_path)
     add_len = (size_t)snprintf(add, sizeof(add), "%s[modules]\ndevice = %s\n",
                                (used > 0 && text[used - 1u] != '\n') ? "\n" : "",
                                dos_path);
-    if (add_len >= sizeof(add) || used + add_len + 1u > sizeof(text)) {
+    if (add_len >= sizeof(add) || used + add_len + 1u > DRV_CFG_MAX) {
+        ag_port_free(text);
         return -AG_ENOSPC;
     }
     memcpy(text + used, add, add_len + 1u);
@@ -1234,10 +1432,12 @@ static ag_err_t cfg_ensure_device(const char *dos_path)
 
     h = ag_vfs_open(DRV_CFG_PATH, NULL, AG_O_WRONLY | AG_O_CREATE | AG_O_TRUNC);
     if (h < 0) {
+        ag_port_free(text);
         return (ag_err_t)h;
     }
     n = ag_vfs_write(h, text, used);
     (void)ag_vfs_close(h);
+    ag_port_free(text);
     if (n < 0) {
         return (ag_err_t)n;
     }
@@ -1247,10 +1447,10 @@ static ag_err_t cfg_ensure_device(const char *dos_path)
     return AG_OK;
 }
 
+/* Both buffers from the heap, for the reason above cfg_ensure_device: eight
+ * kilobytes of stack was what halted the board on `drv uninstall`. */
 static ag_err_t cfg_remove_device(const char *dos_path)
 {
-    char        text[DRV_CFG_MAX];
-    char        out[DRV_CFG_MAX];
     ag_handle_t h;
     int32_t     n;
     size_t      used;
@@ -1259,13 +1459,22 @@ static ag_err_t cfg_remove_device(const char *dos_path)
     int         in_modules = 0;
     int         changed = 0;
 
+    char *const text = (char *)ag_port_alloc(DRV_CFG_MAX * 2u,
+                                             AG_MEM_FAST | AG_MEM_BYTE);
+    if (text == NULL) {
+        return -AG_ENOMEM;
+    }
+    char *const out = text + DRV_CFG_MAX;
+
     h = ag_vfs_open(DRV_CFG_PATH, NULL, AG_O_RDONLY);
     if (h < 0) {
+        ag_port_free(text);
         return (h == -AG_ENOENT) ? AG_OK : (ag_err_t)h;
     }
-    n = ag_vfs_read(h, text, sizeof(text) - 1u);
+    n = ag_vfs_read(h, text, DRV_CFG_MAX - 1u);
     ag_vfs_close(h);
     if (n < 0) {
+        ag_port_free(text);
         return (ag_err_t)n;
     }
     used = (size_t)n;
@@ -1340,7 +1549,8 @@ static ag_err_t cfg_remove_device(const char *dos_path)
 
         copy_len = eol ? (size_t)(eol - line + 1) : strlen(line);
         if (!drop) {
-            if (out_used + copy_len + 1u > sizeof(out)) {
+            if (out_used + copy_len + 1u > DRV_CFG_MAX) {
+                ag_port_free(text);
                 return -AG_ENOSPC;
             }
             memcpy(out + out_used, line, copy_len);
@@ -1353,15 +1563,18 @@ static ag_err_t cfg_remove_device(const char *dos_path)
     }
 
     if (!changed) {
+        ag_port_free(text);
         return AG_OK;
     }
 
     h = ag_vfs_open(DRV_CFG_PATH, NULL, AG_O_WRONLY | AG_O_CREATE | AG_O_TRUNC);
     if (h < 0) {
+        ag_port_free(text);
         return (ag_err_t)h;
     }
     n = ag_vfs_write(h, out, out_used);
     (void)ag_vfs_close(h);
+    ag_port_free(text);
     if (n < 0) {
         return (ag_err_t)n;
     }
@@ -3184,10 +3397,22 @@ static int cmd_bt(int argc, char **argv)
              * why the same thing can be on the list twice.
              */
             const bool rnd = (s_bt_seen[i].addr_type & 1) != 0;
+            /*
+             * Say which kind, because pairing a keyboard and a mouse is the
+             * normal case and a list that calls both "keyboard" makes the
+             * person guess.  "input" is a device whose service list gave it
+             * away without an appearance to say more.
+             */
+            const char *what = rnd ? "private" : "";
+            if (s_bt_seen[i].hid) {
+                switch (s_bt_seen[i].usage) {
+                case AG_BT_USAGE_KEYBOARD: what = "keyboard"; break;
+                case AG_BT_USAGE_MOUSE:    what = "mouse";    break;
+                default:                   what = "input";    break;
+                }
+            }
             ag_console_printf("  %u %-17s %4d %s\n", (unsigned)(i + 1), label,
-                              (int)s_bt_seen[i].rssi,
-                              s_bt_seen[i].hid ? "keyboard" : (rnd ? "private"
-                                                                   : ""));
+                              (int)s_bt_seen[i].rssi, what);
         }
         if (found > s_bt_seen_n) {
             ag_console_printf("%u more heard, not shown\n",
@@ -3673,6 +3898,54 @@ static int cmd_ble(int argc, char **argv)
 #endif /* AG_PORT_HAS_BLE_CENTRAL || AG_PORT_HAS_BLE_PERIPH */
 
 #endif /* AG_PORT_HAS_BT */
+
+#if AG_PORT_HAS_USB_HID
+static int cmd_usb(int argc, char **argv)
+{
+    ag_port_usb_status_t st;
+
+    if (argc >= 2 && ag_path_icmp(argv[1], "off") == 0) {
+        const size_t before = ag_port_mem_free(AG_MEM_FAST);
+        (void)ag_port_usb_stop();
+        const size_t after = ag_port_mem_free(AG_MEM_FAST);
+        ag_console_printf("usb host off, %u KB back\n",
+                          (unsigned)((after - before) / 1024u));
+        return 0;
+    }
+
+    if (argc >= 2 && ag_path_icmp(argv[1], "on") == 0) {
+        const ag_err_t err = ag_port_usb_start();
+        if (err != AG_OK) {
+            ag_console_printf("usb on: %s\n",
+                              ag_loader_api()->sys->strerror(err));
+            return 1;
+        }
+        (void)ag_usbinput_init();
+        ag_console_puts("usb host up\n");
+        return 0;
+    }
+
+    if (ag_port_usb_status(&st) != AG_OK) {
+        ag_console_puts("usb: no host in this build\n");
+        return 1;
+    }
+    switch (st.state) {
+    case AG_USB_OFF:
+        ag_console_puts("host off\n");
+        break;
+    case AG_USB_IDLE:
+        ag_console_puts("host up, nothing plugged in\n");
+        break;
+    case AG_USB_OPEN:
+        ag_console_printf("keyboard %04x:%04x, %u reports\n", st.vid, st.pid,
+                          (unsigned)st.reports);
+        break;
+    default:
+        break;
+    }
+    return 0;
+}
+#endif /* AG_PORT_HAS_USB_HID */
 
 static int cmd_io(int argc, char **argv)
 {
@@ -4264,7 +4537,11 @@ static const ag_command_t k_commands[] = {
     {"boot", "[recovery|normal]", "boot report; set/clear recovery marker",
      cmd_boot},
     {"log", "[-n N|clear]", "system journal", cmd_log},
+#if AG_PORT_HAS_BT || AG_PORT_HAS_USB_HID
+    {"ptr", "", "where the pointer is, and how much it has said", cmd_ptr},
+#endif
     {"uptime", "", "time since reset", cmd_uptime},
+    {"date", "[sync [server]]", "show the clock, or set it from the network", cmd_date},
     {"cls", "", "clear the screen", cmd_cls},
     {"echo", "<text>", "print text", cmd_echo},
     {"color", "<fg> <bg>", "set text colours", cmd_color},
@@ -4298,8 +4575,41 @@ static const ag_command_t k_commands[] = {
     {"wget", "<url> [file]", "fetch a file over http or ftp",
      ag_cmd_wget},
     {"ftp", "<host> [user] [pass]", "file transfer session", ag_cmd_ftp},
-    {"httpd", "[port] [dir] [/w]", "serve a directory (/w: accept files)",
-     ag_cmd_httpd},
+#if defined(CONFIG_ARGON_NET_MQTT) && CONFIG_ARGON_NET_MQTT
+    {"mqtt", "pub|sub <host> <topic> [msg] [/tls]", "MQTT publish/subscribe",
+     ag_cmd_mqtt},
+#endif
+#if defined(CONFIG_ARGON_NET_MODBUS) && CONFIG_ARGON_NET_MODBUS
+    {"modbus", "read|write <host>… | rtu <uart> <baud> …", "Modbus master (TCP+RTU)",
+     ag_cmd_modbus},
+#endif
+#if defined(CONFIG_ARGON_NET_OTA) && CONFIG_ARGON_NET_OTA
+    {"ota", "[<url> [/reboot]]", "update firmware over the network", ag_cmd_ota},
+#endif
+#if defined(CONFIG_ARGON_CAN) && CONFIG_ARGON_CAN
+    {"can", "send|recv <tx> <rx> <kbps> …", "CAN (TWAI) bus", ag_cmd_can},
+#endif
+#if defined(CONFIG_ARGON_ONEWIRE) && CONFIG_ARGON_ONEWIRE
+    {"onewire", "temp|rom <gpio>", "1-Wire / DS18B20", ag_cmd_onewire},
+#endif
+#if defined(CONFIG_ARGON_RMT) && CONFIG_ARGON_RMT
+    {"rmt", "ws2812 <gpio> <RRGGBB>…", "WS2812 LEDs via RMT", ag_cmd_rmt},
+#endif
+#if defined(CONFIG_ARGON_MCPWM) && CONFIG_ARGON_MCPWM
+    {"mcpwm", "start <a> <b> <hz> <duty%> [dead_ns] | stop", "complementary PWM",
+     ag_cmd_mcpwm},
+#endif
+    /* httpd is a loadable app now (HTTPD.AXE), not a built-in - run it by name. */
+#if defined(CONFIG_ARGON_NET_TELNET) && CONFIG_ARGON_NET_TELNET
+    {"telnet", "[on [port]|off]", "the console over TCP :23", cmd_telnet},
+#endif
+#if defined(CONFIG_ARGON_NET_SSH) && CONFIG_ARGON_NET_SSH
+    {"ssh", "[on [port]|off|user <name> [pass]]",
+     "encrypted console on TCP :22", cmd_ssh},
+#endif
+#endif
+#if AG_PORT_HAS_USB_HID
+    {"usb", "[on|off]", "usb keyboard host", cmd_usb},
 #endif
 #if AG_PORT_HAS_BT
     {"bt", "[on|off|scan|open <#|addr>|close|forget]", "bluetooth input", cmd_bt},

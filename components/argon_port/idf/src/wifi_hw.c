@@ -127,6 +127,11 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id,
             (const wifi_event_sta_disconnected_t *)data;
         if (ev != NULL) {
             s_last_reason = ev->reason;
+            /* The one number that says why a join failed - a wrong key, a
+             * handshake that timed out (often RF or power), an AP that refused
+             * the station - which the text status alone cannot tell apart. */
+            ESP_LOGW("wifi.sta", "disconnected, reason %d, rssi %d",
+                     (int)ev->reason, (int)ev->rssi);
         }
         ag_port_net_link_down();
         if (s_want_join && !s_scanning && !s_switching) {

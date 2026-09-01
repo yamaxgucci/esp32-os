@@ -37,6 +37,24 @@ extern "C" {
 #define AG_PAD_SYS_PAUSE 0x01u
 #define AG_PAD_SYS_QUIT  0x02u
 
+/*
+ * A pointer event counted in console cells, turned into one counted in surface
+ * pixels (ABI 0.42).  A no-op for anything that is not a pointer or a wheel,
+ * and a no-op when there is no surface to scale to.
+ *
+ * Two sources need this and neither can do it itself.  A terminal reports a
+ * column and a row because that is all it has - the window on the other end of
+ * the serial line will never say how large its font is.  A touchscreen driver
+ * reports cells because that is what its ABI contract says and because cells
+ * are the one space the driver and the console already agree on; asking a
+ * loadable driver to know the surface size instead would be a change to every
+ * input driver ever written for this system.
+ *
+ * So the kernel scales on the way in, at the two places those sources enter,
+ * and everything above sees pixels.
+ */
+void ag_input_to_pixels(ag_event_t *ev);
+
 /* Registers joy0 and clears state.  Called from ag_devices_init. */
 ag_err_t ag_input_init(void);
 

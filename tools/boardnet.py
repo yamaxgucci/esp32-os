@@ -212,8 +212,11 @@ def main() -> int:
     note(served_len > 0, "ram-disk-holds-it", "%d bytes" % served_len)
 
     # ---- the board as the server ----------------------------------------
+    # httpd is a loadable app now (HTTPD.AXE), not a built-in command: run it by
+    # name from the SD card, where the other apps live.  It serves the RAM disk
+    # (t:\) the same way the built-in did.
     b.text = ""
-    b.p.write(("httpd %d t:\\\r" % args.serve_port).encode())
+    b.p.write(("run a:\\httpd.axe %d t:\\\r" % args.serve_port).encode())
     b.pump(3.0)
     note("Ctrl+C to stop" in strip(b.text), "httpd-started")
 

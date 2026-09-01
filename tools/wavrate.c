@@ -16,6 +16,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "wavrate_core.h"
+
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -144,34 +146,11 @@ static void wav_write(const char *path, const double *x, uint32_t n,
     fclose(f);
 }
 
-static double bessel_i0(double x)
-{
-    double s = 1.0, t = 1.0;
-    int    i;
-    for (i = 1; i < 80; i++) {
-        t *= (x / (2.0 * i)) * (x / (2.0 * i));
-        s += t;
-        if (t < s * 1e-18) break;
-    }
-    return s;
-}
-
-static uint32_t gcd_u(uint32_t a, uint32_t b)
-{
-    while (b != 0) {
-        const uint32_t t = a % b;
-        a = b;
-        b = t;
-    }
-    return a;
-}
-
 int main(int argc, char **argv)
 {
-    uint32_t n = 0, rate = 0, out_rate, l, m, g, ntaps, i, out_n, bits;
-    double  *x, *h, *y;
-    double   fc, gain, sum = 0.0, peak = 0.0;
-    int64_t  k;
+    uint32_t n = 0, rate = 0, out_rate, out_n = 0, i, bits;
+    double  *x, *y;
+    double   peak = 0.0;
 
     if (argc < 4) {
         fprintf(stderr, "usage: wavrate <in.wav> <out.wav> <out_rate> [bits]\n");
@@ -187,53 +166,23 @@ int main(int argc, char **argv)
         printf("wavrate: already %u Hz, copied %u frames\n", rate, n);
         return 0;
     }
-    g = gcd_u(rate, out_rate);
-    l = out_rate / g;
-    m = rate / g;
-    ntaps = l * TAPS_PER_PHASE;
-    if ((ntaps & 1u) == 0) ntaps++;
-
-    /* Cut off below both Nyquists, in the L-times-upsampled domain. */
-    fc = 0.47 / (double)(l > m ? l : m);
-    gain = (double)l;
-    h = (double *)malloc(ntaps * sizeof(double));
-    for (i = 0; i < ntaps; i++) {
-        const double t = (double)i - (double)(ntaps - 1) / 2.0;
-        const double s = (t == 0.0) ? 2.0 * fc
-                                    : sin(2.0 * M_PI * fc * t) / (M_PI * t);
-        const double r = (2.0 * i) / (double)(ntaps - 1) - 1.0;
-        const double w = bessel_i0(12.0 * sqrt(1.0 - r * r)) / bessel_i0(12.0);
-        h[i] = s * w;
-        sum += h[i];
+    /* The filter itself lives in wavrate_core.c, so that the tone matcher can
+     * resample in memory through the same one. */
+    y = wr_resample(x, n, rate, out_rate, &out_n, 0);
+    if (y == NULL) {
+        fprintf(stderr, "wavrate: out of memory\n");
+        return 1;
     }
-    for (i = 0; i < ntaps; i++) {
-        h[i] *= gain / sum;
-    }
-
-    out_n = (uint32_t)(((uint64_t)n * l) / m);
-    y = (double *)calloc(out_n, sizeof(double));
-    /*
-     * Output sample j sits at input position j*m/l.  Only every l-th tap of
-     * the prototype lines up with a real input sample, so the inner loop walks
-     * one phase of it - sixty-four multiplies, not ten thousand.
-     */
     for (i = 0; i < out_n; i++) {
-        const uint64_t pos = (uint64_t)i * m + (ntaps - 1) / 2;
-        const int64_t  base = (int64_t)(pos / l);
-        const uint32_t phase = (uint32_t)(pos % l);
-        double         acc = 0.0;
-        for (k = 0; phase + (uint64_t)k * l < ntaps; k++) {
-            const int64_t idx = base - k;
-            if (idx < 0) break;
-            if (idx < (int64_t)n) {
-                acc += h[phase + (uint64_t)k * l] * x[idx];
-            }
-        }
-        y[i] = acc;
-        if (fabs(acc) > peak) peak = fabs(acc);
+        if (fabs(y[i]) > peak) peak = fabs(y[i]);
     }
-    printf("wavrate: %u Hz -> %u Hz (%u/%u), %u taps, %u -> %u frames, "
-           "peak %.3f\n", rate, out_rate, l, m, ntaps, n, out_n, peak);
+    printf("wavrate: %u Hz -> %u Hz, %u -> %u frames, peak %.3f\n", rate,
+           out_rate, n, out_n, peak);
+    /*
+     * Scaled here rather than in the filter: this program is about to quantise,
+     * and an overshoot past full scale would wrap.  A caller that stays in float
+     * keeps the overshoot, which is the honest signal.
+     */
     if (peak > 0.999) {
         printf("  peak over full scale, scaling by %.4f\n", 0.999 / peak);
         for (i = 0; i < out_n; i++) y[i] *= 0.999 / peak;

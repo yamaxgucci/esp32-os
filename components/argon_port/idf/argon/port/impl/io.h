@@ -71,6 +71,10 @@
 #define AG_PORT_ADC_GPIO(ch) \
     (((ch) >= 0 && (ch) < 4) ? (36 + (ch))    \
                              : (((ch) >= 4 && (ch) < 8) ? (28 + (ch)) : -1))
+#elif CONFIG_IDF_TARGET_ESP32C6
+/* One converter, seven channels, and the simplest map of the three: channel N
+ * is GPIO N (soc/adc_channel.h).  There is no ADC2 on this part. */
+#define AG_PORT_ADC_GPIO(ch) (((ch) >= 0 && (ch) < 7) ? (ch) : -1)
 #else
 #define AG_PORT_ADC_GPIO(ch) (-1)
 #endif

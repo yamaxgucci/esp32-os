@@ -8,6 +8,8 @@
  */
 #include <argon/port/panel.h>
 
+#if CONFIG_ARGON_PANEL_QEMU
+
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_qemu_rgb.h"
 
@@ -138,3 +140,28 @@ void ag_port_panel_present(int32_t y, int32_t h)
     s_y1 = y + h;
     ag_port_task_yield();
 }
+
+#else /* !CONFIG_ARGON_PANEL_QEMU - a machine with no emulator behind it */
+
+/*
+ * No panel, and the contract has a word for that: open() answers false and the
+ * system carries on with a serial console and a soft framebuffer nobody shows.
+ * On a board the glass is reached the other way round - a loadable .SYS driving
+ * the panel over the SPI primitive, the way c:\st7789.sys does on the
+ * ESP32-C6-LCD-1.47 - and that path does not come through here at all.
+ */
+bool ag_port_panel_open(uint16_t w, uint16_t h, void **fb)
+{
+    (void)w;
+    (void)h;
+    (void)fb;
+    return false;
+}
+
+void ag_port_panel_present(int32_t y, int32_t h)
+{
+    (void)y;
+    (void)h;
+}
+
+#endif /* CONFIG_ARGON_PANEL_QEMU */

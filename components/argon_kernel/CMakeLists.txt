@@ -19,12 +19,16 @@ set(ARGON_KERNEL_SRCS
     "src/console/vtin.c"
     "src/console/console.c"
     "src/console/uart_console.c"
+    "src/console/telnet_console.c"
     "src/dev/device.c"
     "src/dev/devfs.c"
     "src/dev/devices.c"
     "src/dev/display.c"
     "src/dev/textpanel.c"
+    "src/dev/hidkbd.c"
+    "src/dev/hidptr.c"
     "src/dev/btinput.c"
+    "src/dev/usbinput.c"
     "src/dev/audio.c"
     "src/dev/pcmmix.c"
     "src/dev/pcmhw.c"
@@ -53,8 +57,15 @@ set(ARGON_KERNEL_SRCS
     "src/net/netmsg.c"
     "src/net/netio.c"
     "src/net/httpc.c"
-    "src/net/httpd.c"
     "src/net/ftpc.c"
+    "src/net/ssh.c"
+    "src/net/mqtt.c"
+    "src/net/modbus.c"
+    "src/net/ota.c"
+    "src/net/can.c"
+    "src/net/onewire.c"
+    "src/net/rmt.c"
+    "src/net/mcpwm.c"
     "src/proc/proc.c"
     "src/proc/session.c"
     "src/proc/threads.c"
@@ -79,6 +90,14 @@ set(ARGON_KERNEL_SRCS
     # Same dual-build idea as fm: shell command `edit`, also buildable as .AXE.
     "../../apps/edit/edit.c")
 
+# See components/argon_port/CMakeLists.txt: `xtensa` is not a component on the
+# RISC-V parts, and naming it there fails the configure rather than the link.
+if(CONFIG_IDF_TARGET_ARCH_XTENSA)
+    set(ARGON_ARCH_REQUIRES xtensa)
+else()
+    set(ARGON_ARCH_REQUIRES "")
+endif()
+
 idf_component_register(
     SRCS ${ARGON_KERNEL_SRCS}
     INCLUDE_DIRS "include"
@@ -93,8 +112,7 @@ idf_component_register(
                   # api->io: buses and pins straight through to the chip.
                   # esp_adc is deliberately absent - see ARGON_ENABLE_ADC.
                   esp_driver_i2c esp_driver_ledc
-                  # xtensa: the exception table the fault handler installs into
-                  xtensa)
+                  ${ARGON_ARCH_REQUIRES})
 
 # Analogue input, off by default: linking esp_adc runs a constructor that stops
 # the boot under QEMU, and QEMU is how this system is verified.  See Kconfig.

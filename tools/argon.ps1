@@ -48,6 +48,8 @@ ArgonOS
                             "copy a:\x.cfg c:\x.cfg", never "... c:\")
   argon test -cp 866 ...   the same, when the screen is in another code page
   argon tests              host unit tests (needs a host C compiler)
+  argon match CAPTURE.nam  fit a model's voicing to a capture of the real
+                           amplifier and measure both; -Model bogner|slo|jcm800
   argon nettest            wget / httpd / ftp in QEMU against
                            tools\netfixture.py (37 checks)
   argon boardnet -port COM3   the same on the real board, over Wi-Fi;
@@ -55,12 +57,14 @@ ArgonOS
   python tools/netfixture.py serve   the same servers, to try things by hand
   argon check              local CI: host tests, then firmware build
   argon target             which chip the firmware is built for
+  argon target esp32c6     the RISC-V board (docs\12-esp32-c6-lcd.md)
   argon target esp32       switch to the board on the desk (docs\09-esp32-cyd.md);
                            esp32-dsp = no radios, big arena; esp32s3 switches
                            back.  esp32s3-cam = esp32s3-board with the camera
                            built into the image.  esp32s3-board = the S3 on the desk, without
                            the two lines that are for QEMU only.  Any: rebuild
   argon flash -port COM5   flash a real board and open the monitor
+                           -NoMonitor: flash and return, for a script
   argon monitor -port COM5 open the serial monitor on a real board
   argon clean              remove the firmware build directory
   argon env                open a shell with the build environment loaded
@@ -155,10 +159,56 @@ function Build-HostTools {
     }
 }
 
+# A defaults file newer than the generated sdkconfig, which does not mean what
+# anybody expects it to mean.
+#
+# ESP-IDF reads sdkconfig.defaults only for symbols sdkconfig does not already
+# carry.  Once sdkconfig exists, editing a defaults file changes nothing at all:
+# `argon build` happily rebuilds with the old value and says nothing.  This has
+# cost this project two separate afternoons - once on CONFIG_ETH_USE_OPENETH,
+# where a `=n` was ignored and a QEMU-only Ethernet MAC went on being compiled
+# for a chip that has no such registers, and once on
+# CONFIG_PARTITION_TABLE_CUSTOM_FILENAME, where the image kept the old layout
+# and a 1 MB filesystem was then written over a 512 KB partition, taking the
+# start of appfs with it.  Neither failure looked anything like its cause.
+#
+# `argon target <chip>` removes sdkconfig first, which is why switching targets
+# has always worked.  So this does not fix anything; it says which command to
+# run.
+function Warn-StaleSdkconfig {
+    if (-not (Test-Path 'sdkconfig')) { return }
+    $cfg = (Get-Item 'sdkconfig').LastWriteTimeUtc
+    # sdkconfig.<chip>.<variant> fragments are defaults too, by another name, so
+    # both patterns are collected.  @() because a single match is not an array
+    # and += on a bare FileInfo is a method-not-found at run time.
+    $newer = @(Get-ChildItem -File -ErrorAction SilentlyContinue |
+               Where-Object {
+                   ($_.Name -like 'sdkconfig.defaults*' -or
+                    $_.Name -match '^sdkconfig\.[a-z0-9]+\.[a-z0-9]+$') -and
+                   $_.LastWriteTimeUtc -gt $cfg
+               })
+    if (-not $newer) { return }
+
+    $target = '<chip>'
+    $line = Select-String -Path 'sdkconfig' -Pattern '^CONFIG_IDF_TARGET="(.+)"$' |
+            Select-Object -First 1
+    if ($line) { $target = $line.Matches[0].Groups[1].Value }
+
+    Write-Host ''
+    Write-Host 'WARNING: these are newer than sdkconfig, and this build will ignore them:' -ForegroundColor Yellow
+    foreach ($f in ($newer | Select-Object -Unique)) {
+        Write-Host ("  {0}" -f $f.Name) -ForegroundColor Yellow
+    }
+    Write-Host ('Defaults only apply to symbols sdkconfig does not already have.' +
+                " Run ``argon target $target`` first to start from them again.") -ForegroundColor Yellow
+    Write-Host ''
+}
+
 switch ($Command.ToLowerInvariant()) {
 
     'build' {
         Initialize-Environment
+        Warn-StaleSdkconfig
         & idf.py build @Rest
         exit $LASTEXITCODE
     }
@@ -185,8 +235,10 @@ switch ($Command.ToLowerInvariant()) {
             Write-Host 'known targets:  esp32s3 (primary, QEMU)'
             Write-Host '                esp32s3-board  the S3 on the desk: no OpenEth, no HostFS'
             Write-Host '                esp32s3-cam    esp32s3-board + the camera built into the image'
+            Write-Host '                esp32s3-zero   ESP32-S3-Zero: 4 MB flash, USB-JTAG console, I2S DAC, no display/SD'
             Write-Host '                esp32       hardware: Wi-Fi and Bluetooth'
             Write-Host '                esp32-dsp   hardware: neither, 48 KB arena'
+            Write-Host '                esp32c6     hardware: RISC-V, USB console, the C6-LCD-1.47'
             exit 0
         }
 
@@ -207,6 +259,9 @@ switch ($Command.ToLowerInvariant()) {
                               $chip = 'esp32s3' }
             'esp32s3-cam' { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32s3;sdkconfig.esp32s3.board;sdkconfig.esp32s3.cam'
                             $chip = 'esp32s3' }
+            'esp32s3-zero' { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32s3;sdkconfig.esp32s3.zero'
+                             $chip = 'esp32s3' }
+            'esp32c6'   { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32c6' }
             default {
                 Write-Host "argon target: no defaults for '$chip'."
                 Write-Host 'Add sdkconfig.defaults.<chip> before building for it.'
@@ -214,6 +269,42 @@ switch ($Command.ToLowerInvariant()) {
             }
         }
         Remove-Item 'sdkconfig' -ErrorAction SilentlyContinue
+
+        # set-target implies fullclean, and fullclean is shutil.rmtree over
+        # everything in build\ - so one read-only file anywhere under it stops
+        # the switch with WinError 5.  Not everything under build\ is IDF's: a
+        # git clone left there is enough, because a pack file is read-only by
+        # design and lives inside a hidden .git, which is why `attrib -R` on
+        # its own does not reach it.  IDF's own guard only looks for a .git
+        # directly in build\, not for one a level down.
+        #
+        # The second failure is worse than the first.  A half-cleaned build
+        # directory has no CMakeCache.txt left, and idf.py then refuses to touch
+        # it at all - "doesn't seem to be a CMake build directory" - so the next
+        # attempt fails differently and the only way out is deleting the
+        # directory by hand.  Do that here instead: fullclean empties it
+        # completely anyway (staged .AXE images and sd_card included), so
+        # removing it outright destroys nothing the switch was going to keep.
+        if (Test-Path 'build') {
+            $readonly = [IO.FileAttributes]::ReadOnly
+            # One walk, two jobs: drop the read-only bit so rmtree can finish,
+            # and name any clone on the way past.  A clone is the one thing
+            # under here that costs more than a rebuild to get back, and it is
+            # going either way - fullclean does not ask.
+            Get-ChildItem -Recurse -Force 'build' -ErrorAction SilentlyContinue |
+                ForEach-Object {
+                    if ($_.PSIsContainer -and $_.Name -eq '.git') {
+                        Write-Host "argon target: a git clone in the build directory is about to go - $($_.Parent.FullName)"
+                    }
+                    if ($_.Attributes -band $readonly) {
+                        $_.Attributes = $_.Attributes -band -bnot $readonly
+                    }
+                }
+            if (-not (Test-Path 'build\CMakeCache.txt')) {
+                Remove-Item -Recurse -Force 'build' -ErrorAction SilentlyContinue
+            }
+        }
+
         & idf.py -D "SDKCONFIG_DEFAULTS=$defaults" set-target $chip
         exit $LASTEXITCODE
     }
@@ -462,6 +553,43 @@ switch ($Command.ToLowerInvariant()) {
         exit $LASTEXITCODE
     }
 
+    'match' {
+        # The tone match: a capture of a real amplifier in, a fitted voicing out.
+        #
+        # A subcommand rather than a line in a notebook because it needs the host
+        # tools built and the model named, and naming the wrong model quietly
+        # fits one amplifier's voicing to another's capture - which measures fine
+        # and is wrong.  Everything else the tool decides for itself, including
+        # whether the capture has a loudspeaker in it.
+        Build-HostTools
+        $model = 'jcm800'
+        $di = 'build/listen/tube_di_22050.wav'
+        $cap = $null
+        # Not $rest: PowerShell variable names are case insensitive, so that would
+        # empty the $Rest this loop is reading.
+        $extra = @()
+        for ($i = 0; $i -lt $Rest.Count; $i++) {
+            $a = $Rest[$i]
+            if ($a -ieq '-Model') { $i++; $model = $Rest[$i] }
+            elseif ($a -ieq '-Di') { $i++; $di = $Rest[$i] }
+            elseif ($a -ieq '-Cab') { $i++; $env:AG_CAB_IR = $Rest[$i] }
+            elseif ($null -eq $cap) { $cap = $a }
+            else { $extra += $a }
+        }
+        if ($null -eq $cap) {
+            Write-Host 'usage: argon match <capture.nam> [-Model bogner] [-Di take.wav] [-Cab ir.wav] [iterations [drive [q]]]'
+            exit 2
+        }
+        if (-not (Test-Path $di)) {
+            Write-Host ("argon match: no take at {0}." -f $di)
+            Write-Host '  build-host\wavrate.exe build\listen\tube_di_22k.wav build\listen\tube_di_22050.wav 22050'
+            exit 1
+        }
+        $env:AG_MODEL = $model
+        & .\build-host\tube_render.exe match $cap $di @extra
+        exit $LASTEXITCODE
+    }
+
     'check' {
         # Local CI without a cloud runner: same gate as the no-board queue item.
         Write-Host '== host tests =='
@@ -510,15 +638,61 @@ switch ($Command.ToLowerInvariant()) {
         exit $LASTEXITCODE
     }
 
+    #
+    # Two things these had to learn, both found by trying to flash a board
+    # from a script rather than by hand.
+    #
+    # `-port COM5` is what `argon boardnet` takes and what this file's own help
+    # and half the documentation showed for flashing too - but flash and
+    # monitor hand their arguments straight to idf.py, whose option is `-p`.
+    # idf.py then reported `command "COM4" is not known to idf.py` and
+    # `ninja: error: unknown target 'COM4'`, which names neither the mistake
+    # nor the fix.  Rather than pick a winner between two spellings already in
+    # use, translate: both work here now.
+    #
+    # And `flash` always ran the monitor after it, which is right at a desk and
+    # impossible in a script - the monitor never returns, so an automated
+    # caller hangs until its timeout with the flash long since finished.
+    # -NoMonitor is that caller's form.  The monitor stays the default,
+    # because someone who typed `argon flash` by hand wants to see the board
+    # come up.
+    #
+    # Without argon at all, from the build directory, with the IDF python:
+    #
+    #   python -m esptool --chip <chip> -p <PORT> -b 460800 \
+    #       --before default_reset --after hard_reset write_flash "@flash_args"
+    #
+    # The accumulator below is NOT called $rest, and that is not a style
+    # choice: PowerShell variable names are case-insensitive, so `$rest = @()`
+    # empties the `$Rest` parameter it was meant to read, and the loop then
+    # walks nothing.  The symptom is the arguments silently vanishing - the
+    # port was still passed (idf.py has a default) and the monitor still
+    # started, so the only visible effect was that -NoMonitor did nothing.
     'flash' {
         Initialize-Environment
-        & idf.py @Rest flash monitor
+        $fwd = @()
+        $noMonitor = $false
+        foreach ($a in $Rest) {
+            if ($a -eq '-NoMonitor') { $noMonitor = $true }
+            elseif ($a -eq '-port' -or $a -eq '--port') { $fwd += '-p' }
+            else { $fwd += $a }
+        }
+        if ($noMonitor) {
+            & idf.py @fwd flash
+        } else {
+            & idf.py @fwd flash monitor
+        }
         exit $LASTEXITCODE
     }
 
     'monitor' {
         Initialize-Environment
-        & idf.py @Rest monitor
+        $fwd = @()
+        foreach ($a in $Rest) {
+            if ($a -eq '-port' -or $a -eq '--port') { $fwd += '-p' }
+            else { $fwd += $a }
+        }
+        & idf.py @fwd monitor
         exit $LASTEXITCODE
     }
 

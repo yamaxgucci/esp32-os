@@ -30,7 +30,29 @@
 #include <argon/port/task.h>
 #include <argon/port/uart.h>
 
-#define AG_IO_UART_RX_BUF 1024
+/*
+ * A kilobyte of receive buffer is a console's worth, and it was a console this
+ * was written for.  It is not a link's worth.
+ *
+ * At four megabaud a kilobyte is two and a half milliseconds - so a reader that
+ * stops reading for longer than that loses bytes, and any reader that does
+ * something with what it read stops for longer than that.  Found with the video
+ * link between the two boards on the desk: the receiver presents each band of
+ * pixels to its panel over SPI before asking for the next one, and bytes went
+ * missing.  The diagnosis is in the numbers rather than in a guess - the same
+ * 757 000 pixels were sent at two megabaud and at four, and the corrupt frames
+ * doubled with the rate (2 then 4) instead of staying level.  A bad line gives
+ * the same count for the same bytes; an overrun gives the same count for the
+ * same *time*, which is what this was.
+ *
+ * Eight kilobytes is twenty milliseconds at four megabaud, which is longer than
+ * anything a driver does between reads.  Transmit stays small on purpose: a
+ * short transmit buffer makes a large write block until the wire has taken it,
+ * and being paced by the wire is the correct behaviour for whoever is filling
+ * it - the alternative is buffering a frame the far end cannot yet draw.
+ */
+#define AG_IO_UART_RX_BUF 8192
+#define AG_IO_UART_TX_BUF 2048
 
 /*
  * A caller with more to send than AG_PORT_SPI_MAX_XFER splits it, and a chip
@@ -605,6 +627,31 @@ static ag_err_t io_spi_xfer(int bus, int cs, const void *tx, void *rx,
 
 static bool s_uart_up[AG_UART_PORTS];
 
+/*
+ * What was last applied to each port, and why it is worth remembering.
+ *
+ * ag_port_uart_config reprograms the divider and the line, and on the original
+ * ESP32 and the S3 it first waits for the transmit shift register to empty.
+ * Neither is free and neither is harmless in the middle of a stream.  Calling
+ * it from every read and every write - which is what happened here - had two
+ * costs: the wait landed between the bytes of a transfer, and a baud rate the
+ * caller had set with uart_config was undone by its own next write, because a
+ * write brings the port up with `want` NULL and NULL means "the rate in
+ * BOARD.CFG".  A port that snaps back to 115200 the moment you use it is not a
+ * port you can measure a wire with.
+ *
+ * So the rate is applied when it is asked for and when it changes, and an
+ * ordinary read or write takes the port as it stands.
+ */
+static ag_port_uart_cfg_t s_uart_cfg[AG_UART_PORTS];
+
+static bool uart_cfg_same(const ag_port_uart_cfg_t *a,
+                          const ag_port_uart_cfg_t *b)
+{
+    return a->baud == b->baud && a->data_bits == b->data_bits &&
+           a->parity == b->parity && a->stop_bits == b->stop_bits;
+}
+
 static ag_err_t uart_bring_up(int port, const ag_port_uart_cfg_t *want)
 {
     if (port < 0 || port >= AG_UART_PORTS) {
@@ -646,18 +693,29 @@ static ag_err_t uart_bring_up(int port, const ag_port_uart_cfg_t *want)
             return taken;
         }
 
+        /* The port applies uart_cfg itself as the last thing open() does, so
+         * there is nothing to apply again here. */
         const ag_err_t rc = ag_port_uart_open(port, &uart_cfg,
                                               AG_IO_UART_RX_BUF,
-                                              AG_IO_UART_RX_BUF);
+                                              AG_IO_UART_TX_BUF);
         if (rc != AG_OK) {
             return rc;
         }
         s_uart_up[port] = true;
+        s_uart_cfg[port] = uart_cfg;
+
+        /* Pins come from BOARD.CFG and do not change while the port is up. */
+        return ag_port_uart_pins(port, cfg->tx, cfg->rx);
     }
 
-    ag_err_t err = ag_port_uart_config(port, &uart_cfg);
+    /* Up already: a read or a write (want == NULL) takes it as it stands. */
+    if (want == NULL || uart_cfg_same(&s_uart_cfg[port], &uart_cfg)) {
+        return AG_OK;
+    }
+
+    const ag_err_t err = ag_port_uart_config(port, &uart_cfg);
     if (err == AG_OK) {
-        err = ag_port_uart_pins(port, cfg->tx, cfg->rx);
+        s_uart_cfg[port] = uart_cfg;
     }
     return err;
 }

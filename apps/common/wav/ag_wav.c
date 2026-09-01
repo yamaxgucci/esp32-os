@@ -38,6 +38,11 @@ void ag_wav_free(ag_wav_pcm_t *w)
 
 int ag_wav_load(const char *path, ag_wav_pcm_t *out)
 {
+    return ag_wav_load_max(path, out, 0u);
+}
+
+int ag_wav_load_max(const char *path, ag_wav_pcm_t *out, uint32_t max_frames)
+{
     ag_handle_t h;
     uint8_t     hdr[12];
     uint16_t    audio_fmt = 0, channels = 0, bits = 0;
@@ -113,9 +118,12 @@ int ag_wav_load(const char *path, ag_wav_pcm_t *out)
         (void)ag_close(h);
         return -1;
     }
-    /* Cap ~30s @ 48k to keep PSRAM polite */
-    if (frames > 48000u * 30u) {
-        frames = 48000u * 30u;
+    /* Cap ~30s @ 48k to keep PSRAM polite, or whatever the caller can hold. */
+    if (max_frames == 0u) {
+        max_frames = 48000u * 30u;
+    }
+    if (frames > max_frames) {
+        frames = max_frames;
     }
 
     mono = (int16_t *)ag_malloc((size_t)frames * sizeof(int16_t));
@@ -125,14 +133,32 @@ int ag_wav_load(const char *path, ag_wav_pcm_t *out)
     }
 
     if (channels == 1u) {
-        int32_t need = (int32_t)(frames * 2u);
-        int32_t got = ag_read(h, mono, (size_t)need);
-        if (got < 32) {
+        /*
+         * In chunks, like the stereo path below.  It was one read of the whole
+         * file, which is a different request to make of a filesystem than a few
+         * hundred small ones, and there is no reason for the two paths through
+         * this function to ask differently.
+         */
+        enum { MONO_CHUNK = 2048 };
+        uint32_t done = 0;
+        while (done < frames) {
+            uint32_t n = frames - done;
+            int32_t  got;
+            if (n > MONO_CHUNK) {
+                n = MONO_CHUNK;
+            }
+            got = ag_read(h, mono + done, (size_t)n * 2u);
+            if (got < 2) {
+                break;
+            }
+            done += (uint32_t)got / 2u;
+        }
+        frames = done;
+        if (frames < 16u) {
             ag_free(mono);
             (void)ag_close(h);
             return -1;
         }
-        frames = (uint32_t)got / 2u;
     } else {
         /* Read in chunks and mix L/R */
         enum { CHUNK = 1024 };

@@ -4,25 +4,49 @@
  */
 #include "ag_fft.h"
 
-/* Quarter-wave sine, Q15: sin(pi/2 * i / 128) for i = 0..128. */
-static const int16_t k_sin_q[129] = {
-    0,     402,   804,   1205,  1607,  2009,  2410,  2811,  3211,  3611,
-    4011,  4409,  4807,  5205,  5601,  5997,  6392,  6786,  7179,  7571,
-    7961,  8351,  8739,  9126,  9511,  9895,  10278, 10659, 11038, 11416,
-    11792, 12166, 12539, 12909, 13278, 13645, 14009, 14372, 14732, 15090,
-    15446, 15799, 16150, 16499, 16845, 17189, 17530, 17868, 18204, 18537,
-    18867, 19194, 19519, 19840, 20159, 20474, 20787, 21096, 21402, 21705,
-    22004, 22301, 22594, 22883, 23169, 23452, 23731, 24006, 24278, 24546,
-    24811, 25072, 25329, 25582, 25831, 26077, 26318, 26556, 26789, 27019,
-    27244, 27466, 27683, 27896, 28105, 28309, 28510, 28706, 28897, 29085,
-    29268, 29446, 29621, 29790, 29955, 30116, 30272, 30424, 30571, 30713,
-    30851, 30984, 31113, 31236, 31356, 31470, 31580, 31684, 31785, 31880,
-    31970, 32056, 32137, 32213, 32284, 32350, 32412, 32468, 32520, 32567,
-    32609, 32646, 32678, 32705, 32727, 32744, 32756, 32764, 32767,
+/*
+ * Quarter-wave sine, Q30: sin(pi/2 * i / 128) for i = 0..128.
+ *
+ * Q30 rather than the Q15 this held first, and it is the single largest thing
+ * separating this engine from the convolution it claims to be.  A Q15 twiddle
+ * is wrong by up to half a part in 32768, and that error is *multiplicative*:
+ * it scales whatever passes through the rotation, so no amount of headroom in
+ * the data words moves it.  Nine stages of it measured as a floor 68 dB under
+ * the signal, which is 8 dB of the whole engine's error and 6 dB of its error
+ * in the top octaves - where a cabinet's own output is 60 dB down and has
+ * none to spare.
+ *
+ * It is free.  The multiply below was already 32x32 into a 64-bit
+ * intermediate, so a wider coefficient costs no instructions, only 258 more
+ * bytes of table.
+ */
+static const int32_t k_sin_q30[129] = {
+    0, 13176464, 26350943, 39521455, 52686014, 65842639,
+    78989349, 92124163, 105245103, 118350194, 131437462, 144504935,
+    157550647, 170572633, 183568930, 196537583, 209476638, 222384147,
+    235258165, 248096755, 260897982, 273659918, 286380643, 299058239,
+    311690799, 324276419, 336813204, 349299266, 361732726, 374111709,
+    386434353, 398698801, 410903207, 423045732, 435124548, 447137835,
+    459083786, 470960600, 482766489, 494499676, 506158392, 517740883,
+    529245404, 540670223, 552013618, 563273883, 574449320, 585538248,
+    596538995, 607449906, 618269338, 628995660, 639627258, 650162530,
+    660599890, 670937767, 681174602, 691308855, 701339000, 711263525,
+    721080937, 730789757, 740388522, 749875788, 759250125, 768510122,
+    777654384, 786681534, 795590213, 804379079, 813046808, 821592095,
+    830013654, 838310216, 846480531, 854523370, 862437520, 870221790,
+    877875009, 885396022, 892783698, 900036924, 907154608, 914135678,
+    920979082, 927683790, 934248793, 940673101, 946955747, 953095785,
+    959092290, 964944360, 970651112, 976211688, 981625251, 986890984,
+    992008094, 996975812, 1001793390, 1006460100, 1010975242, 1015338134,
+    1019548121, 1023604567, 1027506862, 1031254418, 1034846671, 1038283080,
+    1041563127, 1044686319, 1047652185, 1050460278, 1053110176, 1055601479,
+    1057933813, 1060106826, 1062120190, 1063973603, 1065666786, 1067199483,
+    1068571464, 1069782521, 1070832474, 1071721163, 1072448455, 1073014240,
+    1073418433, 1073660973, 1073741824,
 };
 
 /*
- * sin(2*pi*idx/512), Q15, for idx in 0..511.  The index is a 512th of a turn
+ * sin(2*pi*idx/512), Q30, for idx in 0..511.  The index is a 512th of a turn
  * because the table is a 128-step quarter wave, and every twiddle a 512-point
  * transform needs lands on one of those steps exactly.
  */
@@ -31,19 +55,19 @@ static int32_t sin_512(int idx)
     const int quad = (idx >> 7) & 3;
     const int t = idx & 127;
     if (quad == 0) {
-        return k_sin_q[t];
+        return k_sin_q30[t];
     }
     if (quad == 1) {
-        return k_sin_q[128 - t];
+        return k_sin_q30[128 - t];
     }
     if (quad == 2) {
-        return -(int32_t)k_sin_q[t];
+        return -k_sin_q30[t];
     }
-    return -(int32_t)k_sin_q[128 - t];
+    return -k_sin_q30[128 - t];
 }
 
 /*
- * (a*wa + b*wb) >> 15.
+ * (a*wa + b*wb) >> 30, for Q30 twiddles.
  *
  * Written with a 64-bit intermediate on purpose, which looks like the
  * expensive way round on a 32-bit core and is not: the ESP32-S3 has MULL and
@@ -53,11 +77,13 @@ static int32_t sin_512(int idx)
  * and four shifts where the compiler was already emitting three instructions.
  *
  * The 64-bit form is also the accurate one, because the sum happens before the
- * shift rather than after it.
+ * shift rather than after it.  Nothing here overflows: the transform's inputs
+ * are bounded to 2^30 by fft_headroom and the twiddles to 2^30, so the two
+ * products together cannot pass 2^61.
  */
-static int32_t mac_q15(int32_t a, int32_t wa, int32_t b, int32_t wb)
+static int32_t mac_q30(int32_t a, int32_t wa, int32_t b, int32_t wb)
 {
-    return (int32_t)(((int64_t)a * wa + (int64_t)b * wb) >> 15);
+    return (int32_t)(((int64_t)a * wa + (int64_t)b * wb) >> 30);
 }
 
 /*
@@ -86,8 +112,8 @@ AG_FFT_NOINLINE static void bfly(int32_t *ar, int32_t *ai, int half, int count,
 
     while (count-- > 0) {
         const int32_t xr = *br, xi = *bi;
-        const int32_t tr = mac_q15(xr, wr, xi, -wi);
-        const int32_t ti = mac_q15(xr, wi, xi, wr);
+        const int32_t tr = mac_q30(xr, wr, xi, -wi);
+        const int32_t ti = mac_q30(xr, wi, xi, wr);
         *br = *ar - tr;
         *bi = *ai - ti;
         *ar += tr;
@@ -130,8 +156,8 @@ static void bitrev(int32_t *re, int32_t *im, int n)
  *
  * And k = 0 is worth its own loop: the twiddle there is exactly one, so the
  * butterfly is four adds.  That is 511 of the 2304 butterflies for free, and
- * it is also more accurate than what was here before, because a Q15 one is
- * 32767/32768 and every one of those butterflies was quietly losing 0.003%.
+ * it is also the exact one - a tabulated one is never quite unity, and every
+ * one of those butterflies used to lose that much.
  */
 int ag_fft_cplx_i32(int32_t *re, int32_t *im, int n, int forward)
 {
@@ -216,8 +242,8 @@ static void sep_bin(int32_t *re, int32_t *im, int n, int k, int32_t wr,
     const int32_t ai = (int32_t)(((int64_t)zi1 - zi2 + 1) >> 1);
     const int32_t br = (int32_t)(((int64_t)zi1 + zi2 + 1) >> 1);
     const int32_t bi = (int32_t)(((int64_t)zr2 - zr1 + 1) >> 1);
-    const int32_t xr = ar + mac_q15(br, wr, bi, wi);
-    const int32_t xi = ai + mac_q15(bi, wr, br, -wi);
+    const int32_t xr = ar + mac_q30(br, wr, bi, wi);
+    const int32_t xi = ai + mac_q30(bi, wr, br, -wi);
 
     re[k] = xr;
     im[k] = xi;
@@ -309,8 +335,8 @@ static void sep_inv_bin(int32_t *re, int32_t *im, int k, int32_t wr, int32_t wi,
     const int32_t ar = xr1 + xr2, ai = xi1 - xi2;
     const int32_t cr = xr1 - xr2, ci = xi1 + xi2;
 
-    re[k] = ar - mac_q15(ci, wr, cr, wi);
-    im[k] = ai + mac_q15(cr, wr, ci, -wi);
+    re[k] = ar - mac_q30(ci, wr, cr, wi);
+    im[k] = ai + mac_q30(cr, wr, ci, -wi);
 }
 
 static void sep_inv_pair(int32_t *re, int32_t *im, int n, int k, int32_t wr,

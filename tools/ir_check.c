@@ -2,12 +2,21 @@
  * ir_check - how close the fixed-point convolution engine is to the
  * convolution it claims to be.
  *
- *   build-host/ir_check <input.wav> [outdir]
+ *   build-host/ir_check <input.wav> [outdir] [ir.wav]
  *
- * Runs a recording through ag_ir with a cabinet impulse, and through the same
- * impulse convolved in double precision, and reports the difference.  That
- * difference is the whole of what the engine adds: there is nothing else in
- * the path.  Reported per window as well as overall, because a noise floor
+ * Runs a recording through ag_ir with a cabinet impulse - the synthetic 20 ms
+ * one by default, or a measured one given as the third argument - and through
+ * the same impulse convolved in double precision, and reports the difference.
+ * That difference is the whole of what the engine adds: there is nothing else
+ * in the path.
+ *
+ * Reported per band as well as overall, because the overall number hides the
+ * defect this tool exists to find: a cabinet rolls off forty decibels by
+ * 10 kHz and an arithmetic floor does not, so an error invisible under the
+ * low mids can be louder than the signal in the top octave - audible as the
+ * fizz the cabinet was supposed to remove.
+ *
+ * Reported per window as well as overall, because a noise floor
  * that does not follow the signal is inaudible under a loud chord and
  * obvious under a decaying one - an average over the file hides exactly the
  * defect worth finding.
@@ -292,6 +301,52 @@ static void normalize_energy(int16_t *x, uint32_t n, int32_t target)
     normalize_peak(x, n, 32000);
 }
 
+/*
+ * The engine's resampler, copied for the same reason normalize_energy is:
+ * ag_ir_load runs the impulse through this before it uses it, and the
+ * reference has to convolve with the taps the engine ended up with.
+ */
+static int16_t *resample_mono(const int16_t *src, uint32_t src_n,
+                              uint32_t src_rate, uint32_t dst_rate,
+                              uint32_t max_frames, uint32_t *out_n)
+{
+    uint32_t dst_n, i;
+    int16_t *dst;
+    if (src == NULL || src_n == 0u || src_rate == 0u || dst_rate == 0u) {
+        return NULL;
+    }
+    if (src_rate == dst_rate) {
+        dst_n = src_n > max_frames ? max_frames : src_n;
+        dst = (int16_t *)malloc(sizeof(int16_t) * dst_n);
+        if (dst == NULL) {
+            return NULL;
+        }
+        memcpy(dst, src, sizeof(int16_t) * dst_n);
+        *out_n = dst_n;
+        return dst;
+    }
+    dst_n = (uint32_t)((uint64_t)src_n * dst_rate / src_rate);
+    if (dst_n < 8u) {
+        dst_n = 8u;
+    }
+    if (dst_n > max_frames) {
+        dst_n = max_frames;
+    }
+    dst = (int16_t *)malloc(sizeof(int16_t) * dst_n);
+    if (dst == NULL) {
+        return NULL;
+    }
+    for (i = 0; i < dst_n; i++) {
+        uint32_t si = (uint32_t)((uint64_t)i * src_rate / dst_rate);
+        if (si >= src_n) {
+            si = src_n - 1u;
+        }
+        dst[i] = src[si];
+    }
+    *out_n = dst_n;
+    return dst;
+}
+
 /* ------------------------------------------------------------------------ */
 
 static double db(double v)
@@ -314,19 +369,180 @@ static int16_t sat16d(double v)
 }
 
 /*
+ * Where the error lives, in bands.
+ *
+ * Double-precision FFT with a Blackman-Harris window - Hann's leakage skirt
+ * would let the low mids bleed into the top bands and hide exactly the floor
+ * being measured, since the signal up there is forty decibels down.
+ */
+#define BAND_FFT 4096
+
+static void band_report(const int16_t *ref, const int16_t *eng, uint32_t frames,
+                        uint32_t rate, double full, int with_levels)
+{
+    static const double edge[] = { 150.0,  500.0,  2000.0,
+                                   4000.0, 6000.0, 10000.0 };
+    const int     nb = (int)(sizeof(edge) / sizeof(edge[0])) - 1;
+    static double re[2][BAND_FFT], im[2][BAND_FFT];
+    double        sig[8] = { 0 }, err[8] = { 0 }, sig_all = 0.0;
+    uint32_t      off;
+    int           i, b, which;
+
+    for (off = AG_IR_BLOCK; off + BAND_FFT <= frames; off += BAND_FFT / 2u) {
+        for (which = 0; which < 2; which++) {
+            for (i = 0; i < BAND_FFT; i++) {
+                const double t = (double)i / BAND_FFT;
+                const double w =
+                    0.35875 -
+                    0.48829 * cos(2.0 * 3.14159265358979 * t) +
+                    0.14128 * cos(4.0 * 3.14159265358979 * t) -
+                    0.01168 * cos(6.0 * 3.14159265358979 * t);
+                const uint32_t k = off + (uint32_t)i;
+                const double   v =
+                    which == 0 ? (double)ref[k]
+                               : (double)eng[k] - (double)ref[k];
+                re[which][i] = v * w;
+                im[which][i] = 0.0;
+            }
+            /* Radix-2, double, in place. */
+            {
+                int a, j = 0, len;
+                for (a = 1; a < BAND_FFT; a++) {
+                    int m = BAND_FFT >> 1;
+                    for (; m >= 1 && j >= m; m >>= 1) {
+                        j -= m;
+                    }
+                    j += m;
+                    if (a < j) {
+                        double t2;
+                        t2 = re[which][a];
+                        re[which][a] = re[which][j];
+                        re[which][j] = t2;
+                        t2 = im[which][a];
+                        im[which][a] = im[which][j];
+                        im[which][j] = t2;
+                    }
+                }
+                for (len = 2; len <= BAND_FFT; len <<= 1) {
+                    const int half = len >> 1;
+                    for (a = 0; a < BAND_FFT; a += len) {
+                        for (j = 0; j < half; j++) {
+                            const double ang =
+                                -2.0 * 3.14159265358979 * j / len;
+                            const double wr = cos(ang), wi = sin(ang);
+                            const int    i0 = a + j, i1 = i0 + half;
+                            const double tr =
+                                re[which][i1] * wr - im[which][i1] * wi;
+                            const double ti =
+                                re[which][i1] * wi + im[which][i1] * wr;
+                            re[which][i1] = re[which][i0] - tr;
+                            im[which][i1] = im[which][i0] - ti;
+                            re[which][i0] += tr;
+                            im[which][i0] += ti;
+                        }
+                    }
+                }
+            }
+        }
+        for (i = 1; i < BAND_FFT / 2; i++) {
+            const double hz = (double)i * rate / BAND_FFT;
+            sig_all += re[0][i] * re[0][i] + im[0][i] * im[0][i];
+            for (b = 0; b < nb; b++) {
+                if (hz >= edge[b] && hz < edge[b + 1]) {
+                    sig[b] += re[0][i] * re[0][i] + im[0][i] * im[0][i];
+                    err[b] += re[1][i] * re[1][i] + im[1][i] * im[1][i];
+                }
+            }
+        }
+    }
+    printf("           err/sig per band:");
+    for (b = 0; b < nb; b++) {
+        printf(" %.1f-%.1fk %6.1f dB", edge[b] / 1000.0, edge[b + 1] / 1000.0,
+               10.0 * log10((err[b] + 1e-30) / (sig[b] + 1e-30)));
+    }
+    printf("\n");
+    /*
+     * And the level the band is at, because err/sig alone cannot say whether a
+     * band is hard: a cabinet's top octaves sit within a few LSB of the output
+     * word, so the accuracy they demand of the arithmetic is far finer than
+     * the word the result is finally written to.
+     */
+    if (!with_levels) {
+        return;
+    }
+    printf("           band signal, dBFS:");
+    for (b = 0; b < nb; b++) {
+        printf(" %.1f-%.1fk %6.1f", edge[b] / 1000.0, edge[b + 1] / 1000.0,
+               10.0 * log10((sig[b] + 1e-30) / (sig_all + 1e-30)) + full);
+    }
+    printf("\n");
+}
+
+/* The engine's output stage, in double: gain, then the wet/dry mix. */
+static int16_t mix_out(double conv, double dry, uint32_t gain, uint32_t wetmix)
+{
+    double wet = floor((conv * (double)gain + 32.0) / 64.0);
+    if (wet > 32767.0) {
+        wet = 32767.0;
+    }
+    if (wet < -32768.0) {
+        wet = -32768.0;
+    }
+    return sat16d(dry + floor(((wet - dry) * (double)wetmix + 64.0) / 128.0));
+}
+
+/*
+ * What accuracy the engine is actually being asked for.
+ *
+ * The convolution is exact here; only a known amount of noise is added before
+ * the output word is formed.  So this says what a given internal accuracy buys
+ * in each band, and therefore whether a target is a matter of arithmetic or of
+ * the output word - which no measurement of the engine alone can tell apart.
+ */
+static void diag_floor(const double *convd, const int16_t *in,
+                       const int16_t *ref, uint32_t frames, uint32_t rate,
+                       uint32_t gain, uint32_t wetmix, double full)
+{
+    static const double sigma[] = { 1.0, 0.25, 0.0625, 0.015625, 0.0 };
+    int16_t            *tmp = (int16_t *)malloc(sizeof(int16_t) * frames);
+    uint32_t            i, s;
+    uint32_t            rng = 12345u;
+
+    if (tmp == NULL) {
+        return;
+    }
+    for (s = 0; s < sizeof(sigma) / sizeof(sigma[0]); s++) {
+        for (i = 0; i < frames; i++) {
+            /* Two uniforms summed: zero mean, and the rms is the label. */
+            double u;
+            rng = rng * 1664525u + 1013904223u;
+            u = (double)(rng >> 8) / 16777216.0 - 0.5;
+            rng = rng * 1664525u + 1013904223u;
+            u += (double)(rng >> 8) / 16777216.0 - 0.5;
+            tmp[i] = mix_out(convd[i] + u * sigma[s] * 2.449489742783178,
+                             (double)in[i], gain, wetmix);
+        }
+        printf("      exact convolution + %.4f LSB of internal noise:\n",
+               sigma[s]);
+        band_report(ref, tmp, frames, rate, full, 0);
+    }
+    free(tmp);
+}
+
+/*
  * One pass at one input level.  Both paths get the identical input samples,
  * so any difference between them is the engine's.
  */
 static void run_level(const int16_t *src, uint32_t frames, uint32_t rate,
-                      const int16_t *h, uint32_t hn, double atten,
-                      const char *tag, const char *outdir)
+                      const int16_t *h, uint32_t hn, uint32_t h_rate,
+                      double atten, const char *tag, const char *outdir)
 {
     const uint32_t gain = 64u, wetmix = 127u;
     const uint32_t win = rate / 5u; /* 200 ms */
     ag_ir_t   ir;
     int16_t  *in, *eng, *ref, *err, *hn2;
-    double   *hd;
-    uint32_t  i, k, blocks, w, nwin;
+    double   *hd, *convd;
+    uint32_t  i, k, blocks, w, nwin, rn = 0;
     double    tot_s = 0.0, tot_e = 0.0, worst = -240.0, peak_err = 0.0;
     double    worst_sig = 0.0;
     char      path[512];
@@ -342,8 +558,11 @@ static void run_level(const int16_t *src, uint32_t frames, uint32_t rate,
     eng = (int16_t *)malloc(sizeof(int16_t) * frames);
     ref = (int16_t *)malloc(sizeof(int16_t) * frames);
     err = (int16_t *)malloc(sizeof(int16_t) * frames);
-    hn2 = (int16_t *)malloc(sizeof(int16_t) * hn);
-    hd = (double *)malloc(sizeof(double) * hn);
+    /* The engine's own preparation, step for step: resample to its rate,
+     * truncate to its cap, rescale by energy.  AG_IR_MAX_MS is 1000, so the
+     * cap in frames is the rate. */
+    hn2 = resample_mono(h, hn, h_rate, rate, rate, &rn);
+    hd = hn2 != NULL ? (double *)malloc(sizeof(double) * rn) : NULL;
     if (in == NULL || eng == NULL || ref == NULL || err == NULL ||
         hn2 == NULL || hd == NULL) {
         fprintf(stderr, "out of memory\n");
@@ -352,15 +571,14 @@ static void run_level(const int16_t *src, uint32_t frames, uint32_t rate,
     for (i = 0; i < frames; i++) {
         in[i] = sat16d((double)src[i] * atten);
     }
-    memcpy(hn2, h, sizeof(int16_t) * hn);
-    normalize_energy(hn2, hn, 16384);
-    for (i = 0; i < hn; i++) {
+    normalize_energy(hn2, rn, 16384);
+    for (i = 0; i < rn; i++) {
         hd[i] = (double)hn2[i] / 32768.0;
     }
 
     /* The engine. */
     if (ag_ir_init(&ir, rate) != 0 ||
-        ag_ir_load(&ir, h, hn, rate) != 0) {
+        ag_ir_load(&ir, h, hn, h_rate) != 0) {
         fprintf(stderr, "ir init failed\n");
         return;
     }
@@ -378,23 +596,20 @@ static void run_level(const int16_t *src, uint32_t frames, uint32_t rate,
      * The reference, with the engine's own mix arithmetic in double so that
      * only the convolution differs.  Direct form: slow, and beyond argument.
      */
+    convd = (double *)malloc(sizeof(double) * frames);
+    if (convd == NULL) {
+        fprintf(stderr, "out of memory\n");
+        return;
+    }
     for (i = 0; i < frames; i++) {
         double conv = 0.0;
-        double wet, m, dry = (double)in[i];
         uint32_t kk;
-        uint32_t lim = (i + 1u) < hn ? (i + 1u) : hn;
+        uint32_t lim = (i + 1u) < rn ? (i + 1u) : rn;
         for (kk = 0; kk < lim; kk++) {
             conv += hd[kk] * (double)in[i - kk];
         }
-        wet = floor((conv * (double)gain + 32.0) / 64.0);
-        if (wet > 32767.0) {
-            wet = 32767.0;
-        }
-        if (wet < -32768.0) {
-            wet = -32768.0;
-        }
-        m = dry + floor(((wet - dry) * (double)wetmix + 64.0) / 128.0);
-        ref[i] = sat16d(m);
+        convd[i] = conv;
+        ref[i] = mix_out(conv, (double)in[i], gain, wetmix);
     }
 
     /*
@@ -442,6 +657,12 @@ static void run_level(const int16_t *src, uint32_t frames, uint32_t rate,
            db(sqrt(tot_e / (double)(frames - AG_IR_BLOCK)) / 32768.0),
            db(sqrt(tot_e / tot_s)), worst, worst_sig);
     printf("           peak error %.1f LSB over %u windows\n", peak_err, nwin);
+    band_report(ref, eng, frames, rate,
+                db(sqrt(tot_s / (double)(frames - AG_IR_BLOCK)) / 32768.0), 1);
+    if (atten >= 1.0) {
+        diag_floor(convd, in, ref, frames, rate, gain, wetmix,
+                   db(sqrt(tot_s / (double)(frames - AG_IR_BLOCK)) / 32768.0));
+    }
 
     snprintf(path, sizeof(path), "%s/ir_%s_engine.wav", outdir, tag);
     wav_write(path, eng, frames, rate);
@@ -455,6 +676,7 @@ static void run_level(const int16_t *src, uint32_t frames, uint32_t rate,
     free(ref);
     free(err);
     free(hn2);
+    free(convd);
     free(hd);
 }
 
@@ -604,10 +826,10 @@ int main(int argc, char **argv)
     const char *outdir = argc > 2 ? argv[2] : "build/listen";
     int16_t    *src;
     int16_t    *h;
-    uint32_t    frames = 0, rate = 0, hn;
+    uint32_t    frames = 0, rate = 0, hn, h_rate;
 
     if (argc < 2) {
-        fprintf(stderr, "usage: ir_check <input.wav> [outdir]\n");
+        fprintf(stderr, "usage: ir_check <input.wav> [outdir] [ir.wav]\n");
         return 2;
     }
     src = wav_read(argv[1], &frames, &rate);
@@ -618,14 +840,28 @@ int main(int argc, char **argv)
         fprintf(stderr, "rate %u out of range for ag_ir\n", rate);
         return 1;
     }
-    h = (int16_t *)malloc(sizeof(int16_t) * rate);
-    if (h == NULL) {
-        return 1;
+    if (argc > 3) {
+        /* A measured impulse, at whatever rate it was captured; the engine
+         * resamples it to the input's rate itself, and run_level repeats
+         * that for the reference. */
+        h = wav_read(argv[3], &hn, &h_rate);
+        if (h == NULL) {
+            return 1;
+        }
+        printf("ir_check: %s, %u frames at %u Hz, IR %s: %u taps at %u Hz "
+               "(%.0f ms)\n",
+               argv[1], frames, rate, argv[3], hn, h_rate,
+               1000.0 * (double)hn / (double)h_rate);
+    } else {
+        h = (int16_t *)malloc(sizeof(int16_t) * rate);
+        if (h == NULL) {
+            return 1;
+        }
+        hn = make_cab(h, rate, rate);
+        h_rate = rate;
+        printf("ir_check: %s, %u frames at %u Hz, cabinet %u taps (%.0f ms)\n",
+               argv[1], frames, rate, hn, 1000.0 * (double)hn / (double)rate);
     }
-    hn = make_cab(h, rate, rate);
-
-    printf("ir_check: %s, %u frames at %u Hz, cabinet %u taps (%.0f ms)\n",
-           argv[1], frames, rate, hn, 1000.0 * (double)hn / (double)rate);
     printf("  engine vs the same convolution in double precision\n");
 
     /*
@@ -642,9 +878,9 @@ int main(int argc, char **argv)
     diag_delta(rate, 200.0);
     diag_presets(src, frames, rate);
 
-    run_level(src, frames, rate, h, hn, 1.0, "0dB", outdir);
-    run_level(src, frames, rate, h, hn, 0.1, "-20dB", outdir);
-    run_level(src, frames, rate, h, hn, 0.01, "-40dB", outdir);
+    run_level(src, frames, rate, h, hn, h_rate, 1.0, "0dB", outdir);
+    run_level(src, frames, rate, h, hn, h_rate, 0.1, "-20dB", outdir);
+    run_level(src, frames, rate, h, hn, h_rate, 0.01, "-40dB", outdir);
 
     free(h);
     free(src);

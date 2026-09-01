@@ -32,6 +32,34 @@
 #define AG_IR_EMPTY (-127)
 
 /*
+ * How many bits below the output word the overlap-add tail is carried.
+ *
+ * The second half of every convolution is held over and added to the block
+ * after it.  Kept at the resolution of the output word, that hand-over rounds
+ * once per sample, and the half-bit it leaves behind is white: flat across the
+ * spectrum, and so loudest exactly where a loudspeaker is quietest.  Measured
+ * against the same convolution in double precision, that one rounding was
+ * worth about 1.5 dB of the engine's error above 4 kHz, and it is the only
+ * error in the chain that costs nothing to remove - the tail is already int32
+ * and was using fifteen of its bits.
+ *
+ * Eight is what the output word's own headroom pays for: see AG_IR_FINE_MAX,
+ * which is what the tail has to stay under for the gain multiply to stay in
+ * int32, and which at eight bits is still twice full scale.  More bits than
+ * this would buy nothing anyway - at eight, the hand-over rounds a two
+ * hundred and fifty-sixth of an LSB, and the stages around it are two powers
+ * of ten coarser than that.
+ */
+#define AG_IR_TAIL_BITS 8
+
+/*
+ * The most the tail may reach before the gain multiply, so that the multiply
+ * stays inside int32: 127 * 2^24 is under 2^31.  At AG_IR_TAIL_BITS that is
+ * twice full scale, and the output saturates past full scale in any case.
+ */
+#define AG_IR_FINE_MAX (1 << 24)
+
+/*
  * Fully wet.  128 rather than 127 because the mix divides by 128: stopping a
  * notch short leaves 1/128 of the dry signal - inaudible behind a reverb, and
  * the end of a cabinet, which exists to remove the top end that this leak
@@ -94,7 +122,8 @@ typedef struct ag_ir {
      * int32, not int16: this is the second half of the overlap-add, and a
      * cabinet's low end puts more into the tail than into the block that
      * carried it.  Saturating it clipped the part of the output nothing else
-     * clipped.
+     * clipped.  Held AG_IR_TAIL_BITS below the output word, so that handing
+     * it to the next block does not round it.
      */
     int32_t overlap[AG_IR_BLOCK];
 } ag_ir_t;

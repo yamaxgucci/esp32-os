@@ -28,6 +28,16 @@ ag_err_t ag_display_init(void);
 
 bool ag_display_ready(void);
 
+/*
+ * The surface, in pixels.  False when there is none - a headless board, or one
+ * whose [display] says `none`.
+ *
+ * Here because a pointer has to be clamped to something (src/dev/hidptr.c) and
+ * asking gfx->acquire for the size would take the display away from whoever
+ * has it.  Reporting the size is not owning it.
+ */
+bool ag_display_size(uint16_t *w, uint16_t *h);
+
 /* True while an application holds the framebuffer (text blit is suspended). */
 bool ag_display_acquired(void);
 

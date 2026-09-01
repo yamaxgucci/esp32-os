@@ -34,7 +34,7 @@
  * those.  Measure them once, honestly, and the rest of the answer is
  * multiplication.
  *
- * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
  */
 #include <argon/argon.h>
 

@@ -31,8 +31,15 @@ typedef struct {
     const char *name;
     /* Writes to the transport.  May block briefly; must not block forever. */
     int32_t (*write)(void *ctx, const char *data, size_t len);
-    /* Reads whatever is available right now.  Returns 0 when nothing is. */
+    /* Reads whatever is available right now.  Returns 0 when nothing is, and a
+     * negative value when the endpoint has gone (a socket whose peer hung up):
+     * the console then detaches it and, if `close` is set, calls it.  A
+     * transport that never goes away (the UART) just never returns negative. */
     int32_t (*read)(void *ctx, uint8_t *buf, size_t len);
+    /* Optional.  Called once when the endpoint is detached (read returned
+     * negative, or ag_console_detach), so a socket-backed transport can close
+     * its fd and free its slot.  NULL for a transport with nothing to release. */
+    void (*close)(void *ctx);
 } ag_con_transport_t;
 
 ag_err_t ag_console_init(uint16_t cols, uint16_t rows);
@@ -40,6 +47,11 @@ bool     ag_console_ready(void);
 
 /* Adds an endpoint.  It starts with a full repaint owed to it. */
 ag_err_t ag_console_attach(const ag_con_transport_t *transport, void *ctx);
+
+/* Removes the endpoint whose ctx this is, calling its transport `close`.  Safe
+ * to call on a ctx that is not attached (does nothing).  The console also does
+ * this itself when an endpoint's read returns negative. */
+void ag_console_detach(void *ctx);
 
 /*
  * Sends console output somewhere else until cleared, which is how the shell

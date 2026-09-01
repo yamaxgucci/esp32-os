@@ -22,7 +22,7 @@
  * Build:
  *   python tools/gen_font8x8.py
  *   python tools/mkaxe.py --arch xtensa --gcc xtensa-esp32-elf-gcc \
- *       --include sdk/include --include apps/ili9341 \
+ *       --include sdk/include --include apps/common \
  *       -o build/apps/ILI9341.SYS apps/ili9341/ili9341.c
  *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0

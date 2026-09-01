@@ -135,9 +135,18 @@ extern "C" {
  *      transport; the driver configures it with the sensor's pins/format and
  *      pulls frames.  NULL without CONFIG_ARGON_ENABLE_CAMERA (off by default -
  *      no camera in QEMU, and it is a board's peripheral, not the chip's).
+ * 0.42 pointer events carry pixels, always, and ag_coninfo_t gained cell_w /
+ *      cell_h so a text application can get back to a column and a row.
+ *      Before this the same field meant cells from a terminal or a touchscreen
+ *      and pixels from a virtual mouse, and an application could not tell -
+ *      so graphical ones (grain, amp, doom) mishandled every tap.  The console
+ *      is still a grid of cells, because that is what a text console is; what
+ *      changed is that a pointer is a position on a surface and is now reported
+ *      as one.  A terminal has no pixels of its own, so the kernel scales its
+ *      column and row by the cell size on the way in.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 41u
+#define AG_ABI_MINOR 42u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -402,6 +411,21 @@ typedef struct {
     uint16_t cur_y;
     uint8_t  attr;
     bool     has_local_display;
+    /*
+     * ABI 0.42: how big one cell is, in the pixels a pointer event is measured
+     * in.  Zero when there is no surface to measure against - a serial terminal
+     * has no pixels at all and will never say how big its font is.
+     *
+     * Here because pointer events carry pixels (see AG_EV_POINTER_* below) and a
+     * text application needs to get back to a column and a row.  It is a fact
+     * about this console, published once, rather than a second coordinate
+     * system: the console *is* a grid of cells - that is what ag_poke
+     * addresses - while a pointer is a position on a surface.  Conflating the
+     * two is what made touch land in the wrong place in graphical applications
+     * for as long as it did.
+     */
+    uint16_t cell_w;
+    uint16_t cell_h;
 } ag_coninfo_t;
 
 typedef struct ag_con_api {
@@ -485,6 +509,13 @@ typedef struct {
             bool     repeat;
         } key;
         struct {
+            /*
+             * Where, in the pixels of the surface an application draws into
+             * (ABI 0.42).  Every source is scaled to that on the way in - a
+             * mouse counts in pixels already, a touchscreen and a terminal
+             * count in cells and the kernel multiplies.  A text application
+             * divides by con->cell_w / cell_h to get its column and row.
+             */
             int16_t  x, y;
             int16_t  dx, dy;
             uint8_t  buttons;

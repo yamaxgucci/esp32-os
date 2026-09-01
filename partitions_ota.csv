@@ -1,0 +1,21 @@
+# ArgonOS partition table - 8 MB flash, OTA-capable (two app slots).
+#
+# Select with CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_ota.csv" for a
+# board that should update itself over the network (the `ota` command).  The
+# default table is partitions.csv (single app); this one splits the app space
+# into ota_0 and ota_1 so `ota` writes the new image to the slot it is not
+# running from and switches to it, with otadata recording which is current.
+#
+# ota_0 stays at 0x10000, where the flashing tools place the app, so a fresh
+# flash lands in it and boots it.  NOTE: the QEMU esp32s3 does not boot this
+# two-slot layout (it hangs in the bootloader after loading the app); OTA is
+# meant for real hardware, where this table works.
+#
+# Name,     Type, SubType,  Offset,   Size,     Flags
+nvs,        data, nvs,      0x9000,   0x4000,
+otadata,    data, ota,      0xd000,   0x2000,
+phy_init,   data, phy,      0xf000,   0x1000,
+ota_0,      app,  ota_0,    0x10000,  0x200000,
+ota_1,      app,  ota_1,    0x210000, 0x200000,
+sysfs,      data, littlefs, 0x410000, 0x100000,
+appfs,      data, 0x40,     0x510000, 0x2F0000,

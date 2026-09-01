@@ -85,6 +85,23 @@ unsigned ag_port_reserved_pins(const ag_port_pin_range_t **out)
          * this project has no such board, so nothing here pretends to know.
          */
         {6, 11, "flash"},
+#elif CONFIG_IDF_TARGET_ESP32C6
+        /*
+         * SPI0/1 to the flash chip: 24 SPICS0, 25 SPIQ, 26 SPIWP, 27 VDD_SPI,
+         * 28 SPIHD, 29 SPICLK, 30 SPID (soc/spi_pins.h).  27 is not a signal
+         * at all - it is the regulator output the flash is powered from - and
+         * it is inside the range on purpose: driving it is the same dead board
+         * as driving the clock.
+         */
+        {24, 30, "flash"},
+        /*
+         * The USB pins, and on this board they are the console: there is no
+         * bridge chip, the Type-C socket goes to the part itself, and taking
+         * either of these pins ends the conversation with no way to say so.
+         * Named here rather than left to the console's own two lines because
+         * they are the machine's whatever the console is set to.
+         */
+        {12, 13, "usb"},
 #else
         {0, -1, NULL}, /* nothing known for this target */
 #endif

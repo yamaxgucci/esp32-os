@@ -1,6 +1,9 @@
 /*
- * ArgonOS port: ESP-IDF / Xtensa - catching a fault and blaming the right
- * process.
+ * ArgonOS port: ESP-IDF - catching a fault and blaming the right process.
+ *
+ * Two halves, and the file is split down the middle by the instruction set
+ * because argon/port/fault.h says this is the one place where that shows: an
+ * Xtensa half that works, and a RISC-V half that says so.
  *
  * Without an MMU a wild pointer can reach anything, and that is a deliberate
  * trade [Т-12].  What is not acceptable is the consequence: an application that
@@ -38,9 +41,12 @@
  */
 #include <argon/port/fault.h>
 
+#if defined(__XTENSA__)
+
 #include <xtensa/corebits.h>
 
 #include "esp_ipc.h"
+#include "esp_rom_sys.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "xtensa_api.h"
@@ -138,6 +144,18 @@ static void fault_handler(XtExcFrame *frame)
      */
     if (s_note(cause, (uint32_t)frame->pc, (uint32_t)frame->excvaddr,
                (uint32_t)frame->a1)) {
+        /*
+         * Say it here, from the exception itself, with esp_rom_printf - the one
+         * output that is safe in this context (it busy-writes UART0 through ROM,
+         * no lock, no heap, the same call the panic handler uses).  The tidy
+         * report comes later from a task context, but only if recovery gets
+         * there: an application that faulted by corrupting its own stack can
+         * take the unwind down with it, and then this line is the only record
+         * of where it died.
+         */
+        esp_rom_printf("\n[fault] app pc=0x%08x addr=0x%08x cause=%u (%s)\n",
+                       (uint32_t)frame->pc, (uint32_t)frame->excvaddr,
+                       (unsigned)cause, ag_port_fault_cause_name(cause));
         frame->pc = (long)&ag_fault_trampoline;
         return;
     }
@@ -194,3 +212,56 @@ ag_err_t ag_port_fault_init(ag_port_fault_note_fn note,
     s_installed = true;
     return AG_OK;
 }
+
+#else /* !__XTENSA__ - the RISC-V parts (C3, C6, H2, P4) */
+
+/*
+ * Not yet, and not because nobody got round to it.
+ *
+ * The Xtensa half above rests on one property of that architecture: a table of
+ * per-cause handlers whose documented contract is that returning from a handler
+ * restores the thread context *including whatever the handler changed in the
+ * frame*.  That is what makes the trick legal - the handler moves the return PC
+ * and returns, and the faulting task wakes up in the recovery routine on its own
+ * stack.
+ *
+ * RISC-V on ESP-IDF has no such table.  Every exception lands in one vector
+ * which calls panic_from_exception(), and the panic path does not return.  A
+ * port would have to get in ahead of it - overriding esp_panic_handler, or the
+ * vector itself - and then reconstruct the same guarantee by hand out of an
+ * RvExcFrame: change mepc, restore the registers, mret.  That is a real piece
+ * of work with a real way to be subtly wrong, and it is not the thing standing
+ * between this system and a C6 board.
+ *
+ * So it answers -AG_ENOTSUP, which the contract allows in so many words: the
+ * system runs, the supervisor says at boot that a faulting application takes
+ * the machine with it, and it does - the panic handler prints its report and
+ * reboots, which is what every other firmware on this chip does anyway.
+ */
+const char *ag_port_fault_cause_name(uint32_t cause)
+{
+    /* mcause exception codes, for the record the panic handler prints. */
+    switch (cause) {
+    case 0u:  return "instruction address misaligned";
+    case 1u:  return "instruction access fault";
+    case 2u:  return "illegal instruction";
+    case 3u:  return "breakpoint";
+    case 4u:  return "load address misaligned";
+    case 5u:  return "load access fault";
+    case 6u:  return "store address misaligned";
+    case 7u:  return "store access fault";
+    case 8u:  return "environment call";
+    case 11u: return "environment call from machine mode";
+    default:  return "fault";
+    }
+}
+
+ag_err_t ag_port_fault_init(ag_port_fault_note_fn note,
+                            ag_port_fault_recover_fn recover)
+{
+    (void)note;
+    (void)recover;
+    return -AG_ENOTSUP;
+}
+
+#endif /* __XTENSA__ */

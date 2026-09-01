@@ -327,6 +327,24 @@ static uint8_t key_to_button(uint16_t code)
     }
 }
 
+/*
+ * A pointer event's pixels, back to the column and row this screen is drawn in.
+ *
+ * Pointer events carry surface pixels as of ABI 0.42, because a pointer is a
+ * position and a mouse counts in something finer than a cell.  A text screen
+ * still thinks in cells - that is what it is - so the division happens here,
+ * with the cell size the console publishes.  cell_w of zero means there is no
+ * surface at all (a serial terminal and nothing else), and then the event is
+ * already counted in cells.
+ */
+static void tap_to_cell(int16_t px, int16_t py, int *col, int *row)
+{
+    ag_coninfo_t ci;
+    ag_coninfo(&ci);
+    *col = (ci.cell_w > 0) ? ((int)px / (int)ci.cell_w) : (int)px;
+    *row = (ci.cell_h > 0) ? ((int)py / (int)ci.cell_h) : (int)py;
+}
+
 static uint8_t cell_to_button(int col, int row)
 {
     if (col < PIC_COL0) {
@@ -650,7 +668,9 @@ int ag_main(int argc, char **argv)
                 }
             } else if (ev.type == AG_EV_POINTER_DOWN ||
                        ev.type == AG_EV_POINTER_MOVE) {
-                s_tap_bits = cell_to_button(ev.ptr.x, ev.ptr.y);
+                int tc = 0, tr = 0;
+                tap_to_cell(ev.ptr.x, ev.ptr.y, &tc, &tr);
+                s_tap_bits = cell_to_button(tc, tr);
             } else if (ev.type == AG_EV_POINTER_UP) {
                 s_tap_bits = 0;
             }
