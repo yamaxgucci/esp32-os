@@ -322,6 +322,16 @@ static int cmd_mem(int argc, char **argv)
     const size_t int_block = ag_port_mem_largest(AG_MEM_FAST);
     const size_t psram_free = ag_port_mem_free(AG_MEM_SLOW);
     const size_t psram_total = ag_port_mem_total(AG_MEM_SLOW);
+    /*
+     * Extended memory has a largest block too, and leaving it out cost an
+     * evening.  An application that asks for a size gets one contiguous
+     * block or it does not start, so `free` is not the number that decides
+     * anything - Fallout 2 was refused six megabytes three times with this
+     * command reporting more than six free, and the arithmetic to explain
+     * the gap was guesswork every time because the figure that settles it
+     * was the one not printed.  It is the same call as the other two rows.
+     */
+    const size_t psram_block = ag_port_mem_largest(AG_MEM_SLOW);
 
     /*
      * And the same question asked the way an image asks it.
@@ -349,9 +359,10 @@ static int cmd_mem(int argc, char **argv)
                           (unsigned)(byte_free / 1024),
                           (unsigned)(byte_block / 1024));
         if (psram_total > 0) {
-            ag_console_printf("extended %5uK  %5uK\n",
+            ag_console_printf("extended %5uK  %5uK  %5uK\n",
                               (unsigned)(psram_total / 1024),
-                              (unsigned)(psram_free / 1024));
+                              (unsigned)(psram_free / 1024),
+                              (unsigned)(psram_block / 1024));
         } else {
             ag_console_puts("extended  none\n");
         }
@@ -366,9 +377,10 @@ static int cmd_mem(int argc, char **argv)
                           (unsigned)(byte_free / 1024),
                           (unsigned)(byte_block / 1024));
         if (psram_total > 0) {
-            ag_console_printf("  extended  %8u KB  %8u KB\n",
+            ag_console_printf("  extended  %8u KB  %8u KB  %8u KB\n",
                               (unsigned)(psram_total / 1024),
-                              (unsigned)(psram_free / 1024));
+                              (unsigned)(psram_free / 1024),
+                              (unsigned)(psram_block / 1024));
         } else {
             ag_console_puts("  extended         none\n");
         }
