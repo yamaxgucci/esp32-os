@@ -1326,28 +1326,46 @@ static ag_err_t cfg_ensure_bt(const char *addr, int addr_type)
 }
 #endif
 
+/*
+ * The buffer comes from the heap for the reason written out above
+ * cfg_replace_section: four kilobytes of stack in a task with twelve, reached
+ * several frames deep, and the only sign of it is one line the chip prints.
+ *
+ * That fix was made in one of the three functions in this file that had the
+ * same shape, and the other two were left - so `drv install` and
+ * `drv uninstall` went on overflowing until an uninstall halted the board.
+ * Same trap, same message, second time.
+ */
 static ag_err_t cfg_ensure_device(const char *dos_path)
 {
-    char        text[DRV_CFG_MAX];
     ag_handle_t h;
     int32_t     n;
     size_t      used = 0;
     char        add[192];
     size_t      add_len;
 
+    char *const text = (char *)ag_port_alloc(DRV_CFG_MAX,
+                                             AG_MEM_FAST | AG_MEM_BYTE);
+    if (text == NULL) {
+        return -AG_ENOMEM;
+    }
+
     h = ag_vfs_open(DRV_CFG_PATH, NULL, AG_O_RDONLY);
     if (h >= 0) {
-        n = ag_vfs_read(h, text, sizeof(text) - 1u);
+        n = ag_vfs_read(h, text, DRV_CFG_MAX - 1u);
         ag_vfs_close(h);
         if (n < 0) {
+            ag_port_free(text);
             return (ag_err_t)n;
         }
         used = (size_t)n;
         text[used] = '\0';
         if (cfg_has_device_line(text, dos_path)) {
+            ag_port_free(text);
             return AG_OK;
         }
     } else if (h != -AG_ENOENT) {
+        ag_port_free(text);
         return (ag_err_t)h;
     } else {
         text[0] = '\0';
@@ -1358,7 +1376,8 @@ static ag_err_t cfg_ensure_device(const char *dos_path)
     add_len = (size_t)snprintf(add, sizeof(add), "%s[modules]\ndevice = %s\n",
                                (used > 0 && text[used - 1u] != '\n') ? "\n" : "",
                                dos_path);
-    if (add_len >= sizeof(add) || used + add_len + 1u > sizeof(text)) {
+    if (add_len >= sizeof(add) || used + add_len + 1u > DRV_CFG_MAX) {
+        ag_port_free(text);
         return -AG_ENOSPC;
     }
     memcpy(text + used, add, add_len + 1u);
@@ -1366,10 +1385,12 @@ static ag_err_t cfg_ensure_device(const char *dos_path)
 
     h = ag_vfs_open(DRV_CFG_PATH, NULL, AG_O_WRONLY | AG_O_CREATE | AG_O_TRUNC);
     if (h < 0) {
+        ag_port_free(text);
         return (ag_err_t)h;
     }
     n = ag_vfs_write(h, text, used);
     (void)ag_vfs_close(h);
+    ag_port_free(text);
     if (n < 0) {
         return (ag_err_t)n;
     }
@@ -1379,10 +1400,10 @@ static ag_err_t cfg_ensure_device(const char *dos_path)
     return AG_OK;
 }
 
+/* Both buffers from the heap, for the reason above cfg_ensure_device: eight
+ * kilobytes of stack was what halted the board on `drv uninstall`. */
 static ag_err_t cfg_remove_device(const char *dos_path)
 {
-    char        text[DRV_CFG_MAX];
-    char        out[DRV_CFG_MAX];
     ag_handle_t h;
     int32_t     n;
     size_t      used;
@@ -1391,13 +1412,22 @@ static ag_err_t cfg_remove_device(const char *dos_path)
     int         in_modules = 0;
     int         changed = 0;
 
+    char *const text = (char *)ag_port_alloc(DRV_CFG_MAX * 2u,
+                                             AG_MEM_FAST | AG_MEM_BYTE);
+    if (text == NULL) {
+        return -AG_ENOMEM;
+    }
+    char *const out = text + DRV_CFG_MAX;
+
     h = ag_vfs_open(DRV_CFG_PATH, NULL, AG_O_RDONLY);
     if (h < 0) {
+        ag_port_free(text);
         return (h == -AG_ENOENT) ? AG_OK : (ag_err_t)h;
     }
-    n = ag_vfs_read(h, text, sizeof(text) - 1u);
+    n = ag_vfs_read(h, text, DRV_CFG_MAX - 1u);
     ag_vfs_close(h);
     if (n < 0) {
+        ag_port_free(text);
         return (ag_err_t)n;
     }
     used = (size_t)n;
@@ -1472,7 +1502,8 @@ static ag_err_t cfg_remove_device(const char *dos_path)
 
         copy_len = eol ? (size_t)(eol - line + 1) : strlen(line);
         if (!drop) {
-            if (out_used + copy_len + 1u > sizeof(out)) {
+            if (out_used + copy_len + 1u > DRV_CFG_MAX) {
+                ag_port_free(text);
                 return -AG_ENOSPC;
             }
             memcpy(out + out_used, line, copy_len);
@@ -1485,15 +1516,18 @@ static ag_err_t cfg_remove_device(const char *dos_path)
     }
 
     if (!changed) {
+        ag_port_free(text);
         return AG_OK;
     }
 
     h = ag_vfs_open(DRV_CFG_PATH, NULL, AG_O_WRONLY | AG_O_CREATE | AG_O_TRUNC);
     if (h < 0) {
+        ag_port_free(text);
         return (ag_err_t)h;
     }
     n = ag_vfs_write(h, out, out_used);
     (void)ag_vfs_close(h);
+    ag_port_free(text);
     if (n < 0) {
         return (ag_err_t)n;
     }
