@@ -1,0 +1,8 @@
+# What mksysfs puts under C:\drv\ for this board.  One line per image; the
+# names are the built .SYS in build/apps (argon apps --group board).
+#
+# REMDISP only.  This board has no display controller of its own - no ILI9341,
+# no touch - so the default list, which is the CYD's, would install two drivers
+# onto pins that answer nothing.  What it has instead is UART1 to a second
+# board that does have glass.
+REMDISP.SYS
