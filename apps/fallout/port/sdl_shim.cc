@@ -52,6 +52,14 @@ extern "C" unsigned ag_cache_flushes = 0;
 extern "C" unsigned ag_cache_biggest = 0;
 
 /*
+ * And what the art cache had to take out of the arena because its own memory
+ * would not hold the block.  Set in cache.cc from the heap's own count; the
+ * heap has been keeping it all along and nothing was reading it.
+ */
+extern "C" unsigned ag_heap_system_blocks = 0;
+extern "C" unsigned ag_heap_system_bytes = 0;
+
+/*
  * And what the hex-grid distance costs.  It walks tile by tile, so the second
  * of these is the work: it used to be one atan2 in software doubles per step.
  * The third counts walks that gave up - see patches/fallout2-ce/0008.
@@ -500,10 +508,13 @@ static void fps_service(void)
          * has to be pieced together by hand every time it is read.
          */
         shim_printf("[art t=%u] %u read, %u evicted, %u flushed, largest %u; "
+                  "spilled %u KB in %u blocks; "
                   "hexdist %u calls, %u steps, %u gave up\n",
                   (unsigned)ag_millis(),
                   ag_cache_fetches, ag_cache_evicted, ag_cache_flushes,
-                  ag_cache_biggest, ag_tiledist_calls, ag_tiledist_steps,
+                  ag_cache_biggest,
+                  ag_heap_system_bytes / 1024u, ag_heap_system_blocks,
+                  ag_tiledist_calls, ag_tiledist_steps,
                   ag_tiledist_gaveup);
     }
     ag_tiledist_calls = 0;
