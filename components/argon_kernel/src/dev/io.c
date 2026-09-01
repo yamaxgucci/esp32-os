@@ -605,6 +605,31 @@ static ag_err_t io_spi_xfer(int bus, int cs, const void *tx, void *rx,
 
 static bool s_uart_up[AG_UART_PORTS];
 
+/*
+ * What was last applied to each port, and why it is worth remembering.
+ *
+ * ag_port_uart_config reprograms the divider and the line, and on the original
+ * ESP32 and the S3 it first waits for the transmit shift register to empty.
+ * Neither is free and neither is harmless in the middle of a stream.  Calling
+ * it from every read and every write - which is what happened here - had two
+ * costs: the wait landed between the bytes of a transfer, and a baud rate the
+ * caller had set with uart_config was undone by its own next write, because a
+ * write brings the port up with `want` NULL and NULL means "the rate in
+ * BOARD.CFG".  A port that snaps back to 115200 the moment you use it is not a
+ * port you can measure a wire with.
+ *
+ * So the rate is applied when it is asked for and when it changes, and an
+ * ordinary read or write takes the port as it stands.
+ */
+static ag_port_uart_cfg_t s_uart_cfg[AG_UART_PORTS];
+
+static bool uart_cfg_same(const ag_port_uart_cfg_t *a,
+                          const ag_port_uart_cfg_t *b)
+{
+    return a->baud == b->baud && a->data_bits == b->data_bits &&
+           a->parity == b->parity && a->stop_bits == b->stop_bits;
+}
+
 static ag_err_t uart_bring_up(int port, const ag_port_uart_cfg_t *want)
 {
     if (port < 0 || port >= AG_UART_PORTS) {
@@ -646,6 +671,8 @@ static ag_err_t uart_bring_up(int port, const ag_port_uart_cfg_t *want)
             return taken;
         }
 
+        /* The port applies uart_cfg itself as the last thing open() does, so
+         * there is nothing to apply again here. */
         const ag_err_t rc = ag_port_uart_open(port, &uart_cfg,
                                               AG_IO_UART_RX_BUF,
                                               AG_IO_UART_RX_BUF);
@@ -653,11 +680,20 @@ static ag_err_t uart_bring_up(int port, const ag_port_uart_cfg_t *want)
             return rc;
         }
         s_uart_up[port] = true;
+        s_uart_cfg[port] = uart_cfg;
+
+        /* Pins come from BOARD.CFG and do not change while the port is up. */
+        return ag_port_uart_pins(port, cfg->tx, cfg->rx);
     }
 
-    ag_err_t err = ag_port_uart_config(port, &uart_cfg);
+    /* Up already: a read or a write (want == NULL) takes it as it stands. */
+    if (want == NULL || uart_cfg_same(&s_uart_cfg[port], &uart_cfg)) {
+        return AG_OK;
+    }
+
+    const ag_err_t err = ag_port_uart_config(port, &uart_cfg);
     if (err == AG_OK) {
-        err = ag_port_uart_pins(port, cfg->tx, cfg->rx);
+        s_uart_cfg[port] = uart_cfg;
     }
     return err;
 }
