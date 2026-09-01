@@ -596,8 +596,72 @@ nothing here has been measured on hardware.
 
 ## Where the memory goes
 
-**Fallout 2 fits in 8 MB of PSRAM.**  Measured, on `-Psram 8`, standing on a
-loaded map with no allocation failure anywhere in the run:
+**The whole game fits in 8 MB of PSRAM, including the largest map in it.**
+`docs/plans/fallout-memory.md` has the full accounting - every kilobyte
+attributed to a call site with a file and a line - and the negative results,
+which are worth as much.  The short version:
+
+| map | before | now |
+|---|---|---|
+| Temple of Trials | 5123 KB, ran | runs |
+| Arroyo village | peak 6636 against a 6100 arena - **never loaded** | runs at 22 fps |
+| Broken Hills, 767 KB of map file, three elevations, 7102 objects | **died during its own map load** | loads and runs at 19-20 fps |
+
+Six changes, each measured on its own:
+
+| | |
+|---|---|
+| 0016, no guard header on every allocation | ~560 KB |
+| 0014, a bounded script cache (`-scripts N`, off by default) | 878 KB on a map that has been played a while |
+| 0020, the world map's entry arrays sized to what `worldmap.txt` uses | ~440 KB |
+| 0018, sixteen bits of light per tile | 240 KB of bss, which the arena then took |
+| 0015, stop keeping the last movie frame | 200 KB |
+| 0019, slabs for objects and list nodes | 62 KB, and less fragmentation |
+
+`bss` and the arena come out of the same extended memory, which is why 0018
+counts twice: the image's data went from 1812 KB to 1573, and `ARENA_KB` went
+from 6100 to 6340.
+
+Two things were tried and are settled, so that nobody spends runs on them
+again.  **A bigger art cache buys nothing** - 3000 KB instead of 1400 moves the
+arena's high-water mark by exactly the extra 1600.  **A smaller one costs more
+than it saves**: 1000 KB looks excellent on every counter and plays badly, and
+under pressure the options menu, the character editor and the skilldex fail to
+load their art and leave the game in a mode with no way out.  1400 is the
+number; see the note in `fallout2.cfg` for the floor as well as the ceiling.
+
+### The flags this was measured with
+
+| | |
+|---|---|
+| `-memstat N` | the arena every N ms, and the switch that arms the rest |
+| `-mallocs KB N` | name the first N allocations of KB or more **per window**, five return addresses deep |
+| `-prof N` | live bytes per call site: what is still held, not what was asked for |
+| `-scripts N` | cap resident script programs |
+| `-sharp` | keep thin strokes when the panel is smaller than the picture |
+| `-fps N` | where a frame goes |
+
+`-prof` is the one that answered the question, and it needs
+`ARGON_LIBC_MALLOC_PROFILE=1` at build time - its tables are 768 KB of bss,
+which an 8 MB part cannot spare beside the arena, so the app will not load.  To
+instrument an 8 MB failure, leave `ARENA_KB` alone and run `-Psram 16`: the
+arena pressure is identical and the bss has somewhere to live.  Build with
+`ARGON_FALLOUT_DEBUG=1` as well, or addr2line names the enclosing section's
+symbol and every routine this engine inlines into `gameInitWithOptions` comes
+back as `gameInitWithOptions`.
+
+### A 16 MB part
+
+`argon fallout --game 2 --psram 16` gives the arena 12000 KB instead of 6340 and
+says so as it builds; run it with `argon run -Psram 16`.  Nothing else changes
+with the part - the art cache stays at 1400 and the script cap stays off, so a
+bigger arena is the whole of the difference.
+
+### The historical figures
+
+Below is how the first 2476 KB came off, kept because the reasoning still
+applies.  Measured on `-Psram 8`, standing on a loaded map with no allocation
+failure anywhere in the run:
 
 | | |
 |---|---|
