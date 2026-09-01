@@ -43,6 +43,8 @@ static int32_t s_x;
 static int32_t s_y;
 static uint8_t s_buttons;
 static bool    s_placed; /* false until the surface size is known once     */
+static uint32_t s_reports; /* how many arrived from a device               */
+static uint32_t s_events;  /* how many became events for somebody          */
 
 /*
  * Where the pointer may go.  The surface if there is one; failing that the
@@ -88,6 +90,26 @@ void ag_hidptr_reset(void)
     s_placed = true;
 }
 
+void ag_hidptr_stats(int32_t *x, int32_t *y, uint8_t *buttons,
+                     uint32_t *reports, uint32_t *events)
+{
+    if (x != NULL) {
+        *x = s_x;
+    }
+    if (y != NULL) {
+        *y = s_y;
+    }
+    if (buttons != NULL) {
+        *buttons = s_buttons;
+    }
+    if (reports != NULL) {
+        *reports = s_reports;
+    }
+    if (events != NULL) {
+        *events = s_events;
+    }
+}
+
 void ag_hidptr_pos(int32_t *x, int32_t *y)
 {
     if (x != NULL) {
@@ -109,7 +131,9 @@ static void emit(ag_event_type_t type, int16_t dx, int16_t dy, uint8_t buttons)
     ev.ptr.dy = dy;
     ev.ptr.buttons = buttons;
     ev.ptr.slot = 0;
-    (void)ag_console_inject_event(&ev);
+    if (ag_console_inject_event(&ev)) {
+        s_events++;
+    }
 }
 
 void ag_hidptr_report(const uint8_t *data, uint32_t len)
@@ -126,6 +150,7 @@ void ag_hidptr_report(const uint8_t *data, uint32_t len)
     if (!s_placed) {
         ag_hidptr_reset();
     }
+    s_reports++;
 
     const uint8_t buttons = (uint8_t)(data[0] & (BTN_LEFT | BTN_RIGHT | BTN_MIDDLE));
     const int32_t dx = (int32_t)(int8_t)data[1];

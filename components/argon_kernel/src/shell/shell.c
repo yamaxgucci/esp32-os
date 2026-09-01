@@ -43,6 +43,7 @@
 #include <argon/port/ble.h>
 #include <argon/port/usb.h>
 #include <argon/port/io.h>
+#include <argon/hidptr.h>
 #include <argon/port/mem.h>
 #include <argon/port/net.h>
 #include <argon/port/sntp.h>
@@ -475,6 +476,52 @@ static int cmd_boot(int argc, char **argv)
     ag_console_puts("  boot normal    — clear marker\n");
     return 0;
 }
+
+#if AG_PORT_HAS_BT || AG_PORT_HAS_USB_HID
+/*
+ * Where the pointer is, and how much has arrived.
+ *
+ * The whole reason this is a command: a pointing device proves itself only by
+ * its events, the events happen while a hand is on it, and on a machine whose
+ * screen is at the other end of a wire there is nobody watching. Catching the
+ * moment is the wrong instrument. A count that can be asked for afterwards is
+ * the right one - the same shape as `bt` saying how many reports a keyboard has
+ * sent.
+ *
+ * `reports` counts what a device sent, `events` what became an event for
+ * somebody to read. They differ when a report says nothing changed, and the
+ * difference between "the device is silent" and "the device talks and nothing
+ * listens" is exactly what one wants to know first.
+ */
+static int cmd_ptr(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+
+    int32_t  x = 0, y = 0;
+    uint8_t  buttons = 0;
+    uint32_t reports = 0, events = 0;
+    ag_hidptr_stats(&x, &y, &buttons, &reports, &events);
+
+    uint16_t sw = 0, sh = 0;
+    const bool have = ag_display_size(&sw, &sh);
+
+    ag_console_printf("pointer at %d,%d", (int)x, (int)y);
+    if (have) {
+        ag_console_printf(" of %ux%u", (unsigned)sw, (unsigned)sh);
+    }
+    ag_console_printf("  buttons %s%s%s\n",
+                      (buttons & 1u) ? "L" : "-",
+                      (buttons & 2u) ? "R" : "-",
+                      (buttons & 4u) ? "M" : "-");
+    ag_console_printf("%u reports, %u events\n", (unsigned)reports,
+                      (unsigned)events);
+    if (reports == 0) {
+        ag_console_puts("nothing has reported: check `log` for what attached\n");
+    }
+    return 0;
+}
+#endif
 
 static int cmd_uptime(int argc, char **argv)
 {
@@ -4490,6 +4537,9 @@ static const ag_command_t k_commands[] = {
     {"boot", "[recovery|normal]", "boot report; set/clear recovery marker",
      cmd_boot},
     {"log", "[-n N|clear]", "system journal", cmd_log},
+#if AG_PORT_HAS_BT || AG_PORT_HAS_USB_HID
+    {"ptr", "", "where the pointer is, and how much it has said", cmd_ptr},
+#endif
     {"uptime", "", "time since reset", cmd_uptime},
     {"date", "[sync [server]]", "show the clock, or set it from the network", cmd_date},
     {"cls", "", "clear the screen", cmd_cls},

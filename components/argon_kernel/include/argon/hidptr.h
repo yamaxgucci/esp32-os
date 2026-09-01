@@ -54,6 +54,21 @@ void ag_hidptr_report(const uint8_t *data, uint32_t len);
  * and for tests; the events carry their own coordinates. */
 void ag_hidptr_pos(int32_t *x, int32_t *y);
 
+/*
+ * Everything the pointer knows, for the `ptr` command.
+ *
+ * It exists because of how bringing a pointing device up actually goes: the
+ * events are the only sign it works, they arrive while somebody's hand is on
+ * the device, and on a machine whose screen is somewhere else there is nothing
+ * watching.  Catching the moment is the wrong instrument - a count that can be
+ * asked for afterwards is the right one, the same way `bt` reports how many
+ * reports a keyboard has sent.
+ *
+ * Any pointer may be NULL.
+ */
+void ag_hidptr_stats(int32_t *x, int32_t *y, uint8_t *buttons,
+                     uint32_t *reports, uint32_t *events);
+
 #endif
 
 #ifdef __cplusplus
