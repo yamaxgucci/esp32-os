@@ -1,5 +1,5 @@
 /*
- * ArgonOS port: ESP-IDF - USB host, boot-protocol HID keyboard.
+ * ArgonOS port: ESP-IDF - USB host, boot-protocol HID keyboard and mouse.
  *
  * The counterpart of bt_hw.c for a chip that has USB.  It brings up the OTG
  * peripheral as a host, waits for a keyboard to be plugged in, asks it to speak
@@ -8,9 +8,17 @@
  * (src/dev/hidkbd.c).  Nothing here knows what a keystroke is.
  *
  * Minimal on purpose: boot protocol, so there is no report-descriptor parser,
- * which is most of a general HID stack and none of what a keyboard needs.  One
- * device at a time; a mouse is the same report path once there is something on
- * the screen to point at.
+ * which is most of a general HID stack and none of what a keyboard or a mouse
+ * needs.  One device at a time - but *all* of that device's HID interfaces,
+ * which is not the same thing and was the bug: the receiver that comes with a
+ * wireless mouse is one device presenting two interfaces, a keyboard and a
+ * mouse, and a host that claims only the first one claims the keyboard and then
+ * wonders why the mouse is silent.
+ *
+ * Which of the two a report came from is the interface's protocol byte, and
+ * that is the whole classification: 1 is a keyboard, 2 is a mouse.  It used to
+ * be read to *prefer* a keyboard and then thrown away, so every report was
+ * announced as a keyboard's - including a mouse's.
  *
  * The board powers the keyboard: host mode sources 5 V on the OTG port's VBUS,
  * and the internal PHY has no VBUS switch here, so that is a fact about the
@@ -43,6 +51,7 @@ static const char *TAG = "usb";
 #define HID_PROTOCOL_BOOT    0x00u
 #define HID_SUBCLASS_BOOT    0x01u
 #define HID_PROTOCOL_KEYBOARD 0x01u
+#define HID_PROTOCOL_MOUSE    0x02u
 
 static volatile ag_usb_state_t s_state = AG_USB_OFF;
 static volatile bool           s_running;
@@ -54,12 +63,29 @@ static TaskHandle_t             s_cli_task;
 
 /* The attached keyboard, touched only from the client task. */
 static usb_device_handle_t s_dev;
-static uint8_t             s_itf;      /* claimed interface number            */
-static uint8_t             s_ep;       /* its interrupt IN endpoint           */
-static usb_transfer_t     *s_in;       /* the in-flight report transfer       */
-static uint16_t            s_vid;
-static uint16_t            s_pid;
-static volatile uint32_t   s_reports;
+
+/*
+ * One pipe per HID interface the device offers, because a device can offer more
+ * than one and they are not interchangeable.  Three is enough for anything that
+ * turns up on a desk: a keyboard, a mouse, and the consumer-control interface
+ * that combo receivers add for volume keys.
+ */
+#define USB_MAX_PIPES 3
+
+typedef struct {
+    uint8_t         itf;
+    uint8_t         ep;
+    uint16_t        mps;
+    ag_usb_usage_t  usage;
+    bool            claimed;
+    usb_transfer_t *in;
+} usb_pipe_t;
+
+static usb_pipe_t        s_pipe[USB_MAX_PIPES];
+static uint32_t          s_pipes;
+static uint16_t          s_vid;
+static uint16_t          s_pid;
+static volatile uint32_t s_reports;
 
 /* Set by the client callback, acted on by the client task - never open a device
  * from inside the callback, which runs under usb_host_client_handle_events. */
@@ -73,23 +99,27 @@ static volatile int  s_ctrl_status;
 /* ---- descriptor walk --------------------------------------------------- */
 
 /*
- * Find a HID interface's interrupt IN endpoint in the active configuration.
- * Prefers a boot keyboard (subclass 1, protocol 1) but takes any HID interrupt
- * IN, so a keyboard that does not advertise the boot subclass but honours
- * SET_PROTOCOL still works.  Returns true and fills the outputs on a match.
+ * Every HID interface with an interrupt IN endpoint, classified by its protocol
+ * byte.  All of them rather than the best one: see the note at the top about
+ * receivers that present a keyboard and a mouse and expect the host to take
+ * both.
+ *
+ * A protocol byte of 0 - "none" - is still taken and reported as OTHER.  Some
+ * keyboards do not claim the boot subclass and honour SET_PROTOCOL anyway, and
+ * refusing them for a byte they did not fill in would be refusing a keyboard
+ * that works.
  */
-static bool find_kbd(const usb_config_desc_t *cfg, uint8_t *itf_out,
-                     uint8_t *ep_out, uint16_t *mps_out)
+static uint32_t find_hid(const usb_config_desc_t *cfg, usb_pipe_t *out,
+                         uint32_t max)
 {
     const uint8_t *p = (const uint8_t *)cfg;
     const uint16_t total = cfg->wTotalLength;
 
     const usb_intf_desc_t *cur = NULL;
-    bool     found = false;
-    bool     found_boot = false;
-    uint16_t off = 0;
+    uint32_t               n = 0;
+    uint16_t               off = 0;
 
-    while (off + 2u <= total) {
+    while (off + 2u <= total && n < max) {
         const usb_standard_desc_t *d = (const usb_standard_desc_t *)(p + off);
         if (d->bLength == 0u) {
             break;
@@ -105,26 +135,39 @@ static bool find_kbd(const usb_config_desc_t *cfg, uint8_t *itf_out,
                 (ep->bmAttributes & USB_BM_ATTRIBUTES_XFERTYPE_MASK) ==
                 USB_BM_ATTRIBUTES_XFER_INT;
             if (is_in && is_int) {
-                const bool boot =
-                    cur->bInterfaceSubClass == HID_SUBCLASS_BOOT &&
-                    cur->bInterfaceProtocol == HID_PROTOCOL_KEYBOARD;
-                /* Keep the first match; upgrade to a boot keyboard if one
-                 * appears later, and stop once we have it. */
-                if (!found || (boot && !found_boot)) {
-                    *itf_out = cur->bInterfaceNumber;
-                    *ep_out = ep->bEndpointAddress;
-                    *mps_out = ep->wMaxPacketSize;
-                    found = true;
-                    found_boot = boot;
+                /* One pipe per interface: a second endpoint on an interface
+                 * already taken is the same device saying the same things. */
+                bool dup = false;
+                for (uint32_t i = 0; i < n; i++) {
+                    if (out[i].itf == cur->bInterfaceNumber) {
+                        dup = true;
+                        break;
+                    }
                 }
-                if (found_boot) {
-                    break;
+                if (!dup) {
+                    usb_pipe_t *q = &out[n++];
+                    q->itf = cur->bInterfaceNumber;
+                    q->ep = ep->bEndpointAddress;
+                    q->mps = ep->wMaxPacketSize;
+                    q->claimed = false;
+                    q->in = NULL;
+                    switch (cur->bInterfaceProtocol) {
+                    case HID_PROTOCOL_KEYBOARD:
+                        q->usage = AG_USB_USAGE_KEYBOARD;
+                        break;
+                    case HID_PROTOCOL_MOUSE:
+                        q->usage = AG_USB_USAGE_MOUSE;
+                        break;
+                    default:
+                        q->usage = AG_USB_USAGE_OTHER;
+                        break;
+                    }
                 }
             }
         }
         off = (uint16_t)(off + d->bLength);
     }
-    return found;
+    return n;
 }
 
 /* ---- control transfer (SET_PROTOCOL / SET_IDLE) ------------------------ */
@@ -140,7 +183,7 @@ static void ctrl_cb(usb_transfer_t *t)
  * until its callback fires.  We are on the client task here (called from the
  * attach path), so this is a fresh top-level pump, not re-entrancy.
  */
-static int class_request(uint8_t bRequest, uint16_t wValue)
+static int class_request(uint8_t itf, uint8_t bRequest, uint16_t wValue)
 {
     usb_transfer_t *ct = NULL;
     if (usb_host_transfer_alloc(sizeof(usb_setup_packet_t), 0, &ct) != ESP_OK) {
@@ -152,7 +195,7 @@ static int class_request(uint8_t bRequest, uint16_t wValue)
                        USB_BM_REQUEST_TYPE_RECIP_INTERFACE;
     s->bRequest = bRequest;
     s->wValue = wValue;
-    s->wIndex = s_itf;
+    s->wIndex = itf;
     s->wLength = 0;
 
     ct->device_handle = s_dev;
@@ -179,11 +222,16 @@ static int class_request(uint8_t bRequest, uint16_t wValue)
 
 static void in_cb(usb_transfer_t *t)
 {
+    /* Which interface this arrived on, carried in the transfer rather than
+     * looked up: the callback has no other way to know, and announcing a
+     * mouse's report as a keyboard's is what the single-pipe version did. */
+    const usb_pipe_t *q = (const usb_pipe_t *)t->context;
+
     if (t->status == USB_TRANSFER_STATUS_COMPLETED) {
         s_reports++;
         if (s_on_report != NULL && t->actual_num_bytes > 0) {
-            s_on_report(AG_USB_USAGE_KEYBOARD, 0, t->data_buffer,
-                        (uint32_t)t->actual_num_bytes);
+            s_on_report((q != NULL) ? q->usage : AG_USB_USAGE_OTHER, 0,
+                        t->data_buffer, (uint32_t)t->actual_num_bytes);
         }
     }
     /*
@@ -203,13 +251,28 @@ static void in_cb(usb_transfer_t *t)
 
 /* ---- attach / detach --------------------------------------------------- */
 
+static const char *usage_name(ag_usb_usage_t u)
+{
+    switch (u) {
+    case AG_USB_USAGE_KEYBOARD: return "keyboard";
+    case AG_USB_USAGE_MOUSE:    return "mouse";
+    default:                    return "hid";
+    }
+}
+
 static void attach(uint8_t addr)
 {
     if (s_dev != NULL) {
-        return; /* one at a time */
+        return; /* one device at a time; all of its interfaces, though */
     }
     usb_device_handle_t dev = NULL;
     if (usb_host_device_open(s_client, addr, &dev) != ESP_OK) {
+        /*
+         * Said out loud, because silence here is indistinguishable from a
+         * device that never arrived - and those two have nothing in common.
+         * This is where a device that answered the bus but not the host lands.
+         */
+        ESP_LOGW(TAG, "address %u: open failed", addr);
         return;
     }
 
@@ -217,61 +280,89 @@ static void attach(uint8_t addr)
     const usb_config_desc_t *cd = NULL;
     if (usb_host_get_device_descriptor(dev, &dd) != ESP_OK ||
         usb_host_get_active_config_descriptor(dev, &cd) != ESP_OK) {
+        ESP_LOGW(TAG, "address %u: no descriptors", addr);
         (void)usb_host_device_close(s_client, dev);
         return;
     }
 
-    uint8_t  itf = 0;
-    uint8_t  ep = 0;
-    uint16_t mps = 0;
-    if (!find_kbd(cd, &itf, &ep, &mps)) {
-        ESP_LOGI(TAG, "device %04x:%04x has no HID keyboard, ignoring",
+    /*
+     * Say what turned up, always.  Before this the only line on this path was
+     * the refusal, so a device that enumerated and offered nothing usable and
+     * a device that never enumerated at all looked identical from the console -
+     * which is the wrong two things to be unable to tell apart when somebody
+     * has just plugged something in and is waiting.
+     */
+    ESP_LOGI(TAG, "device %04x:%04x, %u configuration interfaces",
+             dd->idVendor, dd->idProduct, cd->bNumInterfaces);
+
+    usb_pipe_t found[USB_MAX_PIPES];
+    const uint32_t n = find_hid(cd, found, USB_MAX_PIPES);
+    if (n == 0) {
+        ESP_LOGI(TAG, "device %04x:%04x has no HID interrupt input, ignoring",
                  dd->idVendor, dd->idProduct);
-        (void)usb_host_device_close(s_client, dev);
-        return;
-    }
-    if (mps == 0u || mps > 64u) {
-        mps = 8u; /* a boot keyboard report is eight bytes */
-    }
-
-    if (usb_host_interface_claim(s_client, dev, itf, 0) != ESP_OK) {
         (void)usb_host_device_close(s_client, dev);
         return;
     }
 
     s_dev = dev;
-    s_itf = itf;
-    s_ep = ep;
     s_vid = dd->idVendor;
     s_pid = dd->idProduct;
     s_reports = 0;
+    s_pipes = 0;
 
-    /* Boot protocol, then idle-forever so the keyboard reports only on change.
-     * SET_IDLE is advisory - some keyboards STALL it - so its failure is not
-     * fatal, but SET_PROTOCOL is what makes the eight-byte report the truth. */
-    if (class_request(HID_REQ_SET_PROTOCOL, HID_PROTOCOL_BOOT) != 0) {
-        ESP_LOGW(TAG, "SET_PROTOCOL(boot) failed; report layout unknown");
+    for (uint32_t i = 0; i < n; i++) {
+        usb_pipe_t *q = &s_pipe[s_pipes];
+        *q = found[i];
+        if (q->mps == 0u || q->mps > 64u) {
+            q->mps = 8u; /* a boot report is eight bytes or fewer */
+        }
+
+        if (usb_host_interface_claim(s_client, dev, q->itf, 0) != ESP_OK) {
+            ESP_LOGW(TAG, "interface %u (%s) refused", q->itf,
+                     usage_name(q->usage));
+            continue;
+        }
+        q->claimed = true;
+
+        /*
+         * Boot protocol, then idle-forever so the device reports only on
+         * change.  SET_IDLE is advisory - some devices STALL it - so its
+         * failure is not fatal, while SET_PROTOCOL is what makes the fixed
+         * report layout the truth.  Per interface, because that is what the
+         * request is addressed to.
+         */
+        if (class_request(q->itf, HID_REQ_SET_PROTOCOL, HID_PROTOCOL_BOOT) != 0) {
+            ESP_LOGW(TAG, "interface %u: SET_PROTOCOL(boot) failed", q->itf);
+        }
+        (void)class_request(q->itf, HID_REQ_SET_IDLE, 0);
+
+        if (usb_host_transfer_alloc(q->mps, 0, &q->in) != ESP_OK) {
+            (void)usb_host_interface_release(s_client, dev, q->itf);
+            q->claimed = false;
+            continue;
+        }
+        q->in->device_handle = dev;
+        q->in->bEndpointAddress = q->ep;
+        q->in->callback = in_cb;
+        q->in->context = q;
+        q->in->num_bytes = q->mps; /* an IN transfer asks for a whole packet */
+
+        ESP_LOGI(TAG, "%s on interface %u, ep 0x%02x, %u byte reports",
+                 usage_name(q->usage), q->itf, q->ep, (unsigned)q->mps);
+        s_pipes++;
+        if (usb_host_transfer_submit(q->in) != ESP_OK) {
+            ESP_LOGW(TAG, "interface %u: first report submit failed", q->itf);
+        }
     }
-    (void)class_request(HID_REQ_SET_IDLE, 0);
 
-    if (usb_host_transfer_alloc(mps, 0, &s_in) != ESP_OK) {
-        (void)usb_host_interface_release(s_client, dev, itf);
-        (void)usb_host_device_close(s_client, dev);
+    if (s_pipes == 0) {
+        ESP_LOGW(TAG, "device %04x:%04x offered %u HID interfaces and none took",
+                 s_vid, s_pid, (unsigned)n);
         s_dev = NULL;
+        (void)usb_host_device_close(s_client, dev);
         return;
     }
-    s_in->device_handle = dev;
-    s_in->bEndpointAddress = ep;
-    s_in->callback = in_cb;
-    s_in->context = NULL;
-    s_in->num_bytes = mps; /* an IN transfer asks for a whole packet */
-
     s_state = AG_USB_OPEN;
-    ESP_LOGI(TAG, "keyboard %04x:%04x on interface %u, ep 0x%02x",
-             s_vid, s_pid, itf, ep);
-    if (usb_host_transfer_submit(s_in) != ESP_OK) {
-        ESP_LOGW(TAG, "first report submit failed");
-    }
 }
 
 static void detach(usb_device_handle_t dev)
@@ -284,22 +375,30 @@ static void detach(usb_device_handle_t dev)
         return;
     }
 
-    /* Stop the report pipe before touching what it uses.  s_dev = NULL first,
-     * so a report callback that fires during the flush does not resubmit. */
+    /* Stop the report pipes before touching what they use.  s_dev = NULL
+     * first, so a callback that fires during the flush does not resubmit. */
     s_dev = NULL;
-    (void)usb_host_endpoint_halt(dev, s_ep);
-    (void)usb_host_endpoint_flush(dev, s_ep);
-    if (s_in != NULL) {
-        (void)usb_host_transfer_free(s_in);
-        s_in = NULL;
+    for (uint32_t i = 0; i < s_pipes; i++) {
+        usb_pipe_t *q = &s_pipe[i];
+        if (!q->claimed) {
+            continue;
+        }
+        (void)usb_host_endpoint_halt(dev, q->ep);
+        (void)usb_host_endpoint_flush(dev, q->ep);
+        if (q->in != NULL) {
+            (void)usb_host_transfer_free(q->in);
+            q->in = NULL;
+        }
+        (void)usb_host_interface_release(s_client, dev, q->itf);
+        q->claimed = false;
     }
-    (void)usb_host_interface_release(s_client, dev, s_itf);
+    s_pipes = 0;
     (void)usb_host_device_close(s_client, dev);
 
     s_state = (s_state == AG_USB_OFF) ? AG_USB_OFF : AG_USB_IDLE;
+    ESP_LOGI(TAG, "%04x:%04x unplugged", s_vid, s_pid);
     s_vid = 0;
     s_pid = 0;
-    ESP_LOGI(TAG, "keyboard unplugged");
 }
 
 /* ---- the two tasks ----------------------------------------------------- */
@@ -342,6 +441,13 @@ static void cli_task(void *arg)
         const uint8_t addr = s_pending_new;
         if (addr != 0u) {
             s_pending_new = 0u;
+            /*
+             * The one line that separates "nothing is plugged in, or it is and
+             * the bus never noticed" from "it was noticed and something after
+             * that went wrong".  Without it both look like an empty log, and an
+             * empty log sends you looking at the wrong half.
+             */
+            ESP_LOGI(TAG, "connect on address %u", addr);
             attach(addr);
         }
         usb_device_handle_t gone = s_pending_gone;
