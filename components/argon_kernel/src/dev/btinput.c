@@ -13,6 +13,7 @@
 #if AG_PORT_HAS_BT
 
 #include <argon/hidkbd.h>
+#include <argon/hidptr.h>
 
 static void on_report(ag_bt_usage_t usage, uint8_t report_id,
                       const uint8_t *data, uint32_t len)
@@ -20,17 +21,20 @@ static void on_report(ag_bt_usage_t usage, uint8_t report_id,
     (void)report_id;
     if (usage == AG_BT_USAGE_KEYBOARD) {
         ag_hidkbd_report(data, len);
+    } else if (usage == AG_BT_USAGE_MOUSE) {
+        /*
+         * This used to say a mouse would go here when there was something on
+         * the screen to point at.  There is now - the screen is the board next
+         * to this one, over a wire (apps/remdisp) - so it does.
+         */
+        ag_hidptr_report(data, len);
     }
-    /*
-     * A mouse would go to the pointer events here.  Left out rather than
-     * stubbed: there is nothing on this screen to point at yet, and a half
-     * done pointer is worse than none.
-     */
 }
 
 ag_err_t ag_btinput_init(void)
 {
     ag_hidkbd_reset();
+    ag_hidptr_reset();
     ag_port_bt_on_report(on_report);
     return AG_OK;
 }

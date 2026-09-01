@@ -12,6 +12,7 @@
 #if AG_PORT_HAS_USB_HID
 
 #include <argon/hidkbd.h>
+#include <argon/hidptr.h>
 
 static void on_report(ag_usb_usage_t usage, uint8_t report_id,
                       const uint8_t *data, uint32_t len)
@@ -19,13 +20,16 @@ static void on_report(ag_usb_usage_t usage, uint8_t report_id,
     (void)report_id;
     if (usage == AG_USB_USAGE_KEYBOARD) {
         ag_hidkbd_report(data, len);
+    } else if (usage == AG_USB_USAGE_MOUSE) {
+        /* The same shared pointer path a Bluetooth mouse takes. */
+        ag_hidptr_report(data, len);
     }
-    /* A mouse is the same pointer path btinput.c leaves for later. */
 }
 
 ag_err_t ag_usbinput_init(void)
 {
     ag_hidkbd_reset();
+    ag_hidptr_reset();
     ag_port_usb_on_report(on_report);
     return AG_OK;
 }

@@ -191,7 +191,10 @@ ag_err_t ag_port_uart_config(int port, const ag_port_uart_cfg_t *cfg)
 #if CONFIG_IDF_TARGET_ESP32
     uart_tx_wait_idle((uint8_t)port);
 #else
-    esp_rom_uart_tx_wait_idle((uint8_t)port);
+    /* The `output` spelling, because the `uart` one is deprecated: IDF renamed
+     * these when a console stopped necessarily being a UART.  Both are provided
+     * from the same ROM symbol on the parts that have it. */
+    esp_rom_output_tx_wait_idle((uint8_t)port);
 #endif
 
     uart_config_t hw;

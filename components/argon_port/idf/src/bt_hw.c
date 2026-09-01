@@ -140,11 +140,14 @@ static void note_device(const struct ble_gap_disc_desc *disc)
         name[n] = '\0';
     }
 
-    bool hid = false;
+    bool          hid = false;
+    ag_bt_usage_t usage = AG_BT_USAGE_OTHER;
     if (fields.appearance_is_present &&
         (fields.appearance == APPEARANCE_KEYBOARD ||
          fields.appearance == APPEARANCE_MOUSE)) {
         hid = true;
+        usage = (fields.appearance == APPEARANCE_MOUSE) ? AG_BT_USAGE_MOUSE
+                                                        : AG_BT_USAGE_KEYBOARD;
     }
     for (int i = 0; !hid && i < fields.num_uuids16; i++) {
         if (ble_uuid_u16(&fields.uuids16[i].u) == BLE_HID_SVC_UUID) {
@@ -162,6 +165,9 @@ static void note_device(const struct ble_gap_disc_desc *disc)
             }
             s_seen[i].rssi = disc->rssi;
             s_seen[i].hid = s_seen[i].hid || hid;
+            if (s_seen[i].usage == AG_BT_USAGE_OTHER) {
+                s_seen[i].usage = usage;
+            }
             unlock();
             return;
         }
@@ -200,6 +206,7 @@ static void note_device(const struct ble_gap_disc_desc *disc)
         d->addr_type = disc->addr.type;
         d->rssi = disc->rssi;
         d->hid = hid;
+        d->usage = usage;
     }
     unlock();
 }

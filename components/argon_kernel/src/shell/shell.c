@@ -3316,10 +3316,22 @@ static int cmd_bt(int argc, char **argv)
              * why the same thing can be on the list twice.
              */
             const bool rnd = (s_bt_seen[i].addr_type & 1) != 0;
+            /*
+             * Say which kind, because pairing a keyboard and a mouse is the
+             * normal case and a list that calls both "keyboard" makes the
+             * person guess.  "input" is a device whose service list gave it
+             * away without an appearance to say more.
+             */
+            const char *what = rnd ? "private" : "";
+            if (s_bt_seen[i].hid) {
+                switch (s_bt_seen[i].usage) {
+                case AG_BT_USAGE_KEYBOARD: what = "keyboard"; break;
+                case AG_BT_USAGE_MOUSE:    what = "mouse";    break;
+                default:                   what = "input";    break;
+                }
+            }
             ag_console_printf("  %u %-17s %4d %s\n", (unsigned)(i + 1), label,
-                              (int)s_bt_seen[i].rssi,
-                              s_bt_seen[i].hid ? "keyboard" : (rnd ? "private"
-                                                                   : ""));
+                              (int)s_bt_seen[i].rssi, what);
         }
         if (found > s_bt_seen_n) {
             ag_console_printf("%u more heard, not shown\n",
