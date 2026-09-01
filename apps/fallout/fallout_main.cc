@@ -77,6 +77,8 @@ extern "C" void sdl_shim_memstat(int every_ms, int trace_kb,
                                  int trace_max, int trace_prof);
 extern "C" void sdl_shim_fps(int every_ms);
 extern "C" void sdl_shim_scale_sharp(int on);
+extern "C" void sdl_shim_hud(int on);
+extern "C" void sdl_shim_log(const char *path);
 extern "C" void sdl_shim_screenshot_now(void);
 
 static bool same(const char *a, const char *b)
@@ -116,10 +118,27 @@ static int to_int(const char *s)
  *                  print the N biggest each window
  *   -fps N         print the frame rate and where a frame goes, every N ms
  *   -autostart     start a new game at once, premade character, no movie
+ *   -log PATH      write every diagnostic line to this file as well as
+ *                  to the console, including the engine's own errors and
+ *                  the out-of-arena line.  The shell's `>` cannot do this
+ *                  for a game: `run` hands the process to the session and
+ *                  returns, and the redirection goes with it
+ *   -hud           three numbers in the corner of the panel: frames per
+ *                  second, arena in use, largest free block - all in KB,
+ *                  green while a full-screen buffer would still fit,
+ *                  amber under half of one, red under a quarter.  For a
+ *                  board, where the console is a cable to a machine that
+ *                  is not there
  *   -smooth        when the panel is smaller than the picture, average
  *                  each 2x2 rather than taking its top-left pixel.  A
  *                  stroke one pixel wide is dimmed rather than dropped,
  *                  and an interface is mostly strokes one pixel wide
+ *   -artcache N    the art cache in kilobytes, overriding fallout2.cfg.  Its
+ *                  floor is a hard one - a single art item in this game is
+ *                  505100 bytes, and a cache that cannot hold it kills the
+ *                  engine - and its ceiling was measured standing on a map,
+ *                  which is not the same as playing.  This is the flag for
+ *                  finding out during a real game
  *   -scripts N     keep at most N script programs resident; the engine
  *                  reloads one when it runs again.  0, the default,
  *                  keeps every script a map has ever run - which is
@@ -142,6 +161,10 @@ extern "C" int ag_autostart = 0;
 /* Read by scriptsTrimPrograms(); see patches/fallout2-ce/0014. */
 extern "C" int ag_script_cache = 0;
 
+/* Read by artInit(); see patches/fallout2-ce/0021.  Zero means the setting in
+ * fallout2.cfg stands. */
+extern "C" int ag_art_cache_kb = 0;
+
 extern "C" int ag_cxx_main(int argc, char **argv)
 {
     /* argv[0] is not decoration here: sfall builds the path of ddraw.ini from
@@ -158,6 +181,8 @@ extern "C" int ag_cxx_main(int argc, char **argv)
     int trace_max = 0;
     int trace_prof = 0;
     int sharp = 0;
+    int hud = 0;
+    const char *logpath = NULL;
     int fps_ms = 0;
     int out = 0;
 
@@ -181,8 +206,14 @@ extern "C" int ag_cxx_main(int argc, char **argv)
             ag_autostart = 1;
         } else if (same(argv[i], "-smooth") || same(argv[i], "-sharp")) {
             sharp = 1;
+        } else if (same(argv[i], "-hud")) {
+            hud = 1;
+        } else if (same(argv[i], "-log") && i + 1 < argc) {
+            logpath = argv[++i];
         } else if (same(argv[i], "-scripts") && i + 1 < argc) {
             ag_script_cache = to_int(argv[++i]);
+        } else if (same(argv[i], "-artcache") && i + 1 < argc) {
+            ag_art_cache_kb = to_int(argv[++i]);
         } else {
             argv[out++] = argv[i];
         }
@@ -195,9 +226,11 @@ extern "C" int ag_cxx_main(int argc, char **argv)
         }
         sdl_shim_screenshot(shot, frames, shot_ms);
     }
+    sdl_shim_log(logpath);
     sdl_shim_memstat(memstat_ms, trace_kb, trace_max, trace_prof);
     sdl_shim_fps(fps_ms);
     sdl_shim_scale_sharp(sharp);
+    sdl_shim_hud(hud);
 
     const int rc = main(out, argv);
 

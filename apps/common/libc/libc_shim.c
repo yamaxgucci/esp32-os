@@ -82,6 +82,21 @@ static int    s_big_max;
  * had taken the other six megabytes meant watching every allocation an eighth
  * that size - hundreds of them, not sixty-four.
  */
+/*
+ * Somewhere else for the failure to go.
+ *
+ * "out of arena asking for N bytes" is the one line that explains a game that
+ * has just stopped working, and on a board the console it prints to is a cable
+ * to a machine that is not there.  So an application can hand over a second
+ * place to write it - see -log in the Fallout port.
+ */
+static void (*s_libc_log)(const char *line);
+
+void ag_libc_log_sink(void (*sink)(const char *line))
+{
+    s_libc_log = sink;
+}
+
 void ag_libc_malloc_trace(size_t min_bytes, int max_reports)
 {
     s_big_min = min_bytes;
@@ -359,11 +374,17 @@ void *malloc(size_t n)
         ag_meminfo_t mi;
         s_malloc_failed = 1;
         ag_meminfo(&mi);
-        ag_printf("malloc: out of arena asking for %u bytes; %u of %u KB free, "
-                  "largest block %u\n",
-                  (unsigned)n, (unsigned)(mi.arena_free / 1024u),
-                  (unsigned)(mi.arena_total / 1024u),
-                  (unsigned)mi.arena_largest);
+        char line[160];
+        snprintf(line, sizeof(line),
+                 "malloc: out of arena asking for %u bytes; %u of %u KB free, "
+                 "largest block %u\n",
+                 (unsigned)n, (unsigned)(mi.arena_free / 1024u),
+                 (unsigned)(mi.arena_total / 1024u),
+                 (unsigned)mi.arena_largest);
+        ag_print(line);
+        if (s_libc_log != NULL) {
+            s_libc_log(line);
+        }
     }
     return p;
 }

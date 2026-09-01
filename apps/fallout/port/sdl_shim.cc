@@ -27,6 +27,7 @@ extern "C" size_t ag_libc_arena_low(void);
 extern "C" void ag_libc_malloc_trace(size_t min_bytes,
                                     int max_reports);
 extern "C" void ag_libc_malloc_profile(int on);
+extern "C" void ag_libc_log_sink(void (*sink)(const char *line));
 extern "C" void ag_libc_malloc_profile_dump(int top);
 extern "C" void ag_libc_io_stats(uint64_t *us, uint32_t *reads,
                                  uint32_t *opens, uint32_t *seeks,
@@ -212,6 +213,73 @@ void sdl_shim_scale_sharp(int on)
  * make_surface when it lends the framebuffer out; read by the blit.
  */
 static int s_panel_shift;
+
+
+/* ---- the session log -----------------------------------------------------
+ *
+ * Everything below prints to the console, and on a board the console is a
+ * cable to a machine that is not there.  The shell can redirect a command's
+ * output to a file, but not this one's: `run` hands the process to the session
+ * and returns, so the redirection is undone before the game has drawn a frame.
+ * Measured, not assumed - the [fps] lines came out on the console with
+ * `> c:\fo2.log` on the command line.
+ *
+ * So the port keeps its own.  Every diagnostic line goes to the console as
+ * before and to this file as well, and the engine's own debugPrint comes
+ * through SDL_LogMessageV, which is where "Error loading skilldex dialog data!"
+ * and the rest of the messages that precede a wedged game are written.
+ *
+ * Opened for append, so a second run adds to the first rather than erasing the
+ * evidence of it.
+ */
+static ag_handle_t s_log = (ag_handle_t)-1;
+
+static void log_line(const char *text);
+
+void sdl_shim_log(const char *path)
+{
+    if (path == NULL || path[0] == '\0') {
+        return;
+    }
+    s_log = ag_open(path, AG_O_WRONLY | AG_O_CREATE | AG_O_APPEND);
+    if (s_log < 0) {
+        s_log = (ag_handle_t)-1;
+        ag_printf("log: cannot write %s\n", path);
+        return;
+    }
+    ag_printf("log: %s\n", path);
+
+    /* And the one line that explains a game which has just stopped working. */
+    ag_libc_log_sink(log_line);
+}
+
+static void log_line(const char *text)
+{
+    if (s_log < 0 || text == NULL) {
+        return;
+    }
+    ag_write(s_log, text, strlen(text));
+}
+
+/*
+ * Print to the console and to the log, in one call.
+ *
+ * Formatted once into a buffer rather than twice through two printfs: the
+ * second one would have to walk the varargs again, and a line that differs
+ * between the console and the file is worse than no file.
+ */
+static void shim_printf(const char *fmt, ...)
+{
+    char line[320];
+    va_list ap;
+
+    va_start(ap, fmt);
+    vsnprintf(line, sizeof(line), fmt, ap);
+    va_end(ap);
+
+    ag_print(line);
+    log_line(line);
+}
 
 /* Bumped whenever the palette is written; palette_lut watches it. */
 static uint32_t s_palette_gen = 1;
@@ -399,7 +467,7 @@ static void fps_service(void)
         uint32_t io_reads = 0, io_opens = 0, io_seeks = 0;
         ag_libc_io_stats(&io_us, &io_reads, &io_opens, &io_seeks, &open_us,
                          &seek_us);
-        ag_printf("[fps t=%u] %u.%02u fps, %u us/frame: blit %u (%u KB), "
+        shim_printf("[fps t=%u] %u.%02u fps, %u us/frame: blit %u (%u KB), "
                   "flush %u in %u (%u KB), engine %u, io %u us "
                   "(open %u, seek %u, read %u; %u KB) "
                   "(%u reads, %u opens of which %u found nothing, %u seeks, "
@@ -431,7 +499,7 @@ static void fps_service(void)
          * console twice, and a number split across two rows is a number that
          * has to be pieced together by hand every time it is read.
          */
-        ag_printf("[art t=%u] %u read, %u evicted, %u flushed, largest %u; "
+        shim_printf("[art t=%u] %u read, %u evicted, %u flushed, largest %u; "
                   "hexdist %u calls, %u steps, %u gave up\n",
                   (unsigned)ag_millis(),
                   ag_cache_fetches, ag_cache_evicted, ag_cache_flushes,
@@ -512,7 +580,7 @@ static void memstat_service(void)
     const unsigned peak_alloc =
         (low == (size_t)-1) ? frame_peak
                             : (unsigned)((mi.arena_total - low) / 1024u);
-    ag_printf("[mem] %u KB used of %u, peak %u (%u with transients), "
+    shim_printf("[mem] %u KB used of %u, peak %u (%u with transients), "
               "largest free block %u KB\n",
               (unsigned)((mi.arena_total - mi.arena_free) / 1024u),
               (unsigned)(mi.arena_total / 1024u),
@@ -1092,6 +1160,9 @@ void SDL_LogMessageV(int category, int priority, const char *fmt, va_list ap)
     vsnprintf(line, sizeof(line), fmt, ap);
     ag_print(line);
     ag_print("\n");
+    /* And to the session log, which is the only record a board keeps. */
+    log_line(line);
+    log_line("\n");
 }
 
 int SDL_ShowSimpleMessageBox(Uint32 flags, const char *title,
@@ -1229,6 +1300,154 @@ int SDL_RenderCopy(SDL_Renderer *r, SDL_Texture *t, const SDL_Rect *s,
  *
  * The third is the case a real panel takes; QEMU's soft display is the first.
  */
+
+/* ---- the readout ---------------------------------------------------------
+ *
+ * Everything this port measures goes to the console, and on a board the
+ * console is a cable to a machine that is not there.  So the same three
+ * numbers can be drawn into the corner of the panel instead: the frame rate,
+ * the arena in use, and the free arena, which between them say whether a
+ * stutter was the picture or the memory.
+ *
+ * Three by five pixels a digit, because a font is the one thing this port does
+ * not have and Fallout's own is inside the game's data.  Drawn straight into
+ * the framebuffer after the flush, so the next frame paints over it and it is
+ * redrawn - which costs a few hundred pixels and no state.
+ */
+static int s_hud;
+static unsigned s_hud_fps10;   /* frames per second, tenths */
+
+void sdl_shim_hud(int on)
+{
+    s_hud = on ? 1 : 0;
+}
+
+/* 0-9 then a space, five rows of three bits, high bit leftmost. */
+static const unsigned char k_hud_font[11][5] = {
+    { 7, 5, 5, 5, 7 }, /* 0 */
+    { 2, 6, 2, 2, 7 }, /* 1 */
+    { 7, 1, 7, 4, 7 }, /* 2 */
+    { 7, 1, 7, 1, 7 }, /* 3 */
+    { 5, 5, 7, 1, 1 }, /* 4 */
+    { 7, 4, 7, 1, 7 }, /* 5 */
+    { 7, 4, 7, 5, 7 }, /* 6 */
+    { 7, 1, 1, 1, 1 }, /* 7 */
+    { 7, 5, 7, 5, 7 }, /* 8 */
+    { 7, 5, 7, 1, 7 }, /* 9 */
+    { 0, 0, 0, 0, 0 }, /* space */
+};
+
+static void hud_glyph(int x, int y, int glyph, Uint16 colour)
+{
+    if (glyph < 0 || glyph > 10) {
+        return;
+    }
+    for (int row = 0; row < 5; ++row) {
+        const unsigned bits = k_hud_font[glyph][row];
+        const int py = y + row;
+        if (py < 0 || py >= (int)s_gfx.height) {
+            continue;
+        }
+        Uint16 *d = (Uint16 *)((Uint8 *)s_gfx.fb + (size_t)py * s_gfx.stride);
+        for (int col = 0; col < 3; ++col) {
+            if ((bits & (4u >> col)) == 0) {
+                continue;
+            }
+            const int px = x + col;
+            if (px >= 0 && px < (int)s_gfx.width) {
+                d[px] = colour;
+            }
+        }
+    }
+}
+
+/* Right-aligned, so the numbers do not dance as they change width. */
+static int hud_number(int x, int y, unsigned value, int digits, Uint16 colour)
+{
+    for (int i = digits - 1; i >= 0; --i) {
+        hud_glyph(x + i * 4, y, (int)(value % 10u), colour);
+        value /= 10u;
+    }
+    return x + digits * 4;
+}
+
+/*
+ * A frame rate of its own, because -fps prints once a window and the readout
+ * wants a number every second whether anything is being printed or not.
+ */
+static void hud_tick(void)
+{
+    static uint32_t next;
+    static uint32_t frames;
+    static uint32_t started;
+
+    if (!s_hud) {
+        return;
+    }
+
+    const uint32_t now = (uint32_t)ag_millis();
+    frames++;
+
+    if (next == 0u) {
+        next = now + 1000u;
+        started = now;
+        frames = 0u;
+        return;
+    }
+    if (now < next) {
+        return;
+    }
+
+    const uint32_t span = now - started;
+    s_hud_fps10 = (span > 0u) ? (frames * 10000u / span) : 0u;
+    if (s_hud_fps10 > 999u) {
+        s_hud_fps10 = 999u;
+    }
+    frames = 0u;
+    started = now;
+    next = now + 1000u;
+}
+
+static void hud_draw(void)
+{
+    if (!s_hud || s_gfx.fb == NULL) {
+        return;
+    }
+
+    ag_meminfo_t mi;
+    ag_meminfo(&mi);
+
+    const unsigned used = (unsigned)((mi.arena_total - mi.arena_free) / 1024u);
+    const unsigned largest = (unsigned)(mi.arena_largest / 1024u);
+    const unsigned fps10 = s_hud_fps10;
+
+    /* Green while there is room for a full-screen buffer, amber when the
+     * largest hole is under half of one, red under a quarter - the three
+     * states that decide whether the next dialogue opens. */
+    Uint16 colour = 0x07E0u;
+    if (largest < 300u) {
+        colour = 0xFFE0u;
+    }
+    if (largest < 150u) {
+        colour = 0xF800u;
+    }
+
+    /* A black strip behind it, or the numbers vanish into the picture. */
+    for (int y = 0; y < 7; ++y) {
+        Uint16 *d = (Uint16 *)((Uint8 *)s_gfx.fb + (size_t)y * s_gfx.stride);
+        for (int x = 0; x < 60 && x < (int)s_gfx.width; ++x) {
+            d[x] = 0;
+        }
+    }
+
+    /* Three plus one is the pitch of a digit; three more between the numbers,
+     * or they read as one long one. */
+    int x = 1;
+    x = hud_number(x, 1, fps10 / 10u, 2, colour) + 3;   /* frames per second */
+    x = hud_number(x, 1, used, 4, colour) + 3;          /* arena in use, KB */
+    (void)hud_number(x, 1, largest, 4, colour);         /* largest free block */
+}
+
 void SDL_RenderPresent(SDL_Renderer *r)
 {
     (void)r;
@@ -1253,6 +1472,8 @@ void SDL_RenderPresent(SDL_Renderer *r)
             }
             dirty_none();
         }
+        hud_tick();
+        hud_draw();
     } else if (s_frame_px != NULL && AG_HAS(g_ag_api->gfx, present)) {
         const ag_blit_t b = {
             .px = s_frame_px,
@@ -1597,7 +1818,7 @@ static void stall_service(void)
         return;
     }
     s_stall_next_ms = now + 3000u;
-    ag_printf("[stall t=%u] no frame for %u ms, still asking for input\n",
+    shim_printf("[stall t=%u] no frame for %u ms, still asking for input\n",
               (unsigned)now, (unsigned)since);
 }
 

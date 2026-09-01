@@ -24,6 +24,8 @@ void ag_libc_malloc_trace(size_t min_bytes, int max_reports);
  * them.  For memory that arrives as hundreds of small blocks, which naming
  * the big ones cannot see.  _dump prints the top sites and clears the table,
  * so each dump measures one window. */
+/* A second place for the out-of-arena line to go; NULL for none. */
+void ag_libc_log_sink(void (*sink)(const char *line));
 void ag_libc_malloc_profile(int on);
 void ag_libc_malloc_profile_dump(int top);
 void *calloc(size_t n, size_t sz);
