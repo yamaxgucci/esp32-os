@@ -12,6 +12,23 @@ takes a keypress, makes a character and stands on the map of the Temple of
 Trials. The opening movies play at 640×480 with no frames dropped when they are
 not skipped - 2502 of `intro.mve`.
 
+**And it runs on the board** (2 September 2026).  An ESP32-S3 with 8 MB of
+PSRAM and no screen of its own, showing the picture on a CYD at the other end
+of two soldered wires and playing its sound through that board's speaker.  The
+Temple of Trials holds **19 frames a second** for eleven minutes: 34 ms of
+engine, 10 ms of halving 640x480 into 320x240, and 7 ms of putting the frame on
+the wire.  The main menu holds 31.
+
+What it does *not* do yet is survive a real map.  Arroyo village loads, plays,
+and runs out of arena about two minutes in - the board can give the game 6050
+KB against the emulator's 6340, and Arroyo wants more than either at its peak.
+Everything measured about that is below and in docs/plans/fallout-memory.md;
+the short version is that the art cache cannot be made smaller (1400 KB is 0.16
+frames a second) or larger (2300 KB runs out sooner), so the memory has to come
+from objects and scripts.
+
+    python apps/fallout/tools/boardrun.py --port COM4 --host <board-ip>         --ssid NET --password SECRET --map artemple.map --seconds 300
+
 **In 8 MB of PSRAM**, with 606 KB to spare, measured rather than argued: see
 **Where the memory goes**.  Standing on the map it holds **27 frames a second**
 in QEMU, median of 210 three-second windows; it was 6.2 before two things that

@@ -4,6 +4,74 @@ Written 31 August 2026, branch `worktree-fallout-cxx`. Everything here is
 measured; the numbers are the point, and the READMEs they came from are
 `apps/fallout/README.md` under **What it would take to have room**.
 
+## On the board, 2 September 2026
+
+Everything above this section was measured in the emulator.  The board is a
+different machine and the difference is 290 KB, all of it outside the game:
+
+| | emulator | board |
+|---|---|---|
+| extended memory free at boot | 8040 KB | 7927 KB (largest block 7808) |
+| code arena in PSRAM | none | 64 KB, taken on the first load, never returned |
+| the display driver's damage grid | none | 4.8 KB (was 150 KB) |
+| **arena the game can have** | **6340 KB** | **6050 KB** |
+
+`mem` did not print the largest extended block, and that is the figure that
+decides whether an image starts - an application asks for one contiguous block
+or it does not start.  Three refusals in one evening were "explained" by
+arithmetic done in somebody's head, and the arithmetic was wrong every time
+while the number was one call away.  It prints now, and so does the loader's
+refusal.
+
+**What runs.**  The Temple of Trials holds 19 frames a second for eleven
+minutes at 4831 KB of 6050, with 784 KB spare and no eviction.  The main menu
+holds 31.  Arroyo village loads and plays and then runs out of arena, always at
+the same point, and giving it 200 KB more only moves the point.
+
+**What a frame costs, at 19 fps on the Temple:**
+
+| | per frame |
+|---|---|
+| engine | 34 ms |
+| halving 640x480 to 320x240 | 10.5 ms |
+| the picture down the wire | 7.3 ms |
+
+The wire is 14% of a frame and is not the problem.  The 10.5 ms of halving is
+ours and is the obvious next thing.
+
+**The art cache is settled from both ends**, which the emulator could only
+establish from one.  Arroyo village, arena 6050, everything else equal:
+
+| art cache | what happens |
+|---|---|
+| 1400 KB | survives, **0.16-0.27 fps**, 300-400 evictions a window |
+| 1800 KB | 4-8 fps while loading, then out of arena |
+| 2300 KB | out of arena sooner, 1 KB free |
+| 2600 KB | out of arena, on a 307200-byte request |
+
+So 1800 stands.  Below it the frame rate is gone; above it the memory is.  A
+bounded script cache (`-scripts 64`) changes nothing on Arroyo, which has few
+scripts - it was measured to matter on Broken Hills and this is not that map.
+
+**One more 307200-byte transient found and removed.**  A census of every
+allocation over 48 KB named `_GNW_win_refresh` three times: a whole 640x480
+screen taken and given back every time a window closes.  An earlier patch had
+fixed the branch that writes into a caller's buffer and left the one that
+writes into `_screen_buffer`, which is the branch that runs.  Patch 0027.
+
+**And the census itself had to be fixed first**, which is the more general
+lesson from the night: `-mallocs` printed to the console while the failure line
+printed to the console *and* the log.  On a board the console is a cable to a
+machine that may not be listening, so the first run made to find out who takes
+six hundred kilobytes came back with the failure and none of the allocations
+that led to it.
+
+**How to run one of these:** `apps/fallout/tools/boardrun.py`, which puts a
+ddraw.ini with the map on the card over HTTP, runs the game with `-autostart`
+and `-log`, and brings the log back.  Three phases with a reset between them,
+because the board has one serial port and the game owns the console while it
+runs.
+
 ## Where it stands after five patches
 
 Shipping configuration is now `-Psram 8`, arena **6340** KB, art cache **1000**
