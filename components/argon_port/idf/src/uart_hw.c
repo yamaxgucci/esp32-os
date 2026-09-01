@@ -12,6 +12,20 @@
 
 #include "driver/uart.h"
 #include "esp_rom_uart.h"
+#if CONFIG_IDF_TARGET_ESP32
+/*
+ * On the original ESP32 the drain below is this header's `uart_tx_wait_idle`
+ * and not the one esp_rom_uart.h declares.  The ROM routine of that name has a
+ * bug, so IDF replaces it with a static inline here - and a static inline emits
+ * no symbol, while `esp32.rom.api.ld` still writes
+ * PROVIDE(esp_rom_uart_tx_wait_idle = uart_tx_wait_idle) against a name nothing
+ * defines.  Every other chip has the real thing in its own <chip>.rom.ld, which
+ * is why the link broke on this target alone.  Reaching for the address in
+ * `esp32.rom.redefined.ld` would have linked the buggy version; this takes the
+ * one IDF wrote to replace it.
+ */
+#include "esp32/rom/uart.h"
+#endif
 #include "freertos/FreeRTOS.h"
 
 #ifdef AG_PORT_UART_JTAG
@@ -157,7 +171,11 @@ ag_err_t ag_port_uart_config(int port, const ag_port_uart_cfg_t *cfg)
      * first removes the race rather than the symptom; on a port with nothing in
      * flight it returns at once.
      */
+#if CONFIG_IDF_TARGET_ESP32
+    uart_tx_wait_idle((uint8_t)port);
+#else
     esp_rom_uart_tx_wait_idle((uint8_t)port);
+#endif
 
     uart_config_t hw;
     fill(&hw, cfg);
