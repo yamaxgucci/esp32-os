@@ -30,6 +30,11 @@
  * follows the traffic - the first band acquires the display, the first console
  * row after that releases it - and the far end's own state is what drives it.
  *
+ * And a third kind, which is not drawn at all: sound.  This board has a
+ * converter with an amplifier behind it and the far end has neither, so it
+ * sends samples and they come out here.  See "the sound" below - the hard part
+ * is that a write to the converter blocks and this loop is the whole program.
+ *
  * The encodings here are mirrored in host-tests/test_rempix.c, which
  * round-trips them against each other: a change here that is not made there
  * passes the tests and breaks the screen.
@@ -43,7 +48,7 @@
 #include <argon/argon.h>
 #include <argon/libc.h>
 
-AG_APP("REMTERM", "1.1", "argon", 0);
+AG_APP("REMTERM", "1.2", "argon", 0);
 
 #define LINK_PORT 1
 #define LINK_BAUD 4000000u
@@ -55,6 +60,7 @@ AG_APP("REMTERM", "1.1", "argon", 0);
 #define FR_BAND   'B' /* pixels as they are                                  */
 #define FR_PACK   'P' /* PackBits over the pixels                            */
 #define FR_IDX    'I' /* a palette and indices                               */
+#define FR_AUD    'A' /* a rate, then unsigned 8-bit mono samples            */
 
 /* Both numbers have to match remdisp.c exactly. */
 #define BAND_ROWS      8u
@@ -299,6 +305,166 @@ static void want_text(void)
     }
 }
 
+/* ---- the sound --------------------------------------------------------- */
+/*
+ * The other half of being a monitor: this board has a converter on GPIO26 with
+ * an amplifier behind it, and the board at the far end has neither.  So the
+ * wire carries samples as well as pixels, and they come out here.
+ *
+ * The hard part is not the bytes - 22 KB/s of the 400 the link carries - it is
+ * that **a write to the converter blocks and this wire cannot wait.**
+ *
+ * /dev/pcm0 gathers samples until it has 93 ms of them and then hands the lot
+ * to the DAC, which takes 93 ms to play them; so in steady state every write
+ * that completes an accumulator sits there for most of a tenth of a second
+ * waiting for room.  That is not a fault - it is what pacing to real time means
+ * - but the link has no flow control, so during that tenth of a second the
+ * UART's buffer overflows and everything in it is lost.
+ *
+ * That was measured before it was reasoned about, and the numbers are worth
+ * keeping: in forty seconds of a static main menu the receiver played 711424
+ * samples and dropped **none**, while the picture managed 35 rectangles and
+ * 163 KB of arriving bytes were thrown away as garbage looking for a frame
+ * header.  Perfect sound, no picture: the audio was blocking the reader, and
+ * because the sender never learns any of this, everything looked healthy at
+ * the other end.
+ *
+ * So the converter gets a thread of its own.  The reader stays in its loop
+ * doing nothing but pulling bytes off the wire; the writer blocks all it likes
+ * on its own stack.  The ring between them is 186 ms, which is longer than any
+ * single band of pixels can hold the line and short enough that a sound let go
+ * is not still playing.
+ *
+ * Nothing here opens the converter until the first sample arrives.  A monitor
+ * that is only showing a picture should not be holding an amplifier open,
+ * humming.
+ */
+#define AUD_RING   4096u /* samples: 186 ms at 22050, 8 KB after conversion  */
+#define AUD_BITE    256u /* samples handed over at once: 11.6 ms            */
+
+static ag_handle_t s_pcm = -1;
+static uint32_t    s_pcm_rate;
+static uint8_t     s_aring[AUD_RING];
+static uint32_t    s_aring_r;
+static uint32_t    s_aring_w;
+static volatile uint32_t s_aring_used;
+static uint32_t    s_asamples;  /* accepted off the wire                    */
+static uint32_t    s_aplayed;   /* handed to the converter                  */
+static uint32_t    s_adropped;  /* the ring was full                        */
+static volatile uint32_t s_arate;  /* what the far end says it is sending    */
+static volatile int      s_astop;
+static ag_thread_t s_athread;
+static ag_mutex_t  s_alock;
+
+/*
+ * One producer (the reader) and one consumer (the thread), so the ring itself
+ * needs no lock for its data - but the two indices and the count do, because
+ * dropping the oldest moves the *reader's* index from the producer's side.
+ * The lock is held for a few instructions and never across a device call.
+ */
+static void aud_push(const uint8_t *p, uint32_t n)
+{
+    if (!ag_mutex_lock(s_alock, 20u)) {
+        return; /* the player is busy; this much sound is lost, not the link */
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        if (s_aring_used == AUD_RING) {
+            /*
+             * Drop the oldest, not the newest.  What is oldest is what the
+             * converter is furthest from wanting, and dropping the newest would
+             * hold a stale ring for ever once it filled.
+             */
+            s_aring_r = (s_aring_r + 1u) % AUD_RING;
+            s_aring_used--;
+            s_adropped++;
+        }
+        s_aring[s_aring_w] = p[i];
+        s_aring_w = (s_aring_w + 1u) % AUD_RING;
+        s_aring_used++;
+    }
+    s_asamples += n;
+    ag_mutex_unlock(s_alock);
+}
+
+/* The converter, opened at the rate the far end says it is sending. */
+static bool aud_open(uint32_t rate)
+{
+    if (s_pcm >= 0 && s_pcm_rate == rate) {
+        return true;
+    }
+    if (s_pcm >= 0) {
+        (void)ag_dev_close(s_pcm);
+        s_pcm = -1;
+    }
+    if (rate < 8000u || rate > 48000u) {
+        return false;
+    }
+    s_pcm = ag_dev_open("/dev/pcm0");
+    if (s_pcm < 0) {
+        return false;
+    }
+    const ag_audio_fmt_t fmt = {.rate = rate, .channels = 1u, .bits = 16u};
+    (void)ag_dev_ioctl(s_pcm, AG_IOC_AUDIO_SETFMT, (void *)&fmt, sizeof(fmt));
+    s_pcm_rate = rate;
+    return true;
+}
+
+/*
+ * The player.  Everything that may block lives here and nowhere else.
+ *
+ * It does not ask how much room the converter has: it just writes, and the
+ * write returns when the sound has somewhere to go.  That blocking *is* the
+ * clock - it is what keeps this thread from spinning and what makes the ring
+ * fill and empty at the rate the far end is producing.
+ */
+static void aud_player(void *arg)
+{
+    (void)arg;
+    static int16_t block[AUD_BITE];
+
+    while (!s_astop) {
+        const uint32_t rate = s_arate;
+        if (rate == 0u || s_aring_used == 0u) {
+            ag_delay(5);
+            continue;
+        }
+        if (!aud_open(rate)) {
+            ag_delay(50);
+            continue;
+        }
+
+        uint32_t n = 0;
+        if (ag_mutex_lock(s_alock, 100u)) {
+            n = s_aring_used;
+            if (n > AUD_BITE) {
+                n = AUD_BITE;
+            }
+            for (uint32_t i = 0; i < n; i++) {
+                /* Unsigned eight-bit back to signed sixteen: the inverse of
+                 * what the far end did to it, and the only shape pcm0 takes. */
+                const int32_t v = (int32_t)s_aring[s_aring_r] - 128;
+                block[i] = (int16_t)(v << 8);
+                s_aring_r = (s_aring_r + 1u) % AUD_RING;
+                s_aring_used--;
+            }
+            ag_mutex_unlock(s_alock);
+        }
+        if (n == 0u) {
+            ag_delay(5);
+            continue;
+        }
+        const int32_t wrote = ag_dev_write(s_pcm, block, n * sizeof(int16_t));
+        if (wrote > 0) {
+            s_aplayed += (uint32_t)wrote / sizeof(int16_t);
+        }
+    }
+
+    if (s_pcm >= 0) {
+        (void)ag_dev_close(s_pcm);
+        s_pcm = -1;
+    }
+}
+
 int ag_main(int argc, char **argv)
 {
     uint32_t baud = LINK_BAUD;
@@ -341,6 +507,18 @@ int ag_main(int argc, char **argv)
     {
         const uint8_t hello = (uint8_t)'H';
         (void)ag_uart_write(LINK_PORT, &hello, 1u);
+    }
+
+    /*
+     * The player, started before anything can arrive rather than on the first
+     * sample: creating a thread takes a stack out of internal memory, and doing
+     * that from inside the reading loop would be a pause in the reading loop at
+     * the exact moment sound started - which is the moment there is most to
+     * lose.  It sleeps until s_arate says the far end is sending.
+     */
+    s_alock = ag_mutex_create();
+    if (s_alock != NULL) {
+        s_athread = ag_thread_create(aud_player, NULL, "remsnd", 4096, 2, 0);
     }
 
     ag_coninfo_t con;
@@ -446,6 +624,21 @@ int ag_main(int argc, char **argv)
         const int claimed = next_byte(20);
         if (claimed < 0 || (uint8_t)claimed != sum) {
             bad++;
+            continue;
+        }
+
+        if (op == FR_AUD && len >= 4u) {
+            /*
+             * Into the ring and straight back to reading.  Nothing here talks
+             * to the converter - that is the player thread's job, and keeping
+             * it out of this loop is the whole point (see "the sound").
+             */
+            const uint32_t rate = rd16(payload) | (rd16(payload + 2) << 16);
+            if (rate >= 8000u && rate <= 48000u) {
+                s_arate = rate;
+                aud_push(payload + 4u, len - 4u);
+            }
+            wire += len;
             continue;
         }
 
@@ -570,6 +763,19 @@ int ag_main(int argc, char **argv)
     s_band = NULL;
     ag_cursor(true);
 
+    /* The player closes the converter on its way out - which matters, because
+     * closing it is what walks the pin down to ground instead of dropping it,
+     * and that difference is a thump in the speaker. */
+    s_astop = 1;
+    if (s_athread != NULL) {
+        (void)ag_thread_join(s_athread, 1000u);
+        s_athread = NULL;
+    }
+    if (s_alock != NULL) {
+        ag_mutex_delete(s_alock);
+        s_alock = NULL;
+    }
+
     uint32_t kpx_s = 0;
     uint32_t flow_ms = 0;
     if (first_px != 0 && last_px > first_px) {
@@ -589,6 +795,11 @@ int ag_main(int argc, char **argv)
         ag_printf("pixels flowed for %u ms, %u k pixels/s\n",
                   (unsigned)flow_ms, (unsigned)kpx_s);
     }
+    if (s_asamples != 0u) {
+        ag_printf("sound: %u samples in, %u played, %u dropped, %u Hz\n",
+                  (unsigned)s_asamples, (unsigned)s_aplayed,
+                  (unsigned)s_adropped, (unsigned)s_pcm_rate);
+    }
 
     /*
      * And the same to a file, because the console cannot be trusted to carry
@@ -605,15 +816,17 @@ int ag_main(int argc, char **argv)
         static const char *const k_names[] = {
             "rows=", " rects=", " kpixels=", " bad=", " stray=",
             " flow_ms=", " kpixels_per_s=", " packed=", " indexed=", " wirekb=",
+            " snd_in=", " snd_played=", " snd_dropped=", " snd_hz=",
         };
-        const uint32_t vals[] = {rows,    bands,        px,
-                                 bad,     stray,        flow_ms,
-                                 kpx_s,   packedframes, idxframes,
-                                 wirekb};
+        const uint32_t vals[] = {rows,       bands,        px,
+                                 bad,        stray,        flow_ms,
+                                 kpx_s,      packedframes, idxframes,
+                                 wirekb,     s_asamples,   s_aplayed,
+                                 s_adropped, s_pcm_rate};
 
         char out[256];
         out[0] = '\0';
-        for (uint32_t i = 0; i < 10u; i++) {
+        for (uint32_t i = 0; i < 14u; i++) {
             char num[24];
             (void)ag_strlcat(out, k_names[i], sizeof(out));
             (void)ag_strlcat(out, ag_utoa(vals[i], num, sizeof(num), 0, false),

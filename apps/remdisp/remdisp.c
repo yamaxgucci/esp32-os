@@ -6,8 +6,9 @@
  * So the screen becomes a device like any other: this publishes a display whose
  * panel is a serial port, and nothing above it can tell the difference.
  *
- * It carries two kinds of traffic, because the kernel offers two and a screen
- * needs both:
+ * It carries three kinds of traffic - two because the kernel offers two and a
+ * screen needs both, and a third because the board at the other end has a
+ * speaker and this one does not:
  *
  *   Pixels (blit_rect, ABI 0.30) - the picture, in bands.  This is the part
  *   that matters: it is a video link, the same idea as VGA or HDMI with a
@@ -24,6 +25,11 @@
  *   for when no application holds the display.  A forty-column row is eighty
  *   bytes and a whole screen is four kilobytes, so this costs nothing next to
  *   the pixels, and without it the far end would go dark at every prompt.
+ *
+ *   Sound (a second device, /dev/pcmrem) - eight-bit mono, 22 KB/s of the
+ *   400 the wire carries.  The S3's own amplifier was unsoldered; the CYD has
+ *   one on its converter pin.  See "sound" below for why it is in this file
+ *   and not in a .SYS of its own, which is where it belongs by subject.
  *
  * What is NOT here, on purpose:
  *
@@ -54,7 +60,7 @@
 #include <argon/argon.h>
 #include <argon/libc.h>
 
-AG_DRV("REMDISP", "1.1", "argon");
+AG_DRV("REMDISP", "1.2", "argon");
 
 /* UART1: the console is UART0 on this board, and the numbering is the chip's. */
 #define LINK_PORT 1
@@ -105,6 +111,7 @@ AG_DRV("REMDISP", "1.1", "argon");
 #define FR_BAND   'B' /* a rectangle of pixels, RGB565 as they are           */
 #define FR_PACK   'P' /* the same, PackBits over the pixels                  */
 #define FR_IDX    'I' /* the same, as a palette and indices                  */
+#define FR_AUD    'A' /* sound: a rate, then unsigned 8-bit mono samples     */
 
 /*
  * A band is at most eight rows, and the reason is the far end's panel rather
@@ -199,6 +206,27 @@ static void put16(uint8_t *p, uint32_t v)
 static uint16_t *s_prev;
 static uint32_t  s_prev_w;
 static uint32_t  s_prev_h;
+/*
+ * Whether the shadow describes what the far end is actually showing.
+ *
+ * This used to be left to chance: the buffer was allocated and not cleared, on
+ * the reasoning that whatever was in it would disagree with the far end and so
+ * the first frame would go out whole.  That reasoning is wrong twice over, and
+ * both ways happened.  PSRAM survives a warm reset, so a fresh allocation can
+ * come back holding the *previous* run's shadow - a picture the far end may
+ * genuinely still be showing, or may not.  And a buffer that happens to be
+ * zeros is a claim that the far end is showing black, which is precisely what
+ * a game fading in from black is about to send.
+ *
+ * The symptom was a black screen with the menu appearing only under the mouse
+ * pointer: every band that was dark "agreed" with the shadow and was never
+ * sent, and the only pixels that ever crossed the wire were the few the cursor
+ * disturbed.  Nothing in the counters looked wrong - the link was working
+ * perfectly, sending exactly what it believed was needed.
+ *
+ * So it is a flag and not an accident.
+ */
+static bool s_prev_valid;
 
 static bool prev_ready(uint32_t w, uint32_t h)
 {
@@ -210,15 +238,12 @@ static bool prev_ready(uint32_t w, uint32_t h)
     if (s_prev == NULL) {
         s_prev_w = 0;
         s_prev_h = 0;
+        s_prev_valid = false;
         return false;
     }
     s_prev_w = w;
     s_prev_h = h;
-    /*
-     * Deliberately not cleared.  Whatever is in it disagrees with the far end,
-     * so the first frame goes out whole - which is exactly what a far end that
-     * has just started listening needs.
-     */
+    s_prev_valid = false;
     return true;
 }
 
@@ -267,10 +292,12 @@ static void poll_far_end(void)
         }
         for (int32_t i = 0; i < n; i++) {
             if (buf[i] == (uint8_t)FR_HELLO) {
-                ag_free(s_prev);
-                s_prev = NULL;
-                s_prev_w = 0;
-                s_prev_h = 0;
+                /* Not freed - only disbelieved.  Freeing it meant the next
+                 * frame had to find 150 KB again, at a moment when a game may
+                 * be holding everything there is; the buffer is fine, it is
+                 * what it claims about the far end that has stopped being
+                 * true. */
+                s_prev_valid = false;
             }
         }
         if ((uint32_t)n < sizeof(buf)) {
@@ -535,7 +562,15 @@ static void rem_blit_rect(ag_handle_t h, const ag_blit_t *b)
     poll_far_end();
 
     const uint8_t *src = (const uint8_t *)b->px;
-    const bool     track = prev_ready(b->surf_w, b->surf_h);
+    /*
+     * `track` is "the shadow may be trusted to say what the far end has".  It
+     * needs the buffer *and* the flag: without the flag the first frame after
+     * a reconnect or a cold start is compared against whatever the memory
+     * happened to hold, and every band that accidentally matched was never
+     * sent.  See s_prev_valid.
+     */
+    const bool     have_prev = prev_ready(b->surf_w, b->surf_h);
+    const bool     track = have_prev && s_prev_valid;
 
     for (uint32_t band = 0; band < b->h; band += BAND_ROWS) {
         uint32_t rows = b->h - band;
@@ -594,7 +629,9 @@ static void rem_blit_rect(ag_handle_t h, const ag_blit_t *b)
             for (uint32_t i = 0; i < rw; i++) {
                 out[r * rw + i] = want[i];
             }
-            if (track) {
+            /* have_prev, not track: the shadow is written even while it is not
+             * yet believed, because writing it is how it becomes believable. */
+            if (have_prev) {
                 uint16_t *have = s_prev +
                                  (size_t)((uint32_t)b->y + band + y0 + r) *
                                      s_prev_w + b->x + x0;
@@ -648,6 +685,24 @@ static void rem_blit_rect(ag_handle_t h, const ag_blit_t *b)
             }
             send_frame(best_op, s_cand, 12u + best_len);
         }
+    }
+
+    /*
+     * The shadow becomes believable once a blit has covered the whole surface,
+     * because only then is every pixel of it something that was actually sent.
+     *
+     * A partial blit leaves the rest of the shadow describing nothing, so it
+     * does not count - which means an application that only ever presents small
+     * rectangles keeps sending them whole and never gets the trimming.  That is
+     * the right way round: sending too much is slow, and trimming against a
+     * shadow that was never filled is a screen with holes in it that nothing
+     * ever repairs.  Everything that drives this wire today - the kernel's own
+     * surface flush, a game's present - hands over the whole picture.
+     */
+    if (have_prev && !s_prev_valid && b->x == 0 && b->y == 0 &&
+        (uint32_t)b->w == (uint32_t)b->surf_w &&
+        (uint32_t)b->h == (uint32_t)b->surf_h) {
+        s_prev_valid = true;
     }
 }
 
@@ -776,6 +831,195 @@ static void rem_text_cursor(ag_handle_t h, uint16_t col, uint16_t row,
  * the far end's glass, because that is what a caller placing a picture needs to
  * know, and it is not the same as the console size above.
  */
+/* ---- sound -------------------------------------------------------------- */
+/*
+ * The same wire, one more opcode, and the far end becomes a sound card as well
+ * as a screen.  It has to be the same wire: the CYD breaks out three pins and
+ * two of them are already this link.
+ *
+ * Why this lives inside the display driver rather than in a .SYS of its own,
+ * which is where it belongs by subject: two modules writing one UART interleave
+ * their frames and neither arrives.  One module owning the port is the whole of
+ * the arrangement, and the kernel makes it free - blit_rect and a device write
+ * are both called with the device registry held, so the two paths cannot be
+ * inside send_frame at once and the shared frame buffer needs no lock.  That is
+ * also the cost: a band of pixels is up to 13 ms of blocking write, and sound
+ * queued behind one waits that long.  The far end's converter holds 93 ms, which
+ * is what covers it.
+ *
+ * Eight-bit mono on the wire, converted here rather than there.  Not a
+ * compromise for bandwidth - 88 KB/s of 22 kHz stereo would fit in 400 - but
+ * because that is what the far end plays: its output is one DAC pin into a
+ * small speaker, and sending sixteen-bit stereo would be sending three bytes
+ * out of four to be thrown away by the receiver's own conversion.  22 KB/s is
+ * five percent of the link, which is what leaves the picture alone.
+ *
+ * No pacing here, deliberately.  A sink that accepts everything instantly makes
+ * the program above it run its mixer as fast as the processor allows (the
+ * lesson written up over pcmnull's clock in dev/audio.c) - but that clock is
+ * upstream of this device, in api->audio, and it governs whatever reaches
+ * pcmmix.  A second one here would only fight it.  What this does instead is
+ * drop: if the wire cannot take the samples, they are counted and gone, because
+ * a sound device that blocks stops the game.
+ */
+#define AUD_RATE_DEFAULT 22050u
+/*
+ * 256 samples, which is 11.6 ms and exactly what pcmmix hands down in one mix
+ * period, so the common case is one write in and one frame out.  Small matters:
+ * the frame is written with the registry held, so this is how long the picture
+ * and the console can be made to wait for the sound.
+ */
+#define AUD_CHUNK 256u
+
+static ag_audio_fmt_t s_afmt;
+static bool           s_afmt_set;
+static uint64_t       s_abytes_in;
+static uint64_t       s_abytes_sent;
+static uint8_t        s_amono[AUD_CHUNK + 4u];
+
+static void aud_default_fmt(ag_audio_fmt_t *out)
+{
+    out->rate = AUD_RATE_DEFAULT;
+    out->channels = 2;
+    out->bits = 16;
+}
+
+static int aud_fmt_ok(const ag_audio_fmt_t *fmt)
+{
+    return fmt != NULL && fmt->rate >= 8000u && fmt->rate <= 48000u &&
+           fmt->bits == 16u && (fmt->channels == 1u || fmt->channels == 2u);
+}
+
+static ag_err_t rem_pcm_open(ag_device_t *dev, uint32_t flags)
+{
+    (void)dev;
+    (void)flags;
+    if (!s_afmt_set) {
+        aud_default_fmt(&s_afmt);
+        s_afmt_set = true;
+    }
+    return s_up ? AG_OK : -AG_ENODEV;
+}
+
+static ag_err_t rem_pcm_close(ag_device_t *dev)
+{
+    (void)dev;
+    return AG_OK;
+}
+
+/*
+ * Signed 16-bit to unsigned 8-bit is the top byte with the sign flipped, and
+ * two channels become one by averaging rather than by dropping the right - the
+ * same arithmetic the far end's DAC driver does, moved to this side of the
+ * wire.  An effect that lives in one channel would otherwise vanish, and there
+ * is no stereo at the other end to lose it in.
+ */
+static int32_t rem_pcm_write(ag_device_t *dev, const void *buf, size_t len,
+                             uint64_t off)
+{
+    (void)dev;
+    (void)off;
+
+    if (buf == NULL || len < 2u) {
+        return -AG_EINVAL;
+    }
+    if (!s_afmt_set) {
+        aud_default_fmt(&s_afmt);
+        s_afmt_set = true;
+    }
+
+    const uint32_t chans = s_afmt.channels ? s_afmt.channels : 2u;
+    const size_t   frame_bytes = (size_t)chans * sizeof(int16_t);
+    const size_t   frames = len / frame_bytes;
+    if (frames == 0u) {
+        return -AG_EINVAL;
+    }
+    s_abytes_in += (uint64_t)(frames * frame_bytes);
+
+    const int16_t *src = (const int16_t *)buf;
+    size_t         done = 0;
+    while (done < frames) {
+        size_t n = frames - done;
+        if (n > AUD_CHUNK) {
+            n = AUD_CHUNK;
+        }
+        put16(s_amono + 0, s_afmt.rate & 0xffffu);
+        put16(s_amono + 2, s_afmt.rate >> 16);
+        uint8_t *out = s_amono + 4;
+        if (chans == 2u) {
+            const int16_t *p = src + (done * 2u);
+            for (size_t i = 0; i < n; i++) {
+                const int32_t mono = ((int32_t)p[i * 2u] + p[i * 2u + 1u]) / 2;
+                out[i] = (uint8_t)((mono + 32768) >> 8);
+            }
+        } else {
+            const int16_t *p = src + done;
+            for (size_t i = 0; i < n; i++) {
+                out[i] = (uint8_t)(((int32_t)p[i] + 32768) >> 8);
+            }
+        }
+        send_frame(FR_AUD, s_amono, (uint32_t)(4u + n));
+        s_abytes_sent += (uint64_t)n;
+        done += n;
+    }
+
+    /*
+     * Always a full accept.  What did not reach the glass is in the counters,
+     * and a short return here would only make the mixer above offer it again.
+     */
+    return (int32_t)(frames * frame_bytes);
+}
+
+static ag_err_t rem_pcm_ioctl(ag_device_t *dev, uint32_t cmd, void *arg,
+                              size_t arglen)
+{
+    (void)dev;
+
+    if (cmd == AG_IOC_AUDIO_GETFMT) {
+        if (arg == NULL || arglen < sizeof(ag_audio_fmt_t)) {
+            return -AG_EINVAL;
+        }
+        if (!s_afmt_set) {
+            aud_default_fmt(&s_afmt);
+            s_afmt_set = true;
+        }
+        *(ag_audio_fmt_t *)arg = s_afmt;
+        return AG_OK;
+    }
+    if (cmd == AG_IOC_AUDIO_SETFMT) {
+        if (arg == NULL || arglen < sizeof(ag_audio_fmt_t)) {
+            return -AG_EINVAL;
+        }
+        if (!aud_fmt_ok((const ag_audio_fmt_t *)arg)) {
+            return -AG_EINVAL;
+        }
+        s_afmt = *(const ag_audio_fmt_t *)arg;
+        s_afmt_set = true;
+        return AG_OK;
+    }
+    if (cmd == AG_IOC_AUDIO_GETSTATS) {
+        if (arg == NULL || arglen < sizeof(ag_audio_stats_t)) {
+            return -AG_EINVAL;
+        }
+        ag_audio_stats_t *st = (ag_audio_stats_t *)arg;
+        memset(st, 0, sizeof(*st));
+        st->bytes_in = s_abytes_in;
+        st->bytes_sent = s_abytes_sent;
+        return AG_OK;
+    }
+    if (cmd == AG_IOC_FLUSH || cmd == AG_IOC_RESET) {
+        return AG_OK;
+    }
+    return -AG_ENOTSUP;
+}
+
+static const ag_dev_ops_t k_pcm_ops = {
+    .open = rem_pcm_open,
+    .close = rem_pcm_close,
+    .write = rem_pcm_write,
+    .ioctl = rem_pcm_ioctl,
+};
+
 static ag_err_t rem_info(ag_handle_t h, ag_gfxinfo_t *out)
 {
     (void)h;
@@ -841,6 +1085,51 @@ ag_err_t ag_driver_init(void)
     if (added != AG_OK) {
         s_up = false;
         return added;
+    }
+
+    /*
+     * The sound card that shares the wire.  A separate device rather than a
+     * second face of rem0, because that is what the mixer looks for: pcmmix
+     * picks its sink by name, and `pcmrem` is in that list ahead of pcm0 -
+     * which on a board whose amplifier was unsoldered is a converter playing to
+     * nothing.  Registered second and not fatal if it fails: a screen with no
+     * sound is worth having, the other way round is not.
+     */
+    {
+        const ag_dev_add_t pcm = {
+            .name = "pcmrem",
+            .driver = "REMDISP",
+            .cls = AG_DEV_AUDIO,
+            .flags = AG_DEVF_EXCLUSIVE,
+            .ops = &k_pcm_ops,
+            .priv = NULL,
+        };
+        const ag_err_t pcm_added = ag_dev_add(&pcm);
+        if (pcm_added != AG_OK) {
+            ag_printf("REMDISP: no pcmrem (%s); the screen still works\n",
+                      ag_strerror(pcm_added));
+        }
+    }
+
+    /*
+     * Take the shadow now, at boot, rather than on the first band.
+     *
+     * It is 150 KB and it decides whether the link runs at fifteen frames a
+     * second or at two, and asking for it lazily means asking for it *after*
+     * whatever application is now on the screen has taken its arena - which on
+     * this board is a game that asks for six megabytes of the eight.  The
+     * screen would then quietly become eight times slower, at the one moment
+     * there was finally something to look at, and nothing would say why.  A
+     * display driver owns its frame memory; it does not queue behind the
+     * programs it is showing.
+     *
+     * 320x240 is what rem_info advertises, so it is what the kernel's own
+     * surface will be.  An application that presents something bigger still
+     * works: prev_ready reallocates, and if that fails the picture is sent
+     * whole - slower, not broken.
+     */
+    if (!prev_ready(320u, 240u)) {
+        ag_printf("REMDISP: no frame shadow; every band will be sent whole\n");
     }
 
     ag_printf("REMDISP: uart%d at %u baud; %ux%u cells, pixels in %u-row bands\n",

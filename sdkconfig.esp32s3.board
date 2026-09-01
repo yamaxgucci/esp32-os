@@ -74,9 +74,21 @@ CONFIG_ARGON_ENABLE_ADC=y
 # still handles it).  The cost of the PSRAM arena is speed: an inner loop that
 # misses the cache pays PSRAM latency, so a hot-text split will come later; this
 # is the coarse form that makes everything fit.
+#
+# 512 KB was chosen to hold "the biggest images in the tree", and then the
+# biggest image in the tree turned out to be 768 KB - Fallout 2 - so it goes to
+# flash XIP regardless and the arena holds nothing.  Meanwhile it is taken out
+# of PSRAM on the first load and never given back, which on an 8 MB part is
+# half a megabyte of the six that game needs, and it is exactly why it refused
+# to start on the board while running in the emulator.
+#
+# 128 KB instead.  Nothing in apps/ is between 128 and 512 KB, so nothing that
+# used to load into the arena stops doing so; what is bigger already paid for
+# flash XIP.  Raise it again the day an image lands in that band and is hot
+# enough to care - XIP costs about 300 cycles on a miss (docs/07).
 CONFIG_ARGON_APP_ARENA_KB=32
 CONFIG_ARGON_APP_ARENA_PSRAM=y
-CONFIG_ARGON_APP_ARENA_PSRAM_KB=512
+CONFIG_ARGON_APP_ARENA_PSRAM_KB=128
 
 # Camera transport for the DVP GC2145 on this board (api->cam); the sensor
 # driver is a loadable .SYS (GC2145.SYS), so the firmware carries only the

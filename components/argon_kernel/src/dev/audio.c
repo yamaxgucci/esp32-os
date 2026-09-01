@@ -28,6 +28,27 @@
 #define AG_PCMNULL_DEPTH 4096u
 
 static ag_device_t    *s_dev;
+/*
+ * Where api->audio actually writes, which for most of this file's life was
+ * s_dev and nothing else - the mute sink, unconditionally.
+ *
+ * That was right when it was written: there were no real outputs, and a
+ * convenience alias for the discard stub is an honest thing to offer.  It has
+ * not been right for a while.  /dev/pcmmix arrived, picks the best real output
+ * there is and falls back to pcmnull when there is none, and every application
+ * that reached for the convenient API instead of opening a /dev node by hand
+ * went on being silent on hardware that could play - silently, because a mute
+ * sink and a working one are indistinguishable from above.  Fallout 2 is the
+ * one that made it visible, but nothing about it is Fallout's.
+ *
+ * So the alias now means "the audio output", and the choice is made at open
+ * because that is when the answer is knowable: a .SYS loaded after boot may
+ * have brought one.  The pacing above stays exactly as it was - a clock, not
+ * the sink's opinion - so an application still cannot outrun real time even
+ * when the sink accepts everything instantly.
+ */
+static ag_device_t    *s_out;
+static void           *s_out_session;
 static int            s_api_held; /* api->audio holds exclusive open */
 static int            s_fmt_set;
 static ag_audio_fmt_t s_fmt;
@@ -174,7 +195,7 @@ static int audio_present(void)
 
 static int audio_is_hw(void)
 {
-    return 0;
+    return (s_api_held && s_out != NULL && s_out != s_dev) ? 1 : 0;
 }
 
 static ag_err_t audio_open(const ag_audio_fmt_t *fmt)
@@ -191,25 +212,55 @@ static ag_err_t audio_open(const ag_audio_fmt_t *fmt)
     if (err != AG_OK) {
         return err;
     }
-    err = ag_dev_open(s_dev, AG_O_WRONLY);
-    if (err != AG_OK) {
-        return err;
+
+    /*
+     * The mixer, when there is one, so that this shares the output with
+     * anything else playing instead of taking it exclusively - and so that
+     * whichever real sink is installed is its problem and not this file's.
+     */
+    s_out = ag_dev_find("pcmmix");
+    if (s_out == NULL) {
+        s_out = s_dev;
     }
+    s_out_session = NULL;
+    err = ag_dev_open2(s_out, AG_O_WRONLY, &s_out_session);
+    if (err != AG_OK) {
+        /* A busy or broken mixer is no reason not to run: fall back to mute. */
+        if (s_out != s_dev) {
+            ag_log(AG_LOG_WARN, TAG, "pcmmix: %d; playing to pcmnull",
+                   (int)err);
+            s_out = s_dev;
+            s_out_session = NULL;
+            err = ag_dev_open2(s_out, AG_O_WRONLY, &s_out_session);
+        }
+        if (err != AG_OK) {
+            s_out = NULL;
+            return err;
+        }
+    }
+    if (s_out != s_dev) {
+        (void)ag_dev_ioctl2(s_out, s_out_session, AG_IOC_AUDIO_SETFMT, &s_fmt,
+                            sizeof(s_fmt));
+    }
+
     s_api_held = 1;
     s_open_us = ag_port_us();
     s_frames_written = 0;
-    ag_log(AG_LOG_INFO, TAG, "pcmnull open %u Hz %u ch (discard, paced)",
-           (unsigned)s_fmt.rate, (unsigned)s_fmt.channels);
+    ag_log(AG_LOG_INFO, TAG, "api->audio open %u Hz %u ch -> %s (paced)",
+           (unsigned)s_fmt.rate, (unsigned)s_fmt.channels,
+           (s_out == s_dev) ? "pcmnull (discard)" : "pcmmix");
     return AG_OK;
 }
 
 static void audio_close(void)
 {
-    if (!s_api_held || s_dev == NULL) {
+    if (!s_api_held || s_out == NULL) {
         return;
     }
     s_api_held = 0;
-    (void)ag_dev_close(s_dev);
+    (void)ag_dev_close2(s_out, s_out_session);
+    s_out = NULL;
+    s_out_session = NULL;
 }
 
 static int32_t audio_write_pcm(const int16_t *pcm, int32_t frames)
@@ -217,11 +268,12 @@ static int32_t audio_write_pcm(const int16_t *pcm, int32_t frames)
     size_t  bytes;
     int32_t n;
 
-    if (!s_api_held || pcm == NULL || frames <= 0 || !s_fmt_set) {
+    if (!s_api_held || s_out == NULL || pcm == NULL || frames <= 0 ||
+        !s_fmt_set) {
         return -AG_EINVAL;
     }
     bytes = (size_t)frames * (size_t)s_fmt.channels * sizeof(int16_t);
-    n = pcm_write(s_dev, pcm, bytes, 0);
+    n = ag_dev_write2(s_out, s_out_session, pcm, bytes, 0);
     if (n < 0) {
         return n;
     }

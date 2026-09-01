@@ -4,8 +4,8 @@
  * Several apps may open this device at once.  Each open gets a private ring;
  * write() pushes interleaved s16 frames into that ring.  Whenever any client
  * has a full mix period, samples are summed (int32 → saturating s16) and
- * written to a single exclusive sink: pcmvirt if present, else pcm0, else
- * pcmnull.  Missing clients contribute silence for that period.
+ * written to a single exclusive sink: pcmvirt if present, then pcmrem, then
+ * pcm0, else pcmnull.  Missing clients contribute silence for that period.
  *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
@@ -160,9 +160,23 @@ static void ring_clear(pcmmix_client_t *c)
     c->ring_used = 0;
 }
 
+/*
+ * Best output first, and the order is the order of how deliberate each one is.
+ *
+ * pcmvirt and pcmrem are both published by a loadable driver, and a driver was
+ * loaded on purpose: nobody installs one and then wants the built-in output
+ * instead.  pcmrem is the wire to a second board (apps/remdisp), which on a
+ * machine whose amplifier is unsoldered is the only output there is - so it has
+ * to come ahead of pcm0, which would otherwise win by existing and play to
+ * nothing at all, indistinguishably from working.
+ */
 static ag_device_t *pick_sink(void)
 {
     ag_device_t *d = ag_dev_find("pcmvirt");
+    if (d != NULL) {
+        return d;
+    }
+    d = ag_dev_find("pcmrem");
     if (d != NULL) {
         return d;
     }
@@ -567,7 +581,7 @@ ag_err_t ag_pcmmix_init(void)
         return err;
     }
     ag_log(AG_LOG_INFO, TAG,
-           "pcmmix ready (sum %u clients → pcmvirt|pcm0|pcmnull)",
+           "pcmmix ready (sum %u clients → pcmvirt|pcmrem|pcm0|pcmnull)",
            (unsigned)PCMMIX_CLIENTS);
     return AG_OK;
 }
