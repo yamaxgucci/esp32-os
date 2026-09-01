@@ -69,8 +69,20 @@ const char *ag_port_audio_name(void) { return "dac"; }
 #define DAC_BUF      512
 #define DAC_FRAMES   (DAC_DESCS * DAC_BUF)
 
-/* How long write() may wait for the converter to drain: one buffer's worth. */
+/*
+ * How long a write may wait for the converter to drain.
+ *
+ * DAC_WAIT_MS is for closing, where waiting is the point: the walk down to
+ * silence has to actually reach the pin before the peripheral stops.
+ *
+ * DAC_POKE_MS is for the ordinary path, and it is short because a write to a
+ * device is made with the kernel's device registry held.  Waiting here does
+ * not only slow the caller down, it stops every other device the caller's
+ * machine has - which on the CYD is the display, being fed pixels down a UART
+ * with no flow control.  See acc_flush.
+ */
 #define DAC_WAIT_MS  120
+#define DAC_POKE_MS  2
 
 /*
  * One whole DMA chain's worth of converted bytes, filled before any of it is
@@ -89,23 +101,54 @@ static uint8_t                 s_channels = 2;
 static uint8_t                 s_acc[ACC_BYTES];
 static size_t                  s_acc_used;
 
-/* Hands the buffer over, in as few calls as the driver will take. */
-static bool acc_flush(void)
+/*
+ * Hands over what the converter will take now, and keeps the rest.
+ *
+ * The first version waited up to DAC_WAIT_MS for the whole accumulator and
+ * threw away anything the converter had not taken by then.  Both halves of
+ * that were wrong on a board that does anything else.
+ *
+ * The wait: in steady state the accumulator fills at exactly the rate the
+ * converter drains, so every flush arrives with the DMA chain full and waits
+ * the best part of a tenth of a second for room.  That is correct pacing and
+ * a disaster for the caller, because a write to a device is made with the
+ * kernel's device registry held - so an audio thread that blocks here blocks
+ * *the display* as well.  Measured on the CYD showing Fallout 2 down the wire
+ * from the S3: 330 KB of arriving pixels in forty seconds thrown away by a
+ * receiver that could not read its UART while this call was inside the driver.
+ *
+ * The discard: dropping the tail turns a full converter into silence rather
+ * than into back-pressure, and the caller is never told.
+ *
+ * So: no wait worth the name, and the remainder stays.  The caller finds less
+ * room next time (ag_port_audio_space reports it) and offers less, which is
+ * back-pressure expressed as a number instead of as a stall.
+ */
+static bool acc_flush_ms(uint32_t ms)
 {
     size_t off = 0;
 
     while (off < s_acc_used) {
         size_t          loaded = 0;
         const esp_err_t err = dac_continuous_write(
-            s_dac, s_acc + off, s_acc_used - off, &loaded, DAC_WAIT_MS);
+            s_dac, s_acc + off, s_acc_used - off, &loaded, ms);
         off += loaded;
-        if (err != ESP_OK) {
-            break; /* the converter is still full: the rest is dropped */
+        if (err != ESP_OK || loaded == 0) {
+            break; /* the converter is full for now; keep what is left */
         }
     }
-    const bool all = (off == s_acc_used);
+    if (off < s_acc_used) {
+        memmove(s_acc, s_acc + off, s_acc_used - off);
+        s_acc_used -= off;
+        return false;
+    }
     s_acc_used = 0;
-    return all;
+    return true;
+}
+
+static bool acc_flush(void)
+{
+    return acc_flush_ms(DAC_POKE_MS);
 }
 
 bool ag_port_audio_present(void)
@@ -168,7 +211,13 @@ void ag_port_audio_close(void)
     if (s_dac == NULL) {
         return;
     }
-    (void)acc_flush();
+    /* Closing is the one place where waiting is the point, so it uses the
+     * patient flush: the walk down to silence below has to reach the pin
+     * before the peripheral is cut, and a two-millisecond poke would leave it
+     * in the accumulator.  Whatever the converter still will not take is
+     * abandoned - the peripheral is about to stop anyway. */
+    (void)acc_flush_ms(DAC_WAIT_MS);
+    s_acc_used = 0;
 
     /*
      * Silence is 128, not 0: the converter swings from ground to the supply
@@ -182,7 +231,8 @@ void ag_port_audio_close(void)
         memset(s_acc + s_acc_used, (uint8_t)level, 16u);
         s_acc_used += 16u;
     }
-    (void)acc_flush();
+    (void)acc_flush_ms(DAC_WAIT_MS);
+    s_acc_used = 0;
 
     (void)dac_continuous_disable(s_dac);
     (void)dac_continuous_del_channels(s_dac);

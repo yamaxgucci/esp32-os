@@ -289,6 +289,50 @@ static uint32_t block_hash(const uint8_t *src, uint32_t stride, uint32_t rows,
 }
 
 /*
+ * One band row forgotten every so often, so the picture repairs itself.
+ *
+ * A lost band is remembered as delivered - the grid records what was *sent*,
+ * and the link has no acknowledgement - so anything that goes missing on the
+ * wire stays wrong until that part of the picture changes again.  On a game
+ * that is usually soon; on a status bar or a menu it is never.  And things do
+ * go missing: measured with the game running, 123 KB of arriving bytes in forty
+ * seconds were thrown away by the receiver hunting for a frame header, because
+ * writing a band to the panel takes long enough for the UART's buffer to
+ * overflow and this link has no flow control.
+ *
+ * So it is the same answer the console path already uses two hundred lines
+ * below, for the same reason: a slow sweep that re-sends what is probably
+ * already right.  A quarter of a second per band row is one extra band in every
+ * fifty at the frame rates seen here, and it puts a ceiling of about eight
+ * seconds on how long any part of the picture can stay wrong.
+ *
+ * Driven from blit_rect rather than a timer, because a driver cannot own a
+ * task.  While nothing is drawing nothing is repaired either - which is the
+ * case that FR_HELLO covers.
+ */
+#define HEAL_BAND_US 250000ull
+
+static uint32_t s_heal_band;
+static uint64_t s_heal_band_at;
+
+static void heal_a_band(void)
+{
+    if (s_hash == NULL || s_hash_rows == 0) {
+        return;
+    }
+    const uint64_t now = (uint64_t)ag_api()->time->us();
+    if (now < s_heal_band_at) {
+        return;
+    }
+    s_heal_band_at = now + HEAL_BAND_US;
+
+    s_heal_band = (s_heal_band + 1u) % s_hash_rows;
+    for (uint32_t c = 0; c < s_hash_cols; c++) {
+        s_hash[(size_t)s_heal_band * s_hash_cols + c] = 0;
+    }
+}
+
+/*
  * The far end asking to be told everything again.
  *
  * The receiver is a monitor, and a monitor gets switched off, unplugged and
@@ -597,6 +641,7 @@ static void rem_blit_rect(ag_handle_t h, const ag_blit_t *b)
     }
 
     poll_far_end();
+    heal_a_band();
 
     const uint8_t *src = (const uint8_t *)b->px;
     /*
