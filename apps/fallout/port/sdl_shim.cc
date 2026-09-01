@@ -318,12 +318,34 @@ void sdl_shim_log(const char *path)
     ag_libc_log_sink(log_line);
 }
 
+/*
+ * The whole point of this file is to survive the thing that killed the game,
+ * and for a while it did not: FAT puts the length in the directory entry and
+ * updates it when the handle is closed, so a run that was reset - or that died
+ * - left a log of exactly zero bytes.  Every line was written and none of them
+ * could be read.  That is the diagnostic tool failing at the only job it has.
+ *
+ * So the handle is synced, but not on every line: the game prints hundreds a
+ * second while a map loads, and a metadata write to the card for each of them
+ * would change what is being measured.  Twice a second is far more often than
+ * anything interesting happens and costs nothing that shows up in a frame rate.
+ */
+#define LOG_SYNC_MS 500u
+
+static uint32_t s_log_synced;
+
 static void log_line(const char *text)
 {
     if (s_log < 0 || text == NULL) {
         return;
     }
     ag_write(s_log, text, strlen(text));
+
+    const uint32_t now = (uint32_t)ag_millis();
+    if (now - s_log_synced >= LOG_SYNC_MS) {
+        s_log_synced = now;
+        (void)ag_sync(s_log);
+    }
 }
 
 /*
@@ -1895,6 +1917,38 @@ extern "C" unsigned ag_frame_stalled_ms(void)
         return 0u;
     }
     return (unsigned)((uint32_t)ag_millis() - s_last_present_ms);
+}
+
+/*
+ * Whether there is room to play a movie, asked before one is started.
+ *
+ * The MVE decoder allocates through internal_malloc_safe, and "safe" here means
+ * that a failed allocation prints a line and takes the process with it.  That
+ * is a reasonable choice on a machine where running out of memory means
+ * something is wrong; it is the wrong one here, where it means the player
+ * walked into a scene with a cut-scene in it while standing on a loaded map.
+ *
+ * Measured on the board: the decoder's buffers come to about 730 KB and the
+ * largest single request is 204900 bytes.  A map that is loaded leaves 450 to
+ * 500 KB, so the answer is usually no, and the run that found this died on
+ * vsuit.mve about ninety seconds into a new game.
+ *
+ * Refusing early turns that into a cut-scene that does not play, which the
+ * callers already handle - gameMoviePlay returns -1 for a movie file that is
+ * missing, and every caller copes.  A skipped scene is a small loss; the loss
+ * it replaces is the whole session.
+ */
+#define MOVIE_NEEDS_FREE    (900u * 1024u)
+#define MOVIE_NEEDS_LARGEST (256u * 1024u)
+
+extern "C" int ag_movie_affordable(void)
+{
+    ag_meminfo_t mi;
+    ag_meminfo(&mi);
+    return (mi.arena_free >= MOVIE_NEEDS_FREE &&
+            mi.arena_largest >= MOVIE_NEEDS_LARGEST)
+               ? 1
+               : 0;
 }
 
 static void stall_service(void)

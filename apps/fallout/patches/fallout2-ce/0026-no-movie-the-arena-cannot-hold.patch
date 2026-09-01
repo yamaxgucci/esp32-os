@@ -1,0 +1,38 @@
+--- a/src/game_movie.cc
++++ b/src/game_movie.cc
+@@ -138,6 +138,11 @@
+ 
+ // gmovie_play
+ // 0x44E690
++/*
++ * ARGON: is there room for one?  Defined by the port; see sdl_shim.cc.
++ */
++extern "C" int ag_movie_affordable(void);
++
+ int gameMoviePlay(int movie, int flags)
+ {
+     gGameMovieIsPlaying = true;
+@@ -145,6 +150,23 @@
+     const char* movieFileName = gMovieFileNames[movie];
+     debugPrint("\nPlaying movie: %s\n", movieFileName);
+ 
++    // ARGON: not if it will not fit.
++    //
++    // The decoder allocates about 730 KB through internal_malloc_safe, whose
++    // idea of safe is to end the process when an allocation fails.  On a map
++    // that is loaded there is about half that free, so walking into a scripted
++    // cut-scene ended the game - vsuit.mve, ninety seconds into a new one, with
++    // `out of arena asking for 204900 bytes; 120 of 5850 KB free`.
++    //
++    // Returning -1 here is the same answer this function already gives for a
++    // movie file that is missing, so every caller is prepared for it.  The
++    // scene does not play; the game goes on.
++    if (!ag_movie_affordable()) {
++        debugPrint("gmovie_play(): no room for %s, skipped\n", movieFileName);
++        gGameMovieIsPlaying = false;
++        return -1;
++    }
++
+     const char* language = settings.system.language.c_str();
+     char movieFilePath[COMPAT_MAX_PATH];
+     int movieFileSize;
