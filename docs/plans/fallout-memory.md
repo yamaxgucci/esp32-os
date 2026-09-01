@@ -693,3 +693,35 @@ why they are fine.
 That predicts black rather than grey, so it is not the whole story.  The cheapest
 next step is not another headless bisection: run it in a window - `argon run -Sd`
 - and watch what the movies actually do.
+
+## What each change costs in function, not just in bytes
+
+Asked directly, and worth having in one place.
+
+| patch | saved | what it takes away |
+|---|---|---|
+| 0014 bounded script cache | 878 KB on a map that has been sat on | **Something, possibly.** An evicted `Program` loses its file-scope variables. Fallout keeps persistent state in `local_var`/`global_var` and drops every program on a map change anyway, so nothing can rely on them across visits — but something may within one. Off by default (`-scripts 0`); it is a flag, not a policy |
+| 0015 last movie frame | 200 KB, every map | Nothing. `_lastMovieBuffer` is written and read nowhere — the only other mention in the engine is `movieExit` freeing it |
+| 0016 no guard header | ~560 KB on a busy map | **A debug check.** `memoryBlockValidate` can no longer catch a write past the end of a block, and `mem_check()` prints the block count and says the byte total is not tracked. Nothing the game does depends on either |
+| 0018 sixteen-bit light | 240 KB of bss, which became arena | **Almost nothing.** The light quantum is 4 of 65536, a two-hundred-and-fiftieth of a palette shade. It saturates only with three full-intensity lights on one hex |
+| 0019 object slabs | 62 KB, and less fragmentation | Nothing. A different allocator for the same objects |
+| 320×240 panel | 450 KB **on hardware**; nothing in QEMU | **A great deal, on purpose.** The interface text is laid out for 640×480 and halving it makes it hard to read. This is about running on a CYD at all |
+
+And one that was reverted: art cache 1400 → 1000 saved 404 KB and cost the frame
+rate and three dialogs. See the note in `fallout2.cfg`.
+
+## 320×240 works
+
+Measured, not just compiled. `C:\SYSTEM.CFG` with `width = 320`, `height = 240`,
+and the port says what it is doing:
+
+```
+SDL: display 320x240
+SDL: panel 320x240, picture 640x480, reducing by 2
+```
+
+The screenshot is the Temple of Trials at 320×240, in colour, 68.6% of sampled
+pixels carrying a colour cast, with the interface bar whole at the bottom.  The
+game runs; the memory figure is unchanged at 5420 KB of 6340 because in QEMU the
+framebuffer belongs to the emulated device either way.  **On hardware the panel
+is 150 KB instead of 600**, and that 450 KB is the arena's.
