@@ -39,6 +39,10 @@
  *   itself instead (see the sweep below), and the pixel path is repaired by the
  *   next frame, which is what a video link does anyway.
  *
+ * The encodings here are mirrored in host-tests/test_rempix.c, which
+ * round-trips them against each other: a change here that is not made there
+ * passes the tests and breaks the screen.
+ *
  * Build (LX7, for the S3 - the far end is an LX6 and needs its own image):
  *   python tools/mkaxe.py --arch xtensa --gcc xtensa-esp32s3-elf-gcc \
  *       --include sdk/include -o build/apps/REMDISP.SYS apps/remdisp/remdisp.c

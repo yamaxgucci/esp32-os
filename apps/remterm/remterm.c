@@ -30,6 +30,10 @@
  * follows the traffic - the first band acquires the display, the first console
  * row after that releases it - and the far end's own state is what drives it.
  *
+ * The encodings here are mirrored in host-tests/test_rempix.c, which
+ * round-trips them against each other: a change here that is not made there
+ * passes the tests and breaks the screen.
+ *
  * Build (LX6, for the ESP32 - the far end is an LX7 and needs its own image):
  *   python tools/mkaxe.py --arch xtensa --gcc xtensa-esp32-elf-gcc \
  *       --include sdk/include -o build/apps/REMTERM.AXE apps/remterm/remterm.c
