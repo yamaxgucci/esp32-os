@@ -166,14 +166,27 @@ static void report_big(size_t n, void *r0, void *r1, void *r2, void *r3,
  * per site, so the difference between two snapshots is exactly what an action
  * kept, with the churn cancelled out.
  *
- * The costs, so they are on the record rather than a surprise: 3 MB of table,
- * a hash and a short probe on every allocation over the threshold, and blocks
- * that arrive when the table is full are counted in a spill line rather than
- * dropped - a total that does not add up is worse than a coarse one.
+ * The costs, so they are on the record rather than a surprise: 786 KB of
+ * table, a hash and a short probe on every allocation over the threshold, and
+ * blocks that arrive when the table is full are counted in a spill line rather
+ * than dropped - a total that does not add up is worse than a coarse one.
+ *
+ * The table used to be four times this and the threshold sixteen bytes, which
+ * came to 4.6 MB of bss - and bss and the arena are the same memory, so on the
+ * 8 MB board the instrumented build left the game 3 MB to run in and could not
+ * reach the thing being measured.  A tool that does not fit on the machine
+ * with the problem is not a tool.  Sixty-four bytes and 65536 slots fits, and
+ * what it gives up is the smallest blocks - which are the ones the spill line
+ * would have told you about anyway.  Both can be raised with -D on a build for
+ * a larger part.
  */
-#define PROFILE_LIVE  262144u        /* pointer slots, a power of two */
+#ifndef PROFILE_LIVE
+#define PROFILE_LIVE  65536u         /* pointer slots, a power of two */
+#endif
 #define PROFILE_SITES 1024u
-#define PROFILE_MIN   16u
+#ifndef PROFILE_MIN
+#define PROFILE_MIN   64u
+#endif
 #define PROFILE_PROBE 256u
 
 typedef struct {
@@ -278,6 +291,21 @@ static void prof_free(void *p)
     s_prof_lost++;
 }
 
+/*
+ * To the log as well as the console, and for the same reason report_big has to:
+ * on a board the console is a cable to a machine that may not be listening, and
+ * a profile that exists only on a screen nobody is reading is a profile that
+ * was not taken.  A run made to find out where five megabytes had gone came
+ * back with the memory figures and none of the sites.
+ */
+static void prof_line(const char *text)
+{
+    ag_print(text);
+    if (s_libc_log != NULL) {
+        s_libc_log(text);
+    }
+}
+
 void ag_libc_malloc_profile_dump(int top)
 {
     unsigned i, j;
@@ -300,15 +328,25 @@ void ag_libc_malloc_profile_dump(int top)
     for (i = 0; i < PROFILE_SITES && s_sites[i].site != NULL; ++i) {
         sites++;
     }
-    ag_printf("[prof] %u KB live in %u blocks from %u/%u sites",
-              total / 1024u, blocks, sites, (unsigned)PROFILE_SITES);
-    /* Cumulative, and it never comes down: a block the tables could not hold
-     * cannot be found again when it is freed.  It is here to say whether the
-     * tables were big enough, not as a figure to add to anything. */
-    if (s_prof_untracked != 0) {
-        ag_printf(", %u KB ever missed", s_prof_untracked / 1024u);
+    /* One line rather than three prints, so it can go through prof_line.
+     * "ever missed" is cumulative and never comes down: a block the tables
+     * could not hold cannot be found again when it is freed.  It says whether
+     * the tables were big enough, and is not a figure to add to anything. */
+    {
+        char head[144];
+        if (s_prof_untracked != 0) {
+            snprintf(head, sizeof(head),
+                     "[prof] %u KB live in %u blocks from %u/%u sites, "
+                     "%u KB ever missed\n",
+                     total / 1024u, blocks, sites, (unsigned)PROFILE_SITES,
+                     s_prof_untracked / 1024u);
+        } else {
+            snprintf(head, sizeof(head),
+                     "[prof] %u KB live in %u blocks from %u/%u sites\n",
+                     total / 1024u, blocks, sites, (unsigned)PROFILE_SITES);
+        }
+        prof_line(head);
     }
-    ag_printf("\n");
     /* A selection sort over 64 entries, a few times a second: the point is not
      * to need a qsort in a diagnostic.  Sites are never cleared - the table is
      * a running picture and two snapshots subtract - so "already printed" is a
@@ -334,9 +372,13 @@ void ag_libc_malloc_profile_dump(int top)
             break;
         }
         done[best] = 1;
-        ag_printf("[prof]  %6u KB  %5u live  %p\n",
-                  s_sites[best].bytes / 1024u, s_sites[best].count,
-                  s_sites[best].site);
+        {
+            char row[96];
+            snprintf(row, sizeof(row), "[prof]  %6u KB  %5u live  %p\n",
+                     s_sites[best].bytes / 1024u, s_sites[best].count,
+                     s_sites[best].site);
+            prof_line(row);
+        }
     }
 }
 

@@ -66,6 +66,59 @@ machine that may not be listening, so the first run made to find out who takes
 six hundred kilobytes came back with the failure and none of the allocations
 that led to it.
 
+**The complete fixed cost, measured on the board at the main menu** with the
+live-bytes profiler.  4037 KB in 1306 blocks from 101 sites, and the `mem`
+figure at the same moment is 5025 - so about a megabyte is blocks under
+sixty-four bytes and the engine's own per-block headers, which is its own
+subject.
+
+| KB | blocks | site |
+|---|---|---|
+| 1804 | 6 | `artInit` - the art cache, at the 1800 KB setting |
+| 439 | 130 | `gameInitWithOptions` |
+| 421 | 23 | `gameInitWithOptions` |
+| 300 | 2 | `falloutMain` - the 640x480 buffer |
+| 201 | 6 | `_gsound_background_play_level_music` |
+| 110 | 105 | `strParseStrFromFunc` |
+| 108 | 5 | `interfaceFontsInit` |
+| 106 | 6 | `protoInit` |
+| 85 | 8 | `isoInit` |
+| 68 | 607 | `gameInitWithOptions` |
+| 56 | 26 | `falloutMain` |
+| 55 | 1 | `aiMessageListInit` |
+| 32 | 1 | `dfileRead` |
+| 29 | 1 | `wmWorldMap_init` |
+| 25 | 1 | `scriptsInit` |
+| 20 | 2 | `objectsInit` |
+
+Two things to take from it.  **The 200 KB block near `_cleanupMovie` is gone** -
+patch 0022 released the decoder's buffers and this run proves it, which the
+emulator's table above could not.  And **the profiler itself had to be made to
+fit**: at 262144 slots and a sixteen-byte threshold it is 4.6 MB of bss, and bss
+and the arena are the same memory, so the instrumented build left the game three
+megabytes and could not reach the thing being measured.  65536 slots and
+sixty-four bytes fits and still names everything above.
+
+**Not scripts, here.**  `-scripts 24` on the Den never prints its "dropped"
+line, so fewer than twenty-four programs are resident when the arena fills.  The
+bounded script cache was measured on Broken Hills deep into a session and that
+is a different situation from a map that fills up two minutes after it loads.
+
+**What maps do, all at arena 6050 with the 1800 KB cache:**
+
+| map | steady fps | outcome |
+|---|---|---|
+| Toxic Caves (`klatoxcv`) | **23** | stable, no evictions |
+| Temple of Trials (`artemple`) | **19** | stable for eleven minutes |
+| Broken Hills (`broken1`) | 16 | out of arena |
+| The Den (`denbus1`) | 15 | out of arena |
+| Klamath downtown (`kladwtwn`) | 9 | survives, art cache thrashing |
+| Arroyo village, Arroyo caves | 5 | out of arena |
+
+The three frame rates in the middle were 11 before zlib's window stopped
+churning through the arena, so fragmentation was costing about a third of the
+speed as well as the memory.
+
 **How to run one of these:** `apps/fallout/tools/boardrun.py`, which puts a
 ddraw.ini with the map on the card over HTTP, runs the game with `-autostart`
 and `-log`, and brings the log back.  Three phases with a reset between them,
