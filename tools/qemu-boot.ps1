@@ -34,6 +34,13 @@ param(
     # Live host folder as guest H: (UART1 ↔ hostfsd). Same helper as qemu-run.
     [string]$HostFs = '',
     [int]$HostFsPort = 5557,
+    # Fake external radio coprocessor on UART2 (↔ tools/rlinkd.py). Lets a guest
+    # driven with EXTRADIO.SYS reach the network with no built-in radio.
+    # 5562 is deliberately outside the OpenEth hostfwd range (5558-5561): those
+    # ports are already forwarded to the guest, and QEMU refuses to start if one
+    # is also taken by rlinkd on the host.
+    [switch]$Radio,
+    [int]$RadioPort = 5562,
     [switch]$NoNet,
     [int]$NetPort = 5558,
     # Tie virtual time to instructions retired instead of to host time.
@@ -108,6 +115,39 @@ if ($HostFs) {
     Write-Host "HostFS: $rootAbs -> guest H: (TCP $HostFsPort / UART1)"
 }
 
+$radioProc = $null
+if ($Radio) {
+    $rpython = Get-ChildItem -Path (Join-Path $env:IDF_TOOLS_PATH 'python_env') `
+        -Filter 'python.exe' -Recurse -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    $rpy = if ($rpython) { $rpython.FullName } else {
+        $g = Get-Command python -ErrorAction SilentlyContinue
+        if (-not $g) { throw 'Python not found for rlinkd.' }
+        $g.Source
+    }
+    $rlinkScript = (Resolve-Path (Join-Path $PSScriptRoot 'rlinkd.py')).Path
+    try {
+        Get-NetTCPConnection -LocalPort $RadioPort -State Listen `
+            -ErrorAction SilentlyContinue |
+            ForEach-Object {
+                Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue
+            }
+        Start-Sleep -Milliseconds 200
+    } catch {}
+    $radioOut = Join-Path (Get-Location) 'build\rlinkd.out.log'
+    $radioErr = Join-Path (Get-Location) 'build\rlinkd.err.log'
+    New-Item -ItemType Directory -Force -Path (Split-Path $radioOut) | Out-Null
+    $radioArgs = '"{0}" --port {1}' -f $rlinkScript, $RadioPort
+    $radioProc = Start-Process -FilePath $rpy -ArgumentList $radioArgs `
+        -PassThru -WindowStyle Hidden `
+        -RedirectStandardOutput $radioOut -RedirectStandardError $radioErr
+    Start-Sleep -Milliseconds 500
+    if ($radioProc.HasExited) {
+        throw "rlinkd exited immediately (exit $($radioProc.ExitCode))"
+    }
+    Write-Host "Radio: fake coprocessor on TCP $RadioPort / UART2"
+}
+
 # wait=on is essential: a TCP serial port with no peer throws its output away,
 # and the whole boot is over in a quarter of a second.  Without it the test
 # races the emulator and loses often enough to be useless.
@@ -148,6 +188,16 @@ if (-not $NoNet) {
 if ($HostFs) {
     # Second -serial is UART1 (HostFS). Console stays on the first.
     $qemuArgs += @('-serial', "tcp:127.0.0.1:$HostFsPort,reconnect=1")
+}
+
+if ($Radio) {
+    # The radio is the next -serial after the console (UART1) - or after HostFS
+    # (UART2) when that is attached too.  QEMU's esp32s3 emulates only UART0 and
+    # UART1, so the working combination is -Radio without -HostFs, which lands
+    # the radio on UART1; the driver defaults to UART1 on the "generic" (QEMU)
+    # board to match.  On real hardware the radio is a free UART (UART2 by
+    # default), set with radio.uart in BOARD.CFG.
+    $qemuArgs += @('-serial', "tcp:127.0.0.1:$RadioPort,reconnect=1")
 }
 
 if ($Sd) {
@@ -473,6 +523,9 @@ try {
     }
     if ($hostfsProc -and -not $hostfsProc.HasExited) {
         Stop-Process -Id $hostfsProc.Id -Force -ErrorAction SilentlyContinue
+    }
+    if ($radioProc -and -not $radioProc.HasExited) {
+        Stop-Process -Id $radioProc.Id -Force -ErrorAction SilentlyContinue
     }
 
     # Written here, not after the try: a run that failed is the run whose

@@ -701,6 +701,10 @@ static ag_err_t uart_bring_up(int port, const ag_port_uart_cfg_t *want)
         if (rc != AG_OK) {
             return rc;
         }
+        ag_err_t pe = ag_port_uart_pins(port, cfg->tx, cfg->rx);
+        if (pe != AG_OK) {
+            return pe;
+        }
         s_uart_up[port] = true;
         s_uart_cfg[port] = uart_cfg;
 
@@ -717,7 +721,7 @@ static ag_err_t uart_bring_up(int port, const ag_port_uart_cfg_t *want)
     if (err == AG_OK) {
         s_uart_cfg[port] = uart_cfg;
     }
-    return err;
+    return AG_OK;
 }
 
 static ag_err_t io_uart_config(int port, uint32_t baud, int databits,

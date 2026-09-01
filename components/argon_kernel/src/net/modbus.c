@@ -26,6 +26,7 @@
 #include <argon/net.h>
 #include <argon/path.h>
 
+#include <argon/netprov.h>
 #include <argon/port/net.h>
 #include <argon/port/uart.h>
 
@@ -387,12 +388,12 @@ int ag_cmd_modbus(int argc, char **argv)
         return 1;
     }
     ag_console_printf("%s:%u ... ", hostbuf, (unsigned)port);
-    const int fd = ag_port_net_connect(netaddr, port, MB_CONNECT_MS);
+    const int fd = ag_netprov_connect(netaddr, port, MB_CONNECT_MS);
     if (fd < 0) {
         ag_console_puts("no answer\n");
         return 1;
     }
-    (void)ag_port_net_nonblock(fd, true);
+    (void)ag_netprov_nonblock(fd, true);
 
     uint8_t    rxbuf[300];
     ag_netio_t rd;
@@ -401,7 +402,7 @@ int ag_cmd_modbus(int argc, char **argv)
 
     if (!is_read && nvals < 1) {
         ag_console_puts("modbus write needs a value\n");
-        (void)ag_port_net_close(fd);
+        (void)ag_netprov_close(fd);
         return 1;
     }
     uint8_t      pdu[256], resp[256];
@@ -413,7 +414,7 @@ int ag_cmd_modbus(int argc, char **argv)
         mb_show(is_read, addr, vals, nvals, resp, rlen);
         rc = 0;
     }
-    (void)ag_port_net_close(fd);
+    (void)ag_netprov_close(fd);
     return rc;
 }
 

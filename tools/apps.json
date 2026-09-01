@@ -98,6 +98,9 @@
     { "out": "ZIP.AXE", "group": "core", "src": ["apps/zip/zip.c"] },
 
     { "out": "ECHO.SYS", "group": "core", "src": ["apps/echo/echo.c"] },
+    { "out": "EXTRADIO.SYS", "group": "core",
+      "include": ["apps/common", "apps/common/rlink"],
+      "src": ["apps/extradio/extradio.c", "apps/common/rlink/ag_rlink.c"] },
     { "out": "GC2145.SYS", "group": "core", "include": ["apps/gc2145"], "src": ["apps/gc2145/gc2145.c"] },
     { "out": "CAM.AXE", "group": "core", "src": ["apps/cam/cam.c"] },
     {
