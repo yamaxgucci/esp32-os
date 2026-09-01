@@ -30,7 +30,29 @@
 #include <argon/port/task.h>
 #include <argon/port/uart.h>
 
-#define AG_IO_UART_RX_BUF 1024
+/*
+ * A kilobyte of receive buffer is a console's worth, and it was a console this
+ * was written for.  It is not a link's worth.
+ *
+ * At four megabaud a kilobyte is two and a half milliseconds - so a reader that
+ * stops reading for longer than that loses bytes, and any reader that does
+ * something with what it read stops for longer than that.  Found with the video
+ * link between the two boards on the desk: the receiver presents each band of
+ * pixels to its panel over SPI before asking for the next one, and bytes went
+ * missing.  The diagnosis is in the numbers rather than in a guess - the same
+ * 757 000 pixels were sent at two megabaud and at four, and the corrupt frames
+ * doubled with the rate (2 then 4) instead of staying level.  A bad line gives
+ * the same count for the same bytes; an overrun gives the same count for the
+ * same *time*, which is what this was.
+ *
+ * Eight kilobytes is twenty milliseconds at four megabaud, which is longer than
+ * anything a driver does between reads.  Transmit stays small on purpose: a
+ * short transmit buffer makes a large write block until the wire has taken it,
+ * and being paced by the wire is the correct behaviour for whoever is filling
+ * it - the alternative is buffering a frame the far end cannot yet draw.
+ */
+#define AG_IO_UART_RX_BUF 8192
+#define AG_IO_UART_TX_BUF 2048
 
 /*
  * A caller with more to send than AG_PORT_SPI_MAX_XFER splits it, and a chip
@@ -675,7 +697,7 @@ static ag_err_t uart_bring_up(int port, const ag_port_uart_cfg_t *want)
          * there is nothing to apply again here. */
         const ag_err_t rc = ag_port_uart_open(port, &uart_cfg,
                                               AG_IO_UART_RX_BUF,
-                                              AG_IO_UART_RX_BUF);
+                                              AG_IO_UART_TX_BUF);
         if (rc != AG_OK) {
             return rc;
         }
