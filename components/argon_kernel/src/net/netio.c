@@ -15,6 +15,7 @@
 #include <argon/console.h>
 #include <argon/shell.h>
 
+#include <argon/netprov.h>
 #include <argon/port/net.h>
 #include <argon/port/task.h>
 #include <argon/port/time.h>
@@ -44,12 +45,12 @@ int32_t ag_netio_recv(int fd, void *buf, size_t len, uint32_t timeout_ms)
          * never come back on this hardware (see port/net.h), so the only
          * thing anybody here waits inside is select.
          */
-        const int ready = ag_port_net_wait_readable(fd, AG_NETIO_SLICE_MS);
+        const int ready = ag_netprov_wait_readable(fd, AG_NETIO_SLICE_MS);
         if (ready < 0) {
             return (int32_t)ready;
         }
         if (ready > 0) {
-            const int32_t n = ag_port_net_recv_now(fd, buf, len);
+            const int32_t n = ag_netprov_recv_now(fd, buf, len);
             if (n != -AG_EAGAIN) {
                 return n;
             }
@@ -109,7 +110,7 @@ ag_err_t ag_netio_send(int fd, const void *buf, size_t len,
     const int64_t  deadline = ag_port_us() + (int64_t)timeout_ms * 1000;
 
     while (left > 0) {
-        const int32_t n = ag_port_net_send(fd, p, left);
+        const int32_t n = ag_netprov_send(fd, p, left);
         if (n == -AG_EAGAIN) {
             ag_err_t why = AG_OK;
             if (!wait_a_moment(deadline, &why)) {

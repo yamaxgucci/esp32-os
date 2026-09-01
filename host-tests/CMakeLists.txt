@@ -131,6 +131,8 @@ add_executable(argon_tests
     test_tube.c
     test_nam.c
     test_netmsg.c
+    test_rlink.c
+    "${ARGON_ROOT}/apps/common/rlink/ag_rlink.c"
     "${ARGON_ROOT}/tools/nam.c"
     "${ARGON_ROOT}/apps/cc/cc_compile.c"
     "${ARGON_ROOT}/components/argon_kernel/src/dev/draw.c"
@@ -144,7 +146,8 @@ target_include_directories(argon_tests BEFORE PRIVATE
 target_include_directories(argon_tests PRIVATE
     "${ARGON_ROOT}/tools"
     ${ARGON_INCLUDES}
-    "${ARGON_ROOT}/apps/common/ir")
+    "${ARGON_ROOT}/apps/common/ir"
+    "${ARGON_ROOT}/apps/common")
 if(NOT MSVC)
     target_link_libraries(argon_tests PRIVATE m)
 endif()

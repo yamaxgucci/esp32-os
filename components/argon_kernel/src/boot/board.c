@@ -103,6 +103,20 @@ static void apply_generic_defaults(void)
         s_board.uart[i].rx = AG_PIN_NONE;
         s_board.uart[i].baud = 115200;
     }
+    /*
+     * UART1/UART2 get placeholder pins in the generic (QEMU) profile.  The
+     * emulator wires these UARTs to its own serial ports and ignores the pin
+     * numbers, but the io layer still refuses to open a UART with none - so a
+     * loadable driver (an external radio on UART2, say) could not reach an
+     * emulated coprocessor without them.  A real board overrides these in
+     * BOARD.CFG with the GPIOs the peripheral is actually wired to; these
+     * numbers avoid the SD/SPI defaults above so nothing collides if it does
+     * not.  UART0 stays the console and is never set here.
+     */
+    s_board.uart[1].tx = 17;
+    s_board.uart[1].rx = 18;
+    s_board.uart[2].tx = 19;
+    s_board.uart[2].rx = 20;
 
     strcpy(s_board.audio.driver, "auto");
     s_board.audio.bclk = AG_PIN_NONE;

@@ -652,14 +652,28 @@ static ag_err_t uart_bring_up(int port, const ag_port_uart_cfg_t *want)
         if (rc != AG_OK) {
             return rc;
         }
+        ag_err_t pe = ag_port_uart_pins(port, cfg->tx, cfg->rx);
+        if (pe != AG_OK) {
+            return pe;
+        }
         s_uart_up[port] = true;
+        return AG_OK;
     }
 
-    ag_err_t err = ag_port_uart_config(port, &uart_cfg);
-    if (err == AG_OK) {
-        err = ag_port_uart_pins(port, cfg->tx, cfg->rx);
+    /*
+     * Already up.  Only an explicit io_uart_config (want != NULL) reprograms
+     * the line: a plain read or write must not, or every byte pumped off the
+     * port would drag a uart_param_config and a tx-drain behind it - wasteful,
+     * and on a live stream a way to lose bytes to a divider reset mid-frame.
+     */
+    if (want != NULL) {
+        ag_err_t err = ag_port_uart_config(port, &uart_cfg);
+        if (err == AG_OK) {
+            err = ag_port_uart_pins(port, cfg->tx, cfg->rx);
+        }
+        return err;
     }
-    return err;
+    return AG_OK;
 }
 
 static ag_err_t io_uart_config(int port, uint32_t baud, int databits,

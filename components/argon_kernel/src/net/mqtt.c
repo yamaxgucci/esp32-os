@@ -26,6 +26,7 @@
 #include <argon/shell.h>
 
 #include <argon/port/mem.h>
+#include <argon/netprov.h>
 #include <argon/port/net.h>
 #include <argon/port/random.h>
 #include <argon/port/task.h>
@@ -98,7 +99,7 @@ static void mq_close(mq_conn_t *c)
     }
 #endif
     if (c->fd >= 0) {
-        (void)ag_port_net_close(c->fd);
+        (void)ag_netprov_close(c->fd);
         c->fd = -1;
     }
 }
@@ -125,12 +126,12 @@ static ag_err_t mq_open(mq_conn_t *c, const char *host, uint16_t port, bool tls)
             ag_console_printf("%s: cannot be resolved\n", host);
             return -AG_EIO;
         }
-        c->fd = ag_port_net_connect(addr, port, MQTT_CONNECT_MS);
+        c->fd = ag_netprov_connect(addr, port, MQTT_CONNECT_MS);
         if (c->fd < 0) {
             ag_console_puts("no answer\n");
             return (ag_err_t)c->fd;
         }
-        (void)ag_port_net_nonblock(c->fd, true);
+        (void)ag_netprov_nonblock(c->fd, true);
     }
     ag_netio_init(&c->rd, c->fd, c->rxbuf, sizeof(c->rxbuf), 0);
     c->rd.tls = c->tls;
