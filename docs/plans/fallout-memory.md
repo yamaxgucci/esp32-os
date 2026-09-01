@@ -801,3 +801,43 @@ pixels carrying a colour cast, with the interface bar whole at the bottom.  The
 game runs; the memory figure is unchanged at 5420 KB of 6340 because in QEMU the
 framebuffer belongs to the emulated device either way.  **On hardware the panel
 is 150 KB instead of 600**, and that 450 KB is the arena's.
+
+## F8: one to one on a panel too small for the picture
+
+Reducing 640x480 to 320x240 takes Fallout's small font from eight pixels tall to
+four, and four pixels is not a letter.  `-smooth` keeps strokes from vanishing;
+it does not make them readable, and saying otherwise on the strength of one
+magnified crop of the status bar was wrong.
+
+So F8 turns the reduction off and shows a 320x240 window onto the picture,
+pixel for pixel, with the arrow keys moving it.  F8 because the game uses F1 to
+F7, F10 and F12, and patch 0013 has F11; the arrows are only swallowed while the
+mode is on.  The pointer is not doubled there - a panel pixel is a picture pixel
+- and moving the window repaints the whole panel from the engine's eight-bit
+surface, because the engine draws only what has changed and would leave the old
+view behind.
+
+**F8 works.**  The screenshot is Arroyo at full resolution with no reduction
+artefacts.
+
+**The arrow keys do not pan, and it is not the port's arithmetic.**  Measured
+properly the second time: in the reduced view the bottom two 30-row bands are
+28% and 22% near-black, which is the interface bar; after F8 and four presses of
+Down they are 4% and 2%, the same as after F8 alone.  The view did not move.
+
+What has been eliminated: the scancodes (`SDL_SCANCODE_LEFT` 80, `DOWN` 81, `UP`
+82 in the port's SDL.h, which are the HID usages `inputplay` sends), the
+interception point (the same block catches F8 through the same path), and the
+offset arithmetic (a full blit with `dstrect` null gives `dy = -pan`, the
+negative-origin clamp trims the height and the source index follows).
+
+What has not: whether the arrow keys reach the application at all.  KBDVIRT has
+swallowed keys before - see `argonos-input-harness`.  **The one-second test is
+to press an arrow with F8 off**: if the map does not scroll either, the keys are
+being lost below the port and nothing in `sdl_shim.cc` will fix it.
+
+And a note on measuring pictures: two frames of a running game always differ
+byte for byte, so an md5 comparison proves nothing.  A first pass at this used
+two coarse colour fractions over two bands, got the same numbers for different
+views, and concluded the opposite of the truth.  Bands down the whole frame are
+what separates "the view moved" from "the game animated".
