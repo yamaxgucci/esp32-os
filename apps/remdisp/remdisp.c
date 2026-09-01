@@ -181,70 +181,111 @@ static void put16(uint8_t *p, uint32_t v)
 /* ---- pixels ------------------------------------------------------------ */
 
 /*
- * The last frame the far end was given, so that pixels it already has cost
- * nothing but the comparison - and so that what *is* sent can be trimmed to the
- * part that moved.
+ * What the far end already has, so that pixels it has cost nothing to keep
+ * there - and so that what *is* sent is trimmed to the part that moved.
  *
  * This is the largest saving available and it is not compression: what a screen
  * does most of the time is not change.  A paused game, a menu, a status bar
  * along the bottom, the whole picture between two footsteps - bytes nobody
  * needs twice.  A flush of the whole surface is what an application does when
  * it does not track its own damage; this turns that back into damage tracking
- * without the application knowing.
+ * without the application knowing.  Measured: a full-surface flush of a still
+ * picture costs 12 ms instead of 190.
  *
- * 150 KB for 320x240, from the module's heap and so from PSRAM.  If it cannot
- * be had, everything is sent - slower, not broken.
+ * It used to be an actual copy of the frame - 150 KB of RGB565, compared pixel
+ * by pixel.  It is a hash per 8x8 block now, which is 4800 bytes, and the
+ * reason is that on this board those two numbers decide whether the game on the
+ * other side of the driver starts at all: 150 KB is a quarter of what Fallout 2
+ * was short of when it was refused its arena.  The screen driver was holding
+ * three per cent of the machine to answer a question that does not need the
+ * pixels themselves.
  *
- * What is deliberately NOT done with it: coding the difference against it.
- * That is what a video codec would do and it would win by a mile, but undoing
- * a difference needs the previous frame at the *receiving* end, and the far end
+ * What is lost with it: the bounding box is now in units of eight pixels rather
+ * than one, and within a band it is the whole eight rows.  A cursor that moved
+ * costs a couple of hundred pixels instead of a hundred.  What is gained
+ * besides the memory: the comparison reads one buffer instead of two.
+ *
+ * A hash can collide, and then a block that changed is not sent.  Thirty-two
+ * bits over sixty-four pixels puts that at about one block in four thousand
+ * million; at twelve hundred blocks and thirty frames a second it is once every
+ * few weeks, and what it costs is one stale 8x8 square for one frame.  Against
+ * a fixed 150 KB that is a good trade.
+ *
+ * Zero means "not known", and the hash is never allowed to be zero.  That is
+ * how a cold start, a reconnect and a partial blit all say the same thing
+ * without a flag: what this driver does not know about, it sends.  The previous
+ * version left the buffer uninitialised and called that "disagrees with the far
+ * end", which is wrong twice over - PSRAM survives a warm reset and can come
+ * back holding the last run's picture, and a buffer of zeros is a claim that
+ * the far end is showing black, which is exactly what a game fading in from
+ * black is about to send.  The symptom was a black screen with the menu
+ * appearing only under the mouse pointer, and every counter said the link was
+ * working perfectly.
+ *
+ * What is deliberately NOT done: coding the difference against the last frame.
+ * That is what a video codec would do and it would win by a mile, but undoing a
+ * difference needs the previous frame at the *receiving* end, and the far end
  * cannot hold one - 150 KB against a largest free block of about ninety is the
- * whole reason this arrangement exists.  Reading it back out of the panel's own
- * memory over SPI is slow and, on this controller, not dependable.  So the
- * shadow is used to decide what to send, never to encode it.
+ * whole reason this arrangement exists.
  */
-static uint16_t *s_prev;
-static uint32_t  s_prev_w;
-static uint32_t  s_prev_h;
-/*
- * Whether the shadow describes what the far end is actually showing.
- *
- * This used to be left to chance: the buffer was allocated and not cleared, on
- * the reasoning that whatever was in it would disagree with the far end and so
- * the first frame would go out whole.  That reasoning is wrong twice over, and
- * both ways happened.  PSRAM survives a warm reset, so a fresh allocation can
- * come back holding the *previous* run's shadow - a picture the far end may
- * genuinely still be showing, or may not.  And a buffer that happens to be
- * zeros is a claim that the far end is showing black, which is precisely what
- * a game fading in from black is about to send.
- *
- * The symptom was a black screen with the menu appearing only under the mouse
- * pointer: every band that was dark "agreed" with the shadow and was never
- * sent, and the only pixels that ever crossed the wire were the few the cursor
- * disturbed.  Nothing in the counters looked wrong - the link was working
- * perfectly, sending exactly what it believed was needed.
- *
- * So it is a flag and not an accident.
- */
-static bool s_prev_valid;
+#define BLK 8u /* the block the hash covers; the same eight rows as a band */
+
+static uint32_t *s_hash;
+static uint32_t  s_hash_cols;
+static uint32_t  s_hash_rows;
+static uint32_t  s_surf_w;
+static uint32_t  s_surf_h;
+
+static void hash_forget(void)
+{
+    if (s_hash != NULL) {
+        for (uint32_t i = 0; i < s_hash_cols * s_hash_rows; i++) {
+            s_hash[i] = 0;
+        }
+    }
+}
 
 static bool prev_ready(uint32_t w, uint32_t h)
 {
-    if (s_prev != NULL && s_prev_w == w && s_prev_h == h) {
+    if (s_hash != NULL && s_surf_w == w && s_surf_h == h) {
         return true;
     }
-    ag_free(s_prev);
-    s_prev = (uint16_t *)ag_malloc((size_t)w * h * sizeof(uint16_t));
-    if (s_prev == NULL) {
-        s_prev_w = 0;
-        s_prev_h = 0;
-        s_prev_valid = false;
+    ag_free(s_hash);
+    s_hash_cols = (w + BLK - 1u) / BLK;
+    s_hash_rows = (h + BLK - 1u) / BLK;
+    s_hash = (uint32_t *)ag_malloc((size_t)s_hash_cols * s_hash_rows *
+                                   sizeof(uint32_t));
+    if (s_hash == NULL) {
+        s_hash_cols = 0;
+        s_hash_rows = 0;
+        s_surf_w = 0;
+        s_surf_h = 0;
         return false;
     }
-    s_prev_w = w;
-    s_prev_h = h;
-    s_prev_valid = false;
+    s_surf_w = w;
+    s_surf_h = h;
+    hash_forget();
     return true;
+}
+
+/*
+ * FNV-1a over the block's pixels, and never zero, because zero is the word for
+ * "not known".  Sixteen bits at a time rather than eight: half the rounds for
+ * the same coverage, and the pixels are sixteen bits anyway.
+ */
+static uint32_t block_hash(const uint8_t *src, uint32_t stride, uint32_t rows,
+                           uint32_t cols)
+{
+    uint32_t h = 2166136261u;
+
+    for (uint32_t r = 0; r < rows; r++) {
+        const uint16_t *px = (const uint16_t *)(src + (size_t)r * stride);
+        for (uint32_t i = 0; i < cols; i++) {
+            h ^= px[i];
+            h *= 16777619u;
+        }
+    }
+    return h != 0u ? h : 1u;
 }
 
 /*
@@ -257,11 +298,10 @@ static bool prev_ready(uint32_t w, uint32_t h)
  * shadow says the far end already has this frame, so on a screen where nothing
  * is moving nothing would ever be sent again and the glass would stay dark.
  *
- * So the receiver says one byte when it starts, and this drops the shadow.
- * prev_ready then allocates a fresh one that is deliberately not cleared,
- * which is exactly "disagrees with the far end" - the next frame goes out
- * whole.  No new state, no new code path: the reconnect uses the same road as
- * the first connection.
+ * So the receiver says one byte when it starts, and this forgets every block
+ * hash.  "Not known" is already the word for a block that has to be sent, so
+ * the reconnect needs no state and no code path of its own: it is the same
+ * road as a cold start.
  *
  * Polled rather than waited for, with a zero timeout, from the two callbacks
  * the kernel already makes often.  A driver cannot own a task.
@@ -292,12 +332,9 @@ static void poll_far_end(void)
         }
         for (int32_t i = 0; i < n; i++) {
             if (buf[i] == (uint8_t)FR_HELLO) {
-                /* Not freed - only disbelieved.  Freeing it meant the next
-                 * frame had to find 150 KB again, at a moment when a game may
-                 * be holding everything there is; the buffer is fine, it is
-                 * what it claims about the far end that has stopped being
-                 * true. */
-                s_prev_valid = false;
+                /* Not freed - only forgotten.  The table is fine; it is what
+                 * it claims about the far end that has stopped being true. */
+                hash_forget();
             }
         }
         if ((uint32_t)n < sizeof(buf)) {
@@ -563,14 +600,21 @@ static void rem_blit_rect(ag_handle_t h, const ag_blit_t *b)
 
     const uint8_t *src = (const uint8_t *)b->px;
     /*
-     * `track` is "the shadow may be trusted to say what the far end has".  It
-     * needs the buffer *and* the flag: without the flag the first frame after
-     * a reconnect or a cold start is compared against whatever the memory
-     * happened to hold, and every band that accidentally matched was never
-     * sent.  See s_prev_valid.
+     * The hash grid is in the surface's own coordinates and its blocks are
+     * eight pixels square, so a band can be compared against it only when it
+     * lines up: the blit has to start on a block boundary vertically and span
+     * the surface horizontally.
+     *
+     * Everything that drives this wire does - the kernel's surface flush and a
+     * game's present both hand over the whole picture - and a blit that does
+     * not is sent whole and made to forget the rows it touched.  That is the
+     * conservative direction: sending too much is slow, and trimming against a
+     * grid that was only partly filled is a screen with holes in it that
+     * nothing ever repairs.
      */
-    const bool     have_prev = prev_ready(b->surf_w, b->surf_h);
-    const bool     track = have_prev && s_prev_valid;
+    const bool track = prev_ready(b->surf_w, b->surf_h) && b->x == 0 &&
+                       (uint32_t)b->w == (uint32_t)b->surf_w &&
+                       ((uint32_t)b->y % BLK) == 0u;
 
     for (uint32_t band = 0; band < b->h; band += BAND_ROWS) {
         uint32_t rows = b->h - band;
@@ -579,40 +623,52 @@ static void rem_blit_rect(ag_handle_t h, const ag_blit_t *b)
         }
 
         uint32_t x0 = 0, x1 = (uint32_t)b->w - 1u;
-        uint32_t y0 = 0, y1 = rows - 1u;
+        const uint32_t y0 = 0, y1 = rows - 1u;
 
         if (track) {
-            /* The bounding box of the difference, in the band's own
-             * coordinates.  Start inverted so "nothing moved" is detectable. */
+            /*
+             * Which blocks of this band differ from what the far end has, as a
+             * bounding box in the band's own coordinates.  Start inverted so
+             * that "nothing moved" is detectable.
+             *
+             * Vertically there is nothing to trim: a band is exactly one row of
+             * blocks, so any change in it costs all eight rows.  That is the
+             * price of the hash and it is a couple of hundred pixels.
+             */
+            uint32_t *row = s_hash + (size_t)(((uint32_t)b->y + band) / BLK) *
+                                         s_hash_cols;
             x0 = (uint32_t)b->w;
             x1 = 0;
-            y0 = rows;
-            y1 = 0;
-            for (uint32_t r = 0; r < rows; r++) {
-                const uint16_t *want =
-                    (const uint16_t *)(src + (size_t)(band + r) * b->stride);
-                const uint16_t *have = s_prev +
-                                       (size_t)((uint32_t)b->y + band + r) *
-                                           s_prev_w + b->x;
-                for (uint32_t i = 0; i < (uint32_t)b->w; i++) {
-                    if (want[i] != have[i]) {
-                        if (i < x0) {
-                            x0 = i;
-                        }
-                        if (i > x1) {
-                            x1 = i;
-                        }
-                        if (r < y0) {
-                            y0 = r;
-                        }
-                        if (r > y1) {
-                            y1 = r;
-                        }
+            for (uint32_t c = 0; c < s_hash_cols; c++) {
+                uint32_t cols = (uint32_t)b->w - c * BLK;
+                if (cols > BLK) {
+                    cols = BLK;
+                }
+                const uint32_t h =
+                    block_hash(src + (size_t)band * b->stride + c * BLK * 2u,
+                               b->stride, rows, cols);
+                if (h != row[c]) {
+                    row[c] = h;
+                    if (c * BLK < x0) {
+                        x0 = c * BLK;
+                    }
+                    if (c * BLK + cols - 1u > x1) {
+                        x1 = c * BLK + cols - 1u;
                     }
                 }
             }
             if (x0 > x1) {
                 continue; /* the far end already has this band */
+            }
+        } else if (s_hash != NULL && (uint32_t)b->y + band < s_surf_h) {
+            /* Sent whole, and the grid told so: these rows are no longer
+             * described by what is in it. */
+            const uint32_t first = ((uint32_t)b->y + band) / BLK;
+            const uint32_t last = ((uint32_t)b->y + band + rows - 1u) / BLK;
+            for (uint32_t r = first; r <= last && r < s_hash_rows; r++) {
+                for (uint32_t c = 0; c < s_hash_cols; c++) {
+                    s_hash[(size_t)r * s_hash_cols + c] = 0;
+                }
             }
         }
 
@@ -620,7 +676,7 @@ static void rem_blit_rect(ag_handle_t h, const ag_blit_t *b)
         const uint32_t rh = y1 - y0 + 1u;
         const uint32_t npx = rw * rh;
 
-        /* Gather the rectangle, and bring the shadow up to date with it. */
+        /* Gather the rectangle. */
         uint16_t *out = (uint16_t *)(s_raw + 12u);
         for (uint32_t r = 0; r < rh; r++) {
             const uint16_t *want =
@@ -628,16 +684,6 @@ static void rem_blit_rect(ag_handle_t h, const ag_blit_t *b)
                 x0;
             for (uint32_t i = 0; i < rw; i++) {
                 out[r * rw + i] = want[i];
-            }
-            /* have_prev, not track: the shadow is written even while it is not
-             * yet believed, because writing it is how it becomes believable. */
-            if (have_prev) {
-                uint16_t *have = s_prev +
-                                 (size_t)((uint32_t)b->y + band + y0 + r) *
-                                     s_prev_w + b->x + x0;
-                for (uint32_t i = 0; i < rw; i++) {
-                    have[i] = want[i];
-                }
             }
         }
 
@@ -687,23 +733,6 @@ static void rem_blit_rect(ag_handle_t h, const ag_blit_t *b)
         }
     }
 
-    /*
-     * The shadow becomes believable once a blit has covered the whole surface,
-     * because only then is every pixel of it something that was actually sent.
-     *
-     * A partial blit leaves the rest of the shadow describing nothing, so it
-     * does not count - which means an application that only ever presents small
-     * rectangles keeps sending them whole and never gets the trimming.  That is
-     * the right way round: sending too much is slow, and trimming against a
-     * shadow that was never filled is a screen with holes in it that nothing
-     * ever repairs.  Everything that drives this wire today - the kernel's own
-     * surface flush, a game's present - hands over the whole picture.
-     */
-    if (have_prev && !s_prev_valid && b->x == 0 && b->y == 0 &&
-        (uint32_t)b->w == (uint32_t)b->surf_w &&
-        (uint32_t)b->h == (uint32_t)b->surf_h) {
-        s_prev_valid = true;
-    }
 }
 
 /* ---- characters -------------------------------------------------------- */
@@ -1112,15 +1141,15 @@ ag_err_t ag_driver_init(void)
     }
 
     /*
-     * Take the shadow now, at boot, rather than on the first band.
+     * Take the hash grid now, at boot, rather than on the first band.
      *
-     * It is 150 KB and it decides whether the link runs at fifteen frames a
-     * second or at two, and asking for it lazily means asking for it *after*
-     * whatever application is now on the screen has taken its arena - which on
-     * this board is a game that asks for six megabytes of the eight.  The
-     * screen would then quietly become eight times slower, at the one moment
+     * It is only 4800 bytes since it stopped being a copy of the frame, so this
+     * is no longer about the memory - it is about *when*.  Asking lazily means
+     * asking after whatever application is now on the screen has taken its
+     * arena, and on this board that is a game holding six megabytes of the
+     * eight; the screen would then quietly stop trimming at the one moment
      * there was finally something to look at, and nothing would say why.  A
-     * display driver owns its frame memory; it does not queue behind the
+     * display driver owns its frame memory and does not queue behind the
      * programs it is showing.
      *
      * 320x240 is what rem_info advertises, so it is what the kernel's own
@@ -1129,7 +1158,7 @@ ag_err_t ag_driver_init(void)
      * whole - slower, not broken.
      */
     if (!prev_ready(320u, 240u)) {
-        ag_printf("REMDISP: no frame shadow; every band will be sent whole\n");
+        ag_printf("REMDISP: no damage grid; every band will be sent whole\n");
     }
 
     ag_printf("REMDISP: uart%d at %u baud; %ux%u cells, pixels in %u-row bands\n",

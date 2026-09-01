@@ -53,15 +53,31 @@ StartingMap=%s
 
 
 def shell(port, cmds, timeout=120, reset=True):
-    """Send commands to the board and return the raw transcript."""
+    """
+    Send commands to the board and return the raw transcript.
+
+    A timeout is not an error here and must not end the run.  boardtest waits
+    for a prompt, and an application that has taken the console never gives one
+    back - which is the normal case for the thing this script exists to run.
+    The transcript is on disk either way, and the next phase resets the board.
+    A version that let the exception out lost a whole configuration of a sweep
+    to a game that was working perfectly.
+    """
     argv = [sys.executable, BOARDTEST, "-p", port, "--timeout", str(timeout)]
     if not reset:
         argv.append("--no-reset")
     argv += cmds
-    subprocess.run(argv, capture_output=True, timeout=timeout + 60)
+    try:
+        subprocess.run(argv, capture_output=True, timeout=timeout + 60)
+    except subprocess.TimeoutExpired:
+        print("  (no prompt back; the application still has the console)",
+              flush=True)
     log = os.path.join(ROOT, "build", "board.log")
-    with open(log, "rb") as f:
-        return f.read().decode("latin-1")
+    try:
+        with open(log, "rb") as f:
+            return f.read().decode("latin-1")
+    except OSError:
+        return ""
 
 
 def strip_ansi(s):
