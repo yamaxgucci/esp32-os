@@ -508,6 +508,11 @@ void sdl_shim_memstat(int every_ms, int trace_kb, int trace_max,
  * engine makes many small ones.
  */
 static uint32_t s_fps_ms;
+
+/* Events as they arrive, before the engine has an opinion about them. */
+static uint32_t s_ev_keys;
+static uint32_t s_ev_ptr_move;
+static uint32_t s_ev_ptr_btn;
 static uint32_t s_fps_next;
 static uint32_t s_frames;
 static uint64_t s_blit_us;
@@ -595,6 +600,21 @@ static void fps_service(void)
                   ag_heap_system_bytes / 1024u, ag_heap_system_blocks,
                   ag_tiledist_calls, ag_tiledist_steps,
                   ag_tiledist_gaveup);
+        /*
+         * And what the hands did, because on a board that is the question
+         * nobody can answer by looking.  The screen is at the far end of a
+         * wire and the console is somewhere else again, so "the mouse does
+         * nothing" has no evidence behind it either way - a pointer that never
+         * reaches the game and a game that ignores it look identical.  These
+         * are counted where the events arrive, before the engine sees them.
+         */
+        shim_printf("[input t=%u] %u keys, %u pointer moves, %u buttons "
+                  "(in the window)\n",
+                  (unsigned)ag_millis(), (unsigned)s_ev_keys,
+                  (unsigned)s_ev_ptr_move, (unsigned)s_ev_ptr_btn);
+        s_ev_keys = 0;
+        s_ev_ptr_move = 0;
+        s_ev_ptr_btn = 0;
     }
     ag_tiledist_calls = 0;
     ag_tiledist_steps = 0;
@@ -1068,21 +1088,43 @@ int SDL_UpperBlit(SDL_Surface *src, const SDL_Rect *srcrect, SDL_Surface *dst,
             }
         }
     } else if (!s_scale_sharp) {
+        /*
+         * The reduction, and it is the second most expensive thing in a frame:
+         * measured on the board at 10.5 ms against 34 ms of engine and 7 ms of
+         * putting the picture on the wire.  Most of that is memory - 300 KB
+         * read and 150 KB written per frame, and the read is strided so the
+         * cache lines are half wasted - but the arithmetic was not helping.
+         *
+         * The source column and both of its bounds checks are the same
+         * expression for every row and depend on x only through a shift, so
+         * the range of x that lands inside the source is computed once here
+         * and the inner loop walks a pointer.  Which x are in range:
+         *
+         *   sxx(x) = base + (x << shift),  base = sx + (ddx << shift) - dx
+         *   sxx >= 0        =>  x >= ceil(-base / step)
+         *   sxx <= src->w-1 =>  x <  ceil((src->w - base) / step)
+         */
+        const int base = sx + ((ddx << shift) - dx);
+        int       x0 = (base < 0) ? (((-base) + step - 1) >> shift) : 0;
+        int       x1 = ddw;
+        {
+            const int room = src->w - base;
+            const int lim = (room <= 0) ? 0 : ((room + step - 1) >> shift);
+            if (lim < x1) {
+                x1 = lim;
+            }
+        }
         for (int y = 0; y < ddh; ++y) {
             const int syy = sy + (((ddy + y) << shift) - dy);
             if (syy < 0 || syy >= src->h) {
                 continue;
             }
-            const Uint8 *s =
-                (const Uint8 *)src->pixels + (size_t)syy * src->pitch;
-            Uint16 *d = (Uint16 *)((Uint8 *)dst->pixels +
-                                   (size_t)(ddy + y) * dst->pitch) + ddx;
-            for (int x = 0; x < ddw; ++x) {
-                const int sxx = sx + (((ddx + x) << shift) - dx);
-                if (sxx < 0 || sxx >= src->w) {
-                    continue;
-                }
-                d[x] = lut[s[sxx]];
+            const Uint8 *sp = (const Uint8 *)src->pixels +
+                              (size_t)syy * src->pitch + base + (x0 << shift);
+            Uint16 *dp = (Uint16 *)((Uint8 *)dst->pixels +
+                                    (size_t)(ddy + y) * dst->pitch) + ddx + x0;
+            for (int x = x0; x < x1; ++x, sp += step) {
+                *dp++ = lut[*sp];
             }
         }
     } else {
@@ -2005,6 +2047,7 @@ static void pump(void)
         switch (e.type) {
         case AG_EV_KEY_DOWN:
         case AG_EV_KEY_UP: {
+            s_ev_keys++;
             const SDL_Scancode sc = scancode_of(e.key.keycode);
             if (sc == SDL_SCANCODE_UNKNOWN) {
                 continue;
@@ -2053,6 +2096,11 @@ static void pump(void)
         case AG_EV_POINTER_DOWN:
         case AG_EV_POINTER_UP:
         case AG_EV_POINTER_MOVE: {
+            if (e.type == AG_EV_POINTER_MOVE) {
+                s_ev_ptr_move++;
+            } else {
+                s_ev_ptr_btn++;
+            }
             /*
              * The pointer arrives in screen coordinates; the engine wants
              * movement.  MOUSEVIRT leaves dx and dy at zero and sends where
