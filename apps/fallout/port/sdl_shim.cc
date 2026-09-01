@@ -182,20 +182,22 @@ static int s_frame_pitch;
 static int s_dirty_x0, s_dirty_y0, s_dirty_x1, s_dirty_y1;
 
 /*
- * Which pixel of a block survives the reduction.
+ * What a block of the picture becomes on a smaller panel.
  *
  * Nearest is every second pixel of every second row, which is right for a
  * photograph and wrong for a font: a stroke one pixel wide survives half the
- * time, and Fallout's interface is full of them.  Sharp keeps, out of each
- * 2x2, the pixel that differs most from the block's average brightness - so a
- * light stroke on dark and a dark stroke on light both come through, which
- * matters because this game has both (the bottom bar is green on black, the
- * character sheet is dark on tan).
+ * time, and Fallout's interface is full of them.
  *
- * It costs four palette lookups and a dozen arithmetic operations per output
- * pixel against one, on a quarter as many pixels: about the same total as the
- * unreduced blit it replaces.  Off by default all the same, because a reduced
- * panel is already a compromise and this is a second one.
+ * The first attempt kept, out of each 2x2, the pixel whose brightness differed
+ * most from the block's average - the reasoning being that a light stroke on
+ * dark and a dark stroke on light would both come through, since this game has
+ * both.  Measured against nearest on the interface bar, it was worse: on a
+ * textured panel the outlier is a speck of background more often than it is a
+ * stroke, so the text came out scattered.
+ *
+ * So: average the four.  It cannot lose a stroke, only dim one, and it is what
+ * a hardware scaler would do.  Twelve table lookups and a dozen adds per output
+ * pixel against one lookup, on a quarter as many pixels.
  */
 static int s_scale_sharp;
 
@@ -765,13 +767,16 @@ int SDL_SetPaletteColors(SDL_Palette *palette, const SDL_Color *colors,
  * fade is.
  */
 /*
- * How bright each palette entry is, on the same schedule as the colour table.
+ * The palette again, split into channels, on the same schedule as the colour
+ * table.
  *
- * Only the reducing blit wants it, and only to decide which pixel of a block
- * to keep.  Rec. 601 weights, rounded to 77/151/28 out of 256, on the eight-bit
- * channels the palette carries.
+ * Only the reducing blit wants these, and only so that four pixels can be
+ * averaged without unpacking four RGB565 words to do it.  Five, six and five
+ * bits, ready to be summed four at a time and shifted back down.
  */
-static Uint8 s_lum[256];
+static Uint8 s_pal_r[256];
+static Uint8 s_pal_g[256];
+static Uint8 s_pal_b[256];
 
 static const Uint16 *palette_lut(const SDL_Palette *pal)
 {
@@ -783,8 +788,9 @@ static const Uint16 *palette_lut(const SDL_Palette *pal)
         const int n = pal->ncolors < 256 ? pal->ncolors : 256;
         for (int i = 0; i < n; ++i) {
             const SDL_Color c = pal->colors[i];
-            s_lum[i] = (Uint8)(((unsigned)c.r * 77u + (unsigned)c.g * 151u +
-                                (unsigned)c.b * 28u) >> 8);
+            s_pal_r[i] = (Uint8)(c.r >> 3);
+            s_pal_g[i] = (Uint8)(c.g >> 2);
+            s_pal_b[i] = (Uint8)(c.b >> 3);
             lut[i] = (Uint16)(((c.r & 0xF8u) << 8) | ((c.g & 0xFCu) << 3) |
                               (c.b >> 3));
         }
@@ -942,42 +948,14 @@ int SDL_UpperBlit(SDL_Surface *src, const SDL_Rect *srcrect, SDL_Surface *dst,
                 const Uint8 p2 = r1[sxx];
                 const Uint8 p3 = r1[sxx2];
 
-                const int l0 = s_lum[p0];
-                const int l1 = s_lum[p1];
-                const int l2 = s_lum[p2];
-                const int l3 = s_lum[p3];
-                const int mean = (l0 + l1 + l2 + l3) >> 2;
+                const unsigned rr = ((unsigned)s_pal_r[p0] + s_pal_r[p1] +
+                                     s_pal_r[p2] + s_pal_r[p3]) >> 2;
+                const unsigned gg = ((unsigned)s_pal_g[p0] + s_pal_g[p1] +
+                                     s_pal_g[p2] + s_pal_g[p3]) >> 2;
+                const unsigned bb = ((unsigned)s_pal_b[p0] + s_pal_b[p1] +
+                                     s_pal_b[p2] + s_pal_b[p3]) >> 2;
 
-                int best = p0;
-                int bestd = l0 - mean;
-                if (bestd < 0) {
-                    bestd = -bestd;
-                }
-                int dd = l1 - mean;
-                if (dd < 0) {
-                    dd = -dd;
-                }
-                if (dd > bestd) {
-                    bestd = dd;
-                    best = p1;
-                }
-                dd = l2 - mean;
-                if (dd < 0) {
-                    dd = -dd;
-                }
-                if (dd > bestd) {
-                    bestd = dd;
-                    best = p2;
-                }
-                dd = l3 - mean;
-                if (dd < 0) {
-                    dd = -dd;
-                }
-                if (dd > bestd) {
-                    best = p3;
-                }
-
-                d[x] = lut[best];
+                d[x] = (Uint16)((rr << 11) | (gg << 5) | bb);
             }
         }
     }
