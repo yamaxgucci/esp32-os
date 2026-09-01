@@ -63,6 +63,23 @@ static ag_err_t from_esp(esp_err_t err)
 
 static void fill(uart_config_t *out, const ag_port_uart_cfg_t *cfg)
 {
+    /*
+     * Zero first, and here rather than at the one call site, so that adding a
+     * second caller cannot lose it again.
+     *
+     * IDF keeps growing uart_config_t - rx_flow_ctrl_thresh, and then a flags
+     * word whose allow_pd bit asks for sleep retention that this UART does not
+     * have - and every field this function does not know about is a field read
+     * off the stack.  What that produces is not a compile error and not a
+     * consistent runtime one either: uart_param_config refuses the port only
+     * when the garbage happens to carry the wrong bit, so the same call can
+     * succeed at one baud rate and fail at the next, and the error names light
+     * sleep rather than anything the caller did.  Here it arrived as
+     * `uart1 at 921600 baud: input/output error` from an application, while
+     * 115200 through the same path worked.
+     */
+    *out = (uart_config_t){0};
+
     static const uart_word_length_t k_bits[] = {
         UART_DATA_5_BITS, UART_DATA_6_BITS, UART_DATA_7_BITS, UART_DATA_8_BITS,
     };
