@@ -76,8 +76,19 @@
  * picture run behind the game.  The port halves it until it fits, so the CYD
  * asking for the same number is not a board that fails to open its port.
  */
-#define AG_IO_UART_RX_BUF 16384
+#define AG_IO_UART_RX_BUF 32768
 #define AG_IO_UART_TX_BUF 32768
+/*
+ * Thirty-two for receive as well, now.  The note above about the CYD not
+ * having 32 KB in one piece was true while that board also started a Wi-Fi
+ * stack at boot; it does not any more - it is a monitor, and the radio was
+ * costing it seventy kilobytes to do nothing - and with 108 KB in its largest
+ * block the ring fits.  The port halves each buffer until the pair fits,
+ * transmit first, so a board that still cannot have it gets a smaller one and
+ * works rather than failing to open the port.  What the sixteen was costing:
+ * eight per cent of the picture's bands corrupted at full load and none at a
+ * fifth of it, which is a receiver falling behind, not a line.
+ */
 
 /*
  * A caller with more to send than AG_PORT_SPI_MAX_XFER splits it, and a chip

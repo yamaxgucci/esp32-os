@@ -174,17 +174,31 @@ ag_err_t ag_port_uart_open(int port, const ag_port_uart_cfg_t *cfg,
          * which is what a fixed 32 KB did, and it came out as a screen that
          * stayed dark.
          */
+        /*
+         * Receive first, transmit second: the transmit buffer is halved all
+         * the way down before the receive buffer gives up a byte.  On the
+         * board that is short of memory - the CYD, the far end of the picture
+         * link - what matters is not losing what arrives at four megabaud
+         * while a band is being written to the panel, and what it sends back
+         * is a byte now and then.  A receiver with 32 KB of ring and 256 bytes
+         * of transmit is the right shape for it; the other way round was the
+         * shape it had, and it lost eight per cent of the bands under load.
+         */
         esp_err_t rc = ESP_FAIL;
-        uint32_t  tx = tx_bytes;
+        uint32_t  rx = rx_bytes ? rx_bytes : 1024u;
         for (;;) {
-            rc = uart_driver_install(port, (int)rx_bytes, (int)tx, 0, NULL, 0);
-            if (rc == ESP_OK || rc == ESP_ERR_INVALID_STATE) {
+            uint32_t tx = tx_bytes ? tx_bytes : 256u;
+            for (;;) {
+                rc = uart_driver_install(port, (int)rx, (int)tx, 0, NULL, 0);
+                if (rc == ESP_OK || rc == ESP_ERR_INVALID_STATE || tx <= 256u) {
+                    break;
+                }
+                tx /= 2u;
+            }
+            if (rc == ESP_OK || rc == ESP_ERR_INVALID_STATE || rx <= 1024u) {
                 break;
             }
-            if (tx <= 256u) {
-                break;
-            }
-            tx /= 2u;
+            rx /= 2u;
         }
         if (rc != ESP_OK && rc != ESP_ERR_INVALID_STATE) {
             return from_esp(rc);
