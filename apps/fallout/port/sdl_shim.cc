@@ -2219,6 +2219,8 @@ static unsigned s_hud_slow_pct;
 static unsigned s_hud_eng_ms, s_hud_blit_ms, s_hud_wire_ms, s_hud_wire_kbs;
 static unsigned s_hud_worst_ms, s_hud_worst_eng_ms, s_hud_worst_wire_ms;
 static bool     s_hud_async;
+static uint32_t s_io_misses_last;
+static unsigned s_hud_io_bad;
 static unsigned s_hud_used_kb, s_hud_hole_kb;
 
 /*
@@ -2331,6 +2333,43 @@ static void hud_tick(void)
     }
 
     /*
+     * The card, which is the one failure that looks exactly like a hang.
+     *
+     * Fallout reads from the card on every frame - art, sounds, the music
+     * stream - and does not check most of those reads.  When the card stops
+     * answering, which this one does (`sdmmc_init_ocr ... 0x107`, and only
+     * unplugging the board fixes it), the engine keeps looping: the frame rate
+     * stays where it was, the readout keeps printing sixty a second, the
+     * picture stops changing and the sound stops.  It cost two evenings and
+     * two reports of a game that had frozen while the board was measurably
+     * running at fifty frames a second.
+     *
+     * An open that finds nothing is already counted, and when the card goes
+     * every open finds nothing.  So a spike in that number is the card, said
+     * out loud, once.
+     */
+    {
+        const uint32_t misses = ag_libc_io_misses();
+        if (misses < s_io_misses_last) {
+            s_io_misses_last = 0; /* the counters were reset under us */
+        }
+        const uint32_t d = misses - s_io_misses_last;
+        s_io_misses_last = misses;
+        if (d >= 8u) {
+            s_hud_io_bad = 4; /* seconds of complaint left on the glass */
+            if (s_events) {
+                shim_printf("[ev t=%u] the filesystem is not answering: "
+                            "%u opens found nothing in the last second - if "
+                            "this does not stop, the card has dropped out and "
+                            "the board needs its power taken away\n",
+                            (unsigned)now, (unsigned)d);
+            }
+        } else if (s_hud_io_bad > 0u) {
+            s_hud_io_bad--;
+        }
+    }
+
+    /*
      * A level change: the mean has settled a third below or half above the
      * level last reported.  Two thresholds rather than one, because a drop is
      * what gets noticed and a recovery only matters once it is clearly back.
@@ -2431,7 +2470,12 @@ static void hud_draw(void)
     x = hud_text(x, 1, "LO", white);
     x = hud_number(x + 2, 1, s_hud_slow_pct, 2,
                    (s_hud_slow_pct >= 20u) ? 0xF800u : 0x07E0u);
-    (void)hud_text(x, 1, "%", white);
+    x = hud_text(x, 1, "%", white);
+    /* The card, in red, when it has stopped answering - the one fault that
+     * otherwise looks like a frame rate that is fine and a game that is not. */
+    if (s_hud_io_bad != 0u) {
+        (void)hud_text(x + 3, 1, "IO", 0xF800u);
+    }
 
     /*
      * Row two: where it went, and this is the row the whole readout exists
