@@ -798,17 +798,32 @@ static int32_t io_uart_write(int port, const void *buf, size_t len)
         return -AG_EINVAL;
     }
 
+    /*
+     * The lock covers the bring-up and nothing else.
+     *
+     * It used to be held across the write as well, and the write blocks: with
+     * a transmit buffer, uart_write_bytes waits for the peripheral to make
+     * room, and a port carrying a picture at four megabaud is full most of
+     * the time.  One io lock covers every UART, and the console is a UART.  So
+     * a thread blocked in a write to the picture link held the lock the
+     * console needed to print, and anything that then printed - the game's
+     * readout, the shell, the kernel's own log - waited behind the wire.  The
+     * evening it was found, the whole board went quiet at once: no readout, no
+     * prompt, not even Ctrl+\, with the game and the kernel both alive and
+     * both waiting on a mutex held by a task that was waiting on a UART.
+     *
+     * The port's write is safe to call without this lock - the driver
+     * serialises writes to one port itself - and two ports have nothing to
+     * serialise between them.
+     */
     lock();
-    ag_err_t err = uart_bring_up(port, NULL);
-    int32_t  n = err;
-    if (err == AG_OK) {
-        n = ag_port_uart_write(port, buf, len);
-        if (n < 0) {
-            n = -AG_EIO;
-        }
-    }
+    const ag_err_t err = uart_bring_up(port, NULL);
     unlock();
-    return n;
+    if (err != AG_OK) {
+        return err;
+    }
+    const int32_t n = ag_port_uart_write(port, buf, len);
+    return (n < 0) ? -AG_EIO : n;
 }
 
 static int32_t io_uart_read(int port, void *buf, size_t len,
