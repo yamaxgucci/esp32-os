@@ -921,6 +921,26 @@ enum ag_ioctl_cmd {
      */
     AG_IOC_DISPLAY_BACKLIGHT = AG_IOC(AG_DEV_DISPLAY, 1),
 
+    /*
+     * Optional: arg is a pointer to an int, non-zero to let the driver send
+     * only the part of a rectangle that differs from what it believes the
+     * screen already has.
+     *
+     * It exists to be turned *off*.  A driver at the end of a wire keeps a
+     * record of the far end so that a screen which has not changed costs
+     * nothing, and that record is the only piece of state in the whole path
+     * that can be wrong: when it says the far end has a block it does not, the
+     * picture stays wrong until some slow repair reaches it.  Turning the
+     * trimming off sends every rectangle whole - one full screen is a quarter
+     * of a second of a four megabaud line, and it cannot be wrong.  That is
+     * the floor to measure everything else against, and the answer when a
+     * picture is misbehaving and nobody knows whose fault it is.
+     *
+     * A driver that always sends everything anyway answers -AG_ENOTSUP, which
+     * is not an error - it is the answer.
+     */
+    AG_IOC_DISPLAY_TRIM = AG_IOC(AG_DEV_DISPLAY, 2),
+
     AG_IOC_AUDIO_GETFMT = AG_IOC(AG_DEV_AUDIO, 1),
     AG_IOC_AUDIO_SETFMT = AG_IOC(AG_DEV_AUDIO, 2),
     /* Optional: arg ag_audio_stats_t (pcmvirt/pcmmix; pcmnull returns zeros). */

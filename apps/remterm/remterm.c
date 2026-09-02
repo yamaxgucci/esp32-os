@@ -8,7 +8,7 @@
  * the same idea as VGA or HDMI, with a thinner cable and a protocol that admits
  * it.
  *
- *   run c:\remterm.axe [baud] [secs]   4000000 by default; any key stops it,
+ *   run c:\remterm.axe [baud] [secs]   4000000 by default; Esc stops it,
  *                                      and so does `secs` if it is not zero
  *
  * The two kinds of traffic are drawn two different ways, and the difference is

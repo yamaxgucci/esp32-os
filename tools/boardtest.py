@@ -102,8 +102,27 @@ class Board:
         # because the I/O is still pending; the only cure is unplugging the
         # cable.  With one, a stuck write raises after 30 s and the process
         # exits, leaving the port openable so a reset can recover the board.
-        self.ser = serial.Serial(port, baud, timeout=0.05, xonxoff=True,
+        #
+        # Opened with DTR and RTS already low, because opening a port is a
+        # reset.
+        #
+        # Every USB-serial bridge on these boards wires DTR and RTS to EN and
+        # IO0 so that a flashing tool can restart the chip, and pyserial
+        # asserts both by default the moment the port opens.  So a command
+        # meant only to *watch* a board restarts it - which is fine when the
+        # next thing is a reset anyway and is not fine at all under --no-reset,
+        # where the whole point is to look at something that is running.
+        #
+        # It cost an evening in the shape of a receiver that kept "going
+        # quiet": every time its counters were read, the board it was running
+        # on was rebooted by the reading.
+        #
+        self.ser = serial.Serial(baudrate=baud, timeout=0.05, xonxoff=True,
                                  write_timeout=30)
+        self.ser.port = port
+        self.ser.dtr = False
+        self.ser.rts = False
+        self.ser.open()
         self.log = log
         self.echo = echo
         self.buf = bytearray()

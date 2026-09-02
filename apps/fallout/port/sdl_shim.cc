@@ -227,13 +227,63 @@ static uint32_t s_flush_rows = 64;
  * rectangle the engine touched, sixty times a second, and now runs once per
  * send - four times a second when the wire is the limit.
  */
-/* -syncsend turns the thread off, so the two can be compared without a
- * rebuild. */
+/*
+ * Off by default, and that is a retreat made on purpose.
+ *
+ * A thread of its own is the right shape and it measured well - the game's
+ * frame rate stopped containing the wire at all.  It also introduced a way for
+ * the picture to stop for ever that did not exist before: everything the
+ * engine draws is held back while a send is in flight, so if a send never
+ * finishes, nothing is ever reduced, nothing is ever sent, and the game runs
+ * on at sixty frames a second in front of a screen that has frozen.  That was
+ * reported as the game hanging, and the game was fine.
+ *
+ * There is a watchdog for it now, below, and the reason it stalled turned out
+ * to be a priority rather than anything structural - see where the thread is
+ * created.  So it is on again, with a three second net under it: a send that
+ * has not finished by then gives up on the thread altogether and the port
+ * falls back to sending on the game's thread, which is slower and has no state
+ * to get stuck in.  -sync asks for that from the start.
+ */
 static int         s_send_async = 1;
 
-void sdl_shim_syncsend(int on)
+void sdl_shim_async(int on)
 {
-    s_send_async = on ? 0 : 1;
+    s_send_async = on ? 1 : 0;
+}
+
+/*
+ * -dumb: tell the panel driver to stop trimming.
+ *
+ * Every rectangle then goes out whole - a full screen is about a quarter of a
+ * second of the wire - and no part of the picture can be wrong, because
+ * nothing is remembered about what the far end has.  It is slower and it is
+ * the floor: when the screen is misbehaving and it is not clear whose state is
+ * lying, this is the run that says whether any state is involved at all.
+ */
+static int s_dumb;
+
+void sdl_shim_dumb(int on)
+{
+    s_dumb = on ? 1 : 0;
+}
+
+static void panel_trim_apply(void)
+{
+    const ag_handle_t h = ag_dev_open("/dev/rem0");
+    if (h < 0) {
+        ag_printf("SDL: no /dev/rem0, so -dumb has nothing to ask\n");
+        return;
+    }
+    int trim = s_dumb ? 0 : 1;
+    const ag_err_t err = ag_dev_ioctl(h, AG_IOC_DISPLAY_TRIM, &trim,
+                                      sizeof(trim));
+    ag_printf("SDL: the panel driver %s\n",
+              (err == AG_OK)
+                  ? (s_dumb ? "will send every rectangle whole"
+                            : "will trim rectangles as usual")
+                  : "does not know how to stop trimming");
+    ag_dev_close(h);
 }
 
 static ag_mutex_t  s_send_lock;
@@ -249,6 +299,9 @@ static int s_send_x, s_send_y, s_send_w, s_send_h;
  * coordinates - which for this path are the panel's as well, because
  * _GNW95_ShowRect passes the same origin for the source and the destination. */
 static int  s_defer_x0, s_defer_y0, s_defer_x1, s_defer_y1;
+
+/* When the send in flight started, for the watchdog in SDL_RenderPresent. */
+static uint32_t s_send_watch_ms;
 
 static void defer_none(void)
 {
@@ -1847,12 +1900,40 @@ SDL_Window *SDL_CreateWindow(const char *title, int x, int y, int w, int h,
          * runs; if it cannot be started the port falls back to sending on the
          * game's thread, which is what it did before and is merely slower.
          */
+        if (s_dumb) {
+            panel_trim_apply();
+        }
+
         if (s_send_async && s_gfx.fb != NULL) {
             s_send_lock = ag_mutex_create();
             s_send_go = ag_sem_create(0, 1);
             if (s_send_go != NULL) {
+                /*
+                 * Priority six, above the game's five, and that is the whole
+                 * of why the first version did not work.
+                 *
+                 * The last argument of ag_thread_create is flags, not a core -
+                 * this thread was written as if it could be pinned to the
+                 * other one, and it cannot.  It runs beside the game on the
+                 * application core, and it was created at priority three
+                 * against a game that runs at five and is runnable about three
+                 * quarters of the time.  So the wire got the scraps: the game
+                 * reached sixty frames a second because it no longer waited
+                 * for anything, and the picture crawled out a band at a time
+                 * because the thing sending it almost never ran.  Reported as
+                 * "the transmission got worse", which it had.
+                 *
+                 * Above the game is right rather than greedy.  This thread
+                 * spends its life blocked in a write to a four megabaud line,
+                 * so it preempts the game, hands its bytes over and goes back
+                 * to sleep; the CPU it takes is the CPU the wire is worth.
+                 *
+                 * Eight kilobytes of stack, not four: the path goes through
+                 * the kernel's display layer and into a loadable driver, and
+                 * four was a guess with nothing behind it.
+                 */
                 s_send_thread = ag_thread_create(sender_task, NULL, "fowire",
-                                                 4096, 3, 0);
+                                                 8192, 6, 0);
             }
             ag_printf("SDL: the wire %s\n",
                       s_send_thread != NULL
@@ -2623,6 +2704,38 @@ void SDL_RenderPresent(SDL_Renderer *r)
 
         /* The readout's numbers first; they are arithmetic and cost nothing. */
         hud_tick();
+
+        /*
+         * A send that never finishes must not freeze the picture for ever.
+         *
+         * While one is in flight nothing is reduced into the panel buffer -
+         * that is what keeps a snapshot whole - so a sender that has died,
+         * faulted or blocked takes the whole screen with it, silently, while
+         * every other number stays perfect.  Three seconds is far longer than
+         * the slowest possible send (a whole screen is about a quarter of a
+         * second), so a flag still set after that is not slowness.
+         *
+         * The recovery is to give up on the thread rather than to poke it: it
+         * has already failed once and the picture matters more than the frame
+         * rate.  Said out loud, because a port that silently changes how it
+         * works is a port that cannot be measured.
+         */
+        if (s_send_busy) {
+            const uint32_t now = (uint32_t)ag_millis();
+            if (s_send_watch_ms == 0u) {
+                s_send_watch_ms = now;
+            } else if ((now - s_send_watch_ms) > 3000u) {
+                shim_printf("[ev t=%u] the wire's thread has not finished a "
+                            "send in %u ms - dropping back to sending on the "
+                            "game's thread\n",
+                            (unsigned)now, (unsigned)(now - s_send_watch_ms));
+                s_send_thread = NULL;   /* stop believing in it */
+                s_send_busy = false;
+                s_send_watch_ms = 0u;
+            }
+        } else {
+            s_send_watch_ms = 0u;
+        }
 
         /*
          * A frame does nothing to the panel at all while a send is in flight -

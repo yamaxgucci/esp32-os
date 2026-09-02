@@ -148,6 +148,11 @@ static uint8_t s_frame[5u + FR_MAX_PAYLOAD + 1u];
 /* What went and what did not.  Read back through the display's ioctl so the
  * thing above the driver can put it in its own readout - a driver cannot
  * print. */
+/* Whether a rectangle may be trimmed against what the far end is believed to
+ * have - see rem_ioctl.  On by default; the whole point of the switch is that
+ * it can be turned off from outside. */
+static bool s_trim = true;
+
 static uint64_t s_sent_bytes;
 static uint32_t s_sent_frames;
 static uint32_t s_dropped;
@@ -742,7 +747,7 @@ static void rem_blit_rect(ag_handle_t h, const ag_blit_t *b)
     const uint32_t bx = (uint32_t)b->x;
     const uint32_t gx0 = bx / BLK;
     const uint32_t gcols = ((uint32_t)b->w + BLK - 1u) / BLK;
-    const bool aligned = prev_ready(b->surf_w, b->surf_h) &&
+    const bool aligned = s_trim && prev_ready(b->surf_w, b->surf_h) &&
                          (bx % BLK) == 0u && ((uint32_t)b->y % BLK) == 0u &&
                          gx0 + gcols <= s_hash_cols;
 
@@ -1238,8 +1243,38 @@ static const ag_display_ops_t k_display_ops = {
     .blit_rect = rem_blit_rect,
 };
 
+/*
+ * The only switch this driver has, and it turns the cleverness off.
+ *
+ * Everything else here is arithmetic that cannot disagree with itself.  The
+ * hash grid is not: it is a claim about a machine at the other end of a wire,
+ * and when the claim is wrong - a frame the line lost, a receiver that missed
+ * a byte - the picture stays wrong until the slow repair sweep reaches those
+ * rows.  With the trimming off every rectangle is sent whole, which is a
+ * quarter of a second for a full screen and cannot be wrong at all.
+ *
+ * It is the floor to measure against, and the first thing to try when a
+ * picture is misbehaving and nobody knows whose fault it is.
+ */
+static ag_err_t rem_ioctl(ag_device_t *dev, uint32_t cmd, void *arg,
+                          size_t arglen)
+{
+    (void)dev;
+    if (cmd != AG_IOC_DISPLAY_TRIM) {
+        return -AG_ENOTSUP;
+    }
+    if (arg == NULL || arglen < sizeof(int)) {
+        return -AG_EINVAL;
+    }
+    s_trim = (*(const int *)arg) != 0;
+    if (!s_trim) {
+        hash_forget();
+    }
+    return AG_OK;
+}
+
 static const ag_dev_ops_t k_dev_ops = {
-    .ioctl = NULL,
+    .ioctl = rem_ioctl,
 };
 
 ag_err_t ag_driver_init(void)
