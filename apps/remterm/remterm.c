@@ -408,7 +408,15 @@ static uint32_t    s_asamples;  /* accepted off the wire                    */
 static uint32_t    s_aplayed;   /* handed to the converter                  */
 static uint32_t    s_adropped;  /* the ring was full                        */
 static uint32_t    s_agaps;     /* the ring ran dry while playing: a stutter */
-static bool        s_astarved;  /* inside such a gap right now               */
+static bool        s_astarved;  /* the ring is empty right now                */
+static ag_time_t   s_astarved_at;
+static bool        s_agap_counted;
+
+/* The lead built before playback starts or resumes, in samples; and how long
+ * the ring may be empty before the converter, which buffers about ninety
+ * milliseconds of its own, has audibly run out too. */
+#define AUD_CUSHION 4400u
+#define AUD_DAC_US  90000ull
 static volatile uint32_t s_arate;  /* what the far end says it is sending    */
 static volatile int      s_astop;
 static ag_thread_t s_athread;
@@ -480,9 +488,34 @@ static void aud_player(void *arg)
     (void)arg;
     static int16_t block[AUD_BITE];
 
+    /*
+     * A cushion, because a ring that is drained the moment anything lands in
+     * it is a ring that is empty at every jitter.
+     *
+     * The far end sends sound in 256-sample frames, in bursts, between bands
+     * of picture that take tens of milliseconds each; the converter plays
+     * continuously.  Play what arrives as it arrives and the ring hovers at
+     * zero, so every late burst is a hole - the receiver counted 75-97 of them
+     * every five seconds at the main menu, fifteen to twenty a second, and the
+     * music sounded exactly like that.  So playback does not start, or
+     * restart after a hole, until AUD_CUSHION samples are waiting: about two
+     * hundred milliseconds of lead, out of a ring that holds seven hundred.
+     * Fewer, longer pauses instead of a stutter, and only when the wire has
+     * really stopped delivering.
+     */
+    bool primed = false;
+
     while (!s_astop) {
         const uint32_t rate = s_arate;
+        if (rate != 0u && !primed) {
+            if (s_aring_used < AUD_CUSHION) {
+                ag_delay(5);
+                continue;
+            }
+            primed = true;
+        }
         if (rate == 0u || s_aring_used == 0u) {
+            primed = false; /* build the cushion again before resuming */
             /*
              * An empty ring while the sound is supposed to be playing is a
              * gap the speaker plays as silence.  Counted as one gap per run of
@@ -497,14 +530,28 @@ static void aud_player(void *arg)
              * that cannot see the fault being reported is worse than none,
              * since it argues with the person.
              */
-            if (rate != 0u && s_aplayed != 0u && !s_astarved) {
-                s_astarved = true;
-                s_agaps++;
+            /*
+             * Counted only once the converter's own buffer must also be dry:
+             * it holds about ninety milliseconds, so a ring that is empty for
+             * less than that has not yet been heard.  A gap is what the ear
+             * would call one.
+             */
+            if (rate != 0u && s_aplayed != 0u) {
+                const ag_time_t now = g_ag_api->time->us();
+                if (!s_astarved) {
+                    s_astarved = true;
+                    s_astarved_at = now;
+                } else if (!s_agap_counted &&
+                           (uint64_t)(now - s_astarved_at) >= AUD_DAC_US) {
+                    s_agap_counted = true;
+                    s_agaps++;
+                }
             }
             ag_delay(5);
             continue;
         }
         s_astarved = false;
+        s_agap_counted = false;
         if (!aud_open(rate)) {
             ag_delay(50);
             continue;
