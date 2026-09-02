@@ -81,7 +81,7 @@ extern "C" void sdl_shim_cycle_ms(int ms);
 extern "C" void sdl_shim_events(int on);
 extern "C" void sdl_shim_flush_rows(int rows);
 extern "C" void sdl_shim_async(int on);
-extern "C" void sdl_shim_dumb(int on);
+extern "C" void sdl_shim_smart(int level);
 extern "C" void sdl_shim_hud(int on);
 extern "C" void sdl_shim_log(const char *path);
 extern "C" void sdl_shim_screenshot_now(void);
@@ -196,7 +196,7 @@ extern "C" int ag_cxx_main(int argc, char **argv)
     int events = 0;
     int flush_rows = 64;
     int async_wire = 1;
-    int dumb = 0;
+    int smart = 0;
     int hud = 0;
     const char *logpath = NULL;
     int fps_ms = 0;
@@ -226,8 +226,10 @@ extern "C" int ag_cxx_main(int argc, char **argv)
             cycle_ms = to_int(argv[++i]);
         } else if (same(argv[i], "-flushrows") && i + 1 < argc) {
             flush_rows = to_int(argv[++i]);
+        } else if (same(argv[i], "-smart") && i + 1 < argc) {
+            smart = to_int(argv[++i]);
         } else if (same(argv[i], "-dumb")) {
-            dumb = 1;
+            smart = 0;
         } else if (same(argv[i], "-sync")) {
             async_wire = 0;
         } else if (same(argv[i], "-events")) {
@@ -259,7 +261,7 @@ extern "C" int ag_cxx_main(int argc, char **argv)
     sdl_shim_cycle_ms(cycle_ms);
     sdl_shim_flush_rows(flush_rows);
     sdl_shim_async(async_wire);
-    sdl_shim_dumb(dumb);
+    sdl_shim_smart(smart);
     /* The readout and the event log are the same instrument seen two
      * ways, so -hud brings both.  -events alone is for a run left going
      * with nobody watching the glass. */

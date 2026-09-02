@@ -152,6 +152,10 @@ static uint8_t s_frame[5u + FR_MAX_PAYLOAD + 1u];
  * have - see rem_ioctl.  On by default; the whole point of the switch is that
  * it can be turned off from outside. */
 static bool s_trim = true;
+/* Whether a band may be packed or palettised before it goes.  Lossless either
+ * way, and stateless - turning it off buys nothing but certainty, which is
+ * sometimes the thing wanted. */
+static bool s_encode = true;
 
 static uint64_t s_sent_bytes;
 static uint32_t s_sent_frames;
@@ -861,15 +865,19 @@ static void rem_blit_rect(ag_handle_t h, const ag_blit_t *b)
         uint8_t        best_op = FR_BAND;
         uint32_t       best_len = 0;
 
-        const uint32_t p = pack16(out, npx, s_cand + 12u, FR_MAX_PAYLOAD - 12u);
+        const uint32_t p =
+            s_encode ? pack16(out, npx, s_cand + 12u, FR_MAX_PAYLOAD - 12u) : 0u;
         if (p != 0 && p < best) {
             best = p;
             best_op = FR_PACK;
             best_len = p;
         }
         const uint32_t q =
-            encode_indexed(out, npx, s_cand + 12u + (best_op == FR_PACK ? p : 0u),
-                           FR_MAX_PAYLOAD - 12u - (best_op == FR_PACK ? p : 0u));
+            s_encode ? encode_indexed(out, npx,
+                                      s_cand + 12u + (best_op == FR_PACK ? p : 0u),
+                                      FR_MAX_PAYLOAD - 12u -
+                                          (best_op == FR_PACK ? p : 0u))
+                     : 0u;
         if (q != 0 && q < best) {
             /* It won; move it to the front of the candidate buffer. */
             uint8_t *from = s_cand + 12u + p;
@@ -1266,7 +1274,16 @@ static ag_err_t rem_ioctl(ag_device_t *dev, uint32_t cmd, void *arg,
     if (arg == NULL || arglen < sizeof(int)) {
         return -AG_EINVAL;
     }
-    s_trim = (*(const int *)arg) != 0;
+    /*
+     * A level, not a flag: 0 is raw bands and no memory of the far end, 1 is
+     * lossless packing with no memory, 2 is everything.  The bottom level is
+     * the one the whole switch exists for - what arrives is exactly what was
+     * in the buffer, band by band, and there is nothing left in this driver
+     * that could disagree with the screen.
+     */
+    const int level = *(const int *)arg;
+    s_encode = level >= 1;
+    s_trim = level >= 2;
     if (!s_trim) {
         hash_forget();
     }

@@ -231,6 +231,10 @@ def main():
                     help="how long to watch the boot before sending anything")
     ap.add_argument("--timeout", type=float, default=20.0,
                     help="how long one command may take")
+    ap.add_argument("--peek", action="store_true",
+                    help="only listen for --seconds: no reset, no prompt, not "
+                         "a single byte sent - for watching a program that "
+                         "stops on a keystroke")
     ap.add_argument("--no-reset", action="store_true",
                     help="attach to a board that is already running")
     ap.add_argument("--quiet", action="store_true", help="do not echo the wire")
@@ -249,9 +253,16 @@ def main():
     os.makedirs(os.path.dirname(args.log), exist_ok=True)
     with open(args.log, "wb") as log:
         board = Board(args.port, args.baud, log, not args.quiet)
-        if not args.no_reset:
+        if not args.no_reset and not args.peek:
             board.reset()
 
+        if args.peek:
+            # Nothing sent, deliberately.  --no-reset still wakes the prompt
+            # with a carriage return, and to a program that stops on any key
+            # a carriage return is a key: REMTERM ended every time its own
+            # counters were read this way, and the screen went with it.
+            board.pump(args.seconds)
+            return
         if args.no_reset:
             # Nothing is coming unprompted from a board that is sitting at a
             # prompt; ask for one.

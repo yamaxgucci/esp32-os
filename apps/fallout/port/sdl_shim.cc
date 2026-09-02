@@ -261,28 +261,53 @@ void sdl_shim_async(int on)
  * the floor: when the screen is misbehaving and it is not clear whose state is
  * lying, this is the run that says whether any state is involved at all.
  */
-static int s_dumb;
+/*
+ * How much the wire is allowed to be clever.  0 is the honest floor: the whole
+ * buffer, raw, every time, and it is the default.
+ *
+ * The default, because the person playing asked for it in so many words after
+ * three evenings of a picture that would stop for ten seconds while every
+ * number said the game was fine.  He is right about the trade.  Every one of
+ * the clever paths - the damage rectangle, the hash of what the far end has,
+ * the packing - exists to do better than four frames a second for a picture
+ * that mostly stays still, and every one of them is a thing that can be
+ * wrong.  When one is wrong the screen shows an old frame and nothing says
+ * so.  The floor cannot be wrong: what arrives is what was in the buffer,
+ * about three times a second, and a screen that stops is then a screen whose
+ * sender has stopped, which is a fault with one place to look.
+ *
+ *   0  the whole buffer, raw                  ~2.7 frames a second
+ *   1  the whole buffer, packed losslessly    ~4.4
+ *   2  only what changed, packed              30-60 when still, 4.4 moving
+ *
+ * -smart N sets it.  The higher levels are not gone; they are earned back one
+ * at a time, against this, with the counters at both ends.
+ */
+static int s_smart;
 
-void sdl_shim_dumb(int on)
+void sdl_shim_smart(int level)
 {
-    s_dumb = on ? 1 : 0;
+    s_smart = (level < 0) ? 0 : (level > 2) ? 2 : level;
 }
 
 static void panel_trim_apply(void)
 {
     const ag_handle_t h = ag_dev_open("/dev/rem0");
     if (h < 0) {
-        ag_printf("SDL: no /dev/rem0, so -dumb has nothing to ask\n");
+        ag_printf("SDL: no /dev/rem0, so the wire keeps its own defaults\n");
         return;
     }
-    int trim = s_dumb ? 0 : 1;
-    const ag_err_t err = ag_dev_ioctl(h, AG_IOC_DISPLAY_TRIM, &trim,
-                                      sizeof(trim));
-    ag_printf("SDL: the panel driver %s\n",
-              (err == AG_OK)
-                  ? (s_dumb ? "will send every rectangle whole"
-                            : "will trim rectangles as usual")
-                  : "does not know how to stop trimming");
+    int level = s_smart;
+    const ag_err_t err = ag_dev_ioctl(h, AG_IOC_DISPLAY_TRIM, &level,
+                                      sizeof(level));
+    static const char *const k_what[] = {
+        "sends the whole buffer raw, every frame",
+        "sends the whole buffer packed, every frame",
+        "sends only what changed",
+    };
+    ag_printf("SDL: the wire %s\n",
+              (err == AG_OK) ? k_what[s_smart]
+                             : "does not take a level; its own defaults stand");
     ag_dev_close(h);
 }
 
@@ -1900,9 +1925,7 @@ SDL_Window *SDL_CreateWindow(const char *title, int x, int y, int w, int h,
          * runs; if it cannot be started the port falls back to sending on the
          * game's thread, which is what it did before and is merely slower.
          */
-        if (s_dumb) {
-            panel_trim_apply();
-        }
+        panel_trim_apply();
 
         if (s_send_async && s_gfx.fb != NULL) {
             s_send_lock = ag_mutex_create();
@@ -2781,6 +2804,14 @@ void SDL_RenderPresent(SDL_Renderer *r)
             }
 
             hud_draw();
+
+            /* Below the top level the damage rectangle is not consulted: the
+             * whole buffer goes, every time, which is the honesty the level
+             * is for.  It still goes through the same snapshot and the same
+             * sender - only the question "what changed?" is not asked. */
+            if (s_smart < 2) {
+                dirty_add(0, 0, (int)s_gfx.width, (int)s_gfx.height);
+            }
 
             if (s_dirty_x1 > s_dirty_x0 && s_dirty_y1 > s_dirty_y0) {
                 /*
