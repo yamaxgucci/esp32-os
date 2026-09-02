@@ -197,10 +197,147 @@ static uint32_t s_blit_frame_us;
  * Sixty-four rows of 320 is 40 KB raw and about 60 ms of link. */
 static uint32_t s_flush_rows = 64;
 
-/* The rectangle still going out, walked down to its bottom edge before any
- * newer damage is looked at.  See the note in SDL_RenderPresent. */
-static int  s_send_x0, s_send_y0, s_send_x1, s_send_y1;
-static bool s_send_any;
+/* ---------------------------------------------------------------------- */
+/* The sender                                                             */
+/* ---------------------------------------------------------------------- */
+
+/*
+ * A thread of its own, on the other core, so that the game never waits for
+ * the wire.
+ *
+ * The shape is the one the machine already has rather than a queue bolted on
+ * top.  The engine draws into its own 640x480 eight-bit surface; the panel
+ * buffer is the reduction of it; the sender reads the panel buffer.  Three
+ * things follow:
+ *
+ *   - There is no queue and nothing to drop.  What is kept between one send
+ *     and the next is a rectangle, not a frame: "this part of the picture has
+ *     moved".  If the wire is slow the intermediate frames simply never come
+ *     into existence, and the far end always gets the newest picture rather
+ *     than an old one out of a backlog.  A queue would have given the opposite
+ *     - the lag that grows.
+ *   - Nothing tears.  The reduction into the panel buffer is what takes the
+ *     snapshot, and it is skipped entirely while a send is in flight, so the
+ *     buffer the sender is reading does not move under it.  One send is one
+ *     instant of one frame, whole.  Half the screen from one step of a scroll
+ *     and half from the next is exactly what a person sees as banding.
+ *   - It costs no memory.  The two buffers it needs both already existed.
+ *
+ * And the reduction gets cheaper as a side effect: it used to run for every
+ * rectangle the engine touched, sixty times a second, and now runs once per
+ * send - four times a second when the wire is the limit.
+ */
+/* -syncsend turns the thread off, so the two can be compared without a
+ * rebuild. */
+static int         s_send_async = 1;
+
+void sdl_shim_syncsend(int on)
+{
+    s_send_async = on ? 0 : 1;
+}
+
+static ag_mutex_t  s_send_lock;
+static ag_sem_t    s_send_go;
+static ag_thread_t s_send_thread;
+static volatile bool s_send_busy;   /* a send is in flight */
+static volatile bool s_send_stop;
+
+/* What the sender is to put on the wire, in panel coordinates. */
+static int s_send_x, s_send_y, s_send_w, s_send_h;
+
+/* Damage the engine reported while the sender was busy, in the engine's
+ * coordinates - which for this path are the panel's as well, because
+ * _GNW95_ShowRect passes the same origin for the source and the destination. */
+static int  s_defer_x0, s_defer_y0, s_defer_x1, s_defer_y1;
+
+static void defer_none(void)
+{
+    s_defer_x0 = s_defer_y0 = 0x7FFF;
+    s_defer_x1 = s_defer_y1 = -1;
+}
+
+static void defer_add(int x, int y, int w, int h)
+{
+    if (w <= 0 || h <= 0) {
+        return;
+    }
+    if (x < s_defer_x0) {
+        s_defer_x0 = x;
+    }
+    if (y < s_defer_y0) {
+        s_defer_y0 = y;
+    }
+    if (x + w > s_defer_x1) {
+        s_defer_x1 = x + w;
+    }
+    if (y + h > s_defer_y1) {
+        s_defer_y1 = y + h;
+    }
+}
+
+static bool sender_busy(void)
+{
+    return s_send_thread != NULL && s_send_busy;
+}
+
+/*
+ * The wire, on its own thread.  Everything it touches is either its own or
+ * settled before it was woken: the rectangle is written under the lock and the
+ * busy flag is what stops anything reducing into the buffer it is reading.
+ */
+/* What the last send cost, read by the frame that starts the next one. */
+static uint32_t s_send_wire_us, s_send_wire_px;
+
+/*
+ * One rectangle, in chunks of rows, and the chunking is not about tearing.
+ *
+ * A whole screen is about ninety kilobytes encoded and the link carries four
+ * hundred a second, so one flush of it holds the device registry for a quarter
+ * of a second - and the sound has to go through that same registry to reach
+ * the same wire.  The mixer's ring is 186 ms, so a 250 ms picture starves it
+ * by construction; that is the ragged music, and it was never a fault in the
+ * audio path.  Sixty-four rows is about sixty milliseconds, which the ring
+ * covers three times over.
+ *
+ * Nothing tears from this, which is why it can be done here at all: the panel
+ * buffer is frozen for the whole of this function - the game defers every
+ * reduction while the send is in flight - so all the chunks come from the same
+ * instant of the same frame.  It was the earlier version, which chunked in the
+ * *game's* thread with the buffer live between chunks, that put the top of the
+ * screen one step of a scroll ahead of the bottom.
+ */
+static uint32_t send_rect(int x, int y, int w, int h)
+{
+    const ag_time_t t0 = ag_micros();
+    const int step = (s_flush_rows != 0u) ? (int)s_flush_rows : h;
+    for (int at = 0; at < h; at += step) {
+        int rows = h - at;
+        if (rows > step) {
+            rows = step;
+        }
+        ag_gfx_flush((uint16_t)x, (uint16_t)(y + at), (uint16_t)w,
+                     (uint16_t)rows);
+    }
+    return (uint32_t)(ag_micros() - t0);
+}
+
+static void sender_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        (void)ag_sem_take(s_send_go, 1000u);
+        if (s_send_stop) {
+            return;
+        }
+        if (!s_send_busy) {
+            continue;
+        }
+        s_send_wire_us = send_rect(s_send_x, s_send_y, s_send_w, s_send_h);
+        s_send_wire_px = (uint32_t)s_send_w * (uint32_t)s_send_h;
+        s_send_busy = false;
+    }
+}
+
 
 void sdl_shim_flush_rows(int rows)
 {
@@ -1277,6 +1414,38 @@ int SDL_UpperBlit(SDL_Surface *src, const SDL_Rect *srcrect, SDL_Surface *dst,
     }
 
     /*
+     * Deferred, when the destination is the panel and a send is in flight.
+     *
+     * The engine keeps its own 640x480 eight-bit surface and draws into that;
+     * this function is only the reduction on the way out, and the panel buffer
+     * it writes into is the very thing the sender is reading.  Writing into it
+     * while a band of it is going down the wire is how the top of the screen
+     * comes from one frame and the bottom from the next - the banding a person
+     * sees when the map scrolls.
+     *
+     * So while the sender is busy, nothing is reduced: the rectangle is
+     * remembered and the caller returns.  The engine carries on drawing into
+     * its own surface at whatever rate it likes, which is the whole point -
+     * there is no queue of frames anywhere, and there is nothing to drop,
+     * because the only thing kept is "this part of the picture has moved".
+     * When the sender finishes, the accumulated rectangle is reduced in one
+     * pass and that is the snapshot: one instant of one frame, whole.
+     *
+     * It costs no memory at all.  The panel buffer is the snapshot and the
+     * engine's own surface is the working copy, and both already existed.
+     */
+    if (dst->pixels == s_gfx.fb && s_gfx.fb != NULL) {
+        s_panel_src = src;
+        s_panel_dst = dst;
+        if (sender_busy()) {
+            /* In the engine's coordinates, which for this path are also the
+             * panel's - _GNW95_ShowRect passes the same origin for both. */
+            defer_add(dx + panx, dy + pany, w, h);
+            return 0;
+        }
+    }
+
+    /*
      * What actually came out different, in destination coordinates.  Every
      * loop below stores through CHANGED(), which writes only when the pixel is
      * not already what it should be and records where that happened.
@@ -1440,6 +1609,48 @@ static void panel_repaint(void)
 
     SDL_Rect srcrect = { 0, 0, s_panel_src->w, s_panel_src->h };
     SDL_Rect dstrect = { 0, 0, 0, 0 };
+    SDL_UpperBlit(s_panel_src, &srcrect, s_panel_dst, &dstrect);
+}
+
+/*
+ * Everything the engine drew while the wire was busy, in one pass.
+ *
+ * The rectangle went by while the panel buffer could not be touched (it was
+ * being read by the sender), so nothing was reduced then; this is where it
+ * happens, and the moment it happens is the moment the snapshot is taken.
+ * Through the same blit, because that is the one place that knows about the
+ * reduction, the offset and the compare-before-store that says what really
+ * changed - and the source and destination origins are the same here, which
+ * is what makes replaying a remembered rectangle correct at all.
+ */
+static void replay_deferred(void)
+{
+    if (s_panel_src == NULL || s_panel_dst == NULL) {
+        return;
+    }
+    int x = s_defer_x0;
+    int y = s_defer_y0;
+    int w = s_defer_x1 - x;
+    int h = s_defer_y1 - y;
+    if (x < 0) {
+        w += x;
+        x = 0;
+    }
+    if (y < 0) {
+        h += y;
+        y = 0;
+    }
+    if (x + w > s_panel_src->w) {
+        w = s_panel_src->w - x;
+    }
+    if (y + h > s_panel_src->h) {
+        h = s_panel_src->h - y;
+    }
+    if (w <= 0 || h <= 0) {
+        return;
+    }
+    SDL_Rect srcrect = { x, y, w, h };
+    SDL_Rect dstrect = { x, y, 0, 0 };
     SDL_UpperBlit(s_panel_src, &srcrect, s_panel_dst, &dstrect);
 }
 
@@ -1618,6 +1829,30 @@ SDL_Window *SDL_CreateWindow(const char *title, int x, int y, int w, int h,
         ag_gfx_clear(0);
         ag_gfx_flush(0, 0, s_gfx.width, s_gfx.height);
         dirty_none();
+        defer_none();
+
+        /*
+         * The wire gets a thread of its own, on the other core.
+         *
+         * Not a worker pool and not a queue - see the note on the sender.  It
+         * exists so that the one thing in the frame that is not the machine's
+         * work, waiting for four megabaud of serial line, happens somewhere
+         * the game is not.  Core 0, because core 1 is where the application
+         * runs; if it cannot be started the port falls back to sending on the
+         * game's thread, which is what it did before and is merely slower.
+         */
+        if (s_send_async && s_gfx.fb != NULL) {
+            s_send_lock = ag_mutex_create();
+            s_send_go = ag_sem_create(0, 1);
+            if (s_send_go != NULL) {
+                s_send_thread = ag_thread_create(sender_task, NULL, "fowire",
+                                                 4096, 3, 0);
+            }
+            ag_printf("SDL: the wire %s\n",
+                      s_send_thread != NULL
+                          ? "has a thread of its own on core 0"
+                          : "is sent on the game's thread (no thread)");
+        }
         ag_printf("SDL: display %ux%u %s, %u bytes per row\n",
                   (unsigned)s_gfx.width, (unsigned)s_gfx.height,
                   s_gfx.fb != NULL ? "with a framebuffer" : "by present()",
@@ -1959,10 +2194,10 @@ static void events_frame(uint32_t frame_us, uint32_t blit_us, uint32_t wire_us,
     }
     s_ev_next_ms = now + 250u;
 
+    const uint32_t in_frame =
+        s_ev_worst_blit_us + ((s_send_thread != NULL) ? 0u : s_ev_worst_wire_us);
     const uint32_t eng_us =
-        (s_ev_worst_us > s_ev_worst_blit_us + s_ev_worst_wire_us)
-            ? (s_ev_worst_us - s_ev_worst_blit_us - s_ev_worst_wire_us)
-            : 0u;
+        (s_ev_worst_us > in_frame) ? (s_ev_worst_us - in_frame) : 0u;
     shim_printf("[ev t=%u] %u slow, worst %u ms: eng %u blit %u wire %u; "
                 "rect %dx%d at %d,%d (%u KB)\n",
                 (unsigned)now, (unsigned)s_ev_slow,
@@ -1983,6 +2218,7 @@ static unsigned s_hud_min100;   /* the worst frame as a rate, hundredths */
 static unsigned s_hud_slow_pct;
 static unsigned s_hud_eng_ms, s_hud_blit_ms, s_hud_wire_ms, s_hud_wire_kbs;
 static unsigned s_hud_worst_ms, s_hud_worst_eng_ms, s_hud_worst_wire_ms;
+static bool     s_hud_async;
 static unsigned s_hud_used_kb, s_hud_hole_kb;
 
 /*
@@ -2051,12 +2287,21 @@ static void hud_tick(void)
         const uint64_t frame_us = sum / frames;
         const uint64_t blit_us = blit / frames;
         const uint64_t wire_us = wire / frames;
-        /* The engine is what is left when the two costs this port can name are
-         * taken out.  Named by subtraction on purpose: an unaccounted
-         * millisecond then shows up as engine rather than vanishing. */
+        /*
+         * The engine is what is left when the costs this port can name are
+         * taken out - and which of them are *in* the frame depends on where
+         * the wire is being driven from.  With a thread of its own it is not:
+         * the game did not wait for it, so subtracting it would invent engine
+         * time that never happened and hide the milliseconds that did.  Named
+         * by subtraction either way, so that an unaccounted millisecond shows
+         * up as engine rather than vanishing.
+         */
+        const uint64_t in_frame =
+            blit_us + ((s_send_thread != NULL) ? 0u : wire_us);
         const uint64_t eng_us =
-            (frame_us > blit_us + wire_us) ? frame_us - blit_us - wire_us : 0u;
+            (frame_us > in_frame) ? frame_us - in_frame : 0u;
         s_hud_eng_ms = (unsigned)(eng_us / 1000u);
+        s_hud_async = (s_send_thread != NULL);
         s_hud_blit_ms = (unsigned)(blit_us / 1000u);
         s_hud_wire_ms = (unsigned)(wire_us / 1000u);
         /* Kilobytes a second the wire was asked to carry.  Asked, not sent:
@@ -2298,85 +2543,105 @@ void SDL_RenderPresent(SDL_Renderer *r)
         uint32_t wire_us = 0, wire_px = 0;
         int flush_x = 0, flush_y = 0, flush_w = 0, flush_h = 0;
 
+        /* The readout's numbers first; they are arithmetic and cost nothing. */
+        hud_tick();
+
         /*
-         * Two rectangles, and it took a broken screen to learn why.
-         *
-         * A frame in which everything moved is 90 KB encoded and the wire
-         * carries 400 a second, so one flush of it holds the link - and the
-         * device registry with it - for a quarter of a second.  Nothing else
-         * can use the link in that time, and the thing that most wants to is
-         * the sound: the mixer's ring is 186 ms, so a 250 ms picture starves
-         * it by construction.  That is the ragged music, and it is not a fault
-         * in the audio path at all.
-         *
-         * So a present sends at most `s_flush_rows` rows.  The first version
-         * left the rest in the damage rectangle and advanced its top edge -
-         * which does not work, because the next frame damages the top of the
-         * screen again (the palette blit, the readout) and pulls the top edge
-         * straight back up.  What that looks like is the top sixty-four rows
-         * of a two-hundred-and-forty row panel being the only part that ever
-         * arrives, and a game that appears to have hung.  Twenty-seven per
-         * cent of a screen, which is exactly 64/240.
-         *
-         * The rectangle being sent is therefore held separately from the
-         * damage collected since it was taken.  The send walks down its own
-         * rectangle to the bottom and only then picks up whatever arrived
-         * meanwhile - so it always finishes what it started, and new damage
-         * to rows already sent is simply included next time round, where the
-         * driver's hash drops it for nothing if it did not really change.
+         * A frame does nothing to the panel at all while a send is in flight -
+         * see the note on the sender.  When it is not, everything that was
+         * held back is reduced in one pass, the readout is drawn on top, and
+         * whatever really came out different is handed over.
          */
-        if (!s_send_any && s_dirty_x1 > s_dirty_x0 && s_dirty_y1 > s_dirty_y0) {
+        if (!sender_busy()) {
             /*
-             * Grown out to the panel driver's block, which is eight pixels
-             * square.  REMDISP compares a rectangle against its record of what
-             * the far end has only when the rectangle starts on a block
-             * boundary; one that does not is sent whole and makes those rows
-             * forget, so an exact three-pixel-wide rectangle costs more on the
-             * wire than a sixteen-pixel one that can be trimmed.
+             * Eight rows of the panel, four times a second, whether anything
+             * drew into them or not - walking down the screen and starting
+             * again.
+             *
+             * Two things need this.  A monitor at the end of a wire can be
+             * unplugged and plugged back in, and the driver then forgets
+             * everything it believed the far end had - but it keeps hashes,
+             * not pixels, so it cannot repaint on its own and has to wait for
+             * a flush.  And a frame the wire loses to noise leaves that part
+             * of the glass showing the frame before it, because over there the
+             * hash says it was sent.  Both come right on a flush that covers
+             * those rows.
              */
-            const int blk = 8;
-            int x1 = (s_dirty_x1 + blk - 1) & ~(blk - 1);
-            int y1 = (s_dirty_y1 + blk - 1) & ~(blk - 1);
-            if (x1 > (int)s_gfx.width) {
-                x1 = (int)s_gfx.width;
+            const uint32_t now_ms = (uint32_t)ag_millis();
+            if (s_repaint_next_ms == 0u) {
+                s_repaint_next_ms = now_ms + REPAINT_EVERY_MS;
+            } else if (now_ms >= s_repaint_next_ms) {
+                s_repaint_next_ms = now_ms + REPAINT_EVERY_MS;
+                const int strip = 8;
+                const int rows = (int)s_gfx.height / strip;
+                if (rows > 0) {
+                    s_repaint_strip = (s_repaint_strip + 1) % rows;
+                    dirty_add(0, s_repaint_strip * strip, (int)s_gfx.width,
+                              strip);
+                }
             }
-            if (y1 > (int)s_gfx.height) {
-                y1 = (int)s_gfx.height;
+
+            /* The snapshot: everything the engine drew while the wire was
+             * busy, reduced into the panel buffer in one pass, so that what
+             * goes out next is one instant of one frame. */
+            if (s_defer_x1 > s_defer_x0 && s_defer_y1 > s_defer_y0) {
+                replay_deferred();
+                defer_none();
             }
-            s_send_x0 = s_dirty_x0 & ~(blk - 1);
-            s_send_y0 = s_dirty_y0 & ~(blk - 1);
-            s_send_x1 = x1;
-            s_send_y1 = y1;
-            s_send_any = true;
-            dirty_none();
+
+            hud_draw();
+
+            if (s_dirty_x1 > s_dirty_x0 && s_dirty_y1 > s_dirty_y0) {
+                /*
+                 * Grown out to the panel driver's block, which is eight pixels
+                 * square.  REMDISP compares a rectangle against its record of
+                 * what the far end has only when the rectangle starts on a
+                 * block boundary; one that does not is sent whole and makes
+                 * those rows forget.
+                 */
+                const int blk = 8;
+                int x1 = (s_dirty_x1 + blk - 1) & ~(blk - 1);
+                int y1 = (s_dirty_y1 + blk - 1) & ~(blk - 1);
+                if (x1 > (int)s_gfx.width) {
+                    x1 = (int)s_gfx.width;
+                }
+                if (y1 > (int)s_gfx.height) {
+                    y1 = (int)s_gfx.height;
+                }
+                s_send_x = s_dirty_x0 & ~(blk - 1);
+                s_send_y = s_dirty_y0 & ~(blk - 1);
+                s_send_w = x1 - s_send_x;
+                s_send_h = y1 - s_send_y;
+                dirty_none();
+
+                flush_x = s_send_x;
+                flush_y = s_send_y;
+                flush_w = s_send_w;
+                flush_h = s_send_h;
+
+                if (s_send_thread != NULL) {
+                    s_send_busy = true;
+                    ag_sem_give(s_send_go);
+                } else {
+                    /* -syncsend, or a thread that could not be started: the
+                     * old behaviour, so the two can be compared. */
+                    s_send_wire_us =
+                        send_rect(s_send_x, s_send_y, s_send_w, s_send_h);
+                    s_send_wire_px =
+                        (uint32_t)s_send_w * (uint32_t)s_send_h;
+                }
+            }
         }
 
-        if (s_send_any) {
-            const int fw = s_send_x1 - s_send_x0;
-            int       fh = s_send_y1 - s_send_y0;
-            if (s_flush_rows != 0 && fh > (int)s_flush_rows) {
-                fh = (int)s_flush_rows;
-            }
-            /* Always timed now.  It used to be timed only under -fps, and
-             * the readout needs the same number without it. */
-            const ag_time_t t0 = ag_micros();
-            ag_gfx_flush((uint16_t)s_send_x0, (uint16_t)s_send_y0,
-                         (uint16_t)fw, (uint16_t)fh);
-            wire_us = (uint32_t)(ag_micros() - t0);
-            wire_px = (uint32_t)fw * (uint32_t)fh;
-            flush_x = s_send_x0;
-            flush_y = s_send_y0;
-            flush_w = fw;
-            flush_h = fh;
-            if (s_fps_ms != 0u) {
-                s_flush_us += (uint64_t)wire_us;
-                s_flush_px += (uint64_t)wire_px;
-                s_flushes++;
-            }
-            s_send_y0 += fh;
-            if (s_send_y0 >= s_send_y1) {
-                s_send_any = false;
-            }
+        /* What the last completed send cost, counted once. */
+        wire_us = s_send_wire_us;
+        wire_px = s_send_wire_px;
+        s_send_wire_us = 0;
+        s_send_wire_px = 0;
+        if (s_fps_ms != 0u && wire_px != 0u) {
+            s_flush_us += (uint64_t)wire_us;
+            s_flush_px += (uint64_t)wire_px;
+            s_flushes++;
         }
 
         /* And the frame this present ends, into the rolling window. */

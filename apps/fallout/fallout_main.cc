@@ -80,6 +80,7 @@ extern "C" void sdl_shim_scale_sharp(int on);
 extern "C" void sdl_shim_cycle_ms(int ms);
 extern "C" void sdl_shim_events(int on);
 extern "C" void sdl_shim_flush_rows(int rows);
+extern "C" void sdl_shim_syncsend(int on);
 extern "C" void sdl_shim_hud(int on);
 extern "C" void sdl_shim_log(const char *path);
 extern "C" void sdl_shim_screenshot_now(void);
@@ -193,6 +194,7 @@ extern "C" int ag_cxx_main(int argc, char **argv)
     int cycle_ms = 100;
     int events = 0;
     int flush_rows = 64;
+    int syncsend = 0;
     int hud = 0;
     const char *logpath = NULL;
     int fps_ms = 0;
@@ -222,6 +224,8 @@ extern "C" int ag_cxx_main(int argc, char **argv)
             cycle_ms = to_int(argv[++i]);
         } else if (same(argv[i], "-flushrows") && i + 1 < argc) {
             flush_rows = to_int(argv[++i]);
+        } else if (same(argv[i], "-syncsend")) {
+            syncsend = 1;
         } else if (same(argv[i], "-events")) {
             events = 1;
         } else if (same(argv[i], "-hud")) {
@@ -250,6 +254,7 @@ extern "C" int ag_cxx_main(int argc, char **argv)
     sdl_shim_scale_sharp(sharp);
     sdl_shim_cycle_ms(cycle_ms);
     sdl_shim_flush_rows(flush_rows);
+    sdl_shim_syncsend(syncsend);
     /* The readout and the event log are the same instrument seen two
      * ways, so -hud brings both.  -events alone is for a run left going
      * with nobody watching the glass. */
