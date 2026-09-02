@@ -482,22 +482,25 @@ colours that are not in the game's palette, so the driver's palette-and-indices
 encoding stops fitting and falls back to raw pixels.  Both spellings select it;
 it is one option with two names.
 
-## The wire has three levels, and the honest one is the default
+## The wire has three levels
 
 `-smart N`, and it goes to the panel driver as `AG_IOC_DISPLAY_TRIM`:
 
 | level | what goes down the wire | a whole screen | when nothing moves |
 |---|---|---|---|
-| **0 (default)** | the whole buffer, raw, every frame | 2.5-2.7 a second | the same |
+| 0 (`-dumb`) | the whole buffer, raw, every frame | 2.5-2.7 a second | the same |
 | 1 | the whole buffer, packed losslessly | ~4.4 | the same |
-| 2 | only the blocks whose hash changed, packed | ~4.4 | 30-60 fps |
+| **2 (default)** | only the blocks whose hash changed, packed | ~4.4 | 30-60 fps |
 
-Level 0 is the default because it cannot be wrong.  Everything above it is a
-claim about what the far end already has, and when a claim is wrong the screen
-shows an old frame and nothing says so; it was reported as the game hanging
-four times in one evening, and each time the board was at fifty frames a
-second.  At level 0 a frame is never wrong for longer than one frame, and a
-screen that stops is a screen whose sender has stopped - one place to look.
+Level 0 was the default for one evening, on the argument that it cannot be
+wrong - everything above it is a claim about what the far end already has, and
+a wrong claim is an old frame on the glass with nothing saying so.  The
+argument was right and the experience was not: a raw screen leaves in bands
+over 375 ms, and on a receiver with no buffer of its own that is not a frame
+every 375 ms but a repaint crawling down the glass; and it fills the wire so
+full that the sound queues behind the picture.  It stays as `-dumb`, the floor
+to measure against and the first thing to run when the picture misbehaves and
+nobody knows whose state is lying.
 
 Measured at the receiver in level 0: 175-190 KB/s, sound complete, and **26-29
 corrupt frames every five seconds** against 0-2 at a fifth of the rate.  The
