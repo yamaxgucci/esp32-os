@@ -64,6 +64,8 @@ typedef struct {
     int16_t         *mix_scratch; /* PCMMIX_PERIOD * 2, heap */
 } pcmmix_state_t;
 
+static void *pcmmix_alloc(size_t n); /* PSRAM first, then internal */
+
 static pcmmix_state_t *s_st; /* heap/PSRAM — keep DRAM BSS tight */
 static ag_device_t    *s_dev;
 
