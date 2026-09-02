@@ -70,14 +70,25 @@
  * between the two boards that is the difference between a game that works
  * while the picture goes out and a game that stops for it.
  *
- * Thirty-two kilobytes is about eighty milliseconds of a four-megabaud line
- * and a little more than one frame's worth of the largest rectangle the port
- * above will send at once, which is the size that overlaps without letting the
- * picture run behind the game.  The port halves it until it fits, so the CYD
- * asking for the same number is not a board that fails to open its port.
+ * Big on receive, small on transmit, and the asymmetry is the point.  A board
+ * carrying a picture is either the sender or the receiver: the sender pushes
+ * bands and reads back the odd byte, the receiver takes four megabaud and sends
+ * the odd byte.  So both want a large receive ring - thirty-two kilobytes,
+ * about a hundred and forty milliseconds, which is what stops the receiver
+ * dropping bands under load - and neither wants a large transmit one.
+ *
+ * The transmit buffer was thirty-two kilobytes for a while, for an experiment
+ * that let the sender's write return before the wire had taken it; that
+ * experiment is gone (the wire is synchronous now), and the two rings together
+ * were sixty-four kilobytes, which the CYD - 179 KB, no PSRAM - could not
+ * allocate on top of the receiver's own audio ring: `UART driver malloc
+ * error`, and a screen that stayed dark.  Two kilobytes is what a synchronous
+ * writer needs; it paces on the wire, which is correct.  The port halves each
+ * until they fit, transmit first, so a board that still cannot have the receive
+ * ring gets a smaller one rather than failing to open the port.
  */
 #define AG_IO_UART_RX_BUF 32768
-#define AG_IO_UART_TX_BUF 32768
+#define AG_IO_UART_TX_BUF 2048
 /* And what the console keeps: a shell's worth, the sizes that were the only
  * sizes until the picture link needed more. */
 #define AG_IO_UART_CON_RX_BUF 4096
