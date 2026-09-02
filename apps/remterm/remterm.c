@@ -395,7 +395,7 @@ static void want_text(void)
  * Sixteen kilobytes of a board that has ninety free, against a stutter that
  * makes music unrecognisable.
  */
-#define AUD_RING  16384u /* samples: 743 ms at 22050, 16 KB                  */
+#define AUD_RING  33075u /* samples: 1.5 s at 22050, 32 KB                   */
 #define AUD_BITE    256u /* samples handed over at once: 11.6 ms            */
 
 static ag_handle_t s_pcm = -1;
@@ -412,10 +412,25 @@ static bool        s_astarved;  /* the ring is empty right now                */
 static ag_time_t   s_astarved_at;
 static bool        s_agap_counted;
 
-/* The lead built before playback starts or resumes, in samples; and how long
- * the ring may be empty before the converter, which buffers about ninety
- * milliseconds of its own, has audibly run out too. */
-#define AUD_CUSHION 4400u
+/*
+ * The lead built before playback starts or resumes, in samples.
+ *
+ * This is the whole answer to the choppy sound, and the size is chosen against
+ * a measured enemy.  Sound and picture share one wire, and a whole screen sent
+ * at once holds that wire - and so keeps sound off it - for up to three
+ * hundred milliseconds.  A cushion smaller than that empties during the gap
+ * and the speaker plays silence; two hundred milliseconds, which is what this
+ * was, could not cover a three hundred millisecond hole, so it still stuttered.
+ *
+ * Five hundred milliseconds covers the worst hole with two hundred to spare.
+ * The cost is half a second of delay between a sound happening in the game and
+ * being heard, which for music and ambience nobody notices, and the ring is a
+ * second and a half so there is room for the bursts that refill it between
+ * holes.  The only real limit is that if the holes came closer together than
+ * the buffer refills the buffer would still lose - but on average the wire
+ * delivers audio as fast as it is played, so between two holes it refills.
+ */
+#define AUD_CUSHION 11025u /* 500 ms */
 #define AUD_DAC_US  90000ull
 static volatile uint32_t s_arate;  /* what the far end says it is sending    */
 static volatile int      s_astop;
