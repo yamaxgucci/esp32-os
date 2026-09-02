@@ -60,13 +60,24 @@
  * with `uart1 at 4000000 baud: input/output error` - a screen that stayed dark
  * for want of a buffer twice the size of the one that works.
  *
- * Transmit stays small on purpose: a short transmit buffer makes a large write
- * block until the wire has taken it, and being paced by the wire is the correct
- * behaviour for whoever is filling it - the alternative is buffering a frame
- * the far end cannot yet draw.
+ * Transmit used to stay at two kilobytes on purpose, so that a large write
+ * blocked until the wire had taken it - being paced by the wire is the correct
+ * behaviour for whoever is filling it.  That is still true and it is not the
+ * same as *waiting* for it.  With a buffer this size a write copies and
+ * returns, and the peripheral's interrupt empties it while the caller draws
+ * the next frame; the pacing comes back the moment the buffer is full, which
+ * on a picture that does not fit in it is one frame later.  On the link
+ * between the two boards that is the difference between a game that works
+ * while the picture goes out and a game that stops for it.
+ *
+ * Thirty-two kilobytes is about eighty milliseconds of a four-megabaud line
+ * and a little more than one frame's worth of the largest rectangle the port
+ * above will send at once, which is the size that overlaps without letting the
+ * picture run behind the game.  The port halves it until it fits, so the CYD
+ * asking for the same number is not a board that fails to open its port.
  */
 #define AG_IO_UART_RX_BUF 16384
-#define AG_IO_UART_TX_BUF 2048
+#define AG_IO_UART_TX_BUF 32768
 
 /*
  * A caller with more to send than AG_PORT_SPI_MAX_XFER splits it, and a chip

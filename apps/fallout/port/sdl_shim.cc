@@ -193,11 +193,28 @@ static int s_dirty_x0, s_dirty_y0, s_dirty_x1, s_dirty_y1;
 /* Microseconds of halving in the frame being built, reset by every present. */
 static uint32_t s_blit_frame_us;
 
+/* The most rows one present may put on the wire; the rest waits for the next.
+ * Sixty-four rows of 320 is 40 KB raw and about 60 ms of link. */
+static uint32_t s_flush_rows = 64;
+
+/* The rectangle still going out, walked down to its bottom edge before any
+ * newer damage is looked at.  See the note in SDL_RenderPresent. */
+static int  s_send_x0, s_send_y0, s_send_x1, s_send_y1;
+static bool s_send_any;
+
+void sdl_shim_flush_rows(int rows)
+{
+    s_flush_rows = (uint32_t)(rows > 0 ? rows : 0);
+}
+
 /* How often one strip of the panel is sent even when nothing changed - see the
- * comment where it is used.  A quarter of a second a strip covers the screen
- * in seven and a half, which is the driver's own repair interval, and costs
- * about five kilobytes each time instead of arriving in one lump. */
-#define REPAINT_EVERY_MS 250u
+ * comment where it is used.  Sixty milliseconds a strip covers the screen in
+ * about two seconds, which is the driver's own repair interval, and costs
+ * about five kilobytes each time instead of arriving in one lump.  It was a
+ * quarter of a second, which put an eight second ceiling on how long a wrong
+ * rectangle could sit behind the mouse pointer - true, bounded, and still a
+ * fault to anyone looking at it. */
+#define REPAINT_EVERY_MS 60u
 static uint32_t s_repaint_next_ms;
 static int      s_repaint_strip;
 
@@ -1883,6 +1900,83 @@ static unsigned     s_hb_at;
 static uint32_t     s_hb_next_ms;
 static uint32_t     s_hud_last_us;
 
+/* ---------------------------------------------------------------------- */
+/* The event log                                                          */
+/* ---------------------------------------------------------------------- */
+
+/*
+ * A line when something happens, not a line every second.
+ *
+ * A per-frame trace of a game that runs for ten minutes is a megabyte of
+ * numbers nobody reads, and a once-a-second average is the thing that hid the
+ * problem in the first place.  What is actually wanted is the shape of the
+ * complaint: it was fine, then it dropped, then it settled somewhere worse,
+ * and here is what the bad frames were made of.
+ *
+ * So two kinds of line.  A slow frame - anything over a tenth of a second -
+ * with its engine/halving/wire split and, which is the part that matters, the
+ * rectangle that was sent: "wire 274 ms, rect 320x240" and "wire 274 ms, rect
+ * 320x64" are a saturated link and a driver that is repeating itself, and they
+ * are not the same fault.  And a level change, when the mean settles somewhere
+ * a third away from where it was, because "it drops when I scroll" is a
+ * statement about levels.
+ *
+ * Rate limited to four lines a second and coalesced in between, so a hundred
+ * consecutive bad frames are one line that says a hundred.
+ */
+static int      s_events;
+static uint32_t s_ev_next_ms;
+static uint32_t s_ev_slow;      /* slow frames since the last line */
+static uint32_t s_ev_worst_us, s_ev_worst_blit_us, s_ev_worst_wire_us;
+static int      s_ev_rx, s_ev_ry, s_ev_rw, s_ev_rh;
+static unsigned s_ev_level100;  /* the level last reported */
+
+void sdl_shim_events(int on)
+{
+    s_events = on ? 1 : 0;
+}
+
+static void events_frame(uint32_t frame_us, uint32_t blit_us, uint32_t wire_us,
+                         int x, int y, int w, int h)
+{
+    if (!s_events || frame_us < HUD_SLOW_US) {
+        return;
+    }
+    s_ev_slow++;
+    if (frame_us > s_ev_worst_us) {
+        s_ev_worst_us = frame_us;
+        s_ev_worst_blit_us = blit_us;
+        s_ev_worst_wire_us = wire_us;
+        s_ev_rx = x;
+        s_ev_ry = y;
+        s_ev_rw = w;
+        s_ev_rh = h;
+    }
+
+    const uint32_t now = (uint32_t)ag_millis();
+    if (s_ev_next_ms != 0u && now < s_ev_next_ms) {
+        return;
+    }
+    s_ev_next_ms = now + 250u;
+
+    const uint32_t eng_us =
+        (s_ev_worst_us > s_ev_worst_blit_us + s_ev_worst_wire_us)
+            ? (s_ev_worst_us - s_ev_worst_blit_us - s_ev_worst_wire_us)
+            : 0u;
+    shim_printf("[ev t=%u] %u slow, worst %u ms: eng %u blit %u wire %u; "
+                "rect %dx%d at %d,%d (%u KB)\n",
+                (unsigned)now, (unsigned)s_ev_slow,
+                (unsigned)(s_ev_worst_us / 1000u), (unsigned)(eng_us / 1000u),
+                (unsigned)(s_ev_worst_blit_us / 1000u),
+                (unsigned)(s_ev_worst_wire_us / 1000u),
+                s_ev_rw, s_ev_rh, s_ev_rx, s_ev_ry,
+                (unsigned)((uint32_t)s_ev_rw * (uint32_t)s_ev_rh * 2u / 1024u));
+    s_ev_slow = 0;
+    s_ev_worst_us = 0;
+    s_ev_worst_blit_us = 0;
+    s_ev_worst_wire_us = 0;
+}
+
 /* Filled in by hud_tick, drawn by hud_draw, printed by hud_log. */
 static unsigned s_hud_fps100;   /* mean frames per second, hundredths */
 static unsigned s_hud_min100;   /* the worst frame as a rate, hundredths */
@@ -1989,6 +2083,26 @@ static void hud_tick(void)
         ag_meminfo(&mi);
         s_hud_used_kb = (unsigned)((mi.arena_total - mi.arena_free) / 1024u);
         s_hud_hole_kb = (unsigned)(mi.arena_largest / 1024u);
+    }
+
+    /*
+     * A level change: the mean has settled a third below or half above the
+     * level last reported.  Two thresholds rather than one, because a drop is
+     * what gets noticed and a recovery only matters once it is clearly back.
+     */
+    if (s_events && s_hud_fps100 > 0u) {
+        const unsigned was = s_ev_level100;
+        if (was == 0u || s_hud_fps100 * 3u < was * 2u ||
+            s_hud_fps100 * 2u > was * 3u) {
+            shim_printf("[ev t=%u] fps level %u.%02u (was %u.%02u): "
+                        "eng %u blit %u wire %u ms, lo %u%%, "
+                        "wire %u KB/s, hole %u KB\n",
+                        (unsigned)now, s_hud_fps100 / 100u,
+                        s_hud_fps100 % 100u, was / 100u, was % 100u,
+                        s_hud_eng_ms, s_hud_blit_ms, s_hud_wire_ms,
+                        s_hud_slow_pct, s_hud_wire_kbs, s_hud_hole_kb);
+            s_ev_level100 = s_hud_fps100;
+        }
     }
 
     /*
@@ -2182,45 +2296,87 @@ void SDL_RenderPresent(SDL_Renderer *r)
          * the engine presents on a timer as well as after a change, and a
          * still screen should cost nothing. */
         uint32_t wire_us = 0, wire_px = 0;
-        if (s_dirty_x1 > s_dirty_x0 && s_dirty_y1 > s_dirty_y0) {
+        int flush_x = 0, flush_y = 0, flush_w = 0, flush_h = 0;
+
+        /*
+         * Two rectangles, and it took a broken screen to learn why.
+         *
+         * A frame in which everything moved is 90 KB encoded and the wire
+         * carries 400 a second, so one flush of it holds the link - and the
+         * device registry with it - for a quarter of a second.  Nothing else
+         * can use the link in that time, and the thing that most wants to is
+         * the sound: the mixer's ring is 186 ms, so a 250 ms picture starves
+         * it by construction.  That is the ragged music, and it is not a fault
+         * in the audio path at all.
+         *
+         * So a present sends at most `s_flush_rows` rows.  The first version
+         * left the rest in the damage rectangle and advanced its top edge -
+         * which does not work, because the next frame damages the top of the
+         * screen again (the palette blit, the readout) and pulls the top edge
+         * straight back up.  What that looks like is the top sixty-four rows
+         * of a two-hundred-and-forty row panel being the only part that ever
+         * arrives, and a game that appears to have hung.  Twenty-seven per
+         * cent of a screen, which is exactly 64/240.
+         *
+         * The rectangle being sent is therefore held separately from the
+         * damage collected since it was taken.  The send walks down its own
+         * rectangle to the bottom and only then picks up whatever arrived
+         * meanwhile - so it always finishes what it started, and new damage
+         * to rows already sent is simply included next time round, where the
+         * driver's hash drops it for nothing if it did not really change.
+         */
+        if (!s_send_any && s_dirty_x1 > s_dirty_x0 && s_dirty_y1 > s_dirty_y0) {
             /*
              * Grown out to the panel driver's block, which is eight pixels
              * square.  REMDISP compares a rectangle against its record of what
              * the far end has only when the rectangle starts on a block
              * boundary; one that does not is sent whole and makes those rows
              * forget, so an exact three-pixel-wide rectangle costs more on the
-             * wire than a sixteen-pixel one that can be trimmed.  Snapping
-             * here means the driver sees rectangles it can work with, and the
-             * few extra pixels are compared and dropped rather than sent.
+             * wire than a sixteen-pixel one that can be trimmed.
              */
             const int blk = 8;
-            int fx1 = (s_dirty_x1 + blk - 1) & ~(blk - 1);
-            int fy1 = (s_dirty_y1 + blk - 1) & ~(blk - 1);
-            if (fx1 > (int)s_gfx.width) {
-                fx1 = (int)s_gfx.width;
+            int x1 = (s_dirty_x1 + blk - 1) & ~(blk - 1);
+            int y1 = (s_dirty_y1 + blk - 1) & ~(blk - 1);
+            if (x1 > (int)s_gfx.width) {
+                x1 = (int)s_gfx.width;
             }
-            if (fy1 > (int)s_gfx.height) {
-                fy1 = (int)s_gfx.height;
+            if (y1 > (int)s_gfx.height) {
+                y1 = (int)s_gfx.height;
             }
-            s_dirty_x0 &= ~(blk - 1);
-            s_dirty_y0 &= ~(blk - 1);
-            s_dirty_x1 = fx1;
-            s_dirty_y1 = fy1;
-            const int fw = s_dirty_x1 - s_dirty_x0;
-            const int fh = s_dirty_y1 - s_dirty_y0;
+            s_send_x0 = s_dirty_x0 & ~(blk - 1);
+            s_send_y0 = s_dirty_y0 & ~(blk - 1);
+            s_send_x1 = x1;
+            s_send_y1 = y1;
+            s_send_any = true;
+            dirty_none();
+        }
+
+        if (s_send_any) {
+            const int fw = s_send_x1 - s_send_x0;
+            int       fh = s_send_y1 - s_send_y0;
+            if (s_flush_rows != 0 && fh > (int)s_flush_rows) {
+                fh = (int)s_flush_rows;
+            }
             /* Always timed now.  It used to be timed only under -fps, and
              * the readout needs the same number without it. */
             const ag_time_t t0 = ag_micros();
-            ag_gfx_flush((uint16_t)s_dirty_x0, (uint16_t)s_dirty_y0,
+            ag_gfx_flush((uint16_t)s_send_x0, (uint16_t)s_send_y0,
                          (uint16_t)fw, (uint16_t)fh);
             wire_us = (uint32_t)(ag_micros() - t0);
             wire_px = (uint32_t)fw * (uint32_t)fh;
+            flush_x = s_send_x0;
+            flush_y = s_send_y0;
+            flush_w = fw;
+            flush_h = fh;
             if (s_fps_ms != 0u) {
                 s_flush_us += (uint64_t)wire_us;
                 s_flush_px += (uint64_t)wire_px;
                 s_flushes++;
             }
-            dirty_none();
+            s_send_y0 += fh;
+            if (s_send_y0 >= s_send_y1) {
+                s_send_any = false;
+            }
         }
 
         /* And the frame this present ends, into the rolling window. */
@@ -2232,6 +2388,8 @@ void SDL_RenderPresent(SDL_Renderer *r)
             if (frame_us != 0u && frame_us < 5000000u) {
                 hud_frame(frame_us, (uint32_t)s_blit_frame_us, wire_us,
                           wire_px);
+                events_frame(frame_us, (uint32_t)s_blit_frame_us, wire_us,
+                             flush_x, flush_y, flush_w, flush_h);
             }
             s_blit_frame_us = 0;
         }

@@ -145,10 +145,29 @@ static bool               s_up;
  * callback that uses it. */
 static uint8_t s_frame[5u + FR_MAX_PAYLOAD + 1u];
 
-static void send_frame(uint8_t op, const uint8_t *payload, uint32_t len)
+/* What went and what did not.  Read back through the display's ioctl so the
+ * thing above the driver can put it in its own readout - a driver cannot
+ * print. */
+static uint64_t s_sent_bytes;
+static uint32_t s_sent_frames;
+static uint32_t s_dropped;
+
+/*
+ * True when every byte of the frame reached the port.
+ *
+ * It used to be void, on the grounds that there is nothing useful to do with a
+ * short write from inside a kernel callback.  That is still true of the write
+ * itself and false of the bookkeeping: the caller has just decided that the
+ * far end now has these pixels, and if the frame did not go, that decision is
+ * a lie that nothing corrects until the slow repair sweep comes round - up to
+ * seven and a half seconds of a rectangle showing the frame before it.  So the
+ * answer goes back and the hash is written only when it is true.
+ */
+static bool send_frame(uint8_t op, const uint8_t *payload, uint32_t len)
 {
     if (!s_up || len > FR_MAX_PAYLOAD) {
-        return;
+        s_dropped++;
+        return false;
     }
     s_frame[0] = FR_MAGIC0;
     s_frame[1] = FR_MAGIC1;
@@ -164,12 +183,20 @@ static void send_frame(uint8_t op, const uint8_t *payload, uint32_t len)
     s_frame[5u + len] = sum;
 
     /*
-     * The result is ignored deliberately.  There is nothing useful to do with a
-     * short write from inside a kernel callback: printing is forbidden here, and
-     * stalling to retry would stop the console or the application for the sake
-     * of one rectangle.
+     * Not retried, and not printed - printing is forbidden here and stalling
+     * to retry would stop the console or the application for the sake of one
+     * rectangle.  Only counted, and reported to the caller so that what the
+     * far end is believed to have stays true.
      */
-    (void)io->uart_write(LINK_PORT, s_frame, 5u + len + 1u);
+    const uint32_t want = 5u + len + 1u;
+    const int32_t  n = io->uart_write(LINK_PORT, s_frame, want);
+    if (n < 0 || (uint32_t)n != want) {
+        s_dropped++;
+        return false;
+    }
+    s_sent_bytes += want;
+    s_sent_frames++;
+    return true;
 }
 
 static void put16(uint8_t *p, uint32_t v)
@@ -310,7 +337,16 @@ static uint32_t block_hash(const uint8_t *src, uint32_t stride, uint32_t rows,
  * task.  While nothing is drawing nothing is repaired either - which is the
  * case that FR_HELLO covers.
  */
-#define HEAL_BAND_US 250000ull
+/*
+ * A quarter of a second was the first number and it is too slow to live with.
+ * Thirty-two rows of blocks at that rate is an eight second ceiling on how
+ * long a wrong rectangle stays on the glass, and eight seconds of dirt behind
+ * a mouse pointer is something a person reports as a fault however carefully
+ * it was reasoned about.  Sixty milliseconds is about two seconds for the
+ * whole screen and costs one band - two and a half kilobytes encoded - per
+ * sixty, which is under a tenth of the wire.
+ */
+#define HEAL_BAND_US 60000ull
 
 static uint32_t s_heal_band;
 static uint64_t s_heal_band_at;
@@ -426,6 +462,13 @@ static void poll_far_end(void)
 static uint8_t  s_raw[FR_MAX_PAYLOAD];  /* geometry + pixels, uncompressed   */
 static uint8_t  s_cand[FR_MAX_PAYLOAD]; /* geometry + whatever encoded best  */
 static uint8_t  s_idx[BAND_MAX_PX];     /* one index per pixel, before packing */
+
+/* The hashes of the blocks in the band being built, held until the band goes.
+ * Wide enough for the widest surface this can carry - a band is at most 320
+ * pixels, so forty blocks, and the margin is free. */
+#define REM_MAX_COLS 64u
+static uint8_t  s_fresh_col[REM_MAX_COLS];
+static uint32_t s_fresh_hash[REM_MAX_COLS];
 static uint16_t s_pal[256];
 
 /*
@@ -722,8 +765,10 @@ static void rem_blit_rect(ag_handle_t h, const ag_blit_t *b)
          */
         const bool track = aligned && rows == BAND_ROWS;
 
-        uint32_t x0 = 0, x1 = (uint32_t)b->w - 1u;
+        uint32_t  x0 = 0, x1 = (uint32_t)b->w - 1u;
         const uint32_t y0 = 0, y1 = rows - 1u;
+        uint32_t *row = NULL;
+        uint32_t  nfresh = 0;
 
         if (track) {
             /*
@@ -735,10 +780,11 @@ static void rem_blit_rect(ag_handle_t h, const ag_blit_t *b)
              * blocks, so any change in it costs all eight rows.  That is the
              * price of the hash and it is a couple of hundred pixels.
              */
-            uint32_t *row = s_hash + (size_t)(((uint32_t)b->y + band) / BLK) *
-                                         s_hash_cols + gx0;
+            row = s_hash + (size_t)(((uint32_t)b->y + band) / BLK) *
+                               s_hash_cols + gx0;
             x0 = (uint32_t)b->w;
             x1 = 0;
+            nfresh = 0;
             for (uint32_t c = 0; c < gcols; c++) {
                 uint32_t cols = (uint32_t)b->w - c * BLK;
                 if (cols > BLK) {
@@ -748,7 +794,14 @@ static void rem_blit_rect(ag_handle_t h, const ag_blit_t *b)
                     block_hash(src + (size_t)band * b->stride + c * BLK * 2u,
                                b->stride, rows, cols);
                 if (h != row[c]) {
-                    row[c] = h;
+                    /* Remembered, not written.  It is written when the band it
+                     * belongs to has actually gone down the wire - see
+                     * send_frame. */
+                    if (nfresh < REM_MAX_COLS) {
+                        s_fresh_col[nfresh] = (uint8_t)c;
+                        s_fresh_hash[nfresh] = h;
+                        nfresh++;
+                    }
                     if (c * BLK < x0) {
                         x0 = c * BLK;
                     }
@@ -823,13 +876,23 @@ static void rem_blit_rect(ag_handle_t h, const ag_blit_t *b)
             best_len = q;
         }
 
+        bool went;
         if (best_op == FR_BAND) {
-            send_frame(FR_BAND, s_raw, 12u + raw);
+            went = send_frame(FR_BAND, s_raw, 12u + raw);
         } else {
             for (uint32_t i = 0; i < 12u; i++) {
                 s_cand[i] = geom[i];
             }
-            send_frame(best_op, s_cand, 12u + best_len);
+            went = send_frame(best_op, s_cand, 12u + best_len);
+        }
+
+        /* Only now is it true that the far end has these blocks.  A band that
+         * did not go leaves its hashes as they were, so the next flush that
+         * reaches these rows sends it again. */
+        if (went && row != NULL) {
+            for (uint32_t i = 0; i < nfresh; i++) {
+                row[s_fresh_col[i]] = s_fresh_hash[i];
+            }
         }
     }
 

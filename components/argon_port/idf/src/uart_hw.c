@@ -156,9 +156,36 @@ ag_err_t ag_port_uart_open(int port, const ag_port_uart_cfg_t *cfg,
         /*
          * Already installed is not a failure: two subsystems may both want the
          * port up and neither knows about the other.
+         *
+         * The transmit buffer is asked for and then halved until it fits,
+         * rather than being a number that is right on one board.  What it buys
+         * is overlap: with a buffer, uart_write_bytes copies and returns, and
+         * the peripheral's interrupt drains it while the caller gets on with
+         * the next frame; without one the caller sits in the write for as long
+         * as the wire takes.  On the link between the two boards that is the
+         * difference between a game that draws while the picture is going out
+         * and a game that waits for it.
+         *
+         * Halving rather than a fixed size because the two ends are not the
+         * same machine: the S3 has PSRAM and internal memory to spare, and the
+         * CYD has 179 KB, no PSRAM, and after a `wifi off` the free memory is
+         * there but not in one piece.  A board that cannot have the big one
+         * gets the small one and works, instead of failing to open the port -
+         * which is what a fixed 32 KB did, and it came out as a screen that
+         * stayed dark.
          */
-        const esp_err_t rc = uart_driver_install(port, (int)rx_bytes,
-                                                 (int)tx_bytes, 0, NULL, 0);
+        esp_err_t rc = ESP_FAIL;
+        uint32_t  tx = tx_bytes;
+        for (;;) {
+            rc = uart_driver_install(port, (int)rx_bytes, (int)tx, 0, NULL, 0);
+            if (rc == ESP_OK || rc == ESP_ERR_INVALID_STATE) {
+                break;
+            }
+            if (tx <= 256u) {
+                break;
+            }
+            tx /= 2u;
+        }
         if (rc != ESP_OK && rc != ESP_ERR_INVALID_STATE) {
             return from_esp(rc);
         }

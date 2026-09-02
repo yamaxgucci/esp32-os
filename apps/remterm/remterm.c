@@ -267,6 +267,9 @@ static int next_byte(uint32_t ms)
 /* Put back everything after the magic bytes of the frame that just failed. */
 /* Not more often than this, however bad the line gets - see the comment where
  * it is used. */
+/* How often the receiver says what it has been getting - see the loop. */
+#define REPORT_US 5000000ull
+
 #define ASK_AGAIN_US 1000000ull
 static ag_time_t s_asked_at;
 
@@ -626,6 +629,25 @@ int ag_main(int argc, char **argv)
      */
     uint32_t tick = 0;
 
+    /*
+     * The receiver's half of the story, once every few seconds.
+     *
+     * Everything this program counts used to be printed when it stopped, and
+     * that is the wrong time: the questions are about a moment during play -
+     * was the picture that stayed wrong a frame this end rejected, or one the
+     * other end never sent?  A pointer that leaves dirt behind it and a link
+     * that is simply full look the same on the glass and are different faults,
+     * and only this end can tell them apart, because only this end knows how
+     * many frames arrived broken.
+     *
+     * It prints into this board's own console, which is the same console the
+     * far end's text lands in, so it comes out of the serial port next to
+     * everything else and can be read afterwards.
+     */
+    uint64_t report_at = (uint64_t)g_ag_api->time->us() + REPORT_US;
+    uint32_t last_rows = 0, last_bands = 0, last_bad = 0, last_stray = 0;
+    uint32_t last_wire = 0, last_asamples = 0, last_adropped = 0;
+
     for (;;) {
         if ((tick++ & 0xffu) == 0u) {
             if (ag_kbhit()) {
@@ -637,6 +659,61 @@ int ag_main(int argc, char **argv)
                 break;
             }
             ag_heartbeat();
+
+            const uint64_t now = (uint64_t)g_ag_api->time->us();
+            if (now >= report_at) {
+                report_at = now + REPORT_US;
+                /*
+                 * Out of the console port directly, and built without printf.
+                 *
+                 * The application SDK has no snprintf on purpose - a printf
+                 * is twenty kilobytes of an arena that holds sixty-four - so
+                 * the line is assembled from ag_utoa.
+                 *
+                 * It goes to the console, and there is a caveat worth writing
+                 * down rather than rediscovering: while this program is
+                 * showing pixels it owns the display, and a console line then
+                 * has nowhere to be drawn.  So these appear while the far end
+                 * is at a shell prompt and stop while a game is running, which
+                 * is the half of the time they are most wanted.  The totals at
+                 * the end of the run always arrive, and they answer the same
+                 * questions less precisely.  Writing to UART0 directly instead
+                 * does not work: the console owns those pins and the io layer
+                 * refuses to reserve them twice.
+                 */
+                char line[192];
+                char num[24];
+                line[0] = '\0';
+                static const char *const k_rx_label[] = {
+                    "[rx] ", " rects ", " KB, ", " rows, ",
+                    " bad, ", " stray, sound ", " in ", " lost",
+                };
+                const uint32_t k_rx_value[] = {
+                    bands - last_bands,
+                    (wire - last_wire) / 1024u,
+                    rows - last_rows,
+                    bad - last_bad,
+                    stray - last_stray,
+                    s_asamples - last_asamples,
+                    s_adropped - last_adropped,
+                };
+                for (uint32_t f = 0; f < 7u; f++) {
+                    ag_strlcat(line, k_rx_label[f], sizeof(line));
+                    ag_strlcat(line, ag_utoa(k_rx_value[f], num, sizeof(num),
+                                             0, false),
+                               sizeof(line));
+                }
+                ag_strlcat(line, k_rx_label[7], sizeof(line));
+                ag_strlcat(line, "\r\n", sizeof(line));
+                ag_printf("%s", line);
+                last_rows = rows;
+                last_bands = bands;
+                last_bad = bad;
+                last_stray = stray;
+                last_wire = wire;
+                last_asamples = s_asamples;
+                last_adropped = s_adropped;
+            }
         }
 
         int c = next_byte(10);
