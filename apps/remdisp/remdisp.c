@@ -172,11 +172,25 @@ static uint32_t s_dropped;
  * seven and a half seconds of a rectangle showing the frame before it.  So the
  * answer goes back and the hash is written only when it is true.
  */
+/*
+ * One frame atomic on the wire.  Picture and sound both leave this board over
+ * the same UART and no longer share the device registry lock (the kernel drops
+ * it before a blit so the wire cannot stall the console and the sound), so this
+ * is what stops the two building the one shared frame buffer over each other.
+ * Held only for one frame - a band, or a little block of samples - so the sound
+ * waits at most one band for its turn and every frame comes off the wire whole,
+ * which is all the receiver needs since each frame carries its own checksum.
+ */
+static ag_mutex_t s_wire_lock;
+
 static bool send_frame(uint8_t op, const uint8_t *payload, uint32_t len)
 {
     if (!s_up || len > FR_MAX_PAYLOAD) {
         s_dropped++;
         return false;
+    }
+    if (s_wire_lock != NULL) {
+        (void)ag_api()->task->mutex_lock(s_wire_lock, 1000u);
     }
     s_frame[0] = FR_MAGIC0;
     s_frame[1] = FR_MAGIC1;
