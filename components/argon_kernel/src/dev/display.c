@@ -34,6 +34,10 @@
 /* Match the text console: 80×25 cells at 8×16 px. */
 #define AG_DISPLAY_DEFAULT_W 640
 #define AG_DISPLAY_DEFAULT_H 400
+/* How many display drivers one present can fan out to.  Two is already
+ * generous - a panel and a remote screen - and the list is walked under the
+ * device lock and then blitted without it (see driver_present_blit). */
+#define AG_DISPLAY_MAX       4
 #define AG_DISPLAY_MAX_W     800
 #define AG_DISPLAY_MAX_H     480
 
@@ -145,8 +149,29 @@ static void driver_present_blit(const ag_blit_t *b)
         return;
     }
 
+    /*
+     * Find the display drivers under the lock, then let go of it before the
+     * blit - because the blit blocks, and this lock is the whole machine's.
+     *
+     * A display at the end of a wire takes hundreds of milliseconds to hand a
+     * full screen over, and blit_rect sits in that write the whole time.  The
+     * device lock is one lock over every device: audio writes take it, the
+     * console takes it, everything does.  Held across the blit, it stops the
+     * game writing a sound and stops the kernel printing a line for as long as
+     * the picture is going out - and with the sender on its own core that is a
+     * second core wedged against the first, which is exactly how the board
+     * went silent with everything alive and nothing running.
+     *
+     * The lock is here to walk the device registry safely, and that is all it
+     * is needed for.  The pointers it finds stay good afterwards: a display
+     * driver is loaded for the length of a session and is not pulled out from
+     * under a blit.  So the walk is locked and the writes are not.
+     */
+    const ag_display_ops_t *ops[AG_DISPLAY_MAX];
+    unsigned n = 0;
+
     ag_dev_lock_hold();
-    for (uint32_t i = 0;; i++) {
+    for (uint32_t i = 0; n < AG_DISPLAY_MAX; i++) {
         ag_devinfo_t info;
         if (ag_dev_info(i, AG_DEV_DISPLAY, &info) != AG_OK) {
             break;
@@ -155,13 +180,22 @@ static void driver_present_blit(const ag_blit_t *b)
         if (dev == NULL || dev->class_ops == NULL) {
             continue;
         }
-        const ag_display_ops_t *ops = (const ag_display_ops_t *)dev->class_ops;
-        if (!AG_HAS(ops, blit_rect) || ops->blit_rect == NULL) {
+        const ag_display_ops_t *o = (const ag_display_ops_t *)dev->class_ops;
+        if (!AG_HAS(o, blit_rect) || o->blit_rect == NULL) {
             continue;
         }
-        ops->blit_rect(0, b);
+        ops[n++] = o;
     }
     ag_dev_lock_release();
+
+    /* The blit lock, not the registry lock: it carries the same "system is
+     * writing" signal to the pin layer but is not the lock audio and the
+     * console are waiting on. */
+    ag_dev_blit_hold();
+    for (unsigned k = 0; k < n; k++) {
+        ops[k]->blit_rect(0, b);
+    }
+    ag_dev_blit_release();
 }
 
 /* The panel's own size, for a system that has no surface of its own to size. */

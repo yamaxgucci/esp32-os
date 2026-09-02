@@ -211,7 +211,7 @@ extern "C" int ag_cxx_main(int argc, char **argv)
      * never wedged.  -async asks for the thread back, for when the lock is
      * narrowed to not cover the write.
      */
-    int async_wire = 0;
+    int async_wire = 1;  /* the wire on its own thread; see the lock fix */
     /* Two: the trimmed, packed wire.  See -dumb for zero. */
     int smart = 2;
     int hud = 0;
