@@ -407,6 +407,8 @@ static volatile uint32_t s_aring_used;
 static uint32_t    s_asamples;  /* accepted off the wire                    */
 static uint32_t    s_aplayed;   /* handed to the converter                  */
 static uint32_t    s_adropped;  /* the ring was full                        */
+static uint32_t    s_agaps;     /* the ring ran dry while playing: a stutter */
+static bool        s_astarved;  /* inside such a gap right now               */
 static volatile uint32_t s_arate;  /* what the far end says it is sending    */
 static volatile int      s_astop;
 static ag_thread_t s_athread;
@@ -481,9 +483,28 @@ static void aud_player(void *arg)
     while (!s_astop) {
         const uint32_t rate = s_arate;
         if (rate == 0u || s_aring_used == 0u) {
+            /*
+             * An empty ring while the sound is supposed to be playing is a
+             * gap the speaker plays as silence.  Counted as one gap per run of
+             * empty polls, not one per poll: "how many times did it stutter"
+             * is the question, and a 300 ms hole is one hole.
+             *
+             * This is the number the first version did not have.  It counted
+             * the ring overflowing - samples that arrived with nowhere to go -
+             * and reported "0 lost" while the music was audibly breaking up,
+             * because the loss was the other way round: the picture had the
+             * wire, the samples arrived late, and the ring ran dry.  A counter
+             * that cannot see the fault being reported is worse than none,
+             * since it argues with the person.
+             */
+            if (rate != 0u && s_aplayed != 0u && !s_astarved) {
+                s_astarved = true;
+                s_agaps++;
+            }
             ag_delay(5);
             continue;
         }
+        s_astarved = false;
         if (!aud_open(rate)) {
             ag_delay(50);
             continue;
@@ -647,6 +668,7 @@ int ag_main(int argc, char **argv)
     uint64_t report_at = (uint64_t)g_ag_api->time->us() + REPORT_US;
     uint32_t last_rows = 0, last_bands = 0, last_bad = 0, last_stray = 0;
     uint32_t last_wire = 0, last_asamples = 0, last_adropped = 0;
+    uint32_t last_agaps = 0;
 
     for (;;) {
         if ((tick++ & 0xffu) == 0u) {
@@ -686,7 +708,7 @@ int ag_main(int argc, char **argv)
                 line[0] = '\0';
                 static const char *const k_rx_label[] = {
                     "[rx] ", " rects ", " KB, ", " rows, ",
-                    " bad, ", " stray, sound ", " in ", " lost",
+                    " bad, ", " stray, sound ", " in ", " gaps ", " full",
                 };
                 const uint32_t k_rx_value[] = {
                     bands - last_bands,
@@ -695,15 +717,16 @@ int ag_main(int argc, char **argv)
                     bad - last_bad,
                     stray - last_stray,
                     s_asamples - last_asamples,
+                    s_agaps - last_agaps,
                     s_adropped - last_adropped,
                 };
-                for (uint32_t f = 0; f < 7u; f++) {
+                for (uint32_t f = 0; f < 8u; f++) {
                     ag_strlcat(line, k_rx_label[f], sizeof(line));
                     ag_strlcat(line, ag_utoa(k_rx_value[f], num, sizeof(num),
                                              0, false),
                                sizeof(line));
                 }
-                ag_strlcat(line, k_rx_label[7], sizeof(line));
+                ag_strlcat(line, k_rx_label[8], sizeof(line));
                 ag_strlcat(line, "\r\n", sizeof(line));
                 ag_printf("%s", line);
                 last_rows = rows;
@@ -713,6 +736,7 @@ int ag_main(int argc, char **argv)
                 last_wire = wire;
                 last_asamples = s_asamples;
                 last_adropped = s_adropped;
+                last_agaps = s_agaps;
             }
         }
 
@@ -973,8 +997,9 @@ int ag_main(int argc, char **argv)
                   (unsigned)flow_ms, (unsigned)kpx_s);
     }
     if (s_asamples != 0u) {
-        ag_printf("sound: %u samples in, %u played, %u dropped, %u Hz\n",
-                  (unsigned)s_asamples, (unsigned)s_aplayed,
+        ag_printf("sound: %u samples in, %u played, %u gaps (ring ran dry), "
+                  "%u dropped (ring full), %u Hz\n",
+                  (unsigned)s_asamples, (unsigned)s_aplayed, (unsigned)s_agaps,
                   (unsigned)s_adropped, (unsigned)s_pcm_rate);
     }
 

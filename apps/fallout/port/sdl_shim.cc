@@ -1935,12 +1935,16 @@ SDL_Window *SDL_CreateWindow(const char *title, int x, int y, int w, int h,
                  * Priority six, above the game's five, and that is the whole
                  * of why the first version did not work.
                  *
-                 * The last argument of ag_thread_create is flags, not a core -
-                 * this thread was written as if it could be pinned to the
-                 * other one, and it cannot.  It runs beside the game on the
-                 * application core, and it was created at priority three
-                 * against a game that runs at five and is runnable about three
-                 * quarters of the time.  So the wire got the scraps: the game
+                 * The last argument of ag_thread_create is flags, and one of
+                 * the flags is the core.  The first version passed zero, which
+                 * is "the application core" - the game's - so the thread ran
+                 * beside the game at priority three against its five and got
+                 * the scraps.  AG_THREAD_SYS_CORE puts it on core 0 with the
+                 * kernel, where the game is not, and where the radio is off
+                 * during play.  Measured: with the sender on the game's core
+                 * and always busy, the engine's frame went from 14 ms to 30.
+                 * The priority still matters for the moments the two share
+                 * anything, so both stay.  So the wire got the scraps: the game
                  * reached sixty frames a second because it no longer waited
                  * for anything, and the picture crawled out a band at a time
                  * because the thing sending it almost never ran.  Reported as
@@ -1956,11 +1960,11 @@ SDL_Window *SDL_CreateWindow(const char *title, int x, int y, int w, int h,
                  * four was a guess with nothing behind it.
                  */
                 s_send_thread = ag_thread_create(sender_task, NULL, "fowire",
-                                                 8192, 6, 0);
+                                                 8192, 6, AG_THREAD_SYS_CORE);
             }
             ag_printf("SDL: the wire %s\n",
                       s_send_thread != NULL
-                          ? "has a thread of its own on core 0"
+                          ? "has a thread of its own on the system core"
                           : "is sent on the game's thread (no thread)");
         }
         ag_printf("SDL: display %ux%u %s, %u bytes per row\n",

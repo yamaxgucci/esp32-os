@@ -196,7 +196,12 @@ extern "C" int ag_cxx_main(int argc, char **argv)
     int events = 0;
     int flush_rows = 64;
     int async_wire = 1;
-    int smart = 0;
+    /* Two: the trimmed, packed wire.  Zero - the whole buffer raw every
+     * frame - was the default for one evening and is measured in the README:
+     * it cannot be wrong, it also cannot look like frames on a receiver with
+     * no buffer of its own, and it fills the wire so full that the sound
+     * queues behind the picture.  -dumb still asks for it. */
+    int smart = 2;
     int hud = 0;
     const char *logpath = NULL;
     int fps_ms = 0;
