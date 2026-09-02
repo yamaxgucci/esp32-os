@@ -77,6 +77,7 @@ extern "C" void sdl_shim_memstat(int every_ms, int trace_kb,
                                  int trace_max, int trace_prof);
 extern "C" void sdl_shim_fps(int every_ms);
 extern "C" void sdl_shim_scale_sharp(int on);
+extern "C" void sdl_shim_cycle_ms(int ms);
 extern "C" void sdl_shim_hud(int on);
 extern "C" void sdl_shim_log(const char *path);
 extern "C" void sdl_shim_screenshot_now(void);
@@ -187,6 +188,7 @@ extern "C" int ag_cxx_main(int argc, char **argv)
     int trace_max = 0;
     int trace_prof = 0;
     int sharp = 0;
+    int cycle_ms = 100;
     int hud = 0;
     const char *logpath = NULL;
     int fps_ms = 0;
@@ -212,6 +214,8 @@ extern "C" int ag_cxx_main(int argc, char **argv)
             ag_autostart = 1;
         } else if (same(argv[i], "-smooth") || same(argv[i], "-sharp")) {
             sharp = 1;
+        } else if (same(argv[i], "-cycle") && i + 1 < argc) {
+            cycle_ms = to_int(argv[++i]);
         } else if (same(argv[i], "-hud")) {
             hud = 1;
         } else if (same(argv[i], "-log") && i + 1 < argc) {
@@ -236,6 +240,7 @@ extern "C" int ag_cxx_main(int argc, char **argv)
     sdl_shim_memstat(memstat_ms, trace_kb, trace_max, trace_prof);
     sdl_shim_fps(fps_ms);
     sdl_shim_scale_sharp(sharp);
+    sdl_shim_cycle_ms(cycle_ms);
     sdl_shim_hud(hud);
 
     const int rc = main(out, argv);

@@ -1,0 +1,41 @@
+--- a/src/svga.cc
++++ b/src/svga.cc
+@@ -14,6 +14,10 @@
+ #include "window_manager.h"
+ #include "window_manager_private.h"
+ 
++// ARGON: the port decides how often a palette change may redraw the screen.
++// See the note in directDrawSetPaletteInRange below.
++extern "C" int ag_palette_blit_wanted(void);
++
+ namespace fallout {
+ 
+ static bool createRenderer(int width, int height);
+@@ -255,7 +259,26 @@
+         }
+ 
+         SDL_SetPaletteColors(gSdlSurface->format->palette, colors, start, count);
+-        SDL_BlitSurface(gSdlSurface, nullptr, gSdlTextureSurface, nullptr);
++        // ARGON: at a rate somebody chose, not at the rate of the fastest
++        // animation in the game.
++        //
++        // This is reached from the colour cycle, which is a ticker: twenty-
++        // seven entries animated at four different speeds, the quickest of
++        // them thirty times a second for the red lamp on the interface bar.
++        // Each change re-blits all 640x480 through the new palette, which on
++        // this machine also means halving it into the 320x240 panel at the far
++        // end of a serial wire.  Measured on the board with the ticker list
++        // timed: colorCycleTicker was 10.1 ms of a 47 ms frame - the largest
++        // single cost in the game - and the picture it produced was almost
++        // always identical to the one before it.
++        //
++        // Dropping one of these loses nothing that does not come back: the
++        // next tick is thirty milliseconds away and redraws the same screen
++        // from the same palette.  So the port is asked, and says no to most of
++        // them.  -cycle 0 restores the original behaviour for a comparison.
++        if (ag_palette_blit_wanted()) {
++            SDL_BlitSurface(gSdlSurface, nullptr, gSdlTextureSurface, nullptr);
++        }
+     }
+ }
+ 

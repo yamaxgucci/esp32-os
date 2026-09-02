@@ -396,6 +396,160 @@ sends only the union of what was blitted since the last one. So:
 Which says the board this wants is one with an RGB panel, and that the CYD -
 320×240 over SPI - is the wrong shape for it twice over.
 
+## Four things nobody had asked for
+
+Standing still on the Temple of Trials, the board did 21 frames a second and
+sent 150 KB of picture down the wire every one of them.  It does 45 now and
+sends about 1 KB.  Nothing here made the engine faster; all four were work the
+machine was doing for no one.
+
+Finding them needed the frame opened up, which is patches 0032 and 0034:
+Fallout does its per-frame work in *tickers* - a list of functions the input
+layer walks once round the loop - so every entry in that list is timed against
+its own address, and so are the seven calls in `mainLoop`.  The addresses come
+out in `[tick]` lines and become names with `nm`; the `[tick base]` line gives
+the offset to subtract, because the image is XIP-mapped wherever the loader put
+it.  It stays in the build: two clock reads per ticker against a ticker that
+costs milliseconds is nothing, and the alternative is answering "where does the
+time go" by argument.
+
+### The palette cycle redrew the whole screen thirty times a second
+
+`colorCycleTicker` was **10.1 ms of the 47** - the most expensive single thing
+in the game.  Fallout animates twenty-seven palette entries at four speeds and
+every change calls `directDrawSetPaletteInRange`, which re-blits the entire
+640x480 through the new palette.  The fastest of the four runs at thirty hertz
+and animates one entry: the red lamp on the interface bar.  So the whole screen
+was converted, and then hashed at the far end to discover it was the same, for
+a blinking light.
+
+Patch 0033 asks the port whether a re-blit is wanted; dropping one loses
+nothing that does not come back, because the next tick is thirty milliseconds
+away and draws the same screen.  `-cycle N` is the shortest gap between two of
+them, 100 ms by default, `-cycle 0` the original behaviour.  10.1 ms became 2.
+
+### The blit dirtied what the caller touched, not what changed
+
+With the cycle re-blitting everything, the damage rectangle was the whole
+screen every frame.  The blit compares before it stores now and reports the
+bounding box of the pixels that really came out different - nearly free, since
+the cache line has to be fetched to be written anyway and an unchanged pixel
+saves the store.
+
+### ...and then the driver could not use it
+
+16 KB a frame, and the frame rate fell from 21 to 14.
+
+REMDISP trims a rectangle against its record of what the far end has only when
+the rectangle lines up with its eight-by-eight blocks, and it used to demand
+the full surface width too.  Every narrow rectangle took the other branch: sent
+whole, and the rows it touched made to forget.  The traffic was down ninety per
+cent and the trimming was off.  The driver hashes a partial-width rectangle
+now, and the port grows its damage out to the block before handing it over.
+
+### `ag_meminfo` costs twelve milliseconds and was called every frame
+
+`renderPresent` cost 19 ms of which the flush was 2.5.  The difference was
+`memstat_service` sampling the arena's free total and largest hole once a frame
+- *before* the check that turns the rest of it off, so a build with no
+`-memstat` paid for it too.  `ag_meminfo` walks the heap, and the heap is six
+megabytes of PSRAM holding twenty thousand blocks: about **twelve milliseconds
+a call**.  It samples four times a second now, and only when something is going
+to print it.
+
+### And one that was mine
+
+The first version of the "send a strip even if nothing changed" repair - which
+a still screen needs, because a monitor plugged back in has to be told
+everything again and the driver keeps hashes rather than pixels - asked for all
+320x240 every two seconds.  That is 150 KB to hash and up to 40 KB to send in
+one go: a hitch of a tenth of a second, and what that looks like from the chair
+is a mouse pointer that stalls twice a minute.  Eight rows four times a second
+covers the screen just as often and costs five kilobytes at a time.
+
+### `-sharp` costs 43 milliseconds
+
+Measured while looking for the above.  The 2x2 average that keeps thin strokes
+when the picture is halved:
+
+| | the halving | frames a second |
+|---|---|---|
+| nearest (the default) | 8.2 ms | 21 |
+| `-sharp` / `-smooth` | **43 ms** | 11 |
+
+Five times the cost, and it makes the wire worse as well: averaging invents
+colours that are not in the game's palette, so the driver's palette-and-indices
+encoding stops fitting and falls back to raw pixels.  Both spellings select it;
+it is one option with two names.
+
+## The readout, and why the averages lied
+
+`-hud` draws three rows into the top-left of the panel and prints the same
+numbers to the log once a second:
+
+```
+FPS 44.83  MIN 12.43  LO 00%
+EG 018  BT 002  WR 001   052/017
+KBS 895  MEM 4871/0800
+```
+
+| | |
+|---|---|
+| `FPS` | frames a second, averaged over the last five |
+| `MIN` | the *worst* frame in those five seconds, as a rate |
+| `LO` | share of frames slower than a tenth of a second |
+| `EG` `BT` `WR` | milliseconds a frame in the engine, in the halving, on the wire |
+| `052/017` | the same engine/wire split **for the worst frame** |
+| `KBS` | kilobytes a second the wire was *asked* to carry |
+| `MEM` | arena in use / largest hole, both KB |
+
+Green above twenty frames a second, amber to ten, red below.
+
+This exists because of a specific failure.  The port was measured at thirty
+frames a second on the Temple of Trials while the person playing it was seeing
+five, and both numbers were true: the harness stands still, has no pointer and
+never scrolls, which is the cheapest scene the game has.  An average over a
+second is the number that hides the complaint; what a player notices is the
+worst frame, and what the worst frame is made of is the whole question.  A
+frame the engine thought about for a fifth of a second and a frame that took a
+fifth of a second to reach the glass are the same stutter from the chair and
+different faults entirely.
+
+**What it says.**  Two scenes, same build, measured 2 September 2026:
+
+| | main menu | Temple, standing still |
+|---|---|---|
+| frames a second | **3.35** | 44.8 |
+| worst frame | 306 ms | 80 ms |
+| frames slower than 100 ms | **100%** | 0% |
+| the engine | **1 ms** | 18 ms |
+| the halving | 10 ms | 2 ms |
+| **the wire** | **285 ms** | 1 ms |
+
+The main menu animates its whole background, so every pixel changes every
+frame; the engine does that in a millisecond and the wire needs 285.  Standing
+on a map almost nothing changes, the driver sends almost nothing, and the wire
+disappears from the frame entirely.
+
+So there is no single frame rate for this port.  There are two, and which one
+applies is decided by how much of the picture moved:
+
+- **the picture mostly still** - menus with the mouse over them, dialogue,
+  inventory, turn-based combat, standing on a map: 30-45 frames a second, and
+  the engine is the cost.
+- **the picture mostly moving** - scrolling the map, a movie, the animated
+  menu: **3.5 to 5**, and it is all wire.  150 KB of RGB565 encodes to 90-115 KB
+  and the line carries 400 KB a second.
+
+Everything a person reports as "the game is slow" is the second row, and none
+of the frame-time work in the section above touches it.  What would: a
+frame-persistent palette instead of one per band (about 15 KB of a 92 KB frame
+is palettes), a real LZ instead of PackBits over the indices, or a faster link
+than 4 Mbaud of hand-soldered UART - Wi-Fi between the two boards measures
+around 500 KB/s *through an SD card write*, so the radio is worth several times
+the wire and is the only one of the three that is a multiple rather than a
+percentage.
+
 ## What it spends its time on
 
 `-fps N` prints where a frame goes, every N milliseconds:

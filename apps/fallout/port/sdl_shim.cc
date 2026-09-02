@@ -190,6 +190,17 @@ static int s_frame_pitch;
  */
 static int s_dirty_x0, s_dirty_y0, s_dirty_x1, s_dirty_y1;
 
+/* Microseconds of halving in the frame being built, reset by every present. */
+static uint32_t s_blit_frame_us;
+
+/* How often one strip of the panel is sent even when nothing changed - see the
+ * comment where it is used.  A quarter of a second a strip covers the screen
+ * in seven and a half, which is the driver's own repair interval, and costs
+ * about five kilobytes each time instead of arriving in one lump. */
+#define REPAINT_EVERY_MS 250u
+static uint32_t s_repaint_next_ms;
+static int      s_repaint_strip;
+
 /*
  * What a block of the picture becomes on a smaller panel.
  *
@@ -463,6 +474,9 @@ void sdl_shim_screenshot(const char *path, int after_frames, int after_ms)
  * it costs one call per present to keep.
  */
 static uint32_t s_memstat_ms;
+/* Declared here rather than with the rest of the readout: the arena sampler
+ * a few hundred lines below needs to know whether anyone is looking. */
+static int s_hud;
 static uint32_t s_memstat_next;
 static size_t s_arena_low = (size_t)-1;
 
@@ -530,6 +544,143 @@ void sdl_shim_fps(int every_ms)
 
 static uint32_t s_last_present_ms;
 static uint32_t s_stall_next_ms;
+
+/* ---------------------------------------------------------------------- */
+/* Where a frame goes inside the engine                                     */
+/* ---------------------------------------------------------------------- */
+
+/*
+ * The board says 47 ms a frame standing still in the Temple of Trials, of
+ * which 8 is converting the picture and 8 is putting it on the wire.  The
+ * other 31 are "the engine", which is not an answer - it is the name of the
+ * part nobody has looked inside.
+ *
+ * Fallout does its per-frame work in tickers: a list of functions the input
+ * layer walks once round the loop.  Music streaming, the mouse, animation, the
+ * palette cycle and the script background pass are all on it.  So the list is
+ * where the time is, and timing each entry by its own address is enough to
+ * name it - addr2line does the rest, and no guess about which one it is has to
+ * be made in advance.
+ *
+ * The cost is two reads of the clock per ticker per frame, which against a
+ * ticker that takes milliseconds is nothing.  It stays in because "the engine
+ * is slow" is a sentence this project should never have to write twice.
+ */
+/*
+ * How often a palette change is allowed to redraw the whole picture.
+ *
+ * Fallout animates twenty-seven palette entries - slime, shoreline, two fires,
+ * computer monitors, and the red lamp on the interface bar - and every change
+ * re-blits the entire screen, because on a PC the display holds RGB and the
+ * indices have to be run through the new palette again.  The lamp alone ticks
+ * thirty times a second.  Measured on the board, colorCycleTicker was 10.1 ms
+ * of a 47 ms frame: the single most expensive thing in the game, spent on a
+ * blinking light.
+ *
+ * Skipping one of those re-blits loses nothing permanently - the next tick is
+ * thirty milliseconds away and does the same work - so the honest thing is to
+ * let them through at a rate somebody chose rather than at the rate the
+ * fastest of four animations happens to run at.  -cycle sets it; 0 turns the
+ * limit off and restores the original behaviour for a comparison.
+ */
+static uint32_t s_pal_blit_ms = 100;
+static uint32_t s_pal_blit_at;
+
+void sdl_shim_cycle_ms(int ms)
+{
+    s_pal_blit_ms = (uint32_t)(ms > 0 ? ms : 0);
+}
+
+extern "C" int ag_palette_blit_wanted(void)
+{
+    if (s_pal_blit_ms == 0u) {
+        return 1;
+    }
+    const uint32_t now = (uint32_t)ag_millis();
+    if (s_pal_blit_at != 0u && (now - s_pal_blit_at) < s_pal_blit_ms) {
+        return 0;
+    }
+    s_pal_blit_at = now;
+    return 1;
+}
+
+/* What renderPresent spends outside the flush; see the note where they are
+ * taken.  Printed per frame in the [pres] line. */
+static uint32_t s_pres_timers_us, s_pres_memstat_us, s_pres_fps_us;
+static uint32_t s_pres_input_us, s_pres_beat_us;
+
+#define AG_TICKERS 12
+extern "C" {
+uint32_t ag_us(void) { return (uint32_t)ag_micros(); }
+void    *ag_ticker_who[AG_TICKERS];
+uint32_t ag_ticker_us[AG_TICKERS];
+uint32_t ag_ticker_calls[AG_TICKERS];
+uint32_t ag_bk_tickers_us;
+uint32_t ag_bk_mouse_us;
+uint32_t ag_ml_input_us;
+uint32_t ag_ml_keys_us;
+uint32_t ag_ml_scripts_us;
+uint32_t ag_ml_maps_us;
+uint32_t ag_ml_present_us;
+uint32_t ag_ml_throttle_us;
+}
+
+static void tickers_report(void)
+{
+    if (s_frames == 0u) {
+        return;
+    }
+    for (int i = 0; i < AG_TICKERS; ++i) {
+        if (ag_ticker_who[i] == NULL) {
+            break;
+        }
+        if (ag_ticker_us[i] / s_frames == 0u) {
+            continue;
+        }
+        shim_printf("[tick] %p %u us/frame (%u calls)\n", ag_ticker_who[i],
+                    (unsigned)(ag_ticker_us[i] / s_frames),
+                    (unsigned)ag_ticker_calls[i]);
+    }
+    /* One known address, so the pointers above can be turned into names:
+     * subtract this from them and add what nm says fps_service is at. */
+    shim_printf("[tick base] fps_service at %p\n", (void *)&tickers_report);
+    shim_printf("[tick t=%u] tickers %u us/frame, mouse %u us/frame\n",
+                (unsigned)ag_millis(),
+                (unsigned)(ag_bk_tickers_us / s_frames),
+                (unsigned)(ag_bk_mouse_us / s_frames));
+    shim_printf("[loop t=%u] input %u, keys %u, scripts %u, maps %u, present %u, throttle %u (us/frame)\n",
+                (unsigned)ag_millis(),
+                (unsigned)(ag_ml_input_us / s_frames),
+                (unsigned)(ag_ml_keys_us / s_frames),
+                (unsigned)(ag_ml_scripts_us / s_frames),
+                (unsigned)(ag_ml_maps_us / s_frames),
+                (unsigned)(ag_ml_present_us / s_frames),
+                (unsigned)(ag_ml_throttle_us / s_frames));
+    ag_ml_input_us = 0;
+    ag_ml_keys_us = 0;
+    ag_ml_scripts_us = 0;
+    ag_ml_maps_us = 0;
+    ag_ml_present_us = 0;
+    ag_ml_throttle_us = 0;
+    shim_printf("[pres t=%u] timers %u, memstat %u, fps %u, input %u, beat %u (us/frame)\n",
+                (unsigned)ag_millis(),
+                (unsigned)(s_pres_timers_us / s_frames),
+                (unsigned)(s_pres_memstat_us / s_frames),
+                (unsigned)(s_pres_fps_us / s_frames),
+                (unsigned)(s_pres_input_us / s_frames),
+                (unsigned)(s_pres_beat_us / s_frames));
+    s_pres_timers_us = 0;
+    s_pres_memstat_us = 0;
+    s_pres_fps_us = 0;
+    s_pres_input_us = 0;
+    s_pres_beat_us = 0;
+    for (int i = 0; i < AG_TICKERS; ++i) {
+        ag_ticker_us[i] = 0;
+        ag_ticker_calls[i] = 0;
+    }
+    ag_bk_tickers_us = 0;
+    ag_bk_mouse_us = 0;
+}
 
 static void fps_service(void)
 {
@@ -615,6 +766,7 @@ static void fps_service(void)
         s_ev_keys = 0;
         s_ev_ptr_move = 0;
         s_ev_ptr_btn = 0;
+        tickers_report();
     }
     ag_tiledist_calls = 0;
     ag_tiledist_steps = 0;
@@ -651,20 +803,51 @@ void sdl_shim_screenshot_now(void)
     write_ppm(s_shot_path);
 }
 
+/*
+ * How often the arena is asked how much of it is left.
+ *
+ * This used to be every frame, and unconditionally - before the check that
+ * turns the rest of this function off.  ag_meminfo is not a counter read: it
+ * walks the heap to find the free total and the largest hole, and the heap in
+ * question is six megabytes of PSRAM holding twenty thousand blocks.  On the
+ * board renderPresent cost 19 ms a frame of which the flush was 2.5, and this
+ * was most of the difference - a diagnostic that the shipping configuration
+ * paid for on every frame whether -memstat was given or not.
+ *
+ * Four times a second is enough for what it is for.  The low-water mark it
+ * keeps is "what the game held between frames at its worst", and a peak that
+ * lasts less than a quarter of a second is not what decides whether the next
+ * map loads; the transient peak, which is the one that does, is counted in the
+ * allocator itself and costs nothing.
+ */
+#define ARENA_SAMPLE_MS 250u
+
 static void memstat_service(void)
 {
-    ag_meminfo_t mi;
-    ag_meminfo(&mi);
-    if (mi.arena_free < s_arena_low) {
-        s_arena_low = mi.arena_free;
+    const uint32_t now = (uint32_t)ag_millis();
+    static uint32_t sample_next;
+
+    /* And only when somebody is going to read it.  One ag_meminfo on the
+     * board's six megabyte arena measured about twelve milliseconds - four a
+     * second is 1.5 ms a frame, which is five per cent of a frame spent
+     * keeping a number for a report nobody asked for. */
+    if ((s_memstat_ms != 0u || s_hud) && now >= sample_next) {
+        sample_next = now + ARENA_SAMPLE_MS;
+        ag_meminfo_t mi;
+        ag_meminfo(&mi);
+        if (mi.arena_free < s_arena_low) {
+            s_arena_low = mi.arena_free;
+        }
     }
+
     if (s_memstat_ms == 0) {
         return;
     }
-    const uint32_t now = (uint32_t)ag_millis();
     if (now < s_memstat_next) {
         return;
     }
+    ag_meminfo_t mi;
+    ag_meminfo(&mi);
     s_memstat_next = now + s_memstat_ms;
     /* The report budget is per window rather than per run.  A fixed budget is
      * spent entirely on startup - the engine asks for six megabytes before it
@@ -1029,7 +1212,9 @@ int SDL_UpperBlit(SDL_Surface *src, const SDL_Rect *srcrect, SDL_Surface *dst,
         return 0;
     }
 
-    const ag_time_t blit_t0 = (s_fps_ms != 0u) ? ag_micros() : 0;
+    /* Timed unconditionally.  It used to be timed only under -fps, and the
+     * readout on the glass needs the same number when nothing is printing. */
+    const ag_time_t blit_t0 = ag_micros();
 
     /*
      * The reduction, when the panel is smaller than the picture.  The rectangle
@@ -1074,6 +1259,31 @@ int SDL_UpperBlit(SDL_Surface *src, const SDL_Rect *srcrect, SDL_Surface *dst,
         return 0;
     }
 
+    /*
+     * What actually came out different, in destination coordinates.  Every
+     * loop below stores through CHANGED(), which writes only when the pixel is
+     * not already what it should be and records where that happened.
+     *
+     * The reason is a measurement.  Standing still in the Temple of Trials the
+     * board spent 8.2 ms a frame converting the whole 640x480 and another
+     * 8.1 ms hashing the result at the far end - 16 of every 47 ms - on a
+     * picture that was identical to the last one.  The engine asks for it:
+     * Fallout cycles its palette, and every cycle calls
+     * directDrawSetPaletteInRange, which re-blits the entire screen.  The
+     * fastest of those cycles runs at thirty hertz and animates one entry -
+     * the red light on the interface bar.  So the whole screen was being
+     * redrawn thirty times a second for one blinking lamp.
+     *
+     * Comparing before storing is close to free where it counts: the cache
+     * line has to be fetched to be written anyway, so the load is already
+     * paid for, and a pixel that does not change saves the store.  What it
+     * buys is that the damage rectangle handed to the panel is the truth
+     * rather than "the caller touched this area".
+     */
+    int cx0 = ddw, cx1 = -1, cy0 = ddh, cy1 = -1;
+#define CHANGED(dp, xi, val)                                                       do {                                                                               const Uint16 v_ = (Uint16)(val);                                               if ((dp)[xi] != v_) {                                                              (dp)[xi] = v_;                                                                 if ((xi) < rx0) rx0 = (xi);                                                    if ((xi) > rx1) rx1 = (xi);                                                }                                                                          } while (0)
+#define ROW_DONE(yi)                                                               do {                                                                               if (rx1 >= rx0) {                                                                  if (rx0 < cx0) cx0 = rx0;                                                      if (rx1 > cx1) cx1 = rx1;                                                      if ((yi) < cy0) cy0 = (yi);                                                    if ((yi) > cy1) cy1 = (yi);                                                }                                                                          } while (0)
+
     if (shift == 0) {
         /* The ordinary case, and the one that runs three hundred thousand
          * times a frame: no arithmetic in the inner loop that was not there
@@ -1083,9 +1293,11 @@ int SDL_UpperBlit(SDL_Surface *src, const SDL_Rect *srcrect, SDL_Surface *dst,
                              (size_t)(sy + y) * src->pitch + sx;
             Uint16 *d = (Uint16 *)((Uint8 *)dst->pixels +
                                    (size_t)(ddy + y) * dst->pitch) + ddx;
+            int rx0 = ddw, rx1 = -1;
             for (int x = 0; x < ddw; ++x) {
-                d[x] = lut[s[x]];
+                CHANGED(d, x, lut[s[x]]);
             }
+            ROW_DONE(y);
         }
     } else if (!s_scale_sharp) {
         /*
@@ -1122,10 +1334,12 @@ int SDL_UpperBlit(SDL_Surface *src, const SDL_Rect *srcrect, SDL_Surface *dst,
             const Uint8 *sp = (const Uint8 *)src->pixels +
                               (size_t)syy * src->pitch + base + (x0 << shift);
             Uint16 *dp = (Uint16 *)((Uint8 *)dst->pixels +
-                                    (size_t)(ddy + y) * dst->pitch) + ddx + x0;
+                                    (size_t)(ddy + y) * dst->pitch) + ddx;
+            int rx0 = ddw, rx1 = -1;
             for (int x = x0; x < x1; ++x, sp += step) {
-                *dp++ = lut[*sp];
+                CHANGED(dp, x, lut[*sp]);
             }
+            ROW_DONE(y);
         }
     } else {
         /* Two rows at a time, because the choice is made across a 2x2 block.
@@ -1143,6 +1357,7 @@ int SDL_UpperBlit(SDL_Surface *src, const SDL_Rect *srcrect, SDL_Surface *dst,
                 (const Uint8 *)src->pixels + (size_t)syy2 * src->pitch;
             Uint16 *d = (Uint16 *)((Uint8 *)dst->pixels +
                                    (size_t)(ddy + y) * dst->pitch) + ddx;
+            int rx0 = ddw, rx1 = -1;
             for (int x = 0; x < ddw; ++x) {
                 const int sxx = sx + (((ddx + x) << shift) - dx);
                 if (sxx < 0 || sxx >= src->w) {
@@ -1162,14 +1377,21 @@ int SDL_UpperBlit(SDL_Surface *src, const SDL_Rect *srcrect, SDL_Surface *dst,
                 const unsigned bb = ((unsigned)s_pal_b[p0] + s_pal_b[p1] +
                                      s_pal_b[p2] + s_pal_b[p3]) >> 2;
 
-                d[x] = (Uint16)((rr << 11) | (gg << 5) | bb);
+                CHANGED(d, x, (rr << 11) | (gg << 5) | bb);
             }
+            ROW_DONE(y);
         }
     }
+#undef CHANGED
+#undef ROW_DONE
 
-    if (s_fps_ms != 0u) {
-        s_blit_us += (uint64_t)(ag_micros() - blit_t0);
-        s_blit_px += (uint64_t)ddw * (uint64_t)ddh;
+    {
+        const uint32_t took = (uint32_t)(ag_micros() - blit_t0);
+        s_blit_frame_us += took;
+        if (s_fps_ms != 0u) {
+            s_blit_us += (uint64_t)took;
+            s_blit_px += (uint64_t)ddw * (uint64_t)ddh;
+        }
     }
 
     /* Remember what changed, so that the present after it can send that and
@@ -1177,7 +1399,9 @@ int SDL_UpperBlit(SDL_Surface *src, const SDL_Rect *srcrect, SDL_Surface *dst,
      * a surface of our own is copied wholesale later anyway.  In panel
      * coordinates, which is what the flush wants. */
     if (dst->pixels == s_gfx.fb) {
-        dirty_add(ddx, ddy, ddw, ddh);
+        if (cx1 >= cx0 && cy1 >= cy0) {
+            dirty_add(ddx + cx0, ddy + cy0, cx1 - cx0 + 1, cy1 - cy0 + 1);
+        }
         s_panel_src = src;
         s_panel_dst = dst;
     }
@@ -1473,8 +1697,6 @@ int SDL_RenderCopy(SDL_Renderer *r, SDL_Texture *t, const SDL_Rect *s,
  * the framebuffer after the flush, so the next frame paints over it and it is
  * redrawn - which costs a few hundred pixels and no state.
  */
-static int s_hud;
-static unsigned s_hud_fps10;   /* frames per second, tenths */
 
 void sdl_shim_hud(int on)
 {
@@ -1494,6 +1716,36 @@ static const unsigned char k_hud_font[11][5] = {
     { 7, 5, 7, 5, 7 }, /* 8 */
     { 7, 5, 7, 1, 7 }, /* 9 */
     { 0, 0, 0, 0, 0 }, /* space */
+};
+
+/*
+ * And the letters, because a column of bare numbers is a column somebody has
+ * to remember the order of.  Three pixels wide is not much for an alphabet and
+ * it does not need to be one: these are the only letters the readout uses, and
+ * they are read in a known word rather than one at a time.
+ */
+static const char k_hud_letters[] = "FPSMINLOEGWRBTKAV%/.";
+static const unsigned char k_hud_letter_font[][5] = {
+    { 7, 4, 6, 4, 4 }, /* F */
+    { 7, 5, 7, 4, 4 }, /* P */
+    { 3, 4, 2, 1, 6 }, /* S */
+    { 5, 7, 7, 5, 5 }, /* M */
+    { 7, 2, 2, 2, 7 }, /* I */
+    { 5, 7, 7, 7, 5 }, /* N */
+    { 4, 4, 4, 4, 7 }, /* L */
+    { 7, 5, 5, 5, 7 }, /* O */
+    { 7, 4, 7, 4, 7 }, /* E */
+    { 7, 4, 5, 5, 7 }, /* G */
+    { 5, 5, 7, 7, 5 }, /* W */
+    { 7, 5, 7, 6, 5 }, /* R */
+    { 7, 5, 6, 5, 7 }, /* B */
+    { 7, 2, 2, 2, 2 }, /* T */
+    { 5, 5, 6, 5, 5 }, /* K */
+    { 7, 5, 7, 5, 5 }, /* A */
+    { 5, 5, 5, 5, 2 }, /* V */
+    { 5, 1, 2, 4, 5 }, /* % */
+    { 1, 1, 2, 4, 4 }, /* / */
+    { 0, 0, 0, 2, 0 }, /* . */
 };
 
 static void hud_glyph(int x, int y, int glyph, Uint16 colour)
@@ -1530,42 +1782,264 @@ static int hud_number(int x, int y, unsigned value, int digits, Uint16 colour)
     return x + digits * 4;
 }
 
+/* One character.  Digits come from the digit table, letters from the other
+ * one, and anything unknown is a gap - the caller is not going to be told off
+ * for a stray character in a readout. */
+static void hud_char(int x, int y, char c, Uint16 colour)
+{
+    if (c >= '0' && c <= '9') {
+        hud_glyph(x, y, c - '0', colour);
+        return;
+    }
+    if (c == ' ') {
+        return;
+    }
+    for (int i = 0; k_hud_letters[i] != ' '; ++i) {
+        if (k_hud_letters[i] != c) {
+            continue;
+        }
+        for (int row = 0; row < 5; ++row) {
+            const unsigned bits = k_hud_letter_font[i][row];
+            const int py = y + row;
+            if (py < 0 || py >= (int)s_gfx.height) {
+                continue;
+            }
+            Uint16 *d =
+                (Uint16 *)((Uint8 *)s_gfx.fb + (size_t)py * s_gfx.stride);
+            for (int col = 0; col < 3; ++col) {
+                if ((bits & (4u >> col)) == 0) {
+                    continue;
+                }
+                const int px = x + col;
+                if (px >= 0 && px < (int)s_gfx.width) {
+                    d[px] = colour;
+                }
+            }
+        }
+        return;
+    }
+}
+
+static int hud_text(int x, int y, const char *text, Uint16 colour)
+{
+    for (; *text != ' '; ++text) {
+        hud_char(x, y, *text, colour);
+        x += 4;
+    }
+    return x;
+}
+
+/* ---------------------------------------------------------------------- */
+/* What the readout is actually for                                       */
+/* ---------------------------------------------------------------------- */
+
+/*
+ * An average is the number that hides the complaint.
+ *
+ * This port has been measured at thirty frames a second standing still in the
+ * Temple of Trials while the person playing it was seeing five, and both were
+ * true: the harness stands still with no pointer and never scrolls, and a
+ * screen that does not change costs almost nothing on the wire.  What a player
+ * sees is the worst frames, not the mean of all of them, and what the worst
+ * frames are made of is the whole question - a frame the engine took a fifth
+ * of a second to think about and a frame that took a fifth of a second to
+ * reach the glass look identical from the chair.
+ *
+ * So the readout carries three kinds of number:
+ *
+ *   how many   - the mean rate, the worst frame in the window, and the share
+ *                of frames slower than a tenth of a second;
+ *   where      - milliseconds a frame in the engine, in the halving, and on
+ *                the wire, side by side, which is the separation that cannot
+ *                be made by watching;
+ *   room       - the arena in use and the largest hole in it, because a
+ *                stutter that is really the art cache thrashing shows here
+ *                first.
+ *
+ * Five one-second buckets, rolled forward, so nothing jumps back to zero while
+ * it is being read.
+ */
+#define HUD_BUCKETS 5u
+#define HUD_SLOW_US 100000u /* a frame slower than this is one of the bad ones */
+
+typedef struct {
+    uint32_t frames;
+    uint32_t worst_us;
+    /* And what that one frame was made of.  An average over a second says the
+     * machine is fine; the frame a person actually noticed is one frame, and
+     * "the engine took a fifth of a second" and "the wire took a fifth of a
+     * second" are different faults with the same symptom. */
+    uint32_t worst_blit_us;
+    uint32_t worst_wire_us;
+    uint32_t slow;
+    uint64_t sum_us;
+    uint64_t blit_us;
+    uint64_t wire_us;
+    uint64_t wire_px;
+} hud_bucket_t;
+
+static hud_bucket_t s_hb[HUD_BUCKETS];
+static unsigned     s_hb_at;
+static uint32_t     s_hb_next_ms;
+static uint32_t     s_hud_last_us;
+
+/* Filled in by hud_tick, drawn by hud_draw, printed by hud_log. */
+static unsigned s_hud_fps100;   /* mean frames per second, hundredths */
+static unsigned s_hud_min100;   /* the worst frame as a rate, hundredths */
+static unsigned s_hud_slow_pct;
+static unsigned s_hud_eng_ms, s_hud_blit_ms, s_hud_wire_ms, s_hud_wire_kbs;
+static unsigned s_hud_worst_ms, s_hud_worst_eng_ms, s_hud_worst_wire_ms;
+static unsigned s_hud_used_kb, s_hud_hole_kb;
+
+/*
+ * One frame's worth, from the present that ends it.  Called whether or not
+ * anything is being drawn or printed: the cost is a subtraction, and a readout
+ * that only starts counting when it is switched on cannot show the second it
+ * was switched on in.
+ */
+static void hud_frame(uint32_t frame_us, uint32_t blit_us, uint32_t wire_us,
+                      uint32_t wire_px)
+{
+    hud_bucket_t *b = &s_hb[s_hb_at];
+    b->frames++;
+    b->sum_us += frame_us;
+    b->blit_us += blit_us;
+    b->wire_us += wire_us;
+    b->wire_px += wire_px;
+    if (frame_us > b->worst_us) {
+        b->worst_us = frame_us;
+        b->worst_blit_us = blit_us;
+        b->worst_wire_us = wire_us;
+    }
+    if (frame_us >= HUD_SLOW_US) {
+        b->slow++;
+    }
+}
+
 /*
  * A frame rate of its own, because -fps prints once a window and the readout
  * wants a number every second whether anything is being printed or not.
  */
 static void hud_tick(void)
 {
-    static uint32_t next;
-    static uint32_t frames;
-    static uint32_t started;
-
-    if (!s_hud) {
-        return;
-    }
-
     const uint32_t now = (uint32_t)ag_millis();
-    frames++;
 
-    if (next == 0u) {
-        next = now + 1000u;
-        started = now;
-        frames = 0u;
+    if (s_hb_next_ms == 0u) {
+        s_hb_next_ms = now + 1000u;
         return;
     }
-    if (now < next) {
+    if (now < s_hb_next_ms) {
         return;
     }
+    s_hb_next_ms = now + 1000u;
 
-    const uint32_t span = now - started;
-    s_hud_fps10 = (span > 0u) ? (frames * 10000u / span) : 0u;
-    if (s_hud_fps10 > 999u) {
-        s_hud_fps10 = 999u;
+    /* Everything the five buckets hold, before the oldest is thrown away. */
+    uint32_t frames = 0, slow = 0, worst = 0, worst_blit = 0, worst_wire = 0;
+    uint64_t sum = 0, blit = 0, wire = 0, px = 0;
+    for (unsigned i = 0; i < HUD_BUCKETS; ++i) {
+        frames += s_hb[i].frames;
+        slow += s_hb[i].slow;
+        sum += s_hb[i].sum_us;
+        blit += s_hb[i].blit_us;
+        wire += s_hb[i].wire_us;
+        px += s_hb[i].wire_px;
+        if (s_hb[i].worst_us > worst) {
+            worst = s_hb[i].worst_us;
+            worst_blit = s_hb[i].worst_blit_us;
+            worst_wire = s_hb[i].worst_wire_us;
+        }
     }
-    frames = 0u;
-    started = now;
-    next = now + 1000u;
+
+    if (frames > 0u && sum > 0u) {
+        uint64_t fps100 = (uint64_t)frames * 100000000ull / sum;
+        s_hud_fps100 = (unsigned)((fps100 > 99999ull) ? 99999ull : fps100);
+        s_hud_slow_pct = (unsigned)(slow * 100u / frames);
+        const uint64_t frame_us = sum / frames;
+        const uint64_t blit_us = blit / frames;
+        const uint64_t wire_us = wire / frames;
+        /* The engine is what is left when the two costs this port can name are
+         * taken out.  Named by subtraction on purpose: an unaccounted
+         * millisecond then shows up as engine rather than vanishing. */
+        const uint64_t eng_us =
+            (frame_us > blit_us + wire_us) ? frame_us - blit_us - wire_us : 0u;
+        s_hud_eng_ms = (unsigned)(eng_us / 1000u);
+        s_hud_blit_ms = (unsigned)(blit_us / 1000u);
+        s_hud_wire_ms = (unsigned)(wire_us / 1000u);
+        /* Kilobytes a second the wire was asked to carry.  Asked, not sent:
+         * the driver trims a rectangle against what the far end already has
+         * and this side never learns by how much.  A number that is much
+         * larger than the wire can carry is the answer either way. */
+        s_hud_wire_kbs = (unsigned)(px * 2ull / 1024ull / HUD_BUCKETS);
+    }
+    if (worst > 0u) {
+        uint64_t min100 = 100000000ull / worst;
+        s_hud_min100 = (unsigned)((min100 > 99999ull) ? 99999ull : min100);
+        s_hud_worst_ms = worst / 1000u;
+        s_hud_worst_wire_ms = worst_wire / 1000u;
+        s_hud_worst_eng_ms =
+            (worst > worst_blit + worst_wire)
+                ? ((worst - worst_blit - worst_wire) / 1000u)
+                : 0u;
+    }
+
+    /* The arena, sampled here rather than every frame: one ag_meminfo on the
+     * board's six megabytes measured about twelve milliseconds. */
+    if (s_hud || s_memstat_ms != 0u) {
+        ag_meminfo_t mi;
+        ag_meminfo(&mi);
+        s_hud_used_kb = (unsigned)((mi.arena_total - mi.arena_free) / 1024u);
+        s_hud_hole_kb = (unsigned)(mi.arena_largest / 1024u);
+    }
+
+    /*
+     * To the log as well as the glass.  The glass is the point - the person
+     * playing it is the instrument that matters - but a run left going while
+     * nobody is watching still has to be readable afterwards, and the two
+     * numbers must be the same numbers or there is nothing to compare.
+     */
+    shim_printf("[hud t=%u] fps %u.%02u min %u.%02u lo %u%%  "
+                "eng %u blit %u wire %u ms  wire %u KB/s  "
+                "worst %u ms (eng %u, wire %u)  "
+                "arena %u used, hole %u\n",
+                (unsigned)now, s_hud_fps100 / 100u, s_hud_fps100 % 100u,
+                s_hud_min100 / 100u, s_hud_min100 % 100u, s_hud_slow_pct,
+                s_hud_eng_ms, s_hud_blit_ms, s_hud_wire_ms, s_hud_wire_kbs,
+                s_hud_worst_ms, s_hud_worst_eng_ms, s_hud_worst_wire_ms,
+                s_hud_used_kb, s_hud_hole_kb);
+
+    s_hb_at = (s_hb_at + 1u) % HUD_BUCKETS;
+    s_hb[s_hb_at].frames = 0;
+    s_hb[s_hb_at].worst_us = 0;
+    s_hb[s_hb_at].slow = 0;
+    s_hb[s_hb_at].sum_us = 0;
+    s_hb[s_hb_at].blit_us = 0;
+    s_hb[s_hb_at].wire_us = 0;
+    s_hb[s_hb_at].wire_px = 0;
 }
+
+/* Green, amber, red by how bad the number is - so the readout can be taken in
+ * without being read. */
+static Uint16 hud_rate_colour(unsigned rate100)
+{
+    if (rate100 >= 2000u) {
+        return 0x07E0u; /* twenty a second or better */
+    }
+    if (rate100 >= 1000u) {
+        return 0xFFE0u; /* ten to twenty */
+    }
+    return 0xF800u;
+}
+
+/* A number with two decimals, right where the cursor is. */
+static int hud_rate(int x, int y, unsigned rate100, Uint16 colour)
+{
+    x = hud_number(x, y, rate100 / 100u, (rate100 >= 10000u) ? 3 : 2, colour);
+    x = hud_text(x, y, ".", colour);
+    return hud_number(x, y, rate100 % 100u, 2, colour);
+}
+
+#define HUD_W 116
+#define HUD_H 22
 
 static void hud_draw(void)
 {
@@ -1573,38 +2047,82 @@ static void hud_draw(void)
         return;
     }
 
-    ag_meminfo_t mi;
-    ag_meminfo(&mi);
-
-    const unsigned used = (unsigned)((mi.arena_total - mi.arena_free) / 1024u);
-    const unsigned largest = (unsigned)(mi.arena_largest / 1024u);
-    const unsigned fps10 = s_hud_fps10;
-
-    /* Green while there is room for a full-screen buffer, amber when the
-     * largest hole is under half of one, red under a quarter - the three
-     * states that decide whether the next dialogue opens. */
-    Uint16 colour = 0x07E0u;
-    if (largest < 300u) {
-        colour = 0xFFE0u;
-    }
-    if (largest < 150u) {
-        colour = 0xF800u;
-    }
+    const int w = (HUD_W < (int)s_gfx.width) ? HUD_W : (int)s_gfx.width;
+    const int h = (HUD_H < (int)s_gfx.height) ? HUD_H : (int)s_gfx.height;
 
     /* A black strip behind it, or the numbers vanish into the picture. */
-    for (int y = 0; y < 7; ++y) {
+    for (int y = 0; y < h; ++y) {
         Uint16 *d = (Uint16 *)((Uint8 *)s_gfx.fb + (size_t)y * s_gfx.stride);
-        for (int x = 0; x < 60 && x < (int)s_gfx.width; ++x) {
+        for (int x = 0; x < w; ++x) {
             d[x] = 0;
         }
     }
 
-    /* Three plus one is the pitch of a digit; three more between the numbers,
-     * or they read as one long one. */
+    const Uint16 white = 0xFFFFu;
+    const Uint16 fps_c = hud_rate_colour(s_hud_fps100);
+    const Uint16 min_c = hud_rate_colour(s_hud_min100);
+
+    /* Row one: how many.  The mean, the worst frame in the last five seconds
+     * as a rate, and the share of frames slower than a tenth of a second. */
     int x = 1;
-    x = hud_number(x, 1, fps10 / 10u, 2, colour) + 3;   /* frames per second */
-    x = hud_number(x, 1, used, 4, colour) + 3;          /* arena in use, KB */
-    (void)hud_number(x, 1, largest, 4, colour);         /* largest free block */
+    x = hud_text(x, 1, "FPS", white);
+    x = hud_rate(x + 2, 1, s_hud_fps100, fps_c) + 3;
+    x = hud_text(x, 1, "MIN", white);
+    x = hud_rate(x + 2, 1, s_hud_min100, min_c) + 3;
+    x = hud_text(x, 1, "LO", white);
+    x = hud_number(x + 2, 1, s_hud_slow_pct, 2,
+                   (s_hud_slow_pct >= 20u) ? 0xF800u : 0x07E0u);
+    (void)hud_text(x, 1, "%", white);
+
+    /*
+     * Row two: where it went, and this is the row the whole readout exists
+     * for.  A frame the engine thought about for two hundred milliseconds and
+     * a frame that took two hundred milliseconds to reach the glass are the
+     * same stutter from the chair and different problems entirely.
+     */
+    x = 1;
+    x = hud_text(x, 8, "EG", white);
+    x = hud_number(x + 2, 8, s_hud_eng_ms, 3, 0xFD20u) + 3;   /* orange */
+    x = hud_text(x, 8, "BT", white);
+    x = hud_number(x + 2, 8, s_hud_blit_ms, 3, 0x07FFu) + 3;  /* cyan */
+    x = hud_text(x, 8, "WR", white);
+    x = hud_number(x + 2, 8, s_hud_wire_ms, 3, 0xF81Fu) + 4;  /* magenta */
+    /* The same split for the worst frame in the window, which is the frame
+     * that was actually noticed.  White so it reads as a different kind of
+     * number from the averages beside it. */
+    x = hud_number(x, 8, s_hud_worst_eng_ms, 3, 0xFD20u);
+    x = hud_text(x, 8, "/", white);
+    (void)hud_number(x, 8, s_hud_worst_wire_ms, 3, 0xF81Fu);
+
+    /* Row three: the wire's load, and the room left in the arena.  Green while
+     * there is space for a full-screen buffer, amber under half of one, red
+     * under a quarter - the three states that decide whether the next
+     * dialogue opens. */
+    Uint16 mem_c = 0x07E0u;
+    if (s_hud_hole_kb < 300u) {
+        mem_c = 0xFFE0u;
+    }
+    if (s_hud_hole_kb < 150u) {
+        mem_c = 0xF800u;
+    }
+    x = 1;
+    x = hud_text(x, 15, "KBS", white);
+    x = hud_number(x + 2, 15, s_hud_wire_kbs, 3, 0xF81Fu) + 3;
+    x = hud_text(x, 15, "MEM", white);
+    x = hud_number(x + 2, 15, s_hud_used_kb, 4, mem_c) + 3;
+    x = hud_text(x, 15, "/", white);
+    (void)hud_number(x, 15, s_hud_hole_kb, 4, mem_c);
+
+    /*
+     * And say that these pixels changed.
+     *
+     * The readout used to be drawn after the flush, on the assumption that the
+     * next frame would paint over it and send it - which was true while the
+     * whole screen was being flushed every frame for the palette cycle.  It is
+     * not true now that only real changes are sent: a still screen sends
+     * nothing, and a readout nobody sends is a readout nobody can read.
+     */
+    dirty_add(0, 0, w, h);
 }
 
 void SDL_RenderPresent(SDL_Renderer *r)
@@ -1615,24 +2133,108 @@ void SDL_RenderPresent(SDL_Renderer *r)
     }
 
     if (s_gfx.fb != NULL) {
+        /*
+         * Eight rows of the panel, four times a second, whether anything drew
+         * into them or not - walking down the screen and starting again.
+         *
+         * Two things need this.  A monitor at the end of a wire can be
+         * unplugged and plugged back in, and when it comes back the driver
+         * forgets everything it believed the far end had - but it keeps hashes,
+         * not pixels, so it cannot repaint on its own and has to wait for a
+         * flush.  And a frame the wire loses to noise leaves that part of the
+         * glass showing the frame before it, because over there the hash says
+         * it was sent.  Both come right on a flush that covers those rows.
+         *
+         * While the blit dirtied whatever the caller touched, such a flush
+         * arrived thirty times a second by accident - the palette cycle
+         * re-blitting the screen.  Now that only real changes are sent, a
+         * still screen sends nothing at all, so the repaint is asked for on
+         * purpose.
+         *
+         * A strip rather than the whole panel, and this is the second version:
+         * the first asked for all 320x240 every two seconds, which is 150 KB
+         * to hash and up to 40 KB to send in one go - a hitch of about a
+         * tenth of a second, twice a minute apart, and what that looks like
+         * from the chair is a mouse pointer that stalls.  Eight rows is five
+         * kilobytes, under a fiftieth of a second, and the whole screen is
+         * covered every seven and a half - which is the same ceiling the
+         * driver's own repair sweep already documents.
+         */
+        const uint32_t now_ms = (uint32_t)ag_millis();
+        if (s_repaint_next_ms == 0u) {
+            s_repaint_next_ms = now_ms + REPAINT_EVERY_MS;
+        } else if (now_ms >= s_repaint_next_ms) {
+            s_repaint_next_ms = now_ms + REPAINT_EVERY_MS;
+            const int strip = 8;
+            const int rows = (int)s_gfx.height / strip;
+            if (rows > 0) {
+                s_repaint_strip = (s_repaint_strip + 1) % rows;
+                dirty_add(0, s_repaint_strip * strip, (int)s_gfx.width, strip);
+            }
+        }
+
+        /* The readout first, so that its own pixels are part of the damage
+         * this present sends rather than waiting for the next one. */
+        hud_tick();
+        hud_draw();
+
         /* Only what was drawn into.  Nothing drawn means nothing to send -
          * the engine presents on a timer as well as after a change, and a
          * still screen should cost nothing. */
+        uint32_t wire_us = 0, wire_px = 0;
         if (s_dirty_x1 > s_dirty_x0 && s_dirty_y1 > s_dirty_y0) {
+            /*
+             * Grown out to the panel driver's block, which is eight pixels
+             * square.  REMDISP compares a rectangle against its record of what
+             * the far end has only when the rectangle starts on a block
+             * boundary; one that does not is sent whole and makes those rows
+             * forget, so an exact three-pixel-wide rectangle costs more on the
+             * wire than a sixteen-pixel one that can be trimmed.  Snapping
+             * here means the driver sees rectangles it can work with, and the
+             * few extra pixels are compared and dropped rather than sent.
+             */
+            const int blk = 8;
+            int fx1 = (s_dirty_x1 + blk - 1) & ~(blk - 1);
+            int fy1 = (s_dirty_y1 + blk - 1) & ~(blk - 1);
+            if (fx1 > (int)s_gfx.width) {
+                fx1 = (int)s_gfx.width;
+            }
+            if (fy1 > (int)s_gfx.height) {
+                fy1 = (int)s_gfx.height;
+            }
+            s_dirty_x0 &= ~(blk - 1);
+            s_dirty_y0 &= ~(blk - 1);
+            s_dirty_x1 = fx1;
+            s_dirty_y1 = fy1;
             const int fw = s_dirty_x1 - s_dirty_x0;
             const int fh = s_dirty_y1 - s_dirty_y0;
-            const ag_time_t t0 = (s_fps_ms != 0u) ? ag_micros() : 0;
+            /* Always timed now.  It used to be timed only under -fps, and
+             * the readout needs the same number without it. */
+            const ag_time_t t0 = ag_micros();
             ag_gfx_flush((uint16_t)s_dirty_x0, (uint16_t)s_dirty_y0,
                          (uint16_t)fw, (uint16_t)fh);
+            wire_us = (uint32_t)(ag_micros() - t0);
+            wire_px = (uint32_t)fw * (uint32_t)fh;
             if (s_fps_ms != 0u) {
-                s_flush_us += (uint64_t)(ag_micros() - t0);
-                s_flush_px += (uint64_t)fw * (uint64_t)fh;
+                s_flush_us += (uint64_t)wire_us;
+                s_flush_px += (uint64_t)wire_px;
                 s_flushes++;
             }
             dirty_none();
         }
-        hud_tick();
-        hud_draw();
+
+        /* And the frame this present ends, into the rolling window. */
+        {
+            const uint32_t now_us = (uint32_t)ag_micros();
+            const uint32_t frame_us =
+                (s_hud_last_us != 0u) ? (now_us - s_hud_last_us) : 0u;
+            s_hud_last_us = now_us;
+            if (frame_us != 0u && frame_us < 5000000u) {
+                hud_frame(frame_us, (uint32_t)s_blit_frame_us, wire_us,
+                          wire_px);
+            }
+            s_blit_frame_us = 0;
+        }
     } else if (s_frame_px != NULL && AG_HAS(g_ag_api->gfx, present)) {
         const ag_blit_t b = {
             .px = s_frame_px,
@@ -1650,18 +2252,31 @@ void SDL_RenderPresent(SDL_Renderer *r)
     /* The engine's frame loop has no other place to be interrupted, and a
      * process that never yields is a process the supervisor kills.  The
      * timers are serviced from here for the same reason: it is the one point
-     * the game passes through every frame and nowhere else. */
+     * the game passes through every frame and nowhere else.
+     *
+     * Timed, because renderPresent turned out to cost 19 ms a frame against
+     * 2.5 for the flush inside it, and everything else it does is here. */
+    const uint32_t p0 = (uint32_t)ag_micros();
     timers_service();
+    const uint32_t p1 = (uint32_t)ag_micros();
     memstat_service();
+    const uint32_t p2 = (uint32_t)ag_micros();
     ++s_frames;
     s_last_present_ms = (uint32_t)ag_millis();
     s_stall_next_ms = 0u;
     fps_service();
+    const uint32_t p3 = (uint32_t)ag_micros();
     /* And the input drivers, which pump their sockets only when read.  A movie
      * runs for minutes without the engine asking for a single event, and a
      * driver unread for that long has lost its connection. */
     sdl_shim_input_service();
+    const uint32_t p4 = (uint32_t)ag_micros();
     ag_heartbeat();
+    s_pres_timers_us += p1 - p0;
+    s_pres_memstat_us += p2 - p1;
+    s_pres_fps_us += p3 - p2;
+    s_pres_input_us += p4 - p3;
+    s_pres_beat_us += (uint32_t)ag_micros() - p4;
 
     ++s_present_count;
     if ((s_shot_after > 0 && s_present_count >= s_shot_after) ||

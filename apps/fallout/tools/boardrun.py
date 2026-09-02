@@ -63,7 +63,9 @@ def shell(port, cmds, timeout=120, reset=True):
     A version that let the exception out lost a whole configuration of a sweep
     to a game that was working perfectly.
     """
-    argv = [sys.executable, BOARDTEST, "-p", port, "--timeout", str(timeout)]
+    log = os.path.join(ROOT, "build", "boardrun-console.log")
+    argv = [sys.executable, BOARDTEST, "-p", port, "--timeout", str(timeout),
+            "--quiet", "--log", log]
     if not reset:
         argv.append("--no-reset")
     argv += cmds
@@ -72,7 +74,6 @@ def shell(port, cmds, timeout=120, reset=True):
     except subprocess.TimeoutExpired:
         print("  (no prompt back; the application still has the console)",
               flush=True)
-    log = os.path.join(ROOT, "build", "board.log")
     try:
         with open(log, "rb") as f:
             return f.read().decode("latin-1")

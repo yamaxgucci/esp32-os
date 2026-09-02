@@ -315,7 +315,7 @@ static uint32_t block_hash(const uint8_t *src, uint32_t stride, uint32_t rows,
 static uint32_t s_heal_band;
 static uint64_t s_heal_band_at;
 
-static void heal_a_band(void)
+static void heal_a_band(uint32_t y, uint32_t h)
 {
     if (s_hash == NULL || s_hash_rows == 0) {
         return;
@@ -326,9 +326,39 @@ static void heal_a_band(void)
     }
     s_heal_band_at = now + HEAL_BAND_US;
 
-    s_heal_band = (s_heal_band + 1u) % s_hash_rows;
+    /*
+     * A row of blocks inside the rectangle that is being sent right now, and
+     * not a row chosen by a counter of its own.
+     *
+     * The point of forgetting a row is that it gets sent again.  A row this
+     * blit does not cover is not sent again by this blit - it waits for a
+     * flush that reaches it, and once the application above only reports the
+     * pixels it really changed, that may be a long wait.  Forgetting a row
+     * inside the current rectangle makes the repair immediate: the blocks read
+     * as changed a few lines below and go out with everything else.
+     *
+     * Which leaves who covers the rest of the screen, and the answer is
+     * whoever is drawing: Fallout's port walks a strip of eight rows down the
+     * panel four times a second for exactly this reason, and the console path
+     * flushes full width anyway.  A row therefore comes round about every
+     * seven and a half seconds, which is the ceiling on how long any part of
+     * the picture can be wrong.
+     */
+    const uint32_t first = y / BLK;
+    if (first >= s_hash_rows) {
+        return;
+    }
+    uint32_t last = (y + (h ? h : 1u) - 1u) / BLK;
+    if (last >= s_hash_rows) {
+        last = s_hash_rows - 1u;
+    }
+    const uint32_t span = (last >= first) ? (last - first + 1u) : 1u;
+    const uint32_t r = first + (s_heal_band++ % span);
+    if (r >= s_hash_rows) {
+        return;
+    }
     for (uint32_t c = 0; c < s_hash_cols; c++) {
-        s_hash[(size_t)s_heal_band * s_hash_cols + c] = 0;
+        s_hash[(size_t)r * s_hash_cols + c] = 0;
     }
 }
 
@@ -641,25 +671,37 @@ static void rem_blit_rect(ag_handle_t h, const ag_blit_t *b)
     }
 
     poll_far_end();
-    heal_a_band();
+    heal_a_band((uint32_t)b->y, b->h);
 
     const uint8_t *src = (const uint8_t *)b->px;
     /*
      * The hash grid is in the surface's own coordinates and its blocks are
      * eight pixels square, so a band can be compared against it only when it
-     * lines up: the blit has to start on a block boundary vertically and span
-     * the surface horizontally.
+     * lines up - on a block boundary in both directions.  It does not have to
+     * span the surface: a rectangle that starts on a block boundary covers a
+     * run of grid columns and those are the ones it updates.
      *
-     * Everything that drives this wire does - the kernel's surface flush and a
-     * game's present both hand over the whole picture - and a blit that does
-     * not is sent whole and made to forget the rows it touched.  That is the
-     * conservative direction: sending too much is slow, and trimming against a
-     * grid that was only partly filled is a screen with holes in it that
-     * nothing ever repairs.
+     * It used to demand the full width, and that was fine while the only
+     * things driving this wire handed over the whole picture.  Then Fallout's
+     * blit learned to report the pixels it really changed, and every flush
+     * became a narrow rectangle - which took this branch, was sent whole, and
+     * made the rows it touched forget what the far end had.  Sixteen kilobytes
+     * a frame went down the wire where the grid had been sending almost
+     * nothing, and the frame rate fell from 21 to 14 for a change that was
+     * supposed to cut the traffic by ninety per cent.  It did cut it; it also
+     * turned the trimming off.
+     *
+     * A blit that still does not line up is sent whole and made to forget the
+     * rows it touched.  That is the conservative direction: sending too much
+     * is slow, and trimming against a grid that was only partly filled is a
+     * screen with holes in it that nothing ever repairs.
      */
-    const bool aligned = prev_ready(b->surf_w, b->surf_h) && b->x == 0 &&
-                         (uint32_t)b->w == (uint32_t)b->surf_w &&
-                         ((uint32_t)b->y % BLK) == 0u;
+    const uint32_t bx = (uint32_t)b->x;
+    const uint32_t gx0 = bx / BLK;
+    const uint32_t gcols = ((uint32_t)b->w + BLK - 1u) / BLK;
+    const bool aligned = prev_ready(b->surf_w, b->surf_h) &&
+                         (bx % BLK) == 0u && ((uint32_t)b->y % BLK) == 0u &&
+                         gx0 + gcols <= s_hash_cols;
 
     for (uint32_t band = 0; band < b->h; band += BAND_ROWS) {
         uint32_t rows = b->h - band;
@@ -694,10 +736,10 @@ static void rem_blit_rect(ag_handle_t h, const ag_blit_t *b)
              * price of the hash and it is a couple of hundred pixels.
              */
             uint32_t *row = s_hash + (size_t)(((uint32_t)b->y + band) / BLK) *
-                                         s_hash_cols;
+                                         s_hash_cols + gx0;
             x0 = (uint32_t)b->w;
             x1 = 0;
-            for (uint32_t c = 0; c < s_hash_cols; c++) {
+            for (uint32_t c = 0; c < gcols; c++) {
                 uint32_t cols = (uint32_t)b->w - c * BLK;
                 if (cols > BLK) {
                     cols = BLK;

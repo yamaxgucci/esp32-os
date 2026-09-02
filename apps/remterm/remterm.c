@@ -265,6 +265,11 @@ static int next_byte(uint32_t ms)
 }
 
 /* Put back everything after the magic bytes of the frame that just failed. */
+/* Not more often than this, however bad the line gets - see the comment where
+ * it is used. */
+#define ASK_AGAIN_US 1000000ull
+static ag_time_t s_asked_at;
+
 static bool rewind_frame(void)
 {
     if (s_frame_at >= s_have) {
@@ -684,6 +689,33 @@ int ag_main(int argc, char **argv)
         const int claimed = next_byte(20);
         if (claimed < 0 || (uint8_t)claimed != sum) {
             bad++;
+            /*
+             * And say so, because a lost band does not come back on its own.
+             *
+             * The far end keeps a hash of every eight-by-eight block and sends
+             * only what differs from it, which means it believes a band it has
+             * written to the wire has arrived.  A band the checksum rejects
+             * therefore leaves that part of the glass showing the frame before
+             * it, for as long as those pixels do not change again - the stale
+             * rectangle behind a mouse pointer that a person reports as "the
+             * codec is not seeing the change".  There is a slow sweep over
+             * there that forgets one row of blocks every quarter second, so it
+             * does come right, in up to eight seconds.
+             *
+             * The same byte the receiver sends when it starts makes the far end
+             * forget everything at once, so it comes right on the next frame
+             * instead.  Rate limited, and that is not a nicety: a full repaint
+             * is about a hundred kilobytes on a wire that loses a frame every
+             * two hundred, so a repaint per corrupt frame is a repaint that
+             * causes the next one.  One a second, at most; while the line is
+             * healthy this costs nothing at all.
+             */
+            const ag_time_t now = g_ag_api->time->us();
+            if (now - s_asked_at >= ASK_AGAIN_US) {
+                s_asked_at = now;
+                const uint8_t hello = (uint8_t)'H';
+                (void)ag_uart_write(LINK_PORT, &hello, 1u);
+            }
             /* Give back everything this frame swallowed: its length came out
              * of the corruption and the bytes after it are the next frames. */
             (void)rewind_frame();

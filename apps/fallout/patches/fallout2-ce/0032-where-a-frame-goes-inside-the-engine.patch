@@ -1,0 +1,68 @@
+--- a/src/input.cc
++++ b/src/input.cc
+@@ -15,6 +15,17 @@
+ #include "touch.h"
+ #include "win32.h"
+ 
++// ARGON: the port's microsecond clock and the table the timings go in.
++// Defined in apps/fallout/port/sdl_shim.cc, outside any namespace.
++extern "C" {
++uint32_t ag_us(void);
++extern void    *ag_ticker_who[12];
++extern uint32_t ag_ticker_us[12];
++extern uint32_t ag_ticker_calls[12];
++extern uint32_t ag_bk_tickers_us;
++extern uint32_t ag_bk_mouse_us;
++}
++
+ namespace fallout {
+ 
+ typedef struct InputEvent {
+@@ -185,10 +196,17 @@
+ {
+     int v1;
+ 
++    // ARGON: timed, because "the engine" was not an answer.  See the note in
++    // tickersExecute below.
++    const uint32_t t0 = ag_us();
+     tickersExecute();
++    const uint32_t t1 = ag_us();
+ 
+     _mouse_info();
+ 
++    ag_bk_tickers_us += t1 - t0;
++    ag_bk_mouse_us += ag_us() - t1;
++
+     v1 = _win_check_all_buttons();
+     if (v1 != -1) {
+         enqueueInputEvent(v1);
+@@ -287,7 +305,29 @@
+ 
+             internal_free(curr);
+         } else {
++            // ARGON: each ticker timed against its own address.
++            //
++            // Fallout does its per-frame work here - music streaming, the
++            // mouse, animation, the palette cycle, the script background pass
++            // - so a frame that is slow is slow in one of these, and which one
++            // is a question the board could not answer.  Keying on the
++            // function pointer means no list of names has to be kept in step
++            // with the engine: addr2line turns the address into the name after
++            // the run, and a ticker added later shows up without anyone
++            // remembering to add it here.
++            const uint32_t t0 = ag_us();
+             curr->proc();
++            const uint32_t dt = ag_us() - t0;
++            for (int i = 0; i < 12; i++) {
++                if (ag_ticker_who[i] == nullptr) {
++                    ag_ticker_who[i] = (void*)curr->proc;
++                }
++                if (ag_ticker_who[i] == (void*)curr->proc) {
++                    ag_ticker_us[i] += dt;
++                    ag_ticker_calls[i]++;
++                    break;
++                }
++            }
+             currPtr = &(curr->next);
+         }
+         curr = next;
