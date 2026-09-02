@@ -45,13 +45,27 @@
  * the same count for the same bytes; an overrun gives the same count for the
  * same *time*, which is what this was.
  *
- * Eight kilobytes is twenty milliseconds at four megabaud, which is longer than
- * anything a driver does between reads.  Transmit stays small on purpose: a
- * short transmit buffer makes a large write block until the wire has taken it,
- * and being paced by the wire is the correct behaviour for whoever is filling
- * it - the alternative is buffering a frame the far end cannot yet draw.
+ * Eight kilobytes is twenty milliseconds at four megabaud, and twenty
+ * milliseconds turned out not to be longer than everything a driver does
+ * between reads.  Running a game down the link, the receiver threw away about
+ * 200 KB of arriving pixels in forty seconds hunting for a frame header - it
+ * falls behind while putting a band on its panel, and a lost band is a
+ * rectangle of the last frame that stays on the glass until something redraws
+ * it.  Sixteen kilobytes is forty milliseconds, which covers a band, a write to
+ * a converter and a filesystem call together.
+ *
+ * Thirty-two was tried first and is too much for the board that needs it: the
+ * CYD has 179 KB and no PSRAM, and after a `wifi off` the free memory is there
+ * but not in one piece, so uart_driver_install failed and the receiver came up
+ * with `uart1 at 4000000 baud: input/output error` - a screen that stayed dark
+ * for want of a buffer twice the size of the one that works.
+ *
+ * Transmit stays small on purpose: a short transmit buffer makes a large write
+ * block until the wire has taken it, and being paced by the wire is the correct
+ * behaviour for whoever is filling it - the alternative is buffering a frame
+ * the far end cannot yet draw.
  */
-#define AG_IO_UART_RX_BUF 8192
+#define AG_IO_UART_RX_BUF 16384
 #define AG_IO_UART_TX_BUF 2048
 
 /*

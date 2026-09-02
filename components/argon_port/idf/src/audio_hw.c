@@ -63,10 +63,21 @@ void ag_port_audio_pins(const ag_port_audio_pins_t *pins)
 
 const char *ag_port_audio_name(void) { return "dac"; }
 
-/* Four descriptors of half a kilobyte: about ninety milliseconds at 22 kHz,
- * which is the whole latency budget and about four kilobytes of DMA buffers. */
-#define DAC_DESCS    4
-#define DAC_BUF      512
+/*
+ * Eight descriptors of a quarter kilobyte: still about ninety milliseconds at
+ * 22 kHz, which is the whole latency budget, but each one is 11.6 ms instead of
+ * 23.
+ *
+ * The length of one descriptor is not a detail - it is the shortest a write can
+ * possibly wait.  A descriptor becomes free to load only once it has been
+ * played, so at the moment the converter starts, *every* descriptor is busy and
+ * the first write has to wait a whole one.  With half-kilobyte descriptors that
+ * is 23 ms, and a poke shorter than that fails every time with
+ * `dac_continuous: Get available descriptor timeout` - which is exactly how the
+ * first version of the short-timeout flush below silenced `beep`.
+ */
+#define DAC_DESCS    8
+#define DAC_BUF      256
 #define DAC_FRAMES   (DAC_DESCS * DAC_BUF)
 
 /*
@@ -80,9 +91,14 @@ const char *ag_port_audio_name(void) { return "dac"; }
  * not only slow the caller down, it stops every other device the caller's
  * machine has - which on the CYD is the display, being fed pixels down a UART
  * with no flow control.  See acc_flush.
+ *
+ * It cannot be *very* short, and two milliseconds was a mistake: a descriptor
+ * is 11.6 ms of sound and does not come free before it has been played, so a
+ * poke shorter than one descriptor fails every time and the sound never
+ * starts.  Twenty is one descriptor and a margin.
  */
 #define DAC_WAIT_MS  120
-#define DAC_POKE_MS  2
+#define DAC_POKE_MS  20
 
 /*
  * One whole DMA chain's worth of converted bytes, filled before any of it is

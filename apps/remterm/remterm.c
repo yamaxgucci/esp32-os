@@ -222,11 +222,33 @@ static bool unpack_indexed(const uint8_t *in, uint32_t len, uint32_t npx)
  * for the length it was given or for the timeout, so a long timeout on a big
  * read would hold a keystroke back for as long as the line stayed quiet.
  */
-#define RX_CHUNK 1024u
+/*
+ * Eight kilobytes, so that a whole band fits in one bufferful and a frame that
+ * turns out to be corrupt can be *un-read*.
+ *
+ * That is what the size is for now, and it is worth the eight kilobytes.  The
+ * wire itself is good: a raw run of 4 MB at four megabaud gives 18 corrupt
+ * blocks in 16114 - **one error in every 233 KB**.  But under the game the
+ * receiver was throwing away 19% of everything that arrived, which is fifteen
+ * frames lost per error, and the reason is that a stumble used to be
+ * unrecoverable in one direction: the length byte of a corrupt frame is
+ * garbage, so the reader consumed up to five kilobytes of whatever followed -
+ * the *next* frames - and then went looking forward for a header it had
+ * already swallowed.
+ *
+ * With the frame inside the buffer, a failed checksum rewinds to one byte past
+ * the magic that started it and the scan carries on from there.  One error
+ * costs one frame.
+ */
+#define RX_CHUNK 8192u
 
 static uint8_t  s_rx[RX_CHUNK];
 static uint32_t s_have;
 static uint32_t s_at;
+/* Where in s_rx the frame being read started, or RX_CHUNK if it began in a
+ * bufferful that has since been replaced - in which case there is nothing to
+ * rewind to and the old behaviour is all that is left. */
+static uint32_t s_frame_at = RX_CHUNK;
 
 static int next_byte(uint32_t ms)
 {
@@ -237,8 +259,20 @@ static int next_byte(uint32_t ms)
         }
         s_have = (uint32_t)n;
         s_at = 0;
+        s_frame_at = RX_CHUNK; /* the frame's start went with the old buffer */
     }
     return (int)s_rx[s_at++];
+}
+
+/* Put back everything after the magic bytes of the frame that just failed. */
+static bool rewind_frame(void)
+{
+    if (s_frame_at >= s_have) {
+        return false;
+    }
+    s_at = s_frame_at + 1u;
+    s_frame_at = RX_CHUNK;
+    return true;
 }
 
 static uint32_t get16(const uint8_t *p)
@@ -550,6 +584,15 @@ int ag_main(int argc, char **argv)
     uint32_t idxframes = 0;
     uint32_t wire = 0;
     uint32_t wirekb = 0;
+    /*
+     * Where the time goes on this side, because the answer decided what to fix
+     * next and could not be guessed.  The wire runs at 12% on average, so
+     * nothing is short of bandwidth - what happens is that a whole frame
+     * arrives in one burst of thirty bands and this end falls behind it.  These
+     * two say by how much and at which of the two steps.
+     */
+    uint64_t us_decode = 0;
+    uint64_t us_present = 0;
 
     const ag_time_t t0 = g_ag_api->time->us();
     const uint64_t  window = (uint64_t)secs * 1000000u;
@@ -586,6 +629,9 @@ int ag_main(int argc, char **argv)
             stray++;
             continue;
         }
+        /* Where this frame began, for rewind_frame if it turns out to be
+         * rubbish.  s_at has already stepped past the byte just read. */
+        s_frame_at = (s_at > 0u) ? (s_at - 1u) : RX_CHUNK;
         c = next_byte(20);
         if (c < 0 || (uint8_t)c != FR_MAGIC1) {
             stray++;
@@ -624,6 +670,9 @@ int ag_main(int argc, char **argv)
         const int claimed = next_byte(20);
         if (claimed < 0 || (uint8_t)claimed != sum) {
             bad++;
+            /* Give back everything this frame swallowed: its length came out
+             * of the corruption and the bytes after it are the next frames. */
+            (void)rewind_frame();
             continue;
         }
 
@@ -657,6 +706,7 @@ int ag_main(int argc, char **argv)
                 continue;
             }
 
+            const ag_time_t t_dec = g_ag_api->time->us();
             const uint8_t *body = payload + 12u;
             const uint32_t blen = len - 12u;
             bool           ok;
@@ -684,6 +734,7 @@ int ag_main(int argc, char **argv)
             if (op != FR_BAND) {
                 packedframes++;
             }
+            us_decode += (uint64_t)(g_ag_api->time->us() - t_dec);
             wire += len;
 
             if (!want_pixels(sw)) {
@@ -713,7 +764,10 @@ int ag_main(int argc, char **argv)
                 .w = (uint16_t)bw,
                 .h = (uint16_t)bh,
             };
-            if (ag_gfx_present(&blit) == AG_OK) {
+            const ag_time_t t_pres = g_ag_api->time->us();
+            const ag_err_t  shown = ag_gfx_present(&blit);
+            us_present += (uint64_t)(g_ag_api->time->us() - t_pres);
+            if (shown == AG_OK) {
                 bands++;
                 pxlow += bw * bh;
                 while (pxlow >= 1000u) {
@@ -817,16 +871,19 @@ int ag_main(int argc, char **argv)
             "rows=", " rects=", " kpixels=", " bad=", " stray=",
             " flow_ms=", " kpixels_per_s=", " packed=", " indexed=", " wirekb=",
             " snd_in=", " snd_played=", " snd_dropped=", " snd_hz=",
+            " us_decode=", " us_present=",
         };
         const uint32_t vals[] = {rows,       bands,        px,
                                  bad,        stray,        flow_ms,
                                  kpx_s,      packedframes, idxframes,
                                  wirekb,     s_asamples,   s_aplayed,
-                                 s_adropped, s_pcm_rate};
+                                 s_adropped, s_pcm_rate,
+                                 (uint32_t)(bands ? us_decode / bands : 0),
+                                 (uint32_t)(bands ? us_present / bands : 0)};
 
         char out[256];
         out[0] = '\0';
-        for (uint32_t i = 0; i < 14u; i++) {
+        for (uint32_t i = 0; i < 16u; i++) {
             char num[24];
             (void)ag_strlcat(out, k_names[i], sizeof(out));
             (void)ag_strlcat(out, ag_utoa(vals[i], num, sizeof(num), 0, false),

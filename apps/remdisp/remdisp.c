@@ -657,15 +657,28 @@ static void rem_blit_rect(ag_handle_t h, const ag_blit_t *b)
      * grid that was only partly filled is a screen with holes in it that
      * nothing ever repairs.
      */
-    const bool track = prev_ready(b->surf_w, b->surf_h) && b->x == 0 &&
-                       (uint32_t)b->w == (uint32_t)b->surf_w &&
-                       ((uint32_t)b->y % BLK) == 0u;
+    const bool aligned = prev_ready(b->surf_w, b->surf_h) && b->x == 0 &&
+                         (uint32_t)b->w == (uint32_t)b->surf_w &&
+                         ((uint32_t)b->y % BLK) == 0u;
 
     for (uint32_t band = 0; band < b->h; band += BAND_ROWS) {
         uint32_t rows = b->h - band;
         if (rows > BAND_ROWS) {
             rows = BAND_ROWS;
         }
+
+        /*
+         * A short band cannot be hashed, and this is not a nicety.
+         *
+         * The hash of a block row is stored as if it described all eight rows,
+         * so a band with fewer - the last one of a blit whose height is not a
+         * multiple of eight - would record a hash taken over four rows and then
+         * hide any later change in the other four.  What that looks like is a
+         * rectangle of the previous frame that never goes away, and the obvious
+         * place to see one is behind a moving mouse pointer, because a pointer
+         * is exactly the thing that makes small blits of arbitrary height.
+         */
+        const bool track = aligned && rows == BAND_ROWS;
 
         uint32_t x0 = 0, x1 = (uint32_t)b->w - 1u;
         const uint32_t y0 = 0, y1 = rows - 1u;

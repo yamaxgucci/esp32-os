@@ -123,6 +123,13 @@
       "src": ["apps/tone/tone.c", "apps/common/libc/libc_shim.c"]
     },
     {
+      "out": "PCMPLAY.AXE", "group": "core",
+      "_note": "Plays a raw PCM file straight at /dev/pcm0 and reports the rate the converter actually ran at, which is not the rate it was asked for. Written to settle 'the sound over the wire is not music': a file on the board's own disk removes the sender, the wire and the receiver's buffering from the question in one step, and the effective-rate line catches a clock divider that landed somewhere else - music at the wrong rate is exactly 'not music'. Default is 8-bit unsigned mono, which is what apps/remdisp carries, so the two put the same numbers on the same pin.",
+      "include": ["apps/common/libc"],
+      "cflags": "-Os -ffunction-sections -fdata-sections -fno-builtin",
+      "src": ["apps/pcmplay/pcmplay.c", "apps/common/libc/libc_shim.c"]
+    },
+    {
       "out": "HTTPD.AXE", "group": "core",
       "_note": "The file server, now a loadable .AXE instead of a built-in command - httpd is out of the firmware. Run it by name: `run httpd.axe [port] [dir] [/w]` (Maxim does not want it re-mapped to a bare `httpd` command). Full serve path (GET 32K byte-exact, listing, HEAD, 404, path-traversal 403, multipart upload + delete) verified in QEMU against tools/netfixture.py, and it drives tools/nettest.ps1's pass-2. Build gotcha it cost: mkaxe used to compile the shim without -fno-builtin, so GCC rewrote libc_shim's own strlen loop into a call to strlen and recursed the stack away deep in netmsg's header parse; mkaxe now passes -fno-builtin for every .AXE.",
       "include": ["apps/common/libc", "components/argon_kernel/include"],

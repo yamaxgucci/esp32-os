@@ -4528,11 +4528,28 @@ static int cmd_beep(int argc, char **argv)
             }
             buf[i] = (int16_t)((v * gain) >> 8);
         }
-        const int32_t wrote =
-            ag_dev_write(dev, buf, (size_t)n * sizeof(int16_t), 0);
-        if (wrote <= 0) {
-            ag_console_printf("pcm0 write: %d\n", (int)wrote);
-            break;
+        /*
+         * A sink may take less than it is offered - that is how it says "wait"
+         * without stopping the machine that asked - so what was accepted is
+         * what counts.  This used to advance by the whole buffer whatever came
+         * back, which silently shortened the tone, and treated a zero as an
+         * error, which ended it.  Both showed up the day /dev/pcm0 stopped
+         * blocking.
+         */
+        uint32_t at = 0;
+        while (at < n) {
+            const int32_t wrote = ag_dev_write(
+                dev, buf + at, (size_t)(n - at) * sizeof(int16_t), 0);
+            if (wrote < 0) {
+                ag_console_printf("pcm0 write: %d\n", (int)wrote);
+                sent = total;
+                break;
+            }
+            if (wrote == 0) {
+                ag_port_task_delay(ag_port_ms_to_ticks(5));
+                continue;
+            }
+            at += (uint32_t)wrote / sizeof(int16_t);
         }
         sent += n;
     }
