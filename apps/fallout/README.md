@@ -482,6 +482,30 @@ colours that are not in the game's palette, so the driver's palette-and-indices
 encoding stops fitting and falls back to raw pixels.  Both spellings select it;
 it is one option with two names.
 
+## The wire has three levels, and the honest one is the default
+
+`-smart N`, and it goes to the panel driver as `AG_IOC_DISPLAY_TRIM`:
+
+| level | what goes down the wire | a whole screen | when nothing moves |
+|---|---|---|---|
+| **0 (default)** | the whole buffer, raw, every frame | 2.5-2.7 a second | the same |
+| 1 | the whole buffer, packed losslessly | ~4.4 | the same |
+| 2 | only the blocks whose hash changed, packed | ~4.4 | 30-60 fps |
+
+Level 0 is the default because it cannot be wrong.  Everything above it is a
+claim about what the far end already has, and when a claim is wrong the screen
+shows an old frame and nothing says so; it was reported as the game hanging
+four times in one evening, and each time the board was at fifty frames a
+second.  At level 0 a frame is never wrong for longer than one frame, and a
+screen that stops is a screen whose sender has stopped - one place to look.
+
+Measured at the receiver in level 0: 175-190 KB/s, sound complete, and **26-29
+corrupt frames every five seconds** against 0-2 at a fifth of the rate.  The
+corruption scales with the throughput, so it is not the line - it is the
+receiver's 16 KB ring overflowing on the CYD.  At level 0 that costs one band
+for one frame; at level 2 it would be a wrong block until the repair sweep.
+Fixing the receiver is what earns level 2 back.
+
 ## The readout, and why the averages lied
 
 `-hud` draws three rows into the top-left of the panel and prints the same
