@@ -78,6 +78,10 @@
  */
 #define AG_IO_UART_RX_BUF 32768
 #define AG_IO_UART_TX_BUF 32768
+/* And what the console keeps: a shell's worth, the sizes that were the only
+ * sizes until the picture link needed more. */
+#define AG_IO_UART_CON_RX_BUF 4096
+#define AG_IO_UART_CON_TX_BUF 2048
 /*
  * Thirty-two for receive as well, now.  The note above about the CYD not
  * having 32 KB in one piece was true while that board also started a Wi-Fi
@@ -731,9 +735,18 @@ static ag_err_t uart_bring_up(int port, const ag_port_uart_cfg_t *want)
 
         /* The port applies uart_cfg itself as the last thing open() does, so
          * there is nothing to apply again here. */
-        const ag_err_t rc = ag_port_uart_open(port, &uart_cfg,
-                                              AG_IO_UART_RX_BUF,
-                                              AG_IO_UART_TX_BUF);
+        /*
+         * The big rings are for a port that carries a picture.  The console
+         * is UART0 on every board here and carries a shell; giving it the same
+         * 64 KB of buffering cost the CYD the memory to load the very program
+         * that reads the picture - `load remterm.axe failed (-12)` - on a
+         * board with 179 KB to its name.  So port 0 keeps what a console
+         * needs, and the rest get the rings, halved until they fit.
+         */
+        const bool     console = (port == 0);
+        const ag_err_t rc = ag_port_uart_open(
+            port, &uart_cfg, console ? AG_IO_UART_CON_RX_BUF : AG_IO_UART_RX_BUF,
+            console ? AG_IO_UART_CON_TX_BUF : AG_IO_UART_TX_BUF);
         if (rc != AG_OK) {
             return rc;
         }
