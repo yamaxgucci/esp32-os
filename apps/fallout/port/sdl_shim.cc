@@ -628,6 +628,12 @@ void sdl_shim_screenshot(const char *path, int after_frames, int after_ms)
  * it costs one call per present to keep.
  */
 static uint32_t s_memstat_ms;
+/* The input handles, declared up here because the readout a thousand
+ * lines below has to say when there are none - which is the difference
+ * between a game that is broken and one that cannot be reached. */
+static ag_handle_t s_kbd = -1;
+static ag_handle_t s_mouse = -1;
+
 /* Declared here rather than with the rest of the readout: the arena sampler
  * a few hundred lines below needs to know whether anyone is looking. */
 static int s_hud;
@@ -2348,6 +2354,19 @@ static void hud_tick(void)
      * every open finds nothing.  So a spike in that number is the card, said
      * out loud, once.
      */
+    /* Said once a minute while it is true, because it is the difference
+     * between a game that is broken and one that cannot be reached. */
+    if (s_events && s_kbd < 0 && s_mouse < 0) {
+        static uint32_t said_ms;
+        if (said_ms == 0u || (now - said_ms) >= 60000u) {
+            said_ms = now;
+            shim_printf("[ev t=%u] there is no keyboard and no pointer: "
+                        "/dev/kbd0 and /dev/mouse0 do not exist, so nothing "
+                        "can be clicked and the menu cannot be left\n",
+                        (unsigned)now);
+        }
+    }
+
     {
         const uint32_t misses = ag_libc_io_misses();
         if (misses < s_io_misses_last) {
@@ -2436,7 +2455,7 @@ static int hud_rate(int x, int y, unsigned rate100, Uint16 colour)
     return hud_number(x, y, rate100 % 100u, 2, colour);
 }
 
-#define HUD_W 116
+#define HUD_W 144
 #define HUD_H 22
 
 static void hud_draw(void)
@@ -2514,7 +2533,22 @@ static void hud_draw(void)
     x = hud_text(x, 15, "MEM", white);
     x = hud_number(x + 2, 15, s_hud_used_kb, 4, mem_c) + 3;
     x = hud_text(x, 15, "/", white);
-    (void)hud_number(x, 15, s_hud_hole_kb, 4, mem_c);
+    x = hud_number(x, 15, s_hud_hole_kb, 4, mem_c);
+
+    /*
+     * And, in red, when there is nothing to click with.
+     *
+     * This one is here because it was reported as a hang three times in one
+     * evening.  With no pointer the main menu cannot be left: the picture
+     * animates, the frame rate is sixty, the sound plays, and nothing a person
+     * does has any effect - which is indistinguishable from a game that has
+     * stopped, and is not one.  Every other number on this readout was fine
+     * each time.  `usb` at the shell says "host up, nothing plugged in", and
+     * now so does the glass.
+     */
+    if (s_kbd < 0 && s_mouse < 0) {
+        (void)hud_text(x + 4, 15, "NOMOUSE", 0xF800u);
+    }
 
     /*
      * And say that these pixels changed.
@@ -2983,8 +3017,6 @@ static Uint32 buttons_of(uint8_t ag)
  * socket, and the host's end is reset - which looks exactly like a keyboard
  * that does not work, and was diagnosed as one for a while.
  */
-static ag_handle_t s_kbd = -1;
-static ag_handle_t s_mouse = -1;
 
 static void input_devices_open(void)
 {
