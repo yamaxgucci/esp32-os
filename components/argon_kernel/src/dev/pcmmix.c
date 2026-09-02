@@ -39,7 +39,7 @@ typedef struct pcmmix_client {
     int            used;
     ag_audio_fmt_t fmt;
     int            fmt_set;
-    uint8_t       *ring; /* PCMMIX_RING_BYTES in PSRAM (or internal fallback) */
+    uint8_t       *ring; /* PCMMIX_RING_BYTES, allocated while the client is open */
     size_t         ring_r;
     size_t         ring_w;
     size_t         ring_used;
@@ -66,7 +66,6 @@ typedef struct {
 
 static pcmmix_state_t *s_st; /* heap/PSRAM — keep DRAM BSS tight */
 static ag_device_t    *s_dev;
-static uint8_t        *s_ring_pool; /* PCMMIX_CLIENTS * PCMMIX_RING_BYTES */
 
 static void default_fmt(ag_audio_fmt_t *out)
 {
@@ -356,7 +355,10 @@ static pcmmix_client_t *alloc_client(pcmmix_state_t *st)
     for (i = 0; i < PCMMIX_CLIENTS; i++) {
         if (!st->clients[i].used) {
             pcmmix_client_t *c = &st->clients[i];
-            uint8_t         *ring = c->ring;
+            uint8_t *ring = (uint8_t *)pcmmix_alloc(PCMMIX_RING_BYTES);
+            if (ring == NULL) {
+                return NULL; /* no memory for a ring is no client */
+            }
             memset(c, 0, sizeof(*c));
             c->ring = ring;
             c->used = 1;
@@ -401,6 +403,8 @@ static ag_err_t mix_close_session(ag_device_t *dev, void *session)
     }
     c->used = 0;
     ring_clear(c);
+    ag_port_free(c->ring);
+    c->ring = NULL;
     if (s_st->client_count > 0) {
         s_st->client_count--;
     }
@@ -543,8 +547,6 @@ static void *pcmmix_alloc(size_t n)
 
 ag_err_t ag_pcmmix_init(void)
 {
-    const size_t pool_bytes =
-        (size_t)PCMMIX_CLIENTS * (size_t)PCMMIX_RING_BYTES;
     const size_t scratch_bytes = PCMMIX_PERIOD * 2u * sizeof(int16_t);
     ag_dev_desc_t desc;
     ag_err_t      err;
@@ -558,21 +560,23 @@ ag_err_t ag_pcmmix_init(void)
     default_fmt(&s_st->mix_fmt);
     s_st->mix_fmt_set = 1;
 
+    /*
+     * No ring pool here any more.  Four clients' rings at sixteen kilobytes
+     * each is sixty-four, taken at boot whether anything ever opens the mixer
+     * or not - and on the CYD, which has 179 KB and plays its sound through
+     * pcm0 directly, that was the memory the picture receiver needed to load
+     * at all (`load remterm.axe failed (-12)`).  A ring is allocated when a
+     * client opens and freed when it closes; a board that never mixes never
+     * pays.
+     */
     s_st->mix_scratch = (int16_t *)pcmmix_alloc(scratch_bytes);
-    s_ring_pool = (uint8_t *)pcmmix_alloc(pool_bytes);
-    if (s_st->mix_scratch == NULL || s_ring_pool == NULL) {
-        ag_port_free(s_st->mix_scratch);
-        ag_port_free(s_ring_pool);
+    if (s_st->mix_scratch == NULL) {
         ag_port_free(s_st);
         s_st = NULL;
-        s_ring_pool = NULL;
         return -AG_ENOMEM;
     }
     memset(s_st->mix_scratch, 0, scratch_bytes);
-    memset(s_ring_pool, 0, pool_bytes);
-    for (i = 0; i < PCMMIX_CLIENTS; i++) {
-        s_st->clients[i].ring = s_ring_pool + i * PCMMIX_RING_BYTES;
-    }
+    (void)i;
 
     memset(&desc, 0, sizeof(desc));
     desc.name = "pcmmix";
@@ -584,10 +588,8 @@ ag_err_t ag_pcmmix_init(void)
     err = ag_dev_register(&desc, &s_dev);
     if (err != AG_OK) {
         ag_port_free(s_st->mix_scratch);
-        ag_port_free(s_ring_pool);
         ag_port_free(s_st);
         s_st = NULL;
-        s_ring_pool = NULL;
         return err;
     }
     ag_log(AG_LOG_INFO, TAG,
