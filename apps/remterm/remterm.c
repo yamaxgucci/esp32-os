@@ -373,7 +373,21 @@ static void want_text(void)
  * that is only showing a picture should not be holding an amplifier open,
  * humming.
  */
-#define AUD_RING   4096u /* samples: 186 ms at 22050, 8 KB after conversion  */
+/*
+ * 743 ms of sound, and the size is set by how long the *sender* can go without
+ * sending any.
+ *
+ * On the S3 the kernel holds its device registry for the whole of a blit, and
+ * one blit is every band of a frame - so while a full screen is going out, the
+ * task that produces sound cannot reach the wire at all.  A frame that takes
+ * two hundred milliseconds is two hundred milliseconds of nothing arriving
+ * here, and at 186 ms of ring that is silence: "a quarter of a second plays, a
+ * fifth does not", which is how it was reported and what it measured.
+ *
+ * Sixteen kilobytes of a board that has ninety free, against a stutter that
+ * makes music unrecognisable.
+ */
+#define AUD_RING  16384u /* samples: 743 ms at 22050, 16 KB                  */
 #define AUD_BITE    256u /* samples handed over at once: 11.6 ms            */
 
 static ag_handle_t s_pcm = -1;

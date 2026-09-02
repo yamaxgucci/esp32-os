@@ -22,7 +22,17 @@
 #define TAG "pcmmix"
 
 #define PCMMIX_CLIENTS     4
-#define PCMMIX_RING_BYTES  (4u * 1024u)
+/*
+ * 16 KB per client, which is 186 ms of 22 kHz stereo, and not four.
+ *
+ * A client's ring is what stands between "the program produced sound" and "the
+ * sink was ready for it", and on this machine the two can be a long way apart:
+ * the kernel holds the device registry across a whole blit, so while a screen
+ * is being pushed down a serial link the task with the samples cannot get in.
+ * Four kilobytes is 46 ms and the surplus is dropped silently - which is where
+ * the game's music went while its picture was being sent.
+ */
+#define PCMMIX_RING_BYTES  (16u * 1024u)
 #define PCMMIX_PERIOD      256u /* frames per mix tick */
 
 typedef struct pcmmix_client {
