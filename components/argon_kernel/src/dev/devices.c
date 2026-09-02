@@ -45,6 +45,41 @@
 static ag_port_mutex_t s_dev_mutex;
 
 /*
+ * A second lock, held only across a display blit that blocks - a picture going
+ * out over a wire, hundreds of milliseconds at a time.
+ *
+ * The registry lock cannot be held across that, because it is the one lock
+ * every device shares: audio writes take it, the console takes it, and a blit
+ * that holds it for a third of a second stops the sound and the log for a
+ * third of a second - a whole second core wedged against the first when the
+ * blit runs on its own thread.  So the blit lets the registry lock go before
+ * it writes (display.c) and takes this one instead.
+ *
+ * It still has to answer the pin layer's one question - "is this the system
+ * writing, or whoever called in?" - because the io claim on the UART pins is
+ * held by the system and a write that looks like it came from the application
+ * is refused, which once put a whole frame into a single character cell.  So
+ * ag_dev_in_driver reports true for the holder of either lock.  Recursive, and
+ * separate, so two of the wire's own writes serialise here without ever
+ * touching the traffic on the registry lock.
+ */
+static ag_port_mutex_t s_blit_mutex;
+
+void ag_dev_blit_hold(void)
+{
+    if (s_blit_mutex != NULL) {
+        ag_port_mutex_take_recursive(s_blit_mutex, AG_PORT_FOREVER);
+    }
+}
+
+void ag_dev_blit_release(void)
+{
+    if (s_blit_mutex != NULL) {
+        ag_port_mutex_give_recursive(s_blit_mutex);
+    }
+}
+
+/*
  * Recursive, because a device operation is entitled to ask the registry about
  * itself, and because the shell reads the registry from inside a listing it is
  * already walking.
@@ -76,8 +111,11 @@ static void dev_unlock(void *ctx)
  */
 bool ag_dev_in_driver(void)
 {
-    return s_dev_mutex != NULL &&
-           ag_port_mutex_holder(s_dev_mutex) == ag_port_task_self();
+    const void *self = ag_port_task_self();
+    if (s_dev_mutex != NULL && ag_port_mutex_holder(s_dev_mutex) == self) {
+        return true;
+    }
+    return s_blit_mutex != NULL && ag_port_mutex_holder(s_blit_mutex) == self;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -238,6 +276,12 @@ ag_err_t ag_devices_init(void)
     if (s_dev_mutex == NULL) {
         s_dev_mutex = ag_port_mutex_new_recursive();
         if (s_dev_mutex == NULL) {
+            return -AG_ENOMEM;
+        }
+    }
+    if (s_blit_mutex == NULL) {
+        s_blit_mutex = ag_port_mutex_new_recursive();
+        if (s_blit_mutex == NULL) {
             return -AG_ENOMEM;
         }
     }

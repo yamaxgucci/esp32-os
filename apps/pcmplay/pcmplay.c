@@ -141,8 +141,9 @@ static int play_tune(ag_handle_t pcm, uint32_t rate, uint32_t bits)
 int ag_main(int argc, char **argv)
 {
     if (argc < 2) {
-        ag_printf("usage: pcmplay <file>|-tune [rate] [bits]\n");
+        ag_printf("usage: pcmplay <file>|-tune [rate] [bits] [dev] [-loop]\n");
         ag_printf("  raw samples, one channel; bits is 8 (unsigned) or 16\n");
+        ag_printf("  -loop repeats the file until a key is pressed\n");
         ag_printf("  -tune plays a melody the board makes itself\n");
         ag_printf("  device is /dev/pcm0 unless given; /dev/pcmmix goes\n");
         ag_printf("  through the mixer to whatever sink is loaded - on the\n");
@@ -163,6 +164,13 @@ int ag_main(int argc, char **argv)
     if (bits != 8u && bits != 16u) {
         ag_printf("pcmplay: bits must be 8 or 16\n");
         return 1;
+    }
+
+    bool loop = false;
+    for (int i = 1; i < argc; i++) {
+        if (argv[i][0] == '-' && argv[i][1] == 'l') {
+            loop = true;
+        }
     }
 
     const bool tune = argv[1][0] == '-' && argv[1][1] == 't';
@@ -230,6 +238,9 @@ int ag_main(int argc, char **argv)
         if (bits == 8u) {
             got = ag_read(f, s_in, sizeof(s_in));
             if (got <= 0) {
+                if (loop && ag_seek(f, 0, AG_SEEK_SET) >= 0) {
+                    continue;
+                }
                 break;
             }
             for (int32_t i = 0; i < got; i++) {
@@ -240,6 +251,9 @@ int ag_main(int argc, char **argv)
         } else {
             got = ag_read(f, s_out, sizeof(s_out));
             if (got <= 0) {
+                if (loop && ag_seek(f, 0, AG_SEEK_SET) >= 0) {
+                    continue;
+                }
                 break;
             }
             got /= (int32_t)sizeof(int16_t);
