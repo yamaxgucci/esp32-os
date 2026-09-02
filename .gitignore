@@ -57,5 +57,3 @@ compile_commands.json
 Thumbs.db
 desktop.ini
 .DS_Store
-build_cyd/
-build_s3/

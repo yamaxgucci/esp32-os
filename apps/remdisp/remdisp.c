@@ -199,9 +199,6 @@ static bool send_frame(uint8_t op, const uint8_t *payload, uint32_t len)
      */
     const uint32_t want = 5u + len + 1u;
     const int32_t  n = io->uart_write(LINK_PORT, s_frame, want);
-    if (s_wire_lock != NULL) {
-        ag_api()->task->mutex_unlock(s_wire_lock);
-    }
     if (n < 0 || (uint32_t)n != want) {
         s_dropped++;
         return false;
@@ -1302,9 +1299,6 @@ ag_err_t ag_driver_init(void)
     io = ag_api()->io;
     if (io == NULL || !AG_HAS(io, uart_write)) {
         return -AG_ENOTSUP;
-    }
-    if (ag_api()->task != NULL && ag_api()->task->mutex_create != NULL) {
-        s_wire_lock = ag_api()->task->mutex_create();
     }
 
     /*

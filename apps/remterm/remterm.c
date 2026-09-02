@@ -395,7 +395,7 @@ static void want_text(void)
  * Sixteen kilobytes of a board that has ninety free, against a stutter that
  * makes music unrecognisable.
  */
-#define AUD_RING  17640u /* samples: 0.8 s at 22050, 17 KB                   */
+#define AUD_RING  33075u /* samples: 1.5 s at 22050, 32 KB                   */
 #define AUD_BITE    256u /* samples handed over at once: 11.6 ms            */
 
 static ag_handle_t s_pcm = -1;
