@@ -195,12 +195,24 @@ extern "C" int ag_cxx_main(int argc, char **argv)
     int cycle_ms = 100;
     int events = 0;
     int flush_rows = 64;
-    int async_wire = 1;
-    /* Two: the trimmed, packed wire.  Zero - the whole buffer raw every
-     * frame - was the default for one evening and is measured in the README:
-     * it cannot be wrong, it also cannot look like frames on a receiver with
-     * no buffer of its own, and it fills the wire so full that the sound
-     * queues behind the picture.  -dumb still asks for it. */
+    /*
+     * The wire on the game's own thread, by default, and off is the safe
+     * answer.
+     *
+     * A thread of its own on the system core sounded right and measured well -
+     * the game's frame stopped containing the wire - but it wedged the board.
+     * ag_gfx_flush takes the device registry lock and holds it across the
+     * whole blocking write to the four megabaud line; a send is a hundred
+     * milliseconds, and for all of it the game on the other core cannot reach
+     * a device - not the card, not the sound.  What that looked like was the
+     * whole board going silent with no reboot, which is a wedge, not a
+     * crash.  Synchronous, the send holds that lock exactly as long as the
+     * engine already expected a flush to take, which is the behaviour that
+     * never wedged.  -async asks for the thread back, for when the lock is
+     * narrowed to not cover the write.
+     */
+    int async_wire = 0;
+    /* Two: the trimmed, packed wire.  See -dumb for zero. */
     int smart = 2;
     int hud = 0;
     const char *logpath = NULL;
