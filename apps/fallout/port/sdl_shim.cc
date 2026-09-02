@@ -3051,9 +3051,52 @@ static void stall_service(void)
               (unsigned)now, (unsigned)since);
 }
 
+/*
+ * Look for a keyboard and a pointer again, once a second, until both are
+ * found.
+ *
+ * They used to be opened once, when the display was taken, and never again -
+ * which is fine on a machine whose input is soldered on and wrong on this one.
+ * A USB mouse plugged in after the game started did not exist as far as the
+ * game was concerned, and neither did one the host lost and re-enumerated.
+ * What that looks like from the chair is a game that has hung: the picture
+ * keeps moving, the frame rate is fine, and nothing responds to anything.  It
+ * cost an hour of somebody's evening and a message saying the game had frozen,
+ * with the board running at sixty-three frames a second at the time.
+ *
+ * Cheap enough to do for ever: two opens of a name that is not there.
+ */
+static void input_devices_rescan(void)
+{
+    static uint32_t next_ms;
+
+    if (s_kbd >= 0 && s_mouse >= 0) {
+        return;
+    }
+    const uint32_t now = (uint32_t)ag_millis();
+    if (next_ms != 0u && now < next_ms) {
+        return;
+    }
+    next_ms = now + 1000u;
+
+    if (s_kbd < 0) {
+        s_kbd = ag_dev_open("/dev/kbd0");
+        if (s_kbd >= 0) {
+            ag_printf("SDL: kbd0 appeared\n");
+        }
+    }
+    if (s_mouse < 0) {
+        s_mouse = ag_dev_open("/dev/mouse0");
+        if (s_mouse >= 0) {
+            ag_printf("SDL: mouse0 appeared\n");
+        }
+    }
+}
+
 void sdl_shim_input_service(void)
 {
     stall_service();
+    input_devices_rescan();
 
     /* Enough for a burst; anything beyond it is read on the next call. */
     uint8_t drain[128];
