@@ -80,6 +80,68 @@ void ag_dev_blit_release(void)
 }
 
 /*
+ * And one lock per device, held across a call into that device's driver in
+ * place of the registry lock.
+ *
+ * The registry lock is one lock for the whole machine, and a driver call is not
+ * always short: a converter plays sound in real time, so a write to it returns
+ * when the hardware has room and not before - on this board, ten milliseconds
+ * at a time, continuously.  Held across that, the registry lock stopped anybody
+ * even *looking* at the registry, and a frame flush looks at it to find the
+ * display drivers.  Measured: 18 microseconds of work, 161 milliseconds of
+ * waiting, and two thirds of Fallout's frame.
+ *
+ * A pool rather than one each, because they are made and given back as devices
+ * come and go and a card being pulled should not lose a mutex.  A slot handed
+ * back keeps its mutex for whoever takes the slot next; nothing is freed, and
+ * there is a bound on how many can exist because there is a bound on devices.
+ */
+static ag_port_mutex_t s_io[AG_DEV_MAX];
+static bool            s_io_taken[AG_DEV_MAX];
+
+static void *dev_call_open(void *ctx)
+{
+    (void)ctx;
+    for (int i = 0; i < AG_DEV_MAX; i++) {
+        if (s_io_taken[i]) {
+            continue;
+        }
+        if (s_io[i] == NULL) {
+            s_io[i] = ag_port_mutex_new_recursive();
+            if (s_io[i] == NULL) {
+                return NULL; /* the registry lock is held instead */
+            }
+        }
+        s_io_taken[i] = true;
+        return s_io[i];
+    }
+    return NULL;
+}
+
+static void dev_call_close(void *ctx, void *iolock)
+{
+    (void)ctx;
+    for (int i = 0; i < AG_DEV_MAX; i++) {
+        if (s_io[i] == iolock) {
+            s_io_taken[i] = false;
+            return;
+        }
+    }
+}
+
+static void dev_call_hold(void *ctx, void *iolock)
+{
+    (void)ctx;
+    ag_port_mutex_take_recursive((ag_port_mutex_t)iolock, AG_PORT_FOREVER);
+}
+
+static void dev_call_release(void *ctx, void *iolock)
+{
+    (void)ctx;
+    ag_port_mutex_give_recursive((ag_port_mutex_t)iolock);
+}
+
+/*
  * Recursive, because a device operation is entitled to ask the registry about
  * itself, and because the shell reads the registry from inside a listing it is
  * already walking.
@@ -115,7 +177,22 @@ bool ag_dev_in_driver(void)
     if (s_dev_mutex != NULL && ag_port_mutex_holder(s_dev_mutex) == self) {
         return true;
     }
-    return s_blit_mutex != NULL && ag_port_mutex_holder(s_blit_mutex) == self;
+    if (s_blit_mutex != NULL && ag_port_mutex_holder(s_blit_mutex) == self) {
+        return true;
+    }
+    /*
+     * And the device's own lock, which is what a read or a write holds now that
+     * the registry lock is let go for the length of the call.  Leaving this out
+     * would answer "the application is writing" for every driver in the system,
+     * and a write that looks like the application's is refused by the pin
+     * claims - which once put a whole frame into a single character cell.
+     */
+    for (int i = 0; i < AG_DEV_MAX; i++) {
+        if (s_io[i] != NULL && ag_port_mutex_holder(s_io[i]) == self) {
+            return true;
+        }
+    }
+    return false;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -289,6 +366,10 @@ ag_err_t ag_devices_init(void)
     const ag_dev_lock_t lock = {
         .lock = dev_lock,
         .unlock = dev_unlock,
+        .call_open = dev_call_open,
+        .call_close = dev_call_close,
+        .call_hold = dev_call_hold,
+        .call_release = dev_call_release,
         .ctx = NULL,
     };
     ag_err_t err = ag_dev_init(&lock);

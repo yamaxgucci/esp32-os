@@ -34,6 +34,57 @@ static void unlock(void)
 void ag_dev_lock_hold(void) { lock(); }
 void ag_dev_lock_release(void) { unlock(); }
 
+/*
+ * Step into a driver, and out of it again.
+ *
+ * The caller holds the registry lock and has already decided what it is going
+ * to call.  enter marks the device busy so the slot cannot be reused, drops the
+ * registry lock and takes the device's own one instead; leave undoes all three
+ * and returns having dropped the registry lock, which is what every caller
+ * below wants next.  See ag_dev_lock_t in the header for why.
+ *
+ * A device with no lock of its own keeps the old behaviour - the registry lock
+ * stays held for the length of the call - so a build that supplies no lock
+ * interface, which is every host test, behaves exactly as it did.
+ */
+static bool call_enter(ag_device_t *dev)
+{
+    if (dev->iolock == NULL || s_lock.call_hold == NULL) {
+        return false;
+    }
+    dev->calls++;
+    unlock();
+    s_lock.call_hold(s_lock.ctx, dev->iolock);
+    return true;
+}
+
+/* Caller holds the lock.  Frees a device that was pulled while it was in use,
+ * once the last handle and the last call have gone. */
+static void reap_locked(ag_device_t *dev)
+{
+    if (dev->used && dev->revoked && dev->open_count == 0 && dev->calls == 0) {
+        if (dev->iolock != NULL && s_lock.call_close != NULL) {
+            s_lock.call_close(s_lock.ctx, dev->iolock);
+        }
+        memset(dev, 0, sizeof(*dev));
+    }
+}
+
+static void call_leave(ag_device_t *dev, bool entered)
+{
+    if (!entered) {
+        unlock();
+        return;
+    }
+    s_lock.call_release(s_lock.ctx, dev->iolock);
+    lock();
+    if (dev->calls > 0) {
+        dev->calls--;
+    }
+    reap_locked(dev);
+    unlock();
+}
+
 ag_err_t ag_dev_init(const ag_dev_lock_t *lock_iface)
 {
     memset(s_devices, 0, sizeof(s_devices));
@@ -163,6 +214,8 @@ ag_err_t ag_dev_register(const ag_dev_desc_t *desc, ag_device_t **out)
         d->priv = desc->priv;
         d->owner = desc->owner;
         d->used = true;
+        d->iolock =
+            (s_lock.call_open != NULL) ? s_lock.call_open(s_lock.ctx) : NULL;
 
         if (out != NULL) {
             *out = d;
@@ -186,9 +239,15 @@ ag_err_t ag_dev_unregister(ag_device_t *dev)
         unlock();
         return -AG_ENODEV;
     }
-    if (dev->open_count > 0) {
+    /* A call still inside the driver is as good a reason to refuse as an open
+     * handle, and for the stronger one: the memory the vtable points into is
+     * about to be handed back. */
+    if (dev->open_count > 0 || dev->calls > 0) {
         unlock();
         return -AG_EBUSY;
+    }
+    if (dev->iolock != NULL && s_lock.call_close != NULL) {
+        s_lock.call_close(s_lock.ctx, dev->iolock);
     }
     memset(dev, 0, sizeof(*dev));
     unlock();
@@ -203,7 +262,10 @@ static uint32_t revoke_locked(ag_device_t *dev)
     }
 
     const uint32_t still_open = dev->open_count;
-    if (still_open == 0) {
+    if (still_open == 0 && dev->calls == 0) {
+        if (dev->iolock != NULL && s_lock.call_close != NULL) {
+            s_lock.call_close(s_lock.ctx, dev->iolock);
+        }
         memset(dev, 0, sizeof(*dev));
     } else {
         dev->revoked = true;
@@ -393,10 +455,9 @@ ag_err_t ag_dev_close2(ag_device_t *dev, void *session)
     }
 
     dev->open_count--;
-    /* A device pulled while it was open disappears with its last handle. */
-    if (dev->revoked && dev->open_count == 0) {
-        memset(dev, 0, sizeof(*dev));
-    }
+    /* A device pulled while it was open disappears with its last handle - or
+     * with the last call still inside it, whichever ends later. */
+    reap_locked(dev);
     unlock();
     return err;
 }
@@ -419,16 +480,20 @@ int32_t ag_dev_read2(ag_device_t *dev, void *session, void *buf, size_t len,
         unlock();
         return 0;
     }
-    int32_t n;
-    if (session != NULL && dev->ops->read_session != NULL) {
-        n = dev->ops->read_session(dev, session, buf, len, off);
-    } else if (dev->ops->read != NULL) {
-        n = dev->ops->read(dev, buf, len, off);
-    } else {
+    int32_t (*fn_session)(ag_device_t *, void *, void *, size_t, uint64_t) =
+        (session != NULL) ? dev->ops->read_session : NULL;
+    int32_t (*fn)(ag_device_t *, void *, size_t, uint64_t) =
+        (fn_session == NULL) ? dev->ops->read : NULL;
+    if (fn_session == NULL && fn == NULL) {
         unlock();
         return -AG_ENOTSUP;
     }
-    unlock();
+
+    const bool entered = call_enter(dev);
+    const int32_t n = (fn_session != NULL)
+                          ? fn_session(dev, session, buf, len, off)
+                          : fn(dev, buf, len, off);
+    call_leave(dev, entered);
     return n;
 }
 
@@ -455,16 +520,21 @@ int32_t ag_dev_write2(ag_device_t *dev, void *session, const void *buf,
         unlock();
         return 0;
     }
-    int32_t n;
-    if (session != NULL && dev->ops->write_session != NULL) {
-        n = dev->ops->write_session(dev, session, buf, len, off);
-    } else if (dev->ops->write != NULL) {
-        n = dev->ops->write(dev, buf, len, off);
-    } else {
+    int32_t (*fn_session)(ag_device_t *, void *, const void *, size_t,
+                          uint64_t) =
+        (session != NULL) ? dev->ops->write_session : NULL;
+    int32_t (*fn)(ag_device_t *, const void *, size_t, uint64_t) =
+        (fn_session == NULL) ? dev->ops->write : NULL;
+    if (fn_session == NULL && fn == NULL) {
         unlock();
         return -AG_ENOTSUP;
     }
-    unlock();
+
+    const bool entered = call_enter(dev);
+    const int32_t n = (fn_session != NULL)
+                          ? fn_session(dev, session, buf, len, off)
+                          : fn(dev, buf, len, off);
+    call_leave(dev, entered);
     return n;
 }
 
@@ -497,14 +567,19 @@ ag_err_t ag_dev_ioctl2(ag_device_t *dev, void *session, uint32_t cmd, void *arg,
         return AG_OK;
     }
 
-    if (session != NULL && dev->ops->ioctl_session != NULL) {
-        err = dev->ops->ioctl_session(dev, session, cmd, arg, arglen);
-    } else if (dev->ops->ioctl != NULL) {
-        err = dev->ops->ioctl(dev, cmd, arg, arglen);
-    } else {
-        err = -AG_ENOTSUP;
+    ag_err_t (*fn_session)(ag_device_t *, void *, uint32_t, void *, size_t) =
+        (session != NULL) ? dev->ops->ioctl_session : NULL;
+    ag_err_t (*fn)(ag_device_t *, uint32_t, void *, size_t) =
+        (fn_session == NULL) ? dev->ops->ioctl : NULL;
+    if (fn_session == NULL && fn == NULL) {
+        unlock();
+        return -AG_ENOTSUP;
     }
-    unlock();
+
+    const bool entered = call_enter(dev);
+    err = (fn_session != NULL) ? fn_session(dev, session, cmd, arg, arglen)
+                               : fn(dev, cmd, arg, arglen);
+    call_leave(dev, entered);
     return err;
 }
 
