@@ -21,7 +21,15 @@ Commands:
                     esc enter space tab up down left right f1..f12
     down NAME       press without releasing
     up NAME         release
-    move X,Y        put the pointer here, in the guest's own pixels
+    move X,Y        put the pointer here, in the guest's own pixels - the
+                    *panel's*, which is not the picture's.  Fallout draws
+                    640x480 into a 320x240 panel and the shim doubles what
+                    arrives, so "move 500,300" on that board is game 1000,600
+                    and lands off the screen; halve the game coordinate first.
+                    Nothing clips it for you, and an off-screen click is
+                    silent.  "-recinput" makes the game print both numbers,
+                    panel and game, for every press - which is the way to
+                    settle it on a machine whose panel you do not know
     wheel N         turn the wheel N notches, negative the other way
     home            slam the pointer into the top-left corner, so that the
                     next glide starts from a position that is actually known
@@ -32,6 +40,14 @@ Commands:
 --wait N holds off until the guest is listening, for up to N seconds: the game
 this was written for takes ten minutes to reach its menu, and connecting before
 the driver is loaded gets a refusal rather than a queue.
+
+On a real board there is a second reason for --wait, and it looked for a whole
+session like a broken driver: **the driver only starts listening once something
+opens the device.**  ensure_listen needs an address, so it cannot bind at load
+time on a board that is still getting one from DHCP, and it is retried from the
+open and the read - which nothing calls until an application asks for a
+pointer.  So load the drivers, start the application, and only then connect:
+before that the port is refused and the board looks dead to this tool.
 
 Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
 """
