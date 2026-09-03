@@ -727,6 +727,9 @@ static uint32_t encode_indexed(const uint16_t *px, uint32_t n, uint8_t *out,
  *   3. Bands stay the transport unit, eight rows at a time, because on the far
  *      end every band is one window-setting on the panel.
  */
+/* Defined with the sound, below; the picture path pumps it. */
+static void aud_drain(void);
+
 static void rem_blit_rect(ag_handle_t h, const ag_blit_t *b)
 {
     (void)h;
@@ -926,6 +929,10 @@ static void rem_blit_rect(ag_handle_t h, const ag_blit_t *b)
         }
     }
 
+    /* The picture is out; give the sound its turn on the same wire, from this
+     * same thread.  Between bands would starve the picture; after the whole
+     * blit keeps them both moving and the far end's cushion covers the wait. */
+    aud_drain();
 }
 
 /* ---- characters -------------------------------------------------------- */
@@ -1042,6 +1049,9 @@ static void rem_text_cursor(ag_handle_t h, uint16_t col, uint16_t row,
         s_shadow[row][col] = under;
     }
     heal_a_few();
+    /* Sound gets its turn on the console path too, so it keeps flowing when the
+     * far end is showing text rather than a picture. */
+    aud_drain();
 }
 
 /* ---- the device -------------------------------------------------------- */
@@ -1098,6 +1108,58 @@ static bool           s_afmt_set;
 static uint64_t       s_abytes_in;
 static uint64_t       s_abytes_sent;
 static uint8_t        s_amono[AUD_CHUNK + 4u];
+
+/*
+ * Sound waits here, and is put on the wire by whoever is already writing to it
+ * - never by the task that produced it.
+ *
+ * This is the whole cure for the freeze.  Picture and sound share one UART, and
+ * the sound used to be written to it from the audio task, which held the device
+ * registry lock while it waited for the wire.  With the picture on its own
+ * thread that was a lock held across a blocking write on one core while the
+ * game waited for it on the other - the board alive, everything stopped, the
+ * sound already buffered still playing.  Now rem_pcm_write only drops samples
+ * in this ring and returns at once, so it holds no lock waiting for anything;
+ * the samples reach the wire from aud_drain(), called from the same paths that
+ * already write it (a blit, the console sweep).  One writer of the wire, and
+ * the producer never blocks.
+ *
+ * Eight kilobytes is about 370 ms at 22 kHz, more than the gap between two of
+ * those draws, and the far end holds half a second of its own besides.
+ */
+#define AUD_WIRE_RING 8192u
+static uint8_t   s_awire[AUD_WIRE_RING];
+static uint32_t  s_awire_r, s_awire_w, s_awire_used;
+static uint32_t  s_awire_rate;
+static ag_mutex_t s_aud_lock;
+
+/* Put up to a chunk of buffered sound on the wire.  Called from the paths that
+ * are already writing the wire, so the audio never rides the producer's stack
+ * or its locks. */
+static void aud_drain(void)
+{
+    if (s_aud_lock == NULL || s_awire_used == 0u || s_awire_rate == 0u) {
+        return;
+    }
+    for (int batch = 0; batch < 8; batch++) {
+        uint32_t n = 0;
+        (void)ag_api()->task->mutex_lock(s_aud_lock, 100u);
+        put16(s_amono + 0, s_awire_rate & 0xffffu);
+        put16(s_amono + 2, s_awire_rate >> 16);
+        while (n < AUD_CHUNK && s_awire_used > 0u) {
+            s_amono[4u + n] = s_awire[s_awire_r];
+            s_awire_r = (s_awire_r + 1u) % AUD_WIRE_RING;
+            s_awire_used--;
+            n++;
+        }
+        ag_api()->task->mutex_unlock(s_aud_lock);
+        if (n == 0u) {
+            break;
+        }
+        send_frame(FR_AUD, s_amono, 4u + n);
+        s_abytes_sent += (uint64_t)n;
+    }
+}
 
 static void aud_default_fmt(ag_audio_fmt_t *out)
 {
@@ -1158,31 +1220,36 @@ static int32_t rem_pcm_write(ag_device_t *dev, const void *buf, size_t len,
     }
     s_abytes_in += (uint64_t)(frames * frame_bytes);
 
+    /*
+     * Only buffered here, not sent.  This returns at once, holding no lock
+     * across the wire - which is the whole point (see s_awire).  The samples
+     * go out from aud_drain(), on the thread that already owns the wire.
+     */
     const int16_t *src = (const int16_t *)buf;
-    size_t         done = 0;
-    while (done < frames) {
-        size_t n = frames - done;
-        if (n > AUD_CHUNK) {
-            n = AUD_CHUNK;
-        }
-        put16(s_amono + 0, s_afmt.rate & 0xffffu);
-        put16(s_amono + 2, s_afmt.rate >> 16);
-        uint8_t *out = s_amono + 4;
+    if (s_aud_lock != NULL) {
+        (void)ag_api()->task->mutex_lock(s_aud_lock, 100u);
+    }
+    s_awire_rate = s_afmt.rate;
+    for (size_t i = 0; i < frames; i++) {
+        uint8_t m;
         if (chans == 2u) {
-            const int16_t *p = src + (done * 2u);
-            for (size_t i = 0; i < n; i++) {
-                const int32_t mono = ((int32_t)p[i * 2u] + p[i * 2u + 1u]) / 2;
-                out[i] = (uint8_t)((mono + 32768) >> 8);
-            }
+            const int32_t mono = ((int32_t)src[i * 2u] + src[i * 2u + 1u]) / 2;
+            m = (uint8_t)((mono + 32768) >> 8);
         } else {
-            const int16_t *p = src + done;
-            for (size_t i = 0; i < n; i++) {
-                out[i] = (uint8_t)(((int32_t)p[i] + 32768) >> 8);
-            }
+            m = (uint8_t)(((int32_t)src[i] + 32768) >> 8);
         }
-        send_frame(FR_AUD, s_amono, (uint32_t)(4u + n));
-        s_abytes_sent += (uint64_t)n;
-        done += n;
+        if (s_awire_used == AUD_WIRE_RING) {
+            /* Full: drop the oldest, so a stall loses the past and not the
+             * present - a gap the far end's cushion is there to swallow. */
+            s_awire_r = (s_awire_r + 1u) % AUD_WIRE_RING;
+            s_awire_used--;
+        }
+        s_awire[s_awire_w] = m;
+        s_awire_w = (s_awire_w + 1u) % AUD_WIRE_RING;
+        s_awire_used++;
+    }
+    if (s_aud_lock != NULL) {
+        ag_api()->task->mutex_unlock(s_aud_lock);
     }
 
     /*
@@ -1319,6 +1386,7 @@ ag_err_t ag_driver_init(void)
     }
     if (ag_api()->task != NULL && ag_api()->task->mutex_create != NULL) {
         s_wire_lock = ag_api()->task->mutex_create();
+        s_aud_lock = ag_api()->task->mutex_create();
     }
 
     /*
