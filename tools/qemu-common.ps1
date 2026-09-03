@@ -307,7 +307,11 @@ function Get-QemuMachineArgs {
         throw "PSRAM must be 8 or 16 MB (asked for $PsramMb)."
     }
     return @(
-        '-M', 'esp32s3'
+        # graphics=on instantiates the machine's esp_rgb display device, which
+        # is off by default.  Without it there is nothing for the QEMU RGB
+        # panel driver to find, the kernel falls back to a framebuffer in RAM,
+        # and `argon run -Gfx` shows a black window with no error anywhere.
+        '-M', 'esp32s3,graphics=on'
         # QEMU reserves a 1 GB JIT buffer by default on a 64-bit host, and it
         # reserves it as committed memory.  On a 16 GB machine with the IDF
         # toolchain and an editor already resident that request fails outright -
