@@ -451,6 +451,9 @@ def main() -> int:
     ap.add_argument("--port", type=int, default=5560)
     ap.add_argument("--width", type=int, default=640)
     ap.add_argument("--height", type=int, default=400)
+    ap.add_argument("--record", default="",
+                    help="append every packet sent to this file, so the "
+                         "session can be replayed later by inputplay --play")
     ap.add_argument("--reconnect", action="store_true")
     ap.add_argument("--hz", type=float, default=60.0)
     ap.add_argument(
@@ -477,6 +480,11 @@ def main() -> int:
         sw = 1920
     if sh < 1:
         sh = 1080
+
+    # Recording is of what goes on the wire, not of what Windows reports:
+    # the two differ, and the wire is the half that can be sent again.
+    rec = open(args.record, "w", encoding="utf-8") if args.record else None
+    rec_t0 = time.monotonic()
 
     period = 1.0 / max(args.hz, 1.0)
     sock: socket.socket | None = None
@@ -627,6 +635,12 @@ def main() -> int:
                         n = sock.send(pkt)
                         if n == len(pkt):
                             prev_x, prev_y, prev_btn = gx, gy, buttons
+                            if rec is not None:
+                                rec.write("M %d %d %d %d %d %d
+" % (
+                                    int((time.monotonic() - rec_t0) * 1000),
+                                    typ, buttons, gx, gy, w8))
+                                rec.flush()
                     except BlockingIOError:
                         pass
                     except OSError as e:

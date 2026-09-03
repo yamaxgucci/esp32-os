@@ -214,6 +214,9 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=5561)
+    ap.add_argument("--record", default="",
+                    help="append every packet sent to this file, for "
+                         "inputplay --play")
     ap.add_argument("--reconnect", action="store_true")
     ap.add_argument("--hz", type=float, default=60.0)
     args = ap.parse_args()
@@ -235,6 +238,9 @@ def main() -> int:
     user32.GetAncestor.restype = wt.HWND
     user32.GetParent.argtypes = (wt.HWND,)
     user32.GetParent.restype = wt.HWND
+    rec = open(args.record, "w", encoding="utf-8") if args.record else None
+    rec_t0 = time.monotonic()
+
     period = 1.0 / max(args.hz, 1.0)
     sock: socket.socket | None = None
     prev: dict[int, bool] = {vk: False for vk in VK_TO_HID}
@@ -314,6 +320,12 @@ def main() -> int:
                 n = sock.send(pkt)
                 if n != len(pkt):
                     raise OSError("short send")
+                if rec is not None:
+                    rec.write("K %d %d %d %d
+" % (
+                        int((time.monotonic() - rec_t0) * 1000),
+                        typ, hid, mods))
+                    rec.flush()
             except OSError as e:
                 print(f"disconnected: {e}", flush=True)
                 try:

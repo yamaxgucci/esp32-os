@@ -1919,6 +1919,24 @@ void sdl_shim_events(int on)
     s_events = on ? 1 : 0;
 }
 
+/*
+ * Write down every key and every click, so that a session at the keyboard can
+ * be replayed at a board that has no screen attached to it.
+ *
+ * The recording is taken where the events arrive in the game, not where the
+ * host helper sent them from: the helper works in the window's pixels and maps
+ * them onto the guest, and the two do not agree closely enough to click a
+ * button with.  What is written here is what the engine acted on, which is the
+ * only thing worth replaying.  tools/inputplay.py speaks the panel numbers
+ * back.
+ */
+static int s_recinput;
+
+void sdl_shim_recinput(int on)
+{
+    s_recinput = on ? 1 : 0;
+}
+
 static void events_frame(uint32_t frame_us, uint32_t blit_us, uint32_t wire_us,
                          int x, int y, int w, int h)
 {
@@ -2830,6 +2848,18 @@ static void pump(void)
         case AG_EV_KEY_UP: {
             s_ev_keys++;
             const SDL_Scancode sc = scancode_of(e.key.keycode);
+            /*
+             * Recorded before the unknown-key test, so a key the shim has no
+             * scancode for is still in the transcript: a step marker that
+             * silently did not happen is worse than a useless one.
+             */
+            if (s_recinput && e.type == AG_EV_KEY_DOWN) {
+                const unsigned kc = (unsigned)e.key.keycode;
+                shim_printf("[rec t=%u] key %u%s%c%s\n", (unsigned)ag_millis(),
+                            kc, (kc >= 32u && kc < 127u) ? " '" : "",
+                            (kc >= 32u && kc < 127u) ? (char)kc : ' ',
+                            (kc >= 32u && kc < 127u) ? "'" : "");
+            }
             if (sc == SDL_SCANCODE_UNKNOWN) {
                 continue;
             }
@@ -2944,6 +2974,28 @@ static void pump(void)
                                ? SDL_BUTTON_MIDDLE
                                : SDL_BUTTON_LEFT);
                 out.button.clicks = 1;
+                /*
+                 * Where the click landed, as the *game* received it - not as
+                 * the host believed it had sent it.  The two disagree: the
+                 * helper maps a letterboxed window onto the guest's size, and
+                 * the guest's own pointer has its own idea of where it is.
+                 * Only this end can be replayed, so only this end is written
+                 * down.  Both coordinate systems go in the line: the panel's,
+                 * which is what inputplay.py speaks, and the picture's, which
+                 * is what stays the same when the panel changes size.
+                 */
+                if (s_recinput) {
+                    const int gx = s_one_to_one ? (x + s_pan_x)
+                                                : (x << s_panel_shift);
+                    const int gy = s_one_to_one ? (y + s_pan_y)
+                                                : (y << s_panel_shift);
+                    shim_printf("[rec t=%u] %s panel=%d,%d game=%d,%d "
+                                "buttons=%u\n",
+                                (unsigned)ag_millis(),
+                                (e.type == AG_EV_POINTER_DOWN) ? "press"
+                                                               : "release",
+                                x, y, gx, gy, (unsigned)s_mouse_buttons);
+                }
             }
             queue_push(&out);
             break;
