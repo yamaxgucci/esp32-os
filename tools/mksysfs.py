@@ -120,8 +120,10 @@ def main():
                     help="board pack holding BOARD.CFG and SYSTEM.CFG")
     ap.add_argument("--apps", default=os.path.join(ROOT, "build", "apps"),
                     help="where the built .SYS images are")
-    ap.add_argument("--partitions",
-                    default=os.path.join(ROOT, "partitions_4mb.csv"))
+    ap.add_argument("--partitions", default=None,
+                    help="the layout to read the sysfs offset from.  By "
+                         "default the one sdkconfig names, which is the one "
+                         "the firmware on the board was built against")
     ap.add_argument("--sdkconfig", default=os.path.join(ROOT, "sdkconfig"))
     ap.add_argument("--out", default=os.path.join(ROOT, "build", "sysfs.bin"))
     ap.add_argument("--display", choices=("soft", "panel", "none"),
@@ -142,6 +144,27 @@ def main():
     ap.add_argument("-p", "--port", help="serial port, for --flash")
     ap.add_argument("--baud", type=int, default=921600)
     args = ap.parse_args()
+
+    #
+    # Which layout, and getting this wrong is silent and expensive.
+    #
+    # The default used to be partitions_4mb.csv, which puts sysfs at 0x200000.
+    # On an 8 MB board the real layout has it at 0x310000 and 0x200000 is
+    # inside the *application* partition - so `--flash` wrote half a megabyte
+    # over the tail of the firmware, esptool said "Hash of data verified", the
+    # board booted (the image ends before there), and C: came back with none
+    # of the files that had just been written to it.  Nothing anywhere said
+    # the offset was wrong.
+    #
+    # sdkconfig names the layout the firmware was actually built against, and
+    # this script already reads sdkconfig for two other things, so ask it.
+    #
+    if args.partitions is None:
+        named = read_config(args.sdkconfig,
+                            "CONFIG_PARTITION_TABLE_CUSTOM_FILENAME",
+                            "partitions_4mb.csv").strip().strip('"')
+        args.partitions = os.path.join(ROOT, named)
+        print("mksysfs: layout %s (from sdkconfig)" % named)
 
     offset, size = read_partition(args.partitions, "sysfs")
     name_max = read_config(args.sdkconfig, "CONFIG_LITTLEFS_OBJ_NAME_LEN", "64")
