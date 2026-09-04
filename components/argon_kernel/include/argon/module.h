@@ -99,7 +99,7 @@ void ag_module_on_unload(void (*fn)(void));
  * away underneath it.
  */
 bool ag_module_task(void (*fn)(void *), void *arg, const char *name,
-                    uint32_t stack, int priority);
+                    uint32_t stack, int priority, uint32_t flags);
 
 /*
  * Walks [modules] device=... from SYSTEM.CFG, then runs I2C probe against

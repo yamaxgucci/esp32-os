@@ -126,9 +126,9 @@ static void api_module_on_unload(void (*fn)(void))
 }
 
 static bool api_module_task(void (*fn)(void *), void *arg, const char *name,
-                            uint32_t stack, int priority)
+                            uint32_t stack, int priority, uint32_t flags)
 {
-    return ag_module_task(fn, arg, name, stack, priority);
+    return ag_module_task(fn, arg, name, stack, priority, flags);
 }
 
 static const ag_sys_api_t k_sys = {

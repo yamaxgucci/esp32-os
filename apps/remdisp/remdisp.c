@@ -147,7 +147,6 @@ static bool               s_up;
 /* One frame, built here and written in one call.  Static because the console
  * task's stack is not this driver's to spend, and the kernel serialises every
  * callback that uses it. */
-static uint8_t s_frame[5u + FR_MAX_PAYLOAD + 1u];
 
 /* What went and what did not.  Read back through the display's ioctl so the
  * thing above the driver can put it in its own readout - a driver cannot
@@ -176,16 +175,6 @@ static uint32_t s_dropped;
  * seven and a half seconds of a rectangle showing the frame before it.  So the
  * answer goes back and the hash is written only when it is true.
  */
-/*
- * One frame atomic on the wire.  Picture and sound both leave this board over
- * the same UART and no longer share the device registry lock (the kernel drops
- * it before a blit so the wire cannot stall the console and the sound), so this
- * is what stops the two building the one shared frame buffer over each other.
- * Held only for one frame - a band, or a little block of samples - so the sound
- * waits at most one band for its turn and every frame comes off the wire whole,
- * which is all the receiver needs since each frame carries its own checksum.
- */
-static ag_mutex_t s_wire_lock;
 
 /*
  * Take, and give back only if it was taken.
@@ -221,42 +210,137 @@ static void lock_give(ag_mutex_t m, bool held)
     }
 }
 
+/*
+ * One task writes the port.  Everybody else leaves the frame here.
+ *
+ * The wire lock used to be held across the write itself, and the write blocks:
+ * uart_write_bytes waits for the peripheral to make room, and a port carrying
+ * a picture is full most of the time.  So whoever held it - the sender, the
+ * console drawing a row of text, the sound - held it for as long as the wire
+ * took, and everything else queued behind.  Twice that ended with a board that
+ * answered nothing at all: the console cannot print without this lock, and a
+ * machine that cannot print is a machine with no way to say what is wrong.
+ *
+ * The io layer learned this lesson before this file did, and wrote it down:
+ * "a thread blocked in a write to the picture link held the lock the console
+ * needed to print... the whole board went quiet at once".  It stopped holding
+ * its lock across the write.  This is the same answer one layer up.
+ *
+ * So a frame is assembled straight into a ring and the caller returns.  The
+ * ring is drained by the one task that owns the port, and nothing else ever
+ * touches it.  What is held while the wire is blocking is nothing at all.
+ *
+ * A frame that does not fit is dropped rather than waited for, and the caller
+ * is told so its idea of what the far end has stays true.  That is the right
+ * failure for a video link: a dropped band is a stale rectangle until the
+ * repair sweep comes round, where waiting is a stopped machine.
+ */
+#define TX_RING 24576u
+
+static uint8_t   *s_tx;
+static uint32_t   s_tx_r, s_tx_w, s_tx_used;
+static ag_mutex_t s_tx_lock;   /* the ring's own bookkeeping, held for bytes  */
+static ag_mutex_t s_drain_lock; /* the port itself, held across the write     */
+static uint8_t    s_tx_out[2048];
+static bool       s_task_ok;   /* false: no task, so the caller drains        */
+
+static void tx_put(uint8_t b)
+{
+    s_tx[s_tx_w] = b;
+    s_tx_w = (s_tx_w + 1u) % TX_RING;
+    s_tx_used++;
+}
+
+/* Defined below: the one place that writes the port. */
+static uint32_t tx_drain(void);
+
 static bool send_frame(uint8_t op, const uint8_t *payload, uint32_t len)
 {
-    if (!s_up || len > FR_MAX_PAYLOAD) {
+    if (!s_up || s_tx == NULL || len > FR_MAX_PAYLOAD) {
         s_dropped++;
         return false;
     }
-    const bool held = lock_take(s_wire_lock, UINT32_MAX);
-    s_frame[0] = FR_MAGIC0;
-    s_frame[1] = FR_MAGIC1;
-    s_frame[2] = op;
-    s_frame[3] = (uint8_t)len;
-    s_frame[4] = (uint8_t)(len >> 8);
+    const uint32_t want = 5u + len + 1u;
+
+    const bool held = lock_take(s_tx_lock, UINT32_MAX);
+    if (TX_RING - s_tx_used < want) {
+        /*
+         * The wire is behind.  Dropped, counted, and reported: the caller is
+         * about to write down that the far end has these pixels, and that has
+         * to stay true or the picture is wrong until the sweep repairs it.
+         */
+        lock_give(s_tx_lock, held);
+        s_dropped++;
+        return false;
+    }
+
+    tx_put(FR_MAGIC0);
+    tx_put(FR_MAGIC1);
+    tx_put(op);
+    tx_put((uint8_t)len);
+    tx_put((uint8_t)(len >> 8));
 
     uint8_t sum = 0;
     for (uint32_t i = 0; i < len; i++) {
-        s_frame[5u + i] = payload[i];
+        tx_put(payload[i]);
         sum = (uint8_t)(sum ^ payload[i]);
     }
-    s_frame[5u + len] = sum;
+    tx_put(sum);
+    lock_give(s_tx_lock, held);
 
-    /*
-     * Not retried, and not printed - printing is forbidden here and stalling
-     * to retry would stop the console or the application for the sake of one
-     * rectangle.  Only counted, and reported to the caller so that what the
-     * far end is believed to have stays true.
-     */
-    const uint32_t want = 5u + len + 1u;
-    const int32_t  n = io->uart_write(LINK_PORT, s_frame, want);
-    lock_give(s_wire_lock, held);
-    if (n < 0 || (uint32_t)n != want) {
-        s_dropped++;
-        return false;
-    }
     s_sent_bytes += want;
     s_sent_frames++;
+
+    /* With no task of its own this driver is what it always was: the caller
+     * carries the frame to the port and waits for it. */
+    if (!s_task_ok) {
+        (void)tx_drain();
+    }
     return true;
+}
+
+/*
+ * Take what is waiting and put it on the wire.  Only the wire task calls this,
+ * and it holds no lock while the port blocks - the bytes are copied out first.
+ */
+static uint32_t tx_drain(void)
+{
+    uint32_t total = 0;
+
+    /*
+     * Only the wire task gets here while there is one, so this is uncontended
+     * and costs a take and a give.  It matters in the degraded case: with no
+     * task the callers drain for themselves, and two of them writing the port
+     * at once is the interleaved rubbish this whole arrangement exists to
+     * prevent.
+     */
+    const bool dheld = lock_take(s_drain_lock, UINT32_MAX);
+
+    for (;;) {
+        const bool held = lock_take(s_tx_lock, UINT32_MAX);
+        uint32_t   n = s_tx_used;
+        if (n > sizeof(s_tx_out)) {
+            n = sizeof(s_tx_out);
+        }
+        for (uint32_t i = 0; i < n; i++) {
+            s_tx_out[i] = s_tx[s_tx_r];
+            s_tx_r = (s_tx_r + 1u) % TX_RING;
+            s_tx_used--;
+        }
+        lock_give(s_tx_lock, held);
+
+        if (n == 0u) {
+            break;
+        }
+        const int32_t w = io->uart_write(LINK_PORT, s_tx_out, n);
+        total += (w > 0) ? (uint32_t)w : 0u;
+        if (w < 0 || (uint32_t)w != n) {
+            break;
+        }
+    }
+
+    lock_give(s_drain_lock, dheld);
+    return total;
 }
 
 static void put16(uint8_t *p, uint32_t v)
@@ -537,6 +621,15 @@ static void poll_far_end(void)
  * bug the day either side changed.
  */
 static ag_mutex_t s_send_lock;
+
+/*
+ * Where a band's time goes, because "seven milliseconds of encoding" was an
+ * inference from a frame rate and not a measurement, and the four candidates -
+ * comparing, gathering, packing, palettising - are all plausible and only one
+ * of them can be first.
+ */
+static uint32_t s_t_hash, s_t_gather, s_t_pack, s_t_idx, s_t_wire;
+static uint32_t s_bands;
 
 static uint8_t  s_raw[FR_MAX_PAYLOAD];  /* geometry + pixels, uncompressed   */
 static uint8_t  s_cand[FR_MAX_PAYLOAD]; /* geometry + whatever encoded best  */
@@ -871,6 +964,7 @@ static void send_rect_locked(const ag_blit_t *b)
              * blocks, so any change in it costs all eight rows.  That is the
              * price of the hash and it is a couple of hundred pixels.
              */
+            const uint32_t th0 = (uint32_t)ag_api()->time->us();
             row = s_hash + (size_t)(((uint32_t)b->y + band) / BLK) *
                                s_hash_cols + gx0;
             x0 = (uint32_t)b->w;
@@ -901,6 +995,7 @@ static void send_rect_locked(const ag_blit_t *b)
                     }
                 }
             }
+            s_t_hash += (uint32_t)ag_api()->time->us() - th0;
             if (x0 > x1) {
                 continue; /* the far end already has this band */
             }
@@ -920,16 +1015,19 @@ static void send_rect_locked(const ag_blit_t *b)
         const uint32_t rh = y1 - y0 + 1u;
         const uint32_t npx = rw * rh;
 
-        /* Gather the rectangle. */
+        /* Gather the rectangle.  A row at a time and not a pixel at a time:
+         * the rows are contiguous at both ends and this is on the wire task's
+         * critical path. */
+        const uint32_t tg0 = (uint32_t)ag_api()->time->us();
         uint16_t *out = (uint16_t *)(s_raw + 12u);
         for (uint32_t r = 0; r < rh; r++) {
             const uint16_t *want =
                 (const uint16_t *)(src + (size_t)(band + y0 + r) * b->stride) +
                 x0;
-            for (uint32_t i = 0; i < rw; i++) {
-                out[r * rw + i] = want[i];
-            }
+            memcpy(out + (size_t)r * rw, want, (size_t)rw * sizeof(uint16_t));
         }
+        s_t_gather += (uint32_t)ag_api()->time->us() - tg0;
+        s_bands++;
 
         uint8_t geom[12];
         put16(geom + 0, (uint32_t)b->x + x0);
@@ -947,19 +1045,23 @@ static void send_rect_locked(const ag_blit_t *b)
         uint8_t        best_op = FR_BAND;
         uint32_t       best_len = 0;
 
+        const uint32_t tp0 = (uint32_t)ag_api()->time->us();
         const uint32_t p =
             s_encode ? pack16(out, npx, s_cand + 12u, FR_MAX_PAYLOAD - 12u) : 0u;
+        s_t_pack += (uint32_t)ag_api()->time->us() - tp0;
         if (p != 0 && p < best) {
             best = p;
             best_op = FR_PACK;
             best_len = p;
         }
+        const uint32_t ti0 = (uint32_t)ag_api()->time->us();
         const uint32_t q =
             s_encode ? encode_indexed(out, npx,
                                       s_cand + 12u + (best_op == FR_PACK ? p : 0u),
                                       FR_MAX_PAYLOAD - 12u -
                                           (best_op == FR_PACK ? p : 0u))
                      : 0u;
+        s_t_idx += (uint32_t)ag_api()->time->us() - ti0;
         if (q != 0 && q < best) {
             /* It won; move it to the front of the candidate buffer. */
             uint8_t *from = s_cand + 12u + p;
@@ -971,6 +1073,7 @@ static void send_rect_locked(const ag_blit_t *b)
             best_len = q;
         }
 
+        const uint32_t tw0 = (uint32_t)ag_api()->time->us();
         bool went;
         if (best_op == FR_BAND) {
             went = send_frame(FR_BAND, s_raw, 12u + raw);
@@ -980,6 +1083,7 @@ static void send_rect_locked(const ag_blit_t *b)
             }
             went = send_frame(best_op, s_cand, 12u + best_len);
         }
+        s_t_wire += (uint32_t)ag_api()->time->us() - tw0;
 
         /* Only now is it true that the far end has these blocks.  A band that
          * did not go leaves its hashes as they were, so the next flush that
@@ -1262,6 +1366,8 @@ static uint64_t s_win_wire;
 static uint32_t s_win_worst_us;
 static uint32_t s_win_behind;
 
+
+
 static void wire_stats(void)
 {
     static uint64_t at;
@@ -1302,6 +1408,20 @@ static void wire_stats(void)
               (unsigned)((px_kb != 0u) ? (wire_kb * 100u / px_kb) : 0u),
               (unsigned)(s_win_worst_us / 1000u), (unsigned)s_win_behind);
 
+    if (s_bands != 0u) {
+        ag_printf("REMDISP: %u bands, us each: compare %u, gather %u, pack %u, "
+                  "palette %u, wire %u\n",
+                  (unsigned)s_bands, (unsigned)(s_t_hash / s_bands),
+                  (unsigned)(s_t_gather / s_bands), (unsigned)(s_t_pack / s_bands),
+                  (unsigned)(s_t_idx / s_bands), (unsigned)(s_t_wire / s_bands));
+    }
+    s_bands = 0;
+    s_t_hash = 0;
+    s_t_gather = 0;
+    s_t_pack = 0;
+    s_t_idx = 0;
+    s_t_wire = 0;
+
     s_win_rects = 0;
     s_win_px = 0;
     s_win_wire = 0;
@@ -1315,6 +1435,7 @@ static void wire_task(void *arg)
     s_wire_running = true;
     while (!s_stop) {
         poll_far_end();
+        (void)tx_drain();
         wire_stats();
 
         uint32_t x = 0, y = 0, w = 0, h = 0;
@@ -1325,6 +1446,7 @@ static void wire_task(void *arg)
             repair = sweep_step(&x, &y, &w, &h);
             if (!repair) {
                 aud_drain();
+                (void)tx_drain();
                 ag_delay(2);
                 continue;
             }
@@ -1376,7 +1498,11 @@ static void wire_task(void *arg)
         }
 
         aud_drain();
+        (void)tx_drain();
     }
+
+    /* Whatever is still queued, before the port stops being ours. */
+    (void)tx_drain();
     s_wire_running = false;
 }
 
@@ -1402,6 +1528,7 @@ static void rem_stop(void)
     const bool held = dmg_lock();
     uint16_t *fb = s_fb;
     s_fb = NULL;
+    s_up = false; /* nothing more goes into the ring once it may be freed */
     s_fb_w = 0;
     s_fb_h = 0;
     s_dmg = false;
@@ -1412,6 +1539,8 @@ static void rem_stop(void)
     }
     if (!s_wire_running) {
         ag_free(fb);
+        ag_free(s_tx);
+        s_tx = NULL;
 
         /*
          * And the grid, which nothing has ever given back: it is five
@@ -1875,7 +2004,8 @@ ag_err_t ag_driver_init(void)
         return -AG_ENOTSUP;
     }
     if (ag_api()->task != NULL && ag_api()->task->mutex_create != NULL) {
-        s_wire_lock = ag_api()->task->mutex_create();
+        s_tx_lock = ag_api()->task->mutex_create();
+        s_drain_lock = ag_api()->task->mutex_create();
         s_aud_lock = ag_api()->task->mutex_create();
         s_send_lock = ag_api()->task->mutex_create();
     }
@@ -1972,8 +2102,9 @@ ag_err_t ag_driver_init(void)
      */
     s_fb_w = 320u;
     s_fb_h = 240u;
+    s_tx = (uint8_t *)ag_malloc(TX_RING);
     s_fb = (uint16_t *)ag_malloc((size_t)s_fb_w * s_fb_h * sizeof(uint16_t));
-    if (s_fb == NULL) {
+    if (s_fb == NULL || s_tx == NULL) {
         s_fb_w = 0;
         s_fb_h = 0;
         ag_printf("REMDISP: no frame of my own (%u KB); the wire will be fed "
@@ -1992,13 +2123,15 @@ ag_err_t ag_driver_init(void)
          * life blocked on a UART, so preferring it costs nothing.
          */
         s_stop = false;
-        if (!ag_module_task(wire_task, NULL, "remwire", 6144u, 6)) {
+        if (!ag_module_task(wire_task, NULL, "remwire", 6144u, 6,
+                            AG_THREAD_SYS_CORE)) {
             ag_free(s_fb);
             s_fb = NULL;
             s_fb_w = 0;
             s_fb_h = 0;
             ag_printf("REMDISP: no task of my own; sending from the caller\n");
         } else {
+            s_task_ok = true;
             ag_module_on_unload(rem_stop);
         }
     }

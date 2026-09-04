@@ -282,9 +282,14 @@ typedef struct ag_sys_api {
      * not return refuses the unload rather than taking the machine down.
      *
      * The task must therefore watch a flag and return.  Do not call exit.
+     *
+     * flags are ag_thread_flags: AG_THREAD_SYS_CORE keeps it off the core the
+     * foreground application runs on, which is what a driver doing real work
+     * wants - the screen driver's encoder and the game were otherwise two
+     * runnable tasks on one core, and the game lost half its frame rate to it.
      */
     bool (*module_task)(void (*fn)(void *), void *arg, const char *name,
-                        uint32_t stack, int priority);
+                        uint32_t stack, int priority, uint32_t flags);
 } ag_sys_api_t;
 
 /* ------------------------------------------------------------------------ */

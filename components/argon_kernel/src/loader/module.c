@@ -81,7 +81,7 @@ static void module_task_entry(void *arg)
 }
 
 bool ag_module_task(void (*fn)(void *), void *arg, const char *name,
-                    uint32_t stack, int priority)
+                    uint32_t stack, int priority, uint32_t flags)
 {
     if (fn == NULL) {
         return false;
@@ -117,10 +117,22 @@ bool ag_module_task(void (*fn)(void *), void *arg, const char *name,
      * module might not be waiting for. */
     slot->running = true;
 
+    /*
+     * The core, from the same flags an application's thread uses.  It matters:
+     * the foreground application is pinned to the app core, so a driver doing
+     * real work there is a second runnable task on the one core that is already
+     * busy - which cost the game half its frame rate before the screen driver
+     * asked for the system core instead.
+     */
+    int core = AG_PORT_ANY_CORE;
+    if (flags & AG_THREAD_SYS_CORE) {
+        core = 0;
+    }
+
     if (!ag_port_task_create(module_task_entry,
                              (name != NULL) ? name : "moddrv", stack, slot,
                              (unsigned)((priority > 0) ? priority : 5),
-                             AG_PORT_ANY_CORE, 0, &slot->task)) {
+                             core, 0, &slot->task)) {
         slot->running = false;
         ag_log(AG_LOG_WARN, "modules", "no memory for a %u byte task stack",
                (unsigned)stack);

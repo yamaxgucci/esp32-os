@@ -140,12 +140,12 @@ static inline void ag_module_on_unload(void (*fn)(void))
  */
 static inline bool ag_module_task(void (*fn)(void *), void *arg,
                                   const char *name, uint32_t stack,
-                                  int priority)
+                                  int priority, uint32_t flags)
 {
     if (!AG_HAS(g_ag_api->sys, module_task)) {
         return false;
     }
-    return g_ag_api->sys->module_task(fn, arg, name, stack, priority);
+    return g_ag_api->sys->module_task(fn, arg, name, stack, priority, flags);
 }
 
 #define ag_log(lvl, tag, ...) (g_ag_api->sys->log((lvl), (tag), __VA_ARGS__))

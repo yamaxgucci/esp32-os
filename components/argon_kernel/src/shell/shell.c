@@ -1851,6 +1851,15 @@ static int cmd_drv(int argc, char **argv)
             ag_console_printf("%s: not loaded\n", argv[2]);
             return 1;
         }
+        if (err == -AG_EBUSY) {
+            /* A module with a task of its own that did not stop when it was
+             * told to.  The image is deliberately left loaded: unmapping code
+             * a task is still inside is a fault that names the wrong culprit. */
+            ag_console_printf("%s: a task of its own has not stopped; "
+                              "still loaded\n",
+                              argv[2]);
+            return 1;
+        }
         if (err != AG_OK) {
             ag_console_printf("%s: %d\n", argv[2], (int)err);
             return 1;
