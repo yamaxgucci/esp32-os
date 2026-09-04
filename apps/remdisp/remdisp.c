@@ -1304,15 +1304,24 @@ static volatile bool s_wire_running;
  *
  * "Has anything been lost since?" - almost never, and asking costs the same as
  * answering, because a row can only be checked by sending it.  So once the debt
- * is paid this drops to a row every half second: a whole screen every fifteen,
- * a twentieth of the wire, and nothing anybody notices.
+ * is paid this drops to a row every sixty milliseconds: a whole screen every
+ * two seconds, seventeen bands a second, and nothing anybody notices.
  *
- * Running it fast all the time was measured and is not free: fifty rows a
- * second is seven milliseconds of encoding each, and the game fell from 45 fps
- * to 25 while the far end gained a refresh nobody needed.
+ * The slow rate was fifteen seconds until a band was measured rather than
+ * guessed.  "Seven milliseconds of encoding" was an inference from a frame rate
+ * and it was wrong by a factor of fourteen: compare 164 us, gather 18, pack 60,
+ * palette 143, wire 108 - about half a millisecond, so seventeen a second is
+ * eight milliseconds of a second and four per cent of the wire.  A screen that
+ * is never more than two seconds stale is worth that; a screen that is fifteen
+ * seconds stale is what a person calls broken.
+ *
+ * The first number the other way was wrong too, and for a better reason: fifty
+ * rows a second did cost the game half its frame rate, but that was measured
+ * while the wire lock was still held across the write, so what the game was
+ * losing was the console and not the encoder.
  */
 #define SWEEP_FAST_US 20000ull
-#define SWEEP_SLOW_US 500000ull
+#define SWEEP_SLOW_US 60000ull
 
 static bool sweep_step(uint32_t *x, uint32_t *y, uint32_t *w, uint32_t *h)
 {
