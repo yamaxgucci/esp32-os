@@ -732,10 +732,38 @@ int ag_main(int argc, char **argv)
     uint32_t last_wire = 0, last_asamples = 0, last_adropped = 0;
     uint32_t last_agaps = 0;
 
-    for (;;) {
+    bool stop = false;
+
+    while (!stop) {
         if ((tick++ & 0xffu) == 0u) {
-            if (ag_kbhit()) {
-                (void)ag_getch();
+            /*
+             * A key stops this.  A key, and not "something happened".
+             *
+             * ag_kbhit() answers whether any event is waiting, and the kernel
+             * says so beside it: "an event carrying no character counts as
+             * something, because deciding that here would mean taking the event
+             * to look at it".  On this board the touchscreen is polled ten
+             * times a second and its pen line runs beside the panel's own SPI,
+             * so events arrive with nobody touching anything - and this loop
+             * took every one of them as "stop".
+             *
+             * From the outside that was a screen showing the game which, at
+             * some random minute, went back to a shell prompt with a blinking
+             * cursor.  It cost most of a day: a receiver that has stopped and a
+             * sender that has stopped look identical on the glass, and every
+             * attempt to find out which sent a byte down the console - which is
+             * also a key, and also stopped it.
+             *
+             * So the event is taken and looked at.  A key stops it; pointers,
+             * focus changes and device notices are ignored.
+             */
+            ag_event_t ev;
+            while (ag_poll_event(&ev, 0)) {
+                if (ev.type == AG_EV_KEY_DOWN || ev.type == AG_EV_QUIT) {
+                    stop = true;
+                }
+            }
+            if (stop) {
                 break;
             }
             if (window != 0 &&

@@ -152,7 +152,31 @@ extern "C" {
  *      go out.  The module owns the task and unload waits for it.
  */
 #define AG_ABI_MAJOR 0u
+
+/*
+ * The minor an image declares, which is not always the one it was compiled
+ * beside.
+ *
+ * The loader refuses an image whose minor is above the kernel's, because such
+ * an image may call something that is not there.  An image that uses only older
+ * calls has no such problem, and there is a real case for saying so: two boards
+ * with two firmwares, and one program that runs on both.  The receiver for the
+ * picture link is exactly that - it lives on the older board and uses nothing
+ * newer than 0.27, and after this header moved to 0.43 it stopped loading there
+ * for no reason but the number.
+ *
+ * So it can be overridden at build time:
+ *
+ *     mkaxe ... --cflags "-DAG_ABI_MINOR=42u"
+ *
+ * The promise that goes with it is the one the ABI already asks for: reach
+ * anything newer than the declared floor through AG_HAS, which checks the
+ * table's own size at runtime.  Declaring a floor and then calling past it
+ * without asking is a null call, and that is on the caller.
+ */
+#ifndef AG_ABI_MINOR
 #define AG_ABI_MINOR 43u
+#endif
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
