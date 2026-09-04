@@ -187,15 +187,47 @@ static uint32_t s_dropped;
  */
 static ag_mutex_t s_wire_lock;
 
+/*
+ * Take, and give back only if it was taken.
+ *
+ * Every lock in this file used to be written as "take with a timeout, ignore
+ * the answer, give it back at the end", and that is two faults in one line.
+ * The give is from a task that does not hold it, which on FreeRTOS frees a
+ * mutex its real owner still believes it holds - so two tasks proceed, and the
+ * priority the first one inherited is handed back under it.  And what the two
+ * then share is s_frame, the one buffer every frame is assembled in, so the
+ * wire carries half of one frame followed by half of another.
+ *
+ * It could not happen while the only writer was whoever called blit_rect: the
+ * kernel held the device registry across that call and the console needed the
+ * same lock before it could print, so the two could never be inside here at
+ * once.  Giving this driver a task of its own took that accidental
+ * serialisation away, and both symptoms arrived together - a picture that was
+ * torn and dirty, and a board that stopped answering at all.
+ *
+ * So the wire lock is waited for without a limit: the holder always finishes,
+ * and there is nothing sensible to do with a refusal when what is being
+ * guarded is a buffer.  The others keep their timeout and honour the answer.
+ */
+static bool lock_take(ag_mutex_t m, uint32_t ms)
+{
+    return (m != NULL) && ag_mutex_lock(m, ms);
+}
+
+static void lock_give(ag_mutex_t m, bool held)
+{
+    if (m != NULL && held) {
+        ag_mutex_unlock(m);
+    }
+}
+
 static bool send_frame(uint8_t op, const uint8_t *payload, uint32_t len)
 {
     if (!s_up || len > FR_MAX_PAYLOAD) {
         s_dropped++;
         return false;
     }
-    if (s_wire_lock != NULL) {
-        (void)ag_api()->task->mutex_lock(s_wire_lock, 1000u);
-    }
+    const bool held = lock_take(s_wire_lock, UINT32_MAX);
     s_frame[0] = FR_MAGIC0;
     s_frame[1] = FR_MAGIC1;
     s_frame[2] = op;
@@ -217,9 +249,7 @@ static bool send_frame(uint8_t op, const uint8_t *payload, uint32_t len)
      */
     const uint32_t want = 5u + len + 1u;
     const int32_t  n = io->uart_write(LINK_PORT, s_frame, want);
-    if (s_wire_lock != NULL) {
-        ag_api()->task->mutex_unlock(s_wire_lock);
-    }
+    lock_give(s_wire_lock, held);
     if (n < 0 || (uint32_t)n != want) {
         s_dropped++;
         return false;
@@ -994,19 +1024,11 @@ static bool       s_dmg;
 static volatile bool s_stop;
 static uint32_t   s_late;    /* blits that went the old way, for `dev`      */
 
-static void dmg_lock(void)
-{
-    if (s_dmg_lock != NULL) {
-        (void)ag_mutex_lock(s_dmg_lock, 1000u);
-    }
-}
+/* Waited for without a limit, for the same reason as the wire lock: what it
+ * guards is a buffer, and half of one is not a picture. */
+static bool dmg_lock(void) { return lock_take(s_dmg_lock, UINT32_MAX); }
 
-static void dmg_unlock(void)
-{
-    if (s_dmg_lock != NULL) {
-        ag_mutex_unlock(s_dmg_lock);
-    }
-}
+static void dmg_unlock(bool held) { lock_give(s_dmg_lock, held); }
 
 /*
  * Snapped outward to the block grid, because the trimming above only runs on a
@@ -1058,7 +1080,7 @@ static bool dmg_take(uint32_t *x, uint32_t *y, uint32_t *w, uint32_t *h)
 {
     bool got = false;
 
-    dmg_lock();
+    const bool held = dmg_lock();
     if (s_dmg) {
         *x = s_dmg_x0;
         *y = s_dmg_y0;
@@ -1067,7 +1089,7 @@ static bool dmg_take(uint32_t *x, uint32_t *y, uint32_t *w, uint32_t *h)
         s_dmg = false;
         got = true;
     }
-    dmg_unlock();
+    dmg_unlock(held);
     return got;
 }
 
@@ -1087,7 +1109,7 @@ static void rem_blit_rect(ag_handle_t h, const ag_blit_t *b)
      * that has just been handed back is the kind of fault that shows up
      * somewhere else entirely.  See rem_stop.
      */
-    dmg_lock();
+    const bool held = dmg_lock();
 
     /*
      * The old way, for the two cases the frame cannot serve: no frame at all
@@ -1098,7 +1120,7 @@ static void rem_blit_rect(ag_handle_t h, const ag_blit_t *b)
      */
     if (s_fb == NULL || b->surf_w != s_fb_w || b->surf_h != s_fb_h ||
         (uint32_t)b->x + b->w > s_fb_w || (uint32_t)b->y + b->h > s_fb_h) {
-        dmg_unlock();
+        dmg_unlock(held);
         s_late++;
         poll_far_end();
         heal_a_band((uint32_t)b->y, b->h);
@@ -1115,7 +1137,7 @@ static void rem_blit_rect(ag_handle_t h, const ag_blit_t *b)
     }
 
     dmg_add_locked((uint32_t)b->x, (uint32_t)b->y, b->w, b->h);
-    dmg_unlock();
+    dmg_unlock(held);
 }
 
 /*
@@ -1128,12 +1150,68 @@ static void rem_blit_rect(ag_handle_t h, const ag_blit_t *b)
  */
 static volatile bool s_wire_running;
 
+/*
+ * What the wire did with the last five seconds, printed from the task itself.
+ *
+ * Not from a callback - printing from one is the deadlock the header warns
+ * about - and not while any lock is held.  It exists because "the picture is
+ * slow" is four different faults with one appearance: too much asked for, too
+ * little compressed away, a wire that cannot carry it, or a sender that never
+ * catches up.  One line separates them, and without it the argument is about
+ * impressions.
+ *
+ * Silent when nothing is drawing, so an idle board stays quiet.
+ */
+#define STAT_US 5000000ull
+
+static uint32_t s_win_rects;
+static uint64_t s_win_px;
+static uint64_t s_win_wire;
+static uint32_t s_win_worst_us;
+static uint32_t s_win_behind;
+
+static void wire_stats(void)
+{
+    static uint64_t at;
+    const uint64_t  now = (uint64_t)ag_api()->time->us();
+
+    if (at == 0ull) {
+        at = now + STAT_US;
+        return;
+    }
+    if (now < at) {
+        return;
+    }
+    at = now + STAT_US;
+    if (s_win_rects == 0u) {
+        return;
+    }
+
+    const uint64_t secs = STAT_US / 1000000ull;
+    const uint32_t px_kb = (uint32_t)(s_win_px * 2ull / 1024ull / secs);
+    const uint32_t wire_kb = (uint32_t)(s_win_wire / 1024ull / secs);
+
+    ag_printf("REMDISP: %u rect/s, %u KB/s of pixels -> %u KB/s on the wire "
+              "(%u%%), worst rect %u ms, behind %u\n",
+              (unsigned)(s_win_rects / (uint32_t)secs), (unsigned)px_kb,
+              (unsigned)wire_kb,
+              (unsigned)((px_kb != 0u) ? (wire_kb * 100u / px_kb) : 0u),
+              (unsigned)(s_win_worst_us / 1000u), (unsigned)s_win_behind);
+
+    s_win_rects = 0;
+    s_win_px = 0;
+    s_win_wire = 0;
+    s_win_worst_us = 0;
+    s_win_behind = 0;
+}
+
 static void wire_task(void *arg)
 {
     (void)arg;
     s_wire_running = true;
     while (!s_stop) {
         poll_far_end();
+        wire_stats();
 
         uint32_t x = 0, y = 0, w = 0, h = 0;
         if (!dmg_take(&x, &y, &w, &h)) {
@@ -1168,7 +1246,23 @@ static void wire_task(void *arg)
             .w = (uint16_t)w,
             .h = (uint16_t)h,
         };
+        const uint64_t t0 = (uint64_t)ag_api()->time->us();
+        const uint64_t wire0 = s_sent_bytes;
         send_rect(&b);
+        const uint32_t took = (uint32_t)((uint64_t)ag_api()->time->us() - t0);
+
+        s_win_rects++;
+        s_win_px += (uint64_t)w * h;
+        s_win_wire += s_sent_bytes - wire0;
+        if (took > s_win_worst_us) {
+            s_win_worst_us = took;
+        }
+        /* Damage that arrived while this one was going out: the sender did not
+         * catch up, and what is on the glass is already old. */
+        if (s_dmg) {
+            s_win_behind++;
+        }
+
         aud_drain();
     }
     s_wire_running = false;
@@ -1193,13 +1287,13 @@ static void rem_stop(void)
 {
     s_stop = true;
 
-    dmg_lock();
+    const bool held = dmg_lock();
     uint16_t *fb = s_fb;
     s_fb = NULL;
     s_fb_w = 0;
     s_fb_h = 0;
     s_dmg = false;
-    dmg_unlock();
+    dmg_unlock(held);
 
     for (int i = 0; i < 200 && s_wire_running; i++) {
         ag_delay(5);
@@ -1431,7 +1525,7 @@ static void aud_drain(void)
     }
     for (int batch = 0; batch < 8; batch++) {
         uint32_t n = 0;
-        (void)ag_api()->task->mutex_lock(s_aud_lock, 100u);
+        const bool aheld = lock_take(s_aud_lock, 100u);
         put16(s_amono + 0, s_awire_rate & 0xffffu);
         put16(s_amono + 2, s_awire_rate >> 16);
         while (n < AUD_CHUNK && s_awire_used > 0u) {
@@ -1440,7 +1534,7 @@ static void aud_drain(void)
             s_awire_used--;
             n++;
         }
-        ag_api()->task->mutex_unlock(s_aud_lock);
+        lock_give(s_aud_lock, aheld);
         if (n == 0u) {
             break;
         }
@@ -1514,9 +1608,7 @@ static int32_t rem_pcm_write(ag_device_t *dev, const void *buf, size_t len,
      * go out from aud_drain(), on the thread that already owns the wire.
      */
     const int16_t *src = (const int16_t *)buf;
-    if (s_aud_lock != NULL) {
-        (void)ag_api()->task->mutex_lock(s_aud_lock, 100u);
-    }
+    const bool wheld = lock_take(s_aud_lock, 100u);
     s_awire_rate = s_afmt.rate;
     for (size_t i = 0; i < frames; i++) {
         uint8_t m;
@@ -1536,9 +1628,7 @@ static int32_t rem_pcm_write(ag_device_t *dev, const void *buf, size_t len,
         s_awire_w = (s_awire_w + 1u) % AUD_WIRE_RING;
         s_awire_used++;
     }
-    if (s_aud_lock != NULL) {
-        ag_api()->task->mutex_unlock(s_aud_lock);
-    }
+    lock_give(s_aud_lock, wheld);
 
     /*
      * Always a full accept.  What did not reach the glass is in the counters,
