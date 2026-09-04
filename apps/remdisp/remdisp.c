@@ -1,8 +1,8 @@
-/*
+﻿/*
  * ArgonOS - this machine's screen, sent down a wire to the board that has glass.
  *
  * The S3 on the desk has no display.  The board next to it is little else but
- * one, and two soldered pins join them (docs/09-esp32-cyd.md, "Провод к S3").
+ * one, and two soldered pins join them (docs/09-esp32-cyd.md, "РџСЂРѕРІРѕРґ Рє S3").
  * So the screen becomes a device like any other: this publishes a display whose
  * panel is a serial port, and nothing above it can tell the difference.
  *
@@ -64,7 +64,7 @@
 #include <argon/argon.h>
 #include <argon/libc.h>
 
-AG_DRV("REMDISP", "1.2", "argon");
+AG_DRV("REMDISP", "1.5", "argon");
 
 /* UART1: the console is UART0 on this board, and the numbering is the chip's. */
 #define LINK_PORT 1
@@ -116,6 +116,28 @@ AG_DRV("REMDISP", "1.2", "argon");
 #define FR_PACK   'P' /* the same, PackBits over the pixels                  */
 #define FR_IDX    'I' /* the same, as a palette and indices                  */
 #define FR_AUD    'A' /* sound: a rate, then unsigned 8-bit mono samples     */
+#define FR_END    'E' /* that frame is whole: its number, and how many bands */
+
+/*
+ * Why a frame needs an end.
+ *
+ * Until now the wire carried bands and nothing else, and a band is a stripe of
+ * the screen.  The far end put each one on the glass as it arrived, so a moving
+ * picture reached the eye as a wipe from the top - the stripes somebody
+ * watching calls running bands - and neither end could say how many *frames* a
+ * second the glass was showing, because neither end knew where one frame ended
+ * and the next began.  Every number about the picture was therefore about
+ * rectangles, which is not what a person looks at.
+ *
+ * So: one two-byte number per frame and the count of bands it was made of,
+ * four bytes at the end of every rectangle the driver sends.  It buys three
+ * things that could not be had before.  The far end can count frames.  A gap
+ * in the numbering names a frame that did not arrive, which no checksum can -
+ * loss used to be invisible here, there being nothing to miss.  And a frame
+ * that arrives with fewer bands than it promised is a frame that lost one,
+ * which is the difference between "the wire dropped a stripe" and "the wire
+ * dropped everything".
+ */
 
 /*
  * A band is at most eight rows, and the reason is the far end's panel rather
@@ -143,6 +165,10 @@ AG_DRV("REMDISP", "1.2", "argon");
 
 static const ag_io_api_t *io;
 static bool               s_up;
+
+/* Which frame is being sent, and how many bands have gone into it. */
+static uint16_t s_frame_no;
+static uint16_t s_frame_bands;
 
 /* One frame, built here and written in one call.  Static because the console
  * task's stack is not this driver's to spend, and the kernel serialises every
@@ -616,7 +642,6 @@ static void heal_a_band(uint32_t y, uint32_t h)
 static uint64_t s_last_blit_us;
 static uint64_t s_last_text_us;
 
-static uint32_t s_sweep_row;
 static uint64_t s_sweep_at;
 static uint32_t s_sweep_owed = 0xffffffffu; /* everything, until told otherwise */
 static uint64_t s_sweep_asked_at;           /* when the far end last complained */
@@ -634,36 +659,33 @@ static void poll_far_end(void)
         for (int32_t i = 0; i < n; i++) {
             if (buf[i] == (uint8_t)FR_HELLO) {
                 /*
-                 * "Send it again."  The far end says this when it starts, and
-                 * also on every frame it could not decode - rate limited to one
-                 * a second at its end.
+                 * "Send it again."  The far end says this when it starts, on
+                 * every frame it could not decode, and now also on every frame
+                 * that never arrived at all - which it can see because the
+                 * frames are numbered.
                  *
-                 * It used to mean hash_forget(): throw away everything believed
-                 * about the far end, so the next rectangle goes whole.  With a
-                 * repair sweep that is both too much and too little.  Too much
-                 * because the link loses a frame or two a second under load, so
-                 * this arrives about once a second, and forgetting the grid
-                 * that often means the trimming never works at all - measured,
-                 * the wire went from 30 KB/s to 380 and the game from 45 fps to
-                 * 2.4.  The receiver's own comment had predicted exactly that:
-                 * "a repaint per corrupt frame is a repaint that causes the
-                 * next one".
+                 * What it triggers is one repair frame covering the screen.
+                 * Not hash_forget() on its own, which was too much and too
+                 * little at once: too much because forgetting the grid on every
+                 * complaint means the trimming never works - measured, the wire
+                 * went from 30 KB/s to 380 and the game from 45 fps to 2.4 -
+                 * and too little because forgetting only repairs the parts the
+                 * game happens to redraw next.  And not a row at a time either,
+                 * which is what replaced it: thirty rows is thirty frames and a
+                 * stripe crawling down the glass.
                  *
-                 * And too little, because forgetting only repairs the parts the
-                 * game happens to redraw next.
-                 *
-                 * So it starts the sweep from the top instead, at the ordinary
-                 * pace.  The whole screen is right again within two seconds,
-                 * the grid keeps working meanwhile, and asking twice costs
-                 * nothing more than asking once.
+                 * Rate limited, and that is not a nicety: under load the link
+                 * loses a frame or two a second, and a full repaint per lost
+                 * frame is a repaint that loses the next one.  Two seconds is
+                 * the shortest interval at which a repaint (about 20 KB) costs
+                 * less than a tenth of the budget.
                  */
                 const uint64_t now = (uint64_t)ag_api()->time->us();
                 if (s_sweep_asked_at == 0ull ||
-                    now - s_sweep_asked_at >= 10000000ull) {
+                    now - s_sweep_asked_at >= 2000000ull) {
                     s_sweep_asked_at = now;
-                    s_sweep_row = 0;
                     s_sweep_at = 0;
-                    s_sweep_owed = s_hash_rows;
+                    s_sweep_owed = 1u;
                 }
             }
         }
@@ -697,6 +719,10 @@ static ag_mutex_t s_send_lock;
  */
 static uint32_t s_t_hash, s_t_gather, s_t_pack, s_t_idx, s_t_wire;
 static uint32_t s_bands;
+/* Pixels actually put on the wire, counted band by band as they go.  Declared
+ * here rather than beside the other window counters because the band loop is
+ * above them and it is the only place that may add to it. */
+static uint64_t s_win_px;
 
 static uint8_t  s_raw[FR_MAX_PAYLOAD];  /* geometry + pixels, uncompressed   */
 static uint8_t  s_cand[FR_MAX_PAYLOAD]; /* geometry + whatever encoded best  */
@@ -958,7 +984,25 @@ static void send_rect(const ag_blit_t *b)
     if (s_send_lock != NULL && !ag_mutex_lock(s_send_lock, 2000u)) {
         return;
     }
+    s_frame_bands = 0;
     send_rect_locked(b);
+
+    /*
+     * The end marker goes out under the same lock as the bands it closes.
+     * Outside it, the fallback path in blit_rect could put a band of the next
+     * frame on the wire between the last band of this one and its end, and the
+     * far end would present a frame it had not finished receiving - which is
+     * the exact fault this marker exists to remove.
+     */
+    if (s_frame_bands != 0u) {
+        uint8_t end[4];
+        end[0] = (uint8_t)s_frame_no;
+        end[1] = (uint8_t)(s_frame_no >> 8);
+        end[2] = (uint8_t)s_frame_bands;
+        end[3] = (uint8_t)(s_frame_bands >> 8);
+        (void)send_frame(FR_END, end, sizeof(end));
+        s_frame_no++;
+    }
     if (s_send_lock != NULL) {
         ag_mutex_unlock(s_send_lock);
     }
@@ -1177,6 +1221,10 @@ static void send_rect_locked(const ag_blit_t *b)
                 row[s_fresh_col[i]] = s_fresh_hash[i];
             }
         }
+        if (went) {
+            s_frame_bands++;
+            s_win_px += npx;
+        }
     }
 
 }
@@ -1382,16 +1430,26 @@ static volatile bool s_wire_running;
  * to show.
  *
  * So: a budget in bytes a second, spent on whatever asks first - real damage
- * before repair, as everywhere else here.  A hundred kilobytes is three times
- * what a game on a map actually uses (33 KB/s measured) and a quarter of what a
- * movie takes if nobody stops it.  What a movie gets instead is about one
- * screen a second, which is a fair picture of a movie and a game that is still
- * running.
+ * before repair, as everywhere else here.
  *
  * Not a frame rate limit: what costs the machine is bytes, and a screen that
  * changed in one corner is not the same as one that changed everywhere.
+ *
+ * The number was a hundred kilobytes because that is three times what a game
+ * standing on a map asks for (33 KB/s measured).  That yardstick was wrong,
+ * and it took somebody watching the glass to say so: a game standing still is
+ * not what anyone looks at.  When the picture *moves*, every frame is a whole
+ * screen - 150 KB of pixels, about 20 KB once encoded - so a hundred kilobytes
+ * a second is five whole screens a second and no more.  That is the lag on the
+ * glass, and it is this constant, not the wire: four megabaud would carry
+ * fifteen screens a second and eight would carry twenty-nine.
+ *
+ * So it is a build-time number now, to be swept rather than argued about, and
+ * what it should be is whatever the game can afford to give up.
  */
+#ifndef WIRE_BUDGET_BPS
 #define WIRE_BUDGET_BPS 100000u
+#endif
 
 static uint64_t s_budget_at;
 static uint32_t s_budget_left = WIRE_BUDGET_BPS;
@@ -1430,11 +1488,27 @@ static void budget_spend(uint32_t bytes)
  * With a task and a frame of its own, the honest thing is available: walk the
  * screen, one row of blocks at a time, and send what is there.
  *
- * One row per turn, and only when nothing is waiting - real damage always goes
- * first, so this costs nothing while the picture is moving.  Thirty rows on
- * this panel, so a screen nobody is drawing on is made right in well under a
- * second, and a row is two and a half kilobytes encoded against a wire that
- * carries four hundred.
+ * It used to walk one row of blocks per turn, and that was the wrong shape.
+ * Thirty rows meant thirty *frames*, each one row tall, twenty milliseconds
+ * apart - and what a person sees when a screen is repaired a row at a time is
+ * a stripe crawling down the glass for six hundred milliseconds, stopping
+ * wherever the budget runs out.  "Everything changes in stripes, and the
+ * stripes hang" is the exact report, and it was not a wire fault or a codec
+ * fault: it was this loop, drawing a stripe at a time because that was cheap
+ * to write.
+ *
+ * It also poisoned every measurement of the frame rate.  A repair row is one
+ * band, so most of what the far end counted as frames were repair rows: 354
+ * frames in twenty seconds carrying 296 bands between them, less than one band
+ * per frame.  Holding a frame's bands back to present them together - which is
+ * the right thing and was asked for - therefore changed nothing at all,
+ * because there was nothing to hold.
+ *
+ * So a repair is now one frame covering the whole screen, and it happens
+ * rarely instead of constantly.  The hash trimming means the bands that have
+ * not changed cost nothing to skip, so what actually goes out is only what the
+ * far end is missing; and it goes out as one frame, which is what a screen
+ * changing looks like.
  *
  * The hashes for the row are forgotten before it is sent, or the band would be
  * compared against what the far end is *believed* to have and skipped - which
@@ -1472,9 +1546,20 @@ static void budget_spend(uint32_t bytes)
  * the next one, which the receiver's own source predicted and this driver then
  * demonstrated at 2.4 fps.
  */
-#define SWEEP_FAST_US 20000ull
-#define SWEEP_SLOW_US 500000ull
-
+/*
+ * And it only happens when the far end says something is missing.
+ *
+ * A repair that runs on a clock has to forget the hashes to have any effect,
+ * and forgetting them means sending the whole screen again - so a timed sweep
+ * costs a full screen every time it fires, forever, on a picture that has not
+ * changed at all.  The old one hid that cost by spreading it over thirty turns;
+ * spreading it is what made the stripes.
+ *
+ * There is no need to guess any more.  Every frame is numbered now, so the far
+ * end can tell that one never arrived - a gap in the numbering - as well as
+ * that one arrived broken, and it says so.  Unasked, nothing is sent: a screen
+ * with nothing missing needs no repair, which is the whole point.
+ */
 static bool sweep_step(uint32_t *x, uint32_t *y, uint32_t *w, uint32_t *h)
 {
     if (s_hash == NULL || s_hash_rows == 0u || s_fb_w == 0u) {
@@ -1484,31 +1569,31 @@ static bool sweep_step(uint32_t *x, uint32_t *y, uint32_t *w, uint32_t *h)
     if (s_last_blit_us == 0ull || s_last_text_us > s_last_blit_us) {
         return false;
     }
+    if (s_sweep_owed == 0u) {
+        return false; /* nothing is missing */
+    }
     const uint64_t now = (uint64_t)ag_api()->time->us();
     if (now < s_sweep_at) {
         return false;
     }
-    s_sweep_at = now + ((s_sweep_owed != 0u) ? SWEEP_FAST_US : SWEEP_SLOW_US);
+    s_sweep_at = now;
+    s_sweep_owed = 0u;
 
-    const uint32_t r = s_sweep_row % s_hash_rows;
-    s_sweep_row++;
-    if (s_sweep_owed == 0xffffffffu) {
-        s_sweep_owed = s_hash_rows; /* the whole screen, now that its size is known */
-    }
-    if (s_sweep_owed != 0u) {
-        s_sweep_owed--;
-    }
-    for (uint32_t c = 0; c < s_hash_cols; c++) {
-        s_hash[(size_t)r * s_hash_cols + c] = 0;
-    }
+    /*
+     * The whole screen, and every hash forgotten with it.  Forgetting is what
+     * makes the trimming send a block again, so this is the only way to
+     * recover a band the far end never got - and doing it for the whole screen
+     * at once is what makes the recovery look like a frame rather than a
+     * stripe.  What it costs is only the blocks that actually differ from what
+     * the far end has, because the trimming still runs: on a still picture the
+     * first repair sends everything and the next one sends nothing.
+     */
+    hash_forget();
     *x = 0;
-    *y = r * BLK;
+    *y = 0;
     *w = s_fb_w;
-    *h = BLK;
-    if (*y + *h > s_fb_h) {
-        *h = s_fb_h - *y;
-    }
-    return *h != 0u;
+    *h = s_fb_h;
+    return *w != 0u && *h != 0u;
 }
 
 /*
@@ -1526,7 +1611,6 @@ static bool sweep_step(uint32_t *x, uint32_t *y, uint32_t *w, uint32_t *h)
 #define STAT_US 5000000ull
 
 static uint32_t s_win_rects;
-static uint64_t s_win_px;
 static uint64_t s_win_wire;
 static uint32_t s_win_worst_us;
 static uint32_t s_win_behind;
@@ -1674,7 +1758,21 @@ static void wire_task(void *arg)
         const uint32_t took = (uint32_t)((uint64_t)ag_api()->time->us() - t0);
 
         s_win_rects++;
-        s_win_px += (uint64_t)w * h;
+        /*
+         * The pixels are counted where they are *sent*, band by band, and not
+         * here where the damage rectangle is known.
+         *
+         * Counting them here was a twelvefold lie.  A rectangle is trimmed to
+         * the blocks that actually changed before anything goes out, so the
+         * area this task picked up bears no relation to the area that left -
+         * measured against the far end's own count of what it presented, 237
+         * thousand pixels a second here against 19 thousand there.  The rest
+         * of the line was right: rectangles a second agreed, bytes a second
+         * agreed.  Only the pixels were invented, and they are what "screens a
+         * second" is divided from, so the one figure a person looking at the
+         * glass would check was the one that was wrong - and it read 3.16
+         * screens a second while the glass showed one every three seconds.
+         */
         s_win_wire += s_sent_bytes - wire0;
         budget_spend((uint32_t)(s_sent_bytes - wire0));
         if (took > s_win_worst_us) {
@@ -2327,10 +2425,10 @@ ag_err_t ag_driver_init(void)
         }
     }
 
-    ag_printf("REMDISP: uart%d at %u baud; %ux%u cells, pixels in %u-row "
-              "bands%s\n",
-              LINK_PORT, (unsigned)LINK_BAUD, (unsigned)REM_COLS,
-              (unsigned)REM_ROWS, (unsigned)BAND_ROWS,
+    ag_printf("REMDISP: uart%d at %u baud, budget %u B/s; %ux%u cells, "
+              "pixels in %u-row bands%s\n",
+              LINK_PORT, (unsigned)LINK_BAUD, (unsigned)WIRE_BUDGET_BPS,
+              (unsigned)REM_COLS, (unsigned)REM_ROWS, (unsigned)BAND_ROWS,
               (s_fb != NULL) ? ", sent from a task of its own" : "");
     return AG_OK;
 }

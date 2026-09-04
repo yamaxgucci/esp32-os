@@ -133,7 +133,23 @@ def main():
 def over_serial(port, baud, dst, data):
     # No DTR/RTS handling at all: touching either resets the chip through the
     # auto-reset circuit, and the whole point is to leave the board running.
-    ser = serial.Serial(port, baud, timeout=0.05, xonxoff=True)
+    #
+    # Opened without touching DTR or RTS, because those two lines are wired to
+    # EN and IO0 on every one of these boards - the auto-reset circuit the
+    # flasher uses.  A library that asserts them at open pulses EN, so simply
+    # *uploading a file* restarted whatever the board was running: a driver
+    # replaced under a game killed the game, and the run had to start again.
+    # They have to be off before the handle exists, not cleared after it, which
+    # is too late; pyserial does that if they are set before open().
+    #
+    ser = serial.Serial()
+    ser.port = port
+    ser.baudrate = baud
+    ser.timeout = 0.05
+    ser.xonxoff = True
+    ser.dtr = False
+    ser.rts = False
+    ser.open()
     try:
         #
         # END first, in case the last run of this was interrupted.  A `recv`

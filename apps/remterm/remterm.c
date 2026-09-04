@@ -48,7 +48,7 @@
 #include <argon/argon.h>
 #include <argon/libc.h>
 
-AG_APP("REMTERM", "1.2", "argon", 0);
+AG_APP("REMTERM", "1.5", "argon", 0);
 
 #define LINK_PORT 1
 #define LINK_BAUD 4000000u
@@ -57,6 +57,7 @@ AG_APP("REMTERM", "1.2", "argon", 0);
 #define FR_MAGIC1 0x5Au
 #define FR_ROW    'R'
 #define FR_CUR    'C'
+#define FR_END    'E' /* that frame is whole: number, and how many bands     */
 #define FR_BAND   'B' /* pixels as they are                                  */
 #define FR_PACK   'P' /* PackBits over the pixels                            */
 #define FR_IDX    'I' /* a palette and indices                               */
@@ -314,9 +315,100 @@ static uint16_t *s_band;      /* surf_w * BAND_ROWS pixels, rows full width */
 static uint32_t  s_band_w;    /* what it was sized for                      */
 static bool      s_acquired;  /* the panel is ours; the console is suspended */
 
+/* ---- one frame at a time ----------------------------------------------- */
+/*
+ * Why the bands of a frame are held back and put on the glass together.
+ *
+ * A band is a stripe, and this program used to put each one on the panel as it
+ * arrived.  Watching that, a moving picture reaches the eye as a wipe down the
+ * screen - the running bands - and worse, nobody can count anything: the
+ * sender's own instrument reported "2.41 screens a second" while the person
+ * watching the glass measured about one screen every three seconds, and both
+ * were right.  The sender was adding up *pixels* and dividing by the area of a
+ * screen, so a dialog box repainted forty times counted as several screens
+ * while the screen as a whole was never once refreshed.  A number like that
+ * cannot be argued with and cannot be used.
+ *
+ * So the far end now marks the end of a frame, and this end holds a frame's
+ * bands until the marker arrives, then decodes and presents them in one go and
+ * counts one frame.  That count is the frame rate a person sees, by
+ * construction, because it is the number of times the picture was made whole.
+ *
+ * What is held is the *encoded* bands, not the pixels.  A screen of pixels is
+ * 150 KB and this board has 125 KB free with 92 KB of it in one piece, so a
+ * second framebuffer was never possible here - that is measured, not assumed.
+ * Encoded, the same screen is a few kilobytes: measured on a Fallout map, a
+ * frame is 6.4 KB, because the far end sends whichever of raw, PackBits or
+ * palette-and-indices came out smallest.
+ *
+ * How much to ask for is therefore not a constant either, and getting it wrong
+ * wedged the board.  Sixty-four kilobytes could not be had at all - this
+ * program's own forty kilobytes of buffers come out of the same heap, and what
+ * is left in one piece after it loads is about sixty-five, not the ninety-two
+ * the shell reports before it.  Forty-eight *could* be had, which was worse:
+ * it left sixteen kilobytes for everything else, the panel driver could not
+ * get what it needs to paint, and the whole board went quiet with the display
+ * held and the console suspended - no fault, no journal entry, nothing to read.
+ *
+ * So the ask starts where the need is, not where the heap is.  A frame is 6.4
+ * KB measured on a Fallout map, so twenty-four kilobytes holds three of them
+ * and leaves forty for the rest of the machine.  A frame that does not fit is
+ * presented in two halves rather than dropped, and says so in frames_split.
+ */
+static const uint32_t k_pend_try[] = {24576u, 16384u, 8192u};
+
+static uint8_t *s_pend;      /* [op][len32][payload] ... , or NULL if no room */
+static uint32_t s_pend_cap;
+static uint32_t s_pend_used;
+static uint32_t s_pend_over; /* frames that had to be split; want this at 0   */
+
+/* The counters.  At file scope because the band path is a function now, and
+ * every one of them is only ever touched from the reader. */
+static uint32_t rows;         /* console rows applied                        */
+static uint32_t bands;        /* bands presented                             */
+static uint32_t px;           /* pixels presented, in thousands              */
+static uint32_t bad;          /* frames whose checksum or shape failed       */
+static uint32_t stray;        /* bytes dropped hunting for a header          */
+static uint32_t pxlow;
+static uint32_t packedframes;
+static uint32_t idxframes;
+static uint32_t wire;         /* payload bytes accepted, all kinds           */
+/*
+ * And the pixel bytes on their own, because `wire` cannot answer the question
+ * it looks like it answers.  It counts sound and end-markers too, so dividing
+ * it by the pixels presented gives a compression ratio with 22 KB/s of audio
+ * folded into it - which is how "the bands compress 7.4 times" and "the bands
+ * compress 1.3 times" were both derived from the same run.  A ratio is only
+ * worth quoting when its numerator and denominator describe the same bytes.
+ */
+static uint32_t wire_px;      /* payload bytes of pixel bands only           */
+static uint32_t frames;       /* whole frames put on the glass               */
+static uint32_t framesmiss;   /* gaps in the numbering                       */
+static uint32_t framespart;   /* frames with fewer bands than promised       */
+static uint32_t framesresync; /* the sender began counting again             */
+static uint32_t inframe;      /* bands presented since the last marker       */
+static uint32_t nextframe;    /* the frame number expected next              */
+static bool     numbered;
+static uint64_t us_decode;
+static uint64_t us_present;
+static ag_time_t first_px;
+static ag_time_t last_px;
+
+/*
+ * Three counters, because "no pixels reached the glass" has three causes with
+ * one appearance, and a run that reported 509 frames closed and nought
+ * rectangles presented could not say which.  Guessing cost an hour; a counter
+ * costs three words each.
+ */
+static uint32_t s_no_width;  /* a surface this end cannot hold           */
+static uint32_t s_no_mem;    /* no room for one band of it               */
+static uint32_t s_no_acq;    /* the display would not be given to us     */
+static uint32_t s_no_pres;   /* present() refused the band               */
+
 static bool want_pixels(uint32_t surf_w)
 {
     if (surf_w == 0 || surf_w > MAX_SURF_W) {
+        s_no_width++;
         return false;
     }
     if (s_band == NULL || s_band_w != surf_w) {
@@ -325,6 +417,7 @@ static bool want_pixels(uint32_t surf_w)
                                        sizeof(uint16_t));
         if (s_band == NULL) {
             s_band_w = 0;
+            s_no_mem++;
             return false;
         }
         s_band_w = surf_w;
@@ -332,6 +425,7 @@ static bool want_pixels(uint32_t surf_w)
     if (!s_acquired) {
         ag_gfxinfo_t gi;
         if (ag_gfx_acquire(&gi) != AG_OK) {
+            s_no_acq++;
             return false;
         }
         s_acquired = true;
@@ -345,6 +439,146 @@ static void want_text(void)
         ag_gfx_release();
         s_acquired = false;
     }
+}
+
+/*
+ * Decode one band and put it on the panel.  A function rather than a limb of
+ * the reader because it is now called from two places: straight from the wire
+ * when nothing is being held back, and from pend_flush when a whole frame is
+ * being laid down at once.
+ */
+static void show_band(uint32_t op, const uint8_t *payload, uint32_t len)
+{
+    const uint32_t bx = get16(payload + 0);
+    const uint32_t by = get16(payload + 2);
+    const uint32_t bw = get16(payload + 4);
+    const uint32_t bh = get16(payload + 6);
+    const uint32_t sw = get16(payload + 8);
+    const uint32_t sh = get16(payload + 10);
+    const uint32_t npx = bw * bh;
+
+    if (bw == 0 || bh == 0 || bh > BAND_ROWS || bx + bw > sw ||
+        npx > BAND_MAX_PX) {
+        bad++;
+        return;
+    }
+
+    const ag_time_t t_dec = g_ag_api->time->us();
+    const uint8_t *body = payload + 12u;
+    const uint32_t blen = len - 12u;
+    bool           ok;
+    if (op == FR_BAND) {
+        if (blen < npx * 2u) {
+            bad++;
+            return;
+        }
+        for (uint32_t i = 0; i < npx; i++) {
+            s_px[i] = (uint16_t)rd16(body + i * 2u);
+        }
+        ok = true;
+    } else if (op == FR_PACK) {
+        ok = unpack16(body, blen, npx);
+    } else {
+        ok = unpack_indexed(body, blen, npx);
+        if (ok) {
+            idxframes++;
+        }
+    }
+    if (!ok) {
+        bad++;
+        return;
+    }
+    if (op != FR_BAND) {
+        packedframes++;
+    }
+    us_decode += (uint64_t)(g_ag_api->time->us() - t_dec);
+    wire += len;
+    wire_px += len;
+
+    if (!want_pixels(sw)) {
+        return;
+    }
+
+    /*
+     * Into rows the width of the whole surface, at the rectangle's own
+     * column: present() is given a stride that spans the surface and a
+     * pointer to the rectangle's first pixel, and reads only bw of each
+     * row.  What sits outside the rectangle is never looked at.
+     */
+    for (uint32_t r = 0; r < bh; r++) {
+        uint16_t *dst = s_band + r * sw + bx;
+        for (uint32_t i = 0; i < bw; i++) {
+            dst[i] = s_px[r * bw + i];
+        }
+    }
+
+    const ag_blit_t blit = {
+        .px = s_band + bx,
+        .stride = sw * sizeof(uint16_t),
+        .surf_w = (uint16_t)sw,
+        .surf_h = (uint16_t)sh,
+        .x = (uint16_t)bx,
+        .y = (uint16_t)by,
+        .w = (uint16_t)bw,
+        .h = (uint16_t)bh,
+    };
+    const ag_time_t t_pres = g_ag_api->time->us();
+    const ag_err_t  shown = ag_gfx_present(&blit);
+    us_present += (uint64_t)(g_ag_api->time->us() - t_pres);
+    if (shown == AG_OK) {
+        bands++;
+        inframe++;
+        pxlow += bw * bh;
+        while (pxlow >= 1000u) {
+            pxlow -= 1000u;
+            px++;
+        }
+        if (first_px == 0) {
+            first_px = g_ag_api->time->us();
+        }
+        last_px = g_ag_api->time->us();
+    } else {
+        s_no_pres++;
+    }
+}
+
+/* Hold a band back.  False means it will not fit and the caller must flush. */
+static bool pend_add(uint32_t op, const uint8_t *payload, uint32_t len)
+{
+    if (s_pend == NULL || len + 5u > s_pend_cap) {
+        return false;
+    }
+    if (s_pend_used + 5u + len > s_pend_cap) {
+        return false;
+    }
+    uint8_t *at = s_pend + s_pend_used;
+    at[0] = (uint8_t)op;
+    at[1] = (uint8_t)len;
+    at[2] = (uint8_t)(len >> 8);
+    at[3] = (uint8_t)(len >> 16);
+    at[4] = (uint8_t)(len >> 24);
+    memcpy(at + 5u, payload, len);
+    s_pend_used += 5u + len;
+    return true;
+}
+
+/* Put everything held on the glass, in the order it arrived. */
+static void pend_flush(void)
+{
+    uint32_t at = 0;
+    while (at + 5u <= s_pend_used) {
+        const uint32_t op = s_pend[at];
+        const uint32_t len = (uint32_t)s_pend[at + 1] |
+                             ((uint32_t)s_pend[at + 2] << 8) |
+                             ((uint32_t)s_pend[at + 3] << 16) |
+                             ((uint32_t)s_pend[at + 4] << 24);
+        if (at + 5u + len > s_pend_used) {
+            break;
+        }
+        show_band(op, s_pend + at + 5u, len);
+        at += 5u + len;
+    }
+    s_pend_used = 0;
 }
 
 /* ---- the sound --------------------------------------------------------- */
@@ -608,7 +842,7 @@ int ag_main(int argc, char **argv)
 {
     uint32_t baud = LINK_BAUD;
     if (argc >= 2 && (!parse_u32(argv[1], &baud) || baud == 0)) {
-        ag_printf("usage: remterm [baud] [secs]\n");
+        ag_printf("usage: remterm [baud] [secs] [whole]\n");
         return 1;
     }
     /*
@@ -619,7 +853,21 @@ int ag_main(int argc, char **argv)
      */
     uint32_t secs = 0;
     if (argc >= 3 && !parse_u32(argv[2], &secs)) {
-        ag_printf("usage: remterm [baud] [secs]\n");
+        ag_printf("usage: remterm [baud] [secs] [whole]\n");
+        return 1;
+    }
+    /*
+     * Holding a frame's bands and presenting them together is the default now,
+     * and it was not when it arrived: the first version of it put nothing on
+     * the glass at all, so it went in behind an argument until it was
+     * understood.  What it needed was not the buffer but a sender whose frames
+     * contain more than one band - the repair sweep was emitting a frame per
+     * stripe, so there was nothing to hold and holding it changed nothing.
+     * Pass 0 to go back to a band at a time.
+     */
+    uint32_t whole = 1;
+    if (argc >= 4 && !parse_u32(argv[3], &whole)) {
+        ag_printf("usage: remterm [baud] [secs] [whole]\n");
         return 1;
     }
 
@@ -660,6 +908,28 @@ int ag_main(int argc, char **argv)
         s_athread = ag_thread_create(aud_player, NULL, "remsnd", 4096, 2, 0);
     }
 
+    /*
+     * The buffer for a frame's worth of encoded bands, as big as the heap will
+     * give - and only when asked for, which is why there is a third argument.
+     *
+     * Holding frames whole is the right thing and it is not yet the safe
+     * thing: the first version of it put nothing on the glass at all - 509
+     * frames closed, nought rectangles presented - and a person watching had a
+     * blank screen while the counters looked busy.  A change that can do that
+     * does not belong on by default while it is still being understood.  So:
+     * `remterm <baud> <secs> 1` to hold frames, nothing to behave as before.
+     */
+    if (whole != 0u) {
+        for (uint32_t i = 0;
+             i < sizeof(k_pend_try) / sizeof(k_pend_try[0]); i++) {
+            s_pend = (uint8_t *)ag_malloc(k_pend_try[i]);
+            if (s_pend != NULL) {
+                s_pend_cap = k_pend_try[i];
+                break;
+            }
+        }
+    }
+
     ag_coninfo_t con;
     ag_coninfo(&con);
 
@@ -667,28 +937,38 @@ int ag_main(int argc, char **argv)
     ag_printf("remterm: %u baud, %ux%u cells, bands up to %ux%u\n",
               (unsigned)baud, (unsigned)con.cols, (unsigned)con.rows,
               (unsigned)MAX_SURF_W, (unsigned)BAND_ROWS);
+    if (s_pend != NULL) {
+        ag_printf("frames held whole: yes, %u KB\n",
+                  (unsigned)(s_pend_cap / 1024u));
+    } else if (whole != 0u) {
+        ag_printf("frames held whole: asked for, no memory\n");
+    }
 
     /*
      * Nothing below this line may print.  A printed line scrolls the console,
      * and the far end sends only the rows it thinks changed - so one scroll
      * here and the two screens disagree until its repair sweep catches up.
      */
-    uint32_t rows = 0;   /* console rows applied                            */
-    uint32_t bands = 0;  /* pixel rectangles presented                      */
-    uint32_t px = 0;     /* pixels presented, in thousands                  */
-    uint32_t bad = 0;    /* frames whose checksum or shape did not come out  */
-    uint32_t stray = 0;  /* bytes dropped hunting for a header              */
-    uint32_t pxlow = 0;
+    /* The counters live at file scope now; see "one frame at a time". */
     /*
      * What the encodings actually bought, which is the only way to know: the
      * sender picks per rectangle, so the answer is a property of the picture and
      * not of the code.  `wire` is payload bytes accepted; against 2 * pixels it
      * is the compression, and the two counts say which encoding won.
      */
-    uint32_t packedframes = 0;
-    uint32_t idxframes = 0;
-    uint32_t wire = 0;
     uint32_t wirekb = 0;
+    /*
+     * Frames, which is what a person watching counts, and until the sender
+     * started marking the end of one there was no way to count them here: the
+     * wire carried stripes, and thirty stripes might be one frame or thirty.
+     *
+     * `frames` is whole frames the marker closed.  `framesmiss` comes from
+     * gaps in the numbering - the only way loss is visible at all on this link,
+     * since a band that never arrives leaves nothing behind to notice.  And
+     * `framespart` counts frames that arrived with fewer bands than they said
+     * they had, which is a stripe lost inside a frame that did arrive.
+     */
+
     /*
      * Where the time goes on this side, because the answer decided what to fix
      * next and could not be guessed.  The wire runs at 12% on average, so
@@ -696,13 +976,11 @@ int ag_main(int argc, char **argv)
      * arrives in one burst of thirty bands and this end falls behind it.  These
      * two say by how much and at which of the two steps.
      */
-    uint64_t us_decode = 0;
-    uint64_t us_present = 0;
+
 
     const ag_time_t t0 = g_ag_api->time->us();
     const uint64_t  window = (uint64_t)secs * 1000000u;
-    ag_time_t       first_px = 0;
-    ag_time_t       last_px = 0;
+
 
     /*
      * The keyboard and the clock are looked at every so often rather than every
@@ -731,6 +1009,7 @@ int ag_main(int argc, char **argv)
     uint32_t last_rows = 0, last_bands = 0, last_bad = 0, last_stray = 0;
     uint32_t last_wire = 0, last_asamples = 0, last_adropped = 0;
     uint32_t last_agaps = 0;
+    uint32_t last_frames = 0, last_framesmiss = 0, last_framespart = 0;
 
     while (true) {
         if ((tick++ & 0xffu) == 0u) {
@@ -794,10 +1073,14 @@ int ag_main(int argc, char **argv)
                 char num[24];
                 line[0] = '\0';
                 static const char *const k_rx_label[] = {
-                    "[rx] ", " rects ", " KB, ", " rows, ",
-                    " bad, ", " stray, sound ", " in ", " gaps ", " full",
+                    "[rx] ", " frames (", " lost, ", " partial), ",
+                    " rects ", " KB, ", " rows, ", " bad, ",
+                    " stray, sound ", " in ", " gaps ", " full",
                 };
                 const uint32_t k_rx_value[] = {
+                    frames - last_frames,
+                    framesmiss - last_framesmiss,
+                    framespart - last_framespart,
                     bands - last_bands,
                     (wire - last_wire) / 1024u,
                     rows - last_rows,
@@ -807,13 +1090,13 @@ int ag_main(int argc, char **argv)
                     s_agaps - last_agaps,
                     s_adropped - last_adropped,
                 };
-                for (uint32_t f = 0; f < 8u; f++) {
+                for (uint32_t f = 0; f < 11u; f++) {
                     ag_strlcat(line, k_rx_label[f], sizeof(line));
                     ag_strlcat(line, ag_utoa(k_rx_value[f], num, sizeof(num),
                                              0, false),
                                sizeof(line));
                 }
-                ag_strlcat(line, k_rx_label[8], sizeof(line));
+                ag_strlcat(line, k_rx_label[11], sizeof(line));
                 ag_strlcat(line, "\r\n", sizeof(line));
                 ag_printf("%s", line);
                 last_rows = rows;
@@ -824,6 +1107,9 @@ int ag_main(int argc, char **argv)
                 last_asamples = s_asamples;
                 last_adropped = s_adropped;
                 last_agaps = s_agaps;
+                last_frames = frames;
+                last_framesmiss = framesmiss;
+                last_framespart = framespart;
             }
         }
 
@@ -910,6 +1196,60 @@ int ag_main(int argc, char **argv)
             continue;
         }
 
+        if (op == FR_END && len == 4u) {
+            const uint32_t no = get16(payload);
+            const uint32_t promised = get16(payload + 2);
+            /* The whole point: one change of the glass per frame. */
+            pend_flush();
+            if (numbered && no != nextframe) {
+                /*
+                 * How far ahead the number jumped is how many frames went
+                 * missing - but only for a jump small enough to be one.
+                 *
+                 * The first version of this line was `(no - nextframe) &
+                 * 0xffff` and nothing else, and it reported 720 950 frames
+                 * lost out of 1326 received.  That is eleven jumps *backwards*
+                 * - a sender whose counter started again - each of which the
+                 * wrapping subtraction turned into sixty-five thousand losses.
+                 * A number that large is not a measurement of anything, and it
+                 * discredits the numbers next to it.
+                 *
+                 * So: a jump of less than a quarter of the range is loss, and
+                 * anything else is a sender that restarted.  Counted, and
+                 * counted separately, because the two mean opposite things.
+                 */
+                const uint32_t ahead = (uint32_t)((no - nextframe) & 0xffffu);
+                if (ahead < 16384u) {
+                    framesmiss += ahead;
+                    /*
+                     * And say so, because this is the only way a frame that
+                     * never arrived can be noticed at all.  A checksum sees a
+                     * frame that came out wrong; nothing sees a frame that did
+                     * not come.  The far end repairs the screen when asked and
+                     * does nothing when not, so an unreported gap is a patch of
+                     * stale picture that stays until something redraws it.
+                     */
+                    const ag_time_t now = g_ag_api->time->us();
+                    if (now - s_asked_at >= ASK_AGAIN_US) {
+                        s_asked_at = now;
+                        const uint8_t hello = (uint8_t)'H';
+                        (void)ag_uart_write(LINK_PORT, &hello, 1u);
+                    }
+                } else {
+                    framesresync++;
+                }
+            }
+            nextframe = (no + 1u) & 0xffffu;
+            numbered = true;
+            if (inframe < promised) {
+                framespart++;
+            }
+            inframe = 0;
+            frames++;
+            wire += len;
+            continue;
+        }
+
         if (op == FR_AUD && len >= 4u) {
             /*
              * Into the ring and straight back to reading.  Nothing here talks
@@ -926,94 +1266,24 @@ int ag_main(int argc, char **argv)
         }
 
         if ((op == FR_BAND || op == FR_PACK || op == FR_IDX) && len >= 12u) {
-            const uint32_t bx = get16(payload + 0);
-            const uint32_t by = get16(payload + 2);
-            const uint32_t bw = get16(payload + 4);
-            const uint32_t bh = get16(payload + 6);
-            const uint32_t sw = get16(payload + 8);
-            const uint32_t sh = get16(payload + 10);
-            const uint32_t npx = bw * bh;
-
-            if (bw == 0 || bh == 0 || bh > BAND_ROWS || bx + bw > sw ||
-                npx > BAND_MAX_PX) {
-                bad++;
-                continue;
-            }
-
-            const ag_time_t t_dec = g_ag_api->time->us();
-            const uint8_t *body = payload + 12u;
-            const uint32_t blen = len - 12u;
-            bool           ok;
-            if (op == FR_BAND) {
-                if (blen < npx * 2u) {
-                    bad++;
-                    continue;
-                }
-                for (uint32_t i = 0; i < npx; i++) {
-                    s_px[i] = (uint16_t)rd16(body + i * 2u);
-                }
-                ok = true;
-            } else if (op == FR_PACK) {
-                ok = unpack16(body, blen, npx);
-            } else {
-                ok = unpack_indexed(body, blen, npx);
-                if (ok) {
-                    idxframes++;
-                }
-            }
-            if (!ok) {
-                bad++;
-                continue;
-            }
-            if (op != FR_BAND) {
-                packedframes++;
-            }
-            us_decode += (uint64_t)(g_ag_api->time->us() - t_dec);
-            wire += len;
-
-            if (!want_pixels(sw)) {
-                continue;
-            }
-
             /*
-             * Into rows the width of the whole surface, at the rectangle's own
-             * column: present() is given a stride that spans the surface and a
-             * pointer to the rectangle's first pixel, and reads only bw of each
-             * row.  What sits outside the rectangle is never looked at.
+             * Held back until the frame is closed, so the glass changes once
+             * per frame instead of once per stripe.  A frame too big for the
+             * buffer is laid down in two halves rather than dropped, and says
+             * so in pend_over.
              */
-            for (uint32_t r = 0; r < bh; r++) {
-                uint16_t *dst = s_band + r * sw + bx;
-                for (uint32_t i = 0; i < bw; i++) {
-                    dst[i] = s_px[r * bw + i];
+            if (!pend_add(op, payload, len)) {
+                if (s_pend != NULL && s_pend_used != 0u) {
+                    s_pend_over++;
+                    pend_flush();
                 }
-            }
-
-            const ag_blit_t blit = {
-                .px = s_band + bx,
-                .stride = sw * sizeof(uint16_t),
-                .surf_w = (uint16_t)sw,
-                .surf_h = (uint16_t)sh,
-                .x = (uint16_t)bx,
-                .y = (uint16_t)by,
-                .w = (uint16_t)bw,
-                .h = (uint16_t)bh,
-            };
-            const ag_time_t t_pres = g_ag_api->time->us();
-            const ag_err_t  shown = ag_gfx_present(&blit);
-            us_present += (uint64_t)(g_ag_api->time->us() - t_pres);
-            if (shown == AG_OK) {
-                bands++;
-                pxlow += bw * bh;
-                while (pxlow >= 1000u) {
-                    pxlow -= 1000u;
-                    px++;
+                if (!pend_add(op, payload, len)) {
+                    show_band(op, payload, len);
                 }
-                if (first_px == 0) {
-                    first_px = g_ag_api->time->us();
-                }
-                last_px = g_ag_api->time->us();
             }
         } else if (op == FR_ROW && len >= 2u) {
+            /* Whatever is held belongs under the text, not over it. */
+            pend_flush();
             want_text();
             const uint32_t y = payload[0];
             uint32_t       count = payload[1];
@@ -1074,7 +1344,12 @@ int ag_main(int argc, char **argv)
 
     wirekb = wire / 1024u;
 
-    ag_printf("\nremterm: %u rows, %u rects, %u k pixels, %u bad, %u stray\n",
+    ag_printf("\nremterm: %u frames (%u lost, %u partial, %u resync, "
+              "%u split), %u fps\n",
+              (unsigned)frames, (unsigned)framesmiss, (unsigned)framespart,
+              (unsigned)framesresync, (unsigned)s_pend_over,
+              (unsigned)((flow_ms != 0u) ? (frames * 1000u / flow_ms) : 0u));
+    ag_printf("remterm: %u rows, %u rects, %u k pixels, %u bad, %u stray\n",
               (unsigned)rows, (unsigned)bands, (unsigned)px, (unsigned)bad,
               (unsigned)stray);
     ag_printf("encoded: %u packed, %u indexed, %u KB on the wire\n",
@@ -1103,22 +1378,42 @@ int ag_main(int argc, char **argv)
                                   AG_O_WRONLY | AG_O_CREATE | AG_O_TRUNC);
     if (f >= 0) {
         static const char *const k_names[] = {
-            "rows=", " rects=", " kpixels=", " bad=", " stray=",
+            "frames=", " frames_lost=", " frames_partial=",
+            " frames_resync=", " frames_split=",
+            " no_width=", " no_mem=", " no_acquire=", " no_present=",
+            " fps=", " bytes_per_frame=",
+            " rows=", " rects=", " kpixels=", " bad=", " stray=",
             " flow_ms=", " kpixels_per_s=", " packed=", " indexed=", " wirekb=",
+            " wirekb_px=", " raw_over_wire_pct=",
             " snd_in=", " snd_played=", " snd_dropped=", " snd_hz=",
             " us_decode=", " us_present=",
         };
-        const uint32_t vals[] = {rows,       bands,        px,
+        const uint32_t vals[] = {frames,     framesmiss,   framespart,
+                                 framesresync, s_pend_over,
+                                 s_no_width, s_no_mem, s_no_acq, s_no_pres,
+                                 (uint32_t)((flow_ms != 0u)
+                                                ? (frames * 1000u / flow_ms)
+                                                : 0u),
+                                 (uint32_t)(frames ? wire / frames : 0),
+                                 rows,       bands,        px,
                                  bad,        stray,        flow_ms,
                                  kpx_s,      packedframes, idxframes,
-                                 wirekb,     s_asamples,   s_aplayed,
+                                 wirekb,     wire_px / 1024u,
+                                 /* raw pixel bytes as a percentage of the
+                                  * bytes that carried them: 100 is no
+                                  * compression at all, 200 is two to one. */
+                                 (uint32_t)((wire_px != 0u)
+                                     ? ((uint64_t)px * 1000ull * 2ull * 100ull /
+                                        wire_px)
+                                     : 0u),
+                                 s_asamples,   s_aplayed,
                                  s_adropped, s_pcm_rate,
                                  (uint32_t)(bands ? us_decode / bands : 0),
                                  (uint32_t)(bands ? us_present / bands : 0)};
 
         char out[256];
         out[0] = '\0';
-        for (uint32_t i = 0; i < 16u; i++) {
+        for (uint32_t i = 0; i < 29u; i++) {
             char num[24];
             (void)ag_strlcat(out, k_names[i], sizeof(out));
             (void)ag_strlcat(out, ag_utoa(vals[i], num, sizeof(num), 0, false),
