@@ -162,7 +162,8 @@ static bool s_encode = true;
 
 static uint64_t s_sent_bytes;
 static uint32_t s_sent_frames;
-static uint32_t s_dropped;
+static uint32_t s_dropped; /* refused: the ring was full                     */
+static uint32_t s_lost;    /* accepted, then the port would not take it       */
 
 /*
  * True when every byte of the frame reached the port.
@@ -332,9 +333,28 @@ static uint32_t tx_drain(void)
         if (n == 0u) {
             break;
         }
-        const int32_t w = io->uart_write(LINK_PORT, s_tx_out, n);
-        total += (w > 0) ? (uint32_t)w : 0u;
-        if (w < 0 || (uint32_t)w != n) {
+
+        /*
+         * Until every byte of what was taken is out, or the port refuses.
+         *
+         * These bytes have already left the ring, so a short write that is not
+         * finished is not a slow frame - it is a frame with a hole in it, and
+         * the receiver spends the rest of the second hunting for a header.
+         * That is exactly what it reported: seventeen bad frames and forty-five
+         * kilobytes of stray in a ten second window, where the same link had
+         * been carrying zero of each.
+         */
+        uint32_t off = 0;
+        while (off < n) {
+            const int32_t w = io->uart_write(LINK_PORT, s_tx_out + off, n - off);
+            if (w <= 0) {
+                s_lost += n - off; /* the hole, named rather than hidden */
+                break;
+            }
+            off += (uint32_t)w;
+        }
+        total += off;
+        if (off != n) {
             break;
         }
     }
@@ -576,6 +596,7 @@ static void heal_a_band(uint32_t y, uint32_t h)
 static uint32_t s_sweep_row;
 static uint64_t s_sweep_at;
 static uint32_t s_sweep_owed = 0xffffffffu; /* everything, until told otherwise */
+static uint64_t s_sweep_asked_at;           /* when the far end last complained */
 
 #define FR_HELLO 'H'
 
@@ -589,15 +610,38 @@ static void poll_far_end(void)
         }
         for (int32_t i = 0; i < n; i++) {
             if (buf[i] == (uint8_t)FR_HELLO) {
-                /* Not freed - only forgotten.  The table is fine; it is what
-                 * it claims about the far end that has stopped being true.
-                 * And the sweep starts from the top, so a receiver that has
-                 * just appeared is given a whole picture instead of whatever
-                 * the game happens to redraw next. */
-                hash_forget();
-                s_sweep_row = 0;
-                s_sweep_at = 0;
-                s_sweep_owed = 0xffffffffu;
+                /*
+                 * "Send it again."  The far end says this when it starts, and
+                 * also on every frame it could not decode - rate limited to one
+                 * a second at its end.
+                 *
+                 * It used to mean hash_forget(): throw away everything believed
+                 * about the far end, so the next rectangle goes whole.  With a
+                 * repair sweep that is both too much and too little.  Too much
+                 * because the link loses a frame or two a second under load, so
+                 * this arrives about once a second, and forgetting the grid
+                 * that often means the trimming never works at all - measured,
+                 * the wire went from 30 KB/s to 380 and the game from 45 fps to
+                 * 2.4.  The receiver's own comment had predicted exactly that:
+                 * "a repaint per corrupt frame is a repaint that causes the
+                 * next one".
+                 *
+                 * And too little, because forgetting only repairs the parts the
+                 * game happens to redraw next.
+                 *
+                 * So it starts the sweep from the top instead, at the ordinary
+                 * pace.  The whole screen is right again within two seconds,
+                 * the grid keeps working meanwhile, and asking twice costs
+                 * nothing more than asking once.
+                 */
+                const uint64_t now = (uint64_t)ag_api()->time->us();
+                if (s_sweep_asked_at == 0ull ||
+                    now - s_sweep_asked_at >= 10000000ull) {
+                    s_sweep_asked_at = now;
+                    s_sweep_row = 0;
+                    s_sweep_at = 0;
+                    s_sweep_owed = s_hash_rows;
+                }
             }
         }
         if ((uint32_t)n < sizeof(buf)) {
@@ -1074,6 +1118,23 @@ static void send_rect_locked(const ag_blit_t *b)
         }
 
         const uint32_t tw0 = (uint32_t)ag_api()->time->us();
+        /*
+         * Put what is already queued on the wire before adding to it.
+         *
+         * A rectangle is up to thirty bands and each is a kilobyte or two, so a
+         * full screen is more than the ring holds - and the ring only used to
+         * be drained between rectangles.  The far end therefore lost the tail
+         * of every big rectangle: six thousand frames refused in a ten minute
+         * game, near enough a third of the picture, while the wire itself sat
+         * two thirds idle.
+         *
+         * Draining here paces the sender against the wire, which is what a
+         * sender should be paced against.  It costs nothing when the ring is
+         * empty - one lock, one look - and it is only ever this task and the
+         * fallback caller, which serialise on the drain lock.
+         */
+        (void)tx_drain();
+
         bool went;
         if (best_op == FR_BAND) {
             went = send_frame(FR_BAND, s_raw, 12u + raw);
@@ -1123,6 +1184,22 @@ static void send_rect_locked(const ag_blit_t *b)
  * gfx->present they are an application's own memory, which the application is
  * free to reuse the instant blit_rect returns.  Reading them later from another
  * task would be reading whatever is there by then.
+ *
+ * What it costs, and what would remove it: a whole screen is 150 KB and about
+ * ten milliseconds of PSRAM, which is a third of a frame while a movie is
+ * playing, and the 150 KB is why the game's arena had to come down.  Both would
+ * go if the kernel said which blits point into a surface that outlives the call
+ * - the system framebuffer is allocated once at boot and never moves, so the
+ * driver could read it in place and keep no frame at all.  That is one flag in
+ * ag_blit_t and one line in display.c.
+ *
+ * Not done, and the reason is worth writing down rather than rediscovering: it
+ * turns a self-contained copy into a pointer this driver holds across time, and
+ * a pointer held across time is only as good as the promise that nothing frees
+ * it.  There is an unexplained intermittent wedge on this board (the console
+ * stops answering mid-game, with and without this driver loaded), and adding a
+ * lifetime assumption while that is outstanding is how a second unexplained
+ * fault gets built on top of the first.
  *
  * No lock around the copy, deliberately.  The sender may read a rectangle that
  * is being written under it and send half of one frame and half of the next -
@@ -1302,26 +1379,31 @@ static volatile bool s_wire_running;
  * a second, and until it has been paid the far end is showing somebody else's
  * picture.
  *
- * "Has anything been lost since?" - almost never, and asking costs the same as
- * answering, because a row can only be checked by sending it.  So once the debt
- * is paid this drops to a row every sixty milliseconds: a whole screen every
- * two seconds, seventeen bands a second, and nothing anybody notices.
+ * "Has anything been lost since?" - and the answer is that it depends entirely
+ * on how hard this is being driven, which makes sweeping fast the wrong answer
+ * twice over.  Measured over five runs of the game, changing one thing at a
+ * time:
  *
- * The slow rate was fifteen seconds until a band was measured rather than
- * guessed.  "Seven milliseconds of encoding" was an inference from a frame rate
- * and it was wrong by a factor of fourteen: compare 164 us, gather 18, pack 60,
- * palette 143, wire 108 - about half a millisecond, so seventeen a second is
- * eight milliseconds of a second and four per cent of the wire.  A screen that
- * is never more than two seconds stale is worth that; a screen that is fifteen
- * seconds stale is what a person calls broken.
+ *   sweep 500 ms   game 46 fps   1.2 screens/s   31 KB/s   0 bad, 0 stray
+ *   sweep  60 ms   game 35 fps   1.7 screens/s   88 KB/s   ~2 bad frames/s
  *
- * The first number the other way was wrong too, and for a better reason: fifty
- * rows a second did cost the game half its frame rate, but that was measured
- * while the wire lock was still held across the write, so what the game was
- * losing was the console and not the encoder.
+ * Eleven frames a second of the game bought half a screen a second - and the
+ * link, which had been carrying thirty kilobytes without losing a byte, started
+ * losing two frames a second at eighty-eight.  This wire has no flow control,
+ * and the far end drops what arrives while it is writing a band to its panel.
+ * Sending less is not only cheaper, it is also more reliable, and the two
+ * compound: fewer bytes, fewer losses, fewer repairs needed.
+ *
+ * So the steady rate is a row every half second, and the fast rate is kept for
+ * the two moments that need it - this driver starting, and the far end saying
+ * it could not read something.  The second is rate limited to one full sweep in
+ * ten seconds, because the far end says that on every corrupt frame and the
+ * loop closes otherwise: a repaint per corrupt frame is a repaint that causes
+ * the next one, which the receiver's own source predicted and this driver then
+ * demonstrated at 2.4 fps.
  */
 #define SWEEP_FAST_US 20000ull
-#define SWEEP_SLOW_US 60000ull
+#define SWEEP_SLOW_US 500000ull
 
 static bool sweep_step(uint32_t *x, uint32_t *y, uint32_t *w, uint32_t *h)
 {
@@ -1416,6 +1498,12 @@ static void wire_stats(void)
               (unsigned)wire_kb,
               (unsigned)((px_kb != 0u) ? (wire_kb * 100u / px_kb) : 0u),
               (unsigned)(s_win_worst_us / 1000u), (unsigned)s_win_behind);
+
+    if (s_dropped != 0u || s_lost != 0u || s_late != 0u) {
+        ag_printf("REMDISP: %u frames refused (ring full), %u bytes lost in "
+                  "the port, %u blits the old way\n",
+                  (unsigned)s_dropped, (unsigned)s_lost, (unsigned)s_late);
+    }
 
     if (s_bands != 0u) {
         ag_printf("REMDISP: %u bands, us each: compare %u, gather %u, pack %u, "
