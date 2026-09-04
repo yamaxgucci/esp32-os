@@ -19,6 +19,13 @@
  *
  *   link send <baud> [kb] [block]    push kb kilobytes (default 256), time it
  *   link recv <baud> [secs] [block]  take what comes for secs seconds
+ *
+ * Neither end watches the keyboard.  It used to: a key stopped a run early,
+ * which is a kindness at a desk.  But `kbhit` is true for *any* input event,
+ * and the board at the far end of this wire has a touchscreen - one stray pen
+ * interrupt and a run stopped after eight kilobytes, reported as the wire
+ * having delivered nothing.  A run is bounded by its own argument; that is
+ * enough, and a measurement that can be ended by a fingerprint is not.
  *   link info                        what BOARD.CFG says uart1 is wired to
  *
  * Start the receiver first.  It reports as it goes, so a run that gets nothing
@@ -37,7 +44,7 @@
 #include <argon/argon.h>
 #include <argon/libc.h>
 
-AG_APP("LINK", "1.2", "argon", 0);
+AG_APP("LINK", "1.3", "argon", 0);
 
 /*
  * UART1.  UART0 is the console on both of these boards, and the port numbering
@@ -182,7 +189,6 @@ static int do_send(uint32_t baud, uint32_t kb)
     const uint32_t target = kb * 1024u;
     uint32_t       sent = 0;
     uint32_t       seq = 0;
-    bool           stopped = false;
 
     /*
      * Every line this prints is kept under forty characters on purpose: the
@@ -210,20 +216,12 @@ static int do_send(uint32_t baud, uint32_t kb)
             return 1;
         }
         sent += (uint32_t)n;
-
-        /* Let the watchdog see us, and let a key out. */
         ag_heartbeat();
-        if (ag_kbhit()) {
-            (void)ag_getch();
-            stopped = true;
-            break;
-        }
     }
     const uint64_t us = (uint64_t)(g_ag_api->time->us() - t0);
 
-    ag_printf("tx bytes=%u ms=%u bps=%u%s\n", (unsigned)sent,
-              (unsigned)(us / 1000u), (unsigned)rate_bps(sent, us),
-              stopped ? " cut" : "");
+    ag_printf("tx bytes=%u ms=%u bps=%u\n", (unsigned)sent,
+              (unsigned)(us / 1000u), (unsigned)rate_bps(sent, us));
     return 0;
 }
 
@@ -256,11 +254,6 @@ static int do_recv(uint32_t baud, uint32_t secs)
         if ((uint64_t)(g_ag_api->time->us() - t0) >= window) {
             break;
         }
-        if (ag_kbhit()) {
-            (void)ag_getch();
-            break;
-        }
-
         const int32_t n = ag_uart_read(LINK_PORT, io, sizeof(io), 200);
         if (n < 0) {
             ag_printf("rx failed: %s\n", ag_strerror((ag_err_t)n));

@@ -152,9 +152,9 @@ def main():
 
     print("%d baud, %d KB per run, %s" % (args.baud, args.kb,
                                           time.strftime("%Y-%m-%d %H:%M")))
-    print("%5s %8s %7s %5s %5s %6s %8s %8s %8s %6s"
-          % ("block", "sent", "ok", "bad", "lost", "resync", "tx bps",
-             "rx bps", "good", "loss%"))
+    print("%5s %8s %8s %7s %5s %5s %6s %8s %8s %6s"
+          % ("block", "sent", "arrived", "ok", "bad", "lost", "resync",
+             "tx bps", "good", "loss%"))
     rows = []
     for _ in range(args.repeat):
         for block in blocks:
@@ -166,10 +166,13 @@ def main():
             lost = got.get("lost", 0)
             missing = blocks_sent - ok
             loss = (100.0 * missing / blocks_sent) if blocks_sent else 0.0
-            print("%5d %8d %7d %5d %5d %6d %8d %8d %8d %6.2f"
-                  % (block, sent.get("bytes", 0), ok, bad, lost,
-                     got.get("resync", 0), sent.get("bps", 0),
-                     got.get("bps", 0), got.get("good", 0), loss))
+            # `arrived` against `sent` is the byte deficit: what the line
+            # (or the receiver) swallowed whole, as opposed to mangled.  A
+            # corrupt block still arrives and is counted here.
+            print("%5d %8d %8d %7d %5d %5d %6d %8d %8d %6.2f"
+                  % (block, sent.get("bytes", 0), got.get("bytes", 0), ok,
+                     bad, lost, got.get("resync", 0), sent.get("bps", 0),
+                     got.get("good", 0), loss))
             sys.stdout.flush()
             rows.append((block, ok, bad, lost, got.get("good", 0)))
             time.sleep(1.0)
