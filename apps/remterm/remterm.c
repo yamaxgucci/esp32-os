@@ -732,40 +732,37 @@ int ag_main(int argc, char **argv)
     uint32_t last_wire = 0, last_asamples = 0, last_adropped = 0;
     uint32_t last_agaps = 0;
 
-    bool stop = false;
-
-    while (!stop) {
+    while (true) {
         if ((tick++ & 0xffu) == 0u) {
             /*
-             * A key stops this.  A key, and not "something happened".
+             * No key stops this, and that is the fix rather than the omission
+             * it looks like.
              *
-             * ag_kbhit() answers whether any event is waiting, and the kernel
-             * says so beside it: "an event carrying no character counts as
-             * something, because deciding that here would mean taking the event
-             * to look at it".  On this board the touchscreen is polled ten
-             * times a second and its pen line runs beside the panel's own SPI,
-             * so events arrive with nobody touching anything - and this loop
-             * took every one of them as "stop".
+             * It used to be `if (ag_kbhit()) { ag_getch(); break; }`.  Both
+             * halves are traps.  ag_kbhit() answers whether *any* event is
+             * waiting - the kernel says so beside it: "an event carrying no
+             * character counts as something" - and ag_getch() blocks until a
+             * character arrives, forever, because that is what the application
+             * API offers.  So one touch event, and this program went into
+             * getch and stayed there: holding the display, drawing nothing,
+             * and swallowing every byte sent at the console afterwards.
              *
-             * From the outside that was a screen showing the game which, at
-             * some random minute, went back to a shell prompt with a blinking
-             * cursor.  It cost most of a day: a receiver that has stopped and a
-             * sender that has stopped look identical on the glass, and every
-             * attempt to find out which sent a byte down the console - which is
-             * also a key, and also stopped it.
+             * On the glass that was a frozen screen with no cursor, and from
+             * the other end a board that answered nothing at all.  It is why
+             * "the picture froze" and "the board hung" were the same report
+             * for most of a day, and why every attempt to ask which one it was
+             * made it worse: the question is a keystroke, and the keystroke
+             * went into the same hole.
              *
-             * So the event is taken and looked at.  A key stops it; pointers,
-             * focus changes and device notices are ignored.
+             * The CYD polls a touchscreen ten times a second whose pen line
+             * runs beside the panel's SPI, so those events arrive with nobody
+             * touching anything.
+             *
+             * A receiver does not need a stop key.  Ctrl+backslash takes the
+             * display back, and `remterm <baud> <secs>` still stops on its own
+             * clock.  Nothing here reads the keyboard now, so nothing here can
+             * be stopped by something that is not one.
              */
-            ag_event_t ev;
-            while (ag_poll_event(&ev, 0)) {
-                if (ev.type == AG_EV_KEY_DOWN || ev.type == AG_EV_QUIT) {
-                    stop = true;
-                }
-            }
-            if (stop) {
-                break;
-            }
             if (window != 0 &&
                 (uint64_t)(g_ag_api->time->us() - t0) >= window) {
                 break;
