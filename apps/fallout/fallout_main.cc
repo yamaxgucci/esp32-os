@@ -80,6 +80,7 @@ extern "C" void sdl_shim_scale_sharp(int on);
 extern "C" void sdl_shim_cycle_ms(int ms);
 extern "C" void sdl_shim_events(int on);
 extern "C" void sdl_shim_recinput(int on);
+extern "C" void sdl_shim_watchdog(unsigned ms);
 extern "C" void sdl_shim_hud(int on);
 extern "C" void sdl_shim_log(const char *path);
 extern "C" void sdl_shim_screenshot_now(void);
@@ -148,6 +149,13 @@ static int to_int(const char *s)
  *                  engine - and its ceiling was measured standing on a map,
  *                  which is not the same as playing.  This is the flag for
  *                  finding out during a real game
+ *   -watchdog N    seconds the game may go without drawing a frame before
+ *                  the supervisor kills it, armed on the first frame.  15 by
+ *                  default; 0 turns it off.  A game that stops with this off
+ *                  stops in silence - no message, no crash record, and the
+ *                  console's input goes with it, because what stopped is the
+ *                  one process that owns the session.  That is what "the board
+ *                  hangs" turned out to be
  *   -scripts N     keep at most N script programs resident; the engine
  *                  reloads one when it runs again.  0, the default,
  *                  keeps every script a map has ever run - which is
@@ -196,6 +204,8 @@ extern "C" int ag_cxx_main(int argc, char **argv)
     int hud = 0;
     const char *logpath = NULL;
     int fps_ms = 0;
+    int watchdog_s = 0;
+    int watchdog_set = 0;
     int out = 0;
 
     for (int i = 0; i < argc; ++i) {
@@ -232,6 +242,9 @@ extern "C" int ag_cxx_main(int argc, char **argv)
             ag_script_cache = to_int(argv[++i]);
         } else if (same(argv[i], "-artcache") && i + 1 < argc) {
             ag_art_cache_kb = to_int(argv[++i]);
+        } else if (same(argv[i], "-watchdog") && i + 1 < argc) {
+            watchdog_s = to_int(argv[++i]);
+            watchdog_set = 1;
         } else {
             argv[out++] = argv[i];
         }
@@ -243,6 +256,9 @@ extern "C" int ag_cxx_main(int argc, char **argv)
             frames = 1;
         }
         sdl_shim_screenshot(shot, frames, shot_ms);
+    }
+    if (watchdog_set) {
+        sdl_shim_watchdog((unsigned)watchdog_s * 1000u);
     }
     sdl_shim_log(logpath);
     sdl_shim_memstat(memstat_ms, trace_kb, trace_max, trace_prof);

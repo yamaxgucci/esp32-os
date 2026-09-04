@@ -681,6 +681,15 @@ static void tickers_report(void)
     ag_bk_mouse_us = 0;
 }
 
+/* Armed on the first present; see there.  0 turns it off (-watchdog 0). */
+static uint32_t s_watchdog_ms = 15000u;
+static bool     s_watchdog_armed;
+
+extern "C" void sdl_shim_watchdog(uint32_t ms)
+{
+    s_watchdog_ms = ms;
+}
+
 static void fps_service(void)
 {
     if (s_fps_ms == 0) {
@@ -2415,6 +2424,31 @@ void SDL_RenderPresent(SDL_Renderer *r)
     sdl_shim_input_service();
     const uint32_t p4 = (uint32_t)ag_micros();
     ag_heartbeat();
+
+    /*
+     * And on the first frame, promise to keep doing that.
+     *
+     * The heartbeat above has been here from the start, with a comment saying
+     * "a process that never yields is a process the supervisor kills" - and it
+     * was not true, because nothing ever armed the watchdog.  A process with
+     * watchdog_ms of zero is one the supervisor skips, so a game that stopped
+     * stopped in silence: no message, no crash record, and a console whose
+     * input had gone with it.  Six hours went into "the board hangs" before it
+     * turned out the board was fine and the game was not.
+     *
+     * Armed here and not before main(), because the seconds before the first
+     * frame are spent reading two .DAT indices and nothing presents during
+     * them; a deadline that starts at the beginning would fire on the loading
+     * rather than on the fault.
+     *
+     * Fifteen seconds is not a frame budget - the worst frame measured on this
+     * board is 600 ms and a map change is a couple of seconds.  It is the
+     * distance between "slow" and "stopped", and it wants to be far from both.
+     */
+    if (s_watchdog_ms != 0u && !s_watchdog_armed) {
+        s_watchdog_armed = true;
+        ag_watchdog(s_watchdog_ms);
+    }
     s_pres_timers_us += p1 - p0;
     s_pres_memstat_us += p2 - p1;
     s_pres_fps_us += p3 - p2;
