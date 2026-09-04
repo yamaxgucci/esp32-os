@@ -487,6 +487,12 @@ static void heal_a_band(uint32_t y, uint32_t h)
  * waits, and a receiver started after it got nothing.  ABI 0.43 gave the
  * module a task, and the case went with it.
  */
+/* Where the repair sweep has got to, and how many rows it still owes.
+ * poll_far_end sends it back to the top.  See sweep_step, far below. */
+static uint32_t s_sweep_row;
+static uint64_t s_sweep_at;
+static uint32_t s_sweep_owed = 0xffffffffu; /* everything, until told otherwise */
+
 #define FR_HELLO 'H'
 
 static void poll_far_end(void)
@@ -500,8 +506,14 @@ static void poll_far_end(void)
         for (int32_t i = 0; i < n; i++) {
             if (buf[i] == (uint8_t)FR_HELLO) {
                 /* Not freed - only forgotten.  The table is fine; it is what
-                 * it claims about the far end that has stopped being true. */
+                 * it claims about the far end that has stopped being true.
+                 * And the sweep starts from the top, so a receiver that has
+                 * just appeared is given a whole picture instead of whatever
+                 * the game happens to redraw next. */
                 hash_forget();
+                s_sweep_row = 0;
+                s_sweep_at = 0;
+                s_sweep_owed = 0xffffffffu;
             }
         }
         if ((uint32_t)n < sizeof(buf)) {
@@ -1151,6 +1163,86 @@ static void rem_blit_rect(ag_handle_t h, const ag_blit_t *b)
 static volatile bool s_wire_running;
 
 /*
+ * A sweep that sends what nobody asked for.
+ *
+ * Everything above only ever puts on the wire what the application redrew.
+ * That is right for traffic and wrong for a screen: the parts of the picture
+ * the game does not touch are never sent, so whatever the far end had before
+ * stays on the glass - and on a map where only a lamp and a critter animate,
+ * that is most of it.  What Maxim saw was exactly this: an old frozen picture
+ * with a few rectangles moving inside it, filling in over ten seconds as the
+ * repair crept through.
+ *
+ * The old repair could not fix it, because it forgot a row of blocks *inside
+ * the rectangle being sent* - a row nothing is sending is not sent again by
+ * forgetting it.  That was the best a driver with no task of its own could do.
+ * With a task and a frame of its own, the honest thing is available: walk the
+ * screen, one row of blocks at a time, and send what is there.
+ *
+ * One row per turn, and only when nothing is waiting - real damage always goes
+ * first, so this costs nothing while the picture is moving.  Thirty rows on
+ * this panel, so a screen nobody is drawing on is made right in well under a
+ * second, and a row is two and a half kilobytes encoded against a wire that
+ * carries four hundred.
+ *
+ * The hashes for the row are forgotten before it is sent, or the band would be
+ * compared against what the far end is *believed* to have and skipped - which
+ * is the belief being repaired.
+ */
+/*
+ * Two speeds, because the sweep is answering two different questions.
+ *
+ * "What has this receiver got?" - nothing, when it has just said hello or the
+ * driver has just loaded.  Then the whole screen is owed and it should go as
+ * fast as it can: thirty rows at one every twenty milliseconds is six tenths of
+ * a second, and until it has been paid the far end is showing somebody else's
+ * picture.
+ *
+ * "Has anything been lost since?" - almost never, and asking costs the same as
+ * answering, because a row can only be checked by sending it.  So once the debt
+ * is paid this drops to a row every half second: a whole screen every fifteen,
+ * a twentieth of the wire, and nothing anybody notices.
+ *
+ * Running it fast all the time was measured and is not free: fifty rows a
+ * second is seven milliseconds of encoding each, and the game fell from 45 fps
+ * to 25 while the far end gained a refresh nobody needed.
+ */
+#define SWEEP_FAST_US 20000ull
+#define SWEEP_SLOW_US 500000ull
+
+static bool sweep_step(uint32_t *x, uint32_t *y, uint32_t *w, uint32_t *h)
+{
+    if (s_hash == NULL || s_hash_rows == 0u || s_fb_w == 0u) {
+        return false;
+    }
+    const uint64_t now = (uint64_t)ag_api()->time->us();
+    if (now < s_sweep_at) {
+        return false;
+    }
+    s_sweep_at = now + ((s_sweep_owed != 0u) ? SWEEP_FAST_US : SWEEP_SLOW_US);
+
+    const uint32_t r = s_sweep_row % s_hash_rows;
+    s_sweep_row++;
+    if (s_sweep_owed == 0xffffffffu) {
+        s_sweep_owed = s_hash_rows; /* the whole screen, now that its size is known */
+    }
+    if (s_sweep_owed != 0u) {
+        s_sweep_owed--;
+    }
+    for (uint32_t c = 0; c < s_hash_cols; c++) {
+        s_hash[(size_t)r * s_hash_cols + c] = 0;
+    }
+    *x = 0;
+    *y = r * BLK;
+    *w = s_fb_w;
+    *h = BLK;
+    if (*y + *h > s_fb_h) {
+        *h = s_fb_h - *y;
+    }
+    return *h != 0u;
+}
+
+/*
  * What the wire did with the last five seconds, printed from the task itself.
  *
  * Not from a callback - printing from one is the deadlock the header warns
@@ -1191,8 +1283,20 @@ static void wire_stats(void)
     const uint32_t px_kb = (uint32_t)(s_win_px * 2ull / 1024ull / secs);
     const uint32_t wire_kb = (uint32_t)(s_win_wire / 1024ull / secs);
 
-    ag_printf("REMDISP: %u rect/s, %u KB/s of pixels -> %u KB/s on the wire "
-              "(%u%%), worst rect %u ms, behind %u\n",
+    /*
+     * Screens a second, not rectangles a second.  A rectangle is whatever part
+     * of the picture moved, so "thirteen a second" says nothing at all about
+     * how often the screen is right - which is the only question the person
+     * looking at the glass is asking.  Pixels sent over pixels there are.
+     */
+    const uint32_t full = ((uint32_t)s_fb_w * s_fb_h != 0u)
+                              ? (uint32_t)(s_win_px * 100ull /
+                                           ((uint64_t)s_fb_w * s_fb_h) / secs)
+                              : 0u;
+
+    ag_printf("REMDISP: %u.%02u screens/s (%u rect/s), %u KB/s of pixels -> "
+              "%u KB/s on the wire (%u%%), worst rect %u ms, behind %u\n",
+              (unsigned)(full / 100u), (unsigned)(full % 100u),
               (unsigned)(s_win_rects / (uint32_t)secs), (unsigned)px_kb,
               (unsigned)wire_kb,
               (unsigned)((px_kb != 0u) ? (wire_kb * 100u / px_kb) : 0u),
@@ -1214,10 +1318,16 @@ static void wire_task(void *arg)
         wire_stats();
 
         uint32_t x = 0, y = 0, w = 0, h = 0;
+        bool     repair = false;
         if (!dmg_take(&x, &y, &w, &h)) {
-            aud_drain();
-            ag_delay(2);
-            continue;
+            /* Nothing was asked for; put a row of the picture on the wire
+             * anyway.  See sweep_step. */
+            repair = sweep_step(&x, &y, &w, &h);
+            if (!repair) {
+                aud_drain();
+                ag_delay(2);
+                continue;
+            }
         }
 
         /* Read once: rem_stop takes the pointer away while this task may be
@@ -1228,7 +1338,9 @@ static void wire_task(void *arg)
             continue;
         }
 
-        heal_a_band(y, h);
+        if (!repair) {
+            heal_a_band(y, h);
+        }
 
         /*
          * Bands, and not the whole rectangle in one call, because send_rect
