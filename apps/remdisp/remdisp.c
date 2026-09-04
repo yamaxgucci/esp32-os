@@ -593,6 +593,29 @@ static void heal_a_band(uint32_t y, uint32_t h)
  */
 /* Where the repair sweep has got to, and how many rows it still owes.
  * poll_far_end sends it back to the top.  See sweep_step, far below. */
+/*
+ * Who painted last owns the glass.
+ *
+ * This driver carries two kinds of picture down one wire - an application's
+ * pixels and the console's characters - and the far end draws whichever
+ * arrives.  That was harmless while pixels only ever moved because an
+ * application drew them: when the console had the screen, nothing sent pixels.
+ *
+ * The repair sweep broke that.  It sends rows of the framebuffer on a clock of
+ * its own, so after an application exited - or was killed - it went on painting
+ * that application's last frame over the console's text.  What Maxim saw was a
+ * band of stale graphics crawling up the screen, one row of blocks every half
+ * second, thirty rows, fifteen seconds a lap, with the text winning where the
+ * two met.  A very accurate description of the bug, as it turned out.
+ *
+ * So the sweep asks who drew last.  Pixels newer than text: an application owns
+ * the screen and the sweep is repairing its picture.  Text newer than pixels:
+ * the console owns it, and there is nothing here to repair - the text path has
+ * a repair sweep of its own, two hundred lines below.
+ */
+static uint64_t s_last_blit_us;
+static uint64_t s_last_text_us;
+
 static uint32_t s_sweep_row;
 static uint64_t s_sweep_at;
 static uint32_t s_sweep_owed = 0xffffffffu; /* everything, until told otherwise */
@@ -1322,6 +1345,8 @@ static void rem_blit_rect(ag_handle_t h, const ag_blit_t *b)
         return;
     }
 
+    s_last_blit_us = (uint64_t)ag_api()->time->us();
+
     const uint8_t *src = (const uint8_t *)b->px;
     const size_t   row_bytes = (size_t)b->w * sizeof(uint16_t);
     for (uint32_t r = 0; r < b->h; r++) {
@@ -1342,6 +1367,51 @@ static void rem_blit_rect(ag_handle_t h, const ag_blit_t *b)
  * to be: a screen is a thing that is looked at, not waited on.
  */
 static volatile bool s_wire_running;
+
+/*
+ * How much of the machine this driver may spend, and why it needs a limit.
+ *
+ * The wire carries four hundred kilobytes a second and the encoder can fill it.
+ * Neither of them is the scarce thing: both ends of every band are in PSRAM,
+ * and so is the game's picture, and so is the game's arena.  One bus, two
+ * cores.  Measured during the opening movie, where the whole screen changes and
+ * the driver was free to send 2.45 screens a second: the game's own blit - a
+ * palette conversion, pure memory - went from 2 ms to 354, its frame rate to
+ * 2.2, and in the end a frame took longer than the fifteen seconds its watchdog
+ * allows and the game was killed.  The driver had throttled the thing it exists
+ * to show.
+ *
+ * So: a budget in bytes a second, spent on whatever asks first - real damage
+ * before repair, as everywhere else here.  A hundred kilobytes is three times
+ * what a game on a map actually uses (33 KB/s measured) and a quarter of what a
+ * movie takes if nobody stops it.  What a movie gets instead is about one
+ * screen a second, which is a fair picture of a movie and a game that is still
+ * running.
+ *
+ * Not a frame rate limit: what costs the machine is bytes, and a screen that
+ * changed in one corner is not the same as one that changed everywhere.
+ */
+#define WIRE_BUDGET_BPS 100000u
+
+static uint64_t s_budget_at;
+static uint32_t s_budget_left = WIRE_BUDGET_BPS;
+static uint32_t s_budget_waits;
+
+static bool budget_ok(void)
+{
+    const uint64_t now = (uint64_t)ag_api()->time->us();
+
+    if (now >= s_budget_at) {
+        s_budget_at = now + 1000000ull;
+        s_budget_left = WIRE_BUDGET_BPS;
+    }
+    return s_budget_left != 0u;
+}
+
+static void budget_spend(uint32_t bytes)
+{
+    s_budget_left = (bytes >= s_budget_left) ? 0u : (s_budget_left - bytes);
+}
 
 /*
  * A sweep that sends what nobody asked for.
@@ -1408,6 +1478,10 @@ static volatile bool s_wire_running;
 static bool sweep_step(uint32_t *x, uint32_t *y, uint32_t *w, uint32_t *h)
 {
     if (s_hash == NULL || s_hash_rows == 0u || s_fb_w == 0u) {
+        return false;
+    }
+    /* Nobody has drawn a picture, or the console has the screen back. */
+    if (s_last_blit_us == 0ull || s_last_text_us > s_last_blit_us) {
         return false;
     }
     const uint64_t now = (uint64_t)ag_api()->time->us();
@@ -1499,6 +1573,11 @@ static void wire_stats(void)
               (unsigned)((px_kb != 0u) ? (wire_kb * 100u / px_kb) : 0u),
               (unsigned)(s_win_worst_us / 1000u), (unsigned)s_win_behind);
 
+    if (s_budget_waits != 0u) {
+        ag_printf("REMDISP: %u turns waiting for the budget\n",
+                  (unsigned)s_budget_waits);
+        s_budget_waits = 0;
+    }
     if (s_dropped != 0u || s_lost != 0u || s_late != 0u) {
         ag_printf("REMDISP: %u frames refused (ring full), %u bytes lost in "
                   "the port, %u blits the old way\n",
@@ -1534,6 +1613,18 @@ static void wire_task(void *arg)
         poll_far_end();
         (void)tx_drain();
         wire_stats();
+
+        if (!budget_ok()) {
+            /* Spent for this second.  The damage stays where it is and goes out
+             * when the budget refills, unioned with whatever arrives meanwhile -
+             * which is what should happen to a picture moving faster than the
+             * machine can carry it. */
+            s_budget_waits++;
+            aud_drain();
+            (void)tx_drain();
+            ag_delay(5);
+            continue;
+        }
 
         uint32_t x = 0, y = 0, w = 0, h = 0;
         bool     repair = false;
@@ -1585,6 +1676,7 @@ static void wire_task(void *arg)
         s_win_rects++;
         s_win_px += (uint64_t)w * h;
         s_win_wire += s_sent_bytes - wire0;
+        budget_spend((uint32_t)(s_sent_bytes - wire0));
         if (took > s_win_worst_us) {
             s_win_worst_us = took;
         }
@@ -1695,6 +1787,8 @@ static ag_err_t rem_text_info(ag_handle_t h, uint16_t *cols, uint16_t *rows)
 
 static void send_row(uint16_t row)
 {
+    s_last_text_us = (uint64_t)ag_api()->time->us();
+
     const uint32_t count = s_shadow_cols[row];
     if (count == 0) {
         return;
