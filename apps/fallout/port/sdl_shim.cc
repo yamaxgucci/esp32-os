@@ -616,6 +616,76 @@ uint32_t ag_ticker_us[AG_TICKERS];
 uint32_t ag_ticker_calls[AG_TICKERS];
 uint32_t ag_bk_tickers_us;
 uint32_t ag_bk_mouse_us;
+/*
+ * Which step of the engine's main loop is running, and how many times it has
+ * been round.  Set by patch 0036; read by the thread below.
+ */
+volatile uint32_t ag_ml_phase;
+volatile uint32_t ag_ml_laps;
+
+/*
+ * The one thing the game could never say: where it was when it stopped.
+ *
+ * It stops perhaps twice an hour, and every measure of it is healthy right up
+ * to the last frame - 43 fps, memory half spare, the card answering in under a
+ * millisecond - and then nothing, between one frame and the next.  The
+ * supervisor kills it forty-five seconds later and writes a crash record, which
+ * says what it can: how long it ran, how much it had.  Not where it was.
+ *
+ * A thread can say that, because the loop being stuck is exactly the condition
+ * under which the loop cannot report.  This one wakes twice a second, and when
+ * the lap counter has not moved for five seconds it writes one line into the
+ * kernel's journal - which is what the crash record dumps.  Silent otherwise:
+ * the counter moves forty times a second when all is well.
+ *
+ * The two numbers separate the two possible faults.  A phase that stays at 3
+ * means the engine is inside scriptsHandleRequests and not coming out - its own
+ * loop, its own bug.  A phase that stays at 5 means it is inside renderPresent,
+ * which is the port's, and which is a call into the kernel that has not
+ * returned.  Either way the next question is a different one from today's.
+ */
+#define WATCH_TICK_MS 500u
+#define WATCH_STUCK_MS 5000u
+
+static volatile bool s_watch_stop;
+
+static void watch_thread(void *arg)
+{
+    (void)arg;
+    uint32_t last_laps = 0;
+    uint32_t last_move_ms = (uint32_t)ag_millis();
+    bool     said = false;
+
+    while (!s_watch_stop) {
+        ag_delay(WATCH_TICK_MS);
+
+        const uint32_t laps = ag_ml_laps;
+        const uint32_t now = (uint32_t)ag_millis();
+
+        if (laps != last_laps) {
+            last_laps = laps;
+            last_move_ms = now;
+            if (said) {
+                ag_log(AG_LOG_WARN, "fallout",
+                       "main loop moving again after %u ms in step %u",
+                       (unsigned)(now - last_move_ms), (unsigned)ag_ml_phase);
+                said = false;
+            }
+            continue;
+        }
+        if (!said && now - last_move_ms >= WATCH_STUCK_MS) {
+            said = true;
+            ag_log(AG_LOG_ERROR, "fallout",
+                   "main loop has not moved for %u ms, stuck in step %u "
+                   "(1 input, 2 keys, 3 scripts, 4 maps, 5 present, 6 throttle)"
+                   ", lap %u",
+                   (unsigned)(now - last_move_ms), (unsigned)ag_ml_phase,
+                   (unsigned)laps);
+        }
+    }
+    ag_thread_exit();
+}
+
 uint32_t ag_ml_input_us;
 uint32_t ag_ml_keys_us;
 uint32_t ag_ml_scripts_us;
@@ -2448,6 +2518,10 @@ void SDL_RenderPresent(SDL_Renderer *r)
     if (s_watchdog_ms != 0u && !s_watchdog_armed) {
         s_watchdog_armed = true;
         ag_watchdog(s_watchdog_ms);
+        /* And the thread that will say where it stopped, if it does.  Two
+         * kilobytes: it holds two integers and a printf. */
+        s_watch_stop = false;
+        (void)ag_thread_create(watch_thread, NULL, "fowatch", 3072, 0, 0);
     }
     s_pres_timers_us += p1 - p0;
     s_pres_memstat_us += p2 - p1;
