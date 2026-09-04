@@ -10,7 +10,11 @@
  * screen needs both, and a third because the board at the other end has a
  * speaker and this one does not:
  *
- *   Pixels (blit_rect, ABI 0.30) - the picture, in bands.  This is the part
+ *   Pixels (blit_rect, ABI 0.30) - the picture, in bands, sent from a task of
+ *   this driver's own (ABI 0.43).  What the caller pays is a copy into the
+ *   driver's frame; the wire is somebody else's problem after that, which is
+ *   the whole point - an application drawing on a screen should not be able to
+ *   tell that the screen is at the end of a cable.  This is the part
  *   that matters: it is a video link, the same idea as VGA or HDMI with a
  *   thinner cable, and the kernel hands it exactly what such a link wants.
  *   ag_blit_t is band-oriented by construction - the pixels belong to the
@@ -359,9 +363,10 @@ static uint32_t block_hash(const uint8_t *src, uint32_t stride, uint32_t rows,
  * fifty at the frame rates seen here, and it puts a ceiling of about eight
  * seconds on how long any part of the picture can stay wrong.
  *
- * Driven from blit_rect rather than a timer, because a driver cannot own a
- * task.  While nothing is drawing nothing is repaired either - which is the
- * case that FR_HELLO covers.
+ * Driven from the rectangle that is going out rather than from a clock of its
+ * own: the point of forgetting a row is that it gets sent again, and a row
+ * nothing is sending is not sent again by forgetting it.  So while nothing is
+ * drawing nothing is repaired - which is the case that FR_HELLO covers.
  */
 /*
  * A quarter of a second was the first number and it is too slow to live with.
@@ -439,22 +444,18 @@ static void heal_a_band(uint32_t y, uint32_t h)
  * the reconnect needs no state and no code path of its own: it is the same
  * road as a cold start.
  *
- * Polled rather than waited for, with a zero timeout, from the two callbacks
- * the kernel already makes often.  A driver cannot own a task.
+ * Polled rather than waited for, with a zero timeout, from the driver's own
+ * task, which comes round every two milliseconds whether or not anything is
+ * drawing.
  *
- * Which leaves one case out, and it is worth naming rather than discovering:
- * while an application holds the display the kernel stops calling text_cursor,
- * and it calls blit_rect only when that application draws.  An application
- * holding a picture that never changes therefore never reads this, and a
- * receiver that reconnects under one stays dark.  Measured, not assumed:
- * gfxdemo paints once and waits, and a receiver started after it got nothing.
- *
- * It does not matter for what this is for - a game redraws, and the console
- * repairs itself through the sweep below - so the fix is not made here.  What
- * it would be: register a second device of class AG_DEV_INPUT whose poll()
- * returns no events and services this instead.  The kernel calls that ten
- * times a second regardless of who owns the screen, and it exists precisely
- * because a loadable driver cannot own a task.
+ * It used to be polled from the two callbacks the kernel makes often, because
+ * a driver could not own a task, and that left a case out: while an
+ * application holds the display the kernel stops calling text_cursor and calls
+ * blit_rect only when the application draws, so an application holding a
+ * picture that never changes never read this and a receiver that reconnected
+ * under one stayed dark.  Measured, not assumed - gfxdemo paints once and
+ * waits, and a receiver started after it got nothing.  ABI 0.43 gave the
+ * module a task, and the case went with it.
  */
 #define FR_HELLO 'H'
 
@@ -480,11 +481,21 @@ static void poll_far_end(void)
 }
 
 /*
- * Work space.  Static rather than automatic because these are kilobytes and the
- * task this runs on belongs to whoever flushed - an application's stack is not
- * the driver's to spend.  Safe as static because the kernel holds the device
- * registry across blit_rect, so two flushes cannot be inside here at once.
+ * Work space.  Static rather than automatic because these are kilobytes, and
+ * the task that used to run this belonged to whoever flushed - an
+ * application's stack is not the driver's to spend.  It is the driver's own
+ * task now, whose stack is the driver's, but the size is the reason either way.
+ *
+ * Two callers can reach this: the wire task with a rectangle out of the
+ * driver's frame, and blit_rect directly for a picture that frame cannot hold
+ * (see the note above rem_blit_rect).  So it is locked - one rectangle at a
+ * time, for as long as the rectangle takes.  It used to be the device registry
+ * that provided that, held across blit_rect by the kernel, and relying on
+ * somebody else's lock for one's own invariant is how this would have become a
+ * bug the day either side changed.
  */
+static ag_mutex_t s_send_lock;
+
 static uint8_t  s_raw[FR_MAX_PAYLOAD];  /* geometry + pixels, uncompressed   */
 static uint8_t  s_cand[FR_MAX_PAYLOAD]; /* geometry + whatever encoded best  */
 static uint8_t  s_idx[BAND_MAX_PX];     /* one index per pixel, before packing */
@@ -710,11 +721,11 @@ static uint32_t encode_indexed(const uint16_t *px, uint32_t n, uint8_t *out,
 /*
  * A rectangle of the picture, in bands, trimmed and encoded.
  *
- * Called on whichever task flushed or presented, with the device registry held,
- * and it blocks for as long as the wire needs.  That is deliberate: an
- * application that asks for more than the wire can carry runs at the speed of
- * the wire, which is honest and measurable.  What happens here is the wire being
- * asked to carry less, in three steps that multiply:
+ * Called on the driver's own task, from the damage rem_blit_rect left behind -
+ * or, for a picture the driver's frame cannot hold, on whoever presented it.
+ * It blocks for as long as the wire needs, which is why it is not the game's
+ * thread any more.  What happens here is the wire being asked to carry less, in
+ * three steps that multiply:
  *
  *   1. The band is compared with the shadow and reduced to the bounding box of
  *      what actually moved.  A caret, a line of text, a walking figure - each
@@ -730,9 +741,10 @@ static uint32_t encode_indexed(const uint16_t *px, uint32_t n, uint8_t *out,
 /* Defined with the sound, below; the picture path pumps it. */
 static void aud_drain(void);
 
-static void rem_blit_rect(ag_handle_t h, const ag_blit_t *b)
+static void send_rect_locked(const ag_blit_t *b);
+
+static void send_rect(const ag_blit_t *b)
 {
-    (void)h;
     if (b == NULL || b->px == NULL || b->w == 0 || b->h == 0) {
         return;
     }
@@ -741,9 +753,17 @@ static void rem_blit_rect(ag_handle_t h, const ag_blit_t *b)
     if ((uint32_t)b->w * BAND_ROWS > BAND_MAX_PX) {
         return;
     }
+    if (s_send_lock != NULL && !ag_mutex_lock(s_send_lock, 2000u)) {
+        return;
+    }
+    send_rect_locked(b);
+    if (s_send_lock != NULL) {
+        ag_mutex_unlock(s_send_lock);
+    }
+}
 
-    poll_far_end();
-    heal_a_band((uint32_t)b->y, b->h);
+static void send_rect_locked(const ag_blit_t *b)
+{
 
     const uint8_t *src = (const uint8_t *)b->px;
     /*
@@ -929,10 +949,278 @@ static void rem_blit_rect(ag_handle_t h, const ag_blit_t *b)
         }
     }
 
-    /* The picture is out; give the sound its turn on the same wire, from this
-     * same thread.  Between bands would starve the picture; after the whole
-     * blit keeps them both moving and the far end's cushion covers the wait. */
-    aud_drain();
+}
+
+/* ---- the wire is not the caller's to wait for -------------------------- */
+/*
+ * Everything above is what has to happen to a rectangle before it can go down a
+ * serial line, and it is not fast: hashing, trimming, three encodings tried
+ * against each other, and then the write itself - a band is two and a half
+ * kilobytes at four megabaud, six milliseconds, and a full screen is thirty
+ * bands.  Until now all of it happened on whichever task called blit_rect,
+ * which is the task that drew the frame.  A game therefore ran at the speed of
+ * the wire: measured, three hundred milliseconds a frame with the whole picture
+ * moving, and the game had no idea it was talking to a wire at all.
+ *
+ * It should not have to know.  A screen at the end of a cable is still a
+ * screen, and what an application does with one is put pixels in it.
+ *
+ * So blit_rect now does the one thing that has to happen while the caller's
+ * pixels are still there - copy them - and marks the rectangle.  A task of the
+ * driver's own (ABI 0.43) picks the damage up and does the rest.  The copy is
+ * the price: a quarter of the screen is 38 KB and about two milliseconds of
+ * PSRAM, against six milliseconds for one band of the thirty that a frame used
+ * to cost the caller.
+ *
+ * The frame belongs to the driver for a second reason, which is correctness.
+ * ag_blit_t's pixels belong to the caller, and when they come from
+ * gfx->present they are an application's own memory, which the application is
+ * free to reuse the instant blit_rect returns.  Reading them later from another
+ * task would be reading whatever is there by then.
+ *
+ * No lock around the copy, deliberately.  The sender may read a rectangle that
+ * is being written under it and send half of one frame and half of the next -
+ * which is what a video link does when it is not synchronised to the source,
+ * and it repairs itself: the hash it records is the hash of what it read, so
+ * the next change to those blocks reads as a change and goes out again.  A lock
+ * would put the caller back to waiting for the wire, which is the whole thing
+ * being fixed.
+ */
+static uint16_t  *s_fb;      /* the driver's own copy of the picture       */
+static uint32_t   s_fb_w, s_fb_h;
+static ag_mutex_t s_dmg_lock;
+static uint32_t   s_dmg_x0, s_dmg_y0, s_dmg_x1, s_dmg_y1; /* x1/y1 exclusive */
+static bool       s_dmg;
+static volatile bool s_stop;
+static uint32_t   s_late;    /* blits that went the old way, for `dev`      */
+
+static void dmg_lock(void)
+{
+    if (s_dmg_lock != NULL) {
+        (void)ag_mutex_lock(s_dmg_lock, 1000u);
+    }
+}
+
+static void dmg_unlock(void)
+{
+    if (s_dmg_lock != NULL) {
+        ag_mutex_unlock(s_dmg_lock);
+    }
+}
+
+/*
+ * Snapped outward to the block grid, because the trimming above only runs on a
+ * rectangle that lines up with it - see `aligned` in send_rect.  A rectangle
+ * that does not is sent whole and makes those rows forget, which costs far more
+ * than the few pixels of rounding.
+ */
+static void dmg_add_locked(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+{
+    uint32_t x0 = (x / BLK) * BLK;
+    uint32_t y0 = (y / BLK) * BLK;
+    uint32_t x1 = ((x + w + BLK - 1u) / BLK) * BLK;
+    uint32_t y1 = ((y + h + BLK - 1u) / BLK) * BLK;
+
+    if (x1 > s_fb_w) {
+        x1 = s_fb_w;
+    }
+    if (y1 > s_fb_h) {
+        y1 = s_fb_h;
+    }
+    if (x0 >= x1 || y0 >= y1) {
+        return;
+    }
+
+    if (!s_dmg) {
+        s_dmg_x0 = x0;
+        s_dmg_y0 = y0;
+        s_dmg_x1 = x1;
+        s_dmg_y1 = y1;
+        s_dmg = true;
+    } else {
+        if (x0 < s_dmg_x0) {
+            s_dmg_x0 = x0;
+        }
+        if (y0 < s_dmg_y0) {
+            s_dmg_y0 = y0;
+        }
+        if (x1 > s_dmg_x1) {
+            s_dmg_x1 = x1;
+        }
+        if (y1 > s_dmg_y1) {
+            s_dmg_y1 = y1;
+        }
+    }
+}
+
+/* True and the rectangle, or false and nothing to do. */
+static bool dmg_take(uint32_t *x, uint32_t *y, uint32_t *w, uint32_t *h)
+{
+    bool got = false;
+
+    dmg_lock();
+    if (s_dmg) {
+        *x = s_dmg_x0;
+        *y = s_dmg_y0;
+        *w = s_dmg_x1 - s_dmg_x0;
+        *h = s_dmg_y1 - s_dmg_y0;
+        s_dmg = false;
+        got = true;
+    }
+    dmg_unlock();
+    return got;
+}
+
+static void rem_blit_rect(ag_handle_t h, const ag_blit_t *b)
+{
+    (void)h;
+    if (b == NULL || b->px == NULL || b->w == 0 || b->h == 0) {
+        return;
+    }
+
+    /*
+     * The damage lock covers the copy as well as the rectangle, and it is not
+     * the wire it is protecting against - the sender holds it for the few
+     * instructions it takes to pick the rectangle up, so nothing here ever
+     * waits on it.  What it settles is who may free the frame: the driver can
+     * be unloaded while an application is drawing, and a memcpy into memory
+     * that has just been handed back is the kind of fault that shows up
+     * somewhere else entirely.  See rem_stop.
+     */
+    dmg_lock();
+
+    /*
+     * The old way, for the two cases the frame cannot serve: no frame at all
+     * (the allocation failed at boot, or the driver is going away), or a
+     * picture of a different size - gfx->present hands over an application's
+     * own surface, which is whatever shape that application wanted.  Slower for
+     * the caller, and correct.
+     */
+    if (s_fb == NULL || b->surf_w != s_fb_w || b->surf_h != s_fb_h ||
+        (uint32_t)b->x + b->w > s_fb_w || (uint32_t)b->y + b->h > s_fb_h) {
+        dmg_unlock();
+        s_late++;
+        poll_far_end();
+        heal_a_band((uint32_t)b->y, b->h);
+        send_rect(b);
+        aud_drain();
+        return;
+    }
+
+    const uint8_t *src = (const uint8_t *)b->px;
+    const size_t   row_bytes = (size_t)b->w * sizeof(uint16_t);
+    for (uint32_t r = 0; r < b->h; r++) {
+        memcpy(s_fb + (size_t)((uint32_t)b->y + r) * s_fb_w + b->x,
+               src + (size_t)r * b->stride, row_bytes);
+    }
+
+    dmg_add_locked((uint32_t)b->x, (uint32_t)b->y, b->w, b->h);
+    dmg_unlock();
+}
+
+/*
+ * The task.  One rectangle at a time, and the sound between them.
+ *
+ * Two milliseconds of sleep when there is nothing, which is a fortieth of the
+ * frame rate this link can carry and cheap enough not to matter; the wire is
+ * the bottleneck, not the polling.  Nothing is notified because nothing needs
+ * to be: a screen is a thing that is looked at, not waited on.
+ */
+static volatile bool s_wire_running;
+
+static void wire_task(void *arg)
+{
+    (void)arg;
+    s_wire_running = true;
+    while (!s_stop) {
+        poll_far_end();
+
+        uint32_t x = 0, y = 0, w = 0, h = 0;
+        if (!dmg_take(&x, &y, &w, &h)) {
+            aud_drain();
+            ag_delay(2);
+            continue;
+        }
+
+        /* Read once: rem_stop takes the pointer away while this task may be
+         * between the two, and it does not give the memory back until this
+         * task has said it has finished the round it is in. */
+        uint16_t *fb = s_fb;
+        if (fb == NULL) {
+            continue;
+        }
+
+        heal_a_band(y, h);
+
+        /*
+         * Bands, and not the whole rectangle in one call, because send_rect
+         * walks it in bands anyway - but the damage is taken in one piece so
+         * that a frame drawn in twenty small pieces goes out as one sweep down
+         * the screen rather than twenty.
+         */
+        const ag_blit_t b = {
+            .px = fb + (size_t)y * s_fb_w + x,
+            .stride = s_fb_w * sizeof(uint16_t),
+            .surf_w = (uint16_t)s_fb_w,
+            .surf_h = (uint16_t)s_fb_h,
+            .x = (uint16_t)x,
+            .y = (uint16_t)y,
+            .w = (uint16_t)w,
+            .h = (uint16_t)h,
+        };
+        send_rect(&b);
+        aud_drain();
+    }
+    s_wire_running = false;
+}
+
+/*
+ * Unload, in the one order that is safe.
+ *
+ * The kernel calls this while the image is still mapped and then waits for the
+ * task; what has to be settled before it frees the frame is that nobody is
+ * inside it.  Two users: the sender, which stops when it sees the flag, and
+ * blit_rect, which copies into the frame under the damage lock.  So the pointer
+ * is taken away under that lock - after which every blit takes the old path -
+ * and only then is the memory given back, once the sender has said it has
+ * gone.
+ *
+ * Not freeing it would be the other choice, and it is worse than it looks: a
+ * driver replaced twice would be holding three hundred kilobytes of a board
+ * that has eight megabytes and a game that wants six.
+ */
+static void rem_stop(void)
+{
+    s_stop = true;
+
+    dmg_lock();
+    uint16_t *fb = s_fb;
+    s_fb = NULL;
+    s_fb_w = 0;
+    s_fb_h = 0;
+    s_dmg = false;
+    dmg_unlock();
+
+    for (int i = 0; i < 200 && s_wire_running; i++) {
+        ag_delay(5);
+    }
+    if (!s_wire_running) {
+        ag_free(fb);
+
+        /*
+         * And the grid, which nothing has ever given back: it is five
+         * kilobytes, and a driver loaded and replaced a dozen times over an
+         * afternoon of `drv install` had leaked sixty by the end.  Same
+         * ordering as the frame - after the sender has gone, because the
+         * sender is what reads it.
+         */
+        ag_free(s_hash);
+        s_hash = NULL;
+        s_hash_cols = 0;
+        s_hash_rows = 0;
+        s_surf_w = 0;
+        s_surf_h = 0;
+    }
 }
 
 /* ---- characters -------------------------------------------------------- */
@@ -1387,6 +1675,7 @@ ag_err_t ag_driver_init(void)
     if (ag_api()->task != NULL && ag_api()->task->mutex_create != NULL) {
         s_wire_lock = ag_api()->task->mutex_create();
         s_aud_lock = ag_api()->task->mutex_create();
+        s_send_lock = ag_api()->task->mutex_create();
     }
 
     /*
@@ -1464,8 +1753,58 @@ ag_err_t ag_driver_init(void)
         ag_printf("REMDISP: no damage grid; every band will be sent whole\n");
     }
 
-    ag_printf("REMDISP: uart%d at %u baud; %ux%u cells, pixels in %u-row bands\n",
+    /*
+     * The frame, and the task that sends it - both taken here, at boot, and for
+     * the same two reasons the grid above is.
+     *
+     * When: a hundred and fifty kilobytes asked for lazily is a hundred and
+     * fifty kilobytes asked for after the game has taken six megabytes of the
+     * eight, and the answer would be no at exactly the moment there was
+     * finally something worth showing.
+     *
+     * Whose: memory asked for from inside blit_rect is charged to whoever
+     * called in, because that is what a process arena is - so a display driver
+     * allocating there would be spending the game's memory to show the game.
+     * ag_driver_init runs on no process, and what is asked for here comes from
+     * the system heap.
+     */
+    s_fb_w = 320u;
+    s_fb_h = 240u;
+    s_fb = (uint16_t *)ag_malloc((size_t)s_fb_w * s_fb_h * sizeof(uint16_t));
+    if (s_fb == NULL) {
+        s_fb_w = 0;
+        s_fb_h = 0;
+        ag_printf("REMDISP: no frame of my own (%u KB); the wire will be fed "
+                  "by whoever draws, and they will wait for it\n",
+                  (unsigned)(320u * 240u * 2u / 1024u));
+    } else {
+        memset(s_fb, 0, (size_t)s_fb_w * s_fb_h * sizeof(uint16_t));
+        if (ag_api()->task != NULL && ag_api()->task->mutex_create != NULL) {
+            s_dmg_lock = ag_api()->task->mutex_create();
+        }
+        /*
+         * Six kilobytes of stack: send_rect's work space is static (see the
+         * note above it), so what is on the stack here is the band loop's own
+         * arithmetic and a twelve byte header.  Priority above the default so
+         * the wire keeps being fed while a game holds both cores; it spends its
+         * life blocked on a UART, so preferring it costs nothing.
+         */
+        s_stop = false;
+        if (!ag_module_task(wire_task, NULL, "remwire", 6144u, 6)) {
+            ag_free(s_fb);
+            s_fb = NULL;
+            s_fb_w = 0;
+            s_fb_h = 0;
+            ag_printf("REMDISP: no task of my own; sending from the caller\n");
+        } else {
+            ag_module_on_unload(rem_stop);
+        }
+    }
+
+    ag_printf("REMDISP: uart%d at %u baud; %ux%u cells, pixels in %u-row "
+              "bands%s\n",
               LINK_PORT, (unsigned)LINK_BAUD, (unsigned)REM_COLS,
-              (unsigned)REM_ROWS, (unsigned)BAND_ROWS);
+              (unsigned)REM_ROWS, (unsigned)BAND_ROWS,
+              (s_fb != NULL) ? ", sent from a task of its own" : "");
     return AG_OK;
 }

@@ -144,9 +144,15 @@ extern "C" {
  *      changed is that a pointer is a position on a surface and is now reported
  *      as one.  A terminal has no pixels of its own, so the kernel scales its
  *      column and row by the cell size on the way in.
+ * 0.43 sys->module_task: a task that belongs to a loadable driver rather than
+ *      to a process, so a driver can do work that takes milliseconds without
+ *      charging it to whoever called in.  Until this, every driver was a
+ *      collection of callbacks on the caller's thread, and a screen at the end
+ *      of a serial wire made the game that drew a frame wait for the frame to
+ *      go out.  The module owns the task and unload waits for it.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 42u
+#define AG_ABI_MINOR 43u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -256,6 +262,29 @@ typedef struct ag_sys_api {
      * sockets, etc.) before the image is unmapped on drv unload/replace.
      */
     void (*module_on_unload)(void (*fn)(void));
+
+    /*
+     * ABI 0.43: during ag_driver_init only — a task of the module's own.
+     *
+     * task->create is the application's, and it refuses a caller with no
+     * process: a thread belongs to a process and dies with it, and a driver has
+     * no process to belong to.  So every driver in this system has been a
+     * collection of callbacks running on whoever called in - which is right for
+     * a register write and wrong for anything that takes milliseconds.  A
+     * screen at the end of a serial wire is the case that forced this: three
+     * hundred milliseconds of a frame going out, charged to the game that drew
+     * it, when the wire could just as well be fed from a task of its own.
+     *
+     * The module owns it.  Unload calls the module_on_unload hook first - which
+     * is where the driver tells its task to stop - and then waits for the task
+     * to return before the image is unmapped, because unmapping code a task is
+     * still inside is a fault that names the wrong culprit.  A task that will
+     * not return refuses the unload rather than taking the machine down.
+     *
+     * The task must therefore watch a flag and return.  Do not call exit.
+     */
+    bool (*module_task)(void (*fn)(void *), void *arg, const char *name,
+                        uint32_t stack, int priority);
 } ag_sys_api_t;
 
 /* ------------------------------------------------------------------------ */

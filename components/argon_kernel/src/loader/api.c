@@ -125,6 +125,12 @@ static void api_module_on_unload(void (*fn)(void))
     ag_module_on_unload(fn);
 }
 
+static bool api_module_task(void (*fn)(void *), void *arg, const char *name,
+                            uint32_t stack, int priority)
+{
+    return ag_module_task(fn, arg, name, stack, priority);
+}
+
 static const ag_sys_api_t k_sys = {
     .size = sizeof(ag_sys_api_t),
     .info = api_info,
@@ -136,6 +142,7 @@ static const ag_sys_api_t k_sys = {
     .strerror = api_strerror,
     .heartbeat = api_heartbeat,
     .module_on_unload = api_module_on_unload,
+    .module_task = api_module_task,
 };
 
 /* ---------------------------------------------------------------------- */
