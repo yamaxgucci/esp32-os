@@ -144,9 +144,15 @@ extern "C" {
  *      changed is that a pointer is a position on a surface and is now reported
  *      as one.  A terminal has no pixels of its own, so the kernel scales its
  *      column and row by the cell size on the way in.
+ * 0.43 the other direction of USB: /dev/usbhid0, the keyboard and mouse this
+ *      board pretends to be when its OTG port is plugged into somebody else's
+ *      computer.  No new vtable slot - it is a character device an application
+ *      writes reports to (ag_usbhid_frame_t) and asks about with
+ *      AG_IOC_USBHID_STATUS.  Absent unless CONFIG_ARGON_USB_DEVICE, which is
+ *      the same peripheral CONFIG_ARGON_USB_HOST uses and therefore excludes.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 42u
+#define AG_ABI_MINOR 43u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -925,7 +931,82 @@ enum ag_ioctl_cmd {
     AG_IOC_AUDIO_SETFMT = AG_IOC(AG_DEV_AUDIO, 2),
     /* Optional: arg ag_audio_stats_t (pcmvirt/pcmmix; pcmnull returns zeros). */
     AG_IOC_AUDIO_GETSTATS = AG_IOC(AG_DEV_AUDIO, 3),
+
+    /*
+     * The USB HID gadget (/dev/usbhid0): what the machine at the other end of
+     * the cable makes of us.  arg: ag_usbhid_status_t.
+     */
+    AG_IOC_USBHID_STATUS = AG_IOC(AG_DEV_CHAR, 1),
 };
+
+/* ------------------------------------------------------------------------ */
+/* usbhid - the keyboard and mouse this board pretends to be                 */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * The other direction of USB.  Everywhere else in this system USB is a host
+ * with a keyboard plugged into it; here the board is the keyboard, plugged into
+ * somebody else's computer, and what an application writes to /dev/usbhid0 is
+ * what that computer believes a person typed.
+ *
+ * Three interfaces, because they are three different promises:
+ *
+ *   AG_USBHID_KBD    boot keyboard, the fixed eight-byte report
+ *   AG_USBHID_MOUSE  boot mouse, relative: buttons and a step
+ *   AG_USBHID_ABS    a pointer that names a position rather than a step
+ *
+ * The first two are boot-protocol devices on purpose.  A BIOS, a boot menu and
+ * a bootloader speak boot protocol and nothing else, and the whole reason to be
+ * a keyboard on a wire rather than a program on the far machine is to be able
+ * to type where no program of ours can run.  The absolute pointer is the
+ * opposite trade - no BIOS will look at it, and it is the only way to put the
+ * cursor where a finger touched a picture of the screen.
+ *
+ * A write is a whole number of AG_USBHID_FRAME-byte frames and returns how many
+ * bytes it took, so a caller can send a chord and its release in one call.  A
+ * frame naming an interface this build does not publish is refused rather than
+ * dropped: silence and success look identical from the far end.
+ */
+typedef enum {
+    AG_USBHID_KBD = 1,
+    AG_USBHID_MOUSE = 2,
+    AG_USBHID_ABS = 3,
+} ag_usbhid_kind_t;
+
+#define AG_USBHID_FRAME 16u    /* one frame on the way to the device        */
+#define AG_USBHID_DATA_MAX 14u /* the report inside it                      */
+
+/* Report lengths, fixed by the descriptors the gadget publishes. */
+#define AG_USBHID_KBD_LEN 8u   /* mods, reserved, six key slots             */
+#define AG_USBHID_MOUSE_LEN 4u /* buttons, dx, dy, wheel (a BIOS reads three) */
+#define AG_USBHID_ABS_LEN 6u   /* buttons, x lo/hi, y lo/hi, wheel          */
+
+/*
+ * The absolute pointer's axes, full scale: a position is 0..AG_USBHID_ABS_MAX
+ * across whatever screen the far machine turns out to have.
+ */
+#define AG_USBHID_ABS_MAX 32767
+
+typedef struct {
+    uint8_t kind; /* ag_usbhid_kind_t                                       */
+    uint8_t len;  /* bytes of `data` that are the report                    */
+    uint8_t data[AG_USBHID_DATA_MAX];
+} ag_usbhid_frame_t;
+
+typedef enum {
+    AG_USBHID_OFF = 0,  /* the gadget is not running                        */
+    AG_USBHID_ATTACHED, /* a cable with power on it, but nobody has asked   */
+    AG_USBHID_READY,    /* configured: reports go somewhere                 */
+} ag_usbhid_state_t;
+
+typedef struct {
+    uint32_t state;    /* ag_usbhid_state_t                                 */
+    uint32_t sent;     /* reports handed to the endpoint since it came up   */
+    uint32_t dropped;  /* reports refused because the endpoint was busy     */
+    uint8_t  leds;     /* the host's lamps: bit0 num, bit1 caps, bit2 scroll */
+    uint8_t  protocol; /* 0 the host asked for boot, 1 for report           */
+    uint8_t  reserved[2];
+} ag_usbhid_status_t;
 
 typedef struct {
     uint32_t sector_size; /* smallest unit the media reads and writes      */

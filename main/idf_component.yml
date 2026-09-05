@@ -29,3 +29,10 @@ dependencies:
     version: "^2.0.0"
     rules:
       - if: "$CONFIG{ARGON_CAMERA_BUILTIN} == True"
+  # The USB device stack, for the board that is a keyboard rather than has one
+  # (CONFIG_ARGON_USB_DEVICE, `argon target esp32s3-kvm`).  Gated the same way
+  # the camera is: a default image neither downloads it nor compiles any of it.
+  espressif/esp_tinyusb:
+    version: "^2.2.1"
+    rules:
+      - if: "$CONFIG{ARGON_USB_DEVICE} == True"

@@ -70,6 +70,13 @@ set(ARGON_DSP_SRCS
     "${ARGON_ROOT}/apps/common/tube/ag_tone.c"
     "${ARGON_ROOT}/apps/common/tube/ag_amp.c")
 
+# The remote keyboard's report builder.  Userspace and pure logic, like the DSP
+# above, and here for the same reason: what it gets wrong is invisible on the
+# far machine - see the header of host-tests/test_kvm.c.
+set(ARGON_KVM_SRCS
+    "${ARGON_ROOT}/apps/common/kvm/ag_kvm.c"
+    "${ARGON_ROOT}/apps/common/kvm/ag_ws.c")
+
 set(ARGON_INCLUDES
     "${CMAKE_CURRENT_LIST_DIR}"
     "${ARGON_ROOT}/sdk/include"
@@ -88,6 +95,7 @@ set(ARGON_INCLUDES
     "${ARGON_ROOT}/apps/common/grain"
     "${ARGON_ROOT}/apps/common/ckt"
     "${ARGON_ROOT}/apps/common/tube"
+    "${ARGON_ROOT}/apps/common/kvm"
     "${ARGON_ROOT}/apps/cktbench")
 
 # The NAM player has to agree with the reference implementation to the last bit -
@@ -132,10 +140,13 @@ add_executable(argon_tests
     test_nam.c
     test_netmsg.c
     test_rempix.c
+    test_kvm.c
+    test_ws.c
     "${ARGON_ROOT}/tools/nam.c"
     "${ARGON_ROOT}/apps/cc/cc_compile.c"
     "${ARGON_ROOT}/components/argon_kernel/src/dev/draw.c"
     ${ARGON_DSP_SRCS}
+    ${ARGON_KVM_SRCS}
     ${ARGON_PORTABLE_SRCS})
 
 # host_stub first, for the same reason as the smoke tools below: ag_ir asks

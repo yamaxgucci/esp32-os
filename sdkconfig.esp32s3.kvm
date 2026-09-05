@@ -1,0 +1,37 @@
+# ArgonOS - the S3 as a keyboard and mouse for somebody else's computer.
+#
+#   argon target esp32s3-kvm
+#
+# An overlay on sdkconfig.esp32s3.board, which is the board on the desk.  One
+# thing changes and it changes everything about the OTG port: the peripheral
+# stops being a host and becomes a device.
+#
+# That is not a preference, it is the silicon.  The S3 has one OTG controller
+# behind one internal PHY, so an image is a host or a device and never both -
+# hence ARGON_USB_HOST=n right below.  A board that wants a keyboard plugged
+# into it wants the other target.
+#
+# The console has to be somewhere else, and on this board it already is: the
+# CAM board has two USB-C sockets, a CH343 bridge for the console and flashing,
+# and the native USB on GPIO19/20.  The bridge is untouched by any of this.  On
+# a board whose only socket is the native one (the S3-Zero) this target would
+# take the console with it, and there is no way around that short of wiring a
+# UART out to pins.
+#
+# The PC at the other end powers the board through that socket, which is the
+# other reason this is a target of its own: a board in host mode sources 5 V on
+# the same pins.
+
+CONFIG_ARGON_USB_HOST=n
+CONFIG_ARGON_USB_DEVICE=y
+
+# Three HID interfaces: boot keyboard, boot mouse, absolute pointer.  TinyUSB
+# sizes its class table from this, so it is a build-time number and it has to
+# agree with what components/argon_port/idf/src/usbdev_hw.c publishes.
+CONFIG_TINYUSB_HID_COUNT=3
+
+# Nothing else.  A composite device with a serial port or a disk in it is a
+# different set of promises to the far machine - see docs/14-usb-kvm.md on what
+# M2 needs - and a keyboard should enumerate as a keyboard.
+CONFIG_TINYUSB_CDC_ENABLED=n
+CONFIG_TINYUSB_MSC_ENABLED=n

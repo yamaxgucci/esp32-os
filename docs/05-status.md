@@ -24,7 +24,8 @@ realtime-эмуляции — в [07-emulator-performance.md](07-emulator-perfor
 что стоит симуляция аналоговых цепей — в
 [08-circuit-simulation.md](08-circuit-simulation.md), что умеет и чего стоит
 сеть — в [10-network.md](10-network.md), режимы энергосбережения — в
-[11-power.md](11-power.md).
+[11-power.md](11-power.md), плата как клавиатура для чужого компьютера — в
+[14-usb-kvm.md](14-usb-kvm.md).
 
 Основная платформа **ESP32-S3** с PSRAM 8 или 16 МБ.
 **Модуль с 32 МБ PSRAM непригоден** — см. «Грабли» ниже.
@@ -244,6 +245,7 @@ $py = "D:\Espressif\tools\python_env\idf5.5_py3.12_env\Scripts\python.exe"
 | Таблица ABI | `src/loader/api.c` | ⚠ **0.38**: `inp->btnp`, `gfx` draw/present, `net` TCP+`resolve` (0.33), **`api->ble`** — BLE-MIDI (0.34), **`api->power`** (0.35), снятие неподтвердившихся (0.36), ступень `cruise` (0.37), **общий BLE central+peripheral и `api->wifimon` monitor/raw-tx (0.38; оба под своими `CONFIG_*`, `NULL` где роль не собрана)** |
 | Загрузчик `.SYS` | `src/loader/module.c` | ✅ `ag_driver_init`, резидент, `drv`, стадия `modules`, пример `apps/echo` |
 | Probe I2C | `src/loader/probe.c` | ✅ `modules.probe`, `drv probe`, `ag_probe_hint`, пример `apps/whoami` |
+| USB-устройство: клавиатура и мышь | порт `idf/src/usbdev_hw.c`, `src/dev/usbhid.c`, `apps/kvm` | ✅ **в эмуляторе**, ждёт платы. OTG-порт наоборот: плата — HID-клавиатура и мышь для чужого ПК, который не запускает ничего (BIOS, экран блокировки, зависший стол). Три интерфейса: boot keyboard, boot mouse, абсолютный указатель. `/dev/usbhid0` берёт кадры `ag_usbhid_frame_t` (**ABI 0.43**); `KVM.AXE` отдаёт телефону страницу и держит WebSocket. Взаимоисключающе с USB-хостом — один контроллер за одним PHY; цель `argon target esp32s3-kvm`. QEMU OTG не эмулирует вообще, поэтому всё выше порта проверяется через `USBHIDVIRT.SYS`: `argon kvmtest` — 19 проверок, плюс хостовые `test_kvm.c`/`test_ws.c`. Экрана по USB не будет никогда — разбор в [14-usb-kvm.md](14-usb-kvm.md) |
 
 Загрузка в QEMU, измерено 16 августа 2026 (`argon test -Sd ver mem boot`):
 
@@ -1001,6 +1003,16 @@ MAX98357A выпаян (пины
 Осталось проверить на плате: вызов держит консоль при перехвате UART0, так что
 проверка — это первый же баннер после прошивки: молчание в консоли значит,
 что слив не сработал.
+
+**USB-устройство (`argon target esp32s3-kvm`, 5 сентября).** Собрано и
+слинковано, в эмуляторе проверено всё, что там проверяемо (`argon kvmtest`,
+19/19). Платой закрывается ровно один вопрос: соглашается ли настоящий хост,
+что эти байты — клавиатура. Что именно проверять — список в
+[14-usb-kvm.md](14-usb-kvm.md), раздел «Что осталось плате»: перечисление на
+Windows и Linux, ввод **в BIOS**, лампочка Caps Lock обратным репортом,
+абсолютный указатель на живой ОС, число репортов в секунду. Плата — CAM (два
+разъёма USB-C: консоль на мосте, OTG на GPIO19/20); на S3-Zero этот образ
+забирает консоль вместе с PHY.
 
 ## Порядок дальнейших работ
 

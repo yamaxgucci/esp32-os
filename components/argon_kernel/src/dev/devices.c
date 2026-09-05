@@ -32,10 +32,12 @@
 
 #include <argon/btinput.h>
 #include <argon/usbinput.h>
+#include <argon/usbhid.h>
 #include <argon/port/bt.h>
 #include <argon/port/sync.h>
 #include <argon/port/task.h>
 #include <argon/port/usb.h>
+#include <argon/port/usbdev.h>
 #include <argon/port/wifi.h>
 
 #include "core/sysconfig.h"
@@ -455,6 +457,32 @@ ag_err_t ag_devices_init(void)
         } else {
             (void)ag_usbinput_init();
             ag_log(AG_LOG_INFO, "usb", "host up, waiting for a keyboard");
+        }
+    }
+#endif
+
+#if AG_PORT_HAS_USB_DEVICE
+    /*
+     * The other direction: this board as a keyboard and a mouse for the machine
+     * its OTG port is plugged into.  /dev/usbhid0 is registered whether or not
+     * the gadget runs - an application that opens it on a board with the cable
+     * out gets -AG_ENODEV from the write, which is a better answer than a
+     * missing device, because the cable is the thing that changes.
+     *
+     * The gadget itself is attached at boot for the same reason the host is
+     * started at boot: enumeration takes a moment and a driver install on the
+     * far machine takes longer, and both are better spent before somebody is
+     * waiting to type.  Opt out with [usb] device = 0 in SYSTEM.CFG.
+     */
+    (void)ag_usbhid_init();
+    if (ag_cfg_get_int(ag_sysconfig(), "usb.device", 1) != 0) {
+        const ag_err_t derr = ag_port_usbdev_start();
+        if (derr != AG_OK) {
+            ag_log(AG_LOG_WARN, "usbhid", "gadget did not start (%d)",
+                   (int)derr);
+        } else {
+            ag_log(AG_LOG_INFO, "usbhid",
+                   "attached as a keyboard and mouse");
         }
     }
 #endif

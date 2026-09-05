@@ -29,6 +29,7 @@ set(ARGON_KERNEL_SRCS
     "src/dev/hidptr.c"
     "src/dev/btinput.c"
     "src/dev/usbinput.c"
+    "src/dev/usbhid.c"
     "src/dev/audio.c"
     "src/dev/pcmmix.c"
     "src/dev/pcmhw.c"

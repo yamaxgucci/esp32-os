@@ -530,6 +530,38 @@ menu "ArgonOS"
             verifiable in QEMU, which models no USB host - the gate is the
             board.
 
+    config ARGON_USB_DEVICE
+        bool "USB device: be a HID keyboard and mouse for another computer"
+        depends on SOC_USB_OTG_SUPPORTED && !ARGON_USB_HOST
+        default n
+        help
+            The other direction of the same cable.  With this on, the board
+            plugged into a PC's USB port is a keyboard and a mouse as far as
+            that PC is concerned, and /dev/usbhid0 is where an application
+            writes what it should believe was typed.
+
+            The point is the moments when no software of ours can run on the
+            far machine: a BIOS, a boot menu, a password prompt, a hung desktop.
+            Nothing on that side is installed and nothing needs to be - it sees
+            a keyboard.  Two of the three interfaces are therefore boot-protocol
+            devices, which is all a BIOS reads; the third is an absolute pointer
+            for putting a cursor where a finger touched a picture of the screen,
+            which no BIOS will look at and no relative mouse can do.
+
+            Mutually exclusive with ARGON_USB_HOST, and not by choice: the OTG
+            peripheral is one controller behind one internal PHY, so an image is
+            a host or a device.  On a board whose Type-C socket goes straight to
+            the chip (the S3-Zero), that PHY is also the USB-Serial-JTAG
+            console, and turning this on takes the console with it - such a
+            board needs its console on a UART before this is any use.  The CAM
+            board has a separate bridge and does not have that problem.
+
+            Costs a USB device stack in the image (TinyUSB, fetched by the
+            component manager only when this is set), so it is off by default.
+            Not verifiable in QEMU, which models no OTG peripheral at all - the
+            gate is the board, and everything above the port is verified through
+            USBHIDVIRT.SYS instead.
+
     config ARGON_CONSOLE_COLS
         int "Console width, characters"
         range 20 240
