@@ -254,6 +254,8 @@ switch ($Command.ToLowerInvariant()) {
                           $chip = 'esp32' }
             'esp32-probe' { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32;sdkconfig.esp32.probe'
                             $chip = 'esp32' }
+            'esp32-cyd' { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32;sdkconfig.esp32.cyd'
+                          $chip = 'esp32' }
             'esp32s3'   { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32s3' }
             'esp32s3-board' { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32s3;sdkconfig.esp32s3.board'
                               $chip = 'esp32s3' }

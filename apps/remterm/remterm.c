@@ -48,7 +48,35 @@
 #include <argon/argon.h>
 #include <argon/libc.h>
 
-AG_APP("REMTERM", "1.5", "argon", 0);
+/*
+ * The heap is asked for, and that number is the whole of why whole frames
+ * work here at all.
+ *
+ * A 320x240 frame is 150 KB and this board has 208 KB free, so it fits - but
+ * an application that does not name a heap gets *a quarter of the free pool*,
+ * which here is 52 KB.  That cap is right for its own reason (a default of a
+ * megabyte would swallow a board without PSRAM whole), and it is why every
+ * attempt to allocate the frame failed on a board with room for it: 150 KB
+ * asked for out of a 52 KB heap, however many pieces it was cut into.
+ *
+ * Three wrong explanations came before this one - the shape of the heap, the
+ * rounding of the pieces, the code arena - and each cost a build and a flash.
+ * The board could have said so at any point; it took adding four numbers to
+ * one printf to ask it.
+ *
+ * And 200 KB could not be had either, for a reason that settles the question:
+ * a process heap is *one* allocation, and the largest free block on this board
+ * is 108 KB.  So under this operating system a 150 KB frame cannot be
+ * assembled here at all - not for want of memory (208 KB is free) but for want
+ * of it in one piece, and cutting the frame into pieces does not help because
+ * the pieces come out of the same heap.
+ *
+ * 100 KB is what fits, and it is enough for everything except the thing this
+ * was for.  Whole frames on this board need the operating system out of the
+ * way - a monitor firmware with no process model, where the whole 300 KB is
+ * one pool.
+ */
+AG_APP_SIZED("REMTERM", "2.3", "argon", 0, 0, 100 * 1024);
 
 #define LINK_PORT 1
 #define LINK_BAUD 4000000u
@@ -58,6 +86,8 @@ AG_APP("REMTERM", "1.5", "argon", 0);
 #define FR_ROW    'R'
 #define FR_CUR    'C'
 #define FR_END    'E' /* that frame is whole: number, and how many bands     */
+#define FR_RAW    'F' /* one slice of a whole frame, uncompressed            */
+#define FR_RESEND 'R' /* ...which this end asks for again when one is missing */
 #define FR_BAND   'B' /* pixels as they are                                  */
 #define FR_PACK   'P' /* PackBits over the pixels                            */
 #define FR_IDX    'I' /* a palette and indices                               */
@@ -273,6 +303,25 @@ static int next_byte(uint32_t ms)
 
 #define ASK_AGAIN_US 1000000ull
 static ag_time_t s_asked_at;
+
+/*
+ * What this end sends back besides "send it again".
+ *
+ * The console of this board cannot be read while this program is showing
+ * pixels: it holds the display, so a console line has nowhere to be drawn, and
+ * taking the console back (Ctrl+backslash) takes the *focus* with it - after
+ * which ag_gfx_acquire refuses and this program stops drawing for good, since
+ * there is no way back to a user slot over a serial line.  So "it is drawing"
+ * and "it is wedged" look identical from here: silence.
+ *
+ * Which meant that every look cost the thing being looked at, and a whole
+ * evening went into telling those two states apart by restarting them.
+ *
+ * So the numbers go the other way, up the wire the picture came down.  The far
+ * end prints them into its own console, which nobody is holding.  Sixteen
+ * bytes every five seconds against a link that carries four hundred thousand.
+ */
+#define FR_STAT 'S'
 
 static bool rewind_frame(void)
 {
@@ -579,6 +628,287 @@ static void pend_flush(void)
         at += 5u + len;
     }
     s_pend_used = 0;
+}
+
+/* ---- whole frames, assembled here -------------------------------------- */
+/*
+ * The far end sends the picture as it is: the whole frame, cut into numbered
+ * slices of eight rows, no trimming and no compression.  This end puts it back
+ * together and shows it only when it is whole, so what appears on the glass is
+ * a frame and not a stripe.
+ *
+ * A frame is 150 KB and no board here will give 150 KB in one piece - with the
+ * radios out of the image this one has 259 KB free and 108 in the largest
+ * block.  That turns out not to matter, and the reason is worth writing down:
+ * the frame does not need to be *contiguous*, it needs to reach the panel
+ * without waiting for the wire in between.  So it is assembled in two or three
+ * pieces and they are pushed to the panel one after another with nothing
+ * between them but SPI - the whole screen in fifteen to twenty milliseconds,
+ * which to an eye is a frame changing.
+ *
+ * What made the old picture crawl was never the size of the buffer.  It was
+ * that each stripe went to the glass as it arrived, three hundred and seventy
+ * milliseconds apart across a frame.
+ *
+ * A slice that does not arrive is asked for by number - 'R', frame, slice -
+ * while the far end still has that frame.  A frame with a hole in it is not
+ * shown; the next one carries the same pixels anyway.
+ */
+#define RAW_ROWS   8u
+/*
+ * How many pieces the frame may be assembled in.
+ *
+ * The heap here is 208 KB free with 108 in the largest block, so one piece of
+ * 150 KB is out and the frame has to be split.  Splitting it further costs
+ * nothing an eye can see: the pieces go to the panel one after another with no
+ * wire wait between them, so the count changes the number of SPI transfers and
+ * not what appears.
+ *
+ * What did cost something was splitting it *wrongly*.  The first version
+ * rounded each piece up to a whole number of slices, so twelve pieces of a
+ * 240-row frame came to 288 rows - 180 KB asked for to hold 150, and at four
+ * pieces it was 164 KB.  Every rung of the ladder therefore asked for more
+ * than the frame and failed on a board that had room for the frame, and the
+ * receiver drew nothing at all while reporting no error anybody had thought to
+ * count.
+ *
+ * So the pieces divide the frame exactly: thirty slices split into 1, 2, 3, 5,
+ * 6, 10, 15 or 30 pieces, every one of them a whole number of slices and the
+ * total always exactly the frame.
+ */
+#define RAW_PIECES 30u
+static const uint32_t k_split[] = {1u, 2u, 3u, 5u, 6u, 10u, 15u, 30u};
+#define RAW_W      320u
+#define RAW_H      240u
+
+static uint8_t *s_piece[RAW_PIECES];
+static uint32_t s_pieces;        /* how many were needed                     */
+static uint32_t s_piece_rows;    /* rows each one holds                      */
+static uint32_t s_asm_bytes;     /* what was taken, for the banner           */
+static uint32_t s_asm_best;      /* most pieces any attempt managed          */
+static uint32_t s_asm_best_of;   /* ...out of how many it needed             */
+static uint32_t s_asm_bytes_each;
+
+static uint32_t s_cur_frame = 0xffffffffu;
+static uint32_t s_have_mask;     /* slices of this frame that arrived        */
+static uint32_t s_want_mask;     /* slices this frame should have            */
+static uint32_t s_ask_mask;      /* ...and which have already been asked for */
+static uint32_t s_frame_w = RAW_W;
+static uint32_t s_frame_h = RAW_H;
+
+static uint32_t s_raw_slices;    /* slices taken in                          */
+static uint32_t s_raw_frames;    /* frames put on the glass whole            */
+static uint32_t s_raw_partial;   /* frames dropped with a hole in them       */
+static uint32_t s_raw_asked;     /* resend requests sent                     */
+static uint64_t s_raw_present;   /* microseconds spent pushing to the panel  */
+
+/*
+ * Take the frame in as few pieces as the heap allows.  One is best and has
+ * never happened; two or three is the ordinary answer and costs nothing.
+ */
+static void asm_alloc(void)
+{
+    for (uint32_t k = 0; k < sizeof(k_split) / sizeof(k_split[0]); k++) {
+        const uint32_t n = k_split[k];
+        /* Exactly, with nothing over: RAW_H is thirty slices and every n here
+         * divides it, so n pieces hold the frame and not a row more. */
+        const uint32_t rows = RAW_H / n;
+        const uint32_t bytes = rows * RAW_W * 2u;
+        /*
+         * Out of the process arena first, and out of the system's internal
+         * memory when that runs out.
+         *
+         * Those are two different pools and only the second one makes this
+         * possible.  A process heap is a single allocation - the largest free
+         * block on this board is 108 KB - so a 150 KB frame cannot come from
+         * the arena however it is cut.  But ag_malloc_caps(AG_MEM_FAST) does
+         * not go to the arena at all: the kernel serves it from the system
+         * heap, where another 80 KB sits.  Ninety-eight plus eighty is a
+         * hundred and seventy-eight, and the frame is a hundred and fifty.
+         */
+        uint32_t got = 0;
+        for (uint32_t i = 0; i < n; i++) {
+            s_piece[i] = (uint8_t *)ag_malloc(bytes);
+            if (s_piece[i] == NULL) {
+                s_piece[i] = (uint8_t *)ag_malloc_caps(bytes, AG_MEM_FAST);
+            }
+            if (s_piece[i] == NULL) {
+                break;
+            }
+            got++;
+        }
+        if (got > s_asm_best) {
+            s_asm_best = got;
+            s_asm_best_of = n;
+            s_asm_bytes_each = bytes;
+        }
+        if (got == n) {
+            s_pieces = n;
+            s_piece_rows = rows;
+            s_asm_bytes = bytes * n;
+            return;
+        }
+        for (uint32_t i = 0; i < got; i++) {
+            ag_free(s_piece[i]);
+            s_piece[i] = NULL;
+        }
+    }
+}
+
+static void ask_again(uint32_t frame, uint32_t slice)
+{
+    uint8_t req[5];
+    req[0] = (uint8_t)FR_RESEND;
+    req[1] = (uint8_t)frame;
+    req[2] = (uint8_t)(frame >> 8);
+    req[3] = (uint8_t)slice;
+    req[4] = (uint8_t)(slice >> 8);
+    (void)ag_uart_write(LINK_PORT, req, sizeof(req));
+    s_raw_asked++;
+}
+
+/* The frame is whole: push every piece, back to back, nothing in between. */
+static void frame_show(void)
+{
+    if (!want_pixels(s_frame_w)) {
+        return;
+    }
+    const ag_time_t t0 = g_ag_api->time->us();
+    for (uint32_t i = 0; i < s_pieces; i++) {
+        const uint32_t y0 = i * s_piece_rows;
+        if (y0 >= s_frame_h) {
+            break;
+        }
+        uint32_t rows = s_piece_rows;
+        if (y0 + rows > s_frame_h) {
+            rows = s_frame_h - y0;
+        }
+        const ag_blit_t blit = {
+            .px = (const uint16_t *)s_piece[i],
+            .stride = s_frame_w * sizeof(uint16_t),
+            .surf_w = (uint16_t)s_frame_w,
+            .surf_h = (uint16_t)s_frame_h,
+            .x = 0,
+            .y = (uint16_t)y0,
+            .w = (uint16_t)s_frame_w,
+            .h = (uint16_t)rows,
+        };
+        if (ag_gfx_present(&blit) != AG_OK) {
+            s_no_pres++;
+        }
+    }
+    s_raw_present += (uint64_t)(g_ag_api->time->us() - t0);
+    s_raw_frames++;
+    if (first_px == 0) {
+        first_px = t0;
+    }
+    last_px = g_ag_api->time->us();
+}
+
+static void raw_slice(const uint8_t *p, uint32_t len)
+{
+    const uint32_t frame = get16(p + 0);
+    const uint32_t slice = get16(p + 2);
+    const uint32_t slices = get16(p + 4);
+    const uint32_t w = get16(p + 6);
+    const uint32_t y0 = get16(p + 8);
+    const uint32_t rows = get16(p + 10);
+
+    if (w == 0u || w > RAW_W || rows == 0u || rows > RAW_ROWS ||
+        slices == 0u || slices > 32u || slice >= slices ||
+        y0 + rows > RAW_H || len < 12u + rows * w * 2u) {
+        bad++;
+        return;
+    }
+    s_raw_slices++;
+    wire_px += len;
+
+    /*
+     * With no buffer, show the slice where it stands.
+     *
+     * Assembling the frame is the better picture and it is not worth a blank
+     * screen: when the allocation fails - which it did, on every layout from
+     * one piece to twelve - the old behaviour is still a picture, a stripe at
+     * a time, and a stripe at a time is what this link did for weeks.  The
+     * first version returned here instead, so a receiver that could not get
+     * its buffer took every slice in and drew nothing at all, for ever,
+     * without saying so.
+     */
+    if (s_pieces == 0u) {
+        if (!want_pixels(w)) {
+            return;
+        }
+        const ag_blit_t one = {
+            .px = (const uint16_t *)(p + 12u),
+            .stride = w * sizeof(uint16_t),
+            .surf_w = (uint16_t)w,
+            .surf_h = (uint16_t)(slices * RAW_ROWS),
+            .x = 0,
+            .y = (uint16_t)y0,
+            .w = (uint16_t)w,
+            .h = (uint16_t)rows,
+        };
+        const ag_time_t t0 = g_ag_api->time->us();
+        if (ag_gfx_present(&one) == AG_OK) {
+            if (first_px == 0) {
+                first_px = t0;
+            }
+            last_px = g_ag_api->time->us();
+        } else {
+            s_no_pres++;
+        }
+        s_raw_present += (uint64_t)(g_ag_api->time->us() - t0);
+        return;
+    }
+
+    if (frame != s_cur_frame) {
+        /* The one before did not finish: say what was missing, then let go. */
+        if (s_cur_frame != 0xffffffffu && s_have_mask != s_want_mask) {
+            s_raw_partial++;
+        }
+        s_cur_frame = frame;
+        s_frame_w = w;
+        s_frame_h = slices * RAW_ROWS;
+        if (s_frame_h > RAW_H) {
+            s_frame_h = RAW_H;
+        }
+        s_have_mask = 0;
+        s_ask_mask = 0;
+        s_want_mask = (slices >= 32u) ? 0xffffffffu : ((1u << slices) - 1u);
+    }
+
+    /*
+     * Out of order means one went missing: ask for it, once, while the far end
+     * still holds this frame.
+     *
+     * Once is the whole of it.  The first version asked for every absent
+     * earlier slice on every slice that arrived, which on a frame that was
+     * never going to complete came to a hundred and fourteen thousand requests
+     * in twenty seconds - five bytes each, against the picture, on the same
+     * wire.  A request that has been made is not information until it has been
+     * answered or the frame has gone.
+     */
+    for (uint32_t i = 0; i < slice; i++) {
+        const uint32_t bit = 1u << i;
+        if ((s_have_mask & bit) == 0u && (s_ask_mask & bit) == 0u) {
+            s_ask_mask |= bit;
+            ask_again(frame, i);
+        }
+    }
+
+    const uint32_t piece = y0 / s_piece_rows;
+    if (piece >= s_pieces) {
+        bad++;
+        return;
+    }
+    const uint32_t off = (y0 % s_piece_rows) * w * 2u;
+    memcpy(s_piece[piece] + off, p + 12u, (size_t)rows * w * 2u);
+    s_have_mask |= (1u << slice);
+
+    if (s_have_mask == s_want_mask) {
+        frame_show();
+        s_cur_frame = 0xffffffffu; /* shown; the next slice starts a new one */
+    }
 }
 
 /* ---- the sound --------------------------------------------------------- */
@@ -919,16 +1249,15 @@ int ag_main(int argc, char **argv)
      * does not belong on by default while it is still being understood.  So:
      * `remterm <baud> <secs> 1` to hold frames, nothing to behave as before.
      */
-    if (whole != 0u) {
-        for (uint32_t i = 0;
-             i < sizeof(k_pend_try) / sizeof(k_pend_try[0]); i++) {
-            s_pend = (uint8_t *)ag_malloc(k_pend_try[i]);
-            if (s_pend != NULL) {
-                s_pend_cap = k_pend_try[i];
-                break;
-            }
-        }
-    }
+    /*
+     * Nothing is allocated for the band path any more.  The far end sends
+     * whole frames now, so the twenty-four kilobytes that used to hold a
+     * frame's worth of encoded bands were being taken away from the buffer
+     * that assembles the frame - which needs every byte it can get.
+     */
+    (void)whole;
+
+    asm_alloc();
 
     ag_coninfo_t con;
     ag_coninfo(&con);
@@ -937,11 +1266,25 @@ int ag_main(int argc, char **argv)
     ag_printf("remterm: %u baud, %ux%u cells, bands up to %ux%u\n",
               (unsigned)baud, (unsigned)con.cols, (unsigned)con.rows,
               (unsigned)MAX_SURF_W, (unsigned)BAND_ROWS);
-    if (s_pend != NULL) {
-        ag_printf("frames held whole: yes, %u KB\n",
-                  (unsigned)(s_pend_cap / 1024u));
-    } else if (whole != 0u) {
-        ag_printf("frames held whole: asked for, no memory\n");
+    if (s_pieces != 0u) {
+        ag_printf("frame assembled in %u piece(s), %u KB, %u rows each\n",
+                  (unsigned)s_pieces, (unsigned)(s_asm_bytes / 1024u),
+                  (unsigned)s_piece_rows);
+    } else {
+        /*
+         * And say what was available, because "no memory" is not a finding.
+         * Every guess about this failure so far has been wrong - the shape of
+         * the heap, the size of the pieces, the code arena - and each one cost
+         * a build and a flash to disprove.  The board knows the answer.
+         */
+        ag_meminfo_t mi;
+        ag_meminfo(&mi);
+        ag_printf("no frame buffer: got %u of %u x %u B\n",
+                  (unsigned)s_asm_best, (unsigned)s_asm_best_of,
+                  (unsigned)s_asm_bytes_each);
+        ag_printf("arena %u free %u big, fast %u\n",
+                  (unsigned)mi.arena_free, (unsigned)mi.arena_largest,
+                  (unsigned)mi.fast_free);
     }
 
     /*
@@ -1069,13 +1412,23 @@ int ag_main(int argc, char **argv)
                  * does not work: the console owns those pins and the io layer
                  * refuses to reserve them twice.
                  */
-                char line[192];
+                char line[256];
                 char num[24];
                 line[0] = '\0';
+                /*
+                 * The four "why is nothing on the glass" counters are in this
+                 * line, not only in the report at the end, because the report
+                 * only appears when the run is over and the interesting state
+                 * is one that does not end: a receiver taking bands perfectly
+                 * and presenting none of them will happily do that for ever.
+                 * Reading it required stopping it, which changed it.
+                 */
                 static const char *const k_rx_label[] = {
                     "[rx] ", " frames (", " lost, ", " partial), ",
                     " rects ", " KB, ", " rows, ", " bad, ",
-                    " stray, sound ", " in ", " gaps ", " full",
+                    " stray; nowidth ", " nomem ", " noacq ", " nopres ",
+                    "; raw ", " slices ", " frames ", " partial ", " asked",
+                    "; sound ", " in ", " gaps ", " full",
                 };
                 const uint32_t k_rx_value[] = {
                     frames - last_frames,
@@ -1086,17 +1439,25 @@ int ag_main(int argc, char **argv)
                     rows - last_rows,
                     bad - last_bad,
                     stray - last_stray,
+                    s_no_width,
+                    s_no_mem,
+                    s_no_acq,
+                    s_no_pres,
+                    s_raw_slices,
+                    s_raw_frames,
+                    s_raw_partial,
+                    s_raw_asked,
                     s_asamples - last_asamples,
                     s_agaps - last_agaps,
                     s_adropped - last_adropped,
                 };
-                for (uint32_t f = 0; f < 11u; f++) {
+                for (uint32_t f = 0; f < 19u; f++) {
                     ag_strlcat(line, k_rx_label[f], sizeof(line));
                     ag_strlcat(line, ag_utoa(k_rx_value[f], num, sizeof(num),
                                              0, false),
                                sizeof(line));
                 }
-                ag_strlcat(line, k_rx_label[11], sizeof(line));
+                ag_strlcat(line, k_rx_label[19], sizeof(line));
                 ag_strlcat(line, "\r\n", sizeof(line));
                 ag_printf("%s", line);
                 last_rows = rows;
@@ -1110,6 +1471,26 @@ int ag_main(int argc, char **argv)
                 last_frames = frames;
                 last_framesmiss = framesmiss;
                 last_framespart = framespart;
+
+                /*
+                 * And the same figures back up the wire, where they can be
+                 * read without taking the display away from this program.
+                 * Little-endian, no checksum: the far end only logs it, and a
+                 * mangled counter is a wrong line in a log, not a wrong
+                 * picture.
+                 */
+                uint8_t st[17];
+                const uint32_t stv[4] = {
+                    s_raw_frames, s_raw_slices, s_pieces, s_raw_asked,
+                };
+                st[0] = (uint8_t)FR_STAT;
+                for (uint32_t k = 0; k < 4u; k++) {
+                    st[1u + k * 4u] = (uint8_t)stv[k];
+                    st[2u + k * 4u] = (uint8_t)(stv[k] >> 8);
+                    st[3u + k * 4u] = (uint8_t)(stv[k] >> 16);
+                    st[4u + k * 4u] = (uint8_t)(stv[k] >> 24);
+                }
+                (void)ag_uart_write(LINK_PORT, st, sizeof(st));
             }
         }
 
@@ -1246,6 +1627,12 @@ int ag_main(int argc, char **argv)
             }
             inframe = 0;
             frames++;
+            wire += len;
+            continue;
+        }
+
+        if (op == FR_RAW && len >= 12u) {
+            raw_slice(payload, len);
             wire += len;
             continue;
         }

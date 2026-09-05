@@ -64,7 +64,7 @@
 #include <argon/argon.h>
 #include <argon/libc.h>
 
-AG_DRV("REMDISP", "1.5", "argon");
+AG_DRV("REMDISP", "2.0", "argon");
 
 /* UART1: the console is UART0 on this board, and the numbering is the chip's. */
 #define LINK_PORT 1
@@ -117,6 +117,28 @@ AG_DRV("REMDISP", "1.5", "argon");
 #define FR_IDX    'I' /* the same, as a palette and indices                  */
 #define FR_AUD    'A' /* sound: a rate, then unsigned 8-bit mono samples     */
 #define FR_END    'E' /* that frame is whole: its number, and how many bands */
+#define FR_RAW    'F' /* one slice of a whole frame, uncompressed           */
+
+/*
+ * The plain way, and for now the only way.
+ *
+ * Everything else in this file - the hash grid, the trimming to changed
+ * blocks, three encodings raced against each other, the byte budget - was
+ * built to make a slow wire carry a picture, and each piece of it works.
+ * Together they produced half a screen a second and a set of numbers nobody
+ * could reconcile with what was on the glass, because every one of them
+ * measured a different thing and two of them were wrong.
+ *
+ * So this is the floor to build back up from: copy the whole frame, cut it
+ * into numbered slices, send them all, and let the far end ask again for what
+ * it did not get.  A 320x240 frame is 150 KB and the wire carries 400 KB/s, so
+ * the ceiling is 2.7 frames a second - three times what all the cleverness was
+ * delivering, and every one of them a whole frame rather than a stripe.
+ *
+ * A slice is eight rows because that is what fits a frame on this wire, not
+ * for any reason to do with the picture.
+ */
+#define RAW_ROWS 8u
 
 /*
  * Why a frame needs an end.
@@ -169,6 +191,27 @@ static bool               s_up;
 /* Which frame is being sent, and how many bands have gone into it. */
 static uint16_t s_frame_no;
 static uint16_t s_frame_bands;
+
+/*
+ * The handshake that keeps the driver from ever seeing half a frame.
+ *
+ * The game draws into the system surface and ends its frame with a flush, and
+ * that flush is the only moment anybody knows the picture is whole.  So the
+ * copy happens there - but only when this driver has asked for one.  The rest
+ * of the time the flush returns at once and the game waits for nothing, which
+ * is the point: the game is not paying for the wire, it is paying for one
+ * memcpy whenever the wire is ready for another frame.
+ */
+static volatile bool s_want_copy;   /* the driver would like a frame        */
+static volatile bool s_have_copy;   /* ...and here it is                    */
+
+/* What each stage costs, measured rather than reasoned about. */
+static uint32_t s_t_copy_us;     /* the game held for the copy               */
+static uint32_t s_t_send_us;     /* the frame put on the wire                */
+static uint32_t s_t_wait_us;     /* the driver waiting for a frame boundary  */
+static uint32_t s_raw_frames;    /* frames sent whole                        */
+static uint32_t s_raw_resent;    /* slices the far end had to ask for again  */
+static uint64_t s_raw_bytes;
 
 /* One frame, built here and written in one call.  Static because the console
  * task's stack is not this driver's to spend, and the kernel serialises every
@@ -647,6 +690,38 @@ static uint32_t s_sweep_owed = 0xffffffffu; /* everything, until told otherwise 
 static uint64_t s_sweep_asked_at;           /* when the far end last complained */
 
 #define FR_HELLO 'H'
+/*
+ * And what the far end says about itself: 'S' then four little-endian
+ * counters - frames closed, bands presented, times the display was refused,
+ * times there was no memory for a band.
+ *
+ * It exists because the far end's own console is unreadable while it is
+ * drawing (it holds the display) and taking that console back stops it drawing
+ * for good.  So "it is drawing" and "it is wedged" were the same observation
+ * from over there, and the only way to tell them apart was to restart it.  Now
+ * it says so, here, into a console nobody is holding.
+ */
+#define FR_STAT  'S'
+/*
+ * And 'R' - "send slice N of frame M again".  Four bytes after it, little
+ * endian.  This is the whole of the recovery scheme for whole-frame mode: the
+ * far end knows which slices it has because they are numbered, so it can name
+ * what is missing instead of asking for the screen back.
+ */
+#define FR_RESEND 'R'
+static void raw_resend(uint32_t frame, uint32_t slice);
+
+static uint8_t  s_stat[16];
+static uint32_t s_stat_have = 0xffffffffu; /* not collecting */
+static uint8_t  s_req[4];
+static uint32_t s_req_have = 0xffffffffu;
+
+static uint32_t stat32(uint32_t at)
+{
+    return (uint32_t)s_stat[at] | ((uint32_t)s_stat[at + 1u] << 8) |
+           ((uint32_t)s_stat[at + 2u] << 16) |
+           ((uint32_t)s_stat[at + 3u] << 24);
+}
 
 static void poll_far_end(void)
 {
@@ -657,6 +732,36 @@ static void poll_far_end(void)
             return;
         }
         for (int32_t i = 0; i < n; i++) {
+            if (s_stat_have != 0xffffffffu) {
+                s_stat[s_stat_have++] = buf[i];
+                if (s_stat_have < sizeof(s_stat)) {
+                    continue;
+                }
+                s_stat_have = 0xffffffffu;
+                ag_printf("REMTERM: %u frames whole, %u slices in, "
+                          "%u buffer pieces, %u resends asked\n",
+                          (unsigned)stat32(0), (unsigned)stat32(4),
+                          (unsigned)stat32(8), (unsigned)stat32(12));
+                continue;
+            }
+            if (s_req_have != 0xffffffffu) {
+                s_req[s_req_have++] = buf[i];
+                if (s_req_have < sizeof(s_req)) {
+                    continue;
+                }
+                s_req_have = 0xffffffffu;
+                raw_resend((uint32_t)s_req[0] | ((uint32_t)s_req[1] << 8),
+                           (uint32_t)s_req[2] | ((uint32_t)s_req[3] << 8));
+                continue;
+            }
+            if (buf[i] == (uint8_t)FR_STAT) {
+                s_stat_have = 0;
+                continue;
+            }
+            if (buf[i] == (uint8_t)FR_RESEND) {
+                s_req_have = 0;
+                continue;
+            }
             if (buf[i] == (uint8_t)FR_HELLO) {
                 /*
                  * "Send it again."  The far end says this when it starts, on
@@ -1376,33 +1481,62 @@ static void rem_blit_rect(ag_handle_t h, const ag_blit_t *b)
     const bool held = dmg_lock();
 
     /*
-     * The old way, for the two cases the frame cannot serve: no frame at all
-     * (the allocation failed at boot, or the driver is going away), or a
-     * picture of a different size - gfx->present hands over an application's
-     * own surface, which is whatever shape that application wanted.  Slower for
-     * the caller, and correct.
+     * Anything that is not the system surface is ignored, and that is a change
+     * with a bruise on it.
+     *
+     * There used to be a fallback here: a blit of a different shape - which is
+     * what gfx->present hands over, an application's own surface - was encoded
+     * and sent from this thread, the caller's.  In whole-frame mode that path
+     * did something much worse than being slow.  It sent bands *and it
+     * advanced the frame number*, in the middle of a frame the wire task was
+     * halfway through sending.  The far end saw the number change on every
+     * slice, decided each one began a new frame, threw away what it had and
+     * asked for it all again: two thousand slices, no frames, and a hundred
+     * and fourteen thousand requests to resend in twenty seconds.
+     *
+     * The game calls both - flush for the screen and present for its own
+     * surfaces - so both arrive here, and only one of them is the picture.
      */
-    if (s_fb == NULL || b->surf_w != s_fb_w || b->surf_h != s_fb_h ||
-        (uint32_t)b->x + b->w > s_fb_w || (uint32_t)b->y + b->h > s_fb_h) {
+    if (s_fb == NULL || b->surf_w != s_fb_w || b->surf_h != s_fb_h) {
         dmg_unlock(held);
         s_late++;
-        poll_far_end();
-        heal_a_band((uint32_t)b->y, b->h);
-        send_rect(b);
-        aud_drain();
         return;
     }
 
     s_last_blit_us = (uint64_t)ag_api()->time->us();
 
-    const uint8_t *src = (const uint8_t *)b->px;
-    const size_t   row_bytes = (size_t)b->w * sizeof(uint16_t);
-    for (uint32_t r = 0; r < b->h; r++) {
-        memcpy(s_fb + (size_t)((uint32_t)b->y + r) * s_fb_w + b->x,
-               src + (size_t)r * b->stride, row_bytes);
+    /*
+     * This call is the end of the game's frame, and the only place anybody
+     * knows the picture is whole.  So the copy happens here - and only when
+     * the driver asked for one.
+     *
+     * Asked-for, rather than every frame, is the whole difference.  Before,
+     * every flush copied its rectangle into this driver's frame whether the
+     * wire wanted it or not: the game paid three to six milliseconds of PSRAM
+     * on every frame it drew, to feed a wire that could take two frames a
+     * second.  Now it pays that once per frame *sent*, and the rest of its
+     * flushes return in nanoseconds.
+     *
+     * The whole surface is copied, not the dirty rectangle, because the whole
+     * frame is what goes out.  b->px points into the middle of the surface -
+     * at the rectangle's corner - so the base is found by walking back.
+     */
+    if (!s_want_copy || s_have_copy) {
+        dmg_unlock(held);
+        return;
     }
-
-    dmg_add_locked((uint32_t)b->x, (uint32_t)b->y, b->w, b->h);
+    const uint64_t c0 = (uint64_t)ag_api()->time->us();
+    const uint8_t *base = (const uint8_t *)b->px -
+                          (size_t)b->y * b->stride -
+                          (size_t)b->x * sizeof(uint16_t);
+    const size_t row_bytes = (size_t)s_fb_w * sizeof(uint16_t);
+    for (uint32_t r = 0; r < s_fb_h; r++) {
+        memcpy(s_fb + (size_t)r * s_fb_w, base + (size_t)r * b->stride,
+               row_bytes);
+    }
+    s_t_copy_us = (uint32_t)((uint64_t)ag_api()->time->us() - c0);
+    s_want_copy = false;
+    s_have_copy = true;
     dmg_unlock(held);
 }
 
@@ -1633,6 +1767,17 @@ static void wire_stats(void)
     if (s_win_rects == 0u) {
         return;
     }
+    /*
+     * And not while the console owns the glass, which is the case the guard
+     * above does not cover: repair frames keep s_win_rects moving after an
+     * application exits, so these lines went on printing - into the console,
+     * which at that moment *is* the far end's screen.  Four lines every five
+     * seconds, scrolling the very picture they describe.  What a person saw
+     * was a screen full of the driver shouting about itself.
+     */
+    if (s_last_text_us > s_last_blit_us) {
+        return;
+    }
 
     const uint64_t secs = STAT_US / 1000000ull;
     const uint32_t px_kb = (uint32_t)(s_win_px * 2ull / 1024ull / secs);
@@ -1689,6 +1834,103 @@ static void wire_stats(void)
     s_win_behind = 0;
 }
 
+/* ---- the plain way: a whole frame, in numbered slices ------------------- */
+/*
+ * One slice on the wire.  Header then pixels, no encoding of any kind:
+ *
+ *   frame:2  slice:2  slices:2  width:2  y:2  rows:2  then rows*width pixels
+ *
+ * The frame number and the slice number are what let the far end say "I never
+ * got slice nine of frame four hundred", which is the whole of the recovery
+ * scheme.  Everything else that used to be here - the hash grid, the trimming,
+ * the three encodings - is still in this file and is not used: this is the
+ * floor, and it is measured before anything is built back on top of it.
+ */
+static bool raw_send_slice(uint32_t slice, uint32_t slices, uint32_t y0,
+                           uint32_t rows)
+{
+    const uint32_t px = rows * s_fb_w;
+    put16(s_raw + 0, s_frame_no);
+    put16(s_raw + 2, slice);
+    put16(s_raw + 4, slices);
+    put16(s_raw + 6, s_fb_w);
+    put16(s_raw + 8, y0);
+    put16(s_raw + 10, rows);
+    memcpy(s_raw + 12, s_fb + (size_t)y0 * s_fb_w,
+           (size_t)px * sizeof(uint16_t));
+    return send_frame(FR_RAW, s_raw, 12u + px * sizeof(uint16_t));
+}
+
+static uint32_t raw_slices(void)
+{
+    return (s_fb_h + RAW_ROWS - 1u) / RAW_ROWS;
+}
+
+/* Send one slice by number, for a far end that missed it. */
+static void raw_resend(uint32_t frame, uint32_t slice)
+{
+    if (frame != s_frame_no || s_fb == NULL) {
+        return; /* that frame is gone; the next whole one will do instead */
+    }
+    const uint32_t slices = raw_slices();
+    if (slice >= slices) {
+        return;
+    }
+    const uint32_t y0 = slice * RAW_ROWS;
+    uint32_t rows = RAW_ROWS;
+    if (y0 + rows > s_fb_h) {
+        rows = s_fb_h - y0;
+    }
+    if (raw_send_slice(slice, slices, y0, rows)) {
+        s_raw_resent++;
+    }
+}
+
+static void raw_stats(void)
+{
+    static uint64_t at;
+    const uint64_t  now = (uint64_t)ag_api()->time->us();
+    if (at == 0ull) {
+        at = now + STAT_US;
+        return;
+    }
+    if (now < at) {
+        return;
+    }
+    at = now + STAT_US;
+    if (s_raw_frames == 0u) {
+        return;
+    }
+    if (s_last_text_us > s_last_blit_us) {
+        return; /* the console has the glass; do not scroll it */
+    }
+
+    const uint32_t secs = (uint32_t)(STAT_US / 1000000ull);
+    const uint32_t fps100 = s_raw_frames * 100u / secs;
+    const uint32_t kbs = (uint32_t)(s_raw_bytes / 1024ull / secs);
+    /* What the copy costs in megabytes a second, which is the number that
+     * says whether PSRAM or the code is the problem. */
+    const uint32_t copy_kbs =
+        (s_t_copy_us != 0u)
+            ? (uint32_t)((uint64_t)s_fb_w * s_fb_h * 2ull * 1000000ull /
+                         s_t_copy_us / 1024ull)
+            : 0u;
+
+    ag_printf("RAW: %u.%02u frames/s, %u KB/s; copy %u us (%u KB/s), "
+              "send %u us, wait %u us, %u resent\n",
+              (unsigned)(fps100 / 100u), (unsigned)(fps100 % 100u),
+              (unsigned)kbs, (unsigned)s_t_copy_us, (unsigned)copy_kbs,
+              (unsigned)s_t_send_us, (unsigned)s_t_wait_us,
+              (unsigned)s_raw_resent);
+    if (s_dropped != 0u || s_lost != 0u) {
+        ag_printf("RAW: %u slices refused (ring full), %u bytes lost in the "
+                  "port\n", (unsigned)s_dropped, (unsigned)s_lost);
+    }
+    s_raw_frames = 0;
+    s_raw_bytes = 0;
+    s_raw_resent = 0;
+}
+
 static void wire_task(void *arg)
 {
     (void)arg;
@@ -1696,96 +1938,85 @@ static void wire_task(void *arg)
     while (!s_stop) {
         poll_far_end();
         (void)tx_drain();
-        wire_stats();
+        raw_stats();
 
-        if (!budget_ok()) {
-            /* Spent for this second.  The damage stays where it is and goes out
-             * when the budget refills, unioned with whatever arrives meanwhile -
-             * which is what should happen to a picture moving faster than the
-             * machine can carry it. */
-            s_budget_waits++;
+        /*
+         * Ask for a frame, and wait at the door rather than reaching in.  The
+         * game copies it at the end of its own frame - see rem_blit_rect - so
+         * what arrives here is never half drawn.
+         */
+        if (!s_have_copy) {
+            const uint64_t w0 = (uint64_t)ag_api()->time->us();
+            s_want_copy = true;
             aud_drain();
             (void)tx_drain();
-            ag_delay(5);
+            ag_delay(2);
+            s_t_wait_us += (uint32_t)((uint64_t)ag_api()->time->us() - w0);
+            continue;
+        }
+        s_t_wait_us = 0;
+
+        if (s_fb == NULL) {
+            s_have_copy = false;
             continue;
         }
 
-        uint32_t x = 0, y = 0, w = 0, h = 0;
-        bool     repair = false;
-        if (!dmg_take(&x, &y, &w, &h)) {
-            /* Nothing was asked for; put a row of the picture on the wire
-             * anyway.  See sweep_step. */
-            repair = sweep_step(&x, &y, &w, &h);
-            if (!repair) {
-                aud_drain();
-                (void)tx_drain();
-                ag_delay(2);
-                continue;
-            }
-        }
-
-        /* Read once: rem_stop takes the pointer away while this task may be
-         * between the two, and it does not give the memory back until this
-         * task has said it has finished the round it is in. */
-        uint16_t *fb = s_fb;
-        if (fb == NULL) {
-            continue;
-        }
-
-        if (!repair) {
-            heal_a_band(y, h);
-        }
-
-        /*
-         * Bands, and not the whole rectangle in one call, because send_rect
-         * walks it in bands anyway - but the damage is taken in one piece so
-         * that a frame drawn in twenty small pieces goes out as one sweep down
-         * the screen rather than twenty.
-         */
-        const ag_blit_t b = {
-            .px = fb + (size_t)y * s_fb_w + x,
-            .stride = s_fb_w * sizeof(uint16_t),
-            .surf_w = (uint16_t)s_fb_w,
-            .surf_h = (uint16_t)s_fb_h,
-            .x = (uint16_t)x,
-            .y = (uint16_t)y,
-            .w = (uint16_t)w,
-            .h = (uint16_t)h,
-        };
         const uint64_t t0 = (uint64_t)ag_api()->time->us();
-        const uint64_t wire0 = s_sent_bytes;
-        send_rect(&b);
-        const uint32_t took = (uint32_t)((uint64_t)ag_api()->time->us() - t0);
+        const uint64_t b0 = s_sent_bytes;
+        const uint32_t slices = raw_slices();
+        for (uint32_t c = 0; c < slices && !s_stop; c++) {
+            const uint32_t y0 = c * RAW_ROWS;
+            uint32_t rows = RAW_ROWS;
+            if (y0 + rows > s_fb_h) {
+                rows = s_fb_h - y0;
+            }
+            (void)raw_send_slice(c, slices, y0, rows);
+            /* Between slices, not after them: the ring is 24 KB and a frame
+             * is 150, so a frame that is not drained as it goes is a frame
+             * that refuses most of itself. */
+            aud_drain();
+            (void)tx_drain();
+            /*
+             * And stand aside between slices.
+             *
+             * A frame is three hundred and seventy-five milliseconds of wire
+             * at four megabaud, and without this line the task spends all of
+             * it on the system core without yielding once - building a slice,
+             * then sitting in a blocking write, thirty times over.  The game
+             * runs on the other core, so that looks harmless and is not: the
+             * kernel work the game depends on - the card, the art cache, the
+             * file mappings - is served here, and it stops being served.
+             *
+             * Measured, that took the game from 28 frames a second to 2.3, and
+             * the number that gave it away was `eng`: the *engine* step went
+             * from 20 ms to 400 while the copy stayed at 7 and the wire at 6.
+             * Nothing this driver was doing to the game's own thread could
+             * have cost that, and the arithmetic said so - seven milliseconds
+             * twice a second is one and a half per cent, not a factor of
+             * twelve.  What it was doing was to everything else.
+             */
+            ag_yield();
+        }
+        s_t_send_us = (uint32_t)((uint64_t)ag_api()->time->us() - t0);
+        s_raw_bytes += s_sent_bytes - b0;
+        s_raw_frames++;
 
-        s_win_rects++;
         /*
-         * The pixels are counted where they are *sent*, band by band, and not
-         * here where the damage rectangle is known.
-         *
-         * Counting them here was a twelvefold lie.  A rectangle is trimmed to
-         * the blocks that actually changed before anything goes out, so the
-         * area this task picked up bears no relation to the area that left -
-         * measured against the far end's own count of what it presented, 237
-         * thousand pixels a second here against 19 thousand there.  The rest
-         * of the line was right: rectangles a second agreed, bytes a second
-         * agreed.  Only the pixels were invented, and they are what "screens a
-         * second" is divided from, so the one figure a person looking at the
-         * glass would check was the one that was wrong - and it read 3.16
-         * screens a second while the glass showed one every three seconds.
+         * A moment for the far end to say what it missed, while the frame is
+         * still here to resend.  Once the next copy happens these pixels are
+         * gone, and a slice asked for after that is answered by the next whole
+         * frame instead - which is not worse, only later.
          */
-        s_win_wire += s_sent_bytes - wire0;
-        budget_spend((uint32_t)(s_sent_bytes - wire0));
-        if (took > s_win_worst_us) {
-            s_win_worst_us = took;
-        }
-        /* Damage that arrived while this one was going out: the sender did not
-         * catch up, and what is on the glass is already old. */
-        if (s_dmg) {
-            s_win_behind++;
+        const uint64_t until = (uint64_t)ag_api()->time->us() + 30000ull;
+        while ((uint64_t)ag_api()->time->us() < until && !s_stop) {
+            poll_far_end();
+            (void)tx_drain();
+            aud_drain();
+            ag_delay(2);
         }
 
-        aud_drain();
-        (void)tx_drain();
+        s_frame_no++;
+        s_have_copy = false;
     }
 
     /* Whatever is still queued, before the port stops being ours. */
@@ -1883,10 +2114,59 @@ static ag_err_t rem_text_info(ag_handle_t h, uint16_t *cols, uint16_t *rows)
     return AG_OK;
 }
 
+/*
+ * How long a picture owns the glass after the last band of it went out.
+ *
+ * "Whoever painted last owns the glass" was already the rule here, and it was
+ * only ever applied to the repair sweep.  The console rows went out whatever
+ * was happening - so a game that prints to its own console, which is every
+ * game with a log or a frame counter, sent five rows a second down the wire
+ * beside its picture, and the far end switched to text for each of them.  On
+ * the glass that is not a picture with text over it: it is text, running,
+ * with the picture appearing between the lines.  Which is exactly the report -
+ * "no picture, only text running" - while this end's counters showed 26
+ * rectangles a second going out perfectly well.
+ *
+ * Two seconds, because it has to outlast the gap between two frames of a game
+ * that has slowed down, and be short enough that a game which exits gives the
+ * console its screen back without a wait anybody notices.
+ */
+#define TEXT_YIELDS_US 2000000ull
+
+/* True while the picture has the glass and the console has been going into the
+ * shadow unsent.  What it buys is the repaint below: rows are only sent when
+ * they change, so a console that changed while nobody was showing it would
+ * come back a line at a time over the top of the old picture. */
+static bool s_text_held;
+
+static void send_row_now(uint16_t row);
+
 static void send_row(uint16_t row)
 {
-    s_last_text_us = (uint64_t)ag_api()->time->us();
+    /*
+     * Not while an application is painting.  The text still goes into the
+     * shadow, so the whole console can be put out at once when the picture
+     * stops - which is the next thing that happens here.
+     */
+    const uint64_t now = (uint64_t)ag_api()->time->us();
+    if (s_last_blit_us != 0ull && now - s_last_blit_us < TEXT_YIELDS_US) {
+        s_text_held = true;
+        return;
+    }
+    if (s_text_held) {
+        s_text_held = false;
+        s_last_text_us = now;
+        for (uint32_t r = 0; r < REM_ROWS; r++) {
+            send_row_now((uint16_t)r);
+        }
+        return; /* this row went with the rest of them */
+    }
+    s_last_text_us = now;
+    send_row_now(row);
+}
 
+static void send_row_now(uint16_t row)
+{
     const uint32_t count = s_shadow_cols[row];
     if (count == 0) {
         return;
