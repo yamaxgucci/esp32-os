@@ -2002,105 +2002,100 @@ static uint32_t raw_slices(void)
 static void raw_send_direct(void)
 {
     const uint32_t slices = raw_slices();
-    const uint32_t framed = 5u + 12u + RAW_ROWS * s_fb_w * 2u + 1u;
 
-    uint32_t c = 0;
-    while (c < slices && !s_stop) {
-        /* Step 3.  Whole slices only: a chunk never ends mid-frame, so the
-         * far end never has to know this buffer exists. */
-        const uint64_t f0 = (uint64_t)ag_api()->time->us();
-        uint32_t n = 0;
-        while (c < slices && n + framed <= s_tx_out_sz) {
-            const uint32_t y0 = c * RAW_ROWS;
-            uint32_t rows = RAW_ROWS;
-            if (y0 + rows > s_fb_h) {
-                rows = s_fb_h - y0;
-            }
-            const uint32_t px  = rows * s_fb_w;
-            const uint32_t len = 12u + px * sizeof(uint16_t);
-            uint8_t *const q = s_tx_out + n;
+    /*
+     * The picture goes out of the buffer the game filled, and nowhere else.
+     *
+     * There used to be a second buffer here: the whole frame, framed for the
+     * wire, assembled once per picture.  A hundred and fifty kilobytes, and it
+     * cost more than it was worth twice over - it is another pass over PSRAM,
+     * and on this board it was the straw that stopped Fallout loading at all,
+     * because the game asks for its six megabytes in one piece and the room
+     * left over was less than this buffer.
+     *
+     * So each slice is three writes: seventeen bytes of header out of a small
+     * buffer, the pixels straight from the frame, and the sum.  The sum is
+     * computed a word at a time immediately before, over the same bytes - one
+     * read pass, on this task's own core, and nothing of the game's is touched.
+     */
+    const uint64_t t_fill0 = (uint64_t)ag_api()->time->us();
+    uint32_t       fill_us = 0;
+    uint32_t       port_us = 0;
+    uint32_t       sent = 0;
+    (void)t_fill0;
 
-            q[0] = FR_MAGIC0;
-            q[1] = FR_MAGIC1;
-            q[2] = FR_RAW;
-            q[3] = (uint8_t)len;
-            q[4] = (uint8_t)(len >> 8);
-            put16(q + 5, s_frame_no);
-            put16(q + 7, c);
-            put16(q + 9, slices);
-            put16(q + 11, s_fb_w);
-            put16(q + 13, y0);
-            put16(q + 15, rows);
-            memcpy(q + 17, s_fb + (size_t)y0 * s_fb_w,
-                   (size_t)px * sizeof(uint16_t));
-
-            uint8_t sum = 0;
-            for (uint32_t i = 0; i < len; i++) {
-                sum = (uint8_t)(sum ^ q[5 + i]);
-            }
-            q[5 + len] = sum;
-
-            n += 5u + len + 1u;
-            c++;
-            s_sent_frames++;
+    for (uint32_t c = 0; c < slices && !s_stop; c++) {
+        const uint32_t y0 = c * RAW_ROWS;
+        uint32_t rows = RAW_ROWS;
+        if (y0 + rows > s_fb_h) {
+            rows = s_fb_h - y0;
         }
-        s_t_fill_us += (uint32_t)((uint64_t)ag_api()->time->us() - f0);
+        const uint32_t  px  = rows * s_fb_w;
+        const uint32_t  len = 12u + px * sizeof(uint16_t);
+        const uint8_t  *pix = (const uint8_t *)(s_fb + (size_t)y0 * s_fb_w);
+        uint8_t         hdr[17];
 
-        /* Step 4.  The port reads internal memory and nothing else. */
-        const uint64_t p0 = (uint64_t)ag_api()->time->us();
-        const bool dheld = lock_take(s_drain_lock, UINT32_MAX);
-        uint32_t off = 0;
+        hdr[0] = FR_MAGIC0;
+        hdr[1] = FR_MAGIC1;
+        hdr[2] = FR_RAW;
+        hdr[3] = (uint8_t)len;
+        hdr[4] = (uint8_t)(len >> 8);
+        put16(hdr + 5, s_frame_no);
+        put16(hdr + 7, c);
+        put16(hdr + 9, slices);
+        put16(hdr + 11, s_fb_w);
+        put16(hdr + 13, y0);
+        put16(hdr + 15, rows);
+
         /*
-         * RAW_SILENT=4: the same time, spent asleep instead of writing.  Eight
-         * bits and two of framing is ten bits a byte, so at LINK_BAUD this
-         * chunk would take n*10/baud seconds on the wire, and that is exactly
-         * how long we sit here doing nothing.  The task is busy for the same
-         * stretch of every second and yields at the same points; the only
-         * thing missing is the peripheral.  If the game is still slow, the
-         * UART is innocent and it is the shape of the waiting that costs.
+         * The sum, a word at a time.  Four bytes of PSRAM per read instead of
+         * one is the difference between a pass that costs a couple of
+         * milliseconds and one that costs twenty; the four lanes are folded
+         * together at the end, which is the same answer as a byte-wise xor.
          */
-#if RAW_SILENT == 4
-        /* Outside the lock, not inside it: sleeping with the port held is the
-         * one thing the real write does not do, and holding it silences the
-         * console for the whole nap - which is a difference the control was
-         * not supposed to have. */
-        lock_give(s_drain_lock, dheld);
-        ag_delay((uint32_t)(((uint64_t)n * 10ull * 1000ull) / (uint64_t)LINK_BAUD));
-        (void)lock_take(s_drain_lock, UINT32_MAX);
-        off = n;
-#endif
-        while (off < n && !s_stop) {
-            /*
-             * How big a bite the port is given.  Zero means the whole buffer
-             * in one call; -DPORT_WRITE_MAX=1024 asks it in kilobytes instead,
-             * thirty-two times per buffer.  Same bytes, same order, same
-             * everything else - only the size of the mouthful changes.
-             */
-            uint32_t take = n - off;
-#if PORT_WRITE_MAX
-            if (take > (uint32_t)PORT_WRITE_MAX) {
-                take = (uint32_t)PORT_WRITE_MAX;
-            }
-#endif
-            const int32_t w = io->uart_write(LINK_PORT, s_tx_out + off, take);
-            if (w <= 0) {
-                s_lost += n - off;
-                break;
-            }
-            off += (uint32_t)w;
+        const uint64_t f0 = (uint64_t)ag_api()->time->us();
+        uint32_t acc = 0;
+        for (uint32_t i = 5; i < 17u; i++) {
+            acc ^= (uint32_t)hdr[i] << (((i - 5u) & 3u) * 8u);
         }
+        const uint32_t *w = (const uint32_t *)(const void *)pix;
+        const uint32_t  words = (px * sizeof(uint16_t)) / 4u;
+        for (uint32_t i = 0; i < words; i++) {
+            acc ^= w[i];
+        }
+        uint8_t sum = (uint8_t)(acc ^ (acc >> 8) ^ (acc >> 16) ^ (acc >> 24));
+        fill_us += (uint32_t)((uint64_t)ag_api()->time->us() - f0);
+
+        const uint64_t p0 = (uint64_t)ag_api()->time->us();
+        const bool     dheld = lock_take(s_drain_lock, UINT32_MAX);
+#if RAW_SILENT == 4
+        ag_delay((uint32_t)((((uint64_t)len + 6ull) * 10ull * 1000ull) /
+                            (uint64_t)LINK_BAUD));
+#else
+        (void)io->uart_write(LINK_PORT, hdr, sizeof(hdr));
+        (void)io->uart_write(LINK_PORT, pix, px * sizeof(uint16_t));
+        (void)io->uart_write(LINK_PORT, &sum, 1u);
+#endif
         lock_give(s_drain_lock, dheld);
-        s_t_port_us += (uint32_t)((uint64_t)ag_api()->time->us() - p0);
-        s_sent_bytes += off;
+        port_us += (uint32_t)((uint64_t)ag_api()->time->us() - p0);
+
+        sent += 5u + len + 1u;
+        s_sent_frames++;
         s_chunks++;
 
-        /* The console and the sound still go through the ring; drain them
-         * between chunks, and stand aside so the kernel work the game leans
-         * on keeps being served. */
+        /*
+         * Between slices, not inside one: the console and the sound travel by
+         * the ring and this is where they get their turn, and the kernel work
+         * the game leans on is served on this core.
+         */
         aud_drain();
         (void)tx_drain();
         ag_yield();
     }
+
+    s_t_fill_us += fill_us;
+    s_t_port_us += port_us;
+    s_sent_bytes += sent;
 }
 
 /* Send one slice by number, for a far end that missed it. */
@@ -2138,7 +2133,7 @@ static void raw_stats(void)
     if (s_raw_frames == 0u) {
         return;
     }
-#if RAW_SILENT == 0
+#if RAW_SILENT == 0 && !SEND_ALWAYS
     if (s_last_text_us > s_last_blit_us) {
         return; /* the console has the glass; do not scroll it */
     }
