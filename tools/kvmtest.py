@@ -31,7 +31,9 @@ import sys
 import time
 
 FRAME = 16
-KIND_KBD, KIND_MOUSE, KIND_ABS = 1, 2, 3
+# 2 was a relative mouse, removed when the flash drive took the last endpoint;
+# the far machine has one pointer and it is absolute.
+KIND_KBD, KIND_ABS = 1, 3
 
 RESULTS = []
 
@@ -332,12 +334,18 @@ def run_checks(host, http_port, hid_port, picture=False):
     phone.send("K u 4 0")
     pc.frames(1.0, want=1)
 
-    # The pointer.
+    # The pointer.  A step is added to a remembered position and sent as a
+    # position, because there is no relative interface on the wire any more:
+    # from the middle of the axis, five right and three up.
+    mid = 32767 // 2
     phone.send("M 5 -3 0 1")
     f = pc.frames(2.0, want=1)
-    ok = (len(f) == 1 and f[0][0] == KIND_MOUSE and f[0][1] == 4 and
-          f[0][2] == 1 and f[0][3] == 5 and f[0][4] == 0xFD)
-    note(ok, "a relative move keeps its sign",
+    ok = len(f) == 1 and f[0][0] == KIND_ABS and f[0][1] == 6 and f[0][2] == 1
+    if ok:
+        x = f[0][3] | (f[0][4] << 8)
+        y = f[0][5] | (f[0][6] << 8)
+        ok = x == mid + 5 * 16 and y == mid - 3 * 16
+    note(ok, "a step moves the pointer from where it was",
          "" if ok else repr([x.hex() for x in f]))
 
     phone.send("A 1000 2000 0 0")
@@ -391,7 +399,7 @@ def run_checks(host, http_port, hid_port, picture=False):
     pc.frames(1.5, want=1)
     phone.close()
 
-    f = pc.frames(3.0, want=3)
+    f = pc.frames(3.0, want=2)
     kinds = [x[0] for x in f]
     ok = KIND_KBD in kinds
     if ok:
@@ -399,9 +407,9 @@ def run_checks(host, http_port, hid_port, picture=False):
         ok = kbd_keys(kb) == (0, [])
     note(ok, "a phone that vanishes releases everything",
          "got %s" % repr([x.hex() for x in f]))
-    ok = KIND_MOUSE in kinds and KIND_ABS in kinds
-    note(ok, "and both pointers' buttons with it",
-         "kinds %s" % kinds)
+    ok = KIND_ABS in kinds and all(
+        x[2] == 0 for x in f if x[0] == KIND_ABS)
+    note(ok, "and the pointer's buttons with it", "kinds %s" % kinds)
 
     pc.close()
 

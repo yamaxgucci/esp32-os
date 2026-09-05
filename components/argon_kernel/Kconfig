@@ -587,6 +587,32 @@ menu "ArgonOS"
             only half of one; off is for bringing the keyboard up on its own
             when something about enumeration is being bisected.
 
+    config ARGON_USB_DEVICE_MSC
+        bool "USB device: a flash drive with the agent on it"
+        depends on ARGON_USB_DEVICE
+        default y
+        help
+            A read-write FAT volume in its own flash partition, offered to the
+            far machine as a removable drive.
+
+            It solves the one problem this system cannot solve from its own
+            end: the program that sends that machine's screen back has to get
+            onto a machine that has never seen this device.  With a drive, it
+            is already there - put KVMAGENT.EXE on it once, from any computer,
+            by dragging it across.
+
+            It costs the relative mouse and there was no way round that.  The
+            S3's OTG core has five device IN endpoints; the keyboard, the
+            pointer, the serial pipe's two and this are five.  What is lost is
+            a mouse in a BIOS, which few machines offer and fewer people use; a
+            relative step from a phone's trackpad is turned into a position one
+            layer up and nothing about pointing changes.
+
+            Needs a partition called `usbdisk` (partitions_kvm.csv, which
+            `argon target esp32s3-kvm` selects).  Without one the interface is
+            still published and the drive simply has no media - a state a host
+            understands and a person can see.
+
     config ARGON_CONSOLE_COLS
         int "Console width, characters"
         range 20 240

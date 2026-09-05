@@ -64,18 +64,34 @@ typedef struct {
 } ag_kvm_kbd_t;
 
 /*
- * Everything the far machine currently believes.  The pointer's part of it is
- * here for one reason: the two pointer interfaces have separate button state
- * over there, so a button pressed on the absolute one can only be released on
- * the absolute one, and a release-everything has to know which.
+ * Everything the far machine currently believes.
+ *
+ * The pointer's position is here because the far machine has exactly one
+ * pointer and it is absolute: a report says where the cursor *is*, not how far
+ * it moved, so somebody has to remember where that was.  This is that somebody,
+ * and it is why a trackpad still works with no relative interface on the wire -
+ * a step is added here and sent as a position.
+ *
+ * The caveat is real and worth knowing: if a hand moves a mouse on the far
+ * machine, its cursor and this position disagree, and the next step from the
+ * phone puts the cursor back where this thinks it was.  Every absolute pointer
+ * behaves that way; it is the price of being able to point at a picture.
  */
 typedef struct {
     ag_kvm_kbd_t kbd;
     uint16_t     abs_x;
     uint16_t     abs_y;
-    uint8_t      abs_buttons;
-    uint8_t      rel_buttons;
+    uint8_t      buttons;
 } ag_kvm_state_t;
+
+/*
+ * How far one unit of a relative step moves the pointer.  The axis is
+ * 0..32767 across whatever screen the far machine has, and sixteen units per
+ * step puts that at 2048 - so on a 1920-wide screen a step is about a pixel,
+ * which is what a finger on a trackpad expects.  A shift rather than a divide
+ * because it is on the path of every pointer move.
+ */
+#define AG_KVM_REL_SHIFT 4
 
 void ag_kvm_reset(ag_kvm_state_t *s);
 
@@ -122,10 +138,8 @@ bool ag_kvm_char_usage(char c, uint8_t *usage, uint8_t *mods);
 void ag_kvm_frame(ag_usbhid_frame_t *f, ag_usbhid_kind_t kind,
                   const uint8_t *data, uint8_t len);
 
-/* The three reports, built into a frame. */
+/* The two reports, built into a frame. */
 void ag_kvm_frame_kbd(ag_usbhid_frame_t *f, const ag_kvm_kbd_t *k);
-void ag_kvm_frame_mouse(ag_usbhid_frame_t *f, uint8_t buttons, int dx, int dy,
-                        int wheel);
 void ag_kvm_frame_abs(ag_usbhid_frame_t *f, uint8_t buttons, int x, int y,
                       int wheel);
 
@@ -161,9 +175,14 @@ int ag_kvm_type_frames(ag_kvm_kbd_t *k, const char *text, size_t len,
  *
  *   K d <usage> <mods>              a key went down, with the modifiers held
  *   K u <usage> <mods>              and came up
- *   M <dx> <dy> <wheel> <buttons>   a relative mouse step
- *   A <x> <y> <wheel> <buttons>     an absolute position, 0..32767 each way
+ *   M <dx> <dy> <wheel> <buttons>   a step: added to the remembered position
+ *   A <x> <y> <wheel> <buttons>     a position outright, 0..32767 each way
  *   R                               release everything: every key, every button
+ *
+ * Both pointer lines produce the same report, because the far machine has one
+ * pointer and it is absolute.  `M` is kept because a trackpad produces steps
+ * and a browser has no idea how big the far screen is; `A` is what a finger on
+ * a picture of that screen produces, where it does.
  *
  * `mods` is the whole modifier byte rather than a change to it, because that is
  * what the browser gives us - a keydown event carries the state of shift, ctrl,

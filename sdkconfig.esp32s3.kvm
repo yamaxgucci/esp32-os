@@ -25,10 +25,13 @@
 CONFIG_ARGON_USB_HOST=n
 CONFIG_ARGON_USB_DEVICE=y
 
-# Three HID interfaces: boot keyboard, boot mouse, absolute pointer.  TinyUSB
-# sizes its class table from this, so it is a build-time number and it has to
-# agree with what components/argon_port/idf/src/usbdev_hw.c publishes.
-CONFIG_TINYUSB_HID_COUNT=3
+# Two HID interfaces: boot keyboard and absolute pointer.  TinyUSB sizes its
+# class table from this, so it is a build-time number and it has to agree with
+# what components/argon_port/idf/src/usbdev_hw.c publishes.
+#
+# Two and not three because of the endpoint budget below: the relative boot
+# mouse was the interface that had to go to make room for the drive.
+CONFIG_TINYUSB_HID_COUNT=2
 
 # The serial pipe beside the keyboard: on the far machine it is a COM port with
 # no driver to install, and it is the only way a picture can come back - USB has
@@ -45,9 +48,18 @@ CONFIG_TINYUSB_CDC_RX_BUFSIZE=4096
 CONFIG_TINYUSB_CDC_TX_BUFSIZE=1024
 CONFIG_TINYUSB_CDC_EP_BUFSIZE=2048
 
-# No mass storage.  It would be the tidy way to put the agent on the far machine
-# - a read-only flash drive with one program on it - and it does not fit: the
-# S3 has five device IN endpoints and the keyboard, the mouse, the tablet and
-# the serial pipe are all five.  Adding a disk means giving up the relative
-# mouse, which is a real trade and a later decision.  See docs/14-usb-kvm.md.
-CONFIG_TINYUSB_MSC_ENABLED=n
+# The drive the agent lives on: a FAT volume in the `usbdisk` partition, which
+# the far machine mounts like any memory stick.  This is what makes the whole
+# thing self-contained - the program that machine needs is on the device before
+# it is ever plugged in.
+CONFIG_TINYUSB_MSC_ENABLED=y
+
+# The partition table with `usbdisk` in it.  Half a megabyte off the end of
+# appfs; see partitions_kvm.csv.
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_kvm.csv"
+
+# Five IN endpoints and one kilobyte of FIFO, in words: 52 receive, 16 for EP0,
+# 16 each for the keyboard, the pointer and the CDC notification, and the rest
+# shared between the two bulk endpoints.  That is the whole budget and there is
+# no sixth interface to be had - see docs/14-usb-kvm.md.
+CONFIG_TINYUSB_MSC_BUFSIZE=512

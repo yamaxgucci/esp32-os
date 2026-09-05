@@ -1,0 +1,26 @@
+# ArgonOS partition table - 8 MB flash, with the flash drive the far machine
+# sees when this board is plugged into it.
+#
+#   argon target esp32s3-kvm
+#
+# The same layout as partitions.csv with half a megabyte taken off the end of
+# appfs and given to `usbdisk`: a FAT volume that is not ArgonOS's filesystem
+# at all.  It exists to be the removable drive the computer on the other end of
+# the cable mounts, and the only thing that ever needs to be on it is the agent
+# that sends that computer's screen back (tools/kvmagent).
+#
+# Why a partition and not a file: mass storage is a block device, the far
+# machine writes to it, and the whole point is that the program is *on the
+# device* before it is plugged into a machine that has never seen it.  Put
+# KVMAGENT.EXE there once, from any computer, by dragging it onto the drive.
+#
+# appfs loses 512 KB and keeps 3.4 MB, which is more relocated .AXE code than
+# anything in this tree comes close to using.
+#
+# Name,     Type, SubType,  Offset,   Size,     Flags
+nvs,        data, nvs,      0x9000,   0x6000,
+phy_init,   data, phy,      0xf000,   0x1000,
+factory,    app,  factory,  0x10000,  0x300000,
+sysfs,      data, littlefs, 0x310000, 0x100000,
+appfs,      data, 0x40,     0x410000, 0x370000,
+usbdisk,    data, fat,      0x780000, 0x80000,

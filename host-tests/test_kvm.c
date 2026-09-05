@@ -313,26 +313,61 @@ static void test_parse_keys(void)
     AG_CHECK_INT(f[0].data[3], 6);
 }
 
+/*
+ * A step, on a wire that carries no relative interface.
+ *
+ * The far machine has one pointer and it is absolute, so `M` is added to a
+ * remembered position here rather than sent as a step.  What must not happen -
+ * and is the whole reason this is tested rather than assumed - is a step that
+ * silently does nothing because nobody remembered where the cursor was.
+ */
+static void test_parse_step(void)
+{
+    ag_kvm_state_t    st;
+    ag_usbhid_frame_t f[4];
+
+    ag_kvm_reset(&st);
+    const int mid = AG_USBHID_ABS_MAX / 2;
+
+    AG_CHECK_INT(parse(&st, "M -3 7 0 1", f, 4), 1);
+    AG_CHECK_INT(f[0].kind, AG_USBHID_ABS);
+    AG_CHECK_INT(f[0].len, AG_USBHID_ABS_LEN);
+    AG_CHECK_INT(f[0].data[0], 1);
+    {
+        const int x = f[0].data[1] | (f[0].data[2] << 8);
+        const int y = f[0].data[3] | (f[0].data[4] << 8);
+        AG_CHECK_INT(x, mid + (-3 << AG_KVM_REL_SHIFT));
+        AG_CHECK_INT(y, mid + (7 << AG_KVM_REL_SHIFT));
+    }
+
+    /* Steps accumulate; that is what makes a trackpad a trackpad. */
+    AG_CHECK_INT(parse(&st, "M 1 1 0 0", f, 4), 1);
+    {
+        const int x = f[0].data[1] | (f[0].data[2] << 8);
+        AG_CHECK_INT(x, mid + (-3 << AG_KVM_REL_SHIFT) +
+                            (1 << AG_KVM_REL_SHIFT));
+    }
+
+    /* A swipe off the edge stops at the edge rather than wrapping round to
+     * the other side, which is what an unclamped sum looks like. */
+    AG_CHECK_INT(parse(&st, "M 99999 99999 0 0", f, 4), 1);
+    AG_CHECK_INT(f[0].data[1], 0xFF);
+    AG_CHECK_INT(f[0].data[2], 0x7F);
+    AG_CHECK_INT(f[0].data[3], 0xFF);
+    AG_CHECK_INT(f[0].data[4], 0x7F);
+    AG_CHECK_INT(parse(&st, "M -99999 -99999 0 0", f, 4), 1);
+    AG_CHECK_INT(f[0].data[1], 0);
+    AG_CHECK_INT(f[0].data[2], 0);
+    AG_CHECK_INT(f[0].data[3], 0);
+    AG_CHECK_INT(f[0].data[4], 0);
+}
+
 static void test_parse_pointer(void)
 {
     ag_kvm_state_t    st;
     ag_usbhid_frame_t f[4];
 
     ag_kvm_reset(&st);
-
-    AG_CHECK_INT(parse(&st, "M -3 7 0 1", f, 4), 1);
-    AG_CHECK_INT(f[0].kind, AG_USBHID_MOUSE);
-    AG_CHECK_INT(f[0].len, AG_USBHID_MOUSE_LEN);
-    AG_CHECK_INT(f[0].data[0], 1);
-    AG_CHECK_INT((int8_t)f[0].data[1], -3);
-    AG_CHECK_INT((int8_t)f[0].data[2], 7);
-    AG_CHECK_INT((int8_t)f[0].data[3], 0);
-
-    /* A swipe longer than a signed byte is clamped rather than wrapped: a
-     * cursor that jumps backwards is what wrapping looks like. */
-    AG_CHECK_INT(parse(&st, "M 900 -900 0 0", f, 4), 1);
-    AG_CHECK_INT((int8_t)f[0].data[1], 127);
-    AG_CHECK_INT((int8_t)f[0].data[2], -127);
 
     /* Absolute: little-endian, and clamped to the axis. */
     AG_CHECK_INT(parse(&st, "A 300 32767 0 0", f, 4), 1);
@@ -349,9 +384,12 @@ static void test_parse_pointer(void)
     AG_CHECK_INT(f[0].data[3], 0);
     AG_CHECK_INT(f[0].data[4], 0);
 
-    /* The wheel is signed and rides on the same report. */
+    /* The wheel is signed and rides on the same report, whichever line
+     * produced it. */
     AG_CHECK_INT(parse(&st, "M 0 0 -1 0", f, 4), 1);
-    AG_CHECK_INT((int8_t)f[0].data[3], -1);
+    AG_CHECK_INT((int8_t)f[0].data[5], -1);
+    AG_CHECK_INT(parse(&st, "A 10 10 3 0", f, 4), 1);
+    AG_CHECK_INT((int8_t)f[0].data[5], 3);
 }
 
 static void test_parse_release(void)
@@ -362,28 +400,25 @@ static void test_parse_release(void)
     ag_kvm_reset(&st);
     AG_CHECK_INT(parse(&st, "K d 4 2", f, 4), 1);
     AG_CHECK_INT(parse(&st, "A 1000 2000 0 1", f, 4), 1);
-    AG_CHECK_INT(parse(&st, "M 0 0 0 2", f, 4), 1);
 
-    /* Release everything: one report per interface, because the far machine
-     * keeps the two pointers' buttons apart. */
+    /* Release everything: one report per interface - the keyboard and the one
+     * pointer the far machine has. */
     const int n = parse(&st, "R", f, 4);
-    AG_CHECK_INT(n, 3);
+    AG_CHECK_INT(n, 2);
     AG_CHECK_INT(f[0].kind, AG_USBHID_KBD);
     AG_CHECK_INT(f[0].data[0], 0);
     AG_CHECK_INT(f[0].data[2], 0);
-    AG_CHECK_INT(f[1].kind, AG_USBHID_MOUSE);
+    AG_CHECK_INT(f[1].kind, AG_USBHID_ABS);
     AG_CHECK_INT(f[1].data[0], 0);
-    AG_CHECK_INT(f[2].kind, AG_USBHID_ABS);
-    AG_CHECK_INT(f[2].data[0], 0);
     /* Released where it stands: the position is not disturbed by letting go. */
-    AG_CHECK_INT(f[2].data[1], 1000 & 0xFF);
-    AG_CHECK_INT(f[2].data[2], 1000 >> 8);
-    AG_CHECK_INT(f[2].data[3], 2000 & 0xFF);
-    AG_CHECK_INT(f[2].data[4], 2000 >> 8);
+    AG_CHECK_INT(f[1].data[1], 1000 & 0xFF);
+    AG_CHECK_INT(f[1].data[2], 1000 >> 8);
+    AG_CHECK_INT(f[1].data[3], 2000 & 0xFF);
+    AG_CHECK_INT(f[1].data[4], 2000 >> 8);
 
-    /* Three frames or nothing: a caller with room for two would otherwise be
+    /* Both frames or neither: a caller with room for one would otherwise be
      * told a release happened that did not. */
-    AG_CHECK_INT(parse(&st, "R", f, 2), -AG_ENOSPC);
+    AG_CHECK_INT(parse(&st, "R", f, 1), -AG_ENOSPC);
 }
 
 static void test_parse_junk(void)
@@ -421,13 +456,16 @@ static void test_frame_layout(void)
     AG_CHECK_INT(sizeof(ag_usbhid_frame_t), AG_USBHID_FRAME);
     AG_CHECK_INT(AG_USBHID_DATA_MAX + 2, AG_USBHID_FRAME);
     AG_CHECK(AG_USBHID_KBD_LEN <= AG_USBHID_DATA_MAX);
-    AG_CHECK(AG_USBHID_MOUSE_LEN <= AG_USBHID_DATA_MAX);
     AG_CHECK(AG_USBHID_ABS_LEN <= AG_USBHID_DATA_MAX);
+    /* Two is a hole where the relative mouse was, not a spare number: a frame
+     * from something built earlier must not become a pointer report. */
+    AG_CHECK_INT(AG_USBHID_KBD, 1);
+    AG_CHECK_INT(AG_USBHID_ABS, 3);
 
     ag_usbhid_frame_t f;
     const uint8_t     data[3] = {1, 2, 3};
-    ag_kvm_frame(&f, AG_USBHID_MOUSE, data, 3);
-    AG_CHECK_INT(f.kind, AG_USBHID_MOUSE);
+    ag_kvm_frame(&f, AG_USBHID_ABS, data, 3);
+    AG_CHECK_INT(f.kind, AG_USBHID_ABS);
     AG_CHECK_INT(f.len, 3);
     AG_CHECK_INT(f.data[0], 1);
     AG_CHECK_INT(f.data[3], 0); /* the rest of the frame is zeroed */
@@ -442,6 +480,7 @@ void run_kvm_tests(void)
     test_typing();
     test_typing_over_held_keys();
     test_parse_keys();
+    test_parse_step();
     test_parse_pointer();
     test_parse_release();
     test_parse_junk();

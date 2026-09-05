@@ -223,7 +223,7 @@ void ag_kvm_frame_kbd(ag_usbhid_frame_t *f, const ag_kvm_kbd_t *k)
     ag_kvm_frame(f, AG_USBHID_KBD, rep, (uint8_t)AG_USBHID_KBD_LEN);
 }
 
-/* A relative axis is one signed byte, so a long swipe arrives as several. */
+/* The wheel is one signed byte, so a long flick arrives as several. */
 static int8_t clamp8(int v)
 {
     if (v > 127) {
@@ -244,17 +244,6 @@ static uint16_t clamp_abs(int v)
         return (uint16_t)AG_USBHID_ABS_MAX;
     }
     return (uint16_t)v;
-}
-
-void ag_kvm_frame_mouse(ag_usbhid_frame_t *f, uint8_t buttons, int dx, int dy,
-                        int wheel)
-{
-    uint8_t rep[AG_USBHID_MOUSE_LEN];
-    rep[0] = (uint8_t)(buttons & 0x07u);
-    rep[1] = (uint8_t)clamp8(dx);
-    rep[2] = (uint8_t)clamp8(dy);
-    rep[3] = (uint8_t)clamp8(wheel);
-    ag_kvm_frame(f, AG_USBHID_MOUSE, rep, (uint8_t)AG_USBHID_MOUSE_LEN);
 }
 
 void ag_kvm_frame_abs(ag_usbhid_frame_t *f, uint8_t buttons, int x, int y,
@@ -431,13 +420,21 @@ int ag_kvm_parse(const char *line, size_t len, ag_kvm_state_t *st,
     }
 
     case 'M': {
+        /*
+         * A step, on a wire that carries no relative interface.  It is added
+         * to the position this end remembers and sent as a position, which is
+         * the only kind of pointer report the far machine has - see the note
+         * on ag_kvm_state_t.
+         */
         int dx = 0, dy = 0, wheel = 0, buttons = 0;
         if (!scan_int(&s, &dx) || !scan_int(&s, &dy) ||
             !scan_int(&s, &wheel) || !scan_int(&s, &buttons)) {
             return -AG_EINVAL;
         }
-        st->rel_buttons = (uint8_t)(buttons & 0x07);
-        ag_kvm_frame_mouse(&out[0], st->rel_buttons, dx, dy, wheel);
+        st->abs_x = clamp_abs((int)st->abs_x + (dx << AG_KVM_REL_SHIFT));
+        st->abs_y = clamp_abs((int)st->abs_y + (dy << AG_KVM_REL_SHIFT));
+        st->buttons = (uint8_t)(buttons & 0x07);
+        ag_kvm_frame_abs(&out[0], st->buttons, st->abs_x, st->abs_y, wheel);
         return 1;
     }
 
@@ -449,28 +446,25 @@ int ag_kvm_parse(const char *line, size_t len, ag_kvm_state_t *st,
         }
         st->abs_x = clamp_abs(x);
         st->abs_y = clamp_abs(y);
-        st->abs_buttons = (uint8_t)(buttons & 0x07);
-        ag_kvm_frame_abs(&out[0], st->abs_buttons, st->abs_x, st->abs_y, wheel);
+        st->buttons = (uint8_t)(buttons & 0x07);
+        ag_kvm_frame_abs(&out[0], st->buttons, st->abs_x, st->abs_y, wheel);
         return 1;
     }
 
     case 'R': {
-        if (max < 3) {
+        if (max < 2) {
             return -AG_ENOSPC;
         }
         ag_kvm_kbd_reset(&st->kbd);
         ag_kvm_frame_kbd(&out[0], &st->kbd);
-        st->rel_buttons = 0;
-        ag_kvm_frame_mouse(&out[1], 0, 0, 0, 0);
         /*
-         * The absolute pointer is released where it stands.  Sending it to a
-         * corner would be a visible jump for a release nobody asked to see, and
-         * the position is state the far machine keeps whether we mention it or
-         * not.
+         * The pointer is released where it stands.  Sending it to a corner
+         * would be a visible jump for a release nobody asked to see, and the
+         * position is state the far machine keeps whether we mention it or not.
          */
-        st->abs_buttons = 0;
-        ag_kvm_frame_abs(&out[2], 0, st->abs_x, st->abs_y, 0);
-        return 3;
+        st->buttons = 0;
+        ag_kvm_frame_abs(&out[1], 0, st->abs_x, st->abs_y, 0);
+        return 2;
     }
 
     default:

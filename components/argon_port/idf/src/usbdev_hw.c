@@ -55,12 +55,32 @@
 #include "tinyusb.h"
 #include "tinyusb_default_config.h"
 
+#if AG_PORT_HAS_USB_MSC
+#include "esp_partition.h"
+#include "tinyusb_msc.h"
+#include "wear_levelling.h"
+#endif
+
 static const char *TAG = "usbdev";
 
-/* Instance numbers, in the order the configuration descriptor lists them. */
+/*
+ * Instance numbers, in the order the configuration descriptor lists them.
+ *
+ * There are two HID interfaces and not three.  The relative boot mouse that
+ * used to sit between them is gone, and it is worth writing down why, because
+ * it is the constraint the whole shape of this device is cut to: the S3's OTG
+ * core has five device IN endpoints (soc/usb_dwc_cfg.h, OTG_NUM_IN_EPS 5) and
+ * that is all.  The keyboard, the pointer, the serial pipe's notification and
+ * bulk, and mass storage are five.  A sixth interface does not exist to be had.
+ *
+ * What was given up is a mouse in a BIOS - few have one and fewer use it.  What
+ * it bought is the flash drive, which is how the program the far machine needs
+ * gets onto a machine that has never seen this device before: it is already on
+ * it.  A relative step is not lost either; it becomes a position, one layer up
+ * (apps/common/kvm), which is what a phone's trackpad wanted anyway.
+ */
 #define ITF_KBD 0
-#define ITF_MOUSE 1
-#define ITF_ABS 2
+#define ITF_ABS 1
 
 #if AG_PORT_HAS_USB_CDC
 /*
@@ -69,10 +89,17 @@ static const char *TAG = "usbdev";
  * Descriptor and a device class of MISC/COMMON/IAD below: without that, a host
  * has no way to know the two belong together.
  */
-#define ITF_CDC 3
-#define ITF_COUNT 5
+#define ITF_CDC 2
+#define ITF_AFTER_CDC 4
 #else
-#define ITF_COUNT 3
+#define ITF_AFTER_CDC 2
+#endif
+
+#if AG_PORT_HAS_USB_MSC
+#define ITF_MSC ITF_AFTER_CDC
+#define ITF_COUNT (ITF_AFTER_CDC + 1)
+#else
+#define ITF_COUNT ITF_AFTER_CDC
 #endif
 
 /* ------------------------------------------------------------------------ */
@@ -120,41 +147,6 @@ static const uint8_t k_desc_kbd[] = {
     0x2A, 0xFF, 0x00, /*   Usage Maximum (255)                               */
     0x81, 0x00,       /*   Input (Data,Ary)       - bytes 2..7, six slots    */
     0xC0,             /* End Collection                                      */
-};
-
-/*
- * The boot mouse: buttons, then three signed bytes.  A BIOS reads the first
- * three and stops, which is exactly what the boot protocol promises; a full
- * operating system reads this descriptor and gets the wheel as well.
- */
-static const uint8_t k_desc_mouse[] = {
-    0x05, 0x01, /* Usage Page (Generic Desktop)                              */
-    0x09, 0x02, /* Usage (Mouse)                                             */
-    0xA1, 0x01, /* Collection (Application)                                  */
-    0x09, 0x01, /*   Usage (Pointer)                                        */
-    0xA1, 0x00, /*   Collection (Physical)                                  */
-    0x05, 0x09, /*     Usage Page (Button)                                  */
-    0x19, 0x01, /*     Usage Minimum (Button 1)                             */
-    0x29, 0x03, /*     Usage Maximum (Button 3)                             */
-    0x15, 0x00, /*     Logical Minimum (0)                                  */
-    0x25, 0x01, /*     Logical Maximum (1)                                  */
-    0x95, 0x03, /*     Report Count (3)                                     */
-    0x75, 0x01, /*     Report Size (1)                                      */
-    0x81, 0x02, /*     Input (Data,Var,Abs) - three buttons                 */
-    0x95, 0x01, /*     Report Count (1)                                     */
-    0x75, 0x05, /*     Report Size (5)                                      */
-    0x81, 0x03, /*     Input (Cnst,Var,Abs) - padding to one byte           */
-    0x05, 0x01, /*     Usage Page (Generic Desktop)                         */
-    0x09, 0x30, /*     Usage (X)                                            */
-    0x09, 0x31, /*     Usage (Y)                                            */
-    0x09, 0x38, /*     Usage (Wheel)                                        */
-    0x15, 0x81, /*     Logical Minimum (-127)                               */
-    0x25, 0x7F, /*     Logical Maximum (127)                                */
-    0x75, 0x08, /*     Report Size (8)                                      */
-    0x95, 0x03, /*     Report Count (3)                                     */
-    0x81, 0x06, /*     Input (Data,Var,Rel) - dx, dy, wheel                 */
-    0xC0,       /*   End Collection                                          */
-    0xC0,       /* End Collection                                            */
 };
 
 /*
@@ -256,12 +248,19 @@ static const char *k_desc_str[] = {
     "ArgonOS HID",              /* 2: product                                 */
     "0001",                     /* 3: serial                                  */
     "Keyboard",                 /* 4: interface 0                             */
-    "Mouse",                    /* 5: interface 1                             */
-    "Tablet",                   /* 6: interface 2                             */
+    "Pointer",                  /* 5: interface 1                             */
 #if AG_PORT_HAS_USB_CDC
-    "ArgonOS screen link",      /* 7: the serial pipe                         */
+    "ArgonOS screen link",      /* 6: the serial pipe                         */
+#endif
+#if AG_PORT_HAS_USB_MSC
+    "ArgonOS disk",             /* 7: the drive the agent lives on            */
 #endif
 };
+
+#define STR_KBD 4
+#define STR_ABS 5
+#define STR_CDC 6
+#define STR_MSC 7
 
 /*
  * The endpoint budget, which is the tightest thing in this file and the reason
@@ -281,41 +280,55 @@ static const char *k_desc_str[] = {
  * is the one that carries the picture and the only one throughput depends on.
  */
 #if AG_PORT_HAS_USB_CDC
-#define CFG_TOTAL_LEN                                                            (TUD_CONFIG_DESC_LEN + 3 * TUD_HID_DESC_LEN + TUD_CDC_DESC_LEN)
+#define CDC_DESC_BYTES TUD_CDC_DESC_LEN
 #else
-#define CFG_TOTAL_LEN (TUD_CONFIG_DESC_LEN + 3 * TUD_HID_DESC_LEN)
+#define CDC_DESC_BYTES 0
 #endif
+#if AG_PORT_HAS_USB_MSC
+#define MSC_DESC_BYTES TUD_MSC_DESC_LEN
+#else
+#define MSC_DESC_BYTES 0
+#endif
+
+#define CFG_TOTAL_LEN                                                        \
+    (TUD_CONFIG_DESC_LEN + 2 * TUD_HID_DESC_LEN + CDC_DESC_BYTES +           \
+     MSC_DESC_BYTES)
 
 /* One interrupt IN endpoint each, polled every millisecond - the fastest a
  * full-speed interrupt endpoint is allowed to be asked, and what every keyboard
  * on a desk asks for. */
 #define EP_KBD 0x81
-#define EP_MOUSE 0x82
-#define EP_ABS 0x83
+#define EP_ABS 0x82
 #define EP_SIZE 16
 #define EP_INTERVAL_MS 1
 
 /* The serial pipe: a notification endpoint nobody uses (CDC insists on one)
  * and a bulk pair.  Sixty-four bytes is the largest a full-speed bulk endpoint
  * may be, and the whole picture goes through it. */
-#define EP_CDC_NOTIF 0x84
-#define EP_CDC_OUT 0x05
-#define EP_CDC_IN 0x85
+#define EP_CDC_NOTIF 0x83
+#define EP_CDC_OUT 0x04
+#define EP_CDC_IN 0x84
 #define EP_CDC_NOTIF_SIZE 8
 #define EP_CDC_SIZE 64
+
+/* The drive.  The fifth and last IN endpoint there is. */
+#define EP_MSC_OUT 0x05
+#define EP_MSC_IN 0x85
+#define EP_MSC_SIZE 64
 
 static const uint8_t k_desc_cfg[] = {
     TUD_CONFIG_DESCRIPTOR(1, ITF_COUNT, 0, CFG_TOTAL_LEN, 0x00, 100),
 
-    TUD_HID_DESCRIPTOR(ITF_KBD, 4, HID_ITF_PROTOCOL_KEYBOARD,
+    TUD_HID_DESCRIPTOR(ITF_KBD, STR_KBD, HID_ITF_PROTOCOL_KEYBOARD,
                        sizeof(k_desc_kbd), EP_KBD, EP_SIZE, EP_INTERVAL_MS),
-    TUD_HID_DESCRIPTOR(ITF_MOUSE, 5, HID_ITF_PROTOCOL_MOUSE,
-                       sizeof(k_desc_mouse), EP_MOUSE, EP_SIZE, EP_INTERVAL_MS),
-    TUD_HID_DESCRIPTOR(ITF_ABS, 6, HID_ITF_PROTOCOL_NONE, sizeof(k_desc_abs),
-                       EP_ABS, EP_SIZE, EP_INTERVAL_MS),
+    TUD_HID_DESCRIPTOR(ITF_ABS, STR_ABS, HID_ITF_PROTOCOL_NONE,
+                       sizeof(k_desc_abs), EP_ABS, EP_SIZE, EP_INTERVAL_MS),
 #if AG_PORT_HAS_USB_CDC
-    TUD_CDC_DESCRIPTOR(ITF_CDC, 7, EP_CDC_NOTIF, EP_CDC_NOTIF_SIZE, EP_CDC_OUT,
-                       EP_CDC_IN, EP_CDC_SIZE),
+    TUD_CDC_DESCRIPTOR(ITF_CDC, STR_CDC, EP_CDC_NOTIF, EP_CDC_NOTIF_SIZE,
+                       EP_CDC_OUT, EP_CDC_IN, EP_CDC_SIZE),
+#endif
+#if AG_PORT_HAS_USB_MSC
+    TUD_MSC_DESCRIPTOR(ITF_MSC, STR_MSC, EP_MSC_OUT, EP_MSC_IN, EP_MSC_SIZE),
 #endif
 };
 
@@ -347,8 +360,6 @@ uint8_t const *tud_hid_descriptor_report_cb(uint8_t instance)
     switch (instance) {
     case ITF_KBD:
         return k_desc_kbd;
-    case ITF_MOUSE:
-        return k_desc_mouse;
     case ITF_ABS:
         return k_desc_abs;
     default:
@@ -394,6 +405,74 @@ void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id,
 /* The port contract                                                        */
 /* ------------------------------------------------------------------------ */
 
+#if AG_PORT_HAS_USB_MSC
+
+static wl_handle_t s_wl = WL_INVALID_HANDLE;
+
+/*
+ * The drive the far machine mounts.  It is a FAT volume in its own flash
+ * partition (partitions_kvm.csv, `usbdisk`) and it is deliberately not any of
+ * ArgonOS's own filesystems: it belongs to whoever plugs the cable in.
+ *
+ * What it is for is the one thing that cannot be solved from this end - getting
+ * the agent onto a computer that has never seen this device.  Drag KVMAGENT.EXE
+ * onto the drive once, from any machine, and from then on the program is on the
+ * device rather than being something you have to already have.
+ *
+ * Ownership is exclusive, and that is mass storage rather than a decision here:
+ * a block device with two writers is a corrupted filesystem.  While the far
+ * machine has it, this board does not.
+ */
+static void msc_start(void)
+{
+    const esp_partition_t *part = esp_partition_find_first(
+        ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_FAT, "usbdisk");
+    if (part == NULL) {
+        ESP_LOGW(TAG, "no 'usbdisk' partition: the drive will have no media");
+        return;
+    }
+
+    esp_err_t err = wl_mount(part, &s_wl);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "wl_mount(usbdisk): %s", esp_err_to_name(err));
+        s_wl = WL_INVALID_HANDLE;
+        return;
+    }
+
+    const tinyusb_msc_driver_config_t drv = {
+        .user_flags = {.val = 0},
+        .callback = NULL,
+        .callback_arg = NULL,
+    };
+    err = tinyusb_msc_install_driver(&drv);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "tinyusb_msc_install_driver: %s", esp_err_to_name(err));
+        return;
+    }
+
+    tinyusb_msc_storage_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.medium.wl_handle = s_wl;
+    cfg.mount_point = TINYUSB_MSC_STORAGE_MOUNT_USB;
+    /*
+     * A blank partition is formatted rather than refused.  The first time a
+     * board is flashed the drive has never held a filesystem, and a computer
+     * that is offered unformatted media asks whether to format it - which is a
+     * question nobody should have to answer about a device that came this way.
+     */
+    cfg.fat_fs.do_not_format = false;
+
+    err = tinyusb_msc_new_storage_spiflash(&cfg, NULL);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "usbdisk storage: %s", esp_err_to_name(err));
+        return;
+    }
+    ESP_LOGI(TAG, "usbdisk: %u KB, the drive the far machine mounts",
+             (unsigned)(part->size / 1024u));
+}
+
+#endif /* AG_PORT_HAS_USB_MSC */
+
 ag_err_t ag_port_usbdev_start(void)
 {
     if (s_running) {
@@ -405,6 +484,12 @@ ag_err_t ag_port_usbdev_start(void)
             return -AG_ENOMEM;
         }
     }
+
+#if AG_PORT_HAS_USB_MSC
+    /* Before the device stack: the class driver has to be there when the far
+     * machine asks what this is. */
+    msc_start();
+#endif
 
     tinyusb_config_t cfg = TINYUSB_DEFAULT_CONFIG();
     cfg.descriptor.device = &k_desc_device;
@@ -422,8 +507,10 @@ ag_err_t ag_port_usbdev_start(void)
     s_dropped = 0;
     s_leds = 0;
     s_running = true;
-    ESP_LOGI(TAG, "attached as a HID keyboard and mouse (%04x:%04x)",
-             ARGON_USB_VID, ARGON_USB_PID);
+    ESP_LOGI(TAG, "attached as a keyboard, a pointer%s%s (%04x:%04x)",
+             AG_PORT_HAS_USB_CDC ? ", a serial port" : "",
+             AG_PORT_HAS_USB_MSC ? " and a drive" : "", ARGON_USB_VID,
+             ARGON_USB_PID);
     return AG_OK;
 }
 
@@ -473,15 +560,13 @@ ag_err_t ag_port_usbdev_send(ag_usbhid_kind_t kind, const uint8_t *rep,
         instance = ITF_KBD;
         want = AG_USBHID_KBD_LEN;
         break;
-    case AG_USBHID_MOUSE:
-        instance = ITF_MOUSE;
-        want = AG_USBHID_MOUSE_LEN;
-        break;
     case AG_USBHID_ABS:
         instance = ITF_ABS;
         want = AG_USBHID_ABS_LEN;
         break;
     default:
+        /* Including 2, which was the relative mouse: a frame built by
+         * something older is refused rather than pointed somewhere else. */
         return -AG_EINVAL;
     }
     if (rep == NULL || len != want) {

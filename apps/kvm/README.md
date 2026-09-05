@@ -70,6 +70,12 @@ the S3 has one OTG controller behind one internal PHY. On the CAM board the
 console stays on the CH343 bridge and nothing collides; on a board whose only
 socket is the native one (the S3-Zero) this image takes the console with it.
 
+The far machine sees five interfaces: a boot keyboard, an absolute pointer, a
+serial port and a flash drive. That is every IN endpoint the S3 has, which is
+why there is no relative mouse — the drive was worth more, because it is what
+puts the agent on a computer that has never seen this device. Drag
+`KVMAGENT.EXE` onto the drive once, from anywhere.
+
 In the emulator there is no OTG peripheral at all, so the devices come from
 drivers instead:
 

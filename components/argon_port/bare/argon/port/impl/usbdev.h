@@ -16,4 +16,6 @@
 
 #define AG_PORT_HAS_USB_CDC 0
 
+#define AG_PORT_HAS_USB_MSC 0
+
 #endif /* ARGON_PORT_IMPL_USBDEV_H */

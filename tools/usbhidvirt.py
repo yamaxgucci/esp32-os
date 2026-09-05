@@ -23,7 +23,7 @@ dumps.
 
 Frame on the wire (16 bytes, the ABI's ag_usbhid_frame_t):
 
-    [0]    kind: 1 keyboard, 2 relative mouse, 3 absolute pointer
+    [0]    kind: 1 keyboard, 3 absolute pointer (2 was a relative mouse)
     [1]    length of the report
     [2..]  the report itself
 
@@ -36,7 +36,9 @@ import sys
 import time
 
 FRAME = 16
-KIND_KBD, KIND_MOUSE, KIND_ABS = 1, 2, 3
+# 2 was a relative mouse and is gone: the far machine has one pointer and it
+# is absolute.  See docs/14-usb-kvm.md on the endpoint budget that decided it.
+KIND_KBD, KIND_ABS = 1, 3
 
 MODS = [
     (0x01, "Ctrl"),
@@ -110,7 +112,7 @@ class Watcher:
         self.held = set()
         self.mods = 0
         self.typed = []
-        self.counts = {KIND_KBD: 0, KIND_MOUSE: 0, KIND_ABS: 0}
+        self.counts = {KIND_KBD: 0, KIND_ABS: 0}
         self.buttons = 0
 
     def say(self, text):
@@ -140,14 +142,12 @@ class Watcher:
             self.say("  key  %s up" % key_name(u))
         self.held = keys
 
-    def mouse(self, rep):
-        dx = rep[1] - 256 if rep[1] > 127 else rep[1]
-        dy = rep[2] - 256 if rep[2] > 127 else rep[2]
-        wheel = rep[3] - 256 if rep[3] > 127 else rep[3]
+    def absolute(self, rep):
+        x = rep[1] | (rep[2] << 8)
+        y = rep[3] | (rep[4] << 8)
+        wheel = rep[5] - 256 if rep[5] > 127 else rep[5]
         btn = rep[0]
-        parts = []
-        if dx or dy:
-            parts.append("move %+d %+d" % (dx, dy))
+        parts = ["at %d,%d" % (x, y)]
         if wheel:
             parts.append("wheel %+d" % wheel)
         if btn != self.buttons:
@@ -157,14 +157,7 @@ class Watcher:
                 elif (self.buttons & bit) and not (btn & bit):
                     parts.append("%s up" % name)
             self.buttons = btn
-        self.say("  ptr  %s" % (", ".join(parts) if parts else "idle"))
-
-    def absolute(self, rep):
-        x = rep[1] | (rep[2] << 8)
-        y = rep[3] | (rep[4] << 8)
-        wheel = rep[5] - 256 if rep[5] > 127 else rep[5]
-        self.say("  abs  %d,%d buttons %d%s"
-                 % (x, y, rep[0], " wheel %+d" % wheel if wheel else ""))
+        self.say("  ptr  %s" % ", ".join(parts))
 
     def frame(self, f):
         kind, length = f[0], f[1]
@@ -173,8 +166,6 @@ class Watcher:
             self.counts[kind] += 1
         if kind == KIND_KBD and length >= 8:
             self.keyboard(rep)
-        elif kind == KIND_MOUSE and length >= 4:
-            self.mouse(rep)
         elif kind == KIND_ABS and length >= 6:
             self.absolute(rep)
         else:
@@ -248,9 +239,8 @@ def main():
         sock.close()
 
     typed = w.text()
-    print("\n%d keyboard, %d mouse, %d absolute; typed %r"
-          % (w.counts[KIND_KBD], w.counts[KIND_MOUSE], w.counts[KIND_ABS],
-             typed), flush=True)
+    print("\n%d keyboard, %d pointer; typed %r"
+          % (w.counts[KIND_KBD], w.counts[KIND_ABS], typed), flush=True)
 
     if args.expect is not None:
         if args.expect in typed:

@@ -154,9 +154,17 @@ extern "C" {
  *      plugged into, with AG_IOC_USBCDC_STATUS.  It is how a program on that
  *      machine sends its screen back, because USB has no way for the machine
  *      to send it by itself.  Absent unless CONFIG_ARGON_USB_DEVICE_CDC.
+ * 0.45 the relative mouse interface is gone, and with it AG_USBHID_MOUSE.  Not
+ *      a simplification - an endpoint budget: the S3 has five device IN
+ *      endpoints, and the keyboard, the pointer, the serial pipe's two and the
+ *      mass-storage drive that carries the agent to the far machine are five.
+ *      A relative step now becomes an absolute one against a remembered
+ *      position, in apps/common/kvm where the position already lived.  The
+ *      enumerator keeps 3 for the pointer and leaves 2 empty, so a frame from
+ *      something built earlier is refused rather than reinterpreted.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 44u
+#define AG_ABI_MINOR 45u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -959,18 +967,28 @@ enum ag_ioctl_cmd {
  * somebody else's computer, and what an application writes to /dev/usbhid0 is
  * what that computer believes a person typed.
  *
- * Three interfaces, because they are three different promises:
+ * Two interfaces, because they are two different promises:
  *
  *   AG_USBHID_KBD    boot keyboard, the fixed eight-byte report
- *   AG_USBHID_MOUSE  boot mouse, relative: buttons and a step
  *   AG_USBHID_ABS    a pointer that names a position rather than a step
  *
- * The first two are boot-protocol devices on purpose.  A BIOS, a boot menu and
- * a bootloader speak boot protocol and nothing else, and the whole reason to be
- * a keyboard on a wire rather than a program on the far machine is to be able
- * to type where no program of ours can run.  The absolute pointer is the
- * opposite trade - no BIOS will look at it, and it is the only way to put the
- * cursor where a finger touched a picture of the screen.
+ * The keyboard is a boot-protocol device on purpose.  A BIOS, a boot menu and a
+ * bootloader speak boot protocol and nothing else, and the whole reason to be a
+ * keyboard on a wire rather than a program on the far machine is to be able to
+ * type where no program of ours can run.
+ *
+ * The pointer is the opposite trade and there is only one of it.  There used to
+ * be a relative boot mouse beside this, and it went because the S3 has five
+ * device IN endpoints and no more: the keyboard, the pointer, the serial pipe's
+ * two, and the flash drive that carries the agent to the far machine are all
+ * five.  What that costs is a mouse in a BIOS, which few have and fewer use;
+ * what it buys is that the program the far machine needs is *on* the device.
+ * A relative step is not lost - it is added to a remembered position and sent
+ * as an absolute one (apps/common/kvm), which is what a phone's trackpad wants
+ * anyway.
+ *
+ * Two is therefore a hole rather than a renumbering: a frame built by something
+ * older must not quietly become a pointer report.
  *
  * A write is a whole number of AG_USBHID_FRAME-byte frames and returns how many
  * bytes it took, so a caller can send a chord and its release in one call.  A
@@ -979,7 +997,7 @@ enum ag_ioctl_cmd {
  */
 typedef enum {
     AG_USBHID_KBD = 1,
-    AG_USBHID_MOUSE = 2,
+    /* 2 was the relative boot mouse, removed in 0.45 - see above. */
     AG_USBHID_ABS = 3,
 } ag_usbhid_kind_t;
 
@@ -987,9 +1005,8 @@ typedef enum {
 #define AG_USBHID_DATA_MAX 14u /* the report inside it                      */
 
 /* Report lengths, fixed by the descriptors the gadget publishes. */
-#define AG_USBHID_KBD_LEN 8u   /* mods, reserved, six key slots             */
-#define AG_USBHID_MOUSE_LEN 4u /* buttons, dx, dy, wheel (a BIOS reads three) */
-#define AG_USBHID_ABS_LEN 6u   /* buttons, x lo/hi, y lo/hi, wheel          */
+#define AG_USBHID_KBD_LEN 8u /* mods, reserved, six key slots               */
+#define AG_USBHID_ABS_LEN 6u /* buttons, x lo/hi, y lo/hi, wheel            */
 
 /*
  * The absolute pointer's axes, full scale: a position is 0..AG_USBHID_ABS_MAX
