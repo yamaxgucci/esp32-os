@@ -75,7 +75,8 @@ set(ARGON_DSP_SRCS
 # far machine - see the header of host-tests/test_kvm.c.
 set(ARGON_KVM_SRCS
     "${ARGON_ROOT}/apps/common/kvm/ag_kvm.c"
-    "${ARGON_ROOT}/apps/common/kvm/ag_ws.c")
+    "${ARGON_ROOT}/apps/common/kvm/ag_ws.c"
+    "${ARGON_ROOT}/apps/common/kvm/ag_vid.c")
 
 set(ARGON_INCLUDES
     "${CMAKE_CURRENT_LIST_DIR}"
@@ -142,6 +143,7 @@ add_executable(argon_tests
     test_rempix.c
     test_kvm.c
     test_ws.c
+    test_vid.c
     "${ARGON_ROOT}/tools/nam.c"
     "${ARGON_ROOT}/apps/cc/cc_compile.c"
     "${ARGON_ROOT}/components/argon_kernel/src/dev/draw.c"

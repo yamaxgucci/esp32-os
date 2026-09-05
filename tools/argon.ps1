@@ -31,7 +31,8 @@ ArgonOS
                            (connect with PuTTY in Raw mode)
   argon run                (default) also OpenEth hostfwd 127.0.0.1:5558
                            (5559 midivirt, 5560 mousevirt, 5561 kbdvirt,
-                            5562 usbhidvirt, 8080 -> guest :80 for KVM.AXE)
+                            5562 usbhidvirt, 5563 usbcdcvirt,
+                            8080 -> guest :80 for KVM.AXE)
   argon run -NoNet         skip the virtual NIC
   python tools/pcmplay.py  play guest PCM streamed to :5558 (MD `net`);
                            or use -Virt / argon virt with kbd+mouse
@@ -50,7 +51,9 @@ ArgonOS
   argon boardnet -port COM3   the same on the real board, over Wi-Fi;
                            add -big for a speed number (14 checks)
   argon kvmtest            the phone-to-USB-keyboard path in QEMU: page,
-                           WebSocket, wire format, HID reports (19 checks)
+                           WebSocket, wire format, HID reports (19 checks);
+                           add `picture` to run the agent and check the screen
+                           as well (`keep` leaves the emulator up)
   python tools/netfixture.py serve   the same servers, to try things by hand
   argon check              local CI: host tests, then firmware build
   argon target             which chip the firmware is built for
@@ -497,7 +500,24 @@ switch ($Command.ToLowerInvariant()) {
         # the HID reports that come out of it.  Not part of `check` for the
         # same reason nettest is not - it wants ports and a Python that can
         # bind them.
-        & (Join-Path $PSScriptRoot 'kvmtest.ps1') @Rest
+        #
+        # Named through a hashtable rather than @Rest, because splatting an
+        # array passes its elements *positionally*: '-Picture' would arrive as
+        # a value for the first parameter and fail to be an integer.
+        #
+        $kvmArgs = @{}
+        foreach ($a in $Rest) {
+            switch -Regex ($a) {
+                '^-?picture$' { $kvmArgs['Picture'] = $true }
+                '^-?keep$'    { $kvmArgs['Keep'] = $true }
+                default {
+                    Write-Host "argon kvmtest: unknown argument '$a'"
+                    Write-Host 'usage: argon kvmtest [picture] [keep]'
+                    exit 1
+                }
+            }
+        }
+        & (Join-Path $PSScriptRoot 'kvmtest.ps1') @kvmArgs
         exit $LASTEXITCODE
     }
 

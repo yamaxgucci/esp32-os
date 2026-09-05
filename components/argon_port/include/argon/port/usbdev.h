@@ -61,6 +61,18 @@ typedef struct {
     uint8_t           protocol; /* 0 boot, 1 report - what the host asked for */
 } ag_port_usbdev_status_t;
 
+/*
+ * The serial pipe, when the build has it (AG_PORT_HAS_USB_CDC).  It is the
+ * same gadget and the same cable: one more function on the composite device,
+ * because a program on the far machine has to be able to send its screen back
+ * and USB gives it no other way.
+ */
+typedef struct {
+    ag_usbcdc_state_t state;
+    uint32_t          rx;
+    uint32_t          tx;
+} ag_port_usbdev_cdc_status_t;
+
 #if AG_PORT_HAS_USB_DEVICE
 
 ag_err_t ag_port_usbdev_start(void);
@@ -70,5 +82,24 @@ ag_err_t ag_port_usbdev_send(ag_usbhid_kind_t kind, const uint8_t *rep,
                              uint32_t len);
 
 #endif /* AG_PORT_HAS_USB_DEVICE */
+
+#if AG_PORT_HAS_USB_CDC
+
+/*
+ * The serial pipe.  Both directions are non-blocking and partial: read takes
+ * what has arrived and no more, write takes what fits in the endpoint's buffer
+ * and says how much, and -AG_EAGAIN means "nothing / no room, come back".  The
+ * caller above owns the framing, because bytes on a serial port have none.
+ *
+ * -AG_ENODEV until the far machine has opened the port.  That is a real state
+ * and not a failure: the cable can be in, the device enumerated and the port
+ * sitting there with no program at the other end of it, which is exactly what
+ * happens before somebody starts the agent.
+ */
+int32_t  ag_port_usbdev_cdc_read(void *buf, uint32_t len);
+int32_t  ag_port_usbdev_cdc_write(const void *buf, uint32_t len);
+ag_err_t ag_port_usbdev_cdc_status(ag_port_usbdev_cdc_status_t *out);
+
+#endif /* AG_PORT_HAS_USB_CDC */
 
 #endif /* ARGON_PORT_USBDEV_H */

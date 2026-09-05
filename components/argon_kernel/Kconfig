@@ -562,6 +562,31 @@ menu "ArgonOS"
             gate is the board, and everything above the port is verified through
             USBHIDVIRT.SYS instead.
 
+    config ARGON_USB_DEVICE_CDC
+        bool "USB device: a serial pipe beside the keyboard"
+        depends on ARGON_USB_DEVICE
+        default y
+        help
+            One more function on the same composite device: a CDC serial port,
+            which on the far machine is a COM port with no driver to install.
+
+            It exists for the picture.  That machine will not send its screen
+            out over USB by itself - USB has no class for a display sink - so
+            the only way to see it is a program running over there, and this is
+            the wire that program talks back down.  /dev/usbcdc0 is a byte pipe
+            and nothing more: what travels on it is messages the application
+            frames, and the board forwards them to the phone without ever
+            decoding a pixel.
+
+            Costs an interface pair and two of the five device IN endpoints the
+            S3's OTG core has.  With the three HID interfaces that is all five,
+            which is why there is no mass-storage function here to carry the
+            program to the far machine - see docs/14-usb-kvm.md.
+
+            On by default when the gadget is, because a KVM without a picture is
+            only half of one; off is for bringing the keyboard up on its own
+            when something about enumeration is being bisected.
+
     config ARGON_CONSOLE_COLS
         int "Console width, characters"
         range 20 240

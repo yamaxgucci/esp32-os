@@ -329,16 +329,18 @@ function Get-QemuMachineArgs {
 
 # OpenEth user-mode NIC + hostfwd so Windows can reach guest TCP listeners.
 # 5558 = PCMVIRT / pcmplay.py; 5559 = MIDIVIRT / midikbd.py;
-# 5560 = MOUSEVIRT; 5561 = KBDVIRT / kbdvirt.py; 5562 = USBHIDVIRT.
+# 5560 = MOUSEVIRT; 5561 = KBDVIRT / kbdvirt.py; 5562 = USBHIDVIRT;
+# 5563 = USBCDCVIRT, where the far machine's agent sends its screen.
 # 8080 -> guest :80 so a browser on this machine can open KVM.AXE's page.
 function Get-QemuNetArgs {
     param([int]$HostPort = 5558, [int]$GuestPort = 5558)
     $fwd = "hostfwd=tcp:127.0.0.1:{0}-:{1}" -f $HostPort, $GuestPort
     if ($HostPort -eq 5558 -and $GuestPort -eq 5558) {
-        # 5558-5562: PCM / MIDI / mouse / kbd / usbhid virt helpers.  2323->23:
+        # 5558-5563: PCM / MIDI / mouse / kbd / usbhid / usbcdc virt helpers.
+        # 2323->23:
         # reach the guest's telnet console from the host
         # (CONFIG_ARGON_NET_TELNET).  8080->80: KVM.AXE's page in a browser.
-        $fwd = "hostfwd=tcp:127.0.0.1:5558-:5558,hostfwd=tcp:127.0.0.1:5559-:5559,hostfwd=tcp:127.0.0.1:5560-:5560,hostfwd=tcp:127.0.0.1:5561-:5561,hostfwd=tcp:127.0.0.1:5562-:5562,hostfwd=tcp:127.0.0.1:2323-:23,hostfwd=tcp:127.0.0.1:2222-:22,hostfwd=tcp:127.0.0.1:8080-:80"
+        $fwd = "hostfwd=tcp:127.0.0.1:5558-:5558,hostfwd=tcp:127.0.0.1:5559-:5559,hostfwd=tcp:127.0.0.1:5560-:5560,hostfwd=tcp:127.0.0.1:5561-:5561,hostfwd=tcp:127.0.0.1:5562-:5562,hostfwd=tcp:127.0.0.1:5563-:5563,hostfwd=tcp:127.0.0.1:2323-:23,hostfwd=tcp:127.0.0.1:2222-:22,hostfwd=tcp:127.0.0.1:8080-:80"
     }
     return @(
         '-nic', ("user,model=open_eth,id=argon0,{0}" -f $fwd)

@@ -30,8 +30,24 @@ CONFIG_ARGON_USB_DEVICE=y
 # agree with what components/argon_port/idf/src/usbdev_hw.c publishes.
 CONFIG_TINYUSB_HID_COUNT=3
 
-# Nothing else.  A composite device with a serial port or a disk in it is a
-# different set of promises to the far machine - see docs/14-usb-kvm.md on what
-# M2 needs - and a keyboard should enumerate as a keyboard.
-CONFIG_TINYUSB_CDC_ENABLED=n
+# The serial pipe beside the keyboard: on the far machine it is a COM port with
+# no driver to install, and it is the only way a picture can come back - USB has
+# no class for a display sink.  Two more interfaces and two more IN endpoints;
+# with the three HID ones that is all five the S3 has.
+CONFIG_TINYUSB_CDC_ENABLED=y
+CONFIG_TINYUSB_CDC_COUNT=1
+
+# The buffers the picture flows through, and the one number worth tuning here.
+# Traffic is almost entirely one way - the far machine sends tiles, this end
+# sends the odd line of clipboard text back - so the receive side gets the
+# room.  These are internal RAM, not PSRAM: they are DMA buffers.
+CONFIG_TINYUSB_CDC_RX_BUFSIZE=4096
+CONFIG_TINYUSB_CDC_TX_BUFSIZE=1024
+CONFIG_TINYUSB_CDC_EP_BUFSIZE=2048
+
+# No mass storage.  It would be the tidy way to put the agent on the far machine
+# - a read-only flash drive with one program on it - and it does not fit: the
+# S3 has five device IN endpoints and the keyboard, the mouse, the tablet and
+# the serial pipe are all five.  Adding a disk means giving up the relative
+# mouse, which is a real trade and a later decision.  See docs/14-usb-kvm.md.
 CONFIG_TINYUSB_MSC_ENABLED=n

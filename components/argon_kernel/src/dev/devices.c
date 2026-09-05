@@ -475,6 +475,15 @@ ag_err_t ag_devices_init(void)
      * waiting to type.  Opt out with [usb] device = 0 in SYSTEM.CFG.
      */
     (void)ag_usbhid_init();
+#if AG_PORT_HAS_USB_CDC
+    /*
+     * The serial pipe on the same cable, for the program on the far machine
+     * that sends its screen back.  Registered unconditionally beside the
+     * keyboard: nothing has to be running over there for the device to exist,
+     * and a read simply says -AG_ENODEV until something does.
+     */
+    (void)ag_usbcdc_init();
+#endif
     if (ag_cfg_get_int(ag_sysconfig(), "usb.device", 1) != 0) {
         const ag_err_t derr = ag_port_usbdev_start();
         if (derr != AG_OK) {

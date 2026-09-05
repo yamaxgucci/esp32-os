@@ -18,4 +18,10 @@
 #define AG_PORT_HAS_USB_DEVICE 0
 #endif
 
+#if defined(CONFIG_ARGON_USB_DEVICE_CDC) && CONFIG_ARGON_USB_DEVICE_CDC
+#define AG_PORT_HAS_USB_CDC 1
+#else
+#define AG_PORT_HAS_USB_CDC 0
+#endif
+
 #endif /* ARGON_PORT_IMPL_USBDEV_H */

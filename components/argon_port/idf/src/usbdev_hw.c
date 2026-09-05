@@ -61,7 +61,19 @@ static const char *TAG = "usbdev";
 #define ITF_KBD 0
 #define ITF_MOUSE 1
 #define ITF_ABS 2
+
+#if AG_PORT_HAS_USB_CDC
+/*
+ * The serial pipe takes two interfaces - a control one and a data one - which
+ * is why a composite device with CDC in it needs an Interface Association
+ * Descriptor and a device class of MISC/COMMON/IAD below: without that, a host
+ * has no way to know the two belong together.
+ */
+#define ITF_CDC 3
+#define ITF_COUNT 5
+#else
 #define ITF_COUNT 3
+#endif
 
 /* ------------------------------------------------------------------------ */
 /* Report descriptors                                                       */
@@ -203,6 +215,17 @@ static const tusb_desc_device_t k_desc_device = {
     .bLength = sizeof(tusb_desc_device_t),
     .bDescriptorType = TUSB_DESC_DEVICE,
     .bcdUSB = 0x0200,
+#if AG_PORT_HAS_USB_CDC
+    /*
+     * With CDC in the mix the device has to say MISC/COMMON/IAD, because the
+     * serial port is two interfaces that belong together and the association
+     * descriptor is the only thing that says so.  Anything else and Windows
+     * binds a driver to the control interface and leaves the data one alone.
+     */
+    .bDeviceClass = TUSB_CLASS_MISC,
+    .bDeviceSubClass = MISC_SUBCLASS_COMMON,
+    .bDeviceProtocol = MISC_PROTOCOL_IAD,
+#else
     /*
      * Class in the interfaces, not here.  A composite device that names a class
      * at the device level tells the host to look for one driver for the whole
@@ -212,6 +235,7 @@ static const tusb_desc_device_t k_desc_device = {
     .bDeviceClass = 0x00,
     .bDeviceSubClass = 0x00,
     .bDeviceProtocol = 0x00,
+#endif
     .bMaxPacketSize0 = CFG_TUD_ENDPOINT0_SIZE,
     .idVendor = ARGON_USB_VID,
     .idProduct = ARGON_USB_PID,
@@ -234,9 +258,33 @@ static const char *k_desc_str[] = {
     "Keyboard",                 /* 4: interface 0                             */
     "Mouse",                    /* 5: interface 1                             */
     "Tablet",                   /* 6: interface 2                             */
+#if AG_PORT_HAS_USB_CDC
+    "ArgonOS screen link",      /* 7: the serial pipe                         */
+#endif
 };
 
-#define CFG_TOTAL_LEN (TUD_CONFIG_DESC_LEN + ITF_COUNT * TUD_HID_DESC_LEN)
+/*
+ * The endpoint budget, which is the tightest thing in this file and the reason
+ * the composite device stops where it does.
+ *
+ * The S3's OTG core is built with five device IN endpoints besides EP0
+ * (soc/usb_dwc_cfg.h: OTG_NUM_IN_EPS 5) and one kilobyte of FIFO shared
+ * between the receive path and every transmit endpoint (OTG_DFIFO_DEPTH 256
+ * words).  Three HID interrupt endpoints plus the serial pipe's notification
+ * and bulk IN is exactly five.  There is no sixth, which is why the flash
+ * drive that would carry the agent to the far machine is not here: adding mass
+ * storage means giving up an interface, and the one to give up is the relative
+ * mouse - see docs/14-usb-kvm.md.
+ *
+ * The FIFO, in words: 52 receive, 16 for EP0, 16 for each of the three HID
+ * endpoints, 16 for the notification, and what is left for the bulk IN, which
+ * is the one that carries the picture and the only one throughput depends on.
+ */
+#if AG_PORT_HAS_USB_CDC
+#define CFG_TOTAL_LEN                                                            (TUD_CONFIG_DESC_LEN + 3 * TUD_HID_DESC_LEN + TUD_CDC_DESC_LEN)
+#else
+#define CFG_TOTAL_LEN (TUD_CONFIG_DESC_LEN + 3 * TUD_HID_DESC_LEN)
+#endif
 
 /* One interrupt IN endpoint each, polled every millisecond - the fastest a
  * full-speed interrupt endpoint is allowed to be asked, and what every keyboard
@@ -247,6 +295,15 @@ static const char *k_desc_str[] = {
 #define EP_SIZE 16
 #define EP_INTERVAL_MS 1
 
+/* The serial pipe: a notification endpoint nobody uses (CDC insists on one)
+ * and a bulk pair.  Sixty-four bytes is the largest a full-speed bulk endpoint
+ * may be, and the whole picture goes through it. */
+#define EP_CDC_NOTIF 0x84
+#define EP_CDC_OUT 0x05
+#define EP_CDC_IN 0x85
+#define EP_CDC_NOTIF_SIZE 8
+#define EP_CDC_SIZE 64
+
 static const uint8_t k_desc_cfg[] = {
     TUD_CONFIG_DESCRIPTOR(1, ITF_COUNT, 0, CFG_TOTAL_LEN, 0x00, 100),
 
@@ -256,6 +313,10 @@ static const uint8_t k_desc_cfg[] = {
                        sizeof(k_desc_mouse), EP_MOUSE, EP_SIZE, EP_INTERVAL_MS),
     TUD_HID_DESCRIPTOR(ITF_ABS, 6, HID_ITF_PROTOCOL_NONE, sizeof(k_desc_abs),
                        EP_ABS, EP_SIZE, EP_INTERVAL_MS),
+#if AG_PORT_HAS_USB_CDC
+    TUD_CDC_DESCRIPTOR(ITF_CDC, 7, EP_CDC_NOTIF, EP_CDC_NOTIF_SIZE, EP_CDC_OUT,
+                       EP_CDC_IN, EP_CDC_SIZE),
+#endif
 };
 
 /* ------------------------------------------------------------------------ */
@@ -455,6 +516,87 @@ ag_err_t ag_port_usbdev_send(ag_usbhid_kind_t kind, const uint8_t *rep,
     xSemaphoreGive(s_lock);
     return rc;
 }
+
+/* ------------------------------------------------------------------------ */
+/* The serial pipe                                                          */
+/* ------------------------------------------------------------------------ */
+
+#if AG_PORT_HAS_USB_CDC
+
+static volatile uint32_t s_cdc_rx;
+static volatile uint32_t s_cdc_tx;
+
+int32_t ag_port_usbdev_cdc_read(void *buf, uint32_t len)
+{
+    if (buf == NULL || len == 0) {
+        return -AG_EINVAL;
+    }
+    if (!s_running || !tud_mounted()) {
+        return -AG_ENODEV;
+    }
+
+    const uint32_t have = tud_cdc_available();
+    if (have == 0) {
+        return -AG_EAGAIN;
+    }
+
+    const uint32_t take = (have < len) ? have : len;
+    const uint32_t got = tud_cdc_read(buf, take);
+    s_cdc_rx += got;
+    return (int32_t)got;
+}
+
+int32_t ag_port_usbdev_cdc_write(const void *buf, uint32_t len)
+{
+    if (buf == NULL || len == 0) {
+        return -AG_EINVAL;
+    }
+    if (!s_running || !tud_mounted()) {
+        return -AG_ENODEV;
+    }
+    if (!tud_cdc_connected()) {
+        /*
+         * Enumerated, but nobody over there has opened the port.  Writing into
+         * a CDC buffer that nothing drains fills it and then blocks every
+         * later write, so this refuses instead - the caller sees the state in
+         * the status and can stop offering.
+         */
+        return -AG_ENODEV;
+    }
+
+    const uint32_t room = tud_cdc_write_available();
+    if (room == 0) {
+        return -AG_EAGAIN;
+    }
+
+    const uint32_t take = (room < len) ? room : len;
+    const uint32_t put = tud_cdc_write(buf, take);
+    (void)tud_cdc_write_flush();
+    s_cdc_tx += put;
+    return (int32_t)put;
+}
+
+ag_err_t ag_port_usbdev_cdc_status(ag_port_usbdev_cdc_status_t *out)
+{
+    if (out == NULL) {
+        return -AG_EINVAL;
+    }
+    memset(out, 0, sizeof(*out));
+    if (!s_running) {
+        out->state = AG_USBCDC_OFF;
+        return AG_OK;
+    }
+    if (!tud_mounted()) {
+        out->state = AG_USBCDC_OFF;
+    } else {
+        out->state = tud_cdc_connected() ? AG_USBCDC_OPEN : AG_USBCDC_IDLE;
+    }
+    out->rx = s_cdc_rx;
+    out->tx = s_cdc_tx;
+    return AG_OK;
+}
+
+#endif /* AG_PORT_HAS_USB_CDC */
 
 #endif /* SOC_USB_OTG_SUPPORTED */
 #endif /* CONFIG_ARGON_USB_DEVICE */

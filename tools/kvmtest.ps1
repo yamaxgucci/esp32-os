@@ -22,7 +22,11 @@ param(
     [int]$Hid = 5562,
     [int]$ConsolePort = 5556,
     # Leave the emulator running afterwards, for poking at the page by hand.
-    [switch]$Keep
+    [switch]$Keep,
+    # Also check the screen, which means running the agent against the
+    # emulator.  It captures this desktop, so do not be surprised to see the
+    # tile count move when something on screen does.
+    [switch]$Picture
 )
 
 $ErrorActionPreference = 'Stop'
@@ -31,9 +35,22 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
-foreach ($img in @('build\apps\KVM.AXE', 'build\apps\USBHIDVIRT.SYS')) {
+foreach ($img in @('build\apps\KVM.AXE', 'build\apps\USBHIDVIRT.SYS',
+                   'build\apps\USBCDCVIRT.SYS')) {
     if (-not (Test-Path $img)) {
-        Write-Error "$img is missing - run: argon apps --only KVM.AXE USBHIDVIRT.SYS"
+        Write-Error ("$img is missing - run: argon apps --only KVM.AXE " +
+                     "USBHIDVIRT.SYS USBCDCVIRT.SYS")
+    }
+}
+
+# The picture needs something producing one.  The agent is a Windows program in
+# this tree; with -Picture it is built if it is not there and pointed at the
+# emulator, which is the same binary that would talk to a board over USB.
+$agentExe = 'build\kvmagent.exe'
+if ($Picture -and -not (Test-Path $agentExe)) {
+    & "$PSScriptRoot\kvmagent\build.cmd" | Out-Null
+    if (-not (Test-Path $agentExe)) {
+        Write-Error 'the agent did not build - see tools\kvmagent\build.cmd'
     }
 }
 
@@ -53,8 +70,9 @@ $qemu = Start-Process -FilePath 'powershell.exe' -PassThru -WindowStyle Hidden `
         "-Port $ConsolePort -NoBuild -HostFs 'build\sd_card'")
 
 try {
-    & $python (Join-Path $PSScriptRoot 'kvmtest.py') `
-        '--http' $Http '--hid' $Hid '--console' $ConsolePort
+    $pyArgs = @('--http', $Http, '--hid', $Hid, '--console', $ConsolePort)
+    if ($Picture) { $pyArgs += @('--agent', (Resolve-Path $agentExe).Path) }
+    & $python (Join-Path $PSScriptRoot 'kvmtest.py') @pyArgs
     $code = $LASTEXITCODE
 } finally {
     if (-not $Keep) {

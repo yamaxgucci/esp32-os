@@ -27,6 +27,15 @@ extern "C" {
 ag_err_t ag_usbhid_init(void);
 #endif
 
+#if AG_PORT_HAS_USB_CDC
+/*
+ * Registers /dev/usbcdc0, the serial pipe on the same cable.  Same gadget, so
+ * there is nothing separate to start: it appears when the far machine
+ * enumerates us and opens the port.
+ */
+ag_err_t ag_usbcdc_init(void);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

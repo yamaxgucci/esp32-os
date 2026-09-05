@@ -150,9 +150,13 @@ extern "C" {
  *      writes reports to (ag_usbhid_frame_t) and asks about with
  *      AG_IOC_USBHID_STATUS.  Absent unless CONFIG_ARGON_USB_DEVICE, which is
  *      the same peripheral CONFIG_ARGON_USB_HOST uses and therefore excludes.
+ * 0.44 /dev/usbcdc0 beside it: a serial pipe to the machine the OTG port is
+ *      plugged into, with AG_IOC_USBCDC_STATUS.  It is how a program on that
+ *      machine sends its screen back, because USB has no way for the machine
+ *      to send it by itself.  Absent unless CONFIG_ARGON_USB_DEVICE_CDC.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 43u
+#define AG_ABI_MINOR 44u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -937,6 +941,12 @@ enum ag_ioctl_cmd {
      * the cable makes of us.  arg: ag_usbhid_status_t.
      */
     AG_IOC_USBHID_STATUS = AG_IOC(AG_DEV_CHAR, 1),
+
+    /*
+     * The USB serial pipe (/dev/usbcdc0): whether the far machine has opened
+     * it, and how much has gone each way.  arg: ag_usbcdc_status_t.
+     */
+    AG_IOC_USBCDC_STATUS = AG_IOC(AG_DEV_CHAR, 2),
 };
 
 /* ------------------------------------------------------------------------ */
@@ -1007,6 +1017,46 @@ typedef struct {
     uint8_t  protocol; /* 0 the host asked for boot, 1 for report           */
     uint8_t  reserved[2];
 } ag_usbhid_status_t;
+
+/* ------------------------------------------------------------------------ */
+/* usbcdc - the serial pipe back from the machine we are plugged into        */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * /dev/usbcdc0 is a byte stream to and from the computer at the other end of
+ * the cable, and it exists for one reason: that computer will not send its
+ * screen out over USB by itself (there is no USB display class - see
+ * docs/14-usb-kvm.md), so the only way to a picture is a program running over
+ * there, and that program needs a way to talk back down the same wire.
+ *
+ * It is a serial port and nothing more.  What goes over it is a stream of
+ * messages this system does not interpret: the board reads them, finds their
+ * boundaries and forwards them, and the pixels inside are decoded by the phone.
+ * That is deliberate - an ESP32 that never touches a pixel costs no frame
+ * buffer, no codec and no CPU, and the wire is the limit rather than we are.
+ *
+ * A CDC device on the far machine is a COM port with no driver to install:
+ * Windows binds usbser.sys to it by class, and Linux and macOS give a tty.
+ * That is the whole reason it is CDC rather than a vendor pipe.
+ */
+typedef enum {
+    AG_USBCDC_OFF = 0,   /* the gadget is not running                       */
+    AG_USBCDC_IDLE,      /* enumerated, but nobody has opened the port      */
+    AG_USBCDC_OPEN,      /* a program over there has it open (DTR asserted) */
+} ag_usbcdc_state_t;
+
+typedef struct {
+    uint32_t state; /* ag_usbcdc_state_t                                    */
+    uint32_t rx;    /* bytes from the far machine since it came up          */
+    uint32_t tx;    /* bytes to it                                          */
+} ag_usbcdc_status_t;
+
+/*
+ * There is deliberately no "bytes lost" here.  A serial port cannot tell you:
+ * when the receive buffer fills, the bytes are gone and nothing counted them.
+ * What *can* be counted is a message that did not frame, and that belongs to
+ * whoever owns the framing - see apps/common/kvm.
+ */
 
 typedef struct {
     uint32_t sector_size; /* smallest unit the media reads and writes      */

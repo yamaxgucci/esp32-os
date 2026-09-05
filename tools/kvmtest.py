@@ -267,7 +267,7 @@ def http_get(host, port, path="/"):
 
 # --------------------------------------------------------------------------
 
-def run_checks(host, http_port, hid_port):
+def run_checks(host, http_port, hid_port, picture=False):
     # The PC first.  USBHIDVIRT refuses writes with nothing connected - the
     # same answer the real device gives with the cable out - so the phone's
     # events would go nowhere if this were the other way round.
@@ -289,13 +289,21 @@ def run_checks(host, http_port, hid_port):
     note(phone.accept_ok, "Sec-WebSocket-Accept is the hash of our key")
 
     # The status push, which is also how the page shows whether a PC is there.
+    #
+    # Patiently, and skipping what is not it.  With an agent running there is a
+    # stream of picture messages on this same socket and the status line is one
+    # small text frame somewhere inside it.
+    #
     got = None
-    for _ in range(4):
+    deadline = time.time() + 12.0
+    while time.time() < deadline:
         f = phone.recv_frame(2.0)
-        if f and f[0] == 1 and f[1].startswith(b"S "):
+        if f is None:
+            continue
+        if f[0] == 1 and f[1].startswith(b"S "):
             got = f[1].decode()
             break
-    note(got is not None, "a status line arrives", got or "nothing in 8 s")
+    note(got is not None, "a status line arrives", got or "nothing in 12 s")
     if got is not None:
         note(got.split()[1] == "2", "the status says a PC is attached", got)
 
@@ -397,6 +405,79 @@ def run_checks(host, http_port, hid_port):
 
     pc.close()
 
+    if picture:
+        phone = Phone(host, http_port)
+        check_picture(phone)
+        phone.close()
+
+
+def png_size(b):
+    """Width and height out of a PNG's IHDR, or None if it is not one."""
+    if len(b) < 24 or b[:8] != b"\x89PNG\r\n\x1a\n" or b[12:16] != b"IHDR":
+        return None
+    return (struct.unpack(">I", b[16:20])[0],
+            struct.unpack(">I", b[20:24])[0])
+
+
+def check_picture(phone, seconds=12.0):
+    """The screen of the far machine, as the phone would receive it.
+
+    This is the half of the system the keyboard tests cannot reach, and it is
+    where the interesting failure lives: the board forwards messages it never
+    looks inside, so a framing mistake does not corrupt a pixel - it stops the
+    picture entirely and leaves a resync counter climbing.  That is what these
+    numbers are for.
+    """
+    hello = None
+    tiles = 0
+    bad = 0
+    covered = 0
+    end = time.time() + seconds
+
+    # Ask for a whole screen, so this does not depend on anything moving over
+    # there while the test runs.
+    phone.send(bytes([65, 71, 0x11, 0, 0, 0, 0, 0]).decode("latin1"), opcode=2)
+
+    while time.time() < end:
+        f = phone.recv_frame(2.0)
+        if f is None:
+            continue
+        op, payload = f
+        if op != 2:
+            continue
+        if len(payload) < 8 or payload[0:2] != b"AG":
+            bad += 1
+            continue
+        t = payload[2]
+        n = struct.unpack("<I", payload[4:8])[0]
+        body = payload[8:8 + n]
+        if t == 0x01 and len(body) >= 8:
+            hello = (struct.unpack("<H", body[2:4])[0],
+                     struct.unpack("<H", body[4:6])[0],
+                     struct.unpack("<H", body[6:8])[0])
+        elif t == 0x02 and len(body) >= 8:
+            x, y, w, h = struct.unpack("<HHHH", body[0:8])
+            size = png_size(body[8:])
+            if size is None or size != (w, h):
+                bad += 1
+            else:
+                covered += w * h
+            tiles += 1
+            if hello is not None and covered >= hello[0] * hello[1]:
+                break
+
+    note(hello is not None, "the agent says how big its screen is",
+         "%r" % (hello,))
+    note(tiles > 0, "tiles arrive", "%d" % tiles)
+    note(bad == 0, "every forwarded message is a framed PNG of its rectangle",
+         "%d bad" % bad)
+    if hello is not None:
+        want = hello[0] * hello[1]
+        note(covered >= want,
+             "a whole screen arrives when the phone asks for one",
+             "%d of %d pixels" % (covered, want))
+    return hello is not None and tiles > 0
+
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -406,7 +487,10 @@ def main():
     ap.add_argument("--hid", type=int, default=5562)
     ap.add_argument("--console", type=int, default=5556)
     ap.add_argument("--no-setup", action="store_true",
-                    help="the driver is installed and the app is running")
+                    help="the drivers are installed and the app is running")
+    ap.add_argument("--agent", default=None,
+                    help="path to kvmagent.exe; starting it turns on the "
+                         "picture checks")
     args = ap.parse_args()
 
     con = None
@@ -420,13 +504,26 @@ def main():
         if not con.wait("usbhidvirt: listen", 20):
             print("USBHIDVIRT did not install", file=sys.stderr)
             return 2
+        con.send(r"drv install h:\usbcdcvirt.sys")
+        if not con.wait("usbcdcvirt: listen", 20):
+            print("USBCDCVIRT did not install", file=sys.stderr)
+            return 2
         con.send(r"run h:\kvm.axe")
         if not con.wait("open http", 20):
             print("KVM.AXE did not start", file=sys.stderr)
             return 2
 
+    agent = None
+    if args.agent is not None:
+        # After the setup, never before: it connects to a listener the guest
+        # only opens once USBCDCVIRT is loaded.
+        agent = subprocess.Popen(
+            [args.agent, "--tcp", "%s:5563" % args.host, "--fps", "5"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(1.0)
+
     try:
-        run_checks(args.host, args.http, args.hid)
+        run_checks(args.host, args.http, args.hid, agent is not None)
     except Exception as exc:  # noqa: BLE001 - the transcript matters more
         note(False, "the run finished", repr(exc))
         # The usual cause, and it is not a bug: KVM.AXE keeps one phone at a
@@ -435,6 +532,8 @@ def main():
         print("if the guest's console says 'phone gone (replaced)', close any "
               "browser tab open on the page and run this again", file=sys.stderr)
     finally:
+        if agent is not None:
+            agent.terminate()
         bad = [n for ok, n, _ in RESULTS if not ok]
         if con is not None:
             if bad:

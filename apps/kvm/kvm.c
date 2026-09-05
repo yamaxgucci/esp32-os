@@ -36,6 +36,7 @@
 #include <string.h>
 
 #include "ag_kvm.h"
+#include "ag_vid.h"
 #include "ag_ws.h"
 #include "kvm_page.h"
 
@@ -44,13 +45,32 @@ AG_APP("KVM", "1.0", "argon", AG_AXE_NEEDS_NET);
 #define KVM_PORT 80u
 
 #define REQ_MAX 1024u  /* an HTTP request that does not fit is not one of ours */
-#define WS_RX 1024u    /* frames in flight; an event is about a dozen bytes    */
+#define WS_RX 4096u    /* frames in flight; an event is a dozen bytes, a
+                        * clipboard paste rather more                        */
 #define FRAMES_MAX 12  /* reports one line can produce                        */
+#define VID_CHUNK 1024u /* one read off the serial pipe                       */
 
-#define ACCEPT_MS 15u
+/*
+ * How many picture messages may be forwarded before going round the loop
+ * again.  There has to be a limit: the far machine can produce tiles faster
+ * than anything here consumes them, and a loop that forwarded until the pipe
+ * ran dry would stop reading the phone's keystrokes while it did.  Input is
+ * the thing that must never wait.
+ */
+#define VID_BURST 8
+
+/* How long the loop sleeps when nothing at all happened.  Short, because it
+ * is also the worst case a keystroke waits before anything looks at it. */
+#define IDLE_MS 4u
 #define REQ_TIMEOUT_MS 3000u
 #define SEND_TIMEOUT_MS 3000u
 #define STATUS_MS 1000u
+
+/*
+ * How long a picture message may take to reach the phone before the phone is
+ * declared gone.  Long, on purpose: see the note above ws_send_ms.
+ */
+#define VID_SEND_MS 15000u
 
 /*
  * How long a report may wait for the endpoint.  One report per interface per
@@ -63,20 +83,30 @@ AG_APP("KVM", "1.0", "argon", AG_AXE_NEEDS_NET);
 
 typedef struct {
     ag_handle_t dev;  /* /dev/usbhid0                                       */
+    ag_handle_t vid;  /* /dev/usbcdc0, or -1 when this build has no pipe    */
     ag_handle_t lfd;  /* the listening socket                               */
     ag_handle_t ws;   /* the phone, or -1                                   */
 
-    uint8_t *rx;   /* WS_RX  */
-    char    *req;  /* REQ_MAX */
+    uint8_t *rx;    /* WS_RX                                                */
+    char    *req;   /* REQ_MAX                                              */
+    uint8_t *vbuf;  /* AG_VID_MAX_MSG - the framer's buffer                 */
+    uint8_t *vchunk; /* VID_CHUNK                                           */
     void    *mem;
 
     size_t rx_n;
+
+    ag_vid_rx_t vrx;
 
     ag_kvm_state_t st;
     uint32_t       lines;
     uint32_t       reports;
     uint32_t       refused;
+    uint32_t       tiles;   /* picture messages forwarded to the phone      */
 } kvm_t;
+
+/* The phone went away, for whatever reason; declared here because the picture
+ * pump finds out about it as often as the socket loop does. */
+static void ws_drop(kvm_t *k, const char *why);
 
 /* ------------------------------------------------------------------------ */
 /* Sockets                                                                  */
@@ -87,11 +117,12 @@ typedef struct {
  * short send is normal and not an error; what is an error is giving up on half
  * a WebSocket frame, because the far end has no way to resynchronise.
  */
-static bool send_all(ag_handle_t s, const void *buf, size_t len)
+static bool send_all_ms(ag_handle_t s, const void *buf, size_t len,
+                        uint32_t ms)
 {
     const uint8_t *p = (const uint8_t *)buf;
     size_t         off = 0;
-    const uint32_t deadline = ag_millis() + SEND_TIMEOUT_MS;
+    const uint32_t deadline = ag_millis() + ms;
 
     while (off < len) {
         const int32_t n = ag_net_send(s, p + off, len - off);
@@ -111,7 +142,30 @@ static bool send_all(ag_handle_t s, const void *buf, size_t len)
     return true;
 }
 
-static bool ws_send(kvm_t *k, uint8_t opcode, const void *payload, size_t len)
+static bool send_all(ag_handle_t s, const void *buf, size_t len)
+{
+    return send_all_ms(s, buf, len, SEND_TIMEOUT_MS);
+}
+
+/*
+ * A frame out.  The deadline is a parameter because the two kinds of traffic
+ * want different patience, and the difference is not a detail.
+ *
+ * A status line is small and if it will not go the phone is gone.  A picture
+ * message is the far machine's screen arriving faster than the phone can draw
+ * it, and that is not a failure - it is the flow control working.  The socket
+ * fills, this blocks, the board stops reading the cable, the cable's buffer
+ * fills, and the agent's own write blocks: back-pressure all the way to the
+ * machine producing the pixels, which is exactly where it should end up.
+ * Giving up early instead - which this did, with three seconds - drops the
+ * phone under load and reconnects it, forever.
+ *
+ * A frame is never half-sent.  Once the header is out the far end is waiting
+ * for exactly that many bytes, so there is no such thing as abandoning the
+ * payload and keeping the connection.
+ */
+static bool ws_send_ms(kvm_t *k, uint8_t opcode, const void *payload,
+                       size_t len, uint32_t ms)
 {
     uint8_t        hdr[4];
     const uint32_t hn = ag_ws_header(hdr, opcode, len);
@@ -119,10 +173,15 @@ static bool ws_send(kvm_t *k, uint8_t opcode, const void *payload, size_t len)
     if (k->ws < 0 || hn == 0) {
         return false;
     }
-    if (!send_all(k->ws, hdr, hn)) {
+    if (!send_all_ms(k->ws, hdr, hn, ms)) {
         return false;
     }
-    return len == 0 || send_all(k->ws, payload, len);
+    return len == 0 || send_all_ms(k->ws, payload, len, ms);
+}
+
+static bool ws_send(kvm_t *k, uint8_t opcode, const void *payload, size_t len)
+{
+    return ws_send_ms(k, opcode, payload, len, SEND_TIMEOUT_MS);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -217,6 +276,97 @@ static void handle_line(kvm_t *k, const char *line, size_t len)
     const int         n = ag_kvm_parse(line, len, &k->st, f, FRAMES_MAX);
     if (n > 0) {
         send_frames(k, f, n);
+    }
+}
+
+/* ------------------------------------------------------------------------ */
+/* The picture                                                              */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * Bytes off the serial pipe, messages on to the phone.  Nothing here looks
+ * inside a message, and that is the whole design: the far machine compresses,
+ * the phone decodes, and this board is a length prefix and a socket.  An ESP32
+ * that never touches a pixel needs no frame buffer, no codec and no CPU worth
+ * measuring, so the wire is the limit rather than we are.
+ *
+ * Returns true when it moved something, which is how the main loop knows
+ * whether it may sleep.
+ */
+static bool pump_video(kvm_t *k)
+{
+    if (k->vid < 0) {
+        return false;
+    }
+
+    bool moved = false;
+
+    for (int burst = 0; burst < VID_BURST; burst++) {
+        /*
+         * Drain first, read second, and never read more than there is room
+         * for.  The order is the whole of it: a read carries about two
+         * messages, so a loop that alternated one read with one message would
+         * take in twice what it gave out, fill the buffer, and start throwing
+         * away the tail of every read.  That is not a slow picture, it is no
+         * picture at all - the framer spends the rest of its life hunting for
+         * a header - and it is what this did until the emulator showed a
+         * resync counter in the hundreds beside two messages delivered.
+         */
+        ag_vid_msg_t msg;
+        while (ag_vid_rx_next(&k->vrx, &msg)) {
+            moved = true;
+            if (k->ws < 0) {
+                continue; /* no phone: the message is read and dropped */
+            }
+            if (!ws_send_ms(k, AG_WS_BIN, msg.raw, msg.raw_len,
+                            VID_SEND_MS)) {
+                ws_drop(k, "the picture could not be sent");
+                return moved;
+            }
+            k->tiles++;
+        }
+
+        uint32_t room = ag_vid_rx_room(&k->vrx);
+        if (room == 0) {
+            break; /* cannot happen after a drain, and not worth trusting */
+        }
+        if (room > VID_CHUNK) {
+            room = VID_CHUNK;
+        }
+        const int32_t n = ag_dev_read(k->vid, k->vchunk, room);
+        if (n <= 0) {
+            break; /* -AG_EAGAIN with nothing there, or no cable */
+        }
+        (void)ag_vid_rx_feed(&k->vrx, k->vchunk, (uint32_t)n);
+        moved = true;
+    }
+    return moved;
+}
+
+/* A message from the phone that is not input: clipboard text, or a request for
+ * a whole screen.  It goes to the far machine's agent as it stands. */
+static void video_out(kvm_t *k, const uint8_t *data, uint32_t len)
+{
+    if (k->vid < 0 || data == NULL || len == 0) {
+        return;
+    }
+    uint32_t       off = 0;
+    const uint32_t deadline = ag_millis() + 200u;
+
+    while (off < len) {
+        const int32_t w = ag_dev_write(k->vid, data + off, len - off);
+        if (w > 0) {
+            off += (uint32_t)w;
+            continue;
+        }
+        if (w == -AG_EAGAIN) {
+            if ((int32_t)(ag_millis() - deadline) >= 0) {
+                break;
+            }
+            ag_delay(1);
+            continue;
+        }
+        break; /* nothing at the other end */
     }
 }
 
@@ -346,10 +496,13 @@ static void ws_adopt(kvm_t *k, ag_handle_t c)
     ag_printf("phone connected\n");
 }
 
-static void ws_service(kvm_t *k)
+/* Returns true when it read something, so the main loop knows not to sleep. */
+static bool ws_service(kvm_t *k)
 {
+    bool moved = false;
+
     if (k->ws < 0) {
-        return;
+        return false;
     }
 
     for (;;) {
@@ -358,11 +511,12 @@ static void ws_service(kvm_t *k)
                 ag_net_recv(k->ws, k->rx + k->rx_n, WS_RX - k->rx_n);
             if (r > 0) {
                 k->rx_n += (size_t)r;
+                moved = true;
             } else if (r == -AG_EAGAIN) {
                 break;
             } else {
                 ws_drop(k, "closed");
-                return;
+                return moved;
             }
         }
 
@@ -376,11 +530,20 @@ static void ws_service(kvm_t *k)
             }
             if (used < 0) {
                 ws_drop(k, "bad frame");
-                return;
+                return moved;
             }
             switch (f.opcode) {
             case AG_WS_TEXT:
                 handle_line(k, (const char *)f.payload, f.len);
+                break;
+            case AG_WS_BIN:
+                /*
+                 * Not input.  Input is text and goes out as HID, because that
+                 * is the half that has to work when nothing runs on the far
+                 * machine.  A binary frame is for the agent - clipboard text,
+                 * or a request for a whole screen - and travels as it stands.
+                 */
+                video_out(k, f.payload, f.len);
                 break;
             case AG_WS_PING:
                 (void)ws_send(k, AG_WS_PONG, f.payload, f.len);
@@ -388,7 +551,7 @@ static void ws_service(kvm_t *k)
             case AG_WS_CLOSE:
                 (void)ws_send(k, AG_WS_CLOSE, NULL, 0);
                 ws_drop(k, "goodbye");
-                return;
+                return moved;
             default:
                 break; /* a pong, or something we do not speak */
             }
@@ -401,23 +564,32 @@ static void ws_service(kvm_t *k)
             /* A frame larger than the buffer cannot arrive: nothing this
              * protocol sends is that big, so the peer is not one of ours. */
             ws_drop(k, "frame too large");
-            return;
+            return moved;
         }
     }
+    return moved;
 }
 
 static void push_status(kvm_t *k)
 {
     ag_usbhid_status_t st;
-    char               line[64];
+    ag_usbcdc_status_t vs;
+    char               line[96];
 
     memset(&st, 0, sizeof(st));
     if (ag_dev_ioctl(k->dev, AG_IOC_USBHID_STATUS, &st, sizeof(st)) != AG_OK) {
         st.state = AG_USBHID_OFF;
     }
-    const int n = snprintf(line, sizeof(line), "S %u %u %u %u",
+    memset(&vs, 0, sizeof(vs));
+    if (k->vid < 0 ||
+        ag_dev_ioctl(k->vid, AG_IOC_USBCDC_STATUS, &vs, sizeof(vs)) != AG_OK) {
+        vs.state = AG_USBCDC_OFF;
+    }
+    const int n = snprintf(line, sizeof(line), "S %u %u %u %u %u %u %u",
                            (unsigned)st.state, (unsigned)k->reports,
-                           (unsigned)k->refused, (unsigned)st.leds);
+                           (unsigned)k->refused, (unsigned)st.leds,
+                           (unsigned)vs.state, (unsigned)k->tiles,
+                           (unsigned)k->vrx.resyncs);
     if (n > 0) {
         (void)ws_send(k, AG_WS_TEXT, line, (size_t)n);
     }
@@ -444,6 +616,7 @@ int ag_main(int argc, char **argv)
     kvm_t k;
     memset(&k, 0, sizeof(k));
     k.dev = -1;
+    k.vid = -1;
     k.lfd = -1;
     k.ws = -1;
     ag_kvm_reset(&k.st);
@@ -462,7 +635,14 @@ int ag_main(int argc, char **argv)
         return 1;
     }
 
-    k.mem = ag_malloc(WS_RX + REQ_MAX);
+    /*
+     * The serial pipe is optional and its absence is not a failure: a build
+     * without it, or a board with nothing running on the far machine, is a
+     * keyboard and a mouse, and that is a whole useful thing on its own.
+     */
+    k.vid = ag_dev_open("usbcdc0");
+
+    k.mem = ag_malloc(WS_RX + REQ_MAX + AG_VID_MAX_MSG + VID_CHUNK);
     if (k.mem == NULL) {
         ag_printf("not enough memory\n");
         (void)ag_dev_close(k.dev);
@@ -470,6 +650,9 @@ int ag_main(int argc, char **argv)
     }
     k.rx = (uint8_t *)k.mem;
     k.req = (char *)k.mem + WS_RX;
+    k.vbuf = (uint8_t *)k.mem + WS_RX + REQ_MAX;
+    k.vchunk = k.vbuf + AG_VID_MAX_MSG;
+    ag_vid_rx_init(&k.vrx, k.vbuf, AG_VID_MAX_MSG);
 
     k.lfd = ag_tcp_listen(port);
     if (k.lfd < 0) {
@@ -501,8 +684,16 @@ int ag_main(int argc, char **argv)
     uint32_t next_status = ag_millis();
 
     while (!ag_interrupted()) {
-        const ag_handle_t c = ag_tcp_accept(k.lfd, ACCEPT_MS);
+        /*
+         * Accept without waiting, then do the work, then sleep only if there
+         * was none.  Waiting inside accept was fine while the only traffic was
+         * a keystroke now and then; with a picture coming down the cable it
+         * would cap the whole thing at a few kilobytes a second.
+         */
+        bool              busy = false;
+        const ag_handle_t c = ag_tcp_accept(k.lfd, 0u);
         if (c >= 0) {
+            busy = true;
             (void)ag_net_set_nonblock(c, true);
 
             const size_t n = read_request(c, k.req, REQ_MAX);
@@ -540,7 +731,8 @@ int ag_main(int argc, char **argv)
             }
         }
 
-        ws_service(&k);
+        busy |= ws_service(&k);
+        busy |= pump_video(&k);
 
         if ((int32_t)(ag_millis() - next_status) >= 0) {
             next_status = ag_millis() + STATUS_MS;
@@ -548,13 +740,22 @@ int ag_main(int argc, char **argv)
                 push_status(&k);
             }
         }
+
+        if (!busy) {
+            ag_delay(IDLE_MS);
+        }
     }
 
     ws_drop(&k, "stopping");
     (void)ag_net_close(k.lfd);
     ag_free(k.mem);
     (void)ag_dev_close(k.dev);
-    ag_printf("stopped: %u lines, %u reports, %u lost\n", (unsigned)k.lines,
-              (unsigned)k.reports, (unsigned)k.refused);
+    if (k.vid >= 0) {
+        (void)ag_dev_close(k.vid);
+    }
+    ag_printf("stopped: %u lines, %u reports, %u lost, %u picture messages, "
+              "%u resyncs\n",
+              (unsigned)k.lines, (unsigned)k.reports, (unsigned)k.refused,
+              (unsigned)k.tiles, (unsigned)k.vrx.resyncs);
     return 0;
 }
