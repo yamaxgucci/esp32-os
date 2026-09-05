@@ -837,6 +837,47 @@ static int32_t io_uart_write(int port, const void *buf, size_t len)
     return (n < 0) ? -AG_EIO : n;
 }
 
+static int32_t io_uart_dma_write(int port, const void *buf, size_t len)
+{
+    if (buf == NULL || len == 0) {
+        return -AG_EINVAL;
+    }
+
+    /*
+     * Same shape as the ordinary write, and the same reason for the lock being
+     * where it is: bring-up under it, the transfer outside.  A DMA transfer is
+     * even longer than a buffered write - it returns when the last byte has
+     * left the wire - so holding the io lock across it would be the same
+     * silent board, only for longer.
+     */
+    lock();
+    const ag_err_t err = uart_bring_up(port, NULL);
+    unlock();
+    if (err != AG_OK) {
+        return err;
+    }
+    return ag_port_uart_dma_write(port, buf, len);
+}
+
+static ag_err_t io_uart_tx_wait(int port, uint32_t timeout_ms)
+{
+    if (!ag_port_uart_is_open(port)) {
+        return AG_OK; /* nothing of ours is in a port that is not open */
+    }
+    return ag_port_uart_tx_wait(port, timeout_ms);
+}
+
+static bool io_uart_dma_ready(int port)
+{
+    lock();
+    const ag_err_t err = uart_bring_up(port, NULL);
+    unlock();
+    if (err != AG_OK) {
+        return false;
+    }
+    return ag_port_uart_dma_ready(port);
+}
+
 static int32_t io_uart_read(int port, void *buf, size_t len,
                             uint32_t timeout_ms)
 {
@@ -1048,6 +1089,9 @@ const ag_io_api_t ag_io_api_table = {
     .i2c_probe = io_i2c_probe,
     .spi_xfer = io_spi_xfer,
     .uart_write = io_uart_write,
+    .uart_tx_wait = io_uart_tx_wait,
+    .uart_dma_write = io_uart_dma_write,
+    .uart_dma_ready = io_uart_dma_ready,
     .uart_read = io_uart_read,
     .uart_config = io_uart_config,
 #if AG_PORT_HAS_ADC

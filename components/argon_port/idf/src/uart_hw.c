@@ -265,6 +265,20 @@ bool ag_port_uart_is_open(int port)
     return valid(port) && uart_is_driver_installed(port);
 }
 
+ag_err_t ag_port_uart_tx_wait(int port, uint32_t timeout_ms)
+{
+    if (!valid(port)) {
+        return -AG_EINVAL;
+    }
+    if (is_jtag(port)) {
+        return AG_OK;
+    }
+    if (!uart_is_driver_installed(port)) {
+        return AG_OK; /* nothing of ours is queued if there is no driver */
+    }
+    return from_esp(uart_wait_tx_done(port, pdMS_TO_TICKS(timeout_ms)));
+}
+
 ag_err_t ag_port_uart_flush(int port)
 {
     if (!valid(port)) {

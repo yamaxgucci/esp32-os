@@ -175,7 +175,7 @@ extern "C" {
  * without asking is a null call, and that is on the caller.
  */
 #ifndef AG_ABI_MINOR
-#define AG_ABI_MINOR 43u
+#define AG_ABI_MINOR 44u
 #endif
 
 /* ------------------------------------------------------------------------ */
@@ -1161,6 +1161,35 @@ typedef struct ag_io_api {
      * once, before the first transfer to that chip.
      */
     ag_err_t (*spi_config)(int bus, int cs, uint32_t khz);
+
+    /*
+     * ABI 0.44: the same port, driven by the UART's own DMA.
+     *
+     * uart_write is a thread copying into a ring and waking whenever the
+     * peripheral has room, which is right for a console and wrong for a
+     * picture: a hundred and fifty kilobytes a frame is eighty wake-ups, and
+     * on a busy board that left the wire half idle - 172 KB/s carried of a
+     * possible 400 while a game ran.  dma_write hands the buffer to the
+     * hardware once and returns when the last byte has gone.
+     *
+     * dma_ready says whether this chip and port can: the original ESP32 and
+     * the S2 have no UHCI, and a caller must keep the ordinary write for them.
+     * The buffer may be in extended memory where the hardware allows it, but
+     * alignment is checked and refused rather than worked around - -AG_EINVAL
+     * means "give me an aligned buffer", not "it did not work".
+     *
+     * The two are different masters of one transmitter: do not have a write
+     * in flight on the same port when this is called.
+     */
+    /*
+     * Wait until everything given to this port has left it.  Not a flush -
+     * that word is taken by the call that throws away what has *arrived* -
+     * but the handover between the two masters of one transmitter: whoever
+     * mixes uart_write with uart_dma_write calls this in between.
+     */
+    ag_err_t (*uart_tx_wait)(int port, uint32_t timeout_ms);
+    bool (*uart_dma_ready)(int port);
+    int32_t (*uart_dma_write)(int port, const void *buf, size_t len);
 } ag_io_api_t;
 
 /* ------------------------------------------------------------------------ */

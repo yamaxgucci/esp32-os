@@ -139,26 +139,25 @@ AG_DRV("REMDISP", "2.0", "argon");
  * for any reason to do with the picture.
  */
 /*
- * Below applications, and that is the whole of it.
+ * Above the applications again, and this time it is earned.
  *
- * This task used to run at 6.  Ordinary applications run at 5, so it outranked
- * every one of them - and a priority above applications is a promise to block
- * at once, which this task cannot keep: the transmit ring is 2 KB and a frame
- * is 154, so it wakes and sleeps some eighty times a frame and is runnable
- * nearly throughout.  Measured on the board with no game in the room, an
- * application asking to wait 100 ms waited 415-470; at 3 it waits 117.  With
- * the game: 1.5 frames a second and a 580 ms engine step became 38-51 fps and
- * 17-23 ms.  The wire pays 1.6-1.8 frames a second down to 1.0-1.4, which is
- * the right way round - a picture that is late is better than a game that has
- * stopped.
+ * It ran at 6 by habit and that was the bug: applications run at 5, and a task
+ * above them is promising to hand the core straight back, which a task writing
+ * a hundred and fifty kilobytes through a two-kilobyte ring cannot do.  It was
+ * dropped to 3 and the game came back - 40 fps instead of 1.5 - at the cost of
+ * the picture, which fell to one frame a second because the sender then had to
+ * queue behind everything.
  *
- * It crosses cores, which is worth knowing: only core 0 runs
- * xTaskIncrementTick in IDF FreeRTOS, so it moves every sleeping task on both
- * cores back to the ready list.  Congest core 0 and the application core waits
- * too, whatever is or is not running there.
+ * What changed is that the picture is carried by DMA now.  This task hands a
+ * slice to the hardware and sleeps; it needs about three milliseconds a frame
+ * for the sums and a handful of small writes, so the promise the priority
+ * makes is one it can keep.  And if it ever stops keeping it, the kernel says
+ * so and drops it below the applications until the window turns - see
+ * argon/budget.h.  Measured with all three in place: the game at 36-42 fps,
+ * the screen at 1.8-2.0 whole frames a second, and not one budget warning.
  */
 #ifndef WIRE_PRIO
-#define WIRE_PRIO 3
+#define WIRE_PRIO 6
 #endif
 
 #ifndef NO_AUDIO
@@ -312,6 +311,21 @@ static volatile uint32_t s_spin[2];
 static volatile uint32_t s_laps[2]; /* laps nobody else wanted, per core */
 #endif
 static uint32_t s_in_blit_us, s_in_text_us, s_in_pcm_us;
+/*
+ * Whether the picture is carried by the UART's own DMA.  Decided once, when
+ * the wire task starts, and given up for good if the port ever refuses a
+ * transfer - see ABI 0.44 and the note there about which chips have it.
+ */
+static bool s_dma;
+
+/*
+ * Step four, taken apart.  Three hundred milliseconds a frame were going
+ * somewhere that neither the wire nor the processor could account for, and a
+ * total is no use for finding out which of five things it is.
+ */
+static uint32_t s_t_hdr_us, s_t_wait_hand_us, s_t_dma_us, s_t_sum_us,
+    s_t_rest_us;
+
 static uint32_t s_rx_bytes;   /* everything the far end sent us */
 static uint32_t s_t_fill_us;  /* step 3: PSRAM -> the internal buffer        */
 static uint32_t s_chunks;     /* how many buffer-fulls a frame took          */
@@ -2066,15 +2080,68 @@ static void raw_send_direct(void)
         uint8_t sum = (uint8_t)(acc ^ (acc >> 8) ^ (acc >> 16) ^ (acc >> 24));
         fill_us += (uint32_t)((uint64_t)ag_api()->time->us() - f0);
 
+        /*
+         * -DPIX_VIA_INTERNAL=1 copies the slice into internal memory first and
+         * writes the port from there, so the two can be told apart: does the
+         * port care whether the bytes it is given live in PSRAM?  It was asked
+         * once before and answered "no", but that was while the game was being
+         * starved of its core by four hundred milliseconds at a time, and
+         * nothing smaller than that was visible.  The buffer is the one the
+         * ring already owns, which is big enough for a slice.
+         */
+        const uint8_t *out = pix;
+#if PIX_VIA_INTERNAL
+        if (s_tx_out_sz >= px * sizeof(uint16_t)) {
+            memcpy(s_tx_out, pix, (size_t)px * sizeof(uint16_t));
+            out = s_tx_out;
+        }
+#endif
+
         const uint64_t p0 = (uint64_t)ag_api()->time->us();
         const bool     dheld = lock_take(s_drain_lock, UINT32_MAX);
 #if RAW_SILENT == 4
         ag_delay((uint32_t)((((uint64_t)len + 6ull) * 10ull * 1000ull) /
                             (uint64_t)LINK_BAUD));
 #else
-        (void)io->uart_write(LINK_PORT, hdr, sizeof(hdr));
-        (void)io->uart_write(LINK_PORT, pix, px * sizeof(uint16_t));
-        (void)io->uart_write(LINK_PORT, &sum, 1u);
+        /*
+         * The pixels by hardware where the chip has it, the header and the sum
+         * by hand either way.
+         *
+         * The two are different masters of one transmitter, so the handover is
+         * explicit: everything written by hand has to have left before the DMA
+         * starts.  That wait costs about forty microseconds for seventeen
+         * bytes, thirty times a frame, and buys the wire being pulled at full
+         * rate by something that is not a task waiting for a core.
+         */
+        if (s_dma) {
+            const uint64_t h0 = (uint64_t)ag_api()->time->us();
+            (void)io->uart_write(LINK_PORT, hdr, sizeof(hdr));
+            const uint64_t h1 = (uint64_t)ag_api()->time->us();
+            (void)io->uart_tx_wait(LINK_PORT, 1000u);
+            const uint64_t h2 = (uint64_t)ag_api()->time->us();
+            s_t_hdr_us += (uint32_t)(h1 - h0);
+            s_t_wait_hand_us += (uint32_t)(h2 - h1);
+            const int32_t w =
+                io->uart_dma_write(LINK_PORT, out, px * sizeof(uint16_t));
+            if (w < 0) {
+                /*
+                 * Said once and then never again: a refusal here is a fact
+                 * about this chip or this buffer's alignment, not weather.
+                 */
+                s_dma = false;
+                ag_printf("REMDISP: the port will not take a DMA transfer "
+                          "(%d); sending by hand\n", (int)w);
+                (void)io->uart_write(LINK_PORT, out, px * sizeof(uint16_t));
+            }
+            const uint64_t d1 = (uint64_t)ag_api()->time->us();
+            s_t_dma_us += (uint32_t)(d1 - h2);
+            (void)io->uart_write(LINK_PORT, &sum, 1u);
+            s_t_sum_us += (uint32_t)((uint64_t)ag_api()->time->us() - d1);
+        } else {
+            (void)io->uart_write(LINK_PORT, hdr, sizeof(hdr));
+            (void)io->uart_write(LINK_PORT, out, px * sizeof(uint16_t));
+            (void)io->uart_write(LINK_PORT, &sum, 1u);
+        }
 #endif
         lock_give(s_drain_lock, dheld);
         port_us += (uint32_t)((uint64_t)ag_api()->time->us() - p0);
@@ -2088,9 +2155,11 @@ static void raw_send_direct(void)
          * the ring and this is where they get their turn, and the kernel work
          * the game leans on is served on this core.
          */
+        const uint64_t r0 = (uint64_t)ag_api()->time->us();
         aud_drain();
         (void)tx_drain();
         ag_yield();
+        s_t_rest_us += (uint32_t)((uint64_t)ag_api()->time->us() - r0);
     }
 
     s_t_fill_us += fill_us;
@@ -2188,6 +2257,18 @@ static void raw_stats(void)
     s_in_text_us = 0;
     s_in_pcm_us = 0;
     ag_printf("RAW: bytes in from the far end: %u\n", (unsigned)s_rx_bytes);
+    ag_printf("RAW: step4 apart, us per frame: header %u, handover %u, dma %u, "
+              "sum %u, between %u\n",
+              (unsigned)(s_t_hdr_us / s_raw_frames),
+              (unsigned)(s_t_wait_hand_us / s_raw_frames),
+              (unsigned)(s_t_dma_us / s_raw_frames),
+              (unsigned)(s_t_sum_us / s_raw_frames),
+              (unsigned)(s_t_rest_us / s_raw_frames));
+    s_t_hdr_us = 0;
+    s_t_wait_hand_us = 0;
+    s_t_dma_us = 0;
+    s_t_sum_us = 0;
+    s_t_rest_us = 0;
     s_rx_bytes = 0;
     s_t_gather_us = 0;
     s_t_fill_us = 0;
@@ -2273,6 +2354,16 @@ static void wire_task(void *arg)
 {
     (void)arg;
     s_wire_running = true;
+
+    /*
+     * Asked here rather than at load: the port is open by now, and on a chip
+     * without UHCI - the original ESP32, the S2 - this is simply false and the
+     * ordinary write carries the picture as it always did.
+     */
+    s_dma = (io->uart_dma_ready != NULL) && io->uart_dma_ready(LINK_PORT) &&
+            (io->uart_dma_write != NULL) && (io->uart_tx_wait != NULL);
+    ag_printf("REMDISP: picture by %s\n",
+              s_dma ? "DMA" : "the processor");
 #if PORT_ON_SYS_CORE
     {
         const ag_err_t e = io->uart_config(LINK_PORT, LINK_BAUD, 8, 0, 1);
@@ -2339,7 +2430,14 @@ static void wire_task(void *arg)
          * gone, and a slice asked for after that is answered by the next whole
          * frame instead - which is not worse, only later.
          */
-        const uint64_t until = (uint64_t)ag_api()->time->us() + 30000ull;
+        /*
+         * A moment for the far end to say what it missed, and a shorter one
+         * than it was.  Thirty milliseconds of every frame is seven per cent
+         * of the wire spent on insurance; ten is enough for a request that is
+         * already sitting in the receive buffer, and the far end has asked for
+         * nothing at all since the frames started arriving whole.
+         */
+        const uint64_t until = (uint64_t)ag_api()->time->us() + 10000ull;
         while ((uint64_t)ag_api()->time->us() < until && !s_stop) {
             poll_far_end();
             (void)tx_drain();
