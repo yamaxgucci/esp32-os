@@ -138,6 +138,57 @@ AG_DRV("REMDISP", "2.0", "argon");
  * A slice is eight rows because that is what fits a frame on this wire, not
  * for any reason to do with the picture.
  */
+/*
+ * Below applications, and that is the whole of it.
+ *
+ * This task used to run at 6.  Ordinary applications run at 5, so it outranked
+ * every one of them - and a priority above applications is a promise to block
+ * at once, which this task cannot keep: the transmit ring is 2 KB and a frame
+ * is 154, so it wakes and sleeps some eighty times a frame and is runnable
+ * nearly throughout.  Measured on the board with no game in the room, an
+ * application asking to wait 100 ms waited 415-470; at 3 it waits 117.  With
+ * the game: 1.5 frames a second and a 580 ms engine step became 38-51 fps and
+ * 17-23 ms.  The wire pays 1.6-1.8 frames a second down to 1.0-1.4, which is
+ * the right way round - a picture that is late is better than a game that has
+ * stopped.
+ *
+ * It crosses cores, which is worth knowing: only core 0 runs
+ * xTaskIncrementTick in IDF FreeRTOS, so it moves every sleeping task on both
+ * cores back to the ready list.  Congest core 0 and the application core waits
+ * too, whatever is or is not running there.
+ */
+#ifndef WIRE_PRIO
+#define WIRE_PRIO 3
+#endif
+
+#ifndef NO_AUDIO
+#define NO_AUDIO 0
+#endif
+
+#ifndef SEND_ALWAYS
+#define SEND_ALWAYS 0
+#endif
+
+#ifndef TICK_PRIO
+#define TICK_PRIO 5
+#endif
+
+#ifndef CORE_METER
+#define CORE_METER 0
+#endif
+
+#ifndef PORT_ON_SYS_CORE
+#define PORT_ON_SYS_CORE 0
+#endif
+
+#ifndef PORT_WRITE_MAX
+#define PORT_WRITE_MAX 0
+#endif
+
+#ifndef RAW_SILENT
+#define RAW_SILENT 0
+#endif
+
 #define RAW_ROWS 8u
 
 /*
@@ -245,6 +296,25 @@ static bool s_encode = true;
 static uint64_t s_sent_bytes;
 static uint32_t s_sent_frames;
 static uint32_t s_dropped; /* refused: the ring was full                     */
+/*
+ * Two counters, one per core, at the lowest priority there is.  They do
+ * nothing but add one, so the rate each of them manages is how much of that
+ * core nobody else wanted.  Read them in three states - the driver silent, the
+ * driver asleep instead of writing, the driver really sending - and the
+ * question "is a core being eaten, and which" stops being a matter of opinion.
+ *
+ * -DCORE_METER=1 builds them; they are off otherwise, because an idle-priority
+ * spinner is exactly the sort of thing that should not ship.
+ */
+static volatile uint32_t s_spin[2];
+
+#if CORE_METER
+static volatile uint32_t s_laps[2]; /* laps nobody else wanted, per core */
+#endif
+static uint32_t s_in_blit_us, s_in_text_us, s_in_pcm_us;
+static uint32_t s_rx_bytes;   /* everything the far end sent us */
+static uint32_t s_t_fill_us;  /* step 3: PSRAM -> the internal buffer        */
+static uint32_t s_chunks;     /* how many buffer-fulls a frame took          */
 static uint32_t s_lost;    /* accepted, then the port would not take it       */
 
 /*
@@ -324,7 +394,20 @@ static uint8_t   *s_tx;
 static uint32_t   s_tx_r, s_tx_w, s_tx_used;
 static ag_mutex_t s_tx_lock;   /* the ring's own bookkeeping, held for bytes  */
 static ag_mutex_t s_drain_lock; /* the port itself, held across the write     */
-static uint8_t    s_tx_out[2048];
+/*
+ * The buffer the port reads from, and the ring behind it, both want to be in
+ * internal SRAM rather than PSRAM.  Not for their own speed - they are small -
+ * but because the game is walking PSRAM at the same time on the other core,
+ * and every byte uart_write dribbles out of PSRAM is a byte the game does not
+ * get.  Measured: with the port write skipped the game ran at 20 fps, with it
+ * at 1.7, while the driver only ever occupied the other core.  So take as much
+ * internal memory as the system will part with, and fall back to the static
+ * two kilobytes if it will part with none.
+ */
+#define TX_OUT_STATIC 2048u
+static uint8_t    s_tx_out_fallback[TX_OUT_STATIC];
+static uint8_t   *s_tx_out = s_tx_out_fallback;
+static uint32_t   s_tx_out_sz = TX_OUT_STATIC;
 static bool       s_task_ok;   /* false: no task, so the caller drains        */
 
 static void tx_put(uint8_t b)
@@ -404,8 +487,8 @@ static uint32_t tx_drain(void)
     for (;;) {
         const bool held = lock_take(s_tx_lock, UINT32_MAX);
         uint32_t   n = s_tx_used;
-        if (n > sizeof(s_tx_out)) {
-            n = sizeof(s_tx_out);
+        if (n > s_tx_out_sz) {
+            n = s_tx_out_sz;
         }
         const uint64_t o0 = (uint64_t)ag_api()->time->us();
         for (uint32_t i = 0; i < n; i++) {
@@ -432,6 +515,15 @@ static uint32_t tx_drain(void)
          */
         uint32_t off = 0;
         const uint64_t p0 = (uint64_t)ag_api()->time->us();
+        /*
+         * RAW_SILENT=3: everything happens except the wire.  The frame is
+         * copied, gathered, put through the ring a byte at a time and taken
+         * out of it again - and then thrown away.  If the game is fast in this
+         * build the cost is the port; if it is slow, the cost is ours.
+         */
+#if RAW_SILENT == 3
+        off = n;
+#endif
         while (off < n) {
             const int32_t w = io->uart_write(LINK_PORT, s_tx_out + off, n - off);
             if (w <= 0) {
@@ -750,6 +842,14 @@ static void poll_far_end(void)
         if (n <= 0) {
             return;
         }
+        /*
+         * Counted, because the far end says very little and anything else
+         * arriving is the wire talking to itself.  Two hand-soldered lines
+         * side by side, one of them swinging at four megabaud: if the receiver
+         * is picking that up, it is taking an interrupt for every few bytes of
+         * nothing, and that is a cost nobody has looked for.
+         */
+        s_rx_bytes += (uint32_t)n;
         for (int32_t i = 0; i < n; i++) {
             if (s_stat_have != 0xffffffffu) {
                 s_stat[s_stat_have++] = buf[i];
@@ -1481,7 +1581,7 @@ static bool dmg_take(uint32_t *x, uint32_t *y, uint32_t *w, uint32_t *h)
     return got;
 }
 
-static void rem_blit_rect(ag_handle_t h, const ag_blit_t *b)
+static void rem_blit_rect_inner(ag_handle_t h, const ag_blit_t *b)
 {
     (void)h;
     if (b == NULL || b->px == NULL || b->w == 0 || b->h == 0) {
@@ -1887,6 +1987,122 @@ static uint32_t raw_slices(void)
     return (s_fb_h + RAW_ROWS - 1u) / RAW_ROWS;
 }
 
+/* ---- steps 3 and 4: PSRAM to internal memory, internal memory to the wire -
+ *
+ * Maxim's shape, and it exists to settle one question and no other: does
+ * reading and writing PSRAM slow the game down?  So PSRAM is touched exactly
+ * once beyond the copy of step 2, and touched the way hardware likes it -
+ * straight through, largest run we can hold.  Fill as much of an internal
+ * buffer as it will take with finished frames, hand the port that buffer, and
+ * go round again until the picture is out.  No slice staged in PSRAM, no ring.
+ *
+ * If the game is still slow in this shape, PSRAM is not what is slowing it,
+ * and the hypothesis is dead rather than wounded.
+ */
+static void raw_send_direct(void)
+{
+    const uint32_t slices = raw_slices();
+    const uint32_t framed = 5u + 12u + RAW_ROWS * s_fb_w * 2u + 1u;
+
+    uint32_t c = 0;
+    while (c < slices && !s_stop) {
+        /* Step 3.  Whole slices only: a chunk never ends mid-frame, so the
+         * far end never has to know this buffer exists. */
+        const uint64_t f0 = (uint64_t)ag_api()->time->us();
+        uint32_t n = 0;
+        while (c < slices && n + framed <= s_tx_out_sz) {
+            const uint32_t y0 = c * RAW_ROWS;
+            uint32_t rows = RAW_ROWS;
+            if (y0 + rows > s_fb_h) {
+                rows = s_fb_h - y0;
+            }
+            const uint32_t px  = rows * s_fb_w;
+            const uint32_t len = 12u + px * sizeof(uint16_t);
+            uint8_t *const q = s_tx_out + n;
+
+            q[0] = FR_MAGIC0;
+            q[1] = FR_MAGIC1;
+            q[2] = FR_RAW;
+            q[3] = (uint8_t)len;
+            q[4] = (uint8_t)(len >> 8);
+            put16(q + 5, s_frame_no);
+            put16(q + 7, c);
+            put16(q + 9, slices);
+            put16(q + 11, s_fb_w);
+            put16(q + 13, y0);
+            put16(q + 15, rows);
+            memcpy(q + 17, s_fb + (size_t)y0 * s_fb_w,
+                   (size_t)px * sizeof(uint16_t));
+
+            uint8_t sum = 0;
+            for (uint32_t i = 0; i < len; i++) {
+                sum = (uint8_t)(sum ^ q[5 + i]);
+            }
+            q[5 + len] = sum;
+
+            n += 5u + len + 1u;
+            c++;
+            s_sent_frames++;
+        }
+        s_t_fill_us += (uint32_t)((uint64_t)ag_api()->time->us() - f0);
+
+        /* Step 4.  The port reads internal memory and nothing else. */
+        const uint64_t p0 = (uint64_t)ag_api()->time->us();
+        const bool dheld = lock_take(s_drain_lock, UINT32_MAX);
+        uint32_t off = 0;
+        /*
+         * RAW_SILENT=4: the same time, spent asleep instead of writing.  Eight
+         * bits and two of framing is ten bits a byte, so at LINK_BAUD this
+         * chunk would take n*10/baud seconds on the wire, and that is exactly
+         * how long we sit here doing nothing.  The task is busy for the same
+         * stretch of every second and yields at the same points; the only
+         * thing missing is the peripheral.  If the game is still slow, the
+         * UART is innocent and it is the shape of the waiting that costs.
+         */
+#if RAW_SILENT == 4
+        /* Outside the lock, not inside it: sleeping with the port held is the
+         * one thing the real write does not do, and holding it silences the
+         * console for the whole nap - which is a difference the control was
+         * not supposed to have. */
+        lock_give(s_drain_lock, dheld);
+        ag_delay((uint32_t)(((uint64_t)n * 10ull * 1000ull) / (uint64_t)LINK_BAUD));
+        (void)lock_take(s_drain_lock, UINT32_MAX);
+        off = n;
+#endif
+        while (off < n && !s_stop) {
+            /*
+             * How big a bite the port is given.  Zero means the whole buffer
+             * in one call; -DPORT_WRITE_MAX=1024 asks it in kilobytes instead,
+             * thirty-two times per buffer.  Same bytes, same order, same
+             * everything else - only the size of the mouthful changes.
+             */
+            uint32_t take = n - off;
+#if PORT_WRITE_MAX
+            if (take > (uint32_t)PORT_WRITE_MAX) {
+                take = (uint32_t)PORT_WRITE_MAX;
+            }
+#endif
+            const int32_t w = io->uart_write(LINK_PORT, s_tx_out + off, take);
+            if (w <= 0) {
+                s_lost += n - off;
+                break;
+            }
+            off += (uint32_t)w;
+        }
+        lock_give(s_drain_lock, dheld);
+        s_t_port_us += (uint32_t)((uint64_t)ag_api()->time->us() - p0);
+        s_sent_bytes += off;
+        s_chunks++;
+
+        /* The console and the sound still go through the ring; drain them
+         * between chunks, and stand aside so the kernel work the game leans
+         * on keeps being served. */
+        aud_drain();
+        (void)tx_drain();
+        ag_yield();
+    }
+}
+
 /* Send one slice by number, for a far end that missed it. */
 static void raw_resend(uint32_t frame, uint32_t slice)
 {
@@ -1922,9 +2138,14 @@ static void raw_stats(void)
     if (s_raw_frames == 0u) {
         return;
     }
+#if RAW_SILENT == 0
     if (s_last_text_us > s_last_blit_us) {
         return; /* the console has the glass; do not scroll it */
     }
+#endif
+    /* In a bisection build nothing reaches the monitor, so the console always
+     * owns the glass and the report above would never be printed - and silence
+     * there is indistinguishable from a driver that did no work at all. */
 
     const uint32_t secs = (uint32_t)(STAT_US / 1000000ull);
     const uint32_t fps100 = s_raw_frames * 100u / secs;
@@ -1944,12 +2165,38 @@ static void raw_stats(void)
               (unsigned)s_t_send_us, (unsigned)s_t_wait_us,
               (unsigned)s_raw_resent);
     /* Per frame, so it can be read against the copy and the wire. */
-    ag_printf("RAW: per frame us: gather %u, ring %u, out %u, port %u\n",
-              (unsigned)(s_t_gather_us / s_raw_frames),
+    ag_printf("RAW: per frame us: step2 copy %u, step3 fill %u, step4 port %u"
+              " (%u chunks of %u B); ring %u, out %u\n",
+              (unsigned)(s_t_copy_us),
+              (unsigned)(s_t_fill_us / s_raw_frames),
+              (unsigned)(s_t_port_us / s_raw_frames),
+              (unsigned)(s_chunks / s_raw_frames),
+              (unsigned)s_tx_out_sz,
               (unsigned)(s_t_ring_us / s_raw_frames),
-              (unsigned)(s_t_out_us / s_raw_frames),
-              (unsigned)(s_t_port_us / s_raw_frames));
+              (unsigned)(s_t_out_us / s_raw_frames));
+#if CORE_METER
+    {
+        static uint32_t was[2];
+        const uint32_t  a = s_laps[0], b = s_laps[1];
+        ag_printf("RAW: free laps per second: sys %u, app %u\n",
+                  (unsigned)((a - was[0]) / (unsigned)(STAT_US / 1000000ull)),
+                  (unsigned)((b - was[1]) / (unsigned)(STAT_US / 1000000ull)));
+        was[0] = a;
+        was[1] = b;
+    }
+#endif
+    ag_printf("RAW: worst us the caller spent inside: blit %u, text %u, "
+              "pcm %u\n",
+              (unsigned)s_in_blit_us, (unsigned)s_in_text_us,
+              (unsigned)s_in_pcm_us);
+    s_in_blit_us = 0;
+    s_in_text_us = 0;
+    s_in_pcm_us = 0;
+    ag_printf("RAW: bytes in from the far end: %u\n", (unsigned)s_rx_bytes);
+    s_rx_bytes = 0;
     s_t_gather_us = 0;
+    s_t_fill_us = 0;
+    s_chunks = 0;
     s_t_ring_us = 0;
     s_t_out_us = 0;
     s_t_port_us = 0;
@@ -1962,10 +2209,83 @@ static void raw_stats(void)
     s_raw_resent = 0;
 }
 
+#if CORE_METER
+/*
+ * How much of each core nobody wanted: one counter per core, below every
+ * application, counting laps.  The number means nothing on its own - only
+ * against the same build in the other state, which is why it is always run
+ * twice: driver asleep, driver sending.
+ *
+ * It stands aside every few thousand laps.  The first version did not, and two
+ * tasks that never yield silenced the whole board.
+ */
+static void spin_task(void *arg)
+{
+    const uint32_t which = (uint32_t)(uintptr_t)arg;
+    uint32_t       n = 0;
+    while (!s_stop) {
+        s_laps[which]++;
+        if (++n >= 4096u) {
+            n = 0;
+            ag_yield();
+        }
+    }
+}
+#endif
+
+#if CORE_METER
+/*
+ * A clock with no hands, on the game's own core.
+ *
+ * It asks to be woken every hundred milliseconds and reports how late it was,
+ * measured against when the tick was due rather than against the previous one,
+ * so a stall is reported once at its true size.  It waits on nothing but the
+ * clock: no wire, no screen, no card.  If this is late while a frame is going
+ * out, the system is not running the application core's threads, which is
+ * Maxim's reading; if it is punctual while the game crawls, then nothing is
+ * being starved and the game is waiting on something of its own.
+ */
+static void tick_task(void *arg)
+{
+    (void)arg;
+    ag_printf("RAW: tick task alive\n");
+    const uint64_t us0 = (uint64_t)ag_api()->time->us();
+    uint64_t due = us0;
+    uint32_t n = 0, worst = 0;
+    while (!s_stop) {
+        due += 100000ull;
+        const uint64_t now = (uint64_t)ag_api()->time->us();
+        if (due > now) {
+            ag_delay((uint32_t)((due - now) / 1000ull));
+        }
+        const uint64_t woke = (uint64_t)ag_api()->time->us();
+        const uint32_t late =
+            (woke > due) ? (uint32_t)((woke - due) / 1000ull) : 0u;
+        if (late > worst) {
+            worst = late;
+        }
+        if (++n >= 10u) {
+            ag_printf("RAW: app-core tick: worst late %u ms of 10\n",
+                      (unsigned)worst);
+            worst = 0;
+            n = 0;
+        }
+    }
+}
+#endif
+
 static void wire_task(void *arg)
 {
     (void)arg;
     s_wire_running = true;
+#if PORT_ON_SYS_CORE
+    {
+        const ag_err_t e = io->uart_config(LINK_PORT, LINK_BAUD, 8, 0, 1);
+        ag_printf("REMDISP: port opened from the wire task: %s\n",
+                  ag_strerror(e));
+        s_up = (e == AG_OK);
+    }
+#endif
     while (!s_stop) {
         poll_far_end();
         (void)tx_drain();
@@ -1976,7 +2296,26 @@ static void wire_task(void *arg)
          * game copies it at the end of its own frame - see rem_blit_rect - so
          * what arrives here is never half drawn.
          */
-        if (!s_have_copy) {
+        /*
+         * Built with -DRAW_SILENT=1 this driver publishes its devices, takes
+         * its task and its frame, and sends nothing at all - no copy, no
+         * slices, no port.  It exists to answer one question that three
+         * arithmetically impossible explanations failed to: is what costs the
+         * game the *sending*, or merely this driver being here?  One variable,
+         * and the game's own eng says which.
+         */
+#if RAW_SILENT == 1
+        ag_delay(20);
+        continue;
+#endif
+        /*
+         * -DSEND_ALWAYS=1: do not wait for anybody to draw.  The buffer is
+         * whatever it happens to hold, and it goes out again and again, which
+         * is all that is wanted from a test whose question is what a busy wire
+         * does to everything else.  With this the game need not be running at
+         * all, so nothing of the game's own can be blamed or credited.
+         */
+        if (!s_have_copy && !SEND_ALWAYS) {
             const uint64_t w0 = (uint64_t)ag_api()->time->us();
             s_want_copy = true;
             aud_drain();
@@ -1994,40 +2333,7 @@ static void wire_task(void *arg)
 
         const uint64_t t0 = (uint64_t)ag_api()->time->us();
         const uint64_t b0 = s_sent_bytes;
-        const uint32_t slices = raw_slices();
-        for (uint32_t c = 0; c < slices && !s_stop; c++) {
-            const uint32_t y0 = c * RAW_ROWS;
-            uint32_t rows = RAW_ROWS;
-            if (y0 + rows > s_fb_h) {
-                rows = s_fb_h - y0;
-            }
-            (void)raw_send_slice(c, slices, y0, rows);
-            /* Between slices, not after them: the ring is 24 KB and a frame
-             * is 150, so a frame that is not drained as it goes is a frame
-             * that refuses most of itself. */
-            aud_drain();
-            (void)tx_drain();
-            /*
-             * And stand aside between slices.
-             *
-             * A frame is three hundred and seventy-five milliseconds of wire
-             * at four megabaud, and without this line the task spends all of
-             * it on the system core without yielding once - building a slice,
-             * then sitting in a blocking write, thirty times over.  The game
-             * runs on the other core, so that looks harmless and is not: the
-             * kernel work the game depends on - the card, the art cache, the
-             * file mappings - is served here, and it stops being served.
-             *
-             * Measured, that took the game from 28 frames a second to 2.3, and
-             * the number that gave it away was `eng`: the *engine* step went
-             * from 20 ms to 400 while the copy stayed at 7 and the wire at 6.
-             * Nothing this driver was doing to the game's own thread could
-             * have cost that, and the arithmetic said so - seven milliseconds
-             * twice a second is one and a half per cent, not a factor of
-             * twelve.  What it was doing was to everything else.
-             */
-            ag_yield();
-        }
+        raw_send_direct();
         s_t_send_us = (uint32_t)((uint64_t)ag_api()->time->us() - t0);
         s_raw_bytes += s_sent_bytes - b0;
         s_raw_frames++;
@@ -2212,7 +2518,7 @@ static void send_row_now(uint16_t row)
     send_frame(FR_ROW, payload, 2u + count * 2u);
 }
 
-static void rem_text_row(ag_handle_t h, uint16_t row,
+static void rem_text_row_inner(ag_handle_t h, uint16_t row,
                          const ag_textcell_t *cells, uint16_t count)
 {
     (void)h;
@@ -2421,7 +2727,7 @@ static ag_err_t rem_pcm_close(ag_device_t *dev)
  * wire.  An effect that lives in one channel would otherwise vanish, and there
  * is no stereo at the other end to lose it in.
  */
-static int32_t rem_pcm_write(ag_device_t *dev, const void *buf, size_t len,
+static int32_t rem_pcm_write_inner(ag_device_t *dev, const void *buf, size_t len,
                              uint64_t off)
 {
     (void)dev;
@@ -2521,6 +2827,49 @@ static ag_err_t rem_pcm_ioctl(ag_device_t *dev, uint32_t cmd, void *arg,
     return -AG_ENOTSUP;
 }
 
+/* ---- how long the caller spends in here ---------------------------------
+ *
+ * Everything the game asks of this driver goes through one of these three, so
+ * timing them from the outside answers the question the whole investigation
+ * came down to: while a frame is on the wire the game's engine step grows from
+ * 20 ms to 580, its own core is provably free, and a thread of priority twelve
+ * on that core wakes on time.  So the game is waiting somewhere, and if it is
+ * waiting in here, this is where it shows.  Worst case per window, because an
+ * average would hide exactly the stall being hunted.
+ */
+static void rem_blit_rect(ag_handle_t h, const ag_blit_t *b)
+{
+    const uint64_t t0 = (uint64_t)ag_api()->time->us();
+    rem_blit_rect_inner(h, b);
+    const uint32_t d = (uint32_t)((uint64_t)ag_api()->time->us() - t0);
+    if (d > s_in_blit_us) {
+        s_in_blit_us = d;
+    }
+}
+
+static void rem_text_row(ag_handle_t h, uint16_t row,
+                         const ag_textcell_t *cells, uint16_t count)
+{
+    const uint64_t t0 = (uint64_t)ag_api()->time->us();
+    rem_text_row_inner(h, row, cells, count);
+    const uint32_t d = (uint32_t)((uint64_t)ag_api()->time->us() - t0);
+    if (d > s_in_text_us) {
+        s_in_text_us = d;
+    }
+}
+
+static int32_t rem_pcm_write(ag_device_t *dev, const void *buf, size_t len,
+                             uint64_t off)
+{
+    const uint64_t t0 = (uint64_t)ag_api()->time->us();
+    const int32_t  r = rem_pcm_write_inner(dev, buf, len, off);
+    const uint32_t d = (uint32_t)((uint64_t)ag_api()->time->us() - t0);
+    if (d > s_in_pcm_us) {
+        s_in_pcm_us = d;
+    }
+    return r;
+}
+
 static const ag_dev_ops_t k_pcm_ops = {
     .open = rem_pcm_open,
     .close = rem_pcm_close,
@@ -2617,7 +2966,20 @@ ag_err_t ag_driver_init(void)
      * header warns about.  Failing now also means the fault arrives as a driver
      * that did not load rather than as a screen that stays dark for no reason.
      */
+    /*
+     * Where this call is made decides which core the UART's interrupt lands
+     * on: uart_driver_install allocates it on the calling core, and this
+     * function runs on the console's - which is the game's.  At four megabaud
+     * the transmitter empties its FIFO every 320 us, so that is three thousand
+     * interrupts a second into whichever core is unlucky.  Built with
+     * -DPORT_ON_SYS_CORE=1 the port is opened by the wire task instead, which
+     * is pinned to the system core, and nothing else changes.
+     */
+#if PORT_ON_SYS_CORE
+    const ag_err_t err = AG_OK;
+#else
     const ag_err_t err = io->uart_config(LINK_PORT, LINK_BAUD, 8, 0, 1);
+#endif
     if (err != AG_OK) {
         ag_printf("REMDISP: uart%d at %u baud: %s\n", LINK_PORT,
                   (unsigned)LINK_BAUD, ag_strerror(err));
@@ -2657,7 +3019,18 @@ ag_err_t ag_driver_init(void)
             .ops = &k_pcm_ops,
             .priv = NULL,
         };
+        /*
+         * -DNO_AUDIO=1 leaves the speaker unpublished, so the game finds no
+         * sink on this wire and its sound goes nowhere.  One variable, and it
+         * decides whether what stalls the game is the picture leaving or the
+         * sound trying to leave beside it: the game paces itself on audio, and
+         * audio here shares the wire with a hundred and fifty kilobytes.
+         */
+#if NO_AUDIO
+        const ag_err_t pcm_added = -AG_EINVAL;
+#else
         const ag_err_t pcm_added = ag_dev_add(&pcm);
+#endif
         if (pcm_added != AG_OK) {
             ag_printf("REMDISP: no pcmrem (%s); the screen still works\n",
                       ag_strerror(pcm_added));
@@ -2702,7 +3075,30 @@ ag_err_t ag_driver_init(void)
      */
     s_fb_w = 320u;
     s_fb_h = 240u;
+    /*
+     * Internal first, and as big a mouthful as it will give: 32 KB means one
+     * uart_write per two slices instead of seventy-five per frame, and the
+     * port stops reading PSRAM altogether.  Whatever is refused falls back to
+     * what was there before, so a system with no internal memory to spare
+     * still gets a picture - just the slow one.
+     */
+    static const uint32_t want[] = { 32768u, 16384u, 8192u, 4096u };
+    for (uint32_t i = 0; i < sizeof(want) / sizeof(want[0]); i++) {
+        uint8_t *fast = (uint8_t *)ag_malloc_caps(want[i], AG_MEM_FAST);
+        if (fast != NULL) {
+            s_tx_out    = fast;
+            s_tx_out_sz = want[i];
+            break;
+        }
+    }
+    /* The ring stays where it was on purpose: one variable per measurement,
+     * and this run is about the buffer the port reads from. */
     s_tx = (uint8_t *)ag_malloc(TX_RING);
+    ag_printf("REMDISP: port buffer %u B %s, ring %u B\n",
+              (unsigned)s_tx_out_sz,
+              (s_tx_out == s_tx_out_fallback) ? "in PSRAM (none spare)"
+                                              : "internal",
+              (unsigned)TX_RING);
     s_fb = (uint16_t *)ag_malloc((size_t)s_fb_w * s_fb_h * sizeof(uint16_t));
     if (s_fb == NULL || s_tx == NULL) {
         s_fb_w = 0;
@@ -2723,7 +3119,26 @@ ag_err_t ag_driver_init(void)
          * life blocked on a UART, so preferring it costs nothing.
          */
         s_stop = false;
-        if (!ag_module_task(wire_task, NULL, "remwire", 6144u, 6,
+#if CORE_METER
+        /*
+         * One probe, not three.  A module is allowed two tasks, and the wire
+         * needs one of them: asking for more took the wire's slot and the
+         * driver quietly fell back to sending from whoever draws - which sent
+         * nothing at all, and made a run that looked like a cure.
+         */
+        ag_printf("RAW: tick probe: %s\n",
+                  ag_module_task(tick_task, NULL, "remtick", 3072u, TICK_PRIO,
+                                 AG_THREAD_APP_CORE)
+                      ? "yes" : "no");
+#endif
+        /*
+         * The priority is a knob because it is a claim, not a fact: six is
+         * above every ordinary application, and a task above applications is
+         * promising to block at once.  This one does not - it sits in a write
+         * that lasts most of a frame.  -DWIRE_PRIO=3 puts it below them and
+         * says whether that promise is what the game is paying for.
+         */
+        if (!ag_module_task(wire_task, NULL, "remwire", 6144u, WIRE_PRIO,
                             AG_THREAD_SYS_CORE)) {
             ag_free(s_fb);
             s_fb = NULL;

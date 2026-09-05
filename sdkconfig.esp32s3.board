@@ -135,3 +135,9 @@ CONFIG_USB_HOST_EXT_PORT_RESET_ATTEMPTS=3
 CONFIG_USB_HOST_EXT_PORT_RESET_RECOVERY_DELAY_MS=200
 CONFIG_USB_HOST_EXT_PORT_CUSTOM_POWER_ON_DELAY_ENABLE=y
 CONFIG_USB_HOST_EXT_PORT_CUSTOM_POWER_ON_DELAY_MS=500
+
+# The UART interrupt was tried in IRAM here (CONFIG_UART_ISR_IN_IRAM) on the
+# theory that its handler was thrashing the flash cache both cores share.  It
+# changed nothing measurable, and it costs more internal memory than this board
+# can spare: the UART driver then wants its rings in internal RAM, three
+# installs fail, and the game faults.  Written down so it is not tried twice.
