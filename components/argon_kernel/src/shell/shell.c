@@ -13,6 +13,7 @@
 #include <argon/board.h>
 #include <argon/cmdline.h>
 #include <argon/codepage.h>
+#include <argon/budget.h>
 #include <argon/console.h>
 #include <argon/session.h>
 #include <argon/display.h>
@@ -977,6 +978,30 @@ static int cmd_ps(int argc, char **argv)
     if (shown == 0) {
         ag_console_puts("  no applications loaded\n");
     }
+
+    /*
+     * And the driver tasks that run above applications, with what they spent
+     * of their budget in the window that just closed.  They are not processes
+     * and have no pid, but they are the only things on this machine that can
+     * starve one, so this is where a person looks when an application is slow
+     * for no reason it can see.
+     */
+    for (uint32_t i = 0;; i++) {
+        const char *name = NULL;
+        uint32_t    used = 0, budget = 0;
+        bool        demoted = false;
+        if (!ag_budget_report(i, &name, &used, &budget, &demoted)) {
+            break;
+        }
+        if (i == 0) {
+            ag_console_puts(
+                "  driver tasks above applications, per 100 ms window:\n");
+        }
+        ag_console_printf("  %-17s used %3u ms of %3u%s\n", name,
+                          (unsigned)used, (unsigned)budget,
+                          demoted ? "  (held down)" : "");
+    }
+
     return 0;
 }
 

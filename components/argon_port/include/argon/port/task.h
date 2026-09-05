@@ -39,6 +39,13 @@
  *   void ag_port_notify_take(bool clear, ag_port_ticks_t ticks)
  *
  *   void ag_port_task_yield(void)
+ *
+ *   typedef void (*ag_port_tick_fn)(int core, ag_port_task_t running)
+ *   bool ag_port_tick_hook(ag_port_tick_fn fn)
+ *       Called on every system tick, on every core, in interrupt context, with
+ *       the task that was running there.  For charging processor time to whoever
+ *       spent it.  Must be short and must not block.  Registered once and never
+ *       taken back.
  *   void ag_port_sched_lock(void)
  *   void ag_port_sched_unlock(void)
  *

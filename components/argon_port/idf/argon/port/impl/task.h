@@ -17,6 +17,7 @@
 #ifndef ARGON_PORT_IMPL_TASK_H
 #define ARGON_PORT_IMPL_TASK_H
 
+#include "esp_attr.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "sdkconfig.h"
@@ -94,6 +95,34 @@ static inline void ag_port_notify_take(bool clear, ag_port_ticks_t ticks)
 }
 
 static inline void ag_port_task_yield(void) { taskYIELD(); }
+
+/*
+ * The tick, per core, in interrupt context.  Not inline: registering it needs
+ * esp_freertos_hooks.h and two trampolines, which is a source file's work -
+ * see src/tick_hw.c.
+ */
+/*
+ * A tick callback must live where the instruction cache being off cannot reach
+ * it, and must call nothing that does not.  The tick fires on both cores all
+ * the time, including while a flash write has the cache disabled, and a
+ * handler in flash then takes the core down with "Cache disabled but cached
+ * memory region accessed".  That is not a theory: it panicked this board on
+ * the first boot after the hook was added.
+ */
+#define AG_PORT_IRAM IRAM_ATTR
+
+typedef void (*ag_port_tick_fn)(int core, ag_port_task_t running);
+bool ag_port_tick_hook(ag_port_tick_fn fn);
+
+/* A notification from interrupt context, with the yield the ISR owes. */
+static inline void ag_port_notify_give_isr(ag_port_task_t t)
+{
+    BaseType_t woken = pdFALSE;
+    vTaskNotifyGiveFromISR(t, &woken);
+    if (woken == pdTRUE) {
+        portYIELD_FROM_ISR();
+    }
+}
 
 static inline void ag_port_sched_lock(void) { vTaskSuspendAll(); }
 
