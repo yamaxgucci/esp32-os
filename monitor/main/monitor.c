@@ -66,6 +66,29 @@ static const char *TAG = "monitor";
 #define FR_MAGIC0 0xA5u
 #define FR_MAGIC1 0x5Au
 #define FR_RAW    0x46u /* F */
+
+/*
+ * A raw slice is one packet now, and the packet is what the sender's memory
+ * already looks like: thirty-two bytes of header and then the pixels, laid out
+ * so the whole thing can leave by DMA in a single transfer with no processor
+ * touching it.  That is why the sum is *in* the header instead of after the
+ * payload - a trailing byte would have to be written by somebody, and the only
+ * somebody available after the pixels is the processor this arrangement exists
+ * to keep out of the way.
+ *
+ *   0   two magic bytes, the op, and a sixteen-bit length  (five bytes)
+ *   5   frame, slice, slices, width, y, rows               (twelve)
+ *   17  the sum, over the twelve above and the pixels
+ *   18  padding to the alignment the sender's DMA wants
+ *   32  the pixels
+ *
+ * The length counts everything after the five, padding included, so a reader
+ * that does not care about any of this can still skip the frame.
+ */
+#define PKT_HDR   32u
+#define PKT_GEOM  12u  /* bytes of geometry, from payload offset 0 */
+#define PKT_SUM   12u  /* where the sum sits, in payload offsets   */
+#define PKT_PIX   (PKT_HDR - 5u) /* payload offset of the pixels    */
 #define FR_RESEND 0x52u /* R */
 #define RAW_ROWS  8u
 #define SLICES    (LCD_H / RAW_ROWS) /* 30 */
@@ -77,6 +100,7 @@ static uint32_t  s_asked;
 static int32_t   s_frame_no = -1;
 
 static uint32_t s_stat_frames, s_stat_slices, s_stat_partial, s_stat_asked;
+static uint32_t s_stat_bad; /* slices whose sum did not agree */
 static uint64_t s_stat_paint_us;
 
 static spi_device_handle_t s_spi;
@@ -248,8 +272,30 @@ static void slice_in(const uint8_t *p, uint32_t len)
     const uint32_t rows = rd16(p + 10);
 
     if (w != LCD_W || slices != SLICES || slice >= SLICES || rows == 0 ||
-        rows > RAW_ROWS || y0 + rows > LCD_H || len < 12u + rows * w * 2u) {
+        rows > RAW_ROWS || y0 + rows > LCD_H ||
+        len < PKT_PIX + rows * w * 2u) {
         return;
+    }
+
+    /*
+     * The sum, over the geometry and the pixels - not over the padding, which
+     * carries nothing and would only make the two ends agree about zeroes.
+     * A slice that does not add up is dropped and asked for again by the gap
+     * logic below, exactly as a missing one is.
+     */
+    {
+        uint8_t got = 0;
+        for (uint32_t i = 0; i < PKT_GEOM; i++) {
+            got = (uint8_t)(got ^ p[i]);
+        }
+        const uint8_t *pix = p + PKT_PIX;
+        for (uint32_t i = 0; i < rows * w * 2u; i++) {
+            got = (uint8_t)(got ^ pix[i]);
+        }
+        if (got != p[PKT_SUM]) {
+            s_stat_bad++;
+            return;
+        }
     }
     s_stat_slices++;
 
@@ -271,7 +317,7 @@ static void slice_in(const uint8_t *p, uint32_t len)
         }
     }
 
-    const uint8_t *src = p + 12;
+    const uint8_t *src = p + PKT_PIX;
     uint16_t *dst = s_frame + (size_t)y0 * LCD_W;
     for (uint32_t i = 0; i < rows * w; i++) {
         dst[i] = (uint16_t)((uint16_t)src[i * 2u + 1u] |
@@ -292,7 +338,7 @@ static void slice_in(const uint8_t *p, uint32_t len)
 static void reader(void *arg)
 {
     static uint8_t io[4096];
-    static uint8_t payload[16 + LCD_W * RAW_ROWS * 2];
+    static uint8_t payload[PKT_PIX + LCD_W * RAW_ROWS * 2];
     enum { HUNT0, HUNT1, OP, LEN0, LEN1, BODY, SUM } st = HUNT0;
     uint32_t op = 0, len = 0, at = 0;
     uint8_t sum = 0;
@@ -335,13 +381,24 @@ static void reader(void *arg)
                 payload[at++] = b;
                 sum = (uint8_t)(sum ^ b);
                 if (at == len) {
-                    st = SUM;
+                    /*
+                     * A picture packet carries its sum inside and has nothing
+                     * after the payload; everything else - console rows, sound
+                     * - still ends with one, and is still read the old way.
+                     */
+                    if (op == FR_RAW) {
+                        if (len >= PKT_PIX) {
+                            slice_in(payload, len);
+                        }
+                        st = HUNT0;
+                    } else {
+                        st = SUM;
+                    }
                 }
                 break;
             case SUM:
-                if (b == sum && op == FR_RAW && len >= 12u) {
-                    slice_in(payload, len);
-                }
+                /* Console and sound only; the picture never reaches here. */
+                (void)sum;
                 st = HUNT0;
                 break;
             }
@@ -404,11 +461,11 @@ void app_main(void)
         const uint64_t pu = s_stat_paint_us - last_paint;
         ESP_LOGI(TAG,
                  "%u.%u frames/s, %u slices/s, paint %u us, %u partial, "
-                 "%u asked, %u free",
+                 "%u asked, %u bad, %u free",
                  (unsigned)(f / 5u), (unsigned)((f * 2u) % 10u),
                  (unsigned)(sl / 5u), (unsigned)(f ? (pu / f) : 0),
                  (unsigned)s_stat_partial, (unsigned)s_stat_asked,
-                 (unsigned)esp_get_free_heap_size());
+                 (unsigned)s_stat_bad, (unsigned)esp_get_free_heap_size());
         last_frames = s_stat_frames;
         last_slices = s_stat_slices;
         last_paint = s_stat_paint_us;

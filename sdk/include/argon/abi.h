@@ -1190,6 +1190,17 @@ typedef struct ag_io_api {
     ag_err_t (*uart_tx_wait)(int port, uint32_t timeout_ms);
     bool (*uart_dma_ready)(int port);
     int32_t (*uart_dma_write)(int port, const void *buf, size_t len);
+
+    /*
+     * The same in two halves, for a caller with more than one thing to send:
+     * submit hands a buffer to the hardware and returns, drain waits for
+     * everything still out.  Waiting for each transfer in turn leaves the wire
+     * idle between them - about a quarter of a frame, measured - because the
+     * next one cannot start until a task has been scheduled to start it.  The
+     * buffers stay the hardware's until drain returns.
+     */
+    int32_t (*uart_dma_submit)(int port, const void *buf, size_t len);
+    ag_err_t (*uart_dma_drain)(int port);
 } ag_io_api_t;
 
 /* ------------------------------------------------------------------------ */

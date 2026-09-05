@@ -39,9 +39,22 @@
 #define AG_PORT_UART_MAX 3
 #endif
 
+/*
+ * Four in the queue, because one at a time leaves the wire idle.
+ *
+ * A transfer that is only started after the last one finished costs a
+ * wake-up between every pair - the interrupt gives the semaphore, the task has
+ * to be scheduled to see it, and the transmitter has nothing to send until it
+ * is.  Measured over thirty slices that was about a hundred milliseconds of a
+ * four-hundred millisecond frame.  With a queue the next slice is already
+ * waiting when the last byte of this one leaves.
+ */
+#define AG_DMA_QUEUE 4
+
 typedef struct {
     uhci_controller_handle_t ctrl;
-    SemaphoreHandle_t        done;
+    SemaphoreHandle_t        done;   /* counts finished transfers */
+    uint32_t                 out;    /* handed over, not yet finished */
     bool                     tried;
 } dma_port_t;
 
@@ -72,7 +85,7 @@ static dma_port_t *dma_for(int port)
     }
     d->tried = true;
 
-    d->done = xSemaphoreCreateBinary();
+    d->done = xSemaphoreCreateCounting(AG_DMA_QUEUE, 0);
     if (d->done == NULL) {
         return NULL;
     }
@@ -85,7 +98,7 @@ static dma_port_t *dma_for(int port)
      */
     const uhci_controller_config_t cfg = {
         .uart_port = (uart_port_t)port,
-        .tx_trans_queue_depth = 2,
+        .tx_trans_queue_depth = AG_DMA_QUEUE,
         .max_transmit_size = 8192,
         .max_receive_internal_mem = 512,
         .dma_burst_size = 32,
@@ -122,7 +135,20 @@ bool ag_port_uart_dma_ready(int port)
     return dma_for(port) != NULL;
 }
 
-int32_t ag_port_uart_dma_write(int port, const void *buf, size_t len)
+/* One finished transfer, waited for.  A minute of patience is not a timeout
+ * anybody should reach: reaching it means the peripheral has stopped. */
+static bool wait_one(dma_port_t *d)
+{
+    if (xSemaphoreTake(d->done, pdMS_TO_TICKS(60000)) != pdTRUE) {
+        return false;
+    }
+    if (d->out > 0u) {
+        d->out--;
+    }
+    return true;
+}
+
+int32_t ag_port_uart_dma_submit(int port, const void *buf, size_t len)
 {
     if (buf == NULL || len == 0u) {
         return -AG_EINVAL;
@@ -132,9 +158,12 @@ int32_t ag_port_uart_dma_write(int port, const void *buf, size_t len)
         return -AG_ENOTSUP;
     }
 
-    /* Anything still in flight from a previous call is finished first: the
-     * semaphore counts one, and a stale give would let this one return early. */
-    (void)xSemaphoreTake(d->done, 0);
+    /* Room in the queue first; only then is the buffer the hardware's. */
+    while (d->out >= AG_DMA_QUEUE) {
+        if (!wait_one(d)) {
+            return -AG_ETIMEDOUT;
+        }
+    }
 
     const esp_err_t rc = uhci_transmit(d->ctrl, (uint8_t *)buf, len);
     if (rc != ESP_OK) {
@@ -142,16 +171,32 @@ int32_t ag_port_uart_dma_write(int port, const void *buf, size_t len)
          * it - so say so rather than copying behind its back. */
         return (rc == ESP_ERR_INVALID_ARG) ? -AG_EINVAL : -AG_EIO;
     }
-
-    /*
-     * A frame at four megabaud is under half a second; a minute of patience
-     * here is not a timeout anybody should ever reach, and reaching it means
-     * the peripheral has stopped rather than that the wire is slow.
-     */
-    if (xSemaphoreTake(d->done, pdMS_TO_TICKS(60000)) != pdTRUE) {
-        return -AG_ETIMEDOUT;
-    }
+    d->out++;
     return (int32_t)len;
+}
+
+ag_err_t ag_port_uart_dma_drain(int port)
+{
+    dma_port_t *d = dma_for(port);
+    if (d == NULL) {
+        return -AG_ENOTSUP;
+    }
+    while (d->out > 0u) {
+        if (!wait_one(d)) {
+            return -AG_ETIMEDOUT;
+        }
+    }
+    return AG_OK;
+}
+
+int32_t ag_port_uart_dma_write(int port, const void *buf, size_t len)
+{
+    const int32_t n = ag_port_uart_dma_submit(port, buf, len);
+    if (n < 0) {
+        return n;
+    }
+    const ag_err_t err = ag_port_uart_dma_drain(port);
+    return (err == AG_OK) ? n : (int32_t)err;
 }
 
 #else /* !SOC_UHCI_SUPPORTED */
@@ -167,6 +212,20 @@ int32_t ag_port_uart_dma_write(int port, const void *buf, size_t len)
     (void)port;
     (void)buf;
     (void)len;
+    return -AG_ENOTSUP;
+}
+
+int32_t ag_port_uart_dma_submit(int port, const void *buf, size_t len)
+{
+    (void)port;
+    (void)buf;
+    (void)len;
+    return -AG_ENOTSUP;
+}
+
+ag_err_t ag_port_uart_dma_drain(int port)
+{
+    (void)port;
     return -AG_ENOTSUP;
 }
 

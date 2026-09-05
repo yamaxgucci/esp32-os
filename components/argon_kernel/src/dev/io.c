@@ -867,6 +867,28 @@ static ag_err_t io_uart_tx_wait(int port, uint32_t timeout_ms)
     return ag_port_uart_tx_wait(port, timeout_ms);
 }
 
+static int32_t io_uart_dma_submit(int port, const void *buf, size_t len)
+{
+    if (buf == NULL || len == 0) {
+        return -AG_EINVAL;
+    }
+    lock();
+    const ag_err_t err = uart_bring_up(port, NULL);
+    unlock();
+    if (err != AG_OK) {
+        return err;
+    }
+    return ag_port_uart_dma_submit(port, buf, len);
+}
+
+static ag_err_t io_uart_dma_drain(int port)
+{
+    if (!ag_port_uart_is_open(port)) {
+        return AG_OK;
+    }
+    return ag_port_uart_dma_drain(port);
+}
+
 static bool io_uart_dma_ready(int port)
 {
     lock();
@@ -1091,6 +1113,8 @@ const ag_io_api_t ag_io_api_table = {
     .uart_write = io_uart_write,
     .uart_tx_wait = io_uart_tx_wait,
     .uart_dma_write = io_uart_dma_write,
+    .uart_dma_submit = io_uart_dma_submit,
+    .uart_dma_drain = io_uart_dma_drain,
     .uart_dma_ready = io_uart_dma_ready,
     .uart_read = io_uart_read,
     .uart_config = io_uart_config,

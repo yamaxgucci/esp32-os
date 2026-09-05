@@ -107,6 +107,18 @@ ag_err_t ag_port_uart_tx_wait(int port, uint32_t timeout_ms);
 bool     ag_port_uart_dma_ready(int port);
 int32_t  ag_port_uart_dma_write(int port, const void *buf, size_t len);
 
+/*
+ * The same, in two halves: hand a buffer over and come back for it later.
+ *
+ * Waiting for each transfer before starting the next leaves the transmitter
+ * idle between them - the interrupt has to be taken, the task scheduled, the
+ * next transfer started, and the wire has nothing to send meanwhile.  Submit
+ * keeps a small queue full instead, and drain waits for what is still out.
+ * The buffers belong to the hardware until drain returns.
+ */
+int32_t  ag_port_uart_dma_submit(int port, const void *buf, size_t len);
+ag_err_t ag_port_uart_dma_drain(int port);
+
 #include <argon/port/impl/uart.h>
 
 #endif /* ARGON_PORT_UART_H */
