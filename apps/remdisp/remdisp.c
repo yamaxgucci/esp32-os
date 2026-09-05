@@ -206,7 +206,20 @@ static volatile bool s_want_copy;   /* the driver would like a frame        */
 static volatile bool s_have_copy;   /* ...and here it is                    */
 
 /* What each stage costs, measured rather than reasoned about. */
-static uint32_t s_t_copy_us;     /* the game held for the copy               */
+static uint32_t s_t_copy_us;     /* 2: the game held for the copy            */
+/*
+ * And every step after it, separately, because the sum said nothing.
+ *
+ * "Send" was 406-486 ms a frame and the wire alone accounts for 383 of it, so
+ * the interesting question - what the driver spends that is not the wire - was
+ * hidden inside one number.  Four timers instead: the gather out of the frame,
+ * the byte-at-a-time fill of the ring, the byte-at-a-time drain of it, and the
+ * write to the port.
+ */
+static uint32_t s_t_gather_us;   /* 3: frame -> the slice being sent          */
+static uint32_t s_t_ring_us;     /* 4: slice -> ring, a byte at a time        */
+static uint32_t s_t_out_us;      /* 5: ring -> out buffer, a byte at a time   */
+static uint32_t s_t_port_us;     /* 6: out buffer -> the wire                 */
 static uint32_t s_t_send_us;     /* the frame put on the wire                */
 static uint32_t s_t_wait_us;     /* the driver waiting for a frame boundary  */
 static uint32_t s_raw_frames;    /* frames sent whole                        */
@@ -351,11 +364,13 @@ static bool send_frame(uint8_t op, const uint8_t *payload, uint32_t len)
     tx_put((uint8_t)(len >> 8));
 
     uint8_t sum = 0;
+    const uint64_t r0 = (uint64_t)ag_api()->time->us();
     for (uint32_t i = 0; i < len; i++) {
         tx_put(payload[i]);
         sum = (uint8_t)(sum ^ payload[i]);
     }
     tx_put(sum);
+    s_t_ring_us += (uint32_t)((uint64_t)ag_api()->time->us() - r0);
     lock_give(s_tx_lock, held);
 
     s_sent_bytes += want;
@@ -392,11 +407,13 @@ static uint32_t tx_drain(void)
         if (n > sizeof(s_tx_out)) {
             n = sizeof(s_tx_out);
         }
+        const uint64_t o0 = (uint64_t)ag_api()->time->us();
         for (uint32_t i = 0; i < n; i++) {
             s_tx_out[i] = s_tx[s_tx_r];
             s_tx_r = (s_tx_r + 1u) % TX_RING;
             s_tx_used--;
         }
+        s_t_out_us += (uint32_t)((uint64_t)ag_api()->time->us() - o0);
         lock_give(s_tx_lock, held);
 
         if (n == 0u) {
@@ -414,6 +431,7 @@ static uint32_t tx_drain(void)
          * been carrying zero of each.
          */
         uint32_t off = 0;
+        const uint64_t p0 = (uint64_t)ag_api()->time->us();
         while (off < n) {
             const int32_t w = io->uart_write(LINK_PORT, s_tx_out + off, n - off);
             if (w <= 0) {
@@ -422,6 +440,7 @@ static uint32_t tx_drain(void)
             }
             off += (uint32_t)w;
         }
+        s_t_port_us += (uint32_t)((uint64_t)ag_api()->time->us() - p0);
         total += off;
         if (off != n) {
             break;
@@ -1856,8 +1875,10 @@ static bool raw_send_slice(uint32_t slice, uint32_t slices, uint32_t y0,
     put16(s_raw + 6, s_fb_w);
     put16(s_raw + 8, y0);
     put16(s_raw + 10, rows);
+    const uint64_t g0 = (uint64_t)ag_api()->time->us();
     memcpy(s_raw + 12, s_fb + (size_t)y0 * s_fb_w,
            (size_t)px * sizeof(uint16_t));
+    s_t_gather_us += (uint32_t)((uint64_t)ag_api()->time->us() - g0);
     return send_frame(FR_RAW, s_raw, 12u + px * sizeof(uint16_t));
 }
 
@@ -1922,6 +1943,16 @@ static void raw_stats(void)
               (unsigned)kbs, (unsigned)s_t_copy_us, (unsigned)copy_kbs,
               (unsigned)s_t_send_us, (unsigned)s_t_wait_us,
               (unsigned)s_raw_resent);
+    /* Per frame, so it can be read against the copy and the wire. */
+    ag_printf("RAW: per frame us: gather %u, ring %u, out %u, port %u\n",
+              (unsigned)(s_t_gather_us / s_raw_frames),
+              (unsigned)(s_t_ring_us / s_raw_frames),
+              (unsigned)(s_t_out_us / s_raw_frames),
+              (unsigned)(s_t_port_us / s_raw_frames));
+    s_t_gather_us = 0;
+    s_t_ring_us = 0;
+    s_t_out_us = 0;
+    s_t_port_us = 0;
     if (s_dropped != 0u || s_lost != 0u) {
         ag_printf("RAW: %u slices refused (ring full), %u bytes lost in the "
                   "port\n", (unsigned)s_dropped, (unsigned)s_lost);
