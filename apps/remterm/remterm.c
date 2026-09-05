@@ -93,10 +93,32 @@ AG_APP_SIZED("REMTERM", "2.3", "argon", 0, 0, 100 * 1024);
 #define FR_IDX    'I' /* a palette and indices                               */
 #define FR_AUD    'A' /* a rate, then unsigned 8-bit mono samples            */
 
+/*
+ * Picture and sound are the same packet with a different body, and it is the
+ * shape the sender's memory is already in - so a slice or a block of samples
+ * leaves there in one DMA transfer with no processor in the path:
+ *
+ *   0   two magic bytes, the op, and a sixteen-bit length  (five bytes)
+ *   5   twelve bytes of what-this-is: for a slice, frame / slice / slices /
+ *       width / y / rows; for sound, rate / samples / sequence
+ *   17  the sum, over those twelve and the body
+ *   18  padding, to the cache line the sender's DMA wants
+ *   32  the body
+ *
+ * The sum travels inside the header rather than after the payload because a
+ * trailing byte would have to be written by somebody, and the only somebody
+ * available after the body is the processor this arrangement exists to keep
+ * out of the way.  Console rows and everything else still end with one.
+ */
+#define PKT_HDR   32u
+#define PKT_GEOM  12u            /* summed bytes, from payload offset 0 */
+#define PKT_SUM   12u            /* where the sum sits, in payload offsets */
+#define PKT_BODY  (PKT_HDR - 5u) /* payload offset of the body */
+
 /* Both numbers have to match remdisp.c exactly. */
 #define BAND_ROWS      8u
 #define BAND_MAX_PX    (BAND_ROWS * 320u)
-#define FR_MAX_PAYLOAD (12u + BAND_MAX_PX * 2u + BAND_MAX_PX / 64u + 16u)
+#define FR_MAX_PAYLOAD (PKT_BODY + BAND_MAX_PX * 2u + BAND_MAX_PX / 64u + 16u)
 
 /*
  * The widest picture this will take, and it is a memory decision.  The band
@@ -816,7 +838,7 @@ static void raw_slice(const uint8_t *p, uint32_t len)
 
     if (w == 0u || w > RAW_W || rows == 0u || rows > RAW_ROWS ||
         slices == 0u || slices > 32u || slice >= slices ||
-        y0 + rows > RAW_H || len < 12u + rows * w * 2u) {
+        y0 + rows > RAW_H || len < PKT_BODY + rows * w * 2u) {
         bad++;
         return;
     }
@@ -839,7 +861,7 @@ static void raw_slice(const uint8_t *p, uint32_t len)
             return;
         }
         const ag_blit_t one = {
-            .px = (const uint16_t *)(p + 12u),
+            .px = (const uint16_t *)(p + PKT_BODY),
             .stride = w * sizeof(uint16_t),
             .surf_w = (uint16_t)w,
             .surf_h = (uint16_t)(slices * RAW_ROWS),
@@ -902,7 +924,7 @@ static void raw_slice(const uint8_t *p, uint32_t len)
         return;
     }
     const uint32_t off = (y0 % s_piece_rows) * w * 2u;
-    memcpy(s_piece[piece] + off, p + 12u, (size_t)rows * w * 2u);
+    memcpy(s_piece[piece] + off, p + PKT_BODY, (size_t)rows * w * 2u);
     s_have_mask |= (1u << slice);
 
     if (s_have_mask == s_want_mask) {
@@ -1541,6 +1563,58 @@ int ag_main(int argc, char **argv)
             stray++;
             continue;
         }
+        /*
+         * Picture and sound check themselves and stop here.  Their sum is in
+         * the header, over the twelve bytes of it and the body as it arrived -
+         * padding included, which is the run the sender computed it over - and
+         * there is no byte after the payload to read.
+         *
+         * A packet that does not add up is dropped rather than rewound: five
+         * kilobytes put back through the framer to look for a header inside
+         * them costs more than the slice is worth, and the gap logic below
+         * asks for a missing slice anyway.
+         */
+        if (op == FR_RAW || op == FR_AUD) {
+            uint8_t got = 0;
+            if (len >= PKT_BODY) {
+                for (uint32_t i = 0; i < PKT_GEOM; i++) {
+                    got = (uint8_t)(got ^ payload[i]);
+                }
+                for (uint32_t i = PKT_BODY; i < len; i++) {
+                    got = (uint8_t)(got ^ payload[i]);
+                }
+            }
+            if (len < PKT_BODY || got != payload[PKT_SUM]) {
+                bad++;
+                continue;
+            }
+            if (op == FR_RAW) {
+                raw_slice(payload, len);
+            } else {
+                /*
+                 * Rate, then how many of the samples are real: the sender
+                 * rounds the count on the wire up to a cache line because its
+                 * DMA reads whole ones, so the tail of a short block is
+                 * padding and the header says how much to keep.
+                 */
+                const uint32_t rate = (uint32_t)payload[0] |
+                                      ((uint32_t)payload[1] << 8) |
+                                      ((uint32_t)payload[2] << 16) |
+                                      ((uint32_t)payload[3] << 24);
+                uint32_t want = (uint32_t)payload[4] |
+                                ((uint32_t)payload[5] << 8);
+                if (want > len - PKT_BODY) {
+                    want = len - PKT_BODY;
+                }
+                if (rate >= 8000u && rate <= 48000u && want != 0u) {
+                    s_arate = rate;
+                    aud_push(payload + PKT_BODY, want);
+                }
+            }
+            wire += len;
+            continue;
+        }
+
         const int claimed = next_byte(20);
         if (claimed < 0 || (uint8_t)claimed != sum) {
             bad++;
@@ -1631,26 +1705,12 @@ int ag_main(int argc, char **argv)
             continue;
         }
 
-        if (op == FR_RAW && len >= 12u) {
-            raw_slice(payload, len);
-            wire += len;
-            continue;
-        }
-
-        if (op == FR_AUD && len >= 4u) {
-            /*
-             * Into the ring and straight back to reading.  Nothing here talks
-             * to the converter - that is the player thread's job, and keeping
-             * it out of this loop is the whole point (see "the sound").
-             */
-            const uint32_t rate = rd16(payload) | (rd16(payload + 2) << 16);
-            if (rate >= 8000u && rate <= 48000u) {
-                s_arate = rate;
-                aud_push(payload + 4u, len - 4u);
-            }
-            wire += len;
-            continue;
-        }
+        /*
+         * Picture and sound never reach here: they are read above, where their
+         * own sum is checked.  Into the ring and straight back to the wire is
+         * the rule for the sound - nothing on this path talks to the
+         * converter, which is the player thread's job (see "the sound").
+         */
 
         if ((op == FR_BAND || op == FR_PACK || op == FR_IDX) && len >= 12u) {
             /*

@@ -32,8 +32,11 @@
  *
  *   Sound (a second device, /dev/pcmrem) - eight-bit mono, 22 KB/s of the
  *   400 the wire carries.  The S3's own amplifier was unsoldered; the CYD has
- *   one on its converter pin.  See "sound" below for why it is in this file
- *   and not in a .SYS of its own, which is where it belongs by subject.
+ *   one on its converter pin.  It is a stream in its own right: its own
+ *   buffers, laid out as wire packets exactly as the picture is, handed to the
+ *   same DMA and interleaved with the slices a block at a time.  See "sound"
+ *   below for why it is in this file and not in a .SYS of its own, which is
+ *   where it belongs by subject.
  *
  * What is NOT here, on purpose:
  *
@@ -1209,8 +1212,14 @@ static uint32_t encode_indexed(const uint16_t *px, uint32_t n, uint8_t *out,
  *   3. Bands stay the transport unit, eight rows at a time, because on the far
  *      end every band is one window-setting on the panel.
  */
-/* Defined with the sound, below; the picture path pumps it. */
-static void aud_drain(void);
+/* Defined with the sound, below.  The wire task is the only caller of any of
+ * them: sound leaves this driver the way the picture does, and both are handed
+ * over from the one thread that owns the port. */
+static uint32_t aud_pump(uint32_t max);
+static void     aud_settle(void);
+static void     aud_close_idle(void);
+static void     aud_stats(void);
+static uint8_t *aud_take_blocks(void);
 
 static void send_rect_locked(const ag_blit_t *b);
 
@@ -2117,17 +2126,21 @@ static void raw_send_direct(void)
     const uint32_t slices = raw_slices();
 
     /*
-     * The console and the sound go first, all of them, and then the port is
-     * the hardware's until the picture is out.
+     * The console goes first, all of it, and then the port is the hardware's
+     * until the picture is out.
      *
-     * They travel by the ring and the ring is written by the processor, which
-     * is the other master of this transmitter; handing over between the two
-     * costs a wait for the port to empty.  Done once at the top of a frame
-     * that is one wait; done between slices, as it used to be, it was thirty,
-     * and they cost more than the bytes they were carrying.
+     * Console text travels by the ring and the ring is written by the
+     * processor, which is the other master of this transmitter; handing over
+     * between the two costs a wait for the port to empty.  Done once at the
+     * top of a frame that is one wait; done between slices, as it used to be,
+     * it was thirty, and they cost more than the bytes they carried.
+     *
+     * Sound is not in this list any more, and that is the point of the change:
+     * it leaves by DMA now, so it needs no handover at all and can go out
+     * between the slices where it belongs.
      */
     const uint64_t t0 = (uint64_t)ag_api()->time->us();
-    aud_drain();
+    aud_close_idle();
     (void)tx_drain();
     if (s_dma) {
         (void)io->uart_tx_wait(LINK_PORT, 1000u);
@@ -2181,6 +2194,19 @@ static void raw_send_direct(void)
         s_chunks++;
 
         /*
+         * And a block of sound, into the same queue, if one is ready.
+         *
+         * This is where the evenness comes from.  Seventeen blocks of sound
+         * fit in the 386 ms a picture takes, and there are thirty slices to
+         * put them between - so each one is 544 bytes slipped in behind 5152,
+         * and the far end's converter is fed steadily right through the frame
+         * instead of being handed the lot at the top of it.  Two, not one, so
+         * that a burst after a pause is cleared inside a frame rather than
+         * trailing the picture for several.
+         */
+        (void)aud_pump(2u);
+
+        /*
          * Stand aside between slices, but do not touch the port: the kernel
          * work the game leans on is served on this core, and a yield costs
          * nothing when there is nobody waiting for it.
@@ -2198,6 +2224,7 @@ static void raw_send_direct(void)
         (void)io->uart_dma_drain(LINK_PORT);
         port_us += (uint32_t)((uint64_t)ag_api()->time->us() - w0);
     }
+    aud_settle();
 
     s_t_fill_us += fill_us;
     s_t_port_us += port_us;
@@ -2275,6 +2302,7 @@ static void raw_stats(void)
     s_in_blit_us = 0;
     s_in_text_us = 0;
     s_in_pcm_us = 0;
+    aud_stats();
     ag_printf("RAW: bytes in from the far end: %u\n", (unsigned)s_rx_bytes);
     ag_printf("RAW: step4 apart, us per frame: header %u, handover %u, dma %u, "
               "sum %u, between %u\n",
@@ -2369,6 +2397,28 @@ static void tick_task(void *arg)
 }
 #endif
 
+/*
+ * The gaps: whatever is waiting, while there is no picture to send.
+ *
+ * Sound goes by DMA like the picture, so it goes first and the hardware is
+ * given back before the console is written - the console still travels by
+ * hand, and the processor must not be at the port while a transfer is in the
+ * air.
+ */
+static void wire_idle_traffic(void)
+{
+    aud_close_idle();
+    if (aud_pump(4u) != 0u) {
+        if (s_dma) {
+            (void)io->uart_dma_drain(LINK_PORT);
+        }
+        aud_settle();
+    }
+    if (s_tx_used != 0u) {
+        (void)tx_drain();
+    }
+}
+
 static void wire_task(void *arg)
 {
     (void)arg;
@@ -2424,8 +2474,7 @@ static void wire_task(void *arg)
         if (!s_have_copy && !SEND_ALWAYS) {
             const uint64_t w0 = (uint64_t)ag_api()->time->us();
             s_want_copy = true;
-            aud_drain();
-            (void)tx_drain();
+            wire_idle_traffic();
             ag_delay(2);
             s_t_wait_us += (uint32_t)((uint64_t)ag_api()->time->us() - w0);
             continue;
@@ -2471,8 +2520,7 @@ static void wire_task(void *arg)
             (uint64_t)ag_api()->time->us() + (uint64_t)window_ms * 1000ull;
         while ((uint64_t)ag_api()->time->us() < until && !s_stop) {
             poll_far_end();
-            (void)tx_drain();
-            aud_drain();
+            wire_idle_traffic();
             ag_delay(2);
         }
 
@@ -2480,7 +2528,13 @@ static void wire_task(void *arg)
         s_have_copy = false;
     }
 
-    /* Whatever is still queued, before the port stops being ours. */
+    /* Whatever is still queued, before the port stops being ours - and the
+     * transfers in the air first, because rem_stop is about to give their
+     * memory back. */
+    if (s_dma) {
+        (void)io->uart_dma_drain(LINK_PORT);
+    }
+    aud_settle();
     (void)tx_drain();
     s_wire_running = false;
 }
@@ -2514,11 +2568,21 @@ static void rem_stop(void)
     s_dmg = false;
     dmg_unlock(held);
 
+    /*
+     * The sound's blocks the same way and for the same reason: taken away
+     * under the lock its producer holds, so a write already inside finishes
+     * into memory that is still there and every write after it finds NULL and
+     * counts a drop.  Freed below, once the sender has gone - the sender is
+     * what hands them to the DMA.
+     */
+    uint8_t *const ab = aud_take_blocks();
+
     for (int i = 0; i < 200 && s_wire_running; i++) {
         ag_delay(5);
     }
     if (!s_wire_running) {
         ag_free(fb);
+        ag_free(ab);
         ag_free(s_tx);
         s_tx = NULL;
 
@@ -2703,9 +2767,6 @@ static void rem_text_cursor(ag_handle_t h, uint16_t col, uint16_t row,
         s_shadow[row][col] = under;
     }
     heal_a_few();
-    /* Sound gets its turn on the console path too, so it keeps flowing when the
-     * far end is showing text rather than a picture. */
-    aud_drain();
 }
 
 /* ---- the device -------------------------------------------------------- */
@@ -2726,12 +2787,7 @@ static void rem_text_cursor(ag_handle_t h, uint16_t col, uint16_t row,
  * Why this lives inside the display driver rather than in a .SYS of its own,
  * which is where it belongs by subject: two modules writing one UART interleave
  * their frames and neither arrives.  One module owning the port is the whole of
- * the arrangement, and the kernel makes it free - blit_rect and a device write
- * are both called with the device registry held, so the two paths cannot be
- * inside send_frame at once and the shared frame buffer needs no lock.  That is
- * also the cost: a band of pixels is up to 13 ms of blocking write, and sound
- * queued behind one waits that long.  The far end's converter holds 93 ms, which
- * is what covers it.
+ * the arrangement.
  *
  * Eight-bit mono on the wire, converted here rather than there.  Not a
  * compromise for bandwidth - 88 KB/s of 22 kHz stereo would fit in 400 - but
@@ -2747,72 +2803,266 @@ static void rem_text_cursor(ag_handle_t h, uint16_t col, uint16_t row,
  * pcmmix.  A second one here would only fight it.  What this does instead is
  * drop: if the wire cannot take the samples, they are counted and gone, because
  * a sound device that blocks stops the game.
+ *
+ * ---- sound is the picture with a different payload -----------------------
+ *
+ * It used to be the odd one out, and the odd one out is what costs.  A write
+ * from the mixer was converted into a ring; a drain copied a chunk of that ring
+ * into a staging buffer; send_frame copied the staging buffer into the transmit
+ * ring a byte at a time, computing an xor as it went; tx_drain copied the
+ * transmit ring into the port's own buffer; and uart_write carried that to the
+ * hardware with the processor.  Four copies and a byte-wise checksum for five
+ * per cent of the traffic.
+ *
+ * The copies were not the worst of it.  The processor writing the port is a
+ * second master of a transmitter whose other master is the DMA, and the two
+ * cannot be interleaved - so every handover between them costs a wait for the
+ * port to go empty.  Sound between the slices meant thirty of those a frame,
+ * and they were measured to cost more than the bytes they carried; the cure at
+ * the time was to send all of the sound at the top of a frame and none of it
+ * during, which is 386 ms of jitter on a stream that has to arrive evenly.
+ *
+ * So sound is laid out exactly as the picture is: blocks of [thirty-two byte
+ * header][samples], aligned, contiguous, each of them a finished packet.  The
+ * mixer's write converts straight into a block, nothing copies it again, and
+ * the wire task hands it to the same DMA queue the slices go into.  Packets
+ * from the two streams interleave on the wire in the order they were queued,
+ * which is what a packet header is for - and a block of sound now costs the
+ * wire its own 544 bytes and nothing else whatever.
  */
 #define AUD_RATE_DEFAULT 22050u
+
 /*
- * 256 samples, which is 11.6 ms and exactly what pcmmix hands down in one mix
- * period, so the common case is one write in and one frame out.  Small matters:
- * the frame is written with the registry held, so this is how long the picture
- * and the console can be made to wait for the sound.
+ * 512 samples is 23 ms at 22 kHz, and 32 + 512 = 544 bytes is seventeen cache
+ * lines - so every block after the first lands aligned for free, which is the
+ * same arithmetic that makes the picture's blocks work.
+ *
+ * Why 23 ms and not the 11.6 the mixer hands down: a block is one transfer and
+ * one header, and at this size the sound is seventeen transfers in the time the
+ * picture takes thirty.  Halving it would double the queue traffic to buy an
+ * evenness the far end's own buffer already provides.
+ *
+ * Thirty-two blocks is 745 ms of cushion and seventeen kilobytes.  It has to be
+ * more than one picture's worth: a block handed to the DMA is not the
+ * producer's again until the frame's drain, so a whole frame of sound - all
+ * seventeen blocks of it - can be in the air at once, and the ring has to hold
+ * that much again to keep filling while it is.
  */
-#define AUD_CHUNK 256u
+#define AUD_PKT_SAMPLES 512u
+#define AUD_PKT_BLK     (PKT_HDR + AUD_PKT_SAMPLES)
+#define AUD_PKTS        32u
 
 static ag_audio_fmt_t s_afmt;
 static bool           s_afmt_set;
 static uint64_t       s_abytes_in;
 static uint64_t       s_abytes_sent;
-static uint8_t        s_amono[AUD_CHUNK + 4u];
+static uint32_t       s_adropped;   /* samples the wire had no room for       */
 
+static uint8_t   *s_apkt;      /* aligned; AUD_PKTS header-and-samples blocks */
+static uint8_t   *s_apkt_raw;  /* what was actually allocated, for freeing    */
+static uint16_t   s_alen[AUD_PKTS]; /* real samples in each finished block    */
+static uint32_t   s_arate;
+static uint32_t   s_afill;     /* samples written into the block in hand      */
+static uint64_t   s_awrote_at; /* when the mixer last put a sample here       */
 /*
- * Sound waits here, and is put on the wire by whoever is already writing to it
- * - never by the task that produced it.
+ * Three counters, all of them counting blocks since the driver loaded and none
+ * of them ever reset: what matters is the difference between two, and unsigned
+ * arithmetic wraps the right way round.
  *
- * This is the whole cure for the freeze.  Picture and sound share one UART, and
- * the sound used to be written to it from the audio task, which held the device
- * registry lock while it waited for the wire.  With the picture on its own
- * thread that was a lock held across a blocking write on one core while the
- * game waited for it on the other - the board alive, everything stopped, the
- * sound already buffered still playing.  Now rem_pcm_write only drops samples
- * in this ring and returns at once, so it holds no lock waiting for anything;
- * the samples reach the wire from aud_drain(), called from the same paths that
- * already write it (a blit, the console sweep).  One writer of the wire, and
- * the producer never blocks.
+ *   below s_a_done          finished, the producer's again
+ *   s_a_done .. s_a_sent    handed to the hardware, still in the air
+ *   s_a_sent .. s_a_filled  finished packets waiting their turn
+ *   s_a_filled              the one being written into
  *
- * Eight kilobytes is about 370 ms at 22 kHz, more than the gap between two of
- * those draws, and the far end holds half a second of its own besides.
+ * The producer only ever touches the block at s_a_filled, and only while
+ * s_a_filled - s_a_done is under AUD_PKTS; everything else is either the
+ * hardware's or queued behind it.  That is the whole of the concurrency here,
+ * and it is why no sample is ever copied twice.
  */
-#define AUD_WIRE_RING 8192u
-static uint8_t   s_awire[AUD_WIRE_RING];
-static uint32_t  s_awire_r, s_awire_w, s_awire_used;
-static uint32_t  s_awire_rate;
+static uint32_t   s_a_filled, s_a_sent, s_a_done;
 static ag_mutex_t s_aud_lock;
 
-/* Put up to a chunk of buffered sound on the wire.  Called from the paths that
- * are already writing the wire, so the audio never rides the producer's stack
- * or its locks. */
-static void aud_drain(void)
+static uint8_t *apkt_block(uint32_t i)
 {
-    if (s_aud_lock == NULL || s_awire_used == 0u || s_awire_rate == 0u) {
+    return s_apkt + (size_t)(i % AUD_PKTS) * AUD_PKT_BLK;
+}
+
+/*
+ * The header, filled in the moment before the block leaves - the same shape as
+ * the picture's, so the far end reads both with one piece of code: five bytes
+ * of framing, twelve of what-this-is, the sum at seventeen, zeroes to
+ * thirty-two.  Here the twelve say a rate, a count of samples and a sequence
+ * number, so a receiver can tell a gap from a reorder.
+ *
+ * Returns how many bytes to hand over.  That is rounded up to a cache line,
+ * because a transfer out of external memory has to be a whole number of them;
+ * the padding is whatever the block held last time round the ring and is not
+ * played, since the header says how many samples are real.  Thirty-one samples
+ * is a millisecond and a half, and only the last block of a sound is ever
+ * short.
+ */
+static uint32_t apkt_head(uint32_t idx, uint32_t samples)
+{
+    uint8_t *const q   = apkt_block(idx);
+    const uint32_t pad = (samples + (PKT_HDR - 1u)) & ~(PKT_HDR - 1u);
+    const uint32_t len = (PKT_HDR - 5u) + pad;
+
+    q[0] = FR_MAGIC0;
+    q[1] = FR_MAGIC1;
+    q[2] = FR_AUD;
+    q[3] = (uint8_t)len;
+    q[4] = (uint8_t)(len >> 8);
+    put16(q + 5, s_arate & 0xffffu);
+    put16(q + 7, s_arate >> 16);
+    put16(q + 9, samples);
+    put16(q + 11, idx & 0xffffu);
+    put16(q + 13, 0);
+    put16(q + 15, 0);
+    q[17] = 0;
+    memset(q + 18, 0, PKT_HDR - 18u);
+
+    uint32_t acc = 0;
+    for (uint32_t i = 5; i < 17u; i++) {
+        acc ^= (uint32_t)q[i] << (((i - 5u) & 3u) * 8u);
+    }
+    const uint32_t *w = (const uint32_t *)(const void *)(q + PKT_HDR);
+    for (uint32_t i = 0; i < pad / 4u; i++) {
+        acc ^= w[i];
+    }
+    q[17] = (uint8_t)(acc ^ (acc >> 8) ^ (acc >> 16) ^ (acc >> 24));
+    return PKT_HDR + pad;
+}
+
+/* Everything handed over has left, so the blocks behind it are the producer's
+ * again.  Only ever called where the transfers are known to be finished. */
+static void aud_settle(void)
+{
+    if (s_a_done == s_a_sent) {
         return;
     }
-    for (int batch = 0; batch < 8; batch++) {
-        uint32_t n = 0;
-        const bool aheld = lock_take(s_aud_lock, 100u);
-        put16(s_amono + 0, s_awire_rate & 0xffffu);
-        put16(s_amono + 2, s_awire_rate >> 16);
-        while (n < AUD_CHUNK && s_awire_used > 0u) {
-            s_amono[4u + n] = s_awire[s_awire_r];
-            s_awire_r = (s_awire_r + 1u) % AUD_WIRE_RING;
-            s_awire_used--;
-            n++;
+    const bool held = lock_take(s_aud_lock, 100u);
+    s_a_done = s_a_sent;
+    lock_give(s_aud_lock, held);
+}
+
+/*
+ * Hand over what is ready, up to a limit, and say how many went.
+ *
+ * The block is taken out of the queue under the lock and only then filled in
+ * and submitted, so a block the producer can still see is never one the
+ * hardware is about to read.  Called from the wire task and nowhere else -
+ * one writer of the port, which is the rule this whole driver is built on.
+ */
+static uint32_t aud_pump(uint32_t max)
+{
+    if (s_apkt == NULL) {
+        return 0u;
+    }
+    uint32_t went = 0;
+    while (went < max) {
+        const bool     held = lock_take(s_aud_lock, 100u);
+        const bool     any  = (s_a_filled - s_a_sent) != 0u;
+        const uint32_t idx  = s_a_sent;
+        const uint32_t n    = any ? s_alen[idx % AUD_PKTS] : 0u;
+        if (any) {
+            s_a_sent++;
         }
-        lock_give(s_aud_lock, aheld);
-        if (n == 0u) {
+        lock_give(s_aud_lock, held);
+        if (!any) {
             break;
         }
-        send_frame(FR_AUD, s_amono, 4u + n);
+
+        const uint32_t bytes = apkt_head(idx, n);
+        bool sent = false;
+        if (s_dma) {
+            const int32_t w =
+                io->uart_dma_submit(LINK_PORT, apkt_block(idx), bytes);
+            if (w < 0) {
+                s_dma = false;
+                ag_printf("REMDISP: the port will not take a DMA transfer "
+                          "(%d); sound by hand\n", (int)w);
+            } else {
+                sent = true;
+            }
+        }
+        if (!sent) {
+            /* No DMA on this chip, or it has just refused one.  The block is
+             * a finished packet either way, so there is nothing to do here but
+             * carry it: no staging, no framing, no checksum. */
+            (void)io->uart_write(LINK_PORT, apkt_block(idx), bytes);
+            aud_settle();
+        }
         s_abytes_sent += (uint64_t)n;
+        s_sent_frames++;
+        went++;
     }
+    return went;
+}
+
+/*
+ * A block that has stopped filling.
+ *
+ * A sound ending part-way through one would otherwise sit here until the next
+ * sound started - the tail of a line of speech arriving behind the silence
+ * after it.  A tenth of a second with nothing written is the end of something,
+ * so close the block and let it go short.
+ */
+static void aud_close_idle(void)
+{
+    if (s_apkt == NULL || s_afill == 0u) {
+        return;
+    }
+    if ((uint64_t)ag_api()->time->us() - s_awrote_at < 100000ull) {
+        return;
+    }
+    const bool held = lock_take(s_aud_lock, 100u);
+    if (s_afill != 0u && (s_a_filled - s_a_done) < AUD_PKTS) {
+        s_alen[s_a_filled % AUD_PKTS] = (uint16_t)s_afill;
+        s_afill = 0;
+        s_a_filled++;
+    }
+    lock_give(s_aud_lock, held);
+}
+
+/*
+ * One line in the five-second report, and only when there is something to say.
+ * What matters here is whether the sound is keeping up: bytes a second says
+ * whether the mixer above is producing at its rate, the queue depth says
+ * whether the wire is taking them at that rate, and anything dropped says it
+ * stopped being true.
+ */
+static void aud_stats(void)
+{
+    static uint64_t was;
+    const uint32_t  n = (uint32_t)(s_abytes_sent - was);
+    was = s_abytes_sent;
+    if (n == 0u && s_adropped == 0u) {
+        return;
+    }
+    const uint32_t secs = (uint32_t)(STAT_US / 1000000ull);
+    ag_printf("RAW: sound %u B/s, %u blocks, %u waiting, %u dropped\n",
+              (unsigned)(n / secs),
+              (unsigned)((n + AUD_PKT_SAMPLES - 1u) / AUD_PKT_SAMPLES),
+              (unsigned)(s_a_filled - s_a_sent), (unsigned)s_adropped);
+    s_adropped = 0;
+}
+
+/*
+ * Unload: take the blocks away from the producer and say what to free.
+ *
+ * Under the lock, so a write already inside finishes into memory that is still
+ * there; every write after this finds NULL and counts a drop.  The memory is
+ * not freed here - the sender may still have blocks in the air, and rem_stop
+ * gives them back once it has gone.
+ */
+static uint8_t *aud_take_blocks(void)
+{
+    const bool held = lock_take(s_aud_lock, 1000u);
+    uint8_t *const raw = s_apkt_raw;
+    s_apkt = NULL;
+    s_apkt_raw = NULL;
+    lock_give(s_aud_lock, held);
+    return raw;
 }
 
 static void aud_default_fmt(ag_audio_fmt_t *out)
@@ -2875,30 +3125,54 @@ static int32_t rem_pcm_write_inner(ag_device_t *dev, const void *buf, size_t len
     s_abytes_in += (uint64_t)(frames * frame_bytes);
 
     /*
-     * Only buffered here, not sent.  This returns at once, holding no lock
-     * across the wire - which is the whole point (see s_awire).  The samples
-     * go out from aud_drain(), on the thread that already owns the wire.
+     * Converted straight into the block that will leave by DMA - there is no
+     * second buffer between this and the wire.  It returns at once and holds
+     * nothing across the port, which is the whole point: a sound device that
+     * waits stops the game above it.
      */
-    const int16_t *src = (const int16_t *)buf;
-    const bool wheld = lock_take(s_aud_lock, 100u);
-    s_awire_rate = s_afmt.rate;
-    for (size_t i = 0; i < frames; i++) {
-        uint8_t m;
-        if (chans == 2u) {
-            const int32_t mono = ((int32_t)src[i * 2u] + src[i * 2u + 1u]) / 2;
-            m = (uint8_t)((mono + 32768) >> 8);
-        } else {
-            m = (uint8_t)(((int32_t)src[i] + 32768) >> 8);
+    const int16_t *src   = (const int16_t *)buf;
+    const bool     wheld = lock_take(s_aud_lock, 100u);
+    s_arate = s_afmt.rate;
+    if (s_apkt == NULL) {
+        s_adropped += (uint32_t)frames;
+    } else {
+        for (size_t i = 0; i < frames; i++) {
+            uint8_t m;
+            if (chans == 2u) {
+                const int32_t mono =
+                    ((int32_t)src[i * 2u] + src[i * 2u + 1u]) / 2;
+                m = (uint8_t)((mono + 32768) >> 8);
+            } else {
+                m = (uint8_t)(((int32_t)src[i] + 32768) >> 8);
+            }
+            if (s_afill == 0u && (s_a_filled - s_a_done) >= AUD_PKTS) {
+                if (s_a_filled == s_a_sent) {
+                    /* Every block is in the air at once, which takes a frame
+                     * of picture far longer than one should ever be.  There is
+                     * nowhere to put this sample. */
+                    s_adropped++;
+                    continue;
+                }
+                /*
+                 * Otherwise: three quarters of a second is queued and the wire
+                 * is not going to catch up.  Playing the backlog out in order
+                 * would only keep the sound that far behind the picture for
+                 * ever, so the queue is thrown away and the sound starts again
+                 * from now.  What is in the air is left alone - it belongs to
+                 * the hardware until the frame's drain.
+                 */
+                s_adropped += (s_a_filled - s_a_sent) * AUD_PKT_SAMPLES;
+                s_a_filled = s_a_sent;
+            }
+            apkt_block(s_a_filled)[PKT_HDR + s_afill] = m;
+            s_afill++;
+            if (s_afill == AUD_PKT_SAMPLES) {
+                s_alen[s_a_filled % AUD_PKTS] = (uint16_t)AUD_PKT_SAMPLES;
+                s_afill = 0;
+                s_a_filled++;
+            }
         }
-        if (s_awire_used == AUD_WIRE_RING) {
-            /* Full: drop the oldest, so a stall loses the past and not the
-             * present - a gap the far end's cushion is there to swallow. */
-            s_awire_r = (s_awire_r + 1u) % AUD_WIRE_RING;
-            s_awire_used--;
-        }
-        s_awire[s_awire_w] = m;
-        s_awire_w = (s_awire_w + 1u) % AUD_WIRE_RING;
-        s_awire_used++;
+        s_awrote_at = (uint64_t)ag_api()->time->us();
     }
     lock_give(s_aud_lock, wheld);
 
@@ -3240,6 +3514,25 @@ ag_err_t ag_driver_init(void)
                     : (uint8_t *)(((uintptr_t)s_pkt_raw + PKT_HDR - 1u) &
                                   ~(uintptr_t)(PKT_HDR - 1u));
     }
+    /*
+     * And the sound's own blocks, by the same arithmetic: 32 + 512 is a whole
+     * number of cache lines, so aligning the front of the run aligns every one
+     * of them.  Seventeen kilobytes.  A driver that cannot have them still
+     * shows a picture - it simply has nowhere to put sound, and says so in the
+     * counters rather than in a fault.
+     */
+    s_apkt_raw =
+        (uint8_t *)ag_malloc((size_t)AUD_PKTS * AUD_PKT_BLK + PKT_HDR - 1u);
+    s_apkt = (s_apkt_raw == NULL)
+                 ? NULL
+                 : (uint8_t *)(((uintptr_t)s_apkt_raw + PKT_HDR - 1u) &
+                               ~(uintptr_t)(PKT_HDR - 1u));
+    if (s_apkt == NULL) {
+        ag_printf("REMDISP: no blocks for the sound (%u KB); the picture goes "
+                  "out alone\n",
+                  (unsigned)(AUD_PKTS * AUD_PKT_BLK / 1024u));
+    }
+
     if (s_pkt == NULL || s_tx == NULL) {
         s_fb_w = 0;
         s_fb_h = 0;

@@ -16,18 +16,26 @@
  * A frame that cannot be assembled whole reaches the glass as stripes, and the
  * stripes were the complaint that started all of this.
  *
- * What is lost with the operating system: the S3 console relayed onto this
- * screen, and the sound.  Both can come back; the sound is one stream of
- * samples into the converter and wants a page of code, not a kernel.
+ * What is lost with the operating system is the S3 console relayed onto this
+ * screen.  The sound came back, and it took a page of code and no kernel: one
+ * stream of samples into the converter on GPIO 26, which is where this board's
+ * amplifier is.
  *
- * The wire protocol is REMDISP own, unchanged:
+ * The wire protocol is REMDISP own:
  *
  *   A5 5A F len16   frame:2 slice:2 slices:2 width:2 y:2 rows:2  pixels...
+ *   A5 5A A len16   rate:4 samples:2 seq:2 pad:4 sum:1 pad...     samples...
  *   A5 5A R ...     going the other way: send slice N of frame M again
+ *
+ * Picture and sound are the same packet with a different body - thirty-two
+ * bytes of header carrying their own sum, then the payload - so one piece of
+ * framing reads both and they interleave on the wire in whatever order the
+ * sender queued them.
  *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
  */
 #include <string.h>
+#include "driver/dac_continuous.h"
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
 #include "driver/uart.h"
@@ -88,7 +96,8 @@ static const char *TAG = "monitor";
 #define PKT_HDR   32u
 #define PKT_GEOM  12u  /* bytes of geometry, from payload offset 0 */
 #define PKT_SUM   12u  /* where the sum sits, in payload offsets   */
-#define PKT_PIX   (PKT_HDR - 5u) /* payload offset of the pixels    */
+#define PKT_PIX   (PKT_HDR - 5u) /* payload offset of the body      */
+#define FR_AUD    0x41u /* A */
 #define FR_RESEND 0x52u /* R */
 #define RAW_ROWS  8u
 #define SLICES    (LCD_H / RAW_ROWS) /* 30 */
@@ -104,6 +113,190 @@ static uint32_t s_stat_bad; /* slices whose sum did not agree */
 static uint64_t s_stat_paint_us;
 
 static spi_device_handle_t s_spi;
+
+/* ---- the sound ----------------------------------------------------------
+ *
+ * A sound packet is the picture packet with samples where the pixels are:
+ * twelve bytes of what-this-is at offset five - a rate, how many samples are
+ * real, and a sequence number - the sum at seventeen, and unsigned eight-bit
+ * mono from thirty-two on.  The sender rounds the count on the wire up to a
+ * cache line because its DMA reads whole ones, so the last few bytes of a
+ * packet may be padding; the header says how many to keep.
+ *
+ * The reader drops them in a ring and goes straight back to the wire.  Nothing
+ * in the reading path touches the converter: a write to it waits for a
+ * descriptor to be played, which is a tenth of a second, and a tenth of a
+ * second not reading the UART is thirty kilobytes of picture on the floor.
+ * That was measured, under the operating system, and it is why the player is a
+ * task of its own.
+ *
+ * Eight thousand samples is 372 ms of cushion.  It is there for the gap
+ * between two frames of picture, not for the wire: the sender interleaves a
+ * block of sound between its slices now, so sound arrives about every 23 ms
+ * whatever the picture is doing.
+ */
+#define AUD_RING   8192u    /* a power of two: the indices are masked, not wrapped */
+#define AUD_PRIME  2048u    /* 93 ms before the first sample is played */
+#define AUD_CHUNK  1024u
+
+/*
+ * On the heap, and taken after the frame - not because nine kilobytes are
+ * precious but because of where they would otherwise sit.  A static lands in
+ * DRAM at link time, inside the one 160 KB region the 150 KB frame has to come
+ * out of in a single piece; nine kilobytes of .bss there took the largest free
+ * block to 147456 and the frame could not be allocated at all.  The board came
+ * up, said "frame buffer 153600 bytes: NO" and returned from app_main, which
+ * from the outside looks exactly like a board that is not running.
+ */
+static uint8_t *s_aring;
+static uint8_t *s_aout;
+/*
+ * One producer, one consumer, no lock.  The reader task owns s_aw and the
+ * player owns s_ar; each of them only ever reads the other's, and both run
+ * free rather than wrapping, so a torn read is impossible on a 32-bit load and
+ * the difference between them is the fill however many times they have wrapped.
+ */
+static volatile uint32_t s_aw, s_ar;
+static volatile uint32_t s_arate;
+static uint32_t s_stat_asamp, s_stat_adrop, s_stat_abad, s_stat_astarve;
+
+static uint32_t aud_used(void)
+{
+    return s_aw - s_ar;
+}
+
+/* One sound packet into the ring.  Called from the reader and nowhere else. */
+static void aud_in(const uint8_t *p, uint32_t len)
+{
+    if (s_aring == NULL || len < PKT_PIX) {
+        return;
+    }
+    const uint32_t rate = (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+                          ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+    const uint32_t want = (uint32_t)p[4] | ((uint32_t)p[5] << 8);
+    const uint32_t body = len - PKT_PIX;
+    if (want == 0u || want > body || rate < 8000u || rate > 48000u) {
+        return;
+    }
+
+    /* The sum, over the twelve bytes of header and the body as it arrived,
+     * padding included - the sender computes it over exactly the same run. */
+    uint8_t got = 0;
+    for (uint32_t i = 0; i < PKT_GEOM; i++) {
+        got = (uint8_t)(got ^ p[i]);
+    }
+    const uint8_t *src = p + PKT_PIX;
+    for (uint32_t i = 0; i < body; i++) {
+        got = (uint8_t)(got ^ src[i]);
+    }
+    if (got != p[PKT_SUM]) {
+        s_stat_abad++;
+        return;
+    }
+
+    s_arate = rate;
+
+    /* One slot is left empty so that full and empty are different states. */
+    const uint32_t room = AUD_RING - 1u - aud_used();
+    uint32_t       take = want;
+    if (take > room) {
+        s_stat_adrop += take - room;
+        take = room;
+    }
+    for (uint32_t i = 0; i < take; i++) {
+        s_aring[(s_aw + i) & (AUD_RING - 1u)] = src[i];
+    }
+    s_aw += take;
+    s_stat_asamp += take;
+}
+
+/*
+ * The converter, fed from the ring and paced by it.
+ *
+ * dac_continuous_write blocks until a descriptor has been played, which is
+ * exactly the clock this wants: the task spends its life asleep in there and
+ * the sound comes out at the rate the peripheral runs, not at the rate the
+ * wire happens to deliver.
+ *
+ * Silence is 128, not 0 - the converter swings from ground to the supply and
+ * the middle is what the amplifier is coupled around.  It matters more than it
+ * looks: a starved DMA chain replays whatever was left in it, which is not a
+ * gap in the sound but a buzz at that buffer's own frequency, and writing
+ * silence is what keeps the chain honest while nothing is arriving.
+ */
+static void player(void *arg)
+{
+    uint8_t *const          out = s_aout;
+    dac_continuous_handle_t dac = NULL;
+    uint32_t                open_at = 0;
+    bool                    primed = false;
+
+    (void)arg;
+    for (;;) {
+        const uint32_t rate = s_arate;
+        if (rate == 0u) {
+            vTaskDelay(pdMS_TO_TICKS(50)); /* nothing has ever arrived */
+            continue;
+        }
+        if (dac != NULL && rate != open_at) {
+            (void)dac_continuous_disable(dac);
+            (void)dac_continuous_del_channels(dac);
+            dac = NULL;
+        }
+        if (dac == NULL) {
+            /* Eight descriptors of a quarter kilobyte: 93 ms of chain, and one
+             * descriptor - 11.6 ms - is the shortest a write can wait. */
+            const dac_continuous_config_t cfg = {
+                .chan_mask = DAC_CHANNEL_MASK_CH1, /* GPIO 26, the amplifier */
+                .desc_num = 8,
+                .buf_size = 256,
+                .freq_hz = rate,
+                .offset = 0,
+                .clk_src = DAC_DIGI_CLK_SRC_DEFAULT,
+                .chan_mode = DAC_CHANNEL_MODE_SIMUL,
+            };
+            if (dac_continuous_new_channels(&cfg, &dac) != ESP_OK ||
+                dac_continuous_enable(dac) != ESP_OK) {
+                ESP_LOGW(TAG, "no converter at %u Hz; the sound stays off",
+                         (unsigned)rate);
+                if (dac != NULL) {
+                    (void)dac_continuous_del_channels(dac);
+                    dac = NULL;
+                }
+                s_arate = 0;
+                continue;
+            }
+            open_at = rate;
+            primed = false;
+            ESP_LOGI(TAG, "sound out on gpio26 at %u Hz", (unsigned)rate);
+        }
+
+        const uint32_t used = aud_used();
+        if (!primed) {
+            primed = used >= AUD_PRIME;
+        } else if (used == 0u) {
+            primed = false;
+            s_stat_astarve++;
+        }
+
+        uint32_t n;
+        if (primed) {
+            n = (used > AUD_CHUNK) ? AUD_CHUNK : used;
+            for (uint32_t i = 0; i < n; i++) {
+                out[i] = s_aring[(s_ar + i) & (AUD_RING - 1u)];
+            }
+        } else {
+            n = 256u;
+            memset(out, 128, n);
+        }
+
+        size_t loaded = 0;
+        if (dac_continuous_write(dac, out, n, &loaded, 200) == ESP_OK &&
+            primed) {
+            s_ar += (uint32_t)loaded;
+        }
+    }
+}
 
 /* ---- the panel ---------------------------------------------------------- */
 
@@ -382,14 +575,17 @@ static void reader(void *arg)
                 sum = (uint8_t)(sum ^ b);
                 if (at == len) {
                     /*
-                     * A picture packet carries its sum inside and has nothing
-                     * after the payload; everything else - console rows, sound
-                     * - still ends with one, and is still read the old way.
+                     * Picture and sound both carry their sum inside the header
+                     * and have nothing after the payload.  Console rows still
+                     * end with one, and are still read the old way.
                      */
                     if (op == FR_RAW) {
                         if (len >= PKT_PIX) {
                             slice_in(payload, len);
                         }
+                        st = HUNT0;
+                    } else if (op == FR_AUD) {
+                        aud_in(payload, len);
                         st = HUNT0;
                     } else {
                         st = SUM;
@@ -397,7 +593,7 @@ static void reader(void *arg)
                 }
                 break;
             case SUM:
-                /* Console and sound only; the picture never reaches here. */
+                /* Console rows only; picture and sound never reach here. */
                 (void)sum;
                 st = HUNT0;
                 break;
@@ -447,12 +643,34 @@ void app_main(void)
     xTaskCreate(reader, "reader", 4096, NULL, 10, NULL);
 
     /*
+     * The sound, if there is room for it once the picture has what it needs.
+     * Nine kilobytes: a 372 ms ring and the block the converter is fed from.
+     */
+    s_aring = heap_caps_malloc(AUD_RING, MALLOC_CAP_8BIT);
+    s_aout = heap_caps_malloc(AUD_CHUNK, MALLOC_CAP_8BIT);
+    if (s_aring == NULL || s_aout == NULL) {
+        free(s_aring);
+        free(s_aout);
+        s_aring = NULL;
+        s_aout = NULL;
+        ESP_LOGW(TAG, "no room for the sound; the picture goes on alone");
+    } else {
+        /*
+         * Below the reader on purpose.  The player spends its life blocked in
+         * the converter, so it costs nothing to prefer the wire over it - and
+         * if the board is ever short of time, a sound that stutters is better
+         * than a picture with holes in it.
+         */
+        xTaskCreate(player, "player", 3072, NULL, 6, NULL);
+    }
+
+    /*
      * The numbers, every five seconds, into the console port - which nothing
      * else here is using.  Under the operating system this was the hard part:
      * the receiver held the display, so its console had nowhere to print, and
      * taking the console back took the display away for good.
      */
-    uint32_t last_frames = 0, last_slices = 0;
+    uint32_t last_frames = 0, last_slices = 0, last_asamp = 0;
     uint64_t last_paint = 0;
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(5000));
@@ -466,6 +684,14 @@ void app_main(void)
                  (unsigned)(sl / 5u), (unsigned)(f ? (pu / f) : 0),
                  (unsigned)s_stat_partial, (unsigned)s_stat_asked,
                  (unsigned)s_stat_bad, (unsigned)esp_get_free_heap_size());
+        if (s_stat_asamp != 0u || s_stat_adrop != 0u) {
+            ESP_LOGI(TAG, "sound %u B/s, %u buffered, %u dropped, %u bad, "
+                          "%u starved",
+                     (unsigned)((s_stat_asamp - last_asamp) / 5u),
+                     (unsigned)aud_used(), (unsigned)s_stat_adrop,
+                     (unsigned)s_stat_abad, (unsigned)s_stat_astarve);
+        }
+        last_asamp = s_stat_asamp;
         last_frames = s_stat_frames;
         last_slices = s_stat_slices;
         last_paint = s_stat_paint_us;
