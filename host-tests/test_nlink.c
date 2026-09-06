@@ -335,6 +335,309 @@ static void test_the_bounds_are_what_was_promised(void)
     AG_CHECK(quantum_ms < 0.726);
 }
 
+/* ---- the window --------------------------------------------------------- */
+
+/*
+ * Sequences wrap at 65536, and comparing them with < is the oldest bug in this
+ * family of protocol: 0 is after 65535, and every naive comparison says the
+ * opposite.  A link that got this wrong would work perfectly for eleven
+ * minutes at 5 MB/s and then throw away a window of data, once, and go on
+ * working - which is the worst way for a bug to behave.
+ */
+static void test_sequence_wrap(void)
+{
+    AG_CHECK(ag_nlink_seq_after(5, 4));
+    AG_CHECK(!ag_nlink_seq_after(4, 5));
+    AG_CHECK(!ag_nlink_seq_after(4, 4));
+    AG_CHECK(ag_nlink_seq_after(0, 65535));      /* the whole point */
+    AG_CHECK(!ag_nlink_seq_after(65535, 0));
+    AG_CHECK(ag_nlink_seq_after(3, 65530));
+    AG_CHECK(!ag_nlink_seq_after(65530, 3));
+}
+
+static void test_window_fills_and_drains(void)
+{
+    ag_nlink_slot_t slots[4];
+    ag_nlink_tx_t   tx;
+    ag_nlink_tx_init(&tx, NL_CLS_BULK, slots, 4, 50);
+
+    const uint8_t body[16] = {0};
+    for (int i = 0; i < 4; i++) {
+        AG_CHECK(ag_nlink_tx_room(&tx));
+        AG_CHECK(ag_nlink_tx_queue(&tx, 1, body, sizeof(body), i == 3));
+    }
+    /* Full is back-pressure, not an error. */
+    AG_CHECK(!ag_nlink_tx_room(&tx));
+    AG_CHECK(!ag_nlink_tx_queue(&tx, 1, body, sizeof(body), false));
+    AG_CHECK_INT(ag_nlink_tx_pending(&tx), 4);
+
+    for (int i = 0; i < 4; i++) {
+        const ag_nlink_slot_t *s = ag_nlink_tx_next(&tx, 0);
+        AG_CHECK(s != NULL);
+        AG_CHECK_INT(s->seq, i);
+        AG_CHECK_INT(s->flags & NL_F_EOM, (i == 3) ? NL_F_EOM : 0);
+    }
+    /* Everything sent, nothing due: the wire has nothing to do. */
+    AG_CHECK(ag_nlink_tx_next(&tx, 0) == NULL);
+
+    /* A cumulative ack for the second frame frees two slots. */
+    ag_nlink_tx_ack(&tx, 1);
+    AG_CHECK_INT(ag_nlink_tx_pending(&tx), 2);
+    AG_CHECK(ag_nlink_tx_room(&tx));
+    ag_nlink_tx_ack(&tx, 3);
+    AG_CHECK_INT(ag_nlink_tx_pending(&tx), 0);
+    AG_CHECK_INT(tx.retransmits, 0);
+}
+
+/*
+ * One lost frame must cost one timeout, not one per frame behind it.  A sender
+ * that re-sent only the oldest would look gentler and take a whole window of
+ * timeouts to recover, because a receiver that discarded everything behind a
+ * gap has nothing to acknowledge.
+ */
+static void test_one_loss_costs_one_timeout(void)
+{
+    ag_nlink_slot_t slots[8];
+    ag_nlink_tx_t   tx;
+    ag_nlink_rx_t   rx;
+    ag_nlink_tx_init(&tx, NL_CLS_BULK, slots, 8, 50);
+    ag_nlink_rx_init(&rx);
+
+    const uint8_t body[8] = {0};
+    for (int i = 0; i < 8; i++) {
+        AG_CHECK(ag_nlink_tx_queue(&tx, 1, body, sizeof(body), false));
+    }
+
+    /* Send all eight; the first is lost on the way. */
+    for (int i = 0; i < 8; i++) {
+        const ag_nlink_slot_t *s = ag_nlink_tx_next(&tx, 0);
+        AG_CHECK(s != NULL);
+        if (i == 0) {
+            continue; /* dropped by the wire */
+        }
+        ag_nlink_hdr_t h = {.cls = NL_CLS_BULK, .seq = s->seq, .len = s->len};
+        AG_CHECK(!ag_nlink_rx_accept(&rx, &h)); /* all of them are gaps */
+    }
+    AG_CHECK_INT(rx.gaps, 7);
+    AG_CHECK_INT(rx.taken, 0);
+    AG_CHECK(ag_nlink_rx_ack(&rx) == NL_ACK_NONE);
+
+    /* Nothing is due before the timeout. */
+    AG_CHECK(ag_nlink_tx_next(&tx, 49) == NULL);
+
+    /* One timeout, and the whole window goes again - in order, and all of it. */
+    for (int i = 0; i < 8; i++) {
+        const ag_nlink_slot_t *s = ag_nlink_tx_next(&tx, 50);
+        AG_CHECK(s != NULL);
+        AG_CHECK_INT(s->seq, i);
+        ag_nlink_hdr_t h = {.cls = NL_CLS_BULK, .seq = s->seq, .len = s->len};
+        AG_CHECK(ag_nlink_rx_accept(&rx, &h));
+    }
+    AG_CHECK_INT(rx.taken, 8);
+    AG_CHECK_INT(ag_nlink_rx_ack(&rx), 7);
+    AG_CHECK_INT(tx.retransmits, 8);
+
+    ag_nlink_tx_ack(&tx, ag_nlink_rx_ack(&rx));
+    AG_CHECK_INT(ag_nlink_tx_pending(&tx), 0);
+}
+
+/* A duplicate means the ACKNOWLEDGEMENT was lost, not the frame - a different
+ * fault, in the other direction of the wire, and worth counting apart. */
+static void test_a_duplicate_is_not_a_gap(void)
+{
+    ag_nlink_rx_t rx;
+    ag_nlink_rx_init(&rx);
+
+    ag_nlink_hdr_t h0 = {.seq = 0};
+    ag_nlink_hdr_t h1 = {.seq = 1};
+    ag_nlink_hdr_t h3 = {.seq = 3};
+
+    /* A stream starts at zero and nothing else will do: a receiver that adopted
+     * whatever arrived first would silently skip the beginning of a transfer
+     * whose first frame was lost, and report success. */
+    AG_CHECK(!ag_nlink_rx_accept(&rx, &h1));
+    AG_CHECK_INT(rx.gaps, 1);
+    AG_CHECK(ag_nlink_rx_ack(&rx) == NL_ACK_NONE);
+
+    AG_CHECK(ag_nlink_rx_accept(&rx, &h0));
+    AG_CHECK(ag_nlink_rx_accept(&rx, &h1));
+    AG_CHECK(!ag_nlink_rx_accept(&rx, &h1)); /* again */
+    AG_CHECK(!ag_nlink_rx_accept(&rx, &h0)); /* older still */
+    AG_CHECK(!ag_nlink_rx_accept(&rx, &h3)); /* 2 is missing */
+    AG_CHECK_INT(rx.dups, 2);
+    AG_CHECK_INT(rx.gaps, 2);
+    AG_CHECK_INT(rx.taken, 2);
+    AG_CHECK_INT(ag_nlink_rx_ack(&rx), 1); /* re-ack, so the peer moves on */
+}
+
+/* ---- a megabyte across a wire that is losing things ---------------------- */
+
+/*
+ * THE TEST THAT MUST NOT BE RUN FOR THE FIRST TIME ON HARDWARE.
+ *
+ * Above 5 Mbaud the measured line corrupts about 1.5% of blocks, and a fast SPI
+ * link will corrupt more; at 5 MB/s errors are not a possibility but a rate.  A
+ * file transfer that fails on one bad frame is useless, and finding that out on
+ * a board means finding it out as "the transfer sometimes stops", weeks later,
+ * with no way to tell a protocol bug from a bad solder joint.
+ *
+ * So: a megabyte through a channel that drops one frame in twenty-five and
+ * corrupts one in fifty, byte-compared at the far end.  Deterministic, so a
+ * failure can be reproduced rather than chased.
+ */
+static uint32_t rng(uint32_t *s)
+{
+    *s = (*s * 1664525u) + 1013904223u;
+    return *s >> 16;
+}
+
+static void test_a_megabyte_through_a_bad_wire(void)
+{
+    enum { TOTAL = 1024u * 1024u, WINDOW = 24 };
+    static uint8_t         src[TOTAL];
+    static uint8_t         dst[TOTAL];
+    static ag_nlink_slot_t slots[WINDOW];
+
+    for (uint32_t i = 0; i < TOTAL; i++) {
+        src[i] = (uint8_t)(i * 31u + (i >> 8));
+    }
+    memset(dst, 0, sizeof(dst));
+
+    ag_nlink_tx_t tx;
+    ag_nlink_rx_t rx;
+    ag_nlink_tx_init(&tx, NL_CLS_BULK, slots, WINDOW, 20);
+    ag_nlink_rx_init(&rx);
+
+    uint32_t seed = 12345u;
+    uint32_t off = 0;      /* how much of src has been handed to the window */
+    uint32_t got = 0;      /* how much has been delivered in order */
+    uint32_t now = 0;
+    uint32_t ack_from_peer = NL_ACK_NONE;
+    uint32_t steps = 0;
+    bool     done = false;
+
+    /* Generous: at ~4100 frames and a 24-frame window this finishes in tens of
+     * thousands of steps.  The bound is here so a protocol that livelocks fails
+     * the test rather than hanging the suite. */
+    const uint32_t max_steps = 4u * 1000u * 1000u;
+
+    while (!done && steps < max_steps) {
+        steps++;
+
+        /* Fill the window from the file. */
+        while (off < TOTAL && ag_nlink_tx_room(&tx)) {
+            uint16_t n = (uint16_t)((TOTAL - off < NL_QUANTUM) ? (TOTAL - off)
+                                                               : NL_QUANTUM);
+            AG_CHECK(ag_nlink_tx_queue(&tx, 1, &src[off], n,
+                                       (off + n) >= TOTAL));
+            off += n;
+        }
+
+        const ag_nlink_slot_t *s = ag_nlink_tx_next(&tx, now);
+        if (s == NULL) {
+            now += 5u; /* nothing to do but let the timer run */
+            continue;
+        }
+
+        /* --- the wire ------------------------------------------------- */
+        uint8_t        hdr[NL_HDR_SIZE];
+        uint8_t        psum[NL_PSUM_SIZE];
+        uint8_t        body[NL_QUANTUM];
+        ag_nlink_hdr_t h = {
+            .cls = NL_CLS_BULK,
+            .flags = s->flags,
+            .chan = s->chan,
+            .seq = s->seq,
+            .ack = (uint16_t)ag_nlink_rx_ack(&rx),
+            .len = s->len,
+        };
+        memcpy(body, s->data, s->len);
+        ag_nlink_pack(hdr, &h);
+        ag_nlink_put_psum(psum, body, h.len);
+
+        const uint32_t roll = rng(&seed) % 100u;
+        bool           lost = (roll < 4u);           /* 4%: never arrives   */
+        const bool     bent = (!lost && roll < 6u);  /* 2%: arrives wrong   */
+        if (bent) {
+            /* Half the time wreck the header, half the time the payload -
+             * the two are caught by different checks and both must be. */
+            if ((rng(&seed) & 1u) != 0u) {
+                hdr[rng(&seed) % 16u] ^= 0x20u;
+            } else if (h.len > 0u) {
+                body[rng(&seed) % h.len] ^= 0x08u;
+            }
+        }
+        now += 1u;
+
+        if (!lost) {
+            ag_nlink_hdr_t g;
+            if (!ag_nlink_unpack(&g, hdr)) {
+                lost = true; /* a bad header is indistinguishable from silence */
+            } else if (!ag_nlink_check_psum(&g, body, psum)) {
+                lost = true; /* and so is a bad payload, deliberately */
+            } else {
+                if (ag_nlink_rx_accept(&rx, &g)) {
+                    AG_CHECK(got + g.len <= TOTAL);
+                    memcpy(&dst[got], body, g.len);
+                    got += g.len;
+                    if ((g.flags & NL_F_EOM) != 0u) {
+                        done = true;
+                    }
+                }
+                /*
+                 * The acknowledgement rides back, and the return direction of
+                 * a wire is a wire too.  Scattered losses are not enough here:
+                 * a sender holding a slightly stale ack behaves identically to
+                 * one holding a current one, so nothing is learned.  What
+                 * exercises the duplicate path is a BLACKOUT longer than the
+                 * timeout - a receiver too busy to answer for a while, which is
+                 * exactly what a board painting a screen is.  Then the sender
+                 * gives up waiting and re-sends frames that did arrive, and the
+                 * receiver has to recognise them as already-had rather than as
+                 * data.  Getting that wrong corrupts a file rather than slowing
+                 * one down.
+                 */
+                const bool blackout = (steps % 500u) < 40u;
+                if (!blackout && (rng(&seed) % 100u) >= 10u) {
+                    ack_from_peer = ag_nlink_rx_ack(&rx);
+                }
+            }
+        }
+        if (ack_from_peer != NL_ACK_NONE) {
+            ag_nlink_tx_ack(&tx, (uint16_t)ack_from_peer);
+        }
+    }
+
+    AG_CHECK(done);
+    AG_CHECK(steps < max_steps);
+    AG_CHECK_INT(got, TOTAL);
+    AG_CHECK_INT(memcmp(src, dst, TOTAL), 0);
+
+    /* It cost something, and the number is the point: a link that says it is
+     * fine while re-sending half of everything is a link about to fall over,
+     * and throughput alone cannot tell the two apart. */
+    AG_CHECK(tx.retransmits > 0u);
+    AG_CHECK(rx.gaps > 0u);
+    /* Both failure modes really happened, so both paths were really taken:
+     * a gap is a frame lost on the way out, a duplicate is an acknowledgement
+     * lost on the way back, and a test that only ever produced one of them
+     * would be silent about half the code. */
+    AG_CHECK(rx.dups > 0u);
+    AG_CHECK(tx.sent > 4000u);
+
+    /*
+     * Printed, not just asserted.  The assertions say it worked; the numbers
+     * say what it cost, and the ratio is the thing to watch when the real wire
+     * replaces this one - a link doing twice the work for the same throughput
+     * looks identical from throughput alone.
+     */
+    printf("  nlink: 1 MB over a 4%%-loss 2%%-corrupt wire - %u frames sent, "
+           "%u of them again (%u%%), %u gaps, %u duplicates\n",
+           (unsigned)tx.sent, (unsigned)tx.retransmits,
+           (unsigned)(tx.retransmits * 100u / (tx.sent ? tx.sent : 1u)),
+           (unsigned)rx.gaps, (unsigned)rx.dups);
+}
+
 void run_nlink_tests(void)
 {
     test_hdr_roundtrip();
@@ -348,4 +651,9 @@ void run_nlink_tests(void)
     test_reservation_is_a_floor_not_a_ceiling();
     test_undersized_reservation_is_counted();
     test_the_bounds_are_what_was_promised();
+    test_sequence_wrap();
+    test_window_fills_and_drains();
+    test_one_loss_costs_one_timeout();
+    test_a_duplicate_is_not_a_gap();
+    test_a_megabyte_through_a_bad_wire();
 }

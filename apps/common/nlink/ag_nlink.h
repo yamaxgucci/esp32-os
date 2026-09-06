@@ -248,4 +248,120 @@ void ag_nlink_sched_tick(ag_nlink_sched_t *s);
  */
 uint32_t ag_nlink_sched_worst_wait(const ag_nlink_sched_t *s, int cls);
 
+/* ------------------------------------------------------------------------ */
+/* Reliability: the window, for the classes that have one                    */
+/* ------------------------------------------------------------------------ */
+/*
+ * CONTROL and BULK are delivered or the link is broken; STREAM is neither, on
+ * purpose, and does not come through here at all.
+ *
+ * GO-BACK-N, and the choice is the wire's rather than fashion.  Between two
+ * boards on a cable there is no reordering - only loss and corruption - so a
+ * receiver that accepts out-of-order frames would carry a reassembly buffer to
+ * handle something that cannot happen.  The receiver here keeps one number.
+ * The cost is that a lost frame re-sends the ones behind it, which on a window
+ * of a few kilobytes is a few kilobytes.
+ *
+ * NO CLOCK AND NO ALLOCATION.  `now_ms` is passed in, and the slots are the
+ * caller's array - so a class that sends small messages rarely (CONTROL) and
+ * one that streams a file (BULK) are the same code with different amounts of
+ * memory, and a test can drive time faster than it passes.
+ *
+ * SIZING THE WINDOW is arithmetic, not taste: it has to hold a round trip's
+ * worth of data, or the wire idles waiting for acknowledgements.  window =
+ * rate * RTT / NL_QUANTUM.  At 5 MB/s and a millisecond that is 5 KB, twenty
+ * frames; at 400 KB/s it is two.  Undersize it and the link runs at
+ * window * NL_QUANTUM / RTT no matter what the physics can do - which is the
+ * 260 KB/s that a one-frame window (send, wait, send) produces on any wire at
+ * all, and the reason this exists.
+ *
+ * SEQUENCE NUMBERS WRAP, and comparing them with < is the oldest bug in this
+ * family of protocol.  Use ag_nlink_seq_after.
+ */
+#define NL_ACK_NONE 0xFFFFu /* "I have accepted nothing yet" */
+
+/* True when `a` is later than `b`, correctly across the 16-bit wrap. */
+bool ag_nlink_seq_after(uint16_t a, uint16_t b);
+
+typedef struct ag_nlink_slot {
+    uint16_t seq;
+    uint16_t len;
+    uint8_t  flags;
+    uint8_t  chan;
+    bool     sent;
+    uint16_t tries;  /* > 1 means this one has been round the wire before */
+    uint32_t sent_ms;
+    uint8_t  data[NL_QUANTUM];
+} ag_nlink_slot_t;
+
+typedef struct ag_nlink_tx {
+    ag_nlink_slot_t *slot; /* the caller's array, `cap` of them */
+    uint16_t         cap;
+    uint16_t         count;    /* slots in use, oldest first */
+    uint16_t         next_seq; /* the sequence the next queued frame takes */
+    uint32_t         rto_ms;
+    uint8_t          cls;
+    /* Counters.  `retransmits` is the one to watch on a real wire: it is the
+     * difference between a link that is working and a link that is working
+     * hard, and the two look identical from throughput alone. */
+    uint32_t sent;
+    uint32_t retransmits;
+} ag_nlink_tx_t;
+
+void ag_nlink_tx_init(ag_nlink_tx_t *tx, uint8_t cls, ag_nlink_slot_t *slots,
+                      uint16_t cap, uint32_t rto_ms);
+
+/* Room for one more frame in the window. */
+bool ag_nlink_tx_room(const ag_nlink_tx_t *tx);
+
+/*
+ * Queue one frame's worth.  `len` must be <= NL_QUANTUM - splitting a message
+ * into quanta is the caller's job, because only the caller knows where its
+ * message boundaries are; set `eom` on the last piece.  False when the window
+ * is full, which is back-pressure and not an error: try again after an ack.
+ */
+bool ag_nlink_tx_queue(ag_nlink_tx_t *tx, uint8_t chan, const void *data,
+                       uint16_t len, bool eom);
+
+/*
+ * The next frame to put on the wire, or NULL when there is nothing to send at
+ * this instant.  It is a fresh frame when one is queued, otherwise the oldest
+ * unacknowledged one whose retransmission is due.  The returned slot belongs to
+ * the tx and stays valid until the next call.
+ */
+const ag_nlink_slot_t *ag_nlink_tx_next(ag_nlink_tx_t *tx, uint32_t now_ms);
+
+/* The peer's cumulative acknowledgement: it has everything up to and including
+ * `ack`.  NL_ACK_NONE means it has nothing yet. */
+void ag_nlink_tx_ack(ag_nlink_tx_t *tx, uint16_t ack);
+
+/* Frames queued or in flight.  Zero means everything has been acknowledged. */
+uint16_t ag_nlink_tx_pending(const ag_nlink_tx_t *tx);
+
+/* Bytes the scheduler should be told are waiting on this class, and the length
+ * of the frame at the head - the two arguments ag_nlink_sched_offer wants. */
+uint32_t ag_nlink_tx_waiting_bytes(const ag_nlink_tx_t *tx);
+uint32_t ag_nlink_tx_head_len(const ag_nlink_tx_t *tx);
+
+typedef struct ag_nlink_rx {
+    uint16_t last;   /* the highest sequence accepted, or NL_ACK_NONE */
+    bool     any;    /* anything accepted at all yet */
+    uint32_t taken;
+    uint32_t dups;   /* already had it: the ack was lost, not the frame */
+    uint32_t gaps;   /* out of order: something ahead of it was lost */
+} ag_nlink_rx_t;
+
+void ag_nlink_rx_init(ag_nlink_rx_t *rx);
+
+/*
+ * Offer a received frame.  True when it is the next one expected and should be
+ * delivered; false when it is a duplicate or arrives out of order, both of
+ * which are discarded.  Either way ag_nlink_rx_ack afterwards is what to put in
+ * the next frame going the other way - a duplicate is answered by re-acking,
+ * because a duplicate means the previous acknowledgement was what got lost.
+ */
+bool ag_nlink_rx_accept(ag_nlink_rx_t *rx, const ag_nlink_hdr_t *h);
+
+uint16_t ag_nlink_rx_ack(const ag_nlink_rx_t *rx);
+
 #endif /* AG_NLINK_H */

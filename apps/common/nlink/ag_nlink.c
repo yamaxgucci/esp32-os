@@ -248,6 +248,205 @@ void ag_nlink_sched_tick(ag_nlink_sched_t *s)
     s->stream_left = s->reserve;
 }
 
+/* ------------------------------------------------------------------------ */
+/* Reliability: the window                                                   */
+/* ------------------------------------------------------------------------ */
+
+bool ag_nlink_seq_after(uint16_t a, uint16_t b)
+{
+    /*
+     * Signed difference, which is how this is done and how it has been got
+     * wrong in every generation of protocol that used a wrapping counter.
+     * a > b is wrong: 0 is after 65535.  a - b > 0 is wrong for the same
+     * reason in unsigned arithmetic.  The cast is the whole trick, and it is
+     * correct for any two sequences less than 32768 apart - which a window of
+     * a few dozen frames comfortably is.
+     */
+    return (int16_t)(a - b) > 0;
+}
+
+void ag_nlink_tx_init(ag_nlink_tx_t *tx, uint8_t cls, ag_nlink_slot_t *slots,
+                      uint16_t cap, uint32_t rto_ms)
+{
+    memset(tx, 0, sizeof(*tx));
+    tx->slot = slots;
+    tx->cap = cap;
+    tx->cls = cls;
+    tx->rto_ms = rto_ms;
+}
+
+bool ag_nlink_tx_room(const ag_nlink_tx_t *tx)
+{
+    return tx->count < tx->cap;
+}
+
+bool ag_nlink_tx_queue(ag_nlink_tx_t *tx, uint8_t chan, const void *data,
+                       uint16_t len, bool eom)
+{
+    if (len > NL_QUANTUM || tx->count >= tx->cap) {
+        return false;
+    }
+    ag_nlink_slot_t *s = &tx->slot[tx->count];
+    s->seq = tx->next_seq++;
+    s->len = len;
+    s->chan = chan;
+    s->flags = (uint8_t)(NL_F_PSUM | (eom ? NL_F_EOM : 0u));
+    s->sent = false;
+    s->sent_ms = 0;
+    /*
+     * Every field, every time.  The slots are the caller's array and this is
+     * the only place that owns one, so a field left over from the frame that
+     * used this slot before - or from whatever was on the stack when the array
+     * was declared - is read as if it belonged to this frame.  `tries` was
+     * exactly that: uninitialised, it counted first transmissions as
+     * retransmissions and the counter lied about a link that was working.
+     */
+    s->tries = 0;
+    if (len > 0u && data != NULL) {
+        memcpy(s->data, data, len);
+    }
+    tx->count++;
+    return true;
+}
+
+const ag_nlink_slot_t *ag_nlink_tx_next(ag_nlink_tx_t *tx, uint32_t now_ms)
+{
+    /*
+     * The oldest unacknowledged frame has timed out: go back to it, and mark
+     * the whole window behind it unsent so it goes again in order.  That is
+     * what the N in go-back-N is, and it is not pessimism.
+     *
+     * The alternative - re-send only the oldest and let the others time out on
+     * their own - looks gentler on a busy wire and is far worse: a receiver
+     * that discarded everything behind a gap has nothing to acknowledge, so
+     * each frame behind the loss costs its own full timeout, and a window of
+     * twenty frames takes twenty timeouts to recover from one lost frame.
+     */
+    if (tx->count > 0u && tx->slot[0].sent &&
+        (uint32_t)(now_ms - tx->slot[0].sent_ms) >= tx->rto_ms) {
+        for (uint16_t i = 0; i < tx->count; i++) {
+            tx->slot[i].sent = false;
+        }
+    }
+    for (uint16_t i = 0; i < tx->count; i++) {
+        if (!tx->slot[i].sent) {
+            tx->slot[i].sent = true;
+            tx->slot[i].sent_ms = now_ms;
+            tx->sent++;
+            if (tx->slot[i].tries > 0u) {
+                tx->retransmits++;
+            }
+            tx->slot[i].tries++;
+            return &tx->slot[i];
+        }
+    }
+    return NULL;
+}
+
+void ag_nlink_tx_ack(ag_nlink_tx_t *tx, uint16_t ack)
+{
+    if (ack == NL_ACK_NONE) {
+        return;
+    }
+    /* Cumulative: everything up to and including `ack` is gone from the window.
+     * A frame is still ours only when its sequence is AFTER the ack. */
+    uint16_t drop = 0;
+    while (drop < tx->count && !ag_nlink_seq_after(tx->slot[drop].seq, ack)) {
+        drop++;
+    }
+    if (drop == 0u) {
+        return;
+    }
+    /*
+     * Slide.  A ring would avoid the move; an array that is moved costs one
+     * memmove of at most a window, and it keeps "oldest first" true by
+     * construction rather than by two indices that have to be reasoned about
+     * every time they are read.  At a few dozen slots that is the better trade.
+     */
+    tx->count = (uint16_t)(tx->count - drop);
+    if (tx->count > 0u) {
+        memmove(&tx->slot[0], &tx->slot[drop],
+                (size_t)tx->count * sizeof(tx->slot[0]));
+    }
+}
+
+uint16_t ag_nlink_tx_pending(const ag_nlink_tx_t *tx) { return tx->count; }
+
+uint32_t ag_nlink_tx_waiting_bytes(const ag_nlink_tx_t *tx)
+{
+    uint32_t n = 0;
+    for (uint16_t i = 0; i < tx->count; i++) {
+        if (!tx->slot[i].sent) {
+            n += tx->slot[i].len + NL_HDR_SIZE + NL_PSUM_SIZE;
+        }
+    }
+    /*
+     * A retransmission that is due is also something the wire has to carry, but
+     * it is not counted here: the scheduler is being asked "is there work", and
+     * answering yes for a frame whose timer has not expired would make a link
+     * with nothing to send look busy for ever.
+     */
+    return n;
+}
+
+uint32_t ag_nlink_tx_head_len(const ag_nlink_tx_t *tx)
+{
+    for (uint16_t i = 0; i < tx->count; i++) {
+        if (!tx->slot[i].sent) {
+            return (uint32_t)tx->slot[i].len + NL_HDR_SIZE + NL_PSUM_SIZE;
+        }
+    }
+    return 0u;
+}
+
+void ag_nlink_rx_init(ag_nlink_rx_t *rx)
+{
+    memset(rx, 0, sizeof(*rx));
+    rx->last = NL_ACK_NONE;
+}
+
+bool ag_nlink_rx_accept(ag_nlink_rx_t *rx, const ag_nlink_hdr_t *h)
+{
+    /*
+     * The first frame of a stream is sequence zero, and nothing else will do.
+     *
+     * The first draft accepted whatever arrived first, reasoning that a link
+     * which insisted on zero could never be resynchronised.  That was wrong in
+     * the way that matters: lose frame zero, and the receiver silently adopts
+     * frame one as the beginning, acknowledges it, and the sender slides past a
+     * quantum of data that nobody ever received.  A transfer that is short by
+     * 256 bytes and reports success.  The lossy-wire test below found it.
+     *
+     * Resynchronisation is a thing the link does on purpose, by resetting both
+     * ends (NL_F_RST), and not something a receiver improvises out of the first
+     * bytes it happens to see.
+     */
+    const uint16_t want = rx->any ? (uint16_t)(rx->last + 1u) : 0u;
+    if (h->seq == want) {
+        rx->any = true;
+        rx->last = h->seq;
+        rx->taken++;
+        return true;
+    }
+    if (rx->any && !ag_nlink_seq_after(h->seq, rx->last)) {
+        /* Already had it.  This means the ACKNOWLEDGEMENT was lost, not the
+         * frame - the peer sent it again because nothing came back.  Counted
+         * separately from a gap because the two say different things about
+         * which direction of the wire is bad. */
+        rx->dups++;
+        return false;
+    }
+    /* Something ahead of it was lost.  Before anything has been accepted at
+     * all, that is any frame but zero. */
+    rx->gaps++;
+    return false;
+}
+
+uint16_t ag_nlink_rx_ack(const ag_nlink_rx_t *rx)
+{
+    return rx->any ? rx->last : NL_ACK_NONE;
+}
+
 uint32_t ag_nlink_sched_worst_wait(const ag_nlink_sched_t *s, int cls)
 {
     switch (cls) {
