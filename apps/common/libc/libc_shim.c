@@ -92,6 +92,35 @@ static int    s_big_max;
  */
 static void (*s_libc_log)(const char *line);
 
+/*
+ * Somebody who can give memory back.
+ *
+ * The arena is one contiguous block and the failure that matters is not
+ * exhaustion, it is fragmentation: "235 of 6050 KB free, largest block 94208"
+ * with 132 KB asked for.  The program that asked does not check the answer -
+ * almost none of them do - so a refusal becomes a write through a null pointer
+ * one instruction later, and the crash names the wrong culprit every time.
+ *
+ * A program that keeps a cache knows how to make room: it can throw the cache
+ * away and read it back off the disk.  Fallout's art cache is 1800 KB of a
+ * 6050 KB arena and does exactly that on its own account already.  So a
+ * refused allocation asks, once, and tries again.
+ *
+ * Once, and not in a loop: if letting go of everything it has did not make
+ * room, asking again will not either, and a loop here would be a hang instead
+ * of a message.  Re-entrant calls are refused for the same reason - the hook
+ * itself allocates.
+ */
+static int (*s_libc_oom)(size_t wanted);
+static int s_in_oom;
+
+void ag_libc_oom_sink(int (*sink)(size_t wanted))
+{
+    s_libc_oom = sink;
+}
+
+unsigned ag_libc_oom_rescues;
+
 void ag_libc_log_sink(void (*sink)(const char *line))
 {
     s_libc_log = sink;
@@ -414,6 +443,17 @@ void *malloc(size_t n)
         n = 1;
     }
     void *p = ag_malloc(n);
+    if (p == NULL && s_libc_oom != NULL && !s_in_oom) {
+        s_in_oom = 1;
+        const int gave = s_libc_oom(n);
+        s_in_oom = 0;
+        if (gave) {
+            p = ag_malloc(n);
+            if (p != NULL) {
+                ag_libc_oom_rescues++;
+            }
+        }
+    }
     report_big(n, __builtin_return_address(0), __builtin_return_address(1),
                __builtin_return_address(2), __builtin_return_address(3),
                __builtin_return_address(4), p);

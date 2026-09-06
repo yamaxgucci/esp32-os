@@ -70,6 +70,48 @@ AG_APP_SIZED("FALLOUT", "0.1", "argon", 0, 0, AG_FALLOUT_ARENA_KB * 1024);
  * no header, and the signature is fixed by the language. */
 int main(int argc, char **argv);
 
+/*
+ * The engine's art cache, declared rather than included: art.h drags in the
+ * whole of the engine's headers and all this needs is the one function.  It
+ * lives in namespace fallout, like everything else over there.
+ */
+namespace fallout {
+int artCacheFlush();
+}
+
+/*
+ * The shim s own, declared rather than included: this file is compiled with
+ * the engine s include path, where <stdlib.h> is the toolchain s and not
+ * apps/common/libc s.
+ */
+extern "C" {
+void            ag_libc_oom_sink(int (*sink)(__SIZE_TYPE__ wanted));
+extern unsigned ag_libc_oom_rescues;
+}
+
+/*
+ * What to do when the arena refuses an allocation.
+ *
+ * The failure on this machine is fragmentation, not exhaustion: "235 of
+ * 6050 KB free, largest block 94208" with 132 KB asked for.  The engine does
+ * not check malloc - almost no engine does - so the refusal used to become a
+ * write through a null pointer one instruction later, and the crash record
+ * named whatever ran next.
+ *
+ * The art cache is 1800 KB of the arena and every byte of it is a copy of
+ * something on the disk, so throwing it away costs a reload and nothing else.
+ * That makes it the one part of this program's memory that can be given back
+ * on demand - and giving it back in one piece is what a fragmented arena
+ * needs.  Once per refusal; if letting go of all of it did not help, asking
+ * again will not either.
+ */
+static int on_out_of_arena(__SIZE_TYPE__ wanted)
+{
+    ag_printf("fallout: %u bytes refused; letting the art cache go\n",
+              (unsigned)wanted);
+    return fallout::artCacheFlush() ? 1 : 0;
+}
+
 /* In port/sdl_shim.cc.  Not SDL: an automated run has no eyes. */
 extern "C" void sdl_shim_screenshot(const char *path, int after_frames,
                                     int after_ms);
@@ -257,6 +299,8 @@ extern "C" int ag_cxx_main(int argc, char **argv)
         }
         sdl_shim_screenshot(shot, frames, shot_ms);
     }
+    ag_libc_oom_sink(on_out_of_arena);
+
     if (watchdog_set) {
         sdl_shim_watchdog((unsigned)watchdog_s * 1000u);
     }

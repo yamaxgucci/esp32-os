@@ -26,6 +26,16 @@ void ag_libc_malloc_trace(size_t min_bytes, int max_reports);
  * so each dump measures one window. */
 /* A second place for the out-of-arena line to go; NULL for none. */
 void ag_libc_log_sink(void (*sink)(const char *line));
+
+/*
+ * Called when an allocation has been refused, before the caller is told.  It
+ * should give memory back if it can and return non-zero if it did; the
+ * allocation is then tried once more.  See the note in libc_shim.c: the
+ * failure that matters on this machine is fragmentation, and the program that
+ * keeps a cache is the one that can do something about it.
+ */
+void ag_libc_oom_sink(int (*sink)(size_t wanted));
+extern unsigned ag_libc_oom_rescues;
 void ag_libc_malloc_profile(int on);
 void ag_libc_malloc_profile_dump(int top);
 void *calloc(size_t n, size_t sz);
