@@ -93,6 +93,12 @@ try {
         'type t:\h.txt'
         "wget http://127.0.0.1:$httpPort/chunked.txt t:\c.txt"
         'dir t:\'
+        # The station half: the same commands a person types at any board's
+        # prompt, answered by a radio that is not on this board.  Nothing in
+        # these four lines names the wire.
+        'wifi scan'
+        'wifi connect argon-test hunter2'
+        'wifi'
     ) | Out-Null
 
     $t = Transcript 'build\rlinktest.log'
@@ -104,6 +110,13 @@ try {
     Check $t 'saved T:\h.txt' 'radio-http-fetch'
     Check $t 'hello from the host' 'radio-http-content'
     Check $t 'saved T:\c.txt' 'radio-http-chunked'
+    # The station half, end to end: `wifi scan` at this board's prompt lists
+    # what the coprocessor heard, with the fields in the right columns.
+    Check $t 'argon-test' 'wifi-scan-lists-remote-network'
+    Check $t 'neighbour-5g' 'wifi-scan-lists-all-of-them'
+    Check $t 'open-guest' 'wifi-scan-open-network'
+    Check $t 'radio on extradio' 'wifi-status-names-the-radio'
+    Check $t 'joined' 'wifi-connect-took'
 } finally {
     if (-not $KeepFixture) {
         if ($fixture -and -not $fixture.HasExited) {

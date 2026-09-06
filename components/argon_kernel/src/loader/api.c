@@ -47,6 +47,30 @@
 #include "net/espnow.h"
 #include "net/wifimon.h"
 
+#if defined(CONFIG_ARGON_ENABLE_NET) && CONFIG_ARGON_ENABLE_NET
+#include <argon/netprov.h>
+#endif
+
+/*
+ * A radio the SYSTEM can reach, which since ABI 0.47 is not the same question
+ * as a radio on this chip: one bound with `net use` counts.  Whether there is
+ * one right now is a runtime matter (ag_netprov_has_wifi), and api->wifi cannot
+ * follow it - k_api is const, in flash, and shared read-only with every loaded
+ * application.  So the table is present whenever a radio is REACHABLE in
+ * principle, and each station call answers -AG_ENODEV while there is none.
+ *
+ * That is a real change of meaning for `api->wifi != NULL`, which used to say
+ * "this chip has a radio" and now says "this system could have one".  An
+ * application that wants the old answer asks wifi->status() and reads
+ * -AG_ENODEV; there was never a way to ask it without a call anyway, because a
+ * radio that is switched off looks the same from a table of pointers.
+ */
+#if AG_PORT_HAS_WIFI || (defined(CONFIG_ARGON_ENABLE_NET) && CONFIG_ARGON_ENABLE_NET)
+#define ARGON_API_HAS_WIFI 1
+#else
+#define ARGON_API_HAS_WIFI 0
+#endif
+
 /* ---------------------------------------------------------------------- */
 /* sys                                                                    */
 /* ---------------------------------------------------------------------- */
@@ -1166,16 +1190,48 @@ static const ag_wifimon_api_t k_wifimon = {
 };
 #endif /* AG_PORT_HAS_WIFIMON */
 
-#if AG_PORT_HAS_WIFI
+#if ARGON_API_HAS_WIFI
 /*
  * The rest of the radio for applications (ABI 0.39): station, access point and
- * ESP-NOW.  Each call is a thin pass to the same port and kernel layer the
- * shell's `wifi` and `espnow` commands drive (src/shell/shell.c), so an
- * application and the prompt reach the radio through one implementation.  The
- * only work done here is raising the radio when a call needs it and converting
- * the port's structs into the ABI's - the ABI cannot name the GPL port types,
- * so the two are kept field-for-field parallel and copied across.
+ * ESP-NOW.  Each call is a thin pass to the same layer the shell's `wifi` and
+ * `espnow` commands drive, so an application and the prompt reach the radio
+ * through one implementation.
+ *
+ * The station six go through ag_netprov_wifi_* (ABI 0.47), which is why this
+ * block is no longer gated on this chip having a radio: the radio may be a
+ * coprocessor on a wire, bound with `net use`, and an application must not be
+ * able to tell.  The port conversion that used to live here moved to
+ * netprov.c, where it is now one provider among two.
+ *
+ * The access point and ESP-NOW halves did NOT move.  They stay gated on the
+ * built-in radio because there is nothing yet on the far end of a wire to ask -
+ * RLINK carries the station half and no more - and a stub answering -AG_ENOTSUP
+ * is worse than an entry AG_HAS reports as absent.
  */
+static ag_err_t api_wifi_start(void) { return ag_netprov_wifi_start(); }
+static ag_err_t api_wifi_stop(void) { return ag_netprov_wifi_stop(); }
+
+static ag_err_t api_wifi_scan(ag_wifi_ap_t *out, uint32_t max, uint32_t *found)
+{
+    return ag_netprov_wifi_scan(out, max, found);
+}
+
+static ag_err_t api_wifi_connect(const char *ssid, const char *pass,
+                                 const uint8_t bssid[6])
+{
+    return ag_netprov_wifi_connect(ssid, pass, bssid);
+}
+
+static ag_err_t api_wifi_disconnect(void) { return ag_netprov_wifi_disconnect(); }
+
+static ag_err_t api_wifi_status(ag_wifi_status_t *out)
+{
+    return ag_netprov_wifi_status(out);
+}
+#endif /* ARGON_API_HAS_WIFI */
+
+#if AG_PORT_HAS_WIFI
+/* Raising this chip's own radio, for the two halves that only it has. */
 static ag_err_t api_wifi_radio_up(void)
 {
     ag_powerctl_bus_needed();
@@ -1183,78 +1239,6 @@ static ag_err_t api_wifi_radio_up(void)
     if (ag_port_wifi_status(&st) != AG_OK || st.state == AG_WIFI_OFF) {
         return ag_net_init();
     }
-    return AG_OK;
-}
-
-static ag_err_t api_wifi_start(void) { return api_wifi_radio_up(); }
-static ag_err_t api_wifi_stop(void) { return ag_port_wifi_stop(); }
-
-static ag_err_t api_wifi_scan(ag_wifi_ap_t *out, uint32_t max, uint32_t *found)
-{
-    if (out == NULL || max == 0u) {
-        return -AG_EINVAL;
-    }
-    const ag_err_t up = api_wifi_radio_up();
-    if (up != AG_OK) {
-        return up;
-    }
-    /*
-     * No heap here.  The port fills at most sixteen records from a stack buffer
-     * of its own, so a matching stack buffer converts them without an
-     * allocation - which matters because with the radio up and an application
-     * resident on this board, a few hundred spare bytes of heap is exactly what
-     * there is not, and a scan that failed only because the conversion buffer
-     * could not be allocated read as -AG_ENOMEM for a scan that would have
-     * worked.  `found` still reports every access point the radio heard.
-     */
-    ag_port_wifi_ap_t tmp[16];
-    uint32_t          cap = (max < 16u) ? max : 16u;
-    uint32_t          n = 0;
-    const ag_err_t    err = ag_port_wifi_scan(tmp, cap, &n);
-    if (err == AG_OK) {
-        const uint32_t copy = (n < cap) ? n : cap;
-        for (uint32_t i = 0; i < copy; i++) {
-            memcpy(out[i].ssid, tmp[i].ssid, sizeof(out[i].ssid));
-            memcpy(out[i].bssid, tmp[i].bssid, 6u);
-            out[i].rssi = tmp[i].rssi;
-            out[i].channel = tmp[i].channel;
-            out[i].auth = (uint8_t)tmp[i].auth;
-        }
-        if (found != NULL) {
-            *found = n;
-        }
-    }
-    return err;
-}
-
-static ag_err_t api_wifi_connect(const char *ssid, const char *pass,
-                                 const uint8_t bssid[6])
-{
-    ag_powerctl_bus_needed();
-    return ag_port_wifi_connect(ssid, pass, bssid);
-}
-
-static ag_err_t api_wifi_disconnect(void) { return ag_port_wifi_disconnect(); }
-
-static ag_err_t api_wifi_status(ag_wifi_status_t *out)
-{
-    if (out == NULL) {
-        return -AG_EINVAL;
-    }
-    ag_port_wifi_status_t st;
-    const ag_err_t        err = ag_port_wifi_status(&st);
-    if (err != AG_OK) {
-        return err;
-    }
-    memset(out, 0, sizeof(*out));
-    out->state = (uint8_t)st.state;
-    memcpy(out->ssid, st.ssid, sizeof(out->ssid));
-    memcpy(out->bssid, st.bssid, 6u);
-    out->pinned = st.pinned;
-    out->rssi = st.rssi;
-    out->channel = st.channel;
-    out->attempts = st.attempts;
-    out->last_reason = (int32_t)st.last_reason;
     return AG_OK;
 }
 
@@ -1340,7 +1324,9 @@ static int32_t api_wifi_espnow_recv(uint8_t mac[6], void *buf, uint32_t max,
 }
 static uint32_t api_wifi_espnow_dropped(void) { return ag_espnow_dropped(); }
 #endif /* AG_PORT_HAS_ESPNOW */
+#endif /* AG_PORT_HAS_WIFI */
 
+#if ARGON_API_HAS_WIFI
 static const ag_wifi_api_t k_wifi = {
     .size = sizeof(ag_wifi_api_t),
     .start = api_wifi_start,
@@ -1365,7 +1351,7 @@ static const ag_wifi_api_t k_wifi = {
     .espnow_dropped = api_wifi_espnow_dropped,
 #endif
 };
-#endif /* AG_PORT_HAS_WIFI */
+#endif /* ARGON_API_HAS_WIFI */
 
 #if defined(CONFIG_ARGON_ENABLE_CAMERA) && CONFIG_ARGON_ENABLE_CAMERA
 /* The DVP transport, straight from the port - the sensor driver is a .SYS. */
@@ -1410,7 +1396,7 @@ static const ag_api_t k_api = {
 #else
     .wifimon = NULL,
 #endif
-#if AG_PORT_HAS_WIFI
+#if ARGON_API_HAS_WIFI
     .wifi = &k_wifi,
 #else
     .wifi = NULL,

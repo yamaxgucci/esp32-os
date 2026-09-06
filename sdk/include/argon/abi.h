@@ -161,12 +161,18 @@ extern "C" {
  *      `wifi scan` and `wifi connect` too, not only sockets.  Without it the
  *      operator has to know which board holds the radio, which is exactly what
  *      an external radio is for avoiding.  The six are NULL on a provider that
- *      is not a Wi-Fi radio; probe with AG_HAS.  api->wifi is consequently no
- *      longer NULL merely because the image has no built-in radio: it is NULL
- *      when there is no radio ANYWHERE, built in or bound, and an application
- *      that probed it to mean "this chip has a radio" now reads "this system
- *      has one".  AG_WIFI_SSID_MAX and friends moved up the header to sit
- *      above both users; nothing about them changed.
+ *      is not a Wi-Fi radio; probe with AG_HAS.  api->wifi consequently changed
+ *      meaning: it is no longer NULL merely because the image has no built-in
+ *      radio, because a build that can BIND one could grow a radio at any
+ *      moment and the table is const, in flash, and cannot follow.  It now
+ *      means "this system could reach a radio", and station calls answer
+ *      -AG_ENODEV while none is there.  An application that wants the old
+ *      answer calls wifi->status() and reads that code - which it needed to do
+ *      anyway, since a radio switched off looked identical from a table of
+ *      pointers.  The access-point and ESP-NOW halves are unchanged and still
+ *      require this chip's own radio; RLINK carries the station half and no
+ *      more.  AG_WIFI_SSID_MAX and friends moved up the header to sit above
+ *      both users; nothing about them changed.
  */
 #define AG_ABI_MAJOR 0u
 #define AG_ABI_MINOR 47u
