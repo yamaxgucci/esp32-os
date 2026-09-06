@@ -372,6 +372,22 @@ static uint32_t s_in_blit_us, s_in_text_us, s_in_pcm_us;
 static uint32_t s_t_huf_us; /* building the code and sending the table */
 static uint32_t s_t_wait_last, s_loops, s_loops_last;
 static uint32_t s_offers; /* full-surface presents the game made */
+
+/*
+ * What the game says it changed, since the last copy.
+ *
+ * The shim hands the display the rectangle the engine drew into and nothing
+ * more - "nothing drawn means nothing to send" is written in its own comment -
+ * so this is not a guess, it is the same contract a real panel gets.  Before
+ * it was used, the copy hashed all seventy-six thousand pixels to find the
+ * fifty blocks that had moved; the game knew which ones all along.
+ *
+ * Unioned across every present, including the ones this driver declines,
+ * because a rectangle it did not take a copy of is still a rectangle that
+ * changed.
+ */
+static uint32_t s_dam_x0, s_dam_y0, s_dam_x1, s_dam_y1; /* x1/y1 exclusive */
+static bool     s_dam_any;
 /*
  * Whether the picture is carried by the UART's own DMA.  Decided once, when
  * the wire task starts, and given up for good if the port ever refuses a
@@ -1727,6 +1743,7 @@ static uint32_t s_bhash[BLK_N];      /* this frame */
 static uint32_t s_bhash_old[BLK_N];  /* what the far end has been told */
 static uint64_t s_bmask[30];         /* which blocks of each slice moved */
 static uint32_t s_blocks_sent;       /* of BLK_N, in the last window */
+static uint32_t s_dam_seen;          /* blocks hashed, of BLK_N */
 static uint32_t s_slices_sent;
 
 /*
@@ -2118,6 +2135,39 @@ static void rem_blit_rect_inner(ag_handle_t h, const ag_blit_t *b)
     s_last_blit_us = (uint64_t)ag_api()->time->us();
     s_offers++;   /* the game offering the screen, whether or not it is wanted */
 
+    if (b->w != 0u && b->h != 0u) {
+        uint32_t x0 = b->x, y0 = b->y;
+        uint32_t x1 = x0 + b->w, y1 = y0 + b->h;
+        if (x1 > s_fb_w) {
+            x1 = s_fb_w;
+        }
+        if (y1 > s_fb_h) {
+            y1 = s_fb_h;
+        }
+        if (x0 < x1 && y0 < y1) {
+            if (!s_dam_any) {
+                s_dam_x0 = x0;
+                s_dam_y0 = y0;
+                s_dam_x1 = x1;
+                s_dam_y1 = y1;
+                s_dam_any = true;
+            } else {
+                if (x0 < s_dam_x0) {
+                    s_dam_x0 = x0;
+                }
+                if (y0 < s_dam_y0) {
+                    s_dam_y0 = y0;
+                }
+                if (x1 > s_dam_x1) {
+                    s_dam_x1 = x1;
+                }
+                if (y1 > s_dam_y1) {
+                    s_dam_y1 = y1;
+                }
+            }
+        }
+    }
+
     /*
      * This call is the end of the game's frame, and the only place anybody
      * knows the picture is whole.  So the copy happens here - and only when
@@ -2196,13 +2246,39 @@ static void rem_blit_rect_inner(ag_handle_t h, const ag_blit_t *b)
         memset(s_cnt, 0, sizeof(s_cnt));
         const uint32_t slices = (s_fb_h + RAW_ROWS - 1u) / RAW_ROWS;
         const uint32_t refresh = (uint32_t)(s_frame_no % slices);
+
+        /* The band and column range the game says it drew in.  Everything
+         * outside it is the same as it was, on the game's own word. */
+        uint32_t s_lo = 0, s_hi = slices - 1u;
+        uint32_t b_lo = 0, b_hi = BLK_COLS - 1u;
+        if (s_dam_any && !s_force) {
+            s_lo = s_dam_y0 / RAW_ROWS;
+            s_hi = (s_dam_y1 - 1u) / RAW_ROWS;
+            b_lo = s_dam_x0 / BLK_W;
+            b_hi = (s_dam_x1 - 1u) / BLK_W;
+        }
+        s_dam_any = false;
+        s_dam_seen += (s_hi - s_lo + 1u) * (b_hi - b_lo + 1u);
+
         for (uint32_t s = 0; s < slices; s++) {
+            /*
+             * The one slice in thirty that goes whole is hashed and converted
+             * whole too, even where nothing moved: it is what is sent, so its
+             * colours have to be in the counts the code is built from.
+             */
+            const bool whole = (s == refresh) || s_force;
+            if (!whole && (s < s_lo || s > s_hi)) {
+                s_bmask[s] = 0;
+                continue;
+            }
             uint8_t *const  dst0 = pkt_bytes(s);
             uint32_t *const hrow = &s_bhash[s * BLK_COLS];
             uint32_t *const orow = &s_bhash_old[s * BLK_COLS];
             const uint8_t *const band = base + (size_t)(s * RAW_ROWS) * b->stride;
-            uint64_t m = 0;
-            for (uint32_t bx = 0; bx < BLK_COLS; bx++) {
+            uint64_t       m = 0;
+            const uint32_t lo = whole ? 0u : b_lo;
+            const uint32_t hi = whole ? BLK_COLS - 1u : b_hi;
+            for (uint32_t bx = lo; bx <= hi; bx++) {
                 uint32_t h = 2166136261u;
                 for (uint32_t r = 0; r < RAW_ROWS; r++) {
                     const uint16_t *const sp =
@@ -2214,7 +2290,7 @@ static void rem_blit_rect_inner(ag_handle_t h, const ag_blit_t *b)
                     }
                 }
                 hrow[bx] = h;
-                if (h == orow[bx] && s != refresh && !s_force) {
+                if (h == orow[bx] && !whole) {
                     continue; /* the far end has this block already */
                 }
                 m |= 1ull << bx;
@@ -3249,9 +3325,12 @@ static void raw_stats(void)
               (unsigned)s_pal_used, (unsigned)s_pal_gen,
               (unsigned)s_pal_miss, (unsigned)s_huf_bytes,
               (unsigned)(s_t_huf_us / s_raw_frames));
-    ag_printf("RAW: moved %u of %u blocks a frame, %u of %u slices\n",
+    ag_printf("RAW: moved %u of %u blocks a frame, %u of %u slices; "
+              "looked at %u\n",
               (unsigned)(s_blocks_sent / s_raw_frames), (unsigned)BLK_N,
-              (unsigned)(s_slices_sent / s_raw_frames), 30u);
+              (unsigned)(s_slices_sent / s_raw_frames), 30u,
+              (unsigned)(s_dam_seen / s_raw_frames));
+    s_dam_seen = 0;
     s_t_huf_us = 0;
     s_blocks_sent = 0;
     s_slices_sent = 0;
