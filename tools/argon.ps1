@@ -415,7 +415,7 @@ switch ($Command.ToLowerInvariant()) {
         # first positional parameter instead of as a switch.
         #
         $valued = @('marker', 'timeoutsec', 'port', 'sdimage', 'quietms',
-                    'logpath', 'put', 'hostfs', 'hostfsport')
+                    'logpath', 'put', 'hostfs', 'hostfsport', 'radioport')
         $send = @()
         $opts = @{}
         # -cp says which code page the screen bytes are in, for the dump only:
@@ -491,6 +491,14 @@ switch ($Command.ToLowerInvariant()) {
         # of `check`: it wants two ports and a Python that can bind them, and a
         # firewall prompt is not a test failure.
         & (Join-Path $PSScriptRoot 'nettest.ps1') @Rest
+        exit $LASTEXITCODE
+    }
+
+    'rlinktest' {
+        # The same network, but over an external radio: EXTRADIO.SYS bound with
+        # `net use extradio`, talking RLINK to a fake coprocessor (rlinkd.py) on
+        # a UART.  Proves the external-radio socket path with no hardware.
+        & (Join-Path $PSScriptRoot 'rlinktest.ps1') @Rest
         exit $LASTEXITCODE
     }
 
