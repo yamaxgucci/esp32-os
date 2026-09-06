@@ -371,6 +371,7 @@ static volatile uint32_t s_laps[2]; /* laps nobody else wanted, per core */
 static uint32_t s_in_blit_us, s_in_text_us, s_in_pcm_us;
 static uint32_t s_t_huf_us; /* building the code and sending the table */
 static uint32_t s_t_wait_last, s_loops, s_loops_last;
+static uint32_t s_offers; /* full-surface presents the game made */
 /*
  * Whether the picture is carried by the UART's own DMA.  Decided once, when
  * the wire task starts, and given up for good if the port ever refuses a
@@ -1957,11 +1958,21 @@ static uint32_t huf_encode(const uint8_t *src, uint32_t n, uint8_t *dst,
     return at;
 }
 
+/*
+ * Every index means something different after this, and the hashes cannot
+ * see it: they are taken over the pixels the game drew, not over the indices,
+ * so a block whose colours have not changed keeps the same hash while the
+ * number standing for those colours has changed underneath it.  So the next
+ * frame is converted and sent whole, and s_force says so.
+ */
+static bool s_force = true;
+
 static void pal_clear(void)
 {
     memset(s_pmap, 0xff, sizeof(s_pmap));
     s_pal_used = 0;
     s_pal_gen++;
+    s_force = true;
 }
 
 static uint32_t pal_index(uint16_t c)
@@ -2105,6 +2116,7 @@ static void rem_blit_rect_inner(ag_handle_t h, const ag_blit_t *b)
     }
 
     s_last_blit_us = (uint64_t)ag_api()->time->us();
+    s_offers++;   /* the game offering the screen, whether or not it is wanted */
 
     /*
      * This call is the end of the game's frame, and the only place anybody
@@ -2202,7 +2214,7 @@ static void rem_blit_rect_inner(ag_handle_t h, const ag_blit_t *b)
                     }
                 }
                 hrow[bx] = h;
-                if (h == orow[bx] && s != refresh) {
+                if (h == orow[bx] && s != refresh && !s_force) {
                     continue; /* the far end has this block already */
                 }
                 m |= 1ull << bx;
@@ -2221,6 +2233,7 @@ static void rem_blit_rect_inner(ag_handle_t h, const ag_blit_t *b)
             }
             s_bmask[s] = m;
         }
+        s_force = false;
     } else {
         for (uint32_t r = 0; r < s_fb_h; r++) {
             uint8_t *dst = (uint8_t *)pkt_pixels(r / RAW_ROWS) +
@@ -3198,6 +3211,9 @@ static void raw_stats(void)
               (unsigned)kbs, (unsigned)s_t_copy_us, (unsigned)copy_kbs,
               (unsigned)s_t_send_us, (unsigned)s_t_wait_last,
               (unsigned)s_raw_resent);
+    ag_printf("RAW: the game offered the screen %u times a second\n",
+              (unsigned)(s_offers / (STAT_US / 1000000ull)));
+    s_offers = 0;
     ag_printf("RAW: %u turns round the loop waiting for the game\n",
               (unsigned)s_loops_last);
     /* Per frame, so it can be read against the copy and the wire. */
