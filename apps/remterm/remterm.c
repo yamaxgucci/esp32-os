@@ -92,6 +92,24 @@ AG_APP_SIZED("REMTERM", "2.3", "argon", 0, 0, 100 * 1024);
 #define FR_PACK   'P' /* PackBits over the pixels                            */
 #define FR_IDX    'I' /* a palette and indices                               */
 #define FR_AUD    'A' /* a rate, then unsigned 8-bit mono samples            */
+/*
+ * And the four the sender learned after this program stopped being the one
+ * that reads it: the picture as palette indices, the palette, the same indices
+ * Huffman-coded, the coded blocks of a slice that moved, and the packet that
+ * closes a frame.  All of them carry their sum inside the header like FR_RAW,
+ * so they are counted and skipped here rather than mistaken for something with
+ * a byte after the payload - which would cost the framing a packet each time.
+ *
+ * Reading them is not hard and is simply not done: the picture goes to the
+ * standalone `monitor` firmware now, which can assemble a 150 KB frame whole
+ * and this cannot (see monitor/CMakeLists.txt).  What REMTERM is still for is
+ * the console and the sound, and those are unchanged.
+ */
+#define FR_IDX8   'X'
+#define FR_PAL    'L'
+#define FR_HUF    'H'
+#define FR_HUFP   'P'
+#define FR_DONE   'Z'
 
 /*
  * Picture and sound are the same packet with a different body, and it is the
@@ -439,6 +457,7 @@ static uint32_t rows;         /* console rows applied                        */
 static uint32_t bands;        /* bands presented                             */
 static uint32_t px;           /* pixels presented, in thousands              */
 static uint32_t bad;          /* frames whose checksum or shape failed       */
+static uint32_t s_newfmt;     /* packets this program is too old to read     */
 static uint32_t stray;        /* bytes dropped hunting for a header          */
 static uint32_t pxlow;
 static uint32_t packedframes;
@@ -1451,6 +1470,7 @@ int ag_main(int argc, char **argv)
                     " stray; nowidth ", " nomem ", " noacq ", " nopres ",
                     "; raw ", " slices ", " frames ", " partial ", " asked",
                     "; sound ", " in ", " gaps ", " full",
+                    "; too new to read ",
                 };
                 const uint32_t k_rx_value[] = {
                     frames - last_frames,
@@ -1472,8 +1492,9 @@ int ag_main(int argc, char **argv)
                     s_asamples - last_asamples,
                     s_agaps - last_agaps,
                     s_adropped - last_adropped,
+                    s_newfmt,
                 };
-                for (uint32_t f = 0; f < 19u; f++) {
+                for (uint32_t f = 0; f < 20u; f++) {
                     ag_strlcat(line, k_rx_label[f], sizeof(line));
                     ag_strlcat(line, ag_utoa(k_rx_value[f], num, sizeof(num),
                                              0, false),
@@ -1574,6 +1595,13 @@ int ag_main(int argc, char **argv)
          * them costs more than the slice is worth, and the gap logic below
          * asks for a missing slice anyway.
          */
+        if (op == FR_IDX8 || op == FR_PAL || op == FR_HUF || op == FR_HUFP ||
+            op == FR_DONE) {
+            s_newfmt++;
+            wire += len;
+            continue; /* sum is in the header; nothing follows the payload */
+        }
+
         if (op == FR_RAW || op == FR_AUD) {
             uint8_t got = 0;
             if (len >= PKT_BODY) {
