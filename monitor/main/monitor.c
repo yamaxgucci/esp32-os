@@ -16,15 +16,21 @@
  * A frame that cannot be assembled whole reaches the glass as stripes, and the
  * stripes were the complaint that started all of this.
  *
- * What is lost with the operating system is the S3 console relayed onto this
- * screen.  The sound came back, and it took a page of code and no kernel: one
- * stream of samples into the converter on GPIO 26, which is where this board's
- * amplifier is.
+ * Nothing is lost with the operating system any more.  The sound came back
+ * first - one stream of samples into the converter on GPIO 26, where this
+ * board's amplifier is - and then the console, because a monitor that shows
+ * only pictures is not a monitor: when the application on the far machine
+ * stops, what should appear here is its shell, and for a long while what
+ * appeared instead was the last frame the dead game drew.
  *
  * The wire protocol is REMDISP own:
  *
  *   A5 5A F len16   frame:2 slice:2 slices:2 width:2 y:2 rows:2  pixels...
+ *   A5 5A X len16   the same twelve, and one byte a pixel instead of two
+ *   A5 5A L len16   gen:2 count:2 pad:8  sum:1 pad...   256 x RGB565
  *   A5 5A A len16   rate:4 samples:2 seq:2 pad:4 sum:1 pad...     samples...
+ *   A5 5A R len16   row:1 count:1  (ch,attr) x count      + sum   console row
+ *   A5 5A C len16   col:1 row:1 ch:1 attr:1 visible:1     + sum   the caret
  *   A5 5A R ...     going the other way: send slice N of frame M again
  *
  * Picture and sound are the same packet with a different body - thirty-two
@@ -35,6 +41,8 @@
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
  */
 #include <string.h>
+#include "font8x8.h"
+
 #include "driver/dac_continuous.h"
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
@@ -98,9 +106,30 @@ static const char *TAG = "monitor";
 #define PKT_SUM   12u  /* where the sum sits, in payload offsets   */
 #define PKT_PIX   (PKT_HDR - 5u) /* payload offset of the body      */
 #define FR_AUD    0x41u /* A */
-#define FR_RESEND 0x52u /* R */
+#define FR_IDX8   0x58u /* X - a slice as one byte a pixel */
+#define FR_PAL    0x4cu /* L - the palette those bytes index */
+#define FR_ROW    0x52u /* R - one row of console cells */
+#define FR_CUR    0x43u /* C - the caret, and the cell under it */
+#define FR_RESEND 0x52u /* R - the same letter, going the other way */
 #define RAW_ROWS  8u
 #define SLICES    (LCD_H / RAW_ROWS) /* 30 */
+
+/*
+ * The colours a slice of indices names.
+ *
+ * Kept byte-swapped, the way the frame is: the controller wants the high byte
+ * first and the far end sends little-endian, so the swap happens once here
+ * rather than 76 800 times a frame.
+ *
+ * A frame of this game has about 150 different colours, so one byte a pixel
+ * carries it with nothing lost - which is the whole reason this exists.  The
+ * far end sends the table whenever it changes and again every sixty-four
+ * frames, so a receiver plugged in late is right within half a minute.
+ */
+static uint16_t s_pal[256];
+static uint32_t s_pal_gen;
+static uint32_t s_stat_pal;
+static uint32_t s_slice_bpp = 2; /* set by the reader from the opcode */
 
 static uint16_t *s_frame;      /* 150 KB, one piece, because it can be */
 static uint32_t  s_have;       /* bitmap of slices in hand             */
@@ -110,6 +139,16 @@ static int32_t   s_frame_no = -1;
 
 static uint32_t s_stat_frames, s_stat_slices, s_stat_partial, s_stat_asked;
 static uint32_t s_stat_bad; /* slices whose sum did not agree */
+/*
+ * Bytes off the wire, and how many of them were not part of anything.
+ *
+ * Without these two a silent screen has three explanations that look identical
+ * from here - nothing is being sent, something is being sent and the line is
+ * mangling it, or it arrives and this program does not understand it - and a
+ * morning went into telling them apart by other means.  `rx` says whether the
+ * wire carries anything; `stray` says whether what it carries makes sense.
+ */
+static uint32_t s_stat_rx, s_stat_stray;
 static uint64_t s_stat_paint_us;
 
 static spi_device_handle_t s_spi;
@@ -441,6 +480,139 @@ static void ask_again(uint32_t frame, uint32_t slice)
     s_stat_asked++;
 }
 
+/* ---- the console --------------------------------------------------------
+ *
+ * Forty by twenty-five cells of eight by eight pixels, which is what REMDISP
+ * sends and what fits: 40 x 8 = 320 exactly, and 25 rows of 8 is 200 of the
+ * 240 available.  The attribute byte is a background nibble and a foreground
+ * nibble and has been since 1981; the sixteen colours are the ones every other
+ * panel driver in this project uses.
+ *
+ * The page is kept here, not just painted, for one reason: the far end sends a
+ * row only when that row changes, so when the glass has been showing a picture
+ * and text starts arriving there is nothing to draw except what is remembered.
+ * Coming back the other way needs nothing - a picture repaints the whole glass
+ * in one go.
+ *
+ * The scratch a row is built in is the frame buffer itself.  It is 150 KB
+ * standing idle whenever text is on the screen, and the alternative - five
+ * kilobytes of .bss - is the thing that broke the frame allocation once
+ * already: static memory sits inside the one region the frame has to come out
+ * of in a single piece.  A picture cannot be half-shown either way, because a
+ * frame reaches the glass only when all thirty slices have arrived.
+ */
+#define CELL_W 8u
+#define CELL_H 8u
+#define TCOLS  (LCD_W / CELL_W) /* 40 */
+#define TROWS  25u              /* what REMDISP sends */
+
+static uint8_t  s_cell_ch[TROWS][TCOLS];
+static uint8_t  s_cell_at[TROWS][TCOLS];
+static uint8_t  s_cur_col, s_cur_row;
+static bool     s_cur_on;
+static bool     s_text;          /* the glass is showing the console */
+static uint32_t s_stat_rows;
+
+/* Written high byte first by the panel, so they are kept swapped, exactly as
+ * slice_in keeps the pixels. */
+static const uint16_t k_cga[16] = {
+    0x0000, 0x1500, 0x4005, 0x5505, 0x00a8, 0x15a8, 0xa0aa, 0x55ad,
+    0x9552, 0x9f52, 0xea57, 0xff57, 0x95fa, 0x9ffa, 0xeaff, 0xffff,
+};
+
+static void text_paint_row(uint32_t row)
+{
+    if (row >= TROWS || s_frame == NULL) {
+        return;
+    }
+    uint16_t *const px = s_frame;
+    for (uint32_t c = 0; c < TCOLS; c++) {
+        uint8_t fg = (uint8_t)(s_cell_at[row][c] & 0x0fu);
+        uint8_t bg = (uint8_t)((s_cell_at[row][c] >> 4) & 0x0fu);
+        if (s_cur_on && row == s_cur_row && c == s_cur_col) {
+            const uint8_t t = fg;
+            fg = bg;
+            bg = t;
+        }
+        const uint16_t f = k_cga[fg];
+        const uint16_t b = k_cga[bg];
+        const uint8_t *const g = k_font8x8[s_cell_ch[row][c]];
+        for (uint32_t y = 0; y < CELL_H; y++) {
+            uint16_t *const o = px + y * LCD_W + c * CELL_W;
+            const uint8_t bits = g[y];
+            /* Bit 0 is the leftmost pixel, as in the font this came from. */
+            for (uint32_t x = 0; x < CELL_W; x++) {
+                o[x] = (bits & (1u << x)) ? f : b;
+            }
+        }
+    }
+    lcd_window(0, (uint16_t)(row * CELL_H), LCD_W - 1,
+               (uint16_t)(row * CELL_H + CELL_H - 1));
+    lcd_data(px, (size_t)LCD_W * CELL_H * sizeof(uint16_t));
+}
+
+/* The console is taking the glass from a picture: black out what the text does
+ * not cover, then lay the whole remembered page down. */
+static void text_take_glass(void)
+{
+    if (s_text) {
+        return;
+    }
+    s_text = true;
+    if (s_frame != NULL) {
+        memset(s_frame, 0, (size_t)LCD_W * CELL_H * sizeof(uint16_t));
+        lcd_window(0, (uint16_t)(TROWS * CELL_H), LCD_W - 1, LCD_H - 1);
+        for (uint32_t y = TROWS * CELL_H; y < LCD_H; y += CELL_H) {
+            lcd_data(s_frame, (size_t)LCD_W * CELL_H * sizeof(uint16_t));
+        }
+    }
+    for (uint32_t r = 0; r < TROWS; r++) {
+        text_paint_row(r);
+    }
+}
+
+static void text_row_in(const uint8_t *p, uint32_t len)
+{
+    if (len < 2u) {
+        return;
+    }
+    const uint32_t row = p[0];
+    const uint32_t count = p[1];
+    if (row >= TROWS || count > TCOLS || len < 2u + count * 2u) {
+        return;
+    }
+    for (uint32_t c = 0; c < count; c++) {
+        s_cell_ch[row][c] = p[2u + c * 2u];
+        s_cell_at[row][c] = p[3u + c * 2u];
+    }
+    for (uint32_t c = count; c < TCOLS; c++) {
+        s_cell_ch[row][c] = ' ';
+        s_cell_at[row][c] = 0x07u;
+    }
+    s_stat_rows++;
+    text_take_glass();
+    text_paint_row(row);
+}
+
+static void text_cursor_in(const uint8_t *p, uint32_t len)
+{
+    if (len < 5u || p[0] >= TCOLS || p[1] >= TROWS) {
+        return;
+    }
+    const uint32_t was_row = s_cur_row;
+    const bool     was_on = s_cur_on;
+    s_cur_col = p[0];
+    s_cur_row = p[1];
+    s_cell_ch[s_cur_row][s_cur_col] = p[2];
+    s_cell_at[s_cur_row][s_cur_col] = p[3];
+    s_cur_on = p[4] != 0u;
+    text_take_glass();
+    if (was_on && was_row != s_cur_row) {
+        text_paint_row(was_row); /* un-draw the caret where it used to be */
+    }
+    text_paint_row(s_cur_row);
+}
+
 static uint32_t rd16(const uint8_t *p)
 {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8);
@@ -455,6 +627,31 @@ static uint32_t rd16(const uint8_t *p)
  * this happens while the wire is the slow part, and the painting has to be one
  * uninterrupted run.
  */
+static void pal_in(const uint8_t *p, uint32_t len)
+{
+    if (len < PKT_PIX + 512u) {
+        return;
+    }
+    uint8_t got = 0;
+    for (uint32_t i = 0; i < PKT_GEOM; i++) {
+        got = (uint8_t)(got ^ p[i]);
+    }
+    const uint8_t *const b = p + PKT_PIX;
+    for (uint32_t i = 0; i < 512u; i++) {
+        got = (uint8_t)(got ^ b[i]);
+    }
+    if (got != p[PKT_SUM]) {
+        s_stat_bad++;
+        return;
+    }
+    for (uint32_t i = 0; i < 256u; i++) {
+        /* Little-endian on the wire, high byte first to the panel. */
+        s_pal[i] = (uint16_t)(b[i * 2u + 1u] | ((uint16_t)b[i * 2u] << 8));
+    }
+    s_pal_gen = (uint32_t)p[0] | ((uint32_t)p[1] << 8);
+    s_stat_pal++;
+}
+
 static void slice_in(const uint8_t *p, uint32_t len)
 {
     const uint32_t frame = rd16(p + 0);
@@ -464,9 +661,12 @@ static void slice_in(const uint8_t *p, uint32_t len)
     const uint32_t y0 = rd16(p + 8);
     const uint32_t rows = rd16(p + 10);
 
+    /* One byte a pixel or two, said by the opcode and passed in here as the
+     * width of a pixel on the wire. */
+    const uint32_t bpp = s_slice_bpp;
     if (w != LCD_W || slices != SLICES || slice >= SLICES || rows == 0 ||
         rows > RAW_ROWS || y0 + rows > LCD_H ||
-        len < PKT_PIX + rows * w * 2u) {
+        len < PKT_PIX + rows * w * bpp) {
         return;
     }
 
@@ -482,7 +682,7 @@ static void slice_in(const uint8_t *p, uint32_t len)
             got = (uint8_t)(got ^ p[i]);
         }
         const uint8_t *pix = p + PKT_PIX;
-        for (uint32_t i = 0; i < rows * w * 2u; i++) {
+        for (uint32_t i = 0; i < rows * w * bpp; i++) {
             got = (uint8_t)(got ^ pix[i]);
         }
         if (got != p[PKT_SUM]) {
@@ -512,13 +712,22 @@ static void slice_in(const uint8_t *p, uint32_t len)
 
     const uint8_t *src = p + PKT_PIX;
     uint16_t *dst = s_frame + (size_t)y0 * LCD_W;
-    for (uint32_t i = 0; i < rows * w; i++) {
-        dst[i] = (uint16_t)((uint16_t)src[i * 2u + 1u] |
-                            ((uint16_t)src[i * 2u] << 8));
+    if (bpp == 1u) {
+        for (uint32_t i = 0; i < rows * w; i++) {
+            dst[i] = s_pal[src[i]];
+        }
+    } else {
+        for (uint32_t i = 0; i < rows * w; i++) {
+            dst[i] = (uint16_t)((uint16_t)src[i * 2u + 1u] |
+                                ((uint16_t)src[i * 2u] << 8));
+        }
     }
     s_have |= (1u << slice);
 
     if (s_have == s_want) {
+        /* A whole frame covers every pixel, so the console needs no clearing
+         * to be taken off the glass - it is simply painted over. */
+        s_text = false;
         paint();
         s_frame_no = -1;
     }
@@ -543,10 +752,14 @@ static void reader(void *arg)
         if (n <= 0) {
             continue;
         }
+        s_stat_rx += (uint32_t)n;
         for (int i = 0; i < n; i++) {
             const uint8_t b = io[i];
             switch (st) {
             case HUNT0:
+                if (b != FR_MAGIC0) {
+                    s_stat_stray++;
+                }
                 st = (b == FR_MAGIC0) ? HUNT1 : HUNT0;
                 break;
             case HUNT1:
@@ -579,22 +792,40 @@ static void reader(void *arg)
                      * and have nothing after the payload.  Console rows still
                      * end with one, and are still read the old way.
                      */
-                    if (op == FR_RAW) {
+                    if (op == FR_RAW || op == FR_IDX8) {
+                        s_slice_bpp = (op == FR_IDX8) ? 1u : 2u;
                         if (len >= PKT_PIX) {
                             slice_in(payload, len);
                         }
+                        st = HUNT0;
+                    } else if (op == FR_PAL) {
+                        pal_in(payload, len);
                         st = HUNT0;
                     } else if (op == FR_AUD) {
                         aud_in(payload, len);
                         st = HUNT0;
                     } else {
+                        /* Console rows and the caret still carry a byte after
+                         * the payload; they are read in the SUM state below,
+                         * which is where they are acted on. */
                         st = SUM;
                     }
                 }
                 break;
             case SUM:
-                /* Console rows only; picture and sound never reach here. */
-                (void)sum;
+                /* Console rows and the caret only; picture and sound never
+                 * reach here.  The sum is checked, because a mangled row would
+                 * otherwise be painted and stay on the glass until that row
+                 * changes again - which on a quiet prompt is for ever. */
+                if (b == sum) {
+                    if (op == FR_ROW) {
+                        text_row_in(payload, len);
+                    } else if (op == FR_CUR) {
+                        text_cursor_in(payload, len);
+                    }
+                } else {
+                    s_stat_bad++;
+                }
                 st = HUNT0;
                 break;
             }
@@ -671,6 +902,7 @@ void app_main(void)
      * taking the console back took the display away for good.
      */
     uint32_t last_frames = 0, last_slices = 0, last_asamp = 0;
+    uint32_t last_rx = 0, last_stray = 0;
     uint64_t last_paint = 0;
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(5000));
@@ -679,11 +911,18 @@ void app_main(void)
         const uint64_t pu = s_stat_paint_us - last_paint;
         ESP_LOGI(TAG,
                  "%u.%u frames/s, %u slices/s, paint %u us, %u partial, "
-                 "%u asked, %u bad, %u free",
+                 "%u asked, %u bad, %u rows, pal %u/%u, %u B/s in (%u stray), "
+                 "%u free",
                  (unsigned)(f / 5u), (unsigned)((f * 2u) % 10u),
                  (unsigned)(sl / 5u), (unsigned)(f ? (pu / f) : 0),
                  (unsigned)s_stat_partial, (unsigned)s_stat_asked,
-                 (unsigned)s_stat_bad, (unsigned)esp_get_free_heap_size());
+                 (unsigned)s_stat_bad, (unsigned)s_stat_rows,
+                 (unsigned)s_stat_pal, (unsigned)s_pal_gen,
+                 (unsigned)((s_stat_rx - last_rx) / 5u),
+                 (unsigned)(s_stat_stray - last_stray),
+                 (unsigned)esp_get_free_heap_size());
+        last_rx = s_stat_rx;
+        last_stray = s_stat_stray;
         if (s_stat_asamp != 0u || s_stat_adrop != 0u) {
             ESP_LOGI(TAG, "sound %u B/s, %u buffered, %u dropped, %u bad, "
                           "%u starved",

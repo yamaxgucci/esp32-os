@@ -119,6 +119,8 @@ AG_DRV("REMDISP", "2.0", "argon");
 #define FR_PACK   'P' /* the same, PackBits over the pixels                  */
 #define FR_IDX    'I' /* the same, as a palette and indices                  */
 #define FR_AUD    'A' /* sound: a rate, then unsigned 8-bit mono samples     */
+#define FR_IDX8   'X' /* a slice as one byte a pixel, into the palette below  */
+#define FR_PAL    'L' /* the palette itself: RGB565, up to 256 entries        */
 #define FR_END    'E' /* that frame is whole: its number, and how many bands */
 #define FR_RAW    'F' /* one slice of a whole frame, uncompressed           */
 
@@ -165,6 +167,38 @@ AG_DRV("REMDISP", "2.0", "argon");
 
 #ifndef NO_AUDIO
 #define NO_AUDIO 0
+#endif
+
+/*
+ * -DIDX_MODE=0 sends the picture as RGB565, the way it went before the palette.
+ * It is the comparison, and it is one #define because that is what a claim of
+ * "twice as fast" has to be answerable by.
+ */
+#ifndef IDX_MODE
+#define IDX_MODE 1
+#endif
+
+/*
+ * -DFRAME_DUMP=N: write the Nth frame this driver holds to A:\FRAME.RAW, once,
+ * and then never again.
+ *
+ * Not a feature and not meant to become one.  A compressor has to be chosen
+ * against a real picture, and the only real picture is the one sitting in this
+ * buffer: what a game actually draws, after the shim has averaged 640x480 down
+ * to 320x240, is not something to guess about.
+ *
+ * A file, and not the console, and that is the whole lesson of the two goes it
+ * took.  The console is a screen: it sends the far end repaints of its
+ * twenty-five rows, not every line handed to it, so anything that scrolls past
+ * between two repaints never leaves the board at all - eleven lines in every
+ * thirty-five, twice, silently.  A hundred and fifty kilobytes onto the card
+ * takes a moment and arrives whole, and comes back over HTTPD.AXE.
+ */
+#ifndef FRAME_DUMP
+#define FRAME_DUMP 0
+#endif
+#ifndef FRAME_DUMP_PATH
+#define FRAME_DUMP_PATH "a:\\FRAME.RAW"
 #endif
 
 #ifndef SEND_ALWAYS
@@ -1550,15 +1584,93 @@ static void send_rect_locked(const ag_blit_t *b)
  */
 #define PKT_HDR 32u
 
-static uint8_t   *s_pkt;     /* aligned; thirty header-and-pixels blocks     */
+static uint8_t   *s_pkt;     /* aligned; thirty header-and-payload blocks    */
 static uint8_t   *s_pkt_raw; /* what was actually allocated, for freeing     */
-static uint32_t   s_pkt_blk; /* PKT_HDR + one slice of pixels                */
+static uint32_t   s_pkt_blk; /* PKT_HDR + one slice, in whichever form       */
+static uint32_t   s_blk_565; /* what a slice costs as RGB565                 */
+static uint32_t   s_blk_idx; /* and as one byte a pixel                      */
 
-/* Where slice c's block starts, and where its pixels start inside it. */
+/* Where slice c's block starts, and where its payload starts inside it. */
 static uint8_t *pkt_block(uint32_t c) { return s_pkt + (size_t)c * s_pkt_blk; }
 static uint16_t *pkt_pixels(uint32_t c)
 {
     return (uint16_t *)(void *)(pkt_block(c) + PKT_HDR);
+}
+static uint8_t *pkt_bytes(uint32_t c) { return pkt_block(c) + PKT_HDR; }
+
+/* ---- the palette --------------------------------------------------------
+ *
+ * A whole frame of this game turns out to hold **146 different colours**.
+ *
+ * That is not a lucky sample and it is worth saying why: Fallout composes into
+ * an eight-bit surface, so the picture has 256 colours before anything else
+ * happens, and the shim's reduction of 640x480 to 320x240 averages four
+ * neighbours - which on dithered art lands back on the colours that were being
+ * dithered between.  Measured on a real map frame taken off the board: 146,
+ * and the commonest 64 of them cover 98.9% of the pixels.
+ *
+ * So the picture fits in one byte a pixel with **nothing lost at all**, and
+ * that is the whole of this: 153 600 bytes become 77 760, the wire's 386 ms
+ * become 194, and every pixel is the pixel the game drew.  Against that, JPEG
+ * measured on the same frame needed 80 KB to reach 35 dB - more than the
+ * lossless palette costs - because dither is noise and noise is what a
+ * discrete cosine transform is worst at.
+ *
+ * The map from colour to index is an open-addressed table of 512 slots, filled
+ * as colours are met.  One probe per pixel in the steady state, and the steady
+ * state is nearly always: a scene keeps its colours.
+ *
+ * When a scene does not fit, the arithmetic says so - s_pal_miss counts the
+ * pixels that found the table full - and the next frame starts the palette
+ * again.  Two frames in a row that overflow means the scene genuinely has more
+ * than 256 colours, and the picture goes back to RGB565 until something
+ * changes; both layouts live in the same arena, which is sized for the larger.
+ */
+#define PAL_N   256u
+#define PMAP_N  512u
+
+static uint16_t s_pal[PAL_N];
+static uint32_t s_pal_used;
+static uint16_t s_pal_gen;    /* bumped whenever an entry is added */
+static uint16_t s_pal_sent;   /* the generation the far end has been told */
+static uint32_t s_pal_miss;   /* pixels that found the palette full */
+static uint32_t s_pal_fails;  /* frames in a row that overflowed */
+static bool     s_pal_on = (IDX_MODE != 0); /* this frame is indices */
+/* (colour << 8) | index, and 0xffffffff for an empty slot: a colour is
+ * sixteen bits so the shifted key can never be the sentinel. */
+static uint32_t s_pmap[PMAP_N];
+static uint8_t *s_palpkt;     /* aligned, DMA-able, 544 bytes */
+static uint8_t *s_palpkt_raw; /* what was allocated, for freeing */
+
+static void pal_clear(void)
+{
+    memset(s_pmap, 0xff, sizeof(s_pmap));
+    s_pal_used = 0;
+    s_pal_gen++;
+}
+
+static uint32_t pal_index(uint16_t c)
+{
+    uint32_t h = ((uint32_t)c * 2654435761u) >> 23; /* 512 slots */
+    for (;;) {
+        const uint32_t e = s_pmap[h];
+        if (e == 0xffffffffu) {
+            break;
+        }
+        if ((uint16_t)(e >> 8) == c) {
+            return e & 0xffu;
+        }
+        h = (h + 1u) & (PMAP_N - 1u);
+    }
+    if (s_pal_used >= PAL_N) {
+        s_pal_miss++;
+        return 0u; /* one frame of the wrong colour, and then a new palette */
+    }
+    const uint32_t i = s_pal_used++;
+    s_pal[i] = c;
+    s_pmap[h] = ((uint32_t)c << 8) | i;
+    s_pal_gen++;
+    return i;
 }
 static uint32_t   s_fb_w, s_fb_h;
 static ag_mutex_t s_dmg_lock;
@@ -1704,15 +1816,53 @@ static void rem_blit_rect_inner(ag_handle_t h, const ag_blit_t *b)
                           (size_t)b->y * b->stride -
                           (size_t)b->x * sizeof(uint16_t);
     const size_t row_bytes = (size_t)s_fb_w * sizeof(uint16_t);
+
+    /*
+     * Which shape this frame is, decided here and not in the middle of it: the
+     * sender is waiting for the copy, so the stride may change now and may not
+     * change again until the frame has gone.
+     */
+#if IDX_MODE
+    if (s_pal_miss != 0u) {
+        /* A scene this palette does not describe.  Start it again; twice in a
+         * row means the scene really has more than 256 colours. */
+        pal_clear();
+        s_pal_miss = 0;
+        s_pal_on = ++s_pal_fails < 2u;
+    } else {
+        s_pal_fails = 0;
+        if (!s_pal_on && (s_frame_no & 63u) == 0u) {
+            pal_clear(); /* try again now and then: scenes change */
+            s_pal_on = true;
+        }
+    }
+#endif
+    s_pkt_blk = s_pal_on ? s_blk_idx : s_blk_565;
+
     /*
      * Row by row into the blocks, which is what it was already doing - only
-     * the destination is now the pixels of slice r/8 rather than a flat frame.
-     * Same bytes, same count, and the headers between them are left alone.
+     * the destination is the payload of slice r/8 rather than a flat frame.
+     *
+     * As indices this is a lookup per pixel instead of a memcpy, and it is
+     * worth it twice over: half the bytes on the wire, and the table is read
+     * far more often than it is written, so the lookup is one probe.
      */
-    for (uint32_t r = 0; r < s_fb_h; r++) {
-        uint8_t *dst = (uint8_t *)pkt_pixels(r / RAW_ROWS) +
-                       (size_t)(r % RAW_ROWS) * row_bytes;
-        memcpy(dst, base + (size_t)r * b->stride, row_bytes);
+    if (s_pal_on) {
+        for (uint32_t r = 0; r < s_fb_h; r++) {
+            const uint16_t *src =
+                (const uint16_t *)(const void *)(base + (size_t)r * b->stride);
+            uint8_t *const dst = pkt_bytes(r / RAW_ROWS) +
+                                 (size_t)(r % RAW_ROWS) * s_fb_w;
+            for (uint32_t x = 0; x < s_fb_w; x++) {
+                dst[x] = (uint8_t)pal_index(src[x]);
+            }
+        }
+    } else {
+        for (uint32_t r = 0; r < s_fb_h; r++) {
+            uint8_t *dst = (uint8_t *)pkt_pixels(r / RAW_ROWS) +
+                           (size_t)(r % RAW_ROWS) * row_bytes;
+            memcpy(dst, base + (size_t)r * b->stride, row_bytes);
+        }
     }
     s_t_copy_us = (uint32_t)((uint64_t)ag_api()->time->us() - c0);
     s_want_copy = false;
@@ -2058,7 +2208,7 @@ static void pkt_head(uint32_t c, uint32_t slices, uint32_t y0, uint32_t rows)
 
     q[0] = FR_MAGIC0;
     q[1] = FR_MAGIC1;
-    q[2] = FR_RAW;
+    q[2] = s_pal_on ? (uint8_t)FR_IDX8 : (uint8_t)FR_RAW;
     q[3] = (uint8_t)len;
     q[4] = (uint8_t)(len >> 8);
     put16(q + 5, s_frame_no);
@@ -2081,11 +2231,74 @@ static void pkt_head(uint32_t c, uint32_t slices, uint32_t y0, uint32_t rows)
         acc ^= (uint32_t)q[i] << (((i - 5u) & 3u) * 8u);
     }
     const uint32_t *w = (const uint32_t *)(const void *)(q + PKT_HDR);
-    const uint32_t  words = (px * sizeof(uint16_t)) / 4u;
+    const uint32_t  words = (px * (s_pal_on ? 1u : 2u)) / 4u;
     for (uint32_t i = 0; i < words; i++) {
         acc ^= w[i];
     }
     q[17] = (uint8_t)(acc ^ (acc >> 8) ^ (acc >> 16) ^ (acc >> 24));
+}
+
+/*
+ * The palette, when the far end has an older one than this.
+ *
+ * Its own block, aligned and DMA-able like every other, and always the full
+ * 512 bytes so that the transfer is a whole number of cache lines and the
+ * length never has to be thought about.  544 bytes = seventeen lines.
+ *
+ * Sent ahead of the slices that use it, which is the only ordering that
+ * matters: a slice whose colours the far end cannot look up is a slice of the
+ * wrong picture.  Nothing acknowledges it - the far end says nothing about
+ * anything - so it is repeated every sixty-four frames as well, which costs a
+ * ten-thousandth of the wire and covers a receiver that was plugged in late.
+ */
+#define PAL_BLK (PKT_HDR + PAL_N * 2u)
+
+static void pal_send(void)
+{
+    if (s_palpkt == NULL) {
+        return;
+    }
+    uint8_t *const q = s_palpkt;
+    const uint32_t len = PAL_BLK - 5u;
+
+    q[0] = FR_MAGIC0;
+    q[1] = FR_MAGIC1;
+    q[2] = FR_PAL;
+    q[3] = (uint8_t)len;
+    q[4] = (uint8_t)(len >> 8);
+    put16(q + 5, s_pal_gen);
+    put16(q + 7, s_pal_used);
+    put16(q + 9, 0);
+    put16(q + 11, 0);
+    put16(q + 13, 0);
+    put16(q + 15, 0);
+    q[17] = 0;
+    memset(q + 18, 0, PKT_HDR - 18u);
+
+    memset(q + PKT_HDR, 0, PAL_N * 2u);
+    for (uint32_t i = 0; i < s_pal_used; i++) {
+        put16(q + PKT_HDR + i * 2u, s_pal[i]);
+    }
+
+    uint32_t acc = 0;
+    for (uint32_t i = 5; i < 17u; i++) {
+        acc ^= (uint32_t)q[i] << (((i - 5u) & 3u) * 8u);
+    }
+    const uint32_t *w = (const uint32_t *)(const void *)(q + PKT_HDR);
+    for (uint32_t i = 0; i < (PAL_N * 2u) / 4u; i++) {
+        acc ^= w[i];
+    }
+    q[17] = (uint8_t)(acc ^ (acc >> 8) ^ (acc >> 16) ^ (acc >> 24));
+
+    bool sent = false;
+    if (s_dma) {
+        sent = io->uart_dma_submit(LINK_PORT, q, PAL_BLK) >= 0;
+    }
+    if (!sent) {
+        (void)io->uart_write(LINK_PORT, q, PAL_BLK);
+    }
+    s_pal_sent = s_pal_gen;
+    s_sent_bytes += PAL_BLK;
 }
 
 static void raw_resend(uint32_t frame, uint32_t slice)
@@ -2121,6 +2334,49 @@ static void raw_resend(uint32_t frame, uint32_t slice)
     }
 }
 
+#if FRAME_DUMP
+static void frame_dump(void)
+{
+    static uint32_t seen;
+    static bool     done;
+    if (done || s_pkt == NULL || ++seen < (uint32_t)FRAME_DUMP) {
+        return;
+    }
+    done = true;
+
+    const ag_handle_t f = ag_open(FRAME_DUMP_PATH, AG_O_WRONLY | AG_O_CREATE |
+                                                       AG_O_TRUNC);
+    if (f < 0) {
+        ag_printf("REMDISP: cannot write %s (%s)\n", FRAME_DUMP_PATH,
+                  ag_strerror((ag_err_t)f));
+        return;
+    }
+    /*
+     * Slice by slice, because that is how the picture is laid out - the
+     * headers between the bands are not part of it and must not go in.
+     */
+    uint32_t wrote = 0;
+    const uint32_t slices = raw_slices();
+    for (uint32_t c = 0; c < slices; c++) {
+        uint32_t rows = RAW_ROWS;
+        if (c * RAW_ROWS + rows > s_fb_h) {
+            rows = s_fb_h - c * RAW_ROWS;
+        }
+        const uint32_t n = rows * s_fb_w * (uint32_t)sizeof(uint16_t);
+        const int32_t  w = ag_write(f, pkt_pixels(c), n);
+        if (w < 0) {
+            ag_printf("REMDISP: %s died at %u bytes (%d)\n", FRAME_DUMP_PATH,
+                      (unsigned)wrote, (int)w);
+            break;
+        }
+        wrote += (uint32_t)w;
+    }
+    (void)ag_close(f);
+    ag_printf("--FRAME %s %u %u %u--\n", FRAME_DUMP_PATH, (unsigned)s_fb_w,
+              (unsigned)s_fb_h, (unsigned)wrote);
+}
+#endif
+
 static void raw_send_direct(void)
 {
     const uint32_t slices = raw_slices();
@@ -2146,6 +2402,12 @@ static void raw_send_direct(void)
         (void)io->uart_tx_wait(LINK_PORT, 1000u);
     }
     s_t_rest_us += (uint32_t)((uint64_t)ag_api()->time->us() - t0);
+
+    /* The colours before the pixels that name them, and again now and then for
+     * a receiver that was not listening when they changed. */
+    if (s_pal_on && (s_pal_sent != s_pal_gen || (s_frame_no & 63u) == 0u)) {
+        pal_send();
+    }
 
     uint32_t fill_us = 0;
     uint32_t port_us = 0;
@@ -2302,6 +2564,9 @@ static void raw_stats(void)
     s_in_blit_us = 0;
     s_in_text_us = 0;
     s_in_pcm_us = 0;
+    ag_printf("RAW: palette %u colours, generation %u, %u pixels missed\n",
+              (unsigned)s_pal_used, (unsigned)s_pal_gen,
+              (unsigned)s_pal_miss);
     aud_stats();
     ag_printf("RAW: bytes in from the far end: %u\n", (unsigned)s_rx_bytes);
     ag_printf("RAW: step4 apart, us per frame: header %u, handover %u, dma %u, "
@@ -2486,6 +2751,9 @@ static void wire_task(void *arg)
             continue;
         }
 
+#if FRAME_DUMP
+        frame_dump();
+#endif
         const uint64_t t0 = (uint64_t)ag_api()->time->us();
         const uint64_t b0 = s_sent_bytes;
         raw_send_direct();
@@ -2583,6 +2851,9 @@ static void rem_stop(void)
     if (!s_wire_running) {
         ag_free(fb);
         ag_free(ab);
+        ag_free(s_palpkt_raw);
+        s_palpkt = NULL;
+        s_palpkt_raw = NULL;
         ag_free(s_tx);
         s_tx = NULL;
 
@@ -3504,10 +3775,20 @@ ag_err_t ag_driver_init(void)
      * nothing about alignment and does not have to: this is the only place
      * that cares.
      */
-    s_pkt_blk = PKT_HDR + RAW_ROWS * s_fb_w * (uint32_t)sizeof(uint16_t);
+    /*
+     * Two strides in one arena.  A slice as RGB565 is 32 + 5120 = 5152 bytes
+     * and as indices 32 + 2560 = 2592, both whole numbers of cache lines, and
+     * the arena is sized for the larger so that a scene the palette cannot
+     * describe can still be sent the old way without asking for memory in the
+     * middle of a game.
+     */
+    s_blk_565 = PKT_HDR + RAW_ROWS * s_fb_w * (uint32_t)sizeof(uint16_t);
+    s_blk_idx = PKT_HDR + RAW_ROWS * s_fb_w;
+    s_pkt_blk = s_pal_on ? s_blk_idx : s_blk_565;
+    pal_clear();
     {
         const size_t want =
-            (size_t)((s_fb_h + RAW_ROWS - 1u) / RAW_ROWS) * s_pkt_blk;
+            (size_t)((s_fb_h + RAW_ROWS - 1u) / RAW_ROWS) * s_blk_565;
         s_pkt_raw = (uint8_t *)ag_malloc(want + PKT_HDR - 1u);
         s_pkt = (s_pkt_raw == NULL)
                     ? NULL
@@ -3533,6 +3814,16 @@ ag_err_t ag_driver_init(void)
                   (unsigned)(AUD_PKTS * AUD_PKT_BLK / 1024u));
     }
 
+    /* And one more block for the palette. */
+    s_palpkt_raw = (uint8_t *)ag_malloc(PAL_BLK + PKT_HDR - 1u);
+    s_palpkt = (s_palpkt_raw == NULL)
+                   ? NULL
+                   : (uint8_t *)(((uintptr_t)s_palpkt_raw + PKT_HDR - 1u) &
+                                 ~(uintptr_t)(PKT_HDR - 1u));
+    if (s_palpkt == NULL) {
+        s_pal_on = false; /* no palette to send means no indices to send */
+    }
+
     if (s_pkt == NULL || s_tx == NULL) {
         s_fb_w = 0;
         s_fb_h = 0;
@@ -3541,7 +3832,7 @@ ag_err_t ag_driver_init(void)
                   (unsigned)(320u * 240u * 2u / 1024u));
     } else {
         memset(s_pkt, 0,
-               (size_t)((s_fb_h + RAW_ROWS - 1u) / RAW_ROWS) * s_pkt_blk);
+               (size_t)((s_fb_h + RAW_ROWS - 1u) / RAW_ROWS) * s_blk_565);
         if (ag_api()->task != NULL && ag_api()->task->mutex_create != NULL) {
             s_dmg_lock = ag_api()->task->mutex_create();
         }
@@ -3587,9 +3878,10 @@ ag_err_t ag_driver_init(void)
     }
 
     ag_printf("REMDISP: uart%d at %u baud, budget %u B/s; %ux%u cells, "
-              "pixels in %u-row bands%s\n",
+              "pixels in %u-row bands%s, %s\n",
               LINK_PORT, (unsigned)LINK_BAUD, (unsigned)WIRE_BUDGET_BPS,
               (unsigned)REM_COLS, (unsigned)REM_ROWS, (unsigned)BAND_ROWS,
-              (s_pkt != NULL) ? ", sent from a task of its own" : "");
+              (s_pkt != NULL) ? ", sent from a task of its own" : "",
+              s_pal_on ? "one byte a pixel" : "RGB565");
     return AG_OK;
 }
