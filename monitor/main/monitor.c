@@ -30,6 +30,9 @@
  *   A5 5A L len16   gen:2 count:2 pad:8  sum:1 pad...   256 x RGB565
  *   A5 5A T len16   frame:2 count:2 pad:8               256 code lengths
  *   A5 5A H len16   frame:2 slice:2 slices:2 y:2 rows:2 bodylen:2   the bits
+ *   A5 5A P len16   the same twelve; the body is five bytes of block mask
+ *                   and then the bits of the blocks it names
+ *   A5 5A Z len16   frame:2 slicemask:4                 that frame is whole
  *   A5 5A A len16   rate:4 samples:2 seq:2 pad:4 sum:1 pad...     samples...
  *   A5 5A R len16   row:1 count:1  (ch,attr) x count      + sum   console row
  *   A5 5A C len16   col:1 row:1 ch:1 attr:1 visible:1     + sum   the caret
@@ -112,6 +115,10 @@ static const char *TAG = "monitor";
 #define FR_PAL    0x4cu /* L - the palette those bytes index */
 #define FR_HUF    0x48u /* H - a slice as Huffman-coded indices */
 #define FR_HTAB   0x54u /* T - the code lengths those bits are read with */
+#define FR_HUFP   0x50u /* P - the same, but only the blocks that moved */
+#define FR_DONE   0x5au /* Z - that frame is whole; which slices it had */
+#define BLK_W     8u
+#define BLK_COLS  (LCD_W / BLK_W)   /* forty blocks across a slice */
 #define FR_ROW    0x52u /* R - one row of console cells */
 #define FR_CUR    0x43u /* C - the caret, and the cell under it */
 #define FR_RESEND 0x52u /* R - the same letter, going the other way */
@@ -166,15 +173,16 @@ static uint16_t s_hcount[17];
 static uint8_t  s_hsym[256];             /* symbols in canonical order */
 static uint32_t s_htab_frame = 0xffffffffu;
 static bool     s_htab_ok;
-static uint32_t s_stat_huf, s_stat_hbad;
+static uint32_t s_stat_huf, s_stat_hbad, s_stat_blocks;
 
 static uint16_t *s_frame;      /* 150 KB, one piece, because it can be */
 static uint32_t  s_have;       /* bitmap of slices in hand             */
-static uint32_t  s_want = (1u << SLICES) - 1u;
+
 static uint32_t  s_asked;
 static int32_t   s_frame_no = -1;
 
 static uint32_t s_stat_frames, s_stat_slices, s_stat_partial, s_stat_asked;
+static uint32_t s_stat_painted; /* rows actually pushed to the glass */
 static uint32_t s_stat_bad; /* slices whose sum did not agree */
 /*
  * Bytes off the wire, and how many of them were not part of anything.
@@ -503,6 +511,45 @@ static void paint(void)
     lcd_data(s_frame, (size_t)LCD_W * LCD_H * sizeof(uint16_t));
     s_stat_paint_us += (uint64_t)(esp_timer_get_time() - t0);
     s_stat_frames++;
+    s_stat_painted += LCD_H;
+}
+
+/*
+ * Only the bands that changed.
+ *
+ * The whole glass is 150 KB down a bus at 80 MHz, which is fifteen and a half
+ * milliseconds - and with the far end sending only the blocks that moved, five
+ * or six bands of thirty is the usual frame.  Runs of neighbouring bands go in
+ * one window rather than one each, because setting the window is three
+ * transactions and is what makes small writes expensive.
+ */
+static void paint_mask(uint32_t mask)
+{
+    if (mask == 0u) {
+        return;
+    }
+    const int64_t t0 = esp_timer_get_time();
+    uint32_t      painted = 0;
+    for (uint32_t s = 0; s < SLICES;) {
+        if ((mask & (1u << s)) == 0u) {
+            s++;
+            continue;
+        }
+        uint32_t e = s;
+        while (e + 1u < SLICES && (mask & (1u << (e + 1u))) != 0u) {
+            e++;
+        }
+        const uint32_t y0 = s * RAW_ROWS;
+        const uint32_t rows = (e - s + 1u) * RAW_ROWS;
+        lcd_window(0, (uint16_t)y0, LCD_W - 1, (uint16_t)(y0 + rows - 1u));
+        lcd_data(s_frame + (size_t)y0 * LCD_W,
+                 (size_t)rows * LCD_W * sizeof(uint16_t));
+        painted += rows;
+        s = e + 1u;
+    }
+    s_stat_paint_us += (uint64_t)(esp_timer_get_time() - t0);
+    s_stat_frames++;
+    s_stat_painted += painted;
 }
 
 /* ---- the wire ----------------------------------------------------------- */
@@ -697,35 +744,67 @@ static void pal_in(const uint8_t *p, uint32_t len)
  */
 static void slice_track(uint32_t frame, uint32_t slice)
 {
+    (void)slice;
     if ((int32_t)frame != s_frame_no) {
-        if (s_frame_no >= 0 && s_have != s_want) {
-            s_stat_partial++;
-        }
         s_frame_no = (int32_t)frame;
         s_have = 0;
         s_asked = 0;
-    }
-
-    /* A gap means one went missing; ask once, while the far end still has it. */
-    for (uint32_t i = 0; i < slice; i++) {
-        const uint32_t bit = 1u << i;
-        if ((s_have & bit) == 0u && (s_asked & bit) == 0u) {
-            s_asked |= bit;
-            ask_again(frame, i);
-        }
     }
 }
 
 static void slice_have(uint32_t slice)
 {
     s_have |= (1u << slice);
-    if (s_have == s_want) {
-        /* A whole frame covers every pixel, so the console needs no clearing
-         * to be taken off the glass - it is simply painted over. */
+}
+
+/*
+ * The far end says a frame is finished, and which slices it was made of.
+ *
+ * It has to say, now that a slice nothing happened in is not sent: waiting for
+ * all thirty would be waiting for ever, and there is no other moment at which
+ * the picture is known to be whole.  What is missing from what was promised is
+ * asked for once, and the glass is painted anyway - a band a frame out of date
+ * is better than a screen that has stopped.
+ */
+static void done_in(const uint8_t *p, uint32_t len)
+{
+    if (len < PKT_GEOM) {
+        return;
+    }
+    uint8_t got = 0;
+    for (uint32_t i = 0; i < PKT_GEOM; i++) {
+        got = (uint8_t)(got ^ p[i]);
+    }
+    if (got != p[PKT_SUM]) {
+        s_stat_bad++;
+        return;
+    }
+    const uint32_t frame = rd16(p + 0);
+    const uint32_t mask = rd16(p + 2) | (rd16(p + 4) << 16);
+    if ((int32_t)frame != s_frame_no) {
+        return; /* a frame whose slices never arrived at all */
+    }
+    const uint32_t missing = mask & ~s_have;
+    if (missing != 0u) {
+        s_stat_partial++;
+        for (uint32_t i = 0; i < SLICES; i++) {
+            if ((missing & (1u << i)) != 0u && (s_asked & (1u << i)) == 0u) {
+                s_asked |= 1u << i;
+                ask_again(frame, i);
+            }
+        }
+    }
+    /*
+     * Coming off text the whole glass has to go; otherwise only the bands the
+     * far end had something to say about.
+     */
+    if (s_text) {
         s_text = false;
         paint();
-        s_frame_no = -1;
+    } else {
+        paint_mask(s_have);
     }
+    s_frame_no = -1;
 }
 
 static void htab_in(const uint8_t *p, uint32_t len)
@@ -878,6 +957,100 @@ static void huf_in(const uint8_t *p, uint32_t len)
     slice_have(slice);
 }
 
+/*
+ * A slice of which only some blocks moved.
+ *
+ * Five bytes of mask, then sixty-four coded symbols for every bit that is set,
+ * eight rows of eight.  What is not named is left exactly as it is on the
+ * frame, which is the whole point: it is already right.
+ */
+static void hufp_in(const uint8_t *p, uint32_t len)
+{
+    const uint32_t frame = rd16(p + 0);
+    const uint32_t slice = rd16(p + 2);
+    const uint32_t slices = rd16(p + 4);
+    const uint32_t y0 = rd16(p + 6);
+    const uint32_t rows = rd16(p + 8);
+    const uint32_t body = rd16(p + 10);
+
+    if (slices != SLICES || slice >= SLICES || rows != RAW_ROWS ||
+        y0 + rows > LCD_H || body < 5u || len < PKT_PIX + body) {
+        return;
+    }
+    uint8_t got = 0;
+    for (uint32_t i = 0; i < PKT_GEOM; i++) {
+        got = (uint8_t)(got ^ p[i]);
+    }
+    for (uint32_t i = PKT_PIX; i < len; i++) {
+        got = (uint8_t)(got ^ p[i]);
+    }
+    if (got != p[PKT_SUM]) {
+        s_stat_bad++;
+        return;
+    }
+    if (!s_htab_ok || s_htab_frame != frame) {
+        s_stat_hbad++;
+        return;
+    }
+
+    const uint8_t *const m = p + PKT_PIX;
+    uint64_t mask = 0;
+    for (uint32_t i = 0; i < 5u; i++) {
+        mask |= (uint64_t)m[i] << (i * 8u);
+    }
+    const uint8_t *const src = m + 5u;
+    const uint32_t       nbits = body - 5u;
+
+    s_stat_slices++;
+    s_stat_huf++;
+    slice_track(frame, slice);
+
+    uint16_t *const base = s_frame + (size_t)y0 * LCD_W;
+    uint32_t        acc = 0, at = 0;
+    int             have = 0;
+
+    for (uint32_t bx = 0; bx < BLK_COLS; bx++) {
+        if ((mask & (1ull << bx)) == 0ull) {
+            continue;
+        }
+        s_stat_blocks++;
+        for (uint32_t r = 0; r < RAW_ROWS; r++) {
+            uint16_t *const dst = base + (size_t)r * LCD_W + bx * BLK_W;
+            for (uint32_t k = 0; k < BLK_W; k++) {
+                while (have <= 24) {
+                    acc = (acc << 8) | ((at < nbits) ? src[at] : 0u);
+                    at++;
+                    have += 8;
+                }
+                if (s_hfast != NULL) {
+                    const uint32_t peek =
+                        (acc >> (have - (int)HUF_FAST)) &
+                        ((1u << HUF_FAST) - 1u);
+                    const uint16_t e = s_hfast[peek];
+                    if (e != 0u) {
+                        have -= (int)(e >> 8);
+                        dst[k] = s_pal[e & 0xffu];
+                        continue;
+                    }
+                }
+                uint32_t code = 0, sym = 0;
+                for (uint32_t l = 1; l <= 15u; l++) {
+                    code = (code << 1) | ((acc >> (have - 1)) & 1u);
+                    have--;
+                    if (s_hcount[l] != 0u &&
+                        (uint32_t)(code - s_hfirst[l]) < s_hcount[l]) {
+                        sym = s_hsym[s_hbase[l] + (code - s_hfirst[l])];
+                        break;
+                    }
+                }
+                dst[k] = s_pal[sym];
+            }
+        }
+    }
+
+    slice_have(slice);
+}
+
 static void slice_in(const uint8_t *p, uint32_t len)
 {
     const uint32_t frame = rd16(p + 0);
@@ -1009,6 +1182,12 @@ static void reader(void *arg)
                     } else if (op == FR_HUF) {
                         huf_in(payload, len);
                         st = HUNT0;
+                    } else if (op == FR_HUFP) {
+                        hufp_in(payload, len);
+                        st = HUNT0;
+                    } else if (op == FR_DONE) {
+                        done_in(payload, len);
+                        st = HUNT0;
                     } else if (op == FR_AUD) {
                         aud_in(payload, len);
                         st = HUNT0;
@@ -1115,7 +1294,7 @@ void app_main(void)
      * taking the console back took the display away for good.
      */
     uint32_t last_frames = 0, last_slices = 0, last_asamp = 0;
-    uint32_t last_rx = 0, last_stray = 0;
+    uint32_t last_rx = 0, last_stray = 0, last_blocks = 0, last_painted = 0;
     uint64_t last_paint = 0;
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(5000));
@@ -1125,18 +1304,23 @@ void app_main(void)
         ESP_LOGI(TAG,
                  "%u.%u frames/s, %u slices/s, paint %u us, %u partial, "
                  "%u asked, %u bad, %u rows, pal %u/%u, coded %u (%u lost), "
-                 "%u B/s in (%u stray), %u free",
+                 "%u blocks/s, %u rows/s painted, %u B/s in (%u stray), "
+                 "%u free",
                  (unsigned)(f / 5u), (unsigned)((f * 2u) % 10u),
                  (unsigned)(sl / 5u), (unsigned)(f ? (pu / f) : 0),
                  (unsigned)s_stat_partial, (unsigned)s_stat_asked,
                  (unsigned)s_stat_bad, (unsigned)s_stat_rows,
                  (unsigned)s_stat_pal, (unsigned)s_pal_gen,
                  (unsigned)s_stat_huf, (unsigned)s_stat_hbad,
+                 (unsigned)((s_stat_blocks - last_blocks) / 5u),
+                 (unsigned)((s_stat_painted - last_painted) / 5u),
                  (unsigned)((s_stat_rx - last_rx) / 5u),
                  (unsigned)(s_stat_stray - last_stray),
                  (unsigned)esp_get_free_heap_size());
         last_rx = s_stat_rx;
         last_stray = s_stat_stray;
+        last_blocks = s_stat_blocks;
+        last_painted = s_stat_painted;
         if (s_stat_asamp != 0u || s_stat_adrop != 0u) {
             ESP_LOGI(TAG, "sound %u B/s, %u buffered, %u dropped, %u bad, "
                           "%u starved",

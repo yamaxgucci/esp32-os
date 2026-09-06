@@ -123,6 +123,8 @@ AG_DRV("REMDISP", "2.0", "argon");
 #define FR_PAL    'L' /* the palette itself: RGB565, up to 256 entries        */
 #define FR_HUF    'H' /* a slice as Huffman-coded indices                     */
 #define FR_HTAB   'T' /* the code lengths those bits are read with            */
+#define FR_HUFP   'P' /* the same, but only the blocks of it that moved       */
+#define FR_DONE   'Z' /* that frame is whole: which slices it was made of     */
 #define FR_END    'E' /* that frame is whole: its number, and how many bands */
 #define FR_RAW    'F' /* one slice of a whole frame, uncompressed           */
 
@@ -187,6 +189,14 @@ AG_DRV("REMDISP", "2.0", "argon");
  */
 #ifndef HUF_MODE
 #define HUF_MODE 1
+#endif
+
+/*
+ * -DDIFF_MODE=0 sends every pixel of every frame, whether it moved or not.
+ * With it on, a slice nothing has happened in is not sent at all.
+ */
+#ifndef DIFF_MODE
+#define DIFF_MODE 1
 #endif
 
 /*
@@ -360,6 +370,7 @@ static volatile uint32_t s_laps[2]; /* laps nobody else wanted, per core */
 #endif
 static uint32_t s_in_blit_us, s_in_text_us, s_in_pcm_us;
 static uint32_t s_t_huf_us; /* building the code and sending the table */
+static uint32_t s_t_wait_last, s_loops, s_loops_last;
 /*
  * Whether the picture is carried by the UART's own DMA.  Decided once, when
  * the wire task starts, and given up for good if the port ever refuses a
@@ -1683,9 +1694,39 @@ static uint8_t  s_hlen[PAL_N];   /* code lengths, 0 for a colour not used    */
 static uint16_t s_hcode[PAL_N];  /* canonical codes, most significant first  */
 static bool     s_huf;           /* a table was built for this frame         */
 static uint8_t *s_hufpkt, *s_hufpkt_raw;  /* the table's own block */
+static uint8_t *s_donepkt;                /* and the one that closes a frame */
 static uint8_t *s_out, *s_out_raw;        /* where coded slices are built */
 static uint32_t s_out_blk, s_out_next;
 static uint32_t s_huf_bytes;     /* what the coded frame came to */
+
+/* ---- what moved ---------------------------------------------------------
+ *
+ * The largest saving on this wire is not a compressor: it is that most of a
+ * screen is the same as it was.  A man walking across a map changes his own
+ * eight by eight blocks and the ones his shadow crosses, and nothing else - a
+ * few dozen of the twelve hundred the screen is made of.
+ *
+ * What is kept is a hash of each block, not the block itself.  A hash is four
+ * bytes against sixty-four, and - which matters more - it is computed while
+ * the copy is already reading those pixels, so nothing is read twice.  Two
+ * arrays of twelve hundred words is nine and a half kilobytes; keeping the
+ * previous frame instead would be seventy-seven and a second walk of it.
+ *
+ * A hash can lie, and this one is thirty-two bits over sixty-four so it lies
+ * about once in four thousand million.  The insurance is a rolling repaint:
+ * one slice in thirty is sent whole whatever its hashes say, so the entire
+ * screen is refreshed every thirty frames whether anything asked for it or
+ * not, and any block that was ever wrong is right within five seconds.
+ */
+#define BLK_W    8u
+#define BLK_COLS (320u / BLK_W)      /* forty blocks across a slice */
+#define BLK_N    (BLK_COLS * 30u)    /* twelve hundred on a screen  */
+
+static uint32_t s_bhash[BLK_N];      /* this frame */
+static uint32_t s_bhash_old[BLK_N];  /* what the far end has been told */
+static uint64_t s_bmask[30];         /* which blocks of each slice moved */
+static uint32_t s_blocks_sent;       /* of BLK_N, in the last window */
+static uint32_t s_slices_sent;
 
 /*
  * Lengths, by the two-queue method.
@@ -1835,6 +1876,52 @@ static bool huf_build(void)
         }
     }
     return false;
+}
+
+/*
+ * The same coder, over only the blocks a mask names.
+ *
+ * Eight by eight at a time and in place: gathering the blocks into a buffer
+ * first would copy up to seventy-six kilobytes a frame that nobody needs, and
+ * the bit accumulator does not care whether the bytes it is fed are next to
+ * each other.
+ */
+static uint32_t huf_encode_blocks(const uint8_t *slice, uint64_t mask,
+                                  uint8_t *dst, uint32_t cap)
+{
+    uint32_t acc = 0, at = 0;
+    int      bits = 0;
+    for (uint32_t bx = 0; bx < BLK_COLS; bx++) {
+        if ((mask & (1ull << bx)) == 0ull) {
+            continue;
+        }
+        for (uint32_t r = 0; r < RAW_ROWS; r++) {
+            const uint8_t *const row = slice + (size_t)r * 320u + bx * BLK_W;
+            for (uint32_t k = 0; k < BLK_W; k++) {
+                const uint32_t s = row[k];
+                const uint32_t l = s_hlen[s];
+                if (l == 0u) {
+                    return 0u;
+                }
+                acc = (acc << l) | s_hcode[s];
+                bits += (int)l;
+                while (bits >= 8) {
+                    if (at >= cap) {
+                        return 0u;
+                    }
+                    bits -= 8;
+                    dst[at++] = (uint8_t)(acc >> bits);
+                }
+            }
+        }
+    }
+    if (bits > 0) {
+        if (at >= cap) {
+            return 0u;
+        }
+        dst[at++] = (uint8_t)(acc << (8 - bits));
+    }
+    return at;
 }
 
 /* One slice's worth of indices, coded.  Returns 0 if it would not be smaller,
@@ -2076,17 +2163,63 @@ static void rem_blit_rect_inner(ag_handle_t h, const ag_blit_t *b)
      * far more often than it is written, so the lookup is one probe.
      */
     if (s_pal_on) {
+        /*
+         * Block by block, and this is the shape that matters.
+         *
+         * The first version walked the picture pixel by pixel, looked every
+         * one up in the palette, wrote it, and hashed it - seventeen and a
+         * half milliseconds on the *game's* own thread, thirteen times a
+         * second, and the game went from 45 frames to 29.  But only about
+         * fifty of the twelve hundred blocks move in a frame, so nearly all of
+         * that work was a lookup and a write for a pixel nobody was going to
+         * send.
+         *
+         * So: hash the eight by eight straight out of the game's surface,
+         * which costs a read and nothing else, and only if it has moved read
+         * it again - out of the cache, where the hash has just left it - to
+         * look the colours up and write the indices.  The counts the coder is
+         * built from then describe exactly the pixels that are going out,
+         * which is if anything the better table.
+         */
         memset(s_cnt, 0, sizeof(s_cnt));
-        for (uint32_t r = 0; r < s_fb_h; r++) {
-            const uint16_t *src =
-                (const uint16_t *)(const void *)(base + (size_t)r * b->stride);
-            uint8_t *const dst = pkt_bytes(r / RAW_ROWS) +
-                                 (size_t)(r % RAW_ROWS) * s_fb_w;
-            for (uint32_t x = 0; x < s_fb_w; x++) {
-                const uint32_t i = pal_index(src[x]);
-                dst[x] = (uint8_t)i;
-                s_cnt[i]++;
+        const uint32_t slices = (s_fb_h + RAW_ROWS - 1u) / RAW_ROWS;
+        const uint32_t refresh = (uint32_t)(s_frame_no % slices);
+        for (uint32_t s = 0; s < slices; s++) {
+            uint8_t *const  dst0 = pkt_bytes(s);
+            uint32_t *const hrow = &s_bhash[s * BLK_COLS];
+            uint32_t *const orow = &s_bhash_old[s * BLK_COLS];
+            const uint8_t *const band = base + (size_t)(s * RAW_ROWS) * b->stride;
+            uint64_t m = 0;
+            for (uint32_t bx = 0; bx < BLK_COLS; bx++) {
+                uint32_t h = 2166136261u;
+                for (uint32_t r = 0; r < RAW_ROWS; r++) {
+                    const uint16_t *const sp =
+                        (const uint16_t *)(const void *)(band +
+                                                         (size_t)r * b->stride) +
+                        bx * BLK_W;
+                    for (uint32_t k = 0; k < BLK_W; k++) {
+                        h = (h ^ sp[k]) * 16777619u;
+                    }
+                }
+                hrow[bx] = h;
+                if (h == orow[bx] && s != refresh) {
+                    continue; /* the far end has this block already */
+                }
+                m |= 1ull << bx;
+                for (uint32_t r = 0; r < RAW_ROWS; r++) {
+                    const uint16_t *const sp =
+                        (const uint16_t *)(const void *)(band +
+                                                         (size_t)r * b->stride) +
+                        bx * BLK_W;
+                    uint8_t *const dp = dst0 + (size_t)r * 320u + bx * BLK_W;
+                    for (uint32_t k = 0; k < BLK_W; k++) {
+                        const uint32_t i = pal_index(sp[k]);
+                        dp[k] = (uint8_t)i;
+                        s_cnt[i]++;
+                    }
+                }
             }
+            s_bmask[s] = m;
         }
     } else {
         for (uint32_t r = 0; r < s_fb_h; r++) {
@@ -2718,6 +2851,111 @@ static uint32_t huf_slice(uint32_t c, uint32_t y0, uint32_t rows,
     return PKT_HDR + pad;
 }
 
+/*
+ * A slice with only the blocks that moved in it.
+ *
+ * The mask travels in the body rather than the header - the twelve summed
+ * bytes of the header are full, and five more of them would be a change to
+ * every packet on the wire for the sake of one kind.  The far end reads five
+ * bytes of mask and then decodes sixty-four symbols for each bit that is set,
+ * putting them where the bit says.
+ */
+static uint32_t huf_slice_part(uint32_t c, uint32_t y0, uint32_t rows,
+                               uint32_t slices, uint64_t mask, uint8_t **out)
+{
+    uint8_t *const q = s_out + (size_t)(s_out_next % HUF_BLKS) * s_out_blk;
+    uint8_t *const body = q + PKT_HDR;
+
+    for (uint32_t i = 0; i < 5u; i++) {
+        body[i] = (uint8_t)(mask >> (i * 8u));
+    }
+    const uint32_t bits = huf_encode_blocks(pkt_bytes(c), mask, body + 5u,
+                                            s_out_blk - PKT_HDR - 5u);
+    if (bits == 0u) {
+        return 0u;
+    }
+    s_out_next++;
+
+    const uint32_t blen = 5u + bits;
+    const uint32_t pad = (blen + (PKT_HDR - 1u)) & ~(PKT_HDR - 1u);
+    memset(body + blen, 0, pad - blen);
+    const uint32_t len = (PKT_HDR - 5u) + pad;
+
+    q[0] = FR_MAGIC0;
+    q[1] = FR_MAGIC1;
+    q[2] = FR_HUFP;
+    q[3] = (uint8_t)len;
+    q[4] = (uint8_t)(len >> 8);
+    put16(q + 5, s_frame_no);
+    put16(q + 7, c);
+    put16(q + 9, slices);
+    put16(q + 11, y0);
+    put16(q + 13, rows);
+    put16(q + 15, blen);
+    q[17] = 0;
+    memset(q + 18, 0, PKT_HDR - 18u);
+
+    uint32_t acc = 0;
+    for (uint32_t i = 5; i < 17u; i++) {
+        acc ^= (uint32_t)q[i] << (((i - 5u) & 3u) * 8u);
+    }
+    const uint32_t *w = (const uint32_t *)(const void *)body;
+    for (uint32_t i = 0; i < pad / 4u; i++) {
+        acc ^= w[i];
+    }
+    q[17] = (uint8_t)(acc ^ (acc >> 8) ^ (acc >> 16) ^ (acc >> 24));
+
+    *out = q;
+    return PKT_HDR + pad;
+}
+
+/*
+ * That frame is whole, and here is what it was made of.
+ *
+ * Necessary the moment a slice can be left out: the far end used to know a
+ * frame was finished because all thirty had arrived, and now most of them
+ * never will.  Thirty-two bytes, once a frame, carrying the set of slices that
+ * were sent - so the receiver knows both when to paint and, if one of them is
+ * missing, which one to ask for.
+ */
+static void send_done(uint32_t mask)
+{
+    uint8_t *const q = s_donepkt;
+    if (q == NULL) {
+        return;
+    }
+    const uint32_t len = PKT_HDR - 5u;
+
+    q[0] = FR_MAGIC0;
+    q[1] = FR_MAGIC1;
+    q[2] = FR_DONE;
+    q[3] = (uint8_t)len;
+    q[4] = (uint8_t)(len >> 8);
+    put16(q + 5, s_frame_no);
+    put16(q + 7, mask & 0xffffu);
+    put16(q + 9, mask >> 16);
+    put16(q + 11, 0);
+    put16(q + 13, 0);
+    put16(q + 15, 0);
+    q[17] = 0;
+    memset(q + 18, 0, PKT_HDR - 18u);
+
+    uint32_t acc = 0;
+    for (uint32_t i = 5; i < 17u; i++) {
+        acc ^= (uint32_t)q[i] << (((i - 5u) & 3u) * 8u);
+    }
+    q[17] = (uint8_t)(acc ^ (acc >> 8) ^ (acc >> 16) ^ (acc >> 24));
+
+    bool sent = false;
+    if (s_dma) {
+        sent = io->uart_dma_submit(LINK_PORT, q, PKT_HDR) >= 0;
+    }
+    if (!sent) {
+        (void)io->uart_write(LINK_PORT, q, PKT_HDR);
+    }
+    s_sent_bytes += PKT_HDR;
+}
+
 static void raw_send_direct(void)
 {
     const uint32_t slices = raw_slices();
@@ -2778,11 +3016,39 @@ static void raw_send_direct(void)
     uint32_t port_us = 0;
     uint32_t sent = 0;
 
+    const uint64_t all_blocks = (1ull << BLK_COLS) - 1ull;
+    uint32_t       donemask = 0;
+
     for (uint32_t c = 0; c < slices && !s_stop; c++) {
         const uint32_t y0 = c * RAW_ROWS;
         uint32_t rows = RAW_ROWS;
         if (y0 + rows > s_fb_h) {
             rows = s_fb_h - y0;
+        }
+
+        uint64_t mask = all_blocks;
+#if DIFF_MODE
+        if (s_pal_on) {
+            /*
+             * The copy decided this, because the copy is where the pixels were
+             * looked at - including the one slice in thirty that goes whole
+             * whatever its hashes say.  That slice is three per cent of the
+             * wire and it is what makes a hash safe to believe: anything the
+             * hash was ever wrong about, or that a lost packet left stale, is
+             * right again within thirty frames.
+             */
+            mask = s_bmask[c];
+            if (mask == 0ull) {
+                continue; /* nothing happened here; the far end has it right */
+            }
+        }
+#endif
+        donemask |= 1u << c;
+        s_slices_sent++;
+        for (uint32_t bx = 0; bx < BLK_COLS; bx++) {
+            if (mask & (1ull << bx)) {
+                s_blocks_sent++;
+            }
         }
 
         /*
@@ -2795,8 +3061,13 @@ static void raw_send_direct(void)
         uint8_t *blk = pkt_block(c);
         uint32_t blen = s_pkt_blk;
         if (s_huf) {
-            uint8_t       *hq = NULL;
+            uint8_t *hq = NULL;
+#if DIFF_MODE
+            const uint32_t hn =
+                huf_slice_part(c, y0, rows, slices, mask, &hq);
+#else
             const uint32_t hn = huf_slice(c, y0, rows, slices, &hq);
+#endif
             if (hn != 0u) {
                 blk = hq;
                 blen = hn;
@@ -2865,6 +3136,13 @@ static void raw_send_direct(void)
      * are the hardware's, so nothing may draw into them - which is exactly the
      * order the frame handshake already keeps.
      */
+    /*
+     * And say the frame is finished, before waiting for it to leave: the far
+     * end paints on this and on nothing else now that slices can be left out.
+     */
+    send_done(donemask);
+    memcpy(s_bhash_old, s_bhash, sizeof(s_bhash_old));
+
     if (s_dma) {
         const uint64_t w0 = (uint64_t)ag_api()->time->us();
         (void)io->uart_dma_drain(LINK_PORT);
@@ -2918,8 +3196,10 @@ static void raw_stats(void)
               "send %u us, wait %u us, %u resent\n",
               (unsigned)(fps100 / 100u), (unsigned)(fps100 % 100u),
               (unsigned)kbs, (unsigned)s_t_copy_us, (unsigned)copy_kbs,
-              (unsigned)s_t_send_us, (unsigned)s_t_wait_us,
+              (unsigned)s_t_send_us, (unsigned)s_t_wait_last,
               (unsigned)s_raw_resent);
+    ag_printf("RAW: %u turns round the loop waiting for the game\n",
+              (unsigned)s_loops_last);
     /* Per frame, so it can be read against the copy and the wire. */
     ag_printf("RAW: per frame us: step2 copy %u, step3 fill %u, step4 port %u"
               " (%u chunks of %u B); ring %u, out %u\n",
@@ -2953,7 +3233,12 @@ static void raw_stats(void)
               (unsigned)s_pal_used, (unsigned)s_pal_gen,
               (unsigned)s_pal_miss, (unsigned)s_huf_bytes,
               (unsigned)(s_t_huf_us / s_raw_frames));
+    ag_printf("RAW: moved %u of %u blocks a frame, %u of %u slices\n",
+              (unsigned)(s_blocks_sent / s_raw_frames), (unsigned)BLK_N,
+              (unsigned)(s_slices_sent / s_raw_frames), 30u);
     s_t_huf_us = 0;
+    s_blocks_sent = 0;
+    s_slices_sent = 0;
     aud_stats();
     ag_printf("RAW: bytes in from the far end: %u\n", (unsigned)s_rx_bytes);
     ag_printf("RAW: step4 apart, us per frame: header %u, handover %u, dma %u, "
@@ -3126,12 +3411,18 @@ static void wire_task(void *arg)
         if (!s_have_copy && !SEND_ALWAYS) {
             const uint64_t w0 = (uint64_t)ag_api()->time->us();
             s_want_copy = true;
+            s_loops++;
             wire_idle_traffic();
             ag_delay(2);
             s_t_wait_us += (uint32_t)((uint64_t)ag_api()->time->us() - w0);
             continue;
         }
+        /* What the last frame actually waited for the game, kept whole: the
+         * running total was being printed mid-wait and read as the answer. */
+        s_t_wait_last = s_t_wait_us;
         s_t_wait_us = 0;
+        s_loops_last = s_loops;
+        s_loops = 0;
 
         if (s_pkt == NULL) {
             s_have_copy = false;
@@ -4227,11 +4518,15 @@ ag_err_t ag_driver_init(void)
      * The coder's table packet, and eight rotating blocks to code slices into.
      * Twenty-one kilobytes; without them the picture still goes, as indices.
      */
-    s_hufpkt_raw = (uint8_t *)ag_malloc(HTAB_BLK + PKT_HDR - 1u);
+    /* Room for the table and, behind it, the thirty-two bytes that close a
+     * frame - HTAB_BLK is a whole number of cache lines, so the second block
+     * is aligned by being where it is. */
+    s_hufpkt_raw = (uint8_t *)ag_malloc(HTAB_BLK + PKT_HDR + PKT_HDR - 1u);
     s_hufpkt = (s_hufpkt_raw == NULL)
                    ? NULL
                    : (uint8_t *)(((uintptr_t)s_hufpkt_raw + PKT_HDR - 1u) &
                                  ~(uintptr_t)(PKT_HDR - 1u));
+    s_donepkt = (s_hufpkt == NULL) ? NULL : s_hufpkt + HTAB_BLK;
     /*
      * Internal memory if there is any: the coder writes these by hand, a byte
      * at a time, while the game is walking PSRAM on the other core - and every
