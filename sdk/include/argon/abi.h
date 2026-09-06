@@ -156,9 +156,20 @@ extern "C" {
  *      chip on a bus like any other .SYS.  One provider is active at a time; the
  *      built-in stack is the default.  Append-only: nothing an existing image
  *      calls has moved.
+ * 0.47 ag_net_ops_t grew a station half - wifi_start/stop/scan/connect/
+ *      disconnect/status - so that a radio at the far end of a wire answers
+ *      `wifi scan` and `wifi connect` too, not only sockets.  Without it the
+ *      operator has to know which board holds the radio, which is exactly what
+ *      an external radio is for avoiding.  The six are NULL on a provider that
+ *      is not a Wi-Fi radio; probe with AG_HAS.  api->wifi is consequently no
+ *      longer NULL merely because the image has no built-in radio: it is NULL
+ *      when there is no radio ANYWHERE, built in or bound, and an application
+ *      that probed it to mean "this chip has a radio" now reads "this system
+ *      has one".  AG_WIFI_SSID_MAX and friends moved up the header to sit
+ *      above both users; nothing about them changed.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 46u
+#define AG_ABI_MINOR 47u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -1272,6 +1283,60 @@ typedef struct ag_cfg_api {
 } ag_cfg_api_t;
 
 /* ------------------------------------------------------------------------ */
+/* radio vocabulary - shared by the net provider class and the wifi API      */
+/* ------------------------------------------------------------------------ */
+/*
+ * These sit above both users because both need them: ag_net_ops_t below
+ * carries the station half of an external radio, and ag_wifi_api_t further
+ * down is the same vocabulary as an application sees it.  They were declared
+ * with the wifi API until ABI 0.47 gave a provider on a wire a station to
+ * drive; nothing about them changed in the move.
+ */
+
+#define AG_WIFI_SSID_MAX 32 /* an SSID is at most 32 bytes, not NUL-counted   */
+#define AG_WIFI_PASS_MAX 63 /* a WPA key is 8..63 characters                  */
+
+/* Security of a network, ag_wifi_ap_t.auth.  Ordered as the port orders it. */
+enum {
+    AG_WIFI_SEC_OPEN = 0,
+    AG_WIFI_SEC_WEP,
+    AG_WIFI_SEC_WPA,
+    AG_WIFI_SEC_WPA2,
+    AG_WIFI_SEC_WPA3,
+    AG_WIFI_SEC_ENTERPRISE,
+    AG_WIFI_SEC_OTHER,
+};
+
+/* Station link state, ag_wifi_status_t.state. */
+enum {
+    AG_WIFI_ST_OFF = 0,   /* radio not started                               */
+    AG_WIFI_ST_IDLE,      /* on, joined to nothing                           */
+    AG_WIFI_ST_JOINING,   /* association or DHCP in progress                 */
+    AG_WIFI_ST_JOINED,    /* associated; an address may still be coming      */
+};
+
+/* One network a scan found. */
+typedef struct {
+    char    ssid[AG_WIFI_SSID_MAX + 1];
+    uint8_t bssid[6];
+    int8_t  rssi;    /* dBm, negative                                        */
+    uint8_t channel;
+    uint8_t auth;    /* AG_WIFI_SEC_*                                         */
+} ag_wifi_ap_t;
+
+/* Where the station half stands.  The key is never reported. */
+typedef struct {
+    uint8_t  state;      /* AG_WIFI_ST_*                                     */
+    char     ssid[AG_WIFI_SSID_MAX + 1]; /* joined or being joined          */
+    uint8_t  bssid[6];   /* the access point actually joined, or zeros       */
+    bool     pinned;     /* this access point was asked for by name          */
+    int8_t   rssi;
+    uint8_t  channel;
+    uint32_t attempts;   /* association attempts since the last join         */
+    int32_t  last_reason;/* the port's own disconnect reason code            */
+} ag_wifi_status_t;
+
+/* ------------------------------------------------------------------------ */
 /* net - TCP sockets (OpenEth in QEMU today; Wi-Fi later on hardware)       */
 /* ------------------------------------------------------------------------ */
 
@@ -1313,7 +1378,7 @@ typedef struct ag_net_api {
 } ag_net_api_t;
 
 /*
- * Class vtable for an AG_DEV_NET device (ABI 0.42), read by the kernel's socket
+ * Class vtable for an AG_DEV_NET device (ABI 0.46), read by the kernel's socket
  * layer when `net use <dev>` binds this device as the active network provider.
  * A .SYS talking to an external radio coprocessor publishes it as class_ops in
  * ag_dev_add; it is not reached through dev->open/ops() by an application.
@@ -1357,6 +1422,34 @@ typedef struct ag_net_ops {
 
     int (*wait_readable)(ag_device_t *dev, int fd, uint32_t timeout_ms);
     int32_t (*recv_now)(ag_device_t *dev, int fd, void *buf, size_t len);
+
+    /*
+     * THE STATION HALF (ABI 0.47).  All six are NULL on a provider that is not
+     * a Wi-Fi radio - a GSM modem has sockets and no networks to list - so the
+     * kernel probes with AG_HAS before every call and reports no radio when
+     * they are absent.  A provider that fills them fills all six.
+     *
+     * Sockets alone do not make a remote radio indistinguishable from a local
+     * one.  `wifi scan` and `wifi connect` are how a person points at the air,
+     * and a board whose only radio is at the far end of a wire has to answer
+     * both, or the operator has to know which board is which - which is the
+     * whole thing this exists to avoid.
+     *
+     * The semantics are ag_wifi_api_t's, exactly, because that is what the
+     * kernel's own radio does and neither the shell nor an application may be
+     * able to tell which one answered: scan blocks a second or two and reports
+     * in `found` how many networks were SEEN, which may exceed the `max` it had
+     * room to return; connect returns when the attempt has been MADE, not when
+     * it has succeeded, and the caller polls status().
+     */
+    ag_err_t (*wifi_start)(ag_device_t *dev);
+    ag_err_t (*wifi_stop)(ag_device_t *dev);
+    ag_err_t (*wifi_scan)(ag_device_t *dev, ag_wifi_ap_t *out, uint32_t max,
+                          uint32_t *found);
+    ag_err_t (*wifi_connect)(ag_device_t *dev, const char *ssid,
+                             const char *pass, const uint8_t bssid[6]);
+    ag_err_t (*wifi_disconnect)(ag_device_t *dev);
+    ag_err_t (*wifi_status)(ag_device_t *dev, ag_wifi_status_t *out);
 } ag_net_ops_t;
 
 /* ------------------------------------------------------------------------ */
@@ -1826,52 +1919,9 @@ typedef struct ag_wifimon_api {
  * anything else yet.
  */
 
-#define AG_WIFI_SSID_MAX 32 /* an SSID is at most 32 bytes, not NUL-counted   */
-#define AG_WIFI_PASS_MAX 63 /* a WPA key is 8..63 characters                  */
-
-/* Security of a network, ag_wifi_ap_t.auth.  Ordered as the port orders it. */
-enum {
-    AG_WIFI_SEC_OPEN = 0,
-    AG_WIFI_SEC_WEP,
-    AG_WIFI_SEC_WPA,
-    AG_WIFI_SEC_WPA2,
-    AG_WIFI_SEC_WPA3,
-    AG_WIFI_SEC_ENTERPRISE,
-    AG_WIFI_SEC_OTHER,
-};
-
-/* Station link state, ag_wifi_status_t.state. */
-enum {
-    AG_WIFI_ST_OFF = 0,   /* radio not started                               */
-    AG_WIFI_ST_IDLE,      /* on, joined to nothing                           */
-    AG_WIFI_ST_JOINING,   /* association or DHCP in progress                 */
-    AG_WIFI_ST_JOINED,    /* associated; an address may still be coming      */
-};
-
 /* ESP-NOW limits, mirroring the port. */
 #define AG_WIFI_ESPNOW_MAX 250 /* one datagram's payload, bytes              */
 #define AG_WIFI_ESPNOW_KEY 16  /* an encryption key, exactly this many bytes */
-
-/* One network a scan found. */
-typedef struct {
-    char    ssid[AG_WIFI_SSID_MAX + 1];
-    uint8_t bssid[6];
-    int8_t  rssi;    /* dBm, negative                                        */
-    uint8_t channel;
-    uint8_t auth;    /* AG_WIFI_SEC_*                                         */
-} ag_wifi_ap_t;
-
-/* Where the station half stands.  The key is never reported. */
-typedef struct {
-    uint8_t  state;      /* AG_WIFI_ST_*                                     */
-    char     ssid[AG_WIFI_SSID_MAX + 1]; /* joined or being joined          */
-    uint8_t  bssid[6];   /* the access point actually joined, or zeros       */
-    bool     pinned;     /* this access point was asked for by name          */
-    int8_t   rssi;
-    uint8_t  channel;
-    uint32_t attempts;   /* association attempts since the last join         */
-    int32_t  last_reason;/* the port's own disconnect reason code            */
-} ag_wifi_status_t;
 
 /* What the access-point half is offering, when one is up. */
 typedef struct {
