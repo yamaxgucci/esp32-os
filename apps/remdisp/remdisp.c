@@ -121,6 +121,8 @@ AG_DRV("REMDISP", "2.0", "argon");
 #define FR_AUD    'A' /* sound: a rate, then unsigned 8-bit mono samples     */
 #define FR_IDX8   'X' /* a slice as one byte a pixel, into the palette below  */
 #define FR_PAL    'L' /* the palette itself: RGB565, up to 256 entries        */
+#define FR_HUF    'H' /* a slice as Huffman-coded indices                     */
+#define FR_HTAB   'T' /* the code lengths those bits are read with            */
 #define FR_END    'E' /* that frame is whole: its number, and how many bands */
 #define FR_RAW    'F' /* one slice of a whole frame, uncompressed           */
 
@@ -176,6 +178,15 @@ AG_DRV("REMDISP", "2.0", "argon");
  */
 #ifndef IDX_MODE
 #define IDX_MODE 1
+#endif
+
+/*
+ * -DHUF_MODE=0 sends the indices as they are, one byte a pixel.  The coder
+ * below is the difference between 77 KB a frame and 47, and it is one #define
+ * because that is what a claim about it has to be answerable by.
+ */
+#ifndef HUF_MODE
+#define HUF_MODE 1
 #endif
 
 /*
@@ -348,6 +359,7 @@ static volatile uint32_t s_spin[2];
 static volatile uint32_t s_laps[2]; /* laps nobody else wanted, per core */
 #endif
 static uint32_t s_in_blit_us, s_in_text_us, s_in_pcm_us;
+static uint32_t s_t_huf_us; /* building the code and sending the table */
 /*
  * Whether the picture is carried by the UART's own DMA.  Decided once, when
  * the wire task starts, and given up for good if the port ever refuses a
@@ -1642,6 +1654,222 @@ static uint32_t s_pmap[PMAP_N];
 static uint8_t *s_palpkt;     /* aligned, DMA-able, 544 bytes */
 static uint8_t *s_palpkt_raw; /* what was allocated, for freeing */
 
+/* ---- the entropy coder --------------------------------------------------
+ *
+ * The indices are not evenly used.  Measured over a real frame: 146 colours,
+ * and the arithmetic that says how much they are worth - the order-0 entropy -
+ * is **4.73 bits a pixel** rather than eight.  So a code that gives the common
+ * colours short bit strings and the rare ones long ones takes the frame from
+ * 77 760 bytes to about 46 500, which is 3.3 times what RGB565 costs, and it
+ * does it losslessly.
+ *
+ * Why Huffman and not deflate, which was measured at 3.9 times: the difference
+ * between them is matching, not coding, and matching is where the processor
+ * goes.  This costs a table lookup and a shift per pixel - about two
+ * milliseconds a frame here and three on the far end - against twenty to
+ * thirty for a deflate of the same bytes, on a core the game is also using.
+ * Four fifths of the saving for a twentieth of the cost.
+ *
+ * Counts are gathered during the copy the game already pays for.  The table is
+ * built once a frame, sent in its own packet ahead of the slices that use it,
+ * and carries the frame number: a slice whose table never arrived is dropped
+ * rather than decoded into rubbish.
+ */
+#define HUF_MAXLEN 15u
+#define HUF_BLKS   8u
+
+static uint32_t s_cnt[PAL_N];    /* how often each index was used this frame */
+static uint8_t  s_hlen[PAL_N];   /* code lengths, 0 for a colour not used    */
+static uint16_t s_hcode[PAL_N];  /* canonical codes, most significant first  */
+static bool     s_huf;           /* a table was built for this frame         */
+static uint8_t *s_hufpkt, *s_hufpkt_raw;  /* the table's own block */
+static uint8_t *s_out, *s_out_raw;        /* where coded slices are built */
+static uint32_t s_out_blk, s_out_next;
+static uint32_t s_huf_bytes;     /* what the coded frame came to */
+
+/*
+ * Lengths, by the two-queue method.
+ *
+ * "Take the two smallest, merge, repeat" is the algorithm; the question is how
+ * the two smallest are found.  Scanning for them is O(n^2) and was measured at
+ * **6.5 ms a frame** on this chip, which is most of what the coding itself
+ * costs - so instead the leaves are sorted once and the merged nodes come out
+ * already in order, and the smallest is the front of one queue or the other.
+ * One comparison a step, and the sort is 256 items.
+ */
+static bool huf_lengths(void)
+{
+    static int32_t wt[2u * PAL_N];
+    static int16_t kid0[2u * PAL_N], kid1[2u * PAL_N];
+    static int16_t leaf[PAL_N];   /* used symbols, lightest first */
+    static int16_t node[PAL_N];   /* merged nodes, in the order they are made */
+    static int16_t stack[2u * PAL_N];
+    static uint8_t depth[2u * PAL_N];
+
+    uint32_t used = 0, last = 0;
+    for (uint32_t i = 0; i < PAL_N; i++) {
+        s_hlen[i] = 0;
+        kid0[i] = -1;
+        kid1[i] = -1;
+        wt[i] = (int32_t)s_cnt[i];
+        if (s_cnt[i] != 0u) {
+            leaf[used++] = (int16_t)i;
+            last = i;
+        }
+    }
+    if (used == 0u) {
+        return false;
+    }
+    if (used == 1u) {
+        s_hlen[last] = 1; /* one symbol still needs a bit to be a symbol */
+        return true;
+    }
+
+    /* Insertion sort: 256 items, nearly sorted from one frame to the next. */
+    for (uint32_t i = 1; i < used; i++) {
+        const int16_t v = leaf[i];
+        const int32_t w = wt[v];
+        uint32_t      j = i;
+        while (j > 0u && wt[leaf[j - 1u]] > w) {
+            leaf[j] = leaf[j - 1u];
+            j--;
+        }
+        leaf[j] = v;
+    }
+
+    uint32_t li = 0, ni = 0, made = 0, n = PAL_N;
+    /* Leaves *left*, not leaves taken: li counts what has been consumed, and
+     * writing the condition the other way round built no tree at all, left
+     * every code length zero, and sent a whole session uncompressed while the
+     * timings said the coder had become eight times faster. */
+    while ((used - li) + (made - ni) > 1u) {
+        int16_t pick[2];
+        for (int k = 0; k < 2; k++) {
+            const bool have_leaf = li < used;
+            const bool have_node = ni < made;
+            if (have_leaf && (!have_node || wt[leaf[li]] <= wt[node[ni]])) {
+                pick[k] = leaf[li++];
+            } else {
+                pick[k] = node[ni++];
+            }
+        }
+        wt[n] = wt[pick[0]] + wt[pick[1]];
+        kid0[n] = pick[0];
+        kid1[n] = pick[1];
+        node[made++] = (int16_t)n;
+        n++;
+    }
+
+    /* Depths, from the root down, iteratively - the tree is 511 nodes and a
+     * recursion here would be a stack this driver has no business using. */
+    if (made == 0u) {
+        return false;
+    }
+    uint32_t top = 0;
+    stack[top] = node[made - 1u];
+    depth[node[made - 1u]] = 0;
+    top++;
+    while (top > 0u) {
+        const int16_t v = stack[--top];
+        const uint8_t d = depth[v];
+        if (kid0[v] < 0) {
+            s_hlen[v] = (d == 0u) ? 1u : d;
+            continue;
+        }
+        depth[kid0[v]] = (uint8_t)(d + 1u);
+        depth[kid1[v]] = (uint8_t)(d + 1u);
+        stack[top++] = kid0[v];
+        stack[top++] = kid1[v];
+    }
+    return true;
+}
+
+/* Canonical codes from the lengths, exactly as deflate defines them, so that
+ * the far end can rebuild them from the lengths alone. */
+static void huf_codes(void)
+{
+    uint16_t count[HUF_MAXLEN + 1u];
+    uint16_t next[HUF_MAXLEN + 1u];
+    memset(count, 0, sizeof(count));
+    for (uint32_t i = 0; i < PAL_N; i++) {
+        count[s_hlen[i]]++;
+    }
+    count[0] = 0;
+    uint16_t code = 0;
+    for (uint32_t l = 1; l <= HUF_MAXLEN; l++) {
+        code = (uint16_t)((code + count[l - 1u]) << 1);
+        next[l] = code;
+    }
+    for (uint32_t i = 0; i < PAL_N; i++) {
+        s_hcode[i] = s_hlen[i] ? next[s_hlen[i]]++ : 0u;
+    }
+}
+
+/*
+ * The whole table, and the one thing that can go wrong with it: a code longer
+ * than fifteen bits will not fit the four-bit lengths the far end is sent, and
+ * a distribution skewed enough to produce one is possible.  Halving the counts
+ * flattens the tree; repeated, it always converges, and it costs a rebuild of
+ * something that takes a fraction of a millisecond.
+ */
+static bool huf_build(void)
+{
+    for (int round = 0; round < 8; round++) {
+        if (!huf_lengths()) {
+            return false;
+        }
+        uint32_t longest = 0;
+        for (uint32_t i = 0; i < PAL_N; i++) {
+            if (s_hlen[i] > longest) {
+                longest = s_hlen[i];
+            }
+        }
+        if (longest <= HUF_MAXLEN) {
+            huf_codes();
+            return true;
+        }
+        for (uint32_t i = 0; i < PAL_N; i++) {
+            if (s_cnt[i] != 0u) {
+                s_cnt[i] = (s_cnt[i] >> 1) | 1u;
+            }
+        }
+    }
+    return false;
+}
+
+/* One slice's worth of indices, coded.  Returns 0 if it would not be smaller,
+ * in which case the slice goes as it is - which is the honest answer for a
+ * band of noise and costs nothing to say. */
+static uint32_t huf_encode(const uint8_t *src, uint32_t n, uint8_t *dst,
+                           uint32_t cap)
+{
+    uint32_t acc = 0, at = 0;
+    int      bits = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        const uint32_t s = src[i];
+        const uint32_t l = s_hlen[s];
+        if (l == 0u) {
+            return 0u; /* a colour the table does not know: not this frame */
+        }
+        acc = (acc << l) | s_hcode[s];
+        bits += (int)l;
+        while (bits >= 8) {
+            if (at >= cap) {
+                return 0u;
+            }
+            bits -= 8;
+            dst[at++] = (uint8_t)(acc >> bits);
+        }
+    }
+    if (bits > 0) {
+        if (at >= cap) {
+            return 0u;
+        }
+        dst[at++] = (uint8_t)(acc << (8 - bits));
+    }
+    return at;
+}
+
 static void pal_clear(void)
 {
     memset(s_pmap, 0xff, sizeof(s_pmap));
@@ -1848,13 +2076,16 @@ static void rem_blit_rect_inner(ag_handle_t h, const ag_blit_t *b)
      * far more often than it is written, so the lookup is one probe.
      */
     if (s_pal_on) {
+        memset(s_cnt, 0, sizeof(s_cnt));
         for (uint32_t r = 0; r < s_fb_h; r++) {
             const uint16_t *src =
                 (const uint16_t *)(const void *)(base + (size_t)r * b->stride);
             uint8_t *const dst = pkt_bytes(r / RAW_ROWS) +
                                  (size_t)(r % RAW_ROWS) * s_fb_w;
             for (uint32_t x = 0; x < s_fb_w; x++) {
-                dst[x] = (uint8_t)pal_index(src[x]);
+                const uint32_t i = pal_index(src[x]);
+                dst[x] = (uint8_t)i;
+                s_cnt[i]++;
             }
         }
     } else {
@@ -2377,6 +2608,116 @@ static void frame_dump(void)
 }
 #endif
 
+/*
+ * The code lengths, ahead of the slices that are read with them.
+ *
+ * Two lengths to a byte, which is all four bits are needed for - the longest
+ * code is fifteen and the builder guarantees it - so the whole table is 128
+ * bytes and the packet is 160, five cache lines.  It carries the frame number
+ * because a slice decoded with the wrong table is not a slightly wrong slice,
+ * it is noise, and the far end has to be able to tell.
+ */
+#define HTAB_BLK (PKT_HDR + PAL_N / 2u)
+
+static void huf_send_table(void)
+{
+    uint8_t *const q = s_hufpkt;
+    const uint32_t len = HTAB_BLK - 5u;
+
+    q[0] = FR_MAGIC0;
+    q[1] = FR_MAGIC1;
+    q[2] = FR_HTAB;
+    q[3] = (uint8_t)len;
+    q[4] = (uint8_t)(len >> 8);
+    put16(q + 5, s_frame_no);
+    put16(q + 7, PAL_N);
+    put16(q + 9, 0);
+    put16(q + 11, 0);
+    put16(q + 13, 0);
+    put16(q + 15, 0);
+    q[17] = 0;
+    memset(q + 18, 0, PKT_HDR - 18u);
+
+    for (uint32_t i = 0; i < PAL_N / 2u; i++) {
+        q[PKT_HDR + i] =
+            (uint8_t)(s_hlen[i * 2u] | (uint8_t)(s_hlen[i * 2u + 1u] << 4));
+    }
+
+    uint32_t acc = 0;
+    for (uint32_t i = 5; i < 17u; i++) {
+        acc ^= (uint32_t)q[i] << (((i - 5u) & 3u) * 8u);
+    }
+    const uint32_t *w = (const uint32_t *)(const void *)(q + PKT_HDR);
+    for (uint32_t i = 0; i < (PAL_N / 2u) / 4u; i++) {
+        acc ^= w[i];
+    }
+    q[17] = (uint8_t)(acc ^ (acc >> 8) ^ (acc >> 16) ^ (acc >> 24));
+
+    bool sent = false;
+    if (s_dma) {
+        sent = io->uart_dma_submit(LINK_PORT, q, HTAB_BLK) >= 0;
+    }
+    if (!sent) {
+        (void)io->uart_write(LINK_PORT, q, HTAB_BLK);
+    }
+    s_sent_bytes += HTAB_BLK;
+}
+
+/*
+ * One coded slice, into the next of the rotating output blocks.
+ *
+ * Rotating and not one per slice: eight blocks of 2592 bytes is twenty
+ * kilobytes against seventy-six for a second whole frame, and eight is more
+ * than the four the DMA queue can hold, so a block is never written while the
+ * hardware is still reading it.
+ *
+ * Returns the bytes to hand over, or 0 if the slice would not be smaller
+ * coded, in which case the caller sends the indices as they are.
+ */
+static uint32_t huf_slice(uint32_t c, uint32_t y0, uint32_t rows,
+                          uint32_t slices, uint8_t **out)
+{
+    uint8_t *const q = s_out + (size_t)(s_out_next % HUF_BLKS) * s_out_blk;
+    const uint32_t npx = rows * s_fb_w;
+    const uint32_t body =
+        huf_encode(pkt_bytes(c), npx, q + PKT_HDR, s_out_blk - PKT_HDR);
+    if (body == 0u || body >= npx) {
+        return 0u;
+    }
+    s_out_next++;
+
+    const uint32_t pad = (body + (PKT_HDR - 1u)) & ~(PKT_HDR - 1u);
+    memset(q + PKT_HDR + body, 0, pad - body);
+    const uint32_t len = (PKT_HDR - 5u) + pad;
+
+    q[0] = FR_MAGIC0;
+    q[1] = FR_MAGIC1;
+    q[2] = FR_HUF;
+    q[3] = (uint8_t)len;
+    q[4] = (uint8_t)(len >> 8);
+    put16(q + 5, s_frame_no);
+    put16(q + 7, c);
+    put16(q + 9, slices);
+    put16(q + 11, y0);
+    put16(q + 13, rows);
+    put16(q + 15, body);
+    q[17] = 0;
+    memset(q + 18, 0, PKT_HDR - 18u);
+
+    uint32_t acc = 0;
+    for (uint32_t i = 5; i < 17u; i++) {
+        acc ^= (uint32_t)q[i] << (((i - 5u) & 3u) * 8u);
+    }
+    const uint32_t *w = (const uint32_t *)(const void *)(q + PKT_HDR);
+    for (uint32_t i = 0; i < pad / 4u; i++) {
+        acc ^= w[i];
+    }
+    q[17] = (uint8_t)(acc ^ (acc >> 8) ^ (acc >> 16) ^ (acc >> 24));
+
+    *out = q;
+    return PKT_HDR + pad;
+}
+
 static void raw_send_direct(void)
 {
     const uint32_t slices = raw_slices();
@@ -2409,6 +2750,30 @@ static void raw_send_direct(void)
         pal_send();
     }
 
+    /*
+     * The code for this frame's colours.  Built here rather than in the copy
+     * because the copy runs on the game's thread and this does not have to.
+     */
+    s_huf = false;
+#if HUF_MODE
+    if (s_pal_on && s_hufpkt != NULL && s_out != NULL) {
+        const uint64_t h0 = (uint64_t)ag_api()->time->us();
+        s_huf = huf_build();
+        if (s_huf) {
+            huf_send_table();
+        } else {
+            static bool moaned;
+            if (!moaned) {
+                moaned = true;
+                ag_printf("REMDISP: no code could be built for this "
+                          "picture; it goes as one byte a pixel\n");
+            }
+        }
+        s_t_huf_us += (uint32_t)((uint64_t)ag_api()->time->us() - h0);
+    }
+#endif
+    s_huf_bytes = 0;
+
     uint32_t fill_us = 0;
     uint32_t port_us = 0;
     uint32_t sent = 0;
@@ -2420,13 +2785,33 @@ static void raw_send_direct(void)
             rows = s_fb_h - y0;
         }
 
+        /*
+         * Coded if that is smaller, and as it stands if it is not - decided
+         * per slice, because a band of the interface codes to a fifth of its
+         * size and a band of dithered ground sometimes to none at all.  Every
+         * packet says which it is in its opcode, so the two mix freely.
+         */
         const uint64_t f0 = (uint64_t)ag_api()->time->us();
-        pkt_head(c, slices, y0, rows);
+        uint8_t *blk = pkt_block(c);
+        uint32_t blen = s_pkt_blk;
+        if (s_huf) {
+            uint8_t       *hq = NULL;
+            const uint32_t hn = huf_slice(c, y0, rows, slices, &hq);
+            if (hn != 0u) {
+                blk = hq;
+                blen = hn;
+                s_huf_bytes += hn;
+            } else {
+                pkt_head(c, slices, y0, rows);
+            }
+        } else {
+            pkt_head(c, slices, y0, rows);
+        }
         fill_us += (uint32_t)((uint64_t)ag_api()->time->us() - f0);
 
         const uint64_t p0 = (uint64_t)ag_api()->time->us();
 #if RAW_SILENT == 4
-        ag_delay((uint32_t)(((uint64_t)s_pkt_blk * 10ull * 1000ull) /
+        ag_delay((uint32_t)(((uint64_t)blen * 10ull * 1000ull) /
                             (uint64_t)LINK_BAUD));
 #else
         if (s_dma) {
@@ -2437,21 +2822,20 @@ static void raw_send_direct(void)
              * frame, which is fine - nothing writes it until the next copy,
              * and the next copy cannot happen until this frame is out.
              */
-            const int32_t w =
-                io->uart_dma_submit(LINK_PORT, pkt_block(c), s_pkt_blk);
+            const int32_t w = io->uart_dma_submit(LINK_PORT, blk, blen);
             if (w < 0) {
                 s_dma = false;
                 ag_printf("REMDISP: the port will not take a DMA transfer "
                           "(%d); sending by hand\n", (int)w);
-                (void)io->uart_write(LINK_PORT, pkt_block(c), s_pkt_blk);
+                (void)io->uart_write(LINK_PORT, blk, blen);
             }
         } else {
-            (void)io->uart_write(LINK_PORT, pkt_block(c), s_pkt_blk);
+            (void)io->uart_write(LINK_PORT, blk, blen);
         }
 #endif
         port_us += (uint32_t)((uint64_t)ag_api()->time->us() - p0);
 
-        sent += s_pkt_blk;
+        sent += blen;
         s_sent_frames++;
         s_chunks++;
 
@@ -2564,9 +2948,12 @@ static void raw_stats(void)
     s_in_blit_us = 0;
     s_in_text_us = 0;
     s_in_pcm_us = 0;
-    ag_printf("RAW: palette %u colours, generation %u, %u pixels missed\n",
+    ag_printf("RAW: palette %u colours, generation %u, %u pixels missed; "
+              "coded %u B a frame, %u us to build\n",
               (unsigned)s_pal_used, (unsigned)s_pal_gen,
-              (unsigned)s_pal_miss);
+              (unsigned)s_pal_miss, (unsigned)s_huf_bytes,
+              (unsigned)(s_t_huf_us / s_raw_frames));
+    s_t_huf_us = 0;
     aud_stats();
     ag_printf("RAW: bytes in from the far end: %u\n", (unsigned)s_rx_bytes);
     ag_printf("RAW: step4 apart, us per frame: header %u, handover %u, dma %u, "
@@ -2854,6 +3241,12 @@ static void rem_stop(void)
         ag_free(s_palpkt_raw);
         s_palpkt = NULL;
         s_palpkt_raw = NULL;
+        ag_free(s_hufpkt_raw);
+        s_hufpkt = NULL;
+        s_hufpkt_raw = NULL;
+        ag_free(s_out_raw);
+        s_out = NULL;
+        s_out_raw = NULL;
         ag_free(s_tx);
         s_tx = NULL;
 
@@ -3752,7 +4145,13 @@ ag_err_t ag_driver_init(void)
      * what was there before, so a system with no internal memory to spare
      * still gets a picture - just the slow one.
      */
-    static const uint32_t want[] = { 32768u, 16384u, 8192u, 4096u };
+    /*
+     * Eight kilobytes now, not thirty-two: this buffer carries console text
+     * and nothing else since the picture started leaving by DMA, and the
+     * internal memory it was holding is worth more to the coder's output
+     * blocks, which are written by the processor once a slice.
+     */
+    static const uint32_t want[] = { 8192u, 4096u, 2048u };
     for (uint32_t i = 0; i < sizeof(want) / sizeof(want[0]); i++) {
         uint8_t *fast = (uint8_t *)ag_malloc_caps(want[i], AG_MEM_FAST);
         if (fast != NULL) {
@@ -3822,6 +4221,38 @@ ag_err_t ag_driver_init(void)
                                  ~(uintptr_t)(PKT_HDR - 1u));
     if (s_palpkt == NULL) {
         s_pal_on = false; /* no palette to send means no indices to send */
+    }
+
+    /*
+     * The coder's table packet, and eight rotating blocks to code slices into.
+     * Twenty-one kilobytes; without them the picture still goes, as indices.
+     */
+    s_hufpkt_raw = (uint8_t *)ag_malloc(HTAB_BLK + PKT_HDR - 1u);
+    s_hufpkt = (s_hufpkt_raw == NULL)
+                   ? NULL
+                   : (uint8_t *)(((uintptr_t)s_hufpkt_raw + PKT_HDR - 1u) &
+                                 ~(uintptr_t)(PKT_HDR - 1u));
+    /*
+     * Internal memory if there is any: the coder writes these by hand, a byte
+     * at a time, while the game is walking PSRAM on the other core - and every
+     * byte written to PSRAM here is a byte the game does not get.  The DMA
+     * reads internal memory just as happily.
+     */
+    s_out_blk = s_blk_idx;
+    s_out_raw = (uint8_t *)ag_malloc_caps(
+        (size_t)HUF_BLKS * s_out_blk + PKT_HDR - 1u, AG_MEM_FAST);
+    if (s_out_raw == NULL) {
+        s_out_raw = (uint8_t *)ag_malloc((size_t)HUF_BLKS * s_out_blk +
+                                         PKT_HDR - 1u);
+    }
+    s_out = (s_out_raw == NULL)
+                ? NULL
+                : (uint8_t *)(((uintptr_t)s_out_raw + PKT_HDR - 1u) &
+                              ~(uintptr_t)(PKT_HDR - 1u));
+    if (s_hufpkt == NULL || s_out == NULL) {
+        ag_printf("REMDISP: no room to code the picture (%u KB); it goes as "
+                  "one byte a pixel\n",
+                  (unsigned)((HUF_BLKS * s_out_blk + HTAB_BLK) / 1024u));
     }
 
     if (s_pkt == NULL || s_tx == NULL) {

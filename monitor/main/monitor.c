@@ -28,6 +28,8 @@
  *   A5 5A F len16   frame:2 slice:2 slices:2 width:2 y:2 rows:2  pixels...
  *   A5 5A X len16   the same twelve, and one byte a pixel instead of two
  *   A5 5A L len16   gen:2 count:2 pad:8  sum:1 pad...   256 x RGB565
+ *   A5 5A T len16   frame:2 count:2 pad:8               256 code lengths
+ *   A5 5A H len16   frame:2 slice:2 slices:2 y:2 rows:2 bodylen:2   the bits
  *   A5 5A A len16   rate:4 samples:2 seq:2 pad:4 sum:1 pad...     samples...
  *   A5 5A R len16   row:1 count:1  (ch,attr) x count      + sum   console row
  *   A5 5A C len16   col:1 row:1 ch:1 attr:1 visible:1     + sum   the caret
@@ -108,6 +110,8 @@ static const char *TAG = "monitor";
 #define FR_AUD    0x41u /* A */
 #define FR_IDX8   0x58u /* X - a slice as one byte a pixel */
 #define FR_PAL    0x4cu /* L - the palette those bytes index */
+#define FR_HUF    0x48u /* H - a slice as Huffman-coded indices */
+#define FR_HTAB   0x54u /* T - the code lengths those bits are read with */
 #define FR_ROW    0x52u /* R - one row of console cells */
 #define FR_CUR    0x43u /* C - the caret, and the cell under it */
 #define FR_RESEND 0x52u /* R - the same letter, going the other way */
@@ -130,6 +134,39 @@ static uint16_t s_pal[256];
 static uint32_t s_pal_gen;
 static uint32_t s_stat_pal;
 static uint32_t s_slice_bpp = 2; /* set by the reader from the opcode */
+
+/* ---- reading the coded picture ------------------------------------------
+ *
+ * Canonical Huffman, the lengths sent as 256 nibbles and the codes rebuilt
+ * from them here - which is why nothing but the lengths has to travel.
+ *
+ * A thousand and twenty four entry table takes any code of ten bits or fewer
+ * in one lookup, and the average code is under five, so the slow walk below is
+ * for the handful of colours that hardly ever appear.  Decoding is a shift, a
+ * lookup and a store per pixel: about three milliseconds a frame here, against
+ * the fifteen the panel itself takes.
+ */
+#define HUF_FAST 10u
+
+/*
+ * On the heap, taken after the frame, and the reason is the same one that
+ * caught the sound's ring: two kilobytes of static memory sit inside the one
+ * 160 KB region the 150 KB frame has to come out of in a single piece, and
+ * the board then comes up saying "frame buffer 153600 bytes: NO" and returns
+ * from app_main - which from the outside is a board that is not running.
+ *
+ * If it cannot be had, the walk below decodes without it: five iterations a
+ * pixel instead of one lookup, which is six milliseconds a frame instead of
+ * three, and a picture rather than none.
+ */
+static uint16_t *s_hfast;                /* (length << 8) | symbol, 0 = long */
+static uint16_t s_hfirst[17];            /* first code of each length */
+static uint16_t s_hbase[17];             /* where that length starts in s_hsym */
+static uint16_t s_hcount[17];
+static uint8_t  s_hsym[256];             /* symbols in canonical order */
+static uint32_t s_htab_frame = 0xffffffffu;
+static bool     s_htab_ok;
+static uint32_t s_stat_huf, s_stat_hbad;
 
 static uint16_t *s_frame;      /* 150 KB, one piece, because it can be */
 static uint32_t  s_have;       /* bitmap of slices in hand             */
@@ -652,6 +689,195 @@ static void pal_in(const uint8_t *p, uint32_t len)
     s_stat_pal++;
 }
 
+/*
+ * Which frame is being assembled, and what of it is missing.
+ *
+ * Shared by every shape a slice can arrive in - RGB565, indices, coded bits -
+ * because the bookkeeping is about frames and not about pixels.
+ */
+static void slice_track(uint32_t frame, uint32_t slice)
+{
+    if ((int32_t)frame != s_frame_no) {
+        if (s_frame_no >= 0 && s_have != s_want) {
+            s_stat_partial++;
+        }
+        s_frame_no = (int32_t)frame;
+        s_have = 0;
+        s_asked = 0;
+    }
+
+    /* A gap means one went missing; ask once, while the far end still has it. */
+    for (uint32_t i = 0; i < slice; i++) {
+        const uint32_t bit = 1u << i;
+        if ((s_have & bit) == 0u && (s_asked & bit) == 0u) {
+            s_asked |= bit;
+            ask_again(frame, i);
+        }
+    }
+}
+
+static void slice_have(uint32_t slice)
+{
+    s_have |= (1u << slice);
+    if (s_have == s_want) {
+        /* A whole frame covers every pixel, so the console needs no clearing
+         * to be taken off the glass - it is simply painted over. */
+        s_text = false;
+        paint();
+        s_frame_no = -1;
+    }
+}
+
+static void htab_in(const uint8_t *p, uint32_t len)
+{
+    if (len < PKT_PIX + 128u) {
+        return;
+    }
+    uint8_t got = 0;
+    for (uint32_t i = 0; i < PKT_GEOM; i++) {
+        got = (uint8_t)(got ^ p[i]);
+    }
+    const uint8_t *const b = p + PKT_PIX;
+    for (uint32_t i = 0; i < 128u; i++) {
+        got = (uint8_t)(got ^ b[i]);
+    }
+    if (got != p[PKT_SUM]) {
+        s_stat_bad++;
+        s_htab_ok = false;
+        return;
+    }
+
+    uint8_t hlen[256];
+    for (uint32_t i = 0; i < 128u; i++) {
+        hlen[i * 2u] = (uint8_t)(b[i] & 0x0fu);
+        hlen[i * 2u + 1u] = (uint8_t)(b[i] >> 4);
+    }
+
+    memset(s_hcount, 0, sizeof(s_hcount));
+    for (uint32_t i = 0; i < 256u; i++) {
+        s_hcount[hlen[i]]++;
+    }
+    s_hcount[0] = 0;
+
+    uint32_t at = 0;
+    for (uint32_t l = 1; l <= 15u; l++) {
+        s_hbase[l] = (uint16_t)at;
+        at += s_hcount[l];
+    }
+    uint16_t fill[17];
+    memcpy(fill, s_hbase, sizeof(fill));
+    for (uint32_t i = 0; i < 256u; i++) {
+        if (hlen[i] != 0u) {
+            s_hsym[fill[hlen[i]]++] = (uint8_t)i;
+        }
+    }
+
+    if (s_hfast != NULL) {
+        memset(s_hfast, 0, (size_t)(1u << HUF_FAST) * sizeof(uint16_t));
+    }
+    uint32_t code = 0;
+    for (uint32_t l = 1; l <= 15u; l++) {
+        s_hfirst[l] = (uint16_t)code;
+        for (uint32_t k = 0; k < s_hcount[l]; k++) {
+            if (s_hfast != NULL && l <= HUF_FAST) {
+                const uint32_t shift = HUF_FAST - l;
+                const uint32_t base = (code + k) << shift;
+                const uint16_t e =
+                    (uint16_t)((l << 8) | s_hsym[s_hbase[l] + k]);
+                for (uint32_t j = 0; j < (1u << shift); j++) {
+                    s_hfast[base + j] = e;
+                }
+            }
+        }
+        code = (code + s_hcount[l]) << 1;
+    }
+
+    s_htab_frame = rd16(p + 0);
+    s_htab_ok = true;
+}
+
+/*
+ * One coded slice, straight onto the frame through the palette: no buffer of
+ * indices in between, because the symbol is the index and the palette turns it
+ * into the colour the panel wants in the same store.
+ */
+static void huf_in(const uint8_t *p, uint32_t len)
+{
+    const uint32_t frame = rd16(p + 0);
+    const uint32_t slice = rd16(p + 2);
+    const uint32_t slices = rd16(p + 4);
+    const uint32_t y0 = rd16(p + 6);
+    const uint32_t rows = rd16(p + 8);
+    const uint32_t body = rd16(p + 10);
+
+    if (slices != SLICES || slice >= SLICES || rows == 0 ||
+        rows > RAW_ROWS || y0 + rows > LCD_H || body == 0u ||
+        len < PKT_PIX + body) {
+        return;
+    }
+    /* Everything sent is summed, padding included, exactly as it was made. */
+    uint8_t got = 0;
+    for (uint32_t i = 0; i < PKT_GEOM; i++) {
+        got = (uint8_t)(got ^ p[i]);
+    }
+    for (uint32_t i = PKT_PIX; i < len; i++) {
+        got = (uint8_t)(got ^ p[i]);
+    }
+    if (got != p[PKT_SUM]) {
+        s_stat_bad++;
+        return;
+    }
+    if (!s_htab_ok || s_htab_frame != frame) {
+        /* The table for this frame never arrived.  Decoding with another
+         * frame's code is not a slightly wrong slice, it is noise. */
+        s_stat_hbad++;
+        return;
+    }
+
+    s_stat_slices++;
+    s_stat_huf++;
+    slice_track(frame, slice);
+
+    const uint8_t *const src = p + PKT_PIX;
+    uint16_t *dst = s_frame + (size_t)y0 * LCD_W;
+    const uint32_t npx = rows * LCD_W;
+    uint32_t acc = 0, at = 0;
+    int      have = 0;
+
+    for (uint32_t i = 0; i < npx; i++) {
+        while (have <= 24) {
+            acc = (acc << 8) | ((at < body) ? src[at] : 0u);
+            at++;
+            have += 8;
+        }
+        if (s_hfast != NULL) {
+            const uint32_t peek =
+                (acc >> (have - (int)HUF_FAST)) & ((1u << HUF_FAST) - 1u);
+            const uint16_t e = s_hfast[peek];
+            if (e != 0u) {
+                have -= (int)(e >> 8);
+                dst[i] = s_pal[e & 0xffu];
+                continue;
+            }
+        }
+        /* Longer than ten bits: walk it, which for these colours is rare. */
+        uint32_t code = 0;
+        uint32_t sym = 0;
+        for (uint32_t l = 1; l <= 15u; l++) {
+            code = (code << 1) | ((acc >> (have - 1)) & 1u);
+            have--;
+            if (s_hcount[l] != 0u &&
+                (uint32_t)(code - s_hfirst[l]) < s_hcount[l]) {
+                sym = s_hsym[s_hbase[l] + (code - s_hfirst[l])];
+                break;
+            }
+        }
+        dst[i] = s_pal[sym];
+    }
+
+    slice_have(slice);
+}
+
 static void slice_in(const uint8_t *p, uint32_t len)
 {
     const uint32_t frame = rd16(p + 0);
@@ -692,23 +918,7 @@ static void slice_in(const uint8_t *p, uint32_t len)
     }
     s_stat_slices++;
 
-    if ((int32_t)frame != s_frame_no) {
-        if (s_frame_no >= 0 && s_have != s_want) {
-            s_stat_partial++;
-        }
-        s_frame_no = (int32_t)frame;
-        s_have = 0;
-        s_asked = 0;
-    }
-
-    /* A gap means one went missing; ask once, while the far end still has it. */
-    for (uint32_t i = 0; i < slice; i++) {
-        const uint32_t bit = 1u << i;
-        if ((s_have & bit) == 0u && (s_asked & bit) == 0u) {
-            s_asked |= bit;
-            ask_again(frame, i);
-        }
-    }
+    slice_track(frame, slice);
 
     const uint8_t *src = p + PKT_PIX;
     uint16_t *dst = s_frame + (size_t)y0 * LCD_W;
@@ -722,15 +932,7 @@ static void slice_in(const uint8_t *p, uint32_t len)
                                 ((uint16_t)src[i * 2u] << 8));
         }
     }
-    s_have |= (1u << slice);
-
-    if (s_have == s_want) {
-        /* A whole frame covers every pixel, so the console needs no clearing
-         * to be taken off the glass - it is simply painted over. */
-        s_text = false;
-        paint();
-        s_frame_no = -1;
-    }
+    slice_have(slice);
 }
 
 /*
@@ -800,6 +1002,12 @@ static void reader(void *arg)
                         st = HUNT0;
                     } else if (op == FR_PAL) {
                         pal_in(payload, len);
+                        st = HUNT0;
+                    } else if (op == FR_HTAB) {
+                        htab_in(payload, len);
+                        st = HUNT0;
+                    } else if (op == FR_HUF) {
+                        huf_in(payload, len);
                         st = HUNT0;
                     } else if (op == FR_AUD) {
                         aud_in(payload, len);
@@ -877,6 +1085,11 @@ void app_main(void)
      * The sound, if there is room for it once the picture has what it needs.
      * Nine kilobytes: a 372 ms ring and the block the converter is fed from.
      */
+    s_hfast = heap_caps_malloc((size_t)(1u << HUF_FAST) * sizeof(uint16_t),
+                               MALLOC_CAP_8BIT);
+    ESP_LOGI(TAG, "decoder table: %s",
+             (s_hfast != NULL) ? "yes" : "no, the slow walk will do");
+
     s_aring = heap_caps_malloc(AUD_RING, MALLOC_CAP_8BIT);
     s_aout = heap_caps_malloc(AUD_CHUNK, MALLOC_CAP_8BIT);
     if (s_aring == NULL || s_aout == NULL) {
@@ -911,13 +1124,14 @@ void app_main(void)
         const uint64_t pu = s_stat_paint_us - last_paint;
         ESP_LOGI(TAG,
                  "%u.%u frames/s, %u slices/s, paint %u us, %u partial, "
-                 "%u asked, %u bad, %u rows, pal %u/%u, %u B/s in (%u stray), "
-                 "%u free",
+                 "%u asked, %u bad, %u rows, pal %u/%u, coded %u (%u lost), "
+                 "%u B/s in (%u stray), %u free",
                  (unsigned)(f / 5u), (unsigned)((f * 2u) % 10u),
                  (unsigned)(sl / 5u), (unsigned)(f ? (pu / f) : 0),
                  (unsigned)s_stat_partial, (unsigned)s_stat_asked,
                  (unsigned)s_stat_bad, (unsigned)s_stat_rows,
                  (unsigned)s_stat_pal, (unsigned)s_pal_gen,
+                 (unsigned)s_stat_huf, (unsigned)s_stat_hbad,
                  (unsigned)((s_stat_rx - last_rx) / 5u),
                  (unsigned)(s_stat_stray - last_stray),
                  (unsigned)esp_get_free_heap_size());
