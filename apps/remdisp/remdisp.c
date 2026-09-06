@@ -1744,6 +1744,13 @@ static uint32_t s_bhash_old[BLK_N];  /* what the far end has been told */
 static uint64_t s_bmask[30];         /* which blocks of each slice moved */
 static uint32_t s_blocks_sent;       /* of BLK_N, in the last window */
 static uint32_t s_dam_seen;          /* blocks hashed, of BLK_N */
+/*
+ * The worst frame of the window, not the average.  A scroll changes the whole
+ * screen at once, and that frame is the one a person sees stutter; an average
+ * over five seconds of standing still says nothing about it.
+ */
+static uint32_t s_worst_bytes, s_worst_send_us, s_worst_blocks;
+static uint32_t s_frame_blocks;
 static uint32_t s_slices_sent;
 
 /*
@@ -3107,6 +3114,7 @@ static void raw_send_direct(void)
 
     const uint64_t all_blocks = (1ull << BLK_COLS) - 1ull;
     uint32_t       donemask = 0;
+    s_frame_blocks = 0;
 
     for (uint32_t c = 0; c < slices && !s_stop; c++) {
         const uint32_t y0 = c * RAW_ROWS;
@@ -3137,6 +3145,7 @@ static void raw_send_direct(void)
         for (uint32_t bx = 0; bx < BLK_COLS; bx++) {
             if (mask & (1ull << bx)) {
                 s_blocks_sent++;
+                s_frame_blocks++;
             }
         }
 
@@ -3231,6 +3240,13 @@ static void raw_send_direct(void)
      */
     send_done(donemask);
     memcpy(s_bhash_old, s_bhash, sizeof(s_bhash_old));
+
+    if (sent > s_worst_bytes) {
+        s_worst_bytes = sent;
+    }
+    if (s_frame_blocks > s_worst_blocks) {
+        s_worst_blocks = s_frame_blocks;
+    }
 
     if (s_dma) {
         const uint64_t w0 = (uint64_t)ag_api()->time->us();
@@ -3330,7 +3346,13 @@ static void raw_stats(void)
               (unsigned)(s_blocks_sent / s_raw_frames), (unsigned)BLK_N,
               (unsigned)(s_slices_sent / s_raw_frames), 30u,
               (unsigned)(s_dam_seen / s_raw_frames));
+    ag_printf("RAW: worst frame of the window: %u blocks, %u B, %u us to send\n",
+              (unsigned)s_worst_blocks, (unsigned)s_worst_bytes,
+              (unsigned)s_worst_send_us);
     s_dam_seen = 0;
+    s_worst_blocks = 0;
+    s_worst_bytes = 0;
+    s_worst_send_us = 0;
     s_t_huf_us = 0;
     s_blocks_sent = 0;
     s_slices_sent = 0;
@@ -3531,6 +3553,9 @@ static void wire_task(void *arg)
         const uint64_t b0 = s_sent_bytes;
         raw_send_direct();
         s_t_send_us = (uint32_t)((uint64_t)ag_api()->time->us() - t0);
+        if (s_t_send_us > s_worst_send_us) {
+            s_worst_send_us = s_t_send_us;
+        }
         s_raw_bytes += s_sent_bytes - b0;
         s_raw_frames++;
 
