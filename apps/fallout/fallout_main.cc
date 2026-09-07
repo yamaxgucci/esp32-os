@@ -90,6 +90,8 @@ void soundEffectsCacheFlush();
 extern "C" {
 void            ag_libc_oom_sink(int (*sink)(__SIZE_TYPE__ wanted));
 extern unsigned ag_libc_oom_rescues;
+/* Does nothing unless the build asked for the profiler; see on_out_of_arena. */
+void            ag_libc_malloc_profile_dump(int top);
 }
 
 /*
@@ -216,6 +218,27 @@ extern "C" void fallout_reserve_tick(void)
 
 static int on_out_of_arena(__SIZE_TYPE__ wanted)
 {
+    /*
+     * ARGON: the census first, before anything is given back.
+     *
+     * "What was the game holding when it was refused" is the question every
+     * one of these failures raises, and the two flushes below are the first
+     * thing that changes the answer.  With the live-bytes profiler compiled in
+     * and switched on (-prof N) this prints the table at exactly the moment of
+     * the refusal; without it the call does nothing and costs nothing.
+     */
+    {
+        ag_meminfo_t before;
+        ag_meminfo(&before);
+        ag_printf("fallout: refused %u B with %u KB used of %u, hole %u B - "
+                  "what is held:\n",
+                  (unsigned)wanted,
+                  (unsigned)((before.arena_total - before.arena_free) / 1024u),
+                  (unsigned)(before.arena_total / 1024u),
+                  (unsigned)before.arena_largest);
+        ag_libc_malloc_profile_dump(32);
+    }
+
     const int flushed = fallout::artCacheFlush() ? 1 : 0;
     /*
      * And the sound cache, which is worth as much as the art flush is not.

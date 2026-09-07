@@ -284,6 +284,19 @@ def compile_one(src: str, obj: str) -> subprocess.CompletedProcess:
     # above, which builds its own list and would drop anything added before it.
     if os.environ.get("ARGON_LIBC_MALLOC_PROFILE") == "1":
         cmd += ["-DAG_LIBC_MALLOC_PROFILE=1"]
+        # And how big its tables are, because that size *is* the distortion:
+        # every kilobyte of table is a kilobyte the arena does not get, so a
+        # measuring build has to say what it took and give the arena that much
+        # less to keep the failure in the same place.  PROFILE_LIVE is pointer
+        # slots at twelve bytes each; PROFILE_MIN is the smallest block the
+        # table bothers with, and blocks under it are counted in a spill total
+        # rather than attributed.
+        live = os.environ.get("ARGON_LIBC_PROFILE_LIVE")
+        if live:
+            cmd += ["-DPROFILE_LIVE=%uu" % int(live)]
+        low = os.environ.get("ARGON_LIBC_PROFILE_MIN")
+        if low:
+            cmd += ["-DPROFILE_MIN=%uu" % int(low)]
     # fpattern refuses to compile until it is told which family of operating
     # system it is on, and there are only two.  DOS is the right answer twice
     # over: ArgonOS separates paths with a backslash and compares names without
