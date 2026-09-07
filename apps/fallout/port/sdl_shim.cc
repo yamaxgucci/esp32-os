@@ -2203,6 +2203,12 @@ static void hud_frame(uint32_t frame_us, uint32_t blit_us, uint32_t wire_us,
  * A frame rate of its own, because -fps prints once a window and the readout
  * wants a number every second whether anything is being printed or not.
  */
+/*
+ * ARGON: set when hud_tick has new numbers to show, cleared when they are on
+ * the screen.  See the note at the end of hud_draw for why it exists.
+ */
+static bool s_hud_changed;
+
 static void hud_tick(void)
 {
     const uint32_t now = (uint32_t)ag_millis();
@@ -2215,6 +2221,7 @@ static void hud_tick(void)
         return;
     }
     s_hb_next_ms = now + 1000u;
+    s_hud_changed = true;
 
     /* Everything the five buckets hold, before the oldest is thrown away. */
     uint32_t frames = 0, slow = 0, worst = 0, worst_blit = 0, worst_wire = 0;
@@ -2502,8 +2509,25 @@ static void hud_draw(void)
      * whole screen was being flushed every frame for the palette cycle.  It is
      * not true now that only real changes are sent: a still screen sends
      * nothing, and a readout nobody sends is a readout nobody can read.
+     *
+     * ARGON: but only when they did change, or when the game had already
+     * dirtied this corner.
+     *
+     * Unconditionally, this one line cost the wire every frame the game drew.
+     * The readout's numbers are recomputed once a second and nothing else in
+     * it moves, while the display driver copies the *whole* 150 KB surface for
+     * every frame it accepts - so a still screen that should have sent nothing
+     * at all was sending sixty full frames a second, and Maxim reported the
+     * game as "much less smooth than this morning" the first time it was left
+     * on.  Once a second is 1/60th of that, and when the game has already
+     * damaged this corner the readout rides along for nothing.
      */
-    dirty_add(0, 0, w, h);
+    const bool overlaps = s_dirty_x1 > s_dirty_x0 && s_dirty_y1 > s_dirty_y0 &&
+                          s_dirty_x0 < w && s_dirty_y0 < h;
+    if (s_hud_changed || overlaps) {
+        dirty_add(0, 0, w, h);
+        s_hud_changed = false;
+    }
 }
 
 void SDL_RenderPresent(SDL_Renderer *r)
