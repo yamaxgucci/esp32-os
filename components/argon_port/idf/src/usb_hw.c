@@ -79,6 +79,22 @@ typedef struct {
     ag_usb_usage_t  usage;
     bool            claimed;
     usb_transfer_t *in;
+    /*
+     * ARGON: what the endpoint last did, and whether it needs picking up.
+     *
+     * A transfer that ends in anything but COMPLETED leaves an interrupt IN
+     * endpoint halted, and a halted endpoint refuses every further submit
+     * until it is cleared.  The first version of this file resubmitted from
+     * the callback whatever the status was and dropped the submit's own error
+     * with a (void) - so one bus error ended the mouse for the rest of the
+     * boot, in silence.  Measured on 7 September 2026: 249 reports and then
+     * nothing, with `usb` still saying the device was open, the journal
+     * holding no complaint, and unplugging the receiver not helping.
+     */
+    volatile int  last_status;  /* usb_transfer_status_t of the last report  */
+    volatile bool recover;      /* the client task owes this pipe a clear    */
+    uint32_t      errors;       /* how many times it has needed one          */
+    bool          dead;         /* cleared and it still would not go         */
 } usb_pipe_t;
 
 static usb_pipe_t        s_pipe[USB_MAX_PIPES];
@@ -151,6 +167,10 @@ static uint32_t find_hid(const usb_config_desc_t *cfg, usb_pipe_t *out,
                     q->mps = ep->wMaxPacketSize;
                     q->claimed = false;
                     q->in = NULL;
+                    q->last_status = (int)USB_TRANSFER_STATUS_COMPLETED;
+                    q->recover = false;
+                    q->errors = 0;
+                    q->dead = false;
                     switch (cur->bInterfaceProtocol) {
                     case HID_PROTOCOL_KEYBOARD:
                         q->usage = AG_USB_USAGE_KEYBOARD;
@@ -220,12 +240,18 @@ static int class_request(uint8_t itf, uint8_t bRequest, uint16_t wValue)
 
 /* ---- report transfer --------------------------------------------------- */
 
+static const char *usage_name(ag_usb_usage_t u);
+
 static void in_cb(usb_transfer_t *t)
 {
     /* Which interface this arrived on, carried in the transfer rather than
      * looked up: the callback has no other way to know, and announcing a
      * mouse's report as a keyboard's is what the single-pipe version did. */
-    const usb_pipe_t *q = (const usb_pipe_t *)t->context;
+    usb_pipe_t *q = (usb_pipe_t *)t->context;
+
+    if (q != NULL) {
+        q->last_status = (int)t->status;
+    }
 
     if (t->status == USB_TRANSFER_STATUS_COMPLETED) {
         s_reports++;
@@ -233,19 +259,91 @@ static void in_cb(usb_transfer_t *t)
             s_on_report((q != NULL) ? q->usage : AG_USB_USAGE_OTHER, 0,
                         t->data_buffer, (uint32_t)t->actual_num_bytes);
         }
+        /*
+         * Resubmit while the device is still here.  A NAK (nothing pressed) is
+         * not an error the driver sees - the library holds the transfer until
+         * the device has something to say - so a completed transfer that is
+         * empty is rare, and the hot path is exactly this: ask again at once,
+         * from the callback, with no task in between.
+         */
+        if (s_running && s_dev != NULL) {
+            if (usb_host_transfer_submit(t) != ESP_OK && q != NULL) {
+                q->recover = true;
+            }
+        }
+        return;
     }
+
     /*
-     * Resubmit while the device is still here.  A NAK (nothing pressed) is not
-     * an error the driver sees - the library holds the transfer until the
-     * keyboard has something to say - so a completed transfer that is empty is
-     * rare, and any non-fatal status is handled by simply asking again.  When
-     * the device is gone, s_dev is already NULL and the transfer is left for
-     * detach() to free.
+     * ARGON: anything else is an error, and an errored interrupt IN endpoint
+     * is halted.  Resubmitting a halted endpoint fails for ever, so this does
+     * not resubmit here - the client task clears the endpoint first, and says
+     * out loud what happened.  Not from the callback, which runs inside
+     * usb_host_client_handle_events and must not call back into the library's
+     * blocking half.
+     *
+     * A device that has gone or a transfer that was cancelled are not faults:
+     * detach() owns the transfer from then on.
      */
-    if (s_running && s_dev != NULL &&
-        t->status != USB_TRANSFER_STATUS_NO_DEVICE &&
+    if (q != NULL && t->status != USB_TRANSFER_STATUS_NO_DEVICE &&
         t->status != USB_TRANSFER_STATUS_CANCELED) {
-        (void)usb_host_transfer_submit(t);
+        q->recover = true;
+    }
+}
+
+static const char *status_name(int st)
+{
+    switch (st) {
+    case USB_TRANSFER_STATUS_COMPLETED: return "completed";
+    case USB_TRANSFER_STATUS_ERROR:     return "bus error";
+    case USB_TRANSFER_STATUS_TIMED_OUT: return "timed out";
+    case USB_TRANSFER_STATUS_CANCELED:  return "cancelled";
+    case USB_TRANSFER_STATUS_STALL:     return "stalled";
+    case USB_TRANSFER_STATUS_OVERFLOW:  return "overflow";
+    case USB_TRANSFER_STATUS_SKIPPED:   return "skipped";
+    case USB_TRANSFER_STATUS_NO_DEVICE: return "gone";
+    default:                            return "unknown";
+    }
+}
+
+/*
+ * ARGON: take a halted endpoint back, on the client task.
+ *
+ * The sequence the library asks for: halt (idempotent, and required before the
+ * other two are legal), flush the queue of whatever was in flight, then clear.
+ * Only then will a submit be accepted again.
+ *
+ * A pipe that will not come back is marked dead and said once, rather than
+ * retried for ever at the speed of the event loop - a mouse that has stopped
+ * is worth one line in the journal, not a thousand.
+ */
+static void pipe_recover(usb_pipe_t *q)
+{
+    q->recover = false;
+    q->errors++;
+
+    if (!s_running || s_dev == NULL || q->in == NULL || !q->claimed) {
+        return;
+    }
+
+    ESP_LOGW(TAG, "%s on interface %u: %s after %u reports, clearing",
+             usage_name(q->usage), q->itf, status_name(q->last_status),
+             (unsigned)s_reports);
+
+    (void)usb_host_endpoint_halt(s_dev, q->ep);
+    (void)usb_host_endpoint_flush(s_dev, q->ep);
+    const esp_err_t cl = usb_host_endpoint_clear(s_dev, q->ep);
+    if (cl != ESP_OK) {
+        ESP_LOGW(TAG, "interface %u: clear failed (%s)", q->itf,
+                 esp_err_to_name(cl));
+    }
+
+    const esp_err_t sub = usb_host_transfer_submit(q->in);
+    if (sub != ESP_OK) {
+        q->dead = true;
+        ESP_LOGE(TAG, "%s on interface %u is not answering (%s); it needs the "
+                      "receiver unplugged and put back",
+                 usage_name(q->usage), q->itf, esp_err_to_name(sub));
     }
 }
 
@@ -455,6 +553,13 @@ static void cli_task(void *arg)
             s_pending_gone = NULL;
             detach(gone);
         }
+
+        /* ARGON: and any endpoint that stopped answering.  See pipe_recover. */
+        for (uint32_t i = 0; i < s_pipes; i++) {
+            if (s_pipe[i].recover && !s_pipe[i].dead) {
+                pipe_recover(&s_pipe[i]);
+            }
+        }
     }
     s_cli_task = NULL;
     vTaskDelete(NULL);
@@ -540,6 +645,17 @@ ag_err_t ag_port_usb_status(ag_port_usb_status_t *out)
     out->vid = s_vid;
     out->pid = s_pid;
     out->reports = s_reports;
+
+    const uint32_t room = (uint32_t)(sizeof(out->pipe) / sizeof(out->pipe[0]));
+    for (uint32_t i = 0; i < s_pipes && i < room; i++) {
+        out->pipe[i].itf = s_pipe[i].itf;
+        out->pipe[i].ep = s_pipe[i].ep;
+        out->pipe[i].usage = s_pipe[i].usage;
+        out->pipe[i].last = status_name(s_pipe[i].last_status);
+        out->pipe[i].errors = s_pipe[i].errors;
+        out->pipe[i].dead = s_pipe[i].dead;
+        out->pipes = i + 1u;
+    }
     return AG_OK;
 }
 

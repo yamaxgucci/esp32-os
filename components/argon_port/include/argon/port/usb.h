@@ -71,6 +71,21 @@ typedef struct {
     uint16_t       vid;
     uint16_t       pid;
     uint32_t       reports; /* how many have arrived since it attached         */
+    /*
+     * ARGON: and what each of the device's HID interfaces is doing, because
+     * "open, 249 reports" was true of a mouse that had stopped for good and
+     * there was no way to see that from outside.  `pipes` is how many are
+     * filled in.
+     */
+    uint32_t pipes;
+    struct {
+        uint8_t        itf;
+        uint8_t        ep;
+        ag_usb_usage_t usage;
+        const char    *last;   /* the last transfer status, in words          */
+        uint32_t       errors; /* how many times it had to be cleared         */
+        bool           dead;   /* cleared and still refusing                  */
+    } pipe[4];
 } ag_port_usb_status_t;
 
 /*

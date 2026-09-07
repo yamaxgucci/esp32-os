@@ -3983,8 +3983,37 @@ static int cmd_usb(int argc, char **argv)
         ag_console_puts("host up, nothing plugged in\n");
         break;
     case AG_USB_OPEN:
-        ag_console_printf("keyboard %04x:%04x, %u reports\n", st.vid, st.pid,
-                          (unsigned)st.reports);
+        /*
+         * ARGON: what it is, not "keyboard" for anything that opened - and one
+         * line per HID interface, with the endpoint's last transfer status.
+         *
+         * "keyboard 046d:c542, 249 reports" was the whole of it, and every word
+         * was misleading at once: the device was a mouse, the count had been
+         * frozen for ten minutes, and the endpoint had been halted since.
+         */
+        ag_console_printf("device %04x:%04x, %u reports total\n", st.vid,
+                          st.pid, (unsigned)st.reports);
+        for (uint32_t i = 0; i < st.pipes; i++) {
+            const char *what = "hid";
+            if (st.pipe[i].usage == AG_USB_USAGE_KEYBOARD) {
+                what = "keyboard";
+            } else if (st.pipe[i].usage == AG_USB_USAGE_MOUSE) {
+                what = "mouse";
+            }
+            ag_console_printf("  %-8s interface %u ep 0x%02x: %s",
+                              what, (unsigned)st.pipe[i].itf,
+                              (unsigned)st.pipe[i].ep,
+                              (st.pipe[i].last != NULL) ? st.pipe[i].last
+                                                        : "?");
+            if (st.pipe[i].errors != 0u) {
+                ag_console_printf(", cleared %u time(s)",
+                                  (unsigned)st.pipe[i].errors);
+            }
+            if (st.pipe[i].dead) {
+                ag_console_puts(", NOT ANSWERING");
+            }
+            ag_console_puts("\n");
+        }
         break;
     default:
         break;
