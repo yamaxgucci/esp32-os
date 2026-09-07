@@ -529,15 +529,48 @@ static const ag_display_ops_t k_fb_class_ops = {
 
 static bool gfx_may_present(void)
 {
-    if (!s_acquired) {
-        return false;
-    }
-    /* Safety net: ignore flush/swap from a background session slot. */
+    /*
+     * ARGON: and say so when the answer is no.
+     *
+     * Both refusals here are silent and both look identical from outside: the
+     * game draws at its usual frame rate, its own counters say it flushed, and
+     * the picture on the panel never changes again.  On 7 September 2026 that
+     * cost an afternoon - the display driver at the end of the wire was
+     * reporting "0 offers" while Fallout reported 36 frames a second, and
+     * there was nothing anywhere to say which of the two was lying.  Neither
+     * was: the flush was being dropped in between.
+     *
+     * Rate limited to one line every two seconds, because the caller is a
+     * game's present and the whole point is not to cost it anything.
+     */
+    static uint64_t said_us;
+    static uint32_t dropped;
+
+    bool           ok = true;
     const ag_pid_t me = ag_proc_self();
-    if (me != AG_PID_KERNEL && me != ag_session_focused_pid()) {
-        return false;
+    const ag_pid_t focused = ag_session_focused_pid();
+
+    if (!s_acquired) {
+        ok = false;
+    } else if (me != AG_PID_KERNEL && me != focused) {
+        /* Safety net: ignore flush/swap from a background session slot. */
+        ok = false;
     }
-    return true;
+
+    if (!ok) {
+        dropped++;
+        const uint64_t now = (uint64_t)ag_port_us();
+        if (said_us == 0ull || (now - said_us) >= 2000000ull) {
+            said_us = now;
+            ag_log(AG_LOG_WARN, "display",
+                   "%u flushes dropped: acquired %u, asking pid %u, focused "
+                   "pid %u",
+                   (unsigned)dropped, (unsigned)s_acquired, (unsigned)me,
+                   (unsigned)focused);
+            dropped = 0;
+        }
+    }
+    return ok;
 }
 
 static ag_err_t gfx_acquire(ag_gfxinfo_t *out)
