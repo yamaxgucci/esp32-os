@@ -987,6 +987,19 @@ And the arena cannot be made bigger.  8007 KB of extended memory is free with
 the card mounted and the image's data takes 1812, but the arena has to be one
 block: 6150 is refused, and so are 6220 and 6360.  All three were tried.
 
+**Correction, 7 September 2026: the number below is measured standing still,
+and 1400 is wrong for playing.** Everything in this section was taken with the
+character stationary on the Temple of Trials, which is why nothing is read and
+nothing is evicted. One fifteen-second window of real play at 1400:
+
+    CACHE t=311101: 738 read, 601 evicted, 1 flushed, spilled 0 KB
+
+Seven hundred reads against six hundred evictions is thrashing - the art goes
+out and comes straight back off the card - and it is felt before it is
+measured. `art_cache_size` is 1800 and is not the place to find arena for the
+temple. Read the rest of this section as an account of how the knee was looked
+for, not as a setting to copy.
+
 **And it does not take two megabytes.**  The setting is whole megabytes, which
 is far too coarse a dial here, so patch 0012 reads it in kilobytes above 16.
 1400 KB measures exactly like 2048 - nothing read, nothing evicted, nothing
