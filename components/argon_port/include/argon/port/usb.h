@@ -71,6 +71,11 @@ typedef struct {
     uint16_t       vid;
     uint16_t       pid;
     uint32_t       reports; /* how many have arrived since it attached         */
+    /* Laps of the port's own event loop.  A count that is not moving means the
+     * port has stopped handling anything at all, which is a different fault
+     * from a device that has gone quiet with a healthy endpoint - and the two
+     * were indistinguishable from outside until this existed. */
+    uint32_t       loops;
     /*
      * ARGON: and what each of the device's HID interfaces is doing, because
      * "open, 249 reports" was true of a mouse that had stopped for good and

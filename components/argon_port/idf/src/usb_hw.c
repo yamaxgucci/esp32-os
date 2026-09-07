@@ -102,6 +102,18 @@ static uint32_t          s_pipes;
 static uint16_t          s_vid;
 static uint16_t          s_pid;
 static volatile uint32_t s_reports;
+/*
+ * ARGON: how many times the client task has been round its loop.
+ *
+ * The one number that separates the two explanations for a mouse that has
+ * stopped, and there was no way to choose between them: either the device has
+ * gone quiet with the endpoint healthy, or this task is stuck and no event of
+ * any kind is being handled - which also explains why unplugging the receiver
+ * does not help, because the unplug is handled here too.  Measured 7 September
+ * 2026: 249 reports and then nothing, twice, with `usb` reporting the endpoint
+ * as "completed", no errors, and nothing in the journal.
+ */
+static volatile uint32_t s_cli_loops;
 
 /* Set by the client callback, acted on by the client task - never open a device
  * from inside the callback, which runs under usb_host_client_handle_events. */
@@ -534,6 +546,7 @@ static void cli_task(void *arg)
 {
     (void)arg;
     while (s_running) {
+        s_cli_loops++;
         usb_host_client_handle_events(s_client, pdMS_TO_TICKS(200));
 
         const uint8_t addr = s_pending_new;
@@ -645,6 +658,7 @@ ag_err_t ag_port_usb_status(ag_port_usb_status_t *out)
     out->vid = s_vid;
     out->pid = s_pid;
     out->reports = s_reports;
+    out->loops = s_cli_loops;
 
     const uint32_t room = (uint32_t)(sizeof(out->pipe) / sizeof(out->pipe[0]));
     for (uint32_t i = 0; i < s_pipes && i < room; i++) {
