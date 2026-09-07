@@ -2066,6 +2066,20 @@ static uint32_t   s_dmg_x0, s_dmg_y0, s_dmg_x1, s_dmg_y1; /* x1/y1 exclusive */
 static bool       s_dmg;
 static volatile bool s_stop;
 static uint32_t   s_late;    /* blits that went the old way, for `dev`      */
+/*
+ * ARGON: and the shape of the last one that was refused.
+ *
+ * The refusal below is silent and permanent: a blit whose surface is not the
+ * size this driver set itself up for is dropped, and if the game's surface has
+ * changed the driver never takes another frame - the picture on the far end
+ * freezes while the sound, which does not go through here, keeps playing.
+ * Reported on 7 September 2026 as "the game has hung", and it had not: it was
+ * drawing at 27 to 34 frames a second the whole time.
+ */
+static uint32_t   s_late_w, s_late_h;
+/* Consecutive five-second windows with no picture sent, so the report can back
+ * off and leave the console usable for asking the board anything else. */
+static uint32_t   s_quiet_windows;
 
 /* Waited for without a limit, for the same reason as the wire lock: what it
  * guards is a buffer, and half of one is not a picture. */
@@ -2174,6 +2188,8 @@ static void rem_blit_rect_inner(ag_handle_t h, const ag_blit_t *b)
     if (s_pkt == NULL || b->surf_w != s_fb_w || b->surf_h != s_fb_h) {
         dmg_unlock(held);
         s_late++;
+        s_late_w = b->surf_w;
+        s_late_h = b->surf_h;
         return;
     }
 
@@ -2584,8 +2600,23 @@ static bool sweep_due(void)
      * the next one nearly free.  Sixty seconds since the last blit means the
      * application has gone and the console should keep the screen.
      */
+    /*
+     * Ten seconds, not sixty, and the difference is a flicker somebody had to
+     * watch.  Reported: "экран начал мигать - то текст, то игра".  The game
+     * had already been killed, and for a whole minute afterwards this clock
+     * kept putting the last frame back while the console kept printing over
+     * it - the picture every three seconds, text two seconds later, round and
+     * round.  A dead application should lose the screen at once and keep
+     * losing it.
+     *
+     * Ten seconds is longer than any gap between frames of a game that is
+     * merely slow - the worst measured is a 96 second load, and during that
+     * the engine is drawing nothing at all, which is the case this clock is
+     * for - so this is a compromise and not a fix.  What it buys is that a
+     * game which has stopped for good stops taking the screen back.
+     */
     if (s_sweep_owed == 0u && s_last_text_us > s_last_blit_us &&
-        now - s_last_blit_us < 60000000ull && now - s_sweep_at >= 3000000ull) {
+        now - s_last_blit_us < 10000000ull && now - s_sweep_at >= 3000000ull) {
         s_sweep_owed = 1u;
         s_sweep_at = 0ull;
     }
@@ -3381,8 +3412,49 @@ static void raw_stats(void)
     }
     at = now + STAT_US;
     if (s_raw_frames == 0u) {
+        /*
+         * ARGON: the first three windows, then once a minute.
+         *
+         * Printed every window this line made the console unusable within a
+         * minute of a game that had stopped drawing - and the console is how
+         * everything else about the board is asked, so a diagnostic that
+         * drowns it costs more than it tells.  Three in a row says what the
+         * state is; after that it is the same sentence and once a minute is
+         * enough to show it is still true.
+         */
+        s_quiet_windows++;
+        if (s_quiet_windows > 3u && (s_quiet_windows % 12u) != 0u) {
+            return;
+        }
+        /*
+         * ARGON: say why, instead of saying nothing.
+         *
+         * This used to return here, so the one state worth a report - the wire
+         * has sent no picture for five seconds - was the state in which the
+         * driver went quiet.  On 7 September 2026 the far end showed a frozen
+         * frame and kept playing sound, the game was drawing at 27 to 34
+         * frames a second, and the driver's log held its two startup lines and
+         * nothing else.  There was no way to tell from outside whether the
+         * game had stopped offering the screen, whether its offers were being
+         * refused, or whether the sender was starved.
+         *
+         * Not suppressed by the glass check below either: if no picture has
+         * gone out for five seconds then nothing is being scrolled over.
+         */
+        ag_printf("RAW: nothing sent in %us: %u offers, %u refused (last "
+                  "%ux%u against %ux%u), %u loops, want %u have %u, "
+                  "frame %s, text %s picture\n",
+                  (unsigned)(STAT_US / 1000000ull), (unsigned)s_offers,
+                  (unsigned)s_late, (unsigned)s_late_w, (unsigned)s_late_h,
+                  (unsigned)s_fb_w, (unsigned)s_fb_h, (unsigned)s_loops,
+                  (unsigned)s_want_copy, (unsigned)s_have_copy,
+                  (s_pkt != NULL) ? "held" : "none",
+                  (s_last_text_us > s_last_blit_us) ? "after" : "before");
+        s_offers = 0;
+        s_late = 0;
         return;
     }
+    s_quiet_windows = 0;
 #if RAW_SILENT == 0 && !SEND_ALWAYS
     if (s_last_text_us > s_last_blit_us) {
         return; /* the console has the glass; do not scroll it */
