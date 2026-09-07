@@ -77,6 +77,9 @@ int main(int argc, char **argv);
  */
 namespace fallout {
 int artCacheFlush();
+/* Same shape and the same reason: every entry is a copy of a file on the card,
+ * and nothing is playing while a map loads.  296 KB, measured. */
+void soundEffectsCacheFlush();
 }
 
 /*
@@ -105,11 +108,154 @@ extern unsigned ag_libc_oom_rescues;
  * needs.  Once per refusal; if letting go of all of it did not help, asking
  * again will not either.
  */
+/*
+ * ARGON: and a block held back for exactly this moment.
+ *
+ * The paragraph above is half wrong, and the board said so on 7 September
+ * 2026.  artCacheFlush gives memory back *inside the cache's own heap* - the
+ * 1800 KB block that heap sits in is taken once at startup and never
+ * returned - so unless art had spilled past it into the arena, the flush
+ * hands the arena nothing at all.  Measured at the moment of death, three
+ * times over: `spilled 0 KB in 0 blocks`, the hook firing, and the game dying
+ * anyway.
+ *
+ * What the arena actually runs out of is not bytes but a *hole*.  Entering the
+ * Temple of Trials:
+ *
+ *     malloc: out of arena asking for 70066 bytes; 172 of 6000 KB free,
+ *             largest block 65536
+ *
+ * A hundred and seventy kilobytes free, in pieces no bigger than sixty-four,
+ * and sixty-eight wanted.  Nothing that frees scattered bytes can help that.
+ *
+ * So one block is taken at startup, while the arena is empty and a large
+ * contiguous allocation is certain to succeed, and it is not used for
+ * anything.  It is a hole, kept.  When a refusal arrives and the flush has not
+ * made room, the hole is handed over and the caller retries into it.
+ *
+ * Three hundred and twenty kilobytes because that is the largest refusal seen:
+ * 307 200, the 640x480 surface a dialogue or the save screen needs.  The
+ * others were 70 066, 146 880 and 193 892.
+ *
+ * It re-arms itself once the crisis passes - see fallout_reserve_tick, called
+ * from the shim's own frame timer. A reserve that is spent and never taken
+ * again would save the first map change of a session and no other.
+ */
+/*
+ * ARGON, second thought, same day: this is a knob and its default is off.
+ *
+ * The reserve answers fragmentation - free bytes that are in no hole big
+ * enough - and that is not what the temple runs out of.  Measured there:
+ *
+ *     malloc: out of arena asking for 16904 bytes; 23 of 6000 KB free
+ *     malloc: out of arena asking for 125760 bytes; 59 of 6000 KB free
+ *
+ * Twenty-three kilobytes free, not a hundred and seventy in pieces.  Against
+ * exhaustion a reserve is worse than nothing: it holds three hundred and
+ * twenty kilobytes out of the peak to give one allocation back once, and the
+ * next refusal arrives with the reserve already spent.  The shortfall was
+ * smaller than the reserve.
+ *
+ * So it is off unless asked for - `-reserve KB` - and it is worth asking for
+ * when the failures come back with plenty free and no hole, which is the shape
+ * it was written for.
+ */
+static unsigned s_reserve_bytes;
+
+static void *s_reserve;
+static unsigned s_reserve_spent;
+static unsigned s_reserve_rearmed;
+
+extern "C" void fallout_reserve_kb(int kb)
+{
+    s_reserve_bytes = (kb > 0) ? (unsigned)kb * 1024u : 0u;
+}
+
+static void reserve_take(void)
+{
+    if (s_reserve == NULL && s_reserve_bytes != 0u) {
+        s_reserve = ag_malloc(s_reserve_bytes);
+    }
+}
+
+/*
+ * Called about once a second from the shim, and cheap when there is nothing
+ * to do: the test is a pointer.  ag_meminfo costs about 12 ms, so it is only
+ * asked once the reserve is actually gone, and only every few seconds.
+ */
+extern "C" void fallout_reserve_tick(void)
+{
+    if (s_reserve != NULL || s_reserve_bytes == 0u) {
+        return;
+    }
+
+    static unsigned last_ms;
+    const unsigned now = (unsigned)ag_millis();
+    if (last_ms != 0u && now - last_ms < 4000u) {
+        return;
+    }
+    last_ms = now;
+
+    ag_meminfo_t mi;
+    ag_meminfo(&mi);
+    /* Only when taking it back cannot itself cause the next refusal: the hole
+     * has to exist with room to spare, not merely exist. */
+    if ((__SIZE_TYPE__)mi.arena_largest < (__SIZE_TYPE__)s_reserve_bytes * 2u) {
+        return;
+    }
+    s_reserve = ag_malloc(s_reserve_bytes);
+    if (s_reserve != NULL) {
+        s_reserve_rearmed++;
+        ag_printf("fallout: reserve taken back (%u KB free, largest %u B, "
+                  "%u spent, %u re-armed)\n",
+                  (unsigned)(mi.arena_free / 1024u),
+                  (unsigned)mi.arena_largest, s_reserve_spent,
+                  s_reserve_rearmed);
+    }
+}
+
 static int on_out_of_arena(__SIZE_TYPE__ wanted)
 {
-    ag_printf("fallout: %u bytes refused; letting the art cache go\n",
-              (unsigned)wanted);
-    return fallout::artCacheFlush() ? 1 : 0;
+    const int flushed = fallout::artCacheFlush() ? 1 : 0;
+    /*
+     * And the sound cache, which is worth as much as the art flush is not.
+     * Measured at the same place on the starting map, one config line apart:
+     *
+     *     sound on   5257 KB used of 6000, largest hole  94 KB
+     *     sound off  4961 KB used of 6000, largest hole 512 KB
+     *
+     * 296 KB held, and it fragments as much as it fills: the largest hole goes
+     * from 512 KB to 94 with sound on.  A map change wants about 720 KB more
+     * than standing still, and 5257 + 720 is 5977 of a 6000 KB arena - which
+     * is the number on the console before every temple crash.
+     */
+    fallout::soundEffectsCacheFlush();
+
+    ag_meminfo_t mi;
+    ag_meminfo(&mi);
+    if ((__SIZE_TYPE__)mi.arena_largest >= wanted) {
+        ag_printf("fallout: %u bytes refused; the art cache going was enough "
+                  "(largest now %u B)\n",
+                  (unsigned)wanted, (unsigned)mi.arena_largest);
+        return 1;
+    }
+
+    if (s_reserve != NULL) {
+        ag_free(s_reserve);
+        s_reserve = NULL;
+        s_reserve_spent++;
+        ag_printf("fallout: %u bytes refused with %u KB free in holes of %u B; "
+                  "spending the %u KB reserve\n",
+                  (unsigned)wanted, (unsigned)(mi.arena_free / 1024u),
+                  (unsigned)mi.arena_largest, s_reserve_bytes / 1024u);
+        return 1;
+    }
+
+    ag_printf("fallout: %u bytes refused; %u KB free, largest %u B, and the "
+              "reserve is already spent\n",
+              (unsigned)wanted, (unsigned)(mi.arena_free / 1024u),
+              (unsigned)mi.arena_largest);
+    return flushed;
 }
 
 /* In port/sdl_shim.cc.  Not SDL: an automated run has no eyes. */
@@ -157,6 +303,10 @@ static int to_int(const char *s)
  *   -shot PATH     write the frame out as a PPM
  *   -frames N      after this many presents
  *   -shotms N      or after this many milliseconds, whichever comes first
+ *   -reserve KB    hold this much of the arena back at startup and hand it
+ *                  over on a refused allocation.  Off by default: it answers
+ *                  fragmentation, and against plain exhaustion it makes the
+ *                  peak worse by its own size.  See on_out_of_arena.
  *   -memstat N     print arena use, and the peak so far, every N ms
  *   -mallocs KB N  with -memstat, name the first N allocations of KB
  *                  or more (default 32 and 64)
@@ -297,6 +447,7 @@ extern "C" int ag_cxx_main(int argc, char **argv)
     int frames = 0;
     int shot_ms = 0;
     int memstat_ms = 0;
+    int reserve_kb = 0;
     int trace_kb = 0;
     int trace_max = 0;
     int trace_prof = 0;
@@ -320,6 +471,8 @@ extern "C" int ag_cxx_main(int argc, char **argv)
             shot_ms = to_int(argv[++i]);
         } else if (same(argv[i], "-memstat") && i + 1 < argc) {
             memstat_ms = to_int(argv[++i]);
+        } else if (same(argv[i], "-reserve") && i + 1 < argc) {
+            reserve_kb = to_int(argv[++i]);
         } else if (same(argv[i], "-mallocs") && i + 2 < argc) {
             trace_kb = to_int(argv[++i]);
             trace_max = to_int(argv[++i]);
@@ -361,6 +514,10 @@ extern "C" int ag_cxx_main(int argc, char **argv)
         sdl_shim_screenshot(shot, frames, shot_ms);
     }
     ag_libc_oom_sink(on_out_of_arena);
+    /* Before the engine has taken anything, so the hole is certain and is one
+     * piece - and only if asked for.  See on_out_of_arena. */
+    fallout_reserve_kb(reserve_kb);
+    reserve_take();
 
     if (watchdog_set) {
         sdl_shim_watchdog((unsigned)watchdog_s * 1000u);

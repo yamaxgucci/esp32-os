@@ -364,6 +364,10 @@ static void log_line(const char *text)
  * second one would have to walk the varargs again, and a line that differs
  * between the console and the file is worse than no file.
  */
+/* In fallout_main.cc: the arena reserve, re-armed from here because
+ * this is the one place that runs every frame. */
+extern "C" void fallout_reserve_tick(void);
+
 static void shim_printf(const char *fmt, ...)
 {
     char line[320];
@@ -2514,6 +2518,11 @@ void SDL_RenderPresent(SDL_Renderer *r)
          * present hands over rather than waiting for the next one. */
         hud_tick();
         hud_draw();
+
+        /* The arena reserve takes itself back once the crisis has
+         * passed.  Cheap: a pointer test, and ag_meminfo only when it
+         * is actually gone.  See on_out_of_arena in fallout_main.cc. */
+        fallout_reserve_tick();
 
         /*
          * Only what was drawn into, handed to the display with one flush.
