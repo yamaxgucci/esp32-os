@@ -1873,7 +1873,7 @@ static void hud_char(int x, int y, char c, Uint16 colour)
     if (c == ' ') {
         return;
     }
-    for (int i = 0; k_hud_letters[i] != ' '; ++i) {
+    for (int i = 0; k_hud_letters[i] != '\0'; ++i) {
         if (k_hud_letters[i] != c) {
             continue;
         }
@@ -1901,7 +1901,7 @@ static void hud_char(int x, int y, char c, Uint16 colour)
 
 static int hud_text(int x, int y, const char *text, Uint16 colour)
 {
-    for (; *text != ' '; ++text) {
+    for (; *text != '\0'; ++text) {
         hud_char(x, y, *text, colour);
         x += 4;
     }
