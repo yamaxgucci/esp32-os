@@ -254,6 +254,11 @@ static SDL_Surface *s_panel_src;
 static SDL_Surface *s_panel_dst;
 static int s_pan_x;           /* the window's origin, in picture pixels */
 static int s_pan_y;
+/* What the last repaint actually wrote, and what it read from: for the report
+ * beside the key, which is the only way to tell a view that did not move from
+ * one that moved and was not sent. */
+static int s_pan_bx0, s_pan_by0, s_pan_bx1, s_pan_by1;
+static int s_pan_sw, s_pan_sh;
 
 /*
  * How much smaller the panel is than the picture, as a shift.  Zero when they
@@ -830,6 +835,24 @@ static void fps_service(void)
                   ag_tiledist_calls, ag_tiledist_steps,
                   ag_tiledist_gaveup);
         /*
+         * What the arena looks like right now, on the same schedule.  A leak
+         * across a map change is invisible from the desk unless the number is
+         * printed on both sides of it: the dialogue surface needs 300 KB in
+         * one piece and works before the temple and not after, so the thing
+         * to watch is not the total but the largest block - before entering
+         * and after leaving.  Once per stats window, so the 12 ms ag_meminfo
+         * costs is paid ninety frames apart.
+         */
+        {
+            ag_meminfo_t mi;
+            ag_meminfo(&mi);
+            shim_printf("[arena t=%u] %u of %u KB free, largest %u B\n",
+                      (unsigned)ag_millis(),
+                      (unsigned)(mi.arena_free / 1024u),
+                      (unsigned)(mi.arena_total / 1024u),
+                      (unsigned)mi.arena_largest);
+        }
+        /*
          * And what the hands did, because on a board that is the question
          * nobody can answer by looking.  The screen is at the far end of a
          * wire and the console is somewhere else again, so "the mouse does
@@ -1367,9 +1390,29 @@ int SDL_UpperBlit(SDL_Surface *src, const SDL_Rect *srcrect, SDL_Surface *dst,
         /* The ordinary case, and the one that runs three hundred thousand
          * times a frame: no arithmetic in the inner loop that was not there
          * before the panel could be smaller. */
+        /*
+         * Where the source starts, after the destination was clamped.
+         *
+         * The clamp above pushes ddx and ddy up to zero when the destination
+         * origin is negative and takes the difference off the width; it does
+         * not move the source, and this path used to read from sx and sy as
+         * written. That is harmless while dx and dy are non-negative, which
+         * they always were - until one to one made dx = -s_pan_x. Then the
+         * window moved, the destination was clamped straight back to the left
+         * edge, and the same pixels as before were copied: the panel did not
+         * change, the comparison found nothing to write, and the report said
+         * `wrote 32767,32767..-1,-1` - an empty rectangle - after every arrow.
+         *
+         * The two scaled paths below never had this: they compute the source
+         * column as sx + (((ddx + x) << shift) - dx), which carries the clamp
+         * with it. This is the same expression with shift zero, hoisted out of
+         * the loop because it does not depend on x or y.
+         */
+        const int soffx = sx + (ddx - dx);
+        const int soffy = sy + (ddy - dy);
         for (int y = 0; y < ddh; ++y) {
             const Uint8 *s = (const Uint8 *)src->pixels +
-                             (size_t)(sy + y) * src->pitch + sx;
+                             (size_t)(soffy + y) * src->pitch + soffx;
             Uint16 *d = (Uint16 *)((Uint8 *)dst->pixels +
                                    (size_t)(ddy + y) * dst->pitch) + ddx;
             int rx0 = ddw, rx1 = -1;
@@ -1481,8 +1524,26 @@ int SDL_UpperBlit(SDL_Surface *src, const SDL_Rect *srcrect, SDL_Surface *dst,
         if (cx1 >= cx0 && cy1 >= cy0) {
             dirty_add(ddx + cx0, ddy + cy0, cx1 - cx0 + 1, cy1 - cy0 + 1);
         }
-        s_panel_src = src;
-        s_panel_dst = dst;
+        /*
+         * Only the whole picture is worth remembering.
+         *
+         * The engine composes into one 640x480 surface and blits that, but it
+         * also blits individual windows straight at the panel - a dialogue
+         * box, a message line - and whichever came last used to be what a
+         * moved window redrew.  So moving the view redrew a dialogue box at a
+         * new offset and left everything around it where it was: "a little
+         * piece of the screen moves and the rest stands still", reported
+         * exactly so, twice.
+         *
+         * The picture is the panel scaled back up by the reduction: 320x240
+         * and a shift of one is 640x480.  Anything smaller is a part, not the
+         * whole, and a part cannot repaint the view.
+         */
+        if (src->w >= (int)(s_gfx.width << s_panel_shift) &&
+            src->h >= (int)(s_gfx.height << s_panel_shift)) {
+            s_panel_src = src;
+            s_panel_dst = dst;
+        }
     }
     return 0;
 }
@@ -1502,7 +1563,49 @@ static void panel_repaint(void)
 
     SDL_Rect srcrect = { 0, 0, s_panel_src->w, s_panel_src->h };
     SDL_Rect dstrect = { 0, 0, 0, 0 };
+
+    /*
+     * What the blit itself thinks changed, kept for the report beside the key.
+     * "The arrows do nothing" has one more meaning than the three already
+     * listed: the window moved, the whole panel was marked, and the pixels
+     * written turned out to be the same ones - which would say the source is
+     * not the picture at all.  Cleared first so the box below is this blit's
+     * own and not last frame's; nothing is lost, because the whole panel is
+     * marked immediately after.
+     */
+    dirty_none();
     SDL_UpperBlit(s_panel_src, &srcrect, s_panel_dst, &dstrect);
+    s_pan_bx0 = s_dirty_x0;
+    s_pan_by0 = s_dirty_y0;
+    s_pan_bx1 = s_dirty_x1;
+    s_pan_by1 = s_dirty_y1;
+    s_pan_sw = s_panel_src->w;
+    s_pan_sh = s_panel_src->h;
+
+    /*
+     * And send it, here, rather than leaving it for the next frame.
+     *
+     * The blit above only fills the panel in memory; what puts it on the far
+     * end is the flush, and the flush runs on the engine's frame.  Moving the
+     * window is precisely the case where the engine is not drawing - it is
+     * sitting on a menu or a dialogue box, which is why somebody wanted a
+     * closer look in the first place - so the new view sat in memory and the
+     * only thing that reached the glass was whatever small rectangle some
+     * other part of the game happened to dirty.  Reported exactly so: "one
+     * block moves and blinks and the picture as a whole stands still".
+     *
+     * The whole panel, because the whole panel changed: every pixel of it now
+     * comes from somewhere else in the picture.
+     *
+     * Marked, not flushed.  This runs on the event pump, and flushing from
+     * there reaches into a display device the wire task is already holding -
+     * the first attempt did exactly that and the key stopped being handled at
+     * all: not even the line below F8 was printed, because the flush above it
+     * never came back.  The present on the engine's own thread is a few
+     * milliseconds away and it sends whatever is marked, which is the whole
+     * panel.
+     */
+    dirty_add(0, 0, (int)s_gfx.width, (int)s_gfx.height);
 }
 
 /* ---- time ---------------------------------------------------------------- */
@@ -2997,6 +3100,18 @@ static void pump(void)
                     if (moved) {
                         pan_clamp();
                         panel_repaint();
+                        /* Said out loud because "the arrows do nothing" has
+                         * three possible meanings - the key never arrived, the
+                         * window did not move, or it moved and the far end was
+                         * not told - and from the desk they look the same. */
+                        ag_printf("panel: window at %d,%d of %dx%d; source "
+                                  "%dx%d wrote %d,%d..%d,%d; damage "
+                                  "%d,%d..%d,%d\n",
+                                  s_pan_x, s_pan_y, (int)s_gfx.width,
+                                  (int)s_gfx.height, s_pan_sw, s_pan_sh,
+                                  s_pan_bx0, s_pan_by0, s_pan_bx1, s_pan_by1,
+                                  s_dirty_x0, s_dirty_y0, s_dirty_x1,
+                                  s_dirty_y1);
                         continue;
                     }
                 }
