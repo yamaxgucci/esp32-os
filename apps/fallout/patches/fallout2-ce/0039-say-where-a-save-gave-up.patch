@@ -1,0 +1,103 @@
+diff --git a/src/loadsave.cc b/src/loadsave.cc
+--- a/src/loadsave.cc
++++ b/src/loadsave.cc
+@@ -2457,10 +2457,12 @@
+ static int _GameMap2Slot(File* stream)
+ {
+     if (_partyMemberPrepSave() == -1) {
++        debugPrint("\nLOADSAVE: map2slot gave up at 1\n");
+         return -1;
+     }
+ 
+     if (_map_save_in_game(false) == -1) {
++        debugPrint("\nLOADSAVE: map2slot gave up at 2\n");
+         return -1;
+     }
+ 
+@@ -2481,6 +2483,8 @@
+         snprintf(_str0, sizeof(_str0), "%s%s\\%s", _patches, critterItemPath, path);
+         snprintf(_str1, sizeof(_str1), "%s%s\\%s%.2d\\%s\\%s", _patches, "SAVEGAME", "SLOT", _slot_cursor + 1, critterItemPath, path);
+         if (fileCopyCompressed(_str0, _str1) == -1) {
++            debugPrint("\nLOADSAVE: map2slot gave up at 3: %s -> %s\n",
++                       _str0, _str1);
+             return -1;
+         }
+     }
+@@ -2490,16 +2494,19 @@
+     char** fileNameList;
+     int fileNameListLength = fileNameListInit(_str0, &fileNameList, 0, 0);
+     if (fileNameListLength == -1) {
++        debugPrint("\nLOADSAVE: map2slot gave up at 4\n");
+         return -1;
+     }
+ 
+     if (fileWriteInt32(stream, fileNameListLength) == -1) {
+         fileNameListFree(&fileNameList, 0);
++        debugPrint("\nLOADSAVE: map2slot gave up at 5\n");
+         return -1;
+     }
+ 
+     if (fileNameListLength == 0) {
+         fileNameListFree(&fileNameList, 0);
++        debugPrint("\nLOADSAVE: map2slot gave up at 6\n");
+         return -1;
+     }
+ 
+@@ -2507,6 +2514,7 @@
+ 
+     if (MapDirErase(_gmpath, "SAV") == -1) {
+         fileNameListFree(&fileNameList, 0);
++        debugPrint("\nLOADSAVE: map2slot gave up at 7\n");
+         return -1;
+     }
+ 
+@@ -2519,6 +2527,7 @@
+         char* string = fileNameList[index];
+         if (fileWrite(string, strlen(string) + 1, 1, stream) == -1) {
+             fileNameListFree(&fileNameList, 0);
++            debugPrint("\nLOADSAVE: map2slot gave up at 8\n");
+             return -1;
+         }
+ 
+@@ -2526,6 +2535,7 @@
+         snprintf(_str1, sizeof(_str1), "%s%s\\%s%.2d\\%s", _patches, "SAVEGAME", "SLOT", _slot_cursor + 1, string);
+         if (fileCopyCompressed(_str0, _str1) == -1) {
+             fileNameListFree(&fileNameList, 0);
++            debugPrint("\nLOADSAVE: map2slot gave up at 9\n");
+             return -1;
+         }
+     }
+@@ -2537,28 +2547,33 @@
+     snprintf(_str0, sizeof(_str0), "%s%s\\%s", _patches, "MAPS", "AUTOMAP.DB");
+ 
+     if (fileCopyCompressed(_str0, _str1) == -1) {
++        debugPrint("\nLOADSAVE: map2slot gave up at 10\n");
+         return -1;
+     }
+ 
+     snprintf(_str0, sizeof(_str0), "%s\\%s", "MAPS", "AUTOMAP.DB");
+     File* inStream = fileOpen(_str0, "rb");
+     if (inStream == nullptr) {
++        debugPrint("\nLOADSAVE: map2slot gave up at 11\n");
+         return -1;
+     }
+ 
+     int fileSize = fileGetSize(inStream);
+     if (fileSize == -1) {
+         fileClose(inStream);
++        debugPrint("\nLOADSAVE: map2slot gave up at 12\n");
+         return -1;
+     }
+ 
+     fileClose(inStream);
+ 
+     if (fileWriteInt32(stream, fileSize) == -1) {
++        debugPrint("\nLOADSAVE: map2slot gave up at 13\n");
+         return -1;
+     }
+ 
+     if (_partyMemberUnPrepSave() == -1) {
++        debugPrint("\nLOADSAVE: map2slot gave up at 14\n");
+         return -1;
+     }
+ 

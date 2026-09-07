@@ -224,6 +224,67 @@ extern "C" int ag_script_cache = 0;
  * fallout2.cfg stands. */
 extern "C" int ag_art_cache_kb = 0;
 
+/*
+ * The directories a save needs, made before the engine is entered.
+ *
+ * The engine makes them itself - and cannot, here. It builds them as
+ * "<master_patches>\\SAVEGAME", and this port runs with master_patches empty
+ * (see fallout2.cfg: the loose-folder search path costs about 75 KB of arena
+ * and there is no patched art to install). Empty leaves "\\SAVEGAME", while the
+ * file it then opens is the relative "SAVEGAME\\SLOT01\\SAVE.DAT" - and whether
+ * those two land in the same place is not something the engine's own mkdir
+ * checks: it ignores the result and carries on to fail at the fopen with
+ * "** Error opening save game for writing! **".
+ *
+ * Measured on the board: no A:\\SAVEGAME, no A:\\MAPS, and saving impossible.
+ * Rather than rewrite twenty-five path expressions in the engine, make the
+ * directories here, with exactly the relative paths the engine's writes use.
+ * Ten slots because the save menu offers ten, and proto/critters and
+ * proto/items because lsgPerformSaveGame makes them per slot.
+ *
+ * Failure is not reported: a directory that exists already fails the same way
+ * as one that cannot be made, and this runs on every start.
+ */
+static void make_save_dirs(void)
+{
+    /* Built by hand: this file keeps clear of the toolchain's stdio, and two
+     * digits and a tail are not worth an snprintf. */
+    static const char *const kTails[] = {
+        "", "\\proto", "\\proto\\critters", "\\proto\\items",
+    };
+    char path[64];
+
+    ag_mkdir("SAVEGAME");
+    ag_mkdir("MAPS");
+    /*
+     * And where the engine keeps modified prototypes.  Saving copies these
+     * into the slot with a plain fopen - not through the archive - so they
+     * have to exist as loose files, and they cannot exist if the directory
+     * the engine writes them to does not.  Without these two the save dies at
+     * the first party member with "Error writing save function #3 data", and
+     * the only trace is opendir(proto/critters) refused: not found.
+     */
+    ag_mkdir("proto");
+    ag_mkdir("proto\\critters");
+    ag_mkdir("proto\\items");
+    for (int slot = 1; slot <= 10; slot++) {
+        for (unsigned t = 0; t < sizeof(kTails) / sizeof(kTails[0]); t++) {
+            const char *tail = kTails[t];
+            unsigned at = 0;
+            for (const char *p = "SAVEGAME\\SLOT"; *p != '\0'; p++) {
+                path[at++] = *p;
+            }
+            path[at++] = (char)('0' + slot / 10);
+            path[at++] = (char)('0' + slot % 10);
+            for (const char *p = tail; *p != '\0'; p++) {
+                path[at++] = *p;
+            }
+            path[at] = '\0';
+            ag_mkdir(path);
+        }
+    }
+}
+
 extern "C" int ag_cxx_main(int argc, char **argv)
 {
     /* argv[0] is not decoration here: sfall builds the path of ddraw.ini from
@@ -315,6 +376,8 @@ extern "C" int ag_cxx_main(int argc, char **argv)
     sdl_shim_recinput(recinput);
     sdl_shim_events(events || hud);
     sdl_shim_hud(hud);
+
+    make_save_dirs();
 
     const int rc = main(out, argv);
 

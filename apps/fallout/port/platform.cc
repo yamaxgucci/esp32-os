@@ -31,8 +31,56 @@ DIR *opendir(const char *path)
         return NULL;
     }
 
-    ag_handle_t h = ag_opendir(path);
+    /*
+     * ARGON: tidy the path before asking, because the engine's callers do not.
+     *
+     * fileFindFirst splits a pattern into a directory and a mask and opens the
+     * directory part, which for "MAPS\\*.SAV" is "MAPS/" - with the separator
+     * still on the end.  compat_resolve_path opens "." for a relative path.
+     * Neither spelling is what the filesystem wants, and what it costs is not
+     * a message: xlistEnumerate simply finds nothing, fileNameListInit returns
+     * zero, and loadsave.cc treats zero files as a failed save - which is what
+     * "** Error writing save function #3 data! **" was, with ARTEMPLE.SAV
+     * sitting on the card the whole time.
+     *
+     * So: backslashes become slashes, a trailing separator is dropped, and an
+     * empty path or "." means where we are.  A path of "/" keeps its slash.
+     */
+    char fixed[256];
+    size_t n = 0;
+    while (path[n] != '\0' && n + 1u < sizeof(fixed)) {
+        fixed[n] = (path[n] == '\\') ? '/' : path[n];
+        n++;
+    }
+    fixed[n] = '\0';
+    while (n > 1u && fixed[n - 1u] == '/') {
+        fixed[--n] = '\0';
+    }
+    if (n == 0u || (n == 1u && fixed[0] == '.')) {
+        fixed[0] = '.';
+        fixed[1] = '\0';
+    }
+
+    ag_handle_t h = ag_opendir(fixed);
+    if (h < 0 && fixed[0] == '.' && fixed[1] == '\0') {
+        /* "." is not a name the filesystem knows; the process's own directory
+         * is what an empty path means to it. */
+        h = ag_opendir("");
+    }
     if (h < 0) {
+        /*
+         * Said out loud, a few times and then never again.  A directory that
+         * will not open is invisible everywhere it matters - the save that
+         * cannot list its maps, the .DAT search that finds no loose files -
+         * and none of those callers report anything at all.  Eight lines is
+         * enough to see which path and which error, and few enough that a
+         * game which asks constantly does not drown the console.
+         */
+        static int moaned;
+        if (moaned < 8) {
+            moaned++;
+            ag_printf("opendir(%s) refused: %s\n", fixed, ag_strerror(h));
+        }
         return NULL;
     }
 
