@@ -930,6 +930,9 @@ static uint32_t stat32(uint32_t at)
            ((uint32_t)s_stat[at + 3u] << 24);
 }
 
+/* Defined with the palette, far below; wanted here, by the far end's "again". */
+static void pal_owe(void);
+
 static void poll_far_end(void)
 {
     uint8_t buf[16];
@@ -1006,6 +1009,26 @@ static void poll_far_end(void)
                     s_sweep_asked_at = now;
                     s_sweep_at = 0;
                     s_sweep_owed = 1u;
+                    /*
+                     * ARGON: and the colours with it, here rather than only in
+                     * the repair path.
+                     *
+                     * The repair path runs when the game is not drawing.  A
+                     * far end that restarted while the game *is* drawing is
+                     * the commoner case and was not covered: it receives
+                     * indices at 24 KB/s, has no palette to read them with,
+                     * and reports `pal 0/0, 0 blocks/s` for ever - measured,
+                     * exactly that, with the sender showing 17 frames a second
+                     * going out perfectly well.
+                     *
+                     * The palette otherwise rides along only when it changes
+                     * or on every sixty-fourth frame, and sixty-four frames of
+                     * undecodable pixels is four seconds of nothing at the one
+                     * moment somebody is watching to see whether it comes
+                     * back.  Asking is rate limited two lines above, so this
+                     * cannot become a palette per frame.
+                     */
+                    pal_owe();
                 }
             }
         }
@@ -1991,6 +2014,21 @@ static uint32_t huf_encode(const uint8_t *src, uint32_t n, uint8_t *dst,
  */
 static bool s_force = true;
 
+/*
+ * "You have no palette": say the colours again on the next frame, and send
+ * that frame whole.
+ *
+ * Whole matters as much as the colours do.  Trimming sends only the blocks
+ * that differ from what the far end is believed to hold, and a far end that
+ * has just restarted holds nothing - so a trimmed frame after a restart is a
+ * frame with almost nothing in it, on top of a screen with nothing on it.
+ */
+static void pal_owe(void)
+{
+    s_pal_sent = (uint16_t)(s_pal_gen - 1u);
+    s_force = true;
+}
+
 static void pal_clear(void)
 {
     memset(s_pmap, 0xff, sizeof(s_pmap));
@@ -2484,19 +2522,77 @@ static void budget_spend(uint32_t bytes)
  * that one arrived broken, and it says so.  Unasked, nothing is sent: a screen
  * with nothing missing needs no repair, which is the whole point.
  */
-static bool sweep_step(uint32_t *x, uint32_t *y, uint32_t *w, uint32_t *h)
+/*
+ * ARGON, and the reason this is now called from the wire task rather than not
+ * at all.
+ *
+ * As written, sweep_step was defined, mentioned in a comment eight hundred
+ * lines above, and never invoked from anywhere.  So FR_HELLO set s_sweep_owed
+ * and nothing ever read it: the far end could ask for the picture as often as
+ * it liked and the answer was silence.  What that looks like from the desk is
+ * a monitor that was unplugged, or reset, or that lost the palette to a
+ * moment of noise, and then shows running console text for ever - which is
+ * exactly the report.
+ *
+ * The second half of the same bug is the text guard that used to be here:
+ *
+ *     if (s_last_blit_us == 0 || s_last_text_us > s_last_blit_us) return false;
+ *
+ * Text takes the glass two seconds after the last band of picture, and a game
+ * sitting on a modal dialogue paints nothing - so text owns the glass, the
+ * repair refuses to run because text owns the glass, and nothing can ever
+ * paint again.  A deadlock with no way out but restarting the game.
+ *
+ * The far end asking *is* the case for taking the glass back: it has nothing
+ * to show and is saying so.  So the guard now only refuses when no picture has
+ * ever been drawn - there is nothing to repair before the first frame - and
+ * who painted last decides everything else, as before.
+ */
+static bool sweep_due(void)
 {
     if (s_hash == NULL || s_hash_rows == 0u || s_fb_w == 0u) {
         return false;
     }
-    /* Nobody has drawn a picture, or the console has the screen back. */
-    if (s_last_blit_us == 0ull || s_last_text_us > s_last_blit_us) {
-        return false;
+    if (s_last_blit_us == 0ull) {
+        return false; /* nobody has ever drawn a picture */
     }
+    const uint64_t now = (uint64_t)ag_api()->time->us();
+
+    /*
+     * ARGON: and take the glass back from the console, on a clock.
+     *
+     * The rest of this function answers the far end asking - and the far end
+     * cannot ask.  Read the receiver: monitor.c has FR_RESEND for a slice
+     * missing out of a frame it is already decoding, and nothing whatever for
+     * "I have just started, send me everything".  FR_HELLO does not appear in
+     * its source at all.  So the sender's whole repair path was waiting on a
+     * message that is never sent.
+     *
+     * What that costs shows up the moment the picture stops moving.  Text
+     * takes the glass two seconds after the last band (TEXT_YIELDS_US), the
+     * game prints to its console every second, and a game sitting on a menu, a
+     * dialogue box or a pause draws nothing - so text wins, and keeps winning,
+     * because the only thing that could take the glass back is a picture and
+     * the only thing that sends a picture is the game drawing.  On the glass
+     * that is running console text where a game should be, for ever, and it is
+     * exactly what was reported twice today.
+     *
+     * So: while an application is alive and has drawn at some point, and the
+     * console currently owns the glass, put the picture back on it every few
+     * seconds.  A whole screen is about 20 KB against 400 KB/s of wire - half
+     * a per cent - and on a picture that has not changed the trimming makes
+     * the next one nearly free.  Sixty seconds since the last blit means the
+     * application has gone and the console should keep the screen.
+     */
+    if (s_sweep_owed == 0u && s_last_text_us > s_last_blit_us &&
+        now - s_last_blit_us < 60000000ull && now - s_sweep_at >= 3000000ull) {
+        s_sweep_owed = 1u;
+        s_sweep_at = 0ull;
+    }
+
     if (s_sweep_owed == 0u) {
         return false; /* nothing is missing */
     }
-    const uint64_t now = (uint64_t)ag_api()->time->us();
     if (now < s_sweep_at) {
         return false;
     }
@@ -2513,11 +2609,21 @@ static bool sweep_step(uint32_t *x, uint32_t *y, uint32_t *w, uint32_t *h)
      * first repair sends everything and the next one sends nothing.
      */
     hash_forget();
-    *x = 0;
-    *y = 0;
-    *w = s_fb_w;
-    *h = s_fb_h;
-    return *w != 0u && *h != 0u;
+
+    /*
+     * And the colours, because a far end that has just started has no palette
+     * and cannot read a single index without one.  The palette normally rides
+     * along every sixty-fourth frame, which is fine while frames are being
+     * produced and no use at all when the game has stopped drawing - which is
+     * the case this whole function exists for.  Measured on the receiver in
+     * that state: `pal 0/0, 0 blocks/s, 28396 B/s in (91631 stray)` - bytes
+     * arriving perfectly well and every one of them undecodable.
+     *
+     * s_force also makes the frame go out whole rather than trimmed against a
+     * belief about the far end that a restarted far end does not share.
+     */
+    pal_owe();
+    return s_fb_w != 0u && s_fb_h != 0u;
 }
 
 /*
@@ -3526,13 +3632,24 @@ static void wire_task(void *arg)
          * all, so nothing of the game's own can be blamed or credited.
          */
         if (!s_have_copy && !SEND_ALWAYS) {
-            const uint64_t w0 = (uint64_t)ag_api()->time->us();
-            s_want_copy = true;
-            s_loops++;
-            wire_idle_traffic();
-            ag_delay(2);
-            s_t_wait_us += (uint32_t)((uint64_t)ag_api()->time->us() - w0);
-            continue;
+            /*
+             * Unless the far end has asked for the picture and the game is not
+             * going to draw one.  The driver is holding the last frame - that
+             * is what the 150 KB here is - so it can answer by itself, and the
+             * ordinary path below sends it.  Without this the answer to
+             * "I have nothing, send it again" is to wait for a game that is
+             * sitting on a dialogue box, which is for ever.
+             */
+            if (!sweep_due()) {
+                const uint64_t w0 = (uint64_t)ag_api()->time->us();
+                s_want_copy = true;
+                s_loops++;
+                wire_idle_traffic();
+                ag_delay(2);
+                s_t_wait_us += (uint32_t)((uint64_t)ag_api()->time->us() - w0);
+                continue;
+            }
+            s_have_copy = true;
         }
         /* What the last frame actually waited for the game, kept whole: the
          * running total was being printed mid-wait and read as the answer. */
