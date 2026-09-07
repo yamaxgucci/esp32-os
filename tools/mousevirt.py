@@ -636,8 +636,7 @@ def main() -> int:
                         if n == len(pkt):
                             prev_x, prev_y, prev_btn = gx, gy, buttons
                             if rec is not None:
-                                rec.write("M %d %d %d %d %d %d
-" % (
+                                rec.write("M %d %d %d %d %d %d\n" % (
                                     int((time.monotonic() - rec_t0) * 1000),
                                     typ, buttons, gx, gy, w8))
                                 rec.flush()
