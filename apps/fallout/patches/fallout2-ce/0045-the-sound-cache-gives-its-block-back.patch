@@ -1,0 +1,105 @@
+diff --git a/src/sound_effects_cache.cc b/src/sound_effects_cache.cc
+--- a/src/sound_effects_cache.cc
++++ b/src/sound_effects_cache.cc
+@@ -8,6 +8,8 @@
+ 
+ #include "cache.h"
+ #include "db.h"
++/* ARGON: for the one line soundEffectsCachePark says about itself. */
++#include "debug.h"
+ #include "memory.h"
+ #include "settings.h"
+ #include "sound_decoder.h"
+@@ -152,6 +154,73 @@
+     }
+ }
+ 
++/*
++ * ARGON: give the cache's whole block back to the arena, and take it later.
++ *
++ * soundEffectsCacheFlush frees the entries *inside* the cache and nothing
++ * else, which is the right thing when the problem is the cache being full and
++ * the wrong thing when the problem is the arena. The cache is one
++ * internal_malloc of cache_size - 257 KB with the setting this port uses, in a
++ * single contiguous block - and the arena's trouble is almost never the total:
++ * measured at the moment a save load was refused, 7 September 2026,
++ *
++ *     refused 127888 B: 5449 KB used of 5604, largest hole 118784 B
++ *
++ * so 155 KB free, 116 KB of it in one piece, and a request for 125. The
++ * refusal hook had already flushed both caches by then and it changed nothing,
++ * because a flush of either returns no bytes at all to the arena. This does:
++ * one block of 257 KB, which is twice what that refusal needed.
++ *
++ * Safe at exactly the two moments it is used - a refused allocation and a map
++ * load - because nothing is playing then and every entry is a copy of a file
++ * on the card. A parked cache reports itself uninitialised, so
++ * soundEffectsCacheFileOpen refuses politely and the engine's own "sound will
++ * not play" path handles it, which patch 0030 already relies on.
++ *
++ * The handles, the effects list and the path stay: they are a few kilobytes
++ * and rebuilding them would mean reading sndlist.lst again.
++ */
++static bool gSoundEffectsCacheParked = false;
++static int  gSoundEffectsCacheSize = 0;
++
++bool soundEffectsCachePark()
++{
++    if (!gSoundEffectsCacheInitialized || gSoundEffectsCacheParked) {
++        return false;
++    }
++    gSoundEffectsCacheSize = gSoundEffectsCache->maxSize;
++    cacheFree(gSoundEffectsCache);
++    gSoundEffectsCacheInitialized = false;
++    gSoundEffectsCacheParked = true;
++    debugPrint("\nsfxc: parked, %d KB back to the arena\n",
++        gSoundEffectsCacheSize / 1024);
++    return true;
++}
++
++bool soundEffectsCacheUnpark()
++{
++    if (!gSoundEffectsCacheParked) {
++        return false;
++    }
++    if (!cacheInit(gSoundEffectsCache, soundEffectsCacheGetFileSizeImpl,
++            soundEffectsCacheReadDataImpl, soundEffectsCacheFreeImpl,
++            gSoundEffectsCacheSize)) {
++        /* Still parked, and it will be tried again: an arena that cannot
++         * spare 257 KB now may be able to in a second, and the game plays
++         * without sound effects in the meantime rather than not at all. */
++        return false;
++    }
++    gSoundEffectsCacheInitialized = true;
++    gSoundEffectsCacheParked = false;
++    debugPrint("\nsfxc: back, %d KB\n", gSoundEffectsCacheSize / 1024);
++    return true;
++}
++
++bool soundEffectsCacheIsParked()
++{
++    return gSoundEffectsCacheParked;
++}
++
+ // sfxc_cached_open
+ // 0x4A915C
+ int soundEffectsCacheFileOpen(const char* fname, int* sampleRate)
+diff --git a/src/sound_effects_cache.h b/src/sound_effects_cache.h
+--- a/src/sound_effects_cache.h
++++ b/src/sound_effects_cache.h
+@@ -11,6 +11,15 @@
+ void soundEffectsCacheExit();
+ int soundEffectsCacheInitialized();
+ void soundEffectsCacheFlush();
++/*
++ * ARGON: hand the cache's whole 257 KB block back to the arena, and take it
++ * again once the peak has passed.  A flush frees the entries inside the cache
++ * and returns nothing to the arena; this returns the block.  See the note in
++ * sound_effects_cache.cc for the measurement that made it necessary.
++ */
++bool soundEffectsCachePark();
++bool soundEffectsCacheUnpark();
++bool soundEffectsCacheIsParked();
+ int soundEffectsCacheFileOpen(const char* fname, int* sampleRate);
+ int soundEffectsCacheFileClose(int handle);
+ int soundEffectsCacheFileRead(int handle, void* buf, unsigned int size);

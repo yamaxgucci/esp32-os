@@ -80,6 +80,11 @@ int artCacheFlush();
 /* Same shape and the same reason: every entry is a copy of a file on the card,
  * and nothing is playing while a map loads.  296 KB, measured. */
 void soundEffectsCacheFlush();
+/* And the one that actually gives the arena bytes rather than freeing entries
+ * inside a block it keeps: 257 KB in one piece.  See patch 0045. */
+bool soundEffectsCachePark();
+bool soundEffectsCacheUnpark();
+bool soundEffectsCacheIsParked();
 }
 
 /*
@@ -187,6 +192,28 @@ static void reserve_take(void)
  */
 extern "C" void fallout_reserve_tick(void)
 {
+    /*
+     * ARGON: the sound cache comes back here, once the peak has passed.
+     *
+     * Parked by on_out_of_arena, which needed its 257 KB as one hole.  Taken
+     * again when there is twice that free in one piece, so that taking it back
+     * cannot itself cause the next refusal - the same rule the reserve below
+     * uses, and for the same reason.  Sound effects are silent until then;
+     * music is not affected, it does not come through this cache.
+     */
+    if (fallout::soundEffectsCacheIsParked()) {
+        static unsigned sfx_ms;
+        const unsigned  t = (unsigned)ag_millis();
+        if (sfx_ms == 0u || t - sfx_ms >= 2000u) {
+            sfx_ms = t;
+            ag_meminfo_t si;
+            ag_meminfo(&si);
+            if (si.arena_largest >= 600u * 1024u) {
+                (void)fallout::soundEffectsCacheUnpark();
+            }
+        }
+    }
+
     if (s_reserve != NULL || s_reserve_bytes == 0u) {
         return;
     }
@@ -261,6 +288,30 @@ static int on_out_of_arena(__SIZE_TYPE__ wanted)
                   "(largest now %u B)\n",
                   (unsigned)wanted, (unsigned)mi.arena_largest);
         return 1;
+    }
+
+    /*
+     * ARGON: and then the sound cache's whole block, which is the one thing
+     * here that hands the arena a large *contiguous* piece.
+     *
+     * Measured at the moment a save load was refused, 7 September 2026:
+     *
+     *     refused 127888 B: 5449 KB used of 5604, largest hole 118784 B
+     *
+     * Both flushes above had already run and neither returned a byte to the
+     * arena - a flush frees the entries inside a cache and keeps the block.
+     * The shortfall was nine kilobytes of contiguity. This gives back 257 KB
+     * in one piece, and fallout_reserve_tick takes it again a second later
+     * once the peak has passed.
+     */
+    if (fallout::soundEffectsCachePark()) {
+        ag_meminfo(&mi);
+        if ((__SIZE_TYPE__)mi.arena_largest >= wanted) {
+            ag_printf("fallout: %u bytes refused; parking the sound cache was "
+                      "enough (largest now %u B)\n",
+                      (unsigned)wanted, (unsigned)mi.arena_largest);
+            return 1;
+        }
     }
 
     if (s_reserve != NULL) {
