@@ -1141,6 +1141,79 @@ demonstrably in the archive. `apps/common/libc` now prints the first failed
 `malloc` with the arena's state, which is what turned that into a one-line
 answer instead of an afternoon.
 
+## Saving and loading
+
+Both work as of 7 September 2026, and getting there took most of a day for one
+reason: every failure printed the same line.
+
+    LOADSAVE: ** Error writing save function #3 data! **
+
+Function #3 is `_GameMap2Slot`, which has fourteen `return -1` in it and not
+one of them said anything. Patch 0039 labels them all -
+`LOADSAVE: map2slot gave up at N` - and that is what finally named the fault
+after three wrong guesses. Keep it.
+
+### The cause: four sets of directories nobody creates
+
+`master_patches` is empty in `fallout2.cfg` and should stay empty (the
+loose-folder search path costs about 75 KB of arena, and there is no patched
+art to install). With it empty the engine writes its files relative to the
+card - and never makes the directories it writes them into, because on a real
+install they came with the game.
+
+`make_save_dirs()` in `fallout_main.cc` makes them before the engine starts,
+using exactly the relative paths the engine's writes use:
+
+    SAVEGAME, SAVEGAME\SLOT01..SLOT10, and proto\critters + proto\items in each
+    MAPS
+    proto, proto\critters, proto\items
+
+**The last three are the ones that cost the day.** `_GameMap2Slot` copies each
+party member's prototype with `fileCopyCompressed`, and that opens the source
+with a plain `compat_fopen` - *not* through the archive. So `proto\critters\*.pro`
+have to exist as loose files on the card. The engine writes them itself, but
+only into a directory that already exists, and it did not. With `A:\proto\critters`
+there, the engine filled it with 24 files of 416 bytes on the first save.
+
+### Two smaller faults on the way, both worth knowing
+
+`opendir()` was handed `MAPS/` - `fileFindFirst` splits a pattern into a
+directory and a mask and leaves the separator on the end - and `.` from
+`compat_resolve_path`. Neither opens on this filesystem, and nothing reports
+it: `xlistEnumerate` finds nothing, `fileNameListInit` returns zero, and
+loadsave.cc treats zero files as a failed save while `ARTEMPLE.SAV` is sitting
+on the card. `port/platform.cc` tidies the path now and complains eight times
+about a directory that will not open, then keeps quiet.
+
+Patch 0038 moves the path separator into the prefix, so an unset
+`master_patches` produces `SAVEGAME` and not `\SAVEGAME` - which is a path from
+the root of the filesystem and not from the card.
+
+### Rejected: master_patches=/sd
+
+It does make the engine's own directory search work, and the game then does not
+start at all: `Couldn't find/load text fonts`, and it exits before the menu.
+Written into `fallout2.cfg` beside the setting.
+
+### Loading takes about a minute and a half, and it is not the card
+
+Measured on the board with `-fps 2000`, during a load of a 62 374-byte save:
+
+    [fps t=385572] 0.40 fps, 2466930 us/frame: engine 2455227, io 49270 us
+                   (open 35105, seek 2029, read 12135; 312 KB)
+
+I/O is 2% of it. And 639 KB read in 45.7 ms elsewhere in the same load is
+14 MB/s, where the card at 10 MHz on one line carries about 1.2 MB/s - so
+nearly every read is served from cache and never reaches the card at all.
+Raising `sd.max_khz` would buy almost nothing here; the time is inside the
+engine. Worth noting separately: opening files costs more than reading them,
+35 ms for 88 opens against 12 ms for 222 reads.
+
+While it loads the engine draws no frames - `[stall] no frame for 96979 ms,
+still asking for input` - so the console takes the far end's glass and the
+screen fills with running text. That reads as a hang and is not one. See
+`docs/09-esp32-cyd.md` for what the driver now does about it.
+
 ## Notes for whoever picks this up
 
 - `ARGON_FALLOUT_LDFLAGS` is passed to the link. `-Wl,-Map=<path>` and
