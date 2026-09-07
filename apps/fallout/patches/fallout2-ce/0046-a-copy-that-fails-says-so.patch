@@ -1,0 +1,317 @@
+diff --git a/src/file_utils.cc b/src/file_utils.cc
+--- a/src/file_utils.cc
++++ b/src/file_utils.cc
+@@ -9,11 +9,13 @@
+ 
+ #include <vector>
+ 
++/* ARGON: for the one line each failure says about itself. */
++#include "debug.h"
+ #include "platform_compat.h"
+ 
+ namespace fallout {
+ 
+-static void fileCopy(const char* existingFilePath, const char* newFilePath);
++static int fileCopy(const char* existingFilePath, const char* newFilePath);
+ 
+ // 0x452740
+ int fileCopyDecompressed(const char* existingFilePath, const char* newFilePath)
+@@ -33,17 +35,39 @@
+         FILE* outStream = compat_fopen(newFilePath, "wb");
+ 
+         if (inStream != nullptr && outStream != nullptr) {
++            /*
++             * ARGON: checked and in blocks, for the reason written above
++             * _gzdecompress_file.  This is the same loop with the same two
++             * faults, and it is the one that brings AUTOMAP.DB back out of a
++             * save slot - LOADSAVE: returning 8.
++             */
++            unsigned char buffer[8192];
++            bool bad = false;
+             for (;;) {
+-                int ch = gzgetc(inStream);
+-                if (ch == -1) {
++                const int got = gzread(inStream, buffer, (unsigned)sizeof(buffer));
++                if (got < 0) {
++                    bad = true;
++                    break;
++                }
++                if (got == 0) {
++                    break;
++                }
++                if (fwrite(buffer, 1, (size_t)got, outStream) != (size_t)got) {
++                    bad = true;
+                     break;
+                 }
+-
+-                fputc(ch, outStream);
+             }
+ 
+             gzclose(inStream);
+-            fclose(outStream);
++            if (fclose(outStream) != 0) {
++                bad = true;
++            }
++            if (bad) {
++                debugPrint("\nFILEUTILS: %s -> %s did not decompress\n",
++                    existingFilePath, newFilePath);
++                compat_remove(newFilePath);
++                return -1;
++            }
+         } else {
+             if (inStream != nullptr) {
+                 gzclose(inStream);
+@@ -56,7 +80,12 @@
+             return -1;
+         }
+     } else {
+-        fileCopy(existingFilePath, newFilePath);
++        if (fileCopy(existingFilePath, newFilePath) == -1) {
++            debugPrint("\nFILEUTILS: %s -> %s did not copy\n",
++                existingFilePath, newFilePath);
++            compat_remove(newFilePath);
++            return -1;
++        }
+     }
+ 
+     return 0;
+@@ -79,7 +108,12 @@
+         // Source file is already gzipped, there is no need to do anything
+         // besides copying.
+         fclose(inStream);
+-        fileCopy(existingFilePath, newFilePath);
++        if (fileCopy(existingFilePath, newFilePath) == -1) {
++            debugPrint("\nFILEUTILS: %s -> %s did not copy\n",
++                existingFilePath, newFilePath);
++            compat_remove(newFilePath);
++            return -1;
++        }
+     } else {
+         gzFile outStream = compat_gzopen(newFilePath, "wb");
+         if (outStream == nullptr) {
+@@ -87,24 +121,95 @@
+             return -1;
+         }
+ 
+-        // Copy byte-by-byte.
++        /*
++         * ARGON: checked, and in blocks.
++         *
++         * This is the *saving* side, and it is where Maxim lost a game. It
++         * wrote the file a byte at a time with gzputc, tested nothing, and
++         * ended in an unconditional `return 0` - so the engine's own check on
++         * it, "LOADSAVE: map2slot gave up at 3", could never fire. Saving
++         * inside the Temple of Trials on 7 September 2026 therefore reported
++         * success and left this on the card:
++         *
++         *     SLOT03/ SAVE.DAT 62790  ARCAVES.SAV 0  ARTEMPLE.SAV 0
++         *             AUTOMAP.SAV 0   sfallgv.sav 36
++         *
++         * Three map files of nothing at all, and a save that cannot be loaded
++         * because there is no map in it. The same save made outside the temple
++         * wrote 12499 bytes for its map, so the difference is how much arena
++         * was left - and zlib's deflate wants about 260 KB of windows.
++         *
++         * gzclose matters as much as the writes: it is where the last block is
++         * flushed, so a failure at the very end of a file shows up only there.
++         */
++        unsigned char buffer[8192];
++        bool bad = false;
+         for (;;) {
+-            int ch = fgetc(inStream);
+-            if (ch == -1) {
++            const size_t got = fread(buffer, 1, sizeof(buffer), inStream);
++            if (got == 0) {
++                if (ferror(inStream) != 0) {
++                    bad = true;
++                }
++                break;
++            }
++            if (gzwrite(outStream, buffer, (unsigned)got) != (int)got) {
++                debugPrint("\nFILEUTILS: %s: deflating %u bytes failed - the "
++                           "card or the arena\n",
++                    newFilePath, (unsigned)got);
++                bad = true;
+                 break;
+             }
+-
+-            gzputc(outStream, ch);
+         }
+ 
+         fclose(inStream);
+-        gzclose(outStream);
++        if (gzclose(outStream) != Z_OK) {
++            debugPrint("\nFILEUTILS: %s did not finish - the last block was "
++                       "not written\n",
++                newFilePath);
++            bad = true;
++        }
++        if (bad) {
++            /* Nothing is better than a file of zero length: a save slot with
++             * an empty map in it looks complete and cannot be loaded. */
++            compat_remove(newFilePath);
++            return -1;
++        }
+     }
+ 
+     return 0;
+ }
+ 
+ // TODO: Check, implementation looks odd.
++/*
++ * ARGON: this used to write a map out one byte at a time, check nothing, and
++ * return success whatever happened.
++ *
++ * It is how a saved game is brought back: _SlotMap2Game decompresses every
++ * .SAV in the slot into MAPS\, and mapLoadSaved then reads it. The engine does
++ * test the return - LOADSAVE: returning 7 - and the test could never fire,
++ * because the old body ended in an unconditional `return 0`. So a write that
++ * failed left a truncated map behind and said nothing, and the failure
++ * surfaced two steps later as
++ *
++ *     Error reading header while loading map
++ *     LOADSAVE: returning 13
++ *     LOADSAVE: ** Error reading load function #3 data! **
++ *
++ * which reads like a corrupt save and is not one. Reported 7 September 2026:
++ * a save made inside the Temple of Trials would not load while one made
++ * outside it would, from the same session and the same card - the difference
++ * being how much arena was left when the map was written out.
++ *
++ * Two changes. Every write is checked and a failure is a failure, so the
++ * engine's own error path runs and says which file. And the copy goes in
++ * blocks of eight kilobytes instead of a byte at a time: a map is a few
++ * hundred kilobytes, which was a few hundred thousand calls through the shim's
++ * stdio for each of the maps a slot holds.
++ *
++ * A truncated file is also removed rather than left where the next attempt
++ * will find it: a partial map in MAPS\ is worse than none, because none is a
++ * missing file and a partial one is a map.
++ */
+ int _gzdecompress_file(const char* existingFilePath, const char* newFilePath)
+ {
+     FILE* stream = compat_fopen(existingFilePath, "rb");
+@@ -130,54 +235,95 @@
+             return -1;
+         }
+ 
+-        while (1) {
+-            int ch = gzgetc(gzstream);
+-            if (ch == -1) {
++        unsigned char buffer[8192];
++        bool bad = false;
++        for (;;) {
++            const int got = gzread(gzstream, buffer, (unsigned)sizeof(buffer));
++            if (got < 0) {
++                debugPrint("\nFILEUTILS: %s would not decompress\n",
++                    existingFilePath);
++                bad = true;
++                break;
++            }
++            if (got == 0) {
++                break;
++            }
++            if (fwrite(buffer, 1, (size_t)got, stream) != (size_t)got) {
++                debugPrint("\nFILEUTILS: %s: a write of %d bytes did not "
++                           "finish - the card or the arena\n",
++                    newFilePath, got);
++                bad = true;
+                 break;
+             }
+-
+-            fputc(ch, stream);
+         }
+ 
+         gzclose(gzstream);
+-        fclose(stream);
++        if (fclose(stream) != 0) {
++            debugPrint("\nFILEUTILS: %s did not close cleanly\n", newFilePath);
++            bad = true;
++        }
++        if (bad) {
++            compat_remove(newFilePath);
++            return -1;
++        }
+     } else {
+-        fileCopy(existingFilePath, newFilePath);
++        if (fileCopy(existingFilePath, newFilePath) == -1) {
++            debugPrint("\nFILEUTILS: %s -> %s did not copy\n",
++                existingFilePath, newFilePath);
++            compat_remove(newFilePath);
++            return -1;
++        }
+     }
+ 
+     return 0;
+ }
+ 
+-static void fileCopy(const char* existingFilePath, const char* newFilePath)
++/*
++ * ARGON: says whether it worked, and does not ask the arena for 64 KB to do it.
++ *
++ * The old body returned void, so its one caller could not tell a copy from a
++ * failure - and its inner loop tested `bytesWritten < 0` on a size_t, which is
++ * never true, so a short write span until fwrite returned zero and then
++ * exited the outer loop as if the file had ended. Two ways to lose a map file
++ * quietly in eight lines.
++ *
++ * The buffer was a std::vector of 0xFFFF bytes, which is 64 KB out of an arena
++ * that fails at a hundred; eight kilobytes on the stack copies at the same
++ * speed on a card whose block is 512 bytes.
++ */
++static int fileCopy(const char* existingFilePath, const char* newFilePath)
+ {
+     FILE* in = compat_fopen(existingFilePath, "rb");
++    if (in == nullptr) {
++        return -1;
++    }
+     FILE* out = compat_fopen(newFilePath, "wb");
+-    if (in != nullptr && out != nullptr) {
+-        std::vector<unsigned char> buffer(0xFFFF);
+-
+-        size_t bytesRead;
+-        while ((bytesRead = fread(buffer.data(), sizeof(*buffer.data()), buffer.size(), in)) > 0) {
+-            size_t bytesWritten;
+-            size_t offset = 0;
+-            while ((bytesWritten = fwrite(buffer.data() + offset, sizeof(*buffer.data()), bytesRead, out)) > 0) {
+-                bytesRead -= bytesWritten;
+-                offset += bytesWritten;
+-            }
++    if (out == nullptr) {
++        fclose(in);
++        return -1;
++    }
+ 
+-            if (bytesWritten < 0) {
+-                bytesRead = -1;
+-                break;
++    unsigned char buffer[8192];
++    int rc = 0;
++    for (;;) {
++        const size_t got = fread(buffer, 1, sizeof(buffer), in);
++        if (got == 0) {
++            if (ferror(in) != 0) {
++                rc = -1;
+             }
++            break;
++        }
++        if (fwrite(buffer, 1, got, out) != got) {
++            rc = -1;
++            break;
+         }
+     }
+ 
+-    if (in != nullptr) {
+-        fclose(in);
+-    }
+-
+-    if (out != nullptr) {
+-        fclose(out);
++    fclose(in);
++    if (fclose(out) != 0) {
++        rc = -1;
+     }
++    return rc;
+ }
+ 
+ } // namespace fallout
