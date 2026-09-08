@@ -29,9 +29,11 @@ realtime-эмуляции — в [07-emulator-performance.md](07-emulator-perfor
 Основная платформа **ESP32-S3** с PSRAM 8 или 16 МБ.
 **Модуль с 32 МБ PSRAM непригоден** — см. «Грабли» ниже.
 
-Плат на столе две, и они разные не только моделью: ESP32-2432S028R («CYD»,
-Xtensa LX6) — [09-esp32-cyd.md](09-esp32-cyd.md); Waveshare ESP32-C6-LCD-1.47
-(**RISC-V**, консоль по USB) — [12-esp32-c6-lcd.md](12-esp32-c6-lcd.md).
+Платы на столе разные не только моделью: ESP32-S3-WROOM CAM (основная, на ней
+Fallout, USB и своя SPI-панель) — [14-esp32-s3-cam.md](14-esp32-s3-cam.md);
+ESP32-2432S028R («CYD», Xtensa LX6) — [09-esp32-cyd.md](09-esp32-cyd.md);
+Waveshare ESP32-C6-LCD-1.47 (**RISC-V**, консоль по USB) —
+[12-esp32-c6-lcd.md](12-esp32-c6-lcd.md).
 
 ## Как работать
 
