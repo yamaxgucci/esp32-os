@@ -39,6 +39,7 @@
 #include <argon/port/usb.h>
 
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "usb/usb_host.h"
@@ -114,6 +115,87 @@ static volatile uint32_t s_reports;
  * as "completed", no errors, and nothing in the journal.
  */
 static volatile uint32_t s_cli_loops;
+
+/*
+ * ARGON: when the last report arrived, so `usb` can say how long a mouse has
+ * been quiet.
+ *
+ * Reported and nothing more.  There was a watchdog here that acted on it; see
+ * the note in the client task for why acting on silence was the fault rather
+ * than the cure.
+ */
+static volatile uint32_t s_last_report_ms;
+
+/*
+ * ARGON: when the device attached, and which HID protocol it is being asked
+ * to speak.
+ *
+ * 8 September 2026, and the fault that has cost Maxim most of a day.  The
+ * descriptor is not the problem and neither is the pipe: this receiver offers
+ * exactly one HID interface - boot subclass, protocol 2, one interrupt IN
+ * endpoint of eight bytes every four milliseconds - it is claimed, SET_PROTOCOL
+ * succeeds, the transfer is submitted for a whole packet and the library
+ * accepts it, and then no transfer ever completes.  Zero reports in two
+ * minutes, six hundred laps of a healthy task.  The same receiver and the same
+ * mouse work on a PC.
+ *
+ * The one thing this host does that a PC does not is ask for the *boot*
+ * protocol.  A PC's HID driver reads the report descriptor and leaves the
+ * device in report protocol, which is what its firmware is built around; boot
+ * protocol is the BIOS fallback, and a receiver is entitled to implement it
+ * badly or to stop reporting when it is selected.
+ *
+ * Both were tried, alternately, and neither produced a single report - so the
+ * protocol is not the answer and the switching has been taken out again.  What
+ * was left in is the printing of the first few reports as raw bytes: the
+ * layout differs between the two protocols, and reading it off a working mouse
+ * is a great deal easier than guessing it.
+ */
+static uint32_t s_attach_ms;
+static uint8_t  s_protocol = HID_PROTOCOL_BOOT;
+static uint32_t s_shown;
+
+/*
+ * ARGON: and the state of the mouse, said out loud on a schedule.
+ *
+ * Maxim, 8 September 2026: "мышь стала очень часто отваливаться, с этим надо
+ * разобраться раз и навсегда."  Every answer so far has come from typing `usb`
+ * at the prompt, and that cannot be done while he plays: the console shares the
+ * wire with the picture, and asking cost him the screen twice.  So the port
+ * says it by itself, into the log the recorder already reads.
+ *
+ * Loud on any change, quiet otherwise: a line when a device arrives or goes,
+ * and one every ten seconds while one is attached and something is wrong with
+ * it.  A healthy attached mouse says nothing at all beyond one line a minute.
+ */
+#define USB_SAY_BUSY_MS  10000u
+#define USB_SAY_IDLE_MS  60000u
+
+static uint32_t s_said_at_ms;
+
+/*
+ * ARGON: and a way back when the receiver is not seen at all.
+ *
+ * A chip reset does not cut VBUS - there is no switch on this board's OTG port
+ * - so the receiver stays powered through it.  From its own point of view it
+ * was never unplugged, so it never signals a connection again, while the host
+ * that has just restarted is waiting for exactly that signal.  Measured on
+ * 8 September 2026: after an esptool reset the mouse enumerated at once; after
+ * three RTS resets in a row, `usb: host up, waiting for a keyboard` and not one
+ * `connect on address` line, with the receiver plugged in the whole time.
+ *
+ * A full uninstall and install of the host library powers the root port down
+ * and up, which is the one thing in reach that makes an already-attached device
+ * enumerate again.  Tried a few times and then left alone: if it is not that,
+ * saying so three times is enough.
+ */
+#define USB_NO_DEVICE_MS 12000u
+#define USB_RETRIES      3
+
+static volatile bool s_restart_wanted;
+static uint32_t      s_up_at_ms;
+static uint32_t      s_retries;
+static bool          s_ever_attached;
 
 /* Set by the client callback, acted on by the client task - never open a device
  * from inside the callback, which runs under usb_host_client_handle_events. */
@@ -250,6 +332,70 @@ static int class_request(uint8_t itf, uint8_t bRequest, uint16_t wValue)
     return rc;
 }
 
+/*
+ * ARGON: read the HID report descriptor, and throw it away.
+ *
+ * Not because anything here parses it - the boot protocol exists so that
+ * nothing has to - but because some devices will not start reporting until the
+ * host has asked for it.  A PC always asks: its HID driver needs the
+ * descriptor to know the layout, so every mouse in the world has been tested
+ * with a host that reads it first, and a receiver that waits for the request
+ * is a receiver nobody ever noticed was waiting.
+ *
+ * That is the last difference left between this host and a working one, for
+ * the fault of 8 September 2026: one HID interface, correctly claimed, the
+ * interrupt transfer armed for a whole packet and accepted by the library,
+ * SET_PROTOCOL answered in both protocols, and not one report in two minutes
+ * from a receiver that works on a PC with the same mouse.
+ *
+ * The length comes from the HID class descriptor if the walk found one, and
+ * 256 otherwise: a short read is fine, the bytes are not used.
+ */
+#define HID_DESC_REPORT 0x22u
+
+static int get_report_descriptor(uint8_t itf, uint16_t len)
+{
+    if (len == 0u || len > 512u) {
+        len = 256u;
+    }
+
+    usb_transfer_t *ct = NULL;
+    if (usb_host_transfer_alloc(sizeof(usb_setup_packet_t) + len, 0, &ct)
+        != ESP_OK) {
+        return -1;
+    }
+    usb_setup_packet_t *sp = (usb_setup_packet_t *)ct->data_buffer;
+    sp->bmRequestType = USB_BM_REQUEST_TYPE_DIR_IN |
+                        USB_BM_REQUEST_TYPE_TYPE_STANDARD |
+                        USB_BM_REQUEST_TYPE_RECIP_INTERFACE;
+    sp->bRequest = USB_B_REQUEST_GET_DESCRIPTOR;
+    sp->wValue = (uint16_t)(HID_DESC_REPORT << 8);
+    sp->wIndex = itf;
+    sp->wLength = len;
+
+    ct->device_handle = s_dev;
+    ct->bEndpointAddress = 0;
+    ct->num_bytes = (int)(sizeof(usb_setup_packet_t) + len);
+    ct->callback = ctrl_cb;
+    ct->context = NULL;
+
+    s_ctrl_done = false;
+    s_ctrl_status = -1;
+    if (usb_host_transfer_submit_control(s_client, ct) != ESP_OK) {
+        usb_host_transfer_free(ct);
+        return -1;
+    }
+    for (int i = 0; i < 50 && !s_ctrl_done; i++) {
+        usb_host_client_handle_events(s_client, pdMS_TO_TICKS(20));
+    }
+    const int rc = s_ctrl_done ? s_ctrl_status : -1;
+    const int got = (int)ct->actual_num_bytes - (int)sizeof(usb_setup_packet_t);
+    ESP_LOGI(TAG, "interface %u: report descriptor asked %u, got %d (%s)",
+             itf, (unsigned)len, got, rc == 0 ? "ok" : "refused");
+    usb_host_transfer_free(ct);
+    return rc;
+}
+
 /* ---- report transfer --------------------------------------------------- */
 
 static const char *usage_name(ag_usb_usage_t u);
@@ -267,6 +413,24 @@ static void in_cb(usb_transfer_t *t)
 
     if (t->status == USB_TRANSFER_STATUS_COMPLETED) {
         s_reports++;
+        s_last_report_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        if (s_shown < 4u && t->actual_num_bytes > 0) {
+            s_shown++;
+            /* Bytes, not meaning: the layout depends on which protocol the
+             * device settled on, and that is exactly what is in doubt. */
+            ESP_LOGI(TAG, "report %u on interface %u, %d bytes: "
+                          "%02x %02x %02x %02x %02x %02x %02x %02x",
+                     (unsigned)s_reports, (q != NULL) ? q->itf : 0xFFu,
+                     t->actual_num_bytes,
+                     t->data_buffer[0],
+                     t->actual_num_bytes > 1 ? t->data_buffer[1] : 0,
+                     t->actual_num_bytes > 2 ? t->data_buffer[2] : 0,
+                     t->actual_num_bytes > 3 ? t->data_buffer[3] : 0,
+                     t->actual_num_bytes > 4 ? t->data_buffer[4] : 0,
+                     t->actual_num_bytes > 5 ? t->data_buffer[5] : 0,
+                     t->actual_num_bytes > 6 ? t->data_buffer[6] : 0,
+                     t->actual_num_bytes > 7 ? t->data_buffer[7] : 0);
+        }
         if (s_on_report != NULL && t->actual_num_bytes > 0) {
             s_on_report((q != NULL) ? q->usage : AG_USB_USAGE_OTHER, 0,
                         t->data_buffer, (uint32_t)t->actual_num_bytes);
@@ -329,6 +493,10 @@ static const char *status_name(int st)
  * retried for ever at the speed of the event loop - a mouse that has stopped
  * is worth one line in the journal, not a thousand.
  */
+/* Declared here: the client task asks for it and it is defined after, next
+ * to the two calls it makes. */
+static void restart_task(void *arg);
+
 static void pipe_recover(usb_pipe_t *q)
 {
     q->recover = false;
@@ -351,6 +519,18 @@ static void pipe_recover(usb_pipe_t *q)
     }
 
     const esp_err_t sub = usb_host_transfer_submit(q->in);
+    if (sub == ESP_ERR_NOT_FINISHED) {
+        /*
+         * ARGON: not a fault at all - the transfer is still queued, which is
+         * the normal state of an armed interrupt IN pipe waiting on a device
+         * that has nothing to say.  The first cut of this treated it as a
+         * failure and marked the pipe dead, so the watchdog meant to revive a
+         * silent mouse was the thing that finished it off.  Measured on
+         * 8 September 2026: "not answering (ESP_ERR_NOT_FINISHED)" four
+         * seconds after a clean attach.
+         */
+        return;
+    }
     if (sub != ESP_OK) {
         q->dead = true;
         ESP_LOGE(TAG, "%s on interface %u is not answering (%s); it needs the "
@@ -405,8 +585,50 @@ static void attach(uint8_t addr)
     ESP_LOGI(TAG, "device %04x:%04x, %u configuration interfaces",
              dd->idVendor, dd->idProduct, cd->bNumInterfaces);
 
+    /*
+     * ARGON: and what it actually says, descriptor by descriptor.
+     *
+     * The mouse works on a PC and delivers exactly one report here - one, at
+     * attach, and then nothing for thirty-nine minutes through five hundred
+     * and eighty-eight attempts to re-arm the endpoint.  Every explanation
+     * left is about *which* interface and *which* endpoint, and this walk has
+     * never once printed what it saw: `usb` says "mouse interface 0 ep 0x82",
+     * and on a receiver of this kind interface 0 is usually the keyboard.
+     * Twelve lines of log against another day of guessing.
+     */
+    {
+        const uint8_t *p = (const uint8_t *)cd;
+        uint16_t off = 0;
+        while (off + 2u <= cd->wTotalLength) {
+            const usb_standard_desc_t *d = (const usb_standard_desc_t *)(p + off);
+            if (d->bLength == 0u) {
+                break;
+            }
+            if (d->bDescriptorType == USB_B_DESCRIPTOR_TYPE_INTERFACE) {
+                const usb_intf_desc_t *i = (const usb_intf_desc_t *)d;
+                ESP_LOGI(TAG, "  interface %u alt %u: class %u sub %u proto %u,"
+                              " %u endpoints",
+                         i->bInterfaceNumber, i->bAlternateSetting,
+                         i->bInterfaceClass, i->bInterfaceSubClass,
+                         i->bInterfaceProtocol, i->bNumEndpoints);
+            } else if (d->bDescriptorType == USB_B_DESCRIPTOR_TYPE_ENDPOINT) {
+                const usb_ep_desc_t *e = (const usb_ep_desc_t *)d;
+                ESP_LOGI(TAG, "    endpoint 0x%02x attr 0x%02x mps %u "
+                              "interval %u",
+                         e->bEndpointAddress, e->bmAttributes,
+                         e->wMaxPacketSize, e->bInterval);
+            }
+            off = (uint16_t)(off + d->bLength);
+        }
+    }
+
     usb_pipe_t found[USB_MAX_PIPES];
     const uint32_t n = find_hid(cd, found, USB_MAX_PIPES);
+    for (uint32_t i = 0; i < n; i++) {
+        ESP_LOGI(TAG, "  taking %s on interface %u, endpoint 0x%02x, mps %u",
+                 usage_name(found[i].usage), found[i].itf, found[i].ep,
+                 (unsigned)found[i].mps);
+    }
     if (n == 0) {
         ESP_LOGI(TAG, "device %04x:%04x has no HID interrupt input, ignoring",
                  dd->idVendor, dd->idProduct);
@@ -415,10 +637,18 @@ static void attach(uint8_t addr)
     }
 
     s_dev = dev;
+    /* ARGON: so the retry above stops once anything has ever been seen -
+     * a device that comes and goes is a different fault from one that was
+     * never enumerated at all. */
+    s_ever_attached = true;
     s_vid = dd->idVendor;
     s_pid = dd->idProduct;
     s_reports = 0;
     s_pipes = 0;
+    s_attach_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    s_last_report_ms = 0u;
+    s_protocol = HID_PROTOCOL_BOOT;
+    s_shown = 0u;
 
     for (uint32_t i = 0; i < n; i++) {
         usb_pipe_t *q = &s_pipe[s_pipes];
@@ -445,6 +675,10 @@ static void attach(uint8_t addr)
             ESP_LOGW(TAG, "interface %u: SET_PROTOCOL(boot) failed", q->itf);
         }
         (void)class_request(q->itf, HID_REQ_SET_IDLE, 0);
+
+        /* ARGON: and behave like a host that means it.  See the note on
+         * get_report_descriptor. */
+        (void)get_report_descriptor(q->itf, 0);
 
         if (usb_host_transfer_alloc(q->mps, 0, &q->in) != ESP_OK) {
             (void)usb_host_interface_release(s_client, dev, q->itf);
@@ -573,8 +807,111 @@ static void cli_task(void *arg)
                 pipe_recover(&s_pipe[i]);
             }
         }
+
+        /*
+         * ARGON: say where things stand, so nobody has to type `usb` while a
+         * game is on the screen.  See the note on USB_SAY_BUSY_MS.
+         */
+        {
+            const uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+            const uint32_t quiet = (s_last_report_ms == 0u)
+                ? 0u : (uint32_t)(now - s_last_report_ms);
+            const bool worrying = (s_dev != NULL && quiet >= 4000u);
+            const uint32_t every = worrying ? USB_SAY_BUSY_MS : USB_SAY_IDLE_MS;
+
+            if (s_said_at_ms == 0u ||
+                (uint32_t)(now - s_said_at_ms) >= every) {
+                s_said_at_ms = now;
+                if (s_dev == NULL) {
+                    ESP_LOGI(TAG, "no device attached (%u laps, %u retries)",
+                             (unsigned)s_cli_loops, (unsigned)s_retries);
+                } else {
+                    ESP_LOGI(TAG, "%04x:%04x, %u reports, quiet %u ms, "
+                                  "%u laps%s",
+                             s_vid, s_pid, (unsigned)s_reports,
+                             (unsigned)quiet, (unsigned)s_cli_loops,
+                             (s_pipes > 0 && s_pipe[0].dead) ? ", DEAD" : "");
+                }
+            }
+        }
+
+        /*
+         * ARGON: and if nothing has ever turned up, try the host again.  See
+         * the note on USB_NO_DEVICE_MS - a receiver that stayed powered
+         * through a chip reset never says hello a second time.
+         */
+        if (s_dev == NULL && !s_ever_attached && s_retries < USB_RETRIES) {
+            const uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+            if (s_up_at_ms != 0u &&
+                (uint32_t)(now - s_up_at_ms) >= USB_NO_DEVICE_MS) {
+                s_up_at_ms = now;
+                s_retries++;
+                ESP_LOGW(TAG, "nothing has enumerated in %u ms; taking the "
+                              "host down and up again (attempt %u of %u)",
+                         (unsigned)USB_NO_DEVICE_MS, (unsigned)s_retries,
+                         (unsigned)USB_RETRIES);
+                s_restart_wanted = false;
+                if (xTaskCreate(restart_task, "usb_restart", 3072, NULL, 5,
+                                NULL) != pdPASS) {
+                    ESP_LOGE(TAG, "no room for the restart task");
+                } else {
+                    /* stop() will end this task; nothing after here runs. */
+                    break;
+                }
+            }
+        }
+
+        /*
+         * ARGON: nothing here touches a pipe that is merely quiet.
+         *
+         * There used to be a watchdog: no report for four seconds while a
+         * device was attached, and it would halt, flush, clear and re-arm the
+         * endpoint.  It was written to revive a mouse that had gone silent,
+         * and it was the reason the mouse went silent.
+         *
+         * Silence is the normal state of an interrupt IN pipe on a mouse
+         * nobody is touching - the device NAKs and the library holds the
+         * transfer - so the watchdog fired on every idle moment, and each
+         * firing halted the endpoint.  Measured 8 September 2026, on a board
+         * doing nothing else at all: two of those in the first eleven seconds
+         * after a clean attach, and then zero reports for forty-five minutes,
+         * with the receiver enumerated, the descriptor read, both HID
+         * protocols tried and the same mouse working on a PC.  Maxim's own
+         * summary was the clue: "работала стабильно, но в какой-то момент
+         * стала отваливаться" - and what changed was this.
+         *
+         * A halted endpoint is also exactly the fault this port had before,
+         * fixed in 58cfd95, and the fix for that one was to stop resubmitting
+         * blindly.  Adding code that halts a healthy endpoint on purpose put
+         * it straight back.
+         *
+         * So: recovery happens only where a transfer has actually failed - the
+         * error path in in_cb sets q->recover, and the sweep above acts on it.
+         * A quiet pipe is left alone, for ever if need be.
+         */
     }
     s_cli_task = NULL;
+    vTaskDelete(NULL);
+}
+
+/*
+ * ARGON: take the host down and up again, from a task of its own.
+ *
+ * Not from the client task: ag_port_usb_stop waits for the client task to
+ * finish before tearing the library down, so a client task that called it
+ * would wait for itself.  This one is created on demand, does the two calls,
+ * and deletes itself.
+ */
+static void restart_task(void *arg)
+{
+    (void)arg;
+    (void)ag_port_usb_stop();
+    const ag_err_t rc = ag_port_usb_start();
+    if (rc != AG_OK) {
+        ESP_LOGE(TAG, "the host would not come back up (%d)", (int)rc);
+    } else {
+        ESP_LOGI(TAG, "host restarted; waiting for a device again");
+    }
     vTaskDelete(NULL);
 }
 
@@ -611,6 +948,8 @@ ag_err_t ag_port_usb_start(void)
 
     s_running = true;
     s_state = AG_USB_IDLE;
+    s_up_at_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    s_said_at_ms = 0u;
 
     /* The library daemon and the client, each on a small stack: this is opt-in
      * (CONFIG_ARGON_USB_HOST) and only on a board that has the OTG peripheral. */
@@ -659,6 +998,10 @@ ag_err_t ag_port_usb_status(ag_port_usb_status_t *out)
     out->pid = s_pid;
     out->reports = s_reports;
     out->loops = s_cli_loops;
+    out->silent_ms = (s_last_report_ms == 0u)
+        ? 0u
+        : (uint32_t)((uint32_t)(esp_timer_get_time() / 1000) - s_last_report_ms);
+    out->prods = 0u;   /* the watchdog that used them is gone; see the note in cli_task */
 
     const uint32_t room = (uint32_t)(sizeof(out->pipe) / sizeof(out->pipe[0]));
     for (uint32_t i = 0; i < s_pipes && i < room; i++) {

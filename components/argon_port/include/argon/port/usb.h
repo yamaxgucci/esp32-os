@@ -76,6 +76,11 @@ typedef struct {
      * from a device that has gone quiet with a healthy endpoint - and the two
      * were indistinguishable from outside until this existed. */
     uint32_t       loops;
+    /* Milliseconds since the last report, and how many times a silent pipe has
+     * been prodded back to life.  "495 reports, endpoint completed" said
+     * nothing about whether that was a second ago or ten minutes. */
+    uint32_t       silent_ms;
+    uint32_t       prods;
     /*
      * ARGON: and what each of the device's HID interfaces is doing, because
      * "open, 249 reports" was true of a mouse that had stopped for good and

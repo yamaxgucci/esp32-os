@@ -3991,9 +3991,11 @@ static int cmd_usb(int argc, char **argv)
          * was misleading at once: the device was a mouse, the count had been
          * frozen for ten minutes, and the endpoint had been halted since.
          */
-        ag_console_printf("device %04x:%04x, %u reports total, %u loops\n",
+        ag_console_printf("device %04x:%04x, %u reports total, %u loops, "
+                          "quiet for %u ms, prodded %u times\n",
                           st.vid, st.pid, (unsigned)st.reports,
-                          (unsigned)st.loops);
+                          (unsigned)st.loops, (unsigned)st.silent_ms,
+                          (unsigned)st.prods);
         for (uint32_t i = 0; i < st.pipes; i++) {
             const char *what = "hid";
             if (st.pipe[i].usage == AG_USB_USAGE_KEYBOARD) {

@@ -93,6 +93,22 @@ unsigned ag_map_loading;
 
 /* Where the game is, for when it stops being anywhere.  See ag_diag.h. */
 const char* volatile ag_step = "before main";
+const char* volatile ag_step_audio = "not started";
+unsigned volatile ag_audio_laps;
+void* volatile ag_ticker_now;
+int volatile ag_script_now = -1;
+int volatile ag_script_proc_now = -1;
+int volatile ag_script_op = -1;
+int volatile ag_script_ip = -1;
+unsigned volatile ag_script_steps;
+unsigned volatile ag_script_waits;
+int volatile ag_moveto_from = -1;
+int volatile ag_moveto_to = -1;
+int volatile ag_moveto_result = -1;
+int volatile ag_dir_origin = -1;
+int volatile ag_dir_rotation = -1;
+int volatile ag_dir_result = -1;
+int volatile ag_rot_target = -1;
 
 /* The engine asks the port for the clock rather than including argon.h: no
  * engine file does, and this is not the change that should start. */
@@ -644,6 +660,14 @@ static uint32_t s_fps_ms;
 static uint32_t s_ev_keys;
 static uint32_t s_ev_ptr_move;
 static uint32_t s_ev_ptr_btn;
+
+/* Where the pointer last was, and which of its buttons were down.
+ * Declared here rather than beside the rest of the mouse state further
+ * down, because the [input] line in memstat_service reports them and a
+ * static has to be declared before the function that reads it. */
+static int s_mouse_x = -1;
+static int s_mouse_y = -1;
+static Uint32 s_mouse_buttons;
 static uint32_t s_fps_next;
 static uint32_t s_frames;
 static uint64_t s_blit_us;
@@ -765,6 +789,10 @@ volatile uint32_t ag_ml_laps;
 #define WATCH_TICK_MS 500u
 #define WATCH_STUCK_MS 5000u
 
+/* Every frame ever handed over, never reset - s_frames is cleared by each
+ * report, and a heartbeat that goes back to nought looks like a stall. */
+static volatile uint32_t s_frames_total;
+
 static volatile bool s_watch_stop;
 
 static void watch_thread(void *arg)
@@ -794,7 +822,20 @@ static void watch_thread(void *arg)
     while (!s_watch_stop) {
         ag_delay(WATCH_TICK_MS);
 
-        const uint32_t laps = ag_ml_laps;
+        /*
+         * ARGON: the heartbeat is the last frame handed over, not the main
+         * loop's lap counter.
+         *
+         * Laps only move inside mainLoop, and the game spends a great deal of
+         * its life elsewhere: the main menu has a loop of its own, so do the
+         * save and load screens, the character editor, the world map and every
+         * movie.  Maxim's game froze *at the main menu* on 8 September 2026 and
+         * this thread said nothing at all, because laps were nought and the
+         * guard for "the loop has not started yet" cannot tell that from "the
+         * loop is not the thing running".  A frame handed to the display is
+         * the one thing all of those do.
+         */
+        const uint32_t laps = ag_ml_laps + s_frames_total;
         const uint32_t now = (uint32_t)ag_millis();
 
         if (laps != last_laps) {
@@ -814,10 +855,10 @@ static void watch_thread(void *arg)
             continue;
         }
         /*
-         * Nothing to report before the loop has run once.  The game spends
-         * about two minutes reading its data before it reaches the loop at
-         * all, and a watcher that calls that a stall says STUCK on every
-         * single run - which is how a report gets ignored.
+         * Nothing to report before the game has drawn anything.  It spends
+         * about two minutes reading its data before the first frame, and a
+         * watcher that calls that a stall says STUCK on every single run -
+         * which is how a report gets ignored.
          */
         if (laps == 0u) {
             last_move_ms = now;
@@ -831,12 +872,50 @@ static void watch_thread(void *arg)
              * it is inside; ag_step says where in the engine, which is the
              * one that names a function rather than a quarter of the program.
              */
-            shim_printf("[watch] STUCK: the main loop has not moved for %u ms."
+            shim_printf("[watch] STUCK: no frame and no lap for %u ms."
                       "  Step %u (1 input, 2 keys, 3 scripts, 4 maps, "
-                      "5 present, 6 throttle), lap %u, at %s, last sound %s\n",
+                      "5 present, 6 throttle), %u laps, %u frames, at %s, "
+                      "last sound %s\n",
                       (unsigned)(now - last_move_ms), (unsigned)ag_ml_phase,
-                      (unsigned)laps, ag_step != NULL ? ag_step : "?",
+                      (unsigned)ag_ml_laps, (unsigned)s_frames_total,
+                      ag_step != NULL ? ag_step : "?",
                       ag_sfx_name[0] != '\0' ? ag_sfx_name : "-");
+            /*
+             * And the other end of it.  A deadlock needs two names, and the
+             * first report of this one had only the game's: "step 1,
+             * inputGetInput, at playing", which says the game is inside the
+             * engine's background handlers and not which of them, nor what it
+             * is waiting for.  The sound thread's own step, and its lap
+             * counter taken twice a second apart, answer both: a counter that
+             * moves means it is not the holder.
+             */
+            const unsigned laps_a = ag_audio_laps;
+            const unsigned steps_a = ag_script_steps;
+            const unsigned waits_a = ag_script_waits;
+            const int ip_a = ag_script_ip;
+            ag_delay(200);
+            shim_printf("[watch] the sound thread is at %s, %u laps then %u "
+                      "200 ms later (%s); background handler %p\n",
+                      ag_step_audio != NULL ? ag_step_audio : "?",
+                      laps_a, (unsigned)ag_audio_laps,
+                      ag_audio_laps == laps_a ? "stopped too" : "still running",
+                      ag_ticker_now);
+            /*
+             * And the interpreter, which is the last place a hang can hide.
+             * Three different faults, told apart by which number moves:
+             * steps climbing is a loop in the script's own bytecode, steps
+             * frozen is one instruction that never returned (and op names it),
+             * waits climbing is a wait whose condition cannot be met.
+             */
+            shim_printf("[watch] script %d proc %d: op 0x%x at ip %d->%d, "
+                      "%u steps -> %u, %u waits -> %u (%s)\n",
+                      ag_script_now, ag_script_proc_now,
+                      (unsigned)ag_script_op, ip_a, ag_script_ip,
+                      steps_a, (unsigned)ag_script_steps,
+                      waits_a, (unsigned)ag_script_waits,
+                      ag_script_waits != waits_a ? "waiting for something"
+                          : (ag_script_steps != steps_a ? "running bytecode"
+                              : "stopped inside one instruction"));
             ag_log(AG_LOG_ERROR, "fallout",
                    "main loop has not moved for %u ms, stuck in step %u "
                    "(1 input, 2 keys, 3 scripts, 4 maps, 5 present, 6 throttle)"
@@ -1322,6 +1401,24 @@ static void memstat_service(void)
     cache_report();
     sfx_report();
     top_report();
+    /*
+     * ARGON: and what the hands did, on this schedule rather than only with
+     * -fps.
+     *
+     * "The mouse worked at the menu and does nothing after loading a save"
+     * (Maxim, 8 September 2026) has two completely different explanations -
+     * the events stop arriving, or they arrive and the engine ignores them -
+     * and no way at all to choose between them: the USB port said the mouse
+     * had never been silent, and the counters that would have settled it were
+     * behind a flag this run does not use.  Cumulative, and with the last
+     * position the port saw, because "42 moves" and "42 moves, all at the same
+     * place" are also different faults.
+     */
+    shim_printf("[input t=%u] %u keys, %u pointer moves, %u buttons; last at "
+              "%d,%d buttons 0x%x\n",
+              (unsigned)ag_millis(), (unsigned)s_ev_keys,
+              (unsigned)s_ev_ptr_move, (unsigned)s_ev_ptr_btn,
+              s_mouse_x, s_mouse_y, (unsigned)s_mouse_buttons);
 }
 
 static void write_ppm(const char *path)
@@ -2956,6 +3053,7 @@ void SDL_RenderPresent(SDL_Renderer *r)
     memstat_service();
     const uint32_t p2 = (uint32_t)ag_micros();
     ++s_frames;
+    ++s_frames_total;
     s_last_present_ms = (uint32_t)ag_millis();
     s_stall_next_ms = 0u;
     fps_service();
@@ -3127,7 +3225,6 @@ static int s_q_tail;
  * position, because it keeps the cursor itself. */
 static int s_mouse_dx;
 static int s_mouse_dy;
-static Uint32 s_mouse_buttons;
 
 /*
  * Buttons that have been down at any point since the engine last looked.
@@ -3144,8 +3241,6 @@ static Uint32 s_mouse_buttons;
  * which is what it was.
  */
 static Uint32 s_mouse_latch;
-static int s_mouse_x = -1;
-static int s_mouse_y = -1;
 
 /*
  * The keyboard as a table of flags indexed by scancode - which is to say by
@@ -3767,19 +3862,31 @@ static void audio_thread(void *arg)
 {
     (void)arg;
     while (!s_audio_stop) {
+        /* ARGON: the lap counter says whether this thread is running at all,
+         * which is the difference between "spinning inside the mixer" and
+         * "blocked in the device write" - and the game's thread waits on
+         * mutexes this thread takes, so when the game stops this is the other
+         * half of the answer.  See ag_diag.h. */
+        ag_audio_laps++;
+
         if (s_audio_paused || s_spec.callback == NULL) {
+            ag_step_audio = "paused";
             ag_delay(10);
             continue;
         }
         if (ag_audio_space() < AUDIO_FRAMES) {
             /* Short: the queue drains in about 46 ms at 22 kHz, and sleeping
              * a whole tick here is how a gap gets into the sound. */
+            ag_step_audio = "waiting for room in the queue";
             ag_delay(2);
             continue;
         }
+        ag_step_audio = "calling the mixer";
         s_spec.callback(s_spec.userdata, (Uint8 *)s_audio_block,
                         (int)sizeof(s_audio_block));
+        ag_step_audio = "writing to the device";
         ag_audio_write(s_audio_block, AUDIO_FRAMES);
+        ag_step_audio = "between blocks";
     }
     ag_thread_exit();
 }

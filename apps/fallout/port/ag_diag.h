@@ -179,6 +179,90 @@ extern const char* volatile ag_step;
 
 #define AG_STEP(where) (ag_step = (where))
 
+/*
+ * And the same for the sound thread, because a deadlock has two ends and one
+ * of them is no use on its own.
+ *
+ * 8 September 2026: the watcher finally spoke, and said the game was in step 1
+ * - inputGetInput - with the breadcrumb at "playing".  inputGetInput runs the
+ * engine's background handlers, one of which is the sound's, and that one takes
+ * a sound buffer's mutex.  So the question became "who is holding it", and
+ * nothing could answer: the holder is the other thread, and it had no
+ * breadcrumb of its own.  These are its.  ag_audio_laps says whether that
+ * thread is running at all, which separates "spinning inside the mixer" from
+ * "blocked in the device write" without any further guessing.
+ */
+extern const char* volatile ag_step_audio;
+extern unsigned volatile ag_audio_laps;
+
+/* Which background handler is running, by address - the list belongs to the
+ * engine, so a pointer that addr2line names later beats a table of names
+ * that has to be kept in step.  Null between handlers. */
+extern void* volatile ag_ticker_now;
+
+/* Which script is running, and which of its procedures.  A trap fires a
+ * spatial script, an animation handler runs it, and a script that does not
+ * come back looks from outside exactly like an animation that does not come
+ * back.  -1 between scripts. */
+extern int volatile ag_script_now;
+extern int volatile ag_script_proc_now;
+
+/*
+ * And what the interpreter is doing, which is the last thing that can hide.
+ *
+ * A script that does not come back is one of three things and they need
+ * different fixes: a loop in its own bytecode (ag_script_steps climbs), a
+ * single instruction that never returns (steps frozen, ag_script_op names it),
+ * or a wait whose condition can never be met (ag_script_waits climbs).  The
+ * watcher samples them twice, 200 ms apart, and says which.
+ */
+extern int volatile ag_script_op;
+extern int volatile ag_script_ip;
+extern unsigned volatile ag_script_steps;
+extern unsigned volatile ag_script_waits;
+
+/* The last move_to a script asked for: where the object was, where it was
+ * asked to go, and what came back.  The Arroyo spear trap walks its spear one
+ * tile at a time towards the player and loops until it arrives - so a step
+ * that does not move is a game that does not come back, and these three
+ * numbers are what is needed to work out why. */
+extern int volatile ag_moveto_from;
+extern int volatile ag_moveto_to;
+extern int volatile ag_moveto_result;
+
+/* And the step that decided where to go: origin, the rotation asked for, and
+ * the tile that came back.  A result equal to the origin is a step that does
+ * not move, which is what an infinite walk is made of.  The first cut of this
+ * recorded move_to's "from" *after* the move, so it always equalled "to" and
+ * proved nothing - hence the whole step, in order. */
+extern int volatile ag_dir_origin;
+extern int volatile ag_dir_rotation;
+extern int volatile ag_dir_result;
+extern int volatile ag_rot_target;
+
+#ifdef __cplusplus
+} /* the scope guard below is C++ */
+
+/*
+ * Names the call that is about to take a lock, and puts the previous name back
+ * on the way out - so a breadcrumb inside a map load does not erase "mapLoad".
+ * Used with __func__, which costs nothing and cannot go stale.
+ */
+struct AgStepScope {
+    const char* was;
+    explicit AgStepScope(const char* what)
+        : was(ag_step)
+    {
+        ag_step = what;
+    }
+    ~AgStepScope() { ag_step = was; }
+};
+
+#define AG_STEP_SCOPE(what) AgStepScope ag_step_scope_(what)
+
+extern "C" {
+#endif
+
 #ifdef __cplusplus
 }
 #endif
