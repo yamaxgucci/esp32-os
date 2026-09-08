@@ -4,8 +4,15 @@
  *   drv install c:\st7789.sys
  *   dev                       -> lcd0  display  ST7789
  *
- * The panel soldered to a Waveshare ESP32-C6-LCD-1.47: 1.47 inches, 172x320,
- * driven landscape as 320x172.  Written from apps/ili9341/ili9341.c, which it
+ * Two panels, both ST7789, and one file: the Waveshare ESP32-C6-LCD-1.47's
+ * 1.47 inch 172x320, driven landscape as 320x172, and a 2.0 inch 240x320
+ * module soldered to the ESP32-S3-WROOM CAM board's header, driven landscape
+ * as 320x240.  The difference between them is the block of constants below
+ * and nothing else; -DST7789_BOARD_S3CAM picks the second, and
+ * tools/apps.json builds both, as ST7789.SYS (RISC-V) and ST7789S3.SYS
+ * (xtensa).
+ *
+ * Written from apps/ili9341/ili9341.c, which it
  * follows closely on purpose - the console path, the window tracking, the
  * scaler and the rules about what a driver may not do are that file's, and
  * copying them wrongly here would be a second set of bugs to find.  What is
@@ -21,6 +28,10 @@
  *   python tools/mkaxe.py --arch riscv32 --gcc riscv32-esp-elf-gcc \
  *       --include sdk/include --include apps/common \
  *       -o build/apps/ST7789.SYS apps/st7789/st7789.c
+ *   python tools/mkaxe.py --arch xtensa --gcc xtensa-esp32s3-elf-gcc \
+ *       --cflags "-Os -ffunction-sections -fdata-sections -DST7789_BOARD_S3CAM" \
+ *       --include sdk/include --include apps/common \
+ *       -o build/apps/ST7789S3.SYS apps/st7789/st7789.c
  *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
  */
@@ -29,14 +40,72 @@
 
 #include "font8x8.h"
 
-AG_DRV("ST7789", "0.1", "argon");
+AG_DRV("ST7789", "0.2", "argon");
 
 /*
- * The board this was written on, and the pins are constants for the same
- * reason they are in the ILI9341 driver: a driver cannot read BOARD.CFG -
- * api->cfg is NULL - and a wrong guess here drives a pin belonging to
- * something else.  They are written down in boards/esp32-c6-lcd-1.47/BOARD.CFG
- * as well, where a person looking for them will look first.
+ * Two boards, one panel controller, and the constants are the whole of the
+ * difference.  They are constants rather than settings for the same reason
+ * they are in the ILI9341 driver: a driver cannot read BOARD.CFG - api->cfg is
+ * NULL - and a wrong guess here drives a pin belonging to something else.
+ * Both sets are written down in the board's own BOARD.CFG as well, where a
+ * person looking for them will look first.
+ *
+ * Which set is compiled in is -DST7789_BOARD_S3CAM, from tools/apps.json.  The
+ * two images are not interchangeable for a second reason anyway: a .SYS
+ * carries its instruction set in its header, and one of these is RISC-V.
+ */
+#if defined(ST7789_BOARD_S3CAM)
+
+/*
+ * A 2.0 inch 240x320 module (020-06PS V2.2, GM1020-06 flex) soldered to the
+ * header of the ESP32-S3-WROOM CAM board, driven landscape as 320x240.
+ *
+ * The bus pins - clock 12, data 11 - are SPI2's IOMUX pins on this part, which
+ * is why the panel is not capped at 40 MHz the way the C6's is.  The chip
+ * select is FSPICS0, and DC sits on 13, which would have been MISO: this panel
+ * has no way to answer, so nothing is lost by spending it.
+ *
+ * The backlight is on 46 and the chip select is not, deliberately.  46 is a
+ * strapping pin that must be low through reset and has an internal pull-down;
+ * BL on the module is a transistor base, which pulls the same way, whereas its
+ * CS may well have a pull-up to VDD - and a pull-up on 46 is a board that
+ * boots into download mode.
+ *
+ * Everything here except 3 and 46 used to be the camera.  See BOARD.CFG.
+ */
+#define LCD_BUS      2
+#define LCD_CS      10
+#define LCD_DC      13
+#define LCD_RST      3
+#define LCD_BL      46
+
+/*
+ * Landscape.  MV turns the addressing on its side; MX or MY then says which
+ * corner is the origin, so 0x60 (MV|MX) and 0xA0 (MV|MY) are the two
+ * landscapes, one the other's 180-degree rotation.  Bit 3 clear is RGB: a
+ * picture with the reds and blues exchanged is that bit and nothing else.
+ *
+ * Which of the two is right is not derivable - it is which end of the flex the
+ * module was soldered by - so this is the first guess and the screen settles
+ * it.
+ */
+#define LCD_MADCTL 0x60
+
+#define LCD_W      320
+#define LCD_H      240
+
+/*
+ * No offset, and that is the easy case: the controller addresses 240x320 and
+ * this glass is all of it.  The C6's panel is 172 rows inside those 240 and
+ * has to be told where they start.
+ */
+#define LCD_X_OFF 0
+#define LCD_Y_OFF 0
+
+#else /* the Waveshare ESP32-C6-LCD-1.47 */
+
+/*
+ * The board this was written on.
  *
  * The chip select is the whole of what separates this panel from the SD card:
  * both are on SPI2, both share clock and data, and only 14 and 4 tell them
@@ -86,10 +155,12 @@ AG_DRV("ST7789", "0.1", "argon");
 #define LCD_X_OFF 0
 #define LCD_Y_OFF 34
 
+#endif
+
 #define CELL_W AG_FONT8X8_W
 #define CELL_H AG_FONT8X8_H
 #define COLS   (LCD_W / CELL_W) /* 40 */
-#define ROWS   (LCD_H / CELL_H) /* 21, and four pixels at the bottom spare */
+#define ROWS   (LCD_H / CELL_H) /* 30 on the S3 panel; 21 on the C6, four spare */
 
 /* One row of text, as pixels.  The only buffer this driver has. */
 static uint16_t s_row[LCD_W * CELL_H];

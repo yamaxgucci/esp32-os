@@ -163,6 +163,14 @@
       "include": ["apps/common"],
       "src": ["apps/st7789/st7789.c"]
     },
+    {
+      "out": "ST7789S3.SYS", "group": "board",
+      "_note": "The same source and the same controller, for the 2.0 inch 240x320 module soldered to the ESP32-S3-WROOM CAM board: -DST7789_BOARD_S3CAM swaps the block of constants (pins, size, no offset) and xtensa is the other instruction set, so it has to be a second image with a name of its own.",
+      "arch": "xtensa", "gcc": "xtensa-esp32s3-elf-gcc",
+      "cflags": "-Os -ffunction-sections -fdata-sections -DST7789_BOARD_S3CAM",
+      "include": ["apps/common"],
+      "src": ["apps/st7789/st7789.c"]
+    },
     { "out": "XPT2046.SYS", "group": "board", "src": ["apps/xpt2046/xpt2046.c"] },
 
     {
