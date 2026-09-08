@@ -115,25 +115,78 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'mksysfs failed' }
 
     # ---- the sequence -----------------------------------------------------
-    # Where the pointer is walked: across the middle, then back, then up, then
-    # a click in the centre.  Coordinates are the surface's own pixels.
+    #
+    # Coordinates are the surface's own pixels, and the ones below are worked
+    # out from the shell's own layout rather than read off a screenshot: the
+    # menu bar is `menubar_h` tall, a title starts `PAD_X` in, the first window
+    # opens eight pixels inside the work area.  Written out here so that a
+    # change to any of those makes this fail loudly rather than click on the
+    # wrong thing quietly.
     $w = if ($Width -gt 0) { $Width } else { 640 }
     $h = if ($Height -gt 0) { $Height } else { 400 }
     $cx = [int]($w / 2)
     $cy = [int]($h / 2)
     $span = [int]($w / 4)
 
+    $menubarH = 18          # DSK_FONT_H + 2
+    $statusH  = 12          # DSK_SMALL_H + 4
+    $border   = 4
+    $titleH   = 18
+    $workY    = $menubarH
+    $workH    = $h - $menubarH - $statusH
+
+    # "File" is the first title: six pixels in, four characters of 8x16, and
+    # PAD_X either side.  The middle of it, and the middle of its first item.
+    $fileX  = 6 + [int]((8 * 4 + 12) / 2)
+    $fileY  = [int]($menubarH / 2)
+    $itemX  = 6 + 3 + 20
+    $itemY  = $menubarH + 3 + 8
+
+    # The first window: eight pixels inside the work area, 220x120 (or what
+    # fits).  Its caption, and the minimise box two boxes in from the right.
+    $winW = if ($w -lt 228) { $w - 8 } else { 220 }
+    $winX = 8
+    $winY = $workY + 8
+    $capY = $winY + $border + [int]($titleH / 2)
+    $capX = $winX + $border + 40
+    $minX = $winX + $border + $winW - 2 * $border - 32 + 8
+
+    # Where its plate goes once it is minimised: bottom-left of the work area.
+    $plateX = 36
+    $plateY = $workY + $workH - 20
+
     $moves = @(
         'home',
-        "glide $($cx - $span),$cy",
-        "glide $($cx + $span),$cy",
-        "glide $cx,$([int]($cy - $h / 6))",
-        "move $cx,$cy",
-        'click',
-        'wait 2000'
+        # Four windows, from the File menu.  A menu that opens, highlights and
+        # closes on its own is most of what Phase 1 claims.
+        "move $fileX,$fileY", 'click', "move $itemX,$itemY", 'click',
+        "move $fileX,$fileY", 'click', "move $itemX,$itemY", 'click',
+        "move $fileX,$fileY", 'click', "move $itemX,$itemY", 'click',
+        "move $fileX,$fileY", 'click', "move $itemX,$itemY", 'click',
+        'wait 300',
+        # Ctrl+Tab twice: down the pile and back.  NOT Alt+Tab - the
+        # supervisor owns that one and it switches session slots.
+        'down leftctrl', 'key tab', 'wait 200', 'key tab', 'up leftctrl',
+        'wait 300',
+        # Raise the first window by its caption, then minimise it.
+        "move $capX,$capY", 'click', 'wait 200',
+        "move $minX,$capY", 'click', 'wait 400',
+        # Its plate is at the bottom left; a double click brings it back.
+        "move $plateX,$plateY", 'click', 'wait 120', 'click', 'wait 400',
+        # And a drag by the outline: press, travel, release.
+        "move $capX,$capY", 'press',
+        "glide $($cx - 40),$($cy - 20)", 'release',
+        'wait 800',
+        # Park the pointer somewhere that hides nothing before the photograph.
+        "move $($w - 30),$($workY + 30)",
+        'wait 1200'
     )
     $quoted = ($moves | ForEach-Object { '"' + $_ + '"' }) -join ' '
     $after = @('"key f5"', '"wait 1500"') -join ' '
+    # Two windows closed with the keyboard, which is the other way to close
+    # one.  Ctrl+F4 closes a window; Alt+F4 would leave the shell.
+    $closing = @('"down leftctrl"', '"key f4"', '"wait 200"', '"key f4"',
+                 '"up leftctrl"', '"wait 400"') -join ' '
 
     $send = @(
         # Nothing to install: the drivers came up from C:\DRV with the boot,
@@ -141,12 +194,20 @@ try {
         'dev',
         # Raw, so the harness does not sit waiting for a prompt that cannot
         # come until the shell's own deadline expires.
-        "~run c:\desktop.axe $Seconds`r",
+        #
+        # The Enter goes in its own write, three hundred milliseconds after
+        # the text.  Sent together it is occasionally lost - the line arrives
+        # and is echoed, the command never runs, and the screenshot shows it
+        # sitting at the prompt untouched.  One run in three, which is not a
+        # thing to leave in a test.
+        "~run c:\desktop.axe $Seconds",
+        '~\x0d',
         '=desktop: surface',
         "!& '$pyexe' 'tools\inputplay.py' --wait 20 $quoted",
         "!.\tools\grab-window.ps1 -Out '$png'",
         "!& '$pyexe' 'tools\inputplay.py' --wait 20 $after",
         "!.\tools\grab-window.ps1 -Out '$png2'",
+        "!& '$pyexe' 'tools\inputplay.py' --wait 20 $closing",
         # 'q' rather than Escape: a lone 0x1b is held back by the console's
         # escape-sequence parser and never arrives as a key on its own.
         '~q',
@@ -233,16 +294,30 @@ try {
     # The numbers it printed on its way out.  Zero pointer events with a good
     # picture means the drawing works and the input does not, and telling those
     # two apart is most of why this script exists.
-    $m = [regex]::Match($text, 'desktop: (\d+) pointer events, (\d+) key events, (\d+) repaints, (\d+) reflushes')
-    if ($m.Success) {
+    # Two patterns, because the shell prints two lines - and it prints two
+    # lines because a single one grew past the console's eighty columns and
+    # was wrapped, with escape sequences through the middle of it.
+    $m = [regex]::Match($text,
+                        'desktop: (\d+) pointer events, (\d+) key events, (\d+) repaints')
+    $m2 = [regex]::Match($text,
+                         'desktop: (\d+) windows, (\d+) reflushes, (\d+) moves coalesced')
+    if ($m.Success -and $m2.Success) {
         $ptr = [int]$m.Groups[1].Value
         $key = [int]$m.Groups[2].Value
         $rep = [int]$m.Groups[3].Value
-        Write-Host "desktop: $ptr pointer events, $key key events, $rep repaints"
+        $win = [int]$m2.Groups[1].Value
+        Write-Host ("desktop: {0} pointer events, {1} key events, {2} repaints, {3} windows left" -f
+                    $ptr, $key, $rep, $win)
         if ($ptr -lt 5) { $fail += "only $ptr pointer events arrived" }
         if ($key -lt 1) { $fail += 'no key ever arrived' }
         if ($rep -lt 1) {
             $fail += 'F5 never reached the shell, so the second picture is not a fresh paint'
+        }
+        # Four opened from the menu, two closed with Alt+F4.  A different
+        # number means a menu that did not open, a click that missed, or a
+        # close that did not close - and the picture alone would not say which.
+        if ($win -ne 2) {
+            $fail += "$win windows were left open, not the two the sequence should leave"
         }
     } else {
         $fail += 'the shell did not print its counts (it may have been killed)'

@@ -68,4 +68,43 @@ typedef struct {
 
 void dsk_metrics_init(dsk_metrics_t *m, int16_t w, int16_t h);
 
+/*
+ * A pointer event, in this shell's own words.
+ *
+ * The system's AG_EV_POINTER_* are mapped to these once, where the events are
+ * read.  Nothing below that point then needs argon.h, which is what lets the
+ * window manager and the menus be compiled and tested on a machine with no
+ * display at all.
+ */
+typedef enum {
+    DSK_PTR_DOWN = 0,
+    DSK_PTR_UP,
+    DSK_PTR_MOVE,
+} dsk_ptr_t;
+
+/*
+ * The handful of HID usage ids the pure-C half needs, spelled here rather than
+ * included from argon/keys.h - which would drag in the ABI and with it the end
+ * of compiling any of this on the host.  They are the same numbers; keys.h is
+ * the authority and these must match it.
+ */
+#define DSK_KEY_ENTER  0x28u
+#define DSK_KEY_ESC    0x29u
+#define DSK_KEY_BACKSPACE 0x2Au
+#define DSK_KEY_TAB    0x2Bu
+#define DSK_KEY_SPACE  0x2Cu
+#define DSK_KEY_F4     0x3Du
+#define DSK_KEY_F5     0x3Eu
+#define DSK_KEY_F6     0x3Fu
+#define DSK_KEY_F10    0x43u
+#define DSK_KEY_RIGHT  0x4Fu
+#define DSK_KEY_LEFT   0x50u
+#define DSK_KEY_DOWN   0x51u
+#define DSK_KEY_UP     0x52u
+
+/* ag_keymod, same story. */
+#define DSK_MOD_SHIFT  (1u << 0)
+#define DSK_MOD_CTRL   (1u << 1)
+#define DSK_MOD_ALT    (1u << 2)
+
 #endif /* ARGON_DSK_H */

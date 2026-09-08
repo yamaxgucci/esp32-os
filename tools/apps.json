@@ -39,7 +39,9 @@
       "cflags": "-Os -ffunction-sections -fdata-sections -fno-builtin",
       "src": ["apps/desktop/desktop.c", "apps/desktop/dsk_rect.c",
               "apps/desktop/dsk_layout.c", "apps/desktop/dsk_paint.c",
-              "apps/desktop/dsk_cursor.c"]
+              "apps/desktop/dsk_paint_surface.c", "apps/desktop/dsk_cursor.c",
+              "apps/desktop/dsk_wm.c", "apps/desktop/dsk_menu.c",
+              "apps/desktop/dsk_dlg.c"]
     },
     {
       "out": "MARAUDER.AXE", "group": "core",

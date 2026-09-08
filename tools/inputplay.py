@@ -35,6 +35,9 @@ Commands:
                     next glide starts from a position that is actually known
     glide X,Y       travel there in small steps, so it can be watched
     click / rclick  press and release a button where the pointer is
+    press [r]       hold the button down and leave it down
+    release [r]     let it up again.  press / glide / release is a drag, and
+                    there is no other way to write one
     say TEXT        type it, one character at a time
 
 --wait N holds off until the guest is listening, for up to N seconds: the game
@@ -77,6 +80,19 @@ HID = {
     "f1": 0x3A, "f2": 0x3B, "f3": 0x3C, "f4": 0x3D, "f5": 0x3E, "f6": 0x3F,
     "f7": 0x40, "f8": 0x41, "f9": 0x42, "f10": 0x43, "f11": 0x44, "f12": 0x45,
     "right": 0x4F, "left": 0x50, "down": 0x51, "up": 0x52,
+    # The modifiers, which carry a usage id like any other key *and* a bit in
+    # every packet sent while they are held.  A real keyboard reports both and
+    # a shell that reads Alt+Tab needs both: the bit says which chord it is.
+    "leftctrl": 0xE0, "leftshift": 0xE1, "leftalt": 0xE2, "leftgui": 0xE3,
+    "rightctrl": 0xE4, "rightshift": 0xE5, "rightalt": 0xE6,
+}
+
+# ag_keymod, the bits KBDVIRT passes through to the guest.
+MOD_BIT = {
+    0xE1: 0x01, 0xE5: 0x01,  # shift
+    0xE0: 0x02, 0xE4: 0x02,  # ctrl
+    0xE2: 0x04, 0xE6: 0x04,  # alt
+    0xE3: 0x08,              # gui
 }
 
 KEY_DOWN, KEY_UP = 1, 2
@@ -86,8 +102,8 @@ PTR_ABS, PTR_WHEEL = 1, 3
 BTN_LEFT, BTN_RIGHT = 0x1, 0x2
 
 
-def key_packet(typ: int, hid: int, unicode_: int) -> bytes:
-    return struct.pack("<BBHHBB", typ, 0, hid, unicode_, 0, 0)
+def key_packet(typ: int, hid: int, unicode_: int, mods: int = 0) -> bytes:
+    return struct.pack("<BBHHBB", typ, mods, hid, unicode_, 0, 0)
 
 
 def mouse_packet(buttons: int, x: int, y: int, wheel: int = 0) -> bytes:
@@ -106,6 +122,7 @@ class Guest:
         self.x = 0
         self.y = 0
         self.buttons = 0
+        self.mods = 0
 
     def _connect(self, port: int, what: str):
         """A socket the guest is actually on the other end of.
@@ -159,17 +176,23 @@ class Guest:
         hid = HID.get(name.lower())
         if hid is None:
             raise SystemExit("inputplay: no key called %r" % name)
-        # A letter carries its character as well as its usage id: the game
-        # looks at the character for menu shortcuts and at the id for
-        # everything else.
+        # A letter carries its character as well as its usage id: an
+        # application looks at the character for what was typed and at the id
+        # for which key it was.
         uni = ord(name) if len(name) == 1 else 0
+        bit = MOD_BIT.get(hid, 0)
         s = self.keyboard()
         if down:
-            s.sendall(key_packet(KEY_DOWN, hid, uni))
+            # A held modifier is in the state from the moment it goes down, so
+            # its own packet carries it too - which is what a real keyboard
+            # reports and what a chord like Alt+Tab is read from.
+            self.mods |= bit
+            s.sendall(key_packet(KEY_DOWN, hid, uni, self.mods))
         if down and up:
             time.sleep(0.05)
         if up:
-            s.sendall(key_packet(KEY_UP, hid, 0))
+            s.sendall(key_packet(KEY_UP, hid, 0, self.mods))
+            self.mods &= ~bit
 
     def move(self, x: int, y: int) -> None:
         self.x, self.y = x, y
@@ -228,12 +251,29 @@ class Guest:
         s.sendall(mouse_packet(self.buttons, self.x, self.y, 0))
 
     def button(self, mask: int) -> None:
+        self.press(mask)
+        time.sleep(0.12)
+        self.release(mask)
+
+    def press(self, mask: int) -> None:
+        """Hold a button down, and leave it down.
+
+        Split out from button() because a drag cannot be expressed any other
+        way: press, then move, then release, with the moves in between
+        carrying the button still set.  A click that presses and releases in
+        one call can never drag anything, and a window manager that drags by
+        an outline is exactly the thing that needs testing.
+        """
         s = self.pointer()
         self.buttons |= mask
         s.sendall(mouse_packet(self.buttons, self.x, self.y))
-        time.sleep(0.12)
+        time.sleep(0.06)
+
+    def release(self, mask: int) -> None:
+        s = self.pointer()
         self.buttons &= ~mask
         s.sendall(mouse_packet(self.buttons, self.x, self.y))
+        time.sleep(0.06)
 
 
 def play(guest: Guest, path: str, speed: float = 1.0) -> None:
@@ -310,6 +350,10 @@ def run(guest: Guest, commands: list) -> None:
             guest.button(BTN_LEFT)
         elif verb == "rclick":
             guest.button(BTN_RIGHT)
+        elif verb == "press":
+            guest.press(BTN_RIGHT if arg[:1].lower() == "r" else BTN_LEFT)
+        elif verb == "release":
+            guest.release(BTN_RIGHT if arg[:1].lower() == "r" else BTN_LEFT)
         elif verb == "wheel":
             guest.wheel(int(arg))
         elif verb == "home":
