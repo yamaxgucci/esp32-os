@@ -21,6 +21,9 @@
 #include <argon/argon.h>
 #include <stdio.h>
 
+/* The cache miss counters, shared with the engine's cache.cc. */
+#include "ag_diag.h"
+
 /* apps/common/libc's watcher; its header is not on this build's include
  * path, and the engine's stdlib.h is the toolchain's. */
 extern "C" size_t ag_libc_arena_low(void);
@@ -50,6 +53,100 @@ extern "C" unsigned ag_cache_fetches = 0;
 extern "C" unsigned ag_cache_evicted = 0;
 extern "C" unsigned ag_cache_flushes = 0;
 extern "C" unsigned ag_cache_biggest = 0;
+
+/*
+ * And the same question asked properly: per cache, split by what the game was
+ * doing at the time, with the hits beside the misses and the cost of a miss in
+ * bytes and in milliseconds.  Declared in ag_diag.h, which says why;
+ * written by cache.cc; defined here for the same reason as the four above.
+ */
+unsigned ag_cache_hit[AG_CACHE_SLOTS];
+unsigned ag_cache_miss[AG_CACHE_SLOTS];
+unsigned ag_cache_refetch[AG_CACHE_SLOTS];
+unsigned ag_cache_miss_kb[AG_CACHE_SLOTS];
+unsigned ag_cache_miss_ms[AG_CACHE_SLOTS];
+unsigned ag_cache_out[AG_CACHE_SLOTS];
+unsigned ag_cache_flush[AG_CACHE_SLOTS];
+unsigned ag_cache_failed[AG_CACHE_SLOTS];
+
+/* And the files those misses read, by name.  Filled by the caches' own read
+ * procs, which are the only code that knows the path. */
+char ag_miss_name[AG_NAME_MAX];
+char ag_top_name[AG_TOP_MISSES][AG_NAME_MAX];
+unsigned ag_top_count[AG_TOP_MISSES];
+unsigned ag_top_ms[AG_TOP_MISSES];
+unsigned ag_top_kb[AG_TOP_MISSES];
+unsigned char ag_top_kind[AG_TOP_MISSES];
+unsigned char ag_top_where[AG_TOP_MISSES];
+
+/* Held above zero by mapLoad while it runs. */
+unsigned ag_map_loading;
+
+/* The engine asks the port for the clock rather than including argon.h: no
+ * engine file does, and this is not the change that should start. */
+unsigned ag_cache_now_us(void)
+{
+    return (unsigned)ag_micros();
+}
+
+/*
+ * The worst lap of the window and what it was doing.
+ *
+ * Kept as it is measured - in microseconds, per step - and reset by the
+ * report.  The cache figures are taken as differences across the lap, which
+ * is what says whether the dip was a file read or something else entirely:
+ * a 280 ms lap with two misses and 270 ms of miss time is answered, and a
+ * 280 ms lap with no misses at all is a different bug.
+ */
+static uint32_t s_worst_us, s_worst_input, s_worst_keys, s_worst_scripts;
+static uint32_t s_worst_maps, s_worst_present, s_worst_throttle;
+static uint32_t s_worst_miss_n, s_worst_miss_ms, s_worst_kb;
+static int s_worst_where = -1;
+static uint32_t s_seen_miss_n, s_seen_miss_ms, s_seen_kb;
+
+static void cache_totals(uint32_t *miss_n, uint32_t *miss_ms, uint32_t *kb)
+{
+    uint32_t n = 0, ms = 0, k = 0;
+    for (int i = 0; i < AG_CACHE_SLOTS; i++) {
+        n += ag_cache_miss[i];
+        ms += ag_cache_miss_ms[i];
+        k += ag_cache_miss_kb[i];
+    }
+    *miss_n = n;
+    *miss_ms = ms;
+    *kb = k;
+}
+
+void ag_frame_note(unsigned input_us, unsigned keys_us, unsigned scripts_us,
+    unsigned maps_us, unsigned present_us, unsigned throttle_us, int where)
+{
+    uint32_t miss_n, miss_ms, kb;
+    cache_totals(&miss_n, &miss_ms, &kb);
+
+    /* Throttle is the deliberate sleep and is not a cost: a lap that slept is
+     * a lap that had time to spare.  It is kept for the report because a slow
+     * lap that still slept means the limiter, not the work. */
+    const uint32_t cost = (uint32_t)input_us + keys_us + scripts_us + maps_us
+        + present_us;
+
+    if (cost > s_worst_us) {
+        s_worst_us = cost;
+        s_worst_input = input_us;
+        s_worst_keys = keys_us;
+        s_worst_scripts = scripts_us;
+        s_worst_maps = maps_us;
+        s_worst_present = present_us;
+        s_worst_throttle = throttle_us;
+        s_worst_where = where;
+        s_worst_miss_n = miss_n - s_seen_miss_n;
+        s_worst_miss_ms = miss_ms - s_seen_miss_ms;
+        s_worst_kb = kb - s_seen_kb;
+    }
+
+    s_seen_miss_n = miss_n;
+    s_seen_miss_ms = miss_ms;
+    s_seen_kb = kb;
+}
 
 /*
  * And what the art cache had to take out of the arena because its own memory
@@ -927,6 +1024,168 @@ void sdl_shim_screenshot_now(void)
  */
 #define ARENA_SAMPLE_MS 250u
 
+/*
+ * What the two caches missed, and while the game was doing what.
+ *
+ * Cumulative since the run started, because the question is "how much of this
+ * happens in a game" and not "how much happened in the last twenty seconds" -
+ * and because the buckets already do the separating that a short window would
+ * otherwise have to do.  The per-window figures are on the [art] line.
+ *
+ * One line per cache rather than one per bucket: twenty-one lines every
+ * twenty seconds is what made the driver's RAW line unusable on an eighty
+ * column console, and a report nobody can read is not a report.  Buckets with
+ * no traffic at all are left out.
+ */
+static const char* const ag_where_name[AG_WHERES] = {
+    "walk", "fight", "talk", "ui", "maps", "wmap", "menu"
+};
+static const char* const ag_kind_name[AG_CACHE_KINDS] = { "art", "snd", "other" };
+
+/*
+ * The worst lap since the last report, split by step.
+ *
+ * This is the line that says what a dip *was*.  Six numbers and the two that
+ * matter beside them: how many cache misses happened inside that lap and how
+ * long they took.  If scripts is the big one, it is the engine's own work -
+ * an attack resolves in scriptsHandleRequests.  If the misses account for it,
+ * it is the card.  If neither does, the time is somewhere nothing measures
+ * yet, and that is the next thing to instrument.
+ */
+static void worst_report(void)
+{
+    if (s_worst_us == 0u) {
+        return;
+    }
+    shim_printf("[worst t=%u] %u ms while %s: input %u, keys %u, scripts %u, "
+              "maps %u, present %u, slept %u (us); %u cache miss cost %u ms, "
+              "%u KB\n",
+              (unsigned)ag_millis(), (unsigned)(s_worst_us / 1000u),
+              (s_worst_where >= 0 && s_worst_where < AG_WHERES)
+                  ? ag_where_name[s_worst_where] : "?",
+              (unsigned)s_worst_input, (unsigned)s_worst_keys,
+              (unsigned)s_worst_scripts, (unsigned)s_worst_maps,
+              (unsigned)s_worst_present, (unsigned)s_worst_throttle,
+              (unsigned)s_worst_miss_n, (unsigned)s_worst_miss_ms,
+              (unsigned)s_worst_kb);
+    s_worst_us = 0u;
+    s_worst_where = -1;
+}
+
+/*
+ * And the files the misses read, worst first.
+ *
+ * Cumulative and merged by name, so the row to look at is the one whose count
+ * is large: that file is being read, thrown out, and read again.
+ */
+static void top_report(void)
+{
+    /* Ordered by picking, with a local mask: the table itself is left exactly
+     * as it was, because it goes on accumulating.  One that reset itself every
+     * twenty seconds could never show the file read thirty times, which is the
+     * whole point of keeping it. */
+    unsigned done = 0;
+
+    for (int printed = 0; printed < AG_TOP_MISSES; printed++) {
+        int pick = -1;
+        unsigned best = 0;
+
+        for (int i = 0; i < AG_TOP_MISSES; i++) {
+            if (ag_top_name[i][0] == '\0' || (done & (1u << i)) != 0u) {
+                continue;
+            }
+            if (ag_top_ms[i] >= best) {
+                best = ag_top_ms[i];
+                pick = i;
+            }
+        }
+        if (pick < 0) {
+            break;
+        }
+        done |= 1u << pick;
+
+        shim_printf("[file t=%u] %s %s x%u, %u KB, %u ms total, last while %s\n",
+                  (unsigned)ag_millis(),
+                  ag_kind_name[ag_top_kind[pick] < AG_CACHE_KINDS
+                                   ? ag_top_kind[pick] : AG_CACHE_OTHER],
+                  ag_top_name[pick], ag_top_count[pick], ag_top_kb[pick],
+                  ag_top_ms[pick],
+                  ag_where_name[ag_top_where[pick] < AG_WHERES
+                                    ? ag_top_where[pick] : AG_WHERE_WALK]);
+    }
+}
+
+static void cache_report(void)
+{
+    static const char* const* const where_name = ag_where_name;
+    static const char* const* const kind_name = ag_kind_name;
+    static bool said_legend;
+
+    unsigned traffic = 0;
+    for (int i = 0; i < AG_CACHE_SLOTS; i++) {
+        traffic += ag_cache_miss[i];
+    }
+    if (traffic == 0) {
+        return;
+    }
+
+    if (!said_legend) {
+        shim_printf("[cache] each group is <doing> <hit rate> <misses>m "
+                  "<of those, files it had and threw out>r <ms the game "
+                  "stood still>; totals since the run began\n");
+        said_legend = true;
+    }
+
+    for (int k = 0; k < AG_CACHE_KINDS; k++) {
+        char line[240];
+        size_t at = 0;
+        bool any = false;
+
+        for (int w = 0; w < AG_WHERES; w++) {
+            const int s = k * AG_WHERES + w;
+            const unsigned hit = ag_cache_hit[s];
+            const unsigned miss = ag_cache_miss[s];
+            if (hit == 0 && miss == 0) {
+                continue;
+            }
+            const unsigned asked = hit + miss;
+            const unsigned pc = (unsigned)((uint64_t)hit * 100u / asked);
+            const int n = snprintf(line + at, sizeof(line) - at,
+                                   "%s%s %u%% %um %ur %ums",
+                                   any ? " | " : "", where_name[w], pc,
+                                   miss, ag_cache_refetch[s],
+                                   ag_cache_miss_ms[s]);
+            if (n < 0) {
+                break;
+            }
+            any = true;
+            at += (size_t)n;
+            /* Truncated rather than wrapped: snprintf returns what it would
+             * have written, so this is the only way to know. */
+            if (at >= sizeof(line) - 48u) {
+                break;
+            }
+        }
+
+        if (!any) {
+            continue;
+        }
+
+        unsigned kb = 0, out = 0, fl = 0, bad = 0;
+        for (int w = 0; w < AG_WHERES; w++) {
+            const int s = k * AG_WHERES + w;
+            kb += ag_cache_miss_kb[s];
+            out += ag_cache_out[s];
+            fl += ag_cache_flush[s];
+            bad += ag_cache_failed[s];
+        }
+
+        shim_printf("[cache %s t=%u] %s || read %u KB, threw out %u, "
+                  "emptied %u times, %u refused\n",
+                  kind_name[k], (unsigned)ag_millis(), line, kb, out, fl, bad);
+    }
+}
+
 static void memstat_service(void)
 {
     const uint32_t now = (uint32_t)ag_millis();
@@ -986,6 +1245,10 @@ static void memstat_service(void)
               peak_alloc,
               (unsigned)(mi.arena_largest / 1024u));
     ag_libc_malloc_profile_dump(s_trace_prof);
+    /* The worst lap first: it is the one that says whether to read the rest. */
+    worst_report();
+    cache_report();
+    top_report();
 }
 
 static void write_ppm(const char *path)
