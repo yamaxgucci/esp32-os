@@ -80,6 +80,12 @@ HID = {
     "f1": 0x3A, "f2": 0x3B, "f3": 0x3C, "f4": 0x3D, "f5": 0x3E, "f6": 0x3F,
     "f7": 0x40, "f8": 0x41, "f9": 0x42, "f10": 0x43, "f11": 0x44, "f12": 0x45,
     "right": 0x4F, "left": 0x50, "down": 0x51, "up": 0x52,
+    # The punctuation a file name needs.  `say` looks a character up here by
+    # its own spelling, so without these it stops at the first dot of
+    # "hello.axe" - and a shell with a Run box is a shell that has to be
+    # typed at.  The ones needing shift are left out rather than faked.
+    ".": 0x37, "-": 0x2D, "/": 0x38, "=": 0x2E, ";": 0x33,
+    "period": 0x37, "minus": 0x2D, "slash": 0x38,
     # The modifiers, which carry a usage id like any other key *and* a bit in
     # every packet sent while they are held.  A real keyboard reports both and
     # a shell that reads Alt+Tab needs both: the bit says which chord it is.

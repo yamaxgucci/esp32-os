@@ -23,8 +23,11 @@
 #include "dsk.h"
 #include "dsk_cursor.h"
 #include "dsk_dlg.h"
+#include "dsk_folder.h"
+#include "dsk_icons.h"
 #include "dsk_menu.h"
 #include "dsk_paint.h"
+#include "dsk_run.h"
 #include "dsk_wm.h"
 
 /*
@@ -52,6 +55,19 @@ static bool     s_double_buf;
 static const char *s_note = "";
 
 static void damage(dsk_rect_t r) { dsk_damage_add(&s_damage, r); }
+
+/* Everything, from the strips to the windows.  Used after a program exits. */
+static void repaint_all(void) { damage(s_m.screen); }
+
+/* A file the folder window wants opened, or a directory it handled itself. */
+static void open_from_folder(const char *path, bool is_dir)
+{
+    if (is_dir) {
+        return; /* the folder window walks into directories on its own */
+    }
+    dsk_run_open(path, &s_note);
+    damage(s_m.statusbar);
+}
 
 /* ---- the double click -------------------------------------------------- */
 
@@ -85,120 +101,109 @@ static bool is_double(uint32_t now, int16_t x, int16_t y)
     return false;
 }
 
-/* ---- a window with something in it ------------------------------------- */
+/* ---- the drives, along the left of the desktop -------------------------- */
 
 /*
- * The test window of Phase 1: a plate, a line saying which one it is, and a
- * count of the clicks it has had.  It exists to be opened, dragged, resized,
- * minimised and closed - which is the whole of what this phase claims - and
- * it is what the scripted check drives.
+ * One icon per mounted drive, in a column from the top-left.
+ *
+ * The letters are asked for rather than listed: the shell knows which of A: to
+ * H: answered mountinfo, and a machine with no card in it should not show a
+ * card.  Their positions are fixed, so a double click is a coordinate the
+ * scripted check can work out for itself.
  */
+#define DRIVE_CELL_W 56
+#define DRIVE_CELL_H 44
+#define DRIVE_MAX    8
+
 typedef struct {
-    int      number;
-    uint32_t clicks;
-    char     line[32];
-} demo_t;
+    char       path[8];
+    char       label[12];
+    dsk_icon_t icon;
+} drive_t;
 
-#define DEMO_MAX DSK_WIN_MAX
-static demo_t s_demo[DEMO_MAX];
-static int    s_demo_next;
+static drive_t s_drives[DRIVE_MAX];
+static int     s_ndrives;
 
-static void demo_draw(dsk_win_t *w, dsk_rect_t client)
+/*
+ * The drives, asked for by mount point rather than by letter.
+ *
+ * mountinfo takes the POSIX name the kernel mounted the filesystem under -
+ * "/sys", not "C:" and not "c:\\" - which is worth writing down because
+ * passing it a DOS path fails silently and the desktop then simply has no
+ * drives on it, with nothing anywhere saying why.  The letters below are the
+ * spelling the rest of the system uses, and what a window's title shows.
+ */
+static void find_drives(void)
 {
-    demo_t *d = (demo_t *)w->user;
-    char    num[16];
+    static const struct {
+        const char *mount;
+        const char *root;
+        dsk_icon_t  icon;
+    } k_drives[] = {
+        {"/sd", "a:\\", DSK_ICON_FLOPPY},
+        {"/sys", "c:\\", DSK_ICON_DRIVE},
+        {"/host", "h:\\", DSK_ICON_HOST},
+        {"/tmp", "t:\\", DSK_ICON_DRIVE},
+    };
 
-    dsk_fill(client, DSK_WHITE);
-    dsk_text((int16_t)(client.x + 6), (int16_t)(client.y + 6), d->line,
-             DSK_BLACK, DSK_WHITE);
-
-    ag_strlcpy(d->line, "clicks ", sizeof(d->line));
-    ag_strlcat(d->line, ag_utoa(d->clicks, num, sizeof(num), 0, false),
-               sizeof(d->line));
-    dsk_text((int16_t)(client.x + 6), (int16_t)(client.y + 6 + DSK_FONT_H),
-             d->line, DSK_BLACK, DSK_WHITE);
-
-    /* A sunken box, so a resize shows the client area really did change. */
-    dsk_bevel(dsk_rect_inset(client, 3), false);
-
-    ag_strlcpy(d->line, "Window ", sizeof(d->line));
-    ag_strlcat(d->line,
-               ag_utoa((uint64_t)(uint32_t)d->number, num, sizeof(num), 0,
-                       false),
-               sizeof(d->line));
-}
-
-static bool demo_pointer(dsk_win_t *w, dsk_hit_t where, int16_t x, int16_t y,
-                         uint8_t buttons, bool down, bool dbl)
-{
-    (void)x;
-    (void)y;
-    (void)buttons;
-    (void)dbl;
-    if (where != DSK_HIT_CLIENT || !down) {
-        return false;
-    }
-    demo_t *d = (demo_t *)w->user;
-    d->clicks++;
-    dsk_wm_damage_rect(dsk_wm_client(w));
-    return true;
-}
-
-static void demo_closed(dsk_win_t *w)
-{
-    demo_t *d = (demo_t *)w->user;
-    if (d != NULL) {
-        d->number = 0;
+    s_ndrives = 0;
+    for (unsigned i = 0;
+         i < sizeof(k_drives) / sizeof(k_drives[0]) && s_ndrives < DRIVE_MAX;
+         i++) {
+        ag_fsinfo_t fs;
+        if (ag_mountinfo(k_drives[i].mount, &fs) != AG_OK) {
+            continue;
+        }
+        drive_t *d = &s_drives[s_ndrives++];
+        ag_strlcpy(d->path, k_drives[i].root, sizeof(d->path));
+        d->label[0] = (char)(k_drives[i].root[0] - 32); /* upper case */
+        d->label[1] = ':';
+        d->label[2] = 0;
+        /* A removable /sd is a card; one that is not is a disk. */
+        d->icon = (k_drives[i].icon == DSK_ICON_FLOPPY && !fs.removable)
+                      ? DSK_ICON_DRIVE
+                      : k_drives[i].icon;
     }
 }
 
-static const dsk_win_ops_t k_demo_ops = {
-    .draw = demo_draw,
-    .key = NULL,
-    .pointer = demo_pointer,
-    .closed = demo_closed,
-};
-
-static void open_demo_window(void)
+static dsk_rect_t drive_rect(int i)
 {
-    demo_t *d = NULL;
-    for (int i = 0; i < DEMO_MAX; i++) {
-        if (s_demo[i].number == 0) {
-            d = &s_demo[i];
-            break;
+    if (i < 0 || i >= s_ndrives) {
+        return dsk_rect_none();
+    }
+    const int16_t per_col = (int16_t)(s_m.work.h / DRIVE_CELL_H);
+    const int16_t col = (per_col > 0) ? (int16_t)(i / per_col) : 0;
+    const int16_t row = (per_col > 0) ? (int16_t)(i % per_col) : 0;
+    return dsk_rect((int16_t)(s_m.work.x + 4 + col * DRIVE_CELL_W),
+                    (int16_t)(s_m.work.y + 4 + row * DRIVE_CELL_H),
+                    DRIVE_CELL_W, DRIVE_CELL_H);
+}
+
+static void draw_drives(void)
+{
+    for (int i = 0; i < s_ndrives; i++) {
+        const dsk_rect_t r = drive_rect(i);
+        if (dsk_rect_empty(r) || !dsk_visible(r)) {
+            continue;
+        }
+        const int16_t ix = (int16_t)(r.x + (r.w - 2 * DSK_ICON_W) / 2);
+        dsk_icon_draw(s_drives[i].icon, ix, (int16_t)(r.y + 2), 2, DSK_TEAL);
+        const int16_t tw = dsk_text_small_width(s_drives[i].label);
+        dsk_text_small((int16_t)(r.x + (r.w - tw) / 2),
+                       (int16_t)(r.y + 2 + 2 * DSK_ICON_H + 2),
+                       s_drives[i].label, DSK_WHITE, DSK_TEAL);
+    }
+}
+
+/* Which drive is under the point, or -1. */
+static int drive_at(int16_t x, int16_t y)
+{
+    for (int i = 0; i < s_ndrives; i++) {
+        if (dsk_rect_has(drive_rect(i), x, y)) {
+            return i;
         }
     }
-    if (d == NULL) {
-        return;
-    }
-    s_demo_next++;
-    d->number = s_demo_next;
-    d->clicks = 0;
-
-    char num[16];
-    char title[DSK_TITLE_MAX];
-    ag_strlcpy(title, "Window ", sizeof(title));
-    ag_strlcat(title,
-               ag_utoa((uint64_t)(uint32_t)d->number, num, sizeof(num), 0,
-                       false),
-               sizeof(title));
-    ag_strlcpy(d->line, title, sizeof(d->line));
-
-    /* Cascaded from the top-left, wrapping when it would leave the desktop. */
-    const int16_t step = (int16_t)(s_m.title_h + s_m.border);
-    const int16_t w = (s_m.work.w < 220) ? (int16_t)(s_m.work.w - 8) : 220;
-    const int16_t h = (s_m.work.h < 120) ? (int16_t)(s_m.work.h - 8) : 120;
-    const int     n = dsk_wm_count();
-    int16_t       at = (int16_t)(n % 5);
-
-    if (dsk_wm_open(title,
-                    dsk_rect((int16_t)(s_m.work.x + 8 + at * step),
-                             (int16_t)(s_m.work.y + 8 + at * step), w, h),
-                    &k_demo_ops, d) == NULL) {
-        d->number = 0;
-        s_note = "no room for another window";
-        damage(s_m.statusbar);
-    }
+    return -1;
 }
 
 /* ---- the desktop's menus ----------------------------------------------- */
@@ -255,7 +260,7 @@ static void rebuild_menus(void)
     s_menus[0].title = "File";
     s_menus[0].n = 0;
     set_item(&s_menus[0], "New window", ID_NEW, true);
-    set_item(&s_menus[0], "Run...", ID_RUN, false);
+    set_item(&s_menus[0], "Run...", ID_RUN, true);
     set_separator(&s_menus[0]);
     set_item(&s_menus[0], "Exit", ID_EXIT, true);
 
@@ -299,6 +304,15 @@ static void exit_done(dsk_answer_t a, void *ctx)
     }
 }
 
+static void run_typed(dsk_answer_t a, const char *text, void *ctx)
+{
+    (void)ctx;
+    if (a == DSK_ANSWER_OK && text != NULL && text[0] != 0) {
+        dsk_run_command(text, &s_note);
+        damage(s_m.statusbar);
+    }
+}
+
 static void menu_chose(uint16_t id)
 {
     if (id >= ID_WINDOW_FIRST) {
@@ -307,7 +321,14 @@ static void menu_chose(uint16_t id)
     }
     switch (id) {
     case ID_NEW:
-        open_demo_window();
+        /* A window onto C:, which is the drive every machine here has. */
+        if (dsk_folder_open("c:\\") == NULL) {
+            s_note = "no room for another window";
+            damage(s_m.statusbar);
+        }
+        break;
+    case ID_RUN:
+        (void)dsk_dlg_input("Run", "Program to run:", "c:\\", run_typed, NULL);
         break;
     case ID_EXIT:
         (void)dsk_dlg_message("Exit", "Leave the desktop?", NULL,
@@ -387,6 +408,7 @@ static void draw_region(dsk_rect_t r)
     }
     dsk_clip(r);
     dsk_fill(s_m.work, DSK_TEAL);
+    draw_drives();
     dsk_clip_reset();
 
     dsk_wm_draw(r);
@@ -489,7 +511,11 @@ static void on_pointer(dsk_ptr_t type, int16_t x, int16_t y, uint8_t buttons,
     }
     /* Nothing wanted it: the click was on the desktop itself. */
     if (type == DSK_PTR_DOWN && dbl) {
-        open_demo_window();
+        const int d = drive_at(x, y);
+        if (d >= 0 && dsk_folder_open(s_drives[d].path) == NULL) {
+            s_note = "no room for another window";
+            damage(s_m.statusbar);
+        }
     }
 }
 
@@ -687,6 +713,9 @@ int ag_main(int argc, char **argv)
     dsk_wm_init(&s_m, damage);
     dsk_menu_init(&s_m, damage, menu_chose);
     dsk_dlg_init(&s_m);
+    dsk_folder_init(&s_m, open_from_folder);
+    dsk_run_init(repaint_all);
+    find_drives();
     rebuild_menus();
 
     /* First paint: everything, once. */
