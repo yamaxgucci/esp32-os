@@ -53,6 +53,7 @@ typedef struct {
     uint8_t     rx_buf[PKT_SIZE];
     uint8_t     rx_n;
     uint8_t     pending_move;
+    uint8_t     listen_moaned; /* the failed-to-listen warning is said once */
 } mousevirt_state_t;
 
 static mousevirt_state_t s_st;
@@ -168,11 +169,36 @@ static void ensure_listen(mousevirt_state_t *st)
     if (!ag_net_is_ready()) {
         return;
     }
-    st->listen = ag_tcp_listen(MOUSEVIRT_PORT);
-    if (st->listen < 0) {
-        st->listen = -1;
+    /*
+     * Two tasks call this and neither may spoil the other's work.
+     *
+     * The kernel's input tick asks this driver for events every ten
+     * milliseconds, and the shell asks it when a device is opened, and both can
+     * read listen < 0 before either has stored its handle.  One of them then
+     * gets -AG_EBUSY from a port the other has just bound - and the version
+     * that wrote that straight into st->listen left the port shut for the rest
+     * of the boot, with a log saying it had opened it a millisecond earlier.
+     *
+     * From the outside: a host tool reporting "nothing listening", a guest
+     * reporting a healthy driver, and one run in three or four failing.  So a
+     * refusal never clears a handle somebody else installed, and a handle won
+     * twice has the loser's copy closed rather than leaked.
+     */
+    const int32_t rc = ag_tcp_listen(MOUSEVIRT_PORT);
+    if (rc < 0) {
+        if (st->listen < 0 && !st->listen_moaned) {
+            st->listen_moaned = 1;
+            ag_log(AG_LOG_WARN, "mousevirt", "cannot listen on :%u (%d)",
+                   (unsigned)MOUSEVIRT_PORT, (int)rc);
+        }
         return;
     }
+    if (st->listen >= 0) {
+        (void)ag_net_close(rc);
+        return;
+    }
+    st->listen = rc;
+    st->listen_moaned = 0;
     (void)ag_net_set_nonblock(st->listen, true);
     ag_log(AG_LOG_INFO, "mousevirt", "listen :%u", (unsigned)MOUSEVIRT_PORT);
 }
@@ -313,6 +339,44 @@ static const ag_dev_ops_t k_ops = {
     .ioctl = mouse_ioctl,
 };
 
+/*
+ * The kernel's service tick (ABI 0.28), and what it is for here.
+ *
+ * A driver on this system has no thread, so being called is the only chance it
+ * gets to look at its socket.  Until this existed the only call that ever came
+ * was read(), which meant an application had to open /dev/mouse0 and read it
+ * every frame *even though the events arrive through ag_poll_event* - and one
+ * that did not, having no reason to think a pointer needed opening, saw a
+ * driver that accepted the host's connection, never read it, and let it be
+ * reset.  From the outside that is a mouse that does not work, and it has been
+ * diagnosed twice from scratch: once for Doom, once for the desktop shell.
+ *
+ * ag_inputpoll_tick calls this every ten milliseconds whatever the foreground
+ * application is doing, which is exactly the tick that was missing.
+ *
+ * It returns no events, and that is deliberate rather than lazy.  The events
+ * are injected from here in the surface's own pixels, which is what a pointer
+ * is measured in (ABI 0.42); the kernel's poll path takes cells and rescales
+ * them, so handing them over would quantise a mouse to the 8x16 grid of the
+ * text console.  The tick is the service; the injection is the delivery.
+ */
+static int32_t mouse_poll(ag_handle_t h, ag_event_t *out, uint32_t max)
+{
+    (void)h;
+    (void)out;
+    (void)max;
+    if (s_st.listen < 0 && s_st.conn < 0) {
+        ensure_listen(&s_st);
+    }
+    pump_rx(&s_st);
+    return 0;
+}
+
+static const ag_input_ops_t k_input_ops = {
+    .size = sizeof(ag_input_ops_t),
+    .poll = mouse_poll,
+};
+
 static void mouse_fini(void)
 {
     if (s_st.conn >= 0) {
@@ -348,6 +412,7 @@ ag_err_t ag_driver_init(void)
             .cls = AG_DEV_INPUT,
             .flags = 0,
             .ops = &k_ops,
+            .class_ops = &k_input_ops,
             .priv = &s_st,
         };
         const ag_err_t err = ag_dev_add(&desc);

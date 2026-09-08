@@ -45,7 +45,7 @@ $qemu = Resolve-Qemu
 Update-FlashImage
 $efuse = Initialize-EfuseFile
 
-$qemuArgs = Get-QemuMachineArgs -EfusePath $efuse
+$qemuArgs = Get-QemuMachineArgs -EfusePath $efuse -Graphics:$Gfx
 
 if (-not $NoNet) {
     $qemuArgs += Get-QemuNetArgs -HostPort $NetPort -GuestPort $NetPort

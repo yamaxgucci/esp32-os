@@ -33,6 +33,15 @@
     { "out": "EDIT.AXE", "group": "core", "src": ["apps/edit/edit.c"] },
     { "out": "GFXDEMO.AXE", "group": "core", "src": ["apps/gfxdemo/gfxdemo.c"] },
     {
+      "out": "DESKTOP.AXE", "group": "core",
+      "_note": "the Win 3.11-style shell; plan and phases in docs/plans/desktop.md",
+      "include": ["apps/desktop"],
+      "cflags": "-Os -ffunction-sections -fdata-sections -fno-builtin",
+      "src": ["apps/desktop/desktop.c", "apps/desktop/dsk_rect.c",
+              "apps/desktop/dsk_layout.c", "apps/desktop/dsk_paint.c",
+              "apps/desktop/dsk_cursor.c"]
+    },
+    {
       "out": "MARAUDER.AXE", "group": "core",
       "_note": "ESP32-Marauder port as a loadable .AXE (Maxim's requirement); UI via gfx->present bands, radio via api->wifimon. Needs the board (touch/display/radio); compiled here to keep it from rotting.",
       "include": ["apps/marauder"],

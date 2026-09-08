@@ -5,6 +5,14 @@
 #   .\tools\qemu-boot.ps1
 #   .\tools\qemu-boot.ps1 -Send @('ver','mem') -Marker 'A:\>'
 #   .\tools\qemu-boot.ps1 -Put 'HELLO.AXE=t:\hello.axe' -Send @('run t:\hello.axe')
+#   .\tools\qemu-boot.ps1 -Gfx -Send @('~run h:\desktop.axe 30\x0d',
+#                                      '!.\tools\grab-window.ps1 -Out build\a.png')
+#
+# A -Send item may be prefixed:
+#
+#   ~   raw bytes, no Enter, no waiting for a prompt (\xNN is decoded)
+#   =   send nothing, wait for this text to appear
+#   !   run this on the host, not in the guest, and record what it printed
 #
 # QEMU's serial port is exposed over TCP rather than stdio.  Piping stdio is
 # what the obvious version of this script does, and it does not work: a
@@ -36,6 +44,15 @@ param(
     [int]$HostFsPort = 5557,
     [switch]$NoNet,
     [int]$NetPort = 5558,
+    # Open QEMU's virtual RGB panel, so a graphical application can be
+    # photographed with tools\grab-window.ps1 while it runs.  Without this the
+    # emulator has no window at all and the soft framebuffer goes nowhere a
+    # camera can see it.
+    #
+    # The console still comes back over TCP, which is the point: this is how a
+    # graphical .AXE gets driven and looked at by a script with nobody at the
+    # desk.  See apps\desktop\check.ps1.
+    [switch]$Gfx,
     # Tie virtual time to instructions retired instead of to host time.
     #
     # Without this, neither clock the guest can read means anything about the
@@ -111,8 +128,8 @@ if ($HostFs) {
 # wait=on is essential: a TCP serial port with no peer throws its output away,
 # and the whole boot is over in a quarter of a second.  Without it the test
 # races the emulator and loses often enough to be useless.
-$qemuArgs = (Get-QemuMachineArgs -EfusePath $efuse) + @(
-    '-display', 'none'
+$qemuArgs = (Get-QemuMachineArgs -EfusePath $efuse -Graphics:$Gfx) + @(
+    '-display', $(if ($Gfx) { 'sdl' } else { 'none' })
     '-monitor', 'none'
     '-serial', "tcp:127.0.0.1:$Port,server=on,wait=on"
 )
@@ -373,6 +390,35 @@ try {
                 $stream.Write($bytes, 0, $bytes.Length)
                 $stream.Flush()
                 Start-Sleep -Milliseconds 300
+                $seen = Read-Available
+                continue
+            }
+            # A leading ! runs a command on *this* machine and sends the guest
+            # nothing.  It is here for the same reason the ~ items are: some of
+            # what a test has to do happens while an application is running and
+            # there is no prompt to hang the next step off.  A graphical
+            # program is driven by tools\inputplay.py over a socket and
+            # photographed with tools\grab-window.ps1, and both of those are
+            # host commands that have to land between the launch and the quit.
+            #
+            # Whatever it prints goes into the transcript, so a run that failed
+            # for a host-side reason says so in the same file as the guest's
+            # own output.
+            if ($cmd.StartsWith('!')) {
+                $host_cmd = $cmd.Substring(1)
+                Write-Host "host: $host_cmd"
+                [void]$text.Append("`r`n[host] $host_cmd`r`n")
+                try {
+                    $out = Invoke-Expression $host_cmd 2>&1 | Out-String
+                    if ($out) {
+                        Write-Host $out.TrimEnd()
+                        [void]$text.Append($out)
+                    }
+                } catch {
+                    $msg = "[host] FAILED: $($_.Exception.Message)"
+                    Write-Host $msg
+                    [void]$text.Append("$msg`r`n")
+                }
                 $seen = Read-Available
                 continue
             }

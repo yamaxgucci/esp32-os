@@ -302,9 +302,23 @@ function Get-QemuSdArgs {
 
 # Machine arguments common to every way we start the emulator.
 function Get-QemuMachineArgs {
-    param([string]$EfusePath)
+    param(
+        [string]$EfusePath,
+        # The virtual RGB panel at 0x21000000, which is a machine option and
+        # not a device: `-device esp_rgb` does not exist and never did.
+        #
+        # This is opt-in on the QEMU side, and the failure when it is left out
+        # is quiet in a way that wasted an afternoon: `-display sdl` still
+        # opens a window, the window is QEMU's own default 800x600, and
+        # everything the guest draws goes into a framebuffer nobody shows.
+        # esp_lcd_new_rgb_qemu fails, ag_port_panel_open answers false, and the
+        # display driver falls back to a soft surface in PSRAM without a word.
+        # The way to tell from the outside: a window that is 800x600 rather
+        # than the size the guest asked for has no panel behind it.
+        [switch]$Graphics
+    )
     return @(
-        '-M', 'esp32s3'
+        '-M', $(if ($Graphics) { 'esp32s3,graphics=on' } else { 'esp32s3' })
         # QEMU reserves a 1 GB JIT buffer by default on a 64-bit host, and it
         # reserves it as committed memory.  On a 16 GB machine with the IDF
         # toolchain and an editor already resident that request fails outright -
