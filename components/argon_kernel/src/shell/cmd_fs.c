@@ -53,13 +53,22 @@ static void print_error(const char *what, ag_err_t err)
  * Splits a user-supplied argument into a directory to walk and a wildcard to
  * match.  "T:\apps\*.axe" becomes /tmp/apps plus "*.axe"; a plain directory
  * becomes itself plus "*".
+ *
+ * `whole_dir` says which of the two happened, and it matters: an argument that
+ * WAS a directory is listed even when it is empty, while one that became a
+ * pattern and matched nothing is "File not found".  Without the distinction an
+ * empty directory and a directory that is not there produce the same output -
+ * see ag_cmd_dir.
  */
 static ag_err_t split_pattern(const char *arg, char *dir, size_t dirlen,
-                              char *pattern, size_t patlen)
+                              char *pattern, size_t patlen, bool *whole_dir)
 {
     char resolved[AG_PATH_MAX];
     ag_err_t err = ag_path_resolve(arg, ag_shell_cwd(), resolved,
                                    sizeof(resolved));
+    if (whole_dir != NULL) {
+        *whole_dir = false;
+    }
     if (err != AG_OK) {
         return err;
     }
@@ -68,6 +77,9 @@ static ag_err_t split_pattern(const char *arg, char *dir, size_t dirlen,
     if (ag_vfs_stat(resolved, NULL, &st) == AG_OK && (st.attr & AG_A_DIR)) {
         snprintf(dir, dirlen, "%s", resolved);
         snprintf(pattern, patlen, "*");
+        if (whole_dir != NULL) {
+            *whole_dir = true;
+        }
         return AG_OK;
     }
 
@@ -109,10 +121,11 @@ int ag_cmd_dir(int argc, char **argv)
 {
     char dir[AG_PATH_MAX];
     char pattern[AG_NAME_MAX];
+    bool whole_dir = true;
 
     if (argc > 1) {
         const ag_err_t err = split_pattern(argv[1], dir, sizeof(dir), pattern,
-                                          sizeof(pattern));
+                                          sizeof(pattern), &whole_dir);
         if (err != AG_OK) {
             print_error(argv[1], err);
             return 1;
@@ -168,6 +181,26 @@ int ag_cmd_dir(int argc, char **argv)
         }
     }
     ag_vfs_closedir(d);
+
+    /*
+     * Nothing matched a pattern: "File not found", as DOS said, and a non-zero
+     * exit code so a script can tell.
+     *
+     * The case this exists for is `dir` on a path that is not there.  It is
+     * not an error to reach here - "t:\nope" resolves, its parent opens, and
+     * the pattern "nope" simply matches nothing - so what came out was the
+     * PARENT's header and a count of zero, which is character for character
+     * what an empty directory that does exist looks like.  `dir` therefore
+     * could not answer "was it deleted", which cost a test run in
+     * apps/fm/check.ps1 before it was written down.
+     *
+     * A directory that exists and is empty still gets its listing and its
+     * totals: it answered the question, and the answer was nothing.
+     */
+    if (!whole_dir && (files + dirs) == 0) {
+        ag_console_puts("File not found\n");
+        return 1;
+    }
 
     ag_console_printf("\n%8u file(s) %12u bytes\n", (unsigned)files,
                       (unsigned)bytes);
@@ -382,7 +415,7 @@ int ag_cmd_del(int argc, char **argv)
     char dir[AG_PATH_MAX];
     char pattern[AG_NAME_MAX];
     ag_err_t err = split_pattern(argv[1], dir, sizeof(dir), pattern,
-                                 sizeof(pattern));
+                                 sizeof(pattern), NULL);
     if (err != AG_OK) {
         print_error(argv[1], err);
         return 1;

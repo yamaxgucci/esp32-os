@@ -332,18 +332,15 @@ try {
         # it: a window drawing the right thing over a filesystem it did not
         # actually change would pass a test that only asked the window.
         #
-        # `type` and not `dir` for the things that should be gone: `dir` on a
-        # path that does not exist lists its PARENT and reports no files,
-        # which is the same output as an empty directory that does exist.
-        # `type` and not `dir` for what should be GONE: `dir` on a path that
-        # does not exist lists its PARENT and reports no files, which is the
-        # same output as an empty directory that does exist.
+        # `type` and not `dir` for the file that should be gone, because it
+        # names the file it could not find and `dir` names the directory it
+        # searched - and here the interesting thing is the file.
         #
-        # And nothing here types a file that might still be there: `type` on an
+        # Nothing here types a file that might still be there: `type` on an
         # .AXE that survived a failed rename puts a kilobyte of Xtensa onto the
-        # screen, which is a failure that hides every other answer on it.  The
-        # listing says both things at once - the new name present, the old one
-        # absent - so it is what is asked.
+        # screen, and that hides every other answer on it.  The listing says
+        # both things at once - the new name present, the old one absent - so
+        # it is what is asked for the rename.
         'type c:\drv2\kbdvirt.sys',
         'dir c:\drv',
         'dir c:\'

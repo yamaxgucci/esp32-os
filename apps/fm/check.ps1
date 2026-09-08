@@ -99,11 +99,13 @@ try {
         # these four lines have to still be on it at the end.
         'dir t:\dst',
         'type t:\dst\sub\b.txt',
-        # `type` and not `dir` for the file that should be gone: `dir` on a
-        # path that does not exist lists its PARENT and reports no files,
-        # which is indistinguishable from an empty directory that does
-        # exist.  `type` says "file not found" and names the file.
-        'type t:\src\sub\b.txt',
+        # `dir` on the directory that should be gone.  It used to be `type` on
+        # a file inside it, because `dir` on a path that does not exist listed
+        # its PARENT and reported no files - character for character what an
+        # empty directory that does exist looks like.  It says "File not
+        # found" now, so the natural question can be asked directly, and
+        # asking it here is what keeps that fixed.
+        'dir t:\src\sub',
         'type t:\src\a.txt'
     )
 
@@ -147,7 +149,7 @@ try {
     #
     #   dir t:\dst              the copy made the tree
     #   type t:\dst\sub\b.txt    with the bytes that were in it
-    #   type t:\src\sub\b.txt    the delete took the directory
+    #   dir t:\src\sub          the delete took the directory
     #   type t:\src\a.txt        and left its sibling alone
     if ($screen -notmatch 'sub +<DIR>') {
         $fail += 'the subdirectory was not copied'
@@ -155,8 +157,8 @@ try {
     if ($screen -notmatch 'world') {
         $fail += "the copied file's contents did not survive"
     }
-    if ($screen -notmatch 'src.sub.b\.txt: file not found') {
-        $fail += 'the deleted directory still has its file in it'
+    if ($screen -notmatch 'File not found') {
+        $fail += 'the deleted directory is still there'
     }
     if ($screen -notmatch 'hello') {
         $fail += 'the delete took the sibling file as well as the directory'
