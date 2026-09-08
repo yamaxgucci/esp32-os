@@ -25,26 +25,27 @@
 # inputplay allowed to connect - before that the port is refused and the guest
 # looks dead.  See the header of tools\inputplay.py.
 #
-# ---- why this runs at 640x400 and not at the board's 320x240 ---------------
+# ---- how the surface size is chosen ----------------------------------------
 #
-# The surface size is read from [display] in C:\SYSTEM.CFG at boot, so testing
-# another size means writing that file and rebooting - and **writing to C: in
-# QEMU is not reliable enough to build a test on**.  Measured over eight runs
-# of exactly that shape:
+# C: is built here and merged into the flash image (tools\mksysfs.py, then
+# -SysFs), so the whole run is one boot: the surface size is in SYSTEM.CFG
+# before anything has started, the two input drivers are already in C:\DRV and
+# named in [modules], and the shell itself is on C:.  Nothing is written to
+# flash by the guest and nothing is rebooted.
 #
-#   * three of them had a file written to C: read back malformed afterwards -
-#     `-91` (AG_EFORMAT), on `c:\desktop.axe` once and on the driver
-#     `drv install` had just copied to `c:\drv\mousevirt.sys` twice
-#   * the boot after such a write took 128 seconds against the usual two
-#   * HostFS sometimes does not come back after the reset, so h:\ paths turn
-#     into "file not found" as well
-#
-# The shell itself is fine at 320x240 - it has been photographed there and the
-# layout is right.  What is missing is a way to *arrange* that size without
-# writing to C:, which is to bake the partition into the flash image with
-# tools\mksysfs.py.  Until that exists, this checks the size QEMU boots with.
+# That is not tidiness.  The obvious version - write C:\SYSTEM.CFG from the
+# shell and reboot - was tried and is not reliable enough to build a test on:
+# over eight runs of that shape, three had a file written to C: read back
+# malformed afterwards (`-91`, AG_EFORMAT: once `c:\desktop.axe`, twice a
+# driver `drv install` had just copied), the boot after such a write took 128
+# seconds against the usual two, and HostFS did not always come back after the
+# reset either.
 [CmdletBinding()]
 param(
+    # The surface to give the shell.  320x240 is what the boards have; the
+    # default is what the firmware boots with when [display] says nothing.
+    [int]$Width = 0,
+    [int]$Height = 0,
     [int]$Seconds = 40,       # the shell's own deadline, so nothing can hang
     [string]$Out = 'build\desktop',
     [switch]$NoBuild
@@ -62,29 +63,11 @@ try {
         if ($LASTEXITCODE -ne 0) { throw 'building the images failed' }
     }
 
-    $share = Join-Path $root 'build\sd_card'
     foreach ($f in @('DESKTOP.AXE', 'KBDVIRT.SYS', 'MOUSEVIRT.SYS')) {
-        if (-not (Test-Path (Join-Path $share $f))) {
-            throw "$f is not staged in build\sd_card"
+        if (-not (Test-Path (Join-Path $root "build\apps\$f"))) {
+            throw "$f is not built (build\apps\$f)"
         }
     }
-
-    <#
-      A fresh flash image, so C: starts empty.
-
-      The image is only rebuilt when the firmware changes (there is a stamp
-      beside it), so without this C: carries everything earlier runs wrote -
-      including the two drivers and the [modules] lines that autoload them.
-      The second run then boots with them already resident, `drv install`
-      replaces them, the new instance cannot bind a port the old one still
-      holds, and the guest ends up with a mouse driver that is loaded and
-      listening to nothing.  Measured: run one fine, run two with zero pointer
-      events and no error anywhere.
-
-      Reformatting littlefs costs the first boot about two seconds.
-    #>
-    Remove-Item -ErrorAction SilentlyContinue -Path (Join-Path $root 'build\qemu_flash.bin'),
-                                                    (Join-Path $root 'build\qemu_flash.stamp')
 
     New-Item -ItemType Directory -Force (Split-Path $Out) | Out-Null
     $png = Join-Path $root "$Out.png"
@@ -101,11 +84,41 @@ try {
         $found.FullName
     }
 
+    # ---- C: ---------------------------------------------------------------
+    $work = Join-Path $root 'build\dsk'
+    New-Item -ItemType Directory -Force $work | Out-Null
+    @('; built by apps\desktop\check.ps1 - the [display] section is appended',
+      '; by mksysfs --display-size',
+      '[modules]',
+      'device = c:\drv\kbdvirt.sys',
+      'device = c:\drv\mousevirt.sys') |
+        Set-Content -Encoding ascii (Join-Path $work 'SYSTEM.CFG')
+
+    $sysfs = Join-Path $work 'sysfs.bin'
+    $mkArgs = @('tools\mksysfs.py', '--board', 'none',
+                '--partitions', 'partitions.csv',
+                '--display', 'soft',
+                '--out', $sysfs,
+                '--add', ((Join-Path $work 'SYSTEM.CFG') + '=SYSTEM.CFG'),
+                '--add', 'build\apps\KBDVIRT.SYS=drv/kbdvirt.sys',
+                '--add', 'build\apps\MOUSEVIRT.SYS=drv/mousevirt.sys',
+                '--add', 'build\apps\DESKTOP.AXE=DESKTOP.AXE')
+    if ($Width -gt 0 -and $Height -gt 0) {
+        $mkArgs += @('--display-size', "${Width}x${Height}")
+    }
+    # littlefs-python lives in the IDF venv, not necessarily in ARGON_PYTHON.
+    $mkpy = Get-ChildItem -Path (Join-Path $env:IDF_TOOLS_PATH 'python_env') `
+        -Filter 'python.exe' -Recurse -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if (-not $mkpy) { throw 'no IDF python for mksysfs (needs littlefs-python)' }
+    & $mkpy.FullName @mkArgs | Out-Host
+    if ($LASTEXITCODE -ne 0) { throw 'mksysfs failed' }
+
     # ---- the sequence -----------------------------------------------------
     # Where the pointer is walked: across the middle, then back, then up, then
     # a click in the centre.  Coordinates are the surface's own pixels.
-    $w = 640
-    $h = 400
+    $w = if ($Width -gt 0) { $Width } else { 640 }
+    $h = if ($Height -gt 0) { $Height } else { 400 }
     $cx = [int]($w / 2)
     $cy = [int]($h / 2)
     $span = [int]($w / 4)
@@ -123,12 +136,12 @@ try {
     $after = @('"key f5"', '"wait 1500"') -join ' '
 
     $send = @(
-        'drv install h:\kbdvirt.sys',
-        'drv install h:\mousevirt.sys',
+        # Nothing to install: the drivers came up from C:\DRV with the boot,
+        # because SYSTEM.CFG on the baked image names them in [modules].
         'dev',
         # Raw, so the harness does not sit waiting for a prompt that cannot
         # come until the shell's own deadline expires.
-        "~run h:\desktop.axe $Seconds`r",
+        "~run c:\desktop.axe $Seconds`r",
         '=desktop: surface',
         "!& '$pyexe' 'tools\inputplay.py' --wait 20 $quoted",
         "!.\tools\grab-window.ps1 -Out '$png'",
@@ -141,7 +154,9 @@ try {
     )
 
     Write-Host "desktop: driving QEMU, transcript -> $log, picture -> $png"
-    & .\tools\qemu-boot.ps1 -Gfx -HostFs $share -LogPath $log `
+    # No -HostFs: everything the guest needs is on the C: image, which is one
+    # fewer moving part - and HostFS is one that has been seen not to come back.
+    & .\tools\qemu-boot.ps1 -Gfx -SysFs $sysfs -LogPath $log `
         -TimeoutSec 90 -Send $send | Out-Host
 
     # ---- what came back ---------------------------------------------------
@@ -195,10 +210,22 @@ try {
         $b.Dispose()
     }
 
-    $m = [regex]::Match($text, 'desktop: surface (\d+)x(\d+) (\w+)')
+    $m = [regex]::Match($text,
+                        'desktop: surface (\d+)x(\d+) (\w+), focus (\w+)')
     if ($m.Success) {
-        Write-Host ("desktop: surface {0}x{1} {2}" -f $m.Groups[1].Value,
-                    $m.Groups[2].Value, $m.Groups[3].Value)
+        Write-Host ("desktop: surface {0}x{1} {2}, focus {3}" -f
+                    $m.Groups[1].Value, $m.Groups[2].Value,
+                    $m.Groups[3].Value, $m.Groups[4].Value)
+        if ($Width -gt 0 -and [int]$m.Groups[1].Value -ne $Width) {
+            $fail += ("asked for a {0}x{1} surface and got {2}x{3}" -f $Width,
+                      $Height, $m.Groups[1].Value, $m.Groups[2].Value)
+        }
+        # Painting before the slot has focus is painting into a flush the
+        # kernel discards.  The shell waits for it; if it gave up waiting, the
+        # picture below is not to be trusted.
+        if ($m.Groups[4].Value -ne 'yes') {
+            $fail += 'the shell started painting without focus'
+        }
     } else {
         $fail += 'the shell never said what surface it got'
     }

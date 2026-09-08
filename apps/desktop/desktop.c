@@ -302,13 +302,32 @@ int ag_main(int argc, char **argv)
     }
 
     s_double_buf = info.double_buf;
+
+    /*
+     * Wait to be given the screen before drawing on it.
+     *
+     * A process is adopted into its session slot a little after it starts
+     * running - measured here at ninety milliseconds after the first
+     * instruction - and until then it is nobody's foreground.  Painting in
+     * that window is work thrown away: the kernel is right to ignore a flush
+     * from a slot that is not focused, and this shell would rather find out by
+     * asking than by looking at a screen that still shows the console.
+     *
+     * Bounded, and then it paints anyway: a machine with no session layer at
+     * all must not be a machine where this hangs.
+     */
+    for (uint32_t waited = 0; !ag_focused() && waited < 2000u; waited += 10u) {
+        ag_delay(10);
+    }
+
     /*
      * Said on the console as well as drawn on the plate, because a script
      * driving this cannot read the screen: the surface it got is the first
      * thing that has to be checkable from the transcript.
      */
-    ag_printf("desktop: surface %ux%u %s\n", (unsigned)info.width,
-              (unsigned)info.height, info.double_buf ? "double" : "single");
+    ag_printf("desktop: surface %ux%u %s, focus %s\n", (unsigned)info.width,
+              (unsigned)info.height, info.double_buf ? "double" : "single",
+              ag_focused() ? "yes" : "no");
 
     dsk_metrics_init(&s_m, (int16_t)info.width, (int16_t)info.height);
     dsk_paint_bind_surface(info.fb, info.stride, s_m.screen_w, s_m.screen_h);
@@ -400,6 +419,24 @@ int ag_main(int argc, char **argv)
                 if (ev.key.unicode == 'q' || ev.key.unicode == 'Q') {
                     running = false;
                 }
+                break;
+            case AG_EV_FOCUS_GAINED:
+                /*
+                 * The screen is ours again and whatever was on it in the
+                 * meantime is not ours.  Repaint the lot; there is no cheaper
+                 * correct answer, because nothing tells us what changed.
+                 */
+                s_repaints++;
+                damage(s_m.screen);
+                break;
+            case AG_EV_FOCUS_LOST:
+                /*
+                 * Stop drawing.  The kernel ignores a flush from an unfocused
+                 * slot anyway, so painting here would be work thrown away, and
+                 * on a board it is work taken from whoever is in front.
+                 */
+                dsk_damage_clear(&s_damage);
+                s_status_dirty = false;
                 break;
             case AG_EV_QUIT:
                 running = false;

@@ -53,6 +53,15 @@ param(
     # graphical .AXE gets driven and looked at by a script with nobody at the
     # desk.  See apps\desktop\check.ps1.
     [switch]$Gfx,
+    # A pre-built C: partition, merged into the flash image (tools\mksysfs.py).
+    #
+    # Everything C: normally has to be given at runtime - the surface size in
+    # [display], the modules to autoload, an application to run - arrives
+    # before the first boot instead.  That matters because writing C: on a
+    # running guest and rebooting is not reliable here: three runs in eight had
+    # a file written that way read back as -91 (AG_EFORMAT), and the boot after
+    # such a write took 128 seconds against the usual two.
+    [string]$SysFs = '',
     # Tie virtual time to instructions retired instead of to host time.
     #
     # Without this, neither clock the guest can read means anything about the
@@ -73,7 +82,7 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'qemu-common.ps1')
 
 $qemu = Resolve-Qemu
-Update-FlashImage
+Update-FlashImage -SysFs $SysFs
 $efuse = Initialize-EfuseFile
 
 $hostfsProc = $null

@@ -160,22 +160,18 @@ void ag_port_panel_present(int32_t y, int32_t h)
         if (!covers) {
             wait_idle();
             /*
-             * Still in flight after the wait gave up.  Writing the registers
-             * now replaces the request QEMU has not finished with, and the
-             * rows it had not reached are simply never copied - which is not
-             * a dropped frame but a *torn* one, and it stays torn until
-             * something happens to redraw those rows.
+             * Fifty milliseconds and still busy.  Writing the registers now
+             * would replace a request QEMU has not finished, and the rows it
+             * had not reached would never be copied at all - a torn frame
+             * rather than a dropped one, which stays on the glass until
+             * something happens to redraw those rows.  So widen this request
+             * to cover what is pending: a wider copy costs pixels, a truncated
+             * one costs correctness.
              *
-             * Seen as the shell's first full paint arriving with the console
-             * text still on the lower half of the screen: the whole frame was
-             * kicked, a sixteen-pixel pointer square was kicked a moment
-             * later, and the pointer's request truncated the frame's.  A
-             * forced repaint cleared it, which is what says the pixels were in
-             * the framebuffer all along and only the sending was cut short.
-             *
-             * So absorb what was pending instead of discarding it.  The cost
-             * is a wider copy for one frame; the alternative is a picture that
-             * is wrong with nothing on either side reporting it.
+             * Not what caused the desktop shell's first paint to arrive in
+             * halves, which was the display owner flushing before its session
+             * slot had focus (see gfx_may_present in src/dev/display.c) - but
+             * looked exactly like it, and is worth not leaving open.
              */
             if ((rgb[RGB_MMIO_UPDATE_STATUS] & 1u) != 0) {
                 if (s_y0 < y) {

@@ -30,7 +30,12 @@ param(
     [switch]$NoNet,
     [int]$NetPort = 5558,
     # Spawn pcmplay + kbdvirt + mousevirt (--reconnect) like hostfsd; kill with QEMU.
-    [switch]$Virt
+    [switch]$Virt,
+    # A pre-built C: partition, merged into the flash image (tools\mksysfs.py).
+    # Everything C: normally has to be given at runtime - the surface size, the
+    # modules to autoload, an application to run - arrives before the first
+    # boot instead, with no writing to flash and no reboot.
+    [string]$SysFs = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -42,7 +47,7 @@ if (-not $NoBuild) {
 }
 
 $qemu = Resolve-Qemu
-Update-FlashImage
+Update-FlashImage -SysFs $SysFs
 $efuse = Initialize-EfuseFile
 
 $qemuArgs = Get-QemuMachineArgs -EfusePath $efuse -Graphics:$Gfx

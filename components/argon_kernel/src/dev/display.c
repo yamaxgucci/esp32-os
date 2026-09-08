@@ -493,17 +493,36 @@ static const ag_display_ops_t k_fb_class_ops = {
 /* gfx API                                                                 */
 /* ---------------------------------------------------------------------- */
 
+/*
+ * May this caller put pixels on the panel?
+ *
+ * Whoever holds the display may, and that is the important clause.  The
+ * focused-slot test below it is a safety net against an application in a
+ * background slot painting over the foreground - which cannot happen to the
+ * holder, because moving focus away force-releases the display from under it
+ * (see ag_session_focus in src/proc/session.c).  So an owner is by
+ * construction the process entitled to draw.
+ *
+ * Testing focus *instead* of ownership cost a long hunt.  A process is adopted
+ * into its slot a little after it starts running, and in that window it can
+ * acquire the display, draw a whole screen and flush it, and every flush is
+ * dropped without a word: acquire said yes, the drawing calls said nothing,
+ * and the panel kept showing the console.  Whether it happened at all depended
+ * on how long the first paint took - the desktop shell lost the race on a
+ * 320x240 surface every single time and won it on 640x400, which is as
+ * confusing a symptom as this system has produced.
+ */
 static bool gfx_may_present(void)
 {
     if (!s_acquired) {
         return false;
     }
-    /* Safety net: ignore flush/swap from a background session slot. */
     const ag_pid_t me = ag_proc_self();
-    if (me != AG_PID_KERNEL && me != ag_session_focused_pid()) {
-        return false;
+    if (me == AG_PID_KERNEL || me == s_owner) {
+        return true;
     }
-    return true;
+    /* Safety net: ignore flush/swap from a background session slot. */
+    return me == ag_session_focused_pid();
 }
 
 static ag_err_t gfx_acquire(ag_gfxinfo_t *out)

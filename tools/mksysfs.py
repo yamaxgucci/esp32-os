@@ -61,45 +61,46 @@ def read_config(sdkconfig, key, default):
     return default
 
 
-def stage(board_dir, apps_dir, out_dir, display=None, extra=()):
-    """Assemble what belongs on C:, from the board pack and the built images."""
+def stage(board_dir, apps_dir, out_dir, display=None, extra=(),
+          display_size=None):
+    """Assemble what belongs on C:, from the board pack and the built images.
+
+    `board_dir` may be None, and then nothing comes from a pack: the caller
+    supplies every file with --add.  That is for the emulator, which has no
+    board and whose pins are nobody's - staging the CYD's BOARD.CFG there
+    describes hardware that is not present and, worse, declares a 160x120
+    display on a machine that could show any size.
+    """
     os.makedirs(out_dir, exist_ok=True)
     staged = []
 
-    for name in ("BOARD.CFG", "SYSTEM.CFG"):
-        src = os.path.join(board_dir, name)
-        if not os.path.isfile(src):
-            raise SystemExit(f"mksysfs: {src} is missing")
-        shutil.copy2(src, os.path.join(out_dir, name))
-        staged.append(name)
+    if board_dir is not None:
+        for name in ("BOARD.CFG", "SYSTEM.CFG"):
+            src = os.path.join(board_dir, name)
+            if not os.path.isfile(src):
+                raise SystemExit(f"mksysfs: {src} is missing")
+            shutil.copy2(src, os.path.join(out_dir, name))
+            staged.append(name)
 
-    # SYSTEM.CFG is read after BOARD.CFG and wins, so the override goes there
-    # rather than editing the board's own description of its hardware.
-    if display is not None:
-        with open(os.path.join(out_dir, "SYSTEM.CFG"), "a",
-                  encoding="utf-8") as f:
-            f.write("\n; Added by mksysfs --display\n"
-                    "[display]\n"
-                    f"driver = {display}\n")
+        # Drivers, under the names SYSTEM.CFG spells: lower case, because that
+        # is what `drv install` writes and littlefs does not fold case.
+        drv_dir = os.path.join(out_dir, "drv")
+        os.makedirs(drv_dir, exist_ok=True)
+        sysfile = os.path.join(board_dir, "modules.txt")
+        if os.path.isfile(sysfile):
+            with open(sysfile, "r", encoding="utf-8") as f:
+                wanted = [l.strip() for l in f
+                          if l.strip() and not l.startswith("#")]
+        else:
+            wanted = ["ILI9341.SYS", "XPT2046.SYS"]
 
-    # Drivers, under the names SYSTEM.CFG spells: lower case, because that is
-    # what `drv install` writes and littlefs does not fold case.
-    drv_dir = os.path.join(out_dir, "drv")
-    os.makedirs(drv_dir, exist_ok=True)
-    sysfile = os.path.join(board_dir, "modules.txt")
-    if os.path.isfile(sysfile):
-        with open(sysfile, "r", encoding="utf-8") as f:
-            wanted = [l.strip() for l in f if l.strip() and not l.startswith("#")]
-    else:
-        wanted = ["ILI9341.SYS", "XPT2046.SYS"]
-
-    for image in wanted:
-        src = os.path.join(apps_dir, image)
-        if not os.path.isfile(src):
-            raise SystemExit(
-                f"mksysfs: {src} is missing - run `argon apps --group board`")
-        shutil.copy2(src, os.path.join(drv_dir, image.lower()))
-        staged.append("drv/" + image.lower())
+        for image in wanted:
+            src = os.path.join(apps_dir, image)
+            if not os.path.isfile(src):
+                raise SystemExit(
+                    f"mksysfs: {src} is missing - run `argon apps --group board`")
+            shutil.copy2(src, os.path.join(drv_dir, image.lower()))
+            staged.append("drv/" + image.lower())
 
     for spec in extra:
         host, _, name = spec.partition("=")
@@ -107,8 +108,29 @@ def stage(board_dir, apps_dir, out_dir, display=None, extra=()):
             name = os.path.basename(host)
         if not os.path.isfile(host):
             raise SystemExit(f"mksysfs: {host} is missing")
-        shutil.copy2(host, os.path.join(out_dir, name))
-        staged.append(name)
+        dst = os.path.join(out_dir, *name.split("/"))
+        os.makedirs(os.path.dirname(dst) or out_dir, exist_ok=True)
+        shutil.copy2(host, dst)
+        if name not in staged:
+            staged.append(name)
+
+    # Last, and that is a fix rather than a detail: SYSTEM.CFG is read after
+    # BOARD.CFG and wins, so the override belongs there rather than in the
+    # board's own description of its hardware - but appending it before the
+    # --add files were copied meant an `--add mine.cfg=SYSTEM.CFG` silently
+    # threw the override away.  Now it is appended to whichever SYSTEM.CFG
+    # ended up on the image, and one is created if none did.
+    if display is not None or display_size is not None:
+        path = os.path.join(out_dir, "SYSTEM.CFG")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write("\n; Added by mksysfs\n[display]\n")
+            if display is not None:
+                f.write(f"driver = {display}\n")
+            if display_size is not None:
+                f.write(f"width  = {display_size[0]}\n"
+                        f"height = {display_size[1]}\n")
+        if "SYSTEM.CFG" not in staged:
+            staged.append("SYSTEM.CFG")
 
     return staged
 
@@ -117,7 +139,10 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--board", default=os.path.join(ROOT, "boards", "esp32-cyd"),
-                    help="board pack holding BOARD.CFG and SYSTEM.CFG")
+                    help="board pack holding BOARD.CFG and SYSTEM.CFG; "
+                         "`none` stages no pack at all and every file comes "
+                         "from --add, which is what the emulator wants - it "
+                         "has no pins to describe and no fixed screen size")
     ap.add_argument("--apps", default=os.path.join(ROOT, "build", "apps"),
                     help="where the built .SYS images are")
     ap.add_argument("--partitions",
@@ -131,6 +156,14 @@ def main():
                          "their own pixels (gfx->present) - which on this board "
                          "is 37 KB of a 320 KB machine handed back; `none` is no "
                          "graphics whatsoever")
+    ap.add_argument("--display-size", metavar="WxH",
+                    help="the soft framebuffer's size, into the same "
+                         "[display] section.  Without this the firmware's "
+                         "default (640x400) stands, and the only other way to "
+                         "change it is to write C:\\SYSTEM.CFG on a running "
+                         "system and reboot - which in QEMU is unreliable "
+                         "enough to have wasted a session (see "
+                         "apps/desktop/check.ps1)")
     ap.add_argument("--add", action="append", default=[], metavar="HOST[=NAME]",
                     help="put another file on C: as well, repeatable.  For "
                          "anything big enough that sending it through the "
@@ -151,10 +184,19 @@ def main():
     # second one did.  Quoted in sdkconfig, hence the strip.
     chip = read_config(args.sdkconfig, "CONFIG_IDF_TARGET", '"esp32"').strip('"')
 
+    size_wh = None
+    if args.display_size:
+        m = re.fullmatch(r"(\d+)\s*[xX]\s*(\d+)", args.display_size.strip())
+        if not m:
+            raise SystemExit("mksysfs: --display-size wants WxH, e.g. 320x240")
+        size_wh = (int(m.group(1)), int(m.group(2)))
+
+    board = None if args.board.lower() == "none" else args.board
+
     staged_dir = tempfile.mkdtemp(prefix="argon-sysfs-")
     try:
-        staged = stage(args.board, args.apps, staged_dir, args.display,
-                       args.add)
+        staged = stage(board, args.apps, staged_dir, args.display,
+                       args.add, size_wh)
         os.makedirs(os.path.dirname(args.out), exist_ok=True)
 
         # The component's own tool, invoked the way its CMake does: block size
@@ -169,8 +211,13 @@ def main():
             raise SystemExit("mksysfs: littlefs-python is missing.  "
                              "pip install littlefs-python")
 
+        note = ""
+        if args.display:
+            note += f"  [display] driver = {args.display}"
+        if size_wh:
+            note += f"  {size_wh[0]}x{size_wh[1]}"
         print(f"mksysfs: {args.out}  {size} bytes at 0x{offset:x}  ({chip})"
-              + (f"  [display] driver = {args.display}" if args.display else ""))
+              + note)
         for name in staged:
             print(f"  C:\\{name}")
     finally:
