@@ -185,14 +185,16 @@
     {
       "out": "FM.AXE", "group": "core",
       "include": ["apps/fm"],
-      "src": ["apps/fm/fm.c", "apps/fm/fmops.c", "apps/fm/fm_ui_text.c"]
+      "src": ["apps/fm/fm.c", "apps/fm/fmops.c", "apps/fm/fm_ui_text.c",
+              "apps/common/fsops/fsops.c", "apps/common/fsops/fsops_argon.c"]
     },
     {
       "out": "GFXFM.AXE", "group": "core",
       "include": ["apps/fm"],
       "cflags": "-Os -ffunction-sections -fdata-sections -DFM_GFX_BUILD",
       "src": ["apps/gfxfm/gfxfm_app.c", "apps/gfxfm/fm_ui_gfx.c",
-              "apps/fm/fm.c", "apps/fm/fmops.c"]
+              "apps/fm/fm.c", "apps/fm/fmops.c",
+              "apps/common/fsops/fsops.c", "apps/common/fsops/fsops_argon.c"]
     },
     {
       "out": "AMP.AXE", "group": "core",

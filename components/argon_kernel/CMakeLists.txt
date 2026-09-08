@@ -87,6 +87,10 @@ set(ARGON_KERNEL_SRCS
     "../../apps/fm/fm.c"
     "../../apps/fm/fmops.c"
     "../../apps/fm/fm_ui_text.c"
+    # The file operations themselves, shared with the desktop shell: the walk
+    # in fsops.c reaches for nothing but the table fsops_argon.c fills in.
+    "../../apps/common/fsops/fsops.c"
+    "../../apps/common/fsops/fsops_argon.c"
     # Same dual-build idea as fm: shell command `edit`, also buildable as .AXE.
     "../../apps/edit/edit.c")
 
