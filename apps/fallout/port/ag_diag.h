@@ -158,6 +158,27 @@ unsigned ag_cache_now_us(void);
  * reads are not counted as the reads of walking around. */
 extern unsigned ag_map_loading;
 
+/*
+ * Where the game is, in one word, for when it stops being anywhere.
+ *
+ * The engine has a watcher thread (watch_thread in sdl_shim.cc) whose whole
+ * job is to say where the main loop was when it stopped, and twice now it has
+ * said nothing at all while the loop was plainly stuck.  The step number it
+ * reports is also too coarse to act on: "step 2, gameHandleKey" covers half
+ * the engine.
+ *
+ * So: a pointer to a literal, stored at the places where the game goes away
+ * for a while.  A store of one word, no lock - a torn read of an aligned word
+ * cannot happen on this machine, and the worst case is one stale name in a
+ * report that is only printed when something has already gone wrong.
+ *
+ * Set it with AG_STEP("what"), and set it back to something coarse afterwards
+ * rather than leaving the last fine-grained name lying around.
+ */
+extern const char* volatile ag_step;
+
+#define AG_STEP(where) (ag_step = (where))
+
 #ifdef __cplusplus
 }
 #endif

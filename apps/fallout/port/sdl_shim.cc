@@ -91,6 +91,9 @@ char ag_sfx_name[AG_NAME_MAX];
 /* Held above zero by mapLoad while it runs. */
 unsigned ag_map_loading;
 
+/* Where the game is, for when it stops being anywhere.  See ag_diag.h. */
+const char* volatile ag_step = "before main";
+
 /* The engine asks the port for the clock rather than including argon.h: no
  * engine file does, and this is not the change that should start. */
 unsigned ag_cache_now_us(void)
@@ -771,6 +774,23 @@ static void watch_thread(void *arg)
     uint32_t last_move_ms = (uint32_t)ag_millis();
     bool     said = false;
 
+    /*
+     * ARGON: it announces itself, because twice it has said nothing while the
+     * loop was plainly stuck and there was no way to tell "the thread is not
+     * there" from "the thread is there and the report does not reach me".
+     *
+     * 7 September 2026, a 558-second freeze; 8 September, the walk into the
+     * second part of the Temple of Trials.  Both times the loop stopped dead,
+     * both times this thread was supposed to name the step, and both times the
+     * log holds not one line from it.  So it says hello on its first tick, and
+     * everything it has to say now goes through shim_printf as well as the
+     * kernel's journal - shim_printf is the path every other line in the log
+     * arrives by, and one of the two paths evidently does not work.
+     */
+    shim_printf("[watch] on, checking every %u ms; a loop that has not moved "
+              "for %u ms will be reported\n",
+              (unsigned)WATCH_TICK_MS, (unsigned)WATCH_STUCK_MS);
+
     while (!s_watch_stop) {
         ag_delay(WATCH_TICK_MS);
 
@@ -778,24 +798,51 @@ static void watch_thread(void *arg)
         const uint32_t now = (uint32_t)ag_millis();
 
         if (laps != last_laps) {
-            last_laps = laps;
-            last_move_ms = now;
             if (said) {
-                ag_log(AG_LOG_WARN, "fallout",
-                       "main loop moving again after %u ms in step %u",
-                       (unsigned)(now - last_move_ms), (unsigned)ag_ml_phase);
+                /* Before last_move_ms is overwritten: the interesting number
+                 * is how long it was gone, and the old code printed the time
+                 * since the move it had just recorded, which is nought. */
+                shim_printf("[watch] moving again after %u ms; it was in "
+                          "step %u at %s\n",
+                          (unsigned)(now - last_move_ms),
+                          (unsigned)ag_ml_phase,
+                          ag_step != NULL ? ag_step : "?");
                 said = false;
             }
+            last_laps = laps;
+            last_move_ms = now;
+            continue;
+        }
+        /*
+         * Nothing to report before the loop has run once.  The game spends
+         * about two minutes reading its data before it reaches the loop at
+         * all, and a watcher that calls that a stall says STUCK on every
+         * single run - which is how a report gets ignored.
+         */
+        if (laps == 0u) {
+            last_move_ms = now;
             continue;
         }
         if (!said && now - last_move_ms >= WATCH_STUCK_MS) {
             said = true;
+            /*
+             * Both ways out, because which of them works is the open
+             * question.  The step number says which of the loop's six calls
+             * it is inside; ag_step says where in the engine, which is the
+             * one that names a function rather than a quarter of the program.
+             */
+            shim_printf("[watch] STUCK: the main loop has not moved for %u ms."
+                      "  Step %u (1 input, 2 keys, 3 scripts, 4 maps, "
+                      "5 present, 6 throttle), lap %u, at %s, last sound %s\n",
+                      (unsigned)(now - last_move_ms), (unsigned)ag_ml_phase,
+                      (unsigned)laps, ag_step != NULL ? ag_step : "?",
+                      ag_sfx_name[0] != '\0' ? ag_sfx_name : "-");
             ag_log(AG_LOG_ERROR, "fallout",
                    "main loop has not moved for %u ms, stuck in step %u "
                    "(1 input, 2 keys, 3 scripts, 4 maps, 5 present, 6 throttle)"
-                   ", lap %u",
+                   ", lap %u, at %s",
                    (unsigned)(now - last_move_ms), (unsigned)ag_ml_phase,
-                   (unsigned)laps);
+                   (unsigned)laps, ag_step != NULL ? ag_step : "?");
         }
     }
     ag_thread_exit();
@@ -2943,10 +2990,27 @@ void SDL_RenderPresent(SDL_Renderer *r)
     if (s_watchdog_ms != 0u && !s_watchdog_armed) {
         s_watchdog_armed = true;
         ag_watchdog(s_watchdog_ms);
-        /* And the thread that will say where it stopped, if it does.  Two
-         * kilobytes: it holds two integers and a printf. */
+        /* And the thread that will say where it stopped, if it does.  Three
+         * kilobytes: it holds a few integers and a printf.
+         *
+         * ARGON: the result is read now.  It was thrown away with a (void),
+         * and a thread that was never created is indistinguishable from one
+         * that is running and has nothing to report - which is exactly the
+         * doubt that two unexplained freezes left me with.  If it cannot be
+         * had, the run should say so at the top of its log rather than leave
+         * the silence to be interpreted later.
+         *
+         * It returns a handle, not a status - ag_thread_t is a void* - so null
+         * is the failure and anything else is the thread.  The first cut of
+         * this tested `!= 0` and duly reported the running thread as "NOT
+         * started (1070490252)", which is its address. */
         s_watch_stop = false;
-        (void)ag_thread_create(watch_thread, NULL, "fowatch", 3072, 0, 0);
+        const ag_thread_t watcher = ag_thread_create(watch_thread, NULL,
+                                                     "fowatch", 3072, 0, 0);
+        if (watcher == NULL) {
+            shim_printf("[watch] NOT started - nothing will say where the "
+                      "game is if it stops\n");
+        }
     }
     s_pres_timers_us += p1 - p0;
     s_pres_memstat_us += p2 - p1;
