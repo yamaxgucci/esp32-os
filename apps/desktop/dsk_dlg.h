@@ -36,6 +36,10 @@ typedef enum {
 
 #define DSK_INPUT_MAX 96
 
+/* How many lines a message may carry.  Six is what a file's properties want:
+ * name, size, date, attributes, and room. */
+#define DSK_DLG_LINES_MAX 6
+
 void dsk_dlg_init(const dsk_metrics_t *m);
 
 /* False when a dialog is already up. */
@@ -50,6 +54,13 @@ bool dsk_dlg_message(const char *title, const char *line1, const char *line2,
 bool dsk_dlg_input(const char *title, const char *prompt, const char *initial,
                    void (*done)(dsk_answer_t a, const char *text, void *ctx),
                    void *ctx);
+
+/*
+ * The same, with as many lines as it takes - what properties are.  Always an
+ * OK box: a list of facts has nothing to answer.
+ */
+bool dsk_dlg_lines(const char *title, const char *const *lines, int n,
+                   void (*done)(dsk_answer_t a, void *ctx), void *ctx);
 
 bool dsk_dlg_up(void);
 

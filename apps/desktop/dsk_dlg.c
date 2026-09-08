@@ -19,8 +19,14 @@ typedef struct {
     bool        up;
     bool        input;      /* a text box rather than a message */
     dsk_dlg_kind_t kind;
-    char        line1[LINE_MAX];
-    char        line2[LINE_MAX];
+    /*
+     * The message text, one string per line.  An array rather than two named
+     * lines because a file's properties are six facts, and the alternative -
+     * gluing them into two lines - is a dialog that truncates whichever fact
+     * happens to be last.
+     */
+    char        line[DSK_DLG_LINES_MAX][LINE_MAX];
+    int         nlines;
     char        text[DSK_INPUT_MAX];
     uint16_t    len;
     bool        caret_lit;
@@ -135,7 +141,7 @@ static void dlg_draw(dsk_win_t *w, dsk_rect_t client)
 
     if (s_d.input) {
         dsk_text_fit((int16_t)(client.x + PAD), (int16_t)(client.y + PAD),
-                     (int16_t)(client.w - 2 * PAD), s_d.line1, DSK_BLACK,
+                     (int16_t)(client.w - 2 * PAD), s_d.line[0], DSK_BLACK,
                      DSK_LGRAY);
         const dsk_rect_t e = edit_rect(client);
         dsk_panel(e, false, DSK_WHITE);
@@ -153,14 +159,12 @@ static void dlg_draw(dsk_win_t *w, dsk_rect_t client)
                      DSK_BLACK);
         }
     } else {
-        dsk_text_fit((int16_t)(client.x + PAD), (int16_t)(client.y + PAD),
-                     (int16_t)(client.w - 2 * PAD), s_d.line1, DSK_BLACK,
-                     DSK_LGRAY);
-        if (s_d.line2[0] != '\0') {
+        for (int i = 0; i < s_d.nlines; i++) {
             dsk_text_fit((int16_t)(client.x + PAD),
-                         (int16_t)(client.y + PAD + DSK_FONT_H + 2),
-                         (int16_t)(client.w - 2 * PAD), s_d.line2, DSK_BLACK,
-                         DSK_LGRAY);
+                         (int16_t)(client.y + PAD +
+                                   i * (DSK_FONT_H + 2)),
+                         (int16_t)(client.w - 2 * PAD), s_d.line[i],
+                         DSK_BLACK, DSK_LGRAY);
         }
     }
 
@@ -287,12 +291,14 @@ static dsk_win_t *open_window(const char *title, int16_t w, int16_t h)
 }
 
 /* Wide enough for the longest line, within what the work area allows. */
-static int16_t width_for(const char *a, const char *b)
+static int16_t width_for_lines(void)
 {
-    size_t n = str_len(a);
-    const size_t m = str_len(b);
-    if (m > n) {
-        n = m;
+    size_t n = 0;
+    for (int i = 0; i < s_d.nlines; i++) {
+        const size_t m = str_len(s_d.line[i]);
+        if (m > n) {
+            n = m;
+        }
     }
     int16_t w = (int16_t)(DSK_FONT_W * (int16_t)n + 2 * PAD + 8);
     const int16_t least = (int16_t)(2 * BTN_W + BTN_GAP + 2 * PAD);
@@ -300,6 +306,27 @@ static int16_t width_for(const char *a, const char *b)
         w = least;
     }
     return w;
+}
+
+/* Shared by both message forms: the lines are already in s_d. */
+static bool open_message(const char *title, dsk_dlg_kind_t kind,
+                         void (*done)(dsk_answer_t a, void *ctx), void *ctx)
+{
+    s_d.kind = kind;
+    s_d.input = false;
+    s_d.done_msg = done;
+    s_d.ctx = ctx;
+    s_d.up = true;
+
+    const int16_t h =
+        (int16_t)(2 * s_m.border + s_m.title_h + PAD +
+                  s_d.nlines * (DSK_FONT_H + 2) + PAD + BTN_H + PAD);
+    s_d.win = open_window(title, width_for_lines(), h);
+    if (s_d.win == NULL) {
+        s_d.up = false;
+        return false;
+    }
+    return true;
 }
 
 bool dsk_dlg_message(const char *title, const char *line1, const char *line2,
@@ -311,23 +338,31 @@ bool dsk_dlg_message(const char *title, const char *line1, const char *line2,
     }
     dlg_t fresh = {0};
     s_d = fresh;
-    s_d.kind = kind;
-    s_d.input = false;
-    str_copy(s_d.line1, sizeof(s_d.line1), line1);
-    str_copy(s_d.line2, sizeof(s_d.line2), line2);
-    s_d.done_msg = done;
-    s_d.ctx = ctx;
-    s_d.up = true;
+    str_copy(s_d.line[0], LINE_MAX, line1);
+    s_d.nlines = 1;
+    if (line2 != NULL && line2[0] != '\0') {
+        str_copy(s_d.line[1], LINE_MAX, line2);
+        s_d.nlines = 2;
+    }
+    return open_message(title, kind, done, ctx);
+}
 
-    const int16_t lines = (line2 != NULL && line2[0] != '\0') ? 2 : 1;
-    const int16_t h = (int16_t)(2 * s_m.border + s_m.title_h + PAD +
-                                lines * (DSK_FONT_H + 2) + PAD + BTN_H + PAD);
-    s_d.win = open_window(title, width_for(line1, line2), h);
-    if (s_d.win == NULL) {
-        s_d.up = false;
+bool dsk_dlg_lines(const char *title, const char *const *lines, int n,
+                   void (*done)(dsk_answer_t a, void *ctx), void *ctx)
+{
+    if (s_d.up || lines == NULL || n <= 0) {
         return false;
     }
-    return true;
+    dlg_t fresh = {0};
+    s_d = fresh;
+    if (n > DSK_DLG_LINES_MAX) {
+        n = DSK_DLG_LINES_MAX;
+    }
+    for (int i = 0; i < n; i++) {
+        str_copy(s_d.line[i], LINE_MAX, lines[i]);
+    }
+    s_d.nlines = n;
+    return open_message(title, DSK_DLG_OK, done, ctx);
 }
 
 bool dsk_dlg_input(const char *title, const char *prompt, const char *initial,
@@ -341,7 +376,8 @@ bool dsk_dlg_input(const char *title, const char *prompt, const char *initial,
     s_d = fresh;
     s_d.kind = DSK_DLG_OKCANCEL;
     s_d.input = true;
-    str_copy(s_d.line1, sizeof(s_d.line1), prompt);
+    str_copy(s_d.line[0], LINE_MAX, prompt);
+    s_d.nlines = 1;
     str_copy(s_d.text, sizeof(s_d.text), initial);
     s_d.len = (uint16_t)str_len(s_d.text);
     s_d.done_txt = done;
@@ -352,7 +388,7 @@ bool dsk_dlg_input(const char *title, const char *prompt, const char *initial,
     const int16_t h =
         (int16_t)(2 * s_m.border + s_m.title_h + PAD + DSK_FONT_H + 4 +
                   DSK_FONT_H + 6 + PAD + BTN_H + PAD);
-    int16_t w = width_for(prompt, NULL);
+    int16_t w = width_for_lines();
     if (w < 240) {
         w = 240;
     }

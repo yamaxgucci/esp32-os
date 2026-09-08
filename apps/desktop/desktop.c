@@ -26,6 +26,7 @@
 #include "dsk_folder.h"
 #include "dsk_icons.h"
 #include "dsk_menu.h"
+#include "dsk_ops.h"
 #include "dsk_paint.h"
 #include "dsk_run.h"
 #include "dsk_wm.h"
@@ -116,7 +117,8 @@ static bool is_double(uint32_t now, int16_t x, int16_t y)
 #define DRIVE_MAX    8
 
 typedef struct {
-    char       path[8];
+    char       path[8];  /* "c:\\", the spelling everything else uses      */
+    char       mount[12]; /* "/sys", which is what mountinfo answers to    */
     char       label[12];
     dsk_icon_t icon;
 } drive_t;
@@ -156,6 +158,7 @@ static void find_drives(void)
         }
         drive_t *d = &s_drives[s_ndrives++];
         ag_strlcpy(d->path, k_drives[i].root, sizeof(d->path));
+        ag_strlcpy(d->mount, k_drives[i].mount, sizeof(d->mount));
         d->label[0] = (char)(k_drives[i].root[0] - 32); /* upper case */
         d->label[1] = ':';
         d->label[2] = 0;
@@ -165,6 +168,17 @@ static void find_drives(void)
                       : k_drives[i].icon;
     }
 }
+
+/*
+ * Which drive icon is picked, or -1.
+ *
+ * One click picks, two open.  Windows 3.11 had no properties on a drive and no
+ * right button to ask with, so the way to ask about one has to be the way to
+ * ask about anything else: pick it, then File > Properties.  Without a
+ * selection there is nothing for that menu item to be about, and a feature
+ * that cannot be reached is a feature that is not there.
+ */
+static int s_drive_sel = -1;
 
 static dsk_rect_t drive_rect(int i)
 {
@@ -186,12 +200,26 @@ static void draw_drives(void)
         if (dsk_rect_empty(r) || !dsk_visible(r)) {
             continue;
         }
+        const bool    picked = (i == s_drive_sel);
+        const uint32_t behind = picked ? DSK_NAVY : DSK_TEAL;
         const int16_t ix = (int16_t)(r.x + (r.w - 2 * DSK_ICON_W) / 2);
-        dsk_icon_draw(s_drives[i].icon, ix, (int16_t)(r.y + 2), 2, DSK_TEAL);
         const int16_t tw = dsk_text_small_width(s_drives[i].label);
-        dsk_text_small((int16_t)(r.x + (r.w - tw) / 2),
-                       (int16_t)(r.y + 2 + 2 * DSK_ICON_H + 2),
-                       s_drives[i].label, DSK_WHITE, DSK_TEAL);
+        const int16_t tx = (int16_t)(r.x + (r.w - tw) / 2);
+        const int16_t ty = (int16_t)(r.y + 2 + 2 * DSK_ICON_H + 2);
+
+        /*
+         * The caption is what carries the selection, not the icon: the icon
+         * is composed over the colour behind it, and inverting a 32x32 image
+         * to say "this one" is both harder to read and harder to draw than
+         * inverting the six characters underneath it.
+         */
+        if (picked) {
+            dsk_fill(dsk_rect((int16_t)(tx - 2), (int16_t)(ty - 1),
+                              (int16_t)(tw + 4), DSK_SMALL_H + 2),
+                     behind);
+        }
+        dsk_icon_draw(s_drives[i].icon, ix, (int16_t)(r.y + 2), 2, DSK_TEAL);
+        dsk_text_small(tx, ty, s_drives[i].label, DSK_WHITE, behind);
     }
 }
 
@@ -211,6 +239,12 @@ static int drive_at(int16_t x, int16_t y)
 enum {
     ID_NEW = 1,
     ID_RUN,
+    ID_COPY,
+    ID_MOVE,
+    ID_RENAME,
+    ID_DELETE,
+    ID_MKDIR,
+    ID_PROPS,
     ID_EXIT,
     ID_CASCADE,
     ID_TILE,
@@ -221,6 +255,488 @@ enum {
 };
 
 static dsk_menu_t s_menus[3];
+
+/* ---- file operations ---------------------------------------------------- */
+
+/*
+ * What the question was about, kept here because the dialogs answer through a
+ * callback and there is only ever one question up at a time (dsk_dlg refuses
+ * a second).  A copy of the path rather than a pointer into the folder's
+ * entries: re-reading the directory while the box is open would move them.
+ */
+static struct {
+    char path[AG_PATH_MAX]; /* what was selected, whole                     */
+    char name[64];          /* its last component, for prompts and errors   */
+    char dir[AG_PATH_MAX];  /* the directory it is in                       */
+    bool is_dir;
+} s_op;
+
+/* dir + name in the DOS spelling the rest of the shell uses. */
+static void path_join(const char *dir, const char *name, char *out, size_t len)
+{
+    ag_strlcpy(out, dir, len);
+    const size_t n = strlen(out);
+    if (n > 0 && out[n - 1] != '\\' && out[n - 1] != '/') {
+        ag_strlcat(out, "\\", len);
+    }
+    ag_strlcat(out, name, len);
+}
+
+/*
+ * The selection of the active window, remembered.  False when there is
+ * nothing selected - the active window is not a folder, or the cursor is on
+ * "..", which is a place and not a file.
+ */
+static bool take_selection(void)
+{
+    dsk_win_t *w = dsk_wm_active();
+    const char *dir = dsk_folder_path(w);
+    if (dir == NULL) {
+        s_note = "no folder window is active";
+        damage(s_m.statusbar);
+        return false;
+    }
+    if (!dsk_folder_selected(w, s_op.path, sizeof(s_op.path), s_op.name,
+                             sizeof(s_op.name), &s_op.is_dir)) {
+        s_note = "nothing is selected";
+        damage(s_m.statusbar);
+        return false;
+    }
+    ag_strlcpy(s_op.dir, dir, sizeof(s_op.dir));
+    return true;
+}
+
+/*
+ * Where a copy or a move should go by default: the directory of another open
+ * folder window, the way a two-panel manager offers the other panel.  With
+ * only one window open there is nowhere better to suggest than where it
+ * already is, and the user has to type.
+ */
+static const char *other_folder_dir(void)
+{
+    dsk_win_t *active = dsk_wm_active();
+    for (int i = 0; i < dsk_wm_count(); i++) {
+        dsk_win_t  *w = dsk_wm_at(i);
+        const char *p = dsk_folder_path(w);
+        if (w != active && p != NULL) {
+            return p;
+        }
+    }
+    return s_op.dir;
+}
+
+/*
+ * Re-read the windows an operation could have changed, and nothing else.
+ *
+ * Two directories at most: where it came from and where it went.  Refreshing
+ * everything would be simpler and is what a first version does, and on HostFS
+ * it costs hundreds of milliseconds per open window for directories nothing
+ * touched.
+ */
+static void after_op(const char *touched)
+{
+    if (!dsk_ops_changed()) {
+        return;
+    }
+    dsk_folder_refresh(s_op.dir);
+    if (touched != NULL) {
+        dsk_folder_refresh(touched);
+    }
+}
+
+/*
+ * Turns what was typed into a finished destination path.
+ *
+ * A name with no directory in it is taken as a name in the source's own
+ * directory; a path that IS a directory gets the source's name appended.  That
+ * second rule is what "copy this there" means, and doing it here rather than
+ * in fsops is deliberate: it is a decision about what the user meant, and it
+ * belongs where they typed it.
+ */
+static void resolve_target(const char *typed, char *out, size_t len)
+{
+    if (typed[0] == '\0') {
+        out[0] = '\0';
+        return;
+    }
+    /* Bare name: beside the original. */
+    bool has_dir = false;
+    for (const char *p = typed; *p != '\0'; p++) {
+        if (*p == '/' || *p == '\\' || *p == ':') {
+            has_dir = true;
+        }
+    }
+    if (!has_dir) {
+        path_join(s_op.dir, typed, out, len);
+    } else {
+        ag_strlcpy(out, typed, len);
+    }
+
+    ag_stat_t st;
+    if (ag_stat(out, &st) == AG_OK && (st.attr & AG_A_DIR) != 0) {
+        char joined[AG_PATH_MAX];
+        path_join(out, s_op.name, joined, sizeof(joined));
+        ag_strlcpy(out, joined, len);
+    }
+}
+
+/* The directory part of a path, for deciding which windows to re-read. */
+static void dir_of(const char *path, char *out, size_t len)
+{
+    ag_strlcpy(out, path, len);
+    int n = (int)strlen(out);
+    while (n > 0 && out[n - 1] != '\\' && out[n - 1] != '/') {
+        out[--n] = '\0';
+    }
+    /* "c:\" keeps its separator; anything deeper loses it. */
+    if (n > 3) {
+        out[n - 1] = '\0';
+    }
+}
+
+static void copy_typed(dsk_answer_t a, const char *text, void *ctx)
+{
+    const bool moving = (ctx != NULL);
+    if (a != DSK_ANSWER_OK || text == NULL) {
+        return;
+    }
+
+    char to[AG_PATH_MAX];
+    resolve_target(text, to, sizeof(to));
+    if (to[0] == '\0') {
+        return;
+    }
+    if (ag_stricmp(to, s_op.path) == 0) {
+        (void)dsk_dlg_message(moving ? "Move" : "Copy",
+                              "That is where it already is.", NULL,
+                              DSK_DLG_OK, NULL, NULL);
+        return;
+    }
+
+    if (moving) {
+        dsk_ops_move(s_op.path, to, s_op.name);
+    } else {
+        dsk_ops_copy(s_op.path, to, s_op.name);
+    }
+
+    char where[AG_PATH_MAX];
+    dir_of(to, where, sizeof(where));
+    after_op(where);
+}
+
+static void rename_typed(dsk_answer_t a, const char *text, void *ctx)
+{
+    (void)ctx;
+    if (a != DSK_ANSWER_OK || text == NULL || text[0] == '\0') {
+        return;
+    }
+    /* A name, not a path: rename moves nothing, and a name with a separator
+     * in it would move the file without having said so. */
+    for (const char *p = text; *p != '\0'; p++) {
+        if (*p == '/' || *p == '\\' || *p == ':') {
+            (void)dsk_dlg_message("Rename", "That is a path, not a name.",
+                                  "Use Move to put it somewhere else.",
+                                  DSK_DLG_OK, NULL, NULL);
+            return;
+        }
+    }
+
+    char to[AG_PATH_MAX];
+    path_join(s_op.dir, text, to, sizeof(to));
+    if (dsk_ops_rename(s_op.path, to, s_op.name)) {
+        after_op(NULL);
+        /* Leave the cursor on the file that was just named, not on whatever
+         * sorts into that row now. */
+        dsk_folder_select_name(dsk_wm_active(), text);
+    }
+}
+
+static void mkdir_typed(dsk_answer_t a, const char *text, void *ctx)
+{
+    (void)ctx;
+    if (a != DSK_ANSWER_OK || text == NULL || text[0] == '\0') {
+        return;
+    }
+    dsk_win_t  *w = dsk_wm_active();
+    const char *dir = dsk_folder_path(w);
+    if (dir == NULL) {
+        return;
+    }
+    ag_strlcpy(s_op.dir, dir, sizeof(s_op.dir));
+
+    char path[AG_PATH_MAX];
+    path_join(dir, text, path, sizeof(path));
+    if (dsk_ops_mkdir(path, text)) {
+        after_op(NULL);
+        dsk_folder_select_name(w, text);
+    }
+}
+
+static void delete_answered(dsk_answer_t a, void *ctx)
+{
+    (void)ctx;
+    if (a != DSK_ANSWER_YES) {
+        return;
+    }
+    dsk_ops_delete(s_op.path, s_op.name);
+    after_op(NULL);
+}
+
+static void ask_copy(bool moving)
+{
+    if (!take_selection()) {
+        return;
+    }
+    char prompt[96];
+    ag_strlcpy(prompt, moving ? "Move " : "Copy ", sizeof(prompt));
+    ag_strlcat(prompt, s_op.is_dir ? "directory " : "", sizeof(prompt));
+    ag_strlcat(prompt, s_op.name, sizeof(prompt));
+    ag_strlcat(prompt, " to:", sizeof(prompt));
+
+    (void)dsk_dlg_input(moving ? "Move" : "Copy", prompt, other_folder_dir(),
+                        copy_typed, moving ? (void *)&s_op : NULL);
+}
+
+static void ask_delete(void)
+{
+    if (!take_selection()) {
+        return;
+    }
+    char line[96];
+    ag_strlcpy(line, "Delete ", sizeof(line));
+    ag_strlcat(line, s_op.name, sizeof(line));
+    ag_strlcat(line, "?", sizeof(line));
+
+    /*
+     * A directory takes everything under it, and the question has to say so:
+     * the filesystem used to refuse a directory that was not empty, and that
+     * refusal was the only thing standing between a keystroke and a tree.
+     */
+    (void)dsk_dlg_message("Delete", line,
+                          s_op.is_dir ? "Everything in it goes too." : NULL,
+                          DSK_DLG_YESNO, delete_answered, NULL);
+}
+
+static void ask_rename(void)
+{
+    if (!take_selection()) {
+        return;
+    }
+    char prompt[96];
+    ag_strlcpy(prompt, "Rename ", sizeof(prompt));
+    ag_strlcat(prompt, s_op.name, sizeof(prompt));
+    ag_strlcat(prompt, " to:", sizeof(prompt));
+    (void)dsk_dlg_input("Rename", prompt, s_op.name, rename_typed, NULL);
+}
+
+/* ---- properties -------------------------------------------------------- */
+
+/*
+ * A date out of a unix timestamp, without a C library and without a timezone.
+ *
+ * The system keeps seconds since 1970 and this shell has no localtime to hand,
+ * so the arithmetic is here: days since the epoch, then walked forward a year
+ * at a time.  A board that has never seen an SNTP server has a clock that
+ * starts at zero, and a file stamped 1970 is worth showing as 1970 rather than
+ * as blank - "no date" and "the clock was never set" are different facts.
+ */
+/*
+ * Two digits with a leading zero.  ag_utoa pads with SPACES, which is what a
+ * right-aligned column of file sizes wants and the opposite of what a date
+ * wants - "2026- 9- 8  0: 0" is not a date.
+ */
+static void pad2(char *out, size_t len, uint32_t v)
+{
+    char two[3];
+    two[0] = (char)('0' + (int)((v / 10u) % 10u));
+    two[1] = (char)('0' + (int)(v % 10u));
+    two[2] = '\0';
+    ag_strlcat(out, two, len);
+}
+
+static void format_date(uint64_t unix_s, char *out, size_t len)
+{
+    static const uint16_t k_month[12] = {31, 28, 31, 30, 31, 30,
+                                         31, 31, 30, 31, 30, 31};
+    char num[24];
+
+    /*
+     * Zero is the ABI's "unknown".  The upper bound is here because the
+     * arithmetic below walks forward a year at a time and a number that is
+     * not a date walks for ever - and one arrived: a filesystem with no mtime
+     * answered (time_t)-1, which sign-extended into 2^64 seconds and, with a
+     * 32-bit day count, came out as a plausible-looking day in the year three
+     * million.  The kernel no longer passes that on; this refuses to render
+     * it either, because a shell that draws whatever it is handed is a shell
+     * that reports the next such number as fact.
+     */
+    if (unix_s == 0 || unix_s > 7258118400ull) { /* past the year 2200 */
+        ag_strlcpy(out, "not recorded", len);
+        return;
+    }
+
+    uint32_t days = (uint32_t)(unix_s / 86400u);
+    const uint32_t secs = (uint32_t)(unix_s % 86400u);
+    int year = 1970;
+    for (;;) {
+        const bool leap =
+            (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+        const uint32_t in_year = leap ? 366u : 365u;
+        if (days < in_year) {
+            break;
+        }
+        days -= in_year;
+        year++;
+    }
+    const bool leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+    int month = 0;
+    for (;;) {
+        uint32_t n = k_month[month];
+        if (month == 1 && leap) {
+            n = 29;
+        }
+        if (days < n || month == 11) {
+            break;
+        }
+        days -= n;
+        month++;
+    }
+
+    out[0] = '\0';
+    ag_strlcat(out, ag_utoa((uint64_t)year, num, sizeof(num), 0, false), len);
+    ag_strlcat(out, "-", len);
+    pad2(out, len, (uint32_t)month + 1u);
+    ag_strlcat(out, "-", len);
+    pad2(out, len, days + 1u);
+    ag_strlcat(out, " ", len);
+    pad2(out, len, secs / 3600u);
+    ag_strlcat(out, ":", len);
+    pad2(out, len, (secs / 60u) % 60u);
+    ag_strlcat(out, ":", len);
+    pad2(out, len, secs % 60u);
+    ag_strlcat(out, " UTC", len);
+}
+
+/* The properties of whatever the pointer picked: a drive, or a file. */
+static void show_drive_props(int which)
+{
+    char        rows[5][64];
+    const char *lines[5];
+    char        num[24];
+    ag_fsinfo_t fs;
+
+    if (which < 0 || which >= s_ndrives) {
+        return;
+    }
+    for (int i = 0; i < 5; i++) {
+        lines[i] = rows[i];
+        rows[i][0] = '\0';
+    }
+
+    ag_strlcpy(rows[0], "Drive ", sizeof(rows[0]));
+    ag_strlcat(rows[0], s_drives[which].label, sizeof(rows[0]));
+
+    if (ag_mountinfo(s_drives[which].mount, &fs) != AG_OK) {
+        ag_strlcpy(rows[1], "not mounted", sizeof(rows[1]));
+        (void)dsk_dlg_lines("Properties", lines, 2, NULL, NULL);
+        return;
+    }
+
+    ag_strlcpy(rows[1], "Filesystem: ", sizeof(rows[1]));
+    ag_strlcat(rows[1], fs.fs, sizeof(rows[1]));
+    if (fs.read_only) {
+        ag_strlcat(rows[1], "  (read only)", sizeof(rows[1]));
+    }
+    if (fs.removable) {
+        ag_strlcat(rows[1], "  removable", sizeof(rows[1]));
+    }
+
+    ag_strlcpy(rows[2], "Total:  ", sizeof(rows[2]));
+    ag_strlcat(rows[2], ag_utoa(fs.total, num, sizeof(num), 0, true),
+               sizeof(rows[2]));
+    ag_strlcat(rows[2], " bytes", sizeof(rows[2]));
+
+    ag_strlcpy(rows[3], "Free:   ", sizeof(rows[3]));
+    ag_strlcat(rows[3], ag_utoa(fs.free, num, sizeof(num), 0, true),
+               sizeof(rows[3]));
+    ag_strlcat(rows[3], " bytes", sizeof(rows[3]));
+
+    ag_strlcpy(rows[4], "Mounted at ", sizeof(rows[4]));
+    ag_strlcat(rows[4], s_drives[which].mount, sizeof(rows[4]));
+
+    (void)dsk_dlg_lines("Properties", lines, 5, NULL, NULL);
+}
+
+static void show_file_props(void)
+{
+    char        rows[5][64];
+    const char *lines[5];
+    char        num[24];
+    ag_stat_t   st;
+
+    if (!take_selection()) {
+        return;
+    }
+    for (int i = 0; i < 5; i++) {
+        lines[i] = rows[i];
+        rows[i][0] = '\0';
+    }
+
+    if (ag_stat(s_op.path, &st) != AG_OK) {
+        ag_strlcpy(rows[0], s_op.name, sizeof(rows[0]));
+        ag_strlcpy(rows[1], "gone since the list was read", sizeof(rows[1]));
+        (void)dsk_dlg_lines("Properties", lines, 2, NULL, NULL);
+        return;
+    }
+
+    ag_strlcpy(rows[0], s_op.name, sizeof(rows[0]));
+
+    ag_strlcpy(rows[1], "Type:   ", sizeof(rows[1]));
+    ag_strlcat(rows[1], s_op.is_dir ? "directory" : "file", sizeof(rows[1]));
+
+    ag_strlcpy(rows[2], "Size:   ", sizeof(rows[2]));
+    if (s_op.is_dir) {
+        /* Not counted: it is a walk of the whole tree, and a dialog that
+         * takes a second to open over HostFS is a dialog that looks stuck. */
+        ag_strlcat(rows[2], "-", sizeof(rows[2]));
+    } else {
+        ag_strlcat(rows[2], ag_utoa(st.size, num, sizeof(num), 0, true),
+                   sizeof(rows[2]));
+        ag_strlcat(rows[2], " bytes", sizeof(rows[2]));
+    }
+
+    ag_strlcpy(rows[3], "Changed: ", sizeof(rows[3]));
+    char when[48];
+    format_date(st.mtime, when, sizeof(when));
+    ag_strlcat(rows[3], when, sizeof(rows[3]));
+
+    ag_strlcpy(rows[4], "Flags:  ", sizeof(rows[4]));
+    if ((st.attr & AG_A_READONLY) != 0) {
+        ag_strlcat(rows[4], "read-only ", sizeof(rows[4]));
+    }
+    if ((st.attr & AG_A_HIDDEN) != 0) {
+        ag_strlcat(rows[4], "hidden ", sizeof(rows[4]));
+    }
+    if ((st.attr & AG_A_SYSTEM) != 0) {
+        ag_strlcat(rows[4], "system ", sizeof(rows[4]));
+    }
+    if (rows[4][8] == '\0') {
+        ag_strlcat(rows[4], "none", sizeof(rows[4]));
+    }
+
+    (void)dsk_dlg_lines("Properties", lines, 5, NULL, NULL);
+}
+
+static void ask_mkdir(void)
+{
+    if (dsk_folder_path(dsk_wm_active()) == NULL) {
+        s_note = "no folder window is active";
+        damage(s_m.statusbar);
+        return;
+    }
+    (void)dsk_dlg_input("Create directory", "Name of the new directory:", "",
+                        mkdir_typed, NULL);
+}
 
 static void set_item(dsk_menu_t *m, const char *label, uint16_t id,
                      bool enabled)
@@ -261,6 +777,22 @@ static void rebuild_menus(void)
     s_menus[0].n = 0;
     set_item(&s_menus[0], "New window", ID_NEW, true);
     set_item(&s_menus[0], "Run...", ID_RUN, true);
+    set_separator(&s_menus[0]);
+    /*
+     * Greyed out rather than hidden when there is nothing selected, so the
+     * menu is the same shape every time it opens and the keys beside the
+     * labels can be learnt from it.
+     */
+    const bool sel = dsk_folder_selected(active, NULL, 0, NULL, 0, NULL);
+    const bool in_folder = dsk_folder_path(active) != NULL;
+    set_item(&s_menus[0], "Copy...  F8", ID_COPY, sel);
+    set_item(&s_menus[0], "Move...  F7", ID_MOVE, sel);
+    set_item(&s_menus[0], "Rename...  F2", ID_RENAME, sel);
+    set_item(&s_menus[0], "Delete  Del", ID_DELETE, sel);
+    set_separator(&s_menus[0]);
+    set_item(&s_menus[0], "Create directory...", ID_MKDIR, in_folder);
+    set_item(&s_menus[0], "Properties...", ID_PROPS,
+             sel || (!in_folder && s_drive_sel >= 0));
     set_separator(&s_menus[0]);
     set_item(&s_menus[0], "Exit", ID_EXIT, true);
 
@@ -329,6 +861,33 @@ static void menu_chose(uint16_t id)
         break;
     case ID_RUN:
         (void)dsk_dlg_input("Run", "Program to run:", "c:\\", run_typed, NULL);
+        break;
+    case ID_COPY:
+        ask_copy(false);
+        break;
+    case ID_MOVE:
+        ask_copy(true);
+        break;
+    case ID_RENAME:
+        ask_rename();
+        break;
+    case ID_DELETE:
+        ask_delete();
+        break;
+    case ID_MKDIR:
+        ask_mkdir();
+        break;
+    case ID_PROPS:
+        /*
+         * Whichever thing is picked.  A folder window's selection wins over a
+         * drive icon, because the window is in front of the icon and that is
+         * what "the thing I am looking at" means.
+         */
+        if (dsk_folder_path(dsk_wm_active()) != NULL) {
+            show_file_props();
+        } else {
+            show_drive_props(s_drive_sel);
+        }
         break;
     case ID_EXIT:
         (void)dsk_dlg_message("Exit", "Leave the desktop?", NULL,
@@ -510,11 +1069,27 @@ static void on_pointer(dsk_ptr_t type, int16_t x, int16_t y, uint8_t buttons,
         return;
     }
     /* Nothing wanted it: the click was on the desktop itself. */
-    if (type == DSK_PTR_DOWN && dbl) {
-        const int d = drive_at(x, y);
+    if (type != DSK_PTR_DOWN) {
+        return;
+    }
+    const int d = drive_at(x, y);
+    if (dbl) {
         if (d >= 0 && dsk_folder_open(s_drives[d].path) == NULL) {
             s_note = "no room for another window";
             damage(s_m.statusbar);
+        }
+        return;
+    }
+
+    /* A single click picks a drive, or unpicks whatever was picked. */
+    if (d != s_drive_sel) {
+        const int was = s_drive_sel;
+        s_drive_sel = d;
+        if (was >= 0) {
+            damage(drive_rect(was));
+        }
+        if (d >= 0) {
+            damage(drive_rect(d));
         }
     }
 }
@@ -568,6 +1143,36 @@ static void on_key(uint16_t keycode, uint32_t unicode, uint16_t mods)
         s_reflushes++;
         dsk_flush(s_m.screen);
         return;
+    }
+
+    /*
+     * The file operation keys, and they are Windows 3.11's File Manager ones:
+     * F7 moves, F8 copies, Delete deletes.  F5 is already refresh, there and
+     * here.  Rename had no key there and F2 is what every manager since has
+     * used, so it is F2.
+     *
+     * Ahead of the windows rather than behind them, because a folder window
+     * would otherwise have to know about operations to pass them on - and
+     * these apply to whatever is selected in the active window, which is a
+     * question about the shell and not about one window.
+     */
+    if (!dsk_dlg_up() && !dsk_menu_open()) {
+        switch (keycode) {
+        case AG_KEY_F7:
+            ask_copy(true);
+            return;
+        case AG_KEY_F8:
+            ask_copy(false);
+            return;
+        case AG_KEY_F2:
+            ask_rename();
+            return;
+        case AG_KEY_DELETE:
+            ask_delete();
+            return;
+        default:
+            break;
+        }
     }
 
     if (dsk_menu_key(keycode, unicode, mods)) {
@@ -715,6 +1320,7 @@ int ag_main(int argc, char **argv)
     dsk_dlg_init(&s_m);
     dsk_folder_init(&s_m, open_from_folder);
     dsk_run_init(repaint_all);
+    dsk_ops_init(&s_m, repaint_all);
     find_drives();
     rebuild_menus();
 

@@ -81,7 +81,19 @@ function Update-FlashImage {
         $s = Get-Item $SysFs
         $want += "|$($s.FullName):$($s.LastWriteTimeUtc.Ticks):$($s.Length)"
     }
-    if ((Test-Path $flash) -and (Test-Path $stamp) -and
+    # The stamp knows what went IN to the flash image and nothing about what
+    # the guest did to it afterwards - and the guest writes to C:, because a
+    # filesystem is for writing to.  So a run that copied a file left it in the
+    # image, the next run with the same inputs reused that image, and littlefs
+    # went on accumulating whatever the run before had done to it.  Measured
+    # over three runs of the desktop's own check: boot 0.65 s, then 1.78 s,
+    # then 2.20 s, and by the third the prompt never appeared at all.  Nothing
+    # in any of that said "stale image".
+    #
+    # Passing -SysFs means "boot this exact C:", so it is rebuilt every time.
+    # It costs one esptool merge, about a second, and it is the difference
+    # between a repeatable test and a test that depends on the one before it.
+    if (-not $SysFs -and (Test-Path $flash) -and (Test-Path $stamp) -and
         (Get-Content $stamp -Raw).Trim() -eq $want) {
         return
     }

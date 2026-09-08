@@ -37,4 +37,23 @@ bool dsk_folder_is(const dsk_win_t *w);
 /* Re-read every folder window showing this directory.  NULL means all. */
 void dsk_folder_refresh(const char *path);
 
+/* The directory this window is showing, or NULL when it is not a folder. */
+const char *dsk_folder_path(const dsk_win_t *w);
+
+/*
+ * What the cursor is on, as a whole path.  False when there is nothing to
+ * point at, or when the cursor is on ".." - which is a place and not a file,
+ * and an operation aimed at it would be aimed at the parent directory.
+ */
+bool dsk_folder_selected(const dsk_win_t *w, char *path, size_t len,
+                         char *name, size_t name_len, bool *is_dir);
+
+/*
+ * Put the cursor on this name, if the window has it.  Called after an
+ * operation so the thing just created or renamed is the thing selected -
+ * without it a rename leaves the cursor on whatever happens to sort into that
+ * row, which is not the file the user just named.
+ */
+void dsk_folder_select_name(dsk_win_t *w, const char *name);
+
 #endif /* ARGON_DSK_FOLDER_H */

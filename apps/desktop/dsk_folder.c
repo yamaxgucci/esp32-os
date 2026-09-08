@@ -499,6 +499,64 @@ bool dsk_folder_is(const dsk_win_t *w)
     return w != NULL && w->ops == &k_folder_ops;
 }
 
+const char *dsk_folder_path(const dsk_win_t *w)
+{
+    if (!dsk_folder_is(w)) {
+        return NULL;
+    }
+    const folder_t *f = (const folder_t *)w->user;
+    return (f != NULL) ? f->path : NULL;
+}
+
+bool dsk_folder_selected(const dsk_win_t *w, char *path, size_t len,
+                         char *name, size_t name_len, bool *is_dir)
+{
+    if (!dsk_folder_is(w)) {
+        return false;
+    }
+    const folder_t *f = (const folder_t *)w->user;
+    if (f == NULL || f->sel < 0 || f->sel >= f->n) {
+        return false;
+    }
+    const entry_t *e = &f->entries[f->sel];
+
+    /* ".." is a place, not a file: an operation aimed at it would be aimed at
+     * the parent directory, which is never what the click meant. */
+    if (e->name[0] == '.' && e->name[1] == '.' && e->name[2] == '\0') {
+        return false;
+    }
+
+    if (path != NULL) {
+        join(f->path, e->name, path, len);
+    }
+    if (name != NULL) {
+        ag_strlcpy(name, e->name, name_len);
+    }
+    if (is_dir != NULL) {
+        *is_dir = e->is_dir;
+    }
+    return true;
+}
+
+void dsk_folder_select_name(dsk_win_t *w, const char *name)
+{
+    if (!dsk_folder_is(w) || name == NULL) {
+        return;
+    }
+    folder_t *f = (folder_t *)w->user;
+    if (f == NULL) {
+        return;
+    }
+    for (int i = 0; i < f->n; i++) {
+        if (ag_stricmp(f->entries[i].name, name) == 0) {
+            f->sel = i;
+            clamp_scroll(w, f);
+            dsk_wm_damage_rect(dsk_wm_client(w));
+            return;
+        }
+    }
+}
+
 void dsk_folder_go(dsk_win_t *w, const char *path)
 {
     folder_t *f = (folder_t *)w->user;

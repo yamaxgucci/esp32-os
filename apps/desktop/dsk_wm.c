@@ -330,6 +330,22 @@ dsk_win_t *dsk_wm_open(const char *title, dsk_rect_t frame,
         return NULL;
     }
 
+    /*
+     * Whoever was on top is about to stop being on top, and its caption
+     * changes colour when that happens - so it needs paint even where the new
+     * window does not cover it.
+     *
+     * dsk_wm_close has always done the same thing from the other end.  This
+     * end did not, and the way it showed was a window caption left half navy
+     * and half grey: a dialog opened over the left part of it, that part was
+     * repainted grey because the dialog's own frame damage happened to cover
+     * it, and the rest stayed the colour it had been.  F5 put it right, which
+     * is exactly the signature of paint that was owed and never asked for -
+     * and it is what the two-photograph check in apps/desktop/check.ps1
+     * exists to catch.
+     */
+    dsk_win_t *was_top = dsk_wm_active();
+
     dsk_win_t *w = &s_win[slot];
     const uint8_t keep = w->slot;
     dsk_win_t     fresh = {0};
@@ -346,6 +362,11 @@ dsk_win_t *dsk_wm_open(const char *title, dsk_rect_t frame,
     dsk_wm_move(w, frame);
     z_to_top(w);
     damage(w->frame);
+    if (was_top != NULL) {
+        damage(was_top->state == DSK_WIN_MINIMISED
+                   ? dsk_wm_icon_rect(was_top)
+                   : dsk_wm_title(was_top));
+    }
     return w;
 }
 

@@ -46,7 +46,13 @@ param(
     # default is what the firmware boots with when [display] says nothing.
     [int]$Width = 0,
     [int]$Height = 0,
-    [int]$Seconds = 40,       # the shell's own deadline, so nothing can hang
+    # The shell's own deadline, so nothing can hang.  It has to cover the
+    # WHOLE scripted run, not one step: the sequence below is around a minute
+    # of waits, and a deadline shorter than that ends the shell partway - which
+    # showed up as an empty photograph, a stray keystroke arriving at the
+    # console prompt, and a dialog counted as a window left open.  None of the
+    # three said anything about a deadline.
+    [int]$Seconds = 120,
     [string]$Out = 'build\desktop',
     [switch]$NoBuild
 )
@@ -220,11 +226,72 @@ try {
                 # 'q' is how gfxdemo exits, and it only gets there if a child
                 # of an application can be typed at.
                 'say q', 'wait 2500')
+
+    # ---- the file operations ---------------------------------------------
+    #
+    # On the window that is already open on C:\, with the keyboard: F8 copies,
+    # F2 renames, Delete deletes.  The destination is typed as a BARE NAME
+    # ("drv2", not "c:\drv2") for two reasons - it is the rule that a name with
+    # no directory in it means "beside the original", which is worth
+    # exercising, and inputplay cannot type a colon or a backslash: they need
+    # shift, and the key table deliberately fakes no modifiers.
+    #
+    # What is NOT asserted here is stopping one halfway.  There is nothing on
+    # this image slow enough to catch: the two files in C:\DRV copy in one
+    # tick, and a copy that finished before Escape could be sent would make the
+    # test pass whether cancelling worked or not.  Interrupting is pinned down
+    # on the host instead, where the tick count is the clock -
+    # test_cancelled_copy_keeps_what_it_finished and
+    # test_failed_move_keeps_the_source in host-tests\test_fsops.c.
+    #
+    # C:\ holds, in order: drv, DESKTOP.AXE, GFXDEMO.AXE, HELLO.AXE,
+    # SYSTEM.CFG.  After the copy, drv2 sorts in as the second directory.
+    $clear = 1..12 | ForEach-Object { 'key backspace' }
+
+    # File > Create directory..., from the keyboard.  F10 puts the shell on the
+    # bar and opens the first menu; Down steps over the separators by itself,
+    # so the seventh stop is Create directory (New window, Run, Copy, Move,
+    # Rename, Delete, Create directory) and the eighth is Properties.
+    #
+    # It runs FIRST of the operations, because it changes what is on which row
+    # and everything after it counts rows.  C:\ then holds: drv, newdir,
+    # DESKTOP.AXE, GFXDEMO.AXE, HELLO.AXE, SYSTEM.CFG.
+    $opsMkdir = @('key f10', 'wait 500') +
+                (1..7 | ForEach-Object { 'key down' }) +
+                @('wait 300', 'key enter', 'wait 800',
+                  'say newdir', 'wait 200', 'key enter', 'wait 1500')
+
+    $opsCopy = @('key home', 'wait 200',
+                 'key f8', 'wait 800') + $clear +
+               @('say drv2', 'wait 200', 'key enter', 'wait 3000')
+
+    # Row 1 is now drv2.  Enter answers Yes, which is the first button.
+    $opsDelete = @('key home', 'key down', 'wait 300',
+                   'key delete', 'wait 800', 'key enter', 'wait 3000')
+
+    # drv, newdir, DESKTOP.AXE, GFXDEMO.AXE, HELLO.AXE - four down now that
+    # Create directory has added one above it.
+    $opsRename = @('key home') + (1..4 | ForEach-Object { 'key down' }) +
+                 @('wait 300', 'key f2', 'wait 800') + $clear +
+                 @('say hi.axe', 'wait 200', 'key enter', 'wait 2000')
+
+    # File > Properties, from the keyboard: F10 puts the shell on the bar and
+    # opens the first menu, and Down steps over the separators by itself.
+    # Seven items in: New window, Run, Copy, Move, Rename, Delete, Create
+    # directory, Properties.
+    $opsProps = @('key f10', 'wait 500') +
+                (1..8 | ForEach-Object { 'key down' }) +
+                @('wait 300', 'key enter', 'wait 1200')
+
+    $keyboard = $runHello + $runGfx + $opsMkdir + $opsCopy + $opsDelete +
+                $opsRename + $opsProps
     $quoted = ($moves | ForEach-Object { '"' + $_ + '"' }) -join ' '
     $after = @('"key f5"', '"wait 1500"') -join ' '
-    # Two windows closed with the keyboard, which is the other way to close
-    # one.  Ctrl+F4 closes a window; Alt+F4 would leave the shell.
-    $closing = @('"wait 200"') -join ' '
+    # The properties box is deliberately still up for both photographs - it is
+    # a modal window, and whether a full repaint puts it back is exactly the
+    # kind of thing the two-photograph criterion is for.  Enter dismisses it
+    # afterwards, so the count of windows left is the one folder window.
+    $closing = @('"key enter"', '"wait 600"') -join ' '
 
     $send = @(
         # Nothing to install: the drivers came up from C:\DRV with the boot,
@@ -242,10 +309,16 @@ try {
         '~\x0d',
         '=desktop: surface',
         "!& '$pyexe' 'tools\inputplay.py' --wait 20 $quoted",
+        # ONE keyboard pass for all of it, and that is not tidiness.
+        #
+        # Every invocation of inputplay opens a fresh socket to KBDVIRT, and
+        # the driver has to accept it and install it while an application is
+        # already reading from the old one.  Six of those in a row is six
+        # chances at that race: a run that did it that way delivered the first
+        # six keystrokes and then eleven of sixty-nine, with every connection
+        # reporting success.  One connection has no race to lose.
         ("!& '$pyexe' 'tools\inputplay.py' --wait 20 " +
-         (($runHello | ForEach-Object { '"' + $_ + '"' }) -join ' ')),
-        ("!& '$pyexe' 'tools\inputplay.py' --wait 20 " +
-         (($runGfx | ForEach-Object { '"' + $_ + '"' }) -join ' ')),
+         (($keyboard | ForEach-Object { '"' + $_ + '"' }) -join ' ')),
         "!.\tools\grab-window.ps1 -Out '$png'",
         "!& '$pyexe' 'tools\inputplay.py' --wait 20 $after",
         "!.\tools\grab-window.ps1 -Out '$png2'",
@@ -253,14 +326,34 @@ try {
         # 'q' rather than Escape: a lone 0x1b is held back by the console's
         # escape-sequence parser and never arrives as a key on its own.
         '~q',
-        '=pointer events'
+        '=pointer events',
+
+        # The disk, from the console rather than from the shell that changed
+        # it: a window drawing the right thing over a filesystem it did not
+        # actually change would pass a test that only asked the window.
+        #
+        # `type` and not `dir` for the things that should be gone: `dir` on a
+        # path that does not exist lists its PARENT and reports no files,
+        # which is the same output as an empty directory that does exist.
+        # `type` and not `dir` for what should be GONE: `dir` on a path that
+        # does not exist lists its PARENT and reports no files, which is the
+        # same output as an empty directory that does exist.
+        #
+        # And nothing here types a file that might still be there: `type` on an
+        # .AXE that survived a failed rename puts a kilobyte of Xtensa onto the
+        # screen, which is a failure that hides every other answer on it.  The
+        # listing says both things at once - the new name present, the old one
+        # absent - so it is what is asked.
+        'type c:\drv2\kbdvirt.sys',
+        'dir c:\drv',
+        'dir c:\'
     )
 
     Write-Host "desktop: driving QEMU, transcript -> $log, picture -> $png"
     # No -HostFs: everything the guest needs is on the C: image, which is one
     # fewer moving part - and HostFS is one that has been seen not to come back.
     & .\tools\qemu-boot.ps1 -Gfx -SysFs $sysfs -LogPath $log `
-        -TimeoutSec 90 -Send $send | Out-Host
+        -TimeoutSec 240 -Send $send | Out-Host
 
     # ---- what came back ---------------------------------------------------
     if (-not (Test-Path $log)) { throw "no transcript at $log" }
@@ -308,6 +401,37 @@ try {
         $fail += "GFXDEMO.AXE's console output never reached the screen"
     }
 
+    # ---- the file operations ---------------------------------------------
+    #
+    # Read off the last console screen, which is what the guest ended up
+    # showing after the shell exited.  The transcript itself is a stream of
+    # whole-screen repaints and cannot answer an ordering question.
+    if (Test-Path 'build-host\vtdump.exe') {
+        $screen = (& cmd /c "build-host\vtdump.exe 80 25 437 < $log") -join "`n"
+        Write-Host $screen
+
+        # Renamed: the listing has the new name and not the old one.
+        if ($screen -notmatch '(?i)HI\.AXE') {
+            $fail += 'F2 did not rename HELLO.AXE'
+        }
+        if ($screen -match '(?i)HELLO\.AXE') {
+            $fail += 'the old name is still there after the rename'
+        }
+        # Copied and then deleted: the copy is gone and the original is not.
+        if ($screen -notmatch '(?i)drv2.kbdvirt\.sys: file not found') {
+            $fail += 'Delete did not remove the copied tree'
+        }
+        if ($screen -notmatch '(?i)kbdvirt\.sys') {
+            $fail += 'the delete took the original C:\DRV as well as the copy'
+        }
+        # Created: the listing has it, and as a directory.
+        if ($screen -notmatch '(?i)newdir +<DIR>') {
+            $fail += 'Create directory did not make it'
+        }
+    } else {
+        Write-Host 'desktop: no vtdump, so the disk itself is not checked'
+    }
+
     # The picture as it stood, against the same picture after a forced full
     # repaint.  Any difference is the shell's own output failing to reach the
     # panel - a torn present, a stale save-under - and it is invisible in
@@ -319,20 +443,42 @@ try {
         if ($a.Width -ne $b.Width -or $a.Height -ne $b.Height) {
             $fail += 'the two pictures are different sizes'
         } else {
-            $diff = 0
+            # Two counts, not one, and the split is the whole point.
+            #
+            # The status strip along the bottom carries counters that move -
+            # the key and pointer totals go up between the two shots because
+            # F5 is itself a key - so a difference there is expected and says
+            # nothing.  ANYWHERE ELSE a difference means the first paint did
+            # not all reach the panel, and the tolerance for it is zero.
+            #
+            # It used to be one number against a budget of "about a strip's
+            # worth of pixels", and that let a real bug through: a window
+            # caption left half navy and half grey came to 1330 pixels,
+            # comfortably under the budget, and the check said ok.  A budget
+            # measured in pixels cannot tell a moving counter from a stale
+            # window; a budget measured in ROWS can.
+            $stripTop = $a.Height - 20
+            $inStrip = 0
+            $above = 0
+            $firstX = -1
+            $firstY = -1
             for ($y = 0; $y -lt $a.Height; $y++) {
                 for ($x = 0; $x -lt $a.Width; $x++) {
-                    if ($a.GetPixel($x, $y) -ne $b.GetPixel($x, $y)) { $diff++ }
+                    if ($a.GetPixel($x, $y) -ne $b.GetPixel($x, $y)) {
+                        if ($y -ge $stripTop) {
+                            $inStrip++
+                        } else {
+                            $above++
+                            if ($firstX -lt 0) { $firstX = $x; $firstY = $y }
+                        }
+                    }
                 }
             }
-            $total = $a.Width * $a.Height
-            Write-Host ("desktop: {0} of {1} pixels differ after a forced repaint" -f
-                        $diff, $total)
-            # The status strip carries counters that move, so a run where the
-            # numbers changed between the two shots is not a failure; anything
-            # beyond that strip is.
-            if ($diff -gt ($a.Width * 14)) {
-                $fail += "the forced repaint changed $diff pixels - the first paint did not all reach the panel"
+            Write-Host ("desktop: after a forced repaint, {0} pixels differ in the status strip and {1} above it" -f
+                        $inStrip, $above)
+            if ($above -gt 0) {
+                $fail += ("the forced repaint changed $above pixels outside the status strip, from ($firstX,$firstY) - " +
+                          'the first paint did not all reach the panel')
             }
         }
         $a.Dispose()

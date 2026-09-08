@@ -42,7 +42,9 @@
               "apps/desktop/dsk_paint_surface.c", "apps/desktop/dsk_cursor.c",
               "apps/desktop/dsk_wm.c", "apps/desktop/dsk_menu.c",
               "apps/desktop/dsk_dlg.c", "apps/desktop/dsk_icons.c",
-              "apps/desktop/dsk_folder.c", "apps/desktop/dsk_run.c"]
+              "apps/desktop/dsk_folder.c", "apps/desktop/dsk_run.c",
+              "apps/desktop/dsk_ops.c",
+              "apps/common/fsops/fsops.c", "apps/common/fsops/fsops_argon.c"]
     },
     {
       "out": "MARAUDER.AXE", "group": "core",
