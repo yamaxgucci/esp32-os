@@ -114,6 +114,28 @@ extern unsigned char ag_top_kind[AG_TOP_MISSES];
 extern unsigned char ag_top_where[AG_TOP_MISSES];
 
 /*
+ * What loading a sound costs, which is not a cache miss and so is invisible to
+ * everything above.
+ *
+ * The sound effects cache holds the *compressed* file.  Every play then reads
+ * it through the ACM decoder into a buffer of its own, copies that into an
+ * audio buffer and frees the first - so the decode is paid again on every
+ * play, and a cache hit does not save it.  Maxim's hour of play: 88 loads of
+ * HMWARRGA.ACM for 26 attacks, each one a malloc of 56086 bytes, a decode, and
+ * a second buffer the same size.
+ *
+ * Timed around soundLoad, so it covers the open, the read, the decode and the
+ * copy - the whole of what the game waits for.
+ */
+extern unsigned ag_sfx_loads;
+extern unsigned ag_sfx_ms;
+extern unsigned ag_sfx_kb;
+extern unsigned ag_sfx_worst_ms;
+extern char ag_sfx_worst[AG_NAME_MAX];
+/* The name being loaded, for the line above; written by soundLoad. */
+extern char ag_sfx_name[AG_NAME_MAX];
+
+/*
  * The worst lap of the reporting window, kept whole.
  *
  * Called from the main loop with that lap's own six phase times; keeps the

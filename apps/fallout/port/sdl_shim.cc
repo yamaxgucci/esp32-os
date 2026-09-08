@@ -79,6 +79,15 @@ unsigned ag_top_kb[AG_TOP_MISSES];
 unsigned char ag_top_kind[AG_TOP_MISSES];
 unsigned char ag_top_where[AG_TOP_MISSES];
 
+/* And what loading a sound costs, which no cache counter can see: the cache
+ * holds the compressed file and every play decodes it again. */
+unsigned ag_sfx_loads;
+unsigned ag_sfx_ms;
+unsigned ag_sfx_kb;
+unsigned ag_sfx_worst_ms;
+char ag_sfx_worst[AG_NAME_MAX];
+char ag_sfx_name[AG_NAME_MAX];
+
 /* Held above zero by mapLoad while it runs. */
 unsigned ag_map_loading;
 
@@ -1115,6 +1124,22 @@ static void top_report(void)
     }
 }
 
+/*
+ * And the sound, which is not in the cache report because it is not a cache
+ * miss: every play decodes the file again whether the cache had it or not.
+ */
+static void sfx_report(void)
+{
+    if (ag_sfx_loads == 0u) {
+        return;
+    }
+    shim_printf("[sfx t=%u] %u loads, %u ms total (%u ms each), %u KB; "
+              "worst %u ms on %s\n",
+              (unsigned)ag_millis(), ag_sfx_loads, ag_sfx_ms,
+              ag_sfx_ms / ag_sfx_loads, ag_sfx_kb, ag_sfx_worst_ms,
+              ag_sfx_worst[0] != '\0' ? ag_sfx_worst : "?");
+}
+
 static void cache_report(void)
 {
     static const char* const* const where_name = ag_where_name;
@@ -1248,6 +1273,7 @@ static void memstat_service(void)
     /* The worst lap first: it is the one that says whether to read the rest. */
     worst_report();
     cache_report();
+    sfx_report();
     top_report();
 }
 
