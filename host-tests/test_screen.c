@@ -398,6 +398,102 @@ static void test_poke_and_fill(void)
     AG_CHECK_STR(row_text(s, 4), "                  **");
 }
 
+/*
+ * Resizing, which is what a display swap and `mode con` go through.
+ *
+ * The whole point is that the picture survives, so every case here is about
+ * what is on the grid afterwards rather than about the return code.
+ */
+static uint32_t g_other_mem[1200];
+static ag_screen_t g_other;
+
+static void test_resize_keeps_the_picture(void)
+{
+    ag_screen_t *s = small_screen(); /* 20x5 */
+    ag_screen_puts(s, "hello\r\nworld");
+
+    /* Wider and taller: nothing is lost, and the cursor stays where it was. */
+    AG_CHECK_INT(ag_screen_recreate(&g_other, g_other_mem,
+                                    sizeof(g_other_mem), 40, 10, s),
+                 AG_OK);
+    AG_CHECK_INT(g_other.cols, 40);
+    AG_CHECK_INT(g_other.rows, 10);
+    AG_CHECK_STR(row_text(&g_other, 0), "hello");
+    AG_CHECK_STR(row_text(&g_other, 1), "world");
+    AG_CHECK_STR(row_text(&g_other, 2), "");
+    AG_CHECK_INT(g_other.cur_x, 5);
+    AG_CHECK_INT(g_other.cur_y, 1);
+    /* A renderer that skips work when nothing moved must not skip this. */
+    AG_CHECK(g_other.generation > s->generation);
+}
+
+static void test_resize_narrower_truncates_the_row(void)
+{
+    ag_screen_t *s = small_screen(); /* 20x5 */
+    ag_screen_puts(s, "abcdefghij");
+
+    AG_CHECK_INT(ag_screen_recreate(&g_other, g_other_mem,
+                                    sizeof(g_other_mem), 4, 5, s),
+                 AG_OK);
+    AG_CHECK_STR(row_text(&g_other, 0), "abcd");
+    /* The cursor was past the new right edge; it is clamped, not wrapped. */
+    AG_CHECK_INT(g_other.cur_x, 3);
+    AG_CHECK_INT(g_other.cur_y, 0);
+}
+
+static void test_resize_shorter_keeps_the_newest_rows(void)
+{
+    ag_screen_t *s = small_screen(); /* 20x5 */
+    ag_screen_puts(s, "one\r\ntwo\r\nthree\r\nfour\r\nfive");
+
+    /* Two rows left: the ones ending at the cursor, not the first two. */
+    AG_CHECK_INT(ag_screen_recreate(&g_other, g_other_mem,
+                                    sizeof(g_other_mem), 20, 2, s),
+                 AG_OK);
+    AG_CHECK_STR(row_text(&g_other, 0), "four");
+    AG_CHECK_STR(row_text(&g_other, 1), "five");
+    AG_CHECK_INT(g_other.cur_y, 1);
+    AG_CHECK_INT(g_other.cur_x, 4);
+}
+
+static void test_resize_carries_attributes(void)
+{
+    ag_screen_t *s = small_screen();
+    ag_screen_set_attr(s, AG_ATTR(AG_YELLOW, AG_BLUE));
+    ag_screen_puts(s, "X");
+    ag_screen_set_cursor(s, false);
+
+    AG_CHECK_INT(ag_screen_recreate(&g_other, g_other_mem,
+                                    sizeof(g_other_mem), 20, 5, s),
+                 AG_OK);
+    AG_CHECK_INT(ag_screen_at(&g_other, 0, 0).attr,
+                 AG_ATTR(AG_YELLOW, AG_BLUE));
+    AG_CHECK_INT(g_other.attr, AG_ATTR(AG_YELLOW, AG_BLUE));
+    AG_CHECK(!g_other.cursor_visible);
+}
+
+static void test_resize_refuses_a_size_that_does_not_fit(void)
+{
+    ag_screen_t *s = small_screen();
+    ag_screen_puts(s, "keepme");
+
+    /* Too little memory, and zero, and past the maximum: all refused... */
+    AG_CHECK_INT(ag_screen_recreate(&g_other, g_other_mem, 16, 80, 25, s),
+                 -AG_ERANGE);
+    AG_CHECK_INT(ag_screen_recreate(&g_other, g_other_mem,
+                                    sizeof(g_other_mem), 0, 5, s),
+                 -AG_EINVAL);
+    AG_CHECK_INT(ag_screen_recreate(&g_other, g_other_mem,
+                                    sizeof(g_other_mem), 20,
+                                    AG_SCREEN_MAX_ROWS + 1, s),
+                 -AG_EINVAL);
+
+    /* ...and the screen that was there is untouched, which is the point: a
+     * typed-in size must not cost the console it was typed at. */
+    AG_CHECK_INT(s->cols, 20);
+    AG_CHECK_STR(row_text(s, 0), "keepme");
+}
+
 void run_screen_tests(void)
 {
     test_init();
@@ -413,4 +509,9 @@ void run_screen_tests(void)
     test_malformed_sequences();
     test_dirty_tracking();
     test_poke_and_fill();
+    test_resize_keeps_the_picture();
+    test_resize_narrower_truncates_the_row();
+    test_resize_shorter_keeps_the_newest_rows();
+    test_resize_carries_attributes();
+    test_resize_refuses_a_size_that_does_not_fit();
 }

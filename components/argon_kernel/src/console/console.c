@@ -673,6 +673,74 @@ ag_err_t ag_console_init(uint16_t cols, uint16_t rows)
     return AG_OK;
 }
 
+/*
+ * A new grid, with the old picture carried over.
+ *
+ * The size the console starts at is a build option because the console exists
+ * three stages before anything has read a file off the flash.  This is how it
+ * changes afterwards, once SYSTEM.CFG can be read and the panel has said how
+ * much glass it has - so a board that gets a different display plugged into it
+ * is a line in a file, not a rebuild.
+ *
+ * The overlap is copied rather than cleared, because the boot report is on
+ * that screen and it is the one screenful most worth keeping.  When the new
+ * grid is shorter, the rows copied are the ones ending at the cursor: that is
+ * what a terminal does when its window is dragged smaller, and it keeps the
+ * newest output rather than the oldest.
+ */
+ag_err_t ag_console_resize(uint16_t cols, uint16_t rows)
+{
+    if (!s_ready) {
+        return -AG_ENODEV;
+    }
+    if (cols == 0 || rows == 0 || cols > AG_SCREEN_MAX_COLS ||
+        rows > AG_SCREEN_MAX_ROWS) {
+        return -AG_EINVAL;
+    }
+    if (cols == s_screen.cols && rows == s_screen.rows) {
+        return AG_OK;
+    }
+
+    const size_t need = ag_screen_memsize(cols, rows);
+    void *mem = ag_port_alloc(need, AG_MEM_FAST | AG_MEM_BYTE);
+    if (mem == NULL) {
+        return -AG_ENOMEM;
+    }
+
+    ag_console_lock();
+
+    ag_screen_t    next;
+    const ag_err_t err =
+        ag_screen_recreate(&next, mem, need, cols, rows, &s_screen);
+    if (err != AG_OK) {
+        ag_console_unlock();
+        ag_port_free(mem);
+        return err;
+    }
+
+    void *old = s_screen.dirty;
+    s_screen  = next;
+
+    /*
+     * Every endpoint is told the whole terminal again, not just the rows: a
+     * VT100 showing eighty columns has to be cleared, or the right-hand half
+     * of the old picture stays there for ever with nothing ever writing to it.
+     */
+    for (int i = 0; i < AG_CON_MAX_ENDPOINTS; i++) {
+        ag_con_endpoint_t *ep = &s_endpoints[i];
+        if (!ep->used) {
+            continue;
+        }
+        ag_vtout_init(&ep->out);
+        ag_vtout_hello(&ep->out, sink_to_transport, ep);
+        ag_vtout_mark_all(&ep->out);
+    }
+
+    ag_console_unlock();
+    ag_port_free(old);
+    return AG_OK;
+}
+
 ag_err_t ag_console_attach(const ag_con_transport_t *transport, void *ctx)
 {
     if (transport == NULL) {

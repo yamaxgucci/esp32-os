@@ -1139,6 +1139,21 @@ void ag_display_show_overlay(const char *label)
     panel_present();
 }
 
+bool ag_display_text_cells(uint16_t *cols, uint16_t *rows)
+{
+    uint16_t w = 0, h = 0;
+    if (!ag_display_size(&w, &h)) {
+        return false;
+    }
+    if (cols != NULL) {
+        *cols = (uint16_t)(w / AG_FONT8X16_W);
+    }
+    if (rows != NULL) {
+        *rows = (uint16_t)(h / AG_FONT8X16_H);
+    }
+    return true;
+}
+
 static void paint_console_cell(const ag_screen_t *screen, uint16_t col,
                                uint16_t row, bool invert)
 {

@@ -38,6 +38,19 @@ bool ag_display_ready(void);
  */
 bool ag_display_size(uint16_t *w, uint16_t *h);
 
+/*
+ * The same surface counted in character cells - what the framebuffer console
+ * can actually show, at the cell size this module draws with.  False when
+ * there is no surface.
+ *
+ * Here rather than computed by the caller because the cell size belongs to
+ * whoever draws the glyphs, and it is not the same everywhere: the
+ * framebuffer console uses 8x16, a panel driver with text ops uses 8x8.  A
+ * caller that divides by its own guess gets a console half of which is off
+ * the glass, which is the bug this exists to stop.
+ */
+bool ag_display_text_cells(uint16_t *cols, uint16_t *rows);
+
 /* True while an application holds the framebuffer (text blit is suspended). */
 bool ag_display_acquired(void);
 

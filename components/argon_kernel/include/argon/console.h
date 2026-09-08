@@ -45,6 +45,18 @@ typedef struct {
 ag_err_t ag_console_init(uint16_t cols, uint16_t rows);
 bool     ag_console_ready(void);
 
+/*
+ * Changes the size of the text screen, keeping what is on it.  The size at
+ * boot is a build option (the console is up three stages before a file can be
+ * read); this is what a line in SYSTEM.CFG and a newly attached display go
+ * through afterwards.  Every endpoint gets a full repaint.
+ *
+ * -AG_ENODEV before the console exists, -AG_EINVAL outside
+ * AG_SCREEN_MAX_COLS/ROWS, -AG_ENOMEM when the new grid does not fit.  The old
+ * grid is kept on failure, so a bad size costs nothing.
+ */
+ag_err_t ag_console_resize(uint16_t cols, uint16_t rows);
+
 /* Adds an endpoint.  It starts with a full repaint owed to it. */
 ag_err_t ag_console_attach(const ag_con_transport_t *transport, void *ctx);
 

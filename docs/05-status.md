@@ -191,7 +191,7 @@ $py = "D:\Espressif\tools\python_env\idf5.5_py3.12_env\Scripts\python.exe"
 | Описание платы | `src/boot/board.c` | ✅ дефолты + `C:\BOARD.CFG` |
 | Журнал логов | `src/core/journal.c`, `log.c` | ✅ кольцо 4 КБ, команда `log` |
 | Пути, конфиг, разбор команд | `src/core/path.c`, `cfg.c`, `cmdline.c` | ✅ |
-| Текстовый экран + ANSI | `src/console/screen.c` | ✅ 80×25, отложенный перенос |
+| Текстовый экран + ANSI | `src/console/screen.c` | ✅ 80×25 по умолчанию, размер из `[console] cols/rows` (или `auto`) и команды `mode`, отложенный перенос |
 | Рендер в VT100 | `src/console/vtout.c` | ✅ по одному на endpoint |
 | Разбор ввода терминала | `src/console/vtin.c` | ✅ HID-коды, UTF-8, мышь |
 | Кодовая страница | `src/console/codepage.c` | ✅ CP437/866/1251, `chcp`, конвертация на краях |

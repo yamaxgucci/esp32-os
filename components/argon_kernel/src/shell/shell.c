@@ -14,6 +14,7 @@
 #include <argon/cmdline.h>
 #include <argon/codepage.h>
 #include <argon/console.h>
+#include <argon/textpanel.h>
 #include <argon/session.h>
 #include <argon/display.h>
 #include <argon/device.h>
@@ -394,6 +395,99 @@ static int cmd_mem(int argc, char **argv)
         ag_console_printf("  WARNING: %u console input events lost\n",
                           (unsigned)dropped);
     }
+    return 0;
+}
+
+/* Case-insensitive compare of the first `len` bytes against a whole word. */
+static bool word_is(const char *a, size_t len, const char *lit)
+{
+    for (size_t i = 0; i < len; i++) {
+        char c = a[i];
+        if (c >= 'A' && c <= 'Z') {
+            c = (char)(c + 32);
+        }
+        if (lit[i] == 0 || c != lit[i]) {
+            return false;
+        }
+    }
+    return lit[len] == 0;
+}
+
+/*
+ * mode - the size of the text screen, the way DOS spelled it.
+ *
+ *     mode                       what it is now
+ *     mode con cols=40 lines=25  change it
+ *
+ * The change is not written anywhere: `[console] cols/rows` in SYSTEM.CFG is
+ * what survives a reset.  This is for trying a size on the display that is
+ * actually plugged in before committing to it, which is exactly the case where
+ * guessing from a datasheet goes wrong.
+ */
+static int cmd_mode(int argc, char **argv)
+{
+    ag_console_lock();
+    const ag_screen_t *scr = ag_console_screen();
+    uint16_t cols = scr->cols, rows = scr->rows;
+    ag_console_unlock();
+
+    if (argc < 2) {
+        ag_console_printf("con: cols=%u lines=%u\n", (unsigned)cols,
+                          (unsigned)rows);
+        /* What `auto` would pick, and where it would have got it from. */
+        uint16_t pcols = 0, prows = 0;
+        if (ag_textpanel_geometry(&pcols, &prows) == AG_OK) {
+            ag_console_printf("panel: %ux%u cells\n", (unsigned)pcols,
+                              (unsigned)prows);
+        } else if (ag_display_text_cells(&pcols, &prows)) {
+            uint16_t w = 0, h = 0;
+            (void)ag_display_size(&w, &h);
+            ag_console_printf("screen: %ux%u px = %ux%u cells\n", (unsigned)w,
+                              (unsigned)h, (unsigned)pcols, (unsigned)prows);
+        }
+        return 0;
+    }
+
+    for (int i = 1; i < argc; i++) {
+        const char *a = argv[i];
+        /* "con" and "con:" are the device this command has always addressed. */
+        if (word_is(a, strlen(a), "con") || word_is(a, strlen(a), "con:")) {
+            continue;
+        }
+
+        const char *eq = strchr(a, '=');
+        if (eq == NULL) {
+            ag_console_printf("mode: don't understand '%s'\n", a);
+            return 1;
+        }
+
+        const int    n    = atoi(eq + 1);
+        const size_t klen = (size_t)(eq - a);
+        if (word_is(a, klen, "cols")) {
+            cols = (uint16_t)n;
+        } else if (word_is(a, klen, "lines") || word_is(a, klen, "rows")) {
+            rows = (uint16_t)n;
+        } else {
+            ag_console_printf("mode: no such setting '%.*s'\n", (int)klen, a);
+            return 1;
+        }
+        if (n < 1) {
+            ag_console_printf("mode: %s must be at least 1\n", a);
+            return 1;
+        }
+    }
+
+    const ag_err_t err = ag_console_resize(cols, rows);
+    if (err != AG_OK) {
+        ag_console_printf("mode: %ux%u refused (%d); at most %ux%u, and it "
+                          "has to fit in memory\n",
+                          (unsigned)cols, (unsigned)rows, (int)err,
+                          (unsigned)AG_SCREEN_MAX_COLS,
+                          (unsigned)AG_SCREEN_MAX_ROWS);
+        return 1;
+    }
+    ag_console_printf("con: cols=%u lines=%u\n", (unsigned)cols,
+                      (unsigned)rows);
     return 0;
 }
 
@@ -4546,6 +4640,7 @@ static const ag_command_t k_commands[] = {
     {"echo", "<text>", "print text", cmd_echo},
     {"color", "<fg> <bg>", "set text colours", cmd_color},
     {"chcp", "[437|866|1251]", "screen code page", cmd_chcp},
+    {"mode", "[con cols=N lines=N]", "text screen size", cmd_mode},
     {"fm", "[left] [right]", "file manager, two panels", cmd_fm},
     {"edit", "[file]", "create or edit a text file", cmd_edit},
     {"gfxdump", "[/live] <file.ppm>", "save framebuffer as PPM", cmd_gfxdump},

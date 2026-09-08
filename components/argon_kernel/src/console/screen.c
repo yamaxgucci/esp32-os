@@ -127,6 +127,49 @@ ag_err_t ag_screen_init(ag_screen_t *s, void *mem, size_t memsize,
     return AG_OK;
 }
 
+ag_err_t ag_screen_recreate(ag_screen_t *dst, void *mem, size_t memsize,
+                            uint16_t cols, uint16_t rows,
+                            const ag_screen_t *src)
+{
+    if (src == NULL || src->cells == NULL) {
+        return -AG_EINVAL;
+    }
+
+    ag_screen_t next;
+    const ag_err_t err = ag_screen_init(&next, mem, memsize, cols, rows);
+    if (err != AG_OK) {
+        return err;
+    }
+
+    /* The first source row to keep: the cursor's row must survive. */
+    const uint16_t keep = (rows < src->rows) ? rows : src->rows;
+    const uint16_t from =
+        (src->cur_y >= keep) ? (uint16_t)(src->cur_y + 1u - keep) : 0u;
+    const uint16_t wide = (cols < src->cols) ? cols : src->cols;
+
+    for (uint16_t y = 0; y < keep && (uint16_t)(y + from) < src->rows; y++) {
+        const ag_cell_t *sr = &src->cells[(size_t)(y + from) * src->cols];
+        ag_cell_t       *dr = &next.cells[(size_t)y * cols];
+        for (uint16_t x = 0; x < wide; x++) {
+            dr[x] = sr[x];
+        }
+        ag_screen_mark_row_dirty(&next, y);
+    }
+
+    next.attr           = src->attr;
+    next.saved_attr     = src->saved_attr;
+    next.cursor_visible = src->cursor_visible;
+    next.cur_x = (src->cur_x < cols) ? src->cur_x : (uint16_t)(cols - 1u);
+    next.cur_y = (uint16_t)(src->cur_y - from);
+    if (next.cur_y >= rows) {
+        next.cur_y = (uint16_t)(rows - 1u);
+    }
+    next.generation = src->generation + 1u;
+
+    *dst = next;
+    return AG_OK;
+}
+
 void ag_screen_cls(ag_screen_t *s)
 {
     for (uint16_t y = 0; y < s->rows; y++) {
