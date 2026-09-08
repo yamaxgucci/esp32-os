@@ -87,7 +87,8 @@ On the OS itself, use Argon CC as above. Using the machine rather than
 programming it: [docs/user/01-shell.md](docs/user/01-shell.md),
 [docs/user/02-board-setup.md](docs/user/02-board-setup.md),
 [docs/user/03-host-share.md](docs/user/03-host-share.md) (QEMU folder sync) and
-[docs/user/04-network.md](docs/user/04-network.md) (fetching and serving files).
+[docs/user/04-network.md](docs/user/04-network.md) (fetching and serving files)
+and [docs/user/05-desktop.md](docs/user/05-desktop.md) (the graphical shell).
 The SDK docs are in
 Russian, like the rest of the design notes.
 

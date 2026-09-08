@@ -80,6 +80,7 @@ try {
     New-Item -ItemType Directory -Force (Split-Path $Out) | Out-Null
     $png = Join-Path $root "$Out.png"
     $png2 = Join-Path $root "$Out-repaint.png"
+    $png3 = Join-Path $root "$Out-restored.png"
     $log = "$Out.log"
 
     $pyexe = if ($env:ARGON_PYTHON -and (Test-Path $env:ARGON_PYTHON)) {
@@ -172,6 +173,12 @@ try {
     $drvX = 4 + 28
     $drvY = $workY + 4 + 22
 
+    # Where the dragged icon is dropped.  The position that should then be in
+    # DESKTOP.INI is checked numerically further down rather than by regex,
+    # because "did it move" is a comparison and not a spelling.
+    $dropX = 300
+    $dropY = $workY + 200
+
     # The folder window it opens, and the middle of its first row.
     $fwX = 8
     $fwY = $workY + 8
@@ -180,6 +187,26 @@ try {
 
     $moves = @(
         'home',
+
+        # FIRST, while the icons can still be seen: drag the second drive icon
+        # off its column, which is the other half of what DESKTOP.INI
+        # remembers.  press / glide / release, because a click and a move are
+        # not a drag - see tools\inputplay.py.
+        #
+        # Before the windows, and that is the whole reason it is here: the
+        # icons live in a column down the left edge and the first folder window
+        # opens on top of them, so a press aimed at an icon after that lands on
+        # the window instead.  Which is what happened, and it looked exactly
+        # like a drag that was not recorded.
+        #
+        # The first cell is at (4,4) inside the work area and the second 44
+        # pixels below it, so the second icon's middle is around
+        # (32, menubar + 4 + 44 + 22).
+        "move 32,$($workY + 70)",
+        'press', 'wait 200',
+        "glide $($dropX),$($dropY)", 'wait 400',
+        'release', 'wait 800',
+
         # A drive opens as a window onto its root.
         "move $drvX,$drvY", 'click', 'wait 120', 'click', 'wait 1500',
         # Into the only directory there is, and back out of it by "..".
@@ -205,14 +232,46 @@ try {
     #
     # Launched from the folder window that is already open on C:\, by
     # selecting a row and pressing Enter - which is how anyone would do it,
-    # and needs no menu coordinates.  Home first so the selection is known
-    # wherever the walk above left it.
+    # and needs no menu coordinates.
     #
-    # C:\ holds, in this order: drv, DESKTOP.AXE, GFXDEMO.AXE, HELLO.AXE,
-    # SYSTEM.CFG.  Directories first, then files by name.  Do NOT open row 1
-    # from here: DESKTOP.AXE starting DESKTOP.AXE works, and a second shell
-    # over the first is not what is being measured.
-    $runHello = @('key home') + (1..3 | ForEach-Object { 'key down' }) +
+    # Do NOT open DESKTOP.AXE from here: a desktop starting a desktop works,
+    # and a second shell over the first is not what is being measured.
+
+    # ---- which row is which ----------------------------------------------
+    #
+    # Every step below picks an entry by counting Downs from Home, so every
+    # step depends on what C:\ holds and in what order the window sorts it -
+    # directories first, then files by name.  Counting them by hand is how a
+    # run launched GFXDEMO where it meant to launch HELLO, and then quit the
+    # shell with the 'q' that was meant for GFXDEMO, and then typed the rest
+    # of the script at the console prompt.  None of which mentioned rows.
+    #
+    # So the listing is written down once and the indices come out of it.
+    # DESKTOP.INI is in it because the icon drag above CREATED it: dragging an
+    # icon writes the arrangement, the file lands on C:, and it sorts between
+    # DESKTOP.AXE and GFXDEMO.AXE - shifting everything below it by one.
+    $rows = @('drv', 'DESKTOP.AXE', 'DESKTOP.INI', 'GFXDEMO.AXE',
+              'HELLO.AXE', 'SYSTEM.CFG')
+
+    # Home, then one Down per row: a selection that starts from a known place
+    # rather than from wherever the last step left it.
+    function Pick($list, $name) {
+        $at = [array]::IndexOf($list, $name)
+        if ($at -lt 0) { throw "no row called $name in the listing" }
+        $keys = @('key home')
+        if ($at -gt 0) { $keys += (1..$at | ForEach-Object { 'key down' }) }
+        # `,$keys` and not `$keys`: PowerShell unrolls a returned array, and a
+        # ONE-element array comes back as a plain string.  The caller then
+        # writes `Pick ... + @(...)`, which on a string is text concatenation -
+        # so row 0 produced one item reading "key homewait 200 key f8..." and
+        # inputplay stopped at "no key called 'homewait 200 ke'".  Everything
+        # after that step silently did not happen, and the disk checks passed
+        # because they were checking that a copy which never happened was not
+        # there.
+        return ,$keys
+    }
+
+    $runHello = (Pick $rows 'HELLO.AXE') +
                 @('wait 300', 'key enter',
                   # Loading off flash, running, printing, and then sitting on
                   # "finished with 0" until a key.
@@ -221,7 +280,7 @@ try {
                   # arrive at the desktop underneath.
                   'key enter', 'wait 1500')
 
-    $runGfx = @('key home') + (1..2 | ForEach-Object { 'key down' }) +
+    $runGfx = (Pick $rows 'GFXDEMO.AXE') +
               @('wait 300', 'key enter', 'wait 4000',
                 # 'q' is how gfxdemo exits, and it only gets there if a child
                 # of an application can be typed at.
@@ -244,8 +303,6 @@ try {
     # test_cancelled_copy_keeps_what_it_finished and
     # test_failed_move_keeps_the_source in host-tests\test_fsops.c.
     #
-    # C:\ holds, in order: drv, DESKTOP.AXE, GFXDEMO.AXE, HELLO.AXE,
-    # SYSTEM.CFG.  After the copy, drv2 sorts in as the second directory.
     $clear = 1..12 | ForEach-Object { 'key backspace' }
 
     # File > Create directory..., from the keyboard.  F10 puts the shell on the
@@ -253,25 +310,32 @@ try {
     # so the seventh stop is Create directory (New window, Run, Copy, Move,
     # Rename, Delete, Create directory) and the eighth is Properties.
     #
-    # It runs FIRST of the operations, because it changes what is on which row
-    # and everything after it counts rows.  C:\ then holds: drv, newdir,
-    # DESKTOP.AXE, GFXDEMO.AXE, HELLO.AXE, SYSTEM.CFG.
+    # It runs FIRST of the operations, because it changes what is on which
+    # row: `newdir` sorts in as the second directory, so $rowsAfterMkdir is
+    # what everything after this counts against.
     $opsMkdir = @('key f10', 'wait 500') +
                 (1..7 | ForEach-Object { 'key down' }) +
                 @('wait 300', 'key enter', 'wait 800',
                   'say newdir', 'wait 200', 'key enter', 'wait 1500')
 
-    $opsCopy = @('key home', 'wait 200',
-                 'key f8', 'wait 800') + $clear +
+    $rowsAfterMkdir = @('drv', 'newdir') +
+                      ($rows | Where-Object { $_ -ne 'drv' })
+
+    # `drv` is copied to `drv2`, which then sorts in beside it.
+    $opsCopy = (Pick $rowsAfterMkdir 'drv') +
+               @('wait 200', 'key f8', 'wait 800') + $clear +
                @('say drv2', 'wait 200', 'key enter', 'wait 3000')
 
-    # Row 1 is now drv2.  Enter answers Yes, which is the first button.
-    $opsDelete = @('key home', 'key down', 'wait 300',
-                   'key delete', 'wait 800', 'key enter', 'wait 3000')
+    $rowsAfterCopy = @('drv', 'drv2') +
+                     ($rowsAfterMkdir | Where-Object { $_ -ne 'drv' })
 
-    # drv, newdir, DESKTOP.AXE, GFXDEMO.AXE, HELLO.AXE - four down now that
-    # Create directory has added one above it.
-    $opsRename = @('key home') + (1..4 | ForEach-Object { 'key down' }) +
+    # Enter answers Yes, which is the first button of a yes/no box.
+    $opsDelete = (Pick $rowsAfterCopy 'drv2') +
+                 @('wait 300', 'key delete', 'wait 800', 'key enter',
+                   'wait 3000')
+
+    # And drv2 is gone again, so the rows are the ones after the mkdir.
+    $opsRename = (Pick $rowsAfterMkdir 'HELLO.AXE') +
                  @('wait 300', 'key f2', 'wait 800') + $clear +
                  @('say hi.axe', 'wait 200', 'key enter', 'wait 2000')
 
@@ -326,6 +390,30 @@ try {
         # 'q' rather than Escape: a lone 0x1b is held back by the console's
         # escape-sequence parser and never arrives as a key on its own.
         '~q',
+        '=pointer events',
+
+        # ---- and now the whole point of DESKTOP.INI ----------------------
+        #
+        # The shell is started a second time and given NOTHING: no clicks, no
+        # keys, and a deadline so it leaves on its own.  Whatever is on the
+        # screen and in its counters therefore came out of the file, and the
+        # counters are what says so - "0 pointer events, 0 key events, 1
+        # window" cannot be produced by a shell that forgot.
+        #
+        # A photograph would show the window too, and would not distinguish a
+        # restored window from one this script had opened; the counters do.
+        'type c:\desktop.ini',
+        '~run c:\desktop.axe 12',
+        '~\x0d',
+        '=desktop: surface',
+        # The surface line is printed before the first paint has reached the
+        # panel, so a photograph taken the moment it appears catches the
+        # console underneath - which is how the restored desktop came out as a
+        # screen full of DESKTOP.INI.  Three seconds is the arrangement being
+        # put back; the assertions below do not depend on this picture, it is
+        # there to be looked at.
+        '!Start-Sleep -Seconds 3',
+        "!.\tools\grab-window.ps1 -Out '$png3'",
         '=pointer events',
 
         # The disk, from the console rather than from the shell that changed
@@ -508,15 +596,16 @@ try {
     # Two patterns, because the shell prints two lines - and it prints two
     # lines because a single one grew past the console's eighty columns and
     # was wrapped, with escape sequences through the middle of it.
-    # The LAST match, not the first.  A program started from the desktop may
-    # itself be a desktop, and then there are two sets of these lines in the
-    # transcript - the nested one prints first, because it exits first.
+    # The shell runs TWICE in this scenario and prints these on the way out
+    # each time, so which match is wanted depends on which run is being asked
+    # about: the first is the one that was driven, the last is the one that was
+    # given nothing and had to remember.
     $mm = [regex]::Matches($text,
                         'desktop: (\d+) pointer events, (\d+) key events, (\d+) repaints')
     $mm2 = [regex]::Matches($text,
                          'desktop: (\d+) windows, (\d+) reflushes, (\d+) moves coalesced')
-    $m = if ($mm.Count -gt 0) { $mm[$mm.Count - 1] } else { $mm }
-    $m2 = if ($mm2.Count -gt 0) { $mm2[$mm2.Count - 1] } else { $mm2 }
+    $m = if ($mm.Count -gt 0) { $mm[0] } else { $mm }
+    $m2 = if ($mm2.Count -gt 0) { $mm2[0] } else { $mm2 }
     if ($m.Success -and $m2.Success) {
         $ptr = [int]$m.Groups[1].Value
         $key = [int]$m.Groups[2].Value
@@ -529,6 +618,25 @@ try {
         if ($rep -lt 1) {
             $fail += 'F5 never reached the shell, so the second picture is not a fresh paint'
         }
+        # Every keystroke the script sends, counted, against what the shell
+        # says it saw.
+        #
+        # This is the assertion that catches a run which quietly did half the
+        # sequence.  Without it, a step that never happened is invisible: the
+        # disk checks below then confirm that a copy which was never made is
+        # not there, and the whole thing passes.  One run delivered thirty of
+        # ninety keys and failed on nothing but the rename.
+        $wantKeys = 0
+        foreach ($k in $keyboard) {
+            if ($k -like 'key *') {
+                $wantKeys++
+            } elseif ($k -like 'say *') {
+                $wantKeys += $k.Substring(4).Length
+            }
+        }
+        if ($key -lt $wantKeys) {
+            $fail += "only $key of $wantKeys keystrokes reached the shell, so the sequence did not all run"
+        }
         # Four opened from the menu, two closed with Alt+F4.  A different
         # number means a menu that did not open, a click that missed, or a
         # close that did not close - and the picture alone would not say which.
@@ -538,6 +646,53 @@ try {
     } else {
         $fail += 'the shell did not print its counts (it may have been killed)'
     }
+
+    # ---- what the second run remembered ---------------------------------
+    #
+    # It was given no input at all and left on its own deadline, so everything
+    # it reports came out of C:\DESKTOP.INI.
+    if ($mm.Count -lt 2 -or $mm2.Count -lt 2) {
+        $fail += 'the shell did not start a second time, so nothing was restored'
+    } else {
+        $r = $mm[$mm.Count - 1]
+        $r2 = $mm2[$mm2.Count - 1]
+        $rPtr = [int]$r.Groups[1].Value
+        $rKey = [int]$r.Groups[2].Value
+        $rWin = [int]$r2.Groups[1].Value
+        Write-Host ("desktop: the restored run saw {0} pointer and {1} key events, and had {2} window(s)" -f
+                    $rPtr, $rKey, $rWin)
+        if ($rPtr -ne 0 -or $rKey -ne 0) {
+            $fail += "the second run was not left alone ($rPtr pointer, $rKey key events), so it proves nothing"
+        }
+        if ($rWin -ne 1) {
+            $fail += "the second run had $rWin windows open, not the one it was left with"
+        }
+    }
+
+    # And the icon: DESKTOP.INI was typed to the console, so the position it
+    # holds can be compared with where the drag actually dropped it.  A regex
+    # for "some big number" would pass on the default position too; this is
+    # the comparison itself.
+    # No ^ anchor and no multiline: the transcript is a stream of cursor
+    # positioning, not of lines, so there is nothing for ^ to anchor to.  The
+    # writer emits exactly "T: = x,y", which is specific enough on its own.
+    $iniLine = [regex]::Match($text, 'T:\s*=\s*(-?\d+)\s*,\s*(-?\d+)')
+    if (-not $iniLine.Success) {
+        $fail += 'DESKTOP.INI holds no position for the icon that was dragged'
+    } else {
+        $ix = [int]$iniLine.Groups[1].Value
+        $iy = [int]$iniLine.Groups[2].Value
+        Write-Host ("desktop: DESKTOP.INI puts the dragged icon at {0},{1}" -f $ix, $iy)
+        # It started at 4,48.  Anything near there means the drag was not
+        # recorded; the drop was at 300,menubar+200.
+        if ($ix -lt 100 -or $iy -lt 100) {
+            $fail += "the dragged icon was written down at $ix,$iy - close to where it started, so the drag was not recorded"
+        }
+    }
+    if (-not (Test-Path $png3)) {
+        $fail += 'no picture of the restored desktop'
+    }
+
 
     if ($fail.Count -gt 0) {
         Write-Host ''

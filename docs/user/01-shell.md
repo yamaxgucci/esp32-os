@@ -661,6 +661,9 @@ autoexec = c:\autoexec.bat
 - Bare-имя (`hello`) ищет `hello.axe`, затем `hello.bat` / `hello.cmd` в cwd и
   по `shell.path` (`.axe` важнее `.bat`, если есть оба).
 - `C:\AUTOEXEC.BAT` (или `shell.autoexec`) выполняется построчно после boot.
+  Строка `run c:\desktop.axe` в нём — это машина, которая загружается сразу в
+  графическую оболочку; `Ctrl+\` уводит оттуда в системный шелл, см.
+  [05-desktop.md](05-desktop.md).
 - Enter в `fm` на `.txt` открывает `edit`, если есть `[assoc]`; на `.bat`/`.cmd`
   запускает скрипт. `F4` всегда открывает текущий файл в `edit` (без `[assoc]`).
 

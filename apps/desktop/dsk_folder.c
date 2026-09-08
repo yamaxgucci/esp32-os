@@ -141,13 +141,40 @@ static void read_dir(folder_t *f)
 
 /* ---- geometry ---------------------------------------------------------- */
 
+/*
+ * The strip along the bottom that says how much is in here.
+ *
+ * It costs a row of the list, so it is dropped rather than shrinking the list
+ * to nothing: on a 320x240 panel a small window has four rows in it, and three
+ * rows with a total under them is worth having while one row with a total
+ * under it is not.
+ */
+#define STATUS_H (DSK_SMALL_H + 3)
+#define STATUS_MIN_ROWS 3
+
+static bool has_status(dsk_win_t *w)
+{
+    const dsk_rect_t c = dsk_wm_client(w);
+    return !dsk_rect_empty(c) && c.h >= (STATUS_H + STATUS_MIN_ROWS * ROW_H);
+}
+
+static dsk_rect_t status_rect(dsk_win_t *w)
+{
+    if (!has_status(w)) {
+        return dsk_rect_none();
+    }
+    const dsk_rect_t c = dsk_wm_client(w);
+    return dsk_rect(c.x, (int16_t)(dsk_rect_y2(c) - STATUS_H), c.w, STATUS_H);
+}
+
 static dsk_rect_t list_rect(dsk_win_t *w)
 {
     const dsk_rect_t c = dsk_wm_client(w);
     if (dsk_rect_empty(c)) {
         return c;
     }
-    return dsk_rect(c.x, c.y, (int16_t)(c.w - BAR_W), c.h);
+    const int16_t h = (int16_t)(has_status(w) ? c.h - STATUS_H : c.h);
+    return dsk_rect(c.x, c.y, (int16_t)(c.w - BAR_W), h);
 }
 
 static dsk_rect_t bar_rect(dsk_win_t *w)
@@ -156,7 +183,8 @@ static dsk_rect_t bar_rect(dsk_win_t *w)
     if (dsk_rect_empty(c) || c.w <= BAR_W) {
         return dsk_rect_none();
     }
-    return dsk_rect((int16_t)(dsk_rect_x2(c) - BAR_W), c.y, BAR_W, c.h);
+    const int16_t h = (int16_t)(has_status(w) ? c.h - STATUS_H : c.h);
+    return dsk_rect((int16_t)(dsk_rect_x2(c) - BAR_W), c.y, BAR_W, h);
 }
 
 static int rows_visible(dsk_win_t *w)
@@ -229,6 +257,52 @@ static void draw_bar(dsk_win_t *w, folder_t *f)
     dsk_panel(dsk_rect(b.x, ty, BAR_W, th), true, DSK_LGRAY);
 }
 
+/*
+ * How many things are in here and how many bytes they come to.
+ *
+ * The count is of everything, the byte total only of files: a directory's own
+ * size is either zero or an implementation detail, and adding it to a total
+ * would make the number mean nothing.  A truncated listing says so here
+ * instead of over the list, because a strip is where a caveat belongs.
+ */
+static void draw_status(dsk_win_t *w, folder_t *f)
+{
+    const dsk_rect_t r = status_rect(w);
+    if (dsk_rect_empty(r) || !dsk_visible(r)) {
+        return;
+    }
+
+    dsk_fill(r, DSK_LGRAY);
+    dsk_hline(r.x, r.y, r.w, DSK_WHITE);
+
+    char     line[64];
+    char     num[24];
+    uint64_t bytes = 0;
+    for (int i = 0; i < f->n; i++) {
+        if (!f->entries[i].is_dir) {
+            bytes += f->entries[i].size;
+        }
+    }
+
+    ag_strlcpy(line, ag_utoa((uint64_t)f->n, num, sizeof(num), 0, false),
+               sizeof(line));
+    ag_strlcat(line, (f->n == 1) ? " object" : " objects", sizeof(line));
+    if (f->truncated) {
+        ag_strlcat(line, " (more not listed)", sizeof(line));
+    }
+    dsk_text_small((int16_t)(r.x + 3), (int16_t)(r.y + 2), line, DSK_BLACK,
+                   DSK_LGRAY);
+
+    ag_strlcpy(line, ag_utoa(bytes, num, sizeof(num), 0, true), sizeof(line));
+    ag_strlcat(line, " bytes", sizeof(line));
+    const int16_t tw = dsk_text_small_width(line);
+    const int16_t tx = (int16_t)(dsk_rect_x2(r) - 3 - tw);
+    /* Only when the two do not collide: a narrow window keeps the count. */
+    if (tx > r.x + 3 + dsk_text_small_width("999 objects")) {
+        dsk_text_small(tx, (int16_t)(r.y + 2), line, DSK_BLACK, DSK_LGRAY);
+    }
+}
+
 static void draw_folder(dsk_win_t *w, dsk_rect_t client)
 {
     folder_t *f = (folder_t *)w->user;
@@ -278,11 +352,14 @@ static void draw_folder(dsk_win_t *w, dsk_rect_t client)
         dsk_text((int16_t)(l.x + 4), (int16_t)(l.y + 4), "(empty)", DSK_DGRAY,
                  DSK_WHITE);
     }
-    if (f->truncated) {
+    if (f->truncated && !has_status(w)) {
+        /* Where there is no strip to say it in, it is said over the list -
+         * ugly, and better than a listing that is quietly short. */
         dsk_text_small((int16_t)(l.x + 4), (int16_t)(dsk_rect_y2(l) - 9),
                        "too many files to list", DSK_MAROON, DSK_WHITE);
     }
     draw_bar(w, f);
+    draw_status(w, f);
 }
 
 /* ---- opening what is selected ------------------------------------------ */

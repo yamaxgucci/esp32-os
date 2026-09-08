@@ -26,6 +26,7 @@
 #include "dsk_folder.h"
 #include "dsk_icons.h"
 #include "dsk_menu.h"
+#include "dsk_ini.h"
 #include "dsk_ops.h"
 #include "dsk_paint.h"
 #include "dsk_run.h"
@@ -78,8 +79,14 @@ static void open_from_folder(const char *path, bool is_dir)
  * a few pixels from the first, and without the slack a double tap is two
  * singles.
  */
-#define DBL_MS 400u
+/*
+ * How near two clicks have to be to count as one double click.  The TIME is a
+ * setting (`[desktop] dblclick` in DESKTOP.INI) because it is about the hand
+ * holding the mouse; the DISTANCE is not, because it is about the mouse.
+ */
 #define DBL_PX 3
+
+static dsk_ini_t s_ini;
 
 static uint32_t s_last_down_ms;
 static int16_t  s_last_down_x, s_last_down_y;
@@ -90,13 +97,13 @@ static bool is_double(uint32_t now, int16_t x, int16_t y)
     const int16_t dy = (int16_t)(y - s_last_down_y);
     const bool near = (dx >= -DBL_PX && dx <= DBL_PX && dy >= -DBL_PX &&
                        dy <= DBL_PX);
-    const bool soon = (now - s_last_down_ms) <= DBL_MS;
+    const bool soon = (now - s_last_down_ms) <= s_ini.dblclick_ms;
     s_last_down_ms = now;
     s_last_down_x = x;
     s_last_down_y = y;
     if (near && soon) {
         /* Do not let a third click read as another double. */
-        s_last_down_ms = now - DBL_MS - 1u;
+        s_last_down_ms = now - (uint32_t)s_ini.dblclick_ms - 1u;
         return true;
     }
     return false;
@@ -121,6 +128,14 @@ typedef struct {
     char       mount[12]; /* "/sys", which is what mountinfo answers to    */
     char       label[12];
     dsk_icon_t icon;
+    /*
+     * Where its cell sits, in work-area pixels.  Laid out in a column to
+     * begin with and then wherever it was dragged to - which is why this is a
+     * position and not an index: an index would mean the icons shuffle when a
+     * card is taken out, and an icon that moves on its own is an icon nobody
+     * can arrange.
+     */
+    int16_t x, y;
 } drive_t;
 
 static drive_t s_drives[DRIVE_MAX];
@@ -156,7 +171,8 @@ static void find_drives(void)
         if (ag_mountinfo(k_drives[i].mount, &fs) != AG_OK) {
             continue;
         }
-        drive_t *d = &s_drives[s_ndrives++];
+        const int at = s_ndrives++;
+        drive_t  *d = &s_drives[at];
         ag_strlcpy(d->path, k_drives[i].root, sizeof(d->path));
         ag_strlcpy(d->mount, k_drives[i].mount, sizeof(d->mount));
         d->label[0] = (char)(k_drives[i].root[0] - 32); /* upper case */
@@ -166,6 +182,14 @@ static void find_drives(void)
         d->icon = (k_drives[i].icon == DSK_ICON_FLOPPY && !fs.removable)
                       ? DSK_ICON_DRIVE
                       : k_drives[i].icon;
+
+        /* Down the left edge to begin with, then wherever it was left. */
+        const int16_t per_col = (int16_t)(s_m.work.h / DRIVE_CELL_H);
+        const int16_t col = (per_col > 0) ? (int16_t)(at / per_col) : 0;
+        const int16_t row = (per_col > 0) ? (int16_t)(at % per_col) : 0;
+        d->x = (int16_t)(4 + col * DRIVE_CELL_W);
+        d->y = (int16_t)(4 + row * DRIVE_CELL_H);
+        (void)dsk_ini_icon_of(&s_ini, d->label, &d->x, &d->y);
     }
 }
 
@@ -180,17 +204,41 @@ static void find_drives(void)
  */
 static int s_drive_sel = -1;
 
+/* Its cell, in screen pixels.  The stored position is relative to the work
+ * area, so a shell that starts on a different surface still puts them on it. */
 static dsk_rect_t drive_rect(int i)
 {
     if (i < 0 || i >= s_ndrives) {
         return dsk_rect_none();
     }
-    const int16_t per_col = (int16_t)(s_m.work.h / DRIVE_CELL_H);
-    const int16_t col = (per_col > 0) ? (int16_t)(i / per_col) : 0;
-    const int16_t row = (per_col > 0) ? (int16_t)(i % per_col) : 0;
-    return dsk_rect((int16_t)(s_m.work.x + 4 + col * DRIVE_CELL_W),
-                    (int16_t)(s_m.work.y + 4 + row * DRIVE_CELL_H),
-                    DRIVE_CELL_W, DRIVE_CELL_H);
+    return dsk_rect((int16_t)(s_m.work.x + s_drives[i].x),
+                    (int16_t)(s_m.work.y + s_drives[i].y), DRIVE_CELL_W,
+                    DRIVE_CELL_H);
+}
+
+/*
+ * Keeps a dragged icon on the desk.
+ *
+ * Clamped rather than refused: a drag that ends off the edge should leave the
+ * icon at the edge, not back where it started - an icon that springs back
+ * looks like a shell that ignored the drag.
+ */
+static void clamp_icon(int16_t *x, int16_t *y)
+{
+    const int16_t max_x = (int16_t)(s_m.work.w - DRIVE_CELL_W);
+    const int16_t max_y = (int16_t)(s_m.work.h - DRIVE_CELL_H);
+    if (*x < 0) {
+        *x = 0;
+    }
+    if (*y < 0) {
+        *y = 0;
+    }
+    if (*x > max_x) {
+        *x = (max_x > 0) ? max_x : 0;
+    }
+    if (*y > max_y) {
+        *y = (max_y > 0) ? max_y : 0;
+    }
 }
 
 static void draw_drives(void)
@@ -201,7 +249,7 @@ static void draw_drives(void)
             continue;
         }
         const bool    picked = (i == s_drive_sel);
-        const uint32_t behind = picked ? DSK_NAVY : DSK_TEAL;
+        const uint32_t behind = picked ? DSK_NAVY : s_ini.background;
         const int16_t ix = (int16_t)(r.x + (r.w - 2 * DSK_ICON_W) / 2);
         const int16_t tw = dsk_text_small_width(s_drives[i].label);
         const int16_t tx = (int16_t)(r.x + (r.w - tw) / 2);
@@ -218,7 +266,8 @@ static void draw_drives(void)
                               (int16_t)(tw + 4), DSK_SMALL_H + 2),
                      behind);
         }
-        dsk_icon_draw(s_drives[i].icon, ix, (int16_t)(r.y + 2), 2, DSK_TEAL);
+        dsk_icon_draw(s_drives[i].icon, ix, (int16_t)(r.y + 2), 2,
+                      s_ini.background);
         dsk_text_small(tx, ty, s_drives[i].label, DSK_WHITE, behind);
     }
 }
@@ -234,6 +283,201 @@ static int drive_at(int16_t x, int16_t y)
     return -1;
 }
 
+/* Both defined further down, and both wanted here: an icon dropped saves the
+ * arrangement, and the arrangement is what puts the windows back. */
+static void save_arrangement(void);
+static void restore_windows(void);
+
+/* ---- putting the windows back ------------------------------------------- */
+
+/*
+ * Reopens what was open, in the order it was open, and no more than that.
+ *
+ * A directory that is no longer there is skipped rather than reported: a card
+ * that was in the slot last time and is not now is the ordinary case, and a
+ * shell that starts with a message box about it is a shell that has to be
+ * dismissed before it can be used.  The window is simply not there, which is
+ * the truth.
+ *
+ * The frame is clamped to the work area for the case the arrangement was
+ * saved on a bigger screen - the same shell runs on a 640x400 window and a
+ * 320x240 panel, and a window restored off the edge of the smaller one is a
+ * window that cannot be reached or closed.
+ */
+static void restore_windows(void)
+{
+    for (int i = 0; i < s_ini.nwins; i++) {
+        const dsk_ini_win_t *want = &s_ini.win[i];
+
+        ag_stat_t st;
+        if (ag_stat(want->path, &st) != AG_OK || (st.attr & AG_A_DIR) == 0) {
+            continue;
+        }
+
+        dsk_win_t *w = dsk_folder_open(want->path);
+        if (w == NULL) {
+            break; /* out of windows: the rest are not going to fit either */
+        }
+
+        dsk_rect_t f = want->frame;
+        if (f.w > s_m.work.w) {
+            f.w = s_m.work.w;
+        }
+        if (f.h > s_m.work.h) {
+            f.h = s_m.work.h;
+        }
+        if (dsk_rect_x2(f) > dsk_rect_x2(s_m.work)) {
+            f.x = (int16_t)(dsk_rect_x2(s_m.work) - f.w);
+        }
+        if (dsk_rect_y2(f) > dsk_rect_y2(s_m.work)) {
+            f.y = (int16_t)(dsk_rect_y2(s_m.work) - f.h);
+        }
+        if (f.x < s_m.work.x) {
+            f.x = s_m.work.x;
+        }
+        if (f.y < s_m.work.y) {
+            f.y = s_m.work.y;
+        }
+        dsk_wm_move(w, f);
+
+        if (want->state == (uint8_t)DSK_WIN_MAXIMISED) {
+            dsk_wm_maximise(w);
+        } else if (want->state == (uint8_t)DSK_WIN_MINIMISED) {
+            dsk_wm_minimise(w);
+        }
+    }
+}
+
+/*
+ * Back into the column they started in, and written down as such.
+ *
+ * The way out of an arrangement that has gone wrong, and the reason it is
+ * saved rather than merely applied: an "arrange" that came back rearranged
+ * after a restart would be an arrange that did not work.
+ */
+static void arrange_icons(void)
+{
+    const int16_t per_col = (int16_t)(s_m.work.h / DRIVE_CELL_H);
+
+    for (int i = 0; i < s_ndrives; i++) {
+        damage(drive_rect(i));
+        const int16_t col = (per_col > 0) ? (int16_t)(i / per_col) : 0;
+        const int16_t row = (per_col > 0) ? (int16_t)(i % per_col) : 0;
+        s_drives[i].x = (int16_t)(4 + col * DRIVE_CELL_W);
+        s_drives[i].y = (int16_t)(4 + row * DRIVE_CELL_H);
+        dsk_ini_set_icon(&s_ini, s_drives[i].label, s_drives[i].x,
+                         s_drives[i].y);
+        damage(drive_rect(i));
+    }
+    save_arrangement();
+}
+
+/* ---- dragging an icon --------------------------------------------------- */
+
+/*
+ * The icon moves with the pointer rather than behind an outline.
+ *
+ * A window is dragged as an outline because a window is big and its contents
+ * cost a repaint per step; an icon cell is 56x44 of flat colour with a 32x32
+ * picture on it, so moving the thing itself costs two small damage rectangles
+ * a step and looks like what it is.  Windows 3.11 dragged a ghost of the icon
+ * for the same reason.
+ */
+static struct {
+    int     which; /* -1 when nothing is being dragged */
+    int16_t dx, dy; /* where in the cell it was grabbed */
+    bool    moved;  /* past the threshold, so this is a drag and not a click */
+} s_drag = {-1, 0, 0, false};
+
+static void drag_icon_to(int16_t x, int16_t y)
+{
+    drive_t *d = &s_drives[s_drag.which];
+    int16_t  nx = (int16_t)(x - s_drag.dx - s_m.work.x);
+    int16_t  ny = (int16_t)(y - s_drag.dy - s_m.work.y);
+    clamp_icon(&nx, &ny);
+
+    if (nx == d->x && ny == d->y) {
+        return;
+    }
+    /*
+     * A few pixels of slop before it counts as a drag: a click with a hand
+     * that moved one pixel is a click, and treating it as a drag would rewrite
+     * DESKTOP.INI every time anyone selected a drive.
+     */
+    if (!s_drag.moved) {
+        const int16_t adx = (int16_t)((nx > d->x) ? nx - d->x : d->x - nx);
+        const int16_t ady = (int16_t)((ny > d->y) ? ny - d->y : d->y - ny);
+        if (adx <= DBL_PX && ady <= DBL_PX) {
+            return;
+        }
+        s_drag.moved = true;
+    }
+
+    damage(drive_rect(s_drag.which)); /* where it was */
+    d->x = nx;
+    d->y = ny;
+    damage(drive_rect(s_drag.which)); /* and where it now is */
+}
+
+static void drag_icon_end(void)
+{
+    const int which = s_drag.which;
+    s_drag.which = -1;
+    if (!s_drag.moved || which < 0) {
+        return;
+    }
+    s_drag.moved = false;
+
+    dsk_ini_set_icon(&s_ini, s_drives[which].label, s_drives[which].x,
+                     s_drives[which].y);
+    save_arrangement();
+    s_note = "icon moved";
+    damage(s_m.statusbar);
+}
+
+/* ---- what gets written down -------------------------------------------- */
+
+/*
+ * Collects the arrangement and writes it.
+ *
+ * The windows are taken bottom to top so that reopening them in the same order
+ * puts them back in the same pile.  Their PATHS are what is saved, not their
+ * contents: a directory that has changed since is read again, which is the
+ * only honest thing to do with a list that was a snapshot.
+ *
+ * Errors are not reported.  This runs on the way out and after an icon has
+ * been dragged, and in both cases there is either nobody left to tell or
+ * nothing the person could do about it - a message box saying the arrangement
+ * could not be saved is a message box in the way of the thing they were doing.
+ * It goes in the log instead.
+ */
+static void save_arrangement(void)
+{
+    s_ini.nwins = 0;
+    for (int z = 0; z < dsk_wm_count() && s_ini.nwins < DSK_INI_WINS; z++) {
+        dsk_win_t  *w = dsk_wm_at(z);
+        const char *path = dsk_folder_path(w);
+        if (path == NULL) {
+            continue; /* a dialog: it belongs to a moment, not to an arrangement */
+        }
+        dsk_ini_win_t *out = &s_ini.win[s_ini.nwins++];
+        ag_strlcpy(out->path, path, sizeof(out->path));
+        /*
+         * A maximised or minimised window is saved by what it will go back to,
+         * plus which of the two it is: saving the maximised frame would make
+         * "restore" restore it to the whole screen.
+         */
+        out->frame = (w->state == DSK_WIN_NORMAL) ? w->frame : w->restore;
+        out->state = (uint8_t)w->state;
+    }
+
+    const ag_err_t err = dsk_ini_save(&s_ini);
+    if (err != AG_OK) {
+        ag_log(AG_LOG_WARN, "desktop", "could not write %s: %d", DSK_INI_PATH,
+               (int)err);
+    }
+}
+
 /* ---- the desktop's menus ----------------------------------------------- */
 
 enum {
@@ -245,6 +489,7 @@ enum {
     ID_DELETE,
     ID_MKDIR,
     ID_PROPS,
+    ID_ARRANGE,
     ID_EXIT,
     ID_CASCADE,
     ID_TILE,
@@ -803,6 +1048,8 @@ static void rebuild_menus(void)
     set_separator(&s_menus[1]);
     set_item(&s_menus[1], "Close", ID_CLOSE, active != NULL);
     set_item(&s_menus[1], "Close all", ID_CLOSE_ALL, n > 0);
+    set_separator(&s_menus[1]);
+    set_item(&s_menus[1], "Arrange icons", ID_ARRANGE, s_ndrives > 0);
     if (n > 0) {
         set_separator(&s_menus[1]);
     }
@@ -905,11 +1152,54 @@ static void menu_chose(uint16_t id)
     case ID_CLOSE_ALL:
         dsk_wm_close_all();
         break;
-    case ID_ABOUT:
-        (void)dsk_dlg_message("About", "ArgonOS Desktop 0.2",
-                              "phase 1 - windows and menus", DSK_DLG_OK,
-                              about_done, NULL);
+    case ID_ARRANGE:
+        arrange_icons();
         break;
+    case ID_ABOUT: {
+        /*
+         * The version of the SYSTEM, not of this shell: a shell that reports
+         * its own number tells you nothing you cannot see, and the number
+         * anyone actually needs when something is wrong is the one the kernel
+         * was built from.
+         */
+        ag_sysinfo_t si;
+        ag_sysinfo_get(&si);
+
+        char rows[4][64];
+        const char *lines[4] = {rows[0], rows[1], rows[2], rows[3]};
+
+        ag_strlcpy(rows[0], "ArgonOS desktop", sizeof(rows[0]));
+
+        ag_strlcpy(rows[1], "System ", sizeof(rows[1]));
+        ag_strlcat(rows[1], si.os_version, sizeof(rows[1]));
+        ag_strlcat(rows[1], " (", sizeof(rows[1]));
+        ag_strlcat(rows[1], si.build, sizeof(rows[1]));
+        ag_strlcat(rows[1], ")", sizeof(rows[1]));
+
+        char num[24];
+        ag_strlcpy(rows[2], si.chip, sizeof(rows[2]));
+        ag_strlcat(rows[2], ", ABI ", sizeof(rows[2]));
+        ag_strlcat(rows[2], ag_utoa(si.abi_major, num, sizeof(num), 0, false),
+                   sizeof(rows[2]));
+        ag_strlcat(rows[2], ".", sizeof(rows[2]));
+        ag_strlcat(rows[2], ag_utoa(si.abi_minor, num, sizeof(num), 0, false),
+                   sizeof(rows[2]));
+
+        ag_meminfo_t mem;
+        ag_meminfo(&mem);
+        ag_strlcpy(rows[3], "Arena ", sizeof(rows[3]));
+        ag_strlcat(rows[3],
+                   ag_utoa(mem.arena_free / 1024u, num, sizeof(num), 0, true),
+                   sizeof(rows[3]));
+        ag_strlcat(rows[3], " KB free of ", sizeof(rows[3]));
+        ag_strlcat(rows[3],
+                   ag_utoa(mem.arena_total / 1024u, num, sizeof(num), 0, true),
+                   sizeof(rows[3]));
+        ag_strlcat(rows[3], " KB", sizeof(rows[3]));
+
+        (void)dsk_dlg_lines("About", lines, 4, about_done, NULL);
+        break;
+    }
     default:
         break;
     }
@@ -966,7 +1256,7 @@ static void draw_region(dsk_rect_t r)
         return;
     }
     dsk_clip(r);
-    dsk_fill(s_m.work, DSK_TEAL);
+    dsk_fill(s_m.work, s_ini.background);
     draw_drives();
     dsk_clip_reset();
 
@@ -1061,7 +1351,26 @@ static void on_pointer(dsk_ptr_t type, int16_t x, int16_t y, uint8_t buttons,
 
     const bool dbl = (type == DSK_PTR_DOWN) ? is_double(now, x, y) : false;
 
-    /* The menu is above everything, so it is asked first. */
+    /*
+     * A drag in progress comes before everything, including the menu.
+     *
+     * Not tidiness: an icon dragged across a window would otherwise have its
+     * movements taken by that window - which would scroll a list while
+     * somebody is moving an icon over it, and then drop the icon back where it
+     * started because the up-click never arrived here either.
+     */
+    if (s_drag.which >= 0) {
+        if (type == DSK_PTR_MOVE && (buttons & 1u) != 0) {
+            drag_icon_to(x, y);
+            return;
+        }
+        if (type == DSK_PTR_UP || (buttons & 1u) == 0) {
+            drag_icon_end();
+            return;
+        }
+    }
+
+    /* The menu is above everything else, so it is asked next. */
     if (dsk_menu_pointer(type, x, y)) {
         return;
     }
@@ -1069,6 +1378,9 @@ static void on_pointer(dsk_ptr_t type, int16_t x, int16_t y, uint8_t buttons,
         return;
     }
     /* Nothing wanted it: the click was on the desktop itself. */
+    if (type == DSK_PTR_UP) {
+        return;
+    }
     if (type != DSK_PTR_DOWN) {
         return;
     }
@@ -1091,6 +1403,14 @@ static void on_pointer(dsk_ptr_t type, int16_t x, int16_t y, uint8_t buttons,
         if (d >= 0) {
             damage(drive_rect(d));
         }
+    }
+
+    /* And arms a drag, which the next movement with the button down starts. */
+    if (d >= 0) {
+        s_drag.which = d;
+        s_drag.dx = (int16_t)(x - drive_rect(d).x);
+        s_drag.dy = (int16_t)(y - drive_rect(d).y);
+        s_drag.moved = false;
     }
 }
 
@@ -1321,7 +1641,16 @@ int ag_main(int argc, char **argv)
     dsk_folder_init(&s_m, open_from_folder);
     dsk_run_init(repaint_all);
     dsk_ops_init(&s_m, repaint_all);
+
+    /*
+     * The arrangement is read BEFORE the drives are found and the windows
+     * opened: the icon positions decide where find_drives puts them, and the
+     * background colour decides what the first paint paints.
+     */
+    dsk_ini_defaults(&s_ini);
+    dsk_ini_load(&s_ini);
     find_drives();
+    restore_windows();
     rebuild_menus();
 
     /* First paint: everything, once. */
@@ -1450,5 +1779,12 @@ int ag_main(int argc, char **argv)
     ag_printf("desktop: %u windows, %u reflushes, %u moves coalesced\n",
               (unsigned)dsk_wm_count(), (unsigned)s_reflushes,
               (unsigned)s_moves_dropped);
+
+    /*
+     * Last, and after the counters have been printed: the counters are what a
+     * scripted run reads, and a write to flash that goes wrong must not be
+     * what stops them appearing.
+     */
+    save_arrangement();
     return 0;
 }
