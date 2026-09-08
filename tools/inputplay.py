@@ -19,6 +19,7 @@ Commands:
     wait MS         do nothing for this long
     key NAME        press and release; NAME is a letter, a digit, or one of
                     esc enter space tab up down left right f1..f12
+                    home end pageup pagedown insert delete
     down NAME       press without releasing
     up NAME         release
     move X,Y        put the pointer here, in the guest's own pixels - the
@@ -80,6 +81,13 @@ HID = {
     "f1": 0x3A, "f2": 0x3B, "f3": 0x3C, "f4": 0x3D, "f5": 0x3E, "f6": 0x3F,
     "f7": 0x40, "f8": 0x41, "f9": 0x42, "f10": 0x43, "f11": 0x44, "f12": 0x45,
     "right": 0x4F, "left": 0x50, "down": 0x51, "up": 0x52,
+    # The navigation cluster.  A list with a scroll bar answers all of these
+    # and none of them could be sent, so a whole half of a folder window's
+    # keyboard was untestable - and Home is what makes a scripted selection
+    # start from a known row instead of wherever the last click left it.
+    "insert": 0x49, "home": 0x4A, "pageup": 0x4B, "delete": 0x4C,
+    "end": 0x4D, "pagedown": 0x4E,
+    "pgup": 0x4B, "pgdn": 0x4E, "del": 0x4C,
     # The punctuation a file name needs.  `say` looks a character up here by
     # its own spelling, so without these it stops at the first dot of
     # "hello.axe" - and a shell with a Run box is a shell that has to be

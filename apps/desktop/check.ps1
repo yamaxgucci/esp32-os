@@ -172,10 +172,6 @@ try {
     $rowX = $fwX + $border + 40
     $rowY = $fwY + $border + $titleH + 8
 
-    # File > Run... is the second item of the first menu.
-    $runX = 6 + 3 + 20
-    $runY = $menubarH + 3 + 16 + 8
-
     $moves = @(
         'home',
         # A drive opens as a window onto its root.
@@ -183,13 +179,47 @@ try {
         # Into the only directory there is, and back out of it by "..".
         "move $rowX,$rowY", 'click', 'wait 120', 'click', 'wait 1500',
         "move $rowX,$rowY", 'click', 'wait 120', 'click', 'wait 1500',
-        # Launching is not asserted here yet: a program the desktop starts
-        # gets the screen but no input, so it cannot be told to give it back.
-        # See docs/plans/desktop.md, phase 2.
         # Park the pointer where it hides nothing before the photograph.
         "move $($w - 30),$($workY + 30)",
         'wait 1200'
     )
+
+    # The two photographs have to be of the SAME state, so everything that
+    # changes the screen happens before the first of them - the launches
+    # included.  Taken between them, a moved selection alone put nine thousand
+    # pixels of honest difference into a test whose whole subject is pixels
+    # that differ for dishonest reasons.
+
+    # ---- launching, which is the other half of a shell -------------------
+    #
+    # Two programs, because they fail differently.  A console one has to have
+    # its output reach the screen; a graphical one has to receive a key, which
+    # is the only way it can be told to give the screen back.  Both were
+    # broken by the same thing and neither showed the other's symptom.
+    #
+    # Launched from the folder window that is already open on C:\, by
+    # selecting a row and pressing Enter - which is how anyone would do it,
+    # and needs no menu coordinates.  Home first so the selection is known
+    # wherever the walk above left it.
+    #
+    # C:\ holds, in this order: drv, DESKTOP.AXE, GFXDEMO.AXE, HELLO.AXE,
+    # SYSTEM.CFG.  Directories first, then files by name.  Do NOT open row 1
+    # from here: DESKTOP.AXE starting DESKTOP.AXE works, and a second shell
+    # over the first is not what is being measured.
+    $runHello = @('key home') + (1..3 | ForEach-Object { 'key down' }) +
+                @('wait 300', 'key enter',
+                  # Loading off flash, running, printing, and then sitting on
+                  # "finished with 0" until a key.
+                  'wait 4000',
+                  # The key that dismisses the report.  It must not also
+                  # arrive at the desktop underneath.
+                  'key enter', 'wait 1500')
+
+    $runGfx = @('key home') + (1..2 | ForEach-Object { 'key down' }) +
+              @('wait 300', 'key enter', 'wait 4000',
+                # 'q' is how gfxdemo exits, and it only gets there if a child
+                # of an application can be typed at.
+                'say q', 'wait 2500')
     $quoted = ($moves | ForEach-Object { '"' + $_ + '"' }) -join ' '
     $after = @('"key f5"', '"wait 1500"') -join ' '
     # Two windows closed with the keyboard, which is the other way to close
@@ -212,6 +242,10 @@ try {
         '~\x0d',
         '=desktop: surface',
         "!& '$pyexe' 'tools\inputplay.py' --wait 20 $quoted",
+        ("!& '$pyexe' 'tools\inputplay.py' --wait 20 " +
+         (($runHello | ForEach-Object { '"' + $_ + '"' }) -join ' ')),
+        ("!& '$pyexe' 'tools\inputplay.py' --wait 20 " +
+         (($runGfx | ForEach-Object { '"' + $_ + '"' }) -join ' ')),
         "!.\tools\grab-window.ps1 -Out '$png'",
         "!& '$pyexe' 'tools\inputplay.py' --wait 20 $after",
         "!.\tools\grab-window.ps1 -Out '$png2'",
@@ -247,8 +281,32 @@ try {
     if ($text -notmatch 'QEMU RGB window') {
         $fail += 'the emulator has no RGB panel - was it started without graphics=on?'
     }
-    # Both programs ran, and the console one's output was still there to be
-    # read: that is the whole point of holding the screen until a key.
+    # ---- launching -------------------------------------------------------
+    #
+    # Each of these was a symptom of one bug (a child of an application was
+    # bound to a session slot of its own instead of on top of its parent's), so
+    # they are asserted separately rather than as one "launching works".
+
+    # The console program's own output.  It went to the journal instead of the
+    # screen while the child was not the top of a focused slot, so a match here
+    # is the console routing and nothing else.
+    if ($text -notmatch 'pid \d+, arena \d+ KB') {
+        $fail += 'HELLO.AXE ran but its output never reached the console'
+    }
+    if ($text -notmatch 'finished with 0') {
+        $fail += 'the desktop never reported HELLO.AXE finishing'
+    }
+    # The graphical one prints nothing of its own when it goes, so the proof
+    # is the desktop's line about it - and its loop has no way out except a
+    # key.  A child that never saw one would still be running, holding the
+    # screen, and there would be no such line anywhere.
+    if ($text -notmatch '(?i)GFXDEMO\.AXE finished with 0') {
+        $fail += 'GFXDEMO.AXE was started but never saw the key that ends it'
+    }
+    # And its own greeting, which is a graphical child writing to the console.
+    if ($text -notmatch 'Esc/Q/Enter quit') {
+        $fail += "GFXDEMO.AXE's console output never reached the screen"
+    }
 
     # The picture as it stood, against the same picture after a forced full
     # repaint.  Any difference is the shell's own output failing to reach the
@@ -307,10 +365,15 @@ try {
     # Two patterns, because the shell prints two lines - and it prints two
     # lines because a single one grew past the console's eighty columns and
     # was wrapped, with escape sequences through the middle of it.
-    $m = [regex]::Match($text,
+    # The LAST match, not the first.  A program started from the desktop may
+    # itself be a desktop, and then there are two sets of these lines in the
+    # transcript - the nested one prints first, because it exits first.
+    $mm = [regex]::Matches($text,
                         'desktop: (\d+) pointer events, (\d+) key events, (\d+) repaints')
-    $m2 = [regex]::Match($text,
+    $mm2 = [regex]::Matches($text,
                          'desktop: (\d+) windows, (\d+) reflushes, (\d+) moves coalesced')
+    $m = if ($mm.Count -gt 0) { $mm[$mm.Count - 1] } else { $mm }
+    $m2 = if ($mm2.Count -gt 0) { $mm2[$mm2.Count - 1] } else { $mm2 }
     if ($m.Success -and $m2.Success) {
         $ptr = [int]$m.Groups[1].Value
         $key = [int]$m.Groups[2].Value

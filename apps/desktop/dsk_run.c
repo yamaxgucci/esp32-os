@@ -90,43 +90,44 @@ static void exec_and_return(const char *path, int argc, const char **argv,
     ag_print(" ...\n");
 
     /*
-     * Spawned and handed the foreground, not exec'd.
+     * Spawned and waited for rather than exec'd, and the reason is Ctrl+C: a
+     * wait with a timeout can notice that the interrupt was aimed at the
+     * child and kill it, where exec would leave the desktop with no say.
      *
-     * ag_exec runs the child and waits, which is all this needs - except that
-     * the session still believes *this* process is the foreground, and the
-     * session is what decides where injected input goes and whose console is
-     * on the screen.  Measured: both a console program and a graphical one
-     * loaded and ran, the graphical one drew (it owns the display, and an
-     * owner may present), and neither ever saw a key.  The console program's
-     * output never reached the transcript either.  From the outside that is
-     * two programs that ignore the keyboard.
-     *
-     * So the child is spawned to get its pid, given the foreground, waited
-     * for, and the foreground taken back.
+     * Nothing here hands the foreground over any more.  It used to, and it
+     * did not work: the session decides where input goes and whose console is
+     * on the screen, and the session's notion of who is in a slot is not the
+     * foreground pid.  A child now goes on top of its parent's slot in the
+     * kernel (ag_session_push_to), which is where that belongs - the shell
+     * never had to do this either.
      */
-    int32_t         status = -1;
-    const ag_pid_t  me = ag_getpid();
-    const ag_pid_t  child = ag_spawn(path, argc, argv, AG_SPAWN_FOREGROUND);
+    int32_t        status = -1;
+    const ag_pid_t child = ag_spawn(path, argc, argv, AG_SPAWN_FOREGROUND);
     if (child < 0) {
         status = (int32_t)child;
     } else {
-        (void)g_ag_api->proc->foreground(child);
         while (ag_wait(child, &status, 200u) != AG_OK) {
             if (ag_interrupted()) {
                 (void)ag_kill(child);
             }
         }
-        (void)g_ag_api->proc->foreground(me);
     }
 
+    /*
+     * Always say how it ended; only stop for a key when there is something to
+     * read.  A graphical program's screen is gone the moment it returns, so
+     * holding the desktop back for a key would be holding it back over an
+     * empty screen - but the line still belongs in the console behind, which
+     * is where anyone looking for what happened will look, and it is the only
+     * trace a program that prints nothing leaves at all.
+     */
     char num[24];
+    ag_print("\n");
+    ag_print(path);
+    ag_print(" finished with ");
+    ag_print(ag_utoa((uint64_t)(uint32_t)status, num, sizeof(num), 0, false));
+    ag_print("\n");
     if (console || status != 0) {
-        ag_print("\n");
-        ag_print(path);
-        ag_print(" finished with ");
-        ag_print(ag_utoa((uint64_t)(uint32_t)status, num, sizeof(num), 0,
-                         false));
-        ag_print("\n");
         wait_for_a_key();
     }
 

@@ -840,6 +840,30 @@ static proc_t *free_slot(void)
 }
 
 /*
+ * Which session slot a new process belongs in.
+ *
+ * A foreground child of a process goes into ITS PARENT'S slot, on top of it -
+ * not into a slot of its own.  That is what makes a program started from
+ * inside an application behave the way one started from the shell does: the
+ * console and the keyboard belong to the top of a slot, so a child sent
+ * somewhere else is a child that can draw and cannot be typed at, and whose
+ * printf goes to the journal instead of the screen.  All three of those were
+ * the same bug.
+ *
+ * Returns the parent's slot, or -1 for "the caller is not a process in a slot"
+ * - the shell, a driver, the kernel - where the old first-free-slot answer is
+ * the right one and the shell does its own binding anyway.
+ */
+static int parent_slot(void)
+{
+    const proc_t *me = current();
+    if (me == NULL) {
+        return -1;
+    }
+    return ag_session_slot_of(me->pid);
+}
+
+/*
  * Common path: reserve a slot, create the task, return immediately.
  * AXE images set load_pending; builtins set binding.entry and heap already.
  */
@@ -889,12 +913,20 @@ static ag_err_t spawn_common(proc_t *p, uint32_t flags, ag_pid_t *out_pid)
     const ag_pid_t bound_pid = p->pid;
     char           bound_name[32];
     const bool     skip_bind = (flags & (uint32_t)AG_SPAWN_NO_SESSION) != 0;
+    /*
+     * Only a foreground child stacks on its parent.  A background one (`run
+     * /b`) must not take the keyboard away, so it gets a slot of its own, as
+     * before.
+     */
+    const int over = background ? -1 : parent_slot();
     set_string(bound_name, sizeof(bound_name), p->name);
     unlock();
     if (!skip_bind) {
-        const ag_err_t bind_err = ag_session_bind(bound_pid, bound_name);
+        const ag_err_t bind_err =
+            (over >= 0) ? ag_session_push_to(bound_pid, bound_name, over)
+                        : ag_session_bind(bound_pid, bound_name);
         if (bind_err != AG_OK) {
-            ag_log(AG_LOG_WARN, "proc", "pid %u: no free session slot (%d)",
+            ag_log(AG_LOG_WARN, "proc", "pid %u: no session slot (%d)",
                    (unsigned)bound_pid, (int)bind_err);
         }
     }
