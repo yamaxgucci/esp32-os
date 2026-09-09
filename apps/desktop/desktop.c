@@ -1843,10 +1843,27 @@ int ag_main(int argc, char **argv)
      * whole transcript - then needs no second rule to recognise the other
      * kind of run.
      */
-    ag_printf("desktop: surface %ux%u %s, focus %s\n", (unsigned)info.width,
-              (unsigned)info.height,
+    /*
+     * Which font the shell draws in, decided by the screen it got.
+     *
+     * 8x16 on 320x240 leaves fifteen lines and forty columns, and a file
+     * manager with fifteen lines is one you scroll instead of read.  8x8
+     * doubles the lines, and Windows made the same trade for the same reason -
+     * the system font of 3.11 at 640x480 is not the font of 320x200.  Four
+     * hundred is the line because that is where a 640x400 surface sits: the
+     * screen a mouse is used on keeps the big font, the panels somebody holds
+     * in one hand get the small one.
+     *
+     * Set before the layout, because every height in it is one line of this
+     * font plus a pixel each side.
+     */
+    dsk_ui_font_set((info.height < 400u) ? DSK_UI_FONT_SMALL
+                                         : DSK_UI_FONT_LARGE);
+
+    ag_printf("desktop: surface %ux%u %s, focus %s, font 8x%d\n",
+              (unsigned)info.width, (unsigned)info.height,
               banded ? "bands" : (info.double_buf ? "double" : "single"),
-              ag_focused() ? "yes" : "no");
+              ag_focused() ? "yes" : "no", (int)dsk_ui_h());
 
     dsk_metrics_init(&s_m, (int16_t)info.width, (int16_t)info.height);
     if (banded) {

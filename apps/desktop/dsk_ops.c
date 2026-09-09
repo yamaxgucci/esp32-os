@@ -92,7 +92,7 @@ static void draw_box(const char *verb, const char *what, uint64_t done,
                  s_m.title_h);
     dsk_fill(cap, DSK_NAVY);
     dsk_text((int16_t)(cap.x + 3),
-             (int16_t)(cap.y + (cap.h - DSK_FONT_H) / 2), verb, DSK_WHITE,
+             (int16_t)(cap.y + (cap.h - dsk_ui_h()) / 2), verb, DSK_WHITE,
              DSK_NAVY);
 
     const int16_t x = (int16_t)(r.x + BOX_PAD);
@@ -100,7 +100,7 @@ static void draw_box(const char *verb, const char *what, uint64_t done,
     int16_t       y = (int16_t)(cap.y + cap.h + 6);
 
     dsk_text_fit(x, y, w, base_name(what), DSK_BLACK, DSK_LGRAY);
-    y = (int16_t)(y + DSK_FONT_H + 4);
+    y = (int16_t)(y + dsk_ui_h() + 4);
 
     /* The bar: sunken track, navy fill, nothing when there is no total. */
     const dsk_rect_t track = dsk_rect(x, y, w, BAR_H);
@@ -142,7 +142,7 @@ static void draw_box(const char *verb, const char *what, uint64_t done,
                    sizeof(line));
     }
     dsk_text_fit(x, y, w, line, DSK_BLACK, DSK_LGRAY);
-    y = (int16_t)(y + DSK_FONT_H + 3);
+    y = (int16_t)(y + dsk_ui_h() + 3);
 
     dsk_text_fit(x, y, w, "Esc to stop", DSK_DGRAY, DSK_LGRAY);
 

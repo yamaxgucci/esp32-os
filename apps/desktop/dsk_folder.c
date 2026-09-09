@@ -343,8 +343,8 @@ static void draw_folder(dsk_win_t *w, dsk_rect_t client)
             while (s[n] != '\0') {
                 n++;
             }
-            dsk_text_fit((int16_t)(dsk_rect_x2(r) - 4 - n * DSK_FONT_W), r.y,
-                         (int16_t)(n * DSK_FONT_W), s, fg, bg);
+            dsk_text_fit((int16_t)(dsk_rect_x2(r) - 4 - n * dsk_ui_w()), r.y,
+                         (int16_t)(n * dsk_ui_w()), s, fg, bg);
         }
     }
 

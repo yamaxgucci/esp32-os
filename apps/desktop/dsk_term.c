@@ -54,8 +54,8 @@ static const uint32_t k_cga[16] = {
 
 static dsk_rect_t row_rect(dsk_rect_t client, uint16_t row)
 {
-    return dsk_rect(client.x, (int16_t)(client.y + row * DSK_FONT_H),
-                    (int16_t)(s_shown_cols * DSK_FONT_W), DSK_FONT_H);
+    return dsk_rect(client.x, (int16_t)(client.y + row * dsk_ui_h()),
+                    (int16_t)(s_shown_cols * dsk_ui_w()), dsk_ui_h());
 }
 
 /*
@@ -69,7 +69,7 @@ static dsk_rect_t row_rect(dsk_rect_t client, uint16_t row)
 static void draw_row(dsk_rect_t client, uint16_t row)
 {
     const ag_textcell_t *cells = s_shadow[row];
-    const int16_t        y = (int16_t)(client.y + row * DSK_FONT_H);
+    const int16_t        y = (int16_t)(client.y + row * dsk_ui_h());
     uint16_t             at = 0;
 
     while (at < s_shown_cols) {
@@ -87,7 +87,7 @@ static void draw_row(dsk_rect_t client, uint16_t row)
         }
         run[end - at] = '\0';
 
-        dsk_text((int16_t)(client.x + at * DSK_FONT_W), y, run,
+        dsk_text((int16_t)(client.x + at * dsk_ui_w()), y, run,
                  k_cga[attr & 0x0Fu], k_cga[(attr >> 4) & 0x0Fu]);
         at = end;
     }
@@ -98,8 +98,8 @@ static void term_draw(dsk_win_t *w, dsk_rect_t client)
     (void)w;
 
     /* The margins the cells do not cover, so the window has no stale edges. */
-    const int16_t used_w = (int16_t)(s_shown_cols * DSK_FONT_W);
-    const int16_t used_h = (int16_t)(s_shown_rows * DSK_FONT_H);
+    const int16_t used_w = (int16_t)(s_shown_cols * dsk_ui_w());
+    const int16_t used_h = (int16_t)(s_shown_rows * dsk_ui_h());
     if (client.w > used_w) {
         dsk_fill(dsk_rect((int16_t)(client.x + used_w), client.y,
                           (int16_t)(client.w - used_w), client.h),
@@ -128,11 +128,11 @@ static void term_draw(dsk_win_t *w, dsk_rect_t client)
     if (info.cur_y >= s_first_row && info.cur_y < s_first_row + s_shown_rows &&
         info.cur_x < s_shown_cols) {
         const dsk_rect_t caret =
-            dsk_rect((int16_t)(client.x + info.cur_x * DSK_FONT_W),
+            dsk_rect((int16_t)(client.x + info.cur_x * dsk_ui_w()),
                      (int16_t)(client.y +
-                               (info.cur_y - s_first_row) * DSK_FONT_H +
-                               DSK_FONT_H - 2),
-                     DSK_FONT_W, 2);
+                               (info.cur_y - s_first_row) * dsk_ui_h() +
+                               dsk_ui_h() - 2),
+                     dsk_ui_w(), 2);
         if (dsk_visible(caret)) {
             dsk_fill(caret, DSK_LGRAY);
         }
@@ -179,8 +179,8 @@ dsk_win_t *dsk_term_open(const dsk_metrics_t *m)
      */
     const int16_t chrome_w = (int16_t)(2 * m->border);
     const int16_t chrome_h = (int16_t)(2 * m->border + m->title_h);
-    int16_t max_cols = (int16_t)((m->work.w - chrome_w) / DSK_FONT_W);
-    int16_t max_rows = (int16_t)((m->work.h - chrome_h) / DSK_FONT_H);
+    int16_t max_cols = (int16_t)((m->work.w - chrome_w) / dsk_ui_w());
+    int16_t max_rows = (int16_t)((m->work.h - chrome_h) / dsk_ui_h());
     if (max_cols < 20) {
         max_cols = 20;
     }
@@ -192,8 +192,8 @@ dsk_win_t *dsk_term_open(const dsk_metrics_t *m)
 
     const dsk_rect_t frame =
         dsk_rect((int16_t)(m->work.x + 8), (int16_t)(m->work.y + 8),
-                 (int16_t)(s_shown_cols * DSK_FONT_W + chrome_w),
-                 (int16_t)(s_shown_rows * DSK_FONT_H + chrome_h));
+                 (int16_t)(s_shown_cols * dsk_ui_w() + chrome_w),
+                 (int16_t)(s_shown_rows * dsk_ui_h() + chrome_h));
 
     for (uint16_t r = 0; r < TERM_ROWS_MAX; r++) {
         for (uint16_t c = 0; c < TERM_COLS_MAX; c++) {

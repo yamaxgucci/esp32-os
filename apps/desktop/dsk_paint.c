@@ -113,15 +113,83 @@ dsk_rect_t dsk_clip_now(void)
 
 bool dsk_visible(dsk_rect_t r) { return dsk_rect_overlaps(r, dsk_clip_now()); }
 
+static dsk_ui_font_t s_ui_font;
+
+void dsk_ui_font_set(dsk_ui_font_t f) { s_ui_font = f; }
+dsk_ui_font_t dsk_ui_font(void) { return s_ui_font; }
+
+int16_t dsk_ui_w(void) { return DSK_FONT_W; } /* both fonts are eight wide */
+
+int16_t dsk_ui_h(void)
+{
+    return (s_ui_font == DSK_UI_FONT_SMALL) ? DSK_SMALL_H : DSK_FONT_H;
+}
+
+/*
+ * The small font with the big one's manners.
+ *
+ * dsk_text_small draws what it is given and runs off the end; the shell's text
+ * is drawn with a width to fit in, and a name too long for its column has to
+ * end in "..." rather than in the middle of the next thing.  Same rule as the
+ * kernel's text_fit, so a window looks the same in either font.
+ */
+static void small_fit(int16_t x, int16_t y, int16_t max_w, const char *s,
+                      uint32_t fg, uint32_t bg)
+{
+    int n = 0;
+    while (s[n] != '\0' && s[n] != '\n') {
+        n++;
+    }
+    if (max_w <= 0 || n * DSK_SMALL_W <= max_w) {
+        dsk_text_small(x, y, s, fg, bg);
+        return;
+    }
+
+    const bool dots = (max_w >= 3 * DSK_SMALL_W);
+    int        nfit = dots ? (max_w - 3 * DSK_SMALL_W) / DSK_SMALL_W
+                           : max_w / DSK_SMALL_W;
+    if (nfit < 0) {
+        nfit = 0;
+    }
+
+    char cut[64];
+    int  keep = nfit;
+    if (keep > (int)sizeof(cut) - 4) {
+        keep = (int)sizeof(cut) - 4;
+    }
+    for (int i = 0; i < keep; i++) {
+        cut[i] = s[i];
+    }
+    int at = keep;
+    if (dots) {
+        cut[at++] = '.';
+        cut[at++] = '.';
+        cut[at++] = '.';
+    }
+    cut[at] = '\0';
+    dsk_text_small(x, y, cut, fg, bg);
+}
+
 void dsk_text(int16_t x, int16_t y, const char *s, uint32_t fg, uint32_t bg)
 {
+    if (s == NULL) {
+        return;
+    }
+    if (s_ui_font == DSK_UI_FONT_SMALL) {
+        dsk_text_small(x, y, s, fg, bg);
+        return;
+    }
     s_p->text(x, y, 0, s, fg, bg);
 }
 
 void dsk_text_fit(int16_t x, int16_t y, int16_t max_w, const char *s,
                   uint32_t fg, uint32_t bg)
 {
-    if (max_w <= 0) {
+    if (max_w <= 0 || s == NULL) {
+        return;
+    }
+    if (s_ui_font == DSK_UI_FONT_SMALL) {
+        small_fit(x, y, max_w, s, fg, bg);
         return;
     }
     s_p->text(x, y, max_w, s, fg, bg);

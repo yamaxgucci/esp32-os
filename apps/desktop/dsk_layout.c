@@ -11,6 +11,9 @@
  */
 #include "dsk.h"
 
+/* The layout is one line of the shell's font per bar; see dsk_ui_h. */
+#include "dsk_paint.h"
+
 void dsk_metrics_init(dsk_metrics_t *m, int16_t w, int16_t h)
 {
     if (m == NULL) {
@@ -18,8 +21,9 @@ void dsk_metrics_init(dsk_metrics_t *m, int16_t w, int16_t h)
     }
     m->screen_w = w;
     m->screen_h = h;
-    m->menubar_h = DSK_FONT_H + 2;   /* one line of 8x16, and a pixel each side */
-    m->title_h = DSK_FONT_H + 2;
+    /* One line of the shell's font, and a pixel each side. */
+    m->menubar_h = (int16_t)(dsk_ui_h() + 2);
+    m->title_h = (int16_t)(dsk_ui_h() + 2);
     m->border = 4;                   /* thick enough to grab with a pointer */
     m->statusbar_h = DSK_SMALL_H + 4;
 

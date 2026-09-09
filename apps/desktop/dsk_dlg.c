@@ -103,8 +103,8 @@ static dsk_rect_t btn_rect(dsk_rect_t client, int which)
 static dsk_rect_t edit_rect(dsk_rect_t client)
 {
     return dsk_rect((int16_t)(client.x + PAD),
-                    (int16_t)(client.y + PAD + DSK_FONT_H + 4),
-                    (int16_t)(client.w - 2 * PAD), (int16_t)(DSK_FONT_H + 6));
+                    (int16_t)(client.y + PAD + dsk_ui_h() + 4),
+                    (int16_t)(client.w - 2 * PAD), (int16_t)(dsk_ui_h() + 6));
 }
 
 /* ---- answering --------------------------------------------------------- */
@@ -146,7 +146,7 @@ static void dlg_draw(dsk_win_t *w, dsk_rect_t client)
         const dsk_rect_t e = edit_rect(client);
         dsk_panel(e, false, DSK_WHITE);
         /* The tail of a long line, so what is being typed stays in sight. */
-        const int16_t room = (int16_t)((e.w - 8) / DSK_FONT_W);
+        const int16_t room = (int16_t)((e.w - 8) / dsk_ui_w());
         const int16_t from =
             (int16_t)((s_d.len > (uint16_t)room) ? s_d.len - room : 0);
         dsk_text_fit((int16_t)(e.x + 4), (int16_t)(e.y + 3),
@@ -154,15 +154,15 @@ static void dlg_draw(dsk_win_t *w, dsk_rect_t client)
                      DSK_WHITE);
         if (s_d.caret_lit) {
             const int16_t cx =
-                (int16_t)(e.x + 4 + (s_d.len - from) * DSK_FONT_W);
-            dsk_fill(dsk_rect(cx, (int16_t)(e.y + 3), 2, DSK_FONT_H),
+                (int16_t)(e.x + 4 + (s_d.len - from) * dsk_ui_w());
+            dsk_fill(dsk_rect(cx, (int16_t)(e.y + 3), 2, dsk_ui_h()),
                      DSK_BLACK);
         }
     } else {
         for (int i = 0; i < s_d.nlines; i++) {
             dsk_text_fit((int16_t)(client.x + PAD),
                          (int16_t)(client.y + PAD +
-                                   i * (DSK_FONT_H + 2)),
+                                   i * (dsk_ui_h() + 2)),
                          (int16_t)(client.w - 2 * PAD), s_d.line[i],
                          DSK_BLACK, DSK_LGRAY);
         }
@@ -176,9 +176,9 @@ static void dlg_draw(dsk_win_t *w, dsk_rect_t client)
             dsk_frame(dsk_rect_inset(b, -1), DSK_BLACK);
         }
         const char   *label = btn_label(i);
-        const int16_t tw = (int16_t)(DSK_FONT_W * (int16_t)str_len(label));
+        const int16_t tw = (int16_t)(dsk_ui_w() * (int16_t)str_len(label));
         dsk_text((int16_t)(b.x + (b.w - tw) / 2),
-                 (int16_t)(b.y + (b.h - DSK_FONT_H) / 2), label, DSK_BLACK,
+                 (int16_t)(b.y + (b.h - dsk_ui_h()) / 2), label, DSK_BLACK,
                  DSK_LGRAY);
     }
 }
@@ -300,7 +300,7 @@ static int16_t width_for_lines(void)
             n = m;
         }
     }
-    int16_t w = (int16_t)(DSK_FONT_W * (int16_t)n + 2 * PAD + 8);
+    int16_t w = (int16_t)(dsk_ui_w() * (int16_t)n + 2 * PAD + 8);
     const int16_t least = (int16_t)(2 * BTN_W + BTN_GAP + 2 * PAD);
     if (w < least) {
         w = least;
@@ -320,7 +320,7 @@ static bool open_message(const char *title, dsk_dlg_kind_t kind,
 
     const int16_t h =
         (int16_t)(2 * s_m.border + s_m.title_h + PAD +
-                  s_d.nlines * (DSK_FONT_H + 2) + PAD + BTN_H + PAD);
+                  s_d.nlines * (dsk_ui_h() + 2) + PAD + BTN_H + PAD);
     s_d.win = open_window(title, width_for_lines(), h);
     if (s_d.win == NULL) {
         s_d.up = false;
@@ -386,8 +386,8 @@ bool dsk_dlg_input(const char *title, const char *prompt, const char *initial,
     s_d.up = true;
 
     const int16_t h =
-        (int16_t)(2 * s_m.border + s_m.title_h + PAD + DSK_FONT_H + 4 +
-                  DSK_FONT_H + 6 + PAD + BTN_H + PAD);
+        (int16_t)(2 * s_m.border + s_m.title_h + PAD + dsk_ui_h() + 4 +
+                  dsk_ui_h() + 6 + PAD + BTN_H + PAD);
     int16_t w = width_for_lines();
     if (w < 240) {
         w = 240;

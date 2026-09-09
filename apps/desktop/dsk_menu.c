@@ -78,12 +78,12 @@ dsk_rect_t dsk_menu_title_rect(int which)
     int16_t at = PAD_X;
     for (int i = 0; i < which; i++) {
         at = (int16_t)(at +
-                       (int16_t)(DSK_FONT_W * (int16_t)label_len(
+                       (int16_t)(dsk_ui_w() * (int16_t)label_len(
                                                   s_menus[i].title)) +
                        2 * PAD_X);
     }
     const int16_t w =
-        (int16_t)(DSK_FONT_W * (int16_t)label_len(s_menus[which].title) +
+        (int16_t)(dsk_ui_w() * (int16_t)label_len(s_menus[which].title) +
                   2 * PAD_X);
     return dsk_rect(at, s_m.menubar.y, w, (int16_t)(s_m.menubar.h - 1));
 }
@@ -98,7 +98,7 @@ static int16_t drop_width(const dsk_menu_t *mn)
         }
     }
     /* Room for a tick to the left and a little air to the right. */
-    return (int16_t)(DSK_FONT_W * (int16_t)widest + 12 + 2 * DROP_PAD + 8);
+    return (int16_t)(dsk_ui_w() * (int16_t)widest + 12 + 2 * DROP_PAD + 8);
 }
 
 static int16_t drop_height(const dsk_menu_t *mn)

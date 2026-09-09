@@ -120,6 +120,35 @@ void dsk_flush(dsk_rect_t r);
 void dsk_text(int16_t x, int16_t y, const char *s, uint32_t fg, uint32_t bg);
 void dsk_text_fit(int16_t x, int16_t y, int16_t max_w, const char *s,
                   uint32_t fg, uint32_t bg);
+/*
+ * Which font the shell's own text is drawn in.
+ *
+ * 8x16 is the kernel's font and the only one a console has; on a 640x400
+ * screen it is right.  On 320x240 - the CYD's glass, the only one anybody
+ * touches - it leaves fifteen lines and forty columns, and a file manager with
+ * fifteen lines is a file manager you scroll instead of read.  The 8x8 font
+ * doubles that, and Windows did the same thing for the same reason: the system
+ * font of 3.11 at 640x480 is not the font of 320x200.
+ *
+ * Everything the shell draws goes through dsk_text/dsk_text_fit, so the choice
+ * is made once, here, and every window, menu and list follows - including the
+ * furniture, because the layout's heights are dsk_ui_h() rather than a
+ * constant.  dsk_text_small stays 8x8 whatever this says: a caption under an
+ * icon and the status strip are deliberately smaller than the body text, and
+ * on a small screen they become the same size, which is what a small screen
+ * looks like.
+ */
+typedef enum {
+    DSK_UI_FONT_LARGE = 0, /* 8x16, the kernel's */
+    DSK_UI_FONT_SMALL,     /* 8x8, the shell's own */
+} dsk_ui_font_t;
+
+void dsk_ui_font_set(dsk_ui_font_t f);
+dsk_ui_font_t dsk_ui_font(void);
+/* One cell of the chosen font.  The layout is built out of these. */
+int16_t dsk_ui_w(void);
+int16_t dsk_ui_h(void);
+
 /* The 8x8 font, for icon captions and the status strip.  Opaque bg only. */
 void dsk_text_small(int16_t x, int16_t y, const char *s, uint32_t fg,
                     uint32_t bg);
