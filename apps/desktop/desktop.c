@@ -262,8 +262,27 @@ static void draw_drives(void)
          * inverting the six characters underneath it.
          */
         if (picked) {
-            dsk_fill(dsk_rect((int16_t)(tx - 2), (int16_t)(ty - 1),
-                              (int16_t)(tw + 4), DSK_SMALL_H + 2),
+            /*
+             * Clipped to the cell, and that is not belt and braces.
+             *
+             * The highlight is the caption's box with a pixel of air around
+             * it, and the arithmetic put its last row one pixel below the
+             * cell: rows r.y+35..r.y+44 against a cell of r.y..r.y+43.  What
+             * gets repainted when an icon moves is the cell, so that one row
+             * survived - and it survived only when the icon was dragged
+             * UPWARDS, because dragging down leaves the stray row inside the
+             * new cell, which is painted.  On the CYD, where a surface pixel
+             * is two rows of glass, it was a blue line trailing the icon.
+             *
+             * A long caption does the same thing sideways, so the rule is the
+             * one worth stating rather than the pixel: a cell's decoration
+             * cannot leave the cell that gets repainted for it.
+             */
+            dsk_fill(dsk_rect_clip(dsk_rect((int16_t)(tx - 2),
+                                            (int16_t)(ty - 1),
+                                            (int16_t)(tw + 4),
+                                            DSK_SMALL_H + 2),
+                                   r),
                      behind);
         }
         dsk_icon_draw(s_drives[i].icon, ix, (int16_t)(r.y + 2), 2,
