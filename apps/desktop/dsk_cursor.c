@@ -43,6 +43,8 @@ static uint16_t   s_compose[DSK_CUR_W * DSK_CUR_H];
 static bool       s_shown;
 static dsk_rect_t s_at; /* where the saved pixels came from */
 
+static void (*s_damage)(dsk_rect_t r);
+
 static int16_t         s_x, s_y;
 static int16_t         s_screen_w, s_screen_h;
 static dsk_cursor_id_t s_id;
@@ -67,8 +69,10 @@ static void unpack(shape_t *out, const char *const *art, int8_t hx, int8_t hy)
     out->hot_y = hy;
 }
 
-void dsk_cursor_init(int16_t screen_w, int16_t screen_h)
+void dsk_cursor_init(int16_t screen_w, int16_t screen_h,
+                     void (*damage_fn)(dsk_rect_t r))
 {
+    s_damage = damage_fn;
     unpack(&s_shape[DSK_CUR_ARROW], k_arrow, 0, 0);
     /* The hourglass points at its middle; the arrow at its tip. */
     unpack(&s_shape[DSK_CUR_WAIT], k_wait, 7, 7);
@@ -111,7 +115,8 @@ dsk_rect_t dsk_cursor_rect(void)
 
 void dsk_cursor_hide(void)
 {
-    if (!s_shown) {
+    /* Nothing was saved, so there is nothing to put back; see dsk_cursor_paint. */
+    if (dsk_paint_banded() || !s_shown) {
         return;
     }
     /*
@@ -126,7 +131,7 @@ void dsk_cursor_hide(void)
 
 void dsk_cursor_show(void)
 {
-    if (s_shown) {
+    if (dsk_paint_banded() || s_shown) {
         return;
     }
     const shape_t *sh = &s_shape[s_id];
@@ -154,11 +159,76 @@ void dsk_cursor_show(void)
     s_shown = true;
 }
 
+/*
+ * The band-mode pair, and why they are separate calls.
+ *
+ * With a surface, the pointer is a patch: read what is under it, draw over it,
+ * and put the pixels back before anything else is drawn.  In band mode there
+ * is nothing outside the current strip to read or put back, so the pointer
+ * stops being a patch and becomes the last thing painted into each strip -
+ * over a background that has just been drawn there, which is exactly what
+ * `read` still answers for.  Moving it is then not drawing at all: it is two
+ * rectangles that owe a repaint, which is what the caller does with the box
+ * this hands back.
+ */
+dsk_rect_t dsk_cursor_place_moved(int16_t x, int16_t y)
+{
+    const dsk_rect_t was = dsk_cursor_rect();
+
+    dsk_cursor_place(x, y);
+    const dsk_rect_t now = dsk_cursor_rect();
+    if (dsk_rect_eq(was, now)) {
+        return dsk_rect_none();
+    }
+    return dsk_rect_union(was, now);
+}
+
+void dsk_cursor_paint(void)
+{
+    const shape_t   *sh = &s_shape[s_id];
+    const dsk_rect_t r = dsk_cursor_rect();
+
+    if (!dsk_visible(r)) {
+        return;
+    }
+    /*
+     * The clip stays as the strip's, unlike the surface path which resets it:
+     * there the pointer is above every window and must not be cut short by
+     * the last piece of drawing; here it must be cut by the strip, because
+     * the strip is all the memory there is.
+     */
+    dsk_paint()->read(r, s_save);
+
+    for (int row = 0; row < DSK_CUR_H; row++) {
+        const uint16_t op = sh->opaque[row];
+        const uint16_t wh = sh->white[row];
+        uint16_t       *out = &s_compose[row * DSK_CUR_W];
+        const uint16_t *in = &s_save[row * DSK_CUR_W];
+        for (int col = 0; col < DSK_CUR_W; col++) {
+            if ((op >> col) & 1u) {
+                out[col] = ((wh >> col) & 1u) ? 0xFFFFu : 0x0000u;
+            } else {
+                out[col] = in[col];
+            }
+        }
+    }
+    dsk_paint()->blit(r, s_compose, DSK_CUR_W);
+}
+
 void dsk_cursor_shape(dsk_cursor_id_t id)
 {
     if (id >= DSK_CUR_COUNT || id == s_id) {
         return;
     }
+    if (dsk_paint_banded()) {
+        const dsk_rect_t before = dsk_cursor_rect();
+        s_id = id;
+        if (s_damage != NULL) {
+            s_damage(dsk_rect_union(before, dsk_cursor_rect()));
+        }
+        return;
+    }
+
     const bool was = s_shown;
     const dsk_rect_t old = s_at;
 

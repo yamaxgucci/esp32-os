@@ -171,4 +171,11 @@ bool dsk_wm_tracking(void);
 void dsk_wm_outline_off(void);
 void dsk_wm_outline_on(void);
 
+/*
+ * Band mode: the outline is scenery, painted into each strip after the
+ * windows and before the pointer.  Both calls above are then no-ops, because
+ * there is nothing saved to take off or put back.
+ */
+void dsk_wm_outline_paint(void);
+
 #endif /* ARGON_DSK_WM_H */

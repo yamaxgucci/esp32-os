@@ -53,6 +53,42 @@ const dsk_painter_t *dsk_paint(void);
 /* Swap in another backend (the host test's recorder, later the band one). */
 void dsk_paint_bind(const dsk_painter_t *p, int16_t w, int16_t h);
 
+/*
+ * Bind the band backend: no surface, a damage rectangle rasterised one
+ * horizontal strip at a time and each strip handed to the panel.  For a board
+ * whose acquire() reports no framebuffer, which is the only way a 320x240
+ * screen happens in 179 KB of RAM.  See dsk_paint_band.c.
+ */
+void dsk_paint_bind_band(int16_t w, int16_t h);
+
+/*
+ * How a repaint is cut into pieces, when it has to be.
+ *
+ * `begin` sets the strip that the next drawing lands in and answers how many
+ * rows it took (0 when there is nothing left); `present` hands the finished
+ * strip to the glass.  Registered by the band backend and by nothing else:
+ * with a surface there is one piece, which is the whole rectangle.
+ */
+typedef struct dsk_bander {
+    int16_t (*begin)(dsk_rect_t r, int16_t y);
+    void (*present)(void);
+} dsk_bander_t;
+
+void dsk_paint_bind_bander(const dsk_bander_t *b);
+bool dsk_paint_banded(void);
+
+/*
+ * Repaint one rectangle, whichever way the bound backend needs.
+ *
+ * With a surface: `draw` once, then flush.  In band mode: `draw` once per
+ * strip, each time with the strip's own rectangle, and the strip goes to the
+ * panel as soon as it is finished.  Anything that reads the background - the
+ * pointer, a drag outline - must therefore be painted by `draw` itself, not
+ * saved and restored around the call, because outside the strip there is
+ * nothing to read.
+ */
+void dsk_paint_region(dsk_rect_t r, void (*draw)(dsk_rect_t r));
+
 /* ---- what the shell actually calls -------------------------------------- */
 
 void dsk_fill(dsk_rect_t r, uint32_t rgb);

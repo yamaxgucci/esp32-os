@@ -30,8 +30,17 @@ static uint16_t to565(uint32_t rgb)
     return (uint16_t)(((r & 0xF8u) << 8) | ((g & 0xFCu) << 3) | (b >> 3));
 }
 
+/* Set by the band backend after it binds itself; see dsk_paint_bind_bander. */
+static const dsk_bander_t *s_bander;
+
 void dsk_paint_bind(const dsk_painter_t *p, int16_t w, int16_t h)
 {
+    /*
+     * A new backend draws its own way, so how a repaint is cut belongs to it
+     * and not to whoever was bound before - and the recorder in the host
+     * tests must never inherit a band driver.
+     */
+    s_bander = NULL;
     s_p = p;
     s_shell_clip = dsk_rect_none();
     s_shell_w = w;
@@ -39,6 +48,38 @@ void dsk_paint_bind(const dsk_painter_t *p, int16_t w, int16_t h)
 }
 
 const dsk_painter_t *dsk_paint(void) { return s_p; }
+
+/* ---- how a repaint is cut into pieces ----------------------------------- */
+
+void dsk_paint_bind_bander(const dsk_bander_t *b) { s_bander = b; }
+bool dsk_paint_banded(void) { return s_bander != NULL; }
+
+void dsk_paint_region(dsk_rect_t r, void (*draw)(dsk_rect_t r))
+{
+    if (draw == NULL || dsk_rect_empty(r)) {
+        return;
+    }
+    if (s_bander == NULL) {
+        draw(r);
+        s_p->flush(r);
+        return;
+    }
+    /*
+     * Bottom of the rectangle recomputed each time rather than kept: `begin`
+     * decides how tall a strip it can afford for this width, and a narrow
+     * rectangle gets one strip where a screen-wide one gets fifteen.
+     */
+    int16_t y = r.y;
+    while (y < (int16_t)(r.y + r.h)) {
+        const int16_t h = s_bander->begin(r, y);
+        if (h <= 0) {
+            return;
+        }
+        draw(dsk_rect(r.x, y, r.w, h));
+        s_bander->present();
+        y = (int16_t)(y + h);
+    }
+}
 
 /* ---- what the shell calls ---------------------------------------------- */
 

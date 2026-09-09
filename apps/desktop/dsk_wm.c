@@ -785,6 +785,15 @@ static void outline_show(dsk_rect_t r)
     if (s_outline_up || !outline_fits(r)) {
         return;
     }
+    /*
+     * Band mode saves nothing and puts nothing back: there is no frame to
+     * read a strip out of, and the outline is painted into each band by
+     * dsk_wm_outline_paint while the band is in hand.  Moving it is then a
+     * damaged rectangle, which outline_flush turns it into.
+     */
+    if (dsk_paint_banded()) {
+        return;
+    }
     dsk_rect_t s[4];
     outline_strips(r, s);
     dsk_clip_reset();
@@ -813,7 +822,35 @@ static void outline_show(dsk_rect_t r)
  * The rows spanned are the same either way, so one flush of the bounding
  * rectangle sends exactly the same pixels for an eighth of the requests.
  */
-static void outline_flush(dsk_rect_t r) { dsk_flush(r); }
+static void outline_flush(dsk_rect_t r)
+{
+    if (dsk_paint_banded()) {
+        damage(r); /* the scene, and the outline with it, is redrawn */
+        return;
+    }
+    dsk_flush(r);
+}
+
+/*
+ * The outline as part of the scene, for the band backend.
+ *
+ * Called inside the band pass, after the furniture and before the pointer,
+ * which is the same order the surface path achieves by saving and restoring
+ * around a repaint.
+ */
+void dsk_wm_outline_paint(void)
+{
+    if (s_track == TRACK_NONE || !outline_fits(s_track_rect)) {
+        return;
+    }
+    dsk_rect_t s[4];
+    outline_strips(s_track_rect, s);
+    for (int i = 0; i < 4; i++) {
+        if (!dsk_rect_empty(s[i])) {
+            dsk_fill(s[i], DSK_BLACK);
+        }
+    }
+}
 
 bool dsk_wm_tracking(void) { return s_track != TRACK_NONE; }
 

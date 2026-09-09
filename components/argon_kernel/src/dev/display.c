@@ -685,7 +685,24 @@ static ag_err_t gfx_present(const ag_blit_t *in)
     if (b.h == 0 || b.h > (uint16_t)(b.surf_h - b.y)) {
         b.h = (uint16_t)(b.surf_h - b.y);
     }
-    if (b.stride < (uint32_t)b.surf_w * sizeof(uint16_t)) {
+    /*
+     * The stride belongs to the RECTANGLE, not to the picture.
+     *
+     * This used to demand `surf_w` rows, which quietly required the caller to
+     * hold a surface-wide buffer - the one thing ag_blit_t's own contract
+     * promises it will not ask for, in as many words: "a renderer that
+     * produces sixteen rows at a time ... has no such corner to point at".
+     * A band renderer hands over a tight buffer of exactly `w` pixels a row,
+     * and every such call was refused with -AG_EINVAL.
+     *
+     * What that looked like, because it is worth recognising again: the
+     * desktop shell on a surfaceless panel drew its whole screen correctly
+     * (one full-width band after another, which passed) and then never
+     * changed anything narrower again.  Selecting an icon did nothing, a menu
+     * highlighted its title but dropped no list - the repaints happened, cost
+     * their milliseconds, and were thrown away at this line.
+     */
+    if (b.stride < (uint32_t)b.w * sizeof(uint16_t)) {
         return -AG_EINVAL;
     }
 

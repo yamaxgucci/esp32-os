@@ -28,8 +28,16 @@ typedef enum {
     DSK_CUR_COUNT,
 } dsk_cursor_id_t;
 
-/* Unpacks the shapes.  Call once, before the first show. */
-void dsk_cursor_init(int16_t screen_w, int16_t screen_h);
+/*
+ * Unpacks the shapes.  Call once, before the first show.
+ *
+ * `damage_fn` is wanted for band mode only, where the pointer is scenery: a
+ * change of shape there is not drawing but a rectangle that owes a repaint,
+ * and without it the hourglass would wait for the next unrelated repaint to
+ * appear.  May be NULL.
+ */
+void dsk_cursor_init(int16_t screen_w, int16_t screen_h,
+                     void (*damage_fn)(dsk_rect_t r));
 
 /* Where the pointer is, in surface pixels.  Clamped to the screen. */
 void    dsk_cursor_place(int16_t x, int16_t y);
@@ -44,6 +52,17 @@ void dsk_cursor_show(void);
 
 /* Hide, move, show, and flush both squares.  For a pointer that only moved. */
 void dsk_cursor_move(int16_t x, int16_t y);
+
+/*
+ * Band mode: the pointer is part of the scene.
+ *
+ * There is no frame to save a patch out of and put back, so moving the
+ * pointer is not a blit - it is two damaged rectangles, which `place_moved`
+ * hands back as one box for the caller to damage, and the drawing happens in
+ * `paint`, called while the strip under the pointer is still in hand.
+ */
+dsk_rect_t dsk_cursor_place_moved(int16_t x, int16_t y);
+void       dsk_cursor_paint(void);
 
 /* The square the pointer occupies now, for adding to a damage list. */
 dsk_rect_t dsk_cursor_rect(void);

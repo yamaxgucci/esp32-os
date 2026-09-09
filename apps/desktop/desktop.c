@@ -1311,6 +1311,21 @@ static uint32_t s_worst_flush_us;
 static uint32_t s_frames;
 static uint64_t s_frame_total_us;
 
+/*
+ * One strip, complete: everything the shell has, in the order it stacks.
+ *
+ * The pointer and the drag outline read the background, so in band mode they
+ * have to be drawn here - while the strip they read from is still the strip
+ * being built - rather than saved and restored around the frame the way the
+ * surface path does it.
+ */
+static void draw_banded(dsk_rect_t r)
+{
+    draw_region(r);
+    dsk_wm_outline_paint();
+    dsk_cursor_paint();
+}
+
 static void commit(void)
 {
     if (s_damage.n == 0) {
@@ -1319,24 +1334,38 @@ static void commit(void)
     const uint32_t t0 = (uint32_t)ag_micros();
     dsk_damage_clip(&s_damage, s_m.screen);
 
-    /*
-     * Pointer off, then outline off, then paint, then both back on in the
-     * other order - because the pointer is above the outline and each of them
-     * holds a copy of what it covered.
-     */
-    dsk_cursor_hide();
-    dsk_wm_outline_off();
-    for (uint8_t i = 0; i < s_damage.n; i++) {
-        draw_region(s_damage.r[i]);
-    }
-    dsk_wm_outline_on();
-    dsk_cursor_show();
+    uint32_t t_flush;
+    if (dsk_paint_banded()) {
+        /*
+         * No frame, so nothing is taken off and put back: each strip is drawn
+         * complete - furniture, outline, pointer - and goes to the panel as
+         * it is finished.  The flush stopwatch starts with the first strip
+         * because in this mode drawing and sending are not separable.
+         */
+        t_flush = (uint32_t)ag_micros();
+        for (uint8_t i = 0; i < s_damage.n; i++) {
+            dsk_paint_region(s_damage.r[i], draw_banded);
+        }
+    } else {
+        /*
+         * Pointer off, then outline off, then paint, then both back on in the
+         * other order - because the pointer is above the outline and each of
+         * them holds a copy of what it covered.
+         */
+        dsk_cursor_hide();
+        dsk_wm_outline_off();
+        for (uint8_t i = 0; i < s_damage.n; i++) {
+            draw_region(s_damage.r[i]);
+        }
+        dsk_wm_outline_on();
+        dsk_cursor_show();
 
-    /* The pointer's square needs a flush even though it needed no repaint. */
-    dsk_damage_add(&s_damage, dsk_cursor_rect());
-    const uint32_t t_flush = (uint32_t)ag_micros();
-    for (uint8_t i = 0; i < s_damage.n; i++) {
-        dsk_flush(s_damage.r[i]);
+        /* The pointer's square needs a flush though it needed no repaint. */
+        dsk_damage_add(&s_damage, dsk_cursor_rect());
+        t_flush = (uint32_t)ag_micros();
+        for (uint8_t i = 0; i < s_damage.n; i++) {
+            dsk_flush(s_damage.r[i]);
+        }
     }
     const uint32_t now = (uint32_t)ag_micros();
 
@@ -1389,12 +1418,33 @@ static void status_settle(uint32_t now)
 
 /* ---- input ------------------------------------------------------------- */
 
+/*
+ * -ptr: every pointer event on the console, as it arrives.
+ *
+ * A board is where the pointer actually is, and a board is exactly where
+ * there is no way to watch one: the touchscreen cannot be scripted and the
+ * screen cannot be photographed.  Two lines of print are the difference
+ * between knowing what the finger sent and guessing from what did not happen.
+ */
+static bool s_ptr_log;
+
 static void on_pointer(dsk_ptr_t type, int16_t x, int16_t y, uint8_t buttons,
                        uint32_t now)
 {
     s_ptr_events++;
+    if (s_ptr_log) {
+        ag_printf("ptr %s %d,%d b%u -> drive %d\n",
+                  (type == DSK_PTR_DOWN)   ? "down"
+                  : (type == DSK_PTR_UP)   ? "up"
+                                           : "move",
+                  (int)x, (int)y, (unsigned)buttons, drive_at(x, y));
+    }
     s_buttons = buttons;
-    dsk_cursor_move(x, y);
+    if (dsk_paint_banded()) {
+        damage(dsk_cursor_place_moved(x, y));
+    } else {
+        dsk_cursor_move(x, y);
+    }
     s_status_dirty = true;
 
     const bool dbl = (type == DSK_PTR_DOWN) ? is_double(now, x, y) : false;
@@ -1728,21 +1778,15 @@ int ag_main(int argc, char **argv)
         ag_printf("desktop: cannot take the display (%d)\n", (int)err);
         return 1;
     }
-    if (info.fb == NULL) {
-        /*
-         * A board with no system surface at all - the pixels would have to be
-         * the shell's own and go out in bands through gfx->present.  That
-         * backend is planned (docs/plans/desktop.md §9.2) and is not here, and
-         * drawing anyway would paint into nothing and say nothing about it.
-         */
-        ag_gfx_release();
-        ag_printf("desktop: this display has no surface (%ux%u); "
-                  "the band renderer is not built yet\n",
-                  (unsigned)info.width, (unsigned)info.height);
-        return 1;
-    }
+    /*
+     * No system surface: the pixels are the shell's own and go out in bands
+     * through gfx->present (dsk_paint_band.c, docs/plans/desktop.md §9.2).
+     * This is how a 320x240 screen happens on a board that cannot hold a
+     * frame of it - the CYD, which is also the only board with a touchscreen.
+     */
+    const bool banded = (info.fb == NULL);
 
-    s_double_buf = info.double_buf;
+    s_double_buf = banded ? false : info.double_buf;
 
     /*
      * Wait to be given the screen before drawing on it.
@@ -1766,13 +1810,20 @@ int ag_main(int argc, char **argv)
      * driving this cannot read the screen: the surface it got is the first
      * thing that has to be checkable from the transcript.
      */
-    ag_printf("desktop: surface %ux%u %s, focus %s\n", (unsigned)info.width,
-              (unsigned)info.height, info.double_buf ? "double" : "single",
+    ag_printf("desktop: %s %ux%u %s, focus %s\n",
+              banded ? "bands on" : "surface", (unsigned)info.width,
+              (unsigned)info.height,
+              banded ? "no frame" : (info.double_buf ? "double" : "single"),
               ag_focused() ? "yes" : "no");
 
     dsk_metrics_init(&s_m, (int16_t)info.width, (int16_t)info.height);
-    dsk_paint_bind_surface(info.fb, info.stride, s_m.screen_w, s_m.screen_h);
-    dsk_cursor_init(s_m.screen_w, s_m.screen_h);
+    if (banded) {
+        dsk_paint_bind_band(s_m.screen_w, s_m.screen_h);
+    } else {
+        dsk_paint_bind_surface(info.fb, info.stride, s_m.screen_w,
+                               s_m.screen_h);
+    }
+    dsk_cursor_init(s_m.screen_w, s_m.screen_h, damage);
     dsk_wm_init(&s_m, damage);
     dsk_menu_init(&s_m, damage, menu_chose);
     dsk_dlg_init(&s_m);
@@ -1796,6 +1847,11 @@ int ag_main(int argc, char **argv)
     damage(s_m.screen);
     commit();
 
+    for (int i = 1; i < argc; i++) {
+        if (ag_stricmp(argv[i], "-ptr") == 0) {
+            s_ptr_log = true;
+        }
+    }
     for (int i = 1; i < argc; i++) {
         if (ag_stricmp(argv[i], "-bench") == 0) {
             bench();
