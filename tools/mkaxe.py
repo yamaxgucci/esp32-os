@@ -51,7 +51,12 @@ import tempfile
 
 # Must match sdk/include/argon/axe.h.
 MAGIC = b"AXE1"
-HEADER_FORMAT = "<4sHHHHI IIII IIII II II II 32s16s32s6I II"
+HEADER_FORMAT_V1 = "<4sHHHHI IIII IIII II II II 32s16s32s6I"
+# Two words more, for an image that has instruction relocations to point at.
+# An image with none is written in the older layout, byte for byte: a format
+# only one architecture needs is not a reason to change every file, and an
+# older loader must keep reading what it always read.
+HEADER_FORMAT = HEADER_FORMAT_V1 + " II"
 ARCHS = {"xtensa": 1, "riscv32": 2}
 
 # Must match enum ag_axe_flags in sdk/include/argon/abi.h.
@@ -723,14 +728,16 @@ def main():
                     "mkaxe: the image defines neither ag_main nor "
                     "ag_driver_init")
 
-        header_size = struct.calcsize(HEADER_FORMAT)
+        fmt = HEADER_FORMAT if irelocs else HEADER_FORMAT_V1
+        header_size = struct.calcsize(fmt)
         code_offset = header_size
         data_offset = code_offset + len(code["stored"])
         reloc_offset = data_offset + len(data["stored"])
         ireloc_offset = reloc_offset + len(relocs) * 4
 
+        tail = (ireloc_offset, len(irelocs)) if irelocs else ()
         header = struct.pack(
-            HEADER_FORMAT, MAGIC,
+            fmt, MAGIC,
             meta.get("abi_major", 0), meta.get("abi_minor", 1),
             ARCHS[args.arch], header_size, flags,
             code["addr"], code["size"], len(code["stored"]), code_offset,
@@ -742,7 +749,7 @@ def main():
             meta.get("version", "").encode()[:15],
             meta.get("author", "").encode()[:31],
             0, 0, 0, 0, 0, 0,
-            ireloc_offset, len(irelocs))
+            *tail)
 
         with open(args.output, "wb") as f:
             f.write(header)

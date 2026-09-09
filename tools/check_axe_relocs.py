@@ -40,17 +40,27 @@ HEADER_FIELDS = (
     "code_base code_size code_file_size code_offset "
     "data_base data_size data_file_size data_offset "
     "entry api_slot reloc_offset reloc_count stack_size heap_size "
-    "name version author r0 r1 r2 r3 r4 r5 ireloc_offset ireloc_count"
+    "name version author r0 r1 r2 r3 r4 r5"
 ).split()
 
 
 def read_axe(path):
     with open(path, "rb") as f:
         blob = f.read()
-    values = struct.unpack_from(mkaxe.HEADER_FORMAT, blob, 0)
+    values = struct.unpack_from(mkaxe.HEADER_FORMAT_V1, blob, 0)
     h = dict(zip(HEADER_FIELDS, values))
     if h["magic"] != b"AXE1":
         raise SystemExit("%s: not an .AXE" % path)
+
+    # The instruction table only exists in an image that has one, and its two
+    # words are only there when the header says so.  Reading them off a shorter
+    # header would read the first bytes of the code and believe them, which is
+    # the mistake the loader has an accessor to avoid.
+    h["ireloc_offset"] = 0
+    h["ireloc_count"] = 0
+    if h["header_size"] >= struct.calcsize(mkaxe.HEADER_FORMAT):
+        h["ireloc_offset"], h["ireloc_count"] = struct.unpack_from(
+            "<II", blob, struct.calcsize(mkaxe.HEADER_FORMAT_V1))
 
     h["code"] = bytearray(blob[h["code_offset"]:
                                h["code_offset"] + h["code_file_size"]])

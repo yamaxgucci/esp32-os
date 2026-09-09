@@ -110,7 +110,7 @@ if ($RestoreOnly) {
     #
     # Any size, because a window that has not been shown yet has no client area
     # to speak of - which is exactly the state this exists to end.
-    $deadline = (Get-Date).AddSeconds(8)
+    $deadline = (Get-Date).AddSeconds(30)
     while ((Get-Date) -lt $deadline) {
         $all = [Win]::Windows($Title, [uint32]$OwnerPid, $true)
         if ($all.Count -gt 0) {
@@ -126,7 +126,7 @@ if ($RestoreOnly) {
         }
         Start-Sleep -Milliseconds 250
     }
-    "grab-window: no window matching '$Title' appeared within 8s"
+    "grab-window: no window matching '$Title' appeared within 30s"
     exit 0
 }
 

@@ -198,9 +198,16 @@ $proc = Start-Process -FilePath $qemu -ArgumentList $qemuArgs -NoNewWindow `
 # something else owns the foreground, which on a machine somebody is using is
 # most of the time.  So it is put up once, here, rather than at grab time -
 # which is too late by then.
+$winJob = $null
 if ($Gfx) {
-    & (Join-Path $PSScriptRoot 'grab-window.ps1') -RestoreOnly `
-        -OwnerPid $proc.Id | Out-Host
+    # In the background, because waiting for it here would stop reading the
+    # console - and the guest talks while the window is still coming up.  Once
+    # rather than repeatedly: restoring a window takes the foreground, and
+    # doing that on a timer to somebody who is working is not acceptable.
+    $winJob = Start-Job -ScriptBlock {
+        param($script, $ownerPid)
+        & $script -RestoreOnly -OwnerPid $ownerPid
+    } -ArgumentList (Join-Path $PSScriptRoot 'grab-window.ps1'), $proc.Id
 }
 
 $text = New-Object System.Text.StringBuilder
@@ -541,6 +548,12 @@ try {
     }
     if ($hostfsProc -and -not $hostfsProc.HasExited) {
         Stop-Process -Id $hostfsProc.Id -Force -ErrorAction SilentlyContinue
+    }
+    if ($winJob) {
+        # Whatever it said about the window is worth seeing: "no window
+        # appeared" explains a black photograph, and nothing else does.
+        Receive-Job $winJob -ErrorAction SilentlyContinue | Out-Host
+        Remove-Job $winJob -Force -ErrorAction SilentlyContinue
     }
 
     # Written here, not after the try: a run that failed is the run whose
