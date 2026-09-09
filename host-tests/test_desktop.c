@@ -392,6 +392,122 @@ static const dsk_win_ops_t k_test_ops = {
     .closed = NULL,
 };
 
+/* ---- how a repaint is cut into strips ---------------------------------- */
+/*
+ * The band backend itself needs a display, but the loop that drives it does
+ * not: it is pure, and it is where a whole rectangle can quietly go missing.
+ * What must hold is simple and is exactly what a photograph cannot tell you
+ * in one shot: the strips tile the rectangle, in order, with no gap and no
+ * overlap, and every strip that was drawn was also presented.
+ */
+#define BAND_PX (320 * 16)
+#define BAND_H_MAX 16
+
+static dsk_rect_t s_band_drawn[64];
+static int        s_band_n;
+static int        s_band_presented;
+static dsk_rect_t s_band_at; /* what begin() last set */
+
+static int16_t fake_begin(dsk_rect_t r, int16_t y)
+{
+    /* The same arithmetic dsk_paint_band.c uses. */
+    if (r.w <= 0 || r.w > (int16_t)BAND_PX) {
+        return 0;
+    }
+    int16_t h = (int16_t)(BAND_PX / r.w);
+    if (h > BAND_H_MAX) {
+        h = BAND_H_MAX;
+    }
+    if (h > (int16_t)(r.y + r.h - y)) {
+        h = (int16_t)(r.y + r.h - y);
+    }
+    if (h <= 0) {
+        return 0;
+    }
+    s_band_at = dsk_rect(r.x, y, r.w, h);
+    return h;
+}
+
+static void fake_present(void) { s_band_presented++; }
+
+static const dsk_bander_t k_fake_bander = {
+    .begin = fake_begin,
+    .present = fake_present,
+};
+
+static void band_draw(dsk_rect_t r)
+{
+    if (s_band_n < 64) {
+        s_band_drawn[s_band_n++] = r;
+    }
+}
+
+static void check_bands_tile(dsk_rect_t r)
+{
+    s_band_n = 0;
+    s_band_presented = 0;
+    dsk_paint_bind(&k_recorder, 640, 400);
+    dsk_paint_bind_bander(&k_fake_bander);
+    AG_CHECK_INT(dsk_paint_banded(), 1);
+
+    dsk_paint_region(r, band_draw);
+
+    /* Every strip drawn went to the glass. */
+    AG_CHECK_INT(s_band_presented, s_band_n);
+    AG_CHECK_INT(s_band_n > 0, 1);
+
+    int16_t at = r.y;
+    for (int i = 0; i < s_band_n; i++) {
+        AG_CHECK_INT(s_band_drawn[i].x, r.x);
+        AG_CHECK_INT(s_band_drawn[i].w, r.w);
+        AG_CHECK_INT(s_band_drawn[i].y, at);
+        AG_CHECK_INT(s_band_drawn[i].h > 0, 1);
+        at = (int16_t)(at + s_band_drawn[i].h);
+    }
+    /* No gap at the end either - the last row of the rectangle is covered. */
+    AG_CHECK_INT(at, (int16_t)(r.y + r.h));
+
+    dsk_paint_bind(&k_recorder, 640, 400); /* clears the bander */
+    AG_CHECK_INT(dsk_paint_banded(), 0);
+}
+
+static void test_bands_cover_the_whole_rectangle(void)
+{
+    /*
+     * Heights around the strip height, and the two that a real run produced
+     * as missing regions on the glass - nineteen rows of a window caption and
+     * thirty-nine of a dialog's lower half.
+     */
+    const int16_t heights[] = {1, 2, 15, 16, 17, 19, 31, 32, 33, 39, 200, 400};
+    const int16_t widths[] = {1, 3, 8, 56, 68, 100, 319, 320};
+
+    for (size_t hi = 0; hi < sizeof(heights) / sizeof(heights[0]); hi++) {
+        for (size_t wi = 0; wi < sizeof(widths) / sizeof(widths[0]); wi++) {
+            const int16_t h = heights[hi];
+            const int16_t w = widths[wi];
+            if (h > 400 || w > 640) {
+                continue;
+            }
+            check_bands_tile(dsk_rect(0, 0, w, h));
+            check_bands_tile(dsk_rect(3, 30, w, h));
+        }
+    }
+
+    /* With no bander bound, the rectangle is drawn once and flushed once. */
+    s_band_n = 0;
+    dsk_paint_bind(&k_recorder, 640, 400);
+    dsk_paint_region(dsk_rect(0, 0, 100, 100), band_draw);
+    AG_CHECK_INT(s_band_n, 1);
+    AG_CHECK_INT(s_band_drawn[0].h, 100);
+
+    /* An empty rectangle draws nothing at all rather than one empty strip. */
+    s_band_n = 0;
+    dsk_paint_bind_bander(&k_fake_bander);
+    dsk_paint_region(dsk_rect_none(), band_draw);
+    AG_CHECK_INT(s_band_n, 0);
+    dsk_paint_bind(&k_recorder, 640, 400);
+}
+
 static void wm_fixture(void)
 {
     dsk_metrics_init(&s_wm_m, 640, 400);
@@ -840,6 +956,7 @@ static void test_menu_choosing(void)
 
 void run_desktop_tests(void)
 {
+    test_bands_cover_the_whole_rectangle();
     test_rect_basics();
     test_rect_overlap();
     test_rect_clip_union();

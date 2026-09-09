@@ -190,6 +190,19 @@ $qemuOut = 'build\qemu-emulator.log'
 $proc = Start-Process -FilePath $qemu -ArgumentList $qemuArgs -NoNewWindow `
     -PassThru -RedirectStandardOutput $qemuOut -RedirectStandardError "$qemuOut.err"
 
+# With graphics, the window has to be up before the guest chooses its mode.
+#
+# SDL creates it at 800x600 and resizes when the RGB panel appears; a window
+# that is minimised at that moment stays 800x600, and every photograph of the
+# run is then of a window that is not the panel.  Windows minimises it whenever
+# something else owns the foreground, which on a machine somebody is using is
+# most of the time.  So it is put up once, here, rather than at grab time -
+# which is too late by then.
+if ($Gfx) {
+    & (Join-Path $PSScriptRoot 'grab-window.ps1') -RestoreOnly `
+        -OwnerPid $proc.Id | Out-Host
+}
+
 $text = New-Object System.Text.StringBuilder
 $client = $null
 $stream = $null

@@ -49,7 +49,7 @@ ArgonOS
   argon boardnet -port COM3   the same on the real board, over Wi-Fi;
                            add -big for a speed number (14 checks)
   python tools/netfixture.py serve   the same servers, to try things by hand
-  argon check              local CI: host tests, then firmware build
+  argon check              local CI: host tests, firmware, apps, relocations
   argon target             which chip the firmware is built for
   argon target esp32c6     the RISC-V board (docs\12-esp32-c6-lcd.md)
   argon target esp32       switch to the board on the desk (docs\09-esp32-cyd.md);
@@ -567,8 +567,31 @@ switch ($Command.ToLowerInvariant()) {
             exit $LASTEXITCODE
         }
 
+        # Does the relocation table actually move an image?
+        #
+        # Not "does it look right": the same source is linked twice at
+        # different pairs of bases, the first image is relocated onto the
+        # second's addresses using nothing but its own table, and the bytes
+        # must come out equal.  Both architectures, because they relocate
+        # differently - xtensa fixes absolute words in a literal pool, RISC-V
+        # re-encodes the immediates of instruction pairs - and the second kind
+        # had no test at all until a board was the only thing that could say.
         Write-Host ''
-        Write-Host 'check: OK (host tests + firmware + apps)'
+        Write-Host '== relocations =='
+        $relargs = @('--include', 'apps/hello', '--include', 'sdk/include',
+                     'apps/hello/hello.c')
+        foreach ($pair in @(@('xtensa', 'xtensa-esp32s3-elf-gcc'),
+                            @('riscv32', 'riscv32-esp-elf-gcc'))) {
+            & python (Join-Path $PSScriptRoot 'check_axe_relocs.py') `
+                --arch $pair[0] --gcc $pair[1] @relargs
+            if ($LASTEXITCODE -ne 0) {
+                Write-Host 'check: an image does not survive being relocated.'
+                exit $LASTEXITCODE
+            }
+        }
+
+        Write-Host ''
+        Write-Host 'check: OK (host tests + firmware + apps + relocations)'
         exit 0
     }
 

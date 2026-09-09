@@ -350,14 +350,24 @@ try {
     # opens the first menu, and Down steps over the separators by itself.
     # Seven items in: New window, Run, Copy, Move, Rename, Delete, Create
     # directory, Properties.
+    # How long to let the shell catch up before a photograph is taken.
+    #
+    # Band mode is fifteen times slower under the emulator than on hardware
+    # and the difference is all handshake: every strip waits for the emulated
+    # panel to finish the last one, so a drag step measured 339 ms here against
+    # 22 ms on a real CYD.  A wait sized for the surface path therefore
+    # photographs a shell that is still working through its queue - which shows
+    # up as a dialog missing its button, and a different number of differing
+    # pixels every run (8936, then 20724, then 5800).
+    $settle = if ($Bands) { 6000 } else { 1200 }
     $opsProps = @('key f10', 'wait 500') +
                 (1..8 | ForEach-Object { 'key down' }) +
-                @('wait 300', 'key enter', 'wait 1200')
+                @('wait 300', 'key enter', "wait $settle")
 
     $keyboard = $runHello + $runGfx + $opsMkdir + $opsCopy + $opsDelete +
                 $opsRename + $opsProps
     $quoted = ($moves | ForEach-Object { '"' + $_ + '"' }) -join ' '
-    $after = @('"key f5"', '"wait 1500"') -join ' '
+    $after = @('"key f5"', ('"wait ' + $settle + '"')) -join ' '
     # The properties box is deliberately still up for both photographs - it is
     # a modal window, and whether a full repaint puts it back is exactly the
     # kind of thing the two-photograph criterion is for.  Enter dismisses it

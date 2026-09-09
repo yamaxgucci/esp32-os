@@ -28,7 +28,16 @@ param(
     [string]$Title = 'QEMU',
     [string]$Out = 'build\qemu_window.png',
     # Restrict the search to this process id (any QEMU otherwise).
-    [int]$OwnerPid = 0
+    [int]$OwnerPid = 0,
+    # Put the window up and take no picture.
+    #
+    # Wanted at the START of a run, not at grab time, and that distinction cost
+    # a green check: an emulator window that is minimised when the guest sets
+    # its display mode keeps SDL's default size - 800x600 - and the panel is
+    # then not what the window shows.  Restoring it later gets a picture of the
+    # wrong thing, which compares equal to itself and hides whatever the two
+    # photographs were meant to catch.
+    [switch]$RestoreOnly
 )
 
 Add-Type -AssemblyName System.Drawing
@@ -86,6 +95,40 @@ public class Win {
   }
 }
 '@
+
+if ($RestoreOnly) {
+    # Waited for, not sampled once.
+    #
+    # The window does not exist for the first second or two of an emulator's
+    # life, and while it does not exist there is nothing to restore - a single
+    # look that early reports "no window" and leaves it minimised for the whole
+    # run.  What that costs is not cosmetic: a minimised window's updates do
+    # not complete, so an application that hands over its pixels a strip at a
+    # time waits for each one and appears to hang.  Measured: the shell's own
+    # benchmark printed nothing at all in three minutes, and printed
+    # immediately once the window was up.
+    #
+    # Any size, because a window that has not been shown yet has no client area
+    # to speak of - which is exactly the state this exists to end.
+    $deadline = (Get-Date).AddSeconds(8)
+    while ((Get-Date) -lt $deadline) {
+        $all = [Win]::Windows($Title, [uint32]$OwnerPid, $true)
+        if ($all.Count -gt 0) {
+            foreach ($w in $all) {
+                if ([Win]::IsIconic($w.H)) {
+                    [void][Win]::ShowWindow($w.H, 9) # SW_RESTORE
+                    "grab-window: restored '$($w.Title)' (it was minimised)"
+                } else {
+                    "grab-window: '$($w.Title)' is already up"
+                }
+            }
+            exit 0
+        }
+        Start-Sleep -Milliseconds 250
+    }
+    "grab-window: no window matching '$Title' appeared within 8s"
+    exit 0
+}
 
 $hits = [Win]::Windows($Title, [uint32]$OwnerPid)
 if ($hits.Count -eq 0) {

@@ -27,9 +27,18 @@ The two parts move independently, so every relocation says which part its word
 lives in and which part the address in that word points into.  Both fit in the
 low two bits of the offset, which are free because the offsets are word aligned.
 
-RISC-V is built contiguous instead: with the medany code model its code reaches
-its data PC-relatively, so the distance between the parts is part of the
-contract and the loader is told to keep them adjacent.
+RISC-V has no literal pool: an address is built by a pair of instructions that
+carry it in their immediate fields.  So it is compiled with the medlow model -
+absolute addressing - and the immediates are relocated as well, which is what
+ag_axe_ireloc_t in sdk/include/argon/axe.h describes.  The alternative, medany,
+reaches data PC-relatively and needs no relocation at all, but then the two
+parts must stay adjacent (--contiguous) and the code cannot be executed from
+flash, which on a board with 200 KB of RAM is the difference between running an
+application and refusing it.
+
+Both are checked the same way and by the same code the loader uses:
+tools/check_axe_relocs.py links a source twice at different bases, relocates
+the first image onto the second's addresses, and demands the bytes be equal.
 """
 
 import argparse
@@ -42,12 +51,64 @@ import tempfile
 
 # Must match sdk/include/argon/axe.h.
 MAGIC = b"AXE1"
-HEADER_FORMAT = "<4sHHHHI IIII IIII II II II 32s16s32s6I"
+HEADER_FORMAT = "<4sHHHHI IIII IIII II II II 32s16s32s6I II"
 ARCHS = {"xtensa": 1, "riscv32": 2}
 
 # Must match enum ag_axe_flags in sdk/include/argon/abi.h.
 AG_AXE_DRIVER = 1 << 3
 AG_AXE_CONTIGUOUS = 1 << 5
+
+# RISC-V relocations that hold an absolute address inside an instruction.
+# Numbers from the psABI; the pairs the medlow code model produces for every
+# reference to a global.  R_RISCV_RELAX (51) is a hint to the linker and says
+# nothing about the final bytes, so it is ignored here.
+R_RISCV_HI20 = 26
+R_RISCV_LO12_I = 27
+R_RISCV_LO12_S = 28
+
+# Must match the AG_AXE_I_* macros in sdk/include/argon/axe.h.
+I_TO_DATA = 0x10000000
+I_HI20 = 0x20000000
+I_LO12_I = 0x40000000
+I_LO12_S = 0x60000000
+
+IRELOC_KIND = {
+    R_RISCV_HI20: I_HI20,
+    R_RISCV_LO12_I: I_LO12_I,
+    R_RISCV_LO12_S: I_LO12_S,
+}
+
+
+def decode_imm(kind, word):
+    """The address bits an instruction currently carries, as the linker left it.
+
+    Only enough to check the tool against itself: the high form gives the top
+    twenty bits, the low forms the bottom twelve, and the two are compared with
+    what the symbol says the address is.
+    """
+    if kind == I_HI20:
+        return word & 0xFFFFF000
+    if kind == I_LO12_I:
+        return (word >> 20) & 0xFFF
+    imm = ((word >> 25) & 0x7F) << 5 | ((word >> 7) & 0x1F)
+    return imm
+
+
+def encode_imm(kind, word, addr):
+    """Put `addr` into the instruction at `word`, leaving everything else.
+
+    The %hi/%lo pair is the classic one: the high half rounds up so that the
+    low half, which is sign-extended when it is added, lands back on the right
+    address.  Getting that adjustment wrong is off-by-4096 on exactly those
+    addresses whose low half is negative, which is half of them.
+    """
+    addr &= 0xFFFFFFFF
+    if kind == I_HI20:
+        return ((addr + 0x800) & 0xFFFFF000) | (word & 0xFFF)
+    lo = addr & 0xFFF
+    if kind == I_LO12_I:
+        return (lo << 20) | (word & 0x000FFFFF)
+    return (((lo >> 5) & 0x7F) << 25) | (word & 0x01FFF07F) | ((lo & 0x1F) << 7)
 AG_AXE_WANT_XIP = 1 << 7  # app asked to run from flash even when code fits arena
 
 # Relocation entry bits, must match AG_AXE_R_* in axe.h.
@@ -261,6 +322,47 @@ class Elf:
                     out[sym["name"]] = sym["value"]
         return out
 
+    def imm_relocs(self, targets):
+        """Every instruction the linker left holding an absolute address.
+
+        Yields (location part, offset in it, target part, target address,
+        relocation type).  Unlike the absolute words above, the address is not
+        stored in the file as a word - it is spread across the instruction's
+        immediate field - so the target address has to come from the symbol
+        table rather than from the bytes.
+        """
+        e = self.endian
+        for sec in self.sections():
+            if sec["type"] != SHT_RELA or sec["info"] not in targets:
+                continue
+
+            where = targets[sec["info"]]
+            syms = self.symbol_table(sec["link"])
+
+            for i in range(sec["size"] // 12):
+                off = sec["offset"] + i * 12
+                r_offset, r_info, addend = struct.unpack_from(e + "IIi",
+                                                             self.data, off)
+                rtype = r_info & 0xFF
+                if rtype not in IRELOC_KIND:
+                    continue
+
+                sym_index = r_info >> 8
+                if sym_index >= len(syms):
+                    raise SystemExit("mkaxe: relocation names symbol %u, which "
+                                     "the symbol table does not have"
+                                     % sym_index)
+                sym = syms[sym_index]
+                shndx = sym["shndx"]
+                if shndx not in targets:
+                    raise SystemExit(
+                        "mkaxe: %s refers to symbol '%s', which is not in the "
+                        "image; an application may only reference itself and "
+                        "the API table" % (where["name"], sym["name"] or "?"))
+
+                yield (where, r_offset - where["addr"], targets[shndx],
+                       (sym["value"] + addend) & 0xFFFFFFFF, rtype)
+
     def abs32_relocs(self, reloc_type, targets):
         """Every absolute 32-bit word the linker resolved, classified.
 
@@ -359,9 +461,17 @@ def main():
                     default=DEFAULT_CODE_BASE)
     ap.add_argument("--data-base", type=lambda v: int(v, 0),
                     default=DEFAULT_DATA_BASE)
+    ap.add_argument("--split", action="store_true",
+                    help="the default on riscv32, and accepted for saying so "
+                         "out loud: two independent parts, so the code can be "
+                         "executed from flash while the data lives in RAM")
+    ap.add_argument("--dump-relocs", action="store_true",
+                    help="print a histogram of the relocation types the "
+                         "linker emitted, and stop")
     ap.add_argument("--contiguous", action="store_true",
-                    help="one block, data straight after code (implied on "
-                         "riscv32, whose code reaches data PC-relatively)")
+                    help="one block, data straight after code: the code then "
+                         "reaches its data PC-relatively (riscv32) and cannot "
+                         "be executed from flash")
     ap.add_argument("--rodata", choices=("data", "code"), default="data",
                     help="which part read-only constants go in; data (the "
                          "default) keeps fonts, images and tables out of the "
@@ -400,11 +510,21 @@ def main():
     if args.arch == "xtensa":
         # Long calls: the linker cannot shorten a call whose target moves.
         args.cflags += " -mlongcalls"
-    else:
-        # PC-relative addressing throughout, which is why this arch is built as
-        # one block: the distance between code and data must not change.
+    elif args.contiguous:
+        # PC-relative addressing throughout, which is what asking for one block
+        # means: the distance between code and data is then part of the
+        # contract, and the loader is told to keep them adjacent.  It also means
+        # the code cannot be executed from flash, because the data would have to
+        # be in flash beside it.
         args.cflags += " -mcmodel=medany"
-        args.contiguous = True
+    else:
+        # Absolute addressing, so the two parts move independently: every
+        # reference to data is a lui/addi (or lui/lw) pair holding the address
+        # itself, and the loader fixes those immediates the way it fixes an
+        # absolute word on xtensa (ag_axe_ireloc_t).  That is what lets the code
+        # be executed from flash while the data sits in RAM - the parts are then
+        # nowhere near each other, which medany cannot express.
+        args.cflags += " -mcmodel=medlow"
 
     workdir = tempfile.mkdtemp(prefix="mkaxe-")
     try:
@@ -473,6 +593,26 @@ def main():
             raise SystemExit("mkaxe: no g_ag_api; is AG_APP() / AG_DRV() missing?")
 
         targets = {p["index"]: p for p in (code, data) if p["index"] >= 0}
+
+        if args.dump_relocs:
+            # What the linker actually emitted, by type and by which part the
+            # word lives in.  Printed rather than guessed at: the set of
+            # relocation types a code model produces is the whole question when
+            # a new one is being taught to the loader.
+            hist = {}
+            e = elf.endian
+            for sec in elf.sections():
+                if sec["type"] != SHT_RELA or sec["info"] not in targets:
+                    continue
+                where = targets[sec["info"]]["name"]
+                for i in range(sec["size"] // 12):
+                    off = sec["offset"] + i * 12
+                    _o, r_info, _a = struct.unpack_from(e + "IIi", elf.data, off)
+                    key = (where, r_info & 0xFF)
+                    hist[key] = hist.get(key, 0) + 1
+            for (where, t), n in sorted(hist.items(), key=lambda kv: -kv[1]):
+                print("%-6s type %3d  x%d" % (where, t, n))
+            return 0
         relocs = set()
         for where, offset, points_to in elf.abs32_relocs(
                 ABS32_RELOC[args.arch], targets):
@@ -503,6 +643,57 @@ def main():
             relocs.add(entry_word)
 
         relocs = sorted(relocs)
+
+        # Addresses that live inside an instruction rather than in a word.
+        #
+        # RISC-V only, and only for a split image: a contiguous one reaches its
+        # data PC-relatively and the pair is already correct wherever the block
+        # lands.  See ag_axe_ireloc_t in sdk/include/argon/axe.h.
+        irelocs = []
+        if not args.contiguous:
+            seen = set()
+            for where, offset, points_to, addr, rtype in elf.imm_relocs(targets):
+                if where["is_data"]:
+                    raise SystemExit(
+                        "mkaxe: an instruction relocation in the data part at "
+                        "%s+%#x - the data part holds no instructions"
+                        % (where["name"], offset))
+                if offset < 0 or offset + 4 > len(where["stored"]):
+                    continue
+                if offset % 2 != 0:
+                    raise SystemExit("mkaxe: instruction at %s+%#x is not even"
+                                     % (where["name"], offset))
+
+                kind = IRELOC_KIND[rtype]
+                word = struct.unpack_from("<I", where["stored"], offset)[0]
+
+                # Cross-check the tool against itself, the way the absolute
+                # words above are checked: re-encoding the address the symbol
+                # table gives must reproduce the bytes the linker already
+                # wrote.  A mismatch means the relocation was understood
+                # wrongly, and it is the difference between finding that here
+                # and finding it as a board that jumps into nothing.
+                if encode_imm(kind, word, addr) != word:
+                    raise SystemExit(
+                        "mkaxe: %s+%#x holds %#010x, but %#010x is what an "
+                        "address of %#010x should encode to (relocation type "
+                        "%u)" % (where["name"], offset, word,
+                                 encode_imm(kind, word, addr), addr, rtype))
+
+                low = points_to["addr"]
+                if not low <= addr <= low + points_to["size"]:
+                    raise SystemExit(
+                        "mkaxe: %s+%#x points at %#x, which is outside %s"
+                        % (where["name"], offset, addr, points_to["name"]))
+
+                site = offset | kind
+                if points_to["is_data"]:
+                    site |= I_TO_DATA
+                entry = (site, addr - low)
+                if entry not in seen:
+                    seen.add(entry)
+                    irelocs.append(entry)
+        irelocs.sort()
 
         meta = read_app_header(code["stored"], syms.get("__ag_app_header", 0),
                                code["addr"])
@@ -536,6 +727,7 @@ def main():
         code_offset = header_size
         data_offset = code_offset + len(code["stored"])
         reloc_offset = data_offset + len(data["stored"])
+        ireloc_offset = reloc_offset + len(relocs) * 4
 
         header = struct.pack(
             HEADER_FORMAT, MAGIC,
@@ -549,7 +741,8 @@ def main():
             meta.get("name", "").encode()[:31],
             meta.get("version", "").encode()[:15],
             meta.get("author", "").encode()[:31],
-            0, 0, 0, 0, 0, 0)
+            0, 0, 0, 0, 0, 0,
+            ireloc_offset, len(irelocs))
 
         with open(args.output, "wb") as f:
             f.write(header)
@@ -557,6 +750,8 @@ def main():
             f.write(data["stored"])
             for r in relocs:
                 f.write(struct.pack("<I", r))
+            for site, target in irelocs:
+                f.write(struct.pack("<II", site, target))
 
         if args.keep_elf:
             shutil.copyfile(elf_path, args.keep_elf)
@@ -573,7 +768,8 @@ def main():
                   " contiguous" if args.contiguous else "",
                   code["size"], data["size"], len(data["stored"]),
                   data["size"] - len(data["stored"]), rodata_bytes,
-                  args.rodata, len(relocs)))
+                  args.rodata, len(relocs)) +
+              ("" if not irelocs else ", %u in instructions" % len(irelocs)))
 
         if not args.no_stage:
             stage_image(args.output)
