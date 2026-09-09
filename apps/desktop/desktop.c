@@ -748,7 +748,16 @@ static void delete_answered(dsk_answer_t a, void *ctx)
     after_op(NULL);
 }
 
-static void ask_copy(bool moving)
+/*
+ * The copy or move box, with the destination already filled in.
+ *
+ * Split out because a drop has a destination and the menu does not: the menu
+ * suggests the other window, a drop names the folder it landed on.  Everything
+ * after that is the same path, dialog and all - a dropped file is confirmed
+ * and copied by exactly the code a menu copy uses, which is the only reason a
+ * gesture that moves data is safe to add at all.
+ */
+static void ask_copy_to(bool moving, const char *dest)
 {
     if (!take_selection()) {
         return;
@@ -759,8 +768,115 @@ static void ask_copy(bool moving)
     ag_strlcat(prompt, s_op.name, sizeof(prompt));
     ag_strlcat(prompt, " to:", sizeof(prompt));
 
-    (void)dsk_dlg_input(moving ? "Move" : "Copy", prompt, other_folder_dir(),
-                        copy_typed, moving ? (void *)&s_op : NULL);
+    (void)dsk_dlg_input(moving ? "Move" : "Copy", prompt, dest, copy_typed,
+                        moving ? (void *)&s_op : NULL);
+}
+
+static void ask_copy(bool moving)
+{
+    ask_copy_to(moving, other_folder_dir());
+}
+
+/* ---- dragging a file out of a window ----------------------------------- */
+
+/*
+ * Windows 3.11's File Manager copied by dragging, and on a touchscreen that
+ * is the natural gesture rather than a clever one: a finger has no second
+ * button and no keyboard beside it, so a drag is the only way to say "this
+ * one, over there" without going through two dialogs.
+ *
+ * What a drop does NOT do is move data silently.  It opens the copy box with
+ * the folder it landed on already typed in, which means the confirmation, the
+ * progress box, the overwrite question and the error reporting are all the
+ * ones that were already there and already tested.  A gesture that starts a
+ * file operation on its own would be a gesture that can destroy a file by
+ * being misread by a resistive panel, and this one cannot.
+ */
+static struct {
+    bool    armed; /* a press landed on a row that could be dragged */
+    bool    moved; /* and then moved far enough to mean it */
+    int16_t x0, y0;
+} s_fdrag;
+
+static void fdrag_arm(int16_t x, int16_t y)
+{
+    dsk_win_t *w = dsk_wm_active();
+    if (dsk_folder_path(w) == NULL ||
+        !dsk_folder_selected(w, NULL, 0, NULL, 0, NULL)) {
+        return;
+    }
+    s_fdrag.armed = true;
+    s_fdrag.moved = false;
+    s_fdrag.x0 = x;
+    s_fdrag.y0 = y;
+}
+
+/* The folder a point lands in: a window's, or a drive icon's on the desk. */
+static const char *drop_dir_at(int16_t x, int16_t y)
+{
+    for (int z = dsk_wm_count() - 1; z >= 0; z--) {
+        dsk_win_t *w = dsk_wm_at(z);
+        if (dsk_rect_has(w->frame, x, y)) {
+            /* The topmost window under the point, folder or not: a dialog
+             * standing over a folder is not a way into it. */
+            return dsk_folder_path(w);
+        }
+    }
+    const int d = drive_at(x, y);
+    return (d >= 0) ? s_drives[d].path : NULL;
+}
+
+/*
+ * True when the event was the drag's, and nothing else should see it.
+ *
+ * Only the release of a drag that actually moved is consumed - everything
+ * else is passed on, because a press that turns out to be a click must still
+ * reach the window as a click.
+ */
+static bool fdrag_pointer(dsk_ptr_t type, int16_t x, int16_t y,
+                          uint8_t buttons)
+{
+    if (!s_fdrag.armed) {
+        return false;
+    }
+    if (type == DSK_PTR_MOVE && (buttons & 1u) != 0) {
+        const int16_t dx = (int16_t)((x > s_fdrag.x0) ? x - s_fdrag.x0
+                                                      : s_fdrag.x0 - x);
+        const int16_t dy = (int16_t)((y > s_fdrag.y0) ? y - s_fdrag.y0
+                                                      : s_fdrag.y0 - y);
+        if (!s_fdrag.moved && (dx > DBL_PX || dy > DBL_PX)) {
+            s_fdrag.moved = true;
+            s_note = "drop it on a folder to copy";
+            damage(s_m.statusbar);
+        }
+        return false;
+    }
+    if (type != DSK_PTR_UP && (buttons & 1u) != 0) {
+        return false;
+    }
+
+    const bool dropped = s_fdrag.moved;
+    s_fdrag.armed = false;
+    s_fdrag.moved = false;
+    if (!dropped) {
+        return false;
+    }
+
+    const char *dest = drop_dir_at(x, y);
+    dsk_win_t  *from = dsk_wm_active();
+    if (dest == NULL) {
+        s_note = "nothing to drop it on there";
+        damage(s_m.statusbar);
+        return true;
+    }
+    if (dsk_folder_path(from) != NULL &&
+        ag_stricmp(dest, dsk_folder_path(from)) == 0) {
+        s_note = "that is where it already is";
+        damage(s_m.statusbar);
+        return true;
+    }
+    ask_copy_to(false, dest);
+    return true;
 }
 
 static void ask_delete(void)
@@ -1498,7 +1614,19 @@ static void on_pointer(dsk_ptr_t type, int16_t x, int16_t y, uint8_t buttons,
     if (dsk_menu_pointer(type, x, y)) {
         return;
     }
+    /*
+     * A drag out of a folder window is watched here, before the windows see
+     * the event: the release of one is the drop and belongs to nobody else,
+     * while everything up to that point is passed on so that a press which
+     * turns out to be a click still reaches the row it was on.
+     */
+    if (fdrag_pointer(type, x, y, buttons)) {
+        return;
+    }
     if (dsk_wm_pointer(type, x, y, buttons, dbl)) {
+        if (type == DSK_PTR_DOWN && !dbl) {
+            fdrag_arm(x, y);
+        }
         return;
     }
     /* Nothing wanted it: the click was on the desktop itself. */
