@@ -214,6 +214,16 @@ try {
         "glide $($dropX),$($dropY)", 'wait 400',
         'release', 'wait 800',
 
+        # The context menu, both ways in: the right button, and a press held
+        # still for longer than LONG_PRESS_MS - which is the only way a finger
+        # has, there being no second button on glass.  Each is closed by a
+        # click far away from it, on bare desk where a click does nothing.
+        "move $($dropX + 60),$($workY + 40)", 'rclick', 'wait 500',
+        "move 600,380", 'click', 'wait 300',
+        "move $($dropX + 60),$($workY + 90)",
+        'press', 'wait 800', 'release', 'wait 400',
+        "move 600,380", 'click', 'wait 300',
+
         # A drive opens as a window onto its root.
         "move $drvX,$drvY", 'click', 'wait 120', 'click', 'wait 1500',
         # Into the only directory there is, and back out of it by "..".
@@ -694,6 +704,14 @@ try {
                     $ptr, $key, $rep, $win)
         if ($ptr -lt 5) { $fail += "only $ptr pointer events arrived" }
         if ($key -lt 1) { $fail += 'no key ever arrived' }
+        # Both ways of asking for the context menu, counted.  A right button
+        # that reached nothing and a long press that was taken for a drag both
+        # look like a passing run otherwise.
+        $ctx = ([regex]::Matches($text, 'desktop: context menu at')).Count
+        Write-Host "desktop: the context menu opened $ctx time(s)"
+        if ($ctx -lt 2) {
+            $fail += "the context menu opened $ctx time(s), wanted 2 (right button and long press)"
+        }
         if ($rep -lt 1) {
             $fail += 'F5 never reached the shell, so the second picture is not a fresh paint'
         }

@@ -508,6 +508,7 @@ enum {
     ID_RENAME,
     ID_DELETE,
     ID_MKDIR,
+    ID_OPEN,
     ID_PROPS,
     ID_ARRANGE,
     ID_EXIT,
@@ -520,7 +521,7 @@ enum {
     ID_WINDOW_FIRST = 100, /* + the window's z index */
 };
 
-static dsk_menu_t s_menus[3];
+static dsk_menu_t s_menus[4];
 
 /* ---- file operations ---------------------------------------------------- */
 
@@ -777,6 +778,97 @@ static void ask_copy(bool moving)
     ask_copy_to(moving, other_folder_dir());
 }
 
+/* ---- the context menu -------------------------------------------------- */
+
+/*
+ * Right button, or a finger held still.
+ *
+ * This shell had none of this on purpose - 3.11 had no right button, and the
+ * way to ask about a thing was to pick it and use the File menu.  Maxim wants
+ * one, which settles it: he is the one using it, and on a touchscreen the
+ * argument for it is stronger than the argument from 1992, because a finger
+ * has no second button and there is no keyboard beside the panel either.
+ *
+ * The items are the File menu's own, by the same ids and the same handlers -
+ * a context menu that did its own copying would be a second way for a file
+ * operation to go wrong.
+ */
+#define LONG_PRESS_MS 500u
+
+static void set_item(dsk_menu_t *m, const char *label, uint16_t id,
+                     bool enabled);
+static void set_separator(dsk_menu_t *m);
+static void fdrag_cancel(void);
+
+static struct {
+    bool     armed;
+    int16_t  x, y;
+    uint32_t at;
+} s_press;
+
+static void context_menu_at(int16_t x, int16_t y)
+{
+    dsk_menu_t *m = &s_menus[3];
+    m->title = "";
+    m->n = 0;
+
+    dsk_win_t  *w = dsk_wm_active();
+    const bool  in_folder = dsk_folder_path(w) != NULL &&
+                           dsk_rect_has(w->frame, x, y);
+    const bool  sel = in_folder &&
+                     dsk_folder_selected(w, NULL, 0, NULL, 0, NULL);
+
+    if (in_folder) {
+        set_item(m, "Open  Enter", ID_OPEN, sel);
+        set_separator(m);
+        set_item(m, "Copy...  F8", ID_COPY, sel);
+        set_item(m, "Move...  F7", ID_MOVE, sel);
+        set_item(m, "Rename...  F2", ID_RENAME, sel);
+        set_item(m, "Delete  Del", ID_DELETE, sel);
+        set_separator(m);
+        set_item(m, "Create directory...", ID_MKDIR, true);
+        set_item(m, "Properties...", ID_PROPS, sel);
+    } else {
+        const int d = drive_at(x, y);
+        if (d >= 0) {
+            s_drive_sel = d;
+            damage(drive_rect(d));
+        }
+        set_item(m, "New window", ID_NEW, true);
+        set_item(m, "Run...", ID_RUN, true);
+        set_separator(m);
+        set_item(m, "Properties...", ID_PROPS, d >= 0);
+        set_item(m, "Arrange icons", ID_ARRANGE, s_ndrives > 0);
+        set_item(m, "System console", ID_CONSOLE, true);
+    }
+    /* Said out loud so a scripted run can prove the menu happened: a
+     * drop-down that opens and closes between two photographs leaves no
+     * other trace. */
+    ag_printf("desktop: context menu at %d,%d, %u items, on %s\n", (int)x,
+              (int)y, (unsigned)m->n, in_folder ? "a file" : "the desk");
+    dsk_menu_popup(3, x, y);
+}
+
+uint32_t press_due_in(uint32_t now)
+{
+    if (!s_press.armed) {
+        return UINT32_MAX; /* no deadline; zero here would mean "due now" */
+    }
+    const uint32_t since = now - s_press.at;
+    return (since >= LONG_PRESS_MS) ? 0u : (LONG_PRESS_MS - since);
+}
+
+/* Held still for long enough: the finger's version of the right button. */
+static void press_settle(uint32_t now)
+{
+    if (!s_press.armed || press_due_in(now) != 0u) {
+        return;
+    }
+    s_press.armed = false;
+    fdrag_cancel(); /* it was a press, not the start of a drag */
+    context_menu_at(s_press.x, s_press.y);
+}
+
 /* ---- dragging a file out of a window ----------------------------------- */
 
 /*
@@ -797,6 +889,12 @@ static struct {
     bool    moved; /* and then moved far enough to mean it */
     int16_t x0, y0;
 } s_fdrag;
+
+
+static void fdrag_cancel(void)
+{
+    s_fdrag.armed = false;
+}
 
 static void fdrag_arm(int16_t x, int16_t y)
 {
@@ -1210,7 +1308,12 @@ static void rebuild_menus(void)
     s_menus[2].n = 0;
     set_item(&s_menus[2], "About...", ID_ABOUT, true);
 
-    dsk_menu_set(s_menus, 3);
+    /*
+     * The fourth is the context menu: filled when somebody asks for it and
+     * never drawn on the bar (dsk_menu_t::hidden).
+     */
+    s_menus[3].hidden = true;
+    dsk_menu_set(s_menus, 4);
 }
 
 static void about_done(dsk_answer_t a, void *ctx)
@@ -1264,6 +1367,9 @@ static void menu_chose(uint16_t id)
         break;
     case ID_DELETE:
         ask_delete();
+        break;
+    case ID_OPEN:
+        (void)dsk_folder_open_sel(dsk_wm_active());
         break;
     case ID_MKDIR:
         ask_mkdir();
@@ -1599,6 +1705,16 @@ static void on_pointer(dsk_ptr_t type, int16_t x, int16_t y, uint8_t buttons,
      * somebody is moving an icon over it, and then drop the icon back where it
      * started because the up-click never arrived here either.
      */
+    /*
+     * Anything but the press itself ends the hold, and this is asked before
+     * the drag branch below rather than after it: that branch takes every
+     * move while an icon is being dragged and returns, so a hold judged
+     * after it never saw the hand move.  The context menu duly popped up in
+     * the middle of dragging an icon, which is the one moment it must not.
+     */
+    if (type != DSK_PTR_DOWN || (buttons & 1u) == 0) {
+        s_press.armed = false;
+    }
     if (s_drag.which >= 0) {
         if (type == DSK_PTR_MOVE && (buttons & 1u) != 0) {
             drag_icon_to(x, y);
@@ -1623,11 +1739,27 @@ static void on_pointer(dsk_ptr_t type, int16_t x, int16_t y, uint8_t buttons,
     if (fdrag_pointer(type, x, y, buttons)) {
         return;
     }
+    if (type == DSK_PTR_DOWN && (buttons & 2u) != 0) {
+        (void)dsk_wm_pointer(type, x, y, buttons, false); /* pick what is under it */
+        context_menu_at(x, y);
+        return;
+    }
     if (dsk_wm_pointer(type, x, y, buttons, dbl)) {
         if (type == DSK_PTR_DOWN && !dbl) {
             fdrag_arm(x, y);
+            s_press.armed = true;
+            s_press.x = x;
+            s_press.y = y;
+            s_press.at = now;
         }
         return;
+    }
+    if (type == DSK_PTR_DOWN && !dbl) {
+        /* On the desk, where no window took it: the hold still counts. */
+        s_press.armed = true;
+        s_press.x = x;
+        s_press.y = y;
+        s_press.at = now;
     }
     /* Nothing wanted it: the click was on the desktop itself. */
     if (type == DSK_PTR_UP) {
@@ -2058,6 +2190,7 @@ int ag_main(int argc, char **argv)
          * it was.
          */
         wait = soonest(wait, dsk_term_due_in(now));
+        wait = soonest(wait, press_due_in(now));
         ag_event_t ev;
 
         if (deadline_s != 0u) {
@@ -2141,6 +2274,7 @@ int ag_main(int argc, char **argv)
         }
         dsk_dlg_tick(now);
         status_settle(now);
+        press_settle(now);
         if (dsk_term_due_in(now) == 0u) {
             dsk_term_tick();
         }

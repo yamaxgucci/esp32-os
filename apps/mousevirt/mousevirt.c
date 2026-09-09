@@ -118,12 +118,26 @@ static void handle_pkt(mousevirt_state_t *st, const mousevirt_pkt_t *pkt)
         inject_ptr(st, AG_EV_WHEEL, pkt->wheel);
     }
 
-    if ((cur & 1u) && !(prev & 1u)) {
+    /*
+     * An edge on any button, not just the first.
+     *
+     * It used to be the first alone, and that made this driver lie about the
+     * hardware it stands in for: a real mouse comes in through hidptr, which
+     * emits a down and an up per bit, so a right button that arrived here as
+     * a plain move with a mask set was a right button no application could
+     * see.  The context menu was written, built and driven by a script that
+     * pressed the right button eleven times without one of them arriving.
+     */
+    const uint8_t edges = (uint8_t)(cur ^ prev);
+    if (edges != 0u) {
         flush_move(st);
-        inject_ptr(st, AG_EV_POINTER_DOWN, 0);
-    } else if (!(cur & 1u) && (prev & 1u)) {
-        flush_move(st);
-        inject_ptr(st, AG_EV_POINTER_UP, 0);
+        for (uint8_t bit = 1u; bit != 0u; bit = (uint8_t)(bit << 1)) {
+            if ((edges & bit) == 0u) {
+                continue;
+            }
+            inject_ptr(st, (cur & bit) ? AG_EV_POINTER_DOWN
+                                       : AG_EV_POINTER_UP, 0);
+        }
     } else {
         /* Coalesce moves: a slow guest would overflow the 64-event queue. */
         st->pending_move = 1;

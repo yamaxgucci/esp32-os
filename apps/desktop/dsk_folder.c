@@ -507,6 +507,16 @@ static bool folder_pointer(dsk_win_t *w, dsk_hit_t where, int16_t x, int16_t y,
     return true;
 }
 
+bool dsk_folder_open_sel(dsk_win_t *w)
+{
+    folder_t *f = (w != NULL) ? (folder_t *)w->user : NULL;
+    if (f == NULL || !dsk_folder_is(w) || f->sel < 0 || f->sel >= f->n) {
+        return false;
+    }
+    activate(w, f->sel);
+    return true;
+}
+
 static bool folder_key(dsk_win_t *w, uint16_t keycode, uint32_t unicode,
                        uint16_t mods)
 {

@@ -56,4 +56,12 @@ bool dsk_folder_selected(const dsk_win_t *w, char *path, size_t len,
  */
 void dsk_folder_select_name(dsk_win_t *w, const char *name);
 
+/*
+ * Open what is picked, the way Enter and a double-click do.
+ *
+ * For the context menu, whose first item has to be the obvious one: a finger
+ * that has just held a row down is not in a position to double-tap it.
+ */
+bool dsk_folder_open_sel(dsk_win_t *w);
+
 #endif /* ARGON_DSK_FOLDER_H */

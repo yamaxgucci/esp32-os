@@ -19,6 +19,9 @@ static void (*s_chose)(uint16_t id);
 static dsk_menu_t *s_menus;
 static int         s_n;
 static int         s_open = -1; /* which title is dropped down, -1 for none */
+/* Where a popped-up menu was asked for; s_pop_x < 0 means "under its title". */
+static int16_t     s_pop_x = -1;
+static int16_t     s_pop_y = -1;
 static int         s_hi = -1;   /* which item is highlighted                */
 
 static size_t label_len(const char *s)
@@ -72,7 +75,7 @@ bool dsk_menu_open(void) { return s_open >= 0; }
 dsk_rect_t dsk_menu_title_rect(int which)
 {
     if (s_menus == NULL || which < 0 || which >= s_n ||
-        dsk_rect_empty(s_m.menubar)) {
+        dsk_rect_empty(s_m.menubar) || s_menus[which].hidden) {
         return dsk_rect_none();
     }
     int16_t at = PAD_X;
@@ -119,7 +122,10 @@ dsk_rect_t dsk_menu_drop_rect(int which)
     const dsk_rect_t t = dsk_menu_title_rect(which);
     int16_t          w = drop_width(mn);
     const int16_t    h = drop_height(mn);
-    int16_t          x = t.x;
+    const bool       popped = (which == s_open && s_pop_x >= 0);
+    int16_t          x = popped ? s_pop_x : t.x;
+    int16_t          y = popped ? s_pop_y
+                                : (int16_t)(s_m.menubar.y + s_m.menubar.h);
 
     if (w > s_m.screen_w) {
         w = s_m.screen_w;
@@ -131,7 +137,17 @@ dsk_rect_t dsk_menu_drop_rect(int which)
     if (x < 0) {
         x = 0;
     }
-    return dsk_rect(x, (int16_t)(s_m.menubar.y + s_m.menubar.h), w, h);
+    if (popped) {
+        /* And the same downwards: a menu asked for near the bottom edge grows
+         * up from the point rather than off the glass. */
+        if (y + h > s_m.screen_h) {
+            y = (int16_t)(s_m.screen_h - h);
+        }
+        if (y < 0) {
+            y = 0;
+        }
+    }
+    return dsk_rect(x, y, w, h);
 }
 
 dsk_rect_t dsk_menu_item_rect(int which, int item)
@@ -273,8 +289,22 @@ static void open_at(int which)
     }
 }
 
+void dsk_menu_popup(int which, int16_t x, int16_t y)
+{
+    const dsk_menu_t *mn = dsk_menu_get(which);
+    if (mn == NULL || mn->n == 0) {
+        return;
+    }
+    dsk_menu_close();
+    s_pop_x = x;
+    s_pop_y = y;
+    open_at(which);
+}
+
 void dsk_menu_close(void)
 {
+    s_pop_x = -1;
+    s_pop_y = -1;
     if (s_open < 0) {
         return;
     }

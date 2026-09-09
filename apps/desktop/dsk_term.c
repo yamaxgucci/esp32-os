@@ -211,7 +211,14 @@ dsk_win_t *dsk_term_open(const dsk_metrics_t *m)
 uint32_t dsk_term_due_in(uint32_t now)
 {
     if (s_win == NULL) {
-        return 0u; /* nothing to poll: no deadline of its own */
+        /*
+         * No deadline, which in this loop is UINT32_MAX and not zero: zero
+         * means "already due".  It said zero, so with the console window shut
+         * - which is nearly always - the shell's wait was nought and the main
+         * loop spun instead of sleeping.  A shell showing a still picture is
+         * supposed to cost nothing.
+         */
+        return UINT32_MAX;
     }
     const uint32_t since = now - s_polled_at;
     return (since >= TERM_POLL_MS) ? 0u : (TERM_POLL_MS - since);

@@ -36,6 +36,12 @@ typedef struct {
     const char      *title;
     dsk_menu_item_t  items[DSK_MENU_ITEMS_MAX];
     uint8_t          n;
+    /*
+     * A menu with no place on the bar: it only ever appears where somebody
+     * asked for it (dsk_menu_popup).  The bar neither draws its title nor
+     * hit-tests it, so it cannot be opened by accident.
+     */
+    bool             hidden;
 } dsk_menu_t;
 
 /*
@@ -52,6 +58,17 @@ void dsk_menu_set(dsk_menu_t *menus, int n);
 dsk_menu_t *dsk_menu_get(int which);
 
 bool dsk_menu_open(void); /* is a drop-down showing? */
+
+/*
+ * Drop `which` at a point instead of under its title.
+ *
+ * For a context menu, which this shell has because a finger has no second
+ * button and no keyboard beside it: a long press has to reach the same items
+ * a mouse reaches with the right one.  The rectangle is slid back onto the
+ * screen the way a drop-down already is, on both axes - a menu opened near
+ * the bottom edge grows upwards rather than off the glass.
+ */
+void dsk_menu_popup(int which, int16_t x, int16_t y);
 void dsk_menu_close(void);
 
 /* Where a title sits on the bar, for hit-testing and for drawing. */
