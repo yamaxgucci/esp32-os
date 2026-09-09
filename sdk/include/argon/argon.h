@@ -167,6 +167,19 @@ static inline void ag_fill(uint16_t x, uint16_t y, uint16_t w, uint16_t h,
  * anything above ASCII - the byte for a Cyrillic letter is not the same in 866 as
  * in 1251, and 1251 has no box drawing at all.
  */
+/*
+ * The console's own cells, for an application that draws the console itself.
+ * `max` is how many cells `cells` holds; the answer is how many were written.
+ */
+static inline int32_t ag_con_peek_row(uint16_t row, ag_textcell_t *cells,
+                                      uint16_t max)
+{
+    if (!AG_HAS(g_ag_api->con, peek_row) || g_ag_api->con->peek_row == NULL) {
+        return -AG_ENOTSUP;
+    }
+    return g_ag_api->con->peek_row(row, cells, max);
+}
+
 static inline uint16_t ag_codepage(void) { return g_ag_api->con->codepage(); }
 static inline ag_err_t ag_set_codepage(uint16_t number)
 {

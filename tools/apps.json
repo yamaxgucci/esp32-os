@@ -45,6 +45,7 @@
               "apps/desktop/dsk_dlg.c", "apps/desktop/dsk_icons.c",
               "apps/desktop/dsk_folder.c", "apps/desktop/dsk_run.c",
               "apps/desktop/dsk_ops.c", "apps/desktop/dsk_ini.c",
+              "apps/desktop/dsk_term.c",
               "apps/common/fsops/fsops.c", "apps/common/fsops/fsops_argon.c"]
     },
     {

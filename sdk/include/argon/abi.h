@@ -146,7 +146,7 @@ extern "C" {
  *      column and row by the cell size on the way in.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 42u
+#define AG_ABI_MINOR 43u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -401,6 +401,17 @@ enum ag_color {
     AG_LRED, AG_LMAGENTA, AG_YELLOW, AG_WHITE,
 };
 
+/*
+ * One cell of a text screen: the byte and its CGA attribute.
+ *
+ * Declared here rather than beside the display vtable that first needed it,
+ * because the console reads its own screen back into these too (peek_row).
+ */
+typedef struct {
+    uint8_t ch;
+    uint8_t attr;
+} ag_textcell_t;
+
 /* Attribute byte, CGA-compatible layout: bg << 4 | fg. */
 #define AG_ATTR(fg, bg) ((uint8_t)(((bg) << 4) | ((fg) & 0x0f)))
 
@@ -465,6 +476,25 @@ typedef struct ag_con_api {
      */
     uint16_t (*codepage)(void);
     ag_err_t (*set_codepage)(uint16_t number);
+
+    /*
+     * Read the screen back, one row at a time (ABI 0.43).
+     *
+     * The console draws itself, on whatever it has: a framebuffer, a panel's
+     * text cells, a serial terminal.  An application that wants to show the
+     * console inside a window of its own - a desktop shell with a console
+     * window in it - cannot use any of those; it needs the cells.
+     *
+     * A row rather than the whole screen, because the caller decides what to
+     * keep: eighty cells is a hundred and sixty bytes, where a screen is two
+     * kilobytes that a caller redrawing one changed line would throw away.
+     *
+     * Returns the number of cells written (never more than `max` or the
+     * screen's width), or a negative error.  Refused for a process that is not
+     * the console's - the same rule ag_poke follows, and for the same reason:
+     * the console belongs to the foreground.
+     */
+    int32_t (*peek_row)(uint16_t row, ag_textcell_t *cells, uint16_t max);
 } ag_con_api_t;
 
 /* ------------------------------------------------------------------------ */
@@ -785,11 +815,6 @@ typedef struct ag_input_ops {
  * nibble background, low nibble foreground, as they have been since CGA.  What
  * the byte means is the code page's business (con->codepage).
  */
-typedef struct {
-    uint8_t ch;
-    uint8_t attr;
-} ag_textcell_t;
-
 /*
  * Class vtable for AG_DEV_DISPLAY devices, returned by dev->ops(h).
  * Compact subset of ag_gfx_api_t keyed by the open handle — for drivers that

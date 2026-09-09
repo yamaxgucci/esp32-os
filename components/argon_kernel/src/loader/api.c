@@ -388,6 +388,45 @@ static void api_fill(uint16_t x, uint16_t y, uint16_t w, uint16_t h, char ch,
     ag_console_unlock();
 }
 
+/*
+ * The console's cells, read back (ABI 0.43).
+ *
+ * Under the console lock, because a row is copied out of the live screen and
+ * the console writes to it from another task - a torn row would be a line of
+ * text with half of two different messages in it, which is the kind of thing
+ * that gets blamed on the reader.
+ */
+static int32_t api_peek_row(uint16_t row, ag_textcell_t *cells, uint16_t max)
+{
+    if (cells == NULL || max == 0) {
+        return -AG_EINVAL;
+    }
+    if (!has_console_focus()) {
+        return -AG_EPERM;
+    }
+
+    int32_t written = -AG_ENODEV;
+
+    ag_console_lock();
+    const ag_screen_t *sc = ag_console_screen();
+    if (sc != NULL && row < sc->rows) {
+        const ag_cell_t *src = ag_screen_row(sc, row);
+        if (src != NULL) {
+            uint16_t n = sc->cols;
+            if (n > max) {
+                n = max;
+            }
+            for (uint16_t i = 0; i < n; i++) {
+                cells[i].ch = (uint8_t)src[i].ch;
+                cells[i].attr = src[i].attr;
+            }
+            written = (int32_t)n;
+        }
+    }
+    ag_console_unlock();
+    return written;
+}
+
 static uint16_t api_codepage(void) { return ag_cp_number(ag_cp_active()); }
 
 static ag_err_t api_set_codepage(uint16_t number)
@@ -423,6 +462,7 @@ static const ag_con_api_t k_con = {
     .fill = api_fill,
     .codepage = api_codepage,
     .set_codepage = api_set_codepage,
+    .peek_row = api_peek_row,
 };
 
 /* ---------------------------------------------------------------------- */

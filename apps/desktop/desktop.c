@@ -30,6 +30,7 @@
 #include "dsk_ops.h"
 #include "dsk_paint.h"
 #include "dsk_run.h"
+#include "dsk_term.h"
 #include "dsk_wm.h"
 
 /*
@@ -515,6 +516,7 @@ enum {
     ID_CLOSE,
     ID_CLOSE_ALL,
     ID_ABOUT,
+    ID_CONSOLE,
     ID_WINDOW_FIRST = 100, /* + the window's z index */
 };
 
@@ -1069,6 +1071,13 @@ static void rebuild_menus(void)
     set_item(&s_menus[1], "Close all", ID_CLOSE_ALL, n > 0);
     set_separator(&s_menus[1]);
     set_item(&s_menus[1], "Arrange icons", ID_ARRANGE, s_ndrives > 0);
+    set_separator(&s_menus[1]);
+    /*
+     * Under Window rather than under File: it opens a window onto something
+     * the machine already has, which is what every other item here does.  What
+     * it shows - and what it deliberately does not do yet - is in dsk_term.h.
+     */
+    set_item(&s_menus[1], "System console", ID_CONSOLE, true);
     if (n > 0) {
         set_separator(&s_menus[1]);
     }
@@ -1173,6 +1182,20 @@ static void menu_chose(uint16_t id)
         break;
     case ID_ARRANGE:
         arrange_icons();
+        break;
+    case ID_CONSOLE:
+        if (dsk_term_open(&s_m) == NULL) {
+            s_note = "no room for another window";
+            damage(s_m.statusbar);
+        } else {
+            /*
+             * Said on the console, which is also what the window now shows -
+             * so the line appears inside it, which is a demonstration as well
+             * as a trace.  A script driving this shell cannot read pixels, and
+             * "the window opened" is otherwise unobservable from outside.
+             */
+            ag_printf("desktop: console window opened\n");
+        }
         break;
     case ID_ABOUT: {
         /*
@@ -1882,6 +1905,13 @@ int ag_main(int argc, char **argv)
          */
         uint32_t   now = ag_millis();
         uint32_t   wait = soonest(status_due_in(now), dsk_dlg_wait_ms(now));
+        /*
+         * The console window polls, because the console changes without
+         * telling anybody: a driver logs, a background process prints.  With
+         * the window shut this asks for nothing and the wait stays as long as
+         * it was.
+         */
+        wait = soonest(wait, dsk_term_due_in(now));
         ag_event_t ev;
 
         if (deadline_s != 0u) {
@@ -1965,6 +1995,9 @@ int ag_main(int argc, char **argv)
         }
         dsk_dlg_tick(now);
         status_settle(now);
+        if (dsk_term_due_in(now) == 0u) {
+            dsk_term_tick();
+        }
         commit();
     }
 

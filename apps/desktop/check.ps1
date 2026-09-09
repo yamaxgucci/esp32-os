@@ -366,14 +366,40 @@ try {
                 (1..8 | ForEach-Object { 'key down' }) +
                 @('wait 300', 'key enter', "wait $settle")
 
+    # Window > System console, the last item of that menu (Cascade, Tile,
+    # Close, Close all, Arrange icons, System console - the arrows skip
+    # separators).  Inside the one keyboard pass rather than a step of its own,
+    # and that is not tidiness: every invocation of inputplay opens a fresh
+    # connection to KBDVIRT, and this file's own header records what a run with
+    # six of them delivered - eleven keystrokes of sixty-nine.  It also puts
+    # the console window in BOTH photographs, so the repaint comparison covers
+    # a window whose content the shell does not own.
+    #
+    # Before the properties box rather than after: that box is modal, and while
+    # one is up the menu bar is fed nothing at all.  A console step after it
+    # photographed the dialog closing and called it a console window.
+    $openConsole = @('key f10', 'wait 400', 'key right', 'wait 300') +
+                   (1..6 | ForEach-Object { 'key down' }) +
+                   @('wait 300', 'key enter', 'wait 1200')
+
+    # Opening a window activates it, so the folder window has to be brought
+    # back before anything that acts on a selection: Properties on the console
+    # window is Properties on nothing, and the dialog never opens.  The Window
+    # menu lists the windows topmost first after its own items, so the eighth
+    # entry is the one underneath the console.
+    $backToFolder = @('key f10', 'wait 400', 'key right', 'wait 300') +
+                    (1..8 | ForEach-Object { 'key down' }) +
+                    @('wait 300', 'key enter', 'wait 800')
+
     $keyboard = $runHello + $runGfx + $opsMkdir + $opsCopy + $opsDelete +
-                $opsRename + $opsProps
+                $opsRename + $openConsole + $backToFolder + $opsProps
     $quoted = ($moves | ForEach-Object { '"' + $_ + '"' }) -join ' '
     $after = @('"key f5"', ('"wait ' + $settle + '"')) -join ' '
     # The properties box is deliberately still up for both photographs - it is
     # a modal window, and whether a full repaint puts it back is exactly the
     # kind of thing the two-photograph criterion is for.  Enter dismisses it
-    # afterwards, so the count of windows left is the one folder window.
+    # afterwards, leaving the folder window and the console window: what each
+    # of those is worth is asserted at the bottom.
     $closing = @('"key enter"', '"wait 600"') -join ' '
 
     $send = @(
@@ -609,6 +635,20 @@ try {
         $b.Dispose()
     }
 
+    # ---- the console window ----------------------------------------------
+    #
+    # It shows the kernel's console inside a window of the shell's own, which
+    # nothing else here does: every other window draws what the shell itself
+    # decided.  Two things say it worked.  This line, which the shell prints
+    # when the window opens - and prints ON the console, so it lands inside the
+    # window it is announcing.  And the two photographs above, which now
+    # include the window: cells that reached the panel once and not on a
+    # repaint would show up there, and the console's content is static by this
+    # point (the last thing to print was a program that has already exited).
+    if ($text -notmatch 'desktop: console window opened') {
+        $fail += 'the console window never opened'
+    }
+
     $m = [regex]::Match($text,
                         'desktop: surface (\d+)x(\d+) (\w+), focus (\w+)')
     if ($m.Success) {
@@ -679,8 +719,12 @@ try {
         # Four opened from the menu, two closed with Alt+F4.  A different
         # number means a menu that did not open, a click that missed, or a
         # close that did not close - and the picture alone would not say which.
-        if ($win -ne 1) {
-            $fail += "$win windows were left open, not the one the sequence should leave"
+        # Two: the folder window this sequence opened and the console window,
+        # which is deliberately left open - what the second run then restores
+        # says whether a window with no folder behind it stays out of the
+        # arrangement, which is the rule DESKTOP.INI is written by.
+        if ($win -ne 2) {
+            $fail += "$win windows were left open, not the two the sequence should leave"
         }
     } else {
         $fail += 'the shell did not print its counts (it may have been killed)'
@@ -703,8 +747,12 @@ try {
         if ($rPtr -ne 0 -or $rKey -ne 0) {
             $fail += "the second run was not left alone ($rPtr pointer, $rKey key events), so it proves nothing"
         }
+        # One, not two: the console window is not part of an arrangement -
+        # it shows a thing the machine has rather than a place on a disk, and
+        # DESKTOP.INI records places.  A second run with two windows would mean
+        # the shell had written down a window it cannot put back.
         if ($rWin -ne 1) {
-            $fail += "the second run had $rWin windows open, not the one it was left with"
+            $fail += "the second run had $rWin windows open, not the one folder window it should restore"
         }
     }
 
