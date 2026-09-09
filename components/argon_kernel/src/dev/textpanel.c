@@ -217,9 +217,17 @@ static void render_locked(const ag_screen_t *screen)
 
     uint16_t cols = screen->cols;
     uint16_t rows = screen->rows;
+    /*
+     * What the panel has, as opposed to what the console uses.  A 320x240
+     * panel is 40x30 cells; a console of 40x25 leaves five rows - forty
+     * pixels - that belong to nobody, and the console never writes there
+     * because as far as it is concerned they do not exist.
+     */
+    uint16_t panel_rows = rows;
     if (ops->text_info != NULL) {
         uint16_t pcols = cols, prows = rows;
         if (ops->text_info(0, &pcols, &prows) == AG_OK) {
+            panel_rows = prows;
             if (pcols < cols) {
                 cols = pcols;
             }
@@ -265,6 +273,33 @@ static void render_locked(const ag_screen_t *screen)
         /* A repainted row has painted over the caret. */
         if (y == s_caret_row) {
             s_caret_lit = false;
+        }
+    }
+
+    /*
+     * The rows the panel has and the console does not.
+     *
+     * Only on a full repaint, which is exactly the moment they matter: the
+     * panel has just appeared, or an application has just given the glass
+     * back.  A released application leaves its last frame on the whole panel
+     * and the console then repaints its own rows over it - so what a person
+     * sees is text on top and a band of somebody else's picture along the
+     * bottom, for ever, because nothing up here believes those rows exist.
+     * Reported as "the console does not finish redrawing the screen", and it
+     * is precisely that: it finished its screen, which is smaller than the
+     * glass.
+     *
+     * Blanked as text rather than as pixels because text is the only road
+     * this file has to the panel, and a row of spaces in the current attribute
+     * is what the console would have put there had it been that tall.
+     */
+    if (full && panel_rows > rows) {
+        for (uint16_t x = 0; x < cols; x++) {
+            s_row[x].ch = ' ';
+            s_row[x].attr = AG_ATTR_DEFAULT;
+        }
+        for (uint16_t y = rows; y < panel_rows; y++) {
+            ops->text_row(0, y, s_row, cols);
         }
     }
 

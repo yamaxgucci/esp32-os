@@ -595,6 +595,15 @@ static void gfx_release(void)
     if (!s_acquired) {
         return;
     }
+    /*
+     * Who lost the glass, and to whom.  A release is invisible from outside
+     * and there are four roads into it, three of them force_release from the
+     * session; when an application is still running but its flushes have
+     * silently stopped reaching the panel, this line is the difference between
+     * knowing and guessing.
+     */
+    ag_log(AG_LOG_INFO, "display", "release: owner pid %u, by pid %u",
+           (unsigned)s_owner, (unsigned)ag_proc_self());
     if (s_surfaceless) {
         s_acquired = false;
         s_owner = AG_PID_KERNEL;

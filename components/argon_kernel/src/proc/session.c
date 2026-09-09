@@ -452,10 +452,45 @@ static void enter_loading_view(int slot, ag_pid_t pid)
 {
     const char *name = s_slots[slot].name[0] ? s_slots[slot].name : "app";
 
+    /*
+     * Unless it is already painting.
+     *
+     * "Loading" is a state of the loader, not of the application: a process is
+     * adopted into its slot a little after it starts running, and a small .AXE
+     * on a fast panel can acquire the display and put a whole frame on the
+     * glass inside that window.  Entering the loading view then took the
+     * screen away from a running application - `display: release: owner pid 1,
+     * by pid 0` - and nothing ever gave it back: every later flush was dropped
+     * without a word, no input reached it, and what a person saw was a console
+     * over the top of one frozen frame.  Reported as "the shell loaded and
+     * seems to have crashed", which is exactly what it looks like.
+     *
+     * The view exists to say "this app cannot paint yet".  An app that has
+     * already painted needs nothing said for it.
+     */
+    if (ag_display_acquired() && ag_display_owner() == pid) {
+        ag_log(AG_LOG_INFO, "session",
+               "loading view skipped: pid %u already owns the display",
+               (unsigned)pid);
+        return;
+    }
+
     ag_log(AG_LOG_INFO, "session", "enter_loading_view slot %d pid %u (%s)",
            ag_session_display_number(slot), (unsigned)pid, name);
 
-    if (ag_display_acquired()) {
+    /*
+     * Asked again, and about the owner rather than about the lock.
+     *
+     * The check above cannot be the only one: ag_log goes out of a UART at
+     * 115200 baud and the line above costs a couple of hundred milliseconds,
+     * which is long enough for the application to acquire the display in
+     * between.  That is not a theoretical window - it is the one this ran into
+     * on the CYD, where the check said "free", the log went out, and the
+     * release then took the glass from a process that had already painted.
+     *
+     * Whose it is decides, and never this process's own.
+     */
+    if (ag_display_acquired() && ag_display_owner() != pid) {
         ag_display_force_release();
     }
 
