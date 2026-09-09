@@ -54,7 +54,14 @@ param(
     # three said anything about a deadline.
     [int]$Seconds = 120,
     [string]$Out = 'build\desktop',
-    [switch]$NoBuild
+    [switch]$NoBuild,
+    # Give the shell no surface at all, so it rasterises in bands straight to
+    # the panel (apps\desktop\dsk_paint_band.c).  Everything below then tests
+    # the OTHER backend, and the two-photograph rule is what makes it worth
+    # doing: a strip the shell drew and the panel never received looks exactly
+    # like a strip the shell forgot, and only the repaint comparison tells them
+    # apart.  It is how the kernel refusing every narrow band was found.
+    [switch]$Bands
 )
 
 $ErrorActionPreference = 'Stop'
@@ -106,7 +113,7 @@ try {
     $sysfs = Join-Path $work 'sysfs.bin'
     $mkArgs = @('tools\mksysfs.py', '--board', 'none',
                 '--partitions', 'partitions.csv',
-                '--display', 'soft',
+                '--display', $(if ($Bands) { 'panel' } else { 'soft' }),
                 '--out', $sysfs,
                 '--add', ((Join-Path $work 'SYSTEM.CFG') + '=SYSTEM.CFG'),
                 '--add', 'build\apps\KBDVIRT.SYS=drv/kbdvirt.sys',
@@ -453,10 +460,30 @@ try {
     if ($text -match 'desktop: this display has no surface') {
         $fail += 'the display had no surface (the band renderer is not built)'
     }
+    if ($Bands) {
+        if ($text -notmatch 'desktop: surface \d+x\d+ bands') {
+            $fail += 'asked for no surface, but the shell did not go into bands'
+        }
+        # A refused present is invisible in the picture: it looks like a
+        # region nothing was drawn in.  The backend says it once, and this is
+        # the only place that would ever read it.
+        if ($text -match 'present .* refused') {
+            $fail += 'the panel refused a band - see the transcript for the code'
+        }
+    } elseif ($text -match 'desktop: surface \d+x\d+ bands') {
+        $fail += 'the shell went into bands with a surface available'
+    }
     if ($text -match 'desktop: cannot take the display') {
         $fail += 'the display was already owned by something else'
     }
-    if ($text -notmatch 'QEMU RGB window') {
+    # The soft path says "as fb0 + QEMU RGB window" when it attaches the
+    # emulated screen; the surfaceless path says "panel0 takes rectangles"
+    # about the same screen, so each mode is asked for its own line.
+    if ($Bands) {
+        if ($text -notmatch 'panel0 takes rectangles') {
+            $fail += 'the emulator gave no rectangle-taking panel - graphics=on?'
+        }
+    } elseif ($text -notmatch 'QEMU RGB window') {
         $fail += 'the emulator has no RGB panel - was it started without graphics=on?'
     }
     # ---- launching -------------------------------------------------------

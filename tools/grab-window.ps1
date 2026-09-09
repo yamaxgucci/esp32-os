@@ -48,6 +48,8 @@ public class Win {
   [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
   [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr dc, uint f);
   [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr h, out R r);
+  [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
   [StructLayout(LayoutKind.Sequential)] public struct R { public int L, T, Rr, B; }
 
   public struct Found { public IntPtr H; public string Title; public uint Pid; public int W; public int Ht; }
@@ -56,6 +58,11 @@ public class Win {
   // client area first: QEMU can have more than one (a monitor window), and the
   // panel is the big one.
   public static List<Found> Windows(string needle, uint wantPid) {
+    return Windows(needle, wantPid, false);
+  }
+
+  /* anySize: keep windows whose client area is 0x0 - a minimised one. */
+  public static List<Found> Windows(string needle, uint wantPid, bool anySize) {
     var hits = new List<Found>();
     EnumWindows(delegate(IntPtr h, IntPtr p) {
       if (!IsWindowVisible(h)) return true;
@@ -69,7 +76,7 @@ public class Win {
       if (wantPid != 0 && pid != wantPid) return true;
       R r; if (!GetClientRect(h, out r)) return true;
       int w = r.Rr - r.L, ht = r.B - r.T;
-      if (w < 32 || ht < 32) return true;
+      if (!anySize && (w < 32 || ht < 32)) return true;
       var f = new Found(); f.H = h; f.Title = t; f.Pid = pid; f.W = w; f.Ht = ht;
       hits.Add(f);
       return true;
@@ -81,6 +88,28 @@ public class Win {
 '@
 
 $hits = [Win]::Windows($Title, [uint32]$OwnerPid)
+if ($hits.Count -eq 0) {
+    # A minimised window is "visible" to Win32 and has a client area of 0x0,
+    # so the size filter above drops it and this used to report no window at
+    # all while the window was in the taskbar.  QEMU opens minimised whenever
+    # something else owns the foreground - which on a working machine is most
+    # of the time - and PrintWindow gives nothing for an iconic window, so the
+    # only way to photograph it is to put it back up.
+    #
+    # Restoring it takes the foreground away from whoever had it.  That is
+    # rude, and it is still better than a test that reports a failure it
+    # cannot explain: the alternative is no picture, which is the one thing
+    # this harness exists to produce.
+    $iconic = [Win]::Windows($Title, [uint32]$OwnerPid, $true) |
+        Where-Object { [Win]::IsIconic($_.H) }
+    if ($iconic) {
+        Write-Host ("grab-window: '" + $iconic[0].Title +
+                    "' was minimised; restoring it to take the picture")
+        [void][Win]::ShowWindow($iconic[0].H, 9) # SW_RESTORE
+        Start-Sleep -Milliseconds 400
+        $hits = [Win]::Windows($Title, [uint32]$OwnerPid)
+    }
+}
 if ($hits.Count -eq 0) {
     throw "no visible window matching '$Title'$(if ($OwnerPid) { " for pid $OwnerPid" })"
 }

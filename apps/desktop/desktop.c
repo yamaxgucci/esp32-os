@@ -1810,10 +1810,16 @@ int ag_main(int argc, char **argv)
      * driving this cannot read the screen: the surface it got is the first
      * thing that has to be checkable from the transcript.
      */
-    ag_printf("desktop: %s %ux%u %s, focus %s\n",
-              banded ? "bands on" : "surface", (unsigned)info.width,
+    /*
+     * One grammar for both backends, with the mode as the third field:
+     * "single", "double" or "bands".  A script that watches for this line -
+     * apps/desktop/check.ps1 does, and it is the first checkable thing in the
+     * whole transcript - then needs no second rule to recognise the other
+     * kind of run.
+     */
+    ag_printf("desktop: surface %ux%u %s, focus %s\n", (unsigned)info.width,
               (unsigned)info.height,
-              banded ? "no frame" : (info.double_buf ? "double" : "single"),
+              banded ? "bands" : (info.double_buf ? "double" : "single"),
               ag_focused() ? "yes" : "no");
 
     dsk_metrics_init(&s_m, (int16_t)info.width, (int16_t)info.height);

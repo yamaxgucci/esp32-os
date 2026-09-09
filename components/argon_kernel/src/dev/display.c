@@ -430,6 +430,108 @@ static const ag_dev_ops_t k_fb_ops = {
     .size = fb_size,
 };
 
+/* ---------------------------------------------------------------------- */
+/* A surfaceless panel that is really a framebuffer - for the emulator     */
+/* ---------------------------------------------------------------------- */
+/*
+ * Why this shim exists.
+ *
+ * `[display] driver = panel` means "no system surface; the application brings
+ * its own pixels and hands them over as rectangles".  On a board that is
+ * literally true: the panel is a loadable .SYS with a blit_rect, and nothing
+ * here holds a frame.  Under QEMU it is not: the emulated screen is a
+ * framebuffer this port is handed a pointer to, and there is no driver that
+ * takes rectangles at all.  So surfaceless mode in the emulator had no panel,
+ * acquire answered -AG_ENODEV, and the whole path was untestable without
+ * hardware.
+ *
+ * That gap is not academic - it is exactly where a bug lived.  The stride
+ * check in gfx_present refused every band narrower than the screen, and the
+ * only machine that could have noticed was a board with a touchscreen and a
+ * person in front of it.  A frame-backed panel presented as a rectangle-taking
+ * device closes it: the same code path, the same present, in an emulator that
+ * can be photographed.
+ */
+static uint16_t *s_shim_fb;
+static uint16_t  s_shim_w, s_shim_h;
+
+static ag_err_t shim_info(ag_handle_t h, ag_gfxinfo_t *out)
+{
+    (void)h;
+    if (out == NULL || s_shim_fb == NULL) {
+        return -AG_ENODEV;
+    }
+    out->width = s_shim_w;
+    out->height = s_shim_h;
+    out->fmt = AG_PIX_RGB565;
+    out->stride = (uint32_t)s_shim_w * sizeof(uint16_t);
+    out->fb = NULL; /* not for drawing into: hand rectangles over */
+    out->double_buf = false;
+    out->direct = true;
+    return AG_OK;
+}
+
+static void shim_blit_rect(ag_handle_t h, const ag_blit_t *b)
+{
+    (void)h;
+    if (b == NULL || b->px == NULL || s_shim_fb == NULL) {
+        return;
+    }
+    if (b->x >= s_shim_w || b->y >= s_shim_h) {
+        return;
+    }
+    uint16_t w = b->w;
+    uint16_t hgt = b->h;
+    if (w > (uint16_t)(s_shim_w - b->x)) {
+        w = (uint16_t)(s_shim_w - b->x);
+    }
+    if (hgt > (uint16_t)(s_shim_h - b->y)) {
+        hgt = (uint16_t)(s_shim_h - b->y);
+    }
+    if (w == 0 || hgt == 0) {
+        return;
+    }
+    /*
+     * The stride is the rectangle's, not the picture's - which is the whole
+     * point of ag_blit_t and the thing this shim has to get right, because a
+     * band renderer hands over a tight buffer.
+     */
+    for (uint16_t row = 0; row < hgt; row++) {
+        const uint16_t *src =
+            (const uint16_t *)(const void *)((const uint8_t *)b->px +
+                                             (size_t)row * b->stride);
+        uint16_t *dst = s_shim_fb + (size_t)(b->y + row) * s_shim_w + b->x;
+        for (uint16_t i = 0; i < w; i++) {
+            dst[i] = src[i];
+        }
+    }
+    if (s_screen_on) {
+        ag_port_panel_present((int32_t)b->y, (int32_t)hgt);
+    }
+}
+
+static const ag_display_ops_t k_shim_class_ops = {
+    .size = sizeof(ag_display_ops_t),
+    .info = shim_info,
+    .blit_rect = shim_blit_rect,
+};
+
+/*
+ * A device needs byte ops as well as class ops - the registry refuses one
+ * without them - and for a screen the honest answer to "how big are you" is
+ * the frame it stands for.  Reading and writing it as bytes is fb0's job on
+ * machines that have an fb0; here there is deliberately no surface to expose.
+ */
+static uint64_t shim_bytes(ag_device_t *dev)
+{
+    (void)dev;
+    return (uint64_t)s_shim_w * (uint64_t)s_shim_h * sizeof(uint16_t);
+}
+
+static const ag_dev_ops_t k_shim_ops = {
+    .size = shim_bytes,
+};
+
 static ag_err_t gfx_acquire(ag_gfxinfo_t *out);
 static void     gfx_release(void);
 static void     gfx_flush(uint16_t x, uint16_t y, uint16_t w, uint16_t h);
@@ -1349,25 +1451,6 @@ ag_err_t ag_display_init(void)
         return AG_OK;
     }
 
-    /*
-     * No surface at all, and the panel driver does the showing.  Nothing is
-     * allocated and nothing is registered: fb0 would be a display device with
-     * no display in it.
-     */
-    if (ag_path_icmp(driver, "panel") == 0) {
-        s_surfaceless = true;
-        s_ready = true;
-        ag_log(AG_LOG_INFO, "display",
-               "no system surface; applications bring their own (present)");
-        return AG_OK;
-    }
-
-    /* Soft is the only backend without a board; unknown names fall back to it. */
-    if (ag_path_icmp(driver, "soft") != 0) {
-        ag_log(AG_LOG_WARN, "display",
-               "driver '%s' not built in; using soft framebuffer", driver);
-    }
-
     uint16_t w = board->display.width;
     uint16_t h = board->display.height;
     if (w == 0) {
@@ -1381,6 +1464,55 @@ ag_err_t ag_display_init(void)
     }
     if (h > AG_DISPLAY_MAX_H) {
         h = AG_DISPLAY_MAX_H;
+    }
+
+    /*
+     * No surface at all, and the panel driver does the showing.  Nothing is
+     * allocated: fb0 would be a display device with no display in it.
+     *
+     * One thing IS registered, and only where it applies - see the shim
+     * above: under QEMU the screen is a framebuffer this port owns rather
+     * than a driver that takes rectangles, and without a rectangle-taking
+     * device there is nothing for a surfaceless application to present to.
+     * On real hardware ag_port_panel_open fails and the panel .SYS is the
+     * device, which is the arrangement this mode was written for.
+     */
+    if (ag_path_icmp(driver, "panel") == 0) {
+        s_surfaceless = true;
+        s_ready = true;
+
+        void *fb = NULL;
+        if (ag_port_panel_open(w, h, &fb) && fb != NULL) {
+            s_shim_fb = (uint16_t *)fb;
+            s_shim_w = w;
+            s_shim_h = h;
+            const ag_dev_desc_t desc = {
+                .name = "panel0",
+                .driver = "fbpanel",
+                .cls = AG_DEV_DISPLAY,
+                .flags = 0,
+                .ops = &k_shim_ops,
+                .class_ops = &k_shim_class_ops,
+                .priv = fb,
+            };
+            if (ag_dev_register(&desc, &s_dev) == AG_OK) {
+                ag_log(AG_LOG_INFO, "display",
+                       "no system surface; %ux%u panel0 takes rectangles",
+                       (unsigned)w, (unsigned)h);
+                return AG_OK;
+            }
+            s_shim_fb = NULL;
+        }
+
+        ag_log(AG_LOG_INFO, "display",
+               "no system surface; applications bring their own (present)");
+        return AG_OK;
+    }
+
+    /* Soft is the only backend without a board; unknown names fall back to it. */
+    if (ag_path_icmp(driver, "soft") != 0) {
+        ag_log(AG_LOG_WARN, "display",
+               "driver '%s' not built in; using soft framebuffer", driver);
     }
 
     const size_t bytes = (size_t)w * (size_t)h * sizeof(uint16_t);
