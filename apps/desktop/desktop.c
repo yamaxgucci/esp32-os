@@ -1278,11 +1278,26 @@ static void draw_region(dsk_rect_t r)
  * the screen first, so that nothing is drawn under a stale copy of the pixels
  * it saved, and goes back on last.
  */
+/*
+ * How long the slowest frame took, and how long the slowest flush inside it.
+ *
+ * The worst one, not the average, and that is the whole point: an average
+ * frame rate on a screen driven over SPI says nothing about what a person
+ * sees, because what they see is the frame that stuttered.  Kept in
+ * microseconds because on this board the interesting ones are tens of
+ * thousands of them.
+ */
+static uint32_t s_worst_frame_us;
+static uint32_t s_worst_flush_us;
+static uint32_t s_frames;
+static uint64_t s_frame_total_us;
+
 static void commit(void)
 {
     if (s_damage.n == 0) {
         return;
     }
+    const uint32_t t0 = (uint32_t)ag_micros();
     dsk_damage_clip(&s_damage, s_m.screen);
 
     /*
@@ -1300,9 +1315,23 @@ static void commit(void)
 
     /* The pointer's square needs a flush even though it needed no repaint. */
     dsk_damage_add(&s_damage, dsk_cursor_rect());
+    const uint32_t t_flush = (uint32_t)ag_micros();
     for (uint8_t i = 0; i < s_damage.n; i++) {
         dsk_flush(s_damage.r[i]);
     }
+    const uint32_t now = (uint32_t)ag_micros();
+
+    const uint32_t flush_us = now - t_flush;
+    const uint32_t frame_us = now - t0;
+    if (flush_us > s_worst_flush_us) {
+        s_worst_flush_us = flush_us;
+    }
+    if (frame_us > s_worst_frame_us) {
+        s_worst_frame_us = frame_us;
+    }
+    s_frames++;
+    s_frame_total_us += frame_us;
+
     dsk_damage_clear(&s_damage);
 }
 
@@ -1577,6 +1606,96 @@ static bool next_event(ag_event_t *ev, uint32_t wait)
     return true;
 }
 
+/*
+ * The board measurement, with nobody at the desk.
+ *
+ * On a board there is no way to script a finger: the pointer is a resistive
+ * panel and the virtual input drivers need the radio, which on this board
+ * costs the UART buffers.  So the shell drives itself through the three
+ * things worth timing and prints what they cost.
+ *
+ * It is NOT a substitute for a finger and does not pretend to be: what it
+ * measures is what the SHELL costs - opening a directory, moving a window,
+ * repainting everything - with the touch latency left out, because that
+ * belongs to the panel and not to this.  A number that includes both would
+ * hide which half it came from.
+ */
+static void bench(void)
+{
+    char     line[96];
+    char     num[24];
+    uint32_t t0;
+
+    ag_printf("desktop: bench on a %dx%d surface\n", (int)s_m.screen_w,
+              (int)s_m.screen_h);
+
+    /* 1. A window onto C:\ - the read, the layout and the first paint. */
+    t0 = (uint32_t)ag_micros();
+    dsk_win_t *w = dsk_folder_open("c:\\");
+    const uint32_t open_us = (uint32_t)ag_micros() - t0;
+    if (w == NULL) {
+        ag_printf("desktop: bench: no window\n");
+        return;
+    }
+    t0 = (uint32_t)ag_micros();
+    commit();
+    const uint32_t first_paint_us = (uint32_t)ag_micros() - t0;
+
+    /* 2. The window moved across the work area, one step at a time, painting
+     *    every step - which is what a drag costs once the outline is off. */
+    s_worst_frame_us = 0;
+    s_worst_flush_us = 0;
+    s_frames = 0;
+    s_frame_total_us = 0;
+
+    const dsk_rect_t start = w->frame;
+    const int16_t    span = (int16_t)(s_m.work.w - start.w);
+    for (int i = 1; i <= 16; i++) {
+        dsk_rect_t f = start;
+        f.x = (int16_t)(s_m.work.x + (span > 0 ? span * i / 16 : 0));
+        dsk_wm_move(w, f);
+        commit();
+    }
+    const uint32_t drag_worst = s_worst_frame_us;
+    const uint32_t drag_flush = s_worst_flush_us;
+    const uint32_t drag_mean =
+        (s_frames > 0) ? (uint32_t)(s_frame_total_us / s_frames) : 0;
+
+    /* 3. Everything, once - what F5 costs, and the floor for any full repaint. */
+    s_worst_frame_us = 0;
+    damage(s_m.screen);
+    commit();
+    const uint32_t full_us = s_worst_frame_us;
+
+    ag_strlcpy(line, "desktop: open c: ", sizeof(line));
+    ag_strlcat(line, ag_utoa(open_us / 1000u, num, sizeof(num), 0, false),
+               sizeof(line));
+    ag_strlcat(line, " ms, first paint ", sizeof(line));
+    ag_strlcat(line, ag_utoa(first_paint_us / 1000u, num, sizeof(num), 0, false),
+               sizeof(line));
+    ag_strlcat(line, " ms, full repaint ", sizeof(line));
+    ag_strlcat(line, ag_utoa(full_us / 1000u, num, sizeof(num), 0, false),
+               sizeof(line));
+    ag_strlcat(line, " ms", sizeof(line));
+    ag_printf("%s\n", line);
+
+    ag_strlcpy(line, "desktop: drag worst ", sizeof(line));
+    ag_strlcat(line, ag_utoa(drag_worst / 1000u, num, sizeof(num), 0, false),
+               sizeof(line));
+    ag_strlcat(line, " ms, mean ", sizeof(line));
+    ag_strlcat(line, ag_utoa(drag_mean / 1000u, num, sizeof(num), 0, false),
+               sizeof(line));
+    ag_strlcat(line, " ms, worst flush ", sizeof(line));
+    ag_strlcat(line, ag_utoa(drag_flush / 1000u, num, sizeof(num), 0, false),
+               sizeof(line));
+    ag_strlcat(line, " ms over 16 steps", sizeof(line));
+    ag_printf("%s\n", line);
+
+    dsk_wm_close(w);
+    damage(s_m.screen);
+    commit();
+}
+
 int ag_main(int argc, char **argv)
 {
     ag_gfxinfo_t info;
@@ -1657,6 +1776,12 @@ int ag_main(int argc, char **argv)
     dsk_damage_clear(&s_damage);
     damage(s_m.screen);
     commit();
+
+    for (int i = 1; i < argc; i++) {
+        if (ag_stricmp(argv[i], "-bench") == 0) {
+            bench();
+        }
+    }
 
     const uint32_t deadline_s = parse_seconds(argc, argv);
     const uint32_t started = ag_millis();
