@@ -46,9 +46,11 @@
  * somewhere else.
  *
  * It is not the final word, though.  `[console] cols/rows` in SYSTEM.CFG is
- * applied once the devices are up (see apply_console_size), so the size is a
- * line in a file for anyone who plugs a different display into a board that is
- * already flashed - which is the whole point of not baking it in.
+ * applied once the devices are up and again once the loadable drivers are
+ * (see apply_console_size), so the size is a line in a file for anyone who
+ * plugs a different display into a board that is already flashed - which is
+ * the whole point of not baking it in.  Twice because `auto` asks the panel,
+ * and a panel that arrives as a .SYS is not there for the first question.
  *
  * The board that wants it smaller is one whose only screen is the panel
  * soldered to it: 320 pixels hold forty of the 8-pixel cells this system
@@ -229,12 +231,26 @@ static void apply_console_size(void)
                                         pcols, AG_SCREEN_MAX_COLS);
     const uint16_t rows = size_from_cfg(cfg, "console.rows", AG_CONSOLE_ROWS,
                                         prows, AG_SCREEN_MAX_ROWS);
+
+    /*
+     * Nothing to do when the answer has not changed, which is the ordinary
+     * case for the second call: a resize reflows the screen, and doing that
+     * to an identical size would throw away the boot report for nothing.
+     */
+    static uint16_t s_cols, s_rows;
+    if (cols == s_cols && rows == s_rows) {
+        return;
+    }
+
     const ag_err_t err = ag_console_resize(cols, rows);
     if (err != AG_OK) {
         kout("console: %ux%u refused with %d, staying at %ux%u\n",
              (unsigned)cols, (unsigned)rows, (int)err,
              (unsigned)AG_CONSOLE_COLS, (unsigned)AG_CONSOLE_ROWS);
+        return;
     }
+    s_cols = cols;
+    s_rows = rows;
 }
 
 static ag_err_t stage_devices(void)
@@ -254,7 +270,22 @@ static ag_err_t stage_modules(void)
     if (ag_boot_in_recovery()) {
         return AG_OK;
     }
-    return ag_modules_boot();
+    const ag_err_t err = ag_modules_boot();
+
+    /*
+     * And again, now that the loadable drivers are up.
+     *
+     * `auto` asks the panel first, and on a board whose panel is a .SYS the
+     * panel does not exist yet at the devices stage: the question fell through
+     * to the framebuffer and a CYD answered 20x7 (a 160x120 surface in 8x16
+     * cells) for glass that holds 40x30.  That is worse than the built-in
+     * size, so the one documented way to fit the console to the screen made
+     * the console smaller.  Asked a second time here, the panel answers for
+     * itself; an explicit size in SYSTEM.CFG gets the same number twice and
+     * the call does nothing.
+     */
+    apply_console_size();
+    return err;
 }
 
 /*
