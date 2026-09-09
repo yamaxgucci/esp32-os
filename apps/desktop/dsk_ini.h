@@ -52,6 +52,14 @@ typedef struct {
 typedef struct {
     uint32_t background;
     uint16_t dblclick_ms;
+    /*
+     * The small font, for whoever wants twice the lines.
+     *
+     * Off by default, and that is Maxim's call after seeing both on the CYD:
+     * 8x8 is readable there and 8x16 is nicer to read, so the choice belongs
+     * to whoever is looking at it rather than to a threshold in the code.
+     */
+    bool     small_font;
 
     dsk_ini_icon_t icon[DSK_INI_ICONS];
     int            nicons;

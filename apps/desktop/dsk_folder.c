@@ -27,7 +27,9 @@ typedef struct {
 typedef struct {
     char     path[AG_PATH_MAX];
     entry_t *entries;
-    int      n;
+    int      cap;   /* entries the allocation actually holds */
+    int      n;     /* entries in it */
+    int      total; /* entries the directory has, listed or not */
     int      sel;
     int      top;      /* the first row on screen */
     bool     truncated;
@@ -99,15 +101,35 @@ static void read_dir(folder_t *f)
     f->sel = 0;
     f->top = 0;
     f->truncated = false;
+    /*
+     * As many entries as this machine will give, not as many as would be nice.
+     *
+     * Five hundred and twelve of them is forty kilobytes in one block, and on
+     * the CYD - 320x240 in bands, so the shell's own data is already forty -
+     * that block does not exist.  What the user saw was a window that would
+     * not open at all and a shell that could show neither C: nor T:, which is
+     * not a shell.  A hundred files listed beats none, so the ask comes down
+     * until it is answered, and the window says what it could not fit.
+     */
     if (f->entries == NULL) {
-        f->entries = (entry_t *)ag_malloc(sizeof(entry_t) * ENTRY_MAX);
+        for (int want = ENTRY_MAX; want >= 32; want /= 2) {
+            f->entries = (entry_t *)ag_malloc(sizeof(entry_t) * (size_t)want);
+            if (f->entries != NULL) {
+                f->cap = want;
+                break;
+            }
+        }
         if (f->entries == NULL) {
             dsk_cursor_shape(DSK_CUR_ARROW);
             return;
         }
     }
+    f->total = 0;
 
     if (!is_root(f->path)) {
+        /* The way up is the shell's row, not the directory's: it is in `n`
+         * because it is on screen, and out of `total` because a count of a
+         * directory is a count of what is in it. */
         entry_t *e = &f->entries[f->n++];
         ag_strlcpy(e->name, "..", sizeof(e->name));
         e->size = 0;
@@ -123,9 +145,15 @@ static void read_dir(folder_t *f)
                 ag_strcmp(de.name, "..") == 0) {
                 continue;
             }
-            if (f->n >= ENTRY_MAX) {
+            /*
+             * Counted even when there is nowhere to put it: a listing that
+             * says "seven objects" about a directory of nine is a listing
+             * that lies, and the count is what the window is believed on.
+             */
+            f->total++;
+            if (f->n >= f->cap) {
                 f->truncated = true;
-                break;
+                continue;
             }
             entry_t *e = &f->entries[f->n++];
             ag_strlcpy(e->name, de.name, sizeof(e->name));
@@ -286,10 +314,15 @@ static void draw_status(dsk_win_t *w, folder_t *f)
 
     ag_strlcpy(line, ag_utoa((uint64_t)f->n, num, sizeof(num), 0, false),
                sizeof(line));
-    ag_strlcat(line, (f->n == 1) ? " object" : " objects", sizeof(line));
     if (f->truncated) {
-        ag_strlcat(line, " (more not listed)", sizeof(line));
+        /* "7 of 9 objects": the second number is the directory, the first is
+         * what fitted in the memory this machine had. */
+        ag_strlcat(line, " of ", sizeof(line));
+        ag_strlcat(line, ag_utoa((uint64_t)f->total, num, sizeof(num), 0,
+                                 false),
+                   sizeof(line));
     }
+    ag_strlcat(line, (f->n == 1) ? " object" : " objects", sizeof(line));
     dsk_text_small((int16_t)(r.x + 3), (int16_t)(r.y + 2), line, DSK_BLACK,
                    DSK_LGRAY);
 

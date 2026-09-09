@@ -1971,23 +1971,6 @@ int ag_main(int argc, char **argv)
      * whole transcript - then needs no second rule to recognise the other
      * kind of run.
      */
-    /*
-     * Which font the shell draws in, decided by the screen it got.
-     *
-     * 8x16 on 320x240 leaves fifteen lines and forty columns, and a file
-     * manager with fifteen lines is one you scroll instead of read.  8x8
-     * doubles the lines, and Windows made the same trade for the same reason -
-     * the system font of 3.11 at 640x480 is not the font of 320x200.  Four
-     * hundred is the line because that is where a 640x400 surface sits: the
-     * screen a mouse is used on keeps the big font, the panels somebody holds
-     * in one hand get the small one.
-     *
-     * Set before the layout, because every height in it is one line of this
-     * font plus a pixel each side.
-     */
-    dsk_ui_font_set((info.height < 400u) ? DSK_UI_FONT_SMALL
-                                         : DSK_UI_FONT_LARGE);
-
     ag_printf("desktop: surface %ux%u %s, focus %s, font 8x%d\n",
               (unsigned)info.width, (unsigned)info.height,
               banded ? "bands" : (info.double_buf ? "double" : "single"),
@@ -2015,6 +1998,24 @@ int ag_main(int argc, char **argv)
      */
     dsk_ini_defaults(&s_ini);
     dsk_ini_load(&s_ini);
+
+    /*
+     * Which font the shell draws in: 8x16 unless DESKTOP.INI asks for 8x8.
+     *
+     * It was chosen by screen size for a day, small below four hundred
+     * pixels, and that was wrong in the way only the person looking can
+     * settle: on the CYD the small font is readable and the big one is
+     * nicer, so twice the lines is a thing to ask for rather than to be
+     * given.  `font = small` in [desktop] asks.
+     *
+     * The layout is rebuilt because every height in it is one line of this
+     * font plus a pixel each side; s_m is filled in place, and the window
+     * manager and the menus hold a pointer to it rather than a copy.
+     */
+    if (s_ini.small_font) {
+        dsk_ui_font_set(DSK_UI_FONT_SMALL);
+        dsk_metrics_init(&s_m, (int16_t)info.width, (int16_t)info.height);
+    }
     find_drives();
     restore_windows();
     rebuild_menus();
