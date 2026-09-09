@@ -285,9 +285,21 @@ static void band_present(void)
     }
 }
 
+/*
+ * The frame is finished.
+ *
+ * In this mode there is no surface to copy from, so flush cannot mean "copy
+ * what I drew" - it means "the strips I have handed over are a whole frame,
+ * show them".  The kernel holds the rows until it hears this (or until a
+ * frame's worth of time has passed, for a caller that never says it), and
+ * then asks the panel once instead of once per strip.
+ */
+static void band_frame_done(void) { ag_gfx_flush(0, 0, 0, 0); }
+
 static const dsk_bander_t s_bander = {
     .begin = band_begin,
     .present = band_present,
+    .frame_done = band_frame_done,
 };
 
 void dsk_paint_bind_band(int16_t w, int16_t h)

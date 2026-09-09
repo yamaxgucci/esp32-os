@@ -72,6 +72,14 @@ void dsk_paint_bind_band(int16_t w, int16_t h);
 typedef struct dsk_bander {
     int16_t (*begin)(dsk_rect_t r, int16_t y);
     void (*present)(void);
+    /*
+     * "That is the frame."  Optional, and worth having: a panel that is told
+     * once per repaint rather than once per strip does the same work in a
+     * fraction of the requests, and under an emulator the requests are what
+     * costs - 339 ms a drag step against 22 ms on real glass, all of it
+     * waiting for the previous strip to be acknowledged.
+     */
+    void (*frame_done)(void);
 } dsk_bander_t;
 
 void dsk_paint_bind_bander(const dsk_bander_t *b);
@@ -88,6 +96,9 @@ bool dsk_paint_banded(void);
  * nothing to read.
  */
 void dsk_paint_region(dsk_rect_t r, void (*draw)(dsk_rect_t r));
+
+/* Say that the strips handed over since the last one make a whole frame. */
+void dsk_paint_frame_done(void);
 
 /* ---- what the shell actually calls -------------------------------------- */
 

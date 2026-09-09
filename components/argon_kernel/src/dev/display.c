@@ -455,6 +455,56 @@ static const ag_dev_ops_t k_fb_ops = {
 static uint16_t *s_shim_fb;
 static uint16_t  s_shim_w, s_shim_h;
 
+/*
+ * Rows written since the emulator was last told, and when it was told.
+ *
+ * One kick per frame rather than one per strip, and the difference is
+ * measured: a drag step in band mode cost 339 ms under the emulator against
+ * 22 ms on a real panel, which is six strips each paying the port's fifty
+ * millisecond wait for the previous one to finish (see wait_idle in
+ * components/argon_port/idf/src/panel_hw.c).  The rows are the same rows
+ * either way; only the number of requests changes.
+ *
+ * Coalescing cannot be unconditional, because an application need not ever
+ * say "frame done": it may present and present and never flush.  So a kick
+ * also goes out when the pending rows have been waiting longer than a frame
+ * is worth, which bounds the delay for a caller that says nothing and costs
+ * nothing for one that does.
+ */
+/*
+ * How the deferral decides, and why not by a clock.
+ *
+ * The first attempt held the rows for twelve milliseconds since the last
+ * kick - which never held anything, because a kick itself waits up to fifty
+ * for the emulator, so the threshold was always already past.  Time cannot
+ * measure "is a frame still being assembled" when the measurement includes
+ * the waiting.
+ *
+ * What answers it is the caller.  An application that says "frame done" once
+ * is trusted to keep saying it, and until it does its strips are held; one
+ * that has never said it gets a kick per strip, exactly as before.  The
+ * safety net is for an application that says it once and then stops.
+ */
+#define AG_SHIM_SAFETY_US 200000
+static int32_t  s_shim_y0 = -1;
+static int32_t  s_shim_y1 = -1;
+static uint64_t s_shim_pending_us;
+static bool     s_shim_trusted;
+
+static void shim_kick(void)
+{
+    if (s_shim_y0 < 0 || s_shim_y1 <= s_shim_y0) {
+        return;
+    }
+    const int32_t y = s_shim_y0;
+    const int32_t h = s_shim_y1 - s_shim_y0;
+    s_shim_y0 = -1;
+    s_shim_y1 = -1;
+    if (s_screen_on) {
+        ag_port_panel_present(y, h);
+    }
+}
+
 static ag_err_t shim_info(ag_handle_t h, ag_gfxinfo_t *out)
 {
     (void)h;
@@ -505,8 +555,21 @@ static void shim_blit_rect(ag_handle_t h, const ag_blit_t *b)
             dst[i] = src[i];
         }
     }
-    if (s_screen_on) {
-        ag_port_panel_present((int32_t)b->y, (int32_t)hgt);
+    /* Pending, not sent - see the note above shim_kick. */
+    const int32_t y0 = (int32_t)b->y;
+    const int32_t y1 = y0 + (int32_t)hgt;
+    if (s_shim_y0 < 0) {
+        s_shim_pending_us = ag_port_us();
+        s_shim_y0 = y0;
+    } else if (y0 < s_shim_y0) {
+        s_shim_y0 = y0;
+    }
+    if (y1 > s_shim_y1) {
+        s_shim_y1 = y1;
+    }
+    if (!s_shim_trusted ||
+        ag_port_us() - s_shim_pending_us >= AG_SHIM_SAFETY_US) {
+        shim_kick();
     }
 }
 
@@ -707,6 +770,7 @@ static void gfx_release(void)
     ag_log(AG_LOG_INFO, "display", "release: owner pid %u, by pid %u",
            (unsigned)s_owner, (unsigned)ag_proc_self());
     if (s_surfaceless) {
+        shim_kick(); /* whatever was still pending is this app's last frame */
         s_acquired = false;
         s_owner = AG_PID_KERNEL;
         /* The panel still has the application's last frame on it; the console
@@ -740,6 +804,21 @@ static void gfx_release(void)
 static void gfx_flush(uint16_t x, uint16_t y, uint16_t w, uint16_t h)
 {
     if (!gfx_may_present()) {
+        return;
+    }
+    /*
+     * With no surface there is nothing to copy, and flush means the one thing
+     * it can mean: the frame the caller has been handing over in pieces is
+     * finished, so show it.  A caller that never says this is not punished -
+     * see shim_kick - but one that does gets its whole frame in one request.
+     */
+    if (s_surfaceless) {
+        (void)x;
+        (void)y;
+        (void)w;
+        (void)h;
+        s_shim_trusted = true;
+        shim_kick();
         return;
     }
     if (w == 0 || h == 0) {

@@ -1346,6 +1346,9 @@ static void commit(void)
         for (uint8_t i = 0; i < s_damage.n; i++) {
             dsk_paint_region(s_damage.r[i], draw_banded);
         }
+        /* All of it is one frame, and saying so is worth a lot: see
+         * dsk_bander_t::frame_done. */
+        dsk_paint_frame_done();
     } else {
         /*
          * Pointer off, then outline off, then paint, then both back on in the

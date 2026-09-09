@@ -352,14 +352,16 @@ try {
     # directory, Properties.
     # How long to let the shell catch up before a photograph is taken.
     #
-    # Band mode is fifteen times slower under the emulator than on hardware
-    # and the difference is all handshake: every strip waits for the emulated
-    # panel to finish the last one, so a drag step measured 339 ms here against
-    # 22 ms on a real CYD.  A wait sized for the surface path therefore
-    # photographs a shell that is still working through its queue - which shows
-    # up as a dialog missing its button, and a different number of differing
-    # pixels every run (8936, then 20724, then 5800).
-    $settle = if ($Bands) { 6000 } else { 1200 }
+    # One number for both backends, which it took a fix to be able to say.
+    # Band mode used to be fifteen times slower under the emulator - a drag
+    # step of 339 ms against 22 ms on a real CYD - because every strip waited
+    # for the emulated panel to acknowledge the last one.  A wait sized for the
+    # surface path then photographed a shell still working through its queue: a
+    # dialog missing its button, and a different pixel count every run (8936,
+    # 20724, 5800).  The panel is now told once per frame instead of once per
+    # strip (ag_gfx_flush in surfaceless mode), which took the same drag step
+    # to 8 ms and a full repaint from 1542 ms to 15.
+    $settle = 1200
     $opsProps = @('key f10', 'wait 500') +
                 (1..8 | ForEach-Object { 'key down' }) +
                 @('wait 300', 'key enter', "wait $settle")

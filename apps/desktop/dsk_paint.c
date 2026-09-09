@@ -54,6 +54,13 @@ const dsk_painter_t *dsk_paint(void) { return s_p; }
 void dsk_paint_bind_bander(const dsk_bander_t *b) { s_bander = b; }
 bool dsk_paint_banded(void) { return s_bander != NULL; }
 
+void dsk_paint_frame_done(void)
+{
+    if (s_bander != NULL && s_bander->frame_done != NULL) {
+        s_bander->frame_done();
+    }
+}
+
 void dsk_paint_region(dsk_rect_t r, void (*draw)(dsk_rect_t r))
 {
     if (draw == NULL || dsk_rect_empty(r)) {
