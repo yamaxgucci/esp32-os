@@ -94,6 +94,21 @@ AG_DRV("XPT2046", "0.2", "argon");
 #define UP_SETTLE_MS 60u
 
 /*
+ * How far away a returning contact is a NEW touch rather than a movement.
+ *
+ * The settle above bridges a contact that flickers where it is; it must not
+ * bridge one that comes back somewhere else.  A double tap does exactly
+ * that - the finger leaves and lands a few pixels off, inside the settle -
+ * and bridged, the two taps become one press with a jump in the middle,
+ * which is a drag.  Maxim found it by double-tapping an icon and watching
+ * it move.
+ *
+ * Twelve pixels: a tap lands within a few of the last one, and a drag that
+ * begins with a jump of twelve has already left the thing it grabbed.
+ */
+#define JUMP_PX 12
+
+/*
  * Raw readings at the edges of the glass.  A resistive panel is a pair of
  * potentiometers and these are where its ends are; they vary between panels of
  * the same model, so they are a starting point rather than a fact.  Anything
@@ -358,6 +373,40 @@ static int32_t touch_poll(ag_handle_t h, ag_event_t *out, uint32_t max)
 
     if (!line && pressed) {
         s_tally.flaky++; /* the wire lied and the glass put it right */
+    }
+
+    /*
+     * Back after a gap, and somewhere else: end the old touch here rather
+     * than dragging it across.  The next poll starts a fresh one at the
+     * new place.
+     */
+    if (pressed && s_state.down && s_up_since != 0u) {
+        int16_t nx, ny;
+        if (s_px) {
+            nx = to_px(rx, PANEL_W);
+            ny = to_px(ry, PANEL_H);
+#if FLIP_X
+            nx = (int16_t)(PANEL_W - 1 - nx);
+#endif
+#if FLIP_Y
+            ny = (int16_t)(PANEL_H - 1 - ny);
+#endif
+            const int dx = (nx > s_state.col) ? nx - s_state.col
+                                              : s_state.col - nx;
+            const int dy = (ny > s_state.row) ? ny - s_state.row
+                                              : s_state.row - ny;
+            if (dx > JUMP_PX || dy > JUMP_PX) {
+                s_up_since = 0u;
+                s_state.down = false;
+                out[0].type = AG_EV_POINTER_UP;
+                out[0].ptr.x = s_state.col;
+                out[0].ptr.y = s_state.row;
+                out[0].ptr.buttons = 0;
+                s_tally.sent++;
+                tally_tick(true);
+                return 1;
+            }
+        }
     }
 
     if (!pressed) {
