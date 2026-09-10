@@ -77,6 +77,11 @@ extern "C" {
  * 0.28 defined ag_input_ops_t: an AG_DEV_INPUT driver the kernel polls for
  *      events, for hardware that has to be asked rather than interrupting.
  * 0.29 appended io->spi_config: the clock for one chip on a shared bus.
+ * 0.44 appended units / span_w / span_h to ag_input_ops_t: an input driver
+ *      that measures in pixels rather than console cells says so, and the
+ *      kernel scales its span to the surface instead of multiplying a cell.
+ *      A touchscreen under a graphical shell loses eight pixels in nine
+ *      otherwise, and has to agree with the kernel about whose grid it is.
  * 0.30 appended blit_rect to ag_display_ops_t: a rectangle of pixels the
  *      kernel owns, for a panel whose glass is larger than any framebuffer
  *      the machine driving it can afford.
@@ -146,7 +151,7 @@ extern "C" {
  *      column and row by the cell size on the way in.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 43u
+#define AG_ABI_MINOR 44u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -799,16 +804,40 @@ typedef struct ag_gfx_api {
  * forever.  The events go into the same queue the terminal decoder feeds, so
  * nothing above can tell a finger from a mouse on the other end of a cable.
  *
- * Coordinates are console cells, like the terminal's mouse reports, because
- * what is on this kind of screen is the console.  A driver for a panel with a
- * framebuffer under it would want pixels; there is no such panel yet, and
- * inventing the second convention before there is something to point at is how
- * both end up wrong.
+ * Coordinates are console cells by default, like the terminal's mouse
+ * reports, because what is on that kind of screen is the console - and a
+ * driver written before ABI 0.44 says nothing about units, so cells is what
+ * silence means.
+ *
+ * There is now something to point at, which is why the other convention
+ * exists (0.44): the CYD runs a graphical shell on a panel with no system
+ * framebuffer, and a touch controller that reports cells throws away eight
+ * pixels in nine before anybody sees it.  Worse, the round trip has to agree
+ * with the kernel about which grid - the console's, not the panel's - and
+ * when it did not, the pointer sat below the stylus and the bottom of the
+ * glass could not be pressed at all.  A driver that measures in pixels says
+ * so and hands over pixels, and no grid is involved.
+ *
+ *   .units  AG_PTR_CELLS (0, and what an older driver means by saying
+ *           nothing) or AG_PTR_PIXELS.
+ *   .span_w Pixels across and down of whatever the driver measured against -
+ *   .span_h its own glass.  The kernel scales that to the surface, so a touch
+ *           panel and a screen of different sizes still agree.  Zero means
+ *           "the same as the surface", which is the usual case.
  */
 typedef struct ag_input_ops {
     uint32_t size;
     int32_t (*poll)(ag_handle_t h, ag_event_t *out, uint32_t max);
+    /* ABI 0.44 */
+    uint16_t units;
+    uint16_t span_w;
+    uint16_t span_h;
 } ag_input_ops_t;
+
+enum ag_ptr_units {
+    AG_PTR_CELLS = 0,
+    AG_PTR_PIXELS = 1,
+};
 
 /*
  * One cell of the text console: the byte on the screen and its colours, high

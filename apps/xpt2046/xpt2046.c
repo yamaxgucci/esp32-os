@@ -41,24 +41,40 @@ AG_DRV("XPT2046", "0.2", "argon");
 #define T_KHZ 2000 /* the datasheet's ceiling, and the panel's is 40000      */
 
 /*
- * The panel this sits on.  The *grid* is not here, and that is the point.
+ * The panel this sits on.  Pixels of it, and no grid at all (ABI 0.44).
  *
- * An input driver reports cells, and the kernel turns them back into pixels
- * with the console's own grid: cw = surface_w / cols, ch = surface_h / rows
- * (ag_input_to_pixels).  This driver used to divide by a grid of its own -
- * the panel's forty by thirty of 8x8 - and the two agree only while the
- * console happens to be forty by thirty as well.  With a console of forty by
- * twenty-five the kernel multiplies each row by nine, and the pointer lands
- * below the stylus, further below the further down the glass you touch.
- * Which is what Maxim saw, and what no amount of looking at this driver's own
- * arithmetic would have explained: both halves were self-consistent and they
- * were not talking about the same grid.
+ * It used to report console cells, because that is what an input driver's
+ * contract said, and the kernel turned them back into pixels with the
+ * console's grid.  Two faults came of that and only one was arithmetic.  The
+ * arithmetic one: this driver divided by a grid of its own - the panel's
+ * forty by thirty of 8x8 - while the kernel multiplied by the console's,
+ * forty by twenty-five, so each row came back nine pixels instead of eight.
+ * The pointer sat below the stylus, further below the lower you touched, and
+ * the bottom forty pixels of glass could not be pressed at all.  Both halves
+ * were self-consistent, which is why neither one alone explained anything.
  *
- * So the grid is asked for, at every poll, from the console itself.
+ * The other fault is the convention: a stylus on 320x240 can point at a
+ * pixel, and rounding it to the nearest cell throws away eight of every nine
+ * before the shell ever sees it.  So the driver says AG_PTR_PIXELS and hands
+ * over pixels of its own span; the kernel scales that span to the surface and
+ * no grid is involved.  On a kernel older than 0.44 that would be read as
+ * cells, so the units are chosen at load time from what the kernel says it
+ * is, and the cell path is kept for it.
  */
 #define PANEL_W  320
 #define PANEL_H  240
 #define CELLS_MAX 255
+
+/*
+ * How far a finger must move to count as having moved, in pixels.
+ *
+ * A resistive panel wanders by a pixel or two while it is held perfectly
+ * still, and reporting cells hid that: a wobble inside one cell was no event
+ * at all.  In pixels it is a stream of them, which is a redraw each and a
+ * cursor that will not sit still.  Two pixels is below what a hand can aim
+ * for and above what the glass invents.
+ */
+#define DEADBAND 2
 
 /*
  * Raw readings at the edges of the glass.  A resistive panel is a pair of
@@ -81,9 +97,16 @@ AG_DRV("XPT2046", "0.2", "argon");
 
 static const ag_io_api_t *io;
 
+/*
+ * True when this kernel understands pixels from an input driver (ABI 0.44).
+ * On an older one the same numbers would be read as console cells and a tap
+ * near the right edge would land four screens away, so the cell path stays.
+ */
+static bool s_px;
+
 static struct {
     bool     down;
-    int16_t  col, row;
+    int16_t  col, row; /* the last position reported: cells or pixels */
     uint32_t samples;
 } s_state;
 
@@ -154,6 +177,25 @@ static uint16_t pressure(uint16_t x, uint16_t z1, uint16_t z2)
  * The division is by span/n rather than by any fixed cell size, because
  * span/n is the number the kernel multiplies by on the way back.
  */
+static int16_t to_px(uint16_t raw, int span)
+{
+    int v = (int)raw;
+    if (v < RAW_MIN) {
+        v = RAW_MIN;
+    }
+    if (v > RAW_MAX) {
+        v = RAW_MAX;
+    }
+    int px = ((v - RAW_MIN) * (span - 1)) / (RAW_MAX - RAW_MIN);
+    if (px < 0) {
+        px = 0;
+    }
+    if (px > span - 1) {
+        px = span - 1;
+    }
+    return (int16_t)px;
+}
+
 static int16_t to_cell(uint16_t raw, int span, int n)
 {
     int v = (int)raw;
@@ -234,26 +276,44 @@ static int32_t touch_poll(ag_handle_t h, ag_event_t *out, uint32_t max)
      * something to reason out.  It was reasoned out first, wrongly: a stylus
      * drawn horizontally left a vertical line.
      */
-    int cols, rows;
-    grid(&cols, &rows);
+    int16_t col, row;
+    int     moved;
 
-    int16_t col = to_cell(rx, PANEL_W, cols);
-    int16_t row = to_cell(ry, PANEL_H, rows);
-
+    if (s_px) {
+        col = to_px(rx, PANEL_W);
+        row = to_px(ry, PANEL_H);
 #if FLIP_X
-    col = (int16_t)(cols - 1 - col);
+        col = (int16_t)(PANEL_W - 1 - col);
 #endif
 #if FLIP_Y
-    row = (int16_t)(rows - 1 - row);
+        row = (int16_t)(PANEL_H - 1 - row);
 #endif
+        const int dx = (col > s_state.col) ? col - s_state.col
+                                           : s_state.col - col;
+        const int dy = (row > s_state.row) ? row - s_state.row
+                                           : s_state.row - row;
+        moved = (dx >= DEADBAND || dy >= DEADBAND);
+    } else {
+        int cols, rows;
+        grid(&cols, &rows);
+        col = to_cell(rx, PANEL_W, cols);
+        row = to_cell(ry, PANEL_H, rows);
+#if FLIP_X
+        col = (int16_t)(cols - 1 - col);
+#endif
+#if FLIP_Y
+        row = (int16_t)(rows - 1 - row);
+#endif
+        moved = (col != s_state.col || row != s_state.row);
+    }
 
     if (!s_state.down) {
         s_state.down = true;
         out[0].type = AG_EV_POINTER_DOWN;
-    } else if (col != s_state.col || row != s_state.row) {
+    } else if (moved) {
         out[0].type = AG_EV_POINTER_MOVE;
     } else {
-        return 0; /* still down, still the same cell: nothing happened */
+        return 0; /* still down, still in the same place: nothing happened */
     }
 
     out[0].ptr.buttons = 1;
@@ -267,9 +327,17 @@ static int32_t touch_poll(ag_handle_t h, ag_event_t *out, uint32_t max)
     return 1;
 }
 
-static const ag_input_ops_t k_input_ops = {
+/*
+ * Filled at load time rather than written down here, because which units this
+ * driver reports depends on whether the kernel it landed on understands the
+ * pixel ones (ABI 0.44).
+ */
+static ag_input_ops_t k_input_ops = {
     .size = sizeof(ag_input_ops_t),
     .poll = touch_poll,
+    .units = AG_PTR_CELLS,
+    .span_w = PANEL_W,
+    .span_h = PANEL_H,
 };
 
 static const ag_dev_ops_t k_dev_ops = {0};
@@ -302,6 +370,17 @@ ag_err_t ag_driver_init(void)
      * controller has seen a command. */
     (void)read_once(CMD_Z1);
 
+    /*
+     * Which units, decided here and not at compile time: this .SYS outlives
+     * the kernel it was built beside, and the answer is a property of the
+     * kernel that loaded it.  Before ag_dev_add, because the table is read
+     * from the moment the device exists.
+     */
+    ag_sysinfo_t si = { 0 };
+    ag_api()->sys->info(&si);
+    s_px = (si.abi_major > 0u) || (si.abi_minor >= 44u);
+    k_input_ops.units = s_px ? AG_PTR_PIXELS : AG_PTR_CELLS;
+
     const ag_dev_add_t desc = {
         .name = "touch0",
         .driver = "XPT2046",
@@ -315,9 +394,15 @@ ag_err_t ag_driver_init(void)
         return err;
     }
 
-    int cols, rows;
-    grid(&cols, &rows);
-    ag_printf("XPT2046: spi%d cs %d at %d kHz, pen %d, %dx%d cells\n", T_BUS,
-              T_CS, T_KHZ, T_IRQ, cols, rows);
+    if (s_px) {
+        ag_printf("XPT2046: spi%d cs %d at %d kHz, pen %d, %dx%d pixels\n",
+                  T_BUS, T_CS, T_KHZ, T_IRQ, PANEL_W, PANEL_H);
+    } else {
+        int cols, rows;
+        grid(&cols, &rows);
+        ag_printf("XPT2046: spi%d cs %d at %d kHz, pen %d, %dx%d cells"
+                  " (kernel 0.%u wants cells)\n", T_BUS, T_CS,
+                  T_KHZ, T_IRQ, cols, rows, (unsigned)si.abi_minor);
+    }
     return AG_OK;
 }
