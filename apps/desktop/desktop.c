@@ -543,6 +543,9 @@ enum {
      * board has none, and until now the font could only be changed by
      * editing DESKTOP.INI on a machine that has one.
      */
+    ID_CUT,
+    ID_CLIPCOPY,
+    ID_PASTE,
     ID_MARK,
     ID_MARK_ALL,
     ID_MARK_NONE,
@@ -567,7 +570,7 @@ enum {
     ID_WINDOW_FIRST = 100, /* + the window's z index */
 };
 
-static dsk_menu_t s_menus[5];
+static dsk_menu_t s_menus[6];
 
 /* ---- file operations ---------------------------------------------------- */
 
@@ -988,6 +991,110 @@ static void apply_font(void)
     ag_printf("desktop: font 8x%d\n", (int)dsk_ui_h());
 }
 
+/* ---- the clipboard ------------------------------------------------------ */
+
+/*
+ * Names, not paths, and one directory for all of them.
+ *
+ * Why a clipboard exists at all when Copy... has been here from the start:
+ * that box asks for a destination, and asking for a destination means typing
+ * one.  The board this shell was written for has a touchscreen and no
+ * keyboard, so "copy these three into that window" was a thing the machine
+ * could do and a person could not ask for.  Pick, walk, paste - no letters.
+ *
+ * Thirty-two of them, and one source directory: a clipboard filled from two
+ * places at once is not a thing anybody has asked for, and holding whole
+ * paths would be eight kilobytes on a machine with a hundred and eleven.
+ */
+#define CLIP_MAX 32
+
+static struct {
+    char dir[AG_PATH_MAX];
+    char name[CLIP_MAX][64];
+    int  n;
+    bool moving; /* cut, as against copy */
+} s_clip;
+
+static void clip_take(bool moving)
+{
+    dsk_win_t *const w = dsk_wm_active();
+    const char      *dir = dsk_folder_path(w);
+    if (dir == NULL) {
+        s_note = "no folder window is active";
+        damage(s_m.statusbar);
+        return;
+    }
+
+    s_clip.n = 0;
+    s_clip.moving = moving;
+    ag_strlcpy(s_clip.dir, dir, sizeof(s_clip.dir));
+
+    const int marks = dsk_folder_marked(w);
+    if (marks > 0) {
+        for (int i = 0; i < marks && s_clip.n < CLIP_MAX; i++) {
+            (void)dsk_folder_marked_at(w, i, NULL, 0, s_clip.name[s_clip.n],
+                                       sizeof(s_clip.name[0]), NULL);
+            s_clip.n++;
+        }
+    } else if (dsk_folder_selected(w, NULL, 0, s_clip.name[0],
+                                   sizeof(s_clip.name[0]), NULL)) {
+        s_clip.n = 1;
+    }
+
+    if (s_clip.n == 0) {
+        s_note = "nothing is selected";
+    } else if (marks > CLIP_MAX) {
+        s_note = moving ? "32 cut (the rest would not fit)"
+                        : "32 copied (the rest would not fit)";
+    } else {
+        s_note = moving ? "cut" : "copied";
+    }
+    damage(s_m.statusbar);
+}
+
+static void clip_paste(void)
+{
+    dsk_win_t *const w = dsk_wm_active();
+    const char      *dir = dsk_folder_path(w);
+    if (dir == NULL || s_clip.n == 0) {
+        s_note = (s_clip.n == 0) ? "the clipboard is empty"
+                                 : "no folder window is active";
+        damage(s_m.statusbar);
+        return;
+    }
+    if (ag_stricmp(dir, s_clip.dir) == 0) {
+        (void)dsk_dlg_message("Paste", "They are already here.",
+                              "Open the window you want them in first.",
+                              DSK_DLG_OK, NULL, NULL);
+        return;
+    }
+
+    for (int i = 0; i < s_clip.n; i++) {
+        char from[AG_PATH_MAX];
+        char to[AG_PATH_MAX];
+        path_join(s_clip.dir, s_clip.name[i], from, sizeof(from));
+        path_join(dir, s_clip.name[i], to, sizeof(to));
+        if (s_clip.moving) {
+            dsk_ops_move(from, to, s_clip.name[i]);
+        } else {
+            dsk_ops_copy(from, to, s_clip.name[i]);
+        }
+    }
+
+    /*
+     * A cut is spent when it is pasted; a copy is not.
+     *
+     * Moving the same files a second time would be moving files that are no
+     * longer where the clipboard says they are, and the second paste would
+     * be a row of error boxes.  Copying them again is a perfectly ordinary
+     * thing to want.
+     */
+    if (s_clip.moving) {
+        s_clip.n = 0;
+    }
+    after_op(dir);
+}
+
 /* ---- the context menu -------------------------------------------------- */
 
 /*
@@ -1018,7 +1125,7 @@ static struct {
 
 static void context_menu_at(int16_t x, int16_t y)
 {
-    dsk_menu_t *m = &s_menus[4];
+    dsk_menu_t *m = &s_menus[5];
     m->title = "";
     m->n = 0;
 
@@ -1034,7 +1141,10 @@ static void context_menu_at(int16_t x, int16_t y)
                                                : "Mark  Space",
                  ID_MARK, sel);
         set_item(m, "Select all", ID_MARK_ALL, true);
-        set_item(m, "Clear marks", ID_MARK_NONE, dsk_folder_marked(w) > 0);
+        set_separator(m);
+        set_item(m, "Cut", ID_CUT, sel);
+        set_item(m, "Copy", ID_CLIPCOPY, sel);
+        set_item(m, "Paste", ID_PASTE, s_clip.n > 0);
         set_separator(m);
         set_item(m, "Copy...  F8", ID_COPY, sel);
         set_item(m, "Move...  F7", ID_MOVE, sel);
@@ -1061,7 +1171,7 @@ static void context_menu_at(int16_t x, int16_t y)
      * other trace. */
     ag_printf("desktop: context menu at %d,%d, %u items, on %s\n", (int)x,
               (int)y, (unsigned)m->n, in_folder ? "a file" : "the desk");
-    dsk_menu_popup(4, x, y);
+    dsk_menu_popup(5, x, y);
 }
 
 uint32_t press_due_in(uint32_t now)
@@ -1512,78 +1622,97 @@ static void rebuild_menus(void)
     set_item(&s_menus[0], "Rename...  F2", ID_RENAME, sel);
     set_item(&s_menus[0], "Delete  Del", ID_DELETE, any);
     set_separator(&s_menus[0]);
-    set_item(&s_menus[0], "Select all  Ctrl+A", ID_MARK_ALL, in_folder);
-    set_item(&s_menus[0], "Clear marks", ID_MARK_NONE,
-             dsk_folder_marked(active) > 0);
-    set_separator(&s_menus[0]);
     set_item(&s_menus[0], "Create directory...", ID_MKDIR, in_folder);
     set_item(&s_menus[0], "Properties...", ID_PROPS,
              sel || (!in_folder && s_drive_sel >= 0));
     set_separator(&s_menus[0]);
     set_item(&s_menus[0], "Exit", ID_EXIT, true);
 
-    s_menus[1].title = "Window";
+    /*
+     * Edit, and why there is one at all.
+     *
+     * Copy... has been here from the start and it asks where to - which
+     * means typing a path, on a board with no keyboard.  Cut, Copy and
+     * Paste are the same operations asked for in the other order: pick
+     * here, walk there, paste, and never spell anything.  That is the whole
+     * of what makes file work possible with a finger.
+     *
+     * A menu of its own because File is full: sixteen items is the limit,
+     * and File is at twelve without any of this.
+     */
+    s_menus[1].title = "Edit";
     s_menus[1].n = 0;
-    set_item(&s_menus[1], "Cascade", ID_CASCADE, n > 0);
-    set_item(&s_menus[1], "Tile", ID_TILE, n > 0);
+    set_item(&s_menus[1], "Cut  Ctrl+X", ID_CUT, any);
+    set_item(&s_menus[1], "Copy  Ctrl+C", ID_CLIPCOPY, any);
+    set_item(&s_menus[1], "Paste  Ctrl+V", ID_PASTE,
+             in_folder && s_clip.n > 0);
     set_separator(&s_menus[1]);
-    set_item(&s_menus[1], "Close", ID_CLOSE, active != NULL);
-    set_item(&s_menus[1], "Close all", ID_CLOSE_ALL, n > 0);
-    set_separator(&s_menus[1]);
-    set_item(&s_menus[1], "Arrange icons", ID_ARRANGE, s_ndrives > 0);
-    set_separator(&s_menus[1]);
+    set_item(&s_menus[1], "Select all  Ctrl+A", ID_MARK_ALL, in_folder);
+    set_item(&s_menus[1], "Clear marks", ID_MARK_NONE,
+             dsk_folder_marked(active) > 0);
+
+    s_menus[2].title = "Window";
+    s_menus[2].n = 0;
+    set_item(&s_menus[2], "Cascade", ID_CASCADE, n > 0);
+    set_item(&s_menus[2], "Tile", ID_TILE, n > 0);
+    set_separator(&s_menus[2]);
+    set_item(&s_menus[2], "Close", ID_CLOSE, active != NULL);
+    set_item(&s_menus[2], "Close all", ID_CLOSE_ALL, n > 0);
+    set_separator(&s_menus[2]);
+    set_item(&s_menus[2], "Arrange icons", ID_ARRANGE, s_ndrives > 0);
+    set_separator(&s_menus[2]);
     /*
      * Under Window rather than under File: it opens a window onto something
      * the machine already has, which is what every other item here does.  What
      * it shows - and what it deliberately does not do yet - is in dsk_term.h.
      */
-    set_item(&s_menus[1], "System console", ID_CONSOLE, true);
+    set_item(&s_menus[2], "System console", ID_CONSOLE, true);
     if (n > 0) {
-        set_separator(&s_menus[1]);
+        set_separator(&s_menus[2]);
     }
     /* Topmost first, which is the order somebody looking at the screen sees. */
     for (int i = n - 1; i >= 0; i--) {
         dsk_win_t *w = dsk_wm_at(i);
         char      *label = s_win_labels[i];
         ag_strlcpy(label, w->title, DSK_TITLE_MAX + 4);
-        set_item(&s_menus[1], label, (uint16_t)(ID_WINDOW_FIRST + i), true);
-        s_menus[1].items[s_menus[1].n - 1].checked = (w == active);
+        set_item(&s_menus[2], label, (uint16_t)(ID_WINDOW_FIRST + i), true);
+        s_menus[2].items[s_menus[2].n - 1].checked = (w == active);
     }
 
-    s_menus[2].title = "Options";
-    s_menus[2].n = 0;
-    set_item(&s_menus[2], "Large font (8x16)", ID_FONT_LARGE, true);
-    set_item(&s_menus[2], "Small font (8x8)", ID_FONT_SMALL, true);
-    s_menus[2].items[0].checked = !s_ini.small_font;
-    s_menus[2].items[1].checked = s_ini.small_font;
-    set_separator(&s_menus[2]);
-    set_item(&s_menus[2], "Teal desk", ID_BG_TEAL, true);
-    set_item(&s_menus[2], "Navy desk", ID_BG_NAVY, true);
-    set_item(&s_menus[2], "Green desk", ID_BG_GREEN, true);
-    set_item(&s_menus[2], "Black desk", ID_BG_BLACK, true);
-    s_menus[2].items[3].checked = (s_ini.background == DSK_TEAL);
-    s_menus[2].items[4].checked = (s_ini.background == DSK_NAVY);
-    s_menus[2].items[5].checked = (s_ini.background == DSK_GREEN);
-    s_menus[2].items[6].checked = (s_ini.background == DSK_BLACK);
-    set_separator(&s_menus[2]);
-    set_item(&s_menus[2], "Slow double click", ID_DBL_SLOW, true);
-    set_item(&s_menus[2], "Normal double click", ID_DBL_NORMAL, true);
-    set_item(&s_menus[2], "Fast double click", ID_DBL_FAST, true);
-    s_menus[2].items[8].checked = (s_ini.dblclick_ms >= 600u);
-    s_menus[2].items[9].checked = (s_ini.dblclick_ms > 300u &&
-                                   s_ini.dblclick_ms < 600u);
-    s_menus[2].items[10].checked = (s_ini.dblclick_ms <= 300u);
-
-    s_menus[3].title = "Help";
+    s_menus[3].title = "Options";
     s_menus[3].n = 0;
-    set_item(&s_menus[3], "About...", ID_ABOUT, true);
+    set_item(&s_menus[3], "Large font (8x16)", ID_FONT_LARGE, true);
+    set_item(&s_menus[3], "Small font (8x8)", ID_FONT_SMALL, true);
+    s_menus[3].items[0].checked = !s_ini.small_font;
+    s_menus[3].items[1].checked = s_ini.small_font;
+    set_separator(&s_menus[3]);
+    set_item(&s_menus[3], "Teal desk", ID_BG_TEAL, true);
+    set_item(&s_menus[3], "Navy desk", ID_BG_NAVY, true);
+    set_item(&s_menus[3], "Green desk", ID_BG_GREEN, true);
+    set_item(&s_menus[3], "Black desk", ID_BG_BLACK, true);
+    s_menus[3].items[3].checked = (s_ini.background == DSK_TEAL);
+    s_menus[3].items[4].checked = (s_ini.background == DSK_NAVY);
+    s_menus[3].items[5].checked = (s_ini.background == DSK_GREEN);
+    s_menus[3].items[6].checked = (s_ini.background == DSK_BLACK);
+    set_separator(&s_menus[3]);
+    set_item(&s_menus[3], "Slow double click", ID_DBL_SLOW, true);
+    set_item(&s_menus[3], "Normal double click", ID_DBL_NORMAL, true);
+    set_item(&s_menus[3], "Fast double click", ID_DBL_FAST, true);
+    s_menus[3].items[8].checked = (s_ini.dblclick_ms >= 600u);
+    s_menus[3].items[9].checked = (s_ini.dblclick_ms > 300u &&
+                                   s_ini.dblclick_ms < 600u);
+    s_menus[3].items[10].checked = (s_ini.dblclick_ms <= 300u);
+
+    s_menus[4].title = "Help";
+    s_menus[4].n = 0;
+    set_item(&s_menus[4], "About...", ID_ABOUT, true);
 
     /*
      * The fifth is the context menu: filled when somebody asks for it and
      * never drawn on the bar (dsk_menu_t::hidden).
      */
-    s_menus[4].hidden = true;
-    dsk_menu_set(s_menus, 5);
+    s_menus[5].hidden = true;
+    dsk_menu_set(s_menus, 6);
 }
 
 static void about_done(dsk_answer_t a, void *ctx)
@@ -1688,6 +1817,15 @@ static void menu_chose(uint16_t id)
              */
             ag_printf("desktop: console window opened\n");
         }
+        break;
+    case ID_CUT:
+        clip_take(true);
+        break;
+    case ID_CLIPCOPY:
+        clip_take(false);
+        break;
+    case ID_PASTE:
+        clip_paste();
         break;
     case ID_MARK:
         dsk_folder_mark(dsk_wm_active(), -1, DSK_MARK_TOGGLE);
@@ -2206,6 +2344,28 @@ static void on_key(uint16_t keycode, uint32_t unicode, uint16_t mods)
      * these apply to whatever is selected in the active window, which is a
      * question about the shell and not about one window.
      */
+    /*
+     * The clipboard chords, ahead of the windows for the same reason the
+     * function keys are: they are about the shell's clipboard and the
+     * active window, not about one window's own keys.  Ctrl+A is NOT here -
+     * that one is a folder window's business, because only the window knows
+     * which rows it has.
+     */
+    if (!dsk_dlg_up() && !dsk_menu_open() && (mods & DSK_MOD_CTRL) != 0) {
+        if (unicode == 'x' || unicode == 'X') {
+            clip_take(true);
+            return;
+        }
+        if (unicode == 'c' || unicode == 'C') {
+            clip_take(false);
+            return;
+        }
+        if (unicode == 'v' || unicode == 'V') {
+            clip_paste();
+            return;
+        }
+    }
+
     if (!dsk_dlg_up() && !dsk_menu_open()) {
         switch (keycode) {
         case AG_KEY_F7:

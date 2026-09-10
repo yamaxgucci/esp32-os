@@ -349,24 +349,23 @@ try {
 
     # File > Create directory..., from the keyboard.  F10 puts the shell on the
     # bar and opens the first menu; Down steps over the separators by itself,
-    # so the eighth stop is Create directory and the ninth is Properties:
-    # New window, Run, Copy, Move, Rename, Delete, Select all, Create
-    # directory, Properties.
+    # so the seventh stop is Create directory (New window, Run, Copy, Move,
+    # Rename, Delete, Create directory) and the eighth is Properties.
     #
-    # "Clear marks" is between Select all and Create directory and is NOT a
-    # stop, because nothing is marked here and Down skips a disabled item as
-    # well as a separator (dsk_menu.c).  That is the trap in counting arrow
-    # presses: the number depends on the state the menu is in, not only on
-    # what is written in it.  Getting it wrong by one put the first operation
-    # into the Properties box, which is modal, and every keystroke after it
-    # went into a dialog instead of the shell - 123 of 154 arrived and every
-    # later assertion failed at once.
+    # Two traps live in that sentence, and both have already been walked
+    # into.  Down skips a DISABLED item as well as a separator, so the count
+    # depends on the state the menu is in and not only on what is written in
+    # it; and every one of these numbers moves when a menu is reorganised -
+    # marking and the clipboard now live under Edit, which is why this is
+    # back to seven and eight.  Wrong by one put an operation into the
+    # Properties box, which is modal, and every keystroke after it went into
+    # a dialog: 123 of 154 arrived and eight assertions failed at once.
     #
     # It runs FIRST of the operations, because it changes what is on which
     # row: `newdir` sorts in as the second directory, so $rowsAfterMkdir is
     # what everything after this counts against.
     $opsMkdir = @('key f10', 'wait 500') +
-                (1..8 | ForEach-Object { 'key down' }) +
+                (1..7 | ForEach-Object { 'key down' }) +
                 @('wait 300', 'key enter', 'wait 800',
                   'say newdir', 'wait 200', 'key enter', 'wait 1500')
 
@@ -393,9 +392,8 @@ try {
 
     # File > Properties, from the keyboard: F10 puts the shell on the bar and
     # opens the first menu, and Down steps over the separators by itself.
-    # Nine stops in: New window, Run, Copy, Move, Rename, Delete, Select
-    # all, Create directory, Properties - "Clear marks" is disabled by then
-    # (the marked copy cleared its own marks) and Down steps over it.
+    # Eight stops in: New window, Run, Copy, Move, Rename, Delete, Create
+    # directory, Properties.
     # How long to let the shell catch up before a photograph is taken.
     #
     # One number for both backends, which it took a fix to be able to say.
@@ -409,7 +407,7 @@ try {
     # to 8 ms and a full repaint from 1542 ms to 15.
     $settle = 1200
     $opsProps = @('key f10', 'wait 500') +
-                (1..9 | ForEach-Object { 'key down' }) +
+                (1..8 | ForEach-Object { 'key down' }) +
                 @('wait 300', 'key enter', "wait $settle")
 
     # Window > System console, the last item of that menu (Cascade, Tile,
@@ -424,7 +422,10 @@ try {
     # Before the properties box rather than after: that box is modal, and while
     # one is up the menu bar is fed nothing at all.  A console step after it
     # photographed the dialog closing and called it a console window.
-    $openConsole = @('key f10', 'wait 400', 'key right', 'wait 300') +
+    # Two Rights: File, Edit, Window.  Edit is new today and every one of
+    # these had to move with it.
+    $openConsole = @('key f10', 'wait 400', 'key right', 'wait 200',
+                     'key right', 'wait 300') +
                    (1..6 | ForEach-Object { 'key down' }) +
                    @('wait 300', 'key enter', 'wait 1200')
 
@@ -433,7 +434,8 @@ try {
     # window is Properties on nothing, and the dialog never opens.  The Window
     # menu lists the windows topmost first after its own items, so the eighth
     # entry is the one underneath the console.
-    $backToFolder = @('key f10', 'wait 400', 'key right', 'wait 300') +
+    $backToFolder = @('key f10', 'wait 400', 'key right', 'wait 200',
+                      'key right', 'wait 300') +
                     (1..8 | ForEach-Object { 'key down' }) +
                     @('wait 300', 'key enter', 'wait 800')
 
@@ -450,10 +452,13 @@ try {
     # highlights nothing, so the first down lands on the first item.  One
     # down here picked "Large font", which was already the font - the shell
     # correctly did nothing, and the step proved nothing.
+    # Three Rights now: File, Edit, Window, Options.
     $optFont = @('key f10', 'wait 400', 'key right', 'wait 200', 'key right',
+                 'wait 200', 'key right',
                  'wait 300', 'key down', 'key down', 'wait 300', 'key enter',
                  'wait 1200',
                  'key f10', 'wait 400', 'key right', 'wait 200', 'key right',
+                 'wait 200', 'key right',
                  'wait 300', 'key down', 'wait 300', 'key enter', 'wait 1200')
 
     # Two rows marked with Space, then File > Copy, which with more than one
@@ -471,9 +476,35 @@ try {
                  @('say c:\picked', 'wait 200', 'key enter',
                    'wait 3000')
 
+    # Edit > Copy, walk into a directory, Edit > Paste.  This is the whole
+    # point of a clipboard on this machine: not one letter is typed, which
+    # is what a board with a touchscreen and no keyboard can actually do.
+    #
+    # Edit is one Right from File; Cut, Copy, Paste are its first three
+    # stops.  Backspace walks the window back up out of newdir afterwards so
+    # that everything after this still counts rows in C:.
+    # After the rename the listing is directories first and then files in
+    # order, with hi.axe where HELLO.AXE was - which is a different row,
+    # since h sorts after G and before S.  Written out rather than derived,
+    # because deriving it hides exactly the sort question a wrong row would
+    # have asked.
+    $rowsAfterRename = @('drv', 'newdir', 'DESKTOP.AXE', 'DESKTOP.INI',
+                         'GFXDEMO.AXE', 'hi.axe', 'SYSTEM.CFG')
+
+    $opsClip = (Pick $rowsAfterRename 'hi.axe') +
+               @('wait 200', 'key f10', 'wait 400', 'key right', 'wait 300',
+                 'key down', 'key down', 'wait 300', 'key enter',
+                 'wait 600') +
+               (Pick $rowsAfterRename 'newdir') +
+               @('wait 200', 'key enter', 'wait 1500',
+                 'key f10', 'wait 400', 'key right', 'wait 300',
+                 'key down', 'key down', 'key down', 'wait 300',
+                 'key enter', 'wait 2500',
+                 'key backspace', 'wait 1500')
+
     $keyboard = $runHello + $runGfx + $opsMkdir + $opsCopy + $opsDelete +
-                $opsRename + $openConsole + $backToFolder + $opsMarked +
-                $optFont + $opsProps
+                $opsRename + $openConsole + $backToFolder + $opsClip +
+                $opsMarked + $optFont + $opsProps
     $quoted = ($moves | ForEach-Object { '"' + $_ + '"' }) -join ' '
     $after = @('"key f5"', ('"wait ' + $settle + '"')) -join ' '
     # The properties box is deliberately still up for both photographs - it is
@@ -558,6 +589,7 @@ try {
         'type c:\drv2\kbdvirt.sys',
         'dir c:\drv',
         'dir c:\picked',
+        'dir c:\newdir',
         'dir c:\'
     )
 
@@ -570,6 +602,18 @@ try {
     # ---- what came back ---------------------------------------------------
     if (-not (Test-Path $log)) { throw "no transcript at $log" }
     $text = Get-Content -Raw $log
+
+    # A run that ran out of time is a failure, not a footnote.
+    #
+    # Per-step timeouts are multiplied by ten under icount, so one marker
+    # that never arrives can sit for forty minutes; qemu-boot now stops the
+    # whole thing at its budget and writes down where it was, and this makes
+    # sure nobody reads the rest of the output as if it meant anything.
+    $ranOut = [regex]::Match($text, '\[host\] out of time at: (.*)')
+    if ($ranOut.Success) {
+        $fail += ("the run ran out of its time budget at: " +
+                  $ranOut.Groups[1].Value.Trim())
+    }
     $fail = @()
 
     if (-not (Test-Path $png)) {
@@ -677,6 +721,23 @@ try {
         } else { 0 }
         if ($picked -lt 2) {
             $fail += "the two marked rows did not both reach c:\picked ($picked of 2)"
+        }
+
+        # Copied through the clipboard, with nothing typed: hi.axe was put
+        # on it in C: and pasted inside newdir.
+        # On the rendered screen and not in the transcript: between two
+        # lines of a listing the transcript carries cursor moves and colour
+        # changes, so "within N characters of" means nothing there.  The
+        # screen is what a person would be reading.
+        #
+        # Three hundred and not a hundred: vtdump pads every line to eighty
+        # columns, so the blank line between a listing's heading and its
+        # first row is a hundred and sixty characters of nothing.  The
+        # generous window is the point - this asks "in this listing", and
+        # the listing is at most a dozen rows.
+        if ($screen -notmatch
+            '(?i)Directory of C:\\newdir[\s\S]{0,300}hi\.axe') {
+            $fail += 'Edit > Copy then Paste did not put hi.axe into newdir'
         }
 
         if ($seen -notmatch '(?i)newdir +<DIR>') {

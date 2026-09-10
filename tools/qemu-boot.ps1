@@ -27,6 +27,14 @@ param(
     # RAM disk.  Which one appears depends on what managed to mount.
     [string]$Marker = '\>',
     [int]$TimeoutSec = 60,
+    # A wall-clock ceiling for the WHOLE run, as against TimeoutSec which is
+    # per step - and per step, under icount, is ten times what it says.  One
+    # marker that never arrives could therefore sit for forty minutes without
+    # anybody being told, and did: a run was left waiting while its window
+    # showed a static screen and three separate "is it stuck?" from the far
+    # side of the desk went answered with "no, it is slow".  Zero means the
+    # old behaviour, which is no ceiling at all.
+    [int]$BudgetSec = 900,
     [string[]]$Send = @(),
     # Files to copy into the guest before the commands run, as
     # 'localpath=guestpath'.  There is no other way in: the emulator has no card
@@ -317,6 +325,11 @@ try {
     function Wait-Prompt {
         param([int]$Was, [int]$Seconds = 10)
         $deadline = (Get-Date).AddSeconds($Seconds)
+        # The run's own ceiling wins: waiting for a prompt is the commonest
+        # thing this script does and the commonest place for it to sit.
+        if ($script:runDeadline -and $deadline -gt $script:runDeadline) {
+            $deadline = $script:runDeadline
+        }
         while ((Get-Date) -lt $deadline) {
             $now = Read-Available
             if ($now -gt $Was) { return $now }
@@ -393,7 +406,26 @@ try {
     }
 
     if ($found -and $Send.Count -gt 0) {
+        # The whole run's clock starts here, once, and every wait below is
+        # cut short by it.  What matters as much as stopping is saying where
+        # it stopped: a budget that kills the run silently is a worse version
+        # of the hang it replaces.
+        $runDeadline = if ($BudgetSec -gt 0) {
+            (Get-Date).AddSeconds($BudgetSec)
+        } else {
+            [datetime]::MaxValue
+        }
+        $script:runDeadline = $runDeadline
+        $overBudget = $false
+
         foreach ($cmd in $Send) {
+            if ((Get-Date) -ge $runDeadline) {
+                $overBudget = $true
+                Write-Host ("qemu-boot: out of time after ${BudgetSec}s; " +
+                            "stopped at: $cmd")
+                [void]$text.Append("`r`n[host] out of time at: $cmd`r`n")
+                break
+            }
             # A leading ~ means raw bytes, sent without an Enter and without
             # waiting for a prompt: that is how a key that interrupts a running
             # application is delivered, since there is no prompt to wait for
@@ -458,6 +490,7 @@ try {
                 $needle = $cmd.Substring(1)
                 $mark = $script:sendMark
                 $deadline = (Get-Date).AddSeconds($TimeoutSec)
+                if ($deadline -gt $runDeadline) { $deadline = $runDeadline }
                 $ok = $false
                 while ((Get-Date) -lt $deadline) {
                     [void](Read-Available)
@@ -478,6 +511,7 @@ try {
                 $wasErr = Count-Of ': no space left'
                 Send-Line $cmd
                 $deadline = (Get-Date).AddSeconds($TimeoutSec)
+                if ($deadline -gt $runDeadline) { $deadline = $runDeadline }
                 while ((Get-Date) -lt $deadline) {
                     [void](Read-Available)
                     if ((Count-Of 'file(s) copied') -gt $wasCopy) { break }
@@ -500,6 +534,7 @@ try {
                 foreach ($e in $endings) { $was[$e] = Count-Of $e }
                 Send-Line $cmd
                 $deadline = (Get-Date).AddSeconds($TimeoutSec)
+                if ($deadline -gt $runDeadline) { $deadline = $runDeadline }
                 while ((Get-Date) -lt $deadline) {
                     [void](Read-Available)
                     $done = $false
