@@ -22,6 +22,13 @@ typedef struct {
     uint64_t   size;
     bool       is_dir;
     dsk_icon_t icon;
+    /*
+     * Picked out for an operation, as against the cursor, which is only
+     * where the keyboard is.  One byte an entry, and it lives on the entry
+     * so that re-reading the directory forgets it - which is right: after a
+     * refresh the fourth row is not the file that was the fourth row.
+     */
+    bool       marked;
 } entry_t;
 
 typedef struct {
@@ -31,6 +38,7 @@ typedef struct {
     int      n;     /* entries in it */
     int      total; /* entries the directory has, listed or not */
     int      sel;
+    int      marked;   /* how many entries carry a mark */
     int      top;      /* the first row on screen */
     bool     truncated;
     bool     used;
@@ -125,6 +133,7 @@ static void read_dir(folder_t *f)
         }
     }
     f->total = 0;
+    f->marked = 0;
 
     if (!is_root(f->path)) {
         /* The way up is the shell's row, not the directory's: it is in `n`
@@ -323,6 +332,15 @@ static void draw_status(dsk_win_t *w, folder_t *f)
                    sizeof(line));
     }
     ag_strlcat(line, (f->n == 1) ? " object" : " objects", sizeof(line));
+    if (f->marked > 0) {
+        /* What an operation will act on, in the one place a person is
+         * already looking to find out what is in this window. */
+        ag_strlcat(line, ", ", sizeof(line));
+        ag_strlcat(line, ag_utoa((uint64_t)f->marked, num, sizeof(num), 0,
+                                 false),
+                   sizeof(line));
+        ag_strlcat(line, " picked", sizeof(line));
+    }
     dsk_text_small((int16_t)(r.x + 3), (int16_t)(r.y + 2), line, DSK_BLACK,
                    DSK_LGRAY);
 
@@ -356,7 +374,16 @@ static void draw_folder(dsk_win_t *w, dsk_rect_t client)
             break;
         }
         const entry_t   *e = &f->entries[at];
-        const bool       lit = (at == f->sel);
+        /*
+         * Two different things, drawn as one where they coincide: a mark is
+         * what an operation will act on, and the cursor is where the
+         * keyboard is.  While nothing is marked the cursor row IS the
+         * selection - which is what every operation in this shell already
+         * assumed, and why marking could be added without touching any of
+         * them.
+         */
+        const bool       lit = e->marked || (f->marked == 0 && at == f->sel);
+        const bool       cursor = (at == f->sel);
         const dsk_rect_t r =
             dsk_rect(l.x, (int16_t)(l.y + i * ROW_H), l.w, ROW_H);
         const uint32_t bg = lit ? DSK_NAVY : DSK_WHITE;
@@ -364,6 +391,11 @@ static void draw_folder(dsk_win_t *w, dsk_rect_t client)
 
         if (lit) {
             dsk_fill(r, DSK_NAVY);
+        }
+        if (cursor && f->marked != 0) {
+            /* Where the two differ, the cursor is a frame and the mark is a
+             * fill, so a marked row under the cursor is still both. */
+            dsk_frame(r, DSK_BLACK);
         }
         dsk_icon_draw(e->icon, r.x, r.y, 1, bg);
         /* The size column is only worth its room when there is room. */
@@ -497,6 +529,21 @@ static bool folder_pointer(dsk_win_t *w, dsk_hit_t where, int16_t x, int16_t y,
     if (at < 0 || at >= f->n) {
         return true;
     }
+    /*
+     * A plain click starts again from nothing, and that matters more than it
+     * looks: without it a mark made a minute ago is still there, invisible
+     * below the fold of a scrolled list, and Delete means more than it looks
+     * like it means.
+     *
+     * There is no Ctrl+click, and not for want of trying: a pointer event
+     * carries buttons and no modifiers (ABI 0.42), so this window cannot
+     * know whether Ctrl was down.  Marking by hand is Space, by finger the
+     * context menu, and neither of those needs two devices at once - which
+     * on the board is just as well, since it has no keyboard at all.
+     */
+    if (f->marked != 0 && !dbl) {
+        dsk_folder_mark(w, -1, DSK_MARK_NONE);
+    }
     if (f->sel != at) {
         f->sel = at;
         dsk_wm_damage_rect(dsk_wm_client(w));
@@ -505,6 +552,92 @@ static bool folder_pointer(dsk_win_t *w, dsk_hit_t where, int16_t x, int16_t y,
         activate(w, at);
     }
     return true;
+}
+
+int dsk_folder_marked(const dsk_win_t *w)
+{
+    const folder_t *f = (w != NULL && dsk_folder_is(w))
+                            ? (const folder_t *)w->user
+                            : NULL;
+    return (f != NULL) ? f->marked : 0;
+}
+
+bool dsk_folder_marked_at(const dsk_win_t *w, int which, char *path,
+                          size_t len, char *name, size_t name_len,
+                          bool *is_dir)
+{
+    const folder_t *f = (w != NULL && dsk_folder_is(w))
+                            ? (const folder_t *)w->user
+                            : NULL;
+    if (f == NULL || which < 0) {
+        return false;
+    }
+    for (int i = 0; i < f->n; i++) {
+        if (!f->entries[i].marked) {
+            continue;
+        }
+        if (which-- != 0) {
+            continue;
+        }
+        const entry_t *e = &f->entries[i];
+        if (path != NULL) {
+            join(f->path, e->name, path, len);
+        }
+        if (name != NULL) {
+            ag_strlcpy(name, e->name, name_len);
+        }
+        if (is_dir != NULL) {
+            *is_dir = e->is_dir;
+        }
+        return true;
+    }
+    return false;
+}
+
+/*
+ * Marking, the three ways a person asks for it.
+ *
+ * `row` of -1 means the cursor, which is what a keyboard and a context menu
+ * both mean by "this one".  ".." is never marked: it is a place, not a file,
+ * and an operation aimed at it is aimed at the parent directory.
+ */
+void dsk_folder_mark(dsk_win_t *w, int row, dsk_mark_t how)
+{
+    folder_t *f = (w != NULL && dsk_folder_is(w)) ? (folder_t *)w->user : NULL;
+    if (f == NULL || f->entries == NULL) {
+        return;
+    }
+    const bool up = !is_root(f->path); /* row 0 is ".." when there is one */
+
+    switch (how) {
+    case DSK_MARK_TOGGLE: {
+        const int at = (row >= 0) ? row : f->sel;
+        if (at < 0 || at >= f->n || (up && at == 0)) {
+            return;
+        }
+        f->entries[at].marked = !f->entries[at].marked;
+        f->marked += f->entries[at].marked ? 1 : -1;
+        break;
+    }
+    case DSK_MARK_ALL:
+    case DSK_MARK_NONE:
+    case DSK_MARK_INVERT:
+        f->marked = 0;
+        for (int i = 0; i < f->n; i++) {
+            if (up && i == 0) {
+                f->entries[i].marked = false;
+                continue;
+            }
+            f->entries[i].marked = (how == DSK_MARK_ALL)    ? true
+                                   : (how == DSK_MARK_NONE) ? false
+                                                            : !f->entries[i].marked;
+            if (f->entries[i].marked) {
+                f->marked++;
+            }
+        }
+        break;
+    }
+    dsk_wm_damage_rect(dsk_wm_client(w));
 }
 
 bool dsk_folder_open_sel(dsk_win_t *w)
@@ -520,8 +653,6 @@ bool dsk_folder_open_sel(dsk_win_t *w)
 static bool folder_key(dsk_win_t *w, uint16_t keycode, uint32_t unicode,
                        uint16_t mods)
 {
-    (void)unicode;
-    (void)mods;
     folder_t *f = (folder_t *)w->user;
     if (f == NULL) {
         return false;
@@ -529,6 +660,29 @@ static bool folder_key(dsk_win_t *w, uint16_t keycode, uint32_t unicode,
     const int rows = rows_visible(w);
     const int was_sel = f->sel;
     const int was_top = f->top;
+
+    /*
+     * Space is the mark key, as it is in every file manager since Norton -
+     * and Ctrl+A is the one every graphical shell since has agreed on.  Both
+     * are here rather than in the desktop's key table because the marks
+     * belong to this window and nothing else can say which row is under its
+     * cursor.
+     */
+    if (keycode == DSK_KEY_SPACE && (mods & DSK_MOD_CTRL) == 0) {
+        dsk_folder_mark(w, -1, DSK_MARK_TOGGLE);
+        if (f->sel + 1 < f->n) {
+            f->sel++; /* marking a run of files should not need two hands */
+            clamp_scroll(w, f);
+            dsk_wm_damage_rect(dsk_wm_client(w));
+        }
+        return true;
+    }
+    if ((mods & DSK_MOD_CTRL) != 0 && (unicode == 'a' || unicode == 'A')) {
+        dsk_folder_mark(w, -1, (f->marked == f->n - (is_root(f->path) ? 0 : 1))
+                                   ? DSK_MARK_NONE
+                                   : DSK_MARK_ALL);
+        return true;
+    }
 
     switch (keycode) {
     case DSK_KEY_UP:

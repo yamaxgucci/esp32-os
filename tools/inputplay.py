@@ -94,6 +94,13 @@ HID = {
     # typed at.  The ones needing shift are left out rather than faked.
     ".": 0x37, "-": 0x2D, "/": 0x38, "=": 0x2E, ";": 0x33,
     "period": 0x37, "minus": 0x2D, "slash": 0x38,
+    # A path needs both of these and neither needs shift on a US keyboard.
+    # Without them a scenario cannot type a destination at all: `say
+    # c:\\picked` stopped dead at the colon, and because send_key raises
+    # rather than skips, everything after it in that invocation was silently
+    # not run - thirty keystrokes and four assertions.
+    "\\": 0x31, "backslash": 0x31, "[": 0x2F, "]": 0x30, "'": 0x34,
+    ",": 0x36, "`": 0x35,
     # The modifiers, which carry a usage id like any other key *and* a bit in
     # every packet sent while they are held.  A real keyboard reports both and
     # a shell that reads Alt+Tab needs both: the bit says which chord it is.
@@ -102,6 +109,14 @@ HID = {
 }
 
 # ag_keymod, the bits KBDVIRT passes through to the guest.
+# What shift makes of a key, for the characters a path or a name needs.
+SHIFTED = {
+    ":": ";", "_": "-", "?": "/", "+": "=", "~": "`", "|": chr(92),
+    "!": "1", "@": "2", "#": "3", "$": "4", "%": "5", "^": "6",
+    "&": "7", "*": "8", "(": "9", ")": "0", "{": "[", "}": "]",
+    '"': "'", "<": ",", ">": ".",
+}
+
 MOD_BIT = {
     0xE1: 0x01, 0xE5: 0x01,  # shift
     0xE0: 0x02, 0xE4: 0x02,  # ctrl
@@ -187,6 +202,26 @@ class Guest:
         return self.mouse
 
     def send_key(self, name: str, down: bool, up: bool) -> None:
+        # A character that needs shift is sent as shift plus the key that
+        # carries it, which is what a keyboard does.  Faking it by sending
+        # the character alone was the other option and it is worse: the
+        # guest would see ';' where the scenario wrote ':' and the mistake
+        # would surface as a file with the wrong name.
+        shifted = SHIFTED.get(name)
+        if shifted is not None:
+            self.mods |= MOD_BIT[0xE1]
+            s = self.keyboard()
+            s.sendall(key_packet(KEY_DOWN, 0xE1, 0, self.mods))
+            try:
+                base = HID[shifted]
+                s.sendall(key_packet(KEY_DOWN, base, ord(name), self.mods))
+                time.sleep(0.05)
+                s.sendall(key_packet(KEY_UP, base, 0, self.mods))
+            finally:
+                self.mods &= ~MOD_BIT[0xE1]
+                s.sendall(key_packet(KEY_UP, 0xE1, 0, self.mods))
+            return
+
         hid = HID.get(name.lower())
         if hid is None:
             raise SystemExit("inputplay: no key called %r" % name)

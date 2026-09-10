@@ -57,6 +57,31 @@ bool dsk_folder_selected(const dsk_win_t *w, char *path, size_t len,
 void dsk_folder_select_name(dsk_win_t *w, const char *name);
 
 /*
+ * Marks: what an operation acts on when it is more than one thing.
+ *
+ * The cursor and the selection used to be the same row, and while nothing is
+ * marked they still are - every operation asks dsk_folder_selected() first
+ * and gets the cursor, exactly as before.  Marks are the other case: once
+ * there are any, they are what Copy, Move and Delete work through.
+ */
+typedef enum {
+    DSK_MARK_TOGGLE = 0, /* one row; -1 means the cursor's */
+    DSK_MARK_ALL,
+    DSK_MARK_NONE,
+    DSK_MARK_INVERT,
+} dsk_mark_t;
+
+void dsk_folder_mark(dsk_win_t *w, int row, dsk_mark_t how);
+
+/* How many rows carry a mark in this window (0 when none do). */
+int dsk_folder_marked(const dsk_win_t *w);
+
+/* The `which`th marked entry, in the order they are listed. */
+bool dsk_folder_marked_at(const dsk_win_t *w, int which, char *path,
+                          size_t len, char *name, size_t name_len,
+                          bool *is_dir);
+
+/*
  * Open what is picked, the way Enter and a double-click do.
  *
  * For the context menu, whose first item has to be the obvious one: a finger

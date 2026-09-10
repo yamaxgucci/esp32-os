@@ -543,6 +543,9 @@ enum {
      * board has none, and until now the font could only be changed by
      * editing DESKTOP.INI on a machine that has one.
      */
+    ID_MARK,
+    ID_MARK_ALL,
+    ID_MARK_NONE,
     ID_FONT_LARGE,
     ID_FONT_SMALL,
     ID_BG_TEAL,
@@ -579,6 +582,9 @@ static struct {
     char name[64];          /* its last component, for prompts and errors   */
     char dir[AG_PATH_MAX];  /* the directory it is in                       */
     bool is_dir;
+    /* The folder window it came from: a dialog is the active window while
+     * it is up, so "which folder?" cannot be asked again afterwards. */
+    dsk_win_t *win;
 } s_op;
 
 /* dir + name in the DOS spelling the rest of the shell uses. */
@@ -608,11 +614,32 @@ static bool take_selection(void)
     }
     if (!dsk_folder_selected(w, s_op.path, sizeof(s_op.path), s_op.name,
                              sizeof(s_op.name), &s_op.is_dir)) {
-        s_note = "nothing is selected";
-        damage(s_m.statusbar);
-        return false;
+        /*
+         * With marks it does not matter where the cursor is - it can be on
+         * ".." - so the first marked entry stands in for it.  What the
+         * operation acts on is the marks; this only fills in the name the
+         * question is asked about and the directory it is asked from.
+         */
+        if (dsk_folder_marked(w) == 0 ||
+            !dsk_folder_marked_at(w, 0, s_op.path, sizeof(s_op.path),
+                                  s_op.name, sizeof(s_op.name),
+                                  &s_op.is_dir)) {
+            s_note = "nothing is selected";
+            damage(s_m.statusbar);
+            return false;
+        }
     }
     ag_strlcpy(s_op.dir, dir, sizeof(s_op.dir));
+    /*
+     * Which window this is about, held rather than asked for again.
+     *
+     * A dialog is a window and it is the active one while it is up, so a
+     * callback that asks "which folder is active?" can be answered with the
+     * dialog - and then the marks belong to nobody and a two-file copy
+     * quietly becomes a one-file copy.  The answer is decided here, where
+     * the folder window is unambiguously the thing being acted on.
+     */
+    s_op.win = w;
     return true;
 }
 
@@ -704,10 +731,92 @@ static void dir_of(const char *path, char *out, size_t len)
     }
 }
 
+/*
+ * Several files into one directory.
+ *
+ * The single-file path asks for the finished NAME, because renaming while
+ * copying is half of what a copy is for.  With more than one there is no
+ * such thing as the finished name, so what is typed is a directory and each
+ * file keeps the name it has.  Two rules for two situations, and the strip
+ * says which one is in force by saying how many are picked.
+ */
+static void copy_marked(dsk_win_t *w, const char *dir, bool moving, int marks)
+{
+    /*
+     * The directory is made if it is not there.
+     *
+     * "Into directory:" is a promise about where things are going, and a
+     * person who types a name that does not exist yet means make it - the
+     * alternative is one error box per file, which is what the first version
+     * of this did: two files, two boxes, and thirty keystrokes of the test
+     * disappearing into them.
+     */
+    ag_stat_t st;
+    if (ag_stat(dir, &st) != AG_OK) {
+        if (!dsk_ops_mkdir(dir, dir)) {
+            return;
+        }
+    } else if ((st.attr & AG_A_DIR) == 0) {
+        (void)dsk_dlg_message(moving ? "Move" : "Copy",
+                              "That name is a file, not a directory.",
+                              "Several things need somewhere to go.",
+                              DSK_DLG_OK, NULL, NULL);
+        return;
+    }
+
+    for (int i = 0; i < marks; i++) {
+        char from[AG_PATH_MAX];
+        char name[DSK_INPUT_MAX];
+        bool is_dir = false;
+        if (!dsk_folder_marked_at(w, i, from, sizeof(from), name,
+                                  sizeof(name), &is_dir)) {
+            break;
+        }
+        char to[AG_PATH_MAX];
+        path_join(dir, name, to, sizeof(to));
+        if (ag_stricmp(to, from) == 0) {
+            continue; /* into the directory it is already in: nothing to do */
+        }
+        if (moving) {
+            dsk_ops_move(from, to, name);
+        } else {
+            dsk_ops_copy(from, to, name);
+        }
+    }
+    /*
+     * The marks go, whichever it was.  After a move the rows are not there;
+     * after a copy they are, and leaving them marked would make the next
+     * Delete mean far more than the person meant.
+     */
+    dsk_folder_mark(w, -1, DSK_MARK_NONE);
+}
+
 static void copy_typed(dsk_answer_t a, const char *text, void *ctx)
 {
     const bool moving = (ctx != NULL);
     if (a != DSK_ANSWER_OK || text == NULL) {
+        return;
+    }
+
+    dsk_win_t *const w = s_op.win;
+    const int        marks = dsk_folder_marked(w);
+    if (marks > 1) {
+        char dir[AG_PATH_MAX];
+        /* Whatever was typed is a directory here, so it is taken as one
+         * without asking the filesystem to agree: it may not exist yet. */
+        bool has_dir = false;
+        for (const char *q = text; *q != '\0'; q++) {
+            if (*q == '/' || *q == '\\' || *q == ':') {
+                has_dir = true;
+            }
+        }
+        if (has_dir) {
+            ag_strlcpy(dir, text, sizeof(dir));
+        } else {
+            path_join(s_op.dir, text, dir, sizeof(dir));
+        }
+        copy_marked(w, dir, moving, marks);
+        after_op(dir);
         return;
     }
 
@@ -788,6 +897,31 @@ static void delete_answered(dsk_answer_t a, void *ctx)
     if (a != DSK_ANSWER_YES) {
         return;
     }
+
+    dsk_win_t *const w = s_op.win;
+    const int        marks = dsk_folder_marked(w);
+    if (marks > 1) {
+        /*
+         * Backwards through the marks, and that is not a style choice: each
+         * delete is answered by the filesystem before the next is asked for,
+         * but the list this walks is the window's own and a row that goes
+         * shifts the ones after it.  Taking the last one first means every
+         * index this loop still has to use is one it has already read.
+         */
+        for (int i = marks - 1; i >= 0; i--) {
+            char from[AG_PATH_MAX];
+            char name[DSK_INPUT_MAX];
+            if (!dsk_folder_marked_at(w, i, from, sizeof(from), name,
+                                      sizeof(name), NULL)) {
+                continue;
+            }
+            dsk_ops_delete(from, name);
+        }
+        dsk_folder_mark(w, -1, DSK_MARK_NONE);
+        after_op(NULL);
+        return;
+    }
+
     dsk_ops_delete(s_op.path, s_op.name);
     after_op(NULL);
 }
@@ -807,10 +941,20 @@ static void ask_copy_to(bool moving, const char *dest)
         return;
     }
     char prompt[96];
+    char num[24];
+    const int marks = dsk_folder_marked(dsk_wm_active());
+
     ag_strlcpy(prompt, moving ? "Move " : "Copy ", sizeof(prompt));
-    ag_strlcat(prompt, s_op.is_dir ? "directory " : "", sizeof(prompt));
-    ag_strlcat(prompt, s_op.name, sizeof(prompt));
-    ag_strlcat(prompt, " to:", sizeof(prompt));
+    if (marks > 1) {
+        ag_strlcat(prompt, ag_utoa((uint64_t)marks, num, sizeof(num), 0,
+                                   false),
+                   sizeof(prompt));
+        ag_strlcat(prompt, " items into directory:", sizeof(prompt));
+    } else {
+        ag_strlcat(prompt, s_op.is_dir ? "directory " : "", sizeof(prompt));
+        ag_strlcat(prompt, s_op.name, sizeof(prompt));
+        ag_strlcat(prompt, " to:", sizeof(prompt));
+    }
 
     (void)dsk_dlg_input(moving ? "Move" : "Copy", prompt, dest, copy_typed,
                         moving ? (void *)&s_op : NULL);
@@ -886,6 +1030,11 @@ static void context_menu_at(int16_t x, int16_t y)
 
     if (in_folder) {
         set_item(m, "Open  Enter", ID_OPEN, sel);
+        set_item(m, (dsk_folder_marked(w) > 0) ? "Mark / unmark  Space"
+                                               : "Mark  Space",
+                 ID_MARK, sel);
+        set_item(m, "Select all", ID_MARK_ALL, true);
+        set_item(m, "Clear marks", ID_MARK_NONE, dsk_folder_marked(w) > 0);
         set_separator(m);
         set_item(m, "Copy...  F8", ID_COPY, sel);
         set_item(m, "Move...  F7", ID_MOVE, sel);
@@ -1060,10 +1209,19 @@ static void ask_delete(void)
     if (!take_selection()) {
         return;
     }
-    char line[96];
+    char      line[96];
+    char      num[24];
+    const int marks = dsk_folder_marked(dsk_wm_active());
+
     ag_strlcpy(line, "Delete ", sizeof(line));
-    ag_strlcat(line, s_op.name, sizeof(line));
-    ag_strlcat(line, "?", sizeof(line));
+    if (marks > 1) {
+        ag_strlcat(line, ag_utoa((uint64_t)marks, num, sizeof(num), 0, false),
+                   sizeof(line));
+        ag_strlcat(line, " picked items?", sizeof(line));
+    } else {
+        ag_strlcat(line, s_op.name, sizeof(line));
+        ag_strlcat(line, "?", sizeof(line));
+    }
 
     /*
      * A directory takes everything under it, and the question has to say so:
@@ -1343,10 +1501,20 @@ static void rebuild_menus(void)
      */
     const bool sel = dsk_folder_selected(active, NULL, 0, NULL, 0, NULL);
     const bool in_folder = dsk_folder_path(active) != NULL;
-    set_item(&s_menus[0], "Copy...  F8", ID_COPY, sel);
-    set_item(&s_menus[0], "Move...  F7", ID_MOVE, sel);
+    /*
+     * Marks count as a selection for the three that can act on many, and do
+     * not for Rename, which cannot: there is no such thing as renaming four
+     * files to one name.
+     */
+    const bool any = sel || dsk_folder_marked(active) > 0;
+    set_item(&s_menus[0], "Copy...  F8", ID_COPY, any);
+    set_item(&s_menus[0], "Move...  F7", ID_MOVE, any);
     set_item(&s_menus[0], "Rename...  F2", ID_RENAME, sel);
-    set_item(&s_menus[0], "Delete  Del", ID_DELETE, sel);
+    set_item(&s_menus[0], "Delete  Del", ID_DELETE, any);
+    set_separator(&s_menus[0]);
+    set_item(&s_menus[0], "Select all  Ctrl+A", ID_MARK_ALL, in_folder);
+    set_item(&s_menus[0], "Clear marks", ID_MARK_NONE,
+             dsk_folder_marked(active) > 0);
     set_separator(&s_menus[0]);
     set_item(&s_menus[0], "Create directory...", ID_MKDIR, in_folder);
     set_item(&s_menus[0], "Properties...", ID_PROPS,
@@ -1520,6 +1688,15 @@ static void menu_chose(uint16_t id)
              */
             ag_printf("desktop: console window opened\n");
         }
+        break;
+    case ID_MARK:
+        dsk_folder_mark(dsk_wm_active(), -1, DSK_MARK_TOGGLE);
+        break;
+    case ID_MARK_ALL:
+        dsk_folder_mark(dsk_wm_active(), -1, DSK_MARK_ALL);
+        break;
+    case ID_MARK_NONE:
+        dsk_folder_mark(dsk_wm_active(), -1, DSK_MARK_NONE);
         break;
     case ID_FONT_LARGE:
     case ID_FONT_SMALL: {

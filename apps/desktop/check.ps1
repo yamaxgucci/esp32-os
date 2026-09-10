@@ -349,14 +349,24 @@ try {
 
     # File > Create directory..., from the keyboard.  F10 puts the shell on the
     # bar and opens the first menu; Down steps over the separators by itself,
-    # so the seventh stop is Create directory (New window, Run, Copy, Move,
-    # Rename, Delete, Create directory) and the eighth is Properties.
+    # so the eighth stop is Create directory and the ninth is Properties:
+    # New window, Run, Copy, Move, Rename, Delete, Select all, Create
+    # directory, Properties.
+    #
+    # "Clear marks" is between Select all and Create directory and is NOT a
+    # stop, because nothing is marked here and Down skips a disabled item as
+    # well as a separator (dsk_menu.c).  That is the trap in counting arrow
+    # presses: the number depends on the state the menu is in, not only on
+    # what is written in it.  Getting it wrong by one put the first operation
+    # into the Properties box, which is modal, and every keystroke after it
+    # went into a dialog instead of the shell - 123 of 154 arrived and every
+    # later assertion failed at once.
     #
     # It runs FIRST of the operations, because it changes what is on which
     # row: `newdir` sorts in as the second directory, so $rowsAfterMkdir is
     # what everything after this counts against.
     $opsMkdir = @('key f10', 'wait 500') +
-                (1..7 | ForEach-Object { 'key down' }) +
+                (1..8 | ForEach-Object { 'key down' }) +
                 @('wait 300', 'key enter', 'wait 800',
                   'say newdir', 'wait 200', 'key enter', 'wait 1500')
 
@@ -383,8 +393,9 @@ try {
 
     # File > Properties, from the keyboard: F10 puts the shell on the bar and
     # opens the first menu, and Down steps over the separators by itself.
-    # Seven items in: New window, Run, Copy, Move, Rename, Delete, Create
-    # directory, Properties.
+    # Nine stops in: New window, Run, Copy, Move, Rename, Delete, Select
+    # all, Create directory, Properties - "Clear marks" is disabled by then
+    # (the marked copy cleared its own marks) and Down steps over it.
     # How long to let the shell catch up before a photograph is taken.
     #
     # One number for both backends, which it took a fix to be able to say.
@@ -398,7 +409,7 @@ try {
     # to 8 ms and a full repaint from 1542 ms to 15.
     $settle = 1200
     $opsProps = @('key f10', 'wait 500') +
-                (1..8 | ForEach-Object { 'key down' }) +
+                (1..9 | ForEach-Object { 'key down' }) +
                 @('wait 300', 'key enter', "wait $settle")
 
     # Window > System console, the last item of that menu (Cascade, Tile,
@@ -445,9 +456,24 @@ try {
                  'key f10', 'wait 400', 'key right', 'wait 200', 'key right',
                  'wait 300', 'key down', 'wait 300', 'key enter', 'wait 1200')
 
+    # Two rows marked with Space, then File > Copy, which with more than one
+    # mark asks for a DIRECTORY and puts both in it under their own names.
+    # Space marks and steps down, so two of them mark two neighbours.
+    #
+    # Home lands on "..", which cannot be marked - a mark on the way up is a
+    # mark on the parent directory - so the first Down is what gets onto a
+    # real row.
+    $opsMarked = @('key home', 'key down', 'wait 200',
+                   'key space', 'key space', 'wait 300',
+                   'key f10', 'wait 400') +
+                 (1..3 | ForEach-Object { 'key down' }) +
+                 @('wait 300', 'key enter', 'wait 800') + $clear +
+                 @('say c:\picked', 'wait 200', 'key enter',
+                   'wait 3000')
+
     $keyboard = $runHello + $runGfx + $opsMkdir + $opsCopy + $opsDelete +
-                $opsRename + $openConsole + $backToFolder + $optFont +
-                $opsProps
+                $opsRename + $openConsole + $backToFolder + $opsMarked +
+                $optFont + $opsProps
     $quoted = ($moves | ForEach-Object { '"' + $_ + '"' }) -join ' '
     $after = @('"key f5"', ('"wait ' + $settle + '"')) -join ' '
     # The properties box is deliberately still up for both photographs - it is
@@ -531,6 +557,7 @@ try {
         # it is what is asked for the rename.
         'type c:\drv2\kbdvirt.sys',
         'dir c:\drv',
+        'dir c:\picked',
         'dir c:\'
     )
 
@@ -613,24 +640,46 @@ try {
     # whole-screen repaints and cannot answer an ordering question.
     if (Test-Path 'build-host\vtdump.exe') {
         $screen = (& cmd /c "build-host\vtdump.exe 80 25 437 < $log") -join "`n"
+
+        # The last screen AND the whole transcript.
+        #
+        # vtdump replays the console and hands back the 80x25 the guest ends
+        # up looking at, which is the right thing for "what does it say now"
+        # - and the wrong thing for evidence printed earlier: adding one more
+        # `dir` at the end scrolled two answers off the top and two
+        # assertions failed about operations that had worked perfectly.  The
+        # transcript still has every byte, so both are searched.
+        $seen = $screen + "`n" + $text
         Write-Host $screen
 
         # Renamed: the listing has the new name and not the old one.
-        if ($screen -notmatch '(?i)HI\.AXE') {
+        if ($seen -notmatch '(?i)HI\.AXE') {
             $fail += 'F2 did not rename HELLO.AXE'
         }
         if ($screen -match '(?i)HELLO\.AXE') {
             $fail += 'the old name is still there after the rename'
         }
         # Copied and then deleted: the copy is gone and the original is not.
-        if ($screen -notmatch '(?i)drv2.kbdvirt\.sys: file not found') {
+        if ($seen -notmatch '(?i)drv2.kbdvirt\.sys: file not found') {
             $fail += 'Delete did not remove the copied tree'
         }
-        if ($screen -notmatch '(?i)kbdvirt\.sys') {
+        if ($seen -notmatch '(?i)kbdvirt\.sys') {
             $fail += 'the delete took the original C:\DRV as well as the copy'
         }
         # Created: the listing has it, and as a directory.
-        if ($screen -notmatch '(?i)newdir +<DIR>') {
+        # Two files, marked and copied in one go, under their own names.
+        # The count is the point: one arriving would look like success to
+        # anything that only asks whether a copy happened at all.
+        $listing = [regex]::Match($seen,
+                   '(?is)Directory of C:\\picked(.{0,400}?)file\(s\)')
+        $picked = if ($listing.Success) {
+            ([regex]::Matches($listing.Groups[1].Value, '<DIR>|\d+')).Count
+        } else { 0 }
+        if ($picked -lt 2) {
+            $fail += "the two marked rows did not both reach c:\picked ($picked of 2)"
+        }
+
+        if ($seen -notmatch '(?i)newdir +<DIR>') {
             $fail += 'Create directory did not make it'
         }
     } else {
