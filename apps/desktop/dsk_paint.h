@@ -102,6 +102,17 @@ void dsk_paint_frame_done(void);
 
 /* ---- what the shell actually calls -------------------------------------- */
 
+/*
+ * Not a colour: "leave what is behind".
+ *
+ * Outside the twenty-four bits a colour uses, so it can travel anywhere a
+ * colour does.  What it costs is a read of the area first, which the band
+ * backend answers from the strip it is holding - the same trick the pointer
+ * has always used, and the reason the desk's pattern can show through an
+ * icon at all.
+ */
+#define DSK_TRANSPARENT 0x01000000u
+
 /* The widest screen this shell composes a scanline for (see dsk_pattern). */
 #define DSK_PATTERN_MAX_W 640
 

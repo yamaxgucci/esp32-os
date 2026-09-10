@@ -339,9 +339,19 @@ static void draw_drives(void)
                                    r),
                      behind);
         }
+        /*
+         * Over the desk rather than over a rectangle of its colour.
+         *
+         * With a tile on the desk the difference is the whole point: an
+         * icon composed against the flat background left a square hole in
+         * the pattern, and so did the caption.  A picked caption keeps its
+         * solid block - that block is what "picked" looks like.
+         */
+        const bool over = (dsk_pattern_rows((int)s_ini.pattern) != NULL);
         dsk_icon_draw(s_drives[i].icon, ix, (int16_t)(r.y + 2), 2,
-                      s_ini.background);
-        dsk_text_small(tx, ty, s_drives[i].label, DSK_WHITE, behind);
+                      over ? DSK_TRANSPARENT : s_ini.background);
+        dsk_text_small(tx, ty, s_drives[i].label, DSK_WHITE,
+                       (over && !picked) ? DSK_TRANSPARENT : behind);
     }
 }
 

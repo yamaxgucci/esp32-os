@@ -155,13 +155,30 @@ void dsk_icon_draw(dsk_icon_t id, int16_t x, int16_t y, int scale, uint32_t bg)
     if (scale > 2) {
         scale = 2;
     }
-    const int      w = DSK_ICON_W * scale;
-    const uint16_t back = to565(bg);
+    const int        w = DSK_ICON_W * scale;
+    const int        h = DSK_ICON_H * scale;
+    const uint16_t   back = to565(bg);
+    const bool       keep = (bg == DSK_TRANSPARENT);
+    const dsk_rect_t box = dsk_rect(x, y, (int16_t)w, (int16_t)h);
+
+    if (keep) {
+        /*
+         * What is behind the icon, so that its transparent pixels stay
+         * behind it.  Every icon here is a shape on a background it does
+         * not own - the desk's pattern, or the white of a list - and
+         * composing against a flat colour was a rectangle of that colour
+         * around every icon.
+         */
+        dsk_paint()->read(box, s_scratch);
+    }
 
     for (int row = 0; row < DSK_ICON_H; row++) {
         const char *art = k_art[id][row];
         for (int col = 0; col < DSK_ICON_W; col++) {
-            const int      n = nibble(art[col]);
+            const int n = nibble(art[col]);
+            if (n < 0 && keep) {
+                continue; /* leave what was read there */
+            }
             const uint16_t px = (n < 0) ? back : to565(k_pal[n]);
             for (int sy = 0; sy < scale; sy++) {
                 uint16_t *out = &s_scratch[(row * scale + sy) * w + col * scale];
@@ -171,8 +188,7 @@ void dsk_icon_draw(dsk_icon_t id, int16_t x, int16_t y, int scale, uint32_t bg)
             }
         }
     }
-    dsk_paint()->blit(dsk_rect(x, y, (int16_t)w, (int16_t)(DSK_ICON_H * scale)),
-                      s_scratch, (uint32_t)w);
+    dsk_paint()->blit(box, s_scratch, (uint32_t)w);
 }
 
 /* ---- which icon a name deserves ---------------------------------------- */

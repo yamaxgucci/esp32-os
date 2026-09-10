@@ -211,17 +211,26 @@ void dsk_text_small(int16_t x, int16_t y, const char *s, uint32_t fg,
     }
     const uint16_t f = to565(fg);
     const uint16_t b = to565(bg);
+    const bool     keep = (bg == DSK_TRANSPARENT);
     uint16_t       cell[DSK_SMALL_W * DSK_SMALL_H];
     int16_t        at = x;
 
     for (const unsigned char *p = (const unsigned char *)s; *p != '\0'; p++) {
         const uint8_t *rows = k_font8x8[*p];
+        const dsk_rect_t box = dsk_rect(at, y, DSK_SMALL_W, DSK_SMALL_H);
+        if (keep) {
+            /* What is behind this character, so only its ink lands on it. */
+            s_p->read(box, cell);
+        }
         for (int row = 0; row < DSK_SMALL_H; row++) {
             const uint8_t bits = rows[row];
             for (int col = 0; col < DSK_SMALL_W; col++) {
                 /* Bit 0 is the leftmost pixel (see apps/common/font8x8.h). */
-                cell[row * DSK_SMALL_W + col] =
-                    ((bits >> col) & 1u) ? f : b;
+                if (((bits >> col) & 1u) != 0u) {
+                    cell[row * DSK_SMALL_W + col] = f;
+                } else if (!keep) {
+                    cell[row * DSK_SMALL_W + col] = b;
+                }
             }
         }
         s_p->blit(dsk_rect(at, y, DSK_SMALL_W, DSK_SMALL_H), cell,

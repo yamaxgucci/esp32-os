@@ -1021,6 +1021,70 @@ static void test_kbd_keys(void)
     AG_CHECK_INT(dsk_kbd_height(60), 0);
 }
 
+/*
+ * Press to look, release to choose - and the release that opened the menu
+ * chooses nothing.
+ *
+ * The old rule chose on the press, which on a touchscreen means the item is
+ * gone before the highlight under the finger has been drawn: Maxim asked
+ * for the highlight and what he was really asking for was this.  The awkward
+ * case is the context menu, which opens under a finger that is still down;
+ * its release lands on the first item and must not take it.
+ */
+static void test_menu_press_and_release(void)
+{
+    static dsk_menu_t menus[1];
+    dsk_metrics_t     m;
+
+    dsk_metrics_init(&m, 640, 400);
+    dsk_paint_bind(&k_recorder, 640, 400);
+    dsk_menu_init(&m, note_damage, chose);
+
+    menus[0].title = "File";
+    menus[0].n = 0;
+    fill_item(&menus[0], "New", 7, false, true);
+    fill_item(&menus[0], "Open", 9, false, true);
+    dsk_menu_set(menus, 1);
+
+    /* Press the title, press an item: nothing chosen yet, and the menu is
+     * still open with that item lit. */
+    const dsk_rect_t t = dsk_menu_title_rect(0);
+    (void)dsk_menu_pointer(DSK_PTR_DOWN, (int16_t)(t.x + 2),
+                           (int16_t)(t.y + 2));
+    s_chosen = 0;
+    const dsk_rect_t i1 = dsk_menu_item_rect(0, 1);
+    (void)dsk_menu_pointer(DSK_PTR_DOWN, (int16_t)(i1.x + 4),
+                           (int16_t)(i1.y + 2));
+    AG_CHECK_INT(s_chosen, 0);
+    AG_CHECK(dsk_menu_open());
+
+    /* Let go on it: now it is chosen and the menu is away. */
+    (void)dsk_menu_pointer(DSK_PTR_UP, (int16_t)(i1.x + 4),
+                           (int16_t)(i1.y + 2));
+    AG_CHECK_INT(s_chosen, 9);
+    AG_CHECK(!dsk_menu_open());
+
+    /*
+     * And the context menu's own case: opened under a finger, the release
+     * of that same finger chooses nothing.  Opened at the point, the first
+     * item is right under it.
+     */
+    s_chosen = 0;
+    dsk_menu_popup(0, 100, 100);
+    AG_CHECK(dsk_menu_open());
+    (void)dsk_menu_pointer(DSK_PTR_UP, 100, 100);
+    AG_CHECK_INT(s_chosen, 0);
+    AG_CHECK(dsk_menu_open());
+
+    /* Moving off it and letting go there does choose, which is the gesture
+     * a hand makes when it has read the menu it asked for. */
+    const dsk_rect_t p1 = dsk_menu_item_rect(0, 1);
+    (void)dsk_menu_pointer(DSK_PTR_UP, (int16_t)(p1.x + 4),
+                           (int16_t)(p1.y + 2));
+    AG_CHECK_INT(s_chosen, 9);
+    dsk_menu_close();
+}
+
 void run_desktop_tests(void)
 {
     test_bands_cover_the_whole_rectangle();
@@ -1039,4 +1103,5 @@ void run_desktop_tests(void)
     test_menu_geometry();
     test_menu_choosing();
     test_kbd_keys();
+    test_menu_press_and_release();
 }

@@ -20,6 +20,38 @@ static dsk_menu_t *s_menus;
 static int         s_n;
 static int         s_open = -1; /* which title is dropped down, -1 for none */
 /* Where a popped-up menu was asked for; s_pop_x < 0 means "under its title". */
+/*
+ * Where the press that opened this menu landed, and whether its release is
+ * still to come.
+ *
+ * A menu is opened by a press and chosen by a release: that is how every
+ * menu has worked since there were menus, and on glass it is the only way a
+ * finger can see what it is about to pick, because there is no hovering.
+ * It also means the first release after the menu appears is the one still
+ * holding it open - and a long press on the desk would then open a context
+ * menu and choose its first item on the way up.
+ *
+ * So a release is ignored when it comes back to the same place as that
+ * press.  Anywhere else it is a person who pressed, looked, moved and let
+ * go on the item they wanted - which is the drag a mouse has always done
+ * from a title into a menu, and works with a finger too.
+ */
+static bool        s_ignore_up;
+static int16_t     s_press_x = -1000;
+static int16_t     s_press_y = -1000;
+
+/* Near enough to be the same touch: a finger moves a pixel or two of its
+ * own accord, and a stylus is steadier than that. */
+#define SAME_TOUCH 4
+
+static bool same_place(int16_t x, int16_t y)
+{
+    const int16_t dx = (int16_t)(x - s_press_x);
+    const int16_t dy = (int16_t)(y - s_press_y);
+    return (dx >= -SAME_TOUCH && dx <= SAME_TOUCH) &&
+           (dy >= -SAME_TOUCH && dy <= SAME_TOUCH);
+}
+
 static int16_t     s_pop_x = -1;
 static int16_t     s_pop_y = -1;
 static int         s_hi = -1;   /* which item is highlighted                */
@@ -273,6 +305,7 @@ void dsk_menu_draw_open(dsk_rect_t area)
 
 static void open_at(int which)
 {
+    s_ignore_up = true;
     if (which == s_open) {
         return;
     }
@@ -298,6 +331,10 @@ void dsk_menu_popup(int which, int16_t x, int16_t y)
     dsk_menu_close();
     s_pop_x = x;
     s_pop_y = y;
+    /* The finger that held still to ask for this menu is still down, and
+     * its release must not pick whatever landed under it. */
+    s_press_x = x;
+    s_press_y = y;
     open_at(which);
 }
 
@@ -391,6 +428,11 @@ bool dsk_menu_pointer(dsk_ptr_t type, int16_t x, int16_t y)
 {
     const int on_title = dsk_menu_title_at(x, y);
 
+    if (type == DSK_PTR_DOWN) {
+        s_press_x = x;
+        s_press_y = y;
+    }
+
     if (s_open < 0) {
         if (type == DSK_PTR_DOWN && on_title >= 0) {
             open_at(on_title);
@@ -418,7 +460,18 @@ bool dsk_menu_pointer(dsk_ptr_t type, int16_t x, int16_t y)
     const int item = dsk_menu_item_at(x, y);
     if (item >= 0) {
         highlight(item);
-        if (type == DSK_PTR_UP || type == DSK_PTR_DOWN) {
+        if (type == DSK_PTR_DOWN || type == DSK_PTR_MOVE) {
+            /* A press inside, or a hand that came in from the bar: from
+             * here on the release means what it says. */
+            s_ignore_up = false;
+            return true;
+        }
+        if (type == DSK_PTR_UP) {
+            if (s_ignore_up && same_place(x, y)) {
+                s_ignore_up = false; /* the release that opened this menu */
+                return true;
+            }
+            s_ignore_up = false;
             choose(item);
         }
         return true;
