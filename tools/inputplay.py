@@ -373,8 +373,18 @@ def run(guest: Guest, commands: list) -> None:
         elif verb == "home":
             guest.home()
         elif verb == "glide":
-            x, _, y = arg.partition(",")
-            guest.glide(int(x), int(y))
+            # "glide X,Y" or "glide X,Y,STEPS".  The step count matters: a
+            # hand on a touchscreen moves the pointer two pixels at a time,
+            # and a scenario that only ever glides in tens tests nothing
+            # about what happens between them.  That hole is how a repaint
+            # fault that only shows at small steps stayed invisible here and
+            # had to be found on the board.
+            parts = [p.strip() for p in arg.split(",")]
+            if len(parts) == 3:
+                guest.glide(int(parts[0]), int(parts[1]), int(parts[2]))
+            else:
+                x, _, y = arg.partition(",")
+                guest.glide(int(x), int(y))
         elif verb == "say":
             for ch in arg:
                 guest.send_key(" " if ch == " " else ch, True, True)

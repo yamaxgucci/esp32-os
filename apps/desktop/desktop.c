@@ -205,6 +205,29 @@ static void find_drives(void)
  */
 static int s_drive_sel = -1;
 
+/*
+ * Where the time goes, in the strip where Maxim can read it (`-lag`).
+ *
+ * "It hangs sometimes" cannot be chased from here: the shell sees events
+ * arrive and pixels go out, and a stall is either one arriving late or the
+ * other taking long, and those have nothing to do with each other.  So both
+ * are measured and both are shown:
+ *
+ *   p  the longest a single repaint took, milliseconds
+ *   g  the longest gap between two pointer events, milliseconds
+ *
+ * A large p is this shell being slow.  A large g with a small p is the
+ * pointer not being delivered - the driver, the bus, or the console tick that
+ * polls it - and nothing this shell does will help.
+ *
+ * Both are worst-of-the-last-three-seconds rather than worst-ever: a number
+ * that only ever grows says what happened once, and what is wanted is what is
+ * happening now.
+ */
+static bool     s_lag;
+static uint32_t s_worst_paint, s_worst_gap;
+static uint32_t s_lag_since, s_last_ptr;
+
 /* Its cell, in screen pixels.  The stored position is relative to the work
  * area, so a shell that starts on a different surface still puts them on it. */
 static dsk_rect_t drive_rect(int i)
@@ -1495,6 +1518,32 @@ static void draw_statusbar(void)
     dsk_fill(s_m.statusbar, DSK_LGRAY);
     dsk_hline(s_m.statusbar.x, s_m.statusbar.y, s_m.statusbar.w, DSK_WHITE);
 
+    /*
+     * With -lag the two numbers come first and the rest of the line goes.
+     *
+     * Forty columns is the whole of this screen, and a diagnostic pushed off
+     * the right-hand edge is not a diagnostic: Maxim could not read the
+     * numbers he was asked to read.
+     */
+    if (s_lag) {
+        ag_strlcpy(line, "p", sizeof(line));
+        ag_strlcat(line, ag_utoa((uint64_t)s_worst_paint, num, sizeof(num), 0,
+                                 false),
+                   sizeof(line));
+        ag_strlcat(line, "ms g", sizeof(line));
+        ag_strlcat(line, ag_utoa((uint64_t)s_worst_gap, num, sizeof(num), 0,
+                                 false),
+                   sizeof(line));
+        ag_strlcat(line, "ms  ", sizeof(line));
+        ag_strlcat(line, ag_utoa((uint64_t)s_ptr_events, num, sizeof(num), 0,
+                                 false),
+                   sizeof(line));
+        ag_strlcat(line, " ev", sizeof(line));
+        dsk_text_small((int16_t)(s_m.statusbar.x + 4), ty, line, DSK_BLACK,
+                       DSK_LGRAY);
+        return;
+    }
+
     ag_strlcpy(line, "ptr ", sizeof(line));
     ag_strlcat(line, ag_utoa((uint64_t)(uint32_t)dsk_cursor_x(), num,
                              sizeof(num), 0, false),
@@ -1699,6 +1748,14 @@ static void on_pointer(dsk_ptr_t type, int16_t x, int16_t y, uint8_t buttons,
                                            : "move",
                   (int)x, (int)y, (unsigned)buttons, drive_at(x, y));
     }
+    if (s_last_ptr != 0u) {
+        const uint32_t gap = now - s_last_ptr;
+        if (gap > s_worst_gap) {
+            s_worst_gap = gap;
+        }
+    }
+    s_last_ptr = now;
+
     s_buttons = buttons;
     if (dsk_paint_banded()) {
         damage(dsk_cursor_place_moved(x, y));
@@ -2173,6 +2230,9 @@ int ag_main(int argc, char **argv)
         if (ag_stricmp(argv[i], "-ptr") == 0) {
             s_ptr_log = true;
         }
+        if (ag_stricmp(argv[i], "-lag") == 0) {
+            s_lag = true;
+        }
     }
     for (int i = 1; i < argc; i++) {
         if (ag_stricmp(argv[i], "-bench") == 0) {
@@ -2290,7 +2350,20 @@ int ag_main(int argc, char **argv)
         if (dsk_term_due_in(now) == 0u) {
             dsk_term_tick();
         }
+        const uint32_t paint_at = ag_millis();
         commit();
+        const uint32_t took = ag_millis() - paint_at;
+        if (took > s_worst_paint) {
+            s_worst_paint = took;
+        }
+        if (paint_at - s_lag_since >= 3000u) {
+            s_lag_since = paint_at;
+            s_worst_paint = 0;
+            s_worst_gap = 0;
+        }
+        if (s_lag) {
+            s_status_dirty = true; /* the numbers are only worth a live strip */
+        }
     }
 
     dsk_cursor_hide();

@@ -229,6 +229,21 @@ try {
         # Into the only directory there is, and back out of it by "..".
         "move $rowX,$rowY", 'click', 'wait 120', 'click', 'wait 1500',
         "move $rowX,$rowY", 'click', 'wait 120', 'click', 'wait 1500',
+        # The same walk with the button held, which is the only way a finger
+        # moves a pointer at all: on glass there is no such thing as hovering,
+        # so every pixel of movement a touchscreen produces is movement with
+        # the button down.  A scenario that only ever glides with it up tests
+        # the half of the code a touch machine never runs.
+        'move 40,300', 'press', 'glide 130,300,90', 'glide 40,300,90',
+        'release', 'wait 300',
+
+        # A pointer walked one pixel at a time, which is how a hand on a
+        # touchscreen moves it and what this scenario never tried: every
+        # other glide here steps in tens, so anything that goes wrong
+        # between two neighbouring pixels was invisible.  Maxim found dots
+        # left behind on the CYD that this could not see.
+        'move 180,300', 'glide 260,300,80', 'glide 180,300,80', 'wait 300',
+
         # A context menu opened and shut on bare desk, LAST, so that the two
         # photographs can see it.  They could not before: the menus were
         # opened early and windows were opened over the place they had been,
