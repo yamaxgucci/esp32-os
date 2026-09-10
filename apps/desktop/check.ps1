@@ -229,6 +229,16 @@ try {
         # Into the only directory there is, and back out of it by "..".
         "move $rowX,$rowY", 'click', 'wait 120', 'click', 'wait 1500',
         "move $rowX,$rowY", 'click', 'wait 120', 'click', 'wait 1500',
+        # A context menu opened and shut on bare desk, LAST, so that the two
+        # photographs can see it.  They could not before: the menus were
+        # opened early and windows were opened over the place they had been,
+        # which is how a menu that erased itself in the wrong place got past
+        # this check and was found by hand on the board instead.  A rectangle
+        # left on the glass is identical in the first photograph and gone from
+        # the second, which is exactly what the forced repaint compares.
+        'move 40,330', 'rclick', 'wait 500',
+        'move 520,330', 'click', 'wait 400',
+
         # Park the pointer where it hides nothing before the photograph.
         "move $($w - 30),$($workY + 30)",
         'wait 1200'

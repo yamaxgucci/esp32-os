@@ -40,13 +40,25 @@ AG_DRV("XPT2046", "0.2", "argon");
 #define T_IRQ 36   /* pen down, active low; input-only pin, external pull-up */
 #define T_KHZ 2000 /* the datasheet's ceiling, and the panel's is 40000      */
 
-/* The panel this sits on, and the cell grid the console draws on it. */
-#define PANEL_W 320
-#define PANEL_H 240
-#define CELL_W  8
-#define CELL_H  8
-#define COLS    (PANEL_W / CELL_W)
-#define ROWS    (PANEL_H / CELL_H)
+/*
+ * The panel this sits on.  The *grid* is not here, and that is the point.
+ *
+ * An input driver reports cells, and the kernel turns them back into pixels
+ * with the console's own grid: cw = surface_w / cols, ch = surface_h / rows
+ * (ag_input_to_pixels).  This driver used to divide by a grid of its own -
+ * the panel's forty by thirty of 8x8 - and the two agree only while the
+ * console happens to be forty by thirty as well.  With a console of forty by
+ * twenty-five the kernel multiplies each row by nine, and the pointer lands
+ * below the stylus, further below the further down the glass you touch.
+ * Which is what Maxim saw, and what no amount of looking at this driver's own
+ * arithmetic would have explained: both halves were self-consistent and they
+ * were not talking about the same grid.
+ *
+ * So the grid is asked for, at every poll, from the console itself.
+ */
+#define PANEL_W  320
+#define PANEL_H  240
+#define CELLS_MAX 255
 
 /*
  * Raw readings at the edges of the glass.  A resistive panel is a pair of
@@ -136,7 +148,13 @@ static uint16_t pressure(uint16_t x, uint16_t z1, uint16_t z2)
 #define FLIP_X 1
 #define FLIP_Y 1
 
-static int16_t to_cell(uint16_t raw, int span, int cell)
+/*
+ * A raw reading to a cell, on an axis of `n` cells over `span` pixels.
+ *
+ * The division is by span/n rather than by any fixed cell size, because
+ * span/n is the number the kernel multiplies by on the way back.
+ */
+static int16_t to_cell(uint16_t raw, int span, int n)
 {
     int v = (int)raw;
     if (v < RAW_MIN) {
@@ -145,15 +163,28 @@ static int16_t to_cell(uint16_t raw, int span, int cell)
     if (v > RAW_MAX) {
         v = RAW_MAX;
     }
+    if (n <= 0) {
+        return 0;
+    }
     const int px = ((v - RAW_MIN) * span) / (RAW_MAX - RAW_MIN);
+    const int cell = (span > n) ? (span / n) : 1;
     int       c = px / cell;
     if (c < 0) {
         c = 0;
     }
-    if (c >= span / cell) {
-        c = span / cell - 1;
+    if (c >= n) {
+        c = n - 1;
     }
     return (int16_t)c;
+}
+
+/* The console's grid, which is the unit this driver reports in. */
+static void grid(int *cols, int *rows)
+{
+    ag_coninfo_t ci = { 0 };
+    ag_coninfo(&ci);
+    *cols = (ci.cols > 0 && ci.cols <= CELLS_MAX) ? (int)ci.cols : 40;
+    *rows = (ci.rows > 0 && ci.rows <= CELLS_MAX) ? (int)ci.rows : 30;
 }
 
 /* ---- the class vtable -------------------------------------------------- */
@@ -203,14 +234,17 @@ static int32_t touch_poll(ag_handle_t h, ag_event_t *out, uint32_t max)
      * something to reason out.  It was reasoned out first, wrongly: a stylus
      * drawn horizontally left a vertical line.
      */
-    int16_t col = to_cell(rx, PANEL_W, CELL_W);
-    int16_t row = to_cell(ry, PANEL_H, CELL_H);
+    int cols, rows;
+    grid(&cols, &rows);
+
+    int16_t col = to_cell(rx, PANEL_W, cols);
+    int16_t row = to_cell(ry, PANEL_H, rows);
 
 #if FLIP_X
-    col = (int16_t)(COLS - 1 - col);
+    col = (int16_t)(cols - 1 - col);
 #endif
 #if FLIP_Y
-    row = (int16_t)(ROWS - 1 - row);
+    row = (int16_t)(rows - 1 - row);
 #endif
 
     if (!s_state.down) {
@@ -281,7 +315,9 @@ ag_err_t ag_driver_init(void)
         return err;
     }
 
+    int cols, rows;
+    grid(&cols, &rows);
     ag_printf("XPT2046: spi%d cs %d at %d kHz, pen %d, %dx%d cells\n", T_BUS,
-              T_CS, T_KHZ, T_IRQ, COLS, ROWS);
+              T_CS, T_KHZ, T_IRQ, cols, rows);
     return AG_OK;
 }
