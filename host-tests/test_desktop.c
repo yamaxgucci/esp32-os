@@ -16,6 +16,7 @@
 #include "test.h"
 
 #include "../apps/desktop/dsk.h"
+#include "../apps/desktop/dsk_kbd.h"
 #include "../apps/desktop/dsk_menu.h"
 #include "../apps/desktop/dsk_paint.h"
 #include "../apps/desktop/dsk_rect.h"
@@ -954,6 +955,72 @@ static void test_menu_choosing(void)
     AG_CHECK(!dsk_menu_open());
 }
 
+/*
+ * The keyboard drawn on the glass, pressed where a finger would press.
+ *
+ * Every key is checked by its own centre rather than a few by hand: the
+ * layout is a table, and a table is exactly the thing that acquires an
+ * off-by-one in the row nobody tried.  What this cannot see is whether the
+ * keys are big enough to hit, which is a question for a hand on the board.
+ */
+static int press_at(dsk_rect_t r, int row, int col)
+{
+    const int16_t kw = (int16_t)(r.w / 10);
+    /* The same arithmetic the widget uses: the key height comes from the
+     * box, so that a keyboard squeezed into what was left still knows
+     * where its own keys are. */
+    const int16_t kh = (int16_t)((r.h - 2) / 5);
+    return dsk_kbd_press(r, (int16_t)(r.x + col * kw + kw / 2),
+                         (int16_t)(r.y + 1 + row * kh + kh / 2));
+}
+
+static void test_kbd_keys(void)
+{
+    dsk_paint_bind(&k_recorder, 640, 400);
+    dsk_ui_font_set(DSK_UI_FONT_LARGE);
+    dsk_kbd_reset();
+
+    const int16_t w = 320;
+    const int16_t h = dsk_kbd_height(w);
+    AG_CHECK(h > 0);
+    const dsk_rect_t r = dsk_rect(0, 100, w, h);
+
+    /* The four rows of characters, cell by cell. */
+    static const char *rows[4] = {
+        "1234567890",
+        "qwertyuiop",
+        "asdfghjkl.",
+        "zxcvbnm-_:",
+    };
+    for (int row = 0; row < 4; row++) {
+        for (int col = 0; col < 10; col++) {
+            AG_CHECK_INT(press_at(r, row, col), rows[row][col]);
+        }
+    }
+
+    /* The last row: shift, backslash, a space bar four cells wide, and the
+     * one that rubs out. */
+    AG_CHECK_INT(press_at(r, 4, 1), (int)'\\');
+    for (int col = 2; col < 6; col++) {
+        AG_CHECK_INT(press_at(r, 4, col), (int)' ');
+    }
+    AG_CHECK_INT(press_at(r, 4, 6), (int)'/');
+    AG_CHECK_INT(press_at(r, 4, 9), DSK_KBD_BACKSPACE);
+
+    /* Shift is for one key and then lets go, which is what a hand holding
+     * it down does: "C:" is shift, C, shift, colon - not a shouted rest. */
+    AG_CHECK_INT(press_at(r, 4, 0), DSK_KBD_SHIFT);
+    AG_CHECK_INT(press_at(r, 1, 0), (int)'Q');
+    AG_CHECK_INT(press_at(r, 1, 0), (int)'q');
+    AG_CHECK_INT(press_at(r, 4, 0), DSK_KBD_SHIFT);
+    AG_CHECK_INT(press_at(r, 3, 9), (int)';');
+
+    /* Outside is nothing, and so is a box too small to hit. */
+    AG_CHECK_INT(dsk_kbd_press(r, (int16_t)(r.x - 4), (int16_t)(r.y + 4)),
+                 DSK_KBD_NONE);
+    AG_CHECK_INT(dsk_kbd_height(60), 0);
+}
+
 void run_desktop_tests(void)
 {
     test_bands_cover_the_whole_rectangle();
@@ -971,4 +1038,5 @@ void run_desktop_tests(void)
     test_wm_draw_order();
     test_menu_geometry();
     test_menu_choosing();
+    test_kbd_keys();
 }

@@ -549,6 +549,9 @@ enum {
     ID_MARK,
     ID_MARK_ALL,
     ID_MARK_NONE,
+    ID_KBD_AUTO,
+    ID_KBD_ON,
+    ID_KBD_OFF,
     ID_FONT_LARGE,
     ID_FONT_SMALL,
     ID_BG_TEAL,
@@ -989,6 +992,42 @@ static void apply_font(void)
     /* Said out loud, because a scripted run cannot read letters off the
      * glass and this is the whole of what the item did. */
     ag_printf("desktop: font 8x%d\n", (int)dsk_ui_h());
+}
+
+/*
+ * A keyboard of its own, or a keyboard drawn on the glass.
+ *
+ * Asked of the device registry rather than guessed from the screen size: a
+ * machine either has something that produces keystrokes or it does not, and
+ * the CYD does not - what types at its prompt is a serial cable, which is
+ * not in the room with the person holding the board.
+ *
+ * The setting wins when it says anything: a board with a keyboard plugged in
+ * still has a hand on the screen, and a machine whose keyboard is across the
+ * room is not one you want to reach for.
+ */
+static bool machine_has_keys(void)
+{
+    ag_devinfo_t info;
+    for (uint32_t i = 0; ; i++) {
+        if (ag_dev_enumerate(i, AG_DEV_INPUT, &info) != AG_OK) {
+            return false;
+        }
+        if (info.name[0] == 'k' && info.name[1] == 'b' &&
+            info.name[2] == 'd') {
+            return true;
+        }
+    }
+}
+
+static void apply_keyboard(void)
+{
+    const bool on = (s_ini.keyboard == 1)   ? true
+                    : (s_ini.keyboard == 2) ? false
+                                            : !machine_has_keys();
+    dsk_dlg_keyboard(on);
+    ag_printf("desktop: on-screen keyboard %s%s\n", on ? "on" : "off",
+              (s_ini.keyboard == 0) ? " (automatic)" : "");
 }
 
 /* ---- the clipboard ------------------------------------------------------ */
@@ -1695,13 +1734,20 @@ static void rebuild_menus(void)
     s_menus[3].items[5].checked = (s_ini.background == DSK_GREEN);
     s_menus[3].items[6].checked = (s_ini.background == DSK_BLACK);
     set_separator(&s_menus[3]);
+    set_item(&s_menus[3], "Keyboard: automatic", ID_KBD_AUTO, true);
+    set_item(&s_menus[3], "Keyboard: always", ID_KBD_ON, true);
+    set_item(&s_menus[3], "Keyboard: never", ID_KBD_OFF, true);
+    s_menus[3].items[8].checked = (s_ini.keyboard == 0);
+    s_menus[3].items[9].checked = (s_ini.keyboard == 1);
+    s_menus[3].items[10].checked = (s_ini.keyboard == 2);
+    set_separator(&s_menus[3]);
     set_item(&s_menus[3], "Slow double click", ID_DBL_SLOW, true);
     set_item(&s_menus[3], "Normal double click", ID_DBL_NORMAL, true);
     set_item(&s_menus[3], "Fast double click", ID_DBL_FAST, true);
-    s_menus[3].items[8].checked = (s_ini.dblclick_ms >= 600u);
-    s_menus[3].items[9].checked = (s_ini.dblclick_ms > 300u &&
-                                   s_ini.dblclick_ms < 600u);
-    s_menus[3].items[10].checked = (s_ini.dblclick_ms <= 300u);
+    s_menus[3].items[12].checked = (s_ini.dblclick_ms >= 600u);
+    s_menus[3].items[13].checked = (s_ini.dblclick_ms > 300u &&
+                                    s_ini.dblclick_ms < 600u);
+    s_menus[3].items[14].checked = (s_ini.dblclick_ms <= 300u);
 
     s_menus[4].title = "Help";
     s_menus[4].n = 0;
@@ -1836,6 +1882,19 @@ static void menu_chose(uint16_t id)
     case ID_MARK_NONE:
         dsk_folder_mark(dsk_wm_active(), -1, DSK_MARK_NONE);
         break;
+    case ID_KBD_AUTO:
+    case ID_KBD_ON:
+    case ID_KBD_OFF: {
+        const uint8_t want = (id == ID_KBD_AUTO)   ? 0u
+                             : (id == ID_KBD_ON)   ? 1u
+                                                   : 2u;
+        if (want != s_ini.keyboard) {
+            s_ini.keyboard = want;
+            apply_keyboard();
+            save_arrangement();
+        }
+        break;
+    }
     case ID_FONT_LARGE:
     case ID_FONT_SMALL: {
         const bool small = (id == ID_FONT_SMALL);
@@ -2625,6 +2684,7 @@ int ag_main(int argc, char **argv)
     dsk_wm_init(&s_m, damage);
     dsk_menu_init(&s_m, damage, menu_chose);
     dsk_dlg_init(&s_m);
+    apply_keyboard();
     dsk_folder_init(&s_m, open_from_folder);
     dsk_run_init(repaint_all);
     dsk_ops_init(&s_m, repaint_all);

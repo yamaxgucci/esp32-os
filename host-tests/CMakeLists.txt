@@ -138,6 +138,7 @@ add_executable(argon_tests
     "${ARGON_ROOT}/apps/desktop/dsk_layout.c"
     "${ARGON_ROOT}/apps/desktop/dsk_paint.c"
     "${ARGON_ROOT}/apps/desktop/dsk_wm.c"
+    "${ARGON_ROOT}/apps/desktop/dsk_kbd.c"
     "${ARGON_ROOT}/apps/desktop/dsk_menu.c"
     "${ARGON_ROOT}/apps/desktop/dsk_dlg.c"
     "${ARGON_ROOT}/apps/common/fsops/fsops.c"

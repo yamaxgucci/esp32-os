@@ -5,6 +5,7 @@
  */
 #include "dsk_dlg.h"
 
+#include "dsk_kbd.h"
 #include "dsk_paint.h"
 #include "dsk_wm.h"
 
@@ -32,6 +33,13 @@ typedef struct {
     bool        caret_lit;
     uint32_t    caret_at;
     dsk_win_t  *win;
+    /*
+     * Whether this box carries a keyboard of its own.  Decided when it
+     * opens, from what the machine has and what the person asked for, and
+     * not re-asked while it is up: a keyboard that appeared halfway through
+     * would move the buttons out from under a finger already going for one.
+     */
+    bool        keys;
     void       *ctx;
     void (*done_msg)(dsk_answer_t a, void *ctx);
     void (*done_txt)(dsk_answer_t a, const char *text, void *ctx);
@@ -39,6 +47,9 @@ typedef struct {
 
 static dsk_metrics_t s_m;
 static dlg_t         s_d;
+static bool          s_want_keys;
+
+void dsk_dlg_keyboard(bool show) { s_want_keys = show; }
 
 static size_t str_len(const char *s)
 {
@@ -98,6 +109,38 @@ static dsk_rect_t btn_rect(dsk_rect_t client, int which)
     const int16_t x0 = (int16_t)(client.x + (client.w - total) / 2);
     return dsk_rect((int16_t)(x0 + which * (BTN_W + BTN_GAP)),
                     (int16_t)(dsk_rect_y2(client) - PAD - BTN_H), BTN_W, BTN_H);
+}
+
+static dsk_rect_t edit_rect(dsk_rect_t client);
+
+/* Where the keyboard goes: between the text field and the buttons. */
+static dsk_rect_t kbd_rect(dsk_rect_t client)
+{
+    if (!s_d.keys) {
+        return dsk_rect_none();
+    }
+    /*
+     * Between the text field and the buttons, and never over either.
+     *
+     * The window manager cuts a box down to the work area, so a box that
+     * asked for more than the screen comes back shorter than it planned -
+     * and a keyboard anchored to the bottom then climbs over the field it
+     * is there to fill.  On the CYD that is exactly what happened: the keys
+     * could be hit and what they typed could not be seen.  So the space is
+     * measured, not assumed, and the keys shrink to fit it.
+     */
+    const dsk_rect_t e = edit_rect(client);
+    const int16_t    top = (int16_t)(dsk_rect_y2(e) + PAD);
+    const int16_t    bottom = (int16_t)(dsk_rect_y2(client) - PAD - BTN_H -
+                                     PAD);
+    const int16_t    avail = (int16_t)(bottom - top);
+    const int16_t    h = dsk_kbd_height_for((int16_t)(client.w - 2 * PAD),
+                                            avail);
+    if (h <= 0) {
+        return dsk_rect_none();
+    }
+    return dsk_rect((int16_t)(client.x + PAD), top,
+                    (int16_t)(client.w - 2 * PAD), h);
 }
 
 static dsk_rect_t edit_rect(dsk_rect_t client)
@@ -168,6 +211,11 @@ static void dlg_draw(dsk_win_t *w, dsk_rect_t client)
         }
     }
 
+    const dsk_rect_t kb = kbd_rect(client);
+    if (!dsk_rect_empty(kb)) {
+        dsk_kbd_draw(kb);
+    }
+
     for (int i = 0; i < btn_count(); i++) {
         const dsk_rect_t b = btn_rect(client, i);
         dsk_panel(b, true, DSK_LGRAY);
@@ -197,6 +245,27 @@ static bool dlg_pointer(dsk_win_t *w, dsk_hit_t where, int16_t x, int16_t y,
             answer(btn_answer(i));
             return true;
         }
+    }
+
+    const dsk_rect_t kb = kbd_rect(client);
+    if (!dsk_rect_empty(kb) && dsk_rect_has(kb, x, y)) {
+        const int c = dsk_kbd_press(kb, x, y);
+        if (c == DSK_KBD_SHIFT) {
+            dsk_wm_damage_rect(kb); /* every label changed case */
+        } else if (c == DSK_KBD_BACKSPACE) {
+            if (s_d.len > 0) {
+                s_d.text[--s_d.len] = '\0';
+                dsk_wm_damage_rect(edit_rect(client));
+            }
+        } else if (c >= 0x20 && c < 0x7F && s_d.len + 1 < DSK_INPUT_MAX) {
+            s_d.text[s_d.len++] = (char)c;
+            s_d.text[s_d.len] = '\0';
+            dsk_wm_damage_rect(edit_rect(client));
+            /* Shift falls back to lower case after one letter, so the
+             * keyboard's own face changed too. */
+            dsk_wm_damage_rect(kb);
+        }
+        return true;
     }
     return true;
 }
@@ -385,12 +454,33 @@ bool dsk_dlg_input(const char *title, const char *prompt, const char *initial,
     s_d.caret_lit = true;
     s_d.up = true;
 
-    const int16_t h =
+    s_d.keys = s_want_keys;
+    dsk_kbd_reset();
+
+    int16_t h =
         (int16_t)(2 * s_m.border + s_m.title_h + PAD + dsk_ui_h() + 4 +
                   dsk_ui_h() + 6 + PAD + BTN_H + PAD);
     int16_t w = width_for_lines();
     if (w < 240) {
         w = 240;
+    }
+    if (s_d.keys) {
+        /*
+         * As wide as there is room for, because the keys divide that width
+         * by ten: on a 320-pixel panel a box sized to its prompt would give
+         * keys of eighteen pixels, and a fingertip is wider than that.
+         */
+        w = s_m.work.w;
+        /* What is left of the screen once the box's own furniture has had
+         * its share; asking for more than this gets the box cut down. */
+        const int16_t room = (int16_t)(s_m.work.h - h - PAD);
+        const int16_t kh = dsk_kbd_height_for(
+            (int16_t)(w - 2 * s_m.border - 2 * PAD), room);
+        if (kh > 0) {
+            h = (int16_t)(h + kh + PAD);
+        } else {
+            s_d.keys = false;
+        }
     }
     s_d.win = open_window(title, w, h);
     if (s_d.win == NULL) {

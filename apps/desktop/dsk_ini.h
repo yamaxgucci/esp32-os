@@ -60,6 +60,16 @@ typedef struct {
      * to whoever is looking at it rather than to a threshold in the code.
      */
     bool     small_font;
+    /*
+     * The keyboard drawn on the glass: 0 automatic, 1 always, 2 never.
+     *
+     * Automatic means "when this machine has no keyboard of its own", which
+     * is the CYD and is not the emulator.  It is a setting and not just a
+     * detection because both mistakes are real: a board with a keyboard
+     * plugged in still has a hand on the screen, and a machine with a
+     * keyboard somewhere else in the room is not one you want to reach for.
+     */
+    uint8_t  keyboard;
 
     dsk_ini_icon_t icon[DSK_INI_ICONS];
     int            nicons;

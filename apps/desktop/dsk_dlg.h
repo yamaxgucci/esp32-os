@@ -42,6 +42,16 @@ typedef enum {
 
 void dsk_dlg_init(const dsk_metrics_t *m);
 
+/*
+ * Whether a box with a text field carries a keyboard drawn on the glass.
+ *
+ * The decision is the shell's, not this file's: it depends on what input
+ * devices the machine has and on what the person chose in Options, and
+ * neither of those is a dialog's business.  See dsk_kbd.h for why it exists
+ * at all.
+ */
+void dsk_dlg_keyboard(bool show);
+
 /* False when a dialog is already up. */
 bool dsk_dlg_message(const char *title, const char *line1, const char *line2,
                      dsk_dlg_kind_t kind,

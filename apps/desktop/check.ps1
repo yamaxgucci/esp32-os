@@ -452,6 +452,26 @@ try {
     # highlights nothing, so the first down lands on the first item.  One
     # down here picked "Large font", which was already the font - the shell
     # correctly did nothing, and the step proved nothing.
+    # Options > Keyboard: always, then back to automatic.
+    #
+    # What this can check from here is the wiring - the setting is read, the
+    # shell says which way it went - and not whether a finger can hit a key,
+    # which is a question for a hand on the board.  The keys themselves are
+    # a host test (test_desktop.c), pressed at the centre of every cell.
+    #
+    # Automatic is the right thing to leave behind: the emulator HAS a
+    # keyboard (KBDVIRT), so a run that ended with "always" would put a
+    # keyboard into every later box and move the buttons that the rest of
+    # this scenario clicks.
+    $optKbd = @('key f10', 'wait 400', 'key right', 'wait 200', 'key right',
+                'wait 200', 'key right', 'wait 300') +
+              (1..8 | ForEach-Object { 'key down' }) +
+              @('wait 300', 'key enter', 'wait 800',
+                'key f10', 'wait 400', 'key right', 'wait 200', 'key right',
+                'wait 200', 'key right', 'wait 300') +
+              (1..7 | ForEach-Object { 'key down' }) +
+              @('wait 300', 'key enter', 'wait 800')
+
     # Three Rights now: File, Edit, Window, Options.
     $optFont = @('key f10', 'wait 400', 'key right', 'wait 200', 'key right',
                  'wait 200', 'key right',
@@ -504,7 +524,7 @@ try {
 
     $keyboard = $runHello + $runGfx + $opsMkdir + $opsCopy + $opsDelete +
                 $opsRename + $openConsole + $backToFolder + $opsClip +
-                $opsMarked + $optFont + $opsProps
+                $opsMarked + $optKbd + $optFont + $opsProps
     $quoted = ($moves | ForEach-Object { '"' + $_ + '"' }) -join ' '
     $after = @('"key f5"', ('"wait ' + $settle + '"')) -join ' '
     # The properties box is deliberately still up for both photographs - it is
@@ -862,6 +882,16 @@ try {
         # Both ways of asking for the context menu, counted.  A right button
         # that reached nothing and a long press that was taken for a drag both
         # look like a passing run otherwise.
+        # The keyboard setting was read and acted on, both ways.  The
+        # shell says which way it went, so this is checked by what it did
+        # and not by the fact that a menu item exists.
+        if ($text -notmatch 'desktop: on-screen keyboard on') {
+            $fail += 'Options > Keyboard: always did not switch it on'
+        }
+        if ($text -notmatch 'desktop: on-screen keyboard off \(automatic\)') {
+            $fail += 'Keyboard: automatic did not come back (the emulator has a keyboard, so it should be off)'
+        }
+
         # The font item did what it says: to 8x8 and back to 8x16.  A menu
         # item that only *opens* is not a setting, and this shell had no way
         # to change the font from the board at all until it existed.
