@@ -11,6 +11,8 @@
 
 #include <argon/codepage.h>
 #include <argon/display.h>
+#include <argon/log.h>
+#include <argon/session.h>
 #include <argon/textpanel.h>
 
 #include <argon/port/mem.h>
@@ -69,7 +71,33 @@ typedef struct {
 #define AG_CON_XOFF 0x13
 #define AG_CON_XON 0x11
 
-static ag_screen_t        s_screen;
+/*
+ * One screen per slot, and why the console owns them rather than the slots.
+ *
+ * A slot switch used to clear the screen, because there was one screen: the
+ * only way to stop slot 2 reading like the tail of slot 1 was to wipe it.
+ * So everything a program said was gone the moment you looked at something
+ * else - and on this machine "something else" is usually the graphical shell,
+ * which is where you go to run the next thing.
+ *
+ * Everything above reaches the screen through ag_console_screen(), all
+ * thirty-odd call sites, so making that answer with the focused slot's screen
+ * is the whole of the change.  They live here and not in the session module
+ * for two reasons: a resize has to reshape every one of them, and the console
+ * is what a screen is FOR - a slot is a stack of processes and does not
+ * otherwise care what a cell is.
+ *
+ * Lazily: index 0 is the system's and exists from boot; a user slot gets its
+ * own the first time it is looked at, so a machine that never leaves slot 1
+ * pays for one.
+ */
+#define CON_SCREENS (AG_SESSION_SLOTS + 1)
+
+static ag_screen_t        s_screens[CON_SCREENS];
+static bool               s_screen_up[CON_SCREENS];
+static int                s_active; /* index into s_screens */
+
+#define s_screen (s_screens[s_active])
 static ag_con_endpoint_t  s_endpoints[AG_CON_MAX_ENDPOINTS];
 static ag_port_mutex_t         s_lock;
 static ag_port_queue_t s_events;
@@ -116,7 +144,109 @@ void *ag_console_lock_holder(void)
     return (void *)ag_port_mutex_holder(s_lock);
 }
 
-ag_screen_t *ag_console_screen(void) { return &s_screen; }
+ag_screen_t *ag_console_screen(void) { return &s_screens[s_active]; }
+
+/* AG_SESSION_SYSTEM is index 0; user slots 0..3 are 1..4. */
+static int screen_index(int slot)
+{
+    if (slot == AG_SESSION_SYSTEM) {
+        return 0;
+    }
+    if (slot < 0 || slot >= AG_SESSION_SLOTS) {
+        return -1;
+    }
+    return slot + 1;
+}
+
+ag_err_t ag_console_adopt_slot(int slot)
+{
+    const int want = screen_index(slot);
+    if (!s_ready || want < 0) {
+        return -AG_EINVAL;
+    }
+    ag_console_lock();
+    if (want != s_active) {
+        /*
+         * The screen that exists changes hands; nothing is allocated and
+         * nothing is drawn.
+         *
+         * The console comes up long before there are slots and its screen
+         * is the one the boot report is written on.  Whoever is focused
+         * when the slots appear has been writing to that screen all along,
+         * so it is theirs - and saying otherwise is not a bookkeeping
+         * detail: going back to that slot would then make it a screen it
+         * had never used, which is to say a blank one, with the boot report
+         * filed under a slot nobody had been looking at.
+         */
+        s_screens[want] = s_screens[s_active];
+        s_screen_up[want] = true;
+        s_screen_up[s_active] = false;
+        memset(&s_screens[s_active], 0, sizeof(s_screens[s_active]));
+        s_active = want;
+    }
+    ag_console_unlock();
+    return AG_OK;
+}
+
+ag_err_t ag_console_use_slot(int slot)
+{
+    const int want = screen_index(slot);
+    if (!s_ready || want < 0) {
+        return -AG_EINVAL;
+    }
+
+    ag_console_lock();
+    if (want == s_active) {
+        ag_console_unlock();
+        return AG_OK;
+    }
+
+    if (!s_screen_up[want]) {
+        /*
+         * A slot that has never been looked at gets its screen now, at the
+         * size the console is now.  Out of memory is not a failure worth
+         * stopping a slot switch for: the slots share the one screen again,
+         * which is what they all did until today.
+         */
+        const size_t need = ag_screen_memsize(s_screens[s_active].cols,
+                                              s_screens[s_active].rows);
+        void        *mem = ag_port_alloc(need, AG_MEM_FAST | AG_MEM_BYTE);
+        if (mem == NULL) {
+            ag_console_unlock();
+            ag_log(AG_LOG_WARN, "console",
+                   "no memory for slot %d's own screen; sharing", slot);
+            return -AG_ENOMEM;
+        }
+        if (ag_screen_init(&s_screens[want], mem, need,
+                           s_screens[s_active].cols,
+                           s_screens[s_active].rows) != AG_OK) {
+            ag_port_free(mem);
+            ag_console_unlock();
+            return -AG_ENOMEM;
+        }
+        s_screen_up[want] = true;
+    }
+
+    s_active = want;
+
+    /*
+     * Everything that draws the console holds a picture of what is on it and
+     * sends only what changed, so a switch has to say that all of it did -
+     * to the panel, to the framebuffer, and to every terminal on the far end
+     * of a wire.
+     */
+    ag_screen_mark_all_dirty(&s_screens[s_active]);
+    for (int i = 0; i < AG_CON_MAX_ENDPOINTS; i++) {
+        ag_con_endpoint_t *ep = &s_endpoints[i];
+        if (ep->used) {
+            ag_vtout_mark_all(&ep->out);
+        }
+    }
+    ag_display_console_dirty();
+    ag_textpanel_owe_full();
+    ag_console_unlock();
+    return AG_OK;
+}
 
 bool ag_console_ready(void) { return s_ready; }
 
@@ -644,7 +774,9 @@ ag_err_t ag_console_init(uint16_t cols, uint16_t rows)
         return -AG_ENOMEM;
     }
 
-    const ag_err_t err = ag_screen_init(&s_screen, mem, need, cols, rows);
+    s_active = 0;
+    const ag_err_t err = ag_screen_init(&s_screens[0], mem, need, cols, rows);
+    s_screen_up[0] = (err == AG_OK);
     if (err != AG_OK) {
         ag_port_free(mem);
         return err;
@@ -701,25 +833,44 @@ ag_err_t ag_console_resize(uint16_t cols, uint16_t rows)
         return AG_OK;
     }
 
-    const size_t need = ag_screen_memsize(cols, rows);
-    void *mem = ag_port_alloc(need, AG_MEM_FAST | AG_MEM_BYTE);
-    if (mem == NULL) {
-        return -AG_ENOMEM;
-    }
-
     ag_console_lock();
 
-    ag_screen_t    next;
-    const ag_err_t err =
-        ag_screen_recreate(&next, mem, need, cols, rows, &s_screen);
-    if (err != AG_OK) {
-        ag_console_unlock();
-        ag_port_free(mem);
-        return err;
+    /*
+     * Every screen that exists, not only the one being looked at: a slot
+     * left at eighty columns while the console moved to forty would come
+     * back the next time it was focused and hand the panel a picture of the
+     * wrong shape.  The one on view keeps its content (that is what
+     * recreate is for); the others are of no interest to anybody yet, so
+     * they are simply remade at the new size.
+     */
+    void *old = NULL;
+    for (int i = 0; i < CON_SCREENS; i++) {
+        if (!s_screen_up[i] && i != s_active) {
+            continue;
+        }
+        const size_t need = ag_screen_memsize(cols, rows);
+        void *mem = ag_port_alloc(need, AG_MEM_FAST | AG_MEM_BYTE);
+        if (mem == NULL) {
+            ag_console_unlock();
+            return -AG_ENOMEM;
+        }
+        ag_screen_t    next;
+        const ag_err_t err = ag_screen_recreate(&next, mem, need, cols, rows,
+                                                &s_screens[i]);
+        if (err != AG_OK) {
+            ag_console_unlock();
+            ag_port_free(mem);
+            return err;
+        }
+        void *was = s_screens[i].dirty;
+        s_screens[i] = next;
+        s_screen_up[i] = true;
+        if (i == s_active) {
+            old = was;
+        } else {
+            ag_port_free(was);
+        }
     }
-
-    void *old = s_screen.dirty;
-    s_screen  = next;
 
     /*
      * Every endpoint is told the whole terminal again, not just the rows: a

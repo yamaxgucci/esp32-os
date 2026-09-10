@@ -1382,6 +1382,16 @@ static void paint_console_cell(const ag_screen_t *screen, uint16_t col,
                (uint8_t)cell.ch, k_cga565[fg], k_cga565[bg]);
 }
 
+/*
+ * Forget what is believed to be on the console.
+ *
+ * The framebuffer console sends only what changed since the generation it
+ * last drew, which is right until the screen underneath is replaced by a
+ * different one - a slot switch - and then "what changed" is a comparison
+ * against somebody else's picture.
+ */
+void ag_display_console_dirty(void) { s_console_gen = 0; }
+
 void ag_display_render_console(const ag_screen_t *screen)
 {
     if (!s_ready || s_acquired || s_front == NULL || screen == NULL) {

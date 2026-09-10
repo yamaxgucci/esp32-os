@@ -117,6 +117,17 @@ void ag_session_init(void)
     s_last_user_slot = 0;
     s_last_user = AG_PID_KERNEL;
     s_last_breakin_us = 0;
+    /*
+     * The screen the console already has is this slot's.
+     *
+     * Everything printed since power-on - the boot report, what the drivers
+     * had to say - was written by whoever holds the focus now, and that is
+     * slot 1.  Without this the console goes on believing that screen is the
+     * system's, and the first return to slot 1 hands it a blank one.
+     */
+    if (ag_console_ready()) {
+        (void)ag_console_adopt_slot(s_focused);
+    }
     (void)ag_proc_set_foreground(AG_PID_KERNEL);
 }
 
@@ -424,8 +435,16 @@ static void enter_shell_view(int slot)
     }
 
     if (ag_console_ready()) {
+        /*
+         * The slot's own screen, and NOT cleared.
+         *
+         * Clearing was how one screen was made to serve four slots: without
+         * it, slot 2 read as the tail of slot 1.  Each has its own now, so
+         * what is on this one is what it had when it was last looked at -
+         * which is the whole reason for going back to a slot.
+         */
+        (void)ag_console_use_slot(slot);
         ag_console_lock();
-        ag_screen_cls(ag_console_screen());
         ag_screen_set_attr(ag_console_screen(), AG_ATTR_DEFAULT);
         ag_screen_set_cursor(ag_console_screen(), true);
         ag_console_unlock();
@@ -495,6 +514,12 @@ static void enter_loading_view(int slot, ag_pid_t pid)
     }
 
     if (ag_console_ready()) {
+        /*
+         * This one IS cleared, on the slot's own screen: "please wait" is
+         * about what is happening now, and what was there belonged to
+         * whatever ran in this slot before.
+         */
+        (void)ag_console_use_slot(slot);
         ag_console_lock();
         ag_screen_cls(ag_console_screen());
         ag_screen_set_attr(ag_console_screen(), AG_ATTR_DEFAULT);

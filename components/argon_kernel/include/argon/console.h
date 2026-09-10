@@ -57,6 +57,27 @@ bool     ag_console_ready(void);
  */
 ag_err_t ag_console_resize(uint16_t cols, uint16_t rows);
 
+/*
+ * Show this slot's own screen (AG_SESSION_SYSTEM, or 0..AG_SESSION_SLOTS-1).
+ *
+ * Each slot keeps what was written to it while somebody was looking at
+ * another one; switching used to clear the single screen instead, which is
+ * why anything a program printed was gone as soon as you went to look at
+ * something else.  The screen is made the first time a slot is shown, and a
+ * machine with no memory for one goes on sharing - that is a slower version
+ * of the old behaviour, not a broken one.
+ */
+ag_err_t ag_console_use_slot(int slot);
+
+/*
+ * Say that the screen already in use belongs to this slot.
+ *
+ * For the one moment that needs it: the console exists before the slots do,
+ * and the boot report is on its screen.  Whoever holds the focus when the
+ * slots start has been writing there all along.
+ */
+ag_err_t ag_console_adopt_slot(int slot);
+
 /* Adds an endpoint.  It starts with a full repaint owed to it. */
 ag_err_t ag_console_attach(const ag_con_transport_t *transport, void *ctx);
 

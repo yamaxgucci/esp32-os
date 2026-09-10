@@ -90,6 +90,10 @@ extern const ag_gfx_api_t ag_gfx_api_table;
  */
 void ag_display_render_console(const ag_screen_t *screen);
 
+/* Throw away what this believes is already on the console: the screen it was
+ * comparing against has been swapped for another slot's. */
+void ag_display_console_dirty(void);
+
 /*
  * Write a framebuffer as a binary PPM (P6) to `path`.
  * `cwd` is for a relative path (same convention as ag_vfs_open).

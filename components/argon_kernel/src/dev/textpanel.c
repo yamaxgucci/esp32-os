@@ -231,6 +231,9 @@ ag_err_t ag_textpanel_geometry(uint16_t *cols, uint16_t *rows)
 static bool s_enabled = true;
 static bool s_owe_full;
 
+/* The same for a panel drawn as characters: a switched screen owes it all. */
+void ag_textpanel_owe_full(void) { s_owe_full = true; }
+
 void ag_textpanel_enable(bool on)
 {
     if (on == s_enabled) {
