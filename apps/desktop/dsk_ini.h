@@ -70,6 +70,8 @@ typedef struct {
      * keyboard somewhere else in the room is not one you want to reach for.
      */
     uint8_t  keyboard;
+    /* Which tile goes behind the icons; 0 is a plain desk. */
+    uint8_t  pattern;
 
     dsk_ini_icon_t icon[DSK_INI_ICONS];
     int            nicons;

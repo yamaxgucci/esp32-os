@@ -102,7 +102,44 @@ void dsk_paint_frame_done(void);
 
 /* ---- what the shell actually calls -------------------------------------- */
 
+/* The widest screen this shell composes a scanline for (see dsk_pattern). */
+#define DSK_PATTERN_MAX_W 640
+
 void dsk_fill(dsk_rect_t r, uint32_t rgb);
+
+/*
+ * The desk's pattern: eight rows of eight bits, tiled from the origin of the
+ * SCREEN and not of the rectangle.
+ *
+ * That last part is the whole difficulty.  A pattern drawn from each damage
+ * rectangle's own corner is a different pattern in every rectangle, and the
+ * desk is repainted in whatever pieces happen to be dirty - so the seams
+ * would move about as windows were dragged.  Anchoring to the screen means a
+ * piece repainted on its own lands exactly where the rest of it already is.
+ *
+ * Eight bytes rather than a picture, because a picture is 150 KB on a
+ * 320x240 panel with 111 KB to its name.  This is what Windows put behind
+ * its icons for the same reason.
+ */
+void dsk_pattern(dsk_rect_t r, const uint8_t rows[8], uint32_t fg,
+                 uint32_t bg);
+
+/*
+ * The desk's pattern: eight rows of eight bits, tiled from the origin of the
+ * SCREEN and not of the rectangle.
+ *
+ * That last part is the whole difficulty.  A pattern drawn from each damage
+ * rectangle's own corner is a different pattern in every rectangle, and the
+ * desk is repainted in whatever pieces happen to be dirty - so the seams
+ * would move about as windows were dragged.  Anchoring to the screen means a
+ * piece repainted on its own lands exactly where the rest of it already is.
+ *
+ * Eight bytes rather than a picture, because a picture is 150 KB on a
+ * 320x240 panel with 111 KB to its name.  This is what Windows put behind
+ * its icons for the same reason.
+ */
+void dsk_pattern(dsk_rect_t r, const uint8_t rows[8], uint32_t fg,
+                 uint32_t bg);
 void dsk_clip(dsk_rect_t r);
 void dsk_clip_reset(void);
 dsk_rect_t dsk_clip_now(void);

@@ -104,6 +104,7 @@ void dsk_ini_defaults(dsk_ini_t *ini)
     ini->dblclick_ms = 400u;
     ini->small_font = false;
     ini->keyboard = 0;
+    ini->pattern = 0;
 }
 
 bool dsk_ini_icon_of(const dsk_ini_t *ini, const char *label, int16_t *x,
@@ -178,6 +179,13 @@ static void apply(dsk_ini_t *ini, sec_t sec, char *key, char *value)
                 ini->small_font = true;
             } else if (ag_stricmp(value, "large") == 0) {
                 ini->small_font = false;
+            }
+        } else if (ag_stricmp(key, "pattern") == 0) {
+            /* By number, and bounded: the names are the shell's to change,
+             * so a file that said "weave" would mean something else after
+             * the next one is added. */
+            if (numbers(value, v, 1) == 1 && v[0] >= 0 && v[0] < 32) {
+                ini->pattern = (uint8_t)v[0];
             }
         } else if (ag_stricmp(key, "keyboard") == 0) {
             if (ag_stricmp(value, "on") == 0) {
@@ -346,6 +354,9 @@ ag_err_t dsk_ini_save(const dsk_ini_t *ini)
     put(text, INI_MAX, "\n; large (8x16) or small (8x8): twice the lines\n"
                        "font       = ");
     put(text, INI_MAX, ini->small_font ? "small" : "large");
+    put(text, INI_MAX, "\n; the tile behind the icons, 0 for a plain desk"
+                       "\npattern    = ");
+    put_num(text, INI_MAX, ini->pattern);
     put(text, INI_MAX, "\n; on-screen keyboard: auto (when the machine has "
                        "no keys), on, off\nkeyboard   = ");
     put(text, INI_MAX, (ini->keyboard == 1)   ? "on"

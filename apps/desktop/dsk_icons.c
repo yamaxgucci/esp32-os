@@ -5,6 +5,39 @@
  */
 #include "dsk_icons.h"
 
+/*
+ * Bit 0 is the leftmost pixel, as in the fonts, and the tile is anchored to
+ * the screen rather than to whatever piece is being repainted - see
+ * dsk_pattern() in dsk_paint.c for why that matters.
+ */
+static const uint8_t k_patterns[DSK_PATTERNS][8] = {
+    {0, 0, 0, 0, 0, 0, 0, 0},                               /* plain      */
+    {0x55, 0x00, 0xAA, 0x00, 0x55, 0x00, 0xAA, 0x00},       /* fine dots  */
+    {0x88, 0x00, 0x22, 0x00, 0x88, 0x00, 0x22, 0x00},       /* wide dots  */
+    {0xFF, 0x88, 0x88, 0x88, 0xFF, 0x88, 0x88, 0x88},       /* bricks     */
+    {0x11, 0x22, 0x44, 0x88, 0x11, 0x22, 0x44, 0x88},       /* weave      */
+};
+
+static const char *const k_pattern_names[DSK_PATTERNS] = {
+    "plain", "fine dots", "wide dots", "bricks", "weave",
+};
+
+const uint8_t *dsk_pattern_rows(int which)
+{
+    if (which <= 0 || which >= DSK_PATTERNS) {
+        return NULL; /* plain: the caller fills and draws no tile */
+    }
+    return k_patterns[which];
+}
+
+const char *dsk_pattern_name(int which)
+{
+    if (which < 0 || which >= DSK_PATTERNS) {
+        return k_pattern_names[0];
+    }
+    return k_pattern_names[which];
+}
+
 #include "dsk_paint.h"
 
 /* The sixteen VGA colours, in their own order: 0 black .. F white. */

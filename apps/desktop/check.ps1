@@ -452,7 +452,19 @@ try {
     # highlights nothing, so the first down lands on the first item.  One
     # down here picked "Large font", which was already the font - the shell
     # correctly did nothing, and the step proved nothing.
+    # Options > Pattern: the item cycles, so one press moves the desk
+    # one tile along.  Seven stops in: Large, Small, Teal, Navy, Green,
+    # Black, Pattern.
+    $optPattern = @('key f10', 'wait 400', 'key right', 'wait 200',
+                    'key right', 'wait 200', 'key right', 'wait 300') +
+                  (1..7 | ForEach-Object { 'key down' }) +
+                  @('wait 300', 'key enter', 'wait 900')
+
     # Options > Keyboard: always, then back to automatic.
+    #
+    # Nine stops and then eight, because Pattern sits above them - the
+    # third time today that adding one menu item moved a count in this
+    # file, and the reason every one of them is written out in words.
     #
     # What this can check from here is the wiring - the setting is read, the
     # shell says which way it went - and not whether a finger can hit a key,
@@ -465,11 +477,11 @@ try {
     # this scenario clicks.
     $optKbd = @('key f10', 'wait 400', 'key right', 'wait 200', 'key right',
                 'wait 200', 'key right', 'wait 300') +
-              (1..8 | ForEach-Object { 'key down' }) +
+              (1..9 | ForEach-Object { 'key down' }) +
               @('wait 300', 'key enter', 'wait 800',
                 'key f10', 'wait 400', 'key right', 'wait 200', 'key right',
                 'wait 200', 'key right', 'wait 300') +
-              (1..7 | ForEach-Object { 'key down' }) +
+              (1..8 | ForEach-Object { 'key down' }) +
               @('wait 300', 'key enter', 'wait 800')
 
     # Three Rights now: File, Edit, Window, Options.
@@ -524,7 +536,7 @@ try {
 
     $keyboard = $runHello + $runGfx + $opsMkdir + $opsCopy + $opsDelete +
                 $opsRename + $openConsole + $backToFolder + $opsClip +
-                $opsMarked + $optKbd + $optFont + $opsProps
+                $opsMarked + $optPattern + $optKbd + $optFont + $opsProps
     $quoted = ($moves | ForEach-Object { '"' + $_ + '"' }) -join ' '
     $after = @('"key f5"', ('"wait ' + $settle + '"')) -join ' '
     # The properties box is deliberately still up for both photographs - it is
@@ -538,6 +550,18 @@ try {
         # Nothing to install: the drivers came up from C:\DRV with the boot,
         # because SYSTEM.CFG on the baked image names them in [modules].
         'dev',
+        # And wait for the LAST line of what `dev` printed before typing
+        # anything else.
+        #
+        # A prompt is not proof.  A run that typed the next line while
+        # the modules were still loading had it swallowed: the
+        # transcript shows `run c:\desktop.axe 120` echoed in the middle
+        # of "modules: loaded KBDVIRT", and the command never ran -
+        # everything after it played into a shell that had started
+        # nothing, and the photographs were of a console.  mouse0 is the
+        # last device the listing names, so seeing it means the listing
+        # is over and the shell is back.
+        '=mouse0',
         # Raw, so the harness does not sit waiting for a prompt that cannot
         # come until the shell's own deadline expires.
         #
@@ -546,7 +570,14 @@ try {
         # and is echoed, the command never runs, and the screenshot shows it
         # sitting at the prompt untouched.  One run in three, which is not a
         # thing to leave in a test.
+        # The Enter goes after the guest has ECHOED the line, not after a
+        # pause.  Together with the text it was lost about one run in
+        # three; three hundred milliseconds later, about one in ten -
+        # the same bug with a bet on top.  An echo is a fact: the shell
+        # has the line in its editor and the only thing left is to
+        # finish it.
         "~run c:\desktop.axe $Seconds",
+        "=run c:\desktop.axe $Seconds",
         '~\x0d',
         '=desktop: surface',
         "!& '$pyexe' 'tools\inputplay.py' --wait 20 $quoted",
@@ -581,6 +612,7 @@ try {
         # restored window from one this script had opened; the counters do.
         'type c:\desktop.ini',
         '~run c:\desktop.axe 12',
+        '=run c:\desktop.axe 12',
         '~\x0d',
         '=desktop: surface',
         # The surface line is printed before the first paint has reached the
@@ -882,6 +914,14 @@ try {
         # Both ways of asking for the context menu, counted.  A right button
         # that reached nothing and a long press that was taken for a drag both
         # look like a passing run otherwise.
+        # The desk pattern changed, and the shell says which tile it is
+        # on now.  The two-photograph criterion covers the rest: a desk
+        # whose repaint does not line up with the tile already drawn
+        # shows up there, not here.
+        if ($text -notmatch 'desktop: desk pattern [1-9]') {
+            $fail += 'Options > Pattern did not change the desk'
+        }
+
         # The keyboard setting was read and acted on, both ways.  The
         # shell says which way it went, so this is checked by what it did
         # and not by the fact that a menu item exists.

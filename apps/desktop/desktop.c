@@ -265,6 +265,36 @@ static void clamp_icon(int16_t *x, int16_t *y)
     }
 }
 
+/*
+ * The desk itself: a colour, and a tile over it when one is chosen.
+ *
+ * Only the damaged part is drawn - the clip sees to that - and the tile is
+ * anchored to the screen, so a piece repainted on its own lands in step
+ * with the rest of it.
+ */
+static void draw_desk(void)
+{
+    const uint8_t *rows = dsk_pattern_rows((int)s_ini.pattern);
+    if (rows == NULL) {
+        dsk_fill(s_m.work, s_ini.background);
+        return;
+    }
+    /*
+     * The tile's ink is the desk colour lightened towards white, rather
+     * than a second colour to choose: two colours is two decisions and one
+     * of them is always wrong at this size.  Windows did the same - its
+     * patterns were one colour on the desk colour.
+     */
+    const uint32_t r8 = (s_ini.background >> 16) & 0xFFu;
+    const uint32_t g8 = (s_ini.background >> 8) & 0xFFu;
+    const uint32_t b8 = s_ini.background & 0xFFu;
+    const uint32_t ink = (((r8 + 0x40u > 0xFFu) ? 0xFFu : r8 + 0x40u) << 16) |
+                         (((g8 + 0x40u > 0xFFu) ? 0xFFu : g8 + 0x40u) << 8) |
+                         ((b8 + 0x40u > 0xFFu) ? 0xFFu : b8 + 0x40u);
+
+    dsk_pattern(s_m.work, rows, ink, s_ini.background);
+}
+
 static void draw_drives(void)
 {
     for (int i = 0; i < s_ndrives; i++) {
@@ -549,6 +579,7 @@ enum {
     ID_MARK,
     ID_MARK_ALL,
     ID_MARK_NONE,
+    ID_PATTERN,
     ID_KBD_AUTO,
     ID_KBD_ON,
     ID_KBD_OFF,
@@ -1630,6 +1661,10 @@ static void set_separator(dsk_menu_t *m)
     it->checked = false;
 }
 
+/* The pattern item's label, held because a menu points at it rather than
+ * copying it. */
+static char s_pattern_label[32];
+
 /* Titles for the window list, held so the menu can point at them. */
 static char s_win_labels[DSK_WIN_MAX][DSK_TITLE_MAX + 4];
 
@@ -1733,6 +1768,15 @@ static void rebuild_menus(void)
     s_menus[3].items[4].checked = (s_ini.background == DSK_NAVY);
     s_menus[3].items[5].checked = (s_ini.background == DSK_GREEN);
     s_menus[3].items[6].checked = (s_ini.background == DSK_BLACK);
+    /*
+     * One item that cycles rather than five that do not fit: a menu holds
+     * sixteen and this one is at fifteen.  The label says where it is now,
+     * which is what a tick would have said.
+     */
+    ag_strlcpy(s_pattern_label, "Pattern: ", sizeof(s_pattern_label));
+    ag_strlcat(s_pattern_label, dsk_pattern_name((int)s_ini.pattern),
+               sizeof(s_pattern_label));
+    set_item(&s_menus[3], s_pattern_label, ID_PATTERN, true);
     set_separator(&s_menus[3]);
     set_item(&s_menus[3], "Keyboard: automatic", ID_KBD_AUTO, true);
     set_item(&s_menus[3], "Keyboard: always", ID_KBD_ON, true);
@@ -1881,6 +1925,14 @@ static void menu_chose(uint16_t id)
         break;
     case ID_MARK_NONE:
         dsk_folder_mark(dsk_wm_active(), -1, DSK_MARK_NONE);
+        break;
+    case ID_PATTERN:
+        s_ini.pattern = (uint8_t)((s_ini.pattern + 1u) % DSK_PATTERNS);
+        repaint_all();
+        save_arrangement();
+        ag_printf("desktop: desk pattern %u (%s)\n",
+                  (unsigned)s_ini.pattern,
+                  dsk_pattern_name((int)s_ini.pattern));
         break;
     case ID_KBD_AUTO:
     case ID_KBD_ON:
@@ -2055,7 +2107,7 @@ static void draw_region(dsk_rect_t r)
         return;
     }
     dsk_clip(r);
-    dsk_fill(s_m.work, s_ini.background);
+    draw_desk();
     draw_drives();
     dsk_clip_reset();
 

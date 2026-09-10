@@ -20,6 +20,21 @@
 
 #include "dsk.h"
 
+/*
+ * The desk's patterns, eight rows of eight bits each.
+ *
+ * Windows called these wallpapers and they are nothing of the kind: a
+ * picture on a 320x240 panel is a hundred and fifty kilobytes on a machine
+ * with a hundred and eleven, so what went behind the icons there - and here
+ * - is a tile.  Named after what they look like rather than after Windows,
+ * because the shapes are ours.
+ */
+#define DSK_PATTERNS 5
+
+/* Index into dsk_pattern_rows(); 0 is a plain desk and draws no tile. */
+const uint8_t *dsk_pattern_rows(int which);
+const char    *dsk_pattern_name(int which);
+
 #define DSK_ICON_W 16
 #define DSK_ICON_H 16
 

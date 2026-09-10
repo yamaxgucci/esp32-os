@@ -230,6 +230,47 @@ void dsk_text_small(int16_t x, int16_t y, const char *s, uint32_t fg,
     }
 }
 
+/*
+ * One scanline at a time, out of a buffer as wide as the widest screen this
+ * shell draws on.
+ *
+ * A tile at a time would be 8x8 blits, which for a desk is a thousand calls;
+ * a whole 8-row block would be five kilobytes of scratch on a machine that
+ * counts them.  A row is 640 bytes and one blit per row of the damaged
+ * piece, which for the pieces that actually get repainted - a strip behind a
+ * moved window, a cell under an icon - is a handful.
+ */
+void dsk_pattern(dsk_rect_t r, const uint8_t rows[8], uint32_t fg,
+                 uint32_t bg)
+{
+    static uint16_t line[DSK_PATTERN_MAX_W];
+
+    if (rows == NULL || dsk_rect_empty(r)) {
+        return;
+    }
+    if (r.w > (int16_t)DSK_PATTERN_MAX_W) {
+        /* Wider than the buffer: the flat colour is wrong but visible, and
+         * a shell that draws nothing at all is worse than one that draws a
+         * plain desk. */
+        dsk_fill(r, bg);
+        return;
+    }
+
+    const uint16_t f = to565(fg);
+    const uint16_t b = to565(bg);
+
+    for (int16_t y = r.y; y < dsk_rect_y2(r); y++) {
+        const uint8_t bits = rows[((unsigned)y) & 7u];
+        for (int16_t i = 0; i < r.w; i++) {
+            const int16_t x = (int16_t)(r.x + i);
+            /* Bit 0 leftmost, as in the fonts, and taken from the screen's
+             * x so that neighbouring pieces line up. */
+            line[i] = ((bits >> (((unsigned)x) & 7u)) & 1u) ? f : b;
+        }
+        s_p->blit(dsk_rect(r.x, y, r.w, 1), line, (uint32_t)r.w);
+    }
+}
+
 int16_t dsk_text_small_width(const char *s)
 {
     int16_t n = 0;
