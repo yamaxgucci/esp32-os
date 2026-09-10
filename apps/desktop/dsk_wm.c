@@ -679,9 +679,18 @@ static void draw_frame(dsk_win_t *w, bool active)
     const dsk_rect_t t = dsk_wm_title(w);
     if (!dsk_rect_empty(t)) {
         dsk_fill(t, active ? DSK_NAVY : DSK_LGRAY);
-        if (!active) {
-            dsk_hline(t.x, (int16_t)(dsk_rect_y2(t) - 1), t.w, DSK_DGRAY);
-        }
+        /*
+         * A line under the title, whatever colour the title is.
+         *
+         * It used to be drawn only for an inactive window, where a grey
+         * title would otherwise merge into the grey frame - and the active
+         * one was left without because navy against a white list is edge
+         * enough.  It is not: the picked row of a list is navy too, and
+         * when the pick is the top row the two run together into one blue
+         * block with no telling where the window's furniture ends and its
+         * contents begin.  Maxim saw that on the board.
+         */
+        dsk_hline(t.x, (int16_t)(dsk_rect_y2(t) - 1), t.w, DSK_DGRAY);
         draw_box(dsk_wm_sysmenu(w), 0);
         draw_box(dsk_wm_minbox(w), 1);
         draw_box(dsk_wm_maxbox(w), 2);
