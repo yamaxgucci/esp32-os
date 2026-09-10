@@ -77,6 +77,23 @@ AG_DRV("XPT2046", "0.2", "argon");
 #define DEADBAND 2
 
 /*
+ * How long the glass may say "nothing is touching me" before it is believed.
+ *
+ * The pen line is one wire and it is not a promise.  While a stylus is drawn
+ * across this panel it reads high on most polls - measured, seventy per cent
+ * of them during a stroke - and every one of those used to end the stroke on
+ * the spot: pointer up, and then down again a few polls later somewhere else.
+ * From a hand's point of view the pointer stops dead for half a second and
+ * then jumps, which is exactly what Maxim reported.
+ *
+ * So while the pen is down the line only raises the question and the
+ * controller answers it: pressure is read, and a release is declared only
+ * after the glass has been quiet for this long.  Sixty milliseconds is under
+ * what a hand can lift and replace, and over what a stroke does to itself.
+ */
+#define UP_SETTLE_MS 60u
+
+/*
  * Raw readings at the edges of the glass.  A resistive panel is a pair of
  * potentiometers and these are where its ends are; they vary between panels of
  * the same model, so they are a starting point rather than a fact.  Anything
@@ -104,11 +121,78 @@ static const ag_io_api_t *io;
  */
 static bool s_px;
 
+/*
+ * Where a poll went, counted, because "it hangs sometimes" cannot be chased
+ * from the far end.
+ *
+ * The shell measures two things and they split the problem in half: how long
+ * its slowest repaint took, and how long it waited between pointer events.
+ * On the CYD the first is five milliseconds and the second is two hundred to
+ * seven hundred - so the shell is not slow, the events are not arriving, and
+ * the only place left is here.  A poll that produces nothing does so for one
+ * of three reasons and they want different fixes, so each is counted and the
+ * tally goes to the kernel's journal - not the console, which is what the
+ * screen is showing.
+ */
+static struct {
+    uint32_t polls;    /* touch_poll called                                */
+    uint32_t no_pen;   /* the pen line says nothing is down                */
+    uint32_t weak;     /* pressed, but under Z_MIN: dropped                */
+    uint32_t still;    /* pressed and read, but inside the dead band       */
+    uint32_t sent;     /* an event handed to the kernel                    */
+    uint32_t flaky;    /* line said up, the glass was still being pressed  */
+    uint32_t worst;    /* longest run of polls that produced nothing, ms   */
+    uint32_t quiet_at; /* when the current dry spell started               */
+    uint32_t said_at;  /* last time this was written down                  */
+} s_tally;
+
+static void tally_tick(bool produced)
+{
+    const uint32_t now = ag_millis();
+
+    if (produced) {
+        const uint32_t dry = (s_tally.quiet_at != 0u) ? now - s_tally.quiet_at
+                                                      : 0u;
+        if (dry > s_tally.worst) {
+            s_tally.worst = dry;
+        }
+        s_tally.quiet_at = now;
+    } else if (s_tally.quiet_at == 0u) {
+        s_tally.quiet_at = now;
+    }
+
+    if (s_tally.said_at == 0u) {
+        s_tally.said_at = now;
+        return;
+    }
+    if (now - s_tally.said_at < 3000u || s_tally.polls == 0u) {
+        return;
+    }
+    ag_log(AG_LOG_INFO, "XPT2046",
+           "polls %u: no pen %u, flaky %u, weak %u, still %u, sent %u; "
+           "longest silence %u ms",
+           (unsigned)s_tally.polls, (unsigned)s_tally.no_pen,
+           (unsigned)s_tally.flaky, (unsigned)s_tally.weak,
+           (unsigned)s_tally.still, (unsigned)s_tally.sent,
+           (unsigned)s_tally.worst);
+    s_tally.said_at = now;
+    s_tally.polls = 0;
+    s_tally.no_pen = 0;
+    s_tally.flaky = 0;
+    s_tally.weak = 0;
+    s_tally.still = 0;
+    s_tally.sent = 0;
+    s_tally.worst = 0;
+}
+
 static struct {
     bool     down;
     int16_t  col, row; /* the last position reported: cells or pixels */
     uint32_t samples;
 } s_state;
+
+/* When the glass first went quiet under a pen we still believe is down. */
+static uint32_t s_up_since;
 
 /* ---- the wire ---------------------------------------------------------- */
 
@@ -245,16 +329,23 @@ static int32_t touch_poll(ag_handle_t h, ag_event_t *out, uint32_t max)
      * has to be confirmed by pressure, because it also goes low while the
      * controller is converting.
      */
-    if (io->gpio_read(T_IRQ) != 0) {
-        if (!s_state.down) {
-            return 0;
-        }
-        s_state.down = false;
-        out[0].type = AG_EV_POINTER_UP;
-        out[0].ptr.x = s_state.col;
-        out[0].ptr.y = s_state.row;
-        out[0].ptr.buttons = 0;
-        return 1;
+    s_tally.polls++;
+
+    const bool line = (io->gpio_read(T_IRQ) == 0); /* low: something is on it */
+
+    /*
+     * Idle is the cheap case and the line is enough for it: nothing is down,
+     * nothing says otherwise, and four conversions a hundred times a second
+     * for a screen nobody is touching would be a tax on the whole bus - which
+     * the panel is using.
+     */
+    if (!line && !s_state.down) {
+        s_tally.no_pen++;
+        tally_tick(false);
+        return 0;
+    }
+    if (!line) {
+        s_tally.no_pen++; /* but we do not believe it; see UP_SETTLE_MS */
     }
 
     const uint16_t z1 = read3(CMD_Z1);
@@ -263,9 +354,39 @@ static int32_t touch_poll(ag_handle_t h, ag_event_t *out, uint32_t max)
     const uint16_t ry = read3(CMD_Y);
     s_state.samples++;
 
-    if (pressure(rx, z1, z2) < Z_MIN) {
-        return 0;
+    const bool pressed = pressure(rx, z1, z2) >= Z_MIN;
+
+    if (!line && pressed) {
+        s_tally.flaky++; /* the wire lied and the glass put it right */
     }
+
+    if (!pressed) {
+        if (!s_state.down) {
+            s_tally.weak++;
+            tally_tick(false);
+            return 0;
+        }
+        /* Down until the glass has been quiet long enough to mean it. */
+        const uint32_t now = ag_millis();
+        if (s_up_since == 0u) {
+            s_up_since = now;
+        }
+        if (now - s_up_since < UP_SETTLE_MS) {
+            s_tally.weak++;
+            tally_tick(false);
+            return 0;
+        }
+        s_up_since = 0u;
+        s_state.down = false;
+        out[0].type = AG_EV_POINTER_UP;
+        out[0].ptr.x = s_state.col;
+        out[0].ptr.y = s_state.row;
+        out[0].ptr.buttons = 0;
+        s_tally.sent++;
+        tally_tick(true);
+        return 1;
+    }
+    s_up_since = 0u;
 
     /*
      * Which raw axis is the screen's across.
@@ -313,6 +434,8 @@ static int32_t touch_poll(ag_handle_t h, ag_event_t *out, uint32_t max)
     } else if (moved) {
         out[0].type = AG_EV_POINTER_MOVE;
     } else {
+        s_tally.still++;
+        tally_tick(false);
         return 0; /* still down, still in the same place: nothing happened */
     }
 
@@ -324,6 +447,8 @@ static int32_t touch_poll(ag_handle_t h, ag_event_t *out, uint32_t max)
 
     s_state.col = col;
     s_state.row = row;
+    s_tally.sent++;
+    tally_tick(true);
     return 1;
 }
 

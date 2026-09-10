@@ -12,6 +12,8 @@
 #include <string.h>
 
 #include "driver/gpio.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "driver/i2c_master.h"
 #include "driver/ledc.h"
 #include "driver/spi_master.h"
@@ -361,6 +363,29 @@ typedef struct {
     spi_dev_t devs[AG_PORT_SPI_DEVS];
     uint32_t  khz; /* the bus default, for a chip nobody set a speed for */
     uint8_t  *bounce; /* tx half then rx half, internal and DMA-able      */
+    /*
+     * One transfer at a time on this bus, whoever asks.
+     *
+     * A bus is shared hardware and this port keeps shared state for it: one
+     * bounce buffer, and a table of devices built on demand.  Two tasks reach
+     * both.  On the CYD they do it constantly: an application pushes pixels
+     * to the panel from its own thread while the console task reads the touch
+     * controller, and the two sit on SPI2 with a chip select each.
+     *
+     * Unserialised, a touch reading and a panel command share the bounce
+     * buffer, and the panel is handed the touch's bytes: a window command
+     * that is not the one that was meant, and a band of pixels landing
+     * somewhere else on the glass.  That is what the dots on Maxim's screen
+     * were - random places, gone at the next repaint - and why they appeared
+     * when touch went pixel-precise: four times the traffic, four times the
+     * chances to collide.
+     *
+     * Recursive, because a transfer too big for the bounce buffer chops
+     * itself into transfers that come back through the front door - and
+     * because dropping chip select between the halves of one command is
+     * exactly what must not happen.
+     */
+    SemaphoreHandle_t lock;
     bool      up;
 } spi_state_t;
 
@@ -396,8 +421,15 @@ ag_err_t ag_port_spi_open(int bus, int sck, int mosi, int miso, uint32_t khz)
         return from_esp(rc);
     }
 
+    s_spi[bus].lock = xSemaphoreCreateRecursiveMutex();
+    if (s_spi[bus].lock == NULL) {
+        (void)spi_bus_free(AG_PORT_SPI_HOST_OF(bus));
+        return -AG_ENOMEM;
+    }
     s_spi[bus].bounce = ag_port_alloc(2u * AG_PORT_SPI_BOUNCE, AG_MEM_DMA);
     if (s_spi[bus].bounce == NULL) {
+        vSemaphoreDelete(s_spi[bus].lock);
+        s_spi[bus].lock = NULL;
         (void)spi_bus_free(AG_PORT_SPI_HOST_OF(bus));
         return -AG_ENOMEM;
     }
@@ -410,15 +442,26 @@ ag_err_t ag_port_spi_open(int bus, int sck, int mosi, int miso, uint32_t khz)
     return AG_OK;
 }
 
+static ag_err_t spi_set_khz_locked(int bus, int cs, uint32_t khz);
+
 ag_err_t ag_port_spi_set_khz(int bus, int cs, uint32_t khz)
 {
     if (!spi_valid(bus)) {
         return -AG_ERANGE;
     }
-    if (!s_spi[bus].up) {
+    if (!s_spi[bus].up || s_spi[bus].lock == NULL) {
         return -AG_ENODEV;
     }
+    /* The device table is the bus's, and this rebuilds entries in it while
+     * another task may be half way through a transfer on one of them. */
+    xSemaphoreTakeRecursive(s_spi[bus].lock, portMAX_DELAY);
+    const ag_err_t err = spi_set_khz_locked(bus, cs, khz);
+    xSemaphoreGiveRecursive(s_spi[bus].lock);
+    return err;
+}
 
+static ag_err_t spi_set_khz_locked(int bus, int cs, uint32_t khz)
+{
     for (int i = 0; i < AG_PORT_SPI_DEVS; i++) {
         spi_dev_t *d = &s_spi[bus].devs[i];
         if (d->cs != cs) {
@@ -494,12 +537,32 @@ static ag_err_t spi_device_for(int bus, int cs, spi_device_handle_t *out)
     return AG_OK;
 }
 
+static ag_err_t spi_xfer_locked(int bus, int cs, const void *tx, void *rx,
+                                size_t len);
+
 ag_err_t ag_port_spi_xfer(int bus, int cs, const void *tx, void *rx, size_t len)
 {
     if (len == 0 || len > AG_PORT_SPI_MAX_XFER) {
         return -AG_EINVAL;
     }
+    if (!spi_valid(bus) || !s_spi[bus].up || s_spi[bus].lock == NULL) {
+        return -AG_ENODEV;
+    }
 
+    /*
+     * Waiting for the bus is not an error to report upwards: the other holder
+     * is a device driver in the middle of a transfer, and it will finish.  A
+     * timeout here would turn a busy bus into a driver failure.
+     */
+    xSemaphoreTakeRecursive(s_spi[bus].lock, portMAX_DELAY);
+    const ag_err_t err = spi_xfer_locked(bus, cs, tx, rx, len);
+    xSemaphoreGiveRecursive(s_spi[bus].lock);
+    return err;
+}
+
+static ag_err_t spi_xfer_locked(int bus, int cs, const void *tx, void *rx,
+                                size_t len)
+{
     spi_device_handle_t dev = NULL;
     ag_err_t            err = spi_device_for(bus, cs, &dev);
     if (err != AG_OK) {

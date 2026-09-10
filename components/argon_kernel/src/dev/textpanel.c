@@ -77,6 +77,9 @@ void ag_inputpoll_tick(void)
          * arena: between finding the vtable and calling it, `drv unload` can
          * free it.  Module unload takes this lock too.
          */
+        bool     pixels = false;
+        uint16_t span_w = 0, span_h = 0;
+
         ag_dev_lock_hold();
         ag_device_t *dev = ag_dev_find(info.name);
         if (dev != NULL && dev->class_ops != NULL) {
@@ -98,6 +101,22 @@ void ag_inputpoll_tick(void)
                  * rather than being allowed to hold the console task. */
                 n = ops->poll(0, evs, 4);
             }
+            /*
+             * Units in the same hold as the poll, not a second one.
+             *
+             * A separate lock and lookup per device per tick is a hundred
+             * contentions a second against everything else that touches the
+             * registry - and a panel being written to is exactly that.  The
+             * pointer stalled and then caught up in a jump.
+             */
+            const uint32_t px_need = (uint32_t)(__builtin_offsetof(
+                                                    ag_input_ops_t, span_h) +
+                                                sizeof(uint16_t));
+            if (ops->size >= px_need && ops->units == AG_PTR_PIXELS) {
+                pixels = true;
+                span_w = ops->span_w;
+                span_h = ops->span_h;
+            }
         }
         ag_dev_lock_release();
 
@@ -115,23 +134,6 @@ void ag_inputpoll_tick(void)
          * what a pointer is measured in above here, and the two are usually
          * the same panel but need not be.
          */
-        const uint32_t px_need = (uint32_t)(__builtin_offsetof(ag_input_ops_t,
-                                                               span_h) +
-                                            sizeof(uint16_t));
-        bool     pixels = false;
-        uint16_t span_w = 0, span_h = 0;
-        ag_dev_lock_hold();
-        ag_device_t *d2 = ag_dev_find(info.name);
-        if (d2 != NULL && d2->class_ops != NULL) {
-            const ag_input_ops_t *ops2 = (const ag_input_ops_t *)d2->class_ops;
-            if (ops2->size >= px_need && ops2->units == AG_PTR_PIXELS) {
-                pixels = true;
-                span_w = ops2->span_w;
-                span_h = ops2->span_h;
-            }
-        }
-        ag_dev_lock_release();
-
         if (pixels) {
             uint16_t sw = 0, sh = 0;
             if (!ag_display_size(&sw, &sh) || sw == 0 || sh == 0) {
