@@ -36,6 +36,7 @@ void run_nam_tests(void);
 void run_netmsg_tests(void);
 void run_rempix_tests(void);
 void run_rlink_tests(void);
+void run_atproto_tests(void);
 
 int main(void)
 {
@@ -67,6 +68,7 @@ int main(void)
     run_netmsg_tests();
     run_rempix_tests();
     run_rlink_tests();
+    run_atproto_tests();
 
     printf("%d checks, %d failures\n", ag_test_checks, ag_test_failures);
     return ag_test_failures == 0 ? 0 : 1;

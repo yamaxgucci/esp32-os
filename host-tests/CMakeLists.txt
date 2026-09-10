@@ -134,6 +134,8 @@ add_executable(argon_tests
     test_rempix.c
     test_rlink.c
     "${ARGON_ROOT}/apps/common/rlink/ag_rlink.c"
+    test_atproto.c
+    "${ARGON_ROOT}/apps/common/atproto/ag_atproto.c"
     "${ARGON_ROOT}/tools/nam.c"
     "${ARGON_ROOT}/apps/cc/cc_compile.c"
     "${ARGON_ROOT}/components/argon_kernel/src/dev/draw.c"

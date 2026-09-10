@@ -502,6 +502,14 @@ switch ($Command.ToLowerInvariant()) {
         exit $LASTEXITCODE
     }
 
+    'attest' {
+        # The AT variant of rlinktest: ATRADIO.SYS bound with `net use atradio`,
+        # talking the stock ESP-01 AT command set to a fake modem (atmodemd.py)
+        # on a UART.  Proves the same socket path over a radio's own firmware.
+        & (Join-Path $PSScriptRoot 'attest.ps1') @Rest
+        exit $LASTEXITCODE
+    }
+
     'tests' {
         Build-HostTools
         & ctest --test-dir build-host --output-on-failure

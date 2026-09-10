@@ -184,3 +184,29 @@ Framed, little-endian, как HSFS. Заголовок фиксированно�
   ради экономии образа; развязка M2 его включает, но сам профиль — отдельно.
 - Приём драйвера/приложения по каналу как поток + режим приёма + подпись
   (безопасность из фазы 4.5): открытый радиоканал, принимающий код, — это RCE.
+
+## AT-вариант — родная прошивка ESP-01 (сделано)
+
+Второй backend, «и тот и другой по необходимости»: тот же `ag_net_ops`, но
+поверх **заводского AT** ESP-01, а не нашего RLINK. Первый результат на железе
+без перепрошивки — только провод.
+
+- **AT-кодек** `apps/common/atproto/ag_atproto.{c,h}` (freestanding, как rlink:
+  ни snprintf/strncmp/strchr, ни strcmp/ag_strcmp — свои `streq`/`sb_*`, только
+  `strlen` общий). Классификация строк (`OK`/`ERROR`/`SEND OK`/`>`/
+  `<n>,CONNECT`/`<n>,CLOSED`/`+CIPDOMAIN`/`+CIFSR`/`+CIPSTA`) и разбор `+IPD`
+  (mux/single, вложенный, неполный хвост, префикс тега на границе). Host-тесты
+  в стиле `test_rlink`: `host-tests/test_atproto.c` (в `argon tests`).
+- **`ATRADIO.SYS`** `apps/atradio/atradio.c`: AT-команды вместо RLINK-rpc,
+  кольца по каналам питаются `+IPD` (стримом, payload не держим в буфере),
+  ловля голого `> `-промпта без перевода строки. `listen`/`accept` →
+  `-AG_ENOTSUP` (серверная модель AT другая; клиентских сокетов хватает wget/
+  ftp/ssh). Join по `radio.ssid`/`radio.pass`; без них модем считается уже
+  подключённым (фикстур/провижининг снаружи).
+- **Фиктивный AT-модем** `tools/atmodemd.py` — как `rlinkd.py`, но говорит AT и
+  проксирует в реальные сокеты. `argon attest` (`tools/attest.ps1`,
+  `qemu-boot -RadioScript atmodemd.py`) — **8/8** в QEMU: `net use atradio` →
+  скачать файл через AT-радио, встроенного в тракте нет.
+
+AT покупает только сокеты: ни monitor mode, ни ESP-NOW, ни инжекта — за этим
+RLINK. TLS/https поверх AT — как и у RLINK, вне тракта (TLS в порту).

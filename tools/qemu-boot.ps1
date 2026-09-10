@@ -41,6 +41,9 @@ param(
     # is also taken by rlinkd on the host.
     [switch]$Radio,
     [int]$RadioPort = 5562,
+    # Which fake coprocessor answers on the radio UART: rlinkd.py (RLINK, our own
+    # firmware) or atmodemd.py (stock AT firmware).  A file name under tools\.
+    [string]$RadioScript = 'rlinkd.py',
     [switch]$NoNet,
     [int]$NetPort = 5558,
     # Tie virtual time to instructions retired instead of to host time.
@@ -125,7 +128,7 @@ if ($Radio) {
         if (-not $g) { throw 'Python not found for rlinkd.' }
         $g.Source
     }
-    $rlinkScript = (Resolve-Path (Join-Path $PSScriptRoot 'rlinkd.py')).Path
+    $rlinkScript = (Resolve-Path (Join-Path $PSScriptRoot $RadioScript)).Path
     try {
         Get-NetTCPConnection -LocalPort $RadioPort -State Listen `
             -ErrorAction SilentlyContinue |
