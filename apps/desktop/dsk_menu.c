@@ -303,12 +303,22 @@ void dsk_menu_popup(int which, int16_t x, int16_t y)
 
 void dsk_menu_close(void)
 {
-    s_pop_x = -1;
-    s_pop_y = -1;
     if (s_open < 0) {
+        s_pop_x = -1;
+        s_pop_y = -1;
         return;
     }
+    /*
+     * The rectangle first, the popup point after it.
+     *
+     * Clearing the point first asks drop_rect where this menu WOULD hang if
+     * it hung under its title, which for a context menu is not where it is.
+     * The screen was then repaired in the wrong place and the menu stayed on
+     * the glass until the cursor smeared it away.
+     */
     const dsk_rect_t was = dsk_menu_drop_rect(s_open);
+    s_pop_x = -1;
+    s_pop_y = -1;
     s_open = -1;
     s_hi = -1;
     if (!dsk_rect_empty(was)) {

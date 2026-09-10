@@ -864,6 +864,18 @@ static void press_settle(uint32_t now)
     if (!s_press.armed || press_due_in(now) != 0u) {
         return;
     }
+    /*
+     * Not while a window is being moved or resized.
+     *
+     * A hand puts a finger on a title bar and waits before it moves - half a
+     * second is nothing to a person deciding where to put a window - and the
+     * menu was popping up in the middle of that and taking the drag with it.
+     * A drag in progress is proof the press was not a hold.
+     */
+    if (dsk_wm_tracking()) {
+        s_press.armed = false;
+        return;
+    }
     s_press.armed = false;
     fdrag_cancel(); /* it was a press, not the start of a drag */
     context_menu_at(s_press.x, s_press.y);
