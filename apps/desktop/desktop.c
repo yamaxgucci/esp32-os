@@ -532,6 +532,26 @@ enum {
     ID_DELETE,
     ID_MKDIR,
     ID_OPEN,
+
+    /*
+     * Settings, as menu items rather than a dialog.
+     *
+     * Every one of them is a choice between three or four named things, and
+     * a menu with a tick beside the current one says that in the space it
+     * already occupies - which on a 320x240 screen is the whole argument.
+     * It is also how Program Manager did it, and it needs no keyboard: this
+     * board has none, and until now the font could only be changed by
+     * editing DESKTOP.INI on a machine that has one.
+     */
+    ID_FONT_LARGE,
+    ID_FONT_SMALL,
+    ID_BG_TEAL,
+    ID_BG_NAVY,
+    ID_BG_GREEN,
+    ID_BG_BLACK,
+    ID_DBL_SLOW,
+    ID_DBL_NORMAL,
+    ID_DBL_FAST,
     ID_PROPS,
     ID_ARRANGE,
     ID_EXIT,
@@ -544,7 +564,7 @@ enum {
     ID_WINDOW_FIRST = 100, /* + the window's z index */
 };
 
-static dsk_menu_t s_menus[4];
+static dsk_menu_t s_menus[5];
 
 /* ---- file operations ---------------------------------------------------- */
 
@@ -801,6 +821,29 @@ static void ask_copy(bool moving)
     ask_copy_to(moving, other_folder_dir());
 }
 
+/*
+ * A different font, without restarting.
+ *
+ * Every height in the layout is one line of the chosen font plus a pixel
+ * each side, so the metrics are rebuilt - in place, because the window
+ * manager, the menus and the dialogs hold a pointer to that structure rather
+ * than a copy of it.  The windows keep the frames they have: a person who
+ * arranged them meant those rectangles, and the shell has no business moving
+ * them because the letters changed size.  A window left maximised is the one
+ * exception and it is left alone too - it is a keystroke from being right,
+ * and guessing at somebody's arrangement is worse than a wrong edge.
+ */
+static void apply_font(void)
+{
+    dsk_ui_font_set(s_ini.small_font ? DSK_UI_FONT_SMALL : DSK_UI_FONT_LARGE);
+    dsk_metrics_init(&s_m, s_m.screen.w, s_m.screen.h);
+    repaint_all();
+    save_arrangement();
+    /* Said out loud, because a scripted run cannot read letters off the
+     * glass and this is the whole of what the item did. */
+    ag_printf("desktop: font 8x%d\n", (int)dsk_ui_h());
+}
+
 /* ---- the context menu -------------------------------------------------- */
 
 /*
@@ -831,7 +874,7 @@ static struct {
 
 static void context_menu_at(int16_t x, int16_t y)
 {
-    dsk_menu_t *m = &s_menus[3];
+    dsk_menu_t *m = &s_menus[4];
     m->title = "";
     m->n = 0;
 
@@ -869,7 +912,7 @@ static void context_menu_at(int16_t x, int16_t y)
      * other trace. */
     ag_printf("desktop: context menu at %d,%d, %u items, on %s\n", (int)x,
               (int)y, (unsigned)m->n, in_folder ? "a file" : "the desk");
-    dsk_menu_popup(3, x, y);
+    dsk_menu_popup(4, x, y);
 }
 
 uint32_t press_due_in(uint32_t now)
@@ -1339,16 +1382,40 @@ static void rebuild_menus(void)
         s_menus[1].items[s_menus[1].n - 1].checked = (w == active);
     }
 
-    s_menus[2].title = "Help";
+    s_menus[2].title = "Options";
     s_menus[2].n = 0;
-    set_item(&s_menus[2], "About...", ID_ABOUT, true);
+    set_item(&s_menus[2], "Large font (8x16)", ID_FONT_LARGE, true);
+    set_item(&s_menus[2], "Small font (8x8)", ID_FONT_SMALL, true);
+    s_menus[2].items[0].checked = !s_ini.small_font;
+    s_menus[2].items[1].checked = s_ini.small_font;
+    set_separator(&s_menus[2]);
+    set_item(&s_menus[2], "Teal desk", ID_BG_TEAL, true);
+    set_item(&s_menus[2], "Navy desk", ID_BG_NAVY, true);
+    set_item(&s_menus[2], "Green desk", ID_BG_GREEN, true);
+    set_item(&s_menus[2], "Black desk", ID_BG_BLACK, true);
+    s_menus[2].items[3].checked = (s_ini.background == DSK_TEAL);
+    s_menus[2].items[4].checked = (s_ini.background == DSK_NAVY);
+    s_menus[2].items[5].checked = (s_ini.background == DSK_GREEN);
+    s_menus[2].items[6].checked = (s_ini.background == DSK_BLACK);
+    set_separator(&s_menus[2]);
+    set_item(&s_menus[2], "Slow double click", ID_DBL_SLOW, true);
+    set_item(&s_menus[2], "Normal double click", ID_DBL_NORMAL, true);
+    set_item(&s_menus[2], "Fast double click", ID_DBL_FAST, true);
+    s_menus[2].items[8].checked = (s_ini.dblclick_ms >= 600u);
+    s_menus[2].items[9].checked = (s_ini.dblclick_ms > 300u &&
+                                   s_ini.dblclick_ms < 600u);
+    s_menus[2].items[10].checked = (s_ini.dblclick_ms <= 300u);
+
+    s_menus[3].title = "Help";
+    s_menus[3].n = 0;
+    set_item(&s_menus[3], "About...", ID_ABOUT, true);
 
     /*
-     * The fourth is the context menu: filled when somebody asks for it and
+     * The fifth is the context menu: filled when somebody asks for it and
      * never drawn on the bar (dsk_menu_t::hidden).
      */
-    s_menus[3].hidden = true;
-    dsk_menu_set(s_menus, 4);
+    s_menus[4].hidden = true;
+    dsk_menu_set(s_menus, 5);
 }
 
 static void about_done(dsk_answer_t a, void *ctx)
@@ -1454,6 +1521,39 @@ static void menu_chose(uint16_t id)
             ag_printf("desktop: console window opened\n");
         }
         break;
+    case ID_FONT_LARGE:
+    case ID_FONT_SMALL: {
+        const bool small = (id == ID_FONT_SMALL);
+        if (small != s_ini.small_font) {
+            s_ini.small_font = small;
+            apply_font();
+        }
+        break;
+    }
+    case ID_BG_TEAL:
+    case ID_BG_NAVY:
+    case ID_BG_GREEN:
+    case ID_BG_BLACK: {
+        const uint32_t bg = (id == ID_BG_TEAL)    ? DSK_TEAL
+                            : (id == ID_BG_NAVY)  ? DSK_NAVY
+                            : (id == ID_BG_GREEN) ? DSK_GREEN
+                                                  : DSK_BLACK;
+        if (bg != s_ini.background) {
+            s_ini.background = bg;
+            repaint_all();
+            save_arrangement();
+        }
+        break;
+    }
+    case ID_DBL_SLOW:
+    case ID_DBL_NORMAL:
+    case ID_DBL_FAST: {
+        s_ini.dblclick_ms = (id == ID_DBL_SLOW)     ? 700u
+                            : (id == ID_DBL_NORMAL) ? 400u
+                                                    : 250u;
+        save_arrangement();
+        break;
+    }
     case ID_ABOUT: {
         /*
          * The version of the SYSTEM, not of this shell: a shell that reports

@@ -426,8 +426,28 @@ try {
                     (1..8 | ForEach-Object { 'key down' }) +
                     @('wait 300', 'key enter', 'wait 800')
 
+    # Options > Small font, then Options > Large font.  Two rights from File
+    # (File, Window, Options), first item and second.  The shell says which
+    # font it went to, so this is checked by what it did and not by the fact
+    # that a key was pressed.
+    #
+    # Both ways round on purpose: leaving the run in the small font would
+    # change every rectangle in the two photographs and every later count of
+    # rows in a window, and a test that quietly rewrites its own expectations
+    # is worth nothing.
+    # Two downs for the second item and one for the first: opening a menu
+    # highlights nothing, so the first down lands on the first item.  One
+    # down here picked "Large font", which was already the font - the shell
+    # correctly did nothing, and the step proved nothing.
+    $optFont = @('key f10', 'wait 400', 'key right', 'wait 200', 'key right',
+                 'wait 300', 'key down', 'key down', 'wait 300', 'key enter',
+                 'wait 1200',
+                 'key f10', 'wait 400', 'key right', 'wait 200', 'key right',
+                 'wait 300', 'key down', 'wait 300', 'key enter', 'wait 1200')
+
     $keyboard = $runHello + $runGfx + $opsMkdir + $opsCopy + $opsDelete +
-                $opsRename + $openConsole + $backToFolder + $opsProps
+                $opsRename + $openConsole + $backToFolder + $optFont +
+                $opsProps
     $quoted = ($moves | ForEach-Object { '"' + $_ + '"' }) -join ' '
     $after = @('"key f5"', ('"wait ' + $settle + '"')) -join ' '
     # The properties box is deliberately still up for both photographs - it is
@@ -732,6 +752,16 @@ try {
         # Both ways of asking for the context menu, counted.  A right button
         # that reached nothing and a long press that was taken for a drag both
         # look like a passing run otherwise.
+        # The font item did what it says: to 8x8 and back to 8x16.  A menu
+        # item that only *opens* is not a setting, and this shell had no way
+        # to change the font from the board at all until it existed.
+        if ($text -notmatch 'desktop: font 8x8') {
+            $fail += 'Options > Small font never took effect'
+        }
+        if ($text -notmatch 'desktop: font 8x16') {
+            $fail += 'Options > Large font never came back'
+        }
+
         $ctx = ([regex]::Matches($text, 'desktop: context menu at')).Count
         Write-Host "desktop: the context menu opened $ctx time(s)"
         if ($ctx -lt 2) {
