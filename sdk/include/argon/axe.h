@@ -188,7 +188,48 @@ typedef struct {
      */
     uint32_t ireloc_offset;
     uint32_t ireloc_count;
+
+    /*
+     * The program's own icon, and why one lives in the file at all.
+     *
+     * A shell picks an icon by extension, so every program on the desk
+     * looks like every other program.  A picture that travels with the
+     * file fixes that without anybody having to keep a list of which
+     * program looks like what - copy the .AXE to another board and its
+     * icon goes with it.
+     *
+     * Nothing in the kernel reads this.  The loader has no use for a
+     * picture, and a shell that wants one opens the file, reads this
+     * header and seeks - which is why this is an offset into the file
+     * rather than a part to be loaded.
+     *
+     * Zero means none, and so does a header too short to hold these two
+     * fields; see ag_axe_icon_t for what is at the other end.
+     */
+    uint32_t icon_offset;
+    uint32_t icon_size;
 } ag_axe_header_t;
+
+/*
+ * What icon_offset points at.
+ *
+ * One byte per pixel, each an index into the sixteen colours a shell draws
+ * its own icons with, and 0xFF for "leave what is behind".  Four bits a
+ * pixel would halve it and would cost either the black that every outline
+ * is drawn in or a second plane for the mask; a hundred and twenty-eight
+ * bytes is not worth either.
+ */
+#define AG_AXE_ICON_MAGIC "AXI1"
+#define AG_AXE_ICON_NONE  0xFFu /* the pixel value that is not a colour */
+
+typedef struct {
+    char    magic[4]; /* "AXI1"                                          */
+    uint8_t w;
+    uint8_t h;
+    uint8_t fmt; /* 0: one byte per pixel, palette index or NONE         */
+    uint8_t pad;
+    /* w * h bytes follow */
+} ag_axe_icon_t;
 
 /*
  * The part of the header every image has and every loader needs.

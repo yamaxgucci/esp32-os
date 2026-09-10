@@ -570,15 +570,19 @@ try {
         # and is echoed, the command never runs, and the screenshot shows it
         # sitting at the prompt untouched.  One run in three, which is not a
         # thing to leave in a test.
-        # The Enter goes after the guest has ECHOED the line, not after a
-        # pause.  Together with the text it was lost about one run in
-        # three; three hundred milliseconds later, about one in ten -
-        # the same bug with a bet on top.  An echo is a fact: the shell
-        # has the line in its editor and the only thing left is to
-        # finish it.
-        "~run c:\desktop.axe $Seconds",
-        "=run c:\desktop.axe $Seconds",
-        '~\x0d',
+        # Text and Enter in ONE write, which is the form qemu-boot's own
+        # header shows and the form every other command here uses (a
+        # plain item is sent as text plus a carriage return, together).
+        #
+        # They were split apart with a note saying that together they
+        # were lost one run in three.  Whatever that was, splitting them
+        # is worse and measurably so: today the line sat echoed at the
+        # prompt with its Enter gone four times, and the two facts added
+        # to catch it - wait for the listing to finish, wait for the
+        # echo - both passed while it happened.  A lone carriage return
+        # in its own write is the thing that goes missing; nothing else
+        # in this file sends one.
+        "~run c:\desktop.axe $Seconds\x0d",
         '=desktop: surface',
         "!& '$pyexe' 'tools\inputplay.py' --wait 20 $quoted",
         # ONE keyboard pass for all of it, and that is not tidiness.
@@ -611,9 +615,7 @@ try {
         # A photograph would show the window too, and would not distinguish a
         # restored window from one this script had opened; the counters do.
         'type c:\desktop.ini',
-        '~run c:\desktop.axe 12',
-        '=run c:\desktop.axe 12',
-        '~\x0d',
+        '~run c:\desktop.axe 12\x0d',
         '=desktop: surface',
         # The surface line is printed before the first paint has reached the
         # panel, so a photograph taken the moment it appears catches the

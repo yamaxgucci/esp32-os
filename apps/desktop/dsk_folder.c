@@ -5,6 +5,8 @@
  */
 #include "dsk_folder.h"
 
+#include <argon/axe.h>
+
 #include <argon/argon.h>
 #include <argon/libc.h>
 
@@ -23,6 +25,12 @@ typedef struct {
     bool       is_dir;
     dsk_icon_t icon;
     /*
+     * Which of this window's own icons is this entry's, or -1 for the one
+     * its extension implies.  A program that carries a picture is drawn
+     * with it (ag_axe_icon_t); the rest share the table.
+     */
+    int8_t     art;
+    /*
      * Picked out for an operation, as against the cursor, which is only
      * where the keyboard is.  One byte an entry, and it lives on the entry
      * so that re-reading the directory forgets it - which is right: after a
@@ -30,6 +38,19 @@ typedef struct {
      */
     bool       marked;
 } entry_t;
+
+/*
+ * How many programs in one directory may show their own face.
+ *
+ * Every one of them costs an open, a read of the header and a read of the
+ * picture, at the moment the directory is listed - and 260 bytes to keep
+ * it in.  Eight is what fits on a screen at once, which is the only place
+ * an icon can be looked at; the ninth program falls back to the table and
+ * nobody can tell until they scroll, by which time the read would have
+ * been paid for anyway.
+ */
+#define ART_MAX 8
+#define ART_PX  (DSK_ICON_W * DSK_ICON_H)
 
 typedef struct {
     char     path[AG_PATH_MAX];
@@ -42,6 +63,8 @@ typedef struct {
     int      top;      /* the first row on screen */
     bool     truncated;
     bool     used;
+    uint8_t  art[ART_MAX][ART_PX];
+    int      narts;
 } folder_t;
 
 #define FOLDER_MAX 8
@@ -95,6 +118,60 @@ static bool grow(folder_t *f)
     f->entries = bigger;
     f->cap = want;
     return true;
+}
+
+/*
+ * The picture a program carries, if it carries one.
+ *
+ * Read straight out of the file with the loader nowhere in sight: the
+ * header says where it is, and a shell has no business loading a program
+ * in order to find out what it looks like.  Anything unexpected - an older
+ * header with no room for the fields, a size that is not one icon, a file
+ * that will not open - means "no picture", which is not an error: it is
+ * every program built before today.
+ */
+static bool read_icon(const char *path, uint8_t *out)
+{
+    const ag_handle_t h = ag_open(path, AG_O_RDONLY);
+    if (h < 0) {
+        return false;
+    }
+
+    bool             ok = false;
+    ag_axe_header_t  hdr;
+    ag_axe_icon_t    pic;
+
+    if (ag_read(h, &hdr, sizeof(hdr)) == (int32_t)sizeof(hdr) &&
+        hdr.magic[0] == 'A' && hdr.magic[1] == 'X' && hdr.magic[2] == 'E' &&
+        hdr.header_size >= (uint16_t)(offsetof(ag_axe_header_t, icon_size) +
+                                      sizeof(uint32_t)) &&
+        hdr.icon_offset != 0 && hdr.icon_size == sizeof(pic) + ART_PX &&
+        ag_seek(h, (int64_t)hdr.icon_offset, AG_SEEK_SET) >= 0 &&
+        ag_read(h, &pic, sizeof(pic)) == (int32_t)sizeof(pic) &&
+        pic.magic[0] == 'A' && pic.magic[1] == 'X' && pic.magic[2] == 'I' &&
+        pic.w == DSK_ICON_W && pic.h == DSK_ICON_H && pic.fmt == 0) {
+        ok = ag_read(h, out, ART_PX) == (int32_t)ART_PX;
+    }
+
+    (void)ag_close(h);
+    return ok;
+}
+
+/* dir + name, spelled the way this file spells it further down. */
+static void join(const char *dir, const char *name, char *out, size_t len);
+
+/* Does this name end in .AXE or .SYS?  Only those carry one. */
+static bool is_program(const char *name)
+{
+    int n = 0;
+    while (name[n] != '\0') {
+        n++;
+    }
+    if (n < 4 || name[n - 4] != '.') {
+        return false;
+    }
+    return ag_stricmp(&name[n - 3], "AXE") == 0 ||
+           ag_stricmp(&name[n - 3], "SYS") == 0;
 }
 
 static void sort_entries(entry_t *e, int n)
@@ -165,6 +242,7 @@ static void read_dir(folder_t *f)
     }
     f->total = 0;
     f->marked = 0;
+    f->narts = 0;
 
     if (!is_root(f->path)) {
         /* The way up is the shell's row, not the directory's: it is in `n`
@@ -176,6 +254,7 @@ static void read_dir(folder_t *f)
         e->is_dir = true;
         e->icon = DSK_ICON_UP;
         e->marked = false;
+        e->art = -1;
     }
 
     const ag_handle_t d = ag_opendir(f->path);
@@ -201,6 +280,15 @@ static void read_dir(folder_t *f)
             e->size = de.st.size;
             e->is_dir = ((de.st.attr & AG_A_DIR) != 0);
             e->icon = e->is_dir ? DSK_ICON_FOLDER : dsk_icon_for(e->name);
+            e->art = -1;
+            if (!e->is_dir && f->narts < ART_MAX && is_program(e->name)) {
+                char whole[AG_PATH_MAX];
+                join(f->path, e->name, whole, sizeof(whole));
+                if (read_icon(whole, f->art[f->narts])) {
+                    e->art = (int8_t)f->narts;
+                    f->narts++;
+                }
+            }
             /*
              * Every field of a new entry is written here, and this one was
              * not: the array comes from ag_malloc and holds whatever was in
@@ -438,7 +526,11 @@ static void draw_folder(dsk_win_t *w, dsk_rect_t client)
              * fill, so a marked row under the cursor is still both. */
             dsk_frame(r, DSK_BLACK);
         }
-        dsk_icon_draw(e->icon, r.x, r.y, 1, bg);
+        if (e->art >= 0) {
+            dsk_icon_draw_px(f->art[e->art], r.x, r.y, 1, bg);
+        } else {
+            dsk_icon_draw(e->icon, r.x, r.y, 1, bg);
+        }
         /* The size column is only worth its room when there is room. */
         const int16_t size_w = (r.w > 200) ? 72 : 0;
         dsk_text_fit((int16_t)(r.x + DSK_ICON_W + 2), r.y,

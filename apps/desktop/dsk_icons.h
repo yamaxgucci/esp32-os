@@ -59,6 +59,17 @@ dsk_icon_t dsk_icon_for(const char *name);
  * picture that are not there - so the caller has to know what is behind it,
  * which on a desktop or in a list it always does.
  */
+/*
+ * An icon that came out of a file rather than out of this table.
+ *
+ * `px` is DSK_ICON_W * DSK_ICON_H bytes, one per pixel: a palette index, or
+ * 0xFF for "leave what is behind" (ag_axe_icon_t in argon/axe.h).  Drawn
+ * exactly like a built-in one, because from here it IS one - which is the
+ * point of a program carrying its own picture.
+ */
+void dsk_icon_draw_px(const uint8_t *px, int16_t x, int16_t y, int scale,
+                      uint32_t bg);
+
 void dsk_icon_draw(dsk_icon_t id, int16_t x, int16_t y, int scale,
                    uint32_t bg);
 

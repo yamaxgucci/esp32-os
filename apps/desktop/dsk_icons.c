@@ -144,11 +144,15 @@ static uint16_t to565(uint32_t rgb)
 /* Doubled is the largest anybody asks for: 32x32. */
 static uint16_t s_scratch[32 * 32];
 
-void dsk_icon_draw(dsk_icon_t id, int16_t x, int16_t y, int scale, uint32_t bg)
+/*
+ * The two draws share everything except where a pixel's colour comes from,
+ * so they share the code and differ in one callback-shaped `if`.  Keeping
+ * them apart would be two scratch buffers and two chances to fix a bug in
+ * one of them.
+ */
+static void draw_pixels(const char *const *art, const uint8_t *px, int16_t x,
+                        int16_t y, int scale, uint32_t bg)
 {
-    if (id >= DSK_ICON_COUNT) {
-        id = DSK_ICON_FILE;
-    }
     if (scale < 1) {
         scale = 1;
     }
@@ -162,33 +166,47 @@ void dsk_icon_draw(dsk_icon_t id, int16_t x, int16_t y, int scale, uint32_t bg)
     const dsk_rect_t box = dsk_rect(x, y, (int16_t)w, (int16_t)h);
 
     if (keep) {
-        /*
-         * What is behind the icon, so that its transparent pixels stay
-         * behind it.  Every icon here is a shape on a background it does
-         * not own - the desk's pattern, or the white of a list - and
-         * composing against a flat colour was a rectangle of that colour
-         * around every icon.
-         */
         dsk_paint()->read(box, s_scratch);
     }
 
     for (int row = 0; row < DSK_ICON_H; row++) {
-        const char *art = k_art[id][row];
         for (int col = 0; col < DSK_ICON_W; col++) {
-            const int n = nibble(art[col]);
+            int n;
+            if (art != NULL) {
+                n = nibble(art[row][col]);
+            } else {
+                const uint8_t v = px[row * DSK_ICON_W + col];
+                n = (v == 0xFFu) ? -1 : (int)(v & 15u);
+            }
             if (n < 0 && keep) {
                 continue; /* leave what was read there */
             }
-            const uint16_t px = (n < 0) ? back : to565(k_pal[n]);
+            const uint16_t c = (n < 0) ? back : to565(k_pal[n]);
             for (int sy = 0; sy < scale; sy++) {
                 uint16_t *out = &s_scratch[(row * scale + sy) * w + col * scale];
                 for (int sx = 0; sx < scale; sx++) {
-                    out[sx] = px;
+                    out[sx] = c;
                 }
             }
         }
     }
     dsk_paint()->blit(box, s_scratch, (uint32_t)w);
+}
+
+void dsk_icon_draw_px(const uint8_t *px, int16_t x, int16_t y, int scale,
+                      uint32_t bg)
+{
+    if (px != NULL) {
+        draw_pixels(NULL, px, x, y, scale, bg);
+    }
+}
+
+void dsk_icon_draw(dsk_icon_t id, int16_t x, int16_t y, int scale, uint32_t bg)
+{
+    if (id >= DSK_ICON_COUNT) {
+        id = DSK_ICON_FILE;
+    }
+    draw_pixels(k_art[id], NULL, x, y, scale, bg);
 }
 
 /* ---- which icon a name deserves ---------------------------------------- */

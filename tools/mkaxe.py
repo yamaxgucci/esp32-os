@@ -57,7 +57,54 @@ HEADER_FORMAT_V1 = "<4sHHHHI IIII IIII II II II 32s16s32s6I"
 # only one architecture needs is not a reason to change every file, and an
 # older loader must keep reading what it always read.
 HEADER_FORMAT = HEADER_FORMAT_V1 + " II"
+# Two more for an image that carries its own icon.  Same rule again: a file
+# without one is written in the shorter layout, and a loader that has never
+# heard of icons reads it exactly as before.
+HEADER_FORMAT_ICON = HEADER_FORMAT + " II"
+
+ICON_W = 16
+ICON_H = 16
+ICON_MAGIC = b"AXI1"
+ICON_NONE = 0xFF
 ARCHS = {"xtensa": 1, "riscv32": 2}
+
+
+def read_icon(path):
+    """A program's icon, written the way the shell's own icons are written.
+
+    Sixteen lines of sixteen characters: '.' is nothing (the desk shows
+    through), and 0-9A-F index the sixteen colours the shell draws with.
+    Text, so it can be edited with the editor that is already on the board
+    and reviewed in a diff like everything else here - a PNG would need a
+    decoder in a tool that has none and would hide its own mistakes.
+    """
+    rows = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.split("#", 1)[0].rstrip("\n").rstrip()
+            if line == "":
+                continue
+            rows.append(line)
+
+    if len(rows) != ICON_H:
+        raise SystemExit("mkaxe: %s has %d rows; an icon has %d"
+                         % (path, len(rows), ICON_H))
+
+    px = bytearray()
+    for y, row in enumerate(rows):
+        if len(row) != ICON_W:
+            raise SystemExit("mkaxe: %s row %d is %d wide; an icon is %d"
+                             % (path, y + 1, len(row), ICON_W))
+        for c in row:
+            if c == ".":
+                px.append(ICON_NONE)
+            elif c in "0123456789ABCDEFabcdef":
+                px.append(int(c, 16))
+            else:
+                raise SystemExit("mkaxe: %s row %d: %r is not a colour or '.'"
+                                 % (path, y + 1, c))
+
+    return (ICON_MAGIC + bytes([ICON_W, ICON_H, 0, 0]) + bytes(px))
 
 # Must match enum ag_axe_flags in sdk/include/argon/abi.h.
 AG_AXE_DRIVER = 1 << 3
@@ -490,6 +537,12 @@ def main():
                          "malloc past the app's own")
     ap.add_argument("--ldflags", default="",
                     help="extra linker flags (e.g. -Wl,--gc-sections)")
+    ap.add_argument("--icon",
+                    help="the program's own icon: sixteen lines of "
+                         "sixteen, '.' for nothing and 0-F for one of "
+                         "the shell's colours.  It travels in the file, "
+                         "so a program looks like itself wherever it is "
+                         "copied")
     ap.add_argument("--keep-elf", help="also write the intermediate ELF here")
     ap.add_argument(
         "--no-stage",
@@ -728,14 +781,30 @@ def main():
                     "mkaxe: the image defines neither ag_main nor "
                     "ag_driver_init")
 
-        fmt = HEADER_FORMAT if irelocs else HEADER_FORMAT_V1
+        icon = read_icon(args.icon) if args.icon else b""
+
+        if icon:
+            fmt = HEADER_FORMAT_ICON
+        elif irelocs:
+            fmt = HEADER_FORMAT
+        else:
+            fmt = HEADER_FORMAT_V1
         header_size = struct.calcsize(fmt)
         code_offset = header_size
         data_offset = code_offset + len(code["stored"])
         reloc_offset = data_offset + len(data["stored"])
         ireloc_offset = reloc_offset + len(relocs) * 4
 
-        tail = (ireloc_offset, len(irelocs)) if irelocs else ()
+        # The icon goes last, after everything the loader reads: nothing
+        # seeks past it, and a shell that wants it knows where it is.
+        icon_offset = ireloc_offset + len(irelocs) * 8
+
+        if icon:
+            tail = (ireloc_offset, len(irelocs), icon_offset, len(icon))
+        elif irelocs:
+            tail = (ireloc_offset, len(irelocs))
+        else:
+            tail = ()
         header = struct.pack(
             fmt, MAGIC,
             meta.get("abi_major", 0), meta.get("abi_minor", 1),
@@ -759,6 +828,8 @@ def main():
                 f.write(struct.pack("<I", r))
             for site, target in irelocs:
                 f.write(struct.pack("<II", site, target))
+            if icon:
+                f.write(icon)
 
         if args.keep_elf:
             shutil.copyfile(elf_path, args.keep_elf)

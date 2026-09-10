@@ -189,6 +189,7 @@
     },
     {
       "out": "FM.AXE", "group": "core",
+      "icon": "apps/fm/fm.icon",
       "include": ["apps/fm"],
       "src": ["apps/fm/fm.c", "apps/fm/fmops.c", "apps/fm/fm_ui_text.c",
               "apps/common/fsops/fsops.c", "apps/common/fsops/fsops_argon.c"]
