@@ -264,11 +264,29 @@ static bool begin(fsops_req_t *req, run_t *r, const char *verb)
     memset(r, 0, sizeof(*r));
     r->verb = verb;
 
-    req->chunk = (char *)ag_malloc(OPS_CHUNK);
+    /*
+     * Eight kilobytes if they are there, and half of that as often as it
+     * takes if they are not.
+     *
+     * The size decides how many system calls a copy costs and nothing else,
+     * so a small buffer is a slow copy and no buffer is no copy at all.
+     * Maxim's paste failed for want of eight kilobytes on a board with
+     * plenty free but none of it in one piece; half a kilobyte would have
+     * done the job while he was looking at it.
+     */
+    uint32_t len = OPS_CHUNK;
+    req->chunk = NULL;
+    while (len >= 512u) {
+        req->chunk = (char *)ag_malloc(len);
+        if (req->chunk != NULL) {
+            break;
+        }
+        len /= 2u;
+    }
     if (req->chunk == NULL) {
         return false;
     }
-    req->chunk_len = OPS_CHUNK;
+    req->chunk_len = len;
     req->fs = fsops_argon_fs();
     req->tick = tick;
     req->tick_ctx = r;

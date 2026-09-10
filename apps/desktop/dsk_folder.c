@@ -66,6 +66,37 @@ static int cmp_entry(const entry_t *a, const entry_t *b)
     return ag_stricmp(a->name, b->name);
 }
 
+/*
+ * Twice the room, or false and the listing says it was cut short.
+ *
+ * Both blocks exist at once for the length of the copy, which is the cost
+ * of not having realloc: doubling from 256 to 512 wants sixty kilobytes for
+ * a moment to end up with forty.  That is why it doubles rather than adding
+ * a fixed slice - the number of moments like that is the logarithm of the
+ * directory, not its size.
+ */
+static bool grow(folder_t *f)
+{
+    if (f->cap >= ENTRY_MAX) {
+        return false;
+    }
+    int want = f->cap * 2;
+    if (want > ENTRY_MAX) {
+        want = ENTRY_MAX;
+    }
+    entry_t *bigger = (entry_t *)ag_malloc(sizeof(entry_t) * (size_t)want);
+    if (bigger == NULL) {
+        return false;
+    }
+    for (int i = 0; i < f->n; i++) {
+        bigger[i] = f->entries[i];
+    }
+    ag_free(f->entries);
+    f->entries = bigger;
+    f->cap = want;
+    return true;
+}
+
 static void sort_entries(entry_t *e, int n)
 {
     /* Insertion sort: a directory is a few hundred entries and this is not
@@ -110,27 +141,27 @@ static void read_dir(folder_t *f)
     f->top = 0;
     f->truncated = false;
     /*
-     * As many entries as this machine will give, not as many as would be nice.
+     * As much as this directory needs, and no more.
      *
-     * Five hundred and twelve of them is forty kilobytes in one block, and on
-     * the CYD - 320x240 in bands, so the shell's own data is already forty -
-     * that block does not exist.  What the user saw was a window that would
-     * not open at all and a shell that could show neither C: nor T:, which is
-     * not a shell.  A hundred files listed beats none, so the ask comes down
-     * until it is answered, and the window says what it could not fit.
+     * This asked for five hundred and twelve entries - forty kilobytes in
+     * one block - and came down by halves until the machine agreed.  It
+     * fixed the window that would not open and left a worse thing behind:
+     * a directory of eight files held forty kilobytes of nothing, out of a
+     * hundred and eleven the whole shell has.  Paste then could not find
+     * eight kilobytes for a copy buffer, on a board with plenty free.
+     *
+     * So it starts small and grows: thirty-two entries, doubling as the
+     * directory turns out to be bigger, up to the ceiling.  A directory of
+     * eight costs two and a half kilobytes, a directory of five hundred
+     * costs what it did before, and neither is decided in advance.
      */
     if (f->entries == NULL) {
-        for (int want = ENTRY_MAX; want >= 32; want /= 2) {
-            f->entries = (entry_t *)ag_malloc(sizeof(entry_t) * (size_t)want);
-            if (f->entries != NULL) {
-                f->cap = want;
-                break;
-            }
-        }
+        f->entries = (entry_t *)ag_malloc(sizeof(entry_t) * 32u);
         if (f->entries == NULL) {
             dsk_cursor_shape(DSK_CUR_ARROW);
             return;
         }
+        f->cap = 32;
     }
     f->total = 0;
     f->marked = 0;
@@ -144,6 +175,7 @@ static void read_dir(folder_t *f)
         e->size = 0;
         e->is_dir = true;
         e->icon = DSK_ICON_UP;
+        e->marked = false;
     }
 
     const ag_handle_t d = ag_opendir(f->path);
@@ -160,7 +192,7 @@ static void read_dir(folder_t *f)
              * that lies, and the count is what the window is believed on.
              */
             f->total++;
-            if (f->n >= f->cap) {
+            if (f->n >= f->cap && !grow(f)) {
                 f->truncated = true;
                 continue;
             }
@@ -169,6 +201,15 @@ static void read_dir(folder_t *f)
             e->size = de.st.size;
             e->is_dir = ((de.st.attr & AG_A_DIR) != 0);
             e->icon = e->is_dir ? DSK_ICON_FOLDER : dsk_icon_for(e->name);
+            /*
+             * Every field of a new entry is written here, and this one was
+             * not: the array comes from ag_malloc and holds whatever was in
+             * that memory, so a directory opened with rubbish in the mark
+             * byte showed every row picked out while the count said none
+             * were.  A field added to a structure that is filled by hand is
+             * a field that has to be filled by hand.
+             */
+            e->marked = false;
         }
         (void)ag_closedir(d);
     }
