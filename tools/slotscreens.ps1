@@ -14,6 +14,17 @@
 #
 # Alt+digit arrives at a serial terminal as ESC followed by the digit, which
 # is why the switches below are raw bytes rather than keystrokes.
+#
+# What this deliberately does NOT do is leave a chatty program running in the
+# other slot, which is the obvious next question - whose screen does its
+# output land on?  Two reasons, and both are worth knowing before trying it
+# again.  A background program is not bound to a session slot at all (`run
+# /b` spawns with AG_SPAWN_NO_SESSION), so nothing in the system can say
+# which screen is its own; and its output goes to the journal, which reaches
+# the serial port WITHOUT passing through any screen - so vtdump, which
+# rebuilds a screen by replaying that port, ends up showing a screenful of
+# journal lines and the test fails for a reason that has nothing to do with
+# slots.
 param(
     [switch]$NoBuild,
     [int]$TimeoutSec = 90
