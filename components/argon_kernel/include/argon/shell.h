@@ -22,6 +22,16 @@ extern "C" {
 /* Runs the read-eval-print loop on the console.  Does not return. */
 void ag_shell_run(void);
 
+/*
+ * Start a second shell, bound to a session slot.
+ *
+ * It has its own working directory, its own line being edited and its own
+ * screen, and it lives until the machine does.  There is one keyboard, so
+ * only the prompt whose slot is in front reads it; the others sit still
+ * with everything they had.
+ */
+ag_err_t ag_shell_start_in_slot(int slot);
+
 /* Executes one command line, as if it had been typed.  Returns the exit code. */
 int ag_shell_execute(const char *line);
 

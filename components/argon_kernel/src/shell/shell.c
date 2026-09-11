@@ -770,6 +770,36 @@ static int date_set(int argc, char **argv)
     return 0;
 }
 
+/*
+ * `prompt 2` - another shell, in the slot named, with its own directory.
+ *
+ * Not a new kind of thing: the slots have always been described as "a
+ * shell per slot, plus an application", and until now the one shell moved
+ * between them as the focus did.  This gives a slot a prompt that stays
+ * there - which is what a window on the desktop will show.
+ */
+static int cmd_prompt(int argc, char **argv)
+{
+    if (argc < 2) {
+        ag_console_puts("prompt <slot>   (2..4)\n");
+        return 1;
+    }
+    const int slot = atoi(argv[1]) - 1;
+    const ag_err_t err = ag_shell_start_in_slot(slot);
+    if (err == -AG_EEXIST) {
+        ag_console_printf("slot %s already has its own prompt\n", argv[1]);
+        return 1;
+    }
+    if (err != AG_OK) {
+        ag_console_printf("prompt: %s\n",
+                          ag_loader_api()->sys->strerror(err));
+        return 1;
+    }
+    ag_console_printf("slot %s has its own prompt now; Alt+%s to see it\n",
+                      argv[1], argv[1]);
+    return 0;
+}
+
 static int cmd_date(int argc, char **argv)
 {
     if (argc >= 2 && ag_path_icmp(argv[1], "set") == 0) {
@@ -4780,6 +4810,7 @@ static const ag_command_t k_commands[] = {
 #endif
     {"uptime", "", "time since reset", cmd_uptime},
     {"date", "[set D T | sync [srv]]", "show the clock, or set it", cmd_date},
+    {"prompt", "<slot>", "give a slot a shell of its own", cmd_prompt},
     {"cls", "", "clear the screen", cmd_cls},
     {"echo", "<text>", "print text", cmd_echo},
     {"color", "<fg> <bg>", "set text colours", cmd_color},
@@ -5208,6 +5239,102 @@ static void show_prompt(void)
     ag_console_unlock();
 }
 
+/* One prompt, for ever; defined at the bottom, beside the boot entry. */
+static void prompt_loop(void);
+
+/* The prompts that belong to one slot each; see ag_shell_start_in_slot. */
+static shell_ctx_t *s_ctx[AG_SESSION_SLOTS];
+
+/*
+ * Is the slot this prompt serves the one in front?
+ *
+ * Always true for the original prompt, which serves whichever slot is
+ * focused - that is what the system shell has always done.
+ */
+static bool my_slot_is_focused(void)
+{
+    const shell_ctx_t *c = sh();
+    const int          f = ag_session_focused();
+
+    if (c->slot != AG_SESSION_FOLLOW) {
+        return c->slot == f;
+    }
+
+    /*
+     * The original prompt follows the focus - and stands aside for a slot
+     * that has a prompt of its own.
+     *
+     * There is one keyboard and one queue, so two prompts that both
+     * believe they are in front do not take turns: they take a character
+     * each.  `cd c:\\drv` typed at a slot with its own prompt arrived
+     * there as `c c:\\drv`, the 'd' having gone to the other one.
+     */
+    return !(f >= 0 && f < AG_SESSION_SLOTS && s_ctx[f] != NULL);
+}
+
+/*
+ * The extra prompts, allocated when one is asked for.
+ *
+ * Statically these were 2560 bytes of DRAM this image does not have - a
+ * working directory, a line editor and a prompt string each, times every
+ * slot, for a feature most boots never use.  A second prompt is optional
+ * and now costs nothing until somebody asks for one.
+ */
+static void shell_instance(void *arg)
+{
+    const int    slot = (int)(intptr_t)arg;
+    shell_ctx_t *c = s_ctx[slot];
+
+    /* Register before anything prints: sh() has to find this task. */
+    for (unsigned i = 0; i < sizeof(s_ctxs) / sizeof(s_ctxs[0]); i++) {
+        if (s_ctxs[i].ctx == NULL) {
+            s_ctxs[i].task = ag_port_task_self();
+            s_ctxs[i].ctx = c;
+            break;
+        }
+    }
+
+    (void)ag_console_bind_task(slot);
+    ag_lineedit_init(&c->line);
+    prompt_loop();
+}
+
+ag_err_t ag_shell_start_in_slot(int slot)
+{
+    if (slot < 0 || slot >= AG_SESSION_SLOTS) {
+        return -AG_EINVAL;
+    }
+    if (s_ctx[slot] != NULL) {
+        return -AG_EEXIST; /* this slot already has a prompt of its own */
+    }
+
+    shell_ctx_t *c =
+        (shell_ctx_t *)ag_port_alloc(sizeof(*c), AG_MEM_BYTE);
+    if (c == NULL) {
+        return -AG_ENOMEM;
+    }
+    memset(c, 0, sizeof(*c));
+    strcpy(c->cwd, "/");
+    c->slot = slot;
+    s_ctx[slot] = c;
+
+    /*
+     * Its own stack, and not a small one: the commands this prompt can run
+     * are the same ones the first can, and `cp`, `zip` and `wifi` all hold
+     * kilobytes of locals.  The figure is the one the system shell's own
+     * task was given.
+     */
+    ag_port_task_t t;
+    if (!ag_port_task_create(shell_instance, "shell2", 8192,
+                             (void *)(intptr_t)slot, 5, 0, 0, &t)) {
+        ag_port_free(c);
+        s_ctx[slot] = NULL;
+        return -AG_ENOMEM;
+    }
+    ag_log(AG_LOG_INFO, "shell", "a second prompt in slot %d", slot + 1);
+    return AG_OK;
+}
+
 void ag_shell_run(void)
 {
     ag_lineedit_init(&s_line);
@@ -5238,9 +5365,29 @@ void ag_shell_run(void)
         "Alt+1..4 / Alt+Tab = user slots; Ctrl+\\ = system shell "
         "(again = kill last app).\n");
 
+    prompt_loop();
+}
+
+/*
+ * One prompt, for as long as the machine runs.
+ *
+ * Split out of ag_shell_run because that function is the BOOT entry: it
+ * replays AUTOEXEC, prints the banner and clears the recovery streak, and
+ * a second prompt calling it did all three again - which read on the
+ * transcript as the machine having restarted.
+ */
+static void prompt_loop(void)
+{
     for (;;) {
-        /* App in the focused slot owns the keyboard; shell waits. */
-        while (!ag_session_shell_owns_keyboard()) {
+        /*
+         * App in the focused slot owns the keyboard; shell waits.
+         *
+         * A prompt bound to a slot waits for ITS slot to be the focused
+         * one as well.  There is one keyboard: two prompts may both be
+         * alive, with their own directories and their own screens, and
+         * only the one in front reads it.
+         */
+        while (!ag_session_shell_owns_keyboard() || !my_slot_is_focused()) {
             ag_port_task_delay(ag_port_ms_to_ticks(50));
         }
 
@@ -5253,7 +5400,7 @@ void ag_shell_run(void)
 
         bool done = false;
         while (!done) {
-            if (!ag_session_shell_owns_keyboard()) {
+            if (!ag_session_shell_owns_keyboard() || !my_slot_is_focused()) {
                 ag_console_lock();
                 ag_console_set_live(NULL, NULL);
                 ag_console_unlock();
