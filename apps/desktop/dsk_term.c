@@ -5,6 +5,8 @@
  */
 #include "dsk_term.h"
 
+#include <argon/libc.h>
+
 #include <argon/argon.h>
 
 #include "dsk_paint.h"
@@ -28,14 +30,48 @@
 /* Ten times a second: faster than anyone reads, slower than anything costs. */
 #define TERM_POLL_MS 100u
 
+/*
+ * One of these per open window, because there is more than one kind.
+ *
+ * The system console is a VIEW: it shows what the machine said and takes no
+ * keys, because there is one keyboard and this desktop is holding it.  A
+ * prompt is somebody's own shell in a session slot, and every key it is
+ * given is passed straight through to that slot.  They are different
+ * windows and they can be open at once, which is why none of this is a
+ * file-wide static any more: it was, and opening the prompt silently took
+ * over the console's window instead of opening its own.
+ */
+typedef struct {
+    dsk_win_t    *win;
+    int           slot;        /* below zero: the system console, as a view */
+    ag_textcell_t shadow[TERM_ROWS_MAX][TERM_COLS_MAX];
+    uint16_t      shown_rows;  /* rows the window has space for  */
+    uint16_t      shown_cols;
+    uint16_t      first_row;   /* which console row is at the top */
+    uint32_t      polled_at;
+    bool          polled;
+    uint16_t      caret_x;
+    uint16_t      caret_y;
+} term_t;
+
+#define TERM_MAX 2 /* the console view and one prompt; 4.8 KB each */
+
 static const dsk_metrics_t *s_m;
-static dsk_win_t           *s_win;
-static ag_textcell_t        s_shadow[TERM_ROWS_MAX][TERM_COLS_MAX];
-static uint16_t             s_shown_rows;  /* rows the window has space for  */
-static uint16_t             s_shown_cols;
-static uint16_t             s_first_row;   /* which console row is at the top */
-static uint32_t             s_polled_at;
-static bool                 s_polled;
+static term_t               s_terms[TERM_MAX];
+
+/* Keys handed to a prompt, and keys the slot took: pixels otherwise. */
+static uint32_t             s_fwd;
+static uint32_t             s_fwd_ok;
+
+static term_t *term_of(const dsk_win_t *w)
+{
+    for (int i = 0; i < TERM_MAX; i++) {
+        if (s_terms[i].win == w) {
+            return &s_terms[i];
+        }
+    }
+    return NULL;
+}
 
 /*
  * The CGA sixteen, as this shell's palette.
@@ -52,10 +88,10 @@ static const uint32_t k_cga[16] = {
     DSK_RED,   DSK_MAGENTA, DSK_YELLOW, DSK_WHITE,
 };
 
-static dsk_rect_t row_rect(dsk_rect_t client, uint16_t row)
+static dsk_rect_t row_rect(const term_t *t, dsk_rect_t client, uint16_t row)
 {
     return dsk_rect(client.x, (int16_t)(client.y + row * dsk_ui_h()),
-                    (int16_t)(s_shown_cols * dsk_ui_w()), dsk_ui_h());
+                    (int16_t)(t->shown_cols * dsk_ui_w()), dsk_ui_h());
 }
 
 /*
@@ -66,18 +102,18 @@ static dsk_rect_t row_rect(dsk_rect_t client, uint16_t row)
  * call instead of sixty is the difference between a window that repaints in
  * one millisecond and one that does not.
  */
-static void draw_row(dsk_rect_t client, uint16_t row)
+static void draw_row(const term_t *t, dsk_rect_t client, uint16_t row)
 {
-    const ag_textcell_t *cells = s_shadow[row];
+    const ag_textcell_t *cells = t->shadow[row];
     const int16_t        y = (int16_t)(client.y + row * dsk_ui_h());
     uint16_t             at = 0;
 
-    while (at < s_shown_cols) {
+    while (at < t->shown_cols) {
         const uint8_t attr = cells[at].attr;
         uint16_t      end = at;
         char          run[TERM_COLS_MAX + 1];
 
-        while (end < s_shown_cols && cells[end].attr == attr) {
+        while (end < t->shown_cols && cells[end].attr == attr) {
             /*
              * A cell holds a code page byte, and a zero is what an untouched
              * cell holds; the font has a glyph at zero and it is not a space.
@@ -95,11 +131,14 @@ static void draw_row(dsk_rect_t client, uint16_t row)
 
 static void term_draw(dsk_win_t *w, dsk_rect_t client)
 {
-    (void)w;
+    const term_t *t = term_of(w);
+    if (t == NULL) {
+        return;
+    }
 
     /* The margins the cells do not cover, so the window has no stale edges. */
-    const int16_t used_w = (int16_t)(s_shown_cols * dsk_ui_w());
-    const int16_t used_h = (int16_t)(s_shown_rows * dsk_ui_h());
+    const int16_t used_w = (int16_t)(t->shown_cols * dsk_ui_w());
+    const int16_t used_h = (int16_t)(t->shown_rows * dsk_ui_h());
     if (client.w > used_w) {
         dsk_fill(dsk_rect((int16_t)(client.x + used_w), client.y,
                           (int16_t)(client.w - used_w), client.h),
@@ -111,11 +150,11 @@ static void term_draw(dsk_win_t *w, dsk_rect_t client)
                  DSK_BLACK);
     }
 
-    for (uint16_t row = 0; row < s_shown_rows; row++) {
-        if (!dsk_visible(row_rect(client, row))) {
+    for (uint16_t row = 0; row < t->shown_rows; row++) {
+        if (!dsk_visible(row_rect(t, client, row))) {
             continue;
         }
-        draw_row(client, row);
+        draw_row(t, client, row);
     }
 
     /*
@@ -123,14 +162,23 @@ static void term_draw(dsk_win_t *w, dsk_rect_t client)
      * this window is a view of a text screen, and where that screen's cursor
      * is is part of what it says.
      */
+    /*
+     * Only for the view.  ag_coninfo answers about THIS task's console, and
+     * a prompt window is showing another slot's screen: there is no way to
+     * ask where that screen's cursor is, so drawing one here would be
+     * drawing our own cursor on somebody else's text.
+     */
+    if (t->slot >= 0) {
+        return;
+    }
     ag_coninfo_t info;
     ag_coninfo(&info);
-    if (info.cur_y >= s_first_row && info.cur_y < s_first_row + s_shown_rows &&
-        info.cur_x < s_shown_cols) {
+    if (info.cur_y >= t->first_row && info.cur_y < t->first_row + t->shown_rows &&
+        info.cur_x < t->shown_cols) {
         const dsk_rect_t caret =
             dsk_rect((int16_t)(client.x + info.cur_x * dsk_ui_w()),
                      (int16_t)(client.y +
-                               (info.cur_y - s_first_row) * dsk_ui_h() +
+                               (info.cur_y - t->first_row) * dsk_ui_h() +
                                dsk_ui_h() - 2),
                      dsk_ui_w(), 2);
         if (dsk_visible(caret)) {
@@ -141,25 +189,109 @@ static void term_draw(dsk_win_t *w, dsk_rect_t client)
 
 static void term_closed(dsk_win_t *w)
 {
-    if (s_win == w) {
-        s_win = NULL;
+    term_t *t = term_of(w);
+    if (t != NULL) {
+        t->win = NULL;
     }
 }
 
+/* Defined below, next to the window it belongs to. */
+static bool term_key(dsk_win_t *w, uint16_t keycode, uint32_t unicode,
+                     uint16_t mods);
+
 static const dsk_win_ops_t k_term_ops = {
     .draw = term_draw,
-    .key = NULL, /* a view, not a prompt - see dsk_term.h */
+    .key = term_key,
     .pointer = NULL,
     .closed = term_closed,
 };
 
-dsk_win_t *dsk_term_open(const dsk_metrics_t *m)
+/*
+ * Which slot this window shows, or below zero for the system console.
+ *
+ * A console window is a VIEW: it shows what the machine said and takes no
+ * keys.  A prompt window is somebody's prompt - a slot with a shell of
+ * its own - and every key it is given is passed straight through, because
+ * the keyboard belongs to whatever is in front and that is this desktop.
+ */
+static int32_t peek(const term_t *t, uint16_t row, ag_textcell_t *cells,
+                    uint16_t max)
+{
+    if (t->slot < 0) {
+        return ag_con_peek_row(row, cells, max);
+    }
+    return ag_con_peek_row_slot(t->slot, row, cells, max);
+}
+
+static bool term_key(dsk_win_t *w, uint16_t keycode, uint32_t unicode,
+                     uint16_t mods)
+{
+    term_t *t = term_of(w);
+    if (t == NULL || t->slot < 0) {
+        return false; /* a view, not a prompt - see dsk_term.h */
+    }
+
+    /*
+     * F10 stays the desktop's.
+     *
+     * Everything else goes to the prompt, which is the point of the window -
+     * but the menu bar is how a machine with no mouse is driven, and a
+     * window that swallowed F10 would be a window you cannot get out of.
+     * The scripted run found it the blunt way: after this window opened,
+     * two hundred keystrokes went to a shell that had not been asked for
+     * them and the desktop never saw a menu again.
+     */
+    if (keycode == DSK_KEY_F10) {
+        return false;
+    }
+
+    /*
+     * Rebuilt rather than forwarded, because what arrives here has already
+     * been taken apart by the shell above: this is the event the prompt on
+     * the other side would have read if the keyboard had been its own.
+     */
+    ag_event_t ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.type = AG_EV_KEY_DOWN;
+    ev.key.keycode = keycode;
+    ev.key.unicode = unicode;
+    ev.key.mods = mods;
+    s_fwd++;
+    const bool took = ag_post_to_slot(t->slot, &ev);
+    if (took) {
+        s_fwd_ok++;
+    }
+    return took;
+}
+
+dsk_win_t *dsk_term_open_slot(const dsk_metrics_t *m, int slot)
 {
     s_m = m;
-    if (s_win != NULL) {
-        dsk_wm_activate(s_win);
-        return s_win;
+
+    /*
+     * The same slot twice is the same window, brought to the front - asking
+     * for the console view while it is open should not open a second view of
+     * the same text.  A different slot is a different window.
+     */
+    term_t *t = NULL;
+    for (int i = 0; i < TERM_MAX; i++) {
+        if (s_terms[i].win != NULL && s_terms[i].slot == slot) {
+            dsk_wm_activate(s_terms[i].win);
+            return s_terms[i].win;
+        }
     }
+    int index = 0;
+    for (int i = 0; i < TERM_MAX; i++) {
+        if (s_terms[i].win == NULL) {
+            t = &s_terms[i];
+            index = i;
+            break;
+        }
+    }
+    if (t == NULL) {
+        return NULL; /* both windows are already somebody's */
+    }
+    t->slot = slot;
 
     ag_coninfo_t info;
     ag_coninfo(&info);
@@ -187,30 +319,35 @@ dsk_win_t *dsk_term_open(const dsk_metrics_t *m)
     if (max_rows < 4) {
         max_rows = 4;
     }
-    s_shown_cols = (cols < (uint16_t)max_cols) ? cols : (uint16_t)max_cols;
-    s_shown_rows = (rows < (uint16_t)max_rows) ? rows : (uint16_t)max_rows;
+    t->shown_cols = (cols < (uint16_t)max_cols) ? cols : (uint16_t)max_cols;
+    t->shown_rows = (rows < (uint16_t)max_rows) ? rows : (uint16_t)max_rows;
 
+    /* Stepped, so the second one does not land exactly on the first. */
+    const int16_t step = (int16_t)(8 + index * 16);
     const dsk_rect_t frame =
-        dsk_rect((int16_t)(m->work.x + 8), (int16_t)(m->work.y + 8),
-                 (int16_t)(s_shown_cols * dsk_ui_w() + chrome_w),
-                 (int16_t)(s_shown_rows * dsk_ui_h() + chrome_h));
+        dsk_rect((int16_t)(m->work.x + step), (int16_t)(m->work.y + step),
+                 (int16_t)(t->shown_cols * dsk_ui_w() + chrome_w),
+                 (int16_t)(t->shown_rows * dsk_ui_h() + chrome_h));
 
     for (uint16_t r = 0; r < TERM_ROWS_MAX; r++) {
         for (uint16_t c = 0; c < TERM_COLS_MAX; c++) {
-            s_shadow[r][c].ch = ' ';
-            s_shadow[r][c].attr = AG_ATTR(AG_LGRAY, AG_BLACK);
+            t->shadow[r][c].ch = ' ';
+            t->shadow[r][c].attr = AG_ATTR(AG_LGRAY, AG_BLACK);
         }
     }
-    s_polled = false;
-    s_first_row = 0;
+    t->polled = false;
+    t->first_row = 0;
+    t->caret_x = 0xFFFFu;
+    t->caret_y = 0xFFFFu;
 
-    s_win = dsk_wm_open("System console", frame, &k_term_ops, NULL);
-    return s_win;
+    t->win = dsk_wm_open((slot < 0) ? "System console" : "MS-DOS Prompt",
+                         frame, &k_term_ops, NULL);
+    return t->win;
 }
 
-uint32_t dsk_term_due_in(uint32_t now)
+static uint32_t due_in_one(const term_t *t, uint32_t now)
 {
-    if (s_win == NULL) {
+    if (t->win == NULL) {
         /*
          * No deadline, which in this loop is UINT32_MAX and not zero: zero
          * means "already due".  It said zero, so with the console window shut
@@ -220,16 +357,28 @@ uint32_t dsk_term_due_in(uint32_t now)
          */
         return UINT32_MAX;
     }
-    const uint32_t since = now - s_polled_at;
+    const uint32_t since = now - t->polled_at;
     return (since >= TERM_POLL_MS) ? 0u : (TERM_POLL_MS - since);
 }
 
-void dsk_term_tick(void)
+uint32_t dsk_term_due_in(uint32_t now)
 {
-    if (s_win == NULL || s_m == NULL) {
+    uint32_t soonest = UINT32_MAX;
+    for (int i = 0; i < TERM_MAX; i++) {
+        const uint32_t d = due_in_one(&s_terms[i], now);
+        if (d < soonest) {
+            soonest = d;
+        }
+    }
+    return soonest;
+}
+
+static void tick_one(term_t *t)
+{
+    if (t->win == NULL || s_m == NULL) {
         return;
     }
-    s_polled_at = ag_millis();
+    t->polled_at = ag_millis();
 
     ag_coninfo_t info;
     ag_coninfo(&info);
@@ -240,34 +389,35 @@ void dsk_term_tick(void)
      * the ones at the top that have scrolled out of interest.
      */
     uint16_t first = 0;
-    if (info.rows > s_shown_rows && info.cur_y >= s_shown_rows) {
-        first = (uint16_t)(info.cur_y - s_shown_rows + 1u);
+    if (t->slot < 0 && info.rows > t->shown_rows &&
+        info.cur_y >= t->shown_rows) {
+        first = (uint16_t)(info.cur_y - t->shown_rows + 1u);
     }
-    const bool scrolled = (first != s_first_row) || !s_polled;
-    s_first_row = first;
-    s_polled = true;
+    const bool scrolled = (first != t->first_row) || !t->polled;
+    t->first_row = first;
+    t->polled = true;
 
-    const dsk_rect_t client = dsk_wm_client(s_win);
+    const dsk_rect_t client = dsk_wm_client(t->win);
 
-    for (uint16_t row = 0; row < s_shown_rows; row++) {
+    for (uint16_t row = 0; row < t->shown_rows; row++) {
         ag_textcell_t fresh[TERM_COLS_MAX];
-        const int32_t n = ag_con_peek_row((uint16_t)(s_first_row + row), fresh,
-                                          s_shown_cols);
+        const int32_t n = peek(t, (uint16_t)(t->first_row + row), fresh,
+                               t->shown_cols);
         if (n <= 0) {
             continue; /* not this row's fault; the console said no */
         }
         bool changed = scrolled;
         for (int32_t i = 0; !changed && i < n; i++) {
-            changed = (fresh[i].ch != s_shadow[row][i].ch) ||
-                      (fresh[i].attr != s_shadow[row][i].attr);
+            changed = (fresh[i].ch != t->shadow[row][i].ch) ||
+                      (fresh[i].attr != t->shadow[row][i].attr);
         }
         if (!changed) {
             continue;
         }
         for (int32_t i = 0; i < n; i++) {
-            s_shadow[row][i] = fresh[i];
+            t->shadow[row][i] = fresh[i];
         }
-        dsk_wm_damage_rect(row_rect(client, row));
+        dsk_wm_damage_rect(row_rect(t, client, row));
     }
 
     /*
@@ -275,16 +425,37 @@ void dsk_term_tick(void)
      * one cell and moves the caret off another - so its row is repainted
      * whenever it has moved.
      */
-    static uint16_t s_caret_x = 0xFFFFu, s_caret_y = 0xFFFFu;
-    if (info.cur_x != s_caret_x || info.cur_y != s_caret_y) {
+    if (t->slot < 0 && (info.cur_x != t->caret_x || info.cur_y != t->caret_y)) {
         for (int pass = 0; pass < 2; pass++) {
-            const uint16_t cy = (pass == 0) ? s_caret_y : info.cur_y;
-            if (cy >= s_first_row && cy < s_first_row + s_shown_rows) {
+            const uint16_t cy = (pass == 0) ? t->caret_y : info.cur_y;
+            if (cy >= t->first_row && cy < t->first_row + t->shown_rows) {
                 dsk_wm_damage_rect(
-                    row_rect(client, (uint16_t)(cy - s_first_row)));
+                    row_rect(t, client, (uint16_t)(cy - t->first_row)));
             }
         }
-        s_caret_x = info.cur_x;
-        s_caret_y = info.cur_y;
+        t->caret_x = info.cur_x;
+        t->caret_y = info.cur_y;
+    }
+}
+
+void dsk_term_tick(void)
+{
+    for (int i = 0; i < TERM_MAX; i++) {
+        tick_one(&s_terms[i]);
+    }
+}
+
+dsk_win_t *dsk_term_open(const dsk_metrics_t *m)
+{
+    return dsk_term_open_slot(m, -1);
+}
+
+void dsk_term_fwd_stats(uint32_t *sent, uint32_t *taken)
+{
+    if (sent != NULL) {
+        *sent = s_fwd;
+    }
+    if (taken != NULL) {
+        *taken = s_fwd_ok;
     }
 }

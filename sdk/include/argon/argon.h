@@ -171,6 +171,42 @@ static inline void ag_fill(uint16_t x, uint16_t y, uint16_t w, uint16_t h,
  * The console's own cells, for an application that draws the console itself.
  * `max` is how many cells `cells` holds; the answer is how many were written.
  */
+/*
+ * A row of the screen belonging to another session slot (ABI 0.45).
+ *
+ * For a window drawing somebody else's prompt: that slot's screen is
+ * nowhere on the glass while this program holds it.
+ */
+static inline int32_t ag_con_peek_row_slot(int slot, uint16_t row,
+                                           ag_textcell_t *cells, uint16_t max)
+{
+    if (!AG_HAS(g_ag_api->con, peek_row_slot) ||
+        g_ag_api->con->peek_row_slot == NULL) {
+        return -AG_ENOTSUP;
+    }
+    return g_ag_api->con->peek_row_slot(slot, row, cells, max);
+}
+
+/* Hand a key to the prompt living in a slot (ABI 0.45). */
+static inline bool ag_post_to_slot(int slot, const ag_event_t *e)
+{
+    if (!AG_HAS(g_ag_api->inp, post_to_slot) ||
+        g_ag_api->inp->post_to_slot == NULL) {
+        return false;
+    }
+    return g_ag_api->inp->post_to_slot(slot, e);
+}
+
+/* Give a slot a shell of its own; negative slot means any free one. */
+static inline int32_t ag_prompt_in_slot(int slot, const char *cwd)
+{
+    if (!AG_HAS(g_ag_api->sys, prompt_in_slot) ||
+        g_ag_api->sys->prompt_in_slot == NULL) {
+        return -AG_ENOTSUP;
+    }
+    return g_ag_api->sys->prompt_in_slot(slot, cwd);
+}
+
 static inline int32_t ag_con_peek_row(uint16_t row, ag_textcell_t *cells,
                                       uint16_t max)
 {

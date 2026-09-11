@@ -9,6 +9,8 @@
  */
 #include <stdarg.h>
 #include <stdio.h>
+#include <argon/session.h>
+#include <argon/shell.h>
 #include <string.h>
 #include <sys/time.h>
 #include <time.h>
@@ -126,6 +128,9 @@ static void api_module_on_unload(void (*fn)(void))
     ag_module_on_unload(fn);
 }
 
+/* Defined below, next to the other session-facing calls. */
+static int32_t api_prompt_in_slot(int slot, const char *cwd);
+
 static const ag_sys_api_t k_sys = {
     .size = sizeof(ag_sys_api_t),
     .info = api_info,
@@ -137,6 +142,7 @@ static const ag_sys_api_t k_sys = {
     .strerror = api_strerror,
     .heartbeat = api_heartbeat,
     .module_on_unload = api_module_on_unload,
+    .prompt_in_slot = api_prompt_in_slot,
 };
 
 /* ---------------------------------------------------------------------- */
@@ -437,6 +443,37 @@ static int32_t api_peek_row_slot(int slot, uint16_t row, ag_textcell_t *cells,
     }
     ag_console_unlock();
     return written;
+}
+
+/*
+ * Give a slot a shell of its own.  A slot below zero means any free one -
+ * a window asking for a prompt has no business choosing a number, and
+ * nothing in the ABI lets it see which are taken.
+ */
+static int32_t api_prompt_in_slot(int slot, const char *cwd)
+{
+    if (slot >= 0) {
+        const ag_err_t err = ag_shell_start_in_slot_at(slot, cwd);
+        return (err == AG_OK) ? (int32_t)slot : (int32_t)err;
+    }
+
+    /*
+     * A free slot is one with nothing RUNNING in it, not merely one with
+     * no prompt.  Asking only about the prompt put the first one in the
+     * caller's own slot - the desktop asks for this, and the desktop is
+     * itself the application sitting in slot 1.
+     */
+    ag_session_slot_t slots[AG_SESSION_SLOTS];
+    ag_session_info(slots);
+    for (int i = 0; i < AG_SESSION_SLOTS; i++) {
+        if (slots[i].pid != AG_PID_KERNEL) {
+            continue;
+        }
+        if (ag_shell_start_in_slot_at(i, cwd) == AG_OK) {
+            return (int32_t)i;
+        }
+    }
+    return -AG_ENOSPC;
 }
 
 static bool api_inp_post_to_slot(int slot, const ag_event_t *ev)

@@ -5284,6 +5284,30 @@ static shell_ctx_t *s_ctx[AG_SESSION_SLOTS];
  * Always true for the original prompt, which serves whichever slot is
  * focused - that is what the system shell has always done.
  */
+/*
+ * May this prompt read keys now?
+ *
+ * The original shell follows the focus: there is one keyboard, and it may
+ * only read when its slot is the one in front.  A prompt started in a slot
+ * of its own is different, and this is what a window on the desktop needs:
+ * it is never in front - the desktop is - and its keys do not come from the
+ * keyboard at all.  They are put into its queue by whoever IS in front,
+ * with ag_console_post_to_slot, and nobody else will ever take them out.
+ *
+ * It waited for a focus it could not be given, so sixteen keys typed into
+ * the desktop's prompt window sat in the queue and the shell above them
+ * spun at fifty milliseconds a turn, for ever.
+ */
+static bool my_slot_is_focused(void);
+
+static bool may_read_keys(void)
+{
+    if (sh()->slot != AG_SESSION_FOLLOW) {
+        return true; /* its own slot, its own queue, its own screen */
+    }
+    return ag_session_shell_owns_keyboard() && my_slot_is_focused();
+}
+
 static bool my_slot_is_focused(void)
 {
     const shell_ctx_t *c = sh();
@@ -5441,7 +5465,7 @@ static void prompt_loop(void)
          * alive, with their own directories and their own screens, and
          * only the one in front reads it.
          */
-        while (!ag_session_shell_owns_keyboard() || !my_slot_is_focused()) {
+        while (!may_read_keys()) {
             ag_port_task_delay(ag_port_ms_to_ticks(50));
         }
 
@@ -5454,7 +5478,7 @@ static void prompt_loop(void)
 
         bool done = false;
         while (!done) {
-            if (!ag_session_shell_owns_keyboard() || !my_slot_is_focused()) {
+            if (!may_read_keys()) {
                 ag_console_lock();
                 ag_console_set_live(NULL, NULL);
                 ag_console_unlock();
@@ -5487,6 +5511,19 @@ static void prompt_loop(void)
                 if (s_line.len > 0) {
                     ag_lineedit_remember(&s_line, s_line.buf);
                     s_last_status = ag_shell_execute(s_line.buf);
+                    if (sh()->slot != AG_SESSION_FOLLOW) {
+                        /*
+                         * One line per command, because a prompt in a slot
+                         * of its own is out of sight: what it prints goes to
+                         * that slot's screen, and that screen lives behind
+                         * somebody's window.  A refusal would otherwise be
+                         * invisible and look exactly like a key that never
+                         * arrived - which is precisely how it looked while
+                         * this was being found.
+                         */
+                        ag_log(AG_LOG_INFO, "shell", "slot %d ran '%s' -> %d",
+                               sh()->slot, s_line.buf, (int)s_last_status);
+                    }
                 }
                 done = true;
                 break;

@@ -54,6 +54,9 @@ static uint32_t s_ptr_events;
 static uint32_t s_key_events;
 static uint8_t  s_buttons;
 static uint32_t s_repaints;
+static uint32_t s_prompt_asks;
+static int32_t  s_prompt_slot = -999;
+static bool     s_prompt_opened;
 static uint32_t s_reflushes;
 static bool     s_double_buf;
 static const char *s_note = "";
@@ -618,6 +621,7 @@ enum {
     ID_DBL_CYCLE,
     ID_DIM,
     ID_SETTIME,
+    ID_PROMPT,
     ID_PROPS,
     ID_ARRANGE,
     ID_EXIT,
@@ -2217,6 +2221,7 @@ static void rebuild_menus(void)
      * it shows - and what it deliberately does not do yet - is in dsk_term.h.
      */
     set_item(&s_menus[2], "System console", ID_CONSOLE, true);
+    set_item(&s_menus[2], "MS-DOS Prompt", ID_PROMPT, true);
     if (n > 0) {
         set_separator(&s_menus[2]);
     }
@@ -2476,6 +2481,45 @@ static void menu_chose(uint16_t id)
     case ID_SETTIME:
         ask_settime();
         break;
+    case ID_PROMPT: {
+        /*
+         * Counted, because everything this does happens on a screen the
+         * transcript cannot read: the menu item, the refusal note and the
+         * prompt's own text are all pixels.  Two numbers printed on the
+         * way out say whether the item was ever chosen and what the
+         * system answered - the difference between 'the menu missed' and
+         * 'there was no slot'.
+         */
+        s_prompt_asks++;
+        /*
+         * A prompt of somebody's own, in a window.
+         *
+         * The console window beside this one is a view: it shows what the
+         * machine said and cannot be typed into, because there is one
+         * keyboard and this desktop is holding it.  This one asks the
+         * system for a shell in a slot of its own and then passes the
+         * keys along - which is the whole difference, and why it needed
+         * a second shell underneath rather than a second window.
+         *
+         * It opens in the directory of the folder window in front, when
+         * there is one: that is where the person is working.
+         */
+        const char *where = dsk_folder_path(dsk_wm_active());
+        const int32_t slot = ag_prompt_in_slot(-1, where);
+        s_prompt_slot = slot;
+        if (slot < 0) {
+            s_note = (slot == -AG_ENOSPC) ? "every slot is busy"
+                                          : "this system has no second shell";
+            damage(s_m.statusbar);
+            break;
+        }
+        s_prompt_opened = (dsk_term_open_slot(&s_m, (int)slot) != NULL);
+        if (!s_prompt_opened) {
+            s_note = "no room for another window";
+            damage(s_m.statusbar);
+        }
+        break;
+    }
     case ID_ABOUT: {
         /*
          * The version of the SYSTEM, not of this shell: a shell that reports
@@ -3529,6 +3573,13 @@ int ag_main(int argc, char **argv)
      */
     uint32_t bands = 0, band_marks = 0;
     dsk_folder_band_stats(&bands, &band_marks);
+    ag_printf("desktop: prompt asked %u time(s), last answer %ld\n",
+              (unsigned)s_prompt_asks, (long)s_prompt_slot);
+    uint32_t fwd = 0, fwd_ok = 0;
+    dsk_term_fwd_stats(&fwd, &fwd_ok);
+    ag_printf("desktop: prompt window %s, %u key(s) forwarded, %u taken\n",
+              s_prompt_opened ? "opened" : "never opened",
+              (unsigned)fwd, (unsigned)fwd_ok);
     ag_printf("desktop: %u bands (last marked %u), %u file drags\n",
               (unsigned)bands, (unsigned)band_marks,
               (unsigned)s_fdrag_arms);

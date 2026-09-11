@@ -497,11 +497,18 @@ try {
     # Opening a window activates it, so the folder window has to be brought
     # back before anything that acts on a selection: Properties on the console
     # window is Properties on nothing, and the dialog never opens.  The Window
-    # menu lists the windows topmost first after its own items, so the eighth
+    # menu lists the windows topmost first after its own items, so the ninth
     # entry is the one underneath the console.
+    #
+    # Nine because the menu grew: 'MS-DOS Prompt' went in beside 'System
+    # console' and pushed every window entry down one.  Counting arrow keys
+    # into a menu whose length is a property of the program is a trap, and
+    # this is the bill for it: the folder never came back, so the clipboard,
+    # the marked rows, Properties and all four Options checks failed at once
+    # and looked like a keyboard that had died.
     $backToFolder = @('key f10', 'wait 400', 'key right', 'wait 200',
                       'key right', 'wait 300') +
-                    (1..8 | ForEach-Object { 'key down' }) +
+                    (1..9 | ForEach-Object { 'key down' }) +
                     @('wait 300', 'key enter', 'wait 800')
 
     # Options > Small font, then Options > Large font.  Two rights from File
@@ -582,6 +589,47 @@ try {
                @('say 2031-03-04 05:06', 'wait 300', 'key enter',
                  'wait 900')
 
+    # Last in the pass, and now for a plain reason: it opens a window that
+    # nothing after it would want in front.
+    #
+    # It spent three runs looking like a defect in the window - 151 of 365
+    # keystrokes delivered, to the keystroke, and everything after it dead.
+    # The window was innocent.  Adding 'MS-DOS Prompt' to the Window menu
+    # made that menu one item longer, and $backToFolder walks that menu by
+    # counting Down keys: its eighth stop had been the folder and became
+    # the console.  The folder never came back, so every later step acted
+    # on the wrong window.  The moral is in the comment on $backToFolder,
+    # and it is why the same number came back when the step was moved: the
+    # count was a property of the program, not of the run.
+    #
+    # What this step proves is the whole point of the window, and it proves
+    # it through the file system rather than the screen: the directory
+    # below exists afterwards or the keys never reached a shell.
+    #
+    # Window > MS-DOS Prompt, the seventh stop, and a command typed
+    # into it.
+    #
+    # This is the one thing the console window beside it cannot do.
+    # That one is a view: it shows what the machine said and takes no
+    # keys, because there is one keyboard and the desktop is holding
+    # it.  This one is somebody's prompt - a slot with a shell of its
+    # own - and the desktop passes the keys along.
+    #
+    # Checked by what the command DID, not by what the window shows:
+    # the prompt writes to its own slot's screen, which never reaches
+    # this transcript.  A directory made in there is on C: afterwards
+    # or the keys never arrived.
+    $opsPrompt = @('key f10', 'wait 500', 'key right', 'wait 200',
+                   'key right', 'wait 300') +
+                 (1..7 | ForEach-Object { 'key down' }) +
+                 @('wait 300', 'key enter', 'wait 1500',
+                   'say md c:\fromwin', 'wait 400', 'key enter',
+                   'wait 1500',
+                   # And shut it again.  While a prompt window is in front it
+                   # takes every key but F10, which is what it is for; the
+                   # rest of this pass is talking to the desktop.
+                   'down leftctrl', 'key f4', 'up leftctrl', 'wait 600')
+
     # Three Rights now: File, Edit, Window, Options.
     $optFont = @('key f10', 'wait 400', 'key right', 'wait 200', 'key right',
                  'wait 200', 'key right',
@@ -635,7 +683,7 @@ try {
     $keyboard = $runHello + $runGfx + $opsMkdir + $opsCopy + $opsDelete +
                 $opsRename + $openConsole + $backToFolder + $opsClip +
                 $opsMarked + $optPattern + $optKbd + $optDim + $optTime +
-                $optFont + $opsProps
+                $optFont + $opsProps + $opsPrompt
     $quoted = ($moves | ForEach-Object { '"' + $_ + '"' }) -join ' '
     $after = @('"key f5"', ('"wait ' + $settle + '"')) -join ' '
     # The properties box is deliberately still up for both photographs - it is
@@ -646,6 +694,17 @@ try {
     $closing = @('"key enter"', '"wait 600"') -join ' '
 
     $send = @(
+        # The lease FIRST, because the virtual mouse cannot exist without it.
+        #
+        # Both virtual drivers open their sockets only once the network has
+        # an address, and QEMU's lease is usually instant - usually.  Three
+        # runs of this file died with `nothing listening on 5560 after 60 s`
+        # and a transcript holding five copies of "interface up (waiting for
+        # an address)" and no address at all.  That is not a driver fault and
+        # not a port in use: it is a boot that had not finished the part the
+        # gesture depends on.  Waiting for the line that says the address
+        # arrived costs nothing when it is already there.
+        '=net: ip ',
         # Nothing to install: the drivers came up from C:\DRV with the boot,
         # because SYSTEM.CFG on the baked image names them in [modules].
         'dev',
@@ -776,7 +835,14 @@ try {
         'dir c:\drv',
         'dir c:\picked',
         'dir c:\newdir',
-        'dir c:\'
+        'dir c:\',
+        # Wait for that listing to FINISH before the run is allowed to
+        # end.  Without this the transcript stopped in the middle of it
+        # - one run held the directory the prompt window had made, the
+        # next one ended two names earlier and said the prompt had
+        # never reached a shell.  The last line of a listing is the
+        # free-space count, so that is what is waited for.
+        '=dir(s)'
     )
 
     Write-Host "desktop: driving QEMU, transcript -> $log, picture -> $png"
@@ -1083,6 +1149,39 @@ try {
             $fail += 'Set time... did not reach the system clock'
         }
 
+        # The prompt window took a command and its shell ran it.  Both
+        # halves matter: a window that draws somebody else's screen is
+        # a view, and a view cannot make a directory.
+        # As a directory in the listing, and that is the whole trick.
+        #
+        # The first version of this was `$text -notmatch 'fromwin'`, and it
+        # passed a run in which nothing was created: inputplay echoes the
+        # keys it is about to send, so the word was in the transcript before
+        # the guest saw a key.  An assertion its own command satisfies is not
+        # an assertion.  The second version asked for FROMWIN in capitals, on
+        # the theory that a DOS listing shouts - it does not; the name is
+        # kept as it was typed.  What the echo cannot contain is the name
+        # followed by the <DIR> column, so that is what is asked for.  A
+        # regex shaped around 'Directory of C:\' is no use either: the
+        # listing arrives full of escape codes.
+        if ($seen -notmatch 'fromwin\s+<DIR>') {
+            $fail += 'the MS-DOS Prompt window never reached a shell'
+        }
+
+        # And what the desktop's own counters say about the same step, which
+        # is what tells a window that never opened from a shell that never
+        # read: see the ID_PROMPT case in desktop.c.
+        $fwd = [regex]::Match($text,
+               'prompt window (opened|never opened), (\d+) key\(s\) forwarded, (\d+) taken')
+        if (-not $fwd.Success -or $fwd.Groups[1].Value -ne 'opened') {
+            $fail += 'the MS-DOS Prompt window never opened'
+        } elseif ($fwd.Groups[2].Value -eq '0') {
+            $fail += 'the MS-DOS Prompt window got no keys'
+        } elseif ($fwd.Groups[3].Value -ne $fwd.Groups[2].Value) {
+            $fail += ("the prompt's slot refused keys: " +
+                      $fwd.Groups[3].Value + ' of ' + $fwd.Groups[2].Value + ' taken')
+        }
+
         $band = [regex]::Match($text, 'desktop: band marked (\d+)')
         if (-not $band.Success) {
             $fail += 'the rubber band never reported a selection'
@@ -1154,7 +1253,12 @@ try {
         # Four opened from the menu, two closed with Alt+F4.  A different
         # number means a menu that did not open, a click that missed, or a
         # close that did not close - and the picture alone would not say which.
-        # Two: the folder window this sequence opened and the console window,
+        # Two, still, although five windows are opened now and not four: the
+    # prompt window is the one in front when the closing keys arrive, so it
+    # is the one they close.  That it opened at all is checked above, by the
+    # desktop's own counters, and what it did is checked on the disk.
+    #
+    # The folder window this sequence opened and the console window,
         # which is deliberately left open - what the second run then restores
         # says whether a window with no folder behind it stays out of the
         # arrangement, which is the rule DESKTOP.INI is written by.

@@ -31,6 +31,20 @@
 dsk_win_t *dsk_term_open(const dsk_metrics_t *m);
 
 /*
+ * The same window, showing a session slot's own screen and feeding it the
+ * keys it cannot read for itself.
+ *
+ * A slot with a shell of its own (ag_prompt_in_slot) has a screen that is
+ * nowhere on the glass while this desktop holds it, and no claim on the
+ * keyboard while this desktop is in front.  Both of those are what this
+ * window is for.  A slot below zero is the system console, as a view.
+ */
+dsk_win_t *dsk_term_open_slot(const dsk_metrics_t *m, int slot);
+
+/* How many keys a prompt window passed on, and how many the slot took. */
+void dsk_term_fwd_stats(uint32_t *sent, uint32_t *taken);
+
+/*
  * Re-read the console and damage the rows that changed.
  *
  * Called from the shell's idle rather than driven by an event, because the

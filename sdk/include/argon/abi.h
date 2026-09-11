@@ -261,6 +261,21 @@ typedef struct ag_sys_api {
      * sockets, etc.) before the image is unmapped on drv unload/replace.
      */
     void (*module_on_unload)(void (*fn)(void));
+
+    /*
+     * ABI 0.45: give a session slot a shell of its own, and say which slot
+     * got it.
+     *
+     * For a desktop that wants a prompt in a window.  `slot` below zero
+     * means any free one, which is what a window asking for a prompt
+     * actually wants - it has no business choosing a slot number, and
+     * nothing else in the ABI lets it enumerate them.  `cwd` may be NULL
+     * for the root.
+     *
+     * Returns the slot, or a negative error: -AG_ENOSPC when every slot
+     * already has something in it.
+     */
+    int32_t (*prompt_in_slot)(int slot, const char *cwd);
 } ag_sys_api_t;
 
 /* ------------------------------------------------------------------------ */
