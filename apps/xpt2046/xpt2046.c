@@ -194,7 +194,19 @@ static struct {
     uint32_t still;    /* pressed and read, but inside the dead band       */
     uint32_t sent;     /* an event handed to the kernel                    */
     uint32_t flaky;    /* line said up, the glass was still being pressed  */
-    uint32_t worst;    /* longest run of polls that produced nothing, ms   */
+    /*
+     * The longest the pointer stood still WHILE SOMETHING WAS ON THE
+     * GLASS, in milliseconds.
+     *
+     * The "while" is the whole value of the number.  It used to be timed
+     * from one delivered event to the next regardless, so a hand lifted
+     * for two seconds between strokes was reported as a two-second
+     * silence - and a report that says 2630 ms about a person resting
+     * their arm cannot also say anything about a pointer that sticks.
+     * Timed only inside a contact, it answers the question it is named
+     * for.
+     */
+    uint32_t worst;
     uint32_t quiet_at; /* when the current dry spell started               */
     uint32_t said_at;  /* last time this was written down                  */
     uint32_t asleep;   /* windows in a row where the glass was untouched   */
@@ -215,9 +227,15 @@ static struct {
     uint32_t z_ok;
 } s_tally;
 
-static void tally_tick(bool produced)
+static void tally_tick(bool produced, bool touching)
 {
     const uint32_t now = ag_millis();
+
+    if (!touching) {
+        /* Nothing is on the glass: there is no gap to measure. */
+        s_tally.quiet_at = 0u;
+        return;
+    }
 
     if (produced) {
         const uint32_t dry = (s_tally.quiet_at != 0u) ? now - s_tally.quiet_at
@@ -262,7 +280,7 @@ static void tally_tick(bool produced)
            "polls %u: no pen %u, flaky %u, weak %u, still %u, sent %u; "
            "%u touch(es) ended, %u of them by a jump; "
            "pressure 0/%u <50/%u <held/%u ok/%u; "
-           "longest silence %u ms; %u quiet window(s) before this",
+           "longest stuck %u ms; %u quiet window(s) before this",
            (unsigned)s_tally.polls, (unsigned)s_tally.no_pen,
            (unsigned)s_tally.flaky, (unsigned)s_tally.weak,
            (unsigned)s_tally.still, (unsigned)s_tally.sent,
@@ -455,7 +473,7 @@ static int32_t touch_poll(ag_handle_t h, ag_event_t *out, uint32_t max)
      */
     if (!line && !s_state.down) {
         s_tally.no_pen++;
-        tally_tick(false);
+        tally_tick(false, s_state.down);
         return 0;
     }
     if (!line) {
@@ -515,7 +533,7 @@ static int32_t touch_poll(ag_handle_t h, ag_event_t *out, uint32_t max)
                 out[0].ptr.y = s_state.row;
                 out[0].ptr.buttons = 0;
                 s_tally.sent++;
-                tally_tick(true);
+                tally_tick(true, s_state.down);
                 return 1;
             }
         }
@@ -524,7 +542,7 @@ static int32_t touch_poll(ag_handle_t h, ag_event_t *out, uint32_t max)
     if (!pressed) {
         if (!s_state.down) {
             s_tally.weak++;
-            tally_tick(false);
+            tally_tick(false, s_state.down);
             return 0;
         }
         /* Down until the glass has been quiet long enough to mean it. */
@@ -536,7 +554,7 @@ static int32_t touch_poll(ag_handle_t h, ag_event_t *out, uint32_t max)
             travelled() ? UP_SETTLE_DRAG_MS : UP_SETTLE_MS;
         if (now - s_up_since < settle) {
             s_tally.weak++;
-            tally_tick(false);
+            tally_tick(false, s_state.down);
             return 0;
         }
         s_up_since = 0u;
@@ -547,7 +565,7 @@ static int32_t touch_poll(ag_handle_t h, ag_event_t *out, uint32_t max)
         out[0].ptr.buttons = 0;
         s_tally.sent++;
         s_tally.ended++;
-        tally_tick(true);
+        tally_tick(true, s_state.down);
         return 1;
     }
     s_up_since = 0u;
@@ -602,7 +620,7 @@ static int32_t touch_poll(ag_handle_t h, ag_event_t *out, uint32_t max)
         out[0].type = AG_EV_POINTER_MOVE;
     } else {
         s_tally.still++;
-        tally_tick(false);
+        tally_tick(false, s_state.down);
         return 0; /* still down, still in the same place: nothing happened */
     }
 
@@ -615,7 +633,7 @@ static int32_t touch_poll(ag_handle_t h, ag_event_t *out, uint32_t max)
     s_state.col = col;
     s_state.row = row;
     s_tally.sent++;
-    tally_tick(true);
+    tally_tick(true, s_state.down);
     return 1;
 }
 
