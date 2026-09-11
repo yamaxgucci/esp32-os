@@ -496,7 +496,29 @@ try {
                     'key right', 'wait 200', 'key right', 'wait 300') +
                   (1..10 | ForEach-Object { 'key down' }) +
                   @('wait 300', 'key enter', 'wait 600')
-    $optDim = $optDimOnce + $optDimOnce + $optDimOnce + $optDimOnce + $clear +
+    $optDim = $optDimOnce + $optDimOnce + $optDimOnce + $optDimOnce
+
+    # Three Rights now: File, Edit, Window, Options.
+    $optFont = @('key f10', 'wait 400', 'key right', 'wait 200', 'key right',
+                 'wait 200', 'key right',
+                 'wait 300', 'key down', 'key down', 'wait 300', 'key enter',
+                 'wait 1200',
+                 'key f10', 'wait 400', 'key right', 'wait 200', 'key right',
+                 'wait 200', 'key right',
+                 'wait 300', 'key down', 'wait 300', 'key enter', 'wait 1200')
+
+    # Two rows marked with Space, then File > Copy, which with more than one
+    # mark asks for a DIRECTORY and puts both in it under their own names.
+    # Space marks and steps down, so two of them mark two neighbours.
+    #
+    # Home lands on "..", which cannot be marked - a mark on the way up is a
+    # mark on the parent directory - so the first Down is what gets onto a
+    # real row.
+    $opsMarked = @('key home', 'key down', 'wait 200',
+                   'key space', 'key space', 'wait 300',
+                   'key f10', 'wait 400') +
+                 (1..3 | ForEach-Object { 'key down' }) +
+                 @('wait 300', 'key enter', 'wait 800') + $clear +
                  @('say c:\picked', 'wait 200', 'key enter',
                    'wait 3000')
 
@@ -606,7 +628,20 @@ try {
         #
         # A photograph would show the window too, and would not distinguish a
         # restored window from one this script had opened; the counters do.
-        'type c:\desktop.ini',
+        # A backspace first, and it is not decoration.
+        #
+        # The 'q' above quits the shell AND stays in the console's line
+        # editor: the focused application took it as a key event and the
+        # editor buffered the same byte.  So the next command arrived as
+        # `qtype c:\\desktop.ini` - "Bad command or file name: qtype" -
+        # the file was never printed, and the run reported that DESKTOP.INI
+        # held no icon position.  Four checks downstream of this have been
+        # blaming the shell for a leftover keystroke.
+        #
+        # Sent as ONE write with the command and its carriage return: a lone
+        # control byte in a write of its own is the thing that goes missing
+        # (see the run line above).
+        "~\x08type c:\desktop.ini\x0d",
         '~run c:\desktop.axe 12\x0d',
         '=desktop: surface',
         # The surface line is printed before the first paint has reached the

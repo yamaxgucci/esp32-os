@@ -193,6 +193,23 @@ static void find_drives(void)
         d->y = (int16_t)(4 + row * DRIVE_CELL_H);
         (void)dsk_ini_icon_of(&s_ini, d->label, &d->x, &d->y);
     }
+
+    /*
+     * Say which ones there are, because a scripted run cannot see them.
+     *
+     * The scenario aims at "the second icon" by arithmetic and then checks
+     * DESKTOP.INI for a drive by name - and which drive is second depends
+     * on what happens to be mounted.  When the two disagree the run fails
+     * with "no position for the icon that was dragged", which reads as a
+     * shell that forgot and is a test that aimed at the wrong cell.
+     */
+    char line[DRIVE_MAX * 4 + 1];
+    line[0] = '\0';
+    for (int i = 0; i < s_ndrives; i++) {
+        ag_strlcat(line, s_drives[i].label, sizeof(line));
+        ag_strlcat(line, " ", sizeof(line));
+    }
+    ag_printf("desktop: drives %s\n", line);
 }
 
 /*
