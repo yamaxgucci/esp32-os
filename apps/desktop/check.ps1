@@ -240,8 +240,19 @@ try {
         # Cleared afterwards, and that matters: the keyboard pass below
         # marks two rows by hand and copies them, and rows left marked here
         # would be copied with them.
-        "move $rowX,$($rowY + 48)", 'press', 'wait 200',
-        "glide $rowX,$($rowY + 8),12", 'wait 300', 'release', 'wait 400',
+        # Down over four rows, then back up to two: the band has to give
+        # back what it took.  It did not - the hand leaves the window on
+        # the way up, the manager routes by what is under the pointer, and
+        # the window stopped hearing about the gesture it was drawing.  The
+        # marks froze half made and the release landed somewhere else, so
+        # nothing ever took them off.
+        #
+        # Rows are 16 apart and row 0's middle is $rowY, so pressing at
+        # +16 and ending at +32 leaves exactly two rows under the band
+        # whatever the directory happens to hold.
+        "move $rowX,$($rowY + 16)", 'press', 'wait 200',
+        "glide $rowX,$($rowY + 80),12", 'wait 300',
+        "glide $rowX,$($rowY + 32),12", 'wait 300', 'release', 'wait 400',
         "move $rowX,$rowY", 'click', 'wait 300',
 
         # Into the only directory there is, and back out of it by "..".
@@ -981,12 +992,17 @@ try {
         # The rubber band marked more than one row.  The number itself is
         # not fixed - it depends on how many entries C:\ has by then - but
         # "more than one" is the whole claim: one row is what a click does.
+        # Exactly two, and the number is the whole point: the band passed
+        # over five rows on the way down and came back to two, so a count
+        # of five would mean the marks were accumulated rather than
+        # recomputed, and a count of one would mean the gesture never
+        # became a band at all.
         $band = [regex]::Match($text, 'desktop: band marked (\d+)')
         if (-not $band.Success) {
             $fail += 'the rubber band never reported a selection'
-        } elseif ([int]$band.Groups[1].Value -lt 2) {
-            $fail += ('the rubber band marked ' + $band.Groups[1].Value +
-                      ' row(s), which is what a click does')
+        } elseif ([int]$band.Groups[1].Value -ne 2) {
+            $fail += ('the rubber band ended with ' + $band.Groups[1].Value +
+                      ' row(s) marked, not the two it came back to')
         }
 
         if ($text -notmatch 'desktop: desk pattern [1-9]') {

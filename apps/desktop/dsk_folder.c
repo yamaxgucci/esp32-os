@@ -521,6 +521,36 @@ bool dsk_folder_on_sel(const dsk_win_t *w, int16_t x, int16_t y)
     return (f->top + (y - l.y) / ROW_H) == f->sel;
 }
 
+static bool folder_pointer(dsk_win_t *w, dsk_hit_t where, int16_t x,
+                           int16_t y, uint8_t buttons, dsk_ptr_t type,
+                           bool dbl);
+
+dsk_win_t *dsk_folder_banding(void)
+{
+    for (int i = 0; i < FOLDER_MAX; i++) {
+        if (s_folders[i].used && s_folders[i].pressed) {
+            /*
+             * The folder knows its own state but not which window wears
+             * it, so the windows are asked instead - there are at most a
+             * handful and this runs once per pointer event.
+             */
+            for (int z = 0; z < dsk_wm_count(); z++) {
+                dsk_win_t *w = dsk_wm_at(z);
+                if (dsk_folder_is(w) && w->user == &s_folders[i]) {
+                    return w;
+                }
+            }
+        }
+    }
+    return NULL;
+}
+
+bool dsk_folder_band_event(dsk_win_t *w, dsk_ptr_t type, int16_t x, int16_t y,
+                           uint8_t buttons)
+{
+    return folder_pointer(w, DSK_HIT_CLIENT, x, y, buttons, type, false);
+}
+
 bool dsk_folder_band_armed(const dsk_win_t *w)
 {
     if (w == NULL || !dsk_folder_is(w)) {
@@ -806,7 +836,23 @@ static bool folder_pointer(dsk_win_t *w, dsk_hit_t where, int16_t x, int16_t y,
             f->by = (int16_t)(dsk_rect_y2(l) - 1);
         }
         band_marks(w, f);
-        dsk_wm_damage_rect(dsk_rect_union(before, band_rect(f)));
+
+        /*
+         * Repainted across the whole width of the list, not just where the
+         * rectangle is.
+         *
+         * A highlight is a full-width thing and the band is whatever shape
+         * the hand drew.  Dragged straight down, the band is a sliver two
+         * pixels wide: the rows inside it were duly marked and only those
+         * two pixels of each were repainted, so on the glass nothing
+         * appeared to be selected at all.  Maxim saw it once and it is the
+         * same rectangle either way - the strips that carry it are as tall
+         * as the band, and their width costs nothing next to their number.
+         */
+        dsk_rect_t hurt = dsk_rect_union(before, band_rect(f));
+        hurt.x = l.x;
+        hurt.w = l.w;
+        dsk_wm_damage_rect(hurt);
         return true;
     }
 

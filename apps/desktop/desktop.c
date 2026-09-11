@@ -2667,6 +2667,26 @@ static void on_pointer(dsk_ptr_t type, int16_t x, int16_t y, uint8_t buttons,
         }
     }
 
+    /*
+     * A rubber band owns the pointer while it is being drawn, and for the
+     * same reason the icon drag above does: the manager routes by what is
+     * under the pointer, so a hand that wanders off the window - up over
+     * the caption, sideways onto the desk - would stop the band dead with
+     * its marks half made, and the release would land somewhere else
+     * entirely and never end it.  Maxim found it by dragging one way and
+     * then back: the highlight would not come off.
+     */
+    if (type != DSK_PTR_DOWN) {
+        dsk_win_t *bw = dsk_folder_banding();
+        if (bw != NULL) {
+            (void)dsk_folder_band_event(bw, type, x, y, buttons);
+            if (s_ptr_log) {
+                ag_printf("ptr    taken by a rubber band\n");
+            }
+            return;
+        }
+    }
+
     /* The menu is above everything else, so it is asked next. */
     if (dsk_menu_pointer(type, x, y)) {
         if (s_ptr_log) {

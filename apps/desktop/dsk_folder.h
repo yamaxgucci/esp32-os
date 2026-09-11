@@ -105,6 +105,24 @@ bool dsk_folder_on_sel(const dsk_win_t *w, int16_t x, int16_t y);
 bool dsk_folder_band_armed(const dsk_win_t *w);
 
 /*
+ * The window currently drawing a rubber band, or NULL.
+ *
+ * A band owns the pointer until the button comes up, for the same reason
+ * a dragged icon does: the hand wanders off the window - upwards over the
+ * caption, sideways onto the desk - and the manager, which routes by
+ * what is under the pointer, stops delivering.  The band then freezes
+ * with its marks half made and never hears the release at all.
+ */
+dsk_win_t *dsk_folder_banding(void);
+
+/*
+ * Hand a move or a release straight to a window that is drawing a band.
+ * Returns true when it was used up.
+ */
+bool dsk_folder_band_event(dsk_win_t *w, dsk_ptr_t type, int16_t x, int16_t y,
+                           uint8_t buttons);
+
+/*
  * Open what is picked, the way Enter and a double-click do.
  *
  * For the context menu, whose first item has to be the obvious one: a finger
