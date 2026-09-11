@@ -1018,8 +1018,7 @@ bool dsk_wm_pointer(dsk_ptr_t type, int16_t x, int16_t y, uint8_t buttons,
             return true;
         }
         if (top->ops->pointer != NULL &&
-            top->ops->pointer(top, what, x, y, buttons,
-                              type == DSK_PTR_DOWN, dbl)) {
+            top->ops->pointer(top, what, x, y, buttons, type, dbl)) {
             return true;
         }
         if (type == DSK_PTR_DOWN && what == DSK_HIT_TITLE) {
@@ -1036,13 +1035,13 @@ bool dsk_wm_pointer(dsk_ptr_t type, int16_t x, int16_t y, uint8_t buttons,
     if (type == DSK_PTR_MOVE) {
         /* Only the window's own handler cares about a move with no drag. */
         if (w->ops->pointer != NULL) {
-            return w->ops->pointer(w, what, x, y, buttons, false, false);
+            return w->ops->pointer(w, what, x, y, buttons, type, false);
         }
         return false;
     }
     if (type == DSK_PTR_UP) {
         if (w->ops->pointer != NULL) {
-            (void)w->ops->pointer(w, what, x, y, buttons, false, dbl);
+            (void)w->ops->pointer(w, what, x, y, buttons, type, dbl);
         }
         return true;
     }
@@ -1091,7 +1090,7 @@ bool dsk_wm_pointer(dsk_ptr_t type, int16_t x, int16_t y, uint8_t buttons,
         return true;
     case DSK_HIT_CLIENT:
         if (w->ops->pointer != NULL) {
-            (void)w->ops->pointer(w, what, x, y, buttons, true, dbl);
+            (void)w->ops->pointer(w, what, x, y, buttons, type, dbl);
         }
         return true;
     default:

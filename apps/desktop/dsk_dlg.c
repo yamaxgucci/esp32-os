@@ -232,8 +232,9 @@ static void dlg_draw(dsk_win_t *w, dsk_rect_t client)
 }
 
 static bool dlg_pointer(dsk_win_t *w, dsk_hit_t where, int16_t x, int16_t y,
-                        uint8_t buttons, bool down, bool dbl)
+                        uint8_t buttons, dsk_ptr_t type, bool dbl)
 {
+    const bool down = (type == DSK_PTR_DOWN);
     (void)buttons;
     (void)dbl;
     if (where != DSK_HIT_CLIENT || !down) {

@@ -226,6 +226,24 @@ try {
 
         # A drive opens as a window onto its root.
         "move $drvX,$drvY", 'click', 'wait 120', 'click', 'wait 1500',
+
+        # A rubber band down the list of the folder window that is open on
+        # C:\, then a plain click to put the selection back to one row.
+        #
+        # Pressed on a row rather than on empty space: a full window has no
+        # empty space, and a gesture that only works in a short directory
+        # is not the gesture.  Glided in steps of four pixels because the
+        # band is built out of the moves that arrive - one jump from start
+        # to finish would mark the same rows and prove nothing about the
+        # rectangle following the hand.
+        #
+        # Cleared afterwards, and that matters: the keyboard pass below
+        # marks two rows by hand and copies them, and rows left marked here
+        # would be copied with them.
+        "move $rowX,$($rowY + 48)", 'press', 'wait 200',
+        "glide $rowX,$($rowY + 8),12", 'wait 300', 'release', 'wait 400',
+        "move $rowX,$rowY", 'click', 'wait 300',
+
         # Into the only directory there is, and back out of it by "..".
         "move $rowX,$rowY", 'click', 'wait 120', 'click', 'wait 1500',
         "move $rowX,$rowY", 'click', 'wait 120', 'click', 'wait 1500',
@@ -243,6 +261,7 @@ try {
         # between two neighbouring pixels was invisible.  Maxim found dots
         # left behind on the CYD that this could not see.
         'move 180,300', 'glide 260,300,80', 'glide 180,300,80', 'wait 300',
+
 
         # A context menu opened and shut on bare desk, LAST, so that the two
         # photographs can see it.  They could not before: the menus were
@@ -564,18 +583,25 @@ try {
         # Nothing to install: the drivers came up from C:\DRV with the boot,
         # because SYSTEM.CFG on the baked image names them in [modules].
         'dev',
-        # And wait for the LAST line of what `dev` printed before typing
-        # anything else.
+        # `dev` is the synchronisation, and its own prompt is the proof.
         #
-        # A prompt is not proof.  A run that typed the next line while
-        # the modules were still loading had it swallowed: the
-        # transcript shows `run c:\desktop.axe 120` echoed in the middle
-        # of "modules: loaded KBDVIRT", and the command never ran -
-        # everything after it played into a shell that had started
-        # nothing, and the photographs were of a console.  mouse0 is the
-        # last device the listing names, so seeing it means the listing
-        # is over and the shell is back.
-        '=mouse0',
+        # A run that typed the next line while the modules were still
+        # loading had it swallowed: the transcript shows `run
+        # c:\desktop.axe 120` echoed in the middle of "modules: loaded
+        # KBDVIRT", and the command never ran - everything after it played
+        # into a shell that had started nothing, and the photographs were
+        # of a console.  A command sent as a plain item waits for the
+        # prompt that follows it, and that prompt cannot come until the
+        # listing is over.
+        #
+        # There used to be a `=mouse0` wait here as well, meant to catch
+        # the last line of that listing.  It never once matched: a wait
+        # only sees what arrives AFTER it is armed, and `dev` had already
+        # printed and returned to the prompt by then.  So every run of
+        # this file sat for its four-minute step timeout at the very first
+        # step, said "warning: 'mouse0' never appeared", and carried on -
+        # which is also how a run whose virtual mouse was not up yet got
+        # as far as playing a gesture into nothing.
         # Raw, so the harness does not sit waiting for a prompt that cannot
         # come until the shell's own deadline expires.
         #
@@ -598,7 +624,12 @@ try {
         # in this file sends one.
         "~run c:\desktop.axe $Seconds\x0d",
         '=desktop: surface',
-        "!& '$pyexe' 'tools\inputplay.py' --wait 20 $quoted",
+        # Sixty seconds, not twenty: this is the real wait for the virtual
+        # mouse, and it is a wait for the driver's socket rather than for a
+        # line of text.  The socket opens when the network has an address,
+        # so under a loaded machine it can be late - and late is what the
+        # dead marker above used to hide.
+        "!& '$pyexe' 'tools\inputplay.py' --wait 60 $quoted",
         # ONE keyboard pass for all of it, and that is not tidiness.
         #
         # Every invocation of inputplay opens a fresh socket to KBDVIRT, and
@@ -947,6 +978,17 @@ try {
         # on now.  The two-photograph criterion covers the rest: a desk
         # whose repaint does not line up with the tile already drawn
         # shows up there, not here.
+        # The rubber band marked more than one row.  The number itself is
+        # not fixed - it depends on how many entries C:\ has by then - but
+        # "more than one" is the whole claim: one row is what a click does.
+        $band = [regex]::Match($text, 'desktop: band marked (\d+)')
+        if (-not $band.Success) {
+            $fail += 'the rubber band never reported a selection'
+        } elseif ([int]$band.Groups[1].Value -lt 2) {
+            $fail += ('the rubber band marked ' + $band.Groups[1].Value +
+                      ' row(s), which is what a click does')
+        }
+
         if ($text -notmatch 'desktop: desk pattern [1-9]') {
             $fail += 'Options > Pattern did not change the desk'
         }

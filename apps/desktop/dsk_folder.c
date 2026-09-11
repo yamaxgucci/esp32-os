@@ -65,7 +65,29 @@ typedef struct {
     bool     used;
     uint8_t  art[ART_MAX][ART_PX];
     int      narts;
+    /*
+     * The rubber band, in screen coordinates.
+     *
+     * `anchor` is where the button went down and is kept whether or not a
+     * band ever appears - a press that never moves is a click, and the
+     * only way to know which it was is to wait and see.  `band` says the
+     * press has travelled far enough to mean a selection.
+     */
+    bool     band;
+    int16_t  ax, ay; /* the anchor */
+    int16_t  bx, by; /* where the pointer is now */
+    bool     pressed;
 } folder_t;
+
+/*
+ * How far the pointer travels before a click becomes a band.
+ *
+ * The same reasoning as the icon drag: a hand that moved two pixels while
+ * clicking has clicked.  On glass it is not two pixels - a stylus rolls,
+ * a finger is eight pixels wide - and a band that appears under every tap
+ * would flicker a selection rectangle over the whole shell.
+ */
+#define BAND_SLOP 5
 
 #define FOLDER_MAX 8
 static folder_t s_folders[FOLDER_MAX];
@@ -483,6 +505,77 @@ static void draw_status(dsk_win_t *w, folder_t *f)
     }
 }
 
+bool dsk_folder_on_sel(const dsk_win_t *w, int16_t x, int16_t y)
+{
+    if (w == NULL || !dsk_folder_is(w)) {
+        return false;
+    }
+    const folder_t *f = (const folder_t *)w->user;
+    if (f == NULL || f->sel < 0 || f->sel >= f->n) {
+        return false;
+    }
+    const dsk_rect_t l = list_rect((dsk_win_t *)w);
+    if (!dsk_rect_has(l, x, y)) {
+        return false;
+    }
+    return (f->top + (y - l.y) / ROW_H) == f->sel;
+}
+
+bool dsk_folder_band_armed(const dsk_win_t *w)
+{
+    if (w == NULL || !dsk_folder_is(w)) {
+        return false;
+    }
+    const folder_t *f = (const folder_t *)w->user;
+    return (f != NULL) && f->pressed;
+}
+
+/* The band as a rectangle, however it was dragged. */
+static dsk_rect_t band_rect(const folder_t *f)
+{
+    const int16_t x0 = (f->ax < f->bx) ? f->ax : f->bx;
+    const int16_t y0 = (f->ay < f->by) ? f->ay : f->by;
+    const int16_t x1 = (f->ax > f->bx) ? f->ax : f->bx;
+    const int16_t y1 = (f->ay > f->by) ? f->ay : f->by;
+    return dsk_rect(x0, y0, (int16_t)(x1 - x0 + 1), (int16_t)(y1 - y0 + 1));
+}
+
+/*
+ * Mark every visible row the band touches, and unmark the rest.
+ *
+ * Recomputed from scratch on every move rather than accumulated, so that
+ * dragging back up unmarks what dragging down marked - a band that only
+ * ever added would make a slip unfixable without starting again.
+ *
+ * Only what is on screen: a band is a thing you draw around what you can
+ * see, and a list that scrolled under it would mark rows nobody pointed
+ * at.
+ */
+static void band_marks(dsk_win_t *w, folder_t *f)
+{
+    const dsk_rect_t l = list_rect(w);
+    const dsk_rect_t b = band_rect(f);
+    const int        rows = rows_visible(w);
+
+    for (int i = 0; i < f->n; i++) {
+        f->entries[i].marked = false;
+    }
+    f->marked = 0;
+
+    for (int i = 0; i < rows; i++) {
+        const int at = f->top + i;
+        if (at >= f->n) {
+            break;
+        }
+        const int16_t y0 = (int16_t)(l.y + i * ROW_H);
+        if (dsk_rect_y2(b) <= y0 || b.y >= y0 + ROW_H) {
+            continue; /* the band is entirely above or below this row */
+        }
+        f->entries[at].marked = true;
+        f->marked++;
+    }
+}
+
 static void draw_folder(dsk_win_t *w, dsk_rect_t client)
 {
     folder_t *f = (folder_t *)w->user;
@@ -558,6 +651,16 @@ static void draw_folder(dsk_win_t *w, dsk_rect_t client)
     }
     draw_bar(w, f);
     draw_status(w, f);
+
+    /*
+     * The band last, over everything, and as part of the client paint
+     * rather than as a thing that saves and restores what it covers: on a
+     * board with no framebuffer there is nothing to save from, and the
+     * strip being drawn is the only pixels that exist.
+     */
+    if (f->band) {
+        dsk_frame(band_rect(f), DSK_BLACK);
+    }
 }
 
 /* ---- opening what is selected ------------------------------------------ */
@@ -629,11 +732,86 @@ static void activate(dsk_win_t *w, int which)
 /* ---- input ------------------------------------------------------------- */
 
 static bool folder_pointer(dsk_win_t *w, dsk_hit_t where, int16_t x, int16_t y,
-                           uint8_t buttons, bool down, bool dbl)
+                           uint8_t buttons, dsk_ptr_t type, bool dbl)
 {
     (void)buttons;
+    const bool down = (type == DSK_PTR_DOWN);
     folder_t *f = (folder_t *)w->user;
-    if (f == NULL || where != DSK_HIT_CLIENT || !down) {
+    if (f == NULL) {
+        return false;
+    }
+
+    /*
+     * Everything that is not a press belongs to the band.
+     *
+     * The manager hands a window its moves and its release with `down`
+     * false, and until now this handler threw them away.  A band needs all
+     * three, and it needs the release most: the marks are the answer and
+     * the rectangle has to come off the screen.
+     */
+    if (!down) {
+        if (!f->pressed) {
+            return false;
+        }
+        if (type != DSK_PTR_MOVE) {
+            /*
+             * Let go.  Whether the marks stay is already decided - they
+             * were made as the band moved - so this only takes the
+             * rectangle away.
+             */
+            const bool was = f->band;
+            f->pressed = false;
+            f->band = false;
+            if (was) {
+                dsk_wm_damage_rect(dsk_wm_client(w));
+                /*
+                 * Said out loud, because a scripted run cannot see a
+                 * selection: the rows are lit on the glass and nowhere
+                 * else.  One line per completed gesture, which is as
+                 * often as a person draws one.
+                 */
+                ag_printf("desktop: band marked %d\n", f->marked);
+            }
+            return was;
+        }
+
+        const dsk_rect_t l = list_rect(w);
+        if (!f->band) {
+            const int16_t dx = (int16_t)((x > f->ax) ? x - f->ax : f->ax - x);
+            const int16_t dy = (int16_t)((y > f->ay) ? y - f->ay : f->ay - y);
+            if (dx <= BAND_SLOP && dy <= BAND_SLOP) {
+                return false; /* still a click, as far as anyone knows */
+            }
+            f->band = true;
+        }
+
+        /*
+         * Kept inside the list.  A band dragged over the scroll bar or the
+         * status strip would paint on them and be rubbed out by their next
+         * repaint, and the rows it selects are in here anyway.
+         */
+        const dsk_rect_t before = band_rect(f);
+        f->bx = x;
+        f->by = y;
+        if (f->bx < l.x) {
+            f->bx = l.x;
+        }
+        if (f->bx >= dsk_rect_x2(l)) {
+            f->bx = (int16_t)(dsk_rect_x2(l) - 1);
+        }
+        if (f->by < l.y) {
+            f->by = l.y;
+        }
+        if (f->by >= dsk_rect_y2(l)) {
+            f->by = (int16_t)(dsk_rect_y2(l) - 1);
+        }
+        band_marks(w, f);
+        dsk_wm_damage_rect(dsk_rect_union(before, band_rect(f)));
+        return true;
+    }
+
+    if (where != DSK_HIT_CLIENT) {
+        f->pressed = false;
         return false;
     }
     const dsk_rect_t b = bar_rect(w);
@@ -657,9 +835,34 @@ static bool folder_pointer(dsk_win_t *w, dsk_hit_t where, int16_t x, int16_t y,
     if (!dsk_rect_has(l, x, y)) {
         return true;
     }
+
+    /*
+     * Every press in the list is a possible band EXCEPT one on the row
+     * that is already picked, which is where dragging a file out of the
+     * window begins.  Both cannot be armed at once: the file drag takes
+     * the release for its drop, so a band armed beside it would never be
+     * told to stop and would stay drawn on the glass.
+     *
+     * Requiring empty space instead would have been simpler and wrong - a
+     * full window has none, and the gesture has to work in the windows
+     * people actually have.
+     */
     const int row = (y - l.y) / ROW_H;
+    f->pressed = !dsk_folder_on_sel(w, x, y);
+    f->band = false;
+    f->ax = x;
+    f->ay = y;
+    f->bx = x;
+    f->by = y;
     const int at = f->top + row;
     if (at < 0 || at >= f->n) {
+        /*
+         * Below the last row: no row to select, but the press still arms
+         * the band, which is where the gesture usually starts.
+         */
+        if (f->marked != 0) {
+            dsk_folder_mark(w, -1, DSK_MARK_NONE);
+        }
         return true;
     }
     /*

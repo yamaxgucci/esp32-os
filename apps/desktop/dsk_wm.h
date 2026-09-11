@@ -64,8 +64,18 @@ typedef struct {
     /* True when the event was used up.  NULL means "not interested". */
     bool (*key)(dsk_win_t *w, uint16_t keycode, uint32_t unicode,
                 uint16_t mods);
+    /*
+     * `type` rather than a "was it a press" flag.
+     *
+     * It used to be a bool, and a window could not tell a move from a
+     * release: both arrived as false.  That is enough for a handler that
+     * only cares about presses and useless for any gesture with a
+     * beginning and an end - a rubber band drawn with the button held has
+     * to know when the button is let go, and the buttons byte does not say
+     * (a virtual mouse reports zero throughout a move).
+     */
     bool (*pointer)(dsk_win_t *w, dsk_hit_t where, int16_t x, int16_t y,
-                    uint8_t buttons, bool down, bool dbl);
+                    uint8_t buttons, dsk_ptr_t type, bool dbl);
     /* Last chance to free anything hung off `user`. */
     void (*closed)(dsk_win_t *w);
 } dsk_win_ops_t;

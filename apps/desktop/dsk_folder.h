@@ -82,6 +82,29 @@ bool dsk_folder_marked_at(const dsk_win_t *w, int which, char *path,
                           bool *is_dir);
 
 /*
+ * Is this point on the row that is already picked?
+ *
+ * Which gesture a press begins depends on the answer: on the picked row it
+ * is the start of dragging that file somewhere, and anywhere else in the
+ * list it is the corner of a rubber band.  The two cannot both be armed -
+ * the drag eats the release that ends the band - and this is the question
+ * that separates them.
+ */
+bool dsk_folder_on_sel(const dsk_win_t *w, int16_t x, int16_t y);
+
+/*
+ * Did the press that just happened begin a rubber band?
+ *
+ * Asked by whoever else wants that press - the file drag, today.  The
+ * window is the one that knows: it took the press, it decided which
+ * gesture it was, and this is that decision rather than a second guess at
+ * it.  Guessing was tried and got it exactly backwards: the caller asked
+ * "was this the picked row?" AFTER the window had moved the selection onto
+ * the row under the press, so the answer was always yes.
+ */
+bool dsk_folder_band_armed(const dsk_win_t *w);
+
+/*
  * Open what is picked, the way Enter and a double-click do.
  *
  * For the context menu, whose first item has to be the obvious one: a finger

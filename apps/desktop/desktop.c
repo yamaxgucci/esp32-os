@@ -1335,6 +1335,18 @@ static void fdrag_arm(int16_t x, int16_t y)
         !dsk_folder_selected(w, NULL, 0, NULL, 0, NULL)) {
         return;
     }
+    /*
+     * And not when the window has already made that press the corner of a
+     * rubber band.  Both cannot run: the drop takes the release, and a
+     * band that never hears the release stays drawn on the glass with its
+     * marks half made - which is exactly what happened, silently, because
+     * this used to ask "was the press on the picked row?" AFTER the window
+     * had moved the picked row to be the one under the press.  It is the
+     * window's decision and the window is asked for it.
+     */
+    if (dsk_folder_band_armed(w)) {
+        return;
+    }
     s_fdrag.armed = true;
     s_fdrag.moved = false;
     s_fdrag.x0 = x;
@@ -2647,6 +2659,9 @@ static void on_pointer(dsk_ptr_t type, int16_t x, int16_t y, uint8_t buttons,
             return;
         }
         if (type == DSK_PTR_UP || (buttons & 1u) == 0) {
+            if (s_ptr_log) {
+                ag_printf("ptr    ended an icon drag\n");
+            }
             drag_icon_end();
             return;
         }
@@ -2654,6 +2669,9 @@ static void on_pointer(dsk_ptr_t type, int16_t x, int16_t y, uint8_t buttons,
 
     /* The menu is above everything else, so it is asked next. */
     if (dsk_menu_pointer(type, x, y)) {
+        if (s_ptr_log) {
+            ag_printf("ptr    taken by the menu\n");
+        }
         return;
     }
     /*
@@ -2663,6 +2681,9 @@ static void on_pointer(dsk_ptr_t type, int16_t x, int16_t y, uint8_t buttons,
      * turns out to be a click still reaches the row it was on.
      */
     if (fdrag_pointer(type, x, y, buttons)) {
+        if (s_ptr_log) {
+            ag_printf("ptr    taken by a file drag\n");
+        }
         return;
     }
     if (type == DSK_PTR_DOWN && (buttons & 2u) != 0) {
@@ -2671,6 +2692,9 @@ static void on_pointer(dsk_ptr_t type, int16_t x, int16_t y, uint8_t buttons,
         return;
     }
     if (dsk_wm_pointer(type, x, y, buttons, dbl)) {
+        if (s_ptr_log) {
+            ag_printf("ptr    taken by a window\n");
+        }
         if (type == DSK_PTR_DOWN && !dbl) {
             fdrag_arm(x, y);
             s_press.armed = true;
@@ -2689,10 +2713,16 @@ static void on_pointer(dsk_ptr_t type, int16_t x, int16_t y, uint8_t buttons,
     }
     /* Nothing wanted it: the click was on the desktop itself. */
     if (type == DSK_PTR_UP) {
+        if (s_ptr_log) {
+            ag_printf("ptr    nobody wanted the release\n");
+        }
         return;
     }
     if (type != DSK_PTR_DOWN) {
         return;
+    }
+    if (s_ptr_log) {
+        ag_printf("ptr    fell through to the desk\n");
     }
     const int d = drive_at(x, y);
     if (dbl) {
