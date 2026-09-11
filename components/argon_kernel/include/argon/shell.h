@@ -32,6 +32,9 @@ void ag_shell_run(void);
  */
 ag_err_t ag_shell_start_in_slot(int slot);
 
+/* The same, starting in a directory rather than at the root. */
+ag_err_t ag_shell_start_in_slot_at(int slot, const char *cwd);
+
 /* Executes one command line, as if it had been typed.  Returns the exit code. */
 int ag_shell_execute(const char *line);
 

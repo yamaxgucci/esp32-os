@@ -141,6 +141,9 @@ static shell_ctx_t *sh(void)
 #define s_prompt       (sh()->prompt)
 #define s_prompt_pos   (sh()->pos)
 
+/* Which slot this prompt belongs to; defined below. */
+static int my_slot(void);
+
 #define AG_SHELL_SCRIPT_MAX_DEPTH 8
 
 /* Defined below; used by run/call before the body. */
@@ -219,13 +222,28 @@ ag_err_t ag_shell_set_cwd(const char *path)
         return -AG_ERANGE;
     }
     strcpy(s_cwd, path);
-    (void)ag_session_set_cwd(ag_session_focused(), path);
+    (void)ag_session_set_cwd(my_slot(), path);
     return AG_OK;
+}
+
+/*
+ * Which session slot this prompt's directory belongs to.
+ *
+ * The original prompt serves whoever is in front and follows the
+ * focus; a prompt of its own belongs to one slot and must not be
+ * dragged about by somebody else's Alt+digit.
+ */
+static int my_slot(void)
+{
+    const shell_ctx_t *c = sh();
+
+    return (c->slot == AG_SESSION_FOLLOW) ? ag_session_focused()
+                                          : c->slot;
 }
 
 static void sync_cwd_from_session(void)
 {
-    const char *cwd = ag_session_cwd(ag_session_focused());
+    const char *cwd = ag_session_cwd(my_slot());
     if (cwd != NULL && cwd[0] == '/') {
         strncpy(s_cwd, cwd, sizeof(s_cwd) - 1);
         s_cwd[sizeof(s_cwd) - 1] = '\0';
@@ -781,11 +799,12 @@ static int date_set(int argc, char **argv)
 static int cmd_prompt(int argc, char **argv)
 {
     if (argc < 2) {
-        ag_console_puts("prompt <slot>   (2..4)\n");
+        ag_console_puts("prompt <slot> [dir]   (slot 2..4)\n");
         return 1;
     }
     const int slot = atoi(argv[1]) - 1;
-    const ag_err_t err = ag_shell_start_in_slot(slot);
+    const ag_err_t err =
+        ag_shell_start_in_slot_at(slot, (argc > 2) ? argv[2] : NULL);
     if (err == -AG_EEXIST) {
         ag_console_printf("slot %s already has its own prompt\n", argv[1]);
         return 1;
@@ -4636,14 +4655,28 @@ static int cmd_slots(int argc, char **argv)
     ag_session_info(slots);
     const int focused = ag_session_focused();
 
-    ag_console_puts("  slot  pid   prio     name\n");
+    ag_console_puts("  slot  pid   prio     name      directory\n");
     ag_console_printf("  sys%s  -     -        system\n",
                       focused == AG_SESSION_SYSTEM ? "*" : " ");
     for (int i = 0; i < AG_SESSION_SLOTS; i++) {
         const int shown = ag_session_display_number(i);
         if (slots[i].pid == AG_PID_KERNEL) {
-            ag_console_printf("  %d%s   -     -        shell\n", shown,
-                              focused == i ? "*" : " ");
+            /*
+             * And where that shell is standing.  Two prompts are only
+             * worth having if they can be in two places, so the
+             * listing that names them says which place each is in -
+             * the one thing about a second prompt that cannot be seen
+             * from the screen of the first.
+             */
+            char        dos[AG_PATH_MAX];
+            const char *at = ag_session_cwd(i);
+            if (at != NULL) {
+                ag_shell_dos_path(at, dos, sizeof(dos));
+                at = dos;
+            }
+            ag_console_printf("  %d%s   -     -        shell     %s\n", shown,
+                              focused == i ? "*" : " ",
+                              (at != NULL) ? at : "/");
         } else {
             ag_proc_prio_t pr = AG_PRIO_NORMAL;
             (void)ag_proc_get_priority(slots[i].pid, &pr);
@@ -5299,7 +5332,7 @@ static void shell_instance(void *arg)
     prompt_loop();
 }
 
-ag_err_t ag_shell_start_in_slot(int slot)
+ag_err_t ag_shell_start_in_slot_at(int slot, const char *cwd)
 {
     if (slot < 0 || slot >= AG_SESSION_SLOTS) {
         return -AG_EINVAL;
@@ -5314,8 +5347,24 @@ ag_err_t ag_shell_start_in_slot(int slot)
         return -AG_ENOMEM;
     }
     memset(c, 0, sizeof(*c));
-    strcpy(c->cwd, "/");
+    /*
+     * Where it starts.  A prompt that opens in the directory being
+     * worked in is worth a line of code: the alternative is that every
+     * window begins at the root and the first thing anybody types is a
+     * cd.
+     */
+    if (cwd == NULL || cwd[0] == '\0' ||
+        ag_path_resolve(cwd, "/", c->cwd, sizeof(c->cwd)) != AG_OK) {
+        strcpy(c->cwd, "/");
+    }
     c->slot = slot;
+    /*
+     * And told to the session, which is where a slot's directory
+     * actually lives - the context is a working copy that the prompt
+     * loop reads back from there every time round.  Setting only the
+     * copy loses it before the first prompt is drawn.
+     */
+    (void)ag_session_set_cwd(slot, c->cwd);
     s_ctx[slot] = c;
 
     /*
@@ -5333,6 +5382,11 @@ ag_err_t ag_shell_start_in_slot(int slot)
     }
     ag_log(AG_LOG_INFO, "shell", "a second prompt in slot %d", slot + 1);
     return AG_OK;
+}
+
+ag_err_t ag_shell_start_in_slot(int slot)
+{
+    return ag_shell_start_in_slot_at(slot, NULL);
 }
 
 void ag_shell_run(void)

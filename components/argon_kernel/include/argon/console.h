@@ -81,6 +81,20 @@ ag_err_t ag_console_resize(uint16_t cols, uint16_t rows);
  */
 ag_err_t ag_console_bind_task(int slot);
 
+/*
+ * Hand an event to the prompt living in a slot.
+ *
+ * A bound task reads only its own queue, so this is the only way anything
+ * reaches it - which is the point: the keyboard belongs to whoever is in
+ * front, and a window showing somebody else's prompt is how the keys get
+ * there.  False when that slot has no prompt of its own, or its queue is
+ * full.
+ */
+bool ag_console_post_to_slot(int slot, const ag_event_t *ev);
+
+/* A slot's own screen, or NULL when it is sharing the visible one. */
+const ag_screen_t *ag_console_screen_of_slot(int slot);
+
 ag_err_t ag_console_use_slot(int slot);
 
 /*

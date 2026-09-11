@@ -397,6 +397,56 @@ static void api_fill(uint16_t x, uint16_t y, uint16_t w, uint16_t h, char ch,
  * text with half of two different messages in it, which is the kind of thing
  * that gets blamed on the reader.
  */
+/*
+ * A row of another slot's screen.
+ *
+ * The permission is the same one api_peek_row asks for and it is asked for
+ * the same reason: the console belongs to the foreground, and a program
+ * that is not in front has no business reading what is on it.  What is
+ * different is WHICH screen - a slot with a prompt of its own has one
+ * nobody is looking at, and a window that draws it is the only way to see
+ * it.
+ */
+static int32_t api_peek_row_slot(int slot, uint16_t row, ag_textcell_t *cells,
+                                 uint16_t max)
+{
+    if (cells == NULL || max == 0) {
+        return -AG_EINVAL;
+    }
+    if (!has_console_focus()) {
+        return -AG_EPERM;
+    }
+
+    int32_t written = -AG_ENODEV;
+
+    ag_console_lock();
+    const ag_screen_t *sc = ag_console_screen_of_slot(slot);
+    if (sc != NULL && row < sc->rows) {
+        const ag_cell_t *src = ag_screen_row(sc, row);
+        if (src != NULL) {
+            uint16_t n = sc->cols;
+            if (n > max) {
+                n = max;
+            }
+            for (uint16_t i = 0; i < n; i++) {
+                cells[i].ch = (uint8_t)src[i].ch;
+                cells[i].attr = src[i].attr;
+            }
+            written = (int32_t)n;
+        }
+    }
+    ag_console_unlock();
+    return written;
+}
+
+static bool api_inp_post_to_slot(int slot, const ag_event_t *ev)
+{
+    if (ev == NULL || !has_console_focus()) {
+        return false;
+    }
+    return ag_console_post_to_slot(slot, ev);
+}
+
 static int32_t api_peek_row(uint16_t row, ag_textcell_t *cells, uint16_t max)
 {
     if (cells == NULL || max == 0) {
@@ -464,6 +514,7 @@ static const ag_con_api_t k_con = {
     .codepage = api_codepage,
     .set_codepage = api_set_codepage,
     .peek_row = api_peek_row,
+    .peek_row_slot = api_peek_row_slot,
 };
 
 /* ---------------------------------------------------------------------- */
@@ -772,6 +823,7 @@ static const ag_inp_api_t k_inp = {
     .btn = api_inp_btn,
     .btnp = api_inp_btnp,
     .inject = api_inp_inject,
+    .post_to_slot = api_inp_post_to_slot,
 };
 
 /* ---------------------------------------------------------------------- */

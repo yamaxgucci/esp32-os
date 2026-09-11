@@ -151,7 +151,7 @@ extern "C" {
  *      column and row by the cell size on the way in.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 44u
+#define AG_ABI_MINOR 45u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -500,6 +500,23 @@ typedef struct ag_con_api {
      * the console belongs to the foreground.
      */
     int32_t (*peek_row)(uint16_t row, ag_textcell_t *cells, uint16_t max);
+
+    /*
+     * The same, from the screen of a session slot that is not this one.
+     *
+     * For a window showing somebody else's prompt.  A slot with a shell of
+     * its own (`prompt 2`) has a screen of its own, and that screen is
+     * nowhere on the glass while a desktop is in front - reading it is the
+     * only way to draw it.
+     *
+     * Slots are numbered from zero here, as they are everywhere inside the
+     * system; the shell writes them from one because that is what the
+     * Alt+digit on the keyboard says.
+     */
+    /* ABI 0.45. */
+    int32_t (*peek_row_slot)(int slot, uint16_t row, ag_textcell_t *cells,
+                             uint16_t max);
+
 } ag_con_api_t;
 
 /* ------------------------------------------------------------------------ */
@@ -608,6 +625,21 @@ typedef struct ag_inp_api {
      * Returns false if the queue is full or the event type is refused.
      */
     bool (*inject)(const ag_event_t *ev);
+
+    /*
+     * Hand an event to the prompt living in a session slot.
+     *
+     * There is one keyboard and it belongs to whoever is in front, so a
+     * prompt behind a window never reads a character on its own: the
+     * window in front reads them and passes them along.  That is the
+     * whole of how a shell can live in a window while a desktop holds
+     * the screen.
+     *
+     * False when that slot has no prompt of its own, or its queue is
+     * full.
+     */
+    /* ABI 0.45. */
+    bool (*post_to_slot)(int slot, const ag_event_t *ev);
 } ag_inp_api_t;
 
 /* ------------------------------------------------------------------------ */

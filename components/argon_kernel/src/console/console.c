@@ -120,9 +120,24 @@ static int                s_active; /* index into s_screens */
 #define CON_BINDS AG_SESSION_SLOTS
 
 static struct {
-    ag_port_task_t task;
-    int            index;
+    ag_port_task_t  task;
+    int             index;
+    /*
+     * And where its keys come from.
+     *
+     * Output was the easy half: a bound task writes to its own screen and
+     * the visible one is unaffected.  Input is the half that decides
+     * whether a prompt can live in a window at all - there is one
+     * keyboard, it belongs to whoever is in front, and a prompt behind a
+     * desktop would otherwise never read a character.  So a bound task
+     * reads from a queue of its own, and whoever is in front puts things
+     * there on its behalf.
+     */
+    ag_port_queue_t q;
 } s_bind[CON_BINDS];
+
+/* Deep enough for a held key to arrive faster than a prompt reads it. */
+#define CON_SLOT_QUEUE 16
 static ag_con_endpoint_t  s_endpoints[AG_CON_MAX_ENDPOINTS];
 static ag_port_mutex_t         s_lock;
 static ag_port_queue_t s_events;
@@ -169,7 +184,25 @@ void *ag_console_lock_holder(void)
     return (void *)ag_port_mutex_holder(s_lock);
 }
 
+/* AG_SESSION_SYSTEM is index 0; user slots 0..3 are 1..4.  Defined below. */
+static int screen_index(int slot);
+
 ag_screen_t *ag_console_screen(void) { return &s_screens[s_active]; }
+
+/*
+ * The screen belonging to a slot, or NULL when that slot has never had one
+ * of its own - in which case it is sharing the visible screen and there is
+ * nothing separate to look at.
+ */
+const ag_screen_t *ag_console_screen_of_slot(int slot)
+{
+    const int want = screen_index(slot);
+
+    if (want < 0 || !s_screen_up[want]) {
+        return NULL;
+    }
+    return &s_screens[want];
+}
 
 /*
  * Give a slot its own screen if it has not got one, at the size the console
@@ -202,17 +235,25 @@ static ag_err_t ensure_screen(int want)
     return AG_OK;
 }
 
-/* The screen the CALLING task writes to: its own, or the visible one. */
-static ag_screen_t *write_screen(void)
+/* The bound entry of the CALLING task, or NULL when it has none. */
+static int bind_of_self(void)
 {
     const ag_port_task_t me = ag_port_task_self();
 
     for (int i = 0; i < CON_BINDS; i++) {
         if (s_bind[i].task == me) {
-            return &s_screens[s_bind[i].index];
+            return i;
         }
     }
-    return &s_screens[s_active];
+    return -1;
+}
+
+/* The screen the CALLING task writes to: its own, or the visible one. */
+static ag_screen_t *write_screen(void)
+{
+    const int b = bind_of_self();
+
+    return (b >= 0) ? &s_screens[s_bind[b].index] : &s_screens[s_active];
 }
 
 /* AG_SESSION_SYSTEM is index 0; user slots 0..3 are 1..4. */
@@ -286,6 +327,14 @@ ag_err_t ag_console_bind_task(int slot)
 
     for (int i = 0; i < CON_BINDS; i++) {
         if (s_bind[i].task == NULL) {
+            if (s_bind[i].q == NULL) {
+                s_bind[i].q = ag_port_queue_new(CON_SLOT_QUEUE,
+                                                   sizeof(ag_event_t));
+                if (s_bind[i].q == NULL) {
+                    ag_console_unlock();
+                    return -AG_ENOMEM;
+                }
+            }
             s_bind[i].task = me;
             s_bind[i].index = want;
             ag_console_unlock();
@@ -684,7 +733,34 @@ bool ag_console_read_event(ag_event_t *ev, uint32_t timeout_ms)
     const ag_port_ticks_t ticks = (timeout_ms == UINT32_MAX)
                                  ? AG_PORT_FOREVER
                                  : ag_port_ms_to_ticks(timeout_ms);
+
+    /*
+     * A bound task reads its own queue and nothing else - not even when
+     * its slot is the one in front.  Two readers of one queue do not take
+     * turns, they take a character each, and that is a bug you can type.
+     * Whoever is in front feeds it with ag_console_post_to_slot.
+     */
+    const int b = bind_of_self();
+    if (b >= 0) {
+        return ag_port_queue_recv(s_bind[b].q, ev, ticks);
+    }
     return ag_port_queue_recv(s_events, ev, ticks);
+}
+
+bool ag_console_post_to_slot(int slot, const ag_event_t *ev)
+{
+    if (!s_ready || ev == NULL) {
+        return false;
+    }
+
+    const int want = screen_index(slot);
+    for (int i = 0; i < CON_BINDS; i++) {
+        if (s_bind[i].task != NULL && s_bind[i].index == want &&
+            s_bind[i].q != NULL) {
+            return ag_port_queue_send(s_bind[i].q, ev, 0);
+        }
+    }
+    return false; /* nothing is listening there */
 }
 
 bool ag_console_key_pressed(uint16_t keycode)
