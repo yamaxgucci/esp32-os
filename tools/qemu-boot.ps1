@@ -198,6 +198,29 @@ $qemuOut = 'build\qemu-emulator.log'
 $proc = Start-Process -FilePath $qemu -ArgumentList $qemuArgs -NoNewWindow `
     -PassThru -RedirectStandardOutput $qemuOut -RedirectStandardError "$qemuOut.err"
 
+# A forward that could not be set up is said once, quietly, to that file.
+#
+# The emulator does not fail when a hostfwd port is taken - it warns and runs
+# on without it, and the port it is usually missing is the one the virtual
+# mouse is reached through.  What that looks like from here is a driver that
+# never came up: sixty seconds of waiting, a gesture played into nothing and
+# half a dozen unrelated failures downstream.  It was read as somebody else's
+# emulator twice and as a shell bug once before the line below was written.
+#
+# A leftover emulator is the usual reason, and this file kills those a few
+# lines above - but killing is not releasing, and the ports come free a
+# moment later than the process goes away.
+Start-Sleep -Milliseconds 700
+if (Test-Path "$qemuOut.err") {
+    $fwd = Select-String -Path "$qemuOut.err" -Pattern 'host forwarding' `
+        -SimpleMatch -ErrorAction SilentlyContinue
+    if ($fwd) {
+        throw ("the emulator could not set up a forwarded port, so the " +
+               "run would look like a dead driver: " +
+               $fwd[0].Line.Trim())
+    }
+}
+
 # With graphics, the window has to be up before the guest chooses its mode.
 #
 # SDL creates it at 800x600 and resizes when the RGB panel appears; a window
