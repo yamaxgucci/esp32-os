@@ -110,6 +110,18 @@ bool dsk_folder_in_list(const dsk_win_t *w, int16_t x, int16_t y);
 bool dsk_folder_band_armed(const dsk_win_t *w);
 
 /*
+ * How many rubber bands have been drawn, and how many rows the last one
+ * left marked.
+ *
+ * Counted rather than printed as it happens, because on a board nobody
+ * can read what is printed as it happens: while an application owns the
+ * screen its output goes to its own slot's console, which is neither the
+ * serial line nor the journal.  A counter read on the way out is the
+ * only instrument that survives the trip.
+ */
+void dsk_folder_band_stats(uint32_t *bands, uint32_t *last_marks);
+
+/*
  * The window currently drawing a rubber band, or NULL.
  *
  * A band owns the pointer until the button comes up, for the same reason

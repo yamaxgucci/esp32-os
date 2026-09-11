@@ -1328,6 +1328,8 @@ static void fdrag_cancel(void)
     s_fdrag.armed = false;
 }
 
+static uint32_t s_fdrag_arms; /* file drags armed, for the board's sake */
+
 static void fdrag_arm(int16_t x, int16_t y)
 {
     dsk_win_t *w = dsk_wm_active();
@@ -1358,6 +1360,7 @@ static void fdrag_arm(int16_t x, int16_t y)
     if (!dsk_folder_in_list(w, x, y) || dsk_folder_band_armed(w)) {
         return;
     }
+    s_fdrag_arms++;
     s_fdrag.armed = true;
     s_fdrag.moved = false;
     s_fdrag.x0 = x;
@@ -1399,6 +1402,12 @@ static bool fdrag_pointer(dsk_ptr_t type, int16_t x, int16_t y,
                                                       : s_fdrag.y0 - y);
         if (!s_fdrag.moved && (dx > DBL_PX || dy > DBL_PX)) {
             s_fdrag.moved = true;
+            /*
+             * And say it with the pointer, not only in the strip: a hand
+             * on a touchscreen is over the screen, and the one place it
+             * is certainly looking is where it is pointing.
+             */
+            dsk_cursor_shape(DSK_CUR_DRAG);
             s_note = "drop it on a folder to copy";
             damage(s_m.statusbar);
         }
@@ -1411,6 +1420,9 @@ static bool fdrag_pointer(dsk_ptr_t type, int16_t x, int16_t y,
     const bool dropped = s_fdrag.moved;
     s_fdrag.armed = false;
     s_fdrag.moved = false;
+    if (dropped) {
+        dsk_cursor_shape(DSK_CUR_ARROW);
+    }
     if (!dropped) {
         return false;
     }
@@ -3376,6 +3388,20 @@ int ag_main(int argc, char **argv)
     ag_printf("desktop: %u windows, %u reflushes, %u moves coalesced\n",
               (unsigned)dsk_wm_count(), (unsigned)s_reflushes,
               (unsigned)s_moves_dropped);
+    /*
+     * The gestures, counted.
+     *
+     * Nothing printed while the shell is running can be read on a board:
+     * its output goes to its own slot's console, which is neither the
+     * serial line nor the journal.  So the only way to ask "did that
+     * gesture happen at all" is to count it and read the count on the
+     * way out.
+     */
+    uint32_t bands = 0, band_marks = 0;
+    dsk_folder_band_stats(&bands, &band_marks);
+    ag_printf("desktop: %u bands (last marked %u), %u file drags\n",
+              (unsigned)bands, (unsigned)band_marks,
+              (unsigned)s_fdrag_arms);
 
     /*
      * Last, and after the counters have been printed: the counters are what a

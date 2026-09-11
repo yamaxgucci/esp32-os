@@ -25,6 +25,16 @@
 typedef enum {
     DSK_CUR_ARROW = 0,
     DSK_CUR_WAIT,
+    /*
+     * Carrying files.
+     *
+     * A drag on this machine had no picture at all: the pointer looked
+     * exactly as it does when nothing is happening, and the only sign
+     * was a line in the status strip that a hand covering the screen is
+     * not looking at.  The arrow keeps its tip - it is still what the
+     * drop lands under - and grows a page beside it.
+     */
+    DSK_CUR_DRAG,
     DSK_CUR_COUNT,
 } dsk_cursor_id_t;
 

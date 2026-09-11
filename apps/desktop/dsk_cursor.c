@@ -30,6 +30,23 @@ static const char *const k_wait[DSK_CUR_H] = {
     "................",
 };
 
+/*
+ * The arrow, with a sheet of paper under its tail.
+ *
+ * Drawn as a page rather than as a copy of the file's own icon: the icon
+ * is 32x32 and this square is 16, and a shrunk icon at this size is a
+ * smudge.  A page says "something is being carried" and the status strip
+ * says what.
+ */
+static const char *const k_drag[DSK_CUR_H] = {
+    "B...............", "BB..............", "BWB.............",
+    "BWWB............", "BWWWB...........", "BWWWWB..........",
+    "BWWWWWB.........", "BWWWWWWB........", "BWWWWWWWB.......",
+    "BWWWWWWWWB......", "BWWWWWBBBBB.....", "BWWBWWB.BBBBBB..",
+    "BWB.BWWB.BWWWWB.", "BB...BWWB.BWWWWB", "B.....BWWB.BWWWB",
+    ".......BB..BBBBB",
+};
+
 typedef struct {
     uint16_t opaque[DSK_CUR_H];
     uint16_t white[DSK_CUR_H];
@@ -76,6 +93,7 @@ void dsk_cursor_init(int16_t screen_w, int16_t screen_h,
     unpack(&s_shape[DSK_CUR_ARROW], k_arrow, 0, 0);
     /* The hourglass points at its middle; the arrow at its tip. */
     unpack(&s_shape[DSK_CUR_WAIT], k_wait, 7, 7);
+    unpack(&s_shape[DSK_CUR_DRAG], k_drag, 0, 0);
     s_screen_w = screen_w;
     s_screen_h = screen_h;
     s_id = DSK_CUR_ARROW;

@@ -109,6 +109,26 @@ AG_DRV("XPT2046", "0.2", "argon");
 #define JUMP_PX 12
 
 /*
+ * How long a contact that is MOVING may go quiet before it has ended.
+ *
+ * A resting stylus keeps a steady pressure; a moving one does not - it
+ * rolls onto its edge, the hand unloads it through a change of direction,
+ * and the reading dips below any threshold for a few tens of
+ * milliseconds.  Sixty of them is not enough: one drag across a list came
+ * out of this driver as FOUR separate touches, which the shell above duly
+ * read as four separate gestures, each one starting by selecting the row
+ * under it and throwing away what the last had marked.
+ *
+ * A quarter of a second while moving, and the ordinary sixty while not.
+ * The distinction matters and it is not cosmetic: the short settle is
+ * what keeps a double tap two taps, and a double tap does not move.  A
+ * contact that has travelled past the threshold below is a drag, and a
+ * drag has no double to protect.
+ */
+#define UP_SETTLE_DRAG_MS 250u
+#define TRAVEL_PX         8
+
+/*
  * Raw readings at the edges of the glass.  A resistive panel is a pair of
  * potentiometers and these are where its ends are; they vary between panels of
  * the same model, so they are a starting point rather than a fact.  Anything
@@ -178,6 +198,21 @@ static struct {
     uint32_t quiet_at; /* when the current dry spell started               */
     uint32_t said_at;  /* last time this was written down                  */
     uint32_t asleep;   /* windows in a row where the glass was untouched   */
+    uint32_t ended;    /* touches that ended: one per finger, if all is well */
+    uint32_t jumped;   /* ...of those, ended because the contact moved away  */
+    /*
+     * What the glass actually reads while somebody is drawing on it.
+     *
+     * Both thresholds in this file were picked by eye and then halved
+     * when they turned out to be wrong, which is how a drag came out as
+     * four touches.  Four counters say where the readings really fall,
+     * so the next number can be chosen instead of guessed: nothing,
+     * under fifty, under the held threshold, and above it.
+     */
+    uint32_t z_none;
+    uint32_t z_lo;
+    uint32_t z_mid;
+    uint32_t z_ok;
 } s_tally;
 
 static void tally_tick(bool produced)
@@ -225,10 +260,15 @@ static void tally_tick(bool produced)
 
     ag_log(AG_LOG_INFO, "XPT2046",
            "polls %u: no pen %u, flaky %u, weak %u, still %u, sent %u; "
+           "%u touch(es) ended, %u of them by a jump; "
+           "pressure 0/%u <50/%u <held/%u ok/%u; "
            "longest silence %u ms; %u quiet window(s) before this",
            (unsigned)s_tally.polls, (unsigned)s_tally.no_pen,
            (unsigned)s_tally.flaky, (unsigned)s_tally.weak,
            (unsigned)s_tally.still, (unsigned)s_tally.sent,
+           (unsigned)s_tally.ended, (unsigned)s_tally.jumped,
+           (unsigned)s_tally.z_none, (unsigned)s_tally.z_lo,
+           (unsigned)s_tally.z_mid, (unsigned)s_tally.z_ok,
            (unsigned)s_tally.worst, (unsigned)s_tally.asleep);
     s_tally.said_at = now;
     s_tally.asleep = 0;
@@ -238,6 +278,12 @@ static void tally_tick(bool produced)
     s_tally.weak = 0;
     s_tally.still = 0;
     s_tally.sent = 0;
+    s_tally.ended = 0;
+    s_tally.jumped = 0;
+    s_tally.z_none = 0;
+    s_tally.z_lo = 0;
+    s_tally.z_mid = 0;
+    s_tally.z_ok = 0;
     s_tally.worst = 0;
 }
 
@@ -249,6 +295,18 @@ static struct {
 
 /* When the glass first went quiet under a pen we still believe is down. */
 static uint32_t s_up_since;
+
+/* Where the current contact started, so a drag can be told from a tap. */
+static int16_t s_down_x, s_down_y;
+
+static bool travelled(void)
+{
+    const int dx = (s_state.col > s_down_x) ? s_state.col - s_down_x
+                                            : s_down_x - s_state.col;
+    const int dy = (s_state.row > s_down_y) ? s_state.row - s_down_y
+                                            : s_down_y - s_state.row;
+    return dx > TRAVEL_PX || dy > TRAVEL_PX;
+}
 
 /* ---- the wire ---------------------------------------------------------- */
 
@@ -410,8 +468,18 @@ static int32_t touch_poll(ag_handle_t h, ag_event_t *out, uint32_t max)
     const uint16_t ry = read3(CMD_Y);
     s_state.samples++;
 
-    const bool pressed =
-        pressure(rx, z1, z2) >= (s_state.down ? Z_MIN_HELD : Z_MIN);
+    const uint16_t z = pressure(rx, z1, z2);
+    const bool     pressed = z >= (s_state.down ? Z_MIN_HELD : Z_MIN);
+
+    if (z == 0u) {
+        s_tally.z_none++;
+    } else if (z < 50u) {
+        s_tally.z_lo++;
+    } else if (z < Z_MIN_HELD) {
+        s_tally.z_mid++;
+    } else {
+        s_tally.z_ok++;
+    }
 
     if (!line && pressed) {
         s_tally.flaky++; /* the wire lied and the glass put it right */
@@ -440,6 +508,8 @@ static int32_t touch_poll(ag_handle_t h, ag_event_t *out, uint32_t max)
             if (dx > JUMP_PX || dy > JUMP_PX) {
                 s_up_since = 0u;
                 s_state.down = false;
+                s_tally.ended++;
+                s_tally.jumped++;
                 out[0].type = AG_EV_POINTER_UP;
                 out[0].ptr.x = s_state.col;
                 out[0].ptr.y = s_state.row;
@@ -462,7 +532,9 @@ static int32_t touch_poll(ag_handle_t h, ag_event_t *out, uint32_t max)
         if (s_up_since == 0u) {
             s_up_since = now;
         }
-        if (now - s_up_since < UP_SETTLE_MS) {
+        const uint32_t settle =
+            travelled() ? UP_SETTLE_DRAG_MS : UP_SETTLE_MS;
+        if (now - s_up_since < settle) {
             s_tally.weak++;
             tally_tick(false);
             return 0;
@@ -474,6 +546,7 @@ static int32_t touch_poll(ag_handle_t h, ag_event_t *out, uint32_t max)
         out[0].ptr.y = s_state.row;
         out[0].ptr.buttons = 0;
         s_tally.sent++;
+        s_tally.ended++;
         tally_tick(true);
         return 1;
     }
@@ -521,6 +594,9 @@ static int32_t touch_poll(ag_handle_t h, ag_event_t *out, uint32_t max)
 
     if (!s_state.down) {
         s_state.down = true;
+        /* Where this contact began, for the settle above. */
+        s_down_x = col;
+        s_down_y = row;
         out[0].type = AG_EV_POINTER_DOWN;
     } else if (moved) {
         out[0].type = AG_EV_POINTER_MOVE;

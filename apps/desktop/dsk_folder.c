@@ -77,6 +77,15 @@ typedef struct {
     int16_t  ax, ay; /* the anchor */
     int16_t  bx, by; /* where the pointer is now */
     bool     pressed;
+    /*
+     * A press that landed on something already picked out, which is how
+     * dragging a set of files begins.  Kept apart from `pressed` because
+     * the two lead opposite ways: one may become a band, the other must
+     * not, and the file drag asks which it was.
+     */
+    bool     picked;
+    bool     picked_moved;
+    int      picked_row;
 } folder_t;
 
 /*
@@ -88,6 +97,19 @@ typedef struct {
  * would flicker a selection rectangle over the whole shell.
  */
 #define BAND_SLOP 5
+
+static uint32_t s_bands;      /* rectangles that got as far as being drawn */
+static uint32_t s_band_marks; /* rows the last one left marked            */
+
+void dsk_folder_band_stats(uint32_t *bands, uint32_t *last_marks)
+{
+    if (bands != NULL) {
+        *bands = s_bands;
+    }
+    if (last_marks != NULL) {
+        *last_marks = s_band_marks;
+    }
+}
 
 #define FOLDER_MAX 8
 static folder_t s_folders[FOLDER_MAX];
@@ -625,6 +647,25 @@ static void band_marks(dsk_win_t *w, folder_t *f)
         f->entries[at].marked = true;
         f->marked++;
     }
+
+    /*
+     * And the cursor follows the hand, inside what has been marked.
+     *
+     * The cursor is drawn as a black frame whenever anything is marked,
+     * which is how a marked row under the cursor manages to be both at
+     * once.  A band left the cursor wherever it had been - usually
+     * outside the selection - so a black rectangle sat around an
+     * otherwise ordinary white row, aligned to it and belonging to
+     * nothing the person had done.  Maxim took it for a leftover of the
+     * rectangle, which is exactly what it looks like.
+     *
+     * The row under the moving end of the band is always one the band
+     * has marked, and it is where the hand is.
+     */
+    const int at_end = f->top + (f->by - l.y) / ROW_H;
+    if (at_end >= 0 && at_end < f->n && f->entries[at_end].marked) {
+        f->sel = at_end;
+    }
 }
 
 static void draw_folder(dsk_win_t *w, dsk_rect_t client)
@@ -665,9 +706,24 @@ static void draw_folder(dsk_win_t *w, dsk_rect_t client)
         if (lit) {
             dsk_fill(r, DSK_NAVY);
         }
-        if (cursor && f->marked != 0) {
-            /* Where the two differ, the cursor is a frame and the mark is a
-             * fill, so a marked row under the cursor is still both. */
+        /*
+         * The cursor is drawn only where it says something the marks do
+         * not: on a row that is NOT marked while others are.
+         *
+         * It used to be drawn on the marked row as well, "so a marked row
+         * under the cursor is still both".  That is true and it is not
+         * worth what it looks like: a rectangle around a sixteen-pixel
+         * row is two horizontal lines, and two horizontal lines across a
+         * full-width row read as rules under the selection, not as a
+         * cursor.  Black, white, flush, inset - Maxim reported each of
+         * those in turn as a stray stripe, and each time it was this.
+         *
+         * Nothing is lost.  A marked row under the cursor is already
+         * marked, which is what any operation will act on; the cursor
+         * only has to be visible when it has wandered off the selection,
+         * and that is exactly when it still is.
+         */
+        if (cursor && f->marked != 0 && !e->marked) {
             dsk_frame(r, DSK_BLACK);
         }
         if (e->art >= 0) {
@@ -801,6 +857,38 @@ static bool folder_pointer(dsk_win_t *w, dsk_hit_t where, int16_t x, int16_t y,
      * the rectangle has to come off the screen.
      */
     if (!down) {
+        /*
+         * A press that began on something already picked out.
+         *
+         * Held and dragged, it is the file drag, and every event here
+         * belongs to that - this handler only watches.  Released without
+         * having gone anywhere, it was a tap, and a tap on one of several
+         * picked rows means "just this one": the marks are kept through
+         * the press so the drag can have them, and dropped here when it
+         * turns out there was no drag.
+         */
+        if (f->picked) {
+            if (type == DSK_PTR_MOVE) {
+                const int16_t dx =
+                    (int16_t)((x > f->ax) ? x - f->ax : f->ax - x);
+                const int16_t dy =
+                    (int16_t)((y > f->ay) ? y - f->ay : f->ay - y);
+                if (dx > BAND_SLOP || dy > BAND_SLOP) {
+                    f->picked_moved = true;
+                }
+                return false;
+            }
+            if (!f->picked_moved && f->picked_row >= 0 &&
+                f->picked_row < f->n) {
+                if (f->marked != 0) {
+                    dsk_folder_mark(w, -1, DSK_MARK_NONE);
+                }
+                f->sel = f->picked_row;
+                dsk_wm_damage_rect(dsk_wm_client(w));
+            }
+            f->picked = false;
+            return false;
+        }
         if (!f->pressed) {
             return false;
         }
@@ -814,6 +902,7 @@ static bool folder_pointer(dsk_win_t *w, dsk_hit_t where, int16_t x, int16_t y,
             f->pressed = false;
             f->band = false;
             if (was) {
+                s_band_marks = (uint32_t)f->marked;
                 dsk_wm_damage_rect(dsk_wm_client(w));
                 /*
                  * Said out loud, because a scripted run cannot see a
@@ -834,6 +923,7 @@ static bool folder_pointer(dsk_win_t *w, dsk_hit_t where, int16_t x, int16_t y,
                 return false; /* still a click, as far as anyone knows */
             }
             f->band = true;
+            s_bands++;
         }
 
         /*
@@ -841,7 +931,6 @@ static bool folder_pointer(dsk_win_t *w, dsk_hit_t where, int16_t x, int16_t y,
          * status strip would paint on them and be rubbed out by their next
          * repaint, and the rows it selects are in here anyway.
          */
-        const dsk_rect_t before = band_rect(f);
         f->bx = x;
         f->by = y;
         if (f->bx < l.x) {
@@ -859,21 +948,24 @@ static bool folder_pointer(dsk_win_t *w, dsk_hit_t where, int16_t x, int16_t y,
         band_marks(w, f);
 
         /*
-         * Repainted across the whole width of the list, not just where the
-         * rectangle is.
+         * The whole list is repainted on every step of the band.
          *
-         * A highlight is a full-width thing and the band is whatever shape
-         * the hand drew.  Dragged straight down, the band is a sliver two
-         * pixels wide: the rows inside it were duly marked and only those
-         * two pixels of each were repainted, so on the glass nothing
-         * appeared to be selected at all.  Maxim saw it once and it is the
-         * same rectangle either way - the strips that carry it are as tall
-         * as the band, and their width costs nothing next to their number.
+         * Not because it is cheap - it is a third of this screen - but
+         * because the exact answer has been wrong twice and I could not
+         * prove the third version right.  A row is marked when the band
+         * touches any part of it, the band's edges stop wherever the hand
+         * is, and the difference between "the rectangle moved" and "these
+         * rows changed colour" is where both bugs lived: first a sliver
+         * two pixels wide that marked rows and repainted none of them,
+         * then a fragment of the rectangle left on the glass that I still
+         * cannot account for by reading the arithmetic.
+         *
+         * The list is small, the moves are coalesced to one a paint, and
+         * a repaint of it costs about two milliseconds on the slowest
+         * board here.  That is the price of not having to be clever, and
+         * it is worth paying until somebody can explain the leftover.
          */
-        dsk_rect_t hurt = dsk_rect_union(before, band_rect(f));
-        hurt.x = l.x;
-        hurt.w = l.w;
-        dsk_wm_damage_rect(hurt);
+        dsk_wm_damage_rect(l);
         return true;
     }
 
@@ -915,13 +1007,36 @@ static bool folder_pointer(dsk_win_t *w, dsk_hit_t where, int16_t x, int16_t y,
      * people actually have.
      */
     const int row = (y - l.y) / ROW_H;
-    f->pressed = !dsk_folder_on_sel(w, x, y);
+    const int at = f->top + row;
+
+    /*
+     * Is this press on something already picked out?
+     *
+     * Marked rows first, and the cursor row only when nothing is marked -
+     * which is the same rule the drawing uses, so what looks picked out
+     * is what counts as picked out.  A press there is the beginning of
+     * dragging those files somewhere and must leave them exactly as they
+     * are; a press anywhere else is the corner of a rubber band.
+     *
+     * It was the cursor row alone before, and that made dragging a
+     * marked set impossible: the marks were made by a band, the cursor
+     * was wherever it had been, so the press landed on a marked row that
+     * was not the cursor, counted as a band, and threw the marks away
+     * before the hand had moved.
+     */
+    const bool on_picked = (at >= 0 && at < f->n) &&
+                           (f->entries[at].marked ||
+                            (f->marked == 0 && at == f->sel));
+
+    f->pressed = !on_picked;
+    f->picked = on_picked;
+    f->picked_moved = false;
+    f->picked_row = at;
     f->band = false;
     f->ax = x;
     f->ay = y;
     f->bx = x;
     f->by = y;
-    const int at = f->top + row;
     if (at < 0 || at >= f->n) {
         /*
          * Below the last row: no row to select, but the press still arms
@@ -944,12 +1059,14 @@ static bool folder_pointer(dsk_win_t *w, dsk_hit_t where, int16_t x, int16_t y,
      * context menu, and neither of those needs two devices at once - which
      * on the board is just as well, since it has no keyboard at all.
      */
-    if (f->marked != 0 && !dbl) {
-        dsk_folder_mark(w, -1, DSK_MARK_NONE);
-    }
-    if (f->sel != at) {
-        f->sel = at;
-        dsk_wm_damage_rect(dsk_wm_client(w));
+    if (!on_picked) {
+        if (f->marked != 0 && !dbl) {
+            dsk_folder_mark(w, -1, DSK_MARK_NONE);
+        }
+        if (f->sel != at) {
+            f->sel = at;
+            dsk_wm_damage_rect(dsk_wm_client(w));
+        }
     }
     if (dbl) {
         activate(w, at);
@@ -1266,6 +1383,9 @@ dsk_win_t *dsk_folder_open(const char *path)
      */
     f->band = false;
     f->pressed = false;
+    f->picked = false;
+    f->picked_moved = false;
+    f->picked_row = -1;
     f->ax = f->ay = f->bx = f->by = 0;
     ag_strlcpy(f->path, path, sizeof(f->path));
 
