@@ -118,8 +118,26 @@ AG_DRV("XPT2046", "0.2", "argon");
 #define RAW_MIN 300
 #define RAW_MAX 3800
 
-/* Below this the glass is not being pressed hard enough to trust. */
-#define Z_MIN 200
+/*
+ * Below this the glass is not being pressed hard enough to trust - and
+ * "this" is two numbers, because starting a touch and continuing one are
+ * different questions.
+ *
+ * Starting one has to be sure: a resistive panel reads a little pressure
+ * from a knock on the desk, and a stroke that begins where nobody put a
+ * finger is worse than one that begins late.
+ *
+ * Continuing one does not.  The contact is established, the finger is
+ * visibly still on the glass, and the pressure a hand applies while MOVING
+ * is lower than the pressure it applied to land - the stylus rolls onto its
+ * edge, the arm takes some of the weight back.  Holding the landing
+ * threshold throughout is what dropped 63 of 300 polls in the middle of a
+ * stroke and left the pointer standing still for 80 ms at a time while
+ * Maxim was drawing.  Those polls read the glass correctly; they were
+ * thrown away by this number alone.
+ */
+#define Z_MIN      200
+#define Z_MIN_HELD 90
 
 /* Start bit, channel, 12-bit differential mode, power down between reads. */
 #define CMD_X  0xd0u
@@ -159,6 +177,7 @@ static struct {
     uint32_t worst;    /* longest run of polls that produced nothing, ms   */
     uint32_t quiet_at; /* when the current dry spell started               */
     uint32_t said_at;  /* last time this was written down                  */
+    uint32_t asleep;   /* windows in a row where the glass was untouched   */
 } s_tally;
 
 static void tally_tick(bool produced)
@@ -183,14 +202,36 @@ static void tally_tick(bool produced)
     if (now - s_tally.said_at < 3000u || s_tally.polls == 0u) {
         return;
     }
+
+    /*
+     * A window where nobody touched the glass says nothing, and saying it
+     * every three seconds is not free: the journal holds a few dozen lines,
+     * so a board left alone for two minutes overwrites the only lines worth
+     * having.  That is not a hypothetical - it is how the first attempt to
+     * measure a stalling pointer came back with forty-four identical lines
+     * of `no pen 300, sent 0` and the interesting ones already gone.
+     *
+     * So an untouched window is counted, not printed, and the count is
+     * carried into the next line that has something in it.  Silence stays
+     * visible; it just stops shouting.
+     */
+    if (s_tally.no_pen == s_tally.polls) {
+        s_tally.asleep++;
+        s_tally.said_at = now;
+        s_tally.polls = 0;
+        s_tally.no_pen = 0;
+        return;
+    }
+
     ag_log(AG_LOG_INFO, "XPT2046",
            "polls %u: no pen %u, flaky %u, weak %u, still %u, sent %u; "
-           "longest silence %u ms",
+           "longest silence %u ms; %u quiet window(s) before this",
            (unsigned)s_tally.polls, (unsigned)s_tally.no_pen,
            (unsigned)s_tally.flaky, (unsigned)s_tally.weak,
            (unsigned)s_tally.still, (unsigned)s_tally.sent,
-           (unsigned)s_tally.worst);
+           (unsigned)s_tally.worst, (unsigned)s_tally.asleep);
     s_tally.said_at = now;
+    s_tally.asleep = 0;
     s_tally.polls = 0;
     s_tally.no_pen = 0;
     s_tally.flaky = 0;
@@ -369,7 +410,8 @@ static int32_t touch_poll(ag_handle_t h, ag_event_t *out, uint32_t max)
     const uint16_t ry = read3(CMD_Y);
     s_state.samples++;
 
-    const bool pressed = pressure(rx, z1, z2) >= Z_MIN;
+    const bool pressed =
+        pressure(rx, z1, z2) >= (s_state.down ? Z_MIN_HELD : Z_MIN);
 
     if (!line && pressed) {
         s_tally.flaky++; /* the wire lied and the glass put it right */
