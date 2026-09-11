@@ -72,6 +72,24 @@ typedef struct {
     uint8_t  keyboard;
     /* Which tile goes behind the icons; 0 is a plain desk. */
     uint8_t  pattern;
+    /*
+     * Seconds of nobody touching it before the backlight goes out; 0 never.
+     *
+     * The board sits on a desk with its screen lit and nothing to turn it
+     * off - on a hand-held with a lit screen the backlight is the largest
+     * single load there is, and this one is lit twenty-four hours a day
+     * showing an idle desktop.
+     */
+    uint16_t dim_s;
+    /*
+     * Minutes east of UTC, for the clock face and nothing else.
+     *
+     * The system clock is UTC and stays UTC: there is no timezone database
+     * on the board, and the kernel is right that an honest UTC beats a
+     * guessed offset.  But a clock on a desk that is three hours out is not
+     * a clock, so the shell carries the offset of the desk it is on.
+     */
+    int16_t  tz_min;
 
     dsk_ini_icon_t icon[DSK_INI_ICONS];
     int            nicons;

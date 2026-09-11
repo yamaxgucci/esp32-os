@@ -52,7 +52,7 @@ param(
     # showed up as an empty photograph, a stray keystroke arriving at the
     # console prompt, and a dialog counted as a window left open.  None of the
     # three said anything about a deadline.
-    [int]$Seconds = 120,
+    [int]$Seconds = 145,
     [string]$Out = 'build\desktop',
     [switch]$NoBuild,
     # Give the shell no surface at all, so it rasterises in bands straight to
@@ -460,11 +460,16 @@ try {
                   (1..7 | ForEach-Object { 'key down' }) +
                   @('wait 300', 'key enter', 'wait 900')
 
-    # Options > Keyboard: always, then back to automatic.
+    # Options > Keyboard, three times round: automatic -> always ->
+    # never -> automatic.
     #
-    # Nine stops and then eight, because Pattern sits above them - the
-    # third time today that adding one menu item moved a count in this
-    # file, and the reason every one of them is written out in words.
+    # Eight stops each time, because it is ONE item now that says its value
+    # in its own label and steps on when it is chosen.  Three settings used
+    # to be three rows with a tick beside the live one; nine such rows
+    # filled the menu and left no room for Dim.
+    #
+    # Three presses rather than one is not thoroughness: the item only
+    # cycles, so the only way back to automatic is all the way round.
     #
     # What this can check from here is the wiring - the setting is read, the
     # shell says which way it went - and not whether a finger can hit a key,
@@ -475,36 +480,23 @@ try {
     # keyboard (KBDVIRT), so a run that ended with "always" would put a
     # keyboard into every later box and move the buttons that the rest of
     # this scenario clicks.
-    $optKbd = @('key f10', 'wait 400', 'key right', 'wait 200', 'key right',
-                'wait 200', 'key right', 'wait 300') +
-              (1..9 | ForEach-Object { 'key down' }) +
-              @('wait 300', 'key enter', 'wait 800',
-                'key f10', 'wait 400', 'key right', 'wait 200', 'key right',
-                'wait 200', 'key right', 'wait 300') +
-              (1..8 | ForEach-Object { 'key down' }) +
-              @('wait 300', 'key enter', 'wait 800')
+    $optKbdOnce = @('key f10', 'wait 400', 'key right', 'wait 200',
+                    'key right', 'wait 200', 'key right', 'wait 300') +
+                  (1..8 | ForEach-Object { 'key down' }) +
+                  @('wait 300', 'key enter', 'wait 800')
+    $optKbd = $optKbdOnce + $optKbdOnce + $optKbdOnce
 
-    # Three Rights now: File, Edit, Window, Options.
-    $optFont = @('key f10', 'wait 400', 'key right', 'wait 200', 'key right',
-                 'wait 200', 'key right',
-                 'wait 300', 'key down', 'key down', 'wait 300', 'key enter',
-                 'wait 1200',
-                 'key f10', 'wait 400', 'key right', 'wait 200', 'key right',
-                 'wait 200', 'key right',
-                 'wait 300', 'key down', 'wait 300', 'key enter', 'wait 1200')
-
-    # Two rows marked with Space, then File > Copy, which with more than one
-    # mark asks for a DIRECTORY and puts both in it under their own names.
-    # Space marks and steps down, so two of them mark two neighbours.
+    # Options > Dim, four times round: never -> 1 min -> 5 -> 15 -> never.
     #
-    # Home lands on "..", which cannot be marked - a mark on the way up is a
-    # mark on the parent directory - so the first Down is what gets onto a
-    # real row.
-    $opsMarked = @('key home', 'key down', 'wait 200',
-                   'key space', 'key space', 'wait 300',
-                   'key f10', 'wait 400') +
-                 (1..3 | ForEach-Object { 'key down' }) +
-                 @('wait 300', 'key enter', 'wait 800') + $clear +
+    # Ten stops: it is the last item.  All the way round on purpose - a run
+    # that left an idle period behind would put the backlight out in the
+    # middle of a later scenario, and on the emulator, where there is no
+    # backlight to see, nothing would say why the picture had stopped.
+    $optDimOnce = @('key f10', 'wait 400', 'key right', 'wait 200',
+                    'key right', 'wait 200', 'key right', 'wait 300') +
+                  (1..10 | ForEach-Object { 'key down' }) +
+                  @('wait 300', 'key enter', 'wait 600')
+    $optDim = $optDimOnce + $optDimOnce + $optDimOnce + $optDimOnce + $clear +
                  @('say c:\picked', 'wait 200', 'key enter',
                    'wait 3000')
 
@@ -536,7 +528,7 @@ try {
 
     $keyboard = $runHello + $runGfx + $opsMkdir + $opsCopy + $opsDelete +
                 $opsRename + $openConsole + $backToFolder + $opsClip +
-                $opsMarked + $optPattern + $optKbd + $optFont + $opsProps
+                $opsMarked + $optPattern + $optKbd + $optDim + $optFont + $opsProps
     $quoted = ($moves | ForEach-Object { '"' + $_ + '"' }) -join ' '
     $after = @('"key f5"', ('"wait ' + $settle + '"')) -join ' '
     # The properties box is deliberately still up for both photographs - it is
@@ -932,6 +924,15 @@ try {
         }
         if ($text -notmatch 'desktop: on-screen keyboard off \(automatic\)') {
             $fail += 'Keyboard: automatic did not come back (the emulator has a keyboard, so it should be off)'
+        }
+
+        # Dim went all the way round and came back to never.  The shell
+        # prints the period it landed on, so the last of these lines is the
+        # proof that a later scenario keeps its screen.
+        foreach ($d in @('1 min', '5 min', '15 min', 'never')) {
+            if ($text -notmatch ('desktop: dim after ' + [regex]::Escape($d))) {
+                $fail += ('Options > Dim never reached ' + $d)
+            }
         }
 
         # The font item did what it says: to 8x8 and back to 8x16.  A menu

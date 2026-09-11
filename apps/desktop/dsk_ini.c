@@ -105,6 +105,8 @@ void dsk_ini_defaults(dsk_ini_t *ini)
     ini->small_font = false;
     ini->keyboard = 0;
     ini->pattern = 0;
+    ini->dim_s = 0;
+    ini->tz_min = 0;
 }
 
 bool dsk_ini_icon_of(const dsk_ini_t *ini, const char *label, int16_t *x,
@@ -186,6 +188,14 @@ static void apply(dsk_ini_t *ini, sec_t sec, char *key, char *value)
              * the next one is added. */
             if (numbers(value, v, 1) == 1 && v[0] >= 0 && v[0] < 32) {
                 ini->pattern = (uint8_t)v[0];
+            }
+        } else if (ag_stricmp(key, "dim") == 0) {
+            if (numbers(value, v, 1) == 1 && v[0] >= 0 && v[0] <= 3600) {
+                ini->dim_s = (uint16_t)v[0];
+            }
+        } else if (ag_stricmp(key, "tz") == 0) {
+            if (numbers(value, v, 1) == 1 && v[0] >= -720 && v[0] <= 840) {
+                ini->tz_min = (int16_t)v[0];
             }
         } else if (ag_stricmp(key, "keyboard") == 0) {
             if (ag_stricmp(value, "on") == 0) {
@@ -354,6 +364,12 @@ ag_err_t dsk_ini_save(const dsk_ini_t *ini)
     put(text, INI_MAX, "\n; large (8x16) or small (8x8): twice the lines\n"
                        "font       = ");
     put(text, INI_MAX, ini->small_font ? "small" : "large");
+    put(text, INI_MAX, "\n; minutes east of UTC, for the clock face only"
+                       "\ntz         = ");
+    put_num(text, INI_MAX, ini->tz_min);
+    put(text, INI_MAX, "\n; seconds idle before the backlight goes out, 0 "
+                       "to leave it on\ndim        = ");
+    put_num(text, INI_MAX, ini->dim_s);
     put(text, INI_MAX, "\n; the tile behind the icons, 0 for a plain desk"
                        "\npattern    = ");
     put_num(text, INI_MAX, ini->pattern);

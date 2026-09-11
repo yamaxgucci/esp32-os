@@ -23,6 +23,7 @@
 #include "dsk.h"
 #include "dsk_cursor.h"
 #include "dsk_dlg.h"
+#include "dsk_clock.h"
 #include "dsk_folder.h"
 #include "dsk_icons.h"
 #include "dsk_menu.h"
@@ -590,18 +591,15 @@ enum {
     ID_MARK_ALL,
     ID_MARK_NONE,
     ID_PATTERN,
-    ID_KBD_AUTO,
-    ID_KBD_ON,
-    ID_KBD_OFF,
+    ID_KBD_CYCLE,
     ID_FONT_LARGE,
     ID_FONT_SMALL,
     ID_BG_TEAL,
     ID_BG_NAVY,
     ID_BG_GREEN,
     ID_BG_BLACK,
-    ID_DBL_SLOW,
-    ID_DBL_NORMAL,
-    ID_DBL_FAST,
+    ID_DBL_CYCLE,
+    ID_DIM,
     ID_PROPS,
     ID_ARRANGE,
     ID_EXIT,
@@ -1674,6 +1672,296 @@ static void set_separator(dsk_menu_t *m)
 /* The pattern item's label, held because a menu points at it rather than
  * copying it. */
 static char s_pattern_label[32];
+static char s_kbd_label[32];
+static char s_dbl_label[32];
+static char s_dim_label[32];
+
+/*
+ * When the last event arrived, and whether the backlight is off now.
+ *
+ * The shell does not know what the panel's backlight is wired to - that is
+ * the driver's business, reached through gfx->backlight - so it keeps only
+ * these two facts and tells the driver when they change.
+ */
+/*
+ * What the screen is doing, and since when.
+ *
+ * Three states rather than two, because "the screen is off" is two
+ * different things to the person in front of it.  Idle for the period the
+ * Dim item names, and the desktop gives way to the clock; ten seconds more
+ * and the light goes out.  Then the first touch brings the clock back - a
+ * glance at a board on a desk should cost a tap and show the time, not open
+ * whatever the finger landed on - and a touch while the clock is up is the
+ * one that means "I want the desktop".
+ *
+ * The times are ours, the brightnesses are the panel's business: the shell
+ * asks for a percentage and a board whose light is on a PWM channel will
+ * show the clock dim, while this one, whose light is a transistor, shows it
+ * lit.  Neither is written down here.
+ */
+typedef enum {
+    SCREEN_LIVE,  /* the desktop                                          */
+    SCREEN_SAVER, /* the clock, at SAVER_PCT                              */
+    SCREEN_DARK   /* light out, controller asleep                         */
+} screen_state_t;
+
+#define SAVER_MS  10000u /* how long the clock stays up, either way round */
+#define SAVER_PCT 20u    /* as dim as the panel can manage and still read */
+
+static screen_state_t s_screen_state = SCREEN_LIVE;
+static uint32_t s_screen_since; /* when this state began                  */
+static uint32_t s_dim_since;    /* when the last input arrived            */
+static uint32_t s_clock_at;     /* the minute the clock face is showing   */
+static unsigned s_clock_nudge;
+/*
+ * Whether the clock will answer the next press.
+ *
+ * A tap is not one event: the press that lights the clock is followed a
+ * moment later by its own release, and that release used to count as the
+ * second tap - the clock flashed up and the desktop was back before the
+ * finger had left the glass.  So a clock raised BY a touch is not armed
+ * until that touch has ended, and only a press that begins afterwards is
+ * somebody asking for the desktop.
+ */
+static bool     s_saver_armed;
+static bool     s_no_light; /* asked once, and nothing on this board answered */
+
+/*
+ * Set the panel's brightness.  Returns true if anything took the request.
+ *
+ * Through the device, not through `gfx`.  `gfx->backlight` is in the ABI and
+ * looks like the obvious call, but the kernel never fills it in - the entry
+ * is NULL on every board, which is why the first version of this dimmed
+ * nothing at all and said nothing about it either.  The light belongs to the
+ * panel DRIVER, which is loadable, so it is asked the way the kernel's own
+ * power path asks it: AG_IOC_DISPLAY_BACKLIGHT at every display in the
+ * registry.  A driver whose panel has no controllable light answers
+ * -AG_ENOTSUP, and that is an answer, not a failure.
+ */
+static bool set_backlight(uint8_t percent)
+{
+    bool taken = false;
+
+    for (uint32_t i = 0;; i++) {
+        ag_devinfo_t info;
+        if (ag_dev_enumerate(i, AG_DEV_DISPLAY, &info) != AG_OK) {
+            break;
+        }
+        const ag_handle_t h = ag_dev_open(info.name);
+        if (h < 0) {
+            continue;
+        }
+        uint8_t arg = percent;
+        if (ag_dev_ioctl(h, AG_IOC_DISPLAY_BACKLIGHT, &arg, sizeof(arg)) ==
+            AG_OK) {
+            taken = true;
+        }
+        (void)ag_dev_close(h);
+    }
+
+    return taken;
+}
+
+/*
+ * What the band callback needs, because it is handed a strip and nothing
+ * else.  Worked out once per repaint rather than once per strip.
+ */
+static int  s_clock_h, s_clock_m;
+static bool s_clock_valid;
+
+static void draw_clock_banded(dsk_rect_t r)
+{
+    (void)r; /* the painter is already clipped to this strip */
+    dsk_clock_draw(s_m.screen, s_clock_h, s_clock_m, s_clock_valid,
+                   s_clock_nudge);
+}
+
+/* Paint the clock face for the minute `now` names. */
+static void draw_clock(void)
+{
+    ag_datetime_t dt;
+    bool          valid = false;
+
+    if (AG_HAS(ag_api()->time, get_datetime) &&
+        ag_api()->time->get_datetime != NULL &&
+        ag_api()->time->get_datetime(&dt) == AG_OK) {
+        /*
+         * Before anything sets it the clock is seconds since 1970 plus
+         * uptime, so it reads as a January morning in 1970.  That is not a
+         * time, and drawing it as one would be a lie a person has to work
+         * out for themselves.
+         */
+        valid = (dt.year >= 2000u);
+    }
+
+    /*
+     * UTC plus the desk's offset, in minutes, wrapped into a day.  Done
+     * here and not by moving the system clock: file timestamps, the network
+     * and `date` all want the real thing.
+     */
+    int mins = 0;
+    if (valid) {
+        mins = (int)dt.hour * 60 + (int)dt.minute + (int)s_ini.tz_min;
+        while (mins < 0) {
+            mins += 24 * 60;
+        }
+        mins %= 24 * 60;
+    }
+
+    s_clock_h = mins / 60;
+    s_clock_m = mins % 60;
+    s_clock_valid = valid;
+
+    dsk_cursor_hide();
+    if (dsk_paint_banded()) {
+        dsk_paint_region(s_m.screen, draw_clock_banded);
+        dsk_paint_frame_done();
+    } else {
+        dsk_clock_draw(s_m.screen, s_clock_h, s_clock_m, s_clock_valid,
+                       s_clock_nudge);
+        dsk_flush(s_m.screen);
+    }
+}
+
+static void enter_saver(uint32_t now, bool armed)
+{
+    s_screen_state = SCREEN_SAVER;
+    s_screen_since = now;
+    s_clock_at = now;
+    s_saver_armed = armed;
+    (void)set_backlight(SAVER_PCT);
+    draw_clock();
+}
+
+static void enter_dark(uint32_t now)
+{
+    s_screen_state = SCREEN_DARK;
+    s_screen_since = now;
+    (void)set_backlight(0);
+}
+
+/* Back to the desktop from wherever we were. */
+static void wake_screen(void)
+{
+    if (s_screen_state == SCREEN_LIVE) {
+        return;
+    }
+    s_screen_state = SCREEN_LIVE;
+    s_screen_since = ag_millis();
+    (void)set_backlight(100);
+    /*
+     * And paint the whole thing again, because the glass does not hold what
+     * was on it.  The clock painted over the desktop; and putting the light
+     * out also puts the controller to sleep - that is the larger half of
+     * the saving, a panel left scanning keeps its oscillator and charge
+     * pumps running for a picture nobody can see - so a panel that has
+     * slept wakes with its memory stale and the driver clears it.  Whoever
+     * wakes it owes it a repaint.  Without this the desktop came back as an
+     * empty screen that filled in wherever the pointer happened to pass.
+     */
+    s_repaints++;
+    repaint_all();
+}
+
+/* Milliseconds until the screen state has to change, UINT32_MAX for never. */
+static uint32_t screen_due_in(uint32_t now)
+{
+    if (s_no_light) {
+        return UINT32_MAX;
+    }
+
+    if (s_screen_state == SCREEN_SAVER) {
+        const uint32_t up = now - s_screen_since;
+        const uint32_t left = (up >= SAVER_MS) ? 0u : SAVER_MS - up;
+        /*
+         * And a wake-up on the minute, so the face is never more than that
+         * out of date.  Cheap: the saver is up for ten seconds, so this
+         * costs at most one repaint of four digits.
+         */
+        const uint32_t shown = now - s_clock_at;
+        const uint32_t tick = (shown >= 60000u) ? 0u : 60000u - shown;
+        return (left < tick) ? left : tick;
+    }
+
+    if (s_screen_state == SCREEN_DARK || s_ini.dim_s == 0u) {
+        return UINT32_MAX;
+    }
+
+    const uint32_t after = (uint32_t)s_ini.dim_s * 1000u;
+    const uint32_t idle = now - s_dim_since;
+    return (idle >= after) ? 0u : after - idle;
+}
+
+/*
+ * An event has arrived: the board is not idle any more.
+ *
+ * Returns true when this one only moved the screen along and must go no
+ * further.  That is the whole point of the two steps: a stylus aimed at a
+ * dark screen is aimed at nothing, so the first touch buys the clock and
+ * the second buys the desktop, and neither presses what happened to be
+ * underneath.
+ */
+static bool wake_on_input(const ag_event_t *ev, uint32_t now)
+{
+    switch (ev->type) {
+    case AG_EV_POINTER_MOVE:
+    case AG_EV_POINTER_DOWN:
+    case AG_EV_POINTER_UP:
+    case AG_EV_WHEEL:
+    case AG_EV_KEY_DOWN:
+    case AG_EV_KEY_UP:
+    case AG_EV_CHAR:
+        break;
+    default:
+        return false;
+    }
+
+    s_dim_since = now;
+    if (s_screen_state == SCREEN_LIVE) {
+        return false;
+    }
+
+    /*
+     * Only a press moves the screen along - never a move and never a
+     * release.  A mouse nudged by the desk it sits on would otherwise light
+     * the room, and on a touchscreen the driver reports a move before every
+     * press and a release after it, so anything looser turns one tap into
+     * two decisions.
+     */
+    const bool press = (ev->type == AG_EV_POINTER_DOWN) ||
+                       (ev->type == AG_EV_KEY_DOWN) ||
+                       (ev->type == AG_EV_CHAR) || (ev->type == AG_EV_WHEEL);
+
+    if (s_screen_state == SCREEN_DARK) {
+        if (press) {
+            enter_saver(now, false); /* armed when this touch ends */
+        }
+        return true;
+    }
+
+    /* SCREEN_SAVER */
+    if (!s_saver_armed) {
+        if (ev->type == AG_EV_POINTER_UP || ev->type == AG_EV_KEY_UP) {
+            s_saver_armed = true;
+        }
+        return true;
+    }
+    if (press) {
+        wake_screen();
+    }
+    return true;
+}
+
+/* The idle periods the Dim item walks through, in seconds; 0 is never. */
+static const uint16_t s_dims[] = { 0u, 60u, 300u, 900u };
+
+static const char *dim_name(uint16_t s)
+{
+    return (s == 0u)    ? "never"
+           : (s < 120u) ? "1 min"
+           : (s < 600u) ? "5 min"
+                        : "15 min";
+}
 
 /* Titles for the window list, held so the menu can point at them. */
 static char s_win_labels[DSK_WIN_MAX][DSK_TITLE_MAX + 4];
@@ -1788,20 +2076,33 @@ static void rebuild_menus(void)
                sizeof(s_pattern_label));
     set_item(&s_menus[3], s_pattern_label, ID_PATTERN, true);
     set_separator(&s_menus[3]);
-    set_item(&s_menus[3], "Keyboard: automatic", ID_KBD_AUTO, true);
-    set_item(&s_menus[3], "Keyboard: always", ID_KBD_ON, true);
-    set_item(&s_menus[3], "Keyboard: never", ID_KBD_OFF, true);
-    s_menus[3].items[8].checked = (s_ini.keyboard == 0);
-    s_menus[3].items[9].checked = (s_ini.keyboard == 1);
-    s_menus[3].items[10].checked = (s_ini.keyboard == 2);
-    set_separator(&s_menus[3]);
-    set_item(&s_menus[3], "Slow double click", ID_DBL_SLOW, true);
-    set_item(&s_menus[3], "Normal double click", ID_DBL_NORMAL, true);
-    set_item(&s_menus[3], "Fast double click", ID_DBL_FAST, true);
-    s_menus[3].items[12].checked = (s_ini.dblclick_ms >= 600u);
-    s_menus[3].items[13].checked = (s_ini.dblclick_ms > 300u &&
-                                    s_ini.dblclick_ms < 600u);
-    s_menus[3].items[14].checked = (s_ini.dblclick_ms <= 300u);
+    /*
+     * Three settings, three items, not nine.  Each of these used to be a
+     * row of alternatives with a tick beside the live one, which is the
+     * Windows form and reads better - but the menu holds sixteen and those
+     * nine filled it, so there was no room left for the fourth setting.
+     * A cycling item says its value in its own label, which is what the
+     * tick was for.
+     */
+    ag_strlcpy(s_kbd_label, "Keyboard: ", sizeof(s_kbd_label));
+    ag_strlcat(s_kbd_label,
+               (s_ini.keyboard == 1)   ? "always"
+               : (s_ini.keyboard == 2) ? "never"
+                                       : "automatic",
+               sizeof(s_kbd_label));
+    set_item(&s_menus[3], s_kbd_label, ID_KBD_CYCLE, true);
+
+    ag_strlcpy(s_dbl_label, "Double click: ", sizeof(s_dbl_label));
+    ag_strlcat(s_dbl_label,
+               (s_ini.dblclick_ms >= 600u)  ? "slow"
+               : (s_ini.dblclick_ms > 300u) ? "normal"
+                                            : "fast",
+               sizeof(s_dbl_label));
+    set_item(&s_menus[3], s_dbl_label, ID_DBL_CYCLE, true);
+
+    ag_strlcpy(s_dim_label, "Dim: ", sizeof(s_dim_label));
+    ag_strlcat(s_dim_label, dim_name(s_ini.dim_s), sizeof(s_dim_label));
+    set_item(&s_menus[3], s_dim_label, ID_DIM, true);
 
     s_menus[4].title = "Help";
     s_menus[4].n = 0;
@@ -1944,17 +2245,23 @@ static void menu_chose(uint16_t id)
                   (unsigned)s_ini.pattern,
                   dsk_pattern_name((int)s_ini.pattern));
         break;
-    case ID_KBD_AUTO:
-    case ID_KBD_ON:
-    case ID_KBD_OFF: {
-        const uint8_t want = (id == ID_KBD_AUTO)   ? 0u
-                             : (id == ID_KBD_ON)   ? 1u
-                                                   : 2u;
-        if (want != s_ini.keyboard) {
-            s_ini.keyboard = want;
-            apply_keyboard();
-            save_arrangement();
+    case ID_KBD_CYCLE:
+        s_ini.keyboard = (uint8_t)((s_ini.keyboard + 1u) % 3u);
+        apply_keyboard();
+        save_arrangement();
+        break;
+    case ID_DIM: {
+        unsigned i = 0;
+        while (i + 1u < sizeof(s_dims) / sizeof(s_dims[0]) &&
+               s_dims[i] != s_ini.dim_s) {
+            i++;
         }
+        s_ini.dim_s = s_dims[(i + 1u) % (sizeof(s_dims) / sizeof(s_dims[0]))];
+        s_dim_since = ag_millis();
+        wake_screen();
+        s_no_light = false; /* a fresh ask: the answer may have changed */
+        save_arrangement();
+        ag_printf("desktop: dim after %s\n", dim_name(s_ini.dim_s));
         break;
     }
     case ID_FONT_LARGE:
@@ -1981,15 +2288,12 @@ static void menu_chose(uint16_t id)
         }
         break;
     }
-    case ID_DBL_SLOW:
-    case ID_DBL_NORMAL:
-    case ID_DBL_FAST: {
-        s_ini.dblclick_ms = (id == ID_DBL_SLOW)     ? 700u
-                            : (id == ID_DBL_NORMAL) ? 400u
-                                                    : 250u;
+    case ID_DBL_CYCLE:
+        s_ini.dblclick_ms = (s_ini.dblclick_ms >= 600u)  ? 400u
+                            : (s_ini.dblclick_ms > 300u) ? 250u
+                                                         : 700u;
         save_arrangement();
         break;
-    }
     case ID_ABOUT: {
         /*
          * The version of the SYSTEM, not of this shell: a shell that reports
@@ -2803,6 +3107,7 @@ int ag_main(int argc, char **argv)
     const uint32_t started = ag_millis();
 
     s_status_at = started;
+    s_dim_since = started;
     s_status_dirty = false;
 
     while (s_running) {
@@ -2822,6 +3127,36 @@ int ag_main(int argc, char **argv)
          */
         wait = soonest(wait, dsk_term_due_in(now));
         wait = soonest(wait, press_due_in(now));
+        wait = soonest(wait, screen_due_in(now));
+        if (screen_due_in(now) == 0u) {
+            if (s_screen_state == SCREEN_SAVER) {
+                if (now - s_screen_since >= SAVER_MS) {
+                    enter_dark(now);
+                } else {
+                    s_clock_at = now;
+                    s_clock_nudge++;
+                    draw_clock();
+                }
+            } else {
+                /*
+                 * Only start this if something can actually be switched
+                 * off at the end of it.  A panel whose driver takes no
+                 * brightness would get the clock and keep it for ever, and
+                 * the next touch would be eaten waking a screen that was
+                 * never out.  Ask once, say so once, and leave it alone.
+                 */
+                if (set_backlight(SAVER_PCT)) {
+                    /*
+                     * Nobody is touching anything - this one came from the
+                     * idle timer, so the next press is a real answer.
+                     */
+                    enter_saver(now, true);
+                } else {
+                    s_no_light = true;
+                    ag_printf("desktop: this panel has no backlight to dim\n");
+                }
+            }
+        }
         ag_event_t ev;
 
         if (deadline_s != 0u) {
@@ -2832,6 +3167,9 @@ int ag_main(int argc, char **argv)
 
         if (next_event(&ev, s_have_held ? 0u : wait)) {
             now = ag_millis();
+            if (wake_on_input(&ev, now)) {
+                continue;
+            }
             switch (ev.type) {
             case AG_EV_POINTER_MOVE:
                 on_pointer(DSK_PTR_MOVE, ev.ptr.x, ev.ptr.y, ev.ptr.buttons,
@@ -2903,6 +3241,19 @@ int ag_main(int argc, char **argv)
         if (deadline_s != 0u && (now - started) >= deadline_s * 1000u) {
             s_running = false;
         }
+        /*
+         * Nothing is painted while the clock is up or the light is out.
+         *
+         * Not an optimisation - a correctness rule.  The desktop paints
+         * through a damage list, and a caret blinking or a status strip
+         * ticking behind the clock would put desktop pixels on a screen
+         * that is showing something else.  The damage keeps accumulating
+         * and is paid off in one repaint when we come back.
+         */
+        if (s_screen_state != SCREEN_LIVE) {
+            continue;
+        }
+
         dsk_dlg_tick(now);
         status_settle(now);
         press_settle(now);
@@ -2926,6 +3277,8 @@ int ag_main(int argc, char **argv)
     }
 
     dsk_cursor_hide();
+    /* Never hand the screen back dark: the next program cannot light it. */
+    wake_screen();
     ag_gfx_release();
     ag_color(AG_LGRAY, AG_BLACK);
     ag_cls();
