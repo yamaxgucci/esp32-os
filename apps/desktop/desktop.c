@@ -617,6 +617,7 @@ enum {
     ID_BG_BLACK,
     ID_DBL_CYCLE,
     ID_DIM,
+    ID_SETTIME,
     ID_PROPS,
     ID_ARRANGE,
     ID_EXIT,
@@ -1683,6 +1684,131 @@ static void show_file_props(void)
     (void)dsk_dlg_lines("Properties", lines, 5, NULL, NULL);
 }
 
+/*
+ * Set the clock, in the time the person reads off it.
+ *
+ * Asked and answered in LOCAL time - what the saver's face shows - and
+ * stored as UTC, because that is what the system keeps and what file
+ * timestamps are in.  Asking for UTC would be asking somebody to do
+ * arithmetic in order to tell a machine what time it is.
+ */
+static void time_typed(dsk_answer_t a, const char *text, void *ctx)
+{
+    (void)ctx;
+    if (a != DSK_ANSWER_OK || text == NULL) {
+        return;
+    }
+
+    int n[6] = { 0, 0, 0, 0, 0, 0 };
+    int got = 0;
+    for (const char *c = text; *c != '\0' && got < 6;) {
+        if (*c < '0' || *c > '9') {
+            c++;
+            continue;
+        }
+        int v = 0;
+        while (*c >= '0' && *c <= '9') {
+            v = v * 10 + (*c - '0');
+            c++;
+        }
+        n[got++] = v;
+    }
+    if (got < 5 || n[0] < 1970 || n[1] < 1 || n[1] > 12 || n[2] < 1 ||
+        n[2] > 31 || n[3] > 23 || n[4] > 59) {
+        s_note = "wanted YYYY-MM-DD HH:MM";
+        damage(s_m.statusbar);
+        return;
+    }
+
+    if (!AG_HAS(ag_api()->time, set_datetime) ||
+        ag_api()->time->set_datetime == NULL) {
+        s_note = "this system cannot be told the time";
+        damage(s_m.statusbar);
+        return;
+    }
+
+    /*
+     * Back to UTC before it is stored.  Minutes are carried across the
+     * day boundary by hand rather than by mktime, because the shell has
+     * no calendar and does not need one: the date moves at most a day
+     * either way, and the clock is being set by somebody who can see it.
+     */
+    int mins = n[3] * 60 + n[4] - (int)s_ini.tz_min;
+    int day = n[2];
+    while (mins < 0) {
+        mins += 24 * 60;
+        day--;
+    }
+    while (mins >= 24 * 60) {
+        mins -= 24 * 60;
+        day++;
+    }
+
+    ag_datetime_t dt;
+    dt.year = (uint16_t)n[0];
+    dt.month = (uint8_t)n[1];
+    dt.day = (uint8_t)((day < 1) ? 1 : day);
+    dt.hour = (uint8_t)(mins / 60);
+    dt.minute = (uint8_t)(mins % 60);
+    dt.second = (uint8_t)n[5];
+    dt.weekday = 0;
+
+    s_note = (ag_api()->time->set_datetime(&dt) == AG_OK) ? "clock set"
+                                                          : "the clock refused that";
+    damage(s_m.statusbar);
+}
+
+static void ask_settime(void)
+{
+    /* Pre-filled with what the clock says now, so a correction is a
+     * correction rather than a fresh typing of six numbers. */
+    char          now[24] = "2026-01-01 00:00";
+    ag_datetime_t dt;
+    if (AG_HAS(ag_api()->time, get_datetime) &&
+        ag_api()->time->get_datetime != NULL &&
+        ag_api()->time->get_datetime(&dt) == AG_OK && dt.year >= 2000u) {
+        int mins = (int)dt.hour * 60 + (int)dt.minute + (int)s_ini.tz_min;
+        while (mins < 0) {
+            mins += 24 * 60;
+        }
+        mins %= 24 * 60;
+
+        char num[8];
+        now[0] = '\0';
+        ag_strlcat(now, ag_utoa(dt.year, num, sizeof(num), 0, false),
+                   sizeof(now));
+        ag_strlcat(now, "-", sizeof(now));
+        if (dt.month < 10u) {
+            ag_strlcat(now, "0", sizeof(now));
+        }
+        ag_strlcat(now, ag_utoa(dt.month, num, sizeof(num), 0, false),
+                   sizeof(now));
+        ag_strlcat(now, "-", sizeof(now));
+        if (dt.day < 10u) {
+            ag_strlcat(now, "0", sizeof(now));
+        }
+        ag_strlcat(now, ag_utoa(dt.day, num, sizeof(num), 0, false),
+                   sizeof(now));
+        ag_strlcat(now, " ", sizeof(now));
+        if (mins / 60 < 10) {
+            ag_strlcat(now, "0", sizeof(now));
+        }
+        ag_strlcat(now, ag_utoa((uint64_t)(mins / 60), num, sizeof(num), 0,
+                                false),
+                   sizeof(now));
+        ag_strlcat(now, ":", sizeof(now));
+        if (mins % 60 < 10) {
+            ag_strlcat(now, "0", sizeof(now));
+        }
+        ag_strlcat(now, ag_utoa((uint64_t)(mins % 60), num, sizeof(num), 0,
+                                false),
+                   sizeof(now));
+    }
+
+    (void)dsk_dlg_input("Set time", "Local time, YYYY-MM-DD HH:MM:", now,
+                        time_typed, NULL);
+}
+
 static void ask_mkdir(void)
 {
     if (dsk_folder_path(dsk_wm_active()) == NULL) {
@@ -2155,6 +2281,7 @@ static void rebuild_menus(void)
     ag_strlcpy(s_dim_label, "Dim: ", sizeof(s_dim_label));
     ag_strlcat(s_dim_label, dim_name(s_ini.dim_s), sizeof(s_dim_label));
     set_item(&s_menus[3], s_dim_label, ID_DIM, true);
+    set_item(&s_menus[3], "Set time...", ID_SETTIME, true);
 
     s_menus[4].title = "Help";
     s_menus[4].n = 0;
@@ -2345,6 +2472,9 @@ static void menu_chose(uint16_t id)
                             : (s_ini.dblclick_ms > 300u) ? 250u
                                                          : 700u;
         save_arrangement();
+        break;
+    case ID_SETTIME:
+        ask_settime();
         break;
     case ID_ABOUT: {
         /*

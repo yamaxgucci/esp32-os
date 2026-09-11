@@ -78,6 +78,14 @@ HID = {
     "1": 0x1E, "2": 0x1F, "3": 0x20, "4": 0x21, "5": 0x22,
     "6": 0x23, "7": 0x24, "8": 0x25, "9": 0x26, "0": 0x27,
     "enter": 0x28, "esc": 0x29, "backspace": 0x2A, "tab": 0x2B, "space": 0x2C,
+    # The space bar under its own character as well as under its name, so
+    # that `say` can type a string with a space in it.  `say` already
+    # believed it could - it maps ' ' to ' ' on the way in - but the
+    # lookup below then found nothing and killed the whole run at that
+    # character, taking every later command with it.  A scenario that
+    # typed a date stopped dead at the gap before the time, and the run
+    # reported three unrelated failures further down.
+    " ": 0x2C,
     "f1": 0x3A, "f2": 0x3B, "f3": 0x3C, "f4": 0x3D, "f5": 0x3E, "f6": 0x3F,
     "f7": 0x40, "f8": 0x41, "f9": 0x42, "f10": 0x43, "f11": 0x44, "f12": 0x45,
     "right": 0x4F, "left": 0x50, "down": 0x51, "up": 0x52,

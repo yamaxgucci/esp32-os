@@ -47,12 +47,18 @@ param(
     [int]$Width = 0,
     [int]$Height = 0,
     # The shell's own deadline, so nothing can hang.  It has to cover the
-    # WHOLE scripted run, not one step: the sequence below is around a minute
-    # of waits, and a deadline shorter than that ends the shell partway - which
+    # WHOLE scripted run, not one step: the sequence below is minutes of
+    # waits, and a deadline shorter than that ends the shell partway - which
     # showed up as an empty photograph, a stray keystroke arriving at the
     # console prompt, and a dialog counted as a window left open.  None of the
     # three said anything about a deadline.
-    [int]$Seconds = 145,
+    #
+    # Generous on purpose, and it costs nothing: the run ends when the
+    # marker arrives, not when this expires, and qemu-boot's own
+    # whole-run budget is what actually stops a hang.  Tuning this to
+    # just-enough is how the last two steps added here each broke the run
+    # in a way that pointed everywhere except at the clock.
+    [int]$Seconds = 300,
     [string]$Out = 'build\desktop',
     [switch]$NoBuild,
     # Give the shell no surface at all, so it rasterises in bands straight to
@@ -557,6 +563,25 @@ try {
                   @('wait 300', 'key enter', 'wait 600')
     $optDim = $optDimOnce + $optDimOnce + $optDimOnce + $optDimOnce
 
+    # Options > Set time..., the eleventh stop, and then a date typed
+    # into it.
+    #
+    # This is the whole path in one go: the menu, the dialog, the
+    # on-screen keyboard's field, the ABI entry that was NULL until
+    # today, and the system clock underneath it.  The console is asked
+    # for the date afterwards, so what is checked is what the machine
+    # believes rather than what the dialog said.
+    #
+    # A year nobody could arrive at by accident: the emulator's clock
+    # starts in 1970 and no other step here touches it.
+    $optTime = @('key f10', 'wait 400', 'key right', 'wait 200',
+                 'key right', 'wait 200', 'key right', 'wait 300') +
+               (1..11 | ForEach-Object { 'key down' }) +
+               @('wait 300', 'key enter', 'wait 900') +
+               (1..20 | ForEach-Object { 'key backspace' }) +
+               @('say 2031-03-04 05:06', 'wait 300', 'key enter',
+                 'wait 900')
+
     # Three Rights now: File, Edit, Window, Options.
     $optFont = @('key f10', 'wait 400', 'key right', 'wait 200', 'key right',
                  'wait 200', 'key right',
@@ -609,7 +634,8 @@ try {
 
     $keyboard = $runHello + $runGfx + $opsMkdir + $opsCopy + $opsDelete +
                 $opsRename + $openConsole + $backToFolder + $opsClip +
-                $opsMarked + $optPattern + $optKbd + $optDim + $optFont + $opsProps
+                $opsMarked + $optPattern + $optKbd + $optDim + $optTime +
+                $optFont + $opsProps
     $quoted = ($moves | ForEach-Object { '"' + $_ + '"' }) -join ' '
     $after = @('"key f5"', ('"wait ' + $settle + '"')) -join ' '
     # The properties box is deliberately still up for both photographs - it is
@@ -719,6 +745,8 @@ try {
         # control byte in a write of its own is the thing that goes missing
         # (see the run line above).
         "~\x08type c:\desktop.ini\x0d",
+        # What the clock believes, after the dialog set it.
+        'date',
         '~run c:\desktop.axe 12\x0d',
         '=desktop: surface',
         # The surface line is printed before the first paint has reached the
@@ -1046,6 +1074,13 @@ try {
                 $fail += ('the dragged window was written down at x=' +
                           "$wx, not at " + ($fwX + 40))
             }
+        }
+
+        # The clock was set from the desktop, through an ABI entry that
+        # was a stub this morning.  The date is checked and the time is
+        # not: seconds pass between the dialog and the question.
+        if ($text -notmatch '2031-03-04') {
+            $fail += 'Set time... did not reach the system clock'
         }
 
         $band = [regex]::Match($text, 'desktop: band marked (\d+)')

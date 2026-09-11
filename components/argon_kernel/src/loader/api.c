@@ -10,6 +10,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/time.h>
 #include <time.h>
 
 #include <argon/journal.h>
@@ -643,6 +644,52 @@ static ag_err_t api_get_datetime(ag_datetime_t *out)
     return AG_OK;
 }
 
+/*
+ * Set the wall clock, UTC.
+ *
+ * The entry beside this one said `NULL, needs an RTC driver` for as long
+ * as it has existed, and that was two different questions treated as one.
+ * Keeping time across a power cut needs an RTC and none of these boards
+ * has one; KNOWING what the time is only needs somebody to say so, and
+ * until now the only somebody was a network time server - which the CYD
+ * cannot reach at all, because bringing its radio up damages its
+ * SYSTEM.CFG.  A machine that cannot be told the time by the person
+ * sitting in front of it is worse than one with no clock.
+ *
+ * It is lost at every power cut, and that is honest rather than
+ * regrettable: the shell draws an unset clock as --:-- rather than as
+ * half past midnight in 1970.
+ */
+static ag_err_t api_set_datetime(const ag_datetime_t *dt)
+{
+    if (dt == NULL || dt->year < 1970u || dt->month < 1u || dt->month > 12u ||
+        dt->day < 1u || dt->day > 31u || dt->hour > 23u || dt->minute > 59u ||
+        dt->second > 60u) {
+        return -AG_EINVAL;
+    }
+
+    struct tm tm;
+    memset(&tm, 0, sizeof(tm));
+    tm.tm_year = (int)dt->year - 1900;
+    tm.tm_mon = (int)dt->month - 1;
+    tm.tm_mday = (int)dt->day;
+    tm.tm_hour = (int)dt->hour;
+    tm.tm_min = (int)dt->minute;
+    tm.tm_sec = (int)dt->second;
+    tm.tm_isdst = 0;
+
+    /* No timezone is set on the board, so mktime's "local" is UTC. */
+    const time_t t = mktime(&tm);
+    if (t == (time_t)-1) {
+        return -AG_EINVAL;
+    }
+
+    struct timeval tv;
+    tv.tv_sec = t;
+    tv.tv_usec = 0;
+    return (settimeofday(&tv, NULL) == 0) ? AG_OK : -AG_EIO;
+}
+
 static const ag_time_api_t k_time = {
     .size = sizeof(ag_time_api_t),
     .us = api_us,
@@ -651,7 +698,7 @@ static const ag_time_api_t k_time = {
     .delay_ms = api_delay_ms,
     .delay_us = api_delay_us,
     .get_datetime = api_get_datetime,
-    .set_datetime = NULL, /* needs an RTC driver */
+    .set_datetime = api_set_datetime,
     .timer_create = NULL,
     .timer_delete = NULL,
 };
