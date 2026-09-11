@@ -701,13 +701,19 @@ try {
         # restored window from one this script had opened; the counters do.
         # A backspace first, and it is not decoration.
         #
-        # The 'q' above quits the shell AND stays in the console's line
-        # editor: the focused application took it as a key event and the
-        # editor buffered the same byte.  So the next command arrived as
-        # `qtype c:\\desktop.ini` - "Bad command or file name: qtype" -
-        # the file was never printed, and the run reported that DESKTOP.INI
-        # held no icon position.  Four checks downstream of this have been
-        # blaming the shell for a leftover keystroke.
+        # The 'q' above is aimed at the desktop, and the desktop is not
+        # always still there to catch it: it also leaves on its own
+        # deadline, and a 'q' that arrives a moment later lands in the
+        # console's line editor instead.  The next command then arrived
+        # as `qtype c:\desktop.ini` - "Bad command or file name: qtype" -
+        # the file was never printed, and the run reported that
+        # DESKTOP.INI held no icon position.  Four checks downstream of
+        # this spent a while being blamed on the shell.
+        #
+        # (It is NOT two readers of one keystroke, which is what this
+        # comment claimed first: an application and the shell take events
+        # from the same queue, and has_the_keyboard() decides which of
+        # them a given one reaches.  One byte, one reader.)
         #
         # Sent as ONE write with the command and its carriage return: a lone
         # control byte in a write of its own is the thing that goes missing
