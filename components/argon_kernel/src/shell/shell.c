@@ -35,6 +35,7 @@
 
 #include <argon/btinput.h>
 #include <argon/usbinput.h>
+#include <sys/time.h>
 #include <time.h>
 
 #include <argon/net.h>
@@ -632,9 +633,94 @@ static int cmd_uptime(int argc, char **argv)
     return 0;
 }
 
+/*
+ * `date set 2026-09-11 14:30[:00]`, UTC, the same clock `date` prints.
+ *
+ * There is no battery under this clock on any board we have, so this is
+ * lost at every power cut and has to be typed again - which is exactly why
+ * it has to exist.  Until now the only way to set the time at all was
+ * `date sync` over the network, and on the CYD bringing the radio up
+ * damages its SYSTEM.CFG, so that board could not have a clock.
+ */
+static int date_set(int argc, char **argv)
+{
+    int n[6] = { 0, 0, 0, 0, 0, 0 };
+
+    if (argc < 4) {
+        ag_console_puts("date set YYYY-MM-DD HH:MM[:SS]   (UTC)\n");
+        return 1;
+    }
+
+    /*
+     * Parsed by hand rather than with sscanf: nothing else in the shell
+     * needs it, and pulling the scanning half of the C library into the
+     * firmware to read six integers is not a trade worth making on a part
+     * whose image is counted in kilobytes.
+     */
+    int got = 0;
+    for (int a = 2; a <= 3; a++) {
+        const char *c = argv[a];
+        while (*c != '\0' && got < 6) {
+            if (*c < '0' || *c > '9') {
+                c++;
+                continue;
+            }
+            int v = 0;
+            while (*c >= '0' && *c <= '9') {
+                v = v * 10 + (*c - '0');
+                c++;
+            }
+            n[got++] = v;
+        }
+    }
+    if (got < 5) {
+        ag_console_puts("date set YYYY-MM-DD HH:MM[:SS]   (UTC)\n");
+        return 1;
+    }
+
+    const int y = n[0], mo = n[1], d = n[2];
+    const int h = n[3], mi = n[4], sec = n[5];
+    if (y < 1970 || mo < 1 || mo > 12 || d < 1 || d > 31 || h > 23 ||
+        mi > 59 || sec > 60) {
+        ag_console_puts("date set: that is not a date and time\n");
+        return 1;
+    }
+
+    struct tm tm;
+    memset(&tm, 0, sizeof(tm));
+    tm.tm_year = y - 1900;
+    tm.tm_mon = mo - 1;
+    tm.tm_mday = d;
+    tm.tm_hour = h;
+    tm.tm_min = mi;
+    tm.tm_sec = sec;
+    tm.tm_isdst = 0;
+
+    /* No timezone is set on the board, so mktime's "local" is UTC. */
+    const time_t t = mktime(&tm);
+    if (t == (time_t)-1) {
+        ag_console_puts("date set: that is not a date and time\n");
+        return 1;
+    }
+
+    struct timeval tv;
+    tv.tv_sec = t;
+    tv.tv_usec = 0;
+    if (settimeofday(&tv, NULL) != 0) {
+        ag_console_puts("date set: the clock refused it\n");
+        return 1;
+    }
+    return 0;
+}
+
 static int cmd_date(int argc, char **argv)
 {
-    if (argc >= 2 && ag_path_icmp(argv[1], "sync") == 0) {
+    if (argc >= 2 && ag_path_icmp(argv[1], "set") == 0) {
+        const int err = date_set(argc, argv);
+        if (err != 0) {
+            return err;
+        }
+    } else if (argc >= 2 && ag_path_icmp(argv[1], "sync") == 0) {
 #if AG_PORT_HAS_SNTP
         const char *server = (argc >= 3) ? argv[2] : NULL;
         ag_console_puts("syncing time...\n");
@@ -664,7 +750,8 @@ static int cmd_date(int argc, char **argv)
     /* Before a sync the clock is seconds since 1970 plus uptime, i.e. still in
      * 1970 - say so rather than let a 1970 date look like a bug. */
     if (tm.tm_year + 1900 < 2000) {
-        ag_console_puts("(clock not set - `date sync` to set it from the network)\n");
+        ag_console_puts("(clock not set - `date set` by hand, or `date sync`"
+                        " from the network)\n");
     }
     return 0;
 }
@@ -4635,7 +4722,7 @@ static const ag_command_t k_commands[] = {
     {"ptr", "", "where the pointer is, and how much it has said", cmd_ptr},
 #endif
     {"uptime", "", "time since reset", cmd_uptime},
-    {"date", "[sync [server]]", "show the clock, or set it from the network", cmd_date},
+    {"date", "[set D T | sync [srv]]", "show the clock, or set it", cmd_date},
     {"cls", "", "clear the screen", cmd_cls},
     {"echo", "<text>", "print text", cmd_echo},
     {"color", "<fg> <bg>", "set text colours", cmd_color},
