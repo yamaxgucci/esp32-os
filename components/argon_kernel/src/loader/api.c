@@ -446,6 +446,34 @@ static int32_t api_peek_row_slot(int slot, uint16_t row, ag_textcell_t *cells,
 }
 
 /*
+ * Where the cursor is on another slot's screen.
+ *
+ * Same permission as reading its rows, and for the same reason: this is
+ * somebody else's screen, and only whatever is holding the glass has any
+ * business drawing it.
+ */
+static int32_t api_cursor_of_slot(int slot, uint16_t *x, uint16_t *y)
+{
+    if (x == NULL || y == NULL) {
+        return -AG_EINVAL;
+    }
+    if (!has_console_focus()) {
+        return -AG_EPERM;
+    }
+
+    int32_t err = -AG_ENODEV;
+    ag_console_lock();
+    const ag_screen_t *sc = ag_console_screen_of_slot(slot);
+    if (sc != NULL) {
+        *x = sc->cur_x;
+        *y = sc->cur_y;
+        err = 0;
+    }
+    ag_console_unlock();
+    return err;
+}
+
+/*
  * Give a slot a shell of its own.  A slot below zero means any free one -
  * a window asking for a prompt has no business choosing a number, and
  * nothing in the ABI lets it see which are taken.
@@ -552,6 +580,7 @@ static const ag_con_api_t k_con = {
     .set_codepage = api_set_codepage,
     .peek_row = api_peek_row,
     .peek_row_slot = api_peek_row_slot,
+    .cursor_of_slot = api_cursor_of_slot,
 };
 
 /* ---------------------------------------------------------------------- */

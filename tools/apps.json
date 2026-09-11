@@ -47,6 +47,7 @@
               "apps/desktop/dsk_clock.c",
               "apps/desktop/dsk_ops.c", "apps/desktop/dsk_ini.c",
               "apps/desktop/dsk_kbd.c",
+              "apps/desktop/dsk_oskbd.c",
               "apps/desktop/dsk_term.c",
               "apps/common/fsops/fsops.c", "apps/common/fsops/fsops_argon.c"]
     },

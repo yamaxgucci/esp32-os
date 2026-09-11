@@ -102,8 +102,22 @@ static dsk_answer_t btn_answer(int which)
     }
 }
 
+/*
+ * True when the desk's keyboard is carrying this box.
+ *
+ * Then the box has no buttons of its own: OK and Cancel are the first two
+ * keys of the keyboard's own row, where a thumb already is.  Two rows of
+ * buttons on a 240-pixel screen is one too many - with the box squeezed into
+ * what is left above the keys, its buttons ended up drawn over the very
+ * field they were there to accept.
+ */
+static bool keys_serve(void) { return s_d.keys && s_d.input; }
+
 static dsk_rect_t btn_rect(dsk_rect_t client, int which)
 {
+    if (keys_serve()) {
+        return dsk_rect_none();
+    }
     const int    n = btn_count();
     const int16_t total = (int16_t)(n * BTN_W + (n - 1) * BTN_GAP);
     const int16_t x0 = (int16_t)(client.x + (client.w - total) / 2);
@@ -114,34 +128,6 @@ static dsk_rect_t btn_rect(dsk_rect_t client, int which)
 static dsk_rect_t edit_rect(dsk_rect_t client);
 
 /* Where the keyboard goes: between the text field and the buttons. */
-static dsk_rect_t kbd_rect(dsk_rect_t client)
-{
-    if (!s_d.keys) {
-        return dsk_rect_none();
-    }
-    /*
-     * Between the text field and the buttons, and never over either.
-     *
-     * The window manager cuts a box down to the work area, so a box that
-     * asked for more than the screen comes back shorter than it planned -
-     * and a keyboard anchored to the bottom then climbs over the field it
-     * is there to fill.  On the CYD that is exactly what happened: the keys
-     * could be hit and what they typed could not be seen.  So the space is
-     * measured, not assumed, and the keys shrink to fit it.
-     */
-    const dsk_rect_t e = edit_rect(client);
-    const int16_t    top = (int16_t)(dsk_rect_y2(e) + PAD);
-    const int16_t    bottom = (int16_t)(dsk_rect_y2(client) - PAD - BTN_H -
-                                     PAD);
-    const int16_t    avail = (int16_t)(bottom - top);
-    const int16_t    h = dsk_kbd_height_for((int16_t)(client.w - 2 * PAD),
-                                            avail);
-    if (h <= 0) {
-        return dsk_rect_none();
-    }
-    return dsk_rect((int16_t)(client.x + PAD), top,
-                    (int16_t)(client.w - 2 * PAD), h);
-}
 
 static dsk_rect_t edit_rect(dsk_rect_t client)
 {
@@ -211,12 +197,7 @@ static void dlg_draw(dsk_win_t *w, dsk_rect_t client)
         }
     }
 
-    const dsk_rect_t kb = kbd_rect(client);
-    if (!dsk_rect_empty(kb)) {
-        dsk_kbd_draw(kb);
-    }
-
-    for (int i = 0; i < btn_count(); i++) {
+    for (int i = 0; i < (keys_serve() ? 0 : btn_count()); i++) {
         const dsk_rect_t b = btn_rect(client, i);
         dsk_panel(b, true, DSK_LGRAY);
         /* The default answer gets the black outline it had in 3.11. */
@@ -248,26 +229,6 @@ static bool dlg_pointer(dsk_win_t *w, dsk_hit_t where, int16_t x, int16_t y,
         }
     }
 
-    const dsk_rect_t kb = kbd_rect(client);
-    if (!dsk_rect_empty(kb) && dsk_rect_has(kb, x, y)) {
-        const int c = dsk_kbd_press(kb, x, y);
-        if (c == DSK_KBD_SHIFT) {
-            dsk_wm_damage_rect(kb); /* every label changed case */
-        } else if (c == DSK_KBD_BACKSPACE) {
-            if (s_d.len > 0) {
-                s_d.text[--s_d.len] = '\0';
-                dsk_wm_damage_rect(edit_rect(client));
-            }
-        } else if (c >= 0x20 && c < 0x7F && s_d.len + 1 < DSK_INPUT_MAX) {
-            s_d.text[s_d.len++] = (char)c;
-            s_d.text[s_d.len] = '\0';
-            dsk_wm_damage_rect(edit_rect(client));
-            /* Shift falls back to lower case after one letter, so the
-             * keyboard's own face changed too. */
-            dsk_wm_damage_rect(kb);
-        }
-        return true;
-    }
     return true;
 }
 
@@ -339,19 +300,48 @@ void dsk_dlg_init(const dsk_metrics_t *m)
     s_d.win = NULL;
 }
 
+/*
+ * True while a box that somebody has to type into is up.
+ *
+ * The desk polls this and raises its keyboard, which is why neither side has
+ * to know when the other opened or closed: a box that appears while the keys
+ * are already up simply keeps them.
+ */
+bool dsk_dlg_wants_keys(void)
+{
+    return s_d.up && s_d.input && s_d.keys;
+}
+
+/* How much of the bottom of the work area is spoken for by the keyboard. */
+static int16_t s_reserve;
+
+void dsk_dlg_reserve(int16_t bottom_px)
+{
+    s_reserve = (bottom_px > 0) ? bottom_px : 0;
+}
+
 bool dsk_dlg_up(void) { return s_d.up; }
 
 static dsk_win_t *open_window(const char *title, int16_t w, int16_t h)
 {
+    /*
+     * Above the keyboard, not under it.  The keys cover the bottom of the
+     * work area while they are up, and a box centred in the whole of it
+     * would put its text field - the one thing the keys are for - behind
+     * them.  That exact fault is written up in dsk_kbd.h, from the days
+     * when the keyboard was inside the box.
+     */
+    const int16_t avail_h =
+        (int16_t)(s_m.work.h - (s_d.input ? s_reserve : 0));
     if (w > s_m.work.w) {
         w = s_m.work.w;
     }
-    if (h > s_m.work.h) {
-        h = s_m.work.h;
+    if (h > avail_h) {
+        h = avail_h;
     }
     const dsk_rect_t f =
         dsk_rect((int16_t)(s_m.work.x + (s_m.work.w - w) / 2),
-                 (int16_t)(s_m.work.y + (s_m.work.h - h) / 3), w, h);
+                 (int16_t)(s_m.work.y + (avail_h - h) / 3), w, h);
     dsk_win_t *win = dsk_wm_open(title, f, &k_dlg_ops, NULL);
     if (win != NULL) {
         win->modal = true;
@@ -458,9 +448,11 @@ bool dsk_dlg_input(const char *title, const char *prompt, const char *initial,
     s_d.keys = s_want_keys;
     dsk_kbd_reset();
 
+    /* No row of buttons when the keyboard is carrying them. */
     int16_t h =
         (int16_t)(2 * s_m.border + s_m.title_h + PAD + dsk_ui_h() + 4 +
-                  dsk_ui_h() + 6 + PAD + BTN_H + PAD);
+                  dsk_ui_h() + 6 + PAD +
+                  (keys_serve() ? 0 : (int16_t)(BTN_H + PAD)));
     int16_t w = width_for_lines();
     if (w < 240) {
         w = 240;
@@ -474,14 +466,7 @@ bool dsk_dlg_input(const char *title, const char *prompt, const char *initial,
         w = s_m.work.w;
         /* What is left of the screen once the box's own furniture has had
          * its share; asking for more than this gets the box cut down. */
-        const int16_t room = (int16_t)(s_m.work.h - h - PAD);
-        const int16_t kh = dsk_kbd_height_for(
-            (int16_t)(w - 2 * s_m.border - 2 * PAD), room);
-        if (kh > 0) {
-            h = (int16_t)(h + kh + PAD);
-        } else {
-            s_d.keys = false;
-        }
+        (void)0; /* the keys are the desk's now; the box only asks for them */
     }
     s_d.win = open_window(title, w, h);
     if (s_d.win == NULL) {

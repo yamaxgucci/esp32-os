@@ -52,6 +52,12 @@ void dsk_dlg_init(const dsk_metrics_t *m);
  */
 void dsk_dlg_keyboard(bool show);
 
+/* True while a box somebody has to type into is up: see dsk_oskbd.h. */
+bool dsk_dlg_wants_keys(void);
+
+/* How much of the bottom of the work area the keyboard is using. */
+void dsk_dlg_reserve(int16_t bottom_px);
+
 /* False when a dialog is already up. */
 bool dsk_dlg_message(const char *title, const char *line1, const char *line2,
                      dsk_dlg_kind_t kind,

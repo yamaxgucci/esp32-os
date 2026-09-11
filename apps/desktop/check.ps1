@@ -500,7 +500,7 @@ try {
     # menu lists the windows topmost first after its own items, so the ninth
     # entry is the one underneath the console.
     #
-    # Nine because the menu grew: 'MS-DOS Prompt' went in beside 'System
+    # Nine because the menu grew: 'Console' went in beside 'System
     # console' and pushed every window entry down one.  Counting arrow keys
     # into a menu whose length is a property of the program is a trap, and
     # this is the bill for it: the folder never came back, so the clipboard,
@@ -594,7 +594,7 @@ try {
     #
     # It spent three runs looking like a defect in the window - 151 of 365
     # keystrokes delivered, to the keystroke, and everything after it dead.
-    # The window was innocent.  Adding 'MS-DOS Prompt' to the Window menu
+    # The window was innocent.  Adding 'Console' to the Window menu
     # made that menu one item longer, and $backToFolder walks that menu by
     # counting Down keys: its eighth stop had been the folder and became
     # the console.  The folder never came back, so every later step acted
@@ -606,7 +606,7 @@ try {
     # it through the file system rather than the screen: the directory
     # below exists afterwards or the keys never reached a shell.
     #
-    # Window > MS-DOS Prompt, the seventh stop, and a command typed
+    # Window > Console, the seventh stop, and a command typed
     # into it.
     #
     # This is the one thing the console window beside it cannot do.
@@ -1165,7 +1165,7 @@ try {
         # regex shaped around 'Directory of C:\' is no use either: the
         # listing arrives full of escape codes.
         if ($seen -notmatch 'fromwin\s+<DIR>') {
-            $fail += 'the MS-DOS Prompt window never reached a shell'
+            $fail += 'the Console window never reached a shell'
         }
 
         # And what the desktop's own counters say about the same step, which
@@ -1174,9 +1174,9 @@ try {
         $fwd = [regex]::Match($text,
                'prompt window (opened|never opened), (\d+) key\(s\) forwarded, (\d+) taken')
         if (-not $fwd.Success -or $fwd.Groups[1].Value -ne 'opened') {
-            $fail += 'the MS-DOS Prompt window never opened'
+            $fail += 'the Console window never opened'
         } elseif ($fwd.Groups[2].Value -eq '0') {
-            $fail += 'the MS-DOS Prompt window got no keys'
+            $fail += 'the Console window got no keys'
         } elseif ($fwd.Groups[3].Value -ne $fwd.Groups[2].Value) {
             $fail += ("the prompt's slot refused keys: " +
                       $fwd.Groups[3].Value + ' of ' + $fwd.Groups[2].Value + ' taken')

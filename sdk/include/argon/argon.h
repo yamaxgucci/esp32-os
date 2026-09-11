@@ -187,6 +187,16 @@ static inline int32_t ag_con_peek_row_slot(int slot, uint16_t row,
     return g_ag_api->con->peek_row_slot(slot, row, cells, max);
 }
 
+/* Where the cursor is on another slot's screen (ABI 0.46). */
+static inline bool ag_con_cursor_slot(int slot, uint16_t *x, uint16_t *y)
+{
+    if (!AG_HAS(g_ag_api->con, cursor_of_slot) ||
+        g_ag_api->con->cursor_of_slot == NULL) {
+        return false;
+    }
+    return g_ag_api->con->cursor_of_slot(slot, x, y) == 0;
+}
+
 /* Hand a key to the prompt living in a slot (ABI 0.45). */
 static inline bool ag_post_to_slot(int slot, const ag_event_t *e)
 {

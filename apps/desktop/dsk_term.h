@@ -13,7 +13,7 @@
  * draws them itself.  It is a *view*: what it shows is the one console the
  * machine has, and typing goes to the desktop as it always did.
  *
- * What it is not, and why not yet: an MS-DOS Prompt, meaning a shell of its
+ * What it is not, and why not yet: a Console, meaning a shell of its
  * own to type at.  That needs a console screen per session slot - there is
  * exactly one today, and switching slots clears it - and a second instance of
  * the shell.  Both are kernel work and neither is needed to read what the
@@ -43,6 +43,26 @@ dsk_win_t *dsk_term_open_slot(const dsk_metrics_t *m, int slot);
 
 /* How many keys a prompt window passed on, and how many the slot took. */
 void dsk_term_fwd_stats(uint32_t *sent, uint32_t *taken);
+
+/*
+ * Whether this window is somebody's prompt rather than the view.
+ *
+ * The shell asks because a prompt is the one window here that a person
+ * types a line into, and on a board whose only input is a stylus that
+ * is when the keyboard has to come up.  The keyboard itself belongs to
+ * the desk, not to this window: there is one of them, and it serves
+ * whatever has focus.
+ */
+bool dsk_term_is_prompt(const dsk_win_t *w);
+
+/*
+ * A tap landed on a prompt's text since this was last asked.
+ *
+ * The desk raises its keyboard on that and on nothing else: a drag is
+ * how the text is scrolled back, and the frame belongs to the window
+ * manager, so neither of those should bring up a keyboard.
+ */
+bool dsk_term_take_tap(void);
 
 /*
  * Re-read the console and damage the rows that changed.

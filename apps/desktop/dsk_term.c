@@ -52,6 +52,19 @@ typedef struct {
     bool          polled;
     uint16_t      caret_x;
     uint16_t      caret_y;
+    /*
+     * Scrolled back by hand, and therefore not following the cursor.
+     *
+     * A terminal that always shows the newest rows cannot be read back, and
+     * on a panel there is no scrollbar worth hitting with a thumb - so the
+     * text itself is dragged.  Dragged to the bottom it follows the prompt
+     * again, which is what a person means by getting back to the bottom.
+     */
+    bool          pinned;
+    int16_t       drag_y;      /* where the finger went down */
+    uint16_t      drag_first;  /* and which row was at the top then */
+    bool          dragging;
+    bool          moved;       /* a drag, so the release is not a tap */
 } term_t;
 
 #define TERM_MAX 2 /* the console view and one prompt; 4.8 KB each */
@@ -163,22 +176,53 @@ static void term_draw(dsk_win_t *w, dsk_rect_t client)
      * is is part of what it says.
      */
     /*
-     * Only for the view.  ag_coninfo answers about THIS task's console, and
-     * a prompt window is showing another slot's screen: there is no way to
-     * ask where that screen's cursor is, so drawing one here would be
-     * drawing our own cursor on somebody else's text.
+     * Only the window in front has a caret.
+     *
+     * That is what a caret says - "the keys are coming here" - and with two
+     * text windows on the desk a caret in both says nothing at all.  It also
+     * keeps a still picture still: a blinking caret in a window nobody is
+     * typing into is a screen that never stops changing, and the shell's own
+     * proof that a repaint put back exactly what was there cannot tell that
+     * apart from a repaint that lost something.
      */
-    if (t->slot >= 0) {
+    if (dsk_wm_active() != w) {
         return;
     }
-    ag_coninfo_t info;
-    ag_coninfo(&info);
-    if (info.cur_y >= t->first_row && info.cur_y < t->first_row + t->shown_rows &&
-        info.cur_x < t->shown_cols) {
+
+    /*
+     * Whose cursor, and where.
+     *
+     * coninfo answers about THIS task's console, so a prompt window asks the
+     * system about the slot it is showing (ABI 0.46).  Without that it drew
+     * no caret at all, and a prompt with nothing blinking in it does not
+     * look like a prompt.
+     */
+    uint16_t cur_x = 0, cur_y = 0;
+    if (t->slot < 0) {
+        ag_coninfo_t info;
+        ag_coninfo(&info);
+        cur_x = info.cur_x;
+        cur_y = info.cur_y;
+    } else if (!ag_con_cursor_slot(t->slot, &cur_x, &cur_y)) {
+        return;
+    }
+
+    /*
+     * Blinking, because that is what says "this one is taking what you
+     * type": with two windows on the desk showing text, a still block says
+     * nothing about which of them the keys are going to.  Half a second on,
+     * half a second off, off the same clock for both windows.
+     */
+    if (((ag_millis() / 500u) & 1u) != 0u) {
+        return;
+    }
+
+    if (cur_y >= t->first_row && cur_y < t->first_row + t->shown_rows &&
+        cur_x < t->shown_cols) {
         const dsk_rect_t caret =
-            dsk_rect((int16_t)(client.x + info.cur_x * dsk_ui_w()),
+            dsk_rect((int16_t)(client.x + cur_x * dsk_ui_w()),
                      (int16_t)(client.y +
-                               (info.cur_y - t->first_row) * dsk_ui_h() +
+                               (cur_y - t->first_row) * dsk_ui_h() +
                                dsk_ui_h() - 2),
                      dsk_ui_w(), 2);
         if (dsk_visible(caret)) {
@@ -199,10 +243,96 @@ static void term_closed(dsk_win_t *w)
 static bool term_key(dsk_win_t *w, uint16_t keycode, uint32_t unicode,
                      uint16_t mods);
 
+/*
+ * A tap landed on a prompt's text, and nobody has taken it yet.
+ *
+ * The desk polls this to raise its keyboard.  It is a TAP, not a press: a
+ * drag is how the text is scrolled, and a keyboard that came up on every
+ * press covered the very rows the person was dragging into view.  Nor is it
+ * the frame - dragging a window by its caption is not asking to type.
+ */
+static bool s_tapped;
+
+bool dsk_term_take_tap(void)
+{
+    const bool was = s_tapped;
+    s_tapped = false;
+    return was;
+}
+
+/* How many rows the text can be scrolled back through. */
+static uint16_t rows_total(const term_t *t)
+{
+    ag_coninfo_t info;
+    ag_coninfo(&info);
+    const uint16_t rows = (info.rows > 0) ? info.rows : t->shown_rows;
+    return (rows > t->shown_rows) ? rows : t->shown_rows;
+}
+
+static bool term_pointer(dsk_win_t *w, dsk_hit_t where, int16_t x, int16_t y,
+                         uint8_t buttons, dsk_ptr_t type, bool dbl)
+{
+    (void)x;
+    (void)buttons;
+    (void)dbl;
+    term_t *t = term_of(w);
+    if (t == NULL) {
+        return false;
+    }
+
+    if (type == DSK_PTR_DOWN) {
+        if (where != DSK_HIT_CLIENT) {
+            return false; /* the frame is the window manager's business */
+        }
+        t->dragging = true;
+        t->moved = false;
+        t->drag_y = y;
+        t->drag_first = t->first_row;
+        return true;
+    }
+    if (!t->dragging) {
+        return false;
+    }
+
+    const uint16_t total = rows_total(t);
+    const int16_t  dy = (int16_t)(y - t->drag_y);
+    const int16_t  rows = (int16_t)(dy / (int16_t)dsk_ui_h());
+    if (rows != 0) {
+        t->moved = true;
+        /*
+         * Dragged DOWN means "show me what came before", the way a sheet of
+         * paper moves under a finger rather than the view moving over it.
+         */
+        int32_t want = (int32_t)t->drag_first - rows;
+        const int32_t most = (int32_t)total - (int32_t)t->shown_rows;
+        if (want < 0) {
+            want = 0;
+        }
+        if (want > most) {
+            want = most;
+        }
+        if ((uint16_t)want != t->first_row) {
+            t->first_row = (uint16_t)want;
+            t->polled = false; /* every row on screen is a different row now */
+            dsk_wm_damage_rect(dsk_wm_client(w));
+        }
+        /* At the bottom it follows the prompt again; above it, it stays. */
+        t->pinned = ((int32_t)t->first_row < most);
+    }
+
+    if (type == DSK_PTR_UP) {
+        t->dragging = false;
+        if (!t->moved && t->slot >= 0) {
+            s_tapped = true; /* a tap on a prompt's text asks for the keys */
+        }
+    }
+    return true;
+}
+
 static const dsk_win_ops_t k_term_ops = {
     .draw = term_draw,
     .key = term_key,
-    .pointer = NULL,
+    .pointer = term_pointer,
     .closed = term_closed,
 };
 
@@ -340,7 +470,7 @@ dsk_win_t *dsk_term_open_slot(const dsk_metrics_t *m, int slot)
     t->caret_x = 0xFFFFu;
     t->caret_y = 0xFFFFu;
 
-    t->win = dsk_wm_open((slot < 0) ? "System console" : "MS-DOS Prompt",
+    t->win = dsk_wm_open((slot < 0) ? "System console" : "Console",
                          frame, &k_term_ops, NULL);
     return t->win;
 }
@@ -388,10 +518,24 @@ static void tick_one(term_t *t)
      * than the window, the rows worth showing are the ones being written, not
      * the ones at the top that have scrolled out of interest.
      */
-    uint16_t first = 0;
-    if (t->slot < 0 && info.rows > t->shown_rows &&
-        info.cur_y >= t->shown_rows) {
-        first = (uint16_t)(info.cur_y - t->shown_rows + 1u);
+    uint16_t first = t->first_row;
+    if (!t->pinned) {
+        /*
+         * Follow the cursor, the way a terminal does - unless somebody has
+         * scrolled back, in which case the rows they are reading stay put
+         * while the prompt goes on printing underneath.
+         */
+        uint16_t cur_y = 0;
+        if (t->slot < 0) {
+            cur_y = info.cur_y;
+        } else {
+            uint16_t cur_x = 0;
+            (void)ag_con_cursor_slot(t->slot, &cur_x, &cur_y);
+        }
+        first = 0;
+        if (info.rows > t->shown_rows && cur_y >= t->shown_rows) {
+            first = (uint16_t)(cur_y - t->shown_rows + 1u);
+        }
     }
     const bool scrolled = (first != t->first_row) || !t->polled;
     t->first_row = first;
@@ -425,17 +569,43 @@ static void tick_one(term_t *t)
      * one cell and moves the caret off another - so its row is repainted
      * whenever it has moved.
      */
-    if (t->slot < 0 && (info.cur_x != t->caret_x || info.cur_y != t->caret_y)) {
-        for (int pass = 0; pass < 2; pass++) {
-            const uint16_t cy = (pass == 0) ? t->caret_y : info.cur_y;
-            if (cy >= t->first_row && cy < t->first_row + t->shown_rows) {
+    if (dsk_wm_active() != t->win) {
+        /*
+         * No caret in a window that is not taking the keys - and the row it
+         * was last drawn on has to be repainted once, or the caret stays
+         * behind on a window that has just lost the focus.
+         */
+        if (t->caret_y != 0xFFFFu) {
+            if (t->caret_y >= t->first_row &&
+                t->caret_y < t->first_row + t->shown_rows) {
                 dsk_wm_damage_rect(
-                    row_rect(t, client, (uint16_t)(cy - t->first_row)));
+                    row_rect(t, client, (uint16_t)(t->caret_y - t->first_row)));
             }
+            t->caret_x = 0xFFFFu;
+            t->caret_y = 0xFFFFu;
         }
-        t->caret_x = info.cur_x;
-        t->caret_y = info.cur_y;
+        return;
     }
+
+    uint16_t cx = info.cur_x, cy = info.cur_y;
+    if (t->slot >= 0) {
+        (void)ag_con_cursor_slot(t->slot, &cx, &cy);
+    }
+    /*
+     * The caret blinks, so its row is repainted on every poll rather than
+     * only when it moves: a hundred milliseconds of a window the size of a
+     * line is nothing, and it is the only thing that says where the typing
+     * is going.
+     */
+    for (int pass = 0; pass < 2; pass++) {
+        const uint16_t row = (pass == 0) ? t->caret_y : cy;
+        if (row >= t->first_row && row < t->first_row + t->shown_rows) {
+            dsk_wm_damage_rect(
+                row_rect(t, client, (uint16_t)(row - t->first_row)));
+        }
+    }
+    t->caret_x = cx;
+    t->caret_y = cy;
 }
 
 void dsk_term_tick(void)
@@ -458,4 +628,10 @@ void dsk_term_fwd_stats(uint32_t *sent, uint32_t *taken)
     if (taken != NULL) {
         *taken = s_fwd_ok;
     }
+}
+
+bool dsk_term_is_prompt(const dsk_win_t *w)
+{
+    const term_t *t = term_of(w);
+    return (t != NULL) && (t->slot >= 0);
 }

@@ -27,6 +27,7 @@
 #include "dsk_folder.h"
 #include "dsk_icons.h"
 #include "dsk_menu.h"
+#include "dsk_oskbd.h"
 #include "dsk_ini.h"
 #include "dsk_ops.h"
 #include "dsk_paint.h"
@@ -55,6 +56,7 @@ static uint32_t s_key_events;
 static uint8_t  s_buttons;
 static uint32_t s_repaints;
 static uint32_t s_prompt_asks;
+static bool     s_keys_for_dlg;  /* the keyboard is up for a box */
 static int32_t  s_prompt_slot = -999;
 static bool     s_prompt_opened;
 static uint32_t s_reflushes;
@@ -1087,6 +1089,8 @@ static void apply_keyboard(void)
                     : (s_ini.keyboard == 2) ? false
                                             : !machine_has_keys();
     dsk_dlg_keyboard(on);
+    dsk_oskbd_allow(on);
+    dsk_dlg_reserve(on ? dsk_oskbd_height() : 0);
     ag_printf("desktop: on-screen keyboard %s%s\n", on ? "on" : "off",
               (s_ini.keyboard == 0) ? " (automatic)" : "");
 }
@@ -2221,7 +2225,7 @@ static void rebuild_menus(void)
      * it shows - and what it deliberately does not do yet - is in dsk_term.h.
      */
     set_item(&s_menus[2], "System console", ID_CONSOLE, true);
-    set_item(&s_menus[2], "MS-DOS Prompt", ID_PROMPT, true);
+    set_item(&s_menus[2], "Console", ID_PROMPT, true);
     if (n > 0) {
         set_separator(&s_menus[2]);
     }
@@ -2658,7 +2662,10 @@ static void draw_region(dsk_rect_t r)
     draw_statusbar();
     dsk_clip_reset();
 
-    /* Last of all, because a menu is above every window. */
+    /* Above every window, because it is the desk's and not a window's. */
+    dsk_oskbd_draw(r);
+
+    /* Last of all, because a menu is above even that. */
     dsk_menu_draw_open(r);
 }
 
@@ -2822,6 +2829,14 @@ static void on_pointer(dsk_ptr_t type, int16_t x, int16_t y, uint8_t buttons,
     }
     s_last_ptr = now;
 
+    /*
+     * The keyboard first, because it is on top of everything it covers: a
+     * window underneath must not get the press that landed on a key.
+     */
+    if (dsk_oskbd_pointer(type, x, y)) {
+        return;
+    }
+
     s_buttons = buttons;
     if (dsk_paint_banded()) {
         damage(dsk_cursor_place_moved(x, y));
@@ -2912,6 +2927,13 @@ static void on_pointer(dsk_ptr_t type, int16_t x, int16_t y, uint8_t buttons,
         if (s_ptr_log) {
             ag_printf("ptr    taken by a window\n");
         }
+        /*
+         * A prompt is where a person types a line, so touching one is
+         * how the keyboard is asked for on a board with no keys.  Not
+         * the view beside it, which takes no typing, and not any other
+         * window: a keyboard that came up whenever anything was touched
+         * would spend its life covering what had just been tapped.
+         */
         if (type == DSK_PTR_DOWN && !dbl) {
             fdrag_arm(x, y);
             s_press.armed = true;
@@ -2969,6 +2991,21 @@ static void on_pointer(dsk_ptr_t type, int16_t x, int16_t y, uint8_t buttons,
         s_drag.dy = (int16_t)(y - drive_rect(d).y);
         s_drag.moved = false;
     }
+}
+
+/*
+ * What the keyboard drawn on the glass produces.
+ *
+ * Straight into the same place a driver's key arrives, so the menu, the
+ * dialogs and the prompt window need to know nothing about where a key came
+ * from - and so that anything which works with a keyboard plugged in works
+ * with a stylus too, without a second path to keep in step.
+ */
+static void on_key(uint16_t keycode, uint32_t unicode, uint16_t mods);
+
+static void oskbd_key(uint16_t keycode, uint32_t unicode)
+{
+    on_key(keycode, unicode, 0);
 }
 
 static void on_key(uint16_t keycode, uint32_t unicode, uint16_t mods)
@@ -3314,6 +3351,7 @@ int ag_main(int argc, char **argv)
     dsk_wm_init(&s_m, damage);
     dsk_menu_init(&s_m, damage, menu_chose);
     dsk_dlg_init(&s_m);
+    dsk_oskbd_init(&s_m, damage, oskbd_key);
     apply_keyboard();
     dsk_folder_init(&s_m, open_from_folder);
     dsk_run_init(repaint_all);
@@ -3390,6 +3428,38 @@ int ag_main(int argc, char **argv)
          * it was.
          */
         wait = soonest(wait, dsk_term_due_in(now));
+
+        /*
+         * A box that has to be typed into gets the keyboard, and loses it
+         * when it goes.  Polled rather than pushed because a box can be
+         * opened from a dozen places here - the menu, a key, a drag that
+         * ends on a folder - and every one of them would have to remember.
+         *
+         * Only the box's own keyboard goes away with it: one raised by
+         * touching a prompt stays until it is dismissed by its own key,
+         * because the person put it there.
+         */
+        if (dsk_term_take_tap()) {
+            dsk_oskbd_show(true);
+        }
+
+        const bool dlg_keys = dsk_dlg_wants_keys();
+        if (dlg_keys != s_keys_for_dlg) {
+            s_keys_for_dlg = dlg_keys;
+            dsk_oskbd_mode(dlg_keys);
+            if (dlg_keys) {
+                dsk_oskbd_show(true);
+            } else if (!dsk_term_is_prompt(dsk_wm_active())) {
+                /*
+                 * The box has gone and nothing else is waiting for a line,
+                 * so the keys go with it - Cancel used to leave them sitting
+                 * there over half the screen.  A prompt in front is the one
+                 * thing that keeps them: it IS waiting for a line.
+                 */
+                dsk_oskbd_show(false);
+            }
+        }
+
         wait = soonest(wait, press_due_in(now));
         wait = soonest(wait, screen_due_in(now));
         if (screen_due_in(now) == 0u) {

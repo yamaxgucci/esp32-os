@@ -151,7 +151,7 @@ extern "C" {
  *      column and row by the cell size on the way in.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 45u
+#define AG_ABI_MINOR 46u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -531,6 +531,20 @@ typedef struct ag_con_api {
     /* ABI 0.45. */
     int32_t (*peek_row_slot)(int slot, uint16_t row, ag_textcell_t *cells,
                              uint16_t max);
+
+    /*
+     * Where that screen's cursor is.
+     *
+     * A window drawing somebody else's prompt has no way to ask: coninfo
+     * answers about the CALLER's console, so a window that drew a caret from
+     * it would be drawing its own cursor on another screen's text - and one
+     * that drew none, as this did first, shows a prompt with nothing
+     * blinking in it, which does not look like a prompt at all.
+     *
+     * Zero on success; the coordinates are cells.
+     */
+    /* ABI 0.46. */
+    int32_t (*cursor_of_slot)(int slot, uint16_t *x, uint16_t *y);
 
 } ag_con_api_t;
 

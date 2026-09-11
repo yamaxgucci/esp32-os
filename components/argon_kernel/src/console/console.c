@@ -187,7 +187,22 @@ void *ag_console_lock_holder(void)
 /* AG_SESSION_SYSTEM is index 0; user slots 0..3 are 1..4.  Defined below. */
 static int screen_index(int slot);
 
-ag_screen_t *ag_console_screen(void) { return &s_screens[s_active]; }
+static ag_screen_t *write_screen(void);
+
+/*
+ * The screen this caller writes to, which is not always the visible one.
+ *
+ * Same rule as every other write: a task bound to a slot gets that slot's
+ * screen, and everyone else gets what is on the glass.  It used to return
+ * the visible screen flatly, and that is what made a prompt window empty -
+ * ag_console_puts went to the slot's own screen while the shell's prompt
+ * and its line, which are drawn through this, went onto the screen the
+ * desktop was sitting on top of.  The window looked at the slot, nothing
+ * had ever been written there, and the prompt was invisible on both.
+ *
+ * Drivers and the session layer have no bind, so they still get the glass.
+ */
+ag_screen_t *ag_console_screen(void) { return write_screen(); }
 
 /*
  * The screen belonging to a slot, or NULL when that slot has never had one
