@@ -67,6 +67,20 @@ ag_err_t ag_console_resize(uint16_t cols, uint16_t rows);
  * machine with no memory for one goes on sharing - that is a slower version
  * of the old behaviour, not a broken one.
  */
+/*
+ * Send THIS task's console output to a slot's own screen, whatever is
+ * visible.  A negative slot puts it back on the visible one.
+ *
+ * For a shell that runs in a slot nobody is looking at: its output belongs
+ * to that slot's screen and must not land over the top of what is in front.
+ * Only the visible screen is rendered to the terminal, so a bound task's
+ * writes wait in their buffer until somebody looks at them.
+ *
+ * Input is not affected and cannot be: there is one keyboard, and which
+ * slot it belongs to is the session's business, not the console's.
+ */
+ag_err_t ag_console_bind_task(int slot);
+
 ag_err_t ag_console_use_slot(int slot);
 
 /*

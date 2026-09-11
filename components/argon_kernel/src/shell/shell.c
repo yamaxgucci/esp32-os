@@ -73,10 +73,73 @@ typedef struct {
 
 int ag_edit_main(int argc, char **argv);
 
-static char          s_cwd[AG_PATH_MAX] = "/";
-static ag_lineedit_t s_line;
-static int           s_last_status;
-static int           s_script_depth;
+/*
+ * What belongs to ONE prompt, as against the machine it runs on.
+ *
+ * There was one prompt for as long as there was one shell, and this was
+ * four file-scope variables.  A second shell - a prompt in a window, with
+ * its own slot and its own directory - makes them four variables per
+ * instance instead, and the difference between the two kinds of state is
+ * the whole content of this struct: a working directory and a line being
+ * edited belong to a prompt, while the device registry, the journal and
+ * SYSTEM.CFG belong to the machine and stay where they are.
+ *
+ * `slot` is the session this prompt serves, or AG_SESSION_FOLLOW for the
+ * original one, which serves whichever slot is focused - that is what the
+ * system shell has always done and it is not a special case to be removed.
+ */
+#define AG_SESSION_FOLLOW (-1)
+
+/* Where this prompt starts on its own screen; the line editor draws from it. */
+typedef struct {
+    uint16_t row;
+    uint16_t col0;
+} prompt_pos_t;
+
+typedef struct {
+    char          cwd[AG_PATH_MAX];
+    ag_lineedit_t line;
+    int           last_status;
+    int           script_depth;
+    char          prompt[AG_PATH_MAX + 16];
+    prompt_pos_t  pos;
+    int           slot;
+} shell_ctx_t;
+
+static shell_ctx_t s_ctx0 = { .cwd = "/", .slot = AG_SESSION_FOLLOW };
+
+/*
+ * Which prompt is speaking, keyed by task.
+ *
+ * The alternative was to pass a context pointer through five thousand
+ * lines of command implementations, most of which have nothing to do with
+ * a prompt.  Keyed by task, the four names below go on meaning exactly
+ * what they meant - "this prompt's directory" - and resolve to the right
+ * one without a single call site changing.
+ */
+static struct {
+    ag_port_task_t task;
+    shell_ctx_t   *ctx;
+} s_ctxs[AG_SESSION_SLOTS];
+
+static shell_ctx_t *sh(void)
+{
+    const ag_port_task_t me = ag_port_task_self();
+
+    for (unsigned i = 0; i < sizeof(s_ctxs) / sizeof(s_ctxs[0]); i++) {
+        if (s_ctxs[i].task == me && s_ctxs[i].ctx != NULL) {
+            return s_ctxs[i].ctx;
+        }
+    }
+    return &s_ctx0;
+}
+
+#define s_cwd          (sh()->cwd)
+#define s_line         (sh()->line)
+#define s_last_status  (sh()->last_status)
+#define s_script_depth (sh()->script_depth)
+#define s_prompt       (sh()->prompt)
+#define s_prompt_pos   (sh()->pos)
 
 #define AG_SHELL_SCRIPT_MAX_DEPTH 8
 
@@ -199,13 +262,7 @@ static void pick_initial_cwd(void)
 /* Line rendering                                                         */
 /* ---------------------------------------------------------------------- */
 
-typedef struct {
-    uint16_t row;
-    uint16_t col0;
-} prompt_pos_t;
-
-static char         s_prompt[AG_PATH_MAX + 16];
-static prompt_pos_t s_prompt_pos;
+/* prompt_pos_t and both of these now live in shell_ctx_t, above. */
 
 /* Caller holds the console lock. */
 static void redraw_line_locked(const ag_lineedit_t *le, const prompt_pos_t *pos)

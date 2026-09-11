@@ -98,6 +98,31 @@ static bool               s_screen_up[CON_SCREENS];
 static int                s_active; /* index into s_screens */
 
 #define s_screen (s_screens[s_active])
+
+/*
+ * Tasks that write to a screen of their own rather than to the visible one.
+ *
+ * The console has always been one place: whoever called wrote where the
+ * person was looking.  That is right for everything that exists today and
+ * wrong for the one thing that does not - a second shell, running in a slot
+ * nobody is looking at, whose output belongs to that slot's screen and must
+ * not appear over the top of whatever is in front.
+ *
+ * Keyed by task rather than by session, because that is the question being
+ * answered: not "whose slot is this" but "who is speaking".  Four entries
+ * because there are four user slots, and a task that never registers gets
+ * today's answer, which is why nothing else in the system has to change.
+ *
+ * The wire falls out of it for free.  Only the visible screen is rendered to
+ * the terminal, so a write to a hidden one stays in its buffer until
+ * somebody looks - which is exactly what a background prompt should do.
+ */
+#define CON_BINDS AG_SESSION_SLOTS
+
+static struct {
+    ag_port_task_t task;
+    int            index;
+} s_bind[CON_BINDS];
 static ag_con_endpoint_t  s_endpoints[AG_CON_MAX_ENDPOINTS];
 static ag_port_mutex_t         s_lock;
 static ag_port_queue_t s_events;
@@ -146,6 +171,50 @@ void *ag_console_lock_holder(void)
 
 ag_screen_t *ag_console_screen(void) { return &s_screens[s_active]; }
 
+/*
+ * Give a slot its own screen if it has not got one, at the size the console
+ * is now.
+ *
+ * Out of memory is not a failure worth stopping a slot switch for: the
+ * slots share the one screen again, which is what they all did until the
+ * per-slot screens existed.
+ */
+static ag_err_t ensure_screen(int want)
+{
+    if (s_screen_up[want]) {
+        return AG_OK;
+    }
+
+    const size_t need = ag_screen_memsize(s_screens[s_active].cols,
+                                          s_screens[s_active].rows);
+    void        *mem = ag_port_alloc(need, AG_MEM_FAST | AG_MEM_BYTE);
+    if (mem == NULL) {
+        ag_log(AG_LOG_WARN, "console", "no memory for screen %d; sharing",
+               want);
+        return -AG_ENOMEM;
+    }
+    if (ag_screen_init(&s_screens[want], mem, need, s_screens[s_active].cols,
+                       s_screens[s_active].rows) != AG_OK) {
+        ag_port_free(mem);
+        return -AG_ENOMEM;
+    }
+    s_screen_up[want] = true;
+    return AG_OK;
+}
+
+/* The screen the CALLING task writes to: its own, or the visible one. */
+static ag_screen_t *write_screen(void)
+{
+    const ag_port_task_t me = ag_port_task_self();
+
+    for (int i = 0; i < CON_BINDS; i++) {
+        if (s_bind[i].task == me) {
+            return &s_screens[s_bind[i].index];
+        }
+    }
+    return &s_screens[s_active];
+}
+
 /* AG_SESSION_SYSTEM is index 0; user slots 0..3 are 1..4. */
 static int screen_index(int slot)
 {
@@ -188,6 +257,45 @@ ag_err_t ag_console_adopt_slot(int slot)
     return AG_OK;
 }
 
+ag_err_t ag_console_bind_task(int slot)
+{
+    const ag_port_task_t me = ag_port_task_self();
+
+    ag_console_lock();
+    /* Unbind first, so a second call replaces rather than duplicates. */
+    for (int i = 0; i < CON_BINDS; i++) {
+        if (s_bind[i].task == me) {
+            s_bind[i].task = NULL;
+        }
+    }
+    if (slot < 0) {
+        ag_console_unlock();
+        return AG_OK;
+    }
+
+    const int want = screen_index(slot);
+    if (want < 0) {
+        ag_console_unlock();
+        return -AG_EINVAL;
+    }
+    /* The screen has to exist before anything writes to it. */
+    if (ensure_screen(want) != AG_OK) {
+        ag_console_unlock();
+        return -AG_ENOMEM;
+    }
+
+    for (int i = 0; i < CON_BINDS; i++) {
+        if (s_bind[i].task == NULL) {
+            s_bind[i].task = me;
+            s_bind[i].index = want;
+            ag_console_unlock();
+            return AG_OK;
+        }
+    }
+    ag_console_unlock();
+    return -AG_ENOSPC;
+}
+
 ag_err_t ag_console_use_slot(int slot)
 {
     const int want = screen_index(slot);
@@ -201,30 +309,9 @@ ag_err_t ag_console_use_slot(int slot)
         return AG_OK;
     }
 
-    if (!s_screen_up[want]) {
-        /*
-         * A slot that has never been looked at gets its screen now, at the
-         * size the console is now.  Out of memory is not a failure worth
-         * stopping a slot switch for: the slots share the one screen again,
-         * which is what they all did until today.
-         */
-        const size_t need = ag_screen_memsize(s_screens[s_active].cols,
-                                              s_screens[s_active].rows);
-        void        *mem = ag_port_alloc(need, AG_MEM_FAST | AG_MEM_BYTE);
-        if (mem == NULL) {
-            ag_console_unlock();
-            ag_log(AG_LOG_WARN, "console",
-                   "no memory for slot %d's own screen; sharing", slot);
-            return -AG_ENOMEM;
-        }
-        if (ag_screen_init(&s_screens[want], mem, need,
-                           s_screens[s_active].cols,
-                           s_screens[s_active].rows) != AG_OK) {
-            ag_port_free(mem);
-            ag_console_unlock();
-            return -AG_ENOMEM;
-        }
-        s_screen_up[want] = true;
+    if (ensure_screen(want) != AG_OK) {
+        ag_console_unlock();
+        return -AG_ENOMEM;
     }
 
     s_active = want;
@@ -307,7 +394,7 @@ void ag_console_write(const char *buf, size_t len)
     if (s_redirect != NULL) {
         s_redirect(s_redirect_ctx, buf, len);
     } else {
-        ag_screen_write(&s_screen, buf, len);
+        ag_screen_write(write_screen(), buf, len);
     }
     ag_console_unlock();
 }
@@ -326,16 +413,17 @@ void ag_console_write_log(const char *buf, size_t len)
          * The prompt leaves the cursor mid-line.  Break away, print the
          * message, then hand the row back to whoever is editing.
          */
-        if (s_screen.cur_x != 0) {
-            ag_screen_puts(&s_screen, "\n");
+        ag_screen_t *sc = write_screen();
+        if (sc->cur_x != 0) {
+            ag_screen_puts(sc, "\n");
         }
-        ag_screen_write(&s_screen, buf, len);
+        ag_screen_write(sc, buf, len);
         if (buf[len - 1] != '\n') {
-            ag_screen_puts(&s_screen, "\n");
+            ag_screen_puts(sc, "\n");
         }
         s_live(s_live_ctx);
     } else {
-        ag_screen_write(&s_screen, buf, len);
+        ag_screen_write(write_screen(), buf, len);
     }
     ag_console_unlock();
 }
