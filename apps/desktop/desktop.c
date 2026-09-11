@@ -1336,15 +1336,26 @@ static void fdrag_arm(int16_t x, int16_t y)
         return;
     }
     /*
-     * And not when the window has already made that press the corner of a
-     * rubber band.  Both cannot run: the drop takes the release, and a
-     * band that never hears the release stays drawn on the glass with its
-     * marks half made - which is exactly what happened, silently, because
-     * this used to ask "was the press on the picked row?" AFTER the window
-     * had moved the picked row to be the one under the press.  It is the
-     * window's decision and the window is asked for it.
+     * From a row, and only from a row.
+     *
+     * This used to arm on ANY press the window took, the caption
+     * included - and the release of a window being dragged by its
+     * caption was then eaten as the drop of a file nobody was dragging,
+     * so `end_track` never ran and the window stayed drawn where it had
+     * been until something else repainted it.  Maxim reported that as
+     * "the window does not move until you click somewhere", and it was
+     * not new: it needed the active folder window to have a selection,
+     * which is most of the time.
+     *
+     * And not when the window has made that press the corner of a rubber
+     * band.  Both cannot run - the drop takes the release, and a band
+     * that never hears the release stays drawn with its marks half made.
+     * The window is asked for its own decision rather than the answer
+     * being guessed at from the coordinates: guessing got it exactly
+     * backwards once already, because by the time the question was asked
+     * the selection had already moved to the row under the press.
      */
-    if (dsk_folder_band_armed(w)) {
+    if (!dsk_folder_in_list(w, x, y) || dsk_folder_band_armed(w)) {
         return;
     }
     s_fdrag.armed = true;

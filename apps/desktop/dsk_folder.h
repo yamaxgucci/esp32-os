@@ -92,6 +92,11 @@ bool dsk_folder_marked_at(const dsk_win_t *w, int which, char *path,
  */
 bool dsk_folder_on_sel(const dsk_win_t *w, int16_t x, int16_t y);
 
+/* Is this point in the list itself - not the caption, border, scroll bar
+ * or status strip?  Asked by whoever wants to know whether a press was
+ * aimed at the files or at the furniture. */
+bool dsk_folder_in_list(const dsk_win_t *w, int16_t x, int16_t y);
+
 /*
  * Did the press that just happened begin a rubber band?
  *

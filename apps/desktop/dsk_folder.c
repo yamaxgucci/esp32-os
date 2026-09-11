@@ -505,6 +505,16 @@ static void draw_status(dsk_win_t *w, folder_t *f)
     }
 }
 
+bool dsk_folder_in_list(const dsk_win_t *w, int16_t x, int16_t y)
+{
+    if (w == NULL || !dsk_folder_is(w)) {
+        return false;
+    }
+    const dsk_rect_t l = list_rect((dsk_win_t *)w);
+    const dsk_rect_t b = bar_rect((dsk_win_t *)w);
+    return dsk_rect_has(l, x, y) && !dsk_rect_has(b, x, y);
+}
+
 bool dsk_folder_on_sel(const dsk_win_t *w, int16_t x, int16_t y)
 {
     if (w == NULL || !dsk_folder_is(w)) {
@@ -528,7 +538,18 @@ static bool folder_pointer(dsk_win_t *w, dsk_hit_t where, int16_t x,
 dsk_win_t *dsk_folder_banding(void)
 {
     for (int i = 0; i < FOLDER_MAX; i++) {
-        if (s_folders[i].used && s_folders[i].pressed) {
+        /*
+         * Drawn, not merely armed.
+         *
+         * Every press in a list arms a possible band, and most of them
+         * turn out to be clicks.  Owning the pointer from the press would
+         * mean the folder eating the release of every click in it - the
+         * context menu's among them - and, worse, one stale armed flag
+         * would take the pointer away from everything else in the shell:
+         * a window dragged by its caption stopped being redrawn at the
+         * end of the drag, because end_track never got the release.
+         */
+        if (s_folders[i].used && s_folders[i].band) {
             /*
              * The folder knows its own state but not which window wears
              * it, so the windows are asked instead - there are at most a
@@ -1238,6 +1259,14 @@ dsk_win_t *dsk_folder_open(const char *path)
         return NULL;
     }
     f->used = true;
+    /*
+     * A slot is reused, so the gesture it was left in is not this
+     * window's.  The marks live on the entries and go with them; these
+     * three do not belong to anything that gets freed.
+     */
+    f->band = false;
+    f->pressed = false;
+    f->ax = f->ay = f->bx = f->by = 0;
     ag_strlcpy(f->path, path, sizeof(f->path));
 
     /* Cascaded, and wide enough for a name and a size when the screen allows. */

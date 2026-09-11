@@ -255,6 +255,35 @@ try {
         "glide $rowX,$($rowY + 32),12", 'wait 300', 'release', 'wait 400',
         "move $rowX,$rowY", 'click', 'wait 300',
 
+        # And now drag the window itself by its caption, forty pixels to
+        # the right - sideways only.
+        #
+        # This was not tested at all until a rubber band broke it: while
+        # one gesture owns the pointer nothing else can have it, and a
+        # band that took the pointer from the press rather than from the
+        # rectangle swallowed the release that ends a window drag.  The
+        # window then stayed drawn where it had been until something else
+        # happened to repaint it - which is what Maxim saw and this file
+        # could not.
+        #
+        # Checked through DESKTOP.INI rather than by eye: the arrangement
+        # holds the frame, so a drag that did not finish leaves the old
+        # position written down.
+        # Sideways only, because x is the coordinate this file knows
+        # exactly: the work area starts at 0 and the window opens eight
+        # pixels into it.  The height of the menu bar is a guess here and
+        # is two pixels out, which does not matter for clicking a row and
+        # would matter for comparing a y.
+        #
+        # A move to the target before the release, so the landing place
+        # is not whichever glide step happened to be delivered last: the
+        # window goes where the outline was, and the outline follows the
+        # moves.
+        "move $($fwX + 60),$($fwY + 8)", 'press', 'wait 200',
+        "glide $($fwX + 100),$($fwY + 8),12", 'wait 300',
+        "move $($fwX + 100),$($fwY + 8)", 'wait 200',
+        'release', 'wait 600',
+
         # Into the only directory there is, and back out of it by "..".
         "move $rowX,$rowY", 'click', 'wait 120', 'click', 'wait 1500',
         "move $rowX,$rowY", 'click', 'wait 120', 'click', 'wait 1500',
@@ -997,6 +1026,22 @@ try {
         # of five would mean the marks were accumulated rather than
         # recomputed, and a count of one would mean the gesture never
         # became a band at all.
+        # The window drag landed where it was dropped.  The folder window
+        # is the only one in the arrangement - the console window has no
+        # path and is not part of one - so there is exactly one line to
+        # read, and it is read as numbers rather than matched as a
+        # spelling.
+        $winline = [regex]::Match($text, '1 = (-?\d+),(-?\d+),\d+,\d+,\d+,c:')
+        if (-not $winline.Success) {
+            $fail += 'DESKTOP.INI holds no frame for the folder window'
+        } else {
+            $wx = [int]$winline.Groups[1].Value
+            if ($wx -ne ($fwX + 40)) {
+                $fail += ('the dragged window was written down at x=' +
+                          "$wx, not at " + ($fwX + 40))
+            }
+        }
+
         $band = [regex]::Match($text, 'desktop: band marked (\d+)')
         if (-not $band.Success) {
             $fail += 'the rubber band never reported a selection'
