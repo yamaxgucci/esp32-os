@@ -97,6 +97,15 @@ static void fill(uart_config_t *out, const ag_port_uart_cfg_t *cfg)
     out->parity = k_parity[(cfg->parity <= 2) ? cfg->parity : 0];
     out->stop_bits = (cfg->stop_bits == 2) ? UART_STOP_BITS_2 : UART_STOP_BITS_1;
     out->flow_ctrl = UART_HW_FLOWCTRL_DISABLE;
+    /*
+     * With flow control off this threshold is unused, but uart_param_config
+     * validates it unconditionally (rx_flow_ctrl_thresh < the FIFO length), so
+     * a stack-garbage value fails the call with "rx flow thresh error".  It hid
+     * as long as ag_port_uart_config's uart_config_t happened to sit on zeroed
+     * stack; a loadable driver reaching UART2 through the io layer found the
+     * value that was not.  Set it, and zero the whole struct at the call site.
+     */
+    out->rx_flow_ctrl_thresh = 0;
 
     /*
      * Not the default clock, and this is the line that lets the processor slow
@@ -197,7 +206,7 @@ ag_err_t ag_port_uart_config(int port, const ag_port_uart_cfg_t *cfg)
     esp_rom_output_tx_wait_idle((uint8_t)port);
 #endif
 
-    uart_config_t hw;
+    uart_config_t hw = {0};
     fill(&hw, cfg);
     return from_esp(uart_param_config(port, &hw));
 }

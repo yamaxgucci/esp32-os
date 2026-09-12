@@ -42,6 +42,7 @@
 #include <argon/vfs.h>
 
 #include <argon/port/mem.h>
+#include <argon/netprov.h>
 #include <argon/port/net.h>
 
 #include "net/netio.h"
@@ -185,14 +186,14 @@ static int ftp_data_open(ftp_t *f)
                           named);
     }
 
-    const int dfd = ag_port_net_connect(f->host_addr, port, FTP_CONNECT_MS);
+    const int dfd = ag_netprov_connect(f->host_addr, port, FTP_CONNECT_MS);
     if (dfd < 0) {
         ag_console_printf("data connection refused on port %u\n",
                           (unsigned)port);
         return dfd;
     }
     /* Non-blocking like every other socket here; netio does the waiting. */
-    (void)ag_port_net_nonblock(dfd, true);
+    (void)ag_netprov_nonblock(dfd, true);
     return dfd;
 }
 
@@ -239,13 +240,13 @@ static ag_err_t ftp_get(ftp_t *f, const char *remote, const char *dest)
     const int n = snprintf(cmd, sizeof(cmd), "RETR %s\r\n", remote);
     if (n < 0 || (size_t)n >= sizeof(cmd) ||
         ftp_send(f, cmd, (size_t)n) != AG_OK) {
-        ag_port_net_close(dfd);
+        ag_netprov_close(dfd);
         return -AG_EIO;
     }
 
     const int code = ftp_reply(f);
     if (code != 150 && code != 125) {
-        ag_port_net_close(dfd);
+        ag_netprov_close(dfd);
         return (code == 550) ? -AG_ENOENT : -AG_EIO;
     }
 
@@ -253,7 +254,7 @@ static ag_err_t ftp_get(ftp_t *f, const char *remote, const char *dest)
         ag_vfs_open(dest, NULL, AG_O_WRONLY | AG_O_CREATE | AG_O_TRUNC);
     if (out < 0) {
         ag_console_printf("%s: cannot be written\n", dest);
-        ag_port_net_close(dfd);
+        ag_netprov_close(dfd);
         (void)ftp_reply(f);
         return (ag_err_t)out;
     }
@@ -298,7 +299,7 @@ static ag_err_t ftp_get(ftp_t *f, const char *remote, const char *dest)
     ag_progress_done(&prog, got);
 
     ag_vfs_close(out);
-    ag_port_net_close(dfd);
+    ag_netprov_close(dfd);
 
     /* The transfer's own result, which is not the same as the socket's. */
     const int done = ftp_reply(f);
@@ -331,14 +332,14 @@ static ag_err_t ftp_put(ftp_t *f, const char *local, const char *remote)
     if (n < 0 || (size_t)n >= sizeof(cmd) ||
         ftp_send(f, cmd, (size_t)n) != AG_OK) {
         ag_vfs_close(in);
-        ag_port_net_close(dfd);
+        ag_netprov_close(dfd);
         return -AG_EIO;
     }
 
     const int code = ftp_reply(f);
     if (code != 150 && code != 125) {
         ag_vfs_close(in);
-        ag_port_net_close(dfd);
+        ag_netprov_close(dfd);
         return (code == 550) ? -AG_EACCES : -AG_EIO;
     }
 
@@ -368,7 +369,7 @@ static ag_err_t ftp_put(ftp_t *f, const char *local, const char *remote)
 
     ag_vfs_close(in);
     /* Closing the data connection is how the server is told the file ended. */
-    ag_port_net_close(dfd);
+    ag_netprov_close(dfd);
 
     const int done = ftp_reply(f);
     if (err == AG_OK && done != 226 && done != 250) {
@@ -390,13 +391,13 @@ static ag_err_t ftp_list(ftp_t *f, const char *path)
                       : snprintf(cmd, sizeof(cmd), "LIST\r\n");
     if (n < 0 || (size_t)n >= sizeof(cmd) ||
         ftp_send(f, cmd, (size_t)n) != AG_OK) {
-        ag_port_net_close(dfd);
+        ag_netprov_close(dfd);
         return -AG_EIO;
     }
 
     const int code = ftp_reply(f);
     if (code != 150 && code != 125) {
-        ag_port_net_close(dfd);
+        ag_netprov_close(dfd);
         return -AG_EIO;
     }
 
@@ -422,7 +423,7 @@ static ag_err_t ftp_list(ftp_t *f, const char *path)
         }
     }
 
-    ag_port_net_close(dfd);
+    ag_netprov_close(dfd);
     (void)ftp_reply(f);
     return AG_OK;
 }
@@ -436,7 +437,7 @@ static void ftp_end(ftp_t *f)
     if (f->ctl >= 0) {
         (void)ftp_send(f, "QUIT\r\n", 6);
         (void)ftp_reply(f);
-        ag_port_net_close(f->ctl);
+        ag_netprov_close(f->ctl);
         f->ctl = -1;
     }
     ag_port_free(f->mem);
@@ -470,7 +471,7 @@ static ag_err_t ftp_begin(ftp_t *f, const ag_url_t *u, const char *cwd)
     (void)ag_ipv4_str(f->host_addr, ip, sizeof(ip));
     ag_console_printf("%s:%u ... ", ip, (unsigned)u->port);
 
-    f->ctl = ag_port_net_connect(f->host_addr, u->port, FTP_CONNECT_MS);
+    f->ctl = ag_netprov_connect(f->host_addr, u->port, FTP_CONNECT_MS);
     if (f->ctl < 0) {
         ag_console_puts("no answer\n");
         err = (ag_err_t)f->ctl;
@@ -481,7 +482,7 @@ static ag_err_t ftp_begin(ftp_t *f, const ag_url_t *u, const char *cwd)
     }
     ag_console_puts("connected\n");
 
-    (void)ag_port_net_nonblock(f->ctl, true);
+    (void)ag_netprov_nonblock(f->ctl, true);
     ag_netio_init(&f->rdr, f->ctl, f->ctlbuf, FTP_CTL_BUF, 0);
 
     if (ftp_reply(f) != 220) {

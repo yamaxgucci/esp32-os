@@ -33,6 +33,17 @@ bool ag_net_ready(void);
  * for whoever adds the other include.
  */
 ag_err_t ag_net_lookup(const char *host, uint32_t *addr_out);
+
+/*
+ * Close every socket the ABI handle table is holding, through whatever provider
+ * owns them.  Called when the active provider is about to change: the sockets
+ * belong to the interface that is going away, exactly as they would be dropped
+ * by `wifi off`.  Kernel services that hold a raw fd of their own (a wget in
+ * flight, an ssh session) are not in this table; switching the provider under
+ * one of those is an operator error, not a case to paper over.
+ */
+void ag_net_reset_sockets(void);
+
 extern const ag_net_api_t ag_net_api_impl;
 const ag_net_api_t *ag_net_api_table(void);
 #else

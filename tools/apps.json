@@ -117,6 +117,12 @@
     { "out": "ZIP.AXE", "group": "core", "src": ["apps/zip/zip.c"] },
 
     { "out": "ECHO.SYS", "group": "core", "src": ["apps/echo/echo.c"] },
+    { "out": "EXTRADIO.SYS", "group": "core",
+      "include": ["apps/common", "apps/common/rlink"],
+      "src": ["apps/extradio/extradio.c", "apps/common/rlink/ag_rlink.c"] },
+    { "out": "ATRADIO.SYS", "group": "core",
+      "include": ["apps/common", "apps/common/atproto"],
+      "src": ["apps/atradio/atradio.c", "apps/common/atproto/ag_atproto.c"] },
     { "out": "GC2145.SYS", "group": "core", "include": ["apps/gc2145"], "src": ["apps/gc2145/gc2145.c"] },
     { "out": "CAM.AXE", "group": "core", "src": ["apps/cam/cam.c"] },
     {
@@ -179,6 +185,14 @@
       "out": "ST7789.SYS", "group": "board",
       "_note": "The panel on the ESP32-C6-LCD-1.47, and the first image in this file built for RISC-V - that board is a C6.  A .SYS carries its instruction set in its header; one built for xtensa is refused by the loader rather than run.",
       "arch": "riscv32", "gcc": "riscv32-esp-elf-gcc",
+      "include": ["apps/common"],
+      "src": ["apps/st7789/st7789.c"]
+    },
+    {
+      "out": "ST7789S3.SYS", "group": "board",
+      "_note": "The same source and the same controller, for the 2.0 inch 240x320 module soldered to the ESP32-S3-WROOM CAM board: -DST7789_BOARD_S3CAM swaps the block of constants (pins, size, no offset) and xtensa is the other instruction set, so it has to be a second image with a name of its own.",
+      "arch": "xtensa", "gcc": "xtensa-esp32s3-elf-gcc",
+      "cflags": "-Os -ffunction-sections -fdata-sections -DST7789_BOARD_S3CAM",
       "include": ["apps/common"],
       "src": ["apps/st7789/st7789.c"]
     },

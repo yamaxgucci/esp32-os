@@ -149,9 +149,30 @@ extern "C" {
  *      changed is that a pointer is a position on a surface and is now reported
  *      as one.  A terminal has no pixels of its own, so the kernel scales its
  *      column and row by the cell size on the way in.
+ * 0.43 ag_net_ops_t: the class vtable for an AG_DEV_NET device, and the first
+ *      time dev->ops() means anything for a class other than a display.  A .SYS
+ *      that speaks to an external radio coprocessor (Wi-Fi, GSM/LTE...) over a
+ *      wire publishes it, and the kernel routes its whole socket path through
+ *      it when the operator says `net use <dev>` - so a board can carry no
+ *      built-in radio at all and still reach the network, the radio being a
+ *      chip on a bus like any other .SYS.  One provider is active at a time; the
+ *      built-in stack is the default.  Append-only: nothing an existing image
+ *      calls has moved.
+ * 0.47 the two lines above, merged.  0.43's ag_net_ops_t came off the radio
+ *      line and 0.44-0.46 - input units, another slot's screen and its
+ *      cursor, a prompt in a slot of its own - off the desktop line, and
+ *      each line had bumped this number for itself while the other was
+ *      being written.  An image built from this carries all of them, so it
+ *      needs a number larger than either, and that is all 0.47 means.
+ *
+ *      The numbers were handed out in parallel and some are spoken for
+ *      twice: worktree-cluster calls its own additions 0.47 and
+ *      worktree-usb-kvm calls its 0.45.  Whichever of those lands next has
+ *      to RENUMBER rather than assume its number is free - and the check is
+ *      one line: `git show <branch>:sdk/include/argon/abi.h | grep MINOR`.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 46u
+#define AG_ABI_MINOR 47u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -1414,6 +1435,53 @@ typedef struct ag_net_api {
      */
     ag_err_t (*resolve)(const char *host, uint32_t *addr_out);
 } ag_net_api_t;
+
+/*
+ * Class vtable for an AG_DEV_NET device (ABI 0.43), read by the kernel's socket
+ * layer when `net use <dev>` binds this device as the active network provider.
+ * A .SYS talking to an external radio coprocessor publishes it as class_ops in
+ * ag_dev_add; it is not reached through dev->open/ops() by an application.
+ *
+ * It mirrors, function for function, what the built-in stack does - the same
+ * shape as components/argon_port/include/argon/port/net.h, because the kernel
+ * clients above it (net.c, netio.c, httpc.c, ftpc.c, ssh.c, ...) are written
+ * against exactly that shape and must not be able to tell which provider is
+ * underneath.  `dev` is the device the kernel bound; recover the driver's state
+ * with dev->get_priv(dev).
+ *
+ * SOCKET IDS.  listen/accept/connect hand back the coprocessor's own small
+ * integers; the kernel wraps them into ag_handle_t exactly as it wraps a port
+ * fd.  A negative return is an -AG_E* code.  Because only one provider is active
+ * at a time the id space belongs to whoever is bound, so no tagging is needed.
+ *
+ * THE recv_now / wait_readable SPLIT is the contract that matters: recv_now must
+ * return whatever has already arrived and never block (-AG_EAGAIN when nothing
+ * has), and wait_readable must answer within its timeout without a blocking
+ * read underneath.  A driver over a wire keeps a per-socket receive buffer fed
+ * by the coprocessor's unsolicited pushes and answers both out of it; recv()
+ * (which the ABI allows to block) may loop over the same buffer.
+ */
+typedef struct ag_net_ops {
+    uint32_t size;
+
+    ag_err_t (*start)(ag_device_t *dev);
+    bool (*ready)(ag_device_t *dev);
+    ag_err_t (*ifaddr)(ag_device_t *dev, uint32_t *addr_out); /* host-order */
+    ag_err_t (*resolve)(ag_device_t *dev, const char *host, uint32_t *addr_out);
+
+    int (*listen)(ag_device_t *dev, uint16_t port);
+    int (*accept)(ag_device_t *dev, int listen_fd, uint32_t timeout_ms);
+    int (*connect)(ag_device_t *dev, uint32_t addr, uint16_t port,
+                   uint32_t timeout_ms);
+
+    int32_t (*send)(ag_device_t *dev, int fd, const void *buf, size_t len);
+    int32_t (*recv)(ag_device_t *dev, int fd, void *buf, size_t len);
+    void (*net_close)(ag_device_t *dev, int fd);
+    ag_err_t (*nonblock)(ag_device_t *dev, int fd, bool on);
+
+    int (*wait_readable)(ag_device_t *dev, int fd, uint32_t timeout_ms);
+    int32_t (*recv_now)(ag_device_t *dev, int fd, void *buf, size_t len);
+} ag_net_ops_t;
 
 /* ------------------------------------------------------------------------ */
 /* audio - PCM output (built-in pcmnull discard; I2S/virt via .SYS)         */

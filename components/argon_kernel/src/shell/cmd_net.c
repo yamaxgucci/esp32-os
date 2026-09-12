@@ -23,6 +23,7 @@
 #include <argon/shell.h>
 #include <argon/vfs.h>
 
+#include <argon/netprov.h>
 #include <argon/port/net.h>
 #include <argon/port/task.h>
 #include <argon/port/time.h>
@@ -54,7 +55,7 @@ static int net_status(void)
     }
 
     uint32_t addr = 0;
-    const ag_err_t err = ag_port_net_ifaddr(&addr);
+    const ag_err_t err = ag_netprov_ifaddr(&addr);
     if (err != AG_OK) {
         ag_console_printf("address: %s\n", strerr(err));
         return 1;
@@ -62,7 +63,7 @@ static int net_status(void)
 
     char ip[16];
     (void)ag_ipv4_str(addr, ip, sizeof(ip));
-    ag_console_printf("address %s\n", ip);
+    ag_console_printf("address %s  (via %s)\n", ip, ag_netprov_active());
     return 0;
 }
 
@@ -114,7 +115,29 @@ int ag_cmd_net(int argc, char **argv)
         return net_status();
     }
 
-    ag_console_puts("usage: net [wait [seconds] | resolve <name>]\n");
+    if (ag_path_icmp(argv[1], "use") == 0) {
+        /*
+         * Bind the network to a provider: the built-in stack, or a loaded .SYS
+         * that drives an external radio.  With no name, say who is bound now.
+         * Switching tears down the sockets the old one held, so it is a
+         * deliberate act, not something a script does mid-transfer.
+         */
+        if (argc < 3) {
+            ag_console_printf("network is via %s\n", ag_netprov_active());
+            ag_console_puts("usage: net use <device|builtin>\n");
+            return 0;
+        }
+        const ag_err_t err = ag_netprov_use_device(argv[2]);
+        if (err != AG_OK) {
+            ag_console_printf("net use %s: %s\n", argv[2], strerr(err));
+            return 1;
+        }
+        ag_console_printf("network is via %s\n", ag_netprov_active());
+        return 0;
+    }
+
+    ag_console_puts(
+        "usage: net [wait [seconds] | resolve <name> | use <device>]\n");
     return 1;
 }
 

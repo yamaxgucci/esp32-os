@@ -47,6 +47,7 @@
 #include <argon/port/io.h>
 #include <argon/hidptr.h>
 #include <argon/port/mem.h>
+#include <argon/netprov.h>
 #include <argon/port/net.h>
 #include <argon/port/sntp.h>
 #include <argon/port/wifi.h>
@@ -2298,7 +2299,7 @@ static int wifi_status(void)
     }
 
     uint32_t addr = 0;
-    if (ag_net_ready() && ag_port_net_ifaddr(&addr) == AG_OK) {
+    if (ag_net_ready() && ag_netprov_ifaddr(&addr) == AG_OK) {
         ag_console_printf("address %u.%u.%u.%u\n", (unsigned)(addr >> 24),
                           (unsigned)((addr >> 16) & 0xffu),
                           (unsigned)((addr >> 8) & 0xffu),
