@@ -390,8 +390,19 @@ function Get-QemuMachineArgs {
         # display driver falls back to a soft surface in PSRAM without a word.
         # The way to tell from the outside: a window that is 800x600 rather
         # than the size the guest asked for has no panel behind it.
-        [switch]$Graphics
+        [switch]$Graphics,
+        # Which flash image this guest runs from, and which efuse file.
+        #
+        # Parameters because a cluster test boots two guests at once and they
+        # cannot share either.  The flash drive is writable raw MTD: two
+        # emulators writing one file corrupt each other's C:, and the symptom
+        # is not a clean failure but a file read back as -91 (AG_EFORMAT) on
+        # some later, unrelated run - see the note in Update-FlashImage about
+        # exactly that.
+        [string]$FlashPath = 'build\qemu_flash.bin',
+        [string]$EfuseOverride = ''
     )
+    if ($EfuseOverride) { $EfusePath = $EfuseOverride }
     return @(
         '-M', $(if ($Graphics) { 'esp32s3,graphics=on' } else { 'esp32s3' })
         # QEMU reserves a 1 GB JIT buffer by default on a 64-bit host, and it
@@ -408,7 +419,7 @@ function Get-QemuMachineArgs {
         # reads the partition table through a mapping rather than a read - then
         # finds no partitions at all.
         '-m', '8M'
-        '-drive', 'file=build\qemu_flash.bin,if=mtd,format=raw'
+        '-drive', "file=$FlashPath,if=mtd,format=raw"
         '-drive', "file=$EfusePath,if=none,format=raw,id=efuse"
         '-global', 'driver=nvram.esp32s3.efuse,property=drive,value=efuse'
         '-global', 'driver=timer.esp32s3.timg,property=wdt_disable,value=true'

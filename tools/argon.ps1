@@ -510,6 +510,14 @@ switch ($Command.ToLowerInvariant()) {
         exit $LASTEXITCODE
     }
 
+    'nodetest' {
+        # Two whole ArgonOS kernels in two emulators, their UART1 ports joined
+        # to each other, measured with apps\link - the cluster's wire, with no
+        # second board and nothing pretending to be a node.
+        & (Join-Path $PSScriptRoot 'nodetest.ps1') @Rest
+        exit $LASTEXITCODE
+    }
+
     'tests' {
         Build-HostTools
         & ctest --test-dir build-host --output-on-failure

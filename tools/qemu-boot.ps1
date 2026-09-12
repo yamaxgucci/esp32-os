@@ -93,7 +93,34 @@ param(
     # repeatably, whatever else the host is doing.  That is not cycles either -
     # it ignores stalls, the cache and PSRAM latency - but it is a floor that
     # belongs to the guest rather than to this PC.
-    [switch]$Icount
+    [switch]$Icount,
+
+    # ---- a second guest, for the cluster ------------------------------------
+    #
+    # Two emulators on this PC wired UART1 to UART1 are two whole ArgonOS
+    # kernels on one wire, with nothing pretending to be anything.  It is the
+    # only way to develop a cluster without a second board, and QEMU already
+    # does everything it needs: a serial port here is a TCP socket, and this
+    # script already opens one as a server (the console) and others as clients
+    # (HostFS, the radio).  The two guests are then just the two ends.
+    #
+    # -LinkPort puts UART1 on that port; -LinkListen makes this guest the one
+    # that listens.  Exactly one of the pair listens; the other connects.
+    [int]$LinkPort = 0,
+    [switch]$LinkListen,
+
+    # Which flash image, and whether to leave other emulators alone.
+    #
+    # Both exist for the same reason and neither is optional for a pair.  The
+    # flash drive is writable: two guests on one file corrupt each other's C:,
+    # and the damage shows up later as a file that reads back -91.  And this
+    # script kills every qemu-system-xtensa it finds before starting, which is
+    # right for one guest and fatal for two - the second would shoot the first.
+    [string]$Flash = '',
+    [switch]$KeepOtherEmulators,
+    # Suffix for this guest's own emulator log, so a pair does not write one
+    # file from two processes.
+    [string]$Tag = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -102,6 +129,32 @@ $ErrorActionPreference = 'Stop'
 $qemu = Resolve-Qemu
 Update-FlashImage -SysFs $SysFs
 $efuse = Initialize-EfuseFile
+
+# A guest of its own gets a flash image of its own, copied from the canonical
+# one so it runs exactly the same firmware.  Copied every time rather than kept:
+# the point of a second node is a repeatable pair, and a C: left over from the
+# previous run is the staleness the stamp above exists to prevent, arriving by
+# the back door.
+$flashPath = 'build\qemu_flash.bin'
+if ($Flash) {
+    Copy-Item -LiteralPath $flashPath -Destination $Flash -Force
+    $flashPath = $Flash
+    # Its own efuse too: blank, and written by whoever boots.
+    $efuse2 = [IO.Path]::ChangeExtension($Flash, $null) + '_efuse.bin'
+    if (-not (Test-Path $efuse2)) {
+        [IO.File]::WriteAllBytes((Join-Path (Get-Location) $efuse2),
+                                 (New-Object byte[] 1024))
+    }
+    $efuse = $efuse2
+}
+
+if ($LinkPort -gt 0 -and ($HostFs -or $Radio)) {
+    # UART1 is the only spare serial QEMU's esp32s3 has - UART2 exists in the
+    # header and passes no data - and HostFS, the radio and the node link all
+    # want it.  Saying so here beats a run where one of the three silently is
+    # not there.
+    throw 'a node link cannot share UART1 with -HostFs or -Radio.'
+}
 
 $hostfsProc = $null
 if ($HostFs) {
@@ -188,7 +241,7 @@ if ($Radio) {
 # wait=on is essential: a TCP serial port with no peer throws its output away,
 # and the whole boot is over in a quarter of a second.  Without it the test
 # races the emulator and loses often enough to be useless.
-$qemuArgs = (Get-QemuMachineArgs -EfusePath $efuse -Graphics:$Gfx) + @(
+$qemuArgs = (Get-QemuMachineArgs -EfusePath $efuse -Graphics:$Gfx -FlashPath $flashPath) + @(
     '-display', $(if ($Gfx) { 'sdl' } else { 'none' })
     '-monitor', 'none'
     '-serial', "tcp:127.0.0.1:$Port,server=on,wait=on"
@@ -227,6 +280,22 @@ if ($HostFs) {
     $qemuArgs += @('-serial', "tcp:127.0.0.1:$HostFsPort,reconnect=1")
 }
 
+if ($LinkPort -gt 0) {
+    # UART1: the wire to the other node.  One end listens, the other connects,
+    # and which is which is decided by the caller rather than by the firmware -
+    # the guests are identical images and must stay that way.
+    #
+    # wait=off on the listener, unlike the console: the console uses wait=on
+    # because a TCP serial with no peer throws its output away and the boot is
+    # over before a test can attach.  Here the peer is another emulator that
+    # has not started yet, and waiting for it would deadlock the pair.
+    $qemuArgs += @('-serial', $(if ($LinkListen) {
+        "tcp:127.0.0.1:$LinkPort,server=on,wait=off"
+    } else {
+        "tcp:127.0.0.1:$LinkPort,reconnect=1"
+    }))
+}
+
 if ($Radio) {
     # The radio is the next -serial after the console (UART1) - or after HostFS
     # (UART2) when that is attached too.  QEMU's esp32s3 emulates only UART0 and
@@ -242,12 +311,19 @@ if ($Sd) {
 }
 
 # A leftover emulator would still hold the port and answer with silence.
-Get-Process qemu-system-xtensa -ErrorAction SilentlyContinue |
-    Stop-Process -Force -ErrorAction SilentlyContinue
+#
+# Not when this guest is half of a pair: the other half is a
+# qemu-system-xtensa too, it is usually already running and waiting on the
+# wire, and killing it here is the first thing a two-node test would do to
+# itself.
+if (-not $KeepOtherEmulators) {
+    Get-Process qemu-system-xtensa -ErrorAction SilentlyContinue |
+        Stop-Process -Force -ErrorAction SilentlyContinue
+}
 
 # QEMU's own chatter goes to a file: it is not part of what the board said,
 # and PowerShell renders anything on stderr as an error.
-$qemuOut = 'build\qemu-emulator.log'
+$qemuOut = $(if ($Tag) { "build\qemu-emulator-$Tag.log" } else { 'build\qemu-emulator.log' })
 $proc = Start-Process -FilePath $qemu -ArgumentList $qemuArgs -NoNewWindow `
     -PassThru -RedirectStandardOutput $qemuOut -RedirectStandardError "$qemuOut.err"
 
