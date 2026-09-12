@@ -1450,7 +1450,20 @@ static int cfg_has_device_line(const char *text, const char *dos_path)
     return 0;
 }
 
-#if AG_PORT_HAS_WIFI || AG_PORT_HAS_BT || \
+/*
+ * A radio the prompt can drive.  Not the same as a radio on this chip since ABI
+ * 0.48: `net use <dev>` binds one on a wire, and `wifi scan` has to work at
+ * this board's prompt or the operator is back to knowing which box holds which
+ * chip - which is the whole thing an external radio exists to avoid.  Every
+ * station call below goes through ag_netprov_wifi_*, which answers -AG_ENODEV
+ * while there is no radio anywhere.
+ *
+ * The access point and ESP-NOW halves keep the narrower gate: they need this
+ * chip's own radio, because RLINK carries the station half and no more.
+ */
+#define ARGON_SHELL_HAS_WIFI (AG_PORT_HAS_WIFI || AG_HAS_NET)
+
+#if ARGON_SHELL_HAS_WIFI || AG_PORT_HAS_BT || \
     (defined(CONFIG_ARGON_NET_SSH) && CONFIG_ARGON_NET_SSH)
 
 /* Case-insensitive compare of a fixed length; the section name in the file may
@@ -1596,9 +1609,9 @@ static ag_err_t cfg_replace_section(const char *section, const char *body)
     return (w < 0) ? (ag_err_t)w : AG_OK;
 }
 
-#endif /* AG_PORT_HAS_WIFI || AG_PORT_HAS_BT || CONFIG_ARGON_NET_SSH */
+#endif /* ARGON_SHELL_HAS_WIFI || AG_PORT_HAS_BT || CONFIG_ARGON_NET_SSH */
 
-#if AG_PORT_HAS_WIFI
+#if ARGON_SHELL_HAS_WIFI
 static ag_err_t cfg_ensure_wifi(const char *ssid, const char *pass,
                                 const uint8_t *bssid)
 {
@@ -2231,44 +2244,65 @@ static void io_show_pin(int pin)
  * because the moment you need them is before anything has been copied onto the
  * board - see docs/user/02-board-setup.md.
  */
-#if AG_PORT_HAS_WIFI
+#if ARGON_SHELL_HAS_WIFI
 
-static const char *wifi_auth_name(ag_wifi_auth_t a)
+/*
+ * The ABI's numbering, not the port's.  What arrives here may have been read
+ * off the air by a chip at the far end of a wire, which has no port types of
+ * ours at all; the two enums carry the same numbers on purpose, and ag_rlink.h
+ * says why renumbering either alone mislabels every network.
+ */
+static const char *wifi_auth_name(uint8_t a)
 {
     switch (a) {
-    case AG_WIFI_OPEN:       return "open";
-    case AG_WIFI_WEP:        return "WEP";
-    case AG_WIFI_WPA:        return "WPA";
-    case AG_WIFI_WPA2:       return "WPA2";
-    case AG_WIFI_WPA3:       return "WPA3";
-    case AG_WIFI_ENTERPRISE: return "802.1X";
-    default:                 return "?";
+    case AG_WIFI_SEC_OPEN:       return "open";
+    case AG_WIFI_SEC_WEP:        return "WEP";
+    case AG_WIFI_SEC_WPA:        return "WPA";
+    case AG_WIFI_SEC_WPA2:       return "WPA2";
+    case AG_WIFI_SEC_WPA3:       return "WPA3";
+    case AG_WIFI_SEC_ENTERPRISE: return "802.1X";
+    default:                     return "?";
     }
 }
 
-static const char *wifi_state_name(ag_wifi_state_t s)
+static const char *wifi_state_name(uint8_t s)
 {
     switch (s) {
-    case AG_WIFI_OFF:     return "off";
-    case AG_WIFI_IDLE:    return "on, not joined";
-    case AG_WIFI_JOINING: return "joining";
-    default:              return "joined";
+    case AG_WIFI_ST_OFF:     return "off";
+    case AG_WIFI_ST_IDLE:    return "on, not joined";
+    case AG_WIFI_ST_JOINING: return "joining";
+    default:                 return "joined";
     }
 }
 
 static int wifi_status(void)
 {
-    ag_port_wifi_status_t st;
-    const ag_err_t        err = ag_port_wifi_status(&st);
+    ag_wifi_status_t st;
+    const ag_err_t   err = ag_netprov_wifi_status(&st);
+    if (err == -AG_ENODEV) {
+        ag_console_puts("no radio: none on this board and none bound\n");
+        ag_console_puts("  `dev` for what is here, `net use <dev>` to bind one "
+                        "on a wire\n");
+        return 1;
+    }
     if (err != AG_OK) {
         ag_console_printf("wifi: %s\n", ag_loader_api()->sys->strerror(err));
         return 1;
     }
 
+    /*
+     * Which radio answered.  Silent for the built-in one, because saying "via
+     * builtin" at every prompt is noise; named otherwise, because that is the
+     * one fact about this board the numbers below cannot show.
+     */
+    if (!ag_netprov_is_builtin()) {
+        ag_console_printf("radio on %s\n", ag_netprov_active());
+    }
+
     ag_console_printf("radio %s\n", wifi_state_name(st.state));
     if (st.ssid[0] != '\0') {
         ag_console_printf("ssid %s", st.ssid);
-        if (st.state == AG_WIFI_JOINED) {
+        if (st.state == AG_WIFI_ST_JOINED) {
             ag_console_printf(", %d dBm, channel %u", (int)st.rssi,
                               (unsigned)st.channel);
         }
@@ -2290,9 +2324,19 @@ static int wifi_status(void)
     } else if (st.pinned) {
         ag_console_puts("pinned to an access point that has not answered\n");
     }
-    if (st.state != AG_WIFI_JOINED && st.last_reason != 0) {
+    if (st.state != AG_WIFI_ST_JOINED && st.last_reason != 0) {
+#if AG_PORT_HAS_WIFI
+        /*
+         * The names live in this chip's own radio driver.  A remote radio's
+         * codes are the same numbers - both ends are IDF - so the table still
+         * fits; a build without the driver prints the number, which is worse
+         * than a name and much better than nothing.
+         */
         ag_console_printf("last failure: %s\n",
-                          ag_port_wifi_reason(st.last_reason));
+                          ag_port_wifi_reason((int)st.last_reason));
+#else
+        ag_console_printf("last failure: reason %d\n", (int)st.last_reason);
+#endif
     }
     if (st.attempts > 1u) {
         ag_console_printf("%u attempts\n", (unsigned)st.attempts);
@@ -2304,7 +2348,7 @@ static int wifi_status(void)
                           (unsigned)((addr >> 16) & 0xffu),
                           (unsigned)((addr >> 8) & 0xffu),
                           (unsigned)(addr & 0xffu));
-    } else if (st.state == AG_WIFI_JOINED) {
+    } else if (st.state == AG_WIFI_ST_JOINED) {
         ag_console_puts("no address yet (DHCP)\n");
     }
 
@@ -2351,11 +2395,17 @@ static uint32_t s_scan_count;
 
 static int wifi_scan(void)
 {
-    ag_port_wifi_ap_t aps[WIFI_SCAN_MAX];
-    uint32_t          found = 0;
+    ag_wifi_ap_t aps[WIFI_SCAN_MAX];
+    uint32_t     found = 0;
 
     ag_console_puts("scanning...\n");
-    const ag_err_t err = ag_port_wifi_scan(aps, WIFI_SCAN_MAX, &found);
+    const ag_err_t err = ag_netprov_wifi_scan(aps, WIFI_SCAN_MAX, &found);
+    if (err == -AG_ENODEV) {
+        ag_console_puts("no radio: none on this board and none bound\n");
+        ag_console_puts("  `dev` for what is here, `net use <dev>` to bind one "
+                        "on a wire\n");
+        return 1;
+    }
     if (err == -AG_EBUSY) {
         /*
          * The radio cannot scan and associate at once, and a board that has
@@ -2363,8 +2413,8 @@ static int wifi_scan(void)
          * the answer every time, which reads as a broken command.  Say which
          * of the two it is and what stops it.
          */
-        ag_port_wifi_status_t st;
-        if (ag_port_wifi_status(&st) == AG_OK && st.ssid[0] != '\0') {
+        ag_wifi_status_t st;
+        if (ag_netprov_wifi_status(&st) == AG_OK && st.ssid[0] != '\0') {
             ag_console_printf("busy joining %s\n", st.ssid);
         } else {
             ag_console_puts("the radio is busy\n");
@@ -2497,9 +2547,22 @@ static int cmd_wifi(int argc, char **argv)
      * cannot.  Both radios are in every image; only one usually runs.
      */
     if (ag_path_icmp(argv[1], "on") == 0) {
-        const size_t before = ag_port_mem_free(AG_MEM_FAST);
+        /*
+         * The memory arithmetic below is about THIS chip's radio.  A radio at
+         * the far end of a wire costs this board nothing to switch on, and
+         * printing "took 0 KB" about it would be a measurement of the wrong
+         * board - so the whole report is skipped when it is not ours.
+         */
+        const bool   ours = ag_netprov_is_builtin();
+        const size_t before = ours ? ag_port_mem_free(AG_MEM_FAST) : 0u;
 
-        const ag_err_t err = ag_net_init();
+        const ag_err_t err = ag_netprov_wifi_start();
+        if (err == -AG_ENODEV) {
+            ag_console_puts("no radio: none on this board and none bound\n");
+            ag_console_puts("  `dev` for what is here, `net use <dev>` to bind "
+                            "one on a wire\n");
+            return 1;
+        }
         if (err != AG_OK) {
             ag_console_printf("wifi on: %s\n",
                               ag_loader_api()->sys->strerror(err));
@@ -2519,15 +2582,20 @@ static int cmd_wifi(int argc, char **argv)
          * So the numbers are printed rather than left to be guessed, and a
          * margin too thin to associate in says so before anyone tries.
          */
-        const size_t after = ag_port_mem_free(AG_MEM_FAST);
-        ag_console_printf("radio on: took %u KB, %u KB free\n",
-                          (unsigned)((before - after) / 1024u),
-                          (unsigned)(after / 1024u));
-        if (after < 24u * 1024u) {
-            ag_console_puts(
-                "  that is thin: association and DHCP want ~16 KB more.\n"
-                "  if the board resets while joining, this is why - stop what\n"
-                "  else is running, or use a build with less in it.\n");
+        if (ours) {
+            const size_t after = ag_port_mem_free(AG_MEM_FAST);
+            ag_console_printf("radio on: took %u KB, %u KB free\n",
+                              (unsigned)((before - after) / 1024u),
+                              (unsigned)(after / 1024u));
+            if (after < 24u * 1024u) {
+                ag_console_puts(
+                    "  that is thin: association and DHCP want ~16 KB more.\n"
+                    "  if the board resets while joining, this is why - stop "
+                    "what\n"
+                    "  else is running, or use a build with less in it.\n");
+            }
+        } else {
+            ag_console_printf("radio on %s\n", ag_netprov_active());
         }
 
         const char *ssid = ag_cfg_get(ag_sysconfig(), "wifi.ssid", NULL);
@@ -2539,7 +2607,7 @@ static int cmd_wifi(int argc, char **argv)
             const bool  have_pin =
                 (pinned != NULL) && ag_mac_parse(pinned, bssid);
 
-            (void)ag_port_wifi_connect(
+            (void)ag_netprov_wifi_connect(
                 ssid, ag_cfg_get(ag_sysconfig(), "wifi.pass", ""),
                 have_pin ? bssid : NULL);
             ag_console_printf("joining %s%s\n", ssid,
@@ -2625,7 +2693,7 @@ static int cmd_wifi(int argc, char **argv)
             }
         }
 
-        const ag_err_t err = ag_port_wifi_connect(ssid, pass, bssid);
+        const ag_err_t err = ag_netprov_wifi_connect(ssid, pass, bssid);
         if (err != AG_OK) {
             ag_console_printf("wifi connect: %s\n",
                               ag_loader_api()->sys->strerror(err));
@@ -2766,16 +2834,27 @@ static int cmd_wifi(int argc, char **argv)
     }
 
     if (ag_path_icmp(argv[1], "off") == 0) {
-        const size_t before = ag_port_mem_free(AG_MEM_FAST);
-        (void)ag_port_wifi_stop();
-        const size_t after = ag_port_mem_free(AG_MEM_FAST);
-        ag_console_printf("radio off, %u KB back\n",
-                          (unsigned)((after - before) / 1024u));
+        /* As with `on`: the kilobytes are this chip's, so only count them when
+         * the radio being stopped is this chip's. */
+        const bool   ours = ag_netprov_is_builtin();
+        const size_t before = ours ? ag_port_mem_free(AG_MEM_FAST) : 0u;
+        const ag_err_t err = ag_netprov_wifi_stop();
+        if (err == -AG_ENODEV) {
+            ag_console_puts("no radio to stop\n");
+            return 1;
+        }
+        if (ours) {
+            const size_t after = ag_port_mem_free(AG_MEM_FAST);
+            ag_console_printf("radio off, %u KB back\n",
+                              (unsigned)((after - before) / 1024u));
+        } else {
+            ag_console_printf("radio off on %s\n", ag_netprov_active());
+        }
         return 0;
     }
 
     if (ag_path_icmp(argv[1], "forget") == 0) {
-        (void)ag_port_wifi_disconnect();
+        (void)ag_netprov_wifi_disconnect();
         const ag_err_t cerr = cfg_ensure_wifi(NULL, NULL, NULL);
         if (cerr != AG_OK) {
             ag_console_printf("SYSTEM.CFG: %d\n", (int)cerr);
@@ -2800,7 +2879,7 @@ static int cmd_wifi(int argc, char **argv)
     return 1;
 }
 
-#endif /* AG_PORT_HAS_WIFI */
+#endif /* ARGON_SHELL_HAS_WIFI */
 
 #if AG_PORT_HAS_ESPNOW
 
@@ -4861,7 +4940,7 @@ static const ag_command_t k_commands[] = {
     {"beep", "[hz] [ms]", "a tone on /dev/pcm0", cmd_beep},
     {"power", "[full|eco|doze|screen on|off|auto on|off]",
      "the clock, the screen, and what applications make of it", ag_cmd_power},
-#if AG_PORT_HAS_WIFI
+#if ARGON_SHELL_HAS_WIFI
     {"wifi", "[on|off|scan|connect <#n|ssid> [pass]|ap <ssid> [pass]|forget]",
      "the radio", cmd_wifi},
 #endif

@@ -42,6 +42,13 @@ AG_DRV("EXTRADIO", "0.1", "argon");
 #define EXT_RING         2048u  /* per-channel receive ring */
 #define EXT_RPC_MS       8000u  /* an RPC that gets no reply is a dead link */
 #define EXT_SCRATCH      256u
+/*
+ * Networks one scan can bring back.  Not a protocol limit (a reply holds 38) but
+ * a memory one: this buys a fixed 840-byte reply buffer in the driver's own
+ * state.  `found` still reports how many the radio saw, so a longer list is
+ * visible as a number even when it is not visible as rows.
+ */
+#define EXT_SCAN_MAX     20u
 
 /* frame assembler states */
 enum { SM_SYNC = 0, SM_HDR, SM_PAYLOAD };
@@ -76,6 +83,11 @@ typedef struct {
 
     bool     ready;
     uint32_t ifaddr;
+    uint32_t caps; /* what the HELLO reply said this coprocessor can do */
+
+    /* One scan reply, decoded in place.  See ext_wifi_scan for why it is not a
+     * local: this driver runs on its caller's stack. */
+    uint8_t scan[EXT_SCAN_MAX * RL_AP_SIZE];
 
     chan_t chan[EXT_MAX_CHAN];
     bool   nb[EXT_MAX_CHAN]; /* O_NONBLOCK per channel */
@@ -224,8 +236,19 @@ static void pump(uint32_t block_ms)
 /* Request / reply                                                         */
 /* ---------------------------------------------------------------------- */
 
+/*
+ * One exchange: send a request, wait for the reply carrying its sequence.
+ *
+ * `repbuf`/`repcap` are the caller's room for the reply's payload.  The
+ * capacity is not decoration: the length in the reply header is the
+ * coprocessor's word, and copying that many bytes into a buffer sized for what
+ * we asked for is how a wire at the far end of the room writes into this
+ * driver's neighbours.  A reply too big for the buffer is refused whole -
+ * truncating it would hand the caller a short list it cannot tell from a
+ * complete one.
+ */
 static ag_err_t rpc(ag_rlink_hdr_t *req, const void *payload,
-                    ag_rlink_hdr_t *rep, uint8_t *repbuf)
+                    ag_rlink_hdr_t *rep, uint8_t *repbuf, uint32_t repcap)
 {
     TASK->mutex_lock(s_ext.lock, UINT32_MAX);
 
@@ -251,10 +274,14 @@ static ag_err_t rpc(ag_rlink_hdr_t *req, const void *payload,
         pump(50);
         if (s_ext.got) {
             *rep = s_ext.rep;
-            if (repbuf != NULL && rep->len > 0) {
-                memcpy(repbuf, s_ext.repbuf, rep->len);
-            }
             r = AG_OK;
+            if (rep->len > 0) {
+                if (repbuf == NULL || rep->len > repcap) {
+                    r = -AG_ERANGE;
+                } else {
+                    memcpy(repbuf, s_ext.repbuf, rep->len);
+                }
+            }
             break;
         }
         waited += 50;
@@ -267,7 +294,7 @@ static ag_err_t rpc(ag_rlink_hdr_t *req, const void *payload,
 
 static ag_err_t rpc_simple(ag_rlink_hdr_t *req, ag_rlink_hdr_t *rep)
 {
-    return rpc(req, NULL, rep, NULL);
+    return rpc(req, NULL, rep, NULL, 0);
 }
 
 /* Take the channel id a reply handed back.  Out-of-range means the coprocessor
@@ -367,7 +394,7 @@ static ag_err_t ext_resolve(ag_device_t *dev, const char *host, uint32_t *addr)
     ag_rlink_hdr_t req, rep;
     ag_rlink_req(&req, RL_OP_RESOLVE, 0);
     req.len = (uint32_t)hlen;
-    const ag_err_t e = rpc(&req, host, &rep, NULL);
+    const ag_err_t e = rpc(&req, host, &rep, NULL, 0);
     if (e != AG_OK) {
         return e;
     }
@@ -438,7 +465,7 @@ static int32_t ext_send(ag_device_t *dev, int fd, const void *buf, size_t len)
         (len > RL_MAX_PAYLOAD) ? RL_MAX_PAYLOAD : (uint32_t)len;
     ag_rlink_hdr_t req, rep;
     ag_rlink_req_send(&req, 0, fd, chunk);
-    const ag_err_t e = rpc(&req, buf, &rep, NULL);
+    const ag_err_t e = rpc(&req, buf, &rep, NULL, 0);
     if (e != AG_OK) {
         return (int32_t)e;
     }
@@ -523,9 +550,166 @@ static int ext_wait_readable(ag_device_t *dev, int fd, uint32_t timeout_ms)
     }
 }
 
+/* ---------------------------------------------------------------------- */
+/* The station half - the radio as a radio, not as a socket               */
+/* ---------------------------------------------------------------------- */
+
+/*
+ * Only present when the coprocessor set RL_CAP_STATION in its HELLO reply; see
+ * ag_driver_init, which blanks these entries otherwise so the kernel's AG_HAS
+ * probe reports no radio rather than a radio that answers -AG_ENOTSUP to
+ * everything.
+ */
+
+/* Every one of these is the same three lines: ask, check the link, check the
+ * far end's answer.  Written out once. */
+static ag_err_t station_simple(uint8_t op)
+{
+    ag_rlink_hdr_t req, rep;
+    ag_rlink_req(&req, op, 0);
+    const ag_err_t e = rpc_simple(&req, &rep);
+    if (e != AG_OK) {
+        return e;
+    }
+    return (rep.status < 0) ? (ag_err_t)rep.status : AG_OK;
+}
+
+static ag_err_t ext_wifi_start(ag_device_t *dev)
+{
+    (void)dev;
+    return station_simple(RL_OP_WSTART);
+}
+
+static ag_err_t ext_wifi_stop(ag_device_t *dev)
+{
+    (void)dev;
+    return station_simple(RL_OP_WSTOP);
+}
+
+static ag_err_t ext_wifi_disconnect(ag_device_t *dev)
+{
+    (void)dev;
+    return station_simple(RL_OP_WLEAVE);
+}
+
+static ag_err_t ext_wifi_scan(ag_device_t *dev, ag_wifi_ap_t *out, uint32_t max,
+                              uint32_t *found)
+{
+    (void)dev;
+    if (out == NULL || found == NULL || max == 0) {
+        return -AG_EINVAL;
+    }
+    /*
+     * Ask for no more than one reply can carry AND no more than the buffer this
+     * driver holds for it.  The reply lands in s_ext.scan rather than on the
+     * caller's stack: this runs on whatever stack reached the provider - a
+     * shell command's, an application's thread - and eight hundred bytes is not
+     * a thing to borrow from a stack whose size is somebody else's decision.
+     */
+    uint32_t want = max;
+    if (want > EXT_SCAN_MAX) {
+        want = EXT_SCAN_MAX;
+    }
+
+    ag_rlink_hdr_t req, rep;
+    ag_rlink_req(&req, RL_OP_WSCAN, 0);
+    req.a0 = want;
+    const ag_err_t e = rpc(&req, NULL, &rep, s_ext.scan, sizeof(s_ext.scan));
+    if (e != AG_OK) {
+        return e;
+    }
+    if (rep.status < 0) {
+        return (ag_err_t)rep.status;
+    }
+
+    uint32_t n = rep.len / RL_AP_SIZE;
+    if (n > want) {
+        n = want; /* a coprocessor sending more than it was asked for */
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        ag_rlink_ap_t w;
+        if (!ag_rlink_unpack_ap(&w, s_ext.scan + i * RL_AP_SIZE)) {
+            continue;
+        }
+        memset(&out[i], 0, sizeof(out[i]));
+        ag_strlcpy(out[i].ssid, w.ssid, sizeof(out[i].ssid));
+        memcpy(out[i].bssid, w.bssid, sizeof(out[i].bssid));
+        out[i].rssi = w.rssi;
+        out[i].channel = w.channel;
+        out[i].auth = w.auth;
+    }
+
+    /*
+     * `found` is how many the radio SAW, which the ABI allows to exceed what
+     * was returned - that is how a person learns the list is longer than the
+     * screen.  Never report fewer than were actually handed back.
+     */
+    *found = (rep.a0 > n) ? rep.a0 : n;
+    return AG_OK;
+}
+
+static ag_err_t ext_wifi_connect(ag_device_t *dev, const char *ssid,
+                                 const char *pass, const uint8_t bssid[6])
+{
+    (void)dev;
+    uint8_t body[RL_JOIN_SIZE];
+    if (!ag_rlink_pack_join(body, ssid, pass, bssid)) {
+        return -AG_EINVAL; /* too long, or nothing to join - never truncated */
+    }
+    ag_rlink_hdr_t req, rep;
+    ag_rlink_req(&req, RL_OP_WJOIN, 0);
+    req.a0 = (bssid != NULL) ? 1u : 0u;
+    req.len = RL_JOIN_SIZE;
+    const ag_err_t e = rpc(&req, body, &rep, NULL, 0);
+    if (e != AG_OK) {
+        return e;
+    }
+    return (rep.status < 0) ? (ag_err_t)rep.status : AG_OK;
+}
+
+static ag_err_t ext_wifi_status(ag_device_t *dev, ag_wifi_status_t *out)
+{
+    (void)dev;
+    if (out == NULL) {
+        return -AG_EINVAL;
+    }
+    uint8_t        body[RL_STATUS_SIZE];
+    ag_rlink_hdr_t req, rep;
+    ag_rlink_req(&req, RL_OP_WSTATUS, 0);
+    const ag_err_t e = rpc(&req, NULL, &rep, body, sizeof(body));
+    if (e != AG_OK) {
+        return e;
+    }
+    if (rep.status < 0) {
+        return (ag_err_t)rep.status;
+    }
+    if (rep.len != RL_STATUS_SIZE) {
+        return -AG_EIO;
+    }
+    ag_rlink_status_t w;
+    if (!ag_rlink_unpack_status(&w, body)) {
+        return -AG_EIO; /* a link state this build has no honest name for */
+    }
+    memset(out, 0, sizeof(*out));
+    out->state = w.state;
+    ag_strlcpy(out->ssid, w.ssid, sizeof(out->ssid));
+    memcpy(out->bssid, w.bssid, sizeof(out->bssid));
+    out->pinned = w.pinned != 0;
+    out->rssi = w.rssi;
+    out->channel = w.channel;
+    out->attempts = w.attempts;
+    out->last_reason = w.last_reason;
+    return AG_OK;
+}
+
 static const ag_dev_ops_t k_dev_ops = {0};
 
-static const ag_net_ops_t k_net_ops = {
+/*
+ * Not const: the station entries are cleared at init when the coprocessor did
+ * not claim RL_CAP_STATION.  One table with a hole punched in it beats two
+ * tables that drift apart the first time a socket op is added to only one.
+ */
+static ag_net_ops_t k_net_ops = {
     .size = sizeof(ag_net_ops_t),
     .start = ext_start,
     .ready = ext_ready,
@@ -540,6 +724,12 @@ static const ag_net_ops_t k_net_ops = {
     .nonblock = ext_nonblock,
     .wait_readable = ext_wait_readable,
     .recv_now = ext_recv_now,
+    .wifi_start = ext_wifi_start,
+    .wifi_stop = ext_wifi_stop,
+    .wifi_scan = ext_wifi_scan,
+    .wifi_connect = ext_wifi_connect,
+    .wifi_disconnect = ext_wifi_disconnect,
+    .wifi_status = ext_wifi_status,
 };
 
 /* ---------------------------------------------------------------------- */
@@ -603,12 +793,32 @@ ag_err_t ag_driver_init(void)
         ag_rlink_req(&req, RL_OP_HELLO, 0);
         req.a0 = RL_PROTO_VERSION;
         if (rpc_simple(&req, &rep) == AG_OK) {
+            s_ext.caps = rep.a1;
             ag_log(AG_LOG_INFO, "extradio", "coprocessor proto %u caps 0x%x",
                    (unsigned)rep.a0, (unsigned)rep.a1);
         } else {
             ag_log(AG_LOG_WARN, "extradio",
                    "no coprocessor on uart%d yet (no HELLO reply)", s_ext.uart);
         }
+    }
+
+    /*
+     * A coprocessor that is not a Wi-Fi radio - a GSM modem, a wired link -
+     * has sockets and no networks to list.  Leaving the station entries
+     * pointing at code that would ask it anyway makes AG_HAS say yes and every
+     * call answer -AG_ENOTSUP, which reads to the operator as a broken radio
+     * rather than as no radio.  Take them out instead.
+     *
+     * A silent coprocessor lands here too (caps stays 0), and that is the right
+     * answer for it as well: nothing has said there is a radio out there.
+     */
+    if ((s_ext.caps & RL_CAP_STATION) == 0) {
+        k_net_ops.wifi_start = NULL;
+        k_net_ops.wifi_stop = NULL;
+        k_net_ops.wifi_scan = NULL;
+        k_net_ops.wifi_connect = NULL;
+        k_net_ops.wifi_disconnect = NULL;
+        k_net_ops.wifi_status = NULL;
     }
 
     const ag_dev_add_t desc = {

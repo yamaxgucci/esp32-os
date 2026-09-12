@@ -66,6 +66,36 @@ ag_err_t    ag_netprov_use_device(const char *name);
 const char *ag_netprov_active(void);
 bool        ag_netprov_is_builtin(void);
 
+/* ------------------------------------------------------------------------ */
+/* The station half                                                          */
+/* ------------------------------------------------------------------------ */
+/*
+ * The radio as a radio: the networks in reach, and joining one.  Same
+ * indirection, same rule - whoever is bound answers, and nothing above can tell
+ * which.  That is the point: with the radio on another board, `wifi scan` has
+ * to work at this board's prompt or the operator is back to knowing which box
+ * holds which chip.
+ *
+ * These speak the ABI's types, not the port's, because the far end does too -
+ * a provider on a wire has no ag_port_wifi_status_t and never will.  The
+ * built-in station is converted into the same shape inside netprov.c, which is
+ * where that conversion moved to from the ABI table.
+ *
+ * has_wifi() is the honest answer to "is there a radio", and it is a runtime
+ * question now: no built-in radio and nothing bound is no; a coprocessor that
+ * claimed the station half is yes.  Every call below answers -AG_ENODEV when it
+ * is false, so a caller may also simply try.
+ */
+bool ag_netprov_has_wifi(void);
+
+ag_err_t ag_netprov_wifi_start(void);
+ag_err_t ag_netprov_wifi_stop(void);
+ag_err_t ag_netprov_wifi_scan(ag_wifi_ap_t *out, uint32_t max, uint32_t *found);
+ag_err_t ag_netprov_wifi_connect(const char *ssid, const char *pass,
+                                 const uint8_t bssid[6]);
+ag_err_t ag_netprov_wifi_disconnect(void);
+ag_err_t ag_netprov_wifi_status(ag_wifi_status_t *out);
+
 #endif /* CONFIG_ARGON_ENABLE_NET */
 
 #endif /* ARGON_NETPROV_H */

@@ -27,9 +27,20 @@
  *   read must be able to say "what has already arrived" without a round trip.
  *
  *   So there is no RL_OP_RECV.  The guest SENDS: HELLO, START, RESOLVE, LISTEN,
- *   ACCEPT, CONNECT, SEND, CLOSE, NONBLOCK, READY, IFADDR.  The coprocessor
- *   PUSHES: DATA (per channel; RL_F_EOF marks the far side closed) and EVENT
- *   (link up / got address / link down).
+ *   ACCEPT, CONNECT, SEND, CLOSE, NONBLOCK, READY, IFADDR - and, when the
+ *   coprocessor is a Wi-Fi radio rather than a modem, WSTART, WSTOP, WSCAN,
+ *   WJOIN, WLEAVE, WSTATUS.  The coprocessor PUSHES: DATA (per channel;
+ *   RL_F_EOF marks the far side closed) and EVENT (link up / got address /
+ *   link down).
+ *
+ * THE STATION HALF is what makes a radio on a wire indistinguishable from one
+ * on the board.  Sockets alone are not enough: `wifi scan` and `wifi connect`
+ * are how a person points at the air, and a board whose only radio is at the
+ * far end of a cable has to be able to do both.  A coprocessor that is not a
+ * Wi-Fi radio (a GSM modem, say) simply leaves RL_CAP_STATION clear in its
+ * HELLO reply and answers none of these; the driver then publishes no station
+ * entries and the kernel reports no radio.  That is why this needed no protocol
+ * version bump - the capability bitmask already says who can do what.
  *
  * A CHANNEL is the coprocessor's own small-integer socket id (0..N).  It is the
  * `ch` field; the guest's kernel wraps it into an ag_handle_t exactly as it
@@ -58,6 +69,27 @@
  *   DATA    push : ch = channel, payload = received bytes; RL_F_EOF => far side
  *                  closed (payload may still carry the last bytes; len may be 0)
  *   EVENT   push : a0 = RL_EV_*, a1 = host-order IPv4 on RL_EV_GOTIP
+ *
+ *   WSTART   req : (none)        rep : status  (radio on, joined to nothing)
+ *   WSTOP    req : (none)        rep : status
+ *   WSCAN    req : a0 = how many networks the guest has room for
+ *            rep : a0 = how many the radio SAW (may exceed the count returned),
+ *                  len = n * RL_AP_SIZE, payload = n packed ag_rlink_ap_t.
+ *                  n is len / RL_AP_SIZE and is <= the requested a0; the guest
+ *                  reports a0 as `found`, which is what the ABI's scan means.
+ *   WJOIN    req : a0 = 1 when the bssid is to be pinned, 0 to join any,
+ *                  payload = RL_JOIN_SIZE bytes: ssid[33] pass[64] bssid[6],
+ *                  each NUL-padded.  Returns when the attempt is MADE, not when
+ *                  it succeeded - the guest polls WSTATUS, exactly as it polls
+ *                  the built-in radio.
+ *            rep : status
+ *   WLEAVE   req : (none)        rep : status
+ *   WSTATUS  req : (none)
+ *            rep : len = RL_STATUS_SIZE, payload = a packed ag_rlink_status_t
+ *
+ *   A password crosses this wire in the clear, and there is no pretending
+ *   otherwise: the link is two boards in one box, and if that wire is
+ *   untrusted then so is the radio at the end of it.
  *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
@@ -97,6 +129,13 @@ enum ag_rlink_op {
     /* Coprocessor -> guest, unsolicited. */
     RL_OP_DATA = 11,
     RL_OP_EVENT = 12,
+    /* The station half - only when the HELLO reply set RL_CAP_STATION. */
+    RL_OP_WSTART = 13,
+    RL_OP_WSTOP = 14,
+    RL_OP_WSCAN = 15,
+    RL_OP_WJOIN = 16,
+    RL_OP_WLEAVE = 17,
+    RL_OP_WSTATUS = 18,
 };
 
 /* flags */
@@ -117,6 +156,8 @@ enum ag_rlink_cap {
     RL_CAP_SOCKETS = 1u << 0, /* net: connect/listen/accept/send/data       */
     RL_CAP_DGRAM = 1u << 1,   /* espnow-shaped datagrams (future)           */
     RL_CAP_MONITOR = 1u << 2, /* 802.11 capture/inject (future)            */
+    RL_CAP_STATION = 1u << 3, /* wifi: WSTART/WSTOP/WSCAN/WJOIN/WLEAVE/    */
+                              /*       WSTATUS - the station half           */
 };
 
 typedef struct ag_rlink_hdr {
@@ -159,5 +200,86 @@ void ag_rlink_req_accept(ag_rlink_hdr_t *h, uint16_t seq, int32_t listen_ch,
                          uint32_t timeout_ms);
 void ag_rlink_req_send(ag_rlink_hdr_t *h, uint16_t seq, int32_t ch,
                        uint32_t len);
+
+/* ------------------------------------------------------------------------ */
+/* The station half: networks and link state on the wire                    */
+/* ------------------------------------------------------------------------ */
+/*
+ * These mirror ag_wifi_ap_t and ag_wifi_status_t, and they are declared here
+ * rather than included from <argon/abi.h> on purpose: this header knows no ABI,
+ * no allocation and no transport, which is what lets the whole codec be tested
+ * on a development machine (host-tests/test_rlink.c).  The driver copies field
+ * for field across the one-line gap.
+ *
+ * The numeric values of `auth` and `state` are deliberately the ABI's own
+ * (AG_WIFI_SEC_* and AG_WIFI_ST_*), so that copy is a copy and not a
+ * translation table nobody remembers to extend.  Renumbering either enum on
+ * one side alone silently mislabels every network a scan returns.
+ */
+#define RL_SSID_MAX 32 /* an SSID is at most 32 bytes, not NUL-counted */
+#define RL_PASS_MAX 63
+
+/* Wire sizes.  Fixed-width records, not NUL-scanned strings: a length nobody
+ * has to compute is a length nobody gets wrong, and 103 bytes is nothing next
+ * to RL_MAX_PAYLOAD. */
+#define RL_AP_SIZE     42u  /* ssid[33] bssid[6] rssi channel auth          */
+#define RL_STATUS_SIZE 51u  /* see ag_rlink_pack_status                     */
+#define RL_JOIN_SIZE   103u /* ssid[33] pass[64] bssid[6]                   */
+
+/* How many networks fit in one WSCAN reply.  38 of them, and the guest asks
+ * for no more than this. */
+#define RL_SCAN_MAX (RL_MAX_PAYLOAD / RL_AP_SIZE)
+
+typedef struct ag_rlink_ap {
+    char    ssid[RL_SSID_MAX + 1];
+    uint8_t bssid[6];
+    int8_t  rssi;    /* dBm, negative      */
+    uint8_t channel;
+    uint8_t auth;    /* AG_WIFI_SEC_*      */
+} ag_rlink_ap_t;
+
+typedef struct ag_rlink_status {
+    uint8_t  state;       /* AG_WIFI_ST_*                                   */
+    char     ssid[RL_SSID_MAX + 1];
+    uint8_t  bssid[6];
+    uint8_t  pinned;      /* this access point was asked for by name         */
+    int8_t   rssi;
+    uint8_t  channel;
+    uint32_t attempts;
+    int32_t  last_reason; /* the far radio's own disconnect reason code      */
+} ag_rlink_status_t;
+
+/*
+ * Pack/unpack one record.  Both unpackers NUL-terminate `ssid` themselves, so a
+ * coprocessor that pads the field with rubbish rather than zeros cannot walk a
+ * reader off its end.
+ *
+ * They differ in what they do with a value they do not recognise, and the
+ * difference is not an inconsistency.  An unknown `auth` becomes
+ * AG_WIFI_SEC_OTHER, which is the enum's own name for exactly this, and
+ * unpack_ap therefore cannot fail: one unfamiliar network must not throw away a
+ * whole scan.  An unknown `state` fails the record, because AG_WIFI_ST_* is a
+ * closed set of four and there is no honest fallback - saying OFF about a
+ * station that is joined is worse than saying nothing.
+ */
+void ag_rlink_pack_ap(uint8_t out[RL_AP_SIZE], const ag_rlink_ap_t *ap);
+bool ag_rlink_unpack_ap(ag_rlink_ap_t *ap, const uint8_t in[RL_AP_SIZE]);
+
+void ag_rlink_pack_status(uint8_t out[RL_STATUS_SIZE],
+                          const ag_rlink_status_t *st);
+bool ag_rlink_unpack_status(ag_rlink_status_t *st,
+                            const uint8_t in[RL_STATUS_SIZE]);
+
+/*
+ * The join request's payload.  `pass` may be NULL or empty (an open network, or
+ * the key the far radio already holds); `bssid` NULL joins any access point of
+ * that name and is what clears the header's a0.  An ssid or a pass too long for
+ * the field is refused rather than truncated - a truncated key joins nothing
+ * and looks like a wrong password forever.
+ */
+bool ag_rlink_pack_join(uint8_t out[RL_JOIN_SIZE], const char *ssid,
+                        const char *pass, const uint8_t bssid[6]);
+bool ag_rlink_unpack_join(char ssid[RL_SSID_MAX + 1], char pass[RL_PASS_MAX + 1],
+                          uint8_t bssid[6], const uint8_t in[RL_JOIN_SIZE]);
 
 #endif /* AG_RLINK_H */
