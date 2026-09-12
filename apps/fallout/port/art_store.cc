@@ -52,6 +52,19 @@ uint32_t s_count;
 
 ag_store_t s_store;
 uint32_t s_bytes;          /* how big the partition is                     */
+
+/*
+ * How much of it we are willing to fill (-flashcap N, in kilobytes).
+ *
+ * Filling the whole partition is not free: everything put in has to be
+ * erased first and written after, and the board is stopped with its cache off
+ * for the whole of both.  Measured on a single map: filling 7733 KB cost 63
+ * seconds of writing and 21 of erasing, and one thirty-second window of play
+ * spent 24 of its seconds simply stopped.  Filling 5672 KB cost 42 and 16.
+ * The art that matters is a small part of what fits, so there is a ceiling,
+ * and it is a setting because it belongs to the map, not to the chip.
+ */
+uint32_t s_cap_bytes;      /* 0 = fill the whole partition */
 uint32_t s_fill_at;        /* where the next write goes                    */
 uint32_t s_erased_to;      /* everything below this is clear and writable  */
 
@@ -137,6 +150,24 @@ uint32_t s_hits, s_misses, s_in_place, s_copied, s_by_spi;
 uint32_t s_bytes_read, s_read_us;
 uint32_t s_bytes_written, s_write_us, s_write_batches;
 uint32_t s_erase_us, s_erase_kb, s_clears;
+
+/*
+ * The same two costs, but per window, so a report answers "how much of these
+ * thirty seconds was the board simply stopped?".  The totals above cannot:
+ * they are dominated by the map load and hide what play actually pays.
+ */
+uint32_t s_win_write_us, s_win_erase_us, s_win_write_kb, s_win_erase_kb;
+uint32_t s_win_batches;
+
+/*
+ * Kilobytes by kind, not just counts.
+ *
+ * "Four and a half megabytes held everything this town needs" and "the store
+ * filled eight" are both true, and the difference is the whole question: what
+ * else went in.  Counting pictures cannot answer it - a critter frame and a
+ * tile differ by a factor of thirty - so the bytes are counted by kind.
+ */
+uint32_t s_kb_load_kind[16], s_kb_play_kind[16];
 
 /*
  * Art that left RAM and did NOT reach flash, counted by why.
@@ -327,7 +358,12 @@ bool erase_more()
     const uint32_t t0 = ag_us();
     const bool ok = api->erase(s_store, s_erased_to, want) == AG_OK;
 
-    s_erase_us += ag_us() - t0;
+    {
+        const uint32_t spent = ag_us() - t0;
+
+        s_erase_us += spent;
+        s_win_erase_us += spent;
+    }
     if (!ok) {
         return false;
     }
@@ -361,7 +397,12 @@ bool write_through(uint32_t at, const uint8_t *src, uint32_t len)
                                                          : (src + done),
                                    piece) == AG_OK;
 
-        s_write_us += ag_us() - t0;
+        {
+            const uint32_t spent = ag_us() - t0;
+
+            s_write_us += spent;
+            s_win_write_us += spent;
+        }
         if (!ok) {
             return false;
         }
@@ -435,6 +476,12 @@ void ag_art_store_in_place(unsigned kinds)
  * at 6.9 against 3.5 milliseconds a kilobyte - but the report is not the
  * judge, the game is, so both ways stay reachable.
  */
+/* How much of the store partition may be filled, in kilobytes; 0 = all. */
+void ag_art_store_cap_kb(unsigned kb)
+{
+    s_cap_bytes = kb * 1024u;
+}
+
 void ag_art_store_stage_kb(unsigned kb)
 {
     s_want_bounce = (kb != 0u);
@@ -468,6 +515,9 @@ void ag_art_store_init(void)
     }
 
     s_bytes = (uint32_t)api->bytes(s_store);
+    if (s_cap_bytes != 0u && s_bytes > s_cap_bytes) {
+        s_bytes = s_cap_bytes;
+    }
 
     /*
      * The staging buffer wants to be in INTERNAL memory, and this is not a
@@ -734,9 +784,11 @@ void ag_art_store_put_many(const ag_art_put_t *items, int count)
             if (s_filling) {
                 s_kept_load++;
                 s_kept_load_kind[kind]++;
+                s_kb_load_kind[kind] += (uint32_t)size;
             } else {
                 s_kept_play++;
                 s_kept_play_kind[kind]++;
+                s_kb_play_kind[kind] += (uint32_t)size;
             }
         }
     }
@@ -882,8 +934,9 @@ void ag_art_store_kinds(char *out, size_t cap)
 
     for (unsigned k = 0; k < 16u && pos > 0 && (size_t)pos < cap; k++) {
         if (s_kept_play_kind[k] != 0u) {
-            pos += snprintf(out + pos, cap - (size_t)pos, " %s %u",
-                            name[k], (unsigned)s_kept_play_kind[k]);
+            pos += snprintf(out + pos, cap - (size_t)pos, " %s %u/%uKB",
+                            name[k], (unsigned)s_kept_play_kind[k],
+                            (unsigned)(s_kb_play_kind[k] >> 10));
         }
     }
     if (pos > 0 && (size_t)pos < cap) {
@@ -891,8 +944,9 @@ void ag_art_store_kinds(char *out, size_t cap)
     }
     for (unsigned k = 0; k < 16u && pos > 0 && (size_t)pos < cap; k++) {
         if (s_kept_load_kind[k] != 0u) {
-            pos += snprintf(out + pos, cap - (size_t)pos, " %s %u",
-                            name[k], (unsigned)s_kept_load_kind[k]);
+            pos += snprintf(out + pos, cap - (size_t)pos, " %s %u/%uKB",
+                            name[k], (unsigned)s_kept_load_kind[k],
+                            (unsigned)(s_kb_load_kind[k] >> 10));
         }
     }
 }
@@ -933,4 +987,21 @@ void ag_art_store_report(char *out, size_t cap)
              (unsigned)s_lost_big, (unsigned)s_lost_closed,
              (unsigned)s_load_ms, (unsigned)s_load_write_ms,
              (unsigned)s_load_erase_ms);
+
+    /*
+     * And what this window alone paid: the part of the last thirty seconds in
+     * which the board was stopped with its cache off, writing or erasing.
+     */
+    {
+        const size_t at = strlen(out);
+
+        if (at + 1u < cap) {
+            snprintf(out + at, cap - at,
+                     " | this window: stopped %u ms writing and %u ms erasing",
+                     (unsigned)(s_win_write_us / 1000u),
+                     (unsigned)(s_win_erase_us / 1000u));
+        }
+        s_win_write_us = 0;
+        s_win_erase_us = 0;
+    }
 }

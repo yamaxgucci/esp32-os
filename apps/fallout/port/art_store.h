@@ -62,6 +62,14 @@ void ag_art_store_in_place(unsigned kinds);
  */
 void ag_art_store_batch_kb(unsigned kb);
 
+/*
+ * How much of the store partition may be filled (-flashcap N kilobytes, 0 for
+ * all of it).  Everything put in must be erased first and written after, and
+ * the board stops with its cache off for both, so the ceiling is what keeps
+ * play from paying for art it will not look at.
+ */
+void ag_art_store_cap_kb(unsigned kb);
+
 /* 0: write straight from the arena.  32: relay through internal memory. */
 void ag_art_store_stage_kb(unsigned kb);
 

@@ -1642,6 +1642,8 @@ extern "C" int ag_cxx_main(int argc, char **argv)
             ag_art_store_batch_kb((unsigned)to_int(argv[++i]));
         } else if (same(argv[i], "-flashwhen") && i + 1 < argc) {
             ag_art_store_write_in_play(to_int(argv[++i]));
+        } else if (same(argv[i], "-flashcap") && i + 1 < argc) {
+            ag_art_store_cap_kb((unsigned)to_int(argv[++i]));
         } else if (same(argv[i], "-flashstage") && i + 1 < argc) {
             ag_art_store_stage_kb((unsigned)to_int(argv[++i]));
         } else if (same(argv[i], "-watchdog") && i + 1 < argc) {
