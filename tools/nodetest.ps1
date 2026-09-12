@@ -370,7 +370,11 @@ if ($Scenario -eq 'link' -or $Scenario -eq 'both') {
                  # other node's, asked for over the wire.
                  'dev',
                  'link run t:\hello.axe one two',
-                 '=from the other node')
+                 '=from the other node',
+                 # And the same thing without being told where.  `run` finds no
+                 # such file here, sees a neighbour, and asks it.
+                 'run t:\hello.axe three',
+                 '=argv[1] = three')
 
     $a = Transcript 'build\nodetest-run-a.log'
     $b = Transcript 'build\nodetest-run-b.log'
@@ -406,6 +410,13 @@ if ($Scenario -eq 'link' -or $Scenario -eq 'both') {
     # the remote section is not proof by itself; the far node has the link
     # driver of its own and says so, and the section header only appears when
     # the far node answered.
+    # Placement, in its simplest and most honest form: the image is the first
+    # datum a program needs, so a file that is on the other node IS the
+    # statement that the program belongs there.  No manifest, no policy, no
+    # names - and the operator did not say where.
+    Check $a 'not here; running it on node0' 'place-run-went-to-the-other-node'
+    Check $a 'argv[1] = three' 'place-run-really-ran-there'
+
     Check $a 'on the other node, over node0' 'dev-far-section-appeared'
     # A window after the header, not a split: the console repaints, so the
     # transcript contains the whole screen several times over and anything

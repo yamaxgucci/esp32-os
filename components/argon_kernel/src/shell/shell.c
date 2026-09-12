@@ -62,6 +62,7 @@
 #include "net/espnow.h"
 #include "net/wifimon.h"
 #include <argon/linkprov.h>
+#include <argon/nodeproc.h>
 #include <argon/nodedev.h>
 
 #include "shell/cmd_link.h"
@@ -1101,6 +1102,62 @@ static int cmd_run(int argc, char **argv)
         ag_shell_resolve_cmd(argv[first], s_cwd, shell_path_env(), resolved,
                              sizeof(resolved));
     if (rerr != AG_OK) {
+        /*
+         * Not here.  If there is another node, ask it - and say so.
+         *
+         * This is the placement rule at its simplest and, it turns out, its
+         * most honest: the plan says move the process to the data, and the
+         * first datum a program needs is its own image.  A file that is on the
+         * other node IS the statement that the program belongs there, and it
+         * needs no manifest, no policy table and no names.
+         *
+         * The manifest was the intended source of this decision, and it still
+         * is for the harder half - "this program wants a sound card" cannot be
+         * read off a directory.  But it has a constraint nobody had noticed:
+         * to decide by manifest you must READ the manifest, which means
+         * reading the file, which means the file has to be reachable from the
+         * node deciding.  With one card per node it is not.  So the easy half
+         * is done by where the file is, and the hard half waits for the
+         * filesystem to cross the wire.
+         *
+         * Only for "no such file": a file that is here and will not load is a
+         * broken file, and running it somewhere else would turn one clear
+         * error into two confusing ones.
+         */
+        if (rerr == -AG_ENOENT && !detach_only && ag_linkprov_bound()) {
+            char line[AG_PATH_MAX + 64];
+            size_t at = 0;
+            for (int i = first; i < argc; i++) {
+                const size_t n = strlen(argv[i]);
+                if (at + n + 2u >= sizeof(line)) {
+                    at = 0;
+                    break;
+                }
+                if (at > 0) {
+                    line[at++] = ' ';
+                }
+                memcpy(line + at, argv[i], n);
+                at += n;
+            }
+            if (at > 0) {
+                line[at] = '\0';
+                ag_console_printf("not here; running it on %s\n",
+                                  ag_linkprov_active());
+                int32_t        code = 0;
+                const ag_err_t err = ag_nodeproc_run(line, 60000u, &code);
+                if (err == AG_OK) {
+                    if (code < 0) {
+                        ag_console_printf("did not run there either: %d\n",
+                                          (int)code);
+                        return 1;
+                    }
+                    return (code == 0) ? 0 : 1;
+                }
+                /* Fall through to the local error: a neighbour that could not
+                 * run it does not change what is wrong here. */
+                ag_console_printf("  (the other node: %d)\n", (int)err);
+            }
+        }
         print_load_error(argv[first], rerr);
         return 1;
     }
