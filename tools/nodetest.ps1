@@ -190,7 +190,7 @@ function Invoke-Pair {
 # ------------------------------------------------------------------ build ---
 
 $only = @('LINK.AXE')
-if ($Scenario -ne 'raw') { $only += 'NODELINK.SYS'; $only += 'HELLO.AXE'; $only += 'NEEDSND.AXE'; $only += 'PCMVIRT.SYS' }
+if ($Scenario -ne 'raw') { $only += 'NODELINK.SYS'; $only += 'HELLO.AXE'; $only += 'NEEDSND.AXE'; $only += 'PCMVIRT.SYS'; $only += 'DEVPOKE.AXE' }
 & python (Join-Path $PSScriptRoot 'build_apps.py') --only @only | Out-Null
 foreach ($img in $only) {
     if (-not (Test-Path "build\apps\$img")) { throw "$img did not build." }
@@ -538,7 +538,8 @@ if ($Scenario -eq 'link' -or $Scenario -eq 'both') {
 
     Invoke-Pair -Tag 'place' `
         -PutBoth @('build\apps\NODELINK.SYS=t:\nodelink.sys') `
-        -PutA @('build\apps\NEEDSND.AXE=t:\needsnd.axe') `
+        -PutA @('build\apps\NEEDSND.AXE=t:\needsnd.axe',
+                'build\apps\DEVPOKE.AXE=t:\devpoke.axe') `
         -PutB @('build\apps\PCMVIRT.SYS=t:\pcmvirt.sys') `
         -SendB @('drv load t:\pcmvirt.sys',
                  'drv load t:\nodelink.sys',
@@ -561,7 +562,13 @@ if ($Scenario -eq 'link' -or $Scenario -eq 'both') {
                  # gives, from the node that is about to hand the job over.
                  'dev',
                  'run t:\needsnd.axe',
-                 '=ran on a node with sound')
+                 '=ran on a node with sound',
+                 # And the far node's devices, in this registry, by name.
+                 'link devs',
+                 '=are in this registry now',
+                 'dev',
+                 'run t:\devpoke.axe sound.pcmvirt 64',
+                 '=devpoke: closed')
 
     $a = Transcript 'build\nodetest-place-a.log'
     $b = Transcript 'build\nodetest-place-b.log'
@@ -592,6 +599,16 @@ if ($Scenario -eq 'link' -or $Scenario -eq 'both') {
     # available - this node has no NEEDSND to load and no loader line of its own
     # to confuse it with, so the line can only have been written over there.
     Check $a 'loader: NEEDSND' 'place-far-kernel-loaded-it-over-the-link'
+
+    # The far node's device, in this node's registry, opened by name.
+    #
+    # `sound.pcmvirt` can only be the far node's: PCMVIRT.SYS is loaded on B
+    # and nowhere else, so this node has no device of that name to open by
+    # mistake.  A listing crossing the wire is a description; an open crossing
+    # it is a conversation, and only the second proves anything.
+    Check $a 'are in this registry now' 'rdev-proxies-registered'
+    Check $a 'sound.pcmvirt is open' 'rdev-opened-a-device-that-is-not-here'
+    Check $a '64 of 64 bytes taken' 'rdev-wrote-through-the-wire'
 }
 
 # ------------------------------------------------- unloading, on one node ---

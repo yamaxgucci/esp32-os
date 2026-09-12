@@ -60,6 +60,7 @@ set(ARGON_KERNEL_SRCS
     "src/net/nodefs.c"
     "src/net/nodedrv.c"
     "src/net/nodehello.c"
+    "src/net/noderdev.c"
     "src/net/espnow.c"
     "src/net/wifimon.c"
     "src/net/netmsg.c"

@@ -24,6 +24,7 @@
 #include <argon/nodedrv.h>
 #include <argon/nodehello.h>
 #include <argon/nodename.h>
+#include <argon/noderdev.h>
 #include <argon/nodefs.h>
 #include <argon/nodeproc.h>
 #include <argon/path.h>
@@ -346,6 +347,10 @@ int ag_cmd_link(int argc, char **argv)
         if (herr != AG_OK) {
             ag_console_printf("  (did not say hello: %d)\n", (int)herr);
         }
+        const ag_err_t rerr = ag_noderdev_serve();
+        if (rerr != AG_OK) {
+            ag_console_printf("  (not serving our devices: %d)\n", (int)rerr);
+        }
         return 0;
     }
 
@@ -433,6 +438,36 @@ int ag_cmd_link(int argc, char **argv)
      * there is one letter for it, and letting it be chosen only invents a way
      * for the two ends to disagree about where the other one is.
      */
+    /*
+     * Not automatic at `link use`, and that is a decision rather than an
+     * omission: attaching asks the far node for its whole registry and puts a
+     * dozen entries into this one, which is a thing an operator should ask for
+     * rather than discover.  Also, the qualified names need the far node's
+     * NAME, and the hello it is waiting on may not have been answered at the
+     * instant the link is bound.
+     */
+    if (ag_path_icmp(argv[1], "devs") == 0) {
+        const int32_t n = ag_noderdev_attach(8000u);
+        if (n == -AG_EAGAIN) {
+            ag_console_puts("the other node has not said its name yet; "
+                            "try again\n");
+            return 1;
+        }
+        if (n < 0) {
+            ag_console_printf("link devs: %d\n", (int)n);
+            return 1;
+        }
+        ag_console_printf("%d device(s) of %s are in this registry now\n",
+                          (int)n, ag_node_peer_name());
+        ag_console_puts("  `dev` lists them; open one by its qualified name\n");
+        return 0;
+    }
+
+    if (ag_path_icmp(argv[1], "nodevs") == 0) {
+        ag_console_printf("%u gone\n", (unsigned)ag_noderdev_detach());
+        return 0;
+    }
+
     if (ag_path_icmp(argv[1], "mount") == 0) {
         const ag_err_t e = ag_nodedrv_mount(AG_NODEDRV_MOUNT);
         if (e != AG_OK) {
@@ -459,7 +494,7 @@ int ag_cmd_link(int argc, char **argv)
     }
 
     ag_console_puts("usage: link [use <dev>|none | run <path> [args] | "
-                    "get <there> <here> | mount | umount | name [x] | "
-                    "ping [n] | echo [secs] | poll [ms]]\n");
+                    "get <there> <here> | mount | umount | devs | nodevs | "
+                    "name [x] | ping [n] | echo [secs] | poll [ms]]\n");
     return 1;
 }
