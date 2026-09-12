@@ -175,7 +175,7 @@ extern "C" {
  * without asking is a null call, and that is on the caller.
  */
 #ifndef AG_ABI_MINOR
-#define AG_ABI_MINOR 44u
+#define AG_ABI_MINOR 45u
 #endif
 
 /* ------------------------------------------------------------------------ */
@@ -2065,6 +2065,85 @@ typedef struct ag_cam_api {
 
 /* ------------------------------------------------------------------------ */
 /* Root table                                                               */
+
+/* ------------------------------------------------------------------------ */
+/* Raw flash stores                                                         */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * A partition an application may use as its own storage, with no filesystem
+ * in the way: it reads, writes and erases bytes at offsets, and it may ask
+ * for a span to appear in the address space so that reading costs a load
+ * instruction instead of a call.
+ *
+ * This exists because a game's art, a synthesiser's samples and a logger's
+ * ring all want the same thing - a few megabytes of flash that survive a
+ * reboot and can be read without copying - and none of them wants a
+ * filesystem's directories, names or write amplification.
+ *
+ * Only partitions of type data with subtype 0x41 can be opened.  That is
+ * deliberate and it is the whole safety story: C: (littlefs), nvs and the
+ * firmware itself are all excluded, so a wrong label cannot destroy the
+ * machine's configuration or the OS.  Add a store to the partition table to
+ * create one; see partitions_16mb.csv.
+ *
+ * What the hardware costs, because it decides how a store may be used:
+ *
+ *   - reading is cheap, and mapped reading is nearly free: the bytes go
+ *     through the same cache the processor's own code does.
+ *   - writing needs the sector erased first, tens of milliseconds for each
+ *     4 KB, and on this class of part the cache is DISABLED while an erase or
+ *     a program runs.  Everything executing from flash stops for that time.
+ *
+ * So a store is filled at a moment the program is already standing still - a
+ * level load, a startup, an explicit save - and read during the parts that
+ * have to be smooth.  A write in an animation loop will be visible as a
+ * freeze, and no amount of buffering hides it.
+ */
+typedef const void *ag_store_t;     /* an open store, NULL when there is none */
+typedef uintptr_t   ag_store_map_t; /* a live mapping, 0 when there is none   */
+
+typedef struct ag_store_api {
+    uint32_t size;
+
+    /*
+     * Open the store with this label, or NULL when the partition table has no
+     * such raw store.  The handle is a description, not a lock: opening the
+     * same store twice is allowed and the two callers share the bytes.
+     */
+    ag_store_t (*open)(const char *label);
+
+    /* Bytes in the store, and the granularity erase() works in (4096 here). */
+    uint64_t (*bytes)(ag_store_t s);
+    uint32_t (*erase_size)(ag_store_t s);
+
+    ag_err_t (*read)(ag_store_t s, uint64_t off, void *buf, size_t len);
+
+    /*
+     * Write bytes that have already been erased.  Flash only clears bits, so
+     * writing over live data without erasing first gives the AND of the two,
+     * silently: erase the span, then write it.
+     */
+    ag_err_t (*write)(ag_store_t s, uint64_t off, const void *buf, size_t len);
+
+    /* Erase whole sectors.  off and len must be multiples of erase_size(). */
+    ag_err_t (*erase)(ag_store_t s, uint64_t off, size_t len);
+
+    /*
+     * Put a span in the address space, read only, and hand back a pointer to
+     * it.  Nothing is copied and no memory is spent: the pointer reaches
+     * flash through the cache.
+     *
+     * It can fail even when the store is fine - the address window for mapped
+     * flash is finite and shared with everything else mapped - so a caller
+     * that needs to work either way should fall back to read() rather than
+     * treat AG_ERR_NOMEM as fatal.  Unmap what is no longer needed.
+     */
+    ag_err_t (*map)(ag_store_t s, uint64_t off, size_t len, const void **addr,
+                    ag_store_map_t *out);
+    void (*unmap)(ag_store_map_t h);
+} ag_store_api_t;
+
 /* ------------------------------------------------------------------------ */
 
 typedef struct ag_api {
@@ -2111,8 +2190,11 @@ typedef struct ag_api {
     /* ABI 0.41+: the DVP camera transport - NULL without
      * CONFIG_ARGON_ENABLE_CAMERA. */
     const ag_cam_api_t *cam;
-} ag_api_t;
 
+    /* ABI 0.45+: raw flash stores.  Never NULL, but open() answers NULL on a
+     * machine whose partition table declares no store. */
+    const ag_store_api_t *store;
+} ag_api_t;
 /* ------------------------------------------------------------------------ */
 /* Executable image header                                                  */
 /* ------------------------------------------------------------------------ */

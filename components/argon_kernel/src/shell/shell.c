@@ -4826,6 +4826,15 @@ int ag_shell_execute(const char *line)
     if (argc == 0) {
         return 0;
     }
+    /*
+     * A line that fills every slot has probably lost its tail, and a lost
+     * tail is invisible: the command runs, and the options that were dropped
+     * simply look as though they do nothing.  Say so.
+     */
+    if (argc == AG_ARGV_MAX) {
+        ag_console_printf("warning: command line cut at %d words; the rest "
+                          "was dropped\n", AG_ARGV_MAX);
+    }
 
     ag_handle_t redirect = AG_INVALID_HANDLE;
     const int   trimmed = take_redirection(argc, argv, &redirect);

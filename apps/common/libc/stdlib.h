@@ -35,6 +35,10 @@ void ag_libc_log_sink(void (*sink)(const char *line));
  * keeps a cache is the one that can do something about it.
  */
 void ag_libc_oom_sink(int (*sink)(size_t wanted));
+/* ARGON: a lender of last resort - malloc asks it when the arena is empty, and
+ * offers every pointer to the giveback before freeing.  See libc_shim.c. */
+void ag_libc_borrow_sink(void *(*borrow)(size_t wanted),
+                         int (*giveback)(void *p, size_t *sizePtr));
 extern unsigned ag_libc_oom_rescues;
 void ag_libc_malloc_profile(int on);
 void ag_libc_malloc_profile_dump(int top);

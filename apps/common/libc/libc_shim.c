@@ -121,6 +121,37 @@ void ag_libc_oom_sink(int (*sink)(size_t wanted))
 
 unsigned ag_libc_oom_rescues;
 
+/*
+ * ARGON: and a lender of last resort.
+ *
+ * The hook above can only free things and let malloc try again, which is no
+ * use when the memory that exists is inside somebody's private pool.  Fallout
+ * 2 keeps its art cache as one block of two and a half megabytes with its own
+ * allocator inside it, and that allocator can both evict art to make room and
+ * move blocks about - so when the arena has nothing left, the cache does, and
+ * every byte of it is a copy of a file on the card.
+ *
+ * Maxim asked for exactly this: "надо не просто очистить кэш арта на отказе, а
+ * убрать столько сколько не хватает и дать память именно из кэша арта."  So
+ * the application may install a pair - one that hands out a block from
+ * wherever it keeps its own memory, one that recognises such a block and takes
+ * it back - and malloc tries the lender after the hook has failed rather than
+ * returning NULL.
+ *
+ * free() and realloc() offer every pointer to the giveback first; it answers
+ * only for its own, which is a lookup in a table of a few dozen entries.
+ */
+static void *(*s_libc_borrow)(size_t wanted);
+static int (*s_libc_giveback)(void *p, size_t *sizePtr);
+
+unsigned ag_libc_borrowed;
+
+void ag_libc_borrow_sink(void *(*borrow)(size_t), int (*giveback)(void *, size_t *))
+{
+    s_libc_borrow = borrow;
+    s_libc_giveback = giveback;
+}
+
 void ag_libc_log_sink(void (*sink)(const char *line))
 {
     s_libc_log = sink;
@@ -214,7 +245,17 @@ static void report_big(size_t n, void *r0, void *r1, void *r2, void *r3,
 #endif
 #define PROFILE_SITES 1024u
 #ifndef PROFILE_MIN
-#define PROFILE_MIN   64u
+/*
+ * ARGON: 1024, not 64.
+ *
+ * At 64 bytes the table sees nearly every allocation the engine makes, and
+ * the hash and probe on each of them made the instrumented build unplayable -
+ * Maxim, 10 September 2026: "очень сильные тормоза, невозможно играть", and
+ * an instrument nobody can hold still enough to use answers nothing.  The
+ * question it exists for is who holds hundreds of kilobytes while a town
+ * loads, and nothing under a kilobyte is ever the answer to that.
+ */
+#define PROFILE_MIN   1024u
 #endif
 #define PROFILE_PROBE 256u
 
@@ -454,6 +495,17 @@ void *malloc(size_t n)
             }
         }
     }
+
+    /* Still nothing: borrow from whatever pool the application keeps.  Guarded
+     * by the same flag - the lender evicts, and evicting calls free. */
+    if (p == NULL && s_libc_borrow != NULL && !s_in_oom) {
+        s_in_oom = 1;
+        p = s_libc_borrow(n);
+        s_in_oom = 0;
+        if (p != NULL) {
+            ag_libc_borrowed++;
+        }
+    }
     report_big(n, __builtin_return_address(0), __builtin_return_address(1),
                __builtin_return_address(2), __builtin_return_address(3),
                __builtin_return_address(4), p);
@@ -498,6 +550,24 @@ void *realloc(void *p, size_t n)
 {
     void *q;
 
+    /*
+     * A borrowed block cannot be handed to ag_realloc - it is not the arena's -
+     * so it is copied out and given back.  The lender remembers how big it was,
+     * which is the one thing realloc needs and the caller never says.
+     */
+    if (p != NULL && s_libc_giveback != NULL && !s_in_oom) {
+        size_t was = 0;
+
+        if (s_libc_giveback(p, &was) != 0) {
+            q = malloc(n);
+            if (q != NULL && was != 0) {
+                memcpy(q, p, (was < n) ? was : n);
+            }
+            /* The giveback has already released it; nothing else to do. */
+            return q;
+        }
+    }
+
     /* Prefer the ABI realloc: it knows the old block size (multi_heap). */
     prof_free(p);
     q = ag_realloc(p, n);
@@ -508,7 +578,16 @@ void *realloc(void *p, size_t n)
 void free(void *p)
 {
     if (p != NULL) {
+        size_t was = 0;
+
         prof_free(p);
+
+        /* Borrowed rather than allocated?  Then it goes back where it came
+         * from, and ag_free must not see it at all. */
+        if (s_libc_giveback != NULL && !s_in_oom && s_libc_giveback(p, &was)) {
+            return;
+        }
+
         ag_free(p);
     }
 }

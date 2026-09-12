@@ -100,7 +100,9 @@ extern unsigned ag_cache_failed[AG_CACHE_SLOTS];
  * pushing everything else out.
  */
 #define AG_NAME_MAX 24
-#define AG_TOP_MISSES 10
+/* Ten was too few to answer "what is being re-read": one lantern animation
+ * read 104 times filled the table and hid everything behind it. */
+#define AG_TOP_MISSES 32
 
 /* The file the current miss is reading.  Written by the cache's read proc,
  * consumed by cacheLock; empty means the read proc did not say. */
@@ -127,6 +129,151 @@ extern unsigned char ag_top_where[AG_TOP_MISSES];
  * Timed around soundLoad, so it covers the open, the read, the decode and the
  * copy - the whole of what the game waits for.
  */
+/*
+ * Where a cache miss actually goes, 9 September 2026.
+ *
+ * The counters above said what a miss costs - 10979 of them while walking,
+ * 118639 ms, 230695 KB read - but not what the time was spent on.  21 KB in
+ * 10.8 ms is 1.9 MB/s, which is far under what the card can do, so the answer
+ * matters: if it is the card, read in bigger pieces; if it is zlib, there is
+ * nothing to win there and the size of the cache is the only lever left.
+ *
+ * Three places, and between them they account for the whole of a miss:
+ *
+ *   open     finding the entry and starting the zlib stream (dfileOpen)
+ *   read     fread of the compressed bytes - the card
+ *   inflate  zlib turning them back into pixels - the processor
+ *
+ * The chunk sizes on the way are worth knowing while reading these: the shim
+ * reads the card 4096 bytes at a time (FILE_RBUF) and zlib is fed 1024 at a
+ * time (DFILE_DECOMPRESSION_BUFFER_SIZE), so a 21 KB frame is twenty trips
+ * through both.
+ */
+/*
+ * How big the art cache would have to be, measured instead of argued.
+ *
+ * The counters say 91% of the misses while walking are for art the cache had
+ * and threw out - which is thrashing, and the cure for thrashing is a cache
+ * that holds the working set.  Nobody knows what that set weighs.  So every
+ * key the cache is asked for is noted with its size, distinct keys only, and
+ * the total is printed once per window: that total IS the cache size that
+ * would have had no re-reads at all in that window.
+ *
+ * A fixed table with no allocation - it runs inside cacheLock, on the path
+ * this whole exercise is about, so it must cost nothing worth measuring.  When
+ * it fills, the overflow is counted and reported rather than silently making
+ * the answer look smaller than it is.
+ */
+void ag_ws_note(int kind, int key, int size);
+
+/*
+ * How far the character has walked, in hexes.
+ *
+ * Maxim, 9 September 2026: "считать надо не на стоящем персонаже.
+ * Отслеживай перемещения и меряй количество промахов на пройденый путь."
+ * Exactly right, and it is the only way these sessions can be compared: a
+ * count of misses measures how much he walked, and misses per hundred hexes
+ * measures the cache.  Standing still has no misses and proves nothing.
+ *
+ * Accumulated in the main loop from the dude's own tile, through the closed
+ * form hex distance - so a teleport across the map counts as the hexes it
+ * really was, and a step counts as one.
+ */
+/*
+ * Art misses by what kind of art it is.
+ *
+ * Measured 9 September 2026: walking costs 2916 art misses per hundred hexes -
+ * twenty-nine misses for every single step, about 350 ms of card reading per
+ * step.  The table of file names could not answer what they were (it keeps the
+ * most expensive files, and a lantern animation read a hundred times filled
+ * it), and the answer decides the fix: tiles and walls are the map itself and
+ * arrive by the dozen as the view scrolls, scenery is objects standing on it,
+ * critters are animations.  A cure for one is no cure for the others.
+ *
+ * Indexed by the object type in the fid - FID_TYPE - so it costs one shift and
+ * one increment on the miss path.
+ */
+#define AG_ART_KINDS 11
+
+extern unsigned ag_art_miss[AG_ART_KINDS];
+extern unsigned ag_art_miss_ms[AG_ART_KINDS];
+
+/* Of those misses, the ones the flash store answered.  A miss that flash
+ * satisfied still costs a copy into the cache, but not a read from the card
+ * and not an inflate - which is the whole point of the store, so the two are
+ * counted apart.  See apps/fallout/port/art_store.h. */
+extern unsigned ag_art_from_flash[AG_ART_KINDS];
+
+/* ARGON: what one tick of _object_animate costs.  It calls
+ * tileWindowRefreshRect once per animated object per frame, and each of those
+ * re-renders the map inside that rectangle - tiles, objects, light.  Its
+ * worst call is the largest single cost left in the game, and these say
+ * whether that is many objects or one large rectangle. */
+extern unsigned ag_anim_refresh_n, ag_anim_refresh_px;
+extern unsigned ag_anim_worst_us, ag_anim_worst_refreshes;
+extern unsigned ag_anim_worst_px, ag_anim_worst_sads;
+extern unsigned ag_anim_seq_us, ag_anim_move_us, ag_anim_script_us;
+extern unsigned ag_anim_worst_seq_us, ag_anim_worst_move_us;
+extern unsigned ag_anim_worst_script_us;
+
+/* Inside _object_move: the path search taken when the way is blocked, and the
+ * map refresh that ends every step. */
+/* A trap for a slow tile script, kept for the whole game: silent until one
+ * call passes the threshold, then it names the tile.  See animation.cc. */
+void ag_script_slow_note(unsigned us, int tile, int elevation);
+
+/* The six layers of one map refresh; see tileRefreshGame in tile.cc. */
+/* Inside the object pass: how many turns of the loop, how many were in range,
+ * how many tiles held anything, how many objects were drawn and what the
+ * drawing itself cost.  See _obj_render_pre_roof in object.cc. */
+extern unsigned ag_render_calls, ag_render_steps, ag_render_inrange;
+extern unsigned ag_render_tiles, ag_render_objects, ag_render_draw_us;
+extern unsigned ag_render_objects2, ag_render_draw2_us;
+/* Inside _obj_render_object: how many calls drew nothing, and what the art
+ * lock cost before anyone asked whether they would. */
+extern unsigned ag_draw_calls, ag_draw_hidden, ag_draw_missed, ag_draw_hit;
+extern unsigned ag_draw_early;
+
+/*
+ * The three kinds of "not in hand", counted apart.
+ *
+ * ag_miss_ram is what the engine's own cache calls a miss: it had nothing.
+ * Most of those are answered by the flash store and cost almost nothing.
+ * ag_miss_card is the one that matters - neither RAM nor flash had it and the
+ * card had to be read, which is milliseconds rather than microseconds.  Using
+ * one word for all three is how a report can say "five thousand misses" about
+ * a game that touched the card two thousand times.
+ */
+extern unsigned ag_art_requests;
+extern unsigned ag_miss_ram, ag_miss_flash, ag_miss_card, ag_miss_card_kb;
+extern unsigned ag_draw_lock_us;
+
+extern unsigned ag_layer_n;
+extern unsigned ag_layer_clear_us, ag_layer_floor_us, ag_layer_pre_us;
+extern unsigned ag_layer_roof_us, ag_layer_post_us, ag_layer_window_us;
+
+extern unsigned ag_path_us, ag_path_n;
+extern unsigned ag_move_refresh_us, ag_move_refresh_n, ag_move_refresh_px;
+
+/* ARGON: what one scroll step costs, in its four parts.
+
+ * gameMouseRefresh was measured at 39.7 ms a frame while the map was moving -
+ * two thirds of everything - and the scroll is what it is doing.  mapScroll
+ * already shifts the window with memmove and redraws only the strip that came
+ * into view, so "it redraws the whole map" is not the answer; these four say
+ * which part it really is.  See mapScroll in map.cc. */
+extern unsigned ag_scroll_steps;
+extern unsigned ag_scroll_move_us;    /* shifting the window buffer      */
+extern unsigned ag_scroll_strip_us;   /* redrawing the exposed strips    */
+extern unsigned ag_scroll_window_us;  /* windowRefresh of the whole map  */
+extern unsigned ag_scroll_mouse_us;   /* hiding and showing the cursor   */
+
+extern unsigned ag_walk_tiles;
+
+extern unsigned ag_dat_open_us, ag_dat_open_n;
+extern unsigned ag_dat_read_us, ag_dat_read_n, ag_dat_read_kb;
+extern unsigned ag_dat_inflate_us, ag_dat_inflate_n;
+
 extern unsigned ag_sfx_loads;
 extern unsigned ag_sfx_ms;
 extern unsigned ag_sfx_kb;

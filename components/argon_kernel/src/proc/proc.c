@@ -751,8 +751,9 @@ static ag_err_t copy_args(proc_t *p, int argc, char **argv)
     size_t at = 0;
 
     p->argc = 0;
+    /* Refuse rather than truncate: a dropped argument is invisible. */
     if (argc > AG_PROC_ARGS_MAX) {
-        argc = AG_PROC_ARGS_MAX;
+        return -AG_ERANGE;
     }
 
     for (int i = 0; i < argc; i++) {

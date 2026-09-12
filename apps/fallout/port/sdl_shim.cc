@@ -23,6 +23,7 @@
 
 /* The cache miss counters, shared with the engine's cache.cc. */
 #include "ag_diag.h"
+#include "art_store.h"
 
 /* apps/common/libc's watcher; its header is not on this build's include
  * path, and the engine's stdlib.h is the toolchain's. */
@@ -93,7 +94,12 @@ unsigned ag_map_loading;
 
 /* Where the game is, for when it stops being anywhere.  See ag_diag.h. */
 const char* volatile ag_step = "before main";
-const char* volatile ag_step_audio = "not started";
+const char* volatile ag_step_audio = "not started";
+
+/* Audio thread timings; see audio_report. */
+static volatile uint32_t s_audio_mix_us, s_audio_write_us;
+static volatile uint32_t s_audio_mix_worst_us, s_audio_write_worst_us;
+static volatile uint32_t s_audio_blocks;
 unsigned volatile ag_audio_laps;
 void* volatile ag_ticker_now;
 int volatile ag_script_now = -1;
@@ -126,11 +132,34 @@ unsigned ag_cache_now_us(void)
  * a 280 ms lap with two misses and 270 ms of miss time is answered, and a
  * 280 ms lap with no misses at all is a different bug.
  */
+/* Longer than this and the lap was a screen, not a frame.  See ag_frame_note. */
+#define AG_MODAL_US (2u * 1000u * 1000u)
+
+static uint32_t s_modal_laps, s_modal_worst_us;
 static uint32_t s_worst_us, s_worst_input, s_worst_keys, s_worst_scripts;
 static uint32_t s_worst_maps, s_worst_present, s_worst_throttle;
 static uint32_t s_worst_miss_n, s_worst_miss_ms, s_worst_kb;
 static int s_worst_where = -1;
 static uint32_t s_seen_miss_n, s_seen_miss_ms, s_seen_kb;
+
+/*
+ * ARGON: long laps kept with their times, printed only when asked.
+ *
+ * A quarter of a second, once a second, is what Maxim describes - and that is
+ * a pattern in TIME, which every report here was averaging away.  Sixty-four
+ * of them is a minute's worth at his rate, and the ring costs 1.5 KB.
+ */
+#define AG_STALLS 64u
+#define AG_STALL_US 120000u   /* a lap this long is one he can see */
+
+typedef struct {
+    uint32_t at_ms;
+    uint32_t cost_us;
+    uint32_t input_us, keys_us, scripts_us, maps_us, present_us;
+} ag_stall_t;
+
+static ag_stall_t s_stalls[AG_STALLS];
+static unsigned s_stall_n;
 
 static void cache_totals(uint32_t *miss_n, uint32_t *miss_ms, uint32_t *kb)
 {
@@ -157,7 +186,55 @@ void ag_frame_note(unsigned input_us, unsigned keys_us, unsigned scripts_us,
     const uint32_t cost = (uint32_t)input_us + keys_us + scripts_us + maps_us
         + present_us;
 
-    if (cost > s_worst_us) {
+    /*
+     * ARGON: a lap that ran a modal screen is not a slow frame.
+     *
+     * Measured on the board, 9 September 2026, and it made the whole report
+     * useless: "125985 ms while walk: scripts 125876059" - a lap of two
+     * minutes, almost all of it in the scripts phase.  Nothing was slow.  In
+     * Fallout's main loop a conversation runs INSIDE scriptsHandleRequests and
+     * does not return until it ends, and the inventory does the same inside
+     * gameHandleKey: "82351 ms ... keys 82210105" was Maxim standing in his
+     * own inventory.  The worst lap of every window was whatever screen he had
+     * opened, and the dips he actually feels - half a second while walking -
+     * were never reported at all.
+     *
+     * So laps over the ceiling are counted and set aside rather than kept.
+     * Two seconds is far longer than any frame this game has ever taken here
+     * and far shorter than any screen a person opens, so the two do not
+     * overlap; the count is printed so that nothing is silently dropped.
+     */
+    if (cost > AG_MODAL_US) {
+        s_modal_laps++;
+        if (cost > s_modal_worst_us) {
+            s_modal_worst_us = cost;
+        }
+    } else if (cost >= AG_STALL_US) {
+        /*
+         * ARGON: every long lap, with the clock time it happened at.
+         *
+         * "Once a second a freeze of 0.2 to 0.5 s" is a description of a
+         * SCHEDULE, and no average can answer it - a report that prints the
+         * worst lap of a window says how bad, never how often or how evenly
+         * spaced.  This keeps the times themselves and prints nothing until
+         * asked, because printing is itself 11 ms a line down a 115200 line
+         * and measuring this way was changing what it measured.
+         */
+        ag_stall_t *e = &s_stalls[s_stall_n % AG_STALLS];
+
+        e->at_ms = (uint32_t)ag_millis();
+        e->cost_us = cost;
+        e->input_us = input_us;
+        e->present_us = present_us;
+        e->keys_us = keys_us;
+        e->scripts_us = scripts_us;
+        e->maps_us = maps_us;
+        s_stall_n++;
+    }
+
+    if (cost > AG_MODAL_US) {
+        /* counted above */
+    } else if (cost > s_worst_us) {
         s_worst_us = cost;
         s_worst_input = input_us;
         s_worst_keys = keys_us;
@@ -495,7 +572,10 @@ extern "C" void fallout_reserve_tick(void);
 
 static void shim_printf(const char *fmt, ...)
 {
-    char line[320];
+    /* Long enough for the longest report, which is the store's: 320 cut it
+     * off silently, and what fell off was the end - where the newest and
+     * usually most interesting numbers are. */
+    char line[640];
     va_list ap;
 
     va_start(ap, fmt);
@@ -670,7 +750,11 @@ static int s_mouse_y = -1;
 static Uint32 s_mouse_buttons;
 static uint32_t s_fps_next;
 static uint32_t s_frames;
-static uint64_t s_blit_us;
+static uint64_t s_blit_us;
+/* The worst single conversion and how many pixels it covered. */
+static uint32_t s_blit_worst_us, s_blit_worst_px;
+/* Rows that took long enough to mean the thread was descheduled. */
+static uint32_t s_preempt_n, s_preempt_us, s_preempt_worst_us;
 static uint64_t s_flush_us;
 static uint32_t s_flushes;
 static uint64_t s_flush_px;
@@ -732,6 +816,35 @@ void sdl_shim_cycle_ms(int ms)
     s_pal_blit_ms = (uint32_t)(ms > 0 ? ms : 0);
 }
 
+/*
+ * Which panel rows hold a colour that the cycle animates.
+ *
+ * The cycle only ever touches palette entries 229 to 255 - slime, shorelines,
+ * two speeds of fire, computer monitors and the red lamp on the interface bar.
+ * Everything else on the screen keeps the colour it had.  But a palette change
+ * invalidates the whole conversion table, so the engine answers it by blitting
+ * all 640x480 again, and on this machine that is the single most expensive
+ * thing that happens: measured at 34 ms when memory is quiet and 132 ms when
+ * it is not, once a second, which is exactly the stall Maxim describes.
+ *
+ * So the port remembers, row by row, whether that row contained any of those
+ * indices the last time it was converted - and a palette-only pass converts
+ * only those rows.  The flag is built during the ordinary conversion, which
+ * already reads every source pixel, so it costs one comparison per pixel and
+ * nothing else.  It cannot go stale: a row can only gain a cycled colour by
+ * being drawn into, and drawing goes through this same conversion.
+ *
+ * Everything starts set, so the first pass after a resolution change builds
+ * the map honestly rather than skipping work it has never looked at.
+ */
+#define AG_CYCLE_FIRST 229u
+#define AG_ROWS_MAX 512u
+
+static unsigned char s_row_cycled[AG_ROWS_MAX];
+static bool s_row_cycled_ready;
+static bool s_palette_only;      /* set around the cycle's own blit */
+static uint32_t s_cycle_rows_done, s_cycle_rows_skipped, s_cycle_passes;
+
 extern "C" int ag_palette_blit_wanted(void)
 {
     if (s_pal_blit_ms == 0u) {
@@ -745,6 +858,14 @@ extern "C" int ag_palette_blit_wanted(void)
     return 1;
 }
 
+/*
+ * The engine is about to blit the whole surface because the palette moved.
+ * Told so, the conversion below skips every row that has no cycled colour in
+ * it.  Set and cleared around that one call; everything else blits normally.
+ */
+extern "C" void ag_palette_only_begin(void) { s_palette_only = true; }
+extern "C" void ag_palette_only_end(void)   { s_palette_only = false; }
+
 /* What renderPresent spends outside the flush; see the note where they are
  * taken.  Printed per frame in the [pres] line. */
 static uint32_t s_pres_timers_us, s_pres_memstat_us, s_pres_fps_us;
@@ -756,6 +877,7 @@ uint32_t ag_us(void) { return (uint32_t)ag_micros(); }
 void    *ag_ticker_who[AG_TICKERS];
 uint32_t ag_ticker_us[AG_TICKERS];
 uint32_t ag_ticker_calls[AG_TICKERS];
+uint32_t ag_ticker_worst[AG_TICKERS];
 uint32_t ag_bk_tickers_us;
 uint32_t ag_bk_mouse_us;
 /*
@@ -947,9 +1069,12 @@ static void tickers_report(void)
         if (ag_ticker_us[i] / s_frames == 0u) {
             continue;
         }
-        shim_printf("[tick] %p %u us/frame (%u calls)\n", ag_ticker_who[i],
+        shim_printf("[tick] %p %u us/frame (%u calls), worst call %u us\n",
+                    ag_ticker_who[i],
                     (unsigned)(ag_ticker_us[i] / s_frames),
-                    (unsigned)ag_ticker_calls[i]);
+                    (unsigned)ag_ticker_calls[i],
+                    (unsigned)ag_ticker_worst[i]);
+        ag_ticker_worst[i] = 0;
     }
     /* One known address, so the pointers above can be turned into names:
      * subtract this from them and add what nm says fps_service is at. */
@@ -1187,6 +1312,309 @@ static const char* const ag_kind_name[AG_CACHE_KINDS] = { "art", "snd", "other" 
  * it is the card.  If neither does, the time is somewhere nothing measures
  * yet, and that is the next thing to instrument.
  */
+/* The working-set table; see ag_diag.h. */
+#define AG_WS_SLOTS 2048
+
+static int      s_ws_key[AG_WS_SLOTS];
+static unsigned s_ws_size[AG_WS_SLOTS];
+static unsigned s_ws_used, s_ws_bytes, s_ws_over;
+
+void ag_ws_note(int kind, int key, int size)
+{
+    unsigned h;
+    unsigned i;
+
+    if (kind != AG_CACHE_ART || size <= 0) {
+        return;
+    }
+
+    h = ((unsigned)key * 2654435761u) & (AG_WS_SLOTS - 1u);
+    for (i = 0; i < AG_WS_SLOTS; i++) {
+        const unsigned at = (h + i) & (AG_WS_SLOTS - 1u);
+        if (s_ws_size[at] == 0u) {
+            if (s_ws_used * 4u >= AG_WS_SLOTS * 3u) {
+                s_ws_over++;   /* three quarters full: stop, and say so */
+                return;
+            }
+            s_ws_key[at] = key;
+            s_ws_size[at] = (unsigned)size;
+            s_ws_used++;
+            s_ws_bytes += (unsigned)size;
+            return;
+        }
+        if (s_ws_key[at] == key) {
+            return;            /* already counted */
+        }
+    }
+    s_ws_over++;
+}
+
+static void ws_report(void)
+{
+    if (s_ws_used == 0u) {
+        return;
+    }
+    shim_printf("[ws t=%u] art asked for %u distinct files, %u KB in this "
+                "window%s\n",
+                (unsigned)ag_millis(), s_ws_used, s_ws_bytes / 1024u,
+                (s_ws_over != 0u) ? " (table full, the real figure is larger)"
+                                  : "");
+    memset(s_ws_size, 0, sizeof(s_ws_size));
+    s_ws_used = 0u;
+    s_ws_bytes = 0u;
+    s_ws_over = 0u;
+}
+
+unsigned ag_art_miss[AG_ART_KINDS];
+unsigned ag_art_from_flash[AG_ART_KINDS];
+unsigned ag_anim_refresh_n, ag_anim_refresh_px;
+unsigned ag_anim_worst_us, ag_anim_worst_refreshes;
+unsigned ag_anim_worst_px, ag_anim_worst_sads;
+unsigned ag_anim_seq_us, ag_anim_move_us, ag_anim_script_us;
+unsigned ag_anim_worst_seq_us, ag_anim_worst_move_us;
+unsigned ag_anim_worst_script_us;
+unsigned ag_path_us, ag_path_n;
+unsigned ag_layer_n;
+unsigned ag_render_calls, ag_render_steps, ag_render_inrange;
+unsigned ag_render_tiles, ag_render_objects, ag_render_draw_us;
+unsigned ag_render_objects2, ag_render_draw2_us;
+unsigned ag_draw_calls, ag_draw_hidden, ag_draw_missed, ag_draw_hit;
+unsigned ag_draw_early;
+unsigned ag_art_requests;
+unsigned ag_miss_ram, ag_miss_flash, ag_miss_card, ag_miss_card_kb;
+unsigned ag_draw_lock_us;
+unsigned ag_layer_clear_us, ag_layer_floor_us, ag_layer_pre_us;
+unsigned ag_layer_roof_us, ag_layer_post_us, ag_layer_window_us;
+unsigned ag_move_refresh_us, ag_move_refresh_n, ag_move_refresh_px;
+unsigned ag_scroll_steps;
+unsigned ag_scroll_move_us;
+unsigned ag_scroll_strip_us;
+unsigned ag_scroll_window_us;
+unsigned ag_scroll_mouse_us;
+unsigned ag_art_miss_ms[AG_ART_KINDS];
+unsigned ag_walk_tiles;
+unsigned ag_dat_open_us, ag_dat_open_n;
+unsigned ag_dat_read_us, ag_dat_read_n, ag_dat_read_kb;
+unsigned ag_dat_inflate_us, ag_dat_inflate_n;
+
+/*
+ * ARGON: what a cache miss is actually made of.
+ *
+ * The three shares add up to the whole of a miss, so the line answers the
+ * question directly: 21 KB in 10.8 ms is 1.9 MB/s, and this says whether that
+ * is the card or zlib.  Averages per call are printed beside the totals
+ * because the chunk sizes make the call counts large - the card is read 4096
+ * bytes at a time and zlib is fed 1024 at a time.
+ */
+/*
+ * Misses per hundred hexes walked - the figure that can be compared between
+ * two sessions, because it divides out how much walking there was.
+ */
+/* Which kind of art the misses are for; see ag_art_miss. */
+/* What the flash art store did, and how much of each miss it took over. */
+/* What a scroll step costs, split four ways.  Silent until the map moves. */
+static void scroll_report(void)
+{
+    if (ag_scroll_steps == 0u) {
+        return;
+    }
+
+    shim_printf("[scroll t=%u] %u steps | move %u us, strips %u us, "
+                "window %u us, cursor %u us (per step)\n",
+                (unsigned)ag_millis(), ag_scroll_steps,
+                ag_scroll_move_us / ag_scroll_steps,
+                ag_scroll_strip_us / ag_scroll_steps,
+                ag_scroll_window_us / ag_scroll_steps,
+                ag_scroll_mouse_us / ag_scroll_steps);
+    ag_scroll_steps = 0;
+    ag_scroll_move_us = 0;
+    ag_scroll_strip_us = 0;
+    ag_scroll_window_us = 0;
+    ag_scroll_mouse_us = 0;
+}
+
+static void art_flash_report(void)
+{
+    /* 300 was not enough once the store started saying what it had done, and
+     * the part that fell off the end was the map-load timing - the one number
+     * the line had been extended to carry. */
+    char line[560];
+    unsigned from_flash = 0;
+    int i;
+
+    for (i = 0; i < AG_ART_KINDS; i++) {
+        from_flash += ag_art_from_flash[i];
+    }
+
+    ag_art_store_report(line, sizeof(line));
+    shim_printf("%s | %u misses came from flash\n", line, from_flash);
+    ag_art_store_kinds(line, sizeof(line));
+    shim_printf("%s\n", line);
+}
+
+static void art_kind_report(void)
+{
+    static const char *const name[AG_ART_KINDS] = {
+        "item", "critter", "scenery", "wall", "tile", "misc",
+        "iface", "inven", "head", "backgrnd", "skilldex"
+    };
+    char line[300];
+    unsigned pos = 0;
+    int i;
+    unsigned total = 0;
+
+    for (i = 0; i < AG_ART_KINDS; i++) {
+        total += ag_art_miss[i];
+    }
+    if (total == 0u) {
+        return;
+    }
+
+    for (i = 0; i < AG_ART_KINDS; i++) {
+        if (ag_art_miss[i] == 0u) {
+            continue;
+        }
+        pos += (unsigned)snprintf(line + pos, sizeof(line) - pos,
+                                  "%s%s %u/%ums", (pos != 0u) ? " | " : "",
+                                  name[i], ag_art_miss[i],
+                                  ag_art_miss_ms[i]);
+        if (pos >= sizeof(line) - 24u) {
+            break;
+        }
+    }
+    shim_printf("[artkind t=%u] %s\n", (unsigned)ag_millis(), line);
+}
+
+static void walk_report(void)
+{
+    /*
+     * ARGON: the misses counted over the SAME window as the hexes.
+     *
+     * The first version divided the running total of misses by the hexes of
+     * the windows that qualified, and the two covered different things: a
+     * session that loaded a map and sat in a menu put all of that in the
+     * numerator while only walking reached the denominator.  Comparing two
+     * builds that way made eight pins look three times worse than four when
+     * the only real difference was that Maxim had walked sixty hexes in one
+     * run and a hundred and fifty in the other.  A rate is only a rate if both
+     * halves are measured over the same stretch.
+     */
+    static unsigned seen_tiles, seen_miss, seen_ms;
+    static unsigned seen_kind[AG_ART_KINDS], seen_kind_ms[AG_ART_KINDS];
+
+    const unsigned tiles = ag_walk_tiles - seen_tiles;
+    const unsigned miss = ag_cache_miss[AG_CACHE_ART * AG_WHERES + AG_WHERE_WALK]
+        - seen_miss;
+    const unsigned ms = ag_cache_miss_ms[AG_CACHE_ART * AG_WHERES + AG_WHERE_WALK]
+        - seen_ms;
+    unsigned crit, crit_ms, tile, tile_ms, all_ms = 0u;
+    int i;
+
+    crit = ag_art_miss[1] - seen_kind[1];              /* OBJ_TYPE_CRITTER */
+    crit_ms = ag_art_miss_ms[1] - seen_kind_ms[1];
+    tile = ag_art_miss[4] - seen_kind[4];              /* OBJ_TYPE_TILE */
+    tile_ms = ag_art_miss_ms[4] - seen_kind_ms[4];
+    for (i = 0; i < AG_ART_KINDS; i++) {
+        all_ms += ag_art_miss_ms[i] - seen_kind_ms[i];
+    }
+
+    seen_tiles += tiles;
+    seen_miss += miss;
+    seen_ms += ms;
+    for (i = 0; i < AG_ART_KINDS; i++) {
+        seen_kind[i] += ag_art_miss[i] - seen_kind[i];
+        seen_kind_ms[i] += ag_art_miss_ms[i] - seen_kind_ms[i];
+    }
+
+    if (tiles < 10u) {
+        return;   /* standing still says nothing about the cache */
+    }
+
+    shim_printf("[walk t=%u] %u hexes | all %u misses %u ms | critter %u/%ums "
+                "| tile %u/%ums | PER 100: %u misses, %u ms, crit %u, tile %u\n",
+                (unsigned)ag_millis(), tiles, miss, ms,
+                crit, crit_ms, tile, tile_ms,
+                miss * 100u / tiles, all_ms * 100u / tiles,
+                crit_ms * 100u / tiles, tile_ms * 100u / tiles);
+
+    /*
+     * And the same thing over the whole run.  A window is twenty seconds and
+     * can hold thirteen hexes or fifty; the per-window figures swing between
+     * 1465 and 8592 misses per hundred hexes on the same build, which is too
+     * noisy to compare two builds by.  The running total settles.
+     */
+    {
+        static unsigned run_hexes, run_miss, run_ms, run_crit_ms, run_tile_ms;
+
+        run_hexes += tiles;
+        run_miss += miss;
+        run_ms += all_ms;
+        run_crit_ms += crit_ms;
+        run_tile_ms += tile_ms;
+
+        shim_printf("[walkrun t=%u] %u hexes so far | PER 100: %u misses, "
+                    "%u ms, crit %u ms, tile %u ms\n",
+                    (unsigned)ag_millis(), run_hexes,
+                    run_miss * 100u / run_hexes, run_ms * 100u / run_hexes,
+                    run_crit_ms * 100u / run_hexes,
+                    run_tile_ms * 100u / run_hexes);
+    }
+}
+
+static void dat_report(void)
+{
+    if (ag_dat_read_n == 0u && ag_dat_open_n == 0u) {
+        return;
+    }
+    shim_printf("[dat t=%u] open %u in %u ms | card %u reads of %u KB in %u ms "
+                "(%u KB/s) | inflate %u in %u ms\n",
+                (unsigned)ag_millis(),
+                ag_dat_open_n, ag_dat_open_us / 1000u,
+                ag_dat_read_n, ag_dat_read_kb, ag_dat_read_us / 1000u,
+                (ag_dat_read_us >= 1000u)
+                    ? (unsigned)((unsigned long long)ag_dat_read_kb * 1000000ull
+                                 / ag_dat_read_us)
+                    : 0u,
+                ag_dat_inflate_n, ag_dat_inflate_us / 1000u);
+}
+
+/*
+ * The stall ring, printed as one burst.  Times first: if they are a second
+ * apart the cause is on a schedule and the schedule names it; if they are
+ * scattered, it is work that happens to be heavy and the breakdown says which
+ * step.  Either way nothing is printed between bursts.
+ */
+static void stall_report(void)
+{
+    if (s_stall_n == 0u) {
+        return;
+    }
+
+    const unsigned have = (s_stall_n < AG_STALLS) ? s_stall_n : AG_STALLS;
+    const unsigned first = (s_stall_n < AG_STALLS) ? 0u
+                                                   : (s_stall_n % AG_STALLS);
+    uint32_t prev = 0;
+
+    shim_printf("[stalls t=%u] %u laps over %u ms since the last burst\n",
+                (unsigned)ag_millis(), (unsigned)s_stall_n,
+                (unsigned)(AG_STALL_US / 1000u));
+
+    for (unsigned i = 0; i < have; i++) {
+        const ag_stall_t *e = &s_stalls[(first + i) % AG_STALLS];
+
+        shim_printf("[stall] t=%u +%u ms | %u ms = input %u, keys %u, "
+                    "scripts %u, maps %u, present %u (us)\n",
+                    (unsigned)e->at_ms,
+                    (unsigned)(prev ? e->at_ms - prev : 0u),
+                    (unsigned)(e->cost_us / 1000u),
+                    (unsigned)e->input_us, (unsigned)e->keys_us,
+                    (unsigned)e->scripts_us, (unsigned)e->maps_us,
+                    (unsigned)e->present_us);
+        prev = e->at_ms;
+    }
+    s_stall_n = 0;
+}
+
 static void worst_report(void)
 {
     if (s_worst_us == 0u) {
@@ -1203,6 +1631,14 @@ static void worst_report(void)
               (unsigned)s_worst_present, (unsigned)s_worst_throttle,
               (unsigned)s_worst_miss_n, (unsigned)s_worst_miss_ms,
               (unsigned)s_worst_kb);
+    if (s_modal_laps != 0u) {
+        shim_printf("[worst] and %u lap(s) over %u s set aside as screens, "
+                    "worst %u ms\n",
+                    (unsigned)s_modal_laps, (unsigned)(AG_MODAL_US / 1000000u),
+                    (unsigned)(s_modal_worst_us / 1000u));
+        s_modal_laps = 0u;
+        s_modal_worst_us = 0u;
+    }
     s_worst_us = 0u;
     s_worst_where = -1;
 }
@@ -1254,6 +1690,212 @@ static void top_report(void)
  * And the sound, which is not in the cache report because it is not a cache
  * miss: every play decodes the file again whether the cache had it or not.
  */
+/* What the audio thread costs, and the worst single block.  See the note in
+ * the thread loop: this exists to tell a slow ticker from a shared wait. */
+/* The worst conversion of the window, with its area - see the note at the
+ * timing site. */
+/* How much of the colour-cycle repaint the row map saved. */
+/* Every read from the card, and the worst single one - see posix_io.cc. */
+extern "C" unsigned ag_io_read_n, ag_io_read_us, ag_io_read_kb;
+extern "C" unsigned ag_io_read_worst_us, ag_io_read_worst_len;
+
+/*
+ * The slow-script trap.  Quiet by design: a tile script that behaves costs
+ * tens of microseconds, and there are thousands of them in a game.  Only one
+ * that takes longer than a frame is worth a line, and then it should say
+ * where it was so the script can be found.
+ */
+#define AG_SLOW_SCRIPT_US 20000u
+
+extern "C" void ag_script_slow_note(unsigned us, int tile, int elevation)
+{
+    static unsigned said;
+
+    if (us < AG_SLOW_SCRIPT_US || said >= 32u) {
+        return;
+    }
+    said++;
+    shim_printf("[slowscript t=%u] a tile script took %u ms at tile %d, "
+                "elevation %d\n",
+                (unsigned)ag_millis(), us / 1000u, tile, elevation);
+}
+
+static void miss_report(void)
+{
+    if (ag_miss_ram == 0u) {
+        return;
+    }
+    shim_printf("[miss t=%u] %u art asked for | %u from RAM, "
+                "%u from flash, %u from the card (%u KB)\n",
+                (unsigned)ag_millis(), ag_art_requests,
+                (ag_art_requests > ag_miss_ram)
+                    ? ag_art_requests - ag_miss_ram : 0u,
+                ag_miss_flash, ag_miss_card, ag_miss_card_kb);
+    ag_art_requests = 0;
+    ag_miss_ram = 0; ag_miss_flash = 0;
+    ag_miss_card = 0; ag_miss_card_kb = 0;
+}
+
+static void draw_report(void)
+{
+    if (ag_draw_calls == 0u) {
+        return;
+    }
+    shim_printf("[draw t=%u] %u calls | %u hidden, %u refused early, "
+                "%u missed the rect, "
+                "%u drew | locking the art cost %u ms\n",
+                (unsigned)ag_millis(), ag_draw_calls, ag_draw_hidden,
+                ag_draw_early, ag_draw_missed, ag_draw_hit,
+                ag_draw_lock_us / 1000u);
+    ag_draw_calls = 0; ag_draw_hidden = 0; ag_draw_missed = 0;
+    ag_draw_hit = 0; ag_draw_lock_us = 0;
+    ag_draw_early = 0;
+}
+
+static void render_report(void)
+{
+    if (ag_render_calls == 0u) {
+        return;
+    }
+    shim_printf("[render t=%u] %u passes | %u steps, %u in range, "
+                "%u tiles with objects | flat %u in %u ms, "
+                "upright %u in %u ms\n",
+                (unsigned)ag_millis(), ag_render_calls, ag_render_steps,
+                ag_render_inrange, ag_render_tiles, ag_render_objects,
+                ag_render_draw_us / 1000u, ag_render_objects2,
+                ag_render_draw2_us / 1000u);
+    ag_render_calls = 0; ag_render_steps = 0; ag_render_inrange = 0;
+    ag_render_tiles = 0; ag_render_objects = 0; ag_render_draw_us = 0;
+    ag_render_objects2 = 0; ag_render_draw2_us = 0;
+}
+
+static void layer_report(void)
+{
+    if (ag_layer_n == 0u) {
+        return;
+    }
+    shim_printf("[layers t=%u] %u refreshes | clear %u, floor %u, "
+                "under-roof %u, roof %u, over-roof %u, window %u (ms)\n",
+                (unsigned)ag_millis(), ag_layer_n,
+                ag_layer_clear_us / 1000u, ag_layer_floor_us / 1000u,
+                ag_layer_pre_us / 1000u, ag_layer_roof_us / 1000u,
+                ag_layer_post_us / 1000u, ag_layer_window_us / 1000u);
+    ag_layer_n = 0;
+    ag_layer_clear_us = 0; ag_layer_floor_us = 0; ag_layer_pre_us = 0;
+    ag_layer_roof_us = 0; ag_layer_post_us = 0; ag_layer_window_us = 0;
+}
+
+static void move_report(void)
+{
+    if (ag_path_n == 0u && ag_move_refresh_n == 0u) {
+        return;
+    }
+    shim_printf("[move t=%u] %u path searches costing %u ms | "
+                "%u refreshes over %u px costing %u ms\n",
+                (unsigned)ag_millis(), ag_path_n, ag_path_us / 1000u,
+                ag_move_refresh_n, ag_move_refresh_px,
+                ag_move_refresh_us / 1000u);
+    ag_path_n = 0; ag_path_us = 0;
+    ag_move_refresh_n = 0; ag_move_refresh_us = 0; ag_move_refresh_px = 0;
+}
+
+static void anim_report(void)
+{
+    if (ag_anim_worst_us == 0u) {
+        return;
+    }
+    shim_printf("[anim t=%u] worst tick %u us | %u refreshes over %u px, "
+                "%u animations live | sequence %u us, move %u us, "
+                "spatial script %u us\n",
+                (unsigned)ag_millis(), ag_anim_worst_us,
+                ag_anim_worst_refreshes, ag_anim_worst_px,
+                ag_anim_worst_sads, ag_anim_worst_seq_us,
+                ag_anim_worst_move_us, ag_anim_worst_script_us);
+    ag_anim_worst_us = 0;
+}
+
+static void preempt_report(void)
+{
+    if (s_preempt_n == 0u) {
+        return;
+    }
+    shim_printf("[preempt t=%u] %u rows lost %u ms in total, worst %u us "
+                "(a row is 60 us of work)\n",
+                (unsigned)ag_millis(), (unsigned)s_preempt_n,
+                (unsigned)(s_preempt_us / 1000u),
+                (unsigned)s_preempt_worst_us);
+    s_preempt_n = 0;
+    s_preempt_us = 0;
+    s_preempt_worst_us = 0;
+}
+
+static void io_report(void)
+{
+    if (ag_io_read_n == 0u) {
+        return;
+    }
+    shim_printf("[io t=%u] %u reads, %u KB, %u ms total | worst single read "
+                "%u us for %u bytes\n",
+                (unsigned)ag_millis(), ag_io_read_n, ag_io_read_kb,
+                ag_io_read_us / 1000u, ag_io_read_worst_us,
+                ag_io_read_worst_len);
+    ag_io_read_n = 0;
+    ag_io_read_us = 0;
+    ag_io_read_kb = 0;
+    ag_io_read_worst_us = 0;
+    ag_io_read_worst_len = 0;
+}
+
+static void cycle_report(void)
+{
+    if (s_cycle_rows_done == 0u && s_cycle_rows_skipped == 0u) {
+        return;
+    }
+    const uint32_t total = s_cycle_rows_done + s_cycle_rows_skipped;
+
+    shim_printf("[cycle t=%u] palette passes: %u rows converted, %u skipped "
+                "(%u%% saved)\n",
+                (unsigned)ag_millis(), (unsigned)s_cycle_rows_done,
+                (unsigned)s_cycle_rows_skipped,
+                total ? (unsigned)(s_cycle_rows_skipped * 100u / total) : 0u);
+    s_cycle_rows_done = 0;
+    s_cycle_rows_skipped = 0;
+}
+
+static void blit_report(void)
+{
+    if (s_blit_worst_us == 0u) {
+        return;
+    }
+    shim_printf("[blit t=%u] worst conversion %u us over %u px "
+                "(%u ns per px)\n",
+                (unsigned)ag_millis(), (unsigned)s_blit_worst_us,
+                (unsigned)s_blit_worst_px,
+                s_blit_worst_px ? (unsigned)((uint64_t)s_blit_worst_us * 1000u
+                                             / s_blit_worst_px) : 0u);
+    s_blit_worst_us = 0;
+    s_blit_worst_px = 0;
+}
+
+static void audio_report(void)
+{
+    if (s_audio_blocks == 0u) {
+        return;
+    }
+    shim_printf("[audio t=%u] %u blocks | mix %u us avg, worst %u us | "
+                "write %u us avg, worst %u us\n",
+                (unsigned)ag_millis(), (unsigned)s_audio_blocks,
+                (unsigned)(s_audio_mix_us / s_audio_blocks),
+                (unsigned)s_audio_mix_worst_us,
+                (unsigned)(s_audio_write_us / s_audio_blocks),
+                (unsigned)s_audio_write_worst_us);
+    s_audio_blocks = 0;
+    s_audio_mix_us = 0;
+    s_audio_write_us = 0;
+    s_audio_mix_worst_us = 0;
+    s_audio_write_worst_us = 0;
+}
+
 static void sfx_report(void)
 {
     if (ag_sfx_loads == 0u) {
@@ -1397,9 +2039,27 @@ static void memstat_service(void)
               (unsigned)(mi.arena_largest / 1024u));
     ag_libc_malloc_profile_dump(s_trace_prof);
     /* The worst lap first: it is the one that says whether to read the rest. */
+    stall_report();
     worst_report();
+    dat_report();
+    ws_report();
+    walk_report();
+    art_kind_report();
+    art_flash_report();
+    scroll_report();
     cache_report();
-    sfx_report();
+    sfx_report();
+    audio_report();
+    blit_report();
+    cycle_report();
+    io_report();
+    preempt_report();
+    anim_report();
+    move_report();
+    layer_report();
+    render_report();
+    draw_report();
+    miss_report();
     top_report();
     /*
      * ARGON: and what the hands did, on this schedule rather than only with
@@ -1875,6 +2535,8 @@ int SDL_UpperBlit(SDL_Surface *src, const SDL_Rect *srcrect, SDL_Surface *dst,
          *   sxx >= 0        =>  x >= ceil(-base / step)
          *   sxx <= src->w-1 =>  x <  ceil((src->w - base) / step)
          */
+        /* Whether this pass covers a whole panel row; see the flag below. */
+        const bool full_width = (ddx == 0 && ddw >= (int)s_gfx.width);
         const int base = sx + ((ddx << shift) - dx);
         int       x0 = (base < 0) ? (((-base) + step - 1) >> shift) : 0;
         int       x1 = ddw;
@@ -1890,13 +2552,69 @@ int SDL_UpperBlit(SDL_Surface *src, const SDL_Rect *srcrect, SDL_Surface *dst,
             if (syy < 0 || syy >= src->h) {
                 continue;
             }
+            const unsigned row = (unsigned)(ddy + y);
+
+            /* ARGON: a palette-only pass has nothing to do in a row that
+             * holds no animated colour.  See the note by s_row_cycled. */
+            if (s_palette_only && row < AG_ROWS_MAX && s_row_cycled_ready
+                    && s_row_cycled[row] == 0u) {
+                s_cycle_rows_skipped++;
+                continue;
+            }
+            if (s_palette_only) {
+                s_cycle_rows_done++;
+            }
+
             const Uint8 *sp = (const Uint8 *)src->pixels +
                               (size_t)syy * src->pitch + base + (x0 << shift);
             Uint16 *dp = (Uint16 *)((Uint8 *)dst->pixels +
                                     (size_t)(ddy + y) * dst->pitch) + ddx;
             int rx0 = ddw, rx1 = -1;
+            unsigned cycled = 0;
+
+            /*
+             * ARGON: how long one row took.
+             *
+             * A row is a few hundred pixels - sixty microseconds of work.  A
+             * row that takes twenty milliseconds did not do more work; the
+             * thread was taken off the processor in the middle of it.  That
+             * is the difference between "this code is slow" and "something
+             * else is running", and nothing else here can tell them apart.
+             * Counting them also gives a rate, which can be held against the
+             * rate of every other periodic thing on the board.
+             */
+            const uint32_t row_t0 = (uint32_t)ag_micros();
             for (int x = x0; x < x1; ++x, sp += step) {
-                CHANGED(dp, x, lut[*sp]);
+                const Uint8 idx = *sp;
+
+                cycled |= (unsigned)(idx >= AG_CYCLE_FIRST);
+                CHANGED(dp, x, lut[idx]);
+            }
+            /*
+             * A pass that did not cover the whole width saw only part of the
+             * row, so it may only ADD the flag - clearing it on the strength
+             * of a fragment would leave the water in the rest of the row
+             * frozen, which is a wrong picture rather than a slow one.  Only
+             * a full-width pass knows enough to clear.
+             */
+            {
+                const uint32_t row_us = (uint32_t)ag_micros() - row_t0;
+
+                if (row_us >= 3000u) {
+                    s_preempt_n++;
+                    s_preempt_us += row_us;
+                    if (row_us > s_preempt_worst_us) {
+                        s_preempt_worst_us = row_us;
+                    }
+                }
+            }
+
+            if (row < AG_ROWS_MAX && !s_palette_only) {
+                if (full_width) {
+                    s_row_cycled[row] = (unsigned char)cycled;
+                } else if (cycled != 0u) {
+                    s_row_cycled[row] = 1u;
+                }
             }
             ROW_DONE(y);
         }
@@ -1944,12 +2662,34 @@ int SDL_UpperBlit(SDL_Surface *src, const SDL_Rect *srcrect, SDL_Surface *dst,
 #undef CHANGED
 #undef ROW_DONE
 
+    /* Once a pass has covered the whole panel, the map is complete and may
+     * be trusted to skip rows. */
+    if (!s_palette_only && ddx == 0 && ddy == 0
+            && ddw >= (int)s_gfx.width && ddh >= (int)s_gfx.height) {
+        s_row_cycled_ready = true;
+    }
+
     {
         const uint32_t took = (uint32_t)(ag_micros() - blit_t0);
         s_blit_frame_us += took;
         if (s_fps_ms != 0u) {
             s_blit_us += (uint64_t)took;
             s_blit_px += (uint64_t)ddw * (uint64_t)ddh;
+        }
+        /*
+         * ARGON: the worst single conversion, with the area it covered.
+         *
+         * The average says 10 ms for a whole screen and the worst frame says
+         * 144, and the two cannot both be about the same work.  Either the
+         * slow one covered far more pixels - in which case the area says so -
+         * or it covered the same pixels far more slowly, which would mean it
+         * was waiting for memory rather than doing arithmetic.  Without the
+         * area the number cannot tell those apart, and that is exactly the
+         * question.
+         */
+        if (took > s_blit_worst_us) {
+            s_blit_worst_us = took;
+            s_blit_worst_px = (uint32_t)ddw * (uint32_t)ddh;
         }
     }
 
@@ -2049,7 +2789,32 @@ static void panel_repaint(void)
 
 Uint32 SDL_GetTicks(void) { return (Uint32)ag_millis(); }
 
-void SDL_Delay(Uint32 ms) { ag_delay(ms); }
+/*
+ * ARGON: and a delay that cannot be asked to sleep for ever.
+ *
+ * The frame limiter's unsigned underflow (see fps_limiter.cc) asked for
+ * 4294967295 ms and got it - the game thread simply stopped, seven minutes
+ * into a session, with everything else still running.  That bug is fixed at
+ * the source, but a sleep of more than a few seconds is not a thing this game
+ * ever legitimately wants, and a program that has stopped for ever is the one
+ * failure the player cannot tell from a crash.  So it is capped, and it says
+ * so once.
+ */
+void SDL_Delay(Uint32 ms)
+{
+    if (ms > 5000u) {
+        static int said;
+
+        if (!said) {
+            said = 1;
+            ag_printf("SDL: a delay of %u ms was asked for; sleeping 5000 "
+                      "instead\n", (unsigned)ms);
+        }
+        ms = 5000u;
+    }
+
+    ag_delay(ms);
+}
 
 /* ---- string helpers the engine borrows ----------------------------------- */
 
@@ -2491,6 +3256,7 @@ typedef struct {
     uint32_t worst_blit_us;
     uint32_t worst_wire_us;
     uint32_t slow;
+    uint64_t slow_us;   /* and the time they took; see hud_frame */
     uint64_t sum_us;
     uint64_t blit_us;
     uint64_t wire_us;
@@ -2601,6 +3367,7 @@ static void events_frame(uint32_t frame_us, uint32_t blit_us, uint32_t wire_us,
 static unsigned s_hud_fps100;   /* mean frames per second, hundredths */
 static unsigned s_hud_min100;   /* the worst frame as a rate, hundredths */
 static unsigned s_hud_slow_pct;
+static unsigned s_hud_slow_frames;
 static unsigned s_hud_eng_ms, s_hud_blit_ms, s_hud_wire_ms, s_hud_wire_kbs;
 static unsigned s_hud_worst_ms, s_hud_worst_eng_ms, s_hud_worst_wire_ms;
 static uint32_t s_io_misses_last;
@@ -2629,6 +3396,16 @@ static void hud_frame(uint32_t frame_us, uint32_t blit_us, uint32_t wire_us,
     }
     if (frame_us >= HUD_SLOW_US) {
         b->slow++;
+        /*
+         * ARGON: and how long they lasted, which is the number that means
+         * something.  Counted as a share of FRAMES, one 200 ms frame among
+         * fifty good ones reads as 2% - and it is a fifth of the second the
+         * person was looking at.  Maxim asked for it by time on 11 September
+         * 2026 and he was right: "lo" is meant to say how much of the time
+         * the game was not answering, not how many entries in a list were
+         * bad.
+         */
+        b->slow_us += frame_us;
     }
 }
 
@@ -2658,10 +3435,12 @@ static void hud_tick(void)
 
     /* Everything the five buckets hold, before the oldest is thrown away. */
     uint32_t frames = 0, slow = 0, worst = 0, worst_blit = 0, worst_wire = 0;
+    uint64_t slow_us = 0;
     uint64_t sum = 0, blit = 0, wire = 0, px = 0;
     for (unsigned i = 0; i < HUD_BUCKETS; ++i) {
         frames += s_hb[i].frames;
         slow += s_hb[i].slow;
+        slow_us += s_hb[i].slow_us;
         sum += s_hb[i].sum_us;
         blit += s_hb[i].blit_us;
         wire += s_hb[i].wire_us;
@@ -2676,7 +3455,8 @@ static void hud_tick(void)
     if (frames > 0u && sum > 0u) {
         uint64_t fps100 = (uint64_t)frames * 100000000ull / sum;
         s_hud_fps100 = (unsigned)((fps100 > 99999ull) ? 99999ull : fps100);
-        s_hud_slow_pct = (unsigned)(slow * 100u / frames);
+        s_hud_slow_pct = (unsigned)(slow_us * 100ull / sum);
+        s_hud_slow_frames = slow;
         const uint64_t frame_us = sum / frames;
         const uint64_t blit_us = blit / frames;
         const uint64_t wire_us = wire / frames;
@@ -2798,12 +3578,14 @@ static void hud_tick(void)
      * nobody is watching still has to be readable afterwards, and the two
      * numbers must be the same numbers or there is nothing to compare.
      */
-    shim_printf("[hud t=%u] fps %u.%02u min %u.%02u lo %u%%  "
+    shim_printf("[hud t=%u] fps %u.%02u min %u.%02u lo %u%% of the time "
+                "(%u frames)  "
                 "eng %u blit %u wire %u ms  wire %u KB/s  "
                 "worst %u ms (eng %u, wire %u)  "
                 "arena %u used, hole %u\n",
                 (unsigned)now, s_hud_fps100 / 100u, s_hud_fps100 % 100u,
                 s_hud_min100 / 100u, s_hud_min100 % 100u, s_hud_slow_pct,
+                s_hud_slow_frames,
                 s_hud_eng_ms, s_hud_blit_ms, s_hud_wire_ms, s_hud_wire_kbs,
                 s_hud_worst_ms, s_hud_worst_eng_ms, s_hud_worst_wire_ms,
                 s_hud_used_kb, s_hud_hole_kb);
@@ -2812,6 +3594,7 @@ static void hud_tick(void)
     s_hb[s_hb_at].frames = 0;
     s_hb[s_hb_at].worst_us = 0;
     s_hb[s_hb_at].slow = 0;
+    s_hb[s_hb_at].slow_us = 0;
     s_hb[s_hb_at].sum_us = 0;
     s_hb[s_hb_at].blit_us = 0;
     s_hb[s_hb_at].wire_us = 0;
@@ -3556,6 +4339,30 @@ static void pump(void)
                 continue;
             }
 
+            /*
+             * ARGON: F9 shows and hides the frame counter.
+             *
+             * Asked for on 9 September 2026, and the reason is worth keeping:
+             * without it there is no way from the chair to tell a frozen game
+             * from a dead mouse.  This setup has no sound and the menu is a
+             * still picture, so a stopped game looks exactly like a running
+             * one.  The counter answers that in a glance - and being able to
+             * turn it off means it can stay out of the way while playing.
+             *
+             * The key is consumed here and never reaches the engine, next to
+             * F8 which the port already owns.
+             */
+            if (sc == SDL_SCANCODE_F9 && e.type == AG_EV_KEY_DOWN) {
+                s_hud = !s_hud;
+                if (!s_hud) {
+                    /* Paint the last frame over the numbers, or they sit on
+                     * the glass until something else happens to redraw. */
+                    panel_repaint();
+                }
+                ag_printf("hud: %s\n", s_hud ? "on" : "off");
+                continue;
+            }
+
             /* The port's own keys, on a panel smaller than the picture. */
             if (s_panel_shift != 0 && e.type == AG_EV_KEY_DOWN) {
                 if (sc == SDL_SCANCODE_F8) {
@@ -3881,12 +4688,33 @@ static void audio_thread(void *arg)
             ag_delay(2);
             continue;
         }
+        /*
+         * ARGON: how long each half takes, worst case.
+         *
+         * Four unrelated tickers in the game's thread all peak at the same
+         * 150-240 ms, which is not four slow functions - it is one thing they
+         * all wait for.  The mixer runs here and takes locks the game thread
+         * takes too, so if it is the thing, this is where it shows.
+         */
         ag_step_audio = "calling the mixer";
+        const uint32_t au0 = ag_us();
         s_spec.callback(s_spec.userdata, (Uint8 *)s_audio_block,
                         (int)sizeof(s_audio_block));
+        const uint32_t au1 = ag_us();
         ag_step_audio = "writing to the device";
         ag_audio_write(s_audio_block, AUDIO_FRAMES);
+        const uint32_t au2 = ag_us();
         ag_step_audio = "between blocks";
+
+        if (au1 - au0 > s_audio_mix_worst_us) {
+            s_audio_mix_worst_us = au1 - au0;
+        }
+        if (au2 - au1 > s_audio_write_worst_us) {
+            s_audio_write_worst_us = au2 - au1;
+        }
+        s_audio_mix_us += au1 - au0;
+        s_audio_write_us += au2 - au1;
+        s_audio_blocks++;
     }
     ag_thread_exit();
 }

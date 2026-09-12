@@ -136,7 +136,13 @@ RODATA_ARGS: list = []
 # What the arena has to hold, measured on the largest map in the game: about
 # 5200 KB before a map loads, and BROKEN2.MAP's seven thousand objects arrive as
 # 1136 KB in one step.  docs/plans/fallout-memory.md has the whole accounting.
-ARENA_KB = 6340
+# 11 September 2026: back down from 6340 to 6000.  The art now lives in flash
+# and the cache in RAM needs about a thousand kilobytes rather than three, so
+# the arena does not need the extra - and the extra was costing more than it
+# gave: a sixteen-kilobyte table added to bss stopped the application loading
+# at all, with no message of any kind.  Three hundred and forty kilobytes of
+# headroom is worth more than three hundred and forty of arena nobody uses.
+ARENA_KB = 6000
 
 # What the arena becomes on the larger part.  8040 KB of extended memory free on
 # an 8 MB module; a 16 MB one reports 16232, and the image's data is the same
@@ -372,6 +378,7 @@ def port_sources() -> list[str]:
         os.path.join(PORT, "platform.cc"),
         os.path.join(PORT, "posix_io.cc"),
         os.path.join(PORT, "dat_index.cc"),
+        os.path.join(PORT, "art_store.cc"),
         os.path.join(FPATTERN, "src", "fpattern.c"),
         os.path.join(ROOT, "apps", "common", "cxx", "cxx_rt.cpp"),
         os.path.join(ROOT, "apps", "common", "cxx", "cxx_throw.cpp"),

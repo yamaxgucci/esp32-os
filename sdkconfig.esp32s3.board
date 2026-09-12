@@ -141,3 +141,13 @@ CONFIG_USB_HOST_EXT_PORT_CUSTOM_POWER_ON_DELAY_MS=500
 # changed nothing measurable, and it costs more internal memory than this board
 # can spare: the UART driver then wants its rings in internal RAM, three
 # installs fail, and the game faults.  Written down so it is not tried twice.
+
+# The chip is an N16R8: 16 MB of flash, of which the shared 8 MB baseline table
+# addressed only half.  The upper 8 MB becomes artfs, a raw partition holding
+# decompressed game art (see partitions_16mb.csv).  Every offset below
+# 0x800000 is unchanged, so switching tables erases nothing.
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=n
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_16mb.csv"

@@ -150,13 +150,41 @@ int _close(int fd)
     return ag_close(handle_of(fd)) == AG_OK ? 0 : -1;
 }
 
+extern "C" uint32_t ag_us(void);
+/*
+ * ARGON: every read from the card passes here, and the worst one is the
+ * question.
+ *
+ * The game still reads while it is being played - music streams in blocks,
+ * and a block arrives about once a second, which is the same rhythm as the
+ * stall Maxim describes.  A card that is busy with its own housekeeping can
+ * take a hundred milliseconds to answer a read that usually costs two, and
+ * the thread that asked simply stops until it does.  The average says
+ * nothing about that; the worst single read says everything.
+ */
+unsigned ag_io_read_n, ag_io_read_us, ag_io_read_kb;
+unsigned ag_io_read_worst_us, ag_io_read_worst_len;
+
 int _read(int fd, void *buf, size_t len)
 {
     if (fd < FD_BIAS) {
         errno = EBADF;
         return -1;
     }
+
+    const uint32_t t0 = ag_us();
     int32_t n = ag_read(handle_of(fd), buf, len);
+    const uint32_t took = ag_us() - t0;
+
+    ag_io_read_n++;
+    ag_io_read_us += took;
+    if (n > 0) {
+        ag_io_read_kb += (unsigned)n >> 10;
+    }
+    if (took > ag_io_read_worst_us) {
+        ag_io_read_worst_us = took;
+        ag_io_read_worst_len = (unsigned)len;
+    }
     return n < 0 ? -1 : (int)n;
 }
 
