@@ -46,9 +46,40 @@ bool ag_linkprov_up(void);
 
 int32_t ag_linkprov_send(uint8_t chan, uint8_t cls, const void *buf,
                          size_t len);
-int32_t ag_linkprov_recv(uint8_t *chan, void *buf, size_t max,
-                         uint32_t timeout_ms);
 void    ag_linkprov_poll(uint32_t ms);
+
+/* ------------------------------------------------------------------------ */
+/* Receiving: one reader, and handlers per channel                           */
+/* ------------------------------------------------------------------------ */
+/*
+ * THERE IS NO recv().  There was, and it was a mistake with a history: the link
+ * hands back whatever arrived next, so two callers reading it steal from each
+ * other.  The moment a second consumer appeared - a server for remote runs
+ * beside the shell's own ping - six messages in twenty-four went to the wrong
+ * one, and the shell reported them lost.  This tree has now made that mistake
+ * on a UART twice and on a link once.
+ *
+ * So exactly one task reads, here, and hands each message to the handler for
+ * its channel.  A channel is one conversation; a consumer takes one and hears
+ * nothing else.
+ *
+ * A HANDLER RUNS ON THE READER TASK, which has two consequences worth knowing
+ * rather than discovering.  It must not block for long: while it is inside,
+ * nothing else on this link is read.  And it must not call ag_linkprov_listen.
+ * Sending IS allowed and is the normal thing to do - that is how an answer is
+ * given.
+ */
+typedef void (*ag_link_rx_fn)(uint8_t chan, const void *buf, uint16_t len,
+                              void *ctx);
+
+ag_err_t ag_linkprov_listen(uint8_t chan, ag_link_rx_fn fn, void *ctx);
+
+/* Stop listening on a channel.  Safe on one nobody holds. */
+void ag_linkprov_unlisten(uint8_t chan);
+
+/* Is the reader task up.  It starts with the first bind and stops with the
+ * last unbind. */
+bool ag_linkprov_reading(void);
 
 ag_err_t ag_linkprov_stats(ag_link_stats_t *out);
 

@@ -120,15 +120,19 @@ function Invoke-Pair {
     param(
         [string]$Tag,
         [string[]]$PutBoth,
+        # Files only the FAR node gets.  Used to prove where a program ran: if
+        # node A never had the image, output that appears on A crossed the wire.
+        [string[]]$PutB = @(),
         [string[]]$SendB,
         [string[]]$SendA
     )
+    $putForB = @($PutBoth) + @($PutB)
     $runner = "build\nodetest-$Tag-b.ps1"
     $lines = @("Set-Location '$root'", "& '$(Join-Path $PSScriptRoot 'qemu-boot.ps1')' ``")
     $lines += "    -Port 5566 -NetPort 5578 -TimeoutSec $TimeoutSec ``"
     $lines += "    -LinkPort $linkPort -LinkListen -Flash '$flashB' ``"
     $lines += "    -KeepOtherEmulators -Tag 'b-$Tag' -LogPath 'build\nodetest-$Tag-b.log' ``"
-    $lines += "    -Put @($(($PutBoth | ForEach-Object { "'$_'" }) -join ',')) ``"
+    $lines += "    -Put @($(($putForB | ForEach-Object { "'$_'" }) -join ',')) ``"
     $lines += "    -Send @($(($SendB | ForEach-Object { "'$_'" }) -join ','))"
     $lines += 'exit $LASTEXITCODE'
     Set-Content -Path $runner -Value $lines -Encoding ascii
@@ -178,7 +182,7 @@ function Invoke-Pair {
 # ------------------------------------------------------------------ build ---
 
 $only = @('LINK.AXE')
-if ($Scenario -ne 'raw') { $only += 'NODELINK.SYS' }
+if ($Scenario -ne 'raw') { $only += 'NODELINK.SYS'; $only += 'HELLO.AXE' }
 & python (Join-Path $PSScriptRoot 'build_apps.py') --only @only | Out-Null
 foreach ($img in $only) {
     if (-not (Test-Path "build\apps\$img")) { throw "$img did not build." }
@@ -321,6 +325,70 @@ if ($Scenario -eq 'link' -or $Scenario -eq 'both') {
     # which is the difference between a link and a node: without it nothing
     # reads the wire unless somebody is inside a `link` command.
     Check $a 'listening' 'link-service-task-started'
+}
+
+# ------------------------------------------- a program run on the other node ---
+#
+# The thing a cluster is FOR, at its smallest: a command typed on node A loads
+# and runs on node B, B's output appears on A's console, and B's exit code comes
+# back as the command's own.
+#
+# HELLO.AXE goes to B only.  That is the point rather than an economy: A never
+# has the file, so output that appears on A cannot have come from A.
+
+if ($Scenario -eq 'link' -or $Scenario -eq 'both') {
+    Write-Host "`n== a program run on the other node ==" -ForegroundColor Cyan
+
+    Invoke-Pair -Tag 'run' `
+        -PutBoth @('build\apps\NODELINK.SYS=t:\nodelink.sys') `
+        -PutB @('build\apps\HELLO.AXE=t:\hello.axe') `
+        -SendB @('drv load t:\nodelink.sys',
+                 'link use node0',
+                 # B has to still BE there when A asks.  qemu-boot kills the
+                 # emulator once its command list is done, so a node that just
+                 # binds and waits is a node that is gone a second later - which
+                 # from A looks exactly like a far end that never answers.
+                 # `link poll` holds the shell without doing anything; the
+                 # serving happens on the link's own reader task regardless.
+                 "link poll $(($SendDelaySec + 30) * 1000)",
+                 '=link on node0') `
+        -SendA @('drv load t:\nodelink.sys',
+                 'link use node0',
+                 # Proof, before the fact, that this node has no such file.
+                 'dir t:\',
+                 "!powershell -NoProfile -Command Start-Sleep -Seconds $SendDelaySec",
+                 'link run t:\hello.axe one two',
+                 '=from the other node')
+
+    $a = Transcript 'build\nodetest-run-a.log'
+    $b = Transcript 'build\nodetest-run-b.log'
+
+    Check $b 'serving remote runs' 'run-far-node-is-serving'
+
+    # The claim this scenario makes is "it ran THERE", so the first thing to
+    # establish is that it could not have run here.  A's own T: is listed
+    # before the run and has no hello.axe on it.
+    $listing = [regex]::Match($a, 'Directory of T:\\(.|\n)*?dir\(s\)')
+    $noFile = $listing.Success -and -not $listing.Value.Contains('hello.axe')
+    # The detail is only for a FAILURE.  Note prints whatever it is given, so a
+    # message computed for both outcomes says the opposite of the result half
+    # the time - which is a test that will eventually be read wrong.
+    Note $noFile 'run-local-node-has-no-such-file' `
+        $(if ($noFile) { '' }
+          elseif (-not $listing.Success) { 'no T: listing to check' }
+          else { 'hello.axe IS on this node' })
+
+    # So everything below crossed the wire.
+    Check $a 'hello from ArgonOS' 'run-output-came-back'
+    Check $a 'argv[1] = one' 'run-arguments-arrived'
+    Check $a 'argv[2] = two' 'run-all-arguments-arrived'
+    Check $a 'from the other node' 'run-exit-code-came-back'
+
+    # Including the far KERNEL's own log of loading the image - which is the
+    # sharpest evidence there is, because A has no loader line of its own to
+    # confuse it with and no file to have loaded.
+    Check $a 'loader: HELLO' 'run-far-kernel-loaded-it'
+    Check $a 'returned 0' 'run-far-kernel-reported-exit'
 }
 
 # ------------------------------------------------- unloading, on one node ---

@@ -4956,7 +4956,7 @@ static const ag_command_t k_commands[] = {
     /* The wire to another node of this system.  Not gated on networking:
      * a link is not a network, and a board with no radio and no stack still
      * has a neighbour if one is wired to it. */
-    {"link", "[use <dev>|none | ping [n] | echo [secs] | poll [ms]]",
+    {"link", "[use <dev>|none | run <path> [args] | ping [n] | echo [secs]]",
      "the wire to another node of this system", ag_cmd_link},
 #if AG_HAS_NET
     {"net", "[wait|resolve <name>]", "address, waiting, and names into addresses",

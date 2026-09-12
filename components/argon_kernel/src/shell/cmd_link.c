@@ -19,6 +19,8 @@
 #include <argon/abi.h>
 #include <argon/console.h>
 #include <argon/linkprov.h>
+#include <argon/loader.h>
+#include <argon/nodeproc.h>
 #include <argon/path.h>
 
 /*
@@ -30,6 +32,64 @@
 #define LINK_CHAN_SHELL 1u
 
 #define LINK_MSG_MAX 240u
+
+/*
+ * A one-message mailbox, filled by the link's reader task.
+ *
+ * There is no recv() to call any more, and the reason is a bug this file
+ * caused: a server for remote runs appeared beside `link ping`, both read the
+ * one inbox, and six messages in twenty-four went to the wrong one - which the
+ * shell then reported as lost.  One reader, handlers per channel, and a
+ * consumer waits on its own channel's mailbox.
+ */
+static volatile bool s_have;
+static uint8_t       s_msg[LINK_MSG_MAX + 1];
+static volatile uint16_t s_msg_len;
+static volatile uint8_t  s_msg_chan;
+
+static void on_shell_msg(uint8_t chan, const void *data, uint16_t len,
+                         void *ctx)
+{
+    (void)ctx;
+    if (s_have) {
+        return; /* the last one has not been taken; drop rather than overwrite */
+    }
+    if (len > sizeof(s_msg)) {
+        len = (uint16_t)sizeof(s_msg);
+    }
+    memcpy(s_msg, data, len);
+    s_msg_len = len;
+    s_msg_chan = chan;
+    s_have = true;
+}
+
+/* Wait for one, up to `ms`.  Returns its length, or -AG_EAGAIN. */
+static int32_t shell_wait(uint8_t *chan, uint8_t *buf, size_t max, uint32_t ms)
+{
+    /*
+     * On the clock, not by counting sleeps: a tick is ten milliseconds whatever
+     * a shorter sleep asks for, and a timeout built out of those is wrong by
+     * that factor - which the driver next door learned the expensive way.
+     */
+    const uint32_t start = (uint32_t)(ag_loader_api()->time->us() / 1000u);
+    for (;;) {
+        if (s_have) {
+            uint16_t n = s_msg_len;
+            if (n > max) {
+                n = (uint16_t)max;
+            }
+            memcpy(buf, s_msg, n);
+            *chan = s_msg_chan;
+            s_have = false;
+            return (int32_t)n;
+        }
+        const uint32_t now = (uint32_t)(ag_loader_api()->time->us() / 1000u);
+        if ((uint32_t)(now - start) >= ms) {
+            return -AG_EAGAIN;
+        }
+        ag_linkprov_poll(2);
+    }
+}
 
 static void print_stats(void)
 {
@@ -81,6 +141,11 @@ static int link_status(void)
 
 static int link_echo(uint32_t secs)
 {
+    if (ag_linkprov_listen(LINK_CHAN_SHELL, on_shell_msg, NULL) != AG_OK) {
+        ag_console_puts("channel 1 is taken\n");
+        return 1;
+    }
+
     uint8_t  buf[LINK_MSG_MAX + 1];
     uint32_t answered = 0;
     uint32_t ms = secs * 1000u;
@@ -88,7 +153,7 @@ static int link_echo(uint32_t secs)
     ag_console_printf("echo: %u s, any key stops\n", (unsigned)secs);
     while (ms > 0) {
         uint8_t       chan = 0;
-        const int32_t n = ag_linkprov_recv(&chan, buf, sizeof(buf), 200);
+        const int32_t n = shell_wait(&chan, buf, sizeof(buf), 200);
         if (ms >= 200u) {
             ms -= 200u;
         } else {
@@ -118,6 +183,11 @@ static int link_echo(uint32_t secs)
 
 static int link_ping(uint32_t count)
 {
+    if (ag_linkprov_listen(LINK_CHAN_SHELL, on_shell_msg, NULL) != AG_OK) {
+        ag_console_puts("channel 1 is taken\n");
+        return 1;
+    }
+
     uint8_t  out[64];
     uint8_t  in[LINK_MSG_MAX + 1];
     uint32_t got = 0;
@@ -147,7 +217,7 @@ static int link_ping(uint32_t count)
         }
 
         uint8_t       chan = 0;
-        const int32_t n = ag_linkprov_recv(&chan, in, sizeof(in), 2000);
+        const int32_t n = shell_wait(&chan, in, sizeof(in), 2000);
         if (n > 0 && in[0] == (uint8_t)LINK_TAG_REP) {
             got++;
         }
@@ -177,6 +247,16 @@ int ag_cmd_link(int argc, char **argv)
             return 1;
         }
         ag_console_printf("link is %s\n", ag_linkprov_active());
+        /*
+         * Start answering the other node.  Here rather than at boot, because
+         * before a link is bound there is nothing to answer on; and here rather
+         * than inside linkprov, because a wire should not have to know what a
+         * process is.
+         */
+        const ag_err_t serr = ag_nodeproc_start();
+        if (serr != AG_OK) {
+            ag_console_printf("  (not serving remote runs: %d)\n", (int)serr);
+        }
         return 0;
     }
 
@@ -192,13 +272,64 @@ int ag_cmd_link(int argc, char **argv)
         const uint32_t s = (argc > 2) ? (uint32_t)atoi(argv[2]) : 20u;
         return link_echo((s == 0) ? 1u : s);
     }
+    if (ag_path_icmp(argv[1], "run") == 0) {
+        if (argc < 3) {
+            ag_console_puts("usage: link run <path> [args...]\n");
+            ag_console_puts("  loads and runs it on the OTHER node; its output "
+                            "comes back here\n");
+            return 1;
+        }
+        /*
+         * Rebuilt from argv rather than passed through whole: the shell has
+         * already split it, and the far side splits it again with the same
+         * code, so quoting means there exactly what it meant here.
+         */
+        char   line[AG_PATH_MAX + 64];
+        size_t at = 0;
+        for (int i = 2; i < argc; i++) {
+            const size_t n = strlen(argv[i]);
+            if (at + n + 2u >= sizeof(line)) {
+                ag_console_puts("link run: command line too long\n");
+                return 1;
+            }
+            if (at > 0) {
+                line[at++] = ' ';
+            }
+            memcpy(line + at, argv[i], n);
+            at += n;
+        }
+        line[at] = '\0';
+
+        int32_t        code = 0;
+        const ag_err_t err = ag_nodeproc_run(line, 60000u, &code);
+        if (err == -AG_EBUSY) {
+            ag_console_puts("the other node is already running something\n");
+            return 1;
+        }
+        if (err != AG_OK) {
+            ag_console_printf("link run: %d\n", (int)err);
+            return 1;
+        }
+        /*
+         * Two different answers, said differently.  A program that returned a
+         * number and a program that never loaded are not the same event, and a
+         * script that could not tell them apart would act on the wrong one.
+         */
+        if (code < 0) {
+            ag_console_printf("did not run there: %d\n", (int)code);
+            return 1;
+        }
+        ag_console_printf("returned %d from the other node\n", (int)code);
+        return (code == 0) ? 0 : 1;
+    }
+
     if (ag_path_icmp(argv[1], "poll") == 0) {
         const uint32_t ms = (argc > 2) ? (uint32_t)atoi(argv[2]) : 500u;
         ag_linkprov_poll(ms);
         return link_status();
     }
 
-    ag_console_puts("usage: link [use <dev>|none | ping [n] | echo [secs] | "
-                    "poll [ms]]\n");
+    ag_console_puts("usage: link [use <dev>|none | run <path> [args] | "
+                    "ping [n] | echo [secs] | poll [ms]]\n");
     return 1;
 }
