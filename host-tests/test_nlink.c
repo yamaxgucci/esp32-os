@@ -381,10 +381,10 @@ static void test_window_fills_and_drains(void)
     AG_CHECK(ag_nlink_tx_next(&tx, 0) == NULL);
 
     /* A cumulative ack for the second frame frees two slots. */
-    ag_nlink_tx_ack(&tx, 1);
+    ag_nlink_tx_ack(&tx, 1, 0);
     AG_CHECK_INT(ag_nlink_tx_pending(&tx), 2);
     AG_CHECK(ag_nlink_tx_room(&tx));
-    ag_nlink_tx_ack(&tx, 3);
+    ag_nlink_tx_ack(&tx, 3, 0);
     AG_CHECK_INT(ag_nlink_tx_pending(&tx), 0);
     AG_CHECK_INT(tx.retransmits, 0);
 }
@@ -437,7 +437,7 @@ static void test_one_loss_costs_one_timeout(void)
     AG_CHECK_INT(ag_nlink_rx_ack(&rx), 7);
     AG_CHECK_INT(tx.retransmits, 8);
 
-    ag_nlink_tx_ack(&tx, ag_nlink_rx_ack(&rx));
+    ag_nlink_tx_ack(&tx, ag_nlink_rx_ack(&rx), 0);
     AG_CHECK_INT(ag_nlink_tx_pending(&tx), 0);
 }
 
@@ -517,7 +517,7 @@ static void test_the_scheduler_is_told_about_a_retransmission(void)
     AG_CHECK_INT(tx.retransmits, 1);
 
     /* And an acknowledgement ends it: no work, no picking, no spinning. */
-    ag_nlink_tx_ack(&tx, 0);
+    ag_nlink_tx_ack(&tx, 0, 50);
     AG_CHECK_INT(ag_nlink_tx_pending(&tx), 0);
     ag_nlink_sched_offer(&s, NL_CLS_CONTROL, ag_nlink_tx_waiting_bytes(&tx, 500),
                          ag_nlink_tx_head_len(&tx, 500));
@@ -543,6 +543,91 @@ static uint32_t rng(uint32_t *s)
 {
     *s = (*s * 1664525u) + 1013904223u;
     return *s >> 16;
+}
+
+/*
+ * The timeout is measured, and it has to move BOTH ways.
+ *
+ * Written in the terms the failure came in: on a link whose round trip was
+ * longer than a fixed timeout, six frames in thirty-two went out twice with
+ * zero frames lost, zero corrupt and zero duplicated - a link working hard and
+ * a link working look identical from throughput alone, and the only number that
+ * tells them apart is this one.
+ */
+static void test_the_timeout_follows_the_round_trip(void)
+{
+    ag_nlink_slot_t slots[8];
+    ag_nlink_tx_t   tx;
+    const uint8_t   body[8] = {0};
+
+    /* Start it far too short on purpose: 30 ms against a 90 ms round trip. */
+    ag_nlink_tx_init(&tx, NL_CLS_CONTROL, slots, 8, 30);
+
+    /* Ten exchanges, each answered after 90 ms. */
+    uint32_t now = 0;
+    for (int i = 0; i < 10; i++) {
+        AG_CHECK(ag_nlink_tx_queue(&tx, 1, body, sizeof(body), true));
+        const ag_nlink_slot_t *s = ag_nlink_tx_next(&tx, now);
+        AG_CHECK(s != NULL);
+        const uint16_t seq = s->seq;
+        now += 90;
+        ag_nlink_tx_ack(&tx, seq, now);
+        now += 10;
+    }
+
+    /*
+     * It climbed past the round trip.  Not "to" it: a timeout equal to the mean
+     * retransmits half of everything by construction, which is why the estimate
+     * carries a deviation term at all.
+     */
+    AG_CHECK(tx.rto_ms > 90u);
+    AG_CHECK(tx.rto_ms <= NL_RTO_MAX_MS);
+    /* And nothing went twice while it was learning past the first exchange. */
+    AG_CHECK(tx.retransmits <= 1u);
+
+    /* Now the wire gets quick, and the estimate has to come back down. */
+    for (int i = 0; i < 40; i++) {
+        AG_CHECK(ag_nlink_tx_queue(&tx, 1, body, sizeof(body), true));
+        const ag_nlink_slot_t *s = ag_nlink_tx_next(&tx, now);
+        AG_CHECK(s != NULL);
+        const uint16_t seq = s->seq;
+        now += 2;
+        ag_nlink_tx_ack(&tx, seq, now);
+        now += 2;
+    }
+    AG_CHECK(tx.rto_ms < 90u);
+    /* But never below the floor - that is the far end's scheduling, not the
+     * wire, and a timeout under it fires on a tick rather than on a loss. */
+    AG_CHECK(tx.rto_ms >= NL_RTO_MIN_MS);
+}
+
+/*
+ * A timeout that is too short must be able to correct itself with no help.
+ *
+ * This is the half that is easy to leave out and impossible to notice: Karn's
+ * rule forbids taking a sample from a frame that was sent twice, so on a link
+ * where EVERY frame times out there is never a legal sample, and without a
+ * backoff the estimate can never move at all.  The link then retransmits at
+ * that rate for as long as it stays up.
+ */
+static void test_a_timeout_that_never_gets_a_sample_still_backs_off(void)
+{
+    ag_nlink_slot_t slots[4];
+    ag_nlink_tx_t   tx;
+    const uint8_t   body[8] = {0};
+
+    ag_nlink_tx_init(&tx, NL_CLS_CONTROL, slots, 4, 40);
+    AG_CHECK(ag_nlink_tx_queue(&tx, 1, body, sizeof(body), true));
+
+    const uint32_t first = tx.rto_ms;
+    uint32_t       now = 0;
+    /* Nobody ever acknowledges.  Walk the clock past each deadline in turn. */
+    for (int i = 0; i < 6; i++) {
+        AG_CHECK(ag_nlink_tx_next(&tx, now) != NULL);
+        now += tx.rto_ms;
+    }
+    AG_CHECK(tx.rto_ms > first);
+    AG_CHECK(tx.rto_ms <= NL_RTO_MAX_MS);
 }
 
 static void test_a_megabyte_through_a_bad_wire(void)
@@ -658,7 +743,7 @@ static void test_a_megabyte_through_a_bad_wire(void)
             }
         }
         if (ack_from_peer != NL_ACK_NONE) {
-            ag_nlink_tx_ack(&tx, (uint16_t)ack_from_peer);
+            ag_nlink_tx_ack(&tx, (uint16_t)ack_from_peer, now);
         }
     }
 
@@ -710,5 +795,7 @@ void run_nlink_tests(void)
     test_one_loss_costs_one_timeout();
     test_a_duplicate_is_not_a_gap();
     test_the_scheduler_is_told_about_a_retransmission();
+    test_the_timeout_follows_the_round_trip();
+    test_a_timeout_that_never_gets_a_sample_still_backs_off();
     test_a_megabyte_through_a_bad_wire();
 }

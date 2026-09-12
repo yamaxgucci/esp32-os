@@ -309,6 +309,17 @@ bool ag_nlink_tx_queue(ag_nlink_tx_t *tx, uint8_t chan, const void *data,
     return true;
 }
 
+static uint32_t clamp_rto(uint32_t ms)
+{
+    if (ms < NL_RTO_MIN_MS) {
+        return NL_RTO_MIN_MS;
+    }
+    if (ms > NL_RTO_MAX_MS) {
+        return NL_RTO_MAX_MS;
+    }
+    return ms;
+}
+
 const ag_nlink_slot_t *ag_nlink_tx_next(ag_nlink_tx_t *tx, uint32_t now_ms)
 {
     /*
@@ -327,6 +338,15 @@ const ag_nlink_slot_t *ag_nlink_tx_next(ag_nlink_tx_t *tx, uint32_t now_ms)
         for (uint16_t i = 0; i < tx->count; i++) {
             tx->slot[i].sent = false;
         }
+        /*
+         * Back off, and this half is not optional.  Karn's rule forbids taking
+         * a sample from a retransmitted frame - so without a backoff a timeout
+         * that is too short can never be corrected by anything, and the link
+         * retransmits at that rate for as long as it is up.  Doubling on each
+         * timeout is what makes the estimator able to climb as well as fall; a
+         * good sample from a frame that goes out once puts it back.
+         */
+        tx->rto_ms = clamp_rto(tx->rto_ms * 2u);
     }
     for (uint16_t i = 0; i < tx->count; i++) {
         if (!tx->slot[i].sent) {
@@ -343,7 +363,35 @@ const ag_nlink_slot_t *ag_nlink_tx_next(ag_nlink_tx_t *tx, uint32_t now_ms)
     return NULL;
 }
 
-void ag_nlink_tx_ack(ag_nlink_tx_t *tx, uint16_t ack)
+/*
+ * One round-trip sample, folded in the way Jacobson and Karels settled on:
+ * a smoothed mean plus four times a smoothed deviation.
+ *
+ * The deviation term is the part that matters and the part usually left out.
+ * A timeout of "the average round trip" retransmits half of all frames by
+ * construction; what is needed is a number the round trip rarely exceeds, and
+ * that is the mean plus several times how much it moves about.
+ *
+ * Integer arithmetic throughout, in milliseconds: this runs on a board with no
+ * hardware floating point, in the path of every acknowledgement.
+ */
+static void rtt_sample(ag_nlink_tx_t *tx, uint32_t r_ms)
+{
+    if (tx->srtt_ms == 0u) {
+        tx->srtt_ms = r_ms;
+        tx->rttvar_ms = r_ms / 2u;
+    } else {
+        const uint32_t diff = (r_ms > tx->srtt_ms) ? (r_ms - tx->srtt_ms)
+                                                   : (tx->srtt_ms - r_ms);
+        /* rttvar = 3/4 rttvar + 1/4 |srtt - r| */
+        tx->rttvar_ms = (tx->rttvar_ms * 3u + diff) / 4u;
+        /* srtt = 7/8 srtt + 1/8 r */
+        tx->srtt_ms = (tx->srtt_ms * 7u + r_ms) / 8u;
+    }
+    tx->rto_ms = clamp_rto(tx->srtt_ms + 4u * tx->rttvar_ms);
+}
+
+void ag_nlink_tx_ack(ag_nlink_tx_t *tx, uint16_t ack, uint32_t now_ms)
 {
     if (ack == NL_ACK_NONE) {
         return;
@@ -356,6 +404,23 @@ void ag_nlink_tx_ack(ag_nlink_tx_t *tx, uint16_t ack)
     }
     if (drop == 0u) {
         return;
+    }
+    /*
+     * Measure, before the slots go.  Karn's rule: only a frame that went out
+     * ONCE can be measured, because the ack for a frame sent twice does not say
+     * which copy it answers - and taking it as a sample drags the estimate
+     * towards whichever guess was wrong, which is how an adaptive timer talks
+     * itself into either a storm or a stall.
+     *
+     * The newest such frame, not the oldest: a cumulative ack for several
+     * frames arrives when the LAST of them got there, so the oldest would be
+     * measured as having taken the whole burst's time.
+     */
+    for (uint16_t i = drop; i-- > 0;) {
+        if (tx->slot[i].tries == 1u) {
+            rtt_sample(tx, (uint32_t)(now_ms - tx->slot[i].sent_ms));
+            break;
+        }
     }
     /*
      * Slide.  A ring would avoid the move; an array that is moved costs one

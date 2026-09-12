@@ -22,6 +22,8 @@
 #include <argon/loader.h>
 #include <argon/nodedev.h>
 #include <argon/nodedrv.h>
+#include <argon/nodehello.h>
+#include <argon/nodename.h>
 #include <argon/nodefs.h>
 #include <argon/nodeproc.h>
 #include <argon/path.h>
@@ -115,6 +117,18 @@ static void print_stats(void)
                       (unsigned)st.acks);
     ag_console_printf("bytes   %u out, %u in\n", (unsigned)st.tx_bytes,
                       (unsigned)st.rx_bytes);
+    /*
+     * Beside the retransmits, because it is what makes them readable: frames
+     * going out twice with no gaps and no duplicates means the acknowledgement
+     * was late against this number, not that the wire lost anything.
+     */
+    if (st.srtt_ms != 0u) {
+        ag_console_printf("timer   %u ms, round trip %u ms (measured)\n",
+                          (unsigned)st.rto_ms, (unsigned)st.srtt_ms);
+    } else {
+        ag_console_printf("timer   %u ms, round trip not measured yet\n",
+                          (unsigned)st.rto_ms);
+    }
 }
 
 static int link_status(void)
@@ -125,8 +139,25 @@ static int link_status(void)
                         "one\n");
         return 1;
     }
+    const char *peer = ag_node_peer_name();
     ag_console_printf("link on %s, far end %s\n", ag_linkprov_active(),
                       ag_linkprov_up() ? "heard" : "silent");
+    /*
+     * Who, not just whether.  "The far end is heard" and "the far end is n2"
+     * are different facts, and only the second one can be typed into a config.
+     */
+    ag_console_printf("this node is %s, the other is %s\n", ag_node_name(),
+                      (peer != NULL) ? peer : "not saying yet");
+    /*
+     * Said here as well as when the two first meet, because a warning you can
+     * only see if you happened to be watching at that second is a warning that
+     * will be missed - the console is twenty-five lines and a bind is followed
+     * by everything else.  A standing condition belongs in the status.
+     */
+    if (peer != NULL && strcmp(peer, ag_node_name()) == 0) {
+        ag_console_printf("  both are called %s - `link name <x>` on one of "
+                          "them\n", peer);
+    }
     print_stats();
     return 0;
 }
@@ -239,6 +270,36 @@ int ag_cmd_link(int argc, char **argv)
         return link_status();
     }
 
+    /*
+     * Before the "is a link bound" gate below, because naming a node is not a
+     * link operation: a board has a name whether or not anything is wired to
+     * it, and the sensible order is to name it and THEN bind - so the first
+     * hello already carries the right name.
+     */
+    if (ag_path_icmp(argv[1], "name") == 0) {
+        if (argc < 3) {
+            ag_console_printf("this node is %s\n", ag_node_name());
+            return 0;
+        }
+        const ag_err_t e = ag_node_name_set(argv[2]);
+        if (e != AG_OK) {
+            ag_console_puts("a node name is letters, digits, '-' and '_', "
+                            "up to eight\n");
+            /* No dot, and it is worth saying why: the dot is what separates a
+             * node from a device in `n2.pcm0`. */
+            ag_console_puts("  no dot: that separates a node from a device\n");
+            return 1;
+        }
+        ag_console_printf("this node is %s\n", ag_node_name());
+        if (ag_linkprov_bound()) {
+            /* Say it again: the neighbour is holding the old one. */
+            (void)ag_nodehello_start();
+        }
+        ag_console_puts("  put `name = ...` under [cluster] in SYSTEM.CFG to "
+                        "keep it\n");
+        return 0;
+    }
+
     if (ag_path_icmp(argv[1], "use") == 0) {
         if (argc < 3) {
             ag_console_puts("usage: link use <dev>|none\n");
@@ -279,6 +340,11 @@ int ag_cmd_link(int argc, char **argv)
         const ag_err_t verr = ag_nodedrv_serve();
         if (verr != AG_OK) {
             ag_console_printf("  (not serving our card: %d)\n", (int)verr);
+        }
+        /* Names, before anything that has to be addressed by one. */
+        const ag_err_t herr = ag_nodehello_start();
+        if (herr != AG_OK) {
+            ag_console_printf("  (did not say hello: %d)\n", (int)herr);
         }
         return 0;
     }
@@ -393,7 +459,7 @@ int ag_cmd_link(int argc, char **argv)
     }
 
     ag_console_puts("usage: link [use <dev>|none | run <path> [args] | "
-                    "get <there> <here> | mount | umount | "
+                    "get <there> <here> | mount | umount | name [x] | "
                     "ping [n] | echo [secs] | poll [ms]]\n");
     return 1;
 }

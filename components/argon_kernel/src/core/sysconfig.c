@@ -13,6 +13,7 @@
 #include <argon/codepage.h>
 #include <argon/loader.h>
 #include <argon/log.h>
+#include <argon/nodename.h>
 #include <argon/vfs.h>
 
 #include <argon/port/mem.h>
@@ -188,6 +189,9 @@ ag_err_t ag_sysconfig_init(void)
      */
     (void)load_one("/sys/BOARD.CFG", "BOARD.CFG");
     (void)load_one("/sys/SYSTEM.CFG", "SYSTEM.CFG");
+
+    /* What this node is called, before anything can be addressed by it. */
+    (void)ag_node_name_init();
 
     /*
      * The code page is applied here rather than in the console stage, which runs

@@ -88,12 +88,18 @@ _Static_assert((int)NL_CLS_CONTROL == (int)AG_LINK_CONTROL &&
 /*
  * How long to wait for an acknowledgement before sending the window again.
  *
- * A PLACEHOLDER, and marked as one.  It has to be longer than a round trip or
- * the link retransmits frames that were merely in flight - at 40 ms it did
- * that between two emulators sharing one PC, which is not even a slow wire.
- * The right number comes from measuring the round trip on the hardware this
- * runs on, and adapting to it the way every long-lived protocol ends up doing;
- * until that measurement exists, generous beats clever.
+ * Where the timeout STARTS.  It is no longer the answer: NLINK measures the
+ * round trip and follows it (see ag_nlink.h), because a fixed number is wrong
+ * at every speed - too short and the link resends frames that were merely in
+ * flight, which costs bandwidth and looks exactly like a lossy wire with
+ * nothing actually lost; too long and a real loss stalls the window for as
+ * long as the number says.  The same code runs on a 16 Mbaud pair of wires and
+ * on two emulators sharing a busy PC, and the round trip differs between them
+ * by two orders of magnitude.
+ *
+ * Generous as a starting point on purpose: the first frames go out before
+ * there is anything to measure, and starting too short spends its first
+ * exchanges retransmitting.
  */
 #define ND_RTO_MS 150u
 
@@ -227,7 +233,7 @@ static void frame_arrived(void)
 
     /* The peer's acknowledgement rides on every frame it sends. */
     if (h->ack != NL_ACK_NONE) {
-        ag_nlink_tx_ack(&s_nd.tx[cls], h->ack);
+        ag_nlink_tx_ack(&s_nd.tx[cls], h->ack, now_ms());
     }
 
     if ((h->flags & NL_F_ACKONLY) != 0u) {
@@ -602,6 +608,14 @@ static ag_err_t nd_stats(ag_device_t *dev, ag_link_stats_t *out)
     out->acks = s_nd.acks;
     out->tx_bytes = s_nd.tx_bytes;
     out->rx_bytes = s_nd.rx_bytes;
+    /*
+     * CONTROL's, not a sum or an average: the three classes have separate
+     * windows and separate timers, and an average of three timeouts is a
+     * number no timer ever used.  Control is the one with a latency budget,
+     * so it is the one worth watching.
+     */
+    out->rto_ms = s_nd.tx[NL_CLS_CONTROL].rto_ms;
+    out->srtt_ms = s_nd.tx[NL_CLS_CONTROL].srtt_ms;
     TASK->mutex_unlock(s_nd.lock);
     return AG_OK;
 }

@@ -316,7 +316,29 @@ typedef struct ag_nlink_tx {
     uint16_t         cap;
     uint16_t         count;    /* slots in use, oldest first */
     uint16_t         next_seq; /* the sequence the next queued frame takes */
+    /*
+     * The retransmission timeout, MEASURED rather than chosen.
+     *
+     * A fixed number is wrong at every speed: too short and the link resends
+     * frames that were merely in flight - which costs bandwidth and looks
+     * exactly like a lossy wire, with zero frames actually lost - and too long
+     * and a real loss stalls the window for as long as the number says.  It
+     * cannot be picked once, because the same code runs on a 16 Mbaud pair of
+     * wires and on two emulators sharing a busy PC, and the round trip differs
+     * by two orders of magnitude between them.
+     *
+     * So: smoothed round trip plus four times its variation, the estimator
+     * every long-lived protocol converges on.  `rto_ms` is the answer in use;
+     * the two below are the state it is computed from, in milliseconds.
+     *
+     * A sample is taken ONLY from a frame that went out once.  The ack for a
+     * frame that was sent twice cannot say which copy it answers, and counting
+     * it drags the estimate towards whichever guess was wrong - which is the
+     * classic way an adaptive timer talks itself into a collapse.
+     */
     uint32_t         rto_ms;
+    uint32_t         srtt_ms;  /* 0 until the first sample                  */
+    uint32_t         rttvar_ms;
     uint8_t          cls;
     /* Counters.  `retransmits` is the one to watch on a real wire: it is the
      * difference between a link that is working and a link that is working
@@ -348,9 +370,29 @@ bool ag_nlink_tx_queue(ag_nlink_tx_t *tx, uint8_t chan, const void *data,
  */
 const ag_nlink_slot_t *ag_nlink_tx_next(ag_nlink_tx_t *tx, uint32_t now_ms);
 
-/* The peer's cumulative acknowledgement: it has everything up to and including
- * `ack`.  NL_ACK_NONE means it has nothing yet. */
-void ag_nlink_tx_ack(ag_nlink_tx_t *tx, uint16_t ack);
+/*
+ * The peer's cumulative acknowledgement: it has everything up to and including
+ * `ack`.  NL_ACK_NONE means it has nothing yet.
+ *
+ * `now_ms` is not decoration: this is where the round trip is measured, and a
+ * clock the caller passes is the same clock the send used.
+ */
+void ag_nlink_tx_ack(ag_nlink_tx_t *tx, uint16_t ack, uint32_t now_ms);
+
+/*
+ * Floor and ceiling for the measured timeout.
+ *
+ * The floor is not a guess at the wire: it is the granularity of the far end's
+ * ANSWER.  A node acknowledges from a task that wakes on the system tick, so an
+ * ack can honestly be a tick or two late while nothing at all is wrong, and a
+ * timeout below that retransmits on the far end's scheduling rather than on
+ * anything the wire did.
+ *
+ * The ceiling exists so that a link which has been idle behind one enormous
+ * measurement does not take most of a minute to notice a real loss.
+ */
+#define NL_RTO_MIN_MS 30u
+#define NL_RTO_MAX_MS 2000u
 
 /* Frames queued or in flight.  Zero means everything has been acknowledged. */
 uint16_t ag_nlink_tx_pending(const ag_nlink_tx_t *tx);

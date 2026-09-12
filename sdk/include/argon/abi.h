@@ -213,9 +213,16 @@ extern "C" {
  *      watch a wire.  A service task belongs to the MODULE, the kernel stops
  *      it when the module is unloaded, and it runs BELOW every application
  *      because a driver task above them has already cost this project a game.
+ *
+ * 0.51 ag_link_stats_t gained rto_ms and srtt_ms: the retransmission timeout
+ *      the link measured, and the round trip behind it.  Without them a
+ *      retransmit count cannot be read - frames going out twice with nothing
+ *      lost, corrupt or duplicated means the acknowledgement was late, not
+ *      that the wire dropped anything, and the two have opposite cures.
+ *      Appended, so a .SYS built before this reads exactly what it did.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 50u
+#define AG_ABI_MINOR 51u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -1227,6 +1234,21 @@ typedef struct ag_link_stats {
     uint32_t acks;
     uint32_t tx_bytes;
     uint32_t rx_bytes;
+    /*
+     * The retransmission timeout in use, in milliseconds, and the smoothed
+     * round trip it was computed from.  Measured, not configured (ABI 0.51).
+     *
+     * Here because without them a retransmit count cannot be interpreted.
+     * Frames going out twice with nothing lost, nothing corrupt and nothing
+     * duplicated means the acknowledgement arrived after the timeout, not that
+     * the wire dropped anything - and those have opposite cures.  The pair of
+     * numbers is what tells them apart at a glance.
+     *
+     * Zero srtt means nothing has been measured yet: every frame so far went
+     * out more than once, or none has been acknowledged.
+     */
+    uint32_t rto_ms;
+    uint32_t srtt_ms;
 } ag_link_stats_t;
 
 /*

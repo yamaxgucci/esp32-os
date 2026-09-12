@@ -393,6 +393,11 @@ if ($Scenario -eq 'link' -or $Scenario -eq 'both') {
                  # One `dev` for the whole system: this node's devices, then the
                  # other node's, asked for over the wire.
                  'dev',
+                 # Neither node was named, so both carry the default.  The
+                 # status has to say so on demand: the warning at the moment
+                 # they met has long since scrolled off a 25-line console.
+                 'link',
+                 '=both are called node',
                  'link run t:\hello.axe one two',
                  '=from the other node',
                  # And the same thing without being told where.  `run` finds no
@@ -468,11 +473,16 @@ if ($Scenario -eq 'link' -or $Scenario -eq 'both') {
     # image is a relocation into nothing, not a warning.
     Check $a 'argv[1] = four' 'get-copy-runs-here'
 
-    Check $a 'on the other node, over node0' 'dev-far-section-appeared'
+    # Neither node was named here, so both carry the default and the header uses
+    # it.  That is worth leaving as it is rather than naming them: it exercises
+    # the case that WILL happen to two boards out of the box, and the collision
+    # it causes is meant to be said out loud rather than worked around.
+    Check $a 'on node, over node0' 'dev-far-section-appeared'
+    Check $a 'both are called node' 'dev-same-name-was-reported'
     # A window after the header, not a split: the console repaints, so the
     # transcript contains the whole screen several times over and anything
     # "after the first occurrence" is most of the run.
-    $at = $a.IndexOf('on the other node, over node0')
+    $at = $a.IndexOf('on node, over node0')
     $window = if ($at -ge 0) {
         $a.Substring($at, [Math]::Min(700, $a.Length - $at))
     } else { '' }
@@ -532,12 +542,21 @@ if ($Scenario -eq 'link' -or $Scenario -eq 'both') {
         -PutB @('build\apps\PCMVIRT.SYS=t:\pcmvirt.sys') `
         -SendB @('drv load t:\pcmvirt.sys',
                  'drv load t:\nodelink.sys',
+                 # Named BEFORE the link is bound, so the first hello already
+                 # carries the right name.  Naming afterwards works too - the
+                 # rename says hello again - but then the test would be proving
+                 # the repair rather than the ordinary case.
+                 'link name sound',
                  'link use node0',
                  "link poll $(($SendDelaySec + 120) * 1000)",
                  '=link on node0') `
         -SendA @('drv load t:\nodelink.sys',
+                 'link name quiet',
                  'link use node0',
                  "!powershell -NoProfile -Command Start-Sleep -Seconds $SendDelaySec",
+                 # Names, before anything that has to be addressed by one.
+                 'link',
+                 '=this node is quiet',
                  # Proof that THIS node cannot: the same refusal the loader
                  # gives, from the node that is about to hand the job over.
                  'dev',
@@ -548,6 +567,14 @@ if ($Scenario -eq 'link' -or $Scenario -eq 'both') {
     $b = Transcript 'build\nodetest-place-b.log'
 
     Check $b 'PCMVIRT' 'place-far-node-has-a-sink'
+
+    # Names.  Each node knows its own and learns the other's from a hello on the
+    # link's own channel - and a name that survives a reboot is the only kind
+    # that can be written into a config file and still mean the same board.
+    Check $a 'this node is quiet' 'name-this-node-knows-itself'
+    Check $a 'the other is sound' 'name-learned-the-neighbour'
+    # And it is used where it matters: the listing of what is over there.
+    Check $a 'on sound, over node0' 'name-used-in-the-device-listing'
 
     # The decision, said out loud.  A shell that moves work silently is a shell
     # nobody can debug.

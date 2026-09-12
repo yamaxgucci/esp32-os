@@ -65,6 +65,7 @@
 #include <argon/nodeproc.h>
 #include <argon/nodedev.h>
 #include <argon/nodedrv.h>
+#include <argon/nodename.h>
 
 #include "shell/cmd_link.h"
 #include "shell/cmd_net.h"
@@ -1510,8 +1511,19 @@ static int cmd_dev(int argc, char **argv)
              * news, and an empty space where its devices were is not. */
             ag_console_printf("\nthe other node did not answer (%d)\n", (int)n);
         } else {
-            ag_console_printf("\non the other node, over %s:\n",
-                              ag_linkprov_active());
+            /*
+             * By name once it has given one.  "The other node" is enough for
+             * two boards and stops being enough at three - and a name is the
+             * only form of this that can be typed into a config file.
+             */
+            const char *peer = ag_node_peer_name();
+            if (peer != NULL) {
+                ag_console_printf("\non %s, over %s:\n", peer,
+                                  ag_linkprov_active());
+            } else {
+                ag_console_printf("\non the other node, over %s:\n",
+                                  ag_linkprov_active());
+            }
             if (n == 0) {
                 ag_console_puts("  nothing\n");
             }
