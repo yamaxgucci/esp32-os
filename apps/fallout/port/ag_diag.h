@@ -231,6 +231,19 @@ void ag_script_slow_note(unsigned us, int tile, int elevation);
  */
 void ag_load_note(unsigned ms);
 
+/* The three phases of unpacking a saved slot onto the card, in milliseconds:
+ * the prototypes, the map files, and the automap plus whatever follows. */
+void ag_unpack_note(unsigned protos_ms, unsigned maps_ms, unsigned rest_ms);
+
+/* One MapDirErase: the pattern, how many files it found, how long listing
+ * them took and how long deleting them took. */
+void ag_direrase_note(const char *what, int files, unsigned list_ms,
+                      unsigned delete_ms);
+
+/* Every compat_remove, summed: time spent resolving the name and time spent
+ * in the card's own remove. */
+void ag_remove_note(unsigned resolve_ms, unsigned remove_ms);
+
 /* The six layers of one map refresh; see tileRefreshGame in tile.cc. */
 /* Inside the object pass: how many turns of the loop, how many were in range,
  * how many tiles held anything, how many objects were drawn and what the

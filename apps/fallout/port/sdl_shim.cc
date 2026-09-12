@@ -1718,6 +1718,34 @@ extern "C" unsigned ag_io_read_worst_us, ag_io_read_worst_len;
  */
 #define AG_SLOW_SCRIPT_US 20000u
 
+static unsigned s_rm_resolve_ms, s_rm_remove_ms, s_rm_n;
+
+extern "C" void ag_remove_note(unsigned resolve_ms, unsigned remove_ms)
+{
+    s_rm_resolve_ms += resolve_ms;
+    s_rm_remove_ms += remove_ms;
+    s_rm_n++;
+}
+
+extern "C" void ag_direrase_note(const char *what, int files,
+                                 unsigned list_ms, unsigned delete_ms)
+{
+    shim_printf("[direrase] %s: %d files, listing %u ms, deleting %u ms "
+                "(%u removes: %u ms resolving, %u ms unlinking)\n",
+                (what != NULL) ? what : "?", files, list_ms, delete_ms,
+                s_rm_n, s_rm_resolve_ms, s_rm_remove_ms);
+    s_rm_resolve_ms = 0;
+    s_rm_remove_ms = 0;
+    s_rm_n = 0;
+}
+
+extern "C" void ag_unpack_note(unsigned protos_ms, unsigned maps_ms,
+                               unsigned rest_ms)
+{
+    shim_printf("[unpack] erasing the card %u ms, party protos %u ms, the rest %u ms\n",
+                protos_ms, maps_ms, rest_ms);
+}
+
 extern "C" void ag_load_note(unsigned ms)
 {
     shim_printf("[load] the whole wait was %u ms (%u.%u s)\n",

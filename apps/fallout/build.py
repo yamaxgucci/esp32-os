@@ -446,7 +446,13 @@ def link(objdir: str, output: str) -> int:
 
     print("allowing %d duplicate symbol(s) the toolchain also defines: %s"
           % (len(dups), ", ".join(sorted(dups))))
-    return run_link(objects, output, extra=" -Wl,--allow-multiple-definition")
+    rc = run_link(objects, output, extra=" -Wl,--allow-multiple-definition")
+    if rc != 0:
+        # The retry failed too, and until now nothing printed why: the
+        # build stopped after "allowing N duplicate symbol(s)" with no
+        # error at all, which reads as a build that simply ended.
+        sys.stderr.write(rc_output)
+    return rc
 
 
 # Set by run_link so the retry above can look at what went wrong.
