@@ -374,7 +374,14 @@ if ($Scenario -eq 'link' -or $Scenario -eq 'both') {
                  # And the same thing without being told where.  `run` finds no
                  # such file here, sees a neighbour, and asks it.
                  'run t:\hello.axe three',
-                 '=argv[1] = three')
+                 '=argv[1] = three',
+                 # And the bulk class, for the first time on a wire: fetch the
+                 # image off the other node and then run it HERE.  A copy that
+                 # executes is a byte-for-byte copy.
+                 'link get t:\hello.axe t:\copy.axe',
+                 '=bytes from the other node',
+                 'run t:\copy.axe four',
+                 '=argv[1] = four')
 
     $a = Transcript 'build\nodetest-run-a.log'
     $b = Transcript 'build\nodetest-run-b.log'
@@ -416,6 +423,14 @@ if ($Scenario -eq 'link' -or $Scenario -eq 'both') {
     # names - and the operator did not say where.
     Check $a 'not here; running it on node0' 'place-run-went-to-the-other-node'
     Check $a 'argv[1] = three' 'place-run-really-ran-there'
+
+    # The bulk class, on a wire, for the first time.  The window, the go-back-N
+    # and the retransmit timer had only ever met an injected loss model on a
+    # development machine.
+    Check $a 'bytes from the other node' 'get-file-came-across'
+    # A copy that executes is a copy that is right: a single wrong byte in an
+    # image is a relocation into nothing, not a warning.
+    Check $a 'argv[1] = four' 'get-copy-runs-here'
 
     Check $a 'on the other node, over node0' 'dev-far-section-appeared'
     # A window after the header, not a split: the console repaints, so the

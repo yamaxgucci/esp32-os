@@ -21,6 +21,7 @@
 #include <argon/linkprov.h>
 #include <argon/loader.h>
 #include <argon/nodedev.h>
+#include <argon/nodefs.h>
 #include <argon/nodeproc.h>
 #include <argon/path.h>
 
@@ -263,6 +264,11 @@ int ag_cmd_link(int argc, char **argv)
             ag_console_printf("  (not answering device listings: %d)\n",
                               (int)derr);
         }
+        const ag_err_t ferr = ag_nodefs_start();
+        if (ferr != AG_OK) {
+            ag_console_printf("  (not answering file fetches: %d)\n",
+                              (int)ferr);
+        }
         return 0;
     }
 
@@ -329,6 +335,22 @@ int ag_cmd_link(int argc, char **argv)
         return (code == 0) ? 0 : 1;
     }
 
+    if (ag_path_icmp(argv[1], "get") == 0) {
+        if (argc < 4) {
+            ag_console_puts("usage: link get <there> <here>\n");
+            ag_console_puts("  copies a file off the other node\n");
+            return 1;
+        }
+        const int32_t n = ag_nodefs_get(argv[2], argv[3], "/", 120000u);
+        if (n < 0) {
+            ag_console_printf("link get: %d\n", (int)n);
+            return 1;
+        }
+        ag_console_printf("%d bytes from the other node -> %s\n", (int)n,
+                          argv[3]);
+        return 0;
+    }
+
     if (ag_path_icmp(argv[1], "poll") == 0) {
         const uint32_t ms = (argc > 2) ? (uint32_t)atoi(argv[2]) : 500u;
         ag_linkprov_poll(ms);
@@ -336,6 +358,7 @@ int ag_cmd_link(int argc, char **argv)
     }
 
     ag_console_puts("usage: link [use <dev>|none | run <path> [args] | "
-                    "ping [n] | echo [secs] | poll [ms]]\n");
+                    "get <there> <here> | ping [n] | echo [secs] | "
+                    "poll [ms]]\n");
     return 1;
 }

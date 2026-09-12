@@ -56,6 +56,7 @@ set(ARGON_KERNEL_SRCS
     "src/net/linkprov.c"
     "src/net/nodeproc.c"
     "src/net/nodedev.c"
+    "src/net/nodefs.c"
     "src/net/espnow.c"
     "src/net/wifimon.c"
     "src/net/netmsg.c"
