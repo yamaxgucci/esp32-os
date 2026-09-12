@@ -81,6 +81,13 @@ void ag_linkprov_unlisten(uint8_t chan);
  * last unbind. */
 bool ag_linkprov_reading(void);
 
+/*
+ * True only on the reader task itself.  Anything that sends a request and then
+ * waits for its answer must refuse to run here: the answer is delivered by
+ * this task, so waiting on it waits for itself.
+ */
+bool ag_linkprov_in_reader(void);
+
 ag_err_t ag_linkprov_stats(ag_link_stats_t *out);
 
 #endif /* ARGON_LINKPROV_H */

@@ -21,6 +21,7 @@
 #include <argon/linkprov.h>
 #include <argon/loader.h>
 #include <argon/nodedev.h>
+#include <argon/nodedrv.h>
 #include <argon/nodefs.h>
 #include <argon/nodeproc.h>
 #include <argon/path.h>
@@ -269,6 +270,16 @@ int ag_cmd_link(int argc, char **argv)
             ag_console_printf("  (not answering file fetches: %d)\n",
                               (int)ferr);
         }
+        /*
+         * Answer file requests from the moment a link exists, without waiting
+         * to be asked: the other node may mount us before we mount it, and a
+         * drive that appears only after both sides have run a command is a
+         * drive nobody can rely on.
+         */
+        const ag_err_t verr = ag_nodedrv_serve();
+        if (verr != AG_OK) {
+            ag_console_printf("  (not serving our card: %d)\n", (int)verr);
+        }
         return 0;
     }
 
@@ -351,6 +362,30 @@ int ag_cmd_link(int argc, char **argv)
         return 0;
     }
 
+    /*
+     * The mountpoint is not the operator's business: a node has one card, so
+     * there is one letter for it, and letting it be chosen only invents a way
+     * for the two ends to disagree about where the other one is.
+     */
+    if (ag_path_icmp(argv[1], "mount") == 0) {
+        const ag_err_t e = ag_nodedrv_mount(AG_NODEDRV_MOUNT);
+        if (e != AG_OK) {
+            ag_console_printf("link mount: %d\n", (int)e);
+            return 1;
+        }
+        ag_console_puts("the other node's card is N:\n");
+        return 0;
+    }
+
+    if (ag_path_icmp(argv[1], "umount") == 0) {
+        const ag_err_t e = ag_nodedrv_unmount(AG_NODEDRV_MOUNT);
+        if (e != AG_OK) {
+            ag_console_printf("link umount: %d\n", (int)e);
+            return 1;
+        }
+        return 0;
+    }
+
     if (ag_path_icmp(argv[1], "poll") == 0) {
         const uint32_t ms = (argc > 2) ? (uint32_t)atoi(argv[2]) : 500u;
         ag_linkprov_poll(ms);
@@ -358,7 +393,7 @@ int ag_cmd_link(int argc, char **argv)
     }
 
     ag_console_puts("usage: link [use <dev>|none | run <path> [args] | "
-                    "get <there> <here> | ping [n] | echo [secs] | "
-                    "poll [ms]]\n");
+                    "get <there> <here> | mount | umount | "
+                    "ping [n] | echo [secs] | poll [ms]]\n");
     return 1;
 }

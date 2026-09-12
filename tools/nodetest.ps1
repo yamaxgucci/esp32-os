@@ -47,7 +47,11 @@
 # Exit code 0 means every check passed.
 [CmdletBinding()]
 param(
-    [int]$TimeoutSec = 120,
+    # Generous, and it has to be: the remote-drive scenario is a round trip per
+    # directory entry and per block of a program image.  Too short does not
+    # report "slow" - the emulator is killed mid-list and the commands after it
+    # simply never ran, which reads as a feature that does not work.
+    [int]$TimeoutSec = 240,
     # Baud is nominal: there is no line here, only a socket, so this only has to
     # be a number both ends configure their port to.  Kept at a real rate so the
     # transcript reads like the board's.
@@ -359,7 +363,9 @@ if ($Scenario -eq 'link' -or $Scenario -eq 'both') {
                  # from A looks exactly like a far end that never answers.
                  # `link poll` holds the shell without doing anything; the
                  # serving happens on the link's own reader task regardless.
-                 "link poll $(($SendDelaySec + 30) * 1000)",
+                 # B must still be there when A asks, and A now asks for a
+                 # whole directory and a whole program image a block at a time.
+                 "link poll $(($SendDelaySec + 120) * 1000)",
                  '=link on node0') `
         -SendA @('drv load t:\nodelink.sys',
                  'link use node0',
@@ -381,7 +387,19 @@ if ($Scenario -eq 'link' -or $Scenario -eq 'both') {
                  'link get t:\hello.axe t:\copy.axe',
                  '=bytes from the other node',
                  'run t:\copy.axe four',
-                 '=argv[1] = four')
+                 '=argv[1] = four',
+                 # And the whole card, as a letter.  Nothing below knows there
+                 # is a wire: `dir` and `run` are the ordinary commands, and the
+                 # loader reads the image over the link a block at a time.
+                 # N: is the far node's WHOLE tree, not one of its drives, so
+                 # its T: is n:\tmp - which is the honest mapping: a node has
+                 # one filesystem and the letters are this node's view of it.
+                 'link mount',
+                 "=the other node's card",
+                 'dir n:\tmp',
+                 '=hello.axe',
+                 'run n:\tmp\hello.axe five',
+                 '=argv[1] = five')
 
     $a = Transcript 'build\nodetest-run-a.log'
     $b = Transcript 'build\nodetest-run-b.log'
@@ -445,6 +463,28 @@ if ($Scenario -eq 'link' -or $Scenario -eq 'both') {
     Note ($rows.Count -eq 3) 'dev-far-devices-listed' `
         $(if ($rows.Count -eq 3) { '' }
           else { "only $($rows.Count) of 3 expected rows" })
+
+    # The other node's card as a drive letter.  The claim is not that a new
+    # command works - it is that NO command had to change: `dir` and `run` are
+    # the ones that were already there, and they do not know there is a wire.
+    Check $a "the other node's card is N:" 'mount-drive-appeared'
+
+    # A directory read over the link: opendir/readdir/closedir, each its own
+    # round trip, and the name has to survive being taken apart and put back.
+    # Case-insensitive on purpose: the shell prints the ON-DISK spelling, which
+    # is the far node's, not a letter this test gets to choose.
+    $nlist = [regex]::Match($a, '(?i)Directory of N:\\tmp(.|\n)*?dir\(s\)')
+    $nHas = $nlist.Success -and $nlist.Value.Contains('hello.axe')
+    Note $nHas 'mount-far-directory-listed' `
+        $(if ($nHas) { '' }
+          elseif (-not $nlist.Success) { 'no N: listing in the transcript' }
+          else { 'N: listed but hello.axe is not in it' })
+
+    # And the one that matters: the LOADER read an image over the wire, a block
+    # at a time, through open/read/seek/close it does not know are remote - and
+    # the program ran.  This is what the manifest half of placement was waiting
+    # for: to decide by what a program declares, a node must be able to read it.
+    Check $a 'argv[1] = five' 'mount-ran-a-program-off-the-far-card'
 }
 
 # ------------------------------------------------- unloading, on one node ---

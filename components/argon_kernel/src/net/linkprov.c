@@ -55,6 +55,18 @@ void ag_linkprov_unlisten(uint8_t chan)
 bool ag_linkprov_reading(void) { return s_reader != NULL; }
 
 /*
+ * Am I the reader?  A different question from the one above, and the two are
+ * easy to mistake for each other: anything that sends a request and then waits
+ * for the answer must refuse to run on this task, because the answer arrives
+ * on it.  Asking "is there a reader" instead refuses ALWAYS - which is what the
+ * remote drive did, and it failed as -EBUSY, a plausible-looking error.
+ */
+bool ag_linkprov_in_reader(void)
+{
+    return s_reader != NULL && ag_port_task_self() == s_reader;
+}
+
+/*
  * The one reader.  Everything that arrives goes to the handler for its channel
  * and nowhere else; a message on a channel nobody holds is dropped, which is
  * the honest thing to do with a conversation nobody is having.

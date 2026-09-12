@@ -168,6 +168,9 @@ static const struct {
     {"/tmp", 'T'},
     {"/dev", 'D'},
     {"/host", 'H'},
+    /* The other node's card, when one is mounted.  A letter like any other:
+     * that is the whole point of doing it as a filesystem. */
+    {"/node", 'N'},
 };
 
 void ag_shell_dos_path(const char *posix_path, char *out, size_t n)
@@ -5053,7 +5056,7 @@ static const ag_command_t k_commands[] = {
     /* The wire to another node of this system.  Not gated on networking:
      * a link is not a network, and a board with no radio and no stack still
      * has a neighbour if one is wired to it. */
-    {"link", "[use <dev>|none | run <path> | get <there> <here> | ping [n]]",
+    {"link", "[use <dev>|none | run | get | mount [N:] | ping [n]]",
      "the wire to another node of this system", ag_cmd_link},
 #if AG_HAS_NET
     {"net", "[wait|resolve <name>]", "address, waiting, and names into addresses",
