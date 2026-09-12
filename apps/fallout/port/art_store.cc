@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include <argon/abi.h>
+#include <argon/argon.h>
 
 extern "C" uint32_t ag_us(void);
 
@@ -210,6 +211,7 @@ uint32_t s_kept_load, s_kept_play;
  * tenth as often - which is the part that was quietly costing the game.
  */
 uint8_t *s_bounce;
+uint32_t s_bounce_bytes;
 bool s_want_bounce = true;
 bool s_stage_internal;
 
@@ -385,8 +387,8 @@ bool write_through(uint32_t at, const uint8_t *src, uint32_t len)
         uint32_t piece = len - done;
 
         if (s_bounce != nullptr) {
-            if (piece > AG_STAGE_INTERNAL_MAX) {
-                piece = AG_STAGE_INTERNAL_MAX;
+            if (piece > s_bounce_bytes) {
+                piece = s_bounce_bytes;
             }
             memcpy(s_bounce, src + done, piece);
         }
@@ -541,8 +543,25 @@ void ag_art_store_init(void)
     if (root != nullptr && root->mem != nullptr
             && root->mem->alloc_caps != nullptr) {
         if (s_want_bounce) {
-            s_bounce = (uint8_t *)root->mem->alloc_caps(AG_STAGE_INTERNAL_MAX,
-                                                        AG_MEM_FAST);
+            /*
+             * Take what internal memory will give, and say so either way.
+             *
+             * Writing to flash from the arena costs 7.4 ms a kilobyte and
+             * from internal memory 3.5 - thirty seconds of a map load.  The
+             * ask for 32 KB was failing silently and the store quietly wrote
+             * the slow way for a whole day; a refusal that says nothing is
+             * how that happens.  So: ask for less rather than give up, and
+             * print what was got.
+             */
+            for (uint32_t want = AG_STAGE_INTERNAL_MAX;
+                    want >= 4096u && s_bounce == nullptr; want >>= 1) {
+                s_bounce = (uint8_t *)root->mem->alloc_caps(want, AG_MEM_FAST);
+                if (s_bounce != nullptr) {
+                    s_bounce_bytes = want;
+                }
+            }
+            ag_printf("fallout: flash relay %u KB of internal memory\n",
+                      (unsigned)(s_bounce_bytes >> 10));
         }
         s_stage_internal = (s_bounce != nullptr);
     }
