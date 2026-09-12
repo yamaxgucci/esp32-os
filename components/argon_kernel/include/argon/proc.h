@@ -56,6 +56,16 @@ ag_err_t ag_proc_exec(const char *path, int argc, char **argv, uint32_t flags,
                       int32_t *exit_code);
 
 /*
+ * Which of a program's declared needs (the AG_AXE_NEEDS_* bits of its .AXE
+ * flags word) this node cannot meet.  Zero means it could start here.
+ *
+ * The one place those tests live.  The loader refuses with it, a node answers
+ * another node's "could you run this?" with it, and the shell decides which
+ * node should get a program with it - and three copies would drift.
+ */
+uint32_t ag_proc_unmet_needs(uint32_t axe_flags);
+
+/*
  * Starts it and returns its pid without waiting.  Image load runs on the new
  * process task so the caller (shell) is not blocked on HostFS/XIP.
  */

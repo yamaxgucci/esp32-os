@@ -177,9 +177,15 @@ static int do_send(uint32_t baud, uint32_t kb)
     }
     const uint64_t us = (uint64_t)(g_ag_api->time->us() - t0);
 
-    ag_printf("sent %u bytes in %u ms = %u B/s%s\n", (unsigned)sent,
-              (unsigned)(us / 1000u), (unsigned)rate_bps(sent, us),
-              stopped ? " (stopped)" : "");
+    /*
+     * `sent` is what the driver ACCEPTED, not what left the wire: there is no
+     * drain in the ABI, so the last block is normally still in the transmit
+     * ring when this returns.  Blocks are reported beside it because they are
+     * the quantity the two ends can actually be compared on.
+     */
+    ag_printf("sent %u bytes in %u blocks in %u ms = %u B/s%s\n",
+              (unsigned)sent, (unsigned)seq, (unsigned)(us / 1000u),
+              (unsigned)rate_bps(sent, us), stopped ? " (stopped)" : "");
     return 0;
 }
 
@@ -276,6 +282,16 @@ static int do_recv(uint32_t baud, uint32_t secs)
     ag_printf("got %u bytes, %u blocks ok, %u corrupt, %u lost, %u stray\n",
               (unsigned)bytes, (unsigned)ok, (unsigned)bad, (unsigned)lost,
               (unsigned)stray);
+    /*
+     * The bytes of a block that never completed.  Printed rather than left to
+     * be worked out from the other numbers: without it a sender that stopped
+     * with a block still in its transmit ring is indistinguishable from a wire
+     * that dropped one, and those have opposite cures.
+     */
+    if (have != 0) {
+        ag_printf("in hand: %u bytes of a block that never finished\n",
+                  (unsigned)have);
+    }
     if (span != 0) {
         ag_printf("while it was flowing: %u ms = %u B/s\n",
                   (unsigned)(span / 1000u), (unsigned)rate_bps(bytes, span));

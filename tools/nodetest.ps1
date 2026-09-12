@@ -127,6 +127,10 @@ function Invoke-Pair {
         # Files only the FAR node gets.  Used to prove where a program ran: if
         # node A never had the image, output that appears on A crossed the wire.
         [string[]]$PutB = @(),
+        # Files only THIS node gets.  The mirror image, and it proves the harder
+        # claim: the program moved and the file did not, so the far node read it
+        # over the wire while being told to run it.
+        [string[]]$PutA = @(),
         [string[]]$SendB,
         [string[]]$SendA
     )
@@ -165,7 +169,7 @@ function Invoke-Pair {
             -TimeoutSec $TimeoutSec -LinkPort $linkPort -KeepOtherEmulators `
             -Flash 'build\qemu_flash_a.bin' `
             -Tag "a-$Tag" -LogPath "build\nodetest-$Tag-a.log" `
-            -Put $PutBoth -Send $SendA | Out-Null
+            -Put (@($PutBoth) + @($PutA)) -Send $SendA | Out-Null
     } finally {
         if (-not $procB.WaitForExit($TimeoutSec * 2000)) {
             Write-Host 'node B did not finish; stopping it.' -ForegroundColor Yellow
@@ -186,7 +190,7 @@ function Invoke-Pair {
 # ------------------------------------------------------------------ build ---
 
 $only = @('LINK.AXE')
-if ($Scenario -ne 'raw') { $only += 'NODELINK.SYS'; $only += 'HELLO.AXE' }
+if ($Scenario -ne 'raw') { $only += 'NODELINK.SYS'; $only += 'HELLO.AXE'; $only += 'NEEDSND.AXE'; $only += 'PCMVIRT.SYS' }
 & python (Join-Path $PSScriptRoot 'build_apps.py') --only @only | Out-Null
 foreach ($img in $only) {
     if (-not (Test-Path "build\apps\$img")) { throw "$img did not build." }
@@ -252,12 +256,26 @@ if ($Scenario -eq 'raw' -or $Scenario -eq 'both') {
         # zero lost about half a transfer, because `lost` counts gaps between
         # sequence numbers and a missing tail is not a gap.  Mutation-tested:
         # point A at a port nobody listens on and the two above pass anyway.
-        $s = [regex]::Match($a, 'sent (\d+) bytes in (\d+) ms')
+        #
+        # BLOCKS, not bytes, and this took three runs and two wrong theories to
+        # settle.  The sender's byte count is what its driver ACCEPTED; there is
+        # no drain in the ABI, so the final block is still in the transmit ring
+        # when the sender stops, and the receiver is left holding part of it.
+        # Comparing byte counts compares two quantities that only coincide if
+        # the sender drained - so it failed by a few dozen bytes, at random,
+        # for ever, and read as a lossy wire.  It is not: every block that
+        # completed was perfect, in order, with nothing lost between them.
+        #
+        # So: every block but the one in flight must have arrived whole.  A dead
+        # wire still fails this - zero is not 252.
+        $s = [regex]::Match($a, 'sent (\d+) bytes in (\d+) blocks')
         if (-not $s.Success) {
             Note $false 'raw-sender-summary-parsed' 'no "sent N bytes" line'
         } else {
-            Note ([int]$s.Groups[1].Value -eq $bytes) 'raw-byte-for-byte' `
-                ("sent {0}, got {1}" -f $s.Groups[1].Value, $bytes)
+            $sentBlocks = [int]$s.Groups[2].Value
+            $short = $sentBlocks - $blocks
+            Note ($short -ge 0 -and $short -le 1) 'raw-every-block-arrived' `
+                ("sent {0} blocks, assembled {1}" -f $sentBlocks, $blocks)
         }
     }
 }
@@ -485,6 +503,68 @@ if ($Scenario -eq 'link' -or $Scenario -eq 'both') {
     # the program ran.  This is what the manifest half of placement was waiting
     # for: to decide by what a program declares, a node must be able to read it.
     Check $a 'argv[1] = five' 'mount-ran-a-program-off-the-far-card'
+}
+
+# ------------------------------------------ placement by what a program needs ---
+#
+# The half of placement that a directory cannot decide.  The file IS here; this
+# node simply cannot do what the program says it needs, and the neighbour can.
+#
+# WHAT MAKES THIS A REAL TEST rather than a rehearsal: the two nodes genuinely
+# differ, and nothing was invented to make them.  QEMU registers no pcm0 - the
+# board has no converter, so `pcmnull stands alone` - and PCMVIRT.SYS registers
+# a sink.  Loading it on B and not on A leaves one node that can make a noise
+# and one that cannot, which is the whole question.
+#
+# And the hard part: NEEDSND.AXE is on A ONLY.  So the program moves and the
+# file does not - B has to read the image off A's card, over the same link it is
+# being told what to run on.  That is what made the far run need a task of its
+# own: served on the link's reader task, the reply carrying those bytes would be
+# delivered by the task blocked waiting for the program to finish, and both
+# nodes would stop dead with nothing in either log.
+
+if ($Scenario -eq 'link' -or $Scenario -eq 'both') {
+    Write-Host "`n== placed by what it needs ==" -ForegroundColor Cyan
+
+    Invoke-Pair -Tag 'place' `
+        -PutBoth @('build\apps\NODELINK.SYS=t:\nodelink.sys') `
+        -PutA @('build\apps\NEEDSND.AXE=t:\needsnd.axe') `
+        -PutB @('build\apps\PCMVIRT.SYS=t:\pcmvirt.sys') `
+        -SendB @('drv load t:\pcmvirt.sys',
+                 'drv load t:\nodelink.sys',
+                 'link use node0',
+                 "link poll $(($SendDelaySec + 120) * 1000)",
+                 '=link on node0') `
+        -SendA @('drv load t:\nodelink.sys',
+                 'link use node0',
+                 "!powershell -NoProfile -Command Start-Sleep -Seconds $SendDelaySec",
+                 # Proof that THIS node cannot: the same refusal the loader
+                 # gives, from the node that is about to hand the job over.
+                 'dev',
+                 'run t:\needsnd.axe',
+                 '=ran on a node with sound')
+
+    $a = Transcript 'build\nodetest-place-a.log'
+    $b = Transcript 'build\nodetest-place-b.log'
+
+    Check $b 'PCMVIRT' 'place-far-node-has-a-sink'
+
+    # The decision, said out loud.  A shell that moves work silently is a shell
+    # nobody can debug.
+    Check $a 'needs audio; running it on node0' 'place-needs-decided-here'
+
+    # And it really ran there - the line can have come from nowhere else, since
+    # this node has no sound and would have refused to start it.
+    Check $a 'ran on a node with sound' 'place-ran-on-the-node-that-can'
+
+    # The far kernel's own loader line, for an image that is not on its card.
+    #
+    # In A's transcript, not B's, and that is not a mistake to tidy up: while a
+    # node runs a guest program its console is redirected into the wire, so the
+    # far KERNEL's log arrives here too.  That makes it the sharpest evidence
+    # available - this node has no NEEDSND to load and no loader line of its own
+    # to confuse it with, so the line can only have been written over there.
+    Check $a 'loader: NEEDSND' 'place-far-kernel-loaded-it-over-the-link'
 }
 
 # ------------------------------------------------- unloading, on one node ---

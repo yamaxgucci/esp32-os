@@ -64,6 +64,7 @@
 #include <argon/linkprov.h>
 #include <argon/nodeproc.h>
 #include <argon/nodedev.h>
+#include <argon/nodedrv.h>
 
 #include "shell/cmd_link.h"
 #include "shell/cmd_net.h"
@@ -1164,6 +1165,63 @@ static int cmd_run(int argc, char **argv)
         print_load_error(argv[first], rerr);
         return 1;
     }
+    /*
+     * The file is here.  The other half of placement: can this node do what the
+     * program says it needs, and if not, can the neighbour?
+     *
+     * The program moves and the FILE DOES NOT, which is the whole difficulty
+     * and the reason this waited for a filesystem over the wire: the far node
+     * has to read an image off this node's card.  It does that through its own
+     * view of us - `/node` there is this node's root - so the path sent over is
+     * the local one with that prefix.
+     */
+    if (!detach_only && ag_linkprov_bound()) {
+        ag_axe_header_t h;
+        if (ag_loader_peek(resolved, NULL, &h) == AG_OK) {
+            const uint32_t unmet = ag_proc_unmet_needs(h.flags);
+            if (unmet != 0) {
+                const int32_t there = ag_nodedev_can(h.flags, 8000u);
+                if (there == 1) {
+                    char line[AG_PATH_MAX + 64];
+                    int  at = snprintf(line, sizeof(line), "%s%s",
+                                       AG_NODEDRV_MOUNT, resolved);
+                    for (int i = first + 1; i < argc && at > 0; i++) {
+                        at += snprintf(line + at, sizeof(line) - (size_t)at,
+                                       " %s", argv[i]);
+                    }
+                    if (at > 0 && (size_t)at < sizeof(line)) {
+                        ag_console_printf(
+                            "needs %s; running it on %s\n",
+                            ((unmet & AG_AXE_NEEDS_GFX) != 0)   ? "a display"
+                            : ((unmet & AG_AXE_NEEDS_NET) != 0) ? "networking"
+                                                                : "audio",
+                            ag_linkprov_active());
+                        int32_t        code = 0;
+                        const ag_err_t err = ag_nodeproc_run(line, 120000u,
+                                                             &code);
+                        if (err == AG_OK) {
+                            if (code < 0) {
+                                ag_console_printf(
+                                    "did not run there either: %d\n",
+                                    (int)code);
+                                return 1;
+                            }
+                            return (code == 0) ? 0 : 1;
+                        }
+                        ag_console_printf("  (the other node: %d)\n",
+                                          (int)err);
+                    }
+                }
+                /*
+                 * A neighbour that said no, or did not answer, changes nothing:
+                 * start it here and let the loader give its own clear refusal.
+                 * Guessing on its behalf would replace one true message with a
+                 * different one.
+                 */
+            }
+        }
+    }
+
     argv[first] = resolved;
     return launch_resolved(resolved, argc - first, &argv[first], detach_only);
 }

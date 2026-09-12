@@ -33,6 +33,39 @@
 #include "fs/storage.h"
 #include "proc/supervisor.h"
 
+/*
+ * Which of a program's declared needs THIS node cannot meet.
+ *
+ * Lives here, alone, because three different questions are the same question:
+ * the loader refusing to start something, another node being asked whether it
+ * could, and the shell deciding which node should get it.  Three copies of
+ * these tests would agree on the day they were written and disagree later, and
+ * the way that failure shows up is a program sent to a board that then refuses
+ * it - which reads as a broken cluster, not as a stale test.
+ *
+ * A device LISTING cannot replace this.  Every node has a sound device, because
+ * pcmnull is one; only `present()` distinguishes a board that can make a noise
+ * from a board that will swallow it.
+ */
+uint32_t ag_proc_unmet_needs(uint32_t axe_flags)
+{
+    uint32_t unmet = 0;
+
+    if ((axe_flags & AG_AXE_NEEDS_GFX) != 0 && !ag_display_ready()) {
+        unmet |= AG_AXE_NEEDS_GFX;
+    }
+    if ((axe_flags & AG_AXE_NEEDS_NET) != 0 && ag_loader_api()->net == NULL) {
+        unmet |= AG_AXE_NEEDS_NET;
+    }
+    if ((axe_flags & AG_AXE_NEEDS_AUDIO) != 0 &&
+        (ag_loader_api()->audio == NULL ||
+         ag_loader_api()->audio->present == NULL ||
+         !ag_loader_api()->audio->present())) {
+        unmet |= AG_AXE_NEEDS_AUDIO;
+    }
+    return unmet;
+}
+
 /* Stack, in bytes, and the arena an application allocates from. */
 #define AG_PROC_STACK_MIN (2u * 1024u)
 #define AG_PROC_STACK_MAX (64u * 1024u)
@@ -681,22 +714,22 @@ static ag_err_t proc_finish_load(proc_t *p)
         ag_loader_unload(&p->app);
         return -AG_EINVAL;
     }
-    if ((p->app.header.flags & AG_AXE_NEEDS_GFX) != 0 && !ag_display_ready()) {
-        ag_log(AG_LOG_ERROR, "proc", "%s: needs a display", p->path);
-        ag_loader_unload(&p->app);
-        return -AG_ENODEV;
-    }
-    if ((p->app.header.flags & AG_AXE_NEEDS_NET) != 0 &&
-        ag_loader_api()->net == NULL) {
-        ag_log(AG_LOG_ERROR, "proc", "%s: needs networking", p->path);
-        ag_loader_unload(&p->app);
-        return -AG_ENODEV;
-    }
-    if ((p->app.header.flags & AG_AXE_NEEDS_AUDIO) != 0 &&
-        (ag_loader_api()->audio == NULL ||
-         ag_loader_api()->audio->present == NULL ||
-         !ag_loader_api()->audio->present())) {
-        ag_log(AG_LOG_ERROR, "proc", "%s: needs audio", p->path);
+    /*
+     * One test, asked once, so that the answer here and the answer another node
+     * gives about itself cannot drift apart.  The messages stay separate - the
+     * test is what must not be copied, not the wording.
+     */
+    const uint32_t unmet = ag_proc_unmet_needs(p->app.header.flags);
+    if (unmet != 0) {
+        const char *what = "something it needs";
+        if ((unmet & AG_AXE_NEEDS_GFX) != 0) {
+            what = "a display";
+        } else if ((unmet & AG_AXE_NEEDS_NET) != 0) {
+            what = "networking";
+        } else if ((unmet & AG_AXE_NEEDS_AUDIO) != 0) {
+            what = "audio";
+        }
+        ag_log(AG_LOG_ERROR, "proc", "%s: needs %s", p->path, what);
         ag_loader_unload(&p->app);
         return -AG_ENODEV;
     }

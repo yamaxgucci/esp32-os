@@ -42,4 +42,20 @@ ag_err_t ag_nodedev_start(void);
  */
 int32_t ag_nodedev_list(ag_devinfo_t *out, uint32_t max, uint32_t timeout_ms);
 
+/*
+ * "Could you run a program that needs this?"  `axe_flags` is a .AXE flags word;
+ * returns 1 for yes, 0 for no, or a negative error.
+ *
+ * Separate from the listing on purpose.  A listing cannot answer it: every node
+ * has a sound device, because pcmnull is one, so a board that can make no noise
+ * at all still lists an AG_DEV_AUDIO row.  This makes the far node apply the
+ * same test its own loader would, which is the only test whose answer matches
+ * what would actually happen there.
+ *
+ * -AG_ETIMEDOUT is not "no".  A node that did not answer and a node that
+ * answered no mean different things: the first is a broken wire, the second is
+ * a reason to place the program somewhere else.
+ */
+int32_t ag_nodedev_can(uint32_t axe_flags, uint32_t timeout_ms);
+
 #endif /* ARGON_NODEDEV_H */

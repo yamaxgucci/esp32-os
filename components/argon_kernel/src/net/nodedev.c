@@ -10,6 +10,7 @@
 #include <argon/device.h>
 #include <argon/linkprov.h>
 #include <argon/log.h>
+#include <argon/proc.h>
 
 #include <argon/port/task.h>
 #include <argon/port/time.h>
@@ -21,6 +22,20 @@ enum {
     ND_OP_LIST = 1, /* "what have you got"                     */
     ND_OP_SOME = 2, /* some of the answer; more may follow     */
     ND_OP_END = 3,  /* that was all of it                      */
+    /*
+     * "Could you run a program that needs this?"  Payload is a .AXE flags word;
+     * the answer is yes or no.
+     *
+     * A separate question from the listing, and it has to be, because a listing
+     * cannot answer it truthfully.  Every node has a sound device - pcmnull, the
+     * mute one - so a node with no sound at all still lists an AG_DEV_AUDIO row,
+     * and deciding from the list would send a program that needs sound to a
+     * board that will refuse it.  Asking lets the far node apply the SAME test
+     * the loader there would apply, which is the only test whose answer matches
+     * what will actually happen.
+     */
+    ND_OP_CAN = 4,
+    ND_OP_CAN_IS = 5, /* status in the first payload byte: 1 yes, 0 no */
 };
 
 /*
@@ -48,6 +63,11 @@ static uint32_t      s_out_max;
 static volatile uint32_t s_out_n;
 static volatile bool     s_done;
 static volatile bool     s_wanted;
+
+/* The capability question in flight.  One at a time; it is a single yes or no. */
+static volatile bool s_can_wanted;
+static volatile bool s_can_have;
+static volatile bool s_can_yes;
 
 static void put_rec(uint8_t *p, const ag_devinfo_t *info)
 {
@@ -123,6 +143,20 @@ static void serve_list(void)
     (void)send_msg(ND_OP_END, NULL, 0);
 }
 
+/*
+ * Answer "could you run a program that needs this?" with the SAME test the
+ * loader here would apply.  Not a guess from the device list - see ND_OP_CAN.
+ */
+static void serve_can(const uint8_t *payload, uint16_t len)
+{
+    uint32_t flags = 0;
+    for (uint16_t i = 0; i < 4u && i < len; i++) {
+        flags |= (uint32_t)payload[i] << (8u * i);
+    }
+    const uint8_t yes = (ag_proc_unmet_needs(flags) == 0) ? 1u : 0u;
+    (void)send_msg(ND_OP_CAN_IS, &yes, 1u);
+}
+
 static void on_msg(uint8_t chan, const void *data, uint16_t n, void *ctx)
 {
     (void)chan;
@@ -155,6 +189,15 @@ static void on_msg(uint8_t chan, const void *data, uint16_t n, void *ctx)
         break;
     case ND_OP_END:
         s_done = true;
+        break;
+    case ND_OP_CAN:
+        serve_can(buf + ND_HDR, len);
+        break;
+    case ND_OP_CAN_IS:
+        if (s_can_wanted && len >= 1u) {
+            s_can_yes = (buf[ND_HDR] != 0u);
+            s_can_have = true;
+        }
         break;
     default:
         break;
@@ -216,4 +259,52 @@ int32_t ag_nodedev_list(ag_devinfo_t *out, uint32_t max, uint32_t timeout_ms)
     }
     s_wanted = false;
     return (int32_t)s_out_n;
+}
+
+int32_t ag_nodedev_can(uint32_t axe_flags, uint32_t timeout_ms)
+{
+    if (!ag_linkprov_bound()) {
+        return -AG_ENODEV;
+    }
+    if (!s_listening) {
+        const ag_err_t e = ag_nodedev_start();
+        if (e != AG_OK) {
+            return (int32_t)e;
+        }
+    }
+    /* The answer arrives on the reader task; asking from it waits for itself. */
+    if (ag_linkprov_in_reader()) {
+        return -AG_EBUSY;
+    }
+
+    uint8_t pay[4];
+    for (uint32_t i = 0; i < 4u; i++) {
+        pay[i] = (uint8_t)((axe_flags >> (8u * i)) & 0xffu);
+    }
+
+    s_can_have = false;
+    s_can_yes = false;
+    s_can_wanted = true;
+
+    const ag_err_t err = send_msg(ND_OP_CAN, pay, sizeof(pay));
+    if (err != AG_OK) {
+        s_can_wanted = false;
+        return (int32_t)err;
+    }
+
+    const int64_t deadline = ag_port_us() + (int64_t)timeout_ms * 1000;
+    while (!s_can_have) {
+        if (ag_port_us() >= deadline) {
+            s_can_wanted = false;
+            /*
+             * A node that did not answer is not a node that said no: the
+             * difference matters, because "no" means place it elsewhere and
+             * this means the wire is not working.
+             */
+            return -AG_ETIMEDOUT;
+        }
+        ag_port_task_delay(ag_port_ms_to_ticks(5));
+    }
+    s_can_wanted = false;
+    return s_can_yes ? 1 : 0;
 }

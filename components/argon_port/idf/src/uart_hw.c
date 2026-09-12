@@ -246,6 +246,21 @@ ag_err_t ag_port_uart_close(int port)
     if (!uart_is_driver_installed(port)) {
         return AG_OK; /* closing what is not open is not an error */
     }
+    /*
+     * Let what was accepted actually leave before the driver goes.
+     *
+     * A write returns once the bytes are in the transmit ring, not once they
+     * are on the wire, and uart_driver_delete throws that ring away - so a
+     * program that writes and exits loses its own tail, silently, having been
+     * told the bytes were taken.  Measured: the wire test reported a receiver
+     * short by a few dozen random bytes with zero corrupt and zero lost, which
+     * reads as a lossy line and was nothing of the sort.
+     *
+     * Bounded, because a port whose far end is not reading must not make
+     * closing it hang; a tail that cannot leave in a second is a tail that is
+     * not going to.
+     */
+    (void)uart_wait_tx_done(port, pdMS_TO_TICKS(1000));
     return from_esp(uart_driver_delete(port));
 }
 

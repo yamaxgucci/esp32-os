@@ -12,6 +12,7 @@
 #include <argon/linkprov.h>
 #include <argon/log.h>
 #include <argon/path.h>
+#include <argon/nodedrv.h>
 #include <argon/proc.h>
 
 #include <argon/port/task.h>
@@ -136,30 +137,53 @@ static int32_t out_sink(void *ctx, const char *data, size_t len)
     return (int32_t)len;
 }
 
-static void serve_run(const uint8_t *payload, uint16_t len)
+/*
+ * The command line being served, and the task serving it.
+ *
+ * A task of its own, and this is the one thing in this file that MUST NOT be
+ * simplified back: running the program on the link's reader task works only for
+ * as long as the program needs nothing from the link.  The moment it reads its
+ * own image off the asking node's card - which is what placement by manifest
+ * asks for, since the program moves and the file does not - the reply carrying
+ * those bytes is delivered by the very task that is blocked waiting for the
+ * program to finish.  Nothing times out and nothing crashes; both nodes simply
+ * stop, which is the worst shape a bug can have.
+ */
+static char           s_run_line[AG_PATH_MAX + 64];
+static ag_port_task_t s_run_task;
+
+static void run_task(void *arg)
 {
-    char line[AG_PATH_MAX + 64];
+    (void)arg;
     char *argv[16];
 
-    if (s_serving_run) {
-        (void)send_msg(NP_OP_BUSY, 0, NULL, 0);
-        return;
+    /*
+     * A path under the remote-drive mountpoint means "it is on YOUR card", so
+     * mount the asker before looking for it.  Doing it here rather than
+     * requiring somebody to have typed `link mount` first is the difference
+     * between placement that works and placement that works if you remembered.
+     * Already mounted is not an error.
+     */
+    if (strncmp(s_run_line, AG_NODEDRV_MOUNT "/",
+                sizeof(AG_NODEDRV_MOUNT)) == 0) {
+        const ag_err_t m = ag_nodedrv_mount(AG_NODEDRV_MOUNT);
+        if (m != AG_OK && m != -AG_EEXIST) {
+            (void)send_msg(NP_OP_EXIT, (int32_t)m, NULL, 0);
+            s_serving_run = false;
+            ag_port_task_delete(NULL);
+            return;
+        }
     }
-    if (len == 0 || len >= sizeof(line)) {
-        (void)send_msg(NP_OP_EXIT, -AG_EINVAL, NULL, 0);
-        return;
-    }
-    memcpy(line, payload, len);
-    line[len] = '\0';
 
-    const int argc = ag_cmdline_split(line, argv, (int)(sizeof(argv) /
-                                                        sizeof(argv[0])));
+    const int argc = ag_cmdline_split(s_run_line, argv,
+                                      (int)(sizeof(argv) / sizeof(argv[0])));
     if (argc <= 0) {
         (void)send_msg(NP_OP_EXIT, -AG_EINVAL, NULL, 0);
+        s_serving_run = false;
+        ag_port_task_delete(NULL);
         return;
     }
 
-    s_serving_run = true;
     /*
      * The same redirection the shell uses for `dir > file.txt`, pointed at the
      * wire instead of a file.  The console does not know what the sink is,
@@ -169,7 +193,6 @@ static void serve_run(const uint8_t *payload, uint16_t len)
     int32_t        code = 0;
     const ag_err_t err = ag_proc_exec(argv[0], argc, argv, 0, &code);
     ag_console_redirect(NULL, NULL);
-    s_serving_run = false;
 
     /*
      * A program that never started and a program that returned a number are
@@ -179,6 +202,34 @@ static void serve_run(const uint8_t *payload, uint16_t len)
      * of lie a script would act on.
      */
     (void)send_msg(NP_OP_EXIT, (err != AG_OK) ? (int32_t)err : code, NULL, 0);
+    s_serving_run = false;
+    ag_port_task_delete(NULL);
+}
+
+static void serve_run(const uint8_t *payload, uint16_t len)
+{
+    if (s_serving_run) {
+        (void)send_msg(NP_OP_BUSY, 0, NULL, 0);
+        return;
+    }
+    if (len == 0 || len >= sizeof(s_run_line)) {
+        (void)send_msg(NP_OP_EXIT, -AG_EINVAL, NULL, 0);
+        return;
+    }
+    memcpy(s_run_line, payload, len);
+    s_run_line[len] = '\0';
+
+    s_serving_run = true;
+    /*
+     * Below applications, deliberately.  A node running a guest program must
+     * not be a node that stops answering its own user - and the wire's own
+     * driver task is below applications for the same reason.
+     */
+    if (!ag_port_task_create(run_task, "noderun", 6144, NULL, 1,
+                             AG_PORT_ANY_CORE, 0, &s_run_task)) {
+        s_serving_run = false;
+        (void)send_msg(NP_OP_EXIT, -AG_ENOMEM, NULL, 0);
+    }
 }
 
 /*
@@ -186,11 +237,11 @@ static void serve_run(const uint8_t *payload, uint16_t len)
  * which is the only thing that reads - see argon/linkprov.h for why there is
  * exactly one.
  *
- * serve_run blocks here for as long as the far program takes, and that is
- * deliberate rather than overlooked: while this node is running somebody
- * else's program it is the SERVER, and a server has nothing else on this link
- * to hear.  The driver's own service task keeps the wire itself moving, so
- * acknowledgements still flow while a program runs.
+ * serve_run must NOT block here, and the reason is worth keeping: a guest
+ * program may read its own image off the ASKING node's card, over this same
+ * link, and the reply carrying those bytes is delivered by this task.  Blocking
+ * here while that program runs deadlocks both nodes silently.  So serve_run
+ * hands the command line to a task of its own and returns at once.
  */
 static void on_msg(uint8_t chan, const void *data, uint16_t n, void *ctx)
 {

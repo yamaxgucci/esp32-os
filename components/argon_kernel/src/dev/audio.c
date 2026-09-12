@@ -137,9 +137,46 @@ static const ag_dev_ops_t k_pcm_ops = {
     .ioctl = pcm_ioctl,
 };
 
+/*
+ * Is there anywhere for sound to GO on this machine?
+ *
+ * Not "is there an audio device": there always is.  pcmnull is registered on
+ * every board, so asking that answered yes on a machine with no converter and
+ * no pins to drive one - which made AG_AXE_NEEDS_AUDIO, whose whole job is to
+ * refuse such a program with a reason, never refuse anything.  A program that
+ * needs sound would start, play into the null device and be silent, and silence
+ * is the one symptom that says nothing about its cause.
+ *
+ * The registry already holds the truth.  ag_pcmhw_init registers pcm0 only when
+ * the board describes an output and the port confirms one - "no output on this
+ * machine; pcmnull stands alone" - and a loaded .SYS registers whatever it
+ * drives.  So an audio device that is a SINK is the answer.
+ *
+ * Two of this class are not sinks, and both are registered by this kernel a few
+ * lines from here, so naming them is not guesswork about hardware: "null" is
+ * the one that swallows sound, and "mix" is a router whose own output is one of
+ * the other three.  Counting either would put the bug straight back.
+ */
+static bool is_a_sink(const char *driver)
+{
+    return strcmp(driver, "null") != 0 && strcmp(driver, "mix") != 0;
+}
+
 static int audio_present(void)
 {
-    return s_dev != NULL ? 1 : 0;
+    if (s_dev == NULL) {
+        return 0;
+    }
+    for (uint32_t i = 0;; i++) {
+        ag_devinfo_t info;
+        if (ag_dev_info(i, AG_DEV_AUDIO, &info) != AG_OK) {
+            break;
+        }
+        if (is_a_sink(info.driver)) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 static int audio_is_hw(void)
