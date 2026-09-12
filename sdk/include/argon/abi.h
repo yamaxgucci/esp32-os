@@ -77,6 +77,11 @@ extern "C" {
  * 0.28 defined ag_input_ops_t: an AG_DEV_INPUT driver the kernel polls for
  *      events, for hardware that has to be asked rather than interrupting.
  * 0.29 appended io->spi_config: the clock for one chip on a shared bus.
+ * 0.44 appended units / span_w / span_h to ag_input_ops_t: an input driver
+ *      that measures in pixels rather than console cells says so, and the
+ *      kernel scales its span to the surface instead of multiplying a cell.
+ *      A touchscreen under a graphical shell loses eight pixels in nine
+ *      otherwise, and has to agree with the kernel about whose grid it is.
  * 0.30 appended blit_rect to ag_display_ops_t: a rectangle of pixels the
  *      kernel owns, for a panel whose glass is larger than any framebuffer
  *      the machine driving it can afford.
@@ -144,10 +149,7 @@ extern "C" {
  *      changed is that a pointer is a position on a surface and is now reported
  *      as one.  A terminal has no pixels of its own, so the kernel scales its
  *      column and row by the cell size on the way in.
- * 0.43-0.45 are held by the USB-device work (usbhid0, usbcdc0, and the
- *      endpoint budget that removed the relative mouse); they land here
- *      when that branch does.
- * 0.46 ag_net_ops_t: the class vtable for an AG_DEV_NET device, and the first
+ * 0.43 ag_net_ops_t: the class vtable for an AG_DEV_NET device, and the first
  *      time dev->ops() means anything for a class other than a display.  A .SYS
  *      that speaks to an external radio coprocessor (Wi-Fi, GSM/LTE...) over a
  *      wire publishes it, and the kernel routes its whole socket path through
@@ -156,23 +158,18 @@ extern "C" {
  *      chip on a bus like any other .SYS.  One provider is active at a time; the
  *      built-in stack is the default.  Append-only: nothing an existing image
  *      calls has moved.
- * 0.47 ag_net_ops_t grew a station half - wifi_start/stop/scan/connect/
- *      disconnect/status - so that a radio at the far end of a wire answers
- *      `wifi scan` and `wifi connect` too, not only sockets.  Without it the
- *      operator has to know which board holds the radio, which is exactly what
- *      an external radio is for avoiding.  The six are NULL on a provider that
- *      is not a Wi-Fi radio; probe with AG_HAS.  api->wifi consequently changed
- *      meaning: it is no longer NULL merely because the image has no built-in
- *      radio, because a build that can BIND one could grow a radio at any
- *      moment and the table is const, in flash, and cannot follow.  It now
- *      means "this system could reach a radio", and station calls answer
- *      -AG_ENODEV while none is there.  An application that wants the old
- *      answer calls wifi->status() and reads that code - which it needed to do
- *      anyway, since a radio switched off looked identical from a table of
- *      pointers.  The access-point and ESP-NOW halves are unchanged and still
- *      require this chip's own radio; RLINK carries the station half and no
- *      more.  AG_WIFI_SSID_MAX and friends moved up the header to sit above
- *      both users; nothing about them changed.
+ * 0.47 the two lines above, merged.  0.43's ag_net_ops_t came off the radio
+ *      line and 0.44-0.46 - input units, another slot's screen and its
+ *      cursor, a prompt in a slot of its own - off the desktop line, and
+ *      each line had bumped this number for itself while the other was
+ *      being written.  An image built from this carries all of them, so it
+ *      needs a number larger than either, and that is all 0.47 means.
+ *
+ *      The numbers were handed out in parallel and some are spoken for
+ *      twice: worktree-cluster calls its own additions 0.47 and
+ *      worktree-usb-kvm calls its 0.45.  Whichever of those lands next has
+ *      to RENUMBER rather than assume its number is free - and the check is
+ *      one line: `git show <branch>:sdk/include/argon/abi.h | grep MINOR`.
  */
 #define AG_ABI_MAJOR 0u
 #define AG_ABI_MINOR 47u
@@ -285,6 +282,21 @@ typedef struct ag_sys_api {
      * sockets, etc.) before the image is unmapped on drv unload/replace.
      */
     void (*module_on_unload)(void (*fn)(void));
+
+    /*
+     * ABI 0.45: give a session slot a shell of its own, and say which slot
+     * got it.
+     *
+     * For a desktop that wants a prompt in a window.  `slot` below zero
+     * means any free one, which is what a window asking for a prompt
+     * actually wants - it has no business choosing a slot number, and
+     * nothing else in the ABI lets it enumerate them.  `cwd` may be NULL
+     * for the root.
+     *
+     * Returns the slot, or a negative error: -AG_ENOSPC when every slot
+     * already has something in it.
+     */
+    int32_t (*prompt_in_slot)(int slot, const char *cwd);
 } ag_sys_api_t;
 
 /* ------------------------------------------------------------------------ */
@@ -430,6 +442,17 @@ enum ag_color {
     AG_LRED, AG_LMAGENTA, AG_YELLOW, AG_WHITE,
 };
 
+/*
+ * One cell of a text screen: the byte and its CGA attribute.
+ *
+ * Declared here rather than beside the display vtable that first needed it,
+ * because the console reads its own screen back into these too (peek_row).
+ */
+typedef struct {
+    uint8_t ch;
+    uint8_t attr;
+} ag_textcell_t;
+
 /* Attribute byte, CGA-compatible layout: bg << 4 | fg. */
 #define AG_ATTR(fg, bg) ((uint8_t)(((bg) << 4) | ((fg) & 0x0f)))
 
@@ -494,6 +517,56 @@ typedef struct ag_con_api {
      */
     uint16_t (*codepage)(void);
     ag_err_t (*set_codepage)(uint16_t number);
+
+    /*
+     * Read the screen back, one row at a time (ABI 0.43).
+     *
+     * The console draws itself, on whatever it has: a framebuffer, a panel's
+     * text cells, a serial terminal.  An application that wants to show the
+     * console inside a window of its own - a desktop shell with a console
+     * window in it - cannot use any of those; it needs the cells.
+     *
+     * A row rather than the whole screen, because the caller decides what to
+     * keep: eighty cells is a hundred and sixty bytes, where a screen is two
+     * kilobytes that a caller redrawing one changed line would throw away.
+     *
+     * Returns the number of cells written (never more than `max` or the
+     * screen's width), or a negative error.  Refused for a process that is not
+     * the console's - the same rule ag_poke follows, and for the same reason:
+     * the console belongs to the foreground.
+     */
+    int32_t (*peek_row)(uint16_t row, ag_textcell_t *cells, uint16_t max);
+
+    /*
+     * The same, from the screen of a session slot that is not this one.
+     *
+     * For a window showing somebody else's prompt.  A slot with a shell of
+     * its own (`prompt 2`) has a screen of its own, and that screen is
+     * nowhere on the glass while a desktop is in front - reading it is the
+     * only way to draw it.
+     *
+     * Slots are numbered from zero here, as they are everywhere inside the
+     * system; the shell writes them from one because that is what the
+     * Alt+digit on the keyboard says.
+     */
+    /* ABI 0.45. */
+    int32_t (*peek_row_slot)(int slot, uint16_t row, ag_textcell_t *cells,
+                             uint16_t max);
+
+    /*
+     * Where that screen's cursor is.
+     *
+     * A window drawing somebody else's prompt has no way to ask: coninfo
+     * answers about the CALLER's console, so a window that drew a caret from
+     * it would be drawing its own cursor on another screen's text - and one
+     * that drew none, as this did first, shows a prompt with nothing
+     * blinking in it, which does not look like a prompt at all.
+     *
+     * Zero on success; the coordinates are cells.
+     */
+    /* ABI 0.46. */
+    int32_t (*cursor_of_slot)(int slot, uint16_t *x, uint16_t *y);
+
 } ag_con_api_t;
 
 /* ------------------------------------------------------------------------ */
@@ -602,6 +675,21 @@ typedef struct ag_inp_api {
      * Returns false if the queue is full or the event type is refused.
      */
     bool (*inject)(const ag_event_t *ev);
+
+    /*
+     * Hand an event to the prompt living in a session slot.
+     *
+     * There is one keyboard and it belongs to whoever is in front, so a
+     * prompt behind a window never reads a character on its own: the
+     * window in front reads them and passes them along.  That is the
+     * whole of how a shell can live in a window while a desktop holds
+     * the screen.
+     *
+     * False when that slot has no prompt of its own, or its queue is
+     * full.
+     */
+    /* ABI 0.45. */
+    bool (*post_to_slot)(int slot, const ag_event_t *ev);
 } ag_inp_api_t;
 
 /* ------------------------------------------------------------------------ */
@@ -798,27 +886,46 @@ typedef struct ag_gfx_api {
  * forever.  The events go into the same queue the terminal decoder feeds, so
  * nothing above can tell a finger from a mouse on the other end of a cable.
  *
- * Coordinates are console cells, like the terminal's mouse reports, because
- * what is on this kind of screen is the console.  A driver for a panel with a
- * framebuffer under it would want pixels; there is no such panel yet, and
- * inventing the second convention before there is something to point at is how
- * both end up wrong.
+ * Coordinates are console cells by default, like the terminal's mouse
+ * reports, because what is on that kind of screen is the console - and a
+ * driver written before ABI 0.44 says nothing about units, so cells is what
+ * silence means.
+ *
+ * There is now something to point at, which is why the other convention
+ * exists (0.44): the CYD runs a graphical shell on a panel with no system
+ * framebuffer, and a touch controller that reports cells throws away eight
+ * pixels in nine before anybody sees it.  Worse, the round trip has to agree
+ * with the kernel about which grid - the console's, not the panel's - and
+ * when it did not, the pointer sat below the stylus and the bottom of the
+ * glass could not be pressed at all.  A driver that measures in pixels says
+ * so and hands over pixels, and no grid is involved.
+ *
+ *   .units  AG_PTR_CELLS (0, and what an older driver means by saying
+ *           nothing) or AG_PTR_PIXELS.
+ *   .span_w Pixels across and down of whatever the driver measured against -
+ *   .span_h its own glass.  The kernel scales that to the surface, so a touch
+ *           panel and a screen of different sizes still agree.  Zero means
+ *           "the same as the surface", which is the usual case.
  */
 typedef struct ag_input_ops {
     uint32_t size;
     int32_t (*poll)(ag_handle_t h, ag_event_t *out, uint32_t max);
+    /* ABI 0.44 */
+    uint16_t units;
+    uint16_t span_w;
+    uint16_t span_h;
 } ag_input_ops_t;
+
+enum ag_ptr_units {
+    AG_PTR_CELLS = 0,
+    AG_PTR_PIXELS = 1,
+};
 
 /*
  * One cell of the text console: the byte on the screen and its colours, high
  * nibble background, low nibble foreground, as they have been since CGA.  What
  * the byte means is the code page's business (con->codepage).
  */
-typedef struct {
-    uint8_t ch;
-    uint8_t attr;
-} ag_textcell_t;
-
 /*
  * Class vtable for AG_DEV_DISPLAY devices, returned by dev->ops(h).
  * Compact subset of ag_gfx_api_t keyed by the open handle — for drivers that
@@ -1289,60 +1396,6 @@ typedef struct ag_cfg_api {
 } ag_cfg_api_t;
 
 /* ------------------------------------------------------------------------ */
-/* radio vocabulary - shared by the net provider class and the wifi API      */
-/* ------------------------------------------------------------------------ */
-/*
- * These sit above both users because both need them: ag_net_ops_t below
- * carries the station half of an external radio, and ag_wifi_api_t further
- * down is the same vocabulary as an application sees it.  They were declared
- * with the wifi API until ABI 0.47 gave a provider on a wire a station to
- * drive; nothing about them changed in the move.
- */
-
-#define AG_WIFI_SSID_MAX 32 /* an SSID is at most 32 bytes, not NUL-counted   */
-#define AG_WIFI_PASS_MAX 63 /* a WPA key is 8..63 characters                  */
-
-/* Security of a network, ag_wifi_ap_t.auth.  Ordered as the port orders it. */
-enum {
-    AG_WIFI_SEC_OPEN = 0,
-    AG_WIFI_SEC_WEP,
-    AG_WIFI_SEC_WPA,
-    AG_WIFI_SEC_WPA2,
-    AG_WIFI_SEC_WPA3,
-    AG_WIFI_SEC_ENTERPRISE,
-    AG_WIFI_SEC_OTHER,
-};
-
-/* Station link state, ag_wifi_status_t.state. */
-enum {
-    AG_WIFI_ST_OFF = 0,   /* radio not started                               */
-    AG_WIFI_ST_IDLE,      /* on, joined to nothing                           */
-    AG_WIFI_ST_JOINING,   /* association or DHCP in progress                 */
-    AG_WIFI_ST_JOINED,    /* associated; an address may still be coming      */
-};
-
-/* One network a scan found. */
-typedef struct {
-    char    ssid[AG_WIFI_SSID_MAX + 1];
-    uint8_t bssid[6];
-    int8_t  rssi;    /* dBm, negative                                        */
-    uint8_t channel;
-    uint8_t auth;    /* AG_WIFI_SEC_*                                         */
-} ag_wifi_ap_t;
-
-/* Where the station half stands.  The key is never reported. */
-typedef struct {
-    uint8_t  state;      /* AG_WIFI_ST_*                                     */
-    char     ssid[AG_WIFI_SSID_MAX + 1]; /* joined or being joined          */
-    uint8_t  bssid[6];   /* the access point actually joined, or zeros       */
-    bool     pinned;     /* this access point was asked for by name          */
-    int8_t   rssi;
-    uint8_t  channel;
-    uint32_t attempts;   /* association attempts since the last join         */
-    int32_t  last_reason;/* the port's own disconnect reason code            */
-} ag_wifi_status_t;
-
-/* ------------------------------------------------------------------------ */
 /* net - TCP sockets (OpenEth in QEMU today; Wi-Fi later on hardware)       */
 /* ------------------------------------------------------------------------ */
 
@@ -1384,7 +1437,7 @@ typedef struct ag_net_api {
 } ag_net_api_t;
 
 /*
- * Class vtable for an AG_DEV_NET device (ABI 0.46), read by the kernel's socket
+ * Class vtable for an AG_DEV_NET device (ABI 0.43), read by the kernel's socket
  * layer when `net use <dev>` binds this device as the active network provider.
  * A .SYS talking to an external radio coprocessor publishes it as class_ops in
  * ag_dev_add; it is not reached through dev->open/ops() by an application.
@@ -1428,34 +1481,6 @@ typedef struct ag_net_ops {
 
     int (*wait_readable)(ag_device_t *dev, int fd, uint32_t timeout_ms);
     int32_t (*recv_now)(ag_device_t *dev, int fd, void *buf, size_t len);
-
-    /*
-     * THE STATION HALF (ABI 0.47).  All six are NULL on a provider that is not
-     * a Wi-Fi radio - a GSM modem has sockets and no networks to list - so the
-     * kernel probes with AG_HAS before every call and reports no radio when
-     * they are absent.  A provider that fills them fills all six.
-     *
-     * Sockets alone do not make a remote radio indistinguishable from a local
-     * one.  `wifi scan` and `wifi connect` are how a person points at the air,
-     * and a board whose only radio is at the far end of a wire has to answer
-     * both, or the operator has to know which board is which - which is the
-     * whole thing this exists to avoid.
-     *
-     * The semantics are ag_wifi_api_t's, exactly, because that is what the
-     * kernel's own radio does and neither the shell nor an application may be
-     * able to tell which one answered: scan blocks a second or two and reports
-     * in `found` how many networks were SEEN, which may exceed the `max` it had
-     * room to return; connect returns when the attempt has been MADE, not when
-     * it has succeeded, and the caller polls status().
-     */
-    ag_err_t (*wifi_start)(ag_device_t *dev);
-    ag_err_t (*wifi_stop)(ag_device_t *dev);
-    ag_err_t (*wifi_scan)(ag_device_t *dev, ag_wifi_ap_t *out, uint32_t max,
-                          uint32_t *found);
-    ag_err_t (*wifi_connect)(ag_device_t *dev, const char *ssid,
-                             const char *pass, const uint8_t bssid[6]);
-    ag_err_t (*wifi_disconnect)(ag_device_t *dev);
-    ag_err_t (*wifi_status)(ag_device_t *dev, ag_wifi_status_t *out);
 } ag_net_ops_t;
 
 /* ------------------------------------------------------------------------ */
@@ -1925,9 +1950,52 @@ typedef struct ag_wifimon_api {
  * anything else yet.
  */
 
+#define AG_WIFI_SSID_MAX 32 /* an SSID is at most 32 bytes, not NUL-counted   */
+#define AG_WIFI_PASS_MAX 63 /* a WPA key is 8..63 characters                  */
+
+/* Security of a network, ag_wifi_ap_t.auth.  Ordered as the port orders it. */
+enum {
+    AG_WIFI_SEC_OPEN = 0,
+    AG_WIFI_SEC_WEP,
+    AG_WIFI_SEC_WPA,
+    AG_WIFI_SEC_WPA2,
+    AG_WIFI_SEC_WPA3,
+    AG_WIFI_SEC_ENTERPRISE,
+    AG_WIFI_SEC_OTHER,
+};
+
+/* Station link state, ag_wifi_status_t.state. */
+enum {
+    AG_WIFI_ST_OFF = 0,   /* radio not started                               */
+    AG_WIFI_ST_IDLE,      /* on, joined to nothing                           */
+    AG_WIFI_ST_JOINING,   /* association or DHCP in progress                 */
+    AG_WIFI_ST_JOINED,    /* associated; an address may still be coming      */
+};
+
 /* ESP-NOW limits, mirroring the port. */
 #define AG_WIFI_ESPNOW_MAX 250 /* one datagram's payload, bytes              */
 #define AG_WIFI_ESPNOW_KEY 16  /* an encryption key, exactly this many bytes */
+
+/* One network a scan found. */
+typedef struct {
+    char    ssid[AG_WIFI_SSID_MAX + 1];
+    uint8_t bssid[6];
+    int8_t  rssi;    /* dBm, negative                                        */
+    uint8_t channel;
+    uint8_t auth;    /* AG_WIFI_SEC_*                                         */
+} ag_wifi_ap_t;
+
+/* Where the station half stands.  The key is never reported. */
+typedef struct {
+    uint8_t  state;      /* AG_WIFI_ST_*                                     */
+    char     ssid[AG_WIFI_SSID_MAX + 1]; /* joined or being joined          */
+    uint8_t  bssid[6];   /* the access point actually joined, or zeros       */
+    bool     pinned;     /* this access point was asked for by name          */
+    int8_t   rssi;
+    uint8_t  channel;
+    uint32_t attempts;   /* association attempts since the last join         */
+    int32_t  last_reason;/* the port's own disconnect reason code            */
+} ag_wifi_status_t;
 
 /* What the access-point half is offering, when one is up. */
 typedef struct {

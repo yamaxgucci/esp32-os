@@ -548,9 +548,17 @@ menu "ArgonOS"
             forty by thirty, and a console wider than the only screen attached
             to the machine is one whose right-hand half nobody ever sees.
 
-            Not a runtime setting, and not in BOARD.CFG: the console is built
-            three stages before any file has been read, and everything printed
-            during those stages would be lost by rebuilding it afterwards.
+            This is the size the console STARTS at, not the size it keeps.
+            It is a build option because the console is built three stages
+            before any file has been read, and everything printed during those
+            stages would be lost by rebuilding it afterwards.
+
+            What a flashed board changes is `[console] cols/rows` in
+            SYSTEM.CFG, applied once the devices are up; `auto` there takes
+            the size from the panel that is actually attached.  `mode con
+            cols=40 lines=25` at the prompt tries a size without a reset.
+            So leave this at 80x25 unless the board's built-in screen is the
+            only one it will ever have.
 
     config ARGON_ENABLE_HOSTFS
         bool "HostFS (H:, live host folder over UART1)"

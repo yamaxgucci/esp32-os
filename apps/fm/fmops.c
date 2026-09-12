@@ -11,6 +11,8 @@
 #include "fm.h"
 #include "fm_ui.h"
 
+#include "../common/fsops/fsops.h"
+
 #ifdef AG_BUILTIN
 int ag_edit_main(int argc, char **argv);
 #endif
@@ -397,7 +399,9 @@ static void absorb_copy_interrupt(void)
 }
 
 /* Modal progress over the panels: title, bar, percent / KB — no spinner. */
-static void copy_progress(const char *label, uint64_t done, uint64_t total)
+static void copy_progress(const char *verb, const char *label, uint64_t done,
+                          uint64_t total, uint32_t files_done,
+                          uint32_t files_total)
 {
     /* Background slot: keep copying, do not paint over the focused app. */
     if (!ag_focused()) {
@@ -430,10 +434,28 @@ static void copy_progress(const char *label, uint64_t done, uint64_t total)
     fm_ui_fill(x, y, w, h, ' ', FM_ATTR_DIALOG);
     fm_frame(x, y, w, h, FM_ATTR_DIALOG);
 
-    ag_strlcpy(title, "Copying ", sizeof(title));
+    ag_strlcpy(title, verb, sizeof(title));
+    ag_strlcat(title, " ", sizeof(title));
     ag_strlcat(title, (label != NULL) ? label : "file", sizeof(title));
     ag_strlcat(title, "...", sizeof(title));
     fm_put_clipped(x + 2, y + 1, inner, title, FM_ATTR_DIALOG);
+
+    /*
+     * How many files, on the line above the bar, and only when there is more
+     * than one.  A tree copy otherwise shows a bar that fills and empties
+     * repeatedly with nothing saying how much of the whole is left.
+     */
+    if (files_total > 1u) {
+        char count[FM_LINE_MAX];
+        ag_strlcpy(count, "file ", sizeof(count));
+        ag_strlcat(count, ag_utoa(files_done + 1u, number, sizeof(number), 0,
+                                  false), sizeof(count));
+        ag_strlcat(count, " of ", sizeof(count));
+        ag_strlcat(count,
+                   ag_utoa(files_total, number, sizeof(number), 0, false),
+                   sizeof(count));
+        fm_put_clipped(x + 2, y + 2, inner, count, FM_ATTR_DIALOG);
+    }
 
     uint32_t filled = 0;
     uint32_t pct = 0;
@@ -489,92 +511,120 @@ static void copy_progress(const char *label, uint64_t done, uint64_t total)
     ag_yield();
 }
 
-/* Copies one file, reporting as it goes.  The error is returned, not printed:
- * the caller knows which of the two names to put in front of it. */
-static ag_err_t copy_file(const char *from, const char *to, const char *label,
-                          uint64_t total)
+/*
+ * The bridge to apps/common/fsops: what the shared walk calls to say where it
+ * is, and what tells it to stop.
+ *
+ * Everything about copying that is not the screen lives there now, shared with
+ * the desktop shell - which is the point: two managers with two answers to
+ * "the disk filled halfway through" is two behaviours, and the half-written
+ * file is the one nobody notices until later.
+ */
+typedef struct {
+    const char *verb;      /* "Copying", "Deleting", "Counting" */
+    uint32_t    last_ui_ms;
+} fm_op_t;
+
+/* The last component, because a full path does not fit the dialog and the
+ * name is the part that says what is happening. */
+static const char *base_name(const char *path)
 {
-    /* HostFS readdir does not fill sizes; ask again so the bar can show %. */
-    if (total == 0) {
-        ag_stat_t st;
-        if (ag_stat(from, &st) == AG_OK && (st.attr & AG_A_DIR) == 0) {
-            total = st.size;
+    const char *at = path;
+    for (const char *p = path; *p != '\0'; p++) {
+        if (*p == '/' || *p == '\\') {
+            at = p + 1;
         }
     }
+    return at;
+}
 
-    const ag_handle_t src = ag_open(from, AG_O_RDONLY);
-    if (src < 0) {
-        return src;
+static bool fm_op_tick(void *ctx, const fsops_progress_t *p)
+{
+    fm_op_t *op = (fm_op_t *)ctx;
+
+    if (copy_cancelled()) {
+        return false;
     }
 
-    const ag_handle_t dst = ag_open(to, AG_O_WRONLY | AG_O_CREATE | AG_O_TRUNC);
-    if (dst < 0) {
-        (void)ag_close(src);
-        return dst;
+    /*
+     * The dialog is rate limited and the cancel check above is not: a copy off
+     * a RAM disk would otherwise spend its time redrawing, and Ctrl+C has to
+     * be noticed on the tick it arrives, not half a second later.
+     */
+    const uint32_t now = ag_millis();
+    const bool     due = (now - op->last_ui_ms) >= FM_COPY_UI_MS;
+    const bool     done = p->file_total > 0 && p->file_done >= p->file_total;
+    if (!due && !done && op->last_ui_ms != 0) {
+        return true;
     }
+    op->last_ui_ms = (now != 0) ? now : 1u;
 
-    char *buf = (char *)ag_malloc(FM_COPY_CHUNK);
-    if (buf == NULL) {
-        (void)ag_close(src);
-        (void)ag_close(dst);
-        return -AG_ENOMEM;
+    /* A measured whole shows the whole; otherwise the file being worked on. */
+    if (p->total_bytes > 0) {
+        copy_progress(op->verb, base_name(p->path), p->total_done,
+                      p->total_bytes, p->files_done, p->files_total);
+    } else {
+        copy_progress(op->verb, base_name(p->path), p->file_done,
+                      p->file_total, p->files_done, p->files_total);
     }
+    return true;
+}
 
-    ag_err_t err = AG_OK;
-    uint64_t done = 0;
-    uint32_t last_ui_ms = 0;
+/*
+ * A request with its copy buffer.  The buffer comes out of the arena rather
+ * than the stack: eight kilobytes on a sixteen kilobyte stack is not a thing
+ * to do, and fsops deliberately allocates nothing itself.
+ */
+static bool fm_op_begin(fsops_req_t *req, fm_op_t *op, const char *verb)
+{
+    memset(req, 0, sizeof(*req));
+    memset(op, 0, sizeof(*op));
+    op->verb = verb;
+
+    req->chunk = (char *)ag_malloc(FM_COPY_CHUNK);
+    if (req->chunk == NULL) {
+        return false;
+    }
+    req->chunk_len = FM_COPY_CHUNK;
+    req->fs = fsops_argon_fs();
+    req->tick = fm_op_tick;
+    req->tick_ctx = op;
 
     s_copy_need_panels = ag_focused();
     s_copy_was_focused = false;
+    return true;
+}
 
-    /* Something on screen before the first HostFS read, which can take a while. */
-    copy_progress(label, 0, total);
-    last_ui_ms = ag_millis();
+static void fm_op_end(fsops_req_t *req)
+{
+    ag_free(req->chunk);
+    req->chunk = NULL;
+}
 
-    for (;;) {
-        if (copy_cancelled()) {
-            err = -AG_EKILLED;
-            break;
-        }
-        /* FOCUS_GAINED while mid-copy: repaint immediately, not next UI tick. */
-        if (s_copy_need_panels && ag_focused()) {
-            last_ui_ms = ag_millis();
-            copy_progress(label, done, total);
-        }
-
-        const int32_t n = ag_read(src, buf, FM_COPY_CHUNK);
-        if (n < 0) {
-            err = (ag_err_t)n;
-            break;
-        }
-        if (n == 0) {
-            break;
-        }
-        const int32_t written = ag_write(dst, buf, (size_t)n);
-        if (written != n) {
-            err = (written < 0) ? (ag_err_t)written : -AG_ENOSPC;
-            break;
-        }
-        done += (uint64_t)n;
-
-        const uint32_t now = ag_millis();
-        if ((now - last_ui_ms) >= FM_COPY_UI_MS ||
-            (total > 0 && done >= total)) {
-            last_ui_ms = now;
-            copy_progress(label, done, total);
-        }
+/*
+ * Counting first, but only for a directory.
+ *
+ * A single file already knows its size from its own stat, so the bar is real
+ * for free.  A tree does not, and the only way to a bar that means anything is
+ * to walk it once before copying it - which over HostFS is a wait of its own,
+ * so it is announced and can be cancelled.
+ */
+static void fm_op_measure(fsops_req_t *req, fm_op_t *op, const char *path,
+                          bool is_dir)
+{
+    if (!is_dir) {
+        return;
     }
-
-    ag_free(buf);
-    (void)ag_sync(dst);
-    (void)ag_close(dst);
-    (void)ag_close(src);
-
-    if (err != AG_OK) {
-        /* A half-written file is worse than none: it looks like a copy. */
-        (void)ag_unlink(to);
+    const char *was = op->verb;
+    op->verb = "Counting";
+    uint64_t bytes = 0;
+    uint32_t files = 0;
+    if (fsops_measure(req, path, &bytes, &files) == AG_OK) {
+        req->total_bytes = bytes;
+        req->files_total = files;
     }
-    return err;
+    op->verb = was;
+    op->last_ui_ms = 0;
 }
 
 /*
@@ -595,14 +645,23 @@ static void resolve_target(const char *typed, const char *name, char *out,
     }
 }
 
+/* How an operation ended, in the same three words everywhere. */
+static void report(const char *name, const char *ok, ag_err_t err)
+{
+    if (err == -AG_EKILLED) {
+        absorb_copy_interrupt();
+        fm_message("cancelled");
+    } else if (err != AG_OK) {
+        fm_error(name, err);
+    } else {
+        fm_message(ok);
+    }
+}
+
 void fm_copy(void)
 {
     const fm_entry_t *e = fm_current();
     if (e == NULL || e->is_up) {
-        return;
-    }
-    if (e->is_dir) {
-        fm_message("copying a whole directory is not implemented yet");
         return;
     }
 
@@ -611,6 +670,7 @@ void fm_copy(void)
 
     char prompt[FM_LINE_MAX];
     ag_strlcpy(prompt, "Copy ", sizeof(prompt));
+    ag_strlcat(prompt, e->is_dir ? "directory " : "", sizeof(prompt));
     ag_strlcat(prompt, e->name, sizeof(prompt));
     ag_strlcat(prompt, " to:", sizeof(prompt));
 
@@ -629,15 +689,17 @@ void fm_copy(void)
         return;
     }
 
-    const ag_err_t err = copy_file(from, to, e->name, e->size);
-    if (err == -AG_EKILLED) {
-        absorb_copy_interrupt();
-        fm_message("cancelled");
-    } else if (err != AG_OK) {
-        fm_error(e->name, err);
-    } else {
-        fm_message("copied");
+    fsops_req_t req;
+    fm_op_t     op;
+    if (!fm_op_begin(&req, &op, "Copying")) {
+        fm_error(e->name, -AG_ENOMEM);
+        return;
     }
+    fm_op_measure(&req, &op, from, e->is_dir);
+    const ag_err_t err = fsops_copy(&req, from, to);
+    fm_op_end(&req);
+
+    report(e->name, "copied", err);
     (void)fm_reload(fm_other());
     (void)fm_reload(fm_active());
 }
@@ -671,34 +733,38 @@ void fm_move(void)
     fm_join(fm_active()->path, e->name, from, sizeof(from));
     resolve_target(answer, e->name, to, sizeof(to));
 
-    ag_err_t err = ag_rename(from, to);
-
     /*
-     * Renaming only works inside one filesystem, and the two panels are often on
-     * two.  Rather than explain that, offer the thing the user meant.
+     * Renaming is tried here rather than left to fsops_move so that the fall
+     * back to copy-and-delete is a question and not a surprise: it is the
+     * difference between an instant operation and one that rewrites every
+     * byte, and on a card that is the difference between now and a minute.
      */
-    if (err != AG_OK && !e->is_dir) {
+    ag_err_t err = ag_rename(from, to);
+    if (err != AG_OK) {
         char question[FM_LINE_MAX];
         ag_strlcpy(question, "Cannot rename across drives (", sizeof(question));
         ag_strlcat(question, ag_strerror(err), sizeof(question));
         ag_strlcat(question, "). Copy and delete instead?", sizeof(question));
 
-        if (fm_confirm(question)) {
-            err = copy_file(from, to, e->name, e->size);
-            if (err == AG_OK) {
-                err = ag_unlink(from);
-            }
+        if (!fm_confirm(question)) {
+            fm_message("");
+            return;
         }
+
+        fsops_req_t req;
+        fm_op_t     op;
+        if (!fm_op_begin(&req, &op, "Copying")) {
+            fm_error(e->name, -AG_ENOMEM);
+            return;
+        }
+        fm_op_measure(&req, &op, from, e->is_dir);
+        /* fsops_move tries the rename again - which costs one refused call and
+         * keeps copy-then-delete, and its ordering, in one place. */
+        err = fsops_move(&req, from, to);
+        fm_op_end(&req);
     }
 
-    if (err == -AG_EKILLED) {
-        absorb_copy_interrupt();
-        fm_message("cancelled");
-    } else if (err != AG_OK) {
-        fm_error(e->name, err);
-    } else {
-        fm_message("moved");
-    }
+    report(e->name, "moved", err);
     (void)fm_reload(fm_other());
     (void)fm_reload(fm_active());
 }
@@ -733,11 +799,17 @@ void fm_delete(void)
         return;
     }
 
+    /*
+     * A directory now takes everything under it, so the question has to say
+     * so.  It used to be refused by the filesystem unless empty, which was its
+     * own kind of safety; the question is what replaces it, and it is asked
+     * before anything is counted or opened.
+     */
     char question[FM_LINE_MAX];
     ag_strlcpy(question, "Delete ", sizeof(question));
-    ag_strlcat(question, e->is_dir ? "directory " : "", sizeof(question));
     ag_strlcat(question, e->name, sizeof(question));
-    ag_strlcat(question, "?", sizeof(question));
+    ag_strlcat(question,
+               e->is_dir ? " and everything in it?" : "?", sizeof(question));
 
     if (!fm_confirm(question)) {
         fm_message("");
@@ -747,16 +819,18 @@ void fm_delete(void)
     char path[AG_PATH_MAX];
     fm_join(fm_active()->path, e->name, path, sizeof(path));
 
-    const ag_err_t err = e->is_dir ? ag_rmdir(path) : ag_unlink(path);
-    if (err != AG_OK) {
-        /* A directory with anything in it is refused by the system, not by us,
-         * and saying which is more useful than a general failure. */
-        fm_error(e->name, err);
+    fsops_req_t req;
+    fm_op_t     op;
+    if (!fm_op_begin(&req, &op, "Deleting")) {
+        fm_error(e->name, -AG_ENOMEM);
         return;
     }
+    fm_op_measure(&req, &op, path, e->is_dir);
+    const ag_err_t err = fsops_delete(&req, path);
+    fm_op_end(&req);
 
+    report(e->name, "deleted", err);
     (void)fm_reload(fm_active());
-    fm_message("deleted");
 }
 
 /* ---------------------------------------------------------------------- */

@@ -132,8 +132,20 @@ add_executable(argon_tests
     test_nam.c
     test_netmsg.c
     test_rempix.c
+    test_desktop.c
+    test_fsops.c
+    "${ARGON_ROOT}/apps/desktop/dsk_rect.c"
+    "${ARGON_ROOT}/apps/desktop/dsk_layout.c"
+    "${ARGON_ROOT}/apps/desktop/dsk_paint.c"
+    "${ARGON_ROOT}/apps/desktop/dsk_wm.c"
+    "${ARGON_ROOT}/apps/desktop/dsk_kbd.c"
+    "${ARGON_ROOT}/apps/desktop/dsk_menu.c"
+    "${ARGON_ROOT}/apps/desktop/dsk_dlg.c"
+    "${ARGON_ROOT}/apps/common/fsops/fsops.c"
     test_rlink.c
     "${ARGON_ROOT}/apps/common/rlink/ag_rlink.c"
+    test_atproto.c
+    "${ARGON_ROOT}/apps/common/atproto/ag_atproto.c"
     test_nlink.c
     "${ARGON_ROOT}/apps/common/nlink/ag_nlink.c"
     "${ARGON_ROOT}/tools/nam.c"

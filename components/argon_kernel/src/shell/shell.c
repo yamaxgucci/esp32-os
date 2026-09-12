@@ -14,6 +14,7 @@
 #include <argon/cmdline.h>
 #include <argon/codepage.h>
 #include <argon/console.h>
+#include <argon/textpanel.h>
 #include <argon/session.h>
 #include <argon/display.h>
 #include <argon/device.h>
@@ -34,6 +35,7 @@
 
 #include <argon/btinput.h>
 #include <argon/usbinput.h>
+#include <sys/time.h>
 #include <time.h>
 
 #include <argon/net.h>
@@ -72,10 +74,76 @@ typedef struct {
 
 int ag_edit_main(int argc, char **argv);
 
-static char          s_cwd[AG_PATH_MAX] = "/";
-static ag_lineedit_t s_line;
-static int           s_last_status;
-static int           s_script_depth;
+/*
+ * What belongs to ONE prompt, as against the machine it runs on.
+ *
+ * There was one prompt for as long as there was one shell, and this was
+ * four file-scope variables.  A second shell - a prompt in a window, with
+ * its own slot and its own directory - makes them four variables per
+ * instance instead, and the difference between the two kinds of state is
+ * the whole content of this struct: a working directory and a line being
+ * edited belong to a prompt, while the device registry, the journal and
+ * SYSTEM.CFG belong to the machine and stay where they are.
+ *
+ * `slot` is the session this prompt serves, or AG_SESSION_FOLLOW for the
+ * original one, which serves whichever slot is focused - that is what the
+ * system shell has always done and it is not a special case to be removed.
+ */
+#define AG_SESSION_FOLLOW (-1)
+
+/* Where this prompt starts on its own screen; the line editor draws from it. */
+typedef struct {
+    uint16_t row;
+    uint16_t col0;
+} prompt_pos_t;
+
+typedef struct {
+    char          cwd[AG_PATH_MAX];
+    ag_lineedit_t line;
+    int           last_status;
+    int           script_depth;
+    char          prompt[AG_PATH_MAX + 16];
+    prompt_pos_t  pos;
+    int           slot;
+} shell_ctx_t;
+
+static shell_ctx_t s_ctx0 = { .cwd = "/", .slot = AG_SESSION_FOLLOW };
+
+/*
+ * Which prompt is speaking, keyed by task.
+ *
+ * The alternative was to pass a context pointer through five thousand
+ * lines of command implementations, most of which have nothing to do with
+ * a prompt.  Keyed by task, the four names below go on meaning exactly
+ * what they meant - "this prompt's directory" - and resolve to the right
+ * one without a single call site changing.
+ */
+static struct {
+    ag_port_task_t task;
+    shell_ctx_t   *ctx;
+} s_ctxs[AG_SESSION_SLOTS];
+
+static shell_ctx_t *sh(void)
+{
+    const ag_port_task_t me = ag_port_task_self();
+
+    for (unsigned i = 0; i < sizeof(s_ctxs) / sizeof(s_ctxs[0]); i++) {
+        if (s_ctxs[i].task == me && s_ctxs[i].ctx != NULL) {
+            return s_ctxs[i].ctx;
+        }
+    }
+    return &s_ctx0;
+}
+
+#define s_cwd          (sh()->cwd)
+#define s_line         (sh()->line)
+#define s_last_status  (sh()->last_status)
+#define s_script_depth (sh()->script_depth)
+#define s_prompt       (sh()->prompt)
+#define s_prompt_pos   (sh()->pos)
+
+/* Which slot this prompt belongs to; defined below. */
+static int my_slot(void);
 
 #define AG_SHELL_SCRIPT_MAX_DEPTH 8
 
@@ -155,13 +223,28 @@ ag_err_t ag_shell_set_cwd(const char *path)
         return -AG_ERANGE;
     }
     strcpy(s_cwd, path);
-    (void)ag_session_set_cwd(ag_session_focused(), path);
+    (void)ag_session_set_cwd(my_slot(), path);
     return AG_OK;
+}
+
+/*
+ * Which session slot this prompt's directory belongs to.
+ *
+ * The original prompt serves whoever is in front and follows the
+ * focus; a prompt of its own belongs to one slot and must not be
+ * dragged about by somebody else's Alt+digit.
+ */
+static int my_slot(void)
+{
+    const shell_ctx_t *c = sh();
+
+    return (c->slot == AG_SESSION_FOLLOW) ? ag_session_focused()
+                                          : c->slot;
 }
 
 static void sync_cwd_from_session(void)
 {
-    const char *cwd = ag_session_cwd(ag_session_focused());
+    const char *cwd = ag_session_cwd(my_slot());
     if (cwd != NULL && cwd[0] == '/') {
         strncpy(s_cwd, cwd, sizeof(s_cwd) - 1);
         s_cwd[sizeof(s_cwd) - 1] = '\0';
@@ -198,13 +281,7 @@ static void pick_initial_cwd(void)
 /* Line rendering                                                         */
 /* ---------------------------------------------------------------------- */
 
-typedef struct {
-    uint16_t row;
-    uint16_t col0;
-} prompt_pos_t;
-
-static char         s_prompt[AG_PATH_MAX + 16];
-static prompt_pos_t s_prompt_pos;
+/* prompt_pos_t and both of these now live in shell_ctx_t, above. */
 
 /* Caller holds the console lock. */
 static void redraw_line_locked(const ag_lineedit_t *le, const prompt_pos_t *pos)
@@ -398,6 +475,99 @@ static int cmd_mem(int argc, char **argv)
     return 0;
 }
 
+/* Case-insensitive compare of the first `len` bytes against a whole word. */
+static bool word_is(const char *a, size_t len, const char *lit)
+{
+    for (size_t i = 0; i < len; i++) {
+        char c = a[i];
+        if (c >= 'A' && c <= 'Z') {
+            c = (char)(c + 32);
+        }
+        if (lit[i] == 0 || c != lit[i]) {
+            return false;
+        }
+    }
+    return lit[len] == 0;
+}
+
+/*
+ * mode - the size of the text screen, the way DOS spelled it.
+ *
+ *     mode                       what it is now
+ *     mode con cols=40 lines=25  change it
+ *
+ * The change is not written anywhere: `[console] cols/rows` in SYSTEM.CFG is
+ * what survives a reset.  This is for trying a size on the display that is
+ * actually plugged in before committing to it, which is exactly the case where
+ * guessing from a datasheet goes wrong.
+ */
+static int cmd_mode(int argc, char **argv)
+{
+    ag_console_lock();
+    const ag_screen_t *scr = ag_console_screen();
+    uint16_t cols = scr->cols, rows = scr->rows;
+    ag_console_unlock();
+
+    if (argc < 2) {
+        ag_console_printf("con: cols=%u lines=%u\n", (unsigned)cols,
+                          (unsigned)rows);
+        /* What `auto` would pick, and where it would have got it from. */
+        uint16_t pcols = 0, prows = 0;
+        if (ag_textpanel_geometry(&pcols, &prows) == AG_OK) {
+            ag_console_printf("panel: %ux%u cells\n", (unsigned)pcols,
+                              (unsigned)prows);
+        } else if (ag_display_text_cells(&pcols, &prows)) {
+            uint16_t w = 0, h = 0;
+            (void)ag_display_size(&w, &h);
+            ag_console_printf("screen: %ux%u px = %ux%u cells\n", (unsigned)w,
+                              (unsigned)h, (unsigned)pcols, (unsigned)prows);
+        }
+        return 0;
+    }
+
+    for (int i = 1; i < argc; i++) {
+        const char *a = argv[i];
+        /* "con" and "con:" are the device this command has always addressed. */
+        if (word_is(a, strlen(a), "con") || word_is(a, strlen(a), "con:")) {
+            continue;
+        }
+
+        const char *eq = strchr(a, '=');
+        if (eq == NULL) {
+            ag_console_printf("mode: don't understand '%s'\n", a);
+            return 1;
+        }
+
+        const int    n    = atoi(eq + 1);
+        const size_t klen = (size_t)(eq - a);
+        if (word_is(a, klen, "cols")) {
+            cols = (uint16_t)n;
+        } else if (word_is(a, klen, "lines") || word_is(a, klen, "rows")) {
+            rows = (uint16_t)n;
+        } else {
+            ag_console_printf("mode: no such setting '%.*s'\n", (int)klen, a);
+            return 1;
+        }
+        if (n < 1) {
+            ag_console_printf("mode: %s must be at least 1\n", a);
+            return 1;
+        }
+    }
+
+    const ag_err_t err = ag_console_resize(cols, rows);
+    if (err != AG_OK) {
+        ag_console_printf("mode: %ux%u refused (%d); at most %ux%u, and it "
+                          "has to fit in memory\n",
+                          (unsigned)cols, (unsigned)rows, (int)err,
+                          (unsigned)AG_SCREEN_MAX_COLS,
+                          (unsigned)AG_SCREEN_MAX_ROWS);
+        return 1;
+    }
+    ag_console_printf("con: cols=%u lines=%u\n", (unsigned)cols,
+                      (unsigned)rows);
+    return 0;
+}
+
 static int cmd_cls(int argc, char **argv)
 {
     (void)argc;
@@ -539,9 +709,125 @@ static int cmd_uptime(int argc, char **argv)
     return 0;
 }
 
+/*
+ * `date set 2026-09-11 14:30[:00]`, UTC, the same clock `date` prints.
+ *
+ * There is no battery under this clock on any board we have, so this is
+ * lost at every power cut and has to be typed again - which is exactly why
+ * it has to exist.  Until now the only way to set the time at all was
+ * `date sync` over the network, and on the CYD bringing the radio up
+ * damages its SYSTEM.CFG, so that board could not have a clock.
+ */
+static int date_set(int argc, char **argv)
+{
+    int n[6] = { 0, 0, 0, 0, 0, 0 };
+
+    if (argc < 4) {
+        ag_console_puts("date set YYYY-MM-DD HH:MM[:SS]   (UTC)\n");
+        return 1;
+    }
+
+    /*
+     * Parsed by hand rather than with sscanf: nothing else in the shell
+     * needs it, and pulling the scanning half of the C library into the
+     * firmware to read six integers is not a trade worth making on a part
+     * whose image is counted in kilobytes.
+     */
+    int got = 0;
+    for (int a = 2; a <= 3; a++) {
+        const char *c = argv[a];
+        while (*c != '\0' && got < 6) {
+            if (*c < '0' || *c > '9') {
+                c++;
+                continue;
+            }
+            int v = 0;
+            while (*c >= '0' && *c <= '9') {
+                v = v * 10 + (*c - '0');
+                c++;
+            }
+            n[got++] = v;
+        }
+    }
+    if (got < 5) {
+        ag_console_puts("date set YYYY-MM-DD HH:MM[:SS]   (UTC)\n");
+        return 1;
+    }
+
+    const int y = n[0], mo = n[1], d = n[2];
+    const int h = n[3], mi = n[4], sec = n[5];
+    if (y < 1970 || mo < 1 || mo > 12 || d < 1 || d > 31 || h > 23 ||
+        mi > 59 || sec > 60) {
+        ag_console_puts("date set: that is not a date and time\n");
+        return 1;
+    }
+
+    struct tm tm;
+    memset(&tm, 0, sizeof(tm));
+    tm.tm_year = y - 1900;
+    tm.tm_mon = mo - 1;
+    tm.tm_mday = d;
+    tm.tm_hour = h;
+    tm.tm_min = mi;
+    tm.tm_sec = sec;
+    tm.tm_isdst = 0;
+
+    /* No timezone is set on the board, so mktime's "local" is UTC. */
+    const time_t t = mktime(&tm);
+    if (t == (time_t)-1) {
+        ag_console_puts("date set: that is not a date and time\n");
+        return 1;
+    }
+
+    struct timeval tv;
+    tv.tv_sec = t;
+    tv.tv_usec = 0;
+    if (settimeofday(&tv, NULL) != 0) {
+        ag_console_puts("date set: the clock refused it\n");
+        return 1;
+    }
+    return 0;
+}
+
+/*
+ * `prompt 2` - another shell, in the slot named, with its own directory.
+ *
+ * Not a new kind of thing: the slots have always been described as "a
+ * shell per slot, plus an application", and until now the one shell moved
+ * between them as the focus did.  This gives a slot a prompt that stays
+ * there - which is what a window on the desktop will show.
+ */
+static int cmd_prompt(int argc, char **argv)
+{
+    if (argc < 2) {
+        ag_console_puts("prompt <slot> [dir]   (slot 2..4)\n");
+        return 1;
+    }
+    const int slot = atoi(argv[1]) - 1;
+    const ag_err_t err =
+        ag_shell_start_in_slot_at(slot, (argc > 2) ? argv[2] : NULL);
+    if (err == -AG_EEXIST) {
+        ag_console_printf("slot %s already has its own prompt\n", argv[1]);
+        return 1;
+    }
+    if (err != AG_OK) {
+        ag_console_printf("prompt: %s\n",
+                          ag_loader_api()->sys->strerror(err));
+        return 1;
+    }
+    ag_console_printf("slot %s has its own prompt now; Alt+%s to see it\n",
+                      argv[1], argv[1]);
+    return 0;
+}
+
 static int cmd_date(int argc, char **argv)
 {
-    if (argc >= 2 && ag_path_icmp(argv[1], "sync") == 0) {
+    if (argc >= 2 && ag_path_icmp(argv[1], "set") == 0) {
+        const int err = date_set(argc, argv);
+        if (err != 0) {
+            return err;
+        }
+    } else if (argc >= 2 && ag_path_icmp(argv[1], "sync") == 0) {
 #if AG_PORT_HAS_SNTP
         const char *server = (argc >= 3) ? argv[2] : NULL;
         ag_console_puts("syncing time...\n");
@@ -571,7 +857,8 @@ static int cmd_date(int argc, char **argv)
     /* Before a sync the clock is seconds since 1970 plus uptime, i.e. still in
      * 1970 - say so rather than let a 1970 date look like a bug. */
     if (tm.tm_year + 1900 < 2000) {
-        ag_console_puts("(clock not set - `date sync` to set it from the network)\n");
+        ag_console_puts("(clock not set - `date set` by hand, or `date sync`"
+                        " from the network)\n");
     }
     return 0;
 }
@@ -1163,20 +1450,7 @@ static int cfg_has_device_line(const char *text, const char *dos_path)
     return 0;
 }
 
-/*
- * A radio the prompt can drive.  Not the same as a radio on this chip since ABI
- * 0.47: `net use <dev>` binds one on a wire, and `wifi scan` has to work at
- * this board's prompt or the operator is back to knowing which box holds which
- * chip - which is the whole thing an external radio exists to avoid.  Every
- * station call below goes through ag_netprov_wifi_*, which answers -AG_ENODEV
- * while there is no radio anywhere.
- *
- * The access point and ESP-NOW halves keep the narrower gate: they need this
- * chip's own radio, because RLINK carries the station half and no more.
- */
-#define ARGON_SHELL_HAS_WIFI (AG_PORT_HAS_WIFI || AG_HAS_NET)
-
-#if ARGON_SHELL_HAS_WIFI || AG_PORT_HAS_BT || \
+#if AG_PORT_HAS_WIFI || AG_PORT_HAS_BT || \
     (defined(CONFIG_ARGON_NET_SSH) && CONFIG_ARGON_NET_SSH)
 
 /* Case-insensitive compare of a fixed length; the section name in the file may
@@ -1322,9 +1596,9 @@ static ag_err_t cfg_replace_section(const char *section, const char *body)
     return (w < 0) ? (ag_err_t)w : AG_OK;
 }
 
-#endif /* ARGON_SHELL_HAS_WIFI || AG_PORT_HAS_BT || CONFIG_ARGON_NET_SSH */
+#endif /* AG_PORT_HAS_WIFI || AG_PORT_HAS_BT || CONFIG_ARGON_NET_SSH */
 
-#if ARGON_SHELL_HAS_WIFI
+#if AG_PORT_HAS_WIFI
 static ag_err_t cfg_ensure_wifi(const char *ssid, const char *pass,
                                 const uint8_t *bssid)
 {
@@ -1957,65 +2231,44 @@ static void io_show_pin(int pin)
  * because the moment you need them is before anything has been copied onto the
  * board - see docs/user/02-board-setup.md.
  */
-#if ARGON_SHELL_HAS_WIFI
+#if AG_PORT_HAS_WIFI
 
-/*
- * The ABI's numbering, not the port's.  What arrives here may have been read
- * off the air by a chip at the far end of a wire, which has no port types of
- * ours at all; the two enums carry the same numbers on purpose, and ag_rlink.h
- * says why renumbering either alone mislabels every network.
- */
-static const char *wifi_auth_name(uint8_t a)
+static const char *wifi_auth_name(ag_wifi_auth_t a)
 {
     switch (a) {
-    case AG_WIFI_SEC_OPEN:       return "open";
-    case AG_WIFI_SEC_WEP:        return "WEP";
-    case AG_WIFI_SEC_WPA:        return "WPA";
-    case AG_WIFI_SEC_WPA2:       return "WPA2";
-    case AG_WIFI_SEC_WPA3:       return "WPA3";
-    case AG_WIFI_SEC_ENTERPRISE: return "802.1X";
-    default:                     return "?";
+    case AG_WIFI_OPEN:       return "open";
+    case AG_WIFI_WEP:        return "WEP";
+    case AG_WIFI_WPA:        return "WPA";
+    case AG_WIFI_WPA2:       return "WPA2";
+    case AG_WIFI_WPA3:       return "WPA3";
+    case AG_WIFI_ENTERPRISE: return "802.1X";
+    default:                 return "?";
     }
 }
 
-static const char *wifi_state_name(uint8_t s)
+static const char *wifi_state_name(ag_wifi_state_t s)
 {
     switch (s) {
-    case AG_WIFI_ST_OFF:     return "off";
-    case AG_WIFI_ST_IDLE:    return "on, not joined";
-    case AG_WIFI_ST_JOINING: return "joining";
-    default:                 return "joined";
+    case AG_WIFI_OFF:     return "off";
+    case AG_WIFI_IDLE:    return "on, not joined";
+    case AG_WIFI_JOINING: return "joining";
+    default:              return "joined";
     }
 }
 
 static int wifi_status(void)
 {
-    ag_wifi_status_t st;
-    const ag_err_t   err = ag_netprov_wifi_status(&st);
-    if (err == -AG_ENODEV) {
-        ag_console_puts("no radio: none on this board and none bound\n");
-        ag_console_puts("  `dev` for what is here, `net use <dev>` to bind one "
-                        "on a wire\n");
-        return 1;
-    }
+    ag_port_wifi_status_t st;
+    const ag_err_t        err = ag_port_wifi_status(&st);
     if (err != AG_OK) {
         ag_console_printf("wifi: %s\n", ag_loader_api()->sys->strerror(err));
         return 1;
     }
 
-    /*
-     * Which radio answered.  Silent for the built-in one, because saying "via
-     * builtin" at every prompt is noise; named otherwise, because that is the
-     * one fact about this board the numbers below cannot show.
-     */
-    if (!ag_netprov_is_builtin()) {
-        ag_console_printf("radio on %s\n", ag_netprov_active());
-    }
-
     ag_console_printf("radio %s\n", wifi_state_name(st.state));
     if (st.ssid[0] != '\0') {
         ag_console_printf("ssid %s", st.ssid);
-        if (st.state == AG_WIFI_ST_JOINED) {
+        if (st.state == AG_WIFI_JOINED) {
             ag_console_printf(", %d dBm, channel %u", (int)st.rssi,
                               (unsigned)st.channel);
         }
@@ -2037,19 +2290,9 @@ static int wifi_status(void)
     } else if (st.pinned) {
         ag_console_puts("pinned to an access point that has not answered\n");
     }
-    if (st.state != AG_WIFI_ST_JOINED && st.last_reason != 0) {
-#if AG_PORT_HAS_WIFI
-        /*
-         * The names live in this chip's own radio driver.  A remote radio's
-         * codes are the same numbers - both ends are IDF - so the table still
-         * fits; a build without the driver prints the number, which is worse
-         * than a name and much better than nothing.
-         */
+    if (st.state != AG_WIFI_JOINED && st.last_reason != 0) {
         ag_console_printf("last failure: %s\n",
-                          ag_port_wifi_reason((int)st.last_reason));
-#else
-        ag_console_printf("last failure: reason %d\n", (int)st.last_reason);
-#endif
+                          ag_port_wifi_reason(st.last_reason));
     }
     if (st.attempts > 1u) {
         ag_console_printf("%u attempts\n", (unsigned)st.attempts);
@@ -2061,7 +2304,7 @@ static int wifi_status(void)
                           (unsigned)((addr >> 16) & 0xffu),
                           (unsigned)((addr >> 8) & 0xffu),
                           (unsigned)(addr & 0xffu));
-    } else if (st.state == AG_WIFI_ST_JOINED) {
+    } else if (st.state == AG_WIFI_JOINED) {
         ag_console_puts("no address yet (DHCP)\n");
     }
 
@@ -2108,17 +2351,11 @@ static uint32_t s_scan_count;
 
 static int wifi_scan(void)
 {
-    ag_wifi_ap_t aps[WIFI_SCAN_MAX];
-    uint32_t     found = 0;
+    ag_port_wifi_ap_t aps[WIFI_SCAN_MAX];
+    uint32_t          found = 0;
 
     ag_console_puts("scanning...\n");
-    const ag_err_t err = ag_netprov_wifi_scan(aps, WIFI_SCAN_MAX, &found);
-    if (err == -AG_ENODEV) {
-        ag_console_puts("no radio: none on this board and none bound\n");
-        ag_console_puts("  `dev` for what is here, `net use <dev>` to bind one "
-                        "on a wire\n");
-        return 1;
-    }
+    const ag_err_t err = ag_port_wifi_scan(aps, WIFI_SCAN_MAX, &found);
     if (err == -AG_EBUSY) {
         /*
          * The radio cannot scan and associate at once, and a board that has
@@ -2126,8 +2363,8 @@ static int wifi_scan(void)
          * the answer every time, which reads as a broken command.  Say which
          * of the two it is and what stops it.
          */
-        ag_wifi_status_t st;
-        if (ag_netprov_wifi_status(&st) == AG_OK && st.ssid[0] != '\0') {
+        ag_port_wifi_status_t st;
+        if (ag_port_wifi_status(&st) == AG_OK && st.ssid[0] != '\0') {
             ag_console_printf("busy joining %s\n", st.ssid);
         } else {
             ag_console_puts("the radio is busy\n");
@@ -2260,22 +2497,9 @@ static int cmd_wifi(int argc, char **argv)
      * cannot.  Both radios are in every image; only one usually runs.
      */
     if (ag_path_icmp(argv[1], "on") == 0) {
-        /*
-         * The memory arithmetic below is about THIS chip's radio.  A radio at
-         * the far end of a wire costs this board nothing to switch on, and
-         * printing "took 0 KB" about it would be a measurement of the wrong
-         * board - so the whole report is skipped when it is not ours.
-         */
-        const bool   ours = ag_netprov_is_builtin();
-        const size_t before = ours ? ag_port_mem_free(AG_MEM_FAST) : 0u;
+        const size_t before = ag_port_mem_free(AG_MEM_FAST);
 
-        const ag_err_t err = ag_netprov_wifi_start();
-        if (err == -AG_ENODEV) {
-            ag_console_puts("no radio: none on this board and none bound\n");
-            ag_console_puts("  `dev` for what is here, `net use <dev>` to bind "
-                            "one on a wire\n");
-            return 1;
-        }
+        const ag_err_t err = ag_net_init();
         if (err != AG_OK) {
             ag_console_printf("wifi on: %s\n",
                               ag_loader_api()->sys->strerror(err));
@@ -2295,20 +2519,15 @@ static int cmd_wifi(int argc, char **argv)
          * So the numbers are printed rather than left to be guessed, and a
          * margin too thin to associate in says so before anyone tries.
          */
-        if (ours) {
-            const size_t after = ag_port_mem_free(AG_MEM_FAST);
-            ag_console_printf("radio on: took %u KB, %u KB free\n",
-                              (unsigned)((before - after) / 1024u),
-                              (unsigned)(after / 1024u));
-            if (after < 24u * 1024u) {
-                ag_console_puts(
-                    "  that is thin: association and DHCP want ~16 KB more.\n"
-                    "  if the board resets while joining, this is why - stop "
-                    "what\n"
-                    "  else is running, or use a build with less in it.\n");
-            }
-        } else {
-            ag_console_printf("radio on %s\n", ag_netprov_active());
+        const size_t after = ag_port_mem_free(AG_MEM_FAST);
+        ag_console_printf("radio on: took %u KB, %u KB free\n",
+                          (unsigned)((before - after) / 1024u),
+                          (unsigned)(after / 1024u));
+        if (after < 24u * 1024u) {
+            ag_console_puts(
+                "  that is thin: association and DHCP want ~16 KB more.\n"
+                "  if the board resets while joining, this is why - stop what\n"
+                "  else is running, or use a build with less in it.\n");
         }
 
         const char *ssid = ag_cfg_get(ag_sysconfig(), "wifi.ssid", NULL);
@@ -2320,7 +2539,7 @@ static int cmd_wifi(int argc, char **argv)
             const bool  have_pin =
                 (pinned != NULL) && ag_mac_parse(pinned, bssid);
 
-            (void)ag_netprov_wifi_connect(
+            (void)ag_port_wifi_connect(
                 ssid, ag_cfg_get(ag_sysconfig(), "wifi.pass", ""),
                 have_pin ? bssid : NULL);
             ag_console_printf("joining %s%s\n", ssid,
@@ -2406,7 +2625,7 @@ static int cmd_wifi(int argc, char **argv)
             }
         }
 
-        const ag_err_t err = ag_netprov_wifi_connect(ssid, pass, bssid);
+        const ag_err_t err = ag_port_wifi_connect(ssid, pass, bssid);
         if (err != AG_OK) {
             ag_console_printf("wifi connect: %s\n",
                               ag_loader_api()->sys->strerror(err));
@@ -2547,27 +2766,16 @@ static int cmd_wifi(int argc, char **argv)
     }
 
     if (ag_path_icmp(argv[1], "off") == 0) {
-        /* As with `on`: the kilobytes are this chip's, so only count them when
-         * the radio being stopped is this chip's. */
-        const bool   ours = ag_netprov_is_builtin();
-        const size_t before = ours ? ag_port_mem_free(AG_MEM_FAST) : 0u;
-        const ag_err_t err = ag_netprov_wifi_stop();
-        if (err == -AG_ENODEV) {
-            ag_console_puts("no radio to stop\n");
-            return 1;
-        }
-        if (ours) {
-            const size_t after = ag_port_mem_free(AG_MEM_FAST);
-            ag_console_printf("radio off, %u KB back\n",
-                              (unsigned)((after - before) / 1024u));
-        } else {
-            ag_console_printf("radio off on %s\n", ag_netprov_active());
-        }
+        const size_t before = ag_port_mem_free(AG_MEM_FAST);
+        (void)ag_port_wifi_stop();
+        const size_t after = ag_port_mem_free(AG_MEM_FAST);
+        ag_console_printf("radio off, %u KB back\n",
+                          (unsigned)((after - before) / 1024u));
         return 0;
     }
 
     if (ag_path_icmp(argv[1], "forget") == 0) {
-        (void)ag_netprov_wifi_disconnect();
+        (void)ag_port_wifi_disconnect();
         const ag_err_t cerr = cfg_ensure_wifi(NULL, NULL, NULL);
         if (cerr != AG_OK) {
             ag_console_printf("SYSTEM.CFG: %d\n", (int)cerr);
@@ -2592,7 +2800,7 @@ static int cmd_wifi(int argc, char **argv)
     return 1;
 }
 
-#endif /* ARGON_SHELL_HAS_WIFI */
+#endif /* AG_PORT_HAS_WIFI */
 
 #if AG_PORT_HAS_ESPNOW
 
@@ -4448,14 +4656,28 @@ static int cmd_slots(int argc, char **argv)
     ag_session_info(slots);
     const int focused = ag_session_focused();
 
-    ag_console_puts("  slot  pid   prio     name\n");
+    ag_console_puts("  slot  pid   prio     name      directory\n");
     ag_console_printf("  sys%s  -     -        system\n",
                       focused == AG_SESSION_SYSTEM ? "*" : " ");
     for (int i = 0; i < AG_SESSION_SLOTS; i++) {
         const int shown = ag_session_display_number(i);
         if (slots[i].pid == AG_PID_KERNEL) {
-            ag_console_printf("  %d%s   -     -        shell\n", shown,
-                              focused == i ? "*" : " ");
+            /*
+             * And where that shell is standing.  Two prompts are only
+             * worth having if they can be in two places, so the
+             * listing that names them says which place each is in -
+             * the one thing about a second prompt that cannot be seen
+             * from the screen of the first.
+             */
+            char        dos[AG_PATH_MAX];
+            const char *at = ag_session_cwd(i);
+            if (at != NULL) {
+                ag_shell_dos_path(at, dos, sizeof(dos));
+                at = dos;
+            }
+            ag_console_printf("  %d%s   -     -        shell     %s\n", shown,
+                              focused == i ? "*" : " ",
+                              (at != NULL) ? at : "/");
         } else {
             ag_proc_prio_t pr = AG_PRIO_NORMAL;
             (void)ag_proc_get_priority(slots[i].pid, &pr);
@@ -4621,11 +4843,13 @@ static const ag_command_t k_commands[] = {
     {"ptr", "", "where the pointer is, and how much it has said", cmd_ptr},
 #endif
     {"uptime", "", "time since reset", cmd_uptime},
-    {"date", "[sync [server]]", "show the clock, or set it from the network", cmd_date},
+    {"date", "[set D T | sync [srv]]", "show the clock, or set it", cmd_date},
+    {"prompt", "<slot>", "give a slot a shell of its own", cmd_prompt},
     {"cls", "", "clear the screen", cmd_cls},
     {"echo", "<text>", "print text", cmd_echo},
     {"color", "<fg> <bg>", "set text colours", cmd_color},
     {"chcp", "[437|866|1251]", "screen code page", cmd_chcp},
+    {"mode", "[con cols=N lines=N]", "text screen size", cmd_mode},
     {"fm", "[left] [right]", "file manager, two panels", cmd_fm},
     {"edit", "[file]", "create or edit a text file", cmd_edit},
     {"gfxdump", "[/live] <file.ppm>", "save framebuffer as PPM", cmd_gfxdump},
@@ -4637,7 +4861,7 @@ static const ag_command_t k_commands[] = {
     {"beep", "[hz] [ms]", "a tone on /dev/pcm0", cmd_beep},
     {"power", "[full|eco|doze|screen on|off|auto on|off]",
      "the clock, the screen, and what applications make of it", ag_cmd_power},
-#if ARGON_SHELL_HAS_WIFI
+#if AG_PORT_HAS_WIFI
     {"wifi", "[on|off|scan|connect <#n|ssid> [pass]|ap <ssid> [pass]|forget]",
      "the radio", cmd_wifi},
 #endif
@@ -5049,6 +5273,147 @@ static void show_prompt(void)
     ag_console_unlock();
 }
 
+/* One prompt, for ever; defined at the bottom, beside the boot entry. */
+static void prompt_loop(void);
+
+/* The prompts that belong to one slot each; see ag_shell_start_in_slot. */
+static shell_ctx_t *s_ctx[AG_SESSION_SLOTS];
+
+/*
+ * Is the slot this prompt serves the one in front?
+ *
+ * Always true for the original prompt, which serves whichever slot is
+ * focused - that is what the system shell has always done.
+ */
+/*
+ * May this prompt read keys now?
+ *
+ * The original shell follows the focus: there is one keyboard, and it may
+ * only read when its slot is the one in front.  A prompt started in a slot
+ * of its own is different, and this is what a window on the desktop needs:
+ * it is never in front - the desktop is - and its keys do not come from the
+ * keyboard at all.  They are put into its queue by whoever IS in front,
+ * with ag_console_post_to_slot, and nobody else will ever take them out.
+ *
+ * It waited for a focus it could not be given, so sixteen keys typed into
+ * the desktop's prompt window sat in the queue and the shell above them
+ * spun at fifty milliseconds a turn, for ever.
+ */
+static bool my_slot_is_focused(void);
+
+static bool may_read_keys(void)
+{
+    if (sh()->slot != AG_SESSION_FOLLOW) {
+        return true; /* its own slot, its own queue, its own screen */
+    }
+    return ag_session_shell_owns_keyboard() && my_slot_is_focused();
+}
+
+static bool my_slot_is_focused(void)
+{
+    const shell_ctx_t *c = sh();
+    const int          f = ag_session_focused();
+
+    if (c->slot != AG_SESSION_FOLLOW) {
+        return c->slot == f;
+    }
+
+    /*
+     * The original prompt follows the focus - and stands aside for a slot
+     * that has a prompt of its own.
+     *
+     * There is one keyboard and one queue, so two prompts that both
+     * believe they are in front do not take turns: they take a character
+     * each.  `cd c:\\drv` typed at a slot with its own prompt arrived
+     * there as `c c:\\drv`, the 'd' having gone to the other one.
+     */
+    return !(f >= 0 && f < AG_SESSION_SLOTS && s_ctx[f] != NULL);
+}
+
+/*
+ * The extra prompts, allocated when one is asked for.
+ *
+ * Statically these were 2560 bytes of DRAM this image does not have - a
+ * working directory, a line editor and a prompt string each, times every
+ * slot, for a feature most boots never use.  A second prompt is optional
+ * and now costs nothing until somebody asks for one.
+ */
+static void shell_instance(void *arg)
+{
+    const int    slot = (int)(intptr_t)arg;
+    shell_ctx_t *c = s_ctx[slot];
+
+    /* Register before anything prints: sh() has to find this task. */
+    for (unsigned i = 0; i < sizeof(s_ctxs) / sizeof(s_ctxs[0]); i++) {
+        if (s_ctxs[i].ctx == NULL) {
+            s_ctxs[i].task = ag_port_task_self();
+            s_ctxs[i].ctx = c;
+            break;
+        }
+    }
+
+    (void)ag_console_bind_task(slot);
+    ag_lineedit_init(&c->line);
+    prompt_loop();
+}
+
+ag_err_t ag_shell_start_in_slot_at(int slot, const char *cwd)
+{
+    if (slot < 0 || slot >= AG_SESSION_SLOTS) {
+        return -AG_EINVAL;
+    }
+    if (s_ctx[slot] != NULL) {
+        return -AG_EEXIST; /* this slot already has a prompt of its own */
+    }
+
+    shell_ctx_t *c =
+        (shell_ctx_t *)ag_port_alloc(sizeof(*c), AG_MEM_BYTE);
+    if (c == NULL) {
+        return -AG_ENOMEM;
+    }
+    memset(c, 0, sizeof(*c));
+    /*
+     * Where it starts.  A prompt that opens in the directory being
+     * worked in is worth a line of code: the alternative is that every
+     * window begins at the root and the first thing anybody types is a
+     * cd.
+     */
+    if (cwd == NULL || cwd[0] == '\0' ||
+        ag_path_resolve(cwd, "/", c->cwd, sizeof(c->cwd)) != AG_OK) {
+        strcpy(c->cwd, "/");
+    }
+    c->slot = slot;
+    /*
+     * And told to the session, which is where a slot's directory
+     * actually lives - the context is a working copy that the prompt
+     * loop reads back from there every time round.  Setting only the
+     * copy loses it before the first prompt is drawn.
+     */
+    (void)ag_session_set_cwd(slot, c->cwd);
+    s_ctx[slot] = c;
+
+    /*
+     * Its own stack, and not a small one: the commands this prompt can run
+     * are the same ones the first can, and `cp`, `zip` and `wifi` all hold
+     * kilobytes of locals.  The figure is the one the system shell's own
+     * task was given.
+     */
+    ag_port_task_t t;
+    if (!ag_port_task_create(shell_instance, "shell2", 8192,
+                             (void *)(intptr_t)slot, 5, 0, 0, &t)) {
+        ag_port_free(c);
+        s_ctx[slot] = NULL;
+        return -AG_ENOMEM;
+    }
+    ag_log(AG_LOG_INFO, "shell", "a second prompt in slot %d", slot + 1);
+    return AG_OK;
+}
+
+ag_err_t ag_shell_start_in_slot(int slot)
+{
+    return ag_shell_start_in_slot_at(slot, NULL);
+}
+
 void ag_shell_run(void)
 {
     ag_lineedit_init(&s_line);
@@ -5079,9 +5444,29 @@ void ag_shell_run(void)
         "Alt+1..4 / Alt+Tab = user slots; Ctrl+\\ = system shell "
         "(again = kill last app).\n");
 
+    prompt_loop();
+}
+
+/*
+ * One prompt, for as long as the machine runs.
+ *
+ * Split out of ag_shell_run because that function is the BOOT entry: it
+ * replays AUTOEXEC, prints the banner and clears the recovery streak, and
+ * a second prompt calling it did all three again - which read on the
+ * transcript as the machine having restarted.
+ */
+static void prompt_loop(void)
+{
     for (;;) {
-        /* App in the focused slot owns the keyboard; shell waits. */
-        while (!ag_session_shell_owns_keyboard()) {
+        /*
+         * App in the focused slot owns the keyboard; shell waits.
+         *
+         * A prompt bound to a slot waits for ITS slot to be the focused
+         * one as well.  There is one keyboard: two prompts may both be
+         * alive, with their own directories and their own screens, and
+         * only the one in front reads it.
+         */
+        while (!may_read_keys()) {
             ag_port_task_delay(ag_port_ms_to_ticks(50));
         }
 
@@ -5094,7 +5479,7 @@ void ag_shell_run(void)
 
         bool done = false;
         while (!done) {
-            if (!ag_session_shell_owns_keyboard()) {
+            if (!may_read_keys()) {
                 ag_console_lock();
                 ag_console_set_live(NULL, NULL);
                 ag_console_unlock();
@@ -5127,6 +5512,19 @@ void ag_shell_run(void)
                 if (s_line.len > 0) {
                     ag_lineedit_remember(&s_line, s_line.buf);
                     s_last_status = ag_shell_execute(s_line.buf);
+                    if (sh()->slot != AG_SESSION_FOLLOW) {
+                        /*
+                         * One line per command, because a prompt in a slot
+                         * of its own is out of sight: what it prints goes to
+                         * that slot's screen, and that screen lives behind
+                         * somebody's window.  A refusal would otherwise be
+                         * invisible and look exactly like a key that never
+                         * arrived - which is precisely how it looked while
+                         * this was being found.
+                         */
+                        ag_log(AG_LOG_INFO, "shell", "slot %d ran '%s' -> %d",
+                               sh()->slot, s_line.buf, (int)s_last_status);
+                    }
                 }
                 done = true;
                 break;

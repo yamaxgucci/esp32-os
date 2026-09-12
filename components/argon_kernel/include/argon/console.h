@@ -45,6 +45,67 @@ typedef struct {
 ag_err_t ag_console_init(uint16_t cols, uint16_t rows);
 bool     ag_console_ready(void);
 
+/*
+ * Changes the size of the text screen, keeping what is on it.  The size at
+ * boot is a build option (the console is up three stages before a file can be
+ * read); this is what a line in SYSTEM.CFG and a newly attached display go
+ * through afterwards.  Every endpoint gets a full repaint.
+ *
+ * -AG_ENODEV before the console exists, -AG_EINVAL outside
+ * AG_SCREEN_MAX_COLS/ROWS, -AG_ENOMEM when the new grid does not fit.  The old
+ * grid is kept on failure, so a bad size costs nothing.
+ */
+ag_err_t ag_console_resize(uint16_t cols, uint16_t rows);
+
+/*
+ * Show this slot's own screen (AG_SESSION_SYSTEM, or 0..AG_SESSION_SLOTS-1).
+ *
+ * Each slot keeps what was written to it while somebody was looking at
+ * another one; switching used to clear the single screen instead, which is
+ * why anything a program printed was gone as soon as you went to look at
+ * something else.  The screen is made the first time a slot is shown, and a
+ * machine with no memory for one goes on sharing - that is a slower version
+ * of the old behaviour, not a broken one.
+ */
+/*
+ * Send THIS task's console output to a slot's own screen, whatever is
+ * visible.  A negative slot puts it back on the visible one.
+ *
+ * For a shell that runs in a slot nobody is looking at: its output belongs
+ * to that slot's screen and must not land over the top of what is in front.
+ * Only the visible screen is rendered to the terminal, so a bound task's
+ * writes wait in their buffer until somebody looks at them.
+ *
+ * Input is not affected and cannot be: there is one keyboard, and which
+ * slot it belongs to is the session's business, not the console's.
+ */
+ag_err_t ag_console_bind_task(int slot);
+
+/*
+ * Hand an event to the prompt living in a slot.
+ *
+ * A bound task reads only its own queue, so this is the only way anything
+ * reaches it - which is the point: the keyboard belongs to whoever is in
+ * front, and a window showing somebody else's prompt is how the keys get
+ * there.  False when that slot has no prompt of its own, or its queue is
+ * full.
+ */
+bool ag_console_post_to_slot(int slot, const ag_event_t *ev);
+
+/* A slot's own screen, or NULL when it is sharing the visible one. */
+const ag_screen_t *ag_console_screen_of_slot(int slot);
+
+ag_err_t ag_console_use_slot(int slot);
+
+/*
+ * Say that the screen already in use belongs to this slot.
+ *
+ * For the one moment that needs it: the console exists before the slots do,
+ * and the boot report is on its screen.  Whoever holds the focus when the
+ * slots start has been writing there all along.
+ */
+ag_err_t ag_console_adopt_slot(int slot);
+
 /* Adds an endpoint.  It starts with a full repaint owed to it. */
 ag_err_t ag_console_attach(const ag_con_transport_t *transport, void *ctx);
 

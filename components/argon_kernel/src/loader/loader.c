@@ -521,6 +521,7 @@ static ag_err_t xip_load_chunked(ag_handle_t h, const ag_axe_header_t *header,
             ? (uint32_t)(uintptr_t)out->place.data - data_base
             : 0u;
     const uint32_t code_bias = code_addr - code_base;
+    const uint32_t data_addr = (uint32_t)(uintptr_t)out->place.data;
     const uint32_t api_val = (uint32_t)(uintptr_t)ag_loader_api();
     const uint32_t api_at = header->api_slot;
     const bool     api_in_code =
@@ -540,14 +541,43 @@ static ag_err_t xip_load_chunked(ag_handle_t h, const ag_axe_header_t *header,
         }
     }
 
+    /*
+     * The instruction relocations, all of them at once.
+     *
+     * Thirteen kilobytes for the desktop shell, against the whole image this
+     * path exists to avoid holding - and they cannot be streamed alongside the
+     * code, because the pages are programmed in order while the table is
+     * sorted by nothing the pages agree with.
+     */
+    const uint32_t inum = ag_axe_ireloc_count(header);
+    ag_axe_ireloc_t *irel = NULL;
+    if (inum > 0) {
+        const size_t ibytes = (size_t)inum * sizeof(ag_axe_ireloc_t);
+        irel = (ag_axe_ireloc_t *)ag_port_alloc(ibytes,
+                                                AG_MEM_FAST | AG_MEM_BYTE);
+        if (irel == NULL) {
+            ag_port_free(rel);
+            return -AG_ENOMEM;
+        }
+        const ag_err_t e = read_at(h, ag_axe_ireloc_offset(header), irel,
+                                   ibytes);
+        if (e != AG_OK) {
+            ag_port_free(irel);
+            ag_port_free(rel);
+            return e;
+        }
+    }
+
     uint8_t *buf = (uint8_t *)ag_port_alloc(AG_XIP_CHUNK, AG_MEM_FAST | AG_MEM_BYTE);
     if (buf == NULL) {
+        ag_port_free(irel);
         ag_port_free(rel);
         return -AG_ENOMEM;
     }
 
     /* Data part into RAM, its bss zeroed (data_alloc does not clear). */
     ag_err_t err = AG_OK;
+    uint32_t n = 0;
     if (out->place.data != NULL && header->data.file_size > 0) {
         err = read_at(h, header->data.offset, out->place.data,
                       header->data.file_size);
@@ -559,10 +589,35 @@ static ag_err_t xip_load_chunked(ag_handle_t h, const ag_axe_header_t *header,
     }
 
     for (uint32_t off = 0; err == AG_OK && off < header->code.size;
-         off += AG_XIP_CHUNK) {
-        uint32_t n = header->code.size - off;
+         off += n) {
+        n = header->code.size - off;
         if (n > AG_XIP_CHUNK) {
             n = AG_XIP_CHUNK;
+        }
+
+        /*
+         * Never cut an instruction in half.
+         *
+         * A word relocation is four-byte aligned and a page is four-byte
+         * aligned, so one can never straddle the boundary.  An instruction
+         * can: compressed instructions make two-byte alignment legal, so a
+         * four-byte instruction may begin two bytes before the end of a page.
+         * Patching half of it here and half in the next page would need the
+         * other half's original bytes, which are in the other page.
+         *
+         * So the page stops short instead.  Only the very last instruction of
+         * a full page can be affected, so this costs four bytes of a page and
+         * happens rarely; programming a shorter run is something appfs allows,
+         * and the next page picks up where this one stopped.
+         */
+        if (n == AG_XIP_CHUNK) {
+            const uint32_t edge = off + n - 2u;
+            for (uint32_t i = 0; i < inum; i++) {
+                if (AG_AXE_I_OFFSET(irel[i].site) == edge) {
+                    n -= 4u;
+                    break;
+                }
+            }
         }
         uint32_t fn = 0;
         if (off < header->code.file_size) {
@@ -596,9 +651,21 @@ static ag_err_t xip_load_chunked(ag_handle_t h, const ag_axe_header_t *header,
             w += (entry & AG_AXE_R_TO_DATA) ? data_bias : code_bias;
             memcpy(buf + (at - off), &w, 4);
         }
+        for (uint32_t i = 0; i < inum; i++) {
+            const uint32_t at = AG_AXE_I_OFFSET(irel[i].site);
+            if (at < off || at + 4u > off + n) {
+                continue;
+            }
+            if (!ag_axe_ireloc_apply(header, buf, header->code.file_size,
+                                     code_addr, data_addr, off, irel[i])) {
+                err = -AG_EFORMAT;
+                break;
+            }
+        }
         err = ag_appfs_program_at((ag_appfs_slot_t *)out->xip_slot, off, buf, n);
     }
     ag_port_free(buf);
+    ag_port_free(irel);
 
     if (err == AG_OK && out->place.data != NULL) {
         for (uint32_t i = 0; i < header->reloc_count; i++) {
@@ -857,10 +924,24 @@ static ag_err_t load_streamed(ag_handle_t h, const ag_axe_header_t *header,
         }
     }
 
+    const uint32_t inum = ag_axe_ireloc_count(header);
+    ag_axe_ireloc_t *irel = NULL;
+    if (err == AG_OK && inum > 0) {
+        const size_t ibytes = (size_t)inum * sizeof(ag_axe_ireloc_t);
+        irel = (ag_axe_ireloc_t *)ag_port_alloc(ibytes,
+                                                AG_MEM_FAST | AG_MEM_BYTE);
+        if (irel == NULL) {
+            err = -AG_ENOMEM;
+        } else {
+            err = read_at(h, ag_axe_ireloc_offset(header), irel, ibytes);
+        }
+    }
+
     if (err == AG_OK) {
         err = ag_axe_apply(&out->header, &out->place, rel,
-                           header->reloc_count, &out->binding);
+                           header->reloc_count, irel, inum, &out->binding);
     }
+    ag_port_free(irel);
     ag_port_free(rel);
 
 #if defined(CONFIG_ARGON_APP_ARENA_PSRAM)
@@ -939,7 +1020,10 @@ static ag_err_t load_whole(const char *path, const char *cwd,
 
     err = ag_axe_apply(&out->header, &out->place,
                        (const uint32_t *)(file + header->reloc_offset),
-                       header->reloc_count, &out->binding);
+                       header->reloc_count,
+                       (const ag_axe_ireloc_t *)(void *)
+                           (file + ag_axe_ireloc_offset(header)),
+                       ag_axe_ireloc_count(header), &out->binding);
     ag_port_free(file);
 
     if (err != AG_OK) {

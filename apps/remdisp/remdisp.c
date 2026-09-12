@@ -78,10 +78,11 @@ AG_DRV("REMDISP", "1.1", "argon");
  *
  * The kernel treats these as a clamp and not as a resize: a local console wider
  * than this arrives with its right-hand columns cut off rather than reflowed.
- * That is what happens today, because this board's console is eighty columns
- * and is sized at boot from its own Kconfig, before any module loads - so
- * making the two agree is a firmware decision, not something a driver can ask
- * for.  The pixels have no such problem; they are placed by size.
+ * A driver still cannot ask for a resize - it loads long after the console is
+ * built - but the size is no longer only a firmware decision either: whoever
+ * sets this link up puts `[console] cols=40 rows=25` in SYSTEM.CFG, or types
+ * `mode con cols=40 lines=25`, and then the two agree.  The pixels have no
+ * such problem; they are placed by size.
  */
 #define REM_COLS 40u
 #define REM_ROWS 25u

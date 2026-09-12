@@ -105,6 +105,11 @@ def command_for(app, defaults, extra_cflags, target_pair, forced_gcc):
         cmd += ["--include", inc]
     if cflags:
         cmd += ["--cflags", cflags]
+    if app.get("icon"):
+        # A program's own face, carried in its file (mkaxe --icon).  Kept in
+        # apps.json beside its sources because that is where everything else
+        # about how this image is built already lives.
+        cmd += ["--icon", app["icon"]]
     cmd += ["-o", "build/apps/" + app["out"]]
     cmd += app["src"]
     return cmd

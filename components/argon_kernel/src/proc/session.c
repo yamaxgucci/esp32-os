@@ -22,9 +22,25 @@
 
 #define AG_BREAKIN_DOUBLE_US 1000000ll
 
+/*
+ * A slot is a stack, not a process.
+ *
+ * `pid` is whoever is on top - the one with the keyboard, the console and the
+ * screen - and AG_PID_KERNEL means the slot's own shell.  `under[]` holds the
+ * ones it was started from, deepest first, each waiting to be top again.
+ *
+ * It has to be a stack because of what a process starting a process means:
+ * the console and the keyboard belong to the top of this slot, so a child has
+ * to be able to take them from its parent without taking a slot of its own -
+ * and give them straight back.  A child sent to some other free slot instead
+ * is a child with the screen and no keyboard, which is what this was before.
+ */
 typedef struct {
     ag_pid_t pid;
     char     name[32];
+    ag_pid_t under[AG_SESSION_DEPTH];
+    char     under_name[AG_SESSION_DEPTH][32];
+    uint8_t  nunder;
     char     cwd[AG_PATH_MAX];
 } slot_t;
 
@@ -35,6 +51,9 @@ static int      s_focused = 0; /* boot: user slot 1 (index 0) */
 static int      s_last_user_slot = 0;
 static ag_pid_t s_last_user = AG_PID_KERNEL;
 static int64_t  s_last_breakin_us;
+
+/* Both ends of a focus change have to hear about it; defined below. */
+static void notify_focus(ag_pid_t prev_pid, ag_pid_t next_pid);
 
 static void cwd_set_default(char *cwd, size_t n)
 {
@@ -98,6 +117,17 @@ void ag_session_init(void)
     s_last_user_slot = 0;
     s_last_user = AG_PID_KERNEL;
     s_last_breakin_us = 0;
+    /*
+     * The screen the console already has is this slot's.
+     *
+     * Everything printed since power-on - the boot report, what the drivers
+     * had to say - was written by whoever holds the focus now, and that is
+     * slot 1.  Without this the console goes on believing that screen is the
+     * system's, and the first return to slot 1 hands it a blank one.
+     */
+    if (ag_console_ready()) {
+        (void)ag_console_adopt_slot(s_focused);
+    }
     (void)ag_proc_set_foreground(AG_PID_KERNEL);
 }
 
@@ -172,12 +202,33 @@ ag_err_t ag_session_set_cwd(int slot, const char *absolute_path)
     return AG_OK;
 }
 
+/* Drops one buried entry, closing the gap it leaves. */
+static void remove_buried(slot_t *sl, int at)
+{
+    for (int j = at; j + 1 < (int)sl->nunder; j++) {
+        sl->under[j] = sl->under[j + 1];
+        memcpy(sl->under_name[j], sl->under_name[j + 1],
+               sizeof(sl->under_name[j]));
+    }
+    sl->nunder--;
+}
+
+/*
+ * Forget `pid` everywhere, top or buried.  A pid appearing twice would be a
+ * bug elsewhere, so this keeps looking rather than stopping at the first.
+ */
 static void clear_pid_from_slots(ag_pid_t pid)
 {
     for (int i = 0; i < AG_SESSION_SLOTS; i++) {
-        if (s_slots[i].pid == pid) {
-            s_slots[i].pid = AG_PID_KERNEL;
-            s_slots[i].name[0] = '\0';
+        slot_t *sl = &s_slots[i];
+        for (int j = (int)sl->nunder - 1; j >= 0; j--) {
+            if (sl->under[j] == pid) {
+                remove_buried(sl, j);
+            }
+        }
+        if (sl->pid == pid) {
+            sl->pid = AG_PID_KERNEL;
+            sl->name[0] = '\0';
         }
     }
 }
@@ -197,6 +248,69 @@ ag_err_t ag_session_bind_to(ag_pid_t pid, const char *name, int slot)
         strncpy(s_slots[slot].name, name, sizeof(s_slots[slot].name) - 1);
     }
     return AG_OK;
+}
+
+ag_err_t ag_session_push_to(ag_pid_t pid, const char *name, int slot)
+{
+    if (pid == AG_PID_KERNEL || !is_user_slot(slot) || s_slots == NULL) {
+        return -AG_EINVAL;
+    }
+
+    slot_t *sl = &s_slots[slot];
+    if (sl->pid == pid) {
+        return AG_OK; /* already the top of exactly this slot */
+    }
+    if (sl->pid == AG_PID_KERNEL) {
+        return ag_session_bind_to(pid, name, slot); /* nothing to push over */
+    }
+    if (sl->nunder >= AG_SESSION_DEPTH) {
+        return -AG_ENFILE;
+    }
+
+    /* It may be sitting in another slot; it must not be in two at once. */
+    clear_pid_from_slots(pid);
+
+    sl->under[sl->nunder] = sl->pid;
+    memcpy(sl->under_name[sl->nunder], sl->name, sizeof(sl->name));
+    sl->nunder++;
+
+    const ag_pid_t was = sl->pid;
+    sl->pid = pid;
+    memset(sl->name, 0, sizeof(sl->name));
+    if (name != NULL) {
+        strncpy(sl->name, name, sizeof(sl->name) - 1);
+    }
+    ag_log(AG_LOG_INFO, "session", "push pid %u over %u in slot %d (depth %u)",
+           (unsigned)pid, (unsigned)was, ag_session_display_number(slot),
+           (unsigned)sl->nunder + 1u);
+
+    /*
+     * The focus did not move between slots, but it did move between processes,
+     * and both of them have to hear about it: the parent stops drawing, the
+     * child learns it may start.
+     */
+    if (s_focused == slot) {
+        notify_focus(was, pid);
+        s_last_user = pid;
+        s_last_user_slot = slot;
+    }
+    return AG_OK;
+}
+
+int ag_session_stack(int slot, ag_pid_t out[AG_SESSION_DEPTH])
+{
+    if (!is_user_slot(slot) || s_slots == NULL || out == NULL) {
+        return 0;
+    }
+    const slot_t *sl = &s_slots[slot];
+    int           n = 0;
+    for (int i = 0; i < (int)sl->nunder && n < AG_SESSION_DEPTH; i++) {
+        out[n++] = sl->under[i];
+    }
+    if (sl->pid != AG_PID_KERNEL && n < AG_SESSION_DEPTH) {
+        out[n++] = sl->pid;
+    }
+    return n;
 }
 
 ag_err_t ag_session_bind(ag_pid_t pid, const char *name)
@@ -221,22 +335,80 @@ ag_err_t ag_session_bind(ag_pid_t pid, const char *name)
 
 void ag_session_unbind(ag_pid_t pid)
 {
+    if (pid == AG_PID_KERNEL || s_slots == NULL) {
+        return;
+    }
+
+    /*
+     * Buried, not top: a parent that died while its child is still running.
+     * Take it out of the stack and leave the top alone - the child still owns
+     * the screen, and pulling it out from under would be a worse answer than
+     * letting it finish.
+     */
+    for (int i = 0; i < AG_SESSION_SLOTS; i++) {
+        slot_t *sl = &s_slots[i];
+        if (sl->pid == pid) {
+            continue;
+        }
+        for (int j = (int)sl->nunder - 1; j >= 0; j--) {
+            if (sl->under[j] == pid) {
+                ag_log(AG_LOG_INFO, "session",
+                       "unbind pid %u from under slot %d (child still on top)",
+                       (unsigned)pid, ag_session_display_number(i));
+                remove_buried(sl, j);
+            }
+        }
+    }
+
     const int slot = ag_session_slot_of(pid);
     if (slot < 0) {
         return;
     }
+
+    slot_t *sl = &s_slots[slot];
     ag_log(AG_LOG_INFO, "session", "unbind pid %u from slot %d (was %s)",
            (unsigned)pid, ag_session_display_number(slot),
-           s_slots[slot].name[0] ? s_slots[slot].name : "?");
-    s_slots[slot].pid = AG_PID_KERNEL;
-    s_slots[slot].name[0] = '\0';
-    if (s_last_user == pid) {
-        s_last_user = AG_PID_KERNEL;
+           sl->name[0] ? sl->name : "?");
+
+    /* Pop: whoever started it becomes the top again. */
+    ag_pid_t next = AG_PID_KERNEL;
+    if (sl->nunder > 0u) {
+        sl->nunder--;
+        next = sl->under[sl->nunder];
+        memcpy(sl->name, sl->under_name[sl->nunder], sizeof(sl->name));
+        sl->under[sl->nunder] = AG_PID_KERNEL;
+    } else {
+        sl->name[0] = '\0';
     }
-    if (s_focused == slot) {
+    sl->pid = next;
+
+    if (s_last_user == pid) {
+        s_last_user = next;
+    }
+
+    if (s_focused != slot) {
+        return;
+    }
+
+    if (next == AG_PID_KERNEL) {
+        /* Back to the slot's own shell, exactly as before. */
         (void)ag_proc_set_foreground(AG_PID_KERNEL);
         ag_supervisor_raise_shell_interrupt();
+        return;
     }
+
+    /*
+     * Back to the parent, which is the whole point of the stack: it is told it
+     * has the focus again so it repaints, and it becomes foreground so its
+     * console writes reach the screen rather than the journal.
+     */
+    ag_log(AG_LOG_INFO, "session", "slot %d back to pid %u (%s)",
+           ag_session_display_number(slot), (unsigned)next,
+           sl->name[0] ? sl->name : "?");
+    (void)ag_proc_set_foreground(next);
+    notify_focus(pid, next);
+    s_last_user = next;
+    s_last_user_slot = slot;
 }
 
 static void notify_focus(ag_pid_t prev_pid, ag_pid_t next_pid)
@@ -263,8 +435,16 @@ static void enter_shell_view(int slot)
     }
 
     if (ag_console_ready()) {
+        /*
+         * The slot's own screen, and NOT cleared.
+         *
+         * Clearing was how one screen was made to serve four slots: without
+         * it, slot 2 read as the tail of slot 1.  Each has its own now, so
+         * what is on this one is what it had when it was last looked at -
+         * which is the whole reason for going back to a slot.
+         */
+        (void)ag_console_use_slot(slot);
         ag_console_lock();
-        ag_screen_cls(ag_console_screen());
         ag_screen_set_attr(ag_console_screen(), AG_ATTR_DEFAULT);
         ag_screen_set_cursor(ag_console_screen(), true);
         ag_console_unlock();
@@ -291,14 +471,55 @@ static void enter_loading_view(int slot, ag_pid_t pid)
 {
     const char *name = s_slots[slot].name[0] ? s_slots[slot].name : "app";
 
+    /*
+     * Unless it is already painting.
+     *
+     * "Loading" is a state of the loader, not of the application: a process is
+     * adopted into its slot a little after it starts running, and a small .AXE
+     * on a fast panel can acquire the display and put a whole frame on the
+     * glass inside that window.  Entering the loading view then took the
+     * screen away from a running application - `display: release: owner pid 1,
+     * by pid 0` - and nothing ever gave it back: every later flush was dropped
+     * without a word, no input reached it, and what a person saw was a console
+     * over the top of one frozen frame.  Reported as "the shell loaded and
+     * seems to have crashed", which is exactly what it looks like.
+     *
+     * The view exists to say "this app cannot paint yet".  An app that has
+     * already painted needs nothing said for it.
+     */
+    if (ag_display_acquired() && ag_display_owner() == pid) {
+        ag_log(AG_LOG_INFO, "session",
+               "loading view skipped: pid %u already owns the display",
+               (unsigned)pid);
+        return;
+    }
+
     ag_log(AG_LOG_INFO, "session", "enter_loading_view slot %d pid %u (%s)",
            ag_session_display_number(slot), (unsigned)pid, name);
 
-    if (ag_display_acquired()) {
+    /*
+     * Asked again, and about the owner rather than about the lock.
+     *
+     * The check above cannot be the only one: ag_log goes out of a UART at
+     * 115200 baud and the line above costs a couple of hundred milliseconds,
+     * which is long enough for the application to acquire the display in
+     * between.  That is not a theoretical window - it is the one this ran into
+     * on the CYD, where the check said "free", the log went out, and the
+     * release then took the glass from a process that had already painted.
+     *
+     * Whose it is decides, and never this process's own.
+     */
+    if (ag_display_acquired() && ag_display_owner() != pid) {
         ag_display_force_release();
     }
 
     if (ag_console_ready()) {
+        /*
+         * This one IS cleared, on the slot's own screen: "please wait" is
+         * about what is happening now, and what was there belonged to
+         * whatever ran in this slot before.
+         */
+        (void)ag_console_use_slot(slot);
         ag_console_lock();
         ag_screen_cls(ag_console_screen());
         ag_screen_set_attr(ag_console_screen(), AG_ATTR_DEFAULT);

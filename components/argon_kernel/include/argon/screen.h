@@ -94,6 +94,23 @@ size_t ag_screen_memsize(uint16_t cols, uint16_t rows);
 ag_err_t ag_screen_init(ag_screen_t *s, void *mem, size_t memsize,
                         uint16_t cols, uint16_t rows);
 
+/*
+ * Like ag_screen_init, but carries the picture over from `src` - what a
+ * resize is.  `dst` and `src` may be the same struct only if they do not share
+ * memory; the caller frees the old block afterwards.
+ *
+ * The overlap is copied rather than cleared, because the screenful worth
+ * keeping is the one already on it.  When the new grid is shorter, the rows
+ * kept are the ones ENDING at the cursor: that is what a terminal does when
+ * its window is dragged smaller, and it keeps the newest output instead of
+ * the oldest.  Attributes, the cursor and its visibility come across, clamped
+ * into the new grid; the generation is bumped so a renderer that skips work
+ * when nothing moved does not skip this.
+ */
+ag_err_t ag_screen_recreate(ag_screen_t *dst, void *mem, size_t memsize,
+                            uint16_t cols, uint16_t rows,
+                            const ag_screen_t *src);
+
 /* Writes text, interpreting control characters and escape sequences. */
 void ag_screen_write(ag_screen_t *s, const char *buf, size_t len);
 void ag_screen_puts(ag_screen_t *s, const char *str);

@@ -430,6 +430,171 @@ static const ag_dev_ops_t k_fb_ops = {
     .size = fb_size,
 };
 
+/* ---------------------------------------------------------------------- */
+/* A surfaceless panel that is really a framebuffer - for the emulator     */
+/* ---------------------------------------------------------------------- */
+/*
+ * Why this shim exists.
+ *
+ * `[display] driver = panel` means "no system surface; the application brings
+ * its own pixels and hands them over as rectangles".  On a board that is
+ * literally true: the panel is a loadable .SYS with a blit_rect, and nothing
+ * here holds a frame.  Under QEMU it is not: the emulated screen is a
+ * framebuffer this port is handed a pointer to, and there is no driver that
+ * takes rectangles at all.  So surfaceless mode in the emulator had no panel,
+ * acquire answered -AG_ENODEV, and the whole path was untestable without
+ * hardware.
+ *
+ * That gap is not academic - it is exactly where a bug lived.  The stride
+ * check in gfx_present refused every band narrower than the screen, and the
+ * only machine that could have noticed was a board with a touchscreen and a
+ * person in front of it.  A frame-backed panel presented as a rectangle-taking
+ * device closes it: the same code path, the same present, in an emulator that
+ * can be photographed.
+ */
+static uint16_t *s_shim_fb;
+static uint16_t  s_shim_w, s_shim_h;
+
+/*
+ * Rows written since the emulator was last told, and when it was told.
+ *
+ * One kick per frame rather than one per strip, and the difference is
+ * measured: a drag step in band mode cost 339 ms under the emulator against
+ * 22 ms on a real panel, which is six strips each paying the port's fifty
+ * millisecond wait for the previous one to finish (see wait_idle in
+ * components/argon_port/idf/src/panel_hw.c).  The rows are the same rows
+ * either way; only the number of requests changes.
+ *
+ * Coalescing cannot be unconditional, because an application need not ever
+ * say "frame done": it may present and present and never flush.  So a kick
+ * also goes out when the pending rows have been waiting longer than a frame
+ * is worth, which bounds the delay for a caller that says nothing and costs
+ * nothing for one that does.
+ */
+/*
+ * How the deferral decides, and why not by a clock.
+ *
+ * The first attempt held the rows for twelve milliseconds since the last
+ * kick - which never held anything, because a kick itself waits up to fifty
+ * for the emulator, so the threshold was always already past.  Time cannot
+ * measure "is a frame still being assembled" when the measurement includes
+ * the waiting.
+ *
+ * What answers it is the caller.  An application that says "frame done" once
+ * is trusted to keep saying it, and until it does its strips are held; one
+ * that has never said it gets a kick per strip, exactly as before.  The
+ * safety net is for an application that says it once and then stops.
+ */
+#define AG_SHIM_SAFETY_US 200000
+static int32_t  s_shim_y0 = -1;
+static int32_t  s_shim_y1 = -1;
+static uint64_t s_shim_pending_us;
+static bool     s_shim_trusted;
+
+static void shim_kick(void)
+{
+    if (s_shim_y0 < 0 || s_shim_y1 <= s_shim_y0) {
+        return;
+    }
+    const int32_t y = s_shim_y0;
+    const int32_t h = s_shim_y1 - s_shim_y0;
+    s_shim_y0 = -1;
+    s_shim_y1 = -1;
+    if (s_screen_on) {
+        ag_port_panel_present(y, h);
+    }
+}
+
+static ag_err_t shim_info(ag_handle_t h, ag_gfxinfo_t *out)
+{
+    (void)h;
+    if (out == NULL || s_shim_fb == NULL) {
+        return -AG_ENODEV;
+    }
+    out->width = s_shim_w;
+    out->height = s_shim_h;
+    out->fmt = AG_PIX_RGB565;
+    out->stride = (uint32_t)s_shim_w * sizeof(uint16_t);
+    out->fb = NULL; /* not for drawing into: hand rectangles over */
+    out->double_buf = false;
+    out->direct = true;
+    return AG_OK;
+}
+
+static void shim_blit_rect(ag_handle_t h, const ag_blit_t *b)
+{
+    (void)h;
+    if (b == NULL || b->px == NULL || s_shim_fb == NULL) {
+        return;
+    }
+    if (b->x >= s_shim_w || b->y >= s_shim_h) {
+        return;
+    }
+    uint16_t w = b->w;
+    uint16_t hgt = b->h;
+    if (w > (uint16_t)(s_shim_w - b->x)) {
+        w = (uint16_t)(s_shim_w - b->x);
+    }
+    if (hgt > (uint16_t)(s_shim_h - b->y)) {
+        hgt = (uint16_t)(s_shim_h - b->y);
+    }
+    if (w == 0 || hgt == 0) {
+        return;
+    }
+    /*
+     * The stride is the rectangle's, not the picture's - which is the whole
+     * point of ag_blit_t and the thing this shim has to get right, because a
+     * band renderer hands over a tight buffer.
+     */
+    for (uint16_t row = 0; row < hgt; row++) {
+        const uint16_t *src =
+            (const uint16_t *)(const void *)((const uint8_t *)b->px +
+                                             (size_t)row * b->stride);
+        uint16_t *dst = s_shim_fb + (size_t)(b->y + row) * s_shim_w + b->x;
+        for (uint16_t i = 0; i < w; i++) {
+            dst[i] = src[i];
+        }
+    }
+    /* Pending, not sent - see the note above shim_kick. */
+    const int32_t y0 = (int32_t)b->y;
+    const int32_t y1 = y0 + (int32_t)hgt;
+    if (s_shim_y0 < 0) {
+        s_shim_pending_us = ag_port_us();
+        s_shim_y0 = y0;
+    } else if (y0 < s_shim_y0) {
+        s_shim_y0 = y0;
+    }
+    if (y1 > s_shim_y1) {
+        s_shim_y1 = y1;
+    }
+    if (!s_shim_trusted ||
+        ag_port_us() - s_shim_pending_us >= AG_SHIM_SAFETY_US) {
+        shim_kick();
+    }
+}
+
+static const ag_display_ops_t k_shim_class_ops = {
+    .size = sizeof(ag_display_ops_t),
+    .info = shim_info,
+    .blit_rect = shim_blit_rect,
+};
+
+/*
+ * A device needs byte ops as well as class ops - the registry refuses one
+ * without them - and for a screen the honest answer to "how big are you" is
+ * the frame it stands for.  Reading and writing it as bytes is fb0's job on
+ * machines that have an fb0; here there is deliberately no surface to expose.
+ */
+static uint64_t shim_bytes(ag_device_t *dev)
+{
+    (void)dev;
+    return (uint64_t)s_shim_w * (uint64_t)s_shim_h * sizeof(uint16_t);
+}
+
+static const ag_dev_ops_t k_shim_ops = {
+    .size = shim_bytes,
+};
+
 static ag_err_t gfx_acquire(ag_gfxinfo_t *out);
 static void     gfx_release(void);
 static void     gfx_flush(uint16_t x, uint16_t y, uint16_t w, uint16_t h);
@@ -493,17 +658,36 @@ static const ag_display_ops_t k_fb_class_ops = {
 /* gfx API                                                                 */
 /* ---------------------------------------------------------------------- */
 
+/*
+ * May this caller put pixels on the panel?
+ *
+ * Whoever holds the display may, and that is the important clause.  The
+ * focused-slot test below it is a safety net against an application in a
+ * background slot painting over the foreground - which cannot happen to the
+ * holder, because moving focus away force-releases the display from under it
+ * (see ag_session_focus in src/proc/session.c).  So an owner is by
+ * construction the process entitled to draw.
+ *
+ * Testing focus *instead* of ownership cost a long hunt.  A process is adopted
+ * into its slot a little after it starts running, and in that window it can
+ * acquire the display, draw a whole screen and flush it, and every flush is
+ * dropped without a word: acquire said yes, the drawing calls said nothing,
+ * and the panel kept showing the console.  Whether it happened at all depended
+ * on how long the first paint took - the desktop shell lost the race on a
+ * 320x240 surface every single time and won it on 640x400, which is as
+ * confusing a symptom as this system has produced.
+ */
 static bool gfx_may_present(void)
 {
     if (!s_acquired) {
         return false;
     }
-    /* Safety net: ignore flush/swap from a background session slot. */
     const ag_pid_t me = ag_proc_self();
-    if (me != AG_PID_KERNEL && me != ag_session_focused_pid()) {
-        return false;
+    if (me == AG_PID_KERNEL || me == s_owner) {
+        return true;
     }
-    return true;
+    /* Safety net: ignore flush/swap from a background session slot. */
+    return me == ag_session_focused_pid();
 }
 
 static ag_err_t gfx_acquire(ag_gfxinfo_t *out)
@@ -576,7 +760,17 @@ static void gfx_release(void)
     if (!s_acquired) {
         return;
     }
+    /*
+     * Who lost the glass, and to whom.  A release is invisible from outside
+     * and there are four roads into it, three of them force_release from the
+     * session; when an application is still running but its flushes have
+     * silently stopped reaching the panel, this line is the difference between
+     * knowing and guessing.
+     */
+    ag_log(AG_LOG_INFO, "display", "release: owner pid %u, by pid %u",
+           (unsigned)s_owner, (unsigned)ag_proc_self());
     if (s_surfaceless) {
+        shim_kick(); /* whatever was still pending is this app's last frame */
         s_acquired = false;
         s_owner = AG_PID_KERNEL;
         /* The panel still has the application's last frame on it; the console
@@ -610,6 +804,21 @@ static void gfx_release(void)
 static void gfx_flush(uint16_t x, uint16_t y, uint16_t w, uint16_t h)
 {
     if (!gfx_may_present()) {
+        return;
+    }
+    /*
+     * With no surface there is nothing to copy, and flush means the one thing
+     * it can mean: the frame the caller has been handing over in pieces is
+     * finished, so show it.  A caller that never says this is not punished -
+     * see shim_kick - but one that does gets its whole frame in one request.
+     */
+    if (s_surfaceless) {
+        (void)x;
+        (void)y;
+        (void)w;
+        (void)h;
+        s_shim_trusted = true;
+        shim_kick();
         return;
     }
     if (w == 0 || h == 0) {
@@ -657,7 +866,24 @@ static ag_err_t gfx_present(const ag_blit_t *in)
     if (b.h == 0 || b.h > (uint16_t)(b.surf_h - b.y)) {
         b.h = (uint16_t)(b.surf_h - b.y);
     }
-    if (b.stride < (uint32_t)b.surf_w * sizeof(uint16_t)) {
+    /*
+     * The stride belongs to the RECTANGLE, not to the picture.
+     *
+     * This used to demand `surf_w` rows, which quietly required the caller to
+     * hold a surface-wide buffer - the one thing ag_blit_t's own contract
+     * promises it will not ask for, in as many words: "a renderer that
+     * produces sixteen rows at a time ... has no such corner to point at".
+     * A band renderer hands over a tight buffer of exactly `w` pixels a row,
+     * and every such call was refused with -AG_EINVAL.
+     *
+     * What that looked like, because it is worth recognising again: the
+     * desktop shell on a surfaceless panel drew its whole screen correctly
+     * (one full-width band after another, which passed) and then never
+     * changed anything narrower again.  Selecting an icon did nothing, a menu
+     * highlighted its title but dropped no list - the repaints happened, cost
+     * their milliseconds, and were thrown away at this line.
+     */
+    if (b.stride < (uint32_t)b.w * sizeof(uint16_t)) {
         return -AG_EINVAL;
     }
 
@@ -1120,6 +1346,21 @@ void ag_display_show_overlay(const char *label)
     panel_present();
 }
 
+bool ag_display_text_cells(uint16_t *cols, uint16_t *rows)
+{
+    uint16_t w = 0, h = 0;
+    if (!ag_display_size(&w, &h)) {
+        return false;
+    }
+    if (cols != NULL) {
+        *cols = (uint16_t)(w / AG_FONT8X16_W);
+    }
+    if (rows != NULL) {
+        *rows = (uint16_t)(h / AG_FONT8X16_H);
+    }
+    return true;
+}
+
 static void paint_console_cell(const ag_screen_t *screen, uint16_t col,
                                uint16_t row, bool invert)
 {
@@ -1140,6 +1381,16 @@ static void paint_console_cell(const ag_screen_t *screen, uint16_t col,
     draw_glyph((int32_t)col * AG_FONT8X16_W, (int32_t)row * AG_FONT8X16_H,
                (uint8_t)cell.ch, k_cga565[fg], k_cga565[bg]);
 }
+
+/*
+ * Forget what is believed to be on the console.
+ *
+ * The framebuffer console sends only what changed since the generation it
+ * last drew, which is right until the screen underneath is replaced by a
+ * different one - a slot switch - and then "what changed" is a comparison
+ * against somebody else's picture.
+ */
+void ag_display_console_dirty(void) { s_console_gen = 0; }
 
 void ag_display_render_console(const ag_screen_t *screen)
 {
@@ -1289,25 +1540,6 @@ ag_err_t ag_display_init(void)
         return AG_OK;
     }
 
-    /*
-     * No surface at all, and the panel driver does the showing.  Nothing is
-     * allocated and nothing is registered: fb0 would be a display device with
-     * no display in it.
-     */
-    if (ag_path_icmp(driver, "panel") == 0) {
-        s_surfaceless = true;
-        s_ready = true;
-        ag_log(AG_LOG_INFO, "display",
-               "no system surface; applications bring their own (present)");
-        return AG_OK;
-    }
-
-    /* Soft is the only backend without a board; unknown names fall back to it. */
-    if (ag_path_icmp(driver, "soft") != 0) {
-        ag_log(AG_LOG_WARN, "display",
-               "driver '%s' not built in; using soft framebuffer", driver);
-    }
-
     uint16_t w = board->display.width;
     uint16_t h = board->display.height;
     if (w == 0) {
@@ -1321,6 +1553,55 @@ ag_err_t ag_display_init(void)
     }
     if (h > AG_DISPLAY_MAX_H) {
         h = AG_DISPLAY_MAX_H;
+    }
+
+    /*
+     * No surface at all, and the panel driver does the showing.  Nothing is
+     * allocated: fb0 would be a display device with no display in it.
+     *
+     * One thing IS registered, and only where it applies - see the shim
+     * above: under QEMU the screen is a framebuffer this port owns rather
+     * than a driver that takes rectangles, and without a rectangle-taking
+     * device there is nothing for a surfaceless application to present to.
+     * On real hardware ag_port_panel_open fails and the panel .SYS is the
+     * device, which is the arrangement this mode was written for.
+     */
+    if (ag_path_icmp(driver, "panel") == 0) {
+        s_surfaceless = true;
+        s_ready = true;
+
+        void *fb = NULL;
+        if (ag_port_panel_open(w, h, &fb) && fb != NULL) {
+            s_shim_fb = (uint16_t *)fb;
+            s_shim_w = w;
+            s_shim_h = h;
+            const ag_dev_desc_t desc = {
+                .name = "panel0",
+                .driver = "fbpanel",
+                .cls = AG_DEV_DISPLAY,
+                .flags = 0,
+                .ops = &k_shim_ops,
+                .class_ops = &k_shim_class_ops,
+                .priv = fb,
+            };
+            if (ag_dev_register(&desc, &s_dev) == AG_OK) {
+                ag_log(AG_LOG_INFO, "display",
+                       "no system surface; %ux%u panel0 takes rectangles",
+                       (unsigned)w, (unsigned)h);
+                return AG_OK;
+            }
+            s_shim_fb = NULL;
+        }
+
+        ag_log(AG_LOG_INFO, "display",
+               "no system surface; applications bring their own (present)");
+        return AG_OK;
+    }
+
+    /* Soft is the only backend without a board; unknown names fall back to it. */
+    if (ag_path_icmp(driver, "soft") != 0) {
+        ag_log(AG_LOG_WARN, "display",
+               "driver '%s' not built in; using soft framebuffer", driver);
     }
 
     const size_t bytes = (size_t)w * (size_t)h * sizeof(uint16_t);

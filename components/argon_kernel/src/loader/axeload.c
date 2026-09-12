@@ -5,11 +5,20 @@
  */
 #include <argon/axeload.h>
 
+#include <stddef.h>
 #include <string.h>
 
 /* Sanity limits: an application asking for more than this is a broken file. */
 #define AG_AXE_MAX_PART (8u * 1024u * 1024u)
 #define AG_AXE_MAX_RELOCS (64u * 1024u)
+
+/*
+ * Instruction relocations are two words each and there are more of them - a
+ * RISC-V image names one for every reference to a global, where xtensa names
+ * one per literal - so the same ceiling in entries is twice the bytes.  The
+ * desktop shell, the largest in the tree, has sixteen hundred.
+ */
+#define AG_AXE_MAX_IRELOCS (64u * 1024u)
 
 ag_axe_arch_t ag_axe_native_arch(void)
 {
@@ -79,13 +88,25 @@ ag_err_t ag_axe_validate(const ag_axe_header_t *header, size_t file_bytes,
     if (header == NULL) {
         return -AG_EINVAL;
     }
-    if (file_bytes < sizeof(ag_axe_header_t)) {
+    if (file_bytes < AG_AXE_HEADER_MIN) {
         return -AG_EFORMAT;
     }
     if (memcmp(header->magic, AG_AXE_MAGIC_STR, 4) != 0) {
         return -AG_EFORMAT;
     }
-    if (header->header_size < sizeof(ag_axe_header_t)) {
+    /*
+     * Big enough to hold what a loader must have, not as big as this loader
+     * happens to be.
+     *
+     * The difference is the whole point of header_size, and getting it wrong is
+     * not subtle: comparing against sizeof(ag_axe_header_t) means the day a
+     * field is added, every image ever built becomes -AG_EFORMAT - which is
+     * what happened, and what it looked like was a board whose panel driver
+     * stopped loading with no other change than a new kernel.  Fields past the
+     * minimum are optional and are asked for through accessors that check for
+     * themselves.
+     */
+    if (header->header_size < AG_AXE_HEADER_MIN) {
         return -AG_EFORMAT;
     }
 
@@ -162,6 +183,23 @@ ag_err_t ag_axe_validate(const ag_axe_header_t *header, size_t file_bytes,
         return -AG_EFORMAT;
     }
 
+    /*
+     * The instruction relocations, if this image is new enough to have any.
+     *
+     * A header that stops before the fields cannot have them, and an image
+     * built by an older tool must keep loading exactly as it did - which is
+     * what header_size is for.  Read through the header rather than off the
+     * struct so a short header is never read past its end.
+     */
+    if (ag_axe_ireloc_count(header) > AG_AXE_MAX_IRELOCS) {
+        return -AG_EFORMAT;
+    }
+    if ((uint64_t)ag_axe_ireloc_offset(header) +
+            (uint64_t)ag_axe_ireloc_count(header) * sizeof(ag_axe_ireloc_t) >
+        file_bytes) {
+        return -AG_EFORMAT;
+    }
+
     /* Execution starts in the code part; the API slot is a variable, so it can
      * be in either, and in practice it is in the data part's bss. */
     if (!part_covers(&header->code, header->entry, 1)) {
@@ -190,9 +228,114 @@ void *ag_axe_resolve(const ag_axe_header_t *header, const ag_axe_place_t *place,
     return NULL;
 }
 
+/*
+ * How much of the header this image actually has.
+ *
+ * Two words were added after `reserved`, so an image built before them has a
+ * shorter header and no table.  Asked through these two rather than by reading
+ * the fields directly, because reading a field an image does not have is
+ * reading whatever follows it in memory - which for a header read into a
+ * struct is the struct's own tail, and would be believed.
+ */
+uint32_t ag_axe_ireloc_count(const ag_axe_header_t *header)
+{
+    if (header == NULL ||
+        header->header_size < offsetof(ag_axe_header_t, ireloc_count) +
+                                  sizeof(uint32_t)) {
+        return 0;
+    }
+    return header->ireloc_count;
+}
+
+uint32_t ag_axe_ireloc_offset(const ag_axe_header_t *header)
+{
+    if (ag_axe_ireloc_count(header) == 0) {
+        return 0;
+    }
+    return header->ireloc_offset;
+}
+
+/*
+ * Put an address into an instruction, leaving the rest of it alone.
+ *
+ * RISC-V builds an address out of two instructions: `lui` carries the top
+ * twenty bits and an `addi`/`lw`/`sw` the low twelve, sign-extended.  The
+ * rounding in the high half is what makes the pair agree: the low half is
+ * signed, so for half of all addresses it subtracts, and the high half has to
+ * have been rounded up by one to match.  Getting that wrong is wrong by
+ * exactly 4096, on exactly those addresses whose low twelve bits are 0x800 or
+ * more - which is a bug that works most of the time.
+ *
+ * Written from the target address alone, so applying it twice is the same as
+ * applying it once.  The streamed XIP path relies on that.
+ *
+ * Byte-wise, because an instruction is only two-byte aligned once compressed
+ * instructions are in play.  That is safe here and would not be on xtensa,
+ * whose instruction memory refuses unaligned access - but an xtensa image has
+ * no entries of this kind at all, because there an address lives in a literal
+ * pool as a plain word.
+ */
+static void ireloc_patch(uint8_t *at, uint32_t kind, uint32_t addr)
+{
+    uint32_t word;
+    memcpy(&word, at, sizeof(word));
+
+    switch (kind) {
+    case AG_AXE_I_HI20:
+        word = ((addr + 0x800u) & 0xFFFFF000u) | (word & 0xFFFu);
+        break;
+    case AG_AXE_I_LO12_I:
+        word = ((addr & 0xFFFu) << 20) | (word & 0x000FFFFFu);
+        break;
+    case AG_AXE_I_LO12_S:
+        word = ((((addr >> 5) & 0x7Fu) << 25) | (word & 0x01FFF07Fu) |
+                ((addr & 0x1Fu) << 7));
+        break;
+    default:
+        return; /* a kind this loader does not know; validation refused it */
+    }
+    memcpy(at, &word, sizeof(word));
+}
+
+/*
+ * One entry, checked against the image it claims to describe.
+ *
+ * Returns false when the entry points outside the part it says it is in, which
+ * is a file disagreeing with itself; the caller refuses the image rather than
+ * writing past an allocation.
+ */
+bool ag_axe_ireloc_apply(const ag_axe_header_t *header, uint8_t *code_bytes,
+                         uint32_t code_stored, uint32_t code_addr,
+                         uint32_t data_addr, uint32_t code_off,
+                         ag_axe_ireloc_t entry)
+{
+    const uint32_t at = AG_AXE_I_OFFSET(entry.site);
+    const uint32_t kind = AG_AXE_I_KIND(entry.site);
+    const bool     to_data = (entry.site & AG_AXE_I_TO_DATA) != 0;
+
+    if (code_stored < 4u || at > code_stored - 4u) {
+        return false;
+    }
+    if (to_data) {
+        if (entry.target > header->data.size) {
+            return false;
+        }
+    } else if (entry.target > header->code.size) {
+        return false;
+    }
+    if (at < code_off) {
+        return true; /* not in the window the caller is holding */
+    }
+
+    const uint32_t base = to_data ? data_addr : code_addr;
+    ireloc_patch(code_bytes + (at - code_off), kind, base + entry.target);
+    return true;
+}
+
 ag_err_t ag_axe_apply(const ag_axe_header_t *header,
                       const ag_axe_place_t *place, const uint32_t *relocs,
-                      uint32_t reloc_count, ag_axe_binding_t *out)
+                      uint32_t reloc_count, const ag_axe_ireloc_t *irelocs,
+                      uint32_t ireloc_count, ag_axe_binding_t *out)
 {
     if (header == NULL || place == NULL || out == NULL) {
         return -AG_EINVAL;
@@ -223,6 +366,12 @@ ag_err_t ag_axe_apply(const ag_axe_header_t *header,
         return -AG_EINVAL;
     }
     if (reloc_count > 0 && relocs == NULL) {
+        return -AG_EINVAL;
+    }
+    if (ireloc_count != ag_axe_ireloc_count(header)) {
+        return -AG_EINVAL;
+    }
+    if (ireloc_count > 0 && irelocs == NULL) {
         return -AG_EINVAL;
     }
 
@@ -290,6 +439,24 @@ ag_err_t ag_axe_apply(const ag_axe_header_t *header,
         memcpy(slot, &word, sizeof(word));
     }
 
+    /*
+     * And the addresses that live inside instructions.  Same biases, different
+     * arithmetic: there is no word to add to, so each one is re-encoded from
+     * the address it should end up holding.  Patched into the writable view for
+     * the same reason the words are, while the address written is the final
+     * one.
+     */
+    for (uint32_t i = 0; i < ireloc_count; i++) {
+        if ((irelocs[i].site & AG_AXE_I_TO_DATA) != 0 && data == NULL) {
+            return -AG_EFORMAT;
+        }
+        if (!ag_axe_ireloc_apply(header, code_write, header->code.file_size,
+                                 (uint32_t)(uintptr_t)code_final,
+                                 (uint32_t)(uintptr_t)data, 0u, irelocs[i])) {
+            return -AG_EFORMAT;
+        }
+    }
+
     out->code_base = (uintptr_t)code_final;
     out->data_base = (uintptr_t)data;
     out->entry = (void *)(code_final + (header->entry - header->code.base));
@@ -303,7 +470,7 @@ ag_err_t ag_axe_apply(const ag_axe_header_t *header,
     if (out->entry == NULL || out->api_slot == NULL) {
         return -AG_EFORMAT;
     }
-    out->relocated = reloc_count;
+    out->relocated = reloc_count + ireloc_count;
     return AG_OK;
 }
 

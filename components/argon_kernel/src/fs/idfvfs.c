@@ -277,13 +277,32 @@ static int to_posix_flags(uint32_t flags)
     return out;
 }
 
+/*
+ * A POSIX stat as this system's stat, and the two fields a filesystem may
+ * simply not have.
+ *
+ * **mtime.** littlefs keeps it as an optional attribute, and esp_littlefs
+ * answers (time_t)-1 when the attribute is not there - which every file
+ * written by tools\mksysfs.py is, because littlefs-python does not write it.
+ * Copied straight across, that -1 sign-extends into a date around the year
+ * three million, which is what the desktop's properties box showed.  The ABI
+ * already has a word for this: zero means unknown.
+ *
+ * **read-only.** littlefs has no permission bits at all - vfs_littlefs_stat
+ * sets st_mode to exactly S_IFREG or S_IFDIR - so testing S_IWUSR marked
+ * every file on C: read-only.  FAT does carry the bits, so the test is kept
+ * and gated on the mode actually having some: a filesystem that says nothing
+ * about permissions must not be read as saying no.
+ */
 static void fill_stat(const struct stat *st, ag_stat_t *out)
 {
     memset(out, 0, sizeof(*out));
     out->size = (uint64_t)st->st_size;
-    out->mtime = (uint64_t)st->st_mtime;
+    out->mtime = (st->st_mtime > 0) ? (uint64_t)st->st_mtime : 0u;
     out->attr = S_ISDIR(st->st_mode) ? AG_A_DIR : 0;
-    if ((st->st_mode & S_IWUSR) == 0) {
+
+    const mode_t perms = st->st_mode & (mode_t)(S_IRWXU | S_IRWXG | S_IRWXO);
+    if (perms != 0 && (st->st_mode & S_IWUSR) == 0) {
         out->attr |= AG_A_READONLY;
     }
 }

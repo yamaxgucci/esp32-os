@@ -43,12 +43,6 @@ RL_OP_CLOSE = 9
 RL_OP_NONBLOCK = 10
 RL_OP_DATA = 11
 RL_OP_EVENT = 12
-RL_OP_WSTART = 13
-RL_OP_WSTOP = 14
-RL_OP_WSCAN = 15
-RL_OP_WJOIN = 16
-RL_OP_WLEAVE = 17
-RL_OP_WSTATUS = 18
 
 # flags
 RL_F_RESPONSE = 1 << 0
@@ -61,50 +55,6 @@ RL_EV_LINKDOWN = 3
 
 # capabilities
 RL_CAP_SOCKETS = 1 << 0
-RL_CAP_STATION = 1 << 3
-
-# --- the station half ------------------------------------------------------
-# This process has no radio, so the networks below are invented.  That is not a
-# weakness of the test: what is under test is that a scan issued in the guest
-# reaches the far end of a wire and comes back as rows, with the fields in the
-# right places.  Whether the far end read them off the air or made them up is
-# the coprocessor's business, and the guest cannot tell - which is the property
-# being checked.
-RL_SSID_MAX = 32
-RL_AP_SIZE = 42
-RL_STATUS_SIZE = 51
-RL_JOIN_SIZE = 103
-
-AG_WIFI_SEC_OPEN = 0
-AG_WIFI_SEC_WPA2 = 3
-AG_WIFI_ST_OFF = 0
-AG_WIFI_ST_IDLE = 1
-AG_WIFI_ST_JOINING = 2
-AG_WIFI_ST_JOINED = 3
-
-# ssid, bssid, rssi, channel, auth - deliberately more than fits on one screen
-# is not needed; three is enough to check ordering and field placement.
-FAKE_APS = [
-    ("argon-test", bytes.fromhex("021122334455"), -42, 6, AG_WIFI_SEC_WPA2),
-    ("neighbour-5g", bytes.fromhex("06AABBCCDDEE"), -71, 11, AG_WIFI_SEC_WPA2),
-    ("open-guest", bytes.fromhex("0A0011223344"), -88, 1, AG_WIFI_SEC_OPEN),
-]
-
-
-def pack_field(s: bytes, n: int) -> bytes:
-    """Fixed-width, NUL-padded, never NUL-counted - as ag_rlink.c writes it."""
-    return s[:n].ljust(n, b"\0")
-
-
-def pack_ap(ssid, bssid, rssi, channel, auth) -> bytes:
-    return (pack_field(ssid.encode(), RL_SSID_MAX + 1) + bssid +
-            struct.pack("<bBB", rssi, channel, auth))
-
-
-def pack_status(state, ssid, bssid, pinned, rssi, channel, attempts, reason):
-    return (struct.pack("<B", state) + pack_field(ssid.encode(), RL_SSID_MAX + 1) +
-            bssid + struct.pack("<BbBIi", 1 if pinned else 0, rssi, channel,
-                                attempts, reason))
 
 # ag_err_t values used here (sdk/include/argon/abi.h)
 AG_ENOENT = 2
@@ -149,17 +99,6 @@ class Radio:
         self.listeners = {}             # ch -> listening socket
         self.free = list(range(MAX_CHAN))
         self.lock = threading.Lock()    # protects chan/listeners/free
-
-        # the station half's state - what WSTATUS reports
-        self.radio = False
-        self.state = AG_WIFI_ST_OFF
-        self.joined = ""
-        self.pinned = False
-        self.bssid = b"\0" * 6
-        self.rssi = 0
-        self.channel = 0
-        self.attempts = 0
-        self.last_reason = 0
 
     # --- wire I/O ---------------------------------------------------------
     def send_frame(self, op, flags, seq, status, ch, a0, a1, payload=b""):
@@ -223,73 +162,8 @@ class Radio:
 
     # --- request handlers -------------------------------------------------
     def on_hello(self, h):
-        self.reply(h["seq"], RL_OP_HELLO, status=0, a0=RL_PROTO_VERSION,
-                   a1=RL_CAP_SOCKETS | RL_CAP_STATION)
-
-    # --- the station half -------------------------------------------------
-    def on_wstart(self, h):
-        self.radio = True
-        if self.state == AG_WIFI_ST_OFF:
-            self.state = AG_WIFI_ST_IDLE
-        self.reply(h["seq"], RL_OP_WSTART, status=0)
-
-    def on_wstop(self, h):
-        self.radio = False
-        self.state = AG_WIFI_ST_OFF
-        self.joined = ""
-        self.reply(h["seq"], RL_OP_WSTOP, status=0)
-
-    def on_wscan(self, h):
-        # a0 is how many the guest has room for; report how many were SEEN.
-        want = min(h["a0"], len(FAKE_APS)) if h["a0"] else len(FAKE_APS)
-        body = b"".join(pack_ap(*ap) for ap in FAKE_APS[:want])
-        self.radio = True
-        if self.state == AG_WIFI_ST_OFF:
-            self.state = AG_WIFI_ST_IDLE
-        self.reply(h["seq"], RL_OP_WSCAN, status=0, a0=len(FAKE_APS),
-                   payload=body)
-
-    def on_wjoin(self, h, payload):
-        if len(payload) != RL_JOIN_SIZE:
-            self.reply(h["seq"], RL_OP_WJOIN, status=-AG_EIO)
-            return
-        ssid = payload[:RL_SSID_MAX + 1].split(b"\0", 1)[0].decode(errors="replace")
-        pinned = bool(h["a0"])
-        bssid = payload[97:103]
-        known = {ap[0]: ap for ap in FAKE_APS}
-        if ssid not in known:
-            # A real radio does not fail the request - it fails the association,
-            # later, and the guest learns about it by polling status.
-            self.state = AG_WIFI_ST_JOINING
-            self.joined = ssid
-            self.pinned = pinned
-            self.attempts += 1
-            self.last_reason = 201  # NO_AP_FOUND, as the port reports it
-            self.reply(h["seq"], RL_OP_WJOIN, status=0)
-            return
-        ap = known[ssid]
-        self.joined = ssid
-        self.pinned = pinned
-        self.bssid = bssid if pinned and any(bssid) else ap[1]
-        self.rssi, self.channel = ap[2], ap[3]
-        self.state = AG_WIFI_ST_JOINED
-        self.attempts += 1
-        self.last_reason = 0
-        self.reply(h["seq"], RL_OP_WJOIN, status=0)
-        # Joined means an address follows, exactly as on_start does it.
-        self.started = True
-        self.push_event(RL_EV_GOTIP, FAKE_IFADDR)
-
-    def on_wleave(self, h):
-        self.state = AG_WIFI_ST_IDLE if self.radio else AG_WIFI_ST_OFF
-        self.joined = ""
-        self.reply(h["seq"], RL_OP_WLEAVE, status=0)
-
-    def on_wstatus(self, h):
-        body = pack_status(self.state, self.joined, self.bssid, self.pinned,
-                           self.rssi, self.channel, self.attempts,
-                           self.last_reason)
-        self.reply(h["seq"], RL_OP_WSTATUS, status=0, payload=body)
+        self.reply(h["seq"], RL_OP_HELLO, status=0,
+                   a0=RL_PROTO_VERSION, a1=RL_CAP_SOCKETS)
 
     def on_start(self, h):
         self.started = True
@@ -424,12 +298,6 @@ class Radio:
             RL_OP_SEND: lambda h, p: self.on_send(h, p),
             RL_OP_CLOSE: lambda h, p: self.on_close(h),
             RL_OP_NONBLOCK: lambda h, p: self.on_nonblock(h),
-            RL_OP_WSTART: lambda h, p: self.on_wstart(h),
-            RL_OP_WSTOP: lambda h, p: self.on_wstop(h),
-            RL_OP_WSCAN: lambda h, p: self.on_wscan(h),
-            RL_OP_WJOIN: lambda h, p: self.on_wjoin(h, p),
-            RL_OP_WLEAVE: lambda h, p: self.on_wleave(h),
-            RL_OP_WSTATUS: lambda h, p: self.on_wstatus(h),
         }
         while True:
             raw = self.read_exact(RL_HDR_SIZE)

@@ -33,6 +33,25 @@
     { "out": "EDIT.AXE", "group": "core", "src": ["apps/edit/edit.c"] },
     { "out": "GFXDEMO.AXE", "group": "core", "src": ["apps/gfxdemo/gfxdemo.c"] },
     {
+      "out": "DESKTOP.AXE", "group": "core",
+      "_note": "the Win 3.11-style shell; plan and phases in docs/plans/desktop.md",
+      "include": ["apps/desktop"],
+      "cflags": "-Os -ffunction-sections -fdata-sections -fno-builtin",
+      "src": ["apps/desktop/desktop.c", "apps/desktop/dsk_rect.c",
+              "apps/desktop/dsk_layout.c", "apps/desktop/dsk_paint.c",
+              "apps/desktop/dsk_paint_surface.c",
+              "apps/desktop/dsk_paint_band.c", "apps/desktop/dsk_cursor.c",
+              "apps/desktop/dsk_wm.c", "apps/desktop/dsk_menu.c",
+              "apps/desktop/dsk_dlg.c", "apps/desktop/dsk_icons.c",
+              "apps/desktop/dsk_folder.c", "apps/desktop/dsk_run.c",
+              "apps/desktop/dsk_clock.c",
+              "apps/desktop/dsk_ops.c", "apps/desktop/dsk_ini.c",
+              "apps/desktop/dsk_kbd.c",
+              "apps/desktop/dsk_oskbd.c",
+              "apps/desktop/dsk_term.c",
+              "apps/common/fsops/fsops.c", "apps/common/fsops/fsops_argon.c"]
+    },
+    {
       "out": "MARAUDER.AXE", "group": "core",
       "_note": "ESP32-Marauder port as a loadable .AXE (Maxim's requirement); UI via gfx->present bands, radio via api->wifimon. Needs the board (touch/display/radio); compiled here to keep it from rotting.",
       "include": ["apps/marauder"],
@@ -101,6 +120,9 @@
     { "out": "EXTRADIO.SYS", "group": "core",
       "include": ["apps/common", "apps/common/rlink"],
       "src": ["apps/extradio/extradio.c", "apps/common/rlink/ag_rlink.c"] },
+    { "out": "ATRADIO.SYS", "group": "core",
+      "include": ["apps/common", "apps/common/atproto"],
+      "src": ["apps/atradio/atradio.c", "apps/common/atproto/ag_atproto.c"] },
     { "out": "GC2145.SYS", "group": "core", "include": ["apps/gc2145"], "src": ["apps/gc2145/gc2145.c"] },
     { "out": "CAM.AXE", "group": "core", "src": ["apps/cam/cam.c"] },
     {
@@ -166,6 +188,14 @@
       "include": ["apps/common"],
       "src": ["apps/st7789/st7789.c"]
     },
+    {
+      "out": "ST7789S3.SYS", "group": "board",
+      "_note": "The same source and the same controller, for the 2.0 inch 240x320 module soldered to the ESP32-S3-WROOM CAM board: -DST7789_BOARD_S3CAM swaps the block of constants (pins, size, no offset) and xtensa is the other instruction set, so it has to be a second image with a name of its own.",
+      "arch": "xtensa", "gcc": "xtensa-esp32s3-elf-gcc",
+      "cflags": "-Os -ffunction-sections -fdata-sections -DST7789_BOARD_S3CAM",
+      "include": ["apps/common"],
+      "src": ["apps/st7789/st7789.c"]
+    },
     { "out": "XPT2046.SYS", "group": "board", "src": ["apps/xpt2046/xpt2046.c"] },
 
     {
@@ -175,15 +205,18 @@
     },
     {
       "out": "FM.AXE", "group": "core",
+      "icon": "apps/fm/fm.icon",
       "include": ["apps/fm"],
-      "src": ["apps/fm/fm.c", "apps/fm/fmops.c", "apps/fm/fm_ui_text.c"]
+      "src": ["apps/fm/fm.c", "apps/fm/fmops.c", "apps/fm/fm_ui_text.c",
+              "apps/common/fsops/fsops.c", "apps/common/fsops/fsops_argon.c"]
     },
     {
       "out": "GFXFM.AXE", "group": "core",
       "include": ["apps/fm"],
       "cflags": "-Os -ffunction-sections -fdata-sections -DFM_GFX_BUILD",
       "src": ["apps/gfxfm/gfxfm_app.c", "apps/gfxfm/fm_ui_gfx.c",
-              "apps/fm/fm.c", "apps/fm/fmops.c"]
+              "apps/fm/fm.c", "apps/fm/fmops.c",
+              "apps/common/fsops/fsops.c", "apps/common/fsops/fsops_argon.c"]
     },
     {
       "out": "AMP.AXE", "group": "core",

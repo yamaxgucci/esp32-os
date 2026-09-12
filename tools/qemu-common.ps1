@@ -24,7 +24,44 @@ function Resolve-Qemu {
 # The image is kept rather than regenerated every time on purpose: C: is formatted
 # on first boot, and throwing it away would add half a second to every boot and
 # change the numbers the boot report is measured against.
+# Offset and size of one partition, out of the table the build actually uses.
+# Read rather than typed, so there is one place where 0x310000 is written down.
+function Get-PartitionEntry {
+    param([string]$Name, [string]$Csv = '')
+    if (-not $Csv) {
+        $Csv = 'partitions.csv'
+        if (Test-Path 'sdkconfig') {
+            $m = Select-String -Path 'sdkconfig' -Pattern `
+                '^CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="(.+)"$' |
+                Select-Object -First 1
+            if ($m) { $Csv = $m.Matches[0].Groups[1].Value }
+        }
+    }
+    if (-not (Test-Path $Csv)) { throw "no partition table at $Csv" }
+    foreach ($line in Get-Content $Csv) {
+        $bare = ($line -split '#', 2)[0].Trim()
+        if (-not $bare) { continue }
+        $cols = $bare -split ',' | ForEach-Object { $_.Trim() }
+        if ($cols.Count -ge 5 -and $cols[0] -eq $Name) {
+            return @{ Offset = [Convert]::ToInt64($cols[3], 16)
+                      Size   = [Convert]::ToInt64($cols[4], 16) }
+        }
+    }
+    throw "no '$Name' partition in $Csv"
+}
+
 function Update-FlashImage {
+    # A pre-built C: partition, merged in with the firmware.
+    #
+    # Why it is worth having: the surface size, the modules to autoload and any
+    # file an application needs are all read off C: at boot, and the only other
+    # way to arrange them is to write C: on a running system and reboot.  In
+    # QEMU that is unreliable - three runs in eight had a file written to C:
+    # read back as -91 (AG_EFORMAT), and the boot after such a write took 128
+    # seconds against the usual two.  An image goes in before anything has
+    # booted, so none of that applies.  Build one with tools\mksysfs.py.
+    param([string]$SysFs = '')
+
     $app = 'build\argonos.bin'
     $flash = 'build\qemu_flash.bin'
     $stamp = 'build\qemu_flash.stamp'
@@ -32,9 +69,31 @@ function Update-FlashImage {
     if (-not (Test-Path $app)) {
         throw "$app not found. Run idf.py build first."
     }
+    if ($SysFs -and -not (Test-Path $SysFs)) {
+        throw "sysfs image not found: $SysFs"
+    }
 
     $want = "$((Get-Item $app).LastWriteTimeUtc.Ticks):$((Get-Item $app).Length)"
-    if ((Test-Path $flash) -and (Test-Path $stamp) -and
+    if ($SysFs) {
+        # In the stamp, or a run that changes only the C: image would reuse the
+        # flash built from the previous one - which is the same silent
+        # staleness the stamp exists to prevent for the firmware.
+        $s = Get-Item $SysFs
+        $want += "|$($s.FullName):$($s.LastWriteTimeUtc.Ticks):$($s.Length)"
+    }
+    # The stamp knows what went IN to the flash image and nothing about what
+    # the guest did to it afterwards - and the guest writes to C:, because a
+    # filesystem is for writing to.  So a run that copied a file left it in the
+    # image, the next run with the same inputs reused that image, and littlefs
+    # went on accumulating whatever the run before had done to it.  Measured
+    # over three runs of the desktop's own check: boot 0.65 s, then 1.78 s,
+    # then 2.20 s, and by the third the prompt never appeared at all.  Nothing
+    # in any of that said "stale image".
+    #
+    # Passing -SysFs means "boot this exact C:", so it is rebuilt every time.
+    # It costs one esptool merge, about a second, and it is the difference
+    # between a repeatable test and a test that depends on the one before it.
+    if (-not $SysFs -and (Test-Path $flash) -and (Test-Path $stamp) -and
         (Get-Content $stamp -Raw).Trim() -eq $want) {
         return
     }
@@ -44,13 +103,29 @@ function Update-FlashImage {
         Select-Object -First 1
     if (-not $python) { throw 'IDF python environment not found.' }
 
-    Write-Host 'Generating build\qemu_flash.bin'
+    $parts = @('0x0', 'build\bootloader\bootloader.bin',
+               '0x8000', 'build\partition_table\partition-table.bin',
+               '0x10000', $app)
+    if ($SysFs) {
+        # Not $sysfs: PowerShell variable names ignore case, so that name
+        # overwrites the $SysFs parameter and the next line looks for a file
+        # called System.Collections.Hashtable.
+        $part = Get-PartitionEntry -Name 'sysfs'
+        if ((Get-Item $SysFs).Length -gt $part.Size) {
+            throw ("$SysFs is {0} bytes and the sysfs partition holds {1}" -f
+                   (Get-Item $SysFs).Length, $part.Size)
+        }
+        $parts += @(('0x{0:x}' -f $part.Offset), $SysFs)
+        Write-Host ("Generating build\qemu_flash.bin (C: from $SysFs at 0x{0:x})" -f
+                    $part.Offset)
+    } else {
+        Write-Host 'Generating build\qemu_flash.bin'
+    }
+
     & $python.FullName -m esptool --chip=esp32s3 merge_bin `
         --output=$flash --fill-flash-size=8MB `
         --flash_mode dio --flash_freq 80m --flash_size 8MB `
-        0x0 build\bootloader\bootloader.bin `
-        0x8000 build\partition_table\partition-table.bin `
-        0x10000 $app | Out-Null
+        @parts | Out-Null
     if (-not $?) { throw 'esptool merge_bin failed.' }
 
     Set-Content -Path $stamp -Value $want -Encoding ascii
@@ -302,9 +377,23 @@ function Get-QemuSdArgs {
 
 # Machine arguments common to every way we start the emulator.
 function Get-QemuMachineArgs {
-    param([string]$EfusePath)
+    param(
+        [string]$EfusePath,
+        # The virtual RGB panel at 0x21000000, which is a machine option and
+        # not a device: `-device esp_rgb` does not exist and never did.
+        #
+        # This is opt-in on the QEMU side, and the failure when it is left out
+        # is quiet in a way that wasted an afternoon: `-display sdl` still
+        # opens a window, the window is QEMU's own default 800x600, and
+        # everything the guest draws goes into a framebuffer nobody shows.
+        # esp_lcd_new_rgb_qemu fails, ag_port_panel_open answers false, and the
+        # display driver falls back to a soft surface in PSRAM without a word.
+        # The way to tell from the outside: a window that is 800x600 rather
+        # than the size the guest asked for has no panel behind it.
+        [switch]$Graphics
+    )
     return @(
-        '-M', 'esp32s3'
+        '-M', $(if ($Graphics) { 'esp32s3,graphics=on' } else { 'esp32s3' })
         # QEMU reserves a 1 GB JIT buffer by default on a 64-bit host, and it
         # reserves it as committed memory.  On a 16 GB machine with the IDF
         # toolchain and an editor already resident that request fails outright -

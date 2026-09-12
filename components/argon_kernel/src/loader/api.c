@@ -9,7 +9,10 @@
  */
 #include <stdarg.h>
 #include <stdio.h>
+#include <argon/session.h>
+#include <argon/shell.h>
 #include <string.h>
+#include <sys/time.h>
 #include <time.h>
 
 #include <argon/journal.h>
@@ -46,30 +49,6 @@
 #include "dev/io.h"
 #include "net/espnow.h"
 #include "net/wifimon.h"
-
-#if defined(CONFIG_ARGON_ENABLE_NET) && CONFIG_ARGON_ENABLE_NET
-#include <argon/netprov.h>
-#endif
-
-/*
- * A radio the SYSTEM can reach, which since ABI 0.47 is not the same question
- * as a radio on this chip: one bound with `net use` counts.  Whether there is
- * one right now is a runtime matter (ag_netprov_has_wifi), and api->wifi cannot
- * follow it - k_api is const, in flash, and shared read-only with every loaded
- * application.  So the table is present whenever a radio is REACHABLE in
- * principle, and each station call answers -AG_ENODEV while there is none.
- *
- * That is a real change of meaning for `api->wifi != NULL`, which used to say
- * "this chip has a radio" and now says "this system could have one".  An
- * application that wants the old answer asks wifi->status() and reads
- * -AG_ENODEV; there was never a way to ask it without a call anyway, because a
- * radio that is switched off looks the same from a table of pointers.
- */
-#if AG_PORT_HAS_WIFI || (defined(CONFIG_ARGON_ENABLE_NET) && CONFIG_ARGON_ENABLE_NET)
-#define ARGON_API_HAS_WIFI 1
-#else
-#define ARGON_API_HAS_WIFI 0
-#endif
 
 /* ---------------------------------------------------------------------- */
 /* sys                                                                    */
@@ -149,6 +128,9 @@ static void api_module_on_unload(void (*fn)(void))
     ag_module_on_unload(fn);
 }
 
+/* Defined below, next to the other session-facing calls. */
+static int32_t api_prompt_in_slot(int slot, const char *cwd);
+
 static const ag_sys_api_t k_sys = {
     .size = sizeof(ag_sys_api_t),
     .info = api_info,
@@ -160,6 +142,7 @@ static const ag_sys_api_t k_sys = {
     .strerror = api_strerror,
     .heartbeat = api_heartbeat,
     .module_on_unload = api_module_on_unload,
+    .prompt_in_slot = api_prompt_in_slot,
 };
 
 /* ---------------------------------------------------------------------- */
@@ -412,6 +395,154 @@ static void api_fill(uint16_t x, uint16_t y, uint16_t w, uint16_t h, char ch,
     ag_console_unlock();
 }
 
+/*
+ * The console's cells, read back (ABI 0.43).
+ *
+ * Under the console lock, because a row is copied out of the live screen and
+ * the console writes to it from another task - a torn row would be a line of
+ * text with half of two different messages in it, which is the kind of thing
+ * that gets blamed on the reader.
+ */
+/*
+ * A row of another slot's screen.
+ *
+ * The permission is the same one api_peek_row asks for and it is asked for
+ * the same reason: the console belongs to the foreground, and a program
+ * that is not in front has no business reading what is on it.  What is
+ * different is WHICH screen - a slot with a prompt of its own has one
+ * nobody is looking at, and a window that draws it is the only way to see
+ * it.
+ */
+static int32_t api_peek_row_slot(int slot, uint16_t row, ag_textcell_t *cells,
+                                 uint16_t max)
+{
+    if (cells == NULL || max == 0) {
+        return -AG_EINVAL;
+    }
+    if (!has_console_focus()) {
+        return -AG_EPERM;
+    }
+
+    int32_t written = -AG_ENODEV;
+
+    ag_console_lock();
+    const ag_screen_t *sc = ag_console_screen_of_slot(slot);
+    if (sc != NULL && row < sc->rows) {
+        const ag_cell_t *src = ag_screen_row(sc, row);
+        if (src != NULL) {
+            uint16_t n = sc->cols;
+            if (n > max) {
+                n = max;
+            }
+            for (uint16_t i = 0; i < n; i++) {
+                cells[i].ch = (uint8_t)src[i].ch;
+                cells[i].attr = src[i].attr;
+            }
+            written = (int32_t)n;
+        }
+    }
+    ag_console_unlock();
+    return written;
+}
+
+/*
+ * Where the cursor is on another slot's screen.
+ *
+ * Same permission as reading its rows, and for the same reason: this is
+ * somebody else's screen, and only whatever is holding the glass has any
+ * business drawing it.
+ */
+static int32_t api_cursor_of_slot(int slot, uint16_t *x, uint16_t *y)
+{
+    if (x == NULL || y == NULL) {
+        return -AG_EINVAL;
+    }
+    if (!has_console_focus()) {
+        return -AG_EPERM;
+    }
+
+    int32_t err = -AG_ENODEV;
+    ag_console_lock();
+    const ag_screen_t *sc = ag_console_screen_of_slot(slot);
+    if (sc != NULL) {
+        *x = sc->cur_x;
+        *y = sc->cur_y;
+        err = 0;
+    }
+    ag_console_unlock();
+    return err;
+}
+
+/*
+ * Give a slot a shell of its own.  A slot below zero means any free one -
+ * a window asking for a prompt has no business choosing a number, and
+ * nothing in the ABI lets it see which are taken.
+ */
+static int32_t api_prompt_in_slot(int slot, const char *cwd)
+{
+    if (slot >= 0) {
+        const ag_err_t err = ag_shell_start_in_slot_at(slot, cwd);
+        return (err == AG_OK) ? (int32_t)slot : (int32_t)err;
+    }
+
+    /*
+     * A free slot is one with nothing RUNNING in it, not merely one with
+     * no prompt.  Asking only about the prompt put the first one in the
+     * caller's own slot - the desktop asks for this, and the desktop is
+     * itself the application sitting in slot 1.
+     */
+    ag_session_slot_t slots[AG_SESSION_SLOTS];
+    ag_session_info(slots);
+    for (int i = 0; i < AG_SESSION_SLOTS; i++) {
+        if (slots[i].pid != AG_PID_KERNEL) {
+            continue;
+        }
+        if (ag_shell_start_in_slot_at(i, cwd) == AG_OK) {
+            return (int32_t)i;
+        }
+    }
+    return -AG_ENOSPC;
+}
+
+static bool api_inp_post_to_slot(int slot, const ag_event_t *ev)
+{
+    if (ev == NULL || !has_console_focus()) {
+        return false;
+    }
+    return ag_console_post_to_slot(slot, ev);
+}
+
+static int32_t api_peek_row(uint16_t row, ag_textcell_t *cells, uint16_t max)
+{
+    if (cells == NULL || max == 0) {
+        return -AG_EINVAL;
+    }
+    if (!has_console_focus()) {
+        return -AG_EPERM;
+    }
+
+    int32_t written = -AG_ENODEV;
+
+    ag_console_lock();
+    const ag_screen_t *sc = ag_console_screen();
+    if (sc != NULL && row < sc->rows) {
+        const ag_cell_t *src = ag_screen_row(sc, row);
+        if (src != NULL) {
+            uint16_t n = sc->cols;
+            if (n > max) {
+                n = max;
+            }
+            for (uint16_t i = 0; i < n; i++) {
+                cells[i].ch = (uint8_t)src[i].ch;
+                cells[i].attr = src[i].attr;
+            }
+            written = (int32_t)n;
+        }
+    }
+    ag_console_unlock();
+    return written;
+}
+
 static uint16_t api_codepage(void) { return ag_cp_number(ag_cp_active()); }
 
 static ag_err_t api_set_codepage(uint16_t number)
@@ -447,6 +578,9 @@ static const ag_con_api_t k_con = {
     .fill = api_fill,
     .codepage = api_codepage,
     .set_codepage = api_set_codepage,
+    .peek_row = api_peek_row,
+    .peek_row_slot = api_peek_row_slot,
+    .cursor_of_slot = api_cursor_of_slot,
 };
 
 /* ---------------------------------------------------------------------- */
@@ -627,6 +761,52 @@ static ag_err_t api_get_datetime(ag_datetime_t *out)
     return AG_OK;
 }
 
+/*
+ * Set the wall clock, UTC.
+ *
+ * The entry beside this one said `NULL, needs an RTC driver` for as long
+ * as it has existed, and that was two different questions treated as one.
+ * Keeping time across a power cut needs an RTC and none of these boards
+ * has one; KNOWING what the time is only needs somebody to say so, and
+ * until now the only somebody was a network time server - which the CYD
+ * cannot reach at all, because bringing its radio up damages its
+ * SYSTEM.CFG.  A machine that cannot be told the time by the person
+ * sitting in front of it is worse than one with no clock.
+ *
+ * It is lost at every power cut, and that is honest rather than
+ * regrettable: the shell draws an unset clock as --:-- rather than as
+ * half past midnight in 1970.
+ */
+static ag_err_t api_set_datetime(const ag_datetime_t *dt)
+{
+    if (dt == NULL || dt->year < 1970u || dt->month < 1u || dt->month > 12u ||
+        dt->day < 1u || dt->day > 31u || dt->hour > 23u || dt->minute > 59u ||
+        dt->second > 60u) {
+        return -AG_EINVAL;
+    }
+
+    struct tm tm;
+    memset(&tm, 0, sizeof(tm));
+    tm.tm_year = (int)dt->year - 1900;
+    tm.tm_mon = (int)dt->month - 1;
+    tm.tm_mday = (int)dt->day;
+    tm.tm_hour = (int)dt->hour;
+    tm.tm_min = (int)dt->minute;
+    tm.tm_sec = (int)dt->second;
+    tm.tm_isdst = 0;
+
+    /* No timezone is set on the board, so mktime's "local" is UTC. */
+    const time_t t = mktime(&tm);
+    if (t == (time_t)-1) {
+        return -AG_EINVAL;
+    }
+
+    struct timeval tv;
+    tv.tv_sec = t;
+    tv.tv_usec = 0;
+    return (settimeofday(&tv, NULL) == 0) ? AG_OK : -AG_EIO;
+}
+
 static const ag_time_api_t k_time = {
     .size = sizeof(ag_time_api_t),
     .us = api_us,
@@ -635,7 +815,7 @@ static const ag_time_api_t k_time = {
     .delay_ms = api_delay_ms,
     .delay_us = api_delay_us,
     .get_datetime = api_get_datetime,
-    .set_datetime = NULL, /* needs an RTC driver */
+    .set_datetime = api_set_datetime,
     .timer_create = NULL,
     .timer_delete = NULL,
 };
@@ -709,6 +889,7 @@ static const ag_inp_api_t k_inp = {
     .btn = api_inp_btn,
     .btnp = api_inp_btnp,
     .inject = api_inp_inject,
+    .post_to_slot = api_inp_post_to_slot,
 };
 
 /* ---------------------------------------------------------------------- */
@@ -1190,48 +1371,16 @@ static const ag_wifimon_api_t k_wifimon = {
 };
 #endif /* AG_PORT_HAS_WIFIMON */
 
-#if ARGON_API_HAS_WIFI
+#if AG_PORT_HAS_WIFI
 /*
  * The rest of the radio for applications (ABI 0.39): station, access point and
- * ESP-NOW.  Each call is a thin pass to the same layer the shell's `wifi` and
- * `espnow` commands drive, so an application and the prompt reach the radio
- * through one implementation.
- *
- * The station six go through ag_netprov_wifi_* (ABI 0.47), which is why this
- * block is no longer gated on this chip having a radio: the radio may be a
- * coprocessor on a wire, bound with `net use`, and an application must not be
- * able to tell.  The port conversion that used to live here moved to
- * netprov.c, where it is now one provider among two.
- *
- * The access point and ESP-NOW halves did NOT move.  They stay gated on the
- * built-in radio because there is nothing yet on the far end of a wire to ask -
- * RLINK carries the station half and no more - and a stub answering -AG_ENOTSUP
- * is worse than an entry AG_HAS reports as absent.
+ * ESP-NOW.  Each call is a thin pass to the same port and kernel layer the
+ * shell's `wifi` and `espnow` commands drive (src/shell/shell.c), so an
+ * application and the prompt reach the radio through one implementation.  The
+ * only work done here is raising the radio when a call needs it and converting
+ * the port's structs into the ABI's - the ABI cannot name the GPL port types,
+ * so the two are kept field-for-field parallel and copied across.
  */
-static ag_err_t api_wifi_start(void) { return ag_netprov_wifi_start(); }
-static ag_err_t api_wifi_stop(void) { return ag_netprov_wifi_stop(); }
-
-static ag_err_t api_wifi_scan(ag_wifi_ap_t *out, uint32_t max, uint32_t *found)
-{
-    return ag_netprov_wifi_scan(out, max, found);
-}
-
-static ag_err_t api_wifi_connect(const char *ssid, const char *pass,
-                                 const uint8_t bssid[6])
-{
-    return ag_netprov_wifi_connect(ssid, pass, bssid);
-}
-
-static ag_err_t api_wifi_disconnect(void) { return ag_netprov_wifi_disconnect(); }
-
-static ag_err_t api_wifi_status(ag_wifi_status_t *out)
-{
-    return ag_netprov_wifi_status(out);
-}
-#endif /* ARGON_API_HAS_WIFI */
-
-#if AG_PORT_HAS_WIFI
-/* Raising this chip's own radio, for the two halves that only it has. */
 static ag_err_t api_wifi_radio_up(void)
 {
     ag_powerctl_bus_needed();
@@ -1239,6 +1388,78 @@ static ag_err_t api_wifi_radio_up(void)
     if (ag_port_wifi_status(&st) != AG_OK || st.state == AG_WIFI_OFF) {
         return ag_net_init();
     }
+    return AG_OK;
+}
+
+static ag_err_t api_wifi_start(void) { return api_wifi_radio_up(); }
+static ag_err_t api_wifi_stop(void) { return ag_port_wifi_stop(); }
+
+static ag_err_t api_wifi_scan(ag_wifi_ap_t *out, uint32_t max, uint32_t *found)
+{
+    if (out == NULL || max == 0u) {
+        return -AG_EINVAL;
+    }
+    const ag_err_t up = api_wifi_radio_up();
+    if (up != AG_OK) {
+        return up;
+    }
+    /*
+     * No heap here.  The port fills at most sixteen records from a stack buffer
+     * of its own, so a matching stack buffer converts them without an
+     * allocation - which matters because with the radio up and an application
+     * resident on this board, a few hundred spare bytes of heap is exactly what
+     * there is not, and a scan that failed only because the conversion buffer
+     * could not be allocated read as -AG_ENOMEM for a scan that would have
+     * worked.  `found` still reports every access point the radio heard.
+     */
+    ag_port_wifi_ap_t tmp[16];
+    uint32_t          cap = (max < 16u) ? max : 16u;
+    uint32_t          n = 0;
+    const ag_err_t    err = ag_port_wifi_scan(tmp, cap, &n);
+    if (err == AG_OK) {
+        const uint32_t copy = (n < cap) ? n : cap;
+        for (uint32_t i = 0; i < copy; i++) {
+            memcpy(out[i].ssid, tmp[i].ssid, sizeof(out[i].ssid));
+            memcpy(out[i].bssid, tmp[i].bssid, 6u);
+            out[i].rssi = tmp[i].rssi;
+            out[i].channel = tmp[i].channel;
+            out[i].auth = (uint8_t)tmp[i].auth;
+        }
+        if (found != NULL) {
+            *found = n;
+        }
+    }
+    return err;
+}
+
+static ag_err_t api_wifi_connect(const char *ssid, const char *pass,
+                                 const uint8_t bssid[6])
+{
+    ag_powerctl_bus_needed();
+    return ag_port_wifi_connect(ssid, pass, bssid);
+}
+
+static ag_err_t api_wifi_disconnect(void) { return ag_port_wifi_disconnect(); }
+
+static ag_err_t api_wifi_status(ag_wifi_status_t *out)
+{
+    if (out == NULL) {
+        return -AG_EINVAL;
+    }
+    ag_port_wifi_status_t st;
+    const ag_err_t        err = ag_port_wifi_status(&st);
+    if (err != AG_OK) {
+        return err;
+    }
+    memset(out, 0, sizeof(*out));
+    out->state = (uint8_t)st.state;
+    memcpy(out->ssid, st.ssid, sizeof(out->ssid));
+    memcpy(out->bssid, st.bssid, 6u);
+    out->pinned = st.pinned;
+    out->rssi = st.rssi;
+    out->channel = st.channel;
+    out->attempts = st.attempts;
+    out->last_reason = (int32_t)st.last_reason;
     return AG_OK;
 }
 
@@ -1324,9 +1545,7 @@ static int32_t api_wifi_espnow_recv(uint8_t mac[6], void *buf, uint32_t max,
 }
 static uint32_t api_wifi_espnow_dropped(void) { return ag_espnow_dropped(); }
 #endif /* AG_PORT_HAS_ESPNOW */
-#endif /* AG_PORT_HAS_WIFI */
 
-#if ARGON_API_HAS_WIFI
 static const ag_wifi_api_t k_wifi = {
     .size = sizeof(ag_wifi_api_t),
     .start = api_wifi_start,
@@ -1351,7 +1570,7 @@ static const ag_wifi_api_t k_wifi = {
     .espnow_dropped = api_wifi_espnow_dropped,
 #endif
 };
-#endif /* ARGON_API_HAS_WIFI */
+#endif /* AG_PORT_HAS_WIFI */
 
 #if defined(CONFIG_ARGON_ENABLE_CAMERA) && CONFIG_ARGON_ENABLE_CAMERA
 /* The DVP transport, straight from the port - the sensor driver is a .SYS. */
@@ -1396,7 +1615,7 @@ static const ag_api_t k_api = {
 #else
     .wifimon = NULL,
 #endif
-#if ARGON_API_HAS_WIFI
+#if AG_PORT_HAS_WIFI
     .wifi = &k_wifi,
 #else
     .wifi = NULL,

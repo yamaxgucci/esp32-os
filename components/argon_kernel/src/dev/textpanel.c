@@ -77,16 +77,45 @@ void ag_inputpoll_tick(void)
          * arena: between finding the vtable and calling it, `drv unload` can
          * free it.  Module unload takes this lock too.
          */
+        bool     pixels = false;
+        uint16_t span_w = 0, span_h = 0;
+
         ag_dev_lock_hold();
         ag_device_t *dev = ag_dev_find(info.name);
         if (dev != NULL && dev->class_ops != NULL) {
             const ag_input_ops_t *ops =
                 (const ag_input_ops_t *)dev->class_ops;
-            if (ops->size >= sizeof(ag_input_ops_t) && ops->poll != NULL) {
+            /*
+             * As much of the table as `poll` needs, not as much as this
+             * kernel's own struct has: demanding the whole of it means every
+             * driver built against an older header stops being polled the day
+             * a field is appended, which is the opposite of what `size` is
+             * for.  (ABI 0.44 appended three.)
+             */
+            const uint32_t need = (uint32_t)(__builtin_offsetof(
+                                                 ag_input_ops_t, poll) +
+                                             sizeof(ops->poll));
+            if (ops->size >= need && ops->poll != NULL) {
                 /* Four is a finger's worth of movement in ten milliseconds; a
                  * driver with more to say is asked again on the next tick
                  * rather than being allowed to hold the console task. */
                 n = ops->poll(0, evs, 4);
+            }
+            /*
+             * Units in the same hold as the poll, not a second one.
+             *
+             * A separate lock and lookup per device per tick is a hundred
+             * contentions a second against everything else that touches the
+             * registry - and a panel being written to is exactly that.  The
+             * pointer stalled and then caught up in a jump.
+             */
+            const uint32_t px_need = (uint32_t)(__builtin_offsetof(
+                                                    ag_input_ops_t, span_h) +
+                                                sizeof(uint16_t));
+            if (ops->size >= px_need && ops->units == AG_PTR_PIXELS) {
+                pixels = true;
+                span_w = ops->span_w;
+                span_h = ops->span_h;
             }
         }
         ag_dev_lock_release();
@@ -99,6 +128,63 @@ void ag_inputpoll_tick(void)
          * bottom of the screen.  A tap there is still a tap and belongs to the
          * nearest row rather than to nowhere.
          */
+        /*
+         * Pixels straight through, when the driver says that is what it
+         * measured (ABI 0.44).  Its span is its own glass; the surface is
+         * what a pointer is measured in above here, and the two are usually
+         * the same panel but need not be.
+         */
+        if (pixels) {
+            uint16_t sw = 0, sh = 0;
+            if (!ag_display_size(&sw, &sh) || sw == 0 || sh == 0) {
+                sw = span_w;
+                sh = span_h;
+            }
+            if (span_w == 0) {
+                span_w = sw;
+            }
+            if (span_h == 0) {
+                span_h = sh;
+            }
+            for (int32_t e = 0; e < n && e < 4; e++) {
+                ag_event_t *ev = &evs[e];
+                switch (ev->type) {
+                case AG_EV_POINTER_DOWN:
+                case AG_EV_POINTER_UP:
+                case AG_EV_POINTER_MOVE:
+                case AG_EV_WHEEL:
+                    break;
+                default:
+                    (void)ag_console_inject_event(ev);
+                    continue;
+                }
+                int32_t x = ev->ptr.x;
+                int32_t y = ev->ptr.y;
+                if (span_w != sw && span_w > 0) {
+                    x = x * (int32_t)sw / (int32_t)span_w;
+                }
+                if (span_h != sh && span_h > 0) {
+                    y = y * (int32_t)sh / (int32_t)span_h;
+                }
+                if (x < 0) {
+                    x = 0;
+                }
+                if (y < 0) {
+                    y = 0;
+                }
+                if (x > (int32_t)sw - 1) {
+                    x = (int32_t)sw - 1;
+                }
+                if (y > (int32_t)sh - 1) {
+                    y = (int32_t)sh - 1;
+                }
+                ev->ptr.x = (int16_t)x;
+                ev->ptr.y = (int16_t)y;
+                (void)ag_console_inject_event(ev);
+            }
+            continue;
+        }
+
         const ag_screen_t *screen = ag_console_screen();
         for (int32_t e = 0; e < n && e < 4; e++) {
             ag_event_t *ev = &evs[e];
@@ -144,6 +230,9 @@ ag_err_t ag_textpanel_geometry(uint16_t *cols, uint16_t *rows)
  */
 static bool s_enabled = true;
 static bool s_owe_full;
+
+/* The same for a panel drawn as characters: a switched screen owes it all. */
+void ag_textpanel_owe_full(void) { s_owe_full = true; }
 
 void ag_textpanel_enable(bool on)
 {
@@ -217,9 +306,17 @@ static void render_locked(const ag_screen_t *screen)
 
     uint16_t cols = screen->cols;
     uint16_t rows = screen->rows;
+    /*
+     * What the panel has, as opposed to what the console uses.  A 320x240
+     * panel is 40x30 cells; a console of 40x25 leaves five rows - forty
+     * pixels - that belong to nobody, and the console never writes there
+     * because as far as it is concerned they do not exist.
+     */
+    uint16_t panel_rows = rows;
     if (ops->text_info != NULL) {
         uint16_t pcols = cols, prows = rows;
         if (ops->text_info(0, &pcols, &prows) == AG_OK) {
+            panel_rows = prows;
             if (pcols < cols) {
                 cols = pcols;
             }
@@ -265,6 +362,33 @@ static void render_locked(const ag_screen_t *screen)
         /* A repainted row has painted over the caret. */
         if (y == s_caret_row) {
             s_caret_lit = false;
+        }
+    }
+
+    /*
+     * The rows the panel has and the console does not.
+     *
+     * Only on a full repaint, which is exactly the moment they matter: the
+     * panel has just appeared, or an application has just given the glass
+     * back.  A released application leaves its last frame on the whole panel
+     * and the console then repaints its own rows over it - so what a person
+     * sees is text on top and a band of somebody else's picture along the
+     * bottom, for ever, because nothing up here believes those rows exist.
+     * Reported as "the console does not finish redrawing the screen", and it
+     * is precisely that: it finished its screen, which is smaller than the
+     * glass.
+     *
+     * Blanked as text rather than as pixels because text is the only road
+     * this file has to the panel, and a row of spaces in the current attribute
+     * is what the console would have put there had it been that tall.
+     */
+    if (full && panel_rows > rows) {
+        for (uint16_t x = 0; x < cols; x++) {
+            s_row[x].ch = ' ';
+            s_row[x].attr = AG_ATTR_DEFAULT;
+        }
+        for (uint16_t y = rows; y < panel_rows; y++) {
+            ops->text_row(0, y, s_row, cols);
         }
     }
 

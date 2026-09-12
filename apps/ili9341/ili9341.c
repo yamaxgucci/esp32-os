@@ -47,6 +47,22 @@ AG_DRV("ILI9341", "0.5", "argon");
  */
 #define LCD_BUS      2
 #define LCD_CS      15
+/*
+ * This panel's own clock, said out loud.
+ *
+ * It used to say nothing and inherit the bus default, which on the CYD is
+ * eighty megahertz - and these wires also carry the touch controller, which
+ * answers at two.  At eighty the picture came out with single wrong pixels
+ * scattered through it whenever a stylus was moving, and nothing anywhere
+ * reported a fault, because SPI does not check what it carried.  It looked
+ * for all the world like a repaint bug in the shell, and two days of the
+ * shell's code were innocent.
+ *
+ * Forty is what the driver's own comments always assumed it was running at,
+ * and what these boards are usually driven at.  A driver that shares a bus
+ * states its speed - the touch driver always did.
+ */
+#define LCD_KHZ  40000
 #define LCD_DC       2
 #define LCD_BL      27
 #define LCD_MADCTL 0x40 /* landscape, and no BGR bit: this panel is RGB */
@@ -85,9 +101,13 @@ static void cmd(uint8_t c)
  */
 static size_t s_chunk = 4096;
 
+/* Transfers this driver gave up on; nothing else can see them happen. */
+static uint32_t s_drops;
+
 static void data(const void *buf, size_t len)
 {
     const uint8_t *p = (const uint8_t *)buf;
+    unsigned       tries = 0;
     io->gpio_write(LCD_DC, 1);
     while (len > 0) {
         const size_t chunk = (len > s_chunk) ? s_chunk : len;
@@ -98,8 +118,25 @@ static void data(const void *buf, size_t len)
             continue;
         }
         if (err != AG_OK) {
+            /*
+             * Never walk away from a half-written rectangle.
+             *
+             * Silently returning here leaves the rest of the band unwritten,
+             * and what stays on the glass is whatever was there before - the
+             * pointer where it used to be, a strip of the window that moved.
+             * It looks exactly like a repaint that never happened, because
+             * that is what it is, and the next thing to paint over it wipes
+             * the evidence.  The bus is shared with the touch controller, so
+             * a refusal here is a transient, and a transient is worth
+             * retrying rather than dropping.
+             */
+            if (++tries <= 3) {
+                continue;
+            }
+            s_drops++;
             return;
         }
+        tries = 0;
         p += chunk;
         len -= chunk;
     }
@@ -432,6 +469,19 @@ static void lcd_blit_rect(ag_handle_t h, const ag_blit_t *b)
     if (!s_up || b == NULL || b->px == NULL || b->w == 0 || b->h == 0) {
         return;
     }
+    /*
+     * Said once, on the kernel's log rather than the console: the console is
+     * what this driver draws, and printing into it from here is the deadlock
+     * the note in abi.h warns about.  The kernel log goes out of the serial
+     * port and touches nothing on the glass.
+     */
+    static bool s_told;
+    if (s_drops != 0u && !s_told) {
+        s_told = true;
+        ag_log(AG_LOG_WARN, "ILI9341", "gave up on %u transfer(s): the glass "
+                                       "is missing pixels somebody drew",
+               (unsigned)s_drops);
+    }
     fit_surface(b->surf_w, b->surf_h);
     if (s_out_w == 0 || s_out_h == 0) {
         return;
@@ -626,6 +676,14 @@ ag_err_t ag_driver_init(void)
     io = ag_api()->io;
     if (io == NULL || !AG_HAS(io, spi_xfer)) {
         return -AG_ENOTSUP;
+    }
+    if (AG_HAS(io, spi_config)) {
+        const ag_err_t clk = io->spi_config(LCD_BUS, LCD_CS, LCD_KHZ);
+        if (clk != AG_OK) {
+            ag_printf("ILI9341: spi%d cs %d at %d kHz: %s\n", LCD_BUS,
+                      LCD_CS, LCD_KHZ, ag_strerror(clk));
+            return clk;
+        }
     }
 
     if (!panel_init()) {

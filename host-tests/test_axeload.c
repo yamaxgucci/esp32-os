@@ -457,7 +457,7 @@ static void test_relocation_matches_a_direct_link(void)
 
     ag_axe_binding_t binding;
     AG_CHECK_INT(ag_axe_apply(&shifted, &place, relocs_of(&a), ha->reloc_count,
-                              &binding),
+                              NULL, 0, &binding),
                  AG_OK);
     AG_CHECK_INT(binding.relocated, ha->reloc_count);
 
@@ -510,7 +510,7 @@ static void test_contiguous_relocation_matches_a_direct_link(void)
 
     ag_axe_binding_t binding;
     AG_CHECK_INT(ag_axe_apply(&shifted, &place, relocs_of(&a), ha->reloc_count,
-                              &binding),
+                              NULL, 0, &binding),
                  AG_OK);
 
     AG_CHECK_INT(compare("code", buf, code_of(&b), hb->code.file_size), 0);
@@ -545,7 +545,7 @@ static void test_entry_and_api_slot(void)
 
     ag_axe_binding_t binding;
     AG_CHECK_INT(ag_axe_apply(h, &place, relocs_of(&a), h->reloc_count,
-                              &binding),
+                              NULL, 0, &binding),
                  AG_OK);
 
     /* The entry point is in the code part, at the offset the header describes. */
@@ -608,34 +608,34 @@ static void test_apply_rejects_bad_input(void)
     const ag_axe_place_t good = {code, h->code.size, data, h->data.size};
 
     AG_CHECK_INT(ag_axe_apply(NULL, &good, relocs_of(&a), h->reloc_count,
-                              &binding),
+                              NULL, 0, &binding),
                  -AG_EINVAL);
-    AG_CHECK_INT(ag_axe_apply(h, NULL, relocs_of(&a), h->reloc_count, &binding),
+    AG_CHECK_INT(ag_axe_apply(h, NULL, relocs_of(&a), h->reloc_count, NULL, 0, &binding),
                  -AG_EINVAL);
 
     /* Too small an allocation is caught before anything is written. */
     ag_axe_place_t small = good;
     small.code_capacity = h->code.size - 1;
     AG_CHECK_INT(ag_axe_apply(h, &small, relocs_of(&a), h->reloc_count,
-                              &binding),
+                              NULL, 0, &binding),
                  -AG_ENOMEM);
 
     small = good;
     small.data_capacity = h->data.size - 1;
     AG_CHECK_INT(ag_axe_apply(h, &small, relocs_of(&a), h->reloc_count,
-                              &binding),
+                              NULL, 0, &binding),
                  -AG_ENOMEM);
 
     /* An image with a data part needs somewhere to put it. */
     ag_axe_place_t nodata = good;
     nodata.data = NULL;
     AG_CHECK_INT(ag_axe_apply(h, &nodata, relocs_of(&a), h->reloc_count,
-                              &binding),
+                              NULL, 0, &binding),
                  -AG_EINVAL);
 
     /* A count that disagrees with the header means the file is inconsistent. */
     AG_CHECK_INT(ag_axe_apply(h, &good, relocs_of(&a), h->reloc_count + 1,
-                              &binding),
+                              NULL, 0, &binding),
                  -AG_EINVAL);
 
     /*
@@ -655,16 +655,16 @@ static void test_apply_rejects_bad_input(void)
     /* A relocation pointing outside the stored bytes must not be applied. */
     memcpy(evil, relocs_of(&a), count * sizeof(uint32_t));
     evil[0] = h->code.size; /* one word past the end of the code part */
-    AG_CHECK_INT(ag_axe_apply(h, &good, evil, count, &binding), -AG_EFORMAT);
+    AG_CHECK_INT(ag_axe_apply(h, &good, evil, count, NULL, 0, &binding), -AG_EFORMAT);
 
     memcpy(evil, relocs_of(&a), count * sizeof(uint32_t));
     evil[0] = h->data.file_size | AG_AXE_R_IN_DATA;
-    AG_CHECK_INT(ag_axe_apply(h, &good, evil, count, &binding), -AG_EFORMAT);
+    AG_CHECK_INT(ag_axe_apply(h, &good, evil, count, NULL, 0, &binding), -AG_EFORMAT);
 
     /* An offset so large it would wrap the bounds check is still refused. */
     memcpy(evil, relocs_of(&a), count * sizeof(uint32_t));
     evil[0] = 0xfffffffcu;
-    AG_CHECK_INT(ag_axe_apply(h, &good, evil, count, &binding), -AG_EFORMAT);
+    AG_CHECK_INT(ag_axe_apply(h, &good, evil, count, NULL, 0, &binding), -AG_EFORMAT);
 
     /*
      * And a relocation about a data part in an image that has none: the header
@@ -677,12 +677,196 @@ static void test_apply_rejects_bad_input(void)
     const ag_axe_place_t place_codeonly = {code, h->code.size, NULL, 0};
     memcpy(evil, relocs_of(&a), count * sizeof(uint32_t));
     evil[0] = AG_AXE_R_TO_DATA;
-    AG_CHECK_INT(ag_axe_apply(&codeonly, &place_codeonly, evil, count, &binding),
+    AG_CHECK_INT(ag_axe_apply(&codeonly, &place_codeonly, evil, count, NULL, 0, &binding),
                  -AG_EFORMAT);
 
     free(evil);
     free(code);
     free(data);
+    free(a.data);
+}
+
+/* ---- instruction relocations (RISC-V) ---------------------------------- */
+/*
+ * These are built by hand rather than from a fixture, and on purpose: what has
+ * to be checked is the arithmetic of re-encoding an address into an
+ * instruction, and the cases that matter are the ones a compiler would only
+ * produce by accident.  The end-to-end version - a real image linked twice and
+ * compared - is tools/check_axe_relocs.py, which runs in `argon check`.
+ */
+
+#define LUI(rd) (0x00000037u | ((uint32_t)(rd) << 7))
+#define ADDI(rd, rs1) \
+    (0x00000013u | ((uint32_t)(rd) << 7) | ((uint32_t)(rs1) << 15))
+#define SW(rs2, rs1) \
+    (0x00002023u | ((uint32_t)(rs2) << 20) | ((uint32_t)(rs1) << 15))
+
+/* What the pair actually computes, which is the only thing that matters. */
+static uint32_t pair_address(uint32_t hi_word, uint32_t lo_word, bool s_form)
+{
+    const uint32_t hi = hi_word & 0xFFFFF000u;
+    int32_t        lo;
+
+    if (s_form) {
+        lo = (int32_t)((((lo_word >> 25) & 0x7Fu) << 5) |
+                       ((lo_word >> 7) & 0x1Fu));
+    } else {
+        lo = (int32_t)((lo_word >> 20) & 0xFFFu);
+    }
+    if (lo & 0x800) {
+        lo -= 0x1000; /* the low half is sign-extended when it is added */
+    }
+    return (uint32_t)((int32_t)hi + lo);
+}
+
+static void check_pair_reaches(const char *what, uint32_t data_addr,
+                              uint32_t target, bool s_form)
+{
+    uint32_t code[2] = {LUI(15), s_form ? SW(14, 15) : ADDI(10, 15)};
+    uint8_t  data[64] = {0};
+
+    ag_axe_header_t h = {0};
+    memcpy(h.magic, AG_AXE_MAGIC_STR, 4);
+    h.header_size = sizeof(h);
+    h.arch = AG_ARCH_RISCV32;
+    h.code.base = 0x42000000u;
+    h.code.size = sizeof(code);
+    h.code.file_size = sizeof(code);
+    h.data.base = 0x3C000000u;
+    h.data.size = sizeof(data);
+    h.data.file_size = sizeof(data);
+    h.entry = h.code.base;
+    h.api_slot = h.code.base;
+    /* The header declares the table; apply refuses a count that disagrees. */
+    h.ireloc_offset = sizeof(h);
+    h.ireloc_count = 2;
+
+    const ag_axe_ireloc_t irel[2] = {
+        {0u | AG_AXE_I_HI20 | AG_AXE_I_TO_DATA, target},
+        {4u | (s_form ? AG_AXE_I_LO12_S : AG_AXE_I_LO12_I) |
+             AG_AXE_I_TO_DATA, target},
+    };
+    const ag_axe_place_t place = {code, sizeof(code),
+                                  (void *)(uintptr_t)data_addr, sizeof(data)};
+
+    /*
+     * The place's data pointer is a made-up address rather than `data`: the
+     * addresses this has to encode are the ones a board hands out, and the
+     * interesting ones - a low half of 0x800 or more, where the high half has
+     * to be rounded up - do not appear among the addresses a test's stack
+     * happens to have.  Nothing dereferences it: bss is zero here, so no
+     * clearing is done through it.
+     */
+    ag_axe_binding_t binding;
+    AG_CHECK_INT(ag_axe_apply(&h, &place, NULL, 0, irel, 2, &binding), AG_OK);
+
+    const uint32_t want = data_addr + target;
+    const uint32_t got = pair_address(code[0], code[1], s_form);
+    if (got != want) {
+        printf("     (%s: the pair reaches %#010x, wanted %#010x)\n", what, got,
+               want);
+    }
+    AG_CHECK_INT(got == want, 1);
+
+    /* Everything but the immediate is left alone - registers included. */
+    AG_CHECK_INT(code[0] & 0xFFFu, LUI(15) & 0xFFFu);
+    if (s_form) {
+        AG_CHECK_INT(code[1] & 0x01FFF07Fu, SW(14, 15) & 0x01FFF07Fu);
+    } else {
+        AG_CHECK_INT(code[1] & 0x000FFFFFu, ADDI(10, 15) & 0x000FFFFFu);
+    }
+}
+
+static void test_instruction_relocations(void)
+{
+    /*
+     * A low half under 0x800 needs no rounding; one at or above it does,
+     * because the low half is added as a signed number.  Both, and the exact
+     * boundary, because getting the rounding wrong is wrong by 4096 on half of
+     * all addresses - a bug that works most of the time, which is the worst
+     * kind to ship in a loader.
+     */
+    /*
+     * The low half is chosen through the base address, not through the offset:
+     * an offset past the end of the part is a different thing entirely and is
+     * refused below, as it should be.
+     */
+    check_pair_reaches("low half 0x100", 0x408100FCu, 4u, false);
+    check_pair_reaches("low half 0x7ff", 0x408107FBu, 4u, false);
+    check_pair_reaches("low half 0x800", 0x408107FCu, 4u, false);
+    check_pair_reaches("low half 0xfff", 0x40810FFBu, 4u, false);
+    check_pair_reaches("base in the middle of a page", 0x40810ABCu, 4u, false);
+    check_pair_reaches("offset zero", 0x40810800u, 0u, false);
+    /* And the store form, whose twelve bits are split across the word. */
+    check_pair_reaches("store, low half 0x100", 0x408100FCu, 4u, true);
+    check_pair_reaches("store, low half 0x8ab", 0x408108A7u, 4u, true);
+
+    /* An entry pointing past the part it names is a file contradicting
+     * itself, and must be refused rather than written. */
+    uint32_t        code[2] = {LUI(15), ADDI(10, 15)};
+    uint8_t         data[64] = {0};
+    ag_axe_header_t h = {0};
+    memcpy(h.magic, AG_AXE_MAGIC_STR, 4);
+    h.header_size = sizeof(h);
+    h.arch = AG_ARCH_RISCV32;
+    h.code.base = 0x42000000u;
+    h.code.size = sizeof(code);
+    h.code.file_size = sizeof(code);
+    h.data.base = 0x3C000000u;
+    h.data.size = sizeof(data);
+    h.data.file_size = sizeof(data);
+    h.entry = h.code.base;
+    h.api_slot = h.code.base;
+
+    h.ireloc_offset = sizeof(h);
+    h.ireloc_count = 1;
+
+    const ag_axe_place_t place = {code, sizeof(code), data, sizeof(data)};
+    ag_axe_binding_t     binding;
+
+    const ag_axe_ireloc_t past_data[1] = {
+        {0u | AG_AXE_I_HI20 | AG_AXE_I_TO_DATA, sizeof(data) + 1u}};
+    AG_CHECK_INT(ag_axe_apply(&h, &place, NULL, 0, past_data, 1, &binding),
+                 -AG_EFORMAT);
+
+    const ag_axe_ireloc_t past_code[1] = {
+        {(uint32_t)sizeof(code) | AG_AXE_I_HI20, 0u}};
+    AG_CHECK_INT(ag_axe_apply(&h, &place, NULL, 0, past_code, 1, &binding),
+                 -AG_EFORMAT);
+
+    /* A count that disagrees with the header is refused before anything is
+     * written, the same way the word table's is. */
+    AG_CHECK_INT(ag_axe_apply(&h, &place, NULL, 0, NULL, 0, &binding),
+                 -AG_EINVAL);
+}
+
+/*
+ * An image from before these fields existed must load exactly as it did.
+ *
+ * Not hypothetical: growing the header and comparing header_size against
+ * sizeof() instead of the documented minimum turned every .AXE ever built into
+ * -AG_EFORMAT, and what that looked like on the board was a panel driver that
+ * stopped loading for no reason anybody could see.
+ */
+static void test_a_short_header_still_loads(void)
+{
+    const blob_t a = load_file(FIXTURE_NOMINAL);
+    if (a.data == NULL) {
+        return;
+    }
+    ag_axe_header_t h = *header_of(&a);
+
+    h.header_size = (uint16_t)AG_AXE_HEADER_MIN;
+    AG_CHECK_INT(ag_axe_validate(&h, a.size, AG_ARCH_XTENSA, h.abi_major,
+                                 h.abi_minor),
+                 AG_OK);
+    AG_CHECK_INT(ag_axe_ireloc_count(&h), 0);
+
+    h.header_size = (uint16_t)(AG_AXE_HEADER_MIN - 1u);
+    AG_CHECK_INT(ag_axe_validate(&h, a.size, AG_ARCH_XTENSA, h.abi_major,
+                                 h.abi_minor),
+                 -AG_EFORMAT);
+
     free(a.data);
 }
 
@@ -703,5 +887,7 @@ void run_axeload_tests(void)
     test_contiguous_relocation_matches_a_direct_link();
     test_entry_and_api_slot();
     test_apply_rejects_bad_input();
+    test_instruction_relocations();
+    test_a_short_header_still_loads();
     test_arch_names();
 }

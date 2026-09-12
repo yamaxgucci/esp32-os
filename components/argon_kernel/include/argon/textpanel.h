@@ -49,6 +49,9 @@ void ag_textpanel_render(const ag_screen_t *screen);
  */
 void ag_textpanel_enable(bool on);
 
+/* Owe the panel a full repaint, for when the screen itself changes. */
+void ag_textpanel_owe_full(void);
+
 /* Drains input devices that must be polled; same tick, same reason. */
 void ag_inputpoll_tick(void);
 

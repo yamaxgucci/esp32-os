@@ -35,7 +35,10 @@ void run_tube_tests(void);
 void run_nam_tests(void);
 void run_netmsg_tests(void);
 void run_rempix_tests(void);
+void run_desktop_tests(void);
+void run_fsops_tests(void);
 void run_rlink_tests(void);
+void run_atproto_tests(void);
 void run_nlink_tests(void);
 
 int main(void)
@@ -67,7 +70,10 @@ int main(void)
     run_nam_tests();
     run_netmsg_tests();
     run_rempix_tests();
+    run_desktop_tests();
+    run_fsops_tests();
     run_rlink_tests();
+    run_atproto_tests();
     run_nlink_tests();
 
     printf("%d checks, %d failures\n", ag_test_checks, ag_test_failures);
