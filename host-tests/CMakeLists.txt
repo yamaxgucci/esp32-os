@@ -150,6 +150,10 @@ add_executable(argon_tests
     "${ARGON_ROOT}/apps/common/atproto/ag_atproto.c"
     test_nlink.c
     "${ARGON_ROOT}/apps/common/nlink/ag_nlink.c"
+    test_espldr.c
+    "${ARGON_ROOT}/apps/common/esp8266/ag_espldr.c"
+    test_stm32ldr.c
+    "${ARGON_ROOT}/apps/common/stm32/ag_stm32ldr.c"
     "${ARGON_ROOT}/tools/nam.c"
     "${ARGON_ROOT}/apps/cc/cc_compile.c"
     test_rv32.c
