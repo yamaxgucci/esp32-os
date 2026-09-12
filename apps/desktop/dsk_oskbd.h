@@ -55,6 +55,15 @@ dsk_rect_t dsk_oskbd_work(void);
 
 void dsk_oskbd_draw(dsk_rect_t clip);
 
+/*
+ * How many times it has been raised, and how many keys it has produced.
+ *
+ * Printed on the way out, because everything this does happens in
+ * pixels: without the two numbers, a keyboard that never came up and a
+ * keyboard whose keys went nowhere look exactly alike.
+ */
+void dsk_oskbd_stats(uint32_t *raises, uint32_t *hits);
+
 /* Where the letters and the row of three are, up or not: for the test. */
 void dsk_oskbd_probe(dsk_rect_t *keys, dsk_rect_t *row);
 

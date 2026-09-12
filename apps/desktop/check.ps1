@@ -619,16 +619,34 @@ try {
     # the prompt writes to its own slot's screen, which never reaches
     # this transcript.  A directory made in there is on C: afterwards
     # or the keys never arrived.
-    $opsPrompt = @('key f10', 'wait 500', 'key right', 'wait 200',
+    # ONE cycle of Options > Keyboard first, which lands on "always".
+    #
+    # The emulator has a keyboard (KBDVIRT), so "automatic" - which is what
+    # the step above deliberately leaves behind - means the keys drawn on the
+    # glass are not merely hidden but refused, and the tap that should raise
+    # them does nothing at all.  On the board it is the other way round:
+    # there is no keyboard there, and automatic turns them on.  So the state
+    # this needs is asked for, used, and handed back below.
+    $opsPrompt = $optKbdOnce +
+                 @('key f10', 'wait 500', 'key right', 'wait 200',
                    'key right', 'wait 300') +
                  (1..7 | ForEach-Object { 'key down' }) +
                  @('wait 300', 'key enter', 'wait 1500',
                    'say md c:\fromwin', 'wait 400', 'key enter',
-                   'wait 1500',
-                   # And shut it again.  While a prompt window is in front it
-                   # takes every key but F10, which is what it is for; the
-                   # rest of this pass is talking to the desktop.
-                   'down leftctrl', 'key f4', 'up leftctrl', 'wait 600')
+                   'wait 1500')
+
+    # Shutting it again is a step of its own, because between this pass and
+    # it comes the one thing a keyboard pass cannot do: type on the keyboard
+    # drawn on the glass.  While a prompt window is in front it takes every
+    # key but F10, which is what it is for, so the rest of the pass cannot
+    # run until it is shut.
+    # Two more cycles put Keyboard back to automatic, and then the window
+    # goes.  Back to automatic because that is what the rest of this file
+    # was written against, and because a setting a test leaves behind is a
+    # setting the next test starts with.
+    $shutPrompt = (($optKbdOnce + $optKbdOnce |
+                    ForEach-Object { '"' + $_ + '"' }) -join ' ') +
+                  ' "down leftctrl" "key f4" "up leftctrl" "wait 600"'
 
     # Three Rights now: File, Edit, Window, Options.
     $optFont = @('key f10', 'wait 400', 'key right', 'wait 200', 'key right',
@@ -765,6 +783,15 @@ try {
         # reporting success.  One connection has no race to lose.
         ("!& '$pyexe' 'tools\inputplay.py' --wait 20 " +
          (($keyboard | ForEach-Object { '"' + $_ + '"' }) -join ' ')),
+        # The keyboard on the glass, hit with the virtual mouse.
+        #
+        # On the board this is the ONLY way to type - that desk has no
+        # keys of its own - and until now "it works" meant somebody had
+        # tried it.  Where to click is asked of the program (it prints
+        # its geometry at startup and when a prompt window opens)
+        # rather than worked out here; see tools\oskbd-poke.ps1.
+        "!.\tools\oskbd-poke.ps1 -Log '$log' -Python '$pyexe'",
+        "!& '$pyexe' 'tools\inputplay.py' --wait 20 $shutPrompt",
         "!.\tools\grab-window.ps1 -Out '$png'",
         "!& '$pyexe' 'tools\inputplay.py' --wait 20 $after",
         "!.\tools\grab-window.ps1 -Out '$png2'",
@@ -924,9 +951,23 @@ try {
     if ($text -notmatch '(?i)GFXDEMO\.AXE finished with 0') {
         $fail += 'GFXDEMO.AXE was started but never saw the key that ends it'
     }
-    # And its own greeting, which is a graphical child writing to the console.
+    # Its own greeting is NOT asserted, and that is worth writing down.
+    #
+    # GFXDEMO prints it after ag_gfx_acquire - while it holds the glass - and
+    # what a program prints while it holds the glass goes to its slot's text
+    # screen, which is not what the wire is mirroring.  The line reached this
+    # transcript in some runs and not others, purely on when the mirror
+    # happened to catch that screen, and a check that turns on a race teaches
+    # everybody to ignore a red gate.
+    #
+    # What a child's console output actually reaching the screen is proved by
+    # is HELLO.AXE, above: it prints without taking the glass.  What is left
+    # for the graphical one is that it ran and was ended by a key, which the
+    # line above asserts.
     if ($text -notmatch 'Esc/Q/Enter quit') {
-        $fail += "GFXDEMO.AXE's console output never reached the screen"
+        Write-Host ('desktop: note - GFXDEMO''s greeting is not in the ' +
+                    'transcript, which is expected: it prints it while it ' +
+                    'holds the glass')
     }
 
     # ---- the file operations ---------------------------------------------
@@ -1166,6 +1207,17 @@ try {
         # listing arrives full of escape codes.
         if ($seen -notmatch 'fromwin\s+<DIR>') {
             $fail += 'the Console window never reached a shell'
+        }
+
+        # A directory whose name was typed entirely on the glass.
+        #
+        # Not a screenshot of a keyboard: a dozen clicks on drawn keys, a
+        # click on the drawn Enter, and the name on the disk afterwards or
+        # the keys did nothing.  Same trap as fromwin - the listing keeps
+        # the name as it was typed - so the <DIR> column is what proves it
+        # is the listing and not an echo.
+        if ($seen -notmatch 'bykeys\s+<DIR>') {
+            $fail += 'the keyboard drawn on the glass never reached a shell'
         }
 
         # And what the desktop's own counters say about the same step, which

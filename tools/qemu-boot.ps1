@@ -492,6 +492,24 @@ try {
                 $host_cmd = $cmd.Substring(1)
                 Write-Host "host: $host_cmd"
                 [void]$text.Append("`r`n[host] $host_cmd`r`n")
+                # What has arrived so far, on disk, BEFORE the command runs.
+                #
+                # A host step may need to read what the guest has said: the
+                # desktop's test asks the program where it drew its keyboard
+                # and then clicks there.  The transcript used to be written
+                # once, at the end, so such a step read the PREVIOUS run's
+                # file - and said, with the line plainly in the log
+                # afterwards, that the program had never printed it.
+                try {
+                    New-Item -ItemType Directory -Force `
+                             -Path (Split-Path -Parent $LogPath) | Out-Null
+                    [System.IO.File]::WriteAllText(
+                        (Join-Path (Get-Location) $LogPath), $text.ToString(),
+                        [System.Text.Encoding]::GetEncoding(28591))
+                } catch {
+                    # A flush that fails is not a reason to fail the run: the
+                    # step may not need the file at all.
+                }
                 try {
                     $out = Invoke-Expression $host_cmd 2>&1 | Out-String
                     if ($out) {

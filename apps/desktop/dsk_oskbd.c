@@ -39,6 +39,10 @@ static int s_btn_down = -1;
  */
 static bool s_for_dialog;
 
+/* Raised this many times, and produced this many keys: see the header. */
+static uint32_t s_raises;
+static uint32_t s_hits;
+
 void dsk_oskbd_mode(bool for_dialog) { s_for_dialog = for_dialog; }
 
 static int16_t btn_h(void) { return (int16_t)(dsk_ui_h() + 6); }
@@ -152,6 +156,9 @@ void dsk_oskbd_show(bool on)
      * gives an empty one and leaves the keys on the glass.
      */
     const dsk_rect_t was = dsk_oskbd_rect();
+    if (on) {
+        s_raises++;
+    }
     s_up = on;
     s_btn_down = -1;
     dsk_kbd_hilite(-1);
@@ -250,6 +257,7 @@ bool dsk_oskbd_pointer(dsk_ptr_t type, int16_t x, int16_t y)
         if (i == 2) {
             dsk_oskbd_show(false);
         } else if (s_key != NULL) {
+            s_hits++;
             if (i == 0) {
                 s_key(DSK_KEY_ENTER, 0x0Du);
             } else {
@@ -269,8 +277,10 @@ bool dsk_oskbd_pointer(dsk_ptr_t type, int16_t x, int16_t y)
     if (c == DSK_KBD_SHIFT) {
         dsk_kbd_hilite(-1); /* every label changed case; nothing stays down */
     } else if (c == DSK_KBD_BACKSPACE && s_key != NULL) {
+        s_hits++;
         s_key(DSK_KEY_BACKSPACE, 0x08u);
     } else if (c >= 0x20 && c < 0x7F && s_key != NULL) {
+        s_hits++;
         s_key(0, (uint32_t)c);
     }
     damage_keys();
@@ -298,4 +308,14 @@ void dsk_oskbd_probe(dsk_rect_t *keys, dsk_rect_t *row)
                         dsk_oskbd_rect().w, btn_h());
     }
     s_up = was;
+}
+
+void dsk_oskbd_stats(uint32_t *raises, uint32_t *hits)
+{
+    if (raises != NULL) {
+        *raises = s_raises;
+    }
+    if (hits != NULL) {
+        *hits = s_hits;
+    }
 }

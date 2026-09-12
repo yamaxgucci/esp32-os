@@ -2517,7 +2517,14 @@ static void menu_chose(uint16_t id)
             damage(s_m.statusbar);
             break;
         }
-        s_prompt_opened = (dsk_term_open_slot(&s_m, (int)slot) != NULL);
+        dsk_win_t *pw = dsk_term_open_slot(&s_m, (int)slot);
+        s_prompt_opened = (pw != NULL);
+        if (pw != NULL) {
+            /* Its text area, for the same reason as the keys above. */
+            const dsk_rect_t c = dsk_wm_client(pw);
+            ag_printf("desktop: prompt window at %d,%d %dx%d\n",
+                      (int)c.x, (int)c.y, (int)c.w, (int)c.h);
+        }
         if (!s_prompt_opened) {
             s_note = "no room for another window";
             damage(s_m.statusbar);
@@ -3352,6 +3359,21 @@ int ag_main(int argc, char **argv)
     dsk_menu_init(&s_m, damage, menu_chose);
     dsk_dlg_init(&s_m);
     dsk_oskbd_init(&s_m, damage, oskbd_key);
+    {
+        /*
+         * Printed so the test can hit the keys with the virtual mouse
+         * without working out where they are for itself.  A test that
+         * computes a layout is a second copy of that layout, and the
+         * copy is wrong the day the real one changes: this file has
+         * already paid for that once, with a step that counted arrow
+         * keys into a menu that had grown an item.
+         */
+        dsk_rect_t keys, row;
+        dsk_oskbd_probe(&keys, &row);
+        ag_printf("desktop: keyboard keys %d,%d %dx%d row %d,%d %dx%d\n",
+                  (int)keys.x, (int)keys.y, (int)keys.w, (int)keys.h,
+                  (int)row.x, (int)row.y, (int)row.w, (int)row.h);
+    }
     apply_keyboard();
     dsk_folder_init(&s_m, open_from_folder);
     dsk_run_init(repaint_all);
@@ -3647,6 +3669,10 @@ int ag_main(int argc, char **argv)
               (unsigned)s_prompt_asks, (long)s_prompt_slot);
     uint32_t fwd = 0, fwd_ok = 0;
     dsk_term_fwd_stats(&fwd, &fwd_ok);
+    uint32_t kbd_raises = 0, kbd_hits = 0;
+    dsk_oskbd_stats(&kbd_raises, &kbd_hits);
+    ag_printf("desktop: keyboard raised %u time(s), %u key(s) from the glass\n",
+              (unsigned)kbd_raises, (unsigned)kbd_hits);
     ag_printf("desktop: prompt window %s, %u key(s) forwarded, %u taken\n",
               s_prompt_opened ? "opened" : "never opened",
               (unsigned)fwd, (unsigned)fwd_ok);
