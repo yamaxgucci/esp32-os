@@ -608,77 +608,140 @@ bool ag_art_store_read(int fid, int size, unsigned char *data)
  */
 void ag_art_store_put(int fid, const unsigned char *data, int size)
 {
-    /*
-     * Art leaving the cache in RAM is written to flash where it lies.
-     *
-     * There is no gathering buffer.  One was tried and it was my invention,
-     * not a requirement: it existed only to make writes rare, because each
-     * write used to drop the mapping over the store and build it again - and
-     * while the mapping is down, art cannot be handed out as a pointer and
-     * every picture is copied instead.
-     *
-     * The dropping was unnecessary.  Writing always happens BEYOND what has
-     * been written and mapped, so nothing under the mapping ever changes; the
-     * mapping only has to be EXTENDED over the new bytes, and that can happen
-     * rarely and on its own schedule.
-     *
-     * The bytes go through a small piece of internal memory when there is one:
-     * a flash driver can only program from internal memory, so a source in the
-     * arena is otherwise relayed through the driver's own tiny buffer.
-     * Measured at 3.5 ms per kilobyte through ours against 6.9 through the
-     * driver's - but that is a report, and the game is the judge.
-     */
-    if (s_store == nullptr || data == nullptr || size <= 0) {
-        s_lost_closed++;
+    const ag_art_put_t one = { fid, data, size };
+
+    ag_art_store_put_many(&one, 1);
+}
+
+/*
+ * A whole eviction, written in one approach to the chip.
+ *
+ * The cache in RAM does not run short of one picture: when it needs room it
+ * gives up a batch of them, and that batch belongs in flash as a single
+ * visit.  Writing switches off the cache that feeds the processor from the
+ * same chip, so the board stops for the length of the visit - and the length
+ * hardly depends on how many bytes go: it is the visit that costs.  Fifty
+ * pictures written one by one are fifty freezes scattered through play; the
+ * same fifty written together are one, at a moment the cache has chosen.
+ *
+ * The erase for the whole batch is done first, for the same reason.
+ */
+void ag_art_store_put_many(const ag_art_put_t *items, int count)
+{
+    if (s_store == nullptr || items == nullptr || count <= 0) {
+        s_lost_closed += (count > 0) ? (uint32_t)count : 0u;
         return;
     }
     if (!s_filling && !s_write_in_play) {
-        s_lost_closed++;
+        s_lost_closed += (uint32_t)count;
         return;
     }
     if (s_full) {
-        s_lost_full++;
-        return;
-    }
-    if (find(fid) != nullptr) {
-        s_lost_dup++;
+        s_lost_full += (uint32_t)count;
         return;
     }
 
-    while (s_fill_at + (uint32_t)size > s_erased_to) {
-        if (!erase_more()) {
-            s_full = true;
-            s_lost_full++;
-            return;
+    /* What is genuinely new, so the erase below is asked for the right size. */
+    uint32_t total = 0;
+
+    for (int i = 0; i < count; i++) {
+        if (items[i].data == nullptr || items[i].size <= 0) {
+            s_lost_closed++;
+            continue;
         }
+        if (find(items[i].fid) != nullptr) {
+            s_lost_dup++;
+            continue;
+        }
+        total += (uint32_t)items[i].size;
     }
 
-    const uint32_t base = s_fill_at;
-
-    if (!write_through(base, data, (uint32_t)size)) {
+    if (total == 0u) {
         return;
     }
 
-    s_write_batches++;
-    s_bytes_written += (uint32_t)size;
-    s_fill_at += (uint32_t)size;
-    index_insert(fid, base, (uint32_t)size);
+    for (int i = 0; i < count; i++) {
+        const int fid = items[i].fid;
+        const int size = items[i].size;
 
-    {
-        const unsigned kind = ((unsigned)fid >> 24) & 0x0Fu;
+        if (items[i].data == nullptr || size <= 0) {
+            continue;
+        }
+        if (find(fid) != nullptr) {
+            continue;
+        }
 
-        if (s_filling) {
-            s_kept_load++;
-            s_kept_load_kind[kind]++;
+        /*
+         * Into the gathering buffer, and out to flash only when it is full.
+         *
+         * This is the shape that played well and that I removed: what makes a
+         * write expensive is the visit to the chip, not the bytes, because
+         * the data cache is off for its whole length.  Evictions arrive one
+         * picture at a time whatever the cache is asked to free, so the
+         * batching has to live here, where they land - three hundred
+         * kilobytes of them leave together, in one visit.
+         */
+        if (s_stage == nullptr) {
+            /* No buffer: the old way, one visit per picture. */
+            while (s_fill_at + (uint32_t)size > s_erased_to) {
+                if (!erase_more()) {
+                    s_full = true;
+                    s_lost_full++;
+                    return;
+                }
+            }
+
+            const uint32_t base = s_fill_at;
+
+            if (!write_through(base, items[i].data, (uint32_t)size)) {
+                return;
+            }
+            s_write_batches++;
+            s_bytes_written += (uint32_t)size;
+            s_fill_at += (uint32_t)size;
+            index_insert(fid, base, (uint32_t)size);
         } else {
-            s_kept_play++;
-            s_kept_play_kind[kind]++;
+            if ((uint32_t)size > s_stage_cap) {
+                s_lost_big++;
+                continue;
+            }
+            if (s_stage_len + (uint32_t)size > s_stage_cap
+                    || s_stage_n >= 256u) {
+                stage_flush();
+            }
+
+            /* Room has to exist in flash for what is being gathered. */
+            while (s_fill_at + s_stage_len + (uint32_t)size > s_erased_to) {
+                if (!erase_more()) {
+                    s_full = true;
+                    s_lost_full++;
+                    stage_flush();
+                    return;
+                }
+            }
+
+            memcpy(s_stage + s_stage_len, items[i].data, (size_t)size);
+            s_stage_index[s_stage_n].fid = fid;
+            s_stage_index[s_stage_n].off = s_stage_len;
+            s_stage_index[s_stage_n].len = (uint32_t)size;
+            s_stage_n++;
+            s_stage_len += (uint32_t)size;
+        }
+
+        {
+            const unsigned kind = ((unsigned)fid >> 24) & 0x0Fu;
+
+            if (s_filling) {
+                s_kept_load++;
+                s_kept_load_kind[kind]++;
+            } else {
+                s_kept_play++;
+                s_kept_play_kind[kind]++;
+            }
         }
     }
 
-    /* Extend the mapping over the new bytes, but only once there are enough
-     * of them to be worth the trip.  Until then those pictures are copied
-     * rather than pointed at - correct, just not free. */
+    /* Extend the mapping over what has actually been written. */
     if (s_fill_at - s_map_to >= kMapGrow) {
         map_data();
     }
@@ -709,6 +772,8 @@ void ag_art_store_fill_begin(void)
 
 void ag_art_store_fill_end(void)
 {
+    /* Whatever is still gathered goes out here, inside the wait. */
+    stage_flush();
 
     /*
      * Clear a megabyte of reserve before the game starts moving.
@@ -740,6 +805,11 @@ void ag_art_store_clear(void)
     if (s_store == nullptr) {
         return;
     }
+
+    /* Nothing gathered survives a clear - it would be written past a store
+     * that no longer holds what the index describes. */
+    s_stage_len = 0;
+    s_stage_n = 0;
 
     unmap_data();
     s_count = 0;

@@ -222,6 +222,15 @@ extern unsigned ag_anim_worst_script_us;
  * call passes the threshold, then it names the tile.  See animation.cc. */
 void ag_script_slow_note(unsigned us, int tile, int elevation);
 
+/*
+ * How long the player waited for a load, start to finish.
+ *
+ * The store timed the window in which art may be written and reported tens of
+ * seconds while the stopwatch in the room said three and a half minutes.  Both
+ * were honest about different things; this one is about the wait.
+ */
+void ag_load_note(unsigned ms);
+
 /* The six layers of one map refresh; see tileRefreshGame in tile.cc. */
 /* Inside the object pass: how many turns of the loop, how many were in range,
  * how many tiles held anything, how many objects were drawn and what the

@@ -94,11 +94,16 @@ unsigned ag_map_loading;
 
 /* Where the game is, for when it stops being anywhere.  See ag_diag.h. */
 const char* volatile ag_step = "before main";
-const char* volatile ag_step_audio = "not started";
-
-/* Audio thread timings; see audio_report. */
-static volatile uint32_t s_audio_mix_us, s_audio_write_us;
-static volatile uint32_t s_audio_mix_worst_us, s_audio_write_worst_us;
+const char* volatile ag_step_audio = "not started";
+
+
+
+/* Audio thread timings; see audio_report. */
+
+static volatile uint32_t s_audio_mix_us, s_audio_write_us;
+
+static volatile uint32_t s_audio_mix_worst_us, s_audio_write_worst_us;
+
 static volatile uint32_t s_audio_blocks;
 unsigned volatile ag_audio_laps;
 void* volatile ag_ticker_now;
@@ -750,10 +755,14 @@ static int s_mouse_y = -1;
 static Uint32 s_mouse_buttons;
 static uint32_t s_fps_next;
 static uint32_t s_frames;
-static uint64_t s_blit_us;
-/* The worst single conversion and how many pixels it covered. */
-static uint32_t s_blit_worst_us, s_blit_worst_px;
-/* Rows that took long enough to mean the thread was descheduled. */
+static uint64_t s_blit_us;
+
+/* The worst single conversion and how many pixels it covered. */
+
+static uint32_t s_blit_worst_us, s_blit_worst_px;
+
+/* Rows that took long enough to mean the thread was descheduled. */
+
 static uint32_t s_preempt_n, s_preempt_us, s_preempt_worst_us;
 static uint64_t s_flush_us;
 static uint32_t s_flushes;
@@ -1707,6 +1716,12 @@ extern "C" unsigned ag_io_read_worst_us, ag_io_read_worst_len;
  */
 #define AG_SLOW_SCRIPT_US 20000u
 
+extern "C" void ag_load_note(unsigned ms)
+{
+    shim_printf("[load] the whole wait was %u ms (%u.%u s)\n",
+                ms, ms / 1000u, (ms % 1000u) / 100u);
+}
+
 extern "C" void ag_script_slow_note(unsigned us, int tile, int elevation)
 {
     static unsigned said;
@@ -2048,11 +2063,14 @@ static void memstat_service(void)
     art_flash_report();
     scroll_report();
     cache_report();
-    sfx_report();
-    audio_report();
+    sfx_report();
+
+    audio_report();
+
     blit_report();
     cycle_report();
-    io_report();
+    io_report();
+
     preempt_report();
     anim_report();
     move_report();

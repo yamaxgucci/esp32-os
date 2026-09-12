@@ -79,6 +79,24 @@ void ag_art_store_write_in_play(int on);
  */
 void ag_art_store_put(int fid, const unsigned char *data, int size);
 
+/*
+ * A whole eviction offered at once.
+ *
+ * The cache does not give up one picture when it runs short - it gives up
+ * about three hundred kilobytes of them, and they should reach the flash as
+ * one approach to the chip.  What costs time is the approach itself: the data
+ * cache is off for its whole length, so everything running from flash stops.
+ * Fifty separate writes are fifty separate freezes scattered through the
+ * game; one is one, at a moment the cache has already chosen.
+ */
+typedef struct {
+    int                  fid;
+    const unsigned char *data;
+    int                  size;
+} ag_art_put_t;
+
+void ag_art_store_put_many(const ag_art_put_t *items, int count);
+
 /* Open the store and read its index.  Safe to call on a machine with no store
  * partition: everything below then answers "not here" and the game runs
  * exactly as it did before. */
