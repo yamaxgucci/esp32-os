@@ -252,13 +252,27 @@ static int32_t rd_write(ag_device_t *dev, const void *buf, size_t len,
         len = RD_MAX_PAYLOAD;
     }
     /*
-     * STREAM, not BULK.  Bytes going to a device are usually somebody's sound
-     * or somebody's picture: they have a deadline, and a file copy must not be
-     * able to push in front of them.  A device write that is genuinely bulk
-     * costs a little latency it does not need; the reverse costs a dropout.
+     * CONTROL, and NOT the stream class, which is the mistake this very line
+     * made first.
+     *
+     * Bytes bound for a device do have a deadline, and STREAM is the class with
+     * the deadline - so it looked right.  But STREAM is deliberately
+     * UNRELIABLE: unsequenced, unacknowledged, delivered if it arrives.  That
+     * is correct for audio being poured at a converter and fatal for a request
+     * that waits for an answer: one dropped frame and the caller sits out its
+     * whole timeout with nothing to retransmit it.  Measured as a write that
+     * took fifteen seconds to report -AG_ETIMEDOUT while the wire was fine.
+     *
+     * A class that may drop is not a class you can ask a question on.  CONTROL
+     * is both reliable and first, which is what this wanted; and it stays
+     * bounded because only one request is outstanding at a time, so a device
+     * cannot flood the wire however hard it is written to.
+     *
+     * The stream class is still the right home for sound - but for a path that
+     * pours samples and never waits, which is a different thing from this.
      */
     return ask(RD_WRITE, (uint32_t)p->far_handle, 0, (uint32_t)off,
-               AG_LINK_STREAM, buf, (uint16_t)len, NULL, NULL);
+               AG_LINK_CONTROL, buf, (uint16_t)len, NULL, NULL);
 }
 
 static ag_err_t rd_ioctl(ag_device_t *dev, uint32_t cmd, void *arg,
@@ -312,8 +326,20 @@ static const ag_dev_ops_t k_proxy_ops = {
 static void reply(uint8_t op, uint16_t tag, int32_t status, uint8_t cls,
                   const void *pay, uint16_t plen)
 {
-    (void)send_raw((uint8_t)(op | RD_REPLY), tag, (uint32_t)status, 0, 0, cls,
-                   pay, plen);
+    const ag_err_t e = send_raw((uint8_t)(op | RD_REPLY), tag,
+                                (uint32_t)status, 0, 0, cls, pay, plen);
+    if (e != AG_OK) {
+        /*
+         * Said, because the shape of this failure is deceptive: the asking node
+         * sees a timeout and blames the wire, while the truth is that this node
+         * answered and the answer could not be sent.  One is a lost frame, the
+         * other is a full window or a link that has gone - and they are fixed
+         * in different places.
+         */
+        ag_log(AG_LOG_WARN, TAG, "op %u answered %d but the reply did not go "
+                                 "out: %d",
+               (unsigned)op, (int)status, (int)e);
+    }
 }
 
 /*
@@ -392,7 +418,9 @@ static void serve_one(const uint8_t *b, uint16_t n)
             want = RD_MAX_PAYLOAD;
         }
         const int32_t r = ag_dev_read(dev, obuf, want, off);
-        reply(op, tag, r, AG_LINK_STREAM, obuf,
+        /* The answer to a question, so the reliable class - same reason as the
+         * write above, in the other direction. */
+        reply(op, tag, r, AG_LINK_CONTROL, obuf,
               (uint16_t)((r > 0) ? r : 0));
         break;
     }

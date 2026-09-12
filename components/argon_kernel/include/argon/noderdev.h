@@ -18,6 +18,12 @@
  * for each of them.  This is the escape hatch the rule needs in order to be
  * advice rather than a prohibition - a rule that forbids gets worked around.
  *
+ * Every call here is a QUESTION that waits for its answer, so all of it rides
+ * the reliable class.  The link's stream class exists for sound and is
+ * deliberately allowed to drop frames; pouring samples at a far converter
+ * belongs there, and it is a different mechanism from this one, not a faster
+ * setting of it.
+ *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #ifndef ARGON_NODERDEV_H

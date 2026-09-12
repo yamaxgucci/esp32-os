@@ -39,7 +39,7 @@ static bool parse_u32(const char *s, uint32_t *out)
 int ag_main(int argc, char **argv)
 {
     if (argc < 2) {
-        ag_print("usage: devpoke <device> [bytes]\n");
+        ag_print("usage: devpoke <device> [bytes] [times]\n");
         ag_print("  opens it by name, writes a pattern, says what it took\n");
         return 2;
     }
@@ -51,6 +51,20 @@ int ag_main(int argc, char **argv)
     }
     if (want > 192u) {
         want = 192u; /* one message on the wire; more is a different test */
+    }
+    /*
+     * Repeats, because some devices only do anything once enough has arrived:
+     * the mixer works a period at a time and does not choose an output until it
+     * has one to send.  A single small write into it is indistinguishable from
+     * a device that ignored it.
+     */
+    uint32_t times = 1;
+    if (argc > 3 && !parse_u32(argv[3], &times)) {
+        ag_printf("devpoke: %s is not a count\n", argv[3]);
+        return 2;
+    }
+    if (times == 0u || times > 1000u) {
+        times = 1;
     }
 
     const ag_handle_t h = ag_dev_open(argv[1]);
@@ -66,16 +80,31 @@ int ag_main(int argc, char **argv)
         buf[i] = (uint8_t)(i * 7u + 1u);
     }
 
-    const int32_t n = ag_dev_write(h, buf, want);
-    if (n < 0) {
-        ag_printf("devpoke: write: %s (%d)\n", ag_strerror((ag_err_t)n),
-                  (int)n);
-        (void)ag_dev_close(h);
-        return 1;
+    uint32_t total = 0;
+    for (uint32_t i = 0; i < times; i++) {
+        /*
+         * Before each write, not after.  A device that never returns is a
+         * different fault from one that returns an error, and the two are
+         * indistinguishable from a program that only reports at the end -
+         * which is how a hang on the sixth write of twelve looked like a hang
+         * at the start.
+         */
+        if (times > 1u) {
+            ag_printf("devpoke: write %u\n", (unsigned)(i + 1u));
+        }
+        const int32_t n = ag_dev_write(h, buf, want);
+        if (n < 0) {
+            ag_printf("devpoke: write: %s (%d)\n", ag_strerror((ag_err_t)n),
+                      (int)n);
+            (void)ag_dev_close(h);
+            return 1;
+        }
+        total += (uint32_t)n;
     }
-    ag_printf("devpoke: %d of %u bytes taken\n", (int)n, (unsigned)want);
+    ag_printf("devpoke: %u of %u bytes taken\n", (unsigned)total,
+              (unsigned)(want * times));
 
     (void)ag_dev_close(h);
     ag_print("devpoke: closed\n");
-    return (n == (int32_t)want) ? 0 : 1;
+    return (total == want * times) ? 0 : 1;
 }

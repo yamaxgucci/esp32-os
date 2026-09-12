@@ -48,10 +48,13 @@
 [CmdletBinding()]
 param(
     # Generous, and it has to be: the remote-drive scenario is a round trip per
-    # directory entry and per block of a program image.  Too short does not
-    # report "slow" - the emulator is killed mid-list and the commands after it
-    # simply never ran, which reads as a feature that does not work.
-    [int]$TimeoutSec = 240,
+    # directory entry and per block of a program image, and the placement one
+    # now opens a device on the other board and pours audio periods at it.
+    # Too short does not report "slow" - the emulator is killed mid-list and the
+    # commands after it simply never ran, which reads as a feature that does not
+    # work.  It has read that way twice; raise this before believing a failure
+    # whose transcript simply stops.
+    [int]$TimeoutSec = 420,
     # Baud is nominal: there is no line here, only a socket, so this only has to
     # be a number both ends configure their port to.  Kept at a real rate so the
     # transcript reads like the board's.
@@ -340,9 +343,19 @@ if ($Scenario -eq 'link' -or $Scenario -eq 'both') {
         # timer that is too short for the moment, not a fault - and an assertion
         # that fails on a busy afternoon is one nobody believes by Friday.
         #
-        # The number is still worth bounding: a link doing a tenth of its work
-        # twice on a perfect wire has something wrong with it.
-        Note ($again * 10 -le $sent) 'link-retransmits-stay-rare' `
+        # Now that the timer is MEASURED, this number says something sharper
+        # than it used to, and the bound had to be re-derived rather than kept.
+        #
+        # The round trip here measures 3 ms and the timer sits on its 30 ms
+        # floor - the floor being the granularity of the far end's ANSWER, not a
+        # guess about the wire.  So a retransmission now means the far node took
+        # more than thirty milliseconds to acknowledge: its scheduler, on a PC
+        # running two emulators, which the floor exists to tolerate.  It is not
+        # a wire fault, and the sharp assertions for that are the two below -
+        # zero gaps and zero bad frames.
+        #
+        # Still bounded, because a quarter would mean the floor itself is wrong.
+        Note ($again * 4 -le $sent) 'link-retransmits-stay-rare' `
             "$again of $sent"
     }
 
@@ -383,7 +396,7 @@ if ($Scenario -eq 'link' -or $Scenario -eq 'both') {
                  # serving happens on the link's own reader task regardless.
                  # B must still be there when A asks, and A now asks for a
                  # whole directory and a whole program image a block at a time.
-                 "link poll $(($SendDelaySec + 120) * 1000)",
+                 "link poll $(($SendDelaySec + 300) * 1000)",
                  '=link on node0') `
         -SendA @('drv load t:\nodelink.sys',
                  'link use node0',
@@ -549,7 +562,7 @@ if ($Scenario -eq 'link' -or $Scenario -eq 'both') {
                  # the repair rather than the ordinary case.
                  'link name sound',
                  'link use node0',
-                 "link poll $(($SendDelaySec + 120) * 1000)",
+                 "link poll $(($SendDelaySec + 300) * 1000)",
                  '=link on node0') `
         -SendA @('drv load t:\nodelink.sys',
                  'link name quiet',
@@ -568,7 +581,32 @@ if ($Scenario -eq 'link' -or $Scenario -eq 'both') {
                  '=are in this registry now',
                  'dev',
                  'run t:\devpoke.axe sound.pcmvirt 64',
-                 '=devpoke: closed')
+                 # Waited for on a word that BOTH outcomes print.  Waiting for
+                 # `closed` looked right and was a trap: a failed run exits
+                 # before printing it, so the harness sat out its whole timeout
+                 # and a plain failure was indistinguishable from a hang - four
+                 # minutes of nothing, in the middle of the transcript.
+                 '=devpoke:',
+                 # And the class default: this node's mixer has no real output
+                 # of its own, so the sound should leave through the
+                 # neighbour's rather than into pcmnull.  Enough bytes for the
+                 # mixer to have a period to send - it does not choose an
+                 # output until it has something to put in it.
+                 # Enough periods to see it SETTLE, not just to see it try.
+                 # Opening a sink on the other board is a round trip, and it can
+                 # arrive while that node is busy with something else - which is
+                 # -AG_EBUSY, correct, and retried on the next period.  Two
+                 # periods gave it two chances and failed about half the time;
+                 # a continuous stream is what this actually models.
+                 'run t:\devpoke.axe pcmmix 192 40',
+                 '=devpoke:',
+                 # From the JOURNAL, not the screen.  The mixer chooses its
+                 # output inside a write, which runs on the application's task
+                 # - and while an application owns the console the kernel log
+                 # does not reach it.  The line was always written; looking for
+                 # it on the screen was looking in the wrong place.
+                 'log -n 40',
+                 '=log')
 
     $a = Transcript 'build\nodetest-place-a.log'
     $b = Transcript 'build\nodetest-place-b.log'
@@ -609,6 +647,13 @@ if ($Scenario -eq 'link' -or $Scenario -eq 'both') {
     Check $a 'are in this registry now' 'rdev-proxies-registered'
     Check $a 'sound.pcmvirt is open' 'rdev-opened-a-device-that-is-not-here'
     Check $a '64 of 64 bytes taken' 'rdev-wrote-through-the-wire'
+
+    # The class default, which is the part an application never sees: nothing
+    # asked for `sound.pcmvirt` here.  The mixer was asked for sound, had no
+    # real output of its own, and found one on the other board - quality first,
+    # distance as the tie-break.  Into pcmnull would have been silence that
+    # reported success.
+    Check $a 'sink /dev/sound.pcmvirt' 'default-sound-left-through-the-neighbour'
 }
 
 # ------------------------------------------------- unloading, on one node ---

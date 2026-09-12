@@ -7,6 +7,10 @@
  * written to a single exclusive sink: pcmvirt if present, else pcm0, else
  * pcmnull.  Missing clients contribute silence for that period.
  *
+ * Each of those is looked for HERE and then on the node next door, so a board
+ * with no converter of its own plays through its neighbour rather than into
+ * pcmnull - quality first, distance only as the tie-break.  See devdefault.c.
+ *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #include "argon/audio.h"
@@ -17,6 +21,7 @@
 
 #include "argon/board.h"
 #include "argon/device.h"
+#include "argon/devdefault.h"
 #include "argon/log.h"
 
 #define TAG "pcmmix"
@@ -51,6 +56,7 @@ typedef struct {
     uint64_t         bytes_out;
     uint64_t         bytes_drop_nosink;
     uint32_t         underrun_events;
+    int              nosink_said; /* so a silence is reported once, not per period */
     int16_t         *mix_scratch; /* PCMMIX_PERIOD * 2, heap */
 } pcmmix_state_t;
 
@@ -160,17 +166,53 @@ static void ring_clear(pcmmix_client_t *c)
     c->ring_used = 0;
 }
 
+/*
+ * Best first, and this order is a fact about SOUND rather than about devices:
+ * a helper on the development machine, then the board's own converter, then
+ * the one that swallows it.  The registry cannot derive this and should not
+ * try - which is why the list stays here and only the looking moved out.
+ *
+ * pcmmix itself is absent from the list deliberately.  It is of class
+ * AG_DEV_AUDIO too, and a mixer that could choose itself as its own output is
+ * a loop with no bottom.
+ */
+static const char *const k_audio_prefer[] = {"pcmvirt", "pcm0", "pcmnull",
+                                             NULL};
+
 static ag_device_t *pick_sink(void)
 {
-    ag_device_t *d = ag_dev_find("pcmvirt");
-    if (d != NULL) {
-        return d;
+    /*
+     * Which also looks at the node next door: a board with no converter of its
+     * own and a neighbour that has one should play through the neighbour rather
+     * than into pcmnull.  Local wins ties - each name is tried here first - so
+     * on a single board this chooses exactly what it always chose.
+     */
+    return ag_dev_default(AG_DEV_AUDIO, k_audio_prefer);
+}
+
+/*
+ * The sink went away under us.
+ *
+ * This was safe to leave out for as long as a sink was a kernel device that
+ * outlives everything.  It stopped being safe the moment the sink can be the
+ * NODE NEXT DOOR: a proxy disappears when the link drops or when somebody
+ * detaches it, and a held pointer into a slot that has been cleared is the
+ * use-after-free this tree has already had twice - the kind that does not
+ * crash, but answers with zeros.
+ *
+ * The registry lock is held here, so nothing in the registry may be called:
+ * not even the close that release_sink would do.  Drop the pointer and return.
+ * The mixer picks again on its next period, which is where the recovery
+ * belongs anyway - "the sound moved to the other board" should not need anyone
+ * to notice and act.
+ */
+static void on_revoke(ag_device_t *dev)
+{
+    if (s_st != NULL && s_st->sink == dev) {
+        s_st->sink = NULL;
+        s_st->sink_held = 0;
+        s_st->sink_name[0] = '\0';
     }
-    d = ag_dev_find("pcm0");
-    if (d != NULL) {
-        return d;
-    }
-    return ag_dev_find("pcmnull");
 }
 
 static void release_sink(pcmmix_state_t *st)
@@ -290,9 +332,25 @@ static void mix_one_period(pcmmix_state_t *st)
         return;
     }
 
-    if (ensure_sink(st) != AG_OK) {
-        st->bytes_drop_nosink += (uint64_t)period_bytes;
-        return;
+    {
+        const ag_err_t serr = ensure_sink(st);
+        if (serr != AG_OK) {
+            st->bytes_drop_nosink += (uint64_t)period_bytes;
+            /*
+             * Once per spell of silence, not once per period - a mixer that
+             * cannot place its output produces a period every few milliseconds
+             * and would bury the console.  Said at all because the symptom
+             * otherwise is silence, and silence is the one symptom that says
+             * nothing about its cause: a counter nobody reads is not an answer.
+             */
+            if (!st->nosink_said) {
+                st->nosink_said = 1;
+                ag_log(AG_LOG_WARN, TAG, "nowhere to send sound: %d",
+                       (int)serr);
+            }
+            return;
+        }
+        st->nosink_said = 0;
     }
     n = ag_dev_write(st->sink, st->mix_scratch, period_bytes, 0);
     if (n > 0) {
@@ -566,8 +624,10 @@ ag_err_t ag_pcmmix_init(void)
         s_ring_pool = NULL;
         return err;
     }
+    (void)ag_dev_on_revoke(on_revoke);
     ag_log(AG_LOG_INFO, TAG,
-           "pcmmix ready (sum %u clients → pcmvirt|pcm0|pcmnull)",
+           "pcmmix ready (sum %u clients → pcmvirt|pcm0|pcmnull, here or on "
+           "the node next door)",
            (unsigned)PCMMIX_CLIENTS);
     return AG_OK;
 }

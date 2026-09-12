@@ -8,6 +8,7 @@ set(ARGON_KERNEL_SRCS
     "src/core/cmdline.c"
     "src/core/sysconfig.c"
     "src/core/nodename.c"
+    "src/dev/devdefault.c"
     "src/core/journal.c"
     "src/core/log.c"
     "src/core/power.c"
