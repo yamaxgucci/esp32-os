@@ -41,6 +41,8 @@
 #include <argon/net.h>
 #include <argon/ssh.h>
 #include "console/telnet_console.h"
+#include "console/uart_console.h"
+#include <argon/port/uart.h>
 #include <argon/port/bt.h>
 #include <argon/port/ble.h>
 #include <argon/port/usb.h>
@@ -4832,6 +4834,102 @@ static int cmd_beep(int argc, char **argv)
     return 0;
 }
 
+/*
+ * Raw serial bridge: hand UART0 (the console) straight to another UART, byte
+ * for byte, until the board is reset.  The board becomes a transparent USB-UART
+ * for a chip wired to that other port - esptool (or anything) on the PC then
+ * talks to that chip through the board.
+ *
+ * The console dies the instant this starts: UART0 stops being a console and
+ * becomes a wire, so nothing the system prints can corrupt the stream.  That is
+ * the whole point, and it is why the only way out is a reset.  It is entered
+ * deliberately, and it never returns.
+ *
+ * esptool's DTR/RTS auto-reset toggles THIS board (that is how the CYD itself is
+ * flashed), not the far chip - so on the PC use `--before no_reset --after
+ * no_reset` and put the far chip into download mode yourself.
+ */
+static int cmd_uartbridge(int argc, char **argv)
+{
+    if (argc < 2) {
+        ag_console_puts("usage: uartbridge <port> [baud]\n");
+        ag_console_puts("  bridges UART0 (the console) <-> uart<port>, raw, "
+                        "until reset\n");
+        ag_console_puts("  the console goes silent while it runs - that is "
+                        "expected\n");
+        return 1;
+    }
+
+    const int      port = atoi(argv[1]);
+    const uint32_t baud =
+        (argc > 2) ? (uint32_t)strtoul(argv[2], NULL, 10) : 115200u;
+
+    if (port <= 0 || port >= AG_PORT_UART_PORTS ||
+        port == AG_PORT_UART_CONSOLE) {
+        ag_console_printf("uartbridge: <port> must be another UART, not %d "
+                          "(the console)\n", AG_PORT_UART_CONSOLE);
+        return 1;
+    }
+    if (baud == 0) {
+        ag_console_puts("uartbridge: baud must be non-zero\n");
+        return 1;
+    }
+
+    const ag_board_uart_t *cfg = &ag_board()->uart[port];
+    if (cfg->tx < 0 && cfg->rx < 0) {
+        ag_console_printf("uartbridge: uart%d has no pins; set [uart%d] tx/rx "
+                          "in C:\\BOARD.CFG\n", port, port);
+        return 1;
+    }
+
+    const ag_port_uart_cfg_t ucfg = {
+        .baud = baud, .data_bits = 8, .parity = 0, .stop_bits = 1,
+    };
+    ag_err_t err = ag_port_uart_open(port, &ucfg, 8192, 2048);
+    if (err != AG_OK) {
+        ag_console_printf("uartbridge: uart%d would not open (%d)\n", port,
+                          (int)err);
+        return 1;
+    }
+    (void)ag_port_uart_pins(port, cfg->tx, cfg->rx);
+
+    ag_console_printf("bridge: UART0 <-> uart%d at %u baud. The console is a "
+                      "wire now; reset to exit.\n", port, (unsigned)baud);
+    ag_console_printf("PC: esptool --port <this COM> --baud %u --before "
+                      "no_reset --after no_reset ...\n", (unsigned)baud);
+    ag_console_sync();
+
+    /* UART0 stops being a console and becomes a plain port we drive directly.
+     * The driver stays installed, so reads and writes on it keep working. */
+    ag_uart_console_detach(AG_PORT_UART_CONSOLE);
+    (void)ag_port_uart_flush(AG_PORT_UART_CONSOLE);
+    if (baud != 115200u) {
+        (void)ag_port_uart_config(AG_PORT_UART_CONSOLE, &ucfg);
+    }
+
+    /*
+     * Copy both ways, forever.  The short read timeouts block (and so yield the
+     * CPU), which keeps the watchdog fed and the rest of the system running;
+     * 256 bytes is far more than a 2 ms window holds at these rates, so nothing
+     * is dropped for want of buffer here.
+     */
+    static uint8_t from_pc[256];
+    static uint8_t from_chip[256];
+    for (;;) {
+        const int32_t n =
+            ag_port_uart_read(AG_PORT_UART_CONSOLE, from_pc, sizeof(from_pc), 2);
+        if (n > 0) {
+            (void)ag_port_uart_write(port, from_pc, (size_t)n);
+        }
+        const int32_t m =
+            ag_port_uart_read(port, from_chip, sizeof(from_chip), 2);
+        if (m > 0) {
+            (void)ag_port_uart_write(AG_PORT_UART_CONSOLE, from_chip, (size_t)m);
+        }
+    }
+    /* not reached */
+}
+
 static const ag_command_t k_commands[] = {
     {"help", "", "list these commands", cmd_help},
     {"ver", "", "version and hardware", cmd_ver},
@@ -4858,6 +4956,9 @@ static const ag_command_t k_commands[] = {
      "modules: list, load, install to C:, unload, I2C probe", cmd_drv},
     {"io", "[pin [mode]] | i2c <bus> | spi <bus> <hex...> | xclk <pin> [hz] | adc [ch]",
      "pins and buses", cmd_io},
+    {"uartbridge", "<port> [baud]",
+     "console <-> another UART, raw, until reset (flash a wired chip from the PC)",
+     cmd_uartbridge},
     {"beep", "[hz] [ms]", "a tone on /dev/pcm0", cmd_beep},
     {"power", "[full|eco|doze|screen on|off|auto on|off]",
      "the clock, the screen, and what applications make of it", ag_cmd_power},

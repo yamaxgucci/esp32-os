@@ -62,3 +62,13 @@ ag_err_t ag_uart_console_attach(int port, int baud)
     s_ports[port].port = port;
     return ag_console_attach(&k_uart_transport, &s_ports[port]);
 }
+
+void ag_uart_console_detach(int port)
+{
+    if (port < 0 || port >= AG_PORT_UART_PORTS) {
+        return;
+    }
+    /* Detach by the same ctx we attached with; the driver is left installed so
+     * the caller keeps a working port to read and write directly. */
+    ag_console_detach(&s_ports[port]);
+}
