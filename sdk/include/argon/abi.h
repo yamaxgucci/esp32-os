@@ -206,9 +206,16 @@ extern "C" {
  *      on the wire, whatever knew which of them were urgent is gone.  The
  *      class is appended, so no existing one moves - a class is a number
  *      inside a .SYS built months ago.
+
+ * 0.50 task->svc_start / svc_stopping: a task a loadable driver may own.
+ *      create() refuses a caller with no process, so until now a .SYS could
+ *      only poll from callbacks the kernel happened to make - which cannot
+ *      watch a wire.  A service task belongs to the MODULE, the kernel stops
+ *      it when the module is unloaded, and it runs BELOW every application
+ *      because a driver task above them has already cost this project a game.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 49u
+#define AG_ABI_MINOR 50u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -1211,6 +1218,13 @@ typedef struct ag_link_stats {
     uint32_t gaps;        /* frames discarded because one ahead of them was lost */
     uint32_t dups;        /* frames already had: an acknowledgement was lost     */
     uint32_t bad;         /* frames whose header or payload did not check out    */
+    /*
+     * Frames that carried nothing but an acknowledgement, sent because the
+     * wire was idle and something was owed.  Counted apart from `sent`: they
+     * are real frames and real bytes, and they are not work anybody asked for,
+     * so adding them to the same number would make a quiet link look busy.
+     */
+    uint32_t acks;
     uint32_t tx_bytes;
     uint32_t rx_bytes;
 } ag_link_stats_t;
@@ -1412,6 +1426,7 @@ typedef struct ag_time_api {
 /* ------------------------------------------------------------------------ */
 
 typedef void *ag_thread_t;
+typedef void *ag_svc_t; /* a service task owned by a module (ABI 0.50) */
 typedef void *ag_mutex_t;
 typedef void *ag_sem_t;
 typedef void *ag_queue_t;
@@ -1451,6 +1466,41 @@ typedef struct ag_task_api {
     /* Disable preemption on the current core; keep it short. */
     void (*critical_enter)(void);
     void (*critical_exit)(void);
+
+    /*
+     * A TASK A LOADABLE DRIVER MAY OWN (ABI 0.50).
+     *
+     * create() above refuses a caller with no current process, and the reason
+     * is sound - a thread must belong to something that can be made to end, and
+     * a driver was not that.  So a .SYS polled from whatever callback the
+     * kernel happened to make: right for a panel that is asked to blit, wrong
+     * for anything whose job is to WATCH.  REMDISP says so in its own source; a
+     * node link cannot work at all that way, because ten polls a second is a
+     * ceiling of sixty kilobytes and a node has to hear what it did not ask
+     * for.
+     *
+     * A service task belongs to the MODULE, which is the owner create() could
+     * not point at.  ONLY VALID FROM ag_driver_init, the same rule dev->add
+     * follows: outside it there is nothing to own the task, and an unowned task
+     * is one nothing can ever stop.
+     *
+     * NO PRIORITY ARGUMENT, deliberately.  Applications run at three levels and
+     * a service task runs below all of them.  A driver task above applications
+     * has cost this project a game - the wire's own task sat there, never
+     * blocked, and 40 fps became unplayable until it was moved down - so the
+     * choice is not offered.  `flags` is reserved and must be 0.
+     *
+     * THE STOP PROTOCOL IS COOPERATIVE, and it must be: the task runs code
+     * inside the module's image, so the image cannot be freed under it.  Check
+     * svc_stopping() in the loop and return when it is true.  A task that never
+     * returns is not killed - killing it would leave whatever it holds held for
+     * ever - it is complained about, and its module stays mapped.  That is a
+     * leak, and it is enormously better than executing memory that has been
+     * given back.
+     */
+    ag_svc_t (*svc_start)(void (*fn)(void *), void *arg, const char *name,
+                          size_t stack, uint32_t flags);
+    bool (*svc_stopping)(ag_svc_t s);
 } ag_task_api_t;
 
 /* ------------------------------------------------------------------------ */

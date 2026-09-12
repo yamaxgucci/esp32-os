@@ -47,6 +47,9 @@ static void print_stats(void)
      */
     ag_console_printf("losses  %u gaps, %u duplicates, %u bad\n",
                       (unsigned)st.gaps, (unsigned)st.dups, (unsigned)st.bad);
+    ag_console_printf("acks    %u sent alone (the wire was idle and one was "
+                      "owed)\n",
+                      (unsigned)st.acks);
     ag_console_printf("bytes   %u out, %u in\n", (unsigned)st.tx_bytes,
                       (unsigned)st.rx_bytes);
 }

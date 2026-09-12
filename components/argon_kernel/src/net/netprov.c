@@ -349,6 +349,32 @@ const char *ag_netprov_active(void) { return s_name; }
 bool ag_netprov_is_builtin(void) { return s_dev == NULL; }
 
 /*
+ * The bound radio went away - `drv unload EXTRADIO` while `net use extradio`
+ * was in force, or the hardware did.  Fall back to the built-in stack before
+ * the pointer becomes an address in an image that has been given back.
+ *
+ * This was latent here before the node link was written and found the same
+ * shape of bug next door: the sockets that were open belong to the interface
+ * that has gone, so they go too, exactly as they do on a deliberate switch.
+ *
+ * Called with the registry lock held: drop the pointer and return, and do not
+ * reach back into the registry.  ag_port_net_start is left to whoever next
+ * wants an address; doing it here would be work under a lock for a board that
+ * may have no built-in radio at all.
+ */
+static void on_revoke(ag_device_t *dev)
+{
+    if (dev == NULL || dev != s_dev) {
+        return;
+    }
+    ag_net_reset_sockets();
+    s_ops = &s_builtin;
+    s_dev = NULL;
+    strcpy(s_name, "builtin");
+    ag_log(AG_LOG_WARN, "net", "the bound radio went away; back to builtin");
+}
+
+/*
  * Every function pointer the kernel actually dials must be present; a NULL one
  * would fault the first time a socket was opened, and the operator should be
  * told at bind time instead.
@@ -414,6 +440,8 @@ ag_err_t ag_netprov_use_device(const char *name)
     if (strcmp(name, "builtin") == 0) {
         return ag_netprov_use_builtin();
     }
+
+    (void)ag_dev_on_revoke(on_revoke);
 
     ag_device_t *dev = ag_dev_find(name);
     if (dev == NULL) {

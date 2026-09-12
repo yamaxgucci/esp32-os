@@ -119,6 +119,23 @@ enum ag_nlink_flag {
     NL_F_PSUM = 1u << 0, /* payload carries a CRC; check it            */
     NL_F_EOM = 1u << 1,  /* last frame of a message split by quantum   */
     NL_F_RST = 1u << 2,  /* channel reset: drop what you have of it    */
+    /*
+     * This frame is nothing but an acknowledgement.  It has no sequence
+     * number, is not delivered, and is not itself acknowledged - so two ends
+     * cannot acknowledge each other for ever.
+     *
+     * Why it exists: an ack normally rides on the next frame going the other
+     * way, which is free when there is one and useless when there is not.  A
+     * request-and-answer pattern ends with an answer nobody replies to, so the
+     * answer's own frame sits unacknowledged until its timer fires and the
+     * whole window goes again.  Measured: one retransmission in twenty-five on
+     * a socket that loses nothing at all.
+     *
+     * A sender emits one only when the wire is otherwise IDLE and something is
+     * owed - so it costs a frame exactly when a frame costs nothing, and an
+     * idle link with nothing new received sends none.
+     */
+    NL_F_ACKONLY = 1u << 3,
 };
 
 /*

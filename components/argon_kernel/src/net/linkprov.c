@@ -34,11 +34,32 @@ static bool ops_complete(const ag_link_ops_t *o)
 const char *ag_linkprov_active(void) { return s_name; }
 bool        ag_linkprov_bound(void) { return s_ops != NULL; }
 
+/*
+ * The device went away - its driver was unloaded, or the hardware did.  Let go
+ * while the pointer still means something: a moment later it is an address in
+ * an image that has been given back, and a link that answers out of freed
+ * memory is worse than one that says it is not there.
+ *
+ * Called with the registry lock held, so nothing here may reach back into it.
+ */
+static void on_revoke(ag_device_t *dev)
+{
+    if (dev != NULL && dev == s_dev) {
+        s_ops = NULL;
+        s_dev = NULL;
+        strcpy(s_name, "none");
+    }
+}
+
 ag_err_t ag_linkprov_use(const char *name)
 {
     if (name == NULL || name[0] == '\0') {
         return -AG_EINVAL;
     }
+    /* Registered on the first bind rather than at boot: a board that never
+     * binds a link never needs the watcher, and on_revoke is idempotent. */
+    (void)ag_dev_on_revoke(on_revoke);
+
     if (strcmp(name, "none") == 0) {
         s_ops = NULL;
         s_dev = NULL;

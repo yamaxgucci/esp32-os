@@ -316,6 +316,49 @@ if ($Scenario -eq 'link' -or $Scenario -eq 'both') {
         Note ([int]$lb.Groups[3].Value -eq 0) 'link-no-bad-frames' `
             ("{0} bad" -f $lb.Groups[3].Value)
     }
+
+    # The driver says "listening" only when its service task started (ABI 0.50),
+    # which is the difference between a link and a node: without it nothing
+    # reads the wire unless somebody is inside a `link` command.
+    Check $a 'listening' 'link-service-task-started'
+}
+
+# ------------------------------------------------- unloading, on one node ---
+#
+# The dangerous half of a driver that owns a task is not running it, it is
+# STOPPING it: the task executes code inside the module's image, so the image
+# cannot be freed while it is in there.  And a bound device outlives its driver
+# in whoever bound it - which was a real use-after-free, and the kind that does
+# not crash: after `drv unload NODELINK` the shell still said "link on node0"
+# and called into an image that had been given back, answering with zeros.
+#
+# One guest is enough for this, and one guest is what it uses.
+
+if ($Scenario -eq 'link' -or $Scenario -eq 'both') {
+    Write-Host "`n== a driver that owns a task, unloaded ==" -ForegroundColor Cyan
+
+    & (Join-Path $PSScriptRoot 'qemu-boot.ps1') -TimeoutSec $TimeoutSec `
+        -LinkPort 5580 -LinkListen -KeepOtherEmulators -Tag 'unload' `
+        -Flash 'build\qemu_flash_unload.bin' -LogPath 'build\nodetest-unload.log' `
+        -Put 'build\apps\NODELINK.SYS=t:\nodelink.sys' `
+        -Send @('drv load t:\nodelink.sys',
+                'link use node0',
+                'drv unload NODELINK',
+                'dev node0',
+                'link',
+                'ver') | Out-Null
+    Get-Process qemu-system-xtensa -ErrorAction SilentlyContinue |
+        Stop-Process -Force -ErrorAction SilentlyContinue
+
+    $u = Transcript 'build\nodetest-unload.log'
+    Check $u 'listening' 'unload-task-started'
+    Check $u 'unloaded NODELINK' 'unload-succeeded'
+    Check $u 'node0: no such device' 'unload-device-gone'
+    # The binding let go.  "link on node0" here would be the use-after-free.
+    Check $u 'no link bound' 'unload-binding-released'
+    # And the system is still alive afterwards, which a freed image being
+    # executed would not have allowed.
+    Check $u 'ArgonOS 0.1.0' 'unload-system-survived'
 }
 
 # Said out loud so nobody quotes it at a board.  There is no line here and no

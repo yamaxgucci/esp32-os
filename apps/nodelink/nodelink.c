@@ -17,18 +17,21 @@
  * the clock.  Symmetry here means the same image runs on every board, which is
  * the property a cluster of identical boards needs most.
  *
- * NO TASK OF ITS OWN, and this is the shape of the whole file.  A .SYS runs its
- * ag_driver_init in kernel context where there is no current process, so
- * api->task->create refuses it - a thread must belong to something that can be
- * made to end, and a driver is not that (components/argon_kernel/src/proc/
- * threads.c, api_create).  HostFS, the external radio and REMDISP are all in
- * the same bind and all answer it the same way: the wire advances on whichever
- * task happens to be calling in.  So every entry point here pumps, and recv()
- * with a timeout is the pump a caller uses when it has nothing to say.
+ * A TASK OF ITS OWN (ABI 0.50), and the difference it makes is the difference
+ * between a link and a node.
  *
- * That is enough while somebody is asking and not enough for a node that must
- * hear an unsolicited request with nobody calling in.  Closing that gap is a
- * service task the ABI does not have; until it does, the kernel side polls.
+ * api->task->create refuses a caller with no current process - a thread must
+ * belong to something that can be made to end - so a .SYS used to advance only
+ * on whichever task happened to call in.  That is enough while somebody is
+ * asking and useless for a node, whose whole job is to hear what it did not ask
+ * for.  api->task->svc_start gives the task to the MODULE instead, the kernel
+ * stops it when the module is unloaded, and it runs below every application:
+ * the wire's own task above them once took a game from 40 fps to unplayable.
+ *
+ * Every entry point still pumps, and that is not redundancy.  A caller that is
+ * already awake should not wait for a task to be scheduled, and the service
+ * task is what covers the times when there is no caller at all.  One mutex
+ * makes the two safe together.
  *
  * ONE MUTEX over the wire, the assembler and the queues, for the same reason as
  * the radio driver: there is then a single reader, and the frame assembler
@@ -107,6 +110,11 @@ typedef struct {
     uint16_t        stream_seq;
 
     ag_nlink_rx_t    rx[NL_CLASSES];
+    /* The acknowledgement last PUT ON THE WIRE for each class, as against the
+     * one rx would give now.  When they differ, the far end is waiting for
+     * something only we can say. */
+    uint16_t         acked[NL_CLASSES];
+    bool             acked_any[NL_CLASSES];
     ag_nlink_sched_t sched;
     uint32_t         period_at; /* ms, when this reservation period began */
 
@@ -126,7 +134,7 @@ typedef struct {
     uint8_t        psum[NL_PSUM_SIZE];
     uint32_t       plen;
 
-    uint32_t tx_bytes, rx_bytes, bad;
+    uint32_t tx_bytes, rx_bytes, bad, acks;
 } node_t;
 
 static node_t s_nd;
@@ -210,6 +218,13 @@ static void frame_arrived(void)
     /* The peer's acknowledgement rides on every frame it sends. */
     if (h->ack != NL_ACK_NONE) {
         ag_nlink_tx_ack(&s_nd.tx[cls], h->ack);
+    }
+
+    if ((h->flags & NL_F_ACKONLY) != 0u) {
+        /* Nothing but the acknowledgement above.  No sequence, so nothing to
+         * accept; no delivery, so nothing to queue; and not acknowledged
+         * itself, so the two ends cannot answer each other for ever. */
+        return;
     }
 
     if (cls == NL_CLS_STREAM) {
@@ -314,6 +329,13 @@ static void emit(uint8_t cls, uint8_t chan, uint16_t seq, uint8_t flags,
     h.credit = 0;
     h.len = len;
 
+    /* Whatever we are sending, it carries the current acknowledgement - so
+     * record what the far end has now been told. */
+    if (cls < NL_CLASSES) {
+        s_nd.acked[cls] = h.ack;
+        s_nd.acked_any[cls] = (h.ack != NL_ACK_NONE);
+    }
+
     uint8_t hdr[NL_HDR_SIZE];
     ag_nlink_pack(hdr, &h);
     wire_write(hdr, NL_HDR_SIZE);
@@ -384,6 +406,28 @@ static void turn(void)
     offer_all(t);
     const int cls = ag_nlink_sched_pick(&s_nd.sched);
     if (cls < 0) {
+        /*
+         * Nothing to say - which is exactly when saying "I have your frames"
+         * is free.  Without this the last answer of a conversation sits
+         * unacknowledged until its timer fires and the whole window goes
+         * again: one retransmission in twenty-five on a socket that loses
+         * nothing.
+         */
+        for (int c = 0; c < NL_CLASSES; c++) {
+            if (c == NL_CLS_STREAM) {
+                continue; /* not sequenced, so nothing to acknowledge */
+            }
+            const uint16_t now_ack = ag_nlink_rx_ack(&s_nd.rx[c]);
+            if (now_ack == NL_ACK_NONE) {
+                continue;
+            }
+            if (s_nd.acked_any[c] && s_nd.acked[c] == now_ack) {
+                continue; /* already told them */
+            }
+            emit((uint8_t)c, 0, 0, NL_F_ACKONLY, NULL, 0);
+            s_nd.acks++;
+            return; /* one frame per turn, here as everywhere */
+        }
         return;
     }
 
@@ -545,10 +589,34 @@ static ag_err_t nd_stats(ag_device_t *dev, ag_link_stats_t *out)
     }
     out->sent += s_nd.sched.sent[NL_CLS_STREAM];
     out->bad = s_nd.bad;
+    out->acks = s_nd.acks;
     out->tx_bytes = s_nd.tx_bytes;
     out->rx_bytes = s_nd.rx_bytes;
     TASK->mutex_unlock(s_nd.lock);
     return AG_OK;
+}
+
+/* ---------------------------------------------------------------------- */
+/* The task that listens when nobody is asking                            */
+/* ---------------------------------------------------------------------- */
+
+static ag_svc_t s_svc;
+
+static void pump_task(void *arg)
+{
+    (void)arg;
+    /*
+     * Short sleeps rather than a blocking read, because the read has to happen
+     * under the same mutex everything else takes, and a task that slept inside
+     * the lock would stop the shell from sending.  Ten milliseconds is a tick;
+     * asking for less does not get less.
+     */
+    while (!ag_api()->task->svc_stopping(s_svc)) {
+        TASK->mutex_lock(s_nd.lock, UINT32_MAX);
+        turn();
+        TASK->mutex_unlock(s_nd.lock);
+        TASK->sleep_ms(1);
+    }
 }
 
 static const ag_dev_ops_t k_dev_ops = {0};
@@ -624,8 +692,26 @@ ag_err_t ag_driver_init(void)
     if (err != AG_OK) {
         return err;
     }
+    /*
+     * The listener.  Started after the device exists, so that a frame arriving
+     * in the same millisecond has somewhere to go.
+     *
+     * Not fatal if it cannot start: the link still works for anything that
+     * calls in, which is every `link` command - it simply cannot hear an
+     * unsolicited request.  Said out loud rather than assumed, because "the
+     * other node is silent" and "this node was not listening" look identical
+     * from the far end.
+     */
+    if (AG_HAS(ag_api()->task, svc_start)) {
+        s_svc = ag_api()->task->svc_start(pump_task, NULL, "nodelink", 4096, 0);
+    }
+    if (s_svc == NULL) {
+        ag_log(AG_LOG_WARN, "nodelink",
+               "no service task: this node answers only while asked");
+    }
+
     ag_log(AG_LOG_INFO, "nodelink",
-           "/dev/node0 on uart%d at %u baud - bind with `link use node0`",
-           s_nd.uart, (unsigned)baud);
+           "/dev/node0 on uart%d at %u baud%s - bind with `link use node0`",
+           s_nd.uart, (unsigned)baud, (s_svc != NULL) ? ", listening" : "");
     return AG_OK;
 }

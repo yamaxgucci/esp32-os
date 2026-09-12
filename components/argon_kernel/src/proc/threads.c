@@ -21,6 +21,7 @@
 
 #include <argon/kernel.h>
 #include <argon/log.h>
+#include <argon/service.h>
 
 #include <argon/port/mem.h>
 #include <argon/port/sync.h>
@@ -473,6 +474,8 @@ const ag_task_api_t ag_task_api_table = {
     .queue_delete = api_queue_delete,
     .queue_send = api_queue_send,
     .queue_recv = api_queue_recv,
+    .svc_start = ag_svc_start,
+    .svc_stopping = ag_svc_stopping,
     .critical_enter = api_critical_enter,
     .critical_exit = api_critical_exit,
 };

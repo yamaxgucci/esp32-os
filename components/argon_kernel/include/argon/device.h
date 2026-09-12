@@ -143,6 +143,26 @@ ag_err_t ag_dev_unregister(ag_device_t *dev);
  * waiting for the holders to close would mean waiting for a process that may
  * never run again.
  */
+/*
+ * Told when a device goes away.
+ *
+ * A subsystem that has BOUND a device holds a pointer to it and to its class
+ * vtable, and a driver can be unloaded under that pointer - after which the
+ * binding is a pointer into an image that has been given back.  Found by
+ * unloading NODELINK while `link use node0` was in force: the next `link` still
+ * said "link on node0" and called into freed memory.  It returned zeros rather
+ * than crashing, which is the version of that bug that ships.
+ *
+ * Called WITH THE REGISTRY LOCK HELD, once per device, before the slot is
+ * cleared - so `dev` may be compared but nothing in the registry may be called
+ * from here.  Drop your pointer and return.
+ *
+ * There is no unregister: these are kernel subsystems that outlive every
+ * driver, not drivers themselves.
+ */
+typedef void (*ag_dev_revoke_fn)(ag_device_t *dev);
+ag_err_t ag_dev_on_revoke(ag_dev_revoke_fn fn);
+
 uint32_t ag_dev_revoke(ag_device_t *dev);
 
 /* Revokes everything one module registered.  Returns how many devices went. */

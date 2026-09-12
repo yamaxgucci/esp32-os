@@ -13,6 +13,7 @@
 #include <argon/log.h>
 #include <argon/path.h>
 #include <argon/probe.h>
+#include <argon/service.h>
 
 #include "core/sysconfig.h"
 
@@ -89,6 +90,24 @@ static void drop_module(module_t *m)
     if (m == NULL || !m->used) {
         return;
     }
+    /*
+     * Service tasks first, and before anything else touches the module.
+     *
+     * They are the only thing here that runs the module's code on a task of its
+     * own, so they are the only thing that can still be INSIDE the image when it
+     * is unmapped.  Stopped and waited for; and if one will not go, the image
+     * stays mapped and this slot is not reused.  A leaked module is loud and
+     * harmless.  Freeing an image out from under a running task is neither -
+     * it took the board down with a watchdog timeout the first time a driver was
+     * unloaded while it was being polled, and that was only a call in flight.
+     */
+    if (!ag_svc_stop_owner(m)) {
+        ag_log(AG_LOG_ERROR, "modules",
+               "%s keeps a task that will not stop; leaving it mapped",
+               m->path);
+        return;
+    }
+
     /* While the image is still mapped: close net listens etc. */
     if (m->fini != NULL) {
         ag_module_fini_fn fini = m->fini;

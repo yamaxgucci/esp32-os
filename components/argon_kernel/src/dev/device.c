@@ -196,10 +196,40 @@ ag_err_t ag_dev_unregister(ag_device_t *dev)
 }
 
 /* Caller holds the lock.  Returns how many handles are still open on it. */
+#define AG_DEV_REVOKE_WATCHERS 4
+static ag_dev_revoke_fn s_revoke_fn[AG_DEV_REVOKE_WATCHERS];
+
+ag_err_t ag_dev_on_revoke(ag_dev_revoke_fn fn)
+{
+    if (fn == NULL) {
+        return -AG_EINVAL;
+    }
+    for (int i = 0; i < AG_DEV_REVOKE_WATCHERS; i++) {
+        if (s_revoke_fn[i] == fn) {
+            return AG_OK; /* twice is once */
+        }
+        if (s_revoke_fn[i] == NULL) {
+            s_revoke_fn[i] = fn;
+            return AG_OK;
+        }
+    }
+    return -AG_ENFILE;
+}
+
 static uint32_t revoke_locked(ag_device_t *dev)
 {
     if (!dev->used) {
         return 0;
+    }
+
+    /*
+     * Before anything else touches the slot: whoever bound this device has to
+     * let go of it while the pointer still means something.
+     */
+    for (int i = 0; i < AG_DEV_REVOKE_WATCHERS; i++) {
+        if (s_revoke_fn[i] != NULL) {
+            s_revoke_fn[i](dev);
+        }
     }
 
     const uint32_t still_open = dev->open_count;
