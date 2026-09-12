@@ -1395,6 +1395,8 @@ unsigned ag_draw_lock_us;
 unsigned ag_layer_clear_us, ag_layer_floor_us, ag_layer_pre_us;
 unsigned ag_layer_roof_us, ag_layer_post_us, ag_layer_window_us;
 unsigned ag_move_refresh_us, ag_move_refresh_n, ag_move_refresh_px;
+unsigned ag_art_lock_us, ag_art_lock_n;
+unsigned ag_anim_worst_lock_us, ag_anim_worst_rfsh_us;
 unsigned ag_scroll_steps;
 unsigned ag_scroll_move_us;
 unsigned ag_scroll_strip_us;
@@ -1825,7 +1827,17 @@ static void anim_report(void)
                 (unsigned)ag_millis(), ag_anim_worst_us,
                 ag_anim_worst_refreshes, ag_anim_worst_px,
                 ag_anim_worst_sads, ag_anim_worst_seq_us,
-                ag_anim_worst_move_us, ag_anim_worst_script_us);
+                ag_anim_worst_move_us, ag_anim_worst_script_us,
+                ag_anim_worst_lock_us, ag_anim_worst_rfsh_us,
+                (ag_anim_worst_us > (ag_anim_worst_seq_us
+                                     + ag_anim_worst_move_us
+                                     + ag_anim_worst_script_us
+                                     + ag_anim_worst_lock_us
+                                     + ag_anim_worst_rfsh_us))
+                    ? (ag_anim_worst_us - ag_anim_worst_seq_us
+                       - ag_anim_worst_move_us - ag_anim_worst_script_us
+                       - ag_anim_worst_lock_us - ag_anim_worst_rfsh_us)
+                    : 0u);
     ag_anim_worst_us = 0;
 }
 

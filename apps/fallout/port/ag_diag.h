@@ -264,6 +264,12 @@ extern unsigned ag_layer_roof_us, ag_layer_post_us, ag_layer_window_us;
 extern unsigned ag_path_us, ag_path_n;
 extern unsigned ag_move_refresh_us, ag_move_refresh_n, ag_move_refresh_px;
 
+/* What artLock costs, everywhere it is called. */
+extern unsigned ag_art_lock_us, ag_art_lock_n;
+
+/* The worst tick, split until nothing is left unnamed. */
+extern unsigned ag_anim_worst_lock_us, ag_anim_worst_rfsh_us;
+
 /* ARGON: what one scroll step costs, in its four parts.
 
  * gameMouseRefresh was measured at 39.7 ms a frame while the map was moving -
