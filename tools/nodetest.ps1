@@ -309,10 +309,19 @@ if ($Scenario -eq 'link' -or $Scenario -eq 'both') {
         $recv = [int]$st.Groups[3].Value
         Write-Host "stack: $sent frames sent ($again again), $recv received"
         Note ($recv -ge $Pings) 'link-frames-received' "$recv received"
-        # A clean socket needs no retransmissions at all.  If this ever goes
-        # non-zero here, the fault is in the driver or the window - not in the
-        # wire, because there is no wire.
-        Note ($again -eq 0) 'link-no-retransmits-on-a-clean-socket' "$again again"
+        # Few, not none.
+        #
+        # None was the check at first, and it was wrong in a way worth keeping:
+        # the socket loses nothing, but the round trip between two emulators
+        # sharing this PC is not a fixed quantity, and it sometimes exceeds the
+        # retransmit timer.  A retransmission then is correct behaviour by a
+        # timer that is too short for the moment, not a fault - and an assertion
+        # that fails on a busy afternoon is one nobody believes by Friday.
+        #
+        # The number is still worth bounding: a link doing a tenth of its work
+        # twice on a perfect wire has something wrong with it.
+        Note ($again * 10 -le $sent) 'link-retransmits-stay-rare' `
+            "$again of $sent"
     }
 
     $lb = [regex]::Match($b, 'losses\s+(\d+) gaps, (\d+) duplicates, (\d+) bad')
@@ -357,6 +366,9 @@ if ($Scenario -eq 'link' -or $Scenario -eq 'both') {
                  # Proof, before the fact, that this node has no such file.
                  'dir t:\',
                  "!powershell -NoProfile -Command Start-Sleep -Seconds $SendDelaySec",
+                 # One `dev` for the whole system: this node's devices, then the
+                 # other node's, asked for over the wire.
+                 'dev',
                  'link run t:\hello.axe one two',
                  '=from the other node')
 
@@ -389,6 +401,24 @@ if ($Scenario -eq 'link' -or $Scenario -eq 'both') {
     # confuse it with and no file to have loaded.
     Check $a 'loader: HELLO' 'run-far-kernel-loaded-it'
     Check $a 'returned 0' 'run-far-kernel-reported-exit'
+
+    # One `dev` for the whole system.  node0 is on BOTH nodes, so seeing it in
+    # the remote section is not proof by itself; the far node has the link
+    # driver of its own and says so, and the section header only appears when
+    # the far node answered.
+    Check $a 'on the other node, over node0' 'dev-far-section-appeared'
+    # A window after the header, not a split: the console repaints, so the
+    # transcript contains the whole screen several times over and anything
+    # "after the first occurrence" is most of the run.
+    $at = $a.IndexOf('on the other node, over node0')
+    $window = if ($at -ge 0) {
+        $a.Substring($at, [Math]::Min(700, $a.Length - $at))
+    } else { '' }
+    $rows = @('NODELINK', 'pcmmix', 'flash0') |
+            Where-Object { $window.Contains($_) }
+    Note ($rows.Count -eq 3) 'dev-far-devices-listed' `
+        $(if ($rows.Count -eq 3) { '' }
+          else { "only $($rows.Count) of 3 expected rows" })
 }
 
 # ------------------------------------------------- unloading, on one node ---

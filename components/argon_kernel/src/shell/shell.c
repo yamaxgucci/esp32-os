@@ -61,6 +61,9 @@
 #include "shell/cmd_fs.h"
 #include "net/espnow.h"
 #include "net/wifimon.h"
+#include <argon/linkprov.h>
+#include <argon/nodedev.h>
+
 #include "shell/cmd_link.h"
 #include "shell/cmd_net.h"
 #include "shell/cmd_power.h"
@@ -1365,6 +1368,43 @@ static int cmd_dev(int argc, char **argv)
 
     if (shown == 0) {
         ag_console_puts("no devices\n");
+    }
+
+    /*
+     * And the other node's, under a rule of its own.
+     *
+     * Asked for rather than cached: a cache would be a second answer to "what
+     * is there", and the moment the two disagree the operator believes the
+     * stale one.  It costs one message and one answer, and `dev` is not a hot
+     * path.
+     *
+     * Marked rather than renamed.  `n2.pcm0` is the decided form and it needs
+     * node names, which are what a THIRD board makes necessary - with two,
+     * "the other one" is unambiguous and a prefix would be ceremony.
+     */
+    if (ag_linkprov_bound()) {
+        ag_devinfo_t far_dev[12];
+        const int32_t n =
+            ag_nodedev_list(far_dev, (uint32_t)(sizeof(far_dev) /
+                                                sizeof(far_dev[0])), 3000);
+        if (n < 0) {
+            /* Said, not swallowed: a neighbour that has stopped answering is
+             * news, and an empty space where its devices were is not. */
+            ag_console_printf("\nthe other node did not answer (%d)\n", (int)n);
+        } else {
+            ag_console_printf("\non the other node, over %s:\n",
+                              ag_linkprov_active());
+            if (n == 0) {
+                ag_console_puts("  nothing\n");
+            }
+            for (int32_t i = 0; i < n; i++) {
+                ag_console_printf(narrow ? "  %-8s %-8s %s\n"
+                                         : "  %-9s %-9s %s\n",
+                                  far_dev[i].name,
+                                  ag_dev_class_name(far_dev[i].cls),
+                                  far_dev[i].driver);
+            }
+        }
     }
     return 0;
 }

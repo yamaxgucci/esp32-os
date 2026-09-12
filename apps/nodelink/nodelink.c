@@ -85,7 +85,17 @@ _Static_assert((int)NL_CLS_CONTROL == (int)AG_LINK_CONTROL &&
 #define ND_RESERVE_BYTES 1764u
 #define ND_PERIOD_MS     10u
 
-#define ND_RTO_MS 40u
+/*
+ * How long to wait for an acknowledgement before sending the window again.
+ *
+ * A PLACEHOLDER, and marked as one.  It has to be longer than a round trip or
+ * the link retransmits frames that were merely in flight - at 40 ms it did
+ * that between two emulators sharing one PC, which is not even a slow wire.
+ * The right number comes from measuring the round trip on the hardware this
+ * runs on, and adapting to it the way every long-lived protocol ends up doing;
+ * until that measurement exists, generous beats clever.
+ */
+#define ND_RTO_MS 150u
 
 /* frame assembler states */
 enum { SM_SYNC = 0, SM_HDR, SM_BODY, SM_PSUM };

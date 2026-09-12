@@ -20,6 +20,7 @@
 #include <argon/console.h>
 #include <argon/linkprov.h>
 #include <argon/loader.h>
+#include <argon/nodedev.h>
 #include <argon/nodeproc.h>
 #include <argon/path.h>
 
@@ -256,6 +257,11 @@ int ag_cmd_link(int argc, char **argv)
         const ag_err_t serr = ag_nodeproc_start();
         if (serr != AG_OK) {
             ag_console_printf("  (not serving remote runs: %d)\n", (int)serr);
+        }
+        const ag_err_t derr = ag_nodedev_start();
+        if (derr != AG_OK) {
+            ag_console_printf("  (not answering device listings: %d)\n",
+                              (int)derr);
         }
         return 0;
     }
