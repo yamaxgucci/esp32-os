@@ -223,6 +223,32 @@ ag_err_t ag_port_uart_pins(int port, int tx, int rx)
                                  UART_PIN_NO_CHANGE));
 }
 
+ag_err_t ag_port_uart_close(int port)
+{
+    if (!valid(port)) {
+        return -AG_EINVAL;
+    }
+#ifdef AG_PORT_UART_JTAG
+    if (is_jtag(port)) {
+        /*
+         * Not closed.  The USB-JTAG serial IS the console on the boards that
+         * have one, and tearing its driver down would take the console with it
+         * - which is a far worse outcome than a port that stays up.  Nothing
+         * needs the pins back: there are none.
+         */
+        return AG_OK;
+    }
+#endif
+    if (port == AG_PORT_UART_CONSOLE) {
+        /* Same reason, said in the other place it is true. */
+        return -AG_EBUSY;
+    }
+    if (!uart_is_driver_installed(port)) {
+        return AG_OK; /* closing what is not open is not an error */
+    }
+    return from_esp(uart_driver_delete(port));
+}
+
 bool ag_port_uart_is_open(int port)
 {
 #ifdef AG_PORT_UART_JTAG

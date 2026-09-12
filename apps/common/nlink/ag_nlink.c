@@ -372,25 +372,31 @@ void ag_nlink_tx_ack(ag_nlink_tx_t *tx, uint16_t ack)
 
 uint16_t ag_nlink_tx_pending(const ag_nlink_tx_t *tx) { return tx->count; }
 
-uint32_t ag_nlink_tx_waiting_bytes(const ag_nlink_tx_t *tx)
+/* True when the oldest unacknowledged frame is overdue and the whole window
+ * behind it is about to go again. */
+static bool rto_expired(const ag_nlink_tx_t *tx, uint32_t now_ms)
 {
-    uint32_t n = 0;
+    return tx->count > 0u && tx->slot[0].sent &&
+           (uint32_t)(now_ms - tx->slot[0].sent_ms) >= tx->rto_ms;
+}
+
+uint32_t ag_nlink_tx_waiting_bytes(const ag_nlink_tx_t *tx, uint32_t now_ms)
+{
+    const bool overdue = rto_expired(tx, now_ms);
+    uint32_t   n = 0;
     for (uint16_t i = 0; i < tx->count; i++) {
-        if (!tx->slot[i].sent) {
+        if (overdue || !tx->slot[i].sent) {
             n += tx->slot[i].len + NL_HDR_SIZE + NL_PSUM_SIZE;
         }
     }
-    /*
-     * A retransmission that is due is also something the wire has to carry, but
-     * it is not counted here: the scheduler is being asked "is there work", and
-     * answering yes for a frame whose timer has not expired would make a link
-     * with nothing to send look busy for ever.
-     */
     return n;
 }
 
-uint32_t ag_nlink_tx_head_len(const ag_nlink_tx_t *tx)
+uint32_t ag_nlink_tx_head_len(const ag_nlink_tx_t *tx, uint32_t now_ms)
 {
+    if (rto_expired(tx, now_ms)) {
+        return (uint32_t)tx->slot[0].len + NL_HDR_SIZE + NL_PSUM_SIZE;
+    }
     for (uint16_t i = 0; i < tx->count; i++) {
         if (!tx->slot[i].sent) {
             return (uint32_t)tx->slot[i].len + NL_HDR_SIZE + NL_PSUM_SIZE;

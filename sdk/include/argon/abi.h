@@ -195,9 +195,20 @@ extern "C" {
  *      own radio; RLINK carries the station half and no more.
  *      AG_WIFI_SSID_MAX and the ap/status structs moved up the header to sit
  *      above both users; nothing about them changed.
+
+ * 0.49 AG_DEV_LINK and ag_link_ops_t: the wire to another node of the same
+ *      system, as a device class of its own.  Not AG_DEV_NET and not
+ *      AG_DEV_CHAR, and the difference is the reason it exists - a net device
+ *      reaches somebody else's machine over somebody else's protocol, a char
+ *      device is a stream with no idea what is in it, and this carries
+ *      MESSAGES between two halves of one system, each with a channel and a
+ *      deadline.  A byte stream cannot express that: by the time the bytes are
+ *      on the wire, whatever knew which of them were urgent is gone.  The
+ *      class is appended, so no existing one moves - a class is a number
+ *      inside a .SYS built months ago.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 48u
+#define AG_ABI_MINOR 49u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -1035,6 +1046,18 @@ typedef enum {
     AG_DEV_AUDIO,
     AG_DEV_STORAGE,
     AG_DEV_MOTOR,
+    /*
+     * ABI 0.49: the wire to another node of the same system.  Appended, so no
+     * existing value moves - a class is a number in a .SYS built months ago.
+     *
+     * Not AG_DEV_NET and not AG_DEV_CHAR, and the difference is the point of
+     * having it.  A net device reaches somebody else's machine over somebody
+     * else's protocol; a char device is a stream with no idea what is in it.
+     * This carries messages between two kernels that are halves of one system,
+     * and what it has to know about them is which channel they belong to and
+     * which deadline they have - see ag_link_ops_t.
+     */
+    AG_DEV_LINK,
 } ag_dev_class_t;
 
 enum ag_dev_flags {
@@ -1143,6 +1166,111 @@ typedef struct {
     const void         *class_ops;
     void               *priv;
 } ag_dev_add_t;
+
+/* ------------------------------------------------------------------------ */
+/* link - the wire to another node of the same system (ABI 0.49)            */
+/* ------------------------------------------------------------------------ */
+/*
+ * Class vtable for an AG_DEV_LINK device: the second live dev->ops class after
+ * ag_net_ops_t, and published the same way, as class_ops in ag_dev_add.
+ *
+ * WHAT IT CARRIES, and why it is messages rather than bytes.  A cluster's wire
+ * has to hold a screen, a sound card, a file being read and the control traffic
+ * that starts a process, all at once and with different deadlines.  A byte
+ * stream cannot express that: by the time the bytes are on the wire the thing
+ * that knew which were urgent is gone.  So the unit here is a message with a
+ * channel and a service class, and the driver underneath decides the order.
+ *
+ * THE CLASSES are apps/common/nlink's, and the reasoning is written out there
+ * rather than repeated: CONTROL is small, prompt and reliable; STREAM has a
+ * reserved rate and is dropped rather than delayed, because a retransmitted
+ * audio frame arrives after the moment it was for; BULK is reliable, windowed
+ * and may wait as long as necessary, and it is the class that pays for the
+ * other two being bounded.
+ *
+ * A CHANNEL is one conversation - a remote device, one process's console, one
+ * file being read.  Channels are independent: a stalled one does not hold up
+ * the others.  Channel 0 is the link talking about itself.
+ *
+ * PUMPING.  recv() may be given a timeout, and while it waits it is what drives
+ * the link: a loadable driver has no task of its own (api->task->create refuses
+ * one - a thread must belong to a process that can be made to end, and a driver
+ * is not that), so the wire advances on the caller's task.  That is the same
+ * bind HostFS and the external radio are in.  It is enough while somebody is
+ * asking; it is not enough for a node that must hear an unsolicited request
+ * with nobody calling in, and closing that gap is a service task the ABI does
+ * not have yet.
+ */
+/* What the link has carried and what it cost.  Counters rather than rates: a
+ * rate is a property of the moment it was taken, and these are meant to be
+ * compared across a run. */
+typedef struct ag_link_stats {
+    uint32_t sent;        /* frames put on the wire, retransmissions included */
+    uint32_t retransmits; /* of those, ones that had been sent before         */
+    uint32_t received;    /* frames accepted and delivered, in order          */
+    uint32_t gaps;        /* frames discarded because one ahead of them was lost */
+    uint32_t dups;        /* frames already had: an acknowledgement was lost     */
+    uint32_t bad;         /* frames whose header or payload did not check out    */
+    uint32_t tx_bytes;
+    uint32_t rx_bytes;
+} ag_link_stats_t;
+
+/*
+ * The service classes, and they are apps/common/nlink's NL_CLS_* under another
+ * name and with deliberately the same numbers.
+ *
+ * Two names for one set because the two must not depend on each other: the ABI
+ * cannot include a driver's private header, and nlink is written to know
+ * nothing of ArgonOS so that its whole codec can be tested on a development
+ * machine.  So they are mirrored, exactly as the Wi-Fi security and link-state
+ * enums mirror the port's - and as there, renumbering one alone silently
+ * mislabels everything that crosses.
+ */
+enum ag_link_class {
+    AG_LINK_CONTROL = 0, /* small, prompt, reliable - a spawn, a device call  */
+    AG_LINK_STREAM = 1,  /* reserved rate, dropped rather than delayed        */
+    AG_LINK_BULK = 2,    /* reliable, windowed, may wait as long as it must   */
+    AG_LINK_CLASSES = 3,
+};
+
+typedef struct ag_link_ops {
+    uint32_t size;
+
+    /* Bring the wire up.  Idempotent. */
+    ag_err_t (*start)(ag_device_t *dev);
+    /* Has anything been heard from the far end. */
+    bool (*up)(ag_device_t *dev);
+
+    /*
+     * Queue one message.  Returns the bytes accepted, or -AG_EAGAIN when the
+     * window for that class is full - which is back-pressure and not an error:
+     * try again after pumping.  A message longer than the driver's limit is
+     * refused rather than split, because only the caller knows where its own
+     * message boundaries are.
+     */
+    int32_t (*send)(ag_device_t *dev, uint8_t chan, uint8_t cls,
+                    const void *buf, size_t len);
+
+    /*
+     * Take one message that has arrived, waiting up to timeout_ms for one.
+     * Fills *chan with the channel it came in on.  Returns its length, or
+     * -AG_EAGAIN when nothing arrived in time.  Pumps the wire while it waits.
+     */
+    int32_t (*recv)(ag_device_t *dev, uint8_t *chan, void *buf, size_t max,
+                    uint32_t timeout_ms);
+
+    /* Advance the link without wanting anything: what a caller with nothing to
+     * say does so the far end is still heard.  Same as recv with no buffer. */
+    void (*poll)(ag_device_t *dev, uint32_t ms);
+
+    /*
+     * Counters.  Written to be read by a person: a link that is working and a
+     * link that is working hard look identical from throughput alone, and the
+     * retransmit count is the difference.
+     */
+    ag_err_t (*stats)(ag_device_t *dev, ag_link_stats_t *out);
+} ag_link_ops_t;
+
 
 /*
  * What matched when the module was loaded by probe, not by an explicit

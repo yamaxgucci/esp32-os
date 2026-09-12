@@ -61,6 +61,7 @@
 #include "shell/cmd_fs.h"
 #include "net/espnow.h"
 #include "net/wifimon.h"
+#include "shell/cmd_link.h"
 #include "shell/cmd_net.h"
 #include "shell/cmd_power.h"
 #include "shell/cmd_unzip.h"
@@ -4952,6 +4953,11 @@ static const ag_command_t k_commands[] = {
     {"mon", "[on|off|watch|hop|channel <n>|tx <hex>|deauth <bssid>|beacon]",
      "watch the air and inject frames", cmd_mon},
 #endif
+    /* The wire to another node of this system.  Not gated on networking:
+     * a link is not a network, and a board with no radio and no stack still
+     * has a neighbour if one is wired to it. */
+    {"link", "[use <dev>|none | ping [n] | echo [secs] | poll [ms]]",
+     "the wire to another node of this system", ag_cmd_link},
 #if AG_HAS_NET
     {"net", "[wait|resolve <name>]", "address, waiting, and names into addresses",
      ag_cmd_net},

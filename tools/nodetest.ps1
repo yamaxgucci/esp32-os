@@ -1,18 +1,25 @@
 # Two nodes, in the emulator, with a wire between them.
 #
-#   .\argon.cmd nodetest
+#   .\argon.cmd nodetest              both scenarios
+#   .\argon.cmd nodetest -Scenario raw    the wire alone
+#   .\argon.cmd nodetest -Scenario link   the wire with the whole stack on it
 #
 # Boots TWO whole ArgonOS kernels on this PC and joins their UART1 ports to each
-# other, then measures the wire between them with apps\link - the same program
-# that measured the real cable between the S3 and the CYD.
+# other.  Then, twice:
 #
-# WHY THIS EXISTS.  A cluster needs two machines, and there is one board on the
-# desk.  Everything else in this tree that needed a second party used a Python
-# process pretending to be one (hostfsd, rlinkd, the AT modem), which is right
-# when the other end is a coprocessor whose firmware is somebody else's.  It is
-# wrong here: the other end is US, and a fake node would be a fake of the thing
-# under test.  So both ends are the real image, and the only thing simulated is
-# the copper.
+#   raw   - measures the wire with apps\link, the same program that measured
+#           the real cable between the S3 and the CYD.  Nothing of ours is in
+#           the path but a UART driver, so a failure here is the harness.
+#   link  - loads NODELINK.SYS on both, binds it, and bounces messages through
+#           the whole stack: the shell, the provider indirection, the driver,
+#           NLINK's scheduler and window, the UART, and all of it backwards.
+#           A round trip here is what a remote process will be built out of.
+#
+# WHY BOTH ENDS ARE REAL.  Everything else in this tree that needed a second
+# party used a Python process pretending to be one (hostfsd, rlinkd, the AT
+# modem), which is right when the far end is a coprocessor running somebody
+# else's firmware.  It is wrong here: the far end is US, and a fake node would
+# be a fake of the thing under test.  The only thing simulated is the copper.
 #
 # HOW IT WORKS.  A serial port in QEMU is a TCP socket, and qemu-boot already
 # opens one as a server (the console) and others as clients (HostFS, the radio).
@@ -31,9 +38,9 @@
 #     copy of the same image.
 #   * QEMU's own chatter went to one log from both processes.  -Tag.
 #
-# TIMING.  B receives for a long window and A waits before sending, rather than
+# TIMING.  B listens on a long window and A waits before speaking, rather than
 # the two racing to be ready.  Without the wait A can finish booting first and
-# push blocks into a UART nobody has opened, and what that looks like from the
+# push into a UART nobody has opened, and what that looks like from the
 # transcript is a lossy wire - a measurement, not a mistake, and one that would
 # have been believed.
 #
@@ -48,7 +55,10 @@ param(
     [int]$Kb = 64,
     # Long enough to cover A's boot, its file transfer and the wait below.
     [int]$RecvSecs = 60,
-    [int]$SendDelaySec = 25
+    [int]$SendDelaySec = 25,
+    [ValidateSet('raw', 'link', 'both')]
+    [string]$Scenario = 'both',
+    [int]$Pings = 24
 )
 
 $ErrorActionPreference = 'Stop'
@@ -83,9 +93,96 @@ function Check {
     Note ($Text.Contains($Needle)) $Name $(if (-not $Text.Contains($Needle)) { "no '$Needle'" })
 }
 
-# The program both nodes run.
-& python (Join-Path $PSScriptRoot 'build_apps.py') --only LINK.AXE | Out-Null
-if (-not (Test-Path 'build\apps\LINK.AXE')) { throw 'LINK.AXE did not build.' }
+# Runs the pair: B's command list in the background, A's in the foreground.
+#
+# A separate PROCESS for B, not a background job.  Start-Job was the obvious way
+# and does not work: the job's runspace cannot dot-source tools\idf-env.ps1 - it
+# simply never returns, and the symptom is a job stuck in Running with nothing
+# on its output, which reads exactly like a guest that failed to boot.  A
+# process inherits $env: from this one, so the environment is already there.
+#
+# B's invocation is WRITTEN TO A FILE and that file is run, rather than being
+# passed as arguments.  Not fastidiousness - two separate quoting problems, and
+# the second has no clean answer:
+#
+#   * Start-Process does not quote for you, and this tree lives under "Unity
+#     Projects", so an unquoted script path arrives as -File 'D:\Work\Unity' and
+#     the child complains that the file has no .ps1 extension.  True, and silent
+#     about the real problem.
+#   * powershell -File passes every argument as a literal string and never
+#     builds an array from one, so a -Send list of three commands binds its
+#     first item to -Send and the other two POSITIONALLY - which lands "link
+#     echo 60" on -BudgetSec and fails with a message about converting a string
+#     to an integer.  Nothing in it mentions -Send.
+#
+# A generated script has neither problem: the array is written as an array.
+function Invoke-Pair {
+    param(
+        [string]$Tag,
+        [string[]]$PutBoth,
+        [string[]]$SendB,
+        [string[]]$SendA
+    )
+    $runner = "build\nodetest-$Tag-b.ps1"
+    $lines = @("Set-Location '$root'", "& '$(Join-Path $PSScriptRoot 'qemu-boot.ps1')' ``")
+    $lines += "    -Port 5566 -NetPort 5578 -TimeoutSec $TimeoutSec ``"
+    $lines += "    -LinkPort $linkPort -LinkListen -Flash '$flashB' ``"
+    $lines += "    -KeepOtherEmulators -Tag 'b-$Tag' -LogPath 'build\nodetest-$Tag-b.log' ``"
+    $lines += "    -Put @($(($PutBoth | ForEach-Object { "'$_'" }) -join ',')) ``"
+    $lines += "    -Send @($(($SendB | ForEach-Object { "'$_'" }) -join ','))"
+    $lines += 'exit $LASTEXITCODE'
+    Set-Content -Path $runner -Value $lines -Encoding ascii
+
+    $procB = Start-Process -FilePath 'powershell' -PassThru -NoNewWindow `
+        -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass',
+                        '-File', ('"{0}"' -f (Join-Path (Get-Location) $runner))) `
+        -RedirectStandardOutput "build\nodetest-$Tag-b.out" `
+        -RedirectStandardError "build\nodetest-$Tag-b.err"
+    Start-Sleep -Milliseconds 500
+    if ($procB.HasExited) {
+        throw ("node B exited at once (code $($procB.ExitCode)); " +
+               "see build\nodetest-$Tag-b.err")
+    }
+
+    try {
+        # A gets its own copy of the flash image too, not the canonical one.
+        #
+        # It ran on the canonical one at first, and that is wrong in a way that
+        # took a run to see: C: is written by whoever boots, so every pair left
+        # its leavings in the image every later test starts from - and the next
+        # thing to use it failed to receive a file over the console with no
+        # explanation.  Both nodes get a fresh copy, because a test that
+        # depends on the one before it is not a test.
+        & (Join-Path $PSScriptRoot 'qemu-boot.ps1') -Port 5556 `
+            -TimeoutSec $TimeoutSec -LinkPort $linkPort -KeepOtherEmulators `
+            -Flash 'build\qemu_flash_a.bin' `
+            -Tag "a-$Tag" -LogPath "build\nodetest-$Tag-a.log" `
+            -Put $PutBoth -Send $SendA | Out-Null
+    } finally {
+        if (-not $procB.WaitForExit($TimeoutSec * 2000)) {
+            Write-Host 'node B did not finish; stopping it.' -ForegroundColor Yellow
+            Stop-Process -Id $procB.Id -Force -ErrorAction SilentlyContinue
+        }
+        foreach ($f in @("build\nodetest-$Tag-b.err")) {
+            if ((Test-Path $f) -and (Get-Item $f).Length -gt 0) {
+                Write-Host "--- $f ---" -ForegroundColor DarkGray
+                Get-Content $f | Select-Object -Last 12 | Out-Host
+            }
+        }
+        Get-Process qemu-system-xtensa -ErrorAction SilentlyContinue |
+            Stop-Process -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Milliseconds 500
+    }
+}
+
+# ------------------------------------------------------------------ build ---
+
+$only = @('LINK.AXE')
+if ($Scenario -ne 'raw') { $only += 'NODELINK.SYS' }
+& python (Join-Path $PSScriptRoot 'build_apps.py') --only @only | Out-Null
+foreach ($img in $only) {
+    if (-not (Test-Path "build\apps\$img")) { throw "$img did not build." }
+}
 
 # One flash image, built once, before either guest can race the other to it.
 Update-FlashImage
@@ -95,124 +192,140 @@ Get-Process qemu-system-xtensa -ErrorAction SilentlyContinue |
     Stop-Process -Force -ErrorAction SilentlyContinue
 Start-Sleep -Milliseconds 500
 
-Write-Host "`n== two nodes, one wire ==" -ForegroundColor Cyan
-Write-Host "node B: console 5566, UART1 listening on $linkPort, flash $flashB"
-Write-Host "node A: console 5556, UART1 connecting to $linkPort"
+# ------------------------------------------------------------ raw scenario ---
 
-# A separate PROCESS, not a background job.
-#
-# Start-Job was the obvious way and does not work: the job's runspace cannot
-# dot-source tools\idf-env.ps1 - it simply never returns, and the symptom is a
-# job stuck in Running for ever with nothing on its output, which reads exactly
-# like a guest that failed to boot.  A process inherits $env: from this one, so
-# the environment is already there and nothing has to be set up again.  It is
-# also what rlinktest does for its fixture, which is the precedent.
-# Quoted by hand.  Start-Process does not quote for you, and this tree lives
-# under "Unity Projects" - so an unquoted script path arrives as -File
-# 'D:\Work\Unity' and the child says the file has no .ps1 extension, which is
-# true and says nothing about the real problem.
-$argsB = @(
-    '-NoProfile', '-ExecutionPolicy', 'Bypass',
-    '-File', ('"{0}"' -f (Join-Path $PSScriptRoot 'qemu-boot.ps1')),
-    '-Port', '5566', '-NetPort', '5578', '-TimeoutSec', "$TimeoutSec",
-    '-LinkPort', "$linkPort", '-LinkListen', '-Flash', $flashB,
-    '-KeepOtherEmulators', '-Tag', 'b', '-LogPath', 'build\nodetest-b.log',
-    '-Put', 'build\apps\LINK.AXE=t:\link.axe',
-    '-Send', ('"run t:\link.axe recv {0} {1}"' -f $Baud, $RecvSecs)
-)
-$procB = Start-Process -FilePath 'powershell' -ArgumentList $argsB -PassThru `
-    -NoNewWindow -RedirectStandardOutput 'build\nodetest-b.out' `
-    -RedirectStandardError 'build\nodetest-b.err'
-Start-Sleep -Milliseconds 500
-if ($procB.HasExited) {
-    throw ("node B exited at once (code $($procB.ExitCode)); " +
-           'see build\nodetest-b.err')
-}
+if ($Scenario -eq 'raw' -or $Scenario -eq 'both') {
+    Write-Host "`n== the wire alone: apps\link between two kernels ==" `
+        -ForegroundColor Cyan
+    Write-Host "node B: console 5566, UART1 listening on $linkPort, flash $flashB"
+    Write-Host "node A: console 5556, UART1 connecting to $linkPort"
 
-try {
-    # A waits on the host, not in the guest: the shell has no sleep, and a
-    # delay typed as a guest command would be a program that has to exist.
-    & (Join-Path $PSScriptRoot 'qemu-boot.ps1') -Port 5556 -TimeoutSec $TimeoutSec `
-        -LinkPort $linkPort -KeepOtherEmulators -Tag 'a' `
-        -LogPath 'build\nodetest-a.log' `
-        -Put "build\apps\LINK.AXE=t:\link.axe" `
-        -Send @("!powershell -NoProfile -Command Start-Sleep -Seconds $SendDelaySec",
-                "run t:\link.axe send $Baud $Kb") | Out-Null
-} finally {
-    # B is still inside its receive window; let it finish and say what it got.
-    if (-not $procB.WaitForExit($TimeoutSec * 2000)) {
-        Write-Host 'node B did not finish; stopping it.' -ForegroundColor Yellow
-        Stop-Process -Id $procB.Id -Force -ErrorAction SilentlyContinue
-    }
-    foreach ($f in @('build\nodetest-b.out', 'build\nodetest-b.err')) {
-        if ((Test-Path $f) -and (Get-Item $f).Length -gt 0) {
-            Write-Host "--- $f ---" -ForegroundColor DarkGray
-            Get-Content $f | Select-Object -Last 12 | Out-Host
+    Invoke-Pair -Tag 'raw' -PutBoth @('build\apps\LINK.AXE=t:\link.axe') `
+        -SendB @("run t:\link.axe recv $Baud $RecvSecs") `
+        -SendA @("!powershell -NoProfile -Command Start-Sleep -Seconds $SendDelaySec",
+                 "run t:\link.axe send $Baud $Kb")
+
+    $a = Transcript 'build\nodetest-raw-a.log'
+    $b = Transcript 'build\nodetest-raw-b.log'
+
+    Check $a 'ArgonOS' 'raw-node-a-booted'
+    Check $b 'ArgonOS' 'raw-node-b-booted'
+    Check $a 'send:' 'raw-node-a-sent'
+    Check $b 'recv:' 'raw-node-b-received'
+
+    # `link` reports whole blocks, corrupt ones and lost ones separately, which
+    # is the distinction the program exists for: a corrupt block means the line
+    # is too fast for the wiring, a lost one means the receiver could not keep
+    # up, and they are cured in opposite directions.
+    $m = [regex]::Match($b,
+        'got (\d+) bytes, (\d+) blocks ok, (\d+) corrupt, (\d+) lost, (\d+) stray')
+    if (-not $m.Success) {
+        $tail = ($b -split "`n" | Where-Object { $_ -match 'block|byte|B/s|arrived' } |
+                 Select-Object -Last 4) -join ' | '
+        Note $false 'raw-summary-parsed' "receiver said: $tail"
+    } else {
+        $bytes  = [int]$m.Groups[1].Value
+        $blocks = [int]$m.Groups[2].Value
+        $bad    = [int]$m.Groups[3].Value
+        $lost   = [int]$m.Groups[4].Value
+        $stray  = [int]$m.Groups[5].Value
+        Write-Host ("wire: $bytes bytes, $blocks blocks ok, $bad corrupt, " +
+                    "$lost lost, $stray stray")
+        Note ($blocks -gt 0) 'raw-carried-blocks' "$blocks blocks"
+        Note ($bad -eq 0) 'raw-no-corruption' "$bad corrupt"
+        Note ($lost -eq 0) 'raw-nothing-lost' "$lost lost"
+        # Stray bytes are the ones thrown away hunting for a header.  A few at
+        # the start are honest; a steady stream means the framing is wrong
+        # rather than the line.
+        Note ($stray -lt 512) 'raw-framing-held' "$stray stray bytes"
+
+        # The check that says "everything arrived", as against "what arrived was
+        # clean".  A receive window that closed early reports zero corrupt and
+        # zero lost about half a transfer, because `lost` counts gaps between
+        # sequence numbers and a missing tail is not a gap.  Mutation-tested:
+        # point A at a port nobody listens on and the two above pass anyway.
+        $s = [regex]::Match($a, 'sent (\d+) bytes in (\d+) ms')
+        if (-not $s.Success) {
+            Note $false 'raw-sender-summary-parsed' 'no "sent N bytes" line'
+        } else {
+            Note ([int]$s.Groups[1].Value -eq $bytes) 'raw-byte-for-byte' `
+                ("sent {0}, got {1}" -f $s.Groups[1].Value, $bytes)
         }
     }
-    Get-Process qemu-system-xtensa -ErrorAction SilentlyContinue |
-        Stop-Process -Force -ErrorAction SilentlyContinue
 }
 
-$a = Transcript 'build\nodetest-a.log'
-$b = Transcript 'build\nodetest-b.log'
+# ----------------------------------------------------------- link scenario ---
 
-# Both kernels really booted - two of them, not one twice.
-Check $a 'ArgonOS' 'node-a-booted'
-Check $b 'ArgonOS' 'node-b-booted'
-Check $a 'send:' 'node-a-sent'
-Check $b 'recv:' 'node-b-received'
+if ($Scenario -eq 'link' -or $Scenario -eq 'both') {
+    Write-Host "`n== the whole stack: NODELINK.SYS and NLINK over the same wire ==" `
+        -ForegroundColor Cyan
 
-# The measurement itself.  `link` reports whole blocks, corrupt ones and lost
-# ones separately, which is the distinction the whole program exists for: a
-# corrupt block means the line is too fast for the wiring, a lost one means the
-# receiver could not keep up, and they are cured in opposite directions.
-$m = [regex]::Match($b,
-    'got (\d+) bytes, (\d+) blocks ok, (\d+) corrupt, (\d+) lost, (\d+) stray')
-if (-not $m.Success) {
-    # Fall back to whatever summary line the receiver printed, so a change in
-    # its wording is a readable failure rather than a silent zero.
-    $tail = ($b -split "`n" | Where-Object { $_ -match 'block|byte|B/s|arrived' } |
-             Select-Object -Last 4) -join ' | '
-    Note $false 'node-b-summary-parsed' "receiver said: $tail"
-} else {
-    $bytes  = [int]$m.Groups[1].Value
-    $blocks = [int]$m.Groups[2].Value
-    $bad    = [int]$m.Groups[3].Value
-    $lost   = [int]$m.Groups[4].Value
-    $stray  = [int]$m.Groups[5].Value
-    Write-Host ("wire: $bytes bytes, $blocks blocks ok, $bad corrupt, " +
-                "$lost lost, $stray stray")
-    Note ($blocks -gt 0) 'wire-carried-blocks' "$blocks blocks"
-    Note ($bad -eq 0) 'wire-no-corruption' "$bad corrupt"
-    Note ($lost -eq 0) 'wire-nothing-lost' "$lost lost"
-    # Stray bytes are the ones thrown away while hunting for a header.  A few at
-    # the very start are honest - the receiver may attach mid-block - but a
-    # steady stream of them means the framing is wrong rather than the line.
-    Note ($stray -lt 512) 'wire-framing-held' "$stray stray bytes"
+    # Each long command is followed by a `=` step: send nothing, wait for the
+    # line that says it FINISHED.
+    #
+    # Not decoration.  qemu-boot decides a command is done when one more prompt
+    # has appeared than before, and that is a count over the whole transcript -
+    # so anything that puts another `>` on the wire ends the wait early.  Both
+    # nodes were cut off mid-ping that way, and the transcripts stopped in the
+    # middle of a working run: the driver's own trace showed the clock ticking
+    # and the receive loop spinning happily at the moment the harness gave up on
+    # it.  Waiting for the sentence the command prints when it is done cannot be
+    # fooled by a repaint.
+    $put = @('build\apps\NODELINK.SYS=t:\nodelink.sys')
+    Invoke-Pair -Tag 'link' -PutBoth $put `
+        -SendB @('drv load t:\nodelink.sys',
+                 'link use node0',
+                 "link echo $RecvSecs",
+                 '=answered ') `
+        -SendA @('drv load t:\nodelink.sys',
+                 'link use node0',
+                 "!powershell -NoProfile -Command Start-Sleep -Seconds $SendDelaySec",
+                 "link ping $Pings",
+                 '=came back')
 
-    # The check that actually says "everything arrived", as against "what
-    # arrived was clean".  A receive window that closed early would report zero
-    # corrupt and zero lost about half a transfer - `lost` counts gaps between
-    # sequence numbers, and a missing tail is not a gap.  Comparing the two
-    # nodes' own byte counts is the only statement that covers it.
-    $s = [regex]::Match($a, 'sent (\d+) bytes in (\d+) ms')
-    if (-not $s.Success) {
-        Note $false 'node-a-summary-parsed' 'no "sent N bytes" line'
+    $a = Transcript 'build\nodetest-link-a.log'
+    $b = Transcript 'build\nodetest-link-b.log'
+
+    Check $a '/dev/node0' 'link-driver-registered'
+    Check $a 'link is node0' 'link-bound-on-a'
+    Check $b 'link is node0' 'link-bound-on-b'
+
+    # The round trip.  Everything above this line is setup; this is the first
+    # statement that two kernels have had a conversation.
+    Check $a ("$Pings of $Pings came back") 'link-every-ping-answered'
+    Check $b 'answered' 'link-far-end-answered'
+
+    $st = [regex]::Match($a,
+        'frames\s+(\d+) sent \((\d+) again\), (\d+) received')
+    if (-not $st.Success) {
+        Note $false 'link-stats-parsed' 'no "frames N sent" line'
     } else {
-        $sent = [int]$s.Groups[1].Value
-        Note ($sent -eq $bytes) 'wire-byte-for-byte' "sent $sent, got $bytes"
+        $sent = [int]$st.Groups[1].Value
+        $again = [int]$st.Groups[2].Value
+        $recv = [int]$st.Groups[3].Value
+        Write-Host "stack: $sent frames sent ($again again), $recv received"
+        Note ($recv -ge $Pings) 'link-frames-received' "$recv received"
+        # A clean socket needs no retransmissions at all.  If this ever goes
+        # non-zero here, the fault is in the driver or the window - not in the
+        # wire, because there is no wire.
+        Note ($again -eq 0) 'link-no-retransmits-on-a-clean-socket' "$again again"
     }
 
-    # Said out loud so nobody quotes it at a board.  There is no line here and
-    # no baud rate: the wire is a TCP socket between two processes on this PC,
-    # and what it carries per second is a property of this PC.  The real cable
-    # is measured by running the same program on two boards.
-    Write-Host ('rate: QEMU only - this wire is a socket, not copper. ' +
-                'For real numbers put LINK.AXE on two boards.') -ForegroundColor DarkGray
+    $lb = [regex]::Match($b, 'losses\s+(\d+) gaps, (\d+) duplicates, (\d+) bad')
+    if ($lb.Success) {
+        Note ([int]$lb.Groups[3].Value -eq 0) 'link-no-bad-frames' `
+            ("{0} bad" -f $lb.Groups[3].Value)
+    }
 }
 
-$failed = @($results | Where-Object { $_ -like 'FAIL *' })
+# Said out loud so nobody quotes it at a board.  There is no line here and no
+# baud rate: the wire is a TCP socket between two processes on this PC, and what
+# it carries per second is a property of this PC.  The real cable is measured by
+# running the same program on two boards.
 Write-Host ''
+Write-Host ('rate: QEMU only - this wire is a socket, not copper. ' +
+            'For real numbers put LINK.AXE on two boards.') -ForegroundColor DarkGray
+
+$failed = @($results | Where-Object { $_ -like 'FAIL *' })
 Write-Host ("nodetest: {0} checks, {1} failed" -f $results.Count, $failed.Count)
 exit $(if ($failed.Count -eq 0) { 0 } else { 1 })

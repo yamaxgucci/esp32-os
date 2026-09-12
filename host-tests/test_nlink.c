@@ -470,6 +470,60 @@ static void test_a_duplicate_is_not_a_gap(void)
     AG_CHECK_INT(ag_nlink_rx_ack(&rx), 1); /* re-ack, so the peer moves on */
 }
 
+/*
+ * A retransmission is WORK, and the scheduler has to be told about it.
+ *
+ * This is here because it was missed, and missed in the way that hurts: the
+ * tests above drive ag_nlink_tx_next directly, so the window and the timer were
+ * both proved correct - while the driver, which asks the SCHEDULER what to send
+ * and only then reaches for a frame, never retransmitted anything at all.
+ * waiting_bytes counted unsent frames only, so once every frame had gone out
+ * once the class looked idle for ever.  Nothing failed; a transfer simply
+ * stopped, on two emulators, after an afternoon.
+ *
+ * So the property is stated here in the terms the driver uses: offer, pick,
+ * send, and ask again after the timer.
+ */
+static void test_the_scheduler_is_told_about_a_retransmission(void)
+{
+    ag_nlink_slot_t slots[4];
+    ag_nlink_tx_t   tx;
+    ag_nlink_sched_t s;
+    ag_nlink_tx_init(&tx, NL_CLS_CONTROL, slots, 4, 50);
+    ag_nlink_sched_init(&s, STREAM_RESERVE);
+
+    const uint8_t body[8] = {0};
+    AG_CHECK(ag_nlink_tx_queue(&tx, 1, body, sizeof(body), true));
+
+    /* Offered, picked, sent - the ordinary path. */
+    ag_nlink_sched_offer(&s, NL_CLS_CONTROL, ag_nlink_tx_waiting_bytes(&tx, 0),
+                         ag_nlink_tx_head_len(&tx, 0));
+    AG_CHECK_INT(ag_nlink_sched_pick(&s), NL_CLS_CONTROL);
+    AG_CHECK(ag_nlink_tx_next(&tx, 0) != NULL);
+    ag_nlink_sched_sent(&s, NL_CLS_CONTROL, sizeof(body) + NL_HDR_SIZE);
+
+    /* Before the timer: nothing to do, and the wire must be free for others. */
+    ag_nlink_sched_offer(&s, NL_CLS_CONTROL, ag_nlink_tx_waiting_bytes(&tx, 10),
+                         ag_nlink_tx_head_len(&tx, 10));
+    AG_CHECK_INT(ag_nlink_sched_pick(&s), -1);
+
+    /* After it: the class has work again, and the frame really comes back. */
+    ag_nlink_sched_offer(&s, NL_CLS_CONTROL, ag_nlink_tx_waiting_bytes(&tx, 50),
+                         ag_nlink_tx_head_len(&tx, 50));
+    AG_CHECK_INT(ag_nlink_sched_pick(&s), NL_CLS_CONTROL);
+    const ag_nlink_slot_t *again = ag_nlink_tx_next(&tx, 50);
+    AG_CHECK(again != NULL);
+    AG_CHECK_INT(again->seq, 0);
+    AG_CHECK_INT(tx.retransmits, 1);
+
+    /* And an acknowledgement ends it: no work, no picking, no spinning. */
+    ag_nlink_tx_ack(&tx, 0);
+    AG_CHECK_INT(ag_nlink_tx_pending(&tx), 0);
+    ag_nlink_sched_offer(&s, NL_CLS_CONTROL, ag_nlink_tx_waiting_bytes(&tx, 500),
+                         ag_nlink_tx_head_len(&tx, 500));
+    AG_CHECK_INT(ag_nlink_sched_pick(&s), -1);
+}
+
 /* ---- a megabyte across a wire that is losing things ---------------------- */
 
 /*
@@ -655,5 +709,6 @@ void run_nlink_tests(void)
     test_window_fills_and_drains();
     test_one_loss_costs_one_timeout();
     test_a_duplicate_is_not_a_gap();
+    test_the_scheduler_is_told_about_a_retransmission();
     test_a_megabyte_through_a_bad_wire();
 }

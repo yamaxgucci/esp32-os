@@ -53,6 +53,7 @@ set(ARGON_KERNEL_SRCS
     "src/loader/api.c"
     "src/net/net.c"
     "src/net/netprov.c"
+    "src/net/linkprov.c"
     "src/net/espnow.c"
     "src/net/wifimon.c"
     "src/net/netmsg.c"
@@ -78,6 +79,7 @@ set(ARGON_KERNEL_SRCS
     "src/shell/cmd_fs.c"
     "src/shell/cmd_unzip.c"
     "src/shell/cmd_net.c"
+    "src/shell/cmd_link.c"
     # miniz (reader/inflate only — see third_party/miniz/README.md)
     "../../third_party/miniz/miniz.c"
     "../../third_party/miniz/miniz_tinfl.c"

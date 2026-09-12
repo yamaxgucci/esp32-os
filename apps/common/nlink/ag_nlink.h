@@ -338,10 +338,22 @@ void ag_nlink_tx_ack(ag_nlink_tx_t *tx, uint16_t ack);
 /* Frames queued or in flight.  Zero means everything has been acknowledged. */
 uint16_t ag_nlink_tx_pending(const ag_nlink_tx_t *tx);
 
-/* Bytes the scheduler should be told are waiting on this class, and the length
- * of the frame at the head - the two arguments ag_nlink_sched_offer wants. */
-uint32_t ag_nlink_tx_waiting_bytes(const ag_nlink_tx_t *tx);
-uint32_t ag_nlink_tx_head_len(const ag_nlink_tx_t *tx);
+/*
+ * Bytes the scheduler should be told are waiting on this class, and the length
+ * of the frame at the head - the two arguments ag_nlink_sched_offer wants.
+ *
+ * `now_ms` is not decoration: a frame that has been sent and whose timer has
+ * expired is work the wire has to do, exactly as much as one never sent, and a
+ * version of this that counted only the unsent ones made RETRANSMISSION
+ * IMPOSSIBLE.  Nothing said so - the window filled, the peer never answered,
+ * and the link sat there having sent each frame exactly once.  It was found by
+ * a transfer that stopped rather than by a test, which is the wrong way round.
+ *
+ * A frame whose timer has NOT expired is still not counted, or a link with
+ * nothing to say would look busy for ever.
+ */
+uint32_t ag_nlink_tx_waiting_bytes(const ag_nlink_tx_t *tx, uint32_t now_ms);
+uint32_t ag_nlink_tx_head_len(const ag_nlink_tx_t *tx, uint32_t now_ms);
 
 typedef struct ag_nlink_rx {
     uint16_t last;   /* the highest sequence accepted, or NL_ACK_NONE */

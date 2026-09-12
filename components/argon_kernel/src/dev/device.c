@@ -137,7 +137,7 @@ ag_err_t ag_dev_register(const ag_dev_desc_t *desc, ag_device_t **out)
     if (!name_is_sane(desc->name)) {
         return -AG_EINVAL;
     }
-    if (desc->cls <= AG_DEV_ANY || desc->cls > AG_DEV_MOTOR) {
+    if (desc->cls <= AG_DEV_ANY || desc->cls > AG_DEV_LINK) {
         return -AG_EINVAL;
     }
 
@@ -534,6 +534,7 @@ const char *ag_dev_class_name(ag_dev_class_t cls)
     case AG_DEV_AUDIO:   return "audio";
     case AG_DEV_STORAGE: return "storage";
     case AG_DEV_MOTOR:   return "motor";
+    case AG_DEV_LINK:    return "link";
     default:             return "?";
     }
 }

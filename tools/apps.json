@@ -123,6 +123,9 @@
     { "out": "ATRADIO.SYS", "group": "core",
       "include": ["apps/common", "apps/common/atproto"],
       "src": ["apps/atradio/atradio.c", "apps/common/atproto/ag_atproto.c"] },
+    { "out": "NODELINK.SYS", "group": "core",
+      "include": ["apps/common", "apps/common/nlink"],
+      "src": ["apps/nodelink/nodelink.c", "apps/common/nlink/ag_nlink.c"] },
     { "out": "GC2145.SYS", "group": "core", "include": ["apps/gc2145"], "src": ["apps/gc2145/gc2145.c"] },
     { "out": "CAM.AXE", "group": "core", "src": ["apps/cam/cam.c"] },
     {

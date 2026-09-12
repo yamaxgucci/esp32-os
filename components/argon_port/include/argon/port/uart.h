@@ -16,6 +16,7 @@
  *
  *   ag_err_t ag_port_uart_open(int port, const ag_port_uart_cfg_t *cfg,
  *                              uint32_t rx_bytes, uint32_t tx_bytes)
+ *   ag_err_t ag_port_uart_close(int port)
  *   ag_err_t ag_port_uart_config(int port, const ag_port_uart_cfg_t *cfg)
  *   ag_err_t ag_port_uart_pins(int port, int tx, int rx)
  *   bool     ag_port_uart_is_open(int port)
@@ -28,7 +29,17 @@
  * Contract, not advice:
  *
  * - open() on a port that is already open is not an error.  Two subsystems may
- *   both want it up, and neither knows about the other.
+ *   both want it UP, and neither knows about the other.
+ * - Sharing that a port is up is not sharing its STREAM.  A port's bytes have
+ *   exactly one owner: two readers steal from each other, and each sees the
+ *   other's traffic as noise and its own as truncated.  This is not
+ *   hypothetical - HostFS probed UART1 for three seconds and never let go of
+ *   it, so the node link that opened the same port afterwards saw HostFS
+ *   handshakes as garbage and its own frames arrive in pieces.
+ * - close() is therefore not decoration: a subsystem that has decided it does
+ *   not want a port must say so, or nothing else can have it.  Closing what is
+ *   not open is not an error; closing the console is -AG_EBUSY, because the
+ *   console is how the failure would have to be reported.
  * - The receive buffer is not optional and its size is the caller's business.
  *   The console asks for 2 KB because that is what absorbs the bytes already on
  *   the line when it sends XOFF - a port that quietly gives it less will lose
@@ -62,6 +73,7 @@ typedef struct {
 
 ag_err_t ag_port_uart_open(int port, const ag_port_uart_cfg_t *cfg,
                            uint32_t rx_bytes, uint32_t tx_bytes);
+ag_err_t ag_port_uart_close(int port);
 ag_err_t ag_port_uart_config(int port, const ag_port_uart_cfg_t *cfg);
 ag_err_t ag_port_uart_pins(int port, int tx, int rx);
 bool     ag_port_uart_is_open(int port);

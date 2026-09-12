@@ -4,6 +4,22 @@
  * Little-endian.  Request and response share the same header; `status` is 0
  * on requests and an ag_err_t (0 or negative) on responses.
  *
+ * WHICH WAY A FRAME IS GOING is in the top bit of `op` (HSFS_F_FROM_HOST), and
+ * it is not decoration.  Without it a request and a successful reply are the
+ * same bytes - same magic, same op, same seq, status zero in both - and a guest
+ * waiting for a reply accepts anything that matches its own request.
+ *
+ * That is fine against a host helper, which never sends a request.  It is not
+ * fine against ANOTHER GUEST: two ArgonOS boards wired UART1 to UART1 both
+ * probe with PING seq 1, each reads the other's probe as its own answer, and
+ * both mount the other as a live host folder.  Found exactly that way, on two
+ * emulators joined by a node link - and on real boards that wiring is the
+ * normal one, so it would have happened there too.
+ *
+ * The guest therefore ignores any frame without the bit, and tools/hostfsd.py
+ * sets it on everything it sends.  The two move together in this tree; an old
+ * helper against a new guest simply never mounts.
+ *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #ifndef ARGON_HSFS_PROTO_H
@@ -49,6 +65,14 @@ enum hsfs_op {
     /* UNLINK request: path only.  Response: status. */
     HSFS_OP_UNLINK = 10,
 };
+
+/*
+ * Set in `op` on every frame the HOST sends - replies and PADPUSH alike.  The
+ * top bit, because the ops are 0..10 and will not reach it.  Mask it off before
+ * comparing an op; require it before believing a frame is an answer.
+ */
+#define HSFS_F_FROM_HOST 0x8000u
+#define HSFS_OP_MASK     0x7FFFu
 
 /* a0 on STAT/OPEN responses: bit0 = directory */
 #define HSFS_MODE_DIR 1u
