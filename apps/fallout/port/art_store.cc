@@ -171,6 +171,17 @@ uint32_t s_win_batches;
 uint32_t s_kb_load_kind[16], s_kb_play_kind[16];
 
 /*
+ * Which of the stored files the game ever came back for.
+ *
+ * "Four and a half megabytes held everything this town needs" against a store
+ * that fills eight: the difference is either art the town does need and the
+ * smaller store was refusing, or art nobody ever asks for twice.  One bit per
+ * index slot answers it, and the bits cost 256 bytes.
+ */
+uint8_t  s_touched[(2048 + 7) / 8];
+uint32_t s_touched_n, s_touched_kb;
+
+/*
  * Art that left RAM and did NOT reach flash, counted by why.
  *
  * Maxim asked for this as an independent check: in a store that is big enough
@@ -443,6 +454,9 @@ void stage_flush()
 
     s_stage_len = 0;
     s_stage_n = 0;
+    memset(s_touched, 0, sizeof(s_touched));
+    s_touched_n = 0;
+    s_touched_kb = 0;
     map_data();
 }
 
@@ -603,6 +617,23 @@ int ag_art_store_size(int fid)
 
 const unsigned char *ag_art_store_ptr(int fid, int *size)
 {
+    /* ARGON: mark this file as one the game came back for.  Doing it in
+     * find() counted the duplicate checks that happen while writing, so
+     * it only belongs on the read path. */
+    {
+        const Entry *e = find(fid);
+
+        if (e != nullptr) {
+            const size_t   slot = (size_t)(e - s_index);
+            const unsigned bit = 1u << (slot & 7u);
+
+            if ((s_touched[slot >> 3] & bit) == 0u) {
+                s_touched[slot >> 3] |= (uint8_t)bit;
+                s_touched_n++;
+                s_touched_kb += e->len;
+            }
+        }
+    }
     /*
      * Interface art, heads, inventory and skilldex are NOT handed out where
      * they lie, and that is not caution - it is measured.  The engine draws
@@ -1016,9 +1047,13 @@ void ag_art_store_report(char *out, size_t cap)
 
         if (at + 1u < cap) {
             snprintf(out + at, cap - at,
-                     " | this window: stopped %u ms writing and %u ms erasing",
+                     " | this window: stopped %u ms writing and %u ms erasing"
+                     " | %u of %u stored files ever asked for (%u of %u KB)",
                      (unsigned)(s_win_write_us / 1000u),
-                     (unsigned)(s_win_erase_us / 1000u));
+                     (unsigned)(s_win_erase_us / 1000u),
+                     (unsigned)s_touched_n, (unsigned)s_count,
+                     (unsigned)(s_touched_kb >> 10),
+                     (unsigned)(s_fill_at >> 10));
         }
         s_win_write_us = 0;
         s_win_erase_us = 0;
