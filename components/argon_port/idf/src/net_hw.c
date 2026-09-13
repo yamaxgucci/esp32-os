@@ -204,7 +204,43 @@ ag_err_t ag_port_net_start(void)
 
 #endif /* AG_PORT_HAS_WIFI */
 
-bool ag_port_net_ready(void) { return s_got_ip; }
+/*
+ * The board's own access point counts as a network.
+ *
+ * s_got_ip is set by IP_EVENT_STA_GOT_IP and by nothing else - a station that
+ * has been given a lease.  An access point is never given one: it *is* the
+ * thing that gives them, and it has 192.168.4.1 from the moment it starts.  So
+ * a board that only offers a point had a radio up, an address printed on its
+ * own console, and a network layer that said "not ready" for ever - which meant
+ * nothing that waits for the network ever started on it.  Not PHONE.SYS, not
+ * HTTPD.AXE, not the virtual keyboard.
+ *
+ * Found on the CYD on 13 September 2026 with `[ap] ssid` set: `wifi` said
+ * `access point "ArgonOS", at 192.168.4.1, 0 clients` while the phone link
+ * never opened its listener.  The roadmap's "join the board's SSID from a phone
+ * and open the map in a browser" had never actually been done, which is how it
+ * survived this long.
+ *
+ * A station lease still wins when there is one: a board doing both is joined to
+ * something, and that is the address the rest of the world can reach.
+ */
+static bool ap_addr(uint32_t *out)
+{
+#if AG_PORT_HAS_WIFI
+    ag_port_wifi_ap_status_t ap;
+    if (ag_port_wifi_ap_status(&ap) == AG_OK && ap.on && ap.ip != 0u) {
+        if (out != NULL) {
+            *out = ap.ip;
+        }
+        return true;
+    }
+#else
+    (void)out;
+#endif
+    return false;
+}
+
+bool ag_port_net_ready(void) { return s_got_ip || ap_addr(NULL); }
 
 ag_err_t ag_port_net_ifaddr(uint32_t *addr)
 {
@@ -212,7 +248,7 @@ ag_err_t ag_port_net_ifaddr(uint32_t *addr)
         return -AG_EINVAL;
     }
     if (!s_got_ip) {
-        return -AG_EAGAIN;
+        return ap_addr(addr) ? AG_OK : -AG_EAGAIN;
     }
     *addr = ntohl(s_ip.addr); /* host-order IPv4 */
     return AG_OK;
