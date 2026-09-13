@@ -1070,6 +1070,16 @@ void ag_art_store_want(int fid)
     if (s_store == nullptr || find(fid) != nullptr) {
         return;
     }
+
+    /* And not what is waiting in the gathering buffer either: find() only
+     * sees what has been written, so asking for these means reading them
+     * off the card a second time to throw them away as duplicates - 1446
+     * of them in the first run of this. */
+    for (uint32_t k = 0; k < s_stage_n; k++) {
+        if (s_stage_index[k].fid == fid) {
+            return;
+        }
+    }
     for (unsigned i = 0; i < s_want_n; i++) {
         if (s_want[i] == fid) {
             return;
