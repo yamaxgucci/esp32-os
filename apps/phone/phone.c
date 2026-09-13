@@ -67,12 +67,13 @@
 #include <argon/argon.h>
 #include <argon/keys.h>
 
+#include <argon/libc.h>
+
 #include <stdio.h>
 #include <string.h>
 
 #include "ag_pixband.h"
 #include "ag_ws.h"
-#include "page.h"
 
 AG_DRV("PHONE", "1.0", "argon");
 
@@ -123,6 +124,15 @@ AG_DRV("PHONE", "1.0", "argon");
 
 /* Events waiting to be read out of /dev/pkbd0 by an application that wants them. */
 #define KEY_RING 64u
+
+/*
+ * Below this much free memory, the next visitor is turned away at the door.
+ *
+ * The number and the reason are HTTPD.AXE's, which found them first: a
+ * connection accepted when lwIP or the Wi-Fi driver is out of memory does not
+ * fail, it aborts the board.  Sixteen kilobytes is measured, not guessed.
+ */
+#define MEM_FLOOR (16u * 1024u)
 
 /* ------------------------------------------------------------------------ */
 /* The protocol inside the WebSocket                                         */
@@ -250,8 +260,14 @@ static struct {
     /* The console mirror. */
     uint16_t      cols, rows;
     uint16_t      cell_w, cell_h;
-    ag_textcell_t cells[TEXT_MAX_ROWS][TEXT_MAX_COLS];
-    uint8_t       row_dirty[TEXT_MAX_ROWS];
+    /*
+     * Allocated to the console that is actually there, not to the largest one
+     * allowed.  As a static array this was eight kilobytes of bss on every
+     * board, including a forty-by-twenty-five one that needs two - and on the
+     * CYD eight kilobytes is a quarter of what it has free.
+     */
+    ag_textcell_t *cells;
+    uint8_t        row_dirty[TEXT_MAX_ROWS];
     uint16_t      cur_col, cur_row;
     ag_textcell_t cur_under;
     bool          cur_visible;
@@ -259,9 +275,14 @@ static struct {
 
     /* The wire. */
     ag_handle_t listen;
-    ag_handle_t conn; /* an upgraded WebSocket, or -1                       */
+    ag_handle_t conn;    /* an upgraded WebSocket, or -1                    */
+    ag_handle_t closing; /* answered, waiting to be hung up - see defer_close */
+    uint64_t    closing_until;
     volatile bool     up;
     volatile bool     owe_everything;
+
+    /* Where the page is, on this board's own disk. */
+    char     page[64];
 
     /* Who may look.  `password` empty means anybody. */
     char     password[PASS_MAX + 1];
@@ -278,6 +299,7 @@ static struct {
     uint32_t          band_px;
     uint32_t          band_cap;
     bool              moaned_frame;
+    bool              moaned_mem;
     bool              want_frame;
 
     /* What an application reading /dev/pkbd0 has not taken yet. */
@@ -335,10 +357,28 @@ static bool send_all(ag_handle_t h, const void *buf, uint32_t len,
             at += (uint32_t)n;
             continue;
         }
-        if (n != -AG_EAGAIN) {
+        /*
+         * "Try again" is more than one answer.
+         *
+         * A non-blocking socket says EAGAIN when its window is full, and lwIP
+         * on a board with little memory says ENOMEM when it has no buffer to
+         * copy into - which is the same situation and clears the same way, as
+         * soon as the peer acknowledges something.  Zero is the third spelling
+         * of it.  Treating those as failures is what cut the page off at 8042
+         * bytes of 14700 on the CYD, with nothing said: the board simply closed
+         * the connection in the middle and the browser got half a page.
+         *
+         * Anything else really is the connection going away, and then the
+         * deadline is what stops this waiting for a phone that has left.
+         */
+        if (n != -AG_EAGAIN && n != -AG_ENOMEM && n != 0) {
+            ag_log(AG_LOG_WARN, "phone", "send failed after %u of %u: %d",
+                   (unsigned)at, (unsigned)len, (int)n);
             return false;
         }
         if (ag_micros() > until) {
+            ag_log(AG_LOG_WARN, "phone", "send stalled at %u of %u",
+                   (unsigned)at, (unsigned)len);
             return false;
         }
         TASK->sleep_ms(2u);
@@ -426,6 +466,72 @@ static void drop_conn(const char *why)
 /* Board to phone: the geometry, the console, the picture                    */
 /* ------------------------------------------------------------------------ */
 
+/* ---- the console's size, which is not a constant ------------------------ */
+
+/*
+ * Asked for again and again, not remembered once.
+ *
+ * The size this driver read at load was the size the console had *at load*, and
+ * on the CYD that is the wrong one: `[console] cols = auto` resolves against
+ * the panel, the panel is a loadable driver, and the kernel therefore sizes the
+ * console a second time after the modules stage.  This driver loads inside that
+ * stage, so it saw forty by twenty-five and the console became forty by thirty
+ * a moment later - and the five rows that were now real never reached the
+ * phone, because text_row refuses a row past what it thinks exists.
+ *
+ * Reported as "the screen is not shown in full, the text is cut".
+ *
+ * It is also not a one-off fix: `mode con lines=...` changes the console while
+ * the system runs, and a screen on the far end of a link should follow it.  So
+ * the task asks a few times a second, which is free, and re-lays the mirror
+ * when the answer changes.
+ */
+static bool sync_console(void)
+{
+    ag_coninfo_t ci;
+    memset(&ci, 0, sizeof(ci));
+    ag_coninfo(&ci);
+
+    uint16_t cols = (ci.cols > 0u && ci.cols <= TEXT_MAX_COLS) ? ci.cols
+                                                               : (uint16_t)80u;
+    uint16_t rows = (ci.rows > 0u && ci.rows <= TEXT_MAX_ROWS) ? ci.rows
+                                                               : (uint16_t)25u;
+    const uint16_t cw = (ci.cell_w > 0u && ci.cell_w < 256u) ? ci.cell_w
+                                                             : (uint16_t)8u;
+    const uint16_t ch = (ci.cell_h > 0u && ci.cell_h < 256u) ? ci.cell_h
+                                                             : (uint16_t)16u;
+
+    if (s.cells != NULL && cols == s.cols && rows == s.rows) {
+        s.cell_w = cw;
+        s.cell_h = ch;
+        return true;
+    }
+
+    ag_textcell_t *grid =
+        (ag_textcell_t *)ag_malloc((size_t)cols * rows * sizeof(*grid));
+    if (grid == NULL) {
+        return s.cells != NULL; /* keep what there is rather than lose it */
+    }
+    for (uint32_t i = 0; i < (uint32_t)cols * rows; i++) {
+        grid[i].ch = ' ';
+        grid[i].attr = 0x07u;
+    }
+
+    lock();
+    ag_textcell_t *old = s.cells;
+    s.cells = grid;
+    s.cols = cols;
+    s.rows = rows;
+    s.cell_w = cw;
+    s.cell_h = ch;
+    memset(s.row_dirty, 0, sizeof(s.row_dirty));
+    unlock();
+
+    ag_free(old);
+    s.owe_everything = true;
+    return true;
+}
+
 /* ---- the password ------------------------------------------------------ */
 
 static bool needs_password(void) { return s.password[0] != '\0'; }
@@ -502,8 +608,8 @@ static bool send_text_row(uint16_t row)
     p[0] = (uint8_t)row;
     p[1] = (uint8_t)count;
     for (uint16_t x = 0; x < count; x++) {
-        p[2u + x * 2u] = s.cells[row][x].ch;
-        p[3u + x * 2u] = s.cells[row][x].attr;
+        p[2u + x * 2u] = s.cells[(size_t)row * s.cols + x].ch;
+        p[3u + x * 2u] = s.cells[(size_t)row * s.cols + x].attr;
     }
     s.row_dirty[row] = 0u;
     unlock();
@@ -1028,6 +1134,69 @@ static const char *header_value(const char *req, const char *name, char *out,
     return NULL;
 }
 
+/*
+ * Wait for the other end to have it before hanging up.
+ *
+ * ag_net_send returns when lwIP has *queued* the bytes, not when they have
+ * gone, and closing a socket throws the queue away.  So a page written in full
+ * and closed immediately arrives cut off, with nothing said on either side: the
+ * driver's log is clean because every send succeeded, and the client reports a
+ * transfer that stopped.  Measured on the CYD fetching its own page: 14700
+ * bytes served, 8042 and then 3946 received on two attempts - a different
+ * number each time, because it is whatever had drained when close hit.
+ *
+ * This is the same lesson the UART layer in this tree already paid for once
+ * (docs: "a write returns when queued not sent, close threw the queue away").
+ *
+ * The client has Content-Length, so it closes as soon as it has the body.
+ * Reading until it does is therefore both the acknowledgement and the end of
+ * the conversation; the deadline is for the client that leaves without saying
+ * anything.
+ */
+/*
+ * Handed over rather than closed, and closed later by the task's own loop.
+ *
+ * Waiting here would be the obvious thing and is the wrong one: this runs on
+ * the task that also feeds the screen, so every page load would freeze the
+ * picture for as long as the wait.  And the wait cannot be short: a client that
+ * reads until end-of-stream rather than counting Content-Length - the shell's
+ * own wget is one - will not close until we do.
+ *
+ * So the socket goes on a shelf with a deadline, the loop drains it a little on
+ * every pass, and it is closed when the peer has gone or the deadline is up.
+ * One at a time, because there is one of these at a time.
+ */
+static void defer_close(ag_handle_t h, uint32_t deadline_ms)
+{
+    if (s.closing >= 0) {
+        (void)ag_net_close(s.closing);
+    }
+    s.closing = h;
+    s.closing_until = ag_micros() + (uint64_t)deadline_ms * 1000ull;
+}
+
+static void pump_deferred(void)
+{
+    if (s.closing < 0) {
+        return;
+    }
+    uint8_t sink[64];
+    for (int i = 0; i < 8; i++) {
+        const int32_t n = ag_net_recv(s.closing, sink, sizeof(sink));
+        if (n == 0 || (n < 0 && n != -AG_EAGAIN)) {
+            break; /* the peer has gone, which means it has the bytes */
+        }
+        if (n < 0) {
+            if (ag_micros() < s.closing_until) {
+                return; /* nothing to read yet, and there is still time */
+            }
+            break;
+        }
+    }
+    (void)ag_net_close(s.closing);
+    s.closing = -1;
+}
+
 static void serve_404(ag_handle_t h)
 {
     static const char k_404[] = "HTTP/1.1 404 Not Found\r\n"
@@ -1036,47 +1205,86 @@ static void serve_404(ag_handle_t h)
     (void)send_all(h, k_404, (uint32_t)(sizeof(k_404) - 1u), 1000u);
 }
 
+/*
+ * The page, streamed off the board's own disk.
+ *
+ * It used to be a C array in this driver, and on a board with memory to spare
+ * that is the tidier thing: one file to ship.  On a board without, it is the
+ * whole problem.  A .SYS keeps its data in RAM, so forty kilobytes of HTML -
+ * fifteen after gzip - were fifteen kilobytes of a CYD that has about thirty
+ * free with its radio up.  Measured there: thirty free at idle, and seven once
+ * a phone had connected, which is the edge a board falls off.
+ *
+ * As a file it costs a one-kilobyte read buffer and lives in flash, which is
+ * the resource this system has four megabytes of.  Nothing about "the tool
+ * lives in the machine" is given up: the file ships in the C: image beside the
+ * driver, and the phone still installs nothing.
+ *
+ * Content-Encoding: gzip, always, because that is the only form on the disk.
+ * Every browser decompresses it and the board never has to.  A client that does
+ * not speak gzip - curl without --compressed - gets bytes it cannot read, which
+ * is a fair trade for a page written for browsers.
+ */
 static void serve_page(ag_handle_t h)
 {
+    ag_stat_t st;
+    if (ag_stat(s.page, &st) != AG_OK || st.size == 0u) {
+        char msg[192];
+        const int k = snprintf(msg, sizeof(msg),
+                               "HTTP/1.1 500 Internal Server Error\r\n"
+                               "Content-Type: text/plain\r\n"
+                               "Connection: close\r\n\r\n"
+                               "%s is missing - put PHONE.GZ on this board "
+                               "(tools/mkpage.py makes it).\n",
+                               s.page);
+        if (k > 0) {
+            (void)send_all(h, msg, (uint32_t)k, 1000u);
+        }
+        return;
+    }
+
+    const ag_handle_t f = ag_open(s.page, AG_O_RDONLY);
+    if (f < 0) {
+        return;
+    }
+
     char hdr[160];
-    /*
-     * Content-Encoding: gzip, always, because that is the only form of the page
-     * this image has.  Every browser since the nineties decompresses it and the
-     * board never has to; what it buys is the page stored at a quarter of its
-     * size, and a .SYS keeps its data in RAM, where a board may have only a
-     * hundred kilobytes to give.  A client that does not speak gzip - curl
-     * without --compressed - gets bytes it cannot read, which is a fair trade
-     * for a page written for browsers.
-     */
     const int n = snprintf(hdr, sizeof(hdr),
-                              "HTTP/1.1 200 OK\r\n"
-                              "Content-Type: text/html; charset=utf-8\r\n"
-                              "Content-Encoding: gzip\r\n"
-                              "Content-Length: %u\r\n"
-                              "Cache-Control: no-store\r\n"
-                              "Connection: close\r\n\r\n",
-                              (unsigned)AG_PHONE_PAGE_LEN);
-    if (n <= 0) {
-        return;
+                           "HTTP/1.1 200 OK\r\n"
+                           "Content-Type: text/html; charset=utf-8\r\n"
+                           "Content-Encoding: gzip\r\n"
+                           "Content-Length: %u\r\n"
+                           "Cache-Control: no-store\r\n"
+                           "Connection: close\r\n\r\n",
+                           (unsigned)st.size);
+    if (n > 0 && send_all(h, hdr, (uint32_t)n, 2000u)) {
+        /*
+         * A kilobyte at a time, with ten seconds for each.  Generous on purpose:
+         * this is going to a phone that may be three rooms away on a weak
+         * signal, and the alternative to waiting is a page that arrives
+         * truncated - which a browser renders as a blank screen and no error.
+         */
+        uint8_t buf[1024];
+        for (;;) {
+            const int32_t got = ag_read(f, buf, sizeof(buf));
+            if (got <= 0) {
+                break;
+            }
+            if (!send_all(h, buf, (uint32_t)got, 10000u)) {
+                break;
+            }
+        }
     }
-    if (!send_all(h, hdr, (uint32_t)n, 2000u)) {
-        return;
-    }
-    /*
-     * Ten seconds, which is generous and deliberate.  This is one write of
-     * twenty kilobytes to a phone that may be three rooms away on a weak
-     * signal, and the alternative to waiting is a page that arrives truncated -
-     * which a browser renders as a blank screen and no error.
-     */
-    (void)send_all(h, ag_phone_page, AG_PHONE_PAGE_LEN, 10000u);
+    (void)ag_close(f);
 }
 
 /*
  * A fresh connection: read its request, then either answer it and close, or
  * turn it into the WebSocket.
  *
- * Returns true when the handle has become the live client and must not be
- * closed by the caller.
+ * Returns true when the handle is no longer the caller's to close: either it
+ * has become the live WebSocket, or it has been answered and handed to
+ * defer_close, which hangs it up once the answer has actually gone.
  */
 static bool serve_request(ag_handle_t h)
 {
@@ -1117,7 +1325,8 @@ static bool serve_request(ag_handle_t h)
         char accept[AG_WS_ACCEPT_LEN];
         if (!ag_ws_accept_key(key, accept)) {
             serve_404(h);
-            return false;
+            defer_close(h, 1500u);
+            return true;
         }
         char resp[220];
         const int n = snprintf(resp, sizeof(resp),
@@ -1148,14 +1357,19 @@ static bool serve_request(ag_handle_t h)
      */
     if (strncmp(req, "GET ", 4) != 0) {
         serve_404(h);
-        return false;
+        defer_close(h, 1500u);
+        return true;
     }
     if (strncmp(req + 4, "/favicon.ico", 12) == 0) {
         serve_404(h);
-        return false;
+        defer_close(h, 1500u);
+        return true;
     }
     serve_page(h);
-    return false;
+    /* Not closed here: the bytes are only queued, and closing throws the queue
+     * away.  See defer_close. */
+    defer_close(h, 4000u);
+    return true; /* the caller must not close it either */
 }
 
 /* ------------------------------------------------------------------------ */
@@ -1312,7 +1526,21 @@ static void phone_task(void *arg)
 {
     (void)arg;
 
+    uint64_t next_sync = 0;
+
     while (!s.stop) {
+        /* The console's size, a few times a second.  See sync_console. */
+        const uint64_t now = (uint64_t)ag_micros();
+        if (now >= next_sync) {
+            next_sync = now + 300000ull;
+            if (!sync_console()) {
+                TASK->sleep_ms(500u);
+                continue;
+            }
+        }
+
+        pump_deferred();
+
         if (!ensure_listen()) {
             TASK->sleep_ms(200u);
             continue;
@@ -1330,9 +1558,33 @@ static void phone_task(void *arg)
          */
         const ag_handle_t fresh = ag_tcp_accept(s.listen, 0u);
         if (fresh >= 0) {
-            (void)ag_net_set_nonblock(fresh, true);
-            if (!serve_request(fresh)) {
+            /*
+             * And turned away at the door when the board has nothing left.
+             *
+             * Not politeness: a connection accepted while lwIP or the Wi-Fi
+             * driver is out of memory does not fail, it aborts the board.
+             * HTTPD.AXE learned this and wrote the number down - sixteen
+             * kilobytes, measured - and this had no floor at all.  On the CYD,
+             * thirty kilobytes free at idle and seven with a phone attached,
+             * that is the difference between a link and a board that stops
+             * answering.
+             */
+            ag_meminfo_t mi;
+            ag_meminfo(&mi);
+            if (mi.system_free < MEM_FLOOR) {
+                if (!s.moaned_mem) {
+                    s.moaned_mem = true;
+                    ag_log(AG_LOG_WARN, "phone",
+                           "refusing a visitor: %u bytes free, floor is %u",
+                           (unsigned)mi.system_free, (unsigned)MEM_FLOOR);
+                }
                 (void)ag_net_close(fresh);
+            } else {
+                s.moaned_mem = false;
+                (void)ag_net_set_nonblock(fresh, true);
+                if (!serve_request(fresh)) {
+                    (void)ag_net_close(fresh);
+                }
             }
         }
 
@@ -1358,6 +1610,10 @@ static void phone_task(void *arg)
         TASK->sleep_ms(10u);
     }
 
+    if (s.closing >= 0) {
+        (void)ag_net_close(s.closing);
+        s.closing = -1;
+    }
     if (s.conn >= 0) {
         (void)ag_net_close(s.conn);
         s.conn = -1;
@@ -1537,11 +1793,11 @@ static void phone_text_row(ag_handle_t h, uint16_t row,
     }
     lock();
     for (uint16_t x = 0; x < count; x++) {
-        s.cells[row][x] = cells[x];
+        s.cells[(size_t)row * s.cols + x] = cells[x];
     }
     for (uint16_t x = count; x < s.cols; x++) {
-        s.cells[row][x].ch = ' ';
-        s.cells[row][x].attr = 0x07u;
+        s.cells[(size_t)row * s.cols + x].ch = ' ';
+        s.cells[(size_t)row * s.cols + x].attr = 0x07u;
     }
     s.row_dirty[row] = 1u;
     unlock();
@@ -1562,7 +1818,7 @@ static void phone_text_cursor(ag_handle_t h, uint16_t col, uint16_t row,
     s.cur_dirty = true;
     /* The cell under the caret is now what the phone has there, and the mirror
      * must agree or the next repaint would put the old character back. */
-    s.cells[row][col] = under;
+    s.cells[(size_t)row * s.cols + col] = under;
     unlock();
 }
 
@@ -1728,6 +1984,7 @@ ag_err_t ag_driver_init(void)
     TASK = api->task;
     s.listen = -1;
     s.conn = -1;
+    s.closing = -1;
 
     s.port = (uint16_t)PHONE_PORT_DEFAULT;
     if (api->cfg != NULL && AG_HAS(api->cfg, get_int)) {
@@ -1744,22 +2001,6 @@ ag_err_t ag_driver_init(void)
      * disagrees with the console is columns quietly cut off; reporting what is
      * already there cannot disagree with itself.
      */
-    ag_coninfo_t ci;
-    memset(&ci, 0, sizeof(ci));
-    ag_coninfo(&ci);
-    s.cols = (ci.cols > 0u && ci.cols <= TEXT_MAX_COLS) ? ci.cols
-                                                        : (uint16_t)80u;
-    s.rows = (ci.rows > 0u && ci.rows <= TEXT_MAX_ROWS) ? ci.rows
-                                                        : (uint16_t)25u;
-    s.cell_w = (ci.cell_w > 0u && ci.cell_w < 256u) ? ci.cell_w : (uint16_t)8u;
-    s.cell_h = (ci.cell_h > 0u && ci.cell_h < 256u) ? ci.cell_h : (uint16_t)16u;
-    for (uint32_t r = 0; r < s.rows; r++) {
-        for (uint32_t c = 0; c < s.cols; c++) {
-            s.cells[r][c].ch = ' ';
-            s.cells[r][c].attr = 0x07u;
-        }
-    }
-
     s.lock = TASK->mutex_create();
     s.wire = TASK->mutex_create();
     if (s.lock == NULL || s.wire == NULL) {
@@ -1768,10 +2009,16 @@ ag_err_t ag_driver_init(void)
 
     s.publish_text = want_text();
 
+    ag_strlcpy(s.page, "C:\\PHONE.GZ", sizeof(s.page));
     if (api->cfg != NULL && AG_HAS(api->cfg, get_str)) {
         if (api->cfg->get_str("phone.password", s.password,
                               sizeof(s.password)) != AG_OK) {
             s.password[0] = '\0';
+        }
+        char p[sizeof(s.page)];
+        if (api->cfg->get_str("phone.page", p, sizeof(p)) == AG_OK &&
+            p[0] != '\0') {
+            ag_strlcpy(s.page, p, sizeof(s.page));
         }
     }
 

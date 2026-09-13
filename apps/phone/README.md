@@ -64,12 +64,27 @@ PHONE: open http://<board>:8765/ - 80x25 cells, NO PASSWORD ([phone] password to
 
 `argon apps --only PHONE.SYS`. The authoritative line lives in
 [`tools/apps.json`](../../tools/apps.json), which also runs
-[`tools/mkpage.py`](../../tools/mkpage.py) first — that turns
-[`web/index.html`](web/index.html) into `page.h`, so a page edited and not
-regenerated cannot ship.
+[`tools/mkpage.py`](../../tools/mkpage.py) first — that gzips
+[`web/index.html`](web/index.html) into `build/apps/PHONE.GZ`, so a page edited
+and not regenerated cannot ship.
 
-Edit the page as HTML. It is served verbatim, comments and all: "view source"
-on the phone is the only debugger on that side of the link.
+**PHONE.GZ has to be on the board, next to the driver.** It is a file on C: and
+not an array inside the .SYS, because a .SYS keeps its data in RAM: as an array
+the driver's data segment was 50 KB, and the CYD has about thirty free with its
+radio up. As a file it costs a one-kilobyte read buffer. Put it there with the
+rest:
+
+```
+python tools/mksysfs.py --board boards/esp32-cyd --add build/apps/PHONE.GZ=PHONE.GZ ...
+```
+
+`[phone] page` names it if it should live somewhere else; the default is
+`C:\PHONE.GZ`. Without it the board answers 500 and says which file is
+missing.
+
+Edit the page as HTML. It is served verbatim (gzipped, not minified), comments
+and all: "view source" on the phone is the only debugger on that side of the
+link.
 
 ## Checking it without a board
 
