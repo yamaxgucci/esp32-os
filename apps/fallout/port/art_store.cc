@@ -1071,6 +1071,27 @@ void ag_art_store_want(int fid)
         return;
     }
 
+    /*
+     * ARGON: never want what the store will never keep.
+     *
+     * This closed a circle that wedged the board for twenty minutes at a
+     * time.  The read path calls want() for every picture that came off the
+     * card; artStoreTopUp drains the list by calling the read path again;
+     * the read path wants it again.  The only exit is find(fid) succeeding
+     * next time round - and for interface art, heads, inventory and
+     * skilldex the put path refuses the picture (they are drawn into, so
+     * they can never live in flash), so find() never succeeds and the loop
+     * never ends.  Measured while stuck on the load panel: 41577 interface
+     * misses costing 557 of the 1000 seconds the board had been up, 166594
+     * file opens, 312 MB off the card, 0 KB written.
+     *
+     * The gate belongs here as well as on the put path, because a list of
+     * work that can never be completed is not a list, it is a spin.
+     */
+    if (!in_place_allowed(fid)) {
+        return;
+    }
+
     /* And not what is waiting in the gathering buffer either: find() only
      * sees what has been written, so asking for these means reading them
      * off the card a second time to throw them away as duplicates - 1446
@@ -1105,6 +1126,14 @@ unsigned ag_art_store_wanted(int *out, unsigned cap)
 unsigned ag_art_store_want_left(void)
 {
     return s_want_n;
+}
+
+void ag_art_store_want_spinning(unsigned done)
+{
+    ag_printf("fallout: the flash top-up is going in circles - %u files "
+              "handled and %u still waiting; emptying the list\n",
+              done, s_want_n);
+    s_want_n = 0u;
 }
 
 void ag_art_store_offer(int fid, const unsigned char *data, int size)
