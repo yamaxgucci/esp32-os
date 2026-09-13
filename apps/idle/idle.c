@@ -24,6 +24,28 @@ int ag_main(int argc, char **argv)
 {
     const char *who = (argc > 1) ? argv[1] : "idle";
 
+    /*
+     * `idle gfx` also takes the screen and keeps it.
+     *
+     * Because "the screen is busy" is a state that has to be REACHED before it
+     * can be tested, and nothing else here reaches it cheaply: every graphical
+     * program in the tree draws something and gives the glass back, which is
+     * the opposite of what is wanted.  This holds it and does nothing with it,
+     * which is exactly what a second monitor's first window looks like to the
+     * board that has to decide where the next one goes.
+     */
+    bool holding = false;
+    if (argc > 1 && argv[1][0] == 'g') {
+        ag_gfxinfo_t info;
+        if (ag_gfx_acquire(&info) == AG_OK) {
+            holding = true;
+            ag_printf("%s: holding the screen, %ux%u\n", who,
+                      (unsigned)info.width, (unsigned)info.height);
+        } else {
+            ag_printf("%s: could not take the screen\n", who);
+        }
+    }
+
     ag_printf("%s: here as pid %d, doing nothing\n", who, (int)ag_getpid());
 
     /*
@@ -34,6 +56,9 @@ int ag_main(int argc, char **argv)
      */
     while (!ag_interrupted()) {
         ag_delay(1000);
+    }
+    if (holding) {
+        ag_gfx_release();
     }
     ag_printf("%s: asked to stop\n", who);
     return 0;

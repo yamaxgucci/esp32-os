@@ -10,6 +10,7 @@
 #include <argon/device.h>
 #include <argon/linkprov.h>
 #include <argon/log.h>
+#include <argon/display.h>
 #include <argon/proc.h>
 
 #include <argon/port/task.h>
@@ -153,7 +154,21 @@ static void serve_can(const uint8_t *payload, uint16_t len)
     for (uint16_t i = 0; i < 4u && i < len; i++) {
         flags |= (uint32_t)payload[i] << (8u * i);
     }
-    const uint8_t yes = (ag_proc_unmet_needs(flags) == 0) ? 1u : 0u;
+    uint8_t yes = (ag_proc_unmet_needs(flags) == 0) ? 1u : 0u;
+    /*
+     * And, for a program that wants the screen, whether the screen is FREE.
+     *
+     * "Can you run this" and "have you anywhere to show it" are different
+     * questions, and the second only matters for one class of program - but for
+     * that class it is the whole question.  The second-monitor model is that a
+     * new application opens on a screen nobody is using; a node that would take
+     * it and then have to steal the glass from whatever is already there is not
+     * a node that can run it, however much hardware it has.
+     */
+    if (yes != 0u && (flags & AG_AXE_NEEDS_GFX) != 0u &&
+        ag_display_owner() != AG_PID_KERNEL) {
+        yes = 0u;
+    }
     (void)send_msg(ND_OP_CAN_IS, &yes, 1u);
 }
 

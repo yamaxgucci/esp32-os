@@ -1181,7 +1181,24 @@ static int cmd_run(int argc, char **argv)
         ag_axe_header_t h;
         if (ag_loader_peek(resolved, NULL, &h) == AG_OK) {
             const uint32_t unmet = ag_proc_unmet_needs(h.flags);
-            if (unmet != 0) {
+            /*
+             * A screen this node HAS but has already given away.
+             *
+             * Not an unmet need - the hardware is here and the loader would
+             * start the program quite happily, by taking the glass from
+             * whatever is on it.  That is the DOS answer and it is the wrong
+             * one for a system with two boards: the model Maxim asked for is a
+             * second monitor, where a new application opens on a screen nobody
+             * is using rather than on top of the one being watched.
+             *
+             * So this is a reason to look next door even when nothing is
+             * missing, and the neighbour answers the same question about its
+             * own glass before accepting.
+             */
+            const bool glass_taken =
+                (h.flags & AG_AXE_NEEDS_GFX) != 0 &&
+                ag_display_owner() != AG_PID_KERNEL;
+            if (unmet != 0 || glass_taken) {
                 const int32_t there = ag_nodedev_can(h.flags, 8000u);
                 if (there == 1) {
                     char line[AG_PATH_MAX + 64];
@@ -1192,12 +1209,41 @@ static int cmd_run(int argc, char **argv)
                                        " %s", argv[i]);
                     }
                     if (at > 0 && (size_t)at < sizeof(line)) {
-                        ag_console_printf(
-                            "needs %s; running it on %s\n",
-                            ((unmet & AG_AXE_NEEDS_GFX) != 0)   ? "a display"
-                            : ((unmet & AG_AXE_NEEDS_NET) != 0) ? "networking"
-                                                                : "audio",
-                            ag_linkprov_active());
+                        /*
+                         * Which reason, in the words of the reason.  "This
+                         * screen is busy" and "this board has no screen" lead
+                         * to the same place and are different facts, and an
+                         * operator who is told the wrong one goes looking for
+                         * hardware that is sitting in front of them.
+                         */
+                        /*
+                         * And in the journal, not only on the screen.
+                         *
+                         * "Where did my program go" is a question asked after
+                         * the fact, by somebody who was not watching - and the
+                         * console is twenty-five lines that an application may
+                         * own by then.  A placement decision that exists only
+                         * as a line that has scrolled away is a decision nobody
+                         * can audit.
+                         */
+                        ag_log(AG_LOG_INFO, "proc",
+                               "%s placed on %s (%s)", resolved,
+                               ag_linkprov_active(),
+                               (unmet == 0) ? "this screen is busy"
+                                            : "this node cannot");
+                        if (unmet == 0) {
+                            ag_console_printf(
+                                "this screen is busy; running it on %s\n",
+                                ag_linkprov_active());
+                        } else {
+                            ag_console_printf(
+                                "needs %s; running it on %s\n",
+                                ((unmet & AG_AXE_NEEDS_GFX) != 0) ? "a display"
+                                : ((unmet & AG_AXE_NEEDS_NET) != 0)
+                                    ? "networking"
+                                    : "audio",
+                                ag_linkprov_active());
+                        }
                         int32_t        code = 0;
                         const ag_err_t err = ag_nodeproc_run(line, 120000u,
                                                              &code);
