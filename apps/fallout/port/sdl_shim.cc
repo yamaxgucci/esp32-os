@@ -1172,13 +1172,73 @@ static void tickers_report(void)
     /* One known address, so the pointers above can be turned into names:
      * subtract this from them and add what nm says fps_service is at. */
     shim_printf("[tick base] fps_service at %p\n", (void *)&tickers_report);
+    shim_printf("[bk t=%u] scripts %u, windows %u, critters %u, timed %u "
+                "(us/frame over %u calls) | worst: scripts %u, windows %u, "
+                "critters %u, timed %u | of the timed: map update %u us, "
+                "queue %u us over %u events, worst burst %u us of %u\n",
+                (unsigned)ag_millis(),
+                (unsigned)(ag_bk_programs_us / (ag_bk_calls ? ag_bk_calls : 1u)),
+                (unsigned)(ag_bk_windows_us / (ag_bk_calls ? ag_bk_calls : 1u)),
+                (unsigned)(ag_bk_critters_us / (ag_bk_calls ? ag_bk_calls : 1u)),
+                (unsigned)(ag_bk_timed_us / (ag_bk_calls ? ag_bk_calls : 1u)),
+                (unsigned)ag_bk_calls,
+                ag_bk_programs_worst, ag_bk_windows_worst,
+                ag_bk_critters_worst, ag_bk_timed_worst,
+                ag_te_mapupd_us, ag_te_queue_us, ag_te_queue_n,
+                ag_te_queue_worst, ag_te_queue_worst_n);
+    ag_bk_programs_us = 0; ag_bk_windows_us = 0;
+    ag_bk_critters_us = 0; ag_bk_timed_us = 0; ag_bk_calls = 0;
+    ag_bk_programs_worst = 0; ag_bk_windows_worst = 0;
+    ag_bk_critters_worst = 0; ag_bk_timed_worst = 0;
+    /* And the queue by type, so a slow burst has a name.  Only the types
+     * that fired are printed - there are sixteen and most never do. */
+    {
+        static const char *const kind[16] = {
+            "drug", "knockout", "withdrawal", "script", "gametime",
+            "poison", "radiation", "flare", "explosion", "trickle",
+            "sneak", "expfail", "mapupdate", "sfx", "14", "15"
+        };
+        char  line[400];
+        int   at = 0;
+
+        for (unsigned i = 0; i < 16u && at >= 0 && at < (int)sizeof(line) - 1;
+                i++) {
+            if (ag_queue_type_n[i] == 0u) {
+                continue;
+            }
+            at += snprintf(line + at, sizeof(line) - (size_t)at,
+                           " %s %u/%uus/worst %uus", kind[i],
+                           ag_queue_type_n[i], ag_queue_type_us[i],
+                           ag_queue_type_worst[i]);
+        }
+        if (at > 0) {
+            shim_printf("[events t=%u] deferred %u | worst script event %u us (of it %u us reading sid %u), %u programs read in %u us, worst %u us |%s\n",
+                        (unsigned)ag_millis(), ag_queue_deferred,
+                        ag_script_event_worst, ag_script_event_worst_load,
+                        ag_script_event_worst_sid, ag_script_load_n,
+                        ag_script_load_us, ag_script_load_worst, line);
+            ag_script_event_worst = 0; ag_script_event_worst_load = 0;
+            ag_script_load_us = 0; ag_script_load_n = 0;
+            ag_script_load_worst = 0;
+        }
+        memset(ag_queue_type_us, 0, sizeof(ag_queue_type_us));
+        memset(ag_queue_type_n, 0, sizeof(ag_queue_type_n));
+        memset(ag_queue_type_worst, 0, sizeof(ag_queue_type_worst));
+        ag_queue_deferred = 0;
+    }
+    ag_te_mapupd_us = 0; ag_te_queue_us = 0; ag_te_queue_n = 0;
+    ag_te_queue_worst = 0; ag_te_queue_worst_n = 0;
+
     shim_printf("[tick t=%u] tickers %u us/frame, mouse %u us/frame\n",
                 (unsigned)ag_millis(),
                 (unsigned)(ag_bk_tickers_us / s_frames),
                 (unsigned)(ag_bk_mouse_us / s_frames));
-    shim_printf("[loop t=%u] input %u, keys %u, scripts %u, maps %u, present %u, throttle %u (us/frame)\n",
+    shim_printf("[loop t=%u] input %u (events %u, handlers %u), keys %u, "
+                "scripts %u, maps %u, present %u, throttle %u (us/frame)\n",
                 (unsigned)ag_millis(),
                 (unsigned)(ag_ml_input_us / s_frames),
+                (unsigned)(ag_in_events_us / s_frames),
+                (unsigned)(ag_in_bk_us / s_frames),
                 (unsigned)(ag_ml_keys_us / s_frames),
                 (unsigned)(ag_ml_scripts_us / s_frames),
                 (unsigned)(ag_ml_maps_us / s_frames),
@@ -1482,6 +1542,24 @@ unsigned ag_move_refresh_us, ag_move_refresh_n, ag_move_refresh_px;
 unsigned ag_art_lock_us, ag_art_lock_n;
 unsigned ag_heaplock_us, ag_heaplock_n;
 unsigned ag_tilerefresh_us, ag_tilerefresh_n, ag_tilerefresh_px;
+unsigned ag_in_events_us, ag_in_bk_us, ag_in_calls;
+unsigned ag_bk_programs_us, ag_bk_windows_us, ag_bk_critters_us,
+         ag_bk_timed_us, ag_bk_calls;
+unsigned ag_queue_type_us[16], ag_queue_type_n[16], ag_queue_type_worst[16];
+unsigned ag_queue_budget_us = 8000u, ag_queue_deferred, ag_queue_done;
+unsigned ag_op_us[1024], ag_op_n[1024], ag_op_worst[1024];
+unsigned ag_pf_scan_us, ag_pf_scan_n, ag_pf_block_us, ag_pf_block_n,
+         ag_pf_slot_us, ag_pf_slot_n, ag_pf_calls, ag_pf_worst_us;
+unsigned ag_pf_exhausted;
+unsigned ag_move_op_us, ag_move_op_n, ag_move_op_worst,
+         ag_move_op_worst_reg, ag_move_op_worst_art;
+unsigned ag_script_load_us, ag_script_load_n, ag_script_load_worst;
+unsigned ag_script_event_worst, ag_script_event_worst_load,
+         ag_script_event_worst_sid;
+unsigned ag_te_mapupd_us, ag_te_queue_us, ag_te_queue_n,
+         ag_te_queue_worst, ag_te_queue_worst_n;
+unsigned ag_bk_programs_worst, ag_bk_windows_worst,
+         ag_bk_critters_worst, ag_bk_timed_worst;
 unsigned ag_anim_worst_tref_us, ag_anim_worst_tref_n, ag_anim_worst_tref_px;
 unsigned ag_anim_worst_lock_us, ag_anim_worst_rfsh_us;
 unsigned ag_scroll_steps;
@@ -1839,6 +1917,81 @@ extern "C" void ag_load_note(unsigned ms)
                 ms, ms / 1000u, (ms % 1000u) / 100u);
 }
 
+/* The five opcodes that cost the most since the last report. */
+static void path_report(void)
+{
+    if (ag_pf_calls == 0u) {
+        return;
+    }
+    shim_printf("[path t=%u] %u searches (%u found nothing and expanded all "
+                "2000 nodes), worst %u us | scanning %u us over "
+                "%u steps, blocking %u us over %u checks, free slot %u us "
+                "over %u\n",
+                (unsigned)ag_millis(), ag_pf_calls, ag_pf_exhausted,
+                ag_pf_worst_us,
+                ag_pf_scan_us, ag_pf_scan_n, ag_pf_block_us, ag_pf_block_n,
+                ag_pf_slot_us, ag_pf_slot_n);
+    if (ag_move_op_n != 0u) {
+        shim_printf("[moveop t=%u] %u calls, %u us total, worst %u us "
+                    "(registering %u us, art %u us)\n",
+                    (unsigned)ag_millis(), ag_move_op_n, ag_move_op_us,
+                    ag_move_op_worst, ag_move_op_worst_reg,
+                    ag_move_op_worst_art);
+        ag_move_op_us = 0; ag_move_op_n = 0; ag_move_op_worst = 0;
+        ag_move_op_worst_reg = 0; ag_move_op_worst_art = 0;
+    }
+    ag_pf_calls = 0; ag_pf_worst_us = 0; ag_pf_exhausted = 0;
+    ag_pf_scan_us = 0; ag_pf_scan_n = 0;
+    ag_pf_block_us = 0; ag_pf_block_n = 0;
+    ag_pf_slot_us = 0; ag_pf_slot_n = 0;
+}
+
+static void op_report(void)
+{
+    unsigned best[5] = { 0, 0, 0, 0, 0 };
+    char     line[400];
+    int      at = 0;
+
+    for (unsigned i = 0; i < 1024u; i++) {
+        if (ag_op_us[i] == 0u) {
+            continue;
+        }
+        for (unsigned slot = 0; slot < 5u; slot++) {
+            if (ag_op_us[i] > ag_op_us[best[slot]]) {
+                for (unsigned k = 4u; k > slot; k--) {
+                    best[k] = best[k - 1u];
+                }
+                best[slot] = i;
+                break;
+            }
+        }
+    }
+
+    for (unsigned slot = 0; slot < 5u && at < (int)sizeof(line) - 1; slot++) {
+        const unsigned i = best[slot];
+
+        if (ag_op_us[i] == 0u) {
+            break;
+        }
+        at += snprintf(line + at, sizeof(line) - (size_t)at,
+                       " 0x%x %u/%uus/worst %uus", 0x8000u | i,
+                       ag_op_n[i], ag_op_us[i], ag_op_worst[i]);
+    }
+    if (at > 0) {
+        shim_printf("[ops t=%u]%s\n", (unsigned)ag_millis(), line);
+    }
+    memset(ag_op_us, 0, sizeof(ag_op_us));
+    memset(ag_op_n, 0, sizeof(ag_op_n));
+    memset(ag_op_worst, 0, sizeof(ag_op_worst));
+}
+
+extern "C" void ag_slow_script_note(const char *name, unsigned sid,
+                                    unsigned ms)
+{
+    shim_printf("[slowtimed] %s (sid %u) ran for %u ms\n",
+                (name != NULL) ? name : "?", sid, ms);
+}
+
 extern "C" void ag_script_slow_note(unsigned us, int tile, int elevation)
 {
     static unsigned said;
@@ -2194,8 +2347,7 @@ static void memstat_service(void)
     ag_libc_malloc_profile_dump(s_trace_prof);
     /* The worst lap first: it is the one that says whether to read the rest. */
     stall_report();
-    metric_report();   /* first: it is the one number that answers "how does
-                        * it play", and the rest explain it. */
+
     worst_report();
     dat_report();
     ws_report();
@@ -2219,6 +2371,17 @@ static void memstat_service(void)
     render_report();
     draw_report();
     miss_report();
+
+    /*
+     * Last, and that is deliberate: the console is a screen, not a stream.
+     * It repaints twenty-five rows, so a line printed early in a long
+     * report has scrolled off before the recorder sees it - which is how
+     * three new reports appeared to print nothing at all.  These are the
+     * ones worth reading, so they go where they will still be on it.
+     */
+    path_report();
+    op_report();
+    metric_report();
     top_report();
     /*
      * ARGON: and what the hands did, on this schedule rather than only with

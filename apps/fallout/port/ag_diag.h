@@ -286,6 +286,52 @@ extern unsigned ag_heaplock_us, ag_heaplock_n;
 
 /* Every redraw of a piece of the map, from wherever it was asked for. */
 extern unsigned ag_tilerefresh_us, ag_tilerefresh_n, ag_tilerefresh_px;
+
+/* inputGetInput, apart: the SDL event pump and the background handlers
+ * (which is where the animation tick actually lives). */
+extern unsigned ag_in_events_us, ag_in_bk_us, ag_in_calls;
+
+/* _doBkProcesses, apart: running scripts, the windows, the one critter
+ * script per call, and the timed events. */
+extern unsigned ag_bk_programs_us, ag_bk_windows_us, ag_bk_critters_us,
+                ag_bk_timed_us, ag_bk_calls;
+/* Inside the timed events: the thirty-second map update, and the queue of
+ * game events with how many were processed in the worst burst. */
+/* The event queue by type, and the budget that keeps a burst of them from
+ * landing in one frame (-qbudget N microseconds, 0 to disable). */
+extern unsigned ag_queue_type_us[16], ag_queue_type_n[16],
+                ag_queue_type_worst[16];
+extern unsigned ag_queue_budget_us, ag_queue_deferred, ag_queue_done;
+
+/* Reading a script off the card, and the worst timed script event with
+ * how much of it was that reading. */
+extern unsigned ag_script_load_us, ag_script_load_n, ag_script_load_worst;
+/* A timed script that took a tenth of a second or more, by name. */
+void ag_slow_script_note(const char *name, unsigned sid, unsigned ms);
+
+/* Where script time goes, by opcode (1024 of them, indexed by opcode &
+ * 0x3FF).  Reported as the few that cost anything. */
+extern unsigned ag_op_us[1024], ag_op_n[1024], ag_op_worst[1024];
+
+/* Inside the path search: scanning the open list for the cheapest node,
+ * the blocking check for each neighbour, and the hunt for a free slot. */
+extern unsigned ag_pf_scan_us, ag_pf_scan_n, ag_pf_block_us, ag_pf_block_n,
+                ag_pf_slot_us, ag_pf_slot_n, ag_pf_calls, ag_pf_worst_us;
+extern unsigned ag_pf_exhausted;
+
+/* animate_move_obj_to_tile: the whole opcode, how much of the worst call
+ * was registering the animation, and how much was locking art. */
+extern unsigned ag_move_op_us, ag_move_op_n, ag_move_op_worst,
+                ag_move_op_worst_reg, ag_move_op_worst_art;
+
+extern unsigned ag_script_event_worst, ag_script_event_worst_load,
+                ag_script_event_worst_sid;
+
+extern unsigned ag_te_mapupd_us, ag_te_queue_us, ag_te_queue_n,
+                ag_te_queue_worst, ag_te_queue_worst_n;
+
+extern unsigned ag_bk_programs_worst, ag_bk_windows_worst,
+                ag_bk_critters_worst, ag_bk_timed_worst;
 extern unsigned ag_anim_worst_tref_us, ag_anim_worst_tref_n,
                 ag_anim_worst_tref_px;
 
