@@ -12,14 +12,21 @@ to run by hand:
 
     python tools/mkpage.py
 
-The page is emitted verbatim: not minified, comments and all.  Two reasons, and
-neither is laziness.  A minifier that gets JavaScript subtly wrong produces a
-page that fails in a browser nobody has here, and the saving is a few kilobytes
-of the one resource this system has plenty of - flash is four megabytes against
-three hundred and twenty kilobytes of RAM.  And "view source" on the phone then
-shows the page that is actually running, which is the only debugger available
-on the far side of this link.
+The page is emitted verbatim and then gzipped, which is not the same as
+minified and is the reason it need not be.  A minifier that gets JavaScript
+subtly wrong produces a page that fails in a browser nobody here has; gzip
+cannot change a byte of it.  The browser decompresses, so the board spends
+nothing - it serves the stored bytes with Content-Encoding: gzip and never sees
+the original.  "View source" on the phone still shows the real page, comments
+and all, because that is what arrives.
+
+And it is not a nicety.  A .SYS keeps its data in RAM, so forty kilobytes of
+page is forty kilobytes of a board that may only have a hundred and ten free -
+on the CYD that is the difference between the desktop starting and not, since
+DESKTOP.AXE wants seventy-one of them in one piece.  Gzip takes the page to
+about a quarter of that.
 """
+import gzip
 import os
 import sys
 
@@ -34,6 +41,12 @@ HEAD = """/*
  * edit the HTML and run `argon apps --only PHONE.SYS`, which regenerates this
  * on the way past.
  *
+ * These are the GZIPPED bytes, served with Content-Encoding: gzip.  The board
+ * never decompresses them - the browser does - so this costs the board nothing
+ * but stores a quarter of what the page weighs, and a .SYS keeps its data in
+ * RAM.  On a board with a hundred and ten kilobytes free that is the whole
+ * difference between an application starting and not.
+ *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
  */
 #ifndef AG_PHONE_PAGE_H
@@ -41,7 +54,9 @@ HEAD = """/*
 
 #include <stdint.h>
 
+/* %u bytes of HTML, gzipped to this. */
 #define AG_PHONE_PAGE_LEN %uu
+#define AG_PHONE_PAGE_GZIP 1
 
 static const char ag_phone_page[AG_PHONE_PAGE_LEN + 1u] =
 """
@@ -83,12 +98,18 @@ def main():
     # count depend on how git checked the file out - and the Content-Length has
     # to be right or the browser waits for bytes that never come.
     page = page.replace(b"\r\n", b"\n")
+    raw_len = len(page)
+
+    # mtime=0 so that the same page produces the same bytes: a generated file
+    # that changes on every run is one that shows up in every diff and rebuilds
+    # the image for nothing.
+    page = gzip.compress(page, compresslevel=9, mtime=0)
 
     lines = []
     for i in range(0, len(page), 40):
         lines.append('    "%s"' % c_escape(page[i:i + 40]))
 
-    text = (HEAD % len(page)) + "\n".join(lines) + TAIL
+    text = (HEAD % (raw_len, len(page))) + "\n".join(lines) + TAIL
 
     old = None
     if os.path.exists(DST):
@@ -99,8 +120,9 @@ def main():
 
     with open(DST, "w", encoding="utf-8", newline="\n") as f:
         f.write(text)
-    print("mkpage: %s -> %s (%u bytes)" %
-          (os.path.relpath(SRC, ROOT), os.path.relpath(DST, ROOT), len(page)))
+    print("mkpage: %s -> %s (%u bytes of HTML, %u gzipped)" %
+          (os.path.relpath(SRC, ROOT), os.path.relpath(DST, ROOT), raw_len,
+           len(page)))
     return 0
 
 

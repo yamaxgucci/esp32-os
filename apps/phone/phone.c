@@ -101,9 +101,11 @@ AG_DRV("PHONE", "1.0", "argon");
 #define BAND_MAX_W 512u
 #define BAND_MAX_PX (BAND_ROWS * BAND_MAX_W)
 
-/* Worst case for PackBits, plus the geometry header this transport prepends. */
+/* The geometry this transport prepends to a band.  The working buffers are
+ * sized at load from the panel that actually turned up - see ensure_memory -
+ * because 512 columns of scratch is a quarter of the free memory on a board
+ * with no PSRAM, for a screen that is 320 across. */
 #define BAND_HDR 8u
-#define BAND_CAP (BAND_HDR + BAND_MAX_PX * 2u + BAND_MAX_PX / 64u + 64u)
 
 /*
  * The console mirror.  Capped rather than allocated to whatever the console
@@ -215,6 +217,7 @@ static struct {
     uint16_t port;
 
     ag_mutex_t lock; /* the frame, the damage, the text shadow              */
+    ag_mutex_t wire; /* one writer inside one WebSocket frame               */
 
     /*
      * The picture, as this driver's own copy of the surface.
@@ -267,10 +270,15 @@ static struct {
     uint8_t  nonce[NONCE_LEN];
     uint32_t nonce_seq;
 
-    /* Working memory, the task's alone once it is running. */
+    /* Working memory, sized to the panel (see ensure_memory). */
     ag_pixband_ctx_t *pix;
     uint16_t         *band;
     uint8_t          *out;
+    uint32_t          band_w;
+    uint32_t          band_px;
+    uint32_t          band_cap;
+    bool              moaned_frame;
+    bool              want_frame;
 
     /* What an application reading /dev/pkbd0 has not taken yet. */
     keyev_t  ring[KEY_RING];
@@ -338,7 +346,19 @@ static bool send_all(ag_handle_t h, const void *buf, uint32_t len,
     return true;
 }
 
-/* One WebSocket binary message: the op byte and its payload, in one write. */
+/*
+ * One WebSocket binary message: the op byte and its payload, in one write.
+ *
+ * Under a lock of its own, because two tasks can reach here.  On a board with
+ * memory to spare only the driver's task sends, and the lock costs nothing; on
+ * one without - the CYD has no PSRAM and a frame it cannot hold - the drawing
+ * application sends its own rectangle from blit_rect while the task is sending
+ * a row of the console.  Two writers interleaving inside one WebSocket frame is
+ * not a torn picture, it is a stream the client can no longer parse.
+ *
+ * The lock is never held across anything but this write, so the only thing that
+ * can wait on it is another write.
+ */
 static bool ws_send(uint8_t op, const void *payload, uint32_t len)
 {
     if (s.conn < 0) {
@@ -348,13 +368,17 @@ static bool ws_send(uint8_t op, const void *payload, uint32_t len)
     const uint32_t n = ag_ws_hdr_build(hdr, AG_WS_BIN, len + 1u, true);
     hdr[n] = op;
 
-    if (!send_all(s.conn, hdr, n + 1u, 2000u)) {
+    if (s.wire != NULL && !TASK->mutex_lock(s.wire, 3000u)) {
         return false;
     }
-    if (len > 0u && !send_all(s.conn, payload, len, 2000u)) {
-        return false;
+    bool ok = send_all(s.conn, hdr, n + 1u, 2000u);
+    if (ok && len > 0u) {
+        ok = send_all(s.conn, payload, len, 2000u);
     }
-    return true;
+    if (s.wire != NULL) {
+        TASK->mutex_unlock(s.wire);
+    }
+    return ok;
 }
 
 /*
@@ -513,10 +537,27 @@ static bool send_cursor(void)
  * network takes, and neither is anything an application that happened to draw
  * should be made to wait for.
  */
+/* Encode whatever is in s.band and put it on the wire.  Both paths end here. */
+static bool encode_and_send(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+{
+    uint8_t op = 0;
+    const uint32_t len = ag_pixband_encode(s.pix, s.band, w * h,
+                                           s.out + BAND_HDR,
+                                           s.band_cap - BAND_HDR, &op);
+    if (len == 0u) {
+        return true; /* refused rather than truncated: see ag_pixband.h */
+    }
+    put16(s.out + 0, x);
+    put16(s.out + 2, y);
+    put16(s.out + 4, w);
+    put16(s.out + 6, h);
+    return ws_send(op, s.out, BAND_HDR + len);
+}
+
 static bool send_band(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
 {
     const uint32_t n = w * h;
-    if (n == 0u || n > BAND_MAX_PX) {
+    if (n == 0u || n > s.band_px || s.pix == NULL) {
         return true;
     }
 
@@ -532,17 +573,48 @@ static bool send_band(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
     }
     unlock();
 
-    uint8_t op = 0;
-    const uint32_t len = ag_pixband_encode(s.pix, s.band, n, s.out + BAND_HDR,
-                                           BAND_CAP - BAND_HDR, &op);
-    if (len == 0u) {
-        return true; /* refused rather than truncated: see ag_pixband.h */
+    return encode_and_send(x, y, w, h);
+}
+
+/*
+ * The same rectangle, taken straight from the caller's pixels.
+ *
+ * For the board with no frame to copy into.  This runs on whichever task drew,
+ * with the device registry held, and it blocks for as long as the network
+ * needs - which is exactly the cost the frame exists to avoid and exactly what
+ * REMDISP pays over its wire.  On a machine with 179 KB and no PSRAM that is
+ * the trade that is on offer: a slower application, or no picture.
+ */
+static bool send_blit_direct(const ag_blit_t *b)
+{
+    if (s.pix == NULL || s.band == NULL || s.out == NULL) {
+        return true;
     }
-    put16(s.out + 0, x);
-    put16(s.out + 2, y);
-    put16(s.out + 4, w);
-    put16(s.out + 6, h);
-    return ws_send(op, s.out, BAND_HDR + len);
+    const uint8_t *src = (const uint8_t *)b->px;
+
+    for (uint32_t y = 0; y < b->h; y += BAND_ROWS) {
+        uint32_t rows = b->h - y;
+        if (rows > BAND_ROWS) {
+            rows = BAND_ROWS;
+        }
+        for (uint32_t x = 0; x < b->w; x += s.band_w) {
+            uint32_t cols = b->w - x;
+            if (cols > s.band_w) {
+                cols = s.band_w;
+            }
+            for (uint32_t r = 0; r < rows; r++) {
+                memcpy(s.band + r * cols,
+                       src + (size_t)(y + r) * b->stride +
+                           (size_t)x * sizeof(uint16_t),
+                       (size_t)cols * sizeof(uint16_t));
+            }
+            if (!encode_and_send((uint32_t)b->x + x, (uint32_t)b->y + y, cols,
+                                 rows)) {
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 /*
@@ -618,10 +690,10 @@ static bool service_client(void)
         if (h > BAND_ROWS) {
             h = BAND_ROWS;
         }
-        for (uint32_t x = x0; x < x1; x += BAND_MAX_W) {
+        for (uint32_t x = x0; x < x1; x += s.band_w) {
             uint32_t w = x1 - x;
-            if (w > BAND_MAX_W) {
-                w = BAND_MAX_W;
+            if (w > s.band_w) {
+                w = s.band_w;
             }
             if (!send_band(x, y, w, h)) {
                 return false;
@@ -967,9 +1039,19 @@ static void serve_404(ag_handle_t h)
 static void serve_page(ag_handle_t h)
 {
     char hdr[160];
+    /*
+     * Content-Encoding: gzip, always, because that is the only form of the page
+     * this image has.  Every browser since the nineties decompresses it and the
+     * board never has to; what it buys is the page stored at a quarter of its
+     * size, and a .SYS keeps its data in RAM, where a board may have only a
+     * hundred kilobytes to give.  A client that does not speak gzip - curl
+     * without --compressed - gets bytes it cannot read, which is a fair trade
+     * for a page written for browsers.
+     */
     const int n = snprintf(hdr, sizeof(hdr),
                               "HTTP/1.1 200 OK\r\n"
                               "Content-Type: text/html; charset=utf-8\r\n"
+                              "Content-Encoding: gzip\r\n"
                               "Content-Length: %u\r\n"
                               "Cache-Control: no-store\r\n"
                               "Connection: close\r\n\r\n",
@@ -1116,23 +1198,43 @@ static bool ensure_listen(void)
  */
 static bool ensure_memory(void)
 {
+    /*
+     * The band, sized to the panel rather than to the widest panel anybody
+     * might have.  On a board with PSRAM the difference is nothing; on the CYD
+     * it is the difference between fitting and not - 512 columns of scratch is
+     * twenty-five kilobytes of a machine with seventy free, for a screen that
+     * is 320 across and never needs more.
+     */
+    if (s.band_w == 0u) {
+        uint32_t w = s.want_w;
+        if (w == 0u) {
+            w = 320u;
+        }
+        if (w > BAND_MAX_W) {
+            w = BAND_MAX_W;
+        }
+        s.band_w = w;
+        s.band_px = BAND_ROWS * w;
+        s.band_cap = BAND_HDR + s.band_px * 2u + s.band_px / 64u + 64u;
+    }
+
     if (s.pix == NULL) {
-        void *mem = ag_malloc(ag_pixband_size(BAND_MAX_PX));
-        if (mem == NULL || !ag_pixband_init(mem, ag_pixband_size(BAND_MAX_PX),
-                                            BAND_MAX_PX)) {
+        const size_t need = ag_pixband_size(s.band_px);
+        void *mem = ag_malloc(need);
+        if (mem == NULL || !ag_pixband_init(mem, need, s.band_px)) {
             ag_free(mem);
             return false;
         }
         s.pix = (ag_pixband_ctx_t *)mem;
     }
     if (s.band == NULL) {
-        s.band = (uint16_t *)ag_malloc(BAND_MAX_PX * sizeof(uint16_t));
+        s.band = (uint16_t *)ag_malloc(s.band_px * sizeof(uint16_t));
         if (s.band == NULL) {
             return false;
         }
     }
     if (s.out == NULL) {
-        s.out = (uint8_t *)ag_malloc(BAND_CAP);
+        s.out = (uint8_t *)ag_malloc(s.band_cap);
         if (s.out == NULL) {
             return false;
         }
@@ -1140,7 +1242,7 @@ static bool ensure_memory(void)
 
     uint32_t w = s.want_w;
     uint32_t h = s.want_h;
-    if (w == 0u || h == 0u) {
+    if (w == 0u || h == 0u || !s.want_frame) {
         return true; /* nothing has asked for more than what is already held */
     }
     if (s.frame != NULL && w <= s.cap_w && h <= s.cap_h) {
@@ -1159,9 +1261,23 @@ static bool ensure_memory(void)
 
     uint16_t *fb = (uint16_t *)ag_malloc((size_t)w * h * sizeof(uint16_t));
     if (fb == NULL) {
-        ag_log(AG_LOG_WARN, "phone", "no memory for a %ux%u frame (%u KB)",
-               (unsigned)w, (unsigned)h,
-               (unsigned)((w * h * 2u) / 1024u));
+        /*
+         * No frame, and that is a mode rather than a failure.
+         *
+         * The frame exists so that blit_rect can be a memcpy and the wire can
+         * be the task's problem.  A board without the memory for one - the CYD
+         * has no PSRAM, and 320x240 is 150 KB of its 179 - sends each rectangle
+         * from the task that drew it instead, which is what REMDISP does over
+         * its wire and costs the drawing application the wire time.  Slower for
+         * that application, and the only alternative is no picture at all.
+         */
+        if (!s.moaned_frame) {
+            s.moaned_frame = true;
+            ag_log(AG_LOG_WARN, "phone",
+                   "no memory for a %ux%u frame (%u KB); sending from the "
+                   "drawing task instead",
+                   (unsigned)w, (unsigned)h, (unsigned)((w * h * 2u) / 1024u));
+        }
         s.want_w = 0;
         s.want_h = 0;
         return true;
@@ -1321,6 +1437,19 @@ static void phone_blit_rect(ag_handle_t h, const ag_blit_t *b)
 {
     (void)h;
     if (b == NULL || b->px == NULL || b->w == 0u || b->h == 0u) {
+        return;
+    }
+
+    /*
+     * No frame at all: this board could not hold one.  Then the rectangle goes
+     * out from here, on the caller's task, and the caller waits for the wire.
+     * Not a fallback bolted on - it is the only way a board with 179 KB and no
+     * PSRAM can show a picture at all.
+     */
+    if (s.frame == NULL && s.pix != NULL) {
+        if (s.conn >= 0 && (!needs_password() || s.authed)) {
+            (void)send_blit_direct(b);
+        }
         return;
     }
 
@@ -1632,7 +1761,8 @@ ag_err_t ag_driver_init(void)
     }
 
     s.lock = TASK->mutex_create();
-    if (s.lock == NULL) {
+    s.wire = TASK->mutex_create();
+    if (s.lock == NULL || s.wire == NULL) {
         return -AG_ENOMEM;
     }
 
@@ -1664,6 +1794,20 @@ ag_err_t ag_driver_init(void)
     {
         const ag_cfg_api_t *cfg = api->cfg;
         uint32_t w = 0, h = 0;
+        /*
+         * `[phone] frame = no` on a board that must not even try.
+         *
+         * The failed allocation is harmless - it falls back to sending from the
+         * drawing task - but the *successful* one on a tight board is not: a
+         * hundred and fifty kilobytes taken here is a hundred and fifty the
+         * application does not get, and DESKTOP.AXE wants seventy-one of them
+         * in one piece.  A board whose owner knows it has no room says so
+         * rather than finding out by having nothing else start.
+         */
+        s.want_frame = true;
+        if (cfg != NULL && AG_HAS(cfg, get_bool)) {
+            s.want_frame = cfg->get_bool("phone.frame", true);
+        }
         if (cfg != NULL && AG_HAS(cfg, get_int)) {
             w = (uint32_t)cfg->get_int("display.width", 0);
             h = (uint32_t)cfg->get_int("display.height", 0);

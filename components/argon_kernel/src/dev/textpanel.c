@@ -459,13 +459,26 @@ static void render_one(const ag_screen_t *screen, const ag_display_ops_t *ops,
 /*
  * Every panel, not the first one.
  *
- * It used to be the first, and that was right for as long as a panel meant the
- * glass soldered to the board.  It stopped being right the moment a second
- * screen could arrive over a wire or a network: with PHONE.SYS loaded on a board
- * that has a display of its own, whichever of the two the registry happened to
- * list first took the console and the other went dark - and which one that was
- * depended on load order, which is not a thing anybody should have to reason
- * about.  Two screens showing the same console is what was asked for both times.
+ * CHANGED 13 September 2026, and written down here because somebody else is
+ * likely to arrive at this function next.  What it used to do: walk the device
+ * registry, take the FIRST display with a text_row, and render the console to
+ * that one alone.
+ *
+ * That was right for as long as a panel meant the glass soldered to the board.
+ * It stopped being right the moment a second screen could arrive from
+ * somewhere else.  With PHONE.SYS loaded on a board that has a display of its
+ * own, whichever of the two the registry happened to list first took the
+ * console and the other went dark - and which one that was depended on load
+ * order, which is not a thing anybody should have to reason about.  The same
+ * applies, unchanged, to a display on another node published into this registry
+ * as a remote device: it is a second panel and the old rule would have picked
+ * one of them by accident.  Two screens showing the same console is what was
+ * wanted every time it came up.
+ *
+ * What that needed: the state of "what this panel has already been shown" is
+ * per panel now (s_panels[], panel_slot()) rather than one set of file statics.
+ * Two screens do not blink their carets in step, and a caret remembered for the
+ * wrong panel rubs out a character on it.
  *
  * The cost is one `text_row` per changed row per panel, on the same tick, and a
  * panel is a driver that has already said it can take them.
