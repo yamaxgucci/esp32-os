@@ -1444,6 +1444,11 @@ extern "C" int ag_art_pins = 0;
  */
 extern "C" int ag_cache_slack_kb = 32;
 
+/* How much more a moving frame counts than a standing one in the
+ * playability metric (-mweight N).  See metric_report in sdl_shim.cc. */
+extern "C" int ag_metric_weight;
+extern "C" int ag_metric_ksigma;
+
 /*
  * The hit credit an entry gets when the cache fetches it back after throwing
  * it out; -boost N.
@@ -1642,6 +1647,10 @@ extern "C" int ag_cxx_main(int argc, char **argv)
             ag_art_store_batch_kb((unsigned)to_int(argv[++i]));
         } else if (same(argv[i], "-flashwhen") && i + 1 < argc) {
             ag_art_store_write_in_play(to_int(argv[++i]));
+        } else if (same(argv[i], "-ksigma") && i + 1 < argc) {
+            ag_metric_ksigma = to_int(argv[++i]);
+        } else if (same(argv[i], "-mweight") && i + 1 < argc) {
+            ag_metric_weight = to_int(argv[++i]);
         } else if (same(argv[i], "-flashcap") && i + 1 < argc) {
             ag_art_store_cap_kb((unsigned)to_int(argv[++i]));
         } else if (same(argv[i], "-flashstage") && i + 1 < argc) {

@@ -280,6 +280,19 @@ extern unsigned ag_move_refresh_us, ag_move_refresh_n, ag_move_refresh_px;
 /* What artLock costs, everywhere it is called. */
 extern unsigned ag_art_lock_us, ag_art_lock_n;
 
+/* And how much of that is the heap: a locked block cannot be moved, and
+ * the art cache compacts around the ones it cannot move. */
+extern unsigned ag_heaplock_us, ag_heaplock_n;
+
+/* Every redraw of a piece of the map, from wherever it was asked for. */
+extern unsigned ag_tilerefresh_us, ag_tilerefresh_n, ag_tilerefresh_px;
+extern unsigned ag_anim_worst_tref_us, ag_anim_worst_tref_n,
+                ag_anim_worst_tref_px;
+
+/* And how much of that is the heap: locking a block makes it immovable, and
+ * the cache's heap compacts around what it cannot move. */
+extern unsigned ag_heaplock_us, ag_heaplock_n;
+
 /* The worst tick, split until nothing is left unnamed. */
 extern unsigned ag_anim_worst_lock_us, ag_anim_worst_rfsh_us;
 

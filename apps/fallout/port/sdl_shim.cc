@@ -1396,6 +1396,9 @@ unsigned ag_layer_clear_us, ag_layer_floor_us, ag_layer_pre_us;
 unsigned ag_layer_roof_us, ag_layer_post_us, ag_layer_window_us;
 unsigned ag_move_refresh_us, ag_move_refresh_n, ag_move_refresh_px;
 unsigned ag_art_lock_us, ag_art_lock_n;
+unsigned ag_heaplock_us, ag_heaplock_n;
+unsigned ag_tilerefresh_us, ag_tilerefresh_n, ag_tilerefresh_px;
+unsigned ag_anim_worst_tref_us, ag_anim_worst_tref_n, ag_anim_worst_tref_px;
 unsigned ag_anim_worst_lock_us, ag_anim_worst_rfsh_us;
 unsigned ag_scroll_steps;
 unsigned ag_scroll_move_us;
@@ -1851,22 +1854,31 @@ static void anim_report(void)
     }
     shim_printf("[anim t=%u] worst tick %u us | %u refreshes over %u px, "
                 "%u animations live | sequence %u us, move %u us, "
-                "spatial script %u us\n",
+                "spatial script %u us, art lock %u us (heap %u us in %u), "
+                "refresh %u us, map redraw %u us in %u over %u px, "
+                "UNACCOUNTED %u us\n",
                 (unsigned)ag_millis(), ag_anim_worst_us,
                 ag_anim_worst_refreshes, ag_anim_worst_px,
                 ag_anim_worst_sads, ag_anim_worst_seq_us,
                 ag_anim_worst_move_us, ag_anim_worst_script_us,
-                ag_anim_worst_lock_us, ag_anim_worst_rfsh_us,
+                ag_anim_worst_lock_us, ag_heaplock_us, ag_heaplock_n,
+                ag_anim_worst_rfsh_us, ag_anim_worst_tref_us,
+                ag_anim_worst_tref_n, ag_anim_worst_tref_px,
                 (ag_anim_worst_us > (ag_anim_worst_seq_us
                                      + ag_anim_worst_move_us
                                      + ag_anim_worst_script_us
                                      + ag_anim_worst_lock_us
-                                     + ag_anim_worst_rfsh_us))
+                                     + ag_anim_worst_tref_us))
                     ? (ag_anim_worst_us - ag_anim_worst_seq_us
                        - ag_anim_worst_move_us - ag_anim_worst_script_us
-                       - ag_anim_worst_lock_us - ag_anim_worst_rfsh_us)
+                       - ag_anim_worst_lock_us - ag_anim_worst_tref_us)
                     : 0u);
     ag_anim_worst_us = 0;
+    ag_tilerefresh_us = 0;
+    ag_tilerefresh_n = 0;
+    ag_tilerefresh_px = 0;
+    ag_heaplock_us = 0;
+    ag_heaplock_n = 0;
 }
 
 static void preempt_report(void)
@@ -2034,6 +2046,9 @@ static void cache_report(void)
     }
 }
 
+/* Defined with the metric itself, further down. */
+static void metric_report(void);
+
 static void memstat_service(void)
 {
     const uint32_t now = (uint32_t)ag_millis();
@@ -2095,6 +2110,8 @@ static void memstat_service(void)
     ag_libc_malloc_profile_dump(s_trace_prof);
     /* The worst lap first: it is the one that says whether to read the rest. */
     stall_report();
+    metric_report();   /* first: it is the one number that answers "how does
+                        * it play", and the rest explain it. */
     worst_report();
     dat_report();
     ws_report();
@@ -3433,6 +3450,176 @@ static unsigned s_hud_io_bad;
 static unsigned s_hud_used_kb, s_hud_hole_kb;
 
 /*
+ * ARGON: the playability metric Maxim asked for on 13 September 2026.
+ *
+ * m = p*s + (1-p)*a, where p is the share of TIME spent in slow frames,
+ * s is the rate during them and a the rate outside them.  So it is a
+ * frame rate, and a stumble weighs what it costs in seconds rather than
+ * what it costs in entries of a list.  Higher is better.
+ *
+ * Standing still flatters any such number - nothing is being drawn - and
+ * throwing the still frames away would lose half the game, so both are
+ * kept and the still part is worth a third:
+ *
+ *     M = (W*T_move*m_move + T_still*m_still) / (W*T_move + T_still)
+ *
+ * with W = 3 by default (-mweight N).  A frame counts as movement when
+ * the map was redrawn in it or the blit was of a real size; standing at
+ * a menu or on an unchanged map is stillness.
+ */
+extern "C" int ag_metric_weight = 3;
+
+struct metric_side {
+    uint32_t frames;
+    uint64_t sum_us;
+    uint32_t slow;
+    uint64_t slow_us;
+    uint64_t sum_ms2;   /* of the squares, in milliseconds, for the spread */
+};
+
+static metric_side s_m_move, s_m_still;
+static metric_side s_m_move_all, s_m_still_all;
+
+/* The worst window of each kind, because an average hides the minute that
+ * made the game unplayable - Maxim asked for it and he is right. */
+static uint32_t s_m_move_worst = 0xFFFFFFFFu, s_m_still_worst = 0xFFFFFFFFu;
+
+static void metric_add(metric_side *side, uint32_t frame_us)
+{
+    const uint64_t ms = frame_us / 1000u;
+
+    side->frames++;
+    side->sum_us += frame_us;
+    side->sum_ms2 += ms * ms;
+    if (frame_us >= HUD_SLOW_US) {
+        side->slow++;
+        side->slow_us += frame_us;
+    }
+}
+
+/* m for one side, in hundredths of a frame per second.  Zero if it never
+ * ran: a side with no frames must not drag the average anywhere. */
+static uint32_t metric_of(const metric_side *side)
+{
+    if (side->frames == 0u || side->sum_us == 0ull) {
+        return 0u;
+    }
+
+    const uint64_t fast_frames = side->frames - side->slow;
+    const uint64_t fast_us = side->sum_us - side->slow_us;
+    /* p, in parts per million of the time. */
+    const uint64_t p = side->slow_us * 1000000ull / side->sum_us;
+    const uint64_t s_rate = (side->slow_us > 0ull)
+        ? ((uint64_t)side->slow * 100000000ull / side->slow_us) : 0ull;
+    const uint64_t a_rate = (fast_us > 0ull)
+        ? (fast_frames * 100000000ull / fast_us) : 0ull;
+
+    return (uint32_t)((p * s_rate + (1000000ull - p) * a_rate) / 1000000ull);
+}
+
+/*
+ * ARGON: how even the game is, in hundredths of a frame per second.
+ *
+ *     smooth = 1000 / (mean_ms + K * sigma_ms)
+ *
+ * Maxim put three cases in the order he would want them: a steady thirty
+ * beats a sixty that stumbles, and a rare deep stall beats frequent small
+ * ones.  A plain average ranks all three backwards; this ranks them 22.3,
+ * 14.0, 13.3 - his order - because what it punishes is the spread.
+ */
+extern "C" int ag_metric_ksigma = 2;
+
+static uint32_t metric_smooth(const metric_side *side)
+{
+    if (side->frames == 0u) {
+        return 0u;
+    }
+
+    const uint64_t n = side->frames;
+    const uint64_t mean_ms = (side->sum_us / 1000ull) / n;
+    const uint64_t mean2 = side->sum_ms2 / n;
+    /* variance = E[t^2] - (E[t])^2, floored at zero for the rounding. */
+    const uint64_t var = (mean2 > mean_ms * mean_ms)
+        ? (mean2 - mean_ms * mean_ms) : 0ull;
+
+    uint64_t sigma = 0ull;
+
+    while ((sigma + 1ull) * (sigma + 1ull) <= var) {
+        sigma++;
+    }
+
+    const uint64_t k = (ag_metric_ksigma >= 0)
+        ? (uint64_t)ag_metric_ksigma : 2ull;
+    const uint64_t denom = mean_ms + k * sigma;
+
+    return (denom > 0ull) ? (uint32_t)(100000ull / denom) : 0u;
+}
+
+static uint32_t metric_together(const metric_side *mv, const metric_side *st)
+{
+    const uint64_t w = (ag_metric_weight > 0) ? (uint64_t)ag_metric_weight : 1ull;
+    const uint64_t tm = mv->sum_us * w;
+    const uint64_t ts = st->sum_us;
+
+    if (tm + ts == 0ull) {
+        return 0u;
+    }
+    return (uint32_t)((metric_of(mv) * tm + metric_of(st) * ts) / (tm + ts));
+}
+
+static void metric_report(void)
+{
+    if (s_m_move.frames == 0u && s_m_still.frames == 0u) {
+        return;
+    }
+
+    /* Two numbers, not one.  Maxim asked for them apart: they answer
+     * different questions and a single average hides which half moved. */
+    const uint32_t mv = metric_of(&s_m_move);
+    const uint32_t st = metric_of(&s_m_still);
+    const uint32_t mv_all = metric_of(&s_m_move_all);
+    const uint32_t st_all = metric_of(&s_m_still_all);
+
+    /* A window only counts towards the worst if it had enough of that
+     * kind in it to mean anything - three seconds. */
+    if (s_m_move.sum_us >= 3000000ull && mv < s_m_move_worst) {
+        s_m_move_worst = mv;
+    }
+    if (s_m_still.sum_us >= 3000000ull && st < s_m_still_worst) {
+        s_m_still_worst = st;
+    }
+
+    const uint32_t mv_sm = metric_smooth(&s_m_move);
+    const uint32_t st_sm = metric_smooth(&s_m_still);
+    const uint32_t mv_sm_all = metric_smooth(&s_m_move_all);
+    const uint32_t st_sm_all = metric_smooth(&s_m_still_all);
+
+    shim_printf("[metric t=%u] moving %u.%02u (smooth %u.%02u) over %u s | "
+                "still %u.%02u (smooth %u.%02u) over %u s || whole session: "
+                "moving %u.%02u (smooth %u.%02u) over %u s, "
+                "still %u.%02u (smooth %u.%02u) over %u s | "
+                "WORST window: moving %u.%02u, still %u.%02u\n",
+                (unsigned)ag_millis(),
+                mv / 100u, mv % 100u, mv_sm / 100u, mv_sm % 100u,
+                (unsigned)(s_m_move.sum_us / 1000000ull),
+                st / 100u, st % 100u, st_sm / 100u, st_sm % 100u,
+                (unsigned)(s_m_still.sum_us / 1000000ull),
+                mv_all / 100u, mv_all % 100u,
+                mv_sm_all / 100u, mv_sm_all % 100u,
+                (unsigned)(s_m_move_all.sum_us / 1000000ull),
+                st_all / 100u, st_all % 100u,
+                st_sm_all / 100u, st_sm_all % 100u,
+                (unsigned)(s_m_still_all.sum_us / 1000000ull),
+                (s_m_move_worst == 0xFFFFFFFFu) ? 0u : s_m_move_worst / 100u,
+                (s_m_move_worst == 0xFFFFFFFFu) ? 0u : s_m_move_worst % 100u,
+                (s_m_still_worst == 0xFFFFFFFFu) ? 0u : s_m_still_worst / 100u,
+                (s_m_still_worst == 0xFFFFFFFFu) ? 0u : s_m_still_worst % 100u);
+
+    memset(&s_m_move, 0, sizeof(s_m_move));
+    memset(&s_m_still, 0, sizeof(s_m_still));
+}
+
+/*
  * One frame's worth, from the present that ends it.  Called whether or not
  * anything is being drawn or printed: the cost is a subtraction, and a readout
  * that only starts counting when it is switched on cannot show the second it
@@ -3441,6 +3628,34 @@ static unsigned s_hud_used_kb, s_hud_hole_kb;
 static void hud_frame(uint32_t frame_us, uint32_t blit_us, uint32_t wire_us,
                       uint32_t wire_px)
 {
+    /*
+     * ARGON: movement or stillness, decided per frame.
+     *
+     * The map being redrawn is what movement is - walking, scrolling, a
+     * critter animating - and it is exactly what the engine counts in
+     * ag_move_refresh_n.  A large blit catches the rest (a dialogue, the
+     * inventory), because a frame that repaints the screen is not a frame
+     * the player is standing in.
+     */
+    {
+        static unsigned last_refresh_n;
+        const bool moved = (ag_move_refresh_n != last_refresh_n)
+            || (wire_px >= 16384u);
+
+        last_refresh_n = ag_move_refresh_n;
+
+        /*
+         * A map load is not play, and it is minutes of frames that take
+         * seconds each: left in, it dragged a window of standing still
+         * from 58 down to 3.  The metric is about the game once it is
+         * running, so loading frames are not counted at all.
+         */
+        if (ag_map_loading == 0u) {
+            metric_add(moved ? &s_m_move : &s_m_still, frame_us);
+            metric_add(moved ? &s_m_move_all : &s_m_still_all, frame_us);
+        }
+    }
+
     hud_bucket_t *b = &s_hb[s_hb_at];
     b->frames++;
     b->sum_us += frame_us;
