@@ -39,6 +39,7 @@ void run_desktop_tests(void);
 void run_fsops_tests(void);
 void run_rlink_tests(void);
 void run_atproto_tests(void);
+void run_phonelink_tests(void);
 
 int main(void)
 {
@@ -73,6 +74,7 @@ int main(void)
     run_fsops_tests();
     run_rlink_tests();
     run_atproto_tests();
+    run_phonelink_tests();
 
     printf("%d checks, %d failures\n", ag_test_checks, ag_test_failures);
     return ag_test_failures == 0 ? 0 : 1;

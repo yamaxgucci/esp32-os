@@ -1,0 +1,100 @@
+/*
+ * ArgonOS - the WebSocket protocol, without a socket in sight.
+ *
+ * A browser cannot open a TCP connection, and a phone is a browser unless
+ * somebody installs something.  So the board speaks the one framing a page can
+ * open by itself.  This is that framing as pure logic - bytes in, bytes out -
+ * for the same reason netmsg.c has no network headers: every defect worth
+ * catching here is a parse, and a parse is catchable on the PC.
+ *
+ * What is here is the server half and only the server half:
+ *
+ *   - the handshake answer, which is a SHA-1 of the client's key and a magic
+ *     string, base64'd.  That is the whole of the "security" in a WebSocket
+ *     upgrade: it proves the server understood the protocol and is not a cache
+ *     replaying an old response.  It is not authentication and nothing here
+ *     pretends otherwise.
+ *   - frame headers, built and parsed.  A client's frames are always masked and
+ *     a server's must never be, which is not symmetry for its own sake: the
+ *     mask exists so a malicious page cannot make a proxy see an attacker's
+ *     bytes as a request of its own.
+ *
+ * Deliberately absent: fragmentation reassembly (a continuation frame is an
+ * error to the caller, which then closes), extensions, and permessage-deflate.
+ * Everything this carries is already compressed by ag_pixband, and a second
+ * pass over the same bytes would cost a board's milliseconds to save a wire's
+ * microseconds.
+ *
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
+ */
+#ifndef AG_WS_H
+#define AG_WS_H
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* Opcodes, the ones a server has any business seeing or sending. */
+#define AG_WS_CONT 0x0u
+#define AG_WS_TEXT 0x1u
+#define AG_WS_BIN 0x2u
+#define AG_WS_CLOSE 0x8u
+#define AG_WS_PING 0x9u
+#define AG_WS_PONG 0xau
+
+/* The accept key is 28 base64 characters; this is with the terminator. */
+#define AG_WS_ACCEPT_LEN 29
+
+/*
+ * The Sec-WebSocket-Accept value for a client's Sec-WebSocket-Key.
+ *
+ * `key` is the header's value as the client sent it, leading and trailing
+ * spaces already trimmed by the caller.  Writes AG_WS_ACCEPT_LEN bytes into
+ * `out`, terminated.  False when `key` is empty or absurdly long, which is a
+ * request to refuse rather than a value to compute.
+ */
+bool ag_ws_accept_key(const char *key, char out[AG_WS_ACCEPT_LEN]);
+
+/* One frame header as it arrived. */
+typedef struct {
+    uint8_t  opcode;
+    bool     fin;
+    bool     masked;
+    uint8_t  mask[4];
+    uint32_t len;  /* payload bytes                                          */
+    uint32_t hdr;  /* header bytes, i.e. where the payload starts            */
+} ag_ws_hdr_t;
+
+/*
+ * Parse a frame header out of the front of a buffer.
+ *
+ *   > 0   header bytes consumed; *out is filled and out->len says how much
+ *         payload must arrive after them
+ *   = 0   not enough bytes yet; ask again when more have come
+ *   < 0   a protocol error the caller must close on: a reserved bit, a 64-bit
+ *         length with the high word set (nothing here sends gigabytes and a
+ *         peer claiming to is either broken or probing), or a payload longer
+ *         than `max_payload`
+ */
+int32_t ag_ws_hdr_parse(const uint8_t *in, uint32_t len, uint32_t max_payload,
+                        ag_ws_hdr_t *out);
+
+/* Undo the client's mask, in place. */
+void ag_ws_unmask(uint8_t *p, uint32_t len, const uint8_t mask[4]);
+
+/*
+ * Build an unmasked server frame header for `len` payload bytes.  Returns the
+ * bytes written (2, 4 or 10); `out` needs 10.  A server never masks, so there
+ * is no masked form of this.
+ */
+uint32_t ag_ws_hdr_build(uint8_t *out, uint8_t opcode, uint32_t len, bool fin);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* AG_WS_H */

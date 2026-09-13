@@ -88,6 +88,8 @@ set(ARGON_INCLUDES
     "${ARGON_ROOT}/apps/common/grain"
     "${ARGON_ROOT}/apps/common/ckt"
     "${ARGON_ROOT}/apps/common/tube"
+    "${ARGON_ROOT}/apps/common/pixband"
+    "${ARGON_ROOT}/apps/common/ws"
     "${ARGON_ROOT}/apps/cktbench")
 
 # The NAM player has to agree with the reference implementation to the last bit -
@@ -146,6 +148,12 @@ add_executable(argon_tests
     "${ARGON_ROOT}/apps/common/rlink/ag_rlink.c"
     test_atproto.c
     "${ARGON_ROOT}/apps/common/atproto/ag_atproto.c"
+    # The link to a phone.  Unlike test_rempix.c, which mirrors REMDISP's codec
+    # in a copy because a .SYS for Xtensa will not link here, these two are the
+    # shipped files: what the test exercises is what PHONE.SYS runs.
+    test_phonelink.c
+    "${ARGON_ROOT}/apps/common/pixband/ag_pixband.c"
+    "${ARGON_ROOT}/apps/common/ws/ag_ws.c"
     "${ARGON_ROOT}/tools/nam.c"
     "${ARGON_ROOT}/apps/cc/cc_compile.c"
     "${ARGON_ROOT}/components/argon_kernel/src/dev/draw.c"

@@ -283,6 +283,15 @@
       "src": ["apps/remdisp/remdisp.c"]
     },
     {
+      "out": "PHONE.SYS", "group": "core",
+      "_note": "The board's screen and keyboard on a phone, over Wi-Fi. Publishes a display device (blit_rect for pixels, text_row/text_cursor for the console) and an input device, and serves its own client page on :8765 - a GET of / returns the HTML, a GET of /ws upgrades to a WebSocket carrying bands of pixels one way and keys and taps the other. Has a task of its own (sys->module_task, ABI 0.48), so blit_rect only copies the rectangle and marks the damage. Plan and protocol in docs/plans/phone.md.",
+      "generate": ["tools/mkpage.py"],
+      "include": ["apps/common/libc", "apps/common/pixband", "apps/common/ws",
+                  "apps/phone"],
+      "src": ["apps/phone/phone.c", "apps/common/pixband/ag_pixband.c",
+              "apps/common/ws/ag_ws.c", "apps/common/libc/libc_shim.c"]
+    },
+    {
       "out": "REMTERM.AXE", "group": "core",
       "_note": "The other end of REMDISP.SYS: takes bands of pixels to the panel with ag_gfx_present and console rows into its own console, switching between the two as the traffic does. Built here for the S3 only to keep it compiling - the image that runs is the LX6 one for the CYD, from a direct mkaxe call with --gcc xtensa-esp32-elf-gcc.",
       "src": ["apps/remterm/remterm.c"]
