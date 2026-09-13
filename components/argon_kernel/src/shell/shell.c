@@ -66,6 +66,7 @@
 #include <argon/nodedev.h>
 #include <argon/nodedrv.h>
 #include <argon/nodename.h>
+#include <argon/nodeps.h>
 
 #include "shell/cmd_link.h"
 #include "shell/cmd_net.h"
@@ -1371,6 +1372,41 @@ static int cmd_ps(int argc, char **argv)
                           (unsigned)(info.mem_used / 1024u),
                           info.foreground ? "  (foreground)" : "");
         shown++;
+    }
+
+    /*
+     * And the other node, in the same table.  One `ps` for the system was asked
+     * for in the same breath as one `dev`, and for the same reason: how many
+     * boards there are is not the operator's problem.
+     */
+    if (ag_linkprov_bound()) {
+        ag_procinfo_t far_info[8];
+        const int32_t n = ag_nodeps_list(far_info, 8, 5000u);
+        const char   *peer = ag_node_peer_name();
+        if (n < 0) {
+            /*
+             * Said, not swallowed.  A neighbour that has stopped answering is
+             * news; an empty space where its processes were is not, and a `ps`
+             * that shows nothing for a board that has gone quiet is a `ps` that
+             * lies about the system.
+             */
+            ag_console_printf("  (%s did not answer: %d)\n",
+                              (peer != NULL) ? peer : "the other node", (int)n);
+        } else {
+            for (int32_t i = 0; i < n; i++) {
+                char qualified[40];
+                snprintf(qualified, sizeof(qualified), "%s.%u",
+                         (peer != NULL) ? peer : "there",
+                         (unsigned)far_info[i].pid);
+                ag_console_printf(
+                    "  %-4s %-17s %-12s %-7s %5u KB%s\n", qualified,
+                    far_info[i].name, ag_proc_state_name(far_info[i].state),
+                    ag_proc_prio_name((ag_proc_prio_t)far_info[i].priority),
+                    (unsigned)(far_info[i].mem_used / 1024u),
+                    far_info[i].foreground ? "  (foreground there)" : "");
+                shown++;
+            }
+        }
     }
 
     if (shown == 0) {
@@ -4871,6 +4907,29 @@ static int cmd_kill(int argc, char **argv)
         return 1;
     }
 
+    /*
+     * `kill n2.7` stops it on the other node.  The same spelling `ps` prints,
+     * which is the whole point of printing it that way: what an operator reads
+     * off the screen has to be what they can type back.
+     */
+    char     node[AG_NODE_NAME_MAX];
+    ag_pid_t parsed = 0;
+    if (ag_nodeps_split(argv[1], node, sizeof(node), &parsed)) {
+        const char *peer = ag_node_peer_name();
+        if (peer == NULL || strcmp(peer, node) != 0) {
+            ag_console_printf("no node called %s is here\n", node);
+            return 1;
+        }
+        const ag_err_t rerr = ag_nodeps_kill(parsed, 5000u);
+        if (rerr != AG_OK) {
+            ag_console_printf("%s.%u: %d\n", node, (unsigned)parsed,
+                              (int)rerr);
+            return 1;
+        }
+        ag_console_printf("%s.%u stopped\n", node, (unsigned)parsed);
+        return 0;
+    }
+
     const ag_pid_t pid = (ag_pid_t)atoi(argv[1]);
     if (pid <= 0) {
         ag_console_puts("pid must be a number above zero\n");
@@ -5181,7 +5240,7 @@ static const ag_command_t k_commands[] = {
     {"prio", "<slot|pid> [low|normal|high]", "show or set process priority",
      cmd_prio},
     {"slots", "", "list session slots (* = focused)", cmd_slots},
-    {"kill", "<pid>", "stop an application", cmd_kill},
+    {"kill", "<pid|node.pid>", "stop an application, here or on the other node", cmd_kill},
     {"fg", "<slot|pid>", "focus a session slot (or pid's slot)", cmd_fg},
     {"dir", "[path]", "list a directory", ag_cmd_dir},
     {"cd", "[path]", "change directory", ag_cmd_cd},

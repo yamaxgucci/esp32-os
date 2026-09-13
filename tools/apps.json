@@ -28,6 +28,7 @@
     { "out": "DEVS.AXE", "group": "core", "src": ["apps/devs/devs.c"] },
     { "out": "DEVPOKE.AXE", "group": "core", "src": ["apps/devpoke/devpoke.c"] },
     { "out": "SPIN.AXE", "group": "core", "src": ["apps/spin/spin.c"] },
+    { "out": "IDLE.AXE", "group": "core", "src": ["apps/idle/idle.c"] },
     { "out": "PWR.AXE", "group": "core", "src": ["apps/pwr/pwr.c"] },
     { "out": "LEAK.AXE", "group": "core", "src": ["apps/leak/leak.c"] },
     { "out": "THREADS.AXE", "group": "core", "src": ["apps/threads/threads.c"] },

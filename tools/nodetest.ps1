@@ -190,7 +190,7 @@ function Invoke-Pair {
     }
 }
 
-# ------------------------------------------------------------------ build ---
+if ($Scenario -ne 'raw') { $only += 'NODELINK.SYS'; $only += 'HELLO.AXE'; $only += 'NEEDSND.AXE'; $only += 'PCMVIRT.SYS'; $only += 'DEVPOKE.AXE'; $only += 'IDLE.AXE' }
 
 $only = @('LINK.AXE')
 if ($Scenario -ne 'raw') { $only += 'NODELINK.SYS'; $only += 'HELLO.AXE'; $only += 'NEEDSND.AXE'; $only += 'PCMVIRT.SYS'; $only += 'DEVPOKE.AXE' }
@@ -551,8 +551,7 @@ if ($Scenario -eq 'link' -or $Scenario -eq 'both') {
 
     Invoke-Pair -Tag 'place' `
         -PutBoth @('build\apps\NODELINK.SYS=t:\nodelink.sys') `
-        -PutA @('build\apps\NEEDSND.AXE=t:\needsnd.axe',
-                'build\apps\DEVPOKE.AXE=t:\devpoke.axe') `
+        -PutA @('build\apps\NEEDSND.AXE=t:\needsnd.axe') `
         -PutB @('build\apps\PCMVIRT.SYS=t:\pcmvirt.sys') `
         -SendB @('drv load t:\pcmvirt.sys',
                  'drv load t:\nodelink.sys',
@@ -574,39 +573,19 @@ if ($Scenario -eq 'link' -or $Scenario -eq 'both') {
                  # Proof that THIS node cannot: the same refusal the loader
                  # gives, from the node that is about to hand the job over.
                  'dev',
+                 # Waited for on a word that BOTH outcomes print.  Waiting on a
+                 # line only the SUCCESS path prints was a trap: a failed run
+                 # exits before printing it, the harness sits out its whole
+                 # timeout, and a plain failure became four minutes of apparent
+                 # hang in the middle of the transcript.
                  'run t:\needsnd.axe',
-                 '=ran on a node with sound',
-                 # And the far node's devices, in this registry, by name.
-                 'link devs',
-                 '=are in this registry now',
-                 'dev',
-                 'run t:\devpoke.axe sound.pcmvirt 64',
-                 # Waited for on a word that BOTH outcomes print.  Waiting for
-                 # `closed` looked right and was a trap: a failed run exits
-                 # before printing it, so the harness sat out its whole timeout
-                 # and a plain failure was indistinguishable from a hang - four
-                 # minutes of nothing, in the middle of the transcript.
-                 '=devpoke:',
-                 # And the class default: this node's mixer has no real output
-                 # of its own, so the sound should leave through the
-                 # neighbour's rather than into pcmnull.  Enough bytes for the
-                 # mixer to have a period to send - it does not choose an
-                 # output until it has something to put in it.
-                 # Enough periods to see it SETTLE, not just to see it try.
-                 # Opening a sink on the other board is a round trip, and it can
-                 # arrive while that node is busy with something else - which is
-                 # -AG_EBUSY, correct, and retried on the next period.  Two
-                 # periods gave it two chances and failed about half the time;
-                 # a continuous stream is what this actually models.
-                 'run t:\devpoke.axe pcmmix 192 40',
-                 '=devpoke:',
-                 # From the JOURNAL, not the screen.  The mixer chooses its
-                 # output inside a write, which runs on the application's task
-                 # - and while an application owns the console the kernel log
-                 # does not reach it.  The line was always written; looking for
-                 # it on the screen was looking in the wrong place.
-                 'log -n 40',
-                 '=log')
+                 # Followed by something that prints WHATEVER the run did, and
+                 # waited on that.  Waiting on the run's own success line was a
+                 # trap: a failed run never prints it, so the harness sat out
+                 # its whole timeout and a plain failure became four minutes of
+                 # apparent hang in the middle of the transcript.
+                 'link',
+                 '=frames')
 
     $a = Transcript 'build\nodetest-place-a.log'
     $b = Transcript 'build\nodetest-place-b.log'
@@ -637,23 +616,101 @@ if ($Scenario -eq 'link' -or $Scenario -eq 'both') {
     # available - this node has no NEEDSND to load and no loader line of its own
     # to confuse it with, so the line can only have been written over there.
     Check $a 'loader: NEEDSND' 'place-far-kernel-loaded-it-over-the-link'
+}
+
+# ------------------------------------------ one registry, one ps, one system ---
+#
+# A SECOND pair, and splitting it out of the one above was not tidying.
+#
+# That scenario had grown to nine things in one guest's lifetime - two drivers,
+# naming, binding, placement, attaching devices, opening one, forty audio
+# periods, a listing and a kill - and a scenario that long tells you very little
+# when its ninth step fails: the guest runs out of time somewhere in the middle
+# and every check after that point fails at once, pointing at nothing.  Twice
+# the failure looked like the wire.
+#
+# The line between them is what each is about.  Above: WHERE a program runs.
+# Here: the far board's devices and processes appearing as this board's.
+
+if ($Scenario -eq 'link' -or $Scenario -eq 'both') {
+    Write-Host "`n== one registry, one ps ==" -ForegroundColor Cyan
+
+    Invoke-Pair -Tag 'share' `
+        -PutBoth @('build\apps\NODELINK.SYS=t:\nodelink.sys') `
+        -PutA @('build\apps\DEVPOKE.AXE=t:\devpoke.axe') `
+        -PutB @('build\apps\PCMVIRT.SYS=t:\pcmvirt.sys',
+                'build\apps\IDLE.AXE=t:\idle.axe') `
+        -SendB @('drv load t:\pcmvirt.sys',
+                 'drv load t:\nodelink.sys',
+                 'link name sound',
+                 'link use node0',
+                 # Something for the other node's `ps` to find.
+                 #
+                 # IDLE and not SPIN, and the difference cost nine checks.
+                 # spin.axe is the SUPERVISOR's test case: it burns a core and
+                 # prints a dot every few milliseconds, so as a stand-in for
+                 # "something is running over there" it drowned this board's
+                 # console and left it too busy to answer - which failed checks
+                 # that had nothing to do with processes and pointed at the wire.
+                 'run /b t:\idle.axe',
+                 "link poll $(($SendDelaySec + 300) * 1000)",
+                 '=link on node0') `
+        -SendA @('drv load t:\nodelink.sys',
+                 'link name quiet',
+                 'link use node0',
+                 "!powershell -NoProfile -Command Start-Sleep -Seconds $SendDelaySec",
+                 'link devs',
+                 '=are in this registry now',
+                 'dev',
+                 'run t:\devpoke.axe sound.pcmvirt 64',
+                 '=devpoke:',
+                 # The class default: this node's mixer has no real output of
+                 # its own, so the sound should leave through the neighbour's
+                 # rather than into pcmnull.  Enough periods to see it SETTLE,
+                 # not just to see it try: opening a sink on the other board is
+                 # a round trip and can arrive while that node is busy, which is
+                 # -AG_EBUSY, correct, and retried on the next period.
+                 'run t:\devpoke.axe pcmmix 192 40',
+                 '=devpoke:',
+                 # One `ps` for the whole system.
+                 'ps',
+                 '=IDLE',
+                 # And the name it printed is the name that can be typed back.
+                 'kill sound.1',
+                 '=sound.1',
+                 # From the JOURNAL, not the screen.  The mixer chooses its
+                 # output inside a write, which runs on the APPLICATION's task -
+                 # and while an application owns the console the kernel log does
+                 # not reach it.  The line was always written; looking for it on
+                 # the screen was looking in the wrong place.
+                 'log -n 40',
+                 '=log')
+
+    $a = Transcript 'build\nodetest-share-a.log'
+    $b = Transcript 'build\nodetest-share-b.log'
 
     # The far node's device, in this node's registry, opened by name.
-    #
-    # `sound.pcmvirt` can only be the far node's: PCMVIRT.SYS is loaded on B
-    # and nowhere else, so this node has no device of that name to open by
-    # mistake.  A listing crossing the wire is a description; an open crossing
-    # it is a conversation, and only the second proves anything.
+    # `sound.pcmvirt` can only be the far node's: PCMVIRT.SYS is loaded on B and
+    # nowhere else, so this node has no device of that name to open by mistake.
     Check $a 'are in this registry now' 'rdev-proxies-registered'
     Check $a 'sound.pcmvirt is open' 'rdev-opened-a-device-that-is-not-here'
     Check $a '64 of 64 bytes taken' 'rdev-wrote-through-the-wire'
 
     # The class default, which is the part an application never sees: nothing
-    # asked for `sound.pcmvirt` here.  The mixer was asked for sound, had no
-    # real output of its own, and found one on the other board - quality first,
-    # distance as the tie-break.  Into pcmnull would have been silence that
-    # reported success.
+    # asked for `sound.pcmvirt` here.  Into pcmnull would have been silence
+    # that reported success.
     Check $a 'sink /dev/sound.pcmvirt' 'default-sound-left-through-the-neighbour'
+
+    # One `ps` for the system.  IDLE runs on the other board and has never been
+    # on this one, so a row for it here crossed the wire.
+    Check $a 'IDLE' 'ps-shows-the-other-node-process'
+    # Under the node's name, which is the point: a pid on its own would be
+    # ambiguous the moment there are two boards, and this is the spelling an
+    # operator can type back.
+    Check $a 'sound.1' 'ps-names-it-by-node'
+    # And typed back it works: the far process is gone.
+    Check $a 'sound.1 stopped' 'kill-reached-the-other-node'
+    Check $b 'killed from the other node' 'kill-far-node-said-who'
 }
 
 # ------------------------------------------------- unloading, on one node ---

@@ -25,6 +25,7 @@
 #include <argon/nodehello.h>
 #include <argon/nodename.h>
 #include <argon/noderdev.h>
+#include <argon/nodeps.h>
 #include <argon/nodefs.h>
 #include <argon/nodeproc.h>
 #include <argon/path.h>
@@ -350,6 +351,10 @@ int ag_cmd_link(int argc, char **argv)
         const ag_err_t rerr = ag_noderdev_serve();
         if (rerr != AG_OK) {
             ag_console_printf("  (not serving our devices: %d)\n", (int)rerr);
+        }
+        const ag_err_t perr = ag_nodeps_serve();
+        if (perr != AG_OK) {
+            ag_console_printf("  (not answering `ps`: %d)\n", (int)perr);
         }
         return 0;
     }
