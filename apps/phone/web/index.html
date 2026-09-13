@@ -569,6 +569,14 @@ function askForPassword(nonce, wrong) {
   ui.askwhy.classList.toggle("bad", !!wrong);
   ui.askpw.value = "";
   setTimeout(() => ui.askpw.focus(), 50);
+  /* The keys are needed now if they are ever needed: on a phone whose own
+   * keyboard does not come up, this dialogue is the first thing that has to be
+   * typed into, and a folded keyboard here is a dead end. */
+  if (window.matchMedia && window.matchMedia("(pointer: coarse)").matches &&
+      !ui.kbd.classList.contains("on")) {
+    ui.kbd.classList.add("on");
+    ui.kb.classList.add("held");
+  }
   st.pendingNonce = nonce;
 }
 
@@ -720,7 +728,39 @@ function send(bytes) {
 
 /* ---- keys ------------------------------------------------------------- */
 
+/*
+ * Every key from the page's own keyboard passes through here, and that is the
+ * one place that knows where a key should go.
+ *
+ * Normally to the board.  While the password is being asked, into the field
+ * instead - because the keys on this page are the only keyboard some phones
+ * offer, and a password box you cannot type into is a board you cannot reach.
+ * Reported exactly that way, from both keyboards at once, which is what made it
+ * two bugs and not one: this was the half where the keys went to the machine
+ * behind the dialogue.
+ */
+function askOpen() { return ui.ask.classList.contains("on"); }
+
+function typeIntoAsk(hid, unicode) {
+  if (hid === K.back) {
+    ui.askpw.value = ui.askpw.value.slice(0, -1);
+    return;
+  }
+  if (hid === K.enter) {
+    ui.askform.dispatchEvent(new Event("submit", {bubbles: true,
+                                                  cancelable: true}));
+    return;
+  }
+  if (unicode >= 32) {
+    ui.askpw.value += String.fromCodePoint(unicode);
+  }
+}
+
 function sendKey(kind, hid, unicode, mods) {
+  if (askOpen()) {
+    if (kind === 1) typeIntoAsk(hid, unicode);
+    return;
+  }
   const m = (mods === undefined ? st.sticky : mods);
   send([IN_KEY, kind, m, hid & 255, hid >> 8, unicode & 255,
         (unicode >> 8) & 255, 0]);
@@ -944,6 +984,20 @@ const BY_CODE = {
 for (let i = 1; i <= 12; i++) BY_CODE["F" + i] = K["f" + i];
 
 window.addEventListener("keydown", (e) => {
+  /*
+   * Not while the person is typing into a field of this page's own.  This
+   * handler ends with preventDefault on anything it recognises, which for a
+   * text input means the character is never inserted - so the password box
+   * swallowed every key from a real keyboard and from a phone's, and looked
+   * broken in exactly the way it was.
+   */
+  const t = e.target;
+  if (t && t !== ui.sink &&
+      (t.tagName === "INPUT" || t.tagName === "TEXTAREA" ||
+       t.isContentEditable)) {
+    return;
+  }
+
   let mods = 0;
   if (e.shiftKey) mods |= MOD.shift;
   if (e.ctrlKey) mods |= MOD.ctrl;
@@ -968,6 +1022,10 @@ ui.sink.addEventListener("input", () => {
   const text = ui.sink.value;
   ui.sink.value = "";
   if (!text) return;
+  if (askOpen()) {
+    for (const ch of text) typeIntoAsk(0, ch.codePointAt(0));
+    return;
+  }
   /*
    * With Ctrl or Alt armed this is not text, it is a chord: the shell wants
    * Ctrl+C as a keystroke with a keycode, not as the letter c.
