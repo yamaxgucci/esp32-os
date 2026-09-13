@@ -344,8 +344,30 @@ static uint16_t rd16(const uint8_t *p)
  * WebSocket frame is not a stale rectangle, it is a stream the client can no
  * longer parse, and the only honest recovery from one is to close.
  */
-static bool send_all(ag_handle_t h, const void *buf, uint32_t len,
-                     uint32_t deadline_ms)
+/*
+ * Three answers, not two, and the difference is what keeps a link alive.
+ *
+ * A board can run out of memory without anybody's connection being gone: an
+ * application loading takes every byte for a moment, lwIP has nothing to copy
+ * into, and sends do not go.  Measured on the CYD: the desktop asking for
+ * 71 KB drove the heap to 3212 bytes free, and for two seconds the screen could
+ * not send a byte.  Treating that as a lost peer dropped the phone, which then
+ * reconnected - which is a link that visibly breaks every time the machine is
+ * busy, for no reason.
+ *
+ * WIRE_STALL is therefore reported only when NOTHING of the message has gone.
+ * Once a byte is out the client is mid-frame and there is no way back: a
+ * WebSocket frame that stops halfway is not a lost rectangle, it is a stream
+ * the client can no longer parse, and the only honest answer is to close.
+ */
+typedef enum {
+    WIRE_OK = 0,
+    WIRE_STALL, /* nothing sent, nothing broken - try again later */
+    WIRE_GONE,  /* the connection is finished, or the stream is  */
+} wire_t;
+
+static wire_t send_all(ag_handle_t h, const void *buf, uint32_t len,
+                       uint32_t deadline_ms)
 {
     const uint8_t *p = (const uint8_t *)buf;
     uint32_t       at = 0;
@@ -374,16 +396,19 @@ static bool send_all(ag_handle_t h, const void *buf, uint32_t len,
         if (n != -AG_EAGAIN && n != -AG_ENOMEM && n != 0) {
             ag_log(AG_LOG_WARN, "phone", "send failed after %u of %u: %d",
                    (unsigned)at, (unsigned)len, (int)n);
-            return false;
+            return WIRE_GONE;
         }
         if (ag_micros() > until) {
+            if (at == 0u) {
+                return WIRE_STALL; /* nothing started; nothing broken */
+            }
             ag_log(AG_LOG_WARN, "phone", "send stalled at %u of %u",
                    (unsigned)at, (unsigned)len);
-            return false;
+            return WIRE_GONE;
         }
         TASK->sleep_ms(2u);
     }
-    return true;
+    return WIRE_OK;
 }
 
 /*
@@ -399,26 +424,35 @@ static bool send_all(ag_handle_t h, const void *buf, uint32_t len,
  * The lock is never held across anything but this write, so the only thing that
  * can wait on it is another write.
  */
-static bool ws_send(uint8_t op, const void *payload, uint32_t len)
+static wire_t ws_send(uint8_t op, const void *payload, uint32_t len)
 {
     if (s.conn < 0) {
-        return false;
+        return WIRE_GONE;
     }
     uint8_t hdr[11];
     const uint32_t n = ag_ws_hdr_build(hdr, AG_WS_BIN, len + 1u, true);
     hdr[n] = op;
 
     if (s.wire != NULL && !TASK->mutex_lock(s.wire, 3000u)) {
-        return false;
+        return WIRE_STALL;
     }
-    bool ok = send_all(s.conn, hdr, n + 1u, 2000u);
-    if (ok && len > 0u) {
-        ok = send_all(s.conn, payload, len, 2000u);
+    wire_t r = send_all(s.conn, hdr, n + 1u, 2000u);
+    if (r == WIRE_OK && len > 0u) {
+        /*
+         * Longer, and a stall here is fatal rather than retried: the header is
+         * out, so the client is inside a frame and waiting for exactly this
+         * many bytes.  Ten seconds is what a phone three rooms away may need;
+         * failing after that is closing a stream that can no longer be read.
+         */
+        r = send_all(s.conn, payload, len, 10000u);
+        if (r == WIRE_STALL) {
+            r = WIRE_GONE;
+        }
     }
     if (s.wire != NULL) {
         TASK->mutex_unlock(s.wire);
     }
-    return ok;
+    return r;
 }
 
 /*
@@ -572,7 +606,7 @@ static void expected_digest(uint8_t out[DIGEST_LEN])
     ag_ws_sha1(buf, NONCE_LEN + n, out);
 }
 
-static bool send_info(void)
+static wire_t send_info(void)
 {
     uint8_t p[9];
     lock();
@@ -599,7 +633,7 @@ static bool send_info(void)
     return ws_send(OP_INFO, p, sizeof(p));
 }
 
-static bool send_text_row(uint16_t row)
+static wire_t send_text_row(uint16_t row)
 {
     uint8_t p[2u + TEXT_MAX_COLS * 2u];
 
@@ -611,13 +645,20 @@ static bool send_text_row(uint16_t row)
         p[2u + x * 2u] = s.cells[(size_t)row * s.cols + x].ch;
         p[3u + x * 2u] = s.cells[(size_t)row * s.cols + x].attr;
     }
-    s.row_dirty[row] = 0u;
     unlock();
 
-    return ws_send(OP_ROW, p, 2u + (uint32_t)count * 2u);
+    const wire_t r = ws_send(OP_ROW, p, 2u + (uint32_t)count * 2u);
+    /* Marked clean only once it has gone.  A row cleared before the send is a
+     * row lost for good when the board was momentarily out of memory. */
+    if (r == WIRE_OK) {
+        lock();
+        s.row_dirty[row] = 0u;
+        unlock();
+    }
+    return r;
 }
 
-static bool send_cursor(void)
+static wire_t send_cursor(void)
 {
     uint8_t p[5];
 
@@ -627,10 +668,15 @@ static bool send_cursor(void)
     p[2] = s.cur_under.ch;
     p[3] = s.cur_under.attr;
     p[4] = s.cur_visible ? 1u : 0u;
-    s.cur_dirty = false;
     unlock();
 
-    return ws_send(OP_CURSOR, p, sizeof(p));
+    const wire_t r = ws_send(OP_CURSOR, p, sizeof(p));
+    if (r == WIRE_OK) {
+        lock();
+        s.cur_dirty = false;
+        unlock();
+    }
+    return r;
 }
 
 /*
@@ -644,14 +690,14 @@ static bool send_cursor(void)
  * should be made to wait for.
  */
 /* Encode whatever is in s.band and put it on the wire.  Both paths end here. */
-static bool encode_and_send(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+static wire_t encode_and_send(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
 {
     uint8_t op = 0;
     const uint32_t len = ag_pixband_encode(s.pix, s.band, w * h,
                                            s.out + BAND_HDR,
                                            s.band_cap - BAND_HDR, &op);
     if (len == 0u) {
-        return true; /* refused rather than truncated: see ag_pixband.h */
+        return WIRE_OK; /* refused rather than truncated: see ag_pixband.h */
     }
     put16(s.out + 0, x);
     put16(s.out + 2, y);
@@ -660,17 +706,17 @@ static bool encode_and_send(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
     return ws_send(op, s.out, BAND_HDR + len);
 }
 
-static bool send_band(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+static wire_t send_band(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
 {
     const uint32_t n = w * h;
     if (n == 0u || n > s.band_px || s.pix == NULL) {
-        return true;
+        return WIRE_OK;
     }
 
     lock();
     if (s.frame == NULL || x + w > s.frame_w || y + h > s.frame_h) {
         unlock();
-        return true;
+        return WIRE_OK;
     }
     /* Strided by the allocation, not by the surface: see cap_w above. */
     for (uint32_t r = 0; r < h; r++) {
@@ -691,10 +737,10 @@ static bool send_band(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
  * REMDISP pays over its wire.  On a machine with 179 KB and no PSRAM that is
  * the trade that is on offer: a slower application, or no picture.
  */
-static bool send_blit_direct(const ag_blit_t *b)
+static wire_t send_blit_direct(const ag_blit_t *b)
 {
     if (s.pix == NULL || s.band == NULL || s.out == NULL) {
-        return true;
+        return WIRE_OK;
     }
     const uint8_t *src = (const uint8_t *)b->px;
 
@@ -714,20 +760,59 @@ static bool send_blit_direct(const ag_blit_t *b)
                            (size_t)x * sizeof(uint16_t),
                        (size_t)cols * sizeof(uint16_t));
             }
-            if (!encode_and_send((uint32_t)b->x + x, (uint32_t)b->y + y, cols,
-                                 rows)) {
-                return false;
+            const wire_t r = encode_and_send((uint32_t)b->x + x,
+                                             (uint32_t)b->y + y, cols, rows);
+            if (r != WIRE_OK) {
+                return r;
             }
         }
     }
-    return true;
+    return WIRE_OK;
+}
+
+/* The union of what has changed, in surface coordinates.  Caller holds the
+ * lock; mark_damage takes it. */
+static void mark_damage_locked(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+{
+    if (w == 0u || h == 0u) {
+        return;
+    }
+    if (s.dx0 >= s.dx1 || s.dy0 >= s.dy1) {
+        s.dx0 = x;
+        s.dy0 = y;
+        s.dx1 = x + w;
+        s.dy1 = y + h;
+        return;
+    }
+    if (x < s.dx0) {
+        s.dx0 = x;
+    }
+    if (y < s.dy0) {
+        s.dy0 = y;
+    }
+    if (x + w > s.dx1) {
+        s.dx1 = x + w;
+    }
+    if (y + h > s.dy1) {
+        s.dy1 = y + h;
+    }
+}
+
+static void mark_damage(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+{
+    lock();
+    mark_damage_locked(x, y, w, h);
+    unlock();
 }
 
 /*
  * Everything the phone is owed, in one pass, and then out to wait for more.
  *
- * Returns false when the connection has gone; the caller drops it rather than
- * carrying on into a socket that is not there.
+ * Returns false only when the connection is finished.  A board that is
+ * momentarily out of memory - an application loading takes every byte for half
+ * a second - is not a finished connection: what could not go out stays marked
+ * and goes on the next pass.  Dropping the phone for that is a link that
+ * visibly breaks every time the machine is busy.
  */
 static bool service_client(void)
 {
@@ -738,21 +823,27 @@ static bool service_client(void)
      */
     if (needs_password() && !s.authed) {
         if (!s.challenged) {
-            make_nonce();
-            s.challenged = true;
-            return ws_send(OP_AUTH, s.nonce, NONCE_LEN);
+            const wire_t r = ws_send(OP_AUTH, s.nonce, NONCE_LEN);
+            if (r == WIRE_GONE) {
+                return false;
+            }
+            s.challenged = (r == WIRE_OK);
         }
         return true;
     }
 
     if (s.owe_everything) {
-        s.owe_everything = false;
-        if (!send_info()) {
+        const wire_t r = send_info();
+        if (r == WIRE_GONE) {
             return false;
         }
+        if (r == WIRE_STALL) {
+            return true; /* still owed; try again next pass */
+        }
+        s.owe_everything = false;
         lock();
-        for (uint32_t r = 0; r < s.rows; r++) {
-            s.row_dirty[r] = 1u;
+        for (uint32_t r2 = 0; r2 < s.rows; r2++) {
+            s.row_dirty[r2] = 1u;
         }
         s.cur_dirty = true;
         if (s.frame != NULL) {
@@ -765,12 +856,25 @@ static bool service_client(void)
     }
 
     for (uint32_t r = 0; r < s.rows; r++) {
-        if (s.row_dirty[r] && !send_text_row((uint16_t)r)) {
+        if (!s.row_dirty[r]) {
+            continue;
+        }
+        const wire_t w = send_text_row((uint16_t)r);
+        if (w == WIRE_GONE) {
             return false;
         }
+        if (w == WIRE_STALL) {
+            return true; /* the row is still marked; come back to it */
+        }
     }
-    if (s.cur_dirty && !send_cursor()) {
-        return false;
+    if (s.cur_dirty) {
+        const wire_t w = send_cursor();
+        if (w == WIRE_GONE) {
+            return false;
+        }
+        if (w == WIRE_STALL) {
+            return true;
+        }
     }
 
     /*
@@ -801,8 +905,14 @@ static bool service_client(void)
             if (w > s.band_w) {
                 w = s.band_w;
             }
-            if (!send_band(x, y, w, h)) {
+            const wire_t r = send_band(x, y, w, h);
+            if (r == WIRE_GONE) {
                 return false;
+            }
+            if (r == WIRE_STALL) {
+                /* Put back what has not gone, so the next pass sends it. */
+                mark_damage(x, y, x1 - x, y1 - y);
+                return true;
             }
         }
     }
@@ -1745,25 +1855,7 @@ static void phone_blit_rect(ag_handle_t h, const ag_blit_t *b)
                src + (size_t)r * b->stride, (size_t)b->w * sizeof(uint16_t));
     }
 
-    if (s.dx0 >= s.dx1 || s.dy0 >= s.dy1) {
-        s.dx0 = b->x;
-        s.dy0 = b->y;
-        s.dx1 = (uint32_t)b->x + b->w;
-        s.dy1 = (uint32_t)b->y + b->h;
-    } else {
-        if (b->x < s.dx0) {
-            s.dx0 = b->x;
-        }
-        if (b->y < s.dy0) {
-            s.dy0 = b->y;
-        }
-        if ((uint32_t)b->x + b->w > s.dx1) {
-            s.dx1 = (uint32_t)b->x + b->w;
-        }
-        if ((uint32_t)b->y + b->h > s.dy1) {
-            s.dy1 = (uint32_t)b->y + b->h;
-        }
-    }
+    mark_damage_locked(b->x, b->y, b->w, b->h);
     unlock();
 }
 
