@@ -110,6 +110,9 @@ static const esp_chip_t *chip_by_name(const char *name)
 static int              s_port = 1;
 static uint32_t         s_baud = 115200u;
 static const esp_chip_t *s_chip; /* the active profile, set by detect/-chip */
+static bool             s_keep;  /* -keep: leave the module in the ROM loader
+                                  * (FLASH_END no-reboot) so the next `write`
+                                  * to another region still finds it in sync */
 
 /* ---- buffers (static: a flash block is 1 KB and the stack is small) --- */
 
@@ -562,8 +565,20 @@ static int do_write(const char *path, uint32_t addr, int gpio0, int rst)
     ag_printf("\n");
     ag_close(h);
 
-    /* FLASH_END with reboot=0 tells the ROM to run the new image.  It may reset
-     * before its reply reaches us, so a timeout here is not a failure. */
+    /* Multi-region firmware (a bootloader at 0x0, a partition table, an app) is
+     * flashed as several `write`s.  The FLASH_DATA blocks above are already
+     * committed to flash; FLASH_END only finalises the session and reboots.  On
+     * the ESP8266 ROM, sending FLASH_END ends the loader session (and its reply
+     * is flaky), so a subsequent `write` to another region cannot re-sync.  With
+     * -keep we therefore skip FLASH_END entirely and leave the module in the
+     * loader; only the final `write` (no -keep) sends it, to run the new image. */
+    if (s_keep) {
+        ag_printf("done - staying in the loader for the next write\n");
+        return 0;
+    }
+
+    /* FLASH_END payload int(not reboot); 0 reboots into the new image.  It may
+     * reset before its reply reaches us, so a timeout here is not a failure. */
     uint8_t end[4];
     ag_esp_put32(end, 0);
     err = command(ESP_CMD_FLASH_END, end, 4, 0, 3000, NULL, status_len());
@@ -582,10 +597,12 @@ static void usage(void)
 {
     ag_printf("usage:\n");
     ag_printf("  espflash id    [-c CHIP] [-p PORT] [-b BAUD] [-r GPIO0 RST]\n");
-    ag_printf("  espflash write <file> [-a ADDR] [-c CHIP] [-p PORT] [-b BAUD]"
-              " [-r GPIO0 RST]\n");
+    ag_printf("  espflash write <file> [-a ADDR] [-keep] [-c CHIP] [-p PORT]"
+              " [-b BAUD] [-r GPIO0 RST]\n");
     ag_printf("PORT default 1 (UART0 is the console), BAUD default 115200,"
               " ADDR default 0.\n");
+    ag_printf("-keep: stay in the loader after writing (for the next region);"
+              " omit it on the last write to reboot into the firmware.\n");
     ag_printf("-c CHIP: auto (default) detects it; or name it - esp8266 esp32"
               " esp32s2 esp32s3 esp32c3 esp32c6 esp32c2 esp32h2\n");
     ag_printf("Omit -r on the CYD and enter download mode by hand.\n");
@@ -650,6 +667,8 @@ int ag_main(int argc, char **argv)
                     return 1;
                 }
             }
+        } else if (ag_strcmp(a, "-keep") == 0) {
+            s_keep = true;
         } else if (ag_strcmp(a, "-r") == 0 && i + 2 < argc) {
             uint32_t g, r;
             if (!parse_u32(argv[i + 1], &g) || !parse_u32(argv[i + 2], &r)) {

@@ -318,8 +318,32 @@ static ag_err_t ext_start(ag_device_t *dev)
 {
     (void)dev;
     ag_rlink_hdr_t req, rep;
+
+    /* The coprocessor owns its radio, so we hand it the network to join:
+     * ssid then passphrase, a0 = ssid length (proto v2).  With no radio.ssid
+     * we send START empty - the coprocessor (or the QEMU fake) uses whatever
+     * network it already has. */
+    uint8_t  creds[RL_MAX_PAYLOAD];
+    uint32_t ssid_len = 0, clen = 0;
+    if (AG_HAS(ag_api()->cfg, get_str)) {
+        char ssid[48] = {0};
+        char pass[64] = {0};
+        (void)ag_api()->cfg->get_str("radio.ssid", ssid, sizeof(ssid));
+        (void)ag_api()->cfg->get_str("radio.pass", pass, sizeof(pass));
+        const size_t sl = strlen(ssid);
+        const size_t pl = strlen(pass);
+        if (sl > 0 && sl + pl <= sizeof(creds)) {
+            memcpy(creds, ssid, sl);
+            memcpy(creds + sl, pass, pl);
+            ssid_len = (uint32_t)sl;
+            clen = (uint32_t)(sl + pl);
+        }
+    }
+
     ag_rlink_req(&req, RL_OP_START, 0);
-    const ag_err_t e = rpc_simple(&req, &rep);
+    req.a0 = ssid_len;
+    req.len = clen;
+    const ag_err_t e = rpc(&req, clen > 0 ? creds : NULL, &rep, NULL);
     if (e != AG_OK) {
         return e;
     }

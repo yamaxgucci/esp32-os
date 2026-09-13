@@ -1,0 +1,12 @@
+# RLINK rides UART0 as raw binary frames, so nothing else may print there.
+# Silence the logs; the boot-ROM banner still lands once at reset, but the guest
+# resynchronises on the RLINK magic and drains it before the first HELLO reply.
+CONFIG_LOG_DEFAULT_LEVEL_NONE=y
+CONFIG_BOOTLOADER_LOG_LEVEL_NONE=y
+
+# Keep Wi-Fi credentials out of flash: they arrive over RLINK at START and live
+# only in RAM, mirroring how the CYD keeps them only in its C: SYSTEM.CFG.
+CONFIG_ESP_WIFI_STORAGE_RAM=y
+
+# A little headroom for concurrent sockets (8 channels + a listener + DNS).
+CONFIG_LWIP_MAX_SOCKETS=10
