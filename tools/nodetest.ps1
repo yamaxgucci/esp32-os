@@ -310,6 +310,9 @@ if ($Scenario -eq 'link' -or $Scenario -eq 'both') {
                  'link use node0',
                  "!powershell -NoProfile -Command Start-Sleep -Seconds $SendDelaySec",
                  "link ping $Pings",
+                 # And the same round trip on the class sound will ride.  It
+                 # had never carried a byte between two nodes before this line.
+                 "link ping $Pings stream",
                  '=came back')
 
     $a = Transcript 'build\nodetest-link-a.log'
@@ -324,9 +327,18 @@ if ($Scenario -eq 'link' -or $Scenario -eq 'both') {
     Check $a ("$Pings of $Pings came back") 'link-every-ping-answered'
     Check $b 'answered' 'link-far-end-answered'
 
-    $st = [regex]::Match($a,
+    # The LAST one, not the first.
+    #
+    # These counters are printed by every `link` status, and the transcript is a
+    # rendered screen that scrolls and redraws - so the same line appears many
+    # times and the first occurrence is the status from BEFORE the pings, which
+    # describes nothing that happened here.  Taking the last is not a tie-break:
+    # these are running totals, so the last one is the only one that covers the
+    # whole scenario.
+    $all = [regex]::Matches($a,
         'frames\s+(\d+) sent \((\d+) again\), (\d+) received')
-    if (-not $st.Success) {
+    $st = if ($all.Count -gt 0) { $all[$all.Count - 1] } else { $null }
+    if ($null -eq $st -or -not $st.Success) {
         Note $false 'link-stats-parsed' 'no "frames N sent" line'
     } else {
         $sent = [int]$st.Groups[1].Value
@@ -359,8 +371,30 @@ if ($Scenario -eq 'link' -or $Scenario -eq 'both') {
             "$again of $sent"
     }
 
-    $lb = [regex]::Match($b, 'losses\s+(\d+) gaps, (\d+) duplicates, (\d+) bad')
-    if ($lb.Success) {
+    # The stream class, which until now had never carried anything between two
+    # nodes.  Everything built so far is a question with an answer, so all of it
+    # went on control or bulk; the class that SOUND is meant to ride had only
+    # ever been exercised by the host tests.  A path nothing has used is a path
+    # nobody knows the state of.
+    #
+    # Judged as an unreliable class should be: losing one is what it is allowed
+    # to do, losing most of them means the path is broken.
+    $sp = [regex]::Match($a, 'ping: \d+ messages on stream(.|\n)*?(\d+) of (\d+) came back')
+    if (-not $sp.Success) {
+        Note $false 'stream-class-carries-messages' 'no stream ping summary'
+    } else {
+        $sgot = [int]$sp.Groups[2].Value
+        $ssent = [int]$sp.Groups[3].Value
+        Note ($sgot * 2 -ge $ssent) 'stream-class-carries-messages' `
+            "$sgot of $ssent"
+    }
+
+    # The last one, for the same reason as the frame counters above: running
+    # totals printed by every status, on a screen that redraws.
+    $lball = [regex]::Matches($b,
+        'losses\s+(\d+) gaps, (\d+) duplicates, (\d+) bad')
+    $lb = if ($lball.Count -gt 0) { $lball[$lball.Count - 1] } else { $null }
+    if ($null -ne $lb -and $lb.Success) {
         Note ([int]$lb.Groups[3].Value -eq 0) 'link-no-bad-frames' `
             ("{0} bad" -f $lb.Groups[3].Value)
     }

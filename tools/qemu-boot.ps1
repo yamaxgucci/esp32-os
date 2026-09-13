@@ -432,12 +432,73 @@ try {
     }
 
     # A terminal sends CR for Enter; CRLF would look like two keys.
+    # The parameter is $Line and NOT $Text, and that is not style.
+    #
+    # PowerShell variable names are case-insensitive and its scoping is dynamic,
+    # so a parameter called $Text IS the script's $text - the StringBuilder the
+    # whole transcript is appended to - inside this function and everything it
+    # calls.  It was called $Text, and the line below therefore recorded the
+    # length of the COMMAND (twelve characters, say) where it meant the length
+    # of the transcript so far (hundreds of thousands).
+    #
+    # That mark is where a `=needle` wait starts looking, so every one of them
+    # searched from the top of the run: a marker printed long before the command
+    # satisfied the wait for it instantly, and the scenario ran on.  Scenarios
+    # that appeared to skip ahead, and checks that passed on stale text, were
+    # this.
     function Send-Line {
-        param([string]$Text)
-        $bytes = [System.Text.Encoding]::ASCII.GetBytes($Text + "`r")
+        param([string]$Line)
+        $bytes = [System.Text.Encoding]::ASCII.GetBytes($Line + "`r")
         $script:sendMark = $text.Length
         $stream.Write($bytes, 0, $bytes.Length)
         $stream.Flush()
+    }
+
+    # Types a command and CHECKS THAT IT ARRIVED.
+    #
+    # The console drops input while it is busy printing, and a whole line
+    # arrives from a socket faster than a UART would ever deliver it.  What that
+    # looks like is not a dropped command - it is a DIFFERENT command: `link
+    # ping 24 stream` lost its first character and ran as `ink`, and the failure
+    # reported was "Bad command or file name", several checks away from the
+    # cause.
+    #
+    # So: look for the echo, and if the line is not there, clear whatever half
+    # of it is and type it again.  Once - a second failure is a real problem and
+    # should be seen, not retried into silence.
+    # NOT named $Text.  PowerShell variables are case-insensitive and its
+    # scoping is dynamic, so a parameter called $Text IS the script's $text -
+    # the StringBuilder every function here appends the transcript to - for this
+    # function and everything it calls.  Read-Available then tried to Append to
+    # a String and the whole guest died with a message about the wrong type,
+    # nowhere near the line that caused it.
+    function Send-Command {
+        param([string]$Line)
+        Send-Line $Line
+        Start-Sleep -Milliseconds 250
+        [void](Read-Available)
+        $tail = $text.ToString()
+        if ($tail.Length -gt 6000) { $tail = $tail.Substring($tail.Length - 6000) }
+        # Escapes stripped before looking.
+        #
+        # What arrives is a RENDERED SCREEN, not a log: a redraw lands cursor
+        # moves and erase-to-end sequences in the middle of the line being
+        # echoed, so a plain search for the command text fails while the command
+        # is sitting there perfectly.  That false alarm is not harmless - it
+        # retypes a command that already ran, and `link devs` twice is not
+        # `link devs`.
+        $tail = $tail -replace "`e\[[0-9;]*[A-Za-z]", ''
+        if ($tail.Contains($Line)) { return }
+
+        Write-Host "warning: the console did not echo '$Line'; typing it again" `
+            -ForegroundColor Yellow
+        # A bare return first: whatever fragment is on the line becomes its own
+        # (failed) command rather than a prefix of the retyped one.
+        $stream.Write([System.Text.Encoding]::ASCII.GetBytes("`r"), 0, 1)
+        $stream.Flush()
+        Start-Sleep -Milliseconds 200
+        [void](Read-Available)
+        Send-Line $Line
     }
 
     # How many times some text appears in what has arrived so far.
@@ -679,7 +740,7 @@ try {
             if ($cmd -match '(?i)^copy\s') {
                 $wasCopy = Count-Of 'file(s) copied'
                 $wasErr = Count-Of ': no space left'
-                Send-Line $cmd
+                Send-Command $cmd
                 $deadline = (Get-Date).AddSeconds($TimeoutSec)
                 if ($deadline -gt $runDeadline) { $deadline = $runDeadline }
                 while ((Get-Date) -lt $deadline) {
@@ -702,7 +763,7 @@ try {
                              'this system speaks', 'holds the')
                 $was = @{}
                 foreach ($e in $endings) { $was[$e] = Count-Of $e }
-                Send-Line $cmd
+                Send-Command $cmd
                 $deadline = (Get-Date).AddSeconds($TimeoutSec)
                 if ($deadline -gt $runDeadline) { $deadline = $runDeadline }
                 while ((Get-Date) -lt $deadline) {
@@ -720,20 +781,20 @@ try {
                 # nothing to wait for it with: what follows in the list is
                 # what stops it.
                 $wasUp = Count-Of 'Ctrl+C to stop'
-                Send-Line $cmd
+                Send-Command $cmd
                 [void](Wait-Text -Needle 'Ctrl+C to stop' -Was $wasUp `
                                  -Seconds $TimeoutSec)
                 $seen = Read-Available
             } elseif ($cmd -match '(?i)^run\s') {
                 $wasRet = Count-Of 'returned '
-                Send-Line $cmd
+                Send-Command $cmd
                 if (-not (Wait-Text -Needle 'returned ' -Was $wasRet `
                                     -Seconds $TimeoutSec)) {
                     Write-Host "warning: run did not report process exit"
                 }
                 $seen = Read-Available
             } else {
-                Send-Line $cmd
+                Send-Command $cmd
                 $seen = Wait-Prompt -Was $seen -Seconds $TimeoutSec
             }
         }

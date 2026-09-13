@@ -217,7 +217,21 @@ static int link_echo(uint32_t secs)
     return 0;
 }
 
-static int link_ping(uint32_t count)
+/*
+ * `count` messages there and back, on `cls`.
+ *
+ * The class is an argument because the STREAM class has never carried anything
+ * between two nodes.  Everything built so far - a remote run, a file, a device
+ * call - is a question with an answer, so all of it went on CONTROL or BULK,
+ * and the class that audio is meant to ride has only ever been exercised by the
+ * host tests.  A path nothing has used is a path nobody knows the state of, and
+ * the whole plan for sound over the wire rests on this one.
+ *
+ * STREAM is UNRELIABLE by design: unsequenced, unacknowledged, dropped rather
+ * than queued when the wire is behind.  So the pass mark for it is not "all of
+ * them" - it is "most of them, and the ones that came are whole".
+ */
+static int link_ping(uint32_t count, uint8_t cls)
 {
     if (ag_linkprov_listen(LINK_CHAN_SHELL, on_shell_msg, NULL) != AG_OK) {
         ag_console_puts("channel 1 is taken\n");
@@ -228,7 +242,10 @@ static int link_ping(uint32_t count)
     uint8_t  in[LINK_MSG_MAX + 1];
     uint32_t got = 0;
 
-    ag_console_printf("ping: %u messages\n", (unsigned)count);
+    ag_console_printf("ping: %u messages on %s\n", (unsigned)count,
+                      (cls == AG_LINK_STREAM)  ? "stream"
+                      : (cls == AG_LINK_BULK) ? "bulk"
+                                              : "control");
     for (uint32_t i = 0; i < count; i++) {
         const int len =
             snprintf((char *)out + 1, sizeof(out) - 1, "ping %u", (unsigned)i);
@@ -241,8 +258,7 @@ static int link_ping(uint32_t count)
          */
         int32_t s = -AG_EAGAIN;
         for (int t = 0; t < 200 && s == -AG_EAGAIN; t++) {
-            s = ag_linkprov_send(LINK_CHAN_SHELL, AG_LINK_CONTROL, out,
-                                 (size_t)len + 1u);
+            s = ag_linkprov_send(LINK_CHAN_SHELL, cls, out, (size_t)len + 1u);
             if (s == -AG_EAGAIN) {
                 ag_linkprov_poll(5);
             }
@@ -263,6 +279,14 @@ static int link_ping(uint32_t count)
     }
     ag_console_printf("%u of %u came back\n", (unsigned)got, (unsigned)count);
     print_stats();
+    /*
+     * An unreliable class is not failed for being unreliable.  Losing one is
+     * what it is allowed to do; losing most of them means the path is broken,
+     * which is a different statement and the one worth making.
+     */
+    if (cls == AG_LINK_STREAM) {
+        return (got * 2u >= count) ? 0 : 1;
+    }
     return (got == count) ? 0 : 1;
 }
 
@@ -365,7 +389,18 @@ int ag_cmd_link(int argc, char **argv)
 
     if (ag_path_icmp(argv[1], "ping") == 0) {
         const uint32_t n = (argc > 2) ? (uint32_t)atoi(argv[2]) : 8u;
-        return link_ping((n == 0) ? 1u : n);
+        uint8_t        cls = AG_LINK_CONTROL;
+        if (argc > 3) {
+            if (ag_path_icmp(argv[3], "stream") == 0) {
+                cls = AG_LINK_STREAM;
+            } else if (ag_path_icmp(argv[3], "bulk") == 0) {
+                cls = AG_LINK_BULK;
+            } else if (ag_path_icmp(argv[3], "control") != 0) {
+                ag_console_puts("class is control, stream or bulk\n");
+                return 1;
+            }
+        }
+        return link_ping((n == 0) ? 1u : n, cls);
     }
     if (ag_path_icmp(argv[1], "echo") == 0) {
         const uint32_t s = (argc > 2) ? (uint32_t)atoi(argv[2]) : 20u;
@@ -500,6 +535,7 @@ int ag_cmd_link(int argc, char **argv)
 
     ag_console_puts("usage: link [use <dev>|none | run <path> [args] | "
                     "get <there> <here> | mount | umount | devs | nodevs | "
-                    "name [x] | ping [n] | echo [secs] | poll [ms]]\n");
+                    "name [x] | ping [n] [control|stream|bulk] | echo [secs] | "
+                    "poll [ms]]\n");
     return 1;
 }
