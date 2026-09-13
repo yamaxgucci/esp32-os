@@ -191,6 +191,8 @@ uint32_t s_touched_n, s_touched_kb;
  * of those points somewhere different.
  */
 uint32_t s_lost_full, s_lost_big, s_lost_closed, s_lost_dup;
+uint32_t s_dup_staged;   /* caught in the gathering buffer */
+uint32_t s_dup_index;    /* found in the index by the audit */
 
 /*
  * Kept at a map load and kept while playing, counted apart.
@@ -772,6 +774,27 @@ void ag_art_store_put_many(const ag_art_put_t *items, int count)
         }
 
         /*
+         * ARGON: and the same picture may be waiting in the gathering
+         * buffer, where find() cannot see it - it is only in the index
+         * once it has been written.  Maxim asked whether the store holds
+         * repeats; this is the only way one could get in, and it would
+         * cost the space twice.
+         */
+        bool already_staged = false;
+
+        for (uint32_t k = 0; k < s_stage_n; k++) {
+            if (s_stage_index[k].fid == fid) {
+                already_staged = true;
+                break;
+            }
+        }
+        if (already_staged) {
+            s_lost_dup++;
+            s_dup_staged++;
+            continue;
+        }
+
+        /*
          * Into the gathering buffer, and out to flash only when it is full.
          *
          * This is the shape that played well and that I removed: what makes a
@@ -1001,8 +1024,30 @@ void ag_art_store_kinds(char *out, size_t cap)
     }
 }
 
+/*
+ * ARGON: is anything in the index twice, and is it still in order?
+ *
+ * The index is sorted by fid and searched with a binary search, so a
+ * repeat means space paid for twice and a search that can miss.  Maxim
+ * asked whether the store holds repeats; this answers it rather than
+ * reasoning about it.  A linear walk over at most 2048 entries, once a
+ * report.
+ */
+static void index_audit(void)
+{
+    s_dup_index = 0;
+    for (uint32_t i = 1; i < s_count; i++) {
+        if (s_index[i].fid == s_index[i - 1].fid) {
+            s_dup_index++;
+        } else if (s_index[i].fid < s_index[i - 1].fid) {
+            s_dup_index |= 0x10000u;
+        }
+    }
+}
+
 void ag_art_store_report(char *out, size_t cap)
 {
+    index_audit();
     if (out == nullptr || cap == 0u) {
         return;
     }
@@ -1048,12 +1093,17 @@ void ag_art_store_report(char *out, size_t cap)
         if (at + 1u < cap) {
             snprintf(out + at, cap - at,
                      " | this window: stopped %u ms writing and %u ms erasing"
-                     " | %u of %u stored files ever asked for (%u of %u KB)",
+                     " | %u of %u stored files ever asked for (%u of %u KB)"
+                     " | repeats: %u caught while gathering, %u in the index%s",
                      (unsigned)(s_win_write_us / 1000u),
                      (unsigned)(s_win_erase_us / 1000u),
                      (unsigned)s_touched_n, (unsigned)s_count,
                      (unsigned)(s_touched_kb >> 10),
-                     (unsigned)(s_fill_at >> 10));
+                     (unsigned)(s_fill_at >> 10),
+                     (unsigned)s_dup_staged,
+                     (unsigned)(s_dup_index & 0xFFFFu),
+                     ((s_dup_index & 0x10000u) != 0u)
+                         ? " AND OUT OF ORDER" : "");
         }
         s_win_write_us = 0;
         s_win_erase_us = 0;
