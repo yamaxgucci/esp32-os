@@ -182,11 +182,28 @@ static struct {
 
     ag_mutex_t lock; /* the frame, the damage, the text shadow              */
 
-    /* The picture, as this driver's own copy of the surface. */
+    /*
+     * The picture, as this driver's own copy of the surface.
+     *
+     * Two sizes, and the difference is the whole reason the first frame is not
+     * lost.  cap_w/cap_h is what was allocated - at ag_driver_init, before
+     * anything has drawn, from the size the display is configured for.
+     * frame_w/frame_h is the surface actually in use, learned from the first
+     * blit that arrives.  The rows are strided by cap_w whatever the surface
+     * turns out to be, so a smaller one simply uses part of the buffer.
+     *
+     * The version before this allocated on seeing the first blit, which meant
+     * dropping that blit - and an application that paints once and waits, which
+     * is most of them, then had a black screen on the phone for ever.  Measured
+     * exactly that way: gfxdemo, 256000 pixels, every one of them #000000.
+     */
     uint16_t *frame;
+    uint32_t  cap_w;
+    uint32_t  cap_h;
     uint32_t  frame_w;
     uint32_t  frame_h;
-    /* What blit_rect saw last, so the task knows what to allocate. */
+    /* A surface larger than cap: the task grows the buffer and one frame is
+     * lost, which is the rare case rather than the first one. */
     volatile uint32_t want_w;
     volatile uint32_t want_h;
 
@@ -316,8 +333,8 @@ static bool send_info(void)
 {
     uint8_t p[9];
     lock();
-    const uint32_t w = (s.frame_w != 0u) ? s.frame_w : s.want_w;
-    const uint32_t h = (s.frame_h != 0u) ? s.frame_h : s.want_h;
+    const uint32_t w = (s.frame_w != 0u) ? s.frame_w : s.cap_w;
+    const uint32_t h = (s.frame_h != 0u) ? s.frame_h : s.cap_h;
     const uint16_t cols = s.cols;
     const uint16_t rows = s.rows;
     unlock();
@@ -395,8 +412,9 @@ static bool send_band(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
         unlock();
         return true;
     }
+    /* Strided by the allocation, not by the surface: see cap_w above. */
     for (uint32_t r = 0; r < h; r++) {
-        memcpy(s.band + r * w, s.frame + (size_t)(y + r) * s.frame_w + x,
+        memcpy(s.band + r * w, s.frame + (size_t)(y + r) * s.cap_w + x,
                (size_t)w * sizeof(uint16_t));
     }
     unlock();
@@ -957,13 +975,23 @@ static bool ensure_memory(void)
         }
     }
 
-    const uint32_t w = s.want_w;
-    const uint32_t h = s.want_h;
+    uint32_t w = s.want_w;
+    uint32_t h = s.want_h;
     if (w == 0u || h == 0u) {
-        return true; /* nothing has drawn yet; the console still works */
+        return true; /* nothing has asked for more than what is already held */
     }
-    if (s.frame != NULL && s.frame_w == w && s.frame_h == h) {
+    if (s.frame != NULL && w <= s.cap_w && h <= s.cap_h) {
+        s.want_w = 0;
+        s.want_h = 0;
         return true;
+    }
+    /* Grow rather than resize: a buffer that only ever gets larger cannot be
+     * thrashed by two surfaces taking turns. */
+    if (w < s.cap_w) {
+        w = s.cap_w;
+    }
+    if (h < s.cap_h) {
+        h = s.cap_h;
     }
 
     uint16_t *fb = (uint16_t *)ag_malloc((size_t)w * h * sizeof(uint16_t));
@@ -980,12 +1008,18 @@ static bool ensure_memory(void)
     lock();
     uint16_t *old = s.frame;
     s.frame = fb;
-    s.frame_w = w;
-    s.frame_h = h;
+    s.cap_w = w;
+    s.cap_h = h;
+    /* The surface in use is whatever the next blit says; until one arrives
+     * there is no picture, only a buffer to put one in. */
+    s.frame_w = 0;
+    s.frame_h = 0;
     s.dx0 = 0;
     s.dy0 = 0;
     s.dx1 = 0;
     s.dy1 = 0;
+    s.want_w = 0;
+    s.want_h = 0;
     unlock();
 
     ag_free(old);
@@ -1102,8 +1136,8 @@ static ag_err_t phone_info(ag_handle_t h, ag_gfxinfo_t *out)
         return -AG_EINVAL;
     }
     memset(out, 0, sizeof(*out));
-    out->width = (uint16_t)((s.frame_w != 0u) ? s.frame_w : s.want_w);
-    out->height = (uint16_t)((s.frame_h != 0u) ? s.frame_h : s.want_h);
+    out->width = (uint16_t)((s.frame_w != 0u) ? s.frame_w : s.cap_w);
+    out->height = (uint16_t)((s.frame_h != 0u) ? s.frame_h : s.cap_h);
     if (out->width == 0u) {
         out->width = 320;
         out->height = 240;
@@ -1127,27 +1161,39 @@ static void phone_blit_rect(ag_handle_t h, const ag_blit_t *b)
         return;
     }
 
-    /* What the task should be holding.  Written without the lock on purpose:
-     * it is a hint, it is a word, and the task re-reads it. */
-    if (s.want_w != b->surf_w || s.want_h != b->surf_h) {
+    lock();
+    if (s.frame == NULL || b->surf_w > s.cap_w || b->surf_h > s.cap_h) {
+        /*
+         * Bigger than what is held, or nothing held at all.  Say so without the
+         * lock mattering - it is two words and the task re-reads them - and
+         * drop this rectangle; the task grows the buffer and the next frame
+         * lands.  This is the rare path now, not the first one.
+         */
         s.want_w = b->surf_w;
         s.want_h = b->surf_h;
-    }
-
-    lock();
-    if (s.frame == NULL || s.frame_w != b->surf_w || s.frame_h != b->surf_h) {
-        unlock();
-        return; /* the task has not caught up with this surface yet */
-    }
-    if ((uint32_t)b->x + b->w > s.frame_w ||
-        (uint32_t)b->y + b->h > s.frame_h) {
         unlock();
         return;
+    }
+    if ((uint32_t)b->x + b->w > b->surf_w ||
+        (uint32_t)b->y + b->h > b->surf_h) {
+        unlock();
+        return;
+    }
+    if (s.frame_w != b->surf_w || s.frame_h != b->surf_h) {
+        /* A new surface in a buffer that already fits it: take the geometry,
+         * and owe the client a fresh 'M' and a whole screen. */
+        s.frame_w = b->surf_w;
+        s.frame_h = b->surf_h;
+        s.dx0 = 0;
+        s.dy0 = 0;
+        s.dx1 = 0;
+        s.dy1 = 0;
+        s.owe_everything = true;
     }
 
     const uint8_t *src = (const uint8_t *)b->px;
     for (uint32_t r = 0; r < b->h; r++) {
-        memcpy(s.frame + (size_t)(b->y + r) * s.frame_w + b->x,
+        memcpy(s.frame + (size_t)(b->y + r) * s.cap_w + b->x,
                src + (size_t)r * b->stride, (size_t)b->w * sizeof(uint16_t));
     }
 
@@ -1428,6 +1474,44 @@ ag_err_t ag_driver_init(void)
     }
 
     s.publish_text = want_text();
+
+    /*
+     * The frame, here and not on the first blit.
+     *
+     * Allocating on the first blit meant dropping it, and an application that
+     * paints once and waits then had a black screen on the phone for ever -
+     * measured as gfxdemo, 256000 pixels, all of them black.  Here there is no
+     * first blit to drop, and this runs on no process, so the memory comes off
+     * the system heap rather than out of whichever application happens to draw.
+     *
+     * The size is a guess that has to be at least right: [display] width and
+     * height when the operator set them, the console's own extent otherwise -
+     * a soft framebuffer sizes the console to fit, so 80x25 of 8x16 cells is
+     * exactly its 640x400 - and 640x400 when neither says anything.  A guess
+     * that comes out too small is not fatal: the task grows the buffer on the
+     * first blit that does not fit, at the cost of that one frame.
+     */
+    {
+        const ag_cfg_api_t *cfg = api->cfg;
+        uint32_t w = 0, h = 0;
+        if (cfg != NULL && AG_HAS(cfg, get_int)) {
+            w = (uint32_t)cfg->get_int("display.width", 0);
+            h = (uint32_t)cfg->get_int("display.height", 0);
+        }
+        if (w == 0u || h == 0u) {
+            w = (uint32_t)s.cols * s.cell_w;
+            h = (uint32_t)s.rows * s.cell_h;
+        }
+        if (w < 160u || h < 120u || w > 1024u || h > 768u) {
+            w = 640u;
+            h = 400u;
+        }
+        s.want_w = w;
+        s.want_h = h;
+        if (!ensure_memory()) {
+            return -AG_ENOMEM;
+        }
+    }
 
     ag_module_on_unload(phone_fini);
 

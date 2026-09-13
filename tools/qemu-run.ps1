@@ -29,6 +29,10 @@ param(
     # OpenEth + hostfwd (default on).  Windows connects to NetPort → guest.
     [switch]$NoNet,
     [int]$NetPort = 5558,
+    # Forward on 0.0.0.0 instead of 127.0.0.1, so another machine on the local
+    # network can reach the guest - a phone opening PHONE.SYS's page, for one.
+    # Off by default: these ports are unauthenticated ways into the guest.
+    [switch]$Lan,
     # Spawn pcmplay + kbdvirt + mousevirt (--reconnect) like hostfsd; kill with QEMU.
     [switch]$Virt,
     # A pre-built C: partition, merged into the flash image (tools\mksysfs.py).
@@ -53,8 +57,19 @@ $efuse = Initialize-EfuseFile
 $qemuArgs = Get-QemuMachineArgs -EfusePath $efuse -Graphics:$Gfx
 
 if (-not $NoNet) {
-    $qemuArgs += Get-QemuNetArgs -HostPort $NetPort -GuestPort $NetPort
-    Write-Host "Net: OpenEth hostfwd 127.0.0.1:$NetPort -> guest :$NetPort"
+    $qemuArgs += Get-QemuNetArgs -HostPort $NetPort -GuestPort $NetPort -Lan:$Lan
+    if ($Lan) {
+        $lanIp = (Get-NetIPAddress -AddressFamily IPv4 |
+                  Where-Object { $_.IPAddress -notlike '127.*' -and
+                                 $_.IPAddress -notlike '169.254.*' -and
+                                 $_.InterfaceAlias -notlike '*WSL*' } |
+                  Select-Object -First 1).IPAddress
+        Write-Host "Net: OpenEth hostfwd 0.0.0.0:$NetPort -> guest :$NetPort"
+        Write-Host "Net: the phone opens  http://${lanIp}:8765/  (PHONE.SYS)"
+        Write-Host "Net: needs a firewall hole - see docs/plans/phone.md"
+    } else {
+        Write-Host "Net: OpenEth hostfwd 127.0.0.1:$NetPort -> guest :$NetPort"
+    }
 }
 
 if ($Sd) {

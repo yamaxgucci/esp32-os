@@ -372,6 +372,8 @@ switch ($Command.ToLowerInvariant()) {
                 $runOpts['NoBuild'] = $true
             } elseif ($a -match '^(?i)-NoNet$') {
                 $runOpts['NoNet'] = $true
+            } elseif ($a -match '^(?i)-Lan$') {
+                $runOpts['Lan'] = $true
             } elseif ($a -match '^(?i)-NetPort$' -and ($i + 1) -lt $Rest.Count) {
                 $runOpts['NetPort'] = [int]$Rest[$i + 1]
                 $i++
