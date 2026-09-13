@@ -309,6 +309,10 @@ extern unsigned ag_script_load_us, ag_script_load_n, ag_script_load_worst;
 /* A timed script that took a tenth of a second or more, by name. */
 void ag_slow_script_note(const char *name, unsigned sid, unsigned ms);
 
+/* One art file read off the card: counted per fid, so the report can name
+ * the art that is read again and again - the art that belongs in flash. */
+void ag_reread_note(int fid, unsigned bytes);
+
 /* Where script time goes, by opcode (1024 of them, indexed by opcode &
  * 0x3FF).  Reported as the few that cost anything. */
 extern unsigned ag_op_us[1024], ag_op_n[1024], ag_op_worst[1024];

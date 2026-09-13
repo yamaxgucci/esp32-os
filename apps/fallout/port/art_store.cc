@@ -192,6 +192,7 @@ uint32_t s_touched_n, s_touched_kb;
  */
 uint32_t s_lost_full, s_lost_big, s_lost_closed, s_lost_dup;
 uint32_t s_dup_staged;   /* caught in the gathering buffer */
+uint32_t s_big_kind[16], s_big_n;   /* written on their own, by kind */
 uint32_t s_dup_index;    /* found in the index by the audit */
 
 /*
@@ -825,7 +826,53 @@ void ag_art_store_put_many(const ag_art_put_t *items, int count)
             index_insert(fid, base, (uint32_t)size);
         } else {
             if ((uint32_t)size > s_stage_cap) {
-                s_lost_big++;
+                /*
+                 * ARGON: too big to gather is not too big to keep.
+                 *
+                 * A picture larger than the gathering buffer used to be
+                 * dropped, so it was read off the card every single time -
+                 * and the ones that size are critter animations, exactly
+                 * the art whose miss costs most.  Maxim asked why anything
+                 * circles between RAM and the card while the store has room
+                 * to spare, and this is one of the two answers.  It goes
+                 * straight to flash instead, in its own visit.
+                 */
+                s_big_kind[((unsigned)fid >> 24) & 0x0Fu]++;
+                s_big_n++;
+
+                stage_flush();   /* keep what is gathered in order */
+
+                while (s_fill_at + (uint32_t)size > s_erased_to) {
+                    if (!erase_more()) {
+                        s_full = true;
+                        s_lost_full++;
+                        return;
+                    }
+                }
+
+                const uint32_t base = s_fill_at;
+
+                if (!write_through(base, items[i].data, (uint32_t)size)) {
+                    return;
+                }
+                s_write_batches++;
+                s_bytes_written += (uint32_t)size;
+                s_fill_at += (uint32_t)size;
+                index_insert(fid, base, (uint32_t)size);
+
+                {
+                    const unsigned kind = ((unsigned)fid >> 24) & 0x0Fu;
+
+                    if (s_filling) {
+                        s_kept_load++;
+                        s_kept_load_kind[kind]++;
+                        s_kb_load_kind[kind] += (uint32_t)size;
+                    } else {
+                        s_kept_play++;
+                        s_kept_play_kind[kind]++;
+                        s_kb_play_kind[kind] += (uint32_t)size;
+                    }
+                }
                 continue;
             }
             if (s_stage_len + (uint32_t)size > s_stage_cap
@@ -1088,13 +1135,32 @@ void ag_art_store_report(char *out, size_t cap)
      * which the board was stopped with its cache off, writing or erasing.
      */
     {
+        static const char *const kname[16] = {
+            "item", "critter", "scenery", "wall", "tile", "misc", "iface",
+            "inven", "head", "backgrnd", "skilldex", "11", "12", "13",
+            "14", "15"
+        };
+        char big_kinds[120];
+        int  bat = 0;
+
+        big_kinds[0] = '\0';
+        for (unsigned k = 0; k < 16u && bat < (int)sizeof(big_kinds) - 1;
+                k++) {
+            if (s_big_kind[k] != 0u) {
+                bat += snprintf(big_kinds + bat,
+                                sizeof(big_kinds) - (size_t)bat, " %s %u",
+                                kname[k], (unsigned)s_big_kind[k]);
+            }
+        }
+
         const size_t at = strlen(out);
 
         if (at + 1u < cap) {
             snprintf(out + at, cap - at,
                      " | this window: stopped %u ms writing and %u ms erasing"
                      " | %u of %u stored files ever asked for (%u of %u KB)"
-                     " | repeats: %u caught while gathering, %u in the index%s",
+                     " | repeats: %u caught while gathering, %u in the index%s"
+                     " | %u too big to gather, written alone:%s",
                      (unsigned)(s_win_write_us / 1000u),
                      (unsigned)(s_win_erase_us / 1000u),
                      (unsigned)s_touched_n, (unsigned)s_count,
@@ -1103,7 +1169,8 @@ void ag_art_store_report(char *out, size_t cap)
                      (unsigned)s_dup_staged,
                      (unsigned)(s_dup_index & 0xFFFFu),
                      ((s_dup_index & 0x10000u) != 0u)
-                         ? " AND OUT OF ORDER" : "");
+                         ? " AND OUT OF ORDER" : "",
+                     (unsigned)s_big_n, big_kinds);
         }
         s_win_write_us = 0;
         s_win_erase_us = 0;

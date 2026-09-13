@@ -1946,6 +1946,79 @@ static void path_report(void)
     ag_pf_slot_us = 0; ag_pf_slot_n = 0;
 }
 
+/*
+ * ARGON: the art that keeps being read off the card.
+ *
+ * A small table, keyed by fid, counting reads.  Anything with more than
+ * one read was evicted and fetched again - and if it is not in the store,
+ * the store is holding the wrong things.
+ */
+#define AG_REREAD_MAX 384
+
+static struct { int fid; unsigned reads, kb; } s_reread[AG_REREAD_MAX];
+static unsigned s_reread_n, s_reread_lost;
+
+extern "C" void ag_reread_note(int fid, unsigned bytes)
+{
+    /* Not while a map is loading: everything is read then, once, and that
+     * is the store being filled rather than art going round in circles. */
+    if (ag_map_loading != 0u) {
+        return;
+    }
+
+    for (unsigned i = 0; i < s_reread_n; i++) {
+        if (s_reread[i].fid == fid) {
+            s_reread[i].reads++;
+            return;
+        }
+    }
+    if (s_reread_n >= AG_REREAD_MAX) {
+        s_reread_lost++;
+        return;
+    }
+    s_reread[s_reread_n].fid = fid;
+    s_reread[s_reread_n].reads = 1;
+    s_reread[s_reread_n].kb = bytes / 1024u;
+    s_reread_n++;
+}
+
+static void reread_report(void)
+{
+    static const char *const kind[16] = {
+        "item", "critter", "scenery", "wall", "tile", "misc", "iface",
+        "inven", "head", "backgrnd", "skilldex", "11", "12", "13", "14", "15"
+    };
+    unsigned again = 0, again_kb = 0, once = 0, once_kb = 0;
+    unsigned by_kind[16] = { 0 };
+    char     line[360];
+    int      at = 0;
+
+    for (unsigned i = 0; i < s_reread_n; i++) {
+        if (s_reread[i].reads > 1u) {
+            again++;
+            again_kb += s_reread[i].kb * (s_reread[i].reads - 1u);
+            by_kind[((unsigned)s_reread[i].fid >> 24) & 15u]++;
+        } else {
+            once++;
+            once_kb += s_reread[i].kb;
+        }
+    }
+    if (s_reread_n == 0u) {
+        return;
+    }
+    for (unsigned k = 0; k < 16u && at < (int)sizeof(line) - 1; k++) {
+        if (by_kind[k] != 0u) {
+            at += snprintf(line + at, sizeof(line) - (size_t)at, " %s %u",
+                           kind[k], by_kind[k]);
+        }
+    }
+    shim_printf("[reread t=%u] IN PLAY %u files off the card: %u once "
+                "(%u KB), %u more than once (%u KB wasted) | read again, "
+                "by kind:%s | %u files did not fit the table\n",
+                (unsigned)ag_millis(), s_reread_n, once, once_kb, again,
+                again_kb, line, s_reread_lost);
+}
+
 static void op_report(void)
 {
     unsigned best[5] = { 0, 0, 0, 0, 0 };
@@ -2379,6 +2452,7 @@ static void memstat_service(void)
      * three new reports appeared to print nothing at all.  These are the
      * ones worth reading, so they go where they will still be on it.
      */
+    reread_report();
     path_report();
     op_report();
     metric_report();
