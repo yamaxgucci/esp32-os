@@ -316,6 +316,38 @@ static bool ws_send(uint8_t op, const void *payload, uint32_t len)
     return true;
 }
 
+/*
+ * Say goodbye before hanging up, when there is something to say.
+ *
+ * One client at a time is the rule here - there is one screen and one keyboard,
+ * and two people typing into them is not a feature - so a second browser takes
+ * the link off the first.  Closing the socket without a word makes that look
+ * like a fault: the page that lost it reconnects, takes the link back, and the
+ * two spin against each other about once a second for ever.  Reported as
+ * "reconnecting every two seconds", and it was two browsers being polite to
+ * each other.
+ *
+ * A WebSocket close carries a code and a reason, so the one being replaced is
+ * told why and stops trying.  Best effort: the frame goes out with a short
+ * deadline and the socket closes whether or not it got there.
+ */
+static void ws_close(const char *reason)
+{
+    if (s.conn < 0 || reason == NULL) {
+        return;
+    }
+    const uint32_t n = (uint32_t)strlen(reason);
+    if (n > 100u) {
+        return;
+    }
+    uint8_t buf[128];
+    const uint32_t k = ag_ws_hdr_build(buf, AG_WS_CLOSE, n + 2u, true);
+    buf[k] = 0x03u; /* 1000, a normal closure */
+    buf[k + 1u] = 0xe8u;
+    memcpy(buf + k + 2u, reason, n);
+    (void)send_all(s.conn, buf, k + 2u + n, 200u);
+}
+
 static void drop_conn(const char *why)
 {
     if (s.conn >= 0) {
@@ -888,6 +920,7 @@ static bool serve_request(ag_handle_t h)
             return false;
         }
 
+        ws_close("replaced");
         drop_conn("replaced");
         s.conn = h;
         s.owe_everything = true;
