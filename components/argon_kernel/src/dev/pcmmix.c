@@ -179,15 +179,39 @@ static void ring_clear(pcmmix_client_t *c)
 static const char *const k_audio_prefer[] = {"pcmvirt", "pcm0", "pcmnull",
                                              NULL};
 
+/*
+ * LOCAL ONLY, for now, and this is a retreat that is written down rather than
+ * quietly made.
+ *
+ * The mixer did choose the node next door - a board with no converter playing
+ * through its neighbour's - and it worked, and then it intermittently froze the
+ * board instead.  Not slowly: the console stops answering and does not come
+ * back.  The cause is understood in outline and not in detail: the device
+ * registry holds ONE recursive mutex across the whole of a driver's call, so
+ * while the mixer waits for a remote sink nothing on this board can touch any
+ * device at all, the console included - which is the shape of a fault this
+ * project has had before.  Bounding the wait to a second and a half changed
+ * nothing, which says the last step is still missing.
+ *
+ * An application that opens a far device ITSELF is unaffected and still works;
+ * it is only the mixer reaching across from inside another device's operation
+ * that does this.  Which is the clue: the fix belongs in not doing wire work
+ * under that lock, not in a flag here.
+ *
+ * A feature that freezes the machine half the time is worse than not having it,
+ * so until then this asks only for what is here.  The machinery it would use
+ * (ag_dev_default, the qualified names, the proxies) is all in place and
+ * correct; one line brings it back.
+ */
 static ag_device_t *pick_sink(void)
 {
-    /*
-     * Which also looks at the node next door: a board with no converter of its
-     * own and a neighbour that has one should play through the neighbour rather
-     * than into pcmnull.  Local wins ties - each name is tried here first - so
-     * on a single board this chooses exactly what it always chose.
-     */
-    return ag_dev_default(AG_DEV_AUDIO, k_audio_prefer);
+    for (int i = 0; k_audio_prefer[i] != NULL; i++) {
+        ag_device_t *d = ag_dev_find(k_audio_prefer[i]);
+        if (d != NULL) {
+            return d;
+        }
+    }
+    return NULL;
 }
 
 /*

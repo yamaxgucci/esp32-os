@@ -83,13 +83,18 @@ int ag_main(int argc, char **argv)
     uint32_t total = 0;
     for (uint32_t i = 0; i < times; i++) {
         /*
-         * Before each write, not after.  A device that never returns is a
-         * different fault from one that returns an error, and the two are
-         * indistinguishable from a program that only reports at the end -
-         * which is how a hang on the sixth write of twelve looked like a hang
-         * at the start.
+         * Before each write, not after: a device that never returns is a
+         * different fault from one that returns an error, and a program that
+         * only reports at the end cannot tell them apart - which is how a hang
+         * on the sixth write of twelve looked like a hang at the start.
+         *
+         * Every eighth, though, not every one.  The journal is a four-kilobyte
+         * RING: forty of these overwrote the very line they were printed to
+         * help find, and the run then failed for want of evidence it had
+         * itself destroyed.  Enough to locate a stop, few enough to leave room
+         * for what stopped.
          */
-        if (times > 1u) {
+        if (times > 1u && (i % 8u) == 0u) {
             ag_printf("devpoke: write %u\n", (unsigned)(i + 1u));
         }
         const int32_t n = ag_dev_write(h, buf, want);

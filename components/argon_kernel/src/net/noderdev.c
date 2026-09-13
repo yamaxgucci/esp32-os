@@ -113,7 +113,10 @@ static ag_err_t send_raw(uint8_t op, uint16_t tag, uint32_t h, uint32_t a,
     if (plen > 0 && pay != NULL) {
         memcpy(buf + RD_HDR, pay, plen);
     }
-    for (int t = 0; t < 2000; t++) {
+    /* Bounded short, and for the same reason as the wait in ask(): this runs
+     * with the registry's one device lock held, so a full window must cost a
+     * pause and not the machine. */
+    for (int t = 0; t < 200; t++) {
         const int32_t r =
             ag_linkprov_send(RD_CHAN, cls, buf, (uint16_t)(RD_HDR + plen));
         if (r >= 0) {
@@ -139,7 +142,9 @@ static int32_t ask(uint8_t op, uint32_t h, uint32_t a, uint32_t b, uint8_t cls,
         return -AG_EBUSY;
     }
 
-    const int64_t give_up = ag_port_us() + 4000000;
+    /* Same reason as the deadline below: this waits with the one device lock
+     * held, so it may not wait long. */
+    const int64_t give_up = ag_port_us() + 1000000;
     while (s_busy) {
         if (ag_port_us() >= give_up) {
             return -AG_ETIMEDOUT;
@@ -156,7 +161,23 @@ static int32_t ask(uint8_t op, uint32_t h, uint32_t a, uint32_t b, uint8_t cls,
 
     int32_t rc = (int32_t)send_raw(op, s_tag, h, a, b, cls, pay, plen);
     if (rc == AG_OK) {
-        const int64_t deadline = ag_port_us() + 15000000;
+        /*
+         * SHORT, and the reason is not the wire.
+         *
+         * Every one of these calls arrives through the device registry, which
+         * holds ONE recursive mutex across the whole of a driver's call - so
+         * for as long as this waits, no other task on this board can touch any
+         * device at all.  Including the console: a blocking audio write holding
+         * that lock is what once ate the picture on this project, and fifteen
+         * seconds of it is not a latency, it is a freeze that looks like a
+         * crash.  The round trip measures three milliseconds; a second and a
+         * half is a wide margin for an answer and a short one for a freeze.
+         *
+         * A call that does time out returns an error, which the caller can act
+         * on.  The alternative - waiting patiently - takes the whole machine
+         * down with it.
+         */
+        const int64_t deadline = ag_port_us() + 1500000;
         rc = -AG_ETIMEDOUT;
         while (ag_port_us() < deadline) {
             if (s_have) {

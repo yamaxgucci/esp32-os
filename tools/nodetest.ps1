@@ -717,7 +717,10 @@ if ($Scenario -eq 'link' -or $Scenario -eq 'both') {
                  # and while an application owns the console the kernel log does
                  # not reach it.  The line was always written; looking for it on
                  # the screen was looking in the wrong place.
-                 'log -n 40',
+                 # The journal is a four-kilobyte RING and it wraps: ask for
+                 # plenty, and keep what runs before this quiet enough that the
+                 # line being looked for is still in it.
+                 'log -n 80',
                  '=log')
 
     $a = Transcript 'build\nodetest-share-a.log'
@@ -730,10 +733,20 @@ if ($Scenario -eq 'link' -or $Scenario -eq 'both') {
     Check $a 'sound.pcmvirt is open' 'rdev-opened-a-device-that-is-not-here'
     Check $a '64 of 64 bytes taken' 'rdev-wrote-through-the-wire'
 
-    # The class default, which is the part an application never sees: nothing
-    # asked for `sound.pcmvirt` here.  Into pcmnull would have been silence
-    # that reported success.
-    Check $a 'sink /dev/sound.pcmvirt' 'default-sound-left-through-the-neighbour'
+    # The class default, asking only for what is HERE - which is a retreat, and
+    # the test says so rather than being deleted.
+    #
+    # The mixer did choose the neighbour's converter, and then intermittently
+    # froze the board doing it: the registry holds one mutex across a driver's
+    # whole call, so waiting for a far device stops every task on this board
+    # from touching any device, console included.  See pick_sink() in pcmmix.c.
+    # An application opening a far device itself is unaffected and is checked
+    # above; it is the mixer reaching across from inside another device's
+    # operation that does this.
+    #
+    # So today the sound goes into pcmnull, and this asserts that rather than
+    # pretending: a board that cannot make a noise makes none.
+    Check $a 'sink /dev/pcmnull' 'default-sound-stays-local-for-now'
 
     # One `ps` for the system.  IDLE runs on the other board and has never been
     # on this one, so a row for it here crossed the wire.
