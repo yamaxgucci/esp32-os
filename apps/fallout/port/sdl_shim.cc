@@ -1955,7 +1955,8 @@ static void path_report(void)
  */
 #define AG_REREAD_MAX 384
 
-static struct { int fid; unsigned reads, kb; } s_reread[AG_REREAD_MAX];
+static struct { int fid; unsigned reads, kb; bool stored; }
+    s_reread[AG_REREAD_MAX];
 static unsigned s_reread_n, s_reread_lost;
 
 extern "C" void ag_reread_note(int fid, unsigned bytes)
@@ -1979,6 +1980,13 @@ extern "C" void ag_reread_note(int fid, unsigned bytes)
     s_reread[s_reread_n].fid = fid;
     s_reread[s_reread_n].reads = 1;
     s_reread[s_reread_n].kb = bytes / 1024u;
+    /*
+     * ARGON: and WHY the store did not serve it.  Two different faults
+     * wear the same face - the picture is not in the store at all, or it
+     * is there and the store refuses to hand it out (the kinds the engine
+     * draws into).  Maxim asked which; this answers it.
+     */
+    s_reread[s_reread_n].stored = (ag_art_store_size(fid) > 0);
     s_reread_n++;
 }
 
@@ -1993,11 +2001,16 @@ static void reread_report(void)
     char     line[360];
     int      at = 0;
 
+    unsigned again_in_store = 0;
+
     for (unsigned i = 0; i < s_reread_n; i++) {
         if (s_reread[i].reads > 1u) {
             again++;
             again_kb += s_reread[i].kb * (s_reread[i].reads - 1u);
             by_kind[((unsigned)s_reread[i].fid >> 24) & 15u]++;
+            if (s_reread[i].stored) {
+                again_in_store++;
+            }
         } else {
             once++;
             once_kb += s_reread[i].kb;
@@ -2014,9 +2027,9 @@ static void reread_report(void)
     }
     shim_printf("[reread t=%u] IN PLAY %u files off the card: %u once "
                 "(%u KB), %u more than once (%u KB wasted) | read again, "
-                "by kind:%s | %u files did not fit the table\n",
+                "by kind:%s (%u of them WERE in the store and it refused to hand them out) | %u files did not fit the table\n",
                 (unsigned)ag_millis(), s_reread_n, once, once_kb, again,
-                again_kb, line, s_reread_lost);
+                again_kb, line, again_in_store, s_reread_lost);
 }
 
 static void op_report(void)

@@ -770,6 +770,21 @@ void ag_art_store_put_many(const ag_art_put_t *items, int count)
         if (items[i].data == nullptr || size <= 0) {
             continue;
         }
+        /*
+         * ARGON: do not store what can never be handed out.
+         *
+         * Interface art, heads, inventory and skilldex are refused on the
+         * read path because the engine draws into them and flash cannot be
+         * written - so putting them in costs the write and the space and
+         * returns nothing, ever.  Measured: 331 KB of interface art per
+         * session, about a second and a half of writing, for pictures that
+         * are read off the card every time regardless.
+         */
+        if (!in_place_allowed(fid)) {
+            s_lost_closed++;
+            continue;
+        }
+
         if (find(fid) != nullptr) {
             continue;
         }
