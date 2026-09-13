@@ -170,9 +170,21 @@ extern "C" {
  *      worktree-usb-kvm calls its 0.45.  Whichever of those lands next has
  *      to RENUMBER rather than assume its number is free - and the check is
  *      one line: `git show <branch>:sdk/include/argon/abi.h | grep MINOR`.
+ * 0.48 sys->module_task: a task that belongs to a loadable driver rather than
+ *      to a process, so a driver can do work that takes milliseconds without
+ *      charging it to whoever called in.  Until this, every driver was a
+ *      collection of callbacks on the caller's thread, and a screen at the end
+ *      of a wire made the game that drew a frame wait for the frame to go out.
+ *      The module owns the task and unload waits for it.
+ *
+ *      This is the renumbering the paragraph above asks for: the work is
+ *      commit 2ec139a on `worktree-fallout-cxx`, where it was written as 0.43
+ *      and board-verified in that shape, and 0.43 was spoken for here by
+ *      ag_net_ops_t before it could land.  Nothing about it changed but the
+ *      number.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 47u
+#define AG_ABI_MINOR 48u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -297,6 +309,38 @@ typedef struct ag_sys_api {
      * already has something in it.
      */
     int32_t (*prompt_in_slot)(int slot, const char *cwd);
+
+    /*
+     * ABI 0.48: during ag_driver_init only — a task of the module's own.
+     *
+     * task->create is the application's, and it refuses a caller with no
+     * process: a thread belongs to a process and dies with it, and a driver has
+     * no process to belong to.  So every driver in this system has been a
+     * collection of callbacks running on whoever called in - which is right for
+     * a register write and wrong for anything that takes milliseconds.  A
+     * screen at the end of a serial wire is the case that forced this: three
+     * hundred milliseconds of a frame going out, charged to the game that drew
+     * it, when the wire could just as well be fed from a task of its own.  A
+     * screen at the end of a network is the same case again, with an accept()
+     * and an HTTP request in it.
+     *
+     * The module owns it.  Unload calls the module_on_unload hook first - which
+     * is where the driver tells its task to stop - and then waits for the task
+     * to return before the image is unmapped, because unmapping code a task is
+     * still inside is a fault that names the wrong culprit.  A task that will
+     * not return refuses the unload rather than taking the machine down.
+     *
+     * The task must therefore watch a flag and return.  Do not call exit.
+     *
+     * `flags` is ag_thread_flags, the same three an application's thread gets,
+     * and the choice is not cosmetic: the foreground application is pinned to
+     * the app core, so a driver doing real work there is a second runnable task
+     * on the one core already busy.  A driver that takes milliseconds asks for
+     * AG_THREAD_SYS_CORE.  `priority` at 5 or below cannot starve an
+     * application; above that it can, and nothing in this build says so.
+     */
+    bool (*module_task)(void (*fn)(void *), void *arg, const char *name,
+                        uint32_t stack, int priority, uint32_t flags);
 } ag_sys_api_t;
 
 /* ------------------------------------------------------------------------ */
@@ -877,9 +921,12 @@ typedef struct ag_gfx_api {
  * Class vtable for AG_DEV_INPUT devices that have to be asked (ABI 0.28).
  *
  * A touchscreen on a slow bus does not interrupt with an event; it holds a
- * voltage, and somebody has to read it.  Doing that from the driver would need
- * a task inside a loadable module - the one thing a .SYS has no way to own -
- * so the kernel asks instead, from the console tick it already runs.
+ * voltage, and somebody has to read it.  So the kernel asks, from the console
+ * tick it already runs, rather than each such driver keeping a task to sleep
+ * and wake on a clock.  (When this was written a .SYS had no way to own a task
+ * at all; since 0.48 it has - sys->module_task - and that is the right answer
+ * for a driver whose work takes milliseconds.  A device that only needs looking
+ * at ten times a second is still better served here.)
  *
  * poll() fills at most `max` events and returns how many, or a negative error.
  * Zero is the normal answer and must be cheap: it is called ten times a second

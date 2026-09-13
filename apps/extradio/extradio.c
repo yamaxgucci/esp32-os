@@ -18,8 +18,10 @@
  *
  * NO BACKGROUND TASK.  A .SYS runs its ag_driver_init in kernel context, where
  * there is no current process, so api->task->create refuses it (a thread must
- * belong to a process that can be made to end).  This is the same bind HostFS
- * is in, and the same answer: pump the UART inline.  Every RLINK frame the
+ * belong to a process that can be made to end).  Since ABI 0.48 there is
+ * sys->module_task, which is a task the *module* owns and unload waits for -
+ * this file does not use it, and the answer here is the same one HostFS gives:
+ * pump the UART inline.  Every RLINK frame the
  * coprocessor sends - the reply to a request, or an unsolicited DATA/EVENT push
  * - is read by whichever call happens to be touching the wire.  rpc() reads
  * frames until its own reply arrives, buffering any pushes it passes on the way;

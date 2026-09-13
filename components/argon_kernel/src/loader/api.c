@@ -131,6 +131,12 @@ static void api_module_on_unload(void (*fn)(void))
     ag_module_on_unload(fn);
 }
 
+static bool api_module_task(void (*fn)(void *), void *arg, const char *name,
+                            uint32_t stack, int priority, uint32_t flags)
+{
+    return ag_module_task(fn, arg, name, stack, priority, flags);
+}
+
 /* Defined below, next to the other session-facing calls. */
 static int32_t api_prompt_in_slot(int slot, const char *cwd);
 
@@ -146,6 +152,7 @@ static const ag_sys_api_t k_sys = {
     .heartbeat = api_heartbeat,
     .module_on_unload = api_module_on_unload,
     .prompt_in_slot = api_prompt_in_slot,
+    .module_task = api_module_task,
 };
 
 /* ---------------------------------------------------------------------- */

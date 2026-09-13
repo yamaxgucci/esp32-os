@@ -10,20 +10,40 @@
 
 #include <argon/cfg.h>
 #include <argon/device.h>
+#include <argon/kernel.h>
 #include <argon/log.h>
 #include <argon/path.h>
 #include <argon/probe.h>
+#include <argon/port/task.h>
 
 #include "core/sysconfig.h"
 
 typedef void (*ag_module_fini_fn)(void);
 
+/*
+ * Two tasks per module, which is one more than anything needs today and a
+ * bound rather than a list that grows - the same reasoning as AG_MODULE_MAX
+ * above it.
+ */
+#define AG_MODULE_TASKS 2
+
+typedef struct module_s module_t;
+
 typedef struct {
+    module_t       *owner;
+    void          (*fn)(void *);
+    void           *arg;
+    ag_port_task_t  task;
+    volatile bool   running;
+} modtask_t;
+
+struct module_s {
     bool             used;
     char             path[AG_PATH_MAX];
     ag_loaded_app_t  app;
     ag_module_fini_fn fini;
-} module_t;
+    modtask_t        tasks[AG_MODULE_TASKS];
+};
 
 static module_t               s_modules[AG_MODULE_MAX];
 static module_t              *s_loading;
@@ -41,6 +61,122 @@ void ag_module_on_unload(void (*fn)(void))
         return;
     }
     s_loading->fini = fn;
+}
+
+/*
+ * The task the module asked for, wrapped so that the module can be told when it
+ * has really gone.
+ *
+ * `running` is cleared here and not by the caller, because the only moment at
+ * which it is true that the task is no longer inside the module's code is after
+ * that code has returned - and the task deletes itself on the next line, which
+ * is a place the module's code cannot reach.
+ */
+static void module_task_entry(void *arg)
+{
+    modtask_t *t = (modtask_t *)arg;
+
+    t->fn(t->arg);
+    t->running = false;
+    ag_port_task_delete(NULL);
+}
+
+bool ag_module_task(void (*fn)(void *), void *arg, const char *name,
+                    uint32_t stack, int priority, uint32_t flags)
+{
+    if (fn == NULL) {
+        return false;
+    }
+    if (s_loading == NULL) {
+        ag_log(AG_LOG_WARN, "modules",
+               "ag_module_task outside ag_driver_init — ignored");
+        return false;
+    }
+
+    modtask_t *slot = NULL;
+    for (uint32_t i = 0; i < AG_MODULE_TASKS; i++) {
+        if (!s_loading->tasks[i].running) {
+            slot = &s_loading->tasks[i];
+            break;
+        }
+    }
+    if (slot == NULL) {
+        ag_log(AG_LOG_WARN, "modules", "%s already has %u tasks",
+               s_loading->app.header.name, (unsigned)AG_MODULE_TASKS);
+        return false;
+    }
+
+    if (stack < 2048u) {
+        stack = 2048u;
+    }
+    slot->owner = s_loading;
+    slot->fn = fn;
+    slot->arg = arg;
+    slot->task = NULL;
+    /* Marked before it exists, for the same reason the process layer does it:
+     * a task that starts running before it is written down is a task the
+     * module might not be waiting for. */
+    slot->running = true;
+
+    /*
+     * The core, from the same flags an application's thread uses.  It matters:
+     * the foreground application is pinned to the app core, so a driver doing
+     * real work there is a second runnable task on the one core that is already
+     * busy - which cost the game half its frame rate before the screen driver
+     * asked for the system core instead.
+     *
+     * AG_THREAD_APP_CORE is zero, so "put me on the application core" and "no
+     * flags at all" arrive here identically, and both must pin: an earlier
+     * version let them fall through to no affinity, and every measurement taken
+     * on the strength of that request was measuring an unknown core.
+     */
+    int core;
+    if (flags & AG_THREAD_ANY_CORE) {
+        core = AG_PORT_ANY_CORE;
+    } else if (flags & AG_THREAD_SYS_CORE) {
+        core = 0;
+    } else {
+        core = (int)ag_sysinfo()->app_core;
+    }
+
+    if (!ag_port_task_create(module_task_entry,
+                             (name != NULL) ? name : "moddrv", stack, slot,
+                             (unsigned)((priority > 0) ? priority : 5),
+                             core, 0, &slot->task)) {
+        slot->running = false;
+        ag_log(AG_LOG_WARN, "modules", "no memory for a %u byte task stack",
+               (unsigned)stack);
+        return false;
+    }
+    /*
+     * What is deliberately not here: the thread budget that watches a driver
+     * task asking for a priority above the applications and drops it below them
+     * when it overruns.  That lives on `worktree-fallout-cxx` with argon/budget.h
+     * and has not landed here; until it does, a driver above priority 5 can
+     * starve the foreground application and nothing will say so.
+     */
+    return true;
+}
+
+/*
+ * How long to wait for a module's tasks after telling them to stop.
+ *
+ * Generous on purpose: the thing a driver task is most likely to be doing when
+ * asked to stop is a write to a wire, and a band of pixels at four megabaud is
+ * six milliseconds.  Half a second is eighty of those, and an unload that takes
+ * half a second is a nuisance where an unload that unmaps running code is a
+ * crash somewhere else entirely.
+ */
+#define MODULE_TASK_WAIT_MS 500u
+
+static bool tasks_stopped(module_t *m)
+{
+    for (uint32_t i = 0; i < AG_MODULE_TASKS; i++) {
+        if (m->tasks[i].running) {
+            return false;
+        }
+    }
+    return true;
 }
 
 static void set_string_path(char *dst, size_t dst_len, const char *src)
@@ -84,16 +220,38 @@ static module_t *alloc_slot(void)
     return NULL;
 }
 
-static void drop_module(module_t *m)
+static bool drop_module(module_t *m)
 {
     if (m == NULL || !m->used) {
-        return;
+        return true;
     }
     /* While the image is still mapped: close net listens etc. */
     if (m->fini != NULL) {
         ag_module_fini_fn fini = m->fini;
         m->fini = NULL;
         fini();
+    }
+
+    /*
+     * And then wait for the module's own tasks, which the hook above has just
+     * been told to stop.  The hook is where a driver sets its flag; this is
+     * where the flag is honoured, because a task still inside the image when
+     * the image is unmapped is not an error anybody can catch - it is a jump
+     * into memory that has been handed back.
+     */
+    if (!tasks_stopped(m)) {
+        for (uint32_t waited = 0; waited < MODULE_TASK_WAIT_MS; waited += 10u) {
+            ag_port_task_delay(ag_port_ms_to_ticks(10));
+            if (tasks_stopped(m)) {
+                break;
+            }
+        }
+    }
+    if (!tasks_stopped(m)) {
+        ag_log(AG_LOG_ERROR, "modules",
+               "%s: a task of its own has not stopped; keeping the image",
+               m->app.header.name);
+        return false;
     }
 
     /*
@@ -111,6 +269,7 @@ static void drop_module(module_t *m)
     ag_loader_unload(&m->app);
     memset(m, 0, sizeof(*m));
     ag_dev_lock_release();
+    return true;
 }
 
 ag_err_t ag_module_load_hinted(const char *path, const char *cwd,
@@ -161,7 +320,10 @@ ag_err_t ag_module_load_hinted(const char *path, const char *cwd,
         if (existing != NULL) {
             ag_log(AG_LOG_INFO, "modules", "replacing %s (%s → %s)", name,
                    existing->path, path);
-            drop_module(existing);
+            if (!drop_module(existing)) {
+                ag_loader_unload(&slot->app);
+                return -AG_EBUSY;
+            }
         }
     }
 
@@ -185,7 +347,7 @@ ag_err_t ag_module_load_hinted(const char *path, const char *cwd,
     if (err != AG_OK) {
         ag_log(AG_LOG_ERROR, "modules", "%s: ag_driver_init returned %d", name,
                (int)err);
-        drop_module(slot);
+        (void)drop_module(slot);
         return err;
     }
 
@@ -207,7 +369,9 @@ ag_err_t ag_module_unload(const char *name)
     }
 
     ag_log(AG_LOG_INFO, "modules", "unloading %s", m->app.header.name);
-    drop_module(m);
+    if (!drop_module(m)) {
+        return -AG_EBUSY;
+    }
     return AG_OK;
 }
 

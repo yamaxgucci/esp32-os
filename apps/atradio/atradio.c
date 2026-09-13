@@ -15,8 +15,10 @@
  *       --include sdk/include --include apps/common --include apps/common/atproto \
  *       -o build\apps\ATRADIO.SYS apps/atradio/atradio.c apps/common/atproto/ag_atproto.c
  *
- * NO BACKGROUND TASK: a .SYS ag_driver_init runs in kernel context with no
- * process, so api->task->create refuses it.  The UART is pumped inline, the
+ * NO BACKGROUND TASK, by choice rather than by force.  api->task->create is the
+ * application's and refuses a caller with no process, which a .SYS
+ * ag_driver_init is; sys->module_task (ABI 0.48) is the driver's own way to one
+ * and this file does not use it.  The UART is pumped inline, the
  * HostFS/EXTRADIO model - every op that must read drives the wire itself.
  *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later

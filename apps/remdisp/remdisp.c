@@ -240,7 +240,9 @@ static bool prev_ready(uint32_t w, uint32_t h)
  * the first connection.
  *
  * Polled rather than waited for, with a zero timeout, from the two callbacks
- * the kernel already makes often.  A driver cannot own a task.
+ * the kernel already makes often.  This version of the file has no task of its
+ * own - it predates sys->module_task (ABI 0.48), and the asynchronous rework
+ * that uses one lives on `worktree-fallout-cxx` (commit 2ec139a).
  *
  * Which leaves one case out, and it is worth naming rather than discovering:
  * while an application holds the display the kernel stops calling text_cursor,
@@ -253,8 +255,8 @@ static bool prev_ready(uint32_t w, uint32_t h)
  * repairs itself through the sweep below - so the fix is not made here.  What
  * it would be: register a second device of class AG_DEV_INPUT whose poll()
  * returns no events and services this instead.  The kernel calls that ten
- * times a second regardless of who owns the screen, and it exists precisely
- * because a loadable driver cannot own a task.
+ * times a second regardless of who owns the screen.  (The other answer, since
+ * ABI 0.48: ask for a task with sys->module_task and read the wire in it.)
  */
 #define FR_HELLO 'H'
 

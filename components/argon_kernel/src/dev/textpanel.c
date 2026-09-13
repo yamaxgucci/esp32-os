@@ -57,8 +57,14 @@ static const ag_display_ops_t *panel_ops(ag_device_t **out_dev)
  * Input devices that have to be asked rather than waited for.
  *
  * Here rather than in a file of its own because it is the same three lines of
- * registry walk as the panel above, on the same tick, for the same reason: a
- * loadable driver cannot own a task, so the kernel does the asking.
+ * registry walk as the panel above, on the same tick, for the same reason: the
+ * driver has nothing of its own that wakes up, so the kernel does the asking.
+ *
+ * Not because it *cannot* have one - it can, since ABI 0.48 and
+ * sys->module_task - but because a touch controller wants reading on a clock
+ * and a clock is exactly what this tick is.  A task per polled device would be
+ * a stack apiece for the same ten calls a second.  A driver with work that
+ * takes milliseconds is the other case, and that one asks for a task.
  */
 void ag_inputpoll_tick(void)
 {

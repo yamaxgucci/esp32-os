@@ -356,8 +356,10 @@ static const ag_dev_ops_t k_ops = {
 /*
  * The kernel's service tick (ABI 0.28), and what it is for here.
  *
- * A driver on this system has no thread, so being called is the only chance it
- * gets to look at its socket.  Until this existed the only call that ever came
+ * This driver has no thread of its own - it could ask for one (sys->module_task,
+ * ABI 0.48) and does not, because looking at a socket ten times a second is
+ * exactly what this tick is for - so being called is the only chance it gets to
+ * look at its socket.  Until this existed the only call that ever came
  * was read(), which meant an application had to open /dev/mouse0 and read it
  * every frame *even though the events arrive through ag_poll_event* - and one
  * that did not, having no reason to think a pointer needed opening, saw a

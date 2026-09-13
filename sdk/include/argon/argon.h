@@ -108,6 +108,25 @@ static inline void ag_module_on_unload(void (*fn)(void))
     }
 }
 
+/*
+ * ABI 0.48: a task that belongs to this module, from ag_driver_init only.
+ *
+ * For the work a driver cannot do on the caller's thread - a wire that takes
+ * milliseconds, a socket that has to be accepted, a sensor that has to be read
+ * on a clock.  Tell it to stop from the ag_module_on_unload hook and let it
+ * return; unload waits for it, and a task that does not return keeps the image
+ * loaded rather than being executed out of freed memory.
+ */
+static inline bool ag_module_task(void (*fn)(void *), void *arg,
+                                  const char *name, uint32_t stack,
+                                  int priority, uint32_t flags)
+{
+    if (!AG_HAS(g_ag_api->sys, module_task)) {
+        return false;
+    }
+    return g_ag_api->sys->module_task(fn, arg, name, stack, priority, flags);
+}
+
 #define ag_log(lvl, tag, ...) (g_ag_api->sys->log((lvl), (tag), __VA_ARGS__))
 
 /* ---- memory ------------------------------------------------------------- */

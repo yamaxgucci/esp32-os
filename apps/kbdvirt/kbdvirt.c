@@ -342,8 +342,9 @@ static const ag_dev_ops_t k_ops = {
 
 /*
  * The kernel's service tick (ABI 0.28).  See the long note over mouse_poll in
- * apps/mousevirt/mousevirt.c: a driver here has no thread, and without this
- * the only service it ever got was an application reading the device - which
+ * apps/mousevirt/mousevirt.c: this driver keeps no thread of its own (it could,
+ * since ABI 0.48), and without this tick the only service it ever got was an
+ * application reading the device - which
  * an application taking its keys from ag_poll_event has no reason to do.
  *
  * No events are returned: they are injected from the pump, already decoded.
