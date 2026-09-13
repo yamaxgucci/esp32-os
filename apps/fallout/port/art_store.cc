@@ -8,6 +8,9 @@
 #include <argon/abi.h>
 #include <argon/argon.h>
 
+/* In the shim: prints one ready-made line. */
+extern "C" void ag_store_use_note(const char *line);
+
 extern "C" uint32_t ag_us(void);
 
 namespace {
@@ -46,6 +49,16 @@ struct Entry {
     int32_t fid;
     uint32_t off;
     uint32_t len;
+    /*
+     * ARGON: has the game ever asked for this one.
+     *
+     * It used to be a bit in a side table indexed by the entry's position,
+     * and the index is kept sorted - so every insert memmoves the entries
+     * and the marks slide onto other files.  The count it produced was
+     * nonsense (nine files read of eight hundred, while the same function
+     * handed out a thousand pointers a window).  It belongs to the file.
+     */
+    uint8_t touched;
 };
 
 Entry s_index[kMaxEntries];
@@ -293,6 +306,7 @@ void index_insert(int fid, uint32_t off, uint32_t len)
     s_index[at].fid = (int32_t)fid;
     s_index[at].off = off;
     s_index[at].len = len;
+    s_index[at].touched = 0u;
     s_count++;
 }
 
@@ -624,17 +638,12 @@ const unsigned char *ag_art_store_ptr(int fid, int *size)
      * find() counted the duplicate checks that happen while writing, so
      * it only belongs on the read path. */
     {
-        const Entry *e = find(fid);
+        Entry *e = const_cast<Entry *>(find(fid));
 
-        if (e != nullptr) {
-            const size_t   slot = (size_t)(e - s_index);
-            const unsigned bit = 1u << (slot & 7u);
-
-            if ((s_touched[slot >> 3] & bit) == 0u) {
-                s_touched[slot >> 3] |= (uint8_t)bit;
-                s_touched_n++;
-                s_touched_kb += e->len;
-            }
+        if (e != nullptr && e->touched == 0u) {
+            e->touched = 1u;
+            s_touched_n++;
+            s_touched_kb += e->len;
         }
     }
     /*
@@ -670,7 +679,20 @@ const unsigned char *ag_art_store_ptr(int fid, int *size)
 
 bool ag_art_store_read(int fid, int size, unsigned char *data)
 {
-    const Entry *e = find(fid);
+    /*
+     * ARGON: this is the OTHER way art leaves the store - copied into RAM
+     * rather than pointed at - and it was not counted as "read back" at
+     * all.  That made the store look useless (four files of seven hundred)
+     * while switching it off cost 38 MB of extra card reads a window and
+     * halved the movement metric.  Both paths mark the file now.
+     */
+    Entry *e = const_cast<Entry *>(find(fid));
+
+    if (e != nullptr && e->touched == 0u) {
+        e->touched = 1u;
+        s_touched_n++;
+        s_touched_kb += e->len;
+    }
 
     if (e == nullptr || data == nullptr || size <= 0
             || (uint32_t)size != e->len) {
@@ -1024,16 +1046,55 @@ void ag_art_store_clear(void)
     (void)erase_more();
 }
 
+/*
+ * ARGON: the list a map asks for, so the store holds what the LOCATION
+ * needs rather than whatever the cache happened to evict.
+ *
+ * Measured on this town: the map names 770 pictures worth 3925 KB, and the
+ * store held 763 files of which the game read four.  Nearly the same count
+ * and the wrong contents - because a critter object names its standing
+ * pose, and the moment it walks the engine wants a different file that no
+ * map mentions.  Those cost 1 MB and are written DURING play, which is the
+ * stall Maxim feels mid-step.
+ *
+ * Anything already stored is not asked for twice.
+ */
+#define AG_WANT_MAX 1100
+
+int      s_want[AG_WANT_MAX];
+unsigned s_want_n;
+unsigned s_want_lost;
+
 void ag_art_store_want(int fid)
 {
-    (void)fid;
+    if (s_store == nullptr || find(fid) != nullptr) {
+        return;
+    }
+    for (unsigned i = 0; i < s_want_n; i++) {
+        if (s_want[i] == fid) {
+            return;
+        }
+    }
+    if (s_want_n >= AG_WANT_MAX) {
+        s_want_lost++;
+        return;
+    }
+    s_want[s_want_n++] = fid;
 }
 
 unsigned ag_art_store_wanted(int *out, unsigned cap)
 {
-    (void)out;
-    (void)cap;
-    return 0;
+    unsigned n = 0;
+
+    while (n < cap && s_want_n != 0u) {
+        out[n++] = s_want[--s_want_n];
+    }
+    return n;
+}
+
+unsigned ag_art_store_want_left(void)
+{
+    return s_want_n;
 }
 
 void ag_art_store_offer(int fid, const unsigned char *data, int size)
@@ -1172,22 +1233,55 @@ void ag_art_store_report(char *out, size_t cap)
 
         if (at + 1u < cap) {
             snprintf(out + at, cap - at,
-                     " | this window: stopped %u ms writing and %u ms erasing"
-                     " | %u of %u stored files ever asked for (%u of %u KB)"
-                     " | repeats: %u caught while gathering, %u in the index%s"
-                     " | %u too big to gather, written alone:%s",
+                     " | this window: stopped %u ms writing and %u ms erasing",
                      (unsigned)(s_win_write_us / 1000u),
-                     (unsigned)(s_win_erase_us / 1000u),
-                     (unsigned)s_touched_n, (unsigned)s_count,
-                     (unsigned)(s_touched_kb >> 10),
-                     (unsigned)(s_fill_at >> 10),
-                     (unsigned)s_dup_staged,
-                     (unsigned)(s_dup_index & 0xFFFFu),
-                     ((s_dup_index & 0x10000u) != 0u)
-                         ? " AND OUT OF ORDER" : "",
-                     (unsigned)s_big_n, big_kinds);
+                     (unsigned)(s_win_erase_us / 1000u));
         }
-        s_win_write_us = 0;
-        s_win_erase_us = 0;
     }
+
+    /*
+     * ARGON: and the store's own worth, on a line of its own.
+     *
+     * It used to ride on the end of the [artflash] line and the console -
+     * which is a screen of twenty-five rows - cut it off exactly when the
+     * store was full and the numbers finally meant something.
+     */
+    {
+        static const char *const kname[16] = {
+            "item", "critter", "scenery", "wall", "tile", "misc", "iface",
+            "inven", "head", "backgrnd", "skilldex", "11", "12", "13",
+            "14", "15"
+        };
+        char big_kinds[120];
+        int  bat = 0;
+
+        big_kinds[0] = '\0';
+        for (unsigned k = 0; k < 16u && bat < (int)sizeof(big_kinds) - 1;
+                k++) {
+            if (s_big_kind[k] != 0u) {
+                bat += snprintf(big_kinds + bat,
+                                sizeof(big_kinds) - (size_t)bat, " %s %u",
+                                kname[k], (unsigned)s_big_kind[k]);
+            }
+        }
+
+        char use[300];
+
+        snprintf(use, sizeof(use),
+                 "[artuse] %u of %u stored files were read back (%u of %u KB)"
+                 " | repeats: %u caught while gathering, %u in the index%s"
+                 " | %u too big to gather, written alone:%s",
+                 (unsigned)s_touched_n, (unsigned)s_count,
+                 (unsigned)(s_touched_kb >> 10),
+                 (unsigned)(s_fill_at >> 10),
+                 (unsigned)s_dup_staged,
+                 (unsigned)(s_dup_index & 0xFFFFu),
+                 ((s_dup_index & 0x10000u) != 0u)
+                     ? " AND OUT OF ORDER" : "",
+                 (unsigned)s_big_n, big_kinds);
+        ag_store_use_note(use);
+    }
+
+    s_win_write_us = 0;
+    s_win_erase_us = 0;
 }

@@ -1959,6 +1959,37 @@ static struct { int fid; unsigned reads, kb; bool stored; }
     s_reread[AG_REREAD_MAX];
 static unsigned s_reread_n, s_reread_lost;
 
+extern "C" void ag_store_use_note(const char *line)
+{
+    if (line != NULL) {
+        shim_printf("%s\n", line);
+    }
+}
+
+extern "C" void ag_map_inventory_note(unsigned files, unsigned kb,
+                                      unsigned skipped,
+                                      const unsigned *n_by_kind,
+                                      const unsigned *kb_by_kind)
+{
+    static const char *const kind[16] = {
+        "item", "critter", "scenery", "wall", "tile", "misc", "iface",
+        "inven", "head", "backgrnd", "skilldex", "11", "12", "13", "14", "15"
+    };
+    char line[300];
+    int  at = 0;
+
+    for (unsigned k = 0; k < 16u && at < (int)sizeof(line) - 1; k++) {
+        if (n_by_kind[k] != 0u) {
+            at += snprintf(line + at, sizeof(line) - (size_t)at,
+                           " %s %u/%uKB", kind[k], n_by_kind[k],
+                           kb_by_kind[k]);
+        }
+    }
+    shim_printf("[mapart] this location needs %u distinct pictures, %u KB "
+                "(%u past the table) |%s\n",
+                files, kb, skipped, line);
+}
+
 extern "C" void ag_reread_note(int fid, unsigned bytes)
 {
     /* Not while a map is loading: everything is read then, once, and that

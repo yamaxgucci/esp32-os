@@ -313,6 +313,15 @@ void ag_slow_script_note(const char *name, unsigned sid, unsigned ms);
  * the art that is read again and again - the art that belongs in flash. */
 void ag_reread_note(int fid, unsigned bytes);
 
+/* What a location needs, counted from its own tile grid and object list
+ * at the end of a map load: how many distinct pictures and how many KB. */
+/* One ready-made line about the store's worth, printed as it is. */
+void ag_store_use_note(const char *line);
+
+void ag_map_inventory_note(unsigned files, unsigned kb, unsigned skipped,
+                           const unsigned *n_by_kind,
+                           const unsigned *kb_by_kind);
+
 /* Where script time goes, by opcode (1024 of them, indexed by opcode &
  * 0x3FF).  Reported as the few that cost anything. */
 extern unsigned ag_op_us[1024], ag_op_n[1024], ag_op_worst[1024];

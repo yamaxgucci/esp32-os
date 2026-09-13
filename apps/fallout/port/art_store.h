@@ -155,6 +155,7 @@ bool ag_art_store_read(int fid, int size, unsigned char *data);
  */
 void ag_art_store_want(int fid);
 unsigned ag_art_store_wanted(int *out, unsigned cap);
+unsigned ag_art_store_want_left(void);
 
 /* The filling window.  Between begin and end, ag_art_store_offer() may write;
  * outside it, offers are ignored.  end() commits the index. */
