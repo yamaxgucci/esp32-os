@@ -28,14 +28,37 @@ phone: http://192.168.4.1:8765/
 
 ```ini
 [phone]
-port = 8765    ; 80 is HTTPD.AXE's, 8080 is too common
-text = yes     ; offer the console as characters (default)
+port = 8765        ; 80 is HTTPD.AXE's, 8080 is too common
+text = yes         ; offer the console as characters (default)
+password = secret  ; leave it out and anybody who reaches the port is in
 ```
 
-**No authentication.** Whoever reaches the port has the screen and the
-keyboard. Same standing as `telnet on` in this system, and the same answer:
-it is off until somebody loads this driver. On a board that matters, put it
-behind the board's own access point and nothing else.
+## The password
+
+Without one, whoever reaches the port has the screen and the keyboard — the
+same standing `telnet on` has here. With one, the board challenges and the
+browser answers: the board sends a nonce, both sides hash it with the password
+(SHA-1), and only the digest crosses. **The password itself is never on the
+wire**, and a digest somebody copied is worth nothing on the next connection.
+Until the answer arrives the board sends nothing at all — not the geometry, not
+a row of the console — and listens to nothing but the answer.
+
+The page asks once and keeps the password in the browser's own storage, per
+board, so the phone is not asked again. A wrong answer costs a second and a
+half and a hung-up connection, which makes guessing over a network a week's
+work rather than an afternoon's.
+
+What it is **not**: encryption. Everything after the answer — the screen, the
+keys — crosses in the clear, because a board this size cannot carry TLS under a
+video link. It keeps strangers out; it does not keep a listener from watching.
+
+Leaving the line out keeps the old behaviour, deliberately: a board that
+suddenly refused its owner after an update would be worse than one that never
+asked. The driver says which it is at load:
+
+```
+PHONE: open http://<board>:8765/ - 80x25 cells, NO PASSWORD ([phone] password to set one)
+```
 
 ## Build
 

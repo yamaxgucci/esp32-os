@@ -176,6 +176,35 @@ static void ws_tests(void)
     AG_CHECK(!ag_ws_accept_key("", accept));
     AG_CHECK(!ag_ws_accept_key(NULL, accept));
 
+    /*
+     * SHA-1 on its own, because the password challenge uses it directly and a
+     * hash that is only ever checked through base64 can be wrong in ways the
+     * handshake test would not separate.  The three vectors are FIPS 180-1's
+     * own, including the empty string - which is the case a padding bug hits
+     * first and the one a handshake never exercises.
+     */
+    static const struct {
+        const char *in;
+        const char *hex;
+    } k_sha1[] = {
+        {"", "da39a3ee5e6b4b0d3255bfef95601890afd80709"},
+        {"abc", "a9993e364706816aba3e25717850c26c9cd0d89d"},
+        {"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq",
+         "84983e441c3bd26ebaae4aa1f95129e5e54670f1"},
+    };
+    for (uint32_t i = 0; i < sizeof(k_sha1) / sizeof(k_sha1[0]); i++) {
+        uint8_t digest[20];
+        char    hex[41];
+        ag_ws_sha1(k_sha1[i].in, strlen(k_sha1[i].in), digest);
+        for (uint32_t j = 0; j < 20u; j++) {
+            static const char d[] = "0123456789abcdef";
+            hex[j * 2u] = d[digest[j] >> 4];
+            hex[j * 2u + 1u] = d[digest[j] & 15u];
+        }
+        hex[40] = '\0';
+        AG_CHECK_STR(hex, k_sha1[i].hex);
+    }
+
     /* ---- frame headers, built and parsed ------------------------------- */
 
     ag_ws_hdr_t h;

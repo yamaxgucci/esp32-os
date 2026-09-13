@@ -140,6 +140,8 @@ AG_DRV("PHONE", "1.0", "argon");
  *   'P'  the same geometry, then PackBits over the pixels
  *   'I'  the same geometry, then a palette and packed indices
  *
+ *   'A'  16 bytes of nonce - "say who you are before I show you anything"
+ *
  * Phone to board:
  *   'H'  (nothing) - "I have just arrived": send the geometry and everything
  *   'K'  u8 kind (1 down, 2 up), u8 mods, u16 hid, u16 unicode, u8 repeat
@@ -147,6 +149,7 @@ AG_DRV("PHONE", "1.0", "argon");
  *        i8 wheel
  *   'T'  UTF-8 text - what a phone's own keyboard produces, where there is no
  *        key to name
+ *   'A'  20 bytes - SHA1(nonce || password), the answer to the challenge
  *
  * 'B' / 'P' / 'I' are ag_pixband's own op bytes, so the encoder's choice is
  * the wire's op with nothing in between.
@@ -154,13 +157,44 @@ AG_DRV("PHONE", "1.0", "argon");
 #define OP_INFO 'M'
 #define OP_ROW 'R'
 #define OP_CURSOR 'C'
+#define OP_AUTH 'A'
 
 #define IN_HELLO 'H'
 #define IN_KEY 'K'
 #define IN_PTR 'P'
 #define IN_TEXT 'T'
+#define IN_AUTH 'A'
 
 #define INFO_HAS_TEXT 0x01u
+
+/*
+ * The password, and what it is and is not.
+ *
+ * Without one, whoever reaches the port has the screen and the keyboard.  That
+ * is the same standing telnet has here, and it is fine for a board on a bench
+ * and wrong for anything else - which is why `[phone] password` exists and why
+ * leaving it out still means no password: a board that suddenly refused its
+ * owner after an update would be worse than one that never asked.
+ *
+ * It is a challenge and a response, not a password sent and compared.  The
+ * board makes a nonce, both sides hash it with the password, and only the
+ * digest crosses - so the password itself is never on a wire that has no TLS,
+ * and a digest somebody copied is worth nothing on the next connection.
+ *
+ * What this is NOT: it is not encryption.  Everything after the answer - the
+ * screen, the keys - crosses in the clear, because a board of this size cannot
+ * carry TLS under a video link.  It keeps strangers out; it does not keep a
+ * listener from watching over your shoulder.  Said here rather than left to be
+ * assumed.
+ */
+#define PASS_MAX 32
+#define NONCE_LEN 16
+#define DIGEST_LEN 20
+
+/* How long a wrong answer costs.  Not a lockout - a board that locks itself is
+ * a board its owner cannot use either - but enough that guessing a password
+ * over a network is a week's work rather than an afternoon's. */
+#define BAD_PASS_DELAY_MS 1500u
 
 /* ------------------------------------------------------------------------ */
 /* State                                                                     */
@@ -225,6 +259,13 @@ static struct {
     ag_handle_t conn; /* an upgraded WebSocket, or -1                       */
     volatile bool     up;
     volatile bool     owe_everything;
+
+    /* Who may look.  `password` empty means anybody. */
+    char     password[PASS_MAX + 1];
+    bool     authed;      /* this connection has answered                   */
+    bool     challenged;  /* ...and has been asked                          */
+    uint8_t  nonce[NONCE_LEN];
+    uint32_t nonce_seq;
 
     /* Working memory, the task's alone once it is running. */
     ag_pixband_ctx_t *pix;
@@ -361,6 +402,46 @@ static void drop_conn(const char *why)
 /* Board to phone: the geometry, the console, the picture                    */
 /* ------------------------------------------------------------------------ */
 
+/* ---- the password ------------------------------------------------------ */
+
+static bool needs_password(void) { return s.password[0] != '\0'; }
+
+/*
+ * A nonce that does not repeat.
+ *
+ * There is no random in the ABI, and this does not need one: what a challenge
+ * has to be is fresh, so that a digest somebody copied off the wire is worth
+ * nothing the next time.  A counter and the microsecond clock, hashed, are
+ * fresh.  Guessing the nonce buys an attacker nothing anyway - without the
+ * password the digest cannot be computed from it.
+ */
+static void make_nonce(void)
+{
+    struct {
+        uint64_t us;
+        uint32_t seq;
+        uint32_t conn;
+    } seed;
+
+    seed.us = (uint64_t)ag_micros();
+    seed.seq = ++s.nonce_seq;
+    seed.conn = (uint32_t)s.conn;
+
+    uint8_t digest[DIGEST_LEN];
+    ag_ws_sha1(&seed, sizeof(seed), digest);
+    memcpy(s.nonce, digest, NONCE_LEN);
+}
+
+static void expected_digest(uint8_t out[DIGEST_LEN])
+{
+    uint8_t buf[NONCE_LEN + PASS_MAX];
+    const uint32_t n = (uint32_t)strlen(s.password);
+
+    memcpy(buf, s.nonce, NONCE_LEN);
+    memcpy(buf + NONCE_LEN, s.password, n);
+    ag_ws_sha1(buf, NONCE_LEN + n, out);
+}
+
 static bool send_info(void)
 {
     uint8_t p[9];
@@ -472,6 +553,20 @@ static bool send_band(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
  */
 static bool service_client(void)
 {
+    /*
+     * Nothing before the answer.  Not the geometry, not a row of the console,
+     * not a band of the picture - a screen shown to somebody who has not said
+     * the password is the screen given away, whatever happens afterwards.
+     */
+    if (needs_password() && !s.authed) {
+        if (!s.challenged) {
+            make_nonce();
+            s.challenged = true;
+            return ws_send(OP_AUTH, s.nonce, NONCE_LEN);
+        }
+        return true;
+    }
+
     if (s.owe_everything) {
         s.owe_everything = false;
         if (!send_info()) {
@@ -639,7 +734,40 @@ static void handle_message(const uint8_t *p, uint32_t len)
     const uint8_t *body = p + 1;
     const uint32_t n = len - 1u;
 
+    /*
+     * Before the answer, the only thing this end listens to is the answer.  A
+     * keystroke from an unauthenticated client is a keystroke at the machine's
+     * shell, so it is not "harmless until the screen is shown" - it is the
+     * whole of what a password is for.
+     */
+    if (needs_password() && !s.authed && op != IN_AUTH) {
+        return;
+    }
+
     switch (op) {
+    case IN_AUTH: {
+        if (!needs_password() || s.authed || !s.challenged ||
+            n != DIGEST_LEN) {
+            return;
+        }
+        uint8_t want[DIGEST_LEN];
+        expected_digest(want);
+        if (memcmp(want, body, DIGEST_LEN) != 0) {
+            ag_log(AG_LOG_WARN, "phone", "wrong password");
+            /* Slowly, and then hang up.  Slowly so that guessing over a network
+             * is a week rather than an afternoon; hang up so the next attempt
+             * has to take a fresh nonce. */
+            TASK->sleep_ms(BAD_PASS_DELAY_MS);
+            ws_close("badpass");
+            drop_conn("wrong password");
+            return;
+        }
+        s.authed = true;
+        s.owe_everything = true;
+        ag_log(AG_LOG_INFO, "phone", "client authenticated");
+        break;
+    }
+
     case IN_HELLO:
         s.owe_everything = true;
         break;
@@ -923,6 +1051,8 @@ static bool serve_request(ag_handle_t h)
         ws_close("replaced");
         drop_conn("replaced");
         s.conn = h;
+        s.authed = false;
+        s.challenged = false;
         s.owe_everything = true;
         ag_log(AG_LOG_INFO, "phone", "client connected");
         return true;
@@ -1508,6 +1638,13 @@ ag_err_t ag_driver_init(void)
 
     s.publish_text = want_text();
 
+    if (api->cfg != NULL && AG_HAS(api->cfg, get_str)) {
+        if (api->cfg->get_str("phone.password", s.password,
+                              sizeof(s.password)) != AG_OK) {
+            s.password[0] = '\0';
+        }
+    }
+
     /*
      * The frame, here and not on the first blit.
      *
@@ -1590,8 +1727,10 @@ ag_err_t ag_driver_init(void)
     }
     s.up = true;
 
-    ag_printf("PHONE: open http://<board>:%u/ - %ux%u cells%s\n",
+    ag_printf("PHONE: open http://<board>:%u/ - %ux%u cells%s, %s\n",
               (unsigned)s.port, (unsigned)s.cols, (unsigned)s.rows,
-              s.publish_text ? "" : " (pixels only)");
+              s.publish_text ? "" : " (pixels only)",
+              needs_password() ? "password set"
+                               : "NO PASSWORD ([phone] password to set one)");
     return AG_OK;
 }

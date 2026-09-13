@@ -131,6 +131,20 @@ static void sha1_final(sha1_t *s, uint8_t out[20])
     }
 }
 
+void ag_ws_sha1(const void *data, size_t len, uint8_t out[20])
+{
+    sha1_t s;
+
+    if (out == NULL) {
+        return;
+    }
+    sha1_init(&s);
+    if (data != NULL && len > 0u) {
+        sha1_update(&s, data, len);
+    }
+    sha1_final(&s, out);
+}
+
 /* ---- base64, encode only ------------------------------------------------ */
 
 static const char k_b64[] =

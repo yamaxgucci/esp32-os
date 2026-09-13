@@ -59,6 +59,24 @@ extern "C" {
  */
 bool ag_ws_accept_key(const char *key, char out[AG_WS_ACCEPT_LEN]);
 
+/*
+ * SHA-1 of a buffer, which this file has because RFC 6455 froze it into the
+ * handshake above.
+ *
+ * Exposed, rather than left private, for one caller and one purpose: the
+ * challenge-response that keeps a password off the wire.  The board sends a
+ * nonce, both sides hash it with the password, and only the digest crosses -
+ * so a password is never sent in the clear over a link that has no TLS.
+ * Preimage resistance is what that needs, and SHA-1 still has it; its broken
+ * collision resistance is not load-bearing here any more than it is in the
+ * handshake.
+ *
+ * Do NOT reach for this for anything else.  The ABI offers SHA-256 for the
+ * cases that want a hash on their own merits, and this one is here because it
+ * was already here.
+ */
+void ag_ws_sha1(const void *data, size_t len, uint8_t out[20]);
+
 /* One frame header as it arrived. */
 typedef struct {
     uint8_t  opcode;
