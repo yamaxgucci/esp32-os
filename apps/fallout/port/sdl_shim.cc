@@ -575,20 +575,104 @@ static void log_line(const char *text)
  * this is the one place that runs every frame. */
 extern "C" void fallout_reserve_tick(void);
 
+/*
+ * ARGON: the reports leave one line per frame, not twenty in one.
+ *
+ * The whole readout is printed every thirty seconds from inside the frame
+ * loop, and the console is a slow device: the service that prints it
+ * averaged 361 us per frame across a window, which is around six hundred
+ * milliseconds landing on the single frame that did the printing.  That
+ * frame was the worst of every window - 282 ms of a "282 ms stall" was
+ * the instrument, not the game, and Maxim was being given that jolt every
+ * thirty seconds while playing.
+ *
+ * So a report goes into a ring and one line leaves per frame.  Nothing is
+ * lost unless the ring overflows, which is counted and said out loud.
+ */
+#define SHIM_REP_LINES 48
+#define SHIM_REP_CHARS 640
+
+static char     s_rep[SHIM_REP_LINES][SHIM_REP_CHARS];
+static unsigned s_rep_head, s_rep_tail, s_rep_lost;
+static bool     s_rep_on = true;
+
+static void shim_print_now(const char *line)
+{
+    ag_print(line);
+    log_line(line);
+}
+
+/*
+ * The console is slow and the frame loop must not wait for it.
+ *
+ * Draining one line per frame was worse than printing everything at once:
+ * at fifty-seven frames a second that is more traffic than the reports
+ * themselves, and every line is milliseconds of UART.  So the printing
+ * happens on a thread of its own, below the game, and the frame loop only
+ * ever copies into the ring.
+ */
+static bool         s_rep_stop;
+static ag_thread_t  s_rep_thread;
+
+static void shim_printer(void *arg)
+{
+    (void)arg;
+    while (!s_rep_stop) {
+        if (s_rep_head == s_rep_tail) {
+            if (s_rep_lost != 0u) {
+                s_rep_lost = 0;
+                shim_print_now("[report] lines were dropped: the ring "
+                               "filled while the console caught up");
+            }
+            ag_delay(20);
+            continue;
+        }
+
+        shim_print_now(s_rep[s_rep_tail]);
+        s_rep_tail = (s_rep_tail + 1u) % SHIM_REP_LINES;
+    }
+    ag_thread_exit();
+}
+
+static void shim_drain(void)
+{
+    /* Kept as the one place that starts the printer, so nothing has to be
+     * added to the port's start-up path. */
+    if (s_rep_thread == NULL && !s_rep_stop) {
+        s_rep_thread = ag_thread_create(shim_printer, NULL, "shimprint",
+                                        4096, 0, 0);
+        if (s_rep_thread == NULL) {
+            s_rep_on = false;   /* no thread: print in place, as before */
+        }
+    }
+}
+
 static void shim_printf(const char *fmt, ...)
 {
     /* Long enough for the longest report, which is the store's: 320 cut it
      * off silently, and what fell off was the end - where the newest and
      * usually most interesting numbers are. */
-    char line[640];
+    char line[SHIM_REP_CHARS];
     va_list ap;
 
     va_start(ap, fmt);
     vsnprintf(line, sizeof(line), fmt, ap);
     va_end(ap);
 
-    ag_print(line);
-    log_line(line);
+    if (!s_rep_on) {
+        shim_print_now(line);
+        return;
+    }
+
+    const unsigned next = (s_rep_head + 1u) % SHIM_REP_LINES;
+
+    if (next == s_rep_tail) {
+        s_rep_lost++;
+        return;
+    }
+    memcpy(s_rep[s_rep_head], line, sizeof(s_rep[0]));
+    s_rep[s_rep_head][SHIM_REP_CHARS - 1] = '\0';
+    s_rep_head = next;
 }
 
 /* Bumped whenever the palette is written; palette_lut watches it. */
@@ -4107,6 +4191,8 @@ void SDL_RenderPresent(SDL_Renderer *r)
     timers_service();
     const uint32_t p1 = (uint32_t)ag_micros();
     memstat_service();
+    /* One queued report line per frame: see shim_printf. */
+    shim_drain();
     const uint32_t p2 = (uint32_t)ag_micros();
     ++s_frames;
     ++s_frames_total;
