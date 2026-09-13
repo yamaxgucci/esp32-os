@@ -27,6 +27,7 @@
 #include <argon/input.h>
 #include <argon/kernel.h>
 #include <argon/keys.h>
+#include <argon/cfg.h>
 #include <argon/loader.h>
 #include <argon/log.h>
 #include <argon/module.h>
@@ -36,6 +37,8 @@
 #include <argon/shell.h>
 #include <argon/filemap.h>
 #include <argon/vfs.h>
+
+#include "core/sysconfig.h"
 
 #include <argon/port/config.h>
 
@@ -1582,6 +1585,70 @@ static const ag_cam_api_t k_cam = {
 };
 #endif
 
+/* ----------------------------------------------------------------------- */
+/* cfg - read the system/board configuration (SYSTEM.CFG + BOARD.CFG).      */
+/*                                                                          */
+/* Read-only for now: a driver reads its own keys (a radio its ssid, a      */
+/* panel its rotation).  Writing back to SYSTEM.CFG is the owner's job      */
+/* through the shell, so set_str/commit answer -AG_ENOTSUP rather than      */
+/* pretend.  Without this table api->cfg was NULL and every `.SYS`/`.AXE`   */
+/* silently saw no configuration at all.                                    */
+/* ----------------------------------------------------------------------- */
+static ag_err_t api_cfg_get_str(const char *key, char *buf, size_t len)
+{
+    if (key == NULL || buf == NULL || len == 0) {
+        return -AG_EINVAL;
+    }
+    buf[0] = '\0';
+    const ag_cfg_t *cfg = ag_sysconfig();
+    if (cfg == NULL) {
+        return -AG_ENOENT;
+    }
+    const char *val = ag_cfg_get(cfg, key, NULL);
+    if (val == NULL) {
+        return -AG_ENOENT;
+    }
+    size_t i = 0;
+    for (; val[i] != '\0' && i + 1 < len; i++) {
+        buf[i] = val[i];
+    }
+    buf[i] = '\0';
+    return AG_OK;
+}
+
+static int32_t api_cfg_get_int(const char *key, int32_t def)
+{
+    const ag_cfg_t *cfg = ag_sysconfig();
+    return (cfg == NULL) ? def : ag_cfg_get_int(cfg, key, def);
+}
+
+static bool api_cfg_get_bool(const char *key, bool def)
+{
+    const ag_cfg_t *cfg = ag_sysconfig();
+    return (cfg == NULL) ? def : ag_cfg_get_bool(cfg, key, def);
+}
+
+static ag_err_t api_cfg_set_str(const char *key, const char *value)
+{
+    (void)key;
+    (void)value;
+    return -AG_ENOTSUP;
+}
+
+static ag_err_t api_cfg_commit(void)
+{
+    return -AG_ENOTSUP;
+}
+
+static const ag_cfg_api_t k_cfg = {
+    .size = sizeof(ag_cfg_api_t),
+    .get_str = api_cfg_get_str,
+    .get_int = api_cfg_get_int,
+    .get_bool = api_cfg_get_bool,
+    .set_str = api_cfg_set_str,
+    .commit = api_cfg_commit,
+};
+
 static const ag_api_t k_api = {
     .size = sizeof(ag_api_t),
     .abi_major = AG_ABI_MAJOR,
@@ -1597,7 +1664,7 @@ static const ag_api_t k_api = {
     .time = &k_time,
     .task = &ag_task_api_table,
     .proc = &k_proc,
-    .cfg = NULL,
+    .cfg = &k_cfg,
 #if defined(CONFIG_ARGON_ENABLE_NET) && CONFIG_ARGON_ENABLE_NET
     .net = &ag_net_api_impl,
 #else
