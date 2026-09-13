@@ -242,8 +242,39 @@ if ($Sd) {
 }
 
 # A leftover emulator would still hold the port and answer with silence.
-Get-Process qemu-system-xtensa -ErrorAction SilentlyContinue |
-    Stop-Process -Force -ErrorAction SilentlyContinue
+#
+# The leftover, and not every emulator on the machine.  This used to stop every
+# process called qemu-system-xtensa, which is right while one person runs one
+# board and wrong the moment anything else is running: a second worktree
+# emulating a second node, or a driver being tried by hand in another window,
+# died silently whenever a test started here.  It cost an afternoon to see,
+# because nothing says "somebody killed it" - the port simply stops answering.
+#
+# What identifies a leftover is the image it is running: two emulators of the
+# same flash file are the same board twice, and the older one is the one that
+# has to go.
+$ourFlash = ($qemuArgs | Where-Object { $_ -like 'file=*.bin,if=mtd,*' } |
+             Select-Object -First 1)
+$ourImage = ''
+if ($ourFlash) {
+    $ourImage = [regex]::Match($ourFlash, '[^\\/=]+\.bin(?=,if=mtd)').Value
+}
+if ($ourImage) {
+    Get-CimInstance Win32_Process -Filter "Name='qemu-system-xtensa.exe'" `
+        -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -and $_.CommandLine.Contains($ourImage) } |
+        ForEach-Object {
+            Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+        }
+} else {
+    # The image could not be read out of our own arguments, which should not
+    # happen; fall back to the old sledgehammer rather than to leaving a
+    # leftover in place, and say so, because it is the sledgehammer that once
+    # killed somebody else's board.
+    Write-Host 'qemu: cannot name this run''s flash image; stopping every emulator'
+    Get-Process qemu-system-xtensa -ErrorAction SilentlyContinue |
+        Stop-Process -Force -ErrorAction SilentlyContinue
+}
 
 # QEMU's own chatter goes to a file: it is not part of what the board said,
 # and PowerShell renders anything on stderr as an error.
