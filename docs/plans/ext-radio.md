@@ -210,3 +210,38 @@ Framed, little-endian, как HSFS. Заголовок фиксированно�
 
 AT покупает только сокеты: ни monitor mode, ни ESP-NOW, ни инжекта — за этим
 RLINK. TLS/https поверх AT — как и у RLINK, вне тракта (TLS в порту).
+
+## Ввод в строй на железе (2026-09-13): ESP-07 + баг `api->cfg == NULL`
+
+Первый рабочий внешний модем — **ESP-07** на стоковой AT-прошивке, припаян к
+**CYD** (esp32/LX6, COM7) на UART1 (`tx=22`, `rx=21`, кроссовер). Модуль сразу
+отвечал на AT (`atbaud` → `115200: OK`), `ATRADIO.SYS` печатал «modem answers AT
+on uart1», но `net use atradio` давал `address 0.0.0.0` и в сеть не выходил.
+
+Диапазон (сеть 2.4 ГГц), пароль и разбор ответа `CIFSR` оказались **ложным
+следом**. Отладочная сборка `atradio` (лог результата CWJAP + строки CIFSR)
+показала `no radio.ssid - not joining`, хотя в `C:\SYSTEM.CFG` секция `[radio]`
+с `ssid`/`pass` присутствовала (проверено `type c:\SYSTEM.CFG`).
+
+**Первопричина — в ядре, не в радио.** В ABI-таблице
+(`components/argon_kernel/src/loader/api.c`) поле `.cfg` было `NULL` и никогда не
+заполнялось: реализации `ag_cfg_api_t` не существовало вовсе. Поэтому
+`ag_api()->cfg` был `NULL` для **любого** `.SYS`/`.AXE`, `AG_HAS(cfg, get_str)`
+давал ложь, и драйвер не читал ни одного ключа. `radio.uart` «срабатывал» только
+потому, что его дефолт и так равен 1. (Тем же тихо страдал `assoc.*` у desktop —
+он просто возвращал «нет обработчика».)
+
+**Фикс:** таблица `k_cfg` (`get_str`/`get_int`/`get_bool` поверх
+`ag_sysconfig()` + `ag_cfg_get*`; `set_str`/`commit` пока `-AG_ENOTSUP` — запись
+в SYSTEM.CFG остаётся делом shell) и `.cfg = &k_cfg`. Это правка **прошивки**
+(пересобрать и прошить образ esp32, не только `.SYS`). ABI-minor не менялся:
+поле уже было в структуре, просто пустое.
+
+После фикса — сквозной путь через ESP-07 подтверждён на плате:
+```
+net use atradio  → joining 'RT-...' → CWJAP OK → ip 192.168.0.126
+net resolve example.com → 8.6.112.0
+wget http://example.com/ → 200 OK, 559 bytes, saved A:\index.htm
+```
+DNS, TCP и HTTP работают через `net use atradio`. Пароли Wi-Fi живут только в
+`C:\SYSTEM.CFG` на плате и в репозиторий не попадают.
