@@ -1406,6 +1406,14 @@ extern "C" int ag_script_cache = 0;
 /* Read by artInit(); see patches/fallout2-ce/0021.  Zero means the setting in
  * fallout2.cfg stands. */
 extern "C" int ag_art_cache_kb = 0;
+
+/* ARGON: -mapfill 1 fills the flash store from the map's own inventory at
+ * the end of a load.  Off by default: it cost seven seconds of load and put
+ * in 51 pictures the play session then did not ask for, and Maxim's ear said
+ * the result was worse.  Kept as a switch rather than deleted, because the
+ * ordering it brings (walking last) is the right shape for a store smaller
+ * than the map. */
+extern "C" int ag_map_fill = 0;
 /*
  * How many of the character's animations are held against eviction; -pins N.
  *
@@ -1639,6 +1647,8 @@ extern "C" int ag_cxx_main(int argc, char **argv)
             ag_art_pins = to_int(argv[++i]);
         } else if (same(argv[i], "-artcache") && i + 1 < argc) {
             ag_art_cache_kb = to_int(argv[++i]);
+        } else if (same(argv[i], "-mapfill") && i + 1 < argc) {
+            ag_map_fill = to_int(argv[++i]);
         } else if (same(argv[i], "-artflash") && i + 1 < argc) {
             ag_art_store_mode(to_int(argv[++i]));
         } else if (same(argv[i], "-inplace") && i + 1 < argc) {

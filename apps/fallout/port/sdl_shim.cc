@@ -1186,6 +1186,14 @@ static void tickers_report(void)
                 ag_bk_critters_worst, ag_bk_timed_worst,
                 ag_te_mapupd_us, ag_te_queue_us, ag_te_queue_n,
                 ag_te_queue_worst, ag_te_queue_worst_n);
+    {
+        char cs[300];
+
+        ag_critter_script_report(cs, sizeof(cs));
+        if (cs[0] != 0) {
+            shim_printf("[critterscript t=%u] %s\n", (unsigned)ag_millis(), cs);
+        }
+    }
     ag_bk_programs_us = 0; ag_bk_windows_us = 0;
     ag_bk_critters_us = 0; ag_bk_timed_us = 0; ag_bk_calls = 0;
     ag_bk_programs_worst = 0; ag_bk_windows_worst = 0;

@@ -318,6 +318,12 @@ void ag_reread_note(int fid, unsigned bytes);
 /* One ready-made line about the store's worth, printed as it is. */
 void ag_store_use_note(const char *line);
 
+/* Which critter script cost what.  Exactly one critter script runs per
+ * frame, so "the critters cost 720 us a frame, worst 101 ms" is one script
+ * being slow - these two say which one, by its name in scripts.lst. */
+void ag_critter_script_took(int script_index, uint32_t us);
+void ag_critter_script_report(char *out, unsigned cap);
+
 void ag_map_inventory_note(unsigned files, unsigned kb, unsigned skipped,
                            const unsigned *n_by_kind,
                            const unsigned *kb_by_kind);
