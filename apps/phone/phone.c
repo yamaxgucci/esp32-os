@@ -306,6 +306,7 @@ static struct {
     uint32_t          band_px;
     uint32_t          band_cap;
     uint32_t          direct_at; /* which band the budget stopped on         */
+    volatile uint8_t  stage;     /* where the task's loop last was            */
     bool              moaned_frame;
     bool              moaned_mem;
     bool              want_frame;
@@ -1792,12 +1793,34 @@ static void phone_task(void *arg)
     (void)arg;
 
     uint64_t next_sync = 0;
+    uint64_t next_beat = 0;
+    uint32_t laps = 0;
 
     while (!s.stop) {
+        /*
+         * A heartbeat, because "the board stopped accepting" is a thing that
+         * cannot be caught in the act.  Every five seconds this says where the
+         * loop has been and how many times it has been round; a stage that
+         * stops advancing names the call that is blocking, which is the one
+         * thing an outside observer cannot see.  Add a counter rather than try
+         * to catch the moment.
+         */
+        const uint64_t beat = (uint64_t)ag_micros();
+        if (beat >= next_beat) {
+            next_beat = beat + 5000000ull;
+            ag_log(AG_LOG_INFO, "phone",
+                   "alive: %u laps, stage %u, listen=%d conn=%d closing=%d",
+                   (unsigned)laps, (unsigned)s.stage, (int)s.listen,
+                   (int)s.conn, (int)s.closing);
+        }
+        laps++;
+
+        s.stage = 1;
         /* The console's size, a few times a second.  See sync_console. */
         const uint64_t now = (uint64_t)ag_micros();
         if (now >= next_sync) {
             next_sync = now + 300000ull;
+            s.stage = 8;
             if (!sync_console()) {
                 TASK->sleep_ms(500u);
                 continue;
@@ -1806,14 +1829,17 @@ static void phone_task(void *arg)
 
         pump_deferred();
 
+        s.stage = 2;
         if (!ensure_listen()) {
             TASK->sleep_ms(200u);
             continue;
         }
+        s.stage = 3;
         if (!ensure_memory()) {
             TASK->sleep_ms(500u);
             continue;
         }
+        s.stage = 4;
 
         /*
          * A new connection, whether or not one is already live.  A phone that
@@ -1873,14 +1899,17 @@ static void phone_task(void *arg)
             TASK->sleep_ms(50u);
             continue;
         }
+        s.stage = 5;
         if (!pump_client()) {
             drop_conn("closed by peer");
             continue;
         }
+        s.stage = 6;
         if (!service_client()) {
             drop_conn("write failed");
             continue;
         }
+        s.stage = 7;
 
         /*
          * Ten milliseconds, which is the interval a screen is asked for rather
