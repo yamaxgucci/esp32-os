@@ -443,31 +443,41 @@ static wire_t send_all(ag_handle_t h, const void *buf, uint32_t len,
  * registry and every other driver in the machine is behind that lock.  Ten
  * seconds there is not a slow picture, it is a board that has stopped.
  */
-static wire_t ws_send(uint8_t op, const void *payload, uint32_t len,
-                      uint32_t hdr_ms, uint32_t body_ms)
+/*
+ * ONE write for the whole message, and that is why `payload` must have
+ * WS_SLACK writable bytes in front of it: the header is built there, so header
+ * and body leave as a single buffer.
+ *
+ * It used to be two writes, and that was a link that dropped itself.  A frame
+ * whose header has gone commits the client to waiting for exactly so many
+ * bytes, so a body that then cannot go is a stream nobody can parse and the
+ * only answer is to close - which is what happened ten seconds after an
+ * application started drawing: "client gone (write failed)", with no other
+ * word, because a body that never started was silently called a lost peer.
+ *
+ * As one write there is no half-sent frame to be committed by.  Nothing
+ * started is nothing broken, and the caller can simply come back to it.
+ */
+#define WS_SLACK 11u
+
+static wire_t ws_send(uint8_t op, void *payload, uint32_t len,
+                      uint32_t deadline_ms)
 {
     if (s.conn < 0) {
         return WIRE_GONE;
     }
-    uint8_t hdr[11];
+    uint8_t *p = (uint8_t *)payload;
+    uint8_t  hdr[WS_SLACK];
     const uint32_t n = ag_ws_hdr_build(hdr, AG_WS_BIN, len + 1u, true);
-    hdr[n] = op;
+
+    /* Header and op byte immediately before the payload, in its slack. */
+    memcpy(p - (n + 1u), hdr, n);
+    p[-1] = (int8_t)op;
 
     if (s.wire != NULL && !TASK->mutex_lock(s.wire, 3000u)) {
         return WIRE_STALL;
     }
-    wire_t r = send_all(s.conn, hdr, n + 1u, hdr_ms);
-    if (r == WIRE_OK && len > 0u) {
-        /*
-         * A stall here is fatal rather than retried: the header is out, so the
-         * client is inside a frame and waiting for exactly this many bytes, and
-         * failing is closing a stream that can no longer be read.
-         */
-        r = send_all(s.conn, payload, len, body_ms);
-        if (r == WIRE_STALL) {
-            r = WIRE_GONE;
-        }
-    }
+    const wire_t r = send_all(s.conn, p - (n + 1u), n + 1u + len, deadline_ms);
     if (s.wire != NULL) {
         TASK->mutex_unlock(s.wire);
     }
@@ -627,7 +637,8 @@ static void expected_digest(uint8_t out[DIGEST_LEN])
 
 static wire_t send_info(void)
 {
-    uint8_t p[9];
+    uint8_t buf[WS_SLACK + 9];
+    uint8_t *p = buf + WS_SLACK;
     lock();
     const uint32_t w = (s.frame_w != 0u) ? s.frame_w : s.cap_w;
     const uint32_t h = (s.frame_h != 0u) ? s.frame_h : s.cap_h;
@@ -649,12 +660,13 @@ static wire_t send_info(void)
     p[6] = (uint8_t)s.cell_w;
     p[7] = (uint8_t)s.cell_h;
     p[8] = s.publish_text ? INFO_HAS_TEXT : 0u;
-    return ws_send(OP_INFO, p, sizeof(p), 2000u, 10000u);
+    return ws_send(OP_INFO, p, 9u, 10000u);
 }
 
 static wire_t send_text_row(uint16_t row)
 {
-    uint8_t p[2u + TEXT_MAX_COLS * 2u];
+    uint8_t  buf[WS_SLACK + 2u + TEXT_MAX_COLS * 2u];
+    uint8_t *p = buf + WS_SLACK;
 
     lock();
     const uint16_t count = s.cols;
@@ -666,8 +678,7 @@ static wire_t send_text_row(uint16_t row)
     }
     unlock();
 
-    const wire_t r = ws_send(OP_ROW, p, 2u + (uint32_t)count * 2u,
-                             2000u, 10000u);
+    const wire_t r = ws_send(OP_ROW, p, 2u + (uint32_t)count * 2u, 10000u);
     /* Marked clean only once it has gone.  A row cleared before the send is a
      * row lost for good when the board was momentarily out of memory. */
     if (r == WIRE_OK) {
@@ -680,7 +691,8 @@ static wire_t send_text_row(uint16_t row)
 
 static wire_t send_cursor(void)
 {
-    uint8_t p[5];
+    uint8_t buf[WS_SLACK + 5];
+    uint8_t *p = buf + WS_SLACK;
 
     lock();
     p[0] = (uint8_t)s.cur_col;
@@ -690,7 +702,7 @@ static wire_t send_cursor(void)
     p[4] = s.cur_visible ? 1u : 0u;
     unlock();
 
-    const wire_t r = ws_send(OP_CURSOR, p, sizeof(p), 2000u, 10000u);
+    const wire_t r = ws_send(OP_CURSOR, p, 5u, 10000u);
     if (r == WIRE_OK) {
         lock();
         s.cur_dirty = false;
@@ -711,20 +723,24 @@ static wire_t send_cursor(void)
  */
 /* Encode whatever is in s.band and put it on the wire.  Both paths end here. */
 static wire_t encode_and_send(uint32_t x, uint32_t y, uint32_t w, uint32_t h,
-                              uint32_t hdr_ms, uint32_t body_ms)
+                              uint32_t deadline_ms)
 {
+    /* s.out is allocated with WS_SLACK bytes in front for ws_send's header. */
+    uint8_t       *body = s.out + WS_SLACK;
+    const uint32_t cap = s.band_cap - WS_SLACK;
+
     uint8_t op = 0;
     const uint32_t len = ag_pixband_encode(s.pix, s.band, w * h,
-                                           s.out + BAND_HDR,
-                                           s.band_cap - BAND_HDR, &op);
+                                           body + BAND_HDR, cap - BAND_HDR,
+                                           &op);
     if (len == 0u) {
         return WIRE_OK; /* refused rather than truncated: see ag_pixband.h */
     }
-    put16(s.out + 0, x);
-    put16(s.out + 2, y);
-    put16(s.out + 4, w);
-    put16(s.out + 6, h);
-    return ws_send(op, s.out, BAND_HDR + len, hdr_ms, body_ms);
+    put16(body + 0, x);
+    put16(body + 2, y);
+    put16(body + 4, w);
+    put16(body + 6, h);
+    return ws_send(op, body, BAND_HDR + len, deadline_ms);
 }
 
 static wire_t send_band(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
@@ -746,7 +762,7 @@ static wire_t send_band(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
     }
     unlock();
 
-    return encode_and_send(x, y, w, h, 2000u, 10000u);
+    return encode_and_send(x, y, w, h, 10000u);
 }
 
 /*
@@ -815,7 +831,7 @@ static wire_t send_blit_direct(const ag_blit_t *b)
              */
             const wire_t r = encode_and_send((uint32_t)b->x + x,
                                              (uint32_t)b->y + y, cols, rows,
-                                             5u, left_ms);
+                                             left_ms);
             if (r == WIRE_GONE) {
                 return r;
             }
@@ -880,7 +896,10 @@ static bool service_client(void)
      */
     if (needs_password() && !s.authed) {
         if (!s.challenged) {
-            const wire_t r = ws_send(OP_AUTH, s.nonce, NONCE_LEN, 2000u, 10000u);
+            uint8_t buf[WS_SLACK + NONCE_LEN];
+            memcpy(buf + WS_SLACK, s.nonce, NONCE_LEN);
+            const wire_t r =
+                ws_send(OP_AUTH, buf + WS_SLACK, NONCE_LEN, 10000u);
             if (r == WIRE_GONE) {
                 return false;
             }
@@ -1611,7 +1630,8 @@ static bool ensure_memory(void)
         }
         s.band_w = w;
         s.band_px = BAND_ROWS * w;
-        s.band_cap = BAND_HDR + s.band_px * 2u + s.band_px / 64u + 64u;
+        s.band_cap = WS_SLACK + BAND_HDR + s.band_px * 2u +
+                     s.band_px / 64u + 64u;
     }
 
     if (s.pix == NULL) {
