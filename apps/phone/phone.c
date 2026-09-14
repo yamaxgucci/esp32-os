@@ -360,6 +360,14 @@ static uint16_t rd16(const uint8_t *p)
  * WebSocket frame that stops halfway is not a lost rectangle, it is a stream
  * the client can no longer parse, and the only honest answer is to close.
  */
+/*
+ * Compare against WIRE_OK.  Never test one of these as a truth value: success
+ * is zero, so `if (send_all(...))` reads as "it worked" and means "it failed".
+ * That is not hypothetical - turning this from a bool into an enum did exactly
+ * that to four callers, and the board answered every page with a correct header
+ * and no body at all: "200 OK, 14700 bytes ... 0 bytes in 3.8s".  The compiler
+ * says nothing, because an enum converts to bool without a word.
+ */
 typedef enum {
     WIRE_OK = 0,
     WIRE_STALL, /* nothing sent, nothing broken - try again later */
@@ -424,7 +432,19 @@ static wire_t send_all(ag_handle_t h, const void *buf, uint32_t len,
  * The lock is never held across anything but this write, so the only thing that
  * can wait on it is another write.
  */
-static wire_t ws_send(uint8_t op, const void *payload, uint32_t len)
+/*
+ * `hdr_ms` is how long to wait for the frame to START, and `body_ms` how long
+ * to finish it once it has.  They are separate because the two are different
+ * promises: nothing is committed until the first byte, and everything is once
+ * it has gone.
+ *
+ * The caller chooses them, and the choice is not cosmetic.  The task can afford
+ * to wait; blit_rect cannot, because the kernel calls it holding the device
+ * registry and every other driver in the machine is behind that lock.  Ten
+ * seconds there is not a slow picture, it is a board that has stopped.
+ */
+static wire_t ws_send(uint8_t op, const void *payload, uint32_t len,
+                      uint32_t hdr_ms, uint32_t body_ms)
 {
     if (s.conn < 0) {
         return WIRE_GONE;
@@ -436,15 +456,14 @@ static wire_t ws_send(uint8_t op, const void *payload, uint32_t len)
     if (s.wire != NULL && !TASK->mutex_lock(s.wire, 3000u)) {
         return WIRE_STALL;
     }
-    wire_t r = send_all(s.conn, hdr, n + 1u, 2000u);
+    wire_t r = send_all(s.conn, hdr, n + 1u, hdr_ms);
     if (r == WIRE_OK && len > 0u) {
         /*
-         * Longer, and a stall here is fatal rather than retried: the header is
-         * out, so the client is inside a frame and waiting for exactly this
-         * many bytes.  Ten seconds is what a phone three rooms away may need;
-         * failing after that is closing a stream that can no longer be read.
+         * A stall here is fatal rather than retried: the header is out, so the
+         * client is inside a frame and waiting for exactly this many bytes, and
+         * failing is closing a stream that can no longer be read.
          */
-        r = send_all(s.conn, payload, len, 10000u);
+        r = send_all(s.conn, payload, len, body_ms);
         if (r == WIRE_STALL) {
             r = WIRE_GONE;
         }
@@ -630,7 +649,7 @@ static wire_t send_info(void)
     p[6] = (uint8_t)s.cell_w;
     p[7] = (uint8_t)s.cell_h;
     p[8] = s.publish_text ? INFO_HAS_TEXT : 0u;
-    return ws_send(OP_INFO, p, sizeof(p));
+    return ws_send(OP_INFO, p, sizeof(p), 2000u, 10000u);
 }
 
 static wire_t send_text_row(uint16_t row)
@@ -647,7 +666,8 @@ static wire_t send_text_row(uint16_t row)
     }
     unlock();
 
-    const wire_t r = ws_send(OP_ROW, p, 2u + (uint32_t)count * 2u);
+    const wire_t r = ws_send(OP_ROW, p, 2u + (uint32_t)count * 2u,
+                             2000u, 10000u);
     /* Marked clean only once it has gone.  A row cleared before the send is a
      * row lost for good when the board was momentarily out of memory. */
     if (r == WIRE_OK) {
@@ -670,7 +690,7 @@ static wire_t send_cursor(void)
     p[4] = s.cur_visible ? 1u : 0u;
     unlock();
 
-    const wire_t r = ws_send(OP_CURSOR, p, sizeof(p));
+    const wire_t r = ws_send(OP_CURSOR, p, sizeof(p), 2000u, 10000u);
     if (r == WIRE_OK) {
         lock();
         s.cur_dirty = false;
@@ -690,7 +710,8 @@ static wire_t send_cursor(void)
  * should be made to wait for.
  */
 /* Encode whatever is in s.band and put it on the wire.  Both paths end here. */
-static wire_t encode_and_send(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+static wire_t encode_and_send(uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                              uint32_t hdr_ms, uint32_t body_ms)
 {
     uint8_t op = 0;
     const uint32_t len = ag_pixband_encode(s.pix, s.band, w * h,
@@ -703,7 +724,7 @@ static wire_t encode_and_send(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
     put16(s.out + 2, y);
     put16(s.out + 4, w);
     put16(s.out + 6, h);
-    return ws_send(op, s.out, BAND_HDR + len);
+    return ws_send(op, s.out, BAND_HDR + len, hdr_ms, body_ms);
 }
 
 static wire_t send_band(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
@@ -725,7 +746,7 @@ static wire_t send_band(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
     }
     unlock();
 
-    return encode_and_send(x, y, w, h);
+    return encode_and_send(x, y, w, h, 2000u, 10000u);
 }
 
 /*
@@ -744,12 +765,39 @@ static wire_t send_blit_direct(const ag_blit_t *b)
     }
     const uint8_t *src = (const uint8_t *)b->px;
 
+    /*
+     * A budget for the whole rectangle, and a small one.
+     *
+     * The kernel calls blit_rect holding the device registry, and every other
+     * driver in the machine is behind that lock - the console, the panel, the
+     * touchscreen.  Whatever is spent here is spent by all of them.  The first
+     * version of this path gave each band ten seconds and gfxdemo froze the
+     * board solid; the picture is worth some milliseconds and it is not worth
+     * the machine.
+     *
+     * So: a hundred milliseconds for the lot.  What does not fit is not sent,
+     * and a rectangle that was not sent is a stale part of somebody's screen
+     * until the next time they draw - which is what a video link does anyway.
+     * A band that cannot even start is skipped without breaking the stream,
+     * because nothing of it has gone.
+     */
+    const uint64_t until = ag_micros() + 100000ull;
+
     for (uint32_t y = 0; y < b->h; y += BAND_ROWS) {
         uint32_t rows = b->h - y;
         if (rows > BAND_ROWS) {
             rows = BAND_ROWS;
         }
         for (uint32_t x = 0; x < b->w; x += s.band_w) {
+            const uint64_t now = ag_micros();
+            if (now >= until) {
+                return WIRE_OK; /* out of time, not out of connection */
+            }
+            uint32_t left_ms = (uint32_t)((until - now) / 1000ull);
+            if (left_ms > 40u) {
+                left_ms = 40u;
+            }
+
             uint32_t cols = b->w - x;
             if (cols > s.band_w) {
                 cols = s.band_w;
@@ -760,10 +808,19 @@ static wire_t send_blit_direct(const ag_blit_t *b)
                            (size_t)x * sizeof(uint16_t),
                        (size_t)cols * sizeof(uint16_t));
             }
+            /*
+             * Five milliseconds to start and the rest to finish.  Starting is
+             * the cheap test for "can this go at all"; once it has started the
+             * frame must be completed or the stream is broken.
+             */
             const wire_t r = encode_and_send((uint32_t)b->x + x,
-                                             (uint32_t)b->y + y, cols, rows);
-            if (r != WIRE_OK) {
+                                             (uint32_t)b->y + y, cols, rows,
+                                             5u, left_ms);
+            if (r == WIRE_GONE) {
                 return r;
+            }
+            if (r == WIRE_STALL) {
+                return WIRE_OK; /* nothing started; leave the rest for later */
             }
         }
     }
@@ -823,7 +880,7 @@ static bool service_client(void)
      */
     if (needs_password() && !s.authed) {
         if (!s.challenged) {
-            const wire_t r = ws_send(OP_AUTH, s.nonce, NONCE_LEN);
+            const wire_t r = ws_send(OP_AUTH, s.nonce, NONCE_LEN, 2000u, 10000u);
             if (r == WIRE_GONE) {
                 return false;
             }
@@ -1161,8 +1218,9 @@ static bool pump_client(void)
                 uint8_t hdr[11];
                 const uint32_t k = ag_ws_hdr_build(hdr, AG_WS_PONG, h.len,
                                                    true);
-                if (!send_all(s.conn, hdr, k, 500u) ||
-                    (h.len > 0u && !send_all(s.conn, body, h.len, 500u))) {
+                if (send_all(s.conn, hdr, k, 500u) != WIRE_OK ||
+                    (h.len > 0u &&
+                     send_all(s.conn, body, h.len, 500u) != WIRE_OK)) {
                     have = 0;
                     return false;
                 }
@@ -1367,22 +1425,36 @@ static void serve_page(ag_handle_t h)
                            "Cache-Control: no-store\r\n"
                            "Connection: close\r\n\r\n",
                            (unsigned)st.size);
-    if (n > 0 && send_all(h, hdr, (uint32_t)n, 2000u)) {
+    if (n > 0 && send_all(h, hdr, (uint32_t)n, 2000u) == WIRE_OK) {
         /*
          * A kilobyte at a time, with ten seconds for each.  Generous on purpose:
          * this is going to a phone that may be three rooms away on a weak
          * signal, and the alternative to waiting is a page that arrives
          * truncated - which a browser renders as a blank screen and no error.
          */
-        uint8_t buf[1024];
+        uint8_t  buf[1024];
+        uint32_t sent = 0;
         for (;;) {
             const int32_t got = ag_read(f, buf, sizeof(buf));
             if (got <= 0) {
                 break;
             }
-            if (!send_all(h, buf, (uint32_t)got, 10000u)) {
+            const wire_t w = send_all(h, buf, (uint32_t)got, 10000u);
+            if (w != WIRE_OK) {
+                /*
+                 * Said, not swallowed.  A page that stops halfway is a blank
+                 * screen in the browser and no error anywhere, and the only
+                 * way to tell "the client stopped reading" from "the board ran
+                 * out" is for this to name which one it was.
+                 */
+                ag_log(AG_LOG_WARN, "phone",
+                       "page stopped after %u of %u bytes (%s)",
+                       (unsigned)sent, (unsigned)st.size,
+                       (w == WIRE_STALL) ? "the client stopped reading"
+                                         : "the connection went");
                 break;
             }
+            sent += (uint32_t)got;
         }
     }
     (void)ag_close(f);
@@ -1445,7 +1517,7 @@ static bool serve_request(ag_handle_t h)
                                   "Connection: Upgrade\r\n"
                                   "Sec-WebSocket-Accept: %s\r\n\r\n",
                                   accept);
-        if (n <= 0 || !send_all(h, resp, (uint32_t)n, 2000u)) {
+        if (n <= 0 || send_all(h, resp, (uint32_t)n, 2000u) != WIRE_OK) {
             return false;
         }
 
@@ -2100,6 +2172,22 @@ ag_err_t ag_driver_init(void)
     }
 
     s.publish_text = want_text();
+
+    /*
+     * The console mirror BEFORE the device is published, and that ordering is
+     * the whole of it.
+     *
+     * The kernel paints a text panel in full exactly once: the first tick after
+     * it sees the driver.  Every tick after that it offers only the rows that
+     * changed.  With the mirror allocated later, on the task, that one full
+     * paint arrived while text_row still had nowhere to put it and was dropped
+     * - so the phone opened on a blank screen and filled in a line at a time as
+     * things happened to change.  Reported exactly that way: "the console is
+     * empty; I started typing and the prompt appeared".
+     */
+    if (!sync_console()) {
+        return -AG_ENOMEM;
+    }
 
     ag_strlcpy(s.page, "C:\\PHONE.GZ", sizeof(s.page));
     if (api->cfg != NULL && AG_HAS(api->cfg, get_str)) {

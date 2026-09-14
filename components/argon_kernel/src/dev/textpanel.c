@@ -268,6 +268,17 @@ typedef struct {
     const ag_display_ops_t *ops;
     uint16_t                caret_col;
     uint16_t                caret_row;
+    /*
+     * The size this panel last said it was.  A panel is repainted in full when
+     * it first appears, and until this was remembered that was the only time -
+     * so a panel that changed its mind afterwards kept whatever it had.  The
+     * phone link does exactly that: it mirrors the console, the console is
+     * sized a second time once the board's own panel driver has loaded, and the
+     * mirror it lays out for the new size starts empty.  Reported as a screen
+     * that was blank until something happened to change on it.
+     */
+    uint16_t                said_cols;
+    uint16_t                said_rows;
     bool                    caret_lit;
     bool                    present; /* seen in this pass                    */
 } textpanel_t;
@@ -347,6 +358,11 @@ static void render_one(const ag_screen_t *screen, const ag_display_ops_t *ops,
     if (ops->text_info != NULL) {
         uint16_t pcols = cols, prows = rows;
         if (ops->text_info(0, &pcols, &prows) == AG_OK) {
+            if (pcols != tp->said_cols || prows != tp->said_rows) {
+                tp->said_cols = pcols;
+                tp->said_rows = prows;
+                full = true; /* a panel of a new size has nothing on it */
+            }
             panel_rows = prows;
             if (pcols < cols) {
                 cols = pcols;
