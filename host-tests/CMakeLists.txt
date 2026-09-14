@@ -154,6 +154,10 @@ add_executable(argon_tests
     test_phonelink.c
     "${ARGON_ROOT}/apps/common/pixband/ag_pixband.c"
     "${ARGON_ROOT}/apps/common/ws/ag_ws.c"
+    test_espldr.c
+    "${ARGON_ROOT}/apps/common/esp8266/ag_espldr.c"
+    test_stm32ldr.c
+    "${ARGON_ROOT}/apps/common/stm32/ag_stm32ldr.c"
     "${ARGON_ROOT}/tools/nam.c"
     "${ARGON_ROOT}/apps/cc/cc_compile.c"
     "${ARGON_ROOT}/components/argon_kernel/src/dev/draw.c"

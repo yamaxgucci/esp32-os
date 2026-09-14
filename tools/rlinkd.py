@@ -25,7 +25,7 @@ import threading
 
 # --- protocol constants (keep in step with apps/common/rlink/ag_rlink.h) ----
 RL_MAGIC = 0x4B4E4C52  # 'RLNK'
-RL_PROTO_VERSION = 1
+RL_PROTO_VERSION = 2  # v2: START carries Wi-Fi credentials (ssid+pass)
 RL_HDR_SIZE = 28
 RL_MAX_PAYLOAD = 1600
 
@@ -165,7 +165,15 @@ class Radio:
         self.reply(h["seq"], RL_OP_HELLO, status=0,
                    a0=RL_PROTO_VERSION, a1=RL_CAP_SOCKETS)
 
-    def on_start(self, h):
+    def on_start(self, h, payload):
+        # v2: START may carry Wi-Fi credentials (ssid then passphrase, a0 =
+        # ssid length).  A real coprocessor joins that network here; we ride
+        # the host's, so we only note it.
+        if h["len"]:
+            sl = min(h["a0"], len(payload))
+            ssid = payload[:sl].decode("ascii", "replace")
+            print(f"rlinkd: START join '{ssid}' (pass {len(payload) - sl}b)",
+                  flush=True)
         self.started = True
         self.reply(h["seq"], RL_OP_START, status=0)
         # A real modem raises "got address" a moment after the link is up.
@@ -288,7 +296,7 @@ class Radio:
     def run(self):
         handlers = {
             RL_OP_HELLO: lambda h, p: self.on_hello(h),
-            RL_OP_START: lambda h, p: self.on_start(h),
+            RL_OP_START: lambda h, p: self.on_start(h, p),
             RL_OP_READY: lambda h, p: self.on_ready(h),
             RL_OP_IFADDR: lambda h, p: self.on_ifaddr(h),
             RL_OP_RESOLVE: lambda h, p: self.on_resolve(h, p),

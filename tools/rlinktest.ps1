@@ -96,7 +96,7 @@ try {
     ) | Out-Null
 
     $t = Transcript 'build\rlinktest.log'
-    Check $t 'coprocessor proto 1' 'radio-handshake'
+    Check $t 'coprocessor proto 2' 'radio-handshake'
     Check $t '/dev/extradio' 'radio-device-registered'
     Check $t 'network is via extradio' 'radio-bound-as-provider'
     Check $t 'via extradio' 'net-status-shows-provider'

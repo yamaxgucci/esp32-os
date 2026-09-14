@@ -1,0 +1,6 @@
+/build/
+sdkconfig
+sdkconfig.old
+# codec copied in at configure time from apps/common/rlink (single source of truth)
+main/ag_rlink.c
+main/ag_rlink.h
