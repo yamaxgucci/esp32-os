@@ -1986,7 +1986,8 @@ extern "C" void ag_store_use_note(const char *line)
 extern "C" void ag_map_inventory_note(unsigned files, unsigned kb,
                                       unsigned skipped,
                                       const unsigned *n_by_kind,
-                                      const unsigned *kb_by_kind)
+                                      const unsigned *kb_by_kind,
+                                      unsigned exits)
 {
     static const char *const kind[16] = {
         "item", "critter", "scenery", "wall", "tile", "misc", "iface",
@@ -2003,8 +2004,8 @@ extern "C" void ag_map_inventory_note(unsigned files, unsigned kb,
         }
     }
     shim_printf("[mapart] this location needs %u distinct pictures, %u KB "
-                "(%u past the table) |%s\n",
-                files, kb, skipped, line);
+                "(%u past the table) | %u hexes lead out of it |%s\n",
+                files, kb, skipped, exits, line);
 }
 
 extern "C" void ag_map_fill_note(unsigned kept, unsigned kb,

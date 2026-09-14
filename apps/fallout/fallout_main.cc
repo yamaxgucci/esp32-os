@@ -1419,6 +1419,11 @@ extern "C" int ag_map_fill = 0;
  * has actually shown instead of by a whole screen in every direction.  Off
  * by default until the two have been compared side by side. */
 extern "C" int ag_render_tight = 0;
+
+/* ARGON: -exits 0 turns off the green hexes that mark where a location can
+ * be walked out of.  On by default: Maxim left two locations by accident
+ * because nothing on the screen said where the edge was. */
+extern "C" int ag_show_exits = 1;
 /*
  * How many of the character's animations are held against eviction; -pins N.
  *
@@ -1652,6 +1657,8 @@ extern "C" int ag_cxx_main(int argc, char **argv)
             ag_art_pins = to_int(argv[++i]);
         } else if (same(argv[i], "-artcache") && i + 1 < argc) {
             ag_art_cache_kb = to_int(argv[++i]);
+        } else if (same(argv[i], "-exits") && i + 1 < argc) {
+            ag_show_exits = to_int(argv[++i]);
         } else if (same(argv[i], "-render") && i + 1 < argc) {
             ag_render_tight = to_int(argv[++i]);
         } else if (same(argv[i], "-mapfill") && i + 1 < argc) {
