@@ -1536,6 +1536,15 @@ unsigned ag_anim_worst_seq_us, ag_anim_worst_move_us;
 unsigned ag_anim_worst_script_us;
 unsigned ag_path_us, ag_path_n;
 unsigned ag_layer_n;
+extern "C" int ag_render_tight;
+
+/* ARGON: the widest and the lowest-reaching art this map has actually shown,
+ * in pixels from a tile's own point.  Grown in object.cc from the bounds the
+ * engine itself computed while drawing; they bound the object search area
+ * under -render 1. */
+extern "C" int ag_reach_side = 0;
+extern "C" int ag_reach_down = 0;
+
 unsigned ag_render_calls, ag_render_steps, ag_render_inrange;
 unsigned ag_render_tiles, ag_render_objects, ag_render_draw_us;
 unsigned ag_render_objects2, ag_render_draw2_us;
@@ -2179,11 +2188,14 @@ static void render_report(void)
     }
     shim_printf("[render t=%u] %u passes | %u steps, %u in range, "
                 "%u tiles with objects | flat %u in %u ms, "
-                "upright %u in %u ms\n",
+                "upright %u in %u ms | search %s, widest art %u px, "
+                "lowest %u px\n",
                 (unsigned)ag_millis(), ag_render_calls, ag_render_steps,
                 ag_render_inrange, ag_render_tiles, ag_render_objects,
                 ag_render_draw_us / 1000u, ag_render_objects2,
-                ag_render_draw2_us / 1000u);
+                ag_render_draw2_us / 1000u,
+                (ag_render_tight != 0) ? "tight" : "a whole screen",
+                (unsigned)ag_reach_side, (unsigned)ag_reach_down);
     ag_render_calls = 0; ag_render_steps = 0; ag_render_inrange = 0;
     ag_render_tiles = 0; ag_render_objects = 0; ag_render_draw_us = 0;
     ag_render_objects2 = 0; ag_render_draw2_us = 0;

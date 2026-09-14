@@ -1414,6 +1414,11 @@ extern "C" int ag_art_cache_kb = 0;
  * ordering it brings (walking last) is the right shape for a store smaller
  * than the map. */
 extern "C" int ag_map_fill = 0;
+
+/* ARGON: -render 1 bounds the object search area by the widest art this map
+ * has actually shown instead of by a whole screen in every direction.  Off
+ * by default until the two have been compared side by side. */
+extern "C" int ag_render_tight = 0;
 /*
  * How many of the character's animations are held against eviction; -pins N.
  *
@@ -1647,6 +1652,8 @@ extern "C" int ag_cxx_main(int argc, char **argv)
             ag_art_pins = to_int(argv[++i]);
         } else if (same(argv[i], "-artcache") && i + 1 < argc) {
             ag_art_cache_kb = to_int(argv[++i]);
+        } else if (same(argv[i], "-render") && i + 1 < argc) {
+            ag_render_tight = to_int(argv[++i]);
         } else if (same(argv[i], "-mapfill") && i + 1 < argc) {
             ag_map_fill = to_int(argv[++i]);
         } else if (same(argv[i], "-artflash") && i + 1 < argc) {
