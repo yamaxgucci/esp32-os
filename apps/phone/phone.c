@@ -280,6 +280,13 @@ static struct {
     uint64_t    closing_until;
     volatile bool     up;
     volatile bool     owe_everything;
+    /*
+     * Just the geometry, without the console behind it.  A surface that
+     * changes size while an application is drawing needs the page told; it
+     * does not need twenty-five rows of stale console painted over the
+     * picture, which is what owing "everything" would do.
+     */
+    volatile bool     owe_info;
 
     /* Where the page is, on this board's own disk. */
     char     page[64];
@@ -298,6 +305,7 @@ static struct {
     uint32_t          band_w;
     uint32_t          band_px;
     uint32_t          band_cap;
+    uint32_t          direct_at; /* which band the budget stopped on         */
     bool              moaned_frame;
     bool              moaned_mem;
     bool              want_frame;
@@ -461,7 +469,7 @@ static wire_t send_all(ag_handle_t h, const void *buf, uint32_t len,
 #define WS_SLACK 11u
 
 static wire_t ws_send(uint8_t op, void *payload, uint32_t len,
-                      uint32_t deadline_ms)
+                      uint32_t deadline_ms, uint32_t lock_ms)
 {
     if (s.conn < 0) {
         return WIRE_GONE;
@@ -474,7 +482,18 @@ static wire_t ws_send(uint8_t op, void *payload, uint32_t len,
     memcpy(p - (n + 1u), hdr, n);
     p[-1] = (int8_t)op;
 
-    if (s.wire != NULL && !TASK->mutex_lock(s.wire, 3000u)) {
+    /*
+     * `lock_ms` is zero for the caller that must not wait at all.
+     *
+     * blit_rect is called with the device registry held, so anything this waits
+     * for is waited for by the console tick, the panel and the touchscreen as
+     * well.  Bounding the *send* was not enough: the wire mutex was still taken
+     * with three seconds of patience, and three seconds of the registry is a
+     * board that has visibly stopped - the glass froze on the loader's line and
+     * never came back.  If the task is mid-message, this frame is simply not
+     * this frame's to send.
+     */
+    if (s.wire != NULL && !TASK->mutex_lock(s.wire, lock_ms)) {
         return WIRE_STALL;
     }
     const wire_t r = send_all(s.conn, p - (n + 1u), n + 1u + len, deadline_ms);
@@ -660,7 +679,7 @@ static wire_t send_info(void)
     p[6] = (uint8_t)s.cell_w;
     p[7] = (uint8_t)s.cell_h;
     p[8] = s.publish_text ? INFO_HAS_TEXT : 0u;
-    return ws_send(OP_INFO, p, 9u, 10000u);
+    return ws_send(OP_INFO, p, 9u, 10000u, 3000u);
 }
 
 static wire_t send_text_row(uint16_t row)
@@ -678,7 +697,8 @@ static wire_t send_text_row(uint16_t row)
     }
     unlock();
 
-    const wire_t r = ws_send(OP_ROW, p, 2u + (uint32_t)count * 2u, 10000u);
+    const wire_t r =
+        ws_send(OP_ROW, p, 2u + (uint32_t)count * 2u, 10000u, 3000u);
     /* Marked clean only once it has gone.  A row cleared before the send is a
      * row lost for good when the board was momentarily out of memory. */
     if (r == WIRE_OK) {
@@ -702,7 +722,7 @@ static wire_t send_cursor(void)
     p[4] = s.cur_visible ? 1u : 0u;
     unlock();
 
-    const wire_t r = ws_send(OP_CURSOR, p, 5u, 10000u);
+    const wire_t r = ws_send(OP_CURSOR, p, 5u, 10000u, 3000u);
     if (r == WIRE_OK) {
         lock();
         s.cur_dirty = false;
@@ -723,7 +743,7 @@ static wire_t send_cursor(void)
  */
 /* Encode whatever is in s.band and put it on the wire.  Both paths end here. */
 static wire_t encode_and_send(uint32_t x, uint32_t y, uint32_t w, uint32_t h,
-                              uint32_t deadline_ms)
+                              uint32_t deadline_ms, uint32_t lock_ms)
 {
     /* s.out is allocated with WS_SLACK bytes in front for ws_send's header. */
     uint8_t       *body = s.out + WS_SLACK;
@@ -740,7 +760,7 @@ static wire_t encode_and_send(uint32_t x, uint32_t y, uint32_t w, uint32_t h,
     put16(body + 2, y);
     put16(body + 4, w);
     put16(body + 6, h);
-    return ws_send(op, body, BAND_HDR + len, deadline_ms);
+    return ws_send(op, body, BAND_HDR + len, deadline_ms, lock_ms);
 }
 
 static wire_t send_band(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
@@ -762,7 +782,7 @@ static wire_t send_band(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
     }
     unlock();
 
-    return encode_and_send(x, y, w, h, 10000u);
+    return encode_and_send(x, y, w, h, 10000u, 3000u);
 }
 
 /*
@@ -787,59 +807,72 @@ static wire_t send_blit_direct(const ag_blit_t *b)
      * The kernel calls blit_rect holding the device registry, and every other
      * driver in the machine is behind that lock - the console, the panel, the
      * touchscreen.  Whatever is spent here is spent by all of them.  The first
-     * version of this path gave each band ten seconds and gfxdemo froze the
-     * board solid; the picture is worth some milliseconds and it is not worth
-     * the machine.
-     *
-     * So: a hundred milliseconds for the lot.  What does not fit is not sent,
-     * and a rectangle that was not sent is a stale part of somebody's screen
-     * until the next time they draw - which is what a video link does anyway.
-     * A band that cannot even start is skipped without breaking the stream,
-     * because nothing of it has gone.
+     * version gave each band ten seconds and gfxdemo froze the board solid; the
+     * picture is worth some milliseconds and it is not worth the machine.
      */
-    const uint64_t until = ag_micros() + 100000ull;
+    const uint64_t until = ag_micros() + 60000ull;
 
-    for (uint32_t y = 0; y < b->h; y += BAND_ROWS) {
+    const uint32_t down = (b->h + BAND_ROWS - 1u) / BAND_ROWS;
+    const uint32_t across = (b->w + s.band_w - 1u) / s.band_w;
+    const uint32_t total = down * across;
+    if (total == 0u) {
+        return WIRE_OK;
+    }
+
+    /*
+     * Starting where the last one stopped, and wrapping.
+     *
+     * With a budget, an application that draws the same rectangle over and
+     * over would send the top of it every time and the bottom never - the cut
+     * always falls in the same place.  Carrying the position over makes the
+     * whole picture arrive across a few frames instead of a third of it
+     * arriving for ever.
+     */
+    uint32_t at = s.direct_at % total;
+    uint32_t done = 0;
+
+    while (done < total) {
+        const uint64_t now = ag_micros();
+        if (now >= until) {
+            break; /* out of time, not out of connection */
+        }
+        uint32_t left_ms = (uint32_t)((until - now) / 1000ull);
+        if (left_ms > 20u) {
+            left_ms = 20u;
+        }
+
+        const uint32_t y = (at / across) * BAND_ROWS;
+        const uint32_t x = (at % across) * s.band_w;
         uint32_t rows = b->h - y;
         if (rows > BAND_ROWS) {
             rows = BAND_ROWS;
         }
-        for (uint32_t x = 0; x < b->w; x += s.band_w) {
-            const uint64_t now = ag_micros();
-            if (now >= until) {
-                return WIRE_OK; /* out of time, not out of connection */
-            }
-            uint32_t left_ms = (uint32_t)((until - now) / 1000ull);
-            if (left_ms > 40u) {
-                left_ms = 40u;
-            }
-
-            uint32_t cols = b->w - x;
-            if (cols > s.band_w) {
-                cols = s.band_w;
-            }
-            for (uint32_t r = 0; r < rows; r++) {
-                memcpy(s.band + r * cols,
-                       src + (size_t)(y + r) * b->stride +
-                           (size_t)x * sizeof(uint16_t),
-                       (size_t)cols * sizeof(uint16_t));
-            }
-            /*
-             * Five milliseconds to start and the rest to finish.  Starting is
-             * the cheap test for "can this go at all"; once it has started the
-             * frame must be completed or the stream is broken.
-             */
-            const wire_t r = encode_and_send((uint32_t)b->x + x,
-                                             (uint32_t)b->y + y, cols, rows,
-                                             left_ms);
-            if (r == WIRE_GONE) {
-                return r;
-            }
-            if (r == WIRE_STALL) {
-                return WIRE_OK; /* nothing started; leave the rest for later */
-            }
+        uint32_t cols = b->w - x;
+        if (cols > s.band_w) {
+            cols = s.band_w;
         }
+
+        for (uint32_t r = 0; r < rows; r++) {
+            memcpy(s.band + r * cols,
+                   src + (size_t)(y + r) * b->stride +
+                       (size_t)x * sizeof(uint16_t),
+                   (size_t)cols * sizeof(uint16_t));
+        }
+        /* Zero patience for the mutex: see ws_send.  The registry is held here
+         * and everything else in the machine is behind it. */
+        const wire_t r = encode_and_send((uint32_t)b->x + x, (uint32_t)b->y + y,
+                                         cols, rows, left_ms, 0u);
+        if (r == WIRE_GONE) {
+            s.direct_at = at;
+            return r;
+        }
+        if (r == WIRE_STALL) {
+            break; /* nothing started; leave the rest for the next frame */
+        }
+        at = (at + 1u) % total;
+        done++;
     }
+    s.direct_at = at;
     return WIRE_OK;
 }
 
@@ -899,11 +932,23 @@ static bool service_client(void)
             uint8_t buf[WS_SLACK + NONCE_LEN];
             memcpy(buf + WS_SLACK, s.nonce, NONCE_LEN);
             const wire_t r =
-                ws_send(OP_AUTH, buf + WS_SLACK, NONCE_LEN, 10000u);
+                ws_send(OP_AUTH, buf + WS_SLACK, NONCE_LEN, 10000u,
+                        3000u);
             if (r == WIRE_GONE) {
                 return false;
             }
             s.challenged = (r == WIRE_OK);
+        }
+        return true;
+    }
+
+    if (s.owe_info && !s.owe_everything) {
+        const wire_t r = send_info();
+        if (r == WIRE_GONE) {
+            return false;
+        }
+        if (r == WIRE_OK) {
+            s.owe_info = false;
         }
         return true;
     }
@@ -917,6 +962,7 @@ static bool service_client(void)
             return true; /* still owed; try again next pass */
         }
         s.owe_everything = false;
+        s.owe_info = false;
         lock();
         for (uint32_t r2 = 0; r2 < s.rows; r2++) {
             s.row_dirty[r2] = 1u;
@@ -1444,6 +1490,7 @@ static void serve_page(ag_handle_t h)
                            "Cache-Control: no-store\r\n"
                            "Connection: close\r\n\r\n",
                            (unsigned)st.size);
+    ag_log(AG_LOG_INFO, "phone", "GET / -> %u bytes", (unsigned)st.size);
     if (n > 0 && send_all(h, hdr, (uint32_t)n, 2000u) == WIRE_OK) {
         /*
          * A kilobyte at a time, with ten seconds for each.  Generous on purpose:
@@ -1474,6 +1521,10 @@ static void serve_page(ag_handle_t h)
                 break;
             }
             sent += (uint32_t)got;
+        }
+        if (sent == st.size) {
+            ag_log(AG_LOG_INFO, "phone", "page sent whole (%u bytes)",
+                   (unsigned)sent);
         }
     }
     (void)ag_close(f);
@@ -1658,8 +1709,20 @@ static bool ensure_memory(void)
 
     uint32_t w = s.want_w;
     uint32_t h = s.want_h;
-    if (w == 0u || h == 0u || !s.want_frame) {
+    if (w == 0u || h == 0u) {
         return true; /* nothing has asked for more than what is already held */
+    }
+    if (!s.want_frame) {
+        /*
+         * No frame, but the size is still the answer to "how big is this
+         * screen".  Leaving it at zero meant the geometry message said 0x0, the
+         * page never sized its canvas, and bands landed in the 300x150 a
+         * browser gives an unsized one - which is exactly the "the screen got
+         * narrower" that came back from the board.
+         */
+        s.cap_w = w;
+        s.cap_h = h;
+        return true;
     }
     if (s.frame != NULL && w <= s.cap_w && h <= s.cap_h) {
         s.want_w = 0;
@@ -1759,6 +1822,21 @@ static void phone_task(void *arg)
          * for as long as TCP takes to notice.  So the newest upgrade wins.
          */
         const ag_handle_t fresh = ag_tcp_accept(s.listen, 0u);
+        /*
+         * A listener can die, and when it does nothing says so: accept goes on
+         * answering the same error for ever and the board simply stops letting
+         * anybody in, with the log as quiet as if nobody had knocked.  EAGAIN
+         * is the ordinary "nobody yet"; anything else means this socket is no
+         * longer a door, so close it and open another.
+         */
+        if (fresh < 0 && fresh != -AG_EAGAIN && fresh != -AG_ETIMEDOUT) {
+            ag_log(AG_LOG_WARN, "phone", "listener died (%d); reopening",
+                   (int)fresh);
+            (void)ag_net_close(s.listen);
+            s.listen = -1;
+            TASK->sleep_ms(200u);
+            continue;
+        }
         if (fresh >= 0) {
             /*
              * And turned away at the door when the board has nothing left.
@@ -1774,15 +1852,16 @@ static void phone_task(void *arg)
             ag_meminfo_t mi;
             ag_meminfo(&mi);
             if (mi.system_free < MEM_FLOOR) {
-                if (!s.moaned_mem) {
-                    s.moaned_mem = true;
-                    ag_log(AG_LOG_WARN, "phone",
-                           "refusing a visitor: %u bytes free, floor is %u",
-                           (unsigned)mi.system_free, (unsigned)MEM_FLOOR);
-                }
+                /*
+                 * Said every time and not once.  This is the answer to "the
+                 * page does not load" and it must be in the journal for the
+                 * attempt being asked about, not for the first one after boot.
+                 */
+                ag_log(AG_LOG_WARN, "phone",
+                       "refused a visitor: %u bytes free, floor is %u",
+                       (unsigned)mi.system_free, (unsigned)MEM_FLOOR);
                 (void)ag_net_close(fresh);
             } else {
-                s.moaned_mem = false;
                 (void)ag_net_set_nonblock(fresh, true);
                 if (!serve_request(fresh)) {
                     (void)ag_net_close(fresh);
@@ -1905,6 +1984,16 @@ static void phone_blit_rect(ag_handle_t h, const ag_blit_t *b)
      * PSRAM can show a picture at all.
      */
     if (s.frame == NULL && s.pix != NULL) {
+        /*
+         * The surface's size, learned from the blit itself.  With no frame
+         * there is nothing else that knows it, and the page needs it to size
+         * the canvas these bands are placed on.
+         */
+        if (s.frame_w != b->surf_w || s.frame_h != b->surf_h) {
+            s.frame_w = b->surf_w;
+            s.frame_h = b->surf_h;
+            s.owe_info = true;
+        }
         if (s.conn >= 0 && (!needs_password() || s.authed)) {
             (void)send_blit_direct(b);
         }
@@ -1938,7 +2027,7 @@ static void phone_blit_rect(ag_handle_t h, const ag_blit_t *b)
         s.dy0 = 0;
         s.dx1 = 0;
         s.dy1 = 0;
-        s.owe_everything = true;
+        s.owe_info = true;
     }
 
     const uint8_t *src = (const uint8_t *)b->px;
