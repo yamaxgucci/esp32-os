@@ -911,11 +911,14 @@ function buildKeyboard() {
       row.appendChild(sh);
     }
     for (const spec of KEYS[i]) row.appendChild(keyButton(spec));
+    /* Enter on the home row, backspace under it: Maxim asked for these
+     * two the other way round, and the one under the thumb should be
+     * the one that deletes rather than the one that submits. */
     if (i === 2) {
-      row.appendChild(specialButton("⌫", "mod", () => tap(K.back)));
+      row.appendChild(specialButton("⏎", "mod", () => tap(K.enter)));
     }
     if (i === 3) {
-      row.appendChild(specialButton("⏎", "mod", () => tap(K.enter)));
+      row.appendChild(specialButton("⌫", "mod", () => tap(K.back)));
     }
     ui.kbd.appendChild(row);
   }
