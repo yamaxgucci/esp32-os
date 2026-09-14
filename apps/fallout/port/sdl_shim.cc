@@ -1990,6 +1990,16 @@ extern "C" void ag_map_inventory_note(unsigned files, unsigned kb,
                 files, kb, skipped, line);
 }
 
+extern "C" void ag_map_fill_note(unsigned kept, unsigned kb,
+                                 unsigned already, unsigned too_big,
+                                 unsigned left, unsigned buf_kb, unsigned ms)
+{
+    shim_printf("[mapfill] %u pictures put in, %u KB, in %u ms | %u were "
+                "already there, %u too big for the %u KB buffer, %u left "
+                "when the store filled up\n",
+                kept, kb, ms, already, too_big, buf_kb, left);
+}
+
 extern "C" void ag_reread_note(int fid, unsigned bytes)
 {
     /* Not while a map is loading: everything is read then, once, and that

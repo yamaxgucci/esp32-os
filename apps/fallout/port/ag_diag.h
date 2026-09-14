@@ -322,6 +322,13 @@ void ag_map_inventory_note(unsigned files, unsigned kb, unsigned skipped,
                            const unsigned *n_by_kind,
                            const unsigned *kb_by_kind);
 
+/* And what filling the store from that inventory actually managed: how many
+ * pictures went in, how many were already there, how many were too big for
+ * the one buffer, and how many were left when the store ran out of room. */
+void ag_map_fill_note(unsigned kept, unsigned kb, unsigned already,
+                      unsigned too_big, unsigned left, unsigned buf_kb,
+                      unsigned ms);
+
 /* Where script time goes, by opcode (1024 of them, indexed by opcode &
  * 0x3FF).  Reported as the few that cost anything. */
 extern unsigned ag_op_us[1024], ag_op_n[1024], ag_op_worst[1024];

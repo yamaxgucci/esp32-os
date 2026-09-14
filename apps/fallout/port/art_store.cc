@@ -1065,9 +1065,20 @@ int      s_want[AG_WANT_MAX];
 unsigned s_want_n;
 unsigned s_want_lost;
 
+bool ag_art_store_full(void)
+{
+    return s_full;
+}
+
+bool ag_art_store_may_keep(int fid)
+{
+    return s_store != nullptr && !s_full && in_place_allowed(fid)
+        && find(fid) == nullptr;
+}
+
 void ag_art_store_want(int fid)
 {
-    if (s_store == nullptr || find(fid) != nullptr) {
+    if (s_store == nullptr || s_full || find(fid) != nullptr) {
         return;
     }
 

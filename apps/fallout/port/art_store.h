@@ -155,6 +155,14 @@ bool ag_art_store_read(int fid, int size, unsigned char *data);
  */
 void ag_art_store_want(int fid);
 
+/* True once the store has run out of room; the fill stops asking. */
+bool ag_art_store_full(void);
+
+/* Whether putting this picture in would achieve anything: there is a store,
+ * it has room, the store is allowed to hand this kind out at all, and it is
+ * not in there already.  The fill asks before reading a file off the card. */
+bool ag_art_store_may_keep(int fid);
+
 /* The top-up found the want list refilling itself: say so and empty it.
  * See the guard in artStoreTopUp and the gate in ag_art_store_want. */
 void ag_art_store_want_spinning(unsigned done);
