@@ -107,12 +107,14 @@ def run_client(cl, args, actions, wait):
     fast, and if this ever becomes a real complaint it is the board's to fix,
     not this script's to hide.
     """
-    # Five seconds, because three was not always enough: a connection opened
-    # too soon after the last one comes back "connect failed: -5", and the
-    # check above it then fails for a reason that has nothing to do with what
-    # it tests.  Whether the board should accept sooner is a real question and
-    # a separate one - see docs/plans/phone.md.
-    time.sleep(5)
+    # A breath between runs, and no more than that.
+    #
+    # This was five seconds on the theory that reconnecting too fast was being
+    # refused - "connect failed: -5" kept appearing.  Measured afterwards: the
+    # board accepts a new connection immediately, with no gap at all, four
+    # times out of four.  The refusals were the memory floor, from a leftover
+    # application, and pacing never had anything to do with it.
+    time.sleep(2)
     # Measured on the cleaned text, not on the raw log: the two have
     # different lengths (escape sequences are stripped), so slicing one by
     # the other's length walks off by however much the board redrew - which
