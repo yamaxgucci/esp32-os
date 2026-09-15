@@ -1293,6 +1293,7 @@ extern "C" void sdl_shim_memstat(int every_ms, int trace_kb,
 extern "C" void sdl_shim_fps(int every_ms);
 extern "C" void sdl_shim_scale_sharp(int on);
 extern "C" void sdl_shim_scale_mode(int mode);
+extern "C" int ag_events_budget_us;
 extern "C" void sdl_shim_cycle_ms(int ms);
 extern "C" void sdl_shim_events(int on);
 extern "C" void sdl_shim_recinput(int on);
@@ -1692,6 +1693,10 @@ extern "C" int ag_cxx_main(int argc, char **argv)
             scale_mode = to_int(argv[++i]);
         } else if (same(argv[i], "-cull") && i + 1 < argc) {
             ag_draw_cull = to_int(argv[++i]);
+        } else if (same(argv[i], "-events") && i + 1 < argc) {
+            /* Microseconds a frame for polling script conditions; 0 = the
+             * original, every condition of every program every frame. */
+            ag_events_budget_us = to_int(argv[++i]);
         } else if (same(argv[i], "-render") && i + 1 < argc) {
             /*
              * 0 the original search area, 1 the bound from the art this map

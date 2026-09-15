@@ -1613,6 +1613,17 @@ extern "C" int ag_render_tight;
 extern "C" int ag_render_alt;
 
 /* ARGON: where the exit grids are lost between the map and the screen. */
+/*
+ * ARGON: how long one frame may spend polling script conditions.
+ *
+ * _doEvents runs every conditional procedure of every live program through
+ * the interpreter, every frame - 1559 us of an 17500 us frame, and 32 ms in
+ * the worst call.  Nothing about it has to finish in one frame, so it is
+ * given a budget and resumes where it stopped.  0 turns that off.
+ */
+extern "C" int ag_events_budget_us = 3000;
+extern "C" unsigned ag_events_split = 0, ag_events_passes = 0;
+
 extern "C" unsigned ag_prog_calls = 0, ag_prog_n = 0;
 extern "C" unsigned ag_prog_sfall_us = 0, ag_prog_run_us = 0;
 extern "C" unsigned ag_prog_events_us = 0, ag_prog_intlib_us = 0;
@@ -2410,6 +2421,12 @@ static void programs_report(void)
                 ag_prog_worst_us, ag_prog_worst_n, ag_prog_worst_sfall,
                 ag_prog_worst_run, ag_prog_worst_one,
                 ag_prog_worst_events, ag_prog_worst_intlib);
+
+    shim_printf("[evbudget t=%u] %u whole passes, %u split across frames "
+                "(budget %u us)\n",
+                (unsigned)ag_millis(), ag_events_passes, ag_events_split,
+                (unsigned)ag_events_budget_us);
+    ag_events_passes = 0; ag_events_split = 0;
 
     ag_prog_calls = 0; ag_prog_n = 0;
     ag_prog_sfall_us = 0; ag_prog_run_us = 0;
