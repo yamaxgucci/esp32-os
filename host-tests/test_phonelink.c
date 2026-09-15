@@ -272,8 +272,89 @@ static void ws_tests(void)
     AG_CHECK(memcmp(payload, masked + h.hdr, h.len) == 0);
 }
 
+/*
+ * The client half, which exists so that a board can test this link without a
+ * person holding a phone.  Every defect here is a parse or a hash, and both
+ * are catchable on the PC - which is the whole reason ag_ws has no socket in
+ * it.
+ */
+static void ws_client_tests(void)
+{
+    /*
+     * RFC 6455's own example, read backwards: the key in section 1.3 is the
+     * base64 of sixteen bytes, and those bytes are "the sample nonce".  So
+     * building the key from them must produce exactly the key the server-side
+     * test above is fed - the two halves meet on a value neither of them
+     * invented.
+     */
+    static const uint8_t k_nonce[16] = {
+        't', 'h', 'e', ' ', 's', 'a', 'm', 'p',
+        'l', 'e', ' ', 'n', 'o', 'n', 'c', 'e',
+    };
+    char key[AG_WS_KEY_LEN];
+    AG_CHECK(ag_ws_client_key(k_nonce, key));
+    AG_CHECK_STR(key, "dGhlIHNhbXBsZSBub25jZQ==");
+
+    AG_CHECK(!ag_ws_client_key(NULL, key));
+
+    /* And the answer that key must come back with. */
+    AG_CHECK(ag_ws_accept_ok(key, "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="));
+
+    /*
+     * The failures matter more than the success: a client that accepts any
+     * answer has not checked anything, and the ways a wrong answer arrives are
+     * short, long, and right-length-wrong-content.
+     */
+    AG_CHECK(!ag_ws_accept_ok(key, "s3pPLMBiTxaQ9kYGzzhZRbK+xOp="));
+    AG_CHECK(!ag_ws_accept_ok(key, "s3pPLMBiTxaQ9kYGzzhZRbK+xOo"));
+    AG_CHECK(!ag_ws_accept_ok(key, "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=="));
+    AG_CHECK(!ag_ws_accept_ok(key, ""));
+    AG_CHECK(!ag_ws_accept_ok(key, NULL));
+
+    /*
+     * A masked frame this side builds must be one the server side parses, and
+     * the payload must come back out of it unchanged.  That round trip is the
+     * only thing that proves the mask bit, the four mask bytes and the header
+     * length all agree - each is easy to get right alone and easy to get wrong
+     * together.
+     */
+    static const uint8_t k_mask[4] = {0x37, 0xfa, 0x21, 0x3d};
+    uint8_t frame[64];
+    const char *msg = "Hello";
+    const uint32_t n = (uint32_t)strlen(msg);
+
+    const uint32_t hdr = ag_ws_hdr_build_masked(frame, AG_WS_TEXT, n, true,
+                                                k_mask);
+    AG_CHECK_INT(hdr, 6u);          /* two bytes plus four of mask */
+    AG_CHECK((frame[1] & 0x80u) != 0u);
+    memcpy(frame + hdr, msg, n);
+    ag_ws_mask(frame + hdr, n, k_mask);
+
+    /* Which is the wire, byte for byte, of RFC 6455's masked example. */
+    static const uint8_t k_wire[] = {0x81, 0x85, 0x37, 0xfa, 0x21, 0x3d,
+                                     0x7f, 0x9f, 0x4d, 0x51, 0x58};
+    AG_CHECK(memcmp(frame, k_wire, sizeof(k_wire)) == 0);
+
+    ag_ws_hdr_t h;
+    AG_CHECK_INT(ag_ws_hdr_parse(frame, hdr + n, 1024u, &h), (int32_t)hdr);
+    AG_CHECK(h.masked);
+    AG_CHECK_INT(h.len, n);
+    uint8_t body[8];
+    memcpy(body, frame + h.hdr, h.len);
+    ag_ws_unmask(body, h.len, h.mask);
+    body[h.len] = '\0';
+    AG_CHECK_STR((const char *)body, "Hello");
+
+    /* A length that needs the two-byte form still leaves room for the mask. */
+    AG_CHECK_INT(ag_ws_hdr_build_masked(frame, AG_WS_BIN, 200u, true, k_mask),
+                 8u);
+    AG_CHECK_INT(ag_ws_hdr_build_masked(frame, AG_WS_BIN, 70000u, true,
+                                        k_mask), 14u);
+}
+
 void run_phonelink_tests(void)
 {
     pixband_tests();
     ws_tests();
+    ws_client_tests();
 }

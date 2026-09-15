@@ -309,3 +309,55 @@ uint32_t ag_ws_hdr_build(uint8_t *out, uint8_t opcode, uint32_t len, bool fin)
     out[9] = (uint8_t)len;
     return 10u;
 }
+
+/* ---- the client half ---------------------------------------------------- */
+
+bool ag_ws_client_key(const uint8_t nonce[16], char out[AG_WS_KEY_LEN])
+{
+    if (nonce == NULL || out == NULL) {
+        return false;
+    }
+    b64_encode(nonce, 16u, out);  /* which terminates for us */
+    return true;
+}
+
+bool ag_ws_accept_ok(const char *sent_key, const char *accept)
+{
+    char want[AG_WS_ACCEPT_LEN];
+
+    if (accept == NULL || !ag_ws_accept_key(sent_key, want)) {
+        return false;
+    }
+    /*
+     * Length first, then content: strcmp on a header value a peer chose is one
+     * missing terminator away from reading somebody else's memory, and this
+     * runs against whatever answered the port.
+     */
+    const size_t n = strlen(accept);
+    if (n != AG_WS_ACCEPT_LEN - 1u) {
+        return false;
+    }
+    return memcmp(want, accept, n) == 0;
+}
+
+uint32_t ag_ws_hdr_build_masked(uint8_t *out, uint8_t opcode, uint32_t len,
+                                bool fin, const uint8_t mask[4])
+{
+    if (out == NULL || mask == NULL) {
+        return 0;
+    }
+    const uint32_t n = ag_ws_hdr_build(out, opcode, len, fin);
+    if (n == 0u) {
+        return 0;
+    }
+    out[1] |= 0x80u; /* the mask bit, which is what makes this a client */
+    for (uint32_t i = 0; i < 4u; i++) {
+        out[n + i] = mask[i];
+    }
+    return n + 4u;
+}
+
+void ag_ws_mask(uint8_t *p, uint32_t len, const uint8_t mask[4])
+{
+    ag_ws_unmask(p, len, mask);
+}

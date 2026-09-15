@@ -133,6 +133,8 @@
       "include": ["apps/common"],
       "cflags": "-Os -ffunction-sections -fdata-sections -fno-builtin",
       "src": ["apps/stm32flash/stm32flash.c", "apps/common/stm32/ag_stm32ldr.c"] },
+    { "out": "UARTMON.AXE", "group": "core", "src": ["apps/uartmon/uartmon.c"] },
+    { "out": "ATBAUD.AXE", "group": "core", "src": ["apps/atbaud/atbaud.c"] },
     { "out": "GC2145.SYS", "group": "core", "include": ["apps/gc2145"], "src": ["apps/gc2145/gc2145.c"] },
     { "out": "CAM.AXE", "group": "core", "src": ["apps/cam/cam.c"] },
     {
@@ -300,6 +302,13 @@
                   "apps/phone"],
       "src": ["apps/phone/phone.c", "apps/common/pixband/ag_pixband.c",
               "apps/common/ws/ag_ws.c", "apps/common/libc/libc_shim.c"]
+    },
+    {
+      "out": "PHONECL.AXE", "group": "core",
+      "_note": "A client of PHONE.SYS, so a second board can test the link instead of a person with a phone. Fetches the page over HTTP, upgrades to the WebSocket, answers the password challenge (SHA1 of nonce and password, apps/common/ws), then mirrors the console and sends keys: `-type`, `-enter`, `-key alt+2`, `-wait MS`, `-screen`, `-hold SECS`. Written after a day in which every one of five faults - a starved radio, picture buffers held for a text screen, a ten-second wait on a shut window, Ctrl+C dropped, an access point that went quiet - had to be reproduced by asking someone to press a key again. What it cannot judge is how the page looks.",
+      "include": ["apps/common/libc", "apps/common/ws"],
+      "src": ["apps/phonecl/phonecl.c", "apps/common/ws/ag_ws.c",
+              "apps/common/libc/libc_shim.c"]
     },
     {
       "out": "REMTERM.AXE", "group": "core",
