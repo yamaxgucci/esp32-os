@@ -13,6 +13,7 @@
 #include <argon/log.h>
 #include <argon/path.h>
 #include <argon/nodedrv.h>
+#include <argon/migrate.h>
 #include <argon/proc.h>
 
 #include <argon/port/task.h>
@@ -42,6 +43,20 @@ enum {
     NP_OP_OUT = 2,
     NP_OP_EXIT = 3,
     NP_OP_BUSY = 4,
+    /*
+     * A migrating program's state, sent in pieces just before the RUN that
+     * starts it.  Separate from RUN because a command line and a blob of
+     * somebody's private state have nothing to do with each other, and
+     * because the state can need more than one message while a command line
+     * never does.
+     */
+    NP_OP_STATE = 5,
+    /*
+     * "It is running here, and it is the one you sent."  Emitted by the far
+     * node the moment a program takes the state that arrived with it, which is
+     * the earliest instant at which that sentence is true.
+     */
+    NP_OP_STARTED = 6,
 };
 
 #define NP_HDR 8u
@@ -152,6 +167,13 @@ static int32_t out_sink(void *ctx, const char *data, size_t len)
 static char           s_run_line[AG_PATH_MAX + 64];
 static ag_port_task_t s_run_task;
 
+/* State arriving with a migrating program, collected before its RUN. */
+/* Set by the far node's STARTED; only a handover ever waits on it. */
+static volatile bool s_started;
+
+static uint8_t  s_in_state[AG_MIGRATE_MAX];
+static uint32_t s_in_state_len;
+
 static void run_task(void *arg)
 {
     (void)arg;
@@ -189,6 +211,13 @@ static void run_task(void *arg)
      * wire instead of a file.  The console does not know what the sink is,
      * which is exactly why this needs nothing new from it.
      */
+    /*
+     * Whatever arrived for it, before it runs: ag_migrate_restore is called by
+     * the program in its first moments, so this must be in place by then.
+     */
+    ag_migrate_arriving(s_in_state, s_in_state_len);
+    s_in_state_len = 0;
+
     ag_console_redirect(out_sink, NULL);
     int32_t        code = 0;
     const ag_err_t err = ag_proc_exec(argv[0], argc, argv, 0, &code);
@@ -257,8 +286,24 @@ static void on_msg(uint8_t chan, const void *data, uint16_t n, void *ctx)
                                                     : len);
 
         switch (op) {
+        case NP_OP_STATE:
+            /* Appended, so a state larger than one message arrives in order on
+             * the reliable class and is put back together by arithmetic. */
+            if (code == 0) {
+                s_in_state_len = 0;
+            }
+            if (have > 0 && s_in_state_len + have <= sizeof(s_in_state)) {
+                memcpy(s_in_state + s_in_state_len, buf + NP_HDR, have);
+                s_in_state_len += have;
+            }
+            break;
         case NP_OP_RUN:
             serve_run(buf + NP_HDR, have);
+            break;
+        case NP_OP_STARTED:
+            /* We are the client, and we asked for a handover: this ends the
+             * wait.  A program that migrated is not going to exit for us. */
+            s_started = true;
             break;
         case NP_OP_OUT:
             /* We are the client: this is the far program talking. */
@@ -303,6 +348,25 @@ bool ag_nodeproc_serving(void) { return s_listening; }
 ag_err_t ag_nodeproc_run(const char *cmdline, uint32_t timeout_ms,
                          int32_t *exit_code)
 {
+    return ag_nodeproc_run_state(cmdline, NULL, 0, timeout_ms, exit_code);
+}
+
+void ag_nodeproc_migrated(void)
+{
+    /*
+     * Best effort on purpose.  If this message is lost the asking node reports
+     * a timeout and says the program is still there, which is wrong but safe:
+     * the program IS running here, and a second copy is not created by anyone
+     * believing otherwise.  The opposite mistake - claiming a move that did not
+     * happen - is the one that loses somebody's work.
+     */
+    (void)send_msg(NP_OP_STARTED, 0, NULL, 0);
+}
+
+ag_err_t ag_nodeproc_run_state(const char *cmdline, const void *state,
+                               uint32_t state_len, uint32_t timeout_ms,
+                               int32_t *exit_code)
+{
     if (cmdline == NULL || cmdline[0] == '\0') {
         return -AG_EINVAL;
     }
@@ -318,8 +382,32 @@ ag_err_t ag_nodeproc_run(const char *cmdline, uint32_t timeout_ms,
 
     s_done = false;
     s_busy_reply = false;
+    s_started = false;
     s_code = 0;
     s_awaiting = true;
+    /* A handover is finished when the program is RUNNING there, not when it
+     * ends: a program worth moving does not end.  Anything else still waits
+     * for the exit code, which is what its caller asked for. */
+    const bool want_started = (state != NULL && state_len > 0);
+
+    /*
+     * The state first, then the command line that starts the program - in that
+     * order, because the far node puts what arrived in place before it runs
+     * anything, and a RUN that overtook its own state would start a migrating
+     * program as a fresh one.  The reliable class keeps the order.
+     */
+    for (uint32_t at = 0; at < state_len;) {
+        const uint16_t chunk =
+            (uint16_t)(((state_len - at) > NP_MAX_PAYLOAD) ? NP_MAX_PAYLOAD
+                                                           : (state_len - at));
+        const ag_err_t se = send_msg(NP_OP_STATE, (int32_t)at,
+                                     (const uint8_t *)state + at, chunk);
+        if (se != AG_OK) {
+            s_awaiting = false;
+            return se;
+        }
+        at += chunk;
+    }
 
     const size_t len = strlen(cmdline);
     ag_err_t     err = send_msg(NP_OP_RUN, 0, cmdline,
@@ -338,7 +426,7 @@ ag_err_t ag_nodeproc_run(const char *cmdline, uint32_t timeout_ms,
      * the driver next door.
      */
     const int64_t deadline = ag_port_us() + (int64_t)timeout_ms * 1000;
-    while (!s_done) {
+    while (!s_done && !(want_started && s_started)) {
         if (ag_port_us() >= deadline) {
             s_awaiting = false;
             return -AG_ETIMEDOUT;
@@ -347,6 +435,12 @@ ag_err_t ag_nodeproc_run(const char *cmdline, uint32_t timeout_ms,
     }
     s_awaiting = false;
 
+    if (want_started && s_started) {
+        if (exit_code != NULL) {
+            *exit_code = 0;
+        }
+        return AG_OK;
+    }
     if (s_busy_reply) {
         return -AG_EBUSY;
     }

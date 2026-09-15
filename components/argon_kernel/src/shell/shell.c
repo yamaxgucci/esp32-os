@@ -21,6 +21,7 @@
 #include <argon/ioclaim.h>
 #include <argon/kernel.h>
 #include <argon/lineedit.h>
+#include <argon/migrate.h>
 #include <argon/loader.h>
 #include <argon/log.h>
 #include <argon/module.h>
@@ -1054,7 +1055,42 @@ static int spawn_in_slot(const char *path, int argc, char **argv,
         }
     }
 
-    if (ag_session_bind_to(pid, name, target_slot) != AG_OK) {
+    /*
+     * WHERE IT GOES, and the whole difference /b makes.
+     *
+     * A slot has one program, and the keyboard belongs to whoever holds the
+     * slot.  So binding a background program into the slot the shell is sitting
+     * in takes the keyboard away from the shell: the prompt is still drawn and
+     * still redrawn, and not one character typed at it is ever seen again -
+     * they go to a program that is not reading them.  That is not a background
+     * program, it is a foreground program with an invisible grip on the console.
+     *
+     * It cost a whole test run to see, because the symptom is that a command
+     * "did not arrive" rather than that the shell is deaf.
+     *
+     * So /b looks for any OTHER free slot and leaves this one alone.  Its
+     * output still reaches the journal and the log echo, which is where the
+     * output of something running in the background belongs.
+     */
+    bool placed = false;
+    if (detach_only) {
+        for (int i = 0; i < AG_SESSION_SLOTS; i++) {
+            if (i == target_slot) {
+                continue;
+            }
+            if (ag_session_bind_to(pid, name, i) == AG_OK) {
+                placed = true;
+                break;
+            }
+        }
+        if (!placed) {
+            /* Every other slot is taken.  Say so rather than quietly stealing
+             * the keyboard - the user can free a slot and try again. */
+            ag_console_puts("run /b: no free slot; it shares this one and the "
+                            "prompt will not answer until it ends\n");
+        }
+    }
+    if (!placed && ag_session_bind_to(pid, name, target_slot) != AG_OK) {
         /* Target slot already has an app — keep whatever free slot spawn used. */
         (void)ag_session_bind(pid, name);
     }
@@ -1294,6 +1330,56 @@ static int cmd_call(int argc, char **argv)
         return 1;
     }
     return ag_shell_run_script(resolved);
+}
+
+/*
+ * Move a running program to the other board.
+ *
+ * Everything this prints is about CONSENT, because that is what migration is
+ * here.  A program that never promised is refused by name rather than by a
+ * number; one that was asked and simply ended without handing anything over
+ * has DECLINED, and that is a legitimate answer which has to be said plainly -
+ * it is also gone, and an operator who is not told would look for it on the
+ * other board.
+ */
+static int cmd_migrate(int argc, char **argv)
+{
+    if (argc < 2) {
+        ag_console_puts("usage: migrate <pid>\n");
+        ag_console_puts("  asks it to move to the other node; it must have "
+                        "said it can\n");
+        return 1;
+    }
+    const ag_pid_t pid = (ag_pid_t)atoi(argv[1]);
+    if (pid <= 0) {
+        ag_console_printf("migrate: %s is not a pid\n", argv[1]);
+        return 1;
+    }
+
+    const ag_err_t e = ag_migrate_away(pid, 15000u);
+    switch (e) {
+    case AG_OK:
+        ag_console_printf("pid %d is now on %s\n", (int)pid,
+                          ag_linkprov_active());
+        return 0;
+    case -AG_ENOTSUP:
+        ag_console_printf("pid %d never said it could move\n", (int)pid);
+        return 1;
+    case -AG_ENODEV:
+        ag_console_puts("no link bound; there is nowhere to move it to\n");
+        return 1;
+    case -AG_EAGAIN:
+        ag_console_printf("pid %d ended without saving: it declined, and it "
+                          "is gone\n", (int)pid);
+        return 1;
+    case -AG_ETIMEDOUT:
+        ag_console_printf("pid %d did not answer; it is still here\n",
+                          (int)pid);
+        return 1;
+    default:
+        ag_console_printf("migrate %d: %d\n", (int)pid, (int)e);
+        return 1;
+    }
 }
 
 static int cmd_log(int argc, char **argv)
@@ -5287,6 +5373,7 @@ static const ag_command_t k_commands[] = {
      cmd_prio},
     {"slots", "", "list session slots (* = focused)", cmd_slots},
     {"kill", "<pid|node.pid>", "stop an application, here or on the other node", cmd_kill},
+    {"migrate", "<pid>", "move a running program to the other node", cmd_migrate},
     {"fg", "<slot|pid>", "focus a session slot (or pid's slot)", cmd_fg},
     {"dir", "[path]", "list a directory", ag_cmd_dir},
     {"cd", "[path]", "change directory", ag_cmd_cd},

@@ -63,7 +63,10 @@ param(
     # Long enough to cover A's boot, its file transfer and the wait below.
     [int]$RecvSecs = 60,
     [int]$SendDelaySec = 25,
-    [ValidateSet('raw', 'link', 'both')]
+    # 'migrate' is one scenario on its own, and it earns its place: the whole
+    # 'link' list is forty minutes, and a handover defect is diagnosed by
+    # repetition.  Everything else is unchanged by it.
+    [ValidateSet('raw', 'link', 'both', 'migrate')]
     [string]$Scenario = 'both',
     [int]$Pings = 24
 )
@@ -200,7 +203,8 @@ function Invoke-Pair {
 $only = @('LINK.AXE')
 if ($Scenario -ne 'raw') {
     $only += @('NODELINK.SYS', 'HELLO.AXE', 'NEEDSND.AXE', 'PCMVIRT.SYS',
-               'DEVPOKE.AXE', 'IDLE.AXE', 'NEEDGFX.AXE', 'GRIND.AXE')
+               'DEVPOKE.AXE', 'IDLE.AXE', 'NEEDGFX.AXE', 'GRIND.AXE',
+               'MIGRANT.AXE')
 }
 & python (Join-Path $PSScriptRoot 'build_apps.py') --only @only | Out-Null
 foreach ($img in $only) {
@@ -332,6 +336,14 @@ if ($Scenario -eq 'link' -or $Scenario -eq 'both') {
                  'link use node0',
                  "!powershell -NoProfile -Command Start-Sleep -Seconds $SendDelaySec",
                  "link ping $Pings",
+                 # WAIT FOR ITS SUMMARY before typing anything else.
+                 #
+                 # Without this the next command is typed as soon as a prompt
+                 # appears - and a prompt appears from a redraw while the ping
+                 # is still running.  The characters then land in the ping,
+                 # which stops on any key, and it reports a fraction of what it
+                 # sent.  Blamed on the wire twice.
+                 "=of $Pings came back",
                  # And the same round trip on the class sound will ride.  It
                  # had never carried a byte between two nodes before this line.
                  "link ping $Pings stream",
@@ -1050,10 +1062,151 @@ if ($Scenario -eq 'link' -or $Scenario -eq 'both') {
     # Printed for a person, asserted about by nobody - see the note above.
     $sp = [regex]::Match($a, 'speedup (\d+\.\d)x on (\d+) cores')
     if ($sp.Success) {
-        Write-Host ("job: {0}x on {1} cores (two emulators on one PC - " +
-                    "not a board measurement)" -f $sp.Groups[1].Value,
-                    $sp.Groups[2].Value) -ForegroundColor DarkGray
+        # The concatenation is parenthesised because -f binds tighter than +:
+        # without the inner brackets it formats only the second half, which has
+        # no placeholders, and the line prints "{0}x on {1} cores" literally.
+        Write-Host ((("job: {0}x on {1} cores (two emulators on one PC - " +
+                      "not a board measurement)") -f $sp.Groups[1].Value,
+                     $sp.Groups[2].Value)) -ForegroundColor DarkGray
     }
+}
+
+# ------------------------- a running program moved to the other board ---
+#
+# Migration level 1, and the claim is exact: a program that was COUNTING here
+# goes on counting THERE, from the number it had reached.
+#
+# MIGRANT.AXE IS ON NODE A ONLY, so the copy that runs on B was read off A's
+# card over the wire - the same proof of travel the placement and job scenarios
+# use.  What is new is that it did not start: it CONTINUED.
+#
+# WHAT WOULD MAKE THIS PASS WITHOUT MEANING ANYTHING, and how each is closed:
+#   - the program merely restarting on the far board: the far node must print a
+#     number GREATER than zero and say how many hops it has made, and "starting
+#     fresh at 0" must not be what it says;
+#   - the state never leaving: the number B continues from is compared against
+#     the last number A printed, and B's must not be smaller;
+#   - the whole thing being a local restart: B says it carried on, and B is
+#     where the transcript is read.
+#
+# The number is the evidence.  Nothing else in this scenario is.
+
+if ($Scenario -eq 'link' -or $Scenario -eq 'both' -or $Scenario -eq 'migrate') {
+    Write-Host "`n== a running program moved to the other board ==" -ForegroundColor Cyan
+
+    Invoke-Pair -Tag 'migrate' `
+        -PutBoth @('build\apps\NODELINK.SYS=t:\nodelink.sys') `
+        -PutA @('build\apps\MIGRANT.AXE=t:\migrant.axe') `
+        -SendB @('drv load t:\nodelink.sys',
+                 'link name there',
+                 'link use node0',
+                 # Nothing of its own: everything that happens here is started
+                 # by A.  And NOT a wait for the program's own words - a remote
+                 # run's output is relayed to whoever ASKED for it, so every
+                 # line the migrated program prints appears on node A's screen
+                 # and none of it on this one.  Waiting here for words that
+                 # travel the other way cost a full run.
+                 #
+                 # What IS here is the far kernel's own journal, which is where
+                 # its loader says what it loaded.
+                 # Timed against A's clock, which starts within a second of
+                 # this one: A asks for the handover at about 44 s.  Dumped
+                 # from the JOURNAL because the console here is redirected into
+                 # the wire for the length of a remote run - which is why the
+                 # far kernel's loader line is not on this screen and never
+                 # will be.
+                 '!powershell -NoProfile -Command Start-Sleep -Seconds 40',
+                 'log -n 60',
+                 '=log') `
+        -SendA @('drv load t:\nodelink.sys',
+                 'link name here',
+                 'link use node0',
+                 "!powershell -NoProfile -Command Start-Sleep -Seconds $SendDelaySec",
+                 'run /b t:\migrant.axe',
+                 # Let it count a few times, so the number it carries is
+                 # plainly not zero and plainly not one.
+                 '!powershell -NoProfile -Command Start-Sleep -Seconds 4',
+                 # No '=' step after it: `migrate` BLOCKS until it has an
+                 # answer, so the prompt coming back is the completion
+                 # signal, and every outcome it can print is a different
+                 # sentence - there is no one word to wait for.
+                 'migrate 1',
+                 # Stay alive while B dumps its journal.  Without this A
+                 # finishes the moment the handover is reported and the harness
+                 # stops B mid-sleep, so the far node's own evidence is lost -
+                 # which reads as "the far kernel never loaded it" while the
+                 # program is demonstrably running there.
+                 '!powershell -NoProfile -Command Start-Sleep -Seconds 25')
+
+    $a = Transcript 'build\nodetest-migrate-a.log'
+    $b = Transcript 'build\nodetest-migrate-b.log'
+
+    # It agreed, at a point of its own choosing, and said where it stopped.
+    $h = [regex]::Match($a, 'migrant: handing over at (\d+)')
+    if (-not $h.Success) {
+        Note $false 'migrate-agreed-and-saved' 'no "handing over at N" line'
+    } else {
+        Note $true 'migrate-agreed-and-saved' ("at {0}" -f $h.Groups[1].Value)
+    }
+    Check $a 'is now on' 'migrate-reported-success-here'
+
+    # The far node loaded an image it has never had a copy of.
+    #
+    # READ ON A, AND BY ORDER.  Node B cannot be asked: for the whole life of a
+    # guest program its console is redirected into the wire, and a migrated
+    # program does not end - so B's own shell answers nobody until it does.
+    # That is a real defect and it is written up in docs/plans/cluster.md; it
+    # is not what this scenario is about.
+    #
+    # Order is what makes this a proof rather than a coincidence.  A's own copy
+    # of MIGRANT was loaded seconds BEFORE the handover; a loader line that
+    # appears AFTER the kernel said it was sending the state was written by the
+    # other board and relayed here.
+    if ($a -match 'migrate: sending \d+ bytes[\s\S]{0,4000}?loader: MIGRANT') {
+        Note $true 'migrate-far-kernel-loaded-our-image' 'relayed from the far node'
+    } else {
+        Note $false 'migrate-far-kernel-loaded-our-image' `
+            'no loader line after the handover'
+    }
+
+    # AND IT CONTINUED RATHER THAN STARTED.  This is the whole scenario.
+    #
+    # Read on A, which is where the far program's output is relayed to.  That
+    # is not a weaker proof than reading it on B: A never ran a second copy -
+    # its own ended, by name, before any of this - and B's journal above says
+    # whose image it loaded.
+    $c = [regex]::Match($a, 'migrant: carried on from (\d+) after (\d+) hop')
+    if (-not $c.Success) {
+        Note $false 'migrate-continued-not-restarted' 'no "carried on from" line'
+    } else {
+        $from = [int]$c.Groups[1].Value
+        $hops = [int]$c.Groups[2].Value
+        Write-Host "migrated: carried on from $from after $hops hop(s)"
+        Note ($from -gt 0 -and $hops -ge 1) 'migrate-continued-not-restarted' `
+            "from $from after $hops hop(s)"
+        # And it is the number A actually reached, not some number.
+        if ($h.Success) {
+            $saved = [int]$h.Groups[1].Value
+            Note ($from -ge $saved) 'migrate-carried-the-real-number' `
+                "saved $saved, resumed at $from"
+        }
+    }
+    # ONE COPY, NOT TWO - and this is deliberately NOT a check that the far
+    # copy avoided starting fresh.
+    #
+    # That check was here and cannot be made sound: "starting fresh" is printed
+    # at the beginning and STAYS ON THE SCREEN, so every redraw after the
+    # handover replays it into any window drawn around the later text.
+    # Counting it was worse (15 hits for one line).  And it proved nothing that
+    # migrate-continued-not-restarted does not already prove: the program says
+    # exactly one of those two sentences, and that check matched the other.
+    #
+    # What is NOT proved elsewhere is that the program is not now running in
+    # two places.  The kernel here names its exit, and presence is safe to read
+    # on a rendered screen - a redraw can repeat a line, never invent one.
+    $ended = $a -match 'MIGRANT \(pid \d+\) returned 0'
+    Note $ended 'migrate-only-one-copy' `
+        $(if ($ended) { 'the copy here ended' } else { 'the copy here never ended' })
 }
 
 # ------------------------------------------------- unloading, on one node ---

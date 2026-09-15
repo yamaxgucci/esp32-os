@@ -480,6 +480,35 @@ static inline bool ag_interrupted(void)
     return g_ag_api->proc->interrupted();
 }
 
+/* ---- moving to another board, by consent (ABI 0.53) -------------------- */
+/*
+ * See AG_AXE_CAN_MIGRATE in abi.h for the promise these implement, and
+ * apps/migrant/migrant.c for the whole shape in twenty lines.  Each answers
+ * safely on a kernel older than 0.53: nothing is wanted, nothing can be saved,
+ * and restore says "a fresh start".
+ */
+static inline bool ag_migrate_wanted(void)
+{
+    if (!AG_HAS(g_ag_api->proc, migrate_wanted)) {
+        return false;
+    }
+    return g_ag_api->proc->migrate_wanted();
+}
+static inline ag_err_t ag_migrate_save(const void *state, uint32_t len)
+{
+    if (!AG_HAS(g_ag_api->proc, migrate_save)) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->proc->migrate_save(state, len);
+}
+static inline int32_t ag_migrate_restore(void *out, uint32_t cap)
+{
+    if (!AG_HAS(g_ag_api->proc, migrate_restore)) {
+        return 0;
+    }
+    return g_ag_api->proc->migrate_restore(out, cap);
+}
+
 /*
  * True while this process's session slot has keyboard/display focus.
  * Outside focus, stop flush/swap and heavy redraw; sleep or yield until

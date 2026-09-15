@@ -518,15 +518,24 @@ try {
             if ($since.Contains($Line)) { return }
         }
 
-        Write-Host "warning: the console did not echo '$Line'; typing it again" `
+        # NOT TYPED AGAIN, and that is the fix rather than the giving up it
+        # looks like.  The check above cannot be made reliable while a program
+        # is painting: what arrives is a rendered screen, so a redraw lands in
+        # the MIDDLE of the echo ("migr" + the program's line + "ate 1") and no
+        # amount of escape-stripping puts the two halves back together.  The
+        # command is sitting there, entered, the whole time.
+        #
+        # Retyping it then does real damage, and did, twice, for months:
+        #   * `link ping 24` stops on any key, so the retyped characters cut it
+        #     short and it reported 23 of 24 - read as a lossy wire;
+        #   * `migrate 1` became `migrate 1migrate 1`, and the migration that
+        #     never happened was read as a broken feature.
+        # Both times the wrong half of the system was blamed.
+        #
+        # So: say so, and let the '=' wait that follows decide.  A command that
+        # really never arrived fails there, with its own name on it.
+        Write-Host "warning: no echo seen for '$Line' (a painting program hides it); carrying on" `
             -ForegroundColor Yellow
-        # A bare return first: whatever fragment is on the line becomes its own
-        # (failed) command rather than a prefix of the retyped one.
-        $stream.Write([System.Text.Encoding]::ASCII.GetBytes("`r"), 0, 1)
-        $stream.Flush()
-        Start-Sleep -Milliseconds 200
-        [void](Read-Available)
-        Send-Line $Line
     }
 
     # How many times some text appears in what has arrived so far.

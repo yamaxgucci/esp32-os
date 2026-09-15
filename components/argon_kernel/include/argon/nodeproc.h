@@ -55,4 +55,19 @@ bool ag_nodeproc_serving(void);
 ag_err_t ag_nodeproc_run(const char *cmdline, uint32_t timeout_ms,
                          int32_t *exit_code);
 
+/*
+ * The same, carrying a migrating program's state to the far node before it
+ * starts (ABI 0.53).  The state is put in place over there BEFORE the program
+ * runs, so its first call to migrate_restore finds it.
+ */
+ag_err_t ag_nodeproc_run_state(const char *cmdline, const void *state,
+                               uint32_t state_len, uint32_t timeout_ms,
+                               int32_t *exit_code);
+
+/*
+ * Tell the node that sent us a migrating program that the program has taken
+ * its state and is running.  Called by the migration code, not by drivers.
+ */
+void ag_nodeproc_migrated(void);
+
 #endif /* ARGON_NODEPROC_H */

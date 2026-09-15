@@ -81,6 +81,7 @@ set(ARGON_KERNEL_SRCS
     "src/net/mcpwm.c"
     "src/proc/proc.c"
     "src/proc/clu.c"
+    "src/proc/migrate.c"
     "src/proc/session.c"
     "src/proc/threads.c"
     "src/proc/service.c"

@@ -236,9 +236,17 @@ extern "C" {
  *      and its nominal rate, and the layers above ask instead of assuming.
  *      NULL on a driver built before this: probe with AG_HAS and fall back to
  *      the conservative pair, which is exactly what the UART gives.
+*
+ * 0.53 AG_AXE_CAN_MIGRATE and proc->migrate_wanted/save/restore: moving a
+ *      running program to another board, by CONSENT.  A program promises it
+ *      can be moved, notices the request where it is safe to, packs what it
+ *      needs, and reopens its own files and devices on the other side -
+ *      because those are different objects there and nothing else can know
+ *      what it was holding.  Only the bytes it hands over travel; the arena,
+ *      the handles and the screen do not.  See AG_AXE_CAN_MIGRATE.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 52u
+#define AG_ABI_MINOR 53u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -1658,7 +1666,63 @@ typedef struct ag_proc_api {
      * focus.  Outside focus, apps should not flush/swap or run heavy redraw.
      */
     bool (*focused)(void);
+
+    /* ------------------------------------------------------------------ */
+    /* ABI 0.53: moving to another board, by consent                      */
+    /* ------------------------------------------------------------------ */
+    /*
+     * Three calls, and between them they are the whole of migration level 1.
+     * There is no callback and no hook: the program decides WHEN it is at a
+     * safe point, which is the one thing only it can know.  See
+     * AG_AXE_CAN_MIGRATE for the promise these implement.
+     *
+     * The shape, whole:
+     *
+     *     int ag_main(int argc, char **argv)
+     *     {
+     *         state_t s = {0};
+     *         (void)ag_migrate_restore(&s, sizeof s);   // 0 = a fresh start
+     *         reopen_whatever_this_needs();             // OURS to do
+     *         for (;;) {
+     *             work(&s);
+     *             if (ag_interrupted()) {
+     *                 if (ag_migrate_wanted()) ag_migrate_save(&s, sizeof s);
+     *                 return 0;
+     *             }
+     *         }
+     *     }
+     *
+     * WHAT IS NOT MOVED, and it is most things: the arena, open handles, the
+     * screen, threads.  Only the bytes handed to save() travel.  That is a
+     * deliberate floor rather than a first draft - four megabytes of arena at
+     * five megabytes a second is eight tenths of a second of a frozen program,
+     * so a level that moved everything would be a level nobody would use.
+     */
+
+    /* True while the interruption that is being reported is a request to move
+     * rather than a request to stop.  Meaningless unless interrupted(). */
+    bool (*migrate_wanted)(void);
+
+    /*
+     * Hand over the state to carry across.  At most AG_MIGRATE_MAX bytes, once
+     * per request; -AG_ERANGE above that, -AG_EPERM when nobody asked.
+     *
+     * Small on purpose.  A program that needs megabytes moved is a program
+     * whose data should have been on a disc both boards can reach.
+     */
+    ag_err_t (*migrate_save)(const void *state, uint32_t len);
+
+    /*
+     * The state this copy was started with, or 0 if it was started fresh.
+     * Returns the bytes written, -AG_ERANGE if `cap` is too small to hold what
+     * was saved - which is a version mismatch between two builds of the same
+     * program, and worth failing loudly rather than truncating.
+     */
+    int32_t (*migrate_restore)(void *out, uint32_t cap);
 } ag_proc_api_t;
+
+/* The most that travels with a migrating program.  See migrate_save. */
+#define AG_MIGRATE_MAX 1024u
 
 /* ------------------------------------------------------------------------ */
 /* cfg - system / board configuration access                                */
@@ -2734,6 +2798,28 @@ enum ag_axe_flags {
      * the flag then only makes that choice intentional rather than incidental.
      */
     AG_AXE_WANT_XIP = 1u << 7,
+    /*
+     * ABI 0.53: this program can be moved to another node while it runs.
+     *
+     * It is a PROMISE, not a permission, and the system will not move anything
+     * that has not made it.  Migration in this system is consent rather than
+     * transparency: there is no shared memory between boards, so a state that
+     * was taken without the program's knowledge could not be put back
+     * faithfully, and pretending otherwise would be the sort of lie that shows
+     * up as a program that works until it doesn't.
+     *
+     * What the promise means, exactly:
+     *   - the program checks proc->interrupted() often enough to notice;
+     *   - when it notices and proc->migrate_wanted() is true, it packs what it
+     *     needs into proc->migrate_save() and returns from ag_main;
+     *   - at start-up it calls proc->migrate_restore(), and if there is
+     *     something there it carries on from it instead of starting fresh;
+     *   - and it REOPENS WHAT IT NEEDS itself.  A file, a device, a socket are
+     *     different objects on the other board; nothing can move them, and the
+     *     program that said it could migrate is the only thing that knows what
+     *     it was holding and why.
+     */
+    AG_AXE_CAN_MIGRATE = 1u << 8,
 };
 
 /*

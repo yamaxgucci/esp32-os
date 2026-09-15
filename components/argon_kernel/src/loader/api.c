@@ -33,6 +33,7 @@
 #include <argon/net.h>
 #include <argon/power.h>
 #include <argon/clu.h>
+#include <argon/migrate.h>
 #include <argon/proc.h>
 #include <argon/shell.h>
 #include <argon/filemap.h>
@@ -1145,6 +1146,9 @@ static const ag_proc_api_t k_proc = {
     .interrupted = ag_proc_interrupted,
     .watchdog = ag_proc_watchdog,
     .focused = ag_proc_focused,
+    .migrate_wanted = ag_migrate_wanted,
+    .migrate_save = ag_migrate_save,
+    .migrate_restore = ag_migrate_restore,
 };
 
 /* ---------------------------------------------------------------------- */
