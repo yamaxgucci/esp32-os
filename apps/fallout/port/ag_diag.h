@@ -326,7 +326,7 @@ void ag_critter_script_report(char *out, unsigned cap);
 
 void ag_map_inventory_note(unsigned files, unsigned kb, unsigned skipped,
                            const unsigned *n_by_kind,
-                           const unsigned *kb_by_kind, unsigned exits);
+                           const unsigned *kb_by_kind);
 
 /* And what filling the store from that inventory actually managed: how many
  * pictures went in, how many were already there, how many were too big for
