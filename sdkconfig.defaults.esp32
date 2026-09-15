@@ -47,7 +47,43 @@ CONFIG_ARGON_ENABLE_PM=y
 # For measuring rather than for using the board, `argon target esp32-dsp`
 # builds the same system with no radios and a 48 KB arena, which is what
 # CKTBENCH wants: 36 KB of code, timed from RAM rather than through the cache.
-CONFIG_ARGON_APP_ARENA_KB=8
+# Sizes for a board with 208 KB and a radio, not for one with PSRAM.
+#
+# Measured on the CYD: an application taking the generic defaults leaves the
+# machine with a largest free block of 5 KB, and at 5 KB the access point goes
+# on beaconing while refusing every station - a WPA2 handshake has nowhere to
+# happen.  The board is then unreachable with nothing in any log, and the phone
+# says "wrong password".  The demo that showed it touches 4.3 KB of stack out
+# of the sixteen it was handed.
+#
+# Eight is also the floor the loader itself runs on (AG_PROC_LOAD_STACK_MIN),
+# so this is the smallest default that cannot break loading.  An image that
+# needs more says so with AG_APP_SIZED and gets it - or is refused, which is
+# the answer we want over a board that cannot be reached.
+CONFIG_ARGON_APP_STACK_KB=8
+CONFIG_ARGON_APP_ARENA_KB=4
+
+# The radio takes its transmit buffers up front instead of asking for them
+# when it needs them.
+#
+# Maxim's question, and the right one: if the memory is going to be needed
+# anyway, why not take it at the start?  By default the driver keeps sixteen
+# dynamic transmit buffers, allocated from the shared heap at the moment of
+# use - which on this board is the moment there is nothing left, because an
+# application is running.  Static buffers are taken during esp_wifi_init,
+# before any application exists, and nothing can take them away.
+#
+# Eight rather than sixteen: each is about 1.6 KB, so this is ~13 KB claimed
+# for good on a 208 KB machine.  That is memory applications no longer get,
+# and that is the trade being made on purpose - a large application now fails
+# to start, with a message, instead of starting and quietly cutting the board
+# off the air.
+#
+# What this does NOT cover: the WPA2 handshake itself, which the supplicant
+# allocates when a station appears.  There is no setting for that one.
+CONFIG_ESP_WIFI_STATIC_TX_BUFFER=y
+CONFIG_ESP_WIFI_TX_BUFFER_TYPE=0
+CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=8
 
 # Both radios, in one image.
 #
