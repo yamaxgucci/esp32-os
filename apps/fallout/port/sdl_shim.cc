@@ -452,6 +452,12 @@ static uint32_t s_blit_frame_us;
  */
 static int s_scale_mode;
 
+/* Which way the panel was last painted, and whether it needs doing again. */
+static int s_scale_shown = -1;
+static int s_scale_changed;
+
+extern "C" int ag_doing_now(void);
+
 void sdl_shim_scale_sharp(int on)
 {
     s_scale_mode = on ? 1 : 0;
@@ -459,7 +465,38 @@ void sdl_shim_scale_sharp(int on)
 
 void sdl_shim_scale_mode(int mode)
 {
-    s_scale_mode = (mode < 0) ? 0 : ((mode > 2) ? 2 : mode);
+    s_scale_mode = (mode < 0) ? 0 : ((mode > 3) ? 3 : mode);
+}
+
+/*
+ * ARGON: mode 3, and it is Maxim's: average while the game is being played,
+ * sample while it is being read.
+ *
+ * The two halves of the trade do not overlap in time.  Averaging is the only
+ * one of the three that shows a map's exit grids - a green outline one pixel
+ * wide - and it is on the map that they matter.  Sampling is the one that
+ * leaves interface text at full contrast, and text is what a menu, a
+ * dialogue and the world map are made of.  Mode 2 was meant to serve both
+ * and serves neither: it keeps the brightest pixel of each block, which is
+ * the stroke only where the ground is darker than the stroke, and Fallout's
+ * outdoor ground is pale sand.  So the exits went and the text did not come
+ * back.
+ *
+ * Switching costs a full repaint, because the panel holds pixels made the
+ * other way and only what the engine redraws would be corrected.
+ */
+static int scale_now(void)
+{
+    if (s_scale_mode != 3) {
+        return s_scale_mode;
+    }
+    switch (ag_doing_now()) {
+    case AG_WHERE_WALK:
+    case AG_WHERE_COMBAT:
+        return 1;   /* averaged: the exits are visible */
+    default:
+        return 0;   /* sampled: the text is sharp */
+    }
 }
 
 /*
@@ -2999,6 +3036,13 @@ int SDL_UpperBlit(SDL_Surface *src, const SDL_Rect *srcrect, SDL_Surface *dst,
     const int panx = (to_panel && s_one_to_one) ? s_pan_x : 0;
     const int pany = (to_panel && s_one_to_one) ? s_pan_y : 0;
     const int step = 1 << shift;
+    const int mode = scale_now();
+
+    /* A change of mode leaves the rest of the panel made the other way. */
+    if (to_panel && mode != s_scale_shown) {
+        s_scale_shown = mode;
+        s_scale_changed = 1;
+    }
 
     dx -= panx;
     dy -= pany;
@@ -3089,7 +3133,7 @@ int SDL_UpperBlit(SDL_Surface *src, const SDL_Rect *srcrect, SDL_Surface *dst,
             }
             ROW_DONE(y);
         }
-    } else if (s_scale_mode == 0) {
+    } else if (mode == 0) {
         /*
          * The reduction, and it is the second most expensive thing in a frame:
          * measured on the board at 10.5 ms against 34 ms of engine and 7 ms of
@@ -3248,7 +3292,7 @@ int SDL_UpperBlit(SDL_Surface *src, const SDL_Rect *srcrect, SDL_Surface *dst,
 
             const uint32_t row_t0 = (uint32_t)ag_micros();
 
-            if (s_scale_mode == 1) {
+            if (mode == 1) {
                 for (int x = x0; x < x1; ++x, p0p += step, p1p += step) {
                     const Uint8 a0 = p0p[0];
                     const Uint8 a1 = p0p[1];
@@ -5174,6 +5218,15 @@ static void pump(void)
      * before anybody presses a key to skip it.
      */
     sdl_shim_input_service();
+
+    /* ARGON: the halving changed its mind between frames (mode 3 follows what
+     * the game is doing), and the panel still holds pixels made the other
+     * way everywhere the engine did not redraw.  Put the whole picture up
+     * again, once, here rather than inside the blit that noticed. */
+    if (s_scale_changed) {
+        s_scale_changed = 0;
+        panel_repaint();
+    }
 
     ag_event_t e;
     while (ag_poll_event(&e, 0)) {

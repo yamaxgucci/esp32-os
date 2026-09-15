@@ -1581,6 +1581,7 @@ extern "C" int ag_cxx_main(int argc, char **argv)
     int trace_max = 0;
     int trace_prof = 0;
     int sharp = 0;
+    /* -1 = not asked for; the default is worked out below. */
     int scale_mode = -1;
     int cycle_ms = 100;
     int events = 0;
@@ -1819,10 +1820,17 @@ extern "C" int ag_cxx_main(int argc, char **argv)
     sdl_shim_log(logpath);
     sdl_shim_memstat(memstat_ms, trace_kb, trace_max, trace_prof);
     sdl_shim_fps(fps_ms);
-    sdl_shim_scale_sharp(sharp);
-    if (scale_mode >= 0) {
-        sdl_shim_scale_mode(scale_mode);
+    /*
+     * How the picture is halved for a panel that cannot hold it.  The default
+     * is 3 - follow what the game is doing: average while it is played, so
+     * that a map's one-pixel exit grids survive, and sample while it is read,
+     * so that interface text keeps its contrast.  -smooth still means the
+     * plain average everywhere, and -scale N overrides both.
+     */
+    if (scale_mode < 0) {
+        scale_mode = sharp ? 1 : 3;
     }
+    sdl_shim_scale_mode(scale_mode);
     sdl_shim_cycle_ms(cycle_ms);
     /* The readout and the event log are the same instrument seen two
      * ways, so -hud brings both.  -events alone is for a run left going
