@@ -148,6 +148,20 @@ def main():
             rep.check("board switched slots",
                       "enter_shell_view slot" in j or "focus" in j)
 
+        print("an application, over the link:")
+        out = run_client(cl, args, '-type "fm" -enter -wait 2500 -screen', 40)
+        rep.check("application appears", "file manager" in out or "Help" in out,
+                  "the file manager draws a frame and a function key bar")
+        out = run_client(cl, args, "-key ctrl+c -wait 1500", 30)
+        if sv:
+            sv.pump(0.5)
+            sv.send("log -n 12", 6)
+            j = sv.text()
+            rep.check("Ctrl+C reaches the board", "chord: hid 6, mods 2" in j)
+            rep.check("the application stops", "asked to stop" in j)
+            rep.check("nothing left running",
+                      "unbind" in j or "returned 0" in j)
+
         if args.hold:
             print("staying connected:")
             out = run_client(cl, args, "-hold %u" % args.hold, args.hold + 25)
