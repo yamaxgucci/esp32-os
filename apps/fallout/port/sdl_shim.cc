@@ -2866,6 +2866,19 @@ static Uint8 s_pal_r[256];
 static Uint8 s_pal_g[256];
 static Uint8 s_pal_b[256];
 
+/*
+ * ARGON: the same three numbers packed into one word, so that averaging a
+ * 2x2 block costs four loads instead of twelve.
+ *
+ * Red at bit 22, green at bit 11, blue at bit 0.  Four of them can be added
+ * straight together: the largest sums are 4*31 = 124 for red and blue and
+ * 4*63 = 252 for green, and each field has eleven bits of room, so nothing
+ * carries into its neighbour.  One kilobyte, which stays in cache; the three
+ * separate tables above cost three loads per component per pixel and the
+ * measurement said the loads, not the arithmetic, were the price.
+ */
+static uint32_t s_pal_packed[256];
+
 static const Uint16 *palette_lut(const SDL_Palette *pal)
 {
     static Uint16 lut[256];
@@ -2879,6 +2892,8 @@ static const Uint16 *palette_lut(const SDL_Palette *pal)
             s_pal_r[i] = (Uint8)(c.r >> 3);
             s_pal_g[i] = (Uint8)(c.g >> 2);
             s_pal_b[i] = (Uint8)(c.b >> 3);
+            s_pal_packed[i] = ((uint32_t)(c.r >> 3) << 22)
+                | ((uint32_t)(c.g >> 2) << 11) | (uint32_t)(c.b >> 3);
             lut[i] = (Uint16)(((c.r & 0xF8u) << 8) | ((c.g & 0xFCu) << 3) |
                               (c.b >> 3));
         }
@@ -3148,42 +3163,95 @@ int SDL_UpperBlit(SDL_Surface *src, const SDL_Rect *srcrect, SDL_Surface *dst,
             ROW_DONE(y);
         }
     } else {
-        /* Two rows at a time, because the choice is made across a 2x2 block.
-         * Larger shifts still look at a 2x2 - sixteen samples for a quarter
-         * panel would cost more than the picture is worth. */
+        /*
+         * The same reduction, averaging the 2x2 block instead of taking one
+         * pixel of it - which is what keeps a line one pixel wide from
+         * vanishing, and a map's exit grids are exactly that.
+         *
+         * Written years ago and never switched on, so it never got the
+         * treatment the branch above had: it recomputed the source column
+         * and both of its bounds checks for every pixel, indexed instead of
+         * walking, read three separate tables per component, and skipped no
+         * rows.  Measured on the board in that state: 1628 ns per output
+         * pixel, 26 ms a frame, 57 fps down to 15.  Same four arithmetic
+         * operations, five hundred times the price of the branch beside it.
+         *
+         * So: the x range is computed once, both rows are walked by pointer,
+         * the four samples come from one packed table, and a row nothing
+         * touched is skipped exactly as above.
+         */
+        const bool full_width = (ddx == 0 && ddw >= (int)s_gfx.width);
+        const int base = sx + ((ddx << shift) - dx);
+        int       x0 = (base < 0) ? (((-base) + step - 1) >> shift) : 0;
+        int       x1 = ddw;
+        {
+            /* One past the right edge, because the block reads base+1. */
+            const int room = src->w - 1 - base;
+            const int lim = (room <= 0) ? 0 : ((room + step - 1) >> shift);
+            if (lim < x1) {
+                x1 = lim;
+            }
+        }
+
         for (int y = 0; y < ddh; ++y) {
             const int syy = sy + (((ddy + y) << shift) - dy);
             if (syy < 0 || syy >= src->h) {
                 continue;
             }
+            const unsigned row = (unsigned)(ddy + y);
+
+            if (s_palette_only && row < AG_ROWS_MAX && s_row_cycled_ready
+                    && s_row_cycled[row] == 0u) {
+                s_cycle_rows_skipped++;
+                continue;
+            }
+            if (s_palette_only) {
+                s_cycle_rows_done++;
+            }
+
             const int syy2 = (syy + 1 < src->h) ? (syy + 1) : syy;
-            const Uint8 *r0 =
-                (const Uint8 *)src->pixels + (size_t)syy * src->pitch;
-            const Uint8 *r1 =
-                (const Uint8 *)src->pixels + (size_t)syy2 * src->pitch;
+            const Uint8 *p0p = (const Uint8 *)src->pixels +
+                               (size_t)syy * src->pitch + base + (x0 << shift);
+            const Uint8 *p1p = (const Uint8 *)src->pixels +
+                               (size_t)syy2 * src->pitch + base + (x0 << shift);
             Uint16 *d = (Uint16 *)((Uint8 *)dst->pixels +
                                    (size_t)(ddy + y) * dst->pitch) + ddx;
             int rx0 = ddw, rx1 = -1;
-            for (int x = 0; x < ddw; ++x) {
-                const int sxx = sx + (((ddx + x) << shift) - dx);
-                if (sxx < 0 || sxx >= src->w) {
-                    continue;
+            unsigned cycled = 0;
+
+            const uint32_t row_t0 = (uint32_t)ag_micros();
+
+            for (int x = x0; x < x1; ++x, p0p += step, p1p += step) {
+                const Uint8 a0 = p0p[0];
+                const Uint8 a1 = p0p[1];
+                const Uint8 b0 = p1p[0];
+                const Uint8 b1 = p1p[1];
+                const uint32_t s = s_pal_packed[a0] + s_pal_packed[a1]
+                    + s_pal_packed[b0] + s_pal_packed[b1];
+
+                cycled |= (unsigned)(a0 >= AG_CYCLE_FIRST);
+                CHANGED(d, x, (Uint16)((((s >> 24) & 0x1Fu) << 11)
+                                       | (((s >> 13) & 0x3Fu) << 5)
+                                       | ((s >> 2) & 0x1Fu)));
+            }
+            {
+                const uint32_t row_us = (uint32_t)ag_micros() - row_t0;
+
+                if (row_us >= 3000u) {
+                    s_preempt_n++;
+                    s_preempt_us += row_us;
+                    if (row_us > s_preempt_worst_us) {
+                        s_preempt_worst_us = row_us;
+                    }
                 }
-                const int sxx2 = (sxx + 1 < src->w) ? (sxx + 1) : sxx;
+            }
 
-                const Uint8 p0 = r0[sxx];
-                const Uint8 p1 = r0[sxx2];
-                const Uint8 p2 = r1[sxx];
-                const Uint8 p3 = r1[sxx2];
-
-                const unsigned rr = ((unsigned)s_pal_r[p0] + s_pal_r[p1] +
-                                     s_pal_r[p2] + s_pal_r[p3]) >> 2;
-                const unsigned gg = ((unsigned)s_pal_g[p0] + s_pal_g[p1] +
-                                     s_pal_g[p2] + s_pal_g[p3]) >> 2;
-                const unsigned bb = ((unsigned)s_pal_b[p0] + s_pal_b[p1] +
-                                     s_pal_b[p2] + s_pal_b[p3]) >> 2;
-
-                CHANGED(d, x, (rr << 11) | (gg << 5) | bb);
+            if (row < AG_ROWS_MAX && !s_palette_only) {
+                if (full_width) {
+                    s_row_cycled[row] = (unsigned char)cycled;
+                } else if (cycled != 0u) {
+                    s_row_cycled[row] = 1u;
+                }
             }
             ROW_DONE(y);
         }
