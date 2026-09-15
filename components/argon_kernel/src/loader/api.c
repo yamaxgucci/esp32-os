@@ -917,7 +917,7 @@ static ag_err_t api_power_declare(ag_power_fitness_t fitness, const char *why)
 
 static ag_store_t api_store_open(const char *label)
 {
-    if (label == NULL || *label == ' ') {
+    if (label == NULL || *label == '\0') {
         return NULL;
     }
 
