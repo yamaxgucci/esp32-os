@@ -180,38 +180,32 @@ static const char *const k_audio_prefer[] = {"pcmvirt", "pcm0", "pcmnull",
                                              NULL};
 
 /*
- * LOCAL ONLY, for now, and this is a retreat that is written down rather than
- * quietly made.
+ * HERE OR ON THE NODE NEXT DOOR, and the road back to that line was the whole
+ * point of the lock work below it.
  *
- * The mixer did choose the node next door - a board with no converter playing
- * through its neighbour's - and it worked, and then it intermittently froze the
- * board instead.  Not slowly: the console stops answering and does not come
- * back.  The cause is understood in outline and not in detail: the device
- * registry holds ONE recursive mutex across the whole of a driver's call, so
- * while the mixer waits for a remote sink nothing on this board can touch any
- * device at all, the console included - which is the shape of a fault this
- * project has had before.  Bounding the wait to a second and a half changed
- * nothing, which says the last step is still missing.
+ * This asked only for local hardware for two days, and the retreat was written
+ * down rather than quietly made: the mixer did choose the neighbour's
+ * converter, it worked, and then it intermittently froze the board - console
+ * stops answering and does not come back, in about half of runs.
  *
- * An application that opens a far device ITSELF is unaffected and still works;
- * it is only the mixer reaching across from inside another device's operation
- * that does this.  Which is the clue: the fix belongs in not doing wire work
- * under that lock, not in a flag here.
+ * The cause, now proved rather than suspected: the registry held ONE recursive
+ * mutex across the whole of a driver's call, and the mixer's reach across the
+ * wire happens inside one.  While it waited for a round trip, nothing on this
+ * board could touch any device at all, the console included.  Bounding the
+ * wait to a second and a half changed nothing, which was the clue that the
+ * waiting was not the problem - the LOCK ACROSS THE WAITING was.
  *
- * A feature that freezes the machine half the time is worse than not having it,
- * so until then this asks only for what is here.  The machinery it would use
- * (ag_dev_default, the qualified names, the proxies) is all in place and
- * correct; one line brings it back.
+ * An application opening a far device itself was never affected, and that is
+ * the same fact from the other side: it holds no other device's lock while it
+ * waits.
+ *
+ * The registry now lets its lock go for the length of a driver call and holds
+ * that device's own lock instead - open and close included, which is what this
+ * path uses.  So the question can be asked of the whole system again.
  */
 static ag_device_t *pick_sink(void)
 {
-    for (int i = 0; k_audio_prefer[i] != NULL; i++) {
-        ag_device_t *d = ag_dev_find(k_audio_prefer[i]);
-        if (d != NULL) {
-            return d;
-        }
-    }
-    return NULL;
+    return ag_dev_default(AG_DEV_AUDIO, k_audio_prefer);
 }
 
 /*

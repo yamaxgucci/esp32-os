@@ -802,20 +802,25 @@ if ($Scenario -eq 'link' -or $Scenario -eq 'both') {
     Check $a 'sound.pcmvirt is open' 'rdev-opened-a-device-that-is-not-here'
     Check $a '64 of 64 bytes taken' 'rdev-wrote-through-the-wire'
 
-    # The class default, asking only for what is HERE - which is a retreat, and
-    # the test says so rather than being deleted.
+    # The class default, asking the WHOLE SYSTEM - which is the line that was
+    # retreated from for two days and is now back.
     #
-    # The mixer did choose the neighbour's converter, and then intermittently
-    # froze the board doing it: the registry holds one mutex across a driver's
-    # whole call, so waiting for a far device stops every task on this board
-    # from touching any device, console included.  See pick_sink() in pcmmix.c.
-    # An application opening a far device itself is unaffected and is checked
-    # above; it is the mixer reaching across from inside another device's
-    # operation that does this.
+    # This node has no converter of its own; the neighbour has PCMVIRT.  So the
+    # mixer's sink must be the far one, reached by its qualified name, and the
+    # sound leaves this board over the wire.
     #
-    # So today the sound goes into pcmnull, and this asserts that rather than
-    # pretending: a board that cannot make a noise makes none.
-    Check $a 'sink /dev/pcmnull' 'default-sound-stays-local-for-now'
+    # It used to freeze node A doing exactly this, in about half of runs -
+    # console stops answering and does not come back - because the registry
+    # held one mutex across the whole of a driver's call and the mixer's reach
+    # across the wire happens inside one.  The cure is in device.c: a call
+    # resolves what it will call under the registry lock, then lets that lock go
+    # and takes the device's own instead, `open` and `close` included.
+    #
+    # WHICH IS WHY THE CHECKS AFTER THIS ONE MATTER AS MUCH AS THIS ONE.  A
+    # board that froze would not answer `ps`, would not kill anything and would
+    # not print its journal; the freeze cannot hide behind a passing assertion
+    # here.
+    Check $a 'sink /dev/sound.pcmvirt' 'default-sound-goes-to-the-node-that-has-one'
 
     # One `ps` for the system.  IDLE runs on the other board and has never been
     # on this one, so a row for it here crossed the wire.

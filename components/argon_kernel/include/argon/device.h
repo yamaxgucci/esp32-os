@@ -39,7 +39,7 @@ extern "C" {
 
 /*
  * Public because a driver needs its own priv pointer back in every callback,
- * and because the shell and the tests read the bookkeeping.  The last three
+ * and because the shell and the tests read the bookkeeping.  The last five
  * fields belong to the registry; a driver must not write them.
  *
  * The ops table and AG_DEV_NAME_MAX live in the ABI: a .SYS sees the same
@@ -66,6 +66,19 @@ struct ag_device {
     const void *owner;
 
     uint32_t open_count;
+    /*
+     * Calls into this driver that are running right now.  The registry lock is
+     * let go for the length of one - see ag_dev_read/write/ioctl - so this is
+     * what keeps the slot from being reused underneath a call that is still
+     * inside somebody's driver.
+     */
+    uint32_t calls;
+    /*
+     * This device's own lock, from the lock interface below, held across a call
+     * into it in place of the registry lock.  NULL means there is none and the
+     * registry lock is held instead, which is what the host tests do.
+     */
+    void    *iolock;
     bool     used;
     bool     revoked; /* the hardware went away, handles are still open     */
 };
@@ -87,10 +100,33 @@ typedef struct {
  *
  * The lock must be recursive: a device operation is entitled to ask the
  * registry about itself.
+ *
+ * The second set is one lock per device, and it exists because the first one is
+ * one lock for the whole machine.  A driver call can block for a long time -
+ * writing sound is the plain case, because a converter plays it in real time
+ * and the write returns when there is room - and while the registry lock was
+ * held across that call, nothing else could so much as look at the registry.
+ * A frame flush walks it to find the display drivers; on the board it needed
+ * 18 microseconds of that walk and waited 161 milliseconds for the turn, and
+ * Fallout lost two thirds of every frame to it.
+ *
+ * So a call resolves what it is going to call under the registry lock, marks
+ * the device busy, lets the registry go, and takes the device's own lock for
+ * the call itself.  Two writes to the same device still serialise; a write to
+ * one device and a walk of the registry no longer do.  display.c has done this
+ * for blits since the wire made it obvious - see driver_present_blit.
+ *
+ * open returns a lock for a newly registered device, or NULL; close gives it
+ * back.  When open is absent or answers NULL the registry lock is held across
+ * the call as it always was, which is what the host tests get.
  */
 typedef struct {
     void (*lock)(void *ctx);
     void (*unlock)(void *ctx);
+    void *(*call_open)(void *ctx);
+    void (*call_close)(void *ctx, void *iolock);
+    void (*call_hold)(void *ctx, void *iolock);
+    void (*call_release)(void *ctx, void *iolock);
     void *ctx;
 } ag_dev_lock_t;
 
@@ -167,6 +203,21 @@ uint32_t ag_dev_revoke(ag_device_t *dev);
 
 /* Revokes everything one module registered.  Returns how many devices went. */
 uint32_t ag_dev_revoke_owner(const void *owner);
+
+/*
+ * Calls that are inside this module's drivers right now.
+ *
+ * Whoever is about to UNMAP a module has to wait for this to reach zero, and
+ * holding the registry lock is no longer the way to be sure of it: a call lets
+ * that lock go for its own length and takes the device's lock instead (see
+ * ag_dev_lock_t).  So the registry lock now says "nobody is looking things up",
+ * which is not the same as "nobody is executing the image".
+ *
+ * And the waiting must be done WITHOUT the registry lock: a call that is
+ * finishing needs it back to write down that it has finished, so a waiter
+ * holding it would be waiting for something it is itself preventing.
+ */
+uint32_t ag_dev_calls_of_owner(const void *owner);
 
 /* NULL when there is no such device, or when it has been revoked. */
 ag_device_t *ag_dev_find(const char *name);

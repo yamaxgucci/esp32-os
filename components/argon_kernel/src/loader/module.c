@@ -14,6 +14,8 @@
 #include <argon/path.h>
 #include <argon/probe.h>
 #include <argon/service.h>
+#include <argon/port/task.h>
+#include <argon/port/time.h>
 
 #include "core/sysconfig.h"
 
@@ -116,17 +118,49 @@ static void drop_module(module_t *m)
     }
 
     /*
-     * The registry is held across the revoke *and* the unload, because the
-     * kernel calls into a driver's class vtable without going through a
-     * handle: a panel's text_row and a touchscreen's poll are called straight
-     * off dev->class_ops, from the console task, ten times a second.  Freeing
-     * the arena those point into while that call is in flight is executing
-     * memory that has just been given back - which took the board down with an
-     * interrupt watchdog timeout the first time a driver was unloaded while it
-     * was being polled.  Whoever calls a class op takes the same lock.
+     * The registry lock is held across the revoke, because the kernel calls
+     * into a driver's class vtable without going through a handle: a panel's
+     * text_row and a touchscreen's poll are called straight off dev->class_ops,
+     * from the console task, ten times a second.  Freeing the arena those point
+     * into while that call is in flight is executing memory that has just been
+     * given back - which took the board down with an interrupt watchdog timeout
+     * the first time a driver was unloaded while it was being polled.  Whoever
+     * calls a class op takes the same lock.
+     *
+     * After the revoke, no NEW call can get in: revoke clears dev->ops under
+     * this lock, and every entry point checks it.
      */
     ag_dev_lock_hold();
     (void)ag_dev_revoke_owner(m);
+    ag_dev_lock_release();
+
+    /*
+     * Then wait for the calls already inside, WITHOUT the lock, and this is the
+     * part the per-device locks made necessary.
+     *
+     * A read, a write, an open or a close lets the registry lock go for its own
+     * length and holds the device's lock instead - that is the whole point of
+     * them - so holding the registry lock here would no longer mean "nobody is
+     * executing this image".  Worse, it would deadlock: a call that is
+     * finishing needs the registry lock back to write down that it has
+     * finished, and a waiter holding it is waiting for what it prevents.
+     *
+     * Bounded, and a refusal if it runs out.  A leaked module is loud and
+     * harmless; unmapping code a task is standing in is neither, and this file
+     * already makes that trade for service tasks a few lines above.
+     */
+    const uint32_t deadline = (uint32_t)(ag_port_us() / 1000) + 3000u;
+    while (ag_dev_calls_of_owner(m) > 0) {
+        if ((uint32_t)(ag_port_us() / 1000) >= deadline) {
+            ag_log(AG_LOG_ERROR, "modules",
+                   "%s still has %u call(s) inside it; leaving it mapped",
+                   m->path, (unsigned)ag_dev_calls_of_owner(m));
+            return;
+        }
+        ag_port_task_delay(ag_port_ms_to_ticks(5));
+    }
+
+    ag_dev_lock_hold();
     ag_loader_unload(&m->app);
     memset(m, 0, sizeof(*m));
     ag_dev_lock_release();
