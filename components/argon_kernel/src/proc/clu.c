@@ -71,7 +71,22 @@ typedef struct {
 
 enum { CLU_NONE = 0, CLU_MASTER, CLU_WORKER };
 
-static clu_thread_t s_threads[AG_CLU_THREADS_MAX];
+/*
+ * The thread table, and it is a POINTER rather than an array on purpose.
+ *
+ * As an array it was three kilobytes of internal SRAM on every board, whether
+ * or not that board would ever run a cluster job - and internal SRAM is the one
+ * memory this system is always short of.  It cost a gate: with six kilobytes
+ * less of it, `nettest`'s TLS fetch failed with "no mem for receive buffer",
+ * because a TLS handshake wants tens of kilobytes and the Ethernet driver could
+ * no longer get its receive buffers.  The parent commit passed the same test
+ * with 96 KB free; this one had 90.
+ *
+ * A job is not a moment when asking for memory is unreasonable - it already
+ * loads an image and starts a process - so the table is taken when a job starts
+ * and given back when it ends.  A board that never runs one pays nothing.
+ */
+static clu_thread_t   *s_threads;
 static ag_port_mutex_t s_lock;
 static uint8_t         s_role;
 static ag_pid_t        s_job_pid;    /* whose job this is, or who serves it */
@@ -119,9 +134,33 @@ static void *msg_alloc(uint32_t bytes)
     return p;
 }
 
+/*
+ * Takes the table if this node has not got one.  Called under the lock, from
+ * the two places a job can begin: a master's first spawn, and a worker being
+ * asked for its first thread.
+ */
+static bool table_take(void)
+{
+    if (s_threads != NULL) {
+        return true;
+    }
+    const size_t bytes = AG_CLU_THREADS_MAX * sizeof(clu_thread_t);
+    s_threads = (clu_thread_t *)ag_port_alloc(bytes, AG_MEM_FAST | AG_MEM_BYTE);
+    if (s_threads == NULL) {
+        /* PSRAM will do: this is touched per message, not per sample. */
+        s_threads = (clu_thread_t *)ag_port_alloc(bytes,
+                                                  AG_MEM_SLOW | AG_MEM_BYTE);
+    }
+    if (s_threads == NULL) {
+        return false;
+    }
+    memset(s_threads, 0, bytes);
+    return true;
+}
+
 static clu_thread_t *by_tid(ag_clu_tid_t tid)
 {
-    if (tid < 0 || (uint32_t)tid >= AG_CLU_THREADS_MAX) {
+    if (s_threads == NULL || tid < 0 || (uint32_t)tid >= AG_CLU_THREADS_MAX) {
         return NULL;
     }
     return s_threads[tid].used ? &s_threads[tid] : NULL;
@@ -130,6 +169,9 @@ static clu_thread_t *by_tid(ag_clu_tid_t tid)
 /* The calling task's thread record, or NULL if it is not one of ours. */
 static clu_thread_t *me(void)
 {
+    if (s_threads == NULL) {
+        return NULL;
+    }
     const ag_port_task_t self = ag_port_task_self();
     for (uint32_t i = 0; i < AG_CLU_THREADS_MAX; i++) {
         if (s_threads[i].used && s_threads[i].local &&
@@ -199,10 +241,14 @@ static void slot_release(clu_thread_t *t)
  */
 static void job_clear(void)
 {
-    for (uint32_t i = 0; i < AG_CLU_THREADS_MAX; i++) {
-        if (s_threads[i].used) {
-            slot_release(&s_threads[i]);
+    if (s_threads != NULL) {
+        for (uint32_t i = 0; i < AG_CLU_THREADS_MAX; i++) {
+            if (s_threads[i].used) {
+                slot_release(&s_threads[i]);
+            }
         }
+        ag_port_free(s_threads);
+        s_threads = NULL;
     }
     s_held_bytes = 0;
     s_role = CLU_NONE;
@@ -227,7 +273,7 @@ static int32_t node_list(ag_clu_node_t *out, uint32_t max)
     here.cpu_hz = (si != NULL) ? si->cpu_hz : 0;
 
     lock();
-    for (uint32_t i = 0; i < AG_CLU_THREADS_MAX; i++) {
+    for (uint32_t i = 0; s_threads != NULL && i < AG_CLU_THREADS_MAX; i++) {
         if (s_threads[i].used && s_threads[i].node == 0) {
             here.threads++;
         }
@@ -253,7 +299,8 @@ static int32_t node_list(ag_clu_node_t *out, uint32_t max)
             out[idx].here = 0;
             out[idx].threads = 0;
             lock();
-            for (uint32_t j = 0; j < AG_CLU_THREADS_MAX; j++) {
+            for (uint32_t j = 0; s_threads != NULL && j < AG_CLU_THREADS_MAX;
+                 j++) {
                 if (s_threads[j].used && s_threads[j].node == idx) {
                     out[idx].threads++;
                 }
@@ -311,7 +358,7 @@ static ag_clu_fn entry_by_name(const char *name)
 /* A free slot, or -1.  tid 0 is the master's and is never handed out here. */
 static ag_clu_tid_t free_tid(void)
 {
-    for (uint32_t i = 1; i < AG_CLU_THREADS_MAX; i++) {
+    for (uint32_t i = 1; s_threads != NULL && i < AG_CLU_THREADS_MAX; i++) {
         if (!s_threads[i].used) {
             return (ag_clu_tid_t)i;
         }
@@ -426,7 +473,7 @@ static bool api_start(const ag_clu_entry_t *tab, uint32_t n)
     for (;;) {
         lock();
         uint32_t running = 0;
-        for (uint32_t i = 0; i < AG_CLU_THREADS_MAX; i++) {
+        for (uint32_t i = 0; s_threads != NULL && i < AG_CLU_THREADS_MAX; i++) {
             if (s_threads[i].used && s_threads[i].local &&
                 !s_threads[i].finished && s_threads[i].task != NULL) {
                 running++;
@@ -472,6 +519,9 @@ static ag_err_t claim(void)
     }
     if (s_tab_pid != pid) {
         return -AG_EPERM; /* start() was never called, so no entry points */
+    }
+    if (!table_take()) {
+        return -AG_ENOMEM;
     }
 
     memset(&s_threads[0], 0, sizeof(s_threads[0]));
@@ -954,6 +1004,10 @@ ag_err_t ag_clu_accept_spawn(ag_clu_tid_t tid, const char *entry,
     }
 
     lock();
+    if (!table_take()) {
+        unlock();
+        return -AG_ENOMEM;
+    }
     if (s_threads[tid].used) {
         unlock();
         return -AG_EEXIST;
@@ -1119,7 +1173,7 @@ uint32_t ag_clu_thread_count(void)
 {
     uint32_t n = 0;
     lock();
-    for (uint32_t i = 0; i < AG_CLU_THREADS_MAX; i++) {
+    for (uint32_t i = 0; s_threads != NULL && i < AG_CLU_THREADS_MAX; i++) {
         if (s_threads[i].used) {
             n++;
         }

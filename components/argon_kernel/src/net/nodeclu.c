@@ -24,8 +24,15 @@
 /* How long a frame may sit waiting for room in the link's window. */
 #define NC_SEND_MS 5000u
 
-/* Spawn requests from the far node waiting to be served. */
-#define NC_REQS 4
+/*
+ * Spawn requests from the far node waiting to be served.
+ *
+ * Two, not four, and that is not a saving for its own sake: the master's spawn
+ * WAITS for its answer, so one wire can have exactly one request in flight.
+ * The second slot is there only so a request arriving while one is being served
+ * is queued rather than refused.
+ */
+#define NC_REQS 2
 
 /*
  * A request is filled in on the link's reader task and served on this file's
@@ -43,7 +50,6 @@ typedef struct {
     bool         taken;
     ag_clu_tid_t tid;
     char         entry[AG_CLU_ENTRY_MAX];
-    char         image[AG_CLU_IMAGE_MAX];
     uint8_t      arg[AG_CLU_ARG_MAX];
     uint32_t     arglen;
 } nc_req_t;
@@ -53,6 +59,16 @@ static ag_port_task_t  s_task;
 static nc_req_t        s_req[NC_REQS];
 static ag_port_mutex_t s_reqlock;
 static ag_cluf_rx_t    s_rx;
+
+/*
+ * The image path, once rather than per request.
+ *
+ * Every thread of one job comes out of the same image - ag_clu_accept_spawn
+ * refuses a second job with a different one - so a copy in every slot was a
+ * quarter of a kilobyte each saying the same thing.  Held under s_reqlock like
+ * the slots themselves.
+ */
+static char s_image[AG_CLU_IMAGE_MAX];
 
 /* The one spawn this node is waiting on an answer for.  One, because only the
  * master spawns and it does so from its own task, one call at a time. */
@@ -65,14 +81,15 @@ static volatile int32_t s_answer;
  * A sender's frame buffer.  One at a time: guarded by s_tx, because two threads
  * of a job fragmenting into the same buffer would interleave their bytes.
  *
- * Sized above today's wire on purpose.  The UART cannot exceed nlink's 256-byte
- * quantum, but the whole point of info() is that the next wire will say
- * something larger, and a buffer pinned to the UART's number would silently cap
- * it.  payload_max() clamps to whatever is here, so a driver reporting more
- * than this is slower than it could be rather than unsafe - and the fix is one
- * number, here.
+ * Sized to today's wire, and NOT to a guess about the next one.  It was 512 so
+ * a faster driver could use bigger frames without a rebuild, which cost a
+ * quarter of a kilobyte of internal SRAM on every board for a wire that does
+ * not exist yet - and this file has just been taught what that costs.
+ * payload_max() clamps to whatever is here, so a driver reporting a larger
+ * message is slower than it could be rather than unsafe, and raising this is
+ * one number on the day there is something to raise it for.
  */
-#define NC_TXBUF 512u
+#define NC_TXBUF 256u
 static ag_port_mutex_t s_tx;
 static uint8_t         s_txbuf[NC_TXBUF + AG_CLUF_HDR];
 
@@ -380,10 +397,12 @@ static void serve_task(void *arg)
              * reader task dead the moment another request arrived.
              */
             nc_req_t req;
+            char     image[AG_CLU_IMAGE_MAX];
             ag_port_mutex_take(s_reqlock, AG_PORT_FOREVER);
             const bool have = s_req[i].used && !s_req[i].taken;
             if (have) {
                 req = s_req[i];
+                memcpy(image, s_image, sizeof(image));
                 s_req[i].taken = true;
             }
             ag_port_mutex_give(s_reqlock);
@@ -392,7 +411,7 @@ static void serve_task(void *arg)
             }
 
             const ag_err_t e = ag_clu_accept_spawn(req.tid, req.entry, req.arg,
-                                                   req.arglen, req.image);
+                                                   req.arglen, image);
             if (e != AG_OK) {
                 ag_log(AG_LOG_WARN, "clu", "cannot run '%s' here: %d",
                        req.entry, (int)e);
@@ -466,8 +485,8 @@ static void serve_spawn(const ag_cluf_hdr_t *h, const uint8_t *body)
         /* entry, image, argument - each where the last one ended. */
         int32_t at = take_string(body, h->len, 0, r->entry, sizeof(r->entry));
         if (at >= 0) {
-            at = take_string(body, h->len, (uint32_t)at, r->image,
-                             sizeof(r->image));
+            at = take_string(body, h->len, (uint32_t)at, s_image,
+                             sizeof(s_image));
         }
         if (at < 0) {
             why = -AG_EINVAL;
