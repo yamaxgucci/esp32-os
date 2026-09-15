@@ -1832,7 +1832,7 @@ static void phone_task(void *arg)
     while (!s.stop) {
         /*
          * A heartbeat, because "the board stopped accepting" is a thing that
-         * cannot be caught in the act.  Every five seconds this says where the
+         * cannot be caught in the act.  Every thirty seconds this says where the
          * loop has been and how many times it has been round; a stage that
          * stops advancing names the call that is blocking, which is the one
          * thing an outside observer cannot see.  Add a counter rather than try
@@ -1840,7 +1840,7 @@ static void phone_task(void *arg)
          */
         const uint64_t beat = (uint64_t)ag_micros();
         if (beat >= next_beat) {
-            next_beat = beat + 5000000ull;
+            next_beat = beat + 30000000ull;
             unsigned worst = 0, worst_us = 0;
             for (unsigned i = 0; i < STAGE_COUNT; i++) {
                 if (stage_max_us[i] > worst_us) {
