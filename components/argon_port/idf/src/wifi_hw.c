@@ -22,6 +22,7 @@
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
 #if AG_PORT_WIFI_HAS_AP
 #include "lwip/inet.h" /* ntohl, for the point's own address in ap_status */
@@ -61,6 +62,17 @@ static volatile bool    s_ap_secured;
 static volatile uint32_t s_ap_clients;
 /* Set by the driver's own AP_START/AP_STOP events - see the handler. */
 static volatile bool    s_ap_air;
+/*
+ * When the point was last configured, in microseconds.
+ *
+ * Not a flag: the driver's stop arrives from the event loop well after
+ * set_config has returned, so a flag held across the call is already clear
+ * when the event lands - the first build of this answered its own
+ * reconfiguration with "nobody asked for that" at every boot.  A second of
+ * grace covers the asynchrony without covering a real failure, which happens
+ * minutes or hours in.
+ */
+static volatile int64_t s_ap_touched_us;
 
 /*
  * The mode the one radio must be in for what is wanted right now.  There is a
@@ -170,6 +182,31 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id,
     case WIFI_EVENT_AP_STOP:
         s_ap_air = false;
         ESP_LOGW("wifi.ap", "point OFF the air");
+        /*
+         * If nobody here asked for that, put it back.
+         *
+         * A point configured in SYSTEM.CFG is the only way to reach this board
+         * - there is no other network and no keyboard in the room - so it
+         * going down is not a state to report, it is a state to leave.  It has
+         * gone down repeatedly with every record of it still reading "up":
+         * `wifi` printed the SSID, the channel and the address while no phone
+         * could see anything, and only a reset or a by-hand `wifi ap` brought
+         * it back.
+         *
+         * The second of grace is the difference between "it fell over" and "we
+         * are in the middle of configuring it": setting the configuration of a
+         * running point makes the driver stop and start it, and answering that
+         * stop by starting it again would be a loop.
+         *
+         * This is not the cause - that is still unknown, and the raising/
+         * on-the-air lines above are here to find it.  It is the board staying
+         * reachable while it is looked for.
+         */
+        if (s_ap_on &&
+            (esp_timer_get_time() - s_ap_touched_us) > 1000000) {
+            ESP_LOGW("wifi.ap", "nobody asked for that; raising it again");
+            (void)apply_mode();
+        }
         break;
 
     case WIFI_EVENT_AP_STACONNECTED:
@@ -590,7 +627,20 @@ ag_err_t ag_port_wifi_ap_start(const char *ssid, const char *pass,
         cfg.ap.authmode = WIFI_AUTH_OPEN;
     }
 
+    /*
+     * Who asks, and how often.
+     *
+     * Setting the configuration of a point that is already up makes the driver
+     * take it down and bring it back - which is the on/OFF/on in the log at
+     * every boot - and a second caller therefore interrupts the first one's
+     * network.  If the bring-back ever fails, the point stays down with every
+     * record of it still saying "up".  That is the shape of the fault being
+     * chased, so the callers get written down.
+     */
+    ESP_LOGW("wifi.ap", "raising %s (was %s)", ssid, s_ap_on ? "up" : "down");
+
     s_ap_on = true;
+    s_ap_touched_us = esp_timer_get_time();
     if (apply_mode() != ESP_OK ||
         esp_wifi_set_config(WIFI_IF_AP, &cfg) != ESP_OK) {
         /* Undo cleanly: a half-started point that reports itself on is worse
@@ -609,6 +659,7 @@ ag_err_t ag_port_wifi_ap_start(const char *ssid, const char *pass,
     s_ap_hidden = hidden;
     s_ap_secured = secured;
     s_ap_clients = 0;
+    s_ap_touched_us = esp_timer_get_time();
     return AG_OK;
 }
 
@@ -656,6 +707,24 @@ ag_err_t ag_port_wifi_ap_status(ag_port_wifi_ap_status_t *out)
         ESP_LOGW("wifi.ap",
                  "%s is recorded up but the radio is not transmitting",
                  s_ap_ssid);
+    }
+
+    /*
+     * And the mode the driver is actually in, which is the one thing left that
+     * nothing here could see.
+     *
+     * A point has now gone off the air several times without an AP_STOP event
+     * - so there is nothing to catch in the act, and the only way to tell "the
+     * radio was switched to station somewhere" from "the radio says AP and
+     * transmits nothing" is to ask it when somebody notices.  The two want
+     * completely different repairs, and guessing between them has already
+     * cost a day.
+     */
+    wifi_mode_t mode = WIFI_MODE_NULL;
+    if (esp_wifi_get_mode(&mode) == ESP_OK &&
+        mode != WIFI_MODE_AP && mode != WIFI_MODE_APSTA) {
+        ESP_LOGW("wifi.ap", "the radio is in mode %d, which carries no point",
+                 (int)mode);
     }
 
     /*
