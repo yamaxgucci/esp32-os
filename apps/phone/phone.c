@@ -383,18 +383,54 @@ typedef enum {
     WIRE_GONE,  /* the connection is finished, or the stream is  */
 } wire_t;
 
+/*
+ * How long to keep trying before the first byte of a message has gone.  Short
+ * on purpose - see the two deadlines inside send_all.
+ */
+#define SEND_START_MS 200u
+
 static wire_t send_all(ag_handle_t h, const void *buf, uint32_t len,
                        uint32_t deadline_ms)
 {
     const uint8_t *p = (const uint8_t *)buf;
     uint32_t       at = 0;
     const uint64_t until = ag_micros() + (uint64_t)deadline_ms * 1000ull;
+    /*
+     * Which "try again" it was, kept for the line below.  EAGAIN and ENOMEM
+     * clear the same way and so are handled the same, but they mean opposite
+     * things about the machine: a full window is a peer that is not reading,
+     * and no buffer is this board being out of them.  Guessing between the two
+     * costs an afternoon; the counter costs two integers.
+     */
+    unsigned again = 0, nomem = 0;
+    /*
+     * Two deadlines, because the two halves of a stuck send are not one
+     * problem.
+     *
+     * Once a byte of a WebSocket message has gone, the rest must follow: the
+     * client is mid-frame, and anything else arriving on that socket is a
+     * stream it can no longer parse.  That half is worth the full deadline.
+     *
+     * Before the first byte, nothing is owed to anybody, and waiting is pure
+     * harm.  Measured on the CYD against a phone whose window had filled: five
+     * thousand EAGAINs and ten seconds per attempt, with the driver's entire
+     * loop inside the wait - so keys went unread, slots would not switch and
+     * commands looked ignored, ten seconds at a time.  The client that is not
+     * reading gains nothing from it either: it will read when it reads, and
+     * the message can go then.
+     */
+    const uint64_t start_by = ag_micros() + (uint64_t)SEND_START_MS * 1000ull;
 
     while (at < len) {
         const int32_t n = ag_net_send(h, p + at, len - at);
         if (n > 0) {
             at += (uint32_t)n;
             continue;
+        }
+        if (n == -AG_EAGAIN) {
+            again++;
+        } else if (n == -AG_ENOMEM) {
+            nomem++;
         }
         /*
          * "Try again" is more than one answer.
@@ -415,12 +451,19 @@ static wire_t send_all(ag_handle_t h, const void *buf, uint32_t len,
                    (unsigned)at, (unsigned)len, (int)n);
             return WIRE_GONE;
         }
+        if (at == 0u && ag_micros() > start_by) {
+            /* Nothing sent, nothing owed: let the loop get on with reading
+             * input, and offer this message again next time round. */
+            return WIRE_STALL;
+        }
         if (ag_micros() > until) {
+            ag_log(AG_LOG_WARN, "phone",
+                   "send stalled at %u of %u after %u ms: %u window, %u no-buffer",
+                   (unsigned)at, (unsigned)len, (unsigned)deadline_ms, again,
+                   nomem);
             if (at == 0u) {
                 return WIRE_STALL; /* nothing started; nothing broken */
             }
-            ag_log(AG_LOG_WARN, "phone", "send stalled at %u of %u",
-                   (unsigned)at, (unsigned)len);
             return WIRE_GONE;
         }
         TASK->sleep_ms(2u);
