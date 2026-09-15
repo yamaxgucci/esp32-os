@@ -87,9 +87,21 @@ CONFIG_ARGON_APP_ARENA_KB=8
 #
 # What this does NOT cover: the WPA2 handshake itself, which the supplicant
 # allocates when a station appears.  There is no setting for that one.
+# Four, not eight, and not the sixteen dynamic ones the default keeps.
+#
+# Eight static buffers cost ~13 KB taken for good, and that turned out to be
+# the file manager's whole margin: it failed to start with "no memory for a
+# 8192 byte task stack", having run perfectly well before.  What fixed the
+# radio was the stack default, measured; these were added on top and never
+# tested on their own, so they were paying rent in somebody else's room.
+#
+# Four keeps the point of the idea - the radio holds transmit memory that no
+# application can take - at half the price, and leaves the room an application
+# needs to exist at all.  A board that stays reachable and runs nothing is not
+# the goal.
 CONFIG_ESP_WIFI_STATIC_TX_BUFFER=y
 CONFIG_ESP_WIFI_TX_BUFFER_TYPE=0
-CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=8
+CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=4
 
 # Both radios, in one image.
 #
