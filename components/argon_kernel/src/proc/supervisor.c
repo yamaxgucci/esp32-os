@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <argon/clu.h>
 #include <argon/console.h>
 #include <argon/journal.h>
 #include <argon/keys.h>
@@ -349,6 +350,19 @@ ag_err_t ag_supervisor_init(void)
     ag_err_t err = ag_proc_init();
     if (err != AG_OK) {
         return err;
+    }
+
+    /*
+     * The cluster's thread table, which exists on every board whether or not
+     * there is a second one: with no link it answers "one node, this one" and
+     * runs every thread here, so a program written for the cluster runs
+     * unchanged alone.  A failure is not fatal to the system - it costs jobs,
+     * not the machine - but it is said out loud.
+     */
+    const ag_err_t cerr = ag_clu_init();
+    if (cerr != AG_OK) {
+        ag_log(AG_LOG_WARN, "clu", "no thread table (%d): no cluster jobs",
+               (int)cerr);
     }
 
     ag_session_init();

@@ -189,6 +189,23 @@ ag_err_t ag_linkprov_use(const char *name)
         strcpy(s_name, "none");
         return e;
     }
+
+    /*
+     * Say what this wire is, and whether everything above it fits on it.  Once,
+     * here, rather than as a surprise inside a driver later - see
+     * AG_LINK_MIN_MTU.
+     */
+    ag_link_info_t info;
+    if (ag_linkprov_info(&info) == AG_OK) {
+        ag_log(AG_LOG_INFO, "link", "%s: %s, %u B per message, %u B/s", s_name,
+               info.wire, (unsigned)info.mtu, (unsigned)info.bytes_per_sec);
+        if (info.mtu < AG_LINK_MIN_MTU) {
+            ag_log(AG_LOG_WARN, "link",
+                   "%s carries only %u bytes a message; the node services want "
+                   "%u and will refuse the requests that do not fit",
+                   s_name, (unsigned)info.mtu, (unsigned)AG_LINK_MIN_MTU);
+        }
+    }
     return AG_OK;
 }
 
@@ -218,4 +235,44 @@ ag_err_t ag_linkprov_stats(ag_link_stats_t *out)
         return -AG_ENODEV;
     }
     return s_ops->stats(s_dev, out);
+}
+
+/*
+ * What the wire IS.  Answered for every bound link, including one whose driver
+ * predates info() - that one gets the UART's own measured numbers, because
+ * every driver that could exist before this entry was a UART.
+ *
+ * The caller therefore never has to handle "I do not know", which matters: the
+ * numbers decide message sizes and timeouts, and a caller that had to guess
+ * when they were missing would be a second set of constants in a second place,
+ * which is exactly the thing this exists to remove.
+ */
+ag_err_t ag_linkprov_info(ag_link_info_t *out)
+{
+    if (out == NULL) {
+        return -AG_EINVAL;
+    }
+    if (s_ops == NULL) {
+        return -AG_ENODEV;
+    }
+
+    memset(out, 0, sizeof(*out));
+    const size_t need =
+        offsetof(ag_link_ops_t, info) + sizeof(((ag_link_ops_t *)0)->info);
+    if (s_ops->size >= need && s_ops->info != NULL &&
+        s_ops->info(s_dev, out) == AG_OK && out->mtu > 0) {
+        if (out->bytes_per_sec == 0) {
+            out->bytes_per_sec = AG_LINK_DEFAULT_RATE;
+        }
+        if (out->rtt_us == 0) {
+            out->rtt_us = AG_LINK_DEFAULT_RTT_US;
+        }
+        return AG_OK;
+    }
+
+    out->mtu = AG_LINK_DEFAULT_MTU;
+    out->bytes_per_sec = AG_LINK_DEFAULT_RATE;
+    out->rtt_us = AG_LINK_DEFAULT_RTT_US;
+    strcpy(out->wire, "uart");
+    return AG_OK;
 }

@@ -131,6 +131,8 @@ add_executable(argon_tests
     test_tube.c
     test_nam.c
     test_netmsg.c
+    test_cluframe.c
+    "${ARGON_ROOT}/components/argon_kernel/src/net/cluframe.c"
     test_rempix.c
     test_desktop.c
     test_fsops.c

@@ -25,6 +25,9 @@
 #include <argon/nodehello.h>
 #include <argon/nodename.h>
 #include <argon/noderdev.h>
+#include <argon/clu.h>
+#include <argon/kernel.h>
+#include <argon/nodeclu.h>
 #include <argon/nodeps.h>
 #include <argon/nodefs.h>
 #include <argon/nodeproc.h>
@@ -380,6 +383,61 @@ int ag_cmd_link(int argc, char **argv)
         if (perr != AG_OK) {
             ag_console_printf("  (not answering `ps`: %d)\n", (int)perr);
         }
+        /*
+         * And the job channel, from the moment a link exists.  A node that only
+         * starts listening once it has run something of its own would refuse
+         * the first job it is offered - and the neighbour has no way to tell
+         * that from "this board cannot do it".
+         */
+        const ag_err_t cerr = ag_nodeclu_start();
+        if (cerr != AG_OK) {
+            ag_console_printf("  (not taking threads of a job: %d)\n",
+                              (int)cerr);
+        }
+        return 0;
+    }
+
+    /*
+     * What a job has to work with: the boards, their cores, and what the wire
+     * between them will carry.
+     *
+     * The last line is the one worth having in front of you before deciding to
+     * spread anything: it turns the link into the number that decides whether a
+     * piece of work should travel at all - how many cycles of a local core a
+     * byte over this wire is worth.  Under about that many cycles per byte, the
+     * work was cheaper at home, and no amount of cores changes it.
+     */
+    if (ag_path_icmp(argv[1], "nodes") == 0) {
+        ag_clu_node_t nodes[4];
+        const int32_t n = ag_clu_api_table.nodes(nodes, 4);
+        uint32_t      cores = 0;
+        for (int32_t i = 0; i < n && i < 4; i++) {
+            ag_console_printf("%-9s %u core%s  %u thread%s%s\n", nodes[i].name,
+                              (unsigned)nodes[i].cores,
+                              (nodes[i].cores == 1) ? "" : "s",
+                              (unsigned)nodes[i].threads,
+                              (nodes[i].threads == 1) ? "" : "s",
+                              nodes[i].here ? "  (here)" : "");
+            cores += nodes[i].cores;
+        }
+        ag_console_printf("%d node%s, %u core%s in all\n", (int)n,
+                          (n == 1) ? "" : "s", (unsigned)cores,
+                          (cores == 1) ? "" : "s");
+
+        ag_link_info_t info;
+        if (ag_linkprov_info(&info) == AG_OK) {
+            const ag_sysinfo_t *si = ag_sysinfo();
+            const uint32_t hz = (si != NULL && si->cpu_hz > 0) ? si->cpu_hz
+                                                               : 240000000u;
+            const uint32_t per_byte =
+                (info.bytes_per_sec > 0) ? (hz / info.bytes_per_sec) : 0;
+            ag_console_printf("wire  %s, %u B per message, %u B/s\n",
+                              info.wire, (unsigned)info.mtu,
+                              (unsigned)info.bytes_per_sec);
+            ag_console_printf("      a byte over it costs %u cycles here; work "
+                              "worth less than that per byte stays home\n",
+                              (unsigned)per_byte);
+        }
         return 0;
     }
 
@@ -535,7 +593,7 @@ int ag_cmd_link(int argc, char **argv)
 
     ag_console_puts("usage: link [use <dev>|none | run <path> [args] | "
                     "get <there> <here> | mount | umount | devs | nodevs | "
-                    "name [x] | ping [n] [control|stream|bulk] | echo [secs] | "
-                    "poll [ms]]\n");
+                    "nodes | name [x] | ping [n] [control|stream|bulk] | "
+                    "echo [secs] | poll [ms]]\n");
     return 1;
 }

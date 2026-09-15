@@ -25,6 +25,7 @@
     { "out": "HELLO.AXE", "group": "core", "src": ["apps/hello/hello.c"] },
     { "out": "NEEDSND.AXE", "group": "core", "src": ["apps/needsnd/needsnd.c"] },
     { "out": "NEEDGFX.AXE", "group": "core", "src": ["apps/needgfx/needgfx.c"] },
+    { "out": "GRIND.AXE", "group": "core", "src": ["apps/grind/grind.c"] },
     { "out": "DISK.AXE", "group": "core", "src": ["apps/disk/disk.c"] },
     { "out": "DEVS.AXE", "group": "core", "src": ["apps/devs/devs.c"] },
     { "out": "DEVPOKE.AXE", "group": "core", "src": ["apps/devpoke/devpoke.c"] },

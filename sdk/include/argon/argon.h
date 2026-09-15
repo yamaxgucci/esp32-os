@@ -1368,6 +1368,93 @@ static inline uint32_t ag_wifi_espnow_dropped(void)
     return g_ag_api->wifi->espnow_dropped();
 }
 
+/* ------------------------------------------------------------------------ */
+/* Threads of one job, across the nodes (ABI 0.52)                          */
+/* ------------------------------------------------------------------------ */
+/*
+ * The shape of a program that uses these, whole:
+ *
+ *     static void grind(ag_clu_tid_t self, const void *arg, uint32_t len);
+ *     static const ag_clu_entry_t k_entries[] = { { "grind", grind } };
+ *
+ *     int ag_main(int argc, char **argv)
+ *     {
+ *         if (ag_clu_start(k_entries, 1)) {
+ *             return 0;   // this copy was a worker; it has done its share
+ *         }
+ *         ag_clu_node_t n[4];
+ *         const int32_t nodes = ag_clu_nodes(n, 4);
+ *         for (int32_t i = 0; i < nodes; i++) {
+ *             for (uint8_t c = 0; c < n[i].cores; c++) {
+ *                 ag_clu_spawn(i, "grind", &job, sizeof(job));
+ *             }
+ *         }
+ *         ...collect with ag_clu_recv()...
+ *     }
+ *
+ * Every one of these answers -AG_ENOSYS on a kernel older than 0.52 rather than
+ * calling through a NULL table, so a program may use them and still start on an
+ * older system - where nodes() reports one node and nothing spreads anywhere.
+ */
+static inline int32_t ag_clu_nodes(ag_clu_node_t *out, uint32_t max)
+{
+    if (!AG_HAS(g_ag_api->clu, nodes)) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->clu->nodes(out, max);
+}
+static inline bool ag_clu_start(const ag_clu_entry_t *tab, uint32_t n)
+{
+    if (!AG_HAS(g_ag_api->clu, start)) {
+        return false;
+    }
+    return g_ag_api->clu->start(tab, n);
+}
+static inline ag_clu_tid_t ag_clu_spawn(int32_t node, const char *entry,
+                                        const void *arg, uint32_t len)
+{
+    if (!AG_HAS(g_ag_api->clu, spawn)) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->clu->spawn(node, entry, arg, len);
+}
+static inline ag_err_t ag_clu_send(ag_clu_tid_t dst, const void *buf,
+                                   uint32_t len, uint32_t timeout_ms)
+{
+    if (!AG_HAS(g_ag_api->clu, send)) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->clu->send(dst, buf, len, timeout_ms);
+}
+static inline int32_t ag_clu_recv(ag_clu_tid_t *from, void *buf, uint32_t cap,
+                                  uint32_t timeout_ms)
+{
+    if (!AG_HAS(g_ag_api->clu, recv)) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->clu->recv(from, buf, cap, timeout_ms);
+}
+static inline ag_err_t ag_clu_join(ag_clu_tid_t t, uint32_t timeout_ms)
+{
+    if (!AG_HAS(g_ag_api->clu, join)) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->clu->join(t, timeout_ms);
+}
+static inline ag_clu_tid_t ag_clu_self(void)
+{
+    if (!AG_HAS(g_ag_api->clu, self)) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->clu->self();
+}
+static inline void ag_clu_done(void)
+{
+    if (AG_HAS(g_ag_api->clu, done)) {
+        g_ag_api->clu->done();
+    }
+}
+
 #ifdef __cplusplus
 }
 #endif

@@ -220,9 +220,25 @@ extern "C" {
  *      lost, corrupt or duplicated means the acknowledgement was late, not
  *      that the wire dropped anything, and the two have opposite cures.
  *      Appended, so a .SYS built before this reads exactly what it did.
+ *
+ * 0.52 api->clu, and ag_link_ops_t gained info().
+ *
+ *      api->clu is one program running on every core of every node - threads
+ *      of one job, spread over the boards, passing data to each other by
+ *      message because there is no memory they share.  Everything before it
+ *      moved whole PROGRAMS between nodes; this is the first thing that lets
+ *      ONE program have the second board's cores.  See ag_clu_api_t.
+ *
+ *      info() is what makes that portable across wires.  Everything above the
+ *      link had the UART's numbers built in - 232-byte payloads and timeouts
+ *      sized for 400 KB/s - and a quad SPI or a parallel bus would have had to
+ *      pretend to be a UART to fit.  A driver now states its largest message
+ *      and its nominal rate, and the layers above ask instead of assuming.
+ *      NULL on a driver built before this: probe with AG_HAS and fall back to
+ *      the conservative pair, which is exactly what the UART gives.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 51u
+#define AG_ABI_MINOR 52u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -1252,6 +1268,38 @@ typedef struct ag_link_stats {
 } ag_link_stats_t;
 
 /*
+ * What this wire IS, as opposed to what it has done (ABI 0.52).
+ *
+ * Written because the wire is going to be replaced and everything above it had
+ * the UART's numbers built in.  The tree holds 232-byte payloads in four
+ * different files, timeouts sized for 400 KB/s, and a window chosen for a
+ * millisecond of round trip; on a quad SPI at 40 MHz every one of those is
+ * wrong by an order of magnitude in a different direction, and a driver that
+ * had to satisfy them all would be a fast wire pretending to be a slow one.
+ *
+ * So the driver states its own shape and the layers above ask.  Three numbers
+ * are enough for every decision they actually make: how much to put in one
+ * message, how long to wait before calling it lost, and whether a block of
+ * work is worth sending away at all.
+ *
+ * `bytes_per_sec` is the PAYLOAD rate, after framing and after whatever the
+ * line loses - the number an application can divide a block size by and get a
+ * time.  For the hand-soldered UART at 16 Mbaud that is 1 132 730 and not
+ * 1 599 966: a quarter of the frames arrive corrupt and are sent again, and a
+ * caller told the line rate would plan against bandwidth that does not exist.
+ *
+ * `rtt_us` is the driver's own estimate for a SMALL message and back, to be
+ * used before anything has been measured; once traffic is flowing, srtt_ms in
+ * the stats above is the better number and supersedes it.
+ */
+typedef struct ag_link_info {
+    uint32_t mtu;           /* largest payload one send() will accept       */
+    uint32_t bytes_per_sec; /* sustained payload rate, both ends counted once */
+    uint32_t rtt_us;        /* small message there and back, unloaded       */
+    char     wire[16];      /* "uart", "spi", "spi-quad", "par8"...         */
+} ag_link_info_t;
+
+/*
  * The service classes, and they are apps/common/nlink's NL_CLS_* under another
  * name and with deliberately the same numbers.
  *
@@ -1305,6 +1353,13 @@ typedef struct ag_link_ops {
      * retransmit count is the difference.
      */
     ag_err_t (*stats)(ag_device_t *dev, ag_link_stats_t *out);
+
+    /*
+     * ABI 0.52: the wire's own shape - see ag_link_info_t.  NULL on a driver
+     * built before it, and the caller then assumes the conservative pair (232
+     * bytes, 400 KB/s), which is what this tree's UART actually gives.
+     */
+    ag_err_t (*info)(ag_device_t *dev, ag_link_info_t *out);
 } ag_link_ops_t;
 
 
@@ -2393,6 +2448,194 @@ typedef struct ag_cam_api {
 } ag_cam_api_t;
 
 /* ------------------------------------------------------------------------ */
+/* clu - one program on every core of every node (ABI 0.52)                 */
+/* ------------------------------------------------------------------------ */
+/*
+ * WHAT THIS IS, AND WHAT IT DELIBERATELY IS NOT.
+ *
+ * Everything the cluster had before this moved whole PROGRAMS: `run` hands a
+ * program to the node that can serve it, its file stays here, its devices are
+ * reachable from there.  That gives every program a core; it does not give one
+ * program the cores of the other board.  This does.
+ *
+ * It is NOT api->task->create across the wire, and the difference is not an
+ * implementation detail to be closed later.  A thread in the ordinary sense is
+ * a stack and a program counter sharing one address space with its siblings -
+ * it reaches a global by name, a pointer means the same thing in every one of
+ * them.  Between two boards there is no such space.  A cache line fetched over
+ * this wire costs tens of microseconds against 1.26 for the worst local miss,
+ * so a shared-memory illusion here would not be slower in the way that
+ * profiling finds, it would be slower in the way that makes the machine
+ * useless.  That measurement is why this interface passes MESSAGES and has no
+ * call that dereferences anything on another board.
+ *
+ * So: a thread here runs a NAMED ENTRY of the same program, on some node, with
+ * a stack of its own and no memory in common with its siblings, and the only
+ * way it exchanges anything with them is send/recv.
+ *
+ * WHAT IT COSTS, so the caller can decide before it builds the wrong thing.
+ * Every byte a thread is given and every byte it answers with crosses the wire
+ * at whatever link->info() reports.  On the measured UART - 1.13 MB/s of
+ * payload at 16 Mbaud - a byte is 0.88 microseconds, which is about 210 cycles
+ * of a 240 MHz core.  A piece of work must therefore be worth more than ~210
+ * cycles for each byte it carries in and out, or it was cheaper to do at home;
+ * and it must be big enough that the round trip (milliseconds, not
+ * microseconds) disappears into it.  Both numbers are readable at run time -
+ * nodes() gives the cores, the link's info() and stats() give the rest - so a
+ * program that wants to decide for itself can, and grind.axe does.
+ *
+ * WHAT SHAPE OF WORK FITS.  The one that carries little and computes much:
+ * filter fitting, convolution, a rendered tile, a compressed frame, a search.
+ * The one that does not is a stream with a deadline shorter than the trip - a
+ * 44.1 kHz audio frame is 0.73 ms and the trip is several - and for that the
+ * answer is not this interface but a one-way pipeline, each node a stage.
+ *
+ * THE RULES, all four of which are arbitrary only in their limits:
+ *
+ *   - Exactly one program on a node may hold a job at a time.  The second gets
+ *     -AG_EBUSY.  A node hosts one worker process per job, processes are
+ *     capped at four, and a cluster that silently ran out of them mid-spawn
+ *     would be worse than one that says no at the start.
+ *   - Only the thread that started the job (tid 0, "the master") may spawn.
+ *     Every thread may send to every other.  Nested spawning needs routing
+ *     that two nodes and one wire cannot exercise, so it is refused rather
+ *     than written blind.
+ *   - A message is at most AG_CLU_MSG_MAX and arrives whole or not at all.
+ *     The wire splits and reassembles it; the caller never sees a fragment.
+ *   - A worker that is still running when the master ends is stopped with it.
+ *     A job outliving the program that owns it is a leak on somebody else's
+ *     board, which is the hardest kind to find.
+ */
+
+/* Longest entry-point name, including the terminator. */
+#define AG_CLU_ENTRY_MAX 16u
+
+/*
+ * The largest single message.  Big enough for a block of audio, a tile of
+ * pixels or a row of coefficients; small enough that a node's mailboxes cannot
+ * eat the heap.  A buffer of this size always fits whatever recv() has.
+ */
+#define AG_CLU_MSG_MAX 4096u
+
+/* Threads in one job, master included, over all nodes. */
+#define AG_CLU_THREADS_MAX 16u
+
+typedef int32_t ag_clu_tid_t;
+
+/* The master, always, on whichever node started the job. */
+#define AG_CLU_MASTER ((ag_clu_tid_t)0)
+
+/* As `node` to spawn(): let the system choose, or insist on this board. */
+#define AG_CLU_ANY   (-1)
+#define AG_CLU_LOCAL (-2)
+
+typedef struct ag_clu_node {
+    char     name[16];  /* what the node calls itself; see ag_node_name()   */
+    uint8_t  cores;     /* how many this board has                          */
+    uint8_t  here;      /* 1 when this entry is the board asking            */
+    uint16_t threads;   /* of this job, running there now                   */
+    uint32_t cpu_hz;
+} ag_clu_node_t;
+
+/*
+ * A thread's body.  `self` is its own tid, so it can say where an answer came
+ * from; `arg` is the blob spawn() was given, valid only for this call.
+ *
+ * Returning ends the thread.  There is no return value on purpose: a result
+ * that fits in an int is a result that should have been a message, and one
+ * that does not would have needed a second mechanism to carry it.  Send what
+ * you computed to whoever asked for it, then return.
+ */
+typedef void (*ag_clu_fn)(ag_clu_tid_t self, const void *arg, uint32_t len);
+
+typedef struct ag_clu_entry {
+    const char *name;
+    ag_clu_fn   fn;
+} ag_clu_entry_t;
+
+typedef struct ag_clu_api {
+    uint32_t size;
+
+    /*
+     * The nodes this job may use, `here` first.  Returns how many were written,
+     * or how many there are when `out` is NULL.  One means this board is alone,
+     * which is not an error and is the answer on most boards most of the time.
+     */
+    int32_t (*nodes)(ag_clu_node_t *out, uint32_t max);
+
+    /*
+     * Declare this program's entry points, and find out which half of the job
+     * this copy of it is.
+     *
+     * FALSE means "you are the master": the table is registered, spawn() will
+     * work, carry on with ag_main.
+     *
+     * TRUE means this copy was started by another node to serve its share of a
+     * job, and by the time it returns that share is finished - the call blocks,
+     * running whatever threads were asked for, until the job ends.  The right
+     * response is to return from ag_main without doing anything else, and the
+     * idiom is one line:
+     *
+     *     if (ag_clu_start(k_entries, 2)) return 0;
+     *
+     * `tab` must stay valid for as long as the job does; a static array is the
+     * normal answer.  The names are matched exactly and are case sensitive.
+     */
+    bool (*start)(const ag_clu_entry_t *tab, uint32_t n);
+
+    /*
+     * Start one thread running `entry`, on `node` - an index from nodes(), or
+     * AG_CLU_ANY to be placed, or AG_CLU_LOCAL to stay here.  Returns its tid,
+     * or a negative error; -AG_EPERM from anything but the master.
+     *
+     * `arg` is copied and must be small - one wire message, so at most a couple
+     * of hundred bytes; it is for what the thread needs to know, not for what
+     * it is to work on.  Anything larger is a send() after the spawn, which
+     * costs nothing extra and does not make start-up wait for a big transfer.
+     */
+    ag_clu_tid_t (*spawn)(int32_t node, const char *entry, const void *arg,
+                          uint32_t len);
+
+    /*
+     * One message to one thread, wherever it is.  Blocks up to timeout_ms if
+     * the far mailbox is full - that is back-pressure and not an error - and
+     * answers -AG_ETIMEDOUT if it stays full, -AG_ENOENT if the thread has
+     * ended, -AG_ERANGE above AG_CLU_MSG_MAX.
+     */
+    ag_err_t (*send)(ag_clu_tid_t dst, const void *buf, uint32_t len,
+                     uint32_t timeout_ms);
+
+    /*
+     * The next message for the calling thread.  Returns its length and fills
+     * *from with the sender, -AG_EAGAIN when none arrived in time.
+     *
+     * A message too big for `cap` is NOT discarded: recv answers -AG_ERANGE and
+     * leaves it at the head, so a caller that was given something unexpected
+     * can ask again with room for it rather than lose it.  A buffer of
+     * AG_CLU_MSG_MAX can never see that error.
+     */
+    int32_t (*recv)(ag_clu_tid_t *from, void *buf, uint32_t cap,
+                    uint32_t timeout_ms);
+
+    /*
+     * Wait for a thread to return.  -AG_ETIMEDOUT while it still runs.
+     * Joining one that has already finished succeeds at once; joining one that
+     * never existed is -AG_ENOENT.
+     */
+    ag_err_t (*join)(ag_clu_tid_t t, uint32_t timeout_ms);
+
+    /* The calling thread's own tid.  AG_CLU_MASTER in ag_main of the master. */
+    ag_clu_tid_t (*self)(void);
+
+    /*
+     * End the job: stop every worker, on every node, and forget the threads.
+     * Called for you when the master's process ends, so a program that simply
+     * returns leaves nothing behind; call it yourself to run a second job.
+     */
+    void (*done)(void);
+} ag_clu_api_t;
+
+/* ------------------------------------------------------------------------ */
 /* Root table                                                               */
 /* ------------------------------------------------------------------------ */
 
@@ -2440,6 +2683,15 @@ typedef struct ag_api {
     /* ABI 0.41+: the DVP camera transport - NULL without
      * CONFIG_ARGON_ENABLE_CAMERA. */
     const ag_cam_api_t *cam;
+
+    /*
+     * ABI 0.52+: threads of one program across the nodes.  Never NULL - a board
+     * with no link answers "one node, this one" and runs every thread locally,
+     * which is the same program working on one core count instead of two.  A
+     * program written against this therefore runs unchanged on a single board,
+     * and that is the point: the cluster is a size, not a different system.
+     */
+    const ag_clu_api_t *clu;
 } ag_api_t;
 
 /* ------------------------------------------------------------------------ */

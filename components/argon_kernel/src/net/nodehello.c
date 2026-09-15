@@ -21,6 +21,7 @@
 #include <argon/libc.h>
 #include <argon/linkprov.h>
 #include <argon/log.h>
+#include <argon/kernel.h>
 #include <argon/nodename.h>
 
 #include <argon/port/task.h>
@@ -37,9 +38,21 @@ enum {
 
 static bool s_listening;
 
+/*
+ * After the name, what the board is made of: cores and clock.
+ *
+ * Appended rather than sent as a second message, and after the name rather than
+ * before it, so an image built before this reads exactly what it did - it takes
+ * the name by its stated length and ignores the tail.  Five bytes, and without
+ * them a job that wants every core of every board has nothing to divide the
+ * work by; `[cluster] cores =` in a config file would be a number somebody has
+ * to keep in step with the hardware by hand.
+ */
+#define NH_CAPS 5u
+
 static ag_err_t send_hello(uint8_t op)
 {
-    uint8_t     buf[NH_HDR + AG_NODE_NAME_MAX];
+    uint8_t     buf[NH_HDR + AG_NODE_NAME_MAX + NH_CAPS];
     const char *me = ag_node_name();
     size_t      n = strlen(me);
     if (n >= AG_NODE_NAME_MAX) {
@@ -48,6 +61,16 @@ static ag_err_t send_hello(uint8_t op)
     buf[0] = op;
     buf[1] = (uint8_t)n;
     memcpy(buf + NH_HDR, me, n);
+
+    const ag_sysinfo_t *si = ag_sysinfo();
+    const uint32_t      hz = (si != NULL) ? si->cpu_hz : 0;
+    uint8_t            *caps = buf + NH_HDR + n;
+    caps[0] = (si != NULL && si->cpu_cores > 0) ? si->cpu_cores : 1u;
+    caps[1] = (uint8_t)(hz & 0xffu);
+    caps[2] = (uint8_t)((hz >> 8) & 0xffu);
+    caps[3] = (uint8_t)((hz >> 16) & 0xffu);
+    caps[4] = (uint8_t)((hz >> 24) & 0xffu);
+    n += NH_CAPS;
 
     /* Short and bounded: a hello that cannot go out now is one the next bind
      * or the next `node` will send again. */
@@ -84,6 +107,18 @@ static void on_msg(uint8_t chan, const void *data, uint16_t n, void *ctx)
     }
     memcpy(name, b + NH_HDR, len);
     name[len] = '\0';
+
+    /* The tail, if this hello has one.  A node that says nothing about its
+     * cores is one running an image from before they were said, and is left at
+     * zero - which every reader is told to take as one. */
+    const uint16_t stated = b[1];
+    if ((uint32_t)n >= (uint32_t)NH_HDR + stated + NH_CAPS) {
+        const uint8_t *caps = b + NH_HDR + stated;
+        const uint32_t hz = (uint32_t)caps[1] | ((uint32_t)caps[2] << 8) |
+                            ((uint32_t)caps[3] << 16) |
+                            ((uint32_t)caps[4] << 24);
+        ag_node_set_peer_caps(caps[0], hz);
+    }
 
     if (b[0] == NH_ASK) {
         ag_node_set_peer_name(name);

@@ -8,6 +8,7 @@
 #include <setjmp.h>
 #include <string.h>
 
+#include <argon/clu.h>
 #include <argon/console.h>
 #include <argon/hostfs.h>
 #include <argon/session.h>
@@ -183,6 +184,8 @@ static proc_t *by_pid(ag_pid_t pid)
     return NULL;
 }
 
+proc_t *ag_proc_by_pid(ag_pid_t pid) { return by_pid(pid); }
+
 const char *ag_proc_state_name(ag_proc_state_t state)
 {
     switch (state) {
@@ -339,6 +342,20 @@ static void release_resource(ag_res_type_t type, void *ref, uint32_t extra,
 static void reap(proc_t *p)
 {
     const uint32_t held = ag_reslist_reclaim(&p->res, release_resource, p);
+
+    /*
+     * A cluster job belongs to this process, and the threads it has on OTHER
+     * boards are not in the list above and would be reclaimed by nothing at
+     * all.  Forgetting the job here is what stops a worker process on the
+     * neighbour waiting for ever for a master that no longer exists.
+     *
+     * AFTER the reclaim, not before, and the order is the whole point: this
+     * takes the job's mailboxes apart, and a thread of this process blocked
+     * waiting on one must already be gone when that happens.  The reclaim
+     * above is what makes sure it is.  It is cheap and touches no wire - the
+     * process table is locked here.
+     */
+    ag_clu_proc_ended(p->pid);
     const uint32_t files = ag_vfs_close_owned_by(p->pid);
     /*
      * Pins last, and never skipped.  An interrupt handler belonging to code

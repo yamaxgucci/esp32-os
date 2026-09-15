@@ -94,11 +94,22 @@ static void thread_entry(void *arg)
     ag_port_task_delete(NULL);
 }
 
-static ag_thread_t api_create(void (*fn)(void *), void *arg, const char *name,
-                              size_t stack, int priority, uint32_t flags)
+/*
+ * The body of create(), with the process named rather than taken from whoever
+ * is calling.
+ *
+ * Both are needed and they are not the same question.  An application creating
+ * a thread of its own is the caller's process, always.  A thread of a CLUSTER
+ * job is asked for by the node next door, and it arrives on the link's task -
+ * which belongs to no process at all, so "the caller's" would be NULL and the
+ * thread could not be owned by anything.  Naming the process is what lets the
+ * thread still belong to the program it runs inside, and therefore still be
+ * reclaimed when that program ends.
+ */
+static ag_thread_t thread_create_in(proc_t *p, void (*fn)(void *), void *arg,
+                                    const char *name, size_t stack,
+                                    int priority, uint32_t flags)
 {
-    proc_t *p = ag_proc_current();
-
     if (fn == NULL) {
         return NULL;
     }
@@ -182,6 +193,29 @@ static ag_thread_t api_create(void (*fn)(void *), void *arg, const char *name,
 
     ag_proc_table_unlock();
     return (ag_thread_t)rec;
+}
+
+static ag_thread_t api_create(void (*fn)(void *), void *arg, const char *name,
+                              size_t stack, int priority, uint32_t flags)
+{
+    return thread_create_in(ag_proc_current(), fn, arg, name, stack, priority,
+                            flags);
+}
+
+ag_thread_t ag_thread_create_in(ag_pid_t pid, void (*fn)(void *), void *arg,
+                                const char *name, size_t stack, int priority,
+                                uint32_t flags)
+{
+    ag_proc_table_lock();
+    proc_t *p = ag_proc_by_pid(pid);
+    ag_proc_table_unlock();
+    /*
+     * The pointer is used after the lock is dropped, which is safe for the one
+     * thing it is used for: a slot is only freed once its process's task has
+     * gone, and the caller here is asking on behalf of a process it has just
+     * seen alive.  thread_create_in takes the lock again for the change itself.
+     */
+    return thread_create_in(p, fn, arg, name, stack, priority, flags);
 }
 
 /*

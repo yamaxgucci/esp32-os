@@ -90,4 +90,41 @@ bool ag_linkprov_in_reader(void);
 
 ag_err_t ag_linkprov_stats(ag_link_stats_t *out);
 
+/*
+ * What a driver that does not implement info() is taken to be.
+ *
+ * These are the hand-soldered UART's own measured figures and not a guess: 232
+ * bytes is what fits this tree's frame inside nlink's 256-byte quantum, and
+ * 400 067 B/s is what `link send/recv` measured at 4 Mbaud between two boards.
+ * A driver built before ABI 0.52 could only have been that UART, so answering
+ * with its numbers is correct rather than merely safe.
+ *
+ * The same wire at 16 Mbaud carries 1 132 730 B/s of payload with a quarter of
+ * the frames thrown away and re-sent - measured too, and 2.83x the useful rate.
+ * It is not the default because the default must hold for the driver that has
+ * not been asked; a driver that runs the line that fast says so through info().
+ */
+#define AG_LINK_DEFAULT_MTU 232u
+#define AG_LINK_DEFAULT_RATE 400067u
+#define AG_LINK_DEFAULT_RTT_US 3000u
+
+/*
+ * The smallest message every node service in this tree still works over.
+ *
+ * Those services size their own frames by hand - the remote drive at 232 bytes,
+ * remote runs at 240, the job channel by asking - and a wire that cannot carry
+ * that much would break them in the worst way available: a request refused deep
+ * inside a driver, reported as whatever error happened to come back.
+ *
+ * So a bound link is measured against this ONCE, at the moment it is bound, and
+ * a wire that is too small says so there.  It is not a refusal: the link still
+ * binds and small traffic still works.  It is the difference between a stated
+ * limitation and a mystery, and the day a quad SPI or a parallel bus appears,
+ * this line is what tells its author which number matters.
+ */
+#define AG_LINK_MIN_MTU 248u
+
+/* The bound wire's shape.  Never answers "unknown" - see the note above. */
+ag_err_t ag_linkprov_info(ag_link_info_t *out);
+
 #endif /* ARGON_LINKPROV_H */

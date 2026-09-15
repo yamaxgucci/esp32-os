@@ -190,10 +190,18 @@ function Invoke-Pair {
     }
 }
 
-if ($Scenario -ne 'raw') { $only += 'NODELINK.SYS'; $only += 'HELLO.AXE'; $only += 'NEEDSND.AXE'; $only += 'PCMVIRT.SYS'; $only += 'DEVPOKE.AXE'; $only += 'IDLE.AXE'; $only += 'NEEDGFX.AXE' }
-
+# ONE list, and it used to be two.
+#
+# There were two of these lines, the first appending to a variable that did not
+# exist yet and the second assigning over it - so IDLE.AXE and NEEDGFX.AXE were
+# named, looked built, and were not: the scenarios below got whatever a previous
+# full build had left in build\apps.  That is the worst kind of harness fault,
+# because it passes until somebody runs it on a clean tree.
 $only = @('LINK.AXE')
-if ($Scenario -ne 'raw') { $only += 'NODELINK.SYS'; $only += 'HELLO.AXE'; $only += 'NEEDSND.AXE'; $only += 'PCMVIRT.SYS'; $only += 'DEVPOKE.AXE' }
+if ($Scenario -ne 'raw') {
+    $only += @('NODELINK.SYS', 'HELLO.AXE', 'NEEDSND.AXE', 'PCMVIRT.SYS',
+               'DEVPOKE.AXE', 'IDLE.AXE', 'NEEDGFX.AXE', 'GRIND.AXE')
+}
 & python (Join-Path $PSScriptRoot 'build_apps.py') --only @only | Out-Null
 foreach ($img in $only) {
     if (-not (Test-Path "build\apps\$img")) { throw "$img did not build." }
@@ -819,6 +827,145 @@ if ($Scenario -eq 'link' -or $Scenario -eq 'both') {
     # And typed back it works: the far process is gone.
     Check $a 'sound.1 stopped' 'kill-reached-the-other-node'
     Check $b 'killed from the other node' 'kill-far-node-said-who'
+}
+
+# ------------------------------ one program, every core of both boards ---
+#
+# The claim under test, in one sentence: ONE program used the cores of TWO
+# boards and got the same answer it gets alone.
+#
+# Everything before this scenario moved whole programs between nodes.  This is
+# the first thing that gives one program the other board's cores - threads of
+# one job, with no memory in common, passing work and results as messages.
+#
+# GRIND.AXE IS ON NODE A ONLY, which is what makes it more than a demonstration.
+# B has never seen the file, so the copy of it that runs there was read off A's
+# card over the same wire that then carried the work - and the two halves of the
+# job are two copies of one image, not a program and a matching helper.
+#
+# WHAT WOULD MAKE THIS PASS WITHOUT MEANING ANYTHING, and how each is closed:
+#   - everything running locally: `link nodes` must say two, and grind must
+#     report threads on the far node by NAME.
+#   - the far half never starting: B's own loader line for GRIND is checked on
+#     B, where the only way it can appear is if B loaded it.
+#   - the work not actually crossing: the sums must agree.  The serial answer is
+#     computed here, on this core, and the spread-out one is assembled from
+#     messages; a wire that dropped or mangled anything gives a different
+#     number.
+#
+# THERE IS NO SPEED ASSERTION, deliberately.  Two emulators sharing one PC do
+# not divide work the way two boards do - they compete for the same host cores -
+# so a speed-up here would be measuring this machine's load.  The speed number
+# is printed for a person to read; what is ASSERTED is that the answer is right
+# and that both boards did some of it.
+
+if ($Scenario -eq 'link' -or $Scenario -eq 'both') {
+    Write-Host "`n== one program, the cores of both boards ==" -ForegroundColor Cyan
+
+    Invoke-Pair -Tag 'job' `
+        -PutBoth @('build\apps\NODELINK.SYS=t:\nodelink.sys') `
+        -PutA @('build\apps\GRIND.AXE=t:\grind.axe') `
+        -SendB @('drv load t:\nodelink.sys',
+                 'link name n2',
+                 'link use node0',
+                 # B does nothing of its own: the whole of its part is started
+                 # by A, on B's node-job channel.  The poll keeps its shell out
+                 # of the way and its wire pumped while that happens.
+                 "link poll $(($SendDelaySec + 120) * 1000)",
+                 '=link on node0',
+                 # From the journal, not the screen: the worker process may own
+                 # B's console while it runs, and a kernel line written then
+                 # reaches nobody.  The journal is a 4 KB ring, so ask early and
+                 # ask for plenty.
+                 'log -n 120',
+                 '=log') `
+        -SendA @('drv load t:\nodelink.sys',
+                 'link name n1',
+                 'link use node0',
+                 "!powershell -NoProfile -Command Start-Sleep -Seconds $SendDelaySec",
+                 'link nodes',
+                 '=cores in all',
+                 # Blocks big enough to matter, and the size was MEASURED
+                 # rather than guessed.
+                 #
+                 # At 120 000 iterations the whole serial run took 3 ms here
+                 # against 600 ms of starting the far half, so the ratio was
+                 # arithmetic about start-up and said nothing about how two
+                 # boards divide work - the emulator runs a register-only loop
+                 # at something like two billion instructions a second, which
+                 # no board does.  At this size the work dominates, which is
+                 # the regime the whole mechanism is for, and the threads live
+                 # seconds rather than milliseconds - so the messages, the
+                 # credits and the queue are exercised over time instead of all
+                 # at once.
+                 'run t:\grind.axe 8 150000000',
+                 # A marker printed on EVERY path out of grind, not only the
+                 # good one.  Waiting for a line only success prints does not
+                 # fail when something breaks - it hangs, and then reports a
+                 # timeout somewhere unrelated.  Twice.
+                 '=grind: ')
+
+    $a = Transcript 'build\nodetest-job-a.log'
+    $b = Transcript 'build\nodetest-job-b.log'
+
+    # There are two boards and the system knows it.
+    Check $a '2 nodes' 'job-two-nodes-visible'
+    # And what a byte over the wire costs, which is the number that decides
+    # whether any of this is worth doing for a given piece of work.
+    Check $a 'cycles here' 'job-wire-cost-reported'
+
+    # The far node by name, in THE PROGRAM's own listing of where it can run -
+    # not the shell's.  Both print the name, so a plain search for "n2" would
+    # pass on `link nodes` alone and prove nothing about what grind was told.
+    #
+    # Told apart by what FOLLOWS: the shell's row carries a thread count after
+    # the cores and the program's does not.  The obvious test - the program
+    # indents its rows and the shell does not, anchored at the start of a line -
+    # was tried and failed, and why it failed is worth keeping: an application's
+    # output goes to the JOURNAL until the session adopts it, so every line of
+    # it arrives as "app/GRIND:1: ..." and nothing of the program's is ever at
+    # the start of a line.  The same adoption is behind the harness defect
+    # written up in docs/plans/cluster.md.
+    #
+    # So the test is an ORDER instead: "all cores:" is a sentence only grind
+    # prints, and the far node's row with a thread count on it follows within a
+    # few lines.  Two attempts before this one were weaker and worth recording,
+    # because both LOOKED specific:
+    #   - anchoring the program's two-space indent to the start of a line: never
+    #     matches, because the journal prefixes every line of it;
+    #   - "n2 ... cores" with a negative lookahead for a thread count: matches
+    #     the shell's row anyway, since `cores?` will match "core" and leave the
+    #     "s" for the lookahead to fail on.  It passed, and proved nothing.
+    Note ([regex]::IsMatch($a, "all cores:[\s\S]{0,300}n2\s+\d+ thread")) `
+        'job-far-node-named-to-the-program'
+
+    # B loaded a program it has never had a copy of.  The image came off A's
+    # card, over the wire, because A asked B for a thread of it.
+    Check $b 'loader: GRIND' 'job-far-kernel-loaded-our-image'
+    # And B says so in its own words as well.
+    Check $b 'serving a job' 'job-far-node-served'
+
+    # Threads really were placed on both boards.
+    $th = [regex]::Match($a, '(\d+) threads on (\d+) nodes')
+    if (-not $th.Success) {
+        Note $false 'job-threads-spread' 'no "N threads on M nodes" line'
+    } else {
+        Note ([int]$th.Groups[1].Value -ge 2 -and [int]$th.Groups[2].Value -ge 2) `
+            'job-threads-spread' `
+            ("{0} threads on {1} nodes" -f $th.Groups[1].Value, $th.Groups[2].Value)
+    }
+
+    # THE claim: the work was cut up, sent away, done elsewhere, brought back,
+    # and the answer is the one this core computes by itself.
+    Check $a 'answers agree' 'job-same-answer-as-one-core'
+
+    # Printed for a person, asserted about by nobody - see the note above.
+    $sp = [regex]::Match($a, 'speedup (\d+\.\d)x on (\d+) cores')
+    if ($sp.Success) {
+        Write-Host ("job: {0}x on {1} cores (two emulators on one PC - " +
+                    "not a board measurement)" -f $sp.Groups[1].Value,
+                    $sp.Groups[2].Value) -ForegroundColor DarkGray
+    }
 }
 
 # ------------------------------------------------- unloading, on one node ---

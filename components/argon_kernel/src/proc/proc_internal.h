@@ -97,6 +97,9 @@ typedef struct {
 /* The process the calling task belongs to, or NULL for the kernel's own tasks. */
 proc_t *ag_proc_current(void);
 
+/* A process by pid, or NULL.  Call with the table locked. */
+proc_t *ag_proc_by_pid(ag_pid_t pid);
+
 /* The process table lock.  Recursive; held while a slot is examined or changed. */
 void ag_proc_table_lock(void);
 void ag_proc_table_unlock(void);
@@ -130,6 +133,16 @@ typedef struct {
 
 /* True when this record is that task; how a thread finds its own process. */
 bool ag_thread_owns(const void *record, ag_port_task_t task);
+
+/*
+ * A thread inside a NAMED process rather than the caller's.  For work asked for
+ * from outside any process - a cluster thread the node next door wants started,
+ * which arrives on the link's task.  Same rules and same limits as the ABI's
+ * create(); see thread_create_in.
+ */
+ag_thread_t ag_thread_create_in(ag_pid_t pid, void (*fn)(void *), void *arg,
+                                const char *name, size_t stack, int priority,
+                                uint32_t flags);
 
 /* Stops the thread if it is still running and frees the record. */
 void ag_thread_release(void *record);

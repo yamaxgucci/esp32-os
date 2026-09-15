@@ -40,6 +40,7 @@ void run_fsops_tests(void);
 void run_rlink_tests(void);
 void run_atproto_tests(void);
 void run_nlink_tests(void);
+void run_cluframe_tests(void);
 
 int main(void)
 {
@@ -75,6 +76,7 @@ int main(void)
     run_rlink_tests();
     run_atproto_tests();
     run_nlink_tests();
+    run_cluframe_tests();
 
     printf("%d checks, %d failures\n", ag_test_checks, ag_test_failures);
     return ag_test_failures == 0 ? 0 : 1;

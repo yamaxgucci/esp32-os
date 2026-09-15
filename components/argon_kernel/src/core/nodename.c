@@ -110,3 +110,31 @@ void ag_node_set_peer_name(const char *name)
     }
     ag_strlcpy(s_peer, name, sizeof(s_peer));
 }
+
+/*
+ * What the other board is made of, as it said in its hello.
+ *
+ * Here rather than in the link because it is the same kind of fact as the name:
+ * something the far node states about itself, remembered until it says
+ * otherwise.  A job that wants to use every core of every board cannot even
+ * decide how many threads to start without it, and guessing "probably two"
+ * would be wrong on the C6 the day it joins.
+ *
+ * Zero cores means it has not said - an older image, or nothing heard yet - and
+ * the caller should read that as one, not as none.
+ */
+static uint8_t  s_peer_cores;
+static uint32_t s_peer_cpu_hz;
+
+void ag_node_set_peer_caps(uint8_t cores, uint32_t cpu_hz)
+{
+    if (cores > 0) {
+        s_peer_cores = cores;
+    }
+    if (cpu_hz > 0) {
+        s_peer_cpu_hz = cpu_hz;
+    }
+}
+
+uint8_t  ag_node_peer_cores(void) { return s_peer_cores; }
+uint32_t ag_node_peer_cpu_hz(void) { return s_peer_cpu_hz; }

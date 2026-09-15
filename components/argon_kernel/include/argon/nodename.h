@@ -50,6 +50,15 @@ const char *ag_node_peer_name(void);
 /* Told by the link when a hello arrives.  Not for anyone else. */
 void ag_node_set_peer_name(const char *name);
 
+/*
+ * What the far node said it is made of.  Cores of 0 means it has not said -
+ * read that as one rather than as none, which is what a board that predates
+ * this being in the hello will look like.
+ */
+void     ag_node_set_peer_caps(uint8_t cores, uint32_t cpu_hz);
+uint8_t  ag_node_peer_cores(void);
+uint32_t ag_node_peer_cpu_hz(void);
+
 #ifdef __cplusplus
 }
 #endif

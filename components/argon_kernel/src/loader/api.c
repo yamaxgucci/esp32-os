@@ -32,6 +32,7 @@
 #include <argon/module.h>
 #include <argon/net.h>
 #include <argon/power.h>
+#include <argon/clu.h>
 #include <argon/proc.h>
 #include <argon/shell.h>
 #include <argon/filemap.h>
@@ -1611,6 +1612,12 @@ static const ag_api_t k_api = {
 #else
     .cam = NULL,
 #endif
+    /*
+     * Never conditional.  A board with no link still has nodes() - itself - and
+     * still runs every thread of a job locally, so a program written against
+     * this runs on one board and on four without being rebuilt.
+     */
+    .clu = &ag_clu_api_table,
 };
 
 const ag_api_t *ag_loader_api(void) { return &k_api; }

@@ -643,6 +643,47 @@ static void pump_task(void *arg)
     }
 }
 
+/*
+ * What this wire is, for the layers that have to size themselves to it.
+ *
+ * The rate is computed from the baud actually configured rather than named as a
+ * constant, because the baud is a config line and a constant would be a lie the
+ * moment anyone changed it.  Ten bits a byte on the line (a start and a stop
+ * bit), then the two corrections that stop it being a brochure number:
+ *
+ *   - framing.  A frame carries NL_QUANTUM of payload under NL_HDR_SIZE of
+ *     header, so the useful fraction is that ratio and not one.
+ *   - the line.  Measured between two boards: clean to 5 Mbaud, and at 16
+ *     Mbaud 24.7% of frames arrive corrupt and are sent again, which leaves
+ *     1 132 730 B/s of payload out of 1 599 966 on the line.  So above 5
+ *     Mbaud three quarters of it is what a caller can actually plan against.
+ *
+ * rtt_us is left at zero: the kernel has a measured round trip in the stats
+ * above, and a driver's guess would only be used before any traffic has flowed.
+ */
+static uint32_t s_baud = ND_BAUD;
+
+static ag_err_t nd_info(ag_device_t *dev, ag_link_info_t *out)
+{
+    (void)dev;
+    if (out == NULL) {
+        return -AG_EINVAL;
+    }
+    memset(out, 0, sizeof(*out));
+    out->mtu = NL_QUANTUM - 8u; /* room for a caller's own small header */
+
+    uint32_t bytes = s_baud / 10u;
+    bytes = (uint32_t)((uint64_t)bytes * NL_QUANTUM /
+                       (NL_QUANTUM + NL_HDR_SIZE));
+    if (s_baud > 5000000u) {
+        bytes = (uint32_t)((uint64_t)bytes * 753u / 1000u);
+    }
+    out->bytes_per_sec = bytes;
+    out->rtt_us = 0;
+    ag_strlcpy(out->wire, "uart", sizeof(out->wire));
+    return AG_OK;
+}
+
 static const ag_dev_ops_t k_dev_ops = {0};
 
 static const ag_link_ops_t k_link_ops = {
@@ -653,6 +694,7 @@ static const ag_link_ops_t k_link_ops = {
     .recv = nd_recv,
     .poll = nd_poll,
     .stats = nd_stats,
+    .info = nd_info,
 };
 
 /* ---------------------------------------------------------------------- */
@@ -676,6 +718,7 @@ ag_err_t ag_driver_init(void)
         s_nd.uart = ag_api()->cfg->get_int("link.uart", ND_UART_DEFAULT);
         baud = (uint32_t)ag_api()->cfg->get_int("link.baud", (int32_t)ND_BAUD);
     }
+    s_baud = baud; /* what info() computes the rate from */
 
     s_nd.lock = TASK->mutex_create();
     if (s_nd.lock == NULL) {
