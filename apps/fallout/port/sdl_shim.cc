@@ -1874,6 +1874,7 @@ static struct {
     uint32_t passes;
     uint32_t pre_ms;
 } s_ab[2];
+static uint32_t s_ab_skipped;
 
 static void render_ab_bucket(void)
 {
@@ -1882,6 +1883,25 @@ static void render_ab_bucket(void)
     }
 
     const unsigned slot = (ag_render_tight != 0) ? 1u : 0u;
+
+    /*
+     * A window with a map load in it belongs to neither side.
+     *
+     * The first run of this said the tightened search was WORSE - more stalls
+     * and a dearer object layer - and the reason was that the columns were
+     * sums, so whichever side happened to contain a load carried seconds of
+     * card reading and flash erasing into its total.  Both sides showed a
+     * worst lap over a second, which is the tell: nothing about a search area
+     * costs a second.
+     *
+     * Half a second is far longer than any frame this game draws and far
+     * shorter than a load, so it separates the two cleanly.
+     */
+    if (s_worst_us > 500000u) {
+        s_ab_skipped++;
+        ag_render_tight = (slot == 1u) ? 0 : 1;
+        return;
+    }
 
     s_ab[slot].windows++;
     s_ab[slot].stalls += s_stall_n;
@@ -1892,15 +1912,23 @@ static void render_ab_bucket(void)
     s_ab[slot].passes += ag_render_calls;
     s_ab[slot].pre_ms += ag_layer_pre_us / 1000u;
 
-    shim_printf("[renderab] wide: %u windows, %u stalls, worst %u ms, "
-                "%u in range per pass, under-roof %u ms | tight: %u windows, "
-                "%u stalls, worst %u ms, %u in range per pass, under-roof %u ms\n",
-                s_ab[0].windows, s_ab[0].stalls, s_ab[0].worst_us / 1000u,
+    shim_printf("[renderab] %u load windows set aside | wide: %u win, "
+                "%u.%u stalls/win, worst %u ms, %u in range/pass, "
+                "under-roof %u us/pass | tight: %u win, %u.%u stalls/win, "
+                "worst %u ms, %u in range/pass, under-roof %u us/pass\n",
+                s_ab_skipped,
+                s_ab[0].windows,
+                s_ab[0].windows ? s_ab[0].stalls / s_ab[0].windows : 0u,
+                s_ab[0].windows ? (s_ab[0].stalls * 10u / s_ab[0].windows) % 10u : 0u,
+                s_ab[0].worst_us / 1000u,
                 s_ab[0].passes ? s_ab[0].inrange / s_ab[0].passes : 0u,
-                s_ab[0].pre_ms,
-                s_ab[1].windows, s_ab[1].stalls, s_ab[1].worst_us / 1000u,
+                s_ab[0].passes ? s_ab[0].pre_ms * 1000u / s_ab[0].passes : 0u,
+                s_ab[1].windows,
+                s_ab[1].windows ? s_ab[1].stalls / s_ab[1].windows : 0u,
+                s_ab[1].windows ? (s_ab[1].stalls * 10u / s_ab[1].windows) % 10u : 0u,
+                s_ab[1].worst_us / 1000u,
                 s_ab[1].passes ? s_ab[1].inrange / s_ab[1].passes : 0u,
-                s_ab[1].pre_ms);
+                s_ab[1].passes ? s_ab[1].pre_ms * 1000u / s_ab[1].passes : 0u);
 
     /* And now the other one, for the window that is starting. */
     ag_render_tight = (slot == 1u) ? 0 : 1;
