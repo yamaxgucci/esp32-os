@@ -572,10 +572,6 @@ static void print_screen(void)
         ag_printf("(no screen arrived)\n");
         return;
     }
-    ag_printf("--- %ux%u, cursor %u,%u %s, %u rows received ---\n",
-              (unsigned)s.cols, (unsigned)s.rows, (unsigned)s.cur_x,
-              (unsigned)s.cur_y, s.cur_on ? "on" : "off",
-              (unsigned)s.rows_seen);
     for (uint32_t y = 0; y < s.rows; y++) {
         char line[MAX_COLS + 1u];
         uint32_t w = 0;
@@ -592,6 +588,58 @@ static void print_screen(void)
         line[w] = 0;
         ag_printf("|%s\n", line);
     }
+
+    /*
+     * The summary goes last, and that is not a matter of taste.
+     *
+     * Printed first, it scrolled off the top before anyone could read it:
+     * thirty rows of screen follow, the console redraws as it scrolls, and
+     * what leaves the serial port is the new picture rather than the lines
+     * that went above it.  The geometry then looked missing while the
+     * screen it describes was plainly arriving - which read as a broken
+     * console for four rounds of checking.
+     */
+    ag_printf("--- %ux%u cells, cursor %u,%u %s, %u rows received ---\n",
+              (unsigned)s.cols, (unsigned)s.rows, (unsigned)s.cur_x,
+              (unsigned)s.cur_y, s.cur_on ? "on" : "off",
+              (unsigned)s.rows_seen);
+}
+
+/*
+ * Is this text anywhere on the screen?
+ *
+ * One line of answer instead of thirty of screen, and that is what makes it
+ * useful: printing a whole console scrolls the client's own display, the
+ * summary above it is gone before anyone reads it, and a check looking for a
+ * word in all that output finds or misses it depending on how much scrolled.
+ * Three checks failed that way before the cause was clear.
+ *
+ * Compared against the cells as they arrived, so it sees what the far screen
+ * says rather than what survived being printed.
+ */
+static bool screen_has(const char *needle)
+{
+    const uint32_t n = (uint32_t)strlen(needle);
+
+    if (n == 0u || s.cols == 0u || s.rows == 0u) {
+        return false;
+    }
+    for (uint32_t y = 0; y < s.rows; y++) {
+        for (uint32_t x = 0; x + n <= s.cols; x++) {
+            uint32_t i = 0;
+            while (i < n) {
+                const uint8_t c = s.cell[((y * s.cols) + x + i) * 2u];
+                if (c != (uint8_t)needle[i]) {
+                    break;
+                }
+                i++;
+            }
+            if (i == n) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -873,6 +921,10 @@ int ag_main(int argc, char **argv)
                     rc = 1;
                 }
             }
+        } else if (strcmp(argv[i], "-find") == 0 && i + 1 < argc) {
+            const char *needle = argv[++i];
+            ag_printf("found %s: %s\n", needle,
+                      screen_has(needle) ? "yes" : "no");
         } else if (strcmp(argv[i], "-screen") == 0) {
             print_screen();
         }

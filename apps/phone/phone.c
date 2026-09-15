@@ -122,6 +122,16 @@ AG_DRV("PHONE", "1.0", "argon");
 /* A client's WebSocket frame.  Input messages are tens of bytes. */
 #define WS_IN_MAX 512u
 
+/*
+ * How often the repair sweep sends one row it was not asked for.
+ *
+ * Two hundred milliseconds: a forty-row console is completely refreshed in
+ * eight seconds, which is fast enough that a lost line is a glitch rather than
+ * a wrong screen, and slow enough to cost about four hundred bytes a second on
+ * a link that carries pictures.
+ */
+#define REPAIR_EVERY_US 200000ull
+
 /* Events waiting to be read out of /dev/pkbd0 by an application that wants them. */
 #define KEY_RING 64u
 
@@ -280,6 +290,23 @@ static struct {
     uint64_t    closing_until;
     volatile bool     up;
     volatile bool     owe_everything;
+    /*
+     * The row the repair sweep will send next, whether or not it changed.
+     *
+     * Rows go out when they change, which is right and cheap and has one
+     * failure mode: a row that is lost - a frame dropped while the phone's
+     * screen was off, a message that went out during a stall - is never sent
+     * again, because nothing on the board thinks it is owed.  The screen then
+     * has a wrong line in it until something happens to rewrite that line, and
+     * the only cure a person has is to reload the page.  REMDISP has the same
+     * problem and answers it the same way.
+     *
+     * One row every repair interval, round and round: a forty-row console is
+     * whole again within a few seconds, and the cost is one row's worth of
+     * bytes - about eighty - per interval.
+     */
+    uint16_t          repair_row;
+    uint64_t          repair_at;
     /*
      * Just the geometry, without the console behind it.  A surface that
      * changes size while an application is drawing needs the page told; it
@@ -1093,6 +1120,28 @@ static bool service_client(void)
         }
         if (w == WIRE_STALL) {
             return true; /* the row is still marked; come back to it */
+        }
+    }
+
+    /*
+     * And one row that nobody asked for.  See s.repair_row: this is the only
+     * thing that repairs a line the client never received, and it costs one
+     * row per interval whether or not anything is wrong.
+     */
+    if (s.rows != 0u) {
+        const uint64_t now_us = (uint64_t)ag_micros();
+        if (now_us >= s.repair_at) {
+            s.repair_at = now_us + REPAIR_EVERY_US;
+            if (s.repair_row >= s.rows) {
+                s.repair_row = 0;
+            }
+            const wire_t w = send_text_row(s.repair_row);
+            if (w == WIRE_GONE) {
+                return false;
+            }
+            if (w == WIRE_OK) {
+                s.repair_row++;
+            }
         }
     }
     if (s.cur_dirty) {

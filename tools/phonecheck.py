@@ -87,11 +87,55 @@ class Report:
 
 
 def run_client(cl, args, actions, wait):
-    """One PHONECL run, returning everything it printed."""
-    before = len(cl.log)
+    """One PHONECL run, returning everything it printed.
+
+    With a pause first.  Runs back to back had the next connection arrive
+    while the board was still finishing with the last one, and it came back
+    "connect failed: -5" - which made the console checks fail in a way that
+    looked exactly like the console being broken.  Three seconds is not a
+    measurement, it is politeness; a person with a phone never reconnects this
+    fast, and if this ever becomes a real complaint it is the board's to fix,
+    not this script's to hide.
+    """
+    time.sleep(3)
+    # Measured on the cleaned text, not on the raw log: the two have
+    # different lengths (escape sequences are stripped), so slicing one by
+    # the other's length walks off by however much the board redrew - which
+    # showed up as console checks failing while the console plainly worked.
+    before = len(cl.text())
     cl.send("run c:\\phonecl.axe %s -pass %s %s" % (args.ip, args.password,
                                                     actions), wait)
-    return cl.text()[len(cl.text()) - (len(cl.log) - before) - 400:]
+    return cl.text()[before:]
+
+
+def tidy(sv):
+    """Leave the board with nothing running.
+
+    By pid, not by Ctrl+backslash: "kill last app" does not take the file
+    manager - tried twice, it stays up - and an application left running is
+    memory the driver needs, so every check after it fails with "connect
+    failed: -5" for reasons that have nothing to do with the link.  That
+    sequence has cost time three times now.
+    """
+    if sv is None:
+        return
+    sv.s.write(b"")           # into the system shell, where kill lives
+    sv.s.flush()
+    sv.pump(1.5)
+    sv.send("", 0.5)
+    for _ in range(4):
+        before = len(sv.text())
+        sv.send("ps", 2.5)
+        out = sv.text()[before:]
+        if "no applications loaded" in out:
+            return
+        # No anchors: the console redraws with cursor moves rather than
+        # newlines, so `ps` arrives as one long line and "^" matches once.
+        pids = re.findall(r"(\d+)\s+[A-Z][A-Z0-9_.]*\s+(?:running|ready|loading)", out)
+        if not pids:
+            return
+        for pid in pids[:4]:
+            sv.send("kill " + pid, 3)
 
 
 def main():
@@ -112,6 +156,9 @@ def main():
 
     try:
         cl.user_slot()
+
+        # Start from a board with nothing running: see tidy().
+        tidy(sv)
 
         print("the page:")
         out = run_client(cl, args, "-get", 25)
@@ -149,9 +196,13 @@ def main():
                       "enter_shell_view slot" in j or "focus" in j)
 
         print("an application, over the link:")
-        out = run_client(cl, args, '-type "fm" -enter -wait 2500 -screen', 40)
-        rep.check("application appears", "file manager" in out or "Help" in out,
-                  "the file manager draws a frame and a function key bar")
+        # Asked of the client, not of its output: printing a whole screen
+        # scrolls the client's console and a word can be lost in the scroll,
+        # which failed this check three times while the application was there.
+        out = run_client(cl, args,
+                         '-type "fm" -enter -wait 2500 -find "file manager"', 40)
+        rep.check("application appears", "found file manager: yes" in out,
+                  "the file manager names itself on its bottom line")
         out = run_client(cl, args, "-key ctrl+c -wait 1500", 30)
         if sv:
             sv.pump(0.5)
@@ -162,6 +213,13 @@ def main():
             rep.check("nothing left running",
                       "unbind" in j or "returned 0" in j)
 
+        print("the repair sweep:")
+        out = run_client(cl, args, "-hold 12", 40)
+        m = re.search(r"held \d+ s, (\d+) rows arrived", out)
+        rep.check("an idle screen still repairs itself",
+                  bool(m) and int(m.group(1)) >= 20,
+                  (m.group(1) + " rows in 12 s") if m else "no hold line")
+
         if args.hold:
             print("staying connected:")
             out = run_client(cl, args, "-hold %u" % args.hold, args.hold + 25)
@@ -169,6 +227,7 @@ def main():
                       "lost" if "link lost" in out else "")
 
     finally:
+        tidy(sv)
         cl.close()
         if sv:
             sv.close()
