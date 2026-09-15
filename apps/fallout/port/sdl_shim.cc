@@ -1613,6 +1613,14 @@ extern "C" int ag_render_tight;
 extern "C" int ag_render_alt;
 
 /* ARGON: where the exit grids are lost between the map and the screen. */
+extern "C" unsigned ag_prog_calls = 0, ag_prog_n = 0;
+extern "C" unsigned ag_prog_sfall_us = 0, ag_prog_run_us = 0;
+extern "C" unsigned ag_prog_events_us = 0, ag_prog_intlib_us = 0;
+extern "C" unsigned ag_prog_worst_us = 0, ag_prog_worst_n = 0;
+extern "C" unsigned ag_prog_worst_one = 0;
+extern "C" unsigned ag_prog_worst_sfall = 0, ag_prog_worst_run = 0;
+extern "C" unsigned ag_prog_worst_events = 0, ag_prog_worst_intlib = 0;
+
 extern "C" unsigned ag_exit_calls = 0, ag_exit_hidden = 0, ag_exit_early = 0;
 extern "C" unsigned ag_exit_noart = 0, ag_exit_missed = 0, ag_exit_drew = 0;
 extern "C" unsigned ag_exit_w = 0, ag_exit_h = 0, ag_exit_flags = 0;
@@ -2384,6 +2392,33 @@ extern "C" void ag_misc_pids_note(const int *pid, const unsigned *n,
                 kinds, line);
 }
 
+static void programs_report(void)
+{
+    if (ag_prog_calls == 0u) {
+        return;
+    }
+
+    const unsigned n = ag_prog_calls;
+
+    shim_printf("[programs t=%u] %u calls, %u programs each | per call: sfall "
+                "%u us, running %u us, events %u us, intlib %u us | WORST call "
+                "%u us over %u programs: sfall %u, running %u (worst one %u), "
+                "events %u, intlib %u\n",
+                (unsigned)ag_millis(), n, ag_prog_n / n,
+                ag_prog_sfall_us / n, ag_prog_run_us / n,
+                ag_prog_events_us / n, ag_prog_intlib_us / n,
+                ag_prog_worst_us, ag_prog_worst_n, ag_prog_worst_sfall,
+                ag_prog_worst_run, ag_prog_worst_one,
+                ag_prog_worst_events, ag_prog_worst_intlib);
+
+    ag_prog_calls = 0; ag_prog_n = 0;
+    ag_prog_sfall_us = 0; ag_prog_run_us = 0;
+    ag_prog_events_us = 0; ag_prog_intlib_us = 0;
+    ag_prog_worst_us = 0; ag_prog_worst_n = 0; ag_prog_worst_one = 0;
+    ag_prog_worst_sfall = 0; ag_prog_worst_run = 0;
+    ag_prog_worst_events = 0; ag_prog_worst_intlib = 0;
+}
+
 static void exit_report(void)
 {
     if (ag_exit_on_map == 0 && ag_exit_calls == 0u) {
@@ -2726,6 +2761,7 @@ static void memstat_service(void)
     preempt_report();
     anim_report();
     move_report();
+    programs_report();
     exit_report();
     layer_report();
     render_report();

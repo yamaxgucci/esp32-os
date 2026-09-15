@@ -321,6 +321,17 @@ void ag_store_use_note(const char *line);
 /* How many hexes lead out of this map, counted when it loads. */
 extern int ag_exit_on_map;
 
+/* Where the script machine's per-frame step goes: sfall's own scripts, a
+ * burst of every live program, the deferred event queue, the library tick.
+ * _doBkProcesses is the biggest thing left in a frame and this is the
+ * biggest thing inside it. */
+extern unsigned ag_prog_calls, ag_prog_n;
+extern unsigned ag_prog_sfall_us, ag_prog_run_us;
+extern unsigned ag_prog_events_us, ag_prog_intlib_us;
+extern unsigned ag_prog_worst_us, ag_prog_worst_n, ag_prog_worst_one;
+extern unsigned ag_prog_worst_sfall, ag_prog_worst_run;
+extern unsigned ag_prog_worst_events, ag_prog_worst_intlib;
+
 /* Every distinct misc proto on the map, with how many of each: the exit
  * grids are supposed to be among them. */
 void ag_misc_pids_note(const int *pid, const unsigned *n, unsigned kinds);
