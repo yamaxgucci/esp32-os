@@ -306,6 +306,21 @@ static struct {
     uint32_t          band_px;
     uint32_t          band_cap;
     uint32_t          direct_at; /* which band the budget stopped on         */
+    /*
+     * When it is worth offering the client another message.
+     *
+     * A client whose window has shut does not open it again because we asked.
+     * Measured on the CYD with a phone that had stopped reading: every lap
+     * spent its 200 ms finding that out, which is five laps a second instead
+     * of a hundred - and a driver at five laps a second reads the keyboard
+     * five times a second, so slots would not switch and Esc did nothing.  The
+     * board looked wedged; it was queuing politely.
+     *
+     * So a stall buys silence: nothing is offered until this time, and the lap
+     * goes back to reading input, which costs nothing and is what the person
+     * at the other end is waiting for.
+     */
+    uint64_t          hush_until;
     volatile uint8_t  stage;     /* where the task's loop last was            */
     bool              moaned_frame;
     bool              moaned_mem;
@@ -384,10 +399,14 @@ typedef enum {
 } wire_t;
 
 /*
- * How long to keep trying before the first byte of a message has gone.  Short
- * on purpose - see the two deadlines inside send_all.
+ * How long to keep trying before the first byte of a message has gone.
+ *
+ * Thirty milliseconds, because a shut window does not open within one: this
+ * only has to be long enough to ride out a momentarily busy socket.  What
+ * follows a stall is the hush (see s.hush_until), and that is where the real
+ * waiting is done - in laps that read the keyboard instead of laps that block.
  */
-#define SEND_START_MS 200u
+#define SEND_START_MS 30u
 
 static wire_t send_all(ag_handle_t h, const void *buf, uint32_t len,
                        uint32_t deadline_ms)
@@ -537,12 +556,26 @@ static wire_t ws_send(uint8_t op, void *payload, uint32_t len,
      * never came back.  If the task is mid-message, this frame is simply not
      * this frame's to send.
      */
+    if (s.hush_until != 0u && (uint64_t)ag_micros() < s.hush_until) {
+        return WIRE_STALL;
+    }
     if (s.wire != NULL && !TASK->mutex_lock(s.wire, lock_ms)) {
         return WIRE_STALL;
     }
     const wire_t r = send_all(s.conn, p - (n + 1u), n + 1u + len, deadline_ms);
     if (s.wire != NULL) {
         TASK->mutex_unlock(s.wire);
+    }
+    /*
+     * A closed window is worth a hundred milliseconds of quiet; anything that
+     * went through means the client is reading again and the quiet is over.
+     * Short on purpose - long enough that the lap costs nothing, short enough
+     * that a screen still feels live once the phone catches up.
+     */
+    if (r == WIRE_STALL) {
+        s.hush_until = (uint64_t)ag_micros() + 100000ull;
+    } else if (r == WIRE_OK) {
+        s.hush_until = 0u;
     }
     return r;
 }
@@ -581,6 +614,8 @@ static void ws_close(const char *reason)
 
 static void drop_conn(const char *why)
 {
+    /* A new client is not the old one's shut window. */
+    s.hush_until = 0u;
     if (s.conn >= 0) {
         (void)ag_net_close(s.conn);
         s.conn = -1;
