@@ -60,8 +60,14 @@ CONFIG_ARGON_ENABLE_PM=y
 # so this is the smallest default that cannot break loading.  An image that
 # needs more says so with AG_APP_SIZED and gets it - or is refused, which is
 # the answer we want over a board that cannot be reached.
+#
+# Only the stack: the process arena is CONFIG_ARGON_APP_HEAP_KB, which has no
+# Kconfig entry and so cannot be set from here at all.  ARGON_APP_ARENA_KB,
+# which does exist, is the *code* arena an .AXE is relocated into - a different
+# thing entirely, and lowering it by mistake only makes images fall back to
+# flash XIP.
 CONFIG_ARGON_APP_STACK_KB=8
-CONFIG_ARGON_APP_ARENA_KB=4
+CONFIG_ARGON_APP_ARENA_KB=8
 
 # The radio takes its transmit buffers up front instead of asking for them
 # when it needs them.
