@@ -193,8 +193,21 @@ ag_err_t ag_port_wifi_start(void)
      * second is not: this system decides what to join from its own config, and
      * a radio that remembers something else joins it before anyone has asked.
      */
+    /*
+     * Not station-and-nothing-else.  An access point asked for before the
+     * radio was started is already recorded in s_ap_on, and starting in STA
+     * wipes it - while the netif, the address and the DHCP server all come up
+     * regardless, so nothing anywhere reports a failure.  The board then
+     * insists its point is up, and no phone can see it.  desired_mode() is
+     * where what-is-wanted lives; it has to be asked here too.
+     */
+#if AG_PORT_WIFI_HAS_AP
+    const wifi_mode_t start_mode = desired_mode();
+#else
+    const wifi_mode_t start_mode = WIFI_MODE_STA;
+#endif
     if (esp_wifi_set_storage(WIFI_STORAGE_RAM) != ESP_OK ||
-        esp_wifi_set_mode(WIFI_MODE_STA) != ESP_OK) {
+        esp_wifi_set_mode(start_mode) != ESP_OK) {
         return -AG_EIO;
     }
     if (esp_wifi_start() != ESP_OK) {
