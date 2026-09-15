@@ -788,8 +788,29 @@ function clearSticky() {
  * the keystroke clears it.  That is how every terminal application on a phone
  * has to do it, and it is the reason Ctrl+C from here reaches the shell at all.
  */
+/*
+ * Two chords as single keys, because they are the two a phone cannot do
+ * without and both were unreachable in practice.
+ *
+ * Sys is Ctrl+backslash - the way into the system shell and, pressed twice,
+ * the way to kill what is running.  Arming Ctrl and then finding the backslash
+ * is two taps on a bar of small keys next to Alt, and the journal showed the
+ * result: every chord arriving at the board had Alt in it, never Ctrl.  A
+ * person aiming for the one control that rescues a stuck board should not have
+ * to aim twice.
+ *
+ * Stop is Ctrl+C, which the driver used to drop on the floor.
+ */
+function chord(hid, mods) {
+  sendKey(1, hid, 0, mods);
+  sendKey(2, hid, 0, mods);
+  clearSticky();
+}
+
 const KEYBAR = [
   ["Esc", () => tap(K.esc)],
+  ["Sys", () => chord(K.backslash, MOD.ctrl)],
+  ["Stop", () => chord(K.c, MOD.ctrl)],
   ["Tab", () => tap(K.tab)],
   ["Ctrl", "mod", MOD.ctrl],
   ["Alt", "mod", MOD.alt],

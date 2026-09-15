@@ -1142,15 +1142,31 @@ static void inject_key(uint8_t kind, uint8_t mods, uint16_t hid,
         return;
     }
     /*
-     * Ctrl+C and F12 are the supervisor's, not the application's - the same
-     * exclusion KBDVIRT makes and for the same reason.  A phone that can stop
-     * the foreground process is a phone that stops it by accident.
+     * Ctrl+C and F12 used to be dropped here, on the grounds that a phone which
+     * can stop the foreground process is a phone that stops it by accident.
+     *
+     * That was the wrong trade, and using the thing showed it: a phone could
+     * start a program and then had no way at all to leave one.  A file manager
+     * that would not take Escape - because it had a one-kilobyte arena and was
+     * barely running - left the board occupied with nothing to be done about it
+     * from the only screen in the room.  Accidents are also less likely than
+     * they look: these arrive as deliberate chords, latched modifier then key,
+     * or from the bar's own Stop key.  A stuck board is worse than a stopped
+     * program.
      */
-    if ((mods & AG_MOD_CTRL) && hid == (uint16_t)AG_KEY_C) {
-        return;
-    }
-    if (hid == (uint16_t)AG_KEY_F12) {
-        return;
+
+    /*
+     * Chords, written down as they arrive.
+     *
+     * "Switching slots does not work" has three possible homes - the page not
+     * sending the modifier, this driver dropping it, or the supervisor not
+     * acting on it - and they look identical from a phone.  One line at the
+     * boundary tells them apart.  Only keys with a modifier, and only presses,
+     * so an ordinary session adds nothing to the journal.
+     */
+    if (kind == 1u && mods != 0u) {
+        ag_log(AG_LOG_INFO, "phone", "chord: hid %u, mods %u", (unsigned)hid,
+               (unsigned)mods);
     }
 
     ag_event_t ev;
