@@ -312,7 +312,21 @@ if ($Scenario -eq 'link' -or $Scenario -eq 'both') {
     Invoke-Pair -Tag 'link' -PutBoth $put `
         -SendB @('drv load t:\nodelink.sys',
                  'link use node0',
-                 "link echo $RecvSecs",
+                 # The window has to COVER THE WORK, so it is derived from the
+                 # work rather than left at a number that used to be enough.
+                 #
+                 # It was $RecvSecs (60), and it fitted only because the second
+                 # ping was being cut short by a harness fault: the echo check
+                 # retyped a command into the running first ping and stopped it
+                 # at seven messages of twenty-four.  With that fixed the first
+                 # ping runs to the end, the second starts later, and 60
+                 # seconds no longer reaches it - so the stream ping got no
+                 # answers and the check said the stream class was broken.
+                 #
+                 # A number that only worked because something else was broken
+                 # is worth replacing with the arithmetic: the wait before A
+                 # speaks, two pings' worth at a second each, and a margin.
+                 "link echo $($SendDelaySec + $Pings * 2 + 40)",
                  '=answered ') `
         -SendA @('drv load t:\nodelink.sys',
                  'link use node0',
@@ -756,15 +770,45 @@ if ($Scenario -eq 'link' -or $Scenario -eq 'both') {
                  # console and left it too busy to answer - which failed checks
                  # that had nothing to do with processes and pointed at the wire.
                  'run /b t:\idle.axe',
-                 "link poll $(($SendDelaySec + 90) * 1000)",
-                 '=link on node0') `
+                 # WAIT FOR THE SOUND rather than poll for a fixed time, and
+                 # this is not a tidying.
+                 #
+                 # `link poll <ms>` was here to keep the guest alive while the
+                 # other node worked, and it held this console for two minutes
+                 # doing it.  Commands typed into a console that is busy
+                 # printing lose characters, so the harness saw no echo and
+                 # typed them AGAIN - two polls of 115 seconds, and the journal
+                 # dump after them never ran at all.  The check then failed
+                 # saying the sound had not arrived, which was a statement
+                 # about this list and not about the wire.
+                 #
+                 # A `=` step types nothing, so nothing is lost to a busy
+                 # console.  What it waits FOR had to be chosen twice: the
+                 # kernel's summary of what was poured goes to the JOURNAL, not
+                 # to this screen, so waiting for it here waited for something
+                 # that was never going to appear - the same "the screen is not
+                 # a log" mistake this file warns about, made by me, in the
+                 # check written to prove the thing the note is about.
+                 #
+                 # `link poll` prints its status when it ends, and that IS on
+                 # this screen.  Long enough to cover the other node's work.
+                 "link poll $(($SendDelaySec + 60) * 1000)",
+                 '=link on node0',
+                 # And from the journal as well, because the screen scrolls and
+                 # the check wants a line it can still find.
+                 'log -n 80',
+                 '=log') `
         -SendA @('drv load t:\nodelink.sys',
                  'link name quiet',
                  'link use node0',
                  "!powershell -NoProfile -Command Start-Sleep -Seconds $SendDelaySec",
                  'link devs',
                  '=are in this registry now',
-                 'dev',
+                 # No `dev` listing here any more.  Nothing checked its output -
+                 # the count that is checked comes from `link devs` above - and
+                 # a dozen lines of it arriving while the next command is typed
+                 # is exactly the state in which this console drops characters.
+                 # A listing printed for nobody is not free.
                  'run t:\devpoke.axe sound.pcmvirt 64',
                  '=devpoke:',
                  # The class default: this node's mixer has no real output of
@@ -800,7 +844,18 @@ if ($Scenario -eq 'link' -or $Scenario -eq 'both') {
     # nowhere else, so this node has no device of that name to open by mistake.
     Check $a 'are in this registry now' 'rdev-proxies-registered'
     Check $a 'sound.pcmvirt is open' 'rdev-opened-a-device-that-is-not-here'
-    Check $a '64 of 64 bytes taken' 'rdev-wrote-through-the-wire'
+
+    # The write was ACCEPTED here - and that is all this line can mean now.
+    #
+    # It used to be called rdev-wrote-through-the-wire, and under the old
+    # request-and-answer path it earned the name: the count came back from the
+    # far node.  Sound is poured now - stream class, no reply, no
+    # retransmission - so the sending side returns the length without evidence
+    # and this would say exactly the same with the wire unplugged.  Kept,
+    # because "the proxy was called and did not refuse" is still worth knowing;
+    # renamed, because it is not proof of arrival.  The proof is below, counted
+    # on the node the bytes landed on.
+    Check $a '64 of 64 bytes taken' 'rdev-write-was-accepted-here'
 
     # The class default, asking the WHOLE SYSTEM - which is the line that was
     # retreated from for two days and is now back.
@@ -821,6 +876,34 @@ if ($Scenario -eq 'link' -or $Scenario -eq 'both') {
     # not print its journal; the freeze cannot hide behind a passing assertion
     # here.
     Check $a 'sink /dev/sound.pcmvirt' 'default-sound-goes-to-the-node-that-has-one'
+
+    # AND THE SOUND ACTUALLY ARRIVED - counted where it landed.
+    #
+    # This is the check the streaming path needed and the old one could not be.
+    # A poured period is sent on the unreliable class with no reply, so nothing
+    # on the sending node can know it got there; the far node counts what it
+    # wrote into its converter and says so once the sound stops.  Unplug the
+    # wire and this line is simply absent.
+    #
+    # The LAST occurrence: the journal dump is a screen that scrolls and
+    # redraws, and these are running totals.
+    $pours = [regex]::Matches($b, 'poured (\d+) periods, (\d+) bytes, (\d+) lost')
+    if ($pours.Count -eq 0) {
+        Note $false 'pour-arrived-at-the-far-node' 'no "poured N periods" line'
+    } else {
+        $pr = $pours[$pours.Count - 1]
+        $pp = [int]$pr.Groups[1].Value
+        $pb = [int]$pr.Groups[2].Value
+        $pl = [int]$pr.Groups[3].Value
+        Write-Host "poured: $pp periods, $pb bytes, $pl lost"
+        Note ($pp -gt 0 -and $pb -gt 0) 'pour-arrived-at-the-far-node' `
+            "$pp periods, $pb bytes"
+        # Losing some is what an unreliable class is allowed to do; losing most
+        # of it means the path is broken rather than lossy.  The bound is where
+        # it says something, not where it passes.
+        Note ($pl -le $pp) 'pour-loses-less-than-it-delivers' `
+            "$pl lost against $pp delivered"
+    }
 
     # One `ps` for the system.  IDLE runs on the other board and has never been
     # on this one, so a row for it here crossed the wire.

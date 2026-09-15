@@ -44,6 +44,12 @@
 #define RD_MAX_PAYLOAD 224u
 #define RD_REPLY 0x80u
 
+/*
+ * In the flags byte: these bytes were POURED, not asked about.  No tag, no
+ * answer, no retransmission - see rd_write.
+ */
+#define RD_F_NOREPLY 0x01u
+
 enum {
     RD_OPEN = 1, /* payload = the device's own name (unqualified) */
     RD_CLOSE,
@@ -96,8 +102,8 @@ static volatile int32_t  s_status;
 static uint8_t           s_rbuf[RD_MAX_PAYLOAD];
 static volatile uint16_t s_rlen;
 
-static ag_err_t send_raw(uint8_t op, uint16_t tag, uint32_t h, uint32_t a,
-                         uint32_t b, uint8_t cls, const void *pay,
+static ag_err_t send_raw(uint8_t op, uint8_t flags, uint16_t tag, uint32_t h,
+                         uint32_t a, uint32_t b, uint8_t cls, const void *pay,
                          uint16_t plen)
 {
     uint8_t buf[RD_HDR + RD_MAX_PAYLOAD];
@@ -105,7 +111,7 @@ static ag_err_t send_raw(uint8_t op, uint16_t tag, uint32_t h, uint32_t a,
         plen = RD_MAX_PAYLOAD;
     }
     buf[0] = op;
-    buf[1] = 0;
+    buf[1] = flags;
     put16(buf + 2, tag);
     put32(buf + 4, h);
     put32(buf + 8, a);
@@ -159,7 +165,7 @@ static int32_t ask(uint8_t op, uint32_t h, uint32_t a, uint32_t b, uint8_t cls,
     s_have = false;
     s_rlen = 0;
 
-    int32_t rc = (int32_t)send_raw(op, s_tag, h, a, b, cls, pay, plen);
+    int32_t rc = (int32_t)send_raw(op, 0, s_tag, h, a, b, cls, pay, plen);
     if (rc == AG_OK) {
         /*
          * SHORT, and the reason is not the wire.
@@ -262,6 +268,70 @@ static int32_t rd_read(ag_device_t *dev, void *buf, size_t len, uint64_t off)
                AG_LINK_CONTROL, NULL, 0, buf, &got);
 }
 
+/* What this node has poured at the neighbour, for `link` and for a person. */
+static uint32_t s_sent_periods;
+static uint32_t s_sent_dropped;
+
+/*
+ * POURING: bytes with a deadline, sent and not asked about.
+ *
+ * Every other write here is a question - it goes out on the reliable class and
+ * waits for the far node to say how many bytes it took.  For SOUND that is the
+ * wrong shape twice over.  A period is due every ten milliseconds and a round
+ * trip is three, so a question costs a third of the budget for nothing; worse,
+ * only one question may be outstanding at a time, so the answer to the last
+ * period gates the next one - and when the far node is busy the request is
+ * refused outright.  That is a dropped period MANUFACTURED BY ASKING, and the
+ * answer was of no use to anybody: a period that arrives late is worse than one
+ * that never arrives, and there is nothing sensible to do with "it did not fit"
+ * except let it go.
+ *
+ * So: the stream class, no tag, no reply, no retransmission, and no waiting -
+ * a period that cannot go on the wire now has missed its moment.
+ *
+ * THE DECISION IS BY DEVICE CLASS, not by a flag from the caller, and that is
+ * deliberate.  Whether bytes need a receipt is a property of what the bytes
+ * ARE.  A caller that had to ask for this would be a caller that could forget
+ * to, and an application writing to a converter has no business knowing which
+ * board the converter is on.
+ *
+ * THE COST, stated because it is a real one: this returns the length without
+ * evidence.  Nothing here can know the far node took the bytes, so nothing
+ * downstream should be believed when it says so - the count that means
+ * something is the one kept on the RECEIVING side, and this file keeps it (see
+ * pour_task).  A check that trusted this return value would be a check that
+ * passes with the wire unplugged, and this tree had one.
+ */
+static int32_t pour(rdev_t *p, const void *buf, size_t len, uint64_t off)
+{
+    uint8_t buf2[RD_HDR + RD_MAX_PAYLOAD];
+    if (len > RD_MAX_PAYLOAD) {
+        len = RD_MAX_PAYLOAD;
+    }
+    buf2[0] = RD_WRITE;
+    buf2[1] = RD_F_NOREPLY;
+    put16(buf2 + 2, 0); /* no tag: nothing will come back to match it */
+    put32(buf2 + 4, (uint32_t)p->far_handle);
+    put32(buf2 + 8, 0);
+    put32(buf2 + 12, (uint32_t)off);
+    memcpy(buf2 + RD_HDR, buf, len);
+
+    /*
+     * ONE attempt.  send_raw's retry loop is right for a request and wrong for
+     * this: waiting for room means the period goes out late, and late is the
+     * one thing it must not be.  The stream class does not queue behind the
+     * reliable one either - that is what the class is for.
+     */
+    const int32_t r = ag_linkprov_send(RD_CHAN, AG_LINK_STREAM, buf2,
+                                       (uint16_t)(RD_HDR + len));
+    if (r < 0) {
+        s_sent_dropped++;
+        return (int32_t)len; /* let go of it, and say the period was taken */
+    }
+    s_sent_periods++;
+    return (int32_t)len;
+}
+
 static int32_t rd_write(ag_device_t *dev, const void *buf, size_t len,
                         uint64_t off)
 {
@@ -272,6 +342,11 @@ static int32_t rd_write(ag_device_t *dev, const void *buf, size_t len,
     if (len > RD_MAX_PAYLOAD) {
         len = RD_MAX_PAYLOAD;
     }
+
+    if (dev->cls == AG_DEV_AUDIO) {
+        return pour(p, buf, len, off);
+    }
+
     /*
      * CONTROL, and NOT the stream class, which is the mistake this very line
      * made first.
@@ -288,9 +363,6 @@ static int32_t rd_write(ag_device_t *dev, const void *buf, size_t len,
      * is both reliable and first, which is what this wanted; and it stays
      * bounded because only one request is outstanding at a time, so a device
      * cannot flood the wire however hard it is written to.
-     *
-     * The stream class is still the right home for sound - but for a path that
-     * pours samples and never waits, which is a different thing from this.
      */
     return ask(RD_WRITE, (uint32_t)p->far_handle, 0, (uint32_t)off,
                AG_LINK_CONTROL, buf, (uint16_t)len, NULL, NULL);
@@ -347,7 +419,7 @@ static const ag_dev_ops_t k_proxy_ops = {
 static void reply(uint8_t op, uint16_t tag, int32_t status, uint8_t cls,
                   const void *pay, uint16_t plen)
 {
-    const ag_err_t e = send_raw((uint8_t)(op | RD_REPLY), tag,
+    const ag_err_t e = send_raw((uint8_t)(op | RD_REPLY), 0, tag,
                                 (uint32_t)status, 0, 0, cls, pay, plen);
     if (e != AG_OK) {
         /*
@@ -375,6 +447,57 @@ static uint8_t        s_req[RD_HDR + RD_MAX_PAYLOAD];
 static volatile uint16_t s_req_len;
 static volatile bool  s_working;
 static ag_port_task_t s_worker;
+
+/* ---- receiving what was poured ------------------------------------------ */
+
+/*
+ * FOUR periods, and a task that stands rather than one that is made.
+ *
+ * A request that expects an answer gets a task of its own, which is affordable
+ * because it happens when somebody asks.  A poured period arrives every ten
+ * milliseconds for as long as there is sound: a task each would be a hundred
+ * tasks a second, and a server that took them one at a time would refuse most
+ * of them.  So one task waits here, and a small ring absorbs the difference
+ * between a wire that delivers in bursts and a converter that consumes evenly.
+ *
+ * Four because that is about forty milliseconds - enough to ride out a burst,
+ * short enough that a period which has been waiting that long is already too
+ * old to be worth playing.
+ *
+ * FULL MEANS THE NEWEST IS DROPPED, not the oldest, and that is what makes this
+ * safe without a lock: only the reader task moves the write end and only the
+ * pouring task moves the read end.  It is also the honest choice - a period
+ * that cannot be taken now has missed its moment, which is the same rule the
+ * sending side follows.
+ */
+#define RD_RING 4
+
+typedef struct {
+    uint8_t  data[RD_MAX_PAYLOAD];
+    uint16_t len;
+    uint32_t handle;
+    uint32_t off;
+} rd_period_t;
+
+static rd_period_t       s_ring[RD_RING];
+static volatile uint32_t s_ring_w;
+static volatile uint32_t s_ring_r;
+static ag_port_task_t    s_pour_task;
+
+/*
+ * THE COUNT THAT MEANS SOMETHING.
+ *
+ * A poured write returns success on the sending node without evidence - there
+ * is nothing to have evidence of, since nothing comes back.  So "all the bytes
+ * were taken" over there is not a fact about this wire, and a test that read it
+ * would pass with the far node switched off.  These are counted where the bytes
+ * actually landed, and said out loud when the sound stops.
+ */
+static uint32_t s_pour_periods;
+static uint32_t s_pour_bytes;
+static uint32_t s_pour_lost;
+static uint32_t s_pour_last_ms;
+static bool     s_pour_said;
 
 static void serve_one(const uint8_t *b, uint16_t n)
 {
@@ -480,6 +603,108 @@ static void worker(void *arg)
     ag_port_task_delete(NULL);
 }
 
+/*
+ * Says what arrived, once per spell of sound rather than once per period.
+ *
+ * Per period would be a hundred lines a second into a four-kilobyte journal,
+ * which would bury the thing it is there to show.  At the end of a burst it is
+ * one line, it is the count kept on the side that received the bytes, and it is
+ * the only number in this path that is evidence of anything.
+ */
+static void pour_report(void)
+{
+    if (s_pour_said || s_pour_periods == 0) {
+        return;
+    }
+    const uint32_t now = (uint32_t)(ag_port_us() / 1000);
+    if ((uint32_t)(now - s_pour_last_ms) < 400u) {
+        return;
+    }
+    ag_log(AG_LOG_INFO, TAG, "poured %u periods, %u bytes, %u lost",
+           (unsigned)s_pour_periods, (unsigned)s_pour_bytes,
+           (unsigned)s_pour_lost);
+    s_pour_said = true;
+}
+
+static void pour_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        if (s_ring_r == s_ring_w) {
+            /* Woken by the next period, and on the clock anyway so the end of
+             * a burst gets its line without anything having to notice. */
+            ag_port_notify_take(true, ag_port_ms_to_ticks(100));
+            pour_report();
+            continue;
+        }
+
+        rd_period_t *pd = &s_ring[s_ring_r];
+        ag_device_t *dev = (pd->handle < (uint32_t)RD_MAX_SESSIONS)
+                               ? s_session[pd->handle]
+                               : NULL;
+        if (dev != NULL) {
+            /*
+             * An ordinary device write, which is exactly the point: it takes
+             * that device's own lock and no longer the registry's, so a
+             * converter that makes this wait stops nothing else on this board.
+             * Before that was true, this path froze the machine.
+             */
+            const int32_t n = ag_dev_write(dev, pd->data, pd->len, pd->off);
+            if (n > 0) {
+                s_pour_periods++;
+                s_pour_bytes += (uint32_t)n;
+            } else {
+                s_pour_lost++;
+            }
+        } else {
+            s_pour_lost++;
+        }
+        s_pour_last_ms = (uint32_t)(ag_port_us() / 1000);
+        s_pour_said = false;
+        s_ring_r = (s_ring_r + 1u) % RD_RING;
+    }
+}
+
+/*
+ * A period off the wire.  Runs on the link's reader task, so it copies and
+ * returns - the converter is written to on the task above.
+ */
+static void take_period(const uint8_t *b, uint16_t n)
+{
+    if (s_pour_task == NULL) {
+        /*
+         * Made on the first period rather than at start-up: a board that never
+         * has sound poured at it should not carry a task and its stack for the
+         * possibility.  Below applications, like every other task this file's
+         * neighbours make.
+         */
+        if (!ag_port_task_create(pour_task, "rdevpour", 3072, NULL, 1,
+                                 AG_PORT_ANY_CORE, 0, &s_pour_task)) {
+            s_pour_lost++;
+            return;
+        }
+        ag_log(AG_LOG_INFO, TAG, "sound is being poured at us from %s",
+               ag_node_peer_name() != NULL ? ag_node_peer_name() : "the wire");
+    }
+
+    const uint32_t next = (s_ring_w + 1u) % RD_RING;
+    if (next == s_ring_r) {
+        s_pour_lost++; /* full: this one missed its moment */
+        return;
+    }
+    rd_period_t *pd = &s_ring[s_ring_w];
+    uint16_t     plen = (uint16_t)(n - RD_HDR);
+    if (plen > sizeof(pd->data)) {
+        plen = (uint16_t)sizeof(pd->data);
+    }
+    memcpy(pd->data, b + RD_HDR, plen);
+    pd->len = plen;
+    pd->handle = get32(b + 4);
+    pd->off = get32(b + 12);
+    s_ring_w = next;
+    ag_port_notify_give(s_pour_task);
+}
+
 static void on_msg(uint8_t chan, const void *data, uint16_t n, void *ctx)
 {
     (void)chan;
@@ -502,6 +727,16 @@ static void on_msg(uint8_t chan, const void *data, uint16_t n, void *ctx)
         memcpy(s_rbuf, b + RD_HDR, plen);
         s_rlen = plen;
         s_have = true;
+        return;
+    }
+
+    /*
+     * Poured bytes.  Not a request: nothing is expected back, so there is no
+     * tag to match, nothing to refuse with, and nobody to refuse to.  Into the
+     * ring and out of this task.
+     */
+    if ((b[1] & RD_F_NOREPLY) != 0) {
+        take_period(b, n);
         return;
     }
 

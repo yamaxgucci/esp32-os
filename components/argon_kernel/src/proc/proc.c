@@ -393,6 +393,46 @@ static void reap(proc_t *p)
         ag_console_restore_tty();
     }
 
+    /*
+     * AND NOW it can be said, because the console is back.
+     *
+     * This used to be written on the process's own task the instant its entry
+     * returned - see proc_task - where the process still owned the console and
+     * the line reached nobody.  The effect was that a program which finished
+     * quickly announced itself and one that ran for seconds did not, which is
+     * indistinguishable from working until something depends on it.  Something
+     * did: the QEMU harness decides a `run` has finished by this line, waited
+     * the full command timeout for programs that outlived their session
+     * adoption, and burned seven minutes a run while every check still passed.
+     *
+     * A foreground run reaps here synchronously (ag_proc_wait), so the line
+     * still lands before the shell's next prompt.
+     */
+    ag_log(AG_LOG_INFO, "proc", "%s (pid %u) returned %d, %u stack bytes unused",
+           p->name, (unsigned)p->pid, (int)p->exit_code,
+           (unsigned)p->stack_unused);
+
+    /*
+     * AND ON THE SCREEN, for the one case where the journal is not enough: a
+     * program somebody started and is watching end.
+     *
+     * The journal line above reaches the console only while log echo is on,
+     * and the shell turns echo on for the length of a COMMAND.  `run` is not
+     * that command: it starts the program in a session slot and returns to the
+     * prompt at once, so by the time the program ends the echo is off and this
+     * event - the direct consequence of what the user typed - is the one thing
+     * about it that nobody sees.  Every other kind of async noise is rightly
+     * kept off the prompt; this is not async noise.
+     *
+     * Only for a program that had the screen, and only when the echo did not
+     * already carry it, so nothing is said twice and a background job stays
+     * quiet.
+     */
+    if (restore_tty && !ag_log_echo()) {
+        ag_console_printf("%s (pid %u) returned %d\n", p->name,
+                          (unsigned)p->pid, (int)p->exit_code);
+    }
+
     ag_loader_unload(&p->app);
 
     if (p->heap_mem != NULL) {
@@ -869,9 +909,24 @@ static void proc_task(void *arg)
     p->stack_unused = (uint32_t)ag_port_task_stack_unused(NULL);
     p->state = AG_PS_ZOMBIE;
 
-    ag_log(AG_LOG_INFO, "proc", "%s (pid %u) returned %d, %u stack bytes unused",
-           p->name, (unsigned)p->pid, (int)p->exit_code,
-           (unsigned)p->stack_unused);
+    /*
+     * The line saying it ended is NOT written here, and where it went instead
+     * is the whole of a defect that took three runs to see.
+     *
+     * Here, the process still owns the console - it is the process's own task,
+     * and the session has not unbound yet.  A kernel log line written while an
+     * application owns the console reaches nobody: not the screen, because the
+     * application has it, and not the eye of whoever is waiting to see the
+     * program finish.  A program that ended in under a few milliseconds got
+     * away with it, because the session had not adopted it yet and its output
+     * was still going to the journal; a program that ran for eight seconds did
+     * not.  So the same system printed "it returned" for short programs and
+     * said nothing at all for long ones - which is the worst possible rule,
+     * because it looks like it works.
+     *
+     * It is written in reap() instead, after the console has been given back.
+     * See there.
+     */
 
     /* Nothing may touch the process after this: whoever waits for it owns it. */
     ag_port_sem_t done = p->done;

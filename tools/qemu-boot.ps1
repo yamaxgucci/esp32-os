@@ -475,20 +475,48 @@ try {
     function Send-Command {
         param([string]$Line)
         Send-Line $Line
-        Start-Sleep -Milliseconds 250
-        [void](Read-Available)
-        $tail = $text.ToString()
-        if ($tail.Length -gt 6000) { $tail = $tail.Substring($tail.Length - 6000) }
-        # Escapes stripped before looking.
+        # WAITED FOR, not sampled once, and the difference is whole runs.
         #
-        # What arrives is a RENDERED SCREEN, not a log: a redraw lands cursor
-        # moves and erase-to-end sequences in the middle of the line being
-        # echoed, so a plain search for the command text fails while the command
-        # is sitting there perfectly.  That false alarm is not harmless - it
-        # retypes a command that already ran, and `link devs` twice is not
-        # `link devs`.
-        $tail = $tail -replace "`e\[[0-9;]*[A-Za-z]", ''
-        if ($tail.Contains($Line)) { return }
+        # This looked once after 250 ms.  A console that is still printing the
+        # previous command's output echoes late - not never - so the check
+        # declared the line lost and typed it AGAIN, which is the one thing it
+        # must not do: `link devs` twice is not `link devs`, and two `run`s of
+        # the same program fight over the same device.  Three seconds of
+        # patience costs nothing when the echo is prompt, which is almost
+        # always, and a genuinely dropped line is still retyped.
+        # Searched from WHERE THE LINE WAS SENT, not in the last few thousand
+        # characters, and that pairing matters as much as the waiting.
+        #
+        # It used to look once, in a 6000-character tail.  Waiting longer
+        # without changing that made it WORSE, not better: a command whose
+        # output starts at once - `link ping 24` prints a line per message -
+        # pushes its own echo out of that tail while the check is still being
+        # patient, so the check concludes the line was lost and types it again.
+        # The retyped characters then stop the running ping, which reports
+        # seven of twenty-four and looks exactly like a bad wire.  Measured:
+        # two runs in a row, both blamed on the link.
+        #
+        # Send-Line records the transcript length before it writes, so
+        # everything from that mark on is what arrived because of this command.
+        # Nothing scrolls out of that.
+        $mark = $script:sendMark
+        for ($echoTry = 0; $echoTry -lt 12; $echoTry++) {
+            Start-Sleep -Milliseconds 250
+            [void](Read-Available)
+            $since = $text.ToString()
+            if ($mark -lt $since.Length) {
+                $since = $since.Substring($mark)
+            }
+            # Escapes stripped before looking.
+            #
+            # What arrives is a RENDERED SCREEN, not a log: a redraw lands
+            # cursor moves and erase-to-end sequences in the middle of the line
+            # being echoed, so a plain search for the command text fails while
+            # the command is sitting there perfectly.  That false alarm is not
+            # harmless - see above.
+            $since = $since -replace "`e\[[0-9;]*[A-Za-z]", ''
+            if ($since.Contains($Line)) { return }
+        }
 
         Write-Host "warning: the console did not echo '$Line'; typing it again" `
             -ForegroundColor Yellow
@@ -784,6 +812,24 @@ try {
                 Send-Command $cmd
                 [void](Wait-Text -Needle 'Ctrl+C to stop' -Was $wasUp `
                                  -Seconds $TimeoutSec)
+                $seen = Read-Available
+            } elseif ($cmd -match '(?i)^run\s+/b\b') {
+                # A BACKGROUND run never reports an exit - that is what /b
+                # means - so waiting for "returned" is waiting for something
+                # that cannot happen.  It cost the whole command timeout and
+                # then gave up, and the damage was not the wait: it pushed the
+                # commands AFTER it past the run's budget, so a journal dump
+                # that a check depended on never happened at all.  Twenty
+                # minutes of a run, and the failure pointed at the feature.
+                #
+                # What the shell does print, exactly once, when a background
+                # process starts.
+                $wasStart = Count-Of 'started pid '
+                Send-Command $cmd
+                if (-not (Wait-Text -Needle 'started pid ' -Was $wasStart `
+                                    -Seconds 60)) {
+                    Write-Host "warning: background run did not report a pid"
+                }
                 $seen = Read-Available
             } elseif ($cmd -match '(?i)^run\s') {
                 $wasRet = Count-Of 'returned '
