@@ -16,6 +16,7 @@
 #include <argon/migrate.h>
 #include <argon/proc.h>
 
+#include <argon/port/mem.h>
 #include <argon/port/task.h>
 #include <argon/port/time.h>
 
@@ -167,11 +168,19 @@ static int32_t out_sink(void *ctx, const char *data, size_t len)
 static char           s_run_line[AG_PATH_MAX + 64];
 static ag_port_task_t s_run_task;
 
-/* State arriving with a migrating program, collected before its RUN. */
 /* Set by the far node's STARTED; only a handover ever waits on it. */
 static volatile bool s_started;
 
-static uint8_t  s_in_state[AG_MIGRATE_MAX];
+/*
+ * State arriving with a migrating program, collected before its RUN.
+ *
+ * From the heap, taken on the first STATE message that ever reaches this
+ * board.  As an array it was a kilobyte of internal .bss on every board built,
+ * and internal SRAM is what a TLS handshake runs out of first: `nettest`
+ * failed on https, and only https, the moment this and its two neighbours
+ * were added as plain arrays.
+ */
+static uint8_t *s_in_state;
 static uint32_t s_in_state_len;
 
 static void run_task(void *arg)
@@ -292,7 +301,18 @@ static void on_msg(uint8_t chan, const void *data, uint16_t n, void *ctx)
             if (code == 0) {
                 s_in_state_len = 0;
             }
-            if (have > 0 && s_in_state_len + have <= sizeof(s_in_state)) {
+            if (s_in_state == NULL) {
+                s_in_state = (uint8_t *)ag_port_alloc(
+                    AG_MIGRATE_MAX, AG_MEM_SLOW | AG_MEM_BYTE);
+                if (s_in_state == NULL) {
+                    s_in_state = (uint8_t *)ag_port_alloc(
+                        AG_MIGRATE_MAX, AG_MEM_FAST | AG_MEM_BYTE);
+                }
+            }
+            /* No buffer means no state, and a program that arrives without its
+             * state starts fresh - which it is written to survive. */
+            if (s_in_state != NULL && have > 0 &&
+                s_in_state_len + have <= AG_MIGRATE_MAX) {
                 memcpy(s_in_state + s_in_state_len, buf + NP_HDR, have);
                 s_in_state_len += have;
             }

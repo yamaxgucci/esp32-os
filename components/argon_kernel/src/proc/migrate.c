@@ -14,6 +14,7 @@
 #include <argon/nodeproc.h>
 #include <argon/proc.h>
 
+#include <argon/port/mem.h>
 #include <argon/port/task.h>
 #include <argon/port/time.h>
 
@@ -30,15 +31,44 @@
  * an answer somebody can act on.
  */
 static ag_pid_t s_asking;              /* who is being asked to move          */
-static uint8_t  s_state[AG_MIGRATE_MAX];
 static uint32_t s_state_len;
 static bool     s_saved;               /* it agreed and handed something over */
 
 /* What a process starting here should find - the far end of somebody else's
  * migration.  Taken once, by the first process that asks. */
-static uint8_t  s_arrived[AG_MIGRATE_MAX];
 static uint32_t s_arrived_len;
 static bool     s_arriving;
+
+/*
+ * BOTH BUFFERS COME FROM THE HEAP, and not for tidiness: as plain arrays they
+ * were 2 KB of internal .bss on every board ever built, whether or not anyone
+ * ever migrates anything - and this tree has already watched a few kilobytes
+ * of exactly that break TLS, because the handshake needs a large contiguous
+ * block and internal SRAM is what runs out first.  `nettest` said it again the
+ * moment these were added: https, and only https.
+ *
+ * Kept once taken, rather than freed after each handover: a kilobyte is not
+ * worth the risk of failing to allocate halfway through moving somebody's
+ * program, and a board that migrated once will migrate again.
+ */
+static uint8_t *s_state;
+static uint8_t *s_arrived;
+
+static uint8_t *buffer_take(uint8_t **slot)
+{
+    if (*slot == NULL) {
+        /* Outside SRAM first, exactly like the thread table next door: this
+         * is a kilobyte that is read and written twice in a handover, so
+         * where it lives costs nothing and what it displaces costs a lot. */
+        *slot = (uint8_t *)ag_port_alloc(AG_MIGRATE_MAX,
+                                         AG_MEM_SLOW | AG_MEM_BYTE);
+        if (*slot == NULL) {
+            *slot = (uint8_t *)ag_port_alloc(AG_MIGRATE_MAX,
+                                             AG_MEM_FAST | AG_MEM_BYTE);
+        }
+    }
+    return *slot;
+}
 
 void ag_migrate_asking(ag_pid_t pid)
 {
@@ -51,10 +81,17 @@ void ag_migrate_done(void) { s_asking = AG_PID_KERNEL; }
 
 void ag_migrate_arriving(const void *state, uint32_t len)
 {
-    if (len > sizeof(s_arrived)) {
-        len = (uint32_t)sizeof(s_arrived);
+    if (len > AG_MIGRATE_MAX) {
+        len = AG_MIGRATE_MAX;
     }
     if (state != NULL && len > 0) {
+        if (buffer_take(&s_arrived) == NULL) {
+            /* Nothing to hand the program: it will start fresh, which is the
+             * honest outcome and the one it is written to survive. */
+            s_arrived_len = 0;
+            s_arriving = false;
+            return;
+        }
         memcpy(s_arrived, state, len);
     }
     s_arrived_len = len;
@@ -72,10 +109,15 @@ ag_err_t ag_migrate_save(const void *state, uint32_t len)
     if (!ag_migrate_wanted()) {
         return -AG_EPERM;
     }
-    if (len > sizeof(s_state)) {
+    if (len > AG_MIGRATE_MAX) {
         return -AG_ERANGE;
     }
     if (state != NULL && len > 0) {
+        if (buffer_take(&s_state) == NULL) {
+            /* Refused before the program has given anything up, so it can act
+             * on the answer: it is still here, and still holds its work. */
+            return -AG_ENOMEM;
+        }
         memcpy(s_state, state, len);
     }
     s_state_len = len;
