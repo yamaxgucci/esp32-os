@@ -92,6 +92,20 @@ static struct {
     /* Frames arrive in pieces; this is what has arrived and not been used. */
     uint8_t  rx[RX_CAP];
     uint32_t rx_len;
+    /*
+     * Bytes of a frame too big for that buffer, still to be thrown away.
+     *
+     * A band of pixels is about five kilobytes and this buffer is two, so
+     * without this the first picture wedges the client for ever: the buffer
+     * fills, the frame can never be complete, nothing is consumed and the loop
+     * spins.  Found by holding the link for two minutes and watching the
+     * client still be there afterwards.
+     *
+     * Thrown away rather than made to fit: this is the text client, it has no
+     * use for pixels, and a buffer sized for them would be five kilobytes it
+     * takes from the board it is testing.
+     */
+    uint32_t skip;
 } s;
 
 /* ------------------------------------------------------------------------ */
@@ -220,11 +234,30 @@ static void rx_drop(uint32_t n)
 /* The two handshakes: HTTP, then the password                               */
 /* ------------------------------------------------------------------------ */
 
-static int fetch_page(uint32_t addr, uint16_t port)
+/*
+ * Connect, and do not let a quiet moment look like a hang.
+ *
+ * A blocking socket was this client's first real bug, and it hid well:
+ * everything worked for as long as the board had something to say, and the
+ * first silent second wedged it for ever inside ag_net_recv.  The hold
+ * reported "10/40 s" and then nothing, which is a fair description of a
+ * program waiting for a screen that is not changing.
+ */
+static bool connect_to(uint32_t addr, uint16_t port)
 {
     s.sock = ag_tcp_connect(addr, port, 4000);
     if ((int32_t)s.sock < 0) {
         ag_printf("connect failed: %d\n", (int)(int32_t)s.sock);
+        return false;
+    }
+    (void)ag_net_set_nonblock(s.sock, true);
+    return true;
+}
+
+
+static int fetch_page(uint32_t addr, uint16_t port)
+{
+    if (!connect_to(addr, port)) {
         return 1;
     }
 
@@ -299,9 +332,7 @@ static int fetch_page(uint32_t addr, uint16_t port)
 
 static bool ws_open(uint32_t addr, uint16_t port)
 {
-    s.sock = ag_tcp_connect(addr, port, 4000);
-    if ((int32_t)s.sock < 0) {
-        ag_printf("connect failed: %d\n", (int)(int32_t)s.sock);
+    if (!connect_to(addr, port)) {
         return false;
     }
 
@@ -479,6 +510,17 @@ static void take_message(const uint8_t *m, uint32_t len)
 static bool take_frames(void)
 {
     for (;;) {
+        /* Finish discarding an oversized frame before looking for a header:
+         * what is in the buffer is its body, not the start of anything. */
+        if (s.skip != 0u) {
+            const uint32_t n = (s.skip < s.rx_len) ? s.skip : s.rx_len;
+            rx_drop(n);
+            s.skip -= n;
+            if (s.skip != 0u) {
+                return true;
+            }
+        }
+
         ag_ws_hdr_t h;
         const int32_t r = ag_ws_hdr_parse(s.rx, s.rx_len, RX_CAP, &h);
         if (r == 0) {
@@ -487,6 +529,12 @@ static bool take_frames(void)
         if (r < 0) {
             ag_printf("bad frame from the board\n");
             return false;
+        }
+        if (h.hdr + h.len > RX_CAP) {
+            /* Bigger than anything this client can hold: step over it. */
+            s.skip = h.len;
+            rx_drop(h.hdr);
+            continue;
         }
         if (s.rx_len < h.hdr + h.len) {
             return true; /* the body is still on its way */
@@ -784,6 +832,16 @@ int ag_main(int argc, char **argv)
             const uint32_t secs = (uint32_t)atoi(argv[++i]);
             const uint32_t before = s.rows_seen;
             for (uint32_t t = 0; t < secs && rc == 0; t++) {
+                /*
+                 * Every ten seconds, because a hold that says nothing until it
+                 * ends cannot be told from a hold that is never going to end -
+                 * which is exactly what happened the first time this ran, and
+                 * cost a rebuild to find out.
+                 */
+                if ((t % 10u) == 0u) {
+                    ag_printf("  %u/%u s, %u rows\n", (unsigned)t,
+                              (unsigned)secs, (unsigned)(s.rows_seen - before));
+                }
                 if (!pump(1000)) {
                     ag_printf("link lost after %u s\n", (unsigned)t);
                     rc = 1;
