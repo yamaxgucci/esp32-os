@@ -5851,8 +5851,23 @@ SDL_AudioDeviceID SDL_OpenAudioDevice(const char *device, int iscapture,
      * when it runs off the end of its stack is not fail, it is corrupt
      * whatever is next and stop the machine somewhere else entirely.
      */
+    /*
+     * ARGON: the system core, for the same reason the printer was moved.
+     *
+     * Moving the printer took the worst script call from 164 ms to 34 - and
+     * left the blit still losing a row worth 60 microseconds of work that
+     * took 22 milliseconds, unchanged to the microsecond.  So a second thread
+     * is still sharing the game's core, and this is the other one created
+     * with no flags at all.
+     *
+     * It spends almost all its life asleep inside a 46 ms I2S write, so it
+     * costs the core it sits on nothing to speak of - but "nothing to speak
+     * of" is not "nothing", and it wakes to mix on every block.  The number
+     * that says this was safe is the write average: it has to stay at 46 ms,
+     * because that is the hardware pacing one 1024-frame block.
+     */
     s_audio_thread = ag_thread_create(audio_thread, NULL, "sdlaudio", 16384, 0,
-                                      0);
+                                      AG_THREAD_SYS_CORE);
     if (s_audio_thread == NULL) {
         ag_audio_close();
         return 0;
