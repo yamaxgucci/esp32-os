@@ -322,6 +322,18 @@ static struct {
      */
     uint64_t          hush_until;
     volatile uint8_t  stage;     /* where the task's loop last was            */
+    /*
+     * Whether anything has sent pixels since the client arrived.
+     *
+     * The band, the packed output and the codec's context are about thirteen
+     * kilobytes on this panel, and a text application needs none of them.  On
+     * a board with 208 KB that thirteen is the difference between the driver
+     * admitting a visitor and refusing one: with the file manager up, free
+     * memory sat at 11868 bytes against a floor of 16384, and the page simply
+     * would not load - the board was holding a picture buffer for a screen
+     * made of characters.
+     */
+    bool              want_pixels;
     bool              moaned_frame;
     bool              moaned_mem;
     bool              want_frame;
@@ -616,6 +628,21 @@ static void drop_conn(const char *why)
 {
     /* A new client is not the old one's shut window. */
     s.hush_until = 0u;
+    /*
+     * And the picture buffers go back to the machine.  Nobody is being sent a
+     * screen, and the next application to start would rather have the
+     * thirteen kilobytes than have the driver hold them against a phone that
+     * may not return for hours.
+     */
+    if (s.pix != NULL || s.band != NULL || s.out != NULL) {
+        ag_free(s.pix);
+        ag_free(s.band);
+        ag_free(s.out);
+        s.pix = NULL;
+        s.band = NULL;
+        s.out = NULL;
+        s.want_pixels = false;
+    }
     if (s.conn >= 0) {
         (void)ag_net_close(s.conn);
         s.conn = -1;
@@ -1971,7 +1998,7 @@ static void phone_task(void *arg)
             continue;
         }
         stage_enter(3);
-        if (!ensure_memory()) {
+        if (s.want_pixels && !ensure_memory()) {
             TASK->sleep_ms(500u);
             continue;
         }
@@ -2137,6 +2164,18 @@ static ag_err_t phone_info(ag_handle_t h, ag_gfxinfo_t *out)
  */
 static void phone_blit_rect(ag_handle_t h, const ag_blit_t *b)
 {
+    /*
+     * From here on the picture buffers are worth their room - and this is the
+     * path that needs them, so it takes them itself rather than waiting a lap
+     * for the task to notice.  A refusal here is a rectangle not sent, which
+     * is a screen that does not update; it is not a board that stops
+     * answering, and that is the right way round.
+     */
+    s.want_pixels = true;
+    if (!ensure_memory()) {
+        return;
+    }
+
     (void)h;
     if (b == NULL || b->px == NULL || b->w == 0u || b->h == 0u) {
         return;
@@ -2523,9 +2562,14 @@ ag_err_t ag_driver_init(void)
         }
         s.want_w = w;
         s.want_h = h;
-        if (!ensure_memory()) {
-            return -AG_ENOMEM;
-        }
+        /*
+         * Sized, not allocated.  Taking the picture buffers at load time means
+         * holding thirteen kilobytes from boot for a screen that may only ever
+         * show text - and on this board that is exactly the memory an
+         * application needs to leave the driver, so the page stopped loading
+         * whenever anything ran.  They are taken when the first rectangle
+         * arrives and given back when the client goes.
+         */
     }
 
     ag_module_on_unload(phone_fini);
