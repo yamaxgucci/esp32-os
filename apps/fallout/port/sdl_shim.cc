@@ -435,11 +435,31 @@ static uint32_t s_blit_frame_us;
  * -smooth 1 takes the averaging branch.  The name matches what it does now:
  * 0 is nearest and sharp, 1 is averaged and soft.
  */
-static int s_scale_average;
+/*
+ * 0 - one pixel of each 2x2, sharp and loses half the thin strokes
+ * 1 - the average of the 2x2, loses nothing and dims every stroke
+ * 2 - the brightest of the 2x2
+ *
+ * The third exists because the first two are a real trade and Maxim found
+ * it by eye: through-a-pixel let him read about half the interface text
+ * (the strokes the sampling happened to land on, at full strength) and
+ * averaging let him read less of it (every stroke survives at a quarter of
+ * its contrast).  Fallout draws light on dark almost everywhere - the
+ * interface, the text, the green exit grids - so the brightest of a block
+ * IS the stroke whenever a block contains one, and it comes through at its
+ * own colour rather than blended into the ground.  Whether the letters then
+ * run together is a question for an eye, not for me.
+ */
+static int s_scale_mode;
 
 void sdl_shim_scale_sharp(int on)
 {
-    s_scale_average = on ? 1 : 0;
+    s_scale_mode = on ? 1 : 0;
+}
+
+void sdl_shim_scale_mode(int mode)
+{
+    s_scale_mode = (mode < 0) ? 0 : ((mode > 2) ? 2 : mode);
 }
 
 /*
@@ -2879,6 +2899,11 @@ static Uint8 s_pal_b[256];
  */
 static uint32_t s_pal_packed[256];
 
+/* And how bright each palette entry is, for the brightest-of-the-block mode.
+ * Rec.601 weights on the eight-bit components, so a green stroke is judged
+ * brighter than a blue one of the same number - which is what an eye does. */
+static Uint8 s_pal_lum[256];
+
 static const Uint16 *palette_lut(const SDL_Palette *pal)
 {
     static Uint16 lut[256];
@@ -2894,6 +2919,8 @@ static const Uint16 *palette_lut(const SDL_Palette *pal)
             s_pal_b[i] = (Uint8)(c.b >> 3);
             s_pal_packed[i] = ((uint32_t)(c.r >> 3) << 22)
                 | ((uint32_t)(c.g >> 2) << 11) | (uint32_t)(c.b >> 3);
+            s_pal_lum[i] = (Uint8)(((unsigned)c.r * 77u + (unsigned)c.g * 151u
+                                    + (unsigned)c.b * 28u) >> 8);
             lut[i] = (Uint16)(((c.r & 0xF8u) << 8) | ((c.g & 0xFCu) << 3) |
                               (c.b >> 3));
         }
@@ -3062,7 +3089,7 @@ int SDL_UpperBlit(SDL_Surface *src, const SDL_Rect *srcrect, SDL_Surface *dst,
             }
             ROW_DONE(y);
         }
-    } else if (!s_scale_average) {
+    } else if (s_scale_mode == 0) {
         /*
          * The reduction, and it is the second most expensive thing in a frame:
          * measured on the board at 10.5 ms against 34 ms of engine and 7 ms of
@@ -3221,18 +3248,57 @@ int SDL_UpperBlit(SDL_Surface *src, const SDL_Rect *srcrect, SDL_Surface *dst,
 
             const uint32_t row_t0 = (uint32_t)ag_micros();
 
-            for (int x = x0; x < x1; ++x, p0p += step, p1p += step) {
-                const Uint8 a0 = p0p[0];
-                const Uint8 a1 = p0p[1];
-                const Uint8 b0 = p1p[0];
-                const Uint8 b1 = p1p[1];
-                const uint32_t s = s_pal_packed[a0] + s_pal_packed[a1]
-                    + s_pal_packed[b0] + s_pal_packed[b1];
+            if (s_scale_mode == 1) {
+                for (int x = x0; x < x1; ++x, p0p += step, p1p += step) {
+                    const Uint8 a0 = p0p[0];
+                    const Uint8 a1 = p0p[1];
+                    const Uint8 b0 = p1p[0];
+                    const Uint8 b1 = p1p[1];
+                    const uint32_t s = s_pal_packed[a0] + s_pal_packed[a1]
+                        + s_pal_packed[b0] + s_pal_packed[b1];
 
-                cycled |= (unsigned)(a0 >= AG_CYCLE_FIRST);
-                CHANGED(d, x, (Uint16)((((s >> 24) & 0x1Fu) << 11)
-                                       | (((s >> 13) & 0x3Fu) << 5)
-                                       | ((s >> 2) & 0x1Fu)));
+                    cycled |= (unsigned)(a0 >= AG_CYCLE_FIRST);
+                    CHANGED(d, x, (Uint16)((((s >> 24) & 0x1Fu) << 11)
+                                           | (((s >> 13) & 0x3Fu) << 5)
+                                           | ((s >> 2) & 0x1Fu)));
+                }
+            } else {
+                /*
+                 * The brightest of the block, at its own colour.
+                 *
+                 * Fallout draws light on dark nearly everywhere, so whenever
+                 * a 2x2 holds a stroke the brightest pixel IS the stroke, and
+                 * it arrives undimmed rather than blended a quarter of the
+                 * way into the ground.  Averaging loses no stroke and dims
+                 * every one; sampling keeps half of them at full strength and
+                 * throws the rest away.  This keeps all of them at full
+                 * strength, and the price is that a gap one pixel wide
+                 * between two strokes can close - which is why it is a mode
+                 * and not a decision.
+                 */
+                for (int x = x0; x < x1; ++x, p0p += step, p1p += step) {
+                    const Uint8 a0 = p0p[0];
+                    const Uint8 a1 = p0p[1];
+                    const Uint8 b0 = p1p[0];
+                    const Uint8 b1 = p1p[1];
+                    Uint8 best = a0;
+                    Uint8 bestl = s_pal_lum[a0];
+
+                    if (s_pal_lum[a1] > bestl) {
+                        best = a1;
+                        bestl = s_pal_lum[a1];
+                    }
+                    if (s_pal_lum[b0] > bestl) {
+                        best = b0;
+                        bestl = s_pal_lum[b0];
+                    }
+                    if (s_pal_lum[b1] > bestl) {
+                        best = b1;
+                    }
+
+                    cycled |= (unsigned)(a0 >= AG_CYCLE_FIRST);
+                    CHANGED(d, x, lut[best]);
+                }
             }
             {
                 const uint32_t row_us = (uint32_t)ag_micros() - row_t0;

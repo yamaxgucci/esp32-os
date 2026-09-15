@@ -1292,6 +1292,7 @@ extern "C" void sdl_shim_memstat(int every_ms, int trace_kb,
                                  int trace_max, int trace_prof);
 extern "C" void sdl_shim_fps(int every_ms);
 extern "C" void sdl_shim_scale_sharp(int on);
+extern "C" void sdl_shim_scale_mode(int mode);
 extern "C" void sdl_shim_cycle_ms(int ms);
 extern "C" void sdl_shim_events(int on);
 extern "C" void sdl_shim_recinput(int on);
@@ -1580,6 +1581,7 @@ extern "C" int ag_cxx_main(int argc, char **argv)
     int trace_max = 0;
     int trace_prof = 0;
     int sharp = 0;
+    int scale_mode = -1;
     int cycle_ms = 100;
     int events = 0;
     int recinput = 0;
@@ -1664,6 +1666,9 @@ extern "C" int ag_cxx_main(int argc, char **argv)
             ag_art_pins = to_int(argv[++i]);
         } else if (same(argv[i], "-artcache") && i + 1 < argc) {
             ag_art_cache_kb = to_int(argv[++i]);
+        } else if (same(argv[i], "-scale") && i + 1 < argc) {
+            /* 0 one pixel of the 2x2, 1 the average, 2 the brightest. */
+            scale_mode = to_int(argv[++i]);
         } else if (same(argv[i], "-cull") && i + 1 < argc) {
             ag_draw_cull = to_int(argv[++i]);
         } else if (same(argv[i], "-render") && i + 1 < argc) {
@@ -1815,6 +1820,9 @@ extern "C" int ag_cxx_main(int argc, char **argv)
     sdl_shim_memstat(memstat_ms, trace_kb, trace_max, trace_prof);
     sdl_shim_fps(fps_ms);
     sdl_shim_scale_sharp(sharp);
+    if (scale_mode >= 0) {
+        sdl_shim_scale_mode(scale_mode);
+    }
     sdl_shim_cycle_ms(cycle_ms);
     /* The readout and the event log are the same instrument seen two
      * ways, so -hud brings both.  -events alone is for a run left going
