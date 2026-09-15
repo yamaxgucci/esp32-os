@@ -1876,6 +1876,10 @@ static struct {
 } s_ab[2];
 static uint32_t s_ab_skipped;
 
+/* Set when a map load finishes, so the window it finished in is set
+ * aside as well - the load's tail is still in it. */
+static unsigned s_ab_load_seen;
+
 static void render_ab_bucket(void)
 {
     if (ag_render_alt == 0) {
@@ -1894,23 +1898,27 @@ static void render_ab_bucket(void)
      * worst lap over a second, which is the tell: nothing about a search area
      * costs a second.
      *
-     * Half a second is far longer than any frame this game draws and far
-     * shorter than a load, so it separates the two cleanly.
+     * The first attempt at the rule was "a worst lap over half a second",
+     * and it threw away nearly every window of real play - the game has laps
+     * that long while walking, which is the whole reason any of this is being
+     * measured.  So the rule asks the map instead: was a load running in this
+     * window, or did one finish in it.
      */
-    if (s_worst_us > 500000u) {
-        s_ab_skipped++;
-        ag_render_tight = (slot == 1u) ? 0 : 1;
-        return;
-    }
+    const bool had_load = (ag_map_loading != 0u) || (s_ab_load_seen != 0u);
 
-    s_ab[slot].windows++;
-    s_ab[slot].stalls += s_stall_n;
-    if (s_worst_us > s_ab[slot].worst_us) {
-        s_ab[slot].worst_us = s_worst_us;
+    s_ab_load_seen = 0;
+    if (had_load) {
+        s_ab_skipped++;
+    } else {
+        s_ab[slot].windows++;
+        s_ab[slot].stalls += s_stall_n;
+        if (s_worst_us > s_ab[slot].worst_us) {
+            s_ab[slot].worst_us = s_worst_us;
+        }
+        s_ab[slot].inrange += ag_render_inrange;
+        s_ab[slot].passes += ag_render_calls;
+        s_ab[slot].pre_ms += ag_layer_pre_us / 1000u;
     }
-    s_ab[slot].inrange += ag_render_inrange;
-    s_ab[slot].passes += ag_render_calls;
-    s_ab[slot].pre_ms += ag_layer_pre_us / 1000u;
 
     shim_printf("[renderab] %u load windows set aside | wide: %u win, "
                 "%u.%u stalls/win, worst %u ms, %u in range/pass, "
@@ -2087,6 +2095,7 @@ extern "C" void ag_unpack_note(unsigned protos_ms, unsigned maps_ms,
 
 extern "C" void ag_load_note(unsigned ms)
 {
+    s_ab_load_seen = 1;
     shim_printf("[load] the whole wait was %u ms (%u.%u s)\n",
                 ms, ms / 1000u, (ms % 1000u) / 100u);
 }
