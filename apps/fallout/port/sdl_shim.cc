@@ -1538,6 +1538,12 @@ unsigned ag_path_us, ag_path_n;
 unsigned ag_layer_n;
 extern "C" int ag_render_tight;
 
+/* ARGON: where the exit grids are lost between the map and the screen. */
+extern "C" unsigned ag_exit_calls = 0, ag_exit_hidden = 0, ag_exit_early = 0;
+extern "C" unsigned ag_exit_noart = 0, ag_exit_missed = 0, ag_exit_drew = 0;
+extern "C" unsigned ag_exit_w = 0, ag_exit_h = 0, ag_exit_flags = 0;
+extern "C" int ag_exit_fid = 0, ag_exit_pid = 0, ag_exit_on_map = 0;
+
 /* ARGON: the widest and the lowest-reaching art this map has actually shown,
  * in pixels from a tile's own point.  Grown in object.cc from the bounds the
  * engine itself computed while drawing; they bound the object search area
@@ -2201,6 +2207,22 @@ static void render_report(void)
     ag_render_objects2 = 0; ag_render_draw2_us = 0;
 }
 
+static void exit_report(void)
+{
+    if (ag_exit_on_map == 0 && ag_exit_calls == 0u) {
+        return;
+    }
+    shim_printf("[exitgrid t=%u] %d on the map | %u reached the drawer: "
+                "%u hidden, %u refused early, %u no art, %u missed the rect, "
+                "%u DREW | last pid %d fid 0x%08x flags 0x%x, art %ux%u\n",
+                (unsigned)ag_millis(), ag_exit_on_map, ag_exit_calls,
+                ag_exit_hidden, ag_exit_early, ag_exit_noart,
+                ag_exit_missed, ag_exit_drew, ag_exit_pid,
+                (unsigned)ag_exit_fid, ag_exit_flags, ag_exit_w, ag_exit_h);
+    ag_exit_calls = 0; ag_exit_hidden = 0; ag_exit_early = 0;
+    ag_exit_noart = 0; ag_exit_missed = 0; ag_exit_drew = 0;
+}
+
 static void layer_report(void)
 {
     if (ag_layer_n == 0u) {
@@ -2514,6 +2536,7 @@ static void memstat_service(void)
     preempt_report();
     anim_report();
     move_report();
+    exit_report();
     layer_report();
     render_report();
     draw_report();
