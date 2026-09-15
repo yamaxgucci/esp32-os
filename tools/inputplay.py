@@ -19,6 +19,7 @@ Commands:
     wait MS         do nothing for this long
     key NAME        press and release; NAME is a letter, a digit, or one of
                     esc enter space tab up down left right f1..f12
+                    home end pageup pagedown insert delete
     down NAME       press without releasing
     up NAME         release
     move X,Y        put the pointer here, in the guest's own pixels - the
@@ -35,6 +36,9 @@ Commands:
                     next glide starts from a position that is actually known
     glide X,Y       travel there in small steps, so it can be watched
     click / rclick  press and release a button where the pointer is
+    press [r]       hold the button down and leave it down
+    release [r]     let it up again.  press / glide / release is a drag, and
+                    there is no other way to write one
     say TEXT        type it, one character at a time
 
 --wait N holds off until the guest is listening, for up to N seconds: the game
@@ -74,9 +78,58 @@ HID = {
     "1": 0x1E, "2": 0x1F, "3": 0x20, "4": 0x21, "5": 0x22,
     "6": 0x23, "7": 0x24, "8": 0x25, "9": 0x26, "0": 0x27,
     "enter": 0x28, "esc": 0x29, "backspace": 0x2A, "tab": 0x2B, "space": 0x2C,
+    # The space bar under its own character as well as under its name, so
+    # that `say` can type a string with a space in it.  `say` already
+    # believed it could - it maps ' ' to ' ' on the way in - but the
+    # lookup below then found nothing and killed the whole run at that
+    # character, taking every later command with it.  A scenario that
+    # typed a date stopped dead at the gap before the time, and the run
+    # reported three unrelated failures further down.
+    " ": 0x2C,
     "f1": 0x3A, "f2": 0x3B, "f3": 0x3C, "f4": 0x3D, "f5": 0x3E, "f6": 0x3F,
     "f7": 0x40, "f8": 0x41, "f9": 0x42, "f10": 0x43, "f11": 0x44, "f12": 0x45,
     "right": 0x4F, "left": 0x50, "down": 0x51, "up": 0x52,
+    # The navigation cluster.  A list with a scroll bar answers all of these
+    # and none of them could be sent, so a whole half of a folder window's
+    # keyboard was untestable - and Home is what makes a scripted selection
+    # start from a known row instead of wherever the last click left it.
+    "insert": 0x49, "home": 0x4A, "pageup": 0x4B, "delete": 0x4C,
+    "end": 0x4D, "pagedown": 0x4E,
+    "pgup": 0x4B, "pgdn": 0x4E, "del": 0x4C,
+    # The punctuation a file name needs.  `say` looks a character up here by
+    # its own spelling, so without these it stops at the first dot of
+    # "hello.axe" - and a shell with a Run box is a shell that has to be
+    # typed at.  The ones needing shift are left out rather than faked.
+    ".": 0x37, "-": 0x2D, "/": 0x38, "=": 0x2E, ";": 0x33,
+    "period": 0x37, "minus": 0x2D, "slash": 0x38,
+    # A path needs both of these and neither needs shift on a US keyboard.
+    # Without them a scenario cannot type a destination at all: `say
+    # c:\\picked` stopped dead at the colon, and because send_key raises
+    # rather than skips, everything after it in that invocation was silently
+    # not run - thirty keystrokes and four assertions.
+    "\\": 0x31, "backslash": 0x31, "[": 0x2F, "]": 0x30, "'": 0x34,
+    ",": 0x36, "`": 0x35,
+    # The modifiers, which carry a usage id like any other key *and* a bit in
+    # every packet sent while they are held.  A real keyboard reports both and
+    # a shell that reads Alt+Tab needs both: the bit says which chord it is.
+    "leftctrl": 0xE0, "leftshift": 0xE1, "leftalt": 0xE2, "leftgui": 0xE3,
+    "rightctrl": 0xE4, "rightshift": 0xE5, "rightalt": 0xE6,
+}
+
+# ag_keymod, the bits KBDVIRT passes through to the guest.
+# What shift makes of a key, for the characters a path or a name needs.
+SHIFTED = {
+    ":": ";", "_": "-", "?": "/", "+": "=", "~": "`", "|": chr(92),
+    "!": "1", "@": "2", "#": "3", "$": "4", "%": "5", "^": "6",
+    "&": "7", "*": "8", "(": "9", ")": "0", "{": "[", "}": "]",
+    '"': "'", "<": ",", ">": ".",
+}
+
+MOD_BIT = {
+    0xE1: 0x01, 0xE5: 0x01,  # shift
+    0xE0: 0x02, 0xE4: 0x02,  # ctrl
+    0xE2: 0x04, 0xE6: 0x04,  # alt
+    0xE3: 0x08,              # gui
 }
 
 KEY_DOWN, KEY_UP = 1, 2
@@ -86,8 +139,8 @@ PTR_ABS, PTR_WHEEL = 1, 3
 BTN_LEFT, BTN_RIGHT = 0x1, 0x2
 
 
-def key_packet(typ: int, hid: int, unicode_: int) -> bytes:
-    return struct.pack("<BBHHBB", typ, 0, hid, unicode_, 0, 0)
+def key_packet(typ: int, hid: int, unicode_: int, mods: int = 0) -> bytes:
+    return struct.pack("<BBHHBB", typ, mods, hid, unicode_, 0, 0)
 
 
 def mouse_packet(buttons: int, x: int, y: int, wheel: int = 0) -> bytes:
@@ -106,6 +159,7 @@ class Guest:
         self.x = 0
         self.y = 0
         self.buttons = 0
+        self.mods = 0
 
     def _connect(self, port: int, what: str):
         """A socket the guest is actually on the other end of.
@@ -156,20 +210,46 @@ class Guest:
         return self.mouse
 
     def send_key(self, name: str, down: bool, up: bool) -> None:
+        # A character that needs shift is sent as shift plus the key that
+        # carries it, which is what a keyboard does.  Faking it by sending
+        # the character alone was the other option and it is worse: the
+        # guest would see ';' where the scenario wrote ':' and the mistake
+        # would surface as a file with the wrong name.
+        shifted = SHIFTED.get(name)
+        if shifted is not None:
+            self.mods |= MOD_BIT[0xE1]
+            s = self.keyboard()
+            s.sendall(key_packet(KEY_DOWN, 0xE1, 0, self.mods))
+            try:
+                base = HID[shifted]
+                s.sendall(key_packet(KEY_DOWN, base, ord(name), self.mods))
+                time.sleep(0.05)
+                s.sendall(key_packet(KEY_UP, base, 0, self.mods))
+            finally:
+                self.mods &= ~MOD_BIT[0xE1]
+                s.sendall(key_packet(KEY_UP, 0xE1, 0, self.mods))
+            return
+
         hid = HID.get(name.lower())
         if hid is None:
             raise SystemExit("inputplay: no key called %r" % name)
-        # A letter carries its character as well as its usage id: the game
-        # looks at the character for menu shortcuts and at the id for
-        # everything else.
+        # A letter carries its character as well as its usage id: an
+        # application looks at the character for what was typed and at the id
+        # for which key it was.
         uni = ord(name) if len(name) == 1 else 0
+        bit = MOD_BIT.get(hid, 0)
         s = self.keyboard()
         if down:
-            s.sendall(key_packet(KEY_DOWN, hid, uni))
+            # A held modifier is in the state from the moment it goes down, so
+            # its own packet carries it too - which is what a real keyboard
+            # reports and what a chord like Alt+Tab is read from.
+            self.mods |= bit
+            s.sendall(key_packet(KEY_DOWN, hid, uni, self.mods))
         if down and up:
             time.sleep(0.05)
         if up:
-            s.sendall(key_packet(KEY_UP, hid, 0))
+            s.sendall(key_packet(KEY_UP, hid, 0, self.mods))
+            self.mods &= ~bit
 
     def move(self, x: int, y: int) -> None:
         self.x, self.y = x, y
@@ -228,12 +308,29 @@ class Guest:
         s.sendall(mouse_packet(self.buttons, self.x, self.y, 0))
 
     def button(self, mask: int) -> None:
+        self.press(mask)
+        time.sleep(0.12)
+        self.release(mask)
+
+    def press(self, mask: int) -> None:
+        """Hold a button down, and leave it down.
+
+        Split out from button() because a drag cannot be expressed any other
+        way: press, then move, then release, with the moves in between
+        carrying the button still set.  A click that presses and releases in
+        one call can never drag anything, and a window manager that drags by
+        an outline is exactly the thing that needs testing.
+        """
         s = self.pointer()
         self.buttons |= mask
         s.sendall(mouse_packet(self.buttons, self.x, self.y))
-        time.sleep(0.12)
+        time.sleep(0.06)
+
+    def release(self, mask: int) -> None:
+        s = self.pointer()
         self.buttons &= ~mask
         s.sendall(mouse_packet(self.buttons, self.x, self.y))
+        time.sleep(0.06)
 
 
 def play(guest: Guest, path: str, speed: float = 1.0) -> None:
@@ -310,13 +407,27 @@ def run(guest: Guest, commands: list) -> None:
             guest.button(BTN_LEFT)
         elif verb == "rclick":
             guest.button(BTN_RIGHT)
+        elif verb == "press":
+            guest.press(BTN_RIGHT if arg[:1].lower() == "r" else BTN_LEFT)
+        elif verb == "release":
+            guest.release(BTN_RIGHT if arg[:1].lower() == "r" else BTN_LEFT)
         elif verb == "wheel":
             guest.wheel(int(arg))
         elif verb == "home":
             guest.home()
         elif verb == "glide":
-            x, _, y = arg.partition(",")
-            guest.glide(int(x), int(y))
+            # "glide X,Y" or "glide X,Y,STEPS".  The step count matters: a
+            # hand on a touchscreen moves the pointer two pixels at a time,
+            # and a scenario that only ever glides in tens tests nothing
+            # about what happens between them.  That hole is how a repaint
+            # fault that only shows at small steps stayed invisible here and
+            # had to be found on the board.
+            parts = [p.strip() for p in arg.split(",")]
+            if len(parts) == 3:
+                guest.glide(int(parts[0]), int(parts[1]), int(parts[2]))
+            else:
+                x, _, y = arg.partition(",")
+                guest.glide(int(x), int(y))
         elif verb == "say":
             for ch in arg:
                 guest.send_key(" " if ch == " " else ch, True, True)

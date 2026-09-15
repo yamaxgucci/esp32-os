@@ -144,6 +144,14 @@ static const char *pad16(const char *s)
  */
 #if defined(__XTENSA__)
 #define OPAQUE_F(x) __asm__ __volatile__("" : "+f"(x))
+#elif defined(__riscv)
+/*
+ * No F extension on the RISC-V parts this tree targets (RV32IMAC), so a double
+ * lives in integer registers and "+f" has nothing to name - and "+x" is an
+ * x86 vector register, which is what this branch used to ask for and why the
+ * image would not compile at all for a C6.
+ */
+#define OPAQUE_F(x) __asm__ __volatile__("" : "+r"(x))
 #else
 #define OPAQUE_F(x) __asm__ __volatile__("" : "+x"(x))
 #endif

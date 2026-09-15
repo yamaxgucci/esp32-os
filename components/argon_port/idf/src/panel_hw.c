@@ -18,10 +18,27 @@
 
 #include <argon/port/panel.h>
 
+/*
+ * Needed for CONFIG_ARGON_PANEL_QEMU below, and its absence is why the
+ * emulator's window was black for as long as it was.
+ *
+ * An undefined macro in #if is zero, not an error, so without this the whole
+ * file compiled down to the "there is no panel here" half and open() answered
+ * false without a word.  Everything downstream then behaved correctly and
+ * uselessly: the display driver allocated a soft surface, applications drew
+ * into it, and QEMU showed its own default 800x600 window with nothing in it.
+ *
+ * Every other file in this port includes this header.  This one was the
+ * exception, and the only visible trace was a window that was the wrong size.
+ */
+#include "sdkconfig.h"
+
 #if CONFIG_ARGON_PANEL_QEMU
 
+#include "esp_err.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_qemu_rgb.h"
+#include "esp_log.h"
 
 #include <argon/port/task.h>
 #include <argon/port/time.h>
@@ -68,7 +85,23 @@ bool ag_port_panel_open(uint16_t w, uint16_t h, void **fb)
     };
 
     esp_lcd_panel_handle_t panel = NULL;
-    if (esp_lcd_new_rgb_qemu(&cfg, &panel) != ESP_OK || panel == NULL) {
+    const esp_err_t       rc = esp_lcd_new_rgb_qemu(&cfg, &panel);
+    if (rc != ESP_OK || panel == NULL) {
+        /*
+         * Said out loud, because the silent version of this cost an afternoon.
+         * The display driver falls back to a soft surface nobody shows, and
+         * from the outside that looks exactly like an application that draws
+         * nothing: an SDL window at QEMU's own default size, staying black.
+         *
+         * ESP_ERR_NOT_SUPPORTED here means the emulator did not identify
+         * itself - either this is real hardware, or QEMU was started without
+         * the machine's `graphics=on` option, which is off by default and is
+         * what instantiates the panel at all.
+         */
+        ESP_LOGW("panel",
+                 "no QEMU RGB panel (%s); is the machine started with "
+                 "graphics=on?",
+                 esp_err_to_name(rc));
         return false;
     }
     (void)esp_lcd_panel_reset(panel);
@@ -136,6 +169,32 @@ void ag_port_panel_present(int32_t y, int32_t h)
         const bool covers = (y <= s_y0) && ((y + h) >= s_y1);
         if (!covers) {
             wait_idle();
+            /*
+             * Fifty milliseconds and still busy.  Writing the registers now
+             * would replace a request QEMU has not finished, and the rows it
+             * had not reached would never be copied at all - a torn frame
+             * rather than a dropped one, which stays on the glass until
+             * something happens to redraw those rows.  So widen this request
+             * to cover what is pending: a wider copy costs pixels, a truncated
+             * one costs correctness.
+             *
+             * Not what caused the desktop shell's first paint to arrive in
+             * halves, which was the display owner flushing before its session
+             * slot had focus (see gfx_may_present in src/dev/display.c) - but
+             * looked exactly like it, and is worth not leaving open.
+             */
+            if ((rgb[RGB_MMIO_UPDATE_STATUS] & 1u) != 0) {
+                if (s_y0 < y) {
+                    h += y - s_y0;
+                    y = s_y0;
+                }
+                if (s_y1 > y + h) {
+                    h = s_y1 - y;
+                }
+                if (y + h > (int32_t)s_h) {
+                    h = (int32_t)s_h - y;
+                }
+            }
         }
     }
 

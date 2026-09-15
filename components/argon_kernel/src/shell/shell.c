@@ -15,6 +15,7 @@
 #include <argon/codepage.h>
 #include <argon/budget.h>
 #include <argon/console.h>
+#include <argon/textpanel.h>
 #include <argon/session.h>
 #include <argon/display.h>
 #include <argon/device.h>
@@ -35,17 +36,21 @@
 
 #include <argon/btinput.h>
 #include <argon/usbinput.h>
+#include <sys/time.h>
 #include <time.h>
 
 #include <argon/net.h>
 #include <argon/ssh.h>
 #include "console/telnet_console.h"
+#include "console/uart_console.h"
+#include <argon/port/uart.h>
 #include <argon/port/bt.h>
 #include <argon/port/ble.h>
 #include <argon/port/usb.h>
 #include <argon/port/io.h>
 #include <argon/hidptr.h>
 #include <argon/port/mem.h>
+#include <argon/netprov.h>
 #include <argon/port/net.h>
 #include <argon/port/sntp.h>
 #include <argon/port/wifi.h>
@@ -72,10 +77,76 @@ typedef struct {
 
 int ag_edit_main(int argc, char **argv);
 
-static char          s_cwd[AG_PATH_MAX] = "/";
-static ag_lineedit_t s_line;
-static int           s_last_status;
-static int           s_script_depth;
+/*
+ * What belongs to ONE prompt, as against the machine it runs on.
+ *
+ * There was one prompt for as long as there was one shell, and this was
+ * four file-scope variables.  A second shell - a prompt in a window, with
+ * its own slot and its own directory - makes them four variables per
+ * instance instead, and the difference between the two kinds of state is
+ * the whole content of this struct: a working directory and a line being
+ * edited belong to a prompt, while the device registry, the journal and
+ * SYSTEM.CFG belong to the machine and stay where they are.
+ *
+ * `slot` is the session this prompt serves, or AG_SESSION_FOLLOW for the
+ * original one, which serves whichever slot is focused - that is what the
+ * system shell has always done and it is not a special case to be removed.
+ */
+#define AG_SESSION_FOLLOW (-1)
+
+/* Where this prompt starts on its own screen; the line editor draws from it. */
+typedef struct {
+    uint16_t row;
+    uint16_t col0;
+} prompt_pos_t;
+
+typedef struct {
+    char          cwd[AG_PATH_MAX];
+    ag_lineedit_t line;
+    int           last_status;
+    int           script_depth;
+    char          prompt[AG_PATH_MAX + 16];
+    prompt_pos_t  pos;
+    int           slot;
+} shell_ctx_t;
+
+static shell_ctx_t s_ctx0 = { .cwd = "/", .slot = AG_SESSION_FOLLOW };
+
+/*
+ * Which prompt is speaking, keyed by task.
+ *
+ * The alternative was to pass a context pointer through five thousand
+ * lines of command implementations, most of which have nothing to do with
+ * a prompt.  Keyed by task, the four names below go on meaning exactly
+ * what they meant - "this prompt's directory" - and resolve to the right
+ * one without a single call site changing.
+ */
+static struct {
+    ag_port_task_t task;
+    shell_ctx_t   *ctx;
+} s_ctxs[AG_SESSION_SLOTS];
+
+static shell_ctx_t *sh(void)
+{
+    const ag_port_task_t me = ag_port_task_self();
+
+    for (unsigned i = 0; i < sizeof(s_ctxs) / sizeof(s_ctxs[0]); i++) {
+        if (s_ctxs[i].task == me && s_ctxs[i].ctx != NULL) {
+            return s_ctxs[i].ctx;
+        }
+    }
+    return &s_ctx0;
+}
+
+#define s_cwd          (sh()->cwd)
+#define s_line         (sh()->line)
+#define s_last_status  (sh()->last_status)
+#define s_script_depth (sh()->script_depth)
+#define s_prompt       (sh()->prompt)
+#define s_prompt_pos   (sh()->pos)
+
+/* Which slot this prompt belongs to; defined below. */
+static int my_slot(void);
 
 #define AG_SHELL_SCRIPT_MAX_DEPTH 8
 
@@ -155,13 +226,28 @@ ag_err_t ag_shell_set_cwd(const char *path)
         return -AG_ERANGE;
     }
     strcpy(s_cwd, path);
-    (void)ag_session_set_cwd(ag_session_focused(), path);
+    (void)ag_session_set_cwd(my_slot(), path);
     return AG_OK;
+}
+
+/*
+ * Which session slot this prompt's directory belongs to.
+ *
+ * The original prompt serves whoever is in front and follows the
+ * focus; a prompt of its own belongs to one slot and must not be
+ * dragged about by somebody else's Alt+digit.
+ */
+static int my_slot(void)
+{
+    const shell_ctx_t *c = sh();
+
+    return (c->slot == AG_SESSION_FOLLOW) ? ag_session_focused()
+                                          : c->slot;
 }
 
 static void sync_cwd_from_session(void)
 {
-    const char *cwd = ag_session_cwd(ag_session_focused());
+    const char *cwd = ag_session_cwd(my_slot());
     if (cwd != NULL && cwd[0] == '/') {
         strncpy(s_cwd, cwd, sizeof(s_cwd) - 1);
         s_cwd[sizeof(s_cwd) - 1] = '\0';
@@ -198,13 +284,7 @@ static void pick_initial_cwd(void)
 /* Line rendering                                                         */
 /* ---------------------------------------------------------------------- */
 
-typedef struct {
-    uint16_t row;
-    uint16_t col0;
-} prompt_pos_t;
-
-static char         s_prompt[AG_PATH_MAX + 16];
-static prompt_pos_t s_prompt_pos;
+/* prompt_pos_t and both of these now live in shell_ctx_t, above. */
 
 /* Caller holds the console lock. */
 static void redraw_line_locked(const ag_lineedit_t *le, const prompt_pos_t *pos)
@@ -410,6 +490,99 @@ static int cmd_mem(int argc, char **argv)
     return 0;
 }
 
+/* Case-insensitive compare of the first `len` bytes against a whole word. */
+static bool word_is(const char *a, size_t len, const char *lit)
+{
+    for (size_t i = 0; i < len; i++) {
+        char c = a[i];
+        if (c >= 'A' && c <= 'Z') {
+            c = (char)(c + 32);
+        }
+        if (lit[i] == 0 || c != lit[i]) {
+            return false;
+        }
+    }
+    return lit[len] == 0;
+}
+
+/*
+ * mode - the size of the text screen, the way DOS spelled it.
+ *
+ *     mode                       what it is now
+ *     mode con cols=40 lines=25  change it
+ *
+ * The change is not written anywhere: `[console] cols/rows` in SYSTEM.CFG is
+ * what survives a reset.  This is for trying a size on the display that is
+ * actually plugged in before committing to it, which is exactly the case where
+ * guessing from a datasheet goes wrong.
+ */
+static int cmd_mode(int argc, char **argv)
+{
+    ag_console_lock();
+    const ag_screen_t *scr = ag_console_screen();
+    uint16_t cols = scr->cols, rows = scr->rows;
+    ag_console_unlock();
+
+    if (argc < 2) {
+        ag_console_printf("con: cols=%u lines=%u\n", (unsigned)cols,
+                          (unsigned)rows);
+        /* What `auto` would pick, and where it would have got it from. */
+        uint16_t pcols = 0, prows = 0;
+        if (ag_textpanel_geometry(&pcols, &prows) == AG_OK) {
+            ag_console_printf("panel: %ux%u cells\n", (unsigned)pcols,
+                              (unsigned)prows);
+        } else if (ag_display_text_cells(&pcols, &prows)) {
+            uint16_t w = 0, h = 0;
+            (void)ag_display_size(&w, &h);
+            ag_console_printf("screen: %ux%u px = %ux%u cells\n", (unsigned)w,
+                              (unsigned)h, (unsigned)pcols, (unsigned)prows);
+        }
+        return 0;
+    }
+
+    for (int i = 1; i < argc; i++) {
+        const char *a = argv[i];
+        /* "con" and "con:" are the device this command has always addressed. */
+        if (word_is(a, strlen(a), "con") || word_is(a, strlen(a), "con:")) {
+            continue;
+        }
+
+        const char *eq = strchr(a, '=');
+        if (eq == NULL) {
+            ag_console_printf("mode: don't understand '%s'\n", a);
+            return 1;
+        }
+
+        const int    n    = atoi(eq + 1);
+        const size_t klen = (size_t)(eq - a);
+        if (word_is(a, klen, "cols")) {
+            cols = (uint16_t)n;
+        } else if (word_is(a, klen, "lines") || word_is(a, klen, "rows")) {
+            rows = (uint16_t)n;
+        } else {
+            ag_console_printf("mode: no such setting '%.*s'\n", (int)klen, a);
+            return 1;
+        }
+        if (n < 1) {
+            ag_console_printf("mode: %s must be at least 1\n", a);
+            return 1;
+        }
+    }
+
+    const ag_err_t err = ag_console_resize(cols, rows);
+    if (err != AG_OK) {
+        ag_console_printf("mode: %ux%u refused (%d); at most %ux%u, and it "
+                          "has to fit in memory\n",
+                          (unsigned)cols, (unsigned)rows, (int)err,
+                          (unsigned)AG_SCREEN_MAX_COLS,
+                          (unsigned)AG_SCREEN_MAX_ROWS);
+        return 1;
+    }
+    ag_console_printf("con: cols=%u lines=%u\n", (unsigned)cols,
+                      (unsigned)rows);
+    return 0;
+}
+
 static int cmd_cls(int argc, char **argv)
 {
     (void)argc;
@@ -551,9 +724,125 @@ static int cmd_uptime(int argc, char **argv)
     return 0;
 }
 
+/*
+ * `date set 2026-09-11 14:30[:00]`, UTC, the same clock `date` prints.
+ *
+ * There is no battery under this clock on any board we have, so this is
+ * lost at every power cut and has to be typed again - which is exactly why
+ * it has to exist.  Until now the only way to set the time at all was
+ * `date sync` over the network, and on the CYD bringing the radio up
+ * damages its SYSTEM.CFG, so that board could not have a clock.
+ */
+static int date_set(int argc, char **argv)
+{
+    int n[6] = { 0, 0, 0, 0, 0, 0 };
+
+    if (argc < 4) {
+        ag_console_puts("date set YYYY-MM-DD HH:MM[:SS]   (UTC)\n");
+        return 1;
+    }
+
+    /*
+     * Parsed by hand rather than with sscanf: nothing else in the shell
+     * needs it, and pulling the scanning half of the C library into the
+     * firmware to read six integers is not a trade worth making on a part
+     * whose image is counted in kilobytes.
+     */
+    int got = 0;
+    for (int a = 2; a <= 3; a++) {
+        const char *c = argv[a];
+        while (*c != '\0' && got < 6) {
+            if (*c < '0' || *c > '9') {
+                c++;
+                continue;
+            }
+            int v = 0;
+            while (*c >= '0' && *c <= '9') {
+                v = v * 10 + (*c - '0');
+                c++;
+            }
+            n[got++] = v;
+        }
+    }
+    if (got < 5) {
+        ag_console_puts("date set YYYY-MM-DD HH:MM[:SS]   (UTC)\n");
+        return 1;
+    }
+
+    const int y = n[0], mo = n[1], d = n[2];
+    const int h = n[3], mi = n[4], sec = n[5];
+    if (y < 1970 || mo < 1 || mo > 12 || d < 1 || d > 31 || h > 23 ||
+        mi > 59 || sec > 60) {
+        ag_console_puts("date set: that is not a date and time\n");
+        return 1;
+    }
+
+    struct tm tm;
+    memset(&tm, 0, sizeof(tm));
+    tm.tm_year = y - 1900;
+    tm.tm_mon = mo - 1;
+    tm.tm_mday = d;
+    tm.tm_hour = h;
+    tm.tm_min = mi;
+    tm.tm_sec = sec;
+    tm.tm_isdst = 0;
+
+    /* No timezone is set on the board, so mktime's "local" is UTC. */
+    const time_t t = mktime(&tm);
+    if (t == (time_t)-1) {
+        ag_console_puts("date set: that is not a date and time\n");
+        return 1;
+    }
+
+    struct timeval tv;
+    tv.tv_sec = t;
+    tv.tv_usec = 0;
+    if (settimeofday(&tv, NULL) != 0) {
+        ag_console_puts("date set: the clock refused it\n");
+        return 1;
+    }
+    return 0;
+}
+
+/*
+ * `prompt 2` - another shell, in the slot named, with its own directory.
+ *
+ * Not a new kind of thing: the slots have always been described as "a
+ * shell per slot, plus an application", and until now the one shell moved
+ * between them as the focus did.  This gives a slot a prompt that stays
+ * there - which is what a window on the desktop will show.
+ */
+static int cmd_prompt(int argc, char **argv)
+{
+    if (argc < 2) {
+        ag_console_puts("prompt <slot> [dir]   (slot 2..4)\n");
+        return 1;
+    }
+    const int slot = atoi(argv[1]) - 1;
+    const ag_err_t err =
+        ag_shell_start_in_slot_at(slot, (argc > 2) ? argv[2] : NULL);
+    if (err == -AG_EEXIST) {
+        ag_console_printf("slot %s already has its own prompt\n", argv[1]);
+        return 1;
+    }
+    if (err != AG_OK) {
+        ag_console_printf("prompt: %s\n",
+                          ag_loader_api()->sys->strerror(err));
+        return 1;
+    }
+    ag_console_printf("slot %s has its own prompt now; Alt+%s to see it\n",
+                      argv[1], argv[1]);
+    return 0;
+}
+
 static int cmd_date(int argc, char **argv)
 {
-    if (argc >= 2 && ag_path_icmp(argv[1], "sync") == 0) {
+    if (argc >= 2 && ag_path_icmp(argv[1], "set") == 0) {
+        const int err = date_set(argc, argv);
+        if (err != 0) {
+            return err;
+        }
+    } else if (argc >= 2 && ag_path_icmp(argv[1], "sync") == 0) {
 #if AG_PORT_HAS_SNTP
         const char *server = (argc >= 3) ? argv[2] : NULL;
         ag_console_puts("syncing time...\n");
@@ -583,7 +872,8 @@ static int cmd_date(int argc, char **argv)
     /* Before a sync the clock is seconds since 1970 plus uptime, i.e. still in
      * 1970 - say so rather than let a 1970 date look like a bug. */
     if (tm.tm_year + 1900 < 2000) {
-        ag_console_puts("(clock not set - `date sync` to set it from the network)\n");
+        ag_console_puts("(clock not set - `date set` by hand, or `date sync`"
+                        " from the network)\n");
     }
     return 0;
 }
@@ -2057,7 +2347,7 @@ static int wifi_status(void)
     }
 
     uint32_t addr = 0;
-    if (ag_net_ready() && ag_port_net_ifaddr(&addr) == AG_OK) {
+    if (ag_net_ready() && ag_netprov_ifaddr(&addr) == AG_OK) {
         ag_console_printf("address %u.%u.%u.%u\n", (unsigned)(addr >> 24),
                           (unsigned)((addr >> 16) & 0xffu),
                           (unsigned)((addr >> 8) & 0xffu),
@@ -4446,14 +4736,28 @@ static int cmd_slots(int argc, char **argv)
     ag_session_info(slots);
     const int focused = ag_session_focused();
 
-    ag_console_puts("  slot  pid   prio     name\n");
+    ag_console_puts("  slot  pid   prio     name      directory\n");
     ag_console_printf("  sys%s  -     -        system\n",
                       focused == AG_SESSION_SYSTEM ? "*" : " ");
     for (int i = 0; i < AG_SESSION_SLOTS; i++) {
         const int shown = ag_session_display_number(i);
         if (slots[i].pid == AG_PID_KERNEL) {
-            ag_console_printf("  %d%s   -     -        shell\n", shown,
-                              focused == i ? "*" : " ");
+            /*
+             * And where that shell is standing.  Two prompts are only
+             * worth having if they can be in two places, so the
+             * listing that names them says which place each is in -
+             * the one thing about a second prompt that cannot be seen
+             * from the screen of the first.
+             */
+            char        dos[AG_PATH_MAX];
+            const char *at = ag_session_cwd(i);
+            if (at != NULL) {
+                ag_shell_dos_path(at, dos, sizeof(dos));
+                at = dos;
+            }
+            ag_console_printf("  %d%s   -     -        shell     %s\n", shown,
+                              focused == i ? "*" : " ",
+                              (at != NULL) ? at : "/");
         } else {
             ag_proc_prio_t pr = AG_PRIO_NORMAL;
             (void)ag_proc_get_priority(slots[i].pid, &pr);
@@ -4625,6 +4929,102 @@ static int cmd_beep(int argc, char **argv)
     return 0;
 }
 
+/*
+ * Raw serial bridge: hand UART0 (the console) straight to another UART, byte
+ * for byte, until the board is reset.  The board becomes a transparent USB-UART
+ * for a chip wired to that other port - esptool (or anything) on the PC then
+ * talks to that chip through the board.
+ *
+ * The console dies the instant this starts: UART0 stops being a console and
+ * becomes a wire, so nothing the system prints can corrupt the stream.  That is
+ * the whole point, and it is why the only way out is a reset.  It is entered
+ * deliberately, and it never returns.
+ *
+ * esptool's DTR/RTS auto-reset toggles THIS board (that is how the CYD itself is
+ * flashed), not the far chip - so on the PC use `--before no_reset --after
+ * no_reset` and put the far chip into download mode yourself.
+ */
+static int cmd_uartbridge(int argc, char **argv)
+{
+    if (argc < 2) {
+        ag_console_puts("usage: uartbridge <port> [baud]\n");
+        ag_console_puts("  bridges UART0 (the console) <-> uart<port>, raw, "
+                        "until reset\n");
+        ag_console_puts("  the console goes silent while it runs - that is "
+                        "expected\n");
+        return 1;
+    }
+
+    const int      port = atoi(argv[1]);
+    const uint32_t baud =
+        (argc > 2) ? (uint32_t)strtoul(argv[2], NULL, 10) : 115200u;
+
+    if (port <= 0 || port >= AG_PORT_UART_PORTS ||
+        port == AG_PORT_UART_CONSOLE) {
+        ag_console_printf("uartbridge: <port> must be another UART, not %d "
+                          "(the console)\n", AG_PORT_UART_CONSOLE);
+        return 1;
+    }
+    if (baud == 0) {
+        ag_console_puts("uartbridge: baud must be non-zero\n");
+        return 1;
+    }
+
+    const ag_board_uart_t *cfg = &ag_board()->uart[port];
+    if (cfg->tx < 0 && cfg->rx < 0) {
+        ag_console_printf("uartbridge: uart%d has no pins; set [uart%d] tx/rx "
+                          "in C:\\BOARD.CFG\n", port, port);
+        return 1;
+    }
+
+    const ag_port_uart_cfg_t ucfg = {
+        .baud = baud, .data_bits = 8, .parity = 0, .stop_bits = 1,
+    };
+    ag_err_t err = ag_port_uart_open(port, &ucfg, 8192, 2048);
+    if (err != AG_OK) {
+        ag_console_printf("uartbridge: uart%d would not open (%d)\n", port,
+                          (int)err);
+        return 1;
+    }
+    (void)ag_port_uart_pins(port, cfg->tx, cfg->rx);
+
+    ag_console_printf("bridge: UART0 <-> uart%d at %u baud. The console is a "
+                      "wire now; reset to exit.\n", port, (unsigned)baud);
+    ag_console_printf("PC: esptool --port <this COM> --baud %u --before "
+                      "no_reset --after no_reset ...\n", (unsigned)baud);
+    ag_console_sync();
+
+    /* UART0 stops being a console and becomes a plain port we drive directly.
+     * The driver stays installed, so reads and writes on it keep working. */
+    ag_uart_console_detach(AG_PORT_UART_CONSOLE);
+    (void)ag_port_uart_flush(AG_PORT_UART_CONSOLE);
+    if (baud != 115200u) {
+        (void)ag_port_uart_config(AG_PORT_UART_CONSOLE, &ucfg);
+    }
+
+    /*
+     * Copy both ways, forever.  The short read timeouts block (and so yield the
+     * CPU), which keeps the watchdog fed and the rest of the system running;
+     * 256 bytes is far more than a 2 ms window holds at these rates, so nothing
+     * is dropped for want of buffer here.
+     */
+    static uint8_t from_pc[256];
+    static uint8_t from_chip[256];
+    for (;;) {
+        const int32_t n =
+            ag_port_uart_read(AG_PORT_UART_CONSOLE, from_pc, sizeof(from_pc), 2);
+        if (n > 0) {
+            (void)ag_port_uart_write(port, from_pc, (size_t)n);
+        }
+        const int32_t m =
+            ag_port_uart_read(port, from_chip, sizeof(from_chip), 2);
+        if (m > 0) {
+            (void)ag_port_uart_write(AG_PORT_UART_CONSOLE, from_chip, (size_t)m);
+        }
+    }
+    /* not reached */
+}
+
 static const ag_command_t k_commands[] = {
     {"help", "", "list these commands", cmd_help},
     {"ver", "", "version and hardware", cmd_ver},
@@ -4636,11 +5036,13 @@ static const ag_command_t k_commands[] = {
     {"ptr", "", "where the pointer is, and how much it has said", cmd_ptr},
 #endif
     {"uptime", "", "time since reset", cmd_uptime},
-    {"date", "[sync [server]]", "show the clock, or set it from the network", cmd_date},
+    {"date", "[set D T | sync [srv]]", "show the clock, or set it", cmd_date},
+    {"prompt", "<slot>", "give a slot a shell of its own", cmd_prompt},
     {"cls", "", "clear the screen", cmd_cls},
     {"echo", "<text>", "print text", cmd_echo},
     {"color", "<fg> <bg>", "set text colours", cmd_color},
     {"chcp", "[437|866|1251]", "screen code page", cmd_chcp},
+    {"mode", "[con cols=N lines=N]", "text screen size", cmd_mode},
     {"fm", "[left] [right]", "file manager, two panels", cmd_fm},
     {"edit", "[file]", "create or edit a text file", cmd_edit},
     {"gfxdump", "[/live] <file.ppm>", "save framebuffer as PPM", cmd_gfxdump},
@@ -4649,6 +5051,9 @@ static const ag_command_t k_commands[] = {
      "modules: list, load, install to C:, unload, I2C probe", cmd_drv},
     {"io", "[pin [mode]] | i2c <bus> | spi <bus> <hex...> | xclk <pin> [hz] | adc [ch]",
      "pins and buses", cmd_io},
+    {"uartbridge", "<port> [baud]",
+     "console <-> another UART, raw, until reset (flash a wired chip from the PC)",
+     cmd_uartbridge},
     {"beep", "[hz] [ms]", "a tone on /dev/pcm0", cmd_beep},
     {"power", "[full|eco|doze|screen on|off|auto on|off]",
      "the clock, the screen, and what applications make of it", ag_cmd_power},
@@ -5073,6 +5478,147 @@ static void show_prompt(void)
     ag_console_unlock();
 }
 
+/* One prompt, for ever; defined at the bottom, beside the boot entry. */
+static void prompt_loop(void);
+
+/* The prompts that belong to one slot each; see ag_shell_start_in_slot. */
+static shell_ctx_t *s_ctx[AG_SESSION_SLOTS];
+
+/*
+ * Is the slot this prompt serves the one in front?
+ *
+ * Always true for the original prompt, which serves whichever slot is
+ * focused - that is what the system shell has always done.
+ */
+/*
+ * May this prompt read keys now?
+ *
+ * The original shell follows the focus: there is one keyboard, and it may
+ * only read when its slot is the one in front.  A prompt started in a slot
+ * of its own is different, and this is what a window on the desktop needs:
+ * it is never in front - the desktop is - and its keys do not come from the
+ * keyboard at all.  They are put into its queue by whoever IS in front,
+ * with ag_console_post_to_slot, and nobody else will ever take them out.
+ *
+ * It waited for a focus it could not be given, so sixteen keys typed into
+ * the desktop's prompt window sat in the queue and the shell above them
+ * spun at fifty milliseconds a turn, for ever.
+ */
+static bool my_slot_is_focused(void);
+
+static bool may_read_keys(void)
+{
+    if (sh()->slot != AG_SESSION_FOLLOW) {
+        return true; /* its own slot, its own queue, its own screen */
+    }
+    return ag_session_shell_owns_keyboard() && my_slot_is_focused();
+}
+
+static bool my_slot_is_focused(void)
+{
+    const shell_ctx_t *c = sh();
+    const int          f = ag_session_focused();
+
+    if (c->slot != AG_SESSION_FOLLOW) {
+        return c->slot == f;
+    }
+
+    /*
+     * The original prompt follows the focus - and stands aside for a slot
+     * that has a prompt of its own.
+     *
+     * There is one keyboard and one queue, so two prompts that both
+     * believe they are in front do not take turns: they take a character
+     * each.  `cd c:\\drv` typed at a slot with its own prompt arrived
+     * there as `c c:\\drv`, the 'd' having gone to the other one.
+     */
+    return !(f >= 0 && f < AG_SESSION_SLOTS && s_ctx[f] != NULL);
+}
+
+/*
+ * The extra prompts, allocated when one is asked for.
+ *
+ * Statically these were 2560 bytes of DRAM this image does not have - a
+ * working directory, a line editor and a prompt string each, times every
+ * slot, for a feature most boots never use.  A second prompt is optional
+ * and now costs nothing until somebody asks for one.
+ */
+static void shell_instance(void *arg)
+{
+    const int    slot = (int)(intptr_t)arg;
+    shell_ctx_t *c = s_ctx[slot];
+
+    /* Register before anything prints: sh() has to find this task. */
+    for (unsigned i = 0; i < sizeof(s_ctxs) / sizeof(s_ctxs[0]); i++) {
+        if (s_ctxs[i].ctx == NULL) {
+            s_ctxs[i].task = ag_port_task_self();
+            s_ctxs[i].ctx = c;
+            break;
+        }
+    }
+
+    (void)ag_console_bind_task(slot);
+    ag_lineedit_init(&c->line);
+    prompt_loop();
+}
+
+ag_err_t ag_shell_start_in_slot_at(int slot, const char *cwd)
+{
+    if (slot < 0 || slot >= AG_SESSION_SLOTS) {
+        return -AG_EINVAL;
+    }
+    if (s_ctx[slot] != NULL) {
+        return -AG_EEXIST; /* this slot already has a prompt of its own */
+    }
+
+    shell_ctx_t *c =
+        (shell_ctx_t *)ag_port_alloc(sizeof(*c), AG_MEM_BYTE);
+    if (c == NULL) {
+        return -AG_ENOMEM;
+    }
+    memset(c, 0, sizeof(*c));
+    /*
+     * Where it starts.  A prompt that opens in the directory being
+     * worked in is worth a line of code: the alternative is that every
+     * window begins at the root and the first thing anybody types is a
+     * cd.
+     */
+    if (cwd == NULL || cwd[0] == '\0' ||
+        ag_path_resolve(cwd, "/", c->cwd, sizeof(c->cwd)) != AG_OK) {
+        strcpy(c->cwd, "/");
+    }
+    c->slot = slot;
+    /*
+     * And told to the session, which is where a slot's directory
+     * actually lives - the context is a working copy that the prompt
+     * loop reads back from there every time round.  Setting only the
+     * copy loses it before the first prompt is drawn.
+     */
+    (void)ag_session_set_cwd(slot, c->cwd);
+    s_ctx[slot] = c;
+
+    /*
+     * Its own stack, and not a small one: the commands this prompt can run
+     * are the same ones the first can, and `cp`, `zip` and `wifi` all hold
+     * kilobytes of locals.  The figure is the one the system shell's own
+     * task was given.
+     */
+    ag_port_task_t t;
+    if (!ag_port_task_create(shell_instance, "shell2", 8192,
+                             (void *)(intptr_t)slot, 5, 0, 0, &t)) {
+        ag_port_free(c);
+        s_ctx[slot] = NULL;
+        return -AG_ENOMEM;
+    }
+    ag_log(AG_LOG_INFO, "shell", "a second prompt in slot %d", slot + 1);
+    return AG_OK;
+}
+
+ag_err_t ag_shell_start_in_slot(int slot)
+{
+    return ag_shell_start_in_slot_at(slot, NULL);
+}
+
 void ag_shell_run(void)
 {
     ag_lineedit_init(&s_line);
@@ -5103,9 +5649,29 @@ void ag_shell_run(void)
         "Alt+1..4 / Alt+Tab = user slots; Ctrl+\\ = system shell "
         "(again = kill last app).\n");
 
+    prompt_loop();
+}
+
+/*
+ * One prompt, for as long as the machine runs.
+ *
+ * Split out of ag_shell_run because that function is the BOOT entry: it
+ * replays AUTOEXEC, prints the banner and clears the recovery streak, and
+ * a second prompt calling it did all three again - which read on the
+ * transcript as the machine having restarted.
+ */
+static void prompt_loop(void)
+{
     for (;;) {
-        /* App in the focused slot owns the keyboard; shell waits. */
-        while (!ag_session_shell_owns_keyboard()) {
+        /*
+         * App in the focused slot owns the keyboard; shell waits.
+         *
+         * A prompt bound to a slot waits for ITS slot to be the focused
+         * one as well.  There is one keyboard: two prompts may both be
+         * alive, with their own directories and their own screens, and
+         * only the one in front reads it.
+         */
+        while (!may_read_keys()) {
             ag_port_task_delay(ag_port_ms_to_ticks(50));
         }
 
@@ -5118,7 +5684,7 @@ void ag_shell_run(void)
 
         bool done = false;
         while (!done) {
-            if (!ag_session_shell_owns_keyboard()) {
+            if (!may_read_keys()) {
                 ag_console_lock();
                 ag_console_set_live(NULL, NULL);
                 ag_console_unlock();
@@ -5151,6 +5717,19 @@ void ag_shell_run(void)
                 if (s_line.len > 0) {
                     ag_lineedit_remember(&s_line, s_line.buf);
                     s_last_status = ag_shell_execute(s_line.buf);
+                    if (sh()->slot != AG_SESSION_FOLLOW) {
+                        /*
+                         * One line per command, because a prompt in a slot
+                         * of its own is out of sight: what it prints goes to
+                         * that slot's screen, and that screen lives behind
+                         * somebody's window.  A refusal would otherwise be
+                         * invisible and look exactly like a key that never
+                         * arrived - which is precisely how it looked while
+                         * this was being found.
+                         */
+                        ag_log(AG_LOG_INFO, "shell", "slot %d ran '%s' -> %d",
+                               sh()->slot, s_line.buf, (int)s_last_status);
+                    }
                 }
                 done = true;
                 break;

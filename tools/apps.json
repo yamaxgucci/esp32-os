@@ -18,662 +18,301 @@
   "defaults": {
     "arch": "xtensa",
     "gcc": "xtensa-esp32s3-elf-gcc",
-    "include": [
-      "sdk/include"
-    ],
+    "include": ["sdk/include"],
     "cflags": "-Os -ffunction-sections -fdata-sections"
   },
   "apps": [
+    { "out": "HELLO.AXE", "group": "core", "src": ["apps/hello/hello.c"] },
+    { "out": "DISK.AXE", "group": "core", "src": ["apps/disk/disk.c"] },
+    { "out": "DEVS.AXE", "group": "core", "src": ["apps/devs/devs.c"] },
+    { "out": "SPIN.AXE", "group": "core", "src": ["apps/spin/spin.c"] },
+    { "out": "PWR.AXE", "group": "core", "src": ["apps/pwr/pwr.c"] },
+    { "out": "LEAK.AXE", "group": "core", "src": ["apps/leak/leak.c"] },
+    { "out": "THREADS.AXE", "group": "core", "src": ["apps/threads/threads.c"] },
+    { "out": "CRASH.AXE", "group": "core", "src": ["apps/crash/crash.c"] },
+    { "out": "EDIT.AXE", "group": "core", "src": ["apps/edit/edit.c"] },
+    { "out": "GFXDEMO.AXE", "group": "core", "src": ["apps/gfxdemo/gfxdemo.c"] },
     {
-      "out": "HELLO.AXE",
-      "group": "core",
-      "src": [
-        "apps/hello/hello.c"
-      ]
-    },
-    {
-      "out": "DISK.AXE",
-      "group": "core",
-      "src": [
-        "apps/disk/disk.c"
-      ]
-    },
-    {
-      "out": "DEVS.AXE",
-      "group": "core",
-      "src": [
-        "apps/devs/devs.c"
-      ]
-    },
-    {
-      "out": "SPIN.AXE",
-      "group": "core",
-      "src": [
-        "apps/spin/spin.c"
-      ]
-    },
-    {
-      "out": "PWR.AXE",
-      "group": "core",
-      "src": [
-        "apps/pwr/pwr.c"
-      ]
-    },
-    {
-      "out": "LEAK.AXE",
-      "group": "core",
-      "src": [
-        "apps/leak/leak.c"
-      ]
-    },
-    {
-      "out": "THREADS.AXE",
-      "group": "core",
-      "src": [
-        "apps/threads/threads.c"
-      ]
-    },
-    {
-      "out": "CRASH.AXE",
-      "group": "core",
-      "src": [
-        "apps/crash/crash.c"
-      ]
-    },
-    {
-      "out": "CXXTEST.AXE",
-      "group": "core",
-      "include": [
-        "apps/common/cxx"
-      ],
-      "src": [
-        "apps/cxxtest/cxxtest.cpp",
-        "apps/common/cxx/cxx_rt.cpp"
-      ]
-    },
-    {
-      "out": "SDLTEST.AXE",
-      "group": "core",
-      "include": [
-        "apps/common/cxx",
-        "apps/fallout/port"
-      ],
+      "out": "DESKTOP.AXE", "group": "core",
+      "_note": "the Win 3.11-style shell; plan and phases in docs/plans/desktop.md",
+      "include": ["apps/desktop"],
       "cflags": "-Os -ffunction-sections -fdata-sections -fno-builtin",
-      "libs": [
-        "stdc++"
-      ],
-      "src": [
-        "apps/fallout/port/sdltest.cc",
-        "apps/fallout/port/sdl_shim.cc",
-        "apps/common/cxx/cxx_rt.cpp",
-        "apps/common/cxx/cxx_throw.cpp",
-        "apps/common/cxx/cxx_hosted.c",
-        "apps/common/libc/libc_shim.c"
-      ]
+      "src": ["apps/desktop/desktop.c", "apps/desktop/dsk_rect.c",
+              "apps/desktop/dsk_layout.c", "apps/desktop/dsk_paint.c",
+              "apps/desktop/dsk_paint_surface.c",
+              "apps/desktop/dsk_paint_band.c", "apps/desktop/dsk_cursor.c",
+              "apps/desktop/dsk_wm.c", "apps/desktop/dsk_menu.c",
+              "apps/desktop/dsk_dlg.c", "apps/desktop/dsk_icons.c",
+              "apps/desktop/dsk_folder.c", "apps/desktop/dsk_run.c",
+              "apps/desktop/dsk_clock.c",
+              "apps/desktop/dsk_ops.c", "apps/desktop/dsk_ini.c",
+              "apps/desktop/dsk_kbd.c",
+              "apps/desktop/dsk_oskbd.c",
+              "apps/desktop/dsk_term.c",
+              "apps/common/fsops/fsops.c", "apps/common/fsops/fsops_argon.c"]
     },
     {
-      "out": "CXXSTL.AXE",
-      "group": "core",
-      "include": [
-        "apps/common/cxx"
-      ],
-      "cflags": "-Os -ffunction-sections -fdata-sections -fno-builtin",
-      "libs": [
-        "stdc++"
-      ],
-      "src": [
-        "apps/cxxtest/stltest.cpp",
-        "apps/common/cxx/cxx_rt.cpp",
-        "apps/common/cxx/cxx_throw.cpp",
-        "apps/common/cxx/cxx_hosted.c",
-        "apps/common/libc/libc_shim.c"
-      ]
-    },
-    {
-      "out": "EDIT.AXE",
-      "group": "core",
-      "src": [
-        "apps/edit/edit.c"
-      ]
-    },
-    {
-      "out": "GFXDEMO.AXE",
-      "group": "core",
-      "src": [
-        "apps/gfxdemo/gfxdemo.c"
-      ]
-    },
-    {
-      "out": "MARAUDER.AXE",
-      "group": "core",
+      "out": "MARAUDER.AXE", "group": "core",
       "_note": "ESP32-Marauder port as a loadable .AXE (Maxim's requirement); UI via gfx->present bands, radio via api->wifimon. Needs the board (touch/display/radio); compiled here to keep it from rotting.",
-      "include": [
-        "apps/marauder"
-      ],
+      "include": ["apps/marauder"],
       "cflags": "-Os -ffunction-sections -fdata-sections -fno-builtin",
-      "src": [
-        "apps/marauder/marauder.c",
-        "apps/marauder/mrd_gfx.c",
-        "apps/marauder/mrd_menu.c",
-        "apps/marauder/mrd_scan.c",
-        "apps/marauder/mrd_wifi.c",
-        "apps/marauder/mrd_bt.c",
-        "apps/marauder/mrd_spam.c"
-      ]
+      "src": ["apps/marauder/marauder.c", "apps/marauder/mrd_gfx.c",
+              "apps/marauder/mrd_menu.c", "apps/marauder/mrd_scan.c",
+              "apps/marauder/mrd_wifi.c", "apps/marauder/mrd_bt.c",
+              "apps/marauder/mrd_spam.c"]
     },
     {
-      "out": "GFXBENCH.AXE",
-      "group": "core",
+      "out": "GFXBENCH.AXE", "group": "core",
       "_note": "native backend only; the LVGL twins are in apps/gfxbench/build.py",
-      "include": [
-        "apps/common/libc",
-        "apps/gfxbench"
-      ],
+      "include": ["apps/common/libc", "apps/gfxbench"],
       "cflags": "-Os -ffunction-sections -fdata-sections -fno-builtin -Wno-unused -Wno-sign-compare",
-      "src": [
-        "apps/gfxbench/gfxbench.c",
-        "apps/gfxbench/native_draw.c",
-        "apps/common/libc/libc_shim.c"
-      ]
+      "src": ["apps/gfxbench/gfxbench.c", "apps/gfxbench/native_draw.c",
+              "apps/common/libc/libc_shim.c"]
     },
     {
-      "out": "TUBEBENCH.AXE",
-      "group": "core",
+      "out": "TUBEBENCH.AXE", "group": "core",
       "_note": "the one-dimensional valve model; read next to `cktbench baked`",
-      "include": [
-        "apps/common",
-        "apps/common/ckt",
-        "apps/common/tube",
-        "apps/common/libc",
-        "apps/tubebench"
-      ],
+      "include": ["apps/common", "apps/common/ckt", "apps/common/tube",
+                  "apps/common/libc", "apps/tubebench"],
       "cflags": "-Os -ffunction-sections -fdata-sections -fno-builtin",
-      "src": [
-        "apps/tubebench/tubebench.c",
-        "apps/common/tube/ag_tube.c",
-        "apps/common/tube/ag_biq.c",
-        "apps/common/tube/ag_os.c",
-        "apps/common/tube/ag_amp.c",
-        "apps/common/tube/ag_tone.c",
-        "apps/common/ckt/ag_mathf.c",
-        "apps/common/ckt/ag_ckt.c",
-        "apps/common/libc/libc_shim.c"
-      ]
+      "src": ["apps/tubebench/tubebench.c",
+              "apps/common/tube/ag_tube.c", "apps/common/tube/ag_biq.c",
+              "apps/common/tube/ag_os.c", "apps/common/tube/ag_amp.c",
+              "apps/common/tube/ag_tone.c",
+              "apps/common/ckt/ag_mathf.c", "apps/common/ckt/ag_ckt.c",
+              "apps/common/libc/libc_shim.c"]
     },
     {
-      "out": "STOMP.AXE",
-      "group": "core",
+      "out": "STOMP.AXE", "group": "core",
       "_note": "the amplifier with its knobs on a screen; the knob list comes from the model",
-      "include": [
-        "apps/common",
-        "apps/common/ckt",
-        "apps/common/tube",
-        "apps/common/dsp",
-        "apps/common/ir",
-        "apps/common/pcm",
-        "apps/common/wav",
-        "apps/common/libc",
-        "apps/stomp"
-      ],
+      "include": ["apps/common", "apps/common/ckt", "apps/common/tube",
+                  "apps/common/dsp", "apps/common/ir", "apps/common/pcm",
+                  "apps/common/wav", "apps/common/libc", "apps/stomp"],
       "cflags": "-Os -ffunction-sections -fdata-sections -fno-builtin",
-      "src": [
-        "apps/stomp/stomp.c",
-        "apps/common/tube/ag_tube.c",
-        "apps/common/tube/ag_biq.c",
-        "apps/common/tube/ag_os.c",
-        "apps/common/tube/ag_amp.c",
-        "apps/common/tube/ag_tone.c",
-        "apps/common/ckt/ag_mathf.c",
-        "apps/common/ckt/ag_ckt.c",
-        "apps/common/dsp/ag_dsp.c",
-        "apps/common/ir/ag_ir.c",
-        "apps/common/ir/ag_fft.c",
-        "apps/common/pcm/ag_pcm.c",
-        "apps/common/wav/ag_wav.c",
-        "apps/common/libc/libc_shim.c"
-      ]
+      "src": ["apps/stomp/stomp.c",
+              "apps/common/tube/ag_tube.c", "apps/common/tube/ag_biq.c",
+              "apps/common/tube/ag_os.c", "apps/common/tube/ag_amp.c",
+              "apps/common/tube/ag_tone.c",
+              "apps/common/ckt/ag_mathf.c", "apps/common/ckt/ag_ckt.c",
+              "apps/common/dsp/ag_dsp.c",
+              "apps/common/ir/ag_ir.c", "apps/common/ir/ag_fft.c",
+              "apps/common/pcm/ag_pcm.c", "apps/common/wav/ag_wav.c",
+              "apps/common/libc/libc_shim.c"]
     },
     {
-      "out": "CKTBENCH.AXE",
-      "group": "core",
-      "include": [
-        "apps/common",
-        "apps/common/ckt",
-        "apps/common/dsp",
-        "apps/common/fx",
-        "apps/common/ir",
-        "apps/common/libc",
-        "apps/cktbench"
-      ],
+      "out": "CKTBENCH.AXE", "group": "core",
+      "include": ["apps/common", "apps/common/ckt", "apps/common/dsp",
+                  "apps/common/fx", "apps/common/ir", "apps/common/libc",
+                  "apps/cktbench"],
       "cflags": "-Os -ffunction-sections -fdata-sections -fno-builtin",
-      "src": [
-        "apps/cktbench/cktbench.c",
-        "apps/cktbench/ckt_circuits.c",
-        "apps/common/ckt/ag_mathf.c",
-        "apps/common/ckt/ag_ckt.c",
-        "apps/common/ckt/ag_stage.c",
-        "apps/common/dsp/ag_dsp.c",
-        "apps/common/fx/ag_fx.c",
-        "apps/common/ir/ag_ir.c",
-        "apps/common/ir/ag_fft.c",
-        "apps/common/libc/libc_shim.c"
-      ]
+      "src": ["apps/cktbench/cktbench.c", "apps/cktbench/ckt_circuits.c",
+              "apps/common/ckt/ag_mathf.c", "apps/common/ckt/ag_ckt.c",
+              "apps/common/ckt/ag_stage.c", "apps/common/dsp/ag_dsp.c",
+              "apps/common/fx/ag_fx.c",
+              "apps/common/ir/ag_ir.c", "apps/common/ir/ag_fft.c",
+              "apps/common/libc/libc_shim.c"]
     },
+    { "out": "FBCON.AXE", "group": "core", "src": ["apps/fbcon/fbcon.c"] },
+    { "out": "WHOAMI.AXE", "group": "core", "src": ["apps/whoami/whoami.c"] },
+    { "out": "ZIP.AXE", "group": "core", "src": ["apps/zip/zip.c"] },
+
+    { "out": "ECHO.SYS", "group": "core", "src": ["apps/echo/echo.c"] },
+    { "out": "EXTRADIO.SYS", "group": "core",
+      "include": ["apps/common", "apps/common/rlink"],
+      "src": ["apps/extradio/extradio.c", "apps/common/rlink/ag_rlink.c"] },
+    { "out": "ATRADIO.SYS", "group": "core",
+      "include": ["apps/common", "apps/common/atproto"],
+      "src": ["apps/atradio/atradio.c", "apps/common/atproto/ag_atproto.c"] },
+    { "out": "ESPFLASH.AXE", "group": "core",
+      "_note": "the board flashes a wired ESP chip itself from a .bin on disk; ESP8266 + ESP32-family ROM protocol over a non-console UART. Codec host-tested (test_espldr).",
+      "include": ["apps/common"],
+      "cflags": "-Os -ffunction-sections -fdata-sections -fno-builtin",
+      "src": ["apps/espflash/espflash.c", "apps/common/esp8266/ag_espldr.c"] },
+    { "out": "STM32FLASH.AXE", "group": "core",
+      "_note": "the board flashes a wired STM32 itself from a .bin on disk; ST AN3155 UART bootloader (8E1). Codec host-tested (test_stm32ldr).",
+      "include": ["apps/common"],
+      "cflags": "-Os -ffunction-sections -fdata-sections -fno-builtin",
+      "src": ["apps/stm32flash/stm32flash.c", "apps/common/stm32/ag_stm32ldr.c"] },
+    { "out": "GC2145.SYS", "group": "core", "include": ["apps/gc2145"], "src": ["apps/gc2145/gc2145.c"] },
+    { "out": "CAM.AXE", "group": "core", "src": ["apps/cam/cam.c"] },
     {
-      "out": "FBCON.AXE",
-      "group": "core",
-      "src": [
-        "apps/fbcon/fbcon.c"
-      ]
-    },
-    {
-      "out": "WHOAMI.AXE",
-      "group": "core",
-      "src": [
-        "apps/whoami/whoami.c"
-      ]
-    },
-    {
-      "out": "ZIP.AXE",
-      "group": "core",
-      "src": [
-        "apps/zip/zip.c"
-      ]
-    },
-    {
-      "out": "ECHO.SYS",
-      "group": "core",
-      "src": [
-        "apps/echo/echo.c"
-      ]
-    },
-    {
-      "out": "GC2145.SYS",
-      "group": "core",
-      "include": [
-        "apps/gc2145"
-      ],
-      "src": [
-        "apps/gc2145/gc2145.c"
-      ]
-    },
-    {
-      "out": "CAM.AXE",
-      "group": "core",
-      "src": [
-        "apps/cam/cam.c"
-      ]
-    },
-    {
-      "out": "TONE.AXE",
-      "group": "core",
+      "out": "TONE.AXE", "group": "core",
       "_note": "A pure sine to /dev/pcm0 at a chosen frequency, level and length - the level is the volume (the I2S DAC has no gain of its own). A steady tone is the cleanest dropout test. Needs [audio] pins in BOARD.CFG.",
-      "include": [
-        "apps/common",
-        "apps/common/libc"
-      ],
+      "include": ["apps/common", "apps/common/libc"],
       "cflags": "-Os -ffunction-sections -fdata-sections -fno-builtin",
-      "src": [
-        "apps/tone/tone.c",
-        "apps/common/libc/libc_shim.c"
-      ]
+      "src": ["apps/tone/tone.c", "apps/common/libc/libc_shim.c"]
     },
     {
-      "out": "PCMPLAY.AXE",
-      "group": "core",
-      "_note": "Plays a raw PCM file straight at /dev/pcm0 and reports the rate the converter actually ran at, which is not the rate it was asked for. Written to settle 'the sound over the wire is not music': a file on the board's own disk removes the sender, the wire and the receiver's buffering from the question in one step, and the effective-rate line catches a clock divider that landed somewhere else - music at the wrong rate is exactly 'not music'. Default is 8-bit unsigned mono, which is what apps/remdisp carries, so the two put the same numbers on the same pin.",
-      "include": [
-        "apps/common/libc"
-      ],
-      "cflags": "-Os -ffunction-sections -fdata-sections -fno-builtin",
-      "src": [
-        "apps/pcmplay/pcmplay.c",
-        "apps/common/libc/libc_shim.c"
-      ]
-    },
-    {
-      "out": "HTTPD.AXE",
-      "group": "core",
+      "out": "HTTPD.AXE", "group": "core",
       "_note": "The file server, now a loadable .AXE instead of a built-in command - httpd is out of the firmware. Run it by name: `run httpd.axe [port] [dir] [/w]` (Maxim does not want it re-mapped to a bare `httpd` command). Full serve path (GET 32K byte-exact, listing, HEAD, 404, path-traversal 403, multipart upload + delete) verified in QEMU against tools/netfixture.py, and it drives tools/nettest.ps1's pass-2. Build gotcha it cost: mkaxe used to compile the shim without -fno-builtin, so GCC rewrote libc_shim's own strlen loop into a call to strlen and recursed the stack away deep in netmsg's header parse; mkaxe now passes -fno-builtin for every .AXE.",
-      "include": [
-        "apps/common/libc",
-        "components/argon_kernel/include"
-      ],
-      "src": [
-        "apps/httpd/httpd.c",
-        "components/argon_kernel/src/net/netmsg.c",
-        "apps/common/libc/libc_shim.c"
-      ]
+      "include": ["apps/common/libc", "components/argon_kernel/include"],
+      "src": ["apps/httpd/httpd.c",
+              "components/argon_kernel/src/net/netmsg.c",
+              "apps/common/libc/libc_shim.c"]
     },
+    { "out": "PCMVIRT.SYS", "group": "core", "src": ["apps/pcmvirt/pcmvirt.c"] },
+    { "out": "KBDVIRT.SYS", "group": "core", "src": ["apps/kbdvirt/kbdvirt.c"] },
+    { "out": "MOUSEVIRT.SYS", "group": "core", "src": ["apps/mousevirt/mousevirt.c"] },
+    { "out": "MIDIVIRT.SYS", "group": "core", "src": ["apps/midivirt/midivirt.c"] },
+
     {
-      "out": "PCMVIRT.SYS",
-      "group": "core",
-      "src": [
-        "apps/pcmvirt/pcmvirt.c"
-      ]
-    },
-    {
-      "out": "KBDVIRT.SYS",
-      "group": "core",
-      "src": [
-        "apps/kbdvirt/kbdvirt.c"
-      ]
-    },
-    {
-      "out": "MOUSEVIRT.SYS",
-      "group": "core",
-      "src": [
-        "apps/mousevirt/mousevirt.c"
-      ]
-    },
-    {
-      "out": "MIDIVIRT.SYS",
-      "group": "core",
-      "src": [
-        "apps/midivirt/midivirt.c"
-      ]
-    },
-    {
-      "out": "SMS.AXE",
-      "group": "big",
-      "include": [
-        "apps/common",
-        "apps/common/libc",
-        "apps/sms/port",
-        "apps/sms/core",
-        "apps/sms/core/z80",
-        "apps/sms/core/sound",
-        "apps/common/fm",
-        "apps/common/dsp"
-      ],
+      "out": "SMS.AXE", "group": "big",
+      "include": ["apps/common", "apps/common/libc", "apps/sms/port",
+                  "apps/sms/core", "apps/sms/core/z80",
+                  "apps/sms/core/sound", "apps/common/fm", "apps/common/dsp"],
       "cflags": "-Os -ffunction-sections -fdata-sections -fno-builtin -DLSB_FIRST -DNOZIP_SUPPORT -DUSE_Z80 -Wno-unused -Wno-sign-compare",
-      "src": [
-        "apps/sms/sms_main.c",
-        "apps/sms/sms_cfg.c",
-        "apps/common/libc/libc_shim.c",
-        "apps/sms/port/platform.c",
-        "apps/sms/port/sound_wav.c",
-        "apps/common/fm/ag_fm.c",
-        "apps/common/dsp/ag_dsp.c",
-        "apps/sms/core/loadrom.c",
-        "apps/sms/core/memz80.c",
-        "apps/sms/core/pio.c",
-        "apps/sms/core/render.c",
-        "apps/sms/core/sms.c",
-        "apps/sms/core/system.c",
-        "apps/sms/core/tms.c",
-        "apps/sms/core/vdp.c",
-        "apps/sms/core/z80/z80.c",
-        "apps/sms/core/sound/sound.c",
-        "apps/sms/core/sound/fmintf.c",
-        "apps/sms/core/sound/sn76489.c"
-      ]
+      "src": ["apps/sms/sms_main.c", "apps/sms/sms_cfg.c",
+              "apps/common/libc/libc_shim.c", "apps/sms/port/platform.c",
+              "apps/sms/port/sound_wav.c", "apps/common/fm/ag_fm.c",
+              "apps/common/dsp/ag_dsp.c",
+              "apps/sms/core/loadrom.c", "apps/sms/core/memz80.c",
+              "apps/sms/core/pio.c", "apps/sms/core/render.c",
+              "apps/sms/core/sms.c", "apps/sms/core/system.c",
+              "apps/sms/core/tms.c", "apps/sms/core/vdp.c",
+              "apps/sms/core/z80/z80.c",
+              "apps/sms/core/sound/sound.c", "apps/sms/core/sound/fmintf.c",
+              "apps/sms/core/sound/sn76489.c"]
     },
+
     {
-      "out": "GB.AXE",
-      "group": "board",
-      "include": [
-        "apps/common",
-        "apps/common/libc",
-        "apps/gb"
-      ],
+      "out": "GB.AXE", "group": "board",
+      "include": ["apps/common", "apps/common/libc", "apps/gb"],
       "cflags": "-Os -ffunction-sections -fdata-sections -fno-builtin -DENABLE_SOUND=0 -DENABLE_LCD=1 -DPEANUT_GB_12_COLOUR=0 -DPEANUT_GB_HIGH_LCD_ACCURACY=0 -Wno-unused -Wno-sign-compare",
-      "src": [
-        "apps/gb/gb_main.c",
-        "apps/common/libc/libc_shim.c"
-      ]
+      "src": ["apps/gb/gb_main.c", "apps/common/libc/libc_shim.c"]
     },
+
+    { "out": "GFXPIX.AXE", "group": "board", "src": ["apps/gfxpix/gfxpix.c"] },
+
+    { "out": "XIPBENCH.AXE", "src": ["apps/xipbench/xipbench.c"] },
+    { "out": "MIDIPAD.AXE", "group": "board", "src": ["apps/midipad/midipad.c"] },
     {
-      "out": "GFXPIX.AXE",
-      "group": "board",
-      "src": [
-        "apps/gfxpix/gfxpix.c"
-      ]
-    },
-    {
-      "out": "FLUSHB.AXE",
-      "group": "board",
-      "src": [
-        "apps/flushb/flushb.c"
-      ]
-    },
-    {
-      "out": "XIPBENCH.AXE",
-      "src": [
-        "apps/xipbench/xipbench.c"
-      ]
-    },
-    {
-      "out": "MIDIPAD.AXE",
-      "group": "board",
-      "src": [
-        "apps/midipad/midipad.c"
-      ]
-    },
-    {
-      "out": "ILI9341.SYS",
-      "group": "board",
+      "out": "ILI9341.SYS", "group": "board",
       "_note": "The panel on the CYD.  --include apps/common is font8x8.h, which is generated (tools/gen_font8x8.py) and shared with ST7789.SYS.",
-      "include": [
-        "apps/common"
-      ],
-      "src": [
-        "apps/ili9341/ili9341.c"
-      ]
+      "include": ["apps/common"],
+      "src": ["apps/ili9341/ili9341.c"]
     },
     {
-      "out": "ST7789.SYS",
-      "group": "board",
+      "out": "ST7789.SYS", "group": "board",
       "_note": "The panel on the ESP32-C6-LCD-1.47, and the first image in this file built for RISC-V - that board is a C6.  A .SYS carries its instruction set in its header; one built for xtensa is refused by the loader rather than run.",
-      "arch": "riscv32",
-      "gcc": "riscv32-esp-elf-gcc",
-      "include": [
-        "apps/common"
-      ],
-      "src": [
-        "apps/st7789/st7789.c"
-      ]
+      "arch": "riscv32", "gcc": "riscv32-esp-elf-gcc",
+      "include": ["apps/common"],
+      "src": ["apps/st7789/st7789.c"]
     },
     {
-      "out": "XPT2046.SYS",
-      "group": "board",
-      "src": [
-        "apps/xpt2046/xpt2046.c"
-      ]
+      "out": "ST7789S3.SYS", "group": "board",
+      "_note": "The same source and the same controller, for the 2.0 inch 240x320 module soldered to the ESP32-S3-WROOM CAM board: -DST7789_BOARD_S3CAM swaps the block of constants (pins, size, no offset) and xtensa is the other instruction set, so it has to be a second image with a name of its own.",
+      "arch": "xtensa", "gcc": "xtensa-esp32s3-elf-gcc",
+      "cflags": "-Os -ffunction-sections -fdata-sections -DST7789_BOARD_S3CAM",
+      "include": ["apps/common"],
+      "src": ["apps/st7789/st7789.c"]
+    },
+    { "out": "XPT2046.SYS", "group": "board", "src": ["apps/xpt2046/xpt2046.c"] },
+
+    {
+      "out": "CC.AXE", "group": "core",
+      "include": ["apps/cc"],
+      "src": ["apps/cc/cc_main.c", "apps/cc/cc_compile.c"]
     },
     {
-      "out": "CC.AXE",
-      "group": "core",
-      "include": [
-        "apps/cc"
-      ],
-      "src": [
-        "apps/cc/cc_main.c",
-        "apps/cc/cc_compile.c"
-      ]
+      "out": "FM.AXE", "group": "core",
+      "icon": "apps/fm/fm.icon",
+      "include": ["apps/fm"],
+      "src": ["apps/fm/fm.c", "apps/fm/fmops.c", "apps/fm/fm_ui_text.c",
+              "apps/common/fsops/fsops.c", "apps/common/fsops/fsops_argon.c"]
     },
     {
-      "out": "FM.AXE",
-      "group": "core",
-      "include": [
-        "apps/fm"
-      ],
-      "src": [
-        "apps/fm/fm.c",
-        "apps/fm/fmops.c",
-        "apps/fm/fm_ui_text.c"
-      ]
-    },
-    {
-      "out": "GFXFM.AXE",
-      "group": "core",
-      "include": [
-        "apps/fm"
-      ],
+      "out": "GFXFM.AXE", "group": "core",
+      "include": ["apps/fm"],
       "cflags": "-Os -ffunction-sections -fdata-sections -DFM_GFX_BUILD",
-      "src": [
-        "apps/gfxfm/gfxfm_app.c",
-        "apps/gfxfm/fm_ui_gfx.c",
-        "apps/fm/fm.c",
-        "apps/fm/fmops.c"
-      ]
+      "src": ["apps/gfxfm/gfxfm_app.c", "apps/gfxfm/fm_ui_gfx.c",
+              "apps/fm/fm.c", "apps/fm/fmops.c",
+              "apps/common/fsops/fsops.c", "apps/common/fsops/fsops_argon.c"]
     },
     {
-      "out": "AMP.AXE",
-      "group": "core",
-      "include": [
-        "apps/common",
-        "apps/common/mp3",
-        "apps/common/libc",
-        "third_party/minimp3"
-      ],
+      "out": "AMP.AXE", "group": "core",
+      "include": ["apps/common", "apps/common/mp3", "apps/common/libc",
+                  "third_party/minimp3"],
       "cflags": "-Os -ffunction-sections -fdata-sections -fno-builtin -DMINIMP3_NO_SIMD",
-      "src": [
-        "apps/amp/amp.c",
-        "apps/amp/amp_cmds.c",
-        "apps/amp/amp_ui.c",
-        "apps/amp/amp_input.c",
-        "apps/amp/amp_skin.c",
-        "apps/amp/amp_eq.c",
-        "apps/amp/amp_playlist.c",
-        "apps/common/mp3/ag_mp3.c",
-        "apps/common/libc/libc_shim.c"
-      ]
+      "src": ["apps/amp/amp.c", "apps/amp/amp_cmds.c", "apps/amp/amp_ui.c",
+              "apps/amp/amp_input.c", "apps/amp/amp_skin.c", "apps/amp/amp_eq.c",
+              "apps/amp/amp_playlist.c", "apps/common/mp3/ag_mp3.c",
+              "apps/common/libc/libc_shim.c"]
     },
     {
-      "out": "DX7.AXE",
-      "group": "core",
-      "include": [
-        "apps/common",
-        "apps/common/dsp",
-        "apps/common/pcm",
-        "apps/common/dx7",
-        "apps/common/fx",
-        "apps/common/libc"
-      ],
+      "out": "DX7.AXE", "group": "core",
+      "include": ["apps/common", "apps/common/dsp", "apps/common/pcm",
+                  "apps/common/dx7", "apps/common/fx", "apps/common/libc"],
       "cflags": "-Os -ffunction-sections -fdata-sections -fno-builtin",
-      "src": [
-        "apps/dx7/dx7.c",
-        "apps/common/dsp/ag_dsp.c",
-        "apps/common/pcm/ag_pcm.c",
-        "apps/common/dx7/ag_dx7.c",
-        "apps/common/dx7/ag_mid.c",
-        "apps/common/fx/ag_fx.c",
-        "apps/common/libc/libc_shim.c"
-      ]
+      "src": ["apps/dx7/dx7.c", "apps/common/dsp/ag_dsp.c",
+              "apps/common/pcm/ag_pcm.c", "apps/common/dx7/ag_dx7.c",
+              "apps/common/dx7/ag_mid.c", "apps/common/fx/ag_fx.c",
+              "apps/common/libc/libc_shim.c"]
     },
     {
-      "out": "GRAIN.AXE",
-      "group": "core",
-      "include": [
-        "apps/common",
-        "apps/common/dsp",
-        "apps/common/pcm",
-        "apps/common/grain",
-        "apps/common/wav",
-        "apps/common/fx",
-        "apps/common/libc"
-      ],
+      "out": "GRAIN.AXE", "group": "core",
+      "include": ["apps/common", "apps/common/dsp", "apps/common/pcm",
+                  "apps/common/grain", "apps/common/wav", "apps/common/fx",
+                  "apps/common/libc"],
       "cflags": "-Os -ffunction-sections -fdata-sections -fno-builtin",
-      "src": [
-        "apps/grain/grain.c",
-        "apps/common/dsp/ag_dsp.c",
-        "apps/common/pcm/ag_pcm.c",
-        "apps/common/grain/ag_grain.c",
-        "apps/common/wav/ag_wav.c",
-        "apps/common/fx/ag_fx.c",
-        "apps/common/libc/libc_shim.c"
-      ]
+      "src": ["apps/grain/grain.c", "apps/common/dsp/ag_dsp.c",
+              "apps/common/pcm/ag_pcm.c", "apps/common/grain/ag_grain.c",
+              "apps/common/wav/ag_wav.c", "apps/common/fx/ag_fx.c",
+              "apps/common/libc/libc_shim.c"]
     },
     {
-      "out": "IRFX.AXE",
-      "group": "core",
-      "include": [
-        "apps/common",
-        "apps/common/dsp",
-        "apps/common/pcm",
-        "apps/common/ir",
-        "apps/common/wav",
-        "apps/common/libc"
-      ],
+      "out": "IRFX.AXE", "group": "core",
+      "include": ["apps/common", "apps/common/dsp", "apps/common/pcm",
+                  "apps/common/ir", "apps/common/wav", "apps/common/libc"],
       "cflags": "-Os -ffunction-sections -fdata-sections -fno-builtin",
-      "src": [
-        "apps/irfx/irfx.c",
-        "apps/common/dsp/ag_dsp.c",
-        "apps/common/pcm/ag_pcm.c",
-        "apps/common/ir/ag_ir.c",
-        "apps/common/ir/ag_fft.c",
-        "apps/common/wav/ag_wav.c",
-        "apps/common/libc/libc_shim.c"
-      ]
+      "src": ["apps/irfx/irfx.c", "apps/common/dsp/ag_dsp.c",
+              "apps/common/pcm/ag_pcm.c", "apps/common/ir/ag_ir.c",
+              "apps/common/ir/ag_fft.c", "apps/common/wav/ag_wav.c",
+              "apps/common/libc/libc_shim.c"]
     },
     {
-      "out": "SYNTH.AXE",
-      "group": "core",
-      "include": [
-        "apps/common",
-        "apps/common/dsp",
-        "apps/common/pcm",
-        "apps/common/synth",
-        "apps/common/fx",
-        "apps/common/ir",
-        "apps/common/libc"
-      ],
+      "out": "SYNTH.AXE", "group": "core",
+      "include": ["apps/common", "apps/common/dsp", "apps/common/pcm",
+                  "apps/common/synth", "apps/common/fx", "apps/common/ir",
+                  "apps/common/libc"],
       "cflags": "-Os -ffunction-sections -fdata-sections -fno-builtin",
-      "src": [
-        "apps/synth/synth.c",
-        "apps/common/dsp/ag_dsp.c",
-        "apps/common/pcm/ag_pcm.c",
-        "apps/common/synth/ag_osc.c",
-        "apps/common/synth/ag_filt.c",
-        "apps/common/synth/ag_dist.c",
-        "apps/common/synth/ag_fmx.c",
-        "apps/common/synth/ag_synth.c",
-        "apps/common/fx/ag_fx.c",
-        "apps/common/ir/ag_ir.c",
-        "apps/common/ir/ag_fft.c",
-        "apps/common/libc/libc_shim.c"
-      ]
+      "src": ["apps/synth/synth.c", "apps/common/dsp/ag_dsp.c",
+              "apps/common/pcm/ag_pcm.c", "apps/common/synth/ag_osc.c",
+              "apps/common/synth/ag_filt.c", "apps/common/synth/ag_dist.c",
+              "apps/common/synth/ag_fmx.c", "apps/common/synth/ag_synth.c",
+              "apps/common/fx/ag_fx.c", "apps/common/ir/ag_ir.c",
+              "apps/common/ir/ag_fft.c", "apps/common/libc/libc_shim.c"]
     },
     {
-      "out": "LINK.AXE",
-      "group": "core",
+      "out": "LINK.AXE", "group": "core",
       "_note": "The wire between two boards, measured. Sends framed blocks with a sequence number and a checksum one way - `link send <baud> [kb] [block]` and `link recv <baud> [secs] [block]`, block being the whole block on the wire, 16..1040, default 260 - and counts ok/corrupt/lost/stray at the other end, so a line too fast for the wiring is told apart from a receiver that was not listening. Needs [uart1] tx/rx in BOARD.CFG on both ends. Build it once per chip - the CYD is an LX6, the S3 an LX7 - and note that this manifest only ever builds for CONFIG_IDF_TARGET, so the other image comes from a direct mkaxe call with --gcc xtensa-esp32-elf-gcc. 4 Mbaud = 400 067 B/s clean over 4 MB; docs/09-esp32-cyd.md has the table.",
-      "src": [
-        "apps/link/link.c"
-      ]
+      "src": ["apps/link/link.c"]
     },
     {
-      "out": "REMDISP.SYS",
-      "group": "core",
+      "out": "REMDISP.SYS", "group": "core",
       "_note": "The screen of a machine that has none, sent down a wire to the board that does: a display device whose panel is UART1. Publishes ag_display_ops_t with blit_rect for pixels and text_row/text_cursor for the console, so ag_gfx_flush and ag_gfx_present reach it without any application knowing. Trims each band to the bounding box of what moved against a shadow of the last frame, then sends whichever is smallest of raw RGB565, PackBits, or palette-and-indices. Measured on the two boards at 4 Mbaud: 15 fps for a whole 320x240 frame every frame and 154 fps on dirty rectangles, 7.8x compression. Needs [uart1] tx/rx in BOARD.CFG; see docs/09-esp32-cyd.md.",
-      "src": [
-        "apps/remdisp/remdisp.c"
-      ]
+      "src": ["apps/remdisp/remdisp.c"]
     },
     {
-      "out": "REMTERM.AXE",
-      "group": "core",
+      "out": "PHONE.SYS", "group": "core",
+      "_note": "The board's screen and keyboard on a phone, over Wi-Fi. Publishes a display device (blit_rect for pixels, text_row/text_cursor for the console) and an input device, and serves its own client page on :8765 - a GET of / returns the HTML, a GET of /ws upgrades to a WebSocket carrying bands of pixels one way and keys and taps the other. Has a task of its own (sys->module_task, ABI 0.48), so blit_rect only copies the rectangle and marks the damage. Plan and protocol in docs/plans/phone.md.",
+      "generate": ["tools/mkpage.py"],
+      "include": ["apps/common/libc", "apps/common/pixband", "apps/common/ws",
+                  "apps/phone"],
+      "src": ["apps/phone/phone.c", "apps/common/pixband/ag_pixband.c",
+              "apps/common/ws/ag_ws.c", "apps/common/libc/libc_shim.c"]
+    },
+    {
+      "out": "REMTERM.AXE", "group": "core",
       "_note": "The other end of REMDISP.SYS: takes bands of pixels to the panel with ag_gfx_present and console rows into its own console, switching between the two as the traffic does. Built here for the S3 only to keep it compiling - the image that runs is the LX6 one for the CYD, from a direct mkaxe call with --gcc xtensa-esp32-elf-gcc.",
-      "src": [
-        "apps/remterm/remterm.c"
-      ]
+      "src": ["apps/remterm/remterm.c"]
     },
-    {
-      "out": "TICKER.AXE",
-      "group": "core",
-      "_note": "A clock with no hands: prints a line every 100 ms and says how late it was, measured against when the tick was due rather than against the last one. Run it beside something heavy and the gaps in its output are the gaps in which the system was not serving applications.",
-      "src": [
-        "apps/ticker/ticker.c"
-      ]
-    },
-    {
-      "out": "CPUPROBE.AXE",
-      "group": "core",
-      "_note": "Fixed arithmetic, a fixed wait spent awake, and a fixed wait spent asleep, worst of twenty reported. Tells apart a core that is slow, a core that is taken away, and a wake-up that is late - three things that look identical from a frame rate. It is what found REMDISP's wire task sitting above every application while never blocking.",
-      "src": [
-        "apps/cpuprobe/cpuprobe.c"
-      ]
-    }
-  ]
+    {"_comment": "Built on worktree-fallout-cxx: the game's own test harness and the pieces it needs."},
+    {"out": "CPUPROBE.AXE", "group": "core", "_note": "Fixed arithmetic, a fixed wait spent awake, and a fixed wait spent asleep, worst of twenty reported. Tells apart a core that is slow, a core that is taken away, and a wake-up that is late - three things that look identical from a frame rate. It is what found REMDISP's wire task sitting above every application while never blocking.", "src": ["apps/cpuprobe/cpuprobe.c"]},
+    {"out": "CXXSTL.AXE", "group": "core", "include": ["apps/common/cxx"], "cflags": "-Os -ffunction-sections -fdata-sections -fno-builtin", "libs": ["stdc++"], "src": ["apps/cxxtest/stltest.cpp", "apps/common/cxx/cxx_rt.cpp", "apps/common/cxx/cxx_throw.cpp", "apps/common/cxx/cxx_hosted.c", "apps/common/libc/libc_shim.c"]},
+    {"out": "CXXTEST.AXE", "group": "core", "include": ["apps/common/cxx"], "src": ["apps/cxxtest/cxxtest.cpp", "apps/common/cxx/cxx_rt.cpp"]},
+    {"out": "FLUSHB.AXE", "group": "board", "src": ["apps/flushb/flushb.c"]},
+    {"out": "PCMPLAY.AXE", "group": "core", "_note": "Plays a raw PCM file straight at /dev/pcm0 and reports the rate the converter actually ran at, which is not the rate it was asked for. Written to settle 'the sound over the wire is not music': a file on the board's own disk removes the sender, the wire and the receiver's buffering from the question in one step, and the effective-rate line catches a clock divider that landed somewhere else - music at the wrong rate is exactly 'not music'. Default is 8-bit unsigned mono, which is what apps/remdisp carries, so the two put the same numbers on the same pin.", "include": ["apps/common/libc"], "cflags": "-Os -ffunction-sections -fdata-sections -fno-builtin", "src": ["apps/pcmplay/pcmplay.c", "apps/common/libc/libc_shim.c"]},
+    {"out": "SDLTEST.AXE", "group": "core", "include": ["apps/common/cxx", "apps/fallout/port"], "cflags": "-Os -ffunction-sections -fdata-sections -fno-builtin", "libs": ["stdc++"], "src": ["apps/fallout/port/sdltest.cc", "apps/fallout/port/sdl_shim.cc", "apps/common/cxx/cxx_rt.cpp", "apps/common/cxx/cxx_throw.cpp", "apps/common/cxx/cxx_hosted.c", "apps/common/libc/libc_shim.c"]},
+    {"out": "TICKER.AXE", "group": "core", "_note": "A clock with no hands: prints a line every 100 ms and says how late it was, measured against when the tick was due rather than against the last one. Run it beside something heavy and the gaps in its output are the gaps in which the system was not serving applications.", "src": ["apps/ticker/ticker.c"]}
+]
 }

@@ -59,6 +59,8 @@ static volatile uint8_t s_ap_channel;
 static volatile bool    s_ap_hidden;
 static volatile bool    s_ap_secured;
 static volatile uint32_t s_ap_clients;
+/* Set by the driver's own AP_START/AP_STOP events - see the handler. */
+static volatile bool    s_ap_air;
 
 /*
  * The mode the one radio must be in for what is wanted right now.  There is a
@@ -151,6 +153,25 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id,
      * read.  The count is the one thing about a point that changes without
      * anyone here doing anything, so it is the one thing worth an event.
      */
+    /*
+     * Whether the point is actually on the air, which is not the same thing as
+     * whether one was asked for.  A board insisting `wifi` showed "access point
+     * ArgonOS, 192.168.4.1" while no phone in the room could see the network
+     * cost most of a day: every record of the point existed - the flag, the
+     * netif, the address, the DHCP server - and the only thing missing was the
+     * radio, which nothing here was listening to.  The driver says so in an
+     * event; now somebody hears it.
+     */
+    case WIFI_EVENT_AP_START:
+        s_ap_air = true;
+        ESP_LOGW("wifi.ap", "point on the air");
+        break;
+
+    case WIFI_EVENT_AP_STOP:
+        s_ap_air = false;
+        ESP_LOGW("wifi.ap", "point OFF the air");
+        break;
+
     case WIFI_EVENT_AP_STACONNECTED:
         s_ap_clients++;
         break;
@@ -623,6 +644,19 @@ ag_err_t ag_port_wifi_ap_status(ag_port_wifi_ap_status_t *out)
     out->hidden = s_ap_hidden;
     out->secured = s_ap_secured;
     out->clients = s_ap_clients;
+
+    /*
+     * Say so when the two disagree.  Everything below is what was configured;
+     * s_ap_air is what the radio reported.  A point that is recorded up and is
+     * not transmitting looks, from every other line this prints, exactly like a
+     * working one - so this is the line that makes "the board says it is up and
+     * my phone cannot see it" a fact the board itself states.
+     */
+    if (s_ap_on && !s_ap_air) {
+        ESP_LOGW("wifi.ap",
+                 "%s is recorded up but the radio is not transmitting",
+                 s_ap_ssid);
+    }
 
     /*
      * The channel it is really on, not the one that was asked for.  With a

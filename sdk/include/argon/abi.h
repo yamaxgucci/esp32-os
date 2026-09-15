@@ -77,6 +77,11 @@ extern "C" {
  * 0.28 defined ag_input_ops_t: an AG_DEV_INPUT driver the kernel polls for
  *      events, for hardware that has to be asked rather than interrupting.
  * 0.29 appended io->spi_config: the clock for one chip on a shared bus.
+ * 0.44 appended units / span_w / span_h to ag_input_ops_t: an input driver
+ *      that measures in pixels rather than console cells says so, and the
+ *      kernel scales its span to the surface instead of multiplying a cell.
+ *      A touchscreen under a graphical shell loses eight pixels in nine
+ *      otherwise, and has to agree with the kernel about whose grid it is.
  * 0.30 appended blit_rect to ag_display_ops_t: a rectangle of pixels the
  *      kernel owns, for a panel whose glass is larger than any framebuffer
  *      the machine driving it can afford.
@@ -144,39 +149,42 @@ extern "C" {
  *      changed is that a pointer is a position on a surface and is now reported
  *      as one.  A terminal has no pixels of its own, so the kernel scales its
  *      column and row by the cell size on the way in.
- * 0.43 sys->module_task: a task that belongs to a loadable driver rather than
+ * 0.43 ag_net_ops_t: the class vtable for an AG_DEV_NET device, and the first
+ *      time dev->ops() means anything for a class other than a display.  A .SYS
+ *      that speaks to an external radio coprocessor (Wi-Fi, GSM/LTE...) over a
+ *      wire publishes it, and the kernel routes its whole socket path through
+ *      it when the operator says `net use <dev>` - so a board can carry no
+ *      built-in radio at all and still reach the network, the radio being a
+ *      chip on a bus like any other .SYS.  One provider is active at a time; the
+ *      built-in stack is the default.  Append-only: nothing an existing image
+ *      calls has moved.
+ * 0.47 the two lines above, merged.  0.43's ag_net_ops_t came off the radio
+ *      line and 0.44-0.46 - input units, another slot's screen and its
+ *      cursor, a prompt in a slot of its own - off the desktop line, and
+ *      each line had bumped this number for itself while the other was
+ *      being written.  An image built from this carries all of them, so it
+ *      needs a number larger than either, and that is all 0.47 means.
+ *
+ *      The numbers were handed out in parallel and some are spoken for
+ *      twice: worktree-cluster calls its own additions 0.47 and
+ *      worktree-usb-kvm calls its 0.45.  Whichever of those lands next has
+ *      to RENUMBER rather than assume its number is free - and the check is
+ *      one line: `git show <branch>:sdk/include/argon/abi.h | grep MINOR`.
+ * 0.48 sys->module_task: a task that belongs to a loadable driver rather than
  *      to a process, so a driver can do work that takes milliseconds without
  *      charging it to whoever called in.  Until this, every driver was a
  *      collection of callbacks on the caller's thread, and a screen at the end
- *      of a serial wire made the game that drew a frame wait for the frame to
- *      go out.  The module owns the task and unload waits for it.
+ *      of a wire made the game that drew a frame wait for the frame to go out.
+ *      The module owns the task and unload waits for it.
+ *
+ *      This is the renumbering the paragraph above asks for: the work is
+ *      commit 2ec139a on `worktree-fallout-cxx`, where it was written as 0.43
+ *      and board-verified in that shape, and 0.43 was spoken for here by
+ *      ag_net_ops_t before it could land.  Nothing about it changed but the
+ *      number.
  */
 #define AG_ABI_MAJOR 0u
-
-/*
- * The minor an image declares, which is not always the one it was compiled
- * beside.
- *
- * The loader refuses an image whose minor is above the kernel's, because such
- * an image may call something that is not there.  An image that uses only older
- * calls has no such problem, and there is a real case for saying so: two boards
- * with two firmwares, and one program that runs on both.  The receiver for the
- * picture link is exactly that - it lives on the older board and uses nothing
- * newer than 0.27, and after this header moved to 0.43 it stopped loading there
- * for no reason but the number.
- *
- * So it can be overridden at build time:
- *
- *     mkaxe ... --cflags "-DAG_ABI_MINOR=42u"
- *
- * The promise that goes with it is the one the ABI already asks for: reach
- * anything newer than the declared floor through AG_HAS, which checks the
- * table's own size at runtime.  Declaring a floor and then calling past it
- * without asking is a null call, and that is on the caller.
- */
-#ifndef AG_ABI_MINOR
-#define AG_ABI_MINOR 45u
-#endif
+#define AG_ABI_MINOR 48u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -288,7 +296,22 @@ typedef struct ag_sys_api {
     void (*module_on_unload)(void (*fn)(void));
 
     /*
-     * ABI 0.43: during ag_driver_init only — a task of the module's own.
+     * ABI 0.45: give a session slot a shell of its own, and say which slot
+     * got it.
+     *
+     * For a desktop that wants a prompt in a window.  `slot` below zero
+     * means any free one, which is what a window asking for a prompt
+     * actually wants - it has no business choosing a slot number, and
+     * nothing else in the ABI lets it enumerate them.  `cwd` may be NULL
+     * for the root.
+     *
+     * Returns the slot, or a negative error: -AG_ENOSPC when every slot
+     * already has something in it.
+     */
+    int32_t (*prompt_in_slot)(int slot, const char *cwd);
+
+    /*
+     * ABI 0.48: during ag_driver_init only — a task of the module's own.
      *
      * task->create is the application's, and it refuses a caller with no
      * process: a thread belongs to a process and dies with it, and a driver has
@@ -297,7 +320,9 @@ typedef struct ag_sys_api {
      * a register write and wrong for anything that takes milliseconds.  A
      * screen at the end of a serial wire is the case that forced this: three
      * hundred milliseconds of a frame going out, charged to the game that drew
-     * it, when the wire could just as well be fed from a task of its own.
+     * it, when the wire could just as well be fed from a task of its own.  A
+     * screen at the end of a network is the same case again, with an accept()
+     * and an HTTP request in it.
      *
      * The module owns it.  Unload calls the module_on_unload hook first - which
      * is where the driver tells its task to stop - and then waits for the task
@@ -307,10 +332,12 @@ typedef struct ag_sys_api {
      *
      * The task must therefore watch a flag and return.  Do not call exit.
      *
-     * flags are ag_thread_flags: AG_THREAD_SYS_CORE keeps it off the core the
-     * foreground application runs on, which is what a driver doing real work
-     * wants - the screen driver's encoder and the game were otherwise two
-     * runnable tasks on one core, and the game lost half its frame rate to it.
+     * `flags` is ag_thread_flags, the same three an application's thread gets,
+     * and the choice is not cosmetic: the foreground application is pinned to
+     * the app core, so a driver doing real work there is a second runnable task
+     * on the one core already busy.  A driver that takes milliseconds asks for
+     * AG_THREAD_SYS_CORE.  `priority` at 5 or below cannot starve an
+     * application; above that it can, and nothing in this build says so.
      */
     bool (*module_task)(void (*fn)(void *), void *arg, const char *name,
                         uint32_t stack, int priority, uint32_t flags);
@@ -459,6 +486,17 @@ enum ag_color {
     AG_LRED, AG_LMAGENTA, AG_YELLOW, AG_WHITE,
 };
 
+/*
+ * One cell of a text screen: the byte and its CGA attribute.
+ *
+ * Declared here rather than beside the display vtable that first needed it,
+ * because the console reads its own screen back into these too (peek_row).
+ */
+typedef struct {
+    uint8_t ch;
+    uint8_t attr;
+} ag_textcell_t;
+
 /* Attribute byte, CGA-compatible layout: bg << 4 | fg. */
 #define AG_ATTR(fg, bg) ((uint8_t)(((bg) << 4) | ((fg) & 0x0f)))
 
@@ -523,6 +561,56 @@ typedef struct ag_con_api {
      */
     uint16_t (*codepage)(void);
     ag_err_t (*set_codepage)(uint16_t number);
+
+    /*
+     * Read the screen back, one row at a time (ABI 0.43).
+     *
+     * The console draws itself, on whatever it has: a framebuffer, a panel's
+     * text cells, a serial terminal.  An application that wants to show the
+     * console inside a window of its own - a desktop shell with a console
+     * window in it - cannot use any of those; it needs the cells.
+     *
+     * A row rather than the whole screen, because the caller decides what to
+     * keep: eighty cells is a hundred and sixty bytes, where a screen is two
+     * kilobytes that a caller redrawing one changed line would throw away.
+     *
+     * Returns the number of cells written (never more than `max` or the
+     * screen's width), or a negative error.  Refused for a process that is not
+     * the console's - the same rule ag_poke follows, and for the same reason:
+     * the console belongs to the foreground.
+     */
+    int32_t (*peek_row)(uint16_t row, ag_textcell_t *cells, uint16_t max);
+
+    /*
+     * The same, from the screen of a session slot that is not this one.
+     *
+     * For a window showing somebody else's prompt.  A slot with a shell of
+     * its own (`prompt 2`) has a screen of its own, and that screen is
+     * nowhere on the glass while a desktop is in front - reading it is the
+     * only way to draw it.
+     *
+     * Slots are numbered from zero here, as they are everywhere inside the
+     * system; the shell writes them from one because that is what the
+     * Alt+digit on the keyboard says.
+     */
+    /* ABI 0.45. */
+    int32_t (*peek_row_slot)(int slot, uint16_t row, ag_textcell_t *cells,
+                             uint16_t max);
+
+    /*
+     * Where that screen's cursor is.
+     *
+     * A window drawing somebody else's prompt has no way to ask: coninfo
+     * answers about the CALLER's console, so a window that drew a caret from
+     * it would be drawing its own cursor on another screen's text - and one
+     * that drew none, as this did first, shows a prompt with nothing
+     * blinking in it, which does not look like a prompt at all.
+     *
+     * Zero on success; the coordinates are cells.
+     */
+    /* ABI 0.46. */
+    int32_t (*cursor_of_slot)(int slot, uint16_t *x, uint16_t *y);
+
 } ag_con_api_t;
 
 /* ------------------------------------------------------------------------ */
@@ -631,6 +719,21 @@ typedef struct ag_inp_api {
      * Returns false if the queue is full or the event type is refused.
      */
     bool (*inject)(const ag_event_t *ev);
+
+    /*
+     * Hand an event to the prompt living in a session slot.
+     *
+     * There is one keyboard and it belongs to whoever is in front, so a
+     * prompt behind a window never reads a character on its own: the
+     * window in front reads them and passes them along.  That is the
+     * whole of how a shell can live in a window while a desktop holds
+     * the screen.
+     *
+     * False when that slot has no prompt of its own, or its queue is
+     * full.
+     */
+    /* ABI 0.45. */
+    bool (*post_to_slot)(int slot, const ag_event_t *ev);
 } ag_inp_api_t;
 
 /* ------------------------------------------------------------------------ */
@@ -818,36 +921,58 @@ typedef struct ag_gfx_api {
  * Class vtable for AG_DEV_INPUT devices that have to be asked (ABI 0.28).
  *
  * A touchscreen on a slow bus does not interrupt with an event; it holds a
- * voltage, and somebody has to read it.  Doing that from the driver would need
- * a task inside a loadable module - the one thing a .SYS has no way to own -
- * so the kernel asks instead, from the console tick it already runs.
+ * voltage, and somebody has to read it.  So the kernel asks, from the console
+ * tick it already runs, rather than each such driver keeping a task to sleep
+ * and wake on a clock.  (When this was written a .SYS had no way to own a task
+ * at all; since 0.48 it has - sys->module_task - and that is the right answer
+ * for a driver whose work takes milliseconds.  A device that only needs looking
+ * at ten times a second is still better served here.)
  *
  * poll() fills at most `max` events and returns how many, or a negative error.
  * Zero is the normal answer and must be cheap: it is called ten times a second
  * forever.  The events go into the same queue the terminal decoder feeds, so
  * nothing above can tell a finger from a mouse on the other end of a cable.
  *
- * Coordinates are console cells, like the terminal's mouse reports, because
- * what is on this kind of screen is the console.  A driver for a panel with a
- * framebuffer under it would want pixels; there is no such panel yet, and
- * inventing the second convention before there is something to point at is how
- * both end up wrong.
+ * Coordinates are console cells by default, like the terminal's mouse
+ * reports, because what is on that kind of screen is the console - and a
+ * driver written before ABI 0.44 says nothing about units, so cells is what
+ * silence means.
+ *
+ * There is now something to point at, which is why the other convention
+ * exists (0.44): the CYD runs a graphical shell on a panel with no system
+ * framebuffer, and a touch controller that reports cells throws away eight
+ * pixels in nine before anybody sees it.  Worse, the round trip has to agree
+ * with the kernel about which grid - the console's, not the panel's - and
+ * when it did not, the pointer sat below the stylus and the bottom of the
+ * glass could not be pressed at all.  A driver that measures in pixels says
+ * so and hands over pixels, and no grid is involved.
+ *
+ *   .units  AG_PTR_CELLS (0, and what an older driver means by saying
+ *           nothing) or AG_PTR_PIXELS.
+ *   .span_w Pixels across and down of whatever the driver measured against -
+ *   .span_h its own glass.  The kernel scales that to the surface, so a touch
+ *           panel and a screen of different sizes still agree.  Zero means
+ *           "the same as the surface", which is the usual case.
  */
 typedef struct ag_input_ops {
     uint32_t size;
     int32_t (*poll)(ag_handle_t h, ag_event_t *out, uint32_t max);
+    /* ABI 0.44 */
+    uint16_t units;
+    uint16_t span_w;
+    uint16_t span_h;
 } ag_input_ops_t;
+
+enum ag_ptr_units {
+    AG_PTR_CELLS = 0,
+    AG_PTR_PIXELS = 1,
+};
 
 /*
  * One cell of the text console: the byte on the screen and its colours, high
  * nibble background, low nibble foreground, as they have been since CGA.  What
  * the byte means is the code page's business (con->codepage).
  */
-typedef struct {
-    uint8_t ch;
-    uint8_t attr;
-} ag_textcell_t;
-
 /*
  * Class vtable for AG_DEV_DISPLAY devices, returned by dev->ops(h).
  * Compact subset of ag_gfx_api_t keyed by the open handle — for drivers that
@@ -1417,6 +1542,53 @@ typedef struct ag_net_api {
      */
     ag_err_t (*resolve)(const char *host, uint32_t *addr_out);
 } ag_net_api_t;
+
+/*
+ * Class vtable for an AG_DEV_NET device (ABI 0.43), read by the kernel's socket
+ * layer when `net use <dev>` binds this device as the active network provider.
+ * A .SYS talking to an external radio coprocessor publishes it as class_ops in
+ * ag_dev_add; it is not reached through dev->open/ops() by an application.
+ *
+ * It mirrors, function for function, what the built-in stack does - the same
+ * shape as components/argon_port/include/argon/port/net.h, because the kernel
+ * clients above it (net.c, netio.c, httpc.c, ftpc.c, ssh.c, ...) are written
+ * against exactly that shape and must not be able to tell which provider is
+ * underneath.  `dev` is the device the kernel bound; recover the driver's state
+ * with dev->get_priv(dev).
+ *
+ * SOCKET IDS.  listen/accept/connect hand back the coprocessor's own small
+ * integers; the kernel wraps them into ag_handle_t exactly as it wraps a port
+ * fd.  A negative return is an -AG_E* code.  Because only one provider is active
+ * at a time the id space belongs to whoever is bound, so no tagging is needed.
+ *
+ * THE recv_now / wait_readable SPLIT is the contract that matters: recv_now must
+ * return whatever has already arrived and never block (-AG_EAGAIN when nothing
+ * has), and wait_readable must answer within its timeout without a blocking
+ * read underneath.  A driver over a wire keeps a per-socket receive buffer fed
+ * by the coprocessor's unsolicited pushes and answers both out of it; recv()
+ * (which the ABI allows to block) may loop over the same buffer.
+ */
+typedef struct ag_net_ops {
+    uint32_t size;
+
+    ag_err_t (*start)(ag_device_t *dev);
+    bool (*ready)(ag_device_t *dev);
+    ag_err_t (*ifaddr)(ag_device_t *dev, uint32_t *addr_out); /* host-order */
+    ag_err_t (*resolve)(ag_device_t *dev, const char *host, uint32_t *addr_out);
+
+    int (*listen)(ag_device_t *dev, uint16_t port);
+    int (*accept)(ag_device_t *dev, int listen_fd, uint32_t timeout_ms);
+    int (*connect)(ag_device_t *dev, uint32_t addr, uint16_t port,
+                   uint32_t timeout_ms);
+
+    int32_t (*send)(ag_device_t *dev, int fd, const void *buf, size_t len);
+    int32_t (*recv)(ag_device_t *dev, int fd, void *buf, size_t len);
+    void (*net_close)(ag_device_t *dev, int fd);
+    ag_err_t (*nonblock)(ag_device_t *dev, int fd, bool on);
+
+    int (*wait_readable)(ag_device_t *dev, int fd, uint32_t timeout_ms);
+    int32_t (*recv_now)(ag_device_t *dev, int fd, void *buf, size_t len);
+} ag_net_ops_t;
 
 /* ------------------------------------------------------------------------ */
 /* audio - PCM output (built-in pcmnull discard; I2S/virt via .SYS)         */

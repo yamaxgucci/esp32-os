@@ -9,6 +9,7 @@
  */
 #include "platform.h"
 
+#include <stdio.h>
 #include <string.h>
 
 #include <argon/kernel.h>
@@ -70,16 +71,51 @@ const char *ag_profile_name(ag_profile_t p)
     }
 }
 
+/*
+ * A label field, filled and cut to fit.
+ *
+ * strncpy cannot say that truncation is intended and snprintf cannot
+ * either - the compiler proves the constant does not fit and refuses both.
+ * memcpy with a length worked out here says what is meant and is checked
+ * the same way.
+ */
+static void put_field(char *dst, size_t cap, const char *src)
+{
+    const size_t n = strlen(src);
+    const size_t k = (n < cap - 1u) ? n : (cap - 1u);
+
+    memcpy(dst, src, k);
+    dst[k] = '\0';
+}
+
 void ag_platform_fill_sysinfo(ag_sysinfo_t *out)
 {
+    /*
+     * These fields are labels and are meant to be cut to fit.  Nothing
+     * here had noticed that the build id no longer does - 39 characters
+     * into 24 - because the game builds the app and not the firmware.
+     */
     memset(out, 0, sizeof(*out));
-    strncpy(out->os_name, "ArgonOS", sizeof(out->os_name) - 1);
-    strncpy(out->os_version, ARGON_VERSION_STR, sizeof(out->os_version) - 1);
-    strncpy(out->build, ARGON_BUILD_ID, sizeof(out->build) - 1);
-    strncpy(out->chip, AG_PORT_TARGET_NAME, sizeof(out->chip) - 1);
-    strncpy(out->board, "generic", sizeof(out->board) - 1);
-    strncpy(out->profile, ag_profile_name(s_plat.profile),
-            sizeof(out->profile) - 1);
+    put_field(out->os_name, sizeof(out->os_name), "ArgonOS");
+    put_field(out->os_version, sizeof(out->os_version), ARGON_VERSION_STR);
+    {
+        /*
+         * A git describe identifies itself at its END - the commit hash -
+         * and on a long-lived branch the name in front of it is longer than
+         * this field on its own.  So when it does not fit, keep the tail.
+         */
+        const char  *id = ARGON_BUILD_ID;
+        const size_t n  = strlen(id);
+
+        if (n >= sizeof(out->build)) {
+            id += n - (sizeof(out->build) - 1u);
+        }
+        put_field(out->build, sizeof(out->build), id);
+    }
+    put_field(out->chip, sizeof(out->chip), AG_PORT_TARGET_NAME);
+    put_field(out->board, sizeof(out->board), "generic");
+    put_field(out->profile, sizeof(out->profile),
+              ag_profile_name(s_plat.profile));
 
     const uint8_t cores = ag_port_cpu_cores();
 

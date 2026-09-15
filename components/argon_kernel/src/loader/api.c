@@ -9,7 +9,10 @@
  */
 #include <stdarg.h>
 #include <stdio.h>
+#include <argon/session.h>
+#include <argon/shell.h>
 #include <string.h>
+#include <sys/time.h>
 #include <time.h>
 
 #include <argon/journal.h>
@@ -24,6 +27,7 @@
 #include <argon/input.h>
 #include <argon/kernel.h>
 #include <argon/keys.h>
+#include <argon/cfg.h>
 #include <argon/loader.h>
 #include <argon/log.h>
 #include <argon/module.h>
@@ -33,6 +37,8 @@
 #include <argon/shell.h>
 #include <argon/filemap.h>
 #include <argon/vfs.h>
+
+#include "core/sysconfig.h"
 
 #include <argon/port/config.h>
 
@@ -132,6 +138,9 @@ static bool api_module_task(void (*fn)(void *), void *arg, const char *name,
     return ag_module_task(fn, arg, name, stack, priority, flags);
 }
 
+/* Defined below, next to the other session-facing calls. */
+static int32_t api_prompt_in_slot(int slot, const char *cwd);
+
 static const ag_sys_api_t k_sys = {
     .size = sizeof(ag_sys_api_t),
     .info = api_info,
@@ -143,6 +152,7 @@ static const ag_sys_api_t k_sys = {
     .strerror = api_strerror,
     .heartbeat = api_heartbeat,
     .module_on_unload = api_module_on_unload,
+    .prompt_in_slot = api_prompt_in_slot,
     .module_task = api_module_task,
 };
 
@@ -396,6 +406,154 @@ static void api_fill(uint16_t x, uint16_t y, uint16_t w, uint16_t h, char ch,
     ag_console_unlock();
 }
 
+/*
+ * The console's cells, read back (ABI 0.43).
+ *
+ * Under the console lock, because a row is copied out of the live screen and
+ * the console writes to it from another task - a torn row would be a line of
+ * text with half of two different messages in it, which is the kind of thing
+ * that gets blamed on the reader.
+ */
+/*
+ * A row of another slot's screen.
+ *
+ * The permission is the same one api_peek_row asks for and it is asked for
+ * the same reason: the console belongs to the foreground, and a program
+ * that is not in front has no business reading what is on it.  What is
+ * different is WHICH screen - a slot with a prompt of its own has one
+ * nobody is looking at, and a window that draws it is the only way to see
+ * it.
+ */
+static int32_t api_peek_row_slot(int slot, uint16_t row, ag_textcell_t *cells,
+                                 uint16_t max)
+{
+    if (cells == NULL || max == 0) {
+        return -AG_EINVAL;
+    }
+    if (!has_console_focus()) {
+        return -AG_EPERM;
+    }
+
+    int32_t written = -AG_ENODEV;
+
+    ag_console_lock();
+    const ag_screen_t *sc = ag_console_screen_of_slot(slot);
+    if (sc != NULL && row < sc->rows) {
+        const ag_cell_t *src = ag_screen_row(sc, row);
+        if (src != NULL) {
+            uint16_t n = sc->cols;
+            if (n > max) {
+                n = max;
+            }
+            for (uint16_t i = 0; i < n; i++) {
+                cells[i].ch = (uint8_t)src[i].ch;
+                cells[i].attr = src[i].attr;
+            }
+            written = (int32_t)n;
+        }
+    }
+    ag_console_unlock();
+    return written;
+}
+
+/*
+ * Where the cursor is on another slot's screen.
+ *
+ * Same permission as reading its rows, and for the same reason: this is
+ * somebody else's screen, and only whatever is holding the glass has any
+ * business drawing it.
+ */
+static int32_t api_cursor_of_slot(int slot, uint16_t *x, uint16_t *y)
+{
+    if (x == NULL || y == NULL) {
+        return -AG_EINVAL;
+    }
+    if (!has_console_focus()) {
+        return -AG_EPERM;
+    }
+
+    int32_t err = -AG_ENODEV;
+    ag_console_lock();
+    const ag_screen_t *sc = ag_console_screen_of_slot(slot);
+    if (sc != NULL) {
+        *x = sc->cur_x;
+        *y = sc->cur_y;
+        err = 0;
+    }
+    ag_console_unlock();
+    return err;
+}
+
+/*
+ * Give a slot a shell of its own.  A slot below zero means any free one -
+ * a window asking for a prompt has no business choosing a number, and
+ * nothing in the ABI lets it see which are taken.
+ */
+static int32_t api_prompt_in_slot(int slot, const char *cwd)
+{
+    if (slot >= 0) {
+        const ag_err_t err = ag_shell_start_in_slot_at(slot, cwd);
+        return (err == AG_OK) ? (int32_t)slot : (int32_t)err;
+    }
+
+    /*
+     * A free slot is one with nothing RUNNING in it, not merely one with
+     * no prompt.  Asking only about the prompt put the first one in the
+     * caller's own slot - the desktop asks for this, and the desktop is
+     * itself the application sitting in slot 1.
+     */
+    ag_session_slot_t slots[AG_SESSION_SLOTS];
+    ag_session_info(slots);
+    for (int i = 0; i < AG_SESSION_SLOTS; i++) {
+        if (slots[i].pid != AG_PID_KERNEL) {
+            continue;
+        }
+        if (ag_shell_start_in_slot_at(i, cwd) == AG_OK) {
+            return (int32_t)i;
+        }
+    }
+    return -AG_ENOSPC;
+}
+
+static bool api_inp_post_to_slot(int slot, const ag_event_t *ev)
+{
+    if (ev == NULL || !has_console_focus()) {
+        return false;
+    }
+    return ag_console_post_to_slot(slot, ev);
+}
+
+static int32_t api_peek_row(uint16_t row, ag_textcell_t *cells, uint16_t max)
+{
+    if (cells == NULL || max == 0) {
+        return -AG_EINVAL;
+    }
+    if (!has_console_focus()) {
+        return -AG_EPERM;
+    }
+
+    int32_t written = -AG_ENODEV;
+
+    ag_console_lock();
+    const ag_screen_t *sc = ag_console_screen();
+    if (sc != NULL && row < sc->rows) {
+        const ag_cell_t *src = ag_screen_row(sc, row);
+        if (src != NULL) {
+            uint16_t n = sc->cols;
+            if (n > max) {
+                n = max;
+            }
+            for (uint16_t i = 0; i < n; i++) {
+                cells[i].ch = (uint8_t)src[i].ch;
+                cells[i].attr = src[i].attr;
+            }
+            written = (int32_t)n;
+        }
+    }
+    ag_console_unlock();
+    return written;
+}
+
 static uint16_t api_codepage(void) { return ag_cp_number(ag_cp_active()); }
 
 static ag_err_t api_set_codepage(uint16_t number)
@@ -431,6 +589,9 @@ static const ag_con_api_t k_con = {
     .fill = api_fill,
     .codepage = api_codepage,
     .set_codepage = api_set_codepage,
+    .peek_row = api_peek_row,
+    .peek_row_slot = api_peek_row_slot,
+    .cursor_of_slot = api_cursor_of_slot,
 };
 
 /* ---------------------------------------------------------------------- */
@@ -611,6 +772,52 @@ static ag_err_t api_get_datetime(ag_datetime_t *out)
     return AG_OK;
 }
 
+/*
+ * Set the wall clock, UTC.
+ *
+ * The entry beside this one said `NULL, needs an RTC driver` for as long
+ * as it has existed, and that was two different questions treated as one.
+ * Keeping time across a power cut needs an RTC and none of these boards
+ * has one; KNOWING what the time is only needs somebody to say so, and
+ * until now the only somebody was a network time server - which the CYD
+ * cannot reach at all, because bringing its radio up damages its
+ * SYSTEM.CFG.  A machine that cannot be told the time by the person
+ * sitting in front of it is worse than one with no clock.
+ *
+ * It is lost at every power cut, and that is honest rather than
+ * regrettable: the shell draws an unset clock as --:-- rather than as
+ * half past midnight in 1970.
+ */
+static ag_err_t api_set_datetime(const ag_datetime_t *dt)
+{
+    if (dt == NULL || dt->year < 1970u || dt->month < 1u || dt->month > 12u ||
+        dt->day < 1u || dt->day > 31u || dt->hour > 23u || dt->minute > 59u ||
+        dt->second > 60u) {
+        return -AG_EINVAL;
+    }
+
+    struct tm tm;
+    memset(&tm, 0, sizeof(tm));
+    tm.tm_year = (int)dt->year - 1900;
+    tm.tm_mon = (int)dt->month - 1;
+    tm.tm_mday = (int)dt->day;
+    tm.tm_hour = (int)dt->hour;
+    tm.tm_min = (int)dt->minute;
+    tm.tm_sec = (int)dt->second;
+    tm.tm_isdst = 0;
+
+    /* No timezone is set on the board, so mktime's "local" is UTC. */
+    const time_t t = mktime(&tm);
+    if (t == (time_t)-1) {
+        return -AG_EINVAL;
+    }
+
+    struct timeval tv;
+    tv.tv_sec = t;
+    tv.tv_usec = 0;
+    return (settimeofday(&tv, NULL) == 0) ? AG_OK : -AG_EIO;
+}
+
 static const ag_time_api_t k_time = {
     .size = sizeof(ag_time_api_t),
     .us = api_us,
@@ -619,7 +826,7 @@ static const ag_time_api_t k_time = {
     .delay_ms = api_delay_ms,
     .delay_us = api_delay_us,
     .get_datetime = api_get_datetime,
-    .set_datetime = NULL, /* needs an RTC driver */
+    .set_datetime = api_set_datetime,
     .timer_create = NULL,
     .timer_delete = NULL,
 };
@@ -693,6 +900,7 @@ static const ag_inp_api_t k_inp = {
     .btn = api_inp_btn,
     .btnp = api_inp_btnp,
     .inject = api_inp_inject,
+    .post_to_slot = api_inp_post_to_slot,
 };
 
 /* ---------------------------------------------------------------------- */
@@ -1490,6 +1698,70 @@ static const ag_cam_api_t k_cam = {
 };
 #endif
 
+/* ----------------------------------------------------------------------- */
+/* cfg - read the system/board configuration (SYSTEM.CFG + BOARD.CFG).      */
+/*                                                                          */
+/* Read-only for now: a driver reads its own keys (a radio its ssid, a      */
+/* panel its rotation).  Writing back to SYSTEM.CFG is the owner's job      */
+/* through the shell, so set_str/commit answer -AG_ENOTSUP rather than      */
+/* pretend.  Without this table api->cfg was NULL and every `.SYS`/`.AXE`   */
+/* silently saw no configuration at all.                                    */
+/* ----------------------------------------------------------------------- */
+static ag_err_t api_cfg_get_str(const char *key, char *buf, size_t len)
+{
+    if (key == NULL || buf == NULL || len == 0) {
+        return -AG_EINVAL;
+    }
+    buf[0] = '\0';
+    const ag_cfg_t *cfg = ag_sysconfig();
+    if (cfg == NULL) {
+        return -AG_ENOENT;
+    }
+    const char *val = ag_cfg_get(cfg, key, NULL);
+    if (val == NULL) {
+        return -AG_ENOENT;
+    }
+    size_t i = 0;
+    for (; val[i] != '\0' && i + 1 < len; i++) {
+        buf[i] = val[i];
+    }
+    buf[i] = '\0';
+    return AG_OK;
+}
+
+static int32_t api_cfg_get_int(const char *key, int32_t def)
+{
+    const ag_cfg_t *cfg = ag_sysconfig();
+    return (cfg == NULL) ? def : ag_cfg_get_int(cfg, key, def);
+}
+
+static bool api_cfg_get_bool(const char *key, bool def)
+{
+    const ag_cfg_t *cfg = ag_sysconfig();
+    return (cfg == NULL) ? def : ag_cfg_get_bool(cfg, key, def);
+}
+
+static ag_err_t api_cfg_set_str(const char *key, const char *value)
+{
+    (void)key;
+    (void)value;
+    return -AG_ENOTSUP;
+}
+
+static ag_err_t api_cfg_commit(void)
+{
+    return -AG_ENOTSUP;
+}
+
+static const ag_cfg_api_t k_cfg = {
+    .size = sizeof(ag_cfg_api_t),
+    .get_str = api_cfg_get_str,
+    .get_int = api_cfg_get_int,
+    .get_bool = api_cfg_get_bool,
+    .set_str = api_cfg_set_str,
+    .commit = api_cfg_commit,
+};
+
 static const ag_api_t k_api = {
     .size = sizeof(ag_api_t),
     .abi_major = AG_ABI_MAJOR,
@@ -1505,7 +1777,7 @@ static const ag_api_t k_api = {
     .time = &k_time,
     .task = &ag_task_api_table,
     .proc = &k_proc,
-    .cfg = NULL,
+    .cfg = &k_cfg,
 #if defined(CONFIG_ARGON_ENABLE_NET) && CONFIG_ARGON_ENABLE_NET
     .net = &ag_net_api_impl,
 #else

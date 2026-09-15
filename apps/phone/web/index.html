@@ -1,0 +1,1129 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#101216">
+<title>ArgonOS</title>
+<!--
+  The screen and keyboard of an ArgonOS board, in a browser.
+
+  Served by PHONE.SYS out of the board's own flash - there is nothing to
+  install and nothing to copy.  Add it to the home screen and it opens without
+  browser chrome, which is the whole of what a "phone app" needs to be here.
+
+  Three decisions worth knowing before changing anything:
+
+  * The board decides which of two screens is live, and it does so without
+    saying: the console arrives as rows of characters only while no application
+    holds the display, and pixels arrive only while one does.  So "whatever
+    arrived last" is not a guess - it is exactly the kernel's own state, read
+    off the traffic.  The caret blinks twice a second for as long as the console
+    owns the screen, which keeps the text side refreshed with no polling.
+
+  * Text is drawn with the browser's own monospace font rather than a bitmap
+    one.  A phone screen is three hundred pixels per inch and an 8x16 font
+    scaled up to it looks like a photograph of a screen; the browser's font at
+    the same grid is simply text.  CP437's box drawing is mapped to Unicode
+    below, because the file manager and the editor are made of it.
+
+  * Every decoder here mirrors apps/common/pixband/ag_pixband.c.  That file is
+    round-tripped against its own decoder on the PC in host-tests; this copy is
+    not, so a change there that is not made here shows up as a picture that is
+    subtly wrong and nothing that says so.
+-->
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body {
+    margin: 0; height: 100%; overflow: hidden; background: #101216;
+    color: #d8dee9; font: 13px/1.4 system-ui, -apple-system, sans-serif;
+    overscroll-behavior: none; touch-action: none;
+  }
+  #app { display: flex; flex-direction: column; height: 100%; }
+
+  header {
+    display: flex; align-items: center; gap: 8px; padding: 6px 10px;
+    padding-top: max(6px, env(safe-area-inset-top));
+    background: #181b21; border-bottom: 1px solid #262a33; flex: none;
+  }
+  #dot { width: 9px; height: 9px; border-radius: 50%; background: #b4523c; flex: none; }
+  #dot.on { background: #4a9e5c; }
+  #name { font-weight: 600; letter-spacing: .02em; }
+  #note { color: #767e8c; font-size: 11px; margin-left: auto; }
+  header button { margin-left: 6px; }
+
+  button {
+    background: #242832; color: #d8dee9; border: 1px solid #333846;
+    border-radius: 6px; padding: 7px 10px; font: inherit; font-size: 12px;
+    white-space: nowrap; cursor: pointer; user-select: none;
+  }
+  button:active { background: #39414f; }
+  button.held { background: #4a5566; border-color: #5d6b80; }
+
+  /*
+   * The state of the link, in a line of its own.
+   *
+   * It used to be said by covering the screen, which is the wrong place twice
+   * over: it hides the picture, and it only appears at the moment something
+   * goes wrong - so a link that is down while nobody is looking says nothing at
+   * all.  A bar under the header is always where it is, is readable while the
+   * last picture is still on the glass, and can be tapped when there is
+   * something to do about it.
+   */
+  #bar {
+    flex: none; display: none; padding: 7px 12px; font-size: 12px;
+    background: #3a2f1c; color: #e0c48a; border-bottom: 1px solid #4a3d24;
+    text-align: center; cursor: pointer;
+  }
+  #bar.on { display: block; }
+  #bar.bad { background: #3a1f1f; color: #e39a9a; border-bottom-color: #4d2a2a; }
+
+  #screen {
+    flex: 1 1 auto; position: relative; display: flex;
+    align-items: center; justify-content: center; overflow: hidden;
+    background: #000;
+  }
+
+  #ask {
+    position: absolute; inset: 0; display: none;
+    align-items: center; justify-content: center;
+    background: rgba(16,18,22,.94); padding: 24px;
+  }
+  #ask.on { display: flex; }
+  #ask form { width: 100%; max-width: 320px; text-align: center; }
+  #ask h2 { font-size: 15px; font-weight: 600; margin: 0 0 4px; }
+  #ask p { color: #767e8c; font-size: 12px; margin: 0 0 14px; }
+  #ask input {
+    width: 100%; padding: 11px 12px; font: inherit; font-size: 16px;
+    background: #21252e; color: #d8dee9; border: 1px solid #39414f;
+    border-radius: 6px; margin-bottom: 10px;
+  }
+  #ask button { width: 100%; padding: 11px 0; font-size: 15px; }
+  #ask .bad { color: #e39a9a; }
+  canvas {
+    display: block; max-width: 100%; max-height: 100%;
+    image-rendering: pixelated; image-rendering: crisp-edges;
+    touch-action: none;
+  }
+  canvas[hidden] { display: none; }
+
+  #keys {
+    flex: none; display: flex; gap: 5px; padding: 6px 8px;
+    background: #181b21; border-top: 1px solid #262a33;
+    overflow-x: auto; overflow-y: hidden; scrollbar-width: none;
+  }
+  #keys::-webkit-scrollbar { display: none; }
+
+  /*
+   * The keyboard the page carries itself.
+   *
+   * The first version had only the row above and a button that focused a
+   * hidden textarea, on the theory that the phone's own keyboard is the one
+   * the owner knows.  On a real phone nothing came up: a browser raises the
+   * keyboard for a field the user can see, and refuses it for one parked off
+   * screen at opacity zero - which is exactly how such a field has to be
+   * parked for a full-screen canvas.  So the keys are drawn here, where
+   * whether they appear is not the browser's opinion.
+   */
+  #kbd {
+    flex: none; display: none; flex-direction: column; gap: 4px;
+    padding: 5px 4px; padding-bottom: max(5px, env(safe-area-inset-bottom));
+    background: #14171c; border-top: 1px solid #262a33;
+  }
+  #kbd.on { display: flex; }
+  #kbd .row { display: flex; gap: 4px; justify-content: center; }
+  #kbd button {
+    flex: 1 1 0; min-width: 0; padding: 9px 0; font-size: 14px;
+    text-align: center; border-radius: 5px;
+  }
+  #kbd button.wide { flex: 2 1 0; }
+  #kbd button.xwide { flex: 4 1 0; }
+  #kbd button.mod { background: #2c3240; font-size: 13px; }
+
+  #sink {
+    /*
+     * In the viewport, not at -9999px: a field a browser considers off screen
+     * is a field it will not raise a keyboard for.  One pixel and transparent,
+     * behind everything, so it never takes a tap meant for the screen.
+     */
+    position: fixed; left: 0; bottom: 0; width: 1px; height: 1px;
+    opacity: 0; border: 0; padding: 0; z-index: -1;
+    color: transparent; background: transparent; caret-color: transparent;
+  }
+  #splash {
+    position: absolute; inset: 0; display: flex; align-items: center;
+    justify-content: center; text-align: center; padding: 20px;
+    color: #767e8c; font-size: 13px; line-height: 1.6; pointer-events: none;
+    white-space: pre-line;
+  }
+  #splash[hidden] { display: none; }
+</style>
+
+<div id="app">
+  <header>
+    <span id="dot"></span>
+    <span id="name">ArgonOS</span>
+    <span id="note">connecting…</span>
+    <button id="kb">⌨</button>
+    <button id="native">abc</button>
+  </header>
+  <div id="bar"></div>
+  <div id="screen">
+    <canvas id="text"></canvas>
+    <canvas id="pix" hidden></canvas>
+    <div id="splash">no picture yet — the board sends one when something draws</div>
+    <div id="ask">
+      <form id="askform">
+        <h2>This board asks for a password</h2>
+        <p id="askwhy">Set in SYSTEM.CFG, section [phone].</p>
+        <input id="askpw" type="password" autocomplete="current-password"
+               autocapitalize="off" autocorrect="off" placeholder="password">
+        <button type="submit">Unlock</button>
+      </form>
+    </div>
+  </div>
+  <div id="keys"></div>
+  <div id="kbd"></div>
+</div>
+<textarea id="sink" autocapitalize="off" autocorrect="off" autocomplete="off"
+          spellcheck="false"></textarea>
+
+<script>
+"use strict";
+
+/* ---- what the board says and what it is told ------------------------- */
+
+const OP_INFO = 0x4d, OP_ROW = 0x52, OP_CURSOR = 0x43, OP_AUTH = 0x41;
+const OP_RAW = 0x42, OP_PACK = 0x50, OP_IDX = 0x49;
+
+const IN_HELLO = 0x48, IN_KEY = 0x4b, IN_PTR = 0x50, IN_TEXT = 0x54;
+const IN_AUTH = 0x41;
+
+/*
+ * SHA-1, written out, because the board's challenge-response needs it and the
+ * browser will not lend one: crypto.subtle exists only in a secure context, and
+ * a page served over http from a board on the local network is not one.  That
+ * is not a detail to design around later - it is the reason this is here.
+ *
+ * Mirrors the C in apps/common/ws/ag_ws.c, which is checked against the RFC's
+ * own vector on the PC.
+ */
+function sha1(bytes) {
+  const ml = bytes.length;
+  const withPad = new Uint8Array((((ml + 8) >> 6) + 1) << 6);
+  withPad.set(bytes);
+  withPad[ml] = 0x80;
+  const view = new DataView(withPad.buffer);
+  view.setUint32(withPad.length - 4, ml << 3, false);
+  view.setUint32(withPad.length - 8, Math.floor(ml / 536870912), false);
+
+  let h0 = 0x67452301, h1 = 0xEFCDAB89, h2 = 0x98BADCFE,
+      h3 = 0x10325476, h4 = 0xC3D2E1F0;
+  const w = new Int32Array(80);
+  const rol = (v, n) => (v << n) | (v >>> (32 - n));
+
+  for (let i = 0; i < withPad.length; i += 64) {
+    for (let j = 0; j < 16; j++) w[j] = view.getInt32(i + j * 4, false);
+    for (let j = 16; j < 80; j++) {
+      w[j] = rol(w[j-3] ^ w[j-8] ^ w[j-14] ^ w[j-16], 1);
+    }
+    let a = h0, b = h1, c = h2, d = h3, e = h4;
+    for (let j = 0; j < 80; j++) {
+      let f, k;
+      if (j < 20) { f = (b & c) | (~b & d); k = 0x5A827999; }
+      else if (j < 40) { f = b ^ c ^ d; k = 0x6ED9EBA1; }
+      else if (j < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8F1BBCDC; }
+      else { f = b ^ c ^ d; k = 0xCA62C1D6; }
+      const t = (rol(a, 5) + f + e + k + w[j]) | 0;
+      e = d; d = c; c = rol(b, 30); b = a; a = t;
+    }
+    h0 = (h0 + a) | 0; h1 = (h1 + b) | 0; h2 = (h2 + c) | 0;
+    h3 = (h3 + d) | 0; h4 = (h4 + e) | 0;
+  }
+
+  const out = new Uint8Array(20);
+  const ov = new DataView(out.buffer);
+  ov.setInt32(0, h0, false); ov.setInt32(4, h1, false);
+  ov.setInt32(8, h2, false); ov.setInt32(12, h3, false);
+  ov.setInt32(16, h4, false);
+  return out;
+}
+
+/* USB HID usage ids - the same numbers argon/keys.h has, because that is what
+ * a keycode is in this system: layout independent, and the kernel's own tables
+ * are written against them. */
+const K = {
+  a:4, b:5, c:6, d:7, e:8, f:9, g:10, h:11, i:12, j:13, k:14, l:15, m:16,
+  n:17, o:18, p:19, q:20, r:21, s:22, t:23, u:24, v:25, w:26, x:27, y:28, z:29,
+  "1":30, "2":31, "3":32, "4":33, "5":34, "6":35, "7":36, "8":37, "9":38, "0":39,
+  enter:40, esc:41, back:42, tab:43, space:44, minus:45, equal:46,
+  lbracket:47, rbracket:48, backslash:49, semicolon:51, quote:52,
+  grave:53, comma:54, period:55, slash:56, caps:57,
+  f1:58, f2:59, f3:60, f4:61, f5:62, f6:63, f7:64, f8:65, f9:66, f10:67,
+  f11:68, f12:69,
+  home:74, pgup:75, del:76, end:77, pgdn:78,
+  right:79, left:80, down:81, up:82,
+};
+
+const MOD = { shift:1, ctrl:2, alt:4, gui:8 };
+
+/*
+ * CP437 to Unicode.  The first thirty-two are the graphic characters the
+ * console actually draws there, not control codes: a file manager made of box
+ * drawing is unreadable without them, and "just print the byte" turns half the
+ * screen into accented Latin.
+ */
+const CP437 = (
+  " ☺☻♥♦♣♠•◘○◙♂♀♪♫☼►◄↕‼¶§▬↨↑↓→←∟↔▲▼" +
+  " !\"#$%&'()*+,-./0123456789:;<=>?" +
+  "@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_" +
+  "`abcdefghijklmnopqrstuvwxyz{|}~⌂" +
+  "ÇüéâäàåçêëèïîìÄÅÉæÆôöòûùÿÖÜ¢£¥₧ƒ" +
+  "áíóúñÑªº¿⌐¬½¼¡«»░▒▓│┤╡╢╖╕╣║╗╝╜╛┐" +
+  "└┴┬├─┼╞╟╚╔╩╦╠═╬╧╨╤╥╙╘╒╓╫╪┘┌█▄▌▐▀" +
+  "αßΓπΣσµτΦΘΩδ∞φε∩≡±≥≤⌠⌡÷≈°∙·√ⁿ²■ "
+).split("");
+
+/* The CGA palette, which is what an attribute byte means and has meant since
+ * 1981.  High nibble background, low nibble foreground. */
+const CGA = [
+  "#000000","#0000aa","#00aa00","#00aaaa","#aa0000","#aa00aa","#aa5500","#aaaaaa",
+  "#555555","#5555ff","#55ff55","#55ffff","#ff5555","#ff55ff","#ffff55","#ffffff",
+];
+
+/* ---- state ----------------------------------------------------------- */
+
+const ui = {
+  dot: document.getElementById("dot"),
+  note: document.getElementById("note"),
+  text: document.getElementById("text"),
+  pix: document.getElementById("pix"),
+  keys: document.getElementById("keys"),
+  kbd: document.getElementById("kbd"),
+  sink: document.getElementById("sink"),
+  splash: document.getElementById("splash"),
+  kb: document.getElementById("kb"),
+  native: document.getElementById("native"),
+  bar: document.getElementById("bar"),
+  ask: document.getElementById("ask"),
+  askform: document.getElementById("askform"),
+  askpw: document.getElementById("askpw"),
+  askwhy: document.getElementById("askwhy"),
+};
+
+/*
+ * The link's state, in the bar under the header, and the only place it is said.
+ *
+ * `tap` is what to do when there is something to do - taking the screen back
+ * from another device, mostly.  Without one the bar is just a line of text and
+ * does not pretend to be a button.
+ */
+function setBar(text, bad, tap) {
+  ui.bar._tap = tap || null;
+  if (!text) {
+    ui.bar.classList.remove("on");
+    return;
+  }
+  ui.bar.textContent = text;
+  ui.bar.classList.toggle("bad", !!bad);
+  ui.bar.classList.add("on");
+  ui.bar.style.cursor = tap ? "pointer" : "default";
+}
+
+document.getElementById("bar").addEventListener("click", () => {
+  if (ui.bar._tap) ui.bar._tap();
+});
+
+const st = {
+  ws: null,
+  cols: 80, rows: 25, cellW: 8, cellH: 16,
+  surfW: 0, surfH: 0,
+  cells: null,          /* Uint16Array, ch | attr << 8 */
+  cur: { x: 0, y: 0, on: false },
+  mode: "text",
+  sticky: 0,            /* modifiers held by the on-screen keys */
+  ptrDown: false,
+  pending: false,       /* a text repaint is already scheduled */
+  dirtyRows: new Set(),
+  pendingNonce: null,   /* a challenge waiting on a password being typed */
+};
+
+/* Drawn at three times the console's own cell, which is where a phone's pixel
+ * density stops being wasted on a scaled-up 8x16 and starts being text. */
+const CW = 12, CH = 24;
+
+const tctx = ui.text.getContext("2d", { alpha: false });
+const pctx = ui.pix.getContext("2d", { alpha: false });
+
+/* ---- the text screen -------------------------------------------------- */
+
+function resizeText() {
+  ui.text.width = st.cols * CW;
+  ui.text.height = st.rows * CH;
+  st.cells = new Uint16Array(st.cols * st.rows).fill(0x0720);
+  tctx.textBaseline = "top";
+  tctx.font = `${CH - 4}px ui-monospace, "SF Mono", Menlo, Consolas, monospace`;
+  paintText();
+}
+
+function paintCell(x, y) {
+  const v = st.cells[y * st.cols + x];
+  const ch = v & 0xff, attr = v >> 8;
+  const px = x * CW, py = y * CH;
+
+  tctx.fillStyle = CGA[(attr >> 4) & 7];
+  tctx.fillRect(px, py, CW, CH);
+
+  const caret = st.cur.on && st.cur.x === x && st.cur.y === y;
+  if (caret) {
+    tctx.fillStyle = CGA[attr & 15];
+    tctx.fillRect(px, py + CH - 3, CW, 2);
+  }
+  if (ch !== 32 && ch !== 0) {
+    tctx.fillStyle = CGA[attr & 15];
+    tctx.fillText(CP437[ch], px + 1, py + 2);
+  }
+}
+
+function paintText() {
+  for (let y = 0; y < st.rows; y++) {
+    for (let x = 0; x < st.cols; x++) paintCell(x, y);
+  }
+}
+
+/* One repaint per animation frame however many rows arrived, because a screen
+ * clearing is twenty-five messages and twenty-five full repaints is a phone
+ * that stutters on a `cls`. */
+function schedulePaint(rows) {
+  if (!st.pending) {
+    st.pending = true;
+    requestAnimationFrame(() => { st.pending = false; flushRows(); });
+  }
+  for (const r of rows) st.dirtyRows.add(r);
+}
+
+function flushRows() {
+  for (const y of st.dirtyRows) {
+    if (y >= st.rows) continue;
+    for (let x = 0; x < st.cols; x++) paintCell(x, y);
+  }
+  st.dirtyRows.clear();
+}
+
+/*
+ * The splash goes on the first thing that arrives, whatever it is - not inside
+ * the mode switch below, which returns early when the mode has not changed and
+ * so never ran at all for a board that started in text and stayed there.
+ */
+function showText() {
+  ui.splash.hidden = true;
+  if (st.mode === "text") return;
+  st.mode = "text";
+  ui.pix.hidden = true;
+  ui.text.hidden = false;
+}
+
+/* ---- the picture ------------------------------------------------------ */
+
+function showPixels() {
+  ui.splash.hidden = true;
+  if (st.mode === "pix") return;
+  st.mode = "pix";
+  ui.text.hidden = true;
+  ui.pix.hidden = false;
+}
+
+function resizePix(w, h) {
+  if (ui.pix.width === w && ui.pix.height === h) return;
+  ui.pix.width = w;
+  ui.pix.height = h;
+  pctx.fillStyle = "#000";
+  pctx.fillRect(0, 0, w, h);
+}
+
+/*
+ * PackBits over 16-bit pixels, and over bytes.  Mirrors pack16 / pack8 in
+ * apps/common/pixband/ag_pixband.c: a control byte, then either that many
+ * literals or that many copies of one.
+ */
+function unpack16(v, at, end, out, n) {
+  let o = 0;
+  while (at < end) {
+    const ctl = v.getUint8(at++);
+    if (ctl & 0x80) {
+      const run = (ctl - 0x80) + 2;
+      const px = v.getUint16(at, true); at += 2;
+      if (o + run > n) return false;
+      for (let k = 0; k < run; k++) out[o++] = px;
+    } else {
+      const lit = ctl + 1;
+      if (o + lit > n) return false;
+      for (let k = 0; k < lit; k++) { out[o++] = v.getUint16(at, true); at += 2; }
+    }
+  }
+  return o === n;
+}
+
+function unpack8(v, at, end, out, n) {
+  let o = 0;
+  while (at < end) {
+    const ctl = v.getUint8(at++);
+    if (ctl & 0x80) {
+      const run = (ctl - 0x80) + 2;
+      const b = v.getUint8(at++);
+      if (o + run > n) return false;
+      for (let k = 0; k < run; k++) out[o++] = b;
+    } else {
+      const lit = ctl + 1;
+      if (o + lit > n) return false;
+      for (let k = 0; k < lit; k++) out[o++] = v.getUint8(at++);
+    }
+  }
+  return o === n;
+}
+
+function band(op, v, at, end) {
+  const x = v.getUint16(at, true), y = v.getUint16(at + 2, true);
+  const w = v.getUint16(at + 4, true), h = v.getUint16(at + 6, true);
+  at += 8;
+
+  const n = w * h;
+  if (n === 0 || n > 1 << 20) return;
+  const px = new Uint16Array(n);
+
+  if (op === OP_RAW) {
+    if (end - at !== n * 2) return;
+    for (let i = 0; i < n; i++) px[i] = v.getUint16(at + i * 2, true);
+  } else if (op === OP_PACK) {
+    if (!unpack16(v, at, end, px, n)) return;
+  } else {
+    const bpp = v.getUint8(at), ncol = v.getUint8(at + 1) + 1;
+    at += 2;
+    const pal = new Uint16Array(ncol);
+    for (let i = 0; i < ncol; i++) { pal[i] = v.getUint16(at, true); at += 2; }
+    const bytes = bpp === 4 ? ((n + 1) >> 1) : n;
+    const raw = new Uint8Array(bytes);
+    if (!unpack8(v, at, end, raw, bytes)) return;
+    for (let i = 0; i < n; i++) {
+      const idx = bpp === 4
+        ? ((i & 1) ? (raw[i >> 1] >> 4) : (raw[i >> 1] & 15))
+        : raw[i];
+      if (idx >= ncol) return;
+      px[i] = pal[idx];
+    }
+  }
+
+  /* RGB565 to the canvas's RGBA, with the low bits replicated into the high
+   * ones so that full white stays full white instead of landing at 248. */
+  const img = pctx.createImageData(w, h);
+  const d = img.data;
+  for (let i = 0, j = 0; i < n; i++) {
+    const c = px[i];
+    const r = (c >> 11) & 31, g = (c >> 5) & 63, b = c & 31;
+    d[j++] = (r << 3) | (r >> 2);
+    d[j++] = (g << 2) | (g >> 4);
+    d[j++] = (b << 3) | (b >> 2);
+    d[j++] = 255;
+  }
+  pctx.putImageData(img, x, y);
+  showPixels();
+}
+
+/* ---- the connection --------------------------------------------------- */
+
+/*
+ * The password is kept per board, so one phone can hold several without being
+ * asked each time, and dropped the moment the board says it was wrong.  In the
+ * browser's own storage: it never leaves this device, and what crosses the wire
+ * is a digest of it and a nonce, never the password.
+ */
+const PW_KEY = "argon.pw." + location.host;
+
+function storedPassword() {
+  try { return localStorage.getItem(PW_KEY) || ""; } catch (e) { return ""; }
+}
+
+function rememberPassword(pw) {
+  try { if (pw) localStorage.setItem(PW_KEY, pw); else localStorage.removeItem(PW_KEY); }
+  catch (e) { /* a private window; ask again next time */ }
+}
+
+function answerChallenge(nonce, pw) {
+  const bytes = new TextEncoder().encode(pw);
+  const buf = new Uint8Array(nonce.length + bytes.length);
+  buf.set(nonce, 0);
+  buf.set(bytes, nonce.length);
+  const digest = sha1(buf);
+  const msg = new Uint8Array(1 + digest.length);
+  msg[0] = IN_AUTH;
+  msg.set(digest, 1);
+  if (st.ws && st.ws.readyState === 1) st.ws.send(msg);
+}
+
+function askForPassword(nonce, wrong) {
+  ui.ask.classList.add("on");
+  ui.askwhy.textContent = wrong
+    ? "That was not it. Try again."
+    : "Set in SYSTEM.CFG, section [phone].";
+  ui.askwhy.classList.toggle("bad", !!wrong);
+  ui.askpw.value = "";
+  setTimeout(() => ui.askpw.focus(), 50);
+  /* The keys are needed now if they are ever needed: on a phone whose own
+   * keyboard does not come up, this dialogue is the first thing that has to be
+   * typed into, and a folded keyboard here is a dead end. */
+  if (window.matchMedia && window.matchMedia("(pointer: coarse)").matches &&
+      !ui.kbd.classList.contains("on")) {
+    ui.kbd.classList.add("on");
+    ui.kb.classList.add("held");
+  }
+  st.pendingNonce = nonce;
+}
+
+ui.askform.addEventListener("submit", (e) => {
+  e.preventDefault();
+  const pw = ui.askpw.value;
+  if (!pw) return;
+  rememberPassword(pw);
+  ui.ask.classList.remove("on");
+  if (st.pendingNonce) {
+    answerChallenge(st.pendingNonce, pw);
+    st.pendingNonce = null;
+  } else {
+    connect();
+  }
+});
+
+function connect() {
+  const url = (location.protocol === "https:" ? "wss://" : "ws://") +
+              location.host + "/ws";
+  const ws = new WebSocket(url);
+  ws.binaryType = "arraybuffer";
+  st.ws = ws;
+
+  ws.onopen = () => {
+    if (ws !== st.ws) { ws.close(); return; }
+    ui.dot.classList.add("on");
+    ui.note.textContent = location.host;
+    setBar("");
+    ws.send(new Uint8Array([IN_HELLO]));
+  };
+  ws.onclose = (ev) => {
+    /*
+     * Only from the socket that is current.  A page that opened two - and it
+     * could, see the visibility handler - gets the board's "replaced" for the
+     * one it abandoned, which is not news and must not be shown as though the
+     * live link had been taken away.  Caught exactly that way: a freshly loaded
+     * page saying another device had the screen while it was connected.
+     */
+    if (ws !== st.ws) return;
+    ui.dot.classList.remove("on");
+
+    /*
+     * The board allows one client: there is one screen and one keyboard.  When
+     * a second browser takes the link it says so in the close, and the one that
+     * lost it must NOT come straight back - two pages reconnecting at each
+     * other is a link that flaps about once a second and looks like a fault.
+     * Wait to be asked instead, and say so where it can be read without
+     * covering the picture that is still on the glass.
+     */
+    if (ev && ev.reason === "replaced") {
+      ui.note.textContent = "screen taken";
+      setBar("Another device has this screen — tap here to take it back",
+             false, () => { setBar("connecting…"); connect(); });
+      return;
+    }
+    if (ev && ev.reason === "badpass") {
+      ui.note.textContent = "locked";
+      rememberPassword("");
+      setBar("Wrong password — tap here to try again", true, () => {
+        setBar("connecting…");
+        connect();
+      });
+      askForPassword(null, true);
+      return;
+    }
+
+    ui.note.textContent = "reconnecting…";
+    setBar("The board is not answering — reconnecting…");
+    /*
+     * A second, not immediately.  A board that has just been reset refuses
+     * connections for a few seconds, and a page that retries as fast as it can
+     * is a page that spends that time producing errors.
+     */
+    setTimeout(connect, 1000);
+  };
+  ws.onerror = () => ws.close();
+  ws.onmessage = (ev) => {
+    if (ws !== st.ws) return;
+    onMessage(new DataView(ev.data));
+  };
+}
+
+function onMessage(v) {
+  if (v.byteLength < 1) return;
+  const op = v.getUint8(0);
+
+  if (op === OP_AUTH) {
+    /* The board has asked who this is, and will send nothing else until it is
+     * answered.  A password we already hold goes straight back; otherwise the
+     * person is asked, once, and the answer is kept for next time. */
+    const nonce = new Uint8Array(v.buffer, 1, v.byteLength - 1);
+    const pw = storedPassword();
+    if (pw) {
+      answerChallenge(nonce, pw);
+    } else {
+      askForPassword(new Uint8Array(nonce), false);
+    }
+    return;
+  }
+
+  /* Anything else means the board is talking, so it is satisfied. */
+  ui.ask.classList.remove("on");
+
+  if (op === OP_INFO) {
+    st.surfW = v.getUint16(1, true);
+    st.surfH = v.getUint16(3, true);
+    const cols = v.getUint8(5), rows = v.getUint8(6);
+    st.cellW = v.getUint8(7) || 8;
+    st.cellH = v.getUint8(8) || 16;
+    if (cols && rows && (cols !== st.cols || rows !== st.rows)) {
+      st.cols = cols; st.rows = rows; resizeText();
+    }
+    if (st.surfW && st.surfH) resizePix(st.surfW, st.surfH);
+    return;
+  }
+
+  if (op === OP_ROW) {
+    const y = v.getUint8(1), n = v.getUint8(2);
+    if (y >= st.rows) return;
+    for (let x = 0; x < n && x < st.cols; x++) {
+      st.cells[y * st.cols + x] =
+        v.getUint8(3 + x * 2) | (v.getUint8(4 + x * 2) << 8);
+    }
+    schedulePaint([y]);
+    showText();
+    return;
+  }
+
+  if (op === OP_CURSOR) {
+    const x = v.getUint8(1), y = v.getUint8(2);
+    const ch = v.getUint8(3), attr = v.getUint8(4), on = v.getUint8(5) !== 0;
+    const was = { x: st.cur.x, y: st.cur.y };
+    if (y < st.rows && x < st.cols) st.cells[y * st.cols + x] = ch | (attr << 8);
+    st.cur = { x, y, on };
+    schedulePaint([was.y, y]);
+    showText();
+    return;
+  }
+
+  if (op === OP_RAW || op === OP_PACK || op === OP_IDX) {
+    band(op, v, 1, v.byteLength);
+  }
+}
+
+function send(bytes) {
+  if (st.ws && st.ws.readyState === 1) st.ws.send(new Uint8Array(bytes));
+}
+
+/* ---- keys ------------------------------------------------------------- */
+
+/*
+ * Every key from the page's own keyboard passes through here, and that is the
+ * one place that knows where a key should go.
+ *
+ * Normally to the board.  While the password is being asked, into the field
+ * instead - because the keys on this page are the only keyboard some phones
+ * offer, and a password box you cannot type into is a board you cannot reach.
+ * Reported exactly that way, from both keyboards at once, which is what made it
+ * two bugs and not one: this was the half where the keys went to the machine
+ * behind the dialogue.
+ */
+function askOpen() { return ui.ask.classList.contains("on"); }
+
+function typeIntoAsk(hid, unicode) {
+  if (hid === K.back) {
+    ui.askpw.value = ui.askpw.value.slice(0, -1);
+    return;
+  }
+  if (hid === K.enter) {
+    ui.askform.dispatchEvent(new Event("submit", {bubbles: true,
+                                                  cancelable: true}));
+    return;
+  }
+  if (unicode >= 32) {
+    ui.askpw.value += String.fromCodePoint(unicode);
+  }
+}
+
+function sendKey(kind, hid, unicode, mods) {
+  if (askOpen()) {
+    if (kind === 1) typeIntoAsk(hid, unicode);
+    return;
+  }
+  const m = (mods === undefined ? st.sticky : mods);
+  send([IN_KEY, kind, m, hid & 255, hid >> 8, unicode & 255,
+        (unicode >> 8) & 255, 0]);
+}
+
+function tap(hid) {
+  sendKey(1, hid, 0);
+  sendKey(2, hid, 0);
+  clearSticky();
+}
+
+function clearSticky() {
+  if (!st.sticky) return;
+  st.sticky = 0;
+  for (const b of ui.keys.querySelectorAll("button.held")) {
+    b.classList.remove("held");
+  }
+}
+
+/*
+ * The bar of keys a phone's own keyboard does not have.
+ *
+ * Ctrl and Alt latch rather than repeat: there is no way to hold one down and
+ * press a letter on a touch screen, so a tap arms it for the next keystroke and
+ * the keystroke clears it.  That is how every terminal application on a phone
+ * has to do it, and it is the reason Ctrl+C from here reaches the shell at all.
+ */
+const KEYBAR = [
+  ["Esc", () => tap(K.esc)],
+  ["Tab", () => tap(K.tab)],
+  ["Ctrl", "mod", MOD.ctrl],
+  ["Alt", "mod", MOD.alt],
+  ["↑", () => tap(K.up)],
+  ["↓", () => tap(K.down)],
+  ["←", () => tap(K.left)],
+  ["→", () => tap(K.right)],
+  ["⏎", () => tap(K.enter)],
+  ["⌫", () => tap(K.back)],
+  ["Home", () => tap(K.home)],
+  ["End", () => tap(K.end)],
+  ["PgUp", () => tap(K.pgup)],
+  ["PgDn", () => tap(K.pgdn)],
+  ["Del", () => tap(K.del)],
+  ["F1", () => tap(K.f1)], ["F2", () => tap(K.f2)], ["F3", () => tap(K.f3)],
+  ["F4", () => tap(K.f4)], ["F5", () => tap(K.f5)], ["F6", () => tap(K.f6)],
+  ["F7", () => tap(K.f7)], ["F8", () => tap(K.f8)], ["F9", () => tap(K.f9)],
+  ["F10", () => tap(K.f10)], ["F11", () => tap(K.f11)], ["F12", () => tap(K.f12)],
+];
+
+for (const item of KEYBAR) {
+  const b = document.createElement("button");
+  b.textContent = item[0];
+  if (item[1] === "mod") {
+    const bit = item[2];
+    b.onclick = () => {
+      st.sticky ^= bit;
+      b.classList.toggle("held", (st.sticky & bit) !== 0);
+    };
+  } else {
+    b.onclick = item[1];
+  }
+  ui.keys.appendChild(b);
+}
+
+/* ---- the keyboard the page carries itself ------------------------------ */
+
+/*
+ * Drawn here rather than asked of the phone, because the phone says no.
+ *
+ * A browser raises its keyboard for a field the person can see and refuses it
+ * for one parked off screen at zero opacity - and off screen is the only place
+ * such a field can be parked behind a full-screen canvas.  Reported as "the
+ * keyboard is not there, only the one row with Esc and Tab", and it was exactly
+ * that.  So these keys are the page's own, and whether they appear is not an
+ * opinion anything else gets to have.  `abc` in the header still tries the
+ * phone's, for whoever wants their own autocomplete and emoji.
+ *
+ * Each key is [label, shifted label, HID usage].  The HID goes out beside the
+ * character because this system's keycodes are USB usage ids and applications
+ * read either - a shell wants the character, DOOM wants the key.
+ */
+const KEYS = [
+  [["1","!",K["1"]],["2","@",K["2"]],["3","#",K["3"]],["4","$",K["4"]],
+   ["5","%",K["5"]],["6","^",K["6"]],["7","&",K["7"]],["8","*",K["8"]],
+   ["9","(",K["9"]],["0",")",K["0"]]],
+  [["q","Q",K.q],["w","W",K.w],["e","E",K.e],["r","R",K.r],["t","T",K.t],
+   ["y","Y",K.y],["u","U",K.u],["i","I",K.i],["o","O",K.o],["p","P",K.p]],
+  [["a","A",K.a],["s","S",K.s],["d","D",K.d],["f","F",K.f],["g","G",K.g],
+   ["h","H",K.h],["j","J",K.j],["k","K",K.k],["l","L",K.l]],
+  [["z","Z",K.z],["x","X",K.x],["c","C",K.c],["v","V",K.v],["b","B",K.b],
+   ["n","N",K.n],["m","M",K.m],
+   [",","<",K.comma],[".",">",K.period]],
+  [["\\","|",K.backslash],[";",":",K.semicolon],["-","_",K.minus],
+   ["/","?",K.slash],["=","+",K.equal],["'","\"",K.quote],
+   ["[","{",K.lbracket],["]","}",K.rbracket]],
+];
+
+let shifted = false;
+
+function keyButton(spec) {
+  const b = document.createElement("button");
+  const paint = () => { b.textContent = shifted ? spec[1] : spec[0]; };
+  paint();
+  b._paint = paint;
+  b.addEventListener("pointerdown", (e) => {
+    e.preventDefault();
+    const ch = shifted ? spec[1] : spec[0];
+    const mods = st.sticky | (shifted ? MOD.shift : 0);
+    /*
+     * With Ctrl or Alt armed this is a chord and not a character: the shell
+     * wants Ctrl+C as a keystroke with a keycode, not as the letter c.
+     */
+    const uni = (st.sticky & (MOD.ctrl | MOD.alt)) ? 0 : ch.codePointAt(0);
+    sendKey(1, spec[2], uni, mods);
+    sendKey(2, spec[2], 0, mods);
+    clearSticky();
+    if (shifted) { shifted = false; repaintKeys(); }
+  });
+  return b;
+}
+
+function specialButton(label, cls, fn) {
+  const b = document.createElement("button");
+  b.textContent = label;
+  if (cls) b.className = cls;
+  b.addEventListener("pointerdown", (e) => { e.preventDefault(); fn(b); });
+  return b;
+}
+
+function repaintKeys() {
+  for (const b of ui.kbd.querySelectorAll("button")) {
+    if (b._paint) b._paint();
+  }
+  const sh = ui.kbd.querySelector("button.shift");
+  if (sh) sh.classList.toggle("held", shifted);
+}
+
+function buildKeyboard() {
+  for (let i = 0; i < KEYS.length; i++) {
+    const row = document.createElement("div");
+    row.className = "row";
+    if (i === 3) {
+      const sh = specialButton("⇧", "mod shift", () => {
+        shifted = !shifted;
+        repaintKeys();
+      });
+      sh.classList.add("shift");
+      row.appendChild(sh);
+    }
+    for (const spec of KEYS[i]) row.appendChild(keyButton(spec));
+    /* Enter on the home row, backspace under it: Maxim asked for these
+     * two the other way round, and the one under the thumb should be
+     * the one that deletes rather than the one that submits. */
+    if (i === 2) {
+      row.appendChild(specialButton("⏎", "mod", () => tap(K.enter)));
+    }
+    if (i === 3) {
+      row.appendChild(specialButton("⌫", "mod", () => tap(K.back)));
+    }
+    ui.kbd.appendChild(row);
+  }
+
+  const last = document.createElement("div");
+  last.className = "row";
+  last.appendChild(specialButton("Esc", "mod", () => tap(K.esc)));
+  last.appendChild(specialButton("Tab", "mod", () => tap(K.tab)));
+  /* Space carries its character as well as its usage id.  The kernel maps a
+   * usage to a character for a real USB keyboard, so this would work either
+   * way - but a key that means a character and does not say so is a key that
+   * depends on somebody else's table staying right. */
+  last.appendChild(specialButton("space", "xwide", () => {
+    sendKey(1, K.space, 32, st.sticky);
+    sendKey(2, K.space, 0, st.sticky);
+    clearSticky();
+  }));
+  last.appendChild(specialButton("`", "mod", () => {
+    sendKey(1, K.grave, shifted ? 126 : 96, st.sticky);
+    sendKey(2, K.grave, 0, st.sticky);
+    clearSticky();
+  }));
+  last.appendChild(specialButton("⌫", "mod", () => tap(K.back)));
+  ui.kbd.appendChild(last);
+}
+
+buildKeyboard();
+
+/*
+ * Up by default on anything with a finger, folded away on a desktop where a
+ * real keyboard is already attached and these keys are only lost screen.  A
+ * phone that opens this page and sees no keys has, from where its owner is
+ * standing, no keyboard at all - which is exactly how the first version was
+ * reported.
+ */
+if (window.matchMedia && window.matchMedia("(pointer: coarse)").matches) {
+  ui.kbd.classList.add("on");
+  ui.kb.classList.add("held");
+}
+
+ui.kb.onclick = () => {
+  ui.kbd.classList.toggle("on");
+  ui.kb.classList.toggle("held", ui.kbd.classList.contains("on"));
+};
+
+/* The phone's own, for whoever wants it.  It may or may not appear - that is
+ * the browser's decision and the reason the keys above exist. */
+ui.native.onclick = () => {
+  ui.sink.value = "";
+  ui.sink.focus();
+};
+
+/*
+ * A phone's keyboard reports characters, not keys.  Two paths, and both are
+ * needed: `keydown` carries the named keys on anything with a real keyboard and
+ * often nothing useful on a touch one, while the hidden textarea's `input`
+ * event carries what was actually composed - including anything past ASCII,
+ * which has no HID usage to be named by.
+ */
+const BY_CODE = {
+  Escape: K.esc, Tab: K.tab, Enter: K.enter, Backspace: K.back,
+  ArrowUp: K.up, ArrowDown: K.down, ArrowLeft: K.left, ArrowRight: K.right,
+  Home: K.home, End: K.end, PageUp: K.pgup, PageDown: K.pgdn, Delete: K.del,
+  Space: K.space,
+};
+for (let i = 1; i <= 12; i++) BY_CODE["F" + i] = K["f" + i];
+
+window.addEventListener("keydown", (e) => {
+  /*
+   * Not while the person is typing into a field of this page's own.  This
+   * handler ends with preventDefault on anything it recognises, which for a
+   * text input means the character is never inserted - so the password box
+   * swallowed every key from a real keyboard and from a phone's, and looked
+   * broken in exactly the way it was.
+   */
+  const t = e.target;
+  if (t && t !== ui.sink &&
+      (t.tagName === "INPUT" || t.tagName === "TEXTAREA" ||
+       t.isContentEditable)) {
+    return;
+  }
+
+  let mods = 0;
+  if (e.shiftKey) mods |= MOD.shift;
+  if (e.ctrlKey) mods |= MOD.ctrl;
+  if (e.altKey) mods |= MOD.alt;
+  if (e.metaKey) mods |= MOD.gui;
+  mods |= st.sticky;
+
+  let hid = BY_CODE[e.code] || 0;
+  if (!hid && /^Key[A-Z]$/.test(e.code)) hid = K[e.code[3].toLowerCase()];
+  if (!hid && /^Digit[0-9]$/.test(e.code)) hid = K[e.code[5]];
+
+  const uni = (e.key && e.key.length === 1) ? e.key.codePointAt(0) : 0;
+  if (!hid && !uni) return;
+
+  e.preventDefault();
+  sendKey(1, hid, (mods & MOD.ctrl) ? 0 : uni, mods);
+  sendKey(2, hid, 0, mods);
+  clearSticky();
+});
+
+ui.sink.addEventListener("input", () => {
+  const text = ui.sink.value;
+  ui.sink.value = "";
+  if (!text) return;
+  if (askOpen()) {
+    for (const ch of text) typeIntoAsk(0, ch.codePointAt(0));
+    return;
+  }
+  /*
+   * With Ctrl or Alt armed this is not text, it is a chord: the shell wants
+   * Ctrl+C as a keystroke with a keycode, not as the letter c.
+   */
+  if (st.sticky && text.length === 1) {
+    const c = text.toLowerCase();
+    const hid = K[c] || 0;
+    if (hid) { tap(hid); return; }
+  }
+  send([IN_TEXT, ...new TextEncoder().encode(text)]);
+  clearSticky();
+});
+
+ui.sink.addEventListener("beforeinput", (e) => {
+  if (e.inputType === "deleteContentBackward") { e.preventDefault(); tap(K.back); }
+  if (e.inputType === "insertLineBreak") { e.preventDefault(); tap(K.enter); }
+});
+
+/* ---- the pointer ------------------------------------------------------ */
+
+/*
+ * Where a touch lands, in the pixels the board measures a pointer in.
+ *
+ * Two different surfaces and the board says which is live: an application's,
+ * whose size arrived with the picture, and the console's, which has no pixels
+ * of its own and is measured in cells times the cell size the kernel draws
+ * with.  Getting this wrong is the bug that put the cursor below the stylus on
+ * the board's own touchscreen for a week, so it is computed from what the board
+ * said rather than from what looks right.
+ */
+function where(ev) {
+  const cv = (st.mode === "pix") ? ui.pix : ui.text;
+  const r = cv.getBoundingClientRect();
+  if (r.width === 0 || r.height === 0) return null;
+
+  const fx = (ev.clientX - r.left) / r.width;
+  const fy = (ev.clientY - r.top) / r.height;
+  if (fx < 0 || fx > 1 || fy < 0 || fy > 1) return null;
+
+  if (st.mode === "pix") {
+    return [Math.floor(fx * st.surfW), Math.floor(fy * st.surfH)];
+  }
+  const col = Math.min(st.cols - 1, Math.floor(fx * st.cols));
+  const row = Math.min(st.rows - 1, Math.floor(fy * st.rows));
+  return [col * st.cellW, row * st.cellH];
+}
+
+function sendPtr(kind, ev, buttons) {
+  const p = where(ev);
+  if (!p) return;
+  send([IN_PTR, kind, buttons, p[0] & 255, (p[0] >> 8) & 255,
+        p[1] & 255, (p[1] >> 8) & 255, 0]);
+}
+
+for (const cv of [ui.text, ui.pix]) {
+  cv.addEventListener("pointerdown", (e) => {
+    e.preventDefault();
+    cv.setPointerCapture(e.pointerId);
+    st.ptrDown = true;
+    sendPtr(1, e, 1);
+  });
+  cv.addEventListener("pointermove", (e) => {
+    if (!st.ptrDown) return;
+    e.preventDefault();
+    sendPtr(3, e, 1);
+  });
+  cv.addEventListener("pointerup", (e) => {
+    if (!st.ptrDown) return;
+    e.preventDefault();
+    st.ptrDown = false;
+    sendPtr(2, e, 0);
+  });
+  cv.addEventListener("pointercancel", () => { st.ptrDown = false; });
+  cv.addEventListener("contextmenu", (e) => e.preventDefault());
+}
+
+/*
+ * Coming back from a locked screen.  The socket is usually dead by then and the
+ * browser has not noticed, so ask for everything: the board answers 'H' by
+ * resending the geometry and marking the whole screen as owed.
+ */
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState !== "visible") return;
+  /*
+   * CLOSING or CLOSED, not "anything but OPEN".  A socket still CONNECTING is
+   * one that has not failed yet, and opening a second beside it makes the board
+   * - which allows one client - throw the first away and report it, which is a
+   * page telling its owner that somebody took the screen from them one second
+   * after they loaded it.
+   */
+  if (!st.ws || st.ws.readyState >= 2) { connect(); return; }
+  if (st.ws.readyState === 1) send([IN_HELLO]);
+});
+
+resizeText();
+setBar("connecting…");
+connect();
+</script>

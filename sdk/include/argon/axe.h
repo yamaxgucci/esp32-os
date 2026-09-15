@@ -30,6 +30,12 @@
  * address must say which part that address is in.  The offsets in the table are
  * word-aligned, which leaves the low two bits free to say exactly that.
  *
+ * On RISC-V there is no literal pool: an address is built by a pair of
+ * instructions carrying it in their immediate fields, so relocating one means
+ * re-encoding the instruction.  That is the second table below
+ * (ag_axe_ireloc_t), and it is what allows the parts to be far apart - which is
+ * what executing the code from flash while the data lives in RAM requires.
+ *
  * Layout of a .AXE file:
  *
  *   +-------------------------+ 0
@@ -44,6 +50,8 @@
  *   |   not bss)              |
  *   +-------------------------+ reloc_offset
  *   | uint32 relocations      | reloc_count entries
+ *   +-------------------------+ ireloc_offset
+ *   | ag_axe_ireloc_t pairs   | ireloc_count entries (RISC-V only)
  *   +-------------------------+
  *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
@@ -51,6 +59,7 @@
 #ifndef ARGON_AXE_H
 #define ARGON_AXE_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -90,6 +99,42 @@ typedef struct {
 #define AG_AXE_R_OFFSET(e) ((e) & ~3u)
 #define AG_AXE_R_IN_DATA 0x1u /* the word itself is stored in the data part */
 #define AG_AXE_R_TO_DATA 0x2u /* the address it holds is in the data part   */
+
+/*
+ * Relocations that live inside an instruction, not in a word of its own.
+ *
+ * Xtensa needs none of these: an address it cannot reach with a PC-relative
+ * instruction is fetched with l32r from a literal pool, so the address is a
+ * plain 32-bit word and the table above describes it.  RISC-V has no literal
+ * pool - an address is built by a pair of instructions that carry it in their
+ * immediate fields (`lui` with the top twenty bits, then `addi`/`lw`/`sw`
+ * with the low twelve) - so relocating one means decoding and re-encoding the
+ * instruction.
+ *
+ * That is what lets a RISC-V image be split into two parts that move
+ * independently, which is what flash XIP requires: code in flash, data in RAM,
+ * nowhere near each other.  Without it the parts have to stay adjacent (see
+ * AG_AXE_CONTIGUOUS) because the code reaches its data by PC-relative
+ * arithmetic, and the code then cannot be executed from flash at all.
+ *
+ * Each entry is a pair of words: where the instruction is, and what address it
+ * should end up holding - as an offset into whichever part that address points
+ * into.  The offset rather than the address, because the loader knows where it
+ * put the parts and the file cannot.  Storing the target rather than a bias to
+ * add makes applying an entry idempotent, which the streamed XIP path needs:
+ * an instruction that straddles a page boundary is patched from both sides.
+ */
+typedef struct {
+    uint32_t site;   /* offset of the instruction, plus the bits below      */
+    uint32_t target; /* offset within the part the address points into      */
+} ag_axe_ireloc_t;
+
+#define AG_AXE_I_OFFSET(e) ((e) & 0x0FFFFFFFu)
+#define AG_AXE_I_TO_DATA 0x10000000u /* the address is in the data part     */
+#define AG_AXE_I_KIND(e) ((e) & 0xE0000000u)
+#define AG_AXE_I_HI20 0x20000000u   /* lui: bits 31..12 hold imm[31:12]     */
+#define AG_AXE_I_LO12_I 0x40000000u /* addi/lw: bits 31..20 hold imm[11:0]  */
+#define AG_AXE_I_LO12_S 0x60000000u /* sw: imm split across 31..25 and 11..7 */
 
 /*
  * An image built for one architecture will not run on the other.  The shell
@@ -133,7 +178,69 @@ typedef struct {
      * All zeros means unsigned (accepted).  See argon/axesig.h.
      */
     uint32_t reserved[6];
+
+    /*
+     * Instruction relocations (see ag_axe_ireloc_t).  Added after `reserved`,
+     * which is why `header_size` exists: an older loader stops before these
+     * fields and reads an image that has none of them exactly as it always
+     * did, and a newer loader reading an older image sees a header too short
+     * to contain them and treats the count as zero.
+     */
+    uint32_t ireloc_offset;
+    uint32_t ireloc_count;
+
+    /*
+     * The program's own icon, and why one lives in the file at all.
+     *
+     * A shell picks an icon by extension, so every program on the desk
+     * looks like every other program.  A picture that travels with the
+     * file fixes that without anybody having to keep a list of which
+     * program looks like what - copy the .AXE to another board and its
+     * icon goes with it.
+     *
+     * Nothing in the kernel reads this.  The loader has no use for a
+     * picture, and a shell that wants one opens the file, reads this
+     * header and seeks - which is why this is an offset into the file
+     * rather than a part to be loaded.
+     *
+     * Zero means none, and so does a header too short to hold these two
+     * fields; see ag_axe_icon_t for what is at the other end.
+     */
+    uint32_t icon_offset;
+    uint32_t icon_size;
 } ag_axe_header_t;
+
+/*
+ * What icon_offset points at.
+ *
+ * One byte per pixel, each an index into the sixteen colours a shell draws
+ * its own icons with, and 0xFF for "leave what is behind".  Four bits a
+ * pixel would halve it and would cost either the black that every outline
+ * is drawn in or a second plane for the mask; a hundred and twenty-eight
+ * bytes is not worth either.
+ */
+#define AG_AXE_ICON_MAGIC "AXI1"
+#define AG_AXE_ICON_NONE  0xFFu /* the pixel value that is not a colour */
+
+typedef struct {
+    char    magic[4]; /* "AXI1"                                          */
+    uint8_t w;
+    uint8_t h;
+    uint8_t fmt; /* 0: one byte per pixel, palette index or NONE         */
+    uint8_t pad;
+    /* w * h bytes follow */
+} ag_axe_icon_t;
+
+/*
+ * The part of the header every image has and every loader needs.
+ *
+ * A loader must check header_size against THIS, never against
+ * sizeof(ag_axe_header_t): the struct grows, images already built do not, and
+ * the whole purpose of header_size is that an older image keeps loading.
+ * Anything past this point is optional and must be asked for through an
+ * accessor that checks header_size for itself.
+ */
+#define AG_AXE_HEADER_MIN offsetof(ag_axe_header_t, ireloc_offset)
 
 #ifdef __cplusplus
 }

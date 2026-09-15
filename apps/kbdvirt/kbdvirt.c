@@ -50,6 +50,7 @@ typedef struct {
     uint8_t      rx_n;
     uint8_t      drop_stale;
     ag_handle_t  last_accept_err;
+    uint8_t      listen_moaned; /* the failed-to-listen warning is said once */
 } kbdvirt_state_t;
 
 static kbdvirt_state_t s_st;
@@ -162,11 +163,27 @@ static void ensure_listen(kbdvirt_state_t *st)
     if (!ag_net_is_ready()) {
         return;
     }
-    st->listen = ag_tcp_listen(KBDVIRT_PORT);
-    if (st->listen < 0) {
-        st->listen = -1;
+    /*
+     * A refusal never clears a handle somebody else installed.  See the long
+     * note in apps/mousevirt/mousevirt.c: the kernel's input tick and the
+     * shell both call this, and the loser of that race used to overwrite the
+     * winner's socket with -1 and leave the port shut for the whole boot.
+     */
+    const int32_t rc = ag_tcp_listen(KBDVIRT_PORT);
+    if (rc < 0) {
+        if (st->listen < 0 && !st->listen_moaned) {
+            st->listen_moaned = 1;
+            ag_log(AG_LOG_WARN, "kbdvirt", "cannot listen on :%u (%d)",
+                   (unsigned)KBDVIRT_PORT, (int)rc);
+        }
         return;
     }
+    if (st->listen >= 0) {
+        (void)ag_net_close(rc);
+        return;
+    }
+    st->listen = rc;
+    st->listen_moaned = 0;
     (void)ag_net_set_nonblock(st->listen, true);
     ag_log(AG_LOG_INFO, "kbdvirt", "listen :%u", (unsigned)KBDVIRT_PORT);
 }
@@ -228,18 +245,20 @@ static void try_accept(kbdvirt_state_t *st)
     st->last_accept_err = 0;
     (void)ag_net_set_nonblock(st->conn, true);
     /*
-     * What this peer has already sent is kept, not dropped.
+     * Events queued from an older peer go; bytes on this brand new socket
+     * stay.
      *
-     * It used to drain here and drop one more read besides, on the reasoning
-     * that a connection older than the app is stale.  It is the opposite: a
-     * driver on this system is serviced only while something reads it, so it
-     * does not accept until an app opens /dev/kbd0 - and everything the host
-     * sent while waiting for that is exactly what the host meant for this app.
-     * Draining it threw away every key pressed before the first frame, which
-     * is most of what a test presses, and left the pointer working because
-     * MOUSEVIRT never had the same idea.
+     * This used to drain the socket here as well, and that was a keyboard that
+     * dropped keys.  The socket has just been accepted, so the only thing it
+     * can hold is what *this* peer has already sent - and a host tool that
+     * connects and immediately types has sent it before the guest, which only
+     * accepts on its ten-millisecond tick, gets here.  Measured: a scripted F5
+     * arriving one run in three, with the driver reporting a healthy
+     * connection every time.
      */
-    ag_log(AG_LOG_INFO, "kbdvirt", "host connected (%d waiting)", spins);
+    ring_clear(st);
+    st->rx_n = 0;
+    ag_log(AG_LOG_INFO, "kbdvirt", "host connected");
 }
 
 static void recv_available(kbdvirt_state_t *st)
@@ -277,13 +296,14 @@ static ag_err_t kbd_open(ag_device_t *dev, uint32_t flags)
     }
     ensure_listen(st);
     /*
-     * A connection that was already open may still hold keys meant for the app
-     * that has just exited, and this one should not inherit them.  A
-     * connection accepted from here on cannot: nothing on it predates this
-     * open, so it is decided before try_accept rather than after.
+     * Throw away what is waiting only when a peer was already connected before
+     * this open: that is a previous application's leftovers and belongs to
+     * nobody.  A connection this open has just accepted has sent nothing but
+     * what the caller is about to want.
      */
-    st->drop_stale = (st->conn >= 0) ? 1u : 0u;
+    const bool had_peer = (st->conn >= 0);
     try_accept(st);
+    st->drop_stale = had_peer ? 1u : 0u;
     return AG_OK;
 }
 
@@ -361,6 +381,35 @@ static const ag_dev_ops_t k_ops = {
     .ioctl = kbd_ioctl,
 };
 
+/*
+ * The kernel's service tick (ABI 0.28).  See the long note over mouse_poll in
+ * apps/mousevirt/mousevirt.c: this driver keeps no thread of its own (it could,
+ * since ABI 0.48), and without this tick the only service it ever got was an
+ * application reading the device - which
+ * an application taking its keys from ag_poll_event has no reason to do.
+ *
+ * No events are returned: they are injected from the pump, already decoded.
+ * The stale-drop is deliberately not run here.  It exists to throw away what a
+ * previous peer left behind when an application opens the device, and running
+ * it on a ten-millisecond tick would throw away every key instead.
+ */
+static int32_t kbd_poll(ag_handle_t h, ag_event_t *out, uint32_t max)
+{
+    (void)h;
+    (void)out;
+    (void)max;
+    if (s_st.listen < 0 && s_st.conn < 0) {
+        ensure_listen(&s_st);
+    }
+    pump_rx(&s_st);
+    return 0;
+}
+
+static const ag_input_ops_t k_input_ops = {
+    .size = sizeof(ag_input_ops_t),
+    .poll = kbd_poll,
+};
+
 static void kbd_fini(void)
 {
     if (s_st.conn >= 0) {
@@ -396,6 +445,7 @@ ag_err_t ag_driver_init(void)
             .cls = AG_DEV_INPUT,
             .flags = 0,
             .ops = &k_ops,
+            .class_ops = &k_input_ops,
             .priv = &s_st,
         };
         const ag_err_t err = ag_dev_add(&desc);

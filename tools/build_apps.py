@@ -113,6 +113,11 @@ def command_for(app, defaults, extra_cflags, target_pair, forced_gcc):
     # decision, not a default.
     for lib in app.get("libs", []):
         cmd += ["--libs", lib]
+    if app.get("icon"):
+        # A program's own face, carried in its file (mkaxe --icon).  Kept in
+        # apps.json beside its sources because that is where everything else
+        # about how this image is built already lives.
+        cmd += ["--icon", app["icon"]]
     cmd += ["-o", "build/apps/" + app["out"]]
     cmd += app["src"]
     return cmd
@@ -177,6 +182,24 @@ def main():
     for i, app in enumerate(apps, 1):
         name = app["out"]
         print(f"[{i}/{len(apps)}] {name}", flush=True)
+
+        # Sources some entries generate rather than keep by hand: PHONE.SYS
+        # carries its client page as a C array made from the .html it is edited
+        # as.  Run here rather than by hand because a generated file that can be
+        # out of date is a generated file that eventually is - and the symptom
+        # would be a board serving last week's page with this week's protocol.
+        gen_failed = False
+        for gen in app.get("generate", []):
+            g = subprocess.run([sys.executable, os.path.join(ROOT, gen)],
+                               cwd=ROOT)
+            if g.returncode != 0:
+                print(f"{name}: {gen} failed", file=sys.stderr)
+                gen_failed = True
+                break
+        if gen_failed:
+            failed.append(name)
+            continue
+
         proc = subprocess.run(
             command_for(app, defaults, extra, target_pair, args.gcc), cwd=ROOT)
         if proc.returncode != 0:
