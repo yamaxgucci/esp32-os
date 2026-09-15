@@ -712,8 +712,26 @@ static void shim_drain(void)
     /* Kept as the one place that starts the printer, so nothing has to be
      * added to the port's start-up path. */
     if (s_rep_thread == NULL && !s_rep_stop) {
+        /*
+         * ARGON: on the SYSTEM core, and the reason is already written down
+         * once in this tree.
+         *
+         * The foreground application is pinned to the application core, so a
+         * thread created with no flags is a second runnable task on the one
+         * core the game is already using - which is exactly how the screen
+         * driver's encoder cost the game half its frame rate before it was
+         * moved.  This thread writes whole report blocks down a 115200 baud
+         * console, which is tens of milliseconds a line, and it was sharing
+         * the game's core the whole time.
+         *
+         * The tell that sent me here: a lap of 164 ms in which the slowest
+         * single thing measured inside it was 34 microseconds, every other
+         * phase of the frame showing its own worst in the same window, and
+         * the blit losing rows worth 60 us of work that took 22 ms.  Nothing
+         * was slow; the thread was not running.
+         */
         s_rep_thread = ag_thread_create(shim_printer, NULL, "shimprint",
-                                        4096, 0, 0);
+                                        4096, 0, AG_THREAD_SYS_CORE);
         if (s_rep_thread == NULL) {
             s_rep_on = false;   /* no thread: print in place, as before */
         }
