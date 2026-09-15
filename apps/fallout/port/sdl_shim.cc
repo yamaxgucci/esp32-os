@@ -419,11 +419,27 @@ static uint32_t s_blit_frame_us;
  * a hardware scaler would do.  Twelve table lookups and a dozen adds per output
  * pixel against one lookup, on a quarter as many pixels.
  */
-static int s_scale_sharp;
+/*
+ * ARGON: and the note above described what SHOULD happen, not what did.
+ *
+ * The averaging is written - it is the last branch of the reducer - but it
+ * was never switched on and nothing called this function, so every frame
+ * went down the nearest path: every second pixel of every second row.  That
+ * is fine for Fallout's art, which is solid shapes, and fatal for anything
+ * one pixel wide.  The exit grids at the edge of a map are exactly that: a
+ * green hex outline a pixel thick, of which the reduction keeps a quarter of
+ * the dots, scattered - so a location had no visible edge and Maxim walked
+ * out of three of them by accident.  Proven by pressing F8: at one to one
+ * the exits are there.
+ *
+ * -smooth 1 takes the averaging branch.  The name matches what it does now:
+ * 0 is nearest and sharp, 1 is averaged and soft.
+ */
+static int s_scale_average;
 
 void sdl_shim_scale_sharp(int on)
 {
-    s_scale_sharp = on ? 1 : 0;
+    s_scale_average = on ? 1 : 0;
 }
 
 /*
@@ -1542,6 +1558,7 @@ extern "C" int ag_render_tight;
 extern "C" unsigned ag_exit_calls = 0, ag_exit_hidden = 0, ag_exit_early = 0;
 extern "C" unsigned ag_exit_noart = 0, ag_exit_missed = 0, ag_exit_drew = 0;
 extern "C" unsigned ag_exit_w = 0, ag_exit_h = 0, ag_exit_flags = 0;
+extern "C" unsigned ag_exit_cullwrong = 0;
 extern "C" int ag_exit_fid = 0, ag_exit_pid = 0, ag_exit_on_map = 0;
 
 /* ARGON: the widest and the lowest-reaching art this map has actually shown,
@@ -2231,13 +2248,15 @@ static void exit_report(void)
     }
     shim_printf("[exitgrid t=%u] %d on the map | %u reached the drawer: "
                 "%u hidden, %u refused early, %u no art, %u missed the rect, "
-                "%u DREW | last pid %d fid 0x%08x flags 0x%x, art %ux%u\n",
+                "%u DREW (%u of them the cheap refusal would have thrown away) "
+                "| last pid %d fid 0x%08x flags 0x%x, art %ux%u\n",
                 (unsigned)ag_millis(), ag_exit_on_map, ag_exit_calls,
                 ag_exit_hidden, ag_exit_early, ag_exit_noart,
-                ag_exit_missed, ag_exit_drew, ag_exit_pid,
+                ag_exit_missed, ag_exit_drew, ag_exit_cullwrong, ag_exit_pid,
                 (unsigned)ag_exit_fid, ag_exit_flags, ag_exit_w, ag_exit_h);
     ag_exit_calls = 0; ag_exit_hidden = 0; ag_exit_early = 0;
     ag_exit_noart = 0; ag_exit_missed = 0; ag_exit_drew = 0;
+    ag_exit_cullwrong = 0;
 }
 
 static void layer_report(void)
@@ -3028,7 +3047,7 @@ int SDL_UpperBlit(SDL_Surface *src, const SDL_Rect *srcrect, SDL_Surface *dst,
             }
             ROW_DONE(y);
         }
-    } else if (!s_scale_sharp) {
+    } else if (!s_scale_average) {
         /*
          * The reduction, and it is the second most expensive thing in a frame:
          * measured on the board at 10.5 ms against 34 ms of engine and 7 ms of

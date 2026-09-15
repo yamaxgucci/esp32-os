@@ -1632,6 +1632,13 @@ extern "C" int ag_cxx_main(int argc, char **argv)
         } else if (same(argv[i], "-autostart")) {
             ag_autostart = 1;
         } else if (same(argv[i], "-smooth") || same(argv[i], "-sharp")) {
+            /* ARGON: this averages the 2x2 block instead of taking one pixel
+             * of it, and it existed all along without ever being switched on.
+             * The reduction was throwing away three pixels in four, which is
+             * invisible on Fallout's solid art and fatal to anything a pixel
+             * wide - the exit grids at the edge of a map are a green outline
+             * exactly that thin, and a location therefore had no visible
+             * edge.  Confirmed by F8: at one to one they are there. */
             sharp = 1;
         } else if (same(argv[i], "-cycle") && i + 1 < argc) {
             cycle_ms = to_int(argv[++i]);
