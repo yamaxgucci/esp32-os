@@ -495,23 +495,7 @@ static int scale_now(void)
     case AG_WHERE_COMBAT:
         return 1;   /* averaged: the exits are visible */
     default:
-        /*
-         * The brightest of the block, and this is where it belongs.
-         *
-         * Tried everywhere first and it failed on the map, for a reason that
-         * only looks obvious afterwards: outdoors the ground is pale sand and
-         * the exit grid is darker green, so the brightest pixel of a block is
-         * the ground and the line went.  A menu is the other way round - dark
-         * panel, light letters - so the brightest pixel of a block that holds
-         * a stroke IS the stroke, and it comes through at full contrast
-         * instead of the one-in-two that sampling gives.
-         *
-         * No font is touched by this.  What it cannot fix is a letter four
-         * pixels tall: there the strokes are one pixel apart and keeping all
-         * of them can close the gaps instead of opening them, which is a
-         * question for an eye.
-         */
-        return 2;
+        return 0;   /* sampled: the text is sharp */
     }
 }
 
