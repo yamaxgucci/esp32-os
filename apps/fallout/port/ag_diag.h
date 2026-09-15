@@ -321,6 +321,10 @@ void ag_store_use_note(const char *line);
 /* How many hexes lead out of this map, counted when it loads. */
 extern int ag_exit_on_map;
 
+/* Every distinct misc proto on the map, with how many of each: the exit
+ * grids are supposed to be among them. */
+void ag_misc_pids_note(const int *pid, const unsigned *n, unsigned kinds);
+
 /* Which critter script cost what.  Exactly one critter script runs per
  * frame, so "the critters cost 720 us a frame, worst 101 ms" is one script
  * being slow - these two say which one, by its name in scripts.lst. */

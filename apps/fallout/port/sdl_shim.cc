@@ -2207,6 +2207,23 @@ static void render_report(void)
     ag_render_objects2 = 0; ag_render_draw2_us = 0;
 }
 
+extern "C" void ag_misc_pids_note(const int *pid, const unsigned *n,
+                                  unsigned kinds)
+{
+    char line[300];
+    int  at = 0;
+
+    for (unsigned i = 0; i < kinds && at < (int)sizeof(line) - 24; i++) {
+        at += snprintf(line + at, sizeof(line) - (size_t)at, " 0x%08x x%u",
+                       (unsigned)pid[i], n[i]);
+    }
+    if (kinds == 0u) {
+        line[0] = 0;
+    }
+    shim_printf("[miscpids] %u kinds of misc object on this map:%s\n",
+                kinds, line);
+}
+
 static void exit_report(void)
 {
     if (ag_exit_on_map == 0 && ag_exit_calls == 0u) {

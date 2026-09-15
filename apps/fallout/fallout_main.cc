@@ -1419,6 +1419,11 @@ extern "C" int ag_map_fill = 0;
  * has actually shown instead of by a whole screen in every direction.  Off
  * by default until the two have been compared side by side. */
 extern "C" int ag_render_tight = 0;
+
+/* ARGON: -cull 0 switches off the port's cheap "this object cannot touch the
+ * rectangle" refusal.  It is the one place the port can drop an object before
+ * the engine decides, so it has to be removable without a rebuild. */
+extern "C" int ag_draw_cull = 1;
 /*
  * How many of the character's animations are held against eviction; -pins N.
  *
@@ -1652,6 +1657,8 @@ extern "C" int ag_cxx_main(int argc, char **argv)
             ag_art_pins = to_int(argv[++i]);
         } else if (same(argv[i], "-artcache") && i + 1 < argc) {
             ag_art_cache_kb = to_int(argv[++i]);
+        } else if (same(argv[i], "-cull") && i + 1 < argc) {
+            ag_draw_cull = to_int(argv[++i]);
         } else if (same(argv[i], "-render") && i + 1 < argc) {
             ag_render_tight = to_int(argv[++i]);
         } else if (same(argv[i], "-mapfill") && i + 1 < argc) {
