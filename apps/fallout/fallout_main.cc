@@ -1421,6 +1421,9 @@ extern "C" int ag_map_fill = 0;
  * by default until the two have been compared side by side. */
 extern "C" int ag_render_tight = 0;
 
+/* -render 2: take turns, one reporting window each.  See render_ab_bucket. */
+extern "C" int ag_render_alt = 0;
+
 /* ARGON: -cull 0 switches off the port's cheap "this object cannot touch the
  * rectangle" refusal.  It is the one place the port can drop an object before
  * the engine decides, so it has to be removable without a rebuild. */
@@ -1673,7 +1676,17 @@ extern "C" int ag_cxx_main(int argc, char **argv)
         } else if (same(argv[i], "-cull") && i + 1 < argc) {
             ag_draw_cull = to_int(argv[++i]);
         } else if (same(argv[i], "-render") && i + 1 < argc) {
-            ag_render_tight = to_int(argv[++i]);
+            /*
+             * 0 the original search area, 1 the bound from the art this map
+             * has shown, 2 both by turns - a window each, summed apart, which
+             * is the only way the difference between them has ever been
+             * measurable: two separate runs are two different walks and the
+             * scene decides the numbers.
+             */
+            const int r = to_int(argv[++i]);
+
+            ag_render_alt = (r == 2) ? 1 : 0;
+            ag_render_tight = (r == 1) ? 1 : 0;
         } else if (same(argv[i], "-mapfill") && i + 1 < argc) {
             ag_map_fill = to_int(argv[++i]);
         } else if (same(argv[i], "-artflash") && i + 1 < argc) {

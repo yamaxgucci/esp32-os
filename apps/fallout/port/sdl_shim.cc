@@ -1610,6 +1610,7 @@ unsigned ag_anim_worst_script_us;
 unsigned ag_path_us, ag_path_n;
 unsigned ag_layer_n;
 extern "C" int ag_render_tight;
+extern "C" int ag_render_alt;
 
 /* ARGON: where the exit grids are lost between the map and the screen. */
 extern "C" unsigned ag_exit_calls = 0, ag_exit_hidden = 0, ag_exit_early = 0;
@@ -1857,6 +1858,54 @@ static void dat_report(void)
  * scattered, it is work that happens to be heavy and the breakdown says which
  * step.  Either way nothing is printed between bursts.
  */
+/*
+ * ARGON: -render 2 - the two search areas, one window each, summed apart.
+ *
+ * Slot 0 is the whole screen in every direction (the original), slot 1 the
+ * bound taken from the art this map has actually shown.  What is compared is
+ * what Maxim feels: how many laps over 120 ms there were, and how long the
+ * worst one was.
+ */
+static struct {
+    uint32_t windows;
+    uint32_t stalls;
+    uint32_t worst_us;
+    uint32_t inrange;
+    uint32_t passes;
+    uint32_t pre_ms;
+} s_ab[2];
+
+static void render_ab_bucket(void)
+{
+    if (ag_render_alt == 0) {
+        return;
+    }
+
+    const unsigned slot = (ag_render_tight != 0) ? 1u : 0u;
+
+    s_ab[slot].windows++;
+    s_ab[slot].stalls += s_stall_n;
+    if (s_worst_us > s_ab[slot].worst_us) {
+        s_ab[slot].worst_us = s_worst_us;
+    }
+    s_ab[slot].inrange += ag_render_inrange;
+    s_ab[slot].passes += ag_render_calls;
+    s_ab[slot].pre_ms += ag_layer_pre_us / 1000u;
+
+    shim_printf("[renderab] wide: %u windows, %u stalls, worst %u ms, "
+                "%u in range per pass, under-roof %u ms | tight: %u windows, "
+                "%u stalls, worst %u ms, %u in range per pass, under-roof %u ms\n",
+                s_ab[0].windows, s_ab[0].stalls, s_ab[0].worst_us / 1000u,
+                s_ab[0].passes ? s_ab[0].inrange / s_ab[0].passes : 0u,
+                s_ab[0].pre_ms,
+                s_ab[1].windows, s_ab[1].stalls, s_ab[1].worst_us / 1000u,
+                s_ab[1].passes ? s_ab[1].inrange / s_ab[1].passes : 0u,
+                s_ab[1].pre_ms);
+
+    /* And now the other one, for the window that is starting. */
+    ag_render_tight = (slot == 1u) ? 0 : 1;
+}
+
 static void stall_report(void)
 {
     if (s_stall_n == 0u) {
@@ -2607,6 +2656,17 @@ static void memstat_service(void)
               peak_alloc,
               (unsigned)(mi.arena_largest / 1024u));
     ag_libc_malloc_profile_dump(s_trace_prof);
+    /*
+     * ARGON: the A/B, taken before any report has reset anything.
+     *
+     * Comparing two runs of this game has failed every time it was tried:
+     * the scene decides the numbers, and no two walks are the same walk.  So
+     * the two settings take turns inside ONE session - a window each - and
+     * their windows are summed apart.  Over a few minutes each side sees the
+     * same kind of scene, which is the only way the difference between them
+     * has ever been visible.
+     */
+    render_ab_bucket();
     /* The worst lap first: it is the one that says whether to read the rest. */
     stall_report();
 
