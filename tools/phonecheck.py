@@ -86,6 +86,16 @@ class Report:
         return 1 if bad else 0
 
 
+def note_if_unlinked(rep, out, what):
+    """A run that never connected fails every check made of it, and the
+    failure says nothing about the thing being checked.  Say which it was."""
+    if "linked to" not in out:
+        why = "connect failed" if "connect failed" in out else "no link"
+        rep.check(what + " (the client never connected)", False, why)
+        return False
+    return True
+
+
 def run_client(cl, args, actions, wait):
     """One PHONECL run, returning everything it printed.
 
@@ -97,7 +107,12 @@ def run_client(cl, args, actions, wait):
     fast, and if this ever becomes a real complaint it is the board's to fix,
     not this script's to hide.
     """
-    time.sleep(3)
+    # Five seconds, because three was not always enough: a connection opened
+    # too soon after the last one comes back "connect failed: -5", and the
+    # check above it then fails for a reason that has nothing to do with what
+    # it tests.  Whether the board should accept sooner is a real question and
+    # a separate one - see docs/plans/phone.md.
+    time.sleep(5)
     # Measured on the cleaned text, not on the raw log: the two have
     # different lengths (escape sequences are stripped), so slicing one by
     # the other's length walks off by however much the board redrew - which
@@ -109,33 +124,37 @@ def run_client(cl, args, actions, wait):
 
 
 def tidy(sv):
-    """Leave the board with nothing running.
+    """Leave the board with nothing running, and say so if it took work.
 
-    By pid, not by Ctrl+backslash: "kill last app" does not take the file
-    manager - tried twice, it stays up - and an application left running is
-    memory the driver needs, so every check after it fails with "connect
-    failed: -5" for reasons that have nothing to do with the link.  That
-    sequence has cost time three times now.
+    By pid: "kill last app" (Ctrl+backslash twice) does not take the file
+    manager - tried repeatedly - and an application left running holds memory
+    the driver needs, so every check after it fails with "connect failed: -5"
+    for reasons unrelated to the link.  That sequence has cost time four times
+    now, which is why this is noisy about what it finds.
     """
     if sv is None:
         return
-    sv.s.write(b"")           # into the system shell, where kill lives
+    sv.s.write(b"\x1c")           # the system shell, where kill lives
     sv.s.flush()
     sv.pump(1.5)
     sv.send("", 0.5)
-    for _ in range(4):
+
+    for attempt in range(5):
         before = len(sv.text())
-        sv.send("ps", 2.5)
+        sv.send("ps", 3)
         out = sv.text()[before:]
         if "no applications loaded" in out:
             return
         # No anchors: the console redraws with cursor moves rather than
-        # newlines, so `ps` arrives as one long line and "^" matches once.
-        pids = re.findall(r"(\d+)\s+[A-Z][A-Z0-9_.]*\s+(?:running|ready|loading)", out)
+        # newlines, so `ps` arrives as one long line.
+        pids = sorted(set(re.findall(
+            r"(\d+)\s+[A-Z][A-Z0-9_.]*\s+(?:running|ready|loading)", out)))
         if not pids:
             return
-        for pid in pids[:4]:
+        print("  (stopping %s left over from an earlier run)" % ", ".join(pids))
+        for pid in pids:
             sv.send("kill " + pid, 3)
+    print("  (warning: the board still has something running)")
 
 
 def main():
@@ -157,8 +176,20 @@ def main():
     try:
         cl.user_slot()
 
-        # Start from a board with nothing running: see tidy().
-        tidy(sv)
+        # Start from a board that has just booted.
+        #
+        # Tidying by pid works and was still not enough: a run that died
+        #half way leaves applications, slots and a client socket behind, and
+        # chasing those states one at a time cost more time than the ten
+        # seconds a reset costs.  The board under test is a test fixture for
+        # the length of this script; it can be restarted.
+        if sv:
+            print("(resetting the board under test)")
+            sv.s.rts = True
+            time.sleep(0.15)
+            sv.s.rts = False
+            sv.pump(10)
+            sv.send("", 1)
 
         print("the page:")
         out = run_client(cl, args, "-get", 25)
@@ -212,6 +243,37 @@ def main():
             rep.check("the application stops", "asked to stop" in j)
             rep.check("nothing left running",
                       "unbind" in j or "returned 0" in j)
+
+        print("joining while something is running:")
+        # Two different questions, and only one of them has a good answer on a
+        # board this size.
+        #
+        # A client that is already connected keeps working while an
+        # application runs - that is the fix from 15 Sep and it is checked
+        # above.  A *new* client arriving afterwards is another matter: the
+        # file manager leaves about five kilobytes as the largest free block,
+        # and the driver refuses visitors below sixteen because accepting one
+        # with no memory aborts the board.  So this measures rather than
+        # demands, and says plainly when the board is too full to be joined.
+        run_client(cl, args, '-type "fm" -enter -wait 2000', 35)
+        if sv:
+            sv.s.write(b"\x1c")
+            sv.s.flush()
+            sv.pump(1.5)
+            sv.send("", 0.5)
+            before = len(sv.text())
+            sv.send("mem", 2.5)
+            m = re.search(r"internal +\d+K +(\d+)K +(\d+)K", sv.text()[before:])
+            largest = int(m.group(2)) if m else 0
+            print("  (with the file manager up: largest free block %u KB)"
+                  % largest)
+            if largest >= 16:
+                out = run_client(cl, args, "-get", 30)
+                rep.check("a new client can still join", "200 OK" in out)
+            else:
+                print("  (too full for a new client, which is expected here "
+                      "and not a fault)")
+        tidy(sv)
 
         print("the repair sweep:")
         out = run_client(cl, args, "-hold 12", 40)
