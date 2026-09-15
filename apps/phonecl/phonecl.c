@@ -57,6 +57,7 @@ AG_APP_SIZED("PHONECL", "1.0", "argon", AG_AXE_NEEDS_NET, 6 * 1024, 2 * 1024);
 
 #define IN_HELLO 'H'
 #define IN_KEY 'K'
+#define IN_PTR 'P'
 #define IN_TEXT 'T'
 #define IN_AUTH 'A'
 
@@ -642,6 +643,60 @@ static bool send_chord(const char *spec)
     return false;
 }
 
+/*
+ * A tap at a place, with whichever button.
+ *
+ * Here so that the right button can be tested at all: a touch screen has one,
+ * the desktop wants two, and the page now arms the second with a latch - none
+ * of which is checkable by looking at a phone, because a tap that arrives as
+ * the wrong button looks exactly like a tap that did not arrive.
+ *
+ * Coordinates are pixels, which is what a driver says it deals in (ABI 0.44).
+ */
+static void send_tap(uint16_t x, uint16_t y, uint8_t buttons)
+{
+    uint8_t body[7];
+
+    body[0] = 1; /* down */
+    body[1] = buttons;
+    body[2] = (uint8_t)x;
+    body[3] = (uint8_t)(x >> 8);
+    body[4] = (uint8_t)y;
+    body[5] = (uint8_t)(y >> 8);
+    body[6] = 0;
+    (void)ws_send(IN_PTR, body, sizeof(body));
+
+    body[0] = 2; /* up */
+    body[1] = 0;
+    (void)ws_send(IN_PTR, body, sizeof(body));
+}
+
+/* "120,80" - a place to put a finger. */
+static bool parse_point(const char *spec, uint16_t *x, uint16_t *y)
+{
+    uint32_t v = 0;
+    bool     digits = false;
+
+    for (const char *p = spec;; p++) {
+        if (*p >= '0' && *p <= '9') {
+            v = v * 10u + (uint32_t)(*p - '0');
+            digits = true;
+            continue;
+        }
+        if (*p == ',' && digits) {
+            *x = (uint16_t)v;
+            v = 0;
+            digits = false;
+            continue;
+        }
+        if (*p == 0 && digits) {
+            *y = (uint16_t)v;
+            return true;
+        }
+        return false;
+    }
+}
+
 /* ------------------------------------------------------------------------ */
 
 int ag_main(int argc, char **argv)
@@ -737,6 +792,28 @@ int ag_main(int argc, char **argv)
             if (rc == 0) {
                 ag_printf("held %u s, %u rows arrived\n", (unsigned)secs,
                           (unsigned)(s.rows_seen - before));
+            }
+        } else if (strcmp(argv[i], "-tap") == 0 && i + 1 < argc) {
+            uint16_t x = 0, y = 0;
+            if (!parse_point(argv[++i], &x, &y)) {
+                ag_printf("not a point: %s\n", argv[i]);
+                rc = 1;
+            } else {
+                send_tap(x, y, 1);
+                if (!pump(200)) {
+                    rc = 1;
+                }
+            }
+        } else if (strcmp(argv[i], "-right") == 0 && i + 1 < argc) {
+            uint16_t x = 0, y = 0;
+            if (!parse_point(argv[++i], &x, &y)) {
+                ag_printf("not a point: %s\n", argv[i]);
+                rc = 1;
+            } else {
+                send_tap(x, y, 2);
+                if (!pump(200)) {
+                    rc = 1;
+                }
             }
         } else if (strcmp(argv[i], "-screen") == 0) {
             print_screen();

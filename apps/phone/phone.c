@@ -1314,6 +1314,21 @@ static void handle_message(const uint8_t *p, uint32_t len)
     case IN_PTR:
         if (n >= 7u) {
             ag_event_t ev;
+            /*
+             * The second button, written down when it arrives.
+             *
+             * A touch screen has one button and the desktop's context menu
+             * wants the other, so the page arms it with a latch - and from the
+             * outside a tap that arrives as the wrong button is
+             * indistinguishable from a tap that did not arrive.  Only the
+             * press, and only the button that is unusual, so an ordinary
+             * session of tapping adds nothing to the journal.
+             */
+            if (body[0] == 1u && (body[1] & 2u) != 0u) {
+                ag_log(AG_LOG_INFO, "phone", "right button at %d,%d",
+                       (int)(int16_t)rd16(body + 2),
+                       (int)(int16_t)rd16(body + 4));
+            }
             memset(&ev, 0, sizeof(ev));
             switch (body[0]) {
             case 1u:

@@ -343,6 +343,17 @@ const st = {
   cur: { x: 0, y: 0, on: false },
   mode: "text",
   sticky: 0,            /* modifiers held by the on-screen keys */
+  /*
+   * The next tap is a right button.
+   *
+   * A touch screen has one button and the desktop wants two - its context
+   * menu is the right one held down - so a phone could reach none of it.  A
+   * latch rather than a long press on purpose: the desktop already reads a
+   * held right button as "menu", so a long press here would be a timer inside
+   * a timer, and the first thing that goes wrong with those is that a slow
+   * finger means something different from a quick one.
+   */
+  rmb: false,
   ptrDown: false,
   pending: false,       /* a text repaint is already scheduled */
   dirtyRows: new Set(),
@@ -814,6 +825,7 @@ const KEYBAR = [
   ["Tab", () => tap(K.tab)],
   ["Ctrl", "mod", MOD.ctrl],
   ["Alt", "mod", MOD.alt],
+  ["RMB", "rmb", 0],
   ["↑", () => tap(K.up)],
   ["↓", () => tap(K.down)],
   ["←", () => tap(K.left)],
@@ -840,6 +852,12 @@ for (const item of KEYBAR) {
       st.sticky ^= bit;
       b.classList.toggle("held", (st.sticky & bit) !== 0);
     };
+  } else if (item[1] === "rmb") {
+    b.onclick = () => {
+      st.rmb = !st.rmb;
+      b.classList.toggle("held", st.rmb);
+    };
+    ui.rmbKey = b;
   } else {
     b.onclick = item[1];
   }
@@ -1109,18 +1127,27 @@ for (const cv of [ui.text, ui.pix]) {
     e.preventDefault();
     cv.setPointerCapture(e.pointerId);
     st.ptrDown = true;
-    sendPtr(1, e, 1);
+    st.ptrButtons = st.rmb ? 2 : 1;
+    sendPtr(1, e, st.ptrButtons);
   });
   cv.addEventListener("pointermove", (e) => {
     if (!st.ptrDown) return;
     e.preventDefault();
-    sendPtr(3, e, 1);
+    sendPtr(3, e, st.ptrButtons);
   });
   cv.addEventListener("pointerup", (e) => {
     if (!st.ptrDown) return;
     e.preventDefault();
     st.ptrDown = false;
     sendPtr(2, e, 0);
+    /* One tap per arming, like the modifiers: a latch that stayed on would
+     * turn every later tap into a menu, which is worse than not having it. */
+    if (st.rmb) {
+      st.rmb = false;
+      if (ui.rmbKey) {
+        ui.rmbKey.classList.remove("held");
+      }
+    }
   });
   cv.addEventListener("pointercancel", () => { st.ptrDown = false; });
   cv.addEventListener("contextmenu", (e) => e.preventDefault());
