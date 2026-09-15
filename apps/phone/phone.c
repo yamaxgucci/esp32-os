@@ -1788,6 +1788,39 @@ static bool ensure_memory(void)
     return true;
 }
 
+/*
+ * Which part of a lap the time went into.
+ *
+ * The heartbeat is printed at the top of the loop, so it can only ever report
+ * a lap that finished: when a lap took ten seconds instead of ten
+ * milliseconds, the stage it printed was the end of the *previous* one and the
+ * call actually holding things up was invisible.  A stopwatch per stage has no
+ * such blind spot - whatever ran long is still the largest number when the
+ * next beat comes round, whether or not the loop was in it at the time.
+ *
+ * Kept as a maximum rather than a total: one ten-second call and a thousand
+ * ten-millisecond ones add up alike, and it is the single long call that is
+ * the fault being looked for.
+ */
+#define STAGE_COUNT 9u
+static uint32_t stage_max_us[STAGE_COUNT];
+static uint8_t  stage_at;
+static uint64_t stage_since;
+
+static void stage_enter(uint8_t n)
+{
+    const uint64_t now = (uint64_t)ag_micros();
+    if (stage_since != 0u && stage_at < STAGE_COUNT) {
+        const uint32_t spent = (uint32_t)(now - stage_since);
+        if (spent > stage_max_us[stage_at]) {
+            stage_max_us[stage_at] = spent;
+        }
+    }
+    stage_at = n;
+    stage_since = now;
+    s.stage = n;
+}
+
 static void phone_task(void *arg)
 {
     (void)arg;
@@ -1808,19 +1841,28 @@ static void phone_task(void *arg)
         const uint64_t beat = (uint64_t)ag_micros();
         if (beat >= next_beat) {
             next_beat = beat + 5000000ull;
+            unsigned worst = 0, worst_us = 0;
+            for (unsigned i = 0; i < STAGE_COUNT; i++) {
+                if (stage_max_us[i] > worst_us) {
+                    worst_us = stage_max_us[i];
+                    worst = i;
+                }
+                stage_max_us[i] = 0;
+            }
             ag_log(AG_LOG_INFO, "phone",
-                   "alive: %u laps, stage %u, listen=%d conn=%d closing=%d",
-                   (unsigned)laps, (unsigned)s.stage, (int)s.listen,
-                   (int)s.conn, (int)s.closing);
+                   "alive: %u laps, in stage %u, worst stage %u took %u us, "
+                   "listen=%d conn=%d closing=%d",
+                   (unsigned)laps, (unsigned)s.stage, worst, worst_us,
+                   (int)s.listen, (int)s.conn, (int)s.closing);
         }
         laps++;
 
-        s.stage = 1;
+        stage_enter(1);
         /* The console's size, a few times a second.  See sync_console. */
         const uint64_t now = (uint64_t)ag_micros();
         if (now >= next_sync) {
             next_sync = now + 300000ull;
-            s.stage = 8;
+            stage_enter(8);
             if (!sync_console()) {
                 TASK->sleep_ms(500u);
                 continue;
@@ -1829,17 +1871,17 @@ static void phone_task(void *arg)
 
         pump_deferred();
 
-        s.stage = 2;
+        stage_enter(2);
         if (!ensure_listen()) {
             TASK->sleep_ms(200u);
             continue;
         }
-        s.stage = 3;
+        stage_enter(3);
         if (!ensure_memory()) {
             TASK->sleep_ms(500u);
             continue;
         }
-        s.stage = 4;
+        stage_enter(4);
 
         /*
          * A new connection, whether or not one is already live.  A phone that
@@ -1899,17 +1941,17 @@ static void phone_task(void *arg)
             TASK->sleep_ms(50u);
             continue;
         }
-        s.stage = 5;
+        stage_enter(5);
         if (!pump_client()) {
             drop_conn("closed by peer");
             continue;
         }
-        s.stage = 6;
+        stage_enter(6);
         if (!service_client()) {
             drop_conn("write failed");
             continue;
         }
-        s.stage = 7;
+        stage_enter(7);
 
         /*
          * Ten milliseconds, which is the interval a screen is asked for rather
