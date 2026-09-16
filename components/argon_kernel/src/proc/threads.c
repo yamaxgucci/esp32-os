@@ -53,6 +53,15 @@ bool ag_thread_owns(const void *record, ag_port_task_t task)
     return rec != NULL && rec->task == task;
 }
 
+/*
+ * How long a dying thread is given to come out of the kernel, and how often it
+ * is asked.  Ten milliseconds is longer than any console write on this board
+ * and the loop is bounded at two seconds, which is far longer than anything
+ * that holds one of these locks legitimately.
+ */
+#define AG_THREAD_UNLOCK_WAIT_MS 10u
+#define AG_THREAD_UNLOCK_TRIES   200u
+
 void ag_thread_release(void *record)
 {
     ag_thread_rec_t *rec = (ag_thread_rec_t *)record;
@@ -65,6 +74,50 @@ void ag_thread_release(void *record)
      * handle is stale and must not be deleted twice.
      */
     if (!rec->finished && rec->task != NULL) {
+        /*
+         * ARGON: not while it is inside the kernel holding a lock.
+         *
+         * Pitfall 21, applied in only one of the two places it had to be.
+         * ag_proc_kill asks holds_kernel_lock before deleting a process's MAIN
+         * task and refuses when the answer is yes - "killing it here would
+         * trade a hung application for a hung system" - and this path, which
+         * deletes the process's THREADS, asked nothing at all.
+         *
+         * It cost a dead board on 16 September 2026, in the middle of Maxim's
+         * game.  Fallout faulted (a null picture handed to a blit), the fault
+         * was recovered as designed, and then the reclaim deleted the port's
+         * report-printer thread - whose whole job is writing blocks to the
+         * console, and which therefore holds the console's recursive mutex for
+         * milliseconds at a time.  FreeRTOS lets only the owner release a
+         * recursive mutex, so a deleted owner holds it for ever: from that
+         * instant nothing in the system could print, including the shell, and
+         * the board looked hung while it was running.  The [fault] line got
+         * out only because it is written with esp_rom_printf, which does not
+         * go through the console at all.
+         *
+         * So the thread is given a bounded while to come out, and if it will
+         * not, it is left alone and said so.  A leaked task is a line in the
+         * journal; a lost console is a board that has to be power-cycled, and
+         * Maxim had to do exactly that.
+         */
+        for (unsigned i = 0; i < AG_THREAD_UNLOCK_TRIES; i++) {
+            if (!ag_proc_task_in_kernel(rec->task)) {
+                break;
+            }
+            ag_port_task_delay(AG_THREAD_UNLOCK_WAIT_MS);
+        }
+
+        if (ag_proc_task_in_kernel(rec->task)) {
+            ag_log(AG_LOG_ERROR, "thread",
+                   "a thread (task %p) is inside the kernel holding a lock "
+                   "after 2 s; left running rather than killed - deleting it "
+                   "would take the console down with it",
+                   (void *)rec->task);
+            rec->finished = true;   /* nobody is to try again */
+            ag_port_free(rec);
+            return;
+        }
+
         ag_port_task_delete(rec->task);
     }
     ag_port_free(rec);
