@@ -1409,6 +1409,9 @@ extern "C" int ag_script_cache = 0;
 
 /* Read by artInit(); see patches/fallout2-ce/0021.  Zero means the setting in
  * fallout2.cfg stands. */
+/* 0 = work it out from the arena; the rule further down answers 1000 KB on
+ * this board, which is the figure Maxim settled on, so a bare
+ * `run fallout2.axe` gets it without the flag.  -artcache N overrides. */
 extern "C" int ag_art_cache_kb = 0;
 
 /* ARGON: -mapfill 1 fills the flash store from the map's own inventory at
@@ -1484,7 +1487,21 @@ extern "C" int ag_art_pins = 0;
  * you.  32 KB is a starting point, not an answer; the flag is here so the
  * answer can be measured.
  */
-extern "C" int ag_cache_slack_kb = 32;
+/*
+ * 256 since 16 September 2026, because it is what every good run used.
+ *
+ * Maxim: "Сделай все текущие параметры с которыми ты для меня запускаешь
+ * умолчнием, чтоб я только писал run Fallout.axe и играл."  The launch line
+ * that produced every acceptable variant was
+ *
+ *   -watchdog 600 -memstat 30000 -fps 30000 -evict 256 -boost 0 -lru 1
+ *   -artcache 1000
+ *
+ * and a setting that has to be typed to get the known-good behaviour is a
+ * setting with the wrong default.  All six now match; the flags still
+ * override, so nothing that was measurable stops being measurable.
+ */
+extern "C" int ag_cache_slack_kb = 256;
 
 /* How much more a moving frame counts than a standing one in the
  * playability metric (-mweight N).  See metric_report in sdl_shim.cc. */
@@ -1500,7 +1517,9 @@ extern "C" int ag_metric_ksigma;
  * 93% of the misses while walking were exactly that loop.  Eight is a guess to
  * be measured, not an answer.
  */
-extern "C" int ag_refetch_boost = 8;
+/* 0 since 16 September 2026: see the note by ag_cache_slack_kb.  With LRU
+ * eviction a boost for re-read entries is the old policy's crutch. */
+extern "C" int ag_refetch_boost = 0;
 
 /*
  * Which entry the art cache throws out; -lru N.
@@ -1598,7 +1617,10 @@ extern "C" int ag_cxx_main(int argc, char **argv)
     const char *shot = NULL;
     int frames = 0;
     int shot_ms = 0;
-    int memstat_ms = 0;
+    /* 30000 both: a report every thirty seconds is what every measured run
+     * had, and with the printer on the system core it costs the game
+     * nothing.  -memstat 0 and -fps 0 turn them off.  See ag_cache_slack_kb. */
+    int memstat_ms = 30000;
     int reserve_kb = 0;
     int trace_kb = 0;
     int trace_max = 0;
@@ -1611,9 +1633,11 @@ extern "C" int ag_cxx_main(int argc, char **argv)
     int recinput = 0;
     int hud = 0;
     const char *logpath = NULL;
-    int fps_ms = 0;
-    int watchdog_s = 0;
-    int watchdog_set = 0;
+    int fps_ms = 30000;
+    /* Ten minutes.  The default in the port is far shorter and kills the game
+     * during a long map load - which is why every run had to say this. */
+    int watchdog_s = 600;
+    int watchdog_set = 1;
     int out = 0;
 
     /*
@@ -1833,23 +1857,36 @@ extern "C" int ag_cxx_main(int argc, char **argv)
         ag_meminfo_t ai;
         ag_meminfo(&ai);
         {
-            const int quarter = (int)(ai.arena_total / 1024u / 4u);
-            const int floor_kb = 1800;   /* what the settings ask for today */
+            /*
+             * ARGON: 1000 KB on a board this size, and only then a quarter.
+             *
+             * The quarter rule was written before 1000 was settled, and on a
+             * 6000 KB arena it answers 1500 - a figure nobody has played.
+             * Maxim settled on 1000 by ear and asked (16 September 2026) that
+             * a bare `run fallout2.axe` get everything the good runs had, so
+             * the rule has to produce it here instead of it being typed every
+             * time.
+             *
+             * Above eight megabytes of arena the quarter takes over, because
+             * his other standing rule is that no memory compromise may be
+             * hard-coded: a 16 MB board has to scale itself up with nobody
+             * editing this file.
+             */
+            const int arena_kb = (int)(ai.arena_total / 1024u);
             const int cap_kb = 3000;
-            int want = quarter;
+            int want;
 
-            if (want < floor_kb) {
-                want = floor_kb;
+            if (arena_kb <= 8000) {
+                want = 1000;
+            } else {
+                want = arena_kb / 4;
+                if (want > cap_kb) {
+                    want = cap_kb;
+                }
             }
-            if (want > cap_kb) {
-                want = cap_kb;
-            }
-            if (want != floor_kb) {
-                ag_art_cache_kb = want;
-                ag_printf("fallout: art cache %d KB, a quarter of a %u KB "
-                          "arena\n",
-                          want, (unsigned)(ai.arena_total / 1024u));
-            }
+            ag_art_cache_kb = want;
+            ag_printf("fallout: art cache %d KB of a %u KB arena\n",
+                      want, (unsigned)(ai.arena_total / 1024u));
         }
     }
 

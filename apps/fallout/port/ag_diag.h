@@ -319,6 +319,13 @@ extern unsigned ag_lap_tickers_us, ag_lap_anim_us;
  * which is a ticker, so the ticker row has to take it out of its own. */
 extern unsigned ag_lap_scroll_us;
 
+/* One refresh of the world map, in four parts: the tiles of the view, the
+ * per-pixel dimming of unvisited subtiles, the interface overlay, and the
+ * window refresh inside it.  See worldmap.cc. */
+extern unsigned ag_wm_calls;
+extern unsigned ag_wm_tiles_us, ag_wm_dim_us, ag_wm_overlay_us;
+extern unsigned ag_wm_tiles_worst, ag_wm_dim_worst, ag_wm_overlay_worst;
+
 /* _GNW95_ShowRect, in two: the copy into the staging surface and the blit
  * that converts it for the panel.  See the note in svga.cc. */
 extern unsigned ag_show_calls, ag_show_px;

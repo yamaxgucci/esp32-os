@@ -1661,7 +1661,17 @@ static void tickers_report(void)
 }
 
 /* Armed on the first present; see there.  0 turns it off (-watchdog 0). */
-static uint32_t s_watchdog_ms = 15000u;
+/*
+ * Ten minutes, not fifteen seconds.
+ *
+ * Fifteen kills the game part way through a map load - loading takes 70 to
+ * 115 seconds on this board - which is why every launch line in the notes
+ * carries -watchdog 600.  A default that has to be overridden to get a
+ * working game is the wrong default; 16 September 2026, with the rest of
+ * them.  The watchdog is still there for what it is for: a game that has
+ * stopped drawing and will never start again.
+ */
+static uint32_t s_watchdog_ms = 600000u;
 static bool     s_watchdog_armed;
 
 extern "C" void sdl_shim_watchdog(uint32_t ms)
@@ -2298,6 +2308,24 @@ static void showrect_report(void)
     ag_show_calls = 0; ag_show_px = 0;
     ag_show_copy_us = 0; ag_show_blit_us = 0;
     ag_show_copy_worst = 0; ag_show_blit_worst = 0; ag_show_worst_px = 0;
+}
+
+/* The world map, when there has been any of it. */
+static void worldmap_report(void)
+{
+    if (ag_wm_calls == 0u) {
+        return;
+    }
+    shim_printf("[worldmap t=%u] %u refreshes | tiles %u us/call (worst %u), dim %u us/call (worst %u), overlay+window %u us/call (worst %u) | %u us a refresh\n",
+                (unsigned)ag_millis(), ag_wm_calls,
+                ag_wm_tiles_us / ag_wm_calls, ag_wm_tiles_worst,
+                ag_wm_dim_us / ag_wm_calls, ag_wm_dim_worst,
+                ag_wm_overlay_us / ag_wm_calls, ag_wm_overlay_worst,
+                (ag_wm_tiles_us + ag_wm_dim_us + ag_wm_overlay_us)
+                    / ag_wm_calls);
+    ag_wm_calls = 0;
+    ag_wm_tiles_us = 0; ag_wm_dim_us = 0; ag_wm_overlay_us = 0;
+    ag_wm_tiles_worst = 0; ag_wm_dim_worst = 0; ag_wm_overlay_worst = 0;
 }
 
 /* The hex cursor handler, once a window. */
@@ -3266,6 +3294,7 @@ static void memstat_service(void)
      * [scroll], which was the one being read.  Both can go back in, one at a
      * time, when their numbers are wanted again.
      */
+    worldmap_report();
     (void)hexcursor_report;
     (void)showrect_report;
 
