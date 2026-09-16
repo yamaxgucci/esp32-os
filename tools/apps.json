@@ -153,6 +153,27 @@
       "_note": "LINK for an LX6 - the image docs/09-esp32-cyd.md has been naming for a month while nothing built it. It measures the wire ALONE, with none of our stack on it, which is the first thing to run on real hardware: a failure there is the wiring or the baud, and everything above would have been read as a cluster fault.",
       "gcc": "xtensa-esp32-elf-gcc",
       "src": ["apps/link/link.c"] },
+    {
+      "out": "NODELNRV.SYS", "group": "board",
+      "_note": "The wire driver for a RISC-V board - the C3 SuperMini and the C6.  One image for both: mkaxe names rv32imc, which the C3 is and the C6 is a superset of.  A third build of the same source, and the reason is always the same - an image built for the wrong instruction set does not refuse to load, it loads and throws an illegal instruction somewhere inside.",
+      "arch": "riscv32", "gcc": "riscv32-esp-elf-gcc",
+      "include": ["apps/common", "apps/common/nlink"],
+      "src": ["apps/nodelink/nodelink.c", "apps/common/nlink/ag_nlink.c"] },
+    {
+      "out": "MIGRANRV.AXE", "group": "board",
+      "_note": "MIGRANT for RISC-V, so a program can move between an Xtensa board and a RISC-V one.  That direction is the interesting one: the state that travels is the program's own bytes, and it has to mean the same on both - which is exactly why migrate_save carries a version stamp.",
+      "arch": "riscv32", "gcc": "riscv32-esp-elf-gcc",
+      "src": ["apps/migrant/migrant.c"] },
+    {
+      "out": "GRINDRV.AXE", "group": "board",
+      "_note": "GRIND for RISC-V.  The C3 has ONE core, so a job spread across two boards gets three threads rather than four, and the speed-up it prints is the honest one for this pair.",
+      "arch": "riscv32", "gcc": "riscv32-esp-elf-gcc",
+      "src": ["apps/grind/grind.c"] },
+    {
+      "out": "LINKRV.AXE", "group": "board",
+      "_note": "LINK for RISC-V: the wire alone, with none of our stack on it.  The first thing to run on any new pair of boards - a failure there is the wiring or the baud, and everything above would have been read as a cluster fault.",
+      "arch": "riscv32", "gcc": "riscv32-esp-elf-gcc",
+      "src": ["apps/link/link.c"] },
     { "out": "GC2145.SYS", "group": "core", "include": ["apps/gc2145"], "src": ["apps/gc2145/gc2145.c"] },
     { "out": "CAM.AXE", "group": "core", "src": ["apps/cam/cam.c"] },
     {

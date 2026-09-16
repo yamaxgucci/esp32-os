@@ -568,6 +568,28 @@ def main():
     if args.arch == "xtensa":
         # Long calls: the linker cannot shorten a call whose target moves.
         args.cflags += " -mlongcalls"
+    else:
+        # THE INSTRUCTION SET, NAMED, because the compiler's own default is
+        # wrong for every chip this system runs on.
+        #
+        # riscv32-esp-elf-gcc defaults to rv32imafdc: hardware single AND double
+        # floating point, and atomics.  No ESP RISC-V part has the float unit at
+        # all, and the C3 has no atomics either - it is rv32imc, while the C6 is
+        # rv32imac.  An image built at the default therefore holds instructions
+        # that do not exist on the machine it is for, and the way that shows up
+        # is an illegal-instruction panic somewhere inside a program that
+        # loaded perfectly.
+        #
+        # Everything built here has run so far only because none of it reached
+        # a float.  That is luck, not design, and the first application to
+        # divide two doubles would have spent a day being blamed on the loader.
+        #
+        # rv32imc is the common denominator: it runs on the C3, and on the C6,
+        # whose extra atomics are a superset.  One image for both boards.
+        args.cflags += " -march=rv32imc_zicsr_zifencei -mabi=ilp32"
+
+    if args.arch == "xtensa":
+        pass
     elif args.contiguous:
         # PC-relative addressing throughout, which is what asking for one block
         # means: the distance between code and data is then part of the

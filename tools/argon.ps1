@@ -260,6 +260,7 @@ switch ($Command.ToLowerInvariant()) {
             Write-Host '                esp32       hardware: Wi-Fi and Bluetooth'
             Write-Host '                esp32-dsp   hardware: neither, 48 KB arena'
             Write-Host '                esp32c6     hardware: RISC-V, USB console, the C6-LCD-1.47'
+            Write-Host '                esp32c3     hardware: RISC-V, USB console, one core, 400 KB - the C3 SuperMini'
             exit 0
         }
 
@@ -283,6 +284,7 @@ switch ($Command.ToLowerInvariant()) {
             'esp32s3-zero' { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32s3;sdkconfig.esp32s3.zero'
                              $chip = 'esp32s3' }
             'esp32c6'   { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32c6' }
+            'esp32c3'   { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32c3' }
             default {
                 Write-Host "argon target: no defaults for '$chip'."
                 Write-Host 'Add sdkconfig.defaults.<chip> before building for it.'

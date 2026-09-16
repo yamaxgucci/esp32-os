@@ -360,6 +360,28 @@ void ag_kernel_main(void)
         s_report.stage_us[i] = (uint32_t)(ag_port_us() - ts);
         s_report.stage_result[i] = err;
 
+        /*
+         * ABSENT IS NOT BROKEN.  -AG_ENODEV from a stage means "there is
+         * nothing of this kind on this board" - no card slot, no panel - which
+         * is a fact about the hardware and not a fault in it.
+         *
+         * It used to be reported as a failure, in red, on every single boot of
+         * any board without an SD card, and printed again in the summary:
+         *
+         *   E (17) boot: stage 'media' failed with -19
+         *     stage 'media' FAILED with -19
+         *
+         * on a board whose own BOARD.CFG says `[sd] interface = none`.  A
+         * message that is wrong on every boot is worse than no message: it
+         * teaches whoever reads the board's first twenty lines to skip them,
+         * and the next line down is where a real fault will appear.
+         */
+        if (err == -AG_ENODEV) {
+            s_report.stage_result[i] = AG_OK;
+            ag_log(AG_LOG_INFO, "boot", "%s: none on this board", st->name);
+            continue;
+        }
+
         if (err != AG_OK) {
             s_report.degraded = true;
             /*

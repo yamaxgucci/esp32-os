@@ -1,0 +1,8 @@
+# What goes into C:\drv on this board, staged by tools\mksysfs.py.
+#
+# One driver, because there is one thing on this board to drive.  No panel and
+# no card slot: this board has a wire and a header.
+#
+# NODELNRV.SYS is the RISC-V build - see SYSTEM.CFG in this directory, and
+# tools\apps.json for why there are three builds of one driver.
+NODELNRV.SYS
