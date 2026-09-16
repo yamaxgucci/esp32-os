@@ -315,6 +315,28 @@ extern unsigned ag_lap_events_us, ag_lap_programs_us, ag_lap_windows_us,
  * _doBkProcesses - the four above - is another entry, so a remainder taken
  * without these called the animation "the button scan". */
 extern unsigned ag_lap_tickers_us, ag_lap_anim_us;
+/* One scroll step of the map, whole.  It happens inside gameMouseRefresh,
+ * which is a ticker, so the ticker row has to take it out of its own. */
+extern unsigned ag_lap_scroll_us;
+
+/* _GNW95_ShowRect, in two: the copy into the staging surface and the blit
+ * that converts it for the panel.  See the note in svga.cc. */
+extern unsigned ag_show_calls, ag_show_px;
+extern unsigned ag_show_copy_us, ag_show_blit_us;
+extern unsigned ag_show_copy_worst, ag_show_blit_worst, ag_show_worst_px;
+/* And which single ticker was the worst of this lap, by the name it was
+ * registered under.  ag_ticker_name_of lives in input.cc. */
+/* What the hex cursor's handler costs, split three ways: moving the cursor,
+ * redrawing the map behind it, and everything else in the function.  It is
+ * the named cause of most freezes while walking; see game_mouse.cc. */
+extern unsigned ag_hexc_calls, ag_hexc_fired;
+extern unsigned ag_hexc_move_us, ag_hexc_rfsh_us, ag_hexc_tail_us;
+extern unsigned ag_hexc_move_worst, ag_hexc_rfsh_worst, ag_hexc_tail_worst;
+extern unsigned ag_hexc_rfsh_px, ag_hexc_rfsh_worst_px;
+
+extern unsigned ag_lap_tick_worst_us;
+extern void    *ag_lap_tick_who;
+const char *ag_ticker_name_of(void *proc);
 /* Inside the timed events: the thirty-second map update, and the queue of
  * game events with how many were processed in the worst burst. */
 /* The event queue by type, and the budget that keeps a burst of them from

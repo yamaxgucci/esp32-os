@@ -237,6 +237,7 @@ enum {
     AG_CAUSE_CRITTERS,    /* _script_chk_critters */
     AG_CAUSE_TIMED,       /* _script_chk_timed_events */
     AG_CAUSE_ANIM,        /* the animation tick, and the map it redraws */
+    AG_CAUSE_SCROLL,      /* one step of the map scrolling under the view */
     AG_CAUSE_TICKERS,     /* whatever else is on the ticker list */
     AG_CAUSE_MOUSE,       /* _mouse_info */
     AG_CAUSE_BUTTONS,     /* the button scan and the keyboard queue */
@@ -247,8 +248,13 @@ enum {
     AG_CAUSES
 };
 
+/* Eight tickers on a live map; the ninth and beyond share the last row
+ * rather than being dropped. */
+#define AG_TICKNAMES_SEEN 8
+
 static const char *const s_cause_name[AG_CAUSES] = {
-    "pump", "programs", "windows", "critters", "timed", "anim", "tickers",
+    "pump", "programs", "windows", "critters", "timed", "anim", "scroll",
+    "tickers",
     "mouse", "buttons", "keys", "requests", "maps", "present"
 };
 
@@ -263,6 +269,13 @@ typedef struct {
      * ones would answer a question nobody asked. */
     uint32_t cause[AG_CAUSES];
     uint32_t cause_small[AG_CAUSES];
+    /*
+     * And when the cause was the ticker list, WHICH ticker.  "tickers 83"
+     * names a list, not a handler, and the list has eight entries on a live
+     * map; this is the row that turns it into something to go and look at.
+     */
+    const char *tick_name[AG_TICKNAMES_SEEN];
+    uint32_t    tick_n[AG_TICKNAMES_SEEN];
 } ag_phase_t;
 
 static ag_phase_t s_phase[AG_PHASES];
@@ -301,6 +314,7 @@ static int census_cause(uint32_t input_us, uint32_t keys_us,
     v[AG_CAUSE_CRITTERS] = ag_lap_critters_us;
     v[AG_CAUSE_TIMED] = ag_lap_timed_us;
     v[AG_CAUSE_ANIM] = ag_lap_anim_us;
+    v[AG_CAUSE_SCROLL] = ag_lap_scroll_us;
     v[AG_CAUSE_MOUSE] = ag_lap_mouse_us;
 
     /*
@@ -310,7 +324,7 @@ static int census_cause(uint32_t input_us, uint32_t keys_us,
      */
     const uint32_t bk = ag_lap_programs_us + ag_lap_windows_us
         + ag_lap_critters_us + ag_lap_timed_us;
-    const uint32_t named_tick = bk + ag_lap_anim_us;
+    const uint32_t named_tick = bk + ag_lap_anim_us + ag_lap_scroll_us;
 
     v[AG_CAUSE_TICKERS] = (ag_lap_tickers_us > named_tick)
         ? (ag_lap_tickers_us - named_tick) : 0u;
@@ -387,6 +401,22 @@ static void census_note(uint32_t cost_us, uint32_t throttle_us, int where,
             if (b == 0) {
                 p->cause_small[cause]++;
             }
+            if (cause == AG_CAUSE_TICKERS && ag_lap_tick_who != NULL) {
+                const char *name = ag_ticker_name_of(ag_lap_tick_who);
+                int         at = AG_TICKNAMES_SEEN - 1;
+
+                /* Compared as pointers, not as strings: every name is a
+                 * literal from the registration site, so the same handler
+                 * always brings the same pointer. */
+                for (int k = 0; k < AG_TICKNAMES_SEEN; k++) {
+                    if (p->tick_name[k] == name || p->tick_name[k] == NULL) {
+                        p->tick_name[k] = name;
+                        at = k;
+                        break;
+                    }
+                }
+                p->tick_n[at]++;
+            }
             break;
         }
     }
@@ -448,6 +478,9 @@ void ag_frame_note(unsigned input_us, unsigned keys_us, unsigned scripts_us,
     ag_lap_mouse_us = 0;
     ag_lap_tickers_us = 0;
     ag_lap_anim_us = 0;
+    ag_lap_scroll_us = 0;
+    ag_lap_tick_worst_us = 0;
+    ag_lap_tick_who = NULL;
 
     if (cost > AG_MODAL_US) {
         s_modal_laps++;
@@ -1500,16 +1533,20 @@ static void tickers_report(void)
         if (ag_ticker_us[i] / s_frames == 0u) {
             continue;
         }
-        shim_printf("[tick] %p %u us/frame (%u calls), worst call %u us\n",
-                    ag_ticker_who[i],
+        shim_printf("[tick] %-26s %u us/frame (%u calls), worst call %u us\n",
+                    ag_ticker_name_of(ag_ticker_who[i]),
                     (unsigned)(ag_ticker_us[i] / s_frames),
                     (unsigned)ag_ticker_calls[i],
                     (unsigned)ag_ticker_worst[i]);
         ag_ticker_worst[i] = 0;
     }
-    /* One known address, so the pointers above can be turned into names:
-     * subtract this from them and add what nm says fps_service is at. */
-    shim_printf("[tick base] fps_service at %p\n", (void *)&tickers_report);
+    /*
+     * The base line is gone with the addresses it was for.  It printed a
+     * known runtime address so that nm could name the others after the
+     * run - three steps, an ELF of exactly that link, and a slide worked
+     * out by hand, on the report that says which handler froze the game.
+     * The names now come from the registration site; see tickersAddNamed.
+     */
     shim_printf("[bk t=%u] scripts %u, windows %u, critters %u, timed %u "
                 "(us/frame over %u calls) | worst: scripts %u, windows %u, "
                 "critters %u, timed %u | of the timed: map update %u us, "
@@ -1939,6 +1976,9 @@ unsigned ag_bk_programs_us, ag_bk_windows_us, ag_bk_critters_us,
 unsigned ag_lap_events_us, ag_lap_programs_us, ag_lap_windows_us,
          ag_lap_critters_us, ag_lap_timed_us, ag_lap_mouse_us;
 unsigned ag_lap_tickers_us, ag_lap_anim_us;
+unsigned ag_lap_scroll_us;
+unsigned ag_lap_tick_worst_us;
+void    *ag_lap_tick_who;
 unsigned ag_queue_type_us[16], ag_queue_type_n[16], ag_queue_type_worst[16];
 unsigned ag_queue_budget_us = 8000u, ag_queue_deferred, ag_queue_done;
 unsigned ag_op_us[1024], ag_op_n[1024], ag_op_worst[1024];
@@ -2245,6 +2285,40 @@ static void render_ab_bucket(void)
  * on them: 31 freezes while walking and 9 while standing says nothing until
  * you know he walked for four minutes and stood for eleven.
  */
+/* Where the picture goes after a window is refreshed, in two. */
+static void showrect_report(void)
+{
+    if (ag_show_calls == 0u) {
+        return;
+    }
+    shim_printf("[showrect t=%u] %u calls over %u px | copy %u us total (worst %u over %u px), convert %u us total (worst %u)\n",
+                (unsigned)ag_millis(), ag_show_calls, ag_show_px,
+                ag_show_copy_us, ag_show_copy_worst, ag_show_worst_px,
+                ag_show_blit_us, ag_show_blit_worst);
+    ag_show_calls = 0; ag_show_px = 0;
+    ag_show_copy_us = 0; ag_show_blit_us = 0;
+    ag_show_copy_worst = 0; ag_show_blit_worst = 0; ag_show_worst_px = 0;
+}
+
+/* The hex cursor handler, once a window. */
+static void hexcursor_report(void)
+{
+    if (ag_hexc_calls == 0u) {
+        return;
+    }
+    shim_printf("[hexcursor t=%u] %u calls, refreshed on %u of them | move %u us/call (worst %u), map %u us/call (worst %u over %u px), rest %u us/call (worst %u) | %u px redrawn\n",
+                (unsigned)ag_millis(), ag_hexc_calls, ag_hexc_fired,
+                ag_hexc_move_us / ag_hexc_calls, ag_hexc_move_worst,
+                ag_hexc_rfsh_us / ag_hexc_calls, ag_hexc_rfsh_worst,
+                ag_hexc_rfsh_worst_px,
+                ag_hexc_tail_us / ag_hexc_calls, ag_hexc_tail_worst,
+                ag_hexc_rfsh_px);
+    ag_hexc_calls = 0; ag_hexc_fired = 0;
+    ag_hexc_move_us = 0; ag_hexc_rfsh_us = 0; ag_hexc_tail_us = 0;
+    ag_hexc_move_worst = 0; ag_hexc_rfsh_worst = 0; ag_hexc_tail_worst = 0;
+    ag_hexc_rfsh_px = 0; ag_hexc_rfsh_worst_px = 0;
+}
+
 static void census_report(void)
 {
     uint32_t total_laps = 0, total_free = 0;
@@ -2357,6 +2431,26 @@ static void census_report(void)
             }
             shim_printf("[freezes] %-9s %-9s %u: %s\n", s_phase_name[i],
                         (pass == 0) ? "0.12-0.25" : "longer", total, line);
+        }
+
+        /* And the handlers behind a "tickers" row, whichever band they
+         * were in: the row above says the list, this says which entry. */
+        {
+            char line[200];
+            int  at = 0;
+
+            for (int k = 0; k < AG_TICKNAMES_SEEN; k++) {
+                if (q->tick_name[k] == NULL || q->tick_n[k] == 0u) {
+                    continue;
+                }
+                at += snprintf(line + at, sizeof(line) - (size_t)at,
+                               "%s%s %u", (at == 0) ? "" : ", ",
+                               q->tick_name[k], (unsigned)q->tick_n[k]);
+            }
+            if (at > 0) {
+                shim_printf("[freezes] %-9s of the tickers: %s\n",
+                            s_phase_name[i], line);
+            }
         }
     }
 }
@@ -3159,6 +3253,8 @@ static void memstat_service(void)
     /* The worst lap first: it is the one that says whether to read the rest. */
     stall_report();
     census_report();
+    hexcursor_report();
+    showrect_report();
 
     worst_report();
     dat_report();
