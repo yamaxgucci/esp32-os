@@ -33,15 +33,26 @@ import time
 import serial
 
 
+def say(*parts):
+    """Print and flush.  The first hour-long run was killed with two
+    hours of findings still sitting in a buffer, which is the same as
+    not having run it."""
+    print(*parts, flush=True)
+
+
 def open_port(name):
     s = serial.Serial()
     s.port = name
     s.baudrate = 115200
     s.timeout = 0.4
-    # The board sends XOFF when its console cannot keep up - the stream is
-    # full of 0x13/0x11 - and typing through that is how commands end up
-    # queued and answered a round late.  Let pyserial honour it.
-    s.xonxoff = True
+    # Deliberately NOT xonxoff.
+    #
+    # The board does send XOFF when its console cannot keep up, and honouring
+    # it looked right - until a run sat for two hours instead of one and had
+    # to be killed.  An XOFF whose XON never arrives blocks every write for
+    # ever, and a test harness that can hang is worse than one that has to
+    # be paced by hand.  The pacing below does that job.
+    s.xonxoff = False
     s.dtr = False
     s.rts = False
     s.open()
@@ -258,7 +269,7 @@ def main():
     # a previous run - tag 13 arriving for round 1 - which is a measurement of
     # the queue and nothing else.  The client rejoins the network by itself,
     # because `wifi connect` wrote it into its SYSTEM.CFG.
-    print("(resetting both boards)")
+    say("(resetting both boards)")
     for b in (sv, cl):
         b.s.rts = True
         time.sleep(0.15)
@@ -282,9 +293,9 @@ def main():
         if "for a list of commands" in cl.text():
             break
     else:
-        print("the client board did not finish booting")
+        say("the client board did not finish booting")
         return 1
-    print("  (client booted; %u bytes of boot log)" % len(cl.log))
+    say("  (client booted; %u bytes of boot log)" % len(cl.log))
     cl.log.clear()
     cl.send("", 1)
 
@@ -294,12 +305,12 @@ def main():
             break
         time.sleep(2)
     else:
-        print("the client never rejoined the network")
+        say("the client never rejoined the network")
         return 1
     cl.user_slot()
 
     free0, largest0 = board_memory(sv)
-    print("start: %u KB free, largest %u KB\n" % (free0, largest0))
+    say("start: %u KB free, largest %u KB\n" % (free0, largest0))
 
     deadline = time.time() + args.minutes * 60
     n = 0
@@ -310,6 +321,10 @@ def main():
     crashes_survived = 0
 
     while time.time() < deadline:
+        # A hard stop as well as the deadline: a round that takes longer than
+        # its own budget plus a minute means something is stuck, and a soak
+        # test that hangs is worse than one that stops and says so.
+        round_started = time.time()
         wait_idle(cl)
         name, actions, wait = ROUNDS[n % len(ROUNDS)]
         n += 1
@@ -327,15 +342,20 @@ def main():
         answered = re.search(r"found [^\n]{0,40}?: yes", out) is not None
         if not linked or not answered:
             unanswered += 1
-            print("%3u %-24s NO ANSWER  (%s, %.0f s)"
+            say("%3u %-24s NO ANSWER  (%s, %.0f s)"
                   % (n, name, "linked" if linked else "not linked", took))
             if unanswered <= 2:
-                print("      got: %r" % out[:220])
+                say("      got: %r" % out[:220])
         else:
             if took > worst:
                 worst, worst_what = took, name
             if "crash" in name or "null call" in name:
                 crashes_survived += 1
+
+        if time.time() - round_started > 180:
+            say("%3u %-24s the harness itself is stuck; stopping" % (n, name))
+            unanswered += 1
+            break
 
         stop_everything(sv)
         free, largest = board_memory(sv)
@@ -344,16 +364,16 @@ def main():
 
         if n % 5 == 0 or not linked:
             left = int(deadline - time.time())
-            print("%3u %-24s %5.1f s   %2u/%2u KB   %u min left"
+            say("%3u %-24s %5.1f s   %2u/%2u KB   %u min left"
                   % (n, name, took, free, largest, max(0, left // 60)))
 
-    print("\n%u rounds in %u minutes" % (n, args.minutes))
-    print("unanswered rounds: %u" % unanswered)
-    print("crashes survived : %u" % crashes_survived)
-    print("slowest answer   : %.1f s (%s)" % (worst, worst_what))
-    print("memory low water : %u KB free, largest %u KB"
+    say("\n%u rounds in %u minutes" % (n, args.minutes))
+    say("unanswered rounds: %u" % unanswered)
+    say("crashes survived : %u" % crashes_survived)
+    say("slowest answer   : %.1f s (%s)" % (worst, worst_what))
+    say("memory low water : %u KB free, largest %u KB"
           % (low_free, low_largest))
-    print("memory at start  : %u KB free, largest %u KB" % (free0, largest0))
+    say("memory at start  : %u KB free, largest %u KB" % (free0, largest0))
 
     stop_everything(sv)
     cl.close()

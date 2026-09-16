@@ -28,6 +28,8 @@
 #include "proc/proc_internal.h"
 
 #include <argon/port/fault.h>
+#include <argon/port/time.h>
+#include <argon/port/wifi.h>
 #include <argon/port/task.h>
 
 /*
@@ -291,6 +293,40 @@ static void supervisor_task(void *arg)
          * comparison of two numbers until something has to change.
          */
         ag_powerctl_tick();
+
+#if AG_PORT_HAS_WIFI && AG_PORT_WIFI_HAS_AP
+        /*
+         * And the point, once in a long while, when nobody is on it.
+         *
+         * A board that runs its own access point has gone off the air several
+         * times with no event, the right mode, and every field of its status
+         * correct - the failure that cannot be detected from in here.  What
+         * fixes it is re-issuing the configuration, which takes milliseconds.
+         *
+         * So: every ten minutes, and only with no station associated, because
+         * applying a configuration takes the point down and up again.  A board
+         * with somebody connected is a board that is demonstrably working, and
+         * this leaves it alone.
+         *
+         * This is not the cause and does not pretend to be.  It is the board
+         * staying reachable while the cause is looked for - the alternative
+         * being a board that is fine except that nobody can reach it, which is
+         * the same as broken from every chair in the room.
+         */
+        {
+            static int64_t s_ap_checked_us;
+            const int64_t  now = ag_port_us();
+
+            if (now - s_ap_checked_us >= 600000000) {
+                s_ap_checked_us = now;
+                ag_port_wifi_ap_status_t ap;
+                if (ag_port_wifi_ap_status(&ap) == AG_OK && ap.on &&
+                    ap.clients == 0u) {
+                    (void)ag_port_wifi_ap_refresh();
+                }
+            }
+        }
+#endif
 
         /*
          * How close that came.  Reported once, at the low-water mark, because

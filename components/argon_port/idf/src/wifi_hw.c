@@ -702,6 +702,24 @@ ag_err_t ag_port_wifi_ap_start(const char *ssid, const char *pass,
     return AG_OK;
 }
 
+ag_err_t ag_port_wifi_ap_refresh(void)
+{
+    if (!s_ap_on) {
+        return -AG_ENODEV;
+    }
+    /*
+     * The same two calls ap_start makes, and the same grace window: applying
+     * the configuration bounces the point, and the AP_STOP that follows is
+     * ours rather than the failure the handler watches for.
+     */
+    s_ap_touched_us = esp_timer_get_time();
+    if (apply_mode() != ESP_OK || apply_ap_config() != ESP_OK) {
+        return -AG_EIO;
+    }
+    s_ap_touched_us = esp_timer_get_time();
+    return AG_OK;
+}
+
 ag_err_t ag_port_wifi_ap_stop(void)
 {
     if (!s_ap_on) {
