@@ -1,0 +1,14 @@
+# What goes into C:\drv on this board, staged by tools\mksysfs.py.
+#
+# NODELINK.SYS is the default build - this board is an ESP32-S3, an LX7, and
+# the plain image in build\apps is built for it.  The CYD on the other end of
+# the wire loads NODELN32.SYS instead: same source, LX6 compiler.  A .SYS built
+# for the wrong one of the two loads and then throws an illegal instruction
+# somewhere inside, which reads as a driver bug rather than as the wrong image.
+#
+# The panel is deliberately NOT here.  This board has a screen when one is
+# soldered to the CAM header (ST7789S3.SYS), and for a cluster test it is a
+# distraction: a board with its own glass never asks the neighbour for one, so
+# half of what placement does would go untested.  Add it when testing the
+# screen, not the cluster.
+NODELINK.SYS

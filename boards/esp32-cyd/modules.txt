@@ -1,0 +1,13 @@
+# What goes into C:\drv on this board, staged by tools\mksysfs.py.
+#
+# Names here are the images in build\apps; they are copied in lower case,
+# because that is what `drv install` writes and littlefs does not fold case.
+#
+# NODELN32.SYS, not NODELINK.SYS.  This board is an ESP32 - an LX6 - and the
+# S3 it is wired to is an LX7.  A .SYS built for one does not refuse to load on
+# the other: it loads and throws an illegal instruction somewhere inside, which
+# reads as a driver bug rather than as the wrong image.  Two boards on one wire
+# need two builds of the driver on that wire.
+ILI9341.SYS
+XPT2046.SYS
+NODELN32.SYS

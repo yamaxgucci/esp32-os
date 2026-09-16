@@ -419,13 +419,20 @@ if ($Scenario -eq 'link' -or $Scenario -eq 'both') {
     } else {
         $sgot = [int]$sp.Groups[2].Value
         $ssent = [int]$sp.Groups[3].Value
-        # Measured across runs: 22, 23, 14, 11 of 24.  One frame is in flight at
-        # a time, so a queue that drops when full cannot explain half of them
-        # going missing - that is an open question about the stream path, and it
-        # is written into the plan rather than tuned away here.  The bound stays
-        # where it says something: a path carrying a third of what it is given
-        # is broken, whatever its class is allowed to do.
-        Note ($sgot * 3 -ge $ssent) 'stream-class-carries-messages' `
+        # A THIRD used to be the bound here, and the comment that justified it
+        # named measurements of 22, 23, 14, 11 of 24 as an unexplained property
+        # of the stream path.  They were not: this harness could not see the
+        # echo of the next command while the previous ping was painting, typed
+        # it again, and the retyped characters stopped the ping - which then
+        # reported a fraction of what it had sent.  The spread was the spread of
+        # WHEN the retype landed.
+        #
+        # With that gone it is 24 of 24, three full runs running.  So the bound
+        # says something again.  Not equality: the class is allowed to lose, and
+        # a check that forbids what the design permits will one day be silenced
+        # by somebody who is right to silence it.  Nine in ten is the line
+        # between "lost one" and "this path is broken".
+        Note ($sgot * 10 -ge $ssent * 9) 'stream-class-carries-messages' `
             "$sgot of $ssent"
     }
 

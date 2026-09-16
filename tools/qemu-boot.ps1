@@ -600,6 +600,39 @@ try {
                 (Join-Path (Get-Location) $local))
             Write-Host "Sending $local ($($bytes.Length) bytes) to $guest"
 
+            # TRIED MORE THAN ONCE, and that is a judgement about what is being
+            # tested rather than laziness.
+            #
+            # This link has no flow control.  When the PC is busy - a build, a
+            # second run, anything - the guest's input queue fills, the port
+            # drops bytes, and recv sits waiting for the rest of a line that
+            # will never come.  The whole forty-minute run then dies on the
+            # scaffolding, having tested nothing; three runs died that way in
+            # one afternoon.
+            #
+            # A transfer is a MEANS here, not the thing under test: every
+            # scenario below is about the wire between two guests, not about
+            # getting a file into one.  So a stalled transfer is tried again,
+            # and says so loudly - a run whose transfers all needed three
+            # attempts is a machine too busy to be measuring anything, and that
+            # is worth seeing rather than hiding.
+            #
+            # recv rewrites the file from the beginning, so a retry cannot
+            # leave behind the truncation it is there to repair.
+            $sent = $false
+            foreach ($attempt in 1..3) {
+                if ($attempt -gt 1) {
+                    Write-Host ("  attempt $attempt of 3 - the guest stopped " +
+                                "keeping up; the machine is busy") `
+                        -ForegroundColor Yellow
+                    # Whatever half-typed line is sitting there is not hex: a
+                    # bare return makes the guest reject it and give the prompt
+                    # back, so the retry starts from a known place.
+                    Send-Line ''
+                    Start-Sleep -Milliseconds 500
+                    [void](Read-Available)
+                }
+
             # recv says "N bytes written" when it is done, and that is what is
             # waited for: the prompt cannot be used here, because a screen full
             # of scrolling hex redraws the prompts already on it and the count
@@ -647,9 +680,17 @@ try {
             # would look like a new one if only the words were counted.
             $done = "$($bytes.Length) bytes written"
             $written = Count-Of $done
-            if (-not (Wait-Text -Needle $done -Was $written `
-                                -Seconds (120 + $bytes.Length / 64))) {
-                throw "$guest did not arrive: recv never reported it written"
+            if (Wait-Text -Needle $done -Was $written `
+                          -Seconds (120 + $bytes.Length / 64)) {
+                    $sent = $true
+                    break
+                }
+            }
+            if (-not $sent) {
+                throw ("$guest did not arrive after three attempts: recv " +
+                       "never reported it written.  The machine is too busy " +
+                       "to run this - nothing else should be building or " +
+                       "emulating while it does.")
             }
             $seen = Read-Available
         }

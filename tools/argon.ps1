@@ -11,6 +11,45 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# Handing arguments on to another PowerShell script, BY NAME.
+#
+# `& $script @Rest` looks exactly like it does this, and does not: splatting an
+# ARRAY binds POSITIONALLY.  So `argon nodetest -Scenario link` put the string
+# "-Scenario" into nodetest's first positional parameter, which is -TimeoutSec,
+# and failed with a message about converting a string to an integer that
+# mentions neither -Scenario nor this file.  It was written down for months as
+# "the wrapper eats the first argument; run the script directly", and it is not
+# nodetest's problem: every named argument to every subcommand went this way.
+#
+# A HASHTABLE splat binds by name, so the pairs are rebuilt here.  Native
+# programs (idf.py, python) are left on the array splat, which is right for
+# them: they take their arguments as plain strings and do their own parsing.
+function Invoke-Ps1 {
+    param([string]$Script, [string[]]$Argv)
+
+    $named = @{}
+    $positional = @()
+    for ($i = 0; $i -lt $Argv.Count; $i++) {
+        $a = $Argv[$i]
+        if ($a -notmatch '^-[A-Za-z]') {
+            $positional += $a
+            continue
+        }
+        $name = $a.Substring(1)
+        $next = if ($i + 1 -lt $Argv.Count) { $Argv[$i + 1] } else { $null }
+        # Its value, or a switch with none.  Something starting with '-' counts
+        # as a value only when it is a number, so -Baud -1 works and
+        # -Scenario -Verbose does not silently eat the second flag.
+        if ($null -ne $next -and $next -notmatch '^-[A-Za-z]') {
+            $named[$name] = $next
+            $i++
+        } else {
+            $named[$name] = $true
+        }
+    }
+    & $Script @named @positional
+}
+
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
@@ -490,7 +529,7 @@ switch ($Command.ToLowerInvariant()) {
         # The network in the emulator, against servers this PC runs.  Not part
         # of `check`: it wants two ports and a Python that can bind them, and a
         # firewall prompt is not a test failure.
-        & (Join-Path $PSScriptRoot 'nettest.ps1') @Rest
+        Invoke-Ps1 (Join-Path $PSScriptRoot 'nettest.ps1') $Rest
         exit $LASTEXITCODE
     }
 
@@ -498,7 +537,7 @@ switch ($Command.ToLowerInvariant()) {
         # The same network, but over an external radio: EXTRADIO.SYS bound with
         # `net use extradio`, talking RLINK to a fake coprocessor (rlinkd.py) on
         # a UART.  Proves the external-radio socket path with no hardware.
-        & (Join-Path $PSScriptRoot 'rlinktest.ps1') @Rest
+        Invoke-Ps1 (Join-Path $PSScriptRoot 'rlinktest.ps1') $Rest
         exit $LASTEXITCODE
     }
 
@@ -506,7 +545,7 @@ switch ($Command.ToLowerInvariant()) {
         # The AT variant of rlinktest: ATRADIO.SYS bound with `net use atradio`,
         # talking the stock ESP-01 AT command set to a fake modem (atmodemd.py)
         # on a UART.  Proves the same socket path over a radio's own firmware.
-        & (Join-Path $PSScriptRoot 'attest.ps1') @Rest
+        Invoke-Ps1 (Join-Path $PSScriptRoot 'attest.ps1') $Rest
         exit $LASTEXITCODE
     }
 
@@ -514,7 +553,7 @@ switch ($Command.ToLowerInvariant()) {
         # Two whole ArgonOS kernels in two emulators, their UART1 ports joined
         # to each other, measured with apps\link - the cluster's wire, with no
         # second board and nothing pretending to be a node.
-        & (Join-Path $PSScriptRoot 'nodetest.ps1') @Rest
+        Invoke-Ps1 (Join-Path $PSScriptRoot 'nodetest.ps1') $Rest
         exit $LASTEXITCODE
     }
 
