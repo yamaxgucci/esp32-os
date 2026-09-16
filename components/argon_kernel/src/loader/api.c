@@ -249,9 +249,30 @@ static void bg_stdout_write(const char *buf, size_t len)
     ag_log_app_write(me, name, buf, len);
 }
 
+/*
+ * May this process's WORDS go out through the console, rather than into the
+ * journal?  Only about output: the screen and the keyboard are asked about
+ * separately, below, and a guest gets neither.
+ *
+ * Focus is the right test for a program on this board - a background one must
+ * not scribble on the user's screen.  It is the wrong test for a program with
+ * somewhere of its own to write: a guest running here for another node is not
+ * asking for the shared screen at all, and putting its words in the journal
+ * instead means the node that asked for it hears nothing.
+ *
+ * This is exactly why the guest used to be started in the FOREGROUND here - to
+ * pass a test it should never have been sitting.  That cost this board its
+ * keyboard for as long as the guest lived, which for a migrated program is for
+ * ever.
+ */
+static bool words_reach_the_console(void)
+{
+    return ag_proc_out_sink(NULL, NULL) || has_console_focus();
+}
+
 static int32_t api_con_write(const char *buf, size_t len)
 {
-    if (!has_console_focus()) {
+    if (!words_reach_the_console()) {
         bg_stdout_write(buf, len);
         return (int32_t)len;
     }
@@ -264,7 +285,7 @@ static int32_t api_con_puts(const char *s)
     if (s == NULL) {
         return 0;
     }
-    if (!has_console_focus()) {
+    if (!words_reach_the_console()) {
         bg_stdout_write(s, strlen(s));
         if (s[0] != '\0' && s[strlen(s) - 1] != '\n') {
             bg_stdout_write("\n", 1);
@@ -277,7 +298,7 @@ static int32_t api_con_puts(const char *s)
 
 static int32_t api_con_vprintf(const char *fmt, va_list ap)
 {
-    if (!has_console_focus()) {
+    if (!words_reach_the_console()) {
         char buf[AG_JOURNAL_LINE_MAX];
         const int n = vsnprintf(buf, sizeof(buf), fmt, ap);
         if (n <= 0) {

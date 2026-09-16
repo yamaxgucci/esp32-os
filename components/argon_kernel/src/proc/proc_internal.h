@@ -14,6 +14,7 @@
 
 #include <argon/lineedit.h>
 #include <argon/path.h>
+#include <argon/console.h>
 #include <argon/proc.h>
 
 #include <argon/port/mem.h>
@@ -92,6 +93,24 @@ typedef struct {
 
     /* One pending focus event: 0 = none, 1 = GAINED, 2 = LOST. */
     volatile uint8_t focus_ev;
+
+    /*
+     * Where THIS process's output goes, if not to the screen.
+     *
+     * A property of the process, deliberately, and set before its task runs.
+     * The alternative - one global redirect on the console - was in place and
+     * was wrong in a way that only showed up over a wire: a node running a
+     * guest program redirected EVERYTHING into the link for as long as the
+     * guest lived, so the board stopped answering its own user.  For a remote
+     * run that lasted a second; for a migrated program, which never ends, it
+     * lasted for ever.
+     *
+     * Set at spawn rather than afterwards because the loader logs from the new
+     * task before spawn returns: anything installed after the fact has already
+     * missed the lines that say why a load failed.
+     */
+    ag_con_sink_fn out_sink;
+    void          *out_ctx;
 } proc_t;
 
 /* The process the calling task belongs to, or NULL for the kernel's own tasks. */

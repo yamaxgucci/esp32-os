@@ -1150,24 +1150,34 @@ if ($Scenario -eq 'link' -or $Scenario -eq 'both' -or $Scenario -eq 'migrate') {
     }
     Check $a 'is now on' 'migrate-reported-success-here'
 
-    # The far node loaded an image it has never had a copy of.
+    # The far node loaded an image it has never had a copy of - ASKED OF THE FAR
+    # NODE, which is where that fact belongs.
     #
-    # READ ON A, AND BY ORDER.  Node B cannot be asked: for the whole life of a
-    # guest program its console is redirected into the wire, and a migrated
-    # program does not end - so B's own shell answers nobody until it does.
-    # That is a real defect and it is written up in docs/plans/cluster.md; it
-    # is not what this scenario is about.
+    # This check spent a while reading A's relayed stream by order instead,
+    # because B could not be asked: a guest program's output sink used to be
+    # hung on B's whole console, so while a migrated program lived - for ever -
+    # B's own shell answered nobody, `log -n 60` included.  The sink belongs to
+    # the guest, not to the board, and it does now.
     #
-    # Order is what makes this a proof rather than a coincidence.  A's own copy
-    # of MIGRANT was loaded seconds BEFORE the handover; a loader line that
-    # appears AFTER the kernel said it was sending the state was written by the
-    # other board and relayed here.
-    if ($a -match 'migrate: sending \d+ bytes[\s\S]{0,4000}?loader: MIGRANT') {
-        Note $true 'migrate-far-kernel-loaded-our-image' 'relayed from the far node'
-    } else {
-        Note $false 'migrate-far-kernel-loaded-our-image' `
-            'no loader line after the handover'
-    }
+    # So this is the strong form again: B's own journal, naming the image B
+    # loaded, on a board that never had a copy of it.
+    Check $b 'loader: MIGRANT' 'migrate-far-kernel-loaded-our-image'
+    # AND THE BOARD IS STILL ITS OWN: its shell ran a command and printed the
+    # answer WHILE hosting a program that has not finished.  "lines held" is
+    # the journal dump's own last word, so its presence is the shell speaking,
+    # not the guest.
+    #
+    # Two facts, not one said twice: the line above says the guest is here, and
+    # this one says the board still belongs to whoever is sitting at it.  That
+    # second half is what was broken - a guest took this board's keyboard to
+    # earn the right to be heard on the wire, and a migrated guest never gives
+    # it back.
+    #
+    # NOT checked by looking for the guest's own words in B's journal, which is
+    # where the first attempt looked: they land there only when they FAIL to
+    # reach the node that asked for them.  That check would have gone green on
+    # the bug and red on the fix, which is exactly backwards.
+    Check $b 'lines held' 'migrate-far-node-still-answers-its-own-user'
 
     # AND IT CONTINUED RATHER THAN STARTED.  This is the whole scenario.
     #

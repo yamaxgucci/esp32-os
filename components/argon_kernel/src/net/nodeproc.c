@@ -216,21 +216,49 @@ static void run_task(void *arg)
     }
 
     /*
-     * The same redirection the shell uses for `dir > file.txt`, pointed at the
-     * wire instead of a file.  The console does not know what the sink is,
-     * which is exactly why this needs nothing new from it.
-     */
-    /*
      * Whatever arrived for it, before it runs: ag_migrate_restore is called by
      * the program in its first moments, so this must be in place by then.
      */
     ag_migrate_arriving(s_in_state, s_in_state_len);
     s_in_state_len = 0;
 
-    ag_console_redirect(out_sink, NULL);
-    int32_t        code = 0;
-    const ag_err_t err = ag_proc_exec(argv[0], argc, argv, 0, &code);
-    ag_console_redirect(NULL, NULL);
+    /*
+     * The sink is handed to the PROGRAM, not hung on the console.
+     *
+     * Hung on the console it caught every writer on this board for as long as
+     * the guest lived - so this node's own shell answered nobody, and for a
+     * migrated program, which never ends, that was permanent.  `log -n 60`
+     * typed here returned nothing at all while the guest counted happily on
+     * the other end of the wire.
+     *
+     * Given at spawn rather than after it, because the loader logs from the
+     * new task before spawn returns: installed afterwards it would already
+     * have missed the lines that say why an image did not load - which is
+     * exactly what the asking node needs to be told.
+     */
+    /*
+     * BACKGROUND AND NO SESSION, and both words are load-bearing.
+     *
+     * A guest has no user on this board - its user is on the other one - so it
+     * must not become the foreground process here and must not be bound into a
+     * session slot.  Started in the foreground (which is what it was) it took
+     * this board's keyboard, and the board's own shell then heard nothing for
+     * as long as the guest lived: for a migrated program, for ever.
+     *
+     * This is the same defect as `run /b` binding into the shell's own slot,
+     * found twice in two places on the same day.  A slot holds one program and
+     * the keyboard belongs to its holder; anything started on somebody else's
+     * behalf must stay out of that.
+     */
+    int32_t  code = 0;
+    ag_pid_t pid = 0;
+    ag_err_t err = ag_proc_spawn_sink(
+        argv[0], argc, argv,
+        (uint32_t)AG_SPAWN_BACKGROUND | (uint32_t)AG_SPAWN_NO_SESSION,
+        out_sink, NULL, &pid);
+    if (err == AG_OK) {
+        err = ag_proc_wait(pid, &code, UINT32_MAX);
+    }
 
     /*
      * A program that never started and a program that returned a number are

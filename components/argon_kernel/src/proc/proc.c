@@ -94,6 +94,22 @@ static ag_port_mutex_t        s_lock;
 static ag_pid_t          s_next_pid = 1;
 static ag_pid_t          s_foreground = AG_PID_KERNEL;
 
+/*
+ * How many processes currently have an output sink of their own.  Kept so the
+ * console can skip asking on every write, which is the common case by far: a
+ * board is not usually running anything for anybody else.
+ */
+static volatile uint32_t s_sinks;
+
+/* Giving a slot back.  Never a bare memset: a slot with a sink is counted. */
+static void release_slot(proc_t *p)
+{
+    if (p->out_sink != NULL && s_sinks > 0) {
+        s_sinks--;
+    }
+    memset(p, 0, sizeof(*p));
+}
+
 /* ---------------------------------------------------------------------- */
 
 static void lock(void)
@@ -447,7 +463,7 @@ static void reap(proc_t *p)
                                                            : AG_PID_KERNEL;
     }
 
-    memset(p, 0, sizeof(*p));
+    release_slot(p);
 }
 
 /* Whatever the application did to the console, the next thing to print gets it
@@ -1038,8 +1054,33 @@ static ag_err_t spawn_common(proc_t *p, uint32_t flags, ag_pid_t *out_pid)
     return AG_OK;
 }
 
+bool ag_proc_out_sink(ag_con_sink_fn *sink, void **ctx)
+{
+    if (s_sinks == 0) {
+        return false;
+    }
+    const proc_t *p = current();
+    if (p == NULL || p->out_sink == NULL) {
+        return false;
+    }
+    if (sink != NULL) {
+        *sink = p->out_sink;
+    }
+    if (ctx != NULL) {
+        *ctx = p->out_ctx;
+    }
+    return true;
+}
+
 ag_err_t ag_proc_spawn(const char *path, int argc, char **argv, uint32_t flags,
                        ag_pid_t *out_pid)
+{
+    return ag_proc_spawn_sink(path, argc, argv, flags, NULL, NULL, out_pid);
+}
+
+ag_err_t ag_proc_spawn_sink(const char *path, int argc, char **argv,
+                            uint32_t flags, ag_con_sink_fn sink, void *ctx,
+                            ag_pid_t *out_pid)
 {
     if (path == NULL) {
         return -AG_EINVAL;
@@ -1055,13 +1096,18 @@ ag_err_t ag_proc_spawn(const char *path, int argc, char **argv, uint32_t flags,
         return -AG_EBUSY;
     }
 
-    memset(p, 0, sizeof(*p));
+    release_slot(p);
     p->used = true;
     p->pid = s_next_pid++;
     p->flags = flags;
     p->started = (ag_time_t)ag_port_us();
     p->sched_class = (uint8_t)AG_PRIO_NORMAL;
     p->load_pending = true;
+    p->out_sink = sink;
+    p->out_ctx = ctx;
+    if (sink != NULL) {
+        s_sinks++;
+    }
     ag_reslist_init(&p->res, p->res_slots, AG_PROC_RES_MAX);
 
     const char *parent_cwd = ag_proc_cwd();
@@ -1071,7 +1117,7 @@ ag_err_t ag_proc_spawn(const char *path, int argc, char **argv, uint32_t flags,
 
     ag_err_t err = copy_args(p, argc, argv);
     if (err != AG_OK) {
-        memset(p, 0, sizeof(*p));
+        release_slot(p);
         unlock();
         return err;
     }
@@ -1104,7 +1150,7 @@ ag_err_t ag_proc_spawn(const char *path, int argc, char **argv, uint32_t flags,
 
     err = spawn_common(p, flags, out_pid);
     if (err != AG_OK) {
-        memset(p, 0, sizeof(*p));
+        release_slot(p);
         unlock();
         return err;
     }
@@ -1131,7 +1177,7 @@ ag_err_t ag_proc_spawn_builtin(const char *name, ag_proc_entry_fn entry,
         return -AG_EBUSY;
     }
 
-    memset(p, 0, sizeof(*p));
+    release_slot(p);
     p->used = true;
     p->pid = s_next_pid++;
     p->flags = flags;
@@ -1160,7 +1206,7 @@ ag_err_t ag_proc_spawn_builtin(const char *name, ag_proc_entry_fn entry,
 
     ag_err_t err = copy_args(p, argc, argv);
     if (err != AG_OK) {
-        memset(p, 0, sizeof(*p));
+        release_slot(p);
         unlock();
         return err;
     }
@@ -1168,7 +1214,7 @@ ag_err_t ag_proc_spawn_builtin(const char *name, ag_proc_entry_fn entry,
     p->stack_bytes = clamp_stack_bytes(stack_bytes);
     err = heap_create(p, heap_bytes);
     if (err != AG_OK) {
-        memset(p, 0, sizeof(*p));
+        release_slot(p);
         unlock();
         return err;
     }
@@ -1178,7 +1224,7 @@ ag_err_t ag_proc_spawn_builtin(const char *name, ag_proc_entry_fn entry,
         if (p->heap_mem != NULL) {
             ag_port_free(p->heap_mem);
         }
-        memset(p, 0, sizeof(*p));
+        release_slot(p);
         unlock();
         return err;
     }

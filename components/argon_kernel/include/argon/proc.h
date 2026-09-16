@@ -16,6 +16,7 @@
 #ifndef ARGON_PROC_H
 #define ARGON_PROC_H
 
+#include <argon/console.h>
 #include <argon/abi.h>
 #include <argon/loader.h>
 #include <argon/reslist.h>
@@ -71,6 +72,26 @@ uint32_t ag_proc_unmet_needs(uint32_t axe_flags);
  */
 ag_err_t ag_proc_spawn(const char *path, int argc, char **argv, uint32_t flags,
                        ag_pid_t *out_pid);
+
+/*
+ * Same, but everything THIS process writes goes to `sink` instead of the
+ * screen - including the loader's own lines about it, because the sink is in
+ * place before the new task runs.
+ *
+ * This is how a node runs a program for another node without going mute
+ * itself.  The console's global redirect cannot do it: that one catches every
+ * writer on the board, so a guest that never ends takes the board's own shell
+ * with it.  What a process writes belongs to the process.
+ */
+ag_err_t ag_proc_spawn_sink(const char *path, int argc, char **argv,
+                            uint32_t flags, ag_con_sink_fn sink, void *ctx,
+                            ag_pid_t *out_pid);
+
+/*
+ * The sink of the process running on THIS task, if it has one.  Asked by the
+ * console on each write, and only while some process has a sink at all.
+ */
+bool ag_proc_out_sink(ag_con_sink_fn *sink, void **ctx);
 
 /*
  * Same as spawn, but entry is already in the kernel image (no .AXE load).
