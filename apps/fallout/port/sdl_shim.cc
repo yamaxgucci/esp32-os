@@ -3253,8 +3253,21 @@ static void memstat_service(void)
     /* The worst lap first: it is the one that says whether to read the rest. */
     stall_report();
     census_report();
-    hexcursor_report();
-    showrect_report();
+    /*
+     * hexcursor_report and showrect_report are out of the burst.
+     *
+     * They answered their questions - the hex cursor's handler is where the
+     * map scroll is called from, and of the 30 ms that finishing a scroll
+     * step costs, 12 are the copy into the screen surface and 20 the
+     * conversion into the panel - and a report that has answered its question
+     * is crowding out the ones that have not.  The burst had outgrown what
+     * the printer's ring can push down a 115200 line: "[report] lines were
+     * dropped" eight times in one session, and the line that went missing was
+     * [scroll], which was the one being read.  Both can go back in, one at a
+     * time, when their numbers are wanted again.
+     */
+    (void)hexcursor_report;
+    (void)showrect_report;
 
     worst_report();
     dat_report();
