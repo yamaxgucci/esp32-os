@@ -777,8 +777,8 @@ static ag_err_t proc_finish_load(proc_t *p)
 
     ag_err_t err = ag_loader_load(p->path, p->cwd, &p->app);
     if (err != AG_OK) {
-        ag_log(AG_LOG_ERROR, "proc", "pid %u: load %s failed (%d)",
-               (unsigned)p->pid, p->path, (int)err);
+        ag_log(AG_LOG_ERROR, "proc", "pid %u: %s: %s (%d)",
+               (unsigned)p->pid, p->path, ag_loader_why(err), (int)err);
         return err;
     }
 
@@ -884,7 +884,10 @@ static void proc_task(void *arg)
         if (load_err != AG_OK) {
             p->exit_code = (int32_t)load_err;
             p->state = AG_PS_ZOMBIE;
-            ag_log(AG_LOG_ERROR, "proc", "%s (pid %u) failed to load: %d",
+            ag_log(AG_LOG_ERROR, "proc", "%s (pid %u): %s (%d)",
+                   p->name, (unsigned)p->pid, ag_loader_why(load_err),
+                   (int)load_err);
+            ag_log(AG_LOG_DEBUG, "proc", "%s (pid %u) failed to load: %d",
                    p->name, (unsigned)p->pid, (int)load_err);
             ag_port_sem_t done_fail = p->done;
             ag_port_sem_give(done_fail);

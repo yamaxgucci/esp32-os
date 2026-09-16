@@ -142,3 +142,8 @@ CONFIG_ARGON_ENABLE_ADC=n
 # five, the size every terminal already is.
 CONFIG_ARGON_CONSOLE_COLS=80
 CONFIG_ARGON_CONSOLE_ROWS=25
+
+# Room for a neighbour's devices as well as this board's.  Ten of its own and
+# fifteen from the CYD is twenty-five, and the default twenty-four refuses the
+# last two - which are the screen and the touchscreen.  See CONFIG_ARGON_DEV_MAX.
+CONFIG_ARGON_DEV_MAX=40

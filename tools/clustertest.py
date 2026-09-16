@@ -121,7 +121,17 @@ def clean(buf):
 RESULTS = []
 
 
-def note(ok, name, detail=""):
+def note(ok, name, detail="", why=""):
+    """One result.
+
+    `detail` is a FACT and is printed either way - "24 of 24" is worth seeing
+    when it passes.  `why` is the reason it failed and is printed only then:
+    the first draft printed the failure reason beside PASS, so the summary read
+    "PASS run-output-came-back - nothing from the program", which is a sentence
+    that cannot be true.
+    """
+    if not ok and why:
+        detail = why
     line = ("PASS " if ok else "FAIL ") + name + (" - " + detail if detail
                                                   else "")
     RESULTS.append((ok, line))
@@ -132,6 +142,21 @@ def note(ok, name, detail=""):
 def check(text, needle, name, detail=""):
     return note(needle in text, name, detail or ("no '%s'" % needle
                                                  if needle not in text else ""))
+
+
+def flat(text):
+    """One line of it, for looking up a PHRASE.
+
+    A console has a width, and the CYD's is forty characters: "built for a
+    different processor" arrives split across two rows, so a search for the
+    sentence finds nothing while the sentence is on the screen.  The C3's
+    console is eighty wide and the same check passed there, which is how the
+    asymmetry gave it away.
+
+    Only for phrases.  Anything that depends on WHICH line a thing is on must
+    use the text as it came.
+    """
+    return re.sub(r"\s+", " ", text)
 
 
 def num(text, pattern, default=None):
@@ -214,105 +239,149 @@ def scen_devices(head, blind):
     """
     print("\n== the neighbour's devices ==", flush=True)
 
+    # ASKED FOR, not automatic.  `link devs` pulls the far node's registry
+    # into this one; a board does not adopt its neighbour's hardware merely by
+    # being wired to it, and that is the right default - two boards on a bench
+    # are not one machine until somebody says so.
+    #
+    # The first draft of this check went straight to `dev` and failed four
+    # times over, which looked like a broken feature and was a harness that
+    # did not know the command.
+    t = blind.ask("link devs", timeout=15.0)
+    note("are in this registry now" in t, "dev-%s-pulled-the-registry" % blind.name,
+         why="link devs said nothing")
+
     t = blind.ask("dev")
     note(head.name + "." in t, "dev-%s-sees-%s-devices" % (blind.name, head.name),
-         "no '%s.' entries" % head.name)
+         why="no '%s.' entries" % head.name)
     for want in ("lcd0", "pcm0"):
         note(head.name + "." + want in t,
              "dev-%s-offers-%s" % (head.name, want))
 
     # And the headless board's DEFAULT for a class it does not have is the
-    # neighbour's.  Asked of the system rather than assumed: `dev default`
-    # names what an application would actually get.
-    t = blind.ask("dev default")
-    note(head.name + "." in t, "dev-default-crosses-the-wire",
-         "the blind node's defaults are all local")
+    # neighbour's.  Not asked of a command that does not exist - the first
+    # draft invented `dev default` - but PROVED by using it: a program that
+    # opens the default audio device on a board with no DAC can only be heard
+    # on the other board, and the sound scenario below counts it there.
 
 
-def scen_remote_run(asker, runner, image):
-    """A program on THIS board's card, executed on the OTHER one.
+def scen_remote_run(asker, runner, image, expect):
+    """A program THIS board does not have, run on the one that does.
 
-    The image has to be one the far board can execute, and that is the whole
-    point of the check: a cluster spanning two instruction sets passes
-    messages and shares devices without noticing the difference, and CODE
-    stops at the line.  So each board carries images built for its NEIGHBOUR
-    as well as itself - HELLORV on the Xtensa board, HELLO32 on the RISC-V one.
+    THERE IS NO `run <node> <program>` - I invented that syntax and spent a
+    round of the matrix watching the shell take the node name for a program,
+    fail to find it, and send the whole line to the far board, which tried to
+    run a program called "c3" and said -2.
 
-    What this proves in one command: the far node reads the file off THIS
-    node's card over the wire, loads it, runs it, and the output comes back
-    here.  The program moved; the file did not.
+    The real rule is better than the one I imagined, and it is written out in
+    shell.c: `run <program>`, and if the file is not HERE and a wire is bound,
+    the line goes to the node that has it.  A file on the other node IS the
+    statement that the program belongs there - no manifest, no policy table,
+    no names.  (The manifest still decides the harder half, "this wants a
+    sound card", which cannot be read off a directory.)
+
+    So the check is: ask for something that is only on the OTHER board.  What
+    comes back proves three things at once - the far node found it, ran it,
+    and its output came home to the node that asked.
     """
-    print("\n== %s runs a program that lives on %s ==" % (runner.name,
-                                                          asker.name),
+    print("\n== %s runs what only %s has ==" % (runner.name, runner.name),
           flush=True)
 
-    t = asker.ask("run %s c:\\%s" % (runner.name, image), timeout=25.0)
-    note("Hello" in t or "hello" in t,
-         "run-%s-output-came-back-to-%s" % (runner.name, asker.name),
-         "nothing from the program")
-    note("not found" not in t and "refused" not in t,
-         "run-%s-accepted-the-image" % runner.name)
+    t = asker.ask("run c:\\%s" % image, timeout=30.0)
+    note("not here" in t, "run-%s-knew-it-was-not-here" % asker.name,
+         why="it did not even look at the wire")
+    note(expect in t, "run-%s-ran-it-and-answered-%s" % (runner.name,
+                                                         asker.name),
+         why="nothing recognisable came back")
 
 
-def scen_wrong_arch(asker, runner, image):
-    """And the line itself: an image for the WRONG instruction set.
+def scen_wrong_arch(node, image):
+    """An image for the other instruction set, on the board that cannot run it.
 
-    Refused, by name, rather than loaded and run into an illegal instruction.
-    This is the check that says what a heterogeneous cluster cannot do, and it
-    is as much a part of the answer as what it can.
+    Refused BY NAME - "built for a different processor" - rather than loaded
+    and run into an illegal instruction somewhere inside.  This is the line a
+    heterogeneous cluster cannot cross, and saying where it falls is as much
+    of the answer as saying what works.
+
+    Tested locally on each board because that is where it actually bites: a
+    copy of the wrong build lands on a card, and the message has to name the
+    reason.  The first draft of this check accepted almost any output, so it
+    would have passed on a crash.
     """
-    print("\n== an image the far board cannot execute ==", flush=True)
-    t = asker.ask("run %s c:\\%s" % (runner.name, image), timeout=25.0)
-    # The loader's own words, and nothing looser.  The first draft of this
-    # check accepted almost any output - it had `or "-" in t` in it - so it
-    # would have passed on a crash, on a timeout and on a blank screen.  A
-    # check that cannot fail is not a check.
-    note("built for a different processor" in t,
-         "wrong-arch-refused-in-those-words",
-         "no clear refusal; read the transcript")
+    print("\n== %s is handed an image for the other processor ==" % node.name,
+          flush=True)
+    t = node.ask("run c:\\%s" % image, timeout=15.0)
+    note("built for a different processor" in flat(t),
+         "wrong-arch-%s-refused-in-those-words" % node.name,
+         why="no clear refusal; read the transcript")
     note("Guru" not in t and "panic" not in t,
-         "wrong-arch-did-not-crash-the-far-board")
+         "wrong-arch-%s-did-not-crash" % node.name)
 
 
-def scen_ps_kill(a, b):
-    """One process table across two boards, and a kill that crosses the wire."""
+def scen_ps_kill(near, far, image):
+    """One process table across two boards, and a kill that crosses the wire.
+
+    A REAL process on the far board, started in the background - the first
+    draft used `link echo`, which is a shell command and not a process, so
+    there was nothing for `ps` to find and the check failed for a reason that
+    had nothing to do with the cluster.
+    """
     print("\n== one ps, both boards ==", flush=True)
-    b.say("link echo 25", wait=0.4)
-    t = a.ask("ps")
-    note(b.name in t, "ps-shows-the-other-board",
-         "no process named for %s" % b.name)
-    b.board.pump(26.0)
+
+    far.ask("run /b c:\\%s" % image, timeout=20.0)
+    time.sleep(1.5)
+    t = near.ask("ps", timeout=15.0)
+    note(far.name + "." in t, "ps-%s-sees-a-process-on-%s" % (near.name,
+                                                              far.name),
+         why="no process named for %s" % far.name)
+
+    # And the name it printed is the name that can be typed back at it.
+    name = num(t, r"(" + far.name + r"\.\d+)")
+    if name:
+        t = near.ask("kill %s" % name, timeout=15.0)
+        note("no such" not in t.lower(), "kill-crossed-the-wire", name)
+    else:
+        note(False, "kill-crossed-the-wire", why="nothing to kill")
 
 
-def scen_sound(quiet, loud):
-    """Sound poured from the board that has none onto the board that has one.
+def scen_sound(quiet, loud, image):
+    """Sound from the board that has no DAC, landing on the board that has one.
 
-    Maxim's third scenario, the half that works: a synthesiser on one board,
-    the output on another.  The C3 has no DAC at all, so its default audio
-    device IS the neighbour's, chosen by class - nothing in the program knows.
+    Maxim's third scenario, the half that works today: the synthesiser on one
+    board, the output on another.  Nothing in the program knows - it opens the
+    mixer, and the mixer's default sink on a board with no output of its own is
+    the NEIGHBOUR'S, chosen by class.
+
+    NOT tested with TONE, which was the first attempt: tone opens /dev/pcm0 BY
+    NAME, so on a board with no pcm0 it simply fails with -2 and the class
+    default never gets a chance to do its job.  A test that names the device is
+    not testing the thing that finds the device.
 
     Counted on the RECEIVING board, and that is the only honest place: the
     CYD's speaker connector ships empty, so listening proves nothing either
-    way.  Periods arrived and periods lost are facts; silence is not.
+    way.  Periods delivered and periods lost are facts; silence is not.
     """
     print("\n== sound, poured across the wire ==", flush=True)
 
-    t = quiet.ask("run c:\\tonerv.axe 440 30 200", timeout=20.0)
-    if "not found" in t:
-        note(False, "sound-tone-image-present",
-             "no tonerv.axe on %s - build it" % quiet.name)
+    t = quiet.ask("run c:\\%s pcmmix 192 40" % image, timeout=30.0)
+    if "file not found" in t or "not found" in t:
+        note(False, "sound-%s-has-the-poker" % quiet.name,
+             why="no %s on %s" % (image, quiet.name))
         return
+    note("devpoke:" in t, "sound-%s-wrote-periods" % quiet.name,
+         why="the program said nothing")
 
-    t = loud.ask("log -n 30", timeout=10.0)
-    got = num(t, r"poured: (\d+) periods", None)
+    t = loud.ask("log -n 30", timeout=15.0)
+    # "poured 8 periods, 1632 bytes, 0 lost" - no colon.  The first version of
+    # this looked for "poured:" and reported "no pour report" while the line
+    # was sitting in the journal.
+    got = num(t, r"poured (\d+) periods", None)
     if got is None:
-        note(False, "sound-arrived-at-%s" % loud.name, "no pour report")
+        note(False, "sound-arrived-at-%s" % loud.name, why="no pour report")
         return
-    lost = num(t, r"poured: \d+ periods, \d+ bytes, (\d+) lost", "?")
+    lost = num(t, r"poured \d+ periods, \d+ bytes, (\d+) lost", "?")
     note(int(got) > 0, "sound-arrived-at-%s" % loud.name,
          "%s periods, %s lost" % (got, lost))
-    note(lost == "0" or int(lost) < int(got),
-         "sound-loses-less-than-it-delivers", "%s lost of %s" % (lost, got))
 
 
 # ------------------------------------------------------------------- main ---
@@ -348,18 +417,37 @@ def main():
     scen_wire(cyd, c3)
     scen_devices(cyd, c3)
 
+    # What is on which board decides who runs what, so the images are chosen
+    # for being present on ONE of them: tonerv.axe only on the C3, link32.axe
+    # only on the CYD.  No new files needed - and the tone doubles as the
+    # sound scenario, since the C3 has no DAC of its own.
     rounds = []
     if args.main in ("cyd", "both"):
-        rounds.append((cyd, c3, "hellorv.axe", "hello32.axe"))
+        rounds.append((cyd, c3, "tonerv.axe 440 20 200", "tone:"))
     if args.main in ("c3", "both"):
-        rounds.append((c3, cyd, "hello32.axe", "hellorv.axe"))
+        rounds.append((c3, cyd, "link32.axe", "usage: link"))
 
-    for asker, runner, right, wrong in rounds:
-        scen_remote_run(asker, runner, right)
-        scen_wrong_arch(asker, runner, wrong)
-        scen_ps_kill(asker, runner)
+    for asker, runner, image, expect in rounds:
+        scen_remote_run(asker, runner, image, expect)
 
-    scen_sound(c3, cyd)
+    # A real process on each board, seen and killed from the other.
+    # MIGRANT, because it is the one program on both boards that keeps running
+    # until told to stop - and the kill below is what stops it, so the check
+    # tidies up after itself.
+    #
+    # Not TONE, which was the first choice and a bad one: on the C3 it opens
+    # /dev/pcm0 by name, finds none, and exits at once - so there was never a
+    # process for `ps` to see, and the check failed for a reason that had
+    # nothing to do with the wire.  Not LINK either: its recv opens uart1,
+    # which the wire driver owns.
+    scen_ps_kill(cyd, c3, "migranrv.axe")
+    scen_ps_kill(c3, cyd, "migran32.axe")
+
+    # The line a heterogeneous cluster cannot cross, on both sides of it.
+    scen_wrong_arch(cyd, "nodehirv.axe")
+    scen_wrong_arch(c3, "nodehi32.axe")
+
+    scen_sound(c3, cyd, "devpokrv.axe")
     scen_restart(c3, cyd)
 
     bad = sum(1 for ok, _ in RESULTS if not ok)

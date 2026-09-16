@@ -1073,6 +1073,35 @@ ag_err_t ag_loader_peek(const char *path, const char *cwd,
                            AG_ABI_MAJOR, AG_ABI_MINOR);
 }
 
+/*
+ * Why an image would not load, in words, once.
+ *
+ * It lived in the shell, which meant the shell's `run` explained itself and
+ * everything else printed a number.  On a board that mattered: an image built
+ * for the other instruction set is refused with -AG_ENOTSUP, and what reached
+ * the screen was "nodehirv.axe (pid 2) returned -45".  Correct, useless, and
+ * indistinguishable from a program that chose to return -45.
+ *
+ * Here rather than in the shell because these are the loader's own answers,
+ * and a second copy of the table is a second copy to drift.
+ */
+const char *ag_loader_why(ag_err_t err)
+{
+    switch (-err) {
+    case AG_ENOENT:  return "file not found";
+    case AG_EFORMAT: return "not an ArgonOS application";
+    case AG_ENOTSUP: return "built for a different processor";
+    case AG_EABI:    return "built for a different version of this system";
+    case AG_ENOMEM:  return "not enough memory (task stack / heap / code arena)";
+    case AG_EBUSY:   return "too many applications are loaded";
+    case AG_ERANGE:  return "too many arguments";
+    case AG_EINVAL:  return "is a driver; use 'drv load'";
+    case AG_EEXIST:  return "already loaded";
+    case AG_ENFILE:  return "too many modules are loaded";
+    default:         return "could not be loaded";
+    }
+}
+
 ag_err_t ag_loader_load(const char *path, const char *cwd,
                         ag_loaded_app_t *out)
 {

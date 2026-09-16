@@ -149,3 +149,6 @@ CONFIG_ESP_CONSOLE_UART_DEFAULT=y
 # serial console shows the same grid - it is one screen, rendered twice.
 CONFIG_ARGON_CONSOLE_COLS=40
 CONFIG_ARGON_CONSOLE_ROWS=25
+
+# Room for a neighbour's devices as well as this board's - see the C3 defaults.
+CONFIG_ARGON_DEV_MAX=40

@@ -28,6 +28,7 @@
 #include <string.h>
 
 #include <argon/device.h>
+#include <argon/port/mem.h>
 #include <argon/libc.h>
 #include <argon/linkprov.h>
 #include <argon/log.h>
@@ -222,10 +223,45 @@ typedef struct {
     bool    used;
 } rdev_t;
 
-/* Enough for a second board's worth.  A third board doubles this, and that is
- * the moment to make it a list rather than an array. */
-#define RD_MAX_PROXIES 12
-static rdev_t s_proxy[RD_MAX_PROXIES];
+/*
+ * Enough for a real second board, and TAKEN FROM THE HEAP when a link is
+ * first bound.
+ *
+ * It was twelve, as a static array, and twelve is exactly what a CYD does not
+ * fit: that board has fifteen devices, and the three that did not make it were
+ * sd0, lcd0 and touch0 - the card, the SCREEN and the touchscreen.  Loadable
+ * drivers register after the built-in ones, so what falls off the end is
+ * always the interesting half, and the whole point of lending a board to a
+ * headless neighbour is its screen.
+ *
+ * Worse than the number was the silence.  `link devs` said "12 device(s) of
+ * cyd are here now" and nothing else; the three that did not fit left no
+ * trace, and the missing screen read as a feature that does not work.
+ *
+ * From the heap because most boards are never in a cluster and should not pay
+ * .bss for one - the same reasoning, and the same mistake already made once,
+ * as the cluster thread table that cost 6 KB and broke TLS.
+ */
+#define RD_MAX_PROXIES 32
+static rdev_t *s_proxy;
+
+static rdev_t *proxy_table(void)
+{
+    if (s_proxy == NULL) {
+        const size_t bytes = sizeof(rdev_t) * RD_MAX_PROXIES;
+        /* Outside SRAM first, like the thread table next door: this is read
+         * once per device open, so where it lives costs nothing and what it
+         * displaces costs a lot. */
+        s_proxy = (rdev_t *)ag_port_alloc(bytes, AG_MEM_SLOW | AG_MEM_BYTE);
+        if (s_proxy == NULL) {
+            s_proxy = (rdev_t *)ag_port_alloc(bytes, AG_MEM_FAST | AG_MEM_BYTE);
+        }
+        if (s_proxy != NULL) {
+            memset(s_proxy, 0, sizeof(rdev_t) * RD_MAX_PROXIES);
+        }
+    }
+    return s_proxy;
+}
 
 static ag_err_t rd_open(ag_device_t *dev, uint32_t flags)
 {
@@ -817,6 +853,11 @@ int32_t ag_noderdev_attach(uint32_t timeout_ms)
     ag_strlcpy(pn, peer, sizeof(pn));
 
     int32_t made = 0;
+    if (proxy_table() == NULL) {
+        ag_log(AG_LOG_ERROR, TAG, "no memory for the neighbour's devices");
+        return 0;
+    }
+
     for (int32_t i = 0; i < n && made < RD_MAX_PROXIES; i++) {
         /*
          * Not the link itself.  A proxy for the far node's own link device
@@ -878,7 +919,21 @@ int32_t ag_noderdev_attach(uint32_t timeout_ms)
             .priv = p,
             .owner = (const void *)&s_proxy,
         };
-        if (ag_dev_register(&desc, NULL) != AG_OK) {
+        const ag_err_t re = ag_dev_register(&desc, NULL);
+        if (re != AG_OK) {
+            /*
+             * SAID OUT LOUD.  This used to be a bare `continue`, and a device
+             * that could not be registered simply was not there: the CYD
+             * offers sixteen, thirteen arrived, and the three missing were the
+             * screen, the touchscreen and the link itself.  The link is
+             * excluded on purpose above; the other two vanished without a
+             * word, which reads as "the cluster cannot share a screen".
+             *
+             * A refusal with a reason is a bug report.  A refusal without one
+             * is a mystery, and mysteries cost days.
+             */
+            ag_log(AG_LOG_WARN, TAG, "%s could not be registered here: %d",
+                   full, (int)re);
             p->used = false;
             continue;
         }
@@ -887,13 +942,33 @@ int32_t ag_noderdev_attach(uint32_t timeout_ms)
     s_attached = (made > 0);
     ag_log(AG_LOG_INFO, TAG, "%d device(s) of %s are here now", (int)made,
            peer);
+    /*
+     * And what did NOT fit, by name of the count.  A listing that quietly
+     * stops at a limit is the worst kind of answer: everything looks healthy
+     * and the device somebody actually wanted is simply absent.
+     */
+    if (n > (int32_t)RD_MAX_PROXIES) {
+        ag_log(AG_LOG_WARN, TAG,
+               "%d of %s's devices did not fit (room for %d); raise "
+               "RD_MAX_PROXIES",
+               (int)(n - (int32_t)RD_MAX_PROXIES), peer, (int)RD_MAX_PROXIES);
+    }
     return made;
 }
 
 uint32_t ag_noderdev_detach(void)
 {
     const uint32_t gone = ag_dev_revoke_owner((const void *)&s_proxy);
-    memset(s_proxy, 0, sizeof(s_proxy));
+    /*
+     * The TABLE, not the pointer to it.  When this was an array `sizeof`
+     * meant the whole thing; the moment it became a heap pointer the same
+     * line meant four bytes, and the table would have been left full of
+     * handles to a node that is no longer there.  GCC caught it
+     * (-Wsizeof-pointer-memaccess); it is the reason that warning exists.
+     */
+    if (s_proxy != NULL) {
+        memset(s_proxy, 0, sizeof(rdev_t) * RD_MAX_PROXIES);
+    }
     s_attached = false;
     return gone;
 }

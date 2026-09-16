@@ -1,5 +1,27 @@
 menu "ArgonOS"
 
+    config ARGON_DEV_MAX
+        int "Devices the registry can hold"
+        range 16 64
+        default 24
+        help
+            How many devices can exist at once, this board's own and any it
+            has borrowed from a neighbour.
+
+            A bound rather than a list that grows, on purpose: a bound that is
+            reached is a diagnosable event, and the registry has to work when
+            memory is short.  Each entry is about seventy bytes of internal
+            SRAM, and every board pays for all of them - so this is a number to
+            raise for a board that is in a cluster, and to leave alone for one
+            that is not.
+
+            Twenty-four is exactly one short of the pair on the desk: a C3 with
+            ten of its own, pulling fifteen from a CYD, registers thirteen and
+            refuses the last two - which were the SCREEN and the touchscreen,
+            because loadable drivers register after built-in ones and what
+            falls off the end is always the interesting half.  It refused them
+            with -AG_ENFILE and, until this was found, without a word.
+
     config ARGON_APP_ARENA_KB
         int "Application code arena, KB"
         range 4 192

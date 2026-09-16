@@ -30,6 +30,11 @@
     { "out": "DISK.AXE", "group": "core", "src": ["apps/disk/disk.c"] },
     { "out": "DEVS.AXE", "group": "core", "src": ["apps/devs/devs.c"] },
     { "out": "DEVPOKE.AXE", "group": "core", "src": ["apps/devpoke/devpoke.c"] },
+    {
+      "out": "DEVPOKRV.AXE", "group": "board",
+      "_note": "DEVPOKE for RISC-V.  Its job in the cluster tests is to write to a device BY CLASS rather than by name - `devpokrv.axe pcmmix 192 40` - which is the only way to test that a board with no output of its own reaches the neighbour's.  TONE cannot do it: it opens /dev/pcm0 by name and simply fails with -2 on a board that has none, so the class default never gets a chance.",
+      "arch": "riscv32", "gcc": "riscv32-esp-elf-gcc",
+      "src": ["apps/devpoke/devpoke.c"] },
     { "out": "SPIN.AXE", "group": "core", "src": ["apps/spin/spin.c"] },
     { "out": "IDLE.AXE", "group": "core", "src": ["apps/idle/idle.c"] },
     { "out": "PWR.AXE", "group": "core", "src": ["apps/pwr/pwr.c"] },
@@ -153,6 +158,20 @@
       "_note": "LINK for an LX6 - the image docs/09-esp32-cyd.md has been naming for a month while nothing built it. It measures the wire ALONE, with none of our stack on it, which is the first thing to run on real hardware: a failure there is the wiring or the baud, and everything above would have been read as a cluster fault.",
       "gcc": "xtensa-esp32-elf-gcc",
       "src": ["apps/link/link.c"] },
+    {
+      "out": "NODEHI.AXE", "group": "core",
+      "_note": "The smallest program worth sending to another board: one line, no buffers.  HELLO.AXE cannot be used for that - it carries a deliberate 512 KB static buffer to prove a large .bss lands outside the arena, which makes it impossible on any board without PSRAM (the CYD has 203 KB in total, the C3 has 174).  A remote-run check written with HELLO fails with -12 for a reason that has nothing to do with the wire.",
+      "src": ["apps/nodehi/nodehi.c"] },
+    {
+      "out": "NODEHI32.AXE", "group": "board",
+      "_note": "NODEHI for an LX6 - what a RISC-V board hands to an Xtensa neighbour.",
+      "gcc": "xtensa-esp32-elf-gcc",
+      "src": ["apps/nodehi/nodehi.c"] },
+    {
+      "out": "NODEHIRV.AXE", "group": "board",
+      "_note": "NODEHI for RISC-V - what an Xtensa board hands to a RISC-V neighbour.",
+      "arch": "riscv32", "gcc": "riscv32-esp-elf-gcc",
+      "src": ["apps/nodehi/nodehi.c"] },
     {
       "out": "HELLO32.AXE", "group": "board",
       "_note": "HELLO for an LX6, so a RISC-V board can ask an Xtensa one to run something.  A cluster that spans instruction sets can pass messages and share devices freely, but CODE only runs where its instruction set is - so each board carries the images its NEIGHBOUR can execute, not only its own.",

@@ -31,11 +31,23 @@ extern "C" {
 #endif
 
 /*
- * How many devices can exist at once.  A bound rather than a list that grows,
- * for the same reason the resource list has one: a bound that is reached is a
- * diagnosable event, and the registry has to work when memory is short.
+ * How many devices can exist at once - this board's own, and any it has
+ * borrowed from a neighbour.
+ *
+ * A bound rather than a list that grows, for the same reason the resource list
+ * has one: a bound that is reached is a diagnosable event, and the registry
+ * has to work when memory is short.  What was missing was the diagnosis - a
+ * borrowed device that did not fit was dropped in silence, and the CYD's
+ * screen simply was not in the C3's registry.  noderdev now names it.
+ *
+ * Settable per board (CONFIG_ARGON_DEV_MAX) because every board pays about
+ * seventy bytes an entry whether or not it will ever be in a cluster.
  */
+#ifdef CONFIG_ARGON_DEV_MAX
+#define AG_DEV_MAX CONFIG_ARGON_DEV_MAX
+#else
 #define AG_DEV_MAX 24
+#endif
 
 /*
  * Public because a driver needs its own priv pointer back in every callback,

@@ -985,24 +985,17 @@ static int cmd_color(int argc, char **argv)
 
 static void print_load_error(const char *path, ag_err_t err)
 {
-    const char *why;
-
-    switch (-err) {
-    case AG_ENOENT:  why = "file not found"; break;
-    case AG_EFORMAT: why = "not an ArgonOS application"; break;
-    case AG_ENOTSUP: why = "built for a different processor"; break;
-    case AG_EABI:    why = "built for a different version of this system"; break;
-    case AG_ENOMEM:
-        why = "not enough memory (task stack / heap / code arena)";
-        break;
-    case AG_EBUSY:   why = "too many applications are loaded"; break;
-    case AG_ERANGE:  why = "too many arguments"; break;
-    case AG_EINVAL:  why = "is a driver; use 'drv load'"; break;
-    case AG_EEXIST:  why = "already loaded"; break;
-    case AG_ENFILE:  why = "too many modules are loaded"; break;
-    default:         why = "could not be loaded"; break;
-    }
-    ag_console_printf("%s: %s\n", path, why);
+    /*
+     * The loader's own words - see ag_loader_why().
+     *
+     * This used to be a table right here, which meant the shell's `run`
+     * explained itself in a sentence and every other path printed a bare
+     * number: a board refused an image built for the other instruction set
+     * and what reached the screen was "returned -45", which is correct,
+     * useless, and indistinguishable from a program that chose to return -45.
+     * A second copy of a user-facing table is a second copy to drift.
+     */
+    ag_console_printf("%s: %s\n", path, ag_loader_why(err));
 }
 
 static const char *shell_path_env(void)
