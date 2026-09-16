@@ -166,6 +166,232 @@ typedef struct {
 static ag_stall_t s_stalls[AG_STALLS];
 static unsigned s_stall_n;
 
+/*
+ * ARGON: a census of freezes - how many over the whole game, and during what.
+ *
+ * Maxim asked the one question every report here refused to answer: not how
+ * bad the worst lap was, but HOW MANY.  The stall ring holds sixty-four and
+ * is emptied every burst, so it can show a pattern and never a total; the
+ * worst-lap figures are one lap each.  Neither can say "forty freezes in ten
+ * minutes, thirty-one of them while walking".
+ *
+ * Two things make the counts comparable, and without both they are not:
+ *
+ *   - the time spent in each phase is counted beside its freezes, so the
+ *     column that matters is freezes PER MINUTE of that phase.  Standing
+ *     still is most of a session; a raw count would make it look worst.
+ *   - laps over the modal ceiling are left out of both, count and time.  A
+ *     lap holding a whole conversation is not a freeze, and its minutes would
+ *     swamp the rate of whatever phase it landed in.
+ *
+ * Nothing here is ever reset: this is the session, not the window.
+ */
+enum {
+    AG_PH_STILL = 0,
+    AG_PH_WALK,
+    AG_PH_COMBAT,
+    AG_PH_DIALOG,
+    AG_PH_UI,
+    AG_PH_WORLDMAP,
+    AG_PH_LOAD,
+    AG_PH_MENU,
+    AG_PHASES
+};
+
+static const char *const s_phase_name[AG_PHASES] = {
+    "standing", "walking", "combat", "dialogue", "screens", "worldmap",
+    "map load", "menu"
+};
+
+/* The bands are exclusive, so the columns sum to the total.  120 ms is the
+ * floor because that is AG_STALL_US - the length at which he sees one. */
+#define AG_BANDS 4
+static const uint32_t s_band_us[AG_BANDS] = {
+    120000u, 250000u, 500000u, 1000000u
+};
+/* The lower edge of each band, in seconds - the header has five characters a
+ * column, so the band is named by where it starts and the row above says the
+ * bands are exclusive. */
+static const char *const s_band_name[AG_BANDS] = {
+    "0.12", "0.25", "0.5", "1s+"
+};
+
+/*
+ * And what each freeze was doing, which is the question the bands raise.
+ *
+ * Maxim, 16 September 2026: "интересуют только фризы 0.12-0.25, как стоя так
+ * и на ходу" - a hundred and twenty laps a session, and every report the port
+ * had was either an average over seventeen hundred laps or the single worst
+ * one.  Neither can say what the hundred and twenty have in common.
+ *
+ * The eleven below are the whole lap, with the input phase - which is where
+ * every long lap has landed so far - opened up into the six parts that are
+ * already timed inside it.  A lap gets exactly one cause: the largest.  That
+ * is a crude rule and it is the right one here, because what is being asked
+ * is which of them to go and fix.
+ */
+enum {
+    AG_CAUSE_PUMP = 0,    /* the SDL event pump */
+    AG_CAUSE_PROGRAMS,    /* _updatePrograms: the script machine */
+    AG_CAUSE_WINDOWS,     /* _updateWindows */
+    AG_CAUSE_CRITTERS,    /* _script_chk_critters */
+    AG_CAUSE_TIMED,       /* _script_chk_timed_events */
+    AG_CAUSE_ANIM,        /* the animation tick, and the map it redraws */
+    AG_CAUSE_TICKERS,     /* whatever else is on the ticker list */
+    AG_CAUSE_MOUSE,       /* _mouse_info */
+    AG_CAUSE_BUTTONS,     /* the button scan and the keyboard queue */
+    AG_CAUSE_KEYS,        /* gameHandleKey */
+    AG_CAUSE_REQUESTS,    /* scriptsHandleRequests */
+    AG_CAUSE_MAPS,        /* mapHandleTransition */
+    AG_CAUSE_PRESENT,     /* renderPresent */
+    AG_CAUSES
+};
+
+static const char *const s_cause_name[AG_CAUSES] = {
+    "pump", "programs", "windows", "critters", "timed", "anim", "tickers",
+    "mouse", "buttons", "keys", "requests", "maps", "present"
+};
+
+typedef struct {
+    uint32_t laps;
+    uint64_t us;
+    uint32_t band[AG_BANDS];
+    uint32_t worst_us;
+    uint32_t worst_at_ms;
+    /* Causes of this phase's freezes, and of the 0.12-0.25 band alone: he
+     * asked about that band, and a table that mixes it with the rare long
+     * ones would answer a question nobody asked. */
+    uint32_t cause[AG_CAUSES];
+    uint32_t cause_small[AG_CAUSES];
+} ag_phase_t;
+
+static ag_phase_t s_phase[AG_PHASES];
+static uint32_t s_census_from_ms;
+static uint32_t s_census_modal;
+
+/*
+ * Standing and walking are the same place to ag_doing_now() - both are
+ * AG_WHERE_WALK, which says "on a map with no window open".  What tells them
+ * apart is whether the map was redrawn during the lap, which is what walking
+ * IS: the same test the metric has used since it was split in two.
+ */
+static int census_phase(int where, bool moved)
+{
+    switch (where) {
+    case AG_WHERE_COMBAT:   return AG_PH_COMBAT;
+    case AG_WHERE_DIALOG:   return AG_PH_DIALOG;
+    case AG_WHERE_UI:       return AG_PH_UI;
+    case AG_WHERE_WORLDMAP: return AG_PH_WORLDMAP;
+    case AG_WHERE_MAPLOAD:  return AG_PH_LOAD;
+    case AG_WHERE_MENU:     return AG_PH_MENU;
+    default:                return moved ? AG_PH_WALK : AG_PH_STILL;
+    }
+}
+
+/* The largest of the eleven, from the lap's own numbers. */
+static int census_cause(uint32_t input_us, uint32_t keys_us,
+                        uint32_t requests_us, uint32_t maps_us,
+                        uint32_t present_us)
+{
+    uint32_t v[AG_CAUSES];
+
+    v[AG_CAUSE_PUMP] = ag_lap_events_us;
+    v[AG_CAUSE_PROGRAMS] = ag_lap_programs_us;
+    v[AG_CAUSE_WINDOWS] = ag_lap_windows_us;
+    v[AG_CAUSE_CRITTERS] = ag_lap_critters_us;
+    v[AG_CAUSE_TIMED] = ag_lap_timed_us;
+    v[AG_CAUSE_ANIM] = ag_lap_anim_us;
+    v[AG_CAUSE_MOUSE] = ag_lap_mouse_us;
+
+    /*
+     * The ticker list holds the four script parts above, the animation tick,
+     * and everything else somebody registered; what is left of it after the
+     * two named ones is its own row rather than nobody's.
+     */
+    const uint32_t bk = ag_lap_programs_us + ag_lap_windows_us
+        + ag_lap_critters_us + ag_lap_timed_us;
+    const uint32_t named_tick = bk + ag_lap_anim_us;
+
+    v[AG_CAUSE_TICKERS] = (ag_lap_tickers_us > named_tick)
+        ? (ag_lap_tickers_us - named_tick) : 0u;
+
+    /*
+     * And the button scan with the keyboard queue, which nothing times, as
+     * the remainder of the phase.  It is a remainder and it has already lied
+     * once: before the animation tick was measured, this row took the blame
+     * for 107 of the 126 freezes of a session, because the animation is a
+     * ticker and the ticker list was not in the sum.  A remainder can only be
+     * trusted once everything large beside it has a name.
+     */
+    const uint32_t known = ag_lap_events_us + ag_lap_tickers_us
+        + ag_lap_mouse_us;
+
+    v[AG_CAUSE_BUTTONS] = (input_us > known) ? (input_us - known) : 0u;
+    v[AG_CAUSE_KEYS] = keys_us;
+    v[AG_CAUSE_REQUESTS] = requests_us;
+    v[AG_CAUSE_MAPS] = maps_us;
+    v[AG_CAUSE_PRESENT] = present_us;
+
+    int best = 0;
+
+    for (int i = 1; i < AG_CAUSES; i++) {
+        if (v[i] > v[best]) {
+            best = i;
+        }
+    }
+    return best;
+}
+
+static void census_note(uint32_t cost_us, uint32_t throttle_us, int where,
+                        int cause)
+{
+    static unsigned last_refresh_n;
+
+    /* move_report zeroes this counter every burst, so "different" is the
+     * test, not "greater": one lap a window is mislabelled and that is the
+     * whole error. */
+    const bool moved = (ag_move_refresh_n != last_refresh_n);
+
+    last_refresh_n = ag_move_refresh_n;
+
+    if (s_census_from_ms == 0u) {
+        s_census_from_ms = (uint32_t)ag_millis();
+    }
+    if (cost_us > AG_MODAL_US) {
+        s_census_modal++;
+        return;
+    }
+
+    ag_phase_t *p = &s_phase[census_phase(where, moved)];
+
+    p->laps++;
+    /*
+     * Wall time, not work time - the sleep belongs in it.
+     *
+     * The first run of this divided by the work only, and standing still came
+     * out at 5477 laps in 45 "seconds": 121 laps a second, when the game was
+     * running at 57.  The limiter's sleep is most of a lap that has time to
+     * spare, so leaving it out shrank the quiet phases far more than the busy
+     * ones - which is the one thing a rate compared between phases must not
+     * do.  A freeze is still judged on the work; only the denominator changed.
+     */
+    p->us += (uint64_t)cost_us + throttle_us;
+    if (cost_us > p->worst_us) {
+        p->worst_us = cost_us;
+        p->worst_at_ms = (uint32_t)ag_millis();
+    }
+    for (int b = AG_BANDS - 1; b >= 0; b--) {
+        if (cost_us >= s_band_us[b]) {
+            p->band[b]++;
+            p->cause[cause]++;
+            if (b == 0) {
+                p->cause_small[cause]++;
+            }
+            break;
+        }
+    }
+}
+
 static void cache_totals(uint32_t *miss_n, uint32_t *miss_ms, uint32_t *kb)
 {
     uint32_t n = 0, ms = 0, k = 0;
@@ -209,6 +435,20 @@ void ag_frame_note(unsigned input_us, unsigned keys_us, unsigned scripts_us,
      * and far shorter than any screen a person opens, so the two do not
      * overlap; the count is printed so that nothing is silently dropped.
      */
+    census_note(cost, throttle_us, where,
+                census_cause(input_us, keys_us, scripts_us, maps_us,
+                             present_us));
+
+    /* One lap's worth, read; the next lap starts from nothing. */
+    ag_lap_events_us = 0;
+    ag_lap_programs_us = 0;
+    ag_lap_windows_us = 0;
+    ag_lap_critters_us = 0;
+    ag_lap_timed_us = 0;
+    ag_lap_mouse_us = 0;
+    ag_lap_tickers_us = 0;
+    ag_lap_anim_us = 0;
+
     if (cost > AG_MODAL_US) {
         s_modal_laps++;
         if (cost > s_modal_worst_us) {
@@ -513,10 +753,17 @@ static int scale_now(void)
  * F7, F10 and F12, and patch 0013 has F11.  The arrows are only swallowed while
  * one to one is on, so they do whatever they normally do the rest of the time.
  *
- * The window does not follow the pointer.  It could be made to, but the port
- * knows where the host's pointer is on the panel and not where the engine's
- * cursor is on the picture, and a window that lurches on a twitch of the mouse
- * while a dialogue is being read is worse than one that stays where it is put.
+ * Asked for on 16 September 2026: the arrows keep their jump of a quarter
+ * screen, and the mouse moves the window smoothly.  It moves when the pointer
+ * is within a finger of an edge, faster the closer it gets - which is how this
+ * game has always scrolled its map, and it composes with that: the window
+ * slides until it reaches the edge of the picture, and from there the engine's
+ * own scrolling takes over.
+ *
+ * The earlier note here said the window must not follow the pointer, because
+ * it "would lurch on a twitch of the mouse while a dialogue is being read".
+ * That objection is answered by the margin rather than by refusing: a pointer
+ * resting anywhere in the middle three quarters moves nothing at all.
  */
 static int s_one_to_one;      /* F8: showing the picture at its own size */
 
@@ -1343,6 +1590,13 @@ static void tickers_report(void)
                 (unsigned)(ag_ml_maps_us / s_frames),
                 (unsigned)(ag_ml_present_us / s_frames),
                 (unsigned)(ag_ml_throttle_us / s_frames));
+    /* These two were never reset, so the "events/handlers" pair in the line
+     * above was a running total divided by one window's frames: it printed
+     * handlers 133252 us/frame beside an input phase of 5558, which cannot
+     * both be true.  Found while looking for something else. */
+    ag_in_events_us = 0;
+    ag_in_bk_us = 0;
+    ag_in_calls = 0;
     ag_ml_input_us = 0;
     ag_ml_keys_us = 0;
     ag_ml_scripts_us = 0;
@@ -1680,6 +1934,11 @@ unsigned ag_tilerefresh_us, ag_tilerefresh_n, ag_tilerefresh_px;
 unsigned ag_in_events_us, ag_in_bk_us, ag_in_calls;
 unsigned ag_bk_programs_us, ag_bk_windows_us, ag_bk_critters_us,
          ag_bk_timed_us, ag_bk_calls;
+/* The same six, for ONE lap: cleared by ag_frame_note after it has read
+ * them.  See the cause table in the freeze census. */
+unsigned ag_lap_events_us, ag_lap_programs_us, ag_lap_windows_us,
+         ag_lap_critters_us, ag_lap_timed_us, ag_lap_mouse_us;
+unsigned ag_lap_tickers_us, ag_lap_anim_us;
 unsigned ag_queue_type_us[16], ag_queue_type_n[16], ag_queue_type_worst[16];
 unsigned ag_queue_budget_us = 8000u, ag_queue_deferred, ag_queue_done;
 unsigned ag_op_us[1024], ag_op_n[1024], ag_op_worst[1024];
@@ -1977,6 +2236,129 @@ static void render_ab_bucket(void)
 
     /* And now the other one, for the window that is starting. */
     ag_render_tight = (slot == 1u) ? 0 : 1;
+}
+
+/*
+ * ARGON: the census, printed as one table.
+ *
+ * One row per phase, and the rows are only comparable because the seconds are
+ * on them: 31 freezes while walking and 9 while standing says nothing until
+ * you know he walked for four minutes and stood for eleven.
+ */
+static void census_report(void)
+{
+    uint32_t total_laps = 0, total_free = 0;
+    uint64_t total_us = 0;
+
+    for (int i = 0; i < AG_PHASES; i++) {
+        total_laps += s_phase[i].laps;
+        total_us += s_phase[i].us;
+        for (int b = 0; b < AG_BANDS; b++) {
+            total_free += s_phase[i].band[b];
+        }
+    }
+    if (total_laps == 0u) {
+        return;
+    }
+
+    const uint32_t now = (uint32_t)ag_millis();
+
+    shim_printf("[freezes t=%u] the whole session: %u laps over %u ms in "
+                "%u s of play, %u laps over %u s set aside as screens\n",
+                (unsigned)now, (unsigned)total_free,
+                (unsigned)(s_band_us[0] / 1000u),
+                (unsigned)(total_us / 1000000ull),
+                (unsigned)s_census_modal,
+                (unsigned)(AG_MODAL_US / 1000000u));
+    /*
+     * Ten columns inside seventy-four characters, because the console is
+     * eighty wide and a wrapped row is a row that has to be reassembled
+     * before it can be read.  The first version of this table wrapped and the
+     * two columns that carry the answer - the rate and the worst - were the
+     * ones that fell off the end.
+     */
+    shim_printf("[freezes] %-9s %5s %6s %5s %5s %4s %4s %5s %6s %6s\n",
+                "phase", "sec", "laps", s_band_name[0], s_band_name[1],
+                s_band_name[2], s_band_name[3], "all", "/min", "worst");
+
+    for (int i = 0; i < AG_PHASES; i++) {
+        const ag_phase_t *q = &s_phase[i];
+
+        if (q->laps == 0u) {
+            continue;
+        }
+
+        uint32_t n = 0;
+
+        for (int b = 0; b < AG_BANDS; b++) {
+            n += q->band[b];
+        }
+
+        /* Per minute of THIS phase, in tenths: the only figure on the row
+         * that can be held beside another row. */
+        const uint32_t secs = (uint32_t)(q->us / 1000000ull);
+        const uint32_t rate = (q->us > 0ull)
+            ? (uint32_t)((uint64_t)n * 600000000ull / q->us) : 0u;
+
+        shim_printf("[freezes] %-9s %5u %6u %5u %5u %4u %4u %5u %4u.%u %6u\n",
+                    s_phase_name[i], (unsigned)secs, (unsigned)q->laps,
+                    (unsigned)q->band[0], (unsigned)q->band[1],
+                    (unsigned)q->band[2], (unsigned)q->band[3], (unsigned)n,
+                    (unsigned)(rate / 10u), (unsigned)(rate % 10u),
+                    (unsigned)(q->worst_us / 1000u));
+    }
+
+    /*
+     * And what they were, biggest first.
+     *
+     * Two lines a phase: the band he asked about, and everything longer.  The
+     * second is the short one and is printed anyway, because "the long ones
+     * have a different cause" is a thing this table must be able to say.
+     */
+    for (int i = 0; i < AG_PHASES; i++) {
+        const ag_phase_t *q = &s_phase[i];
+
+        for (int pass = 0; pass < 2; pass++) {
+            const uint32_t *src = (pass == 0) ? q->cause_small : q->cause;
+            uint32_t        col[AG_CAUSES];
+            char            line[200];
+            int             at = 0;
+            unsigned        total = 0;
+
+            for (int c = 0; c < AG_CAUSES; c++) {
+                col[c] = src[c];
+                /* The second pass is everything ABOVE the first band, so the
+                 * two lines add up to the row above rather than overlapping. */
+                if (pass == 1) {
+                    col[c] -= q->cause_small[c];
+                }
+                total += col[c];
+            }
+            if (total == 0u) {
+                continue;
+            }
+            /* Selection sort by hand: eleven entries, and the alternative is
+             * a comparator and a sort in a file that has neither. */
+            for (int k = 0; k < 4; k++) {
+                int best = -1;
+
+                for (int c = 0; c < AG_CAUSES; c++) {
+                    if (col[c] != 0u && (best < 0 || col[c] > col[best])) {
+                        best = c;
+                    }
+                }
+                if (best < 0) {
+                    break;
+                }
+                at += snprintf(line + at, sizeof(line) - (size_t)at,
+                               "%s%s %u", (k == 0) ? "" : ", ",
+                               s_cause_name[best], (unsigned)col[best]);
+                col[best] = 0u;
+            }
+            shim_printf("[freezes] %-9s %-9s %u: %s\n", s_phase_name[i],
+                        (pass == 0) ? "0.12-0.25" : "longer", total, line);
+        }
+    }
 }
 
 static void stall_report(void)
@@ -2776,6 +3158,7 @@ static void memstat_service(void)
     render_ab_bucket();
     /* The worst lap first: it is the one that says whether to read the rest. */
     stall_report();
+    census_report();
 
     worst_report();
     dat_report();
@@ -5377,6 +5760,155 @@ void sdl_shim_input_service(void)
     }
 }
 
+/*
+ * ARGON: the mouse moves the one-to-one window, smoothly.
+ *
+ * Three decisions, each of which had a cheaper wrong answer:
+ *
+ *   - it is driven from here, not from the pointer event.  A hand held still
+ *     at the edge sends no events at all, so a view that moved only on
+ *     movement would stop the moment it was wanted most.  pump() is called
+ *     several times a lap (the engine polls until the queue is empty), so the
+ *     step is taken on a clock instead: sixty a second, whatever the polling
+ *     does.
+ *   - the edge is measured against the ENGINE's cursor, not the driver's
+ *     pointer.  The first version used the driver's position and Maxim
+ *     reported both halves of the mistake in one sentence: "sometimes the
+ *     mouse has to go past the visible area before it moves, and sometimes it
+ *     starts before I reach the edge".  The driver's position is the panel's,
+ *     0..319, and it saturates there; the cursor he can see is the engine's,
+ *     0..639, accumulated from relative motion and clipped to the picture.
+ *     Once either one has run into a limit the other does not have, they are
+ *     apart - and the one that matters is the one on the glass.
+ *   - the cursor travels WITH the window, by feeding the slide back in as
+ *     relative motion.  Otherwise the cursor stays where it is on the picture
+ *     while the window slides out from under it, the pointer drifts back into
+ *     the middle, and the scroll stops itself after two ticks.  This is what
+ *     makes holding the pointer at the edge keep scrolling, which is how this
+ *     game has always behaved.
+ *   - a step that would leave the picture is not a step.  pan_clamp already
+ *     refuses it, and repainting anyway would cost a whole panel blit per
+ *     frame for ever, just for holding the pointer against the left edge.
+ */
+#define AG_PAN_TICK   16u     /* ms between steps: about sixty a second */
+
+/*
+ * One speed, not a ramp.  `-pan <pixels>`, 0 turns it off.
+ *
+ * The first version went from one pixel a tick at the outer edge of the
+ * margin to twelve at the very edge, on the theory that it would let a small
+ * push nudge and a firm push travel.  Maxim, from the chair: "вроде какое-то
+ * ускорение появилось.  Оно либо лишнее, либо слишком большое."  Both halves
+ * of that are true of a ramp whose whole range is forty pixels wide - the
+ * speed then depends on exactly where in those forty the hand stopped, which
+ * is not something a hand can aim at.  So the speed is flat and the only
+ * thing the margin decides is whether it moves at all.
+ *
+ * Six pixels a tick is about 360 a second: the 320 hidden pixels of the
+ * picture go by in a little under a second.
+ */
+extern "C" int ag_pan_speed = 6;
+
+/*
+ * And how near an edge starts it, in panel pixels.  `-panedge <pixels>`.
+ *
+ * Forty was a guess and it was too wide: with the whole panel 320 across, a
+ * band of forty on each side leaves only the middle 240 standing still, and
+ * the window began to move while the cursor still looked well inside the
+ * picture.  Twenty, asked for from the chair after trying it.
+ */
+extern "C" int ag_pan_edge = 20;
+
+static void pan_follow_pointer(void)
+{
+    static uint32_t next_ms;
+
+    if (!s_one_to_one || s_panel_shift == 0 || s_mouse_x < 0
+            || ag_pan_speed <= 0) {
+        return;
+    }
+
+    const uint32_t now = (uint32_t)ag_millis();
+
+    if (next_ms != 0u && now < next_ms) {
+        return;
+    }
+    next_ms = now + AG_PAN_TICK;
+
+    const int w = (int)s_gfx.width;
+    const int h = (int)s_gfx.height;
+
+    /* Where the cursor is on the panel: the engine's place on the picture,
+     * less the window's origin.  This is the number the margins are about. */
+    int cx = 0, cy = 0;
+
+    ag_mouse_where(&cx, &cy);
+
+    const int mx = cx - s_pan_x;
+    const int my = cy - s_pan_y;
+    int dx = 0, dy = 0;
+
+    if (mx < ag_pan_edge) {
+        dx = -ag_pan_speed;
+    } else if (mx >= w - ag_pan_edge) {
+        dx = ag_pan_speed;
+    }
+    if (my < ag_pan_edge) {
+        dy = -ag_pan_speed;
+    } else if (my >= h - ag_pan_edge) {
+        dy = ag_pan_speed;
+    }
+    const int was_x = s_pan_x;
+    const int was_y = s_pan_y;
+
+    s_pan_x += dx;
+    s_pan_y += dy;
+
+    /*
+     * And the cursor may not leave the window, whatever the margins said.
+     *
+     * A hand moving faster than twelve pixels a tick outruns the slide, and
+     * without this the cursor walks off the visible part of the picture and
+     * disappears - which from the chair is indistinguishable from the pointer
+     * having died.  When that happens the window stops easing and simply goes
+     * where it must.
+     */
+    if (cx - s_pan_x < 0) {
+        s_pan_x = cx;
+    } else if (cx - s_pan_x >= w) {
+        s_pan_x = cx - w + 1;
+    }
+    if (cy - s_pan_y < 0) {
+        s_pan_y = cy;
+    } else if (cy - s_pan_y >= h) {
+        s_pan_y = cy - h + 1;
+    }
+
+    pan_clamp();
+
+    const int went_x = s_pan_x - was_x;
+    const int went_y = s_pan_y - was_y;
+
+    if (went_x == 0 && went_y == 0) {
+        return;
+    }
+
+    /*
+     * Carry the cursor along, as relative motion.
+     *
+     * The engine never reads a position from the port - dinput.cc asks
+     * SDL_GetRelativeMouseState and adds what it gets to its own cursor - so
+     * this, and not an SDL_MOUSEMOTION with new coordinates, is the only way
+     * to tell it the cursor has moved.  The first version of this pushed a
+     * motion event and it did precisely nothing: the engine does not look at
+     * that field.
+     */
+    s_mouse_dx += went_x;
+    s_mouse_dy += went_y;
+
+    panel_repaint();
+}
+
 static void pump(void)
 {
     /*
@@ -5395,6 +5927,8 @@ static void pump(void)
         s_scale_changed = 0;
         panel_repaint();
     }
+
+    pan_follow_pointer();
 
     ag_event_t e;
     while (ag_poll_event(&e, 0)) {
@@ -5453,8 +5987,9 @@ static void pump(void)
                     s_one_to_one = !s_one_to_one;
                     panel_repaint();
                     ag_printf("panel: %s\n",
-                              s_one_to_one ? "one to one, arrows to move"
-                                           : "whole picture");
+                              s_one_to_one
+                                  ? "one to one, arrows jump, mouse slides"
+                                  : "whole picture");
                     continue;
                 }
                 if (s_one_to_one) {

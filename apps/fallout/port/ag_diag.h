@@ -295,6 +295,26 @@ extern unsigned ag_in_events_us, ag_in_bk_us, ag_in_calls;
  * script per call, and the timed events. */
 extern unsigned ag_bk_programs_us, ag_bk_windows_us, ag_bk_critters_us,
                 ag_bk_timed_us, ag_bk_calls;
+
+/*
+ * And the same parts for one lap only, so that a freeze can be given a cause
+ * instead of a phase.
+ *
+ * A window's averages cannot say what a single 150 ms lap was doing: the
+ * averages are over seventeen hundred laps and the freeze is one of them, and
+ * "worst of the window" is one lap per part with no way to tell whether they
+ * are the same lap.  Maxim asked specifically about the 0.12-0.25 s band,
+ * which is a hundred and twenty laps a session - a question about a
+ * distribution, and these are what the distribution is made of.  Every site
+ * that adds to the accumulators above adds here too; ag_frame_note reads
+ * these and clears them once a lap.
+ */
+extern unsigned ag_lap_events_us, ag_lap_programs_us, ag_lap_windows_us,
+                ag_lap_critters_us, ag_lap_timed_us, ag_lap_mouse_us;
+/* The whole ticker list, and the animation tick that is one entry in it.
+ * _doBkProcesses - the four above - is another entry, so a remainder taken
+ * without these called the animation "the button scan". */
+extern unsigned ag_lap_tickers_us, ag_lap_anim_us;
 /* Inside the timed events: the thirty-second map update, and the queue of
  * game events with how many were processed in the worst burst. */
 /* The event queue by type, and the budget that keeps a burst of them from
@@ -427,6 +447,11 @@ void ag_frame_note(unsigned input_us, unsigned keys_us, unsigned scripts_us,
 /* What the game is doing right now, as one of AG_WHERE_*.  Implemented in
  * cache.cc, where the game's own state is reachable; the port never calls it. */
 int ag_doing_now(void);
+
+/* Where the cursor the player can see is, in the picture's pixels.  The port's
+ * own idea of the pointer is the driver's, in panel pixels, and the two are
+ * not the same position - see mouse.cc, which implements this. */
+void ag_mouse_where(int *x, int *y);
 
 /* The clock the frame timings use, in microseconds.  Implemented in the port
  * so that no engine file has to include <argon/argon.h>. */

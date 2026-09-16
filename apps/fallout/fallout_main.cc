@@ -1294,6 +1294,8 @@ extern "C" void sdl_shim_fps(int every_ms);
 extern "C" void sdl_shim_scale_sharp(int on);
 extern "C" void sdl_shim_scale_mode(int mode);
 extern "C" int ag_events_budget_us;
+extern "C" int ag_pan_speed;
+extern "C" int ag_pan_edge;
 extern "C" void sdl_shim_cycle_ms(int ms);
 extern "C" void sdl_shim_events(int on);
 extern "C" void sdl_shim_recinput(int on);
@@ -1691,6 +1693,14 @@ extern "C" int ag_cxx_main(int argc, char **argv)
         } else if (same(argv[i], "-scale") && i + 1 < argc) {
             /* 0 one pixel of the 2x2, 1 the average, 2 the brightest. */
             scale_mode = to_int(argv[++i]);
+        } else if (same(argv[i], "-pan") && i + 1 < argc) {
+            /* Pixels a tick the one-to-one window slides at when the cursor
+             * is near an edge, sixty ticks a second; 0 leaves the arrows as
+             * the only way to move it. */
+            ag_pan_speed = to_int(argv[++i]);
+        } else if (same(argv[i], "-panedge") && i + 1 < argc) {
+            /* How near an edge of the panel starts the slide, in pixels. */
+            ag_pan_edge = to_int(argv[++i]);
         } else if (same(argv[i], "-cull") && i + 1 < argc) {
             ag_draw_cull = to_int(argv[++i]);
         } else if (same(argv[i], "-events") && i + 1 < argc) {
