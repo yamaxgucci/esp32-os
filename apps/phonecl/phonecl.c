@@ -931,5 +931,33 @@ int ag_main(int argc, char **argv)
     }
 
     ag_net_close(s.sock);
+    /*
+     * A last line, so a script can tell "finished" from "still going".
+     *
+     * The shell's prompt is no good for that: it is echoed while the command
+     * is still being typed, so a harness watching for it measures its own
+     * keystrokes.  One word printed here is unambiguous and costs nothing.
+     */
+    /*
+     * The tag last, and this is what makes a script able to read this at
+     * all.
+     *
+     * A console that is still catching up delivers the previous run's
+     * output during the next one, so a harness watching for "done" finds
+     * the last round's "done" within half a second and measures nothing.
+     * A number the caller chose cannot be confused with anything earlier.
+     */
+    ag_printf("done %d\n", rc);
+    for (int i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "-tag") == 0 && i + 1 < argc) {
+            /*
+             * In brackets, because a bare number is a substring of a
+             * bigger one: a harness looking for "tag 1" found it inside
+             * "tag 13" left on the screen by an earlier run, and every
+             * round then finished instantly with somebody else's answer.
+             */
+            ag_printf("tag[%s]\n", argv[i + 1]);
+        }
+    }
     return rc;
 }
