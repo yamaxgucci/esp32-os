@@ -105,6 +105,16 @@ def stage(board_dir, apps_dir, out_dir, display=None, extra=(),
             shutil.copy2(src, os.path.join(out_dir, name))
             staged.append(name)
 
+        # AUTOEXEC.BAT if the pack has one - what this board does for itself at
+        # boot, as against what it IS, which is the two files above.  Optional,
+        # because most boards do nothing; a cluster node binds its wire here,
+        # since a binding is lost on every reset and a board in a cupboard has
+        # nobody to type it again.
+        auto = os.path.join(board_dir, "AUTOEXEC.BAT")
+        if os.path.isfile(auto):
+            shutil.copy2(auto, os.path.join(out_dir, "AUTOEXEC.BAT"))
+            staged.append("AUTOEXEC.BAT")
+
         # Drivers, under the names SYSTEM.CFG spells: lower case, because that
         # is what `drv install` writes and littlefs does not fold case.
         drv_dir = os.path.join(out_dir, "drv")

@@ -154,6 +154,16 @@
       "gcc": "xtensa-esp32-elf-gcc",
       "src": ["apps/link/link.c"] },
     {
+      "out": "HELLO32.AXE", "group": "board",
+      "_note": "HELLO for an LX6, so a RISC-V board can ask an Xtensa one to run something.  A cluster that spans instruction sets can pass messages and share devices freely, but CODE only runs where its instruction set is - so each board carries the images its NEIGHBOUR can execute, not only its own.",
+      "gcc": "xtensa-esp32-elf-gcc",
+      "src": ["apps/hello/hello.c"] },
+    {
+      "out": "HELLORV.AXE", "group": "board",
+      "_note": "HELLO for RISC-V, the mirror of HELLO32: what an Xtensa board hands to a RISC-V neighbour.",
+      "arch": "riscv32", "gcc": "riscv32-esp-elf-gcc",
+      "src": ["apps/hello/hello.c"] },
+    {
       "out": "NODELNRV.SYS", "group": "board",
       "_note": "The wire driver for a RISC-V board - the C3 SuperMini and the C6.  One image for both: mkaxe names rv32imc, which the C3 is and the C6 is a superset of.  A third build of the same source, and the reason is always the same - an image built for the wrong instruction set does not refuse to load, it loads and throws an illegal instruction somewhere inside.",
       "arch": "riscv32", "gcc": "riscv32-esp-elf-gcc",
@@ -179,6 +189,14 @@
     {
       "out": "TONE.AXE", "group": "core",
       "_note": "A pure sine to /dev/pcm0 at a chosen frequency, level and length - the level is the volume (the I2S DAC has no gain of its own). A steady tone is the cleanest dropout test. Needs [audio] pins in BOARD.CFG.",
+      "include": ["apps/common", "apps/common/libc"],
+      "cflags": "-Os -ffunction-sections -fdata-sections -fno-builtin",
+      "src": ["apps/tone/tone.c", "apps/common/libc/libc_shim.c"]
+    },
+    {
+      "out": "TONERV.AXE", "group": "board",
+      "_note": "TONE for RISC-V.  Its point on the C3 is that the board has no DAC at all: the tone goes to the default audio device, which by class is the NEIGHBOUR'S - nothing in the program knows or asks. That is the sound half of the cluster, and it is counted on the receiving board because the CYD's speaker connector ships empty and silence proves nothing.",
+      "arch": "riscv32", "gcc": "riscv32-esp-elf-gcc",
       "include": ["apps/common", "apps/common/libc"],
       "cflags": "-Os -ffunction-sections -fdata-sections -fno-builtin",
       "src": ["apps/tone/tone.c", "apps/common/libc/libc_shim.c"]

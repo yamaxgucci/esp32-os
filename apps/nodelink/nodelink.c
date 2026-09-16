@@ -209,6 +209,10 @@ static void inbox_put(uint8_t chan, const uint8_t *data, uint16_t len)
     s_nd.in_fill++;
 }
 
+/* Defined below, beside the bind that sends it.  Declared here because the
+ * receive path has to act on a reset before it judges a sequence. */
+static void reset_channels(bool announce);
+
 static void frame_arrived(void)
 {
     const ag_nlink_hdr_t *h = &s_nd.cur;
@@ -234,6 +238,22 @@ static void frame_arrived(void)
     /* The peer's acknowledgement rides on every frame it sends. */
     if (h->ack != NL_ACK_NONE) {
         ag_nlink_tx_ack(&s_nd.tx[cls], h->ack, now_ms());
+    }
+
+    if ((h->flags & NL_F_RST) != 0u) {
+        /*
+         * The peer has started over - booted, or been bound again - and has
+         * forgotten both what it sent us and what it had of ours.  Acted on
+         * BEFORE the sequence check below, because a receiver waiting for
+         * sequence zero rejects everything, this frame included, and a reset
+         * that has to arrive in order is not a reset.
+         *
+         * Not announced back: both ends are now at the beginning, and a reply
+         * would only give the two of them something to answer for ever.
+         */
+        reset_channels(false);
+        ag_log(AG_LOG_INFO, "nodelink", "the other end started over");
+        return;
     }
 
     if ((h->flags & NL_F_ACKONLY) != 0u) {
@@ -470,10 +490,62 @@ static void turn(void)
 /* The class vtable                                                        */
 /* ---------------------------------------------------------------------- */
 
+/*
+ * Both halves of every sequenced class, back to the beginning.
+ *
+ * `announce` tells the far end to do the same.  Reset is symmetric on purpose:
+ * "forget what you have of this channel" is worthless one-sided, because the
+ * peer's next frame would still carry a sequence our receiver has never seen
+ * the start of.
+ */
+static void reset_channels(bool announce)
+{
+    ag_nlink_tx_init(&s_nd.tx[NL_CLS_CONTROL], NL_CLS_CONTROL, s_nd.slot_ctl,
+                     ND_WIN_CONTROL, ND_RTO_MS);
+    ag_nlink_tx_init(&s_nd.tx[NL_CLS_BULK], NL_CLS_BULK, s_nd.slot_bulk,
+                     ND_WIN_BULK, ND_RTO_MS);
+    for (int c = 0; c < NL_CLASSES; c++) {
+        ag_nlink_rx_init(&s_nd.rx[c]);
+    }
+    if (announce) {
+        /* Sequence zero on the frame itself, and it does not matter: the far
+         * end acts on the flag BEFORE it looks at the sequence, which is the
+         * only way a reset can reach a receiver that is refusing everything. */
+        emit(NL_CLS_CONTROL, 0, 0, NL_F_RST, NULL, 0);
+        emit(NL_CLS_BULK, 0, 0, NL_F_RST, NULL, 0);
+    }
+}
+
+/*
+ * Binding the wire.
+ *
+ * THE RESET IS THE POINT, and it is what a year of testing in an emulator
+ * could not have asked for.  A receiver accepts sequence zero first and
+ * nothing else - deliberately, so that a lost first frame cannot be silently
+ * skipped - and two boards on a bench do not start together: one has been
+ * running for a minute, has sent frames 0..N into a wire nobody was listening
+ * to, and never sends zero again.  The other boots, expects zero, and counts
+ * every frame that arrives as a gap.  For ever.
+ *
+ * What that looks like from the outside is exactly what it looked like here:
+ * bytes flowing both ways, every checksum good, ZERO frames received, zero
+ * bad, and a peer that "is not saying yet".  It reads as a bad wire, and two
+ * hours went on the wire before the counters were believed.
+ *
+ * In the emulator both guests are started by one script and come up together,
+ * so both begin at zero and this never happens.  The flag for it - NL_F_RST -
+ * has been in the header the whole time, named in a comment as the way a link
+ * is resynchronised, and nothing sent it or acted on it.  A line in a header
+ * is not a mechanism.
+ *
+ * Whoever binds LAST fixes the pair, which is why this needs no retry: a board
+ * that reboots binds again and its reset reaches a peer that never left.
+ */
 static ag_err_t nd_start(ag_device_t *dev)
 {
     (void)dev;
     TASK->mutex_lock(s_nd.lock, UINT32_MAX);
+    reset_channels(true);
     turn();
     TASK->mutex_unlock(s_nd.lock);
     return AG_OK;
