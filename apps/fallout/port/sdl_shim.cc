@@ -2310,6 +2310,18 @@ static void showrect_report(void)
     ag_show_copy_worst = 0; ag_show_blit_worst = 0; ag_show_worst_px = 0;
 }
 
+/* Pictures that could not be drawn because they never loaded. */
+static void blitnull_report(void)
+{
+    if (ag_blit_null_n == 0u) {
+        return;
+    }
+    shim_printf("[nopicture t=%u] %u blits refused, nothing drawn (last %ux%u) - the art cache could not find room\n",
+                (unsigned)ag_millis(), ag_blit_null_n,
+                ag_blit_null_w, ag_blit_null_h);
+    ag_blit_null_n = 0;
+}
+
 /* The world map, when there has been any of it. */
 static void worldmap_report(void)
 {
@@ -3295,6 +3307,7 @@ static void memstat_service(void)
      * time, when their numbers are wanted again.
      */
     worldmap_report();
+    blitnull_report();
     (void)hexcursor_report;
     (void)showrect_report;
 

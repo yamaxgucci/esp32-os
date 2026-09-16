@@ -322,6 +322,13 @@ extern unsigned ag_lap_scroll_us;
 /* One refresh of the world map, in four parts: the tiles of the view, the
  * per-pixel dimming of unvisited subtiles, the interface overlay, and the
  * window refresh inside it.  See worldmap.cc. */
+/* Blits refused because the picture was never loaded - see draw.cc, where a
+ * null source used to be a crash.  Any number above zero is a sprite that did
+ * not appear, which is worth knowing even though it no longer kills the
+ * game. */
+extern unsigned ag_blit_null_n;
+extern unsigned ag_blit_null_w, ag_blit_null_h;
+
 extern unsigned ag_wm_calls;
 extern unsigned ag_wm_tiles_us, ag_wm_dim_us, ag_wm_overlay_us;
 extern unsigned ag_wm_tiles_worst, ag_wm_dim_worst, ag_wm_overlay_worst;
