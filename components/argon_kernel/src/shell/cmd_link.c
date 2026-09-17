@@ -381,6 +381,7 @@ int ag_cmd_link(int argc, char **argv)
         } else {
             ag_console_printf("link is %s\n", ag_linkprov_active());
         }
+        return 0;
     }
 
     /*
