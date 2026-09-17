@@ -144,11 +144,14 @@ void ag_node_autobind(void)
     }
 
     /*
-     * `auto` means the only link device there is.  Only the ONLY one: with two
-     * of them there is a right answer and a wrong one, and a board that picked
-     * for itself would be wrong half the time and silent about it.
+     * `auto` is EVERY link device this board has, not the first one.
+     *
+     * It used to mean "the only one", and refused when there were two - which
+     * was right while a board could hold one wire and wrong the moment it
+     * could hold four.  The board in the middle of a star has a wire per
+     * spoke and wants all of them; naming them one by one in a config is a
+     * list that goes stale the first time somebody adds a board.
      */
-    char chosen[AG_DEV_NAME_MAX];
     if (ag_path_icmp(want, "auto") == 0) {
         uint32_t found = 0;
         for (uint32_t i = 0;; i++) {
@@ -157,8 +160,10 @@ void ag_node_autobind(void)
                 break;
             }
             found++;
-            if (found == 1u) {
-                ag_strlcpy(chosen, di.name, sizeof(chosen));
+            const ag_err_t e = ag_node_bind(di.name, false);
+            if (e != AG_OK) {
+                ag_log(AG_LOG_WARN, TAG, "could not bind %s at boot: %d",
+                       di.name, (int)e);
             }
         }
         if (found == 0u) {
@@ -167,23 +172,47 @@ void ag_node_autobind(void)
                    "wire driver in [modules]?");
             return;
         }
-        if (found > 1u) {
-            ag_log(AG_LOG_WARN, TAG,
-                   "[link] bind = auto, but this board has %u link devices - "
-                   "name the one you mean",
-                   (unsigned)found);
-            return;
-        }
-    } else {
-        ag_strlcpy(chosen, want, sizeof(chosen));
+        ag_log(AG_LOG_INFO, TAG, "%u wire%s bound at boot, as [link] bind = "
+                                 "auto asked",
+               (unsigned)found, (found == 1u) ? "" : "s");
+        return;
     }
 
-    const ag_err_t e = ag_node_bind(chosen, false);
-    if (e != AG_OK) {
-        ag_log(AG_LOG_WARN, TAG, "could not bind %s at boot: %d", chosen,
-               (int)e);
-    } else {
-        ag_log(AG_LOG_INFO, TAG, "%s bound at boot, as [link] bind asked",
-               chosen);
+    /*
+     * Or a list of names, for a board that holds some of its wires and not
+     * others: `bind = node0 node2`.  Spaces or commas, because a person
+     * writing a list writes one or the other and being right about which is
+     * not worth an error message.
+     */
+    uint32_t bound = 0;
+    const char *p = want;
+    while (*p != '\0') {
+        while (*p == ' ' || *p == ',' || *p == '\t') {
+            p++;
+        }
+        char  one[AG_DEV_NAME_MAX];
+        size_t n = 0;
+        while (*p != '\0' && *p != ' ' && *p != ',' && *p != '\t' &&
+               n + 1u < sizeof(one)) {
+            one[n++] = *p++;
+        }
+        one[n] = '\0';
+        if (n == 0u) {
+            break;
+        }
+        const ag_err_t e = ag_node_bind(one, false);
+        if (e != AG_OK) {
+            ag_log(AG_LOG_WARN, TAG, "could not bind %s at boot: %d", one,
+                   (int)e);
+        } else {
+            bound++;
+            ag_log(AG_LOG_INFO, TAG, "%s bound at boot, as [link] bind asked",
+                   one);
+        }
+    }
+    if (bound > 1u) {
+        ag_log(AG_LOG_INFO, TAG, "%u wires: this board is the middle of the "
+                                 "cluster",
+               (unsigned)bound);
     }
 }

@@ -1,0 +1,7 @@
+# What goes into C:\drv on this board, staged by tools\mksysfs.py.
+#
+# NODELINK.SYS, which is the S3's own build: NODELN32 is the CYD's (an LX6)
+# and NODELNRV is the C3's (RISC-V).  A .SYS for the wrong instruction set
+# does not refuse to load - it loads and throws an illegal instruction
+# somewhere inside, which reads as a driver bug rather than the wrong image.
+NODELINK.SYS

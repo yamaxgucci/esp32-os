@@ -1,0 +1,20 @@
+# What goes on this board's C:, staged by tools\mksysfs.py.
+#
+# The rule, the same as on the other two: a board carries the images its
+# NEIGHBOURS can execute as well as its own.  This one has two neighbours of
+# two different instruction sets, so it carries three builds of the programs
+# that travel - and being the middle of the star, it is the board a program
+# passes through.
+#
+# Xtensa LX7, for this board itself:
+NODEHI.AXE
+MIGRANT.AXE
+GRIND.AXE
+# Xtensa LX6, for the CYD next door:
+NODEHI32.AXE
+MIGRAN32.AXE
+GRIND32.AXE
+# RISC-V, for the C3 next door:
+NODEHIRV.AXE
+MIGRANRV.AXE
+GRINDRV.AXE

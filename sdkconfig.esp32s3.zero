@@ -44,3 +44,11 @@ CONFIG_ARGON_NET_WIFI_AP=y
 # components/argon_port/idf/argon/port/impl/uart.h).
 # CONFIG_ESP_CONSOLE_UART_DEFAULT is not set
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# The device table, and this board needs the biggest one: as the middle of the
+# star it registers a proxy for every device of BOTH neighbours beside its own.
+# The CYD alone publishes thirteen (screen, touch, card, converter, mixer, the
+# buses), the C3 ten, and this board has ten of its own - so the default of 24
+# would refuse the second neighbour's registry part way through, once per
+# device.  See CONFIG_ARGON_DEV_MAX and net/noderdev.c.
+CONFIG_ARGON_DEV_MAX=56
