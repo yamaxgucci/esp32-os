@@ -4324,8 +4324,40 @@ static int cmd_io(int argc, char **argv)
         uint8_t   tx[64];
         uint8_t   rx[64];
         size_t    n = 0;
+        int       first = 3;
+        int       cs = -1;
 
-        for (int i = 3; i < argc; i++) {
+        /*
+         * ARGON: and with a chip select, if one is named - `io spi 2 cs41 ...`
+         *
+         * Without it this reaches only a device that answers with no select at
+         * all, which in practice means nothing on a shared bus.  The question
+         * that comes up on every new board is the opposite one: there are four
+         * wires and a guess at which pin selects the card, and the cheapest
+         * possible test is to assert that pin and see whether anything at all
+         * comes back other than 0xff.
+         *
+         * 400 kHz, because the one device anybody probes this way is an SD
+         * card and that is the speed a card's own initialisation runs at; a
+         * panel at 80 MHz on the same bus is a different device with a clock
+         * of its own, which is what the per-chip-select configuration is for.
+         */
+        if (argc >= 5 && (argv[3][0] == 'c' || argv[3][0] == 'C')
+                && (argv[3][1] == 's' || argv[3][1] == 'S')) {
+            cs = atoi(argv[3] + 2);
+            first = 4;
+            if (io->spi_config != NULL) {
+                const ag_err_t cfg = io->spi_config(bus, cs, 400);
+
+                if (cfg != AG_OK) {
+                    ag_console_printf("spi%d cs %d: %s\n", bus, cs,
+                                      ag_loader_api()->sys->strerror(cfg));
+                    return 1;
+                }
+            }
+        }
+
+        for (int i = first; i < argc; i++) {
             if (n >= sizeof(tx)) {
                 ag_console_printf("io spi: at most %u bytes\n",
                                   (unsigned)sizeof(tx));
@@ -4334,7 +4366,7 @@ static int cmd_io(int argc, char **argv)
             tx[n++] = (uint8_t)strtoul(argv[i], NULL, 16);
         }
 
-        const ag_err_t err = io->spi_xfer(bus, -1, tx, rx, n);
+        const ag_err_t err = io->spi_xfer(bus, cs, tx, rx, n);
         if (err != AG_OK) {
             ag_console_printf("spi%d: %s\n", bus,
                               ag_loader_api()->sys->strerror(err));
