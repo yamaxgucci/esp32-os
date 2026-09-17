@@ -5,8 +5,16 @@ host toolchain (image name `CC.AXE`).
 
 ## Language
 
-- Types: `int` (32-bit), `char` (one **unsigned** byte), `struct`, a pointer to
-  any of those, `void` (return / empty params)
+- Types: `int` (32-bit), `char` (one **unsigned** byte), `unsigned` /
+  `unsigned int` (32-bit, counting upwards only), `unsigned char`, `struct`, a
+  pointer to any of those, `void` (return / empty params).  `signed int` is
+  accepted and means `int`; `signed char` is refused, because a byte is loaded
+  zero-extended here and always has been
+- Unsigned is not decoration: `/`, `%`, `>>` and the four comparisons emit
+  different instructions for it (QUOU/REMU/SRL/BLTU).  A `typedef unsigned int
+  uint32_t;` therefore behaves as the name says.  A hex constant may fill the
+  word (`0x80000000`, `0xffffffff`); a decimal one may not, because written out
+  it is more likely a typo than an intention
 - Entry: `ag_main` (app) or `ag_driver_init` (`.SYS` driver). Exactly one.
   Other functions allowed; **define before use**
 - Drivers: `#pragma drv "NAME" "VER" "AUTHOR"` (required) sets the image

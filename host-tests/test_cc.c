@@ -540,6 +540,67 @@ static void check_migrant_example(void)
     free(buf);
 }
 
+/*
+ * Counting upwards only, at the two ends the host can see: it compiles, and
+ * the constants that fill a word are accepted.
+ *
+ * What a host test CANNOT see is the instruction chosen - QUOU against QUOS,
+ * SRL against SRA, BLTU against BLT - because that only shows up in an answer.
+ * apps/cc/examples/unsigned.c prints seven of those answers with the signed
+ * reading beside each, and was run on the emulator:
+ *
+ *     shr 08000000   shr_s f8000000   div 55555555   rem 5
+ *     gt yes         gt_s no          shr20 00000800
+ */
+static void check_unsigned_example(void)
+{
+    const char *paths[] = {"../apps/cc/examples/unsigned.c",
+                           "apps/cc/examples/unsigned.c", NULL};
+    FILE       *f = NULL;
+    for (int i = 0; paths[i] != NULL; i++) {
+        f = fopen(paths[i], "rb");
+        if (f != NULL) {
+            break;
+        }
+    }
+    AG_CHECK(f != NULL);
+    if (f == NULL) {
+        return;
+    }
+    char *buf = (char *)malloc(16 * 1024);
+    AG_CHECK(buf != NULL);
+    if (buf == NULL) {
+        fclose(f);
+        return;
+    }
+    const size_t n = fread(buf, 1, 16u * 1024u - 1u, f);
+    fclose(f);
+    buf[n] = '\0';
+
+    cc_result_t res;
+    const int   rc = cc_compile_to_axe(buf, n, &res);
+    AG_CHECK(rc == 0);
+    if (rc != 0) {
+        printf("     unsigned.c: %s\n", res.err);
+        free(buf);
+        return;
+    }
+    AG_CHECK(strcmp((const char *)res.axe + 72, "UNSIGNED") == 0);
+    cc_result_free(&res);
+    free(buf);
+
+    /* A hex constant may fill the word; a decimal one may not, and saying so
+     * is the point of the second half. */
+    check_prog("int ag_main(void) { int x = 0xffffffff; return x; }\n", 1);
+    check_prog("int ag_main(void) { unsigned x = 0x80000000; return 0; }\n", 1);
+    check_prog("int ag_main(void) { unsigned char c = 1; return c; }\n", 1);
+    check_prog("typedef unsigned int u32;\n"
+               "int ag_main(void) { u32 a = 7; return a / 2; }\n", 1);
+    /* `signed char` is a byte this compiler cannot represent, and says so
+     * rather than quietly treating it as unsigned. */
+    check_prog("int ag_main(void) { signed char c = 1; return c; }\n", 0);
+}
+
 static void check_echo_sys_example(void)
 {
     /* AG_AXE_DRIVER = 1<<3 */
@@ -1285,6 +1346,7 @@ void run_cc_tests(void)
     }
 
     check_migrant_example();
+    check_unsigned_example();
     check_asteroids_example();
     check_dx7nofx_example();
     check_echo_sys_example();

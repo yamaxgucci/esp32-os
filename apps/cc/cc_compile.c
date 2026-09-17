@@ -149,6 +149,8 @@ typedef enum {
     T_STRING,
     T_INT,
     T_CHAR,
+    T_UNSIGNED,
+    T_SIGNED,
     T_VOID,
     T_RETURN,
     T_IF,
@@ -972,6 +974,12 @@ static tok_t kw(const char *s)
     if (CC_STRCMP(s, "char") == 0) {
         return T_CHAR;
     }
+    if (CC_STRCMP(s, "unsigned") == 0) {
+        return T_UNSIGNED;
+    }
+    if (CC_STRCMP(s, "signed") == 0) {
+        return T_SIGNED;
+    }
     if (CC_STRCMP(s, "struct") == 0) {
         return T_STRUCT;
     }
@@ -1285,7 +1293,20 @@ static void lex_next(lex_t *L)
                 } else {
                     break;
                 }
-                if (v > (int32_t)((0x7fffffffu - (uint32_t)d) / 16u)) {
+                /*
+                 * A HEX CONSTANT MAY FILL THE WORD.  0x80000000 and
+                 * 0xffffffff are how a mask, a top bit and an all-ones are
+                 * written, and refusing them because they do not fit a SIGNED
+                 * int made every such program unwritable - which mattered
+                 * little while there were no unsigned types and matters a
+                 * great deal now that there are.  The value is kept as the
+                 * same 32 bits either way; what it MEANS is decided by what
+                 * it is compared or divided against.
+                 *
+                 * Decimal below is left alone: `4294967295` written out is far
+                 * more likely to be a typo than an intention.
+                 */
+                if ((uint32_t)v > ((0xffffffffu - (uint32_t)d) / 16u)) {
                     lex_fail(L, "integer constant too large");
                     return;
                 }
@@ -1588,6 +1609,9 @@ typedef struct {
     int kind;
     int esize;
     int sidx;
+    /* Counts upwards only: see type_t.  Of the ELEMENT for an array or a
+     * pointer, which is what a load off it yields. */
+    int uns;
 } ptype_t;
 
 typedef struct {
@@ -1613,14 +1637,16 @@ typedef struct {
 
 static ptype_t ty_scalar(int esize)
 {
-    ptype_t t = {PK_SCALAR, esize, -1};
+    /* A byte is unsigned here and a word is not, unless something says so -
+     * ty_of carries the declared answer, and this is only the default. */
+    ptype_t t = {PK_SCALAR, esize, -1, (esize == 1)};
     return t;
 }
 
 /* What one element of an array, or the target of a pointer, is. */
 static ptype_t ty_elem(const ptype_t *t)
 {
-    ptype_t e = {PK_SCALAR, t->esize, t->sidx};
+    ptype_t e = {PK_SCALAR, t->esize, t->sidx, t->uns};
     if (t->sidx >= 0) {
         e.kind = PK_STRUCT;
     }
@@ -1647,12 +1673,14 @@ typedef struct {
     int    is_void;
 } func_t;
 
-/* A typedef is only a name for an existing type (optional pointer). */
+/* A typedef is only a name for an existing type (optional pointer).  This is
+ * what makes `typedef unsigned int uint32_t;` mean what it says. */
 typedef struct {
     char name[MAX_NAME];
     int  esize;
     int  sidx;
     int  is_ptr;
+    int  uns;
 } tdef_t;
 
 typedef struct {
@@ -1882,6 +1910,22 @@ static void emit_rems(gen_t *g, int ar, int as, int at)
     emit_rrr(g, 0xf2, ar, as, at);
 }
 
+/*
+ * The same two, counting upwards only.  QUOU and REMU sit beside QUOS and REMS
+ * in the same encoding group - 0xc and 0xe where those are 0xd and 0xf - which
+ * is the ISA saying the two kinds of division are the same instruction with a
+ * different idea of the top bit.
+ */
+static void emit_quou(gen_t *g, int ar, int as, int at)
+{
+    emit_rrr(g, 0xc2, ar, as, at);
+}
+
+static void emit_remu(gen_t *g, int ar, int as, int at)
+{
+    emit_rrr(g, 0xe2, ar, as, at);
+}
+
 static void emit_and(gen_t *g, int ar, int as, int at)
 {
     emit_rrr(g, 0x10, ar, as, at);
@@ -1920,6 +1964,14 @@ static void emit_sll(gen_t *g, int ar, int as)
 static void emit_sra(gen_t *g, int ar, int at)
 {
     emit3(g, (uint8_t)(at << 4), (uint8_t)(ar << 4), 0xb1);
+}
+
+/* SRL, the same shape as SRA and the same asymmetry: the operand is in t.  It
+ * shifts zeros in where SRA shifts the sign, which is the whole difference
+ * between `>>` on a count and `>>` on a measurement. */
+static void emit_srl(gen_t *g, int ar, int at)
+{
+    emit3(g, (uint8_t)(at << 4), (uint8_t)(ar << 4), 0x91);
 }
 
 /* SLLI encodes 32 - sa, which is why a shift by 0 has no encoding at all. */
@@ -2016,7 +2068,10 @@ static void emit_j_placeholder(gen_t *g, size_t *site)
 enum {
     B_BEQ = 0x1,
     B_BLT = 0x2,
+    /* Counting upwards only: BLTU sits beside BLT, BGEU beside BGE. */
+    B_BLTU = 0x3,
     B_BGE = 0xa,
+    B_BGEU = 0xb,
     B_BNE = 0x9
 };
 
@@ -2043,6 +2098,17 @@ static void patch_b(gen_t *g, size_t site, size_t target)
 {
     emit_b_rr(g, (g->code[site + 1] >> 4) & 0xf, g->code[site + 1] & 0xf,
               (g->code[site] >> 4) & 0xf, site, target);
+}
+
+static void emit_setlt_cc(gen_t *g, int ar, int as, int at, int uns)
+{
+    size_t blt_site, j_site;
+    emit_b_placeholder(g, uns ? B_BLTU : B_BLT, as, at, &blt_site);
+    emit_movi(g, ar, 0);
+    emit_j_placeholder(g, &j_site);
+    patch_b(g, blt_site, g->len);
+    emit_movi(g, ar, 1);
+    emit_j_to(g, j_site, g->len);
 }
 
 static void emit_setlt(gen_t *g, int ar, int as, int at)
@@ -2635,15 +2701,37 @@ typedef struct {
     gen_t        *g;
     int           pesize;
     int           psidx;
+    /*
+     * And whether the value now in a8 counts upwards only.  The fourth member
+     * of the same one-value type system: whatever produced the value sets it,
+     * and the six operators whose machine instruction differs between signed
+     * and unsigned - / % >> < <= > >= - consult it.
+     *
+     * Set from the DECLARED type at the point of a load, because that is the
+     * only place the answer is known: a word in a register looks the same
+     * either way, which is exactly why getting this wrong is silent.
+     */
+    int           puns;
     jump_frame_t  jumps[MAX_LOOP_DEPTH];
     int           njumps;
 } par_t;
 
-/* A declared type: what one element is, and whether the name is a pointer. */
+/*
+ * A declared type: what one element is, whether the name is a pointer, and
+ * whether it counts upwards only.
+ *
+ * `uns` is not decoration.  Three operators mean different machine
+ * instructions for it - divide, remainder and shift-right - and four
+ * comparisons take a different branch, so a compiler that recorded the word
+ * and ignored it would produce code that is wrong by a sign bit, silently and
+ * only for large values.  A `char` has always been unsigned here; this is the
+ * same fact said about a word.
+ */
 typedef struct {
     int esize;
     int sidx;
     int is_ptr;
+    int uns;
 } type_t;
 
 static void pfail(par_t *p, const char *msg)
@@ -2791,10 +2879,36 @@ static int accept_type(par_t *p, type_t *ty)
     skip_cv(p);
     ty->sidx = -1;
     ty->is_ptr = 0;
-    if (accept(p, T_INT)) {
+    ty->uns = 0;
+    /*
+     * `unsigned`, `unsigned int`, `unsigned char`, and `signed` said out loud
+     * for symmetry.  A bare `unsigned` is a word, as it is in C - the `int`
+     * after it is optional and means nothing extra.
+     */
+    if (p->L->tok == T_UNSIGNED || p->L->tok == T_SIGNED) {
+        ty->uns = (p->L->tok == T_UNSIGNED);
+        lex_next(p->L);
+        skip_cv(p);
+        if (accept(p, T_CHAR)) {
+            ty->esize = 1;
+            /* `signed char` is a byte this compiler cannot represent: loads
+             * of a byte are zero-extending here and always have been.  Said
+             * rather than quietly treated as unsigned. */
+            if (!ty->uns) {
+                pfail(p, "signed char is not supported; char is unsigned here");
+                return 0;
+            }
+        } else {
+            (void)accept(p, T_INT);
+            ty->esize = 4;
+        }
+    } else if (accept(p, T_INT)) {
         ty->esize = 4;
     } else if (accept(p, T_CHAR)) {
+        /* A char is unsigned here, and has been since before there was a word
+         * for it - see the README. */
         ty->esize = 1;
+        ty->uns = 1;
     } else if (p->L->tok == T_STRUCT) {
         lex_next(p->L);
         if (p->L->tok != T_IDENT) {
@@ -2818,6 +2932,7 @@ static int accept_type(par_t *p, type_t *ty)
         ty->esize = p->g->tdefs[ti].esize;
         ty->sidx = p->g->tdefs[ti].sidx;
         ty->is_ptr = p->g->tdefs[ti].is_ptr;
+        ty->uns = p->g->tdefs[ti].uns;
     } else {
         return 0;
     }
@@ -2839,6 +2954,7 @@ static ptype_t ty_of(const type_t *ty, int is_array)
     ptype_t t;
     t.esize = ty->esize;
     t.sidx = ty->sidx;
+    t.uns = ty->uns;
     if (ty->is_ptr) {
         t.kind = PK_PTR;
     } else if (is_array) {
@@ -3054,6 +3170,7 @@ static int try_operand_to_a9(par_t *p, int level)
         emit_movi(p->g, 9, L->num);
         lex_next(L);
         p->pesize = 0;
+        p->puns = 0;
         p->psidx = -1;
         return 1;
     }
@@ -3075,6 +3192,7 @@ static int try_operand_to_a9(par_t *p, int level)
     lex_next(L);
     p->pesize = (s->t.kind == PK_PTR) ? ty_size(p->g, &s->t) : 0;
     p->psidx = (s->t.kind == PK_PTR) ? s->t.sidx : -1;
+    p->puns = (s->t.kind == PK_PTR) ? 0 : s->t.uns;
     return 1;
 }
 
@@ -3214,8 +3332,12 @@ static void place_rvalue(par_t *p, place_t *pl)
     if (pl->t.kind == PK_PTR) {
         p->pesize = ty_size(p->g, &pl->t);
         p->psidx = pl->t.sidx;
+        p->puns = 0; /* a pointer is a pointer, not a number */
     } else {
         p->pesize = 0;
+        /* THE POINT WHERE THE ANSWER IS KNOWN.  A word in a register carries
+         * no sign; the declared type of the place it came from does. */
+        p->puns = pl->t.uns;
         p->psidx = -1;
     }
 }
@@ -3410,6 +3532,7 @@ static void parse_sizeof(par_t *p)
     expect(p, T_RPAREN, "expected ')'");
     emit_movi(p->g, 8, sizeof_type_bytes(p, &ty));
     p->pesize = 0;
+    p->puns = 0;
     p->psidx = -1;
 }
 
@@ -3419,6 +3542,7 @@ static void parse_primary(par_t *p)
         return;
     }
     p->pesize = 0;
+    p->puns = 0;
     p->psidx = -1;
     if (p->L->tok == T_NUM) {
         emit_movi(p->g, 8, p->L->num);
@@ -3442,6 +3566,7 @@ static void parse_primary(par_t *p)
         if (p->L->tok == T_LPAREN) {
             parse_call_by_name(p, name);
             p->pesize = 0;
+            p->puns = 0;
             p->psidx = -1;
             return;
         }
@@ -3547,12 +3672,14 @@ static void parse_unary(par_t *p)
         emit_movi(p->g, 9, 0);
         emit_sub(p->g, 8, 9, 8);
         p->pesize = 0;
+        p->puns = 0;
         return;
     }
     if (accept(p, T_NOT)) {
         parse_unary(p);
         emit_bool_not_a8(p->g);
         p->pesize = 0;
+        p->puns = 0;
         return;
     }
     if (accept(p, T_TILDE)) {
@@ -3560,6 +3687,7 @@ static void parse_unary(par_t *p)
         emit_movi(p->g, 9, -1);
         emit_xor(p->g, 8, 8, 9);
         p->pesize = 0;
+        p->puns = 0;
         return;
     }
     if (accept(p, T_STAR)) {
@@ -3575,6 +3703,7 @@ static void parse_unary(par_t *p)
         }
         emit_load_sized(p->g, 8, 8, 0, k);
         p->pesize = 0;
+        p->puns = 0;
         return;
     }
     if (accept(p, T_AMP)) {
@@ -3595,6 +3724,14 @@ static void parse_mul(par_t *p)
            p->L->tok == T_PERCENT) {
         const tok_t op = p->L->tok;
         lex_next(p->L);
+        /*
+         * WHAT THE LEFT SIDE WAS, taken before the right side overwrites it.
+         * The one-value type system describes whatever is in a8 NOW, so the
+         * left operand's answer has to be kept by hand across parsing the
+         * right - and the result counts upwards if either side does, which is
+         * C's rule for two operands of the same width.
+         */
+        const int lu = p->puns;
         int lhs = 8, rhs = 9;
         if (!try_operand_to_a9(p, 0)) {
             push_a8(p->g);
@@ -3603,14 +3740,26 @@ static void parse_mul(par_t *p)
             lhs = 9;
             rhs = 8;
         }
+        const int uns = lu || p->puns;
         if (op == T_STAR) {
+            /* Multiplication does not care: the low 32 bits of a product are
+             * the same bits either way. */
             emit_mull(p->g, 8, lhs, rhs);
         } else if (op == T_SLASH) {
-            emit_quos(p->g, 8, lhs, rhs);
+            if (uns) {
+                emit_quou(p->g, 8, lhs, rhs);
+            } else {
+                emit_quos(p->g, 8, lhs, rhs);
+            }
+        } else if (uns) {
+            emit_remu(p->g, 8, lhs, rhs);
         } else {
             emit_rems(p->g, 8, lhs, rhs);
         }
         p->pesize = 0;
+        /* Carried, not cleared: `a / b * c` must still know what a and b were
+         * when it reaches the second operator. */
+        p->puns = uns;
     }
 }
 
@@ -3670,6 +3819,12 @@ static void parse_shift(par_t *p)
          * a phase accumulator - and it needs neither SAR nor a register for the
          * count.  A shift by zero is not encodable in SLLI, and is nothing.
          */
+        /*
+         * WHAT IS BEING SHIFTED decides which way `>>` fills.  Only the left
+         * side matters here - C says so, and it is also the only one that
+         * makes sense: how far you shift has no sign.
+         */
+        const int uns = p->puns;
         if (p->L->tok == T_NUM && p->L->num >= 0 && p->L->num <= 31 &&
             !binds_tighter(peek_tok(p->L), 2)) {
             const int sa = (int)p->L->num;
@@ -3677,11 +3832,23 @@ static void parse_shift(par_t *p)
             if (sa != 0) {
                 if (op == T_SHL) {
                     emit_slli(p->g, 8, 8, sa);
+                } else if (uns) {
+                    /*
+                     * Through SAR even for a constant.  SRLI exists but takes
+                     * a four-bit count, so it cannot shift by more than 15 -
+                     * and a right shift by 16 or more is exactly what a
+                     * program taking the top half of a word does.  One extra
+                     * instruction beats a silent wrong answer above 15.
+                     */
+                    emit_movi(p->g, 9, sa);
+                    emit_ssr(p->g, 9);
+                    emit_srl(p->g, 8, 8);
                 } else {
                     emit_srai(p->g, 8, 8, sa);
                 }
             }
             p->pesize = 0;
+            p->puns = uns;
             continue;
         }
         int lhs = 8, rhs = 9;
@@ -3697,9 +3864,14 @@ static void parse_shift(par_t *p)
             emit_sll(p->g, 8, lhs);
         } else {
             emit_ssr(p->g, rhs);
-            emit_sra(p->g, 8, lhs);
+            if (uns) {
+                emit_srl(p->g, 8, lhs);
+            } else {
+                emit_sra(p->g, 8, lhs);
+            }
         }
         p->pesize = 0;
+        p->puns = uns;
     }
 }
 
@@ -3710,6 +3882,16 @@ static void parse_rel(par_t *p)
            p->L->tok == T_GE) {
         const tok_t op = p->L->tok;
         lex_next(p->L);
+        /*
+         * As with divide: the left side's answer has to survive parsing the
+         * right, and either side being unsigned makes the comparison so.
+         *
+         * This is the one that bites hardest in practice.  A counter that has
+         * passed 0x80000000 is a large number, and a signed `<` calls it
+         * negative - so `while (i < n)` runs for ever or not at all, on the
+         * one value in four billion nobody tests with.
+         */
+        const int lu = p->puns;
         int lhs = 8, rhs = 9;
         if (!try_operand_to_a9(p, 3)) {
             push_a8(p->g);
@@ -3718,18 +3900,21 @@ static void parse_rel(par_t *p)
             lhs = 9;
             rhs = 8;
         }
+        const int uns = lu || p->puns;
         if (op == T_LT) {
-            emit_setlt(p->g, 8, lhs, rhs);
+            emit_setlt_cc(p->g, 8, lhs, rhs, uns);
         } else if (op == T_GT) {
-            emit_setlt(p->g, 8, rhs, lhs);
+            emit_setlt_cc(p->g, 8, rhs, lhs, uns);
         } else if (op == T_LE) {
-            emit_setlt(p->g, 8, rhs, lhs);
+            emit_setlt_cc(p->g, 8, rhs, lhs, uns);
             emit_bool_not_a8(p->g);
         } else {
-            emit_setlt(p->g, 8, lhs, rhs);
+            emit_setlt_cc(p->g, 8, lhs, rhs, uns);
             emit_bool_not_a8(p->g);
         }
         p->pesize = 0;
+        /* The result is 0 or 1: a plain int, whatever was compared. */
+        p->puns = 0;
     }
 }
 
@@ -3756,6 +3941,7 @@ static void parse_eq(par_t *p)
         emit_movi(p->g, 8, 1);
         emit_j_to(p->g, j_site, p->g->len);
         p->pesize = 0;
+        p->puns = 0;
     }
 }
 
@@ -3778,6 +3964,7 @@ static void parse_bitand(par_t *p)
         }
         emit_and(p->g, 8, lhs, rhs);
         p->pesize = 0;
+        p->puns = 0;
     }
 }
 
@@ -3796,6 +3983,7 @@ static void parse_bitxor(par_t *p)
         }
         emit_xor(p->g, 8, lhs, rhs);
         p->pesize = 0;
+        p->puns = 0;
     }
 }
 
@@ -3814,6 +4002,7 @@ static void parse_bitor(par_t *p)
         }
         emit_or(p->g, 8, lhs, rhs);
         p->pesize = 0;
+        p->puns = 0;
     }
 }
 
@@ -3839,6 +4028,7 @@ static void parse_and(par_t *p)
         emit_movi(p->g, 8, 0);
         emit_j_to(p->g, end_j, p->g->len);
         p->pesize = 0;
+        p->puns = 0;
     }
 }
 
@@ -3859,6 +4049,7 @@ static void parse_or(par_t *p)
         emit_movi(p->g, 8, 1);
         emit_j_to(p->g, end_j, p->g->len);
         p->pesize = 0;
+        p->puns = 0;
     }
 }
 
@@ -3881,6 +4072,7 @@ static void parse_cond(par_t *p)
     parse_cond(p);
     emit_j_to(p->g, j_end, p->g->len);
     p->pesize = 0;
+    p->puns = 0;
     p->psidx = -1;
 }
 
@@ -4528,6 +4720,7 @@ static void parse_typedef(par_t *p)
     td->esize = ty.esize;
     td->sidx = ty.sidx;
     td->is_ptr = ty.is_ptr;
+    td->uns = ty.uns;
     lex_next(p->L);
     expect(p, T_SEMI, "expected ';' after typedef");
 }
