@@ -17,6 +17,8 @@
 #include <argon/log.h>
 #include <argon/module.h>
 #include <argon/proc.h>
+#include <argon/path.h>
+#include <argon/libc.h>
 #include <argon/vfs.h>
 
 #include <argon/port/mem.h>
@@ -1085,6 +1087,73 @@ ag_err_t ag_loader_peek(const char *path, const char *cwd,
  * Here rather than in the shell because these are the loader's own answers,
  * and a second copy of the table is a second copy to drift.
  */
+/*
+ * MY OWN BUILD OF THAT PROGRAM, found by what it IS rather than by what it is
+ * called.
+ *
+ * A cluster spanning two instruction sets passes messages and shares devices
+ * without noticing the line; code stops at it dead.  The answer is not to
+ * carry one binary that runs on both - there is no such thing for Xtensa and
+ * RISC-V - but to stop sending code at all: send the program's IDENTITY and
+ * let each board use the copy it can execute.
+ *
+ * The identity is already in every image: name, version, author and the
+ * instruction set, in the header, and until now nothing read them for this.
+ *
+ * Searched rather than indexed because the set is small - a board's C: holds
+ * tens of images, not thousands - and because an index is a second thing to
+ * keep true.  If that ever stops being cheap, the place to put the index is
+ * here, behind this function, and nothing above it changes.
+ */
+ag_err_t ag_loader_find_by_name(const char *want, char *out, size_t cap)
+{
+    if (want == NULL || want[0] == '\0' || out == NULL || cap == 0) {
+        return -AG_EINVAL;
+    }
+
+    const ag_handle_t d = ag_vfs_opendir("/sys", "/sys");
+    if (d < 0) {
+        return -AG_ENOENT;
+    }
+
+    ag_err_t found = -AG_ENOENT;
+    for (;;) {
+        ag_dirent_t e;
+        if (ag_vfs_readdir(d, &e) != AG_OK) {
+            break;
+        }
+        if ((e.st.attr & (uint32_t)AG_A_DIR) != 0u) {
+            continue;
+        }
+
+        char path[AG_PATH_MAX];
+        if (snprintf(path, sizeof(path), "/sys/%s", e.name) >= (int)sizeof(path)) {
+            continue;
+        }
+
+        ag_axe_header_t h;
+        if (ag_loader_peek(path, "/sys", &h) != AG_OK) {
+            continue; /* not an image, or not a readable one */
+        }
+        /*
+         * Executable HERE.  An image of the other instruction set is exactly
+         * what sent us looking, so accepting one would be a loop.
+         */
+        if ((ag_axe_arch_t)h.arch != ag_axe_native_arch()) {
+            continue;
+        }
+        if (ag_path_icmp(h.name, want) != 0) {
+            continue;
+        }
+
+        ag_strlcpy(out, path, cap);
+        found = AG_OK;
+        break;
+    }
+    ag_vfs_closedir(d);
+    return found;
+}
+
 const char *ag_loader_why(ag_err_t err)
 {
     switch (-err) {

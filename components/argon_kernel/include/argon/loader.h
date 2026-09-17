@@ -99,4 +99,11 @@ const ag_api_t *ag_loader_api(void);
  */
 const char *ag_loader_why(ag_err_t err);
 
+/*
+ * This board's own image of the program called `want`, by the name in its
+ * header rather than by any filename.  -AG_ENOENT when this board has no
+ * build of it that it could execute.
+ */
+ag_err_t ag_loader_find_by_name(const char *want, char *out, size_t cap);
+
 #endif /* ARGON_LOADER_H */

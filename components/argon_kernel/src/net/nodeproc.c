@@ -10,6 +10,7 @@
 #include <argon/cmdline.h>
 #include <argon/console.h>
 #include <argon/linkprov.h>
+#include <argon/loader.h>
 #include <argon/log.h>
 #include <argon/path.h>
 #include <argon/nodedrv.h>
@@ -258,6 +259,41 @@ static void run_task(void *arg)
         out_sink, NULL, &pid);
     if (err == AG_OK) {
         err = ag_proc_wait(pid, &code, UINT32_MAX);
+    }
+
+    /*
+     * WRONG MACHINE?  THEN ASK FOR THE PROGRAM, NOT FOR THE FILE.
+     *
+     * The first step of the cascade in docs/plans/cluster.md 3b, and it needs
+     * nothing new on the wire.  The asking node handed us a path; we can READ
+     * what is there - its card is mounted - we simply cannot EXECUTE it.  So
+     * we read its header, which has carried the program's name, version and
+     * instruction set all along and which nothing has ever used for this, and
+     * we look for OUR OWN build of that program.
+     *
+     * That is identity, not a filename guess: the answer does not depend on
+     * what the neighbour called the file, nor on which drive letter it is on.
+     *
+     * Said out loud, because a program that quietly ran a different copy of
+     * itself would be a mystery the first time the two builds disagreed.
+     */
+    if (err == -AG_ENOTSUP || code == (int32_t)-AG_ENOTSUP) {
+        ag_axe_header_t theirs;
+        char            mine[AG_PATH_MAX];
+        if (ag_loader_peek(argv[0], "/", &theirs) == AG_OK &&
+            ag_loader_find_by_name(theirs.name, mine, sizeof(mine)) == AG_OK) {
+            ag_log(AG_LOG_INFO, "node",
+                   "%s is for another processor; running my own %s (%s %s)",
+                   argv[0], mine, theirs.name, theirs.version);
+            argv[0] = mine;
+            err = ag_proc_spawn_sink(
+                argv[0], argc, argv,
+                (uint32_t)AG_SPAWN_BACKGROUND | (uint32_t)AG_SPAWN_NO_SESSION,
+                out_sink, NULL, &pid);
+            if (err == AG_OK) {
+                err = ag_proc_wait(pid, &code, UINT32_MAX);
+            }
+        }
     }
 
     /*
