@@ -59,6 +59,20 @@ enum {
      * the earliest instant at which that sentence is true.
      */
     NP_OP_STARTED = 6,
+    /*
+     * "Send me back what you are holding for me."
+     *
+     * The other half of the standby shape: a board hands its work to a small
+     * neighbour and goes quiet, and when work turns up again it has to be
+     * able to get it back.  Migration is always started by the process that
+     * moves, so this does not carry a process or a state - it asks the far
+     * node to start ITS side of an ordinary migration, homewards.
+     *
+     * No argument, and that is deliberate: the far node knows exactly which
+     * process arrived from here, and a pid chosen on this side would be this
+     * board's number for something it no longer holds.
+     */
+    NP_OP_RETURN = 7,
 };
 
 #define NP_HDR 8u
@@ -99,6 +113,11 @@ static volatile bool    s_busy_reply;
 
 /* True while this node is running something for the other one. */
 static volatile bool s_serving_run;
+
+/* Whose guest we are holding, for NP_OP_RETURN to send home.  Zero when none;
+ * one at a time, because one run is served at a time. */
+static volatile ag_pid_t s_guest_pid;
+static ag_port_task_t    s_return_task;
 
 static ag_err_t send_msg(uint8_t op, int32_t code, const void *payload,
                          uint16_t len)
@@ -184,6 +203,45 @@ static volatile bool s_started;
 static uint8_t *s_in_state;
 static uint32_t s_in_state_len;
 
+/*
+ * SENDING A GUEST HOME, on a task of its own.
+ *
+ * ag_migrate_away waits for the program to reach a checkpoint and then puts
+ * its state on the wire, so it cannot run on the link's reader: that task is
+ * the one that would have to carry the state, and it would be waiting for
+ * itself.  Exactly the trap serving a run walks into, and the same way out.
+ *
+ * Short-lived rather than a standing task, because a board is asked for its
+ * guest back rarely - once when the neighbour wakes - and a permanent 3 KB
+ * stack for that would be paid on every board that never hosts one.
+ */
+static void return_task(void *arg)
+{
+    (void)arg;
+    const ag_pid_t pid = s_guest_pid;
+    if (pid != 0) {
+        const ag_err_t e = ag_migrate_away(pid, 3000u);
+        if (e != AG_OK) {
+            ag_log(AG_LOG_WARN, "node",
+                   "asked to send pid %u home: %d - it stays here",
+                   (unsigned)pid, (int)e);
+        }
+    }
+    s_return_task = NULL;
+    ag_port_task_delete(NULL);
+}
+
+static void start_return_task(void)
+{
+    if (s_guest_pid == 0 || s_return_task != NULL) {
+        return;
+    }
+    if (!ag_port_task_create(return_task, "ag_nphome", 3072, NULL, 1, 0, 0,
+                             &s_return_task)) {
+        ag_log(AG_LOG_ERROR, "node", "no task to send the guest home");
+    }
+}
+
 static void run_task(void *arg)
 {
     (void)arg;
@@ -258,7 +316,16 @@ static void run_task(void *arg)
         (uint32_t)AG_SPAWN_BACKGROUND | (uint32_t)AG_SPAWN_NO_SESSION,
         out_sink, NULL, &pid);
     if (err == AG_OK) {
+        /*
+         * Remember whose guest this is, so NP_OP_RETURN has something to send
+         * home.  One, because one run is served at a time (NP_OP_BUSY says so
+         * to anybody asking for a second), and cleared below whatever happens
+         * to it - a stale pid here would answer a request to come home by
+         * migrating a process that is no longer the one that arrived.
+         */
+        s_guest_pid = pid;
         err = ag_proc_wait(pid, &code, UINT32_MAX);
+        s_guest_pid = 0;
     }
 
     /*
@@ -280,8 +347,46 @@ static void run_task(void *arg)
     if (err == -AG_ENOTSUP || code == (int32_t)-AG_ENOTSUP) {
         ag_axe_header_t theirs;
         char            mine[AG_PATH_MAX];
-        if (ag_loader_peek(argv[0], "/", &theirs) == AG_OK &&
-            ag_loader_find_by_name(theirs.name, mine, sizeof(mine)) == AG_OK) {
+        /*
+         * -AG_ENOTSUP FROM THE PEEK IS THE ANSWER, NOT A FAILURE.
+         *
+         * ag_loader_peek fills the header and only then validates it, and the
+         * validation it fails here is the arch check - which is the very fact
+         * that sent us looking.  Magic and ABI passed, so the name in that
+         * header is as trustworthy as any other image's.
+         *
+         * The first draft treated every non-OK peek as "cannot read it" and
+         * so refused every single time, saying so in the journal while the
+         * asking board saw only -45.  Reading a file and being able to run it
+         * are different questions, and this asks the first one.
+         */
+        ag_err_t        peeked = ag_loader_peek(argv[0], "/", &theirs);
+        if (peeked == -AG_ENOTSUP) {
+            peeked = AG_OK;
+        }
+        ag_err_t        found  = (peeked == AG_OK)
+                                     ? ag_loader_find_by_name(theirs.name, mine,
+                                                              sizeof(mine))
+                                     : peeked;
+        /*
+         * SAY WHY, when the substitution does not happen.  The first draft
+         * fell through in silence, so a board that could not read the header
+         * and a board that simply had no build of that program looked exactly
+         * alike from the other end - both just "-45" - and the only way to
+         * tell them apart was to guess.
+         */
+        if (peeked != AG_OK) {
+            ag_log(AG_LOG_WARN, "node",
+                   "%s is for another processor and I cannot read its header "
+                   "to learn which program it is: %s",
+                   argv[0], ag_loader_why(peeked));
+        } else if (found != AG_OK) {
+            ag_log(AG_LOG_WARN, "node",
+                   "%s is for another processor and I have no build of %s "
+                   "that I could run instead",
+                   argv[0], theirs.name);
+        }
+        if (found == AG_OK) {
             ag_log(AG_LOG_INFO, "node",
                    "%s is for another processor; running my own %s (%s %s)",
                    argv[0], mine, theirs.name, theirs.version);
@@ -291,7 +396,9 @@ static void run_task(void *arg)
                 (uint32_t)AG_SPAWN_BACKGROUND | (uint32_t)AG_SPAWN_NO_SESSION,
                 out_sink, NULL, &pid);
             if (err == AG_OK) {
+                s_guest_pid = pid;
                 err = ag_proc_wait(pid, &code, UINT32_MAX);
+                s_guest_pid = 0;
             }
         }
     }
@@ -403,10 +510,43 @@ static void on_msg(uint8_t chan, const void *data, uint16_t n, void *ctx)
             s_busy_reply = true;
             s_done = true;
             break;
+        case NP_OP_RETURN:
+            /*
+             * The board that sent us this work wants it back.
+             *
+             * ag_migrate_away only ASKS - the guest agrees at its next
+             * checkpoint and travels by the ordinary route, which on this
+             * board means straight back down the wire it came in on.  A guest
+             * that will not move stays, and the asking board finds that out
+             * the way it finds out anything else: its work did not arrive.
+             *
+             * Not done on this task.  This is the link's reader, and the
+             * migration it would start needs the link to carry the state -
+             * which is this task's own job, so waiting here would be waiting
+             * for itself.  The same trap as serving a run, and the same
+             * answer: hand it to the run task.
+             */
+            start_return_task();
+            break;
         default:
             break;
         }
     }
+}
+
+ag_err_t ag_nodeproc_ask_return(void)
+{
+    if (!ag_linkprov_bound()) {
+        return -AG_ENODEV;
+    }
+    /*
+     * Asked, not awaited.  The far node answers by starting a migration
+     * towards us, and that arrives the ordinary way - as a RUN with a state -
+     * so there is nothing here to wait for.  A board that is holding nothing
+     * of ours simply does nothing, which is the right answer to "send back
+     * what you have of mine" when it has none.
+     */
+    return send_msg(NP_OP_RETURN, 0, NULL, 0);
 }
 
 ag_err_t ag_nodeproc_start(void)

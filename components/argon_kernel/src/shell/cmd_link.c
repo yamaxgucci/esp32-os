@@ -30,6 +30,7 @@
 #include <argon/nodeclu.h>
 #include <argon/nodeps.h>
 #include <argon/nodefs.h>
+#include <argon/nodestandby.h>
 #include <argon/nodeproc.h>
 #include <argon/path.h>
 
@@ -141,7 +142,7 @@ static int link_status(void)
     if (!ag_linkprov_bound()) {
         ag_console_puts("no link bound\n");
         ag_console_puts("  `dev` lists what is here; `link use <dev>` binds "
-                        "one\n");
+                        "one, and again for a second neighbour\n");
         return 1;
     }
     const char *peer = ag_node_peer_name();
@@ -162,6 +163,22 @@ static int link_status(void)
     if (peer != NULL && strcmp(peer, ag_node_name()) == 0) {
         ag_console_printf("  both are called %s - `link name <x>` on one of "
                           "them\n", peer);
+    }
+    /*
+     * The reader's remaining stack, per wire.  Here rather than in some
+     * diagnostic corner because of what running out of it did: the board
+     * serving a file read rebooted, and the only visible symptom was an error
+     * on the OTHER board fifteen seconds later.
+     */
+    for (int32_t w = 0; w < (int32_t)AG_LINK_WIRES; w++) {
+        const char *nm = ag_linkprov_name_at(w);
+        if (nm == NULL) {
+            continue;
+        }
+        const uint32_t left = ag_linkprov_reader_stack_left(w);
+        ag_console_printf("reader  %s: %u stack bytes unused%s\n", nm,
+                          (unsigned)left,
+                          (left < 1024u) ? "  <- close to the edge" : "");
     }
     print_stats();
     return 0;
@@ -339,7 +356,20 @@ int ag_cmd_link(int argc, char **argv)
             ag_console_printf("link use %s: %d\n", argv[2], (int)err);
             return 1;
         }
-        ag_console_printf("link is %s\n", ag_linkprov_active());
+        /*
+         * Say how many wires this board now holds, because `link use` stopped
+         * meaning "instead of" and started meaning "as well as" the moment a
+         * board could have three neighbours.  Silence there would read as the
+         * old behaviour, and the first sign of the difference would be a job
+         * spread over more boards than anyone meant to wire up.
+         */
+        const int32_t wires = ag_linkprov_count();
+        if (wires > 1) {
+            ag_console_printf("link is %s (%d wires bound)\n",
+                              ag_linkprov_active(), (int)wires);
+        } else {
+            ag_console_printf("link is %s\n", ag_linkprov_active());
+        }
         /*
          * Start answering the other node.  Here rather than at boot, because
          * before a link is bound there is nothing to answer on; and here rather
@@ -350,6 +380,13 @@ int ag_cmd_link(int argc, char **argv)
         if (serr != AG_OK) {
             ag_console_printf("  (not serving remote runs: %d)\n", (int)serr);
         }
+        /*
+         * The standby watcher, here for the same reason as the rest: before a
+         * wire exists there is nowhere to hand work to.  It starts only if
+         * SYSTEM.CFG asked for it, so on every board that is not half of a
+         * fast-and-frugal pair this call does nothing at all.
+         */
+        (void)ag_standby_start();
         const ag_err_t derr = ag_nodedev_start();
         if (derr != AG_OK) {
             ag_console_printf("  (not answering device listings: %d)\n",
@@ -407,11 +444,67 @@ int ag_cmd_link(int argc, char **argv)
      * byte over this wire is worth.  Under about that many cycles per byte, the
      * work was cheaper at home, and no amount of cores changes it.
      */
+    /*
+     * LET GO OF ONE NAMED WIRE.
+     *
+     * `link use none` drops the selected one, which is what it always meant
+     * when there was only ever one.  With several, the wire somebody wants
+     * rid of is usually not the one that happens to be selected, and saying
+     * which is the difference between letting go of a board and letting go of
+     * whichever board was last spoken to.
+     */
+    /*
+     * The standby pair, by hand.  `link standby` hands the work over now and
+     * `link wake` asks for it back, which is what the timer does on its own -
+     * and which is the only way to try the shape without waiting out the
+     * quiet period, so it exists for the bench as much as for a person.
+     */
+    if (ag_path_icmp(argv[1], "standby") == 0) {
+        const ag_err_t e = ag_standby_handover();
+        if (e != AG_OK) {
+            ag_console_printf("link standby: %d\n", (int)e);
+            return 1;
+        }
+        return 0;
+    }
+    if (ag_path_icmp(argv[1], "wake") == 0) {
+        const ag_err_t e = ag_standby_fetch();
+        if (e != AG_OK) {
+            ag_console_printf("link wake: %d\n", (int)e);
+            return 1;
+        }
+        ag_console_puts("asked for our work back\n");
+        return 0;
+    }
+
+    if (ag_path_icmp(argv[1], "drop") == 0) {
+        if (argc < 3) {
+            ag_console_puts("usage: link drop <dev>\n");
+            return 1;
+        }
+        const ag_err_t err = ag_linkprov_drop(argv[2]);
+        if (err != AG_OK) {
+            ag_console_printf("link drop %s: %d\n", argv[2], (int)err);
+            return 1;
+        }
+        const int32_t left = ag_linkprov_count();
+        ag_console_printf("dropped %s; %d wire%s left\n", argv[2], (int)left,
+                          (left == 1) ? "" : "s");
+        return 0;
+    }
+
     if (ag_path_icmp(argv[1], "nodes") == 0) {
-        ag_clu_node_t nodes[4];
-        const int32_t n = ag_clu_api_table.nodes(nodes, 4);
+        /*
+         * One more than the wires: the list the cluster layer builds starts
+         * with THIS board.  Four was exactly right while a board had one
+         * neighbour and is one short of the smallest interesting cluster now,
+         * and the entry it would have dropped is a whole board's cores.
+         */
+        ag_clu_node_t nodes[AG_LINK_WIRES + 1u];
+        const int32_t cap = (int32_t)(sizeof(nodes) / sizeof(nodes[0]));
+        const int32_t n = ag_clu_api_table.nodes(nodes, (uint32_t)cap);
         uint32_t      cores = 0;
-        for (int32_t i = 0; i < n && i < 4; i++) {
+        for (int32_t i = 0; i < n && i < cap; i++) {
             ag_console_printf("%-9s %u core%s  %u thread%s%s\n", nodes[i].name,
                               (unsigned)nodes[i].cores,
                               (nodes[i].cores == 1) ? "" : "s",
@@ -431,6 +524,25 @@ int ag_cmd_link(int argc, char **argv)
                                                                : 240000000u;
             const uint32_t per_byte =
                 (info.bytes_per_sec > 0) ? (hz / info.bytes_per_sec) : 0;
+            /*
+             * Name the wire when there is more than one of them.  The numbers
+             * below are the SELECTED wire's, and on a board holding three a
+             * line that just says "wire" invites reading them as the
+             * cluster's - which they are not, and the slowest wire is the one
+             * that decides whether work should travel.
+             */
+            if (ag_linkprov_count() > 1) {
+                ag_console_printf("wires ");
+                for (int32_t w = 0; w < (int32_t)AG_LINK_WIRES; w++) {
+                    const char *nm = ag_linkprov_name_at(w);
+                    if (nm != NULL) {
+                        ag_console_printf("%s%s", nm,
+                                          (w == ag_linkprov_current()) ? "* "
+                                                                       : " ");
+                    }
+                }
+                ag_console_puts("  (* is the one these numbers are for)\n");
+            }
             ag_console_printf("wire  %s, %u B per message, %u B/s\n",
                               info.wire, (unsigned)info.mtu,
                               (unsigned)info.bytes_per_sec);
@@ -591,9 +703,10 @@ int ag_cmd_link(int argc, char **argv)
         return link_status();
     }
 
-    ag_console_puts("usage: link [use <dev>|none | run <path> [args] | "
+    ag_console_puts("usage: link [use <dev>|none | drop <dev> | "
+                    "run <path> [args] | "
                     "get <there> <here> | mount | umount | devs | nodevs | "
                     "nodes | name [x] | ping [n] [control|stream|bulk] | "
-                    "echo [secs] | poll [ms]]\n");
+                    "echo [secs] | poll [ms] | standby | wake]\n");
     return 1;
 }

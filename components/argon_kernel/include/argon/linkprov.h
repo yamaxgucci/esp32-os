@@ -44,9 +44,68 @@ bool        ag_linkprov_bound(void);
 /* Has anything been heard from the far end since the link came up. */
 bool ag_linkprov_up(void);
 
+/*
+ * WHICH WIRE THESE MEAN, when a board has more than one neighbour.
+ *
+ * The wire this call is reading, if it is being made from a link's reader task
+ * - so an answer goes back out the wire its question arrived on, and no
+ * service above had to be told about wires at all.  Otherwise the selected
+ * wire, the one `link use` last named.
+ *
+ * Only something that starts a NEW conversation with a named far node has to
+ * choose, and that is what the _on and _at calls below are for.
+ */
 int32_t ag_linkprov_send(uint8_t chan, uint8_t cls, const void *buf,
                          size_t len);
 void    ag_linkprov_poll(uint32_t ms);
+
+/* ------------------------------------------------------------------------ */
+/* Several wires: choosing one on purpose                                    */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * How many neighbours one board can hold at once.  Four rather than two
+ * because the shape worth supporting is a star - one board with the screen and
+ * the card, several small ones each working a core - and four leaves is
+ * already more compute than the wire between them can feed.
+ *
+ * Each wire costs a reader task (4 KB of stack), so this is not free and is
+ * not meant to grow without a measurement behind it.
+ */
+#define AG_LINK_WIRES 4u
+
+/* Which wire this call means - the index behind the rule above, or -1 when
+ * there is none.  For a service that must remember something PER NEIGHBOUR
+ * while serving a message from one of them. */
+int32_t ag_linkprov_current(void);
+
+/* How many wires are bound, and the name of one by index (NULL past the end).
+ * Indices are stable while a wire stays bound. */
+int32_t     ag_linkprov_count(void);
+const char *ag_linkprov_name_at(int32_t wire);
+int32_t     ag_linkprov_index_of(const char *name);
+
+/*
+ * Bytes still unused on a wire's reader task, at its worst moment so far.
+ *
+ * Worth having at the prompt because this task serves the far node's file
+ * reads and therefore runs the whole filesystem stack: when it overflowed, the
+ * board did not report a fault, it REBOOTED - and a board that reboots cannot
+ * tell you why.  A number that can be looked at turns that into a warning.
+ */
+uint32_t ag_linkprov_reader_stack_left(int32_t wire);
+
+/* Let go of one named wire.  `ag_linkprov_use("none")` drops the selected one;
+ * this drops the one asked for, whichever is selected. */
+ag_err_t ag_linkprov_drop(const char *name);
+
+/* Send on a named wire rather than on the one this call would mean. */
+int32_t ag_linkprov_send_on(int32_t wire, uint8_t chan, uint8_t cls,
+                            const void *buf, size_t len);
+
+/* Let every wire move, not only the current one: for a caller that is waiting
+ * on answers from several neighbours at once. */
+void ag_linkprov_poll_all(uint32_t ms);
 
 /* ------------------------------------------------------------------------ */
 /* Receiving: one reader, and handlers per channel                           */

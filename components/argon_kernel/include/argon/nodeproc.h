@@ -70,4 +70,11 @@ ag_err_t ag_nodeproc_run_state(const char *cmdline, const void *state,
  */
 void ag_nodeproc_migrated(void);
 
+/*
+ * "Send me back what you are holding for me."  The far node starts an ordinary
+ * migration homewards for the guest that came from here; it does not answer,
+ * and a node holding nothing of ours does nothing.  -AG_ENODEV with no wire.
+ */
+ag_err_t ag_nodeproc_ask_return(void);
+
 #endif /* ARGON_NODEPROC_H */

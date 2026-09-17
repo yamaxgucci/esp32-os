@@ -143,12 +143,24 @@ static ag_err_t wait_for_room(uint32_t deadline)
     return AG_OK;
 }
 
-static ag_err_t send_bytes(const uint8_t *p, uint32_t total)
+static int32_t wire_of_node(int32_t node);
+
+/*
+ * `wire` is which neighbour, and -1 means THE ONE IN HAND: the wire a reply is
+ * being written to, which the link layer already knows because this is running
+ * on that wire's reader task.  Everything the serving side sends passes -1 and
+ * so needs no routing at all; only a call that STARTS something with a named
+ * node has to say where, and those all have the node index to hand.
+ */
+static ag_err_t send_bytes(int32_t wire, const uint8_t *p, uint32_t total)
 {
     const uint32_t deadline =
         now_ms() + (ag_linkprov_in_reader() ? 100u : NC_SEND_MS);
     for (;;) {
-        const int32_t r = ag_linkprov_send(NC_CHAN, AG_LINK_CONTROL, p, total);
+        const int32_t r =
+            (wire < 0)
+                ? ag_linkprov_send(NC_CHAN, AG_LINK_CONTROL, p, total)
+                : ag_linkprov_send_on(wire, NC_CHAN, AG_LINK_CONTROL, p, total);
         if (r >= 0) {
             return AG_OK;
         }
@@ -162,7 +174,8 @@ static ag_err_t send_bytes(const uint8_t *p, uint32_t total)
     }
 }
 
-static ag_err_t send_frame(const ag_cluf_hdr_t *h, const void *payload)
+static ag_err_t send_frame(int32_t wire, const ag_cluf_hdr_t *h,
+                           const void *payload)
 {
     uint8_t        buf[AG_CLUF_HDR + 64];
     const uint32_t total = AG_CLUF_HDR + h->len;
@@ -171,11 +184,14 @@ static ag_err_t send_frame(const ag_cluf_hdr_t *h, const void *payload)
         return -AG_ERANGE; /* the caller must use the shared buffer instead */
     }
     (void)ag_cluf_put(buf, h, payload);
-    return send_bytes(buf, total);
+    return send_bytes(wire, buf, total);
 }
 
 /* The same, for a frame already built in s_txbuf (a data fragment). */
-static ag_err_t send_txbuf(uint32_t total) { return send_bytes(s_txbuf, total); }
+static ag_err_t send_txbuf(int32_t wire, uint32_t total)
+{
+    return send_bytes(wire, s_txbuf, total);
+}
 
 /* ---------------------------------------------------------------------- */
 /* The transport the cluster layer uses                                    */
@@ -185,7 +201,7 @@ static ag_err_t tr_spawn(int32_t node, ag_clu_tid_t tid, const char *entry,
                          const void *arg, uint32_t len, const char *image,
                          uint32_t timeout_ms)
 {
-    (void)node; /* one wire, one neighbour - see ag_clu_transport_t */
+    const int32_t wire = wire_of_node(node);
 
     if (ag_linkprov_in_reader()) {
         /* Waiting here would wait for the task that delivers the answer. */
@@ -239,7 +255,7 @@ static ag_err_t tr_spawn(int32_t node, ag_clu_tid_t tid, const char *entry,
     ag_err_t e;
     if (ag_port_mutex_take(s_tx, ag_port_ms_to_ticks(NC_SEND_MS))) {
         const uint32_t total = (uint32_t)ag_cluf_put(s_txbuf, &h, body);
-        e = send_txbuf(total);
+        e = send_txbuf(wire, total);
         ag_port_mutex_give(s_tx);
     } else {
         e = -AG_EBUSY;
@@ -268,7 +284,7 @@ static ag_err_t tr_spawn(int32_t node, ag_clu_tid_t tid, const char *entry,
 static ag_err_t tr_send(int32_t node, ag_clu_tid_t from, ag_clu_tid_t to,
                         const void *buf, uint32_t len)
 {
-    (void)node;
+    const int32_t wire = wire_of_node(node);
 
     if (!ag_linkprov_bound()) {
         return -AG_ENODEV;
@@ -297,7 +313,7 @@ static ag_err_t tr_send(int32_t node, ag_clu_tid_t from, ag_clu_tid_t to,
             .c = len,
         };
         const uint32_t total = (uint32_t)ag_cluf_put(s_txbuf, &h, src + off);
-        e = send_txbuf(total);
+        e = send_txbuf(wire, total);
         off += take;
     } while (e == AG_OK && off < len);
 
@@ -307,48 +323,83 @@ static ag_err_t tr_send(int32_t node, ag_clu_tid_t from, ag_clu_tid_t to,
 
 static void tr_credit(int32_t node, ag_clu_tid_t tid, uint32_t n)
 {
-    (void)node;
+    const int32_t wire = wire_of_node(node);
     ag_cluf_hdr_t h = { .op = AG_CLUF_CREDIT, .flags = 0, .len = 0,
                         .a = tid, .b = (int32_t)n, .c = 0 };
-    (void)send_frame(&h, NULL);
+    (void)send_frame(wire, &h, NULL);
 }
 
 static void tr_exited(int32_t node, ag_clu_tid_t tid)
 {
-    (void)node;
+    const int32_t wire = wire_of_node(node);
     ag_cluf_hdr_t h = { .op = AG_CLUF_EXIT, .flags = 0, .len = 0,
                         .a = tid, .b = 0, .c = 0 };
-    (void)send_frame(&h, NULL);
+    (void)send_frame(wire, &h, NULL);
 }
 
 static void tr_end(int32_t node)
 {
-    (void)node;
+    const int32_t wire = wire_of_node(node);
     ag_cluf_hdr_t h = { .op = AG_CLUF_END, .flags = 0, .len = 0,
                         .a = 0, .b = 0, .c = 0 };
-    (void)send_frame(&h, NULL);
+    (void)send_frame(wire, &h, NULL);
+}
+
+/*
+ * NODE INDEX TO WIRE.
+ *
+ * The cluster layer addresses a far board by its position in the list
+ * tr_nodes builds, and that list is the bound wires in order - so node k is
+ * the k-th wire this board holds.  One rule, in one place, and the reason
+ * tr_nodes and this walk the table the same way.
+ *
+ * Not a name lookup: names arrive late (a board says its own in its hello, and
+ * until then it is "node0"), and a job that started before the hello landed
+ * would address a node that has no name yet.  The wire is there from the
+ * moment it is bound, which is earlier than anything can ask.
+ */
+static int32_t wire_of_node(int32_t node)
+{
+    if (node < 0) {
+        return -1;
+    }
+    int32_t seen = 0;
+    for (int32_t i = 0; i < (int32_t)AG_LINK_WIRES; i++) {
+        if (ag_linkprov_name_at(i) == NULL) {
+            continue;
+        }
+        if (seen == node) {
+            return i;
+        }
+        seen++;
+    }
+    return -1;
 }
 
 static int32_t tr_nodes(ag_clu_node_t *out, uint32_t max)
 {
-    if (!ag_linkprov_bound()) {
-        return 0;
+    int32_t n = 0;
+    for (int32_t i = 0; i < (int32_t)AG_LINK_WIRES; i++) {
+        const char *wire = ag_linkprov_name_at(i);
+        if (wire == NULL) {
+            continue;
+        }
+        if (out != NULL && (uint32_t)n < max) {
+            const char   *name = ag_node_peer_name_at(i);
+            const uint8_t cores = ag_node_peer_cores_at(i);
+            memset(&out[n], 0, sizeof(out[n]));
+            snprintf(out[n].name, sizeof(out[n].name), "%s",
+                     (name != NULL && name[0] != '\0') ? name : wire);
+            /* It has not said, so one - never none.  A node counted as having
+             * no cores would never be given a thread, and the cluster would
+             * quietly be half its size. */
+            out[n].cores = (cores > 0) ? cores : 1u;
+            out[n].cpu_hz = ag_node_peer_cpu_hz_at(i);
+            out[n].here = 0;
+        }
+        n++;
     }
-    if (out != NULL && max >= 1) {
-        const char   *name = ag_node_peer_name();
-        const uint8_t cores = ag_node_peer_cores();
-        memset(&out[0], 0, sizeof(out[0]));
-        snprintf(out[0].name, sizeof(out[0].name), "%s",
-                 (name != NULL && name[0] != '\0') ? name
-                                                   : ag_linkprov_active());
-        /* It has not said, so one - never none.  A node counted as having no
-         * cores would never be given a thread, and the cluster would quietly
-         * be half its size. */
-        out[0].cores = (cores > 0) ? cores : 1u;
-        out[0].cpu_hz = ag_node_peer_cpu_hz();
-        out[0].here = 0;
-    }
-    return 1;
+    return n;
 }
 
 static const ag_clu_transport_t k_transport = {
@@ -418,7 +469,7 @@ static void serve_task(void *arg)
             }
             ag_cluf_hdr_t h = { .op = AG_CLUF_SPAWN_OK, .flags = 0, .len = 0,
                                 .a = req.tid, .b = (int32_t)e, .c = 0 };
-            (void)send_frame(&h, NULL);
+            (void)send_frame(-1, &h, NULL);
 
             ag_port_mutex_take(s_reqlock, AG_PORT_FOREVER);
             s_req[i].used = false;
@@ -515,7 +566,7 @@ static void serve_spawn(const ag_cluf_hdr_t *h, const uint8_t *body)
      */
     ag_cluf_hdr_t no = { .op = AG_CLUF_SPAWN_OK, .flags = 0, .len = 0,
                          .a = h->a, .b = (int32_t)why, .c = 0 };
-    (void)send_frame(&no, NULL);
+    (void)send_frame(-1, &no, NULL);
 }
 
 /*

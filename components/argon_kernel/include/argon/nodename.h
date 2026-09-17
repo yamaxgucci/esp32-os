@@ -59,6 +59,15 @@ void     ag_node_set_peer_caps(uint8_t cores, uint32_t cpu_hz);
 uint8_t  ag_node_peer_cores(void);
 uint32_t ag_node_peer_cpu_hz(void);
 
+/*
+ * The same three facts about the neighbour on a NAMED wire, for something
+ * enumerating the whole cluster rather than serving one message.  The
+ * unindexed calls above are these, asked about the wire in hand.
+ */
+const char *ag_node_peer_name_at(int32_t wire);
+uint8_t     ag_node_peer_cores_at(int32_t wire);
+uint32_t    ag_node_peer_cpu_hz_at(int32_t wire);
+
 #ifdef __cplusplus
 }
 #endif

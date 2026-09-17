@@ -311,11 +311,108 @@ def scen_wrong_arch(node, image):
     print("\n== %s is handed an image for the other processor ==" % node.name,
           flush=True)
     t = node.ask("run c:\\%s" % image, timeout=15.0)
-    note("built for a different processor" in flat(t),
-         "wrong-arch-%s-refused-in-those-words" % node.name,
-         why="no clear refusal; read the transcript")
     note("Guru" not in t and "panic" not in t,
          "wrong-arch-%s-did-not-crash" % node.name)
+
+    # IN THE JOURNAL, NOT ON THE SCREEN.
+    #
+    # The refusal always happens; whether its words are still VISIBLE depends
+    # on what else wanted the screen in the same half-second.  Once, on the
+    # CYD, the loading view opened over them and the transcript kept only
+    # "returned -45" - a check that failed while the board was behaving
+    # exactly as designed.  The journal holds what was said whatever the
+    # screen did, which is the rule this tree already wrote down for driver
+    # messages, and it applies here for the same reason.
+    j = flat(node.ask("log -n 12", timeout=20.0))
+    note("built for a different processor" in j,
+         "wrong-arch-%s-refused-in-those-words" % node.name,
+         why="no clear refusal in the journal either")
+
+
+def scen_cross_arch(asker, runner, foreign, copied):
+    """The line a cluster cannot cross, crossed - by sending the PROGRAM.
+
+    The runner is handed a path to an image of the OTHER instruction set.  It
+    cannot execute it, but it can READ it, so it takes the program's name out
+    of the header and runs its own build of that program instead.
+
+    Set up by COPYING rather than by deleting.  The first plan was to remove
+    one board's own NODEHI so the run would have to travel, and the two
+    directions then wanted the same file gone and present at once; worse, a
+    check that deletes from a card leaves the board different afterwards.  A
+    copy under a name the ASKER does not have sends the run across just as
+    surely, destroys nothing, and tests the actual claim - that the answer
+    comes from the header and not from what the file is called.
+    """
+    print("\n== %s asks for an image %s cannot execute ==" % (asker.name,
+                                                             runner.name),
+          flush=True)
+
+    runner.ask("copy c:\\%s c:\\%s" % (foreign, copied), timeout=20.0)
+    t = asker.ask("run c:\\%s" % copied, timeout=40.0)
+    f = flat(t)
+    note("not here" in f, "cross-%s-sent-it-to-%s" % (asker.name, runner.name),
+         why="it never reached the wire")
+    note("nodehi: here" in f, "cross-%s-ran-its-own-build" % runner.name,
+         why="no output from the substituted program")
+    # NOT "-45 is absent": the number is there on purpose.  The first attempt
+    # IS the refusal - that is what starts the substitution - so the journal
+    # and the transcript both carry it, and a check that forbids it fails on a
+    # run that worked perfectly.  What must not survive is the ASKER being
+    # told the run came to nothing.
+    note("did not run there either" not in f,
+         "cross-%s-did-not-refuse" % runner.name,
+         why="the asker was told it failed")
+
+
+def scen_standby(fast, small, image):
+    """Work handed to the neighbour, and fetched back - across two ISAs.
+
+    Maxim's fourth shape: a board with the clock and the current beside one
+    that costs nothing to leave on.  `link standby` is what the idle watcher
+    does on its own, said by hand so the check does not have to wait out the
+    quiet period; `link wake` is what it does when work turns up again.
+
+    It exercises the cascade as well, and not by arrangement: the image that
+    travels is the ASKING board's, so the receiving board is always handed one
+    it cannot execute and has to find its own build of that program - in both
+    directions, since the work comes home the same way.
+
+    The number is the point.  MIGRANT counts, and a run that says "carried on
+    from 6" has proved the state crossed; one that starts at 0 has proved only
+    that a program can be started twice.
+    """
+    print("\n== %s hands its work to %s and takes it back ==" % (fast.name,
+                                                                 small.name),
+          flush=True)
+
+    fast.ask("run /b c:\\%s" % image, timeout=25.0)
+    time.sleep(2.0)
+
+    t = flat(fast.ask("link standby", timeout=45.0))
+    note("now on" in t, "standby-%s-handed-over" % fast.name,
+         why="nothing moved; see the journal for what refused")
+    note("carried on from" in t, "standby-state-crossed",
+         why="it started fresh instead of carrying on")
+
+    time.sleep(2.0)
+    t = flat(small.ask("ps", timeout=25.0))
+    note("MIGRANT" in t, "standby-%s-is-running-it" % small.name,
+         why="the neighbour has no such process")
+    t = flat(small.ask("log -n 8", timeout=30.0))
+    note("another processor" in t, "standby-%s-substituted-its-own" %
+         small.name, why="no substitution line in the journal")
+
+    fast.ask("link wake", timeout=30.0)
+    time.sleep(8.0)
+    t = flat(fast.ask("ps", timeout=25.0))
+    note("MIGRANT" in t and small.name + "." not in t,
+         "standby-work-came-home", why="it is still on the neighbour")
+
+    # Tidy up: the check that leaves a counter running poisons the next one.
+    name = num(flat(fast.ask("ps", timeout=20.0)), r"(\d+)\s+MIGRANT")
+    if name:
+        fast.ask("kill %s" % name, timeout=20.0)
 
 
 def scen_ps_kill(near, far, image):
@@ -463,6 +560,19 @@ def main():
     # The line a heterogeneous cluster cannot cross, on both sides of it.
     scen_wrong_arch(cyd, "nodehirv.axe")
     scen_wrong_arch(c3, "nodehi32.axe")
+
+    # ...and the same line crossed, when the run comes over the wire.  Local
+    # is still a refusal: nobody asked for a program there, they named a file.
+    if args.main in ("cyd", "both"):
+        scen_cross_arch(cyd, c3, "nodehi32.axe", "xeno32.axe")
+    if args.main in ("c3", "both"):
+        scen_cross_arch(c3, cyd, "nodehirv.axe", "xenorv.axe")
+
+    # The standby pair.  Last, because it is the only scenario that leaves a
+    # process running across boards if it fails half way, and because it uses
+    # everything the ones above have already proved separately.
+    if args.main in ("cyd", "both"):
+        scen_standby(cyd, c3, "migran32.axe")
 
     scen_sound(c3, cyd, "devpokrv.axe")
     scen_restart(c3, cyd)
