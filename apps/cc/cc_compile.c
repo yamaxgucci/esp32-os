@@ -2724,6 +2724,10 @@ typedef struct {
      * either way, which is exactly why getting this wrong is silent.
      */
     int           puns;
+    /* Whether the type just parsed carried `static`.  Kept so that a static
+     * LOCAL - which promises to outlive the call, and would not - can be
+     * refused rather than quietly turned into an ordinary one. */
+    int           saw_static;
     jump_frame_t  jumps[MAX_LOOP_DEPTH];
     int           njumps;
 } par_t;
@@ -2906,6 +2910,7 @@ static int parse_array_size(par_t *p)
 
 static int accept_type(par_t *p, type_t *ty)
 {
+    p->saw_static = 0;
     skip_cv(p);
     ty->sidx = -1;
     ty->is_ptr = 0;
@@ -2953,6 +2958,14 @@ static int accept_type(par_t *p, type_t *ty)
         lex_next(p->L);
         ty->sidx = si;
         ty->esize = p->g->structs[si].size;
+    } else if (p->L->tok == T_IDENT && CC_STRCMP(p->L->text, "bool") == 0 &&
+               find_tdef(p->g, p->L->text) < 0) {
+        /* One byte, unsigned - the host compiler's _Bool, so a struct shared
+         * across the ABI has the same shape on both sides.  Not a keyword: a
+         * program that says `typedef int bool;` keeps its own meaning. */
+        lex_next(p->L);
+        ty->esize = 1;
+        ty->uns = 1;
     } else if (p->L->tok == T_IDENT) {
         const int ti = find_tdef(p->g, p->L->text);
         if (ti < 0) {
@@ -4195,6 +4208,19 @@ static void parse_local_decl(par_t *p, const type_t *ty)
         pfail(p, "expected identifier after type");
         return;
     }
+    /*
+     * `static` outside a function is what this compiler already does - one
+     * translation unit, nothing outside can see a name - so it is accepted
+     * and ignored there.  Inside one it promises something else: a variable
+     * that survives the call.  This compiler gives every local a frame slot,
+     * so accepting the word would be agreeing to a promise it does not keep,
+     * and the program would be wrong in the way that is hardest to see - it
+     * would work until the second call.
+     */
+    if (p->saw_static) {
+        pfail(p, "a static local is not supported; make it a global");
+        return;
+    }
     char name[MAX_NAME];
     cpy_err(name, sizeof(name), p->L->text);
     lex_next(p->L);
@@ -4850,6 +4876,19 @@ static void parse_program(par_t *p)
     p->g->data_next = 4;
     p->g->entry_idx = -1;
     p->g->is_driver = 0;
+
+    /*
+     * `true` and `false`, and `bool` in accept_type beside them.
+     *
+     * As enumerators rather than as keywords, so that a program which defines
+     * its own - and plenty do, out of habit - gets the ordinary "duplicate
+     * enumerator" rather than a parse error it cannot read.  A `bool` is ONE
+     * BYTE here, the same as the host compiler's _Bool: a struct with a bool
+     * in it is handed across the ABI by address, and a field that was four
+     * bytes on one side and one on the other would be read as nonsense.
+     */
+    (void)add_enum(p->g, "false", 0);
+    (void)add_enum(p->g, "true", 1);
 
     while (p->L->tok != T_EOF && !p->g->err && !p->L->err) {
         if (accept(p, T_TYPEDEF)) {

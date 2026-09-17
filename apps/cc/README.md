@@ -10,6 +10,13 @@ host toolchain (image name `CC.AXE`).
   pointer to any of those, `void` (return / empty params).  `signed int` is
   accepted and means `int`; `signed char` is refused, because a byte is loaded
   zero-extended here and always has been
+- `bool` with `true` / `false`: one byte, like the host compiler's `_Bool`, so a
+  struct carrying one has the same shape on both sides of the ABI. Not a
+  keyword — a program that says `typedef int bool;` keeps its own meaning
+- `static` on a function or a global is accepted and ignored: an image is one
+  translation unit, so it already describes what happens. On a **local** it is
+  refused rather than quietly turned into an ordinary one — a variable that
+  promises to survive the call and does not would be wrong on the second call
 - Unsigned is not decoration: `/`, `%`, `>>` and the four comparisons emit
   different instructions for it (QUOU/REMU/SRL/BLTU).  A `typedef unsigned int
   uint32_t;` therefore behaves as the name says.  A hex constant may fill the

@@ -618,6 +618,23 @@ static void check_unsigned_example(void)
                "  return t.a; }\n", 0);
     /* sizeof of an expression has no honest answer here. */
     check_prog("int ag_main(void) { int a = 1; return sizeof(a + 1); }\n", 0);
+
+    /* `static` where it already describes what happens, and refused where it
+     * would promise something this compiler does not do. */
+    check_prog("static int g;\n"
+               "static int f(void) { return 1; }\n"
+               "int ag_main(void) { g = f(); return g; }\n", 1);
+    check_prog("int ag_main(void) { static int n = 0; return n; }\n", 0);
+
+    /* bool, one byte like the host's _Bool, with true and false. */
+    check_prog("int ag_main(void) { bool b = true; if (b) { return 1; }\n"
+               "  return 0; }\n", 1);
+    check_prog("struct v { bool a; bool b; };\n"
+               "int ag_main(void) { struct v s = {true, false};\n"
+               "  return sizeof(s); }\n", 1);
+    /* A program that has its own idea of bool keeps it. */
+    check_prog("typedef int bool;\n"
+               "int ag_main(void) { bool b = 1; return b; }\n", 1);
 }
 
 static void check_echo_sys_example(void)

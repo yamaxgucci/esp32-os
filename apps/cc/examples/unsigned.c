@@ -17,10 +17,21 @@
 
 typedef unsigned int u32;
 
+/*
+ * `static` here says what this compiler already does - one image, nothing
+ * outside it can see a name - and is accepted for exactly that reason.
+ *
+ * No value on the declaration: a global here is zero until something assigns
+ * it, which is a limit of this compiler and not of the word `static`.
+ */
+static u32 top_bit;
+
 int ag_main(void)
 {
-    u32 top = 0x80000000;
-    u32 all = 0xffffffff;
+    top_bit = 0x80000000;
+    u32  top = top_bit;
+    u32  all = 0xffffffff;
+    bool big = top > 1;
     int stop = 0x80000000; /* the same bits, read the other way */
 
     /*
@@ -39,7 +50,7 @@ int ag_main(void)
      * And the comparison, which is the one that bites hardest: a counter past
      * 0x80000000 is a large number, and a signed `<` calls it negative.
      */
-    if (top > 1) {
+    if (big) {
         ag_print("gt    yes\n");
     } else {
         ag_print("gt    no\n");
