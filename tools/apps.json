@@ -208,6 +208,20 @@
       "include": ["apps/common"],
       "src": ["apps/st7789/st7789.c"]
     },
+    {
+      "out": "ST7789WS2.SYS", "group": "board",
+      "_note": "The same source again, for the Waveshare ESP32-S3-Touch-LCD-2: -DST7789_BOARD_WSLCD2 is a third block of constants - the panel is on SPI2 with the microSD, and it has no reset line the documents agree on, so the driver brings it up with SWRESET instead of a pin.",
+      "arch": "xtensa", "gcc": "xtensa-esp32s3-elf-gcc",
+      "cflags": "-Os -ffunction-sections -fdata-sections -DST7789_BOARD_WSLCD2",
+      "include": ["apps/common"],
+      "src": ["apps/st7789/st7789.c"]
+    },
+    {
+      "out": "CST816.SYS", "group": "board",
+      "_note": "The capacitive touch controller on that board's glass, and its only pointing device until something is plugged into the header: one USB socket, and it is the console.",
+      "arch": "xtensa", "gcc": "xtensa-esp32s3-elf-gcc",
+      "src": ["apps/cst816/cst816.c"]
+    },
     { "out": "XPT2046.SYS", "group": "board", "src": ["apps/xpt2046/xpt2046.c"] },
 
     {

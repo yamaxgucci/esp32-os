@@ -1,0 +1,40 @@
+# ArgonOS - Waveshare ESP32-S3-Touch-LCD-2, on top of sdkconfig.esp32s3.board.
+#
+# What this board is, against the ESP32-S3-WROOM CAM this tree already builds
+# for: the same chip and the same 16 MB / 8 MB octal parts, a panel of its own
+# on SPI instead of a soldered module, a capacitive touch controller, and one
+# USB-C going straight to the chip.
+#
+# The console is the interesting difference.  There is no bridge chip on this
+# board, so the serial port a host sees is the S3's own USB-Serial-JTAG - the
+# same arrangement as the S3-Zero, and the reason CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
+# is here.  The consequence is worth stating rather than discovering: the S3
+# has ONE pair of USB pins and two controllers behind them, and only one can be
+# connected at a time.  With the console on USB there is no USB host, so a USB
+# keyboard or mouse needs the console moved to UART0 on the header (43/44)
+# first.  The touch panel and BLE do not have that problem.
+
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=n
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=n
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_16mb.csv"
+
+# The R8 part is octal PSRAM, like the CAM board and unlike the Zero's quad.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_USE_CAPS_ALLOC=y
+
+# The console the USB-C socket actually presents.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# No camera is fitted - the board brings the header out and nothing else - so
+# the driver and its buffers stay out of the image.  The header's pins are
+# written down in BOARD.CFG for whoever solders a sensor to it.
+CONFIG_ARGON_ENABLE_CAMERA=n
+
+# And no USB host while the console is on those same two pins.  Turning this
+# back on is half of the "I want a USB mouse" answer; the other half is moving
+# the console to UART0.
+CONFIG_ARGON_USB_HOST=n

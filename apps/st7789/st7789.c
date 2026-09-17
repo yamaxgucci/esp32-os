@@ -54,7 +54,44 @@ AG_DRV("ST7789", "0.2", "argon");
  * two images are not interchangeable for a second reason anyway: a .SYS
  * carries its instruction set in its header, and one of these is RISC-V.
  */
-#if defined(ST7789_BOARD_S3CAM)
+#if defined(ST7789_BOARD_WSLCD2)
+
+/*
+ * Waveshare ESP32-S3-Touch-LCD-2: a 2.0 inch 240x320 IPS panel, driven
+ * landscape as 320x240, with a CST816D touch controller on the same glass.
+ *
+ * The bus is shared with the microSD slot - clock 39, data 38, and a MISO on
+ * 40 that only the card uses - so the chip select is the whole of what keeps
+ * them apart, and this driver must never drive the bus pins itself.
+ *
+ * LCD_RST is -1, and that is deliberate rather than unknown-and-ignored.
+ * CircuitPython's board file for this board calls GPIO0 "LCD_RESET"; GPIO0 is
+ * also the BOOT button; and Waveshare's schematic shows LCD_RST reaching the
+ * panel through a pair of fitting options (R16 NC/0R, R17 NC/10K) rather than
+ * from a named GPIO.  Two sources, two answers, and driving the wrong pin is
+ * worse than driving none - so the panel is brought up with SWRESET, which the
+ * controller has for exactly this case.  If it ever comes up dark or
+ * scrambled, GPIO0 here is the first thing to try.
+ */
+#define LCD_BUS      2
+#define LCD_CS      45
+#define LCD_DC      42
+#define LCD_RST     -1
+#define LCD_BL       1
+
+/* Landscape.  Which of the two landscapes is right depends on which end of
+ * the flex the glass was attached by, and no document says; 0x60 is the first
+ * guess and the screen settles it, as it did on the other two boards. */
+#define LCD_MADCTL 0x60
+
+#define LCD_W      320
+#define LCD_H      240
+
+/* The controller addresses 240x320 and this glass is all of it. */
+#define LCD_X_OFF 0
+#define LCD_Y_OFF 0
+
+#elif defined(ST7789_BOARD_S3CAM)
 
 /*
  * A 2.0 inch 240x320 module (020-06PS V2.2, GM1020-06 flex) soldered to the
@@ -677,8 +714,11 @@ static bool panel_init(void)
     static const uint8_t pixfmt[]  = {0x55}; /* 16 bits, and this one matters */
 
     if (io->gpio_config(LCD_DC, AG_GPIO_OUT) != AG_OK ||
-        io->gpio_config(LCD_RST, AG_GPIO_OUT) != AG_OK ||
         io->gpio_config(LCD_BL, AG_GPIO_OUT) != AG_OK) {
+        return false;
+    }
+    /* A board may have no reset line of its own; see LCD_RST above. */
+    if (LCD_RST >= 0 && io->gpio_config(LCD_RST, AG_GPIO_OUT) != AG_OK) {
         return false;
     }
 
@@ -691,12 +731,14 @@ static bool panel_init(void)
      * left in its registers, and this board ships with a factory demo that
      * leaves plenty.
      */
-    io->gpio_write(LCD_RST, 1);
-    ag_api()->time->delay_ms(10);
-    io->gpio_write(LCD_RST, 0);
-    ag_api()->time->delay_ms(10);
-    io->gpio_write(LCD_RST, 1);
-    ag_api()->time->delay_ms(120);
+    if (LCD_RST >= 0) {
+        io->gpio_write(LCD_RST, 1);
+        ag_api()->time->delay_ms(10);
+        io->gpio_write(LCD_RST, 0);
+        ag_api()->time->delay_ms(10);
+        io->gpio_write(LCD_RST, 1);
+        ag_api()->time->delay_ms(120);
+    }
 
     cmd(0x01); /* software reset as well, for the registers RST does not clear */
     ag_api()->time->delay_ms(150);

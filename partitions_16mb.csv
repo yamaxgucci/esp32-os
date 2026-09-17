@@ -1,0 +1,18 @@
+# ArgonOS partition table - 16 MB flash.
+#
+# The same layout as partitions.csv with the whole of the chip declared.  The
+# baseline table stops at 0x800000 because that was the first board's size;
+# every S3 in this project since has had sixteen megabytes and has been using
+# half of them (see the note in docs, and Maxim's question of 11 September
+# 2026: "почему у нас всего 4мб флэш?").  A new board is the right place to
+# start declaring the truth - nothing is on it yet to be erased.
+#
+# All of the extra goes to appfs, which is where relocated .AXE code and the
+# flash art store live: 11.9 MB instead of 3.9.
+#
+# Name,     Type, SubType,  Offset,   Size,     Flags
+nvs,        data, nvs,      0x9000,   0x6000,
+phy_init,   data, phy,      0xf000,   0x1000,
+factory,    app,  factory,  0x10000,  0x300000,
+sysfs,      data, littlefs, 0x310000, 0x100000,
+appfs,      data, 0x40,     0x410000, 0xBF0000,

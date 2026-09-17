@@ -218,6 +218,7 @@ switch ($Command.ToLowerInvariant()) {
             Write-Host '                esp32s3-board  the S3 on the desk: no OpenEth, no HostFS'
             Write-Host '                esp32s3-cam    esp32s3-board + the camera built into the image'
             Write-Host '                esp32s3-zero   ESP32-S3-Zero: 4 MB flash, USB-JTAG console, I2S DAC, no display/SD'
+            Write-Host '                esp32s3-touch-lcd-2  Waveshare ESP32-S3-Touch-LCD-2: 2in 240x320 ST7789 + CST816 touch, 16 MB, USB-JTAG console'
             Write-Host '                esp32       hardware: Wi-Fi and Bluetooth'
             Write-Host '                esp32-dsp   hardware: neither, 48 KB arena'
             Write-Host '                esp32c6     hardware: RISC-V, USB console, the C6-LCD-1.47'
@@ -243,6 +244,11 @@ switch ($Command.ToLowerInvariant()) {
                             $chip = 'esp32s3' }
             'esp32s3-zero' { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32s3;sdkconfig.esp32s3.zero'
                              $chip = 'esp32s3' }
+            # Waveshare ESP32-S3-Touch-LCD-2: the board profile plus a panel,
+            # a touch controller, 16 MB of flash and a console on the chip's
+            # own USB.  See sdkconfig.esp32s3.wslcd2.
+            'esp32s3-touch-lcd-2' { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32s3;sdkconfig.esp32s3.board;sdkconfig.esp32s3.wslcd2'
+                                    $chip = 'esp32s3' }
             'esp32c6'   { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32c6' }
             default {
                 Write-Host "argon target: no defaults for '$chip'."

@@ -1,0 +1,12 @@
+# What mksysfs puts under C:\drv\ for this board.  One line per image; the
+# names are the built .SYS in build/apps (argon apps --group board).
+#
+# The panel is an ST7789 like the CAM board's, on different pins and with no
+# reset line of its own - one more -D in tools/apps.json, not another driver.
+#
+# The touch controller is a CST816D and is genuinely new: capacitive, on I2C,
+# nothing like the CYD's resistive XPT2046, which is why that one is not on
+# this list.  It is also the only pointing device this board has until
+# something is plugged into the header - the single USB socket is the console.
+ST7789WS2.SYS
+CST816.SYS
