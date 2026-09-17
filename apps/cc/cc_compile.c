@@ -94,6 +94,7 @@ static void cc_free(void *p)
 #define AG_AXE_NEEDS_GFX (1u << 1)
 #define AG_AXE_DRIVER (1u << 3)
 #define AG_AXE_NEEDS_AUDIO (1u << 6)
+#define AG_AXE_CAN_MIGRATE (1u << 8)
 
 #define RET_VOID 0
 #define RET_BOOL 1
@@ -267,8 +268,15 @@ typedef struct {
     char       exp[EXP_CAP];
     cc_read_file_fn reader;
     void      *reader_ctx;
-    /* #pragma drv "NAME" "VER" "AUTHOR" — header identity for .SYS images. */
+    /*
+     * #pragma drv "NAME" "VER" "AUTHOR" — header identity for .SYS images,
+     * and #pragma app for the same three fields of a .AXE.  One set of
+     * strings because it is one set of header fields; has_drv is what decides
+     * whether the image is a driver, and has_app only that somebody said.
+     */
     int        has_drv;
+    int        has_app;
+    int        can_migrate; /* #pragma migrate */
     char       drv_name[32];
     char       drv_ver[16];
     char       drv_author[32];
@@ -824,6 +832,53 @@ static void pp_directive(lex_t *L)
                 return;
             }
             L->pp->has_drv = 1;
+            skip_line(L);
+            return;
+        }
+        /*
+         * #pragma app "NAME" "VER" "AUTHOR" - what this program IS.
+         *
+         * Every image this compiler produced was called "TCC 0.2 cc", which
+         * was harmless while a program only ever ran where it was built and
+         * fatal the moment one travels: a cluster spanning two instruction
+         * sets hands a far board the program's NAME and asks for its own
+         * build of it (cluster.md 3b).  Two boards that had both compiled
+         * their own copy would both answer to "TCC", and the far one would
+         * run whichever image it happened to find first.
+         *
+         * The same three strings a driver already gives, because it is the
+         * same three fields in the same header - a program is not a lesser
+         * kind of image, it just had nobody to tell.
+         */
+        if (CC_STRCMP(kind, "app") == 0) {
+            if (!pp_qstr(L, L->pp->drv_name, sizeof(L->pp->drv_name)) ||
+                !pp_qstr(L, L->pp->drv_ver, sizeof(L->pp->drv_ver)) ||
+                !pp_qstr(L, L->pp->drv_author, sizeof(L->pp->drv_author))) {
+                if (!L->err) {
+                    lex_fail(L,
+                             "expected #pragma app \"NAME\" \"VER\" \"AUTHOR\"");
+                }
+                return;
+            }
+            if (L->pp->drv_name[0] == '\0') {
+                lex_fail(L, "empty program name in #pragma app");
+                return;
+            }
+            L->pp->has_app = 1;
+            skip_line(L);
+            return;
+        }
+        /*
+         * #pragma migrate - this program can be asked to move to another
+         * board, and promises to save what it needs when asked.
+         *
+         * A flag rather than something the compiler could work out: only the
+         * author knows whether the state the program keeps is all of it.  A
+         * program that claims this and does not answer the request is simply
+         * left where it is, so the claim costs nothing but a missed handover.
+         */
+        if (CC_STRCMP(kind, "migrate") == 0) {
+            L->pp->can_migrate = 1;
             skip_line(L);
             return;
         }
@@ -2431,6 +2486,24 @@ static const builtin_t BUILTINS[] = {
     {"ag_poll_event", 2, API_OFF_INP, INP_OFF_POLL, RET_BOOL, 0, ABI_MINOR_BASE, NULL},
     {"ag_heartbeat", 0, API_OFF_SYS, SYS_OFF_HEARTBEAT, RET_VOID, 0, ABI_MINOR_BASE, NULL},
     {"ag_focused", 0, API_OFF_PROC, PROC_OFF_FOCUSED, RET_BOOL, 0, ABI_MINOR_FOCUS, NULL},
+    /*
+     * Moving to another board, which is three calls and a promise.
+     *
+     *   while (running) {
+     *       ... a slice of the work ...
+     *       if (ag_migrate_wanted()) { ag_migrate_save(&s, sizeof_state); return 0; }
+     *   }
+     *
+     * and at the top, ag_migrate_restore(&s, cap) - 0 means a fresh start,
+     * which is the answer every program gets the first time.  The promise is
+     * that the state named here is ALL of it: the handles and the screen do
+     * not travel, and nothing can check that but the author.
+     *
+     * Declared with #pragma migrate, or the kernel will never ask.
+     */
+    {"ag_migrate_wanted", 0, API_OFF_PROC, PROC_OFF_MIG_WANTED, RET_BOOL, 0, ABI_MINOR_MIGRATE, NULL},
+    {"ag_migrate_save", 2, API_OFF_PROC, PROC_OFF_MIG_SAVE, RET_RAW, 0, ABI_MINOR_MIGRATE, NULL},
+    {"ag_migrate_restore", 2, API_OFF_PROC, PROC_OFF_MIG_RESTORE, RET_RAW, 0, ABI_MINOR_MIGRATE, NULL},
 
     /* Console text.  ag_printf is the kernel's own, reached with its arguments
      * in the outgoing registers, which is what the windowed ABI asks of any
@@ -4777,6 +4850,9 @@ int cc_compile_to_axe_inc(const char *src, size_t src_len,
         if (g->is_driver) {
             flags |= AG_AXE_DRIVER;
         }
+        if (g->pp.can_migrate) {
+            flags |= AG_AXE_CAN_MIGRATE;
+        }
         wr_u32(axe + 12, flags);
     }
 
@@ -4800,11 +4876,15 @@ int cc_compile_to_axe_inc(const char *src, size_t src_len,
 
     wr_u32(axe + 64, g->pp.app_stack);
     wr_u32(axe + 68, g->pp.app_heap);
-    if (g->is_driver) {
+    if (g->is_driver || g->pp.has_app) {
         wr_str(axe + 72, 32, g->pp.drv_name);
         wr_str(axe + 104, 16, g->pp.drv_ver);
         wr_str(axe + 120, 32, g->pp.drv_author);
     } else {
+        /* Nobody said, so the compiler owns the name.  It is worth nothing to
+         * anyone but the loader's log - and a program that is going to travel
+         * must say, or the far board cannot tell it from every other program
+         * compiled here. */
         wr_str(axe + 72, 32, "TCC");
         wr_str(axe + 104, 16, "0.2");
         wr_str(axe + 120, 32, "cc");

@@ -66,7 +66,7 @@ param(
     # 'migrate' is one scenario on its own, and it earns its place: the whole
     # 'link' list is forty minutes, and a handover defect is diagnosed by
     # repetition.  Everything else is unchanged by it.
-    [ValidateSet('raw', 'link', 'both', 'migrate')]
+    [ValidateSet('raw', 'link', 'both', 'migrate', 'ccmigrate')]
     [string]$Scenario = 'both',
     [int]$Pings = 24
 )
@@ -1224,6 +1224,102 @@ if ($Scenario -eq 'link' -or $Scenario -eq 'both' -or $Scenario -eq 'migrate') {
     $ended = $a -match 'MIGRANT \(pid \d+\) returned 0'
     Note $ended 'migrate-only-one-copy' `
         $(if ($ended) { 'the copy here ended' } else { 'the copy here never ended' })
+}
+
+# --------------------------------- a program the board compiled, migrating ---
+#
+# The same handover, but the program was written on the guest's own filesystem
+# as C and compiled BY THE BOARD - the second rung of the cascade in
+# docs/plans/cluster.md 3b, which only means anything if a program built that
+# way can travel at all.
+#
+# Two things had to be true for it and neither was.  A program compiled here
+# had no identity: every image the compiler wrote called itself "TCC 0.2 cc",
+# so a far node asked to find "its own build of that program" could not tell
+# one from any other.  And there was no way to declare AG_AXE_CAN_MIGRATE or
+# to reach proc->migrate_*, so the kernel would never have asked it to move.
+# `#pragma app`, `#pragma migrate` and three builtins are what this checks.
+if ($Scenario -eq 'ccmigrate') {
+    Write-Host "`n== a program the board compiled, moved to the other board ==" `
+        -ForegroundColor Cyan
+
+    Invoke-Pair -Tag 'ccmig' `
+        -PutBoth @('build\apps\NODELINK.SYS=t:\nodelink.sys') `
+        -PutA @('build\apps\CC.AXE=t:\cc.axe',
+                'apps\cc\examples\migrant.c=t:\migrant.c') `
+        -SendB @('drv load t:\nodelink.sys',
+                 'link name there',
+                 'link use node0',
+                 # LATER THAN THE PLAIN HANDOVER'S 40 SECONDS, and the number
+                 # is arithmetic rather than a guess that grew twice.
+                 #
+                 # A's side of this run: its own boot and the two files it is
+                 # sent - CC.AXE is 33 KB over the console, which is most of a
+                 # minute - then $SendDelaySec of waiting, about 26 seconds of
+                 # compiling, and four of counting before it asks.  Measured on
+                 # this pair, A reaches `migrate` at about 121 s of its uptime,
+                 # and B starts within a second of A.
+                 #
+                 # B spends about 17 s on its own three commands, so a 125 s
+                 # sleep dumps the journal at roughly 142 s - twenty seconds
+                 # after the program should have landed here.  At 40, and then
+                 # at 80, this journal was snapped BEFORE the handover and the
+                 # check read "the far kernel never loaded it": true, and about
+                 # the wrong moment.
+                 '!powershell -NoProfile -Command Start-Sleep -Seconds 125',
+                 'log -n 60',
+                 '=log') `
+        -SendA @('drv load t:\nodelink.sys',
+                 'link name here',
+                 'link use node0',
+                 "!powershell -NoProfile -Command Start-Sleep -Seconds $SendDelaySec",
+                 # The board compiles it.  `cc: wrote` is the compiler's own
+                 # word for success; waiting for the prompt alone would also
+                 # match a compiler that printed an error and exited.
+                 'run t:\cc.axe t:\migrant.c t:\migrant.axe',
+                 '=cc: wrote',
+                 'run /b t:\migrant.axe',
+                 '!powershell -NoProfile -Command Start-Sleep -Seconds 4',
+                 # pid 2, not 1: the COMPILER was the first program to run on
+                 # this board and it took pid 1 before it exited.  `migrate 1`
+                 # answered -2 and was right to.
+                 'migrate 2',
+                 # Stay alive while B dumps its journal, for the same reason
+                 # the plain handover does: A finishing stops the pair, and the
+                 # far node's own evidence goes with it.  Long enough to
+                 # outlast B's 125 s wait - see the arithmetic there.
+                 '!powershell -NoProfile -Command Start-Sleep -Seconds 45')
+
+    $a = Transcript 'build\nodetest-ccmig-a.log'
+    $b = Transcript 'build\nodetest-ccmig-b.log'
+
+    Check $a 'cc: wrote' 'ccmig-board-compiled-it'
+    # The name in the header, which is what the cascade matches on - and what
+    # every image this compiler wrote was missing.
+    Check $a 'loader: MIGRANT' 'ccmig-image-knows-its-own-name'
+
+    $h = [regex]::Match($a, 'migrant: handing over at (\d+)')
+    if (-not $h.Success) {
+        Note $false 'ccmig-agreed-and-saved' 'no "handing over at N" line'
+    } else {
+        Note $true 'ccmig-agreed-and-saved' ("at {0}" -f $h.Groups[1].Value)
+    }
+    Check $a 'is now on' 'ccmig-reported-success-here'
+    Check $b 'loader: MIGRANT' 'ccmig-far-kernel-loaded-it'
+
+    $c = [regex]::Match($a, 'migrant: carried on from (\d+) after (\d+) hop')
+    if (-not $c.Success) {
+        Note $false 'ccmig-continued-not-restarted' 'no "carried on from" line'
+    } else {
+        $from = [int]$c.Groups[1].Value
+        Note ($from -gt 0) 'ccmig-continued-not-restarted' `
+            ("resumed at {0}" -f $from)
+        if ($h.Success) {
+            Note ($from -ge [int]$h.Groups[1].Value) `
+                'ccmig-carried-the-real-number' `
+                ("saved {0}, resumed at {1}" -f $h.Groups[1].Value, $from)
+        }
+    }
 }
 
 # ------------------------------------------------- unloading, on one node ---

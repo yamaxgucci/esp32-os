@@ -69,6 +69,11 @@ extern "C" {
 #define SYS_OFF_HEARTBEAT 32
 
 #define PROC_OFF_FOCUSED 48
+/* Moving a running program to another board (ABI 0.53).  Four bytes an entry
+ * from the `size` field, so these follow focused in declaration order. */
+#define PROC_OFF_MIG_WANTED  52
+#define PROC_OFF_MIG_SAVE    56
+#define PROC_OFF_MIG_RESTORE 60
 
 #define TIME_OFF_US       4
 #define TIME_OFF_MS       8
@@ -130,6 +135,7 @@ extern "C" {
 #define ABI_MINOR_GFX25  25
 #define ABI_MINOR_GFX26  26
 #define ABI_MINOR_FOCUS  20
+#define ABI_MINOR_MIGRATE 53
 
 typedef struct {
     uint8_t *axe;

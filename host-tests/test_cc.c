@@ -92,6 +92,13 @@ _Static_assert(SUB_SLOT(ag_sys_api_t, heartbeat) == SYS_OFF_HEARTBEAT,
                "sys.heartbeat moved");
 _Static_assert(SUB_SLOT(ag_proc_api_t, focused) == PROC_OFF_FOCUSED,
                "proc.focused moved");
+_Static_assert(SUB_SLOT(ag_proc_api_t, migrate_wanted) == PROC_OFF_MIG_WANTED,
+               "proc.migrate_wanted moved");
+_Static_assert(SUB_SLOT(ag_proc_api_t, migrate_save) == PROC_OFF_MIG_SAVE,
+               "proc.migrate_save moved");
+_Static_assert(SUB_SLOT(ag_proc_api_t, migrate_restore) ==
+                   PROC_OFF_MIG_RESTORE,
+               "proc.migrate_restore moved");
 
 _Static_assert(SUB_SLOT(ag_time_api_t, us) == TIME_OFF_US, "time.us moved");
 _Static_assert(SUB_SLOT(ag_time_api_t, ms) == TIME_OFF_MS, "time.ms moved");
@@ -477,6 +484,60 @@ static void check_dx7nofx_example(void)
     /* pcmvirt/midivirt via ag_dev_* (no AG_AXE_NEEDS_AUDIO; not ag_audio_*). */
     check_example_file("dx7nofx", "../apps/cc/examples/dx7nofx.c",
                        "apps/cc/examples/dx7nofx.c", 128 * 1024, 0u);
+}
+
+/*
+ * The program that travels, and the two things that make it possible.
+ *
+ * AG_AXE_CAN_MIGRATE (1<<8) so the kernel asks it to move at all, and its own
+ * NAME in the header so that the board it lands on can look for its own build
+ * of the same program.  Every image this compiler wrote used to be called
+ * "TCC", which is indistinguishable from every other, and a cascade that
+ * matches on identity would have matched the wrong thing.
+ */
+static void check_migrant_example(void)
+{
+    const char *paths[] = {"../apps/cc/examples/migrant.c",
+                           "apps/cc/examples/migrant.c", NULL};
+    FILE       *f = NULL;
+    for (int i = 0; paths[i] != NULL; i++) {
+        f = fopen(paths[i], "rb");
+        if (f != NULL) {
+            break;
+        }
+    }
+    AG_CHECK(f != NULL);
+    if (f == NULL) {
+        return;
+    }
+    char *buf = (char *)malloc(16 * 1024);
+    AG_CHECK(buf != NULL);
+    if (buf == NULL) {
+        fclose(f);
+        return;
+    }
+    const size_t n = fread(buf, 1, 16u * 1024u - 1u, f);
+    fclose(f);
+    buf[n] = '\0';
+
+    cc_result_t res;
+    const int   rc = cc_compile_to_axe(buf, n, &res);
+    AG_CHECK(rc == 0);
+    if (rc != 0) {
+        printf("     migrant.c: %s\n", res.err);
+        free(buf);
+        return;
+    }
+    const uint32_t flags = (uint32_t)res.axe[12] | ((uint32_t)res.axe[13] << 8) |
+                           ((uint32_t)res.axe[14] << 16) |
+                           ((uint32_t)res.axe[15] << 24);
+    AG_CHECK((flags & (1u << 8)) != 0u);       /* AG_AXE_CAN_MIGRATE */
+    AG_CHECK((flags & (1u << 3)) == 0u);       /* not a driver */
+    /* name at 72, version at 104 - what the far node matches on. */
+    AG_CHECK(strcmp((const char *)res.axe + 72, "MIGRANT") == 0);
+    AG_CHECK(strcmp((const char *)res.axe + 104, "1.0") == 0);
+    cc_result_free(&res);
+    free(buf);
 }
 
 static void check_echo_sys_example(void)
@@ -1223,6 +1284,7 @@ void run_cc_tests(void)
         cc_result_free(&res);
     }
 
+    check_migrant_example();
     check_asteroids_example();
     check_dx7nofx_example();
     check_echo_sys_example();
