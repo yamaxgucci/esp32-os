@@ -353,7 +353,22 @@ int ag_cmd_copy(int argc, char **argv)
     int32_t  n;
     int      status = 0;
 
-    while ((n = ag_vfs_read(in, chunk, sizeof(chunk))) > 0) {
+    /*
+     * AG_COPY_CHUNK, not sizeof(chunk).
+     *
+     * `chunk` is a POINTER since the buffer moved off the stack, so
+     * sizeof was four - and every copy on this system read four bytes at a
+     * time.  On a local card that is merely slow and invisible.  Over the
+     * wire it is a round trip per four bytes: a 10 KB file cost 178 KB of
+     * traffic and eleven seconds, which is where "the remote drive is slow"
+     * came from, and what made a migrating program's image take a second and
+     * a half to arrive.
+     *
+     * The same shape as the one gcc caught next door in noderdev.c, where an
+     * array became a pointer and sizeof went with it.  Nothing warns here,
+     * because passing sizeof(void*) as a length is perfectly legal.
+     */
+    while ((n = ag_vfs_read(in, chunk, AG_COPY_CHUNK)) > 0) {
         size_t   left = (size_t)n;
         size_t   off = 0;
         ag_err_t werr = AG_OK;

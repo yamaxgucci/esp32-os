@@ -2242,7 +2242,9 @@ static ag_err_t drv_copy_file(const char *src_abs, const char *dst_abs)
         return -AG_ENOMEM;
     }
 
-    while ((n = ag_vfs_read(in, chunk, sizeof(chunk))) > 0) {
+    /* DRV_COPY_CHUNK, not sizeof(chunk): the buffer is on the heap, so sizeof
+     * is four.  See the same fix in cmd_fs.c's copy for what that costs. */
+    while ((n = ag_vfs_read(in, chunk, DRV_COPY_CHUNK)) > 0) {
         size_t left = (size_t)n;
         size_t off = 0;
         while (left > 0) {
