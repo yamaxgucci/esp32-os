@@ -157,9 +157,23 @@ static ag_err_t load_one(const char *path, const char *label)
                label, (unsigned)AG_CFG_LINE_MAX);
     }
 
+    const uint16_t lost_before = s_cfg.dropped;
     const ag_err_t err = ag_cfg_parse(sk.out, &s_cfg);
     if (err == AG_OK) {
         note_source(label);
+    }
+    /*
+     * Settings that did not fit the table are COUNTED, and were never said.
+     * A count nobody reads is the same as no count: a key that is present in
+     * the file and absent from the system is the hardest kind of fault to
+     * look at, because every explanation you try is about the code.
+     */
+    if (s_cfg.dropped > lost_before) {
+        ag_log(AG_LOG_WARN, TAG,
+               "%s: %u setting(s) did not fit - the table holds %u, and the "
+               "ones past that are not in effect",
+               label, (unsigned)(s_cfg.dropped - lost_before),
+               (unsigned)AG_CFG_MAX_ENTRIES);
     }
     return err;
 }
