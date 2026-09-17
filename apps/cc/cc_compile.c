@@ -168,6 +168,7 @@ typedef enum {
     T_SIZEOF,
     T_CONST,
     T_VOLATILE,
+    T_STATIC,
     T_LPAREN,
     T_RPAREN,
     T_LBRACE,
@@ -1030,6 +1031,9 @@ static tok_t kw(const char *s)
     }
     if (CC_STRCMP(s, "const") == 0) {
         return T_CONST;
+    }
+    if (CC_STRCMP(s, "static") == 0) {
+        return T_STATIC;
     }
     if (CC_STRCMP(s, "volatile") == 0) {
         return T_VOLATILE;
@@ -2771,7 +2775,25 @@ static int32_t const_expr_from(lex_t *L, gen_t *g);
 
 static void skip_cv(par_t *p)
 {
-    while (accept(p, T_CONST) || accept(p, T_VOLATILE)) {
+    /*
+     * `static` is accepted and ignored, beside const and volatile.
+     *
+     * Ignored honestly rather than by accident: an image compiled here is one
+     * translation unit and nothing outside it can see a name, so `static` on
+     * a function or a global already describes what happens.  A `static`
+     * LOCAL would be a different promise - one that outlives the call - and
+     * that one is refused where locals are declared rather than silently
+     * broken here.
+     */
+    for (;;) {
+        if (accept(p, T_STATIC)) {
+            p->saw_static = 1;
+            continue;
+        }
+        if (accept(p, T_CONST) || accept(p, T_VOLATILE)) {
+            continue;
+        }
+        break;
     }
 }
 

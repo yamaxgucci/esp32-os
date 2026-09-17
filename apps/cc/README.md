@@ -63,6 +63,12 @@ No floats, unions, arrays of pointers, or pointers to pointers. Functions return
 `int` or `void` — an address is an `int` like any other, so a function that hands
 one back is declared `int`.
 
+A struct local may be given its fields where it is declared —
+`struct v s = {1, 2};`, in declaration order, a trailing comma allowed, and
+whatever is left out is zero (so `= {0}` means all of it). Nested structs and
+arrays inside the braces are refused rather than guessed at. That is an
+initialiser and not a copy: everywhere else,
+
 A struct is only ever handled by address: no struct assignment (`a = b`), no
 struct parameter or return value — pass `&s` and take a `struct v *`. Fields go
 in declaration order, each on its natural alignment (a word for everything but

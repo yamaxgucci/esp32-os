@@ -599,6 +599,25 @@ static void check_unsigned_example(void)
     /* `signed char` is a byte this compiler cannot represent, and says so
      * rather than quietly treating it as unsigned. */
     check_prog("int ag_main(void) { signed char c = 1; return c; }\n", 0);
+
+    /* sizeof a variable, and a struct given its fields at a declaration. */
+    check_prog("struct v { int a; int b; };\n"
+               "int ag_main(void) { struct v s = {1, 2}; return sizeof(s); }\n",
+               1);
+    check_prog("struct v { int a; char c; };\n"
+               "int ag_main(void) { struct v s = {0}; return s.a + s.c; }\n",
+               1);
+    check_prog("int ag_main(void) { char b[5]; return sizeof(b); }\n", 1);
+    /* More values than fields is a mistake, not a truncation. */
+    check_prog("struct v { int a; };\n"
+               "int ag_main(void) { struct v s = {1, 2}; return s.a; }\n", 0);
+    /* And a whole-struct assignment is still refused - the brace list is a
+     * declaration's initialiser, not a copy. */
+    check_prog("struct v { int a; };\n"
+               "int ag_main(void) { struct v s = {1}; struct v t; t = s;\n"
+               "  return t.a; }\n", 0);
+    /* sizeof of an expression has no honest answer here. */
+    check_prog("int ag_main(void) { int a = 1; return sizeof(a + 1); }\n", 0);
 }
 
 static void check_echo_sys_example(void)

@@ -43,10 +43,7 @@ struct state {
 
 int ag_main(void)
 {
-    struct state s;
-    s.version = 1;
-    s.count = 0;
-    s.hops = 0;
+    struct state s = {1, 0, 0};
 
     /*
      * 0 means nothing arrived: a fresh start, which is what happens the first
@@ -60,9 +57,7 @@ int ag_main(void)
         return 1;
     }
     if (got == 0) {
-        s.version = 1;
-        s.count = 0;
-        s.hops = 0;
+        /* Nothing to undo: the declaration above already holds these. */
         ag_print("migrant: starting fresh at 0\n");
     } else {
         if (s.version != 1) {
