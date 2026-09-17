@@ -371,17 +371,34 @@ def scen_sound(quiet, loud, image):
     note("devpoke:" in t, "sound-%s-wrote-periods" % quiet.name,
          why="the program said nothing")
 
+    # WAIT BEFORE ASKING.  The receiving board says its count 400 ms after the
+    # last period - deliberately, so the end of a burst gets one line instead
+    # of forty - and its pour task wakes on a 100 ms timer.  Reading the
+    # journal the instant the sending board returns its prompt asks before the
+    # answer has been written, and reports "no pour report" while the sound
+    # arrived perfectly.  That cost an evening of suspecting the receiver.
+    time.sleep(2.0)
     t = loud.ask("log -n 30", timeout=15.0)
     # "poured 8 periods, 1632 bytes, 0 lost" - no colon.  The first version of
     # this looked for "poured:" and reported "no pour report" while the line
     # was sitting in the journal.
+    # Flattened first: the CYD's console is forty wide, so "poured 7 periods,
+    # 1568 bytes, 0 lost" arrives cut in two and the loss count is on the next
+    # row.  The same wrap already hid a refusal message earlier today.
+    t = flat(t)
     got = num(t, r"poured (\d+) periods", None)
     if got is None:
         note(False, "sound-arrived-at-%s" % loud.name, why="no pour report")
         return
     lost = num(t, r"poured \d+ periods, \d+ bytes, (\d+) lost", "?")
+    # "? lost" is honest and not a failure: this board's console is forty
+    # columns and the journal CLIPS an entry to the width, so the tail of
+    # "poured 7 periods, 1568 bytes, 0 lost" never reaches the screen.  The
+    # count that matters - periods that reached the converter - is at the
+    # front of the line, which is where it belongs.
     note(int(got) > 0, "sound-arrived-at-%s" % loud.name,
-         "%s periods, %s lost" % (got, lost))
+         "%s periods, lost: %s" % (got, lost if lost != "?" else
+                                   "off the 40-column screen"))
 
 
 # ------------------------------------------------------------------- main ---

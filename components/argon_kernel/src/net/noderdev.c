@@ -515,6 +515,9 @@ typedef struct {
     uint32_t off;
 } rd_period_t;
 
+/* Said once: a flood of identical warnings is a flood, not a diagnosis. */
+static bool              s_no_sink_said;
+
 static rd_period_t       s_ring[RD_RING];
 static volatile uint32_t s_ring_w;
 static volatile uint32_t s_ring_r;
@@ -649,7 +652,16 @@ static void worker(void *arg)
  */
 static void pour_report(void)
 {
-    if (s_pour_said || s_pour_periods == 0) {
+    /*
+     * ANYTHING to report, not only successes.
+     *
+     * This asked for `s_pour_periods == 0` and returned - so a pour in which
+     * EVERY period was lost said nothing at all, and the one case the counter
+     * exists for was the one case it stayed quiet in.  On the bench that read
+     * as "the sound never arrived", while the periods were arriving and being
+     * dropped one by one for a reason nobody printed.
+     */
+    if (s_pour_said || (s_pour_periods == 0 && s_pour_lost == 0)) {
         return;
     }
     const uint32_t now = (uint32_t)(ag_port_us() / 1000);
@@ -693,6 +705,18 @@ static void pour_task(void *arg)
                 s_pour_lost++;
             }
         } else {
+            /*
+             * Nothing to write it to.  Said once, by name of the handle: a
+             * period with no session is not a wire fault and not a converter
+             * fault, it is an open that did not happen or did not survive, and
+             * the three are indistinguishable from a count of losses alone.
+             */
+            if (!s_no_sink_said) {
+                ag_log(AG_LOG_WARN, TAG,
+                       "poured sound has nowhere to go: no open device for "
+                       "handle %u", (unsigned)pd->handle);
+                s_no_sink_said = true;
+            }
             s_pour_lost++;
         }
         s_pour_last_ms = (uint32_t)(ag_port_us() / 1000);
