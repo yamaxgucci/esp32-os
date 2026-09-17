@@ -64,6 +64,23 @@ class Board:
         self.s = open_port(port)
         self.log = bytearray()
 
+    def type_line(self, text):
+        """A line, in pieces the board's console can keep up with.
+
+        Written whole, a ninety-character command loses characters in the
+        middle: the console asks for a pause with XOFF, this harness cannot
+        honour it (an XOFF whose XON never comes blocks for ever), and what
+        arrives is a command torn in half.  Three rounds of an hour-long run
+        failed that way, all of them the longest command in the set - which
+        looked like the board dropping input and was this typing too fast.
+        """
+        for i in range(0, len(text), 24):
+            self.s.write(text[i:i + 24].encode())
+            self.s.flush()
+            time.sleep(0.05)
+        self.s.write(b"\r")
+        self.s.flush()
+
     def pump(self, seconds):
         end = time.time() + seconds
         while time.time() < end:
