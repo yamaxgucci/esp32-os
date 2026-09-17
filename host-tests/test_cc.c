@@ -43,6 +43,7 @@ _Static_assert(API_SLOT(io) == API_OFF_IO, "ag_api_t.io moved");
 _Static_assert(API_SLOT(time) == API_OFF_TIME, "ag_api_t.time moved");
 _Static_assert(API_SLOT(proc) == API_OFF_PROC, "ag_api_t.proc moved");
 _Static_assert(API_SLOT(audio) == API_OFF_AUDIO, "ag_api_t.audio moved");
+_Static_assert(API_SLOT(clu) == API_OFF_CLU, "ag_api_t.clu moved");
 
 _Static_assert(SUB_SLOT(ag_mem_api_t, alloc) == MEM_OFF_ALLOC,
                "mem.alloc moved");
@@ -87,6 +88,20 @@ _Static_assert(SUB_SLOT(ag_inp_api_t, key_pressed) == INP_OFF_KEY_PRESSED,
                "inp.key_pressed moved");
 _Static_assert(SUB_SLOT(ag_inp_api_t, pad) == INP_OFF_PAD, "inp.pad moved");
 _Static_assert(SUB_SLOT(ag_inp_api_t, btn) == INP_OFF_BTN, "inp.btn moved");
+
+/*
+ * The cluster table.  These eight are the only way a program compiled on the
+ * board can use more than the board it was compiled on, and a slot that moved
+ * would send a thread's work through the wrong function rather than fail.
+ */
+_Static_assert(SUB_SLOT(ag_clu_api_t, nodes) == CLU_OFF_NODES, "clu.nodes moved");
+_Static_assert(SUB_SLOT(ag_clu_api_t, start) == CLU_OFF_START, "clu.start moved");
+_Static_assert(SUB_SLOT(ag_clu_api_t, spawn) == CLU_OFF_SPAWN, "clu.spawn moved");
+_Static_assert(SUB_SLOT(ag_clu_api_t, send) == CLU_OFF_SEND, "clu.send moved");
+_Static_assert(SUB_SLOT(ag_clu_api_t, recv) == CLU_OFF_RECV, "clu.recv moved");
+_Static_assert(SUB_SLOT(ag_clu_api_t, join) == CLU_OFF_JOIN, "clu.join moved");
+_Static_assert(SUB_SLOT(ag_clu_api_t, self) == CLU_OFF_SELF, "clu.self moved");
+_Static_assert(SUB_SLOT(ag_clu_api_t, done) == CLU_OFF_DONE, "clu.done moved");
 
 _Static_assert(SUB_SLOT(ag_sys_api_t, heartbeat) == SYS_OFF_HEARTBEAT,
                "sys.heartbeat moved");
@@ -635,6 +650,85 @@ static void check_unsigned_example(void)
     /* A program that has its own idea of bool keeps it. */
     check_prog("typedef int bool;\n"
                "int ag_main(void) { bool b = 1; return b; }\n", 1);
+}
+
+/*
+ * A job for the whole cluster, written in the dialect the board itself
+ * compiles.  Two things are being checked here that nothing else checks:
+ *
+ *  - the eight ag_clu_* names resolve, with `&worker` as the code address in
+ *    an entry table this compiler has no function-pointer type for;
+ *  - the image DEMANDS ABI 0.52.  A kernel older than the cluster would
+ *    otherwise hand the program a NULL table and it would fault on the first
+ *    call instead of being refused at load.
+ *
+ * What a host test cannot see is whether the work actually left the board.
+ * That is `argon nodetest -Scenario ccjob`: node A compiles this file, runs
+ * it, and the blocks are ground on node B.
+ */
+static void check_clujob_example(void)
+{
+    const char *paths[] = {"../apps/cc/examples/clujob.c",
+                           "apps/cc/examples/clujob.c", NULL};
+    FILE       *f = NULL;
+    for (int i = 0; paths[i] != NULL; i++) {
+        f = fopen(paths[i], "rb");
+        if (f != NULL) {
+            break;
+        }
+    }
+    AG_CHECK(f != NULL);
+    if (f == NULL) {
+        return;
+    }
+    char *buf = (char *)malloc(16 * 1024);
+    AG_CHECK(buf != NULL);
+    if (buf == NULL) {
+        fclose(f);
+        return;
+    }
+    const size_t n = fread(buf, 1, 16u * 1024u - 1u, f);
+    fclose(f);
+    buf[n] = '\0';
+
+    cc_result_t res;
+    const int   rc = cc_compile_to_axe(buf, n, &res);
+    AG_CHECK(rc == 0);
+    if (rc != 0) {
+        printf("     clujob.c: %s\n", res.err);
+        free(buf);
+        return;
+    }
+    const uint32_t minor = (uint32_t)res.axe[6] | ((uint32_t)res.axe[7] << 8);
+    AG_CHECK(minor >= 52u);
+    AG_CHECK(strcmp((const char *)res.axe + 72, "CLUJOB") == 0);
+    cc_result_free(&res);
+    free(buf);
+
+    /* Each of the eight on its own, so that a broken one is named rather than
+     * hidden behind whichever comes first in the example. */
+    check_prog("int ag_main(void) { return ag_clu_nodes(0, 0); }\n", 1);
+    check_prog("struct e { int name; int fn; };\n"
+               "struct e t[1];\n"
+               "void w(int s, char *a, int n) { return; }\n"
+               "int ag_main(void) { t[0].name = \"w\"; t[0].fn = &w;\n"
+               "  if (ag_clu_start(&t[0], 1)) { return 0; } return 0; }\n", 1);
+    check_prog("int ag_main(void) { return ag_clu_spawn(-1, \"w\", 0, 0); }\n",
+               1);
+    check_prog("int ag_main(void) { char b[4];\n"
+               "  return ag_clu_send(0, &b[0], 4, 100); }\n", 1);
+    check_prog("int ag_main(void) { char b[4]; int f;\n"
+               "  return ag_clu_recv(&f, &b[0], 4, 100); }\n", 1);
+    check_prog("int ag_main(void) { return ag_clu_join(1, 100); }\n", 1);
+    check_prog("int ag_main(void) { return ag_clu_self(); }\n", 1);
+    check_prog("int ag_main(void) { ag_clu_done(); return 0; }\n", 1);
+    /* The arity is the ABI: a call with the wrong number of arguments would
+     * put rubbish in a register the kernel reads. */
+    check_prog("int ag_main(void) { return ag_clu_join(1); }\n", 0);
+    check_prog("int ag_main(void) { return ag_clu_self(1); }\n", 0);
+    /* And the names are the kernel's, so a program may not take them. */
+    check_prog("int ag_clu_self(void) { return 0; }\n"
+               "int ag_main(void) { return ag_clu_self(); }\n", 0);
 }
 
 static void check_echo_sys_example(void)
@@ -1383,6 +1477,7 @@ void run_cc_tests(void)
 
     check_migrant_example();
     check_unsigned_example();
+    check_clujob_example();
     check_asteroids_example();
     check_dx7nofx_example();
     check_echo_sys_example();

@@ -2583,6 +2583,47 @@ static const builtin_t BUILTINS[] = {
     {"ag_migrate_save", 2, API_OFF_PROC, PROC_OFF_MIG_SAVE, RET_RAW, 0, ABI_MINOR_MIGRATE, NULL},
     {"ag_migrate_restore", 2, API_OFF_PROC, PROC_OFF_MIG_RESTORE, RET_RAW, 0, ABI_MINOR_MIGRATE, NULL},
 
+    /*
+     * The cluster: threads of ONE program on the cores of every board that
+     * answered.  The table is never NULL, so all of this works on a board that
+     * is alone - it says there is one node and runs every thread here - and a
+     * program written with these calls is the same program on one board and on
+     * three.  That is the point of putting them in a compiler that lives on the
+     * board: the job can be written where it is to run.
+     *
+     * The shape of a job, and it is short enough to give whole:
+     *
+     *   struct entry { int name; int fn; };   // ag_clu_entry_t, word by word
+     *   struct entry tab[1];
+     *
+     *   void worker(int self, char *arg, int len) { ... ag_clu_send(0, ...); }
+     *
+     *   int ag_main(void) {
+     *       tab[0].name = "work";
+     *       tab[0].fn   = &worker;
+     *       if (ag_clu_start(&tab[0], 1)) return 0;   // a share, now finished
+     *       t = ag_clu_spawn(-1, "work", &job, sizeof(job));
+     *       ...
+     *   }
+     *
+     * `&worker` is an ordinary word here, as it is in a .SYS built by this
+     * compiler; the kernel calls it with the windowed ABI every function this
+     * compiler writes already uses.
+     *
+     * ag_clu_start is the line that decides which half of the job this copy is.
+     * TRUE means another node started us to serve its share, the call has
+     * already run that share to its end, and the only right answer is to return
+     * from ag_main at once.
+     */
+    {"ag_clu_nodes", 2, API_OFF_CLU, CLU_OFF_NODES, RET_RAW, 0, ABI_MINOR_CLUSTER, NULL},
+    {"ag_clu_start", 2, API_OFF_CLU, CLU_OFF_START, RET_BOOL, 0, ABI_MINOR_CLUSTER, NULL},
+    {"ag_clu_spawn", 4, API_OFF_CLU, CLU_OFF_SPAWN, RET_RAW, 0, ABI_MINOR_CLUSTER, NULL},
+    {"ag_clu_send", 4, API_OFF_CLU, CLU_OFF_SEND, RET_RAW, 0, ABI_MINOR_CLUSTER, NULL},
+    {"ag_clu_recv", 4, API_OFF_CLU, CLU_OFF_RECV, RET_RAW, 0, ABI_MINOR_CLUSTER, NULL},
+    {"ag_clu_join", 2, API_OFF_CLU, CLU_OFF_JOIN, RET_RAW, 0, ABI_MINOR_CLUSTER, NULL},
+    {"ag_clu_self", 0, API_OFF_CLU, CLU_OFF_SELF, RET_RAW, 0, ABI_MINOR_CLUSTER, NULL},
+    {"ag_clu_done", 0, API_OFF_CLU, CLU_OFF_DONE, RET_VOID, 0, ABI_MINOR_CLUSTER, NULL},
+
     /* Console text.  ag_printf is the kernel's own, reached with its arguments
      * in the outgoing registers, which is what the windowed ABI asks of any
      * caller of a variadic function. */

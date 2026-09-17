@@ -34,6 +34,7 @@ extern "C" {
 #define API_OFF_TIME  40
 #define API_OFF_PROC  48
 #define API_OFF_AUDIO 60
+#define API_OFF_CLU   84
 
 #define MEM_OFF_ALLOC   4
 #define MEM_OFF_REALLOC 12
@@ -114,6 +115,21 @@ extern "C" {
 #define GFX_OFF_POLY_UV         128
 #define GFX_OFF_POLY_FILL_TEX   132
 
+/*
+ * Threads of one program over several boards (ABI 0.52).  The table is never
+ * NULL: a board alone answers "one node, this one" and runs every thread here,
+ * so a program written against these calls is the same program on one board
+ * and on three.
+ */
+#define CLU_OFF_NODES 4
+#define CLU_OFF_START 8
+#define CLU_OFF_SPAWN 12
+#define CLU_OFF_SEND  16
+#define CLU_OFF_RECV  20
+#define CLU_OFF_JOIN  24
+#define CLU_OFF_SELF  28
+#define CLU_OFF_DONE  32
+
 #define AUDIO_OFF_PRESENT 4
 #define AUDIO_OFF_IS_HW   8
 #define AUDIO_OFF_OPEN    12
@@ -135,6 +151,7 @@ extern "C" {
 #define ABI_MINOR_GFX25  25
 #define ABI_MINOR_GFX26  26
 #define ABI_MINOR_FOCUS  20
+#define ABI_MINOR_CLUSTER 52
 #define ABI_MINOR_MIGRATE 53
 
 typedef struct {

@@ -27,6 +27,12 @@ host toolchain (image name `CC.AXE`).
 - Drivers: `#pragma drv "NAME" "VER" "AUTHOR"` (required) sets the image
   header; the compiler stamps `AG_AXE_DRIVER`. `&func` yields a code address
   for filling an ops table
+- Apps: `#pragma app "NAME" "VER" "AUTHOR"` gives the image its own identity in
+  the header. Without it every image this compiler wrote called itself
+  `TCC 0.2 cc`, which makes a cluster that looks for *its own build of that
+  program* unable to tell one from any other
+- `#pragma migrate` stamps `AG_AXE_CAN_MIGRATE`, without which the kernel never
+  asks the program to move and the three `ag_migrate_*` calls are dead code
 - App sizes: `#pragma appstack N` / `#pragma appheap N` write non-zero
   `stack_size` / `heap_size` into the AXE header (kernel defaults if omitted;
   `N` is decimal or `0x` hex bytes)
@@ -111,7 +117,9 @@ of a guest.
 The image demands the highest ABI minor of the features it uses: 8 plain, 9 for
 `ag_gfx_*` (which also sets `AG_AXE_NEEDS_GFX`), 10 for `ag_btn`, 14 for
 `ag_audio_*` (`AG_AXE_NEEDS_AUDIO`), 16 for clip/round-rect, 17 for
-`ag_gfx_blit_bind` / `blit_copy` / `blit_keyed`, 20 for `ag_focused`.
+`ag_gfx_blit_bind` / `blit_copy` / `blit_keyed`, 20 for `ag_focused`, 52 for
+`ag_clu_*`, 53 for `ag_migrate_*`. That is what makes an older kernel refuse
+the image at load instead of handing it a NULL table to fault on.
 
 | Builtin | Notes |
 |---------|--------|
@@ -164,6 +172,25 @@ The image demands the highest ABI minor of the features it uses: 8 plain, 9 for
 | `ag_dev_read` / `ag_dev_write` / `ag_dev_ioctl` | same shapes as the FS calls |
 | `ag_dev_add(desc)` / `ag_dev_remove(name)` | publish / withdraw (only in `ag_driver_init`) |
 | `ag_dev_priv(dev)` | driver's `priv` from inside ops callbacks |
+| `ag_migrate_wanted()` | true when a board has asked this program to move (ABI 0.53) |
+| `ag_migrate_save(p, n)` / `ag_migrate_restore(p, n)` | hand over / take back the state; restore returns 0 on a fresh start |
+| `ag_clu_nodes(out, max)` | boards this job may use; `out` 0 asks only for the count (ABI 0.52) |
+| `ag_clu_start(tab, n)` | declare the entry points; **true means this copy is a worker and its share is already done** |
+| `ag_clu_spawn(node, name, arg, len)` | one thread there; node `-1` any, `-2` here |
+| `ag_clu_send(tid, buf, len, ms)` / `ag_clu_recv(&from, buf, cap, ms)` | messages between threads, wherever they are |
+| `ag_clu_join(tid, ms)` / `ag_clu_self()` / `ag_clu_done()` | wait for one, ask who I am, end the job |
+
+The cluster entry table is `ag_clu_entry_t` written out word by word —
+`struct entry { int name; int fn; };` — and filled at run time with a string and
+`&worker`, the same way a `.SYS` fills its ops. `ag_clu_nodes` is asked for the
+count rather than the table because `ag_clu_node_t` has a `char[16]` in it,
+which this compiler cannot yet lay out.
+
+A whole job in the dialect: [`examples/clujob.c`](examples/clujob.c) — it
+computes the same sum twice, once on this core and once out of the messages
+that came back, and the two must be the same number. `argon nodetest -Scenario
+ccjob` compiles that file **on node A** and checks that node B, which has never
+held a copy of the image, ran it.
 
 No `ag_seek`: the kernel API is `int64_t`, and every value in this language is a
 32-bit word. Open flags are ordinary `#define`s (see above), not keywords.

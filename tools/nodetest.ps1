@@ -66,7 +66,8 @@ param(
     # 'migrate' is one scenario on its own, and it earns its place: the whole
     # 'link' list is forty minutes, and a handover defect is diagnosed by
     # repetition.  Everything else is unchanged by it.
-    [ValidateSet('raw', 'link', 'both', 'migrate', 'ccmigrate')]
+    [ValidateSet('raw', 'link', 'both', 'migrate', 'ccmigrate',
+                 'ccjob')]
     [string]$Scenario = 'both',
     [int]$Pings = 24
 )
@@ -205,6 +206,13 @@ if ($Scenario -ne 'raw') {
     $only += @('NODELINK.SYS', 'HELLO.AXE', 'NEEDSND.AXE', 'PCMVIRT.SYS',
                'DEVPOKE.AXE', 'IDLE.AXE', 'NEEDGFX.AXE', 'GRIND.AXE',
                'MIGRANT.AXE')
+}
+# The compiler, for the two scenarios that build a program ON THE BOARD.  It
+# was missing from this list and they ran on whatever a previous full build had
+# left in build\apps - which is exactly the fault described above, and it passed
+# for weeks because `argon check` happens to run first in the gate.
+if ($Scenario -eq 'ccmigrate' -or $Scenario -eq 'ccjob') {
+    $only += @('CC.AXE')
 }
 & python (Join-Path $PSScriptRoot 'build_apps.py') --only @only | Out-Null
 foreach ($img in $only) {
@@ -1320,6 +1328,115 @@ if ($Scenario -eq 'ccmigrate') {
                 ("saved {0}, resumed at {1}" -f $h.Groups[1].Value, $from)
         }
     }
+}
+
+# ------------------- a job for both boards, written on one of them ---
+#
+# The last rung that was missing, and the claim is one sentence: A PROGRAM
+# WRITTEN AND COMPILED ON A BOARD USED THE OTHER BOARD'S CORES.
+#
+# Everything before this either moved a whole program between nodes, or gave one
+# program both boards' cores from an image built on a PC.  Here the source is a
+# file on node A's card, the compiler is CC.AXE running on node A, and the image
+# that appears on node B was written by node A minutes earlier - B has never had
+# a copy of it and there is no copy of it anywhere else.
+#
+# WHAT WOULD MAKE THIS PASS WITHOUT MEANING ANYTHING, and how each is closed:
+#   - the compiler failing quietly: `cc: wrote` is checked, not the prompt.
+#   - everything running on A: B's own loader line for CLUJOB is read off B's
+#     journal, where it can only appear if B loaded it, and B is also asked to
+#     say in its own words that it is serving a job.
+#   - the work not actually crossing: the program computes the same sum twice,
+#     once on this core in a plain loop and once out of the messages that came
+#     back, and both numbers are printed.  They are compared here as well as by
+#     the program, because a program that printed "answers agree" from a branch
+#     that was never taken would otherwise be believed.
+#
+# NO SPEED IS ASSERTED, for the reason the GRIND scenario gives at length: two
+# emulators on one PC compete for the same host cores.
+
+if ($Scenario -eq 'ccjob') {
+    Write-Host "`n== a cluster job the board itself compiled ==" `
+        -ForegroundColor Cyan
+
+    Invoke-Pair -Tag 'ccjob' `
+        -PutBoth @('build\apps\NODELINK.SYS=t:\nodelink.sys') `
+        -PutA @('build\apps\CC.AXE=t:\cc.axe',
+                'apps\cc\examples\clujob.c=t:\clujob.c') `
+        -SendB @('drv load t:\nodelink.sys',
+                 'link name n2',
+                 'link use node0',
+                 # B does nothing of its own - its whole part is started by A -
+                 # and the poll keeps its shell out of the way and its wire
+                 # pumped while that happens.  Long enough to outlast A's
+                 # compile: A spends $SendDelaySec waiting, then the better part
+                 # of a minute compiling, before the job even starts.
+                 "link poll $(($SendDelaySec + 230) * 1000)",
+                 '=link on node0',
+                 # From the journal and not the screen: while a worker thread
+                 # owns B's console, a kernel line written then reaches nobody.
+                 'log -n 120',
+                 '=log') `
+        -SendA @('drv load t:\nodelink.sys',
+                 'link name n1',
+                 'link use node0',
+                 "!powershell -NoProfile -Command Start-Sleep -Seconds $SendDelaySec",
+                 # The board compiles the job.  `cc: wrote` is the compiler's
+                 # own word for success; the prompt alone would also follow an
+                 # error message.
+                 'run t:\cc.axe t:\clujob.c t:\clujob.axe',
+                 '=cc: wrote',
+                 'link nodes',
+                 '=cores in all',
+                 # A marker printed on EVERY path out of clujob, not only the
+                 # good one - see the note in the GRIND scenario.
+                 'run t:\clujob.axe',
+                 '=clujob: ')
+
+    $a = Transcript 'build\nodetest-ccjob-a.log'
+    $b = Transcript 'build\nodetest-ccjob-b.log'
+
+    Check $a 'cc: wrote' 'ccjob-board-compiled-it'
+    # The name in the header, which is what the far node matches on.
+    Check $a 'loader: CLUJOB' 'ccjob-image-knows-its-own-name'
+    Check $a '2 nodes' 'ccjob-two-nodes-visible'
+
+    # What THE PROGRAM was told, not what the shell printed: a job that saw one
+    # node would run entirely here and every other check would still pass.
+    $pn = [regex]::Match($a, 'clujob: (\d+) node')
+    if (-not $pn.Success) {
+        Note $false 'ccjob-program-saw-the-cluster' 'no "clujob: N node(s)" line'
+    } else {
+        Note ([int]$pn.Groups[1].Value -ge 2) 'ccjob-program-saw-the-cluster' `
+            ("{0} nodes" -f $pn.Groups[1].Value)
+    }
+    $pt = [regex]::Match($a, 'clujob: (\d+) thread')
+    if (-not $pt.Success) {
+        Note $false 'ccjob-threads-spread' 'no "clujob: N thread(s)" line'
+    } else {
+        Note ([int]$pt.Groups[1].Value -ge 2) 'ccjob-threads-spread' `
+            ("{0} threads" -f $pt.Groups[1].Value)
+    }
+
+    # THE claim.  B is running an image that did not exist an hour ago and that
+    # B has never held a copy of: it was compiled on A, on A's own card.
+    Check $b 'loader: CLUJOB' 'ccjob-far-kernel-ran-what-a-cc-wrote'
+    Check $b 'serving a job' 'ccjob-far-node-served'
+
+    # The two sums, read here rather than taken on the program's word - a
+    # branch that was never reached cannot print a verdict, but it also cannot
+    # print two numbers.
+    $s1 = [regex]::Match($a, 'clujob: here\s+\d+ blocks, sum ([0-9a-f]{8})')
+    $s2 = [regex]::Match($a, 'clujob: spread\s+(\d+) blocks, sum ([0-9a-f]{8})')
+    if (-not ($s1.Success -and $s2.Success)) {
+        Note $false 'ccjob-both-sums-printed' 'one of the two sums is missing'
+    } else {
+        Note ($s1.Groups[1].Value -eq $s2.Groups[2].Value) `
+            'ccjob-same-answer-as-one-core' `
+            ("{0} here, {1} spread over {2} blocks" -f $s1.Groups[1].Value,
+             $s2.Groups[2].Value, $s2.Groups[1].Value)
+    }
+    Check $a 'clujob: answers agree' 'ccjob-program-agrees-too'
 }
 
 # ------------------------------------------------- unloading, on one node ---
