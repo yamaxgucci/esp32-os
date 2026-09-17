@@ -186,6 +186,42 @@ ag_err_t ag_standby_fetch(void)
     return e;
 }
 
+/*
+ * THE WATCHER IS SMALL; THE HANDOVER IS BIG AND SHORT-LIVED.
+ *
+ * Watching costs nothing - a walk of the process table once a second - but
+ * handing over can end in starting a program again HERE, which runs the whole
+ * loader and filesystem stack and wants eight kilobytes.  Giving the watcher
+ * that permanently cost the CYD eight kilobytes it does not have: with the
+ * watcher enabled the board had 2836 bytes of arena left and every program
+ * after it failed with -12, including ones the neighbour had asked for.
+ *
+ * So the watcher keeps a small stack and, when it decides, starts a task that
+ * exists for the length of one handover.
+ */
+static ag_port_task_t s_hand_task;
+
+static void handover_task(void *arg)
+{
+    (void)arg;
+    (void)ag_standby_handover();
+    s_quiet_since = now_ms();
+    s_hand_task = NULL;
+    ag_port_task_delete(NULL);
+}
+
+static void handover_soon(void)
+{
+    if (s_hand_task != NULL) {
+        return;
+    }
+    if (!ag_port_task_create(handover_task, "ag_handover", 8192, NULL, 1, 0, 0,
+                             &s_hand_task)) {
+        ag_log(AG_LOG_ERROR, TAG, "no task to hand the work over with");
+        s_quiet_since = now_ms();
+    }
+}
+
 static void standby_task(void *arg)
 {
     (void)arg;
@@ -217,11 +253,10 @@ static void standby_task(void *arg)
         if ((uint32_t)(now_ms() - s_quiet_since) < s_after_s * 1000u) {
             continue;
         }
-        (void)ag_standby_handover();
-        /* Whether it worked or not, do not ask again immediately: a board
-         * with nothing movable would otherwise sweep its whole process list
-         * every second for as long as it stays quiet. */
-        s_quiet_since = now_ms();
+        /* Whether it works or not, the quiet clock restarts when that task
+         * finishes: a board with nothing movable would otherwise sweep its
+         * whole process list every second for as long as it stays quiet. */
+        handover_soon();
     }
 }
 
@@ -247,7 +282,9 @@ ag_err_t ag_standby_start(void)
     /* Priority 1, below every application, for the reason the link's reader
      * is: a watcher that can interrupt the work it is watching would change
      * the answer by asking the question. */
-    if (!ag_port_task_create(standby_task, "ag_standby", 3072, NULL, 1, 0, 0,
+    /* Small: this task only walks the process table.  The handover it decides
+     * on runs on a task of its own - see handover_soon(). */
+    if (!ag_port_task_create(standby_task, "ag_standby", 2560, NULL, 1, 0, 0,
                              &s_task)) {
         ag_log(AG_LOG_ERROR, TAG, "no task; standby is off");
         return -AG_ENOMEM;

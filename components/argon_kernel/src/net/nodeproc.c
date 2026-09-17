@@ -236,7 +236,17 @@ static void start_return_task(void)
     if (s_guest_pid == 0 || s_return_task != NULL) {
         return;
     }
-    if (!ag_port_task_create(return_task, "ag_nphome", 3072, NULL, 1, 0, 0,
+    /*
+     * EIGHT KILOBYTES, for the reason the link's reader needed them.
+     *
+     * Sending a guest home can end in starting it again HERE - when the board
+     * that asked for it cannot take it - and starting a program goes down
+     * through the loader into the filesystem, which is exactly the depth that
+     * overflowed 4 KB next door and took the whole board with it.  It did the
+     * same here: the C3 panicked and rebooted, twice, in the one path meant to
+     * stop work being lost.
+     */
+    if (!ag_port_task_create(return_task, "ag_nphome", 8192, NULL, 1, 0, 0,
                              &s_return_task)) {
         ag_log(AG_LOG_ERROR, "node", "no task to send the guest home");
     }
@@ -667,6 +677,34 @@ ag_err_t ag_nodeproc_run_state(const char *cmdline, const void *state,
     }
     if (s_busy_reply) {
         return -AG_EBUSY;
+    }
+    /*
+     * A HANDOVER THAT ENDED INSTEAD OF STARTING IS A FAILED HANDOVER.
+     *
+     * For a plain remote run, ending IS the answer and its code belongs to the
+     * caller - that is the branch below.  For a migration it is the opposite:
+     * the program was supposed to be running over there, and what came back
+     * instead was an exit.  Reporting AG_OK for that said "moved" about a
+     * program that had ceased to exist: it had already ended here, it never
+     * started there, and both boards were satisfied.
+     *
+     * Seen on the bench the day the standby watcher started asking for its
+     * work back by itself.  The far board was out of memory - "no memory for a
+     * 16384 byte task stack" - and the near one logged "moved to node0 with 12
+     * bytes of state" in the same second.
+     */
+    if (want_started) {
+        if (exit_code != NULL) {
+            *exit_code = s_code;
+        }
+        /*
+         * The far node's own reason when it gave one - a failed load arrives
+         * as its negative error, which is the case worth seeing (-12 when the
+         * board is full).  A non-negative code means the program ran and
+         * exited without ever taking the state it was sent, so it is not the
+         * program we handed over: -AG_EINTR, the handover was cut short.
+         */
+        return (s_code < 0) ? (ag_err_t)s_code : -AG_EINTR;
     }
     if (exit_code != NULL) {
         *exit_code = s_code;

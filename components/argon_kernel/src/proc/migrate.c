@@ -240,12 +240,63 @@ ag_err_t ag_migrate_away(ag_pid_t pid, uint32_t timeout_ms)
     ag_log(AG_LOG_INFO, TAG, "sending %u bytes and '%s'",
            (unsigned)s_state_len, line);
     int32_t        code = 0;
-    const ag_err_t e = ag_nodeproc_run_state(line, s_state, s_state_len,
+    ag_err_t e = ag_nodeproc_run_state(line, s_state, s_state_len,
                                              timeout_ms, &code);
     ag_migrate_done();
+    /*
+     * `code` counts as much as `e`.  The far node reports a program that would
+     * not load as an exit with its reason, and reading only the call's return
+     * value made "it is running over there" the answer to "it could not be
+     * started over there".
+     */
+    if (e == AG_OK && code < 0) {
+        e = (ag_err_t)code;
+    }
     if (e != AG_OK) {
+        /*
+         * IT DID NOT START THERE, SO IT CARRIES ON HERE.
+         *
+         * The program consented and ended, and its state is still in hand -
+         * nothing has been given away.  Dropping it at this point destroyed
+         * the work for a reason that has nothing to do with the program: the
+         * far board was full.  That was survivable while a handover was
+         * something a person typed; the standby watcher asks for its work
+         * back on its own, and a board that had filled up in the meantime
+         * turned "fetch my job" into "lose my job".
+         *
+         * Started fresh from its own last checkpoint, which is exactly what
+         * it would have got on the other board.  A program that cannot be
+         * restarted here either has lost nothing more than it already had.
+         */
         ag_log(AG_LOG_ERROR, TAG, "%s did not start over there: %d", path,
                (int)e);
+        ag_migrate_arriving(s_state, s_state_len);
+        char    *argv0 = path;
+        ag_pid_t back = 0;
+        /*
+         * IN THE BACKGROUND AND WITH NO SESSION, both deliberate.
+         *
+         * This runs on whatever task asked for the handover, and one of those
+         * is the link's own return task, which has no session of its own -
+         * binding a slot from there is not a thing that can be done.  And a
+         * program that quietly took the keyboard back because a handover it
+         * never asked for had failed would be a worse surprise than a program
+         * that carries on where nobody is looking.  Its work survives, which
+         * is the whole reason for this path.
+         */
+        const ag_err_t r = ag_proc_spawn(path, 1, &argv0,
+                                         (uint32_t)AG_SPAWN_BACKGROUND |
+                                             (uint32_t)AG_SPAWN_NO_SESSION,
+                                         &back);
+        if (r == AG_OK) {
+            ag_log(AG_LOG_WARN, TAG,
+                   "%s carries on here instead, from its own checkpoint", path);
+        } else {
+            ag_log(AG_LOG_ERROR, TAG,
+                   "%s could not be restarted here either (%d) - its work is "
+                   "gone",
+                   path, (int)r);
+        }
         return e;
     }
     ag_log(AG_LOG_INFO, TAG, "%s moved to %s with %u bytes of state", path,
