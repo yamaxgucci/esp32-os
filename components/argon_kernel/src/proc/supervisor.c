@@ -28,6 +28,7 @@
 #include "proc/proc_internal.h"
 
 #include <argon/port/fault.h>
+#include <argon/port/mem.h>
 #include <argon/port/time.h>
 #include <argon/port/wifi.h>
 #include <argon/port/task.h>
@@ -86,8 +87,12 @@ void ag_supervisor_kill_request(ag_pid_t pid)
     }
 }
 
+static volatile bool s_explain_stop;
+
 static void request_soft_interrupt(ag_event_t *ev)
 {
+    ag_log(AG_LOG_INFO, "supervisor", "stop key: foreground pid %u, slot %d",
+           (unsigned)ag_proc_foreground(), ag_session_focused());
     if (ag_proc_foreground() != AG_PID_KERNEL) {
         s_interrupt_request = true;
         if (s_task != NULL) {
@@ -96,6 +101,46 @@ static void request_soft_interrupt(ag_event_t *ev)
         ev->type = AG_EV_QUIT;
     } else {
         s_shell_interrupt = true;
+        /*
+         * And if the thing the person is trying to stop is somewhere else.
+         *
+         * Ctrl+C belongs to the shell in front of you.  With the system shell
+         * in front of you and an application in a slot, it cancels the empty
+         * line you were not typing and the application carries on - correctly,
+         * and completely silently, which is how an evening goes on being spent
+         * pressing it.  Deciding here and printing on the supervisor's task,
+         * like everything else this function touches.
+         */
+        if (ag_proc_count() > 0u) {
+            s_explain_stop = true;
+            if (s_task != NULL) {
+                ag_port_notify_give(s_task);
+            }
+        }
+    }
+}
+
+/* What is running, where, and the two ways to reach it. */
+static void explain_how_to_stop(void)
+{
+    ag_session_slot_t slots[AG_SESSION_SLOTS];
+    ag_session_info(slots);
+    bool said = false;
+    for (int i = 0; i < AG_SESSION_SLOTS; i++) {
+        if (slots[i].pid == AG_PID_KERNEL) {
+            continue;
+        }
+        ag_console_printf(
+            "%s (pid %u) is running in slot %d: Alt+%d goes to it, "
+            "Ctrl+\\ twice stops it\n",
+            slots[i].name[0] ? slots[i].name : "an application",
+            (unsigned)slots[i].pid, ag_session_display_number(i),
+            ag_session_display_number(i));
+        said = true;
+    }
+    if (!said) {
+        ag_console_puts("nothing is running in a slot; Ctrl+\\ twice stops "
+                        "the last application\n");
     }
 }
 
@@ -167,6 +212,16 @@ static void interrupt_foreground(void)
         (void)ag_proc_signal(fg);
     }
 }
+
+/*
+ * What counts as starving: the largest block the board could still
+ * hand out.  Sixteen kilobytes because that is the floor the phone
+ * link refuses visitors below, measured by HTTPD.AXE before it -
+ * under it the board is reachable in name only.  Free total is the
+ * wrong number here and has been before: a board can show seventy
+ * kilobytes free and refuse a twenty-five kilobyte image.
+ */
+#define AG_SUP_STARVED_BYTES (16u * 1024u)
 
 /*
  * The crash record on disk.  Written here rather than where the crash happened:
@@ -258,6 +313,10 @@ static void supervisor_task(void *arg)
             s_interrupt_request = false;
             interrupt_foreground();
         }
+        if (s_explain_stop) {
+            s_explain_stop = false;
+            explain_how_to_stop();
+        }
         if (s_stop_request) {
             s_stop_request = false;
             if (ag_session_enter_system()) {
@@ -315,6 +374,7 @@ static void supervisor_task(void *arg)
          */
         {
             static int64_t s_ap_checked_us;
+            static int64_t s_ap_raised_us;
             const int64_t  now = ag_port_us();
 
             if (now - s_ap_checked_us >= 600000000) {
@@ -322,7 +382,57 @@ static void supervisor_task(void *arg)
                 ag_port_wifi_ap_status_t ap;
                 if (ag_port_wifi_ap_status(&ap) == AG_OK && ap.on &&
                     ap.clients == 0u) {
+                    s_ap_raised_us = now;
                     (void)ag_port_wifi_ap_refresh();
+                }
+            }
+
+            /*
+             * And the other reason to re-raise it: the board is starving and
+             * nothing of ours is holding the memory.
+             *
+             * Measured on the CYD, and reproducible in half a minute.  A
+             * client that stops reading - a browser tab closed, a program
+             * killed with its socket left open - leaves the radio holding
+             * about forty kilobytes that nothing gives back.  Not the driver:
+             * it drops the connection and frees its buffers, and the number
+             * does not move.  Not the sockets: closing them does not move it
+             * either, and it survives the station leaving, the point sitting
+             * with no clients at all, and five minutes of waiting.  What does
+             * move it is re-issuing the point's configuration: 13 KB free and
+             * 6 as the largest block, then 55 and 44 ten seconds later.
+             *
+             * Below sixteen kilobytes the phone link refuses every visitor,
+             * because accepting one with no memory aborts the board.  So the
+             * end of it is a board with a network, a listener and a page it
+             * will not serve to anybody, for as long as it is left on - which
+             * is how this was found, on a board that had been up for hours.
+             *
+             * Only with nothing loaded, which is what makes this safe.  A
+             * board down to five kilobytes with the file manager up is a board
+             * whose memory is accounted for, and bouncing the point under a
+             * person who is using it would be the cure being worse.  With no
+             * application at all the memory belongs to something below us, and
+             * this is the one thing measured to return it.
+             *
+             * Not the cause, and it does not pretend to be.  The cause is
+             * somewhere in the radio's own buffers and is not ours to see from
+             * here.  This is the board getting itself back, which is the
+             * difference between a fault and a fault that ends the day.
+             */
+            if (now - s_ap_raised_us >= 120000000) {
+                const size_t largest =
+                    ag_port_mem_largest(AG_MEM_FAST | AG_MEM_BYTE);
+                if (largest < AG_SUP_STARVED_BYTES && ag_proc_count() == 0u) {
+                    ag_port_wifi_ap_status_t ap;
+                    if (ag_port_wifi_ap_status(&ap) == AG_OK && ap.on) {
+                        s_ap_raised_us = now;
+                        ag_log(AG_LOG_WARN, "supervisor",
+                               "starving with nothing loaded (%u bytes as the "
+                               "largest block); raising the point again",
+                               (unsigned)largest);
+                        (void)ag_port_wifi_ap_refresh();
+                    }
                 }
             }
         }

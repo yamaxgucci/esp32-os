@@ -86,6 +86,12 @@ class Report:
         return 1 if bad else 0
 
 
+def client_ran_out(out):
+    """A client that could not start is not an answer about the server."""
+    m = re.search(r"loading with (\d+) free, largest (\d+)", out)
+    return bool(m) and int(m.group(2)) < 16384
+
+
 def note_if_unlinked(rep, out, what):
     """A run that never connected fails every check made of it, and the
     failure says nothing about the thing being checked.  Say which it was."""
@@ -176,6 +182,20 @@ def main():
     sv = Board(args.server) if args.server else None
 
     try:
+        # Both boards, not just the one under test.
+        #
+        # The client is a fixture too, and it wears out: after fifty-odd runs
+        # of PHONECL it was down to eighteen kilobytes free and eight as its
+        # largest block, and every check after that failed with the board under
+        # test in perfect health.  "The page will not load" from a client that
+        # cannot start its own program is the most expensive kind of wrong
+        # answer, because it points at the wrong board.
+        print("(resetting the client board)")
+        cl.s.rts = True
+        time.sleep(0.15)
+        cl.s.rts = False
+        cl.pump(12)
+        cl.send("", 1)
         cl.user_slot()
 
         # Start from a board that has just booted.
@@ -283,6 +303,79 @@ def main():
         rep.check("an idle screen still repairs itself",
                   bool(m) and int(m.group(1)) >= 20,
                   (m.group(1) + " rows in 12 s") if m else "no hold line")
+
+        print("an application that will not stop talking:")
+        # The evening's first fault, and the one that hid the rest.
+        #
+        # SPIN prints without pause.  With the announcement printed before the
+        # focus was taken, the shell's own line queued behind the application's
+        # output - eight seconds, measured - and for those eight seconds there
+        # was a running application in a focused slot and no foreground
+        # process, so Ctrl+C reached nothing.  From the keyboard: a program
+        # that cannot be stopped.
+        if sv:
+            sv.s.write(b"\x1b1")            # a user slot; run refuses elsewhere
+            sv.s.flush()
+            sv.pump(1.5)
+            sv.send("run c:\\spin.axe", 5)
+            out = run_client(cl, args, "-wait 1200 -key ctrl+c -wait 3000", 35)
+            rep.check("a printing application takes Ctrl+C over the link",
+                      "linked to" in out)
+            # Asked of ps.  Counting what still arrives does not answer it:
+            # an application printing twelve thousand characters a second
+            # leaves a queue behind it, and the queue goes on draining for
+            # seconds after the application is gone - 6803 characters of it,
+            # which failed this check while the application was already dead.
+            sv.s.write(b"\x1c")
+            sv.s.flush()
+            sv.pump(2)
+            before = len(sv.text())
+            sv.send("ps", 5)
+            rep.check("and the application is gone",
+                      "SPIN" not in sv.text()[before:])
+            tidy(sv)
+
+        print("a client that vanishes:")
+        # The second, and the reason a board left alone stopped answering.
+        #
+        # A client killed with its socket still open reads nothing and
+        # acknowledges nothing.  The radio then holds about forty kilobytes
+        # that the driver, the sockets and five minutes of waiting do not
+        # return, and below sixteen the link refuses every visitor - so the
+        # board keeps its network and never serves a page again.  The
+        # supervisor re-raises the point when it is starving with nothing
+        # loaded; this asks whether that got the board back.
+        cl.s.write(b"\x1b1")
+        cl.s.flush()
+        cl.pump(1.2)
+        cl.send("run c:\\phonecl.axe %s -pass %s -hold 600"
+                % (args.ip, args.password), 14)
+        cl.s.write(b"\x1c")                  # kill it where it stands
+        cl.s.flush()
+        time.sleep(0.3)
+        cl.s.write(b"\x1c")
+        cl.s.flush()
+        cl.pump(6)
+        cl.user_slot()                      # killed from the system shell
+        if sv:
+            sv.pump(90)                     # the supervisor's own pace
+            sv.s.write(b"\x1c")
+            sv.s.flush()
+            sv.pump(1.5)
+            before = len(sv.text())
+            sv.send("mem", 2.5)
+            m = re.search(r"internal +\d+K +(\d+)K +(\d+)K",
+                          sv.text()[before:])
+            largest = int(m.group(2)) if m else 0
+            rep.check("the board gets its memory back", largest >= 16,
+                      "%u KB as the largest block" % largest)
+        out = run_client(cl, args, "-get", 30)
+        if client_ran_out(out):
+            rep.check("and serves the page to the next visitor (the CLIENT "
+                      "board ran out of memory)", False,
+                      "reset it and run this again")
+        else:
+            rep.check("and serves the page to the next visitor", "200 OK" in out)
 
         if args.hold:
             print("staying connected:")

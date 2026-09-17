@@ -1051,16 +1051,25 @@ static int spawn_in_slot(const char *path, int argc, char **argv,
     }
 
     const int slot = ag_session_slot_of(pid);
-    ag_console_printf("started pid %u in slot %d (loading)\n", (unsigned)pid,
-                      slot >= 0 ? ag_session_display_number(slot) : -1);
 
     /*
      * Focus the new app only if the user stayed on the launch slot.  Alt+N
      * during a long load must not yank them back from another slot.
+     *
+     * Before the line that announces it, and that order is load-bearing.  An
+     * application that starts printing at once fills the console, and the
+     * announcement then waits its turn - measured at eight seconds on the CYD
+     * with an application printing twelve thousand characters a second.  With
+     * the focus taken after it, those eight seconds are a running application
+     * in a focused slot with no foreground process, so Ctrl+C reaches nothing
+     * and the board looks like it is ignoring the keyboard.  It was.
      */
     if (!detach_only && slot >= 0 && ag_session_focused() == target_slot) {
         (void)ag_session_focus(slot);
     }
+
+    ag_console_printf("started pid %u in slot %d (loading)\n", (unsigned)pid,
+                      slot >= 0 ? ag_session_display_number(slot) : -1);
     return 0;
 }
 

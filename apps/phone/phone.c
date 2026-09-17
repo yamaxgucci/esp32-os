@@ -288,6 +288,11 @@ static struct {
     ag_handle_t conn;    /* an upgraded WebSocket, or -1                    */
     ag_handle_t closing; /* answered, waiting to be hung up - see defer_close */
     uint64_t    closing_until;
+    /*
+     * When this client last proved it was there - a byte read from it,
+     * or a message it actually took.  See LINK_SILENT_US.
+     */
+    uint64_t    last_life_us;
     volatile bool     up;
     volatile bool     owe_everything;
     /*
@@ -447,12 +452,55 @@ typedef enum {
  */
 #define SEND_START_MS 30u
 
+/*
+ * And how long a message already begun may go with nothing moving.
+ *
+ * Measured on the board, in the journal of the evening this was found:
+ * "send stalled at 47 of 85 after 10000 ms", and beside it "worst stage 6 took
+ * 10002121 us".  Ten seconds inside one write - and the accept that lets a
+ * phone load the page is in the same loop, so for those ten seconds the board
+ * had a network, a listener, and no way to answer anybody.
+ *
+ * The window is idle time, not total time: every byte the peer takes puts it
+ * back.  So a slow phone on a weak signal is never cut off however long its
+ * screen takes to arrive, and a phone that has stopped taking bytes at all is
+ * let go after two seconds instead of ten.  Two seconds of a peer accepting
+ * nothing, on a link where the two ends are in the same room, is a peer that
+ * has gone; it will open another socket when it comes back, and the newest
+ * upgrade wins anyway.
+ */
+#define SEND_IDLE_MS 2000u
+
+/*
+ * And how long a client may prove nothing at all before it is let go.
+ *
+ * A phone that is merely idle is not silent: the repair sweep sends it
+ * a row several times a second and the row goes, so the clock below is
+ * reset by the ordinary working of the link.  What resets nothing is a
+ * peer whose window shut and never opened - the program behind it gone,
+ * the socket still open on its board.  Then every send stalls at its
+ * first byte, a stall is not a failure, and the connection is held for
+ * as long as the board runs.  Measured: 830 seconds and counting, with
+ * the beat cheerfully reporting conn=1895825409 the whole time.
+ *
+ * It matters more than one stuck socket, because one client is all
+ * there is: while that connection is held nobody else is served, and
+ * the memory floor then refuses the new visitor who would have replaced
+ * it.  The board keeps its network, keeps its listener, and can never
+ * be reached again - which is exactly how this was found.
+ *
+ * Thirty seconds: long enough that a phone in a pocket, a lift or a
+ * screen lock comes back to the same session, short enough that nobody
+ * waits for a board twice.
+ */
+#define LINK_SILENT_US 30000000ull
+
 static wire_t send_all(ag_handle_t h, const void *buf, uint32_t len,
-                       uint32_t deadline_ms)
+                       uint32_t idle_ms)
 {
     const uint8_t *p = (const uint8_t *)buf;
     uint32_t       at = 0;
-    const uint64_t until = ag_micros() + (uint64_t)deadline_ms * 1000ull;
+    uint64_t       until = ag_micros() + (uint64_t)idle_ms * 1000ull;
     /*
      * Which "try again" it was, kept for the line below.  EAGAIN and ENOMEM
      * clear the same way and so are handled the same, but they mean opposite
@@ -483,6 +531,8 @@ static wire_t send_all(ag_handle_t h, const void *buf, uint32_t len,
         const int32_t n = ag_net_send(h, p + at, len - at);
         if (n > 0) {
             at += (uint32_t)n;
+            /* Progress, so the clock starts again: see SEND_IDLE_MS. */
+            until = ag_micros() + (uint64_t)idle_ms * 1000ull;
             continue;
         }
         if (n == -AG_EAGAIN) {
@@ -516,8 +566,9 @@ static wire_t send_all(ag_handle_t h, const void *buf, uint32_t len,
         }
         if (ag_micros() > until) {
             ag_log(AG_LOG_WARN, "phone",
-                   "send stalled at %u of %u after %u ms: %u window, %u no-buffer",
-                   (unsigned)at, (unsigned)len, (unsigned)deadline_ms, again,
+                   "send stalled at %u of %u, nothing moved for %u ms: "
+                   "%u window, %u no-buffer",
+                   (unsigned)at, (unsigned)len, (unsigned)idle_ms, again,
                    nomem);
             if (at == 0u) {
                 return WIRE_STALL; /* nothing started; nothing broken */
@@ -571,7 +622,7 @@ static wire_t send_all(ag_handle_t h, const void *buf, uint32_t len,
 #define WS_SLACK 11u
 
 static wire_t ws_send(uint8_t op, void *payload, uint32_t len,
-                      uint32_t deadline_ms, uint32_t lock_ms)
+                      uint32_t idle_ms, uint32_t lock_ms)
 {
     if (s.conn < 0) {
         return WIRE_GONE;
@@ -601,7 +652,7 @@ static wire_t ws_send(uint8_t op, void *payload, uint32_t len,
     if (s.wire != NULL && !TASK->mutex_lock(s.wire, lock_ms)) {
         return WIRE_STALL;
     }
-    const wire_t r = send_all(s.conn, p - (n + 1u), n + 1u + len, deadline_ms);
+    const wire_t r = send_all(s.conn, p - (n + 1u), n + 1u + len, idle_ms);
     if (s.wire != NULL) {
         TASK->mutex_unlock(s.wire);
     }
@@ -615,6 +666,7 @@ static wire_t ws_send(uint8_t op, void *payload, uint32_t len,
         s.hush_until = (uint64_t)ag_micros() + 100000ull;
     } else if (r == WIRE_OK) {
         s.hush_until = 0u;
+        s.last_life_us = (uint64_t)ag_micros();
     }
     return r;
 }
@@ -670,6 +722,7 @@ static void drop_conn(const char *why)
         s.out = NULL;
         s.want_pixels = false;
     }
+    s.last_life_us = 0u;
     if (s.conn >= 0) {
         (void)ag_net_close(s.conn);
         s.conn = -1;
@@ -812,7 +865,7 @@ static wire_t send_info(void)
     p[6] = (uint8_t)s.cell_w;
     p[7] = (uint8_t)s.cell_h;
     p[8] = s.publish_text ? INFO_HAS_TEXT : 0u;
-    return ws_send(OP_INFO, p, 9u, 10000u, 3000u);
+    return ws_send(OP_INFO, p, 9u, SEND_IDLE_MS, 3000u);
 }
 
 static wire_t send_text_row(uint16_t row)
@@ -831,7 +884,7 @@ static wire_t send_text_row(uint16_t row)
     unlock();
 
     const wire_t r =
-        ws_send(OP_ROW, p, 2u + (uint32_t)count * 2u, 10000u, 3000u);
+        ws_send(OP_ROW, p, 2u + (uint32_t)count * 2u, SEND_IDLE_MS, 3000u);
     /* Marked clean only once it has gone.  A row cleared before the send is a
      * row lost for good when the board was momentarily out of memory. */
     if (r == WIRE_OK) {
@@ -855,7 +908,7 @@ static wire_t send_cursor(void)
     p[4] = s.cur_visible ? 1u : 0u;
     unlock();
 
-    const wire_t r = ws_send(OP_CURSOR, p, 5u, 10000u, 3000u);
+    const wire_t r = ws_send(OP_CURSOR, p, 5u, SEND_IDLE_MS, 3000u);
     if (r == WIRE_OK) {
         lock();
         s.cur_dirty = false;
@@ -876,7 +929,7 @@ static wire_t send_cursor(void)
  */
 /* Encode whatever is in s.band and put it on the wire.  Both paths end here. */
 static wire_t encode_and_send(uint32_t x, uint32_t y, uint32_t w, uint32_t h,
-                              uint32_t deadline_ms, uint32_t lock_ms)
+                              uint32_t idle_ms, uint32_t lock_ms)
 {
     /* s.out is allocated with WS_SLACK bytes in front for ws_send's header. */
     uint8_t       *body = s.out + WS_SLACK;
@@ -893,7 +946,7 @@ static wire_t encode_and_send(uint32_t x, uint32_t y, uint32_t w, uint32_t h,
     put16(body + 2, y);
     put16(body + 4, w);
     put16(body + 6, h);
-    return ws_send(op, body, BAND_HDR + len, deadline_ms, lock_ms);
+    return ws_send(op, body, BAND_HDR + len, idle_ms, lock_ms);
 }
 
 static wire_t send_band(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
@@ -915,7 +968,7 @@ static wire_t send_band(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
     }
     unlock();
 
-    return encode_and_send(x, y, w, h, 10000u, 3000u);
+    return encode_and_send(x, y, w, h, SEND_IDLE_MS, 3000u);
 }
 
 /*
@@ -1065,7 +1118,7 @@ static bool service_client(void)
             uint8_t buf[WS_SLACK + NONCE_LEN];
             memcpy(buf + WS_SLACK, s.nonce, NONCE_LEN);
             const wire_t r =
-                ws_send(OP_AUTH, buf + WS_SLACK, NONCE_LEN, 10000u,
+                ws_send(OP_AUTH, buf + WS_SLACK, NONCE_LEN, SEND_IDLE_MS,
                         3000u);
             if (r == WIRE_GONE) {
                 return false;
@@ -1441,6 +1494,7 @@ static bool pump_client(void)
             return false;
         }
         have += (uint32_t)n;
+        s.last_life_us = (uint64_t)ag_micros();
 
         for (;;) {
             ag_ws_hdr_t h;
@@ -1691,7 +1745,7 @@ static void serve_page(ag_handle_t h)
             if (got <= 0) {
                 break;
             }
-            const wire_t w = send_all(h, buf, (uint32_t)got, 10000u);
+            const wire_t w = send_all(h, buf, (uint32_t)got, SEND_IDLE_MS);
             if (w != WIRE_OK) {
                 /*
                  * Said, not swallowed.  A page that stops halfway is a blank
@@ -1780,6 +1834,7 @@ static bool serve_request(ag_handle_t h)
         ws_close("replaced");
         drop_conn("replaced");
         s.conn = h;
+        s.last_life_us = (uint64_t)ag_micros();
         s.authed = false;
         s.challenged = false;
         s.owe_everything = true;
@@ -2124,6 +2179,16 @@ static void phone_task(void *arg)
 
         if (s.conn < 0) {
             TASK->sleep_ms(50u);
+            continue;
+        }
+        /*
+         * A client that has proved nothing for half a minute.  Not an
+         * error anywhere - every call returned what it should - which
+         * is why nothing else in this loop can see it.
+         */
+        if (s.last_life_us != 0u &&
+            (uint64_t)ag_micros() - s.last_life_us > LINK_SILENT_US) {
+            drop_conn("silent for 30 s");
             continue;
         }
         stage_enter(5);
