@@ -54,7 +54,7 @@ int ag_main(void)
      * is our own state, saved by the copy of us that used to be somewhere
      * else.
      */
-    int got = ag_migrate_restore(&s, 12);
+    int got = ag_migrate_restore(&s, sizeof(s));
     if (got < 0) {
         ag_print("migrant: the state that arrived is not mine\n");
         return 1;
@@ -86,7 +86,7 @@ int ag_main(void)
          */
         if (ag_migrate_wanted()) {
             ag_printf("migrant: handing over at %d\n", s.count);
-            ag_migrate_save(&s, 12);
+            ag_migrate_save(&s, sizeof(s));
             return 0;
         }
     }

@@ -1618,6 +1618,12 @@ typedef struct {
     char    name[MAX_NAME];
     int     off;
     int     nwords;
+    /*
+     * And the exact byte count, which nwords cannot answer: it is rounded up
+     * to a word, so `char b[5]` stores 2 and `sizeof b` must say 5.  Kept for
+     * sizeof alone - everything else works in words or in elements.
+     */
+    int     nbytes;
     ptype_t t;
 } sym_t;
 
@@ -2188,6 +2194,7 @@ static int add_local_t(gen_t *g, const char *name, const ptype_t *t, int nelem)
     cpy_err(g->locals[i].name, MAX_NAME, name);
     g->locals[i].off = SPILL_BYTES + g->local_words * 4;
     g->locals[i].nwords = nwords;
+    g->locals[i].nbytes = sym_bytes(g, t, nelem);
     g->locals[i].t = *t;
     g->local_words += nwords;
     return i;
@@ -2222,6 +2229,7 @@ static int add_global_t(gen_t *g, const char *name, const ptype_t *t, int nelem)
     cpy_err(g->globals[i].name, MAX_NAME, name);
     g->globals[i].off = g->data_next;
     g->globals[i].nwords = (bytes + 3) / 4;
+    g->globals[i].nbytes = bytes;
     g->globals[i].t = *t;
     g->data_next += bytes;
     return i;
@@ -3525,12 +3533,41 @@ static void parse_sizeof(par_t *p)
 {
     expect(p, T_LPAREN, "expected '(' after sizeof");
     type_t ty;
-    if (!accept_type(p, &ty)) {
+    int    bytes = -1;
+    if (accept_type(p, &ty)) {
+        bytes = sizeof_type_bytes(p, &ty);
+    } else if (p->L->tok == T_IDENT) {
+        /*
+         * `sizeof(s)` on a NAME, which is how a program asks for the size of
+         * the thing it is about to hand over rather than repeating a number:
+         *
+         *     ag_migrate_save(&s, sizeof(s));
+         *
+         * The alternative is what apps/cc/examples/migrant.c had to write -
+         * a literal 12 beside a three-field struct - and a literal that has
+         * to be kept in step with a declaration is a bug with a date on it.
+         *
+         * Only a name, not an expression: the compiler has no typed tree to
+         * ask, and a `sizeof(a + b)` it could not answer honestly would be
+         * worse than one it refuses.
+         */
+        const int li = find_local(p->g, p->L->text);
+        const int gi = (li < 0) ? find_global(p->g, p->L->text) : -1;
+        if (li >= 0) {
+            bytes = p->g->locals[li].nbytes;
+        } else if (gi >= 0) {
+            bytes = p->g->globals[gi].nbytes;
+        } else {
+            pfail(p, "sizeof: not a type or a variable");
+            return;
+        }
+        lex_next(p->L);
+    } else {
         pfail(p, "expected type in sizeof");
         return;
     }
     expect(p, T_RPAREN, "expected ')'");
-    emit_movi(p->g, 8, sizeof_type_bytes(p, &ty));
+    emit_movi(p->g, 8, bytes);
     p->pesize = 0;
     p->puns = 0;
     p->psidx = -1;
@@ -4159,8 +4196,69 @@ static void parse_local_decl(par_t *p, const type_t *ty)
         return;
     }
     if (t.kind == PK_STRUCT) {
-        if (p->L->tok == T_ASSIGN) {
-            pfail(p, "cannot assign a whole struct");
+        if (p->L->tok != T_ASSIGN) {
+            return;
+        }
+        lex_next(p->L);
+        /*
+         * `struct v s = {1, 0, 0};` - AT A DECLARATION ONLY.
+         *
+         * Not struct assignment, which stays refused: `a = b` between two
+         * structs would be a copy this compiler has no instruction for and
+         * the reader no reason to expect.  This is a list of values written
+         * into the fields in declaration order, which is what a brace list
+         * means and all it means.
+         *
+         * Worth having because the alternative is what every program here had
+         * to write - three lines of `s.x = ...` where C says one - and
+         * because a field left out of that sequence is invisible, while a
+         * field left out of a brace list is zeroed by rule.
+         */
+        if (p->L->tok != T_LBRACE) {
+            pfail(p, "a struct is initialised with a brace list, "
+                     "and cannot be assigned");
+            return;
+        }
+        lex_next(p->L);
+        const int      si = t.sidx;
+        const struct_t *st = &p->g->structs[si];
+        const int      base = p->g->locals[idx].off;
+        int            fi = 0;
+        if (p->L->tok != T_RBRACE) {
+            for (;;) {
+                if (fi >= st->nfields) {
+                    pfail(p, "more values than the struct has fields");
+                    return;
+                }
+                const field_t *f = &st->fields[fi];
+                if (f->t.kind == PK_STRUCT || f->t.kind == PK_ARRAY) {
+                    pfail(p, "a nested struct or array cannot be given a "
+                             "value in a brace list");
+                    return;
+                }
+                parse_expr(p);
+                emit_store_sized(p->g, 8, 7, base + f->off, ty_store(&f->t),
+                                 9);
+                fi++;
+                if (!accept(p, T_COMMA)) {
+                    break;
+                }
+                /* `{1, 2,}` - a trailing comma is how a list is edited. */
+                if (p->L->tok == T_RBRACE) {
+                    break;
+                }
+            }
+        }
+        expect(p, T_RBRACE, "expected '}'");
+        /* What was left out is zero, which is what C promises and what makes
+         * `= {0}` mean "all of it". */
+        for (; fi < st->nfields; fi++) {
+            const field_t *f = &st->fields[fi];
+            if (f->t.kind == PK_STRUCT || f->t.kind == PK_ARRAY) {
+                continue; /* not reachable by a value above; left as it was */
+            }
+            emit_movi(p->g, 8, 0);
+            emit_store_sized(p->g, 8, 7, base + f->off, ty_store(&f->t), 9);
         }
         return;
     }

@@ -32,7 +32,10 @@ host toolchain (image name `CC.AXE`).
   or empty; step the same (no decl)
 - `switch` is an if-chain with fall-through; `break` leaves it (no `continue`)
 - `typedef` and `enum { A, B = 3 }` (enumerators are int constants); `const` /
-  `volatile` are accepted and ignored; `sizeof(type)` for known types
+  `volatile` are accepted and ignored; `sizeof(type)` for known types, and
+  `sizeof(name)` for a declared variable or array - exact, so `char b[5]` is 5.
+  Not `sizeof(expression)`: there is no typed tree to ask, and an answer it
+  could not give honestly would be worse than a refusal
 - Arrays and pointers: `a[i]`, `a[i] = expr`, `*p`, `*p = expr`, `&x`, `&a[i]`,
   `&func` (code address of a function already defined)
 - Structs: `struct v { int x; char tag; int a[4]; struct v *next; };` then
