@@ -83,7 +83,23 @@ static ag_err_t send_hello(uint8_t op)
         if (r != -AG_EAGAIN) {
             return (ag_err_t)r;
         }
-        ag_linkprov_poll(2);
+        /*
+         * DO NOT PUMP THE WIRE FROM THE TASK THAT PUMPS IT.
+         *
+         * The answer to a hello is sent from inside the handler, which runs on
+         * the link's reader task - so ag_linkprov_poll here re-enters the
+         * driver this task is already inside a recv() of.  The same trap
+         * nodeclu's wait_for_room is written around, and it cost a real
+         * symptom: the node that ANSWERED a hello never got its answer out, so
+         * one board knew its neighbour's name and the other went on calling it
+         * "node0" for ever.  Asking is sent from the shell task at bind time
+         * and was never affected, which is why the fault looked one-sided.
+         */
+        if (ag_linkprov_in_reader()) {
+            ag_port_task_delay(ag_port_ms_to_ticks(2));
+        } else {
+            ag_linkprov_poll(2);
+        }
     }
     return -AG_ETIMEDOUT;
 }
@@ -122,7 +138,19 @@ static void on_msg(uint8_t chan, const void *data, uint16_t n, void *ctx)
 
     if (b[0] == NH_ASK) {
         ag_node_set_peer_name(name);
-        (void)send_hello(NH_TELL); /* an answer, which nobody answers */
+        /*
+         * Said out loud when it fails.  This was `(void)` - an answer that
+         * never went out looked exactly like one that was never needed, and
+         * the only visible consequence was a node stuck calling its
+         * neighbour "node0", three layers away from here.
+         */
+        const ag_err_t e = send_hello(NH_TELL);
+        if (e != AG_OK) {
+            ag_log(AG_LOG_WARN, "hello",
+                   "could not answer %s's hello (%d); it will go on calling "
+                   "us by the wire's name",
+                   name, (int)e);
+        }
     } else if (b[0] == NH_TELL) {
         ag_node_set_peer_name(name);
     }

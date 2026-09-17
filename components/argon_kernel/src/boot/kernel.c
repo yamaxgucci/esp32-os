@@ -25,6 +25,7 @@
 #include <argon/shell.h>
 #include <argon/textpanel.h>
 
+#include <argon/nodeboot.h>
 #include <argon/port/time.h>
 #include <argon/port/task.h>
 #include <argon/port/uart.h>
@@ -285,6 +286,16 @@ static ag_err_t stage_modules(void)
      * the call does nothing.
      */
     apply_console_size();
+
+    /*
+     * The wire, if SYSTEM.CFG asked for one.  Here because the link driver is
+     * a loadable .SYS and has only just registered its device, and before
+     * AUTOEXEC because a board that is half of a cluster should come up as
+     * half of a cluster - the binding is lost on every reset, so leaving it to
+     * a line in a batch file lost it on every test that resets a board and on
+     * every power cut in the field.
+     */
+    ag_node_autobind();
     return err;
 }
 

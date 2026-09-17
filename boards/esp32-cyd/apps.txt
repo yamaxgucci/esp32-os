@@ -1,0 +1,16 @@
+# What goes on this board's C:, staged by tools\mksysfs.py.
+#
+# The rule that decides this list: a board carries the images its NEIGHBOUR
+# can execute as well as its own.  A cluster spanning two instruction sets
+# passes messages and shares devices without noticing the line, and code stops
+# at it dead - so MIGRANT travelling from here to the C3 arrives as an image
+# that board cannot run, and the C3 answers by finding its own build of the
+# same program (cluster.md 3b).  For that to work, each side needs both.
+#
+# Xtensa, for this board itself:
+GRIND32.AXE
+LINK32.AXE
+MIGRAN32.AXE
+NODEHI32.AXE
+# RISC-V, for the C3 next door to be handed:
+NODEHIRV.AXE

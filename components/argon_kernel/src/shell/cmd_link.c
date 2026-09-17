@@ -27,6 +27,7 @@
 #include <argon/noderdev.h>
 #include <argon/clu.h>
 #include <argon/kernel.h>
+#include <argon/nodeboot.h>
 #include <argon/nodeclu.h>
 #include <argon/nodeps.h>
 #include <argon/nodefs.h>
@@ -351,7 +352,17 @@ int ag_cmd_link(int argc, char **argv)
             ag_console_puts("usage: link use <dev>|none\n");
             return 1;
         }
-        const ag_err_t err = ag_linkprov_use(argv[2]);
+        /*
+         * A board told it is not in a cluster says so, rather than binding
+         * and then refusing everything one service at a time.
+         */
+        if (!ag_cluster_allowed()) {
+            ag_console_puts("this board is not in a cluster\n");
+            ag_console_puts("  [cluster] multiboard = none in SYSTEM.CFG "
+                            "says so; set it to yes to join one\n");
+            return 1;
+        }
+        const ag_err_t err = ag_node_bind(argv[2], true);
         if (err != AG_OK) {
             ag_console_printf("link use %s: %d\n", argv[2], (int)err);
             return 1;
@@ -370,68 +381,6 @@ int ag_cmd_link(int argc, char **argv)
         } else {
             ag_console_printf("link is %s\n", ag_linkprov_active());
         }
-        /*
-         * Start answering the other node.  Here rather than at boot, because
-         * before a link is bound there is nothing to answer on; and here rather
-         * than inside linkprov, because a wire should not have to know what a
-         * process is.
-         */
-        const ag_err_t serr = ag_nodeproc_start();
-        if (serr != AG_OK) {
-            ag_console_printf("  (not serving remote runs: %d)\n", (int)serr);
-        }
-        /*
-         * The standby watcher, here for the same reason as the rest: before a
-         * wire exists there is nowhere to hand work to.  It starts only if
-         * SYSTEM.CFG asked for it, so on every board that is not half of a
-         * fast-and-frugal pair this call does nothing at all.
-         */
-        (void)ag_standby_start();
-        const ag_err_t derr = ag_nodedev_start();
-        if (derr != AG_OK) {
-            ag_console_printf("  (not answering device listings: %d)\n",
-                              (int)derr);
-        }
-        const ag_err_t ferr = ag_nodefs_start();
-        if (ferr != AG_OK) {
-            ag_console_printf("  (not answering file fetches: %d)\n",
-                              (int)ferr);
-        }
-        /*
-         * Answer file requests from the moment a link exists, without waiting
-         * to be asked: the other node may mount us before we mount it, and a
-         * drive that appears only after both sides have run a command is a
-         * drive nobody can rely on.
-         */
-        const ag_err_t verr = ag_nodedrv_serve();
-        if (verr != AG_OK) {
-            ag_console_printf("  (not serving our card: %d)\n", (int)verr);
-        }
-        /* Names, before anything that has to be addressed by one. */
-        const ag_err_t herr = ag_nodehello_start();
-        if (herr != AG_OK) {
-            ag_console_printf("  (did not say hello: %d)\n", (int)herr);
-        }
-        const ag_err_t rerr = ag_noderdev_serve();
-        if (rerr != AG_OK) {
-            ag_console_printf("  (not serving our devices: %d)\n", (int)rerr);
-        }
-        const ag_err_t perr = ag_nodeps_serve();
-        if (perr != AG_OK) {
-            ag_console_printf("  (not answering `ps`: %d)\n", (int)perr);
-        }
-        /*
-         * And the job channel, from the moment a link exists.  A node that only
-         * starts listening once it has run something of its own would refuse
-         * the first job it is offered - and the neighbour has no way to tell
-         * that from "this board cannot do it".
-         */
-        const ag_err_t cerr = ag_nodeclu_start();
-        if (cerr != AG_OK) {
-            ag_console_printf("  (not taking threads of a job: %d)\n",
-                              (int)cerr);
-        }
-        return 0;
     }
 
     /*

@@ -1,0 +1,16 @@
+# What goes on this board's C:, staged by tools\mksysfs.py.  See the CYD's
+# apps.txt for the rule: each board carries what its neighbour can execute as
+# well as its own.
+#
+# RISC-V, for this board itself:
+DEVPOKRV.AXE
+GRINDRV.AXE
+LINKRV.AXE
+MIGRANRV.AXE
+NODEHIRV.AXE
+# TONE is here and not on the CYD on purpose: this board has no converter at
+# all, so a tone started here has to land on the neighbour's - which is what
+# the class default is for, and what the sound scenario checks.
+TONERV.AXE
+# Xtensa, for the CYD next door to be handed:
+NODEHI32.AXE

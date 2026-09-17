@@ -63,6 +63,7 @@ set(ARGON_KERNEL_SRCS
     "src/net/nodehello.c"
     "src/net/noderdev.c"
     "src/net/nodeps.c"
+    "src/net/nodeboot.c"
     "src/net/nodeclu.c"
     "src/net/nodestandby.c"
     "src/net/cluframe.c"

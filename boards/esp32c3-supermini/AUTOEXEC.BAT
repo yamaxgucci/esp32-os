@@ -1,7 +1,7 @@
-rem Bind the wire at boot.
+rem Nothing to do here any more.
 rem
-rem A board whose SYSTEM.CFG names it in the cluster and loads the wire
-rem driver still has to be TOLD to bind, and the binding is lost on every
-rem reset - so every test that resets a board loses it, and so does every
-rem power cut in the field.  Until the kernel does this for itself, here.
-link use node0
+rem Binding the wire used to be a line in this file, with a note saying it
+rem belonged in the kernel.  It does now: [link] bind in SYSTEM.CFG, done
+rem before this file is read, so a board that is half of a cluster comes up
+rem as half of a cluster - after a reset, after a power cut, and in every
+rem test that resets a board.

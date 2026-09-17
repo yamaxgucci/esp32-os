@@ -105,11 +105,35 @@ def stage(board_dir, apps_dir, out_dir, display=None, extra=(),
             shutil.copy2(src, os.path.join(out_dir, name))
             staged.append(name)
 
+        # Applications this board is supposed to carry, listed in apps.txt
+        # beside modules.txt.
+        #
+        # They used to be named on the command line with --add, every time, by
+        # whoever happened to be flashing the board.  That is a card whose
+        # contents live in somebody's shell history: the cluster pair needs
+        # five images on one board and seven on the other, chosen so that each
+        # carries what its NEIGHBOUR can execute, and getting one wrong shows
+        # up as a test failing for a reason that looks like the cluster.
+        # --add still works, for one-off files that are nobody's board.
+        appsfile = os.path.join(board_dir, "apps.txt")
+        if os.path.isfile(appsfile):
+            with open(appsfile, "r", encoding="utf-8") as f:
+                for line in f:
+                    image = line.strip()
+                    if not image or image.startswith("#"):
+                        continue
+                    src = os.path.join(apps_dir, image)
+                    if not os.path.isfile(src):
+                        raise SystemExit(
+                            f"mksysfs: {src} is missing - run "
+                            f"`argon apps --group board`")
+                    shutil.copy2(src, os.path.join(out_dir, image))
+                    staged.append(image)
+
         # AUTOEXEC.BAT if the pack has one - what this board does for itself at
         # boot, as against what it IS, which is the two files above.  Optional,
-        # because most boards do nothing; a cluster node binds its wire here,
-        # since a binding is lost on every reset and a board in a cupboard has
-        # nobody to type it again.
+        # and most boards do nothing: binding a wire used to be here and is now
+        # [link] bind in SYSTEM.CFG, which is read before this file runs.
         auto = os.path.join(board_dir, "AUTOEXEC.BAT")
         if os.path.isfile(auto):
             shutil.copy2(auto, os.path.join(out_dir, "AUTOEXEC.BAT"))
