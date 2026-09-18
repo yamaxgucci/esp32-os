@@ -49,6 +49,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PAGE = os.path.join(ROOT, "apps", "phone", "web", "index.html")
 
 GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+RECORDED = "build/sample.bands"
 
 OP_INFO, OP_ROW, OP_CURSOR, OP_SCROLL = b"M", b"R", b"C", b"S"
 OP_RAW = b"B"
@@ -192,6 +193,44 @@ def picture_bands(px, rows_per_band=8):
     return out
 
 
+def recorded_bands(path):
+    """Bands encoded by the board's own encoder, from build-host/pixband_sample.
+
+    The page has three decoders and this harness could only exercise one of
+    them: a board sends palette-and-indices almost every time - measured, 522
+    bands of 522 - so the decoder a phone actually uses was the one nobody had
+    tried.  Writing the encoder again here to test them would be the mistake
+    ag_pixband.h exists to avoid, so the bytes come from the same C the board
+    runs and the page is the only thing under test.
+
+    Each record is a 32-bit length and then exactly what goes in a frame.
+    """
+    out = []
+    with open(path, "rb") as f:
+        blob = f.read()
+    at = 0
+    while at + 4 <= len(blob):
+        n = struct.unpack_from("<I", blob, at)[0]
+        at += 4
+        if n == 0 or at + n > len(blob):
+            break
+        out.append(blob[at:at + n])
+        at += n
+    return out
+
+
+def recorded_geometry(bands):
+    """How big the picture is, from the bands themselves."""
+    w = h = 0
+    for b in bands:
+        if len(b) < 9:
+            continue
+        x, y, bw, bh = struct.unpack_from("<HHHH", b, 1)
+        w = max(w, x + bw)
+        h = max(h, y + bh)
+    return w or SURF_W, h or SURF_H
+
+
 # ---- the server -----------------------------------------------------------
 
 def serve_page(conn, head):
@@ -222,6 +261,15 @@ def serve_ws(conn, head, what):
             for m in picture_bands(picture()):
                 conn.sendall(frame(m))
                 time.sleep(0.005)
+        if what == "recorded":
+            bands = recorded_bands(RECORDED)
+            w, h = recorded_geometry(bands)
+            conn.sendall(frame(OP_INFO + struct.pack("<HH", w, h) +
+                               bytes([COLS, ROWS, CELL_W, CELL_H, 0x01])))
+            for m in bands:
+                conn.sendall(frame(m))
+                time.sleep(0.005)
+            print("replayed %u recorded bands, %ux%u" % (len(bands), w, h))
         print("sent the %s" % what)
 
     send_all()
@@ -255,9 +303,15 @@ def serve_ws(conn, head, what):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8765)
-    ap.add_argument("--show", choices=("text", "picture", "both"),
+    ap.add_argument("--show", choices=("text", "picture", "both", "recorded"),
                     default="picture")
+    ap.add_argument("--bands", default="build/sample.bands",
+                    help="for --show recorded: a file from "
+                         "build-host/pixband_sample, which encodes with the "
+                         "same C the board runs")
     args = ap.parse_args()
+    global RECORDED
+    RECORDED = args.bands
 
     srv = socket.socket()
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

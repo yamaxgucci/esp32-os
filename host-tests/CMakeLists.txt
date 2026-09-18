@@ -193,6 +193,17 @@ add_executable(vtdump
 
 target_include_directories(vtdump PRIVATE ${ARGON_INCLUDES})
 
+# A picture encoded by the real encoder, for tools/phonepage.py to replay at a
+# browser.  The page's three decoders are the half of the phone link that the
+# two-board rig cannot judge, and writing the encoder a second time in Python
+# to test them would be a second thing to be wrong - see ag_pixband.h.
+add_executable(pixband_sample
+    "${ARGON_ROOT}/tools/pixband_sample.c"
+    "${ARGON_ROOT}/apps/common/pixband/ag_pixband.c")
+
+target_include_directories(pixband_sample PRIVATE
+    "${ARGON_ROOT}/apps/common/pixband")
+
 # Listening files.  Not tests - ears catch things numbers do not - but they
 # are built here so the engines they render cannot quietly stop compiling.
 # Run build-host/engine_smoke to write build/listen/*.wav.
@@ -357,8 +368,8 @@ foreach(smoke engine_smoke synth_smoke ckt_smoke ckt_play ir_check)
         "${ARGON_ROOT}/apps/common/ir")
 endforeach()
 
-foreach(target argon_tests vtdump engine_smoke synth_smoke ckt_smoke ckt_play
-        ir_check wavdiff wavrate ckt_exact tube_render)
+foreach(target argon_tests vtdump pixband_sample engine_smoke synth_smoke
+        ckt_smoke ckt_play ir_check wavdiff wavrate ckt_exact tube_render)
     if(MSVC)
         target_compile_definitions(${target} PRIVATE _CRT_SECURE_NO_WARNINGS)
         target_compile_options(${target} PRIVATE /W4)
