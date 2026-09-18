@@ -359,6 +359,7 @@ const st = {
   pending: false,       /* a text repaint is already scheduled */
   dirtyRows: new Set(),
   pendingNonce: null,   /* a challenge waiting on a password being typed */
+  lastBand: -1e9,       /* when a band of pixels last arrived; see showText */
 };
 
 /* Drawn at three times the console's own cell, which is where a phone's pixel
@@ -430,6 +431,13 @@ function flushRows() {
  */
 function showText() {
   ui.splash.hidden = true;
+  /*
+   * Not while a picture is live.  See the note above showPixels: rows keep
+   * arriving under an application that owns the screen - the repair sweep
+   * alone is one every two hundred milliseconds - and letting each of them
+   * take the front made the page flick between the two twice a second.
+   */
+  if (st.mode === "pix" && performance.now() - st.lastBand < 2000) return;
   if (st.mode === "text") return;
   st.mode = "text";
   ui.pix.hidden = true;
@@ -438,8 +446,17 @@ function showText() {
 
 /* ---- the picture ------------------------------------------------------ */
 
+/*
+ * The picture takes the front, and keeps it for as long as it is being fed.
+ *
+ * A board with no framebuffer cannot re-send a rectangle, so an application
+ * that wants to be seen hands its picture over again and again; between those
+ * the console goes on sending rows.  st.lastBand is how showText tells "the
+ * text changed under a live picture" from "the picture has stopped".
+ */
 function showPixels() {
   ui.splash.hidden = true;
+  st.lastBand = performance.now();
   if (st.mode === "pix") return;
   st.mode = "pix";
   ui.text.hidden = true;

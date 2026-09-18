@@ -506,6 +506,15 @@ static bool api_queue_recv(ag_queue_t q, void *item, uint32_t timeout_ms)
 static void api_critical_enter(void) { ag_port_sched_lock(); }
 static void api_critical_exit(void) { ag_port_sched_unlock(); }
 
+/*
+ * The low tide of this task's stack.  See task->stack_left: it is asked by code
+ * running on a stack somebody else sized.
+ */
+static uint32_t api_stack_left(void)
+{
+    return (uint32_t)ag_port_task_stack_unused(NULL);
+}
+
 const ag_task_api_t ag_task_api_table = {
     .size = sizeof(ag_task_api_t),
     .create = api_create,
@@ -528,4 +537,5 @@ const ag_task_api_t ag_task_api_table = {
     .queue_recv = api_queue_recv,
     .critical_enter = api_critical_enter,
     .critical_exit = api_critical_exit,
+    .stack_left = api_stack_left,
 };

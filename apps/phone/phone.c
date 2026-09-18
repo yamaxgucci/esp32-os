@@ -316,6 +316,8 @@ static struct {
     uint32_t      band_hushed;
     uint32_t      band_busy;
     uint32_t      band_refused;
+    uint32_t      band_nostack;
+    bool          moaned_stack;
 
     /* The wire. */
     ag_handle_t listen;
@@ -506,6 +508,14 @@ typedef enum {
 #define SEND_IDLE_MS 2000u
 
 /*
+ * How much of the caller's stack this driver insists on before it sends a
+ * picture from inside blit_rect.  See the note there: the path is an encoder
+ * plus lwIP, and eight kilobytes of application stack was measured to be too
+ * little for it.
+ */
+#define BLIT_STACK_FLOOR 6144u
+
+/*
  * And how long a client may prove nothing at all before it is let go.
  *
  * A phone that is merely idle is not silent: the repair sweep sends it
@@ -682,6 +692,17 @@ static wire_t ws_send(uint8_t op, void *payload, uint32_t len,
      */
     const bool is_band = (op != OP_ROW && op != OP_CURSOR && op != OP_INFO &&
                           op != OP_SCROLL && op != OP_AUTH);
+    /*
+     * The hush covers the picture too, and that was tried both ways.
+     *
+     * It refuses most bands - measured, 211 of 258 - and exempting them does
+     * not buy a picture: the same two frames arrive and the console's rows
+     * drop from two hundred to fifty-five, because the two are competing for
+     * one wire and the quiet was what kept the text moving.  So the picture
+     * goes at the speed the console leaves it, which on this board is a frame
+     * or two every thirty seconds, and the counters below say so rather than
+     * leaving it to be guessed.
+     */
     if (s.hush_until != 0u && (uint64_t)ag_micros() < s.hush_until) {
         if (is_band) {
             s.band_hushed++;
@@ -2233,11 +2254,12 @@ static void phone_task(void *arg)
                 ag_log(AG_LOG_INFO, "phone",
                        "picture: %u blits in, %u bands out, %u bytes; "
                        "not sent: %u no memory, %u hushed, %u wire busy, "
-                       "%u refused; surface %ux%u, frame %s",
+                       "%u refused, %u no stack; surface %ux%u, frame %s",
                        (unsigned)s.blits, (unsigned)s.bands,
                        (unsigned)s.band_bytes, (unsigned)s.band_nomem,
                        (unsigned)s.band_hushed, (unsigned)s.band_busy,
-                       (unsigned)s.band_refused, (unsigned)s.frame_w,
+                       (unsigned)s.band_refused, (unsigned)s.band_nostack,
+                       (unsigned)s.frame_w,
                        (unsigned)s.frame_h,
                        (s.frame != NULL) ? "held" : "none (sent from the "
                                                     "drawing task)");
@@ -2478,6 +2500,32 @@ static void phone_blit_rect(ag_handle_t h, const ag_blit_t *b)
             s.owe_info = true;
         }
         if (s.conn >= 0 && (!needs_password() || s.authed)) {
+            /*
+             * On the caller's stack, so ask whether there is one to spend.
+             *
+             * What follows is the band encoder, the WebSocket framing and the
+             * whole of lwIP, and an application that declared eight kilobytes
+             * for its own drawing has not got it: measured, three board resets
+             * in seventeen runs, each a stack overflow in the application that
+             * drew and each followed by the allocator asserting on a heap the
+             * overflow had already crossed into.
+             *
+             * Zero means the kernel cannot say (ABI older than 0.51), and then
+             * this behaves as it always did.
+             */
+            const uint32_t left = ag_stack_left();
+            if (left != 0u && left < BLIT_STACK_FLOOR) {
+                s.band_nostack++;
+                if (!s.moaned_stack) {
+                    s.moaned_stack = true;
+                    ag_log(AG_LOG_WARN, "phone",
+                           "not sending the picture: %u bytes of the drawing "
+                           "task's stack left, %u wanted - give it a bigger "
+                           "one (AG_APP_SIZED)",
+                           (unsigned)left, (unsigned)BLIT_STACK_FLOOR);
+                }
+                return;
+            }
             (void)send_blit_direct(b);
         }
         return;

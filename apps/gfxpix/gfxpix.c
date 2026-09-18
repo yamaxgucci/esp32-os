@@ -56,7 +56,25 @@
 #include <argon/argon.h>
 #include <argon/keys.h>
 
-AG_APP("GFXPIX", "1.3", "argon", AG_AXE_NEEDS_GFX);
+/*
+ * Sixteen kilobytes of stack, and the reason is not this program.
+ *
+ * On a board with no framebuffer the screen at the end of the wire is
+ * fed from inside the drawing call: PHONE.SYS encodes the band and
+ * pushes it through the socket on the caller's task, which is this
+ * one.  Eight kilobytes - what an application gets by default - is not
+ * enough for a band encoder plus lwIP, and the board resets:
+ *
+ *   ***ERROR*** A stack overflow in task gfxpix.axe has been detected
+ *
+ * followed, on the next run, by the allocator asserting on a heap the
+ * overflow had already walked into.  Three resets in seventeen runs,
+ * one cause.
+ *
+ * Anything that draws while a phone is attached wants the same.
+ */
+AG_APP_SIZED("GFXPIX", "1.3", "argon", AG_AXE_NEEDS_GFX, 16 * 1024,
+             4 * 1024);
 
 /* Digits, by hand: the SDK has no atoi and two arguments are not a reason to
  * want one. */
@@ -259,16 +277,48 @@ int ag_main(int argc, char **argv)
          * the circle, and what gives the link's encoder a second chance at the
          * frame it was not yet ready for.
          */
-        for (uint32_t left = hold_s * 1000u; left != 0u;) {
-            const uint32_t nap = (left < 500u) ? left : 500u;
-            ag_delay(nap);
-            left -= nap;
+        /*
+         * With no number, until somebody stops it.  A picture drawn once
+         * and let go is a flash - reported from a phone as "it flickered
+         * and went" - and on the glass the console takes the screen back
+         * the moment this releases it.  The command without arguments is
+         * the first one anybody types, so it is the one that has to
+         * behave.
+         */
+        uint32_t   left = hold_s * 1000u;
+        const bool forever = (hold_s == 0u);
+        for (;;) {
+            if (!forever) {
+                if (left == 0u) {
+                    break;
+                }
+                const uint32_t nap = (left < 500u) ? left : 500u;
+                ag_delay(nap);
+                left -= nap;
+            } else {
+                ag_delay(500);
+                ag_event_t ev;
+                bool       done = false;
+                while (ag_poll_event(&ev, 0)) {
+                    if (ev.type == AG_EV_QUIT ||
+                        ev.type == AG_EV_KEY_DOWN) {
+                        done = true;
+                    }
+                }
+                if (done || ag_interrupted()) {
+                    break;
+                }
+            }
             if (own_picture() != 0) {
                 bad = 1;
             }
         }
         ag_gfx_release();
-        ag_printf("3 held %u s\n", (unsigned)hold_s);
+        if (forever) {
+            ag_printf("3 held until stopped\n");
+        } else {
+            ag_printf("3 held %u s\n", (unsigned)hold_s);
+        }
         return bad;
     }
 

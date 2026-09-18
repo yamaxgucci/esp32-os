@@ -170,6 +170,13 @@ extern "C" {
  *      worktree-usb-kvm calls its 0.45.  Whichever of those lands next has
  *      to RENUMBER rather than assume its number is free - and the check is
  *      one line: `git show <branch>:sdk/include/argon/abi.h | grep MINOR`.
+ * 0.51 appended task->stack_left: how much of the current task's stack has
+ *      never been touched, for code that runs on a stack it does not own.  A
+ *      driver called from a display callback spends the drawing application's,
+ *      and PHONE.SYS on a board with no framebuffer spends a band encoder and
+ *      all of lwIP of it - three board resets in seventeen runs, each one a
+ *      stack overflow in the application that drew.  A rectangle not sent is a
+ *      screen that does not update; a stack overflow is a board that reboots.
  * 0.50 appended net->reset: a connection thrown away rather than closed, for
  *      a peer that has stopped reading.  `close` promises to deliver what is
  *      queued and TCP keeps that promise indefinitely, so a deaf peer holds the
@@ -198,7 +205,7 @@ extern "C" {
  *      number.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 50u
+#define AG_ABI_MINOR 51u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -1383,6 +1390,25 @@ typedef struct ag_task_api {
     /* Disable preemption on the current core; keep it short. */
     void (*critical_enter)(void);
     void (*critical_exit)(void);
+
+    /*
+     * ABI 0.51: bytes of stack the current task has never touched.
+     *
+     * For code that runs on a stack it does not own.  A driver called from a
+     * display callback, a filesystem hook or an input poll is spending the
+     * caller's, and the caller declared its size for its own work rather than
+     * for whatever a driver might do next.  PHONE.SYS on a board with no
+     * framebuffer sends the picture from inside blit_rect - the band encoder,
+     * the WebSocket framing and all of lwIP - and eight kilobytes, which is
+     * what an application gets by default, is not enough for that: three board
+     * resets in seventeen runs, every one a stack overflow in the drawing
+     * application.
+     *
+     * A watermark, not a live figure: it is the low tide of this task since it
+     * started, so it is conservative in the right direction.  Zero if the port
+     * cannot tell.
+     */
+    uint32_t (*stack_left)(void);
 } ag_task_api_t;
 
 /* ------------------------------------------------------------------------ */

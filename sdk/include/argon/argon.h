@@ -1100,6 +1100,20 @@ static inline ag_err_t ag_net_close(ag_handle_t sock)
  * Only for a peer already judged gone.  -AG_ENOSYS on a kernel older than the
  * call, so a caller that wants either may fall back to close.
  */
+/*
+ * Bytes of stack this task has never used (ABI 0.51), or 0 on a kernel that
+ * does not offer it - so a caller that must have an answer treats 0 as "do not
+ * risk it" or as "cannot tell", whichever is safe for what it was about to do.
+ */
+static inline uint32_t ag_stack_left(void)
+{
+    const ag_task_api_t *t = g_ag_api->task;
+    if (t == NULL || !AG_HAS(t, stack_left)) {
+        return 0u;
+    }
+    return t->stack_left();
+}
+
 static inline ag_err_t ag_net_reset(ag_handle_t sock)
 {
     if (g_ag_api->net == NULL || !AG_HAS(g_ag_api->net, reset)) {

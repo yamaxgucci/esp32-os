@@ -261,6 +261,31 @@ def serve_ws(conn, head, what):
             for m in picture_bands(picture()):
                 conn.sendall(frame(m))
                 time.sleep(0.005)
+        if what == "live":
+            # A picture and a console at the same time, at the rates the board
+            # sends them: bands twice a second, one console row five times a
+            # second.  This is the state a phone is in while an application is
+            # drawing, and the one that made the page flick between the two.
+            bands = recorded_bands(RECORDED)
+            w, h = recorded_geometry(bands)
+            conn.sendall(frame(OP_INFO + struct.pack("<HH", w, h) +
+                               bytes([COLS, ROWS, CELL_W, CELL_H, 0x01])))
+            for m in text_screen()[1:]:
+                conn.sendall(frame(m))
+            print("live: %u bands every 500 ms, a row every 200 ms"
+                  % len(bands))
+            n = 0
+            while True:
+                for m in bands:
+                    conn.sendall(frame(m))
+                    time.sleep(0.004)
+                for i in range(2):
+                    time.sleep(0.2)
+                    n += 1
+                    conn.sendall(frame(row(ROWS - 2,
+                                           "  the console is still talking: "
+                                           "%u" % n, 0x0F)))
+                time.sleep(0.1)
         if what == "recorded":
             bands = recorded_bands(RECORDED)
             w, h = recorded_geometry(bands)
@@ -303,7 +328,8 @@ def serve_ws(conn, head, what):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8765)
-    ap.add_argument("--show", choices=("text", "picture", "both", "recorded"),
+    ap.add_argument("--show",
+                    choices=("text", "picture", "both", "recorded", "live"),
                     default="picture")
     ap.add_argument("--bands", default="build/sample.bands",
                     help="for --show recorded: a file from "
