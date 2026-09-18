@@ -185,6 +185,19 @@ add_executable(vtdump
 
 target_include_directories(vtdump PRIVATE ${ARGON_INCLUDES})
 
+# The board's own compiler, run here.  Not a test by itself: it is what makes a
+# change to the code generator answerable - compile every example before and
+# after and compare the hashes.
+add_executable(cchost
+    "${ARGON_ROOT}/tools/cchost/cchost.c"
+    "${ARGON_ROOT}/apps/cc/cc_compile.c")
+
+target_include_directories(cchost PRIVATE
+    "${ARGON_ROOT}/apps/cc"
+    ${ARGON_INCLUDES})
+
+target_compile_definitions(cchost PRIVATE AG_HOST=1)
+
 # Listening files.  Not tests - ears catch things numbers do not - but they
 # are built here so the engines they render cannot quietly stop compiling.
 # Run build-host/engine_smoke to write build/listen/*.wav.
@@ -349,8 +362,8 @@ foreach(smoke engine_smoke synth_smoke ckt_smoke ckt_play ir_check)
         "${ARGON_ROOT}/apps/common/ir")
 endforeach()
 
-foreach(target argon_tests vtdump engine_smoke synth_smoke ckt_smoke ckt_play
-        ir_check wavdiff wavrate ckt_exact tube_render)
+foreach(target argon_tests vtdump cchost engine_smoke synth_smoke ckt_smoke
+        ckt_play ir_check wavdiff wavrate ckt_exact tube_render)
     if(MSVC)
         target_compile_definitions(${target} PRIVATE _CRT_SECURE_NO_WARNINGS)
         target_compile_options(${target} PRIVATE /W4)

@@ -1998,6 +1998,61 @@ static void emit_srai(gen_t *g, int ar, int at, int sa)
           (uint8_t)(((0x2 | (sa >> 4)) << 4) | 0x1));
 }
 
+/*
+ * Shifting, as four operations, because this is the other place a machine
+ * shows through.  Xtensa has no shift-by-register instruction: the count goes
+ * into the shift-amount register first (SSL for left, SSR for right) and the
+ * shift itself then reads it.  A machine with an ordinary three-register shift
+ * needs none of that, and the parser should not have to know which it is on.
+ *
+ * emit_shr_i USES REGISTER 9 when the value is unsigned, for the reason
+ * written at its body; every caller has 9 free, and a caller that has not must
+ * not use it.
+ */
+static void emit_shl_rr(gen_t *g, int dst, int lhs, int amt)
+{
+    emit_ssl(g, amt);
+    emit_sll(g, dst, lhs);
+}
+
+static void emit_shr_rr(gen_t *g, int dst, int lhs, int amt, int uns)
+{
+    emit_ssr(g, amt);
+    if (uns) {
+        emit_srl(g, dst, lhs);
+    } else {
+        emit_sra(g, dst, lhs);
+    }
+}
+
+static void emit_shl_i(gen_t *g, int dst, int src, int sa)
+{
+    if (sa == 0) {
+        return;
+    }
+    emit_slli(g, dst, src, sa);
+}
+
+static void emit_shr_i(gen_t *g, int dst, int src, int sa, int uns)
+{
+    if (sa == 0) {
+        return;
+    }
+    if (!uns) {
+        emit_srai(g, dst, src, sa);
+        return;
+    }
+    /*
+     * Through the shift-amount register even for a constant.  SRLI exists but
+     * takes a four-bit count, so it cannot shift by more than 15 - and a right
+     * shift by 16 or more is exactly what a program taking the top half of a
+     * word does.  One extra instruction beats a silent wrong answer above 15.
+     */
+    emit_movi(g, 9, sa);
+    emit_ssr(g, 9);
+    emit_srl(g, dst, src);
+}
+
 static void emit_l8ui(gen_t *g, int at, int as, int off)
 {
     if (off < 0 || off > 255) {
@@ -2432,7 +2487,7 @@ static void emit_scale(gen_t *g, int reg, int size)
         sh++;
     }
     if (v == 1 && sh <= 31) {
-        emit_slli(g, reg, reg, sh);
+        emit_shl_i(g, reg, reg, sh);
         return;
     }
     emit_movi(g, 11, size);
@@ -2537,6 +2592,60 @@ static void place_store(gen_t *g, place_t *pl, int val, int scratch)
         place_addr(g, pl);
     }
     emit_store_sized(g, val, 8, pl->off, size, scratch);
+}
+
+/* ---- the frame ---------------------------------------------------------- */
+/*
+ * Opening and closing a function, kept together and away from the parser,
+ * because this is where a machine shows through hardest.
+ *
+ * Xtensa's windowed call gives a function its arguments in a2..a7 and its
+ * caller's in a10..a15; a machine without a window would use one set for both.
+ * ENTRY allocates the frame and rotates the window in a single instruction;
+ * a machine without one would subtract from the stack pointer and save the
+ * return address itself.  None of that belongs in the code that parses an
+ * expression, and while it was written out there the parser named a1, a2 and
+ * a7 directly - three registers whose meaning is not the same twice.
+ *
+ * What is left in the parser is a set of NUMBERS, not registers: 8 is the
+ * value in hand, 9 the other operand, 7 the frame, 10..15 the outgoing
+ * arguments.  A second back end is free to put those wherever it likes.
+ */
+
+/* The frame size is only known once the body has been read, so ENTRY is
+ * emitted at the maximum and rewritten - see patch_entry. */
+static void emit_frame_open(gen_t *g)
+{
+    emit_entry(g, SPILL_BYTES + MAX_LOCAL_WORDS * 4 + FRAME_TOP_SAVE);
+}
+
+static void emit_frame_size(gen_t *g, size_t site, int framesize)
+{
+    patch_entry(g, site, framesize);
+}
+
+/*
+ * Parameters into their frame slots.
+ *
+ * Stored through a1 rather than a7, because a7 is about to become the frame
+ * pointer: with six parameters the last one would otherwise be overwritten by
+ * its own frame pointer.  a1 and a7 hold the same address; only the order
+ * matters.
+ */
+static void emit_params_home(gen_t *g, int nparams)
+{
+    for (int i = 0; i < nparams && i < MAX_PARAMS; i++) {
+        emit_store_sized(g, 2 + i, 1, g->locals[i].off,
+                         sym_access_size(&g->locals[i]), 8);
+    }
+    emit_mov_n(g, 7, 1);
+}
+
+/* Falling off the end of a function is `return 0`. */
+static void emit_func_return(gen_t *g)
+{
+    emit_movi(g, 2, 0);
+    emit_retw_n(g);
 }
 
 /* ---- builtins ---------------------------------------------------------- */
@@ -3462,11 +3571,9 @@ static void emit_compound_op(gen_t *g, tok_t op, int dst, int lhs, int rhs)
     } else if (op == T_CARET_EQ) {
         emit_xor(g, dst, lhs, rhs);
     } else if (op == T_SHL_EQ) {
-        emit_ssl(g, rhs);
-        emit_sll(g, dst, lhs);
+        emit_shl_rr(g, dst, lhs, rhs);
     } else {
-        emit_ssr(g, rhs);
-        emit_sra(g, dst, lhs);
+        emit_shr_rr(g, dst, lhs, rhs, 0);
     }
 }
 
@@ -3942,23 +4049,10 @@ static void parse_shift(par_t *p)
             !binds_tighter(peek_tok(p->L), 2)) {
             const int sa = (int)p->L->num;
             lex_next(p->L);
-            if (sa != 0) {
-                if (op == T_SHL) {
-                    emit_slli(p->g, 8, 8, sa);
-                } else if (uns) {
-                    /*
-                     * Through SAR even for a constant.  SRLI exists but takes
-                     * a four-bit count, so it cannot shift by more than 15 -
-                     * and a right shift by 16 or more is exactly what a
-                     * program taking the top half of a word does.  One extra
-                     * instruction beats a silent wrong answer above 15.
-                     */
-                    emit_movi(p->g, 9, sa);
-                    emit_ssr(p->g, 9);
-                    emit_srl(p->g, 8, 8);
-                } else {
-                    emit_srai(p->g, 8, 8, sa);
-                }
+            if (op == T_SHL) {
+                emit_shl_i(p->g, 8, 8, sa);
+            } else {
+                emit_shr_i(p->g, 8, 8, sa, uns);
             }
             p->pesize = 0;
             p->puns = uns;
@@ -3973,15 +4067,9 @@ static void parse_shift(par_t *p)
             rhs = 8;
         }
         if (op == T_SHL) {
-            emit_ssl(p->g, rhs);
-            emit_sll(p->g, 8, lhs);
+            emit_shl_rr(p->g, 8, lhs, rhs);
         } else {
-            emit_ssr(p->g, rhs);
-            if (uns) {
-                emit_srl(p->g, 8, lhs);
-            } else {
-                emit_sra(p->g, 8, lhs);
-            }
+            emit_shr_rr(p->g, 8, lhs, rhs, uns);
         }
         p->pesize = 0;
         p->puns = uns;
@@ -4697,23 +4785,13 @@ static void parse_function(par_t *p, int is_void, const char *name)
     p->g->spill_top = 0;
 
     const size_t code_off = p->g->len;
-    emit_entry(p->g, SPILL_BYTES + MAX_LOCAL_WORDS * 4 + FRAME_TOP_SAVE);
+    emit_frame_open(p->g);
 
-    /*
-     * Parameters arrive in a2..a7 and are stored through a1, because a7 is
-     * about to become the frame pointer - with six parameters the last one
-     * would otherwise be overwritten by its own frame pointer.  a7 and a1 hold
-     * the same address; only the order matters.
-     */
     const int nparams = parse_params(p);
     if (p->g->err) {
         return;
     }
-    for (int i = 0; i < nparams && i < MAX_PARAMS; i++) {
-        emit_store_sized(p->g, 2 + i, 1, p->g->locals[i].off,
-                         sym_access_size(&p->g->locals[i]), 8);
-    }
-    emit_mov_n(p->g, 7, 1);
+    emit_params_home(p->g, nparams);
 
     const int fi = p->g->nfuncs++;
     cpy_err(p->g->funcs[fi].name, MAX_NAME, name);
@@ -4732,12 +4810,11 @@ static void parse_function(par_t *p, int is_void, const char *name)
 
     parse_block(p);
 
-    emit_movi(p->g, 2, 0);
-    emit_retw_n(p->g);
+    emit_func_return(p->g);
 
     /* The stack pointer stays 16-byte aligned, so the frame rounds to 16. */
     const int used = SPILL_BYTES + p->g->local_words * 4 + FRAME_TOP_SAVE;
-    patch_entry(p->g, code_off, (used + 15) & ~15);
+    emit_frame_size(p->g, code_off, (used + 15) & ~15);
 }
 
 /*
