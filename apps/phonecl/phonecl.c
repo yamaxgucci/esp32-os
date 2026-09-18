@@ -53,6 +53,7 @@ AG_APP_SIZED("PHONECL", "1.0", "argon", AG_AXE_NEEDS_NET, 6 * 1024, 2 * 1024);
 #define OP_INFO 'M'
 #define OP_ROW 'R'
 #define OP_CURSOR 'C'
+#define OP_SCROLL 'S'
 #define OP_AUTH 'A'
 
 #define IN_HELLO 'H'
@@ -485,6 +486,30 @@ static void take_message(const uint8_t *m, uint32_t len)
                 }
                 s.rows_seen++;
             }
+        }
+        break;
+
+    case OP_SCROLL:
+        /*
+         * The board's console moved up by so many rows; everything else about
+         * the screen is unchanged.  Counted as rows arrived, because that is
+         * what it stands for and a harness watching the row count would
+         * otherwise report a link that had gone quiet.
+         */
+        if (n >= 1u && b[0] > 0u && b[0] < s.rows) {
+            const uint32_t lines = b[0];
+            const uint32_t keep = s.rows - lines;
+            memmove(s.cell, s.cell + lines * s.cols * 2u,
+                    (size_t)keep * s.cols * 2u);
+            for (uint32_t y = keep; y < s.rows; y++) {
+                for (uint32_t x = 0; x < s.cols; x++) {
+                    const uint32_t at = (y * s.cols + x) * 2u;
+                    s.cell[at] = ' ';
+                    s.cell[at + 1u] = 0x07u;
+                }
+            }
+            s.cur_y = (s.cur_y >= lines) ? (s.cur_y - lines) : 0u;
+            s.rows_seen++;
         }
         break;
 

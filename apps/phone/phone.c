@@ -158,6 +158,7 @@ AG_DRV("PHONE", "1.0", "argon");
  *        u8 flags
  *   'R'  u8 row, u8 count, count x (ch, attr)
  *   'C'  u8 col, u8 row, u8 ch, u8 attr, u8 visible
+ *   'S'  u8 lines - the console moved up by that many, the rest is unchanged
  *   'B'  u16 x, u16 y, u16 w, u16 h, pixels RGB565 as they are
  *   'P'  the same geometry, then PackBits over the pixels
  *   'I'  the same geometry, then a palette and packed indices
@@ -179,6 +180,7 @@ AG_DRV("PHONE", "1.0", "argon");
 #define OP_INFO 'M'
 #define OP_ROW 'R'
 #define OP_CURSOR 'C'
+#define OP_SCROLL 'S'
 #define OP_AUTH 'A'
 
 #define IN_HELLO 'H'
@@ -282,6 +284,16 @@ static struct {
     ag_textcell_t cur_under;
     bool          cur_visible;
     bool          cur_dirty;
+    /*
+     * Rows the client has yet to be told to scroll.
+     *
+     * A scroll used to arrive here as text_row for every row on the screen -
+     * thirty rows of Wi-Fi, about five kilobytes, for one printed line.  Now
+     * the console says it moved and this passes that on in two bytes.  Owed
+     * rather than sent at once because the send can stall, and the rows that
+     * follow a scroll are only correct after it.
+     */
+    uint8_t       scroll_owed;
 
     /* The wire. */
     ag_handle_t listen;
@@ -868,6 +880,15 @@ static wire_t send_info(void)
     return ws_send(OP_INFO, p, 9u, SEND_IDLE_MS, 3000u);
 }
 
+/* Two bytes that stand for a screenful.  See OP_SCROLL. */
+static wire_t send_scroll(uint8_t lines)
+{
+    uint8_t  buf[WS_SLACK + 1u];
+    uint8_t *p = buf + WS_SLACK;
+    p[0] = lines;
+    return ws_send(OP_SCROLL, p, 1u, SEND_IDLE_MS, 3000u);
+}
+
 static wire_t send_text_row(uint16_t row)
 {
     uint8_t  buf[WS_SLACK + 2u + TEXT_MAX_COLS * 2u];
@@ -1150,6 +1171,8 @@ static bool service_client(void)
         s.owe_everything = false;
         s.owe_info = false;
         lock();
+        /* Everything is going; a scroll the client never saw means nothing. */
+        s.scroll_owed = 0u;
         for (uint32_t r2 = 0; r2 < s.rows; r2++) {
             s.row_dirty[r2] = 1u;
         }
@@ -1161,6 +1184,24 @@ static bool service_client(void)
             s.dy1 = s.frame_h;
         }
         unlock();
+    }
+
+    /*
+     * The scroll first, and nothing else until it has gone.
+     *
+     * A row sent before it would land on the client's old screen and be
+     * scrolled out from under itself a moment later, which is a line of text
+     * in the wrong place until something happens to that row again.
+     */
+    if (s.scroll_owed != 0u) {
+        const wire_t w = send_scroll(s.scroll_owed);
+        if (w == WIRE_GONE) {
+            return false;
+        }
+        if (w != WIRE_OK) {
+            return true; /* still owed; the rows wait with it */
+        }
+        s.scroll_owed = 0u;
     }
 
     for (uint32_t r = 0; r < s.rows; r++) {
@@ -1834,6 +1875,7 @@ static bool serve_request(ag_handle_t h)
         ws_close("replaced");
         drop_conn("replaced");
         s.conn = h;
+        s.scroll_owed = 0u;
         s.last_life_us = (uint64_t)ag_micros();
         s.authed = false;
         s.challenged = false;
@@ -2409,6 +2451,51 @@ static void phone_text_row(ag_handle_t h, uint16_t row,
     unlock();
 }
 
+/*
+ * The console moved up, and this mirror moves with it.
+ *
+ * Called on the console task with the registry held, like text_row, and under
+ * the same rule: it must not print and it must not wait.  All it does is a
+ * memmove and a note; the wire is the task's.
+ */
+static void phone_text_scroll(ag_handle_t h, uint16_t lines)
+{
+    (void)h;
+    if (lines == 0u || s.cells == NULL || lines >= s.rows) {
+        return;
+    }
+    lock();
+    const uint16_t keep = (uint16_t)(s.rows - lines);
+    memmove(s.cells, s.cells + (size_t)lines * s.cols,
+            (size_t)keep * s.cols * sizeof(s.cells[0]));
+    for (uint16_t y = keep; y < s.rows; y++) {
+        for (uint16_t x = 0; x < s.cols; x++) {
+            s.cells[(size_t)y * s.cols + x].ch = ' ';
+            s.cells[(size_t)y * s.cols + x].attr = 0x07u;
+        }
+    }
+    /* A row that was waiting to be sent is the same row of text, higher up. */
+    for (uint16_t y = 0; y < keep; y++) {
+        s.row_dirty[y] = s.row_dirty[y + lines];
+    }
+    for (uint16_t y = keep; y < s.rows; y++) {
+        s.row_dirty[y] = 1u;
+    }
+    /*
+     * More than the screen is tall, or more than the client has kept up with:
+     * cheaper to send the screen than to explain it, and owe_everything is
+     * exactly that.
+     */
+    const uint32_t owed = (uint32_t)s.scroll_owed + lines;
+    if (owed >= s.rows || owed > 255u) {
+        s.scroll_owed = 0u;
+        s.owe_everything = true;
+    } else {
+        s.scroll_owed = (uint8_t)owed;
+    }
+    unlock();
+}
+
 static void phone_text_cursor(ag_handle_t h, uint16_t col, uint16_t row,
                               ag_textcell_t under, bool visible)
 {
@@ -2507,6 +2594,7 @@ static const ag_display_ops_t k_display_ops_text = {
     .text_row = phone_text_row,
     .text_cursor = phone_text_cursor,
     .blit_rect = phone_blit_rect,
+    .text_scroll = phone_text_scroll,
 };
 
 static const ag_display_ops_t k_display_ops_pixels = {

@@ -195,6 +195,7 @@
 /* ---- what the board says and what it is told ------------------------- */
 
 const OP_INFO = 0x4d, OP_ROW = 0x52, OP_CURSOR = 0x43, OP_AUTH = 0x41;
+const OP_SCROLL = 0x53;
 const OP_RAW = 0x42, OP_PACK = 0x50, OP_IDX = 0x49;
 
 const IN_HELLO = 0x48, IN_KEY = 0x4b, IN_PTR = 0x50, IN_TEXT = 0x54;
@@ -714,6 +715,39 @@ function onMessage(v) {
     }
     schedulePaint([y]);
     showText();
+    return;
+  }
+
+  /*
+   * The console moved up.  Two bytes, where this used to be every row on the
+   * screen - about five kilobytes of Wi-Fi for one printed line, thirty times
+   * a second when something was talking.
+   *
+   * The glass moves rather than being redrawn: a canvas may be drawn onto
+   * itself and the source is taken before the drawing starts, so an
+   * overlapping copy is defined and does what it looks like.
+   */
+  if (op === OP_SCROLL) {
+    const n = v.getUint8(1);
+    if (n > 0 && n < st.rows) {
+      st.cells.copyWithin(0, n * st.cols);
+      st.cells.fill(0x0720, (st.rows - n) * st.cols);
+
+      const keep = (st.rows - n) * CH;
+      tctx.drawImage(ui.text, 0, n * CH, ui.text.width, keep,
+                     0, 0, ui.text.width, keep);
+      tctx.fillStyle = CGA[0];
+      tctx.fillRect(0, keep, ui.text.width, n * CH);
+
+      /* A row already queued for repaint is the same row of text, higher up. */
+      const moved = new Set();
+      for (const r of st.dirtyRows) if (r >= n) moved.add(r - n);
+      st.dirtyRows = moved;
+
+      /* And the caret went with the picture, which is where it is drawn. */
+      st.cur = { x: st.cur.x, y: st.cur.y - n, on: st.cur.on };
+      showText();
+    }
     return;
   }
 

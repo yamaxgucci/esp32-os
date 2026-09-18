@@ -1398,7 +1398,18 @@ void ag_display_render_console(const ag_screen_t *screen)
         return;
     }
 
-    const bool full = (s_console_gen == 0);
+    /*
+     * A scroll is a full repaint here, which is exactly what it cost before
+     * this existed - the saving is for the renderers that talk over a wire.
+     *
+     * The screen's dirty set moves with the picture now, so repainting only
+     * the dirty rows without moving the pixels as well would leave the old
+     * text on the glass.  Moving them is a memmove of the framebuffer and
+     * worth doing; it is left for the next hand, because this path costs no
+     * bytes on any wire and the flush to the panel that follows is unchanged
+     * either way.
+     */
+    const bool full = (s_console_gen == 0) || ag_screen_scrolled(screen) > 0u;
     const bool dirty = full || ag_screen_any_dirty(screen);
     const bool want_caret = screen->cursor_visible;
     const bool lit =

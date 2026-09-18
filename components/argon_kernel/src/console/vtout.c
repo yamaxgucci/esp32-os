@@ -115,6 +115,11 @@ static inline size_t word_count(uint16_t rows)
     return ((size_t)rows + 31u) / 32u;
 }
 
+static inline bool row_pending_raw(const ag_vtout_t *o, uint16_t y)
+{
+    return (o->dirty[y / 32u] & ((uint32_t)1u << (y % 32u))) != 0;
+}
+
 void ag_vtout_init(ag_vtout_t *o)
 {
     if (o == NULL) {
@@ -130,10 +135,46 @@ void ag_vtout_mark_all(ag_vtout_t *o)
 {
     memset(o->dirty, 0xff, sizeof(o->dirty));
     o->synced = false;
+    /* Everything is about to be painted; scrolling first would only flicker. */
+    o->pending_scroll = 0;
+}
+
+/* This endpoint's pending rows move with the picture, exactly as the screen's
+ * own set does: a row that changed and has not gone out yet is the same row of
+ * text, higher up. */
+static void shift_pending_up(ag_vtout_t *o, uint16_t rows, uint16_t lines)
+{
+    for (uint16_t y = 0; y + lines < rows; y++) {
+        const uint16_t from = (uint16_t)(y + lines);
+        if (row_pending_raw(o, from)) {
+            o->dirty[y / 32u] |= (uint32_t)1u << (y % 32u);
+        } else {
+            o->dirty[y / 32u] &= ~((uint32_t)1u << (y % 32u));
+        }
+    }
+    for (uint16_t y = (uint16_t)(rows - lines); y < rows; y++) {
+        o->dirty[y / 32u] |= (uint32_t)1u << (y % 32u);
+    }
 }
 
 void ag_vtout_take_dirty(ag_vtout_t *o, const ag_screen_t *s)
 {
+    const uint16_t rows = (o->rows != 0 && o->rows < s->rows) ? o->rows
+                                                              : s->rows;
+    const uint16_t moved = ag_screen_scrolled(s);
+
+    if (moved > 0u) {
+        const uint32_t total = (uint32_t)o->pending_scroll + moved;
+        if (!ag_screen_scroll_usable(s) || moved >= rows || total >= rows) {
+            /* Further than the screen is tall, or more than this endpoint has
+             * caught up with: cheaper to repaint than to explain. */
+            ag_vtout_mark_all(o);
+        } else {
+            shift_pending_up(o, rows, moved);
+            o->pending_scroll = (uint16_t)total;
+        }
+    }
+
     const size_t n = word_count(s->rows);
     for (size_t i = 0; i < n && i < sizeof(o->dirty) / sizeof(o->dirty[0]);
          i++) {
@@ -153,7 +194,7 @@ bool ag_vtout_pending(const ag_vtout_t *o)
 
 static bool row_pending(const ag_vtout_t *o, uint16_t y)
 {
-    return (o->dirty[y / 32u] & ((uint32_t)1u << (y % 32u))) != 0;
+    return row_pending_raw(o, y);
 }
 
 static void row_done(ag_vtout_t *o, uint16_t y)
@@ -260,7 +301,40 @@ void ag_vtout_flush(ag_vtout_t *o, const ag_screen_t *s, ag_vt_sink_fn sink,
         o->last_attr = AG_ATTR_DEFAULT;
         o->cursor_visible = false;
         o->synced = true;
+        o->pending_scroll = 0;
     }
+
+    /*
+     * The scroll, before the rows that changed on top of it.
+     *
+     * Measured on the CYD with an application printing eleven lines a second:
+     * the console was sending each of them 23 times - 9.4 KB/s of an 11.5 KB/s
+     * line - and everything else that wanted the console, the shell's echo
+     * included, queued behind that.  One line feed instead.
+     */
+    if (o->pending_scroll > 0u && o->pending_scroll < rows) {
+        if (o->region_rows != rows) {
+            /* Scroll only what is ours; a window taller than the console must
+             * not have its own rows dragged about by our line feeds. */
+            emit_str(&e, "\x1b[1;");
+            emit_uint(&e, rows);
+            emit_char(&e, 'r');
+            o->region_rows = rows;
+        }
+        /* A line feed paints the new row in the current background, so leave
+         * a coloured one behind first or the screen grows a stripe. */
+        if (o->last_attr != AG_ATTR_DEFAULT) {
+            emit_attr(&e, AG_ATTR_DEFAULT);
+            o->last_attr = AG_ATTR_DEFAULT;
+        }
+        emit_goto(&e, 0, (uint16_t)(rows - 1));
+        for (uint16_t i = 0; i < o->pending_scroll; i++) {
+            emit_char(&e, '\n');
+        }
+        o->last_x = 0;
+        o->last_y = (uint16_t)(rows - 1);
+    }
+    o->pending_scroll = 0;
 
     for (uint16_t y = 0; y < rows; y++) {
         if (row_pending(o, y)) {
@@ -299,8 +373,10 @@ void ag_vtout_hello(ag_vtout_t *o, ag_vt_sink_fn sink, void *ctx)
 
     emitter_t e = {.sink = sink, .ctx = ctx, .len = 0};
 
-    /* Reset attributes, enable autowrap, clear, home, show the cursor. */
-    emit_str(&e, "\x1b[0m\x1b[?7h\x1b[2J\x1b[H\x1b[?25h");
+    /* Reset attributes, drop any scrolling region, enable autowrap, clear,
+     * home, show the cursor.  The region is set again by the first flush that
+     * needs one, and set from the console's height rather than guessed. */
+    emit_str(&e, "\x1b[0m\x1b[r\x1b[?7h\x1b[2J\x1b[H\x1b[?25h");
 #if CONFIG_ARGON_CONSOLE_KEY_EVENTS
     /*
      * Ask the host terminal for key-release reports.  Kitty: progressive
@@ -324,6 +400,7 @@ void ag_vtout_goodbye(ag_vt_sink_fn sink, void *ctx)
     }
 
     emitter_t e = {.sink = sink, .ctx = ctx, .len = 0};
-    emit_str(&e, "\x1b[0m\x1b[?25h\r\n");
+    /* And the whole window back to the terminal, scrolling region included. */
+    emit_str(&e, "\x1b[0m\x1b[r\x1b[?25h\r\n");
     emit_drain(&e);
 }

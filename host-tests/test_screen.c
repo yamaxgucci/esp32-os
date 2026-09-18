@@ -162,6 +162,64 @@ static void test_scroll(void)
     AG_CHECK_STR(row_text(s, 4), "");
 }
 
+/*
+ * A scroll is two facts, not one: everything moved up, and these rows are new.
+ * Reported as one - "everything changed" - it cost the console 23 sends of
+ * every printed line on the CYD.
+ */
+static void test_scroll_is_counted_and_the_dirty_set_moves(void)
+{
+    ag_screen_t *s = small_screen();   /* 20x5 */
+
+    ag_screen_puts(s, "r0\nr1\nr2\nr3\nr4");
+    ag_screen_clear_dirty(s);
+    AG_CHECK_INT(ag_screen_scrolled(s), 0);
+    AG_CHECK_INT(ag_screen_scroll_usable(s), 0);
+
+    /* One line off the top: one row is new, and only that one. */
+    ag_screen_scroll_up(s, 1);
+    AG_CHECK_INT(ag_screen_scrolled(s), 1);
+    AG_CHECK_INT(ag_screen_scroll_usable(s), 1);
+    AG_CHECK_INT(ag_screen_row_dirty(s, 0), 0);
+    AG_CHECK_INT(ag_screen_row_dirty(s, 3), 0);
+    AG_CHECK_INT(ag_screen_row_dirty(s, 4), 1);
+
+    /* A row written before the scroll is still that row of text, higher up. */
+    ag_screen_clear_dirty(s);
+    ag_screen_poke(s, 0, 3, 'X', AG_ATTR_DEFAULT);
+    AG_CHECK_INT(ag_screen_row_dirty(s, 3), 1);
+    ag_screen_scroll_up(s, 1);
+    AG_CHECK_INT(ag_screen_row_dirty(s, 2), 1);   /* moved with it     */
+    AG_CHECK_INT(ag_screen_row_dirty(s, 3), 0);   /* and left no ghost */
+    AG_CHECK_INT(ag_screen_row_dirty(s, 4), 1);   /* the new row       */
+
+    /* Two scrolls in one tick add up, and the set is shifted twice. */
+    ag_screen_clear_dirty(s);
+    ag_screen_poke(s, 0, 4, 'Y', AG_ATTR_DEFAULT);
+    ag_screen_scroll_up(s, 1);
+    ag_screen_scroll_up(s, 1);
+    AG_CHECK_INT(ag_screen_scrolled(s), 2);
+    AG_CHECK_INT(ag_screen_row_dirty(s, 2), 1);   /* Y, two rows up    */
+    AG_CHECK_INT(ag_screen_row_dirty(s, 3), 1);
+    AG_CHECK_INT(ag_screen_row_dirty(s, 4), 1);
+
+    /* Clearing the set ends the scroll with it: they are one report. */
+    ag_screen_clear_dirty(s);
+    AG_CHECK_INT(ag_screen_scrolled(s), 0);
+
+    /* Too far to express is not a scroll at all, it is a new screen. */
+    ag_screen_scroll_up(s, 99);
+    AG_CHECK_INT(ag_screen_scroll_usable(s), 0);
+    AG_CHECK_INT(ag_screen_row_dirty(s, 0), 1);
+    AG_CHECK_INT(ag_screen_row_dirty(s, 4), 1);
+
+    /* And neither is a clear, which repaints everything anyway. */
+    ag_screen_clear_dirty(s);
+    ag_screen_scroll_up(s, 1);
+    ag_screen_cls(s);
+    AG_CHECK_INT(ag_screen_scrolled(s), 0);
+}
+
 static void test_sgr_colours(void)
 {
     ag_screen_t *s = small_screen();
@@ -357,12 +415,22 @@ static void test_dirty_tracking(void)
     ag_screen_puts(s, "x");
     AG_CHECK(!ag_screen_any_dirty(s));
 
-    /* Scrolling moves every row. */
+    /*
+     * Scrolling moves every row - and says so as a scroll, not as damage.
+     *
+     * This used to mark all five rows dirty, which is true of the model and
+     * useless to every renderer: each of them can move its own picture up, and
+     * being told "everything changed" made the console send each printed line
+     * 23 times.  Now the scroll is one number and the dirty set names only the
+     * row that is genuinely new.
+     */
     ag_screen_clear_dirty(s);
     ag_screen_scroll_up(s, 1);
-    for (uint16_t y = 0; y < s->rows; y++) {
-        AG_CHECK(ag_screen_row_dirty(s, y));
+    AG_CHECK_INT(ag_screen_scrolled(s), 1);
+    for (uint16_t y = 0; y + 1 < s->rows; y++) {
+        AG_CHECK(!ag_screen_row_dirty(s, y));
     }
+    AG_CHECK(ag_screen_row_dirty(s, (uint16_t)(s->rows - 1)));
 
     /* Rows past 32 need the second word of the bitmap. */
     ag_screen_t big;
@@ -501,6 +569,7 @@ void run_screen_tests(void)
     test_control_chars();
     test_deferred_wrap();
     test_scroll();
+    test_scroll_is_counted_and_the_dirty_set_moves();
     test_sgr_colours();
     test_sgr_reverse();
     test_sgr_extended_is_consumed();

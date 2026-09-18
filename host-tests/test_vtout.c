@@ -267,7 +267,10 @@ static void test_hello_and_goodbye(void)
     ag_vtout_t o;
     cap_reset();
     ag_vtout_hello(&o, cap_sink, NULL);
-    AG_CHECK_STR(captured(), "^[[0m^[[?7h^[[2J^[[H^[[?25h");
+    /* The [r drops any scrolling region: this endpoint sets its own from
+     * the console height, and a region left by whatever was here before
+     * would cut the screen in half. */
+    AG_CHECK_STR(captured(), "^[[0m^[[r^[[?7h^[[2J^[[H^[[?25h");
 
     /* A terminal that just attached owes the whole screen. */
     AG_CHECK(ag_vtout_pending(&o));
@@ -277,7 +280,75 @@ static void test_hello_and_goodbye(void)
 
     cap_reset();
     ag_vtout_goodbye(cap_sink, NULL);
-    AG_CHECK_STR(captured(), "^[[0m^[[?25h\r\n");
+    /* And gives the whole window back on the way out. */
+    AG_CHECK_STR(captured(), "^[[0m^[[r^[[?25h\r\n");
+}
+
+/*
+ * A scroll goes out as a scroll.
+ *
+ * It used to go out as every row of the screen: 23 sends of one printed line
+ * on the CYD, 9.4 KB/s of an 11.5 KB/s serial line, with the shell's own echo
+ * queued behind it.  What the terminal needs is a line feed on the bottom row
+ * of a region it has been given, and then only the rows that really changed.
+ */
+static void test_a_scroll_goes_out_as_one(void)
+{
+    ag_screen_t *s = screen8x2();       /* eight columns, two rows */
+    ag_vtout_init(&g_out);
+    ag_vtout_mark_all(&g_out);
+    ag_screen_puts(s, "one\ntwo");
+    cap_reset();
+    ag_vtout_take_dirty(&g_out, s);
+    ag_vtout_flush(&g_out, s, cap_sink, NULL);
+    ag_screen_clear_dirty(s);
+
+    /* The third line pushes the first one off the top. */
+    ag_screen_puts(s, "\nthree");
+    cap_reset();
+    ag_vtout_take_dirty(&g_out, s);
+    ag_vtout_flush(&g_out, s, cap_sink, NULL);
+    ag_screen_clear_dirty(s);
+
+    /* The region, once, then a line feed at the bottom of it. */
+    const char *out = captured();
+    AG_CHECK(strstr(out, "^[[1;2r") != NULL);
+    AG_CHECK(strstr(out, "^[[2;1H\n") != NULL);
+    /* The row that is genuinely new, and not the one that only moved. */
+    AG_CHECK(strstr(out, "three") != NULL);
+    AG_CHECK(strstr(out, "two") == NULL);
+
+    /* And the region is not re-sent while the size is the same. */
+    ag_screen_puts(s, "\nfour");
+    cap_reset();
+    ag_vtout_take_dirty(&g_out, s);
+    ag_vtout_flush(&g_out, s, cap_sink, NULL);
+    ag_screen_clear_dirty(s);
+    const char *again = captured();
+    AG_CHECK(strstr(again, "^[[1;2r") == NULL);
+    AG_CHECK(strstr(again, "four") != NULL);
+}
+
+/*
+ * A scroll past the whole screen is not a scroll, and neither is a clear:
+ * both repaint, and a line feed before a full repaint is only flicker.
+ */
+static void test_a_scroll_too_far_is_a_repaint(void)
+{
+    ag_screen_t *s = screen8x2();
+    ag_vtout_init(&g_out);
+    ag_vtout_mark_all(&g_out);
+    ag_screen_puts(s, "one\ntwo");
+    cap_reset();
+    ag_vtout_take_dirty(&g_out, s);
+    ag_vtout_flush(&g_out, s, cap_sink, NULL);
+    ag_screen_clear_dirty(s);
+
+    ag_screen_scroll_up(s, 5);
+    cap_reset();
+    ag_vtout_take_dirty(&g_out, s);
+    ag_vtout_flush(&g_out, s, cap_sink, NULL);
+    AG_CHECK(strstr(captured(), "^[[2;1H\n") == NULL);
 }
 
 static void test_control_characters_are_not_forwarded(void)
@@ -364,5 +435,7 @@ void run_vtout_tests(void)
     test_endpoints_are_independent();
     test_terminal_smaller_than_screen();
     test_hello_and_goodbye();
+    test_a_scroll_goes_out_as_one();
+    test_a_scroll_too_far_is_a_repaint();
     test_control_characters_are_not_forwarded();
 }

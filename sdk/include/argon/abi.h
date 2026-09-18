@@ -170,6 +170,14 @@ extern "C" {
  *      worktree-usb-kvm calls its 0.45.  Whichever of those lands next has
  *      to RENUMBER rather than assume its number is free - and the check is
  *      one line: `git show <branch>:sdk/include/argon/abi.h | grep MINOR`.
+ * 0.49 appended text_scroll to ag_display_ops_t: the console moved up by so
+ *      many rows, for a panel that can move its own picture.  Before it, a
+ *      scroll was reported to every renderer as damage to every row - true,
+ *      and the most expensive true thing available: on the CYD an application
+ *      printing eleven lines a second made the console send each of them 23
+ *      times, 9.4 KB/s of an 11.5 KB/s line, with the shell's own echo queued
+ *      behind it.  Optional; a driver that leaves it NULL is sent every row as
+ *      before.
  * 0.48 sys->module_task: a task that belongs to a loadable driver rather than
  *      to a process, so a driver can do work that takes milliseconds without
  *      charging it to whoever called in.  Until this, every driver was a
@@ -184,7 +192,7 @@ extern "C" {
  *      number.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 48u
+#define AG_ABI_MINOR 49u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -1038,6 +1046,30 @@ typedef struct ag_display_ops {
      * with something to say says it from ag_driver_init.
      */
     void (*blit_rect)(ag_handle_t h, const ag_blit_t *b);
+
+    /*
+     * ABI 0.49: the console moved up, rather than every row of it changing.
+     *
+     * A scroll used to reach a panel as text_row for every row on the glass,
+     * because that is what the screen model reported and it is true - each row
+     * now holds different characters.  It is also the most expensive way to
+     * say it.  Measured on the CYD: an application printing eleven lines a
+     * second had the console sending each of them 23 times, 9.4 KB/s of an
+     * 11.5 KB/s serial line, and over the phone link thirty rows of Wi-Fi
+     * traffic per printed line.
+     *
+     * `lines` rows leave the top, the same number of blank rows arrive at the
+     * bottom, and nothing else about the picture has changed.  A driver that
+     * can move its own pixels - a memmove of a framebuffer, a hardware
+     * scrolling region, a page moving its own rows - does that and then takes
+     * the text_row calls that follow for the rows that genuinely changed.
+     *
+     * Optional, and its absence costs nothing but speed: a driver that leaves
+     * it NULL is sent every row exactly as before.  Called on the console tick
+     * with `h` zero and the registry held, before the text_row calls for the
+     * same tick, and under the same rule as those - it must not print.
+     */
+    void (*text_scroll)(ag_handle_t h, uint16_t lines);
 } ag_display_ops_t;
 
 /* ------------------------------------------------------------------------ */

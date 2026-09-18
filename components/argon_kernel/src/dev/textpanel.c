@@ -324,6 +324,7 @@ static void panel_forget_all(void)
 static void render_one(const ag_screen_t *screen, const ag_display_ops_t *ops,
                        textpanel_t *tp, bool full)
 {
+    /* `full` is decided again below for a panel that cannot scroll itself. */
     if (full) {
         tp->caret_col = 0xffffu;
         tp->caret_row = 0xffffu;
@@ -374,6 +375,39 @@ static void render_one(const ag_screen_t *screen, const ag_display_ops_t *ops,
     }
     if (cols > AG_SCREEN_MAX_COLS) {
         cols = AG_SCREEN_MAX_COLS;
+    }
+
+    /*
+     * The scroll, before anything that changed on top of it.
+     *
+     * A driver that can move its own picture is told once and then given the
+     * rows that genuinely changed; one that cannot is given the whole screen,
+     * which is what every panel got for every printed line until now.  The
+     * screen's dirty set is shifted with the picture, so "repaint the dirty
+     * rows" without one of these two would leave stale text on the glass.
+     */
+    const uint16_t moved = ag_screen_scrolled(screen);
+    if (!full && moved > 0u) {
+        if (AG_HAS(ops, text_scroll) && ag_screen_scroll_usable(screen) &&
+            moved < rows) {
+            ops->text_scroll(0, moved);
+            /*
+             * The caret moved with everything else, and this panel's record of
+             * where it left one is now a row too low.  Forgetting it costs one
+             * redraw and avoids rubbing out a character on the wrong row.
+             */
+            tp->caret_col = 0xffffu;
+            tp->caret_row = 0xffffu;
+            tp->caret_lit = false;
+        } else {
+            /* No scroll of its own: the whole screen, as before this existed.
+             * The caret went with the text, so what this panel remembers about
+             * it is a row out of date either way. */
+            full = true;
+            tp->caret_col = 0xffffu;
+            tp->caret_row = 0xffffu;
+            tp->caret_lit = false;
+        }
     }
 
     if (s_row == NULL || s_row_cols < cols) {
