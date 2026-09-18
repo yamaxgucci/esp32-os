@@ -317,6 +317,7 @@ static struct {
     uint32_t      band_busy;
     uint32_t      band_refused;
     uint32_t      band_nostack;
+    uint64_t      direct_last;
     uint32_t      stall_band;
     uint32_t      stall_text;
     bool          moaned_stack;
@@ -516,6 +517,15 @@ typedef enum {
  * little for it.
  */
 #define BLIT_STACK_FLOOR 6144u
+
+/*
+ * The picture's share of the device registry: at most one sending pass every
+ * DIRECT_EVERY_US, at most DIRECT_BUDGET_US spent inside it.  See the note in
+ * send_blit_direct - these two together are what stop a fast drawing
+ * application from starving the rest of the machine through this driver.
+ */
+#define DIRECT_EVERY_US  150000ull
+#define DIRECT_BUDGET_US 25000ull
 
 /*
  * And how long a client may prove nothing at all before it is let go.
@@ -1118,15 +1128,31 @@ static wire_t send_blit_direct(const ag_blit_t *b)
     const uint8_t *src = (const uint8_t *)b->px;
 
     /*
-     * A budget for the whole rectangle, and a small one.
+     * How often, before how long.
      *
-     * The kernel calls blit_rect holding the device registry, and every other
-     * driver in the machine is behind that lock - the console, the panel, the
-     * touchscreen.  Whatever is spent here is spent by all of them.  The first
-     * version gave each band ten seconds and gfxdemo froze the board solid; the
-     * picture is worth some milliseconds and it is not worth the machine.
+     * A per-call budget bounds one rectangle and nothing else: how many
+     * rectangles arrive a second is the drawing application's business, not
+     * this driver's.  At two frames a second sixty milliseconds a call is a
+     * tenth of the machine; at twenty frames a second it is the machine, and
+     * the machine then behaves exactly as it was reported to - the picture
+     * stops half drawn and the access point stops answering, because the
+     * console, the panel, the touchscreen and the radio's own work all sit
+     * behind the one device registry this runs inside.
+     *
+     * So the gate is a share of time: a pass at most every DIRECT_EVERY_US,
+     * and DIRECT_BUDGET_US inside it.  However fast anybody draws, this takes
+     * a sixth of that lock at worst.  A frame that arrives between passes is
+     * dropped, which is a screen that updates later and not a board that stops
+     * answering.
      */
-    const uint64_t until = ag_micros() + 60000ull;
+    const uint64_t now0 = ag_micros();
+    if (s.direct_last != 0ull && now0 - s.direct_last < DIRECT_EVERY_US) {
+        s.band_hushed++;
+        return WIRE_OK;
+    }
+    s.direct_last = now0;
+
+    const uint64_t until = now0 + DIRECT_BUDGET_US;
 
     const uint32_t down = (b->h + BAND_ROWS - 1u) / BAND_ROWS;
     const uint32_t across = (b->w + s.band_w - 1u) / s.band_w;

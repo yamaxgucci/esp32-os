@@ -403,10 +403,38 @@ static void supervisor_task(void *arg)
              * gets worse.
              */
             {
-                static size_t s_starved_said;
-                const size_t  largest =
+                static size_t   s_starved_said;
+                static uint64_t s_starved_looked;
+
+                /*
+                 * Cheap questions first, and the expensive one hardly ever.
+                 *
+                 * The largest free block is not a counter: IDF walks every
+                 * block in the heap to find it, with interrupts disabled for
+                 * the whole walk.  Idle, that is microseconds; with the
+                 * picture path allocating and freeing bands as fast as an
+                 * application draws, one walk outlasted the interrupt
+                 * watchdog and reset the board - three times out of three,
+                 * with this line at the top of the backtrace.  A leak watcher
+                 * that kills the machine is worse than no leak watcher.
+                 *
+                 * The report below only ever fires with nothing loaded, so ask
+                 * that first; then the free total, which is a real counter;
+                 * and only then, and at most every few seconds, walk.
+                 */
+                const uint64_t now_us = ag_port_us();
+                if (ag_proc_count() != 0u ||
+                    ag_port_mem_free(AG_MEM_FAST | AG_MEM_BYTE) >
+                        AG_SUP_STARVED_BYTES * 4u ||
+                    (s_starved_looked != 0ull &&
+                     now_us - s_starved_looked < 5000000ull)) {
+                    goto starve_done;
+                }
+                s_starved_looked = now_us;
+
+                const size_t largest =
                     ag_port_mem_largest(AG_MEM_FAST | AG_MEM_BYTE);
-                if (largest < AG_SUP_STARVED_BYTES && ag_proc_count() == 0u) {
+                if (largest < AG_SUP_STARVED_BYTES) {
                     if (s_starved_said == 0u || largest + 2048u < s_starved_said) {
                         s_starved_said = largest;
                         ag_log(AG_LOG_WARN, "supervisor",
@@ -415,9 +443,10 @@ static void supervisor_task(void *arg)
                                "them",
                                (unsigned)largest);
                     }
-                } else if (largest >= AG_SUP_STARVED_BYTES) {
+                } else {
                     s_starved_said = 0u;
                 }
+            starve_done:;
             }
         }
 #endif

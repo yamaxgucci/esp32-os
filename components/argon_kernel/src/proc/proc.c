@@ -469,15 +469,22 @@ bool ag_proc_take_crash_record(char *out, size_t len)
     return waiting;
 }
 
-static void crash_record(proc_t *p, const char *reason)
+/*
+ * `may_lock` is false on the fault path.  See the note below: the heap query
+ * is the one thing in here that takes a lock, and on that path it is the
+ * difference between a recorded fault and a reset board.
+ */
+static void crash_record(proc_t *p, const char *reason, bool may_lock)
 {
     const uint32_t up_ms = now_ms() - (uint32_t)(p->started / 1000);
     size_t         used = 0;
+    bool           used_known = false;
 
-    if (p->heap != NULL) {
+    if (may_lock && p->heap != NULL) {
         ag_port_heap_info_t info;
         ag_port_heap_info(p->heap, &info);
         used = info.allocated;
+        used_known = true;
     }
 
     /*
@@ -488,17 +495,34 @@ static void crash_record(proc_t *p, const char *reason)
      * board (a double fault / interrupt-watchdog reset).  So the record is built
      * only into the lock-free crash buffer; the supervisor drains it to the
      * console and to /sys/crash.log from a safe context (write_crash_record).
+     *
+     * The heap query above is the same rule and was the same bug: it does not
+     * read like a lock, and inside IDF it enters a critical section on the
+     * heap's spinlock.  Measured on the board - an application faulted while
+     * the picture animated, and the machine reset with the watchdog standing
+     * on crash_record -> ag_port_heap_info -> spinlock_acquire.  Hence
+     * `may_lock`, and hence a record that says "arena unknown" rather than one
+     * that costs the board.
      */
     s_crash_text[0] = '\0';
     crash_printf("%s (pid %u) killed at %u ms uptime: %s\n", p->name,
                  (unsigned)p->pid, (unsigned)now_ms(),
                  (reason != NULL) ? reason : "no reason given");
-    crash_printf("  %s for %u ms, %u B of a %u KB arena, %u resource(s), "
-                 "%u B code at %p\n",
-                 ag_proc_state_name(p->state), (unsigned)up_ms, (unsigned)used,
-                 (unsigned)(p->heap_size / 1024u),
-                 (unsigned)ag_reslist_count(&p->res),
-                 (unsigned)p->app.header.code.size, p->app.place.code);
+    if (used_known) {
+        crash_printf("  %s for %u ms, %u B of a %u KB arena, %u resource(s), "
+                     "%u B code at %p\n",
+                     ag_proc_state_name(p->state), (unsigned)up_ms,
+                     (unsigned)used, (unsigned)(p->heap_size / 1024u),
+                     (unsigned)ag_reslist_count(&p->res),
+                     (unsigned)p->app.header.code.size, p->app.place.code);
+    } else {
+        crash_printf("  %s for %u ms, arena use unknown (fault path), %u KB "
+                     "arena, %u resource(s), %u B code at %p\n",
+                     ag_proc_state_name(p->state), (unsigned)up_ms,
+                     (unsigned)(p->heap_size / 1024u),
+                     (unsigned)ag_reslist_count(&p->res),
+                     (unsigned)p->app.header.code.size, p->app.place.code);
+    }
     s_crash_waiting = true;
 
     /*
@@ -1232,7 +1256,7 @@ ag_err_t ag_proc_kill(ag_pid_t pid, const char *reason)
         return -AG_EBUSY;
     }
 
-    crash_record(p, reason);
+    crash_record(p, reason, true);
 
     ag_port_task_delete(task);
     p->task = NULL;
@@ -1626,7 +1650,7 @@ void ag_proc_fault_exit(void)
         return;
     }
 
-    crash_record(p, "faulted");
+    crash_record(p, "faulted", false);   /* mid-fault: nothing here may lock */
     p->killed = true;
     p->exit_code = -AG_EKILLED;
 

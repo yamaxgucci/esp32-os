@@ -17,13 +17,13 @@
  *                      each a different colour, so a mirrored or rotated
  *                      surface shows up as the wrong corner being red.
  *
- *   A red dot goes round the circle, one step of sixty-four per frame, twenty
+ *   A red dot goes round the circle, one step of sixty-four per frame, ten
  *   frames a second, because a still picture cannot tell a working link from a
  *   frozen one - which is what came back from the phone the first time.  Only
  *   the rows it moved through are redrawn and handed over, which is what
  *   makes that rate affordable; the whole picture goes once every two seconds
- *   so nothing painted on top of it stays.  A lap is a little over three
- *   seconds when the board is keeping up.
+ *   so nothing painted on top of it stays.  A lap is six seconds when the
+ *   board is keeping up.
  *
  *   The picture is handed over again twice a second for as long as it is
  *   held, which is not decoration: a screen at the end of a wire keeps
@@ -155,11 +155,13 @@ static void draw_scene(uint16_t w, uint16_t h)
 #define OWN_BAND 16
 
 /*
- * Milliseconds a frame.  Fifty because a patch costs two or three and the eye
- * stops seeing steps somewhere above ten a second; sixty-four positions at
- * this rate is a lap in a little over three seconds.
+ * Milliseconds a frame.  A hundred, because ten a second is where the eye
+ * stops seeing steps and twenty was greedy: every frame goes through the
+ * device registry, and this program is meant to be left running while
+ * somebody uses the machine.  Sixty-four positions at this rate is a lap in
+ * six seconds.
  */
-#define FRAME_MS 50u
+#define FRAME_MS 100u
 
 static uint16_t s_band[OWN_W * OWN_BAND];
 
