@@ -1,0 +1,504 @@
+diff --git a/src/animation.cc b/src/animation.cc
+--- a/src/animation.cc
++++ b/src/animation.cc
+@@ -1720,9 +1720,13 @@ int _make_path(Object* object, int from, int to, unsigned char* rotations, int a
+ // 0x415EFC
+ int pathfinderFindPath(Object* object, int from, int to, unsigned char* rotations, int a5, PathBuilderCallback* callback)
+ {
++    const uint32_t ag_pf0 = ag_us();
++    const unsigned ag_pf_n0 = ag_pf_scan_n;
+     if (a5) {
+         if (callback(object, to, object->elevation) != nullptr) {
+-            return 0;
++            { ag_pf_calls++; const uint32_t t = ag_us() - ag_pf0;
++          if (t > ag_pf_worst_us) ag_pf_worst_us = t; (void)ag_pf_n0; }
++        return 0;
+         }
+     }
+ 
+@@ -1762,6 +1766,8 @@ int pathfinderFindPath(Object* object, int from, int to, unsigned char* rotation
+ 
+         PathNode* prev = nullptr;
+         int v12 = 0;
++        const uint32_t ag_scan0 = ag_us();
++
+         for (int index = 0; v12 < openPathNodeListLength; index += 1) {
+             PathNode* curr = &(gOpenPathNodeList[index]);
+             if (curr->tile != -1) {
+@@ -1773,6 +1779,9 @@ int pathfinderFindPath(Object* object, int from, int to, unsigned char* rotation
+             }
+         }
+ 
++        ag_pf_scan_us += ag_us() - ag_scan0;
++        ag_pf_scan_n++;
++
+         PathNode* curr = &(gOpenPathNodeList[v63]);
+ 
+         memcpy(&temp, curr, sizeof(temp));
+@@ -1794,7 +1803,13 @@ int pathfinderFindPath(Object* object, int from, int to, unsigned char* rotation
+         closedPathNodeListLength += 1;
+ 
+         if (closedPathNodeListLength == 2000) {
+-            return 0;
++            /* ARGON: the expensive case - no path, so every one of the two
++             * thousand nodes was expanded and each expansion scanned the
++             * open list linearly. */
++            ag_pf_exhausted++;
++            { ag_pf_calls++; const uint32_t t = ag_us() - ag_pf0;
++          if (t > ag_pf_worst_us) ag_pf_worst_us = t; (void)ag_pf_n0; }
++        return 0;
+         }
+ 
+         for (int rotation = 0; rotation < ROTATION_COUNT; rotation++) {
+@@ -1805,7 +1820,11 @@ int pathfinderFindPath(Object* object, int from, int to, unsigned char* rotation
+             }
+ 
+             if (tile != to) {
++                const uint32_t ag_cb0 = ag_us();
+                 Object* v24 = callback(object, tile, object->elevation);
++
++                ag_pf_block_us += ag_us() - ag_cb0;
++                ag_pf_block_n++;
+                 if (v24 != nullptr) {
+                     if (!canUseDoor(object, v24)) {
+                         continue;
+@@ -1814,16 +1833,22 @@ int pathfinderFindPath(Object* object, int from, int to, unsigned char* rotation
+             }
+ 
+             int v25 = 0;
++            const uint32_t ag_slot0 = ag_us();
++
+             for (; v25 < 2000; v25++) {
+                 if (gOpenPathNodeList[v25].tile == -1) {
+                     break;
+                 }
+             }
++            ag_pf_slot_us += ag_us() - ag_slot0;
++            ag_pf_slot_n++;
+ 
+             openPathNodeListLength += 1;
+ 
+             if (openPathNodeListLength == 2000) {
+-                return 0;
++                { ag_pf_calls++; const uint32_t t = ag_us() - ag_pf0;
++          if (t > ag_pf_worst_us) ag_pf_worst_us = t; (void)ag_pf_n0; }
++        return 0;
+             }
+ 
+             gPathfinderProcessedTiles[tile / 8] |= bit;
+@@ -1906,7 +1931,9 @@ int pathfinderFindPath(Object* object, int from, int to, unsigned char* rotation
+             }
+         }
+ 
+-        return index;
++        { ag_pf_calls++; const uint32_t t = ag_us() - ag_pf0;
++      if (t > ag_pf_worst_us) ag_pf_worst_us = t; }
++    return index;
+     }
+ 
+     return 0;
+diff --git a/src/input.cc b/src/input.cc
+--- a/src/input.cc
++++ b/src/input.cc
+@@ -177,6 +177,10 @@ int inputGetInput()
+      * function is an SDL event pump, a list of background handlers, the mouse
+      * and a scan of every button on screen.  Four different things.
+      */
++    /* ARGON: and now timed apart as well.  The worst frame while walking
++     * is a second of "input", and this function is four things. */
++    const uint32_t ag_i0 = ag_us();
++
+     AG_STEP("input: SDL events");
+     _GNW95_process_message();
+ 
+@@ -184,10 +188,18 @@ int inputGetInput()
+         _GNW95_lost_focus();
+     }
+ 
++    const uint32_t ag_i1 = ag_us();
++
+     AG_STEP("input: background handlers");
+     _process_bk();
+     AG_STEP("playing");
+ 
++    const uint32_t ag_i2 = ag_us();
++
++    ag_in_events_us += ag_i1 - ag_i0;
++    ag_in_bk_us += ag_i2 - ag_i1;
++    ag_in_calls++;
++
+     v3 = dequeueInputEvent();
+     if (v3 == -1 && mouseGetEvent() & 0x33) {
+         mouseGetPosition(&_input_mx, &_input_my);
+diff --git a/src/interpreter.cc b/src/interpreter.cc
+--- a/src/interpreter.cc
++++ b/src/interpreter.cc
+@@ -20,6 +20,8 @@
+ /* ARGON: the breadcrumbs.  See port/ag_diag.h. */
+ #include "ag_diag.h"
+ 
++extern "C" uint32_t ag_us(void);
++
+ namespace fallout {
+ 
+ typedef struct ProgramListNode {
+@@ -2771,7 +2773,29 @@ void _interpret(Program* program, int a2)
+             programFatalError(err);
+         }
+ 
+-        handler(program);
++        /*
++         * ARGON: what a script spends its time in, by opcode.
++         *
++         * ZCBrahmn.int runs for 921 ms in a single timed event and
++         * KChild.int for 1018 - the second-long jolt while walking - with
++         * nothing read off the card, so it is all execution.  A clock read
++         * per instruction is cheap next to that, and it is the only way to
++         * tell a script that loops from a built-in that is slow.
++         */
++        {
++            const uint32_t ag_op0 = ag_us();
++
++            handler(program);
++
++            const uint32_t ag_took = ag_us() - ag_op0;
++            const unsigned ag_slot = opcodeIndex & 0x3FFu;
++
++            ag_op_us[ag_slot] += ag_took;
++            ag_op_n[ag_slot]++;
++            if (ag_took > ag_op_worst[ag_slot]) {
++                ag_op_worst[ag_slot] = ag_took;
++            }
++        }
+     }
+ 
+     if ((program->flags & PROGRAM_FLAG_EXITED) != 0) {
+diff --git a/src/queue.cc b/src/queue.cc
+--- a/src/queue.cc
++++ b/src/queue.cc
+@@ -1,5 +1,9 @@
+ #include "queue.h"
+ 
++#include "ag_diag.h"
++
++extern "C" uint32_t ag_us(void);
++
+ #include "actions.h"
+ #include "critter.h"
+ #include "display_monitor.h"
+@@ -347,17 +351,53 @@ int queueProcessEvents()
+     // TODO: this is 0 or 1, but in some cases -1. Probably needs to be bool.
+     int stopProcess = 0;
+ 
++    /*
++     * ARGON: due events, with a budget, and counted by type.
++     *
++     * This loop runs every event that has come due, and they come due
++     * together: nineteen of them in a thirty-second window cost 1.11
++     * seconds inside ONE frame - the second-long jolt while walking.  A
++     * budget on the caller could not help, because the whole burst is
++     * inside this one call.
++     *
++     * The queue is keyed on game time, which moves in tenths of a second,
++     * so an event finishing a frame or two later is not late in any sense
++     * the game can tell.  What it must never do is starve: the events left
++     * over are the head of the list and run first next frame.
++     */
++    const uint32_t ag_began = ag_us();
++
+     while (gQueueListHead != nullptr) {
+         QueueListNode* queueListNode = gQueueListHead;
+         if (time < queueListNode->time || stopProcess != 0) {
+             break;
+         }
++        if (ag_queue_budget_us != 0u
++                && ag_us() - ag_began >= ag_queue_budget_us
++                && ag_queue_done != 0u) {
++            ag_queue_deferred++;
++            break;
++        }
+ 
+         gQueueListHead = queueListNode->next;
+ 
+         EventTypeDescription* eventTypeDescription = &(gEventTypeDescriptions[queueListNode->type]);
++        const uint32_t ag_e0 = ag_us();
++
+         stopProcess = eventTypeDescription->handlerProc(queueListNode->owner, queueListNode->data);
+ 
++        {
++            const uint32_t took = ag_us() - ag_e0;
++            const unsigned kind = (unsigned)queueListNode->type & 15u;
++
++            ag_queue_type_us[kind] += took;
++            ag_queue_type_n[kind]++;
++            if (took > ag_queue_type_worst[kind]) {
++                ag_queue_type_worst[kind] = took;
++            }
++            ag_queue_done++;
++        }
++
+         if (eventTypeDescription->freeProc != nullptr) {
+             eventTypeDescription->freeProc(queueListNode->data);
+         }
+diff --git a/src/scripts.cc b/src/scripts.cc
+--- a/src/scripts.cc
++++ b/src/scripts.cc
+@@ -43,6 +43,9 @@
+ /* ARGON: the breadcrumbs.  See port/ag_diag.h. */
+ #include "ag_diag.h"
+ 
++/* The microsecond clock, as animation.cc takes it. */
++extern "C" uint32_t ag_us(void);
++
+ namespace fallout {
+ 
+ #define SCRIPT_LIST_EXTENT_SIZE 16
+@@ -780,7 +783,16 @@ static void _doBkProcesses()
+         _set = 1;
+     }
+ 
++    /*
++     * ARGON: the four things this does, timed apart.
++     *
++     * It is the most expensive background handler by far - 3.4 ms of every
++     * frame and a worst call of 1.12 seconds, against 199 ms for the worst
++     * of its siblings - and until now it was one number.
++     */
+     int v0 = _get_bk_time();
++    const uint32_t ag_b0 = ag_us();
++
+     if (gScriptsEnabled) {
+         _lasttime = v0;
+ 
+@@ -791,16 +803,48 @@ static void _doBkProcesses()
+         }
+     }
+ 
++    const uint32_t ag_b1 = ag_us();
++
+     _updateWindows();
+ 
++    const uint32_t ag_b2 = ag_us();
++
+     if (gScriptsEnabled && _script_engine_run_critters) {
+         // SFALL: Fix to prevent the execution of critter_p_proc and game events
+         // when playing movies.
+         if (!_gdialogActive() && !gameMovieIsPlaying()) {
+             _script_chk_critters();
++            const uint32_t ag_b3 = ag_us();
++
++            const uint32_t ag_b4 = ag_us();
++
+             _script_chk_timed_events();
++
++            const uint32_t ag_b5 = ag_us();
++
++            ag_bk_timed_us += ag_b5 - ag_b4;
++            ag_bk_critters_us += ag_b3 - ag_b2;
++            if (ag_b3 - ag_b2 > ag_bk_critters_worst) {
++                ag_bk_critters_worst = ag_b3 - ag_b2;
++            }
++            if (ag_b5 - ag_b4 > ag_bk_timed_worst) {
++                ag_bk_timed_worst = ag_b5 - ag_b4;
++            }
+         }
+     }
++
++    ag_bk_programs_us += ag_b1 - ag_b0;
++    ag_bk_windows_us += ag_b2 - ag_b1;
++    ag_bk_calls++;
++
++    /* The averages are small and the outlier is a second, so keep the
++     * worst of each part as well. */
++    if (ag_b1 - ag_b0 > ag_bk_programs_worst) {
++        ag_bk_programs_worst = ag_b1 - ag_b0;
++    }
++    if (ag_b2 - ag_b1 > ag_bk_windows_worst) {
++        ag_bk_windows_worst = ag_b2 - ag_b1;
++    }
+ }
+ 
+ // 0x4A3CA0
+@@ -847,6 +891,54 @@ static void _script_chk_critters()
+ // TODO: Check.
+ //
+ // 0x4A3D84
++/*
++ * ARGON: the thirty-second map update, spread over frames.
++ *
++ * Every thirty seconds the game runs map_update on every script of the
++ * map.  In a town that is a hundred and fifty of them, some needing their
++ * program read off the card, and it all happens inside one frame:
++ * measured at 913 ms against an average of 755 us for the same handler.
++ * That is the jolt a player gets twice a minute.
++ *
++ * Nothing about map_update needs them in the same frame - it is periodic
++ * housekeeping - so the list is kept and walked with a few milliseconds
++ * of budget per frame until it is done.
++ */
++#define AG_MAPUPD_MAX 600
++#define AG_MAPUPD_BUDGET_US 6000u
++
++/* How long a frame may spend on due game events before leaving the rest
++ * for the next one.  Eight milliseconds is half a frame at sixty. */
++#define AG_QUEUE_BUDGET_US 8000u
++
++static int ag_mapupd_sid[AG_MAPUPD_MAX];
++static int ag_mapupd_len;
++static int ag_mapupd_at;
++
++static void ag_mapupd_step(void)
++{
++    if (ag_mapupd_at >= ag_mapupd_len) {
++        return;
++    }
++
++    const uint32_t began = ag_us();
++    const bool     spatials = _scr_SpatialsEnabled;
++
++    _scr_SpatialsEnabled = false;
++    while (ag_mapupd_at < ag_mapupd_len) {
++        scriptExecProc(ag_mapupd_sid[ag_mapupd_at++], SCRIPT_PROC_MAP_UPDATE);
++        if (ag_us() - began >= AG_MAPUPD_BUDGET_US) {
++            break;
++        }
++    }
++    _scr_SpatialsEnabled = spatials;
++
++    if (ag_mapupd_at >= ag_mapupd_len) {
++        ag_mapupd_len = 0;
++        ag_mapupd_at = 0;
++    }
++}
++
+ static void _script_chk_timed_events()
+ {
+     int v0 = _get_bk_time();
+@@ -859,7 +951,11 @@ static void _script_chk_timed_events()
+     if (gameGetState() != GAME_STATE_4) {
+         if (getTicksBetween(v0, _last_light_time) >= 30000) {
+             _last_light_time = v0;
++
++            const uint32_t ag_mu0 = ag_us();
++
+             scriptsExecMapUpdateScripts(SCRIPT_PROC_MAP_UPDATE);
++            ag_te_mapupd_us += ag_us() - ag_mu0;
+         }
+     } else {
+         v1 = false;
+@@ -873,13 +969,43 @@ static void _script_chk_timed_events()
+         v1 = true;
+     }
+ 
++    /* A few of the map-update scripts, if any are still owed. */
++    ag_mapupd_step();
++
+     if (v1) {
++        const uint32_t ag_q0 = ag_us();
++        unsigned       ag_q_n = 0;
++
++        /*
++         * ARGON: due events, but not all of them in one frame.
++         *
++         * Twenty-four events in a thirty-second window cost 1.25 seconds,
++         * and they come due together: the worst burst was 1.11 seconds in
++         * a single frame - the second-long jolt while walking.  An event
++         * that is a few frames late is not late in game terms (the queue
++         * is keyed on game time, which moves in tenths of a second), so
++         * the burst gets a budget and the rest waits for the next frame.
++         */
+         while (!queueIsEmpty()) {
+             if (gameTimeGetTime() < queueGetNextEventTime()) {
+                 break;
+             }
+ 
+             queueProcessEvents();
++            ag_q_n++;
++
++            if (ag_us() - ag_q0 >= AG_QUEUE_BUDGET_US) {
++                break;
++            }
++        }
++
++        const uint32_t ag_q_took = ag_us() - ag_q0;
++
++        ag_te_queue_us += ag_q_took;
++        ag_te_queue_n += ag_q_n;
++        if (ag_q_took > ag_te_queue_worst) {
++            ag_te_queue_worst = ag_q_took;
++            ag_te_queue_worst_n = ag_q_n;
+         }
+     }
+ }
+@@ -960,6 +1086,9 @@ err:
+ // 0x4A3F4C
+ int scriptEventProcess(Object* obj, void* data)
+ {
++    const uint32_t ag_ev0 = ag_us();
++    const unsigned ag_ld0 = ag_script_load_us;
++
+     ScriptEvent* scriptEvent = (ScriptEvent*)data;
+ 
+     Script* script;
+@@ -971,6 +1100,31 @@ int scriptEventProcess(Object* obj, void* data)
+ 
+     scriptExecProc(scriptEvent->sid, SCRIPT_PROC_TIMED);
+ 
++    {
++        const uint32_t took = ag_us() - ag_ev0;
++
++        if (took > ag_script_event_worst) {
++            ag_script_event_worst = took;
++            ag_script_event_worst_load = ag_script_load_us - ag_ld0;
++            ag_script_event_worst_sid = scriptEvent->sid;
++        }
++
++        /* ARGON: a timed script that takes a tenth of a second is the
++         * jolt while walking; say which one it is, by name. */
++        if (took >= 100000u) {
++            char name[16];
++
++            name[0] = '\0';
++            if (scriptsGetFileName(script->index & 0xFFFFFF, name,
++                                   sizeof(name)) == -1) {
++                name[0] = '?';
++                name[1] = '\0';
++            }
++            ag_slow_script_note(name, (unsigned)scriptEvent->sid,
++                                took / 1000u);
++        }
++    }
++
+     return 0;
+ }
+ 
+@@ -1414,7 +1568,17 @@ int scriptExecProc(int sid, int proc)
+          */
+         scriptsTrimPrograms();
+ 
++        /* ARGON: what reading a script costs.  One timed script event was
++         * 921 ms of a frame and this is the only thing in it that touches
++         * the card. */
++        const uint32_t ag_pl0 = ag_us();
++
+         script->program = scriptsCreateProgramByName(name);
++        ag_script_load_us += ag_us() - ag_pl0;
++        ag_script_load_n++;
++        if (ag_us() - ag_pl0 > ag_script_load_worst) {
++            ag_script_load_worst = ag_us() - ag_pl0;
++        }
+         if (script->program == nullptr) {
+             debugPrint("\nError: exec_script_proc: script load failed!");
+             return -1;
+@@ -2785,6 +2949,11 @@ void scriptsExecMapUpdateScripts(int proc)
+ 
+             scriptExecProc(sidList[index], proc);
+         }
++    } else if (proc == SCRIPT_PROC_MAP_UPDATE && sidListLength <= AG_MAPUPD_MAX) {
++        /* ARGON: handed to ag_mapupd_step, a few milliseconds a frame. */
++        memcpy(ag_mapupd_sid, sidList, sizeof(*sidList) * (size_t)sidListLength);
++        ag_mapupd_len = sidListLength;
++        ag_mapupd_at = 0;
+     } else {
+         for (int index = 0; index < sidListLength; index++) {
+             scriptExecProc(sidList[index], proc);

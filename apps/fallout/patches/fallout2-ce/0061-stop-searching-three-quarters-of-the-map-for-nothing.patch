@@ -1,0 +1,111 @@
+diff --git a/src/object.cc b/src/object.cc
+--- a/src/object.cc
++++ b/src/object.cc
+@@ -1,5 +1,12 @@
+ #include "object.h"
+ 
++/* ARGON: -render 1 bounds the object search by the art actually seen
++ * instead of by a whole screen in each direction.  See the note in
++ * _obj_render_pre_roof. */
++extern "C" int ag_render_tight;
++extern "C" int ag_reach_side;
++extern "C" int ag_reach_down;
++
+ #include <assert.h>
+ #include <string.h>
+ 
+@@ -965,9 +972,64 @@ void _obj_render_pre_roof(Rect* rect, int elevation)
+     }
+ 
+     int ambientIntensity = lightGetAmbientIntensity();
+-    int minX = updatedRect.left - 320;
+-    int minY = updatedRect.top - 240;
+-    int maxX = updatedRect.right + 320;
++
++    /*
++     * ARGON: how far outside the dirty rectangle an object can still reach.
++     *
++     * The original grows the search area by a WHOLE SCREEN in every
++     * direction, so refreshing a forty-pixel square searches the same three
++     * thousand hex positions as refreshing the entire map.  Measured on the
++     * board: 100 refreshes in thirty seconds, 295200 turns of this loop,
++     * 28874 calls to the object drawer - and 480 of them drew anything.
++     * This pass is 63% of a map refresh and a map refresh is 145 ms of the
++     * worst 147 ms animation tick, which is the jolt Maxim feels.
++     *
++     * Three quarters of that search area cannot contain anything, and the
++     * drawing code says so rather than a guess.  An object is drawn from
++     *
++     *     top    = screenY - (height - 1)      bottom = screenY
++     *     left   = screenX - width / 2         right  = left + width - 1
++     *
++     * where screenX/screenY are its tile's point plus the art's offsets.
++     * So:
++     *
++     *  - an object NEVER reaches below its own tile point, which makes the
++     *    240 pixels ABOVE the rectangle useless: something up there draws
++     *    further up, away from us.  Only the art's own y offset and an
++     *    object's animation offset can push it down, and both are tens of
++     *    pixels.  Sixty-four is generous.
++     *  - sideways it reaches half its width, so 320 pixels of padding is
++     *    room for art 640 pixels wide.  Nothing in this game is a third of
++     *    that; the floor here is 192, which allows 384, and it GROWS if a
++     *    picture ever proves wider - ag_size_note keeps the widest seen.
++     *  - BELOW the rectangle the full 240 stays: a tall wall standing on a
++     *    tile under us really does draw up into view.
++     *
++     * -render 0 puts the original back, so the two can be compared.
++     */
++    int padSide = 320;
++    int padUp = 240;
++
++    if (ag_render_tight != 0) {
++        padSide = ag_reach_side + 32;
++        if (padSide < 192) {
++            padSide = 192;
++        }
++        if (padSide > 320) {
++            padSide = 320;
++        }
++        padUp = ag_reach_down + 32;
++        if (padUp < 64) {
++            padUp = 64;
++        }
++        if (padUp > 240) {
++            padUp = 240;
++        }
++    }
++
++    int minX = updatedRect.left - padSide;
++    int minY = updatedRect.top - padUp;
++    int maxX = updatedRect.right + padSide;
+     int maxY = updatedRect.bottom + 240;
+     int upperLeftTile = tileFromScreenXY(minX, minY, elevation, true);
+     int updateAreaHexWidth = (maxX - minX + 1) / 32;
+@@ -5185,10 +5247,26 @@ static inline unsigned ag_size_slot(int fid)
+ }
+ 
+ /* Remember the widest this fid's rectangle has ever reached around its tile. */
++/*
++ * ARGON: the widest and the lowest-reaching art seen on this map, in pixels
++ * from the tile's own point.  These bound the search area in
++ * _obj_render_pre_roof; they only ever grow, and they are fed by the same
++ * bounds the engine itself computed while drawing.
++ */
+ static void ag_size_note(int fid, int dleft, int dright, int dtop, int dbottom)
+ {
+     AgArtSize* e = &gArtSizes[ag_size_slot(fid)];
+ 
++    if (-dleft > ag_reach_side) {
++        ag_reach_side = -dleft;
++    }
++    if (dright > ag_reach_side) {
++        ag_reach_side = dright;
++    }
++    if (dbottom > ag_reach_down) {
++        ag_reach_down = dbottom;
++    }
++
+     if (e->fid != fid) {
+         /* One slot per hash, last writer wins: a collision costs the other
+          * fid its shortcut, never its correctness. */

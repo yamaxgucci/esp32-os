@@ -1,0 +1,73 @@
+diff --git a/src/interpreter.cc b/src/interpreter.cc
+--- a/src/interpreter.cc
++++ b/src/interpreter.cc
+@@ -23,7 +23,8 @@
+ extern "C" uint32_t ag_us(void);
+ extern "C" int ag_events_budget_us;
+ extern "C" unsigned ag_events_split, ag_events_passes;
+-static int ag_ev_resume;
++static int ag_ev_resume;      /* which program to start the next pass at */
++static int ag_ev_resume_proc; /* and which procedure inside it */
+ 
+ namespace fallout {
+ 
+@@ -3059,14 +3060,26 @@ static void _doEvents()
+             programListNode = gInterpreterProgramListHead;
+             ag_ev_index = 0;
+             ag_ev_resume = 0;
++            ag_ev_resume_proc = 0;
+         }
+     }
+ 
+     while (programListNode != nullptr) {
+         procedureCount = stackReadInt32(programListNode->program->procedures, 0);
+ 
+-        procedurePtr = programListNode->program->procedures + 4;
+-        for (procedureIndex = 0; procedureIndex < procedureCount; procedureIndex++) {
++        /* Only the program the last frame stopped inside resumes part
++         * way through; every one after it starts at its first procedure. */
++        int ag_first = 0;
++
++        if (ag_events_budget_us > 0 && ag_ev_index == ag_ev_resume
++                && ag_ev_resume_proc > 0 && ag_ev_resume_proc < procedureCount) {
++            ag_first = ag_ev_resume_proc;
++        }
++        ag_ev_resume_proc = 0;
++
++        procedurePtr = programListNode->program->procedures
++            + 4 + (size_t)ag_first * sizeof(Procedure);
++        for (procedureIndex = ag_first; procedureIndex < procedureCount; procedureIndex++) {
+             procedureFlags = stackReadInt32(procedurePtr, offsetof(Procedure, flags));
+             if ((procedureFlags & PROCEDURE_FLAG_CONDITIONAL) != 0) {
+                 memcpy(env, programListNode->program, sizeof(env));
+@@ -3099,6 +3112,22 @@ static void _doEvents()
+                 }
+             }
+             procedurePtr += sizeof(Procedure);
++
++            /*
++             * After every PROCEDURE, and that is the whole point.
++             *
++             * Checked after every program instead, the budget did nothing:
++             * 1695 passes finished whole, 8 were split, and the worst call
++             * was still 165 milliseconds - because all of it was inside one
++             * program, and the check ran when it was already spent.
++             */
++            if (ag_events_budget_us > 0
++                    && (int)(ag_us() - ag_ev_began) >= ag_events_budget_us) {
++                ag_ev_resume = ag_ev_index;
++                ag_ev_resume_proc = procedureIndex + 1;
++                ag_events_split++;
++                return;
++            }
+         }
+ 
+         programListNode = programListNode->next;
+@@ -3114,6 +3143,7 @@ static void _doEvents()
+ 
+     /* A whole pass finished: the next one starts at the top. */
+     ag_ev_resume = 0;
++    ag_ev_resume_proc = 0;
+     ag_events_passes++;
+ }
+ 

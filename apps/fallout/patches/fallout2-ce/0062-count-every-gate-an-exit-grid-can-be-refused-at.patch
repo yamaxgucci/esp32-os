@@ -1,0 +1,107 @@
+diff --git a/src/map.cc b/src/map.cc
+--- a/src/map.cc
++++ b/src/map.cc
+@@ -23,6 +23,7 @@ extern "C" void ag_loan_map_end(void);
+ extern "C" uint32_t ag_us(void);
+ /* -mapfill: fill the store from the map inventory at the end of a load. */
+ extern "C" int ag_map_fill;
++extern "C" int ag_exit_on_map;
+ 
+ /* ARGON: for aiMessagesRelease; see the release below. */
+ #include "combat_ai.h"
+@@ -935,8 +936,15 @@ static void ag_map_inventory(void)
+         }
+     }
+ 
++    /* ARGON: and how many hexes lead out of this map, so that "the exits
++     * are not drawn" can be told from "there are no exits here". */
++    ag_exit_on_map = 0;
++
+     for (Object* obj = objectFindFirst(); obj != nullptr;
+             obj = objectFindNext()) {
++        if (isExitGridPid(obj->pid)) {
++            ag_exit_on_map++;
++        }
+         /*
+          * ARGON: a critter is not one picture.
+          *
+diff --git a/src/object.cc b/src/object.cc
+--- a/src/object.cc
++++ b/src/object.cc
+@@ -1,5 +1,12 @@
+ #include "object.h"
+ 
++/* ARGON: why the exit grids are not on the screen; see the counters
++ * in _obj_render_object. */
++extern "C" unsigned ag_exit_calls, ag_exit_hidden, ag_exit_early;
++extern "C" unsigned ag_exit_noart, ag_exit_missed, ag_exit_drew;
++extern "C" unsigned ag_exit_w, ag_exit_h, ag_exit_flags;
++extern "C" int ag_exit_fid, ag_exit_pid, ag_exit_on_map;
++
+ /* ARGON: -render 1 bounds the object search by the art actually seen
+  * instead of by a whole screen in each direction.  See the note in
+  * _obj_render_pre_roof. */
+@@ -5339,15 +5346,34 @@ static void _obj_render_object(Object* object, Rect* rect, int light)
+      * little for a big blit, so the split matters. */
+     ag_draw_calls++;
+ 
++    /* ARGON: the way out of a map is drawn like anything else, and Maxim
++     * says it is not being drawn.  Every gate this function can refuse at
++     * is counted separately for exit grids, so the answer is a number
++     * rather than a theory. */
++    const bool ag_is_exit = isExitGridPid(object->pid);
++
++    if (ag_is_exit) {
++        ag_exit_calls++;
++        ag_exit_fid = object->fid;
++        ag_exit_pid = object->pid;
++        ag_exit_flags = (unsigned)object->flags;
++    }
++
+     int type = FID_TYPE(object->fid);
+     if (artIsObjectTypeHidden(type)) {
+         ag_draw_hidden++;
++        if (ag_is_exit) {
++            ag_exit_hidden++;
++        }
+         return;
+     }
+ 
+     /* ARGON: the cheap refusal, before the art is fetched.  See ag_size_note. */
+     if (ag_cannot_touch(object, rect)) {
+         ag_draw_early++;
++        if (ag_is_exit) {
++            ag_exit_early++;
++        }
+         return;
+     }
+ 
+@@ -5356,6 +5382,9 @@ static void _obj_render_object(Object* object, Rect* rect, int light)
+     Art* art = artLock(object->fid, &cacheEntry);
+     ag_draw_lock_us += ag_us() - ag_d0;
+     if (art == nullptr) {
++        if (ag_is_exit) {
++            ag_exit_noart++;
++        }
+         return;
+     }
+ 
+@@ -5406,10 +5435,18 @@ static void _obj_render_object(Object* object, Rect* rect, int light)
+ 
+     if (rectIntersection(&objectRect, rect, &objectRect) != 0) {
+         ag_draw_missed++;
++        if (ag_is_exit) {
++            ag_exit_missed++;
++        }
+         artUnlock(cacheEntry);
+         return;
+     }
+     ag_draw_hit++;
++    if (ag_is_exit) {
++        ag_exit_drew++;
++        ag_exit_w = frameWidth;
++        ag_exit_h = frameHeight;
++    }
+ 
+     unsigned char* src = artGetFrameData(art, object->frame, object->rotation);
+     const unsigned char* src2 = src;

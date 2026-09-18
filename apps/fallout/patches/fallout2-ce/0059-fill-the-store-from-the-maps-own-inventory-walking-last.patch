@@ -1,0 +1,212 @@
+diff --git a/src/art.cc b/src/art.cc
+--- a/src/art.cc
++++ b/src/art.cc
+@@ -1376,6 +1376,80 @@ int ag_art_size_of(int fid)
+     return size;
+ }
+ 
++/*
++ * ARGON: fill the store from the list a map made of itself.
++ *
++ * Two rules, both learned the hard way.
++ *
++ * ONE BUFFER, not one per picture.  The first version asked the arena for
++ * every file it read - a critter animation is around 300 KB, and the art
++ * cache reacts to a large allocation it cannot satisfy by throwing ITSELF
++ * away, so the fill kept emptying the cache the load was filling.  Here the
++ * buffer is taken once, sized to the largest picture worth keeping, and
++ * given back at the end.
++ *
++ * ORDER MATTERS, because the store is smaller than some maps need.  The
++ * caller sorts the list: floor tiles first, then the objects standing on
++ * them, then critters' standing poses, and walking animations LAST - Maxim
++ * asked for that explicitly, because a big location should spend its last
++ * kilobytes on something that is on the screen rather than on an animation
++ * that may never play.  When the store fills up the tail is simply dropped.
++ */
++void artStoreFillList(const int* fids, unsigned count)
++{
++    if (fids == nullptr || count == 0u || !ag_art_store_present()) {
++        return;
++    }
++
++    const uint32_t t0 = ag_us();
++    size_t cap = 320u * 1024u;
++    unsigned char* buf = nullptr;
++
++    while (cap >= 64u * 1024u) {
++        buf = (unsigned char*)internal_malloc(cap);
++        if (buf != nullptr) {
++            break;
++        }
++        cap /= 2u;
++    }
++    if (buf == nullptr) {
++        ag_map_fill_note(0u, 0u, 0u, 0u, count, 0u, 0u);
++        return;
++    }
++
++    unsigned kept = 0, kb = 0, already = 0, too_big = 0, left = 0;
++
++    for (unsigned i = 0; i < count; i++) {
++        int size = 0;
++
++        if (ag_art_store_full()) {
++            left = count - i;
++            break;
++        }
++        if (!ag_art_store_may_keep(fids[i])) {
++            already++;
++            continue;
++        }
++        if (artCacheGetFileSizeImpl(fids[i], &size) != 0 || size <= 0) {
++            continue;
++        }
++        if ((size_t)size > cap) {
++            too_big++;
++            continue;
++        }
++        if (artCacheReadDataImpl(fids[i], &size, buf) != 0) {
++            continue;
++        }
++        ag_art_store_offer(fids[i], buf, size);
++        kept++;
++        kb += (unsigned)size / 1024u;
++    }
++
++    internal_free(buf);
++    ag_map_fill_note(kept, kb, already, too_big, left,
++                     (unsigned)(cap / 1024u), (ag_us() - t0) / 1000u);
++}
++
+ void artStoreTopUp(void)
+ {
+     /* ARGON: sixty-four at a time, until the list is empty.  It used to take
+diff --git a/src/art.h b/src/art.h
+--- a/src/art.h
++++ b/src/art.h
+@@ -157,6 +157,10 @@ const unsigned char* artGetFrameData(Art* art, int frame, int direction);
+ /* ARGON: write the art asked for outside a map load into the flash store.
+  * Call it at the start of a fill window; see apps/fallout/port/art_store.h. */
+ void artStoreTopUp(void);
++
++/* Put the art a map named into the flash store, in the order given, using
++ * ONE buffer for the whole job.  See the note on the definition. */
++void artStoreFillList(const int* fids, unsigned count);
+ int ag_art_size_of(int fid);
+ ArtFrame* artGetFrame(Art* art, int frame, int direction);
+ bool artExists(int fid);
+diff --git a/src/map.cc b/src/map.cc
+--- a/src/map.cc
++++ b/src/map.cc
+@@ -836,10 +836,26 @@ int mapLoadByName(char* fileName)
+  * from whatever the cache happened to evict: measured, 788 stored files
+  * and nine of them ever read back.
+  */
++/*
++ * ARGON: and the order the store is filled in, which matters because some
++ * locations name more art than the store holds.  Maxim's rule: walking
++ * animations go in LAST, so that a big map spends its last kilobytes on
++ * something that is actually on the screen.
++ */
++enum {
++    AG_FILL_TILE = 0,   /* the floor, drawn everywhere, every frame */
++    AG_FILL_OBJ  = 1,   /* scenery, walls, items standing on it */
++    AG_FILL_POSE = 2,   /* critters as they stand */
++    AG_FILL_WALK = 3,   /* and only then how they walk */
++    AG_FILL_KINDS
++};
++
+ static void ag_map_inventory(void)
+ {
+     enum { kMax = 3000 };
+     static int      seen[kMax];
++    static uint8_t  prio[kMax];
++    static int      order[kMax];
+     static unsigned kb_by_kind[16];
+     static unsigned n_by_kind[16];
+     unsigned        n = 0;
+@@ -851,7 +867,8 @@ static void ag_map_inventory(void)
+ 
+     /* Sorted insert, so the "have I seen this" question stays cheap. */
+     struct local {
+-        static bool add(int *list, unsigned *len, unsigned max, int fid)
++        static bool add(int *list, uint8_t *pri, unsigned *len, unsigned max,
++                        int fid, uint8_t p)
+         {
+             unsigned lo = 0, hi = *len;
+ 
+@@ -859,6 +876,9 @@ static void ag_map_inventory(void)
+                 const unsigned mid = lo + (hi - lo) / 2u;
+ 
+                 if (list[mid] == fid) {
++                    if (p < pri[mid]) {
++                        pri[mid] = p;
++                    }
+                     return false;
+                 }
+                 if (list[mid] < fid) {
+@@ -872,8 +892,10 @@ static void ag_map_inventory(void)
+             }
+             for (unsigned i = *len; i > lo; i--) {
+                 list[i] = list[i - 1u];
++                pri[i] = pri[i - 1u];
+             }
+             list[lo] = fid;
++            pri[lo] = p;
+             (*len)++;
+             return true;
+         }
+@@ -891,7 +913,8 @@ static void ag_map_inventory(void)
+             };
+ 
+             for (int k = 0; k < 2; k++) {
+-                if (!local::add(seen, &n, kMax, fids[k])) {
++                if (!local::add(seen, prio, &n, kMax, fids[k],
++                                AG_FILL_TILE)) {
+                     if (n >= kMax) {
+                         skipped++;
+                     }
+@@ -935,7 +958,8 @@ static void ag_map_inventory(void)
+                                           (obj->fid & 0xF000) >> 12,
+                                           (obj->fid & 0x70000000) >> 28);
+ 
+-                if (local::add(seen, &n, kMax, afid)) {
++                if (local::add(seen, prio, &n, kMax, afid,
++                              AG_FILL_WALK)) {
+                     const int asize = ag_art_size_of(afid);
+                     const unsigned akind = ((unsigned)afid >> 24) & 15u;
+ 
+@@ -948,7 +972,10 @@ static void ag_map_inventory(void)
+             }
+         }
+ 
+-        if (!local::add(seen, &n, kMax, obj->fid)) {
++        if (!local::add(seen, prio, &n, kMax, obj->fid,
++                        (PID_TYPE(obj->pid) == OBJ_TYPE_CRITTER)
++                            ? (uint8_t)AG_FILL_POSE
++                            : (uint8_t)AG_FILL_OBJ)) {
+             if (n >= kMax) {
+                 skipped++;
+             }
+@@ -966,6 +993,20 @@ static void ag_map_inventory(void)
+     }
+ 
+     ag_map_inventory_note(n, total_kb, skipped, n_by_kind, kb_by_kind);
++
++    /* Floors, then what stands on them, then critters, then walking. */
++    {
++        unsigned at = 0;
++
++        for (unsigned p = 0; p < AG_FILL_KINDS; p++) {
++            for (unsigned i = 0; i < n; i++) {
++                if (prio[i] == p) {
++                    order[at++] = seen[i];
++                }
++            }
++        }
++        artStoreFillList(order, at);
++    }
+ }
+ 
+ int mapLoadById(int map)
