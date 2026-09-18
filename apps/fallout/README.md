@@ -19,6 +19,25 @@ Temple of Trials holds **19 frames a second** for eleven minutes: 34 ms of
 engine, 10 ms of halving 640x480 into 320x240, and 7 ms of putting the frame on
 the wire.  The main menu holds 31.
 
+**And since 13 September 2026 it is played, not demonstrated, and the Temple is
+no longer the hard case.**  What changed is where the art of a location lives:
+the 1000 KB RAM cache keeps the frame's working set, everything it evicts is
+written into **8 MB of flash**, and a picture that is in flash is handed to the
+engine **as a pointer through XIP** - no copy, no arena.  A location that wants
+789 distinct pictures and 5382 KB of art now plays with the arena at 4021 KB of
+6000 (peak 5566), 100% of 1302 store asks served from flash, and single-figure
+reads from the card per play window.  Turning the store off on the same spot
+costs 38.9 MB of extra card reads in one window.  The freeze census over 241
+seconds of play: 9 freezes standing (3.5/min), 73 walking (50/min), nearly all
+in the 0.12-0.25 s band and attributed by name - map scrolling and the
+animation tick.  Settled, do not touch without being asked: **arena 6000, art
+cache 1000**.  Everything about this - the algorithm, the numbers, the launch
+line (a bare `run fallout2.axe`, the flags are the defaults now) and what is
+still open - is in
+[`docs/plans/fallout-handover.md`](../../docs/plans/fallout-handover.md), first
+sections.  **The older analysis in `docs/plans/fallout-memory.md` predates the
+flash store: its "towns do not fit in 8 MB" conclusion is superseded.**
+
 What it does *not* do yet is survive a real map.  Arroyo village loads, plays,
 and runs out of arena about two minutes in - the board can give the game 6050
 KB against the emulator's 6340, and Arroyo wants more than either at its peak.
@@ -999,6 +1018,12 @@ out and comes straight back off the card - and it is felt before it is
 measured. `art_cache_size` is 1800 and is not the place to find arena for the
 temple. Read the rest of this section as an account of how the knee was looked
 for, not as a setting to copy.
+
+*And since 13 September 2026 it is 1000, worked out by the port from the arena
+size rather than read from `fallout2.cfg`. The thrashing above is what happens
+when an evicted picture has to come back off the card; with the flash store it
+comes back from flash as a pointer, so the knee moved. See the top of this
+file.*
 
 **And it does not take two megabytes.**  The setting is whole megabytes, which
 is far too coarse a dial here, so patch 0012 reads it in kilobytes above 16.
