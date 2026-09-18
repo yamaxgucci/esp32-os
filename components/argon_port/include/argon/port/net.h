@@ -76,12 +76,49 @@ bool     ag_port_net_ready(void);
 ag_err_t ag_port_net_ifaddr(uint32_t *addr);
 void     ag_port_net_on_ready(ag_port_net_ready_fn fn);
 
+/*
+ * What the stack is holding, for an operator asking where the memory went.
+ *
+ * A connection the application has closed is not necessarily a connection the
+ * stack has finished with: with the far end's window shut and its program
+ * gone, lwIP keeps the block and everything queued on it and probes for ever.
+ * Nothing above this layer can see that, and the difference between "nine
+ * kilobytes in one connection" and "forty across nine" is the difference
+ * between a leak and a stuck peer.
+ *
+ * Counts are of TCP blocks; `queued` is what is waiting to be sent or
+ * acknowledged on them, in bytes.  Zeroed and left alone on a port with no
+ * stack to ask.
+ */
+typedef struct {
+    uint16_t active;    /* established, closing, probing - all of it       */
+    uint16_t listening;
+    uint16_t time_wait; /* finished, waiting out the last packets          */
+    uint16_t bound;     /* a port taken and nothing on it                  */
+    uint32_t queued;    /* bytes on the send queues of the active ones     */
+    uint16_t stalled;   /* active blocks whose peer is advertising nothing */
+} ag_port_net_stats_t;
+
+ag_err_t ag_port_net_stats(ag_port_net_stats_t *out);
+
 int     ag_port_net_listen(uint16_t port);
 int     ag_port_net_accept(int lfd, uint32_t timeout_ms);
 int     ag_port_net_connect(uint32_t addr, uint16_t port, uint32_t timeout_ms);
 int32_t ag_port_net_send(int fd, const void *buf, size_t len);
 int32_t ag_port_net_recv(int fd, void *buf, size_t len);
 void    ag_port_net_close(int fd);
+
+/*
+ * The same, for a peer that is not going to take what is queued.
+ *
+ * A graceful close leaves TCP trying to deliver, which is right until the far
+ * end has stopped reading - then the connection, its send queue and every
+ * buffer on it are held until something takes the interface down.  This sends
+ * a reset instead: the far end is told, the queue is discarded, and the memory
+ * comes back now.  Only for a peer already judged gone; anything else should
+ * close.
+ */
+void    ag_port_net_close_hard(int fd);
 ag_err_t ag_port_net_nonblock(int fd, bool on);
 
 /* Host-order IPv4 for a name.  -AG_ENOENT when the name does not resolve,

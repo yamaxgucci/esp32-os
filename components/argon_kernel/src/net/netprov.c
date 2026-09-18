@@ -146,6 +146,14 @@ int32_t ag_netprov_recv(int fd, void *buf, size_t len)
     return s_ops->recv(s_dev, fd, buf, len);
 }
 void     ag_netprov_close(int fd) { s_ops->net_close(s_dev, fd); }
+void     ag_netprov_close_hard(int fd)
+{
+    if (ag_netprov_is_builtin()) {
+        ag_port_net_close_hard(fd);
+        return;
+    }
+    s_ops->net_close(s_dev, fd);
+}
 ag_err_t ag_netprov_nonblock(int fd, bool on)
 {
     return s_ops->nonblock(s_dev, fd, on);

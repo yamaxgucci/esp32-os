@@ -170,6 +170,12 @@ extern "C" {
  *      worktree-usb-kvm calls its 0.45.  Whichever of those lands next has
  *      to RENUMBER rather than assume its number is free - and the check is
  *      one line: `git show <branch>:sdk/include/argon/abi.h | grep MINOR`.
+ * 0.50 appended net->reset: a connection thrown away rather than closed, for
+ *      a peer that has stopped reading.  `close` promises to deliver what is
+ *      queued and TCP keeps that promise indefinitely, so a deaf peer holds the
+ *      block and every buffer on it - 11520 bytes queued and 32 KB of heap,
+ *      measured, returned only by taking the interface down.  Needs
+ *      CONFIG_LWIP_SO_LINGER, now on in sdkconfig.defaults.
  * 0.49 appended text_scroll to ag_display_ops_t: the console moved up by so
  *      many rows, for a panel that can move its own picture.  Before it, a
  *      scroll was reported to every renderer as damage to every row - true,
@@ -192,7 +198,7 @@ extern "C" {
  *      number.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 49u
+#define AG_ABI_MINOR 50u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -1513,6 +1519,22 @@ typedef struct ag_net_api {
      * resolve, -AG_EAGAIN before the interface has an address of its own.
      */
     ag_err_t (*resolve)(const char *host, uint32_t *addr_out);
+
+    /*
+     * ABI 0.50: throw this connection away instead of closing it.
+     *
+     * `close` is a promise to deliver what is already queued, and TCP keeps
+     * that promise for as long as it takes - which against a peer that has
+     * stopped reading is for ever.  Measured on the CYD: a client killed with
+     * its socket open left 11520 bytes queued on our side and 32 KB of heap
+     * held, and nothing but taking the interface down returned it.
+     *
+     * This sends a reset: the far end is told, the queue is discarded, the
+     * memory comes back now.  Use it only for a peer already judged gone - a
+     * send that has stalled past its deadline, a client that has proved
+     * nothing for half a minute.  Everything else should close.
+     */
+    ag_err_t (*reset)(ag_handle_t sock);
 } ag_net_api_t;
 
 /*

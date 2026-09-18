@@ -213,6 +213,21 @@ def main():
             sv.pump(10)
             sv.send("", 1)
 
+        # What this board looks like with nothing on it, so a later reading has
+        # something to be compared against rather than a number picked here.
+        idle_largest = 0
+        if sv:
+            sv.s.write(b"\x1c")
+            sv.s.flush()
+            sv.pump(1.5)
+            before = len(sv.text())
+            sv.send("mem", 2.5)
+            m = re.search(r"internal +\d+K +(\d+)K +(\d+)K",
+                          sv.text()[before:])
+            idle_largest = int(m.group(2)) if m else 0
+            print("(idle: %u KB as the largest free block)" % idle_largest)
+            sv.user_slot()
+
         print("the page:")
         out = run_client(cl, args, "-get", 25)
         rep.check("http answers 200", "200 OK" in out)
@@ -304,6 +319,46 @@ def main():
                   bool(m) and int(m.group(1)) >= 20,
                   (m.group(1) + " rows in 12 s") if m else "no hold line")
 
+        print("a picture, over the link:")
+        # GFXPIX draws a circle, a diagonal and four differently coloured
+        # corners - a circle because a text mode cannot draw one.  The client
+        # cannot draw a band (one is five kilobytes and it holds two) so it
+        # counts them and reads the nine bytes in front: how many, how big,
+        # and which of the three encodings the board chose.
+        if sv:
+            # The client first, and drawing second.  This board keeps no frame,
+            # so a rectangle that has been sent is gone: a client that joins
+            # after the drawing sees an empty picture, which is what the first
+            # run of this check found and reported as "no bands arrived".
+            cl.user_slot()
+            before = len(cl.text())
+            cl.s.write(("run c:\\phonecl.axe %s -pass %s -hold 20 -pix\r"
+                        % (args.ip, args.password)).encode())
+            cl.s.flush()
+            cl.pump(8)
+
+            sv.s.write(b"\x1b1")
+            sv.s.flush()
+            sv.pump(1.5)
+            sv.send("run c:\\gfxpix.axe 10", 3)
+            cl.pump(30)
+            out = cl.text()[before:]
+            m = re.search(r"picture: (\d+) bands, (\d+) bytes, (\d+)x(\d+)",
+                          out)
+            rep.check("a drawing application reaches the link",
+                      bool(m) and int(m.group(1)) > 0,
+                      ("%s bands, %s bytes, %sx%s"
+                       % m.groups()) if m else "no bands arrived")
+            if m:
+                # Sixteen rows at a time over a 160x144 picture is nine
+                # rectangles and eighteen bands; fewer means the board gave up
+                # part way, and this has been a screen that stopped halfway
+                # down before.
+                rep.check("and the whole of it arrives",
+                          int(m.group(3)) >= 64 and int(m.group(4)) >= 64,
+                          "%sx%s covered" % (m.group(3), m.group(4)))
+            tidy(sv)
+
         print("an application that will not stop talking:")
         # The evening's first fault, and the one that hid the rest.
         #
@@ -358,17 +413,27 @@ def main():
         cl.pump(6)
         cl.user_slot()                      # killed from the system shell
         if sv:
-            sv.pump(90)                     # the supervisor's own pace
+            sv.pump(6)                      # seconds, not the supervisor's minute
             sv.s.write(b"\x1c")
             sv.s.flush()
             sv.pump(1.5)
             before = len(sv.text())
             sv.send("mem", 2.5)
-            m = re.search(r"internal +\d+K +(\d+)K +(\d+)K",
-                          sv.text()[before:])
+            sv.send("net sockets", 2.5)
+            out = sv.text()[before:]
+            m = re.search(r"internal +\d+K +(\d+)K +(\d+)K", out)
             largest = int(m.group(2)) if m else 0
-            rep.check("the board gets its memory back", largest >= 16,
-                      "%u KB as the largest block" % largest)
+            rep.check("the board gets its memory back at once",
+                      largest >= idle_largest - 4,
+                      "%u KB as the largest block, %u when idle"
+                      % (largest, idle_largest))
+            o = re.search(r"(\d+) open, \d+ listening", out)
+            q = re.search(r"(\d+) bytes waiting to go out", out)
+            rep.check("and the stack is holding nothing",
+                      bool(o) and int(o.group(1)) == 0 and
+                      bool(q) and int(q.group(1)) == 0,
+                      ("%s open, %s bytes queued" % (o.group(1), q.group(1)))
+                      if o and q else "no answer from `net sockets`")
         out = run_client(cl, args, "-get", 30)
         if client_ran_out(out):
             rep.check("and serves the page to the next visitor (the CLIENT "

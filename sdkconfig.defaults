@@ -95,3 +95,12 @@ CONFIG_LWIP_TCP_RECVMBOX_SIZE=12
 # segment with about a kilobyte to spare, and the choice was between a smaller
 # arena and a stack that carries what it cannot use.
 CONFIG_LWIP_IPV6=n
+
+# SO_LINGER, so a connection can be thrown away instead of closed.
+#
+# Off by default in ESP-IDF, and without it there is no way from a socket to
+# tell TCP "this peer is gone, drop what is queued".  A graceful close on a
+# peer that has stopped reading keeps the block and everything on it for ever:
+# measured on the CYD as 11520 bytes queued and 32 KB of heap that only came
+# back when the interface went down.  See api->net->reset (ABI 0.50).
+CONFIG_LWIP_SO_LINGER=y

@@ -5016,7 +5016,8 @@ static const ag_command_t k_commands[] = {
      "watch the air and inject frames", cmd_mon},
 #endif
 #if AG_HAS_NET
-    {"net", "[wait|resolve <name>]", "address, waiting, and names into addresses",
+    {"net", "[wait|resolve <name>|sockets]",
+     "address, waiting, names into addresses, and what the stack holds",
      ag_cmd_net},
     {"wget", "<url> [file]", "fetch a file over http or ftp",
      ag_cmd_wget},

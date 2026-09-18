@@ -15,6 +15,7 @@
 
 #include <argon/log.h>
 #include <argon/net.h>
+#include <argon/proc.h>
 #include <argon/netprov.h>
 #include <argon/power.h>
 #include <argon/netmsg.h>
@@ -29,6 +30,13 @@
 
 static int             s_fds[AG_NET_MAX_SOCK];
 static bool            s_in_use[AG_NET_MAX_SOCK];
+/*
+ * Whose socket it is.  AG_PID_KERNEL for one opened by a driver's own task or
+ * by a kernel service, and those are nobody's to reclaim: the phone link's
+ * listener is opened from the driver's task and must outlive every process
+ * that ever connects to it.
+ */
+static ag_pid_t        s_owner[AG_NET_MAX_SOCK];
 static ag_port_mutex_t s_lock;
 
 static void lock(void)
@@ -69,6 +77,7 @@ static ag_handle_t adopt_fd(int fd)
         if (!s_in_use[i]) {
             s_in_use[i] = true;
             s_fds[i] = fd;
+            s_owner[i] = ag_proc_self();
             unlock();
             return (ag_handle_t)(AG_NET_HANDLE_BASE + i);
         }
@@ -277,9 +286,62 @@ static ag_err_t api_close(ag_handle_t h)
     const int fd = s_fds[slot];
     s_in_use[slot] = false;
     s_fds[slot] = -1;
+    s_owner[slot] = AG_PID_KERNEL;
     unlock();
     ag_netprov_close(fd);
     return AG_OK;
+}
+
+static ag_err_t api_reset(ag_handle_t h)
+{
+    const int slot = slot_of(h);
+    if (slot < 0) {
+        return -AG_EBADF;
+    }
+    lock();
+    if (!s_in_use[slot]) {
+        unlock();
+        return -AG_EBADF;
+    }
+    const int fd = s_fds[slot];
+    s_in_use[slot] = false;
+    s_fds[slot] = -1;
+    s_owner[slot] = AG_PID_KERNEL;
+    unlock();
+    ag_netprov_close_hard(fd);
+    return AG_OK;
+}
+
+uint32_t ag_net_close_owned_by(ag_pid_t pid)
+{
+    if (pid == AG_PID_KERNEL) {
+        return 0u; /* the kernel's own are not anybody's to reclaim */
+    }
+
+    int      fds[AG_NET_MAX_SOCK];
+    uint32_t n = 0;
+
+    lock();
+    for (int i = 0; i < AG_NET_MAX_SOCK; i++) {
+        if (s_in_use[i] && s_owner[i] == pid) {
+            fds[n++] = s_fds[i];
+            s_in_use[i] = false;
+            s_fds[i] = -1;
+            s_owner[i] = AG_PID_KERNEL;
+        }
+    }
+    unlock();
+
+    /* Outside the lock: a close goes into the stack, and the stack is
+     * entitled to take its time about a connection it is still flushing. */
+    for (uint32_t i = 0; i < n; i++) {
+        ag_netprov_close(fds[i]);
+    }
+    if (n != 0u) {
+        ag_log(AG_LOG_INFO, "net", "closed %u socket(s) left by pid %u",
+               (unsigned)n, (unsigned)pid);
+    }
+    return n;
 }
 
 static ag_err_t api_set_nonblock(ag_handle_t h, bool on)
@@ -299,6 +361,7 @@ const ag_net_api_t ag_net_api_impl = {
     .tcp_listen = api_tcp_listen,
     .tcp_accept = api_tcp_accept,
     .tcp_connect = api_tcp_connect,
+    .reset = api_reset,
     .send = api_send,
     .recv = api_recv,
     .close = api_close,

@@ -374,7 +374,6 @@ static void supervisor_task(void *arg)
          */
         {
             static int64_t s_ap_checked_us;
-            static int64_t s_ap_raised_us;
             const int64_t  now = ag_port_us();
 
             if (now - s_ap_checked_us >= 600000000) {
@@ -382,57 +381,42 @@ static void supervisor_task(void *arg)
                 ag_port_wifi_ap_status_t ap;
                 if (ag_port_wifi_ap_status(&ap) == AG_OK && ap.on &&
                     ap.clients == 0u) {
-                    s_ap_raised_us = now;
                     (void)ag_port_wifi_ap_refresh();
                 }
             }
 
             /*
-             * And the other reason to re-raise it: the board is starving and
-             * nothing of ours is holding the memory.
+             * And the state that should now be unreachable, watched anyway.
              *
-             * Measured on the CYD, and reproducible in half a minute.  A
-             * client that stops reading - a browser tab closed, a program
-             * killed with its socket left open - leaves the radio holding
-             * about forty kilobytes that nothing gives back.  Not the driver:
-             * it drops the connection and frees its buffers, and the number
-             * does not move.  Not the sockets: closing them does not move it
-             * either, and it survives the station leaving, the point sitting
-             * with no clients at all, and five minutes of waiting.  What does
-             * move it is re-issuing the point's configuration: 13 KB free and
-             * 6 as the largest block, then 55 and 44 ten seconds later.
+             * A board with nothing loaded and no memory was the shape of a
+             * fault that took an evening: a socket outlived the process that
+             * opened it, the far end held the connection and everything queued
+             * on it, and the only thing that returned the memory was taking
+             * the interface down.  For a while this bounced the access point
+             * to get it back, which worked and explained nothing.
              *
-             * Below sixteen kilobytes the phone link refuses every visitor,
-             * because accepting one with no memory aborts the board.  So the
-             * end of it is a board with a network, a listener and a page it
-             * will not serve to anybody, for as long as it is left on - which
-             * is how this was found, on a board that had been up for hours.
-             *
-             * Only with nothing loaded, which is what makes this safe.  A
-             * board down to five kilobytes with the file manager up is a board
-             * whose memory is accounted for, and bouncing the point under a
-             * person who is using it would be the cure being worse.  With no
-             * application at all the memory belongs to something below us, and
-             * this is the one thing measured to return it.
-             *
-             * Not the cause, and it does not pretend to be.  The cause is
-             * somewhere in the radio's own buffers and is not ours to see from
-             * here.  This is the board getting itself back, which is the
-             * difference between a fault and a fault that ends the day.
+             * The cause is fixed - a socket belongs to its process and dies
+             * with it, and a peer judged gone is reset rather than closed - so
+             * the bounce is gone with it.  A board that quietly repairs itself
+             * every two minutes is a board that never tells anybody the next
+             * leak of this shape exists.  Said once, and then only again if it
+             * gets worse.
              */
-            if (now - s_ap_raised_us >= 120000000) {
-                const size_t largest =
+            {
+                static size_t s_starved_said;
+                const size_t  largest =
                     ag_port_mem_largest(AG_MEM_FAST | AG_MEM_BYTE);
                 if (largest < AG_SUP_STARVED_BYTES && ag_proc_count() == 0u) {
-                    ag_port_wifi_ap_status_t ap;
-                    if (ag_port_wifi_ap_status(&ap) == AG_OK && ap.on) {
-                        s_ap_raised_us = now;
+                    if (s_starved_said == 0u || largest + 2048u < s_starved_said) {
+                        s_starved_said = largest;
                         ag_log(AG_LOG_WARN, "supervisor",
-                               "starving with nothing loaded (%u bytes as the "
-                               "largest block); raising the point again",
+                               "nothing is loaded and the largest free block "
+                               "is %u bytes; `net sockets` says who is holding "
+                               "them",
                                (unsigned)largest);
-                        (void)ag_port_wifi_ap_refresh();
                     }
+                } else if (largest >= AG_SUP_STARVED_BYTES) {
+                    s_starved_said = 0u;
                 }
             }
         }

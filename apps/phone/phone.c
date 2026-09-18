@@ -295,6 +295,17 @@ static struct {
      */
     uint8_t       scroll_owed;
 
+    /*
+     * What the picture path has done since boot.  `blits` is the kernel
+     * handing this driver a rectangle - the half that happens whether or not
+     * anybody is connected - and `bands` is what went out on the wire.  Blits
+     * with no bands is a driver that is being given a picture and cannot send
+     * it; no blits at all is nothing drawing.
+     */
+    uint32_t      blits;
+    uint32_t      bands;
+    uint32_t      band_bytes;
+
     /* The wire. */
     ag_handle_t listen;
     ag_handle_t conn;    /* an upgraded WebSocket, or -1                    */
@@ -715,7 +726,27 @@ static void ws_close(const char *reason)
     (void)send_all(s.conn, buf, k + 2u + n, 200u);
 }
 
+/*
+ * Let a client go, and say whether TCP should still be trying to reach it.
+ *
+ * `gone` is for a peer this driver has already decided is not listening: a
+ * send that stalled past its deadline, half a minute of silence, a write that
+ * failed.  A polite close there is a promise to deliver what is queued to
+ * somebody who is taking nothing, and TCP keeps that promise indefinitely -
+ * measured as 11520 bytes queued and 32 KB of heap held until the access point
+ * was taken down.  A reset ends it now.
+ *
+ * Everything else closes: a client replaced by a newer one, or turned away for
+ * the wrong password, is a peer that is still there and still reading.
+ */
+static void drop_conn_reason(const char *why, bool gone);
+
 static void drop_conn(const char *why)
+{
+    drop_conn_reason(why, false);
+}
+
+static void drop_conn_reason(const char *why, bool gone)
 {
     /* A new client is not the old one's shut window. */
     s.hush_until = 0u;
@@ -736,7 +767,9 @@ static void drop_conn(const char *why)
     }
     s.last_life_us = 0u;
     if (s.conn >= 0) {
-        (void)ag_net_close(s.conn);
+        if (!gone || ag_net_reset(s.conn) != AG_OK) {
+            (void)ag_net_close(s.conn);
+        }
         s.conn = -1;
         ag_log(AG_LOG_INFO, "phone", "client gone (%s)", why ? why : "?");
     }
@@ -967,7 +1000,12 @@ static wire_t encode_and_send(uint32_t x, uint32_t y, uint32_t w, uint32_t h,
     put16(body + 2, y);
     put16(body + 4, w);
     put16(body + 6, h);
-    return ws_send(op, body, BAND_HDR + len, idle_ms, lock_ms);
+    const wire_t r = ws_send(op, body, BAND_HDR + len, idle_ms, lock_ms);
+    if (r == WIRE_OK) {
+        s.bands++;
+        s.band_bytes += BAND_HDR + len;
+    }
+    return r;
 }
 
 static wire_t send_band(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
@@ -2136,6 +2174,21 @@ static void phone_task(void *arg)
                    "listen=%d conn=%d closing=%d",
                    (unsigned)laps, (unsigned)s.stage, worst, worst_us,
                    (int)s.listen, (int)s.conn, (int)s.closing);
+            /*
+             * And the picture, on its own line so a search for it finds one
+             * thing.  Silent when nothing has ever drawn, which is the common
+             * case on a board showing a shell.
+             */
+            if (s.blits != 0u || s.bands != 0u) {
+                ag_log(AG_LOG_INFO, "phone",
+                       "picture: %u blits in, %u bands out, %u bytes, "
+                       "surface %ux%u, frame %s",
+                       (unsigned)s.blits, (unsigned)s.bands,
+                       (unsigned)s.band_bytes, (unsigned)s.frame_w,
+                       (unsigned)s.frame_h,
+                       (s.frame != NULL) ? "held" : "none (sent from the "
+                                                    "drawing task)");
+            }
         }
         laps++;
 
@@ -2230,7 +2283,7 @@ static void phone_task(void *arg)
          */
         if (s.last_life_us != 0u &&
             (uint64_t)ag_micros() - s.last_life_us > LINK_SILENT_US) {
-            drop_conn("silent for 30 s");
+            drop_conn_reason("silent for 30 s", true);
             continue;
         }
         stage_enter(5);
@@ -2240,7 +2293,7 @@ static void phone_task(void *arg)
         }
         stage_enter(6);
         if (!service_client()) {
-            drop_conn("write failed");
+            drop_conn_reason("write failed", true);
             continue;
         }
         stage_enter(7);
@@ -2335,6 +2388,7 @@ static ag_err_t phone_info(ag_handle_t h, ag_gfxinfo_t *out)
  */
 static void phone_blit_rect(ag_handle_t h, const ag_blit_t *b)
 {
+    s.blits++;
     /*
      * From here on the picture buffers are worth their room - and this is the
      * path that needs them, so it takes them itself rather than waiting a lap

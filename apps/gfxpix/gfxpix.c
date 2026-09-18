@@ -23,6 +23,12 @@
  *                      the system's surface cannot do for it: the shape is
  *                      wrong and the memory is wanted elsewhere.
  *
+ *                      Taken by itself, without the word, on a display that
+ *                      has no surface at all - a board whose framebuffer would
+ *                      be 150 KB of a 207 KB heap.  There the first mode draws
+ *                      into nothing and says it drew; this one is the only one
+ *                      that puts a picture anywhere.
+ *
  *   gfxpix cycle [n]   the whole surface, one flat colour at a time, changing
  *                      every second, n times.  For telling "there was no
  *                      picture" apart from "the panel went black" and from "the
@@ -209,6 +215,25 @@ int ag_main(int argc, char **argv)
 
     const uint16_t w = info.width;
     const uint16_t h = info.height;
+
+    /*
+     * A display with no surface draws nothing, whatever is asked of it.
+     *
+     * fb == NULL is the kernel saying "there is no framebuffer here; hand me
+     * pixels with gfx->present" (ag_gfxinfo_t), which is the CYD: 320x240 in
+     * RGB565 is 150 KB of a 207 KB heap.  Drawing into it is not an error
+     * anywhere - every primitive checks and returns - so the run reports a
+     * circle, holds the screen, and shows a blank one.  Measured exactly that
+     * way while looking for why a phone only ever showed text.
+     *
+     * So this takes the road that works instead of the one that was asked
+     * for, and says which.  `own` on the command line still forces it.
+     */
+    if (!own && info.fb == NULL) {
+        own = 1;
+        ag_printf("no surface on this display (fb is NULL); "
+                  "drawing into my own memory and handing it over\n");
+    }
 
     if (own) {
         if (!AG_HAS(ag_api()->gfx, present)) {

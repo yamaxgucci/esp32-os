@@ -67,10 +67,43 @@ static int net_status(void)
     return 0;
 }
 
+/*
+ * What the stack is holding.
+ *
+ * "The board has no memory and nothing is running" had no next question until
+ * this existed: the driver frees its buffers, the application closes its
+ * sockets, and forty kilobytes stay gone.  A connection the application has
+ * finished with is not one the stack has finished with - with the far end's
+ * window shut and its program gone, lwIP keeps the block and everything queued
+ * on it and probes for ever - and `stalled` is the count of exactly those.
+ */
+static int net_sockets(void)
+{
+    ag_port_net_stats_t st;
+    if (ag_port_net_stats(&st) != AG_OK) {
+        ag_console_puts("sockets: the stack did not answer\n");
+        return 1;
+    }
+    ag_console_printf("  %u open, %u listening, %u closing, %u bound\n",
+                      (unsigned)st.active, (unsigned)st.listening,
+                      (unsigned)st.time_wait, (unsigned)st.bound);
+    ag_console_printf("  %u bytes waiting to go out", (unsigned)st.queued);
+    if (st.stalled != 0u) {
+        ag_console_printf(", %u of them to a peer that is taking nothing",
+                          (unsigned)st.stalled);
+    }
+    ag_console_puts("\n");
+    return 0;
+}
+
 int ag_cmd_net(int argc, char **argv)
 {
     if (argc < 2) {
         return net_status();
+    }
+
+    if (ag_path_icmp(argv[1], "sockets") == 0) {
+        return net_sockets();
     }
 
     if (ag_path_icmp(argv[1], "resolve") == 0) {
@@ -137,7 +170,8 @@ int ag_cmd_net(int argc, char **argv)
     }
 
     ag_console_puts(
-        "usage: net [wait [seconds] | resolve <name> | use <device>]\n");
+        "usage: net [wait [seconds] | resolve <name> | use <device> "
+        "| sockets]\n");
     return 1;
 }
 

@@ -1088,6 +1088,26 @@ static inline ag_err_t ag_net_close(ag_handle_t sock)
     return g_ag_api->net->close(sock);
 }
 
+/*
+ * Throw a connection away instead of closing it (ABI 0.50).
+ *
+ * `ag_net_close` promises TCP will deliver what is queued, and against a peer
+ * that has stopped reading that promise is kept for ever - the connection, its
+ * queue and every buffer on it are held until something takes the interface
+ * down.  This resets it: the far end is told, the queue goes, the memory comes
+ * back now.
+ *
+ * Only for a peer already judged gone.  -AG_ENOSYS on a kernel older than the
+ * call, so a caller that wants either may fall back to close.
+ */
+static inline ag_err_t ag_net_reset(ag_handle_t sock)
+{
+    if (g_ag_api->net == NULL || !AG_HAS(g_ag_api->net, reset)) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->net->reset(sock);
+}
+
 static inline ag_err_t ag_net_set_nonblock(ag_handle_t sock, bool on)
 {
     if (g_ag_api->net == NULL || g_ag_api->net->set_nonblock == NULL) {

@@ -54,6 +54,9 @@ AG_APP_SIZED("PHONECL", "1.0", "argon", AG_AXE_NEEDS_NET, 6 * 1024, 2 * 1024);
 #define OP_ROW 'R'
 #define OP_CURSOR 'C'
 #define OP_SCROLL 'S'
+#define OP_RAW 'B'
+#define OP_PACK 'P'
+#define OP_IDX 'I'
 #define OP_AUTH 'A'
 
 #define IN_HELLO 'H'
@@ -87,6 +90,16 @@ static struct {
     uint8_t  cell[MAX_COLS * MAX_ROWS * 2u];
     uint32_t cols, rows;
     uint32_t cur_x, cur_y;
+
+    /*
+     * The picture, counted rather than drawn.  See note_band: a band is bigger
+     * than this client's whole receive buffer, so the pixels go past
+     * uncollected and only their shape is kept.
+     */
+    uint32_t bands;
+    uint32_t band_bytes;
+    uint32_t band_raw, band_pack, band_idx;
+    uint16_t pix_x0, pix_y0, pix_x1, pix_y1;
     bool     cur_on;
     uint32_t rows_seen; /* how many row messages have landed, ever */
 
@@ -432,6 +445,65 @@ static bool ws_open(uint32_t addr, uint16_t port)
 /* The screen                                                                */
 /* ------------------------------------------------------------------------ */
 
+/*
+ * What a band says about itself, from the nine bytes in front of its pixels:
+ * the encoding the board chose, and where on the surface it goes.
+ */
+static void note_band(const uint8_t *head, uint32_t have, uint32_t len)
+{
+    s.bands++;
+    s.band_bytes += len;
+    if (have >= 1u) {
+        if (head[0] == OP_RAW) {
+            s.band_raw++;
+        } else if (head[0] == OP_PACK) {
+            s.band_pack++;
+        } else if (head[0] == OP_IDX) {
+            s.band_idx++;
+        }
+    }
+    if (have >= 9u) {
+        const uint16_t x = (uint16_t)(head[1] | (head[2] << 8));
+        const uint16_t y = (uint16_t)(head[3] | (head[4] << 8));
+        const uint16_t w = (uint16_t)(head[5] | (head[6] << 8));
+        const uint16_t h = (uint16_t)(head[7] | (head[8] << 8));
+        if (s.bands == 1u) {
+            s.pix_x0 = x;
+            s.pix_y0 = y;
+            s.pix_x1 = (uint16_t)(x + w);
+            s.pix_y1 = (uint16_t)(y + h);
+        } else {
+            if (x < s.pix_x0) {
+                s.pix_x0 = x;
+            }
+            if (y < s.pix_y0) {
+                s.pix_y0 = y;
+            }
+            if ((uint16_t)(x + w) > s.pix_x1) {
+                s.pix_x1 = (uint16_t)(x + w);
+            }
+            if ((uint16_t)(y + h) > s.pix_y1) {
+                s.pix_y1 = (uint16_t)(y + h);
+            }
+        }
+    }
+}
+
+/* One line, so a run that saw no picture says so rather than saying nothing. */
+static void report_bands(void)
+{
+    if (s.bands == 0u) {
+        ag_printf("picture: no bands\n");
+        return;
+    }
+    ag_printf("picture: %u bands, %u bytes, %ux%u at %u,%u "
+              "(raw %u, packed %u, indexed %u)\n",
+              (unsigned)s.bands, (unsigned)s.band_bytes,
+              (unsigned)(s.pix_x1 - s.pix_x0), (unsigned)(s.pix_y1 - s.pix_y0),
+              (unsigned)s.pix_x0, (unsigned)s.pix_y0, (unsigned)s.band_raw,
+              (unsigned)s.band_pack, (unsigned)s.band_idx);
+}
+
 static void take_message(const uint8_t *m, uint32_t len)
 {
     if (len == 0u) {
@@ -521,8 +593,14 @@ static void take_message(const uint8_t *m, uint32_t len)
         }
         break;
 
+    case OP_RAW:
+    case OP_PACK:
+    case OP_IDX:
+        /* Pixels.  Counted, not drawn: see note_band. */
+        note_band(m, len, len);
+        break;
+
     default:
-        /* 'B', 'P' and 'I' are pixels; a text client has no use for them. */
         break;
     }
 }
@@ -556,7 +634,21 @@ static bool take_frames(void)
             return false;
         }
         if (h.hdr + h.len > RX_CAP) {
-            /* Bigger than anything this client can hold: step over it. */
+            /*
+             * Bigger than anything this client can hold: step over it - but
+             * look at its first nine bytes on the way past, which is where a
+             * band says what it is and where it goes.  Almost every band is
+             * this: eight rows of a 320-wide surface is five kilobytes and
+             * this buffer is two.
+             */
+            const uint32_t have = (s.rx_len > h.hdr) ? (s.rx_len - h.hdr) : 0u;
+            if (h.opcode == AG_WS_BIN && have >= 1u) {
+                const uint8_t *body = s.rx + h.hdr;
+                if (body[0] == OP_RAW || body[0] == OP_PACK ||
+                    body[0] == OP_IDX) {
+                    note_band(body, (have < 9u) ? have : 9u, h.len);
+                }
+            }
             s.skip = h.len;
             rx_drop(h.hdr);
             continue;
@@ -825,7 +917,7 @@ int ag_main(int argc, char **argv)
     if (argc < 2) {
         ag_printf("usage: phonecl <ip> [-port N] [-pass P] [-get]\n");
         ag_printf("       [-type TEXT] [-enter] [-key CHORD] [-wait MS]\n");
-        ag_printf("       [-screen] [-hold SECS]\n");
+        ag_printf("       [-screen] [-pix] [-hold SECS]\n");
         return 1;
     }
 
@@ -923,6 +1015,7 @@ int ag_main(int argc, char **argv)
             if (rc == 0) {
                 ag_printf("held %u s, %u rows arrived\n", (unsigned)secs,
                           (unsigned)(s.rows_seen - before));
+                report_bands();
             }
         } else if (strcmp(argv[i], "-tap") == 0 && i + 1 < argc) {
             uint16_t x = 0, y = 0;
@@ -952,6 +1045,8 @@ int ag_main(int argc, char **argv)
                       screen_has(needle) ? "yes" : "no");
         } else if (strcmp(argv[i], "-screen") == 0) {
             print_screen();
+        } else if (strcmp(argv[i], "-pix") == 0) {
+            report_bands();
         }
     }
 

@@ -76,6 +76,9 @@ static uint16_t *s_draw;  /* s_back while acquired with DB, else front */
  * without a single extra test.
  */
 static bool s_surfaceless;
+/* Said once per acquire; see the surfaceless branch of gfx_flush. */
+static bool s_warned_surfaceless;
+static bool s_shim_seen; /* the caller has handed over pixels at least once */
 static uint16_t *s_snap;  /* last released graphics frame, for gfxdump */
 static uint16_t  s_w;
 static uint16_t  s_h;
@@ -714,6 +717,8 @@ static ag_err_t gfx_acquire(ag_gfxinfo_t *out)
         s_acquired = true;
         s_owner = ag_proc_self();
         s_draw = NULL;
+        s_warned_surfaceless = false;
+        s_shim_seen = false;
         if (out != NULL) {
             out->width = pw;
             out->height = ph;
@@ -817,6 +822,23 @@ static void gfx_flush(uint16_t x, uint16_t y, uint16_t w, uint16_t h)
         (void)y;
         (void)w;
         (void)h;
+        /*
+         * And if nothing was ever handed over, say so.
+         *
+         * A flush with no surface and no pixels presented is an application
+         * that drew into the soft primitives, every one of which returned
+         * quietly because there is nowhere to draw.  It then reports success
+         * and shows a blank screen, which is the most expensive way for a
+         * system to be wrong.  Once per acquire; an application that knows
+         * what it is doing never sees it.
+         */
+        if (!s_shim_seen && !s_warned_surfaceless) {
+            s_warned_surfaceless = true;
+            ag_log(AG_LOG_WARN, "display",
+                   "this display has no surface of its own, so drawing into "
+                   "it did nothing; hand pixels over with gfx->present "
+                   "(ag_gfxinfo_t.fb is NULL and says so)");
+        }
         s_shim_trusted = true;
         shim_kick();
         return;
@@ -855,6 +877,7 @@ static ag_err_t gfx_present(const ag_blit_t *in)
     if (!gfx_may_present()) {
         return -AG_EPERM;
     }
+    s_shim_seen = true; /* pixels were handed over; see gfx_flush */
 
     ag_blit_t b = *in;
     if (b.x >= b.surf_w || b.y >= b.surf_h) {

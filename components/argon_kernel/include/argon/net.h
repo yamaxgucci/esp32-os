@@ -44,6 +44,17 @@ ag_err_t ag_net_lookup(const char *host, uint32_t *addr_out);
  */
 void ag_net_reset_sockets(void);
 
+/*
+ * Close whatever `pid` left open, and say how many there were.
+ *
+ * Called when a process ends however it ended.  A socket outliving its process
+ * is not merely untidy: the far end sees a peer that is alive and reading
+ * nothing, so it keeps the connection, keeps writing into a window that never
+ * opens, and keeps both blocks and everything queued on them - measured at
+ * forty kilobytes that nothing but taking the interface down would return.
+ */
+uint32_t ag_net_close_owned_by(ag_pid_t pid);
+
 extern const ag_net_api_t ag_net_api_impl;
 const ag_net_api_t *ag_net_api_table(void);
 #else
@@ -58,6 +69,11 @@ static inline ag_err_t ag_net_lookup(const char *host, uint32_t *addr_out)
     return -AG_ENOSYS;
 }
 static inline const ag_net_api_t *ag_net_api_table(void) { return NULL; }
+static inline uint32_t ag_net_close_owned_by(ag_pid_t pid)
+{
+    (void)pid;
+    return 0u;
+}
 #endif
 
 #ifdef __cplusplus

@@ -18,6 +18,7 @@
 #include <argon/loader.h>
 #include <argon/power.h>
 #include <argon/log.h>
+#include <argon/net.h>
 #include <argon/path.h>
 #include <argon/shell.h>
 #include <argon/vfs.h>
@@ -336,6 +337,17 @@ static void reap(proc_t *p)
     if (ag_audio_opened()) {
         ag_audio_api_table.close();
     }
+
+    /*
+     * Its sockets, before anything else about it is let go.
+     *
+     * A process that exits closes its own; one that is killed, faults or runs
+     * out of stack does not, and until this was here nothing else did either.
+     * The far end of such a socket sees a peer that is alive and reading
+     * nothing for ever - which cost this board forty kilobytes a time, with
+     * `net sockets` showing two connections open and no application running.
+     */
+    (void)ag_net_close_owned_by(p->pid);
 
     const bool restore_tty = (ag_session_focused_pid() == p->pid);
     ag_session_unbind(p->pid);

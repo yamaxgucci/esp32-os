@@ -25,7 +25,9 @@
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "lwip/netdb.h"
+#include "lwip/priv/tcp_priv.h"
 #include "lwip/sockets.h"
+#include "lwip/tcpip.h"
 #include "nvs_flash.h"
 
 #include "net_hw.h"
@@ -397,11 +399,69 @@ int32_t ag_port_net_recv(int fd, void *buf, size_t len)
     return (n < 0) ? (int32_t)map_errno(errno) : (int32_t)n;
 }
 
+ag_err_t ag_port_net_stats(ag_port_net_stats_t *out)
+{
+    if (out == NULL) {
+        return -AG_EINVAL;
+    }
+    memset(out, 0, sizeof(*out));
+
+    /*
+     * Walked with the stack locked, because these lists are the TCP timer's
+     * and it runs on its own thread.  LOCK_TCPIP_CORE is what every other
+     * caller into lwIP's internals uses here.
+     */
+    LOCK_TCPIP_CORE();
+    for (const struct tcp_pcb *p = tcp_active_pcbs; p != NULL; p = p->next) {
+        out->active++;
+        /*
+         * snd_queuelen is segments, not bytes; what is wanted is how much is
+         * actually held, and that is the unsent and unacked chains.
+         */
+        for (const struct tcp_seg *g = p->unsent; g != NULL; g = g->next) {
+            out->queued += g->len;
+        }
+        for (const struct tcp_seg *g = p->unacked; g != NULL; g = g->next) {
+            out->queued += g->len;
+        }
+        if (p->snd_wnd == 0u) {
+            out->stalled++;
+        }
+    }
+    for (const struct tcp_pcb_listen *p = tcp_listen_pcbs.listen_pcbs;
+         p != NULL; p = p->next) {
+        out->listening++;
+    }
+    for (const struct tcp_pcb *p = tcp_tw_pcbs; p != NULL; p = p->next) {
+        out->time_wait++;
+    }
+    for (const struct tcp_pcb *p = tcp_bound_pcbs; p != NULL; p = p->next) {
+        out->bound++;
+    }
+    UNLOCK_TCPIP_CORE();
+    return AG_OK;
+}
+
 void ag_port_net_close(int fd)
 {
     if (fd >= 0) {
         (void)lwip_close(fd);
     }
+}
+
+void ag_port_net_close_hard(int fd)
+{
+    if (fd < 0) {
+        return;
+    }
+    /*
+     * Linger of zero is the standard spelling of "reset it": close then sends
+     * an RST instead of a FIN and frees the queue with it.  Needs
+     * CONFIG_LWIP_SO_LINGER, which sdkconfig.defaults turns on for this.
+     */
+    struct linger lg = {.l_onoff = 1, .l_linger = 0};
+    (void)lwip_setsockopt(fd, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
+    (void)lwip_close(fd);
 }
 
 /*
