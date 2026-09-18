@@ -305,6 +305,17 @@ static struct {
     uint32_t      blits;
     uint32_t      bands;
     uint32_t      band_bytes;
+    /*
+     * And the four ways one does not.  A picture that does not appear looks
+     * the same from a chair whichever of them it was, and they want different
+     * answers: no buffers is a memory budget, hushed is this driver's own
+     * pacing, busy is the wire, refused is the encoder being given less room
+     * than the band needs.
+     */
+    uint32_t      band_nomem;
+    uint32_t      band_hushed;
+    uint32_t      band_busy;
+    uint32_t      band_refused;
 
     /* The wire. */
     ag_handle_t listen;
@@ -669,10 +680,18 @@ static wire_t ws_send(uint8_t op, void *payload, uint32_t len,
      * never came back.  If the task is mid-message, this frame is simply not
      * this frame's to send.
      */
+    const bool is_band = (op != OP_ROW && op != OP_CURSOR && op != OP_INFO &&
+                          op != OP_SCROLL && op != OP_AUTH);
     if (s.hush_until != 0u && (uint64_t)ag_micros() < s.hush_until) {
+        if (is_band) {
+            s.band_hushed++;
+        }
         return WIRE_STALL;
     }
     if (s.wire != NULL && !TASK->mutex_lock(s.wire, lock_ms)) {
+        if (is_band) {
+            s.band_busy++;
+        }
         return WIRE_STALL;
     }
     const wire_t r = send_all(s.conn, p - (n + 1u), n + 1u + len, idle_ms);
@@ -994,7 +1013,13 @@ static wire_t encode_and_send(uint32_t x, uint32_t y, uint32_t w, uint32_t h,
                                            body + BAND_HDR, cap - BAND_HDR,
                                            &op);
     if (len == 0u) {
-        return WIRE_OK; /* refused rather than truncated: see ag_pixband.h */
+        /*
+         * Refused rather than truncated (ag_pixband.h) - and counted, because
+         * returning success for a band that was never sent is how a picture
+         * that never appeared came to look like a picture nobody drew.
+         */
+        s.band_refused++;
+        return WIRE_OK;
     }
     put16(body + 0, x);
     put16(body + 2, y);
@@ -1983,6 +2008,31 @@ static bool ensure_listen(void)
  * heap - the same place ag_driver_init would have got it, and not out of the
  * arena of whichever application happened to be the one that drew.
  */
+/*
+ * Which buffer could not be had, and what the machine had at the time.
+ *
+ * Said once: the caller comes straight back and a line an attempt is two a
+ * second of the same sentence.  Both figures, because they answer different
+ * questions - the arena is whoever is being charged, and inside blit_rect that
+ * is the process that happened to draw rather than this driver, so a refusal
+ * with the system half free is that and not a shortage.
+ */
+static bool no_pixel_memory(const char *what, size_t bytes)
+{
+    static bool said;
+    if (!said) {
+        said = true;
+        ag_meminfo_t mi;
+        ag_meminfo(&mi);
+        ag_log(AG_LOG_WARN, "phone",
+               "no memory for %s (%u bytes): arena %u free, %u largest; "
+               "system %u free",
+               what, (unsigned)bytes, (unsigned)mi.arena_free,
+               (unsigned)mi.arena_largest, (unsigned)mi.system_free);
+    }
+    return false;
+}
+
 static bool ensure_memory(void)
 {
     /*
@@ -2011,20 +2061,20 @@ static bool ensure_memory(void)
         void *mem = ag_malloc(need);
         if (mem == NULL || !ag_pixband_init(mem, need, s.band_px)) {
             ag_free(mem);
-            return false;
+            return no_pixel_memory("the encoder", need);
         }
         s.pix = (ag_pixband_ctx_t *)mem;
     }
     if (s.band == NULL) {
         s.band = (uint16_t *)ag_malloc(s.band_px * sizeof(uint16_t));
         if (s.band == NULL) {
-            return false;
+            return no_pixel_memory("a band", s.band_px * sizeof(uint16_t));
         }
     }
     if (s.out == NULL) {
         s.out = (uint8_t *)ag_malloc(s.band_cap);
         if (s.out == NULL) {
-            return false;
+            return no_pixel_memory("the encoded band", s.band_cap);
         }
     }
 
@@ -2181,10 +2231,13 @@ static void phone_task(void *arg)
              */
             if (s.blits != 0u || s.bands != 0u) {
                 ag_log(AG_LOG_INFO, "phone",
-                       "picture: %u blits in, %u bands out, %u bytes, "
-                       "surface %ux%u, frame %s",
+                       "picture: %u blits in, %u bands out, %u bytes; "
+                       "not sent: %u no memory, %u hushed, %u wire busy, "
+                       "%u refused; surface %ux%u, frame %s",
                        (unsigned)s.blits, (unsigned)s.bands,
-                       (unsigned)s.band_bytes, (unsigned)s.frame_w,
+                       (unsigned)s.band_bytes, (unsigned)s.band_nomem,
+                       (unsigned)s.band_hushed, (unsigned)s.band_busy,
+                       (unsigned)s.band_refused, (unsigned)s.frame_w,
                        (unsigned)s.frame_h,
                        (s.frame != NULL) ? "held" : "none (sent from the "
                                                     "drawing task)");
@@ -2398,6 +2451,7 @@ static void phone_blit_rect(ag_handle_t h, const ag_blit_t *b)
      */
     s.want_pixels = true;
     if (!ensure_memory()) {
+        s.band_nomem++;
         return;
     }
 

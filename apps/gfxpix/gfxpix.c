@@ -17,6 +17,11 @@
  *                      each a different colour, so a mirrored or rotated
  *                      surface shows up as the wrong corner being red.
  *
+ *   The picture is handed over again twice a second for as long as it is
+ *   held, which is not decoration: a screen at the end of a wire keeps
+ *   nothing, so a picture drawn once belongs to whoever happened to be
+ *   watching.  A phone picked up afterwards would see an empty canvas.
+ *
  *   gfxpix own [s]     the same picture, but 160x144 in the application's own
  *                      memory, handed to the panel sixteen rows at a time
  *                      (gfx->present).  What an emulator has to do, and what
@@ -242,12 +247,25 @@ int ag_main(int argc, char **argv)
             return 1;
         }
         const ag_time_t t0 = ag_micros();
-        const int       bad = own_picture();
+        int             bad = own_picture();
         const ag_time_t t1 = ag_micros();
         ag_printf("2 own %dx%d in %u us%s\n", OWN_W, OWN_H,
                   (unsigned)(t1 - t0), bad ? " (failed)" : "");
-        if (hold_s != 0) {
-            ag_delay(hold_s * 1000u);
+        /*
+         * And again, twice a second, for as long as it is held.  See the note
+         * at the top of this file: a screen on the other end of a wire keeps
+         * nothing, so a picture sent once belongs only to whoever was watching
+         * then.  Repeating it is what makes a phone picked up afterwards show
+         * the circle, and what gives the link's encoder a second chance at the
+         * frame it was not yet ready for.
+         */
+        for (uint32_t left = hold_s * 1000u; left != 0u;) {
+            const uint32_t nap = (left < 500u) ? left : 500u;
+            ag_delay(nap);
+            left -= nap;
+            if (own_picture() != 0) {
+                bad = 1;
+            }
         }
         ag_gfx_release();
         ag_printf("3 held %u s\n", (unsigned)hold_s);

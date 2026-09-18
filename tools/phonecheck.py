@@ -18,6 +18,7 @@ What it cannot judge: how the page looks, and whether it can be used with a
 thumb.  That stays a person's job, and no amount of this replaces it.
 """
 import argparse
+import os
 import re
 import sys
 import time
@@ -38,9 +39,12 @@ def open_port(name):
 
 
 class Board:
-    def __init__(self, port):
+    def __init__(self, port, name="board"):
         self.s = open_port(port)
         self.log = bytearray()
+        self.name = name
+        self._clean = ""   # everything cleaned so far
+        self._at = 0       # how much of self.log that covers
 
     def pump(self, seconds):
         end = time.time() + seconds
@@ -61,8 +65,30 @@ class Board:
         self.send("", 0.5)
 
     def text(self):
-        t = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", self.log.decode("latin1"))
-        return t.replace("\r", "\n")
+        """Everything the board has said, cleaned - and cleaned once.
+
+        This used to run over the whole log on every call, which is several
+        times a round: by the end of a run that is megabytes of regular
+        expression while nothing is reading the port, and Windows' receive
+        buffer is four kilobytes.  The board's next answer went missing and the
+        check blamed the board.
+        """
+        if len(self.log) > self._at:
+            # A few bytes of overlap: an escape sequence can straddle two
+            # reads, and half of one left in the text is a stray letter in the
+            # middle of a word somebody is searching for.
+            back = 16 if self._at >= 16 else self._at
+            fresh = self.log[self._at - back:].decode("latin1")
+            fresh = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", fresh)
+            fresh = fresh.replace("\r", "\n")
+            if back:
+                keep = self._clean[:len(self._clean) - back] \
+                    if len(self._clean) >= back else ""
+                self._clean = keep + fresh
+            else:
+                self._clean += fresh
+            self._at = len(self.log)
+        return self._clean
 
     def close(self):
         try:
@@ -178,8 +204,8 @@ def main():
     args = ap.parse_args()
 
     rep = Report()
-    cl = Board(args.client)
-    sv = Board(args.server) if args.server else None
+    cl = Board(args.client, "client")
+    sv = Board(args.server, "server") if args.server else None
 
     try:
         # Both boards, not just the one under test.
@@ -450,6 +476,20 @@ def main():
 
     finally:
         tidy(sv)
+        # Everything both boards said, byte for byte.  Twice now the question
+        # "which side failed" has had no evidence behind it.
+        for b in (cl, sv):
+            if b is None:
+                continue
+            try:
+                path = os.path.join("build", "phonecheck-%s.log" % b.name)
+                os.makedirs("build", exist_ok=True)
+                with open(path, "wb") as f:
+                    f.write(b.log)
+                print("(%s transcript: %s, %u bytes)"
+                      % (b.name, path, len(b.log)))
+            except OSError as exc:
+                print("(could not write the %s transcript: %s)" % (b.name, exc))
         cl.close()
         if sv:
             sv.close()
