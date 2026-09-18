@@ -1,0 +1,36 @@
+# ArgonOS - the C3 as QEMU emulates it, on top of sdkconfig.defaults.esp32c3.
+#
+# WHY THIS FILE EXISTS.  Everything RISC-V in this tree has been verified on the
+# board and nowhere else, because there was no emulator for it here.  There is
+# now - Espressif's QEMU has an esp32c3 machine, `idf_tools.py install
+# qemu-riscv32` - and that turns "plug the C3 in" from a precondition of every
+# RISC-V check into a last step.
+#
+# Two lines are all that differ, and both are about what the emulated part does
+# not have.
+#
+# THE CONSOLE.  The real SuperMini has no bridge chip: its USB-C socket goes to
+# the chip's own USB pins, so the console is the built-in USB-serial-JTAG
+# device.  QEMU's esp32c3 presents a UART on -serial and nothing on that
+# device, so a guest configured for the board says everything into a socket
+# nobody is holding - and the symptom is a boot that produces not one byte,
+# which reads exactly like a guest that did not start.
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=n
+
+# THE RADIO.  There is no Wi-Fi in the emulated part, and an image that carries
+# the stack anyway spends about fifty kilobytes of a four-hundred-kilobyte
+# machine on a peripheral that will never answer.  Off here; the board build
+# above keeps it.
+CONFIG_ARGON_ENABLE_NET=n
+CONFIG_ARGON_NET_WIFI=n
+
+# THE CHIP REVISION.  QEMU's efuses start blank, so the emulated part reports
+# revision 0.0, and the bootloader this IDF builds refuses anything below v0.3:
+#
+#   E boot_comm: chip revision check failed. Required >= v0.3, found v0.0.
+#
+# then resets, and does it again, for ever - which on the screen looks exactly
+# like a guest that will not start.  Accepting v0 is safe here and only here:
+# the real SuperMini reports its own revision and keeps the board build's floor.
+CONFIG_ESP32C3_REV_MIN_0=y

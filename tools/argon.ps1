@@ -261,6 +261,7 @@ switch ($Command.ToLowerInvariant()) {
             Write-Host '                esp32-dsp   hardware: neither, 48 KB arena'
             Write-Host '                esp32c6     hardware: RISC-V, USB console, the C6-LCD-1.47'
             Write-Host '                esp32c3     hardware: RISC-V, USB console, one core, 400 KB - the C3 SuperMini'
+        Write-Host '                esp32c3-qemu  the same in the emulator: console on UART0, no radio'
             exit 0
         }
 
@@ -285,6 +286,8 @@ switch ($Command.ToLowerInvariant()) {
                              $chip = 'esp32s3' }
             'esp32c6'   { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32c6' }
             'esp32c3'   { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32c3' }
+            'esp32c3-qemu' { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32c3;sdkconfig.esp32c3.qemu'
+                             $chip = 'esp32c3' }
             default {
                 Write-Host "argon target: no defaults for '$chip'."
                 Write-Host 'Add sdkconfig.defaults.<chip> before building for it.'
@@ -540,6 +543,15 @@ switch ($Command.ToLowerInvariant()) {
         # `net use extradio`, talking RLINK to a fake coprocessor (rlinkd.py) on
         # a UART.  Proves the external-radio socket path with no hardware.
         Invoke-Ps1 (Join-Path $PSScriptRoot 'rlinktest.ps1') $Rest
+        exit $LASTEXITCODE
+    }
+
+    'rvtest' {
+        # The other instruction set, with no board plugged in: a CC-written
+        # RISC-V image run on an emulated ESP32-C3, and an emulated S3 writing
+        # one that matches the host build of the same compiler byte for byte.
+        # Switches the target twice and leaves it on esp32s3.
+        Invoke-Ps1 (Join-Path $PSScriptRoot 'rvtest.ps1') $Rest
         exit $LASTEXITCODE
     }
 

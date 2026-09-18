@@ -10,7 +10,10 @@
 # itself, so the console is the built-in USB serial device and not a UART.  No
 # display and no card slot: a header of thirteen pins and a green LED.
 #
-# QEMU does not run this target; everything here is verified on the board.
+# QEMU DOES run this target, since 18 Sep 2026: `idf_tools.py install
+# qemu-riscv32` and `argon target esp32c3-qemu`, which is this file plus
+# sdkconfig.esp32c3.qemu.  What the emulator cannot show is the radio, the
+# USB console and the pins; everything else no longer waits for the board.
 #
 # THE THREE NUMBERS THAT MAKE THIS BOARD DIFFERENT FROM THE C6:
 #

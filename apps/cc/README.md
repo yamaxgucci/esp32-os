@@ -1,7 +1,20 @@
 # Argon CC — tiny C → `.AXE` on the device
 
-**Argon CC** compiles a small subset of C to a runnable Xtensa `.AXE` without a
-host toolchain (image name `CC.AXE`).
+**Argon CC** compiles a small subset of C to a runnable `.AXE` without a host
+toolchain (image name `CC.AXE`). Two machines: **Xtensa** and **RV32IM**.
+
+```text
+run t:\cc.axe t:\hi.c t:\hi.axe             this board
+run t:\cc.axe -riscv t:\hi.c t:\hi.axe      the other one
+```
+
+The default is the board it is running on; `-riscv` / `-xtensa` says otherwise.
+Cross-compiling is what the cluster needs and it goes one way in practice: this
+compiler wants three megabytes of heap, which every board with PSRAM has and no
+C3 ever will, so the board that can compile does it for the board that cannot.
+The image header carries the architecture and the far board's loader names it —
+an image for the wrong machine does not refuse to load, it loads and throws an
+illegal instruction somewhere inside.
 
 ## Language
 
@@ -230,6 +243,42 @@ sticky keys remain a fallback. `[` `]` algorithm, `,` `.` preset, `-` `=`
 feedback, Space panic, Esc quit. The live UI shows `Perf` / `Stream`
 (render load %, late, drop, resync) like host DX7. Smoke prints
 `dx7nofx: smoke ok`.
+
+## The two back ends
+
+`cc_compile.c` is one translation unit with a **seam** in the middle: one
+function per operation the parser can ask for, and the two machines under it
+(`xt_*`, `rv_*`). Above the seam the registers are NUMBERS, not registers — 8
+is the value in hand, 9 the other operand, 7 the frame, 10..15 the arguments
+going out, and a call's answer comes back in 10, which is true of a windowed
+machine (a2 seen as a10) and of an ordinary one (a0) alike.
+
+What actually differs is not the encodings:
+
+| | Xtensa | RV32IM |
+|---|---|---|
+| an address | `l32r` from a literal pool beside the code; relocating it is arithmetic on a word | `lui`+`addi` carrying it in their immediates; relocating it rewrites two instructions (`ag_axe_ireloc_t`) |
+| a call | `ENTRY` rotates a window and allocates the frame; arguments arrive eight registers along | the prologue saves `ra` and `s0` itself; arguments arrive where the caller put them |
+| the frame size | one rewritten `ENTRY` | every `return` jumps to one epilogue, written when the size is known |
+| `a < b` | a branch and two moves | `slt` / `sltu` |
+| `x >> 20` unsigned | through the shift-amount register: `SRLI` cannot count past 15 | `srli` |
+
+How it is known to work, and the first is not enough:
+
+- `tools/ccbaseline.ps1` compiles every example with the host build of this
+  compiler (`build-host/cchost.exe`) and prints a hash each. Run it before a
+  change to the code generator and after: an Xtensa image that was not meant to
+  move must not move.
+- `riscv32-esp-elf-objdump` decodes every instruction of every example. That
+  says they are legal, not that they are the right ones.
+- `host-tests/test_rv32.c` **runs** them: an RV32IM interpreter, the two parts
+  placed somewhere other than where they were linked, and the kernel's own
+  `ag_axe_ireloc_apply` used to relocate — so it also checks that the compiler
+  and the loader agree about which bits of a `lui` an address goes into.
+- `argon rvtest` is the whole thing with no board: an emulated ESP32-C3 runs
+  the images and gives the same seven unsigned answers the Xtensa build gives,
+  and an emulated S3 writes one with `cc -riscv` that matches the host build
+  byte for byte.
 
 ## Build
 

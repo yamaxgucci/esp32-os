@@ -219,6 +219,24 @@ foreach ($img in $only) {
     if (-not (Test-Path "build\apps\$img")) { throw "$img did not build." }
 }
 
+# HOW LONG IT TAKES TO POUR CC.AXE DOWN A CONSOLE, and why it is computed
+# rather than written down.
+#
+# `recv` runs at about 600 bytes a second - 64 bytes a line, a round trip a
+# line, paced by the guest's echo - so every scenario that sends the compiler
+# waits about a minute before it can do anything, and the far node's wait has
+# to outlast that.  THAT NUMBER HAS BEEN A CONSTANT THREE TIMES AND GONE STALE
+# THREE TIMES: 40, then 80, then 125, and 125 held only until CC.AXE gained two
+# kilobytes for its RISC-V back end - after which node B dumped its journal
+# nineteen seconds before the handover it was there to witness, and the check
+# read "the far kernel never loaded it": true, and about the wrong moment.
+#
+# A compiler that grows now moves this with it.
+$ccSecs = 0
+if (Test-Path 'build\apps\CC.AXE') {
+    $ccSecs = [int][math]::Ceiling((Get-Item 'build\apps\CC.AXE').Length / 600.0)
+}
+
 # One flash image, built once, before either guest can race the other to it.
 Update-FlashImage
 
@@ -1258,23 +1276,18 @@ if ($Scenario -eq 'ccmigrate') {
         -SendB @('drv load t:\nodelink.sys',
                  'link name there',
                  'link use node0',
-                 # LATER THAN THE PLAIN HANDOVER'S 40 SECONDS, and the number
-                 # is arithmetic rather than a guess that grew twice.
+                 # LATER THAN THE PLAIN HANDOVER'S 40 SECONDS, and derived
+                 # rather than guessed - see $ccSecs above for the three times
+                 # a constant here went stale.
                  #
-                 # A's side of this run: its own boot and the two files it is
-                 # sent - CC.AXE is 33 KB over the console, which is most of a
-                 # minute - then $SendDelaySec of waiting, about 26 seconds of
-                 # compiling, and four of counting before it asks.  Measured on
-                 # this pair, A reaches `migrate` at about 121 s of its uptime,
-                 # and B starts within a second of A.
-                 #
-                 # B spends about 17 s on its own three commands, so a 125 s
-                 # sleep dumps the journal at roughly 142 s - twenty seconds
-                 # after the program should have landed here.  At 40, and then
-                 # at 80, this journal was snapped BEFORE the handover and the
-                 # check read "the far kernel never loaded it": true, and about
-                 # the wrong moment.
-                 '!powershell -NoProfile -Command Start-Sleep -Seconds 125',
+                 # A's side of this run: its own boot (~20 s) and the two files
+                 # it is sent - migrant.c is ~5 s and CC.AXE is $ccSecs - then
+                 # $SendDelaySec of waiting, about 30 s of compiling and 5 of
+                 # counting before it asks.  B spends about 35 s on its boot
+                 # and its own three commands, so it needs the same total less
+                 # that, plus margin.
+                 ("!powershell -NoProfile -Command Start-Sleep -Seconds {0}" -f
+                  ($ccSecs + $SendDelaySec + 60)),
                  'log -n 60',
                  '=log') `
         -SendA @('drv load t:\nodelink.sys',
@@ -1295,8 +1308,8 @@ if ($Scenario -eq 'ccmigrate') {
                  # Stay alive while B dumps its journal, for the same reason
                  # the plain handover does: A finishing stops the pair, and the
                  # far node's own evidence goes with it.  Long enough to
-                 # outlast B's 125 s wait - see the arithmetic there.
-                 '!powershell -NoProfile -Command Start-Sleep -Seconds 45')
+                 # outlast B's wait - see the arithmetic there.
+                 '!powershell -NoProfile -Command Start-Sleep -Seconds 60')
 
     $a = Transcript 'build\nodetest-ccmig-a.log'
     $b = Transcript 'build\nodetest-ccmig-b.log'
@@ -1369,9 +1382,11 @@ if ($Scenario -eq 'ccjob') {
                  # B does nothing of its own - its whole part is started by A -
                  # and the poll keeps its shell out of the way and its wire
                  # pumped while that happens.  Long enough to outlast A's
-                 # compile: A spends $SendDelaySec waiting, then the better part
-                 # of a minute compiling, before the job even starts.
-                 "link poll $(($SendDelaySec + 230) * 1000)",
+                 # compile, and derived from the size of the compiler for the
+                 # reason written at $ccSecs: A waits $SendDelaySec, then pours
+                 # CC.AXE and clujob.c down the console, then compiles for the
+                 # better part of a minute, before the job even starts.
+                 "link poll $(($ccSecs + $SendDelaySec + 170) * 1000)",
                  '=link on node0',
                  # From the journal and not the screen: while a worker thread
                  # owns B's console, a kernel line written then reaches nobody.

@@ -1,14 +1,38 @@
 # Shared helpers for the QEMU scripts.  Dot-source, do not run directly.
 
+# Which chip the build in build\ is for.
+#
+# Read from the generated sdkconfig rather than passed in, because everything
+# that launches the emulator has to agree with what was built and there is
+# exactly one place that knows: two RISC-V and three Xtensa targets share these
+# scripts, and a mismatch is a guest that produces no output at all.
+function Get-QemuTarget {
+    if (-not (Test-Path 'sdkconfig')) {
+        throw 'No sdkconfig. Run: argon target <chip>'
+    }
+    $line = Select-String -Path 'sdkconfig' -Pattern '^CONFIG_IDF_TARGET="(.+)"$' |
+            Select-Object -First 1
+    if (-not $line) { throw 'sdkconfig names no target.' }
+    return $line.Matches[0].Groups[1].Value
+}
+
 function Resolve-Qemu {
     if (-not $env:IDF_TOOLS_PATH) {
         throw 'Run tools\idf-env.ps1 first.'
     }
-    $exe = Get-ChildItem -Path (Join-Path $env:IDF_TOOLS_PATH 'tools\qemu-xtensa') `
-        -Filter 'qemu-system-xtensa.exe' -Recurse -ErrorAction SilentlyContinue |
+    $chip = Get-QemuTarget
+    if ($chip -like 'esp32c*' -or $chip -like 'esp32h*' -or $chip -like 'esp32p*') {
+        $pkg = 'qemu-riscv32'
+        $bin = 'qemu-system-riscv32.exe'
+    } else {
+        $pkg = 'qemu-xtensa'
+        $bin = 'qemu-system-xtensa.exe'
+    }
+    $exe = Get-ChildItem -Path (Join-Path $env:IDF_TOOLS_PATH "tools\$pkg") `
+        -Filter $bin -Recurse -ErrorAction SilentlyContinue |
         Select-Object -First 1
     if (-not $exe) {
-        throw 'QEMU not installed. Run: idf_tools.py install qemu-xtensa'
+        throw "QEMU for $chip not installed. Run: idf_tools.py install $pkg"
     }
     return $exe.FullName
 }
@@ -122,9 +146,17 @@ function Update-FlashImage {
         Write-Host 'Generating build\qemu_flash.bin'
     }
 
-    & $python.FullName -m esptool --chip=esp32s3 merge_bin `
-        --output=$flash --fill-flash-size=8MB `
-        --flash_mode dio --flash_freq 80m --flash_size 8MB `
+    # The chip and its flash size, from the build rather than typed: a 4 MB
+    # part filled to 8 MB boots to nothing, and esptool will not say why.
+    $chip = Get-QemuTarget
+    $mb = '8MB'
+    if (Select-String -Path 'sdkconfig' -Pattern '^CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y$' `
+            -Quiet -ErrorAction SilentlyContinue) {
+        $mb = '4MB'
+    }
+    & $python.FullName -m esptool --chip=$chip merge_bin `
+        --output=$flash --fill-flash-size=$mb `
+        --flash_mode dio --flash_freq 80m --flash_size $mb `
         @parts | Out-Null
     if (-not $?) { throw 'esptool merge_bin failed.' }
 
@@ -403,6 +435,21 @@ function Get-QemuMachineArgs {
         [string]$EfuseOverride = ''
     )
     if ($EfuseOverride) { $EfusePath = $EfuseOverride }
+    $chip = Get-QemuTarget
+    if ($chip -ne 'esp32s3') {
+        # The other machines, which have neither PSRAM nor a panel: the
+        # arguments below that name esp32s3 devices do not exist on them, and
+        # QEMU refuses to start rather than ignoring one - which is the good
+        # behaviour and the reason this is a separate list instead of a filter.
+        return @(
+            '-M', $chip
+            '-accel', 'tcg,tb-size=64'
+            '-drive', "file=$FlashPath,if=mtd,format=raw"
+            '-drive', "file=$EfusePath,if=none,format=raw,id=efuse"
+            '-global', "driver=nvram.$chip.efuse,property=drive,value=efuse"
+            '-global', "driver=timer.$chip.timg,property=wdt_disable,value=true"
+        )
+    }
     return @(
         '-M', $(if ($Graphics) { 'esp32s3,graphics=on' } else { 'esp32s3' })
         # QEMU reserves a 1 GB JIT buffer by default on a 64-bit host, and it
