@@ -24,21 +24,33 @@
 # IT SWITCHES THE TARGET TWICE and ends on esp32s3, the primary one.  Expect
 # twenty minutes.
 #
-# ONE THING SEEN HERE IS NOT EXPLAINED, and it is written down rather than
-# tidied away.  Twice in nine runs, while this scenario was still being
-# written, node A's remote run answered -60 (AG_ETIMEDOUT) after the full
-# sixty seconds while everything else about the wire was healthy: the hello
-# exchange had named the far node and counted its cores, and node B's journal
-# showed nothing at all for the whole of that minute.  It has not happened in
-# the five runs since the shape below (six short polls, and a live round trip
-# before the ask), but five runs is not a proof and nothing was changed in the
-# system - only in what this script asks for.
+# THE FAULT THIS FILE USED TO DESCRIBE WAS THIS SCRIPT'S, AND IT IS FIXED.
 #
-# So the scenario is arranged to carry its own evidence next time: `link devs`
-# proves the wire is alive AT THAT MOMENT rather than from memory, the polls
-# are short enough to leave a heartbeat in the transcript, and node B ends by
-# printing its frame counters and its journal.  A failure here should say
-# whether the request arrived and was dropped or never arrived.
+# It read: "on this pair a node serves exactly one remote run per session; the
+# second is retransmitted to the ceiling and answered -60 while the far node's
+# counters stand still".  Every word of the evidence was true and the
+# conclusion was wrong.  The far node's counters stood still because there was
+# no far node: it had reached the end of its own script and exited.
+#
+# What kept it waiting was silence in the shell.  `run x.axe` that lands here
+# prints "returned N"; `run x.axe` that crosses the wire printed the program's
+# output and nothing else, while `link run` - the same thing asked for
+# differently - has always said "returned N from the other node".  qemu-boot
+# waits for "returned " to know a run is over, so every remote run in a
+# scripted scenario sat for the whole command timeout, seven minutes, and the
+# node it was talking to had a hundred and twenty seconds of `link poll` to
+# live.  Everything asked after that got no answer, correctly.
+#
+# Found by measuring rather than by re-running: tools\xcluprobe.ps1 asks for
+# four remote runs of three kinds in one session with the frame counters
+# printed between them.  All four are served - and the same probe is what
+# showed that the first shape of the question ("does the SECOND one fail?")
+# had the wrong subject, because two runs in a row passed.
+#
+# So this scenario is ONE SESSION again, and it now proves something the two
+# could not: the same node answers two different asks, and the cascade picks a
+# DIFFERENT rung for each of them - a native build of its own for one program,
+# the portable build for another - without being reset in between.
 #
 # Exit code 0 means every check passed.
 [CmdletBinding()]
@@ -180,25 +192,6 @@ Start-Sleep -Milliseconds 500
 # tools\nodetest.ps1; the difference here is that the two guests are two
 # different machines, so B carries its own -Chip and a flash image built before
 # the target moved on.
-#
-# TWO SESSIONS RATHER THAN ONE, and that is not tidiness - it is a defect
-# written down.  ON THIS PAIR, A NODE SERVES EXACTLY ONE REMOTE RUN.  The
-# second one that any session asks for is never received: node A retransmits
-# the request 215 times with its timer backed off from a measured 10 ms round
-# trip to the 2 s ceiling, and node B's counters do not move at all - "0 gaps,
-# 0 duplicates, 0 bad" and its "bytes in" unchanged, so the frame is not
-# arriving rather than being rejected.  Sixty seconds later the asking node
-# reports -60.
-#
-# It is not the bytecode: the same second request fails with the same native
-# image that succeeded as the first.  It is not this pair being emulated in
-# general either: nodetest's own pair of two S3s does a dozen remote things in
-# one session and passes.  Unexplained, and on the C3 side; written up in
-# docs/plans/cluster.md.
-#
-# So each claim gets a session of its own, in which it is the FIRST remote run.
-# That is not hiding the fault - it is the only way to test anything else while
-# it stands.
 
 function Invoke-XPair {
     param(
@@ -230,6 +223,29 @@ function Invoke-XPair {
     if ($procB.HasExited) {
         throw ("node B exited at once (code $($procB.ExitCode)); " +
                "see build\xclutest-$Tag-b.err")
+    }
+
+    # A DOES NOT START UNTIL B HAS ITS FILES, for the reason written up at
+    # Invoke-Pair in tools\nodetest.ps1: both guests deliver their own over the
+    # console, B's are the many, and a transfer that has to be retried costs
+    # about two minutes - after which A is asking a node whose listener has not
+    # started.  Waiting for what B SAYS rather than for a number of seconds.
+    if ($PutB.Count -gt 0) {
+        $deadline = (Get-Date).AddSeconds($TimeoutSec)
+        $ready = $false
+        while ((Get-Date) -lt $deadline -and -not $procB.HasExited) {
+            $out = Get-Content "build\xclutest-$Tag-b.out" -Raw `
+                -ErrorAction SilentlyContinue
+            if ($out -and $out.Contains('--- deliveries done ---')) {
+                $ready = $true
+                break
+            }
+            Start-Sleep -Milliseconds 500
+        }
+        if (-not $ready) {
+            Write-Host ('node B has not finished its deliveries; starting A ' +
+                        'anyway') -ForegroundColor Yellow
+        }
     }
 
     try {
@@ -274,11 +290,20 @@ Write-Host "`n== an Xtensa node and a RISC-V node, one cluster ==" `
 # that is where a board keeps the images it can run.  Put on T: it is invisible
 # to the substitution and the far node answers "no build of that program here",
 # which is true and reads like the cascade is broken.
+#
+# TWO PROGRAMS, TWO RUNGS, ONE SESSION.  Node B is given a native build of its
+# own of one program (NODEHI) and only the portable build of the other
+# (UNSIGNED), so the same node answers the same kind of ask two different ways
+# within a few seconds - which is the cascade being a cascade rather than a
+# single trick, and cannot be shown by two sessions of one run each.
 Invoke-XPair -Tag 'run' `
     -PutB @('build\apps\NODELNRV.SYS=t:\nodelnrv.sys',
             'build\apps\NODEHIRV.AXE=c:\nodehirv.axe',
             'build\apps\NODEHI.AXE=t:\nodehi.axe',
-            'build\apps\NODEHI.AXE=t:\xeno.axe') `
+            'build\apps\NODEHI.AXE=t:\xeno.axe',
+            'build\apps\AGVMRV.AXE=c:\agvm.axe',
+            "$bank\bc-unsigned.bc=c:\unsigned.bc",
+            "$bank\xt-unsigned.axe=t:\xeno2.axe") `
     -SendB (@('drv load t:\nodelnrv.sys',
               'link name c3',
               'link use node0',
@@ -298,9 +323,15 @@ Invoke-XPair -Tag 'run' `
              'link devs',
              '=are in this registry now',
              # A IS NOT GIVEN THIS FILE.  Placement sends the run to whichever
-             # node has it, which is B - and B cannot execute it.
+             # node has it, which is B - and B cannot execute it.  RUNG ONE:
+             # B has a build of its own.
              'run t:\xeno.axe',
-             '=nodehi: here')
+             '=nodehi: here',
+             # RUNG THREE, on the same node without resetting anything: this
+             # program B can neither execute nor build, and what it has is the
+             # portable one.
+             'run t:\xeno2.axe',
+             '=shr20')
 
 $a = Transcript 'build\xclutest-run-a.log'
 $b = Transcript 'build\xclutest-run-b.log'
@@ -341,55 +372,39 @@ Check $a 'nodehi: here' 'xclu-far-node-ran-its-own-build'
 Note (-not (Flat $a).Contains('did not run there either')) `
     'xclu-asker-was-not-told-it-failed'
 
-# ---- 2. and the rung below that, in a session of its own ------------------
+# THE SAME NODE SERVED A SECOND ASK, and said so in the words a local run uses.
+#
+# This line is the one the fault at the top of this file was made of: it did
+# not exist, so a scripted remote run had nothing to finish on and waited out
+# its whole timeout while the far node's script ran out.  Checked here rather
+# than assumed, because everything below it depends on the session still being
+# alive.
+Check $a 'returned 0 from node0' 'xclu-remote-run-reported-its-exit'
+
+# ---- 2. and the rung below that, on the same node, seconds later ----------
 #
 # The far node cannot execute the image it was handed AND has no build of its
 # own it can execute either.  What it has is the portable one, and that is the
 # whole of the third rung: it runs, and the answers come back.
 #
-# A SEPARATE SESSION because of the one-remote-run fault written up at the top
-# of this file.  unsigned.c is the program to use: its seven answers are the
-# ones where signedness changes the result, so "it ran" and "it ran correctly"
-# are the same check.
-
-Write-Host "`n== a node that can neither run it nor build it ==" `
-    -ForegroundColor Cyan
-
-Invoke-XPair -Tag 'bc' `
-    -PutB @('build\apps\NODELNRV.SYS=t:\nodelnrv.sys',
-            'build\apps\AGVMRV.AXE=c:\agvm.axe',
-            "$bank\bc-unsigned.bc=c:\unsigned.bc",
-            "$bank\xt-unsigned.axe=t:\xeno2.axe") `
-    -SendB (@('drv load t:\nodelnrv.sys',
-              'link name c3',
-              'link use node0') + $hold) `
-    -PutA @('build\apps\NODELINK.SYS=t:\nodelink.sys') `
-    -SendA @('drv load t:\nodelink.sys',
-             'link name s3',
-             'link use node0',
-             "!powershell -NoProfile -Command Start-Sleep -Seconds $SendDelaySec",
-             'link nodes',
-             '=cores in all',
-             'run t:\xeno2.axe',
-             '=shr20')
-
-$a2 = Transcript 'build\xclutest-bc-a.log'
-$b2 = Transcript 'build\xclutest-bc-b.log'
+# unsigned.c is the program to use: its seven answers are the ones where
+# signedness changes the result, so "it ran" and "it ran correctly" are the
+# same check.
 
 # Its own words for the choice, not the file transfer: "running my own
 # /sys/unsigned.bc".  The first draft of this check looked for the name alone
 # and passed on the line where the file was DELIVERED, which proved nothing.
-CheckTight $b2 'running my own /sys/unsigned.bc' `
+CheckTight $b 'running my own /sys/unsigned.bc' `
     'xclu-bc-far-node-chose-the-portable-build'
 # On the ASKING node, because that is where the far node's loader line arrives
 # along with everything else the program said.
-Check $a2 'AGVM: riscv32' 'xclu-bc-interpreter-loaded-there'
+Check $a 'AGVM: riscv32' 'xclu-bc-interpreter-loaded-there'
 # The seven where signedness changes the answer, so "it ran" and "it ran
 # correctly" are one check.  On the ASKING node, because that is where the far
 # node's output has to arrive for any of this to be worth anything.
 foreach ($k in @('shr 08000000', 'shr_s f8000000', 'div 55555555',
                  'rem 5', 'gt yes', 'gt_s no', 'shr20 00000800')) {
-    Check $a2 $k ('xclu-bc-' + ($k -replace '\s+', '-'))
+    Check $a $k ('xclu-bc-' + ($k -replace '\s+', '-'))
 }
 
 $failed = @($results | Where-Object { $_ -like 'FAIL *' })

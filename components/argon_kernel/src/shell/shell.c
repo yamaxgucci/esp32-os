@@ -1186,6 +1186,28 @@ static int cmd_run(int argc, char **argv)
                                           (int)code);
                         return 1;
                     }
+                    /*
+                     * SAID, and in the same words a run that stayed here is
+                     * said in.  This printed nothing at all on success, so a
+                     * run that crossed the wire ended in silence: the program's
+                     * output arrived and then the prompt came back, with no way
+                     * to tell a program that finished from one still running
+                     * over there.  `link run` has always reported this - the
+                     * two ways of asking for the same thing answered
+                     * differently.
+                     *
+                     * It cost more than tidiness.  The harness waits for
+                     * "returned " to know a `run` is over (tools\qemu-boot.ps1)
+                     * and there was no such line, so every remote run in a
+                     * scripted scenario burned the whole command timeout -
+                     * seven minutes in xclutest - and the node it had been
+                     * talking to reached the end of its own script and exited
+                     * while it waited.  Anything asked after that got no answer
+                     * at all, which is where "a node serves exactly one remote
+                     * run per session" came from.  There was no such rule.
+                     */
+                    ag_console_printf("returned %d from %s\n", (int)code,
+                                      ag_linkprov_active());
                     return (code == 0) ? 0 : 1;
                 }
                 /* Fall through to the local error: a neighbour that could not
@@ -1283,6 +1305,11 @@ static int cmd_run(int argc, char **argv)
                                     (int)code);
                                 return 1;
                             }
+                            /* The same sentence as the other placement path
+                             * above, for the same reason. */
+                            ag_console_printf("returned %d from %s\n",
+                                              (int)code,
+                                              ag_linkprov_active());
                             return (code == 0) ? 0 : 1;
                         }
                         ag_console_printf("  (the other node: %d)\n",

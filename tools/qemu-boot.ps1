@@ -907,10 +907,41 @@ try {
                 }
                 $seen = Read-Available
             } elseif ($cmd -match '(?i)^run\s') {
-                $wasRet = Count-Of 'returned '
+                # EVERY WAY A RUN CAN END, not only the happy one.
+                #
+                # This waited for "returned " alone, and a run that crossed the
+                # wire did not print it: the shell reported a remote run's exit
+                # in silence while `link run` reported it in words.  So the
+                # wait ran to the full command timeout - SEVEN MINUTES in
+                # xclutest - and the node on the other end, whose own script is
+                # a fixed number of seconds long, reached the end of it and
+                # exited while this one waited.  Everything asked after that
+                # went to a machine that was gone: retransmitted to the ceiling
+                # and answered -60, with the far node's counters standing still
+                # because there was no far node.  That is the whole of the
+                # "a node serves exactly one remote run per session" fault that
+                # was written up here and in docs\plans\cluster.md.
+                #
+                # The shell now says "returned N from <node>", which is the
+                # real fix; this list is the belt to that pair of braces, so
+                # that the next answer nobody thought of costs a warning rather
+                # than a timeout.
+                $endings = @('returned ', 'did not run there',
+                             'the other node:')
+                $was = @{}
+                foreach ($e in $endings) { $was[$e] = Count-Of $e }
                 Send-Command $cmd
-                if (-not (Wait-Text -Needle 'returned ' -Was $wasRet `
-                                    -Seconds $TimeoutSec)) {
+                $deadline = (Get-Date).AddSeconds($TimeoutSec)
+                if ($deadline -gt $runDeadline) { $deadline = $runDeadline }
+                $done = $false
+                while (-not $done -and (Get-Date) -lt $deadline) {
+                    [void](Read-Available)
+                    foreach ($e in $endings) {
+                        if ((Count-Of $e) -gt $was[$e]) { $done = $true; break }
+                    }
+                    if (-not $done) { Start-Sleep -Milliseconds 200 }
+                }
+                if (-not $done) {
                     Write-Host "warning: run did not report process exit"
                 }
                 $seen = Read-Available

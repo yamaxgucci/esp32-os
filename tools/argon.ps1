@@ -555,6 +555,15 @@ switch ($Command.ToLowerInvariant()) {
         exit $LASTEXITCODE
     }
 
+    'xcluprobe' {
+        # Not a check - a measurement.  Two remote runs on that pair with the
+        # frame counters printed between them, for the one-remote-run fault
+        # written up at the top of xclutest.ps1.  Reuses the last xclutest's
+        # banked C3 image and builds nothing.
+        Invoke-Ps1 (Join-Path $PSScriptRoot 'xcluprobe.ps1') $Rest
+        exit $LASTEXITCODE
+    }
+
     'rvtest' {
         # The other instruction set, with no board plugged in: a CC-written
         # RISC-V image run on an emulated ESP32-C3, and an emulated S3 writing
