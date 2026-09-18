@@ -40,6 +40,13 @@ static void cc_free(void *p)
 #define CODE_BASE 0x42000000u
 #define DATA_BASE 0x3C000000u
 #define AXE_HDR   176u
+/*
+ * And the same header with ireloc_offset / ireloc_count on the end, which a
+ * RISC-V image needs and an Xtensa one has no use for.  Two sizes rather than
+ * one because header_size is how a loader that predates those fields knows to
+ * stop before them - see the note on ag_axe_header_t.
+ */
+#define AXE_HDR_I 184u
 
 /*
  * Code may exceed the IRAM arena (CONFIG_ARGON_APP_ARENA_KB, 192 on S3): the
@@ -88,9 +95,20 @@ static void cc_free(void *p)
 #define MAX_LOCAL_WORDS 224
 #define FRAME_TOP_SAVE 32
 #define MAX_PARAMS 6
+/* Returns in one function, and instruction relocations in one image. */
+#define MAX_RET_SITES 128
+#define MAX_IRELOCS   8192
 
 #define AG_AXE_R_IN_DATA 0x1u
 #define AG_AXE_R_TO_DATA 0x2u
+/* Relocations inside an instruction, which only RISC-V has.  The names and the
+ * bits are ag_axe_ireloc_t's in sdk/include/argon/axe.h; the compiler has no
+ * headers of its own, so they are repeated here and asserted against the real
+ * ones in host-tests/test_cc.c. */
+#define AG_AXE_I_TO_DATA 0x10000000u
+#define AG_AXE_I_HI20    0x20000000u
+#define AG_AXE_I_LO12_I  0x40000000u
+#define AG_AXE_I_LO12_S  0x60000000u
 #define AG_AXE_NEEDS_GFX (1u << 1)
 #define AG_AXE_DRIVER (1u << 3)
 #define AG_AXE_NEEDS_AUDIO (1u << 6)
@@ -1645,14 +1663,6 @@ typedef struct {
     field_t fields[MAX_FIELDS];
 } struct_t;
 
-static ptype_t ty_scalar(int esize)
-{
-    /* A byte is unsigned here and a word is not, unless something says so -
-     * ty_of carries the declared answer, and this is only the default. */
-    ptype_t t = {PK_SCALAR, esize, -1, (esize == 1)};
-    return t;
-}
-
 /* What one element of an array, or the target of a pointer, is. */
 static ptype_t ty_elem(const ptype_t *t)
 {
@@ -1733,6 +1743,20 @@ typedef struct {
     int      needs_gfx;
     int      needs_audio;
     int      min_abi;
+    int      arch; /* cc_arch_t: which back end below is in use */
+    /*
+     * Relocations that live inside an instruction, which only RISC-V has:
+     * there is no literal pool there, an address is built by a lui/addi pair
+     * carrying it in their immediate fields, and relocating one means
+     * rewriting the instruction.  Two words an entry, allocated on first use
+     * so an Xtensa compile never pays for it.  See ag_axe_ireloc_t.
+     */
+    uint32_t *irel;
+    int       nirel;
+    /* Where each `return` in the function being written jumps to be given the
+     * epilogue: on RISC-V the frame size is not known when they are emitted. */
+    size_t   ret_site[MAX_RET_SITES];
+    int      nret;
     int      spill_top;
     int      err;
     char     errmsg[160];
@@ -1783,7 +1807,15 @@ static void emit3(gen_t *g, uint8_t a, uint8_t b, uint8_t c)
     emit_raw(g, x, 3);
 }
 
-static void emit_entry(gen_t *g, int framesize)
+/* ---- the Xtensa back end ------------------------------------------------ */
+/*
+ * Everything below here down to the seam knows what an Xtensa instruction
+ * looks like, and nothing above or below it does.  The names begin xt_ for
+ * exactly that reason: a call to one of them from the parser is a leak, and a
+ * leak with a name is one a reader can see.
+ */
+
+static void xt_entry(gen_t *g, int framesize)
 {
     const int imm = framesize / 8;
     emit3(g, 0x36, (uint8_t)(((imm & 0xf) << 4) | 1), (uint8_t)(imm >> 4));
@@ -1795,7 +1827,7 @@ static void emit_entry(gen_t *g, int framesize)
  * and rewritten with the real one.  Sizing every frame at the maximum instead
  * would cost each call the deepest function's stack.
  */
-static void patch_entry(gen_t *g, size_t site, int framesize)
+static void xt_patch_entry(gen_t *g, size_t site, int framesize)
 {
     if (site + 2 >= g->len || g->code[site] != 0x36) {
         gfail(g, "bad entry site");
@@ -1806,12 +1838,12 @@ static void patch_entry(gen_t *g, size_t site, int framesize)
     g->code[site + 2] = (uint8_t)(imm >> 4);
 }
 
-static void emit_retw_n(gen_t *g)
+static void xt_retw_n(gen_t *g)
 {
     emit2(g, 0x1d, 0xf0);
 }
 
-static void emit_mov_n(gen_t *g, int ad, int as)
+static void xt_mov_n(gen_t *g, int ad, int as)
 {
     emit2(g, (uint8_t)((ad << 4) | 0x0d), (uint8_t)as);
 }
@@ -1834,7 +1866,7 @@ static int add_lit(gen_t *g, uint8_t kind, uint32_t val_or_off)
     return li;
 }
 
-static void emit_l32r_lit(gen_t *g, int at, int li)
+static void xt_l32r_lit(gen_t *g, int at, int li)
 {
     if (li < 0 || li >= g->nlit) {
         gfail(g, "bad literal index");
@@ -1851,7 +1883,7 @@ static void emit_l32r_lit(gen_t *g, int at, int li)
     emit3(g, (uint8_t)((at << 4) | 0x1), 0xff, 0xff);
 }
 
-static void emit_movi(gen_t *g, int at, int32_t imm)
+static void xt_movi(gen_t *g, int at, int32_t imm)
 {
     if (imm >= -32 && imm <= 95) {
         const uint32_t u = (uint32_t)imm & 0x7fu;
@@ -1869,55 +1901,55 @@ static void emit_movi(gen_t *g, int at, int32_t imm)
     if (li < 0) {
         return;
     }
-    emit_l32r_lit(g, at, li);
+    xt_l32r_lit(g, at, li);
 }
 
-static void emit_li_data(gen_t *g, int at, uint32_t data_off)
+static void xt_li_data(gen_t *g, int at, uint32_t data_off)
 {
     const int li = add_lit(g, LIT_DATA_OFF, data_off);
     if (li < 0) {
         return;
     }
-    emit_l32r_lit(g, at, li);
+    xt_l32r_lit(g, at, li);
 }
 
-static void emit_li_code(gen_t *g, int at, uint32_t code_off)
+static void xt_li_code(gen_t *g, int at, uint32_t code_off)
 {
     const int li = add_lit(g, LIT_CODE_OFF, code_off);
     if (li < 0) {
         return;
     }
-    emit_l32r_lit(g, at, li);
+    xt_l32r_lit(g, at, li);
 }
 
-static void emit_add_n(gen_t *g, int ar, int as, int at)
+static void xt_add_n(gen_t *g, int ar, int as, int at)
 {
     emit2(g, (uint8_t)((at << 4) | 0x0a), (uint8_t)((ar << 4) | as));
 }
 
-static void emit_rrr(gen_t *g, uint8_t opc, int ar, int as, int at)
+static void xt_rrr(gen_t *g, uint8_t opc, int ar, int as, int at)
 {
     emit3(g, (uint8_t)((at << 4) | 0x0), (uint8_t)((ar << 4) | as), opc);
 }
 
-static void emit_sub(gen_t *g, int ar, int as, int at)
+static void xt_sub(gen_t *g, int ar, int as, int at)
 {
-    emit_rrr(g, 0xc0, ar, as, at);
+    xt_rrr(g, 0xc0, ar, as, at);
 }
 
-static void emit_mull(gen_t *g, int ar, int as, int at)
+static void xt_mull(gen_t *g, int ar, int as, int at)
 {
-    emit_rrr(g, 0x82, ar, as, at);
+    xt_rrr(g, 0x82, ar, as, at);
 }
 
-static void emit_quos(gen_t *g, int ar, int as, int at)
+static void xt_quos(gen_t *g, int ar, int as, int at)
 {
-    emit_rrr(g, 0xd2, ar, as, at);
+    xt_rrr(g, 0xd2, ar, as, at);
 }
 
-static void emit_rems(gen_t *g, int ar, int as, int at)
+static void xt_rems(gen_t *g, int ar, int as, int at)
 {
-    emit_rrr(g, 0xf2, ar, as, at);
+    xt_rrr(g, 0xf2, ar, as, at);
 }
 
 /*
@@ -1926,29 +1958,29 @@ static void emit_rems(gen_t *g, int ar, int as, int at)
  * is the ISA saying the two kinds of division are the same instruction with a
  * different idea of the top bit.
  */
-static void emit_quou(gen_t *g, int ar, int as, int at)
+static void xt_quou(gen_t *g, int ar, int as, int at)
 {
-    emit_rrr(g, 0xc2, ar, as, at);
+    xt_rrr(g, 0xc2, ar, as, at);
 }
 
-static void emit_remu(gen_t *g, int ar, int as, int at)
+static void xt_remu(gen_t *g, int ar, int as, int at)
 {
-    emit_rrr(g, 0xe2, ar, as, at);
+    xt_rrr(g, 0xe2, ar, as, at);
 }
 
-static void emit_and(gen_t *g, int ar, int as, int at)
+static void xt_and(gen_t *g, int ar, int as, int at)
 {
-    emit_rrr(g, 0x10, ar, as, at);
+    xt_rrr(g, 0x10, ar, as, at);
 }
 
-static void emit_or(gen_t *g, int ar, int as, int at)
+static void xt_or(gen_t *g, int ar, int as, int at)
 {
-    emit_rrr(g, 0x20, ar, as, at);
+    xt_rrr(g, 0x20, ar, as, at);
 }
 
-static void emit_xor(gen_t *g, int ar, int as, int at)
+static void xt_xor(gen_t *g, int ar, int as, int at)
 {
-    emit_rrr(g, 0x30, ar, as, at);
+    xt_rrr(g, 0x30, ar, as, at);
 }
 
 /*
@@ -1956,22 +1988,22 @@ static void emit_xor(gen_t *g, int ar, int as, int at)
  * takes its operand in the s field and SRA in the t field - an asymmetry of the
  * ISA, not of this compiler.
  */
-static void emit_ssl(gen_t *g, int as)
+static void xt_ssl(gen_t *g, int as)
 {
     emit3(g, 0x00, (uint8_t)(0x10 | as), 0x40);
 }
 
-static void emit_ssr(gen_t *g, int as)
+static void xt_ssr(gen_t *g, int as)
 {
     emit3(g, 0x00, (uint8_t)as, 0x40);
 }
 
-static void emit_sll(gen_t *g, int ar, int as)
+static void xt_sll(gen_t *g, int ar, int as)
 {
     emit3(g, 0x00, (uint8_t)((ar << 4) | as), 0xa1);
 }
 
-static void emit_sra(gen_t *g, int ar, int at)
+static void xt_sra(gen_t *g, int ar, int at)
 {
     emit3(g, (uint8_t)(at << 4), (uint8_t)(ar << 4), 0xb1);
 }
@@ -1979,20 +2011,20 @@ static void emit_sra(gen_t *g, int ar, int at)
 /* SRL, the same shape as SRA and the same asymmetry: the operand is in t.  It
  * shifts zeros in where SRA shifts the sign, which is the whole difference
  * between `>>` on a count and `>>` on a measurement. */
-static void emit_srl(gen_t *g, int ar, int at)
+static void xt_srl(gen_t *g, int ar, int at)
 {
     emit3(g, (uint8_t)(at << 4), (uint8_t)(ar << 4), 0x91);
 }
 
 /* SLLI encodes 32 - sa, which is why a shift by 0 has no encoding at all. */
-static void emit_slli(gen_t *g, int ar, int as, int sa)
+static void xt_slli(gen_t *g, int ar, int as, int sa)
 {
     const int inv = 32 - sa;
     emit3(g, (uint8_t)((inv & 0xf) << 4), (uint8_t)((ar << 4) | as),
           (uint8_t)(((inv >> 4) << 4) | 0x1));
 }
 
-static void emit_srai(gen_t *g, int ar, int at, int sa)
+static void xt_srai(gen_t *g, int ar, int at, int sa)
 {
     emit3(g, (uint8_t)(at << 4), (uint8_t)((ar << 4) | (sa & 0xf)),
           (uint8_t)(((0x2 | (sa >> 4)) << 4) | 0x1));
@@ -2005,41 +2037,41 @@ static void emit_srai(gen_t *g, int ar, int at, int sa)
  * shift itself then reads it.  A machine with an ordinary three-register shift
  * needs none of that, and the parser should not have to know which it is on.
  *
- * emit_shr_i USES REGISTER 9 when the value is unsigned, for the reason
+ * xt_shr_i USES REGISTER 9 when the value is unsigned, for the reason
  * written at its body; every caller has 9 free, and a caller that has not must
  * not use it.
  */
-static void emit_shl_rr(gen_t *g, int dst, int lhs, int amt)
+static void xt_shl_rr(gen_t *g, int dst, int lhs, int amt)
 {
-    emit_ssl(g, amt);
-    emit_sll(g, dst, lhs);
+    xt_ssl(g, amt);
+    xt_sll(g, dst, lhs);
 }
 
-static void emit_shr_rr(gen_t *g, int dst, int lhs, int amt, int uns)
+static void xt_shr_rr(gen_t *g, int dst, int lhs, int amt, int uns)
 {
-    emit_ssr(g, amt);
+    xt_ssr(g, amt);
     if (uns) {
-        emit_srl(g, dst, lhs);
+        xt_srl(g, dst, lhs);
     } else {
-        emit_sra(g, dst, lhs);
+        xt_sra(g, dst, lhs);
     }
 }
 
-static void emit_shl_i(gen_t *g, int dst, int src, int sa)
+static void xt_shl_i(gen_t *g, int dst, int src, int sa)
 {
     if (sa == 0) {
         return;
     }
-    emit_slli(g, dst, src, sa);
+    xt_slli(g, dst, src, sa);
 }
 
-static void emit_shr_i(gen_t *g, int dst, int src, int sa, int uns)
+static void xt_shr_i(gen_t *g, int dst, int src, int sa, int uns)
 {
     if (sa == 0) {
         return;
     }
     if (!uns) {
-        emit_srai(g, dst, src, sa);
+        xt_srai(g, dst, src, sa);
         return;
     }
     /*
@@ -2048,12 +2080,12 @@ static void emit_shr_i(gen_t *g, int dst, int src, int sa, int uns)
      * shift by 16 or more is exactly what a program taking the top half of a
      * word does.  One extra instruction beats a silent wrong answer above 15.
      */
-    emit_movi(g, 9, sa);
-    emit_ssr(g, 9);
-    emit_srl(g, dst, src);
+    xt_movi(g, 9, sa);
+    xt_ssr(g, 9);
+    xt_srl(g, dst, src);
 }
 
-static void emit_l8ui(gen_t *g, int at, int as, int off)
+static void xt_l8ui(gen_t *g, int at, int as, int off)
 {
     if (off < 0 || off > 255) {
         gfail(g, "bad load offset");
@@ -2062,7 +2094,7 @@ static void emit_l8ui(gen_t *g, int at, int as, int off)
     emit3(g, (uint8_t)((at << 4) | 0x2), (uint8_t)as, (uint8_t)off);
 }
 
-static void emit_s8i(gen_t *g, int at, int as, int off)
+static void xt_s8i(gen_t *g, int at, int as, int off)
 {
     if (off < 0 || off > 255) {
         gfail(g, "bad store offset");
@@ -2072,7 +2104,7 @@ static void emit_s8i(gen_t *g, int at, int as, int off)
           (uint8_t)off);
 }
 
-static void emit_l32i(gen_t *g, int at, int as, int off)
+static void xt_l32i(gen_t *g, int at, int as, int off)
 {
     if ((off & 3) != 0 || off < 0 || off > 1020) {
         gfail(g, "bad load offset");
@@ -2087,7 +2119,7 @@ static void emit_l32i(gen_t *g, int at, int as, int off)
     }
 }
 
-static void emit_s32i(gen_t *g, int at, int as, int off)
+static void xt_s32i(gen_t *g, int at, int as, int off)
 {
     if ((off & 3) != 0 || off < 0 || off > 1020) {
         gfail(g, "bad store offset");
@@ -2102,12 +2134,12 @@ static void emit_s32i(gen_t *g, int at, int as, int off)
     }
 }
 
-static void emit_callx8(gen_t *g, int as)
+static void xt_call_reg(gen_t *g, int as)
 {
     emit3(g, 0xe0, (uint8_t)as, 0x00);
 }
 
-static void emit_j_to(gen_t *g, size_t from_off, size_t target_off)
+static void xt_j_to(gen_t *g, size_t from_off, size_t target_off)
 {
     const int32_t imm = (int32_t)target_off - (int32_t)(from_off + 4);
     if (imm < -131072 || imm > 131071) {
@@ -2124,7 +2156,7 @@ static void emit_j_to(gen_t *g, size_t from_off, size_t target_off)
     g->code[from_off + 2] = (uint8_t)(w >> 16);
 }
 
-static void emit_j_placeholder(gen_t *g, size_t *site)
+static void xt_j_placeholder(gen_t *g, size_t *site)
 {
     *site = g->len;
     emit3(g, 0x46, 0x00, 0x00);
@@ -2140,7 +2172,7 @@ enum {
     B_BNE = 0x9
 };
 
-static void emit_b_rr(gen_t *g, int opn, int as, int at, size_t from_off,
+static void xt_b_rr(gen_t *g, int opn, int as, int at, size_t from_off,
                       size_t target_off)
 {
     const int32_t imm = (int32_t)target_off - (int32_t)(from_off + 4);
@@ -2153,38 +2185,719 @@ static void emit_b_rr(gen_t *g, int opn, int as, int at, size_t from_off,
     g->code[from_off + 2] = (uint8_t)imm;
 }
 
-static void emit_b_placeholder(gen_t *g, int opn, int as, int at, size_t *site)
+static void xt_b_placeholder(gen_t *g, int opn, int as, int at, size_t *site)
 {
     *site = g->len;
     emit3(g, (uint8_t)((at << 4) | 0x7), (uint8_t)((opn << 4) | as), 0x00);
 }
 
-static void patch_b(gen_t *g, size_t site, size_t target)
+static void xt_patch_b(gen_t *g, size_t site, size_t target)
 {
-    emit_b_rr(g, (g->code[site + 1] >> 4) & 0xf, g->code[site + 1] & 0xf,
+    xt_b_rr(g, (g->code[site + 1] >> 4) & 0xf, g->code[site + 1] & 0xf,
               (g->code[site] >> 4) & 0xf, site, target);
 }
 
-static void emit_setlt_cc(gen_t *g, int ar, int as, int at, int uns)
+static void xt_setlt_cc(gen_t *g, int ar, int as, int at, int uns)
 {
     size_t blt_site, j_site;
-    emit_b_placeholder(g, uns ? B_BLTU : B_BLT, as, at, &blt_site);
-    emit_movi(g, ar, 0);
-    emit_j_placeholder(g, &j_site);
-    patch_b(g, blt_site, g->len);
-    emit_movi(g, ar, 1);
-    emit_j_to(g, j_site, g->len);
+    xt_b_placeholder(g, uns ? B_BLTU : B_BLT, as, at, &blt_site);
+    xt_movi(g, ar, 0);
+    xt_j_placeholder(g, &j_site);
+    xt_patch_b(g, blt_site, g->len);
+    xt_movi(g, ar, 1);
+    xt_j_to(g, j_site, g->len);
 }
 
-static void emit_setlt(gen_t *g, int ar, int as, int at)
+
+/* ---- the RISC-V back end ------------------------------------------------ */
+/*
+ * RV32IM, which is what every RISC-V part in this project has (C3, C6, H2,
+ * P4).  Written out rather than assembled because there is no assembler here
+ * and because the whole of what this compiler emits is a few dozen shapes.
+ *
+ * THE TWO THINGS THAT ARE NOT LIKE XTENSA, and they are the whole of the work:
+ *
+ *  - There is no literal pool.  An address is built by `lui` with its top
+ *    twenty bits and `addi` with its low twelve, and the loader relocates it
+ *    by rewriting those two instructions - ag_axe_ireloc_t, which already
+ *    exists because images built on a PC for the C3 need exactly this.
+ *
+ *  - There is no register window.  A function's arguments arrive where the
+ *    caller put them (a0..a5) instead of eight registers along, and nothing
+ *    saves the return address for us, so the prologue does.  And the frame
+ *    size is not known until the body has been read, which on Xtensa costs one
+ *    rewritten ENTRY and here would cost an immediate in every `return` - so
+ *    every return JUMPS to one epilogue, written when the size is known.
+ *
+ * Registers, mapping the seam's numbers onto the machine:
+ *      7  the frame     -> s0 (x8), callee-saved, so it survives a call
+ *      8  the value     -> t0 (x5)
+ *      9  the other one -> t1 (x6)
+ *  10..15 arguments     -> a0..a5, which ARE x10..x15
+ * and an answer comes back in a0, which is number 10 - the same as on the
+ * windowed machine, where the callee's a2 is the caller's a10.
+ */
+
+#define RV_ZERO 0
+#define RV_RA   1
+#define RV_SP   2
+#define RV_S0   8
+
+static int rvr(int v)
 {
-    size_t blt_site, j_site;
-    emit_b_placeholder(g, B_BLT, as, at, &blt_site);
-    emit_movi(g, ar, 0);
-    emit_j_placeholder(g, &j_site);
-    patch_b(g, blt_site, g->len);
-    emit_movi(g, ar, 1);
-    emit_j_to(g, j_site, g->len);
+    switch (v) {
+    case 7:
+        return RV_S0;
+    case 8:
+        return 5; /* t0 */
+    case 9:
+        return 6; /* t1 */
+    default:
+        return v; /* 10..15 are a0..a5 already */
+    }
+}
+
+static void rv_word(gen_t *g, uint32_t w)
+{
+    const uint8_t b[4] = {(uint8_t)w, (uint8_t)(w >> 8), (uint8_t)(w >> 16),
+                          (uint8_t)(w >> 24)};
+    emit_raw(g, b, 4);
+}
+
+static uint32_t rv_enc_r(uint32_t f7, int rs2, int rs1, uint32_t f3, int rd,
+                         uint32_t op)
+{
+    return (f7 << 25) | ((uint32_t)rs2 << 20) | ((uint32_t)rs1 << 15) |
+           (f3 << 12) | ((uint32_t)rd << 7) | op;
+}
+
+static uint32_t rv_enc_i(int32_t imm, int rs1, uint32_t f3, int rd,
+                         uint32_t op)
+{
+    return (((uint32_t)imm & 0xfffu) << 20) | ((uint32_t)rs1 << 15) |
+           (f3 << 12) | ((uint32_t)rd << 7) | op;
+}
+
+static uint32_t rv_enc_s(int32_t imm, int rs2, int rs1, uint32_t f3,
+                         uint32_t op)
+{
+    const uint32_t u = (uint32_t)imm & 0xfffu;
+    return ((u >> 5) << 25) | ((uint32_t)rs2 << 20) | ((uint32_t)rs1 << 15) |
+           (f3 << 12) | ((u & 0x1fu) << 7) | op;
+}
+
+/* ---- instructions, in real register numbers ---------------------------- */
+
+static void rvi_alu(gen_t *g, uint32_t f7, uint32_t f3, int rd, int rs1,
+                    int rs2)
+{
+    rv_word(g, rv_enc_r(f7, rs2, rs1, f3, rd, 0x33u));
+}
+
+static void rvi_addi(gen_t *g, int rd, int rs1, int32_t imm)
+{
+    if (imm < -2048 || imm > 2047) {
+        gfail(g, "immediate out of range");
+        return;
+    }
+    rv_word(g, rv_enc_i(imm, rs1, 0x0u, rd, 0x13u));
+}
+
+static void rvi_shifti(gen_t *g, uint32_t f7, uint32_t f3, int rd, int rs1,
+                       int sa)
+{
+    if (sa < 0 || sa > 31) {
+        gfail(g, "bad shift count");
+        return;
+    }
+    rv_word(g, rv_enc_r(f7, sa, rs1, f3, rd, 0x13u));
+}
+
+static void rvi_lw(gen_t *g, int rd, int rs1, int32_t off)
+{
+    if (off < -2048 || off > 2047) {
+        gfail(g, "bad load offset");
+        return;
+    }
+    rv_word(g, rv_enc_i(off, rs1, 0x2u, rd, 0x03u));
+}
+
+static void rvi_lbu(gen_t *g, int rd, int rs1, int32_t off)
+{
+    if (off < -2048 || off > 2047) {
+        gfail(g, "bad load offset");
+        return;
+    }
+    rv_word(g, rv_enc_i(off, rs1, 0x4u, rd, 0x03u));
+}
+
+static void rvi_sw(gen_t *g, int rs2, int rs1, int32_t off)
+{
+    if (off < -2048 || off > 2047) {
+        gfail(g, "bad store offset");
+        return;
+    }
+    rv_word(g, rv_enc_s(off, rs2, rs1, 0x2u, 0x23u));
+}
+
+static void rvi_sb(gen_t *g, int rs2, int rs1, int32_t off)
+{
+    if (off < -2048 || off > 2047) {
+        gfail(g, "bad store offset");
+        return;
+    }
+    rv_word(g, rv_enc_s(off, rs2, rs1, 0x0u, 0x23u));
+}
+
+/* ---- the seam's operations --------------------------------------------- */
+
+static void rv_mov_n(gen_t *g, int ad, int as)
+{
+    rvi_addi(g, rvr(ad), rvr(as), 0);
+}
+
+static void rv_movi(gen_t *g, int at, int32_t imm)
+{
+    const int rd = rvr(at);
+    if (imm >= -2048 && imm <= 2047) {
+        rvi_addi(g, rd, RV_ZERO, imm);
+        return;
+    }
+    /*
+     * ADDI sign-extends its twelve bits, so the top half has to be rounded up
+     * whenever the low half will come back negative.  Getting this wrong is
+     * off by exactly 4096 for half of all constants, which is the kind of
+     * mistake that passes every test written with small numbers.
+     */
+    const int32_t  lo = (int32_t)(((uint32_t)imm & 0xfffu) ^ 0x800u) - 0x800;
+    const uint32_t hi = ((uint32_t)imm - (uint32_t)lo) & 0xfffff000u;
+    rv_word(g, hi | ((uint32_t)rd << 7) | 0x37u); /* lui rd, hi */
+    if (lo != 0) {
+        rvi_addi(g, rd, rd, lo);
+    }
+}
+
+static void rv_ireloc(gen_t *g, uint32_t site, uint32_t kind, uint32_t target,
+                      int to_data)
+{
+    if (g->irel == NULL) {
+        g->irel = (uint32_t *)CC_ALLOC((size_t)MAX_IRELOCS * 8u);
+        if (g->irel == NULL) {
+            gfail(g, "out of memory");
+            return;
+        }
+        g->nirel = 0;
+    }
+    if (g->nirel >= MAX_IRELOCS) {
+        gfail(g, "too many address references");
+        return;
+    }
+    g->irel[g->nirel * 2] = site | kind | (to_data ? AG_AXE_I_TO_DATA : 0u);
+    g->irel[g->nirel * 2 + 1] = target;
+    g->nirel++;
+}
+
+/*
+ * An address, as a lui/addi pair the loader will fill in.  Both go out holding
+ * zero: ireloc_patch writes the whole field rather than adding to it, which is
+ * what makes applying an entry twice harmless - and the streamed XIP path does
+ * apply some of them twice, from both sides of a page boundary.
+ *
+ * The ADDI is always emitted, even for an address whose low twelve bits will
+ * turn out to be zero: which bits they are is not known until the image is
+ * loaded, and an instruction that is not there cannot be patched.
+ */
+static void rv_li_part(gen_t *g, int at, uint32_t off, int to_data)
+{
+    const int rd = rvr(at);
+    rv_ireloc(g, (uint32_t)g->len, AG_AXE_I_HI20, off, to_data);
+    rv_word(g, ((uint32_t)rd << 7) | 0x37u); /* lui rd, 0 */
+    rv_ireloc(g, (uint32_t)g->len, AG_AXE_I_LO12_I, off, to_data);
+    rvi_addi(g, rd, rd, 0);
+}
+
+static void rv_li_data(gen_t *g, int at, uint32_t data_off)
+{
+    rv_li_part(g, at, data_off, 1);
+}
+
+static void rv_li_code(gen_t *g, int at, uint32_t code_off)
+{
+    rv_li_part(g, at, code_off, 0);
+}
+
+static void rv_add_n(gen_t *g, int ar, int as, int at)
+{
+    rvi_alu(g, 0x00u, 0x0u, rvr(ar), rvr(as), rvr(at));
+}
+
+static void rv_sub(gen_t *g, int ar, int as, int at)
+{
+    rvi_alu(g, 0x20u, 0x0u, rvr(ar), rvr(as), rvr(at));
+}
+
+static void rv_mull(gen_t *g, int ar, int as, int at)
+{
+    rvi_alu(g, 0x01u, 0x0u, rvr(ar), rvr(as), rvr(at));
+}
+
+static void rv_quos(gen_t *g, int ar, int as, int at)
+{
+    rvi_alu(g, 0x01u, 0x4u, rvr(ar), rvr(as), rvr(at));
+}
+
+static void rv_rems(gen_t *g, int ar, int as, int at)
+{
+    rvi_alu(g, 0x01u, 0x6u, rvr(ar), rvr(as), rvr(at));
+}
+
+static void rv_quou(gen_t *g, int ar, int as, int at)
+{
+    rvi_alu(g, 0x01u, 0x5u, rvr(ar), rvr(as), rvr(at));
+}
+
+static void rv_remu(gen_t *g, int ar, int as, int at)
+{
+    rvi_alu(g, 0x01u, 0x7u, rvr(ar), rvr(as), rvr(at));
+}
+
+static void rv_and(gen_t *g, int ar, int as, int at)
+{
+    rvi_alu(g, 0x00u, 0x7u, rvr(ar), rvr(as), rvr(at));
+}
+
+static void rv_or(gen_t *g, int ar, int as, int at)
+{
+    rvi_alu(g, 0x00u, 0x6u, rvr(ar), rvr(as), rvr(at));
+}
+
+static void rv_xor(gen_t *g, int ar, int as, int at)
+{
+    rvi_alu(g, 0x00u, 0x4u, rvr(ar), rvr(as), rvr(at));
+}
+
+static void rv_shl_rr(gen_t *g, int dst, int lhs, int amt)
+{
+    rvi_alu(g, 0x00u, 0x1u, rvr(dst), rvr(lhs), rvr(amt));
+}
+
+static void rv_shr_rr(gen_t *g, int dst, int lhs, int amt, int uns)
+{
+    rvi_alu(g, uns ? 0x00u : 0x20u, 0x5u, rvr(dst), rvr(lhs), rvr(amt));
+}
+
+static void rv_shl_i(gen_t *g, int dst, int src, int sa)
+{
+    if (sa == 0) {
+        return;
+    }
+    rvi_shifti(g, 0x00u, 0x1u, rvr(dst), rvr(src), sa);
+}
+
+/*
+ * Unlike the Xtensa one this needs no register for the count and no warning
+ * about which: SRLI takes a full five-bit shift, so there is nothing here that
+ * cannot shift a word by twenty.
+ */
+static void rv_shr_i(gen_t *g, int dst, int src, int sa, int uns)
+{
+    if (sa == 0) {
+        return;
+    }
+    rvi_shifti(g, uns ? 0x00u : 0x20u, 0x5u, rvr(dst), rvr(src), sa);
+}
+
+static void rv_l8ui(gen_t *g, int at, int as, int off)
+{
+    rvi_lbu(g, rvr(at), rvr(as), off);
+}
+
+static void rv_s8i(gen_t *g, int at, int as, int off)
+{
+    rvi_sb(g, rvr(at), rvr(as), off);
+}
+
+static void rv_l32i(gen_t *g, int at, int as, int off)
+{
+    rvi_lw(g, rvr(at), rvr(as), off);
+}
+
+static void rv_s32i(gen_t *g, int at, int as, int off)
+{
+    rvi_sw(g, rvr(at), rvr(as), off);
+}
+
+static void rv_call_reg(gen_t *g, int as)
+{
+    rv_word(g, rv_enc_i(0, rvr(as), 0x0u, RV_RA, 0x67u)); /* jalr ra, 0(rs) */
+}
+
+/* ---- jumps and branches ------------------------------------------------- */
+
+static void rv_j_to(gen_t *g, size_t from_off, size_t target_off)
+{
+    const int32_t imm = (int32_t)target_off - (int32_t)from_off;
+    if (imm < -1048576 || imm > 1048574 || (imm & 1) != 0) {
+        gfail(g, "jump too far");
+        return;
+    }
+    if (from_off + 4u > g->len) {
+        gfail(g, "bad jump site");
+        return;
+    }
+    const uint32_t u = (uint32_t)imm;
+    const uint32_t w = 0x6fu | (((u >> 20) & 1u) << 31) |
+                       (((u >> 1) & 0x3ffu) << 21) | (((u >> 11) & 1u) << 20) |
+                       (((u >> 12) & 0xffu) << 12);
+    g->code[from_off] = (uint8_t)w;
+    g->code[from_off + 1] = (uint8_t)(w >> 8);
+    g->code[from_off + 2] = (uint8_t)(w >> 16);
+    g->code[from_off + 3] = (uint8_t)(w >> 24);
+}
+
+static void rv_j_placeholder(gen_t *g, size_t *site)
+{
+    *site = g->len;
+    rv_word(g, 0x6fu); /* jal zero, 0 */
+}
+
+/*
+ * The seam's condition numbers are Xtensa's, and this is where they become the
+ * other machine's.  A translation rather than a renumbering, because those
+ * numbers are written at a dozen places in the parser and renumbering them is
+ * a change that does not show up in a diff of the file that matters.
+ */
+static uint32_t rv_cond(int opn)
+{
+    switch (opn) {
+    case B_BEQ:
+        return 0x0u;
+    case B_BNE:
+        return 0x1u;
+    case B_BLT:
+        return 0x4u;
+    case B_BGE:
+        return 0x5u;
+    case B_BLTU:
+        return 0x6u;
+    default:
+        return 0x7u; /* B_BGEU */
+    }
+}
+
+static void rv_b_placeholder(gen_t *g, int opn, int as, int at, size_t *site)
+{
+    *site = g->len;
+    rv_word(g, rv_enc_r(0u, rvr(at), rvr(as), rv_cond(opn), 0, 0x63u));
+}
+
+/*
+ * The registers and the condition are already in the instruction, so patching
+ * one only rewrites its immediate - no decoding of the placeholder, which is
+ * what the Xtensa side has to do.
+ */
+static void rv_patch_b(gen_t *g, size_t site, size_t target)
+{
+    const int32_t imm = (int32_t)target - (int32_t)site;
+    if (imm < -4096 || imm > 4094 || (imm & 1) != 0) {
+        gfail(g, "branch too far");
+        return;
+    }
+    if (site + 4u > g->len) {
+        gfail(g, "bad branch site");
+        return;
+    }
+    uint32_t w = (uint32_t)g->code[site] | ((uint32_t)g->code[site + 1] << 8) |
+                 ((uint32_t)g->code[site + 2] << 16) |
+                 ((uint32_t)g->code[site + 3] << 24);
+    const uint32_t u = (uint32_t)imm;
+    w &= 0x01fff07fu;
+    w |= (((u >> 12) & 1u) << 31) | (((u >> 5) & 0x3fu) << 25) |
+         (((u >> 1) & 0xfu) << 8) | (((u >> 11) & 1u) << 7);
+    g->code[site] = (uint8_t)w;
+    g->code[site + 1] = (uint8_t)(w >> 8);
+    g->code[site + 2] = (uint8_t)(w >> 16);
+    g->code[site + 3] = (uint8_t)(w >> 24);
+}
+
+/* One instruction, where the windowed machine needs a branch and two moves:
+ * SLT is exactly this operation. */
+static void rv_setlt_cc(gen_t *g, int ar, int as, int at, int uns)
+{
+    rvi_alu(g, 0x00u, uns ? 0x3u : 0x2u, rvr(ar), rvr(as), rvr(at));
+}
+
+/* ---- the seam ----------------------------------------------------------- */
+/*
+ * One function per operation the parser can ask for, and the whole of what a
+ * back end has to answer.  Below this line nothing knows an instruction; above
+ * it nothing knows what a statement is.
+ *
+ * THE REGISTERS ARE NUMBERS, NOT REGISTERS.  8 is the value in hand, 9 the
+ * other operand, 7 the frame, 10..15 the arguments going out - and a call's
+ * answer comes back in 10, which is true of a windowed machine (a2 seen as
+ * a10) and of an ordinary one (a0) alike.  Each back end maps them to whatever
+ * its own architecture calls those things.
+ *
+ * Dispatch at run time rather than at build time because one binary has to be
+ * able to write both: the host tests compile every example for both machines,
+ * and a board asked for a program its neighbour can run has to produce the
+ * neighbour's instructions, not its own.
+ */
+
+static void emit_mov_n(gen_t *g, int ad, int as)
+{
+    if (g->arch == CC_ARCH_RV32) {
+        rv_mov_n(g, ad, as);
+        return;
+    }
+    xt_mov_n(g, ad, as);
+}
+
+static void emit_movi(gen_t *g, int at, int32_t imm)
+{
+    if (g->arch == CC_ARCH_RV32) {
+        rv_movi(g, at, imm);
+        return;
+    }
+    xt_movi(g, at, imm);
+}
+
+static void emit_li_data(gen_t *g, int at, uint32_t data_off)
+{
+    if (g->arch == CC_ARCH_RV32) {
+        rv_li_data(g, at, data_off);
+        return;
+    }
+    xt_li_data(g, at, data_off);
+}
+
+static void emit_li_code(gen_t *g, int at, uint32_t code_off)
+{
+    if (g->arch == CC_ARCH_RV32) {
+        rv_li_code(g, at, code_off);
+        return;
+    }
+    xt_li_code(g, at, code_off);
+}
+
+static void emit_add_n(gen_t *g, int ar, int as, int at)
+{
+    if (g->arch == CC_ARCH_RV32) {
+        rv_add_n(g, ar, as, at);
+        return;
+    }
+    xt_add_n(g, ar, as, at);
+}
+
+static void emit_sub(gen_t *g, int ar, int as, int at)
+{
+    if (g->arch == CC_ARCH_RV32) {
+        rv_sub(g, ar, as, at);
+        return;
+    }
+    xt_sub(g, ar, as, at);
+}
+
+static void emit_mull(gen_t *g, int ar, int as, int at)
+{
+    if (g->arch == CC_ARCH_RV32) {
+        rv_mull(g, ar, as, at);
+        return;
+    }
+    xt_mull(g, ar, as, at);
+}
+
+static void emit_quos(gen_t *g, int ar, int as, int at)
+{
+    if (g->arch == CC_ARCH_RV32) {
+        rv_quos(g, ar, as, at);
+        return;
+    }
+    xt_quos(g, ar, as, at);
+}
+
+static void emit_rems(gen_t *g, int ar, int as, int at)
+{
+    if (g->arch == CC_ARCH_RV32) {
+        rv_rems(g, ar, as, at);
+        return;
+    }
+    xt_rems(g, ar, as, at);
+}
+
+static void emit_quou(gen_t *g, int ar, int as, int at)
+{
+    if (g->arch == CC_ARCH_RV32) {
+        rv_quou(g, ar, as, at);
+        return;
+    }
+    xt_quou(g, ar, as, at);
+}
+
+static void emit_remu(gen_t *g, int ar, int as, int at)
+{
+    if (g->arch == CC_ARCH_RV32) {
+        rv_remu(g, ar, as, at);
+        return;
+    }
+    xt_remu(g, ar, as, at);
+}
+
+static void emit_and(gen_t *g, int ar, int as, int at)
+{
+    if (g->arch == CC_ARCH_RV32) {
+        rv_and(g, ar, as, at);
+        return;
+    }
+    xt_and(g, ar, as, at);
+}
+
+static void emit_or(gen_t *g, int ar, int as, int at)
+{
+    if (g->arch == CC_ARCH_RV32) {
+        rv_or(g, ar, as, at);
+        return;
+    }
+    xt_or(g, ar, as, at);
+}
+
+static void emit_xor(gen_t *g, int ar, int as, int at)
+{
+    if (g->arch == CC_ARCH_RV32) {
+        rv_xor(g, ar, as, at);
+        return;
+    }
+    xt_xor(g, ar, as, at);
+}
+
+static void emit_shl_rr(gen_t *g, int dst, int lhs, int amt)
+{
+    if (g->arch == CC_ARCH_RV32) {
+        rv_shl_rr(g, dst, lhs, amt);
+        return;
+    }
+    xt_shl_rr(g, dst, lhs, amt);
+}
+
+static void emit_shr_rr(gen_t *g, int dst, int lhs, int amt, int uns)
+{
+    if (g->arch == CC_ARCH_RV32) {
+        rv_shr_rr(g, dst, lhs, amt, uns);
+        return;
+    }
+    xt_shr_rr(g, dst, lhs, amt, uns);
+}
+
+static void emit_shl_i(gen_t *g, int dst, int src, int sa)
+{
+    if (g->arch == CC_ARCH_RV32) {
+        rv_shl_i(g, dst, src, sa);
+        return;
+    }
+    xt_shl_i(g, dst, src, sa);
+}
+
+/* May use register 9; see the body it dispatches to. */
+static void emit_shr_i(gen_t *g, int dst, int src, int sa, int uns)
+{
+    if (g->arch == CC_ARCH_RV32) {
+        rv_shr_i(g, dst, src, sa, uns);
+        return;
+    }
+    xt_shr_i(g, dst, src, sa, uns);
+}
+
+static void emit_l8ui(gen_t *g, int at, int as, int off)
+{
+    if (g->arch == CC_ARCH_RV32) {
+        rv_l8ui(g, at, as, off);
+        return;
+    }
+    xt_l8ui(g, at, as, off);
+}
+
+static void emit_s8i(gen_t *g, int at, int as, int off)
+{
+    if (g->arch == CC_ARCH_RV32) {
+        rv_s8i(g, at, as, off);
+        return;
+    }
+    xt_s8i(g, at, as, off);
+}
+
+static void emit_l32i(gen_t *g, int at, int as, int off)
+{
+    if (g->arch == CC_ARCH_RV32) {
+        rv_l32i(g, at, as, off);
+        return;
+    }
+    xt_l32i(g, at, as, off);
+}
+
+static void emit_s32i(gen_t *g, int at, int as, int off)
+{
+    if (g->arch == CC_ARCH_RV32) {
+        rv_s32i(g, at, as, off);
+        return;
+    }
+    xt_s32i(g, at, as, off);
+}
+
+/* Call the address in a register.  The answer is in register 10 afterwards. */
+static void emit_call_reg(gen_t *g, int as)
+{
+    if (g->arch == CC_ARCH_RV32) {
+        rv_call_reg(g, as);
+        return;
+    }
+    xt_call_reg(g, as);
+}
+
+static void emit_j_to(gen_t *g, size_t from_off, size_t target_off)
+{
+    if (g->arch == CC_ARCH_RV32) {
+        rv_j_to(g, from_off, target_off);
+        return;
+    }
+    xt_j_to(g, from_off, target_off);
+}
+
+static void emit_j_placeholder(gen_t *g, size_t *site)
+{
+    if (g->arch == CC_ARCH_RV32) {
+        rv_j_placeholder(g, site);
+        return;
+    }
+    xt_j_placeholder(g, site);
+}
+
+static void emit_b_placeholder(gen_t *g, int opn, int as, int at, size_t *site)
+{
+    if (g->arch == CC_ARCH_RV32) {
+        rv_b_placeholder(g, opn, as, at, site);
+        return;
+    }
+    xt_b_placeholder(g, opn, as, at, site);
+}
+
+static void patch_b(gen_t *g, size_t site, size_t target)
+{
+    if (g->arch == CC_ARCH_RV32) {
+        rv_patch_b(g, site, target);
+        return;
+    }
+    xt_patch_b(g, site, target);
+}
+
+/* ar = (as < at), 0 or 1. */
+static void emit_setlt_cc(gen_t *g, int ar, int as, int at, int uns)
+{
+    if (g->arch == CC_ARCH_RV32) {
+        rv_setlt_cc(g, ar, as, at, uns);
+        return;
+    }
+    xt_setlt_cc(g, ar, as, at, uns);
 }
 
 static int find_local(gen_t *g, const char *name)
@@ -2612,40 +3325,203 @@ static void place_store(gen_t *g, place_t *pl, int val, int scratch)
  * arguments.  A second back end is free to put those wherever it likes.
  */
 
-/* The frame size is only known once the body has been read, so ENTRY is
- * emitted at the maximum and rewritten - see patch_entry. */
-static void emit_frame_open(gen_t *g)
+/*
+ * On Xtensa.  ENTRY rotates the register window and allocates the frame in one
+ * instruction, which is why nothing here saves a return address: the window
+ * holds it.  The size is only known once the body has been read, so ENTRY goes
+ * out at the maximum and is rewritten - see xt_patch_entry.
+ */
+static void xt_frame_open(gen_t *g)
 {
-    emit_entry(g, SPILL_BYTES + MAX_LOCAL_WORDS * 4 + FRAME_TOP_SAVE);
+    xt_entry(g, SPILL_BYTES + MAX_LOCAL_WORDS * 4 + FRAME_TOP_SAVE);
 }
 
-static void emit_frame_size(gen_t *g, size_t site, int framesize)
+static void xt_frame_size(gen_t *g, size_t site, int framesize)
 {
-    patch_entry(g, site, framesize);
+    xt_patch_entry(g, site, framesize);
 }
 
 /*
- * Parameters into their frame slots.
- *
- * Stored through a1 rather than a7, because a7 is about to become the frame
- * pointer: with six parameters the last one would otherwise be overwritten by
- * its own frame pointer.  a1 and a7 hold the same address; only the order
- * matters.
+ * Parameters into their frame slots.  They arrive in a2..a7 - the window turns
+ * the caller's a10..a15 into these - and are stored through a1 rather than a7,
+ * because a7 is about to become the frame pointer: with six parameters the
+ * last one would otherwise be overwritten by its own frame pointer.  a1 and a7
+ * hold the same address; only the order matters.
  */
-static void emit_params_home(gen_t *g, int nparams)
+static void xt_params_home(gen_t *g, int nparams)
 {
     for (int i = 0; i < nparams && i < MAX_PARAMS; i++) {
         emit_store_sized(g, 2 + i, 1, g->locals[i].off,
                          sym_access_size(&g->locals[i]), 8);
     }
-    emit_mov_n(g, 7, 1);
+    xt_mov_n(g, 7, 1);
+}
+
+/*
+ * `return expr;` with the value in 8, or `return;` with none.  RETW unwinds the
+ * window, so a2 here is the caller's a10 - which is why the seam can say "the
+ * answer comes back in 10" and mean it on a machine with no window too.
+ */
+static void xt_return(gen_t *g, int have_value)
+{
+    if (have_value) {
+        xt_mov_n(g, 2, 8);
+    } else {
+        xt_movi(g, 2, 0);
+    }
+    xt_retw_n(g);
+}
+
+static void xt_func_return(gen_t *g)
+{
+    xt_return(g, 0);
+}
+
+/*
+ * And on RISC-V, where the prologue has to do by hand what ENTRY does in one
+ * instruction:
+ *
+ *      addi sp, sp, -F
+ *      sw   ra, F-4(sp)
+ *      sw   s0, F-8(sp)
+ *
+ * F is not known yet, so these three go out holding zero and are rewritten by
+ * rv_frame_size - the same trick as the rewritten ENTRY, and for the same
+ * reason.  The save area at the top of the frame is the one Xtensa keeps for a
+ * window overflow, which on this machine holds these two words instead.
+ */
+static void rv_frame_open(gen_t *g)
+{
+    g->nret = 0;
+    rvi_addi(g, RV_SP, RV_SP, 0);
+    rvi_sw(g, RV_RA, RV_SP, 0);
+    rvi_sw(g, RV_S0, RV_SP, 0);
+}
+
+/*
+ * Parameters into their frame slots.  They arrive in a0..a5 - there is no
+ * window to shift them - and go out through sp, because s0 is not the frame
+ * pointer until the line after.
+ */
+static void rv_params_home(gen_t *g, int nparams)
+{
+    for (int i = 0; i < nparams && i < MAX_PARAMS; i++) {
+        const int reg = 10 + i; /* a0..a5, where the caller left them */
+        const int off = g->locals[i].off;
+        if (sym_access_size(&g->locals[i]) == 1) {
+            rvi_sb(g, reg, RV_SP, off);
+        } else {
+            rvi_sw(g, reg, RV_SP, off);
+        }
+    }
+    rvi_addi(g, RV_S0, RV_SP, 0); /* mv s0, sp */
+}
+
+/*
+ * Every return jumps to the one epilogue at the end of the function, written
+ * by rv_frame_size once the frame is known.  An epilogue at each return would
+ * need the frame size in three immediates at every one of them, and a `return`
+ * inside a loop inside a switch is not a place to be patching a list of sites.
+ */
+static void rv_return(gen_t *g, int have_value)
+{
+    if (have_value) {
+        rvi_addi(g, 10, rvr(8), 0); /* mv a0, t0 */
+    } else {
+        rvi_addi(g, 10, RV_ZERO, 0);
+    }
+    if (g->nret >= MAX_RET_SITES) {
+        gfail(g, "too many returns in one function");
+        return;
+    }
+    g->ret_site[g->nret++] = g->len;
+    rv_word(g, 0x6fu); /* jal zero, <epilogue> */
+}
+
+static void rv_func_return(gen_t *g)
+{
+    rv_return(g, 0);
+}
+
+static void rv_frame_size(gen_t *g, size_t site, int framesize)
+{
+    if (site + 12u > g->len) {
+        gfail(g, "bad frame site");
+        return;
+    }
+    /* The prologue, now that the size is known.  Written by rewinding the
+     * emit position, which is why these three must be exactly as long the
+     * second time - all of them are ordinary 32-bit instructions, so they
+     * are. */
+    const size_t end = g->len;
+    g->len = site;
+    rvi_addi(g, RV_SP, RV_SP, -framesize);
+    rvi_sw(g, RV_RA, RV_SP, framesize - 4);
+    rvi_sw(g, RV_S0, RV_SP, framesize - 8);
+    if (g->len != site + 12u) {
+        gfail(g, "bad frame site");
+        return;
+    }
+    g->len = end;
+
+    /* And the epilogue every return jumps to. */
+    const size_t epi = g->len;
+    rvi_lw(g, RV_RA, RV_SP, framesize - 4);
+    rvi_lw(g, RV_S0, RV_SP, framesize - 8);
+    rvi_addi(g, RV_SP, RV_SP, framesize);
+    rv_word(g, rv_enc_i(0, RV_RA, 0x0u, RV_ZERO, 0x67u)); /* jalr zero, 0(ra) */
+    for (int i = 0; i < g->nret; i++) {
+        rv_j_to(g, g->ret_site[i], epi);
+    }
+    g->nret = 0;
+}
+
+/* ---- the frame, at the seam --------------------------------------------- */
+
+static void emit_frame_open(gen_t *g)
+{
+    if (g->arch == CC_ARCH_RV32) {
+        rv_frame_open(g);
+        return;
+    }
+    xt_frame_open(g);
+}
+
+static void emit_frame_size(gen_t *g, size_t site, int framesize)
+{
+    if (g->arch == CC_ARCH_RV32) {
+        rv_frame_size(g, site, framesize);
+        return;
+    }
+    xt_frame_size(g, site, framesize);
+}
+
+static void emit_params_home(gen_t *g, int nparams)
+{
+    if (g->arch == CC_ARCH_RV32) {
+        rv_params_home(g, nparams);
+        return;
+    }
+    xt_params_home(g, nparams);
 }
 
 /* Falling off the end of a function is `return 0`. */
 static void emit_func_return(gen_t *g)
 {
-    emit_movi(g, 2, 0);
-    emit_retw_n(g);
+    if (g->arch == CC_ARCH_RV32) {
+        rv_func_return(g);
+        return;
+    }
+    xt_func_return(g);
+}
+
+static void emit_return(gen_t *g, int have_value)
+{
+    if (g->arch == CC_ARCH_RV32) {
+        rv_return(g, have_value);
+        return;
+    }
+    xt_return(g, have_value);
 }
 
 /* ---- builtins ---------------------------------------------------------- */
@@ -3222,7 +4098,7 @@ static void emit_user_call(par_t *p, int fi)
     const func_t *fn = &p->g->funcs[fi];
     parse_call_args_to_regs(p, fn->nparams);
     emit_li_code(p->g, 8, (uint32_t)fn->code_off);
-    emit_callx8(p->g, 8);
+    emit_call_reg(p->g, 8);
     if (!fn->is_void) {
         emit_mov_n(p->g, 8, 10);
     } else {
@@ -3262,7 +4138,7 @@ static void emit_builtin_call(par_t *p, const builtin_t *b)
         parse_call_args_to_regs(p, b->nargs);
     }
     emit_load_api_fn(p->g, 8, b->api_off, b->fn_off);
-    emit_callx8(p->g, 8);
+    emit_call_reg(p->g, 8);
     if (b->ret_mode == RET_BOOL) {
         emit_mov_n(p->g, 8, 10);
         emit_movi(p->g, 9, 0);
@@ -4584,14 +5460,12 @@ static void parse_stmt(par_t *p)
         return;
     }
     if (accept(p, T_RETURN)) {
-        if (p->L->tok != T_SEMI) {
+        const int has_value = (p->L->tok != T_SEMI);
+        if (has_value) {
             parse_expr(p);
-            emit_mov_n(p->g, 2, 8);
-        } else {
-            emit_movi(p->g, 2, 0);
         }
         expect(p, T_SEMI, "expected ';' after return");
-        emit_retw_n(p->g);
+        emit_return(p->g, has_value);
         return;
     }
     if (accept(p, T_IF)) {
@@ -5195,6 +6069,7 @@ static void gen_free(gen_t *g)
         CC_FREE(g->pp.incls[i].text);
     }
     CC_FREE(g->data);
+    CC_FREE(g->irel);
     CC_FREE(g);
 }
 
@@ -5206,12 +6081,23 @@ int cc_compile_to_axe(const char *src, size_t src_len, cc_result_t *out)
 int cc_compile_to_axe_inc(const char *src, size_t src_len,
                           cc_read_file_fn reader, void *ctx, cc_result_t *out)
 {
+    return cc_compile_to_axe_for(src, src_len, reader, ctx, CC_ARCH_HOST, out);
+}
+
+int cc_compile_to_axe_for(const char *src, size_t src_len,
+                          cc_read_file_fn reader, void *ctx, int arch,
+                          cc_result_t *out)
+{
     if (out == NULL) {
         return -1;
     }
     memset(out, 0, sizeof(*out));
     if (src == NULL) {
         cpy_err(out->err, sizeof(out->err), "null source");
+        return -1;
+    }
+    if (arch != CC_ARCH_XTENSA && arch != CC_ARCH_RV32) {
+        cpy_err(out->err, sizeof(out->err), "unknown architecture");
         return -1;
     }
 
@@ -5245,6 +6131,7 @@ int cc_compile_to_axe_inc(const char *src, size_t src_len,
     g->is_driver = 0;
     g->data_next = 4;
     g->min_abi = ABI_MINOR_BASE;
+    g->arch = arch;
     g->pp.reader = reader;
     g->pp.reader_ctx = ctx;
 
@@ -5293,7 +6180,10 @@ int cc_compile_to_axe_inc(const char *src, size_t src_len,
     const size_t data_size = ((size_t)g->data_next + 3u) & ~3u;
     const size_t data_file = data_size;
     const size_t reloc_bytes = (size_t)g->nrelocs * 4u;
-    const size_t file_size = AXE_HDR + code_size + data_file + reloc_bytes;
+    const size_t irel_bytes = (size_t)g->nirel * 8u;
+    const size_t hdr = (g->arch == CC_ARCH_RV32) ? AXE_HDR_I : AXE_HDR;
+    const size_t file_size =
+        hdr + code_size + data_file + reloc_bytes + irel_bytes;
 
     uint8_t *axe = (uint8_t *)CC_ALLOC(file_size);
     if (axe == NULL) {
@@ -5307,8 +6197,8 @@ int cc_compile_to_axe_inc(const char *src, size_t src_len,
     memcpy(axe + 0, "AXE1", 4);
     wr_u16(axe + 4, 0);
     wr_u16(axe + 6, (uint16_t)g->min_abi);
-    wr_u16(axe + 8, 1);
-    wr_u16(axe + 10, (uint16_t)AXE_HDR);
+    wr_u16(axe + 8, (uint16_t)g->arch);
+    wr_u16(axe + 10, (uint16_t)hdr);
     {
         uint32_t flags = 0;
         if (g->needs_gfx) {
@@ -5329,20 +6219,25 @@ int cc_compile_to_axe_inc(const char *src, size_t src_len,
     wr_u32(axe + 16, CODE_BASE);
     wr_u32(axe + 20, (uint32_t)code_size);
     wr_u32(axe + 24, (uint32_t)code_size);
-    wr_u32(axe + 28, AXE_HDR);
+    wr_u32(axe + 28, (uint32_t)hdr);
 
     wr_u32(axe + 32, DATA_BASE);
     wr_u32(axe + 36, (uint32_t)data_size);
     wr_u32(axe + 40, (uint32_t)data_file);
-    wr_u32(axe + 44, AXE_HDR + (uint32_t)code_size);
+    wr_u32(axe + 44, (uint32_t)hdr + (uint32_t)code_size);
 
     const uint32_t entry = CODE_BASE + (uint32_t)lit_bytes +
                            (uint32_t)g->funcs[g->entry_idx].code_off;
     wr_u32(axe + 48, entry);
     wr_u32(axe + 52, DATA_BASE);
 
-    wr_u32(axe + 56, AXE_HDR + (uint32_t)code_size + (uint32_t)data_file);
+    wr_u32(axe + 56, (uint32_t)hdr + (uint32_t)code_size + (uint32_t)data_file);
     wr_u32(axe + 60, (uint32_t)g->nrelocs);
+    if (hdr == AXE_HDR_I) {
+        wr_u32(axe + 176, (uint32_t)hdr + (uint32_t)code_size +
+                              (uint32_t)data_file + (uint32_t)reloc_bytes);
+        wr_u32(axe + 180, (uint32_t)g->nirel);
+    }
 
     wr_u32(axe + 64, g->pp.app_stack);
     wr_u32(axe + 68, g->pp.app_heap);
@@ -5360,18 +6255,25 @@ int cc_compile_to_axe_inc(const char *src, size_t src_len,
         wr_str(axe + 120, 32, "cc");
     }
 
-    uint8_t *code = axe + AXE_HDR;
+    uint8_t *code = axe + hdr;
     for (int i = 0; i < g->nlit; i++) {
         wr_u32(code + (size_t)i * 4u, g->lit[i]);
     }
     memcpy(code + lit_bytes, text, g->len);
 
-    uint8_t *data = axe + AXE_HDR + code_size;
+    uint8_t *data = axe + hdr + code_size;
     memcpy(data, g->data, (size_t)g->data_next);
 
     uint8_t *rel = data + data_file;
     for (int i = 0; i < g->nrelocs; i++) {
         wr_u32(rel + (size_t)i * 4u, g->relocs[i]);
+    }
+
+    /* Two words an entry: where the instruction is, and the offset of the
+     * address it should end up holding.  See ag_axe_ireloc_t. */
+    uint8_t *irel = rel + reloc_bytes;
+    for (int i = 0; i < g->nirel * 2; i++) {
+        wr_u32(irel + (size_t)i * 4u, g->irel[i]);
     }
 
     CC_FREE(text);

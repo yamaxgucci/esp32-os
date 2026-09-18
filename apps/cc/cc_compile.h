@@ -154,6 +154,26 @@ extern "C" {
 #define ABI_MINOR_CLUSTER 52
 #define ABI_MINOR_MIGRATE 53
 
+/*
+ * Which machine to write instructions for.  The numbers are ag_axe_arch_t's,
+ * because they go straight into the image header and a second set of names for
+ * the same two things is a second thing to keep in step.
+ *
+ * CC_ARCH_HOST is what this build of the compiler targets when nothing says
+ * otherwise: the board it is running on.  A board asked for a program its
+ * NEIGHBOUR can run says so explicitly.
+ */
+typedef enum {
+    CC_ARCH_XTENSA = 1,
+    CC_ARCH_RV32 = 2
+} cc_arch_t;
+
+#if defined(__riscv)
+#define CC_ARCH_HOST CC_ARCH_RV32
+#else
+#define CC_ARCH_HOST CC_ARCH_XTENSA
+#endif
+
 typedef struct {
     uint8_t *axe;
     size_t   axe_len;
@@ -176,6 +196,11 @@ int cc_compile_to_axe(const char *src, size_t src_len, cc_result_t *out);
 /* The same, for a source that may include files. A NULL reader refuses them. */
 int cc_compile_to_axe_inc(const char *src, size_t src_len,
                           cc_read_file_fn reader, void *ctx, cc_result_t *out);
+
+/* And the same again, for a machine other than the one this build targets. */
+int cc_compile_to_axe_for(const char *src, size_t src_len,
+                          cc_read_file_fn reader, void *ctx, int arch,
+                          cc_result_t *out);
 
 void cc_result_free(cc_result_t *out);
 

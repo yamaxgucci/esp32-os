@@ -152,6 +152,7 @@ add_executable(argon_tests
     "${ARGON_ROOT}/apps/common/nlink/ag_nlink.c"
     "${ARGON_ROOT}/tools/nam.c"
     "${ARGON_ROOT}/apps/cc/cc_compile.c"
+    test_rv32.c
     "${ARGON_ROOT}/components/argon_kernel/src/dev/draw.c"
     ${ARGON_DSP_SRCS}
     ${ARGON_PORTABLE_SRCS})

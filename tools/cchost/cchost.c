@@ -11,6 +11,8 @@
  *   build-host/cchost in.c out.axe        compile
  *   build-host/cchost in.c -              compile, write nothing, report size
  *   build-host/cchost in.c out.axe -v     and print the header
+ *   build-host/cchost in.c out.axe -riscv for the other machine
+ *   build-host/cchost in.c out.bin -code  just the code part, to disassemble
  *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
  */
@@ -100,7 +102,26 @@ int main(int argc, char **argv)
     }
     const char *in = argv[1];
     const char *out = argv[2];
-    const int   verbose = (argc > 3 && strcmp(argv[3], "-v") == 0);
+    int         verbose = 0;
+    int         arch = CC_ARCH_XTENSA;
+    int         code_only = 0;
+    for (int i = 3; i < argc; i++) {
+        if (strcmp(argv[i], "-v") == 0) {
+            verbose = 1;
+        } else if (strcmp(argv[i], "-riscv") == 0) {
+            arch = CC_ARCH_RV32;
+        } else if (strcmp(argv[i], "-xtensa") == 0) {
+            arch = CC_ARCH_XTENSA;
+        } else if (strcmp(argv[i], "-code") == 0) {
+            /* The code part alone, so a real disassembler can be pointed at
+             * it: objdump -D -b binary -m riscv:rv32 is the only independent
+             * reader of these instructions this project has. */
+            code_only = 1;
+        } else {
+            fprintf(stderr, "cchost: unknown option %s\n", argv[i]);
+            return 2;
+        }
+    }
 
     /* The directory the source sits in, for the include reader above. */
     const char *slash = strrchr(in, '/');
@@ -123,8 +144,8 @@ int main(int argc, char **argv)
     }
 
     cc_result_t res;
-    const int   rc = cc_compile_to_axe_inc(src, src_len, read_include, NULL,
-                                           &res);
+    const int   rc = cc_compile_to_axe_for(src, src_len, read_include, NULL,
+                                           arch, &res);
     free(src);
     if (rc != 0) {
         fprintf(stderr, "cchost: %s: %s\n", in, res.err);
@@ -147,6 +168,10 @@ int main(int argc, char **argv)
         printf("  entry %08x api_slot %08x relocs %u at %u\n", rd_u32(h + 48),
                rd_u32(h + 52), (unsigned)rd_u32(h + 60),
                (unsigned)rd_u32(h + 56));
+        if (rd_u16(h + 10) >= 184) {
+            printf("  irelocs %u at %u\n", (unsigned)rd_u32(h + 180),
+                   (unsigned)rd_u32(h + 176));
+        }
         printf("  name %s version %s\n", (const char *)h + 72,
                (const char *)h + 104);
     }
@@ -158,7 +183,11 @@ int main(int argc, char **argv)
             cc_result_free(&res);
             return 1;
         }
-        fwrite(res.axe, 1, res.axe_len, f);
+        if (code_only) {
+            fwrite(res.axe + rd_u32(res.axe + 28), 1, rd_u32(res.axe + 24), f);
+        } else {
+            fwrite(res.axe, 1, res.axe_len, f);
+        }
         fclose(f);
     }
     cc_result_free(&res);

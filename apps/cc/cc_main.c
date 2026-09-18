@@ -130,10 +130,42 @@ static int write_all(const char *path, const void *data, size_t len)
     return 0;
 }
 
+/*
+ * Which machine to write for.  The default is this board, and the reason there
+ * is a choice at all is the cluster: a board asked for a program its NEIGHBOUR
+ * can run has to produce the neighbour's instructions.
+ *
+ * And it goes that way round rather than the other because of memory.  This
+ * compiler wants three megabytes of heap, which every board with PSRAM has and
+ * no C3 ever will - so the board that CAN compile does it for the board that
+ * cannot, and the small board only has to run the answer.
+ */
 int ag_main(int argc, char **argv)
 {
-    if (argc < 3) {
-        ag_print("usage: cc <in.c> <out.axe|out.sys>\n");
+    const char *in = NULL;
+    const char *out = NULL;
+    int         arch = CC_ARCH_HOST;
+
+    for (int i = 1; i < argc; i++) {
+        if (ag_strcmp(argv[i], "-riscv") == 0 ||
+            ag_strcmp(argv[i], "-riscv32") == 0) {
+            arch = CC_ARCH_RV32;
+        } else if (ag_strcmp(argv[i], "-xtensa") == 0) {
+            arch = CC_ARCH_XTENSA;
+        } else if (argv[i][0] == '-' && argv[i][1] != '\0') {
+            ag_printf("cc: unknown option %s\n", argv[i]);
+            return 1;
+        } else if (in == NULL) {
+            in = argv[i];
+        } else if (out == NULL) {
+            out = argv[i];
+        } else {
+            ag_print("cc: too many file names\n");
+            return 1;
+        }
+    }
+    if (in == NULL || out == NULL) {
+        ag_print("usage: cc [-riscv|-xtensa] <in.c> <out.axe|out.sys>\n");
         return 1;
     }
 
@@ -144,27 +176,38 @@ int ag_main(int argc, char **argv)
     }
 
     size_t src_len = 0;
-    if (read_all(argv[1], src, SRC_CAP - 1, &src_len) != 0) {
+    if (read_all(in, src, SRC_CAP - 1, &src_len) != 0) {
         ag_free(src);
         return 1;
     }
     src[src_len] = '\0';
 
     cc_result_t res;
-    if (cc_compile_to_axe_inc(src, src_len, include_reader, argv[1], &res) !=
-        0) {
+    if (cc_compile_to_axe_for(src, src_len, include_reader, (void *)in, arch,
+                              &res) != 0) {
         ag_printf("cc: %s\n", res.err);
         ag_free(src);
         return 1;
     }
     ag_free(src);
 
-    if (write_all(argv[2], res.axe, res.axe_len) != 0) {
+    if (write_all(out, res.axe, res.axe_len) != 0) {
         cc_result_free(&res);
         return 1;
     }
 
-    ag_printf("cc: wrote %s (%u bytes)\n", argv[2], (unsigned)res.axe_len);
+    /*
+     * The architecture is named only when it is not this board's, and it is
+     * named because the alternative is an image that looks fine here and
+     * refuses to start with nothing to point at.
+     */
+    if (arch == CC_ARCH_HOST) {
+        ag_printf("cc: wrote %s (%u bytes)\n", out, (unsigned)res.axe_len);
+    } else {
+        ag_printf("cc: wrote %s (%u bytes, %s)\n", out,
+                  (unsigned)res.axe_len,
+                  (arch == CC_ARCH_RV32) ? "riscv32" : "xtensa");
+    }
     cc_result_free(&res);
     return 0;
 }
