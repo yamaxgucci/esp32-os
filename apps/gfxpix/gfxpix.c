@@ -17,6 +17,12 @@
  *                      each a different colour, so a mirrored or rotated
  *                      surface shows up as the wrong corner being red.
  *
+ *   A red dot goes round the circle, one step of sixteen per frame, because a
+ *   still picture cannot tell a working link from a frozen one - which is
+ *   exactly what came back from the phone the first time.  It is also the
+ *   frame rate, readable from across the room: a lap a second is sixteen
+ *   frames a second.
+ *
  *   The picture is handed over again twice a second for as long as it is
  *   held, which is not decoration: a screen at the end of a wire keeps
  *   nothing, so a picture drawn once belongs to whoever happened to be
@@ -153,12 +159,29 @@ static uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b)
     return (uint16_t)(((r & 0xf8u) << 8) | ((g & 0xfcu) << 3) | (b >> 3));
 }
 
+/*
+ * Where the spoke is pointing.  Advanced once per frame by the caller, so a
+ * still picture and a stopped link look different from across the room - the
+ * one thing a test picture has to be able to say and the one thing the first
+ * version of this could not.
+ */
+static int s_phase;
+
+/* Sixteen positions round the circle, as (dx, dy) in sixteenths. */
+static const signed char k_spoke[16][2] = {
+    {16, 0},  {15, 6},   {11, 11},  {6, 15},   {0, 16},   {-6, 15},
+    {-11, 11},{-15, 6},  {-16, 0},  {-15, -6}, {-11, -11},{-6, -15},
+    {0, -16}, {6, -15},  {11, -11}, {15, -6},
+};
+
 static int own_picture(void)
 {
     /* A circle, two diagonals and a border - the same test as the framebuffer
-     * path, so the two can be compared by eye. */
+     * path, so the two can be compared by eye - and a spoke that moves. */
     const int cx = OWN_W / 2, cy = OWN_H / 2;
     const int r = (OWN_W < OWN_H ? OWN_W : OWN_H) / 2 - 2;
+    const int sx = cx + (k_spoke[s_phase & 15][0] * (r - 6)) / 16;
+    const int sy = cy + (k_spoke[s_phase & 15][1] * (r - 6)) / 16;
 
     for (int y0 = 0; y0 < OWN_H; y0 += OWN_BAND) {
         const int rows = (OWN_H - y0 < OWN_BAND) ? (OWN_H - y0) : OWN_BAND;
@@ -174,6 +197,10 @@ static int own_picture(void)
                 } else if (x * OWN_H == y * OWN_W ||
                            (OWN_W - 1 - x) * OWN_H == y * OWN_W) {
                     c = rgb565(255, 255, 255);
+                } else if ((x - sx) * (x - sx) + (y - sy) * (y - sy) <= 36) {
+                    /* The spoke's head: six pixels across, and the only thing
+                     * in this picture that is ever in a different place. */
+                    c = rgb565(255, 40, 40);
                 } else if (dx * dx + dy * dy <= r * r) {
                     c = rgb565(224, 192, 64);
                 } else {
@@ -288,33 +315,42 @@ int ag_main(int argc, char **argv)
         uint32_t   left = hold_s * 1000u;
         const bool forever = (hold_s == 0u);
         for (;;) {
+            if (!forever && left == 0u) {
+                break;
+            }
+            const uint32_t nap = (forever || left > 500u) ? 500u : left;
+            ag_delay(nap);
             if (!forever) {
-                if (left == 0u) {
-                    break;
-                }
-                const uint32_t nap = (left < 500u) ? left : 500u;
-                ag_delay(nap);
                 left -= nap;
-            } else {
-                ag_delay(500);
-                ag_event_t ev;
-                bool       done = false;
-                while (ag_poll_event(&ev, 0)) {
-                    if (ev.type == AG_EV_QUIT ||
-                        ev.type == AG_EV_KEY_DOWN) {
-                        done = true;
-                    }
-                }
-                if (done || ag_interrupted()) {
-                    break;
+            }
+
+            /*
+             * Both ways round.  This used to be asked only when no number was
+             * given, and `run gfxpix.axe 20` then sat out its twenty seconds
+             * through Esc, through Ctrl+C and through `stop`: the key arrived
+             * and the flag was set, and nobody in here looked at either.  An
+             * application holding the screen and deaf to the stop key looks
+             * exactly like a hung one - which is the state this program exists
+             * to let somebody rule out.
+             */
+            ag_event_t ev;
+            bool       done = false;
+            while (ag_poll_event(&ev, 0)) {
+                if (ev.type == AG_EV_QUIT || ev.type == AG_EV_KEY_DOWN) {
+                    done = true;
                 }
             }
+            if (done || ag_interrupted()) {
+                break;
+            }
+
+            s_phase++;
             if (own_picture() != 0) {
                 bad = 1;
             }
         }
         ag_gfx_release();
-        if (forever) {
+        if (forever || left != 0u) {
             ag_printf("3 held until stopped\n");
         } else {
             ag_printf("3 held %u s\n", (unsigned)hold_s);
