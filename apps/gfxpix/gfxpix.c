@@ -17,11 +17,13 @@
  *                      each a different colour, so a mirrored or rotated
  *                      surface shows up as the wrong corner being red.
  *
- *   A red dot goes round the circle, one step of sixteen per frame, because a
- *   still picture cannot tell a working link from a frozen one - which is
- *   exactly what came back from the phone the first time.  It is also the
- *   frame rate, readable from across the room: a lap a second is sixteen
- *   frames a second.
+ *   A red dot goes round the circle, one step of sixty-four per frame, twenty
+ *   frames a second, because a still picture cannot tell a working link from a
+ *   frozen one - which is what came back from the phone the first time.  Only
+ *   the rectangle it moved through is redrawn and handed over, which is what
+ *   makes that rate affordable; the whole picture goes once every two seconds
+ *   so nothing painted on top of it stays.  A lap is a little over three
+ *   seconds when the board is keeping up.
  *
  *   The picture is handed over again twice a second for as long as it is
  *   held, which is not decoration: a screen at the end of a wire keeps
@@ -152,6 +154,13 @@ static void draw_scene(uint16_t w, uint16_t h)
 #define OWN_H 144
 #define OWN_BAND 16
 
+/*
+ * Milliseconds a frame.  Fifty because a patch costs two or three and the eye
+ * stops seeing steps somewhere above ten a second; sixty-four positions at
+ * this rate is a lap in a little over three seconds.
+ */
+#define FRAME_MS 50u
+
 static uint16_t s_band[OWN_W * OWN_BAND];
 
 static uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b)
@@ -167,21 +176,103 @@ static uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b)
  */
 static int s_phase;
 
-/* Sixteen positions round the circle, as (dx, dy) in sixteenths. */
-static const signed char k_spoke[16][2] = {
-    {16, 0},  {15, 6},   {11, 11},  {6, 15},   {0, 16},   {-6, 15},
-    {-11, 11},{-15, 6},  {-16, 0},  {-15, -6}, {-11, -11},{-6, -15},
-    {0, -16}, {6, -15},  {11, -11}, {15, -6},
+/*
+ * A quarter turn in sixteen steps, as (dx, dy) in sixteenths; the other three
+ * quarters are this one with the signs and the axes swapped.  Sixty-four
+ * positions rather than sixteen because at twenty frames a second sixteen
+ * reads as a second hand ticking, which is what came back from the board.
+ */
+static const signed char k_quarter[16][2] = {
+    {16, 0},  {16, 2},  {16, 3},  {15, 5},  {15, 6},  {14, 8},
+    {13, 9},  {12, 11}, {11, 11}, {11, 12}, {9, 13},  {8, 14},
+    {6, 15},  {5, 15},  {3, 16},  {2, 16},
 };
+
+/* Where the dot sits for a phase, in picture pixels. */
+static void spoke_at(int phase, int *sx, int *sy)
+{
+    const int cx = OWN_W / 2, cy = OWN_H / 2;
+    const int r = (OWN_W < OWN_H ? OWN_W : OWN_H) / 2 - 2 - 6;
+    const int q = (phase >> 4) & 3, i = phase & 15;
+    int       dx = k_quarter[i][0], dy = k_quarter[i][1];
+
+    for (int t = 0; t < q; t++) {
+        const int nx = -dy;     /* a quarter turn */
+        dy = dx;
+        dx = nx;
+    }
+    *sx = cx + (dx * r) / 16;
+    *sy = cy + (dy * r) / 16;
+}
+
+/* The picture as a rule, so a patch of it and the whole of it agree. */
+static uint16_t pixel_at(int x, int y, int sx, int sy)
+{
+    const int cx = OWN_W / 2, cy = OWN_H / 2;
+    const int r = (OWN_W < OWN_H ? OWN_W : OWN_H) / 2 - 2;
+    const int dx = x - cx, dy = y - cy;
+
+    if (x == 0 || y == 0 || x == OWN_W - 1 || y == OWN_H - 1) {
+        return rgb565(255, 255, 255);
+    }
+    if (x * OWN_H == y * OWN_W || (OWN_W - 1 - x) * OWN_H == y * OWN_W) {
+        return rgb565(255, 255, 255);
+    }
+    if ((x - sx) * (x - sx) + (y - sy) * (y - sy) <= 36) {
+        return rgb565(255, 40, 40);   /* the dot: the only thing that moves */
+    }
+    if (dx * dx + dy * dy <= r * r) {
+        return rgb565(224, 192, 64);
+    }
+    return rgb565(0, 0, 128);
+}
+
+/*
+ * Just the rectangle that changed.
+ *
+ * Redrawing all of 160x144 to move one dot costs 45-80 ms on this board and a
+ * whole picture's worth of wire; a patch around where the dot was and where it
+ * is costs about a thirtieth of that, which is the difference between ticking
+ * twice a second and moving.
+ */
+static int own_patch(int px, int py, int pw, int ph, int sx, int sy)
+{
+    if (px < 0) { pw += px; px = 0; }
+    if (py < 0) { ph += py; py = 0; }
+    if (px + pw > OWN_W) { pw = OWN_W - px; }
+    if (py + ph > OWN_H) { ph = OWN_H - py; }
+    if (pw <= 0 || ph <= 0) {
+        return 0;
+    }
+    for (int row = 0; row < ph; row++) {
+        for (int col = 0; col < pw; col++) {
+            s_band[row * pw + col] = pixel_at(px + col, py + row, sx, sy);
+        }
+    }
+    const ag_blit_t b = {
+        .px = s_band,
+        .stride = (uint16_t)(pw * (int)sizeof(uint16_t)),
+        .surf_w = OWN_W,
+        .surf_h = OWN_H,
+        .x = (uint16_t)px,
+        .y = (uint16_t)py,
+        .w = (uint16_t)pw,
+        .h = (uint16_t)ph,
+    };
+    const ag_err_t err = ag_gfx_present(&b);
+    if (err != AG_OK) {
+        ag_printf("present patch at %d,%d: %s\n", px, py, ag_strerror(err));
+        return 1;
+    }
+    return 0;
+}
 
 static int own_picture(void)
 {
     /* A circle, two diagonals and a border - the same test as the framebuffer
-     * path, so the two can be compared by eye - and a spoke that moves. */
-    const int cx = OWN_W / 2, cy = OWN_H / 2;
-    const int r = (OWN_W < OWN_H ? OWN_W : OWN_H) / 2 - 2;
-    const int sx = cx + (k_spoke[s_phase & 15][0] * (r - 6)) / 16;
-    const int sy = cy + (k_spoke[s_phase & 15][1] * (r - 6)) / 16;
+     * path, so the two can be compared by eye - and a dot that moves. */
+    int sx, sy;
+    spoke_at(s_phase, &sx, &sy);
 
     for (int y0 = 0; y0 < OWN_H; y0 += OWN_BAND) {
         const int rows = (OWN_H - y0 < OWN_BAND) ? (OWN_H - y0) : OWN_BAND;
@@ -189,24 +280,7 @@ static int own_picture(void)
         for (int row = 0; row < rows; row++) {
             const int y = y0 + row;
             for (int x = 0; x < OWN_W; x++) {
-                const int dx = x - cx, dy = y - cy;
-                uint16_t  c;
-
-                if (x == 0 || y == 0 || x == OWN_W - 1 || y == OWN_H - 1) {
-                    c = rgb565(255, 255, 255);
-                } else if (x * OWN_H == y * OWN_W ||
-                           (OWN_W - 1 - x) * OWN_H == y * OWN_W) {
-                    c = rgb565(255, 255, 255);
-                } else if ((x - sx) * (x - sx) + (y - sy) * (y - sy) <= 36) {
-                    /* The spoke's head: six pixels across, and the only thing
-                     * in this picture that is ever in a different place. */
-                    c = rgb565(255, 40, 40);
-                } else if (dx * dx + dy * dy <= r * r) {
-                    c = rgb565(224, 192, 64);
-                } else {
-                    c = rgb565(0, 0, 128);
-                }
-                s_band[row * OWN_W + x] = c;
+                s_band[row * OWN_W + x] = pixel_at(x, y, sx, sy);
             }
         }
 
@@ -318,7 +392,7 @@ int ag_main(int argc, char **argv)
             if (!forever && left == 0u) {
                 break;
             }
-            const uint32_t nap = (forever || left > 500u) ? 500u : left;
+            const uint32_t nap = (forever || left > FRAME_MS) ? FRAME_MS : left;
             ag_delay(nap);
             if (!forever) {
                 left -= nap;
@@ -344,9 +418,29 @@ int ag_main(int argc, char **argv)
                 break;
             }
 
+            /*
+             * The dot moves; the picture around it does not.  So the patch
+             * that goes over covers where it was and where it is, and the
+             * whole picture only every two seconds - enough to heal anything
+             * that painted over it, not so much that it costs the frame rate.
+             */
+            int ox, oy, nx, ny;
+            spoke_at(s_phase, &ox, &oy);
             s_phase++;
-            if (own_picture() != 0) {
-                bad = 1;
+            spoke_at(s_phase, &nx, &ny);
+
+            if ((s_phase % (2000 / FRAME_MS)) == 0) {
+                if (own_picture() != 0) {
+                    bad = 1;
+                }
+            } else {
+                const int x0 = (ox < nx ? ox : nx) - 7;
+                const int y0 = (oy < ny ? oy : ny) - 7;
+                const int x1 = (ox > nx ? ox : nx) + 8;
+                const int y1 = (oy > ny ? oy : ny) + 8;
+                if (own_patch(x0, y0, x1 - x0, y1 - y0, nx, ny) != 0) {
+                    bad = 1;
+                }
             }
         }
         ag_gfx_release();
