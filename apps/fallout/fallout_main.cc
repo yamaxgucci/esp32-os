@@ -329,8 +329,35 @@ static int s_art_lent;
 #define AG_ART_STEP_KB     512
 #define AG_ART_GROW_EVERY 30000u
 
+/*
+ * ARGON: and the floor that matters when the arena has no hole left.
+ *
+ * AG_ART_FLOOR_KB is 1400 because the cache used to be 1800.  Maxim then
+ * settled it at 1000 by ear - and with a cache of 1000 both rungs that use
+ * that constant went dead: the shrink needs `have - 512 >= 1400`, which is
+ * false, and the grow returns early on `have < 1400`.  Nobody noticed,
+ * because a dead rung is silent.
+ *
+ * It cost the save panel on 16 September 2026.  The panel wants 307200 bytes
+ * in one piece; the arena had 583 KB free in holes of 208 KB; the ladder in
+ * on_out_of_arena ran and every rung failed - a flush frees entries and keeps
+ * the block, parking the sound cache gives 257 KB which is not enough, the
+ * shrink was dead, and lending the whole block is refused whenever a single
+ * entry is locked, which on the save screen it always is.  So the game said
+ * "Error loading save game screen data" and Maxim saw no window, again.
+ *
+ * Under a refusal the cache may go far smaller than 1400: the alternative is
+ * an allocation that fails, and the note further down already says which of
+ * those is worth having.  It is taken back afterwards - up to whatever size
+ * was configured, never past it - by the tick that used to only grow.
+ */
+#define AG_ART_PANIC_KB    256
+
 static unsigned s_art_resize_ms;
 static unsigned s_art_grows, s_art_shrinks, s_art_refused;
+/* What the cache is meant to be, so an emergency shrink can be undone
+ * without ever growing past the size that was asked for. */
+static int s_art_want_kb;
 
 static int art_ceiling_kb(const ag_meminfo_t *mi)
 {
@@ -540,11 +567,25 @@ extern "C" void fallout_reserve_tick(void)
             ag_meminfo(&gi);
             {
                 const int have = fallout::artCacheMaxSize() / 1024;
-                const int want = have + AG_ART_STEP_KB;
+                int       want = have + AG_ART_STEP_KB;
 
                 /* Before art_init there is nothing to grow. */
-                if (have < AG_ART_FLOOR_KB) {
+                if (have <= 0) {
                     return;
+                }
+                /*
+                 * Never past the size that was asked for.  This test used to
+                 * be `have < AG_ART_FLOOR_KB`, which with a 1000 KB cache
+                 * returned every time and so could never give back what an
+                 * emergency shrink had taken.
+                 */
+                if (s_art_want_kb > 0) {
+                    if (have >= s_art_want_kb) {
+                        return;
+                    }
+                    if (want > s_art_want_kb) {
+                        want = s_art_want_kb;
+                    }
                 }
                 const unsigned need =
                     (unsigned)(AG_ART_STEP_KB + 1024) * 1024u;
@@ -939,11 +980,33 @@ static int slab_free(void *p)
     return 0;
 }
 
+/*
+ * ARGON: and when a big borrow is refused, say why.
+ *
+ * Only for the large ones - the small slab path runs thousands of times and a
+ * line there would be its own denial of service.  A big refusal is rare and
+ * is always somebody's bad day: on 16 September 2026 the save panel asked for
+ * 307224 bytes, this function said no, and the log contained not one word
+ * about it, so the failure looked like the ladder above having no rungs.
+ */
+static void loan_refused(const char *why, __SIZE_TYPE__ wanted)
+{
+    if (wanted < AG_SLAB_BIG) {
+        return;
+    }
+    ag_printf("fallout: could not lend %u KB out of the art cache: %s\n",
+              (unsigned)(wanted / 1024u), why);
+}
+
 static void *arena_borrow(__SIZE_TYPE__ wanted)
 {
     int i;
 
-    if (wanted == 0u || ag_loans_on == 0) {
+    if (wanted == 0u) {
+        return NULL;
+    }
+    if (ag_loans_on == 0) {
+        loan_refused("lending is off (-loans 0)", wanted);
         return NULL;
     }
 
@@ -951,6 +1014,7 @@ static void *arena_borrow(__SIZE_TYPE__ wanted)
     if (s_loan_thread == NULL) {
         s_loan_thread = loan_thread_now();
     } else if (loan_thread_now() != s_loan_thread) {
+        loan_refused("asked from a thread that is not the borrower", wanted);
         return NULL;
     }
 
@@ -970,6 +1034,8 @@ static void *arena_borrow(__SIZE_TYPE__ wanted)
 
             if (!fallout::artBorrow((int)wanted, &handle, &got)) {
                 s_loans_refused++;
+                loan_refused("the art cache refused - see the CACHE line "
+                             "above for which step", wanted);
                 return NULL;
             }
 
@@ -987,6 +1053,7 @@ static void *arena_borrow(__SIZE_TYPE__ wanted)
     }
 
     s_loans_refused++;
+    loan_refused("no loan slot free", wanted);
     return NULL;
 }
 
@@ -1200,7 +1267,9 @@ static int on_out_of_arena(__SIZE_TYPE__ wanted)
      */
     {
         const int have = fallout::artCacheMaxSize() / 1024;
-        if (!s_art_lent && have - AG_ART_STEP_KB >= AG_ART_FLOOR_KB) {
+        /* Down to the panic floor, not to the comfortable one: this path runs
+         * only when an allocation has already been refused. */
+        if (!s_art_lent && have - AG_ART_STEP_KB >= AG_ART_PANIC_KB) {
             const int want = have - AG_ART_STEP_KB;
             if (fallout::artCacheResize(want * 1024)) {
                 s_art_shrinks++;
@@ -1889,6 +1958,9 @@ extern "C" int ag_cxx_main(int argc, char **argv)
                       want, (unsigned)(ai.arena_total / 1024u));
         }
     }
+
+    /* What the cache is meant to be, for the shrink to be undone against. */
+    s_art_want_kb = (ag_art_cache_kb > 0) ? ag_art_cache_kb : 0;
 
     fallout_reserve_kb(reserve_kb);
     /* A fifth of the big one: enough for every small refusal seen (2984, 9614)

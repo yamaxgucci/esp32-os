@@ -329,6 +329,14 @@ extern unsigned ag_lap_scroll_us;
 extern unsigned ag_blit_null_n;
 extern unsigned ag_blit_null_w, ag_blit_null_h;
 
+/* And the interface overlay inside it, in four: the background blitted
+ * through a transparency test, the tabs (which draw text), the dial and the
+ * date, and the window refresh of all 640x480. */
+extern unsigned ag_wmo_calls;
+extern unsigned ag_wmo_bg_us, ag_wmo_tabs_us, ag_wmo_dial_us, ag_wmo_win_us;
+extern unsigned ag_wmo_bg_worst, ag_wmo_tabs_worst, ag_wmo_dial_worst,
+                ag_wmo_win_worst;
+
 extern unsigned ag_wm_calls;
 extern unsigned ag_wm_tiles_us, ag_wm_dim_us, ag_wm_overlay_us;
 extern unsigned ag_wm_tiles_worst, ag_wm_dim_worst, ag_wm_overlay_worst;

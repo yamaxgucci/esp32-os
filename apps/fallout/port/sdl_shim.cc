@@ -767,6 +767,18 @@ static int scale_now(void)
     case AG_WHERE_WALK:
     case AG_WHERE_COMBAT:
         return 1;   /* averaged: the exits are visible */
+    case AG_WHERE_WORLDMAP:
+        /*
+         * ARGON: and the world map, asked for on 16 September 2026 - "на карте
+         * мира нужно усреднение как в игре".
+         *
+         * It had been in the sampled half by default, which is the right
+         * choice for a screen made of text and the wrong one for this: the
+         * world map is a picture with one-pixel roads and a party marker a
+         * few pixels across, and taking every second pixel loses exactly
+         * those, the same way it lost the map exits on foot.
+         */
+        return 1;
     default:
         return 0;   /* sampled: the text is sharp */
     }
@@ -2335,6 +2347,19 @@ static void worldmap_report(void)
                 ag_wm_overlay_us / ag_wm_calls, ag_wm_overlay_worst,
                 (ag_wm_tiles_us + ag_wm_dim_us + ag_wm_overlay_us)
                     / ag_wm_calls);
+    if (ag_wmo_calls != 0u) {
+        shim_printf("[wmoverlay t=%u] %u | background %u us/call (worst %u), tabs %u (worst %u), dial+date %u (worst %u), window %u (worst %u)\n",
+                    (unsigned)ag_millis(), ag_wmo_calls,
+                    ag_wmo_bg_us / ag_wmo_calls, ag_wmo_bg_worst,
+                    ag_wmo_tabs_us / ag_wmo_calls, ag_wmo_tabs_worst,
+                    ag_wmo_dial_us / ag_wmo_calls, ag_wmo_dial_worst,
+                    ag_wmo_win_us / ag_wmo_calls, ag_wmo_win_worst);
+        ag_wmo_calls = 0;
+        ag_wmo_bg_us = 0; ag_wmo_tabs_us = 0; ag_wmo_dial_us = 0;
+        ag_wmo_win_us = 0;
+        ag_wmo_bg_worst = 0; ag_wmo_tabs_worst = 0; ag_wmo_dial_worst = 0;
+        ag_wmo_win_worst = 0;
+    }
     ag_wm_calls = 0;
     ag_wm_tiles_us = 0; ag_wm_dim_us = 0; ag_wm_overlay_us = 0;
     ag_wm_tiles_worst = 0; ag_wm_dim_worst = 0; ag_wm_overlay_worst = 0;
