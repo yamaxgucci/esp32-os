@@ -317,6 +317,8 @@ static struct {
     uint32_t      band_busy;
     uint32_t      band_refused;
     uint32_t      band_nostack;
+    uint32_t      stall_band;
+    uint32_t      stall_text;
     bool          moaned_stack;
 
     /* The wire. */
@@ -604,8 +606,25 @@ static wire_t send_all(ag_handle_t h, const void *buf, uint32_t len,
             return WIRE_GONE;
         }
         if (at == 0u && ag_micros() > start_by) {
-            /* Nothing sent, nothing owed: let the loop get on with reading
-             * input, and offer this message again next time round. */
+            /*
+             * Nothing sent, nothing owed: let the loop get on with reading
+             * input, and offer this message again next time round.
+             *
+             * Said once, because this is the stall that matters and nothing
+             * ever printed it.  A hundred and ten bytes that cannot start on
+             * an idle link is not a shut window, it is the stack having no
+             * buffer - and the two counters tell them apart.  Two frames of a
+             * two-kilobyte picture in thirty seconds was traced this far and
+             * no further for want of this line.
+             */
+            static bool moaned_start;
+            if (!moaned_start) {
+                moaned_start = true;
+                ag_log(AG_LOG_WARN, "phone",
+                       "a %u byte send could not start in %u ms: "
+                       "%u window, %u no-buffer",
+                       (unsigned)len, (unsigned)SEND_START_MS, again, nomem);
+            }
             return WIRE_STALL;
         }
         if (ag_micros() > until) {
@@ -726,6 +745,12 @@ static wire_t ws_send(uint8_t op, void *payload, uint32_t len,
      * that a screen still feels live once the phone catches up.
      */
     if (r == WIRE_STALL) {
+        /* Who lights the quiet that refuses everybody else. */
+        if (is_band) {
+            s.stall_band++;
+        } else {
+            s.stall_text++;
+        }
         s.hush_until = (uint64_t)ag_micros() + 100000ull;
     } else if (r == WIRE_OK) {
         s.hush_until = 0u;
@@ -2254,11 +2279,13 @@ static void phone_task(void *arg)
                 ag_log(AG_LOG_INFO, "phone",
                        "picture: %u blits in, %u bands out, %u bytes; "
                        "not sent: %u no memory, %u hushed, %u wire busy, "
-                       "%u refused, %u no stack; surface %ux%u, frame %s",
+                       "%u refused, %u no stack; stalls: %u band, %u text; "
+                       "surface %ux%u, frame %s",
                        (unsigned)s.blits, (unsigned)s.bands,
                        (unsigned)s.band_bytes, (unsigned)s.band_nomem,
                        (unsigned)s.band_hushed, (unsigned)s.band_busy,
                        (unsigned)s.band_refused, (unsigned)s.band_nostack,
+                       (unsigned)s.stall_band, (unsigned)s.stall_text,
                        (unsigned)s.frame_w,
                        (unsigned)s.frame_h,
                        (s.frame != NULL) ? "held" : "none (sent from the "
