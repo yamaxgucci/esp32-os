@@ -1,11 +1,13 @@
 # Argon CC — tiny C → `.AXE` on the device
 
 **Argon CC** compiles a small subset of C to a runnable `.AXE` without a host
-toolchain (image name `CC.AXE`). Two machines: **Xtensa** and **RV32IM**.
+toolchain (image name `CC.AXE`). Three machines: **Xtensa**, **RV32IM**, and
+one with no processor at all.
 
 ```text
 run t:\cc.axe t:\hi.c t:\hi.axe             this board
 run t:\cc.axe -riscv t:\hi.c t:\hi.axe      the other one
+run t:\cc.axe -bc t:\hi.c t:\hi.bc          both, through AGVM.AXE
 ```
 
 The default is the board it is running on; `-riscv` / `-xtensa` says otherwise.
@@ -244,24 +246,24 @@ feedback, Space panic, Esc quit. The live UI shows `Perf` / `Stream`
 (render load %, late, drop, resync) like host DX7. Smoke prints
 `dx7nofx: smoke ok`.
 
-## The two back ends
+## The three back ends
 
 `cc_compile.c` is one translation unit with a **seam** in the middle: one
-function per operation the parser can ask for, and the two machines under it
-(`xt_*`, `rv_*`). Above the seam the registers are NUMBERS, not registers — 8
+function per operation the parser can ask for, and the machines under it
+(`xt_*`, `rv_*`, `bc_*`). Above the seam the registers are NUMBERS, not registers — 8
 is the value in hand, 9 the other operand, 7 the frame, 10..15 the arguments
 going out, and a call's answer comes back in 10, which is true of a windowed
 machine (a2 seen as a10) and of an ordinary one (a0) alike.
 
 What actually differs is not the encodings:
 
-| | Xtensa | RV32IM |
-|---|---|---|
-| an address | `l32r` from a literal pool beside the code; relocating it is arithmetic on a word | `lui`+`addi` carrying it in their immediates; relocating it rewrites two instructions (`ag_axe_ireloc_t`) |
-| a call | `ENTRY` rotates a window and allocates the frame; arguments arrive eight registers along | the prologue saves `ra` and `s0` itself; arguments arrive where the caller put them |
-| the frame size | one rewritten `ENTRY` | every `return` jumps to one epilogue, written when the size is known |
-| `a < b` | a branch and two moves | `slt` / `sltu` |
-| `x >> 20` unsigned | through the shift-amount register: `SRLI` cannot count past 15 | `srli` |
+| | Xtensa | RV32IM | bytecode |
+|---|---|---|---|
+| an address | `l32r` from a literal pool beside the code; relocating it is arithmetic on a word | `lui`+`addi` carrying it in their immediates; relocating it rewrites two instructions (`ag_axe_ireloc_t`) | an offset the interpreter adds to where it put the data — no relocations at all |
+| a call | `ENTRY` rotates a window and allocates the frame; arguments arrive eight registers along | the prologue saves `ra` and `s0` itself; arguments arrive where the caller put them | one `CALL`; a tagged operand is a call inside the image, anything else is an address in the ABI table |
+| the frame size | one rewritten `ENTRY` | every `return` jumps to one epilogue, written when the size is known | a rewritten `ENTER`, and the frame is a block of the interpreter's store |
+| `a < b` | a branch and two moves | `slt` / `sltu` | `SLT` / `SLTU` |
+| `x >> 20` unsigned | through the shift-amount register: `SRLI` cannot count past 15 | `srli` | `SHRUI` |
 
 How it is known to work, and the first is not enough:
 
@@ -277,8 +279,44 @@ How it is known to work, and the first is not enough:
   and the loader agree about which bits of a `lui` an address goes into.
 - `argon rvtest` is the whole thing with no board: an emulated ESP32-C3 runs
   the images and gives the same seven unsigned answers the Xtensa build gives,
-  and an emulated S3 writes one with `cc -riscv` that matches the host build
-  byte for byte.
+  an emulated S3 writes one with `cc -riscv` that matches the host build byte
+  for byte, and the SAME `.bc` file is run on both machines through the
+  interpreter and has to answer identically.
+
+## `-bc`: the machine with no processor
+
+The third rung of the cascade in [`docs/plans/cluster.md`](../../docs/plans/cluster.md).
+`cc -bc x.c x.bc` writes an image with `arch = 3`, and
+[`AGVM.AXE`](../agvm/agvm.c) runs it:
+
+```text
+run t:\agvm.axe t:\x.bc
+```
+
+One file every board can execute, at five to fifty times the cost of native
+code. That is the right trade for coordination — policy, supervision, glue —
+because such a program sleeps between events, and the wrong one for audio.
+
+The instruction set is the seam written down
+([`apps/common/agvm/ag_bc.h`](../common/agvm/ag_bc.h)): sixteen registers with
+the seam's own numbers, so the back end is about one line an operation. It is
+also the only one of the three with **no relocations at all** — Xtensa fetches
+an address from a literal beside the code and RISC-V builds it in a `lui`/`addi`
+pair, and both need fixing up once the parts are placed; the interpreter knows
+where it put the data and adds the offset as it runs.
+
+The interpreter is ~2 KB of code on either machine and **knows no builtins**: a
+bytecode program reaches the ABI the way a native one does (load the api
+pointer out of its own data, walk to the sub-table, walk to the function, call
+it), so all it needs is a CALL that can call an ordinary address with six
+arguments. Adding an ABI call to the system adds nothing to it.
+
+**What it cannot do**, and the reason the plan gives this rung to coordination
+rather than to everything: a code address here is an offset into bytecode with
+the top bit set, which is not something the kernel can jump to. So a bytecode
+program cannot be a `.SYS` driver and cannot register cluster entry points —
+both are callbacks *from* native code. Registers hold real addresses and there
+is no MMU underneath, so this is portability, not a sandbox.
 
 ## Build
 

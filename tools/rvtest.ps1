@@ -1,8 +1,8 @@
-# The other instruction set, end to end, with no board plugged in.
+# The machines that are not this one, end to end, with no board plugged in.
 #
 #   .\argon.cmd rvtest
 #
-# Two claims, and they are separate:
+# Three claims, and they are separate:
 #
 #   1. A program the board's own compiler wrote for RISC-V RUNS on a RISC-V
 #      part, and gives the same answers the Xtensa build gives.  Checked on an
@@ -16,6 +16,12 @@
 #      cluster's second rung: the board with the memory to compile does it for
 #      the board that has not got it - CC wants three megabytes of heap, and no
 #      C3 will ever have them.
+#
+#   3. And the third rung: ONE image that both machines run.  The same .bc
+#      file, byte for byte, is handed to AGVM.AXE on the Xtensa guest and to
+#      AGVMRV.AXE on the RISC-V one, and the answers have to be identical -
+#      including the seven where signedness changes the answer, which is where
+#      an interpreter that took a shortcut would show.
 #
 # IT SWITCHES THE TARGET TWICE, because the two halves are two different chips
 # and one build directory.  It ends on esp32s3, the primary target, so the rest
@@ -98,6 +104,36 @@ function New-RvImages {
     }
 }
 
+# And the bytecode ones, which go in build-bank\ rather than build\ - not for
+# tidiness but because THE SAME FILE has to reach both guests.  Switching
+# target is a fullclean, so anything in build\ would be compiled twice, and
+# "the same program" is a weaker claim than "the same bytes".
+$bank = 'build-bank'
+function New-BcImages {
+    New-Item -ItemType Directory -Force -Path $bank | Out-Null
+    foreach ($ex in @('unsigned', 'selftest')) {
+        $out = Join-Path $bank "bc-$ex.bc"
+        if (Test-Path $out) { continue }
+        & '.\build-host\cchost.exe' "apps\cc\examples\$ex.c" $out -bc |
+            Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            throw "cchost could not compile $ex.c to bytecode."
+        }
+    }
+}
+
+# The seven answers where signedness changes the answer, and they are the same
+# seven whatever the machine.  That is the claim, so it is one table.
+$sevenRx = @{
+    'shr   08000000' = 'unsigned-shift-right'
+    'shr_s f8000000' = 'signed-shift-right'
+    'div   55555555' = 'unsigned-divide'
+    'rem   5'        = 'unsigned-remainder'
+    'gt    yes'      = 'unsigned-compare'
+    'gt_s  no'       = 'signed-compare'
+    'shr20 00000800' = 'shift-past-fifteen'
+}
+
 # The host build of the board's own compiler, which is what both halves are
 # measured against.
 if (-not (Test-Path 'build-host\cchost.exe')) {
@@ -110,6 +146,12 @@ if (-not (Test-Path 'build-host\cchost.exe')) {
 
 Set-Target 'esp32c3-qemu'
 New-RvImages
+# Fresh at the start of the run, and then left alone: phase two must hand the
+# far machine THE SAME BYTES, not the same source compiled again.
+Remove-Item (Join-Path $bank 'bc-*.bc') -ErrorAction SilentlyContinue
+New-BcImages
+& python (Join-Path $PSScriptRoot 'build_apps.py') --only AGVMRV.AXE | Out-Null
+if (-not (Test-Path 'build\apps\AGVMRV.AXE')) { throw 'AGVMRV.AXE did not build.' }
 
 Write-Host "`n== a program compiled for RISC-V, on a RISC-V part ==" `
     -ForegroundColor Cyan
@@ -117,10 +159,17 @@ Write-Host "`n== a program compiled for RISC-V, on a RISC-V part ==" `
 & (Join-Path $PSScriptRoot 'qemu-boot.ps1') -TimeoutSec $TimeoutSec `
     -LogPath 'build\rvtest-c3.log' `
     -Put @('build\rv-unsigned.axe=c:\rvuns.axe',
-           'build\rv-selftest.axe=c:\rvst.axe') `
+           'build\rv-selftest.axe=c:\rvst.axe',
+           'build\apps\AGVMRV.AXE=c:\agvm.axe',
+           "$bank\bc-unsigned.bc=c:\uns.bc",
+           "$bank\bc-selftest.bc=c:\st.bc") `
     -Send @('ver',
             'run c:\rvuns.axe',
             'run c:\rvst.axe',
+            # And the same two programs again, as bytecode, through the
+            # interpreter.  Same source, same answers, no processor.
+            'run c:\agvm.axe c:\uns.bc',
+            'run c:\agvm.axe c:\st.bc',
             'errorlevel') | Out-Null
 Stop-Emulators
 
@@ -155,6 +204,16 @@ Note ([regex]::IsMatch($c3, 'failures:[\s\S]{0,40}?\b0\b')) `
     'rv-selftest-no-failures'
 Check $c3 'returned 0' 'rv-selftest-exit-zero'
 
+# The third rung, on this machine.  The interpreter says which processor IT is
+# built for; what it runs says nothing about a processor at all.
+Check $c3 'AGVM: riscv32' 'bc-interpreter-is-riscv-here'
+# Twice each, because the native run above printed them once: seven answers
+# from native code and seven from bytecode is fourteen occurrences.
+foreach ($k in $sevenRx.Keys) {
+    $n = ([regex]::Matches($c3, [regex]::Escape($k))).Count
+    Note ($n -ge 2) ('bc-c3-' + $sevenRx[$k]) "$n occurrences"
+}
+
 # ------------------------------------ 2. and a board can write one ---
 
 Set-Target 'esp32s3'
@@ -162,8 +221,10 @@ New-RvImages
 
 Write-Host "`n== a board compiling for the other machine ==" -ForegroundColor Cyan
 
-& python (Join-Path $PSScriptRoot 'build_apps.py') --only CC.AXE | Out-Null
+& python (Join-Path $PSScriptRoot 'build_apps.py') --only CC.AXE AGVM.AXE |
+    Out-Null
 if (-not (Test-Path 'build\apps\CC.AXE')) { throw 'CC.AXE did not build.' }
+if (-not (Test-Path 'build\apps\AGVM.AXE')) { throw 'AGVM.AXE did not build.' }
 
 $share = 'build\rvshare'
 New-Item -ItemType Directory -Force -Path $share | Out-Null
@@ -173,10 +234,18 @@ Remove-Item (Join-Path $share 'fromboard.axe') -ErrorAction SilentlyContinue
     -LogPath 'build\rvtest-s3.log' -HostFs $share `
     -Put @('build\apps\CC.AXE=t:\cc.axe',
            'apps\cc\examples\selftest.c=t:\selftest.c',
-           'apps\cc\examples\ppinc.h=t:\ppinc.h') `
+           'apps\cc\examples\ppinc.h=t:\ppinc.h',
+           'build\apps\AGVM.AXE=t:\agvm.axe',
+           "$bank\bc-unsigned.bc=t:\uns.bc",
+           "$bank\bc-selftest.bc=t:\st.bc") `
     -Send @('run t:\cc.axe -riscv t:\selftest.c h:\fromboard.axe',
             '=cc: wrote',
-            'dir h:\') | Out-Null
+            'dir h:\',
+            # THE SAME BYTES the RISC-V guest ran, on a machine with a
+            # different instruction set and a different word order in its
+            # registers.  Nothing about these files changed between the two.
+            'run t:\agvm.axe t:\uns.bc',
+            'run t:\agvm.axe t:\st.bc') | Out-Null
 Stop-Emulators
 
 $s3 = Transcript 'build\rvtest-s3.log'
@@ -184,6 +253,15 @@ $s3 = Transcript 'build\rvtest-s3.log'
 # Said out loud by the compiler, because an image for another machine that
 # looks like any other is the mistake this line exists to prevent.
 Check $s3 'riscv32' 'rv-board-said-which-machine'
+
+# And the third rung on the other machine.
+Check $s3 'AGVM: xtensa' 'bc-interpreter-is-xtensa-here'
+foreach ($k in $sevenRx.Keys) {
+    Check $s3 $k ('bc-s3-' + $sevenRx[$k])
+}
+Check $s3 'cc selftest' 'bc-s3-selftest-ran'
+Note ([regex]::IsMatch($s3, 'failures:[\s\S]{0,40}?\b0\b')) `
+    'bc-s3-selftest-no-failures'
 
 $made = Join-Path $share 'fromboard.axe'
 if (-not (Test-Path $made)) {

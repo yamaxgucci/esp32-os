@@ -152,6 +152,8 @@ int ag_main(int argc, char **argv)
             arch = CC_ARCH_RV32;
         } else if (ag_strcmp(argv[i], "-xtensa") == 0) {
             arch = CC_ARCH_XTENSA;
+        } else if (ag_strcmp(argv[i], "-bc") == 0) {
+            arch = CC_ARCH_BC;
         } else if (argv[i][0] == '-' && argv[i][1] != '\0') {
             ag_printf("cc: unknown option %s\n", argv[i]);
             return 1;
@@ -165,7 +167,7 @@ int ag_main(int argc, char **argv)
         }
     }
     if (in == NULL || out == NULL) {
-        ag_print("usage: cc [-riscv|-xtensa] <in.c> <out.axe|out.sys>\n");
+        ag_print("usage: cc [-riscv|-xtensa|-bc] <in.c> <out.axe|.sys|.bc>\n");
         return 1;
     }
 
@@ -204,9 +206,14 @@ int ag_main(int argc, char **argv)
     if (arch == CC_ARCH_HOST) {
         ag_printf("cc: wrote %s (%u bytes)\n", out, (unsigned)res.axe_len);
     } else {
+        const char *named = "xtensa";
+        if (arch == CC_ARCH_RV32) {
+            named = "riscv32";
+        } else if (arch == CC_ARCH_BC) {
+            named = "bytecode";
+        }
         ag_printf("cc: wrote %s (%u bytes, %s)\n", out,
-                  (unsigned)res.axe_len,
-                  (arch == CC_ARCH_RV32) ? "riscv32" : "xtensa");
+                  (unsigned)res.axe_len, named);
     }
     cc_result_free(&res);
     return 0;

@@ -9,6 +9,7 @@
  *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
  */
+#include "ag_bc.h"
 #include "cc_compile.h"
 
 #ifdef AG_HOST
@@ -2627,6 +2628,263 @@ static void rv_setlt_cc(gen_t *g, int ar, int as, int at, int uns)
     rvi_alu(g, 0x00u, uns ? 0x3u : 0x2u, rvr(ar), rvr(as), rvr(at));
 }
 
+/* ---- the bytecode back end ----------------------------------------------- */
+/*
+ * The third machine, and the only one with no processor: `cc -bc x.c x.bc`
+ * writes an image that AGVM.AXE runs anywhere.  See apps/common/agvm/ag_bc.h
+ * for what the instructions are and why this rung exists at all.
+ *
+ * It is the shortest of the three back ends by a long way, and that is the
+ * point of having had a seam: the instruction set IS the seam, so most of what
+ * follows is one line an operation.  Registers keep the seam's own numbers -
+ * there is nothing to map them onto.
+ */
+
+static void bc_byte(gen_t *g, uint8_t b)
+{
+    emit_raw(g, &b, 1);
+}
+
+static void bc_rr(gen_t *g, int a, int b)
+{
+    bc_byte(g, (uint8_t)(((a & 0xf) << 4) | (b & 0xf)));
+}
+
+static void bc_u16(gen_t *g, uint32_t v)
+{
+    const uint8_t b[2] = {(uint8_t)v, (uint8_t)(v >> 8)};
+    emit_raw(g, b, 2);
+}
+
+static void bc_u32(gen_t *g, uint32_t v)
+{
+    const uint8_t b[4] = {(uint8_t)v, (uint8_t)(v >> 8), (uint8_t)(v >> 16),
+                          (uint8_t)(v >> 24)};
+    emit_raw(g, b, 4);
+}
+
+static void bc_put_u32(gen_t *g, size_t at, uint32_t v)
+{
+    if (at + 4u > g->len) {
+        gfail(g, "bad patch site");
+        return;
+    }
+    g->code[at] = (uint8_t)v;
+    g->code[at + 1] = (uint8_t)(v >> 8);
+    g->code[at + 2] = (uint8_t)(v >> 16);
+    g->code[at + 3] = (uint8_t)(v >> 24);
+}
+
+/* rd <- rs1 OP rs2 */
+static void bc_alu(gen_t *g, uint8_t op, int ar, int as, int at)
+{
+    bc_byte(g, op);
+    bc_rr(g, ar, as);
+    bc_byte(g, (uint8_t)(at & 0xf));
+}
+
+static void bc_mov_n(gen_t *g, int ad, int as)
+{
+    bc_byte(g, AG_BC_MOV);
+    bc_rr(g, ad, as);
+}
+
+static void bc_movi(gen_t *g, int at, int32_t imm)
+{
+    bc_byte(g, AG_BC_LI);
+    bc_byte(g, (uint8_t)(at & 0xf));
+    bc_u32(g, (uint32_t)imm);
+}
+
+/*
+ * An address, and the one place this machine is simpler than both the others:
+ * there are no relocations at all.  Xtensa fetches an address from a literal
+ * beside the code and RISC-V builds it in a pair of instructions, and both need
+ * the loader to fix them up once the parts are placed.  Here the interpreter
+ * knows where it put the data and adds the offset as it runs.
+ */
+static void bc_li_data(gen_t *g, int at, uint32_t data_off)
+{
+    bc_byte(g, AG_BC_LIDATA);
+    bc_byte(g, (uint8_t)(at & 0xf));
+    bc_u32(g, data_off);
+}
+
+static void bc_li_code(gen_t *g, int at, uint32_t code_off)
+{
+    bc_byte(g, AG_BC_LICODE);
+    bc_byte(g, (uint8_t)(at & 0xf));
+    bc_u32(g, code_off);
+}
+
+static void bc_add_n(gen_t *g, int ar, int as, int at)
+{
+    bc_alu(g, AG_BC_ADD, ar, as, at);
+}
+
+static void bc_sub(gen_t *g, int ar, int as, int at)
+{
+    bc_alu(g, AG_BC_SUB, ar, as, at);
+}
+
+static void bc_mull(gen_t *g, int ar, int as, int at)
+{
+    bc_alu(g, AG_BC_MUL, ar, as, at);
+}
+
+static void bc_quos(gen_t *g, int ar, int as, int at)
+{
+    bc_alu(g, AG_BC_DIVS, ar, as, at);
+}
+
+static void bc_rems(gen_t *g, int ar, int as, int at)
+{
+    bc_alu(g, AG_BC_REMS, ar, as, at);
+}
+
+static void bc_quou(gen_t *g, int ar, int as, int at)
+{
+    bc_alu(g, AG_BC_DIVU, ar, as, at);
+}
+
+static void bc_remu(gen_t *g, int ar, int as, int at)
+{
+    bc_alu(g, AG_BC_REMU, ar, as, at);
+}
+
+static void bc_and(gen_t *g, int ar, int as, int at)
+{
+    bc_alu(g, AG_BC_AND, ar, as, at);
+}
+
+static void bc_or(gen_t *g, int ar, int as, int at)
+{
+    bc_alu(g, AG_BC_OR, ar, as, at);
+}
+
+static void bc_xor(gen_t *g, int ar, int as, int at)
+{
+    bc_alu(g, AG_BC_XOR, ar, as, at);
+}
+
+static void bc_shl_rr(gen_t *g, int dst, int lhs, int amt)
+{
+    bc_alu(g, AG_BC_SHL, dst, lhs, amt);
+}
+
+static void bc_shr_rr(gen_t *g, int dst, int lhs, int amt, int uns)
+{
+    bc_alu(g, uns ? AG_BC_SHRU : AG_BC_SHRS, dst, lhs, amt);
+}
+
+static void bc_shift_i(gen_t *g, uint8_t op, int dst, int src, int sa)
+{
+    bc_byte(g, op);
+    bc_rr(g, dst, src);
+    bc_byte(g, (uint8_t)sa);
+}
+
+static void bc_shl_i(gen_t *g, int dst, int src, int sa)
+{
+    if (sa == 0) {
+        return;
+    }
+    bc_shift_i(g, AG_BC_SHLI, dst, src, sa);
+}
+
+static void bc_shr_i(gen_t *g, int dst, int src, int sa, int uns)
+{
+    if (sa == 0) {
+        return;
+    }
+    bc_shift_i(g, uns ? AG_BC_SHRUI : AG_BC_SHRSI, dst, src, sa);
+}
+
+static void bc_mem(gen_t *g, uint8_t op, int a, int b, int off)
+{
+    if (off < 0 || off > 65535) {
+        gfail(g, "bad memory offset");
+        return;
+    }
+    bc_byte(g, op);
+    bc_rr(g, a, b);
+    bc_u16(g, (uint32_t)off);
+}
+
+static void bc_l8ui(gen_t *g, int at, int as, int off)
+{
+    bc_mem(g, AG_BC_LBU, at, as, off);
+}
+
+static void bc_s8i(gen_t *g, int at, int as, int off)
+{
+    bc_mem(g, AG_BC_SB, at, as, off);
+}
+
+static void bc_l32i(gen_t *g, int at, int as, int off)
+{
+    bc_mem(g, AG_BC_LW, at, as, off);
+}
+
+static void bc_s32i(gen_t *g, int at, int as, int off)
+{
+    bc_mem(g, AG_BC_SW, at, as, off);
+}
+
+static void bc_call_reg(gen_t *g, int as)
+{
+    bc_byte(g, AG_BC_CALL);
+    bc_byte(g, (uint8_t)(as & 0xf));
+}
+
+static void bc_j_to(gen_t *g, size_t from_off, size_t target_off)
+{
+    bc_put_u32(g, from_off + 1u, (uint32_t)target_off);
+}
+
+static void bc_j_placeholder(gen_t *g, size_t *site)
+{
+    *site = g->len;
+    bc_byte(g, AG_BC_JMP);
+    bc_u32(g, 0);
+}
+
+static uint8_t bc_cond(int opn)
+{
+    switch (opn) {
+    case B_BEQ:
+        return AG_BC_BEQ;
+    case B_BNE:
+        return AG_BC_BNE;
+    case B_BLT:
+        return AG_BC_BLT;
+    case B_BGE:
+        return AG_BC_BGE;
+    case B_BLTU:
+        return AG_BC_BLTU;
+    default:
+        return AG_BC_BGEU;
+    }
+}
+
+static void bc_b_placeholder(gen_t *g, int opn, int as, int at, size_t *site)
+{
+    *site = g->len;
+    bc_byte(g, bc_cond(opn));
+    bc_rr(g, as, at);
+    bc_u32(g, 0);
+}
+
+static void bc_patch_b(gen_t *g, size_t site, size_t target)
+{
+    bc_put_u32(g, site + 2u, (uint32_t)target);
+}
+
+static void bc_setlt_cc(gen_t *g, int ar, int as, int at, int uns)
+{
+    bc_alu(g, uns ? AG_BC_SLTU : AG_BC_SLT, ar, as, at);
+}
+
 /* ---- the seam ----------------------------------------------------------- */
 /*
  * One function per operation the parser can ask for, and the whole of what a
@@ -2647,6 +2905,10 @@ static void rv_setlt_cc(gen_t *g, int ar, int as, int at, int uns)
 
 static void emit_mov_n(gen_t *g, int ad, int as)
 {
+    if (g->arch == CC_ARCH_BC) {
+        bc_mov_n(g, ad, as);
+        return;
+    }
     if (g->arch == CC_ARCH_RV32) {
         rv_mov_n(g, ad, as);
         return;
@@ -2656,6 +2918,10 @@ static void emit_mov_n(gen_t *g, int ad, int as)
 
 static void emit_movi(gen_t *g, int at, int32_t imm)
 {
+    if (g->arch == CC_ARCH_BC) {
+        bc_movi(g, at, imm);
+        return;
+    }
     if (g->arch == CC_ARCH_RV32) {
         rv_movi(g, at, imm);
         return;
@@ -2665,6 +2931,10 @@ static void emit_movi(gen_t *g, int at, int32_t imm)
 
 static void emit_li_data(gen_t *g, int at, uint32_t data_off)
 {
+    if (g->arch == CC_ARCH_BC) {
+        bc_li_data(g, at, data_off);
+        return;
+    }
     if (g->arch == CC_ARCH_RV32) {
         rv_li_data(g, at, data_off);
         return;
@@ -2674,6 +2944,10 @@ static void emit_li_data(gen_t *g, int at, uint32_t data_off)
 
 static void emit_li_code(gen_t *g, int at, uint32_t code_off)
 {
+    if (g->arch == CC_ARCH_BC) {
+        bc_li_code(g, at, code_off);
+        return;
+    }
     if (g->arch == CC_ARCH_RV32) {
         rv_li_code(g, at, code_off);
         return;
@@ -2683,6 +2957,10 @@ static void emit_li_code(gen_t *g, int at, uint32_t code_off)
 
 static void emit_add_n(gen_t *g, int ar, int as, int at)
 {
+    if (g->arch == CC_ARCH_BC) {
+        bc_add_n(g, ar, as, at);
+        return;
+    }
     if (g->arch == CC_ARCH_RV32) {
         rv_add_n(g, ar, as, at);
         return;
@@ -2692,6 +2970,10 @@ static void emit_add_n(gen_t *g, int ar, int as, int at)
 
 static void emit_sub(gen_t *g, int ar, int as, int at)
 {
+    if (g->arch == CC_ARCH_BC) {
+        bc_sub(g, ar, as, at);
+        return;
+    }
     if (g->arch == CC_ARCH_RV32) {
         rv_sub(g, ar, as, at);
         return;
@@ -2701,6 +2983,10 @@ static void emit_sub(gen_t *g, int ar, int as, int at)
 
 static void emit_mull(gen_t *g, int ar, int as, int at)
 {
+    if (g->arch == CC_ARCH_BC) {
+        bc_mull(g, ar, as, at);
+        return;
+    }
     if (g->arch == CC_ARCH_RV32) {
         rv_mull(g, ar, as, at);
         return;
@@ -2710,6 +2996,10 @@ static void emit_mull(gen_t *g, int ar, int as, int at)
 
 static void emit_quos(gen_t *g, int ar, int as, int at)
 {
+    if (g->arch == CC_ARCH_BC) {
+        bc_quos(g, ar, as, at);
+        return;
+    }
     if (g->arch == CC_ARCH_RV32) {
         rv_quos(g, ar, as, at);
         return;
@@ -2719,6 +3009,10 @@ static void emit_quos(gen_t *g, int ar, int as, int at)
 
 static void emit_rems(gen_t *g, int ar, int as, int at)
 {
+    if (g->arch == CC_ARCH_BC) {
+        bc_rems(g, ar, as, at);
+        return;
+    }
     if (g->arch == CC_ARCH_RV32) {
         rv_rems(g, ar, as, at);
         return;
@@ -2728,6 +3022,10 @@ static void emit_rems(gen_t *g, int ar, int as, int at)
 
 static void emit_quou(gen_t *g, int ar, int as, int at)
 {
+    if (g->arch == CC_ARCH_BC) {
+        bc_quou(g, ar, as, at);
+        return;
+    }
     if (g->arch == CC_ARCH_RV32) {
         rv_quou(g, ar, as, at);
         return;
@@ -2737,6 +3035,10 @@ static void emit_quou(gen_t *g, int ar, int as, int at)
 
 static void emit_remu(gen_t *g, int ar, int as, int at)
 {
+    if (g->arch == CC_ARCH_BC) {
+        bc_remu(g, ar, as, at);
+        return;
+    }
     if (g->arch == CC_ARCH_RV32) {
         rv_remu(g, ar, as, at);
         return;
@@ -2746,6 +3048,10 @@ static void emit_remu(gen_t *g, int ar, int as, int at)
 
 static void emit_and(gen_t *g, int ar, int as, int at)
 {
+    if (g->arch == CC_ARCH_BC) {
+        bc_and(g, ar, as, at);
+        return;
+    }
     if (g->arch == CC_ARCH_RV32) {
         rv_and(g, ar, as, at);
         return;
@@ -2755,6 +3061,10 @@ static void emit_and(gen_t *g, int ar, int as, int at)
 
 static void emit_or(gen_t *g, int ar, int as, int at)
 {
+    if (g->arch == CC_ARCH_BC) {
+        bc_or(g, ar, as, at);
+        return;
+    }
     if (g->arch == CC_ARCH_RV32) {
         rv_or(g, ar, as, at);
         return;
@@ -2764,6 +3074,10 @@ static void emit_or(gen_t *g, int ar, int as, int at)
 
 static void emit_xor(gen_t *g, int ar, int as, int at)
 {
+    if (g->arch == CC_ARCH_BC) {
+        bc_xor(g, ar, as, at);
+        return;
+    }
     if (g->arch == CC_ARCH_RV32) {
         rv_xor(g, ar, as, at);
         return;
@@ -2773,6 +3087,10 @@ static void emit_xor(gen_t *g, int ar, int as, int at)
 
 static void emit_shl_rr(gen_t *g, int dst, int lhs, int amt)
 {
+    if (g->arch == CC_ARCH_BC) {
+        bc_shl_rr(g, dst, lhs, amt);
+        return;
+    }
     if (g->arch == CC_ARCH_RV32) {
         rv_shl_rr(g, dst, lhs, amt);
         return;
@@ -2782,6 +3100,10 @@ static void emit_shl_rr(gen_t *g, int dst, int lhs, int amt)
 
 static void emit_shr_rr(gen_t *g, int dst, int lhs, int amt, int uns)
 {
+    if (g->arch == CC_ARCH_BC) {
+        bc_shr_rr(g, dst, lhs, amt, uns);
+        return;
+    }
     if (g->arch == CC_ARCH_RV32) {
         rv_shr_rr(g, dst, lhs, amt, uns);
         return;
@@ -2791,6 +3113,10 @@ static void emit_shr_rr(gen_t *g, int dst, int lhs, int amt, int uns)
 
 static void emit_shl_i(gen_t *g, int dst, int src, int sa)
 {
+    if (g->arch == CC_ARCH_BC) {
+        bc_shl_i(g, dst, src, sa);
+        return;
+    }
     if (g->arch == CC_ARCH_RV32) {
         rv_shl_i(g, dst, src, sa);
         return;
@@ -2801,6 +3127,10 @@ static void emit_shl_i(gen_t *g, int dst, int src, int sa)
 /* May use register 9; see the body it dispatches to. */
 static void emit_shr_i(gen_t *g, int dst, int src, int sa, int uns)
 {
+    if (g->arch == CC_ARCH_BC) {
+        bc_shr_i(g, dst, src, sa, uns);
+        return;
+    }
     if (g->arch == CC_ARCH_RV32) {
         rv_shr_i(g, dst, src, sa, uns);
         return;
@@ -2810,6 +3140,10 @@ static void emit_shr_i(gen_t *g, int dst, int src, int sa, int uns)
 
 static void emit_l8ui(gen_t *g, int at, int as, int off)
 {
+    if (g->arch == CC_ARCH_BC) {
+        bc_l8ui(g, at, as, off);
+        return;
+    }
     if (g->arch == CC_ARCH_RV32) {
         rv_l8ui(g, at, as, off);
         return;
@@ -2819,6 +3153,10 @@ static void emit_l8ui(gen_t *g, int at, int as, int off)
 
 static void emit_s8i(gen_t *g, int at, int as, int off)
 {
+    if (g->arch == CC_ARCH_BC) {
+        bc_s8i(g, at, as, off);
+        return;
+    }
     if (g->arch == CC_ARCH_RV32) {
         rv_s8i(g, at, as, off);
         return;
@@ -2828,6 +3166,10 @@ static void emit_s8i(gen_t *g, int at, int as, int off)
 
 static void emit_l32i(gen_t *g, int at, int as, int off)
 {
+    if (g->arch == CC_ARCH_BC) {
+        bc_l32i(g, at, as, off);
+        return;
+    }
     if (g->arch == CC_ARCH_RV32) {
         rv_l32i(g, at, as, off);
         return;
@@ -2837,6 +3179,10 @@ static void emit_l32i(gen_t *g, int at, int as, int off)
 
 static void emit_s32i(gen_t *g, int at, int as, int off)
 {
+    if (g->arch == CC_ARCH_BC) {
+        bc_s32i(g, at, as, off);
+        return;
+    }
     if (g->arch == CC_ARCH_RV32) {
         rv_s32i(g, at, as, off);
         return;
@@ -2847,6 +3193,10 @@ static void emit_s32i(gen_t *g, int at, int as, int off)
 /* Call the address in a register.  The answer is in register 10 afterwards. */
 static void emit_call_reg(gen_t *g, int as)
 {
+    if (g->arch == CC_ARCH_BC) {
+        bc_call_reg(g, as);
+        return;
+    }
     if (g->arch == CC_ARCH_RV32) {
         rv_call_reg(g, as);
         return;
@@ -2856,6 +3206,10 @@ static void emit_call_reg(gen_t *g, int as)
 
 static void emit_j_to(gen_t *g, size_t from_off, size_t target_off)
 {
+    if (g->arch == CC_ARCH_BC) {
+        bc_j_to(g, from_off, target_off);
+        return;
+    }
     if (g->arch == CC_ARCH_RV32) {
         rv_j_to(g, from_off, target_off);
         return;
@@ -2865,6 +3219,10 @@ static void emit_j_to(gen_t *g, size_t from_off, size_t target_off)
 
 static void emit_j_placeholder(gen_t *g, size_t *site)
 {
+    if (g->arch == CC_ARCH_BC) {
+        bc_j_placeholder(g, site);
+        return;
+    }
     if (g->arch == CC_ARCH_RV32) {
         rv_j_placeholder(g, site);
         return;
@@ -2874,6 +3232,10 @@ static void emit_j_placeholder(gen_t *g, size_t *site)
 
 static void emit_b_placeholder(gen_t *g, int opn, int as, int at, size_t *site)
 {
+    if (g->arch == CC_ARCH_BC) {
+        bc_b_placeholder(g, opn, as, at, site);
+        return;
+    }
     if (g->arch == CC_ARCH_RV32) {
         rv_b_placeholder(g, opn, as, at, site);
         return;
@@ -2883,6 +3245,10 @@ static void emit_b_placeholder(gen_t *g, int opn, int as, int at, size_t *site)
 
 static void patch_b(gen_t *g, size_t site, size_t target)
 {
+    if (g->arch == CC_ARCH_BC) {
+        bc_patch_b(g, site, target);
+        return;
+    }
     if (g->arch == CC_ARCH_RV32) {
         rv_patch_b(g, site, target);
         return;
@@ -2893,6 +3259,10 @@ static void patch_b(gen_t *g, size_t site, size_t target)
 /* ar = (as < at), 0 or 1. */
 static void emit_setlt_cc(gen_t *g, int ar, int as, int at, int uns)
 {
+    if (g->arch == CC_ARCH_BC) {
+        bc_setlt_cc(g, ar, as, at, uns);
+        return;
+    }
     if (g->arch == CC_ARCH_RV32) {
         rv_setlt_cc(g, ar, as, at, uns);
         return;
@@ -3476,10 +3846,63 @@ static void rv_frame_size(gen_t *g, size_t site, int framesize)
     g->nret = 0;
 }
 
+/*
+ * And on the machine with no processor, where the frame is the interpreter's
+ * own store rather than a stack pointer: ENTER carries the size and the
+ * interpreter points register 7 at a block of that many bytes.  The size is
+ * patched the same way the other two patch theirs.
+ *
+ * `&local` therefore has to be a REAL address - a program hands it to ag_read
+ * and to ag_migrate_save like any other - so that block is ordinary memory and
+ * not an index into anything.
+ */
+static void bc_frame_open(gen_t *g)
+{
+    bc_byte(g, AG_BC_ENTER);
+    bc_u32(g, 0);
+}
+
+static void bc_frame_size(gen_t *g, size_t site, int framesize)
+{
+    bc_put_u32(g, site + 1u, (uint32_t)framesize);
+}
+
+static void bc_params_home(gen_t *g, int nparams)
+{
+    for (int i = 0; i < nparams && i < MAX_PARAMS; i++) {
+        const int reg = 10 + i; /* where the caller left them */
+        const int off = g->locals[i].off;
+        if (sym_access_size(&g->locals[i]) == 1) {
+            bc_s8i(g, reg, 7, off);
+        } else {
+            bc_s32i(g, reg, 7, off);
+        }
+    }
+}
+
+static void bc_return(gen_t *g, int have_value)
+{
+    if (have_value) {
+        bc_mov_n(g, 10, 8);
+    } else {
+        bc_movi(g, 10, 0);
+    }
+    bc_byte(g, AG_BC_RET);
+}
+
+static void bc_func_return(gen_t *g)
+{
+    bc_return(g, 0);
+}
+
 /* ---- the frame, at the seam --------------------------------------------- */
 
 static void emit_frame_open(gen_t *g)
 {
+    if (g->arch == CC_ARCH_BC) {
+        bc_frame_open(g);
+        return;
+    }
     if (g->arch == CC_ARCH_RV32) {
         rv_frame_open(g);
         return;
@@ -3489,6 +3912,10 @@ static void emit_frame_open(gen_t *g)
 
 static void emit_frame_size(gen_t *g, size_t site, int framesize)
 {
+    if (g->arch == CC_ARCH_BC) {
+        bc_frame_size(g, site, framesize);
+        return;
+    }
     if (g->arch == CC_ARCH_RV32) {
         rv_frame_size(g, site, framesize);
         return;
@@ -3498,6 +3925,10 @@ static void emit_frame_size(gen_t *g, size_t site, int framesize)
 
 static void emit_params_home(gen_t *g, int nparams)
 {
+    if (g->arch == CC_ARCH_BC) {
+        bc_params_home(g, nparams);
+        return;
+    }
     if (g->arch == CC_ARCH_RV32) {
         rv_params_home(g, nparams);
         return;
@@ -3508,6 +3939,10 @@ static void emit_params_home(gen_t *g, int nparams)
 /* Falling off the end of a function is `return 0`. */
 static void emit_func_return(gen_t *g)
 {
+    if (g->arch == CC_ARCH_BC) {
+        bc_func_return(g);
+        return;
+    }
     if (g->arch == CC_ARCH_RV32) {
         rv_func_return(g);
         return;
@@ -3517,6 +3952,10 @@ static void emit_func_return(gen_t *g)
 
 static void emit_return(gen_t *g, int have_value)
 {
+    if (g->arch == CC_ARCH_BC) {
+        bc_return(g, have_value);
+        return;
+    }
     if (g->arch == CC_ARCH_RV32) {
         rv_return(g, have_value);
         return;
@@ -6096,7 +6535,8 @@ int cc_compile_to_axe_for(const char *src, size_t src_len,
         cpy_err(out->err, sizeof(out->err), "null source");
         return -1;
     }
-    if (arch != CC_ARCH_XTENSA && arch != CC_ARCH_RV32) {
+    if (arch != CC_ARCH_XTENSA && arch != CC_ARCH_RV32 &&
+        arch != CC_ARCH_BC) {
         cpy_err(out->err, sizeof(out->err), "unknown architecture");
         return -1;
     }

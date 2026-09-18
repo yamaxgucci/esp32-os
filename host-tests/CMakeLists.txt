@@ -163,6 +163,7 @@ target_include_directories(argon_tests BEFORE PRIVATE
     "${ARGON_ROOT}/tools/host_stub")
 target_include_directories(argon_tests PRIVATE
     "${ARGON_ROOT}/tools"
+    "${ARGON_ROOT}/apps/common/agvm"
     ${ARGON_INCLUDES}
     "${ARGON_ROOT}/apps/common/ir"
     "${ARGON_ROOT}/apps/common")
@@ -195,6 +196,7 @@ add_executable(cchost
 
 target_include_directories(cchost PRIVATE
     "${ARGON_ROOT}/apps/cc"
+    "${ARGON_ROOT}/apps/common/agvm"
     ${ARGON_INCLUDES})
 
 target_compile_definitions(cchost PRIVATE AG_HOST=1)

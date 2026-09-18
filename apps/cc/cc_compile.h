@@ -165,7 +165,11 @@ extern "C" {
  */
 typedef enum {
     CC_ARCH_XTENSA = 1,
-    CC_ARCH_RV32 = 2
+    CC_ARCH_RV32 = 2,
+    /* The machine with no processor - see apps/common/agvm/ag_bc.h.  It is an
+     * arch like the others because an image is an image: same header, same
+     * name and version, same way of saying what it needs. */
+    CC_ARCH_BC = 3
 } cc_arch_t;
 
 #if defined(__riscv)

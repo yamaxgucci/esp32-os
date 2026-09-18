@@ -12,6 +12,7 @@
  *   build-host/cchost in.c -              compile, write nothing, report size
  *   build-host/cchost in.c out.axe -v     and print the header
  *   build-host/cchost in.c out.axe -riscv for the other machine
+ *   build-host/cchost in.c out.bc  -bc    for the one with no processor
  *   build-host/cchost in.c out.bin -code  just the code part, to disassemble
  *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
@@ -112,6 +113,8 @@ int main(int argc, char **argv)
             arch = CC_ARCH_RV32;
         } else if (strcmp(argv[i], "-xtensa") == 0) {
             arch = CC_ARCH_XTENSA;
+        } else if (strcmp(argv[i], "-bc") == 0) {
+            arch = CC_ARCH_BC;
         } else if (strcmp(argv[i], "-code") == 0) {
             /* The code part alone, so a real disassembler can be pointed at
              * it: objdump -D -b binary -m riscv:rv32 is the only independent

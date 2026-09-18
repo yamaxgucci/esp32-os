@@ -287,8 +287,28 @@
     { "out": "XPT2046.SYS", "group": "board", "src": ["apps/xpt2046/xpt2046.c"] },
 
     {
+      "out": "AGVM.AXE", "group": "core",
+      "_note": "The machine with no processor - the cascade's third rung.  It runs a .bc image, which is one file every board can execute, at five to fifty times the cost of native code.  Small because it knows no builtins: a bytecode program reaches the ABI the same way a native one does, so the interpreter only has to be able to call an ordinary function address.",
+      "include": ["apps/common/agvm"],
+      "src": ["apps/agvm/agvm.c"]
+    },
+    {
+      "out": "AGVMRV.AXE", "group": "board",
+      "_note": "The same interpreter for RISC-V.  The INTERPRETER is native code and therefore per-machine; the images it runs are not, which is the whole point.",
+      "arch": "riscv32", "gcc": "riscv32-esp-elf-gcc",
+      "include": ["apps/common/agvm"],
+      "src": ["apps/agvm/agvm.c"]
+    },
+    {
+      "out": "AGVM32.AXE", "group": "board",
+      "_note": "And for an LX6 - the CYD.",
+      "gcc": "xtensa-esp32-elf-gcc",
+      "include": ["apps/common/agvm"],
+      "src": ["apps/agvm/agvm.c"]
+    },
+    {
       "out": "CC.AXE", "group": "core",
-      "include": ["apps/cc"],
+      "include": ["apps/cc", "apps/common/agvm"],
       "src": ["apps/cc/cc_main.c", "apps/cc/cc_compile.c"]
     },
     {
