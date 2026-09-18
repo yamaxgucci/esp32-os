@@ -529,7 +529,7 @@ try {
             # being echoed, so a plain search for the command text fails while
             # the command is sitting there perfectly.  That false alarm is not
             # harmless - see above.
-            $since = $since -replace "`e\[[0-9;]*[A-Za-z]", ''
+            $since = $since -replace "$([char]27)\[[0-9;]*[A-Za-z]", ''
             if ($since.Contains($Line)) { return }
         }
 
@@ -709,6 +709,16 @@ try {
             }
             $seen = Read-Available
         }
+        # SAID OUT LOUD, so a second guest can wait for it.
+        #
+        # A pair starts B first and A half a second later, and each delivers
+        # its own files - but a transfer that had to be retried costs about two
+        # minutes, and then A is sending into a node whose receiver has not
+        # started.  Two checks reported a dead wire that way today and once
+        # before.  Invoke-Pair waits for this line rather than for a number of
+        # seconds; see tools\nodetest.ps1.
+        Write-Host '--- deliveries done ---'
+
     }
 
     if ($found -and $Send.Count -gt 0) {

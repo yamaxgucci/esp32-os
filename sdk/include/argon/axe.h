@@ -72,6 +72,20 @@ typedef enum {
     AG_ARCH_NONE = 0,
     AG_ARCH_XTENSA = 1,  /* ESP32, S2, S3          */
     AG_ARCH_RISCV32 = 2, /* C3, C6, H2, P4         */
+    /*
+     * And one that is not a processor: portable bytecode, run by AGVM.AXE.
+     * The cascade's third rung - one image every board can execute, at five to
+     * fifty times the cost.  It is an arch like the others because an image is
+     * an image: same header, same name and version, same way of saying what it
+     * needs.  ag_axe_native_arch() never answers this, so everything that asks
+     * "can I run this" keeps its old answer, and the one place that knows
+     * better is the spawn - see via_interpreter in proc.c.
+     *
+     * The instruction set itself is apps/common/agvm/ag_bc.h, which repeats
+     * this number for the compiler's sake; host-tests/test_cc.c asserts they
+     * agree.
+     */
+    AG_ARCH_BC = 3,
 } ag_axe_arch_t;
 
 /*

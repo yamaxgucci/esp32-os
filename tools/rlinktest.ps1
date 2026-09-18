@@ -49,7 +49,7 @@ function Note {
 function Transcript {
     param([string]$Path)
     $raw = Get-Content -LiteralPath $Path -Raw -Encoding UTF8
-    return ($raw -replace "`e\[[0-9;]*[A-Za-z]", "`n")
+    return ($raw -replace "$([char]27)\[[0-9;]*[A-Za-z]", "`n")
 }
 
 function Check {

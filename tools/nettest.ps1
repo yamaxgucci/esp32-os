@@ -61,7 +61,21 @@ function Note {
 function Transcript {
     param([string]$Path)
     $raw = Get-Content -LiteralPath $Path -Raw -Encoding UTF8
-    return ($raw -replace "`e\[[0-9;]*[A-Za-z]", "`n")
+    # `[char]27` and not `` `e ``.
+    #
+    # THIS DID NOT WORK FOR MONTHS AND NOTHING SAID SO.  In Windows PowerShell 5.1
+    # the escape `` `e `` is not ESC - that spelling arrived in PowerShell 6 - so
+    # the pattern below was the LETTER e followed by a bracket, which matches
+    # almost nothing.  The escape sequences stayed in the transcript, and every
+    # check in every one of these scripts has been searching text with
+    # "\x1b[23;1H" sitting in the middle of it.
+    #
+    # What that hides is a phrase that happens to be interrupted: the console
+    # wraps at eighty columns and paints the next row with a cursor move, so
+    # "/sys/unsigned.bc" arrives as "/sys/unsig", ESC, "[23;1H", "ned.bc".  A check
+    # for the whole phrase then fails while the board is doing exactly the right
+    # thing - which is how this was found.
+    return ($raw -replace "$([char]27)\[[0-9;]*[A-Za-z]", "`n")
 }
 
 function Check {

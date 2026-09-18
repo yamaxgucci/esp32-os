@@ -31,7 +31,22 @@
 
 #include "ag_bc.h"
 
-AG_APP_SIZED("AGVM", "1.0", "argon", 0, 8 * 1024, 96 * 1024);
+/*
+ * WHAT THIS ASKS FOR, and why it is not a round number with a margin.
+ *
+ * The first draft wanted 96 KB of heap because that was cheap on an S3.  On a
+ * C3 with a wire driver already resident the largest free block was 73 KB, and
+ * the cascade got all the way to the end - the far node refused the foreign
+ * image, found the portable build, and the kernel sent it here - only for this
+ * to be refused for memory.  A program that asks for room it does not need
+ * fails in the one place where the answer was otherwise correct.
+ *
+ * What it actually needs: the bytecode file, the program's data part, the
+ * frame store below, and about two kilobytes for its own state.  The file is
+ * read into a buffer that GROWS rather than one sized for the largest
+ * imaginable image, so a two-kilobyte program costs two kilobytes.
+ */
+AG_APP_SIZED("AGVM", "1.0", "argon", 0, 8 * 1024, 48 * 1024);
 
 /*
  * The frame store, and why it is one block taken up front.
@@ -41,11 +56,15 @@ AG_APP_SIZED("AGVM", "1.0", "argon", 0, 8 * 1024, 96 * 1024);
  * memory rather than an index into something.  One allocation rather than one
  * per call because a call has to cost an increment, not a trip to the heap.
  */
-#define VM_FRAME_BYTES (16u * 1024u)
+#define VM_FRAME_BYTES (8u * 1024u)
+
+/* The largest bytecode image this will read.  A ceiling rather than an
+ * allocation: the buffer below grows to what the file needs and no further. */
+#define VM_FILE_MAX (32u * 1024u)
 
 /* Nested calls.  Deeper than any program this rung is for, and bounded because
  * a runaway recursion must say so rather than walk off the end of an array. */
-#define VM_DEPTH 192
+#define VM_DEPTH 128
 
 typedef struct {
     uint32_t pc;  /* where the caller carries on            */
@@ -377,7 +396,13 @@ static uint8_t *read_all(const char *path, uint32_t *out_len)
         ag_printf("agvm: open %s: %s\n", path, ag_strerror(h));
         return NULL;
     }
-    uint32_t cap = 64u * 1024u;
+    /*
+     * Grown rather than guessed.  There is no seek in the application ABI - it
+     * is int64 and every value here is a word - so the size is not knowable
+     * before reading; doubling costs one copy per doubling and leaves a small
+     * program paying for a small program.
+     */
+    uint32_t cap = 4u * 1024u;
     uint8_t *buf = (uint8_t *)ag_malloc(cap);
     if (buf == NULL) {
         ag_close(h);
@@ -387,11 +412,23 @@ static uint8_t *read_all(const char *path, uint32_t *out_len)
     uint32_t n = 0;
     for (;;) {
         if (n == cap) {
-            ag_close(h);
-            ag_free(buf);
-            ag_printf("agvm: %s is larger than %u bytes\n", path,
-                      (unsigned)cap);
-            return NULL;
+            if (cap >= VM_FILE_MAX) {
+                ag_close(h);
+                ag_free(buf);
+                ag_printf("agvm: %s is larger than %u bytes\n", path,
+                          (unsigned)VM_FILE_MAX);
+                return NULL;
+            }
+            uint8_t *bigger = (uint8_t *)ag_realloc(buf, cap * 2u);
+            if (bigger == NULL) {
+                ag_close(h);
+                ag_free(buf);
+                ag_printf("agvm: no room for %s past %u bytes\n", path,
+                          (unsigned)cap);
+                return NULL;
+            }
+            buf = bigger;
+            cap *= 2u;
         }
         const int32_t got = ag_read(h, buf + n, cap - n);
         if (got < 0) {

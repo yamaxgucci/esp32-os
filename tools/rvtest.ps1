@@ -57,7 +57,7 @@ function Transcript {
     param([string]$Path)
     if (-not (Test-Path -LiteralPath $Path)) { return '' }
     $raw = Get-Content -LiteralPath $Path -Raw -Encoding UTF8
-    return ($raw -replace "`e\[[0-9;]*[A-Za-z]", "`n")
+    return ($raw -replace "$([char]27)\[[0-9;]*[A-Za-z]", "`n")
 }
 
 function Check {

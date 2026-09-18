@@ -43,7 +43,7 @@
 # Exit code 0 means every check passed.
 [CmdletBinding()]
 param(
-    [int]$TimeoutSec = 300,
+    [int]$TimeoutSec = 420,
     [int]$SendDelaySec = 25,
     # Use what is already built and banked.  For iterating; a green run of that
     # is not a green run of this.
@@ -75,7 +75,7 @@ function Transcript {
     param([string]$Path)
     if (-not (Test-Path -LiteralPath $Path)) { return '' }
     $raw = Get-Content -LiteralPath $Path -Raw -Encoding UTF8
-    return ($raw -replace "`e\[[0-9;]*[A-Za-z]", "`n")
+    return ($raw -replace "$([char]27)\[[0-9;]*[A-Za-z]", "`n")
 }
 
 # The console is 80 columns and a sentence that crosses the edge arrives split
@@ -91,6 +91,20 @@ function Check {
     $f = Flat $Text
     Note ($f.Contains($Needle)) $Name `
         $(if (-not $f.Contains($Needle)) { "no '$Needle'" })
+}
+
+# For a phrase that contains a PATH.
+#
+# Flattening rescues a sentence broken at a space; it does not rescue a word
+# broken in the middle, which is what the eightieth column does to
+# "/sys/unsigned.bc" - the break becomes a space and the phrase is no longer
+# there.  So this one compares with every space removed from both sides, which
+# is safe for a path and would not be for prose.
+function CheckTight {
+    param([string]$Text, [string]$Needle, [string]$Name)
+    $t = ($Text -replace '\s+', '')
+    $n = ($Needle -replace '\s+', '')
+    Note ($t.Contains($n)) $Name $(if (-not $t.Contains($n)) { "no '$Needle'" })
 }
 
 function Set-Target {
@@ -130,11 +144,31 @@ if (-not (Test-Path $flashB)) {
 
 # Every image is arch-tagged in tools\apps.json, so these build whatever the
 # firmware target happens to be.
-$only = @('NODELINK.SYS', 'NODELNRV.SYS', 'NODEHI.AXE', 'NODEHIRV.AXE')
+$only = @('NODELINK.SYS', 'NODELNRV.SYS', 'NODEHI.AXE', 'NODEHIRV.AXE',
+          'AGVMRV.AXE')
 & python (Join-Path $PSScriptRoot 'build_apps.py') --only @only | Out-Null
 foreach ($img in $only) {
     if (-not (Test-Path "build\apps\$img")) { throw "$img did not build." }
 }
+
+# THE THIRD RUNG NEEDS A PROGRAM THAT EXISTS TWICE AND NOT THREE TIMES:
+# as an Xtensa image, which is what node A asks for, and as BYTECODE on node B
+# - and NOT as a RISC-V build, or rung one would answer first and rung three
+# would never be reached.  unsigned.c is the one to use because its seven
+# answers are the ones where signedness changes the answer, so "it ran" and "it
+# ran correctly" are the same check.
+if (-not (Test-Path 'build-host\cchost.exe')) {
+    cmake -S host-tests -B build-host -G Ninja | Out-Null
+    cmake --build build-host --target cchost | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'cchost did not build.' }
+}
+New-Item -ItemType Directory -Force -Path $bank | Out-Null
+& '.\build-host\cchost.exe' 'apps\cc\examples\unsigned.c' `
+    (Join-Path $bank 'xt-unsigned.axe') -xtensa | Out-Null
+if ($LASTEXITCODE -ne 0) { throw 'cchost could not compile unsigned.c.' }
+& '.\build-host\cchost.exe' 'apps\cc\examples\unsigned.c' `
+    (Join-Path $bank 'bc-unsigned.bc') -bc | Out-Null
+if ($LASTEXITCODE -ne 0) { throw 'cchost could not compile unsigned.c to bytecode.' }
 
 Stop-Emulators
 Start-Sleep -Milliseconds 500
@@ -146,117 +180,130 @@ Start-Sleep -Milliseconds 500
 # tools\nodetest.ps1; the difference here is that the two guests are two
 # different machines, so B carries its own -Chip and a flash image built before
 # the target moved on.
+#
+# TWO SESSIONS RATHER THAN ONE, and that is not tidiness - it is a defect
+# written down.  ON THIS PAIR, A NODE SERVES EXACTLY ONE REMOTE RUN.  The
+# second one that any session asks for is never received: node A retransmits
+# the request 215 times with its timer backed off from a measured 10 ms round
+# trip to the 2 s ceiling, and node B's counters do not move at all - "0 gaps,
+# 0 duplicates, 0 bad" and its "bytes in" unchanged, so the frame is not
+# arriving rather than being rejected.  Sixty seconds later the asking node
+# reports -60.
+#
+# It is not the bytecode: the same second request fails with the same native
+# image that succeeded as the first.  It is not this pair being emulated in
+# general either: nodetest's own pair of two S3s does a dozen remote things in
+# one session and passes.  Unexplained, and on the C3 side; written up in
+# docs/plans/cluster.md.
+#
+# So each claim gets a session of its own, in which it is the FIRST remote run.
+# That is not hiding the fault - it is the only way to test anything else while
+# it stands.
 
-$runner = 'build\xclutest-b.ps1'
-$lines = @("Set-Location '$root'",
-           "& '$(Join-Path $PSScriptRoot 'qemu-boot.ps1')' ``")
-$lines += "    -Port 5586 -TimeoutSec $TimeoutSec -NoNet ``"
-$lines += "    -LinkPort $linkPort -LinkListen -Chip 'esp32c3' ``"
-$lines += "    -Flash '$flashB' -FlashAsIs -KeepOtherEmulators ``"
-$lines += "    -Tag 'b-xclu' -LogPath 'build\xclutest-b.log' ``"
-# NODEHIRV GOES ON C:, and that is not a preference.
-#
-# ag_loader_find_by_name searches /sys - the internal flash, which is C: - and
-# nowhere else, because that is where a board keeps the images it can run.  Put
-# on T: it is invisible to the substitution and the far node answers "no build
-# of that program here", which is true and reads like the cascade is broken.
-#
-# The two foreign images stay on T:, which is a RAM disk and the right place
-# for something that is only there to be refused.
-$lines += ("    -Put @('build\apps\NODELNRV.SYS=t:\nodelnrv.sys'," +
-           "'build\apps\NODEHIRV.AXE=c:\nodehirv.axe'," +
-           "'build\apps\NODEHI.AXE=t:\nodehi.axe'," +
-           "'build\apps\NODEHI.AXE=t:\xeno.axe') ``")
-$lines += ("    -Send @('drv load t:\nodelnrv.sys'," +
-           "'link name c3'," +
-           "'link use node0'," +
-           # An image for the other processor, run where it cannot run.  Before
-           # anything else, so its refusal is in the journal by the time the
-           # far node starts asking for things.
-           "'run t:\nodehi.axe'," +
-           "'log -n 14'," +
-           # And then hold the shell while A does its half.  The serving
-           # happens on the link's own reader task regardless; this only keeps
-           # the guest alive, because qemu-boot stops an emulator once its
-           # command list is done and a node that has gone looks exactly like
-           # one that never answered.
-           # SIX SHORT POLLS RATHER THAN ONE LONG ONE, and the reason is
-           # what a transcript is worth: a single `link poll 115000` prints
-           # nothing for two minutes, so a node that stopped at second twenty
-           # and a node that was working throughout leave the SAME
-           # transcript.  Each of these returns a prompt, which is a
-           # heartbeat.
-           "'link poll 20000','link poll 20000','link poll 20000'," +
-           "'link poll 20000','link poll 20000','link poll 20000'," +
-           # The frame counters, so that a failure carries its own evidence:
-           # whether something arrived and was thrown away, or never arrived.
-           "'link'," +
-           # AND THE JOURNAL AFTERWARDS, which is the only place the far
-           # node's side of a remote run is written down: the program it
-           # substituted, or the reason it could not.  Without this the
-           # evidence for the one thing this scenario exists to show is on the
-           # asking node only, as a number.
-           "'log -n 40')")
-$lines += 'exit $LASTEXITCODE'
-Set-Content -Path $runner -Value $lines -Encoding ascii
+function Invoke-XPair {
+    param(
+        [string]$Tag,
+        [string[]]$PutB,
+        [string[]]$SendB,
+        [string[]]$PutA,
+        [string[]]$SendA
+    )
+    $runner = "build\xclutest-$Tag-b.ps1"
+    $q = { param($a) '@(' + (($a | ForEach-Object { "'$_'" }) -join ',') + ')' }
+    $lines = @("Set-Location '$root'",
+               "& '$(Join-Path $PSScriptRoot 'qemu-boot.ps1')' ``")
+    $lines += "    -Port 5586 -TimeoutSec $TimeoutSec -NoNet ``"
+    $lines += "    -LinkPort $linkPort -LinkListen -Chip 'esp32c3' ``"
+    $lines += "    -Flash '$flashB' -FlashAsIs -KeepOtherEmulators ``"
+    $lines += "    -Tag 'b-$Tag' -LogPath 'build\xclutest-$Tag-b.log' ``"
+    $lines += "    -Put $(& $q $PutB) ``"
+    $lines += "    -Send $(& $q $SendB)"
+    $lines += 'exit $LASTEXITCODE'
+    Set-Content -Path $runner -Value $lines -Encoding ascii
+
+    $procB = Start-Process -FilePath 'powershell' -PassThru -NoNewWindow `
+        -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass',
+                        '-File', ('"{0}"' -f (Join-Path (Get-Location) $runner))) `
+        -RedirectStandardOutput "build\xclutest-$Tag-b.out" `
+        -RedirectStandardError "build\xclutest-$Tag-b.err"
+    Start-Sleep -Milliseconds 500
+    if ($procB.HasExited) {
+        throw ("node B exited at once (code $($procB.ExitCode)); " +
+               "see build\xclutest-$Tag-b.err")
+    }
+
+    try {
+        & (Join-Path $PSScriptRoot 'qemu-boot.ps1') -Port 5576 `
+            -TimeoutSec $TimeoutSec -LinkPort $linkPort -KeepOtherEmulators `
+            -Flash "build\qemu_flash_xclu_a.bin" `
+            -Tag "a-$Tag" -LogPath "build\xclutest-$Tag-a.log" `
+            -Put $PutA -Send $SendA | Out-Null
+    } finally {
+        if (-not $procB.WaitForExit($TimeoutSec * 2000)) {
+            Write-Host 'node B did not finish; stopping it.' -ForegroundColor Yellow
+            Stop-Process -Id $procB.Id -Force -ErrorAction SilentlyContinue
+        }
+        if ((Test-Path "build\xclutest-$Tag-b.err") -and
+            (Get-Item "build\xclutest-$Tag-b.err").Length -gt 0) {
+            Write-Host "--- build\xclutest-$Tag-b.err ---" -ForegroundColor DarkGray
+            Get-Content "build\xclutest-$Tag-b.err" | Select-Object -Last 12 |
+                Out-Host
+        }
+        Stop-Emulators
+        Start-Sleep -Milliseconds 500
+    }
+}
+
+# The polls that hold node B's shell open while A does its half.  SIX SHORT
+# ONES rather than one long one, and the reason is what a transcript is worth:
+# a single `link poll 120000` prints nothing for two minutes, so a node that
+# stopped at second twenty and a node that worked throughout leave the same
+# transcript.  Each of these returns a prompt, which is a heartbeat.  Then the
+# frame counters and the journal, so that a failure carries its own evidence.
+$hold = @('link poll 20000', 'link poll 20000', 'link poll 20000',
+          'link poll 20000', 'link poll 20000', 'link poll 20000',
+          'link', 'log -n 40')
+
+# ---- 1. the line, and the line crossed by identity ------------------------
 
 Write-Host "`n== an Xtensa node and a RISC-V node, one cluster ==" `
     -ForegroundColor Cyan
 
-$procB = Start-Process -FilePath 'powershell' -PassThru -NoNewWindow `
-    -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass',
-                    '-File', ('"{0}"' -f (Join-Path (Get-Location) $runner))) `
-    -RedirectStandardOutput 'build\xclutest-b.out' `
-    -RedirectStandardError 'build\xclutest-b.err'
-Start-Sleep -Milliseconds 500
-if ($procB.HasExited) {
-    throw ("node B exited at once (code $($procB.ExitCode)); " +
-           "see build\xclutest-b.err")
-}
+# NODEHIRV GOES ON C:, and that is not a preference.  ag_loader_find_by_name
+# searches /sys - the internal flash, which is C: - and nowhere else, because
+# that is where a board keeps the images it can run.  Put on T: it is invisible
+# to the substitution and the far node answers "no build of that program here",
+# which is true and reads like the cascade is broken.
+Invoke-XPair -Tag 'run' `
+    -PutB @('build\apps\NODELNRV.SYS=t:\nodelnrv.sys',
+            'build\apps\NODEHIRV.AXE=c:\nodehirv.axe',
+            'build\apps\NODEHI.AXE=t:\nodehi.axe',
+            'build\apps\NODEHI.AXE=t:\xeno.axe') `
+    -SendB (@('drv load t:\nodelnrv.sys',
+              'link name c3',
+              'link use node0',
+              # An image for the other processor, run where it cannot run.
+              'run t:\nodehi.axe',
+              'log -n 14') + $hold) `
+    -PutA @('build\apps\NODELINK.SYS=t:\nodelink.sys') `
+    -SendA @('drv load t:\nodelink.sys',
+             'link name s3',
+             'link use node0',
+             "!powershell -NoProfile -Command Start-Sleep -Seconds $SendDelaySec",
+             'link nodes',
+             '=cores in all',
+             # THE FAR END, ASKED SOMETHING IT CANNOT ANSWER FROM MEMORY.
+             # `link nodes` prints what the hello exchange left behind and
+             # would look the same if the wire had died since.
+             'link devs',
+             '=are in this registry now',
+             # A IS NOT GIVEN THIS FILE.  Placement sends the run to whichever
+             # node has it, which is B - and B cannot execute it.
+             'run t:\xeno.axe',
+             '=nodehi: here')
 
-try {
-    & (Join-Path $PSScriptRoot 'qemu-boot.ps1') -Port 5576 `
-        -TimeoutSec $TimeoutSec -LinkPort $linkPort -KeepOtherEmulators `
-        -Flash 'build\qemu_flash_xclu_a.bin' `
-        -Tag 'a-xclu' -LogPath 'build\xclutest-a.log' `
-        -Put @('build\apps\NODELINK.SYS=t:\nodelink.sys') `
-        -Send @('drv load t:\nodelink.sys',
-                'link name s3',
-                'link use node0',
-                "!powershell -NoProfile -Command Start-Sleep -Seconds $SendDelaySec",
-                'link nodes',
-                '=cores in all',
-                # THE FAR END, ASKED SOMETHING IT CANNOT ANSWER FROM MEMORY.
-                #
-                # `link nodes` prints what the hello exchange left behind, and
-                # would look exactly the same if the wire had died since.
-                # Pulling the neighbour's device registry is a round trip NOW,
-                # so a failure below this line is about the run path rather
-                # than about the wire - which is a distinction this scenario
-                # had to make once already.
-                'link devs',
-                '=are in this registry now',
-
-                # A IS NOT GIVEN THIS FILE.  Placement sends the run to
-                # whichever node has it, which is B - and B cannot execute it.
-                'run t:\xeno.axe',
-                '=nodehi: here') | Out-Null
-} finally {
-    if (-not $procB.WaitForExit($TimeoutSec * 2000)) {
-        Write-Host 'node B did not finish; stopping it.' -ForegroundColor Yellow
-        Stop-Process -Id $procB.Id -Force -ErrorAction SilentlyContinue
-    }
-    if ((Test-Path 'build\xclutest-b.err') -and
-        (Get-Item 'build\xclutest-b.err').Length -gt 0) {
-        Write-Host '--- build\xclutest-b.err ---' -ForegroundColor DarkGray
-        Get-Content 'build\xclutest-b.err' | Select-Object -Last 12 | Out-Host
-    }
-    Stop-Emulators
-    Start-Sleep -Milliseconds 500
-}
-
-$a = Transcript 'build\xclutest-a.log'
-$b = Transcript 'build\xclutest-b.log'
+$a = Transcript 'build\xclutest-run-a.log'
+$b = Transcript 'build\xclutest-run-b.log'
 
 # ------------------------------------------------------------- the checks ---
 
@@ -293,6 +340,57 @@ Check $a 'nodehi: here' 'xclu-far-node-ran-its-own-build'
 # the run came to nothing.
 Note (-not (Flat $a).Contains('did not run there either')) `
     'xclu-asker-was-not-told-it-failed'
+
+# ---- 2. and the rung below that, in a session of its own ------------------
+#
+# The far node cannot execute the image it was handed AND has no build of its
+# own it can execute either.  What it has is the portable one, and that is the
+# whole of the third rung: it runs, and the answers come back.
+#
+# A SEPARATE SESSION because of the one-remote-run fault written up at the top
+# of this file.  unsigned.c is the program to use: its seven answers are the
+# ones where signedness changes the result, so "it ran" and "it ran correctly"
+# are the same check.
+
+Write-Host "`n== a node that can neither run it nor build it ==" `
+    -ForegroundColor Cyan
+
+Invoke-XPair -Tag 'bc' `
+    -PutB @('build\apps\NODELNRV.SYS=t:\nodelnrv.sys',
+            'build\apps\AGVMRV.AXE=c:\agvm.axe',
+            "$bank\bc-unsigned.bc=c:\unsigned.bc",
+            "$bank\xt-unsigned.axe=t:\xeno2.axe") `
+    -SendB (@('drv load t:\nodelnrv.sys',
+              'link name c3',
+              'link use node0') + $hold) `
+    -PutA @('build\apps\NODELINK.SYS=t:\nodelink.sys') `
+    -SendA @('drv load t:\nodelink.sys',
+             'link name s3',
+             'link use node0',
+             "!powershell -NoProfile -Command Start-Sleep -Seconds $SendDelaySec",
+             'link nodes',
+             '=cores in all',
+             'run t:\xeno2.axe',
+             '=shr20')
+
+$a2 = Transcript 'build\xclutest-bc-a.log'
+$b2 = Transcript 'build\xclutest-bc-b.log'
+
+# Its own words for the choice, not the file transfer: "running my own
+# /sys/unsigned.bc".  The first draft of this check looked for the name alone
+# and passed on the line where the file was DELIVERED, which proved nothing.
+CheckTight $b2 'running my own /sys/unsigned.bc' `
+    'xclu-bc-far-node-chose-the-portable-build'
+# On the ASKING node, because that is where the far node's loader line arrives
+# along with everything else the program said.
+Check $a2 'AGVM: riscv32' 'xclu-bc-interpreter-loaded-there'
+# The seven where signedness changes the answer, so "it ran" and "it ran
+# correctly" are one check.  On the ASKING node, because that is where the far
+# node's output has to arrive for any of this to be worth anything.
+foreach ($k in @('shr 08000000', 'shr_s f8000000', 'div 55555555',
+                 'rem 5', 'gt yes', 'gt_s no', 'shr20 00000800')) {
+    Check $a2 $k ('xclu-bc-' + ($k -replace '\s+', '-'))
+}
 
 $failed = @($results | Where-Object { $_ -like 'FAIL *' })
 Write-Host ''

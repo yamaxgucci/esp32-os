@@ -1117,6 +1117,19 @@ ag_err_t ag_loader_find_by_name(const char *want, char *out, size_t cap)
     }
 
     ag_err_t found = -AG_ENOENT;
+    /*
+     * A bytecode build of the same program, kept aside in case there is no
+     * native one.  That is the cascade's third rung and it costs this much:
+     * the second-best answer is remembered while the best one is looked for,
+     * and only used if the search ends without it.
+     *
+     * Second-best on purpose.  Bytecode runs five to fifty times slower, so a
+     * board that has its own build must never be given the portable one -
+     * which is exactly what would happen if this took the first match.
+     */
+    char     bc[AG_PATH_MAX];
+    bool     have_bc = false;
+
     for (;;) {
         ag_dirent_t e;
         if (ag_vfs_readdir(d, &e) != AG_OK) {
@@ -1132,25 +1145,39 @@ ag_err_t ag_loader_find_by_name(const char *want, char *out, size_t cap)
         }
 
         ag_axe_header_t h;
-        if (ag_loader_peek(path, "/sys", &h) != AG_OK) {
-            continue; /* not an image, or not a readable one */
-        }
+        const ag_err_t  pk = ag_loader_peek(path, "/sys", &h);
         /*
-         * Executable HERE.  An image of the other instruction set is exactly
-         * what sent us looking, so accepting one would be a loop.
+         * -AG_ENOTSUP is "read and understood, not for this machine", which is
+         * what a bytecode image always answers - ag_axe_native_arch() is never
+         * AG_ARCH_BC.  Anything else that cannot be read is not an image.
          */
-        if ((ag_axe_arch_t)h.arch != ag_axe_native_arch()) {
+        if (pk != AG_OK && pk != -AG_ENOTSUP) {
             continue;
         }
         if (ag_path_icmp(h.name, want) != 0) {
             continue;
         }
 
-        ag_strlcpy(out, path, cap);
-        found = AG_OK;
-        break;
+        if ((ag_axe_arch_t)h.arch == ag_axe_native_arch()) {
+            ag_strlcpy(out, path, cap);
+            found = AG_OK;
+            break;
+        }
+        if ((ag_axe_arch_t)h.arch == AG_ARCH_BC && !have_bc) {
+            ag_strlcpy(bc, path, sizeof(bc));
+            have_bc = true;
+        }
+        /*
+         * And anything else is an image of the OTHER instruction set, which is
+         * exactly what sent us looking: taking one would be a loop.
+         */
     }
     ag_vfs_closedir(d);
+
+    if (found != AG_OK && have_bc) {
+        ag_strlcpy(out, bc, cap);
+        found = AG_OK;
+    }
     return found;
 }
 

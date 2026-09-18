@@ -96,7 +96,21 @@ function Transcript {
     param([string]$Path)
     if (-not (Test-Path -LiteralPath $Path)) { return '' }
     $raw = Get-Content -LiteralPath $Path -Raw -Encoding UTF8
-    return ($raw -replace "`e\[[0-9;]*[A-Za-z]", "`n")
+    # `[char]27` and not `` `e ``.
+    #
+    # THIS DID NOT WORK FOR MONTHS AND NOTHING SAID SO.  In Windows PowerShell 5.1
+    # the escape `` `e `` is not ESC - that spelling arrived in PowerShell 6 - so
+    # the pattern below was the LETTER e followed by a bracket, which matches
+    # almost nothing.  The escape sequences stayed in the transcript, and every
+    # check in every one of these scripts has been searching text with
+    # "\x1b[23;1H" sitting in the middle of it.
+    #
+    # What that hides is a phrase that happens to be interrupted: the console
+    # wraps at eighty columns and paints the next row with a cursor move, so
+    # "/sys/unsigned.bc" arrives as "/sys/unsig", ESC, "[23;1H", "ned.bc".  A check
+    # for the whole phrase then fails while the board is doing exactly the right
+    # thing - which is how this was found.
+    return ($raw -replace "$([char]27)\[[0-9;]*[A-Za-z]", "`n")
 }
 
 function Check {
@@ -161,6 +175,35 @@ function Invoke-Pair {
     if ($procB.HasExited) {
         throw ("node B exited at once (code $($procB.ExitCode)); " +
                "see build\nodetest-$Tag-b.err")
+    }
+
+    # A DOES NOT START UNTIL B HAS ITS FILES.
+    #
+    # Both guests deliver their own, and a delivery that has to be retried -
+    # "the guest stopped keeping up; the machine is busy" - costs about two
+    # minutes.  A was then sending into a node whose receiver had not started
+    # yet, and the raw scenario reported a wire that carried nothing: true, and
+    # about the wrong moment.  Twice.
+    #
+    # Waiting for what B SAYS rather than for a number of seconds, because the
+    # number would be the same kind of guess that has gone stale three times in
+    # this file already.
+    if ($putForB.Count -gt 0) {
+        $deadline = (Get-Date).AddSeconds($TimeoutSec)
+        $ready = $false
+        while ((Get-Date) -lt $deadline -and -not $procB.HasExited) {
+            $out = Get-Content "build\nodetest-$Tag-b.out" -Raw `
+                -ErrorAction SilentlyContinue
+            if ($out -and $out.Contains('--- deliveries done ---')) {
+                $ready = $true
+                break
+            }
+            Start-Sleep -Milliseconds 500
+        }
+        if (-not $ready) {
+            Write-Host ('node B has not finished its deliveries; starting A ' +
+                        'anyway') -ForegroundColor Yellow
+        }
     }
 
     try {
@@ -1159,13 +1202,26 @@ if ($Scenario -eq 'link' -or $Scenario -eq 'both' -or $Scenario -eq 'migrate') {
                  #
                  # What IS here is the far kernel's own journal, which is where
                  # its loader says what it loaded.
-                 # Timed against A's clock, which starts within a second of
-                 # this one: A asks for the handover at about 44 s.  Dumped
-                 # from the JOURNAL because the console here is redirected into
-                 # the wire for the length of a remote run - which is why the
-                 # far kernel's loader line is not on this screen and never
-                 # will be.
-                 '!powershell -NoProfile -Command Start-Sleep -Seconds 40',
+                 # Timed against A's clock, which now starts when THIS node
+                 # has its files - see the wait in Invoke-Pair.  A's run from
+                 # there is its boot, one small image over the console,
+                 # $SendDelaySec of waiting and a few seconds of counting: it
+                 # asks for the handover at about 47 s.
+                 #
+                 # DERIVED, not a constant.  It was 40 while A asked at 44, and
+                 # it passed only because B's clock had a head start that the
+                 # delivery wait has now removed - so the journal was snapped
+                 # eighteen seconds before the handover and the check read "the
+                 # far kernel never loaded it": true, and about the wrong
+                 # moment.  The same sentence has been written twice in this
+                 # file about two other constants.
+                 #
+                 # Dumped from the JOURNAL because the console here is
+                 # redirected into the wire for the length of a remote run -
+                 # which is why the far kernel's loader line is not on this
+                 # screen and never will be.
+                 ("!powershell -NoProfile -Command Start-Sleep -Seconds {0}" -f
+                  ($SendDelaySec + 45)),
                  'log -n 60',
                  '=log') `
         -SendA @('drv load t:\nodelink.sys',

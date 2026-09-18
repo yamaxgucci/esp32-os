@@ -1081,6 +1081,62 @@ ag_err_t ag_proc_spawn(const char *path, int argc, char **argv, uint32_t flags,
     return ag_proc_spawn_sink(path, argc, argv, flags, NULL, NULL, out_pid);
 }
 
+/*
+ * A bytecode image has no processor to run it, so the interpreter does.
+ *
+ * HERE RATHER THAN IN THE SHELL, and that is the whole reason it is worth the
+ * few lines: `run`, placement, a run asked for over the wire and the cascade's
+ * own fallback all arrive at this function, and none of them should have to
+ * know that some images are not instructions.
+ *
+ * The interpreter is found the way the cascade finds anything - BY NAME, among
+ * the images this board can actually execute - so each board carries its own
+ * build of AGVM and nothing has a path written into it.
+ *
+ * Returns true and rewrites path/argv when the image turns out to be bytecode.
+ * `store` holds the rewritten argv; it must outlive the spawn, which is why it
+ * is the caller's.
+ */
+#define VM_ARGS_MAX (AG_PROC_ARGS_MAX)
+
+static bool via_interpreter(const char **path, int *argc, char ***argv,
+                            char *vmpath, size_t vmcap,
+                            const char **store)
+{
+    ag_axe_header_t h;
+    const ag_err_t  pk = ag_loader_peek(*path, ag_proc_cwd(), &h);
+    /*
+     * -AG_ENOTSUP means the header was read and understood and the image is
+     * simply not for this machine - which is exactly the answer for bytecode,
+     * because ag_axe_native_arch() is never AG_ARCH_BC.
+     */
+    if ((pk != AG_OK && pk != -AG_ENOTSUP) || h.arch != (uint16_t)AG_ARCH_BC) {
+        return false;
+    }
+    if (ag_loader_find_by_name("AGVM", vmpath, vmcap) != AG_OK) {
+        /*
+         * Both halves of the reason, in one sentence, because neither is any
+         * use alone: the load that follows will refuse this image with "built
+         * for a different processor", which is true of every foreign image and
+         * says nothing about what is actually missing here.
+         */
+        ag_log(AG_LOG_ERROR, "proc",
+               "%s is bytecode and this board has no AGVM to run it", *path);
+        return false;
+    }
+
+    int n = 0;
+    store[n++] = vmpath;  /* argv[0] is the image being run, as everywhere */
+    store[n++] = *path;   /* and the bytecode is its first argument        */
+    for (int i = 1; i < *argc && n < (int)VM_ARGS_MAX; i++) {
+        store[n++] = (*argv)[i];
+    }
+    *path = vmpath;
+    *argc = n;
+    *argv = (char **)store;
+    return true;
+}
+
 ag_err_t ag_proc_spawn_sink(const char *path, int argc, char **argv,
                             uint32_t flags, ag_con_sink_fn sink, void *ctx,
                             ag_pid_t *out_pid)
@@ -1088,6 +1144,11 @@ ag_err_t ag_proc_spawn_sink(const char *path, int argc, char **argv,
     if (path == NULL) {
         return -AG_EINVAL;
     }
+
+    char        vmpath[AG_PATH_MAX];
+    const char *vmargv[VM_ARGS_MAX];
+    (void)via_interpreter(&path, &argc, &argv, vmpath, sizeof(vmpath),
+                          vmargv);
 
     lock();
 
