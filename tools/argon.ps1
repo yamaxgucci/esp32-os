@@ -546,6 +546,15 @@ switch ($Command.ToLowerInvariant()) {
         exit $LASTEXITCODE
     }
 
+    'xclutest' {
+        # Two guests of DIFFERENT instruction sets as one cluster - an Xtensa S3
+        # under qemu-system-xtensa and a RISC-V C3 under qemu-system-riscv32.
+        # What needed both boards on the desk until the C3 emulator existed.
+        # Switches the target twice and leaves it on esp32s3.
+        Invoke-Ps1 (Join-Path $PSScriptRoot 'xclutest.ps1') $Rest
+        exit $LASTEXITCODE
+    }
+
     'rvtest' {
         # The other instruction set, with no board plugged in: a CC-written
         # RISC-V image run on an emulated ESP32-C3, and an emulated S3 writing

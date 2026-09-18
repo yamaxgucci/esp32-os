@@ -117,6 +117,15 @@ param(
     # script kills every qemu-system-xtensa it finds before starting, which is
     # right for one guest and fatal for two - the second would shoot the first.
     [string]$Flash = '',
+    # The image in -Flash is FINISHED: do not rebuild build\qemu_flash.bin and
+    # do not copy over it.  For a pair of guests that are two different
+    # machines - only one of them can be the target that was built last, so the
+    # other's image was made earlier and kept aside.
+    [switch]$FlashAsIs,
+    # Which machine this guest is, when it is not the one sdkconfig names.
+    # Goes with -FlashAsIs and means the same thing: this half of the pair was
+    # built before the target moved on.
+    [string]$Chip = '',
     [switch]$KeepOtherEmulators,
     # Suffix for this guest's own emulator log, so a pair does not write one
     # file from two processes.
@@ -126,8 +135,10 @@ param(
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'qemu-common.ps1')
 
-$qemu = Resolve-Qemu
-Update-FlashImage -SysFs $SysFs
+$qemu = Resolve-Qemu -Chip $Chip
+if (-not $FlashAsIs) {
+    Update-FlashImage -SysFs $SysFs
+}
 $efuse = Initialize-EfuseFile
 
 # A guest of its own gets a flash image of its own, copied from the canonical
@@ -137,7 +148,11 @@ $efuse = Initialize-EfuseFile
 # the back door.
 $flashPath = 'build\qemu_flash.bin'
 if ($Flash) {
-    Copy-Item -LiteralPath $flashPath -Destination $Flash -Force
+    if (-not $FlashAsIs) {
+        Copy-Item -LiteralPath $flashPath -Destination $Flash -Force
+    } elseif (-not (Test-Path -LiteralPath $Flash)) {
+        throw "no prepared flash image at $Flash"
+    }
     $flashPath = $Flash
     # Its own efuse too: blank, and written by whoever boots.
     $efuse2 = [IO.Path]::ChangeExtension($Flash, $null) + '_efuse.bin'
@@ -241,7 +256,8 @@ if ($Radio) {
 # wait=on is essential: a TCP serial port with no peer throws its output away,
 # and the whole boot is over in a quarter of a second.  Without it the test
 # races the emulator and loses often enough to be useless.
-$qemuArgs = (Get-QemuMachineArgs -EfusePath $efuse -Graphics:$Gfx -FlashPath $flashPath) + @(
+$qemuArgs = (Get-QemuMachineArgs -EfusePath $efuse -Graphics:$Gfx `
+                                 -FlashPath $flashPath -Chip $Chip) + @(
     '-display', $(if ($Gfx) { 'sdl' } else { 'none' })
     '-monitor', 'none'
     '-serial', "tcp:127.0.0.1:$Port,server=on,wait=on"

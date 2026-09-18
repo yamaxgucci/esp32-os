@@ -34,3 +34,26 @@ CONFIG_ARGON_NET_WIFI=n
 # like a guest that will not start.  Accepting v0 is safe here and only here:
 # the real SuperMini reports its own revision and keeps the board build's floor.
 CONFIG_ESP32C3_REV_MIN_0=y
+
+# THE HARDWARE STACK GUARD, off here and nowhere else.
+#
+# The C3 watches its stack pointer with the ASSIST_DEBUG peripheral, and QEMU
+# does not emulate it: the bounds registers read back as zero and the interrupt
+# fires on its own.  What that looks like is a panic one instruction after a
+# module is loaded -
+#
+#   Guru Meditation Error: Core 0 panic'ed (Stack protection fault).
+#   ASSIST_DEBUG is not triggered BUT interrupt occurred!
+#   Stack bounds: 0x00000000 - 0x00000000
+#
+# - and the second line is IDF's own panic handler saying the peripheral does
+# NOT corroborate the interrupt it was given.  The bounds being zero says the
+# same thing from the other side: nothing ever stored them.
+#
+# The S3 has the same peripheral and never sees this, because IDF arms the
+# guard on the RISC-V ports only.
+#
+# IF THIS EVER HIDES A REAL OVERFLOW the symptom will be corruption a little
+# later rather than a clean panic here, so it is worth remembering that this
+# line exists.  The board build keeps the guard.
+CONFIG_ESP_SYSTEM_HW_STACK_GUARD=n

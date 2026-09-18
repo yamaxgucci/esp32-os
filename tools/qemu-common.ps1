@@ -33,10 +33,14 @@ function Stop-Emulators {
 }
 
 function Resolve-Qemu {
+    # `Chip` overrides what is in sdkconfig, for the one case where they
+    # differ: a pair of guests that are two DIFFERENT machines, booted from
+    # images built earlier and kept aside.  See tools\xclutest.ps1.
+    param([string]$Chip = '')
     if (-not $env:IDF_TOOLS_PATH) {
         throw 'Run tools\idf-env.ps1 first.'
     }
-    $chip = Get-QemuTarget
+    $chip = if ($Chip) { $Chip } else { Get-QemuTarget }
     if ($chip -like 'esp32c*' -or $chip -like 'esp32h*' -or $chip -like 'esp32p*') {
         $pkg = 'qemu-riscv32'
         $bin = 'qemu-system-riscv32.exe'
@@ -448,10 +452,12 @@ function Get-QemuMachineArgs {
         # some later, unrelated run - see the note in Update-FlashImage about
         # exactly that.
         [string]$FlashPath = 'build\qemu_flash.bin',
-        [string]$EfuseOverride = ''
+        [string]$EfuseOverride = '',
+        # As in Resolve-Qemu: which machine, when it is not the one built last.
+        [string]$Chip = ''
     )
     if ($EfuseOverride) { $EfusePath = $EfuseOverride }
-    $chip = Get-QemuTarget
+    $chip = if ($Chip) { $Chip } else { Get-QemuTarget }
     if ($chip -ne 'esp32s3') {
         # The other machines, which have neither PSRAM nor a panel: the
         # arguments below that name esp32s3 devices do not exist on them, and
