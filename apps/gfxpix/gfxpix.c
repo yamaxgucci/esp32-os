@@ -20,7 +20,7 @@
  *   A red dot goes round the circle, one step of sixty-four per frame, twenty
  *   frames a second, because a still picture cannot tell a working link from a
  *   frozen one - which is what came back from the phone the first time.  Only
- *   the rectangle it moved through is redrawn and handed over, which is what
+ *   the rows it moved through are redrawn and handed over, which is what
  *   makes that rate affordable; the whole picture goes once every two seconds
  *   so nothing painted on top of it stays.  A lap is a little over three
  *   seconds when the board is keeping up.
@@ -434,11 +434,19 @@ int ag_main(int argc, char **argv)
                     bad = 1;
                 }
             } else {
-                const int x0 = (ox < nx ? ox : nx) - 7;
+                /*
+                 * Whole rows, not a box round the dot.
+                 *
+                 * The box was two milliseconds and the rows are six, which a
+                 * fifty millisecond frame can afford either way - and on the
+                 * glass the narrow one left streaks along the path.  Whole
+                 * rows are the shape every band renderer here hands over and
+                 * the shape this panel is known to be right about; the narrow
+                 * rectangle is a separate bug, being hunted separately.
+                 */
                 const int y0 = (oy < ny ? oy : ny) - 7;
-                const int x1 = (ox > nx ? ox : nx) + 8;
                 const int y1 = (oy > ny ? oy : ny) + 8;
-                if (own_patch(x0, y0, x1 - x0, y1 - y0, nx, ny) != 0) {
+                if (own_patch(0, y0, OWN_W, y1 - y0, nx, ny) != 0) {
                     bad = 1;
                 }
             }
