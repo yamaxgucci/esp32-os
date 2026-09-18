@@ -16,6 +16,22 @@ function Get-QemuTarget {
     return $line.Matches[0].Groups[1].Value
 }
 
+# Every emulator, not just the Xtensa one.
+#
+# WHY THIS IS A FUNCTION.  Six places in these scripts killed
+# `qemu-system-xtensa` by name, which was the whole list until 18 Sep 2026.  A
+# stray qemu-system-riscv32 now survives all of them, keeps a core busy, and
+# the next run does not fail - it goes SLOW, which came out as node B needing a
+# second attempt at a file transfer and arriving a hundred and fifty seconds
+# after the sender had finished.  Two checks then reported a dead wire, which
+# was true and was about the wrong thing.
+function Stop-Emulators {
+    foreach ($name in @('qemu-system-xtensa', 'qemu-system-riscv32')) {
+        Get-Process $name -ErrorAction SilentlyContinue |
+            Stop-Process -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Resolve-Qemu {
     if (-not $env:IDF_TOOLS_PATH) {
         throw 'Run tools\idf-env.ps1 first.'

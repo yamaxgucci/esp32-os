@@ -317,8 +317,7 @@ if ($Sd) {
 # wire, and killing it here is the first thing a two-node test would do to
 # itself.
 if (-not $KeepOtherEmulators) {
-    Get-Process qemu-system-xtensa -ErrorAction SilentlyContinue |
-        Stop-Process -Force -ErrorAction SilentlyContinue
+    Stop-Emulators
 }
 
 # QEMU's own chatter goes to a file: it is not part of what the board said,

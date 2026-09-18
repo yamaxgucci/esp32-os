@@ -32,6 +32,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'idf-env.ps1')
+. (Join-Path $PSScriptRoot 'qemu-common.ps1')
 
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
@@ -121,8 +122,7 @@ Write-Host "`n== a program compiled for RISC-V, on a RISC-V part ==" `
             'run c:\rvuns.axe',
             'run c:\rvst.axe',
             'errorlevel') | Out-Null
-Get-Process qemu-system-riscv32 -ErrorAction SilentlyContinue |
-    Stop-Process -Force -ErrorAction SilentlyContinue
+Stop-Emulators
 
 $c3 = Transcript 'build\rvtest-c3.log'
 
@@ -177,8 +177,7 @@ Remove-Item (Join-Path $share 'fromboard.axe') -ErrorAction SilentlyContinue
     -Send @('run t:\cc.axe -riscv t:\selftest.c h:\fromboard.axe',
             '=cc: wrote',
             'dir h:\') | Out-Null
-Get-Process qemu-system-xtensa -ErrorAction SilentlyContinue |
-    Stop-Process -Force -ErrorAction SilentlyContinue
+Stop-Emulators
 
 $s3 = Transcript 'build\rvtest-s3.log'
 

@@ -188,8 +188,7 @@ function Invoke-Pair {
                 Get-Content $f | Select-Object -Last 12 | Out-Host
             }
         }
-        Get-Process qemu-system-xtensa -ErrorAction SilentlyContinue |
-            Stop-Process -Force -ErrorAction SilentlyContinue
+        Stop-Emulators
         Start-Sleep -Milliseconds 500
     }
 }
@@ -241,8 +240,7 @@ if (Test-Path 'build\apps\CC.AXE') {
 Update-FlashImage
 
 # The one kill, here rather than in each guest.
-Get-Process qemu-system-xtensa -ErrorAction SilentlyContinue |
-    Stop-Process -Force -ErrorAction SilentlyContinue
+Stop-Emulators
 Start-Sleep -Milliseconds 500
 
 # ------------------------------------------------------------ raw scenario ---
@@ -370,6 +368,25 @@ if ($Scenario -eq 'link' -or $Scenario -eq 'both') {
                  # which stops on any key, and it reports a fraction of what it
                  # sent.  Blamed on the wire twice.
                  "=of $Pings came back",
+                 # CLEAR THE SCREEN FIRST, and it is the marker below that
+                 # needs it.
+                 #
+                 # `=text` waits for that text to appear MORE OFTEN than it
+                 # already has, counted over everything that has arrived - and
+                 # what arrives is a screen being redrawn, so a row that is
+                 # still on the screen is counted again every time it scrolls.
+                 # "came back" was already up there from the ping above, so the
+                 # wait was satisfied by a repaint: the harness moved on, the
+                 # run ended, and the transcript stops one line into the stream
+                 # ping with no summary.  The check then said the stream class
+                 # carries nothing, which was a statement about the harness.
+                 #
+                 # After `cls` that row is not on the screen to be redrawn, so
+                 # the next "came back" is the one this ping prints.  The note
+                 # over Count-Of in qemu-boot.ps1 says exactly this: wait only
+                 # for text that is printed once and does not sit on the screen
+                 # scrolling.
+                 'cls',
                  # And the same round trip on the class sound will ride.  It
                  # had never carried a byte between two nodes before this line.
                  "link ping $Pings stream",
@@ -1478,8 +1495,7 @@ if ($Scenario -eq 'link' -or $Scenario -eq 'both') {
                 'dev node0',
                 'link',
                 'ver') | Out-Null
-    Get-Process qemu-system-xtensa -ErrorAction SilentlyContinue |
-        Stop-Process -Force -ErrorAction SilentlyContinue
+    Stop-Emulators
 
     $u = Transcript 'build\nodetest-unload.log'
     Check $u 'listening' 'unload-task-started'
