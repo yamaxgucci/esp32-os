@@ -144,7 +144,12 @@
    * bottom row.  Fixed width so the two rows line up, and the ↑ pushed to sit
    * over the ↓ (one arrow-width in from the right). */
   #kbd button.arrow { background: #2c3240; flex: 0 0 46px; }
-  #kbd button.arrow.up { margin-left: auto; margin-right: 50px; }
+  /* The up arrow pushes itself and the backtick after it to the right end of the
+   * symbol row, so ↑ sits over the ↓ and ` over the → of the row below. */
+  #kbd button.arrow.up { margin-left: auto; }
+  /* A single-character key sized to its glyph (the bottom-left slash, matched to
+   * the backslash above it) rather than stretched across the row. */
+  #kbd button.narrowkey { flex: 0 1 auto; padding: 9px 13px; }
   /* The symbol row, narrower keys sized to their one character and centred, so
    * the row does not stretch each key to a tenth of the screen - which also
    * leaves room at its right end for the ↑ (excluded from this rule). */
@@ -1024,42 +1029,41 @@ function buildKeyboard() {
     if (i === 3) {
       row.appendChild(specialButton("⌫", "mod", () => tap(K.back)));
     }
-    /* The top of the arrow cluster: ↑ at the right end of the symbol row, so the
-     * four arrows form the usual inverted-T with ← ↓ → on the row below. */
+    /* The top of the arrow cluster: ↑ at the right end of the symbol row (over
+     * the ↓ below), and the backtick to its right (over the → below).  The
+     * backtick lives here rather than on the bottom row so that row is free for
+     * a wide space. */
     if (i === 4) {
       row.appendChild(specialButton("↑", "arrow up", () => tap(K.up)));
+      row.appendChild(specialButton("`", "arrow", () => {
+        sendKey(1, K.grave, shifted ? 126 : 96, st.sticky);
+        sendKey(2, K.grave, 0, st.sticky);
+        clearSticky();
+      }));
     }
     ui.kbd.appendChild(row);
   }
 
   const last = document.createElement("div");
   last.className = "row";
-  /* `/` (with `?` on shift) where Esc used to be: Esc is already on the top
-   * strip, and a slash is wanted on the keyboard proper. */
-  last.appendChild(specialButton("/", "mod", () => {
+  /* `/` where Esc used to be (Esc is on the top strip), sized to its glyph like
+   * the `\` on the row above rather than stretched. */
+  last.appendChild(specialButton("/", "narrowkey", () => {
     sendKey(1, K.slash, shifted ? 63 : 47, st.sticky);
     sendKey(2, K.slash, 0, st.sticky);
     clearSticky();
   }));
-  /* Space carries its character as well as its usage id.  The kernel maps a
-   * usage to a character for a real USB keyboard, so this would work either
-   * way - but a key that means a character and does not say so is a key that
-   * depends on somebody else's table staying right.  Narrower than before
-   * (wide, not xwide) and shifted left, to leave the right end for the arrows. */
-  last.appendChild(specialButton("space", "wide", () => {
+  /* A wide space, now that the backtick has moved up to the symbol row.  Carries
+   * its character as well as its usage id, so it does not depend on the kernel's
+   * usage-to-character table. */
+  last.appendChild(specialButton("space", "xwide", () => {
     sendKey(1, K.space, 32, st.sticky);
     sendKey(2, K.space, 0, st.sticky);
     clearSticky();
   }));
-  last.appendChild(specialButton("`", "mod", () => {
-    sendKey(1, K.grave, shifted ? 126 : 96, st.sticky);
-    sendKey(2, K.grave, 0, st.sticky);
-    clearSticky();
-  }));
-  /* The foot of the arrow cluster: ← ↓ → bottom-right, with ↑ above the ↓ on
-   * the row above - the usual inverted-T.  Tab and backspace left this row to
-   * make room: Tab is on the top strip already, and backspace is on the row
-   * above (under the letters, where the deleting thumb wants it). */
+  /* The foot of the arrow cluster: ← ↓ → , with ↑ above the ↓ on the row above -
+   * the usual inverted-T.  Tab and backspace left this row: Tab is on the top
+   * strip, backspace is on the row above under the letters. */
   last.appendChild(specialButton("←", "arrow", () => tap(K.left)));
   last.appendChild(specialButton("↓", "arrow", () => tap(K.down)));
   last.appendChild(specialButton("→", "arrow", () => tap(K.right)));
