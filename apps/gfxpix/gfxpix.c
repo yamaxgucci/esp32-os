@@ -195,13 +195,19 @@ static void draw_dot_strip(uint16_t w, uint16_t h, int ox, int oy, int nx,
 #define OWN_BAND 16
 
 /*
- * Milliseconds a frame.  A hundred, because ten a second is where the eye
- * stops seeing steps and twenty was greedy: every frame goes through the
- * device registry, and this program is meant to be left running while
- * somebody uses the machine.  Sixty-four positions at this rate is a lap in
- * six seconds.
+ * Milliseconds a frame.  Fifty, so twenty a second: smooth motion rather than
+ * the ten-a-second the eye still sees stepping through.
+ *
+ * Ten used to be the ceiling because every frame went through the device
+ * registry - blit_rect on the phone link encoded and sent the whole strip while
+ * holding the registry, so twenty was greedy with the one lock the rest of the
+ * machine waits on.  That is no longer true: on a board that holds a frame the
+ * phone driver's blit_rect is a memcpy under its own lock and the encode and the
+ * network are its task's, off the registry (see apps/phone/phone.c).  So twenty
+ * costs the registry nothing it did not already, and the picture is smoother.
+ * Sixty-four positions at this rate is a lap in a little over three seconds.
  */
-#define FRAME_MS 100u
+#define FRAME_MS 50u
 
 static uint16_t s_band[OWN_W * OWN_BAND];
 
