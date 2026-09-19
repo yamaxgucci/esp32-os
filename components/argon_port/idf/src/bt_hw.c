@@ -324,6 +324,24 @@ static ag_err_t hidh_ensure(void)
 
 void ag_port_bt_on_report(ag_port_bt_report_fn fn) { s_on_report = fn; }
 
+/*
+ * Give the Bluetooth controller's memory back to the heap.
+ *
+ * With CONFIG_BT_ENABLED the controller reserves a large block (~64 KB on this
+ * part) whether or not anything uses it.  A board with PSRAM never notices; a
+ * board without it - the CYD - cannot then fit station Wi-Fi and the phone
+ * server, and a driver load fails with -12.  Called at boot only for a board
+ * that has said it will not use Bluetooth ([bt] release), because once this runs
+ * the controller cannot be started again until reset.
+ */
+void ag_port_bt_mem_release(void)
+{
+    if (s_state != AG_BT_OFF) {
+        return; /* already up; nothing to give back */
+    }
+    (void)esp_bt_controller_mem_release(ESP_BT_MODE_BTDM);
+}
+
 ag_err_t ag_port_bt_start(void)
 {
     if (s_state != AG_BT_OFF) {

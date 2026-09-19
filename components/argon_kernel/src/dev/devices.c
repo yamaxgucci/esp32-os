@@ -428,7 +428,15 @@ ag_err_t ag_devices_init(void)
          * hostname says otherwise; not fatal, and a build without mDNS just
          * does without the name.
          */
-        if (err == AG_OK) {
+        if (err == AG_OK &&
+            ag_cfg_get_bool(ag_sysconfig(), "net.mdns", true)) {
+            /*
+             * `[net] mdns = no` for a board too tight for it.  The mDNS
+             * responder costs a task and its buffers - on a part with no PSRAM
+             * that can be the kilobytes the supervisor stage then fails to get
+             * (stage 'supervisor' failed with -12).  A board that cannot spare
+             * them reaches the network by address instead of by name.
+             */
             const char *host =
                 ag_cfg_get(ag_sysconfig(), "net.hostname", "argon");
             const ag_err_t merr = ag_port_net_mdns(host);
@@ -534,6 +542,17 @@ ag_err_t ag_devices_init(void)
                        kbd);
             }
         }
+    } else if (ag_cfg_get_bool(ag_sysconfig(), "bt.release", false)) {
+        /*
+         * A board that will not use Bluetooth can have the controller's memory
+         * back - about sixty-four kilobytes it reserves whether or not anything
+         * uses it.  On a part with no PSRAM (the CYD) that is the difference
+         * between station Wi-Fi plus the phone server fitting and a driver
+         * failing to load with -12.  Opt-in, because after this the radio cannot
+         * be started until reset - a board that might want `bt on` leaves it out.
+         */
+        ag_port_bt_mem_release();
+        ag_log(AG_LOG_INFO, "bt", "controller memory released ([bt] release)");
     }
 #endif
 

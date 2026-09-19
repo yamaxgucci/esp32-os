@@ -108,6 +108,10 @@ ag_err_t ag_port_bt_close(void);
 ag_err_t ag_port_bt_status(ag_port_bt_status_t *out);
 void     ag_port_bt_on_report(ag_port_bt_report_fn fn);
 
+/* Return the BT controller's reserved memory to the heap; see bt_hw.c.  Only
+ * for a board that will not use Bluetooth - it cannot be started afterwards. */
+void     ag_port_bt_mem_release(void);
+
 #endif /* AG_PORT_HAS_BT */
 
 #endif /* ARGON_PORT_BT_H */
