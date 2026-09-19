@@ -38,6 +38,7 @@
 #include <argon/port/task.h>
 #include <argon/port/time.h>
 #include <argon/port/usb.h>
+#include <argon/port/net.h>
 #include <argon/port/wifi.h>
 
 #include "core/sysconfig.h"
@@ -420,6 +421,22 @@ ag_err_t ag_devices_init(void)
         err = ag_net_init();
         if (err != AG_OK && err != -AG_ENOSYS) {
             ag_log(AG_LOG_WARN, "dev", "net init failed (%d)", (int)err);
+        }
+        /*
+         * A name on the network, so a phone opens http://argon.local:8765/
+         * rather than the address DHCP gave the board.  `argon` unless [net]
+         * hostname says otherwise; not fatal, and a build without mDNS just
+         * does without the name.
+         */
+        if (err == AG_OK) {
+            const char *host =
+                ag_cfg_get(ag_sysconfig(), "net.hostname", "argon");
+            const ag_err_t merr = ag_port_net_mdns(host);
+            if (merr == AG_OK) {
+                ag_log(AG_LOG_INFO, "net", "mdns: %s.local", host);
+            } else if (merr != -AG_ENOSYS) {
+                ag_log(AG_LOG_WARN, "net", "mdns failed (%d)", (int)merr);
+            }
         }
     }
 

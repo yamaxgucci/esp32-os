@@ -24,6 +24,7 @@
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"
+#include "mdns.h"
 #include "lwip/netdb.h"
 #include "lwip/priv/tcp_priv.h"
 #include "lwip/sockets.h"
@@ -108,6 +109,35 @@ static void on_got_ip(void *arg, esp_event_base_t base, int32_t id, void *data)
 }
 
 void ag_port_net_on_ready(ag_port_net_ready_fn fn) { s_on_ready = fn; }
+
+/*
+ * A name on the network, so a phone opens http://argon.local:8765/ rather than
+ * the address DHCP happened to hand out - which nobody can guess and which
+ * changes.  mDNS answers <hostname>.local for whatever interface is up, the
+ * station's lease or the board's own access point alike; the component watches
+ * the netifs itself, so this only has to be called once, after the stack is up.
+ *
+ * Idempotent: init once, and the name can be set again to change it.
+ */
+ag_err_t ag_port_net_mdns(const char *hostname)
+{
+    static bool inited;
+
+    if (hostname == NULL || hostname[0] == '\0') {
+        hostname = "argon";
+    }
+    if (!inited) {
+        if (mdns_init() != ESP_OK) {
+            return -AG_EIO;
+        }
+        inited = true;
+    }
+    if (mdns_hostname_set(hostname) != ESP_OK) {
+        return -AG_EIO;
+    }
+    (void)mdns_instance_name_set(hostname);
+    return AG_OK;
+}
 
 /* Everything both links need before either can be brought up. */
 static ag_err_t common_start(void)

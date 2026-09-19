@@ -22,6 +22,13 @@ dependencies:
     rules:
       - if: "$CONFIG{ARGON_PANEL_QEMU} == True"
   joltwallet/littlefs: "^1.14.0"
+  # mDNS, so a board answers to a name (argon.local) rather than the address
+  # DHCP happened to hand it.  Small, and only linked when the build has a
+  # network at all.
+  espressif/mdns:
+    version: "^1.2.0"
+    rules:
+      - if: "$CONFIG{ARGON_ENABLE_NET} == True"
   # The whole camera in the image, sensor drivers and all - fetched only when
   # CONFIG_ARGON_CAMERA_BUILTIN is set (argon target esp32s3-cam).  A default
   # build never downloads it: see camera_builtin_hw.c and the port CMakeLists.

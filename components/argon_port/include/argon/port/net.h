@@ -77,6 +77,14 @@ ag_err_t ag_port_net_ifaddr(uint32_t *addr);
 void     ag_port_net_on_ready(ag_port_net_ready_fn fn);
 
 /*
+ * Answer to <hostname>.local on the network via mDNS, so a board is reached by
+ * name rather than by the address DHCP gave it.  NULL or empty means "argon".
+ * Call once the stack is up; idempotent.  A port with no mDNS returns
+ * -AG_ENOSYS and nothing is lost but the name.
+ */
+ag_err_t ag_port_net_mdns(const char *hostname);
+
+/*
  * What the stack is holding, for an operator asking where the memory went.
  *
  * A connection the application has closed is not necessarily a connection the
