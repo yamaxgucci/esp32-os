@@ -355,6 +355,25 @@ static void reap(proc_t *p)
         ag_console_restore_tty();
     }
 
+    /*
+     * The last look at its memory, and often the only one anybody gets: an
+     * application that writes past its own data usually stands on its own
+     * feet first and faults, long before a supervisor tick could notice.
+     * Measured on the test program - eight bytes past its buffer reached the
+     * image's own remaining bss, overwrote a pointer, and the next line read
+     * it.  A memcmp on a path that is already freeing memory, and it turns
+     * "the application faulted" into "the application faulted after writing
+     * past the end of its own data".
+     */
+    size_t guard_past = 0;
+    if (!p->guard_said && ag_loader_guard_broken(&p->app, &guard_past)) {
+        p->guard_said = true;
+        ag_log(AG_LOG_ERROR, "proc",
+               "%s (pid %u) wrote past the end of its own data by at least %u "
+               "bytes - a bug in %s, not in the board",
+               p->name, (unsigned)p->pid, (unsigned)guard_past, p->name);
+    }
+
     ag_loader_unload(&p->app);
 
     if (p->heap_mem != NULL) {
@@ -474,6 +493,43 @@ bool ag_proc_take_crash_record(char *out, size_t len)
  * is the one thing in here that takes a lock, and on that path it is the
  * difference between a recorded fault and a reset board.
  */
+/*
+ * The hardware watch: asked for by `guard watch`, spent on the next
+ * application that starts.
+ *
+ * There is one watchpoint to give (the chip has two per core and FreeRTOS may
+ * hold the other for stack overflow), so it is not a mode the system runs in -
+ * it is a single shot, aimed deliberately.  Four bytes inside the guard are
+ * enough: an overrun that reaches the guard at all reaches its first word, and
+ * four bytes is a size and an alignment the hardware accepts everywhere.
+ */
+static bool s_guard_watch_armed;
+
+void ag_proc_guard_watch(bool on) { s_guard_watch_armed = on; }
+bool ag_proc_guard_watching(void) { return s_guard_watch_armed; }
+
+static void guard_watch_take(const proc_t *p, int core)
+{
+    if (!s_guard_watch_armed || p->app.guard == NULL) {
+        return;
+    }
+    /* The guard sits past the data, which need not leave it word-aligned. */
+    const uintptr_t at = ((uintptr_t)p->app.guard + 3u) & ~(uintptr_t)3u;
+
+    s_guard_watch_armed = false;
+    if (!ag_port_watch_write(core, (const void *)at, 4u)) {
+        ag_log(AG_LOG_WARN, "proc",
+               "%s: could not arm the hardware watch on its data guard; the "
+               "guard is still checked every tick",
+               p->name);
+        return;
+    }
+    ag_log(AG_LOG_WARN, "proc",
+           "%s: hardware watch armed at %p - a write past its data will stop "
+           "the board and print the instruction that did it",
+           p->name, (void *)at);
+}
+
 static void crash_record(proc_t *p, const char *reason, bool may_lock)
 {
     const uint32_t up_ms = now_ms() - (uint32_t)(p->started / 1000);
@@ -946,6 +1002,9 @@ static ag_err_t spawn_common(proc_t *p, uint32_t flags, ag_pid_t *out_pid)
         *out_pid = p->pid;
     }
 
+    /* On the core this task was pinned to, before it has run an instruction. */
+    guard_watch_take(p, core);
+
     const ag_pid_t bound_pid = p->pid;
     char           bound_name[32];
     const bool     skip_bind = (flags & (uint32_t)AG_SPAWN_NO_SESSION) != 0;
@@ -1197,6 +1256,50 @@ ag_err_t ag_proc_signal(ag_pid_t pid)
            (unsigned)p->pid);
     unlock();
     return AG_OK;
+}
+
+uint32_t ag_proc_check_guards(void)
+{
+    ag_pid_t caught[AG_PROC_MAX];
+    size_t   past[AG_PROC_MAX];
+    char     names[AG_PROC_MAX][32];
+    uint32_t n = 0;
+
+    /*
+     * Looked at under the lock, killed outside it: ag_proc_kill waits for the
+     * task to leave the kernel and takes the lock itself, and this runs on the
+     * supervisor, which must not be the task holding it while that happens.
+     */
+    lock();
+    for (uint32_t i = 0; i < AG_PROC_MAX && n < AG_PROC_MAX; i++) {
+        proc_t *p = &s_procs[i];
+        if (!p->used || p->state == AG_PS_ZOMBIE || p->guard_said) {
+            continue;
+        }
+        size_t bytes = 0;
+        if (!ag_loader_guard_broken(&p->app, &bytes)) {
+            continue;
+        }
+        p->guard_said = true; /* once per process, not once per tick */
+        caught[n] = p->pid;
+        past[n] = bytes;
+        snprintf(names[n], sizeof(names[n]), "%s", p->name);
+        n++;
+    }
+    unlock();
+
+    for (uint32_t i = 0; i < n; i++) {
+        ag_log(AG_LOG_ERROR, "proc",
+               "%s (pid %u) wrote past the end of its own data by at least "
+               "%u bytes - stopping it before the damage is used",
+               names[i], (unsigned)caught[i], (unsigned)past[i]);
+        ag_log(AG_LOG_ERROR, "proc",
+               "  this is a bug in %s, not in the board: a buffer of its own "
+               "was written off the end, into whatever the heap put next",
+               names[i]);
+        (void)ag_proc_kill(caught[i], "wrote past its own data");
+    }
+    return n;
 }
 
 ag_err_t ag_proc_kill(ag_pid_t pid, const char *reason)

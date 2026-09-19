@@ -269,14 +269,64 @@ static void copy_image(void *dst, const void *src, size_t bytes)
  */
 static void *data_alloc(size_t bytes)
 {
-    void *p = ag_port_alloc_aligned(16, bytes, AG_MEM_SLOW | AG_MEM_BYTE);
+    /* Room for the guard, and the guard written into it: see guard_arm. */
+    const size_t want = bytes + AG_APP_GUARD_BYTES;
+
+    void *p = ag_port_alloc_aligned(16, want, AG_MEM_SLOW | AG_MEM_BYTE);
     if (p == NULL) {
-        p = ag_port_alloc_aligned(16, bytes, AG_MEM_IRAM8);
+        p = ag_port_alloc_aligned(16, want, AG_MEM_IRAM8);
     }
     if (p == NULL) {
-        p = ag_port_alloc_aligned(16, bytes, AG_MEM_FAST | AG_MEM_BYTE);
+        p = ag_port_alloc_aligned(16, want, AG_MEM_FAST | AG_MEM_BYTE);
     }
     return p;
+}
+
+/*
+ * The pattern, and where it went.
+ *
+ * `end` is the first byte past the application's data.  For an image with its
+ * own data allocation that is inside the block data_alloc reserved; for a
+ * contiguous image it is inside the code allocation, which place_arena sizes
+ * with the same allowance.  Either way the bytes belong to us, which is the
+ * whole point - a guard written into somebody else's block would be the very
+ * corruption it is meant to catch.
+ */
+static void guard_arm(ag_loaded_app_t *out, void *end)
+{
+    if (end == NULL) {
+        out->guard = NULL;
+        return;
+    }
+    memset(end, AG_APP_GUARD_BYTE, AG_APP_GUARD_BYTES);
+    out->guard = end;
+}
+
+bool ag_loader_guard_broken(const ag_loaded_app_t *app, size_t *bytes_past)
+{
+    if (app == NULL || app->guard == NULL) {
+        return false;
+    }
+    const uint8_t *g = (const uint8_t *)app->guard;
+    size_t         last = 0;
+    bool           broken = false;
+
+    for (size_t i = 0; i < AG_APP_GUARD_BYTES; i++) {
+        if (g[i] != AG_APP_GUARD_BYTE) {
+            broken = true;
+            last = i + 1u;
+        }
+    }
+    if (broken && bytes_past != NULL) {
+        /*
+         * At least this far: the furthest disturbed byte inside the guard.  A
+         * write that cleared the whole guard went further still, and the guard
+         * cannot say how much - what it can say is that it happened and who
+         * did it, which is what was missing.
+         */
+        *bytes_past = last;
+    }
+    return broken;
 }
 
 static void *scratch_alloc(size_t bytes)
@@ -337,7 +387,8 @@ static ag_err_t place_arena(const ag_axe_header_t *header, ag_loaded_app_t *out)
 
     const bool contiguous = (header->flags & AG_AXE_CONTIGUOUS) != 0;
     const size_t code_bytes =
-        contiguous ? (size_t)header->code.size + header->data.size
+        contiguous ? (size_t)header->code.size + header->data.size +
+                         AG_APP_GUARD_BYTES
                    : (size_t)header->code.size;
 
     void *code = ag_arena_alloc(&s_code, code_bytes, 16);
@@ -363,6 +414,7 @@ static ag_err_t place_arena(const ag_axe_header_t *header, ag_loaded_app_t *out)
     if (contiguous) {
         out->place.data = (uint8_t *)code + header->code.size;
         out->place.data_capacity = header->data.size;
+        guard_arm(out, (uint8_t *)out->place.data + header->data.size);
         return AG_OK;
     }
 
@@ -391,6 +443,7 @@ static ag_err_t place_arena(const ag_axe_header_t *header, ag_loaded_app_t *out)
     out->place.data = data;
     out->place.data_capacity = header->data.size;
     out->data_owned = data;
+    guard_arm(out, (uint8_t *)data + header->data.size);
     return AG_OK;
 }
 
@@ -433,6 +486,7 @@ static ag_err_t place_psram(const ag_axe_header_t *header, ag_loaded_app_t *out)
     out->place.data = data;
     out->place.data_capacity = header->data.size;
     out->data_owned = data;
+    guard_arm(out, (uint8_t *)data + header->data.size);
     out->code_from_psram = true;
     return AG_OK;
 }
@@ -492,6 +546,7 @@ static ag_err_t place_xip(const ag_axe_header_t *header, ag_loaded_app_t *out)
     out->place.data = data;
     out->place.data_capacity = header->data.size;
     out->data_owned = data;
+    guard_arm(out, (uint8_t *)data + header->data.size);
     out->code_scratch = NULL;
     out->xip_slot = slot;
     out->code_from_xip = true;

@@ -106,6 +106,23 @@ const char *ag_proc_state_name(ag_proc_state_t state);
 /* Collects processes that have finished and were not waited for. */
 uint32_t ag_proc_reap_finished(void);
 
+/*
+ * Check every loaded application's data guard; kill any that has been written
+ * past and say so.  Returns how many were caught.  Called from the supervisor
+ * on its tick - see ag_proc_check_guards in proc.c for why on a timer rather
+ * than only at unload.
+ */
+uint32_t ag_proc_check_guards(void);
+
+/*
+ * Ask for a CPU watchpoint on the data guard of the next application to start.
+ * One shot: it is spent when that application starts, because the chip has one
+ * such watch to give.  A hit stops the board and prints the instruction - see
+ * ag_port_watch_write.
+ */
+void ag_proc_guard_watch(bool on);
+bool ag_proc_guard_watching(void);
+
 /* ---------------------------------------------------------------------- */
 /* What the syscall table forwards here                                   */
 /* ---------------------------------------------------------------------- */

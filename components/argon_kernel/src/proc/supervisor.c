@@ -482,6 +482,13 @@ static void supervisor_task(void *arg)
             (void)ag_proc_kill(hung, reason);
         }
 
+        /*
+         * Before reaping, because reaping frees the very blocks an overrun
+         * damages: an application caught here is killed and named while the
+         * evidence and the culprit are both still in memory.
+         */
+        (void)ag_proc_check_guards();
+
         (void)ag_proc_reap_finished();
 
         /* Last, so that the journal tail it writes includes everything above. */

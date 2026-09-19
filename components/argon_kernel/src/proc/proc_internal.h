@@ -51,6 +51,8 @@ typedef struct {
     ag_port_sem_t   done;
     int32_t           exit_code;
     bool              killed;
+    /* Its data guard has already been reported: say it once, not every tick. */
+    bool              guard_said;
     bool              has_waiter; /* somebody is in ag_proc_wait for it      */
     volatile bool     signalled;
     jmp_buf           exit_jump;

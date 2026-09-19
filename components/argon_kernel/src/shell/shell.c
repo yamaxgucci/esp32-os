@@ -4971,10 +4971,48 @@ static int cmd_uartbridge(int argc, char **argv)
     /* not reached */
 }
 
+/*
+ * The data guards, and the hardware watch on the next one.
+ *
+ * Every loaded application has sixteen bytes of pattern past its data and the
+ * supervisor checks them on its tick; that part is not optional and has no
+ * switch.  `guard watch` arms a CPU watchpoint on the guard of the next
+ * application to start, so that the write is caught at the instruction rather
+ * than noticed a tick later - at the price of the board, because a watchpoint
+ * hit is a debug exception and that path reboots.  Off by default, said
+ * plainly when armed.
+ */
+static int cmd_guard(int argc, char **argv)
+{
+    if (argc >= 2 && ag_path_icmp(argv[1], "watch") == 0) {
+        const bool on = (argc < 3) || ag_path_icmp(argv[2], "off") != 0;
+        ag_proc_guard_watch(on);
+        ag_console_printf(on ? "the next application to start gets a hardware watch on "
+                       "its data guard.\n"
+                       "a write past it will stop the board and print the "
+                       "instruction that did it.\n"
+                     : "hardware watch off; the guards are still checked every "
+                       "tick.\n");
+        return 0;
+    }
+    if (argc >= 2) {
+        ag_console_printf("usage: guard [watch [off]]\n");
+        return 1;
+    }
+
+    ag_console_printf("data guards: %u bytes past every application's data, checked "
+              "on the supervisor tick\n", (unsigned)AG_APP_GUARD_BYTES);
+    ag_console_printf("hardware watch: %s\n",
+              ag_proc_guard_watching() ? "armed for the next application"
+                                       : "off ('guard watch' arms it)");
+    return 0;
+}
+
 static const ag_command_t k_commands[] = {
     {"help", "", "list these commands", cmd_help},
     {"ver", "", "version and hardware", cmd_ver},
     {"mem", "", "memory usage", cmd_mem},
+    {"guard", "[watch [off]]", "application data guards", cmd_guard},
     {"boot", "[recovery|normal]", "boot report; set/clear recovery marker",
      cmd_boot},
     {"log", "[-n N|clear]", "system journal", cmd_log},
