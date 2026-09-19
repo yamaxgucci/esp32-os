@@ -246,25 +246,50 @@ static int own_patch(int px, int py, int pw, int ph, int sx, int sy)
     if (pw <= 0 || ph <= 0) {
         return 0;
     }
-    for (int row = 0; row < ph; row++) {
-        for (int col = 0; col < pw; col++) {
-            s_band[row * pw + col] = pixel_at(px + col, py + row, sx, sy);
-        }
+
+    /*
+     * In strips the buffer can hold, because it could not hold what it was
+     * asked for and nothing said so.
+     *
+     * s_band is OWN_W * OWN_BAND pixels.  A box round the dot fitted; whole
+     * rows of the same height did not - 160 by 21 into room for 2560 - and
+     * the 1600 bytes past the end landed in the system heap, next to the
+     * application's own data where the loader puts it.  The board then died
+     * somewhere else entirely, in an allocator merging a block whose
+     * neighbour's header had been overwritten.  A buffer that cannot say no
+     * is a buffer that takes the machine down with it.
+     */
+    const int per = (OWN_W * OWN_BAND) / pw;
+    if (per <= 0) {
+        return 0;
     }
-    const ag_blit_t b = {
-        .px = s_band,
-        .stride = (uint16_t)(pw * (int)sizeof(uint16_t)),
-        .surf_w = OWN_W,
-        .surf_h = OWN_H,
-        .x = (uint16_t)px,
-        .y = (uint16_t)py,
-        .w = (uint16_t)pw,
-        .h = (uint16_t)ph,
-    };
-    const ag_err_t err = ag_gfx_present(&b);
-    if (err != AG_OK) {
-        ag_printf("present patch at %d,%d: %s\n", px, py, ag_strerror(err));
-        return 1;
+    for (int done = 0; done < ph; done += per) {
+        int rows = ph - done;
+        if (rows > per) {
+            rows = per;
+        }
+        for (int row = 0; row < rows; row++) {
+            for (int col = 0; col < pw; col++) {
+                s_band[row * pw + col] =
+                    pixel_at(px + col, py + done + row, sx, sy);
+            }
+        }
+        const ag_blit_t b = {
+            .px = s_band,
+            .stride = (uint16_t)(pw * (int)sizeof(uint16_t)),
+            .surf_w = OWN_W,
+            .surf_h = OWN_H,
+            .x = (uint16_t)px,
+            .y = (uint16_t)(py + done),
+            .w = (uint16_t)pw,
+            .h = (uint16_t)rows,
+        };
+        const ag_err_t err = ag_gfx_present(&b);
+        if (err != AG_OK) {
+            ag_printf("present patch at %d,%d: %s\n", px, py + done,
+                      ag_strerror(err));
+            return 1;
+        }
     }
     return 0;
 }
