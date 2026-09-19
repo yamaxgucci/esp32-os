@@ -887,6 +887,18 @@ static inline ag_err_t ag_ble_adv_status(ag_ble_adv_status_t *out)
     return g_ag_api->ble->adv_status(out);
 }
 
+/* Push bytes to the connected client as a GATT notification (board->phone,
+ * ABI 0.52).  One packet (<= the ATT MTU, ~180 bytes usable); chunk anything
+ * larger.  -AG_ENODEV until a client is connected, -AG_ENOSYS on an older
+ * kernel or a build with no BLE peripheral. */
+static inline ag_err_t ag_ble_adv_notify(const void *data, uint32_t len)
+{
+    if (!AG_HAS(g_ag_api->ble, adv_notify)) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->ble->adv_notify(data, len);
+}
+
 /* ---- BLE general: observer + GATT client (ABI 0.38) --------------------- */
 
 /*

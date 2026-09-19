@@ -1131,6 +1131,7 @@ static volatile bool     s_adv_is_midi; /* advertising as a MIDI device       */
 static volatile bool     s_adv_client;
 static volatile uint16_t s_periph_conn = 0xffff; /* the connected client       */
 static uint16_t          s_midi_val_handle;      /* set by ble_gatts_add_svcs  */
+static uint16_t          s_periph_val_handle;    /* the read/notify characteristic */
 static volatile uint32_t s_adv_writes;
 static uint8_t           s_adv_read[BLE_PERIPH_VAL_MAX];
 static volatile uint32_t s_adv_read_len;
@@ -1199,7 +1200,10 @@ static const struct ble_gatt_svc_def s_periph_svcs[] = {
             {
                 .uuid = &s_periph_rd_uuid.u,
                 .access_cb = periph_access,
-                .flags = BLE_GATT_CHR_F_READ,
+                /* Read for a client that polls, NOTIFY so the board can push -
+                 * the console and keys of the phone link cross this way. */
+                .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY,
+                .val_handle = &s_periph_val_handle,
             },
             {
                 .uuid = &s_periph_wr_uuid.u,
@@ -1403,6 +1407,30 @@ void ag_port_ble_adv_set_read(const void *data, uint32_t len)
         memcpy(s_adv_read, data, len);
     }
     s_adv_read_len = len;
+}
+
+/*
+ * Push bytes to the connected client as a GATT notification on the read
+ * characteristic - the board->phone direction the phone link needs, since a
+ * client cannot be made to poll fast enough for a live screen.  One packet, at
+ * most an ATT MTU's worth; the caller chunks anything larger.  -AG_ENODEV when
+ * nobody is connected or subscribed.
+ */
+ag_err_t ag_port_ble_adv_notify(const void *data, uint32_t len)
+{
+    if (s_periph_conn == 0xffff) {
+        return -AG_ENODEV;
+    }
+    if (data == NULL || len == 0u) {
+        return -AG_EINVAL;
+    }
+    struct os_mbuf *om = ble_hs_mbuf_from_flat(data, len);
+    if (om == NULL) {
+        return -AG_ENOMEM;
+    }
+    return (ble_gatts_notify_custom(s_periph_conn, s_periph_val_handle, om) == 0)
+               ? AG_OK
+               : -AG_EIO;
 }
 
 int32_t ag_port_ble_adv_last_write(uint8_t *out, uint32_t max)

@@ -170,6 +170,9 @@ extern "C" {
  *      worktree-usb-kvm calls its 0.45.  Whichever of those lands next has
  *      to RENUMBER rather than assume its number is free - and the check is
  *      one line: `git show <branch>:sdk/include/argon/abi.h | grep MINOR`.
+ * 0.52 appended ble->adv_notify: the peripheral pushes bytes to the connected
+ *      client as a GATT notification (board->phone), the direction the phone
+ *      link over BLE needs - a client cannot poll fast enough for a screen.
  * 0.51 appended task->stack_left: how much of the current task's stack has
  *      never been touched, for code that runs on a stack it does not own.  A
  *      driver called from a display callback spends the drawing application's,
@@ -205,7 +208,7 @@ extern "C" {
  *      number.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 51u
+#define AG_ABI_MINOR 52u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -1802,6 +1805,16 @@ typedef struct ag_ble_api {
      * adv_start and this share one advertising instance - use one at a time.
      */
     ag_err_t (*adv_raw)(const uint8_t addr[6], const void *data, uint32_t len);
+
+    /*
+     * ABI 0.52 - the peripheral pushes bytes to the connected client as a GATT
+     * notification on its read characteristic (NULL without the peripheral
+     * build).  This is the board->phone direction for a link over BLE: a client
+     * cannot be made to poll fast enough for a live screen.  One packet, at most
+     * an ATT MTU's worth (~180 bytes after overhead); the caller chunks more.
+     * -AG_ENODEV until a client is connected.
+     */
+    ag_err_t (*adv_notify)(const void *data, uint32_t len);
 } ag_ble_api_t;
 
 /* ------------------------------------------------------------------------ */

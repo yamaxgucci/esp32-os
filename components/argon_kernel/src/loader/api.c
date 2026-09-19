@@ -1208,6 +1208,11 @@ static ag_err_t api_ble_adv_status(ag_ble_adv_status_t *out)
 {
     return ag_port_ble_adv_status(out);
 }
+
+static ag_err_t api_ble_adv_notify(const void *data, uint32_t len)
+{
+    return ag_port_ble_adv_notify(data, len);
+}
 #endif /* AG_PORT_HAS_BLE_PERIPH */
 
 #if AG_PORT_HAS_BLE_CENTRAL
@@ -1290,6 +1295,7 @@ static const ag_ble_api_t k_ble = {
 #endif
 #if AG_PORT_HAS_BLE_PERIPH
     .adv_raw = api_ble_adv_raw,
+    .adv_notify = api_ble_adv_notify,
 #endif
 };
 #endif /* AG_PORT_HAS_BLE_PERIPH || AG_PORT_HAS_BLE_CENTRAL */
