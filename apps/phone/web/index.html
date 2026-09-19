@@ -140,6 +140,15 @@
   #kbd button.wide { flex: 2 1 0; }
   #kbd button.xwide { flex: 4 1 0; }
   #kbd button.mod { background: #2c3240; font-size: 13px; }
+  /* Arrows in an inverted-T: ↑ at the right end of the symbol row, ← ↓ → on the
+   * bottom row.  Fixed width so the two rows line up, and the ↑ pushed to sit
+   * over the ↓ (one arrow-width in from the right). */
+  #kbd button.arrow { background: #2c3240; flex: 0 0 46px; }
+  #kbd button.arrow.up { margin-left: auto; margin-right: 50px; }
+  /* The symbol row, narrower keys sized to their one character and centred, so
+   * the row does not stretch each key to a tenth of the screen - which also
+   * leaves room at its right end for the ↑ (excluded from this rule). */
+  #kbd .row.narrow button:not(.arrow) { flex: 0 1 auto; padding: 9px 13px; }
 
   #sink {
     /*
@@ -944,7 +953,7 @@ const KEYS = [
    ["n","N",K.n],["m","M",K.m],
    [",","<",K.comma],[".",">",K.period]],
   [["\\","|",K.backslash],[";",":",K.semicolon],["-","_",K.minus],
-   ["/","?",K.slash],["=","+",K.equal],["'","\"",K.quote],
+   [":",";",K.semicolon],["=","+",K.equal],["'","\"",K.quote],
    ["[","{",K.lbracket],["]","}",K.rbracket]],
 ];
 
@@ -992,6 +1001,11 @@ function buildKeyboard() {
   for (let i = 0; i < KEYS.length; i++) {
     const row = document.createElement("div");
     row.className = "row";
+    /* The symbol row's keys are one character each; let them be narrow rather
+     * than stretched, which also leaves the bottom row room for the arrows. */
+    if (i === 4) {
+      row.classList.add("narrow");
+    }
     if (i === 3) {
       const sh = specialButton("⇧", "mod shift", () => {
         shifted = !shifted;
@@ -1010,18 +1024,29 @@ function buildKeyboard() {
     if (i === 3) {
       row.appendChild(specialButton("⌫", "mod", () => tap(K.back)));
     }
+    /* The top of the arrow cluster: ↑ at the right end of the symbol row, so the
+     * four arrows form the usual inverted-T with ← ↓ → on the row below. */
+    if (i === 4) {
+      row.appendChild(specialButton("↑", "arrow up", () => tap(K.up)));
+    }
     ui.kbd.appendChild(row);
   }
 
   const last = document.createElement("div");
   last.className = "row";
-  last.appendChild(specialButton("Esc", "mod", () => tap(K.esc)));
-  last.appendChild(specialButton("Tab", "mod", () => tap(K.tab)));
+  /* `/` (with `?` on shift) where Esc used to be: Esc is already on the top
+   * strip, and a slash is wanted on the keyboard proper. */
+  last.appendChild(specialButton("/", "mod", () => {
+    sendKey(1, K.slash, shifted ? 63 : 47, st.sticky);
+    sendKey(2, K.slash, 0, st.sticky);
+    clearSticky();
+  }));
   /* Space carries its character as well as its usage id.  The kernel maps a
    * usage to a character for a real USB keyboard, so this would work either
    * way - but a key that means a character and does not say so is a key that
-   * depends on somebody else's table staying right. */
-  last.appendChild(specialButton("space", "xwide", () => {
+   * depends on somebody else's table staying right.  Narrower than before
+   * (wide, not xwide) and shifted left, to leave the right end for the arrows. */
+  last.appendChild(specialButton("space", "wide", () => {
     sendKey(1, K.space, 32, st.sticky);
     sendKey(2, K.space, 0, st.sticky);
     clearSticky();
@@ -1031,7 +1056,13 @@ function buildKeyboard() {
     sendKey(2, K.grave, 0, st.sticky);
     clearSticky();
   }));
-  last.appendChild(specialButton("⌫", "mod", () => tap(K.back)));
+  /* The foot of the arrow cluster: ← ↓ → bottom-right, with ↑ above the ↓ on
+   * the row above - the usual inverted-T.  Tab and backspace left this row to
+   * make room: Tab is on the top strip already, and backspace is on the row
+   * above (under the letters, where the deleting thumb wants it). */
+  last.appendChild(specialButton("←", "arrow", () => tap(K.left)));
+  last.appendChild(specialButton("↓", "arrow", () => tap(K.down)));
+  last.appendChild(specialButton("→", "arrow", () => tap(K.right)));
   ui.kbd.appendChild(last);
 }
 
