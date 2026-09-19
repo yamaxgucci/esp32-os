@@ -317,6 +317,22 @@ static struct {
     uint32_t      band_busy;
     uint32_t      band_refused;
     uint32_t      band_nostack;
+
+    /*
+     * Complaints owed from inside blit_rect.
+     *
+     * That call runs with the kernel's device registry held, and the console
+     * is a device: on the S3 a single ag_log from in there took the whole
+     * machine down, first flush, no output, no watchdog.  So the pixel path
+     * records what it would have said and the driver's task says it.
+     */
+    bool          owe_nomem;
+    char          owe_nomem_what[24];
+    uint32_t      owe_nomem_bytes;
+    bool          owe_noframe;
+    uint32_t      owe_frame_w, owe_frame_h;
+    bool          owe_nostack;
+    uint32_t      owe_stack_left;
     uint64_t      direct_last;
     uint32_t      stall_band;
     uint32_t      stall_text;
@@ -2089,20 +2105,59 @@ static bool ensure_listen(void)
  * is the process that happened to draw rather than this driver, so a refusal
  * with the system half free is that and not a shortage.
  */
+/*
+ * Reachable from blit_rect, so it does not speak - see `owe_nomem`.  It writes
+ * down what it would have said; the task says it, with the memory figures read
+ * there rather than here (ag_meminfo is an ABI call, and this is no place to
+ * make one either).
+ */
 static bool no_pixel_memory(const char *what, size_t bytes)
 {
-    static bool said;
-    if (!said) {
-        said = true;
+    if (!s.owe_nomem) {
+        size_t i = 0;
+        for (; what[i] != '\0' && i + 1u < sizeof(s.owe_nomem_what); i++) {
+            s.owe_nomem_what[i] = what[i];
+        }
+        s.owe_nomem_what[i] = '\0';
+        s.owe_nomem_bytes = (uint32_t)bytes;
+        s.owe_nomem = true;
+    }
+    return false;
+}
+
+/*
+ * The complaints owed by the pixel path, said from the task, which holds
+ * nothing.  Once each: they are about how the board is built, not about this
+ * frame.
+ */
+static void say_what_is_owed(void)
+{
+    if (s.owe_nomem) {
+        s.owe_nomem = false;
         ag_meminfo_t mi;
         ag_meminfo(&mi);
         ag_log(AG_LOG_WARN, "phone",
                "no memory for %s (%u bytes): arena %u free, %u largest; "
                "system %u free",
-               what, (unsigned)bytes, (unsigned)mi.arena_free,
-               (unsigned)mi.arena_largest, (unsigned)mi.system_free);
+               s.owe_nomem_what, (unsigned)s.owe_nomem_bytes,
+               (unsigned)mi.arena_free, (unsigned)mi.arena_largest,
+               (unsigned)mi.system_free);
     }
-    return false;
+    if (s.owe_noframe) {
+        s.owe_noframe = false;
+        ag_log(AG_LOG_WARN, "phone",
+               "no memory for a %ux%u frame (%u KB); sending from the drawing "
+               "task instead",
+               (unsigned)s.owe_frame_w, (unsigned)s.owe_frame_h,
+               (unsigned)((s.owe_frame_w * s.owe_frame_h * 2u) / 1024u));
+    }
+    if (s.owe_nostack) {
+        s.owe_nostack = false;
+        ag_log(AG_LOG_WARN, "phone",
+               "not sending the picture: %u bytes of the drawing task's stack "
+               "left, %u wanted - give it a bigger one (AG_APP_SIZED)",
+               (unsigned)s.owe_stack_left, (unsigned)BLIT_STACK_FLOOR);
+    }
 }
 
 static bool ensure_memory(void)
@@ -2195,10 +2250,9 @@ static bool ensure_memory(void)
          */
         if (!s.moaned_frame) {
             s.moaned_frame = true;
-            ag_log(AG_LOG_WARN, "phone",
-                   "no memory for a %ux%u frame (%u KB); sending from the "
-                   "drawing task instead",
-                   (unsigned)w, (unsigned)h, (unsigned)((w * h * 2u) / 1024u));
+            s.owe_frame_w = w;
+            s.owe_frame_h = h;
+            s.owe_noframe = true; /* said by the task: see say_what_is_owed */
         }
         s.want_w = 0;
         s.want_h = 0;
@@ -2272,6 +2326,10 @@ static void phone_task(void *arg)
     uint32_t laps = 0;
 
     while (!s.stop) {
+        /* Anything the pixel path could not say for itself - see the note
+         * above say_what_is_owed. */
+        say_what_is_owed();
+
         /*
          * A heartbeat, because "the board stopped accepting" is a thing that
          * cannot be caught in the act.  Every thirty seconds this says where the
@@ -2571,11 +2629,8 @@ static void phone_blit_rect(ag_handle_t h, const ag_blit_t *b)
                 s.band_nostack++;
                 if (!s.moaned_stack) {
                     s.moaned_stack = true;
-                    ag_log(AG_LOG_WARN, "phone",
-                           "not sending the picture: %u bytes of the drawing "
-                           "task's stack left, %u wanted - give it a bigger "
-                           "one (AG_APP_SIZED)",
-                           (unsigned)left, (unsigned)BLIT_STACK_FLOOR);
+                    s.owe_stack_left = left;
+                    s.owe_nostack = true; /* said by the task, not from here */
                 }
                 return;
             }

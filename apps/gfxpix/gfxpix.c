@@ -137,6 +137,46 @@ static void draw_scene(uint16_t w, uint16_t h)
 }
 
 /*
+ * The dot, on a board that has a surface of its own.
+ *
+ * The same sixty-four positions and the same ten frames a second as the
+ * surfaceless path - see spoke_at - but drawn with the system's own
+ * primitives, and flushed as a strip rather than a whole screen: 46 ms goes on
+ * a full 320x240 flush here, and the strip the dot moves through is a
+ * twentieth of it.
+ *
+ * Repainting the strip means repainting what the dot was standing on, which is
+ * why the circle, the diagonals and the corners are all redrawn clipped to it.
+ * Cheaper than keeping a copy of the background and correct without one.
+ */
+static void draw_dot_strip(uint16_t w, uint16_t h, int ox, int oy, int nx,
+                           int ny)
+{
+    int y0 = ((oy < ny) ? oy : ny) - 8;
+    int y1 = ((oy > ny) ? oy : ny) + 9;
+
+    if (y0 < 0) {
+        y0 = 0;
+    }
+    if (y1 > (int)h) {
+        y1 = (int)h;
+    }
+    if (y1 <= y0) {
+        return;
+    }
+
+    /*
+     * The background of the strip, rebuilt: the panel has no memory of what
+     * was under the dot and this program deliberately keeps none.
+     */
+    ag_gfx_clip(0, (int16_t)y0, w, (uint16_t)(y1 - y0));
+    draw_scene(w, h);
+    ag_gfx_fill_circle((int16_t)nx, (int16_t)ny, 6, 0x00FF2828u);
+    ag_gfx_clip_reset();
+    ag_gfx_flush(0, (uint16_t)y0, w, (uint16_t)(y1 - y0));
+}
+
+/*
  * The other way round: pixels the application owns, handed straight to the
  * panel (gfx->present, ABI 0.31).
  *
@@ -190,7 +230,24 @@ static const signed char k_quarter[16][2] = {
     {6, 15},  {5, 15},  {3, 16},  {2, 16},
 };
 
-/* Where the dot sits for a phase, in picture pixels. */
+/* Where the dot sits for a phase, on a picture of the given size. */
+static void spoke_at_size(int w, int h, int phase, int *sx, int *sy)
+{
+    const int cx = w / 2, cy = h / 2;
+    const int r = (w < h ? w : h) / 2 - 2 - 6;
+    const int q = (phase >> 4) & 3, i = phase & 15;
+    int       dx = k_quarter[i][0], dy = k_quarter[i][1];
+
+    for (int t = 0; t < q; t++) {
+        const int nx = -dy;
+        dy = dx;
+        dx = nx;
+    }
+    *sx = cx + (dx * r) / 16;
+    *sy = cy + (dy * r) / 16;
+}
+
+/* Where the dot sits for a phase, in the own-memory picture. */
 static void spoke_at(int phase, int *sx, int *sy)
 {
     const int cx = OWN_W / 2, cy = OWN_H / 2;
@@ -518,21 +575,46 @@ int ag_main(int argc, char **argv)
      * scroll is waiting to appear the moment it lets go - which is what made
      * the last run look like "the bottom half is green".
      */
-    if (hold_s != 0) {
-        ag_delay(hold_s * 1000u);
-        ag_gfx_release();
-        ag_printf("4 held %u s\n", (unsigned)hold_s);
-        return 0;
-    }
+    /*
+     * And then it moves, for as long as it is held.
+     *
+     * A still picture cannot say whether the thing showing it is alive, which
+     * is the whole complaint this program exists to answer - on the screen in
+     * front of the board and, through the phone driver, on a screen at the
+     * other end of a wire.
+     */
+    uint32_t   left = hold_s * 1000u;
+    const bool forever = (hold_s == 0u);
 
     for (;;) {
+        if (!forever && left == 0u) {
+            break;
+        }
+        const uint32_t nap = (forever || left > FRAME_MS) ? FRAME_MS : left;
+        ag_delay(nap);
+        if (!forever) {
+            left -= nap;
+        }
+
         ag_event_t ev;
+        bool       done = false;
         while (ag_poll_event(&ev, 0)) {
             if (ev.type == AG_EV_QUIT || ev.type == AG_EV_KEY_DOWN) {
-                ag_gfx_release();
-                return 0;
+                done = true;
             }
         }
-        ag_delay(30);
+        if (done || ag_interrupted()) {
+            break;
+        }
+
+        int ox, oy, nx, ny;
+        spoke_at_size(w, h, s_phase, &ox, &oy);
+        s_phase++;
+        spoke_at_size(w, h, s_phase, &nx, &ny);
+        draw_dot_strip(w, h, ox, oy, nx, ny);
     }
+
+    ag_gfx_release();
+    ag_printf("4 held %s\n", forever ? "until stopped" : "its time");
+    return 0;
 }
