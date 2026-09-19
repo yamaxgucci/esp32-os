@@ -337,3 +337,59 @@ void ag_port_watch_clear(int core)
     struct watch_req r = {.addr = NULL, .bytes = 0, .set = false, .ok = false};
     (void)watch_on_core(core, &r);
 }
+
+/* ------------------------------------------------------------------------ */
+/* Speaking past the kernel                                                  */
+/* ------------------------------------------------------------------------ */
+
+#include <stdarg.h>
+#include <stdio.h>
+
+#include "esp_rom_sys.h"
+#include "esp_timer.h"
+
+void ag_port_raw_print(const char *fmt, ...)
+{
+    char    buf[160];
+    va_list ap;
+
+    va_start(ap, fmt);
+    (void)vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    esp_rom_printf("%s", buf);
+}
+
+static esp_timer_handle_t s_lockwatch;
+static void (*s_lockwatch_fn)(void);
+
+static void lockwatch_tick(void *arg)
+{
+    (void)arg;
+    if (s_lockwatch_fn != NULL) {
+        s_lockwatch_fn();
+    }
+}
+
+bool ag_port_lockwatch_start(void (*fn)(void), uint32_t period_ms)
+{
+    if (fn == NULL || period_ms == 0u) {
+        return false;
+    }
+    s_lockwatch_fn = fn;
+    if (s_lockwatch == NULL) {
+        const esp_timer_create_args_t args = {
+            .callback = lockwatch_tick,
+            .arg = NULL,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "lockwatch",
+            .skip_unhandled_events = true,
+        };
+        if (esp_timer_create(&args, &s_lockwatch) != ESP_OK) {
+            return false;
+        }
+    } else {
+        (void)esp_timer_stop(s_lockwatch);
+    }
+    return esp_timer_start_periodic(s_lockwatch,
+                                    (uint64_t)period_ms * 1000ull) == ESP_OK;
+}

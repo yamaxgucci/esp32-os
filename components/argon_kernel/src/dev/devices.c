@@ -33,8 +33,10 @@
 #include <argon/btinput.h>
 #include <argon/usbinput.h>
 #include <argon/port/bt.h>
+#include <argon/port/fault.h>
 #include <argon/port/sync.h>
 #include <argon/port/task.h>
+#include <argon/port/time.h>
 #include <argon/port/usb.h>
 #include <argon/port/wifi.h>
 
@@ -49,16 +51,92 @@ static ag_port_mutex_t s_dev_mutex;
  * itself, and because the shell reads the registry from inside a listing it is
  * already walking.
  */
+/*
+ * Who holds the registry, since when, and inside which driver call.
+ *
+ * Written by the holder, read by a timer that takes no lock (see
+ * ag_dev_lockwatch): a torn read there costs a wrong number in a report, never
+ * anything worse, and the alternative - a lock around the record - would put
+ * the watch behind the thing it watches.  The depth is one counter and not one
+ * per task because a recursive mutex has one holder: whoever else calls
+ * dev_lock is asleep inside the take until that holder is gone.
+ */
+static volatile ag_port_task_t s_hold_task;
+static volatile int64_t        s_hold_since;
+static volatile uint32_t       s_hold_depth;
+static const char *volatile    s_note_dev;
+static const char *volatile    s_note_op;
+
 static void dev_lock(void *ctx)
 {
     (void)ctx;
     ag_port_mutex_take_recursive(s_dev_mutex, AG_PORT_FOREVER);
+    if (s_hold_depth++ == 0u) {
+        s_hold_task = ag_port_task_self();
+        s_hold_since = ag_port_us();
+    }
 }
 
 static void dev_unlock(void *ctx)
 {
     (void)ctx;
+    if (s_hold_depth != 0u && --s_hold_depth == 0u) {
+        s_hold_task = NULL;
+        s_hold_since = 0;
+        s_note_dev = NULL;
+        s_note_op = NULL;
+    }
     ag_port_mutex_give_recursive(s_dev_mutex);
+}
+
+void ag_dev_note_call(const char *dev, const char *op)
+{
+    s_note_dev = dev;
+    s_note_op = op;
+}
+
+void ag_dev_note_done(void)
+{
+    s_note_dev = NULL;
+    s_note_op = NULL;
+}
+
+/*
+ * Runs on the port's timer, holding nothing.  Two seconds is an order of
+ * magnitude past the longest honest hold on this system (a whole-panel flush,
+ * tens of milliseconds); anything longer is a driver that has stopped, and
+ * this is the one voice left to say whose.
+ */
+#define AG_LOCKWATCH_AFTER_US 2000000ll
+
+void ag_dev_lockwatch(void)
+{
+    static int64_t said_at;
+
+    const ag_port_task_t who = s_hold_task;
+    const int64_t        since = s_hold_since;
+    if (who == NULL || since == 0) {
+        said_at = 0;
+        return;
+    }
+    const int64_t now = ag_port_us();
+    if (now - since < AG_LOCKWATCH_AFTER_US) {
+        return;
+    }
+    if (said_at != 0 && now - said_at < AG_LOCKWATCH_AFTER_US) {
+        return;
+    }
+    said_at = now;
+
+    const char *dev = s_note_dev;
+    const char *op = s_note_op;
+    ag_port_raw_print("\n[lockwatch] device registry held %u ms by '%s'%s%s%s%s\n",
+                      (unsigned)((now - since) / 1000ll),
+                      ag_port_task_name(who),
+                      (dev != NULL) ? " inside " : "",
+                      (dev != NULL) ? dev : "",
+                      (op != NULL) ? "." : "",
+                      (op != NULL) ? op : "");
 }
 
 /*
@@ -251,6 +329,10 @@ ag_err_t ag_devices_init(void)
     if (err != AG_OK) {
         return err;
     }
+
+    /* The watch on that lock: see ag_dev_lockwatch.  Not fatal if the port
+     * cannot give a timer; the board is then as it was. */
+    (void)ag_port_lockwatch_start(ag_dev_lockwatch, 1000u);
 
     ag_devfs_reset();
     err = ag_vfs_mount("/dev", ag_devfs_ops(), NULL, 0);

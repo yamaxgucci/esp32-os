@@ -98,4 +98,19 @@ bool ag_port_watch_write(int core, const void *addr, size_t bytes);
 /* Drop the watch set by ag_port_watch_write, if any. */
 void ag_port_watch_clear(int core);
 
+/*
+ * Print past everything: no console, no log, no lock - straight to the UART
+ * through the ROM.  For the report that has to come out of a machine whose
+ * console is behind the very lock being reported on.  Busy-waits on the UART,
+ * so it is for a line a second, not for logging.
+ */
+void ag_port_raw_print(const char *fmt, ...);
+
+/*
+ * Call `fn` every `period_ms` from a context that holds none of the kernel's
+ * locks and does not wait for any of them, so that it still runs when the
+ * kernel does not.  One such timer; a second call replaces the first.
+ */
+bool ag_port_lockwatch_start(void (*fn)(void), uint32_t period_ms);
+
 #endif /* ARGON_PORT_FAULT_H */

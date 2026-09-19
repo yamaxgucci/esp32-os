@@ -390,7 +390,9 @@ static void render_one(const ag_screen_t *screen, const ag_display_ops_t *ops,
     if (!full && moved > 0u) {
         if (AG_HAS(ops, text_scroll) && ag_screen_scroll_usable(screen) &&
             moved < rows) {
+            ag_dev_note_call("text panel", "text_scroll");
             ops->text_scroll(0, moved);
+            ag_dev_note_done();
             /*
              * The caret moved with everything else, and this panel's record of
              * where it left one is now a row too low.  Forgetting it costs one
@@ -439,7 +441,9 @@ static void render_one(const ag_screen_t *screen, const ag_display_ops_t *ops,
             s_row[x].ch = (uint8_t)src[x].ch;
             s_row[x].attr = src[x].attr;
         }
+        ag_dev_note_call("text panel", "text_row");
         ops->text_row(0, y, s_row, cols);
+        ag_dev_note_done();
         /* A repainted row has painted over the caret. */
         if (y == tp->caret_row) {
             tp->caret_lit = false;

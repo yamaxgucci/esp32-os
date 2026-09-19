@@ -162,7 +162,9 @@ static void driver_present_blit(const ag_blit_t *b)
         if (!AG_HAS(ops, blit_rect) || ops->blit_rect == NULL) {
             continue;
         }
+        ag_dev_note_call(dev->name, "blit_rect");
         ops->blit_rect(0, b);
+        ag_dev_note_done();
     }
     ag_dev_lock_release();
 }

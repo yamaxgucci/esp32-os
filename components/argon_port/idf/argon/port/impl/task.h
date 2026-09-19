@@ -76,6 +76,13 @@ static inline ag_port_task_t ag_port_task_self(void)
     return xTaskGetCurrentTaskHandle();
 }
 
+/* The task's name, for a report; never NULL. */
+static inline const char *ag_port_task_name(ag_port_task_t t)
+{
+    const char *n = (t != NULL) ? pcTaskGetName(t) : NULL;
+    return (n != NULL) ? n : "?";
+}
+
 static inline void ag_port_task_prio_set(ag_port_task_t t, unsigned prio)
 {
     vTaskPrioritySet(t, (UBaseType_t)prio);
