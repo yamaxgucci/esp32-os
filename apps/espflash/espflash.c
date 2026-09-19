@@ -584,8 +584,17 @@ static void usage(void)
     ag_printf("  espflash id    [-c CHIP] [-p PORT] [-b BAUD] [-r GPIO0 RST]\n");
     ag_printf("  espflash write <file> [-a ADDR] [-c CHIP] [-p PORT] [-b BAUD]"
               " [-r GPIO0 RST]\n");
-    ag_printf("PORT default 1 (UART0 is the console), BAUD default 115200,"
-              " ADDR default 0.\n");
+    /*
+     * NOT "UART0 is the console", which was the old wording and is false on
+     * the two boards this matters most for: the C3 SuperMini and the S3-Zero
+     * talk over the chip's own USB, so UART0 there is an ordinary port - and
+     * on the Zero it is the pair the ROM itself uses, which is a reason to
+     * leave it alone that has nothing to do with the console.  The kernel used
+     * to believe the same thing and would not configure [uart0] at all; see
+     * boot/board.c.
+     */
+    ag_printf("PORT default 1; any port but this board's console.  BAUD"
+              " default 115200, ADDR default 0.\n");
     ag_printf("-c CHIP: auto (default) detects it; or name it - esp8266 esp32"
               " esp32s2 esp32s3 esp32c3 esp32c6 esp32c2 esp32h2\n");
     ag_printf("Omit -r on the CYD and enter download mode by hand.\n");

@@ -1496,6 +1496,49 @@ static int cmd_errorlevel(int argc, char **argv)
 
 static int cmd_reboot(int argc, char **argv)
 {
+    /*
+     * `reboot /download` comes back up as the chip's OWN ROM LOADER, so that
+     * something on the other end of a wire can flash this board - see
+     * docs/user/06-flashing-a-coprocessor.md.  It is the software half of the
+     * classic strap-and-reset dance, and it exists because on the boards this
+     * matters for the reset line is not brought out at all.
+     *
+     * A switch on `reboot` rather than a command of its own, because it IS a
+     * restart and a person looking for how to restart differently will look
+     * here.  What comes back is not this system, which is why it says so and
+     * why it says the price out loud.
+     */
+    if (argc >= 2 && (ag_path_icmp(argv[1], "/download") == 0 ||
+                      ag_path_icmp(argv[1], "/d") == 0)) {
+        if (!ag_port_download_boot_capable()) {
+            /*
+             * Said as the WIRING it implies, not as "unsupported".  The answer
+             * to this on an ESP32 is two wires and a flasher that drives them,
+             * which the person holding the board can act on; "not supported"
+             * is a dead end they would have to go and research.
+             */
+            ag_console_puts(
+                "this part has no software download boot: hold its boot pin "
+                "low\n  and pulse its reset line instead (ESPFLASH.AXE "
+                "-r <gpio0> <rst>)\n");
+            return 1;
+        }
+        /*
+         * THE PRICE, BEFORE THE FACT.  The bit lives in the RTC domain, a
+         * software reset does not clear it, and nothing in the ROM or in
+         * ESP-IDF clears it either.  A board sent here is a loader until it
+         * loses power - so anybody typing this on a board they cannot reach
+         * the plug of should know that before they press return, not after.
+         */
+        ag_console_puts(
+            "restarting as the ROM loader; it stays one until the power is "
+            "cut\n");
+        ag_console_sync();
+        ag_port_download_boot();
+        /* Only reached if the port declined after all. */
+        ag_console_puts("it did not go\n");
+        return 1;
+    }
     (void)argc;
     (void)argv;
 
@@ -5515,7 +5558,8 @@ static const ag_command_t k_commands[] = {
     {"run", "[/b] <file> [args]", "run an application or .bat script", cmd_run},
     {"call", "<script.bat>", "run a shell command script", cmd_call},
     {"errorlevel", "", "exit code of the last command", cmd_errorlevel},
-    {"reboot", "", "restart the board", cmd_reboot},
+    {"reboot", "[/download]", "restart the board (/download: as the ROM loader)",
+     cmd_reboot},
     {NULL, NULL, NULL, NULL},
 };
 

@@ -1,0 +1,26 @@
+# ArgonOS - 4 MB, arranged for a board whose job includes FLASHING ANOTHER ONE.
+#
+# partitions_4mb.csv gives C: 512 KB and the loader's slot area 1.5 MB, which is
+# the right shape for a board that runs programs.  The S3-Zero also carries the
+# C3's firmware - about a megabyte - because it is the flasher on that pair, and
+# a megabyte does not go into 512 KB.
+#
+# So the two are swapped round.  What that costs is the slot area, which on this
+# board holds nine images under a kilobyte each: it is the one partition here
+# with nothing in it.
+#
+# THE ALTERNATIVE WAS TO READ THE FIRMWARE OVER THE WIRE, off the CYD's card
+# through the remote drive, and it is rejected on purpose: the times you need to
+# flash the C3 are exactly the times the cluster is not working.  A rescue tool
+# must not depend on the thing it rescues.
+#
+# Changing this table is a FULL ERASE - C: goes with it.  That is free now and
+# will not be later, which is the argument for doing it before the board is in
+# service rather than after.
+#
+# Name,     Type, SubType,  Offset,   Size,
+nvs,        data, nvs,      0x9000,   0x6000,
+phy_init,   data, phy,      0xf000,   0x1000,
+factory,    app,  factory,  0x10000,  0x1F0000,
+sysfs,      data, littlefs, 0x200000, 0x160000,
+appfs,      data, 0x40,     0x360000, 0xA0000,

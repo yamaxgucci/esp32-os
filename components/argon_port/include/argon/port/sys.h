@@ -28,6 +28,19 @@
  * board that "seems to have restarted" into a board that says why.
  *   void       ag_port_restart(void)         does not return
  *
+ *   bool       ag_port_download_boot_capable(void)
+ *   void       ag_port_download_boot(void)   does not return, when capable
+ *
+ * download_boot restarts into the chip's OWN ROM LOADER, so that something on
+ * the other end of a wire can flash this board.  It is a separate call and not
+ * a flag on restart because it is not a restart in the sense anything else
+ * means: what comes back up is not this system.
+ *
+ * A port with no such facility answers false and does nothing, which is the
+ * honest answer for a part whose only way into the loader is a pin held low
+ * while the reset line is pulsed.  The two are not interchangeable and the
+ * caller has to be able to tell, because the wiring differs.
+ *
  *   uint8_t  ag_port_cpu_cores(void)
  *   uint8_t  ag_port_cpu_revision(void)      major revision, 0 if unknown
  *   uint32_t ag_port_cpu_hz(void)

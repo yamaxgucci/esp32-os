@@ -60,6 +60,14 @@ static inline ag_reset_t ag_port_reset_reason(void)
 
 static inline void ag_port_restart(void) { esp_restart(); }
 
+/*
+ * Out of line, in src/dlboot_hw.c, and that is not a style choice: it wants the
+ * chip's RTC register map, and this header is pulled into most of the kernel.
+ * A macro table belongs in one translation unit, not in all of them.
+ */
+bool ag_port_download_boot_capable(void);
+void ag_port_download_boot(void);
+
 static inline uint8_t ag_port_cpu_cores(void)
 {
     esp_chip_info_t chip;

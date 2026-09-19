@@ -7,12 +7,16 @@
 # Layered after sdkconfig.defaults.esp32s3, which assumes an N16R8 module
 # (8 MB flash, octal PSRAM, UART console); this trims it to what this chip has.
 
-# 4 MB flash and the matching partition table.  C: (sysfs, littlefs) holds
-# BOARD.CFG - there is no card on this board.
+# 4 MB flash and a partition table of this board's own.  C: (sysfs, littlefs)
+# holds BOARD.CFG - there is no card on this board - and, because this board is
+# the flasher of the C3 beside it, the C3's FIRMWARE: about a megabyte, which
+# does not go into the 512 KB the ordinary 4 MB table gives C:.  So C: and the
+# loader's slot area are swapped round; see partitions_4mb_zero.csv for what
+# that costs and why reading it over the wire instead was rejected.
 CONFIG_ESPTOOLPY_FLASHSIZE_8MB=n
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 CONFIG_PARTITION_TABLE_CUSTOM=y
-CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_4mb.csv"
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_4mb_zero.csv"
 
 # This module's PSRAM is quad, not the octal the primary target assumes.  It is
 # on because the bigger apps - DX7 and the like - ask for a ~192 KB arena that

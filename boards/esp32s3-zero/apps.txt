@@ -23,3 +23,8 @@ GRINDRV.AXE
 NODEHI32.AXE
 MIGRAN32.AXE
 GRIND32.AXE
+# And the reason this board's C: is bigger than the other 4 MB boards': it is
+# the FLASHER of the C3, which sits on a power bank with no data cable of its
+# own.  ESPFLASH talks the ROM loader's protocol down [uart2]; the firmware it
+# writes is a file on this C:, put there with boardput over the network.
+ESPFLASH.AXE

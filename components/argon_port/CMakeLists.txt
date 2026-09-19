@@ -16,7 +16,25 @@ endif()
 # Sources belonging to the chosen port.  The header part of the contract costs
 # nothing (see README: static inline, or it does not belong here); these are the
 # subsystems that are genuinely machine-specific.
-file(GLOB ARGON_PORT_SRCS "${CMAKE_CURRENT_LIST_DIR}/${ARGON_PORT}/src/*.c")
+#
+# CONFIGURE_DEPENDS, and it is worth the re-glob it costs.  A plain GLOB is
+# evaluated once and cached, so a NEW file in that directory does not build and
+# the failure arrives as a linker error naming functions that are sitting right
+# there in the file you just wrote.  Ten minutes each time, and the cure is not
+# discoverable from the message.
+#
+# NOT IN SCRIPT MODE.  ESP-IDF runs every component's CMakeLists a second time
+# under `cmake -P` to collect its requirements, and CONFIGURE_DEPENDS is
+# refused outright there ("invalid for script and find package modes") - which
+# fails the whole configure, some way from this line.  The requirements pass
+# does not care which sources exist, so the plain glob is the right answer to
+# give it.
+if(CMAKE_SCRIPT_MODE_FILE)
+    file(GLOB ARGON_PORT_SRCS "${CMAKE_CURRENT_LIST_DIR}/${ARGON_PORT}/src/*.c")
+else()
+    file(GLOB ARGON_PORT_SRCS CONFIGURE_DEPENDS
+         "${CMAKE_CURRENT_LIST_DIR}/${ARGON_PORT}/src/*.c")
+endif()
 
 # The exception table fault_hw.c installs into is the one thing here that is
 # named after the instruction set rather than after the chip.  `xtensa` is a
