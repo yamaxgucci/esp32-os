@@ -842,20 +842,25 @@ static void drop_conn_reason(const char *why, bool gone)
     /* A new client is not the old one's shut window. */
     s.hush_until = 0u;
     /*
-     * And the picture buffers go back to the machine.  Nobody is being sent a
-     * screen, and the next application to start would rather have the
-     * thirteen kilobytes than have the driver hold them against a phone that
-     * may not return for hours.
+     * The picture buffers are NOT freed here, and that is a fix, not an
+     * oversight.
+     *
+     * They used to be, on the argument that a client gone should give its
+     * thirteen kilobytes back.  But this runs on the driver's task, and the
+     * same buffers are allocated and read on the DRAWING application's task
+     * inside blit_rect - two tasks, no shared lock over the pointers.  A
+     * disconnect during a picture (a slot switch, a second browser taking the
+     * link) therefore freed s.pix/s.band/s.out from under a blit_rect that was
+     * still using or allocating them: a double-free that comprehensive heap
+     * poisoning caught as `CORRUPT HEAP: Bad head ... got 0xfefefefe` under
+     * multi_heap_free, and that otherwise showed up as the board freezing or
+     * resetting on the first slot switch.
+     *
+     * They are small (about thirteen kilobytes, from PSRAM on a board that has
+     * it) and they are freed once, on the driver's own task, when the task
+     * exits - the one place nothing else can be touching them.  Held for the
+     * life of the driver rather than freed across a task boundary.
      */
-    if (s.pix != NULL || s.band != NULL || s.out != NULL) {
-        ag_free(s.pix);
-        ag_free(s.band);
-        ag_free(s.out);
-        s.pix = NULL;
-        s.band = NULL;
-        s.out = NULL;
-        s.want_pixels = false;
-    }
     s.last_life_us = 0u;
     if (s.conn >= 0) {
         if (!gone || ag_net_reset(s.conn) != AG_OK) {
@@ -1551,6 +1556,51 @@ static uint32_t utf8_next(const uint8_t *p, uint32_t len, uint32_t *at)
     return cp;
 }
 
+/* ---- the input write-ahead log ----------------------------------------- */
+/*
+ * Every key and tap from the page is written to C:\PHONELOG.TXT and flushed to
+ * flash BEFORE it is acted on.  A driver's ag_log reaches only the journal in
+ * RAM, and a watchdog reset wipes that - so the very input that hung the board
+ * would vanish with it.  Synced ahead of the injection, the last line in this
+ * file is the one that did it, and the whole file replays the session.  Asked
+ * for on 19 September: "record my presses so they can be replayed and the hang
+ * caught."
+ *
+ * Opened, written, synced and closed per event: slow by flash standards and
+ * nothing by human ones, and the point is durability, not throughput.  Pointer
+ * moves are not logged - they arrive many times a second and never carry the
+ * fault - only key up/down, typed text, taps and the wheel.
+ */
+#define INLOG_PATH "C:\\PHONELOG.TXT"
+#define INLOG_CAP  (64u * 1024u)
+static uint32_t s_inlog_bytes;
+
+static void input_log(const char *line)
+{
+    if (line == NULL || !AG_HAS(ag_api()->fs, write)) {
+        return;
+    }
+    const uint32_t n = (uint32_t)strlen(line);
+    uint32_t flags = AG_O_WRONLY | AG_O_CREATE | AG_O_APPEND;
+    if (s_inlog_bytes + n > INLOG_CAP) {
+        /* Wrap rather than grow without bound: a long session keeps its most
+         * recent trail, which is the part a hang is at the end of. */
+        flags = AG_O_WRONLY | AG_O_CREATE | AG_O_TRUNC;
+        s_inlog_bytes = 0u;
+    }
+    const ag_handle_t f = ag_open(INLOG_PATH, flags);
+    if (f < 0) {
+        return;
+    }
+    if (ag_write(f, line, n) == (int32_t)n) {
+        s_inlog_bytes += n;
+    }
+    /* Sync, so the line is on flash before the injection below runs - the whole
+     * point is that a line survives the input that hangs the board. */
+    (void)ag_sync(f);
+    (void)ag_close(f);
+}
+
 static void handle_message(const uint8_t *p, uint32_t len)
 {
     if (len == 0u) {
@@ -1559,6 +1609,7 @@ static void handle_message(const uint8_t *p, uint32_t len)
     const uint8_t op = p[0];
     const uint8_t *body = p + 1;
     const uint32_t n = len - 1u;
+    const unsigned ms = (unsigned)(ag_micros() / 1000ull);
 
     /*
      * Before the answer, the only thing this end listens to is the answer.  A
@@ -1579,6 +1630,11 @@ static void handle_message(const uint8_t *p, uint32_t len)
         uint8_t want[DIGEST_LEN];
         expected_digest(want);
         if (memcmp(want, body, DIGEST_LEN) != 0) {
+            {
+                char b[48];
+                (void)snprintf(b, sizeof(b), "%u ---- bad password ----\n", ms);
+                input_log(b);
+            }
             ag_log(AG_LOG_WARN, "phone", "wrong password");
             /* Slowly, and then hang up.  Slowly so that guessing over a network
              * is a week rather than an afternoon; hang up so the next attempt
@@ -1590,16 +1646,35 @@ static void handle_message(const uint8_t *p, uint32_t len)
         }
         s.authed = true;
         s.owe_everything = true;
+        {
+            char b[48];
+            (void)snprintf(b, sizeof(b), "%u ==== authenticated ====\n", ms);
+            input_log(b);
+        }
         ag_log(AG_LOG_INFO, "phone", "client authenticated");
         break;
     }
 
-    case IN_HELLO:
+    case IN_HELLO: {
+        char b[40];
+        (void)snprintf(b, sizeof(b), "%u hello\n", ms);
+        input_log(b);
         s.owe_everything = true;
         break;
+    }
 
     case IN_KEY:
         if (n >= 7u) {
+            /* Write-ahead: on flash before it is injected, so a key that hangs
+             * the board is still the last line in the log after the reset. */
+            char b[80];
+            (void)snprintf(b, sizeof(b),
+                           "%u key %s mods=%u hid=%u uni=%u rpt=%u\n", ms,
+                           (body[0] == 1u) ? "down"
+                                           : (body[0] == 2u) ? "up" : "?",
+                           (unsigned)body[1], (unsigned)rd16(body + 2),
+                           (unsigned)rd16(body + 4), (unsigned)body[6]);
+            input_log(b);
             inject_key(body[0], body[1], rd16(body + 2), rd16(body + 4),
                        body[6] != 0u);
         }
@@ -1608,6 +1683,22 @@ static void handle_message(const uint8_t *p, uint32_t len)
     case IN_PTR:
         if (n >= 7u) {
             ag_event_t ev;
+            /* Write-ahead, but not for moves: a tap (down/up) or the wheel can
+             * hang the board through a redraw; a move never has, and there are
+             * hundreds a second of them. */
+            if (body[0] == 1u || body[0] == 2u || body[0] == 4u) {
+                char b[80];
+                (void)snprintf(b, sizeof(b),
+                               "%u ptr %s btn=%u x=%d y=%d w=%d\n", ms,
+                               (body[0] == 1u) ? "down"
+                                               : (body[0] == 2u) ? "up"
+                                                                 : "wheel",
+                               (unsigned)body[1],
+                               (int)(int16_t)rd16(body + 2),
+                               (int)(int16_t)rd16(body + 4),
+                               (int)(int8_t)body[6]);
+                input_log(b);
+            }
             /*
              * The second button, written down when it arrives.
              *
@@ -1649,6 +1740,14 @@ static void handle_message(const uint8_t *p, uint32_t len)
         break;
 
     case IN_TEXT: {
+        {
+            /* The typed text itself, capped so one paste cannot fill the log. */
+            char b[80];
+            const uint32_t take = (n < 48u) ? n : 48u;
+            (void)snprintf(b, sizeof(b), "%u text \"%.*s\"\n", ms, (int)take,
+                           (const char *)body);
+            input_log(b);
+        }
         uint32_t at = 0;
         while (at < n) {
             const uint32_t cp = utf8_next(body, n, &at);
@@ -2275,9 +2374,14 @@ static bool ensure_memory(void)
     s.dy1 = 0;
     s.want_w = 0;
     s.want_h = 0;
+    /* Freed inside the lock: send_band reads s.frame under this same lock, so
+     * the old buffer cannot be handed to it and freed at the same time.  This
+     * grow runs on whichever task drew (blit_rect calls ensure_memory), which
+     * is not the task that reads the frame - the same cross-task hazard the
+     * buffer frees above were removed for. */
+    ag_free(old);
     unlock();
 
-    ag_free(old);
     ag_log(AG_LOG_INFO, "phone", "frame %ux%u (%u KB)", (unsigned)w,
            (unsigned)h, (unsigned)((w * h * 2u) / 1024u));
     s.owe_everything = true;
@@ -2398,7 +2502,25 @@ static void phone_task(void *arg)
             continue;
         }
         stage_enter(3);
-        if (s.want_pixels && !ensure_memory()) {
+        /*
+         * Allocate on THIS task, and on a frame board do it before anything has
+         * drawn - not only after the first blit set want_pixels.
+         *
+         * Two things were wrong when the buffers were taken inside blit_rect.
+         * First, blit_rect runs on the drawing application's task, so the
+         * allocation was charged to that application's arena - small internal
+         * SRAM on a .AXE - and a 5 KB band failed there while the driver's own
+         * eight megabytes of PSRAM sat free, which is the "no memory for a band:
+         * arena 8 MB free" that made no sense.  Second, the failure dropped the
+         * application's FIRST blit, and for a program that paints a whole scene
+         * once and then only animates a strip (gfxpix), that first blit IS the
+         * scene: the phone then showed black everywhere the moving dot had not
+         * yet been.  Taken here, on a task that belongs to no process, the frame
+         * comes from the driver's PSRAM and is ready before the scene is drawn,
+         * so the scene lands in it and every client - even one that connects
+         * later - gets the whole picture from owe_everything.
+         */
+        if ((s.want_frame || s.want_pixels) && !ensure_memory()) {
             TASK->sleep_ms(500u);
             continue;
         }
@@ -2575,21 +2697,32 @@ static ag_err_t phone_info(ag_handle_t h, ag_gfxinfo_t *out)
 static void phone_blit_rect(ag_handle_t h, const ag_blit_t *b)
 {
     s.blits++;
-    /*
-     * From here on the picture buffers are worth their room - and this is the
-     * path that needs them, so it takes them itself rather than waiting a lap
-     * for the task to notice.  A refusal here is a rectangle not sent, which
-     * is a screen that does not update; it is not a board that stops
-     * answering, and that is the right way round.
-     */
-    s.want_pixels = true;
-    if (!ensure_memory()) {
-        s.band_nomem++;
+    (void)h;
+    if (b == NULL || b->px == NULL || b->w == 0u || b->h == 0u) {
         return;
     }
 
-    (void)h;
-    if (b == NULL || b->px == NULL || b->w == 0u || b->h == 0u) {
+    /*
+     * The picture buffers are NOT allocated here, and that is the whole of the
+     * crash the board kept hitting.
+     *
+     * blit_rect runs on the DRAWING application's task, so an ag_malloc here
+     * comes from that application's arena - and when the application exits, its
+     * arena is freed whole, taking the driver's band, encoder and frame with it
+     * while the driver still points at them.  The driver then went on writing
+     * pixels into freed memory: comprehensive heap poisoning caught it as
+     * "CORRUPT HEAP: ... got 0xf800..." - an RGB565 red in a block that should
+     * have held the free pattern - and without poisoning it was the board
+     * freezing or resetting a moment after a program that drew was stopped.
+     *
+     * The buffers therefore belong to the driver's own task, which has no
+     * process and takes them from the driver's heap (the ensure_memory call in
+     * phone_task).  Here we only USE them: if the task has not made them yet,
+     * drop this rectangle - it allocates within a lap and the next one lands.
+     */
+    s.want_pixels = true;
+    if (s.pix == NULL || s.band == NULL || s.out == NULL) {
+        s.band_nomem++;
         return;
     }
 
@@ -2599,7 +2732,20 @@ static void phone_blit_rect(ag_handle_t h, const ag_blit_t *b)
      * Not a fallback bolted on - it is the only way a board with 179 KB and no
      * PSRAM can show a picture at all.
      */
-    if (s.frame == NULL && s.pix != NULL) {
+    if (s.frame == NULL) {
+        /*
+         * A frame board whose task has not made the frame yet: drop this
+         * rectangle and tell the task the size to make.  Do NOT fall into the
+         * direct path below - it encodes and sends from this, the drawing
+         * application's, stack, which was its own source of resets.  On a frame
+         * board the frame is ready within a lap of boot, so this is only ever
+         * the first blit or two.
+         */
+        if (s.want_frame) {
+            s.want_w = b->surf_w;
+            s.want_h = b->surf_h;
+            return;
+        }
         /*
          * The surface's size, learned from the blit itself.  With no frame
          * there is nothing else that knows it, and the page needs it to size
@@ -3051,6 +3197,24 @@ ag_err_t ag_driver_init(void)
          * whenever anything ran.  They are taken when the first rectangle
          * arrives and given back when the client goes.
          */
+    }
+
+    /*
+     * The input log's running size, and a line that marks this boot.
+     *
+     * The size is read from the file so append lands past what a previous boot
+     * wrote and the cap still bounds it.  The boot marker is the divider a hang
+     * is found by: the last input line before a "boot" line is the one the
+     * board reset on.
+     */
+    if (AG_HAS(api->fs, write)) {
+        ag_stat_t lst;
+        s_inlog_bytes = (ag_stat(INLOG_PATH, &lst) == AG_OK)
+                            ? (uint32_t)lst.size
+                            : 0u;
+        char b[64];
+        (void)snprintf(b, sizeof(b), "==== boot %s ====\n", "PHONE " "1.0");
+        input_log(b);
     }
 
     ag_module_on_unload(phone_fini);
