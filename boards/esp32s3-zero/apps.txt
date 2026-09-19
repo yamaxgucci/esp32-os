@@ -1,20 +1,25 @@
 # What goes on this board's C:, staged by tools\mksysfs.py.
 #
 # The rule, the same as on the other two: a board carries the images its
-# NEIGHBOURS can execute as well as its own.  This one has two neighbours of
-# two different instruction sets, so it carries three builds of the programs
-# that travel - and being the middle of the star, it is the board a program
-# passes through.
+# NEIGHBOURS can execute as well as its own.  This one is a LEAF with a single
+# neighbour, the C3, so its own Xtensa LX7 and the C3's RISC-V are what it
+# needs to hand anything over.
+#
+# THE CYD'S LX6 BUILDS ARE HERE ANYWAY, and that is deliberate: the CYD is two
+# hops away, a program sent there passes through the C3, and the board that
+# ASKS is the one that must carry an image the far board can run.  Three small
+# files against a 4 MB flash is not a saving worth a journey that fails at the
+# far end.
 #
 # Xtensa LX7, for this board itself:
 NODEHI.AXE
 MIGRANT.AXE
 GRIND.AXE
-# Xtensa LX6, for the CYD next door:
-NODEHI32.AXE
-MIGRAN32.AXE
-GRIND32.AXE
 # RISC-V, for the C3 next door:
 NODEHIRV.AXE
 MIGRANRV.AXE
 GRINDRV.AXE
+# Xtensa LX6, for the CYD two hops away:
+NODEHI32.AXE
+MIGRAN32.AXE
+GRIND32.AXE

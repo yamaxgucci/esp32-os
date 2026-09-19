@@ -1054,7 +1054,14 @@ void ag_io_register_devices(void)
             register_bus(k_spi_names[i], "spi", AG_DEV_BUS);
         }
     }
-    for (int i = 1; i < AG_UART_PORTS; i++) {
+    /* Skipping the CONSOLE's port rather than port zero, for the reason
+     * written up at the configuration loop in boot/board.c: on a board whose
+     * console is the chip's own USB, UART0 is an ordinary free port and a
+     * board that configured it would not have seen it listed in `dev`. */
+    for (int i = 0; i < AG_UART_PORTS; i++) {
+        if (i == AG_PORT_UART_CONSOLE) {
+            continue;
+        }
         const ag_board_uart_t *cfg = &ag_board()->uart[i];
         if (cfg->tx >= 0 || cfg->rx >= 0) {
             register_bus(k_uart_names[i], "uart", AG_DEV_BUS);

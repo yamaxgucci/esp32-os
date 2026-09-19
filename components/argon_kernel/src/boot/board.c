@@ -11,6 +11,9 @@
 #include <argon/path.h>
 
 #include <argon/port/config.h>
+/* For AG_PORT_UART_CONSOLE: which port is the one the system talks over is a
+ * property of the board, not a constant - see the UART loop below. */
+#include <argon/port/uart.h>
 
 #include "sdkconfig.h"
 
@@ -200,9 +203,31 @@ static void apply_bus_config(const ag_cfg_t *cfg)
         bus->khz = cfg_rate(cfg, key, bus->khz, 80000);
     }
 
-    /* UART0 is the console and is not configurable here: the pins it uses are
-     * the ones the system is talking to you over. */
-    for (int i = 1; i < AG_UART_PORTS; i++) {
+    /*
+     * EVERY PORT BUT THE CONSOLE'S, and which one that is depends on the board.
+     *
+     * This loop started at 1, with a comment saying UART0 is the console and
+     * the pins it uses are the ones the system is talking to you over.  True
+     * on a board with a USB-to-UART bridge, and FALSE on the two that have
+     * none: the C3 SuperMini and the S3-Zero talk over the chip's own
+     * USB-Serial-JTAG, the port layer models that as a pseudo-port past the
+     * real UARTs (AG_PORT_UART_CONSOLE), and UART0 on those boards drives two
+     * header pins that nothing else wants.
+     *
+     * What the old rule cost: a `[uart0]` section was read by nobody and said
+     * so to nobody.  The C3 has exactly two UARTs, so refusing UART0 refused
+     * it a SECOND WIRE - which is the whole of a three-board cluster with the
+     * C3 in the middle.  The pins were free the entire time.
+     *
+     * The ROM still prints its reset banner on UART0's DEFAULT pins (20/21 on
+     * the C3), whatever the matrix is told afterwards.  That is an argument
+     * for putting the wire on other pins, not for leaving the port unusable -
+     * and the pin table refuses the console's own pins by number either way.
+     */
+    for (int i = 0; i < AG_UART_PORTS; i++) {
+        if (i == AG_PORT_UART_CONSOLE) {
+            continue;
+        }
         ag_board_uart_t *port = &s_board.uart[i];
 
         snprintf(key, sizeof(key), "uart%d.tx", i);

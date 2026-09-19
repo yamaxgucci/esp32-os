@@ -2,6 +2,11 @@
 # apps.txt for the rule: each board carries what its neighbour can execute as
 # well as its own.
 #
+# THIS BOARD HAS TWO NEIGHBOURS OF TWO DIFFERENT INSTRUCTION SETS, so it is the
+# only one of the three that carries all three builds of the programs that
+# travel.  It is also the board a message between the other two passes through,
+# which is the middle's job and the reason the list is longest here.
+#
 # RISC-V, for this board itself:
 DEVPOKRV.AXE
 GRINDRV.AXE
@@ -12,5 +17,11 @@ NODEHIRV.AXE
 # all, so a tone started here has to land on the neighbour's - which is what
 # the class default is for, and what the sound scenario checks.
 TONERV.AXE
-# Xtensa, for the CYD next door to be handed:
+# Xtensa LX6, for the CYD on uart1:
 NODEHI32.AXE
+GRIND32.AXE
+MIGRAN32.AXE
+# Xtensa LX7, for the S3-Zero on uart0:
+NODEHI.AXE
+GRIND.AXE
+MIGRANT.AXE

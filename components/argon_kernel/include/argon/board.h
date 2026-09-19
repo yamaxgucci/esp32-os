@@ -75,7 +75,16 @@ typedef struct {
  */
 #define AG_I2C_BUSES 2  /* I2C0, I2C1                                       */
 #define AG_SPI_BUSES 2  /* SPI2, SPI3; SPI1 belongs to the flash            */
-#define AG_UART_PORTS 3 /* UART0 is the console                             */
+/*
+ * UART0, UART1, UART2 - every port the widest chip here has, INCLUDING UART0.
+ *
+ * It used to read "UART0 is the console" and the configuration loop skipped
+ * it.  That is true of a board with a USB-to-UART bridge and false of the C3
+ * SuperMini and the S3-Zero, which talk over the chip's own USB-Serial-JTAG
+ * and have UART0 sitting free on the header.  Which port is the console is
+ * AG_PORT_UART_CONSOLE, a property of the board; it is not this number.
+ */
+#define AG_UART_PORTS 3
 
 #define AG_SPI_FIRST 2 /* the chip's number of the first usable SPI         */
 
