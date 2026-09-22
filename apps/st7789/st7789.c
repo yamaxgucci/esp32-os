@@ -4,13 +4,14 @@
  *   drv install c:\st7789.sys
  *   dev                       -> lcd0  display  ST7789
  *
- * Two panels, both ST7789, and one file: the Waveshare ESP32-C6-LCD-1.47's
- * 1.47 inch 172x320, driven landscape as 320x172, and a 2.0 inch 240x320
- * module soldered to the ESP32-S3-WROOM CAM board's header, driven landscape
- * as 320x240.  The difference between them is the block of constants below
- * and nothing else; -DST7789_BOARD_S3CAM picks the second, and
- * tools/apps.json builds both, as ST7789.SYS (RISC-V) and ST7789S3.SYS
- * (xtensa).
+ * Three panels, all ST7789, and one file: the Waveshare ESP32-C6-LCD-1.47's
+ * 1.47 inch 172x320, driven landscape as 320x172; a 2.0 inch 240x320 module
+ * soldered to the ESP32-S3-WROOM CAM board's header, driven landscape as
+ * 320x240; and the Waveshare ESP32-S3-Touch-LCD-2's own 2 inch 240x320, also
+ * driven landscape as 320x240.  The difference between them is the block of
+ * constants below and nothing else; -DST7789_BOARD_S3CAM picks the second and
+ * -DST7789_BOARD_LCD2 the third, and tools/apps.json builds all three, as
+ * ST7789.SYS (RISC-V), ST7789S3.SYS and ST7789LCD2.SYS (xtensa).
  *
  * Written from apps/ili9341/ili9341.c, which it
  * follows closely on purpose - the console path, the window tracking, the
@@ -32,6 +33,10 @@
  *       --cflags "-Os -ffunction-sections -fdata-sections -DST7789_BOARD_S3CAM" \
  *       --include sdk/include --include apps/common \
  *       -o build/apps/ST7789S3.SYS apps/st7789/st7789.c
+ *   python tools/mkaxe.py --arch xtensa --gcc xtensa-esp32s3-elf-gcc \
+ *       --cflags "-Os -ffunction-sections -fdata-sections -DST7789_BOARD_LCD2" \
+ *       --include sdk/include --include apps/common \
+ *       -o build/apps/ST7789LCD2.SYS apps/st7789/st7789.c
  *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
  */
@@ -102,6 +107,66 @@ AG_DRV("ST7789", "0.2", "argon");
 #define LCD_X_OFF 0
 #define LCD_Y_OFF 0
 
+#elif defined(ST7789_BOARD_LCD2)
+
+/*
+ * The Waveshare ESP32-S3-Touch-LCD-2's own panel: 2 inch 240x320 IPS on an
+ * ST7789T3, driven landscape as 320x240.
+ *
+ * The control lines are not negotiable and they are not the S3-CAM's: chip
+ * select 45, data/command 42, backlight 1, and NO RESET LINE AT ALL.  Both
+ * vendor ports say so - the IDF example passes reset_gpio_num = -1
+ * (06_lvgl_example/main/main.c) and the Arduino one passes RST -1 to the panel
+ * constructor (01_factory/bsp_lv_port.cpp).  The panel therefore comes out of
+ * whatever the chip's own reset left in it, and the software reset below is the
+ * whole of the reset path - which is why that block in panel_init() is
+ * conditional on LCD_RST.
+ *
+ * 45 is a strapping pin on this chip (the VDD_SPI voltage sampled at reset) and
+ * it is the panel's chip select, because that is how WaveShare wired it.  It is
+ * also why this driver must never drive the bus pins itself: the port owns the
+ * chip select and holds it high except during a transfer.
+ *
+ * The bus is SPI2 and it is SHARED WITH THE TF CARD: clock 39, data 38 and MISO
+ * 40 go to the panel and to the card together, and 45 and 41 tell them apart -
+ * the same shape as the C6 block below, and the same note applies.
+ *
+ * INVERSION: the INVON sent below (cmd 0x21) is required by this panel, and the
+ * driver already sends it for every board.  Two independent vendor ports agree
+ * for this one: the IDF example calls esp_lcd_panel_invert_color(handle, true),
+ * and the Arduino port constructs the panel with the IPS flag set - the
+ * constructor argument marked "IPS" in bsp_lv_port.cpp - which Arduino_GFX
+ * turns into exactly this command (Arduino_ST7789::invertDisplay:
+ * (_ips ^ i) ? INVON : INVOFF, and _ips is true here).
+ */
+#define LCD_BUS      2
+#define LCD_CS      45
+#define LCD_DC      42
+#define LCD_RST     (-1)
+#define LCD_BL       1
+
+/*
+ * Landscape, and the same 0x60 the S3-CAM's panel uses.  Unlike that one this
+ * is not a first guess: it is what the vendor's own Arduino port writes for
+ * rotation 1 on this panel (Arduino_ST7789.cpp: MX | MV | RGB = 0x60), and the
+ * IDF example leaves the panel in its own portrait addressing, which is the
+ * same orientation a quarter turn round.  Bit 3 clear is RGB; the reds and
+ * blues exchanged is that bit and nothing else.
+ */
+#define LCD_MADCTL 0x60
+
+#define LCD_W      320
+#define LCD_H      240
+
+/*
+ * No offset, and this is the easy case: the ST7789T3 addresses 240x320 and this
+ * glass is all of it - unlike the C6's 172 rows inside the same controller.
+ * A wrong offset here is not a shifted picture: the rows past the end of the
+ * glass still exist in the controller and come out as a band of noise.
+ */
+#define LCD_X_OFF 0
+#define LCD_Y_OFF 0
+
 #else /* the Waveshare ESP32-C6-LCD-1.47 */
 
 /*
@@ -155,7 +220,7 @@ AG_DRV("ST7789", "0.2", "argon");
 #define LCD_X_OFF 0
 #define LCD_Y_OFF 34
 
-#endif
+#endif /* board variants */
 
 #define CELL_W AG_FONT8X8_W
 #define CELL_H AG_FONT8X8_H
@@ -677,10 +742,14 @@ static bool panel_init(void)
     static const uint8_t pixfmt[]  = {0x55}; /* 16 bits, and this one matters */
 
     if (io->gpio_config(LCD_DC, AG_GPIO_OUT) != AG_OK ||
-        io->gpio_config(LCD_RST, AG_GPIO_OUT) != AG_OK ||
         io->gpio_config(LCD_BL, AG_GPIO_OUT) != AG_OK) {
         return false;
     }
+#if LCD_RST >= 0
+    if (io->gpio_config(LCD_RST, AG_GPIO_OUT) != AG_OK) {
+        return false;
+    }
+#endif
 
     /* Dark until there is something of ours to show. */
     io->gpio_write(LCD_BL, 0);
@@ -690,13 +759,21 @@ static bool panel_init(void)
      * the panel comes out of it in a known state whatever the last firmware
      * left in its registers, and this board ships with a factory demo that
      * leaves plenty.
+     *
+     * Only where the board has one.  The ESP32-S3-Touch-LCD-2 does not: both
+     * vendor ports pass -1 for the reset pin, so the panel's only reset is the
+     * software one two lines down (0x01), which clears the controller's
+     * registers whatever they were and is what the vendor's own bring-up does
+     * with reset_gpio_num = -1.
      */
+#if LCD_RST >= 0
     io->gpio_write(LCD_RST, 1);
     ag_api()->time->delay_ms(10);
     io->gpio_write(LCD_RST, 0);
     ag_api()->time->delay_ms(10);
     io->gpio_write(LCD_RST, 1);
     ag_api()->time->delay_ms(120);
+#endif
 
     cmd(0x01); /* software reset as well, for the registers RST does not clear */
     ag_api()->time->delay_ms(150);

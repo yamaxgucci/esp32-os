@@ -114,13 +114,45 @@ static volatile bool    s_busy_reply;
 /* True while this node is running something for the other one. */
 static volatile bool s_serving_run;
 
+/*
+ * WHO ASKED FOR THE PROGRAM BEING SERVED HERE.
+ *
+ * A run is answered for seconds after it was asked for, on the program's own
+ * task, and the frames that answer it - its output, its exit, and the STARTED
+ * a migrating program emits when it takes its state - are sent from there.
+ * ag_linkprov_from() means nothing on those tasks: it is only valid inside the
+ * receive callback.  So the asker's hash is taken in serve_run, on that
+ * callback, and remembered for as long as the guest lives.  Without it the
+ * answer would say "for whoever is reading", be taken by a board in between,
+ * and the node that asked would wait out its whole timeout.
+ *
+ * One guest at a time, because one run is served at a time - NP_OP_BUSY says so
+ * to anybody asking for a second - so one word is all the state this needs.
+ */
+static volatile uint16_t s_run_from;
+
 /* Whose guest we are holding, for NP_OP_RETURN to send home.  Zero when none;
  * one at a time, because one run is served at a time. */
 static volatile ag_pid_t s_guest_pid;
-static ag_port_task_t    s_return_task;
 
-static ag_err_t send_msg(uint8_t op, int32_t code, const void *payload,
-                         uint16_t len)
+/*
+ * How long the homeward state send waits for the far node to say the program
+ * is running there.  The same three seconds the return task used before it was
+ * removed - see the two halves in NP_OP_RETURN below.
+ */
+#define NP_HOME_TIMEOUT_MS 3000u
+
+/*
+ * One frame out, ON PURPOSE TO SOMEBODY.
+ *
+ * `dst` is ag_node_hash() of the node the frame is for.  It is a parameter
+ * because this file speaks to two different nodes: an answer goes to whoever
+ * asked (which can be a board beyond the neighbour), while a new conversation -
+ * a run ordered by this board's own prompt - goes to the node `link use` last
+ * named.  Those are the same node only when nothing is in between.
+ */
+static ag_err_t send_msg(uint16_t dst, uint8_t op, int32_t code,
+                         const void *payload, uint16_t len)
 {
     uint8_t buf[NP_HDR + NP_MAX_PAYLOAD];
     if (len > NP_MAX_PAYLOAD) {
@@ -141,7 +173,8 @@ static ag_err_t send_msg(uint8_t op, int32_t code, const void *payload,
      */
     for (int t = 0; t < 400; t++) {
         const int32_t r =
-            ag_linkprov_send(NP_CHAN, AG_LINK_CONTROL, buf, NP_HDR + len);
+            ag_linkprov_send_to(dst, NP_CHAN, AG_LINK_CONTROL, buf,
+                                NP_HDR + len);
         if (r >= 0) {
             return AG_OK;
         }
@@ -164,7 +197,7 @@ static int32_t out_sink(void *ctx, const char *data, size_t len)
     while (left > 0) {
         const uint16_t chunk =
             (uint16_t)((left > NP_MAX_PAYLOAD) ? NP_MAX_PAYLOAD : left);
-        if (send_msg(NP_OP_OUT, 0, data, chunk) != AG_OK) {
+        if (send_msg(s_run_from, NP_OP_OUT, 0, data, chunk) != AG_OK) {
             return (int32_t)(len - left); /* the link went: stop quietly */
         }
         data += chunk;
@@ -204,52 +237,45 @@ static uint8_t *s_in_state;
 static uint32_t s_in_state_len;
 
 /*
- * SENDING A GUEST HOME, on a task of its own.
+ * SENDING A GUEST HOME, ON THE TASK THAT WAS ALREADY WAITING FOR IT.
  *
- * ag_migrate_away waits for the program to reach a checkpoint and then puts
- * its state on the wire, so it cannot run on the link's reader: that task is
- * the one that would have to carry the state, and it would be waiting for
- * itself.  Exactly the trap serving a run walks into, and the same way out.
+ * There used to be a task of this file's own here - start_return_task, 8192
+ * bytes, created the moment NP_OP_RETURN arrived.  It was created at exactly
+ * the one moment the board cannot afford it: the guest it has to send home is
+ * still running, its 8 KB stack has taken the largest free block, and an 8 KB
+ * task stack must be contiguous.  Measured on the C3 (COM8) in the harness run:
  *
- * Short-lived rather than a standing task, because a board is asked for its
- * guest back rarely - once when the neighbour wakes - and a permanent 3 KB
- * stack for that would be paid on every board that never hosts one.
+ *   I (79879) proc: MIGRANRV.AXE: loading with 16800 free, largest 8704
+ *   E (82544) node: no task to send the guest home
+ *
+ * and the guest went on counting on the C3 for the rest of the run, holding
+ * the memory the next scenario needed.  The request WAS answered - that is what
+ * three runs of "it is still on the neighbour" got wrong - there was simply no
+ * room to answer it with.
+ *
+ * The task it needed was already there.  run_task below sits in ag_proc_wait
+ * for this very pid for as long as the guest lives, and wakes the instant it
+ * ends - which is the instant the program has handed its state over.  So the
+ * ask is done where the request arrives, on the link's reader, which must not
+ * wait (the state travels down the link that task reads) and must not allocate
+ * (that is the whole point); the carrying is done below, on the waiting task.
  */
-static void return_task(void *arg)
+static ag_err_t serve_guest(ag_pid_t pid, int32_t *code)
 {
-    (void)arg;
-    const ag_pid_t pid = s_guest_pid;
-    if (pid != 0) {
-        const ag_err_t e = ag_migrate_away(pid, 3000u);
-        if (e != AG_OK) {
-            ag_log(AG_LOG_WARN, "node",
-                   "asked to send pid %u home: %d - it stays here",
-                   (unsigned)pid, (int)e);
-        }
-    }
-    s_return_task = NULL;
-    ag_port_task_delete(NULL);
-}
-
-static void start_return_task(void)
-{
-    if (s_guest_pid == 0 || s_return_task != NULL) {
-        return;
-    }
+    s_guest_pid = pid;
+    const ag_err_t e = ag_proc_wait(pid, code, UINT32_MAX);
     /*
-     * EIGHT KILOBYTES, for the reason the link's reader needed them.
-     *
-     * Sending a guest home can end in starting it again HERE - when the board
-     * that asked for it cannot take it - and starting a program goes down
-     * through the loader into the filesystem, which is exactly the depth that
-     * overflowed 4 KB next door and took the whole board with it.  It did the
-     * same here: the C3 panicked and rebooted, twice, in the one path meant to
-     * stop work being lost.
+     * Cleared BEFORE the check, so that a request that arrived while the guest
+     * was ending is not lost: an ask that lands after this line finds no guest
+     * here and is ignored, and an ask that landed before it is still
+     * outstanding for this pid - the program was signalled, it saved its state
+     * and returned, and the state is in hand waiting for exactly this send.
      */
-    if (!ag_port_task_create(return_task, "ag_nphome", 8192, NULL, 1, 0, 0,
-                             &s_return_task)) {
-        ag_log(AG_LOG_ERROR, "node", "no task to send the guest home");
+    s_guest_pid = 0;
+    if (ag_migrate_asked(pid)) {
+        (void)ag_migrate_send_home(NP_HOME_TIMEOUT_MS);
     }
+    return e;
 }
 
 static void run_task(void *arg)
@@ -268,7 +294,7 @@ static void run_task(void *arg)
                 sizeof(AG_NODEDRV_MOUNT)) == 0) {
         const ag_err_t m = ag_nodedrv_mount(AG_NODEDRV_MOUNT);
         if (m != AG_OK && m != -AG_EEXIST) {
-            (void)send_msg(NP_OP_EXIT, (int32_t)m, NULL, 0);
+            (void)send_msg(s_run_from, NP_OP_EXIT, (int32_t)m, NULL, 0);
             s_serving_run = false;
             ag_port_task_delete(NULL);
             return;
@@ -278,7 +304,7 @@ static void run_task(void *arg)
     const int argc = ag_cmdline_split(s_run_line, argv,
                                       (int)(sizeof(argv) / sizeof(argv[0])));
     if (argc <= 0) {
-        (void)send_msg(NP_OP_EXIT, -AG_EINVAL, NULL, 0);
+        (void)send_msg(s_run_from, NP_OP_EXIT, -AG_EINVAL, NULL, 0);
         s_serving_run = false;
         ag_port_task_delete(NULL);
         return;
@@ -329,13 +355,11 @@ static void run_task(void *arg)
         /*
          * Remember whose guest this is, so NP_OP_RETURN has something to send
          * home.  One, because one run is served at a time (NP_OP_BUSY says so
-         * to anybody asking for a second), and cleared below whatever happens
-         * to it - a stale pid here would answer a request to come home by
-         * migrating a process that is no longer the one that arrived.
+         * to anybody asking for a second), and cleared whatever happens to it -
+         * a stale pid here would answer a request to come home by migrating a
+         * process that is no longer the one that arrived.
          */
-        s_guest_pid = pid;
-        err = ag_proc_wait(pid, &code, UINT32_MAX);
-        s_guest_pid = 0;
+        err = serve_guest(pid, &code);
     }
 
     /*
@@ -406,9 +430,7 @@ static void run_task(void *arg)
                 (uint32_t)AG_SPAWN_BACKGROUND | (uint32_t)AG_SPAWN_NO_SESSION,
                 out_sink, NULL, &pid);
             if (err == AG_OK) {
-                s_guest_pid = pid;
-                err = ag_proc_wait(pid, &code, UINT32_MAX);
-                s_guest_pid = 0;
+                err = serve_guest(pid, &code);
             }
         }
     }
@@ -420,24 +442,38 @@ static void run_task(void *arg)
      * here.  The alternative - reporting 0 for "it did not run" - is the sort
      * of lie a script would act on.
      */
-    (void)send_msg(NP_OP_EXIT, (err != AG_OK) ? (int32_t)err : code, NULL, 0);
+    (void)send_msg(s_run_from, NP_OP_EXIT, (err != AG_OK) ? (int32_t)err : code,
+                   NULL, 0);
     s_serving_run = false;
     ag_port_task_delete(NULL);
 }
 
 static void serve_run(const uint8_t *payload, uint16_t len)
 {
+    /*
+     * THE ASKER, taken here because this is the receive callback and the last
+     * moment ag_linkprov_from() means anything - the run itself is served on a
+     * task of its own and answers from there.
+     *
+     * The three refusals below answer THIS asker, so they use `from` directly
+     * rather than s_run_from: with a guest already running (NP_OP_BUSY), what
+     * is in s_run_from belongs to that guest and its own asker, and answering
+     * the wrong node "busy" would leave the right one waiting.
+     */
+    const uint16_t from = ag_linkprov_from();
+
     if (s_serving_run) {
-        (void)send_msg(NP_OP_BUSY, 0, NULL, 0);
+        (void)send_msg(from, NP_OP_BUSY, 0, NULL, 0);
         return;
     }
     if (len == 0 || len >= sizeof(s_run_line)) {
-        (void)send_msg(NP_OP_EXIT, -AG_EINVAL, NULL, 0);
+        (void)send_msg(from, NP_OP_EXIT, -AG_EINVAL, NULL, 0);
         return;
     }
     memcpy(s_run_line, payload, len);
     s_run_line[len] = '\0';
 
+    s_run_from = from;
     s_serving_run = true;
     /*
      * Below applications, deliberately.  A node running a guest program must
@@ -447,7 +483,7 @@ static void serve_run(const uint8_t *payload, uint16_t len)
     if (!ag_port_task_create(run_task, "noderun", 6144, NULL, 1,
                              AG_PORT_ANY_CORE, 0, &s_run_task)) {
         s_serving_run = false;
-        (void)send_msg(NP_OP_EXIT, -AG_ENOMEM, NULL, 0);
+        (void)send_msg(from, NP_OP_EXIT, -AG_ENOMEM, NULL, 0);
     }
 }
 
@@ -524,19 +560,28 @@ static void on_msg(uint8_t chan, const void *data, uint16_t n, void *ctx)
             /*
              * The board that sent us this work wants it back.
              *
-             * ag_migrate_away only ASKS - the guest agrees at its next
-             * checkpoint and travels by the ordinary route, which on this
-             * board means straight back down the wire it came in on.  A guest
-             * that will not move stays, and the asking board finds that out
-             * the way it finds out anything else: its work did not arrive.
+             * ASKED HERE, CARRIED BY THE TASK THAT IS ALREADY WAITING - see the
+             * note over serve_guest for the measurement that made this the
+             * shape.  This task is the link's reader: it must not wait for the
+             * program (the state would travel down the link this task reads,
+             * so waiting here is waiting for itself) and it must not create a
+             * task to wait on its behalf (a resident guest leaves no room for
+             * one, which is exactly how this failed).
              *
-             * Not done on this task.  This is the link's reader, and the
-             * migration it would start needs the link to carry the state -
-             * which is this task's own job, so waiting here would be waiting
-             * for itself.  The same trap as serving a run, and the same
-             * answer: hand it to the run task.
+             * ag_migrate_ask only signals; the guest agrees at its next
+             * checkpoint, ends, and serve_guest above carries the state home
+             * the moment it does.  A request that finds no guest here is
+             * ignored, which is the right answer to "send back what you have
+             * of mine" when it has nothing.
              */
-            start_return_task();
+            if (s_guest_pid != 0) {
+                const ag_err_t e = ag_migrate_ask(s_guest_pid);
+                if (e != AG_OK) {
+                    ag_log(AG_LOG_WARN, "node",
+                           "asked for pid %u back: %d - it stays here",
+                           (unsigned)s_guest_pid, (int)e);
+                }
+            }
             break;
         default:
             break;
@@ -555,8 +600,12 @@ ag_err_t ag_nodeproc_ask_return(void)
      * so there is nothing here to wait for.  A board that is holding nothing
      * of ours simply does nothing, which is the right answer to "send back
      * what you have of mine" when it has none.
+     *
+     * A new conversation, so it goes to the node this board is talking to: this
+     * is the one frame here that asks rather than answers, and `link use` is
+     * what names who is asked.
      */
-    return send_msg(NP_OP_RETURN, 0, NULL, 0);
+    return send_msg(ag_linkprov_target(), NP_OP_RETURN, 0, NULL, 0);
 }
 
 ag_err_t ag_nodeproc_start(void)
@@ -593,8 +642,12 @@ void ag_nodeproc_migrated(void)
      * the program IS running here, and a second copy is not created by anyone
      * believing otherwise.  The opposite mistake - claiming a move that did not
      * happen - is the one that loses somebody's work.
+     *
+     * Answered to the node that ordered the run, which is the board the state
+     * just came from - not to the selected target, which is a different board
+     * whenever this program was sent here by a board beyond the neighbour.
      */
-    (void)send_msg(NP_OP_STARTED, 0, NULL, 0);
+    (void)send_msg(s_run_from, NP_OP_STARTED, 0, NULL, 0);
 }
 
 ag_err_t ag_nodeproc_run_state(const char *cmdline, const void *state,
@@ -619,6 +672,13 @@ ag_err_t ag_nodeproc_run_state(const char *cmdline, const void *state,
     s_started = false;
     s_code = 0;
     s_awaiting = true;
+    /*
+     * A NEW conversation with the node this board is talking to, so every frame
+     * below carries that node as its destination - `link use <name>` is what
+     * puts a board two hops away in there, and the relay in between is what
+     * makes the hop from the neighbour onwards.
+     */
+    const uint16_t dst = ag_linkprov_target();
     /* A handover is finished when the program is RUNNING there, not when it
      * ends: a program worth moving does not end.  Anything else still waits
      * for the exit code, which is what its caller asked for. */
@@ -634,7 +694,7 @@ ag_err_t ag_nodeproc_run_state(const char *cmdline, const void *state,
         const uint16_t chunk =
             (uint16_t)(((state_len - at) > NP_MAX_PAYLOAD) ? NP_MAX_PAYLOAD
                                                            : (state_len - at));
-        const ag_err_t se = send_msg(NP_OP_STATE, (int32_t)at,
+        const ag_err_t se = send_msg(dst, NP_OP_STATE, (int32_t)at,
                                      (const uint8_t *)state + at, chunk);
         if (se != AG_OK) {
             s_awaiting = false;
@@ -644,7 +704,7 @@ ag_err_t ag_nodeproc_run_state(const char *cmdline, const void *state,
     }
 
     const size_t len = strlen(cmdline);
-    ag_err_t     err = send_msg(NP_OP_RUN, 0, cmdline,
+    ag_err_t     err = send_msg(dst, NP_OP_RUN, 0, cmdline,
                                 (uint16_t)((len > NP_MAX_PAYLOAD)
                                                ? NP_MAX_PAYLOAD
                                                : len));

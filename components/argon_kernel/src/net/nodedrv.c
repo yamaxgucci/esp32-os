@@ -17,6 +17,27 @@
  *   3. A request may not be made from the link's reader task: the reply would
  *      arrive on the very task that is blocked waiting for it.
  *
+ * AND FILE BYTES DO NOT TRAVEL AS REQUESTS ANY MORE.  They did: a read was
+ * ND_READ, the far node answered with ND_MAX_PAYLOAD (232) bytes, and the next
+ * 232 bytes cost another round trip.  One exchange in flight at a time is a
+ * ceiling of chunk / round trip whatever the wire can do, and it was measured
+ * as exactly that: 232 bytes per 15 ms on the SPI pair (15 467 B/s) and 232 per
+ * 5 ms on the UART (46 400 B/s), against 1 755 781 B/s of wire.  The link has a
+ * 24-frame BULK window that shape never used.
+ *
+ * So a read now opens a STREAM.  ND_FETCH asks once for as much as the wire
+ * says it moves in an eighth of a second (nd_stream_max, never less than one
+ * `copy` buffer), the serving side reads its file and pushes chunks back to
+ * back on BULK, and the asking side writes each chunk at its running offset.  There is no
+ * reassembly and no tag table: BULK is one sequence space with go-back-N, so
+ * the chunks are in order or the transfer fails loudly - and the window plus
+ * the acknowledgements inside it ARE the flow control.  The byte count still
+ * travels with the verdict (ND_END), because a stream that ends early must be
+ * a failure and not a short file (see net/nodefs.c, which paid for that one).
+ *
+ * Everything genuinely request-shaped - stat, readdir, seek, write, unlink -
+ * keeps the tag-matched request/answer path unchanged.
+ *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #include <argon/nodedrv.h>
@@ -33,8 +54,95 @@
 
 #define ND_CHAN 5u
 #define ND_HDR 12u
-#define ND_MAX_PAYLOAD 232u
 #define ND_REPLY 0x80u
+
+/*
+ * THE MOST ONE FRAME HERE MAY CARRY, and why a number is still allowed to
+ * exist at all after `ND_MAX_PAYLOAD 232` was removed.
+ *
+ * What a frame carries is now asked of the wire (nd_payload_max below).  What
+ * is left here is a CEILING on this file's own buffers, which are static or on
+ * the link reader's stack - the task that has already been overflowed once on
+ * this bench (see linkprov.c, eight kilobytes and why).  255 payload plus the
+ * 12-byte header is 267, inside the 288-byte buffer that task receives into,
+ * and it is also the widest value the one spare header byte can name.  A wire
+ * that reports more than this carries smaller frames than it could: slower
+ * than it could be, never unsafe.  Raising it is one number on the day there
+ * is a wire worth raising it for.
+ */
+#define ND_CHUNK_MAX 255u
+
+/*
+ * HOW MUCH OF A FILE ONE REQUEST MAY ASK FOR, and it is not a constant either.
+ *
+ * The frame size comes from `mtu` (see nd_payload_max); this is how many FRAMES
+ * one request may pull, and it has to not be a constant for the same reason:
+ * the point of the change is that the round trip stops being the unit of work,
+ * and one fixed request size makes it the unit again on any wire faster than a
+ * few hundred kilobytes a second.  So this is what the wire says it moves in an
+ * eighth of a second, held between two numbers that are about this file rather
+ * than about a wire:
+ *
+ *   the floor is the buffer `copy` reads with (shell/cmd_fs.c, AG_COPY_CHUNK),
+ *   because below it a file transfer is back to one request per buffer read;
+ *
+ *   the ceiling bounds how long the serving board stays inside its link reader
+ *   task for one request - while it streams, that wire hears nothing else -
+ *   and 16 KB is a second and a half even on the slowest direction this bench
+ *   has measured (380 B/s, SPI).
+ *
+ * A wire that overstates its rate only asks for more in one request, which the
+ * window and the asking side's stall timer bound anyway; the SPI pair declares
+ * 2 253 521 B/s and was measured at 380, so that is not hypothetical.
+ */
+#define ND_STREAM_MIN 4096u
+#define ND_STREAM_MAX 16384u
+
+static uint32_t nd_stream_max(void)
+{
+    ag_link_info_t info;
+    uint32_t       n = ND_STREAM_MIN;
+
+    if (ag_linkprov_info(&info) == AG_OK && info.bytes_per_sec > 0) {
+        n = info.bytes_per_sec / 8u;
+    }
+    if (n < ND_STREAM_MIN) {
+        n = ND_STREAM_MIN;
+    }
+    if (n > ND_STREAM_MAX) {
+        n = ND_STREAM_MAX;
+    }
+    return n;
+}
+
+/*
+ * How long the asking side waits with NOTHING arriving before it calls the far
+ * side dead.
+ *
+ * A STALL and not a total: every chunk that lands refreshes it, so a wire that
+ * is slow but working is waited out and a wire that has stopped is not.  That
+ * distinction is the only honest one available here, because the rate the wire
+ * reports about itself is not usable as a deadline - info().bytes_per_sec said
+ * 2 253 521 for a pair that was delivering 380 B/s, so a deadline computed from
+ * it would fail transfers that were going as well as the wire allowed.
+ */
+#define ND_STALL_MS 5000u
+
+/*
+ * How long to wait for the one exchange slot.
+ *
+ * A holder is a stream now, not a 232-byte question, so the wait is that
+ * stream's worst honest case: ND_STREAM_MAX at the slowest rate this cluster
+ * has measured (380 B/s on SPI - four milliseconds a byte), plus two seconds
+ * for whatever exchange follows it.  Derived from the same numbers as the
+ * stream itself, so it does not need revisiting when the wire does, and still
+ * bounded, so a board that has gone away cannot hold every other file here for
+ * good.
+ */
+static uint32_t nd_lock_ms(void)
+{
+    return 2000u + nd_stream_max() * 4u;
+}
 
 enum {
     ND_OPEN = 1,
@@ -49,6 +157,14 @@ enum {
     ND_OPENDIR,
     ND_READDIR,
     ND_CLOSEDIR,
+    /*
+     * The streamed read and the two frames of its answer.  ND_READ stays, and
+     * stays served: a board that has not been flashed with this still reads
+     * files with it (see nd_read's fallback).
+     */
+    ND_FETCH,
+    ND_DATA,
+    ND_END,
 };
 
 static void put16(uint8_t *p, uint16_t v)
@@ -85,27 +201,132 @@ static uint64_t get64(const uint8_t *p)
 static bool s_serving;
 
 /*
- * One request outstanding at a time.  Deliberate: it is the shape the rest of
- * this codebase already uses for file work, and it keeps the tag the only
- * thing standing between a late reply and the wrong caller - a rule small
- * enough to be sure of.
+ * One exchange outstanding at a time, request or stream.  Deliberate: it is
+ * the shape the rest of this codebase already uses for file work, and it keeps
+ * the tag the only thing standing between a late reply and the wrong caller -
+ * a rule small enough to be sure of.
  */
 static volatile bool     s_busy;
 static volatile uint16_t s_tag;
 static volatile bool     s_have;
 static volatile int32_t  s_status;
-static uint8_t           s_rbuf[ND_MAX_PAYLOAD];
+static uint8_t           s_rbuf[ND_CHUNK_MAX];
 static volatile uint16_t s_rlen;
 
-static ag_err_t send_raw(uint8_t op, uint16_t tag, uint32_t h, uint32_t arg,
-                         uint8_t cls, const void *pay, uint16_t plen)
+/*
+ * The streamed read in progress, asking side.  `s_fbuf` is the CALLER's buffer
+ * and the link's reader task is the only writer of it while s_fetch is true: it
+ * writes each chunk straight at s_foff, which is why nothing is reassembled and
+ * why there is no per-chunk allocation anywhere in this file.
+ *
+ * `s_fcount` is the sender's own byte count, from the END, and it is compared
+ * against s_foff before anything is reported as success.
+ */
+static volatile bool     s_fetch;
+static volatile uint16_t s_ftag;
+static uint8_t          *s_fbuf;
+static volatile uint32_t s_fwant;
+static volatile uint32_t s_foff;
+static volatile uint32_t s_fcount;
+static volatile bool     s_fend;
+static volatile bool     s_frefused;
+static volatile int32_t  s_fstatus;
+
+/*
+ * What one frame on the bound wire can hold, header aside.
+ *
+ * 232 was the UART's figure written down in four files; this asks instead, and
+ * the plan's own list named this constant as the first thing a fast wire breaks
+ * against.  A wire that will not say (a driver older than info()) is answered
+ * with the UART's measured numbers by ag_linkprov_info itself, so there is no
+ * "unknown" case here.
+ */
+static uint32_t nd_payload_max(void)
 {
-    uint8_t buf[ND_HDR + ND_MAX_PAYLOAD];
-    if (plen > ND_MAX_PAYLOAD) {
-        plen = ND_MAX_PAYLOAD;
+    ag_link_info_t info;
+    uint32_t       n = ND_CHUNK_MAX;
+
+    if (ag_linkprov_info(&info) == AG_OK && info.mtu > ND_HDR) {
+        const uint32_t m = info.mtu - ND_HDR;
+        if (m < n) {
+            n = m;
+        }
+    }
+    return n;
+}
+
+/*
+ * One tag counter for both shapes of exchange, so a number is never reused
+ * while anything carrying it could still be on the wire: a late reply to a
+ * timed-out request and a late chunk of an abandoned stream are both caught by
+ * the number, which is the only thing that can catch them.
+ */
+static uint16_t next_tag(void)
+{
+    static uint16_t t = 1;
+
+    if (++t == 0) {
+        t = 1;
+    }
+    return t;
+}
+
+/* Take the one exchange slot, or say why not.  Bounded, and see nd_lock_ms. */
+static int32_t nd_lock(void)
+{
+    if (!ag_linkprov_bound()) {
+        return -AG_ENODEV;
+    }
+    if (ag_linkprov_in_reader()) {
+        return -AG_EBUSY;
+    }
+
+    const int64_t give_up = ag_port_us() + (int64_t)nd_lock_ms() * 1000;
+    while (s_busy) {
+        if (ag_port_us() >= give_up) {
+            return -AG_ETIMEDOUT;
+        }
+        ag_port_task_delay(ag_port_ms_to_ticks(2));
+    }
+    s_busy = true;
+    return AG_OK;
+}
+
+static void nd_unlock(void)
+{
+    /* Clear the tag before the flags: a frame arriving now belongs to nobody,
+     * and the reader task must not start writing into a buffer that is about
+     * to be returned to its owner. */
+    s_tag = 0;
+    s_ftag = 0;
+    s_fetch = false;
+    s_busy = false;
+}
+
+/*
+ * One frame out.
+ *
+ * `dst` is the node it is FOR.  Zero means a NEW conversation, which the link
+ * addresses to the node `link use` last named; anything else is an answer and
+ * is addressed to the node that asked - which is not the same board at all
+ * when a third one sits in between (net/nodefs.c had a file arrive somewhere
+ * else this way, and the same latent mistake was here).
+ *
+ * `note` is the one header byte this protocol never used: the asking side's
+ * own per-frame payload limit, so a serving side does not put a frame on the
+ * wire that the asking side's link cannot hold.  Zero is "did not say", which
+ * is what everything but ND_FETCH says.
+ */
+static ag_err_t send_frame(uint16_t dst, uint8_t op, uint8_t note, uint16_t tag,
+                           uint32_t h, uint32_t arg, uint8_t cls,
+                           const void *pay, uint16_t plen)
+{
+    uint8_t buf[ND_HDR + ND_CHUNK_MAX];
+    if (plen > ND_CHUNK_MAX) {
+        plen = ND_CHUNK_MAX;
     }
     buf[0] = op;
-    buf[1] = 0;
+    buf[1] = note;
     put16(buf + 2, tag);
     put32(buf + 4, h);
     put32(buf + 8, arg);
@@ -113,10 +334,14 @@ static ag_err_t send_raw(uint8_t op, uint16_t tag, uint32_t h, uint32_t arg,
         memcpy(buf + ND_HDR, pay, plen);
     }
     /* A full window is back-pressure, not a failure; bounded so a departed
-     * node cannot block us for ever. */
+     * node cannot block us for ever.  Pumping while we wait is also what lets
+     * the acknowledgements that open the window come in - on a wire with one
+     * clock master, nothing moves unless somebody is inside the driver. */
     for (int t = 0; t < 2000; t++) {
-        const int32_t r =
-            ag_linkprov_send(ND_CHAN, cls, buf, (uint16_t)(ND_HDR + plen));
+        const size_t  n = (size_t)(ND_HDR + plen);
+        const int32_t r = (dst == 0) ? ag_linkprov_send(ND_CHAN, cls, buf, n)
+                                     : ag_linkprov_send_to(dst, ND_CHAN, cls,
+                                                           buf, n);
         if (r >= 0) {
             return AG_OK;
         }
@@ -131,31 +356,16 @@ static ag_err_t send_raw(uint8_t op, uint16_t tag, uint32_t h, uint32_t arg,
 static int32_t ask(uint8_t op, uint32_t h, uint32_t arg, uint8_t cls,
                    const void *pay, uint16_t plen, void *out, uint16_t *outlen)
 {
-    static uint16_t next_tag = 1;
-
-    if (!ag_linkprov_bound()) {
-        return -AG_ENODEV;
-    }
-    if (ag_linkprov_in_reader()) {
-        return -AG_EBUSY;
+    const int32_t lock = nd_lock();
+    if (lock != AG_OK) {
+        return lock;
     }
 
-    const int64_t give_up = ag_port_us() + 4000000;
-    while (s_busy) {
-        if (ag_port_us() >= give_up) {
-            return -AG_ETIMEDOUT;
-        }
-        ag_port_task_delay(ag_port_ms_to_ticks(2));
-    }
-    s_busy = true;
-    if (++next_tag == 0) {
-        next_tag = 1;
-    }
-    s_tag = next_tag;
+    s_tag = next_tag();
     s_have = false;
     s_rlen = 0;
 
-    int32_t rc = (int32_t)send_raw(op, s_tag, h, arg, cls, pay, plen);
+    int32_t rc = (int32_t)send_frame(0, op, 0, s_tag, h, arg, cls, pay, plen);
     if (rc == AG_OK) {
         const int64_t deadline = ag_port_us() + 15000000;
         rc = -AG_ETIMEDOUT;
@@ -176,8 +386,7 @@ static int32_t ask(uint8_t op, uint32_t h, uint32_t arg, uint8_t cls,
         *outlen = n;
     }
     /* Clear the tag before the flag: a reply arriving now belongs to nobody. */
-    s_tag = 0;
-    s_busy = false;
+    nd_unlock();
     return rc;
 }
 
@@ -186,8 +395,15 @@ static int32_t ask(uint8_t op, uint32_t h, uint32_t arg, uint8_t cls,
 static void reply(uint8_t op, uint16_t tag, int32_t status, uint8_t cls,
                   const void *pay, uint16_t plen)
 {
-    (void)send_raw((uint8_t)(op | ND_REPLY), tag, (uint32_t)status, 0, cls, pay,
-                   plen);
+    /*
+     * ADDRESSED TO WHOEVER ASKED, not to the board `link use` last named here.
+     * The target is where a NEW conversation goes; an answer has exactly one
+     * right destination, and on a board in the middle of three that is a node
+     * this one may never have selected.  A reply that says "for whoever is
+     * reading" is taken by the board in between.
+     */
+    (void)send_frame(ag_linkprov_from(), (uint8_t)(op | ND_REPLY), 0, tag,
+                     (uint32_t)status, 0, cls, pay, plen);
 }
 
 static uint16_t enc_stat(uint8_t *p, const ag_stat_t *st)
@@ -213,7 +429,14 @@ static void serve(const uint8_t *b, uint16_t n)
     const uint8_t *pay = b + ND_HDR;
     const uint16_t plen = (uint16_t)(n - ND_HDR);
     char           path[AG_PATH_MAX];
-    uint8_t        obuf[ND_MAX_PAYLOAD];
+    /* A local, and therefore a private one per reader task: two neighbours of a
+     * three-board cluster can be inside serve() at the same moment, each on its
+     * own wire's reader. */
+    uint8_t        obuf[ND_CHUNK_MAX];
+    /* What the wire will carry, asked once for this frame's answer.  Every
+     * reply below is bounded by it, so nothing here can hand the driver a
+     * message it is going to refuse. */
+    const uint32_t cap = nd_payload_max();
 
     uint16_t pc = plen;
     if (pc >= sizeof(path)) {
@@ -252,13 +475,88 @@ static void serve(const uint8_t *b, uint16_t n)
               0);
         break;
     case ND_READ: {
+        /* The request-shaped read, kept for a peer that does not know
+         * ND_FETCH.  Sized by the wire, not by a number of ours. */
         uint32_t want = arg;
-        if (want > ND_MAX_PAYLOAD) {
-            want = ND_MAX_PAYLOAD;
+        if (want > cap) {
+            want = cap;
         }
         const int32_t r = ag_vfs_read((ag_handle_t)h, obuf, want);
         /* BULK: file bytes may wait behind anything with a deadline. */
         reply(op, tag, r, AG_LINK_BULK, obuf, (uint16_t)((r > 0) ? r : 0));
+        break;
+    }
+    case ND_FETCH: {
+        /*
+         * A STREAMED READ: one request, and the file goes back as a run of
+         * BULK frames without being asked again.
+         *
+         * The window and the acknowledgements in it are the flow control -
+         * send_frame waits when the window is full and pumps the wire while it
+         * waits, which is also what lets the acknowledgements that open it
+         * arrive.  BULK is one sequence space with go-back-N, so the chunks
+         * reach the asking side in order and the END below cannot overtake the
+         * data it ends (net/nodefs.c measured what END on CONTROL did: a
+         * 19 024-byte file reported as 15 600 bytes, with no error said
+         * anywhere).
+         *
+         * WHO ASKED is taken once, here, because this callback is a long one:
+         * ag_linkprov_from() answers only while it runs, and further frames on
+         * this wire are handled by this same task before it returns.  Every
+         * frame of the answer is addressed to that node - a stream addressed
+         * to "whoever is reading" is taken by the board in between and the
+         * asking node waits for a file that arrived somewhere else.
+         */
+        const uint16_t peer = ag_linkprov_from();
+        const uint32_t most = nd_stream_max();
+        uint32_t       want = arg;
+        if (want > most) {
+            want = most;
+        }
+        /* The asking side may say that its own link holds less than ours; it
+         * must never be sent a frame its end cannot receive. */
+        uint32_t chunk = cap;
+        if (b[1] != 0 && (uint32_t)b[1] < chunk) {
+            chunk = b[1];
+        }
+
+        uint32_t sent = 0;
+        int32_t  err = 0;
+        while (sent < want) {
+            uint32_t take = chunk;
+            if (take > want - sent) {
+                take = want - sent;
+            }
+            const int32_t r = ag_vfs_read((ag_handle_t)h, obuf, take);
+            if (r < 0) {
+                err = r;
+                break;
+            }
+            if (r == 0) {
+                break; /* end of file: a short answer, not a failure */
+            }
+            const ag_err_t e = send_frame(peer, ND_DATA, 0, tag, 0, 0,
+                                          AG_LINK_BULK, obuf, (uint16_t)r);
+            if (e != AG_OK) {
+                err = (int32_t)e;
+                break;
+            }
+            sent += (uint32_t)r;
+        }
+
+        /*
+         * THE COUNT GOES WITH THE VERDICT, on BULK, in the same sequence space
+         * as the bytes it counts.
+         *
+         * `sent` is what was handed to the reliable class and not what was
+         * read, because a chunk the link refused never left.  The asking side
+         * compares it against the bytes that reached its buffer, so a stream
+         * that ended early is a failure and not a short file - the property
+         * that makes silent truncation impossible, and the one this floor has
+         * already paid for once (net/nodefs.c).
+         */
+        (void)send_frame(peer, ND_END, 0, tag, (uint32_t)err, sent,
+                         AG_LINK_BULK, NULL, 0);
         break;
     }
     case ND_WRITE:
@@ -294,8 +592,17 @@ static void serve(const uint8_t *b, uint16_t n)
         } else {
             const uint16_t k = enc_stat(obuf, &de.st);
             size_t         nl = strlen(de.name);
-            if (nl > (size_t)(ND_MAX_PAYLOAD - k - 1u)) {
-                nl = (size_t)(ND_MAX_PAYLOAD - k - 1u);
+            /*
+             * The name is cut to what the WIRE leaves beside the stat, and
+             * the subtraction is guarded: `cap` comes from a driver now and a
+             * too-small one would otherwise wrap it into an enormous length
+             * and write the name straight off the end of obuf.
+             */
+            const size_t room = (cap > (uint32_t)k + 1u)
+                                    ? (size_t)(cap - (uint32_t)k - 1u)
+                                    : 0u;
+            if (nl > room) {
+                nl = room;
             }
             memcpy(obuf + k, de.name, nl);
             obuf[k + nl] = '\0';
@@ -309,6 +616,75 @@ static void serve(const uint8_t *b, uint16_t n)
     }
 }
 
+/*
+ * A frame of a streamed read, on the board that asked for it.
+ *
+ * Every chunk is written straight at the running offset and nothing is
+ * reassembled: BULK is one sequence space with go-back-N, so what arrives
+ * arrives in order or the transfer ends in a failure.  That is the whole reason
+ * a stream needs no tag table, no receive window and no credit of its own - the
+ * link's window IS the flow control, and the acknowledgements in it are how the
+ * serving side is slowed down.
+ */
+static void on_stream(const uint8_t *b, uint16_t n)
+{
+    const uint8_t  op = b[0];
+    const uint16_t tag = get16(b + 2);
+
+    if (op == (uint8_t)(ND_FETCH | ND_REPLY)) {
+        /*
+         * NOT a stream: a peer that does not know ND_FETCH answers the request
+         * itself, and serve()'s default case answers -ENOTSUP.  Its verdict is
+         * the request's answer, and nd_read falls back to the one-exchange
+         * read that peer does know.
+         */
+        if (!s_fetch || tag != s_ftag) {
+            return;
+        }
+        s_fstatus = (int32_t)get32(b + 4);
+        s_frefused = true;
+        s_fend = true;
+        return;
+    }
+
+    /* A chunk or an end that nobody is waiting for - abandoned, timed out, or
+     * a tail arriving after the fetch gave up - is dropped by its number. */
+    if (!s_fetch || tag != s_ftag) {
+        return;
+    }
+
+    if (op == ND_DATA) {
+        const uint16_t plen = (uint16_t)(n - ND_HDR);
+        if (plen == 0) {
+            return;
+        }
+        if (plen > s_fwant - s_foff) {
+            /*
+             * MORE THAN WAS ASKED FOR, and it is a failure rather than extra
+             * credit, for the same reason a short write is: the bytes after
+             * this one would land past the end of the caller's buffer or, if
+             * silently dropped, would shift everything behind them.
+             */
+            s_fstatus = -AG_EIO;
+            s_fend = true;
+            return;
+        }
+        memcpy(s_fbuf + s_foff, b + ND_HDR, plen);
+        s_foff += plen;
+        return;
+    }
+
+    /*
+     * ND_END.  The sender's own count travels with the verdict and is compared
+     * by the caller against what reached the buffer: the last frame arriving
+     * says nothing about the length of the file, which is exactly how a
+     * truncated copy was once reported as a success (net/nodefs.c).
+     */
+    s_fstatus = (int32_t)get32(b + 4);
+    s_fcount = get32(b + 8);
+    s_fend = true;
+}
+
 static void on_msg(uint8_t chan, const void *data, uint16_t n, void *ctx)
 {
     (void)chan;
@@ -317,6 +693,19 @@ static void on_msg(uint8_t chan, const void *data, uint16_t n, void *ctx)
         return;
     }
     const uint8_t *b = (const uint8_t *)data;
+
+    /*
+     * THE STREAMED READ's frames first.  They are neither requests nor replies
+     * in the tag-matched sense: they are one answer's chunks, recognized by
+     * their opcode and their number, and only the side that asked ever sees
+     * them - so they are decided before the request/reply split below, which
+     * would send them to serve() as if they were questions.
+     */
+    if (b[0] == ND_DATA || b[0] == ND_END ||
+        b[0] == (uint8_t)(ND_FETCH | ND_REPLY)) {
+        on_stream(b, n);
+        return;
+    }
 
     if ((b[0] & ND_REPLY) == 0) {
         serve(b, n);
@@ -361,9 +750,141 @@ static uint32_t fh(void *file)
     return (uint32_t)(uintptr_t)file - 1u;
 }
 
+/*
+ * The streamed read, asking side: one request, and the bytes arrive on BULK.
+ *
+ * This is the whole of the change that makes a file move at the speed of the
+ * wire instead of the speed of a round trip.  It was one ND_READ per 232 bytes,
+ * each waiting for its own reply, which is a ceiling of chunk / round trip
+ * whatever the link can do - measured at 232 bytes per 15 ms on the SPI pair.
+ * Here the serving side is told once how much is wanted and answers with a run
+ * of chunks, and its own window fills the wire while the asking side writes
+ * each chunk at the running offset.
+ *
+ * `len` is the caller's buffer size, so one read of a 4096-byte buffer is one
+ * request and about seventeen frames, and a caller with a bigger buffer gets
+ * fewer requests rather than more round trips - up to the wire-derived bound,
+ * past which one request would hold the serving board's link reader for longer
+ * than the rest of that wire can wait.
+ */
+static int32_t fetch(uint32_t h, void *out, size_t len)
+{
+    if (out == NULL || len == 0) {
+        return 0;
+    }
+
+    uint32_t want = (uint32_t)len;
+    const uint32_t most = nd_stream_max();
+    if (want > most) {
+        want = most;
+    }
+
+    const int32_t lock = nd_lock();
+    if (lock != AG_OK) {
+        return lock;
+    }
+
+    s_ftag = next_tag();
+    s_fbuf = (uint8_t *)out;
+    s_fwant = want;
+    s_foff = 0;
+    s_fcount = 0;
+    s_fend = false;
+    s_frefused = false;
+    s_fstatus = 0;
+    /* Published LAST: the reader task is allowed to write into `out` only once
+     * every field it needs means something. */
+    s_fetch = true;
+
+    int32_t rc = (int32_t)send_frame(0, ND_FETCH, (uint8_t)nd_payload_max(),
+                                     s_ftag, h, want, AG_LINK_CONTROL, NULL, 0);
+    if (rc == AG_OK) {
+        int64_t  stall = ag_port_us() + (int64_t)ND_STALL_MS * 1000;
+        uint32_t seen = 0;
+
+        for (;;) {
+            if (s_fend) {
+                if (s_frefused) {
+                    /*
+                     * Not a failure to fetch, a peer that does not know how:
+                     * the caller falls back (see nd_read).  -ENOTSUP is what
+                     * serve()'s default case answers an unknown op, and it is
+                     * the only way out of here that means "try the old way".
+                     */
+                    rc = (s_fstatus < 0) ? s_fstatus : -AG_ENOTSUP;
+                } else if (s_fstatus == -AG_ENOTSUP) {
+                    /*
+                     * A stream that RAN and failed with that code is not a
+                     * refusal, whatever it says: the far side has already read
+                     * and moved its file position, so falling back to a second
+                     * read would hand the caller bytes from further into the
+                     * file.  Reported as the I/O failure it is, for the same
+                     * reason a stream that ends short is.
+                     */
+                    rc = -AG_EIO;
+                } else if (s_fstatus != AG_OK) {
+                    rc = s_fstatus;
+                } else if (s_fcount != s_foff) {
+                    /* The count is only a promise about a transfer the sender
+                     * called good; behind an error it is where it stopped. */
+                    rc = -AG_EIO;
+                } else {
+                    rc = (int32_t)s_foff;
+                }
+                break;
+            }
+            /*
+             * Refreshed by progress, not by the clock alone: this measures a
+             * STALL, so a wire that is slow but working is waited out, and one
+             * that has stopped is caught in ND_STALL_MS.  The waiting task
+             * sleeps between checks rather than spinning - the reader task is
+             * the one doing the work, and it is also the task that must keep
+             * the wire moving on a link with one clock master.
+             */
+            if (s_foff != seen) {
+                seen = s_foff;
+                stall = ag_port_us() + (int64_t)ND_STALL_MS * 1000;
+            } else if (ag_port_us() >= stall) {
+                rc = -AG_ETIMEDOUT;
+                break;
+            }
+            ag_port_task_delay(ag_port_ms_to_ticks(2));
+        }
+    }
+
+    nd_unlock();
+    return rc;
+}
+
+/*
+ * A PATH MUST FIT ONE FRAME, and it is checked against the WIRE now rather
+ * than against a number of ours.
+ *
+ * The request used to be cut to ND_MAX_PAYLOAD and sent anyway, so a path
+ * longer than that opened whatever its first 232 bytes named - a different
+ * file, with no error said anywhere.  A path that cannot travel is refused
+ * here, and refused before anything is opened or created on the far side.
+ * (net/nodefs.c had the same defect in its fetch and lost it the same way.)
+ */
+static ag_err_t nd_check_path(const char *rel)
+{
+    if (rel == NULL) {
+        return -AG_EINVAL;
+    }
+    const size_t n = strlen(rel);
+    if (n == 0 || n > nd_payload_max()) {
+        return -AG_EINVAL;
+    }
+    return AG_OK;
+}
+
 static ag_err_t nd_open(void *c, const char *rel, uint32_t flags, void **file)
 {
     (void)c;
+    const ag_err_t e = nd_check_path(rel);
+    if (e != AG_OK) {
+        return e;
+    }
     const int32_t r = ask(ND_OPEN, 0, flags, AG_LINK_CONTROL, rel,
                           (uint16_t)strlen(rel), NULL, NULL);
     if (r < 0) {
@@ -382,18 +903,47 @@ static ag_err_t nd_close(void *c, void *file)
 static int32_t nd_read(void *c, void *file, void *buf, size_t len)
 {
     (void)c;
-    if (len > ND_MAX_PAYLOAD) {
-        len = ND_MAX_PAYLOAD;
+    const int32_t n = fetch(fh(file), buf, len);
+
+    if (n != -AG_ENOTSUP) {
+        return n;
     }
-    uint16_t got = (uint16_t)len;
-    return ask(ND_READ, fh(file), (uint32_t)len, AG_LINK_CONTROL, NULL, 0, buf,
-               &got);
+
+    /*
+     * A PEER THAT DOES NOT KNOW ND_FETCH.  One board flashed and one not is the
+     * normal state of this bench while an image is going onto the second, and a
+     * mount that stopped reading across that window would be a worse failure
+     * than a slow one - so the old shape, one exchange per chunk, is kept as
+     * the fallback.
+     *
+     * And the count is checked here too: the reply's status is the number of
+     * bytes the far side read, and its payload is what arrived.  When they
+     * disagree the reply was cut somewhere this end cannot see, and reporting
+     * the larger number would be the silent truncation this file has already
+     * been bitten by.  Fewer bytes than were asked for is not a failure - it is
+     * end of file - but fewer bytes than were CLAIMED is.
+     */
+    uint16_t      got = (len > ND_CHUNK_MAX) ? (uint16_t)ND_CHUNK_MAX
+                                             : (uint16_t)len;
+    const int32_t r =
+        ask(ND_READ, fh(file), (uint32_t)got, AG_LINK_CONTROL, NULL, 0, buf,
+            &got);
+    if (r < 0) {
+        return r;
+    }
+    return (r == (int32_t)got) ? r : -AG_EIO;
 }
 static int32_t nd_write(void *c, void *file, const void *buf, size_t len)
 {
     (void)c;
-    if (len > ND_MAX_PAYLOAD) {
-        len = ND_MAX_PAYLOAD;
+    /* One frame's worth, from the wire: a bigger request would be refused by
+     * the driver and the write would fail for a reason nobody could see. */
+    const uint32_t cap = nd_payload_max();
+    if (len > cap) {
+        len = cap;
+    }
+    if (len == 0) {
+        return 0;
     }
     return ask(ND_WRITE, fh(file), 0, AG_LINK_BULK, buf, (uint16_t)len, NULL,
                NULL);
@@ -431,6 +981,10 @@ static ag_err_t nd_stat(void *c, const char *rel, ag_stat_t *out)
     }
     uint8_t       o[20];
     uint16_t      on = (uint16_t)sizeof(o);
+    const ag_err_t pe = nd_check_path(rel);
+    if (pe != AG_OK) {
+        return pe;
+    }
     const int32_t r = ask(ND_STAT, 0, 0, AG_LINK_CONTROL, rel,
                           (uint16_t)strlen(rel), o, &on);
     if (r < 0) {
@@ -444,6 +998,10 @@ static ag_err_t nd_stat(void *c, const char *rel, ag_stat_t *out)
 }
 static ag_err_t nd_path_op(uint8_t op, const char *rel)
 {
+    const ag_err_t pe = nd_check_path(rel);
+    if (pe != AG_OK) {
+        return pe;
+    }
     return (ag_err_t)ask(op, 0, 0, AG_LINK_CONTROL, rel, (uint16_t)strlen(rel),
                          NULL, NULL);
 }
@@ -465,6 +1023,10 @@ static ag_err_t nd_rmdir(void *c, const char *rel)
 static ag_err_t nd_opendir(void *c, const char *rel, void **dir)
 {
     (void)c;
+    const ag_err_t pe = nd_check_path(rel);
+    if (pe != AG_OK) {
+        return pe;
+    }
     const int32_t r = ask(ND_OPENDIR, 0, 0, AG_LINK_CONTROL, rel,
                           (uint16_t)strlen(rel), NULL, NULL);
     if (r < 0) {
@@ -476,7 +1038,7 @@ static ag_err_t nd_opendir(void *c, const char *rel, void **dir)
 static ag_err_t nd_readdir(void *c, void *dir, ag_dirent_t *out)
 {
     (void)c;
-    uint8_t       o[ND_MAX_PAYLOAD];
+    uint8_t       o[ND_CHUNK_MAX];
     uint16_t      on = (uint16_t)sizeof(o);
     const int32_t r =
         ask(ND_READDIR, fh(dir), 0, AG_LINK_CONTROL, NULL, 0, o, &on);

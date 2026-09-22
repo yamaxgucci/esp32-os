@@ -21,6 +21,9 @@
 #include <argon/port/sync.h>
 #include <argon/port/task.h>
 
+/* ag_port_panic_t: the record a panic leaves behind, for the shape of it. */
+#include <argon/port/fault.h>
+
 /* Bounds on what one process may hold.  A bound that is reached is a diagnosable
  * event; an unbounded list is a leak with extra steps (see argon/reslist.h). */
 #define AG_PROC_RES_MAX 32
@@ -36,6 +39,7 @@ typedef struct {
     bool     reported; /* so a fault is not written out twice on the way down */
     uint32_t cause;
     uint32_t pc;
+    uint32_t ra;    /* where the faulting function would have returned to */
     uint32_t vaddr;
     uint32_t sp;
 } ag_proc_fault_t;
@@ -197,12 +201,23 @@ bool ag_proc_task_in_kernel(ag_port_task_t task);
  * Returns false when this process cannot be recovered, in which case the caller
  * must let the fault take its normal course.
  */
-bool ag_proc_note_fault(uint32_t cause, uint32_t pc, uint32_t vaddr, uint32_t sp);
+bool ag_proc_note_fault(uint32_t cause, uint32_t pc, uint32_t vaddr, uint32_t sp,
+                        uint32_t ra);
 
 /*
  * Where a faulted process resumes, in ordinary task context: reports what
  * happened and ends the process.  Does not return.
  */
 void ag_proc_fault_exit(void);
+
+/*
+ * A panic the port refused to recover - the kernel's own fault, one taken while
+ * a kernel lock was held, a watchdog - copied out of the memory that survived
+ * the reboot it caused, and put into the same crash record as everything else.
+ * Called once, at boot, by the supervisor; the port clears its copy as it hands
+ * it over.  There is no process to blame, which is why it arrives here rather
+ * than through ag_proc_note_fault.
+ */
+void ag_proc_record_panic(const ag_port_panic_t *panic);
 
 #endif /* ARGON_PROC_INTERNAL_H */

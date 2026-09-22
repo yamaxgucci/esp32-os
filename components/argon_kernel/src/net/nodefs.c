@@ -35,8 +35,36 @@ enum {
 };
 
 #define NF_HDR 8u
-/* What fits in one message beside the header.  The link's quantum caps it. */
-#define NF_MAX_PAYLOAD 240u
+/*
+ * The most of a file one frame may carry.
+ *
+ * It was 240 - the UART's own message size, written down here as if it were a
+ * property of file transfer.  It is not: it is a ceiling on THIS file's
+ * buffers, and a wire that says it carries less is obeyed (nf_payload_max
+ * below).  A wire that says it carries more is used up to here.  255 plus the
+ * 8-byte header is 263, inside the 288-byte buffer the link reader receives
+ * into, and raising it is one number on the day there is a wire to raise it
+ * for.
+ */
+#define NF_CHUNK_MAX 255u
+
+/* What one frame on the bound wire can hold, header aside.  Asked, not
+ * assumed: the wire states its own shape and this is what info() is for.  A
+ * driver older than info() is answered with the UART's measured numbers by
+ * ag_linkprov_info itself, so there is no "unknown" case here. */
+static uint32_t nf_payload_max(void)
+{
+    ag_link_info_t info;
+    uint32_t       n = NF_CHUNK_MAX;
+
+    if (ag_linkprov_info(&info) == AG_OK && info.mtu > NF_HDR) {
+        const uint32_t m = info.mtu - NF_HDR;
+        if (m < n) {
+            n = m;
+        }
+    }
+    return n;
+}
 
 static void put_u16(uint8_t *p, uint16_t v)
 {
@@ -69,12 +97,24 @@ static volatile bool     s_done;
 static volatile int32_t  s_status;
 static volatile bool     s_wanted;
 
-static ag_err_t send_msg(uint8_t op, uint8_t cls, int32_t code,
+/*
+ * One frame out, ON PURPOSE TO SOMEBODY.
+ *
+ * `dst` is ag_node_hash() of the node the frame is for, and it is a parameter
+ * rather than left to the link because the two callers mean different nodes:
+ * a fetch asks the node this board is talking to (the selected target), while
+ * every frame of an answer is for the node that ASKED - which need not be the
+ * same board, and is not the same board at all when a third one sits in
+ * between.  An answer that says "for whoever is reading" is taken by the board
+ * in between and never passed home, and the asking node then waits for a file
+ * that arrived somewhere else.
+ */
+static ag_err_t send_msg(uint16_t dst, uint8_t op, uint8_t cls, int32_t code,
                          const void *payload, uint16_t len)
 {
-    uint8_t buf[NF_HDR + NF_MAX_PAYLOAD];
-    if (len > NF_MAX_PAYLOAD) {
-        len = NF_MAX_PAYLOAD;
+    uint8_t buf[NF_HDR + NF_CHUNK_MAX];
+    if (len > NF_CHUNK_MAX) {
+        len = NF_CHUNK_MAX;
     }
     buf[0] = op;
     buf[1] = 0;
@@ -90,7 +130,8 @@ static ag_err_t send_msg(uint8_t op, uint8_t cls, int32_t code,
      * must not hold a file open here for ever.
      */
     for (int t = 0; t < 2000; t++) {
-        const int32_t r = ag_linkprov_send(NF_CHAN, cls, buf, NF_HDR + len);
+        const int32_t r =
+            ag_linkprov_send_to(dst, NF_CHAN, cls, buf, NF_HDR + len);
         if (r >= 0) {
             return AG_OK;
         }
@@ -105,10 +146,27 @@ static ag_err_t send_msg(uint8_t op, uint8_t cls, int32_t code,
 /* Read the file and push it, in order, on the bulk class. */
 static void serve_get(const uint8_t *payload, uint16_t len)
 {
-    char path[AG_PATH_MAX];
+    /*
+     * WHOSE FILE THIS IS, taken once before the first byte moves.
+     *
+     * ag_linkprov_from() answers only while the receive callback runs, and this
+     * callback is a long one: it reads the whole file and pumps the wire
+     * whenever the window is full, so further frames are handled by this same
+     * task before it returns.  The requester is remembered here and every frame
+     * of the transfer is addressed to it - the last one included, which leaves
+     * seconds later, on the bulk class, behind every chunk in front of it.  A
+     * frame that said "for whoever is reading" instead would be taken by the
+     * board in between and the asking node would wait for ever.
+     */
+    const uint16_t from = ag_linkprov_from();
+    char           path[AG_PATH_MAX];
+    /* One frame's worth, from the wire rather than from a number here.
+     * nf_payload_max() never answers more than sizeof(chunk). */
+    uint8_t  chunk[NF_CHUNK_MAX];
+    const uint32_t cap = nf_payload_max();
 
     if (len == 0 || len >= sizeof(path)) {
-        (void)send_msg(NF_OP_END, AG_LINK_CONTROL, -AG_EINVAL, NULL, 0);
+        (void)send_msg(from, NF_OP_END, AG_LINK_CONTROL, -AG_EINVAL, NULL, 0);
         return;
     }
     memcpy(path, payload, len);
@@ -116,14 +174,20 @@ static void serve_get(const uint8_t *payload, uint16_t len)
 
     const ag_handle_t h = ag_vfs_open(path, "/", AG_O_RDONLY);
     if (h < 0) {
-        (void)send_msg(NF_OP_END, AG_LINK_CONTROL, (int32_t)h, NULL, 0);
+        (void)send_msg(from, NF_OP_END, AG_LINK_CONTROL, (int32_t)h, NULL, 0);
         return;
     }
 
     ag_err_t err = AG_OK;
+    /*
+     * WHAT THIS SIDE BELIEVES IT SENT, kept because the receiver's only other
+     * source for that number is nothing at all.  It is the count of bytes
+     * handed to the link's reliable class - not bytes read, because a chunk the
+     * link refused never left - and it travels with the END below.
+     */
+    uint32_t sent = 0;
     for (;;) {
-        uint8_t       chunk[NF_MAX_PAYLOAD];
-        const int32_t n = ag_vfs_read(h, chunk, sizeof(chunk));
+        const int32_t n = ag_vfs_read(h, chunk, cap);
         if (n < 0) {
             err = (ag_err_t)n;
             break;
@@ -136,21 +200,49 @@ static void serve_get(const uint8_t *payload, uint16_t len)
          * retransmissions are for: it may wait behind anything with a deadline,
          * and it is the only one here that could be made to.
          */
-        err = send_msg(NF_OP_DATA, AG_LINK_BULK, 0, chunk, (uint16_t)n);
+        err = send_msg(from, NF_OP_DATA, AG_LINK_BULK, 0, chunk, (uint16_t)n);
         if (err != AG_OK) {
             break;
         }
+        sent += (uint32_t)n;
     }
     (void)ag_vfs_close(h);
 
     /*
-     * END on CONTROL, and the whole transfer's correctness rests on this being
-     * the same channel as the data: a channel is one conversation and the link
-     * keeps a conversation in order, so END cannot overtake the bytes it ends.
-     * A different channel would let it, and the file would be closed short
-     * while the tail was still on the wire.
+     * END on BULK - the same class as the bytes it ends - and the whole
+     * transfer's correctness rests on that word.
+     *
+     * It was CONTROL, on the belief that "the link keeps a conversation in
+     * order, so END cannot overtake the bytes it ends".  A channel is one
+     * conversation; a CLASS is one sequence space.  The receiver keeps a
+     * separate expected number per class, and the scheduler sends CONTROL
+     * first, always, on purpose - a control frame is a device call or a spawn
+     * and never a payload.  So END on CONTROL did not queue behind the data,
+     * it overtook it.
+     *
+     * Measured, C3 to S3-Zero over one wire: 80 chunks of a 19 024-byte file
+     * went out, 15 of them were still unacknowledged when END left, the
+     * receiver took END, closed the file and stopped listening, and the copy
+     * was reported as 15 600 bytes with no error said anywhere.  The count
+     * moved with the window, not with the wire: 15 600 and 15 840 on two runs,
+     * both whole chunks, both short by less than ND_WIN_BULK.
+     *
+     * On BULK the sequence number puts END behind every chunk it ends.  A tail
+     * stuck behind a retransmission is then waited for rather than dropped,
+     * and a transfer that cannot finish reports a timeout instead of a file
+     * that is quietly the wrong length.
+     *
+     * AND THE COUNT GOES WITH THE VERDICT (see on_msg's NF_OP_END).  Order was
+     * never the whole of the answer: a frame can be in the right place and
+     * still not arrive at the file, and then the last frame's arrival says
+     * nothing about the file's length.  Four bytes in the payload the header
+     * already reserves costs nothing and is the only place the receiver can
+     * learn what the length was meant to be.
      */
-    (void)send_msg(NF_OP_END, AG_LINK_CONTROL, (int32_t)err, NULL, 0);
+    uint8_t tail[4];
+    put_u32(tail, sent);
+    (void)send_msg(from, NF_OP_END, AG_LINK_BULK, (int32_t)err, tail,
+                   (uint16_t)sizeof(tail));
 }
 
 static void on_msg(uint8_t chan, const void *data, uint16_t n, void *ctx)
@@ -174,8 +266,17 @@ static void on_msg(uint8_t chan, const void *data, uint16_t n, void *ctx)
     case NF_OP_DATA:
         if (s_wanted && s_sink >= 0 && len > 0) {
             const int32_t w = ag_vfs_write(s_sink, buf + NF_HDR, len);
-            if (w < 0) {
-                s_status = w;
+            /*
+             * A SHORT WRITE IS NOT A PARTIAL SUCCESS.  The bytes a sink did
+             * not take are gone, and everything written after them lands where
+             * they should have been - a file that is both short and shifted.
+             * The tree already reads this call this way where the bytes matter
+             * (`copy`, cmd_fs.c) and here it was `w < 0` alone, so a sink that
+             * took half a chunk was counted as half a chunk and the transfer
+             * carried on as if nothing had happened.
+             */
+            if (w != (int32_t)len) {
+                s_status = (w < 0) ? w : -AG_EIO;
                 s_done = true;
             } else {
                 s_got += (uint32_t)w;
@@ -184,6 +285,33 @@ static void on_msg(uint8_t chan, const void *data, uint16_t n, void *ctx)
         break;
     case NF_OP_END:
         s_status = (int32_t)get_u32(buf + 4);
+        /*
+         * THE COUNT, AND WHY NOTHING ELSE HERE COULD DO THIS JOB.
+         *
+         * The end of a transfer used to be "an END arrived and its code was
+         * zero", which is a statement about the LAST FRAME and not about the
+         * file: every byte before it could be missing and this still said
+         * success.  That is not hypothetical.  The link accepts a frame as
+         * delivered - advancing the sequence number it will acknowledge -
+         * BEFORE the message is queued for this service, and a full queue
+         * there drops it (nodelink.c, frame_arrived then inbox_put).  A message
+         * dropped that way is never sent again, because the far end was
+         * already told it arrived; neither end can see it in a byte count and
+         * no wire counter names it.  What can see it is a count that travelled
+         * with the verdict, compared here against what actually reached the
+         * file.
+         *
+         * Only when the sender said AG_OK: with an error the count is where it
+         * stopped, and a receiver that is behind that is the error working as
+         * intended.
+         *
+         * A peer that states no count (len < 4) is one built before this, and
+         * is left alone: a check that cannot be made must not invent a
+         * failure.
+         */
+        if (s_status == AG_OK && len >= 4 && get_u32(buf + NF_HDR) != s_got) {
+            s_status = -AG_EIO;
+        }
         s_done = true;
         break;
     default:
@@ -223,6 +351,21 @@ int32_t ag_nodefs_get(const char *remote, const char *local, const char *cwd,
         }
     }
 
+    /*
+     * A PATH THAT DOES NOT FIT ONE FRAME IS REFUSED, not truncated.
+     *
+     * It was truncated, to whatever the constant of the day allowed, and the
+     * far node then opened whatever the first part named: a long path meaning
+     * one file could fetch a DIFFERENT file, with no error said anywhere.  The
+     * length is checked against the wire - which is what decides how much of a
+     * path travels - and before the sink is created, so a refused fetch does
+     * not leave an empty file behind.
+     */
+    const size_t rl = strlen(remote);
+    if (rl == 0 || rl > nf_payload_max()) {
+        return -AG_EINVAL;
+    }
+
     const ag_handle_t h =
         ag_vfs_open(local, cwd, AG_O_WRONLY | AG_O_CREATE | AG_O_TRUNC);
     if (h < 0) {
@@ -235,11 +378,14 @@ int32_t ag_nodefs_get(const char *remote, const char *local, const char *cwd,
     s_status = 0;
     s_wanted = true;
 
-    const size_t rl = strlen(remote);
-    ag_err_t     err = send_msg(NF_OP_GET, AG_LINK_CONTROL, 0, remote,
-                                (uint16_t)((rl > NF_MAX_PAYLOAD)
-                                               ? NF_MAX_PAYLOAD
-                                               : rl));
+    /*
+     * A NEW conversation, so it goes to the node `link use` last named rather
+     * than to whoever answered last: this is the one frame in this file that is
+     * not an answer, and the target is precisely what that call is for.  Zero
+     * there means the neighbour in hand, which is what it has always meant.
+     */
+    ag_err_t err = send_msg(ag_linkprov_target(), NF_OP_GET, AG_LINK_CONTROL, 0,
+                            remote, (uint16_t)rl);
     if (err == AG_OK) {
         const int64_t deadline = ag_port_us() + (int64_t)timeout_ms * 1000;
         while (!s_done) {

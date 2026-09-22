@@ -164,7 +164,48 @@ def num(text, pattern, default=None):
     return m.group(1) if m else default
 
 
+def last_complaint(journal):
+    """The last thing a board's JOURNAL called a problem, or "".
+
+    For failure details.  A board says what went wrong in its journal whatever
+    the screen was doing - that rule is already in this tree - and a check that
+    fails without carrying the other board's sentence sends the next reader
+    looking in the wrong place.  Measured: `standby-work-came-home` failed three
+    runs saying only "it is still on the neighbour", while the C3 had said
+    "no task to send the guest home" in the same second.
+
+    Only the last one: a journal tail holds the whole run's noise, and the line
+    that matters is the one nearest the failure.
+    """
+    hits = re.findall(r"\b[EW] \(\d+\) [^EW]*", journal)
+    if not hits:
+        return ""
+    # The journal's own furniture - how many lines it is holding, and the
+    # prompt under it - is not part of the sentence.
+    clue = re.split(r"\s+\d+ lines held|\s+\(\d+\) [A-Z]:\\", hits[-1])[0]
+    return clue.strip()[:140]
+
+
 # ---------------------------------------------------------------- the wire ---
+
+
+def bind_to(node, other, tries=4):
+    """Point `node`'s link at the wire that reaches `other`.
+
+    A no-op on a bench of two boards, and not one on a bench of three: the
+    middle board holds two wires, and whichever of them the shell last used is
+    the one `link ping` goes out of.  A ping that leaves by the wrong wire is
+    answered by nobody and reports "0 of 24" - the exact reading that once cost
+    two hours of measuring copper that was fine.  So the wire is chosen by
+    NAME (the far end announces its own), and by looking rather than assuming.
+    """
+    for i in range(tries):
+        t = node.ask("link")
+        if ("the other is " + other.name) in t:
+            return True
+        node.ask("link use node%d" % i)
+    t = node.ask("link")
+    return ("the other is " + other.name) in t
 
 
 def scen_wire(a, b):
@@ -406,8 +447,25 @@ def scen_standby(fast, small, image):
     fast.ask("link wake", timeout=30.0)
     time.sleep(8.0)
     t = flat(fast.ask("ps", timeout=25.0))
-    note("MIGRANT" in t and small.name + "." not in t,
-         "standby-work-came-home", why="it is still on the neighbour")
+    if "MIGRANT" in t and small.name + "." not in t:
+        note(True, "standby-work-came-home")
+    else:
+        # AND ASK THE BOARD THAT WAS ASKED FOR IT, because that is where the
+        # reason is.  This check failed three runs in a row saying only "it is
+        # still on the neighbour", which reads as the harness not waiting long
+        # enough - and the answer was in the C3's own journal the whole time:
+        #
+        #   E (82544) node: no task to send the guest home
+        #
+        # Nobody read it, because this harness only reads the board that ASKS
+        # after `link wake`.  A cluster failure is a sentence one board says and
+        # the other hears, so a failure detail that does not carry what the
+        # other board said is a failure detail that costs a run.
+        why = "it is still on the neighbour"
+        clue = last_complaint(flat(small.ask("log -n 12", timeout=30.0)))
+        if clue:
+            why += "; %s journal: %s" % (small.name, clue)
+        note(False, "standby-work-came-home", why=why)
 
     # Tidy up: the check that leaves a counter running poisons the next one.
     name = num(flat(fast.ask("ps", timeout=20.0)), r"(\d+)\s+MIGRANT")
@@ -527,6 +585,15 @@ def main():
     cyd.restart()
     c3.restart()
     time.sleep(1.5)
+
+    # Which wire each board is talking on.  On the desk this ran on, the C3 had
+    # two neighbours bound, so this is what makes the pair under test the pair
+    # named on the command line.
+    print("choosing the wire between them", flush=True)
+    if not bind_to(cyd, c3):
+        print("  cyd never reported c3 on its wire", flush=True)
+    if not bind_to(c3, cyd):
+        print("  c3 never reported cyd on any wire it has", flush=True)
 
     scen_wire(cyd, c3)
     scen_devices(cyd, c3)

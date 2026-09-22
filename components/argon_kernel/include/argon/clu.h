@@ -98,6 +98,24 @@ typedef struct ag_clu_transport {
 
     /* The nodes this transport can reach, this board NOT included. */
     int32_t (*nodes)(ag_clu_node_t *out, uint32_t max);
+
+    /*
+     * The nodes this transport has only HEARD about: the far side of a
+     * neighbour, which no wire of ours reaches.
+     *
+     * Kept apart from `nodes` deliberately, and the reason is not tidiness.
+     * Everything that PLACES work walks `nodes` - pick_node in proc/clu.c picks
+     * the node with the most cores over and hands the index to spawn() - and a
+     * node that cannot be addressed must never be picked: a frame carries no
+     * destination, so a spawn for a node two hops away would go to whichever
+     * neighbour is in hand and start the thread on the wrong board, silently.
+     * So the seen ones are reported here, for an operator to look at, and stay
+     * out of every decision.
+     *
+     * `via` receives the index of the transport's own wire each one is seen
+     * through, or -1 when it is not known.  Returns how many were written.
+     */
+    int32_t (*peers_seen)(ag_clu_node_t *out, int32_t *via, uint32_t max);
 } ag_clu_transport_t;
 
 void ag_clu_set_transport(const ag_clu_transport_t *t);

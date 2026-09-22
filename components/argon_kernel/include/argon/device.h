@@ -42,7 +42,24 @@ extern "C" {
  *
  * Settable per board (CONFIG_ARGON_DEV_MAX) because every board pays about
  * seventy bytes an entry whether or not it will ever be in a cluster.
+ *
+ * THE INCLUDE BELOW IS THE WHOLE FIX, and it is here because without it the
+ * setting was a line that did nothing on every board.  This header read
+ * CONFIG_ARGON_DEV_MAX under #ifdef but never asked the port for the build-time
+ * options, so whether the symbol existed depended on whether the .c that
+ * included this header happened to have pulled sdkconfig.h in first - and in
+ * device.c it had not.  Every board ran on the twenty-four below while its
+ * sdkconfig said forty.
+ *
+ * Measured on the bench, the C3 in the middle of the trio: `link devs` brought
+ * in the CYD's registry and stopped at exactly twelve, refusing cyd.sd0,
+ * cyd.lcd0 and cyd.touch0 with -ENFILE (-23) - the card slot, the screen and
+ * the touchscreen, which are the three devices a cluster exists to lend.  Twelve
+ * of its own plus twelve borrowed is twenty-four, and the log said so next to a
+ * config that said forty.
  */
+#include <argon/port/config.h>
+
 #ifdef CONFIG_ARGON_DEV_MAX
 #define AG_DEV_MAX CONFIG_ARGON_DEV_MAX
 #else

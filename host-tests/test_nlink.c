@@ -34,6 +34,8 @@ static void test_hdr_roundtrip(void)
         .ack = 0x1234,
         .credit = 300,
         .len = 200,
+        .dst = 0xC3D1,
+        .src = 0x1A2B,
     };
     uint8_t buf[NL_HDR_SIZE];
     ag_nlink_pack(buf, &h);
@@ -48,6 +50,8 @@ static void test_hdr_roundtrip(void)
     AG_CHECK_INT(g.ack, 0x1234);
     AG_CHECK_INT(g.credit, 300);
     AG_CHECK_INT(g.len, 200);
+    AG_CHECK_INT(g.dst, 0xC3D1);
+    AG_CHECK_INT(g.src, 0x1A2B);
     AG_CHECK(g.crc == h.crc);
 }
 
@@ -63,6 +67,8 @@ static void test_exact_bytes(void)
         .ack = 0x0403,
         .credit = 0x0605,
         .len = 0x0008,
+        .dst = 0x0A09,
+        .src = 0x0C0B,
     };
     uint8_t b[NL_HDR_SIZE];
     ag_nlink_pack(b, &h);
@@ -83,11 +89,18 @@ static void test_exact_bytes(void)
     AG_CHECK_INT(b[13], 0x06);
     AG_CHECK_INT(b[14], 0x08);
     AG_CHECK_INT(b[15], 0x00);
+    /* The addressing sits between the old fields and the CRC, so the CRC's
+     * own offset moved with it and a frame from before this build cannot be
+     * read as if nothing had happened. */
+    AG_CHECK_INT(b[16], 0x09);
+    AG_CHECK_INT(b[17], 0x0A);
+    AG_CHECK_INT(b[18], 0x0B);
+    AG_CHECK_INT(b[19], 0x0C);
 }
 
 static void test_reject(void)
 {
-    ag_nlink_hdr_t h = {.cls = NL_CLS_CONTROL, .len = 4};
+    ag_nlink_hdr_t h = {.cls = NL_CLS_CONTROL, .len = 4, .dst = 0x1234};
     uint8_t        b[NL_HDR_SIZE];
     ag_nlink_hdr_t g;
 
@@ -104,6 +117,15 @@ static void test_reject(void)
     b[4] = NL_VERSION + 1u;
     AG_CHECK(!ag_nlink_unpack(&g, b));
 
+    /*
+     * Yesterday's header, which is the case the version exists for: the same
+     * magic, the fields up to `len` unchanged, and `dst` sitting exactly where
+     * the old build put its CRC.  It must be refused, not read.
+     */
+    ag_nlink_pack(b, &h);
+    b[4] = 1u;
+    AG_CHECK(!ag_nlink_unpack(&g, b));
+
     /* a class that does not exist */
     ag_nlink_pack(b, &h);
     b[5] = NL_CLASSES;
@@ -116,8 +138,16 @@ static void test_reject(void)
     b[15] = (uint8_t)((NL_QUANTUM + 1u) >> 8);
     AG_CHECK(!ag_nlink_unpack(&g, b));
 
-    /* one flipped bit anywhere in the header */
-    for (unsigned i = 0; i < 16u; i++) {
+    /* one flipped bit anywhere in the twenty bytes the CRC covers, the
+     * addressing included: a corrupted dst must not send a frame to the wrong
+     * board, and a corrupted src must not address an answer to one */
+    for (unsigned i = 0; i < 20u; i++) {
+        ag_nlink_pack(b, &h);
+        b[i] ^= 0x01u;
+        AG_CHECK(!ag_nlink_unpack(&g, b));
+    }
+    /* and one in the CRC itself */
+    for (unsigned i = 20u; i < NL_HDR_SIZE; i++) {
         ag_nlink_pack(b, &h);
         b[i] ^= 0x01u;
         AG_CHECK(!ag_nlink_unpack(&g, b));
@@ -364,11 +394,13 @@ static void test_window_fills_and_drains(void)
     const uint8_t body[16] = {0};
     for (int i = 0; i < 4; i++) {
         AG_CHECK(ag_nlink_tx_room(&tx));
-        AG_CHECK(ag_nlink_tx_queue(&tx, 1, body, sizeof(body), i == 3));
+        AG_CHECK(ag_nlink_tx_queue(&tx, 1, 0x1111, 0x2222, body, sizeof(body),
+                                   i == 3));
     }
     /* Full is back-pressure, not an error. */
     AG_CHECK(!ag_nlink_tx_room(&tx));
-    AG_CHECK(!ag_nlink_tx_queue(&tx, 1, body, sizeof(body), false));
+    AG_CHECK(!ag_nlink_tx_queue(&tx, 1, 0x1111, 0x2222, body, sizeof(body),
+                                false));
     AG_CHECK_INT(ag_nlink_tx_pending(&tx), 4);
 
     for (int i = 0; i < 4; i++) {
@@ -376,6 +408,11 @@ static void test_window_fills_and_drains(void)
         AG_CHECK(s != NULL);
         AG_CHECK_INT(s->seq, i);
         AG_CHECK_INT(s->flags & NL_F_EOM, (i == 3) ? NL_F_EOM : 0);
+        /* The addressing is carried with the payload, because the frame goes
+         * out on a later call than the one that queued it - and a relayed one
+         * must not lose who it is for or who sent it. */
+        AG_CHECK_INT(s->dst, 0x1111);
+        AG_CHECK_INT(s->src, 0x2222);
     }
     /* Everything sent, nothing due: the wire has nothing to do. */
     AG_CHECK(ag_nlink_tx_next(&tx, 0) == NULL);
@@ -405,7 +442,7 @@ static void test_one_loss_costs_one_timeout(void)
 
     const uint8_t body[8] = {0};
     for (int i = 0; i < 8; i++) {
-        AG_CHECK(ag_nlink_tx_queue(&tx, 1, body, sizeof(body), false));
+        AG_CHECK(ag_nlink_tx_queue(&tx, 1, 2, 3, body, sizeof(body), false));
     }
 
     /* Send all eight; the first is lost on the way. */
@@ -493,7 +530,7 @@ static void test_the_scheduler_is_told_about_a_retransmission(void)
     ag_nlink_sched_init(&s, STREAM_RESERVE);
 
     const uint8_t body[8] = {0};
-    AG_CHECK(ag_nlink_tx_queue(&tx, 1, body, sizeof(body), true));
+    AG_CHECK(ag_nlink_tx_queue(&tx, 1, 0, 0, body, sizeof(body), true));
 
     /* Offered, picked, sent - the ordinary path. */
     ag_nlink_sched_offer(&s, NL_CLS_CONTROL, ag_nlink_tx_waiting_bytes(&tx, 0),
@@ -566,7 +603,7 @@ static void test_the_timeout_follows_the_round_trip(void)
     /* Ten exchanges, each answered after 90 ms. */
     uint32_t now = 0;
     for (int i = 0; i < 10; i++) {
-        AG_CHECK(ag_nlink_tx_queue(&tx, 1, body, sizeof(body), true));
+        AG_CHECK(ag_nlink_tx_queue(&tx, 1, 0, 0, body, sizeof(body), true));
         const ag_nlink_slot_t *s = ag_nlink_tx_next(&tx, now);
         AG_CHECK(s != NULL);
         const uint16_t seq = s->seq;
@@ -587,7 +624,7 @@ static void test_the_timeout_follows_the_round_trip(void)
 
     /* Now the wire gets quick, and the estimate has to come back down. */
     for (int i = 0; i < 40; i++) {
-        AG_CHECK(ag_nlink_tx_queue(&tx, 1, body, sizeof(body), true));
+        AG_CHECK(ag_nlink_tx_queue(&tx, 1, 0, 0, body, sizeof(body), true));
         const ag_nlink_slot_t *s = ag_nlink_tx_next(&tx, now);
         AG_CHECK(s != NULL);
         const uint16_t seq = s->seq;
@@ -617,7 +654,7 @@ static void test_a_timeout_that_never_gets_a_sample_still_backs_off(void)
     const uint8_t   body[8] = {0};
 
     ag_nlink_tx_init(&tx, NL_CLS_CONTROL, slots, 4, 40);
-    AG_CHECK(ag_nlink_tx_queue(&tx, 1, body, sizeof(body), true));
+    AG_CHECK(ag_nlink_tx_queue(&tx, 1, 0, 0, body, sizeof(body), true));
 
     const uint32_t first = tx.rto_ms;
     uint32_t       now = 0;
@@ -667,7 +704,7 @@ static void test_a_megabyte_through_a_bad_wire(void)
         while (off < TOTAL && ag_nlink_tx_room(&tx)) {
             uint16_t n = (uint16_t)((TOTAL - off < NL_QUANTUM) ? (TOTAL - off)
                                                                : NL_QUANTUM);
-            AG_CHECK(ag_nlink_tx_queue(&tx, 1, &src[off], n,
+            AG_CHECK(ag_nlink_tx_queue(&tx, 1, 0xABCD, 0x1234, &src[off], n,
                                        (off + n) >= TOTAL));
             off += n;
         }
@@ -689,6 +726,8 @@ static void test_a_megabyte_through_a_bad_wire(void)
             .seq = s->seq,
             .ack = (uint16_t)ag_nlink_rx_ack(&rx),
             .len = s->len,
+            .dst = s->dst,
+            .src = s->src,
         };
         memcpy(body, s->data, s->len);
         ag_nlink_pack(hdr, &h);
@@ -699,9 +738,11 @@ static void test_a_megabyte_through_a_bad_wire(void)
         const bool     bent = (!lost && roll < 6u);  /* 2%: arrives wrong   */
         if (bent) {
             /* Half the time wreck the header, half the time the payload -
-             * the two are caught by different checks and both must be. */
+             * the two are caught by different checks and both must be.  The
+             * header half now reaches the addressing too, because a corrupted
+             * dst is a frame on its way to the wrong board. */
             if ((rng(&seed) & 1u) != 0u) {
-                hdr[rng(&seed) % 16u] ^= 0x20u;
+                hdr[rng(&seed) % 20u] ^= 0x20u;
             } else if (h.len > 0u) {
                 body[rng(&seed) % h.len] ^= 0x08u;
             }
@@ -715,6 +756,11 @@ static void test_a_megabyte_through_a_bad_wire(void)
             } else if (!ag_nlink_check_psum(&g, body, psum)) {
                 lost = true; /* and so is a bad payload, deliberately */
             } else {
+                /* The addressing survived the wire with the payload: a frame
+                 * whose dst changed in flight is a frame delivered to the
+                 * wrong board, and this is where that would be caught. */
+                AG_CHECK_INT(g.dst, 0xABCD);
+                AG_CHECK_INT(g.src, 0x1234);
                 if (ag_nlink_rx_accept(&rx, &g)) {
                     AG_CHECK(got + g.len <= TOTAL);
                     memcpy(&dst[got], body, g.len);

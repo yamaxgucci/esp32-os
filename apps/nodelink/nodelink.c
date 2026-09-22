@@ -108,6 +108,16 @@ enum { SM_SYNC = 0, SM_HDR, SM_BODY, SM_PSUM };
 
 typedef struct {
     uint8_t  chan;
+    uint8_t  cls;
+    /*
+     * The addressing the frame carried.  The driver does NOT act on it: it
+     * cannot, because it does not know this board's name nor any neighbour's -
+     * that is the kernel's (see linkprov.c, which relays).  It is carried here,
+     * and out through recv_a, so the kernel can decide whether a message is for
+     * this board or is one to move across to the next wire.
+     */
+    uint16_t dst;
+    uint16_t src;
     uint16_t len;
     uint8_t  data[NL_QUANTUM];
 } msg_t;
@@ -139,7 +149,27 @@ typedef struct {
     /* Receive side: whole messages, waiting to be taken. */
     msg_t    inbox[ND_RX_QUEUE];
     uint32_t in_r, in_w, in_fill;
+    /*
+     * Two counters, and they are not two names for the same thing.
+     *
+     * `in_dropped` is the STREAM class only: a frame nobody collected is gone
+     * by design, because that class is not acknowledged and a retransmitted
+     * audio frame arrives after the moment it was for (see inbox_put).
+     *
+     * `in_refused` is CONTROL or BULK arriving with no room in the queue.  The
+     * frame was NOT taken, the sequence it carries is still owed, and the
+     * peer's retransmission brings it back - so non-zero here is NORMAL and
+     * harmless under load: it is this board's reader being behind the wire and
+     * the window doing its job.  There is deliberately no counter for
+     * "accepted and then discarded", because that event is the defect and this
+     * file no longer has a path that can produce it; a non-zero value of such
+     * a counter is the thing to be afraid of, and its absence is the point.
+     *
+     * Neither number is in ag_link_stats_t, so neither can be printed by
+     * `link` today; they are here to be read by whoever is in this file next.
+     */
     uint32_t in_dropped;
+    uint32_t in_refused;
 
     /* frame assembler */
     int            sm;
@@ -210,22 +240,51 @@ static void wire_write(node_t *nd, const void *buf, size_t len)
 /* Receiving                                                               */
 /* ---------------------------------------------------------------------- */
 
-static void inbox_put(node_t *nd, uint8_t chan, const uint8_t *data,
-                      uint16_t len)
+/*
+ * One message into the queue, room assumed.
+ *
+ * THE CALLER HAS ALREADY CHECKED THERE IS ROOM, and for a sequenced class that
+ * check is what keeps the class honest - see frame_arrived, where it is made
+ * BEFORE the sequence number is allowed to move.  The check is repeated here
+ * anyway because the STREAM class has no sequence to lean on and dropping is
+ * the only thing left to do with a frame that will never be sent again.
+ *
+ * A STREAM message that cannot be queued is genuinely gone; that is the class
+ * working as designed.  "Dropped rather than delayed" is its whole contract and
+ * a retransmitted audio frame would arrive after the moment it was for.
+ *
+ * WHAT THIS BRANCH MUST NEVER SEE AGAIN is a CONTROL or BULK frame.  It used
+ * to see them, and that was the defect: the frame had already been accepted,
+ * the sequence the peer is acknowledged with had already moved, so the far end
+ * was told its message had arrived - and its retransmission, which is what its
+ * window exists to make, was refused as a duplicate.  Permanent silent loss, at
+ * whole-message granularity, reported to the operator as success.
+ *
+ * THE ORIGINAL AUTHOR CHOSE THE DROP, and the reasoning was defensible enough
+ * that it is worth keeping: stopping the acknowledgement closes the far end's
+ * window, and then "the sender blocks on a link that is only slow because
+ * nobody here is reading it, and a control message behind the jam waits on a
+ * picture nobody wants.  A count says the same thing without the deadlock."
+ * He weighed a stall against a silent drop and took the drop because he
+ * believed the count would tell somebody.  It did not: `in_dropped` was never
+ * printed by any command and the sender was never told, so what shipped was
+ * not a count instead of a deadlock but permanent loss with no counter, no log
+ * and a success at the end of it.  The instrumentation the choice depended on
+ * did not exist, and without it the choice was wrong.  Do not revert this for
+ * the reason that produced the bug.
+ */
+static void inbox_put(node_t *nd, uint8_t chan, uint8_t cls, uint16_t dst,
+                      uint16_t src, const uint8_t *data, uint16_t len)
 {
     if (nd->in_fill >= ND_RX_QUEUE) {
-        /*
-         * Dropped, and counted.  The alternative is to stop acknowledging and
-         * let the far end's window close, which sounds tidier and is worse: the
-         * sender then blocks on a link that is only slow because nobody here is
-         * reading it, and a control message behind the jam waits on a picture
-         * nobody wants.  A count says the same thing without the deadlock.
-         */
         nd->in_dropped++;
         return;
     }
     msg_t *m = &nd->inbox[nd->in_w];
     m->chan = chan;
+    m->cls = cls;
+    m->dst = dst;
+    m->src = src;
     m->len = len;
     if (len > 0) {
         memcpy(m->data, data, len);
@@ -291,12 +350,75 @@ static void frame_arrived(node_t *nd)
     if (cls == NL_CLS_STREAM) {
         /* Not sequenced and not acknowledged: whatever arrives is delivered,
          * and what did not arrive is not worth knowing about by the time it
-         * could be asked for. */
-        inbox_put(nd, h->chan, nd->body, h->len);
+         * could be asked for.  Left exactly as it was, and deliberately: for
+         * THIS class a full queue is the design (see inbox_put), not a defect,
+         * because there is no sequence to hold back and nothing will bring the
+         * frame again. */
+        inbox_put(nd, h->chan, cls, h->dst, h->src, nd->body, h->len);
+        return;
+    }
+
+    /*
+     * ROOM FIRST, SEQUENCE SECOND - the order of these two statements is the
+     * whole of this fix.
+     *
+     * It was the other way round.  ag_nlink_rx_accept() moved the sequence this
+     * receiver will acknowledge, and only afterwards did inbox_put() look and
+     * find no room, discard the message and count it.  The far end had already
+     * been told that message had arrived, so when it sent the message again -
+     * which is precisely what its window is for - rx_accept refused the copy as
+     * a duplicate (ag_nlink.c, rx->dups) and the bytes were gone for good.
+     * Nothing said so: not a log line, not a counter the shell prints, and not
+     * the sender, whose window had slid past it.  What that looked like from
+     * outside was `link get` reporting success over a file short by a whole
+     * number of messages, because whole messages are what was lost.
+     *
+     * A REFUSAL IS NOT A LOSS.  Leaving the expected sequence where it is says
+     * "I still want this one": the peer's next retransmission brings the same
+     * message, and it is taken as soon as the queue has drained.  That is
+     * ordinary back-pressure, and it is what the window is for - the peer
+     * waits, it does not lose.  It costs retransmissions while this board's
+     * reader is behind the wire, and that is the honest price of not lying.
+     *
+     * WHAT THE PEER IS TOLD stays correct by construction rather than by a
+     * second rule: rx->last only moves for a message that is actually queued,
+     * so the acknowledgement - riding on the next frame, or sent alone by
+     * turn() - still says "everything up to here" and stops short of the frame
+     * that was refused.  Neither a reset nor an acknowledgement-only frame
+     * reaches this point (both return above, and neither carries a sequence),
+     * so neither is affected by it; and the peer's acknowledgement of OUR
+     * frames was taken even earlier, so refusing an inbound frame never stops
+     * this end's own window from sliding.
+     *
+     * IT TOOK TWO BOARDS TO FIND, and that is worth knowing before changing it
+     * back: on a UART at a few hundred kilobytes a second the queue below never
+     * fills, so this branch never runs and the defect is invisible.  It needs a
+     * wire fast enough to outrun the file write behind it.
+     */
+    if (nd->in_fill >= ND_RX_QUEUE) {
+        /*
+         * Counted, and non-zero here is normal and harmless under load - it
+         * means the reader is behind the wire and the window is doing its job.
+         * There is no counter for "accepted and then discarded" because this
+         * branch is what makes that impossible; see in_refused in node_t.
+         */
+        nd->in_refused++;
         return;
     }
     if (ag_nlink_rx_accept(&nd->rx[cls], h)) {
-        inbox_put(nd, h->chan, nd->body, h->len);
+        /*
+         * Accepted on THIS hop, whether or not it is for this board, and that
+         * is deliberate: a relayed frame travels two hops with two independent
+         * sequence spaces, so the middle board owes the origin an
+         * acknowledgement for its hop and owes the far end its own sequence
+         * numbers on the other wire.  Whether it is delivered here or moved
+         * across is the kernel's decision, and this driver is not told it -
+         * it has no names to decide with.
+         *
+         * The queue has room - it was checked immediately above and nothing
+         * runs in between - so this put cannot drop what was just accepted.
+         */
+        inbox_put(nd, h->chan, cls, h->dst, h->src, nd->body, h->len);
     }
 }
 
@@ -375,7 +497,7 @@ static uint16_t ack_for(node_t *nd, uint8_t cls)
 }
 
 static void emit(node_t *nd, uint8_t cls, uint8_t chan, uint16_t seq,
-                 uint8_t flags,
+                 uint8_t flags, uint16_t dst, uint16_t src,
                  const uint8_t *body, uint16_t len)
 {
     ag_nlink_hdr_t h;
@@ -390,6 +512,13 @@ static void emit(node_t *nd, uint8_t cls, uint8_t chan, uint16_t seq,
      * second mechanism to get wrong. */
     h.credit = 0;
     h.len = len;
+    /* Stamped, not decided: what the caller asked for, or - for the frames the
+     * link generates about ITSELF, a reset or an acknowledgement - zero, which
+     * means "whoever is reading it" and is exactly what those mean.  A relayed
+     * frame's src came from the far end of a previous hop and is passed through
+     * untouched, because it is what that far end answers. */
+    h.dst = dst;
+    h.src = src;
 
     /* Whatever we are sending, it carries the current acknowledgement - so
      * record what the far end has now been told. */
@@ -486,7 +615,7 @@ static void turn(node_t *nd)
             if (nd->acked_any[c] && nd->acked[c] == now_ack) {
                 continue; /* already told them */
             }
-            emit(nd, (uint8_t)c, 0, 0, NL_F_ACKONLY, NULL, 0);
+            emit(nd, (uint8_t)c, 0, 0, NL_F_ACKONLY, 0u, 0u, NULL, 0);
             nd->acks++;
             return; /* one frame per turn, here as everywhere */
         }
@@ -495,8 +624,8 @@ static void turn(node_t *nd)
 
     if (cls == NL_CLS_STREAM) {
         const msg_t *m = &nd->stream[nd->stream_r];
-        emit(nd, NL_CLS_STREAM, m->chan, nd->stream_seq++, NL_F_EOM, m->data,
-             m->len);
+        emit(nd, NL_CLS_STREAM, m->chan, nd->stream_seq++, NL_F_EOM, m->dst,
+             m->src, m->data, m->len);
         nd->stream_r = (nd->stream_r + 1u) % ND_STREAM_QUEUE;
         nd->stream_fill--;
         ag_nlink_sched_sent(&nd->sched, cls, (uint32_t)m->len + NL_HDR_SIZE);
@@ -507,7 +636,8 @@ static void turn(node_t *nd)
     if (s == NULL) {
         return;
     }
-    emit(nd, (uint8_t)cls, s->chan, s->seq, s->flags, s->data, s->len);
+    emit(nd, (uint8_t)cls, s->chan, s->seq, s->flags, s->dst, s->src, s->data,
+         s->len);
     ag_nlink_sched_sent(&nd->sched, cls,
                         (uint32_t)s->len + NL_HDR_SIZE + NL_PSUM_SIZE);
 }
@@ -537,8 +667,8 @@ static void reset_channels(node_t *nd, bool announce)
         /* Sequence zero on the frame itself, and it does not matter: the far
          * end acts on the flag BEFORE it looks at the sequence, which is the
          * only way a reset can reach a receiver that is refusing everything. */
-        emit(nd, NL_CLS_CONTROL, 0, 0, NL_F_RST, NULL, 0);
-        emit(nd, NL_CLS_BULK, 0, 0, NL_F_RST, NULL, 0);
+        emit(nd, NL_CLS_CONTROL, 0, 0, NL_F_RST, 0u, 0u, NULL, 0);
+        emit(nd, NL_CLS_BULK, 0, 0, NL_F_RST, 0u, 0u, NULL, 0);
     }
 }
 
@@ -593,8 +723,15 @@ static bool nd_up(ag_device_t *dev)
     return r;
 }
 
-static int32_t nd_send(ag_device_t *dev, uint8_t chan, uint8_t cls,
-                       const void *buf, size_t len)
+/*
+ * One message queued, addressed or not.  Everything that knows about windows,
+ * classes and the stream ring lives here once, so that the addressed and the
+ * unaddressed entry points cannot drift apart - they differ in the two numbers
+ * they stamp and in nothing else.
+ */
+static int32_t send_common(ag_device_t *dev, uint8_t chan, uint8_t cls,
+                           const void *buf, size_t len, uint16_t dst,
+                           uint16_t src)
 {
     node_t *nd = (node_t *)ag_dev_priv(dev);
     if (nd == NULL) {
@@ -624,12 +761,15 @@ static int32_t nd_send(ag_device_t *dev, uint8_t chan, uint8_t cls,
         }
         msg_t *m = &nd->stream[nd->stream_w];
         m->chan = chan;
+        m->cls = cls;
+        m->dst = dst;
+        m->src = src;
         m->len = (uint16_t)len;
         memcpy(m->data, buf, len);
         nd->stream_w = (nd->stream_w + 1u) % ND_STREAM_QUEUE;
         nd->stream_fill++;
         r = (int32_t)len;
-    } else if (ag_nlink_tx_queue(&nd->tx[cls], chan, buf, (uint16_t)len,
+    } else if (ag_nlink_tx_queue(&nd->tx[cls], chan, dst, src, buf, (uint16_t)len,
                                  true)) {
         r = (int32_t)len;
     } else {
@@ -640,8 +780,34 @@ static int32_t nd_send(ag_device_t *dev, uint8_t chan, uint8_t cls,
     return r;
 }
 
-static int32_t nd_recv(ag_device_t *dev, uint8_t *chan, void *buf, size_t max,
-                       uint32_t timeout_ms)
+static int32_t nd_send(ag_device_t *dev, uint8_t chan, uint8_t cls,
+                       const void *buf, size_t len)
+{
+    /*
+     * The entry a kernel from before ABI 0.54 calls, and the honest reading of
+     * it is "for whoever is reading": zero in both fields is what every frame
+     * meant before a board had a neighbour it could not reach directly.
+     */
+    return send_common(dev, chan, cls, buf, len, 0u, 0u);
+}
+
+static int32_t nd_send_a(ag_device_t *dev, uint8_t chan, const void *buf,
+                         size_t len, const ag_link_addr_t *to)
+{
+    if (to == NULL) {
+        return -AG_EINVAL;
+    }
+    /*
+     * The three fields are copied out here and carried with the payload: the
+     * frame goes out on a later call than this one, and a relayed message must
+     * still leave with the destination and the SOURCE it arrived with.
+     */
+    return send_common(dev, chan, to->cls, buf, len, to->dst, to->src);
+}
+
+static int32_t recv_common(ag_device_t *dev, uint8_t *chan, void *buf,
+                           size_t max, uint32_t timeout_ms,
+                           ag_link_addr_t *from)
 {
     node_t *nd = (node_t *)ag_dev_priv(dev);
     if (nd == NULL) {
@@ -669,6 +835,11 @@ static int32_t nd_recv(ag_device_t *dev, uint8_t *chan, void *buf, size_t max,
             const uint16_t n = (m->len < max) ? m->len : (uint16_t)max;
             memcpy(buf, m->data, n);
             *chan = m->chan;
+            if (from != NULL) {
+                from->dst = m->dst;
+                from->src = m->src;
+                from->cls = m->cls;
+            }
             nd->in_r = (nd->in_r + 1u) % ND_RX_QUEUE;
             nd->in_fill--;
             TASK->mutex_unlock(nd->lock);
@@ -681,6 +852,20 @@ static int32_t nd_recv(ag_device_t *dev, uint8_t *chan, void *buf, size_t max,
         }
         TASK->sleep_ms(1);
     }
+}
+
+static int32_t nd_recv(ag_device_t *dev, uint8_t *chan, void *buf, size_t max,
+                       uint32_t timeout_ms)
+{
+    /* A kernel from before 0.54 asks this, and gets no addressing - which is
+     * what it understands. */
+    return recv_common(dev, chan, buf, max, timeout_ms, NULL);
+}
+
+static int32_t nd_recv_a(ag_device_t *dev, uint8_t *chan, void *buf, size_t max,
+                         uint32_t timeout_ms, ag_link_addr_t *from)
+{
+    return recv_common(dev, chan, buf, max, timeout_ms, from);
 }
 
 static void nd_poll(ag_device_t *dev, uint32_t ms)
@@ -724,6 +909,27 @@ static ag_err_t nd_stats(ag_device_t *dev, ag_link_stats_t *out)
     out->acks = nd->acks;
     out->tx_bytes = nd->tx_bytes;
     out->rx_bytes = nd->rx_bytes;
+    /*
+     * WHAT A FULL QUEUE DID, which is the pair whose absence let this defect
+     * ship: the counters existed in this file and no command printed them, so
+     * the silent loss they counted looked exactly like a healthy link.
+     *
+     * `rx_refused` is CONTROL and BULK frames this board did not take because
+     * there was no room.  The peer still has them - that is what its window is
+     * for - and its next retransmission brings them back, so a number here is
+     * NORMAL and is the window doing its job on a board whose reader is behind
+     * the wire.  It is not loss.
+     *
+     * `rx_dropped` is STREAM frames, which are neither acknowledged nor
+     * retransmitted: no room means gone, and that is that class working as
+     * designed rather than a fault.
+     *
+     * There is deliberately no third counter for "accepted and then
+     * discarded" - that was the defect, and frame_arrived no longer has a path
+     * that can produce it.
+     */
+    out->rx_refused = nd->in_refused;
+    out->rx_dropped = nd->in_dropped;
     /*
      * CONTROL's, not a sum or an average: the three classes have separate
      * windows and separate timers, and an average of three timeouts is a
@@ -842,6 +1048,12 @@ static const ag_link_ops_t k_link_ops = {
     .poll = nd_poll,
     .stats = nd_stats,
     .info = nd_info,
+    /* ABI 0.54.  Both pairs are filled in: this driver is built against the
+     * current table and answers the old calls too, so a kernel from before the
+     * addressing still binds it and gets the unaddressed behaviour it
+     * understands. */
+    .send_a = nd_send_a,
+    .recv_a = nd_recv_a,
 };
 
 /* ---------------------------------------------------------------------- */

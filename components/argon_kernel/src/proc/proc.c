@@ -244,7 +244,11 @@ static ag_err_t heap_create(proc_t *p, uint32_t requested)
      * that asked for a size is not touched: it gets what it asked for or it
      * does not start.
      */
-    if (!required) {
+    if (required) {
+        if (size < AG_PROC_HEAP_MIN) {
+            size = AG_PROC_HEAP_MIN;
+        }
+    } else {
         size_t pool = ag_port_mem_free(AG_MEM_SLOW);
         if (pool == 0) {
             pool = ag_port_mem_free(AG_MEM_FAST);
@@ -252,13 +256,36 @@ static ag_err_t heap_create(proc_t *p, uint32_t requested)
         if (size > pool / 4u) {
             size = pool / 4u;
         }
+        /*
+         * THE FLOOR IS FOR A SIZE THE APPLICATION NAMED, NOT FOR A DEFAULT.
+         *
+         * This used to be a plain `if (size < AG_PROC_HEAP_MIN) size = ...`
+         * after the cap, and on a board with no PSRAM the floor silently
+         * overruled the cap - which is the one case the cap exists for.
+         * Measured on the C3: 34 KB of internal free at rest, so a quarter of
+         * the pool is 8.5 KB, which the 16 KB floor put back to 16.  The cap
+         * was written so that a default arena does not eat a small machine,
+         * and it handed that machine a quarter of itself anyway.
+         *
+         * Where the pool is under 64 KB there is no arena a DEFAULT can
+         * honestly have, and the honest answer is the one docs/13-memory.md
+         * already states: an application that names no heap gets none, and its
+         * ag_malloc returns NULL, rather than the machine paying 16 KB for a
+         * promise nobody made.  Measured, on the boards in this tree: the C3
+         * (34 KB free) now gives none; the CYD, the S3 and the QEMU build all
+         * have a pool whose quarter is above the floor and are unchanged.
+         *
+         * This is not a nicety on the C3, it is the difference between one
+         * guest and two: an 8 KB stack plus a 16 KB arena is 24 KB of the 34
+         * that board has, and the SECOND program - always the neighbour's
+         * build being substituted for a foreign one - is refused at 8 KB.
+         */
+        if (size < AG_PROC_HEAP_MIN) {
+            size = 0;
+        }
     }
 
-    if (size < AG_PROC_HEAP_MIN) {
-        size = AG_PROC_HEAP_MIN;
-    }
-
-    for (;;) {
+    while (size >= AG_PROC_HEAP_MIN) {
         /* PSRAM, then byte-accessible D/IRAM, then ordinary internal - so the
          * arena does not carve the DMA-capable DRAM the radio needs whole (see
          * data_alloc in src/loader/loader.c). */
@@ -283,15 +310,13 @@ static ag_err_t heap_create(proc_t *p, uint32_t requested)
         /*
          * An image that asked for a size needs that size: refusing to start is
          * better than starting something that will fail halfway through.  One
-         * that took the default gets whatever is available instead.
+         * that took the default gets whatever is available instead - and,
+         * below the floor, nothing at all.
          */
-        if (required || size <= AG_PROC_HEAP_MIN) {
+        if (required) {
             break;
         }
         size /= 2;
-        if (size < AG_PROC_HEAP_MIN) {
-            size = AG_PROC_HEAP_MIN;
-        }
     }
 
     if (required) {
@@ -500,7 +525,8 @@ bool ag_proc_task_in_kernel(ag_port_task_t task)
  * Written down in an exception context, so: no locks, no logging, no allocation.
  * Answers whether this fault belongs to an application that can be unwound.
  */
-bool ag_proc_note_fault(uint32_t cause, uint32_t pc, uint32_t vaddr, uint32_t sp)
+bool ag_proc_note_fault(uint32_t cause, uint32_t pc, uint32_t vaddr, uint32_t sp,
+                        uint32_t ra)
 {
     proc_t *p = current();
 
@@ -517,6 +543,7 @@ bool ag_proc_note_fault(uint32_t cause, uint32_t pc, uint32_t vaddr, uint32_t sp
     p->fault.pending = true;
     p->fault.cause = cause;
     p->fault.pc = pc;
+    p->fault.ra = ra;
     p->fault.vaddr = vaddr;
     p->fault.sp = sp;
     return true;
@@ -561,6 +588,42 @@ bool ag_proc_take_crash_record(char *out, size_t len)
     }
     unlock();
     return waiting;
+}
+
+/*
+ * The panic the port could not recover, reported in the same form as a process
+ * that faulted - because it is the same question being asked, and the answer
+ * should not depend on which of the two happened.
+ *
+ * It is a boot-time report and not a live one: the machine that took the fault
+ * is gone.  The port kept the numbers across that reboot (RTC memory on ESP32),
+ * and this turns them into the record the supervisor already knows how to write
+ * to /sys/crash.log, journal tail and all.  Nothing here locks, so it goes
+ * through the same lock-free buffer as a crash in the fault-recovery path.
+ */
+void ag_proc_record_panic(const ag_port_panic_t *panic)
+{
+    if (panic == NULL) {
+        return;
+    }
+
+    s_crash_text[0] = '\0';
+    crash_printf("panic before this boot (the machine went down; no process "
+                 "survived to be blamed)\n");
+    crash_printf("  %s at pc %08x, ra %08x, address %08x, sp %08x\n",
+                 ag_port_fault_cause_name(panic->cause), (unsigned)panic->pc,
+                 (unsigned)panic->ra, (unsigned)panic->vaddr,
+                 (unsigned)panic->sp);
+    crash_printf("  image %08x (first 4 bytes of the ELF SHA256)",
+                 (unsigned)panic->image);
+    if (panic->words > 0) {
+        crash_printf(", stack top:");
+        for (uint32_t i = 0; i < panic->words; i++) {
+            crash_printf(" %08x", (unsigned)panic->stack[i]);
+        }
+    }
+    crash_printf("\n");
+    s_crash_waiting = true;
 }
 
 static void crash_record(proc_t *p, const char *reason)
@@ -613,9 +676,17 @@ static void crash_record(proc_t *p, const char *reason)
     const uintptr_t code = (uintptr_t)p->app.place.code;
     const uintptr_t code_end = code + p->app.header.code.size;
 
-    crash_printf("  %s at pc %08x, address %08x, sp %08x\n",
+    /*
+     * pc first, and ra next to it: the pc is where it died and the ra is where
+     * it came from, and for a bad cast or an unset function pointer the two
+     * together are usually the whole diagnosis.  The faulting sp is here because
+     * a stack is what an application that is not obviously wrong is usually
+     * short of.
+     */
+    crash_printf("  %s at pc %08x, ra %08x, address %08x, sp %08x\n",
                  ag_port_fault_cause_name(p->fault.cause), (unsigned)p->fault.pc,
-                 (unsigned)p->fault.vaddr, (unsigned)p->fault.sp);
+                 (unsigned)p->fault.ra, (unsigned)p->fault.vaddr,
+                 (unsigned)p->fault.sp);
 
     if (p->fault.pc >= code && p->fault.pc < code_end) {
         crash_printf("  pc is offset 0x%x in its own code\n",
@@ -1194,11 +1265,32 @@ ag_err_t ag_proc_spawn_sink(const char *path, int argc, char **argv,
      * image.  A failure to read it here is not fatal - the default is a working
      * answer and the real load will report the same problem properly - so the
      * header is a hint at this point and nothing more.
+     *
+     * -AG_ENOTSUP IS AN ANSWER, NOT A FAILURE, and this is the line the whole
+     * cross-ISA cluster turns on.
+     *
+     * ag_loader_peek fills the header and only THEN validates it, and the check
+     * that fails for an image built for the other instruction set is the arch
+     * check - which is not a statement about the stack, or the name, or the
+     * size.  Ignoring the header on that answer costs the board its DEFAULT
+     * stack (CONFIG_ARGON_APP_STACK_KB, 16 KB) for a program that named 8, and
+     * on the C3 that is the difference between the second guest starting and
+     * being refused.  Measured on COM8: `run c:\nodehi32.axe` - NODEHI for the
+     * other processor, declaring 8192 - logged "loading with 18776 free",
+     * which is 16384 gone; its own RISC-V build, which validates, logged
+     * "loading with 26968 free", which is 8192 gone.  One number, two answers,
+     * and the wrong one lands exactly on the path this board exists for: a run
+     * arriving over the wire is very often the neighbour's build of a program.
+     *
+     * The same reading is already relied on in nodeproc.c, where the identity
+     * in a header that failed validation is what makes the substitution
+     * possible at all.  This is the second half of that fact.
      */
     {
         ag_axe_header_t peek;
-        uint32_t        want = 0;
-        if (ag_loader_peek(p->path, p->cwd, &peek) == AG_OK) {
+        uint32_t        want   = 0;
+        const ag_err_t  peeked = ag_loader_peek(p->path, p->cwd, &peek);
+        if (peeked == AG_OK || peeked == -AG_ENOTSUP) {
             want = peek.stack_size;
         }
         /*

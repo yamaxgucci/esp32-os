@@ -58,8 +58,9 @@
  * it will never see one; the same restraint one layer down keeps that promise
  * cheap to keep.
  *
- * ag_reset_t has three values because the kernel distinguishes three cases and
+ * ag_reset_t has four values because the kernel distinguishes four cases and
  * no more: a cold start clears the crash streak, a deliberate restart keeps it,
+ * a console or debugger attach is somebody else's decision and is not a crash,
  * and anything else increments it.  Map an unknown reason to AG_RESET_OTHER -
  * being counted as a crash is the safe direction.
  *
@@ -77,6 +78,16 @@
 typedef enum {
     AG_RESET_POWERON = 0, /* cold start: no history to carry */
     AG_RESET_SOFTWARE,    /* asked for it: `reboot`, or a restart after update */
+    /*
+     * A HOST did it, not the firmware: opening the console of a chip whose
+     * console is its own USB-Serial-JTAG resets it (rst:0x15), and attaching a
+     * JTAG debugger does the same.  It is the same act as typing at a prompt -
+     * an operator looking at the board - and it says nothing about whether the
+     * board was healthy, so it is not a crash.  The port is the only layer that
+     * can tell these two apart from a watchdog: both are just "a reset" to
+     * everything above.
+     */
+    AG_RESET_ATTACH,
     AG_RESET_OTHER        /* watchdog, panic, brownout - something went wrong */
 } ag_reset_t;
 

@@ -179,6 +179,15 @@ static void interrupt_foreground(void)
 #define AG_CRASH_KEEP_BYTES (32u * 1024u)
 #define AG_CRASH_TAIL_LINES 20
 
+/*
+ * True while the record in the crash buffer came from a panic the port kept in
+ * RTC memory rather than from a process that this system killed.  The port holds
+ * such a record until it is told it has been written down, so that a machine
+ * that dies again before the supervisor gets to it does not take the evidence
+ * with it (see ag_port_fault_last_panic in argon/port/fault.h).
+ */
+static bool s_panic_waiting;
+
 static void write_crash_record(void)
 {
     char text[512];
@@ -243,6 +252,18 @@ static void write_crash_record(void)
 
     ag_log(AG_LOG_INFO, "supervisor", "crash record appended to %s",
            AG_CRASH_PATH);
+
+    /*
+     * Written down, so the port may forget it - after the close and not before,
+     * because the whole point of holding it is that it survives a death between
+     * the read and the write.  The early return above (the file could not be
+     * opened) leaves it in RTC on purpose: a record that could not be written is
+     * reported again next boot rather than dropped because the disk was busy.
+     */
+    if (s_panic_waiting) {
+        s_panic_waiting = false;
+        ag_port_fault_panic_reported();
+    }
 }
 
 static void supervisor_task(void *arg)
@@ -378,6 +399,29 @@ ag_err_t ag_supervisor_init(void)
                "faults will not be caught (%d): an application that faults takes "
                "the system with it",
                (int)err);
+    }
+
+    /*
+     * And the other half of that: a panic the port could NOT recover, kept
+     * across the reboot it caused.  Read here rather than reported where it
+     * happened, because where it happened was an exception context on a machine
+     * that is no longer running, and here there is a filesystem, a log and a
+     * console.  The port answers once; a second boot with no panic hears false.
+     *
+     * This is the case that matters on a bench nobody is watching: an
+     * intermittent fault during a long soak used to leave nothing at all behind.
+     */
+    {
+        ag_port_panic_t panic;
+        if (ag_port_fault_last_panic(&panic)) {
+            ag_proc_record_panic(&panic);
+            /*
+             * Held in RTC until write_crash_record has it on disk.  This boot
+             * may not live that long - the C3 does not - and the record is the
+             * only account of why the last one died.
+             */
+            s_panic_waiting = true;
+        }
     }
 
     if (!ag_port_task_create(supervisor_task, "ag_super", AG_SUP_STACK, NULL,

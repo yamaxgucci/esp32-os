@@ -23,7 +23,25 @@
  */
 #include <argon/argon.h>
 
-AG_APP("NODEHI", "1.0", "argon", 0);
+/*
+ * EIGHT KILOBYTES, NAMED RATHER THAN TAKEN FROM THE DEFAULT.
+ *
+ * The code here needs almost nothing - one line out, no buffers - so the size
+ * that matters is not this program's but the LOADER's: the image is read,
+ * relocated and started on this very task, and AG_PROC_LOAD_STACK_MIN (8 KB) is
+ * the kernel's own written-down floor for that work.  Eight kilobytes is
+ * therefore the smallest honest ask, not a guess.
+ *
+ * WHY IT IS WRITTEN DOWN AT ALL.  Taking the default costs a 16 KB stack
+ * (CONFIG_ARGON_APP_STACK_KB, which no board in this tree overrides), and on
+ * the C3 that is the difference between a cluster and half of one.  Measured
+ * on COM8: 34 KB free with a 27 KB largest block at rest, 18 KB free with 9 KB
+ * largest while ONE default-sized guest runs - so the second program, which on
+ * a heterogeneous cluster is always this one being substituted for a foreign
+ * build, is refused with -12 before it can print its single line.  Two 8 KB
+ * stacks fit where one 16 KB stack and a second of any size do not.
+ */
+AG_APP_SIZED("NODEHI", "1.0", "argon", 0, 8 * 1024, 0);
 
 int ag_main(int argc, char **argv)
 {

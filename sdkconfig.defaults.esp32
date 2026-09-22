@@ -49,17 +49,31 @@ CONFIG_ARGON_ENABLE_PM=y
 # CKTBENCH wants: 36 KB of code, timed from RAM rather than through the cache.
 CONFIG_ARGON_APP_ARENA_KB=8
 
-# Both radios, in one image.
+# One radio in this image: Wi-Fi.  Bluetooth is OFF, and that is a measurement
+# rather than a preference.
 #
-# They were two builds for half a day, on the strength of a link failure that
-# turned out to be the arena above rather than the radios.  Linked, they cost
-# flash and about 25 KB of static RAM; *running*, Wi-Fi costs ~37 KB and
-# Bluetooth ~54, and both at once leave 11 KB free, which is not a machine.  So
-# neither starts unless something asks: [wifi] ssid or [bt] keyboard in
-# SYSTEM.CFG, or `wifi on` / `bt on` at the prompt, and `off` gives it back.
+# The arithmetic was already in this file: linked, the two radios cost flash and
+# about 25 KB of static RAM; *running*, Wi-Fi costs ~37 KB and Bluetooth ~54,
+# and both at once leave 11 KB free, which is not a machine.  So neither starts
+# unless something asks: [wifi] ssid in SYSTEM.CFG, or `wifi on` at the prompt,
+# and `off` gives it back.
+#
+# What turned that into a decision, measured on the board 2026-09-20: `link run`
+# FROM THE NEIGHBOUR answered -12 while the very same program ran when typed
+# here, and the journal said why -
+#
+#     E proc: nodehi32.axe: no memory for a 16384 byte task stack
+#     (internal SRAM and PSRAM both failed)
+#
+# A remote run holds one more task - the 6144-byte `noderun` in nodeproc.c - and
+# the wire machinery beside it, and that was the difference between a largest
+# free block of 19 KB and one big enough for the stack this board's own programs
+# ask for.  Nothing here uses Bluetooth: the board has a touchscreen, not a
+# keyboard to pair, and no HID host to be.  Wi-Fi stays - this is the board that
+# serves files to a phone.
 CONFIG_ARGON_ENABLE_NET=y
 CONFIG_ARGON_NET_WIFI=y
-CONFIG_ARGON_ENABLE_BLE=y
+CONFIG_ARGON_ENABLE_BLE=n
 CONFIG_ETH_USE_OPENETH=n
 
 # Monitor mode and raw 802.11 injection, off by default because a board that
@@ -70,26 +84,12 @@ CONFIG_ETH_USE_OPENETH=n
 # running; the static cost is small.
 CONFIG_ARGON_NET_WIFI_MON=y
 
-CONFIG_BT_ENABLED=y
-CONFIG_BT_NIMBLE_ENABLED=y
-# BLE only, and NimBLE rather than Bluedroid: the controller's classic half is
-# handed back at start (about 30 KB), and NimBLE is roughly half of Bluedroid.
-CONFIG_BTDM_CTRL_MODE_BLE_ONLY=y
-CONFIG_BTDM_CTRL_MODE_BR_EDR_ONLY=n
-CONFIG_BTDM_CTRL_MODE_BTDM=n
-CONFIG_BT_NIMBLE_ROLE_CENTRAL=y
-CONFIG_BT_NIMBLE_ROLE_OBSERVER=y
-# Peripheral is on, and not by choice: the whole of ESP-IDF's NimBLE HID *host*
-# is behind BT_NIMBLE_HID_SERVICE, whose menu depends on the GATT *server*.
-CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
-CONFIG_BT_NIMBLE_ROLE_BROADCASTER=n
-CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
-CONFIG_BT_NIMBLE_GATT_SERVER=y
-CONFIG_BT_NIMBLE_HID_SERVICE=y
-# A keyboard is bonded once and remembered.  Without this it asks to be paired
-# again after every power cut - and pairing is done from a keyboard.
-CONFIG_BT_NIMBLE_NVS_PERSIST=y
-CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y
+# And the Bluetooth half of the menu goes with it.  Kept as a line rather than
+# deleted so that the next reader sees the choice instead of wondering where a
+# keyboard went.  BT_NIMBLE_ENABLED is deliberately NOT named here: it is a
+# choice symbol, and setting one of those from a defaults file earns a warning
+# about select/imply having no effect on it on every single build.
+CONFIG_BT_ENABLED=n
 
 # A panic reboots rather than halting.
 #

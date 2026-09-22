@@ -257,6 +257,7 @@ switch ($Command.ToLowerInvariant()) {
             Write-Host '                esp32s3-board  the S3 on the desk: no OpenEth, no HostFS'
             Write-Host '                esp32s3-cam    esp32s3-board + the camera built into the image'
             Write-Host '                esp32s3-zero   ESP32-S3-Zero: 4 MB flash, USB-JTAG console, I2S DAC, no display/SD'
+            Write-Host '                esp32s3-lcd2   Waveshare ESP32-S3-Touch-LCD-2: 16 MB flash, ST7789 panel and TF card on one SPI bus'
             Write-Host '                esp32       hardware: Wi-Fi and Bluetooth'
             Write-Host '                esp32-dsp   hardware: neither, 48 KB arena'
             Write-Host '                esp32c6     hardware: RISC-V, USB console, the C6-LCD-1.47'
@@ -283,6 +284,8 @@ switch ($Command.ToLowerInvariant()) {
             'esp32s3-cam' { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32s3;sdkconfig.esp32s3.board;sdkconfig.esp32s3.cam'
                             $chip = 'esp32s3' }
             'esp32s3-zero' { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32s3;sdkconfig.esp32s3.zero'
+                             $chip = 'esp32s3' }
+            'esp32s3-lcd2' { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32s3;sdkconfig.esp32s3.lcd2'
                              $chip = 'esp32s3' }
             'esp32c6'   { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32c6' }
             'esp32c3'   { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32c3' }

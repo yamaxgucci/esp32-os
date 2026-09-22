@@ -1,0 +1,99 @@
+# What goes into C:\drv on this board, staged by tools\mksysfs.py.
+#
+# Names here are the images in build\apps; they are copied in lower case,
+# because that is what `drv install` writes and littlefs does not fold case.
+#
+# ST7789LCD2.SYS, and not ST7789.SYS or ST7789S3.SYS.  All three are the same
+# source (apps/st7789/st7789.c) with a different block of constants compiled in,
+# and the constants are the pins and the panel geometry:
+#
+#   ST7789.SYS     RISC-V, the C6-LCD-1.47:  CS 14  DC 15  RST 21  BL 22
+#   ST7789S3.SYS   xtensa, the S3-WROOM-CAM's soldered panel:
+#                                            CS 10  DC 13  RST  3  BL 46
+#   ST7789LCD2.SYS xtensa, THIS board:       CS 45  DC 42  RST none  BL  1
+#
+# Loading the wrong one is not a refusal: it configures the wrong pins and
+# draws into nothing, while driving GPIO 10 or 21 - which on this board is a
+# camera data line or the SDA of the I2C bus.  That is the same class of mistake
+# as loading NODELN32 on an S3, and it is why the name has the board in it.
+ST7789LCD2.SYS
+#
+# The wire.  NODELINK.SYS is the S3's own build; built for the wrong processor
+# it loads and throws an illegal instruction inside rather than refusing.
+NODELINK.SYS
+#
+# LINKSPI.SYS - the link over a four-wire SPI cable rather than a UART: the same
+# driver the Zero carries, one image for both ends because both are S3s, with
+# [linkspi] role deciding who holds the clock.
+#
+# ON THIS BOARD IT NEEDS `bus = 3` UNDER [linkspi].  The soldered link pads
+# 10..13 are SPI3 here, not SPI2, for the reason BOARD.CFG's "SPI3 - THE FAST
+# LINK" gives: SPI2 is the panel and the card (39/38/40) and a bus is master or
+# slave for as long as it is up.  The driver's default is bus 2, which on this
+# board is those panel pins - so a [linkspi] section that leaves the key out
+# drives the panel's clock and data instead of the cable.  The cs 10 default
+# belongs to the other wiring BOARD.CFG describes at the end of that block (the
+# role-swap fallback, the link as a third chip select on SPI2), not to the plan.
+#
+# Loaded by hand - `drv load c:\drv\linkspi.sys` - and not from SYSTEM.CFG's
+# [modules], so that a board with no cable yet keeps a clean boot log.
+LINKSPI.SYS
+#
+# The touch driver, the second in this tree after the CYD's XPT2046.  A device
+# class driver rather than an application: it publishes touch0 as an AG_DEV_INPUT
+# device and the kernel asks it from its own console tick, so a .SYS here owns no
+# task.  No board in the name, unlike the panel's image, because the chip and its
+# address are the same wherever this is built: what differs between boards -
+# geometry, the turn, the two pins - are BOARD.CFG keys, not constants compiled
+# in.  See the note at the bottom for what this unit does with it.
+CST816.SYS
+
+# ---------------------------------------------------------------------------
+# WHAT IS NOT HERE, AND WHY.
+#
+# THE TOUCH CONTROLLER IS NOT SHORT OF A DRIVER ANY MORE.  CST816.SYS above is
+# apps/cst816/cst816.c, built through tools/apps.json; the driver publishes
+# touch0 as an AG_DEV_INPUT device and the kernel polls it, which is the shape
+# the CYD's XPT2046 has.  The two bus pins are the kernel's and cannot be the
+# driver's - [i2c0] in BOARD.CFG is where 48 and 47 live, and a driver can only
+# name the bus number - and the frame is [touch] in the same file: 240x320 in the
+# controller's own portrait axes, turned by `rotation` (1 or 3 for the two
+# landscapes) into the 320x240 span [display] asks for.  See that block for why
+# this pack carries 3, and why the turn is not the whole answer.
+#
+# A SILENT CHIP IS A REFUSAL, NOT A QUIET NO-OP.  The driver probes its own
+# address before publishing anything; with nothing at 0x15 it prints "nothing
+# answered at 0x15 - the controller is silent" and returns the error, so no
+# touch0 is created and `dev` lists none.  That is deliberate: a touch device
+# that answers nothing is one the cluster would offer to its neighbours and
+# could not serve, and a touch0 published anyway would report the same fault one
+# layer further from its cause.
+#
+# AND ON THIS UNIT THE CHIP DOES NOT ANSWER AT ALL.  Measured: a scan of I2C
+# port 0 (SDA 48, SCL 47) over 0x08..0x77 found exactly one device, 0x6B - the
+# QMI8658 IMU.  Nothing at 0x15.  So the pins and the bus are right and the
+# touch controller is silent: asleep, unpowered, or not fitted, which is
+# unresolved and is a hardware question.  Nothing in ArgonOS is implicated, and
+# the driver's own refusal line is what "touch is silent" looks like in a boot
+# log on this board - there is no on-board touch test to run until the chip
+# answers.  Written down here so that silence is never read as an ArgonOS
+# failure: the driver exists, is installed, and is the thing reporting it.
+#
+# NO IMU DRIVER, for the same reason: a QMI8658 at 0x6B on the same bus, and the
+# one chip on this board that does answer a scan.
+#
+# THE CARD SHARES THE PANEL'S BUS, which is why the panel's chip select is now
+# driven high before the card is touched.  GPIO 45 is that chip select AND a
+# strapping pin: it comes out of reset floating low, and a selected ST7789 then
+# drives the card's MISO line.  Measured on this board with the vendor's own card
+# example, A/B/A - driving the pin HIGH before the card was touched mounted the
+# card (SDHC, FAT32), leaving it as it came out of reset failed with
+# sdmmc_init_ocr: send_cond returned 0x109 / ESP_ERR_INVALID_CRC, and HIGH again
+# succeeded.  The pack's answer is one key, [sd] cs_hold = 45, which the kernel
+# parses in board.c and the port applies before the SPI bus comes up
+# (storage.c), so the boot mount of A: no longer waits on a driver to load first;
+# BOARD.CFG under [sd] has the whole measurement.  WRITTEN BUT NOT YET MEASURED
+# ON HARDWARE: the board has not been flashed since the key landed, so the claim
+# above is the vendor measurement plus the kernel's own reading of that pin, and
+# the boot log of the first flash that mounts A: is what settles it.
+# ---------------------------------------------------------------------------

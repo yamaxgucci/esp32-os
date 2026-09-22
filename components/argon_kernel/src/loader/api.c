@@ -15,7 +15,9 @@
 #include <sys/time.h>
 #include <time.h>
 
+#include <argon/cfg.h>
 #include <argon/journal.h>
+#include "core/sysconfig.h"
 
 #include <argon/codepage.h>
 #include <argon/console.h>
@@ -47,7 +49,9 @@
 #include <argon/port/task.h>
 #include <argon/port/wifi.h>
 #include <argon/port/camera.h>
+#include <argon/port/usbd.h>
 
+#include "console/uart_console.h"
 #include "dev/io.h"
 #include "net/espnow.h"
 #include "net/wifimon.h"
@@ -1594,6 +1598,114 @@ static const ag_cam_api_t k_cam = {
 };
 #endif
 
+#if AG_PORT_HAS_USBD
+/*
+ * The card reader, ABI 0.55.  The application owns everything - which device to
+ * lend, read-only versus writable, the stop condition, what to print - and the
+ * port owns only the drivers and the PHY.  This wrapper owns the one thing that
+ * is neither's: the console ENDPOINT.  It is detached before the port takes the
+ * PHY, so the console task stops writing to a peripheral that is about to vanish,
+ * and re-attached after the port restores it.  The detach/attach pair is why the
+ * stop condition must never be a typed command: while TinyUSB owns the PHY the
+ * console is unreachable, so the application ends the session on a host eject or
+ * a timeout.
+ */
+static ag_err_t api_usbd_start(const ag_usbd_msc_cbs_t *cbs)
+{
+    if (cbs == NULL) {
+        return -AG_EINVAL;
+    }
+    ag_uart_console_detach(AG_PORT_UART_CONSOLE);
+    const ag_err_t err = ag_port_usbd_start(cbs);
+    if (err != AG_OK) {
+        (void)ag_uart_console_attach(AG_PORT_UART_CONSOLE, 115200);
+    }
+    return err;
+}
+
+static ag_err_t api_usbd_stop(void)
+{
+    const ag_err_t err = ag_port_usbd_stop();
+    /* Re-attach the console even if the port teardown half-failed: a console
+     * that does not come back is the one failure the operator cannot recover
+     * from without a power cycle. */
+    (void)ag_uart_console_attach(AG_PORT_UART_CONSOLE, 115200);
+    return err;
+}
+
+static ag_err_t api_usbd_status(ag_usbd_status_t *out)
+{
+    return ag_port_usbd_status(out);
+}
+
+static const ag_usbd_api_t k_usbd = {
+    .size = sizeof(ag_usbd_api_t),
+    .start = api_usbd_start,
+    .stop = api_usbd_stop,
+    .status = api_usbd_status,
+};
+#endif /* AG_PORT_HAS_USBD */
+
+/*
+ * Configuration, for a .SYS or an .AXE that needs to know what the board was
+ * told.  The subtable was NULL until now, and that had a cost nobody could see
+ * from a config file: a driver asking the ABI which UART its wire was on got the
+ * compiled-in default instead, so `[link2] uart = 0` was read as "this wire was
+ * never asked for" and the middle of a cluster could not have a second wire
+ * however its SYSTEM.CFG was written - silently, with nothing in the journal.
+ * See wire_up() in apps/nodelink.
+ *
+ * Read-only for now.  Nothing here writes the file back, so set_str and commit
+ * say so rather than pretending; a board's configuration is edited on a PC and
+ * flashed into C:, which the tools already do.
+ *
+ * Filling in a subtable that was NULL is not an ABI change: every caller
+ * already guards with AG_HAS(api->cfg, get_int).
+ */
+static ag_err_t api_cfg_get_str(const char *key, char *buf, size_t len)
+{
+    if (key == NULL || buf == NULL || len == 0u) {
+        return -AG_EINVAL;
+    }
+    const char *v = ag_cfg_get(ag_sysconfig(), key, NULL);
+    if (v == NULL) {
+        return -AG_ENOENT;
+    }
+    const size_t n = strlen(v);
+    const size_t copy = (n < len - 1u) ? n : len - 1u;
+    memcpy(buf, v, copy);
+    buf[copy] = '\0';
+    return AG_OK;
+}
+
+static int32_t api_cfg_get_int(const char *key, int32_t def)
+{
+    return ag_cfg_get_int(ag_sysconfig(), key, def);
+}
+
+static bool api_cfg_get_bool(const char *key, bool def)
+{
+    return ag_cfg_get_bool(ag_sysconfig(), key, def);
+}
+
+static ag_err_t api_cfg_set_str(const char *key, const char *value)
+{
+    (void)key;
+    (void)value;
+    return -AG_ENOTSUP;
+}
+
+static ag_err_t api_cfg_commit(void) { return -AG_ENOTSUP; }
+
+static const ag_cfg_api_t k_cfg = {
+    .size = sizeof(ag_cfg_api_t),
+    .get_str = api_cfg_get_str,
+    .get_int = api_cfg_get_int,
+    .get_bool = api_cfg_get_bool,
+    .set_str = api_cfg_set_str,
+    .commit = api_cfg_commit,
+};
+
 static const ag_api_t k_api = {
     .size = sizeof(ag_api_t),
     .abi_major = AG_ABI_MAJOR,
@@ -1609,7 +1721,7 @@ static const ag_api_t k_api = {
     .time = &k_time,
     .task = &ag_task_api_table,
     .proc = &k_proc,
-    .cfg = NULL,
+    .cfg = &k_cfg,
 #if defined(CONFIG_ARGON_ENABLE_NET) && CONFIG_ARGON_ENABLE_NET
     .net = &ag_net_api_impl,
 #else
@@ -1643,6 +1755,11 @@ static const ag_api_t k_api = {
      * this runs on one board and on four without being rebuilt.
      */
     .clu = &ag_clu_api_table,
+#if AG_PORT_HAS_USBD
+    .usbd = &k_usbd,
+#else
+    .usbd = NULL,
+#endif
 };
 
 const ag_api_t *ag_loader_api(void) { return &k_api; }

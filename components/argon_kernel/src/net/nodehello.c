@@ -50,7 +50,60 @@ static bool s_listening;
  */
 #define NH_CAPS 5u
 
-static ag_err_t send_hello(uint8_t op)
+/*
+ * A hello, and WHO IT IS FOR.
+ *
+ * A QUESTION IS ASKED OF THE COPPER and therefore carries `dst` zero - "for
+ * whoever is reading".  That is not the same thing as "where the board is
+ * pointed": a question is "who are you" about the board at the other end of
+ * THIS wire, and one addressed to the target asked a node two hops away
+ * instead.  An ANSWER goes to the node that asked, which is what `from` is, and
+ * which is NOT the target as soon as a board two hops away can be named.
+ *
+ * WHY THE QUESTION'S ADDRESS IS NOT A STYLE CHOICE.  `dst` zero is the one
+ * address the relay never forwards (linkprov's route(): a frame for anybody but
+ * this board goes back out), so a frame that arrives with `dst` zero is CERTAIN
+ * to have been written by the board on the far end of the wire that carried it.
+ * A name is remembered against the wire it arrived on - the slot `link use c3`,
+ * `link nodes`, `link devs`, the `ps` label and linkprov's wire_towards() all
+ * read - and that slot means "the neighbour of this wire" and nothing else.
+ * Addressed to the target, a question was relayed instead, the far node
+ * answered "I am zero" to a leaf whose neighbour is c3, and the leaf filed the
+ * ANSWER against its wire: the label became `zero.1` and `link use c3` answered
+ * -19 because no wire had a neighbour by that name any more.  On a middle board
+ * it is worse than a wrong label - wire_towards() routes by those names.
+ *
+ * Asking the wire is what makes both branches of on_msg() safe, and this is the
+ * rule they rely on: a question is always addressed to "whoever is reading", so
+ * it is never relayed and its sender is this wire's neighbour; an answer is
+ * addressed to the asker, so the only question it can be the answer to is the
+ * one this board asked, on this wire, of its own neighbour.
+ *
+ * THIS IS THE WHOLE OF THE FIX FOR A MIDDLE BOARD THAT FORGETS ITS NEIGHBOURS.
+ * A wire is chosen by NAME - linkprov's wire_towards() compares a frame's
+ * destination with the name a hello taught it - and names are in RAM, so a
+ * middle that restarts starts with none.  It asks both wires who they are, and
+ * with the answer addressed to the TARGET the exchange failed in exactly the
+ * case that matters:
+ *
+ *   - the CYD (target = zero, `link use zero`) receives the question, learns
+ *     "c3", and answers with the destination ZERO - the wire's own neighbour is
+ *     skipped, the frame is addressed past the middle board;
+ *   - the middle, holding no names yet, cannot choose a wire for it and drops
+ *     it: `relay: a frame for e763 was dropped (no bound wire has a neighbour
+ *     by that name yet)`, measured on the bench, e763 being ag_node_hash
+ *     ("zero");
+ *   - so the middle never learns either neighbour, every relayed frame is
+ *     dropped for good, and `ps` across two hops answers -60 for ever while
+ *     single-hop work still looks perfect.  THAT ASYMMETRY IS THE SYMPTOM.
+ *
+ * Addressed to the asker, the same exchange refills the table in one round trip
+ * and a relay is routable again before anyone asks it anything.
+ *
+ * The same rule is stated next door in nodeps.c, which takes ag_linkprov_from()
+ * once and copies it into every frame of its answer for this reason.
+ */
+static ag_err_t send_hello_to(uint16_t dst, uint8_t op)
 {
     uint8_t     buf[NH_HDR + AG_NODE_NAME_MAX + NH_CAPS];
     const char *me = ag_node_name();
@@ -75,8 +128,14 @@ static ag_err_t send_hello(uint8_t op)
     /* Short and bounded: a hello that cannot go out now is one the next bind
      * or the next `node` will send again. */
     for (int t = 0; t < 100; t++) {
-        const int32_t r = ag_linkprov_send(NH_CHAN, AG_LINK_CONTROL, buf,
-                                           (uint16_t)(NH_HDR + n));
+        /*
+         * send_to, NOT send: `send` stamps the target `link use` last named,
+         * and a question must reach the board on this wire and no other.  With
+         * `dst` zero this picks the same wire `send` would have; it only stops
+         * the far node from being asked, and answered, in the wire's place.
+         */
+        const int32_t r = ag_linkprov_send_to(dst, NH_CHAN, AG_LINK_CONTROL,
+                                              buf, (uint16_t)(NH_HDR + n));
         if (r >= 0) {
             return AG_OK;
         }
@@ -137,6 +196,22 @@ static void on_msg(uint8_t chan, const void *data, uint16_t n, void *ctx)
     }
 
     if (b[0] == NH_ASK) {
+        /*
+         * WHO ASKED, taken before anything is sent: the answer is addressed to
+         * this node, and `from` is only meaningful while the handler runs.
+         * Zero - a question that named nobody, which an old image sends - keeps
+         * the old meaning and goes out for whoever is reading.
+         */
+        const uint16_t from = ag_linkprov_from();
+        /*
+         * The sender of a QUESTION is this wire's neighbour, always: a question
+         * is addressed to "whoever is reading" and the relay never forwards
+         * such a frame (see send_hello_to).  The ANSWER below is recorded on
+         * the same footing - it is addressed to the asker, so the only question
+         * it can be answering is the one this board asked on this wire.  That
+         * is what makes this slot mean "the board at the end of this copper"
+         * rather than "whoever spoke last".
+         */
         ag_node_set_peer_name(name);
         /*
          * Said out loud when it fails.  This was `(void)` - an answer that
@@ -144,7 +219,7 @@ static void on_msg(uint8_t chan, const void *data, uint16_t n, void *ctx)
          * the only visible consequence was a node stuck calling its
          * neighbour "node0", three layers away from here.
          */
-        const ag_err_t e = send_hello(NH_TELL);
+        const ag_err_t e = send_hello_to(from, NH_TELL);
         if (e != AG_OK) {
             ag_log(AG_LOG_WARN, "hello",
                    "could not answer %s's hello (%d); it will go on calling "
@@ -172,6 +247,12 @@ ag_err_t ag_nodehello_start(void)
      * Asked, not waited for.  The other node may not be up yet, and a bind that
      * blocks until a neighbour answers is a bind that fails on the board that
      * happens to boot first - which is half of them.
+     *
+     * Zero is "whoever is on this wire", and that is the whole of what a
+     * question asks: `ag_node_autobind` binds one wire at a time and asks on
+     * each, so the middle of a cluster asks BOTH of its neighbours who they
+     * are.  It is the answer that has to be addressed to the asker - see
+     * send_hello_to.
      */
-    return send_hello(NH_ASK);
+    return send_hello_to(0u, NH_ASK);
 }

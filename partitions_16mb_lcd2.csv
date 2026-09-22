@@ -1,0 +1,39 @@
+# ArgonOS - 16 MB flash, arranged for the Waveshare ESP32-S3-Touch-LCD-2.
+#
+# Selected by sdkconfig.esp32s3.lcd2, which is `argon target esp32s3-lcd2`;
+# see that file for why this board is built at 16 MB rather than at the primary
+# target's 8.
+#
+# The shape is partitions.csv's (the 8 MB baseline), scaled to the part:
+#
+#   factory  3 MB   the same app slot the 8 MB table gives.  The firmware is
+#                   1.35 MB today (measured: build\argonos.bin, 1 412 880 bytes,
+#                   built for the S3-Zero at 4 MB); 3 MB is room for radios, a
+#                   camera and the 192 KB arena without touching this file.
+#   sysfs    2 MB   C:, littlefs - BOARD.CFG, SYSTEM.CFG, C:\drv and the
+#                   programs from the pack's apps.txt.  Twice the 8 MB table's
+#                   1 MB, because this board is a leaf that carries three
+#                   instruction sets' worth of programs (its own LX7 builds,
+#                   the CYD's LX6, the C3's RISC-V) and because a cartridge is
+#                   up to a megabyte.
+#   appfs   10.9 MB the loader's raw slot area for flash XIP, subtype 0x40 -
+#                   not a filesystem: the loader erases, programs and mmap()s
+#                   slots itself (components/argon_kernel/src/loader/appfs.c).
+#                   It is the remainder, deliberately: unused flash in this
+#                   partition costs nothing, and the alternative - a second app
+#                   slot for OTA - is a shape this board does not need yet.
+#                   partitions_ota.csv is the model for the day it does, and the
+#                   note there about QEMU not booting a two-slot layout applies.
+#
+# The three lines every table here keeps at the same offsets: nvs at 0x9000,
+# phy_init at 0xf000, the app at 0x10000, so a flashing tool written for one
+# board cannot land the app somewhere else on another.
+#
+# Changing this table is a FULL ERASE - C: goes with it.
+#
+# Name,     Type, SubType,  Offset,   Size,     Flags
+nvs,        data, nvs,      0x9000,   0x6000,
+phy_init,   data, phy,      0xf000,   0x1000,
+factory,    app,  factory,  0x10000,  0x300000,
+sysfs,      data, littlefs, 0x310000, 0x200000,
+appfs,      data, 0x40,     0x510000, 0xAF0000,

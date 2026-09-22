@@ -81,6 +81,15 @@ typedef struct {
     /* SPI pins, and the host as the schematic numbers it. */
     int16_t sck, mosi, miso, cs;
     uint8_t spi_host;
+    /*
+     * A pin that is not the card's own chip select but must be driven HIGH
+     * before the bus comes up and before the first card command, or the card
+     * cannot be read: the panel's CS on a board whose display and slot share
+     * one SPI bus.  Negative means the feature is off - the port does not touch
+     * a pin it was not told about.  See ag_board_sd_t.cs_hold for the board
+     * this exists for and the A/B that found it.
+     */
+    int16_t cs_hold;
 } ag_port_sd_cfg_t;
 
 typedef void *ag_port_sd_t;

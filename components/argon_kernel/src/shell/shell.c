@@ -627,10 +627,44 @@ static int cmd_boot(int argc, char **argv)
         return 0;
     }
 
-    static const char *const k_stage_names[AG_STAGE_COUNT] = {
-        "platform", "memory", "log",     "board",  "console",    "storage",
-        "config",   "devices", "media",  "modules", "supervisor", "shell",
+    /*
+     * EVERY stage, named by the enum it belongs to, and both halves of that are
+     * the fix for a fault that made this command unrunable.
+     *
+     * It was a plain list of twelve strings for a thirteen-value AG_STAGE_COUNT,
+     * and an array with fewer initialisers than its size is not an error in C:
+     * the rest is zero.  So `power` was missing, every stage from there down
+     * printed its neighbour's name, and the last one - AG_STAGE_SHELL, the
+     * thirteenth - was a NULL handed to `printf("  %-11s ok ...")`.  In this
+     * newlib that goes straight to `strlen(NULL)`: a Load access fault, from the
+     * one command whose whole job is to say what happened at boot.  It took the
+     * board down every time anybody asked it why the board had gone down.
+     *
+     * Designated initialisers with the kernel's own AG_STAGE_* names are what
+     * make the order right by construction, and the assertion is what makes a
+     * stage added to kernel.h a build error here rather than a NULL at run time
+     * - which is the part that would otherwise happen again, because nothing in
+     * this file tells you how many stages there are.
+     */
+    static const char *const k_stage_names[] = {
+        [AG_STAGE_PLATFORM]   = "platform",
+        [AG_STAGE_MEMORY]     = "memory",
+        [AG_STAGE_LOG]        = "log",
+        [AG_STAGE_BOARD]      = "board",
+        [AG_STAGE_CONSOLE]    = "console",
+        [AG_STAGE_STORAGE]    = "storage",
+        [AG_STAGE_CONFIG]     = "config",
+        [AG_STAGE_POWER]      = "power",
+        [AG_STAGE_DEVICES]    = "devices",
+        [AG_STAGE_MEDIA]      = "media",
+        [AG_STAGE_MODULES]    = "modules",
+        [AG_STAGE_SUPERVISOR] = "supervisor",
+        [AG_STAGE_SHELL]      = "shell",
     };
+
+    _Static_assert(sizeof(k_stage_names) / sizeof(k_stage_names[0]) ==
+                       AG_STAGE_COUNT,
+                   "every AG_STAGE_* needs a name in k_stage_names");
 
     const ag_boot_report_t *r = ag_boot_report();
 

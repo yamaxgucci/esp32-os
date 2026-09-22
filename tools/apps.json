@@ -28,6 +28,10 @@
     { "out": "GRIND.AXE", "group": "core", "src": ["apps/grind/grind.c"] },
     { "out": "MIGRANT.AXE", "group": "core", "src": ["apps/migrant/migrant.c"] },
     { "out": "DISK.AXE", "group": "core", "src": ["apps/disk/disk.c"] },
+    {
+      "out": "USBMSC.AXE", "group": "core",
+      "_note": "The board as a USB card reader, stage 1 read-only.  Started by an operator command, takes the board's one USB port away from the console for the session, and ends on a host eject/unplug or a timeout - never a typed command, because there is no console while it runs.  Needs CONFIG_ARGON_USB_MSC in the firmware.",
+      "src": ["apps/usbmsc/usbmsc.c"] },
     { "out": "DEVS.AXE", "group": "core", "src": ["apps/devs/devs.c"] },
     { "out": "DEVPOKE.AXE", "group": "core", "src": ["apps/devpoke/devpoke.c"] },
     {
@@ -41,6 +45,11 @@
     { "out": "LEAK.AXE", "group": "core", "src": ["apps/leak/leak.c"] },
     { "out": "THREADS.AXE", "group": "core", "src": ["apps/threads/threads.c"] },
     { "out": "CRASH.AXE", "group": "core", "src": ["apps/crash/crash.c"] },
+    {
+      "out": "CRASHRV.AXE", "group": "board",
+      "_note": "CRASH for RISC-V, and it has to name its compiler rather than rely on the target.  TOOLCHAIN_FOR_TARGET has no esp32c3 entry, so on a C3 build an entry that names neither arch nor gcc is built for the manifest's default - xtensa-esp32s3 - and the board answers `built for a different processor (-45)` when it is asked to run it.  That is the right default for the images the C3 carries FOR THE ZERO (NODEHI/GRIND/MIGRANT are LX7 builds and must stay so); it is the wrong one for a program the C3 runs ITSELF.  A deliberate panic on the C3 is what proves that a fault the kernel cannot recover still leaves a record across the reboot, so this image exists.",
+      "arch": "riscv32", "gcc": "riscv32-esp-elf-gcc",
+      "src": ["apps/crash/crash.c"] },
     { "out": "EDIT.AXE", "group": "core", "src": ["apps/edit/edit.c"] },
     { "out": "GFXDEMO.AXE", "group": "core", "src": ["apps/gfxdemo/gfxdemo.c"] },
     {
@@ -137,6 +146,11 @@
     { "out": "NODELINK.SYS", "group": "core",
       "include": ["apps/common", "apps/common/nlink"],
       "src": ["apps/nodelink/nodelink.c", "apps/common/nlink/ag_nlink.c"] },
+    {
+      "out": "LINKSPI.SYS", "group": "core",
+      "_note": "The same wire driver over a four-wire SPI cable instead of a UART: nodelink's frame assembler, classes and windows, with a byte ring feeding fixed full-duplex blocks through io->spi_xfer (or spi_slave_xfer). Both bench boards are ESP32-S3, so one Xtensa image serves either end and the role - master or slave, who holds the clock - is a SYSTEM.CFG line rather than a second build. Loaded by hand for the SPI test (`drv load c:\\drv\\linkspi.sys`), which is why nothing auto-loads it.",
+      "include": ["apps/common", "apps/common/nlink"],
+      "src": ["apps/linkspi/linkspi.c", "apps/common/nlink/ag_nlink.c"] },
     {
       "out": "NODELN32.SYS", "group": "board",
       "_note": "The same wire driver for an LX6 - the CYD is an ESP32, the S3 an ESP32-S3, and a .AXE or .SYS built for one throws an illegal instruction on the other rather than refusing to load. Two boards joined by this wire therefore need two images of it, and the only difference is the compiler. Needed to test the cluster on real hardware at all.",
@@ -294,7 +308,16 @@
       "include": ["apps/common"],
       "src": ["apps/st7789/st7789.c"]
     },
+    {
+      "out": "ST7789LCD2.SYS", "group": "board",
+      "_note": "The same controller again, for the 2 inch panel built into the Waveshare ESP32-S3-Touch-LCD-2: -DST7789_BOARD_LCD2 selects that board's constants (chip select 45, data/command 42, backlight 1, NO reset pin, landscape 320x240, no offset).  A third image rather than a pin someone edits by hand, because the constants are the wiring: ST7789S3.SYS loaded on this board would drive GPIO 10 and 13, which here are camera data lines, and would take GPIO 3 - a strapping pin on this chip - for a reset line the panel does not have.  This image loaded on the S3-CAM board would spend 45 on nothing and drive 42, which there is that board's wire to the CYD.",
+      "arch": "xtensa", "gcc": "xtensa-esp32s3-elf-gcc",
+      "cflags": "-Os -ffunction-sections -fdata-sections -DST7789_BOARD_LCD2",
+      "include": ["apps/common"],
+      "src": ["apps/st7789/st7789.c"]
+    },
     { "out": "XPT2046.SYS", "group": "board", "src": ["apps/xpt2046/xpt2046.c"] },
+    { "out": "CST816.SYS", "group": "board", "src": ["apps/cst816/cst816.c"] },
 
     {
       "out": "AGVM.AXE", "group": "core",

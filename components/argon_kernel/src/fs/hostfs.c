@@ -20,6 +20,8 @@
 #include <argon/port/time.h>
 #include <argon/port/uart.h>
 
+#include "dev/io.h"
+
 #define HSFS_UART           1
 #define HSFS_UART_BAUD      115200
 #define HSFS_RX_BUF         (64 * 1024)
@@ -168,6 +170,26 @@ static bool uart_open(void)
 {
     if (s_uart_up) {
         return true;
+    }
+    /*
+     * NOT A PORT WE MAY TAKE IF SOMEBODY ELSE HAS IT UP.
+     *
+     * On the boards on the desk UART1 is the cluster wire, and nodelink brings
+     * it up through io.  Probing it here would put HSFS PINGs on that wire every
+     * fifty milliseconds - and, worse, the "give the port back" below would
+     * close a driver nodelink's reader task is still reading: it then reads a
+     * port that is no longer installed, which IDF reports as "uart driver
+     * error", once per call.  Measured on the Zero: 74 909 lines during one
+     * 19 KB transfer, and the transfer lost.
+     *
+     * QEMU stages no BOARD.CFG and nothing claims UART1 there, so the probe
+     * still runs for the one case it was written for.
+     */
+    if (ag_io_uart_claimed(HSFS_UART)) {
+        ag_log(AG_LOG_INFO, "hostfs",
+               "UART%d is in use (a wire?); not looking for a host helper on it",
+               HSFS_UART);
+        return false;
     }
     const ag_port_uart_cfg_t cfg = {
         .baud = HSFS_UART_BAUD,
@@ -852,7 +874,18 @@ static void hostfs_wait_task(void *arg)
          * still using the port, and the console can never be closed at all.
          */
         ag_log(AG_LOG_INFO, "hostfs", "no host helper on UART1 (skip H:)");
-        if (s_uart_up) {
+        if (s_uart_up && ag_io_uart_claimed(HSFS_UART)) {
+            /*
+             * Somebody took the port while we were asking - the node link does,
+             * a second or so before this task gives up.  Closing it now deletes
+             * the driver under their reader task, which is the failure this
+             * whole comment is about; leaving it open is the lesser harm and is
+             * said out loud, because a port left open by accident and one given
+             * away twice look identical from the outside.
+             */
+            ag_log(AG_LOG_INFO, "hostfs",
+                   "UART%d was taken while probing; leaving it open", HSFS_UART);
+        } else if (s_uart_up) {
             (void)ag_port_uart_close(HSFS_UART);
             s_uart_up = false;
         }

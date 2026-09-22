@@ -55,6 +55,25 @@ typedef struct {
     int16_t cs;
     uint8_t spi_host;
 
+    /*
+     * A pin that is NOT the card's own chip select but has to be held high for
+     * the card to be readable at all: the panel's CS on a board where the
+     * display and the slot share one SPI bus.  GPIO 45 on the Waveshare
+     * ESP32-S3-Touch-LCD-2 is that pin - a strapping pin, so it floats low out
+     * of reset, and a selected ST7789 drives its SDO onto the card's MISO line.
+     * Measured there: driving it high before the card is touched mounts
+     * (SDHC, 7690 MB, FAT32); leaving it floating fails with 0x109 /
+     * ESP_ERR_INVALID_CRC.
+     *
+     * The card is mounted at the MEDIA stage and loadable .SYS drivers load
+     * AFTER it (MODULES), so at mount time no driver owns the panel's select
+     * and nothing has written it.  The port drives this pin high before the SPI
+     * bus comes up, which is why it lives here rather than with the display.
+     * AG_PIN_NONE (the default) means the feature is off and the port does
+     * nothing - every board without this arrangement is unaffected.
+     */
+    int16_t cs_hold;
+
     /* Card detect, when the board has one.  Without it, removal is noticed
      * only when a transfer fails. */
     int16_t card_detect;
@@ -109,6 +128,15 @@ typedef struct {
     int16_t  mosi;
     int16_t  miso;
     uint32_t khz;
+    /*
+     * Pad drive strength, 0..3 = GPIO_DRIVE_CAP_n, -1 = leave the chip's
+     * default.  A board setting rather than a driver's, because the answer is a
+     * property of the wiring and not of what is being said over it: the same
+     * three pins that carry a link cleanly at the weakest setting look like a
+     * broken wire at the default one, and nothing in the failure says which.
+     * See docs/plans/cluster.md, pad drive.
+     */
+    int8_t   drive;
 } ag_board_spi_t;
 
 typedef struct {

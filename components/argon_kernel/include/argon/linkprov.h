@@ -103,6 +103,47 @@ ag_err_t ag_linkprov_drop(const char *name);
 int32_t ag_linkprov_send_on(int32_t wire, uint8_t chan, uint8_t cls,
                             const void *buf, size_t len);
 
+/* ------------------------------------------------------------------------ */
+/* Beyond the neighbour: the same frame, addressed                            */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * `dst` is ag_node_hash() of the node this frame is for; 0 means "whoever is
+ * reading it", which is what every frame meant before a leaf had a neighbour
+ * it could not reach directly.  A frame whose dst is neither 0 nor the
+ * reader's own hash is RELAYED by the board in between (see nodelink.c), so
+ * addressing a far leaf is the whole of what a sender does: name it, and let
+ * the wire under it choose the first hop.
+ *
+ * The first hop is the wire this call would use anyway - the selected one, or
+ * the one it is being made from - so a leaf that named the far node before
+ * switching wires would address it out of the wrong one.  `link use` therefore
+ * sets both.
+ */
+int32_t ag_linkprov_send_to(uint16_t dst, uint8_t chan, uint8_t cls,
+                            const void *buf, size_t len);
+int32_t ag_linkprov_send_to_on(int32_t wire, uint16_t dst, uint8_t chan,
+                               uint8_t cls, const void *buf, size_t len);
+
+/*
+ * The node that sent the frame being handled, or 0.  Valid while a receive
+ * callback runs, and it is what an ANSWER must be addressed to: a reply that
+ * says "for whoever is on the wire" is taken by the board in between instead
+ * of being passed home, and the far end then waits for an answer that arrived
+ * somewhere else.
+ */
+uint16_t ag_linkprov_from(void);
+
+/* This board's own name hash, so a service can tell "for me" from "for the one
+ * beyond" without hashing its own name on every frame. */
+uint16_t ag_linkprov_here(void);
+
+/* The node that NEW conversations are addressed to, as `link use` last set it;
+ * 0 until something beyond the neighbour is named.  ag_linkprov_send() stamps
+ * exactly this, which is why no service above had to learn about addressing. */
+uint16_t ag_linkprov_target(void);
+void     ag_linkprov_set_target(uint16_t hash);
+
 /* Let every wire move, not only the current one: for a caller that is waiting
  * on answers from several neighbours at once. */
 void ag_linkprov_poll_all(uint32_t ms);

@@ -126,6 +126,17 @@ const char *ag_node_peer_name_at(int32_t wire)
     if (wire < 0 || (uint32_t)wire >= AG_LINK_WIRES) {
         return NULL;
     }
+    /*
+     * A wire with nothing bound has no peer, whatever it was told before it was
+     * let go.  Said here rather than cleared at the drop because the name is
+     * this module's to hold and the wire table is the link's: a name that
+     * outlived its wire would be a name a frame could still be ROUTED by, and
+     * the link asks this question exactly when deciding which wire leads to a
+     * distant node.
+     */
+    if (ag_linkprov_name_at(wire) == NULL) {
+        return NULL;
+    }
     return (s_peer[wire][0] != '\0') ? s_peer[wire] : NULL;
 }
 
@@ -197,4 +208,39 @@ uint8_t  ag_node_peer_cores(void)
 uint32_t ag_node_peer_cpu_hz(void)
 {
     return s_peer_cpu_hz_at[peer_slot()];
+}
+
+/*
+ * A name as the sixteen bits a frame has room for.
+ *
+ * FNV-1a, the 32-bit constants, reduced to the low half.  The reduction is
+ * written out rather than left implicit because it is the one thing two
+ * independent implementations would disagree about, and they must not: a
+ * destination that meant one board to the sender and another to the relay
+ * would deliver a message to the wrong half of the cluster with nothing
+ * anywhere reporting an error.  This function is the only implementation, and
+ * everything - the sender, the middle board deciding whether to relay, the
+ * board deciding whether a frame is for it - asks it.
+ *
+ * The multiply is 32-bit rather than 16 because the 32-bit constants are the
+ * published ones and a truncated variant would be a second, private algorithm
+ * that only this tree speaks.  It is computed over at most eight bytes, so the
+ * cost is nothing next to the frame it decides about.
+ *
+ * Zero is "no node" and is NOT remapped: a name whose hash is exactly zero
+ * would be indistinguishable from "whoever is reading this", which the header
+ * notes as a curiosity rather than a risk.  Remapping it to anything else would
+ * only move the collision, not remove it.
+ */
+uint16_t ag_node_hash(const char *name)
+{
+    if (name == NULL || name[0] == '\0') {
+        return 0u;
+    }
+    uint32_t h = 2166136261u;
+    for (const unsigned char *p = (const unsigned char *)name; *p != '\0'; p++) {
+        h ^= (uint32_t)*p;
+        h *= 16777619u;
+    }
+    return (uint16_t)(h & 0xffffu);
 }

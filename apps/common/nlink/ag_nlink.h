@@ -78,7 +78,7 @@
  *   carries its own CRC and is checked on its own; the payload's, when there is
  *   one, is four bytes AFTER the payload and outside `len`.
  *
- *   So a frame on the wire is:  header (20) + len + (NL_F_PSUM ? 4 : 0).
+ *   So a frame on the wire is:  header (24) + len + (NL_F_PSUM ? 4 : 0).
  *
  * Little-endian on the wire, because both ends that matter are little-endian
  * and saying so once is cheaper than byte-swapping twice.
@@ -93,9 +93,18 @@
 #include <stdint.h>
 
 #define NL_MAGIC   0x4B4E4C4Eu /* 'NLNK' little-endian on the wire */
-#define NL_VERSION 1u
+/*
+ * 2, and not 1, because the header grew from twenty bytes to twenty-four when
+ * `dst` and `src` were added.  The version is checked before anything else in
+ * ag_nlink_unpack, so a board still running the old layout has its frames
+ * refused as a desync - resynchronised from the next magic - rather than
+ * believed: the old CRC sat where `dst`/`src` sit now and the old header CRC
+ * range is a different range, so a mixed pair would otherwise misparse
+ * silently for as long as it took anyone to notice.
+ */
+#define NL_VERSION 2u
 
-#define NL_HDR_SIZE 20u
+#define NL_HDR_SIZE 24u
 
 /*
  * The largest payload one frame may carry.  Not a buffer size - a latency
@@ -158,7 +167,12 @@ typedef struct ag_nlink_hdr {
     uint16_t ack;
     uint16_t credit;
     uint16_t len;    /* payload bytes following, <= NL_QUANTUM */
-    uint32_t crc;    /* over the sixteen header bytes before it, and nothing
+    uint16_t dst;    /* node this frame is for, as ag_node_hash(); 0 = whoever
+                      * is reading it - which is what every frame meant before
+                      * a board had a neighbour it could not reach directly */
+    uint16_t src;    /* node that sent it, same encoding; the answer goes back
+                      * to this one */
+    uint32_t crc;    /* over the twenty header bytes before it, and nothing
                       * else - see "WHAT IS CHECKSUMMED" above */
 } ag_nlink_hdr_t;
 
@@ -305,6 +319,15 @@ typedef struct ag_nlink_slot {
     uint16_t len;
     uint8_t  flags;
     uint8_t  chan;
+    /*
+     * The addressing, remembered with the payload.  A queued frame is put on
+     * the wire by a later call than the one that queued it, and a relayed
+     * frame has to leave with the SAME dst and src it arrived with - the src
+     * especially, because that is what the far end addresses its answer to.
+     * The queue is therefore the only place that can still know them.
+     */
+    uint16_t dst;
+    uint16_t src;
     bool     sent;
     uint16_t tries;  /* > 1 means this one has been round the wire before */
     uint32_t sent_ms;
@@ -359,8 +382,8 @@ bool ag_nlink_tx_room(const ag_nlink_tx_t *tx);
  * message boundaries are; set `eom` on the last piece.  False when the window
  * is full, which is back-pressure and not an error: try again after an ack.
  */
-bool ag_nlink_tx_queue(ag_nlink_tx_t *tx, uint8_t chan, const void *data,
-                       uint16_t len, bool eom);
+bool ag_nlink_tx_queue(ag_nlink_tx_t *tx, uint8_t chan, uint16_t dst,
+                       uint16_t src, const void *data, uint16_t len, bool eom);
 
 /*
  * The next frame to put on the wire, or NULL when there is nothing to send at

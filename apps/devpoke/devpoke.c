@@ -18,7 +18,24 @@
 #include <argon/argon.h>
 #include <argon/libc.h>
 
-AG_APP("DEVPOKE", "1.0", "argon", 0);
+/*
+ * EIGHT KILOBYTES, NAMED RATHER THAN TAKEN FROM THE DEFAULT.
+ *
+ * This program writes a pattern into one device and says what it took, so 8 KB
+ * is not a measurement of its own needs - it is AG_PROC_LOAD_STACK_MIN, the
+ * floor the kernel names for the task an image is read and relocated on, and
+ * nothing here wants more.
+ *
+ * WHY NOT THE DEFAULT: it is 16 KB (CONFIG_ARGON_APP_STACK_KB, which no board
+ * in this tree overrides), and the board this program is the sound test FOR is
+ * the C3 - the one with no converter, whose only way to make a noise is to pour
+ * it at its neighbour.  Measured on COM8: one default-sized guest leaves the C3
+ * with 18 KB free and a 9 KB largest block, so DEVPOKRV is refused with -12
+ * whenever anything else is running - which, on the middle board of a cluster,
+ * is whenever the test is worth running.  Two 8 KB stacks fit in what one 16 KB
+ * stack leaves behind.
+ */
+AG_APP_SIZED("DEVPOKE", "1.0", "argon", 0, 8 * 1024, 0);
 
 static bool parse_u32(const char *s, uint32_t *out)
 {

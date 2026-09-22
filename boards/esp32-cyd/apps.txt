@@ -14,3 +14,12 @@ MIGRAN32.AXE
 NODEHI32.AXE
 # RISC-V, for the C3 next door to be handed:
 NODEHIRV.AXE
+# Xtensa LX7, for the S3-Zero beyond it.  Same rule as on the Zero's own list,
+# which has carried the CYD's LX6 builds since before there was a route: a
+# program that travels two hops is SENT by the board that asks, and the far
+# board can only run an image built for itself.  Without these, `link run` from
+# here to the Zero fails at the far end for a reason that has nothing to do
+# with the wire.
+NODEHI.AXE
+MIGRANT.AXE
+GRIND.AXE

@@ -36,16 +36,55 @@ else()
          "${CMAKE_CURRENT_LIST_DIR}/${ARGON_PORT}/src/*.c")
 endif()
 
-# The exception table fault_hw.c installs into is the one thing here that is
-# named after the instruction set rather than after the chip.  `xtensa` is a
-# component on the Xtensa parts and does not exist at all on the RISC-V ones
-# (C3, C6, H2, P4), where naming it fails the configure rather than the link.
-# RISC-V has no equivalent table, so fault_hw.c compiles there to a port that
-# answers -AG_ENOTSUP - which argon/port/fault.h allows in so many words.
-if(CONFIG_IDF_TARGET_ARCH_XTENSA)
-    set(ARGON_ARCH_REQUIRES xtensa)
-else()
-    set(ARGON_ARCH_REQUIRES "")
+# The architecture component - `xtensa` on one side, `riscv` on the other - is
+# NOT named here, and that is a build failure rather than a preference.
+#
+# It was `ARGON_ARCH_REQUIRES`, decided by `if(CONFIG_IDF_TARGET_ARCH_XTENSA)`,
+# and a REQUIREMENTS list may not be conditional on a CONFIG_* value.  ESP-IDF
+# evaluates every component's CMakeLists a FIRST time in CMake scripting mode to
+# collect its requirements, and that pass runs before the configuration exists
+# (`build.cmake`: "Perform early expansion of component CMakeLists.txt in CMake
+# scripting mode", called above __kconfig_generate_config).  The variable is
+# therefore undefined there, the else() branch is taken on every target, and
+# configuring an ESP32 - the CYD, the S3-Zero - died with
+#
+#   CMake Error: Failed to resolve component 'riscv' required by component
+#   'argon_port'
+#
+# which is what made every board except the C3 unbuildable.  On the C3 it hid
+# itself: there `riscv` is a real component, so the wrong branch gave the right
+# answer.
+#
+# Nothing is lost by dropping it.  ESP-IDF appends the target's architecture
+# component to __COMPONENT_REQUIRES_COMMON and adds the common requirements to
+# every component of the build, so `riscv` with riscv/rvruntime-frames.h and
+# `xtensa` with xtensa/corebits.h are already required, include directories and
+# all, by the component system itself.  What is NOT a common requirement is
+# esp_app_format, which is why it is named in the list below instead: without it
+# esp_app_desc.h, the running image's ELF SHA256, is not reachable.
+
+# HOW THE PANIC PATH IS ENTERED ON RISC-V.
+#
+# The trap entry in components/riscv/vectors.S calls xt_unhandled_exception()
+# and, if that returns, restores the frame and mrets - so routing that one call
+# to fault_hw.c is all that is needed to get in ahead of the panic handler, and
+# all that is needed to send a faulting application somewhere else instead.
+# --wrap does exactly that and nothing else: it rewrites the reference, leaving
+# ESP-IDF's own symbol in place as __real_xt_unhandled_exception.
+#
+# esp_panic_handler is wrapped as well, because a watchdog, a cache error or an
+# abort reaches the panicking code without passing through that first call.  The
+# record written there is what survives the reboot.
+#
+# Both only on RISC-V: the Xtensa half of fault_hw.c keeps no record across a
+# reboot, so wrapping either symbol there would break the link for a behaviour
+# nothing would use.
+#
+# NOT IN SCRIPT MODE, like the glob above: ESP-IDF re-runs this file under
+# `cmake -P` to read its requirements, and build properties do not exist there.
+if(NOT CMAKE_SCRIPT_MODE_FILE AND NOT CONFIG_IDF_TARGET_ARCH_XTENSA)
+    idf_build_set_property(LINK_OPTIONS "-Wl,--wrap=esp_panic_handler" APPEND)
+    idf_build_set_property(LINK_OPTIONS "-Wl,--wrap=xt_unhandled_exception" APPEND)
 endif()
 
 idf_component_register(
@@ -55,6 +94,11 @@ idf_component_register(
     # wherever the kernel includes them.
     REQUIRES argon_abi heap esp_timer freertos log esp_system esp_hw_support
              esp_common esp_psram
+             # spi_flash_cache_enabled(): the RISC-V fault handler is in IRAM and
+             # has to know whether the code that decides may be fetched at all
+             # (fault_hw.c).  The header is private to spi_flash, so it has to be
+             # named here rather than reached through another component.
+             spi_flash
              # esp_mmu_map / esp_cache_msync: mapping PSRAM into the instruction
              # window for the code arena (execmem_hw.c, S-1)
              esp_mm
@@ -66,7 +110,10 @@ idf_component_register(
              # is still there and still answers, which is how the port says
              # this image cannot scale.
              esp_pm
-             ${ARGON_ARCH_REQUIRES}
+             # the running image's ELF SHA256, for the panic record (fault_hw.c).
+             # The one thing that used to travel in ARGON_ARCH_REQUIRES and is
+             # not a common requirement of its own - see the note above.
+             esp_app_format
              # the serial ports everything talks over before there is anything
              # else - and, on a part whose Type-C socket goes straight to the
              # chip, the USB device that is the console instead of a UART
@@ -120,6 +167,25 @@ endif()
 if(CONFIG_ARGON_USB_HOST)
     idf_component_get_property(usb_lib usb COMPONENT_LIB)
     target_link_libraries(${COMPONENT_LIB} PRIVATE ${usb_lib})
+endif()
+
+# USB device (CONFIG_ARGON_USB_MSC): the OTG peripheral as a mass-storage DEVICE
+# for the card-reader application (usbd_hw.c).  Bare TinyUSB, not esp_tinyusb -
+# see main/idf_component.yml for why.  The `usb` component supplies the PHY API
+# (esp_private/usb_phy.h) and the tinyusb component supplies the device stack.
+# tinyusb ships no tusb_config.h of its own, so the port owns one
+# (idf/tusb/tusb_config.h) and injects it onto both its own compile - usbd_hw.c
+# includes tusb.h - and the tinyusb library's, the same mechanism esp_tinyusb
+# uses to inject its own.
+if(CONFIG_ARGON_USB_MSC)
+    idf_component_get_property(usb_phy_lib usb COMPONENT_LIB)
+    target_link_libraries(${COMPONENT_LIB} PRIVATE ${usb_phy_lib})
+    idf_component_get_property(tinyusb_lib espressif__tinyusb COMPONENT_LIB)
+    target_link_libraries(${COMPONENT_LIB} PRIVATE ${tinyusb_lib})
+    target_include_directories(${COMPONENT_LIB} PRIVATE
+        "${CMAKE_CURRENT_LIST_DIR}/idf/tusb")
+    target_include_directories(${tinyusb_lib} PRIVATE
+        "${CMAKE_CURRENT_LIST_DIR}/idf/tusb")
 endif()
 
 # The built-in camera (CONFIG_ARGON_CAMERA_BUILTIN): Espressif's esp32-camera,

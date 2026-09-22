@@ -15,6 +15,7 @@
  *   CONFIG_ARGON_APP_HEAP_KB        default process arena
  *   CONFIG_ARGON_APP_STACK_KB       default process stack
  *   CONFIG_ARGON_CONSOLE_KEY_EVENTS console event queue depth
+ *   CONFIG_ARGON_DEV_MAX            devices the registry can hold
  *   CONFIG_ARGON_ENABLE_ADC         link analogue input (see io.h for why not)
  *   CONFIG_ARGON_ENABLE_AUDIO       link sound output (/dev/pcm0)
  *   CONFIG_ARGON_ENABLE_HOSTFS      mount H: from a host helper on UART1

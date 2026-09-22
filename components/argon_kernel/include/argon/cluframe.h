@@ -53,6 +53,19 @@ enum {
     AG_CLUF_EXIT = 5,
     /* The job is over: stop everything that belongs to it. */
     AG_CLUF_END = 6,
+    /*
+     * THE NODES BEYOND ME, told to each neighbour so that a leaf can see the
+     * leaf on the far side of the middle.  No fields in the header; the payload
+     * is a list of records, each
+     *
+     *   uint8_t name_len, name bytes, uint8_t cores, uint8_t hops, uint32_t hz
+     *
+     * because a name is the only stable identity a board has - the wire index
+     * it arrives on is where it CAME FROM and means something different to
+     * every reader.  Sent by the transport on a timer; a board that does not
+     * know this op ignores it, which is why it is safe to add.
+     */
+    AG_CLUF_PEERS = 7,
 };
 
 /* On AG_CLUF_DATA only. */

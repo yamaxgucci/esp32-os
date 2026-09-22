@@ -552,6 +552,29 @@ menu "ArgonOS"
             verifiable in QEMU, which models no USB host - the gate is the
             board.
 
+    config ARGON_USB_MSC
+        bool "USB device: mass-storage card reader (read-only)"
+        depends on SOC_USB_OTG_SUPPORTED
+        default n
+        help
+            The USB-OTG peripheral as a DEVICE that exposes the SD card as a
+            USB mass-storage volume, so a PC can copy files off the card with
+            no card reader.  Stage 1 is read-only on purpose: the write hook is
+            refused and the host mounts the volume read-only, which cannot
+            corrupt the card.
+
+            This takes the one USB port the board has away from the console.
+            On a board whose console is the native USB-Serial-JTAG the two
+            cannot run at once (one internal PHY, two owners), so starting a
+            session silently drops the console until it ends.  The session is
+            therefore started by an operator command - the usbmsc application -
+            never from the boot path, and it ends on a host eject or a timeout,
+            never a typed command.
+
+            Off by default and only on chips with the OTG peripheral.  Not
+            verifiable in QEMU, which models no USB device - the gate is the
+            board.
+
     config ARGON_CONSOLE_COLS
         int "Console width, characters"
         range 20 240

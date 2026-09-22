@@ -7,6 +7,7 @@
 
 #include "driver/sdmmc_host.h"
 #include "driver/sdspi_host.h"
+#include "driver/gpio.h"
 #include "soc/soc_caps.h"
 #include "driver/spi_common.h"
 #include "esp_littlefs.h"
@@ -138,6 +139,49 @@ static esp_err_t mount_spi(const ag_port_sd_cfg_t *sd, const char *base,
         .quadhd_io_num = -1,
         .max_transfer_sz = 4096,
     };
+
+    /*
+     * THE PANEL'S CHIP SELECT, HELD HIGH WHILE THE CARD IS TALKED TO.
+     *
+     * On a board where the display and the slot share one SPI bus - SCLK,
+     * MOSI and MISO go to both and only the chip selects tell them apart -
+     * the card is readable only while the panel is deselected.  That is
+     * normally free, because a chip select idles high; it is not free when
+     * the panel's CS is also a strapping pin.  GPIO 45 on the Waveshare
+     * ESP32-S3-Touch-LCD-2 is exactly that: it comes out of reset pulled low,
+     * so the ST7789 reads itself as selected, drives its SDO onto MISO - the
+     * wire the card answers on - and the card's replies arrive corrupted.
+     *
+     * Measured on that board, one boot, A/B/A, with the vendor's own card
+     * example: drive GPIO 45 high before touching the card -> the card mounts
+     * (SDHC, 7690 MB, FAT32); leave it as it comes out of reset -> the mount
+     * fails, `sdmmc_init_ocr: send_cond (1) returned 0x109`, which is
+     * ESP_ERR_INVALID_CRC; high again -> mounts.
+     *
+     * So it has to be an OUTPUT driving HIGH before spi_bus_initialize() and
+     * before the first card command.  Why here and not in a driver: the card
+     * is mounted at the MEDIA stage and loadable .SYS drivers load at MODULES,
+     * which runs after it, so at this point nothing owns the panel yet - the
+     * ST7789 driver that would hold this line is not loaded.  BOARD.CFG sets
+     * it with `sd.cs_hold`; a board that does not set it never reaches this
+     * block, and the pin it names is not the card's own CS (`sd.cs` above),
+     * which stays the business of the SPI device below.
+     */
+    if (sd->cs_hold >= 0) {
+        const gpio_config_t hold = {
+            .pin_bit_mask = 1ULL << (unsigned)sd->cs_hold,
+            .mode = GPIO_MODE_INPUT_OUTPUT,
+            .pull_up_en = GPIO_PULLUP_DISABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type = GPIO_INTR_DISABLE,
+        };
+        const esp_err_t gerr = gpio_config(&hold);
+        if (gerr != ESP_OK) {
+            return gerr;
+        }
+        /* Driven before the bus exists, so it is high for the whole mount. */
+        gpio_set_level((gpio_num_t)sd->cs_hold, 1);
+    }
 
     /*
      * Remembered, because asking twice is not free of consequence.

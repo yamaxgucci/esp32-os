@@ -104,7 +104,17 @@ static volatile bool    s_kill_wanted;
 static volatile bool    s_kill_have;
 static volatile int32_t s_kill_status;
 
-static ag_err_t send_msg(uint8_t op, const void *payload, uint16_t len)
+/*
+ * One frame out, ON PURPOSE TO SOMEBODY.
+ *
+ * `dst` is ag_node_hash() of the node the frame is for.  A listing is asked of
+ * the node this board is talking to, and every frame of the answer is for the
+ * node that asked - the same node only while the two are neighbours, and never
+ * the same when a third board sits in between.  An answer sent "for whoever is
+ * reading" is taken by that third board and the asker waits out its timeout.
+ */
+static ag_err_t send_msg(uint16_t dst, uint8_t op, const void *payload,
+                         uint16_t len)
 {
     uint8_t buf[NP_HDR + NP_MAX_MSG];
     if (len > NP_MAX_MSG) {
@@ -118,7 +128,8 @@ static ag_err_t send_msg(uint8_t op, const void *payload, uint16_t len)
     }
     for (int t = 0; t < 200; t++) {
         const int32_t r =
-            ag_linkprov_send(NP_CHAN, AG_LINK_CONTROL, buf, NP_HDR + len);
+            ag_linkprov_send_to(dst, NP_CHAN, AG_LINK_CONTROL, buf,
+                                NP_HDR + len);
         if (r >= 0) {
             return AG_OK;
         }
@@ -132,8 +143,19 @@ static ag_err_t send_msg(uint8_t op, const void *payload, uint16_t len)
 
 static void serve_list(void)
 {
-    uint8_t  pack[NP_MAX_MSG];
-    uint16_t at = 0;
+    /*
+     * WHOSE LISTING THIS IS, taken once for the whole answer.
+     *
+     * The reply is several frames - the process records go out packed, and END
+     * always follows - and ag_linkprov_from() is only answered while the
+     * receive callback is running.  A full window is waited out INSIDE
+     * send_msg by pumping the wire, which runs further callbacks on this same
+     * task before it returns, so the asker is remembered here rather than asked
+     * for again per frame.
+     */
+    const uint16_t from = ag_linkprov_from();
+    uint8_t        pack[NP_MAX_MSG];
+    uint16_t       at = 0;
 
     for (uint32_t i = 0;; i++) {
         ag_procinfo_t info;
@@ -141,21 +163,21 @@ static void serve_list(void)
             break;
         }
         if (at + NP_REC > sizeof(pack)) {
-            (void)send_msg(NP_SOME, pack, at);
+            (void)send_msg(from, NP_SOME, pack, at);
             at = 0;
         }
         put_rec(pack + at, &info);
         at = (uint16_t)(at + NP_REC);
     }
     if (at > 0) {
-        (void)send_msg(NP_SOME, pack, at);
+        (void)send_msg(from, NP_SOME, pack, at);
     }
     /*
      * END goes out even when there was nothing, and that is why it exists: a
      * node running nothing and a node that is not there look identical without
      * it, and they mean opposite things.
      */
-    (void)send_msg(NP_END, NULL, 0);
+    (void)send_msg(from, NP_END, NULL, 0);
 }
 
 static void on_msg(uint8_t chan, const void *data, uint16_t n, void *ctx)
@@ -192,13 +214,18 @@ static void on_msg(uint8_t chan, const void *data, uint16_t n, void *ctx)
         s_done = true;
         break;
     case NP_KILL: {
+        /*
+         * The asker, taken before the kill, because the answer goes out below
+         * once the process is gone and the reply belongs to whoever asked.
+         */
+        const uint16_t from = ag_linkprov_from();
         const ag_pid_t pid =
             (len >= 4u) ? (ag_pid_t)get32(buf + NP_HDR) : (ag_pid_t)0;
         const int32_t r =
             (int32_t)ag_proc_kill(pid, "killed from the other node");
         uint8_t       o[4];
         put32(o, (uint32_t)r);
-        (void)send_msg(NP_KILLED, o, sizeof(o));
+        (void)send_msg(from, NP_KILLED, o, sizeof(o));
         break;
     }
     case NP_KILLED:
@@ -252,7 +279,12 @@ int32_t ag_nodeps_list(ag_procinfo_t *out, uint32_t max, uint32_t timeout_ms)
     s_done = false;
     s_wanted = true;
 
-    const ag_err_t err = send_msg(NP_LIST, NULL, 0);
+    /*
+     * A NEW conversation, so it is addressed to the node `link use` last named
+     * rather than to whoever spoke last.  Zero there is the neighbour in hand,
+     * which is what this has always meant.
+     */
+    const ag_err_t err = send_msg(ag_linkprov_target(), NP_LIST, NULL, 0);
     if (err != AG_OK) {
         s_wanted = false;
         return (int32_t)err;
@@ -291,7 +323,9 @@ ag_err_t ag_nodeps_kill(ag_pid_t pid, uint32_t timeout_ms)
     s_kill_status = 0;
     s_kill_wanted = true;
 
-    const ag_err_t err = send_msg(NP_KILL, p, sizeof(p));
+    /* A new conversation too, and to the same node the listing above asks -
+     * the one this board is talking to. */
+    const ag_err_t err = send_msg(ag_linkprov_target(), NP_KILL, p, sizeof(p));
     if (err != AG_OK) {
         s_kill_wanted = false;
         return err;

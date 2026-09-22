@@ -148,8 +148,8 @@ static ag_err_t sd_space(void *ctx, uint64_t *total, uint64_t *available)
 
 /*
  * The board file describes the card the way the schematic does; the port wants
- * the same facts in its own struct.  Ten lines of copying is the price of the
- * kernel not knowing which chip it is on.
+ * the same facts in its own struct.  A dozen lines of copying is the price of
+ * the kernel not knowing which chip it is on.
  */
 static void sd_cfg_from_board(const ag_board_sd_t *sd, ag_port_sd_cfg_t *out)
 {
@@ -170,6 +170,12 @@ static void sd_cfg_from_board(const ag_board_sd_t *sd, ag_port_sd_cfg_t *out)
     out->miso = sd->miso;
     out->cs = sd->cs;
     out->spi_host = (uint8_t)sd->spi_host;
+    /*
+     * Copied rather than left to the memset above: "off" is AG_PIN_NONE, which
+     * is negative, and zero is GPIO 0 - a pin the port would then drive on
+     * every board that never asked for it.
+     */
+    out->cs_hold = sd->cs_hold;
 }
 
 /* ---------------------------------------------------------------------- */

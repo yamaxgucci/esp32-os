@@ -50,6 +50,38 @@ extern "C" {
  */
 ag_err_t ag_migrate_away(ag_pid_t pid, uint32_t timeout_ms);
 
+/*
+ * The same move, split where a board that is HOLDING a guest has to split it.
+ *
+ * ag_migrate_away needs a task of its own: it waits for the program to reach a
+ * checkpoint, and the task that carries the state cannot be the link's reader,
+ * because the state travels down the link that reader reads.  On a board that
+ * is holding somebody else's guest there is no room for that task - the guest's
+ * own stack has the largest free block, and the failure is silent:
+ *
+ *   E (82544) node: no task to send the guest home
+ *   (measured on COM8 with a resident 8 KB guest: 16 KB free, largest 7 KB)
+ *
+ * So the request is answered in two steps instead.  ag_migrate_ask signals the
+ * program and returns at once - one call, no allocation, safe on the link's
+ * reader.  The carrying is then done by the task that is ALREADY waiting for
+ * that pid - the node's run task - with ag_migrate_send_home, which is the
+ * instant the state is complete and the program has gone.
+ *
+ * ag_migrate_away remains ask+wait+send for the callers that have a task of
+ * their own to spare: the shell's `migrate` and the standby watcher.
+ */
+ag_err_t ag_migrate_ask(ag_pid_t pid);
+
+/* Is this pid the one an ask is outstanding for?  Asked by the task that was
+ * already waiting for it, so that an ordinary guest that simply ended is not
+ * carried anywhere. */
+bool     ag_migrate_asked(ag_pid_t pid);
+
+/* Carry the state of the program that was asked - it has gone.  -AG_EINVAL if
+ * nobody was asked, -AG_EAGAIN if it ended without saving anything. */
+ag_err_t ag_migrate_send_home(uint32_t timeout_ms);
+
 /* What the syscall table forwards here. */
 bool     ag_migrate_wanted(void);
 ag_err_t ag_migrate_save(const void *state, uint32_t len);

@@ -1484,6 +1484,40 @@ static inline void ag_clu_done(void)
     }
 }
 
+/* ---- the board as a USB device (ABI 0.55+) ------------------------------ */
+
+/*
+ * The card reader, on demand.  api->usbd is NULL unless the build has
+ * CONFIG_ARGON_USB_MSC (off by default) - probe before calling, or read
+ * -AG_ENOSYS back.  start() takes the USB port away from the console and
+ * becomes a mass-storage device whose callbacks are the application's own
+ * (see ag_usbd_msc_cbs_t); stop() tears it down and restores the console.
+ * The console is unreachable from its USB port for the whole session, so the
+ * application must end it on a host eject or a timeout, never a typed command.
+ */
+static inline bool ag_usbd_available(void) { return g_ag_api->usbd != NULL; }
+static inline ag_err_t ag_usbd_start(const ag_usbd_msc_cbs_t *cbs)
+{
+    if (g_ag_api->usbd == NULL) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->usbd->start(cbs);
+}
+static inline ag_err_t ag_usbd_stop(void)
+{
+    if (g_ag_api->usbd == NULL) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->usbd->stop();
+}
+static inline ag_err_t ag_usbd_status(ag_usbd_status_t *out)
+{
+    if (g_ag_api->usbd == NULL || g_ag_api->usbd->status == NULL) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->usbd->status(out);
+}
+
 #ifdef __cplusplus
 }
 #endif

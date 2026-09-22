@@ -11,6 +11,7 @@
 #include <argon/device.h>
 #include <argon/libc.h>
 #include <argon/log.h>
+#include <argon/nodename.h>
 
 #include <argon/port/task.h>
 
@@ -63,6 +64,171 @@ static wire_t *current(void)
         return &s_wire[s_sel];
     }
     return NULL;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Beyond the neighbour: who a frame is for, and who is sending it           */
+/* ------------------------------------------------------------------------ */
+/*
+ * THREE PIECES OF STATE, and each is here rather than in a service above for
+ * the same reason: they are properties of the WIRE, and something that serves
+ * three neighbours at once has one answer per wire, not one answer.
+ *
+ * `s_from` is the source of the frame being handled, kept per wire because two
+ * reader tasks can be inside a handler at the same time and a single variable
+ * would attribute one neighbour's message to the other.  It is written
+ * immediately before the handler is called and read by ag_linkprov_from(),
+ * which is the only caller that means anything by it.
+ *
+ * `s_here` is this board's own name as a number, cached with the name it was
+ * computed from so that a `node name` (which can happen at the prompt at any
+ * moment) cannot leave a stale hash deciding what is "for me" - a board that
+ * believed the wrong number would relay its own messages onward for ever.
+ *
+ * `s_target` is what `link use` last named as the far node, and is what a NEW
+ * conversation is addressed to.  Everything that ANSWERS uses
+ * ag_linkprov_from() instead; this is for the callers that start one.
+ */
+static uint16_t s_from[LINK_WIRES];
+static uint16_t s_target;
+static uint16_t s_here;
+static char     s_here_name[AG_NODE_NAME_MAX];
+
+static int wire_slot(const wire_t *w)
+{
+    return (int)(w - &s_wire[0]);
+}
+
+uint16_t ag_linkprov_here(void)
+{
+    const char *n = ag_node_name();
+    if (strcmp(s_here_name, n) != 0) {
+        ag_strlcpy(s_here_name, n, sizeof(s_here_name));
+        s_here = ag_node_hash(n);
+    }
+    return s_here;
+}
+
+uint16_t ag_linkprov_from(void)
+{
+    const wire_t *w = current();
+    return (w != NULL) ? s_from[wire_slot(w)] : 0u;
+}
+
+uint16_t ag_linkprov_target(void)
+{
+    return s_target;
+}
+
+void ag_linkprov_set_target(uint16_t hash)
+{
+    s_target = hash;
+}
+
+/*
+ * The wire whose neighbour is `dst`, or -1.  A wire whose peer has not named
+ * itself yet CANNOT BE ROUTED TO and is passed over rather than guessed at: the
+ * first frame of a hello exchange has no name in it to match, and a board that
+ * picked a wire for an unnamed neighbour would send a stranger's traffic out of
+ * whichever wire happened to be free.
+ *
+ * The comparison is over hashes, which is what the frame carries; the names
+ * behind them are the ones the hello exchange learned, per wire, and are what
+ * makes a far leaf reachable at all.
+ */
+static int32_t wire_towards(uint16_t dst)
+{
+    for (unsigned i = 0; i < LINK_WIRES; i++) {
+        if (s_wire[i].ops == NULL) {
+            continue;
+        }
+        const char *peer = ag_node_peer_name_at((int32_t)i);
+        if (peer != NULL && ag_node_hash(peer) == dst) {
+            return (int32_t)i;
+        }
+    }
+    return -1;
+}
+
+/*
+ * A frame the middle board has to move across, and how long it will wait for
+ * room on the outgoing wire before giving up on it.
+ *
+ * The wait is the back-pressure and it is the reason there is no queue task
+ * here.  The outgoing class has a window; when it is full the honest answer is
+ * to stop reading the incoming wire for a moment, because that lets the
+ * origin's window fill too and the origin slow down - which is a wire doing its
+ * job.  A queue between the two hops would absorb the difference for a while
+ * and then drop, and a drop here is invisible to BOTH ends: the middle has
+ * already acknowledged the frame on the incoming hop, so the origin believes it
+ * was delivered, and the far end never saw it.  Waiting is the only answer that
+ * does not lie.
+ *
+ * It is bounded because the reader task is the only thing that reads this
+ * wire - while it waits, the driver's own service task can still fill the
+ * driver's eight-message inbox, and a wait long enough to overflow that would
+ * cost frames somewhere the counter cannot explain.  Eight tries at a tick is
+ * the compromise; a real one-way congestion lasts longer than that and is
+ * logged rather than hidden.
+ */
+#define LINK_RELAY_TRIES 8u
+
+/* One drop, said once.  Three reasons, so at most three lines in a run: a
+ * frame per line at audio or file rates is the flood this tree has already
+ * been bitten by. */
+static bool s_relay_said[3];
+static uint32_t s_relay_dropped;
+static uint32_t s_relayed;
+
+static void relay_drop(unsigned why, uint16_t dst, const char *what)
+{
+    s_relay_dropped++;
+    if (!s_relay_said[why]) {
+        s_relay_said[why] = true;
+        ag_log(AG_LOG_WARN, "link",
+               "relay: a frame for %04x was dropped (%s) - %u relayed and %u "
+               "dropped since the link came up; this is said once, not per "
+               "frame",
+               (unsigned)dst, what, (unsigned)s_relayed,
+               (unsigned)s_relay_dropped);
+    }
+}
+
+static void relay(wire_t *arrived, uint8_t chan, const ag_link_addr_t *a,
+                  const uint8_t *buf, uint16_t len)
+{
+    const int32_t to = wire_towards(a->dst);
+    if (to < 0) {
+        relay_drop(0, a->dst,
+                   "no bound wire has a neighbour by that name yet");
+        return;
+    }
+    if (&s_wire[to] == arrived) {
+        /* The only wire that leads there is the one it came in on, so
+         * forwarding it would put it back where it started. */
+        relay_drop(1, a->dst, "the only wire to there is the one it arrived on");
+        return;
+    }
+    /*
+     * `a` goes out untouched, `src` included.  That is the whole of what makes
+     * a relayed conversation work: the far end answers the node it is talking
+     * to, and if this board put its own name there the answer would come back
+     * here instead of going home.
+     */
+    for (unsigned tries = 0;; tries++) {
+        const int32_t r =
+            s_wire[to].ops->send_a(s_wire[to].dev, chan, buf, len, a);
+        if (r >= 0) {
+            s_relayed++;
+            return;
+        }
+        if (r != -AG_EAGAIN || tries >= LINK_RELAY_TRIES) {
+            relay_drop(2, a->dst,
+                       "the wire out of here had no room for it");
+            return;
+        }
+        ag_port_task_delay(ag_port_ms_to_ticks(1));
+    }
 }
 
 /*
@@ -126,9 +292,47 @@ bool ag_linkprov_in_reader(void)
 }
 
 /*
+ * One message off a wire, and the decision this whole file now exists for.
+ *
+ * A frame with no destination, or with this board's own, is delivered upward
+ * exactly as it always was.  Anything else is going somewhere this board is
+ * merely in the way of, and is moved across and NOT delivered here - delivering
+ * it as well would have the middle board answer its neighbours' traffic, and
+ * both ends would then be talking to the middle instead of to each other.
+ */
+static void route(wire_t *w, uint8_t chan, const ag_link_addr_t *from,
+                  const uint8_t *buf, uint16_t len)
+{
+    const uint16_t me = ag_linkprov_here();
+    if (from->dst != 0u && from->dst != me) {
+        relay(w, chan, from, buf, len);
+        return;
+    }
+    /*
+     * For this board.  Whoever is about to be handed it may answer, and the
+     * answer has to be addressed to the node that WROTE the message - which,
+     * for a frame that crossed a middle board, is not the wire's neighbour.
+     * Recorded before the handler runs and per wire, because two neighbours can
+     * be inside a handler at the same moment.
+     */
+    s_from[wire_slot(w)] = from->src;
+    /*
+     * The handler runs HERE, on this wire's own task, and that is what makes a
+     * reply go back the way the question came: current() finds this wire by
+     * asking which task is running.
+     */
+    if (chan < LINK_CHANS && s_rx_fn[chan] != NULL) {
+        s_rx_fn[chan](chan, buf, len, s_rx_ctx[chan]);
+    }
+}
+
+/*
  * The one reader.  Everything that arrives goes to the handler for its channel
  * and nowhere else; a message on a channel nobody holds is dropped, which is
  * the honest thing to do with a conversation nobody is having.
+ *
+ * A message addressed past this board is the one exception, and it is decided
+ * before the handler table is consulted - see route().
  */
 static void reader_task(void *arg)
 {
@@ -139,19 +343,15 @@ static void reader_task(void *arg)
             ag_port_task_delay(ag_port_ms_to_ticks(20));
             continue;
         }
-        uint8_t       chan = 0;
-        const int32_t n = w->ops->recv(w->dev, &chan, buf, sizeof(buf), 50);
+        uint8_t        chan = 0;
+        ag_link_addr_t from;
+        memset(&from, 0, sizeof(from));
+        const int32_t n =
+            w->ops->recv_a(w->dev, &chan, buf, sizeof(buf), 50, &from);
         if (n <= 0) {
             continue;
         }
-        /*
-         * The handler runs HERE, on this wire's own task, and that is what
-         * makes a reply go back the way the question came: current() finds
-         * this wire by asking which task is running.
-         */
-        if (chan < LINK_CHANS && s_rx_fn[chan] != NULL) {
-            s_rx_fn[chan](chan, buf, (uint16_t)n, s_rx_ctx[chan]);
-        }
+        route(w, chan, &from, buf, (uint16_t)n);
     }
     w->reader = NULL;
     ag_port_task_delete(NULL);
@@ -206,6 +406,30 @@ static bool ops_complete(const ag_link_ops_t *o)
 {
     return o != NULL && o->size >= LINK_OPS_MIN && o->start && o->up &&
            o->send && o->recv && o->poll && o->stats;
+}
+
+/*
+ * A driver that can carry an address, which since ABI 0.54 is not optional.
+ *
+ * The entries are past `info` and are tested the way this tree tests every
+ * appended entry - by offset rather than by sizeof, so a driver built against a
+ * LATER table still answers this question about the pair it does have.
+ *
+ * MISSING IS REFUSED, and that is the point rather than a strictness.  A
+ * driver without them would bind, answer, and carry the direct-neighbour
+ * traffic everything is first tested with - while every frame addressed past
+ * this board was delivered here instead, or stamped with a zero source the far
+ * end cannot answer.  That failure is invisible from both ends: the cluster
+ * looks alive and the one thing the addressing exists for does not work.  One
+ * line naming the version and a link that does not come up is a bench that can
+ * be fixed in thirty seconds.
+ */
+static bool ops_addressed(const ag_link_ops_t *o)
+{
+    const size_t need = offsetof(ag_link_ops_t, recv_a) +
+                        sizeof(((ag_link_ops_t *)0)->recv_a);
+    return o != NULL && o->size >= need && o->send_a != NULL &&
+           o->recv_a != NULL;
 }
 
 const char *ag_linkprov_active(void)
@@ -295,14 +519,44 @@ int32_t ag_linkprov_index_of(const char *name)
     return -1;
 }
 
-int32_t ag_linkprov_send_on(int32_t wire, uint8_t chan, uint8_t cls,
-                            const void *buf, size_t len)
+/*
+ * One bound wire, one message, addressed.  The one place the addressed send
+ * entry is called for a NEW message, so that there is one statement of what a
+ * locally-sent frame is stamped with and it is not repeated per caller.
+ *
+ * `src` is this board, always: a message sent from here was written here.
+ * The relay does NOT come through this function - it must keep the source it
+ * received, and it calls send_a directly for that reason (see relay()).
+ */
+static int32_t send_addressed(int32_t wire, uint16_t dst, uint8_t chan,
+                              uint8_t cls, const void *buf, size_t len)
 {
     if (wire < 0 || (unsigned)wire >= LINK_WIRES ||
         s_wire[wire].ops == NULL) {
         return -AG_ENODEV;
     }
-    return s_wire[wire].ops->send(s_wire[wire].dev, chan, cls, buf, len);
+    const ag_link_addr_t to = {dst, ag_linkprov_here(), cls};
+    return s_wire[wire].ops->send_a(s_wire[wire].dev, chan, buf, len, &to);
+}
+
+int32_t ag_linkprov_send_on(int32_t wire, uint8_t chan, uint8_t cls,
+                            const void *buf, size_t len)
+{
+    return send_addressed(wire, ag_linkprov_target(), chan, cls, buf, len);
+}
+
+int32_t ag_linkprov_send_to(uint16_t dst, uint8_t chan, uint8_t cls,
+                            const void *buf, size_t len)
+{
+    const wire_t *w = current();
+    return send_addressed((w != NULL) ? wire_slot(w) : -1, dst, chan, cls, buf,
+                          len);
+}
+
+int32_t ag_linkprov_send_to_on(int32_t wire, uint16_t dst, uint8_t chan,
+                               uint8_t cls, const void *buf, size_t len)
+{
+    return send_addressed(wire, dst, chan, cls, buf, len);
 }
 
 void ag_linkprov_poll_all(uint32_t ms)
@@ -378,6 +632,14 @@ ag_err_t ag_linkprov_use(const char *name)
         ag_log(AG_LOG_ERROR, "link", "%s: incomplete link ops", name);
         return -AG_ENOTSUP;
     }
+    if (!ops_addressed(ops)) {
+        ag_log(AG_LOG_ERROR, "link",
+               "%s was built before ABI 0.54 and cannot carry an address - "
+               "rebuild it; without that pair a frame for a board past this one "
+               "would be delivered here instead",
+               name);
+        return -AG_ENOTSUP;
+    }
 
     /*
      * Already bound is a SELECTION, not a second binding.  Typing `link use
@@ -444,13 +706,21 @@ bool ag_linkprov_up(void)
     return (w != NULL) && w->ops->up(w->dev);
 }
 
+/*
+ * A NEW message, from here.  It is stamped `src` = this board and `dst` =
+ * whatever `link use` last named - which is why nothing above this file had to
+ * learn about addressing: a service that only ever talks to the node it was
+ * pointed at keeps calling this, and gets a frame the middle board can route.
+ *
+ * A service that ANSWERS does not come through here: it addresses the answer to
+ * ag_linkprov_from(), because the node that asked is not necessarily the node
+ * on the wire.  ag_linkprov_send_to() is that call.
+ */
 int32_t ag_linkprov_send(uint8_t chan, uint8_t cls, const void *buf, size_t len)
 {
-    wire_t *w = current();
-    if (w == NULL) {
-        return -AG_ENODEV;
-    }
-    return w->ops->send(w->dev, chan, cls, buf, len);
+    const wire_t *w = current();
+    return send_addressed((w != NULL) ? wire_slot(w) : -1, ag_linkprov_target(),
+                          chan, cls, buf, len);
 }
 
 void ag_linkprov_poll(uint32_t ms)
@@ -467,6 +737,24 @@ ag_err_t ag_linkprov_stats(ag_link_stats_t *out)
     if (w == NULL) {
         return -AG_ENODEV;
     }
+    /*
+     * Zeroed before the driver is asked, and it is the driver that makes this
+     * necessary rather than tidiness.
+     *
+     * ag_link_stats_t carries no size and no version marker: a driver fills the
+     * fields it was built with and nothing tells it that the struct it was
+     * handed is larger.  That is safe in exactly one direction - the caller's
+     * struct is the bigger one - and only when the caller has cleared it, since
+     * everything past the last field the driver knows keeps whatever the stack
+     * held.  A driver image from an older build would then report a
+     * retransmission or a dropped-message count assembled out of somebody
+     * else's locals, and a number that is wrong is worse than a number that is
+     * absent: it gets believed.
+     *
+     * Here rather than in the caller because every caller needs it and only one
+     * of them would remember.
+     */
+    memset(out, 0, sizeof(*out));
     return w->ops->stats(w->dev, out);
 }
 

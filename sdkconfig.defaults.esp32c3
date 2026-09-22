@@ -50,12 +50,37 @@ CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_160=y
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 CONFIG_ESP_CONSOLE_UART_DEFAULT=n
 
-# The code arena, out of the same heap Wi-Fi wants.  48 KB rather than the C6's
+# The code arena, out of the same heap Wi-Fi wants.  32 KB rather than the C6's
 # 64: this part has a hundred kilobytes less to divide, and an arena that cannot
 # be allocated is a board that does not boot rather than one that runs smaller
 # programs.  Raise it if an application is refused for want of code space AND
 # there is memory to spare at the boot line - both halves, not either.
-CONFIG_ARGON_APP_ARENA_KB=48
+#
+# IT WAS 48, AND 48 IS THE VALUE THAT MAKES THIS BOARD UNABLE TO RUN ANYTHING.
+#
+# The arena is a static array in .iram.bss, so every kilobyte of it is a
+# kilobyte the heap never sees - and on this part the heap is short enough that
+# the SIZE OF THE LARGEST FREE BLOCK is what decides whether a program starts.
+# At 48 KB, on the bench, with two wires up:
+#
+#   $ mem
+#                    total        free     largest
+#     internal       173 KB        23 KB        15 KB
+#   $ run c:\nodehirv.axe
+#   E proc: nodehirv.axe: no memory for a 16384 byte task stack
+#           (internal SRAM and PSRAM both failed)
+#
+# 23 KB free and a 16 KB stack refused, because no single block was big enough.
+# 48 KB of arena bought nothing: what is loaded into it is the wire driver
+# (6.8 KB of code, 1.9 KB of data) and a program the size of TONE (19 KB), so a
+# 32 KB ceiling holds both and hands 16 KB back to the heap at the same time -
+# and this board's whole purpose in the cluster is to run the guest on the
+# other end of a wire, so "cannot start a program" is "cannot do its job".
+#
+# 32 and not 16: TONE is on this board's C: on purpose (it has no converter, so
+# a tone started here lands on the neighbour's), and it needs 19 KB of the
+# arena beside the driver.  Sixteen would fit the stack and lose the program.
+CONFIG_ARGON_APP_ARENA_KB=32
 
 # And the one line without which the arena is useless.  It is not the C6's line,
 # and finding that out cost the first boot on this board.
@@ -146,7 +171,39 @@ CONFIG_ARGON_ENABLE_ADC=n
 CONFIG_ARGON_CONSOLE_COLS=80
 CONFIG_ARGON_CONSOLE_ROWS=25
 
-# Room for a neighbour's devices as well as this board's.  Ten of its own and
-# fifteen from the CYD is twenty-five, and the default twenty-four refuses the
-# last two - which are the screen and the touchscreen.  See CONFIG_ARGON_DEV_MAX.
-CONFIG_ARGON_DEV_MAX=40
+# Room for a neighbour's devices as well as this board's - and this board has
+# TWO neighbours, so the pair's arithmetic does not cover it.  Measured on the
+# bench: this board's own registry is twelve entries, the CYD offers fifteen
+# (one of them its link, skipped) and the S3-Zero twelve.  Twelve plus fifteen
+# plus twelve is thirty-nine.
+#
+# WHAT IT COSTS, MEASURED on this board with `mem` either side of the change:
+# thirty-two kilobyte entries is seven kilobytes - free went 39 -> 32 KB and the
+# largest block 31 -> 25 KB - because a borrowed device costs a slot in this
+# table *and* an entry in the proxy table behind it.  That is 224 bytes an
+# entry, which is what the number below is now chosen against.
+#
+# SIXTY-FOUR BECAME FORTY-EIGHT, AND THE SECOND GUEST IS WHY.
+#
+# The C3's whole reason to exist in this cluster is to run a program on behalf
+# of a neighbour, and the pair test now reaches the state the middle board has
+# to survive: ONE guest already running (a migrated MIGRANT, or the neighbour's
+# build being substituted for a foreign one) while a SECOND is asked for.  With
+# the table at sixty-four entries the C3 has 15308 bytes free and a 7424-byte
+# largest block while that one guest runs, and the second is refused - by 768
+# bytes, which is what a 224-byte entry times sixteen is worth.  At forty-eight
+# the same state has room for the second 8 KB stack, and thirty-nine is still
+# what it needs, with nine to spare.
+#
+# Forty was the value that first suggested itself here and it is the wrong one:
+# thirty-nine is the measured requirement with NO margin, and a table that fills
+# up refuses the screen and the touchscreen first (see the note that follows).
+# Forty-eight is the smallest round number that holds what the middle must hold.
+#
+# THE OLD VALUE HERE WAS FORTY, AND IT WAS ALSO A LINE THAT DID NOTHING.  See
+# argon/device.h: the header read CONFIG_ARGON_DEV_MAX without asking the port
+# for it, so every board ran on the twenty-four in its #else - and this board
+# refused the CYD's screen, touchscreen and card slot with -ENFILE (-23) while
+# its sdkconfig said forty.  A number here is only worth writing now that it
+# arrives.
+CONFIG_ARGON_DEV_MAX=48

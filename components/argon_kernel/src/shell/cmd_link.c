@@ -46,6 +46,65 @@
 #define LINK_MSG_MAX 240u
 
 /*
+ * The two tags of the ping/echo protocol, here rather than beside `link echo`
+ * because the receive path counts the answers and so has to know which byte
+ * says a message is one.
+ *
+ * A reply is the message with one byte in front of it, so that a node cannot
+ * mistake its own echo for a request and the two nodes cannot echo at each
+ * other for ever.  That is not hypothetical: the first draft echoed the message
+ * unchanged and both ends bounced one message until the window filled.
+ */
+#define LINK_TAG_REQ 'q'
+#define LINK_TAG_REP 'r'
+
+/*
+ * THE PING'S OWN COUNT, taken where the answers arrive rather than where they
+ * are read.
+ *
+ * `link ping` used to count the answers it took out of the one-message mailbox
+ * below, and a mailbox that holds one message drops everything that arrives
+ * while it is full - so what was being counted was how often the command got
+ * back to the mailbox in time, not how many answers came back.  Measured on two
+ * boards: `0 of 500 came back` while the link's own counters read 539 frames
+ * sent and 539 received, no gaps, no duplicates, no bad frames and a one
+ * millisecond round trip.  The wire had carried every answer; the instrument
+ * was reading its own drain rate and calling it the wire.
+ *
+ * So the count is incremented HERE, on the link's reader task, for every answer
+ * that arrives - and the mailbox below is left exactly as it is, because it is
+ * right for what it is for: a consumer that genuinely wants one outstanding
+ * message (`link echo`) takes them one at a time and does not care what it
+ * misses while it is busy.
+ *
+ * THE RUN is what makes the count belong to one command.  An answer that
+ * arrives after its ping has given up carries the run it was sent for, and only
+ * the armed run is counted, so a straggler cannot be added to the next
+ * command's total.  Zero means nothing is armed, which is why the run number
+ * starts at one.
+ */
+static volatile uint32_t s_ping_run; /* the run whose answers count; 0 = none */
+static volatile uint32_t s_ping_got; /* answers that arrived for that run     */
+static uint32_t          s_ping_next; /* the run number the next ping takes   */
+
+/* The run number out of "ping NNNNN", or 0 when the message is not that. */
+static uint32_t ping_run_of(const uint8_t *p, uint16_t len)
+{
+    static const char k[] = "ping ";
+    if (len < sizeof(k) - 1u || memcmp(p, k, sizeof(k) - 1u) != 0) {
+        return 0u;
+    }
+    uint32_t v = 0u;
+    for (uint16_t i = sizeof(k) - 1u; i < len; i++) {
+        if (p[i] < '0' || p[i] > '9') {
+            break;
+        }
+        v = v * 10u + (uint32_t)(p[i] - '0');
+    }
+    return v;
+}
+
+/*
  * A one-message mailbox, filled by the link's reader task.
  *
  * There is no recv() to call any more, and the reason is a bug this file
@@ -53,16 +112,44 @@
  * one inbox, and six messages in twenty-four went to the wrong one - which the
  * shell then reported as lost.  One reader, handlers per channel, and a
  * consumer waits on its own channel's mailbox.
+ *
+ * WHO SENT IT AND WHICH WIRE IT CAME IN ON travel with the message, because
+ * the task that answers is not the task that received: the link's reader fills
+ * this, and the shell takes from it here - and ag_linkprov_from() means nothing
+ * on the shell's own task.  A reply that does not carry both is a reply taken
+ * by the board in between instead of being passed home - on the middle of three
+ * boards, `link echo` would answer the wrong node and `link ping` would report
+ * zero answers on a wire that is working perfectly.
  */
+typedef struct {
+    uint8_t  chan;
+    uint16_t from; /* the node that sent it, for the answer */
+    int32_t  wire; /* the wire it arrived on, so the answer leaves by it */
+} link_origin_t;
+
 static volatile bool s_have;
 static uint8_t       s_msg[LINK_MSG_MAX + 1];
 static volatile uint16_t s_msg_len;
-static volatile uint8_t  s_msg_chan;
+static link_origin_t     s_msg_who;
 
 static void on_shell_msg(uint8_t chan, const void *data, uint16_t len,
                          void *ctx)
 {
     (void)ctx;
+    const uint8_t *d = (const uint8_t *)data;
+
+    /*
+     * COUNTED BEFORE THE MAILBOX CAN REFUSE IT, and that order is the whole of
+     * this instrument: an answer is an answer whether or not anybody was
+     * waiting to take it out of the queue.  See s_ping_run above.
+     */
+    if (len > 1u && d[0] == (uint8_t)LINK_TAG_REP) {
+        const uint32_t run = s_ping_run;
+        if (run != 0u && ping_run_of(d + 1u, (uint16_t)(len - 1u)) == run) {
+            s_ping_got++;
+        }
+    }
+
     if (s_have) {
         return; /* the last one has not been taken; drop rather than overwrite */
     }
@@ -71,19 +158,34 @@ static void on_shell_msg(uint8_t chan, const void *data, uint16_t len,
     }
     memcpy(s_msg, data, len);
     s_msg_len = len;
-    s_msg_chan = chan;
+    s_msg_who.chan = chan;
+    s_msg_who.from = ag_linkprov_from();
+    s_msg_who.wire = ag_linkprov_current();
     s_have = true;
 }
 
-/* Wait for one, up to `ms`.  Returns its length, or -AG_EAGAIN. */
-static int32_t shell_wait(uint8_t *chan, uint8_t *buf, size_t max, uint32_t ms)
+/*
+ * Milliseconds since boot, from the loader's clock.
+ *
+ * One place for the unit conversion, because `link ping` times a whole run with
+ * it and a second copy is a second thing to get the factor wrong in.
+ */
+static uint32_t now_ms(void)
+{
+    return (uint32_t)(ag_loader_api()->time->us() / 1000u);
+}
+
+/* Wait for one, up to `ms`.  Returns its length, or -AG_EAGAIN.  Where it came
+ * from is filled in when `who` is not NULL. */
+static int32_t shell_wait(link_origin_t *who, uint8_t *buf, size_t max,
+                          uint32_t ms)
 {
     /*
      * On the clock, not by counting sleeps: a tick is ten milliseconds whatever
      * a shorter sleep asks for, and a timeout built out of those is wrong by
      * that factor - which the driver next door learned the expensive way.
      */
-    const uint32_t start = (uint32_t)(ag_loader_api()->time->us() / 1000u);
+    const uint32_t start = now_ms();
     for (;;) {
         if (s_have) {
             uint16_t n = s_msg_len;
@@ -91,16 +193,35 @@ static int32_t shell_wait(uint8_t *chan, uint8_t *buf, size_t max, uint32_t ms)
                 n = (uint16_t)max;
             }
             memcpy(buf, s_msg, n);
-            *chan = s_msg_chan;
+            if (who != NULL) {
+                *who = s_msg_who;
+            }
             s_have = false;
             return (int32_t)n;
         }
-        const uint32_t now = (uint32_t)(ag_loader_api()->time->us() / 1000u);
-        if ((uint32_t)(now - start) >= ms) {
+        if ((uint32_t)(now_ms() - start) >= ms) {
             return -AG_EAGAIN;
         }
         ag_linkprov_poll(2);
     }
+}
+
+/*
+ * An ANSWER, to whoever asked and out the wire it arrived on.
+ *
+ * The wire as well as the hash: the selected wire is where a NEW conversation
+ * goes, and this board may have several neighbours, so an answer sent without
+ * saying which wire would leave by whichever one was last selected - which on
+ * the board in the middle is the other one half the time.
+ */
+static int32_t reply_to(const link_origin_t *who, uint8_t cls, const void *buf,
+                        size_t len)
+{
+    if (who->wire >= 0) {
+        return ag_linkprov_send_to_on(who->wire, who->from, who->chan, cls, buf,
+                                      len);
+    }
+    return ag_linkprov_send_to(who->from, who->chan, cls, buf, len);
 }
 
 static void print_stats(void)
@@ -119,6 +240,27 @@ static void print_stats(void)
      */
     ag_console_printf("losses  %u gaps, %u duplicates, %u bad\n",
                       (unsigned)st.gaps, (unsigned)st.dups, (unsigned)st.bad);
+    /*
+     * THE TWO NUMBERS THAT WERE MISSING WHEN THIS SHIPPED, and here the words
+     * matter more than the figures.  Both were counted inside the driver while
+     * no command printed either, which is how a link that was quietly throwing
+     * messages away looked identical to a link that was working: the counter
+     * existed, so the defect was assumed to be visible, and nobody could see
+     * it.
+     *
+     * So they are printed apart and said out loud, because a reader has to be
+     * able to tell them from each other at a glance and neither from loss:
+     * refused is the peer sending it again (normal under load - the window
+     * doing its job), dropped is STREAM only and is that class working as
+     * designed.  Neither is a gap, a duplicate or a bad frame, and a reader who
+     * takes either for wire loss will look in the wrong place.
+     */
+    ag_console_printf("queue   %u refused, %u dropped\n",
+                      (unsigned)st.rx_refused, (unsigned)st.rx_dropped);
+    ag_console_puts("        refused: no room for it, so the peer sends it "
+                    "again - normal under load\n");
+    ag_console_puts("        dropped: stream only, which is never acknowledged "
+                    "- by design\n");
     ag_console_printf("acks    %u sent alone (the wire was idle and one was "
                       "owed)\n",
                       (unsigned)st.acks);
@@ -144,6 +286,8 @@ static int link_status(void)
         ag_console_puts("no link bound\n");
         ag_console_puts("  `dev` lists what is here; `link use <dev>` binds "
                         "one, and again for a second neighbour\n");
+        ag_console_puts("  a board may also be named: `link use <node>`, which "
+                        "reaches one beyond the neighbour\n");
         return 1;
     }
     const char *peer = ag_node_peer_name();
@@ -164,6 +308,24 @@ static int link_status(void)
     if (peer != NULL && strcmp(peer, ag_node_name()) == 0) {
         ag_console_printf("  both are called %s - `link name <x>` on one of "
                           "them\n", peer);
+    }
+    /*
+     * AND WHO A NEW COMMAND ACTUALLY TALKS TO.
+     *
+     * Said here because it is a standing condition that outlives the command
+     * that set it: `link use zero` leaves a board two hops away as the
+     * destination, and `link run` after it goes there rather than next door.
+     * Only when it differs from this wire's own neighbour, which is the case
+     * nobody needs told twice.
+     */
+    if (ag_linkprov_target() != 0) {
+        const int32_t cw = ag_linkprov_current();
+        const char   *np = (cw >= 0) ? ag_node_peer_name_at(cw) : NULL;
+        if (np == NULL || ag_node_hash(np) != ag_linkprov_target()) {
+            ag_console_puts("  a board beyond the neighbour is selected; "
+                            "`link nodes` marks it\n"
+                            "  `link use none` clears it\n");
+        }
     }
     /*
      * The reader's remaining stack, per wire.  Here rather than in some
@@ -188,14 +350,10 @@ static int link_status(void)
 /*
  * Answer whatever arrives, for `secs` seconds.  The other half of `ping`.
  *
- * A reply is the message with one byte in front of it, so that a node cannot
- * mistake its own echo for a request and the two nodes cannot echo at each
- * other for ever.  That is not hypothetical: the first draft echoed the message
- * unchanged and both ends bounced one message until the window filled.
+ * One message at a time, out of the mailbox, which is what the mailbox is for:
+ * an echo does not care what arrived while it was busy, and it is the ping -
+ * counting on the receive path, see s_ping_run - that has to see every answer.
  */
-#define LINK_TAG_REQ 'q'
-#define LINK_TAG_REP 'r'
-
 static int link_echo(uint32_t secs)
 {
     if (ag_linkprov_listen(LINK_CHAN_SHELL, on_shell_msg, NULL) != AG_OK) {
@@ -209,8 +367,10 @@ static int link_echo(uint32_t secs)
 
     ag_console_printf("echo: %u s, any key stops\n", (unsigned)secs);
     while (ms > 0) {
-        uint8_t       chan = 0;
-        const int32_t n = shell_wait(&chan, buf, sizeof(buf), 200);
+        link_origin_t who;
+        memset(&who, 0, sizeof(who));
+        who.wire = -1;
+        const int32_t n = shell_wait(&who, buf, sizeof(buf), 200);
         if (ms >= 200u) {
             ms -= 200u;
         } else {
@@ -228,8 +388,14 @@ static int link_echo(uint32_t secs)
         if (n <= 0 || buf[0] != (uint8_t)LINK_TAG_REQ) {
             continue;
         }
+        /*
+         * THE OTHER HALF OF `ping`, and the answer goes back to the node that
+         * asked, out the wire its question arrived on.  An echo that says "for
+         * whoever is reading" is taken by a board in between, and a ping across
+         * two hops then reports nothing answered on a wire that is fine.
+         */
         buf[0] = (uint8_t)LINK_TAG_REP;
-        if (ag_linkprov_send(chan, AG_LINK_CONTROL, buf, (size_t)n) > 0) {
+        if (reply_to(&who, AG_LINK_CONTROL, buf, (size_t)n) > 0) {
             answered++;
         }
     }
@@ -251,7 +417,17 @@ static int link_echo(uint32_t secs)
  * STREAM is UNRELIABLE by design: unsequenced, unacknowledged, dropped rather
  * than queued when the wire is behind.  So the pass mark for it is not "all of
  * them" - it is "most of them, and the ones that came are whole".
+ *
+ * WHAT IS MEASURED, and it is a ROUND TRIP: one exchange is this end's shell
+ * sending a request, the far end's shell reading it and answering, and the
+ * answer coming back.  The number below is therefore exchanges per second, and
+ * half of it is not a one-way latency - it contains both wires and both ends'
+ * shells.  The caveat is printed with the number for that reason: a figure
+ * whose halves are both counted once reads exactly like a one-way time, and the
+ * difference between them is a factor of two in whatever is sized from it.
  */
+#define LINK_PING_STALL_MS 2000u
+
 static int link_ping(uint32_t count, uint8_t cls)
 {
     if (ag_linkprov_listen(LINK_CHAN_SHELL, on_shell_msg, NULL) != AG_OK) {
@@ -259,27 +435,61 @@ static int link_ping(uint32_t count, uint8_t cls)
         return 1;
     }
 
-    uint8_t  out[64];
-    uint8_t  in[LINK_MSG_MAX + 1];
-    uint32_t got = 0;
+    /*
+     * The request is the same message every time, so it is built once: the run
+     * number is what tells this command's answers from anything else's, and the
+     * width is fixed so that the exchange size printed with the rate is one
+     * number rather than one per message.
+     */
+    uint8_t        out[64];
+    const uint32_t run = ++s_ping_next; /* never 0: zero means "not armed" */
+    const int plen = snprintf((char *)out + 1, sizeof(out) - 1,
+                              "ping %05u", (unsigned)run);
+    if (plen < 1 || (size_t)plen + 2u > sizeof(out)) {
+        ag_console_puts("ping: cannot build the request\n");
+        return 1;
+    }
+    out[0] = (uint8_t)LINK_TAG_REQ;
+    const uint32_t bytes = (uint32_t)plen + 1u; /* the tag, then the text */
 
-    ag_console_printf("ping: %u messages on %s\n", (unsigned)count,
+    /*
+     * ARMED, and armed in this order: disarm, clear, arm.  The reader task
+     * counts only when the armed run matches the one in the message, and the
+     * new run number has never been sent, so an increment racing this cannot
+     * land on the fresh count.
+     */
+    s_ping_run = 0u;
+    s_ping_got = 0u;
+    s_ping_run = run;
+
+    ag_console_printf("ping: %u messages on %s, %u bytes each way\n",
+                      (unsigned)count,
                       (cls == AG_LINK_STREAM)  ? "stream"
                       : (cls == AG_LINK_BULK) ? "bulk"
-                                              : "control");
-    for (uint32_t i = 0; i < count; i++) {
-        const int len =
-            snprintf((char *)out + 1, sizeof(out) - 1, "ping %u", (unsigned)i);
-        out[0] = (uint8_t)LINK_TAG_REQ;
+                                              : "control",
+                      (unsigned)bytes);
 
+    const uint32_t start = now_ms();
+    uint32_t       sent = 0;
+    uint32_t       seen = 0;      /* what the count was when we last looked  */
+    uint32_t       moved = 0;     /* when it last moved - the stall clock    */
+    bool           stopped = false;
+
+    for (uint32_t i = 0; i < count; i++) {
         /*
          * A full window is back-pressure, not a failure: pump and try again.
          * Bounded, because a link whose far end has gone away would otherwise
          * spin here for ever and look like a hung shell.
          */
+        /*
+         * A NEW conversation, so it is addressed to the node `link use` last
+         * named - which makes a ping a two-hop test: with a far leaf selected,
+         * the request is relayed by the board in between and the answer below
+         * is addressed straight back here.
+         */
         int32_t s = -AG_EAGAIN;
         for (int t = 0; t < 200 && s == -AG_EAGAIN; t++) {
-            s = ag_linkprov_send(LINK_CHAN_SHELL, cls, out, (size_t)len + 1u);
+            s = ag_linkprov_send(LINK_CHAN_SHELL, cls, out, bytes);
             if (s == -AG_EAGAIN) {
                 ag_linkprov_poll(5);
             }
@@ -288,17 +498,71 @@ static int link_ping(uint32_t count, uint8_t cls)
             ag_console_printf("send %u: %d\n", (unsigned)i, (int)s);
             break;
         }
-
-        uint8_t       chan = 0;
-        const int32_t n = shell_wait(&chan, in, sizeof(in), 2000);
-        if (n > 0 && in[0] == (uint8_t)LINK_TAG_REP) {
-            got++;
+        sent++;
+        if (sent == 1u) {
+            moved = now_ms(); /* the stall clock starts with the first question */
         }
-        if (ag_console_getch(0) >= 0) {
+
+        /*
+         * ONE EXCHANGE OUTSTANDING, and that is this instrument measuring the
+         * wire rather than the far end's shell: `link echo` keeps one request
+         * in its mailbox and answers them one at a time, so a burst of `count`
+         * requests would overflow that mailbox and the missing answers would be
+         * that mailbox's fault - the same mistake as the one being fixed, one
+         * board along.  Waiting for this answer is also what makes the elapsed
+         * time a round trip.
+         *
+         * The wait is for the COUNT, not for a message in the mailbox, so
+         * nothing that arrives is lost on the way to the total.
+         */
+        while (s_ping_got < sent) {
+            const uint32_t now = now_ms();
+            if (s_ping_got != seen) {
+                seen = s_ping_got;
+                moved = now;
+            }
+            if ((uint32_t)(now - moved) >= LINK_PING_STALL_MS) {
+                stopped = true;
+                break;
+            }
+            if (ag_console_getch(0) >= 0) {
+                stopped = true;
+                break;
+            }
+            ag_linkprov_poll(2);
+        }
+        if (stopped) {
             break;
         }
     }
-    ag_console_printf("%u of %u came back\n", (unsigned)got, (unsigned)count);
+
+    /*
+     * Disarmed BEFORE the count is read, so the number printed is the number
+     * this run ended with: an answer still in flight is no longer this
+     * command's, and cannot be the next one's either - it carries this run.
+     */
+    s_ping_run = 0u;
+    const uint32_t got = s_ping_got;
+
+    uint32_t ms = (uint32_t)(now_ms() - start);
+    if (ms == 0u) {
+        ms = 1u; /* a run can be shorter than the clock; the rate is not 0/0 */
+    }
+
+    /*
+     * THE NUMBER, SAID AS A RATE AND WITH THE EXCHANGE SIZE BESIDE IT.  A tally
+     * on its own says nothing about the link: exchanges per second over 11-byte
+     * messages and over 240-byte ones are different measurements, and elapsed
+     * time is the other half of what makes a count readable.
+     */
+    ag_console_printf("%u of %u came back in %u ms - %u exchanges/s, %u B "
+                      "each way\n",
+                      (unsigned)got, (unsigned)count, (unsigned)ms,
+                      (unsigned)(((uint64_t)got * 1000u) / ms),
+                      (unsigned)bytes);
+    ag_console_puts("  round trip: question, far shell, answer - not a one-way "
+                    "time, do not halve it\n");
+
     print_stats();
     /*
      * An unreliable class is not failed for being unreliable.  Losing one is
@@ -349,7 +613,7 @@ int ag_cmd_link(int argc, char **argv)
 
     if (ag_path_icmp(argv[1], "use") == 0) {
         if (argc < 3) {
-            ag_console_puts("usage: link use <dev>|none\n");
+            ag_console_puts("usage: link use <dev>|none|<node>\n");
             return 1;
         }
         /*
@@ -362,11 +626,106 @@ int ag_cmd_link(int argc, char **argv)
                             "says so; set it to yes to join one\n");
             return 1;
         }
-        const ag_err_t err = ag_node_bind(argv[2], true);
+
+        /*
+         * THREE FORMS, AND THE THIRD ONE IS NEW.
+         *
+         *   none         let the selected wire go and forget who was named
+         *   nodeN        a wire device: bind it, and talk to ITS neighbour
+         *   <node>       a board by name, which need not be a neighbour
+         *
+         * A NAME IS TWO FACTS.  A board two hops away is reached THROUGH the
+         * neighbour that told us about it, so the wire has to be selected - the
+         * first hop - AND the frame has to say which node it is for, so that
+         * the board in between passes it on instead of taking it.  `link use
+         * zero` used to do only the first, and every frame after it said "for
+         * whoever is reading", which the middle board is.
+         *
+         * The target is CLEARED for a wire and for `none`, and that is not
+         * tidiness: without it, a far node named a moment ago would still be
+         * the destination of the next `link run`, sent out a wire that does not
+         * reach it.
+         */
+        const char *want = argv[2];
+
+        if (ag_path_icmp(want, "none") == 0) {
+            const ag_err_t err = ag_node_bind(want, true);
+            if (err != AG_OK) {
+                ag_console_printf("link use %s: %d\n", want, (int)err);
+                return 1;
+            }
+            ag_linkprov_set_target(0);
+            ag_console_printf("link is %s\n", ag_linkprov_active());
+            ag_console_puts("  nothing named: commands go to the neighbour in "
+                            "hand\n");
+            return 0;
+        }
+
+        /* The wire, if the word is one of ours: `node0` is what `dev` lists
+         * and what a script already knows. */
+        int32_t wire = ag_linkprov_index_of(want);
+        bool    far = false;
+
+        /* Otherwise a neighbour's node name - what the board calls itself,
+         * which is the identity that survives a reboot and a re-cable. */
+        if (wire < 0) {
+            for (int32_t w = 0; w < (int32_t)AG_LINK_WIRES && wire < 0; w++) {
+                const char *peer = ag_node_peer_name_at(w);
+                if (peer != NULL && peer[0] != '\0' &&
+                    ag_path_icmp(peer, want) == 0) {
+                    wire = w;
+                }
+            }
+        }
+
+        /* And finally a board beyond them, which the cluster transport heard
+         * about from a neighbour and which names the wire it is heard through
+         * (see ag_clu_peers_seen).  That wire index is THIS board's - the
+         * sender's indices would name a different board here. */
+        if (wire < 0 && ag_clu_api_table.peers_seen != NULL) {
+            ag_clu_node_t  seen[AG_LINK_WIRES * 2u];
+            int32_t        via[AG_LINK_WIRES * 2u];
+            const uint32_t scap = (uint32_t)(sizeof(seen) / sizeof(seen[0]));
+            const int32_t  m = ag_clu_api_table.peers_seen(seen, via, scap);
+            for (int32_t i = 0; i < m && (uint32_t)i < scap; i++) {
+                if (via[i] >= 0 && ag_path_icmp(seen[i].name, want) == 0) {
+                    wire = via[i];
+                    far = true;
+                    break;
+                }
+            }
+        }
+
+        /*
+         * Bind or select the wire.  A word that is none of the above is still
+         * given to the binder, because a link device that is not bound yet
+         * answers to its own name and nothing here can tell it from a node
+         * name that has not been learned.
+         */
+        const char *dev = (wire >= 0) ? ag_linkprov_name_at(wire) : want;
+        if (dev == NULL) {
+            dev = want; /* the wire went between the lookup and here */
+        }
+        const ag_err_t err = ag_node_bind(dev, true);
         if (err != AG_OK) {
-            ag_console_printf("link use %s: %d\n", argv[2], (int)err);
+            ag_console_printf("link use %s: %d\n", dev, (int)err);
             return 1;
         }
+        wire = ag_linkprov_index_of(dev);
+
+        /*
+         * WHO THE NEXT NEW CONVERSATION IS FOR.  A neighbour, by its own name
+         * hash - 0 there would mean the same thing today, but the hash keeps
+         * meaning it after another wire is selected.  A far node, by ITS hash,
+         * which is the whole of what makes the relay pass the frame on.
+         */
+        uint16_t target = 0;
+        if (wire >= 0) {
+            target = far ? ag_node_hash(want)
+                         : ag_node_hash(ag_node_peer_name_at(wire));
+        }
+        ag_linkprov_set_target(target);
+
         /*
          * Say how many wires this board now holds, because `link use` stopped
          * meaning "instead of" and started meaning "as well as" the moment a
@@ -380,6 +739,24 @@ int ag_cmd_link(int argc, char **argv)
                               ag_linkprov_active(), (int)wires);
         } else {
             ag_console_printf("link is %s\n", ag_linkprov_active());
+        }
+        /*
+         * And WHICH BOARD the next command talks to, in a sentence rather than
+         * a count: "the link is node0" no longer says it, now that a board two
+         * hops away can be named through that wire.
+         */
+        if (far) {
+            const char *via = (wire >= 0) ? ag_node_peer_name_at(wire) : NULL;
+            ag_console_printf("  next command goes to %s, through %s\n", want,
+                              (via != NULL && via[0] != '\0')
+                                  ? via
+                                  : ag_linkprov_active());
+        } else if (target != 0) {
+            const char *peer = ag_node_peer_name_at(wire);
+            ag_console_printf("  next command goes to %s\n", peer);
+        } else {
+            ag_console_puts("  the neighbour has not said its name yet; "
+                            "commands go to whoever is on that wire\n");
         }
         return 0;
     }
@@ -454,18 +831,94 @@ int ag_cmd_link(int argc, char **argv)
         const int32_t cap = (int32_t)(sizeof(nodes) / sizeof(nodes[0]));
         const int32_t n = ag_clu_api_table.nodes(nodes, (uint32_t)cap);
         uint32_t      cores = 0;
+        /*
+         * WHICH ONE A NEW COMMAND WOULD TALK TO, marked as it is listed.
+         *
+         * By the target hash rather than by the wire, because that is what an
+         * outgoing frame carries: `link use cyd` names a board, and the mark
+         * has to be on the board, not on the wire it happens to be reached
+         * through.  ag_node_hash() of a name is what the link layer stamps.
+         */
+        const uint16_t sel = ag_linkprov_target();
         for (int32_t i = 0; i < n && i < cap; i++) {
-            ag_console_printf("%-9s %u core%s  %u thread%s%s\n", nodes[i].name,
-                              (unsigned)nodes[i].cores,
+            const bool chosen =
+                (sel != 0) && (ag_node_hash(nodes[i].name) == sel);
+            ag_console_printf("%-9s %u core%s  %u thread%s%s%s\n",
+                              nodes[i].name, (unsigned)nodes[i].cores,
                               (nodes[i].cores == 1) ? "" : "s",
                               (unsigned)nodes[i].threads,
                               (nodes[i].threads == 1) ? "" : "s",
-                              nodes[i].here ? "  (here)" : "");
+                              nodes[i].here ? "  (here)" : "",
+                              chosen ? "  (selected)" : "");
             cores += nodes[i].cores;
         }
         ag_console_printf("%d node%s, %u core%s in all\n", (int)n,
                           (n == 1) ? "" : "s", (unsigned)cores,
                           (cores == 1) ? "" : "s");
+
+        /*
+         * AND WHAT IS BEYOND THEM.
+         *
+         * A leaf holds one wire and therefore one neighbour, so the list above
+         * says "only me and the one next door" while a third board is running
+         * two hops away.  The middle knows, and says so - net/nodeclu.c sends
+         * each neighbour the names it knows - and this is where an operator
+         * reads it.
+         *
+         * USABLE BY NAME, which is what changed: a frame carries a destination
+         * now, so `link use <name>` selects the wire that reaches the board in
+         * between AND addresses the far board itself, and the request is
+         * relayed.  Still NOT counted with the ones above, because that list is
+         * the wires this board holds and the job layer picks a node from it: a
+         * thread placed "on" a far board through the neighbour's index would
+         * land on the neighbour.
+         */
+        if (ag_clu_api_table.peers_seen != NULL) {
+            ag_clu_node_t seen[AG_LINK_WIRES * 2u];
+            int32_t       via[AG_LINK_WIRES * 2u];
+            const uint32_t scap =
+                (uint32_t)(sizeof(seen) / sizeof(seen[0]));
+            const int32_t m = ag_clu_api_table.peers_seen(seen, via, scap);
+            if (m > 0) {
+                ag_console_puts("beyond them, seen through a neighbour "
+                                "(`link use <name>` talks to one):\n");
+                for (int32_t i = 0; i < m && (uint32_t)i < scap; i++) {
+                    const char *far = (via[i] >= 0)
+                                          ? ag_node_peer_name_at(via[i])
+                                          : NULL;
+                    const char *wire = (via[i] >= 0)
+                                           ? ag_linkprov_name_at(via[i])
+                                           : NULL;
+                    ag_console_printf(
+                        "%-9s %u core%s  via %s%s\n", seen[i].name,
+                        (unsigned)seen[i].cores,
+                        (seen[i].cores == 1) ? "" : "s",
+                        (far != NULL && far[0] != '\0')
+                            ? far
+                            : ((wire != NULL) ? wire : "?"),
+                        ((sel != 0) &&
+                         (ag_node_hash(seen[i].name) == sel))
+                            ? "  (selected)"
+                            : "");
+                }
+            }
+        }
+
+        /*
+         * AND THE WORD THAT CHANGES IT, in one line, because the mark above is
+         * what a reader sees and this is what a reader types.  `none` is said
+         * too: leaving a far node selected is the state that surprises, since
+         * the next `link run` would then go two hops away.
+         */
+        if (sel == 0) {
+            ag_console_puts("nothing selected: commands go to the neighbour in "
+                            "hand\n  `link use <name>` names one; `link use "
+                            "none` also clears it\n");
+        } else {
+            ag_console_puts("the marked node is what a new command talks to\n"
+                            "  `link use <name>|nodeN` changes it; `link use "
+                            "none` clears it\n");
+        }
 
         ag_link_info_t info;
         if (ag_linkprov_info(&info) == AG_OK) {
@@ -653,7 +1106,7 @@ int ag_cmd_link(int argc, char **argv)
         return link_status();
     }
 
-    ag_console_puts("usage: link [use <dev>|none | drop <dev> | "
+    ag_console_puts("usage: link [use <dev>|none|<node> | drop <dev> | "
                     "run <path> [args] | "
                     "get <there> <here> | mount | umount | devs | nodevs | "
                     "nodes | name [x] | ping [n] [control|stream|bulk] | "

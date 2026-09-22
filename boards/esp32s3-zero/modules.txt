@@ -5,3 +5,22 @@
 # does not refuse to load - it loads and throws an illegal instruction
 # somewhere inside, which reads as a driver bug rather than the wrong image.
 NODELINK.SYS
+#
+# LINKSPI.SYS - the same link driver over a four-wire SPI cable instead of the
+# UART, and this board's own build for it.  Both ends of the cable are S3s, so
+# ONE image serves either end: [linkspi] role in SYSTEM.CFG says which end holds
+# the clock, and the driver publishes node1 by default so that it can sit beside
+# the UART's node0.
+#
+# The pins are BOARD.CFG's, not the driver's: [spi2] is sck 12, mosi 11,
+# miso 13 on this board, which are SPI2's own IOMUX pins, and the link's cs is
+# 10 (the driver's default).  The rate is [linkspi] khz, which the driver asks
+# the port for on its own chip select - BOARD.CFG's [spi2] khz is only where the
+# bus comes up before the driver does.
+#
+# LOADED BY HAND for the SPI test - `drv load c:\drv\linkspi.sys` - and
+# deliberately NOT in SYSTEM.CFG's [modules]: an image that auto-loads on a
+# board with nothing soldered to those pads would only add noise to every boot
+# log, and the UART wire is the one that has to keep answering while the new one
+# is being measured.
+LINKSPI.SYS

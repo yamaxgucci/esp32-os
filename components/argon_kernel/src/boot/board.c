@@ -83,6 +83,8 @@ static void apply_generic_defaults(void)
     s_board.sd.miso = 13;
     s_board.sd.cs = 10;
     s_board.sd.spi_host = 2; /* SPI2, as the datasheet numbers it */
+    /* Off unless a board asks for it: see ag_board_sd_t.cs_hold. */
+    s_board.sd.cs_hold = AG_PIN_NONE;
 
     /*
      * Buses start unwired, and they stay that way until BOARD.CFG says
@@ -100,6 +102,9 @@ static void apply_generic_defaults(void)
         s_board.spi[i].mosi = AG_PIN_NONE;
         s_board.spi[i].miso = AG_PIN_NONE;
         s_board.spi[i].khz = 1000;
+        /* Leave the pad drive as the chip came up with it: this is an
+         * electrical choice for one board's wiring, not a default. */
+        s_board.spi[i].drive = -1;
     }
     for (int i = 0; i < AG_UART_PORTS; i++) {
         s_board.uart[i].tx = AG_PIN_NONE;
@@ -201,6 +206,18 @@ static void apply_bus_config(const ag_cfg_t *cfg)
         bus->miso = cfg_pin(cfg, key, bus->miso);
         snprintf(key, sizeof(key), "spi%d.khz", chip);
         bus->khz = cfg_rate(cfg, key, bus->khz, 80000);
+        /*
+         * 0..3 is the whole range a chip's pad driver has; -1 and "absent" both
+         * mean leave it as it is.  A number outside that is not a strength and
+         * is refused rather than clamped: a board that wrote 7 meant something
+         * this file does not say, and quietly driving the pins at some other
+         * strength is how that goes unnoticed.
+         */
+        snprintf(key, sizeof(key), "spi%d.drive", chip);
+        const int32_t drive = ag_cfg_get_int(cfg, key, bus->drive);
+        if (drive >= -1 && drive <= 3) {
+            bus->drive = (int8_t)drive;
+        }
     }
 
     /*
@@ -300,6 +317,14 @@ ag_err_t ag_board_apply_config(const ag_cfg_t *cfg)
     s_board.sd.mosi = cfg_pin(cfg, "sd.mosi", s_board.sd.mosi);
     s_board.sd.miso = cfg_pin(cfg, "sd.miso", s_board.sd.miso);
     s_board.sd.cs = cfg_pin(cfg, "sd.cs", s_board.sd.cs);
+    /*
+     * The pin that has to be held high for the card to be readable on a board
+     * where the panel's chip select and the card's share a bus.  It is read
+     * like every other pin, so a board without this arrangement leaves it at
+     * AG_PIN_NONE and the port drives nothing; see ag_board_sd_t.cs_hold for
+     * the measurement behind it.
+     */
+    s_board.sd.cs_hold = cfg_pin(cfg, "sd.cs_hold", s_board.sd.cs_hold);
     s_board.sd.card_detect = cfg_pin(cfg, "sd.card_detect",
                                      s_board.sd.card_detect);
 

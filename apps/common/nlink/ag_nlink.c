@@ -94,9 +94,15 @@ void ag_nlink_pack(uint8_t out[NL_HDR_SIZE], ag_nlink_hdr_t *h)
     put_u16(out + 10, h->ack);
     put_u16(out + 12, h->credit);
     put_u16(out + 14, h->len);
+    put_u16(out + 16, h->dst);
+    put_u16(out + 18, h->src);
 
-    h->crc = ag_nlink_crc32(0, out, 16u);
-    put_u32(out + 16, h->crc);
+    /* The twenty bytes before the CRC, which is now the twenty that carry a
+     * destination and a source as well as the fields that were always here.
+     * The range is a constant in two places and both are in this file, which
+     * is the only reason it can be one. */
+    h->crc = ag_nlink_crc32(0, out, 20u);
+    put_u32(out + 20, h->crc);
 }
 
 bool ag_nlink_unpack(ag_nlink_hdr_t *h, const uint8_t in[NL_HDR_SIZE])
@@ -120,8 +126,12 @@ bool ag_nlink_unpack(ag_nlink_hdr_t *h, const uint8_t in[NL_HDR_SIZE])
      * bytes off a wire.  A single CRC over header and payload could not: it
      * would need the payload first, and how much payload there is is the very
      * field in question.
+     *
+     * Twenty bytes and not sixteen: dst and src are inside the range, so a
+     * frame whose addressing was corrupted in flight is refused here rather
+     * than relayed to the wrong board or believed to be for this one.
      */
-    if (ag_nlink_crc32(0, in, 16u) != get_u32(in + 16)) {
+    if (ag_nlink_crc32(0, in, 20u) != get_u32(in + 20)) {
         return false;
     }
     h->magic = NL_MAGIC;
@@ -133,7 +143,9 @@ bool ag_nlink_unpack(ag_nlink_hdr_t *h, const uint8_t in[NL_HDR_SIZE])
     h->ack = get_u16(in + 10);
     h->credit = get_u16(in + 12);
     h->len = len;
-    h->crc = get_u32(in + 16);
+    h->dst = get_u16(in + 16);
+    h->src = get_u16(in + 18);
+    h->crc = get_u32(in + 20);
     return true;
 }
 
@@ -280,8 +292,8 @@ bool ag_nlink_tx_room(const ag_nlink_tx_t *tx)
     return tx->count < tx->cap;
 }
 
-bool ag_nlink_tx_queue(ag_nlink_tx_t *tx, uint8_t chan, const void *data,
-                       uint16_t len, bool eom)
+bool ag_nlink_tx_queue(ag_nlink_tx_t *tx, uint8_t chan, uint16_t dst,
+                       uint16_t src, const void *data, uint16_t len, bool eom)
 {
     if (len > NL_QUANTUM || tx->count >= tx->cap) {
         return false;
@@ -290,6 +302,8 @@ bool ag_nlink_tx_queue(ag_nlink_tx_t *tx, uint8_t chan, const void *data,
     s->seq = tx->next_seq++;
     s->len = len;
     s->chan = chan;
+    s->dst = dst;
+    s->src = src;
     s->flags = (uint8_t)(NL_F_PSUM | (eom ? NL_F_EOM : 0u));
     s->sent = false;
     s->sent_ms = 0;

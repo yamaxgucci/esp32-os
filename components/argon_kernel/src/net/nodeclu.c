@@ -52,6 +52,18 @@ typedef struct {
     char         entry[AG_CLU_ENTRY_MAX];
     uint8_t      arg[AG_CLU_ARG_MAX];
     uint32_t     arglen;
+    /*
+     * WHO ASKED, AND ON WHICH WIRE.
+     *
+     * The answer to a spawn is sent from the serving task, not from the reader
+     * that took the request, so neither ag_linkprov_from() nor the wire in hand
+     * means anything there.  Both are remembered here, per request, at the
+     * moment the request arrives; without them the answer says "for whoever is
+     * reading" and leaves by whichever wire was last selected, and a board with
+     * more than one neighbour answers the wrong one.
+     */
+    uint16_t from;
+    int32_t  wire;
 } nc_req_t;
 
 static bool            s_listening;
@@ -59,6 +71,71 @@ static ag_port_task_t  s_task;
 static nc_req_t        s_req[NC_REQS];
 static ag_port_mutex_t s_reqlock;
 static ag_cluf_rx_t    s_rx;
+
+/*
+ * THE MASTER OF THE JOB BEING SERVED HERE, and the wire its SPAWN arrived on.
+ *
+ * A worker's own frames - a credit for room in a mailbox, a thread's exit, the
+ * end of the job - are sent from a program's task long after the spawn, where
+ * neither ag_linkprov_from() nor the wire in hand means anything.  They are
+ * answers to the board that started the job, so that board's hash and the wire
+ * it reached us on are remembered when the request arrives.  Set on the reader
+ * task; a later job replaces it, and a board that starts its OWN job clears it
+ * at its first spawn (the cluster layer refuses to be master and worker at
+ * once, so the two are never both true).
+ */
+static volatile uint16_t s_job_from;
+static volatile int32_t  s_job_wire = -1;
+
+/*
+ * WHAT IS ON THE FAR SIDE OF A NEIGHBOUR.
+ *
+ * A leaf has one wire and therefore one neighbour, so the list tr_nodes builds
+ * has exactly one entry in it - and with three boards wired in a row that
+ * answers "who is here?" with "only me and the one next door" while a third
+ * board is running two hops away.  The middle knows; this is how it says so,
+ * and how a leaf keeps what it was told.
+ *
+ * NAMES TRAVEL, NOT WIRE INDICES.  A wire index is a position in the
+ * RECEIVER's list and would name a different board on every reader; a name is
+ * the only identity a board has that means the same thing at both ends.
+ *
+ * HOPS BOUND IT.  A board tells its neighbours about its own neighbours (one
+ * hop) and about what it was told (one hop further), and never more than
+ * NC_PEERS_MAX_HOPS - which is enough for a star of any size and cannot grow a
+ * loop, because a record that would come back to its author is dropped both by
+ * the name check here and by the direct-neighbour check on arrival.
+ *
+ * THIS IS NOT ROUTING, and the table is kept out of `nodes` on purpose: a frame
+ * carries no destination yet, so work placed on a node two hops away would go
+ * to whichever neighbour is in hand.  See argon/clu.h for that argument in the
+ * place that makes the decision.
+ */
+#define NC_PEERS 4u            /* far nodes remembered at once */
+#define NC_PEERS_MS 2000u      /* how often the list is sent */
+#define NC_PEERS_TTL_MS 10000u /* silence for this long forgets one */
+#define NC_PEERS_MAX_HOPS 2u   /* told about, then told on - and no further */
+#define NC_PEER_REC_MAX 16u    /* name_len + name + cores + hops + hz  */
+/*
+ * Room for one list: this board, its other neighbours, and what it was told.
+ * Sized from the worst case rather than the bench, or the last records would
+ * fall off the end of the buffer on a board with all four wires bound.
+ */
+#define NC_PEERS_BUF (AG_CLUF_HDR + (1u + AG_LINK_WIRES + NC_PEERS) * NC_PEER_REC_MAX)
+
+typedef struct {
+    bool     used;
+    char     name[AG_NODE_NAME_MAX];
+    uint8_t  cores;
+    uint8_t  hops;
+    uint32_t cpu_hz;
+    int32_t  via;     /* MY wire index this was heard through */
+    uint32_t seen_ms; /* when a neighbour last said it, for ageing */
+} nc_peer_t;
+
+static nc_peer_t       s_peer[NC_PEERS];
+static ag_port_mutex_t s_peerlock;
+static uint32_t        s_peers_at; /* when the list last went out */
 
 /*
  * The image path, once rather than per request.
@@ -145,22 +222,62 @@ static ag_err_t wait_for_room(uint32_t deadline)
 
 static int32_t wire_of_node(int32_t node);
 
+/* The node at the far end of a wire, as the hash a frame must carry to reach
+ * it.  0 - "whoever is reading" - while the neighbour has not said its name,
+ * which reaches the same board all the same. */
+static uint16_t dst_of_wire(int32_t wire)
+{
+    return (wire < 0) ? 0 : ag_node_hash(ag_node_peer_name_at(wire));
+}
+
+/*
+ * WHERE A FRAME FOR `node` GOES: which wire it leaves by, and which node it
+ * names.  Both, and they are not the same fact - a frame for a board past the
+ * neighbour leaves by the wire that reaches it and NAMES the far board, and the
+ * board in between passes it on because of the name.
+ *
+ * A node index is this board's own (see wire_of_node), so the destination is
+ * the neighbour at that wire.  NOT ag_linkprov_target(): that names the node a
+ * new CONVERSATION is for, and a board with two neighbours can have named a far
+ * node through one of them while placing a thread on the other - sending that
+ * thread's frames to the far node's hash would have them relayed away from the
+ * board they are for.
+ *
+ * THE WORKER SIDE IS THE EXCEPTION.  The cluster layer gives the master node 1
+ * whether or not this board holds a second wire - a leaf's only neighbour is
+ * wire 0 - so on a board SERVING a job, index 1 is the board that asked and not
+ * a wire of ours.  Its address was remembered when its SPAWN arrived.
+ */
+static void route_to(int32_t node, int32_t *wire, uint16_t *dst)
+{
+    if (node == 1 && s_job_from != 0) {
+        *wire = s_job_wire;
+        *dst = s_job_from;
+        return;
+    }
+    const int32_t w = wire_of_node(node);
+    *wire = w;
+    *dst = dst_of_wire(w);
+}
+
 /*
  * `wire` is which neighbour, and -1 means THE ONE IN HAND: the wire a reply is
  * being written to, which the link layer already knows because this is running
- * on that wire's reader task.  Everything the serving side sends passes -1 and
- * so needs no routing at all; only a call that STARTS something with a named
- * node has to say where, and those all have the node index to hand.
+ * on that wire's reader task.  `dst` is who the frame is for, which for every
+ * answer is the node that asked - the board in between takes a frame that says
+ * "for whoever is reading" and the asker waits out its whole timeout.
  */
-static ag_err_t send_bytes(int32_t wire, const uint8_t *p, uint32_t total)
+static ag_err_t send_bytes(int32_t wire, uint16_t dst, const uint8_t *p,
+                           uint32_t total)
 {
     const uint32_t deadline =
         now_ms() + (ag_linkprov_in_reader() ? 100u : NC_SEND_MS);
     for (;;) {
         const int32_t r =
             (wire < 0)
-                ? ag_linkprov_send(NC_CHAN, AG_LINK_CONTROL, p, total)
-                : ag_linkprov_send_on(wire, NC_CHAN, AG_LINK_CONTROL, p, total);
+                ? ag_linkprov_send_to(dst, NC_CHAN, AG_LINK_CONTROL, p, total)
+                : ag_linkprov_send_to_on(wire, dst, NC_CHAN, AG_LINK_CONTROL,
+                                         p, total);
         if (r >= 0) {
             return AG_OK;
         }
@@ -174,7 +291,7 @@ static ag_err_t send_bytes(int32_t wire, const uint8_t *p, uint32_t total)
     }
 }
 
-static ag_err_t send_frame(int32_t wire, const ag_cluf_hdr_t *h,
+static ag_err_t send_frame(int32_t wire, uint16_t dst, const ag_cluf_hdr_t *h,
                            const void *payload)
 {
     uint8_t        buf[AG_CLUF_HDR + 64];
@@ -184,13 +301,13 @@ static ag_err_t send_frame(int32_t wire, const ag_cluf_hdr_t *h,
         return -AG_ERANGE; /* the caller must use the shared buffer instead */
     }
     (void)ag_cluf_put(buf, h, payload);
-    return send_bytes(wire, buf, total);
+    return send_bytes(wire, dst, buf, total);
 }
 
 /* The same, for a frame already built in s_txbuf (a data fragment). */
-static ag_err_t send_txbuf(int32_t wire, uint32_t total)
+static ag_err_t send_txbuf(int32_t wire, uint16_t dst, uint32_t total)
 {
-    return send_bytes(wire, s_txbuf, total);
+    return send_bytes(wire, dst, s_txbuf, total);
 }
 
 /* ---------------------------------------------------------------------- */
@@ -201,8 +318,6 @@ static ag_err_t tr_spawn(int32_t node, ag_clu_tid_t tid, const char *entry,
                          const void *arg, uint32_t len, const char *image,
                          uint32_t timeout_ms)
 {
-    const int32_t wire = wire_of_node(node);
-
     if (ag_linkprov_in_reader()) {
         /* Waiting here would wait for the task that delivers the answer. */
         return -AG_EBUSY;
@@ -210,6 +325,20 @@ static ag_err_t tr_spawn(int32_t node, ag_clu_tid_t tid, const char *entry,
     if (!ag_linkprov_bound()) {
         return -AG_ENODEV;
     }
+
+    /*
+     * A job of this board's OWN, so any memory of a job it SERVED is stale and
+     * has to go: the cluster layer refuses to be master and worker at the same
+     * time, so from here on index 1 means a wire of ours and not the board that
+     * once employed us.  Left behind, it would address this job's frames to
+     * that board.
+     */
+    s_job_from = 0;
+    s_job_wire = -1;
+
+    int32_t  wire;
+    uint16_t dst;
+    route_to(node, &wire, &dst);
 
     /* Entry, image path (which carries the far node's mount prefix), argument. */
     uint8_t body[AG_CLU_ENTRY_MAX + AG_PATH_MAX + 16u + AG_CLU_ARG_MAX];
@@ -255,7 +384,7 @@ static ag_err_t tr_spawn(int32_t node, ag_clu_tid_t tid, const char *entry,
     ag_err_t e;
     if (ag_port_mutex_take(s_tx, ag_port_ms_to_ticks(NC_SEND_MS))) {
         const uint32_t total = (uint32_t)ag_cluf_put(s_txbuf, &h, body);
-        e = send_txbuf(wire, total);
+        e = send_txbuf(wire, dst, total);
         ag_port_mutex_give(s_tx);
     } else {
         e = -AG_EBUSY;
@@ -284,11 +413,14 @@ static ag_err_t tr_spawn(int32_t node, ag_clu_tid_t tid, const char *entry,
 static ag_err_t tr_send(int32_t node, ag_clu_tid_t from, ag_clu_tid_t to,
                         const void *buf, uint32_t len)
 {
-    const int32_t wire = wire_of_node(node);
-
     if (!ag_linkprov_bound()) {
         return -AG_ENODEV;
     }
+
+    int32_t  wire;
+    uint16_t dst;
+    route_to(node, &wire, &dst);
+
     if (!ag_port_mutex_take(s_tx, ag_port_ms_to_ticks(NC_SEND_MS))) {
         return -AG_EBUSY;
     }
@@ -313,7 +445,7 @@ static ag_err_t tr_send(int32_t node, ag_clu_tid_t from, ag_clu_tid_t to,
             .c = len,
         };
         const uint32_t total = (uint32_t)ag_cluf_put(s_txbuf, &h, src + off);
-        e = send_txbuf(wire, total);
+        e = send_txbuf(wire, dst, total);
         off += take;
     } while (e == AG_OK && off < len);
 
@@ -323,26 +455,32 @@ static ag_err_t tr_send(int32_t node, ag_clu_tid_t from, ag_clu_tid_t to,
 
 static void tr_credit(int32_t node, ag_clu_tid_t tid, uint32_t n)
 {
-    const int32_t wire = wire_of_node(node);
+    int32_t  wire;
+    uint16_t dst;
+    route_to(node, &wire, &dst);
     ag_cluf_hdr_t h = { .op = AG_CLUF_CREDIT, .flags = 0, .len = 0,
                         .a = tid, .b = (int32_t)n, .c = 0 };
-    (void)send_frame(wire, &h, NULL);
+    (void)send_frame(wire, dst, &h, NULL);
 }
 
 static void tr_exited(int32_t node, ag_clu_tid_t tid)
 {
-    const int32_t wire = wire_of_node(node);
+    int32_t  wire;
+    uint16_t dst;
+    route_to(node, &wire, &dst);
     ag_cluf_hdr_t h = { .op = AG_CLUF_EXIT, .flags = 0, .len = 0,
                         .a = tid, .b = 0, .c = 0 };
-    (void)send_frame(wire, &h, NULL);
+    (void)send_frame(wire, dst, &h, NULL);
 }
 
 static void tr_end(int32_t node)
 {
-    const int32_t wire = wire_of_node(node);
+    int32_t  wire;
+    uint16_t dst;
+    route_to(node, &wire, &dst);
     ag_cluf_hdr_t h = { .op = AG_CLUF_END, .flags = 0, .len = 0,
                         .a = 0, .b = 0, .c = 0 };
-    (void)send_frame(wire, &h, NULL);
+    (void)send_frame(wire, dst, &h, NULL);
 }
 
 /*
@@ -357,6 +495,10 @@ static void tr_end(int32_t node)
  * until then it is "node0"), and a job that started before the hello landed
  * would address a node that has no name yet.  The wire is there from the
  * moment it is bound, which is earlier than anything can ask.
+ *
+ * A frame that is being SENT goes through route_to rather than through this,
+ * because on the board serving a job index 1 is the master and not a wire - see
+ * the note there.
  */
 static int32_t wire_of_node(int32_t node)
 {
@@ -374,6 +516,285 @@ static int32_t wire_of_node(int32_t node)
         seen++;
     }
     return -1;
+}
+
+/* ---------------------------------------------------------------------- */
+/* What the neighbours say about themselves                                */
+/* ---------------------------------------------------------------------- */
+
+/* True when a wire of ours reaches a board that calls itself `name`. */
+static bool name_is_direct(const char *name)
+{
+    for (int32_t i = 0; i < (int32_t)AG_LINK_WIRES; i++) {
+        if (ag_linkprov_name_at(i) == NULL) {
+            continue;
+        }
+        const char *p = ag_node_peer_name_at(i);
+        if (p != NULL && p[0] != '\0' && strcmp(p, name) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* The wire whose far end calls itself `name`, or -1. */
+static int32_t wire_of_name(const char *name)
+{
+    for (int32_t i = 0; i < (int32_t)AG_LINK_WIRES; i++) {
+        if (ag_linkprov_name_at(i) == NULL) {
+            continue;
+        }
+        const char *p = ag_node_peer_name_at(i);
+        if (p != NULL && p[0] != '\0' && strcmp(p, name) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/* One record into `buf`.  False when it does not fit or the name is unusable. */
+static bool put_peer_rec(uint8_t *buf, uint32_t cap, uint32_t *at,
+                         const char *name, uint8_t cores, uint8_t hops,
+                         uint32_t cpu_hz)
+{
+    const size_t n = strlen(name);
+    if (n == 0 || n >= AG_NODE_NAME_MAX) {
+        return false;
+    }
+    if (*at + 1u + n + 1u + 1u + 4u > cap) {
+        return false;
+    }
+    buf[(*at)++] = (uint8_t)n;
+    memcpy(buf + *at, name, n);
+    *at += (uint32_t)n;
+    buf[(*at)++] = cores;
+    buf[(*at)++] = hops;
+    buf[(*at)++] = (uint8_t)(cpu_hz & 0xffu);
+    buf[(*at)++] = (uint8_t)((cpu_hz >> 8) & 0xffu);
+    buf[(*at)++] = (uint8_t)((cpu_hz >> 16) & 0xffu);
+    buf[(*at)++] = (uint8_t)((cpu_hz >> 24) & 0xffu);
+    return true;
+}
+
+/*
+ * Tell one neighbour who else is here.
+ *
+ * The first record is THIS board, and that is not decoration: the reader has no
+ * way to ask which wire a message arrived on (the link layer answers that
+ * question only for a reply), so the sender names itself and the reader learns
+ * "through that one" from a name it already knows.
+ *
+ * `learned` is a snapshot and `buf` belongs to the caller, so no send happens
+ * while s_peerlock is held: a send waits for room on a busy wire, and the reader
+ * task - which learns on the same lock - must not be made to wait behind it.
+ */
+static void send_peers(int32_t wire, uint32_t now, const nc_peer_t *learned,
+                       uint8_t *buf)
+{
+    const char *me = ag_node_name();
+    const char *towards = ag_node_peer_name_at(wire);
+    const uint32_t cap = NC_PEERS_BUF - AG_CLUF_HDR;
+    uint32_t       at = 0;
+
+    if (me == NULL || me[0] == '\0') {
+        return;
+    }
+    (void)put_peer_rec(buf + AG_CLUF_HDR, cap, &at, me, 0u, 0u, 0u);
+
+    /* My other neighbours: one hop from whoever is reading this. */
+    for (int32_t i = 0; i < (int32_t)AG_LINK_WIRES; i++) {
+        if (i == wire || ag_linkprov_name_at(i) == NULL) {
+            continue;
+        }
+        const char *n = ag_node_peer_name_at(i);
+        if (n == NULL || n[0] == '\0' || strcmp(n, me) == 0) {
+            continue;
+        }
+        (void)put_peer_rec(buf + AG_CLUF_HDR, cap, &at, n,
+                           ag_node_peer_cores_at(i), 1u,
+                           ag_node_peer_cpu_hz_at(i));
+    }
+
+    /* And what I was told, one hop further out. */
+    for (uint32_t k = 0; k < NC_PEERS; k++) {
+        const nc_peer_t *p = &learned[k];
+        if (!p->used || p->hops >= NC_PEERS_MAX_HOPS) {
+            continue;
+        }
+        if ((uint32_t)(now - p->seen_ms) > NC_PEERS_TTL_MS) {
+            continue;
+        }
+        if (towards != NULL && strcmp(p->name, towards) == 0) {
+            continue; /* the one being told; it knows itself */
+        }
+        if (name_is_direct(p->name)) {
+            continue; /* a wire of ours appeared; it is told as a neighbour */
+        }
+        (void)put_peer_rec(buf + AG_CLUF_HDR, cap, &at, p->name, p->cores,
+                           (uint8_t)(p->hops + 1u), p->cpu_hz);
+    }
+
+    const ag_cluf_hdr_t h = { .op = AG_CLUF_PEERS, .flags = 0,
+                              .len = (uint16_t)at, .a = 0, .b = 0, .c = 0 };
+    (void)ag_cluf_put(buf, &h, NULL); /* the records are already there */
+    /* The neighbour at the end of this wire, by name: a list poured at whoever
+     * is reading would be taken as ITS list by a board in between. */
+    (void)send_bytes(wire, dst_of_wire(wire), buf, AG_CLUF_HDR + at);
+}
+
+/* The timer, and every bound wire.  Called from the transport's own task. */
+static void peers_tick(void)
+{
+    if (s_peerlock == NULL) {
+        return;
+    }
+    const uint32_t now = now_ms();
+    if ((uint32_t)(now - s_peers_at) < NC_PEERS_MS) {
+        return;
+    }
+    s_peers_at = now;
+
+    nc_peer_t snap[NC_PEERS];
+    uint8_t   buf[NC_PEERS_BUF];
+
+    ag_port_mutex_take(s_peerlock, AG_PORT_FOREVER);
+    memcpy(snap, s_peer, sizeof(snap));
+    ag_port_mutex_give(s_peerlock);
+
+    for (int32_t i = 0; i < (int32_t)AG_LINK_WIRES; i++) {
+        if (ag_linkprov_name_at(i) != NULL) {
+            send_peers(i, now, snap, buf);
+        }
+    }
+}
+
+/* A neighbour's list arrived.  Runs on the link's reader task. */
+static void peers_learn(const uint8_t *body, uint32_t len)
+{
+    const char *me = ag_node_name();
+    const uint32_t now = now_ms();
+    bool     have_via = false;
+    int32_t  via = -1;
+    uint32_t at = 0;
+
+    while (at + 2u <= len) {
+        const uint32_t n = body[at++];
+        if (n == 0 || n >= AG_NODE_NAME_MAX || at + n + 6u > len) {
+            return; /* a record that does not fit: whole ones before it stand */
+        }
+        char name[AG_NODE_NAME_MAX];
+        memcpy(name, body + at, n);
+        name[n] = '\0';
+        at += n;
+        const uint8_t cores = body[at++];
+        const uint8_t hops = body[at++];
+        const uint32_t hz = (uint32_t)body[at] |
+                            ((uint32_t)body[at + 1] << 8) |
+                            ((uint32_t)body[at + 2] << 16) |
+                            ((uint32_t)body[at + 3] << 24);
+        at += 4u;
+
+        if (!have_via) {
+            /*
+             * The first record is the sender.  If it is not a board a wire of
+             * ours reaches, this frame did not come from a neighbour and is
+             * dropped whole: there would be nowhere to say "through" it, and a
+             * node nobody can point at is worse than one not shown.
+             */
+            via = wire_of_name(name);
+            if (via < 0) {
+                return;
+            }
+            have_via = true;
+            continue;
+        }
+        if (me != NULL && strcmp(name, me) == 0) {
+            continue; /* my own name coming home */
+        }
+        if (hops == 0u || hops > NC_PEERS_MAX_HOPS) {
+            continue;
+        }
+        if (name_is_direct(name)) {
+            continue; /* a wire of ours beats hearsay */
+        }
+        if (s_peerlock == NULL) {
+            return;
+        }
+
+        ag_port_mutex_take(s_peerlock, AG_PORT_FOREVER);
+        uint32_t slot = NC_PEERS;
+        for (uint32_t k = 0; k < NC_PEERS; k++) {
+            if (s_peer[k].used && strcmp(s_peer[k].name, name) == 0) {
+                slot = k;
+                break;
+            }
+        }
+        for (uint32_t k = 0; slot == NC_PEERS && k < NC_PEERS; k++) {
+            if (!s_peer[k].used) {
+                slot = k;
+            }
+        }
+        if (slot == NC_PEERS) {
+            /* Full.  The oldest goes, so a board that left is the one lost. */
+            uint32_t oldest = 0;
+            for (uint32_t k = 1; k < NC_PEERS; k++) {
+                if ((uint32_t)(now - s_peer[k].seen_ms) >
+                    (uint32_t)(now - s_peer[oldest].seen_ms)) {
+                    oldest = k;
+                }
+            }
+            slot = oldest;
+        }
+        nc_peer_t *p = &s_peer[slot];
+        memset(p, 0, sizeof(*p));
+        snprintf(p->name, sizeof(p->name), "%s", name);
+        p->used = true;
+        p->cores = cores;
+        p->hops = hops;
+        p->cpu_hz = hz;
+        p->via = via;
+        p->seen_ms = now;
+        ag_port_mutex_give(s_peerlock);
+    }
+}
+
+/*
+ * What an operator is shown: the far side of a neighbour, with the wire it is
+ * seen through.  Deliberately NOT part of tr_nodes - see argon/clu.h.
+ */
+static int32_t tr_peers_seen(ag_clu_node_t *out, int32_t *via, uint32_t max)
+{
+    if (s_peerlock == NULL) {
+        return 0;
+    }
+    const uint32_t now = now_ms();
+    int32_t        n = 0;
+
+    ag_port_mutex_take(s_peerlock, AG_PORT_FOREVER);
+    for (uint32_t k = 0; k < NC_PEERS; k++) {
+        const nc_peer_t *p = &s_peer[k];
+        if (!p->used || (uint32_t)(now - p->seen_ms) > NC_PEERS_TTL_MS) {
+            continue;
+        }
+        if (name_is_direct(p->name)) {
+            continue; /* it became a neighbour of ours in the meantime */
+        }
+        if (out == NULL || (uint32_t)n >= max) {
+            n++;
+            continue;
+        }
+        memset(&out[n], 0, sizeof(out[n]));
+        snprintf(out[n].name, sizeof(out[n].name), "%s", p->name);
+        out[n].cores = (p->cores > 0) ? p->cores : 1u;
+        out[n].cpu_hz = p->cpu_hz;
+        out[n].here = 0;
+        if (via != NULL) {
+            via[n] = p->via;
+        }
+        n++;
+    }
+    ag_port_mutex_give(s_peerlock);
+    return n;
 }
 
 static int32_t tr_nodes(ag_clu_node_t *out, uint32_t max)
@@ -409,6 +830,7 @@ static const ag_clu_transport_t k_transport = {
     .exited = tr_exited,
     .end = tr_end,
     .nodes = tr_nodes,
+    .peers_seen = tr_peers_seen,
 };
 
 /* ---------------------------------------------------------------------- */
@@ -467,9 +889,18 @@ static void serve_task(void *arg)
                 ag_log(AG_LOG_WARN, "clu", "cannot run '%s' here: %d",
                        req.entry, (int)e);
             }
+            /*
+             * THE ANSWER GOES BACK TO WHOEVER ASKED, out of the wire their
+             * request arrived on - both remembered in the slot, because this is
+             * not the reader task and neither ag_linkprov_from() nor the wire in
+             * hand means anything here.  On the board in the middle, the
+             * selected wire is the other neighbour half the time, and a
+             * spawn acknowledgement that leaves by it is a job that never
+             * starts anywhere.
+             */
             ag_cluf_hdr_t h = { .op = AG_CLUF_SPAWN_OK, .flags = 0, .len = 0,
                                 .a = req.tid, .b = (int32_t)e, .c = 0 };
-            (void)send_frame(-1, &h, NULL);
+            (void)send_frame(req.wire, req.from, &h, NULL);
 
             ag_port_mutex_take(s_reqlock, AG_PORT_FOREVER);
             s_req[i].used = false;
@@ -498,6 +929,14 @@ static void serve_task(void *arg)
             ag_clu_job_end();
         }
 
+        /*
+         * And what the neighbours should know about each other.  From here
+         * rather than from the reader: putting a frame on a wire blocks while
+         * the link's window is full, and a reader stopped there hears nothing
+         * at all - including the acknowledgement that would empty the window.
+         */
+        peers_tick();
+
         ag_port_task_delay(ag_port_ms_to_ticks(20));
     }
 }
@@ -520,6 +959,16 @@ static int32_t take_string(const uint8_t *body, uint32_t len, uint32_t at,
 
 static void serve_spawn(const ag_cluf_hdr_t *h, const uint8_t *body)
 {
+    /*
+     * WHO ASKED AND ON WHICH WIRE, taken first because this runs on the reader
+     * task and these are the two facts it alone can answer.  They are kept in
+     * the slot for the serving task, which answers the spawn, and in s_job_* for
+     * every frame of the job afterwards - a worker's own frames are sent from a
+     * program's task, where neither is available.
+     */
+    const uint16_t from = ag_linkprov_from();
+    const int32_t  wire = ag_linkprov_current();
+
     ag_port_mutex_take(s_reqlock, AG_PORT_FOREVER);
 
     nc_req_t *r = NULL;
@@ -551,8 +1000,12 @@ static void serve_spawn(const ag_cluf_hdr_t *h, const uint8_t *body)
                 r->arglen = arglen;
             }
             r->tid = h->a;
+            r->from = from;
+            r->wire = wire;
             r->taken = false;
             r->used = true;
+            s_job_from = from;
+            s_job_wire = wire;
             ag_port_mutex_give(s_reqlock);
             return;
         }
@@ -562,11 +1015,12 @@ static void serve_spawn(const ag_cluf_hdr_t *h, const uint8_t *body)
     /*
      * Answered here, on the reader task, and it is the one send from this
      * handler - short, and the alternative is a spawn that gets no answer at
-     * all until the far end's twenty-second timeout.
+     * all until the far end's twenty-second timeout.  Addressed to the node
+     * that asked, which is not necessarily the one at the end of this wire.
      */
     ag_cluf_hdr_t no = { .op = AG_CLUF_SPAWN_OK, .flags = 0, .len = 0,
                          .a = h->a, .b = (int32_t)why, .c = 0 };
-    (void)send_frame(-1, &no, NULL);
+    (void)send_frame(wire, from, &no, NULL);
 }
 
 /*
@@ -627,6 +1081,10 @@ static void on_msg(uint8_t chan, const void *data, uint16_t n, void *ctx)
         ag_clu_job_end();
         break;
 
+    case AG_CLUF_PEERS:
+        peers_learn(body, (uint32_t)h.len);
+        break;
+
     default:
         break;
     }
@@ -651,6 +1109,12 @@ ag_err_t ag_nodeclu_start(void)
     if (s_reqlock == NULL) {
         s_reqlock = ag_port_mutex_new();
         if (s_reqlock == NULL) {
+            return -AG_ENOMEM;
+        }
+    }
+    if (s_peerlock == NULL) {
+        s_peerlock = ag_port_mutex_new();
+        if (s_peerlock == NULL) {
             return -AG_ENOMEM;
         }
     }

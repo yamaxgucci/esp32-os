@@ -244,9 +244,148 @@ extern "C" {
  *      because those are different objects there and nothing else can know
  *      what it was holding.  Only the bytes it hands over travel; the arena,
  *      the handles and the screen do not.  See AG_AXE_CAN_MIGRATE.
+ *
+ * 0.54 ag_link_ops_t gained send_a() and recv_a(): the same two calls with the
+ *      addressing a relay needs.
+ *
+ *      Until now a frame had a channel and a class and no destination, so a
+ *      board could only ever talk to the neighbour on the other end of its
+ *      wire - and a leaf of a three-board cluster could not reach the leaf on
+ *      the other side of the middle one at all.  The middle board now RELAYS a
+ *      message addressed past it, and to do that it must be told the
+ *      destination, the source and the class: the destination to decide
+ *      whether to relay and out of which wire, the source because that is what
+ *      the far end addresses its answer to and a relay that overwrote it would
+ *      send every answer to itself, and the class because CONTROL, BULK and
+ *      STREAM have independent sequence spaces - a relayed frame promoted or
+ *      demoted between them would be acknowledged by one end and invisible to
+ *      the other.  See ag_link_addr_t.
+ *
+ *      APPENDED, not substituted, and that is not tidiness: flashing is per
+ *      partition, so there is a window where this kernel is running with the
+ *      driver image still on C: from the build before.  A changed signature
+ *      would have that kernel call the old function with the new arguments -
+ *      no error, wrong arguments, on the wire everything else depends on.  The
+ *      pair is therefore new entries past `info`, and a driver that does not
+ *      provide them is REFUSED at bind with a line saying so rather than bound
+ *      in a degraded mode: a driver that accepts but cannot address is the
+ *      worst of the three outcomes, because the cluster looks alive, the
+ *      direct-neighbour traffic works, and only the frames addressed past the
+ *      middle are delivered locally or addressed wrongly.
+ *
+ * 0.55 api->usbd: the USB-OTG peripheral as a DEVICE, lent to an application
+ *      for a session it owns.  The port installs TinyUSB on demand, cycles the
+ *      internal PHY away from the console and back, and forwards the MSC
+ *      callbacks to a table the application registers; the application decides
+ *      which block device to lend, whether it is writable, when the session
+ *      ends, and what to print.  NULL unless CONFIG_ARGON_USB_MSC (off by
+ *      default) - probe with AG_HAS.  Stage 1 is read-only: the write hook is
+ *      refused and the host mounts the volume read-only.
+ *
+ * 0.56 api->spi_slave_open and spi_slave_xfer: the same three wires from the
+ *      other end of the clock.
+ *
+ *      Until now every SPI bus in the system was a master's: the clock was
+ *      always ours to drive and a chip select always ours to pull.  A cluster
+ *      wire between two of these boards is the cheapest link either of them
+ *      has, and it needs the other half - a board that the neighbour clocks.
+ *      So slave_open takes the select as an INPUT pin the peer drives, and it
+ *      takes it there rather than on a transfer, because the driver holds that
+ *      pin from the moment it is initialized; slave_xfer then waits for the
+ *      peer and reports a timeout as a timeout, since a slave that returned
+ *      success for a block nobody clocked would hand its caller a frame
+ *      assembled out of nothing.  See ag_port_spi_slave_open.
+ *
+ *      APPENDED past spi_config, for the reason written out at 0.54: a kernel
+ *      can be running against a driver image from the build before, so the two
+ *      entries go past the end of the struct and a driver built before them
+ *      leaves them NULL.  Probe with AG_HAS - a NULL here says this driver's
+ *      SPI cannot be a slave, which is a fact about the driver and not a
+ *      failure of the call.
+ *
+ *      The pad drive strength that makes such a link carry frames at all is
+ *      not an ABI entry: it is a property of one board's wiring and is set per
+ *      bus from BOARD.CFG - `spi<bus>.drive` in docs/03-board-config.md.
+ *
+ * 0.57 api->spi_link_open / close / write / read: the slave end of a bus kept
+ *      ARMED, which is what turns "a bus that can be a slave" into a link.
+ *
+ *      0.56 gave a driver the slave's half of the clock and one transaction of
+ *      its own to wait on.  That is the whole of what a slave is, and it is not
+ *      enough to carry a link: the peer owns the select, so a block that arrives
+ *      while the driver is between one transfer and the next is not delayed, it
+ *      is LOST.  Measured, on this project's own two boards: the receiving slave
+ *      accepted 92 frames while logging 238 gaps and 99 bad, and the master
+ *      retransmitted 87% of what it sent.  Nothing was wrong with the wire - the
+ *      driver simply could not be back in a transfer before the next select
+ *      pulse, and no amount of care in a driver fixes that, because the driver's
+ *      loop is application time and the wire's rate is not.
+ *
+ *      So the queue is kept armed by the kernel, at a PRIORITY THE KERNEL
+ *      CHOOSES, and what a driver gets is bytes.  That split is the point of
+ *      these four and not a detail of them: the service knows nothing about
+ *      frames, channels or classes - a block boundary is not a frame boundary -
+ *      and the driver knows nothing about transactions, DMA-capable buffers or
+ *      the window.  A .SYS cannot have the priority (0.50 says why, and the
+ *      reason stands), so the listening end of a wire belongs to the system.
+ *
+ *      spi_link_open takes the bus as a slave with the select INPUT its peer
+ *      drives, the block every transaction carries in both directions, and the
+ *      rate the peer is expected to clock at; the pins and the clock come from
+ *      BOARD.CFG's spi<bus> section exactly as the master path gets them, which
+ *      is why there is no pin argument here.  write returns the bytes it took,
+ *      or -AG_EAGAIN when the transmit ring is full rather than blocking or
+ *      dropping; read waits up to its timeout for bytes the peer clocked.
+ *      close stops the service task, waits for it and gives the bus back.
+ *
+ *      APPENDED past spi_slave_xfer, for the reason written out at 0.54 and
+ *      0.56: an image from the build before leaves them NULL.  A driver that
+ *      finds them NULL has the slave bus of 0.56 and no more - probe with
+ *      AG_HAS, and expect the gaps above if it uses it that way.
+ *
+ *      spi_link_stats and ag_spilink_stats_t came with them, in this same
+ *      number, after the first hardware round in which the slave wedged and the
+ *      close line - the whole instrument for the gap question - printed
+ *      nothing, because the board never got far enough to close the link.  What
+ *      the wedge was: with the peer quiet, the armed transactions are never
+ *      completed, so they are never reaped, so the pool stays full and there is
+ *      nothing for the task to do.  A task that retries in that state without
+ *      blocking is a task SPINNING AT A PRIORITY ABOVE EVERY APPLICATION, and
+ *      the board it starves looks hung - every command timing out at the
+ *      console of a machine that is otherwise fine.  The service now blocks on
+ *      every path that has nothing to do, and rebuilds the slave interface when
+ *      nothing has been clocked for a whole second, because a slot is freed
+ *      only by its owner reaping it and armed-but-never-clockable blocks are
+ *      otherwise a pool that stays full until the board is reflashed.  The
+ *      counters are readable while it happens because this is the failure that
+ *      cannot be caught after the fact.
+ *
+ *      ag_link_stats_t gained rx_refused and rx_dropped under this same number
+ *      rather than one of its own, because they answer the question that entry
+ *      is about - was the wire working - for the half of it no counter could
+ *      previously see.
+ *
+ *      What they could not see: a link was acknowledging frames whose message
+ *      it then dropped because its own receive queue was full.  That is
+ *      permanent loss reported to the layers above as success, and it showed up
+ *      as nothing but a file transfer that wrote a short file and said it had
+ *      finished.  Every counter on the wire was clean, because the loss was
+ *      after the wire.  The pair tells the two kinds apart, and their cures are
+ *      opposite: a message REFUSED is the peer's to send again and a message
+ *      DROPPED is not.  See the fields themselves.
+ *
+ *      Neither field is safe to append on its own, and that is worth stating
+ *      where the next person will append: ag_link_stats_t carries no size and
+ *      no version, so a driver built before this writes only the fields it
+ *      knows and leaves these two holding whatever was in the caller's struct.
+ *      The caller's struct is the larger one, which is the safe direction - but
+ *      only if it is ZEROED first.  The kernel's wrapper
+ *      (ag_linkprov_stats, src/net/linkprov.c) now does that before it calls a
+ *      driver's stats(), so an older driver leaves zeros here and not stack
+ *      garbage.  Any future append needs the same guarantee and has it.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 53u
+#define AG_ABI_MINOR 57u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -1273,6 +1412,36 @@ typedef struct ag_link_stats {
      */
     uint32_t rto_ms;
     uint32_t srtt_ms;
+    /*
+     * Messages this end refused because its receive queue had no room for them,
+     * and the peer kept ownership: it will send them again, so under load a
+     * non-zero count here is NORMAL and is not a fault.  It is back-pressure
+     * arriving a layer later than would have been free.
+     *
+     * The fault it can show is a climb with a peer that is not sending much:
+     * then the queue is not being drained, and the number says so before
+     * anything above notices that it has stopped hearing.
+     *
+     * ABI 0.57.
+     */
+    uint32_t rx_refused;
+    /*
+     * Messages thrown away instead of acknowledged.  STREAM only, and there it
+     * is the class working as designed - STREAM drops rather than blocks, and
+     * nobody asks the peer to send it again.  So for STREAM this is NOT a fault.
+     *
+     * For any class that promises delivery it is permanent loss, and it is the
+     * counter this pair was added for: a message read off the wire, counted as
+     * received and then dropped is loss that every other number here reports as
+     * success.  Non-zero there is the fault, and it is the one to chase.
+     *
+     * The two are apart because their cures are opposite: refused messages come
+     * back, dropped ones do not.
+     *
+     * ABI 0.57.  Zeroed by the caller before the driver is asked (see the note
+     * at 0.57), so a driver built before this leaves zeros and not garbage.
+     */
+    uint32_t rx_dropped;
 } ag_link_stats_t;
 
 /*
@@ -1325,6 +1494,30 @@ enum ag_link_class {
     AG_LINK_CLASSES = 3,
 };
 
+/*
+ * Where a message is going, where it came from, and how it is travelling
+ * (ABI 0.54) - the three things about it that are not its channel and not its
+ * bytes.
+ *
+ * `dst` is a node NAME as a number, and the kernel is the only thing that
+ * knows how a name becomes one; a driver neither hashes nor interprets either
+ * field, it stamps what it is given on the way out and reports what it read on
+ * the way in.  Zero means "whoever is reading this", which is what every frame
+ * meant before a board had a neighbour it could not reach directly, so a driver
+ * that has never heard of addressing and stamps zeros is doing the old thing
+ * rather than a wrong one.
+ *
+ * `src` must survive a relay UNCHANGED.  It is the node that wrote the
+ * message, not the board that last put it on a wire, and it is what the
+ * receiver addresses its answer to; a middle board that stamped itself would
+ * have every answer arrive at the middle.
+ */
+typedef struct ag_link_addr {
+    uint16_t dst; /* node it is for, 0 = whoever is reading it             */
+    uint16_t src; /* node that sent it, same encoding, 0 = not stated      */
+    uint8_t  cls; /* ag_link_class it travels in                          */
+} ag_link_addr_t;
+
 typedef struct ag_link_ops {
     uint32_t size;
 
@@ -1339,6 +1532,10 @@ typedef struct ag_link_ops {
      * try again after pumping.  A message longer than the driver's limit is
      * refused rather than split, because only the caller knows where its own
      * message boundaries are.
+     *
+     * Unaddressed: this is the entry a kernel from before 0.54 knows, and a
+     * frame queued through it is meant for whoever is reading it.  Use send_a
+     * where it is there.
      */
     int32_t (*send)(ag_device_t *dev, uint8_t chan, uint8_t cls,
                     const void *buf, size_t len);
@@ -1368,6 +1565,26 @@ typedef struct ag_link_ops {
      * bytes, 400 KB/s), which is what this tree's UART actually gives.
      */
     ag_err_t (*info)(ag_device_t *dev, ag_link_info_t *out);
+
+    /*
+     * ABI 0.54: the same two calls, with the addressing - see ag_link_addr_t.
+     *
+     * `to` is stamped on every frame the message becomes, and is copied rather
+     * than kept by pointer: the frame goes out on a later call than the one
+     * that queued it.  `from` is filled with what the arriving frames carried,
+     * so the layer above can tell a message for this board from one to relay,
+     * and can address an answer to whoever actually sent it.
+     *
+     * NULL on a driver built before this one, and the pair is APPENDED rather
+     * than substituted on purpose - see the 0.54 note at the top.  A kernel
+     * that finds them missing refuses the device with one line saying the
+     * driver predates addressing, because the alternative is quiet: the board
+     * would deliver every relayed frame to itself.
+     */
+    int32_t (*send_a)(ag_device_t *dev, uint8_t chan, const void *buf, size_t len,
+                      const ag_link_addr_t *to);
+    int32_t (*recv_a)(ag_device_t *dev, uint8_t *chan, void *buf, size_t max,
+                      uint32_t timeout_ms, ag_link_addr_t *from);
 } ag_link_ops_t;
 
 
@@ -1435,6 +1652,54 @@ enum ag_gpio_edge { AG_EDGE_RISING = 1, AG_EDGE_FALLING = 2, AG_EDGE_BOTH = 3 };
 
 typedef void (*ag_isr_fn)(void *arg);
 
+/*
+ * What one SPI slave link has done (ABI 0.57).  Read with io->spi_link_stats
+ * while the link is RUNNING, which is the point of it.
+ *
+ * The service already kept these numbers and printed them at close, and that
+ * was the wrong instrument: the first hardware round in which the slave wedged
+ * printed nothing at all, because nothing got far enough to close the link.  A
+ * fault that has to be shut down before it can be seen is a fault nobody sees,
+ * so the same counters are readable at any time - a driver can print them from
+ * its own listener loop, and the shell can ask.
+ *
+ * A reader can tell a working link from a wedged one without knowing anything
+ * about SPI:
+ *
+ *   blocks_clocked stops moving, or never moved  ->  the peer is not clocking
+ *                                                    this end, or the pool of
+ *                                                    armed transactions is
+ *                                                    stuck and a recovery is
+ *                                                    due;
+ *   timeouts and stalls rise                     ->  the wire is quiet for
+ *                                                    whole seconds at a time;
+ *   recoveries rises                             ->  the link has rebuilt
+ *                                                    itself; a rising count is
+ *                                                    a wire problem, not a
+ *                                                    service problem;
+ *   blocks_unarmed non-zero                      ->  a block completed with
+ *                                                    nothing armed, which the
+ *                                                    service exists to prevent;
+ *   errors / last_error                          ->  the port refused a call.
+ *
+ * `open` and `task_stuck` say whether the service is there at all: a closed
+ * link answers with everything zero and open == false, and task_stuck means a
+ * teardown could not stop the task and nothing was freed.
+ */
+typedef struct {
+    uint32_t blocks_clocked; /* transactions the peer completed            */
+    uint32_t blocks_data;    /* of those, the ones that carried real bytes */
+    uint32_t blocks_unarmed; /* completed with nothing of ours armed       */
+    uint32_t bytes_dropped;  /* received bytes with no room in the RX ring */
+    uint32_t timeouts;       /* reaps that found no block waiting          */
+    uint32_t stalls;         /* whole quiet windows with nothing clocked   */
+    uint32_t recoveries;     /* times the slave interface was rebuilt      */
+    uint32_t errors;         /* arm/reap failures, last_error is the first */
+    ag_err_t last_error;
+    bool     open;           /* the service is up and its task is running  */
+    bool     task_stuck;     /* a teardown could not stop the task         */
+} ag_spilink_stats_t;
+
 typedef struct ag_io_api {
     uint32_t size;
 
@@ -1471,6 +1736,80 @@ typedef struct ag_io_api {
      * once, before the first transfer to that chip.
      */
     ag_err_t (*spi_config)(int bus, int cs, uint32_t khz);
+
+    /*
+     * ABI 0.56: the bus from the other end of the clock, appended past
+     * spi_config so that a driver built before this reads exactly what it did.
+     *
+     * spi_slave_open brings the bus up as a slave and names the select INPUT
+     * the peer drives - that pin is part of the interface, so it is given once
+     * here rather than on every transfer.  khz is what the caller expects the
+     * peer to run at; a slave has no clock of its own to set it on.
+     *
+     * spi_slave_xfer is full duplex like spi_xfer: `tx` and `rx` are the same
+     * length and `len` is at most AG_PORT_SPI_MAX_XFER (8192).  It blocks until
+     * the peer has clocked the block or timeout_ms has passed, and a timeout is
+     * -AG_ETIMEDOUT with nothing written to `rx` - bytes nobody clocked are not
+     * a frame.  -AG_ENODEV means the bus was not opened as a slave first.
+     */
+    ag_err_t (*spi_slave_open)(int bus, int cs, uint32_t khz);
+    ag_err_t (*spi_slave_xfer)(int bus, const void *tx, void *rx, size_t len,
+                               uint32_t timeout_ms);
+
+    /*
+     * ABI 0.57: the same bus, kept armed by the kernel, as a byte stream.
+     *
+     * spi_slave_xfer is one transaction and the caller waits for it.  On a wire
+     * where the peer clocks blocks back to back, the time between one transfer
+     * completing and the next being queued is time with nobody listening, and a
+     * select pulse that falls inside it is lost silently.  The kernel does not
+     * have that window: it keeps several blocks armed and refills them as they
+     * complete, at a priority it chooses rather than one a driver is given.
+     *
+     * So a driver that wants the slave's bytes registers four calls instead.
+     * spi_link_open(bus, cs, khz, block) brings the bus up as a slave through
+     * exactly the path spi_slave_open uses - the pins and the clock from
+     * BOARD.CFG, the drive strength from `spi<bus>.drive` - and starts the
+     * service.  `block` is the unit of every transaction in both directions and
+     * has to be a whole number of words, because the engine writes words; it is
+     * at most AG_PORT_SPI_MAX_XFER.  `khz` is what the caller expects the peer
+     * to run at - a slave has no clock of its own to set it on.
+     *
+     * spi_link_write takes what fits of `buf` and returns the count, or
+     * -AG_EAGAIN when the transmit ring is full: it never blocks and never
+     * drops, so the remainder is the caller's to offer again.  spi_link_read
+     * waits up to timeout_ms for bytes the peer clocked and returns how many,
+     * or -AG_EAGAIN when nothing arrived.  0 polls; UINT32_MAX waits.
+     *
+     * spi_link_close stops the service task, waits for it, and gives the bus
+     * back, so a driver that closes on unload leaves no task behind.  Both it
+     * and a link the driver never closed are torn down when the driver's module
+     * is unloaded, the kernel taking back what a module forgot.
+     *
+     * The bytes are bytes: no framing, no channels, no classes, and a block
+     * carries as many of them as a block holds.  What arrived is counted in
+     * bytes and nothing more - the layer above owns every boundary.
+     */
+    ag_err_t (*spi_link_open)(int bus, int cs, uint32_t khz, uint32_t block);
+    ag_err_t (*spi_link_close)(int bus);
+    int32_t (*spi_link_write)(int bus, const void *buf, size_t len);
+    int32_t (*spi_link_read)(int bus, void *buf, size_t len,
+                             uint32_t timeout_ms);
+
+    /*
+     * The counters, while the link is alive, and this one is not a convenience.
+     *
+     * The first hardware round in which the slave wedged produced no evidence
+     * at all: the close line never printed, because nothing got far enough to
+     * unload the driver that would have closed the link.  An instrument that
+     * only reports at the end does not report on the failures that matter - the
+     * ones that hang the board - so the same numbers are readable at any time.
+     *
+     * -AG_ENODEV when no link has ever been opened on that bus; a link that was
+     * opened and has been closed answers AG_OK with open == false and the
+     * counters cleared.  See ag_spilink_stats_t for how to read them.
+     */
+    ag_err_t (*spi_link_stats)(int bus, ag_spilink_stats_t *out);
 } ag_io_api_t;
 
 /* ------------------------------------------------------------------------ */
@@ -2697,7 +3036,102 @@ typedef struct ag_clu_api {
      * returns leaves nothing behind; call it yourself to run a second job.
      */
     void (*done)(void);
+
+    /*
+     * THE BOARDS BEYOND THE ONES `nodes` LISTS.
+     *
+     * A leaf holds one wire and therefore has one neighbour, so `nodes` answers
+     * "only me and the one next door" while a third board is running two hops
+     * away.  The middle knows that and says so on the wire (net/nodeclu.c), and
+     * this is how it is read: `out` receives the far boards, `via` the index of
+     * the wire each one is seen through, and the return is how many there are
+     * (or, with `out` NULL, how many there are).
+     *
+     * DELIBERATELY NOT PART OF `nodes`, and the reason is not tidiness: every
+     * caller that PLACES work walks `nodes` - spawn(AG_CLU_ANY) picks the board
+     * with the most cores - and a frame carries no destination yet, so a thread
+     * aimed at a board two hops away would be started on the neighbour in hand.
+     * So these are shown and not used.
+     *
+     * NEW, SO TEST `size` (or AG_HAS) BEFORE CALLING IT: a kernel built before
+     * this field reports it as absent, not as NULL.
+     */
+    int32_t (*peers_seen)(ag_clu_node_t *out, int32_t *via, uint32_t max);
 } ag_clu_api_t;
+
+/* ------------------------------------------------------------------------ */
+/* usbd - the board as a USB device, on demand (ABI 0.55)                   */
+/* ------------------------------------------------------------------------ */
+/*
+ * The USB-OTG peripheral as a mass-storage DEVICE, owned by an application for
+ * a session.  The port does only what an application cannot: install TinyUSB,
+ * cycle the one internal PHY away from the USB-Serial-JTAG console and back,
+ * and forward the TinyUSB MSC callbacks to a table the application registers
+ * below.  The application owns everything else - which block device is lent
+ * (it reads /dev/sd0 itself), read-only versus writable, the stop condition,
+ * and what is printed - so nothing in the kernel has a policy about any of it.
+ *
+ * The callbacks in ag_usbd_msc_cbs_t are the application's own functions; the
+ * port calls them from TinyUSB's task.  They must not block and must not be
+ * re-entered, exactly like an interrupt handler - the port serialises the MSC
+ * command stream, but a callback that sleeps would stall the USB task and lose
+ * the host.  Stage 1 is read-only: the application's write10 answers 0 and its
+ * is_writable answers false, so the host mounts the volume read-only.
+ */
+
+/*
+ * One mass-storage LUN's worth of behaviour, all of it the application's.
+ *
+ * `capacity` must fill *block_count and *block_size (in bytes) and return 0;
+ * `read10` copies bufsize bytes of the volume starting at (lba * block_size +
+ * offset) into `buf` and returns the byte count; `write10` is the same in the
+ * other direction and is expected to return 0 in stage 1.  `is_writable` gates
+ * the host's own write path; `unit_ready` is the media-present probe (return
+ * false and the host sees an empty slot).  `start_stop` is the SCSI START STOP
+ * UNIT command - `start` loads, `eject` is the host asking the media to go -
+ * and `mounted`/`unmounted` are host attach and detach (USB unplug).  Any
+ * pointer may be NULL, and the port then supplies a safe no-op default.
+ */
+typedef struct ag_usbd_msc_cbs {
+    int32_t (*capacity)(uint32_t lun, uint32_t *block_count,
+                        uint32_t *block_size);
+    int32_t (*read10)(uint32_t lun, uint32_t lba, uint32_t offset, void *buf,
+                      uint32_t bufsize);
+    int32_t (*write10)(uint32_t lun, uint32_t lba, uint32_t offset,
+                       const void *buf, uint32_t bufsize);
+    bool    (*is_writable)(uint32_t lun);
+    bool    (*unit_ready)(uint32_t lun);
+    bool    (*start_stop)(uint32_t lun, bool start, bool eject);
+    void    (*mounted)(void);
+    void    (*unmounted)(void);
+} ag_usbd_msc_cbs_t;
+
+/* What status() reports: is the device up, and has a host attached. */
+typedef struct {
+    bool up;      /* TinyUSB installed, PHY taken from the console            */
+    bool mounted; /* a host has enumerated and attached                       */
+} ag_usbd_status_t;
+
+typedef struct ag_usbd_api {
+    uint32_t size;
+
+    /*
+     * Take the PHY and become a USB device with the callbacks in `cbs`.  The
+     * console is gone from its USB port from the moment this succeeds until
+     * stop() - there is no way to have both, so this is stated to the operator
+     * before it happens.  -AG_EBUSY when the device is already up.
+     */
+    ag_err_t (*start)(const ag_usbd_msc_cbs_t *cbs);
+
+    /*
+     * Tear the device down and restore the USB-Serial-JTAG console.  The
+     * callback table is cleared first, so an application that dies mid-session
+     * cannot leave the port calling its freed code.  A no-op when not up.
+     */
+    ag_err_t (*stop)(void);
+
+    ag_err_t (*status)(ag_usbd_status_t *out);
+} ag_usbd_api_t;
 
 /* ------------------------------------------------------------------------ */
 /* Root table                                                               */
@@ -2756,6 +3190,10 @@ typedef struct ag_api {
      * and that is the point: the cluster is a size, not a different system.
      */
     const ag_clu_api_t *clu;
+
+    /* ABI 0.55+: the board as a USB mass-storage device, on demand.  NULL
+     * unless CONFIG_ARGON_USB_MSC (off by default) - probe with AG_HAS. */
+    const ag_usbd_api_t *usbd;
 } ag_api_t;
 
 /* ------------------------------------------------------------------------ */

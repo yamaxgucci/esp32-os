@@ -1,0 +1,37 @@
+# What goes on this board's C:, staged by tools\mksysfs.py.
+#
+# The rule that decides this list, the same as on the other boards: a board
+# carries the images its NEIGHBOUR can execute as well as its own.  A cluster
+# passes messages and shares devices without noticing an instruction set, and
+# code stops at it dead - so MIGRANT sent from here to a RISC-V board arrives
+# as an image that board cannot run, and the far end answers by finding its own
+# build of the same program (cluster.md 3b).  For that to work, each side needs
+# both.
+#
+# THIS BOARD'S NEIGHBOUR IS NOT CHOSEN YET, and that is why three instruction
+# sets are here rather than one.  There is no wire soldered (BOARD.CFG says
+# which pins are meant for it) and nothing in the pack assumes which board ends
+# up at the other end.  Nine small files against a 16 MB flash is not a saving
+# worth a journey that fails at the far end - the same argument the S3-Zero's
+# list makes for carrying the LX6 builds of a board two hops away.
+
+# Xtensa LX7, for this board itself - the cluster trio:
+NODEHI.AXE
+MIGRANT.AXE
+GRIND.AXE
+# And one program that needs the thing this board has and the others do not.
+# BOARD.CFG keeps `driver = soft` at 320x240, so an application can ask the
+# kernel for a surface and put a picture on 2 inches of glass; GFXDEMO is the
+# smallest program that proves that path end to end, and the first thing to run
+# on a new screen.  It is NOT here as a cluster program.
+GFXDEMO.AXE
+
+# Xtensa LX6, for the CYD:
+NODEHI32.AXE
+MIGRAN32.AXE
+GRIND32.AXE
+
+# RISC-V, for the C3 (and any C6 that takes its place):
+NODEHIRV.AXE
+MIGRANRV.AXE
+GRINDRV.AXE

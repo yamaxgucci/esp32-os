@@ -28,7 +28,24 @@
 #include <argon/argon.h>
 #include <argon/libc.h>
 
-AG_APP("MIGRANT", "1.0", "argon", AG_AXE_CAN_MIGRATE);
+/*
+ * EIGHT KILOBYTES, NAMED RATHER THAN TAKEN FROM THE DEFAULT, and the number is
+ * the loader's floor rather than this program's need.
+ *
+ * MIGRANT keeps three words of state and prints a number; its own frames are
+ * shallow.  What is not shallow is the load: the image is read, relocated and
+ * started on this very task, and AG_PROC_LOAD_STACK_MIN (8 KB) is the kernel's
+ * statement of what that needs.
+ *
+ * The default it used to take is 16 KB (CONFIG_ARGON_APP_STACK_KB, which no
+ * board overrides), and on the C3 that is the whole standby shape: measured on
+ * COM8, one default-sized guest leaves 18 KB free and a 9 KB largest block, so
+ * the MIGRANT that `link standby` sends over - always the NEIGHBOUR'S build of
+ * this program, which the far board has to substitute for its own - cannot
+ * start.  `link standby` then answers -2, and the handover silently does not
+ * happen.  Two 8 KB stacks fit where a 16 KB one leaves no room for a second.
+ */
+AG_APP_SIZED("MIGRANT", "1.0", "argon", AG_AXE_CAN_MIGRATE, 8 * 1024, 0);
 
 /*
  * What travels.  A version stamp in front of it because the two ends are two

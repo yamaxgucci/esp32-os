@@ -68,6 +68,20 @@ const char *ag_node_peer_name_at(int32_t wire);
 uint8_t     ag_node_peer_cores_at(int32_t wire);
 uint32_t    ag_node_peer_cpu_hz_at(int32_t wire);
 
+/*
+ * A name as a number small enough to travel in every frame.
+ *
+ * A name is the only identity that survives a reboot and means the same thing
+ * on all three boards, but 9 bytes of it in a 24-byte header is a fifth of the
+ * payload, so what travels is this hash.  FNV-1a over the bytes, with 0 kept
+ * for "no node" - a name that hashes to 0 would be indistinguishable from the
+ * "no destination, this frame is for whoever is reading it" case, and three
+ * boards make that collision a curiosity rather than a risk.
+ *
+ * NULL and "" hash to 0.
+ */
+uint16_t ag_node_hash(const char *name);
+
 #ifdef __cplusplus
 }
 #endif

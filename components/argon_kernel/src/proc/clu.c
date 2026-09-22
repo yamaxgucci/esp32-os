@@ -887,6 +887,20 @@ static void api_done(void)
     unlock();
 }
 
+/*
+ * The boards beyond our neighbours, as the transport heard them.  A wrapper
+ * rather than a pointer straight at the transport's, because a transport is
+ * optional - a kernel with no wire has none - and "nobody told me about any"
+ * and "there is nobody to tell me" have the same answer.
+ */
+static int32_t api_peers_seen(ag_clu_node_t *out, int32_t *via, uint32_t max)
+{
+    if (s_tr == NULL || s_tr->peers_seen == NULL) {
+        return 0;
+    }
+    return s_tr->peers_seen(out, via, max);
+}
+
 const ag_clu_api_t ag_clu_api_table = {
     .size = sizeof(ag_clu_api_t),
     .nodes = api_nodes,
@@ -897,6 +911,7 @@ const ag_clu_api_t ag_clu_api_table = {
     .join = api_join,
     .self = api_self,
     .done = api_done,
+    .peers_seen = api_peers_seen,
 };
 
 /* ---------------------------------------------------------------------- */
