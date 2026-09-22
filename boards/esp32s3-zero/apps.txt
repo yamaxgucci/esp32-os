@@ -32,3 +32,7 @@ ESPFLASH.AXE
 # Something to LOOK at, for the board whose screen is on the other end of a
 # cable: GFXDEMO draws, and where it lands is the whole demonstration.
 GFXDEMO.AXE
+# And a picture that will NOT compress, because the one above does: the demo
+# frame crossed the wire as 3 KB for 75 000 pixels, so measuring a transport on
+# it measures the encoder.  GFXNOISE sends every band whole.
+GFXNOISE.AXE

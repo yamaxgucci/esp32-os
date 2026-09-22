@@ -419,6 +419,11 @@
       "src": ["apps/link/link.c"]
     },
     {
+      "out": "GFXNOISE.AXE", "group": "core",
+      "_note": "A picture that will not compress, so a wire can be measured. Every other graphics test draws shapes on a flat ground and REMDISP packs those to almost nothing - the demo picture crossed as 3 KB for 75 000 pixels, so comparing two transports on it measures the encoder and not the copper. Noise does not pack, does not index and never matches the previous frame, so every band is sent whole. Reports the frames and bytes it offered, so the sender is readable without the receiver.",
+      "src": ["apps/gfxnoise/gfxnoise.c"]
+    },
+    {
       "out": "REMDISP.SYS", "group": "core",
       "_note": "The screen of a machine that has none, sent down a wire to the board that does: a display device whose panel is UART1. Publishes ag_display_ops_t with blit_rect for pixels and text_row/text_cursor for the console, so ag_gfx_flush and ag_gfx_present reach it without any application knowing. Trims each band to the bounding box of what moved against a shadow of the last frame, then sends whichever is smallest of raw RGB565, PackBits, or palette-and-indices. Measured on the two boards at 4 Mbaud: 15 fps for a whole 320x240 frame every frame and 154 fps on dirty rectangles, 7.8x compression. Needs [uart1] tx/rx in BOARD.CFG; see docs/09-esp32-cyd.md.",
       "src": ["apps/remdisp/remdisp.c"]

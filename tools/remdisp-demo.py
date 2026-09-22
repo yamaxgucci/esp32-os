@@ -71,6 +71,8 @@ def main():
     # band is up to 5194.  Here because finding the size at which the
     # slave stops coming up is a sweep.
     ap.add_argument("--block", type=int, default=512)
+    ap.add_argument("--watch", type=float, default=3.0,
+                    help="seconds to keep listening to the screen end")
     # The images the run needs, put before anything is unloaded:
     # --upload HOST=GUEST, repeatable, screen end.
     ap.add_argument("--upload", action="append", default=[])
@@ -130,8 +132,12 @@ def main():
         print(say(h, "dev", wait=2.0))
         print(say(h, "run %s" % a.app, wait=6.0, timeout=60.0))
 
-        # What the screen end saw of it, in its own words.
-        g.pump(3.0)
+        # What the screen end saw of it, in ITS OWN words, and the wait is an
+        # argument because three seconds is not enough to hear it: remterm
+        # reports when its own clock runs out, and a run that stops listening
+        # first leaves only the SENDER'''s numbers - which say what was offered
+        # to the wire, never what crossed it.
+        g.pump(a.watch)
         print(visible(bytes(g.buf)).decode("latin-1")[-1200:])
         return 0
     finally:
