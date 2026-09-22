@@ -49,3 +49,12 @@ desktop.ini
 
 # Board WiFi password, read by the flashing tools (assets/pwd). Never committed.
 assets/pwd
+
+# Board transcripts are RENDERED SCREENS - the same rows painted over and over -
+# so one run is megabytes of repetition.  The numbers out of them are extracted
+# into logs/*.md, and THAT is committed: the last round of SPI work put every
+# raw log in build/cluster-stash/ and lost the lot, because build/ is what
+# `argon target` deletes.  Evidence lives in logs/, and its readable part lives
+# in git.
+logs/*.log
+logs/SYSTEM-*.CFG

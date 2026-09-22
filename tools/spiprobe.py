@@ -16,6 +16,7 @@ which is the tree's own documented behaviour.  Evidence lives in logs/.
 """
 
 import argparse
+import io
 import os
 import re
 import sys
@@ -136,6 +137,10 @@ def main():
     ap.add_argument("--log", default=os.path.join(LOGDIR, "spiprobe.log"))
     ap.add_argument("--up", action="store_true",
                     help="load linkspi and bind node1 on both first")
+    ap.add_argument("--khz", type=int, default=0,
+                    help="rewrite [linkspi] khz on BOTH boards and reboot them")
+    ap.add_argument("--gap", type=int, default=-1,
+                    help="rewrite [linkspi] gap_us on the master the same way")
     ap.add_argument("--put", action="append", default=[],
                     metavar="HOST=GUEST",
                     help="deliver a file to BOTH boards before anything else")
@@ -145,6 +150,32 @@ def main():
     tee = Tee(a.log)
     m = Board(a.master, a.baud, Sink(tee, 'master'), False)
     s = Board(a.slave, a.baud, Sink(tee, 'slave'), False)
+
+    # A setting swept from here rather than from a reflash.  The two boards
+    # carry their pack's SYSTEM.CFG byte for byte (checked: 3983 and 6791), so
+    # rewriting one key in the pack copy and delivering it leaves everything
+    # else exactly as it was - which is what makes two runs comparable.
+    packs = {"master": os.path.join(ROOT, "boards", "esp32s3-zero",
+                                    "SYSTEM.CFG"),
+             "slave": os.path.join(ROOT, "boards", "esp32s3-touch-lcd-2",
+                                   "SYSTEM.CFG")}
+
+    def retune(tag, path):
+        text = io.open(path, encoding="utf-8", newline="").read()
+        # Inside [linkspi] only: `khz` appears in [spi2] and [spi3] as well, and
+        # those are where the bus comes up before the driver asks for its own
+        # rate - changing them would move a second variable.
+        head, _, tail = text.partition("[linkspi]")
+        if a.khz:
+            tail = re.sub(r"(?m)^khz\s*=\s*\d+", "khz  = %d" % a.khz, tail, 1)
+        if a.gap >= 0 and "gap_us" in tail:
+            tail = re.sub(r"(?m)^gap_us\s*=\s*\d+", "gap_us = %d" % a.gap,
+                          tail, 1)
+        out = os.path.join(LOGDIR, "SYSTEM-%s.CFG" % tag)
+        os.makedirs(LOGDIR, exist_ok=True)
+        io.open(out, "w", encoding="utf-8", newline="").write(
+            head + "[linkspi]" + tail)
+        return out
 
     try:
         if a.reset:
@@ -158,6 +189,19 @@ def main():
             # A bare return, to find the prompt without doing anything.
             run(m, tee, "master", "")
             run(s, tee, "slave", "")
+
+        if a.khz or a.gap >= 0:
+            tee.note("retuning: khz=%s gap=%s" % (a.khz or "-",
+                                                  a.gap if a.gap >= 0 else "-"))
+            for board, tag in ((m, "master"), (s, "slave")):
+                board.put(retune(tag, packs[tag]), "c:\\system.cfg",
+                          chunk_bytes=127)
+            # Read at boot and nowhere else, so the change is a reboot away.
+            tee.note("rebooting into the new settings")
+            m.reset()
+            s.reset()
+            m.pump(6.0)
+            s.pump(6.0)
 
         for spec in a.put:
             host, guest = spec.split("=", 1)
