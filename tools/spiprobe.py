@@ -141,6 +141,8 @@ def main():
                     help="rewrite [linkspi] khz on BOTH boards and reboot them")
     ap.add_argument("--gap", type=int, default=-1,
                     help="rewrite [linkspi] gap_us on the master the same way")
+    ap.add_argument("--gapmax", type=int, default=-1,
+                    help="[linkspi] gap_max_us: 0 turns the adaptive growth off")
     ap.add_argument("--put", action="append", default=[],
                     metavar="HOST=GUEST",
                     help="deliver a file to BOTH boards before anything else")
@@ -171,6 +173,17 @@ def main():
         if a.gap >= 0 and "gap_us" in tail:
             tail = re.sub(r"(?m)^gap_us\s*=\s*\d+", "gap_us = %d" % a.gap,
                           tail, 1)
+        if a.gapmax >= 0:
+            # The key may not be in the pack at all - it is new - so set it if
+            # it is there and append it to the section if it is not.  Appended
+            # right after `dev`, which every [linkspi] has, so it lands inside
+            # the section and not in whatever follows it.
+            if re.search(r"(?m)^gap_max_us\s*=", tail):
+                tail = re.sub(r"(?m)^gap_max_us\s*=\s*\d+",
+                              "gap_max_us = %d" % a.gapmax, tail, 1)
+            else:
+                tail = re.sub(r"(?m)^(dev\s*=.*)$",
+                              r"\1\ngap_max_us = %d" % a.gapmax, tail, 1)
         out = os.path.join(LOGDIR, "SYSTEM-%s.CFG" % tag)
         os.makedirs(LOGDIR, exist_ok=True)
         io.open(out, "w", encoding="utf-8", newline="").write(
@@ -190,9 +203,10 @@ def main():
             run(m, tee, "master", "")
             run(s, tee, "slave", "")
 
-        if a.khz or a.gap >= 0:
-            tee.note("retuning: khz=%s gap=%s" % (a.khz or "-",
-                                                  a.gap if a.gap >= 0 else "-"))
+        if a.khz or a.gap >= 0 or a.gapmax >= 0:
+            tee.note("retuning: khz=%s gap=%s gapmax=%s"
+                     % (a.khz or "-", a.gap if a.gap >= 0 else "-",
+                        a.gapmax if a.gapmax >= 0 else "-"))
             for board, tag in ((m, "master"), (s, "slave")):
                 board.put(retune(tag, packs[tag]), "c:\\system.cfg",
                           chunk_bytes=127)

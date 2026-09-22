@@ -348,6 +348,55 @@ _Static_assert((int)NL_CLS_CONTROL == (int)AG_LINK_CONTROL &&
  */
 #define LSPI_GAP_US_DEFAULT 100u
 
+/*
+ * THE CEILING THE GAP GROWS TO WHILE THE PEER SAYS NOTHING, and the step it
+ * grows by when `gap_us` is zero.  `gap_max_us` in [linkspi]; 0 turns the
+ * growth off and leaves the fixed gap this file had.
+ *
+ * WHY A GROWING GAP AT ALL, in one measured number: of 1376 blocks the master
+ * clocked to fetch a 19 KB file, 91 carried any bytes.  Ninety-three per cent
+ * of them were the master asking a slave that had nothing ready yet, and each
+ * one costs that slave a reap, an arm and a hand-over on a task above every
+ * application.  The wire was never the limit - it is measured at 1 755 781 B/s
+ * and this carried eleven thousand.
+ *
+ * WHY IT MUST BE SMALL.  The reply to a request can only travel inside a block
+ * the master clocks, so every microsecond of gap is a microsecond a finished
+ * answer may sit waiting - this is the trap awaiting_answer() already warns
+ * about, where gating the waiting case cost 682 ms per round trip.  Two
+ * milliseconds against a measured six of round trip is the compromise: it can
+ * cost a third of a round trip at worst, and it cannot cost a scheduler tick.
+ *
+ * AND IT RESETS TO THE FLOOR ON ANYTHING HEARD, which is what makes it safe:
+ * the growth only ever happens while the peer is silent, and one frame - an
+ * acknowledgement counts - puts the wire back at full rate for the next.
+ *
+ * OFF BY DEFAULT, BECAUSE IT WAS MEASURED AND IT MAKES THIS LINK SLOWER.  The
+ * reasoning above is sound and the conclusion it points at is wrong, which is
+ * worth leaving in the file rather than quietly deleting.  The same 19212-byte
+ * fetch, 5 MHz, master to slave, 22 Sep:
+ *
+ *     gap_us   growth      B/s     blocks   gaps
+ *          0   off        6 963     1735     63
+ *        600   off       19 192     1048     40   <- what the pack asks for
+ *       1200   off       13 405      887      -
+ *        600   to 2000   15 429      721     17
+ *
+ * The growth did exactly what it was built to do - a third fewer blocks, less
+ * than half the gaps - and cost a fifth of the throughput.  So the empty blocks
+ * were not waste: on a wire with one clock master an empty block is the only
+ * way the other end gets to speak, and cutting them cuts the answers with them.
+ * The curve falls away on BOTH sides of 600 us, which is the shape of a real
+ * optimum rather than a floor, and the pack already sat on it.
+ *
+ * What that leaves for the next person: the loss is the thing to attack, not
+ * the polling.  A quarter of the frames this link sends are retransmissions
+ * (155 sent for 83 delivered at the best setting), and every one of the three
+ * rows above gets worse in exactly the way its gap count does.
+ */
+#define LSPI_GAP_MAX_US_DEFAULT 0u
+#define LSPI_GAP_STEP_US        100u
+
 /* The defaults for the config keys, all of them overridable in SYSTEM.CFG
  * under [linkspi].  `dev` is node1 and not node0 because the UART driver
  * already owns node0, and on the Zero both wires are meant to coexist: the SPI
@@ -421,6 +470,7 @@ typedef struct {
     int      cs;
     uint32_t khz;    /* what info() computes the rate from                  */
     uint32_t gap_us; /* MASTER only: dead time between two blocks it clocks */
+    uint32_t gap_max_us; /* MASTER only: what the gap grows to while unanswered */
     bool     master; /* true = this end holds the clock                    */
     /*
      * SLAVE only: the kernel's link is open on this bus, so unloading has to
@@ -1168,13 +1218,39 @@ static void offer_all(node_t *nd, uint32_t t)
  * sits in) and the transfer lock held, so no second block of this wire can
  * close the gap from underneath it.
  */
+static uint32_t gap_for_now(const node_t *nd)
+{
+    if (nd->gap_max_us == 0u) {
+        return nd->gap_us; /* the growth is off: the fixed gap, as before */
+    }
+    /*
+     * LINEAR IN THE NUMBER OF EMPTY BLOCKS SINCE THE PEER LAST SPOKE, not
+     * geometric, and the difference is the thing this has to protect.  Doubling
+     * reaches the ceiling in three blocks, so the first reply after a short
+     * silence pays the whole of it; growing by a step means the gap is still
+     * near the floor for the blocks that immediately follow a request, which is
+     * exactly when an answer is most likely to arrive.
+     *
+     * `fruitless` is already the right counter and already has the right reset:
+     * clock_block() zeroes it on any frame heard and reset_channels() zeroes it
+     * on any new transmission, so a live exchange never leaves the floor.
+     */
+    const uint32_t step = (nd->gap_us != 0u) ? nd->gap_us : LSPI_GAP_STEP_US;
+    uint32_t       g = nd->gap_us + step * nd->fruitless;
+    if (g > nd->gap_max_us) {
+        g = nd->gap_max_us;
+    }
+    return g;
+}
+
 static void block_gap(const node_t *nd)
 {
-    if (nd->gap_us == 0u) {
+    const uint32_t want = gap_for_now(nd);
+    if (want == 0u) {
         return;
     }
     const uint64_t start = g_ag_api->time->us();
-    while ((uint32_t)(g_ag_api->time->us() - start) < nd->gap_us) {
+    while ((uint32_t)(g_ag_api->time->us() - start) < want) {
         /* spin: the bound above is what keeps this from being a stall */
     }
 }
@@ -2338,6 +2414,15 @@ static ag_err_t wire_up(void)
     }
     const int32_t gap = cfg_int("linkspi.gap_us", (int32_t)LSPI_GAP_US_DEFAULT);
     nd->gap_us = (gap > 0) ? (uint32_t)gap : 0u;
+    const int32_t gmax =
+        cfg_int("linkspi.gap_max_us", (int32_t)LSPI_GAP_MAX_US_DEFAULT);
+    nd->gap_max_us = (gmax > 0) ? (uint32_t)gmax : 0u;
+    /* A ceiling below the floor would make the gap SHORTER the longer the peer
+     * is silent, which is the opposite of the intent and reads as a typo rather
+     * than a choice; the floor wins and the growth is simply off. */
+    if (nd->gap_max_us != 0u && nd->gap_max_us < nd->gap_us) {
+        nd->gap_max_us = nd->gap_us;
+    }
     cfg_str("linkspi.dev", nd->dev, sizeof(nd->dev), LSPI_DEV_DEFAULT);
 
     /*
