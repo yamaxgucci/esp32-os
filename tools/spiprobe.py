@@ -141,6 +141,8 @@ def main():
                     help="rewrite [linkspi] khz on BOTH boards and reboot them")
     ap.add_argument("--gap", type=int, default=-1,
                     help="rewrite [linkspi] gap_us on the master the same way")
+    ap.add_argument("--drive", type=int, default=-1,
+                    help="[spiN] drive on BOTH boards' BOARD.CFG (0..3)")
     ap.add_argument("--gapmax", type=int, default=-1,
                     help="[linkspi] gap_max_us: 0 turns the adaptive growth off")
     ap.add_argument("--put", action="append", default=[],
@@ -161,6 +163,26 @@ def main():
                                     "SYSTEM.CFG"),
              "slave": os.path.join(ROOT, "boards", "esp32s3-touch-lcd-2",
                                    "SYSTEM.CFG")}
+    boards = {"master": os.path.join(ROOT, "boards", "esp32s3-zero",
+                                     "BOARD.CFG"),
+              "slave": os.path.join(ROOT, "boards", "esp32s3-touch-lcd-2",
+                                    "BOARD.CFG")}
+
+    def redrive(tag, path):
+        """The pad drive lives in BOARD.CFG's [spiN], not in SYSTEM.CFG.
+
+        Only the section this link uses: the master's bus is 2 and the slave's
+        is 3, and the OTHER [spiN] on the slave drives its panel and its card.
+        """
+        text = io.open(path, encoding="utf-8", newline="").read()
+        want = "[spi2]" if tag == "master" else "[spi3]"
+        head, sep, tail = text.partition(want)
+        assert sep, path
+        tail = re.sub(r"(?m)^drive\s*=\s*\d+", "drive = %d" % a.drive, tail, 1)
+        out = os.path.join(LOGDIR, "BOARD-%s.CFG" % tag)
+        os.makedirs(LOGDIR, exist_ok=True)
+        io.open(out, "w", encoding="utf-8", newline="").write(head + want + tail)
+        return out
 
     def retune(tag, path):
         text = io.open(path, encoding="utf-8", newline="").read()
@@ -203,7 +225,13 @@ def main():
             run(m, tee, "master", "")
             run(s, tee, "slave", "")
 
-        if a.khz or a.gap >= 0 or a.gapmax >= 0:
+        if a.drive >= 0:
+            tee.note("pad drive -> %d on both" % a.drive)
+            for board, tag in ((m, "master"), (s, "slave")):
+                board.put(redrive(tag, boards[tag]), "c:\\board.cfg",
+                          chunk_bytes=127)
+
+        if a.khz or a.gap >= 0 or a.gapmax >= 0 or a.drive >= 0:
             tee.note("retuning: khz=%s gap=%s gapmax=%s"
                      % (a.khz or "-", a.gap if a.gap >= 0 else "-",
                         a.gapmax if a.gapmax >= 0 else "-"))

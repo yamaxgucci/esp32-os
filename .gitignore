@@ -58,3 +58,4 @@ assets/pwd
 # in git.
 logs/*.log
 logs/SYSTEM-*.CFG
+logs/BOARD-*.CFG

@@ -132,13 +132,30 @@
 #define SPILINK_SLOTS 3u
 
 /*
- * A power of two so the ring arithmetic is a mask, and 4096 because that is what
- * this wire's driver keeps on its own side: eight blocks of the 512 bytes a
- * cluster link uses, which is more than the driver ever has queued for one
- * round trip.
+ * A power of two so the ring arithmetic is a mask.
+ *
+ * THE TWO RINGS DO NOT CARRY THE SAME THING, and sizing them alike was the
+ * mistake this comment used to make.  The transmit ring holds what this board
+ * chose to say: frames, and never more than a round trip's worth, so eight
+ * blocks of 512 is generous and 4096 stays.
+ *
+ * THE RECEIVE RING HOLDS EVERY BYTE THE PEER CLOCKS, AND MOST OF THEM ARE
+ * PADDING.  A master with nothing to send still clocks a whole block and fills
+ * it with zeros (linkspi.c, clock_block), because a block is the only way the
+ * other end gets to speak.  Measured on the real pair, one 19 KB fetch: 826
+ * blocks clocked, 69 of them carrying anything - so 423 KB went through this
+ * ring to deliver 35 KB, and the ring lost 3584 bytes of it ("bytes with no
+ * room", seven whole blocks).  What it loses is not padding, because padding is
+ * most of what is there: it is whatever arrived when the ring happened to be
+ * full, and an acknowledgement lost that way costs a retransmission window.
+ *
+ * So the receive side is four times the transmit side.  That is a floor under
+ * a burst, not a cure: the cure is for the master to stop sending half a
+ * megabyte of zeros, and that is a change to the block loop rather than to a
+ * constant.  This one is what makes the measurement of that change readable.
  */
 #define SPILINK_TX_RING 4096u
-#define SPILINK_RX_RING 4096u
+#define SPILINK_RX_RING 16384u
 
 #define SPILINK_TASK_STACK 4096u
 
