@@ -32,6 +32,8 @@
 #include <argon/nodeps.h>
 #include <argon/nodefs.h>
 #include <argon/nodestandby.h>
+/* For the SPI slave service's own counters - see print_spilink below. */
+#include <argon/spilink.h>
 #include <argon/nodeproc.h>
 #include <argon/path.h>
 
@@ -224,6 +226,59 @@ static int32_t reply_to(const link_origin_t *who, uint8_t cls, const void *buf,
     return ag_linkprov_send_to(who->from, who->chan, cls, buf, len);
 }
 
+/*
+ * THE BLOCK LAYER, UNDER THE FRAMES, on the end that does not clock it.
+ *
+ * Everything above says frames and bytes, which is the right unit for a wire
+ * whose two ends both get to speak when they like.  On the SPI pair only one
+ * end clocks, so the far end can put a frame out ONLY inside a block the
+ * master opened - and then "frames received" and "blocks clocked" are two
+ * different questions with two different cures.  A link carrying a tenth of
+ * what the wire measured could be a scheduler that is not filling blocks or a
+ * master that is not clocking them, and from above the two look the same.
+ *
+ * The counters existed and were readable through the ABI from the day the
+ * service was written; nothing printed them, which in this tree is the same as
+ * not having them.  So: both buses asked, only the open one printed, and no
+ * line at all on a board with no SPI link - which is most of them.
+ *
+ * Deltas are the operator's arithmetic, deliberately: two `link` calls around
+ * a transfer say what that transfer cost, and a rate printed here would be a
+ * rate over the whole life of the link, which is the number nobody wants.
+ */
+static void print_spilink(void)
+{
+    for (int bus = 2; bus <= 3; bus++) {
+        ag_spilink_stats_t sp;
+        if (ag_spilink_stats(bus, &sp) != AG_OK || !sp.open) {
+            continue;
+        }
+        ag_console_printf("spi%d    %u blocks clocked by the peer, %u with "
+                          "bytes in them\n",
+                          bus, (unsigned)sp.blocks_clocked,
+                          (unsigned)sp.blocks_data);
+        /*
+         * Only when non-zero, all four of them.  A line of zeros on a healthy
+         * link is noise an operator learns to skip, and then the one run where
+         * it is not zero gets skipped too.
+         */
+        if (sp.blocks_unarmed != 0u || sp.bytes_dropped != 0u ||
+            sp.timeouts != 0u || sp.stalls != 0u) {
+            ag_console_printf("        %u into nothing armed, %u bytes with no "
+                              "room, %u timeouts, %u stalls\n",
+                              (unsigned)sp.blocks_unarmed,
+                              (unsigned)sp.bytes_dropped, (unsigned)sp.timeouts,
+                              (unsigned)sp.stalls);
+        }
+        if (sp.recoveries != 0u || sp.errors != 0u || sp.task_stuck) {
+            ag_console_printf("        %u rebuilds, %u errors (last %d)%s\n",
+                              (unsigned)sp.recoveries, (unsigned)sp.errors,
+                              (int)sp.last_error,
+                              sp.task_stuck ? ", TASK STUCK" : "");
+        }
+    }
+}
+
 static void print_stats(void)
 {
     ag_link_stats_t st;
@@ -278,6 +333,7 @@ static void print_stats(void)
         ag_console_printf("timer   %u ms, round trip not measured yet\n",
                           (unsigned)st.rto_ms);
     }
+    print_spilink();
 }
 
 static int link_status(void)

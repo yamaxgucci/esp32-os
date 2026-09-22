@@ -1307,13 +1307,16 @@ static bool clock_block(node_t *nd)
  * the wait is still fresh - fewer than LSPI_FRUITLESS_MAX blocks have gone out
  * with nothing heard since the last thing the peer said.
  *
- * ONE COPY, and it is load-bearing that there is only one: block_due() asks it
- * to decide whether to CLOCK a block at all, and wire_has_work_now() asks it to
- * decide whether the pumping loop comes straight back instead of sleeping the
- * tick.  On a master those two questions have to give the same answer, because a
- * loop that comes back at once and then finds block_due() false is a spin that
- * clocks nothing - and a loop that clocks nothing never hears the answer it is
- * waiting for.
+ * ONE CALLER NOW, AND THAT IS THE POINT: block_due(), which decides whether to
+ * CLOCK a block at all.  It had a second - wire_has_work_now(), which decided
+ * whether the pumping loop came straight back instead of sleeping the tick -
+ * and the pair was a trap rather than a convenience.  "We are waiting for an
+ * answer" is a good reason for a MASTER to clock another block, because
+ * clocking is how the answer can arrive and the clocking blocks.  It is not a
+ * reason for anybody to spin: a slave waiting for an answer can do nothing at
+ * all to hasten it, and on a slave this loop has no blocking call in it, so the
+ * same true answer that kept the master usefully busy left the slave yielding
+ * at a priority above its own shell.  See wire_backoff().
  *
  * WHY KEEPING AWAKE MATTERS, and it is a different reason on each end:
  *
@@ -1396,7 +1399,7 @@ static bool block_due(const node_t *nd)
      * ONE block per LSPI_IDLE_MS however high LSPI_BLOCKS_PER_TURN is set - the
      * timestamps move between two iterations of the loop above.  Whether the
      * block is clocked at all still depends on how often turn() is called, and
-     * with this kernel's 10 ms tick an idle master's real cadence is the tick's;
+     * with the kernel's 1 ms tick an idle master's real cadence is the tick's;
      * the floor is only the shortest gap it will leave.
      */
     return (uint32_t)(now_ms() - nd->last_block_ms) >= LSPI_IDLE_MS;
@@ -1430,101 +1433,19 @@ static int ack_owed_class(const node_t *nd)
     return -1;
 }
 
-/*
- * Is there anything for the wire to do RIGHT NOW?
- *
- * Read under the lock.  Six things count, and none of them is "the link has
- * traffic" in general:
- *
- *   - the ring has bytes.  A frame was emitted on the last turn and the round
- *     after this one will carry it;
- *   - a frame is READY to go on a windowed class.  ag_nlink_tx_waiting_bytes()
- *     is the call the scheduler itself is fed from, and it counts what is
- *     unsent plus what is DUE to go again - so a frame waiting on its
- *     retransmission timer does not hold the fast path open.  Waiting on a
- *     timer is what the tick is for;
- *   - the stream queue holds a whole message.  That class has no window, so
- *     waiting_bytes() cannot see it;
- *   - WE OWE AN ACKNOWLEDGEMENT.  This is the state turn() already tracks for
- *     the ack-only emit, asked once through ack_owed_class() - the same test,
- *     not a new one - and it is what makes a master that is only RECEIVING have
- *     work: it owes acks, it is the only clock, and without this it would sleep
- *     the tick and starve its own peer of the clock that peer needs to answer;
- *   - WE ARE WAITING FOR AN ANSWER: frames sent and not yet acknowledged, with
- *     nothing heard back.  The answer to those frames can only leave inside a
- *     block WE clock, so a master that stops clocking because its own queues are
- *     empty makes every round trip cost a scheduler tick - which is the measured
- *     `link get`: nodedrv.c asks 232 bytes and waits, 682 ms an exchange, 340
- *     B/s, against the UART's 5 ms.  That is latency, not bandwidth, and nothing
- *     about it was lost or corrupt;
- *   - the peer said something within LSPI_LIVE_MS (rx_frames, which counts an
- *     acknowledgement as talking).  It usually has more.
- *
- * THE GUARD, and it is why the fifth test above is not simply "unacknowledged
- * frames".  A peer that has gone away leaves its window non-empty FOR EVER, so
- * that condition alone would hold the fast path open for ever: a core burned
- * clocking empty blocks at a wire that is not there.  So it holds only while
- * nd->fruitless < LSPI_FRUITLESS_MAX - a fruitless counter, reset to zero by any
- * frame heard and by any new transmission from a caller.  A live exchange hears
- * an acknowledgement per round trip, so it never reaches the bound and never
- * falls out of the fast path; an absent peer costs about 20 ms of clocking and
- * then goes back to the tick.  Everything else here is bounded by construction:
- * an owed ack is cleared by the very next turn, which emits it.
- *
- * AND THE PIECES MEAN SLIGHTLY DIFFERENT THINGS ON EACH END, which is worth
- * reading before changing one:
- *
- *   - the ring, the stream queue, ready frames and an owed acknowledgement are
- *     work on EITHER end - a slave still has to emit a frame and hand it over,
- *     and it still has to answer what arrived, so its loop must not sleep while
- *     any of those is true.  On a slave "ready to go" means the frame is about
- *     to be written to the kernel, which is promptness rather than clocking;
- *   - liveness is the same idea on both - on a master "keep clocking", on a
- *     slave "keep draining and answering";
- *   - WAITING FOR AN ANSWER IS ALSO BOTH, but for opposite reasons: it holds the
- *     master's clock open and it holds the slave's EAR open, because on a slave
- *     the reply lands in the kernel's buffer and only this driver can read it
- *     out.  The two are bounded differently - blocks clocked against wall time -
- *     and awaiting_answer() has the whole of that.
- */
-static bool wire_has_work_now(const node_t *nd)
-{
-    if (nd->ring_fill > 0u) {
-        return true; /* the master's block, or the slave's leftovers */
-    }
-    if (nd->stream_fill > 0u) {
-        return true;
-    }
-    if (ack_owed_class(nd) >= 0) {
-        return true;
-    }
-    const uint32_t t = now_ms();
-    for (int c = 0; c < NL_CLASSES; c++) {
-        if (c == NL_CLS_STREAM) {
-            continue;
-        }
-        if (ag_nlink_tx_waiting_bytes(&nd->tx[c], t) > 0u) {
-            return true; /* ready now */
-        }
-    }
-    if (awaiting_answer(nd)) {
-        /* Asked through the same helper block_due() uses, so on a master the
-         * loop cannot come straight back to a turn that then declines to clock.
-         * Both roles reach it: see the helper for why each has to stay awake. */
-        return true;
-    }
-    return (uint32_t)(t - nd->last_rx_ms) < LSPI_LIVE_MS;
-}
 
 /*
  * What a pumping loop does between two turns - THE one place that decides, and
  * it decides because the alternative has already cost this driver two measured
  * rounds.
  *
- * THE SCHEDULER TICK IS NOT A RATE.  sleep_ms(1) in this kernel is a 10 ms tick
- * ("ten milliseconds is a tick; asking for less does not get less"), so any loop
- * that sleeps between turns pins the wire at a hundred turns a second whatever
- * the bus can do.  Measured: four blocks per 10 ms, about 560 blocks/s, against
+ * THE SCHEDULER TICK IS NOT A RATE - and it is ONE millisecond here, not ten.
+ * This paragraph said ten, which is the figure from a kernel built at 100 Hz;
+ * sdkconfig.defaults sets CONFIG_FREERTOS_HZ=1000 and every board in this pair
+ * is built from it.  The difference decides the whole design of this function:
+ * at ten milliseconds a loop that sleeps between turns is pinned to a hundred
+ * turns a second and yielding instead is worth doing, and at one it is pinned
+ * to a THOUSAND - which is already more than this master has ever clocked.  Measured: four blocks per 10 ms, about 560 blocks/s, against
  * a cable that carries 1 755 781 B/s.  It bit first as pump_task sleeping on
  * the ROLE, and then again as recv_common and nd_poll sleeping after every
  * turn - so the rule lives here now and all three callers use it, because three
@@ -1552,11 +1473,59 @@ static bool wire_has_work_now(const node_t *nd)
  */
 static void wire_backoff(node_t *nd, bool moved)
 {
-    TASK->mutex_lock(nd->lock, UINT32_MAX);
-    const bool busy = moved || wire_has_work_now(nd);
-    TASK->mutex_unlock(nd->lock);
-
-    if (busy) {
+    (void)nd;
+    /*
+     * ONLY A TURN THAT DID SOMETHING MAY COME STRAIGHT BACK.  Wanting to do
+     * something is not doing something, and the difference is a board that
+     * answers its console and one that does not.
+     *
+     * WHAT THE OLD RULE WAS AND WHAT IT COST.  It yielded whenever the turn
+     * moved bytes OR wire_has_work_now() said the wire had anything pending -
+     * an unacknowledged frame, an owed acknowledgement, a peer heard from in
+     * the last 20 ms.  On a MASTER that is harmless: a turn with work clocks a
+     * block, and clocking blocks inside the transfer, so the task is off the
+     * processor for most of every pass and everything below it runs.
+     *
+     * ON A SLAVE THERE IS NO BLOCKING CALL IN THE WHOLE LOOP.  Its turn drains
+     * the kernel's buffer with spi_link_read(..., 0), which polls by
+     * definition, and hands bytes back the same way.  So a slave with a frame
+     * outstanding - which is EVERY slave in the second after `drv load`, since
+     * bringing the link up announces a reset - had `busy` true, nothing to
+     * block on, and a yield.
+     *
+     * WHAT THAT DID, MEASURED: `drv load c:\drv\linkspi.sys` on the slave
+     * printed the loader's line and then never returned a prompt, and no
+     * command on that board answered again.  Twice, on the first load after a
+     * boot, 22 Sep; with this rule the same command returns at once and the
+     * link comes up.  That is the whole of what is established.
+     *
+     * THE MECHANISM IS NOT.  The first draft of this comment said the task is
+     * above the shell, and it is not: ag_svc_start hands out priority 1, below
+     * every application, and the console runs at 10.  So this is not a simple
+     * case of a high-priority task starving a low one, and the honest form of
+     * the finding is the measurement above rather than a story that fits it.
+     * What can be said without guessing is the rule itself, which holds whatever
+     * the scheduler does: a loop with no blocking call in it must not decide
+     * how often to go round by asking whether it WANTS to do something.
+     *
+     * THE SLEEP COSTS NOTHING HERE, and the number behind that is worth having
+     * because the comment above this function had it wrong.  It says a tick is
+     * ten milliseconds; CONFIG_FREERTOS_HZ is 1000 in sdkconfig.defaults, so a
+     * tick on these boards is ONE - and one tick of floor is a thousand turns
+     * a second against a master that has never been measured above 610 blocks
+     * a second.  The pacing this rule was protecting was not being paid for by
+     * the yield; it was being paid for by a tick that is ten times shorter than
+     * the file believed.
+     *
+     * So: yield after a turn that moved something (it also blocked, on a
+     * master, and on a slave it is real progress), and otherwise let the tick
+     * pass.  wire_has_work_now(), which asked "is anything pending", is gone
+     * with this: it had exactly one caller and answering yes was the whole
+     * defect.  Whether to CLOCK a block is a different question and block_due()
+     * still asks it, through awaiting_answer() and the fruitless counter -
+     * both of which that function also used, and both of which stay.
+     */
+    if (moved) {
         TASK->yield();
     } else {
         TASK->sleep_ms(1);
