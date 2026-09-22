@@ -889,18 +889,40 @@ static ag_err_t spi_xfer_locked(int bus, int cs, const void *tx, void *rx,
         if (rx != NULL) {
             return -AG_EINVAL;
         }
+        /*
+         * Chip select must NOT come up between the pieces.  It used to, and
+         * that made the dicing visible on the wire to anyone who frames on it:
+         * a peer taking chip select as the frame boundary saw one 5 KB block
+         * arrive as six.  So the bus is held for the whole run and every piece
+         * but the last carries CS_KEEP_ACTIVE, which leaves the line down
+         * across the gap.  The caller sees one transfer because the far end
+         * does too.
+         */
+        esp_err_t ae = spi_device_acquire_bus(dev, portMAX_DELAY);
+        if (ae != ESP_OK) {
+            return from_esp(ae);
+        }
         const uint8_t *p = (const uint8_t *)tx;
         size_t         left = len;
         while (left > 0) {
             const size_t n = (left > AG_PORT_SPI_BOUNCE) ? AG_PORT_SPI_BOUNCE
                                                          : left;
-            const ag_err_t e = ag_port_spi_xfer(bus, cs, p, NULL, n);
-            if (e != AG_OK) {
-                return e;
+            memcpy(s_spi[bus].bounce, p, n);
+            spi_transaction_t piece = {
+                .flags = (n < left) ? SPI_TRANS_CS_KEEP_ACTIVE : 0u,
+                .length = n * 8u,
+                .tx_buffer = s_spi[bus].bounce,
+                .rx_buffer = NULL,
+            };
+            ae = spi_device_polling_transmit(dev, &piece);
+            if (ae != ESP_OK) {
+                spi_device_release_bus(dev);
+                return from_esp(ae);
             }
             p += n;
             left -= n;
         }
+        spi_device_release_bus(dev);
         return AG_OK;
     }
 
