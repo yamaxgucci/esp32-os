@@ -63,6 +63,9 @@ def main():
     ap.add_argument("--secs", type=int, default=90,
                     help="how long the screen end serves")
     ap.add_argument("--app", default="c:\\gfxdemo.axe")
+    ap.add_argument("--spi", action="store_true",
+                    help="the screen goes over SPI (both ends), not the UART")
+    ap.add_argument("--khz", type=int, default=20000)
     ap.add_argument("--log", default=os.path.join(LOGDIR, "remdisp.log"))
     a = ap.parse_args()
 
@@ -80,8 +83,24 @@ def main():
         # THE RECEIVER FIRST.  The sender's first band would otherwise land on a
         # board that is not listening, and a picture that starts half way
         # through is the kind of thing that gets blamed on the wire.
-        print(say(g, "run c:\\remterm.axe 4000000 %d" % a.secs, wait=2.0,
-                  timeout=15.0))
+        # ONE WIRE, ONE DRIVER, ON BOTH ENDS.  NODELINK binds uart1 at boot and
+        # both transports below want the same four pins; with it loaded the
+        # first run showed 11343 stray bytes at the screen end and a -60 from
+        # the link.
+        # BOTH ENDS LET GO BEFORE EITHER OPENS.  The screen end unloading
+        # alone is not enough: the host still has NODELINK bound and is driving
+        # pin 11 as a UART transmitter while the screen tries to bring the same
+        # pin up as an SPI slave, and spi_link_open then never returns.  It
+        # worked by accident the first time it was tried by hand, because that
+        # board happened to have been left with the link already unloaded.
+        print(say(h, "drv unload NODELINK", wait=1.5, timeout=20.0))
+        print(say(g, "drv unload NODELINK", wait=1.5, timeout=20.0))
+        if a.spi:
+            print(say(g, "run c:\\remterm.axe spi %d %d" % (a.khz, a.secs),
+                      wait=2.0, timeout=15.0))
+        else:
+            print(say(g, "run c:\\remterm.axe 4000000 %d" % a.secs, wait=2.0,
+                      timeout=15.0))
         time.sleep(2.0)
 
         # THE CLUSTER LINK LETS GO OF THE WIRE FIRST.
@@ -92,7 +111,6 @@ def main():
         # the link: the two of them talking over each other.  One wire, one
         # driver - and that is the whole reason this demo is a separate script
         # and not a line added to the cluster's harness.
-        print(say(h, "drv unload NODELINK", wait=2.0, timeout=20.0))
         print(say(h, "drv load c:\\drv\\remdisp.sys", wait=2.0, timeout=30.0))
         print(say(h, "dev", wait=2.0))
         print(say(h, "run %s" % a.app, wait=6.0, timeout=60.0))

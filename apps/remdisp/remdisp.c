@@ -137,6 +137,103 @@ static bool               s_up;
 /* One frame, built here and written in one call.  Static because the console
  * task's stack is not this driver's to spend, and the kernel serialises every
  * callback that uses it. */
+/* ---------------------------------------------------------------------- */
+/* The wire: a UART, or the SPI the same four pins can carry                */
+/* ---------------------------------------------------------------------- */
+/*
+ * WHY THIS IS A SWITCH AND NOT A SECOND DRIVER.  Everything above and below
+ * writes FRAMES - magic, length, payload, checksum - into a byte stream and
+ * never asks what carries it.  That is the whole reason this path runs at the
+ * wire's rate while the cluster link over the same copper manages a few
+ * thousand bytes a second: there is no window, no acknowledgement and no
+ * retransmission here, and a band that is damaged is a band redrawn on the
+ * next frame.  Carrying the same stream over SPI is therefore a change of two
+ * functions, not a change of design.
+ *
+ * AND SPI IS THE EASY CASE HERE, which is worth saying because it is the hard
+ * case for the cluster link.  A link has to let the far end speak, so its
+ * master clocks blocks whether or not it has anything to send - measured: 93%
+ * of them empty.  A screen is ONE WAY.  This master clocks only when it has
+ * pixels, so there are no empty blocks at all, and the reverse channel is one
+ * byte that a poll ten times a second can collect.
+ *
+ * [remdisp] in SYSTEM.CFG:  wire = uart | spi, and for spi: bus, cs, khz,
+ * block, gap_us.  The default is the UART, so a board that says nothing keeps
+ * the behaviour it had.
+ */
+#define RD_WIRE_UART 0
+#define RD_WIRE_SPI  1
+
+static int      s_wire = RD_WIRE_UART;
+static int      s_bus  = 2;
+static int      s_cs   = 10;
+static uint32_t s_khz  = 20000u;
+/*
+ * THE BLOCK IS WHAT THE FAR END ARMS, so a write longer than one is truncated
+ * at the slave and the rest is clocked into a chip whose transaction has
+ * ended.  A frame here is up to 5194 bytes, so the write is CUT INTO BLOCKS
+ * and the far end puts the stream back together the same way it does over a
+ * UART - which it already knows how to do, because a UART has no blocks
+ * either.
+ *
+ * 512 rather than the 8192 one transfer could carry: the kernel's slave
+ * service was measured falling over at 4096 (123 stalls and 123 rebuilds of
+ * the interface in one run), and this is not the place to find out why.
+ */
+static uint32_t s_blk  = 512u;
+/*
+ * Dead time between two blocks, because the far end has to have the next
+ * transaction armed when the select falls and a master clocking back to back
+ * leaves it no room.  The cluster link measured this as load-bearing on the
+ * same pair; 0 is legal and worth trying, which is what the key is for.
+ */
+static uint32_t s_gap  = 100u;
+
+static void wire_gap(void)
+{
+    if (s_gap == 0u) {
+        return;
+    }
+    const uint64_t t0 = ag_api()->time->us();
+    while ((uint32_t)(ag_api()->time->us() - t0) < s_gap) {
+        /* bounded by the number above: deliberate dead time, not a stall */
+    }
+}
+
+static void wire_write(const uint8_t *p, uint32_t n)
+{
+    if (s_wire == RD_WIRE_UART) {
+        (void)io->uart_write(LINK_PORT, p, n);
+        return;
+    }
+    while (n > 0u) {
+        const uint32_t k = (n > s_blk) ? s_blk : n;
+        (void)io->spi_xfer(s_bus, s_cs, p, NULL, k);
+        p += k;
+        n -= k;
+        if (n > 0u) {
+            wire_gap();
+        }
+    }
+}
+
+/*
+ * What the far end has said, which is one byte and rarely.  On SPI a receive
+ * needs a clock, so this one clocks a short empty block; the zeros it reads
+ * when nothing was queued are skipped by the caller, which is scanning for a
+ * single character anyway.
+ */
+static int32_t wire_read(uint8_t *p, uint32_t n)
+{
+    if (s_wire == RD_WIRE_UART) {
+        return io->uart_read(LINK_PORT, p, n, 0);
+    }
+    if (io->spi_xfer(s_bus, s_cs, NULL, p, n) != AG_OK) {
+        return 0;
+    }
+    return (int32_t)n;
+}
+
 static uint8_t s_frame[5u + FR_MAX_PAYLOAD + 1u];
 
 static void send_frame(uint8_t op, const uint8_t *payload, uint32_t len)
@@ -163,7 +260,7 @@ static void send_frame(uint8_t op, const uint8_t *payload, uint32_t len)
      * stalling to retry would stop the console or the application for the sake
      * of one rectangle.
      */
-    (void)io->uart_write(LINK_PORT, s_frame, 5u + len + 1u);
+    wire_write(s_frame, 5u + len + 1u);
 }
 
 static void put16(uint8_t *p, uint32_t v)
@@ -262,7 +359,7 @@ static void poll_far_end(void)
 {
     uint8_t buf[16];
     for (;;) {
-        const int32_t n = io->uart_read(LINK_PORT, buf, sizeof(buf), 0);
+        const int32_t n = wire_read(buf, sizeof(buf));
         if (n <= 0) {
             return;
         }
@@ -821,12 +918,53 @@ ag_err_t ag_driver_init(void)
      * header warns about.  Failing now also means the fault arrives as a driver
      * that did not load rather than as a screen that stays dark for no reason.
      */
-    const ag_err_t err = io->uart_config(LINK_PORT, LINK_BAUD, 8, 0, 1);
-    if (err != AG_OK) {
-        ag_printf("REMDISP: uart%d at %u baud: %s\n", LINK_PORT,
-                  (unsigned)LINK_BAUD, ag_strerror(err));
-        ag_printf("REMDISP: set [uart%d] tx/rx in C:\\BOARD.CFG\n", LINK_PORT);
-        return err;
+    /* Which wire, before anything is opened.  A board that says nothing gets
+     * the UART, which is what every board that has one has had. */
+    char wire[8];
+    ag_strlcpy(wire, "uart", sizeof(wire));
+    if (ag_api()->cfg != NULL && AG_HAS(ag_api()->cfg, get_str)) {
+        (void)ag_api()->cfg->get_str("remdisp.wire", wire, sizeof(wire));
+    }
+    if (wire[0] == 's' || wire[0] == 'S') {
+        s_wire = RD_WIRE_SPI;
+    }
+    if (ag_api()->cfg != NULL && AG_HAS(ag_api()->cfg, get_int)) {
+        s_bus = ag_api()->cfg->get_int("remdisp.bus", s_bus);
+        s_cs = ag_api()->cfg->get_int("remdisp.cs", s_cs);
+        s_khz = (uint32_t)ag_api()->cfg->get_int("remdisp.khz", (int32_t)s_khz);
+        s_blk = (uint32_t)ag_api()->cfg->get_int("remdisp.block",
+                                                 (int32_t)s_blk);
+        const int32_t g = ag_api()->cfg->get_int("remdisp.gap_us",
+                                                 (int32_t)s_gap);
+        s_gap = (g > 0) ? (uint32_t)g : 0u;
+    }
+    if (s_blk == 0u || s_blk > 4096u) {
+        s_blk = 512u;
+    }
+
+    ag_err_t err;
+    if (s_wire == RD_WIRE_SPI) {
+        if (!AG_HAS(io, spi_xfer) || !AG_HAS(io, spi_config)) {
+            ag_printf("REMDISP: this kernel has no io->spi_xfer\n");
+            return -AG_ENOTSUP;
+        }
+        err = io->spi_config(s_bus, s_cs, s_khz);
+        if (err != AG_OK) {
+            ag_printf("REMDISP: spi%d cs%d at %u kHz: %s\n", s_bus, s_cs,
+                      (unsigned)s_khz, ag_strerror(err));
+            ag_printf("REMDISP: set [spi%d] sck/mosi/miso in C:\\BOARD.CFG\n",
+                      s_bus);
+            return err;
+        }
+    } else {
+        err = io->uart_config(LINK_PORT, LINK_BAUD, 8, 0, 1);
+        if (err != AG_OK) {
+            ag_printf("REMDISP: uart%d at %u baud: %s\n", LINK_PORT,
+                      (unsigned)LINK_BAUD, ag_strerror(err));
+            ag_printf("REMDISP: set [uart%d] tx/rx in C:\\BOARD.CFG\n",
+                      LINK_PORT);
+            return err;
+        }
     }
     s_up = true;
 

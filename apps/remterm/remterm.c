@@ -222,10 +222,30 @@ static uint8_t  s_rx[RX_CHUNK];
 static uint32_t s_have;
 static uint32_t s_at;
 
+/*
+ * WHICH WIRE.  `remterm spi [khz]` puts this end on the SPI the same four pins
+ * carry, as a SLAVE: the board with the pixels holds the clock, which it must,
+ * because it is the one with something to say.
+ *
+ * The kernel keeps the blocks armed and hands this a plain byte stream
+ * (spi_link_open/read, ABI 0.57), so everything below is unchanged - the
+ * framer already puts a stream back together and has never known what carried
+ * it.  That is the whole of the change, and it is the reason the screen path
+ * is worth copying onto SPI at all: no window, no acknowledgement, nothing to
+ * port.
+ */
+static int      s_spi;   /* 0 = UART, else the bus number */
+static int      s_cs = 10;
+
 static int next_byte(uint32_t ms)
 {
     if (s_at >= s_have) {
-        const int32_t n = ag_uart_read(LINK_PORT, s_rx, sizeof(s_rx), ms);
+        int32_t n;
+        if (s_spi != 0) {
+            n = g_ag_api->io->spi_link_read(s_spi, s_rx, sizeof(s_rx), ms);
+        } else {
+            n = ag_uart_read(LINK_PORT, s_rx, sizeof(s_rx), ms);
+        }
         if (n <= 0) {
             return -1;
         }
@@ -301,9 +321,20 @@ static void want_text(void)
 
 int ag_main(int argc, char **argv)
 {
-    uint32_t baud = LINK_BAUD;
-    if (argc >= 2 && (!parse_u32(argv[1], &baud) || baud == 0)) {
-        ag_printf("usage: remterm [baud] [secs]\n");
+    /*
+     * `remterm spi [khz] [secs]` instead of `remterm [baud] [secs]`.  One word
+     * rather than a flag, because it changes what the first number means and a
+     * flag would let the two disagree.
+     */
+    int first = 1;
+    if (argc >= 2 && argv[1][0] == 's' && argv[1][1] == 'p') {
+        s_spi = 2; /* overridden below; the C3's and the Zero's differ */
+        first = 2;
+    }
+
+    uint32_t baud = s_spi ? 20000u : LINK_BAUD; /* kHz when it is SPI */
+    if (argc > first && (!parse_u32(argv[first], &baud) || baud == 0)) {
+        ag_printf("usage: remterm [baud] [secs] | remterm spi [khz] [secs]\n");
         return 1;
     }
     /*
@@ -313,8 +344,8 @@ int ag_main(int argc, char **argv)
      * to travel down the same console the harness is reading.
      */
     uint32_t secs = 0;
-    if (argc >= 3 && !parse_u32(argv[2], &secs)) {
-        ag_printf("usage: remterm [baud] [secs]\n");
+    if (argc > first + 1 && !parse_u32(argv[first + 1], &secs)) {
+        ag_printf("usage: remterm [baud] [secs] | remterm spi [khz] [secs]\n");
         return 1;
     }
 
@@ -323,12 +354,40 @@ int ag_main(int argc, char **argv)
         return 1;
     }
 
-    const ag_err_t err = g_ag_api->io->uart_config(LINK_PORT, baud, 8, 0, 1);
-    if (err != AG_OK) {
-        ag_printf("uart%d at %u baud: %s\n", LINK_PORT, (unsigned)baud,
-                  ag_strerror(err));
-        ag_printf("is [uart%d] tx/rx set in C:\\BOARD.CFG?\n", LINK_PORT);
-        return 1;
+    ag_err_t err;
+    if (s_spi != 0) {
+        if (!AG_HAS(g_ag_api->io, spi_link_open)) {
+            ag_printf("remterm: this kernel has no io->spi_link_open "
+                      "(ABI 0.57)\n");
+            return 1;
+        }
+        /*
+         * The bus is this board's spare one - the panel and the card have the
+         * other - and 512 is the block, which must be what the far end writes
+         * in.  See remdisp.c: it cuts a frame into blocks of exactly this.
+         */
+        s_spi = 3;
+        /* Said BEFORE the call, because the call is where this hung the first
+         * time it was tried and a silent app is a silent fault. */
+        ag_printf("remterm: opening spi%d cs%d as a link at %u kHz...\n",
+                  s_spi, s_cs, (unsigned)baud);
+        err = g_ag_api->io->spi_link_open(s_spi, s_cs, baud, 512u);
+        ag_printf("remterm: spi_link_open said %d\n", (int)err);
+        if (err != AG_OK) {
+            ag_printf("spi%d cs%d as a link at %u kHz: %s\n", s_spi, s_cs,
+                      (unsigned)baud, ag_strerror(err));
+            ag_printf("is [spi%d] sck/mosi/miso set in C:\\BOARD.CFG?\n",
+                      s_spi);
+            return 1;
+        }
+    } else {
+        err = g_ag_api->io->uart_config(LINK_PORT, baud, 8, 0, 1);
+        if (err != AG_OK) {
+            ag_printf("uart%d at %u baud: %s\n", LINK_PORT, (unsigned)baud,
+                      ag_strerror(err));
+            ag_printf("is [uart%d] tx/rx set in C:\\BOARD.CFG?\n", LINK_PORT);
+            return 1;
+        }
     }
 
     /*
@@ -340,7 +399,11 @@ int ag_main(int argc, char **argv)
      */
     {
         const uint8_t hello = (uint8_t)'H';
-        (void)ag_uart_write(LINK_PORT, &hello, 1u);
+        if (s_spi != 0) {
+            (void)g_ag_api->io->spi_link_write(s_spi, &hello, 1u);
+        } else {
+            (void)ag_uart_write(LINK_PORT, &hello, 1u);
+        }
     }
 
     ag_coninfo_t con;
