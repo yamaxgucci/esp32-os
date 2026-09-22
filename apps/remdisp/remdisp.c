@@ -234,7 +234,23 @@ static int32_t wire_read(uint8_t *p, uint32_t n)
     return (int32_t)n;
 }
 
-static uint8_t s_frame[5u + FR_MAX_PAYLOAD + 1u];
+/*
+ * THE FRAME BUFFER IS DMA-CAPABLE WHEN THE WIRE IS SPI, and that is not a
+ * micro-optimisation - it is the difference between a picture and nothing.
+ *
+ * The port splits any transfer longer than AG_PORT_SPI_BOUNCE (1024) into
+ * separate transactions when it has to copy through its bounce buffer, and a
+ * separate transaction means the chip select RISES between the pieces.  The
+ * far end frames on exactly that, so a 5194-byte band arrived as six
+ * fragments and was destroyed, while an 80-byte console row - one transaction
+ * either way - arrived perfectly.  Measured: 24 rows, 0 rectangles, 2 511 644
+ * bytes counted stray.
+ *
+ * io_hw.c takes a fast path for a write-only transfer FROM DMA-CAPABLE MEMORY:
+ * no copy and no cap, so the whole frame crosses as one transaction.  A static
+ * array in a loadable driver is not that memory, so the buffer is allocated.
+ */
+static uint8_t *s_frame;
 
 static void send_frame(uint8_t op, const uint8_t *payload, uint32_t len)
 {
@@ -938,8 +954,17 @@ ag_err_t ag_driver_init(void)
                                                  (int32_t)s_gap);
         s_gap = (g > 0) ? (uint32_t)g : 0u;
     }
-    if (s_blk == 0u || s_blk > 4096u) {
+    if (s_blk == 0u || s_blk > 8192u) {
         s_blk = 512u;
+    }
+
+    s_frame = (uint8_t *)ag_malloc_caps(5u + FR_MAX_PAYLOAD + 1u,
+                                        (s_wire == RD_WIRE_SPI) ? AG_MEM_DMA
+                                                                : AG_MEM_DEFAULT);
+    if (s_frame == NULL) {
+        ag_printf("REMDISP: no room for a %u byte frame buffer\n",
+                  (unsigned)(5u + FR_MAX_PAYLOAD + 1u));
+        return -AG_ENOMEM;
     }
 
     ag_err_t err;

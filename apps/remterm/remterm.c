@@ -236,6 +236,7 @@ static uint32_t s_at;
  */
 static int      s_spi;   /* 0 = UART, else the bus number */
 static int      s_cs = 10;
+static uint32_t s_dumped;
 
 static int next_byte(uint32_t ms)
 {
@@ -245,6 +246,23 @@ static int next_byte(uint32_t ms)
             n = g_ag_api->io->spi_link_read(s_spi, s_rx, sizeof(s_rx), ms);
         } else {
             n = ag_uart_read(LINK_PORT, s_rx, sizeof(s_rx), ms);
+        }
+        /*
+         * THE FIRST BLOCK THAT EVER ARRIVES, SAID OUT LOUD, and once.
+         *
+         * The SPI transport counted five million stray bytes and not one
+         * rectangle, which is the framer never finding a magic - and from
+         * above, "the bytes are wrong" and "the bytes are right and the framer
+         * is wrong" look identical.  Sixteen bytes settle it: A5 5A at the
+         * front means the transport is sound, anything else means it is not.
+         */
+        if (n > 0 && s_dumped == 0u) {
+            s_dumped = 1u;
+            ag_printf("remterm: first %d B:", (int)((n > 16) ? 16 : n));
+            for (int32_t i = 0; i < n && i < 16; i++) {
+                ag_printf(" %02x", (unsigned)s_rx[i]);
+            }
+            ag_printf("\n");
         }
         if (n <= 0) {
             return -1;
@@ -371,7 +389,17 @@ int ag_main(int argc, char **argv)
          * time it was tried and a silent app is a silent fault. */
         ag_printf("remterm: opening spi%d cs%d as a link at %u kHz...\n",
                   s_spi, s_cs, (unsigned)baud);
-        err = g_ag_api->io->spi_link_open(s_spi, s_cs, baud, 512u);
+        /*
+         * 8192 AND NOT 512, and the difference is the whole of whether this
+         * works.  A console row is eighty bytes and fits in any block; a BAND
+         * is up to 5194 (FR_MAX_PAYLOAD plus the header and the checksum) and
+         * at 512 it was cut into ELEVEN transactions.  Measured: 24 rows
+         * arrived and NOT ONE rectangle, with 2 876 906 bytes counted stray -
+         * the small frames survived and every large one was destroyed between
+         * its pieces.  One frame, one transaction, and the port's largest is
+         * 8192 which is comfortably above the largest frame.
+         */
+        err = g_ag_api->io->spi_link_open(s_spi, s_cs, baud, 8192u);
         ag_printf("remterm: spi_link_open said %d\n", (int)err);
         if (err != AG_OK) {
             ag_printf("spi%d cs%d as a link at %u kHz: %s\n", s_spi, s_cs,
