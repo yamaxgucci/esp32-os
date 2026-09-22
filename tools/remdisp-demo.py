@@ -66,6 +66,14 @@ def main():
     ap.add_argument("--spi", action="store_true",
                     help="the screen goes over SPI (both ends), not the UART")
     ap.add_argument("--khz", type=int, default=20000)
+    # The block is how many bytes the SLAVE takes in one assertion of
+    # the chip select, so it has to be at least the largest frame - a
+    # band is up to 5194.  Here because finding the size at which the
+    # slave stops coming up is a sweep.
+    ap.add_argument("--block", type=int, default=512)
+    # The images the run needs, put before anything is unloaded:
+    # --upload HOST=GUEST, repeatable, screen end.
+    ap.add_argument("--upload", action="append", default=[])
     ap.add_argument("--log", default=os.path.join(LOGDIR, "remdisp.log"))
     a = ap.parse_args()
 
@@ -77,6 +85,12 @@ def main():
     try:
         h.reset()
         g.reset()
+        h.pump(3.0)
+        g.pump(3.0)
+        for spec in a.upload:
+            host, guest = spec.split("=", 1)
+            print("upload %s -> %s" % (host, guest))
+            g.put(host, guest, chunk_bytes=127)
         h.pump(8.0)
         g.pump(8.0)
 
@@ -96,7 +110,8 @@ def main():
         print(say(h, "drv unload NODELINK", wait=1.5, timeout=20.0))
         print(say(g, "drv unload NODELINK", wait=1.5, timeout=20.0))
         if a.spi:
-            print(say(g, "run c:\\remterm.axe spi %d %d" % (a.khz, a.secs),
+            print(say(g, "run c:\\remterm.axe spi %d %d %d"
+                      % (a.khz, a.secs, a.block),
                       wait=2.0, timeout=15.0))
         else:
             print(say(g, "run c:\\remterm.axe 4000000 %d" % a.secs, wait=2.0,

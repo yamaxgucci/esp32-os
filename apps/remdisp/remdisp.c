@@ -387,7 +387,18 @@ static void poll_far_end(void)
                 s_prev_h = 0;
             }
         }
-        if ((uint32_t)n < sizeof(buf)) {
+        /*
+         * ONE PASS ON SPI, AND THIS IS NOT A TIDY-UP.  The loop drains a UART
+         * buffer and ends when the buffer is empty, which a UART says by
+         * handing back less than was asked for.  SPI has no buffer and cannot
+         * say it: a read CLOCKS its bytes, so it always returns the full
+         * length, and this loop never ended.  The driver's ten-a-second hook
+         * stayed inside it for ever - measured on the boards at 43651
+         * transactions in twenty seconds, ONE of them carrying real bytes, and
+         * not a single band ever sent, because the hook never came back to
+         * send one.
+         */
+        if (s_wire == RD_WIRE_SPI || (uint32_t)n < sizeof(buf)) {
             return;
         }
     }
@@ -1007,8 +1018,23 @@ ag_err_t ag_driver_init(void)
         return added;
     }
 
-    ag_printf("REMDISP: uart%d at %u baud; %ux%u cells, pixels in %u-row bands\n",
-              LINK_PORT, (unsigned)LINK_BAUD, (unsigned)REM_COLS,
-              (unsigned)REM_ROWS, (unsigned)BAND_ROWS);
+    /*
+     * Which wire, said out loud.  It used to say `uart` whichever one was
+     * open, and a banner that names the wrong transport is worse than none:
+     * a run over SPI printed `uart1 at 4000000 baud` and cost an hour of
+     * looking for a fault in the wrong half of the system.
+     */
+    if (s_wire == RD_WIRE_SPI) {
+        ag_printf("REMDISP: spi%d cs%d at %u kHz, blocks of %u; %ux%u cells, "
+                  "pixels in %u-row bands\n",
+                  s_bus, s_cs, (unsigned)s_khz, (unsigned)s_blk,
+                  (unsigned)REM_COLS, (unsigned)REM_ROWS,
+                  (unsigned)BAND_ROWS);
+    } else {
+        ag_printf("REMDISP: uart%d at %u baud; %ux%u cells, "
+                  "pixels in %u-row bands\n",
+                  LINK_PORT, (unsigned)LINK_BAUD, (unsigned)REM_COLS,
+                  (unsigned)REM_ROWS, (unsigned)BAND_ROWS);
+    }
     return AG_OK;
 }

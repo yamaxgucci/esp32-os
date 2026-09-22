@@ -352,7 +352,7 @@ int ag_main(int argc, char **argv)
 
     uint32_t baud = s_spi ? 20000u : LINK_BAUD; /* kHz when it is SPI */
     if (argc > first && (!parse_u32(argv[first], &baud) || baud == 0)) {
-        ag_printf("usage: remterm [baud] [secs] | remterm spi [khz] [secs]\n");
+        ag_printf("usage: remterm [baud] [secs] | remterm spi [khz] [secs] [block]\n");
         return 1;
     }
     /*
@@ -362,8 +362,18 @@ int ag_main(int argc, char **argv)
      * to travel down the same console the harness is reading.
      */
     uint32_t secs = 0;
+    /*
+     * The block is an argument because finding the size at which the slave
+     * stops coming up is a sweep, and a sweep that costs a rebuild a step is
+     * not a sweep.
+     */
+    uint32_t block = 512u;
+    if (argc > first + 2 && !parse_u32(argv[first + 2], &block)) {
+        ag_printf("remterm: the block must be a number\n");
+        return 1;
+    }
     if (argc > first + 1 && !parse_u32(argv[first + 1], &secs)) {
-        ag_printf("usage: remterm [baud] [secs] | remterm spi [khz] [secs]\n");
+        ag_printf("usage: remterm [baud] [secs] | remterm spi [khz] [secs] [block]\n");
         return 1;
     }
 
@@ -387,36 +397,21 @@ int ag_main(int argc, char **argv)
         s_spi = 3;
         /* Said BEFORE the call, because the call is where this hung the first
          * time it was tried and a silent app is a silent fault. */
-        ag_printf("remterm: opening spi%d cs%d as a link at %u kHz...\n",
-                  s_spi, s_cs, (unsigned)baud);
+        ag_printf("remterm: opening spi%d cs%d as a link at %u kHz, block %u...\n",
+                  s_spi, s_cs, (unsigned)baud, (unsigned)block);
         /*
-         * 8192 AND NOT 512, and the difference is the whole of whether this
-         * works.  A console row is eighty bytes and fits in any block; a BAND
-         * is up to 5194 (FR_MAX_PAYLOAD plus the header and the checksum) and
-         * at 512 it was cut into ELEVEN transactions.  Measured: 24 rows
-         * arrived and NOT ONE rectangle, with 2 876 906 bytes counted stray -
-         * the small frames survived and every large one was destroyed between
-         * its pieces.  One frame, one transaction, and the port's largest is
-         * 8192 which is comfortably above the largest frame.
-         */
-        /*
-         * BACK TO 512 BECAUSE 8192 HANGS THE OPEN.  Measured with nothing at
-         * all on the other end of the cable: spi_link_open(3, 10, 20000, 8192)
-         * never returns, and the same call with 512 returns 0 and runs.  The
-         * link service showed the same shape at 4096 - 123 stalls and 123
-         * rebuilds of the interface in one run - so the service's limit is
-         * somewhere between 512 and 4096 and is the next thing to find.
+         * The block is how many bytes the slave takes in ONE assertion of the
+         * chip select, so it must be at least the largest frame: a console row is
+         * eighty bytes and fits in anything, a BAND is up to 5194.  Holding the
+         * chip select down across a diced write - which the port does now - is
+         * necessary and NOT sufficient: with a 512-byte block armed, the rest of
+         * a held-down 5194-byte transfer is clocked into nothing.
          *
-         * WHAT THAT COSTS, and it is the reason the screen is still on the
-         * UART: a band is up to 5194 bytes and will not cross in one
-         * transaction at 512, so it arrives diced by the chip select and is
-         * destroyed.  Small enough bands WOULD fit (BAND_ROWS = 1 is about 670
-         * bytes) and would cost eight times as many transactions - about 8 fps
-         * against the UART's 13.  So there is no shortcut: the service has to
-         * take a big block before SPI can beat the wire it was meant to
-         * replace.
+         * 512 is the default because 8192 did not come up.  It is the third
+         * argument so that finding where it stops coming up costs a command and
+         * not a rebuild.
          */
-        err = g_ag_api->io->spi_link_open(s_spi, s_cs, baud, 512u);
+        err = g_ag_api->io->spi_link_open(s_spi, s_cs, baud, block);
         ag_printf("remterm: spi_link_open said %d\n", (int)err);
         if (err != AG_OK) {
             ag_printf("spi%d cs%d as a link at %u kHz: %s\n", s_spi, s_cs,
@@ -693,6 +688,28 @@ int ag_main(int argc, char **argv)
               (unsigned)stray);
     ag_printf("encoded: %u packed, %u indexed, %u KB on the wire\n",
               (unsigned)packedframes, (unsigned)idxframes, (unsigned)wirekb);
+    /*
+     * The service's own counters, and they are the difference between knowing
+     * that frames did not arrive and knowing WHY.  Stray bytes say only that
+     * something crossed and did not parse; blocks_unarmed says the peer clocked
+     * while this end had nothing waiting, which is a different fault from a
+     * block that arrived and was rebuilt wrong.  Read here because the shell
+     * cannot: the link closes with the application that opened it.
+     */
+    if (s_spi != 0 && AG_HAS(g_ag_api->io, spi_link_stats)) {
+        ag_spilink_stats_t st;
+        if (g_ag_api->io->spi_link_stats(s_spi, &st) == AG_OK) {
+            ag_printf("spilink: %u blocks, %u with data, %u unarmed, "
+                      "%u dropped\n",
+                      (unsigned)st.blocks_clocked, (unsigned)st.blocks_data,
+                      (unsigned)st.blocks_unarmed, (unsigned)st.bytes_dropped);
+            ag_printf("spilink: %u timeouts, %u stalls, %u rebuilds, "
+                      "%u errors (%d)\n",
+                      (unsigned)st.timeouts, (unsigned)st.stalls,
+                      (unsigned)st.recoveries, (unsigned)st.errors,
+                      (int)st.last_error);
+        }
+    }
     if (flow_ms != 0) {
         ag_printf("pixels flowed for %u ms, %u k pixels/s\n",
                   (unsigned)flow_ms, (unsigned)kpx_s);
