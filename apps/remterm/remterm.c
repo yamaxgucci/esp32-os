@@ -399,7 +399,24 @@ int ag_main(int argc, char **argv)
          * its pieces.  One frame, one transaction, and the port's largest is
          * 8192 which is comfortably above the largest frame.
          */
-        err = g_ag_api->io->spi_link_open(s_spi, s_cs, baud, 8192u);
+        /*
+         * BACK TO 512 BECAUSE 8192 HANGS THE OPEN.  Measured with nothing at
+         * all on the other end of the cable: spi_link_open(3, 10, 20000, 8192)
+         * never returns, and the same call with 512 returns 0 and runs.  The
+         * link service showed the same shape at 4096 - 123 stalls and 123
+         * rebuilds of the interface in one run - so the service's limit is
+         * somewhere between 512 and 4096 and is the next thing to find.
+         *
+         * WHAT THAT COSTS, and it is the reason the screen is still on the
+         * UART: a band is up to 5194 bytes and will not cross in one
+         * transaction at 512, so it arrives diced by the chip select and is
+         * destroyed.  Small enough bands WOULD fit (BAND_ROWS = 1 is about 670
+         * bytes) and would cost eight times as many transactions - about 8 fps
+         * against the UART's 13.  So there is no shortcut: the service has to
+         * take a big block before SPI can beat the wire it was meant to
+         * replace.
+         */
+        err = g_ag_api->io->spi_link_open(s_spi, s_cs, baud, 512u);
         ag_printf("remterm: spi_link_open said %d\n", (int)err);
         if (err != AG_OK) {
             ag_printf("spi%d cs%d as a link at %u kHz: %s\n", s_spi, s_cs,
