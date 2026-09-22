@@ -28,3 +28,7 @@ GRIND32.AXE
 # own.  ESPFLASH talks the ROM loader's protocol down [uart2]; the firmware it
 # writes is a file on this C:, put there with boardput over the network.
 ESPFLASH.AXE
+#
+# Something to LOOK at, for the board whose screen is on the other end of a
+# cable: GFXDEMO draws, and where it lands is the whole demonstration.
+GFXDEMO.AXE

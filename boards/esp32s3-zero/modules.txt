@@ -24,3 +24,16 @@ NODELINK.SYS
 # log, and the UART wire is the one that has to keep answering while the new one
 # is being measured.
 LINKSPI.SYS
+#
+# REMDISP.SYS - THIS BOARD'S SCREEN, AT THE OTHER END OF THE CABLE.
+#
+# It publishes a display device whose panel is uart1, so an application's
+# pixels go down the wire and nothing above it knows.  It does NOT go through
+# the cluster link: no frames, no window, no acknowledgements - which is why it
+# runs at the wire's own rate (400 067 B/s measured at 4 Mbaud, zero corrupt)
+# while the link over the same copper manages a few thousand.
+#
+# LOADED BY HAND, like LINKSPI: the far end has to be running REMTERM.AXE for
+# any of it to mean anything, and a driver that auto-loaded would spend every
+# boot talking to nobody.
+REMDISP.SYS

@@ -141,6 +141,8 @@ def main():
                     help="rewrite [linkspi] khz on BOTH boards and reboot them")
     ap.add_argument("--gap", type=int, default=-1,
                     help="rewrite [linkspi] gap_us on the master the same way")
+    ap.add_argument("--linkbaud", type=int, default=0,
+                    help="[link] baud on BOTH boards: the UART wire's rate")
     ap.add_argument("--drive", type=int, default=-1,
                     help="[spiN] drive on BOTH boards' BOARD.CFG (0..3)")
     ap.add_argument("--gapmax", type=int, default=-1,
@@ -186,6 +188,17 @@ def main():
 
     def retune(tag, path):
         text = io.open(path, encoding="utf-8", newline="").read()
+
+        # [link] first, because it is a different section from [linkspi] and
+        # the UART wire is what it sets.  Same rule as below: only the section
+        # that owns the number, so one run moves one variable.
+        if a.linkbaud:
+            h2, s2, t2 = text.partition("[link]")
+            assert s2, path
+            t2 = re.sub(r"(?m)^baud\s*=\s*\d+", "baud = %d" % a.linkbaud,
+                        t2, 1)
+            text = h2 + s2 + t2
+
         # Inside [linkspi] only: `khz` appears in [spi2] and [spi3] as well, and
         # those are where the bus comes up before the driver asks for its own
         # rate - changing them would move a second variable.
@@ -231,9 +244,10 @@ def main():
                 board.put(redrive(tag, boards[tag]), "c:\\board.cfg",
                           chunk_bytes=127)
 
-        if a.khz or a.gap >= 0 or a.gapmax >= 0 or a.drive >= 0:
-            tee.note("retuning: khz=%s gap=%s gapmax=%s"
-                     % (a.khz or "-", a.gap if a.gap >= 0 else "-",
+        if a.khz or a.gap >= 0 or a.gapmax >= 0 or a.drive >= 0 or a.linkbaud:
+            tee.note("retuning: baud=%s khz=%s gap=%s gapmax=%s"
+                     % (a.linkbaud or "-", a.khz or "-",
+                        a.gap if a.gap >= 0 else "-",
                         a.gapmax if a.gapmax >= 0 else "-"))
             for board, tag in ((m, "master"), (s, "slave")):
                 board.put(retune(tag, packs[tag]), "c:\\system.cfg",
