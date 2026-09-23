@@ -474,6 +474,7 @@ static uint64_t rd_size(ag_device_t *dev)
  * something.
  */
 static rdev_t *s_display_proxy;
+static bool    s_display_real; /* it is a panel, not a buffer */
 
 static rdev_t *proxy_of(ag_handle_t h)
 {
@@ -1267,12 +1268,33 @@ int32_t ag_noderdev_attach(uint32_t timeout_ms)
          */
         const bool is_display = (info[i].cls == AG_DEV_DISPLAY);
         if (is_display) {
-            if (s_display_proxy == NULL) {
+            /*
+             * A PANEL BEATS A BUFFER IN MEMORY, and that is a fact about
+             * screens rather than about registries - the same shape as "a real
+             * converter beats the null one", which is why the audio list lives
+             * in the mixer.  Taking whichever came first sent a megabyte of
+             * pixels to the far board's SOFT framebuffer, where nobody was
+             * looking, while its ST7789 sat beside it in the same listing.
+             *
+             * The far board's driver name is what says which is which; it
+             * travels in the device record already.  Same family of mistake as
+             * pcmnull always being present.
+             */
+            const bool real = (ag_stricmp(info[i].driver, "soft") != 0);
+            const bool better =
+                (s_display_proxy == NULL) ||
+                (real && !s_display_real);
+            if (better) {
+                if (s_display_proxy != NULL && s_display_proxy != p) {
+                    ag_log(AG_LOG_INFO, TAG,
+                           "%s (%s) takes the screen from %s", full,
+                           info[i].driver, s_display_proxy->qualified);
+                }
                 s_display_proxy = p;
+                s_display_real = real;
             } else if (s_display_proxy != p) {
-                ag_log(AG_LOG_WARN, TAG,
-                       "%s: a second remote screen; %s keeps the class",
-                       full, s_display_proxy->qualified);
+                ag_log(AG_LOG_INFO, TAG, "%s: %s already has the screen", full,
+                       s_display_proxy->qualified);
             }
         }
 
