@@ -334,10 +334,55 @@ static void route(wire_t *w, uint8_t chan, const ag_link_addr_t *from,
  * A message addressed past this board is the one exception, and it is decided
  * before the handler table is consulted - see route().
  */
+/*
+ * THE READER RECEIVES INTO A BUFFER THE SIZE OF THE WIRE, and 288 bytes on its
+ * stack was the ceiling on EVERY service on EVERY wire, whatever the driver
+ * said it could carry.  The SPI link reports 2 040 bytes a message; a screen's
+ * rectangles cut to that size crossed the wire intact and were cut to 288 here,
+ * one message at a time, and the picture stayed exactly as slow as before.
+ *
+ * On the heap and not the stack, because the stack is the one that serves the
+ * far node's file reads down through FAT and the SD driver - it has been
+ * overflowed once already (see reader_start), and two more kilobytes on it
+ * would be the next time.  Sized once per reader from the driver's own mtu,
+ * never smaller than the 288 every service was written against.
+ */
+#define READER_BUF_MIN 288u
+#define READER_BUF_MAX 4096u
+
 static void reader_task(void *arg)
 {
-    wire_t *w = (wire_t *)arg;
-    uint8_t buf[288];
+    wire_t  *w = (wire_t *)arg;
+    uint32_t cap = READER_BUF_MIN;
+    if (w->ops != NULL && w->ops->info != NULL) {
+        ag_link_info_t li;
+        memset(&li, 0, sizeof(li));
+        if (w->ops->info(w->dev, &li) == AG_OK && li.mtu > 0u) {
+            /* The payload plus room for whatever header the driver keeps on
+             * top of its own mtu. */
+            cap = li.mtu + 64u;
+        }
+    }
+    if (cap < READER_BUF_MIN) {
+        cap = READER_BUF_MIN;
+    }
+    if (cap > READER_BUF_MAX) {
+        cap = READER_BUF_MAX;
+    }
+    uint8_t *buf = (uint8_t *)ag_port_alloc(cap, AG_MEM_BYTE);
+    if (buf == NULL) {
+        ag_log(AG_LOG_ERROR, "link",
+               "%s: no %u bytes for the reader; falling back to 288", w->name,
+               (unsigned)cap);
+        cap = READER_BUF_MIN;
+        buf = (uint8_t *)ag_port_alloc(cap, AG_MEM_BYTE);
+        if (buf == NULL) {
+            w->reader = NULL;
+            ag_port_task_delete(NULL);
+            return;
+        }
+    }
+
     while (!w->reader_stop) {
         if (w->ops == NULL) {
             ag_port_task_delay(ag_port_ms_to_ticks(20));
@@ -346,13 +391,13 @@ static void reader_task(void *arg)
         uint8_t        chan = 0;
         ag_link_addr_t from;
         memset(&from, 0, sizeof(from));
-        const int32_t n =
-            w->ops->recv_a(w->dev, &chan, buf, sizeof(buf), 50, &from);
+        const int32_t n = w->ops->recv_a(w->dev, &chan, buf, cap, 50, &from);
         if (n <= 0) {
             continue;
         }
         route(w, chan, &from, buf, (uint16_t)n);
     }
+    ag_port_free(buf);
     w->reader = NULL;
     ag_port_task_delete(NULL);
 }

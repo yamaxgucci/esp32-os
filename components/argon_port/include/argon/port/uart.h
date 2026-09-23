@@ -83,6 +83,39 @@ int32_t  ag_port_uart_read(int port, void *buf, size_t len,
                            uint32_t timeout_ms);
 int32_t  ag_port_uart_pending(int port);
 
+/*
+ * Wait until everything handed to this port has actually left it - the
+ * driver's own buffer and the peripheral's FIFO both empty.
+ *
+ * Not ag_port_uart_flush, which is a different thing wearing a similar name:
+ * that one throws away what has arrived, and using it to make room for a DMA
+ * transfer would silently eat the far end's replies.
+ *
+ * It exists because DMA and the ordinary write are two masters of one
+ * transmitter.  Whoever mixes them has to hand over cleanly, and this is the
+ * handover.
+ */
+ag_err_t ag_port_uart_tx_wait(int port, uint32_t timeout_ms);
+
+bool     ag_port_uart_dma_ready(int port);
+int32_t  ag_port_uart_dma_write(int port, const void *buf, size_t len);
+
+/*
+ * The same, in two halves: hand a buffer over and come back for it later.
+ *
+ * Waiting for each transfer before starting the next leaves the transmitter
+ * idle between them - the interrupt has to be taken, the task scheduled, the
+ * next transfer started, and the wire has nothing to send meanwhile.  Submit
+ * keeps a small queue full instead, and drain waits for what is still out.
+ * The buffers belong to the hardware until drain returns.
+ */
+int32_t  ag_port_uart_dma_submit(int port, const void *buf, size_t len);
+ag_err_t ag_port_uart_dma_drain(int port);
+
+/* Receive by DMA into the caller's buffer; len a multiple of 4096. */
+int32_t  ag_port_uart_dma_read(int port, void *buf, size_t len,
+                               uint32_t timeout_ms);
+
 #include <argon/port/impl/uart.h>
 
 #endif /* ARGON_PORT_UART_H */

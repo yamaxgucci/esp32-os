@@ -109,10 +109,14 @@ CONFIG_ARGON_APP_ARENA_KB=32
 CONFIG_ESP_SYSTEM_MEMPROT_FEATURE=n
 CONFIG_ESP_SYSTEM_MEMPROT_FEATURE_LOCK=n
 
-# Radios on, for the same reason as everywhere else: the test harnesses need
-# them, and a board that cannot be reached is a board that cannot be debugged.
-CONFIG_ARGON_ENABLE_NET=y
-CONFIG_ARGON_NET_WIFI=y
+# WI-FI OFF TOO, since 23 Sep 2026, at Maxim's word.  It was kept for one
+# reason - the board sat on a power bank and telnet was its only console.  It
+# is on USB now, beside the Zero, and what it is for is the wire: the stack
+# held ~50 KB of a machine that had 25 KB free after boot with its largest
+# piece 7 KB, which is less than one DMA ring for the UART at 16 Mbaud.
+# Getting files on is mksysfs over USB, as on every other board here.
+CONFIG_ARGON_ENABLE_NET=n
+CONFIG_ARGON_NET_WIFI=n
 CONFIG_ETH_USE_OPENETH=n
 
 # BLE IS OFF ON THIS BOARD, and it is the 400 KB that decides it.
@@ -133,7 +137,7 @@ CONFIG_ETH_USE_OPENETH=n
 CONFIG_ARGON_ENABLE_BLE=n
 CONFIG_BT_ENABLED=n
 
-CONFIG_ARGON_NET_WIFI_MON=y
+CONFIG_ARGON_NET_WIFI_MON=n
 
 # Smaller than the C6's, and that is the 400 KB talking: these buffers come out
 # of internal SRAM, which is the memory this part is short of.

@@ -190,7 +190,17 @@ _Static_assert((int)NL_CLS_CONTROL == (int)AG_LINK_CONTROL &&
  * block that carries it is filled, and on a slave it holds only what
  * spi_link_write REFUSED (its transmit ring was full), which wire_write gives
  * straight over whenever the ring is empty. */
-#define LSPI_RING      4096u
+/*
+ * Room for several of the LARGEST frames, and that is the rule rather than a
+ * number: a frame that does not fit is not started (see turn()).  At 4096 with
+ * NL_QUANTUM at 256 the ring held fourteen frames; with the SPI build's 2048 it
+ * held ONE, and ring_append wrote as much of the second as fitted and dropped
+ * the rest - a truncated frame on the wire whose sequence number the window
+ * had already spent.  Measured at 40 MHz on a clean transport (0 unarmed, 0
+ * dropped at the far service): 538 of 867 frames sent twice and 464 gaps, a
+ * 77 KB file in 39 seconds.
+ */
+#define LSPI_RING      16384u
 #define LSPI_RING_MASK (LSPI_RING - 1u)
 
 /*
@@ -419,8 +429,19 @@ _Static_assert((int)NL_CLS_CONTROL == (int)AG_LINK_CONTROL &&
  * NL_QUANTUM is then two multiplications, and that is the moment to change
  * these two lines.
  */
+/*
+ * AND THE BULK WINDOW IS BYTES, NOT FRAMES - measured, 23 Sep, the day the
+ * SPI build's quantum went from 256 to 2048.  Twenty-four frames were 6.8 KB
+ * in flight and became 48 KB, which this wire drains in about 120 ms at the
+ * rate it clocks blocks; the retransmit timer, measured from small exchanges
+ * at 1-2 ms of round trip, is 30.  So the timer fired long before the frames
+ * had even left the slave, and the window went round again: 563 of 890 frames
+ * sent twice, every one of them a frame the master already had.  The bytes a
+ * window may have outstanding are what nodelink's 24 x 256 always meant.
+ */
+#define LSPI_WIN_BYTES   (24u * 256u)
 #define LSPI_WIN_CONTROL 4u
-#define LSPI_WIN_BULK    24u
+#define LSPI_WIN_BULK                                                            ((LSPI_WIN_BYTES / NL_QUANTUM) < 3u ? 3u : (LSPI_WIN_BYTES / NL_QUANTUM))
 
 /* The stream class is not windowed - it is not retransmitted - so its queue is
  * a plain ring of whole messages waiting for their slot. */
@@ -1124,6 +1145,45 @@ static void feed(node_t *nd, uint8_t b)
     }
 }
 
+/*
+ * A BLOCK INTO THE ASSEMBLER, AND THE PADDING IS SKIPPED RATHER THAN FED.
+ *
+ * Most of what crosses this wire is the zero padding of blocks that had
+ * little to carry, and feeding it one byte at a time through the assembler
+ * cost more than the wire did.  Measured at 40 MHz: the slave could not drain
+ * the service's receive ring, 463 360 bytes were dropped for want of room -
+ * and the master's ACKNOWLEDGEMENTS went with them, so the slave sent 432 of
+ * its 755 frames twice and the master counted 373 gaps.  A 77 KB file took
+ * 27 seconds.
+ *
+ * Exact, not a heuristic: while the assembler is hunting for the magic, a zero
+ * byte cannot be any part of "NLNK", so a run of them only clears the window.
+ * Inside a frame every byte is fed as before - a payload may be all zeros.
+ */
+static void feed_block(node_t *nd, const uint8_t *p, int32_t n)
+{
+    int32_t i = 0;
+    while (i < n) {
+        if (nd->sm == SM_SYNC && p[i] == 0u) {
+            int32_t j = i + 1;
+            while (j < n && (((uintptr_t)(p + j)) & 3u) != 0u && p[j] == 0u) {
+                j++;
+            }
+            while (j + 4 <= n && (((uintptr_t)(p + j)) & 3u) == 0u &&
+                   *(const uint32_t *)(const void *)(p + j) == 0u) {
+                j += 4;
+            }
+            while (j < n && p[j] == 0u) {
+                j++;
+            }
+            memset(nd->win, 0, sizeof(nd->win));
+            i = j;
+            continue;
+        }
+        feed(nd, p[i++]);
+    }
+}
+
 /* ---------------------------------------------------------------------- */
 /* Sending                                                                 */
 /* ---------------------------------------------------------------------- */
@@ -1334,9 +1394,7 @@ static bool clock_block(node_t *nd)
          * what does not is written at rx_frames - an acknowledgement counts.
          */
         const uint32_t heard_before = nd->rx_frames;
-        for (uint32_t i = 0; i < LSPI_BLOCK; i++) {
-            feed(nd, nd->rxblk[i]);
-        }
+        feed_block(nd, nd->rxblk, (int32_t)LSPI_BLOCK);
         if (nd->rx_frames != heard_before) {
             nd->last_rx_ms = now_ms();
             nd->blocks_heard++;
@@ -1692,9 +1750,7 @@ static bool slave_move(node_t *nd)
             break; /* -AG_EAGAIN: nothing buffered, which is the normal exit */
         }
         nd->rx_bytes += (uint32_t)n;
-        for (int32_t i = 0; i < n; i++) {
-            feed(nd, nd->rxblk[i]);
-        }
+        feed_block(nd, nd->rxblk, n);
         moved = true;
     }
     return moved;
@@ -1793,10 +1849,20 @@ static bool turn(node_t *nd)
      * them into its own transactions - so the same argument holds by not
      * existing: nothing on that end waits for a boundary.
      */
-    const int owe = ack_owed_class(nd);
-    if (owe >= 0) {
+    /*
+     * A FRAME IS STARTED ONLY IF ALL OF IT FITS.  The ring cannot refuse part
+     * of a frame gracefully - it would put the head on the wire and drop the
+     * tail - so the decision waits for a turn with room, and the window keeps
+     * the frame, which is exactly where it belongs until it can go whole.
+     */
+    const uint32_t room = LSPI_RING - nd->ring_fill;
+    const int      owe = ack_owed_class(nd);
+    if (owe >= 0 && room >= NL_HDR_SIZE) {
         emit(nd, (uint8_t)owe, 0, 0, NL_F_ACKONLY, 0u, 0u, NULL, 0);
         nd->acks++;
+    }
+    if (LSPI_RING - nd->ring_fill < LSPI_FRAME_MAX) {
+        goto move_bytes;
     }
 
     offer_all(nd, t);
@@ -1818,6 +1884,7 @@ static bool turn(node_t *nd)
         }
     }
 
+move_bytes:
     /*
      * THE MASTER'S BLOCK, and a slave stops here: it has already drained and
      * answered, and wire_write handed its bytes over as they were built, so

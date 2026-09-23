@@ -48,3 +48,5 @@ DESKTOP.AXE
 # pixels arrive as bands and go straight to the glass, and the far console
 # arrives as characters.  A monitor at the end of a cable.
 REMTERM.AXE
+# Blocks across the wire, counted: tools/wireblk.py.
+WIREBLK.AXE

@@ -56,6 +56,9 @@
  */
 ag_err_t ag_spilink_open(int bus, int cs, uint32_t khz, uint32_t block, int sck,
                          int mosi, int miso);
+/* The same with AG_SPILINK_MASTER / AG_SPILINK_FRAMED (ABI 0.60). */
+ag_err_t ag_spilink_open2(int bus, int cs, uint32_t khz, uint32_t block,
+                          uint32_t flags, int sck, int mosi, int miso);
 
 /*
  * Stops the task, waits for it to leave, and gives back everything open

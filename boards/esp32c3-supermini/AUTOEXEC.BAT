@@ -17,7 +17,7 @@ rem
 rem And it is what makes `reboot /download` reachable: that is how this board is
 rem handed to the S3-Zero to be flashed, and with no console there would be no
 rem way to ask for it.  See docs/user/06-flashing-a-coprocessor.md.
-telnet on
+rem telnet on - no radio in this build since 23 Sep 2026; the board is on USB
 
 rem Binding the wire used to be a line in this file, with a note saying it
 rem belonged in the kernel.  It does now: [link] bind in SYSTEM.CFG, done

@@ -149,6 +149,7 @@
     {
       "out": "LINKSPI.SYS", "group": "core",
       "_note": "The same wire driver over a four-wire SPI cable instead of a UART: nodelink's frame assembler, classes and windows, with a byte ring feeding fixed full-duplex blocks through io->spi_xfer (or spi_slave_xfer). Both bench boards are ESP32-S3, so one Xtensa image serves either end and the role - master or slave, who holds the clock - is a SYSTEM.CFG line rather than a second build. Loaded by hand for the SPI test (`drv load c:\\drv\\linkspi.sys`), which is why nothing auto-loads it.",
+      "cflags": "-Os -ffunction-sections -fdata-sections -DNL_QUANTUM=2048u",
       "include": ["apps/common", "apps/common/nlink"],
       "src": ["apps/linkspi/linkspi.c", "apps/common/nlink/ag_nlink.c"] },
     {
@@ -422,6 +423,16 @@
       "out": "GFXNOISE.AXE", "group": "core",
       "_note": "A picture that will not compress, so a wire can be measured. Every other graphics test draws shapes on a flat ground and REMDISP packs those to almost nothing - the demo picture crossed as 3 KB for 75 000 pixels, so comparing two transports on it measures the encoder and not the copper. Noise does not pack, does not index and never matches the previous frame, so every band is sent whole. Reports the frames and bytes it offered, so the sender is readable without the receiver.",
       "src": ["apps/gfxnoise/gfxnoise.c"]
+    },
+    {
+      "out": "PINS.AXE", "group": "core",
+      "_note": "Rings out the wires between two boards: one board drives one pin, the other reads every pin of the bundle pulled up or down. tools/pinring.py walks it both ways.",
+      "src": ["apps/pins/pins.c"]
+    },
+    {
+      "out": "WIREBLK.AXE", "group": "core",
+      "_note": "Fixed-size blocks across the wire between two boards, counted one by one: each carries its sequence and a payload the receiver recomputes, so every block is intact, damaged or missing. UART, SPI as master (holds the clock) or SPI as slave (the kernel link service), either direction. tools/wireblk.py runs the matrix.",
+      "src": ["apps/wireblk/wireblk.c"]
     },
     {
       "out": "WIREBENCH.AXE", "group": "core",

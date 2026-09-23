@@ -111,7 +111,17 @@
  * budget.  See "THE TWO NUMBERS" above: this is how long anything with a
  * deadline can be made to wait behind a transfer that has already started.
  */
+/*
+ * PER WIRE, AT BUILD TIME.  Every link driver compiles this file into itself,
+ * so a driver whose wire can carry more says so with -DNL_QUANTUM=... in its
+ * own build line and nothing else changes.  Raising the one default instead
+ * was tried: the SPI link went from 48 to 575 KB/s and the UART link, which
+ * binds at boot and carries everything by default, stopped attaching the far
+ * registry at all.  Both ends of one wire run the same driver, so they agree.
+ */
+#ifndef NL_QUANTUM
 #define NL_QUANTUM 256u
+#endif
 
 /* Channels.  0 is reserved for the link talking about itself. */
 #define NL_CHAN_LINK 0u

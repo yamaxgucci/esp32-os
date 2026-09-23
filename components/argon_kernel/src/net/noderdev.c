@@ -43,6 +43,18 @@
 #define RD_CHAN 6u
 #define RD_HDR 16u
 #define RD_MAX_PAYLOAD 224u
+
+/*
+ * THE SIZE OF A POURED DISPLAY MESSAGE COMES FROM THE WIRE, and 224 was a
+ * number chosen for the smallest wire this tree has.  Cut to it, a band of
+ * pixels became 25 messages and the screen on the other board ran at 910 KB/s
+ * over a 20 MHz SPI link that was clocking twice that - the wire was idle half
+ * the time while the proxy made 3 800 sends a second.  The requests and
+ * replies above stay at RD_MAX_PAYLOAD: they are small, and they are not what
+ * was slow.  RD_POUR_CAP is the largest the buffers are made for; the size in
+ * use is whatever the bound link says it will carry.
+ */
+#define RD_POUR_CAP 2024u
 #define RD_REPLY 0x80u
 
 /*
@@ -509,7 +521,26 @@ static ag_err_t ensure_open(rdev_t *p)
  * anything between messages.
  */
 #define RD_BLIT_HDR 12u
-#define RD_BLIT_PX  ((RD_MAX_PAYLOAD - RD_BLIT_HDR) / 2u) /* pixels per slice */
+/* What one poured message may carry on the wire that is bound now. */
+static uint16_t rd_pour_payload(void)
+{
+    ag_link_info_t li;
+    uint32_t       room = RD_MAX_PAYLOAD;
+    if (ag_linkprov_info(&li) == AG_OK && li.mtu > RD_HDR) {
+        room = li.mtu - RD_HDR;
+    }
+    if (room > RD_POUR_CAP) {
+        room = RD_POUR_CAP;
+    }
+    if (room < RD_BLIT_HDR + 2u) {
+        room = RD_BLIT_HDR + 2u;
+    }
+    return (uint16_t)room;
+}
+
+/* The message a blit is cut into: the display path is serialised by the
+ * device registry, so one buffer, and not 2 KB on a caller's stack. */
+static uint8_t s_blitmsg[RD_HDR + RD_POUR_CAP];
 
 static rdev_t *proxy_of(ag_handle_t h);
 
@@ -557,15 +588,28 @@ static void rd_blit(ag_handle_t h, const ag_blit_t *b)
     }
 
     const uint8_t *rows = (const uint8_t *)b->px;
-    uint8_t        msg[RD_HDR + RD_MAX_PAYLOAD];
+    uint8_t *const msg = s_blitmsg;
+    const uint16_t pixroom = (uint16_t)((rd_pour_payload() - RD_BLIT_HDR) / 2u);
 
-    for (uint16_t r = 0; r < b->h; r++) {
-        const uint16_t *src =
-            (const uint16_t *)(const void *)(rows + (size_t)r * b->stride);
-        for (uint16_t x = 0; x < b->w; x += (uint16_t)RD_BLIT_PX) {
+    /*
+     * WHOLE ROWS WHEN A ROW FITS, so a slice is w by k rather than a strip of
+     * one row: on a 2 KB message that is three rows of a 320-wide band in one
+     * send instead of nine sends.  A row wider than a message is still cut
+     * across, which is what a small wire needs.
+     */
+    const uint16_t per_rows =
+        (b->w <= pixroom) ? (uint16_t)(pixroom / b->w) : 1u;
+    const uint16_t per_cols = (b->w <= pixroom) ? b->w : pixroom;
+
+    for (uint16_t r = 0; r < b->h; r = (uint16_t)(r + per_rows)) {
+        uint16_t rh = (uint16_t)(b->h - r);
+        if (rh > per_rows) {
+            rh = per_rows;
+        }
+        for (uint16_t x = 0; x < b->w; x = (uint16_t)(x + per_cols)) {
             uint16_t n = (uint16_t)(b->w - x);
-            if (n > (uint16_t)RD_BLIT_PX) {
-                n = (uint16_t)RD_BLIT_PX;
+            if (n > per_cols) {
+                n = per_cols;
             }
             msg[0] = RD_BLIT;
             msg[1] = RD_F_NOREPLY;
@@ -577,12 +621,19 @@ static void rd_blit(ag_handle_t h, const ag_blit_t *b)
             put16(q + 0, (uint16_t)(b->x + x));
             put16(q + 2, (uint16_t)(b->y + r));
             put16(q + 4, n);
-            put16(q + 6, 1);
+            put16(q + 6, rh);
             put16(q + 8, b->surf_w);
             put16(q + 10, b->surf_h);
-            memcpy(q + RD_BLIT_HDR, src + x, (size_t)n * 2u);
-            (void)ag_linkprov_send(RD_CHAN, AG_LINK_STREAM, msg,
-                                   (uint16_t)(RD_HDR + RD_BLIT_HDR + n * 2u));
+            uint8_t *dst = q + RD_BLIT_HDR;
+            for (uint16_t k = 0; k < rh; k++) {
+                const uint16_t *src = (const uint16_t *)(const void *)(
+                    rows + (size_t)(r + k) * b->stride);
+                memcpy(dst, src + x, (size_t)n * 2u);
+                dst += (size_t)n * 2u;
+            }
+            (void)ag_linkprov_send(
+                RD_CHAN, AG_LINK_STREAM, msg,
+                (uint16_t)(RD_HDR + RD_BLIT_HDR + (uint32_t)n * rh * 2u));
         }
     }
 }
@@ -753,7 +804,13 @@ static ag_port_task_t s_worker;
 #define RD_RING 4
 
 typedef struct {
-    uint8_t  data[RD_MAX_PAYLOAD];
+    /*
+     * Into s_ring_mem, which is made the first time anything is poured at this
+     * board.  Every board carries this file, the C3 has no PSRAM, and a board
+     * that is never somebody else's screen or speaker should not pay 8 KB of
+     * internal memory for the possibility.
+     */
+    uint8_t *data;
     uint16_t len;
     uint32_t handle;
     uint32_t off;
@@ -778,6 +835,7 @@ static uint32_t serve_poured_class(ag_device_t *dev,
                                    const rd_period_t *pd);
 
 static rd_period_t       s_ring[RD_RING];
+static uint8_t          *s_ring_mem;
 static volatile uint32_t s_ring_w;
 static volatile uint32_t s_ring_r;
 static ag_port_task_t    s_pour_task;
@@ -1185,6 +1243,17 @@ static uint32_t serve_poured_class(ag_device_t *dev, const rd_period_t *pd)
 
 static void take_period(const uint8_t *b, uint16_t n)
 {
+    if (s_ring_mem == NULL) {
+        s_ring_mem = (uint8_t *)ag_port_alloc((size_t)RD_RING * RD_POUR_CAP,
+                                              AG_MEM_BYTE);
+        if (s_ring_mem == NULL) {
+            s_pour_lost++;
+            return;
+        }
+        for (uint32_t i = 0; i < RD_RING; i++) {
+            s_ring[i].data = s_ring_mem + (size_t)i * RD_POUR_CAP;
+        }
+    }
     if (s_pour_task == NULL) {
         /*
          * Made on the first period rather than at start-up: a board that never
@@ -1208,8 +1277,8 @@ static void take_period(const uint8_t *b, uint16_t n)
     }
     rd_period_t *pd = &s_ring[s_ring_w];
     uint16_t     plen = (uint16_t)(n - RD_HDR);
-    if (plen > sizeof(pd->data)) {
-        plen = (uint16_t)sizeof(pd->data);
+    if (plen > RD_POUR_CAP) {
+        plen = (uint16_t)RD_POUR_CAP;
     }
     memcpy(pd->data, b + RD_HDR, plen);
     pd->len = plen;

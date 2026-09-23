@@ -139,7 +139,20 @@ AG_DRV("ST7789", "0.2", "argon");
  * turns into exactly this command (Arduino_ST7789::invertDisplay:
  * (_ips ^ i) ? INVON : INVOFF, and _ips is true here).
  */
-#define LCD_BUS      2
+/*
+ * SPI3 ON THIS BOARD, and the reason is the other board rather than the panel.
+ *
+ * The four wires to the neighbour are soldered to GPIO 10-13, which are SPI2's
+ * own IOMUX pins.  With the panel on SPI2 the link had to be SPI3, which has no
+ * IOMUX pins at all and reaches 10-13 through the GPIO matrix - and the
+ * matrix's delay on the SLAVE's MISO output is longer than half a clock above
+ * about 20 MHz.  Measured: at 26 MHz the master read its own frames back ("this
+ * node is zero, the other is zero"), at 20 MHz with 2 KB blocks the same.  A
+ * panel is written and never read, so the matrix costs it nothing that matters:
+ * 3 355 KB/s at 40 MHz, measured here, and 40 MHz is the matrix's ceiling for a
+ * master, which is why [spi3] asks for no more.
+ */
+#define LCD_BUS      3
 #define LCD_CS      45
 #define LCD_DC      42
 #define LCD_RST     (-1)

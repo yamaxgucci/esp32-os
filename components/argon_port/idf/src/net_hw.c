@@ -36,6 +36,13 @@
 
 static esp_netif_t         *s_netif;
 static volatile bool        s_got_ip;
+/*
+ * lwIP exists once esp_netif_init has run, and not before.  A socket call
+ * before that is not refused by lwIP - it asserts ("Invalid mbox") and takes
+ * the machine down: `telnet on` in the C3's AUTOEXEC did exactly that, every
+ * boot, on a board whose radio had not been started.  So the calls ask first.
+ */
+static volatile bool        s_stack_up;
 static esp_ip4_addr_t       s_ip;
 static ag_port_net_ready_fn s_on_ready;
 
@@ -122,6 +129,7 @@ static ag_err_t common_start(void)
     if (esp_netif_init() != ESP_OK) {
         return -AG_EIO;
     }
+    s_stack_up = true;
 
     err = esp_event_loop_create_default();
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
@@ -234,6 +242,9 @@ ag_err_t ag_port_net_ifaddr(uint32_t *addr)
  */
 int ag_port_net_listen(uint16_t port)
 {
+    if (!s_stack_up) {
+        return -AG_ENODEV;
+    }
     const int fd = lwip_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (fd < 0) {
         return (int)map_errno(errno);
@@ -316,6 +327,9 @@ int ag_port_net_accept(int lfd, uint32_t timeout_ms)
 
 int ag_port_net_connect(uint32_t addr, uint16_t port, uint32_t timeout_ms)
 {
+    if (!s_stack_up) {
+        return -AG_ENODEV;
+    }
     const int fd = lwip_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (fd < 0) {
         return (int)map_errno(errno);
@@ -383,6 +397,9 @@ void ag_port_net_close(int fd)
  */
 ag_err_t ag_port_net_resolve(const char *host, uint32_t *addr)
 {
+    if (!s_stack_up) {
+        return -AG_ENODEV;
+    }
     if (host == NULL || addr == NULL || host[0] == '\0') {
         return -AG_EINVAL;
     }

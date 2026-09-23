@@ -766,6 +766,133 @@ static ag_err_t io_spi_slave_xfer(int bus, const void *tx, void *rx, size_t len,
  * parser here or there, and that is deliberate - a link whose pins are read
  * twice is a link that can be wired two ways.
  */
+static ag_err_t uart_bring_up(int port, const ag_port_uart_cfg_t *cfg);
+
+static int32_t io_uart_dma_write(int port, const void *buf, size_t len)
+{
+    if (buf == NULL || len == 0) {
+        return -AG_EINVAL;
+    }
+
+    /*
+     * Same shape as the ordinary write, and the same reason for the lock being
+     * where it is: bring-up under it, the transfer outside.  A DMA transfer is
+     * even longer than a buffered write - it returns when the last byte has
+     * left the wire - so holding the io lock across it would be the same
+     * silent board, only for longer.
+     */
+    lock();
+    const ag_err_t err = uart_bring_up(port, NULL);
+    unlock();
+    if (err != AG_OK) {
+        return err;
+    }
+    return ag_port_uart_dma_write(port, buf, len);
+}
+
+static ag_err_t io_uart_tx_wait(int port, uint32_t timeout_ms)
+{
+    if (!ag_port_uart_is_open(port)) {
+        return AG_OK; /* nothing of ours is in a port that is not open */
+    }
+    return ag_port_uart_tx_wait(port, timeout_ms);
+}
+
+static int32_t io_uart_dma_submit(int port, const void *buf, size_t len)
+{
+    if (buf == NULL || len == 0) {
+        return -AG_EINVAL;
+    }
+    lock();
+    const ag_err_t err = uart_bring_up(port, NULL);
+    unlock();
+    if (err != AG_OK) {
+        return err;
+    }
+    return ag_port_uart_dma_submit(port, buf, len);
+}
+
+static ag_err_t io_uart_dma_drain(int port)
+{
+    if (!ag_port_uart_is_open(port)) {
+        return AG_OK;
+    }
+    return ag_port_uart_dma_drain(port);
+}
+
+static bool io_uart_dma_ready(int port)
+{
+    lock();
+    const ag_err_t err = uart_bring_up(port, NULL);
+    unlock();
+    if (err != AG_OK) {
+        return false;
+    }
+    return ag_port_uart_dma_ready(port);
+}
+
+static int32_t io_uart_dma_read(int port, void *buf, size_t len,
+                                uint32_t timeout_ms)
+{
+    lock();
+    const ag_err_t err = uart_bring_up(port, NULL);
+    unlock();
+    if (err != AG_OK) {
+        return err;
+    }
+    return ag_port_uart_dma_read(port, buf, len, timeout_ms);
+}
+
+static ag_err_t io_spi_link_open2(int bus, int cs, uint32_t khz,
+                                  uint32_t frame, uint32_t flags)
+{
+    if ((flags & AG_SPILINK_MASTER) == 0u) {
+        /* the slave end: the same bring-up as the raw link */
+        if (cs < 0 || khz == 0) {
+            return -AG_EINVAL;
+        }
+        lock();
+        ag_err_t err = spi_bring_up(bus, true, cs);
+        if (err == AG_OK) {
+            const int idx = spi_index(bus);
+            err = ag_spilink_open2(bus, cs, khz, frame, flags,
+                                   ag_board()->spi[idx].sck,
+                                   ag_board()->spi[idx].mosi,
+                                   ag_board()->spi[idx].miso);
+        }
+        unlock();
+        if (err != AG_OK) {
+            ag_log(AG_LOG_WARN, "io", "spi%d link open failed: %d", bus,
+                   (int)err);
+        }
+        return err;
+    }
+    if (cs < 0 || khz == 0) {
+        return -AG_EINVAL;
+    }
+    lock();
+    ag_err_t err = spi_bring_up(bus, false, AG_PIN_NONE);
+    if (err == AG_OK) {
+        err = spi_take_cs(bus, cs);
+    }
+    if (err == AG_OK) {
+        err = ag_port_spi_set_khz(bus, cs, khz);
+    }
+    if (err == AG_OK) {
+        const int idx = spi_index(bus);
+        err = ag_spilink_open2(bus, cs, khz, frame, flags,
+                               ag_board()->spi[idx].sck,
+                               ag_board()->spi[idx].mosi,
+                               ag_board()->spi[idx].miso);
+    }
+    unlock();
+    if (err != AG_OK) {
+        ag_log(AG_LOG_WARN, "io", "spi%d master link open failed: %d", bus,
+               (int)err);
+    }
+    return err;
+}
+
 static ag_err_t io_spi_link_open(int bus, int cs, uint32_t khz, uint32_t block)
 {
     if (cs < 0 || khz == 0) {
@@ -1257,10 +1384,17 @@ const ag_io_api_t ag_io_api_table = {
     .spi_slave_open = io_spi_slave_open,
     .spi_slave_xfer = io_spi_slave_xfer,
     .spi_link_open = io_spi_link_open,
+    .uart_tx_wait = io_uart_tx_wait,
+    .uart_dma_ready = io_uart_dma_ready,
+    .uart_dma_write = io_uart_dma_write,
+    .uart_dma_submit = io_uart_dma_submit,
+    .uart_dma_drain = io_uart_dma_drain,
+    .uart_dma_read = io_uart_dma_read,
     .spi_link_close = io_spi_link_close,
     .spi_link_write = io_spi_link_write,
     .spi_link_read = io_spi_link_read,
     .spi_link_stats = io_spi_link_stats,
+    .spi_link_open2 = io_spi_link_open2,
 };
 
 ag_err_t ag_io_init(void)

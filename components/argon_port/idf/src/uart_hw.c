@@ -127,7 +127,25 @@ static void fill(uart_config_t *out, const ag_port_uart_cfg_t *cfg)
      * a file transfer at 921600 is not a thing to do at 40 MHz anyway.
      */
 #if SOC_UART_SUPPORT_XTAL_CLK
-    out->source_clk = UART_SCLK_XTAL;
+    /*
+     * ...and above 2.5 Mbaud the crystal is the wrong clock, measured on
+     * 23 Sep 2026.  A UART divides its clock by a whole number of cycles per
+     * bit plus sixteenths, and 40 MHz does not divide into 16 Mbaud: 2.5, so
+     * the bits came out alternately 50 and 75 ns long and the receiver, also at
+     * 40 MHz, sampled each one two and a half times.  What the Zero-C3 wire
+     * showed was a lone 1 between two 0s read as 0, at the phase where the two
+     * crystals' 24 ppm beat put the sample on the short bit - one damaged byte
+     * every 840 bytes - and 12 Mbaud (3.33) not working at all, while 8 and
+     * 10 Mbaud (5 and 4, whole numbers) were clean.  The peripheral bus is
+     * 80 MHz and divides 16 Mbaud by exactly 5, sampled five times a bit.
+     *
+     * The price is the one the ESP32 branch below already pays: a fast port
+     * follows the bus down if the processor is run off the crystal.  Sixteen
+     * cycles a bit (the most the receiver can use) at 40 MHz is 2.5 Mbaud, so
+     * that is the line.
+     */
+    out->source_clk =
+        (cfg->baud <= 2500000u) ? UART_SCLK_XTAL : UART_SCLK_APB;
 #elif SOC_UART_SUPPORT_REF_TICK
     out->source_clk =
         (cfg->baud <= 115200u) ? UART_SCLK_REF_TICK : UART_SCLK_APB;
@@ -262,6 +280,20 @@ ag_err_t ag_port_uart_close(int port)
      */
     (void)uart_wait_tx_done(port, pdMS_TO_TICKS(1000));
     return from_esp(uart_driver_delete(port));
+}
+
+ag_err_t ag_port_uart_tx_wait(int port, uint32_t timeout_ms)
+{
+    if (!valid(port)) {
+        return -AG_EINVAL;
+    }
+    if (is_jtag(port)) {
+        return AG_OK;
+    }
+    if (!uart_is_driver_installed(port)) {
+        return AG_OK; /* nothing of ours is queued if there is no driver */
+    }
+    return from_esp(uart_wait_tx_done(port, pdMS_TO_TICKS(timeout_ms)));
 }
 
 bool ag_port_uart_is_open(int port)

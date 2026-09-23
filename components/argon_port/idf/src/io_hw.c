@@ -670,7 +670,7 @@ ag_err_t ag_port_spi_slave_open(int bus, int sck, int mosi, int miso, int cs,
     }
 
     /*
-     * The port's own resources - the locks, the staging pair, the pool - are
+     * The port's own resources - the locks and the pool - are
      * made here if they are not there yet, and kept if they are.  Nothing
      * frees them but the end of the program, and that is deliberate: a reset
      * throws the DRIVER's interface away and builds it again, while these are
@@ -680,7 +680,6 @@ ag_err_t ag_port_spi_slave_open(int bus, int sck, int mosi, int miso, int cs,
      * not cost sixteen kilobytes an attempt.
      */
     const bool had_lock = (s_spi[bus].lock != NULL);
-    const bool had_sbuf = (s_spi[bus].sbuf != NULL);
     const bool had_pool = (s_spi[bus].pool != NULL);
     const bool had_waiter = (s_spi[bus].waiter != NULL);
 
@@ -691,24 +690,13 @@ ag_err_t ag_port_spi_slave_open(int bus, int sck, int mosi, int miso, int cs,
         (void)spi_slave_free(AG_PORT_SPI_HOST_OF(bus));
         return -AG_ENOMEM;
     }
-    /*
-     * Word-aligned because the DMA writes whole words: with a length that is
-     * not a multiple of four the driver checks the address and the byte count
-     * together, and a buffer that fails either check is a transfer that never
-     * starts.  The alignment is asked for rather than assumed.
-     */
-    if (!had_sbuf) {
-        s_spi[bus].sbuf = ag_port_alloc_aligned(4, 2u * AG_PORT_SPI_MAX_XFER,
-                                                AG_MEM_DMA);
-    }
     if (!had_pool) {
         s_spi[bus].pool = xSemaphoreCreateMutex();
     }
     if (!had_waiter) {
         s_spi[bus].waiter = xSemaphoreCreateMutex();
     }
-    if (s_spi[bus].sbuf == NULL || s_spi[bus].pool == NULL ||
-        s_spi[bus].waiter == NULL) {
+    if (s_spi[bus].pool == NULL || s_spi[bus].waiter == NULL) {
         if (!had_waiter && s_spi[bus].waiter != NULL) {
             vSemaphoreDelete(s_spi[bus].waiter);
             s_spi[bus].waiter = NULL;
@@ -716,10 +704,6 @@ ag_err_t ag_port_spi_slave_open(int bus, int sck, int mosi, int miso, int cs,
         if (!had_pool && s_spi[bus].pool != NULL) {
             vSemaphoreDelete(s_spi[bus].pool);
             s_spi[bus].pool = NULL;
-        }
-        if (!had_sbuf && s_spi[bus].sbuf != NULL) {
-            ag_port_free(s_spi[bus].sbuf);
-            s_spi[bus].sbuf = NULL;
         }
         if (!had_lock) {
             vSemaphoreDelete(s_spi[bus].lock);
@@ -877,6 +861,51 @@ ag_err_t ag_port_spi_xfer(int bus, int cs, const void *tx, void *rx, size_t len)
      */
     xSemaphoreTakeRecursive(s_spi[bus].lock, portMAX_DELAY);
     const ag_err_t err = spi_xfer_locked(bus, cs, tx, rx, len);
+    xSemaphoreGiveRecursive(s_spi[bus].lock);
+    return err;
+}
+
+static ag_err_t spi_drain(int bus, spi_device_handle_t dev);
+
+/*
+ * The caller's buffers straight to the engine, and the caller asleep while it
+ * clocks.  No bounce, no staging and no polling: both buffers are the DMA's
+ * for the length of the call, which is why both must be memory it can reach,
+ * word-aligned.  spi_device_transmit queues the transaction and waits on its
+ * completion interrupt, so a 4 KB frame at 20 MHz costs the core the setup
+ * and the wake-up rather than the 1.6 ms of the wire.
+ */
+ag_err_t ag_port_spi_xfer_dma(int bus, int cs, const void *tx, void *rx,
+                              size_t len)
+{
+    if (len == 0 || len > AG_PORT_SPI_MAX_XFER || tx == NULL || rx == NULL) {
+        return -AG_EINVAL;
+    }
+    if (!esp_ptr_dma_capable(tx) || !esp_ptr_dma_capable(rx) ||
+        ((uintptr_t)tx & 3u) != 0u || ((uintptr_t)rx & 3u) != 0u) {
+        return -AG_EINVAL;
+    }
+    if (!spi_valid(bus) || !s_spi[bus].up || s_spi[bus].lock == NULL) {
+        return -AG_ENODEV;
+    }
+    if (s_spi[bus].slave) {
+        return -AG_EINVAL;
+    }
+
+    xSemaphoreTakeRecursive(s_spi[bus].lock, portMAX_DELAY);
+    spi_device_handle_t dev = NULL;
+    ag_err_t            err = spi_device_for(bus, cs, &dev);
+    if (err == AG_OK) {
+        err = spi_drain(bus, dev);
+    }
+    if (err == AG_OK) {
+        spi_transaction_t t = {
+            .length = len * 8u,
+            .tx_buffer = tx,
+            .rx_buffer = rx,
+        };
+        err = from_esp(spi_device_transmit(dev, &t));
+    }
     xSemaphoreGiveRecursive(s_spi[bus].lock);
     return err;
 }
@@ -1396,6 +1425,19 @@ static ag_err_t spi_slave_xfer_locked(int bus, const void *tx, void *rx,
         }
     }
 
+    /*
+     * Made the first time somebody actually transfers one at a time, not at
+     * open: 16 KB of DMA memory that the pipelined pair never touches, held
+     * from the first open for the life of the boot.  On the C3 that was the
+     * difference between an SPI link with 4 KB frames opening and not.
+     */
+    if (st->sbuf == NULL) {
+        st->sbuf = ag_port_alloc_aligned(4, 2u * AG_PORT_SPI_MAX_XFER,
+                                         AG_MEM_DMA);
+        if (st->sbuf == NULL) {
+            return -AG_ENOMEM;
+        }
+    }
     uint8_t *const out = st->sbuf;
 
     /*
@@ -1607,7 +1649,7 @@ ag_err_t ag_port_spi_slave_arm(int bus, const void *tx, void *rx, size_t len)
  * must not do is touch those buffers again, or arm that slot's memory, until it
  * has reaped that block.
  */
-ag_err_t ag_port_spi_slave_reap(int bus, int *slot, uint32_t *got,
+ag_err_t ag_port_spi_slave_reap(int bus, int *slot, uint32_t *got, void **rx,
                                 uint32_t timeout_ms)
 {
     if (!spi_valid(bus) || !s_spi[bus].up || s_spi[bus].lock == NULL) {
@@ -1631,6 +1673,11 @@ ag_err_t ag_port_spi_slave_reap(int bus, int *slot, uint32_t *got,
     }
     if (got != NULL) {
         *got = n;
+    }
+    /* which of the caller's buffers the peer's bytes are in: the one thing
+     * that names the block without assuming the order they come back in */
+    if (rx != NULL) {
+        *rx = (s >= 0 && s < AG_PORT_SPI_SLAVE_QUEUE) ? st->slot[s].rx : NULL;
     }
     return AG_OK;
 }

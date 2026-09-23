@@ -39,3 +39,6 @@ GFXNOISE.AXE
 # And the same wire carrying something that is not a picture at all: writes to
 # /dev/wire0, which REMDISP publishes beside its display.
 WIREBENCH.AXE
+# Blocks across the wire, counted: tools/wireblk.py.
+WIREBLK.AXE
+PINS.AXE

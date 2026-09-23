@@ -70,7 +70,7 @@
  *       blocks, and nothing above it has to change because the pool exists.
  *   ag_err_t ag_port_spi_slave_arm(int bus, const void *tx, void *rx,
  *                                  size_t len)
- *   ag_err_t ag_port_spi_slave_reap(int bus, int *slot, uint32_t *got,
+ *   ag_err_t ag_port_spi_slave_reap(int bus, int *slot, uint32_t *got, void **rx,
  *                                   uint32_t timeout_ms)
  *       The one-at-a-time transfer split in two, so that several blocks are on
  *       the wire at once.  arm queues one block and returns at once - it does
@@ -254,13 +254,22 @@ ag_err_t ag_port_spi_open(int bus, int sck, int mosi, int miso, uint32_t khz);
 ag_err_t ag_port_spi_set_khz(int bus, int cs, uint32_t khz);
 ag_err_t ag_port_spi_xfer(int bus, int cs, const void *tx, void *rx,
                           size_t len);
+/*
+ * A master transfer of the caller's own DMA-capable, word-aligned buffers, in
+ * one transaction, with the caller's task BLOCKED rather than polling for the
+ * length of it.  For a service that clocks frame after frame: spi_xfer copies
+ * a long duplex transfer through staging and spins in the polling call while
+ * it crosses, which for 4 KB at 20 MHz is 1.6 ms of a core doing nothing.
+ */
+ag_err_t ag_port_spi_xfer_dma(int bus, int cs, const void *tx, void *rx,
+                              size_t len);
 
 ag_err_t ag_port_spi_slave_open(int bus, int sck, int mosi, int miso, int cs,
                                 uint32_t khz);
 ag_err_t ag_port_spi_slave_xfer(int bus, const void *tx, void *rx, size_t len,
                                 uint32_t timeout_ms);
 ag_err_t ag_port_spi_slave_arm(int bus, const void *tx, void *rx, size_t len);
-ag_err_t ag_port_spi_slave_reap(int bus, int *slot, uint32_t *got,
+ag_err_t ag_port_spi_slave_reap(int bus, int *slot, uint32_t *got, void **rx,
                                 uint32_t timeout_ms);
 ag_err_t ag_port_spi_slave_reset(int bus);
 ag_err_t ag_port_spi_set_drive(int bus, int cap);

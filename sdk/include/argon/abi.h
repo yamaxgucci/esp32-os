@@ -385,7 +385,7 @@ extern "C" {
  *      garbage.  Any future append needs the same guarantee and has it.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 57u
+#define AG_ABI_MINOR 60u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -1698,7 +1698,18 @@ typedef struct {
     ag_err_t last_error;
     bool     open;           /* the service is up and its task is running  */
     bool     task_stuck;     /* a teardown could not stop the task         */
+    /* ABI 0.60, framed links only: */
+    uint32_t frames_bad;     /* clocked frames with no header in them      */
+    uint32_t seq_gaps;       /* frames of the peer's that never arrived    */
+    uint32_t wire_us;        /* master: time inside transfers, in total    */
+    uint32_t loop_us;        /* master: time of whole passes, in total     */
+    uint32_t reorders;       /* slave: blocks back out of the armed order  */
+    uint32_t short_frames;   /* slave: frames the master clocked short     */
 } ag_spilink_stats_t;
+
+/* spi_link_open2 flags (ABI 0.60). */
+#define AG_SPILINK_MASTER 1u /* this end holds the clock                   */
+#define AG_SPILINK_FRAMED 2u /* transactions carry a header: see spilink.c */
 
 typedef struct ag_io_api {
     uint32_t size;
@@ -1810,6 +1821,46 @@ typedef struct ag_io_api {
      * counters cleared.  See ag_spilink_stats_t for how to read them.
      */
     ag_err_t (*spi_link_stats)(int bus, ag_spilink_stats_t *out);
+
+    /*
+     * ABI 0.58: the UART by DMA, carried over from worktree-fallout-cxx
+     * (4b67339 and 9745482, where it was numbered 0.44 - a number this
+     * branch had already spent on something else, so it is appended here
+     * rather than renumbered).  A .AXE built before this finds the
+     * members absent through AG_HAS and falls back to uart_write.
+     */
+    /*
+     * Wait until everything given to this port has left it.  Not a flush -
+     * that word is taken by the call that throws away what has *arrived* -
+     * but the handover between the two masters of one transmitter: whoever
+     * mixes uart_write with uart_dma_write calls this in between.
+     */
+    ag_err_t (*uart_tx_wait)(int port, uint32_t timeout_ms);
+    bool (*uart_dma_ready)(int port);
+    int32_t (*uart_dma_write)(int port, const void *buf, size_t len);
+
+    /*
+     * The same in two halves, for a caller with more than one thing to send:
+     * submit hands a buffer to the hardware and returns, drain waits for
+     * everything still out.  Waiting for each transfer in turn leaves the wire
+     * idle between them - about a quarter of a frame, measured - because the
+     * next one cannot start until a task has been scheduled to start it.  The
+     * buffers stay the hardware's until drain returns.
+     */
+    int32_t (*uart_dma_submit)(int port, const void *buf, size_t len);
+    ag_err_t (*uart_dma_drain)(int port);
+    /* ABI 0.59: receive by DMA into the caller's buffer. */
+    int32_t (*uart_dma_read)(int port, void *buf, size_t len,
+                             uint32_t timeout_ms);
+    /*
+     * ABI 0.60: an SPI link at either end of the clock, and framed: every
+     * transaction is a `frame`-byte frame whose header says how much of it is
+     * data and how much room the sender has, so the stream carries no padding
+     * and never overruns the far end.  Read, write, close and stats are the
+     * spi_link_* calls above.  A master must be framed.
+     */
+    ag_err_t (*spi_link_open2)(int bus, int cs, uint32_t khz, uint32_t frame,
+                               uint32_t flags);
 } ag_io_api_t;
 
 /* ------------------------------------------------------------------------ */
