@@ -58,6 +58,23 @@ enum {
     RD_WRITE,
     RD_IOCTL,
     RD_SIZE,
+    /*
+     * A DEVICE THAT IS NOT A STREAM OF BYTES.
+     *
+     * open/read/write/ioctl/size is the whole of what a proxy used to forward,
+     * and it is enough for anything whose interface IS bytes - which is why a
+     * board with no converter could already play through its neighbour's.  A
+     * screen is not that: its class vtable is blit_rect, info and the text
+     * three, and a proxy without them is a device the graphics layer walks
+     * straight past.  Measured before these existed: an application on the
+     * screenless board drew 464 700 KB of pixels and 632 bytes crossed the
+     * wire.  The devices were VISIBLE and not USABLE.
+     */
+    RD_GFXINFO,  /* -> width, height, fmt, stride, flags                   */
+    RD_BLIT,     /* poured: geometry then pixels, no reply                 */
+    RD_TEXTINFO, /* -> cols, rows                                          */
+    RD_TEXTROW,  /* poured: row then cells                                 */
+    RD_TEXTCUR,  /* poured: col, row, visible                              */
 };
 
 static void put32(uint8_t *p, uint32_t v)
@@ -441,6 +458,232 @@ static uint64_t rd_size(ag_device_t *dev)
     return (uint64_t)get32(o) | ((uint64_t)get32(o + 4) << 32);
 }
 
+/* ---- a screen on the other board --------------------------------------- */
+
+/*
+ * WHICH REMOTE SCREEN, and the honest answer is "the one".
+ *
+ * A class vtable is called with a handle the caller does not fill in -
+ * display.c walks the registry and calls ops->blit_rect(0, b) - so a vtable
+ * shared by several proxies cannot tell them apart.  Every local driver has
+ * the same shape and does not notice, because it has one device.
+ *
+ * So: the first proxied display wins and a second is said out loud rather than
+ * silently shadowing it.  Two boards with screens joined to one that has none
+ * is a real arrangement and this is where it will need the handle to mean
+ * something.
+ */
+static rdev_t *s_display_proxy;
+
+static rdev_t *proxy_of(ag_handle_t h)
+{
+    (void)h;
+    return s_display_proxy;
+}
+
+/*
+ * Opened on first use rather than at `link devs`.  Attaching a registry must
+ * not open anything - see the note on why proxies do not appear at `link use`
+ * - and a screen is used by the graphics layer, which never opens a device.
+ */
+static ag_err_t ensure_open(rdev_t *p)
+{
+    if (p->far_handle >= 0) {
+        return AG_OK;
+    }
+    const int32_t r = ask(RD_OPEN, 0, 0, 0, AG_LINK_CONTROL, p->name,
+                          (uint16_t)strlen(p->name), NULL, NULL);
+    if (r < 0) {
+        return (ag_err_t)r;
+    }
+    p->far_handle = r;
+    return AG_OK;
+}
+
+
+/*
+ * THE GEOMETRY THAT TRAVELS WITH EVERY SLICE.  Twelve bytes, and the same
+ * shape REMDISP puts on its wire, because it is the smallest description of
+ * "these pixels belong here" that does not need the far end to remember
+ * anything between messages.
+ */
+#define RD_BLIT_HDR 12u
+#define RD_BLIT_PX  ((RD_MAX_PAYLOAD - RD_BLIT_HDR) / 2u) /* pixels per slice */
+
+static rdev_t *proxy_of(ag_handle_t h);
+
+static ag_err_t rd_gfxinfo(ag_handle_t h, ag_gfxinfo_t *out)
+{
+    rdev_t *p = proxy_of(h);
+    if (p == NULL || out == NULL) {
+        return -AG_ENODEV;
+    }
+    if (ensure_open(p) != AG_OK) {
+        return -AG_ENODEV;
+    }
+    uint8_t  ans[16];
+    uint16_t got = 0;
+    const int32_t r = ask(RD_GFXINFO, (uint32_t)p->far_handle, 0, 0,
+                          AG_LINK_CONTROL, NULL, 0, ans, &got);
+    if (r < 0 || got < 12u) {
+        return (r < 0) ? (ag_err_t)r : -AG_EIO;
+    }
+    memset(out, 0, sizeof(*out));
+    out->width = get16(ans);
+    out->height = get16(ans + 2);
+    out->fmt = (ag_pixfmt_t)get16(ans + 4);
+    out->stride = get32(ans + 6);
+    out->direct = (ans[10] != 0);
+    out->double_buf = (ans[11] != 0);
+    return AG_OK;
+}
+
+/*
+ * A BLIT, CUT INTO PIECES THAT FIT.  Not reassembled at the far end: every
+ * piece is a complete rectangle with its own geometry, so a piece that is lost
+ * costs its own pixels and nothing else - the same trade a screen over a wire
+ * has always made.  It is cut by ROWS first and then across, because a run
+ * along a row is what the far end can put on the glass in one go.
+ */
+static void rd_blit(ag_handle_t h, const ag_blit_t *b)
+{
+    rdev_t *p = proxy_of(h);
+    if (p == NULL || b == NULL || b->px == NULL || b->w == 0 || b->h == 0) {
+        return;
+    }
+    if (ensure_open(p) != AG_OK) {
+        return;
+    }
+
+    const uint8_t *rows = (const uint8_t *)b->px;
+    uint8_t        msg[RD_HDR + RD_MAX_PAYLOAD];
+
+    for (uint16_t r = 0; r < b->h; r++) {
+        const uint16_t *src =
+            (const uint16_t *)(const void *)(rows + (size_t)r * b->stride);
+        for (uint16_t x = 0; x < b->w; x += (uint16_t)RD_BLIT_PX) {
+            uint16_t n = (uint16_t)(b->w - x);
+            if (n > (uint16_t)RD_BLIT_PX) {
+                n = (uint16_t)RD_BLIT_PX;
+            }
+            msg[0] = RD_BLIT;
+            msg[1] = RD_F_NOREPLY;
+            put16(msg + 2, 0);
+            put32(msg + 4, (uint32_t)p->far_handle);
+            put32(msg + 8, 0);
+            put32(msg + 12, 0);
+            uint8_t *const q = msg + RD_HDR;
+            put16(q + 0, (uint16_t)(b->x + x));
+            put16(q + 2, (uint16_t)(b->y + r));
+            put16(q + 4, n);
+            put16(q + 6, 1);
+            put16(q + 8, b->surf_w);
+            put16(q + 10, b->surf_h);
+            memcpy(q + RD_BLIT_HDR, src + x, (size_t)n * 2u);
+            (void)ag_linkprov_send(RD_CHAN, AG_LINK_STREAM, msg,
+                                   (uint16_t)(RD_HDR + RD_BLIT_HDR + n * 2u));
+        }
+    }
+}
+
+static ag_err_t rd_textinfo(ag_handle_t h, uint16_t *cols, uint16_t *rows)
+{
+    rdev_t *p = proxy_of(h);
+    if (p == NULL) {
+        return -AG_ENODEV;
+    }
+    if (ensure_open(p) != AG_OK) {
+        return -AG_ENODEV;
+    }
+    uint8_t  ans[8];
+    uint16_t got = 0;
+    const int32_t r = ask(RD_TEXTINFO, (uint32_t)p->far_handle, 0, 0,
+                          AG_LINK_CONTROL, NULL, 0, ans, &got);
+    if (r < 0 || got < 4u) {
+        return (r < 0) ? (ag_err_t)r : -AG_EIO;
+    }
+    if (cols != NULL) {
+        *cols = get16(ans);
+    }
+    if (rows != NULL) {
+        *rows = get16(ans + 2);
+    }
+    return AG_OK;
+}
+
+static void rd_textrow(ag_handle_t h, uint16_t row, const ag_textcell_t *cells,
+                       uint16_t count)
+{
+    rdev_t *p = proxy_of(h);
+    if (p == NULL || cells == NULL || count == 0) {
+        return;
+    }
+    if (ensure_open(p) != AG_OK) {
+        return;
+    }
+    uint16_t max = (uint16_t)((RD_MAX_PAYLOAD - 4u) / sizeof(ag_textcell_t));
+    if (count > max) {
+        count = max;
+    }
+    uint8_t msg[RD_HDR + RD_MAX_PAYLOAD];
+    msg[0] = RD_TEXTROW;
+    msg[1] = RD_F_NOREPLY;
+    put16(msg + 2, 0);
+    put32(msg + 4, (uint32_t)p->far_handle);
+    put32(msg + 8, 0);
+    put32(msg + 12, 0);
+    put16(msg + RD_HDR, row);
+    put16(msg + RD_HDR + 2, count);
+    memcpy(msg + RD_HDR + 4, cells, (size_t)count * sizeof(ag_textcell_t));
+    (void)ag_linkprov_send(
+        RD_CHAN, AG_LINK_STREAM, msg,
+        (uint16_t)(RD_HDR + 4u + count * sizeof(ag_textcell_t)));
+}
+
+static void rd_textcur(ag_handle_t h, uint16_t col, uint16_t row,
+                       ag_textcell_t under, bool visible)
+{
+    rdev_t *p = proxy_of(h);
+    if (p == NULL) {
+        return;
+    }
+    if (ensure_open(p) != AG_OK) {
+        return;
+    }
+    uint8_t msg[RD_HDR + 8];
+    msg[0] = RD_TEXTCUR;
+    msg[1] = RD_F_NOREPLY;
+    put16(msg + 2, 0);
+    put32(msg + 4, (uint32_t)p->far_handle);
+    put32(msg + 8, 0);
+    put32(msg + 12, 0);
+    put16(msg + RD_HDR, col);
+    put16(msg + RD_HDR + 2, row);
+    msg[RD_HDR + 4] = visible ? 1u : 0u;
+    /* The cell under the caret travels with it: a caret drawn as a blank rubs
+     * out the character it is standing on. */
+    msg[RD_HDR + 5] = under.ch;
+    msg[RD_HDR + 6] = under.attr;
+    (void)ag_linkprov_send(RD_CHAN, AG_LINK_STREAM, msg,
+                           (uint16_t)(RD_HDR + 7u));
+}
+
+static const ag_display_ops_t k_proxy_display_ops = {
+    /*
+     * THE SIZE IS NOT DECORATION.  AG_HAS asks whether the table is long
+     * enough to contain the member before it looks at it, so a table that
+     * leaves this zero has NO members at all as far as every caller is
+     * concerned - which is a screen that is registered, listed, and walked
+     * straight past.
+     */
+    .size = sizeof(ag_display_ops_t),
+    .info = rd_gfxinfo,
+    .blit_rect = rd_blit,
+    .text_info = rd_textinfo,
+    .text_row = rd_textrow,
+    .text_cursor = rd_textcur,
+};
+
 static const ag_dev_ops_t k_proxy_ops = {
     .open = rd_open,
     .close = rd_close,
@@ -626,6 +869,89 @@ static void serve_one(const uint8_t *b, uint16_t n)
         put32(obuf, (uint32_t)sz);
         put32(obuf + 4, (uint32_t)(sz >> 32));
         reply(op, tag, 0, AG_LINK_CONTROL, obuf, 8);
+        break;
+    }
+    case RD_GFXINFO: {
+        const ag_display_ops_t *d = (const ag_display_ops_t *)dev->class_ops;
+        ag_gfxinfo_t            gi;
+        if (d == NULL || d->info == NULL || d->info(0, &gi) != AG_OK) {
+            reply(op, tag, -AG_ENOTSUP, AG_LINK_CONTROL, NULL, 0);
+            break;
+        }
+        put16(obuf + 0, gi.width);
+        put16(obuf + 2, gi.height);
+        put16(obuf + 4, (uint16_t)gi.fmt);
+        put32(obuf + 6, gi.stride);
+        obuf[10] = gi.direct ? 1u : 0u;
+        obuf[11] = gi.double_buf ? 1u : 0u;
+        reply(op, tag, 0, AG_LINK_CONTROL, obuf, 12);
+        break;
+    }
+    case RD_BLIT: {
+        /*
+         * Poured, so there is nothing to answer and nothing to retransmit: a
+         * slice that does not arrive is a rectangle of pixels that stays as it
+         * was.  Each one carries its own geometry, so nothing is remembered
+         * between them.
+         */
+        const ag_display_ops_t *d = (const ag_display_ops_t *)dev->class_ops;
+        if (d == NULL || d->blit_rect == NULL || plen < RD_BLIT_HDR) {
+            break;
+        }
+        const ag_blit_t bl = {
+            .px = pay + RD_BLIT_HDR,
+            .stride = (uint32_t)get16(pay + 4) * 2u,
+            .surf_w = get16(pay + 8),
+            .surf_h = get16(pay + 10),
+            .x = get16(pay + 0),
+            .y = get16(pay + 2),
+            .w = get16(pay + 4),
+            .h = get16(pay + 6),
+        };
+        if ((uint32_t)bl.w * bl.h * 2u <= (uint32_t)(plen - RD_BLIT_HDR)) {
+            d->blit_rect(0, &bl);
+        }
+        break;
+    }
+    case RD_TEXTINFO: {
+        const ag_display_ops_t *d = (const ag_display_ops_t *)dev->class_ops;
+        uint16_t                cols = 0, rows = 0;
+        if (d == NULL || d->text_info == NULL ||
+            d->text_info(0, &cols, &rows) != AG_OK) {
+            reply(op, tag, -AG_ENOTSUP, AG_LINK_CONTROL, NULL, 0);
+            break;
+        }
+        put16(obuf + 0, cols);
+        put16(obuf + 2, rows);
+        reply(op, tag, 0, AG_LINK_CONTROL, obuf, 4);
+        break;
+    }
+    case RD_TEXTROW: {
+        const ag_display_ops_t *d = (const ag_display_ops_t *)dev->class_ops;
+        if (d == NULL || d->text_row == NULL || plen < 4u) {
+            break;
+        }
+        const uint16_t row = get16(pay);
+        uint16_t       n = get16(pay + 2);
+        const uint16_t room =
+            (uint16_t)((plen - 4u) / sizeof(ag_textcell_t));
+        if (n > room) {
+            n = room;
+        }
+        d->text_row(0, row, (const ag_textcell_t *)(const void *)(pay + 4), n);
+        break;
+    }
+    case RD_TEXTCUR: {
+        const ag_display_ops_t *d = (const ag_display_ops_t *)dev->class_ops;
+        if (d == NULL || d->text_cursor == NULL || plen < 5u) {
+            break;
+        }
+        ag_textcell_t under = {.ch = ' ', .attr = 0};
+        if (plen >= 7u) {
+            under.ch = pay[5];
+            under.attr = pay[6];
+        }
+        d->text_cursor(0, get16(pay), get16(pay + 2), under, pay[4] != 0u);
         break;
     }
     default:
@@ -934,12 +1260,29 @@ int32_t ag_noderdev_attach(uint32_t timeout_ms)
         p->far_handle = -1;
         p->used = true;
 
+        /*
+         * A display gets the class vtable as well as the byte one.  Without it
+         * the graphics layer walks past this device and the screen on the
+         * other board is listed and unusable.
+         */
+        const bool is_display = (info[i].cls == AG_DEV_DISPLAY);
+        if (is_display) {
+            if (s_display_proxy == NULL) {
+                s_display_proxy = p;
+            } else if (s_display_proxy != p) {
+                ag_log(AG_LOG_WARN, TAG,
+                       "%s: a second remote screen; %s keeps the class",
+                       full, s_display_proxy->qualified);
+            }
+        }
+
         const ag_dev_desc_t desc = {
             .name = p->qualified,
             .driver = "node",
             .cls = info[i].cls,
             .flags = info[i].flags,
             .ops = &k_proxy_ops,
+            .class_ops = is_display ? (const void *)&k_proxy_display_ops : NULL,
             .priv = p,
             .owner = (const void *)&s_proxy,
         };
