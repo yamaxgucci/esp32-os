@@ -424,6 +424,11 @@
       "src": ["apps/gfxnoise/gfxnoise.c"]
     },
     {
+      "out": "WIREBENCH.AXE", "group": "core",
+      "_note": "How fast the wire between two boards carries ANYBODY'S bytes. Writes noise to /dev/wire0 - the pipe REMDISP publishes beside its display - so the path that moves a picture at 2.68 MB/s can be measured carrying something that is not a picture. The far end (REMTERM) counts what arrived and what failed its checksum.",
+      "src": ["apps/wirebench/wirebench.c"]
+    },
+    {
       "out": "REMDISP.SYS", "group": "core",
       "_note": "The screen of a machine that has none, sent down a wire to the board that does: a display device whose panel is UART1. Publishes ag_display_ops_t with blit_rect for pixels and text_row/text_cursor for the console, so ag_gfx_flush and ag_gfx_present reach it without any application knowing. Trims each band to the bounding box of what moved against a shadow of the last frame, then sends whichever is smallest of raw RGB565, PackBits, or palette-and-indices. Measured on the two boards at 4 Mbaud: 15 fps for a whole 320x240 frame every frame and 154 fps on dirty rectangles, 7.8x compression. Needs [uart1] tx/rx in BOARD.CFG; see docs/09-esp32-cyd.md.",
       "src": ["apps/remdisp/remdisp.c"]

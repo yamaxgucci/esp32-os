@@ -55,6 +55,7 @@ AG_APP("REMTERM", "1.1", "argon", 0);
 #define FR_BAND   'B' /* pixels as they are                                  */
 #define FR_PACK   'P' /* PackBits over the pixels                            */
 #define FR_IDX    'I' /* a palette and indices                               */
+#define FR_BULK   'B' /* anybody's bytes: counted, not drawn                 */
 
 /* Both numbers have to match remdisp.c exactly. */
 #define BAND_ROWS      12u
@@ -558,6 +559,9 @@ int ag_main(int argc, char **argv)
     uint32_t px = 0;     /* pixels presented, in thousands                  */
     uint32_t bad = 0;    /* frames whose checksum or shape did not come out  */
     uint32_t stray = 0;  /* bytes dropped hunting for a header              */
+    uint32_t bulk = 0;          /* bytes through /dev/wire0        */
+    uint32_t bulk_first_ms = 0; /* when the first of them arrived  */
+    uint32_t bulk_last_ms = 0;
     uint32_t pxlow = 0;
     /*
      * What the encodings actually bought, which is the only way to know: the
@@ -636,6 +640,22 @@ int ag_main(int argc, char **argv)
             continue;
         }
 
+        if (op == FR_BULK) {
+            /*
+             * Somebody else's bytes, through the same framing the pixels use.
+             * Counted and thrown away: what is being measured is whether the
+             * shape that carries a picture carries anything else at the same
+             * rate, and keeping them would measure a disk instead.  The
+             * checksum above has already passed, so these are bytes that
+             * arrived intact.
+             */
+            bulk += len;
+            if (bulk_first_ms == 0u) {
+                bulk_first_ms = (uint32_t)(g_ag_api->time->us() / 1000u);
+            }
+            bulk_last_ms = (uint32_t)(g_ag_api->time->us() / 1000u);
+            continue;
+        }
         if ((op == FR_BAND || op == FR_PACK || op == FR_IDX) && len >= 12u) {
             const uint32_t bx = get16(payload + 0);
             const uint32_t by = get16(payload + 2);
@@ -770,6 +790,13 @@ int ag_main(int argc, char **argv)
     ag_printf("\nremterm: %u rows, %u rects, %u k pixels, %u bad, %u stray\n",
               (unsigned)rows, (unsigned)bands, (unsigned)px, (unsigned)bad,
               (unsigned)stray);
+    if (bulk != 0u) {
+        const uint32_t ms = (bulk_last_ms > bulk_first_ms)
+                                ? (bulk_last_ms - bulk_first_ms)
+                                : 1u;
+        ag_printf("wire0: %u KB in %u ms, %u KB/s\n", (unsigned)(bulk / 1024u),
+                  (unsigned)ms, (unsigned)(bulk / ms * 1000u / 1024u));
+    }
     ag_printf("encoded: %u packed, %u indexed, %u KB on the wire\n",
               (unsigned)packedframes, (unsigned)idxframes, (unsigned)wirekb);
     /*
@@ -823,7 +850,7 @@ int ag_main(int argc, char **argv)
             "rows=", " rects=", " kpixels=", " bad=", " stray=",
             " flow_ms=", " kpixels_per_s=", " packed=", " indexed=", " wirekb=",
             " blocks=", " blocks_data=", " unarmed=", " dropped=",
-            " timeouts=", " stalls=", " rebuilds=",
+            " timeouts=", " stalls=", " rebuilds=", " bulkkb=", " bulkms=",
         };
         const uint32_t vals[] = {rows,    bands,        px,
                                  bad,     stray,        flow_ms,
@@ -835,7 +862,11 @@ int ag_main(int argc, char **argv)
                                  st.bytes_dropped,
                                  st.timeouts,
                                  st.stalls,
-                                 st.recoveries};
+                                 st.recoveries,
+                                 bulk / 1024u,
+                                 (bulk_last_ms > bulk_first_ms)
+                                     ? (bulk_last_ms - bulk_first_ms)
+                                     : 0u};
 
         char out[512];
         out[0] = '\0';

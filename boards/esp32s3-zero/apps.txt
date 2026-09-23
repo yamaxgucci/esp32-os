@@ -36,3 +36,6 @@ GFXDEMO.AXE
 # frame crossed the wire as 3 KB for 75 000 pixels, so measuring a transport on
 # it measures the encoder.  GFXNOISE sends every band whole.
 GFXNOISE.AXE
+# And the same wire carrying something that is not a picture at all: writes to
+# /dev/wire0, which REMDISP publishes beside its display.
+WIREBENCH.AXE

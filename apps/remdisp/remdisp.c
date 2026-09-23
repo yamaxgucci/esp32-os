@@ -114,6 +114,7 @@ AG_DRV("REMDISP", "1.1", "argon");
 #define FR_BAND   'B' /* a rectangle of pixels, RGB565 as they are           */
 #define FR_PACK   'P' /* the same, PackBits over the pixels                  */
 #define FR_IDX    'I' /* the same, as a palette and indices                  */
+#define FR_BULK   'B' /* anybody's bytes, in the shape that works            */
 
 /*
  * A band is at most eight rows, and the reason is the far end's panel rather
@@ -1093,6 +1094,53 @@ static const ag_dev_ops_t k_dev_ops = {
     .ioctl = NULL,
 };
 
+/*
+ * THE WIRE AS A PIPE, and this is the whole point of the driver rather than a
+ * sideline.
+ *
+ * What this driver does for a screen - build a frame as big as the transport
+ * will take, hand it over in ONE transaction, and check it at the far end with
+ * a checksum - is not about pixels.  Measured on this pair at 40 MHz it moves
+ * 2.68 MB/s with one bad frame in 6043.  The cluster link over the same four
+ * wires moves about 20 KB/s, and the difference is not the data and not the
+ * copper: it cuts the stream into 248-byte frames and waits for an
+ * acknowledgement of each, so the bytes in flight are a window of 5.9 KB
+ * against a measured round trip of 25 to 45 ms.
+ *
+ * So the shape is offered to everybody else as a character device.  Write to
+ * /dev/wire0 and the bytes cross in frames of FR_MAX_PAYLOAD, one transaction
+ * each.  What it does NOT do, and the caller must know: there is no
+ * acknowledgement and nothing is sent again.  A frame that fails its checksum
+ * at the far end is counted and dropped.  That is the right trade for pixels
+ * and for anything idempotent or checkpointed above; it is the wrong one for a
+ * file transfer that must not lose a byte, and the answer for those is a
+ * batched acknowledgement on top of this, not a return to 248-byte frames.
+ */
+static int32_t pipe_write(ag_device_t *dev, const void *buf, size_t len,
+                          uint64_t off)
+{
+    (void)dev;
+    (void)off;
+    if (!s_up || buf == NULL) {
+        return -AG_ENODEV;
+    }
+
+    const uint8_t *p = (const uint8_t *)buf;
+    size_t         left = len;
+    while (left > 0u) {
+        const uint32_t n =
+            (left > FR_MAX_PAYLOAD) ? FR_MAX_PAYLOAD : (uint32_t)left;
+        send_frame(FR_BULK, p, n);
+        p += n;
+        left -= n;
+    }
+    return (int32_t)len;
+}
+
+static const ag_dev_ops_t k_pipe_ops = {
+    .write = pipe_write,
+};
+
 ag_err_t ag_driver_init(void)
 {
     io = ag_api()->io;
@@ -1207,5 +1255,21 @@ ag_err_t ag_driver_init(void)
                   LINK_PORT, (unsigned)s_baud, (unsigned)REM_COLS,
                   (unsigned)REM_ROWS, (unsigned)BAND_ROWS);
     }
+    /*
+     * And the same wire as a pipe.  A failure to publish it is not a failure
+     * to be a screen, so it is noted and the driver stays up.
+     */
+    const ag_dev_add_t pipe_desc = {
+        .name = "wire0",
+        .driver = "REMDISP",
+        .cls = AG_DEV_CHAR,
+        .flags = 0,
+        .ops = &k_pipe_ops,
+        .priv = NULL,
+    };
+    if (ag_dev_add(&pipe_desc) != AG_OK) {
+        ag_printf("REMDISP: /dev/wire0 could not be published\n");
+    }
+
     return AG_OK;
 }

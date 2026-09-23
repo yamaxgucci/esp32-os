@@ -528,6 +528,12 @@ typedef struct {
      */
     uint8_t  *staging;
     /*
+     * The receive half for a LONG DUPLEX transfer.  Separate from the pair
+     * above because that one is the write ping-pong and both halves of it can
+     * be in flight; this is used inside one synchronous call and nowhere else.
+     */
+    uint8_t  *staging_rx;
+    /*
      * The other half of the staging pair, and the transaction in flight.
      *
      * A long write is QUEUED rather than polled: the engine clocks it out of
@@ -941,7 +947,54 @@ static ag_err_t spi_xfer_locked(int bus, int cs, const void *tx, void *rx,
          * would not survive that.
          */
         if (rx != NULL) {
-            return -AG_EINVAL;
+            /*
+             * A LONG TRANSFER THAT ALSO READS, and it used to be refused
+             * outright.  The refusal was not a hardware limit: it was that the
+             * only way to send something long was to cut it into bounce-sized
+             * pieces, and cutting a transfer that reads drops chip select in
+             * the middle of a chip's answer.  Nothing has to be cut any more.
+             *
+             * WHO NEEDED IT.  The cluster link is a full-duplex byte stream -
+             * every block it clocks carries bytes in both directions - so it
+             * was held at the bounce buffer's 512-byte block whatever the
+             * wire could do, and its measured ceiling was about 500
+             * transactions a second AT ANY CLOCK: 21 037 B/s at 5 MHz and
+             * 15 852 B/s at 20 MHz.
+             *
+             * Synchronous, unlike the write below: the caller wants the bytes
+             * that came back, so there is nothing to overlap with.
+             */
+            const ag_err_t d = spi_drain(bus, dev);
+            if (d != AG_OK) {
+                return d;
+            }
+            if (s_spi[bus].staging == NULL) {
+                s_spi[bus].staging = ag_port_alloc_aligned(
+                    4, 2u * AG_PORT_SPI_MAX_XFER, AG_MEM_DMA);
+            }
+            if (s_spi[bus].staging_rx == NULL) {
+                s_spi[bus].staging_rx = ag_port_alloc_aligned(
+                    4, AG_PORT_SPI_MAX_XFER, AG_MEM_DMA);
+            }
+            if (s_spi[bus].staging == NULL || s_spi[bus].staging_rx == NULL) {
+                return -AG_ENOMEM;
+            }
+            if (tx != NULL) {
+                memcpy(s_spi[bus].staging, tx, len);
+            } else {
+                memset(s_spi[bus].staging, 0, len);
+            }
+            spi_transaction_t both = {
+                .length = len * 8u,
+                .tx_buffer = s_spi[bus].staging,
+                .rx_buffer = s_spi[bus].staging_rx,
+            };
+            const esp_err_t ae = spi_device_polling_transmit(dev, &both);
+            if (ae != ESP_OK) {
+                return from_esp(ae);
+            }
+            memcpy(rx, s_spi[bus].staging_rx, len);
+            return AG_OK;
         }
 
         /*
