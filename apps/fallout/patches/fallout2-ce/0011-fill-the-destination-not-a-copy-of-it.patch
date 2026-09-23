@@ -1,0 +1,36 @@
+diff --git a/src/window_manager.cc b/src/window_manager.cc
+index 9381222..ee5942e 100644
+--- a/src/window_manager.cc
++++ b/src/window_manager.cc
+@@ -890,6 +890,31 @@ void _GNW_win_refresh(Window* window, Rect* rect, unsigned char* a3)
+                 while (v16 != nullptr) {
+                     int width = v16->rect.right - v16->rect.left + 1;
+                     int height = v16->rect.bottom - v16->rect.top + 1;
++
++                    // ARGON: fill the destination, do not fill a copy of it.
++                    //
++                    // This paints a rectangle in one colour.  It did so by
++                    // asking for a buffer the size of the rectangle, filling
++                    // that, and copying it over - which for the background
++                    // window at full screen is 307200 bytes taken and given
++                    // back, and when the arena is tight it is 307200 bytes
++                    // that are not there.  The `if (buf != nullptr)` below
++                    // then quietly does nothing at all, and what the caller
++                    // gets is whatever was in its buffer already: the black
++                    // rectangles that follow the mouse cursor around a map
++                    // when memory has run low are this.
++                    //
++                    // Only the branch that has a destination can be filled in
++                    // place; _scr_blit further down needs something to read
++                    // from, so that one keeps the buffer.
++                    if (dest_pitch != 0) {
++                        bufferFill(a3 + dest_pitch * (v16->rect.top - rect->top)
++                                       + v16->rect.left - rect->left,
++                            width, height, dest_pitch, _bk_color);
++                        v16 = v16->next;
++                        continue;
++                    }
++
+                     unsigned char* buf = (unsigned char*)internal_malloc(width * height);
+                     if (buf != nullptr) {
+                         bufferFill(buf, width, height, width, _bk_color);

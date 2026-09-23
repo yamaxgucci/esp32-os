@@ -13,6 +13,7 @@
 #include <argon/board.h>
 #include <argon/cmdline.h>
 #include <argon/codepage.h>
+#include <argon/budget.h>
 #include <argon/console.h>
 #include <argon/textpanel.h>
 #include <argon/session.h>
@@ -402,6 +403,16 @@ static int cmd_mem(int argc, char **argv)
     const size_t int_block = ag_port_mem_largest(AG_MEM_FAST);
     const size_t psram_free = ag_port_mem_free(AG_MEM_SLOW);
     const size_t psram_total = ag_port_mem_total(AG_MEM_SLOW);
+    /*
+     * Extended memory has a largest block too, and leaving it out cost an
+     * evening.  An application that asks for a size gets one contiguous
+     * block or it does not start, so `free` is not the number that decides
+     * anything - Fallout 2 was refused six megabytes three times with this
+     * command reporting more than six free, and the arithmetic to explain
+     * the gap was guesswork every time because the figure that settles it
+     * was the one not printed.  It is the same call as the other two rows.
+     */
+    const size_t psram_block = ag_port_mem_largest(AG_MEM_SLOW);
 
     /*
      * And the same question asked the way an image asks it.
@@ -429,9 +440,10 @@ static int cmd_mem(int argc, char **argv)
                           (unsigned)(byte_free / 1024),
                           (unsigned)(byte_block / 1024));
         if (psram_total > 0) {
-            ag_console_printf("extended %5uK  %5uK\n",
+            ag_console_printf("extended %5uK  %5uK  %5uK\n",
                               (unsigned)(psram_total / 1024),
-                              (unsigned)(psram_free / 1024));
+                              (unsigned)(psram_free / 1024),
+                              (unsigned)(psram_block / 1024));
         } else {
             ag_console_puts("extended  none\n");
         }
@@ -446,9 +458,10 @@ static int cmd_mem(int argc, char **argv)
                           (unsigned)(byte_free / 1024),
                           (unsigned)(byte_block / 1024));
         if (psram_total > 0) {
-            ag_console_printf("  extended  %8u KB  %8u KB\n",
+            ag_console_printf("  extended  %8u KB  %8u KB  %8u KB\n",
                               (unsigned)(psram_total / 1024),
-                              (unsigned)(psram_free / 1024));
+                              (unsigned)(psram_free / 1024),
+                              (unsigned)(psram_block / 1024));
         } else {
             ag_console_puts("  extended         none\n");
         }
@@ -1264,6 +1277,30 @@ static int cmd_ps(int argc, char **argv)
     if (shown == 0) {
         ag_console_puts("  no applications loaded\n");
     }
+
+    /*
+     * And the driver tasks that run above applications, with what they spent
+     * of their budget in the window that just closed.  They are not processes
+     * and have no pid, but they are the only things on this machine that can
+     * starve one, so this is where a person looks when an application is slow
+     * for no reason it can see.
+     */
+    for (uint32_t i = 0;; i++) {
+        const char *name = NULL;
+        uint32_t    used = 0, budget = 0;
+        bool        demoted = false;
+        if (!ag_budget_report(i, &name, &used, &budget, &demoted)) {
+            break;
+        }
+        if (i == 0) {
+            ag_console_puts(
+                "  driver tasks above applications, per 100 ms window:\n");
+        }
+        ag_console_printf("  %-17s used %3u ms of %3u%s\n", name,
+                          (unsigned)used, (unsigned)budget,
+                          demoted ? "  (held down)" : "");
+    }
+
     return 0;
 }
 
@@ -2136,6 +2173,15 @@ static int cmd_drv(int argc, char **argv)
         const ag_err_t err = ag_module_unload(argv[2]);
         if (err == -AG_ENOENT) {
             ag_console_printf("%s: not loaded\n", argv[2]);
+            return 1;
+        }
+        if (err == -AG_EBUSY) {
+            /* A module with a task of its own that did not stop when it was
+             * told to.  The image is deliberately left loaded: unmapping code
+             * a task is still inside is a fault that names the wrong culprit. */
+            ag_console_printf("%s: a task of its own has not stopped; "
+                              "still loaded\n",
+                              argv[2]);
             return 1;
         }
         if (err != AG_OK) {
@@ -4236,8 +4282,40 @@ static int cmd_usb(int argc, char **argv)
         ag_console_puts("host up, nothing plugged in\n");
         break;
     case AG_USB_OPEN:
-        ag_console_printf("keyboard %04x:%04x, %u reports\n", st.vid, st.pid,
-                          (unsigned)st.reports);
+        /*
+         * ARGON: what it is, not "keyboard" for anything that opened - and one
+         * line per HID interface, with the endpoint's last transfer status.
+         *
+         * "keyboard 046d:c542, 249 reports" was the whole of it, and every word
+         * was misleading at once: the device was a mouse, the count had been
+         * frozen for ten minutes, and the endpoint had been halted since.
+         */
+        ag_console_printf("device %04x:%04x, %u reports total, %u loops, "
+                          "quiet for %u ms, prodded %u times\n",
+                          st.vid, st.pid, (unsigned)st.reports,
+                          (unsigned)st.loops, (unsigned)st.silent_ms,
+                          (unsigned)st.prods);
+        for (uint32_t i = 0; i < st.pipes; i++) {
+            const char *what = "hid";
+            if (st.pipe[i].usage == AG_USB_USAGE_KEYBOARD) {
+                what = "keyboard";
+            } else if (st.pipe[i].usage == AG_USB_USAGE_MOUSE) {
+                what = "mouse";
+            }
+            ag_console_printf("  %-8s interface %u ep 0x%02x: %s",
+                              what, (unsigned)st.pipe[i].itf,
+                              (unsigned)st.pipe[i].ep,
+                              (st.pipe[i].last != NULL) ? st.pipe[i].last
+                                                        : "?");
+            if (st.pipe[i].errors != 0u) {
+                ag_console_printf(", cleared %u time(s)",
+                                  (unsigned)st.pipe[i].errors);
+            }
+            if (st.pipe[i].dead) {
+                ag_console_puts(", NOT ANSWERING");
+            }
+            ag_console_puts("\n");
+        }
         break;
     default:
         break;
@@ -4861,11 +4939,28 @@ static int cmd_beep(int argc, char **argv)
             }
             buf[i] = (int16_t)((v * gain) >> 8);
         }
-        const int32_t wrote =
-            ag_dev_write(dev, buf, (size_t)n * sizeof(int16_t), 0);
-        if (wrote <= 0) {
-            ag_console_printf("pcm0 write: %d\n", (int)wrote);
-            break;
+        /*
+         * A sink may take less than it is offered - that is how it says "wait"
+         * without stopping the machine that asked - so what was accepted is
+         * what counts.  This used to advance by the whole buffer whatever came
+         * back, which silently shortened the tone, and treated a zero as an
+         * error, which ended it.  Both showed up the day /dev/pcm0 stopped
+         * blocking.
+         */
+        uint32_t at = 0;
+        while (at < n) {
+            const int32_t wrote = ag_dev_write(
+                dev, buf + at, (size_t)(n - at) * sizeof(int16_t), 0);
+            if (wrote < 0) {
+                ag_console_printf("pcm0 write: %d\n", (int)wrote);
+                sent = total;
+                break;
+            }
+            if (wrote == 0) {
+                ag_port_task_delay(ag_port_ms_to_ticks(5));
+                continue;
+            }
+            at += (uint32_t)wrote / sizeof(int16_t);
         }
         sent += n;
     }
@@ -5215,6 +5310,15 @@ int ag_shell_execute(const char *line)
     int argc = ag_cmdline_split(work, argv, AG_ARGV_MAX);
     if (argc == 0) {
         return 0;
+    }
+    /*
+     * A line that fills every slot has probably lost its tail, and a lost
+     * tail is invisible: the command runs, and the options that were dropped
+     * simply look as though they do nothing.  Say so.
+     */
+    if (argc == AG_ARGV_MAX) {
+        ag_console_printf("warning: command line cut at %d words; the rest "
+                          "was dropped\n", AG_ARGV_MAX);
     }
 
     ag_handle_t redirect = AG_INVALID_HANDLE;

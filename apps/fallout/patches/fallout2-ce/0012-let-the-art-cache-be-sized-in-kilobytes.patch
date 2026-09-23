@@ -1,0 +1,27 @@
+diff --git a/src/art.cc b/src/art.cc
+index 205b360..3b8f93c 100644
+--- a/src/art.cc
++++ b/src/art.cc
+@@ -134,8 +134,21 @@ int artInit()
+     File* stream;
+     char string[200];
+ 
++    // ARGON: art_cache_size in kilobytes when it is larger than 16.
++    //
++    // The setting is megabytes and a whole number of them, which is a coarse
++    // dial when the difference between a cache that thrashes and one that does
++    // not has to be paid for out of an arena with a hundred kilobytes to
++    // spare.  One megabyte re-reads two hundred map tiles in one window out of
++    // three; two megabytes reads nothing at all.  Somewhere between them is
++    // the smallest cache that works, and there was no way to ask for it.
++    //
++    // Sixteen is the boundary because no machine this runs on has sixteen
++    // megabytes to give the art cache, and no useful cache is sixteen
++    // kilobytes, so the two ranges cannot be confused.
+     int cacheSize = settings.system.art_cache_size;
+-    if (!cacheInit(&gArtCache, artCacheGetFileSizeImpl, artCacheReadDataImpl, artCacheFreeImpl, cacheSize << 20)) {
++    int cacheBytes = (cacheSize > 16) ? (cacheSize << 10) : (cacheSize << 20);
++    if (!cacheInit(&gArtCache, artCacheGetFileSizeImpl, artCacheReadDataImpl, artCacheFreeImpl, cacheBytes)) {
+         debugPrint("cache_init failed in art_init\n");
+         return -1;
+     }

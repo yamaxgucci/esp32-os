@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <argon/budget.h>
 #include <argon/console.h>
 #include <argon/journal.h>
 #include <argon/keys.h>
@@ -69,6 +70,9 @@
 
 /* Nothing needs doing most of the time; a wake-up also collects zombies. */
 #define AG_SUP_TICK_MS 250
+
+/* And while a driver is being charged for its time - see argon/budget.h. */
+#define AG_SUP_BUDGET_TICK_MS 50
 
 static ag_port_task_t      s_task;
 static volatile bool     s_stop_request;
@@ -301,13 +305,37 @@ static void write_crash_record(void)
            AG_CRASH_PATH);
 }
 
+void ag_supervisor_poke_isr(void)
+{
+    ag_port_task_t t = s_task;
+    if (t != NULL) {
+        ag_port_notify_give_isr(t);
+    }
+}
+
 static void supervisor_task(void *arg)
 {
     (void)arg;
 
     for (;;) {
         /* Woken by a hotkey, or on the tick to collect what has finished. */
-        ag_port_notify_take(true, ag_port_ms_to_ticks(AG_SUP_TICK_MS));
+        /*
+         * A quarter of a second when there is nothing to police, fifty
+         * milliseconds when there is: a budget window is a hundred, and a
+         * punishment that arrives after the window it belongs to has closed is
+         * no punishment at all.
+         */
+        ag_port_notify_take(true,
+                            ag_port_ms_to_ticks(ag_budget_watching()
+                                                    ? AG_SUP_BUDGET_TICK_MS
+                                                    : AG_SUP_TICK_MS));
+
+        /*
+         * First, because it is the cheapest thing here and the most urgent:
+         * a driver that has overrun its budget is holding a core away from an
+         * application right now, and the tick that noticed cannot fix it.
+         */
+        (void)ag_budget_service();
 
         if (s_interrupt_request) {
             s_interrupt_request = false;
@@ -519,6 +547,13 @@ ag_err_t ag_supervisor_init(void)
 
     ag_session_init();
     s_focus_slot_request = -1;
+
+    /*
+     * The tick starts charging here, before the first driver can be loaded:
+     * the supervisor is what acts on what it finds, so there is no point
+     * accounting for a moment when nobody can be punished.
+     */
+    ag_budget_init();
 
     /*
      * Before any application can run: from here on a fault in one costs that

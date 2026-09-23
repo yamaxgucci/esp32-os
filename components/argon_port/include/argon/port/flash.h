@@ -71,6 +71,17 @@ ag_port_part_t ag_port_part_find(const char *label);
 uint64_t       ag_port_part_size(ag_port_part_t p);
 uint32_t       ag_port_part_erase_size(ag_port_part_t p);
 
+/*
+ * The partition's subtype byte, 0xFF when there is no partition.
+ *
+ * find() already refuses anything that is not a data partition, so the
+ * firmware itself is out of reach - but C: (littlefs) and nvs are data too,
+ * and an application that could erase those could destroy the machine's
+ * configuration by typing one wrong label.  The subtype is how a caller tells
+ * "a raw store nobody else owns" from "someone's filesystem".
+ */
+uint8_t        ag_port_part_subtype(ag_port_part_t p);
+
 ag_err_t ag_port_part_read(ag_port_part_t p, uint64_t off, void *buf,
                            size_t len);
 ag_err_t ag_port_part_write(ag_port_part_t p, uint64_t off, const void *buf,

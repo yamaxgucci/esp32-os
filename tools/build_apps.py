@@ -63,7 +63,16 @@ def target_from_sdkconfig():
 
 def load_manifest():
     with open(MANIFEST, encoding="utf-8") as f:
-        return json.load(f)
+        manifest = json.load(f)
+
+    # A JSON file has no comments, so the manifest carries them as objects -
+    # at the top level, and between entries in the list where one section of
+    # it needs a word of explanation.  Those are not images and have no "out";
+    # dropping them here is what lets them be written at all.  Without this the
+    # build dies on the first one with KeyError: 'out', which is how the merge
+    # of the Fallout branch into main first failed on 23 September 2026.
+    manifest["apps"] = [a for a in manifest["apps"] if "out" in a]
+    return manifest
 
 
 def toolchain_for(app, defaults, target_pair, forced_gcc):
@@ -105,6 +114,14 @@ def command_for(app, defaults, extra_cflags, target_pair, forced_gcc):
         cmd += ["--include", inc]
     if cflags:
         cmd += ["--cflags", cflags]
+    if "cxxflags" in app:
+        cmd += ["--cxxflags", app["cxxflags"]]
+    # Archives beyond libgcc.  Only the STL images need one so far, and they
+    # need it named here rather than guessed: -lstdc++ pulls in code compiled
+    # for a hosted system, and which image is willing to carry that is a
+    # decision, not a default.
+    for lib in app.get("libs", []):
+        cmd += ["--libs", lib]
     if app.get("icon"):
         # A program's own face, carried in its file (mkaxe --icon).  Kept in
         # apps.json beside its sources because that is where everything else

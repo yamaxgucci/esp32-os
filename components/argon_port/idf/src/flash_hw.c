@@ -32,6 +32,11 @@ uint64_t ag_port_part_size(ag_port_part_t p)
     return (p != NULL) ? (uint64_t)((const esp_partition_t *)p)->size : 0u;
 }
 
+uint8_t ag_port_part_subtype(ag_port_part_t p)
+{
+    return (p != NULL) ? (uint8_t)((const esp_partition_t *)p)->subtype : 0xFFu;
+}
+
 uint32_t ag_port_part_erase_size(ag_port_part_t p)
 {
     if (p == NULL) {

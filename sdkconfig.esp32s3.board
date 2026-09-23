@@ -74,9 +74,27 @@ CONFIG_ARGON_ENABLE_ADC=y
 # still handles it).  The cost of the PSRAM arena is speed: an inner loop that
 # misses the cache pays PSRAM latency, so a hot-text split will come later; this
 # is the coarse form that makes everything fit.
+#
+# 512 KB was chosen to hold "the biggest images in the tree", and then the
+# biggest image in the tree turned out to be 768 KB - Fallout 2 - so it goes to
+# flash XIP regardless and the arena holds nothing.  Meanwhile it is taken out
+# of PSRAM on the first load and never given back, which on an 8 MB part is
+# half a megabyte of the six that game needs, and it is exactly why it refused
+# to start on the board while running in the emulator.
+#
+# 64 KB instead, which is enough for every .SYS on this board several times
+# over and for the small applications; what is bigger already paid for flash
+# XIP.  Raise it again the day an image lands in that band and is hot enough
+# to care - XIP costs about 300 cycles on a miss (docs/07).
+#
+# The arena is the whole game here, literally: with Fallout 2 the difference
+# between running and not is a couple of hundred kilobytes, and every one of
+# them has to come from outside its own arena, because inside it the art cache
+# gives nothing back - shrinking that from 1800 to 1400 KB was measured at 0.16
+# frames a second and four hundred evictions a window.
 CONFIG_ARGON_APP_ARENA_KB=32
 CONFIG_ARGON_APP_ARENA_PSRAM=y
-CONFIG_ARGON_APP_ARENA_PSRAM_KB=512
+CONFIG_ARGON_APP_ARENA_PSRAM_KB=64
 
 # Camera transport for the DVP GC2145 on this board (api->cam); the sensor
 # driver is a loadable .SYS (GC2145.SYS), so the firmware carries only the
@@ -117,3 +135,19 @@ CONFIG_USB_HOST_EXT_PORT_RESET_ATTEMPTS=3
 CONFIG_USB_HOST_EXT_PORT_RESET_RECOVERY_DELAY_MS=200
 CONFIG_USB_HOST_EXT_PORT_CUSTOM_POWER_ON_DELAY_ENABLE=y
 CONFIG_USB_HOST_EXT_PORT_CUSTOM_POWER_ON_DELAY_MS=500
+
+# The UART interrupt was tried in IRAM here (CONFIG_UART_ISR_IN_IRAM) on the
+# theory that its handler was thrashing the flash cache both cores share.  It
+# changed nothing measurable, and it costs more internal memory than this board
+# can spare: the UART driver then wants its rings in internal RAM, three
+# installs fail, and the game faults.  Written down so it is not tried twice.
+
+# The chip is an N16R8: 16 MB of flash, of which the shared 8 MB baseline table
+# addressed only half.  The upper 8 MB becomes artfs, a raw partition holding
+# decompressed game art (see partitions_16mb.csv).  Every offset below
+# 0x800000 is unchanged, so switching tables erases nothing.
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=n
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_16mb.csv"

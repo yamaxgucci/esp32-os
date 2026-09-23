@@ -390,8 +390,13 @@ function Get-QemuMachineArgs {
         # display driver falls back to a soft surface in PSRAM without a word.
         # The way to tell from the outside: a window that is 800x600 rather
         # than the size the guest asked for has no panel behind it.
-        [switch]$Graphics
+        [switch]$Graphics,
+        # 8 or 16 and nothing else - see the note by -m below.
+        [int]$PsramMb = 8
     )
+    if ($PsramMb -ne 8 -and $PsramMb -ne 16) {
+        throw "PSRAM must be 8 or 16 MB (asked for $PsramMb)."
+    }
     return @(
         '-M', $(if ($Graphics) { 'esp32s3,graphics=on' } else { 'esp32s3' })
         # QEMU reserves a 1 GB JIT buffer by default on a 64-bit host, and it
@@ -402,12 +407,18 @@ function Get-QemuMachineArgs {
         # like a port problem and is not one.  A guest this size never fills
         # 64 MB of translated code.
         '-accel', 'tcg,tb-size=64'
-        # 8 MB, matching an N16R8 module.  Not a detail: the S3 reaches flash
-        # and PSRAM through one 32 MB window on the data bus, so 32 MB of PSRAM
-        # leaves no address space to map flash into, and esp_partition - which
-        # reads the partition table through a mapping rather than a read - then
-        # finds no partitions at all.
-        '-m', '8M'
+        # 8 MB by default, matching an N16R8 module.  Not a detail: the S3
+        # reaches flash and PSRAM through one 32 MB window on the data bus, so
+        # 32 MB of PSRAM leaves no address space to map flash into, and
+        # esp_partition - which reads the partition table through a mapping
+        # rather than a read - then finds no partitions at all.
+        #
+        # 16 is the other size a real module comes in, and 16 + 8 of flash
+        # still fits the window.  Ask for it when the guest genuinely needs it:
+        # Fallout 2 does, and nothing else in the tree does, so the default
+        # stays at the smaller part where a shortage shows up rather than
+        # hiding until somebody flashes a board.
+        '-m', "${PsramMb}M"
         '-drive', 'file=build\qemu_flash.bin,if=mtd,format=raw'
         '-drive', "file=$EfusePath,if=none,format=raw,id=efuse"
         '-global', 'driver=nvram.esp32s3.efuse,property=drive,value=efuse'

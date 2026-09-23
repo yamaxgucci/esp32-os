@@ -1,0 +1,549 @@
+diff --git a/src/worldmap.cc b/src/worldmap.cc
+--- a/src/worldmap.cc
++++ b/src/worldmap.cc
+@@ -3,6 +3,7 @@
+ #include <assert.h>
+ #include <ctype.h>
+ #include <math.h>
++#include <stdint.h>
+ #include <stdio.h>
+ #include <string.h>
+ 
+@@ -280,24 +281,80 @@
+     int maps[20];
+ } Terrain;
+ 
++/*
++ * ARGON: the encounter tables in a hundred and eighteen kilobytes instead of
++ * four hundred and six.
++ *
++ * Counted from worldmap.txt itself rather than estimated, 7 September 2026:
++ * 1695 encounter table entries, 2891 sub-entries between them, 2334 condition
++ * entries, 370 encounter base type entries and 563 items.  The engine declares
++ * every one of those at its worst case inside the entry that owns it -
++ * subEntries[6], entries[3], items[10] - so the arena holds room for 10170
++ * sub-entries to store 2891, and for 3700 items to store 563.
++ *
++ *     table entries  1695 x 180 = 297 KB
++ *     base entries    370 x 300 = 108 KB
++ *
++ * Patch 0020 already took the same waste out one level up, where the tables
++ * were declared entries[41] and use 22.3.  This is that idea applied to the
++ * three arrays inside an entry: they move into pools shared by every entry,
++ * and an entry says where its own run starts.
++ *
++ * An *index* rather than a pointer, because the pools grow by realloc while
++ * the file is parsed and a pointer would not survive the move.  The index is
++ * uint16_t and the worst case worldmap.txt could ask for is 76 tables x 40
++ * entries x 6 sub-entries = 18240, so the type has three times the room it
++ * needs; wm_pool_grow says so out loud if that ever stops being true.
++ *
++ * The pooled structures are narrowed at the same time, because they are read
++ * through four accessors and nothing takes the address of a field: a count of
++ * critters, a condition operator and an item quantity do not need 32 bits.
++ * The fields of the entries themselves are left as int - they are passed to
++ * strParseIntWithKey by address, and a narrower field there is a compile error
++ * for every one of a dozen call sites, for 17 KB.
++ *
++ *     table entries  1695 x  32 =  53 KB
++ *     base entries    370 x  48 =  17 KB
++ *     sub-entries    2891 x   8 =  23 KB
++ *     conditions     2334 x   8 =  18 KB
++ *     items           563 x  12 =   7 KB
++ *
++ * 288 KB, on every map, from startup to exit.  The temple peaked at 5977 KB of
++ * 6000 and a save load at 5940, and this is what those had left over.
++ */
+ typedef struct EncounterConditionEntry {
+-    int type;
+-    int conditionalOperator;
+-    int param;
+-    int value;
++    int8_t type;
++    int8_t conditionalOperator;
++    int16_t param;
++    int32_t value;
+ } EncounterConditionEntry;
+ 
++/*
++ * A run in wmCondPool, not three entries of its own.  `first` means nothing
++ * while entriesLength is zero, and 39% of table entries have no condition.
++ *
++ * logicalOperators is [3] where the engine had [2], and that is a fix rather
++ * than a rounding up.  wmParseConditional increments entriesLength to 3 and
++ * *then* looks for another "and" in the rest of the line, writing
++ * logicalOperators[entriesLength - 1] - so index 2, past the end - and
++ * wmEvalConditional reads the same index back.  The engine's own comment says
++ * "FIXME: Can overflow with all 3 conditions specified".  With the old layout
++ * that wrote into subEntiesLength, which followed the condition inside the
++ * entry; with this one the condition is the entry's last member and it would
++ * write into the *next* entry.  Two bytes each is the cheapest possible answer
++ * to that, and it makes the read give back what the write put there.
++ */
+ typedef struct EncounterCondition {
+-    int entriesLength;
+-    EncounterConditionEntry entries[3];
+-    int logicalOperators[2];
++    uint16_t first;
++    int16_t entriesLength;
++    int8_t logicalOperators[3];
+ } EncounterCondition;
+ 
+ typedef struct EncounterTableSubEntry {
+-    int minimumCount;
+-    int maximumCount;
+-    int encounterIndex;
+-    int situation;
++    int16_t minimumCount;
++    int16_t maximumCount;
++    int16_t encounterIndex;
++    int16_t situation;
+ } EncounterTableSubEntry;
+ 
+ typedef struct EncounterTableEntry {
+@@ -306,9 +363,10 @@
+     int scenery;
+     int chance;
+     int counter;
++    int16_t subEntiesLength;
++    /* ARGON: a run in wmSubPool; see the note above. */
++    uint16_t subFirst;
+     EncounterCondition condition;
+-    int subEntiesLength;
+-    EncounterTableSubEntry subEntries[6];
+ } EncounterTableEntry;
+ 
+ typedef struct EncounterTable {
+@@ -323,14 +381,16 @@
+ } EncounterTable;
+ 
+ typedef struct EncounterItem {
+-    int pid;
+-    int minimumQuantity;
+-    int maximumQuantity;
++    int32_t pid;
++    int16_t minimumQuantity;
++    int16_t maximumQuantity;
+     bool isEquipped;
+ } EncounterItem;
+ 
+ typedef struct EncounterEntry {
+-    char field_0[40];
++    /* ARGON: field_0[40] was here.  Nothing in the engine writes it and
++     * nothing reads it - not even the slot initialiser - so 370 encounter
++     * entries carried forty bytes of uninitialised stack each. */
+     int field_28;
+     int ratioMode;
+     int ratio;
+@@ -338,10 +398,11 @@
+     int flags;
+     int distance;
+     int tile;
+-    int itemsLength;
+-    EncounterItem items[10];
+     int team;
+     int scriptIdx;
++    int16_t itemsLength;
++    /* ARGON: a run in wmItemPool. */
++    uint16_t itemsFirst;
+     EncounterCondition condition;
+ } EncounterEntry;
+ 
+@@ -863,6 +924,124 @@
+ // 0x67303C
+ static int wmMaxEncounterInfoTables;
+ 
++/*
++ * ARGON: the three pools the encounter data now keeps its arrays in.
++ *
++ * Filled once while worldmap.txt is parsed, never afterwards, and freed
++ * together in wmWorldMap_exit.  Each entry owns a contiguous run and says
++ * where the run starts; the run is claimed on the *first* append rather than
++ * at slot-init, because parsing one encounter table entry can parse a whole
++ * encounter base type in the middle of itself - wmParseFindSubEncTypeMatch
++ * reaches wmReadEncBaseType - and a run reserved before that happens would no
++ * longer be contiguous when it came back.
++ */
++static EncounterTableSubEntry* wmSubPool;
++static int wmSubPoolLen;
++static int wmSubPoolCap;
++
++static EncounterConditionEntry* wmCondPool;
++static int wmCondPoolLen;
++static int wmCondPoolCap;
++
++static EncounterItem* wmItemPool;
++static int wmItemPoolLen;
++static int wmItemPoolCap;
++
++/*
++ * Room for one more in a pool, in one place so the failure is in one place.
++ *
++ * Doubling rather than growing by one: this runs 5788 times over the three
++ * pools while a file is parsed and each realloc of the whole pool is a copy.
++ * The engine's own habit here is to realloc per element (see the note in
++ * wmReadEncounterType) and it can afford to - 1695 copies of an array that
++ * ends at 53 KB - but the pools are appended to five times as often.
++ *
++ * Returns false only when the arena refuses or an index would not fit in the
++ * uint16_t the entries hold.  The caller stops parsing; the engine's own
++ * habit for this class of failure is exit(1) and this keeps to it, because a
++ * half-parsed encounter table is a game that rolls the wrong monsters at the
++ * player an hour later.
++ */
++static bool wm_pool_grow(void** data, int* len, int* cap, size_t stride,
++    const char* what)
++{
++    if (*len + 1 > 65535) {
++        debugPrint("\nwmConfigInit: more than 65535 %s in worldmap.txt", what);
++        return false;
++    }
++    if (*len < *cap) {
++        return true;
++    }
++    int want = (*cap == 0) ? 64 : *cap * 2;
++    void* grown = internal_realloc(*data, stride * (size_t)want);
++    if (grown == nullptr) {
++        debugPrint("\nwmConfigInit: no room for %d %s", want, what);
++        return false;
++    }
++    *data = grown;
++    *cap = want;
++    return true;
++}
++
++static bool wmSubPoolRoom()
++{
++    return wm_pool_grow((void**)&wmSubPool, &wmSubPoolLen, &wmSubPoolCap,
++        sizeof(*wmSubPool), "encounter sub-entries");
++}
++
++static bool wmCondPoolRoom()
++{
++    return wm_pool_grow((void**)&wmCondPool, &wmCondPoolLen, &wmCondPoolCap,
++        sizeof(*wmCondPool), "encounter conditions");
++}
++
++static bool wmItemPoolRoom()
++{
++    return wm_pool_grow((void**)&wmItemPool, &wmItemPoolLen, &wmItemPoolCap,
++        sizeof(*wmItemPool), "encounter items");
++}
++
++/* The runs, read back.  Index, not pointer, so a growth cannot dangle. */
++static EncounterTableSubEntry* wmSubEntry(EncounterTableEntry* entry, int index)
++{
++    return &wmSubPool[entry->subFirst + index];
++}
++
++static EncounterItem* wmItemAt(EncounterEntry* entry, int index)
++{
++    return &wmItemPool[entry->itemsFirst + index];
++}
++
++static EncounterConditionEntry* wmCondEntry(EncounterCondition* condition,
++    int index)
++{
++    return &wmCondPool[condition->first + index];
++}
++
++static void wmEncPoolsFree()
++{
++    if (wmSubPool != nullptr) {
++        internal_free(wmSubPool);
++        wmSubPool = nullptr;
++    }
++    wmSubPoolLen = 0;
++    wmSubPoolCap = 0;
++
++    if (wmCondPool != nullptr) {
++        internal_free(wmCondPool);
++        wmCondPool = nullptr;
++    }
++    wmCondPoolLen = 0;
++    wmCondPoolCap = 0;
++
++    if (wmItemPool != nullptr) {
++        internal_free(wmItemPool);
++        wmItemPool = nullptr;
++    }
++    wmItemPoolLen = 0;
++    wmItemPoolCap = 0;
++}
++
+ static bool gTownMapHotkeysFix;
+ static double gGameTimeIncRemainder = 0.0;
+ static FrmImage _backgroundFrmImage;
+@@ -1084,6 +1263,9 @@
+ 
+     wmMaxEncBaseTypes = 0;
+ 
++    /* ARGON: and the three pools the entries kept their arrays in. */
++    wmEncPoolsFree();
++
+     if (wmAreaInfoList != nullptr) {
+         internal_free(wmAreaInfoList);
+         wmAreaInfoList = nullptr;
+@@ -1431,6 +1613,38 @@
+ 
+     configFree(&config);
+ 
++    /*
++     * ARGON: what the encounter tables actually cost, said out loud once.
++     *
++     * The size of this was worked out from worldmap.txt on the host and then
++     * built against that arithmetic; a line in the log is what turns it into a
++     * measurement, and it is one line at startup rather than a profiler that
++     * takes 768 KB of the arena to weigh a 6000 KB one.  See the note on
++     * EncounterConditionEntry for what the old layout came to.
++     */
++    {
++        int tableEntries = 0;
++        for (int index = 0; index < wmMaxEncounterInfoTables; index++) {
++            tableEntries += wmEncounterTableList[index].entriesLength;
++        }
++        int baseEntries = 0;
++        for (int index = 0; index < wmMaxEncBaseTypes; index++) {
++            baseEntries += wmEncBaseTypeList[index].entriesLength;
++        }
++        const int bytes = (int)(sizeof(EncounterTable) * wmMaxEncounterInfoTables
++            + sizeof(EncounterTableEntry) * tableEntries
++            + sizeof(Encounter) * wmMaxEncBaseTypes
++            + sizeof(EncounterEntry) * baseEntries
++            + sizeof(*wmSubPool) * wmSubPoolCap
++            + sizeof(*wmCondPool) * wmCondPoolCap
++            + sizeof(*wmItemPool) * wmItemPoolCap);
++        debugPrint("\nwm: %d tables/%d entries, %d encounters/%d entries, "
++                   "pools %d sub %d cond %d item = %d KB\n",
++            wmMaxEncounterInfoTables, tableEntries, wmMaxEncBaseTypes,
++            baseEntries, wmSubPoolLen, wmCondPoolLen, wmItemPoolLen,
++            bytes / 1024);
++    }
++
+     return 0;
+ }
+ 
+@@ -1597,14 +1811,30 @@
+     }
+ 
+     while (string != nullptr) {
+-        EncounterTableSubEntry* encounterTableSubEntry = &(encounterTableEntry->subEntries[encounterTableEntry->subEntiesLength]);
++        /*
++         * ARGON: the sub-entries are a run in wmSubPool.
++         *
++         * The run is claimed here, on the first append for this entry, and not
++         * at slot-init: strParseStrFromFunc below reaches wmReadEncBaseType
++         * through wmParseFindSubEncTypeMatch, which parses a whole encounter
++         * base type in the middle of this one.  That appends to the condition
++         * and item pools - not to this one - so the pointer taken here stays
++         * good, but a run reserved before it happened would not.
++         */
++        if (!wmSubPoolRoom()) {
++            return -1;
++        }
++        if (encounterTableEntry->subEntiesLength == 0) {
++            encounterTableEntry->subFirst = (uint16_t)wmSubPoolLen;
++        }
++        EncounterTableSubEntry* encounterTableSubEntry = &wmSubPool[wmSubPoolLen];
+ 
+         // NOTE: Uninline.
+         wmEncounterSubEncSlotInit(encounterTableSubEntry);
+ 
+         if (*string == '(') {
+             string++;
+-            encounterTableSubEntry->minimumCount = atoi(string);
++            encounterTableSubEntry->minimumCount = (int16_t)atoi(string);
+ 
+             while (*string != '\0' && *string != '-') {
+                 string++;
+@@ -1614,7 +1844,7 @@
+                 string++;
+             }
+ 
+-            encounterTableSubEntry->maximumCount = atoi(string);
++            encounterTableSubEntry->maximumCount = (int16_t)atoi(string);
+ 
+             while (*string != '\0' && *string != ')') {
+                 string++;
+@@ -1637,9 +1867,13 @@
+         char ch = *end;
+         *end = '\0';
+ 
+-        if (strParseStrFromFunc(&string, &(encounterTableSubEntry->encounterIndex), wmParseFindSubEncTypeMatch) == -1) {
++        /* ARGON: through an int, because the field is 16 bits now and
++         * strParseStrFromFunc writes an int through a pointer. */
++        int parsed = -1;
++        if (strParseStrFromFunc(&string, &parsed, wmParseFindSubEncTypeMatch) == -1) {
+             return -1;
+         }
++        encounterTableSubEntry->encounterIndex = (int16_t)parsed;
+ 
+         *end = ch;
+ 
+@@ -1656,12 +1890,15 @@
+         *end = '\0';
+ 
+         if (*string != '\0') {
+-            strParseStrFromList(&string, &(encounterTableSubEntry->situation), wmEncOpStrs, ENCOUNTER_SITUATION_COUNT);
++            int situation = encounterTableSubEntry->situation;
++            strParseStrFromList(&string, &situation, wmEncOpStrs, ENCOUNTER_SITUATION_COUNT);
++            encounterTableSubEntry->situation = (int16_t)situation;
+         }
+ 
+         *end = ch;
+ 
+         encounterTableEntry->subEntiesLength++;
++        wmSubPoolLen++;
+ 
+         while (*string == ' ') {
+             string++;
+@@ -1824,7 +2061,26 @@
+             break;
+         }
+ 
+-        wmParseEncounterItemType(&string, &(encounterEntry->items[encounterEntry->itemsLength]), &(encounterEntry->itemsLength), ":");
++        /*
++         * ARGON: the items are a run in wmItemPool.  563 of them across 370
++         * entries, against room for 3700 when every entry carried items[10].
++         *
++         * The run is claimed on the first item and the pool's length follows
++         * itemsLength, because wmParseEncounterItemType only counts an item it
++         * actually recognised - a chunk that is not "item:..." leaves the
++         * count alone and the slot unclaimed.
++         */
++        if (!wmItemPoolRoom()) {
++            break;
++        }
++        if (encounterEntry->itemsLength == 0) {
++            encounterEntry->itemsFirst = (uint16_t)wmItemPoolLen;
++        }
++        /* Through an int: wmParseEncounterItemType counts through a pointer. */
++        int itemsLength = encounterEntry->itemsLength;
++        wmParseEncounterItemType(&string, &wmItemPool[wmItemPoolLen], &itemsLength, ":");
++        encounterEntry->itemsLength = (int16_t)itemsLength;
++        wmItemPoolLen = encounterEntry->itemsFirst + encounterEntry->itemsLength;
+     }
+ 
+     strParseIntWithKey(&string, "script", &(encounterEntry->scriptIdx), ":");
+@@ -1861,6 +2117,7 @@
+     encounterEntry->distance = 0;
+     encounterEntry->tile = -1;
+     encounterEntry->itemsLength = 0;
++    encounterEntry->itemsFirst = 0;
+     encounterEntry->scriptIdx = -1;
+     encounterEntry->team = -1;
+ 
+@@ -1891,6 +2148,7 @@
+     encounterTableEntry->chance = 0;
+     encounterTableEntry->counter = -1;
+     encounterTableEntry->subEntiesLength = 0;
++    encounterTableEntry->subFirst = 0;
+ 
+     return wmConditionalDataInit(&(encounterTableEntry->condition));
+ }
+@@ -1941,15 +2199,12 @@
+ {
+     condition->entriesLength = 0;
+ 
+-    for (int index = 0; index < 3; index++) {
+-        EncounterConditionEntry* conditionEntry = &(condition->entries[index]);
+-        conditionEntry->type = ENCOUNTER_CONDITION_TYPE_NONE;
+-        conditionEntry->conditionalOperator = ENCOUNTER_CONDITIONAL_OPERATOR_NONE;
+-        conditionEntry->param = 0;
+-        conditionEntry->value = 0;
+-    }
++    /* ARGON: nothing to clear - the three entries are a run in wmCondPool now,
++     * claimed by wmParseConditional on its first append, and `first` means
++     * nothing while entriesLength is zero. */
++    condition->first = 0;
+ 
+-    for (int index = 0; index < 2; index++) {
++    for (int index = 0; index < 3; index++) {
+         condition->logicalOperators[index] = ENCOUNTER_LOGICAL_OPERATOR_NONE;
+     }
+ 
+@@ -2167,7 +2422,7 @@
+     if (*string == '(') {
+         string++;
+ 
+-        encounterItem->minimumQuantity = atoi(string);
++        encounterItem->minimumQuantity = (int16_t)atoi(string);
+ 
+         while (isdigit(*string)) {
+             string++;
+@@ -2176,7 +2431,7 @@
+         if (*string == '-') {
+             string++;
+ 
+-            encounterItem->maximumQuantity = atoi(string);
++            encounterItem->maximumQuantity = (int16_t)atoi(string);
+ 
+             while (isdigit(*string)) {
+                 string++;
+@@ -2218,12 +2473,37 @@
+ static int wmParseConditional(char** stringPtr, const char* a2, EncounterCondition* condition)
+ {
+     while (condition->entriesLength < 3) {
+-        EncounterConditionEntry* conditionEntry = &(condition->entries[condition->entriesLength]);
+-        if (wmParseSubConditional(stringPtr, a2, &(conditionEntry->type), &(conditionEntry->conditionalOperator), &(conditionEntry->param), &(conditionEntry->value)) == -1) {
++        /*
++         * ARGON: the condition's entries are a run in wmCondPool, claimed on
++         * the first one.  61% of encounter table entries have a condition and
++         * they average 2.24 entries of the three the engine reserved; the
++         * other 39% reserved sixty bytes to hold nothing.
++         *
++         * Through four ints, because wmParseSubConditional writes ints through
++         * pointers and the pooled fields are narrower.
++         */
++        if (!wmCondPoolRoom()) {
++            return -1;
++        }
++        if (condition->entriesLength == 0) {
++            condition->first = (uint16_t)wmCondPoolLen;
++        }
++        EncounterConditionEntry* conditionEntry = &wmCondPool[wmCondPoolLen];
++
++        int type = ENCOUNTER_CONDITION_TYPE_NONE;
++        int conditionalOperator = ENCOUNTER_CONDITIONAL_OPERATOR_NONE;
++        int param = 0;
++        int value = 0;
++        if (wmParseSubConditional(stringPtr, a2, &type, &conditionalOperator, &param, &value) == -1) {
+             return -1;
+         }
++        conditionEntry->type = (int8_t)type;
++        conditionEntry->conditionalOperator = (int8_t)conditionalOperator;
++        conditionEntry->param = (int16_t)param;
++        conditionEntry->value = value;
+ 
+         condition->entriesLength++;
++        wmCondPoolLen++;
+ 
+         char* andStatement = strstr(*stringPtr, "and");
+         if (andStatement != nullptr) {
+@@ -3799,7 +4079,7 @@
+ 
+     Object* prevCritter = nullptr;
+     for (int index = 0; index < encounterTableEntry->subEntiesLength; index++) {
+-        EncounterTableSubEntry* encounterTableSubEntry = &(encounterTableEntry->subEntries[index]);
++        EncounterTableSubEntry* encounterTableSubEntry = wmSubEntry(encounterTableEntry, index);
+ 
+         int critterCount = randomBetween(encounterTableSubEntry->minimumCount, encounterTableSubEntry->maximumCount);
+ 
+@@ -3969,7 +4249,7 @@
+             objectSetRotation(object, direction, nullptr);
+ 
+             for (int itemIndex = 0; itemIndex < encounterEntry->itemsLength; itemIndex++) {
+-                EncounterItem* encounterItem = &(encounterEntry->items[itemIndex]);
++                EncounterItem* encounterItem = wmItemAt(encounterEntry, itemIndex);
+ 
+                 int quantity;
+                 if (encounterItem->maximumQuantity == encounterItem->minimumQuantity) {
+@@ -4210,7 +4490,7 @@
+ 
+     bool matches = true;
+     for (int index = 0; index < condition->entriesLength; index++) {
+-        EncounterConditionEntry* conditionEntry = &(condition->entries[index]);
++        EncounterConditionEntry* conditionEntry = wmCondEntry(condition, index);
+ 
+         matches = true;
+         switch (conditionEntry->type) {

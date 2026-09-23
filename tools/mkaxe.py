@@ -43,6 +43,7 @@ the first image onto the second's addresses, and demands the bytes be equal.
 
 import argparse
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -179,6 +180,10 @@ ABS32_RELOC = {"xtensa": 1, "riscv32": 1}
 SHT_SYMTAB = 2
 SHT_RELA = 4
 SHT_NOBITS = 8
+SHF_ALLOC = 0x2
+
+# Sources handed to the C++ driver rather than the C one.
+CXX_SUFFIXES = (".cpp", ".cc", ".cxx")
 
 CODE_SECTION = ".image"
 DATA_SECTION = ".dimage"
@@ -201,7 +206,16 @@ SECTIONS
   /DISCARD/ :
   {{
     *(.xt.lit) *(.xt.prop) *(.comment) *(.xtensa.info)
-    *(.note .note.*) *(.riscv.attributes) *(.eh_frame*)
+    *(.note .note.*) *(.riscv.attributes)
+    /* Unwinding.  .eh_frame describes how to undo a frame and
+       .gcc_except_table says which catch clause a landing pad belongs to;
+       both are useless without the personality routine and the unwinder,
+       which is a chunk of libgcc this image has no room for.  They arrive
+       anyway, because libstdc++.a was built with exceptions on and its
+       string and vector members have catch blocks.  Nothing throws: C++ is
+       compiled -fno-exceptions here and cxx_throw.cpp turns the library's
+       own failures into a panic.  */
+    *(.eh_frame*) *(.gcc_except_table*)
   }}
 }}
 """
@@ -220,17 +234,89 @@ def rodata_lines():
 
 
 def code_block(rodata_in_code):
-    """The part that gets executed.  Literals first: l32r only reaches back."""
+    """The part that gets executed.
+
+    The literals are interleaved with the code rather than gathered at the
+    front, and the single input specification is what does it: naming both in
+    one *( ) tells ld to lay the matching sections down in the order it reads
+    the objects, so each object's literal pool lands immediately before that
+    object's own text.
+
+    This matters because l32r - the only way an Xtensa instruction reaches a
+    32-bit constant - addresses backwards and no further than 256 KB.  With all
+    the literals first, that is the largest an image's code can be, and the
+    limit announces itself as `dangerous relocation: l32r: literal target out
+    of range` from somewhere inside libgcc's floating point.  Half a megabyte
+    of engine found it.  Interleaved, the distance is one object wide instead
+    of one image wide, and the ceiling is gone.
+
+    Backwards is still the direction, so an object's literals must precede its
+    text; they do, because .literal is named first.  ESP-IDF's own linker
+    scripts write the same line for the same reason.
+    """
     lines = ["  .image :", "  {",
-             "    *(.literal .literal.*)",
-             "    *(.text .text.*)",
+             # The two roots.  Nothing in the image refers to the entry point -
+             # the loader jumps to it from outside - so with --gc-sections the
+             # linker is entitled to throw it away, and does: a large image
+             # built with --gc-sections came out with no ag_main at all.  KEEP
+             # says otherwise.  Harmless when the pattern matches nothing,
+             # which is the case for whichever of the two this image is not.
+             "    KEEP(*(.literal.ag_main .text.ag_main "
+             ".literal.ag_driver_init .text.ag_driver_init))",
+             "    *(.literal .text .literal.* .text.*)",
              "    " + HOT_RODATA_INPUT]
     if rodata_in_code:
         lines += rodata_lines()
-    lines += ["    *(.ag_header)",
+    lines += ["    KEEP(*(.ag_header))",
               "    . = ALIGN(4);",
               "  }"]
     return "\n".join(lines) + "\n"
+
+
+def init_array_lines():
+    """The C++ static constructors, and the destructors that undo them.
+
+    Each entry is the absolute address of a function in the code part, so the
+    words belong with the data and point at the code - exactly the case the
+    relocation format already describes.  The loader needs nothing new for
+    them.
+
+    KEEP because nothing references these entries.  The bracketing symbols are
+    defined inside the section on purpose: a symbol defined in an output
+    section is relative to it, so the runtime's reference to one relocates like
+    any other address in the image instead of coming out absolute, which is a
+    thing this format cannot express.
+
+    Both spellings are collected, because the two toolchains disagree: the
+    Xtensa compiler is built without --enable-initfini-array and emits the
+    1990s .ctors, the RISC-V one emits .init_array.  ESP-IDF has the same split
+    and solves it in its own startup by iterating one of them backwards.
+
+    Here they are merged instead, which is what a modern GNU ld default script
+    does and what glibc then walks forwards.  The trick is SORT_BY_INIT_PRIORITY:
+    on .init_array.NNN it sorts by NNN, and on .ctors.NNN it knows the number is
+    stored as 65535 - priority and sorts accordingly.  So one ascending range
+    comes out of either compiler, and ag_cxx_init can walk it in one direction
+    without knowing which one it was built by.
+
+    The unprioritised entries are one per translation unit, not one per object:
+    the C++ front end wraps a file's constructors in a single function and
+    registers that.  Order within a file is therefore the file's; order between
+    files is unspecified by the language, and is link order here.
+    """
+    return ["    . = ALIGN(4);",
+            "    __ag_init_array_start = .;",
+            "    KEEP(*(SORT_BY_INIT_PRIORITY(.init_array.*) "
+            "SORT_BY_INIT_PRIORITY(.ctors.*)))",
+            "    KEEP(*(.init_array))",
+            "    KEEP(*(.ctors))",
+            "    __ag_init_array_end = .;",
+            "    __ag_fini_array_start = .;",
+            "    KEEP(*(SORT_BY_INIT_PRIORITY(.fini_array.*) "
+            "SORT_BY_INIT_PRIORITY(.dtors.*)))",
+            "    KEEP(*(.fini_array))",
+            "    KEEP(*(.dtors))",
+            "    __ag_fini_array_end = .;"]
 
 
 def data_block(rodata_in_code):
@@ -238,6 +324,7 @@ def data_block(rodata_in_code):
     lines = ["  .dimage :", "  {"]
     if not rodata_in_code:
         lines += rodata_lines()
+    lines += init_array_lines()
     lines += ["    *(.data .data.* .sdata .sdata.*)",
               "    . = ALIGN(4);",
               "    __ag_bss_start = .;",
@@ -502,13 +589,25 @@ def part_of(elf, name, is_data):
 
 def main():
     ap = argparse.ArgumentParser(description="Build an ArgonOS .AXE image")
-    ap.add_argument("sources", nargs="+", help="C sources or object files")
+    ap.add_argument("sources", nargs="+",
+                    help="C or C++ sources (.c, .cpp/.cc/.cxx) or object files")
     ap.add_argument("-o", "--output", required=True)
     ap.add_argument("--arch", choices=sorted(ARCHS), default="xtensa")
     ap.add_argument("--gcc", default="xtensa-esp32s3-elf-gcc")
+    ap.add_argument("--gxx", default=None,
+                    help="the C++ driver; by default the C one with gcc "
+                         "replaced by g++. Only used for C++ sources, and the "
+                         "link is done with the C driver either way: -nostdlib "
+                         "means the driver adds nothing of its own")
     ap.add_argument("--include", action="append", default=[],
                     help="added to the include path")
     ap.add_argument("--cflags", default="-Os -ffunction-sections -fdata-sections")
+    ap.add_argument("--cxxflags", default="-fno-exceptions -fno-rtti",
+                    help="added to cflags for C++ sources only. The default "
+                         "turns off the two features that need a runtime we do "
+                         "not have: unwinding needs .eh_frame and a personality "
+                         "routine, typeinfo needs a comparison the linker "
+                         "cannot fold. Override to build a port that throws")
     ap.add_argument("--code-base", type=lambda v: int(v, 0),
                     default=DEFAULT_CODE_BASE)
     ap.add_argument("--data-base", type=lambda v: int(v, 0),
@@ -550,6 +649,13 @@ def main():
         help="do not also copy the image into build/apps and build/sd_card",
     )
     args = ap.parse_args()
+
+    if args.gxx is None:
+        # xtensa-esp32s3-elf-gcc -> xtensa-esp32s3-elf-g++, and the same for a
+        # full path with or without .exe.  Anything that does not end in gcc is
+        # left alone and will fail loudly if a C++ source needs it.
+        args.gxx = re.sub(r"gcc(\.exe)?$", lambda m: "g++" + (m.group(1) or ""),
+                          args.gcc)
 
     # An .AXE is freestanding: it links -nostdlib and carries its own libc
     # (apps/common/libc). Without this, the compiler recognises the standard
@@ -593,7 +699,10 @@ def main():
                 continue
             # Unique names: LVGL (and any multi-dir tree) repeats basenames.
             obj = os.path.join(workdir, "s%d.o" % i)
-            cmd = [args.gcc, "-c"] + args.cflags.split()
+            is_cxx = src.lower().endswith(CXX_SUFFIXES)
+            cmd = [args.gxx if is_cxx else args.gcc, "-c"] + args.cflags.split()
+            if is_cxx:
+                cmd += args.cxxflags.split()
             for inc in args.include:
                 cmd += ["-I", inc]
             cmd += [src, "-o", obj]
@@ -617,6 +726,21 @@ def main():
         with open(elf_path, "rb") as f:
             elf_data = f.read()
         elf = Elf(elf_data)
+
+        # Nothing that occupies memory may sit outside the two parts.  An
+        # allocated section the script does not name is an orphan, and ld puts
+        # an orphan wherever it likes - the image simply would not carry it,
+        # with no diagnostic anywhere.  .init_array is what made this worth
+        # checking: losing it loses every C++ constructor, and the program
+        # starts anyway, on zeroed objects.
+        for sec in elf.sections():
+            if not (sec["flags"] & SHF_ALLOC) or sec["size"] == 0:
+                continue
+            if sec["name"] not in (CODE_SECTION, DATA_SECTION):
+                raise SystemExit(
+                    "mkaxe: section '%s' (%u bytes) was placed outside the "
+                    "image; name it in the linker script in this file, or "
+                    "discard it" % (sec["name"], sec["size"]))
 
         code = part_of(elf, CODE_SECTION, is_data=False)
         if code["size"] == 0:

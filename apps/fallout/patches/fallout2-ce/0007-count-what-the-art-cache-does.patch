@@ -1,0 +1,58 @@
+diff --git a/src/cache.cc b/src/cache.cc
+index 3893e21..d6e8d46 100644
+--- a/src/cache.cc
++++ b/src/cache.cc
+@@ -35,6 +35,21 @@ static int _lock_sound_ticker = 0;
+ 
+ // cache_init
+ // 0x41FCC0
++/*
++ * ARGON: what the cache is actually doing, counted.
++ *
++ * "The game reads the same two hundred files over and over while nothing
++ * moves" is an observation, not a diagnosis.  These four say whether it is the
++ * cache being too small, the eviction policy throwing out more than it needs,
++ * or the whole thing being emptied because one large entry would not fit -
++ * which are three different bugs with three different fixes.  The port prints
++ * them beside the frame rate.
++ */
++extern "C" unsigned ag_cache_fetches;
++extern "C" unsigned ag_cache_evicted;
++extern "C" unsigned ag_cache_flushes;
++extern "C" unsigned ag_cache_biggest;
++
+ bool cacheInit(Cache* cache, CacheSizeProc* sizeProc, CacheReadProc* readProc, CacheFreeProc* freeProc, int maxSize)
+ {
+     if (!heapInit(&(cache->heap), maxSize)) {
+@@ -248,6 +263,8 @@ static bool cacheFetchEntryForKey(Cache* cache, int key, int* indexPtr)
+         }
+ 
+         if (!allocated) {
++            // ARGON: this is the expensive one - the whole cache goes.
++            ag_cache_flushes++;
+             cacheFlush(cache);
+ 
+             allocated = true;
+@@ -271,6 +288,12 @@ static bool cacheFetchEntryForKey(Cache* cache, int key, int* indexPtr)
+                 break;
+             }
+ 
++            // ARGON: one entry read in off the card.
++            ag_cache_fetches++;
++            if ((unsigned)size > ag_cache_biggest) {
++                ag_cache_biggest = (unsigned)size;
++            }
++
+             heapUnlock(&(cache->heap), cacheEntry->heapHandleIndex);
+ 
+             cacheEntry->size = size;
+@@ -536,6 +559,9 @@ static bool cacheSweep(Cache* cache)
+             } else {
+                 int cacheEntrySize = cacheEntry->size;
+ 
++                // ARGON: one entry thrown out to make room for another.
++                ag_cache_evicted++;
++
+                 // NOTE: Uninline.
+                 cacheEntryFree(cache, cacheEntry);
+ 

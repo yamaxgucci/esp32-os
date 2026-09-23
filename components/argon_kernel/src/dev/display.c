@@ -34,6 +34,10 @@
 /* Match the text console: 80×25 cells at 8×16 px. */
 #define AG_DISPLAY_DEFAULT_W 640
 #define AG_DISPLAY_DEFAULT_H 400
+/* How many display drivers one present can fan out to.  Two is already
+ * generous - a panel and a remote screen - and the list is walked under the
+ * device lock and then blitted without it (see driver_present_blit). */
+#define AG_DISPLAY_MAX       4
 #define AG_DISPLAY_MAX_W     800
 #define AG_DISPLAY_MAX_H     480
 
@@ -148,8 +152,29 @@ static void driver_present_blit(const ag_blit_t *b)
         return;
     }
 
+    /*
+     * Find the display drivers under the lock, then let go of it before the
+     * blit - because the blit blocks, and this lock is the whole machine's.
+     *
+     * A display at the end of a wire takes hundreds of milliseconds to hand a
+     * full screen over, and blit_rect sits in that write the whole time.  The
+     * device lock is one lock over every device: audio writes take it, the
+     * console takes it, everything does.  Held across the blit, it stops the
+     * game writing a sound and stops the kernel printing a line for as long as
+     * the picture is going out - and with the sender on its own core that is a
+     * second core wedged against the first, which is exactly how the board
+     * went silent with everything alive and nothing running.
+     *
+     * The lock is here to walk the device registry safely, and that is all it
+     * is needed for.  The pointers it finds stay good afterwards: a display
+     * driver is loaded for the length of a session and is not pulled out from
+     * under a blit.  So the walk is locked and the writes are not.
+     */
+    const ag_display_ops_t *ops[AG_DISPLAY_MAX];
+    unsigned n = 0;
+
     ag_dev_lock_hold();
-    for (uint32_t i = 0;; i++) {
+    for (uint32_t i = 0; n < AG_DISPLAY_MAX; i++) {
         ag_devinfo_t info;
         if (ag_dev_info(i, AG_DEV_DISPLAY, &info) != AG_OK) {
             break;
@@ -158,15 +183,29 @@ static void driver_present_blit(const ag_blit_t *b)
         if (dev == NULL || dev->class_ops == NULL) {
             continue;
         }
-        const ag_display_ops_t *ops = (const ag_display_ops_t *)dev->class_ops;
-        if (!AG_HAS(ops, blit_rect) || ops->blit_rect == NULL) {
+        const ag_display_ops_t *o = (const ag_display_ops_t *)dev->class_ops;
+        if (!AG_HAS(o, blit_rect) || o->blit_rect == NULL) {
             continue;
         }
-        ag_dev_note_call(dev->name, "blit_rect");
-        ops->blit_rect(0, b);
-        ag_dev_note_done();
+        ops[n++] = o;
     }
     ag_dev_lock_release();
+
+    /* The blit lock, not the registry lock: it carries the same "system is
+     * writing" signal to the pin layer but is not the lock audio and the
+     * console are waiting on.
+     *
+     * There is no ag_dev_note_call around these calls, and main had one here
+     * before the merge of 23 September 2026.  The note names whoever is
+     * holding the REGISTRY when the lock watchdog fires, and it is cleared
+     * when that lock is let go - which now happens a few lines above, before
+     * any driver is called.  A note here would name a driver in a report
+     * about a lock this code is no longer holding. */
+    ag_dev_blit_hold();
+    for (unsigned k = 0; k < n; k++) {
+        ops[k]->blit_rect(0, b);
+    }
+    ag_dev_blit_release();
 }
 
 /* The panel's own size, for a system that has no surface of its own to size. */
@@ -684,15 +723,52 @@ static const ag_display_ops_t k_fb_class_ops = {
  */
 static bool gfx_may_present(void)
 {
-    if (!s_acquired) {
-        return false;
-    }
+    /*
+     * ARGON: and say so when the answer is no.
+     *
+     * Both refusals here are silent and both look identical from outside: the
+     * game draws at its usual frame rate, its own counters say it flushed, and
+     * the picture on the panel never changes again.  On 7 September 2026 that
+     * cost an afternoon - the display driver at the end of the wire was
+     * reporting "0 offers" while Fallout reported 36 frames a second, and
+     * there was nothing anywhere to say which of the two was lying.  Neither
+     * was: the flush was being dropped in between.
+     *
+     * Rate limited to one line every two seconds, because the caller is a
+     * game's present and the whole point is not to cost it anything.
+     */
+    static uint64_t said_us;
+    static uint32_t dropped;
+
+    bool           ok = true;
     const ag_pid_t me = ag_proc_self();
-    if (me == AG_PID_KERNEL || me == s_owner) {
-        return true;
+    const ag_pid_t focused = ag_session_focused_pid();
+
+    if (!s_acquired) {
+        ok = false;
+    } else if (me == AG_PID_KERNEL || me == s_owner) {
+        /* The holder is entitled to draw; see the note above this
+         * function for what testing focus INSTEAD of ownership cost. */
+        ok = true;
+    } else {
+        /* Safety net: ignore flush/swap from a background session slot. */
+        ok = (me == focused);
     }
-    /* Safety net: ignore flush/swap from a background session slot. */
-    return me == ag_session_focused_pid();
+
+    if (!ok) {
+        dropped++;
+        const uint64_t now = (uint64_t)ag_port_us();
+        if (said_us == 0ull || (now - said_us) >= 2000000ull) {
+            said_us = now;
+            ag_log(AG_LOG_WARN, "display",
+                   "%u flushes dropped: acquired %u, asking pid %u, owner "
+                   "pid %u, focused pid %u",
+                   (unsigned)dropped, (unsigned)s_acquired, (unsigned)me,
+                   (unsigned)s_owner, (unsigned)focused);
+            dropped = 0;
+        }
+    }
+    return ok;
 }
 
 static ag_err_t gfx_acquire(ag_gfxinfo_t *out)

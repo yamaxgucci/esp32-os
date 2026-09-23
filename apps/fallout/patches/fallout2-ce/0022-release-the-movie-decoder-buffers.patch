@@ -1,0 +1,38 @@
+diff --git a/src/game_movie.cc b/src/game_movie.cc
+--- a/src/game_movie.cc
++++ b/src/game_movie.cc
+@@ -12,6 +12,7 @@
+ #include "input.h"
+ #include "mouse.h"
+ #include "movie.h"
++#include "movie_lib.h"
+ #include "movie_effect.h"
+ #include "palette.h"
+ #include "platform_compat.h"
+@@ -265,6 +266,26 @@
+     _movieStop();
+     _moviefx_stop();
+     _movieUpdate();
++
++    /*
++     * ARGON: and give the decoder's buffers back.
++     *
++     * MVE keeps three: the file record buffer and two frames, and for a 640x320
++     * movie the two frames alone are 409600 bytes.  MVE_MemAlloc reuses them
++     * between movies rather than freeing and taking them again, which is right,
++     * and MVE_ReleaseMem is what finally returns them - through _cleanupMovie,
++     * which is reached by a path that depends on how the movie ended.
++     *
++     * Measured rather than reasoned about: standing on BROKEN2.MAP with the
++     * opening movies long finished, a live-block census found 419 KB in three
++     * blocks still held by movieMallocImpl, and the map load then failed for
++     * want of 32 KB.  So the release is asked for here as well, where the game
++     * is done with the movie for certain.  It is idempotent - MVE_MemFree
++     * checks its own `alloced` flag - so it costs nothing when the usual path
++     * has already run.
++     */
++    MVE_ReleaseMem();
++
+     paletteSetEntries(gPaletteBlack);
+ 
+     gGameMoviesSeen[movie] = 1;

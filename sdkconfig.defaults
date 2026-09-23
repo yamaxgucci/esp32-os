@@ -36,6 +36,20 @@ CONFIG_FATFS_LFN_HEAP=y
 CONFIG_FATFS_MAX_LFN=255
 CONFIG_FATFS_API_ENCODING_UTF_8=y
 
+# Seeking into a large file, without walking the cluster chain to get there.
+#
+# FatFs resolves a file offset by following the FAT from the first cluster, so
+# a seek into a 326 MB archive is tens of thousands of table steps - every
+# time.  Fast seek keeps a cluster link map for the open file instead, which
+# for a file written contiguously is a couple of entries.  Measured on Fallout
+# 2, whose engine seeks to a different offset in MASTER.DAT for every sprite it
+# draws: the frame was spending nine tenths of itself in the filesystem.
+#
+# It costs FATFS_FAST_SEEK_BUFFER_SIZE words per open read-only file (the
+# default 64 is 256 bytes) and applies to read mode only, which is what an
+# archive is opened as.
+CONFIG_FATFS_USE_FASTSEEK=y
+
 # Colours in log lines are stripped by the journal anyway, and the console
 # applies its own attributes.  Turning them off saves the bytes on the wire.
 CONFIG_LOG_COLORS=n

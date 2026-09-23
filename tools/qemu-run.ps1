@@ -35,6 +35,9 @@ param(
     [switch]$Lan,
     # Spawn pcmplay + kbdvirt + mousevirt (--reconnect) like hostfsd; kill with QEMU.
     [switch]$Virt,
+    # PSRAM the emulated part carries: 8 (default, the smaller module) or 16.
+    # Fallout 2 needs 16; nothing else in the tree does.
+    [int]$Psram = 8,
     # A pre-built C: partition, merged into the flash image (tools\mksysfs.py).
     # Everything C: normally has to be given at runtime - the surface size, the
     # modules to autoload, an application to run - arrives before the first
@@ -54,7 +57,7 @@ $qemu = Resolve-Qemu
 Update-FlashImage -SysFs $SysFs
 $efuse = Initialize-EfuseFile
 
-$qemuArgs = Get-QemuMachineArgs -EfusePath $efuse -Graphics:$Gfx
+$qemuArgs = Get-QemuMachineArgs -EfusePath $efuse -PsramMb $Psram -Graphics:$Gfx
 
 if (-not $NoNet) {
     $qemuArgs += Get-QemuNetArgs -HostPort $NetPort -GuestPort $NetPort -Lan:$Lan

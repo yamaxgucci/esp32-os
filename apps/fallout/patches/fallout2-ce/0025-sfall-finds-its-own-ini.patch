@@ -1,0 +1,51 @@
+--- a/src/sfall_config.cc
++++ b/src/sfall_config.cc
+@@ -37,7 +37,18 @@
+     configSetInt(&gSfallConfig, SFALL_CONFIG_MISC_KEY, SFALL_CONFIG_MAIN_MENU_FONT_COLOR_KEY, 0);
+     configSetInt(&gSfallConfig, SFALL_CONFIG_MISC_KEY, SFALL_CONFIG_MAIN_MENU_OFFSET_X_KEY, 0);
+     configSetInt(&gSfallConfig, SFALL_CONFIG_MISC_KEY, SFALL_CONFIG_MAIN_MENU_OFFSET_Y_KEY, 0);
+-    configSetInt(&gSfallConfig, SFALL_CONFIG_MISC_KEY, SFALL_CONFIG_SKIP_OPENING_MOVIES_KEY, 0);
++    // ARGON: 1, not 0.  This line is the reason main.cc's own default never
++    // mattered: the key is *set* here, so configGetInt always succeeds and
++    // always answers, and initialising the variable at the call site changes
++    // nothing at all.  Two attempts at turning the opening movies off went
++    // that way before this line was found.
++    //
++    // Why they are off by default here at all: a movie is 730 KB of decoder
++    // buffers out of an arena of 5850, and the picture leaves this machine
++    // down a serial link where a frame in which every pixel changes is the one
++    // case that cannot be compressed - about one frame a second, measured.
++    // ddraw.ini can still ask for them.
++    configSetInt(&gSfallConfig, SFALL_CONFIG_MISC_KEY, SFALL_CONFIG_SKIP_OPENING_MOVIES_KEY, 1);
+     configSetString(&gSfallConfig, SFALL_CONFIG_MISC_KEY, SFALL_CONFIG_STARTING_MAP_KEY, "");
+     configSetBool(&gSfallConfig, SFALL_CONFIG_MISC_KEY, SFALL_CONFIG_DISPLAY_KARMA_CHANGES_KEY, false);
+     configSetInt(&gSfallConfig, SFALL_CONFIG_MISC_KEY, SFALL_CONFIG_OVERRIDE_CRITICALS_MODE_KEY, 2);
+@@ -70,11 +81,26 @@
+ 
+     char path[COMPAT_MAX_PATH];
+     char* executable = argv[0];
++    // ARGON: the last separator of either kind, not the last backslash.
++    //
++    // "beside the executable" was implemented as "after the last backslash in
++    // argv[0]", which is true on Windows and on nothing else.  Here argv[0] is
++    // /sd/fallout2.axe and the search found nothing, so the path collapsed to
++    // a bare "ddraw.ini" resolved against whatever the working directory
++    // happened to be - and the file sitting right next to the image was never
++    // opened.  The failure is silent by design (configRead is called with
++    // false for "required"), so every setting in it simply had no effect.
+     char* ch = strrchr(executable, '\\');
++    char* fwd = strrchr(executable, '/');
++    if (fwd != nullptr && (ch == nullptr || fwd > ch)) {
++        ch = fwd;
++    }
+     if (ch != nullptr) {
++        const char sep = *ch;
+         *ch = '\0';
+-        snprintf(path, sizeof(path), "%s\\%s", executable, SFALL_CONFIG_FILE_NAME);
+-        *ch = '\\';
++        snprintf(path, sizeof(path), "%s%c%s", executable, sep,
++                 SFALL_CONFIG_FILE_NAME);
++        *ch = sep;
+     } else {
+         strcpy(path, SFALL_CONFIG_FILE_NAME);
+     }

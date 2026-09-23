@@ -17,6 +17,27 @@ extern "C" {
 #endif
 
 /*
+ * What the two objects AG_APP defines have to be declared with in C++.
+ *
+ * Both are found by name: mkaxe looks up __ag_app_header to read the metadata
+ * and g_ag_api to tell the loader which word to write the syscall table into.
+ * A C++ definition at namespace scope would be mangled, and the const one
+ * would also be given internal linkage by the language - so both would come
+ * out as something like _ZL15__ag_app_header, the tool would find neither, and
+ * an image would be built with an empty name and no stack or heap request.
+ * That failed quietly, once, which is why this exists.
+ *
+ * The macro is used inside AG_APP_SIZED rather than wrapping the header,
+ * because the macro expands at the application's file scope, where this block
+ * has long since closed.
+ */
+#ifdef __cplusplus
+#define AG_LINKAGE extern "C"
+#else
+#define AG_LINKAGE
+#endif
+
+/*
  * Declares the application image header and the API pointer slot.  Put this
  * once at file scope in the application's main translation unit:
  *
@@ -55,8 +76,8 @@ extern "C" {
  */
 #define AG_APP_SIZED(app_name, app_version, app_author, app_flags,           \
                      app_stack, app_heap)                                    \
-    const ag_api_t *g_ag_api = NULL;                                         \
-    __attribute__((used, section(".ag_header")))                             \
+    AG_LINKAGE const ag_api_t *g_ag_api = NULL;                              \
+    AG_LINKAGE __attribute__((used, section(".ag_header")))                  \
     const ag_app_header_t __ag_app_header = {                                \
         .magic = AG_AXE_MAGIC,                                               \
         .abi_major = AG_ABI_MAJOR,                                           \

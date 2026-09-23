@@ -18,7 +18,10 @@ CONFIG_ESPTOOLPY_FLASHSIZE_4MB=n
 CONFIG_ESPTOOLPY_FLASHSIZE_8MB=n
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_PARTITION_TABLE_CUSTOM=y
-CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_16mb.csv"
+# Its own table, not the S3-CAM's: partitions_16mb.csv keeps the upper eight
+# megabytes as `artfs` for Fallout's art store, which this board has no use
+# for, so the whole of the chip goes to appfs here.
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_16mb_lcd2.csv"
 
 # The R8 part is octal PSRAM, like the CAM board and unlike the Zero's quad.
 CONFIG_SPIRAM=y

@@ -71,6 +71,7 @@ set(ARGON_KERNEL_SRCS
     "src/proc/session.c"
     "src/proc/threads.c"
     "src/proc/supervisor.c"
+    "src/proc/budget.c"
     "src/shell/lineedit.c"
     "src/shell/shell_path.c"
     "src/shell/shell.c"

@@ -1,0 +1,47 @@
+--- a/src/main.cc
++++ b/src/main.cc
+@@ -97,7 +97,21 @@
+     // screen for two minutes were the same program.  game.cc reads the same
+     // key three lines from here and does initialise it; this is the one that
+     // did not.
+-    int skipOpeningMovies = 0;
++    // ARGON: the default is the other way round on this machine.
++    //
++    // sfall's own default is to play them, and that is right on a PC.  Here a
++    // movie is the single largest thing the game ever asks for - the decoder's
++    // frame buffers are about 730 KB of an arena that is 5850 - and the screen
++    // is at the far end of a serial link, where a picture in which every pixel
++    // changes every frame is the one case the link cannot compress.  Measured
++    // on the board: about one frame a second, and the run that got as far as
++    // the attract loop died in movie.cc asking for 204900 bytes with 164 KB
++    // left.
++    //
++    // So they are off unless ddraw.ini says otherwise, rather than on unless
++    // it does.  Note that the file has to be found for either default to be
++    // overridden - see the line sfall_config.cc prints.
++    int skipOpeningMovies = 1;
+     configGetInt(&gSfallConfig, SFALL_CONFIG_MISC_KEY, SFALL_CONFIG_SKIP_OPENING_MOVIES_KEY, &skipOpeningMovies);
+     if (skipOpeningMovies < 1) {
+         gameMoviePlay(MOVIE_IPLOGO, GAME_MOVIE_FADE_IN);
+@@ -229,8 +243,19 @@
+                 debugPrint("Main menu timed-out\n");
+                 // FALLTHROUGH
+             case MAIN_MENU_SCREENSAVER:
+-                mainMenuWindowHide(true);
+-                gameMoviePlay(MOVIE_INTRO, GAME_MOVIE_PAUSE_MUSIC);
++                // ARGON: the attract loop does nothing here, and the menu is
++                // not even hidden for it.
++                //
++                // It is the one thing in the game that starts on its own, and
++                // what it starts is the one thing this machine cannot do: the
++                // intro movie, 730 KB of decoder buffers on top of a main menu
++                // that is already holding most of the arena.  A player who put
++                // the controller down for a minute came back to a game that had
++                // died in movie.cc, which is a poor reward for making tea.
++                //
++                // Nothing is lost that a player wants: the movie is on the menu
++                // as an entry, and playing it there is a choice made when the
++                // arena is not also holding a loaded game.
+                 break;
+             case MAIN_MENU_OPTIONS:
+                 mainMenuWindowHide(true);

@@ -165,9 +165,50 @@ ag_err_t ag_port_uart_open(int port, const ag_port_uart_cfg_t *cfg,
         /*
          * Already installed is not a failure: two subsystems may both want the
          * port up and neither knows about the other.
+         *
+         * The transmit buffer is asked for and then halved until it fits,
+         * rather than being a number that is right on one board.  What it buys
+         * is overlap: with a buffer, uart_write_bytes copies and returns, and
+         * the peripheral's interrupt drains it while the caller gets on with
+         * the next frame; without one the caller sits in the write for as long
+         * as the wire takes.  On the link between the two boards that is the
+         * difference between a game that draws while the picture is going out
+         * and a game that waits for it.
+         *
+         * Halving rather than a fixed size because the two ends are not the
+         * same machine: the S3 has PSRAM and internal memory to spare, and the
+         * CYD has 179 KB, no PSRAM, and after a `wifi off` the free memory is
+         * there but not in one piece.  A board that cannot have the big one
+         * gets the small one and works, instead of failing to open the port -
+         * which is what a fixed 32 KB did, and it came out as a screen that
+         * stayed dark.
          */
-        const esp_err_t rc = uart_driver_install(port, (int)rx_bytes,
-                                                 (int)tx_bytes, 0, NULL, 0);
+        /*
+         * Receive first, transmit second: the transmit buffer is halved all
+         * the way down before the receive buffer gives up a byte.  On the
+         * board that is short of memory - the CYD, the far end of the picture
+         * link - what matters is not losing what arrives at four megabaud
+         * while a band is being written to the panel, and what it sends back
+         * is a byte now and then.  A receiver with 32 KB of ring and 256 bytes
+         * of transmit is the right shape for it; the other way round was the
+         * shape it had, and it lost eight per cent of the bands under load.
+         */
+        esp_err_t rc = ESP_FAIL;
+        uint32_t  rx = rx_bytes ? rx_bytes : 1024u;
+        for (;;) {
+            uint32_t tx = tx_bytes ? tx_bytes : 256u;
+            for (;;) {
+                rc = uart_driver_install(port, (int)rx, (int)tx, 0, NULL, 0);
+                if (rc == ESP_OK || rc == ESP_ERR_INVALID_STATE || tx <= 256u) {
+                    break;
+                }
+                tx /= 2u;
+            }
+            if (rc == ESP_OK || rc == ESP_ERR_INVALID_STATE || rx <= 1024u) {
+                break;
+            }
+            rx /= 2u;
+        }
         if (rc != ESP_OK && rc != ESP_ERR_INVALID_STATE) {
             return from_esp(rc);
         }
@@ -231,6 +272,20 @@ bool ag_port_uart_is_open(int port)
     }
 #endif
     return valid(port) && uart_is_driver_installed(port);
+}
+
+ag_err_t ag_port_uart_tx_wait(int port, uint32_t timeout_ms)
+{
+    if (!valid(port)) {
+        return -AG_EINVAL;
+    }
+    if (is_jtag(port)) {
+        return AG_OK;
+    }
+    if (!uart_is_driver_installed(port)) {
+        return AG_OK; /* nothing of ours is queued if there is no driver */
+    }
+    return from_esp(uart_wait_tx_done(port, pdMS_TO_TICKS(timeout_ms)));
 }
 
 ag_err_t ag_port_uart_flush(int port)

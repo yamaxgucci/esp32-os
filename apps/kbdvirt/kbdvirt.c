@@ -49,6 +49,7 @@ typedef struct {
     uint8_t      rx_buf[PKT_SIZE];
     uint8_t      rx_n;
     uint8_t      drop_stale;
+    ag_handle_t  last_accept_err;
     uint8_t      listen_moaned; /* the failed-to-listen warning is said once */
 } kbdvirt_state_t;
 
@@ -187,21 +188,61 @@ static void ensure_listen(kbdvirt_state_t *st)
     ag_log(AG_LOG_INFO, "kbdvirt", "listen :%u", (unsigned)KBDVIRT_PORT);
 }
 
+/*
+ * Take every connection that is waiting, not one per call.
+ *
+ * A host tool that retries while the guest boots leaves one queued connection
+ * per attempt, and QEMU's forwarding accepts them all whether or not anybody
+ * here ever will.  Taking one per read then works through a queue of corpses
+ * at a frame each while the live socket - always the last of them - waits its
+ * turn and its keys go nowhere.
+ *
+ * The newest peer is the real one, so the rest are closed as they come.
+ *
+ * This was not the bug that made the keyboard look dead - that was the drain
+ * below - but it is a real one and it is the same shape, so it is fixed here
+ * rather than left to be found the same way.
+ */
 static void try_accept(kbdvirt_state_t *st)
 {
     ag_handle_t peer;
+    int         spins = 0;
     ensure_listen(st);
     if (st->listen < 0) {
         return;
     }
-    peer = ag_tcp_accept(st->listen, 0u);
-    if (peer < 0) {
+    for (;;) {
+        peer = ag_tcp_accept(st->listen, 0u);
+        if (peer < 0) {
+            break;
+        }
+        /* Quietly: a line for each of forty corpses is not a diagnosis, and
+         * the count goes in the one line printed below. */
+        if (st->conn >= 0) {
+            (void)ag_net_close(st->conn);
+        }
+        st->conn = peer;
+        st->rx_n = 0;
+        if (++spins >= 64) {
+            break;
+        }
+    }
+    if (spins == 0) {
+        /*
+         * -EAGAIN is the ordinary answer - nobody is knocking - and it arrives
+         * sixty times a second, so it is not worth a line.  Anything else is
+         * the driver failing to take a connection that is there, which from
+         * the outside looks exactly like a keyboard that does not work, and
+         * left no trace at all until this line existed.  Once per code, so a
+         * standing fault does not fill the screen.
+         */
+        if (peer != (ag_handle_t)(-AG_EAGAIN) && peer != st->last_accept_err) {
+            st->last_accept_err = peer;
+            ag_log(AG_LOG_WARN, "kbdvirt", "accept refused: %d", (int)peer);
+        }
         return;
     }
-    if (st->conn >= 0) {
-        close_conn(st, "replaced by new peer");
-    }
-    st->conn = peer;
+    st->last_accept_err = 0;
     (void)ag_net_set_nonblock(st->conn, true);
     /*
      * Events queued from an older peer go; bytes on this brand new socket

@@ -1,0 +1,70 @@
+diff --git a/src/heap.cc b/src/heap.cc
+--- a/src/heap.cc
++++ b/src/heap.cc
+@@ -913,12 +913,27 @@
+ system:
+ 
+     if (1) {
+-        char stats[512];
+-        if (heapPrintStats(heap, stats, sizeof(stats))) {
+-            debugPrint("\n%s\n", stats);
+-        }
+-
++        /*
++         * ARGON: the stats block only when something is actually taken.
++         *
++         * This label is reached on every probe that fails, not only on the one
++         * that gives up: the cache tries ten times with a4 == 1, growing what
++         * it asks for, and each of those printed five hundred bytes of heap
++         * statistics to the console.  Counted on Broken Hills: 710 of them,
++         * against 11 on the Temple of Trials.  On a board with a serial console
++         * that is the frame rate.
++         *
++         * The interesting case - a block taken out of the arena because the
++         * cache could not hold it - still prints, and the heap has been keeping
++         * score of those all along in systemBlocks and systemSize.  See the
++         * two exports in cache.cc, which is where the port reads them.
++         */
+         if (a4 == 0) {
++            char stats[512];
++            if (heapPrintStats(heap, stats, sizeof(stats))) {
++                debugPrint("\n%s\n", stats);
++            }
++
+             debugPrint("Allocating block from system memory...\n");
+             unsigned char* block = (unsigned char*)internal_malloc(size + HEAP_BLOCK_OVERHEAD_SIZE);
+             if (block == nullptr) {
+diff --git a/src/cache.cc b/src/cache.cc
+--- a/src/cache.cc
++++ b/src/cache.cc
+@@ -50,6 +50,19 @@
+ extern "C" unsigned ag_cache_flushes;
+ extern "C" unsigned ag_cache_biggest;
+ 
++/*
++ * ARGON: and what the cache's heap has had to take out of the arena.
++ *
++ * heapFindFreeBlock ends at a label that calls internal_malloc when the cache's
++ * own memory cannot be made to fit the block - unbounded, and outside every
++ * figure the cache reports about itself.  The heap counts those in systemBlocks
++ * and systemSize; nothing was reading them.  Worth reading, because three
++ * separate attempts to give the largest map in the game more arena all ended at
++ * the same wall, and an unbounded spill would explain that.
++ */
++extern "C" unsigned ag_heap_system_blocks;
++extern "C" unsigned ag_heap_system_bytes;
++
+ bool cacheInit(Cache* cache, CacheSizeProc* sizeProc, CacheReadProc* readProc, CacheFreeProc* freeProc, int maxSize)
+ {
+     if (!heapInit(&(cache->heap), maxSize)) {
+@@ -275,6 +288,10 @@
+             }
+         }
+ 
++        /* After the last attempt, which is the one that may have spilled. */
++        ag_heap_system_blocks = (unsigned)cache->heap.systemBlocks;
++        ag_heap_system_bytes = (unsigned)cache->heap.systemSize;
++
+         if (!allocated) {
+             break;
+         }

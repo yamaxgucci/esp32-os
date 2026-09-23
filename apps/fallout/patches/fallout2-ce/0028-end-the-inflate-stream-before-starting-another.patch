@@ -1,0 +1,31 @@
+--- a/src/dfile.cc
++++ b/src/dfile.cc
+@@ -789,6 +789,28 @@
+             if (dfile->decompressionBuffer == nullptr) {
+                 goto err;
+             }
++        } else {
++            // ARGON: end the stream that is already in there before starting a
++            // new one on top of it.
++            //
++            // This is the reuse path the comment above describes, and reuse is
++            // the normal case in this port - see patch 0005, which keeps the
++            // archive open.  The z_stream struct is reused, but it is not
++            // *empty*: it still holds zlib's internal state for the last entry,
++            // including a 32 KB sliding window that updatewindow() allocated.
++            // inflateInit() on top of that installs a fresh state and orphans
++            // the old one, window and all, and nothing ever frees it.
++            //
++            // Thirty-two kilobytes per compressed entry opened.  It is the
++            // whole of the shortfall on an 8 MB board: a census of the last
++            // second before Fallout 2 ran out of arena in the Den found 1344 KB
++            // in forty-six blocks, every one of them zcalloc under
++            // updatewindow, and every out-of-arena failure of the night - on
++            // five different maps - was a request for exactly 32768 bytes.
++            //
++            // dfileRewind two hundred lines above already does this correctly,
++            // which is how the fix was checked rather than guessed.
++            (void)inflateEnd(dfile->decompressionStream);
+         }
+ 
+         dfile->decompressionStream->zalloc = Z_NULL;

@@ -244,8 +244,20 @@ static ag_err_t heap_create(proc_t *p, uint32_t requested)
     }
 
     if (required) {
-        ag_log(AG_LOG_ERROR, "proc", "%s asked for a %u KB arena; there is none",
-               p->name, (unsigned)(requested / 1024u));
+        /*
+         * Say what there was, not only that there was not enough.  "There is
+         * none" sends whoever reads it to work out the shortfall by
+         * subtraction - image data, driver buffers, whatever the kernel took
+         * at boot - and the answer to that arithmetic was wrong three times in
+         * one evening while the number itself was one call away.  A block is
+         * what is asked for and a block is what is reported.
+         */
+        ag_log(AG_LOG_ERROR, "proc",
+               "%s asked for a %u KB arena; the largest block is %u KB "
+               "(%u KB free)",
+               p->name, (unsigned)(requested / 1024u),
+               (unsigned)(ag_port_mem_largest(AG_MEM_SLOW) / 1024u),
+               (unsigned)(ag_port_mem_free(AG_MEM_SLOW) / 1024u));
         return -AG_ENOMEM;
     }
 
@@ -831,8 +843,9 @@ static ag_err_t copy_args(proc_t *p, int argc, char **argv)
     size_t at = 0;
 
     p->argc = 0;
+    /* Refuse rather than truncate: a dropped argument is invisible. */
     if (argc > AG_PROC_ARGS_MAX) {
-        argc = AG_PROC_ARGS_MAX;
+        return -AG_ERANGE;
     }
 
     for (int i = 0; i < argc; i++) {

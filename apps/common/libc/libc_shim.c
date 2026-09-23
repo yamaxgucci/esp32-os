@@ -24,12 +24,516 @@ FILE *stdin = &s_stdin;
 FILE *stdout = &s_stdout;
 FILE *stderr = &s_stderr;
 
+/*
+ * A failed allocation is the quietest failure there is.  A vendored engine
+ * checks the pointer, gives up on whatever it was doing, and reports something
+ * unrelated three layers up - "Error: Loading proto message files!" when what
+ * actually happened is that the arena was full.  So the first one says so.
+ *
+ * Once, not every time: the caller usually keeps trying, and a program that
+ * has run out of memory does not need its console filled as well.
+ */
+static int s_malloc_failed;
+
+/*
+ * The lowest the arena has been, which is not what sampling it once a frame
+ * tells you.
+ *
+ * A big transient - the engine reading a whole file into a buffer, copying it
+ * somewhere and freeing it again - lives and dies between two frames, so a
+ * per-frame watcher never sees it and reports a high-water mark that is short
+ * by however large it was.  Fallout 2 decodes a map's ambience whole - half a
+ * megabyte, allocated and handed on between two frames - and the difference
+ * was what decided whether the game fitted in 8 MB of PSRAM.
+ *
+ * So the arena is sampled here as well, but only for allocations big enough to
+ * matter: ag_meminfo is a call and the engine makes thirty thousand small
+ * allocations before it draws anything.
+ */
+#define ARENA_WATCH_MIN (64u * 1024u)
+
+static size_t s_arena_low = (size_t)-1;
+
+size_t ag_libc_arena_low(void)
+{
+    return s_arena_low;
+}
+
+/*
+ * The big ones, named by where they were asked for.
+ *
+ * A failed allocation says how many bytes it wanted and nothing about who
+ * wanted them, and in a vendored engine of 128000 lines that is not a lead.
+ * The return address is, once it is run through the link map - and the ones
+ * before it say which phase the program was in.  Bounded, because a program
+ * that streams audio asks for large blocks forever.
+ *
+ * Off unless asked for: a program that allocates a megabyte on purpose should
+ * not have to explain itself on the console every time it runs.
+ */
+static int    s_big_reported;
+static size_t s_big_min;
+static int    s_big_max;
+
+/*
+ * Both the threshold and the cap are arguments rather than constants, because
+ * the block that will not fit is not always a big one.  The allocation that
+ * ended Fallout 2 on an 8 MB part was thirty-two kilobytes, and finding what
+ * had taken the other six megabytes meant watching every allocation an eighth
+ * that size - hundreds of them, not sixty-four.
+ */
+/*
+ * Somewhere else for the failure to go.
+ *
+ * "out of arena asking for N bytes" is the one line that explains a game that
+ * has just stopped working, and on a board the console it prints to is a cable
+ * to a machine that is not there.  So an application can hand over a second
+ * place to write it - see -log in the Fallout port.
+ */
+static void (*s_libc_log)(const char *line);
+
+/*
+ * Somebody who can give memory back.
+ *
+ * The arena is one contiguous block and the failure that matters is not
+ * exhaustion, it is fragmentation: "235 of 6050 KB free, largest block 94208"
+ * with 132 KB asked for.  The program that asked does not check the answer -
+ * almost none of them do - so a refusal becomes a write through a null pointer
+ * one instruction later, and the crash names the wrong culprit every time.
+ *
+ * A program that keeps a cache knows how to make room: it can throw the cache
+ * away and read it back off the disk.  Fallout's art cache is 1800 KB of a
+ * 6050 KB arena and does exactly that on its own account already.  So a
+ * refused allocation asks, once, and tries again.
+ *
+ * Once, and not in a loop: if letting go of everything it has did not make
+ * room, asking again will not either, and a loop here would be a hang instead
+ * of a message.  Re-entrant calls are refused for the same reason - the hook
+ * itself allocates.
+ */
+static int (*s_libc_oom)(size_t wanted);
+static int s_in_oom;
+
+void ag_libc_oom_sink(int (*sink)(size_t wanted))
+{
+    s_libc_oom = sink;
+}
+
+unsigned ag_libc_oom_rescues;
+
+/*
+ * ARGON: and a lender of last resort.
+ *
+ * The hook above can only free things and let malloc try again, which is no
+ * use when the memory that exists is inside somebody's private pool.  Fallout
+ * 2 keeps its art cache as one block of two and a half megabytes with its own
+ * allocator inside it, and that allocator can both evict art to make room and
+ * move blocks about - so when the arena has nothing left, the cache does, and
+ * every byte of it is a copy of a file on the card.
+ *
+ * Maxim asked for exactly this: "надо не просто очистить кэш арта на отказе, а
+ * убрать столько сколько не хватает и дать память именно из кэша арта."  So
+ * the application may install a pair - one that hands out a block from
+ * wherever it keeps its own memory, one that recognises such a block and takes
+ * it back - and malloc tries the lender after the hook has failed rather than
+ * returning NULL.
+ *
+ * free() and realloc() offer every pointer to the giveback first; it answers
+ * only for its own, which is a lookup in a table of a few dozen entries.
+ */
+static void *(*s_libc_borrow)(size_t wanted);
+static int (*s_libc_giveback)(void *p, size_t *sizePtr);
+
+unsigned ag_libc_borrowed;
+
+void ag_libc_borrow_sink(void *(*borrow)(size_t), int (*giveback)(void *, size_t *))
+{
+    s_libc_borrow = borrow;
+    s_libc_giveback = giveback;
+}
+
+void ag_libc_log_sink(void (*sink)(const char *line))
+{
+    s_libc_log = sink;
+}
+
+void ag_libc_malloc_trace(size_t min_bytes, int max_reports)
+{
+    s_big_min = min_bytes;
+    s_big_max = max_reports;
+    s_big_reported = 0;
+}
+
+static void report_big(size_t n, void *r0, void *r1, void *r2, void *r3,
+                       void *r4, void *p)
+{
+    if (s_big_min == 0 || n < s_big_min || s_big_reported >= s_big_max) {
+        return;
+    }
+    s_big_reported++;
+    /*
+     * Five return addresses, because fewer are not enough.  A vendored engine
+     * reaches malloc through layers of its own: Fallout 2 goes
+     * caller -> internal_malloc -> the allocator registered with its memory
+     * manager -> a block wrapper -> malloc, so three frames name nothing but
+     * that plumbing.  Five reach the code that wanted the memory, and the
+     * ones below it say which layer it came through.
+     *
+     * To the log as well as the console, which the failure line below already
+     * did and this did not.  On a board the console is a cable to a machine
+     * that may not be listening; a census that only exists on a screen nobody
+     * is reading is a census that was not taken.  A run made to find out who
+     * takes six hundred kilobytes came back with the failure and none of the
+     * allocations that led to it.
+     */
+    char line[160];
+    snprintf(line, sizeof(line),
+             "malloc: %u bytes from %p %p %p %p %p%s\n", (unsigned)n,
+             r0, r1, r2, r3, r4, (p == NULL) ? " FAILED" : "");
+    ag_print(line);
+    if (s_libc_log != NULL) {
+        s_libc_log(line);
+    }
+}
+
+/*
+ * The live-bytes profiler below is 768 KB of bss, which is 768 KB the arena
+ * cannot have: Fallout 2 asks for a 6100 KB arena and an 8 MB part has no room
+ * for both.  So it compiles to nothing unless the build asks for it -
+ * ARGON_LIBC_MALLOC_PROFILE=1, or -DAG_LIBC_MALLOC_PROFILE=1 by hand - and the
+ * two entry points stay, doing nothing, so callers need no guard of their own.
+ */
+#ifndef AG_LIBC_MALLOC_PROFILE
+#define AG_LIBC_MALLOC_PROFILE 0
+#endif
+
+#if AG_LIBC_MALLOC_PROFILE
+
+/*
+ * What is still held, by call site.
+ *
+ * Naming the big allocations is enough when one of them is the problem.  It is
+ * no use when two megabytes arrive as four hundred blocks of five kilobytes,
+ * which is what visiting a new elevation of a Fallout 2 map costs.  And
+ * counting what is *asked for* is no use either: the engine opens and closes
+ * files all frame, so a three-second window on a quiet map asks for
+ * thirty-seven megabytes and gives them all back.  Churn drowns the answer.
+ *
+ * So this tracks what is still outstanding.  Every allocation of PROFILE_MIN
+ * or more goes in a table keyed by its pointer, remembering the call site four
+ * frames up - the engine's own caller rather than one of its allocator layers.
+ * free() and realloc() take it out again.  A dump is a snapshot of live bytes
+ * per site, so the difference between two snapshots is exactly what an action
+ * kept, with the churn cancelled out.
+ *
+ * The costs, so they are on the record rather than a surprise: 786 KB of
+ * table, a hash and a short probe on every allocation over the threshold, and
+ * blocks that arrive when the table is full are counted in a spill line rather
+ * than dropped - a total that does not add up is worse than a coarse one.
+ *
+ * The table used to be four times this and the threshold sixteen bytes, which
+ * came to 4.6 MB of bss - and bss and the arena are the same memory, so on the
+ * 8 MB board the instrumented build left the game 3 MB to run in and could not
+ * reach the thing being measured.  A tool that does not fit on the machine
+ * with the problem is not a tool.  Sixty-four bytes and 65536 slots fits, and
+ * what it gives up is the smallest blocks - which are the ones the spill line
+ * would have told you about anyway.  Both can be raised with -D on a build for
+ * a larger part.
+ */
+#ifndef PROFILE_LIVE
+#define PROFILE_LIVE  65536u         /* pointer slots, a power of two */
+#endif
+#define PROFILE_SITES 1024u
+#ifndef PROFILE_MIN
+/*
+ * ARGON: 1024, not 64.
+ *
+ * At 64 bytes the table sees nearly every allocation the engine makes, and
+ * the hash and probe on each of them made the instrumented build unplayable -
+ * Maxim, 10 September 2026: "очень сильные тормоза, невозможно играть", and
+ * an instrument nobody can hold still enough to use answers nothing.  The
+ * question it exists for is who holds hundreds of kilobytes while a town
+ * loads, and nothing under a kilobyte is ever the answer to that.
+ */
+#define PROFILE_MIN   1024u
+#endif
+#define PROFILE_PROBE 256u
+
+typedef struct {
+    void    *p;
+    void    *site;
+    uint32_t n;
+} prof_live_t;
+
+typedef struct {
+    void    *site;
+    uint32_t bytes;
+    uint32_t count;
+} prof_site_t;
+
+static prof_live_t s_live[PROFILE_LIVE];
+static prof_site_t s_sites[PROFILE_SITES];
+static uint32_t    s_prof_untracked;   /* live bytes the table could not hold */
+static uint32_t    s_prof_lost;        /* frees of blocks it never saw */
+static int         s_prof_on;
+
+void ag_libc_malloc_profile(int on)
+{
+    s_prof_on = on ? 1 : 0;
+}
+
+static unsigned prof_hash(void *p)
+{
+    /* The low bits of a heap pointer are alignment, so drop them first. */
+    uintptr_t v = (uintptr_t)p >> 4;
+    v *= 2654435761u;
+    return (unsigned)(v & (PROFILE_LIVE - 1u));
+}
+
+static prof_site_t *prof_site(void *site)
+{
+    unsigned i;
+
+    for (i = 0; i < PROFILE_SITES; ++i) {
+        if (s_sites[i].site == site) {
+            return &s_sites[i];
+        }
+        if (s_sites[i].site == NULL) {
+            s_sites[i].site = site;
+            return &s_sites[i];
+        }
+    }
+    return NULL;
+}
+
+static void prof_alloc(void *p, size_t n, void *site)
+{
+    unsigned h, i;
+
+    if (!s_prof_on || p == NULL || n < PROFILE_MIN) {
+        return;
+    }
+    h = prof_hash(p);
+    for (i = 0; i < PROFILE_PROBE; ++i) {
+        prof_live_t *slot = &s_live[(h + i) & (PROFILE_LIVE - 1u)];
+        if (slot->p == NULL) {
+            prof_site_t *st = prof_site(site);
+            slot->p = p;
+            slot->site = site;
+            slot->n = (uint32_t)n;
+            if (st != NULL) {
+                st->bytes += (uint32_t)n;
+                st->count++;
+            } else {
+                s_prof_untracked += (uint32_t)n;
+            }
+            return;
+        }
+    }
+    s_prof_untracked += (uint32_t)n;
+}
+
+static void prof_free(void *p)
+{
+    unsigned h, i;
+
+    if (!s_prof_on || p == NULL) {
+        return;
+    }
+    h = prof_hash(p);
+    for (i = 0; i < PROFILE_PROBE; ++i) {
+        prof_live_t *slot = &s_live[(h + i) & (PROFILE_LIVE - 1u)];
+        if (slot->p == p) {
+            prof_site_t *st = prof_site(slot->site);
+            if (st != NULL && st->bytes >= slot->n) {
+                st->bytes -= slot->n;
+                st->count--;
+            }
+            slot->p = NULL;
+            slot->site = NULL;
+            slot->n = 0;
+            return;
+        }
+        if (slot->p == NULL) {
+            break;      /* the probe run ends: it was never tracked */
+        }
+    }
+    s_prof_lost++;
+}
+
+/*
+ * To the log as well as the console, and for the same reason report_big has to:
+ * on a board the console is a cable to a machine that may not be listening, and
+ * a profile that exists only on a screen nobody is reading is a profile that
+ * was not taken.  A run made to find out where five megabytes had gone came
+ * back with the memory figures and none of the sites.
+ */
+static void prof_line(const char *text)
+{
+    ag_print(text);
+    if (s_libc_log != NULL) {
+        s_libc_log(text);
+    }
+}
+
+void ag_libc_malloc_profile_dump(int top)
+{
+    unsigned i, j;
+    uint32_t total = 0;
+
+    if (!s_prof_on) {
+        return;
+    }
+    for (i = 0; i < PROFILE_SITES && s_sites[i].site != NULL; ++i) {
+        total += s_sites[i].bytes;
+    }
+    unsigned blocks = 0;
+    unsigned sites = 0;
+
+    for (i = 0; i < PROFILE_LIVE; ++i) {
+        if (s_live[i].p != NULL) {
+            blocks++;
+        }
+    }
+    for (i = 0; i < PROFILE_SITES && s_sites[i].site != NULL; ++i) {
+        sites++;
+    }
+    /* One line rather than three prints, so it can go through prof_line.
+     * "ever missed" is cumulative and never comes down: a block the tables
+     * could not hold cannot be found again when it is freed.  It says whether
+     * the tables were big enough, and is not a figure to add to anything. */
+    {
+        char head[144];
+        if (s_prof_untracked != 0) {
+            snprintf(head, sizeof(head),
+                     "[prof] %u KB live in %u blocks from %u/%u sites, "
+                     "%u KB ever missed\n",
+                     total / 1024u, blocks, sites, (unsigned)PROFILE_SITES,
+                     s_prof_untracked / 1024u);
+        } else {
+            snprintf(head, sizeof(head),
+                     "[prof] %u KB live in %u blocks from %u/%u sites\n",
+                     total / 1024u, blocks, sites, (unsigned)PROFILE_SITES);
+        }
+        prof_line(head);
+    }
+    /* A selection sort over 64 entries, a few times a second: the point is not
+     * to need a qsort in a diagnostic.  Sites are never cleared - the table is
+     * a running picture and two snapshots subtract - so "already printed" is a
+     * local array rather than a mark in the table.  It has to be local for a
+     * second reason: ag_printf may allocate, and an allocation landing in a
+     * table that is halfway through being tagged would corrupt it. */
+    unsigned char done[PROFILE_SITES];
+    memset(done, 0, sizeof(done));
+    for (j = 0; j < (unsigned)top; ++j) {
+        unsigned best = PROFILE_SITES;
+        uint32_t bestb = 0;
+
+        for (i = 0; i < PROFILE_SITES && s_sites[i].site != NULL; ++i) {
+            if (done[i]) {
+                continue;
+            }
+            if (s_sites[i].bytes > bestb) {
+                bestb = s_sites[i].bytes;
+                best = i;
+            }
+        }
+        if (best == PROFILE_SITES) {
+            break;
+        }
+        done[best] = 1;
+        {
+            char row[96];
+            snprintf(row, sizeof(row), "[prof]  %6u KB  %5u live  %p\n",
+                     s_sites[best].bytes / 1024u, s_sites[best].count,
+                     s_sites[best].site);
+            prof_line(row);
+        }
+    }
+}
+
+#else /* AG_LIBC_MALLOC_PROFILE */
+
+void ag_libc_malloc_profile(int on)
+{
+    (void)on;
+}
+
+void ag_libc_malloc_profile_dump(int top)
+{
+    (void)top;
+}
+
+static void prof_alloc(void *p, size_t n, void *site)
+{
+    (void)p;
+    (void)n;
+    (void)site;
+}
+
+static void prof_free(void *p)
+{
+    (void)p;
+}
+
+#endif /* AG_LIBC_MALLOC_PROFILE */
+
 void *malloc(size_t n)
 {
     if (n == 0) {
         n = 1;
     }
-    return ag_malloc(n);
+    void *p = ag_malloc(n);
+    if (p == NULL && s_libc_oom != NULL && !s_in_oom) {
+        s_in_oom = 1;
+        const int gave = s_libc_oom(n);
+        s_in_oom = 0;
+        if (gave) {
+            p = ag_malloc(n);
+            if (p != NULL) {
+                ag_libc_oom_rescues++;
+            }
+        }
+    }
+
+    /* Still nothing: borrow from whatever pool the application keeps.  Guarded
+     * by the same flag - the lender evicts, and evicting calls free. */
+    if (p == NULL && s_libc_borrow != NULL && !s_in_oom) {
+        s_in_oom = 1;
+        p = s_libc_borrow(n);
+        s_in_oom = 0;
+        if (p != NULL) {
+            ag_libc_borrowed++;
+        }
+    }
+    report_big(n, __builtin_return_address(0), __builtin_return_address(1),
+               __builtin_return_address(2), __builtin_return_address(3),
+               __builtin_return_address(4), p);
+    prof_alloc(p, n, __builtin_return_address(4));
+    if (p != NULL && n >= ARENA_WATCH_MIN) {
+        ag_meminfo_t mi;
+        ag_meminfo(&mi);
+        if ((size_t)mi.arena_free < s_arena_low) {
+            s_arena_low = (size_t)mi.arena_free;
+        }
+    }
+    if (p == NULL && !s_malloc_failed) {
+        ag_meminfo_t mi;
+        s_malloc_failed = 1;
+        ag_meminfo(&mi);
+        char line[160];
+        snprintf(line, sizeof(line),
+                 "malloc: out of arena asking for %u bytes; %u of %u KB free, "
+                 "largest block %u\n",
+                 (unsigned)n, (unsigned)(mi.arena_free / 1024u),
+                 (unsigned)(mi.arena_total / 1024u),
+                 (unsigned)mi.arena_largest);
+        ag_print(line);
+        if (s_libc_log != NULL) {
+            s_libc_log(line);
+        }
+    }
+    return p;
 }
 
 void *calloc(size_t n, size_t sz)
@@ -44,18 +548,83 @@ void *calloc(size_t n, size_t sz)
 
 void *realloc(void *p, size_t n)
 {
+    void *q;
+
+    /*
+     * A borrowed block cannot be handed to ag_realloc - it is not the arena's -
+     * so it is copied out and given back.  The lender remembers how big it was,
+     * which is the one thing realloc needs and the caller never says.
+     */
+    if (p != NULL && s_libc_giveback != NULL && !s_in_oom) {
+        size_t was = 0;
+
+        if (s_libc_giveback(p, &was) != 0) {
+            q = malloc(n);
+            if (q != NULL && was != 0) {
+                memcpy(q, p, (was < n) ? was : n);
+            }
+            /* The giveback has already released it; nothing else to do. */
+            return q;
+        }
+    }
+
     /* Prefer the ABI realloc: it knows the old block size (multi_heap). */
-    return ag_realloc(p, n);
+    prof_free(p);
+    q = ag_realloc(p, n);
+    prof_alloc(q, n, __builtin_return_address(3));
+    return q;
 }
 
 void free(void *p)
 {
     if (p != NULL) {
+        size_t was = 0;
+
+        prof_free(p);
+
+        /* Borrowed rather than allocated?  Then it goes back where it came
+         * from, and ag_free must not see it at all. */
+        if (s_libc_giveback != NULL && !s_in_oom && s_libc_giveback(p, &was)) {
+            return;
+        }
+
         ag_free(p);
     }
 }
 
-void exit(int code) { ag_exit(code); }
+/*
+ * atexit, and an exit that honours it.
+ *
+ * Both are here rather than left to newlib because newlib's version reaches
+ * for __on_exit_args and a registry the C++ runtime also wants; letting that
+ * object in means two exit paths over one process.  Thirty-two is more than
+ * any port has registered - the C++ statics go through __cxa_atexit in
+ * apps/common/cxx, not through here.
+ */
+#define ATEXIT_MAX 32
+
+static void (*s_atexit[ATEXIT_MAX])(void);
+static int s_atexit_count;
+
+int atexit(void (*fn)(void))
+{
+    if (fn == NULL || s_atexit_count >= ATEXIT_MAX) {
+        return -1;
+    }
+    s_atexit[s_atexit_count++] = fn;
+    return 0;
+}
+
+void exit(int code)
+{
+    while (s_atexit_count > 0) {
+        /* Decrement first: a handler that calls exit again must not run the
+         * same handler twice. */
+        s_atexit[--s_atexit_count]();
+    }
+    ag_exit(code);
+}
+
 void abort(void) { ag_panic("abort"); }
 
 /* What a failed assert() expands to.  Print where it happened, then panic. */
@@ -89,7 +658,9 @@ int atoi(const char *s)
 
 double atof(const char *s)
 {
-    return (double)atoi(s);
+    /* This used to be atoi in disguise, which read 0.75 as zero.  Nothing in
+     * the tree had a fractional constant to notice until a game engine did. */
+    return strtod(s, NULL);
 }
 
 static int fmt_out(char *buf, size_t n, size_t *pos, char c)
@@ -101,17 +672,45 @@ static int fmt_out(char *buf, size_t n, size_t *pos, char c)
     return 1;
 }
 
-static int fmt_str(char *buf, size_t n, size_t *pos, const char *s)
+/*
+ * %s, with the width and precision that used to be parsed and thrown away.
+ *
+ * Precision on a string is a maximum, not a minimum: "%.4s" of "items" is
+ * "item".  Ignoring it does not look like a formatting bug when it happens -
+ * Fallout builds the name of a message file that way, so the engine asked the
+ * archive for pro_items.msg, was told there was no such file, and reported
+ * that it could not load its prototypes.  An afternoon, that one.
+ *
+ * Width is a minimum, padded with spaces, left-justified when the caller said
+ * '-'.  Zero padding is not honoured for strings, which is what C says.
+ */
+static int fmt_str(char *buf, size_t n, size_t *pos, const char *s, int width,
+                   int prec, int left)
 {
-    int c = 0;
+    int len = 0;
+    int i;
+
     if (s == NULL) {
         s = "(null)";
     }
-    while (*s) {
-        fmt_out(buf, n, pos, *s++);
-        c++;
+    while (s[len] != '\0' && (prec < 0 || len < prec)) {
+        len++;
     }
-    return c;
+
+    if (!left) {
+        for (i = len; i < width; i++) {
+            fmt_out(buf, n, pos, ' ');
+        }
+    }
+    for (i = 0; i < len; i++) {
+        fmt_out(buf, n, pos, s[i]);
+    }
+    if (left) {
+        for (i = len; i < width; i++) {
+            fmt_out(buf, n, pos, ' ');
+        }
+    }
+    return len > width ? len : width;
 }
 
 static int fmt_uint_field(char *buf, size_t n, size_t *pos, unsigned long v,
@@ -238,7 +837,8 @@ static int argon_vsnprintf(char *buf, size_t n, const char *fmt, va_list ap)
             }
             switch (*fmt) {
             case 's':
-                fmt_str(buf, n, &pos, va_arg(ap, const char *));
+                fmt_str(buf, n, &pos, va_arg(ap, const char *), width, prec,
+                        left);
                 break;
             case 'c':
                 fmt_out(buf, n, &pos, (char)va_arg(ap, int));
@@ -268,7 +868,7 @@ static int argon_vsnprintf(char *buf, size_t n, const char *fmt, va_list ap)
                                width, prec, zeropad, left);
                 break;
         case 'p':
-            fmt_str(buf, n, &pos, "0x");
+            fmt_str(buf, n, &pos, "0x", 0, -1, 0);
             fmt_uint(buf, n, &pos, (unsigned long)va_arg(ap, void *), 16, 0);
             break;
         case 'f':
@@ -405,6 +1005,193 @@ int fflush(FILE *f)
     return 0;
 }
 
+/*
+ * How much is read ahead.
+ *
+ * Sixteen kilobytes was tried on the guess that a read costs mostly the call.
+ * It is the other way round: the calls fell by two and a half times and the
+ * time in the filesystem doubled, taking Fallout 2 from 5.7 frames a second to
+ * 3.3.  The cost is in the bytes.
+ *
+ * Which makes reading ahead by a fixed amount the wrong shape.  A caller that
+ * asks for a kilobyte and then seeks somewhere else - what reading one entry
+ * out of an archive looks like - has three quarters of a four-kilobyte fetch
+ * thrown away.
+ *
+ * So a fetch is as big as the request, rounded up to a sector, and then each
+ * fill that follows another without a seek between them may be twice the last.
+ * Reading a file through from the front reaches the full buffer in four fills
+ * and pays the per-call cost as rarely as a fixed four kilobytes ever did;
+ * seeking somewhere and taking a kilobyte fetches a kilobyte.  The floor is
+ * for the third kind of caller: fgets asks for one character at a time, and
+ * before any of this that was one system call per character.
+ *
+ * Every open file pays for the buffer, which is why it is allocated on the
+ * first read small enough to want one and never for a caller streaming
+ * something bigger.
+ */
+#define FILE_RBUF 4096
+#define FILE_RFILL_MIN 512
+
+/*
+ * What the filesystem costs, kept because "the engine is slow" is not a
+ * finding.  A frame that spends its time in ag_read is a frame waiting on a
+ * card and a FAT driver, which is ours to make faster; a frame that spends it
+ * anywhere else is the program thinking, which is not.  Two clock reads per
+ * call, and buffering has already made the calls rare.
+ */
+static uint64_t s_io_us;
+static uint32_t s_io_reads;
+static uint32_t s_io_opens;
+static uint32_t s_io_seeks;
+
+/*
+ * And split by which of the three it was.  One number for the filesystem says
+ * a frame is waiting on the card; it does not say whether it is waiting to be
+ * told where a file is, to be moved inside one, or for bytes - and those three
+ * have nothing in common to fix.
+ */
+static uint64_t s_open_us;
+static uint64_t s_seek_us;
+
+/*
+ * And how many bytes came back.  Reads counted alone say nothing about a card:
+ * four hundred of them is a fortnight's work or a fifth of a second depending
+ * on how big each one was, and it was bytes that the read-ahead experiment
+ * turned out to be about.
+ */
+static uint64_t s_io_bytes;
+
+/*
+ * Opens that found nothing, counted separately.
+ *
+ * A program that looks for a file in three places before the one it is in
+ * pays for two directory walks every time, and on FAT a directory walk is not
+ * cheap.  Nothing about that shows up as slow code or as bytes read, so it is
+ * invisible unless it is counted.
+ */
+static uint32_t s_io_misses;
+
+
+uint32_t ag_libc_io_misses(void)
+{
+    return s_io_misses;
+}
+
+uint64_t ag_libc_io_bytes(void)
+{
+    return s_io_bytes;
+}
+
+void ag_libc_io_stats(uint64_t *us, uint32_t *reads, uint32_t *opens,
+                      uint32_t *seeks, uint64_t *open_us, uint64_t *seek_us)
+{
+    if (us != NULL) {
+        *us = s_io_us;
+    }
+    if (open_us != NULL) {
+        *open_us = s_open_us;
+    }
+    if (seek_us != NULL) {
+        *seek_us = s_seek_us;
+    }
+    if (reads != NULL) {
+        *reads = s_io_reads;
+    }
+    if (opens != NULL) {
+        *opens = s_io_opens;
+    }
+    if (seeks != NULL) {
+        *seeks = s_io_seeks;
+    }
+}
+
+void ag_libc_io_reset(void)
+{
+    s_io_us = 0;
+    s_io_reads = 0;
+    s_io_opens = 0;
+    s_io_seeks = 0;
+    s_io_misses = 0;
+    s_open_us = 0;
+    s_seek_us = 0;
+    s_io_bytes = 0;
+}
+
+static int32_t timed_read(ag_handle_t h, void *buf, size_t len)
+{
+    const ag_time_t t0 = ag_micros();
+    const int32_t   n = ag_read(h, buf, len);
+    s_io_us += (uint64_t)(ag_micros() - t0);
+    s_io_reads++;
+    if (n > 0) {
+        s_io_bytes += (uint64_t)n;
+    }
+    return n;
+}
+
+/*
+ * Give back what has been read ahead and not consumed.
+ *
+ * The kernel's position is past the end of the buffer, so anything that moves
+ * or uses the position directly - a seek, a write, a tell - has to put it back
+ * where the caller thinks it is first.
+ */
+static void read_drop(FILE *f)
+{
+    const int unread = f->rlen - f->rpos;
+    if (unread > 0) {
+        (void)ag_seek((ag_handle_t)f->h, -(int64_t)unread, AG_SEEK_CUR);
+    }
+    f->rlen = 0;
+    f->rpos = 0;
+    f->rahead = 0; /* wherever it lands next, start small again */
+}
+
+/*
+ * Fill the buffer from the current kernel position.  Returns bytes available,
+ * 0 at end of file, -1 on error.
+ *
+ * `want` is what the caller is asking for, which is what gets fetched, rounded
+ * up to a sector so a request that straddles one does not cost two reads.
+ */
+static int read_fill(FILE *f, size_t want)
+{
+    if (f->rbuf == NULL) {
+        f->rbuf = (unsigned char *)malloc(FILE_RBUF);
+        if (f->rbuf == NULL) {
+            return -1; /* no buffer: the caller reads unbuffered instead */
+        }
+        f->rcap = FILE_RBUF;
+    }
+
+    size_t       fetch = (want + 511u) & ~(size_t)511u;
+    const size_t floor = (f->rahead > 0) ? (size_t)f->rahead : FILE_RFILL_MIN;
+    if (fetch < floor) {
+        fetch = floor;
+    }
+    if (fetch > (size_t)f->rcap) {
+        fetch = (size_t)f->rcap;
+    }
+
+    const int32_t n = timed_read((ag_handle_t)f->h, f->rbuf, fetch);
+    if (n < 0) {
+        f->err = 1;
+        return -1;
+    }
+    /*
+     * Each fill that follows another without a seek between may fetch twice as
+     * much.  A caller reading a file through from the front reaches the whole
+     * buffer in four fills and pays the per-call cost as rarely as it used to;
+     * a caller that seeks, takes a kilobyte and seeks again starts small every
+     * time and never fetches a page it will not look at.
+     */
+    f->rahead = (fetch * 2u > (size_t)f->rcap) ? f->rcap : (int)(fetch * 2u);
+    f->rlen = (int)n;
+    f->rpos = 0;
+    return (int)n;
+}
+
 FILE *fopen(const char *path, const char *mode)
 {
     uint32_t flags = AG_O_RDONLY;
@@ -420,8 +1207,14 @@ FILE *fopen(const char *path, const char *mode)
         flags = AG_O_RDWR;
     }
     {
+        const ag_time_t open_t0 = ag_micros();
         ag_handle_t h = ag_open(path, flags);
+        const uint64_t open_dt = (uint64_t)(ag_micros() - open_t0);
+        s_io_us += open_dt;
+        s_open_us += open_dt;
+        s_io_opens++;
         if (h < 0) {
+            s_io_misses++;
             errno = ENOENT;
             return NULL;
         }
@@ -434,6 +1227,11 @@ FILE *fopen(const char *path, const char *mode)
         f->h = (int)h;
         f->eof = 0;
         f->err = 0;
+        f->rbuf = NULL;
+        f->rcap = 0;
+        f->rlen = 0;
+        f->rpos = 0;
+        f->rahead = 0;
         return f;
     }
 }
@@ -443,6 +1241,10 @@ int fclose(FILE *f)
     if (f == NULL || f->h < 0) {
         return 0;
     }
+    if (f->rbuf != NULL) {
+        free(f->rbuf);
+        f->rbuf = NULL;
+    }
     ag_close((ag_handle_t)f->h);
     free(f);
     return 0;
@@ -450,23 +1252,85 @@ int fclose(FILE *f)
 
 size_t fread(void *ptr, size_t size, size_t nmemb, FILE *f)
 {
-    size_t  want, got = 0;
-    int32_t n;
+    size_t   want, got = 0;
+    uint8_t *out = (uint8_t *)ptr;
+
     if (f == NULL || ptr == NULL || size == 0) {
         return 0;
     }
     want = size * nmemb;
+
+    /* The console is not a file and has nothing to read ahead from. */
+    if (f->h < 0) {
+        while (got < want) {
+            const int32_t n = timed_read((ag_handle_t)f->h, out + got, want - got);
+            if (n < 0) {
+                f->err = 1;
+                break;
+            }
+            if (n == 0) {
+                f->eof = 1;
+                break;
+            }
+            got += (size_t)n;
+        }
+        return got / size;
+    }
+
+    /* Whatever is already in hand, first. */
+    {
+        const size_t have = (size_t)(f->rlen - f->rpos);
+        const size_t take = (have < want) ? have : want;
+        if (take > 0) {
+            memcpy(out, f->rbuf + f->rpos, take);
+            f->rpos += (int)take;
+            got += take;
+        }
+    }
+
     while (got < want) {
-        n = ag_read((ag_handle_t)f->h, (uint8_t *)ptr + got, want - got);
-        if (n < 0) {
-            f->err = 1;
-            break;
+        const size_t left = want - got;
+        /* A request the buffer could not hold goes straight to the kernel: no
+         * point copying a megabyte twice to save a call. */
+        if (left >= (size_t)FILE_RBUF) {
+            const int32_t n = timed_read((ag_handle_t)f->h, out + got, left);
+            if (n < 0) {
+                f->err = 1;
+                break;
+            }
+            if (n == 0) {
+                f->eof = 1;
+                break;
+            }
+            got += (size_t)n;
+            continue;
         }
-        if (n == 0) {
-            f->eof = 1;
-            break;
+        {
+            const int n = read_fill(f, left);
+            if (n < 0) {
+                /* Out of memory for a buffer, or a read error.  Fall back to
+                 * reading straight through rather than failing. */
+                const int32_t d = timed_read((ag_handle_t)f->h, out + got, left);
+                if (d <= 0) {
+                    if (d == 0) {
+                        f->eof = 1;
+                    }
+                    break;
+                }
+                got += (size_t)d;
+                continue;
+            }
+            if (n == 0) {
+                f->eof = 1;
+                break;
+            }
+            {
+                const size_t take = ((size_t)n < left) ? (size_t)n : left;
+                memcpy(out + got, f->rbuf, take);
+                f->rpos = (int)take;
+                got += take;
+            }
         }
-        got += (size_t)n;
     }
     return size ? got / size : 0;
 }
@@ -477,6 +1341,10 @@ size_t fwrite(const void *ptr, size_t size, size_t nmemb, FILE *f)
     int32_t n;
     if (f == NULL || ptr == NULL || size == 0) {
         return 0;
+    }
+    if (f->h >= 0 && f->rlen > f->rpos) {
+        /* The kernel is ahead of where the caller thinks it is. */
+        read_drop(f);
     }
     want = size * nmemb;
     while (got < want) {
@@ -504,8 +1372,18 @@ int fseek(FILE *f, long off, int whence)
     } else if (whence == SEEK_END) {
         ag_wh = AG_SEEK_END;
     }
-    if (ag_seek((ag_handle_t)f->h, off, ag_wh) < 0) {
-        return -1;
+    /* SEEK_CUR is relative to where the *caller* is, not to the kernel. */
+    read_drop(f);
+    {
+        const ag_time_t t0 = ag_micros();
+        const int64_t   r = ag_seek((ag_handle_t)f->h, off, ag_wh);
+        const uint64_t seek_dt = (uint64_t)(ag_micros() - t0);
+        s_io_us += seek_dt;
+        s_seek_us += seek_dt;
+        s_io_seeks++;
+        if (r < 0) {
+            return -1;
+        }
     }
     f->eof = 0;
     return 0;
@@ -518,7 +1396,136 @@ long ftell(FILE *f)
         return -1;
     }
     p = ag_seek((ag_handle_t)f->h, 0, AG_SEEK_CUR);
-    return (long)p;
+    if (p < 0) {
+        return -1;
+    }
+    /* Less whatever was read ahead and not yet handed out. */
+    return (long)(p - (int64_t)(f->rlen - f->rpos));
+}
+
+/*
+ * These three are here for a reason that is not obvious: without them the
+ * linker takes newlib's, and newlib's rewind lives in an object that also
+ * defines fseek and reaches for _fflush_r, which drags in newlib's fflush and
+ * fclose - and those collide with the ones above.  One missing function pulls
+ * a whole stdio in behind it.  Providing them keeps the archive closed.
+ */
+void rewind(FILE *f)
+{
+    if (f != NULL && f->h >= 0) {
+        f->rlen = 0;
+        f->rpos = 0;
+        ag_seek((ag_handle_t)f->h, 0, AG_SEEK_SET);
+        f->eof = 0;
+    }
+}
+
+int fputc(int c, FILE *f)
+{
+    unsigned char ch = (unsigned char)c;
+    return fwrite(&ch, 1, 1, f) == 1 ? (int)ch : -1;
+}
+
+int fputs(const char *s, FILE *f)
+{
+    size_t n;
+    if (s == NULL) {
+        return -1;
+    }
+    n = strlen(s);
+    return fwrite(s, 1, n, f) == n ? 0 : -1;
+}
+
+/*
+ * Enough of strtod for a configuration file: sign, digits, a point, more
+ * digits, and an exponent.  No hexadecimal float, no infinity, no NaN - none
+ * of which appear in a .cfg, and each of which is a corner where a
+ * hand-written parser goes quietly wrong.
+ *
+ * Accumulating in a double and scaling once at the end costs one rounding
+ * rather than one per digit.
+ */
+double strtod(const char *s, char **end)
+{
+    double mantissa = 0.0;
+    int    exponent = 0;
+    int    sign = 1;
+    int    digits = 0;
+    const char *start = s;
+
+    if (s == NULL) {
+        if (end) {
+            *end = NULL;
+        }
+        return 0.0;
+    }
+    while (isspace((unsigned char)*s)) {
+        s++;
+    }
+    if (*s == '-') {
+        sign = -1;
+        s++;
+    } else if (*s == '+') {
+        s++;
+    }
+    while (*s >= '0' && *s <= '9') {
+        mantissa = mantissa * 10.0 + (double)(*s - '0');
+        s++;
+        digits++;
+    }
+    if (*s == '.') {
+        s++;
+        while (*s >= '0' && *s <= '9') {
+            mantissa = mantissa * 10.0 + (double)(*s - '0');
+            exponent--;
+            s++;
+            digits++;
+        }
+    }
+    if (digits == 0) {
+        /* Nothing was consumed, so nothing was a number. */
+        if (end) {
+            *end = (char *)start;
+        }
+        return 0.0;
+    }
+    if (*s == 'e' || *s == 'E') {
+        const char *mark = s;
+        int         esign = 1;
+        int         evalue = 0;
+        int         edigits = 0;
+        s++;
+        if (*s == '-') {
+            esign = -1;
+            s++;
+        } else if (*s == '+') {
+            s++;
+        }
+        while (*s >= '0' && *s <= '9') {
+            evalue = evalue * 10 + (*s - '0');
+            s++;
+            edigits++;
+        }
+        if (edigits == 0) {
+            s = mark; /* an 'e' with no exponent is not part of the number */
+        } else {
+            exponent += esign * evalue;
+        }
+    }
+
+    while (exponent > 0) {
+        mantissa *= 10.0;
+        exponent--;
+    }
+    while (exponent < 0) {
+        mantissa /= 10.0;
+        exponent++;
+    }
+
+    if (end) {
+        *end = (char *)s;
+    }
+    return sign < 0 ? -mantissa : mantissa;
 }
 
 /*
@@ -707,6 +1714,37 @@ int fgetc(FILE *f)
     return (int)c;
 }
 
+/*
+ * By seeking back a byte rather than keeping a pushback slot, which means the
+ * character that comes back is the one that was there - not the one handed in.
+ * Every caller in sight pushes back what it just read, which is what ungetc is
+ * for; a caller that pushes back something else would find this lying, and the
+ * fix then is a byte in FILE rather than a smarter seek.
+ *
+ * It is also here to keep newlib out: a single call to newlib's ungetc drags
+ * in its fflush, which drags in its stdio table, which then collides with
+ * three functions this file already defines.
+ */
+int ungetc(int c, FILE *f)
+{
+    if (f == NULL || f->h < 0 || c == EOF) {
+        return EOF;
+    }
+    /* Usually the byte is still in the buffer, and stepping back over it is
+     * both exact and free. */
+    if (f->rpos > 0) {
+        f->rpos--;
+        f->eof = 0;
+        return c;
+    }
+    read_drop(f);
+    if (ag_seek((ag_handle_t)f->h, -1, AG_SEEK_CUR) < 0) {
+        return EOF;
+    }
+    f->eof = 0;
+    return c;
+}
+
 char *fgets(char *s, int n, FILE *f)
 {
     int i = 0, c;
@@ -863,6 +1901,86 @@ long strtol(const char *s, char **end, int base)
         *end = (char *)s;
     }
     return v * sign;
+}
+
+/*
+ * The unsigned twin, needed because std::stoul and its neighbours live in the
+ * same libstdc++ member as the rest of std::string: without one here, newlib's
+ * comes in, and newlib's reaches for a per-thread reentrancy structure that
+ * this side of the world does not have.
+ *
+ * Like strtol above it does not report overflow through errno.  A caller that
+ * needs to tell 4294967296 from 0 has to check the digits itself.
+ */
+unsigned long strtoul(const char *s, char **end, int base)
+{
+    unsigned long v = 0;
+    int negate = 0;
+
+    if (s == NULL) {
+        if (end) {
+            *end = NULL;
+        }
+        return 0;
+    }
+    while (isspace((unsigned char)*s)) {
+        s++;
+    }
+    if (*s == '-') {
+        /* Standard, and surprising: a negated unsigned conversion is legal and
+         * wraps.  Ports parse -1 as a mask often enough to matter. */
+        negate = 1;
+        s++;
+    } else if (*s == '+') {
+        s++;
+    }
+    if (base == 0) {
+        if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
+            base = 16;
+            s += 2;
+        } else if (s[0] == '0') {
+            base = 8;
+        } else {
+            base = 10;
+        }
+    }
+    if (base == 16 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
+        s += 2;
+    }
+    for (;;) {
+        int  d;
+        char c = *s;
+        if (c >= '0' && c <= '9') {
+            d = c - '0';
+        } else if (c >= 'a' && c <= 'z') {
+            d = c - 'a' + 10;
+        } else if (c >= 'A' && c <= 'Z') {
+            d = c - 'A' + 10;
+        } else {
+            break;
+        }
+        if (d >= base) {
+            break;
+        }
+        v = v * (unsigned long)base + (unsigned long)d;
+        s++;
+    }
+    if (end) {
+        *end = (char *)s;
+    }
+    return negate ? (unsigned long)0 - v : v;
+}
+
+void *memchr(const void *p, int c, size_t n)
+{
+    const unsigned char *b = (const unsigned char *)p;
+    const unsigned char  want = (unsigned char)c;
+    for (size_t i = 0; i < n; ++i) {
+        if (b[i] == want) {
+            return (void *)(b + i);
+        }
+    }
+    return NULL;
 }
 
 int sscanf(const char *str, const char *fmt, ...)

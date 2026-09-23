@@ -1,0 +1,75 @@
+diff --git a/src/game_mouse.cc b/src/game_mouse.cc
+index a80ec3c..43ab953 100644
+--- a/src/game_mouse.cc
++++ b/src/game_mouse.cc
+@@ -285,6 +285,25 @@ bool _gmouse_clicked_on_edge = false;
+ // 0x518D9C
+ static int dword_518D9C = -1;
+ 
++// ARGON: what the hex cursor looked like the last time it was moved and the map
++// under it redrawn.  See the note in gameMouseRefresh below.
++//
++// Nine values and not two, because "the pointer has not moved" is not the same
++// question as "nothing about the cursor has changed": the mode changes the
++// shape, the elevation changes what is under it, and three other places in this
++// file move the same object.  Comparing where the object actually ended up
++// means anything that moves it invalidates this without having to know that
++// this exists.
++static int ag_hex_mouse_x = -1;
++static int ag_hex_mouse_y = -1;
++static int ag_hex_elevation = -1;
++static int ag_hex_mode = -1;
++static int ag_hex_fid = -1;
++static int ag_hex_flags = -1;
++static int ag_hex_tile = -1;
++static int ag_hex_sx = -1;
++static int ag_hex_sy = -1;
++
+ // 0x596C3C
+ static int gGameMouseActionMenuItems[GAME_MOUSE_ACTION_MENU_ITEM_COUNT];
+ 
+@@ -648,9 +667,41 @@ void gameMouseRefresh()
+         break;
+     }
+ 
+-    Rect r1;
+-    if (_gmouse_3d_move_to(mouseX, mouseY, gElevation, &r1) == 0) {
+-        tileWindowRefreshRect(&r1, gElevation);
++    // ARGON: only when something about the cursor has actually changed.
++    //
++    // _gmouse_3d_move_to returns 0 whether or not it moved anything, so this
++    // refreshed a piece of the isometric map on every single frame - floor,
++    // walls, objects, roof and light, re-rendered for a hex cursor sitting
++    // exactly where it already was.  On a PC that is free.  Measured on the S3
++    // with the ticker list timed, standing on a map with a pointer that had not
++    // moved once: gameMouseRefresh was 8.5 ms of a 22 ms frame, the largest
++    // single cost in the game and larger than the drawing.
++    //
++    // Nothing is lost by skipping it.  The cursor is an ordinary object in the
++    // list at its tile, so whoever else refreshes that rectangle - an
++    // animation, the palette cycle, a scroll - draws it again in its turn; this
++    // path is here to move it, and there is nothing to move.
++    if (mouseX != ag_hex_mouse_x || mouseY != ag_hex_mouse_y
++        || gElevation != ag_hex_elevation || gGameMouseMode != ag_hex_mode
++        || gGameMouseHexCursor->fid != ag_hex_fid
++        || gGameMouseHexCursor->flags != ag_hex_flags
++        || gGameMouseHexCursor->tile != ag_hex_tile
++        || gGameMouseHexCursor->sx != ag_hex_sx
++        || gGameMouseHexCursor->sy != ag_hex_sy) {
++        Rect r1;
++        if (_gmouse_3d_move_to(mouseX, mouseY, gElevation, &r1) == 0) {
++            tileWindowRefreshRect(&r1, gElevation);
++        }
++
++        ag_hex_mouse_x = mouseX;
++        ag_hex_mouse_y = mouseY;
++        ag_hex_elevation = gElevation;
++        ag_hex_mode = gGameMouseMode;
++        ag_hex_fid = gGameMouseHexCursor->fid;
++        ag_hex_flags = gGameMouseHexCursor->flags;
++        ag_hex_tile = gGameMouseHexCursor->tile;
++        ag_hex_sx = gGameMouseHexCursor->sx;
++        ag_hex_sy = gGameMouseHexCursor->sy;
+     }
+ 
+     if ((gGameMouseHexCursor->flags & OBJECT_HIDDEN) != 0 || _gmouse_mapper_mode != 0) {

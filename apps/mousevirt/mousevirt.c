@@ -53,6 +53,7 @@ typedef struct {
     uint8_t     rx_buf[PKT_SIZE];
     uint8_t     rx_n;
     uint8_t     pending_move;
+    ag_handle_t last_accept_err;
     uint8_t     listen_moaned; /* the failed-to-listen warning is said once */
 } mousevirt_state_t;
 
@@ -217,29 +218,53 @@ static void ensure_listen(mousevirt_state_t *st)
     ag_log(AG_LOG_INFO, "mousevirt", "listen :%u", (unsigned)MOUSEVIRT_PORT);
 }
 
+/*
+ * Take every connection that is waiting, not one per call.
+ *
+ * One host tool, and always the newest peer (same as pcmvirt/midivirt):
+ * rejecting while a half-closed zombie still sat in st->conn made the host see
+ * connect → WinError 10053 on every --reconnect attempt.  Taking only one per
+ * call has the same shape of fault a step earlier - a tool that retried while
+ * the guest booted leaves a queued connection per attempt, QEMU's forwarding
+ * having accepted them all, and the live socket is the last in that queue.
+ * One accepted per read means a frame each to work through the dead ones while
+ * the real pointer sits still.
+ */
 static void try_accept(mousevirt_state_t *st)
 {
     ag_handle_t peer;
+    int         spins = 0;
     ensure_listen(st);
     if (st->listen < 0) {
         return;
     }
-    peer = ag_tcp_accept(st->listen, 0u);
-    if (peer < 0) {
+    for (;;) {
+        peer = ag_tcp_accept(st->listen, 0u);
+        if (peer < 0) {
+            break;
+        }
+        if (st->conn >= 0) {
+            (void)ag_net_close(st->conn);
+        }
+        st->conn = peer;
+        st->rx_n = 0;
+        if (++spins >= 64) {
+            break;
+        }
+    }
+    if (spins == 0) {
+        /* -EAGAIN is nobody knocking, sixty times a second.  Anything else is
+         * a connection the driver failed to take, which is invisible from the
+         * host - it sees a socket that opened and a pointer that never moves. */
+        if (peer != (ag_handle_t)(-AG_EAGAIN) && peer != st->last_accept_err) {
+            st->last_accept_err = peer;
+            ag_log(AG_LOG_WARN, "mousevirt", "accept refused: %d", (int)peer);
+        }
         return;
     }
-    /*
-     * One host tool.  Always take the newest peer (same as pcmvirt/midivirt).
-     * Rejecting while a half-closed zombie still sat in st->conn made the host
-     * see connect → WinError 10053 on every --reconnect attempt.
-     */
-    if (st->conn >= 0) {
-        close_conn(st, "replaced by new peer");
-    }
-    st->conn = peer;
+    st->last_accept_err = 0;
     (void)ag_net_set_nonblock(st->conn, true);
-    st->rx_n = 0;
-    ag_log(AG_LOG_INFO, "mousevirt", "host connected");
+    ag_log(AG_LOG_INFO, "mousevirt", "host connected (%d waiting)", spins);
 }
 
 /* Non-blocking drain; closes st->conn on peer error/EOF. */

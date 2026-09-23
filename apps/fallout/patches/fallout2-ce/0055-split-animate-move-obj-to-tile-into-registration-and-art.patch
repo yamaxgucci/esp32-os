@@ -1,0 +1,53 @@
+diff --git a/src/interpreter_extra.cc b/src/interpreter_extra.cc
+--- a/src/interpreter_extra.cc
++++ b/src/interpreter_extra.cc
+@@ -48,6 +48,8 @@
+ /* ARGON: the breadcrumbs.  See port/ag_diag.h. */
+ #include "ag_diag.h"
+ 
++extern "C" uint32_t ag_us(void);
++
+ namespace fallout {
+ 
+ typedef enum ScriptError {
+@@ -1434,6 +1436,18 @@ static void opAnimateMoveObjectToTile(Program* program)
+         flags &= ~0x10;
+     }
+ 
++    /*
++     * ARGON: where this opcode spends a second.
++     *
++     * animate_move_obj_to_tile is 0x80CE, and the interpreter profile put
++     * a single call at 921 ms - the jolt while walking, from the wandering
++     * critters' timed scripts.  The path search inside it measures 3-24 ms
++     * in a quiet window, so the rest is either the registration or the art
++     * of the animation being locked (a critter animation is 116 KB).
++     */
++    const uint32_t ag_m0 = ag_us();
++    const unsigned ag_lock0 = ag_art_lock_us;
++
+     reg_anim_begin(ANIMATION_REQUEST_UNRESERVED);
+ 
+     if (flags == 0) {
+@@ -1442,7 +1456,21 @@ static void opAnimateMoveObjectToTile(Program* program)
+         animationRegisterRunToTile(object, tile, object->elevation, -1, 0);
+     }
+ 
++    const uint32_t ag_m1 = ag_us();
++
+     reg_anim_end();
++
++    {
++        const uint32_t took = ag_us() - ag_m0;
++
++        ag_move_op_us += took;
++        ag_move_op_n++;
++        if (took > ag_move_op_worst) {
++            ag_move_op_worst = took;
++            ag_move_op_worst_reg = ag_m1 - ag_m0;
++            ag_move_op_worst_art = ag_art_lock_us - ag_lock0;
++        }
++    }
+ }
+ 
+ // tile_in_tile_rect

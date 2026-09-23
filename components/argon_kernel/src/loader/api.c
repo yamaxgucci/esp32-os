@@ -48,6 +48,7 @@
 #include <argon/port/task.h>
 #include <argon/port/wifi.h>
 #include <argon/port/camera.h>
+#include <argon/port/flash.h>
 
 #include "dev/io.h"
 #include "net/espnow.h"
@@ -1109,6 +1110,111 @@ static ag_err_t api_power_declare(ag_power_fitness_t fitness, const char *why)
     return err;
 }
 
+/*
+ * Raw flash stores (ABI 0.45).
+ *
+ * A thin pass-through to the port, with one rule enforced here and nowhere
+ * else: only subtype 0x41 may be opened.  ag_port_part_find already refuses
+ * anything that is not a data partition, so the firmware is safe from a typo,
+ * but C: (littlefs, subtype 0x82) and nvs are data partitions too and an
+ * application that could erase those could wipe the machine's configuration.
+ * One comparison is the entire difference between "a store of my own" and
+ * "any storage on the machine".
+ */
+#define AG_STORE_SUBTYPE 0x41u
+
+static ag_store_t api_store_open(const char *label)
+{
+    if (label == NULL || *label == '\0') {
+        return NULL;
+    }
+
+    ag_port_part_t p = ag_port_part_find(label);
+
+    if (p == NULL || ag_port_part_subtype(p) != AG_STORE_SUBTYPE) {
+        return NULL;
+    }
+    return (ag_store_t)p;
+}
+
+static uint64_t api_store_bytes(ag_store_t s)
+{
+    return ag_port_part_size((ag_port_part_t)s);
+}
+
+static uint32_t api_store_erase_size(ag_store_t s)
+{
+    return ag_port_part_erase_size((ag_port_part_t)s);
+}
+
+/* Every call re-checks the handle: it came from an application, so it is a
+ * number the application can make up, and a made-up one must not reach the
+ * flash driver. */
+static bool store_ok(ag_store_t s)
+{
+    return s != NULL && ag_port_part_subtype((ag_port_part_t)s) == AG_STORE_SUBTYPE;
+}
+
+static ag_err_t api_store_read(ag_store_t s, uint64_t off, void *buf,
+                               size_t len)
+{
+    if (!store_ok(s) || buf == NULL) {
+        return AG_EINVAL;
+    }
+    return ag_port_part_read((ag_port_part_t)s, off, buf, len);
+}
+
+static ag_err_t api_store_write(ag_store_t s, uint64_t off, const void *buf,
+                                size_t len)
+{
+    if (!store_ok(s) || buf == NULL) {
+        return AG_EINVAL;
+    }
+    return ag_port_part_write((ag_port_part_t)s, off, buf, len);
+}
+
+static ag_err_t api_store_erase(ag_store_t s, uint64_t off, size_t len)
+{
+    if (!store_ok(s)) {
+        return AG_EINVAL;
+    }
+    return ag_port_part_erase((ag_port_part_t)s, off, len);
+}
+
+static ag_err_t api_store_map(ag_store_t s, uint64_t off, size_t len,
+                              const void **addr, ag_store_map_t *out)
+{
+    if (!store_ok(s) || addr == NULL || out == NULL) {
+        return AG_EINVAL;
+    }
+
+    ag_port_map_t h = 0;
+    const ag_err_t err = ag_port_part_map_data((ag_port_part_t)s, off, len,
+                                               addr, &h);
+
+    *out = (ag_store_map_t)h;
+    return err;
+}
+
+static void api_store_unmap(ag_store_map_t h)
+{
+    if (h != 0) {
+        ag_port_part_unmap((ag_port_map_t)h);
+    }
+}
+
+static const ag_store_api_t k_store = {
+    .size = sizeof(ag_store_api_t),
+    .open = api_store_open,
+    .bytes = api_store_bytes,
+    .erase_size = api_store_erase_size,
+    .read = api_store_read,
+    .write = api_store_write,
+    .erase = api_store_erase,
+    .map = api_store_map,
+    .unmap = api_store_unmap,
+};
+
 static const ag_power_api_t k_power = {
     .size = sizeof(ag_power_api_t),
     .status = api_power_status,
@@ -1690,6 +1796,7 @@ static const ag_api_t k_api = {
     .ble = NULL,
 #endif
     .power = &k_power,
+    .store = &k_store,
 #if AG_PORT_HAS_WIFIMON
     .wifimon = &k_wifimon,
 #else

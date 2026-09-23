@@ -516,6 +516,110 @@ static void test_case_insensitive(void)
     AG_CHECK_STR(real, "/tmp/Sega/rom.sms");
 }
 
+/* Number of refusals served from the table since the last call. */
+static uint32_t miss_hits(void)
+{
+    static uint32_t seen;
+    uint32_t        now = 0;
+    ag_vfs_miss_stats(&now, NULL);
+    const uint32_t delta = now - seen;
+    seen = now;
+    return delta;
+}
+
+static void test_negative_lookups(void)
+{
+    setup();
+    (void)miss_hits();
+
+    /* Asked twice, the second answer comes from memory. */
+    AG_CHECK_INT(ag_vfs_open("/tmp/absent.txt", NULL, AG_O_RDONLY), -AG_ENOENT);
+    AG_CHECK_INT(miss_hits(), 0);
+    AG_CHECK_INT(ag_vfs_open("/tmp/absent.txt", NULL, AG_O_RDONLY), -AG_ENOENT);
+    AG_CHECK_INT(miss_hits(), 1);
+
+    /* stat is served from the same table, and feeds it. */
+    ag_stat_t st;
+    AG_CHECK_INT(ag_vfs_stat("/tmp/absent.txt", NULL, &st), -AG_ENOENT);
+    AG_CHECK_INT(miss_hits(), 1);
+    AG_CHECK_INT(ag_vfs_stat("/tmp/nostat", NULL, &st), -AG_ENOENT);
+    AG_CHECK_INT(ag_vfs_stat("/tmp/nostat", NULL, &st), -AG_ENOENT);
+    AG_CHECK_INT(miss_hits(), 1);
+
+    /* Case is not part of the name here, so it is not part of the key. */
+    AG_CHECK_INT(ag_vfs_open("/tmp/ABSENT.TXT", NULL, AG_O_RDONLY), -AG_ENOENT);
+    AG_CHECK_INT(miss_hits(), 1);
+
+    /*
+     * One entry for a whole missing directory: the first name under it is
+     * asked, the rest are refused without the backend hearing about them.
+     */
+    uint32_t before = 0;
+    ag_vfs_miss_stats(NULL, &before);
+    AG_CHECK_INT(ag_vfs_open("/tmp/art/critters/a.frm", NULL, AG_O_RDONLY),
+                 -AG_ENOENT);
+    AG_CHECK_INT(miss_hits(), 0);
+    for (int i = 0; i < 20; i++) {
+        char path[64];
+        snprintf(path, sizeof(path), "/tmp/art/critters/%d.frm", i);
+        AG_CHECK_INT(ag_vfs_open(path, NULL, AG_O_RDONLY), -AG_ENOENT);
+    }
+    AG_CHECK_INT(miss_hits(), 20);
+    uint32_t after = 0;
+    ag_vfs_miss_stats(NULL, &after);
+    AG_CHECK_INT((int)(after - before), 1);
+
+    /* Creating the name forgets that it was ever missing. */
+    AG_CHECK_INT(write_file("/tmp/absent.txt", "here now"), AG_OK);
+    AG_CHECK_STR(read_file("/tmp/absent.txt"), "here now");
+    AG_CHECK_INT(miss_hits(), 0);
+
+    /* And so does making the directory that was not there. */
+    AG_CHECK_INT(ag_vfs_open("/tmp/art/critters/a.frm", NULL, AG_O_RDONLY),
+                 -AG_ENOENT);
+    AG_CHECK_INT(ag_vfs_mkdir("/tmp/art", NULL), AG_OK);
+    AG_CHECK_INT(ag_vfs_mkdir("/tmp/art/critters", NULL), AG_OK);
+    AG_CHECK_INT(write_file("/tmp/art/critters/a.frm", "sprite"), AG_OK);
+    AG_CHECK_STR(read_file("/tmp/art/critters/a.frm"), "sprite");
+
+    /* Unlinking is a change too: what was there is asked about again. */
+    AG_CHECK_INT(ag_vfs_open("/tmp/gone.txt", NULL, AG_O_RDONLY), -AG_ENOENT);
+    AG_CHECK_INT(ag_vfs_unlink("/tmp/absent.txt", NULL), AG_OK);
+    ag_vfs_miss_stats(NULL, &after);
+    AG_CHECK_INT((int)after, 0);
+    AG_CHECK_INT(ag_vfs_open("/tmp/absent.txt", NULL, AG_O_RDONLY), -AG_ENOENT);
+    AG_CHECK_INT(miss_hits(), 0);
+
+    /* A write open is never answered from the table: it may create the name. */
+    AG_CHECK_INT(ag_vfs_open("/tmp/absent.txt", NULL, AG_O_RDONLY), -AG_ENOENT);
+    AG_CHECK_INT(miss_hits(), 1);
+    AG_CHECK_INT(write_file("/tmp/absent.txt", "again"), AG_OK);
+    AG_CHECK_STR(read_file("/tmp/absent.txt"), "again");
+}
+
+static void test_volatile_mount_is_not_remembered(void)
+{
+    setup();
+    AG_CHECK_INT(ag_vfs_unmount("/sys"), AG_OK);
+    AG_CHECK_INT(ag_vfs_mount("/sys", ag_ramfs_ops(), g_sys,
+                              AG_MOUNT_VOLATILE),
+                 AG_OK);
+    (void)miss_hits();
+
+    /*
+     * /dev grows when a driver loads and /host is edited in another window.
+     * Nothing on such a mount is worth remembering, because the answer can
+     * change with nobody here to notice.
+     */
+    for (int i = 0; i < 3; i++) {
+        AG_CHECK_INT(ag_vfs_open("/sys/absent", NULL, AG_O_RDONLY), -AG_ENOENT);
+    }
+    AG_CHECK_INT(miss_hits(), 0);
+    uint32_t entries = 1;
+    ag_vfs_miss_stats(NULL, &entries);
+    AG_CHECK_INT((int)entries, 0);
+}
+
 void run_vfs_tests(void)
 {
     test_mounting();
@@ -534,6 +638,8 @@ void run_vfs_tests(void)
     test_bad_handles();
     test_budget();
     test_case_insensitive();
+    test_negative_lookups();
+    test_volatile_mount_is_not_remembered();
 
     /* Leave nothing mounted for whatever runs next. */
     ag_vfs_init(NULL);

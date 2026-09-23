@@ -15,13 +15,64 @@
 #include "argon/log.h"
 #include "argon/proc.h"
 
+#include <argon/port/time.h>
+
 #define TAG "audio"
 
+/*
+ * How far ahead of the sound a writer may get, in frames.  A real output has a
+ * buffer and so does this one; at 22 kHz, 4096 frames is 186 ms, which is more
+ * than any frame of any program here takes and small enough that stopping the
+ * program stops the sound.
+ */
+#define AG_PCMNULL_DEPTH 4096u
+
 static ag_device_t    *s_dev;
+/*
+ * Where api->audio actually writes, which for most of this file's life was
+ * s_dev and nothing else - the mute sink, unconditionally.
+ *
+ * That was right when it was written: there were no real outputs, and a
+ * convenience alias for the discard stub is an honest thing to offer.  It has
+ * not been right for a while.  /dev/pcmmix arrived, picks the best real output
+ * there is and falls back to pcmnull when there is none, and every application
+ * that reached for the convenient API instead of opening a /dev node by hand
+ * went on being silent on hardware that could play - silently, because a mute
+ * sink and a working one are indistinguishable from above.  Fallout 2 is the
+ * one that made it visible, but nothing about it is Fallout's.
+ *
+ * So the alias now means "the audio output", and the choice is made at open
+ * because that is when the answer is knowable: a .SYS loaded after boot may
+ * have brought one.  The pacing above stays exactly as it was - a clock, not
+ * the sink's opinion - so an application still cannot outrun real time even
+ * when the sink accepts everything instantly.
+ */
+static ag_device_t    *s_out;
+static void           *s_out_session;
 static int            s_api_held; /* api->audio holds exclusive open */
 static int            s_fmt_set;
 static ag_audio_fmt_t s_fmt;
 static ag_pid_t       s_owner = AG_PID_KERNEL;
+
+/*
+ * The mute output still takes a second to play a second.
+ *
+ * It used to accept everything the instant it was offered and report 4096
+ * frames of room for ever, which is not a device - it is an infinitely fast
+ * one, and no such thing exists to be muted.  Programs pace themselves by the
+ * room their output reports, so against this one they ran their mixer as fast
+ * as the processor allowed.  Fallout 2 streams its music from the card, and
+ * with a null sink it read that music at 500 KB a second to play 88 KB of it -
+ * six times over, and eighteen milliseconds of every frame, on a machine where
+ * the frame was fifty.  Every measurement of anything with sound in it was
+ * wrong by that much.
+ *
+ * So the sink keeps a clock.  Frames written are counted, frames the sample
+ * rate says have been consumed since the device was opened are counted, and
+ * the room reported is the difference against a fixed depth.
+ */
+static uint64_t s_open_us;
+static uint64_t s_frames_written;
 
 static void default_fmt(ag_audio_fmt_t *out)
 {
@@ -144,7 +195,7 @@ static int audio_present(void)
 
 static int audio_is_hw(void)
 {
-    return 0;
+    return (s_api_held && s_out != NULL && s_out != s_dev) ? 1 : 0;
 }
 
 static ag_err_t audio_open(const ag_audio_fmt_t *fmt)
@@ -161,23 +212,55 @@ static ag_err_t audio_open(const ag_audio_fmt_t *fmt)
     if (err != AG_OK) {
         return err;
     }
-    err = ag_dev_open(s_dev, AG_O_WRONLY);
-    if (err != AG_OK) {
-        return err;
+
+    /*
+     * The mixer, when there is one, so that this shares the output with
+     * anything else playing instead of taking it exclusively - and so that
+     * whichever real sink is installed is its problem and not this file's.
+     */
+    s_out = ag_dev_find("pcmmix");
+    if (s_out == NULL) {
+        s_out = s_dev;
     }
+    s_out_session = NULL;
+    err = ag_dev_open2(s_out, AG_O_WRONLY, &s_out_session);
+    if (err != AG_OK) {
+        /* A busy or broken mixer is no reason not to run: fall back to mute. */
+        if (s_out != s_dev) {
+            ag_log(AG_LOG_WARN, TAG, "pcmmix: %d; playing to pcmnull",
+                   (int)err);
+            s_out = s_dev;
+            s_out_session = NULL;
+            err = ag_dev_open2(s_out, AG_O_WRONLY, &s_out_session);
+        }
+        if (err != AG_OK) {
+            s_out = NULL;
+            return err;
+        }
+    }
+    if (s_out != s_dev) {
+        (void)ag_dev_ioctl2(s_out, s_out_session, AG_IOC_AUDIO_SETFMT, &s_fmt,
+                            sizeof(s_fmt));
+    }
+
     s_api_held = 1;
-    ag_log(AG_LOG_INFO, TAG, "pcmnull open %u Hz %u ch (discard)",
-           (unsigned)s_fmt.rate, (unsigned)s_fmt.channels);
+    s_open_us = ag_port_us();
+    s_frames_written = 0;
+    ag_log(AG_LOG_INFO, TAG, "api->audio open %u Hz %u ch -> %s (paced)",
+           (unsigned)s_fmt.rate, (unsigned)s_fmt.channels,
+           (s_out == s_dev) ? "pcmnull (discard)" : "pcmmix");
     return AG_OK;
 }
 
 static void audio_close(void)
 {
-    if (!s_api_held || s_dev == NULL) {
+    if (!s_api_held || s_out == NULL) {
         return;
     }
     s_api_held = 0;
-    (void)ag_dev_close(s_dev);
+    (void)ag_dev_close2(s_out, s_out_session);
+    s_out = NULL;
+    s_out_session = NULL;
 }
 
 static int32_t audio_write_pcm(const int16_t *pcm, int32_t frames)
@@ -185,20 +268,35 @@ static int32_t audio_write_pcm(const int16_t *pcm, int32_t frames)
     size_t  bytes;
     int32_t n;
 
-    if (!s_api_held || pcm == NULL || frames <= 0 || !s_fmt_set) {
+    if (!s_api_held || s_out == NULL || pcm == NULL || frames <= 0 ||
+        !s_fmt_set) {
         return -AG_EINVAL;
     }
     bytes = (size_t)frames * (size_t)s_fmt.channels * sizeof(int16_t);
-    n = pcm_write(s_dev, pcm, bytes, 0);
+    n = ag_dev_write2(s_out, s_out_session, pcm, bytes, 0);
     if (n < 0) {
         return n;
     }
-    return (int32_t)((size_t)n / (sizeof(int16_t) * (size_t)s_fmt.channels));
+    n = (int32_t)((size_t)n / (sizeof(int16_t) * (size_t)s_fmt.channels));
+    s_frames_written += (uint64_t)n;
+    return n;
 }
 
 static int32_t audio_space(void)
 {
-    return s_api_held ? 4096 : 0;
+    if (!s_api_held || !s_fmt_set) {
+        return 0;
+    }
+    {
+        const uint64_t elapsed = ag_port_us() - s_open_us;
+        const uint64_t played = elapsed * (uint64_t)s_fmt.rate / 1000000u;
+        const uint64_t ahead =
+            (s_frames_written > played) ? s_frames_written - played : 0u;
+        if (ahead >= AG_PCMNULL_DEPTH) {
+            return 0;
+        }
+        return (int32_t)(AG_PCMNULL_DEPTH - ahead);
+    }
 }
 
 const ag_audio_api_t ag_audio_api_table = {

@@ -1,0 +1,205 @@
+diff --git a/src/draw.cc b/src/draw.cc
+--- a/src/draw.cc
++++ b/src/draw.cc
+@@ -7,6 +7,46 @@
+ 
+ namespace fallout {
+ 
++/*
++ * ARGON: a picture that was never loaded is drawn as nothing, not as a crash.
++ *
++ * 16 September 2026, in the middle of Maxim playing: a random encounter on
++ * the world map ended the session with
++ *
++ *   CACHE: ? (key 100663637) would not load - 980 of 1000 KB in the cache is
++ *          in use, 54 entries
++ *   [fault] app pc=... addr=0x00000000 cause=28 (read from an invalid address)
++ *
++ * and the faulting address resolved to transSrcCopy, nineteen bytes in.  The
++ * art cache could not find room for one interface frame, artLock answered
++ * null as it is supposed to, and the caller handed that null straight to a
++ * blit.  Somewhere among the sixty-odd callers of these two functions is one
++ * that does not check, and finding it by reading is a search of the whole
++ * engine; every one of them, though, is drawing a picture, and a picture that
++ * could not be loaded has exactly one correct appearance: absent.
++ *
++ * So the check goes here, where every path passes, and it is counted rather
++ * than hidden - a sprite that silently fails to draw is a bug report too, and
++ * the report prints the count and the last size asked for.
++ */
++extern "C" {
++unsigned ag_blit_null_n;
++unsigned ag_blit_null_w, ag_blit_null_h;
++}
++
++static inline bool ag_blit_ok(const void* dest, const void* src, int width,
++    int height)
++{
++    if (dest != nullptr && src != nullptr) {
++        return true;
++    }
++    ag_blit_null_n++;
++    ag_blit_null_w = (unsigned)width;
++    ag_blit_null_h = (unsigned)height;
++    return false;
++}
++
++
+ // 0x4D2FC0
+ void bufferDrawLine(unsigned char* buf, int pitch, int x1, int y1, int x2, int y2, int color)
+ {
+@@ -151,6 +191,11 @@ void bufferDrawRectShadowed(unsigned char* buf, int pitch, int left, int top, in
+ // 0x4D33F0
+ void blitBufferToBufferStretch(const unsigned char* src, int srcWidth, int srcHeight, int srcPitch, unsigned char* dest, int destWidth, int destHeight, int destPitch)
+ {
++    if (src == nullptr || dest == nullptr) {
++        ag_blit_null_n++;
++        return;
++    }
++
+     int stepX = (destWidth << 16) / srcWidth;
+     int stepY = (destHeight << 16) / srcHeight;
+ 
+@@ -178,6 +223,11 @@ void blitBufferToBufferStretch(const unsigned char* src, int srcWidth, int srcHe
+ // 0x4D3560
+ void blitBufferToBufferStretchTrans(const unsigned char* src, int srcWidth, int srcHeight, int srcPitch, unsigned char* dest, int destWidth, int destHeight, int destPitch)
+ {
++    if (src == nullptr || dest == nullptr) {
++        ag_blit_null_n++;
++        return;
++    }
++
+     int stepX = (destWidth << 16) / srcWidth;
+     int stepY = (destHeight << 16) / srcHeight;
+ 
+@@ -313,6 +363,10 @@ void bufferOutline(unsigned char* buf, int width, int height, int pitch, int col
+ // 0x4E0DB0
+ void srcCopy(unsigned char* dest, int destPitch, const unsigned char* src, int srcPitch, int width, int height)
+ {
++    if (!ag_blit_ok(dest, src, width, height)) {
++        return;
++    }
++
+     for (int y = 0; y < height; y++) {
+         memcpy(dest, src, width);
+         dest += destPitch;
+@@ -323,6 +377,10 @@ void srcCopy(unsigned char* dest, int destPitch, const unsigned char* src, int s
+ // 0x4E0ED5
+ void transSrcCopy(unsigned char* dest, int destPitch, const unsigned char* src, int srcPitch, int width, int height)
+ {
++    if (!ag_blit_ok(dest, src, width, height)) {
++        return;
++    }
++
+     int destSkip = destPitch - width;
+     int srcSkip = srcPitch - width;
+ 
+diff --git a/src/worldmap.cc b/src/worldmap.cc
+--- a/src/worldmap.cc
++++ b/src/worldmap.cc
+@@ -51,6 +51,9 @@
+ #include "tile.h"
+ #include "window_manager.h"
+ 
++/* The microsecond clock, as the other instrumented files take it. */
++extern "C" uint32_t ag_us(void);
++
+ namespace fallout {
+ 
+ #define CITY_NAME_SIZE (40)
+@@ -3473,8 +3476,16 @@ static int wmWorldMapFunc(int a1)
+                 }
+             }
+ 
+-            wmInterfaceRefresh();
+-
++            /*
++             * ARGON: one refresh a step, not two.
++             *
++             * This one used to run here, and then wmMarkSubTileRadiusVisited
++             * changed which subtiles are dimmed and the refresh below drew
++             * the whole world map again - with nothing presented in between,
++             * so the first one's pixels never reached the glass.  A refresh
++             * is the most expensive thing on this screen; doing it twice a
++             * step is half the cost of travelling.
++             */
+             if (getTicksBetween(now, partyHealTime) > 1000) {
+                 if (_partyMemberRestingHeal(3)) {
+                     interfaceRenderHitPoints(false);
+@@ -5546,12 +5557,38 @@ static int wmTileGrabArt(int tileIdx)
+ }
+ 
+ // 0x4C3830
++/*
++ * ARGON: what one refresh of the world map costs, in four parts.
++ *
++ * Maxim, 16 September 2026: "перемещение на карте мира очень тормозит".  This
++ * function is four different things and it was one number:
++ *
++ *   tiles    the 450x443 view copied out of the world map's 350x300 tiles
++ *   dim      hiding unknown subtiles and dimming unvisited ones, per pixel
++ *            over a 7x6 grid of subtiles per tile
++ *   overlay  wmRefreshInterfaceOverlay: the whole 640x480 interface frame
++ *            blitted again THROUGH A TRANSPARENCY TEST, plus the tabs, the
++ *            dial and the date
++ *   window   windowRefresh of all 640x480: composed into the screen surface
++ *            and converted into the panel
++ *
++ * The last two do not depend on the party having moved at all, which is the
++ * first thing to check once there are numbers.
++ */
++extern "C" {
++unsigned ag_wm_calls;
++unsigned ag_wm_tiles_us, ag_wm_dim_us, ag_wm_overlay_us;
++unsigned ag_wm_tiles_worst, ag_wm_dim_worst, ag_wm_overlay_worst;
++}
++
+ static int wmInterfaceRefresh()
+ {
+     if (wmInterfaceWasInitialized != 1) {
+         return 0;
+     }
+ 
++    const uint32_t ag_w0 = ag_us();
++
+     int v17 = wmWorldOffsetX % WM_TILE_WIDTH;
+     int v18 = wmWorldOffsetY % WM_TILE_HEIGHT;
+     int v20 = WM_TILE_HEIGHT - v18;
+@@ -5610,6 +5647,8 @@ static int wmInterfaceRefresh()
+         y += height;
+     }
+ 
++    const uint32_t ag_w1 = ag_us();
++
+     // Render cities.
+     for (int index = 0; index < wmMaxAreaNum; index++) {
+         CityInfo* cityInfo = &(wmAreaInfoList[index]);
+@@ -5690,10 +5729,28 @@ static int wmInterfaceRefresh()
+         v30 += v29;
+     }
+ 
++    const uint32_t ag_w2 = ag_us();
++
+     wmDrawCursorStopped();
+ 
+     wmRefreshInterfaceOverlay(true);
+ 
++    const uint32_t ag_w3 = ag_us();
++
++    ag_wm_calls++;
++    ag_wm_tiles_us += ag_w1 - ag_w0;
++    ag_wm_dim_us += ag_w2 - ag_w1;
++    ag_wm_overlay_us += ag_w3 - ag_w2;
++    if (ag_w1 - ag_w0 > ag_wm_tiles_worst) {
++        ag_wm_tiles_worst = ag_w1 - ag_w0;
++    }
++    if (ag_w2 - ag_w1 > ag_wm_dim_worst) {
++        ag_wm_dim_worst = ag_w2 - ag_w1;
++    }
++    if (ag_w3 - ag_w2 > ag_wm_overlay_worst) {
++        ag_wm_overlay_worst = ag_w3 - ag_w2;
++    }
++
+     return 0;
+ }
+ 

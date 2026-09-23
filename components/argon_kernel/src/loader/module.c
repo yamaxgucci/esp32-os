@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <argon/budget.h>
 #include <argon/cfg.h>
 #include <argon/device.h>
 #include <argon/kernel.h>
@@ -77,6 +78,7 @@ static void module_task_entry(void *arg)
     modtask_t *t = (modtask_t *)arg;
 
     t->fn(t->arg);
+    ag_budget_forget(t->task);
     t->running = false;
     ag_port_task_delete(NULL);
 }
@@ -124,11 +126,17 @@ bool ag_module_task(void (*fn)(void *), void *arg, const char *name,
      * real work there is a second runnable task on the one core that is already
      * busy - which cost the game half its frame rate before the screen driver
      * asked for the system core instead.
-     *
+     */
+    /*
+     * The same three cases an application's thread gets, and for the same
+     * reason - but this used to be two, and the missing one was the default.
      * AG_THREAD_APP_CORE is zero, so "put me on the application core" and "no
-     * flags at all" arrive here identically, and both must pin: an earlier
-     * version let them fall through to no affinity, and every measurement taken
-     * on the strength of that request was measuring an unknown core.
+     * flags at all" arrive here identically, and both fell through to no
+     * affinity: a module that asked for the app core was pinned to neither,
+     * and every measurement taken on the strength of that request was
+     * measuring an unknown core.  Found on 5 September 2026 while hunting the
+     * driver task that starved the game, when a probe said the application
+     * core was idle and could not have known.
      */
     int core;
     if (flags & AG_THREAD_ANY_CORE) {
@@ -148,13 +156,16 @@ bool ag_module_task(void (*fn)(void *), void *arg, const char *name,
                (unsigned)stack);
         return false;
     }
+
     /*
-     * What is deliberately not here: the thread budget that watches a driver
-     * task asking for a priority above the applications and drops it below them
-     * when it overruns.  That lives on `worktree-fallout-cxx` with argon/budget.h
-     * and has not landed here; until it does, a driver above priority 5 can
-     * starve the foreground application and nothing will say so.
+     * Above the applications is a promise to hand the core straight back, and
+     * this is where the promise gets a number attached to it.  A driver that
+     * asked for 5 or less cannot starve an application and is not watched; one
+     * that asked for more is charged from the system tick and dropped below
+     * them if it overruns.  See argon/budget.h for what this cost the game.
      */
+    ag_budget_watch(slot->task, (name != NULL) ? name : "moddrv",
+                    (unsigned)((priority > 0) ? priority : 5), 0);
     return true;
 }
 

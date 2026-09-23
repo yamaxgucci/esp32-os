@@ -62,6 +62,8 @@ param(
     [string]$RadioScript = 'rlinkd.py',
     [switch]$NoNet,
     [int]$NetPort = 5558,
+    # PSRAM the emulated part carries: 8 (default, the smaller module) or 16.
+    [int]$Psram = 8,
     # Open QEMU's virtual RGB panel, so a graphical application can be
     # photographed with tools\grab-window.ps1 while it runs.  Without this the
     # emulator has no window at all and the soft framebuffer goes nowhere a
@@ -188,7 +190,7 @@ if ($Radio) {
 # wait=on is essential: a TCP serial port with no peer throws its output away,
 # and the whole boot is over in a quarter of a second.  Without it the test
 # races the emulator and loses often enough to be useless.
-$qemuArgs = (Get-QemuMachineArgs -EfusePath $efuse -Graphics:$Gfx) + @(
+$qemuArgs = (Get-QemuMachineArgs -EfusePath $efuse -PsramMb $Psram -Graphics:$Gfx) + @(
     '-display', $(if ($Gfx) { 'sdl' } else { 'none' })
     '-monitor', 'none'
     '-serial', "tcp:127.0.0.1:$Port,server=on,wait=on"
@@ -279,6 +281,13 @@ if ($ourImage) {
 # QEMU's own chatter goes to a file: it is not part of what the board said,
 # and PowerShell renders anything on stderr as an error.
 $qemuOut = 'build\qemu-emulator.log'
+# An escape hatch for debugging, and the only way to attach one: ARGON_QEMU_EXTRA
+# is split on spaces and appended, so `-s` puts a gdb stub on :1234 and `-S`
+# holds the machine until the debugger says go.
+if ($env:ARGON_QEMU_EXTRA) {
+    $qemuArgs += ($env:ARGON_QEMU_EXTRA -split ' ' | Where-Object { $_ -ne '' })
+}
+
 $proc = Start-Process -FilePath $qemu -ArgumentList $qemuArgs -NoNewWindow `
     -PassThru -RedirectStandardOutput $qemuOut -RedirectStandardError "$qemuOut.err"
 
@@ -326,6 +335,44 @@ if ($Gfx) {
 }
 
 $text = New-Object System.Text.StringBuilder
+$nextFlush = [datetime]::MinValue
+
+# Byte for byte, through Latin-1: every byte of the line was appended as the
+# character of the same number, and Latin-1 is the encoding that turns it back
+# into that byte.  WriteAllText's UTF-8 would encode anything above 0x7f as two
+# bytes, which was invisible while the guest only ever said ASCII and turned
+# every Cyrillic character into mojibake the moment it did not.
+#
+# One handle, opened for sharing, rather than WriteAllText each time.  The
+# transcript is now rewritten once a second and something is usually watching
+# it; WriteAllText opens the file exclusively, so a reader that happened to
+# have it open killed the run - which is a poor way to be told that somebody
+# was reading the log.
+$script:logStream = $null
+
+function Write-Transcript {
+    if ($null -eq $script:logStream) {
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $LogPath) |
+            Out-Null
+        $script:logStream = New-Object System.IO.FileStream(
+            (Join-Path (Get-Location) $LogPath),
+            [System.IO.FileMode]::Create,
+            [System.IO.FileAccess]::Write,
+            [System.IO.FileShare]::ReadWrite)
+    }
+    $bytes = [System.Text.Encoding]::GetEncoding(28591).GetBytes($text.ToString())
+    $script:logStream.Position = 0
+    $script:logStream.Write($bytes, 0, $bytes.Length)
+    $script:logStream.SetLength($bytes.Length)
+    $script:logStream.Flush()
+}
+
+# Emptied before the run, not only written after it.  Until the guest says
+# anything the file still held the *previous* run's transcript, and every check
+# made against it in the meantime - by a person or by a script waiting for a
+# marker - was answered about a run that had already finished.
+Write-Transcript
+
 $client = $null
 $stream = $null
 $found = $false
@@ -370,6 +417,17 @@ try {
                 [void]$keep.Append([char]$b)
             }
             [void]$text.Append($keep.ToString())
+        }
+        # Write what we have, at most once a second.
+        #
+        # The transcript used to appear only when the run ended, which is fine
+        # for a boot test that takes twenty seconds and useless for a game that
+        # takes fifteen minutes: for all of them there was no way to see what
+        # the guest was doing except to wait for it to stop.  A second's
+        # granularity costs nothing and makes `tail` work.
+        if ((Get-Date) -gt $script:nextFlush) {
+            $script:nextFlush = (Get-Date).AddSeconds(1)
+            Write-Transcript
         }
         $s = $text.ToString()
         $count = 0
@@ -721,17 +779,11 @@ try {
 
     # Written here, not after the try: a run that failed is the run whose
     # transcript is worth having, and a throw would have skipped it.
-    #
-    # Byte for byte, through Latin-1: every byte of the line was appended as the
-    # character of the same number, and Latin-1 is the encoding that turns it back
-    # into that byte.  WriteAllText's UTF-8 would encode anything above 0x7f as
-    # two bytes, which was invisible while the guest only ever said ASCII and
-    # turned every Cyrillic character into mojibake the moment it did not.
-    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $LogPath) |
-        Out-Null
-    [System.IO.File]::WriteAllText((Join-Path (Get-Location) $LogPath),
-                                   $text.ToString(),
-                                   [System.Text.Encoding]::GetEncoding(28591))
+    Write-Transcript
+    if ($null -ne $script:logStream) {
+        $script:logStream.Dispose()
+        $script:logStream = $null
+    }
 }
 
 if ($found) {

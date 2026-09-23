@@ -1152,6 +1152,26 @@ enum ag_ioctl_cmd {
      */
     AG_IOC_DISPLAY_BACKLIGHT = AG_IOC(AG_DEV_DISPLAY, 1),
 
+    /*
+     * Optional: arg is a pointer to an int, non-zero to let the driver send
+     * only the part of a rectangle that differs from what it believes the
+     * screen already has.
+     *
+     * It exists to be turned *off*.  A driver at the end of a wire keeps a
+     * record of the far end so that a screen which has not changed costs
+     * nothing, and that record is the only piece of state in the whole path
+     * that can be wrong: when it says the far end has a block it does not, the
+     * picture stays wrong until some slow repair reaches it.  Turning the
+     * trimming off sends every rectangle whole - one full screen is a quarter
+     * of a second of a four megabaud line, and it cannot be wrong.  That is
+     * the floor to measure everything else against, and the answer when a
+     * picture is misbehaving and nobody knows whose fault it is.
+     *
+     * A driver that always sends everything anyway answers -AG_ENOTSUP, which
+     * is not an error - it is the answer.
+     */
+    AG_IOC_DISPLAY_TRIM = AG_IOC(AG_DEV_DISPLAY, 2),
+
     AG_IOC_AUDIO_GETFMT = AG_IOC(AG_DEV_AUDIO, 1),
     AG_IOC_AUDIO_SETFMT = AG_IOC(AG_DEV_AUDIO, 2),
     /* Optional: arg ag_audio_stats_t (pcmvirt/pcmmix; pcmnull returns zeros). */
@@ -1314,6 +1334,46 @@ typedef struct ag_io_api {
      * once, before the first transfer to that chip.
      */
     ag_err_t (*spi_config)(int bus, int cs, uint32_t khz);
+
+    /*
+     * ABI 0.44: the same port, driven by the UART's own DMA.
+     *
+     * uart_write is a thread copying into a ring and waking whenever the
+     * peripheral has room, which is right for a console and wrong for a
+     * picture: a hundred and fifty kilobytes a frame is eighty wake-ups, and
+     * on a busy board that left the wire half idle - 172 KB/s carried of a
+     * possible 400 while a game ran.  dma_write hands the buffer to the
+     * hardware once and returns when the last byte has gone.
+     *
+     * dma_ready says whether this chip and port can: the original ESP32 and
+     * the S2 have no UHCI, and a caller must keep the ordinary write for them.
+     * The buffer may be in extended memory where the hardware allows it, but
+     * alignment is checked and refused rather than worked around - -AG_EINVAL
+     * means "give me an aligned buffer", not "it did not work".
+     *
+     * The two are different masters of one transmitter: do not have a write
+     * in flight on the same port when this is called.
+     */
+    /*
+     * Wait until everything given to this port has left it.  Not a flush -
+     * that word is taken by the call that throws away what has *arrived* -
+     * but the handover between the two masters of one transmitter: whoever
+     * mixes uart_write with uart_dma_write calls this in between.
+     */
+    ag_err_t (*uart_tx_wait)(int port, uint32_t timeout_ms);
+    bool (*uart_dma_ready)(int port);
+    int32_t (*uart_dma_write)(int port, const void *buf, size_t len);
+
+    /*
+     * The same in two halves, for a caller with more than one thing to send:
+     * submit hands a buffer to the hardware and returns, drain waits for
+     * everything still out.  Waiting for each transfer in turn leaves the wire
+     * idle between them - about a quarter of a frame, measured - because the
+     * next one cannot start until a task has been scheduled to start it.  The
+     * buffers stay the hardware's until drain returns.
+     */
+    int32_t (*uart_dma_submit)(int port, const void *buf, size_t len);
+    ag_err_t (*uart_dma_drain)(int port);
 } ag_io_api_t;
 
 /* ------------------------------------------------------------------------ */
@@ -2270,6 +2330,85 @@ typedef struct ag_cam_api {
 
 /* ------------------------------------------------------------------------ */
 /* Root table                                                               */
+
+/* ------------------------------------------------------------------------ */
+/* Raw flash stores                                                         */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * A partition an application may use as its own storage, with no filesystem
+ * in the way: it reads, writes and erases bytes at offsets, and it may ask
+ * for a span to appear in the address space so that reading costs a load
+ * instruction instead of a call.
+ *
+ * This exists because a game's art, a synthesiser's samples and a logger's
+ * ring all want the same thing - a few megabytes of flash that survive a
+ * reboot and can be read without copying - and none of them wants a
+ * filesystem's directories, names or write amplification.
+ *
+ * Only partitions of type data with subtype 0x41 can be opened.  That is
+ * deliberate and it is the whole safety story: C: (littlefs), nvs and the
+ * firmware itself are all excluded, so a wrong label cannot destroy the
+ * machine's configuration or the OS.  Add a store to the partition table to
+ * create one; see partitions_16mb.csv.
+ *
+ * What the hardware costs, because it decides how a store may be used:
+ *
+ *   - reading is cheap, and mapped reading is nearly free: the bytes go
+ *     through the same cache the processor's own code does.
+ *   - writing needs the sector erased first, tens of milliseconds for each
+ *     4 KB, and on this class of part the cache is DISABLED while an erase or
+ *     a program runs.  Everything executing from flash stops for that time.
+ *
+ * So a store is filled at a moment the program is already standing still - a
+ * level load, a startup, an explicit save - and read during the parts that
+ * have to be smooth.  A write in an animation loop will be visible as a
+ * freeze, and no amount of buffering hides it.
+ */
+typedef const void *ag_store_t;     /* an open store, NULL when there is none */
+typedef uintptr_t   ag_store_map_t; /* a live mapping, 0 when there is none   */
+
+typedef struct ag_store_api {
+    uint32_t size;
+
+    /*
+     * Open the store with this label, or NULL when the partition table has no
+     * such raw store.  The handle is a description, not a lock: opening the
+     * same store twice is allowed and the two callers share the bytes.
+     */
+    ag_store_t (*open)(const char *label);
+
+    /* Bytes in the store, and the granularity erase() works in (4096 here). */
+    uint64_t (*bytes)(ag_store_t s);
+    uint32_t (*erase_size)(ag_store_t s);
+
+    ag_err_t (*read)(ag_store_t s, uint64_t off, void *buf, size_t len);
+
+    /*
+     * Write bytes that have already been erased.  Flash only clears bits, so
+     * writing over live data without erasing first gives the AND of the two,
+     * silently: erase the span, then write it.
+     */
+    ag_err_t (*write)(ag_store_t s, uint64_t off, const void *buf, size_t len);
+
+    /* Erase whole sectors.  off and len must be multiples of erase_size(). */
+    ag_err_t (*erase)(ag_store_t s, uint64_t off, size_t len);
+
+    /*
+     * Put a span in the address space, read only, and hand back a pointer to
+     * it.  Nothing is copied and no memory is spent: the pointer reaches
+     * flash through the cache.
+     *
+     * It can fail even when the store is fine - the address window for mapped
+     * flash is finite and shared with everything else mapped - so a caller
+     * that needs to work either way should fall back to read() rather than
+     * treat AG_ERR_NOMEM as fatal.  Unmap what is no longer needed.
+     */
+    ag_err_t (*map)(ag_store_t s, uint64_t off, size_t len, const void **addr,
+                    ag_store_map_t *out);
+    void (*unmap)(ag_store_map_t h);
+} ag_store_api_t;
+
 /* ------------------------------------------------------------------------ */
 
 typedef struct ag_api {
@@ -2316,8 +2455,11 @@ typedef struct ag_api {
     /* ABI 0.41+: the DVP camera transport - NULL without
      * CONFIG_ARGON_ENABLE_CAMERA. */
     const ag_cam_api_t *cam;
-} ag_api_t;
 
+    /* ABI 0.45+: raw flash stores.  Never NULL, but open() answers NULL on a
+     * machine whose partition table declares no store. */
+    const ag_store_api_t *store;
+} ag_api_t;
 /* ------------------------------------------------------------------------ */
 /* Executable image header                                                  */
 /* ------------------------------------------------------------------------ */

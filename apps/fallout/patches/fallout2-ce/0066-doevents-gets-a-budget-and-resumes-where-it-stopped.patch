@@ -1,0 +1,82 @@
+diff --git a/src/interpreter.cc b/src/interpreter.cc
+--- a/src/interpreter.cc
++++ b/src/interpreter.cc
+@@ -21,6 +21,9 @@
+ #include "ag_diag.h"
+ 
+ extern "C" uint32_t ag_us(void);
++extern "C" int ag_events_budget_us;
++extern "C" unsigned ag_events_split, ag_events_passes;
++static int ag_ev_resume;
+ 
+ namespace fallout {
+ 
+@@ -3017,9 +3020,48 @@ static void _doEvents()
+         return;
+     }
+ 
++    /*
++     * ARGON: every frame, every program, every conditional procedure - and
++     * each condition is a run of the interpreter.
++     *
++     * Measured on the board: 88 live programs, 1559 microseconds of every
++     * frame in here against 683 for running all 88 programs, and in the
++     * worst call 32227 of 32908 microseconds - ninety-eight per cent.
++     * This is the largest single thing left in a frame and it is polling.
++     *
++     * Nothing about it needs to finish inside one frame: a condition that
++     * has become true fires a frame or two later instead of immediately,
++     * which at fifty-seven frames a second is tens of milliseconds.  So the
++     * walk is given a budget and resumes where it stopped, exactly as the
++     * thirty-second map update was given one (913 ms in a single frame
++     * before that).
++     *
++     * The cursor is a COUNT, not a pointer: programs exit and their nodes
++     * are freed between frames, and a pointer kept across one would be a
++     * use-after-free the first time a script ended.
++     *
++     * -events 0 turns the budget off and polls everything every frame, the
++     * way it was.
++     */
++    const uint32_t ag_ev_began = ag_us();
++    int            ag_ev_index = 0;
++
+     programListNode = gInterpreterProgramListHead;
+     time = 1000 * _timerFunc() / _timerTick;
+ 
++    if (ag_events_budget_us > 0) {
++        while (ag_ev_index < ag_ev_resume && programListNode != nullptr) {
++            programListNode = programListNode->next;
++            ag_ev_index++;
++        }
++        if (programListNode == nullptr) {
++            /* The list shrank under the cursor: start again from the top. */
++            programListNode = gInterpreterProgramListHead;
++            ag_ev_index = 0;
++            ag_ev_resume = 0;
++        }
++    }
++
+     while (programListNode != nullptr) {
+         procedureCount = stackReadInt32(programListNode->program->procedures, 0);
+ 
+@@ -3060,7 +3102,19 @@ static void _doEvents()
+         }
+ 
+         programListNode = programListNode->next;
++        ag_ev_index++;
++
++        if (ag_events_budget_us > 0
++                && (int)(ag_us() - ag_ev_began) >= ag_events_budget_us) {
++            ag_ev_resume = ag_ev_index;
++            ag_events_split++;
++            return;
++        }
+     }
++
++    /* A whole pass finished: the next one starts at the top. */
++    ag_ev_resume = 0;
++    ag_events_passes++;
+ }
+ 
+ // 0x46E10C
