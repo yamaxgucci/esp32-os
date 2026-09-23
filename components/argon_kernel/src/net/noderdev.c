@@ -757,10 +757,25 @@ typedef struct {
     uint16_t len;
     uint32_t handle;
     uint32_t off;
+    /*
+     * WHICH OPERATION THIS IS, and leaving it out was a real defect rather
+     * than an omission.  Everything poured used to be written at the device
+     * with ag_dev_write, because everything poured was an audio period - so
+     * when a screen's blits started arriving the same way they were written at
+     * the panel as raw bytes.  Against the far board's SOFT framebuffer that
+     * SUCCEEDED (it takes bytes), and the counters read "1 019 808 bytes, 0
+     * lost" while nothing was ever drawn; against its real ST7789, which has
+     * no write, every one was counted lost.  Both readings were wrong in the
+     * same way: the message was never dispatched by what it says it is.
+     */
+    uint8_t  op;
 } rd_period_t;
 
 /* Said once: a flood of identical warnings is a flood, not a diagnosis. */
 static bool              s_no_sink_said;
+
+static uint32_t serve_poured_class(ag_device_t *dev,
+                                   const rd_period_t *pd);
 
 static rd_period_t       s_ring[RD_RING];
 static volatile uint32_t s_ring_w;
@@ -779,6 +794,9 @@ static ag_port_task_t    s_pour_task;
 static uint32_t s_pour_periods;
 static uint32_t s_pour_bytes;
 static uint32_t s_pour_lost;
+static uint32_t s_pour_said_ms;
+static uint32_t s_pour_said_periods;
+static uint32_t s_pour_said_lost;
 static uint32_t s_pour_last_ms;
 static bool     s_pour_said;
 
@@ -988,17 +1006,41 @@ static void pour_report(void)
      * as "the sound never arrived", while the periods were arriving and being
      * dropped one by one for a reason nobody printed.
      */
-    if (s_pour_said || (s_pour_periods == 0 && s_pour_lost == 0)) {
+    if (s_pour_periods == 0 && s_pour_lost == 0) {
         return;
     }
     const uint32_t now = (uint32_t)(ag_port_us() / 1000);
     if ((uint32_t)(now - s_pour_last_ms) < 400u) {
         return;
     }
+    /*
+     * SAID AGAIN WHEN THE NUMBERS HAVE MOVED, and once was not enough.
+     *
+     * A burst of sound ends and one line at the end of it is the whole story.
+     * A SCREEN never ends: the pixels keep coming for as long as something is
+     * drawing, and a line printed after the first period and then never again
+     * reported "1 period, 160 bytes" for an eight-second run - which reads as
+     * a transport that delivered almost nothing, when it had delivered
+     * everything. There is no number anywhere else that says how much arrived.
+     *
+     * So the line repeats when the counters have actually moved, and no faster
+     * than once a second, which is a journal that can be read rather than a
+     * journal that is a flood.
+     */
+    if (s_pour_said && (uint32_t)(now - s_pour_said_ms) < 1000u) {
+        return;
+    }
+    if (s_pour_said && s_pour_periods == s_pour_said_periods &&
+        s_pour_lost == s_pour_said_lost) {
+        return;
+    }
     ag_log(AG_LOG_INFO, TAG, "poured %u periods, %u bytes, %u lost",
            (unsigned)s_pour_periods, (unsigned)s_pour_bytes,
            (unsigned)s_pour_lost);
     s_pour_said = true;
+    s_pour_said_ms = now;
+    s_pour_said_periods = s_pour_periods;
+    s_pour_said_lost = s_pour_lost;
 }
 
 static void pour_task(void *arg)
@@ -1024,6 +1066,24 @@ static void pour_task(void *arg)
              * converter that makes this wait stops nothing else on this board.
              * Before that was true, this path froze the machine.
              */
+            if (pd->op != RD_WRITE) {
+                /*
+                 * A class call rather than bytes: the pixels of a rectangle,
+                 * a row of characters, the caret.  It goes to the device's
+                 * class vtable, and it is here rather than on the reader task
+                 * for the same reason a write is - putting a band on a panel
+                 * takes as long as the panel takes.
+                 */
+                const uint32_t did = serve_poured_class(dev, pd);
+                if (did > 0u) {
+                    s_pour_periods++;
+                    s_pour_bytes += did;
+                } else {
+                    s_pour_lost++;
+                }
+                s_ring_r = (s_ring_r + 1u) % RD_RING;
+                continue;
+            }
             const int32_t n = ag_dev_write(dev, pd->data, pd->len, pd->off);
             if (n > 0) {
                 s_pour_periods++;
@@ -1056,6 +1116,73 @@ static void pour_task(void *arg)
  * A period off the wire.  Runs on the link's reader task, so it copies and
  * returns - the converter is written to on the task above.
  */
+/*
+ * A poured CLASS call, carried out on the pour task.  Returns the bytes it
+ * accounted for, or 0 when the device cannot do it - which is what the lost
+ * counter is for.
+ */
+static uint32_t serve_poured_class(ag_device_t *dev, const rd_period_t *pd)
+{
+    const ag_display_ops_t *d = (const ag_display_ops_t *)dev->class_ops;
+    const uint8_t          *pay = pd->data;
+    const uint16_t          plen = pd->len;
+
+    switch (pd->op) {
+    case RD_BLIT: {
+        if (d == NULL || d->blit_rect == NULL || plen < RD_BLIT_HDR) {
+            return 0;
+        }
+        const ag_blit_t bl = {
+            .px = pay + RD_BLIT_HDR,
+            .stride = (uint32_t)get16(pay + 4) * 2u,
+            .surf_w = get16(pay + 8),
+            .surf_h = get16(pay + 10),
+            .x = get16(pay + 0),
+            .y = get16(pay + 2),
+            .w = get16(pay + 4),
+            .h = get16(pay + 6),
+        };
+        const uint32_t want = (uint32_t)bl.w * bl.h * 2u;
+        if (want == 0u || want > (uint32_t)(plen - RD_BLIT_HDR)) {
+            return 0;
+        }
+        d->blit_rect(0, &bl);
+        return want;
+    }
+    case RD_TEXTROW: {
+        if (d == NULL || d->text_row == NULL || plen < 4u) {
+            return 0;
+        }
+        const uint16_t row = get16(pay);
+        uint16_t       cnt = get16(pay + 2);
+        const uint16_t room = (uint16_t)((plen - 4u) / sizeof(ag_textcell_t));
+        if (cnt > room) {
+            cnt = room;
+        }
+        if (cnt == 0u) {
+            return 0;
+        }
+        d->text_row(0, row, (const ag_textcell_t *)(const void *)(pay + 4),
+                    cnt);
+        return (uint32_t)cnt * sizeof(ag_textcell_t);
+    }
+    case RD_TEXTCUR: {
+        if (d == NULL || d->text_cursor == NULL || plen < 5u) {
+            return 0;
+        }
+        ag_textcell_t under = {.ch = ' ', .attr = 0};
+        if (plen >= 7u) {
+            under.ch = pay[5];
+            under.attr = pay[6];
+        }
+        d->text_cursor(0, get16(pay), get16(pay + 2), under, pay[4] != 0u);
+        return 1u;
+    }
+    default:
+        return 0;
+    }
+}
+
 static void take_period(const uint8_t *b, uint16_t n)
 {
     if (s_pour_task == NULL) {
@@ -1088,6 +1215,7 @@ static void take_period(const uint8_t *b, uint16_t n)
     pd->len = plen;
     pd->handle = get32(b + 4);
     pd->off = get32(b + 12);
+    pd->op = b[0];
     s_ring_w = next;
     ag_port_notify_give(s_pour_task);
 }
