@@ -65,6 +65,11 @@ def main():
     ap.add_argument("--app", default="c:\\gfxdemo.axe")
     ap.add_argument("--spi", action="store_true",
                     help="the screen goes over SPI (both ends), not the UART")
+    # The UART side's rate, and it is NOT 4 Mbaud by accident: this
+    # cable has been measured at 16 Mbaud (1 132 730 B/s of payload),
+    # and a comparison against 4 Mbaud is a comparison against 400
+    # KB/s, which is that baud's ceiling rather than the wire's.
+    ap.add_argument("--linkbaud", type=int, default=4000000)
     ap.add_argument("--khz", type=int, default=20000)
     # The block is how many bytes the SLAVE takes in one assertion of
     # the chip select, so it has to be at least the largest frame - a
@@ -116,7 +121,8 @@ def main():
                       % (a.khz, a.secs, a.block),
                       wait=2.0, timeout=15.0))
         else:
-            print(say(g, "run c:\\remterm.axe 4000000 %d" % a.secs, wait=2.0,
+            print(say(g, "run c:\\remterm.axe %d %d" % (a.linkbaud, a.secs),
+                      wait=2.0,
                       timeout=15.0))
         time.sleep(2.0)
 
@@ -138,6 +144,14 @@ def main():
         # first leaves only the SENDER'''s numbers - which say what was offered
         # to the wire, never what crossed it.
         g.pump(a.watch)
+
+        # AND THE VERDICT FROM A FILE, NOT FROM THE SCREEN.  The screen
+        # end repaints its console and scraping that LOSES TEXT: a run
+        # whose picture plainly arrived has come back with no report in
+        # it at all, which then reads as a fault that never happened and
+        # sends the next hour after a ghost.  remterm writes the same
+        # numbers to c:\remterm.txt, and a file does not repaint.
+        print(say(g, "type c:\\remterm.txt", wait=1.5, timeout=20.0))
         print(visible(bytes(g.buf)).decode("latin-1")[-1200:])
         return 0
     finally:

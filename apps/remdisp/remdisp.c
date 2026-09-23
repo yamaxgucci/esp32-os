@@ -65,6 +65,14 @@ AG_DRV("REMDISP", "1.1", "argon");
  * and the table in docs/09-esp32-cyd.md).  Both ends must agree, so the same
  * number appears in remterm.c.
  */
+/*
+ * THE DEFAULT IS NOT THE WIRE'S SPEED.  This cable has been measured at
+ * 16 Mbaud - 1 599 966 B/s on the line, 1 132 730 B/s of payload after 24.7%
+ * of blocks come back bad - and comparing anything against the 4 Mbaud below
+ * compares it against 400 KB/s, which is that baud's ceiling and not the
+ * wire's.  `[remdisp] baud` in SYSTEM.CFG moves it; the compiled-in number
+ * stays where it was so a board that says nothing behaves as it did.
+ */
 #ifndef LINK_BAUD
 #define LINK_BAUD 4000000u
 #endif
@@ -116,7 +124,7 @@ AG_DRV("REMDISP", "1.1", "argon");
  * end can hold without a framebuffer - and not having a framebuffer over there
  * is the whole reason this arrangement exists.
  */
-#define BAND_ROWS 8u
+#define BAND_ROWS 12u
 
 /*
  * The largest band, in pixels, and the frame that has to hold one.
@@ -163,11 +171,21 @@ static bool               s_up;
  */
 #define RD_WIRE_UART 0
 #define RD_WIRE_SPI  1
+/*
+ * A wire that throws everything away, and it is an instrument rather than a
+ * joke: it is the only way to weigh what this driver costs against what the
+ * transport costs.  With `wire = none` the frames are built exactly as usual
+ * and then dropped, so whatever the sender still manages is its own ceiling.
+ * The difference against the same run over SPI is the wire.
+ */
+#define RD_WIRE_NONE 2
 
 static int      s_wire = RD_WIRE_UART;
+static uint64_t s_polled;   /* when the reverse channel was last read */
 static int      s_bus  = 2;
 static int      s_cs   = 10;
 static uint32_t s_khz  = 20000u;
+static uint32_t s_baud = LINK_BAUD;
 /*
  * THE BLOCK IS WHAT THE FAR END ARMS, so a write longer than one is truncated
  * at the slave and the rest is clocked into a chip whose transaction has
@@ -202,6 +220,9 @@ static void wire_gap(void)
 
 static void wire_write(const uint8_t *p, uint32_t n)
 {
+    if (s_wire == RD_WIRE_NONE) {
+        return;
+    }
     if (s_wire == RD_WIRE_UART) {
         (void)io->uart_write(LINK_PORT, p, n);
         return;
@@ -215,6 +236,16 @@ static void wire_write(const uint8_t *p, uint32_t n)
             wire_gap();
         }
     }
+    /*
+     * AND AFTER THE LAST PIECE TOO, which used to be left out because the gap
+     * was thought of as something between the parts of one frame.  It is not:
+     * the far end has to ARM a block between transactions, and with a block
+     * big enough to hold a whole frame there is only ever one piece, so
+     * consecutive frames arrived back to back with no room at all.  The faster
+     * the clock the sooner the next one starts, which is why doubling the rate
+     * made it worse rather than better.
+     */
+    wire_gap();
 }
 
 /*
@@ -225,6 +256,9 @@ static void wire_write(const uint8_t *p, uint32_t n)
  */
 static int32_t wire_read(uint8_t *p, uint32_t n)
 {
+    if (s_wire == RD_WIRE_NONE) {
+        return 0;
+    }
     if (s_wire == RD_WIRE_UART) {
         return io->uart_read(LINK_PORT, p, n, 0);
     }
@@ -263,12 +297,35 @@ static void send_frame(uint8_t op, const uint8_t *payload, uint32_t len)
     s_frame[3] = (uint8_t)len;
     s_frame[4] = (uint8_t)(len >> 8);
 
-    uint8_t sum = 0;
-    for (uint32_t i = 0; i < len; i++) {
-        s_frame[5u + i] = payload[i];
-        sum = (uint8_t)(sum ^ payload[i]);
+    /*
+     * A WORD AT A TIME, because this is every byte of every band.  It used to
+     * copy and checksum byte by byte, which at the rates this now runs at is
+     * a whole pass over five kilobytes per band spent on a loop the compiler
+     * cannot widen: the XOR of the bytes is the XOR of the words folded down,
+     * so the two can be done together on aligned words and the ends by hand.
+     */
+    memcpy(s_frame + 5u, payload, len);
+
+    uint32_t       acc = 0;
+    const uint8_t *q = payload;
+    uint32_t       n = len;
+    while (n != 0u && (((uintptr_t)q & 3u) != 0u)) {
+        acc ^= (uint32_t)*q++;
+        n--;
     }
-    s_frame[5u + len] = sum;
+    while (n >= 4u) {
+        uint32_t w;
+        memcpy(&w, q, sizeof(w));
+        acc ^= (w & 0xFFu) ^ ((w >> 8) & 0xFFu) ^ ((w >> 16) & 0xFFu) ^
+               (w >> 24);
+        q += 4;
+        n -= 4u;
+    }
+    while (n != 0u) {
+        acc ^= (uint32_t)*q++;
+        n--;
+    }
+    s_frame[5u + len] = (uint8_t)acc;
 
     /*
      * The result is ignored deliberately.  There is nothing useful to do with a
@@ -314,8 +371,37 @@ static uint16_t *s_prev;
 static uint32_t  s_prev_w;
 static uint32_t  s_prev_h;
 
+/*
+ * WHEN THE SHADOW STOPS PAYING FOR ITSELF.
+ *
+ * Trimming a band to what actually moved is the whole reason a still screen
+ * costs nothing, and on a picture that changes EVERYWHERE it is two passes
+ * over the band - a comparison and an update - that never once save a byte.
+ * That is the video case, and it is the case where the frame rate matters.
+ *
+ * So after enough bands in a row come back "all of it moved", the shadow is
+ * dropped and the bands go whole; it is allowed back after a while, and the
+ * first frame after that goes out whole anyway (the buffer is deliberately not
+ * cleared), so nothing can be missed by letting go of it.
+ */
+#define PREV_GIVE_UP   16u
+#define PREV_TRY_AGAIN 600u
+
+static uint32_t s_prev_full;  /* bands in a row where everything moved */
+static uint32_t s_prev_rest;  /* bands to wait before tracking again   */
+
 static bool prev_ready(uint32_t w, uint32_t h)
 {
+    if (s_prev_rest != 0u) {
+        s_prev_rest--;
+        if (s_prev != NULL) {
+            ag_free(s_prev);
+            s_prev = NULL;
+            s_prev_w = 0;
+            s_prev_h = 0;
+        }
+        return false;
+    }
     if (s_prev != NULL && s_prev_w == w && s_prev_h == h) {
         return true;
     }
@@ -374,6 +460,23 @@ static bool prev_ready(uint32_t w, uint32_t h)
 static void poll_far_end(void)
 {
     uint8_t buf[16];
+
+    /*
+     * TEN TIMES A SECOND AND NOT ONCE A BAND.
+     *
+     * This sits at the top of blit_rect, which is called for every band, and a
+     * read is the one thing that cannot be queued: it has to wait for the
+     * write already on the wire, so every poll turned an overlapped write back
+     * into a blocking one.  Measured at 40 MHz: with the poll per band the
+     * sender offered 2885 KB/s and the engine was idle half the time.  What
+     * comes back this way is a single byte saying a new screen has appeared,
+     * so a tenth of a second is far more often than it needs.
+     */
+    const uint64_t now = ag_api()->time->us();
+    if (s_polled != 0u && (uint32_t)(now - s_polled) < 100000u) {
+        return;
+    }
+    s_polled = now;
     for (;;) {
         const int32_t n = wire_read(buf, sizeof(buf));
         if (n <= 0) {
@@ -411,6 +514,10 @@ static void poll_far_end(void)
  * registry across blit_rect, so two flushes cannot be inside here at once.
  */
 static uint8_t  s_raw[FR_MAX_PAYLOAD];  /* geometry + pixels, uncompressed   */
+/* How many bands in a row refused to compress, and a counter to
+ * re-test on.  See the note where they are used. */
+static uint32_t s_nocomp;
+static uint32_t s_bandseq;
 static uint8_t  s_cand[FR_MAX_PAYLOAD]; /* geometry + whatever encoded best  */
 static uint8_t  s_idx[BAND_MAX_PX];     /* one index per pixel, before packing */
 static uint16_t s_pal[256];
@@ -660,7 +767,7 @@ static void rem_blit_rect(ag_handle_t h, const ag_blit_t *b)
     poll_far_end();
 
     const uint8_t *src = (const uint8_t *)b->px;
-    const bool     track = prev_ready(b->surf_w, b->surf_h);
+    bool           track = prev_ready(b->surf_w, b->surf_h);
 
     for (uint32_t band = 0; band < b->h; band += BAND_ROWS) {
         uint32_t rows = b->h - band;
@@ -702,7 +809,26 @@ static void rem_blit_rect(ag_handle_t h, const ag_blit_t *b)
                 }
             }
             if (x0 > x1) {
+                s_prev_full = 0;
                 continue; /* the far end already has this band */
+            }
+            if (x0 == 0u && y0 == 0u && x1 == (uint32_t)b->w - 1u &&
+                y1 == rows - 1u) {
+                if (++s_prev_full >= PREV_GIVE_UP) {
+                    /*
+                     * Arm the rest and stop tracking for the rest of THIS
+                     * call.  The buffer itself is let go in prev_ready, which
+                     * is the only place that is not inside this loop: `track`
+                     * is decided once per blit, and freeing here left it true
+                     * with nothing behind it - a fault, found on the board the
+                     * first time this ran.
+                     */
+                    s_prev_full = 0;
+                    s_prev_rest = PREV_TRY_AGAIN;
+                    track = false;
+                }
+            } else {
+                s_prev_full = 0;
             }
         }
 
@@ -716,16 +842,15 @@ static void rem_blit_rect(ag_handle_t h, const ag_blit_t *b)
             const uint16_t *want =
                 (const uint16_t *)(src + (size_t)(band + y0 + r) * b->stride) +
                 x0;
-            for (uint32_t i = 0; i < rw; i++) {
-                out[r * rw + i] = want[i];
-            }
+            /* A row at a time.  This used to be two per-pixel loops, which
+             * is the same work the compiler cannot widen - on the full-band
+             * case that is every pixel of every frame. */
+            memcpy(out + (size_t)r * rw, want, (size_t)rw * sizeof(uint16_t));
             if (track) {
                 uint16_t *have = s_prev +
                                  (size_t)((uint32_t)b->y + band + y0 + r) *
                                      s_prev_w + b->x + x0;
-                for (uint32_t i = 0; i < rw; i++) {
-                    have[i] = want[i];
-                }
+                memcpy(have, want, (size_t)rw * sizeof(uint16_t));
             }
         }
 
@@ -745,15 +870,42 @@ static void rem_blit_rect(ag_handle_t h, const ag_blit_t *b)
         uint8_t        best_op = FR_BAND;
         uint32_t       best_len = 0;
 
-        const uint32_t p = pack16(out, npx, s_cand + 12u, FR_MAX_PAYLOAD - 12u);
+        /*
+         * THE CAP IS THE CURRENT BEST, NOT THE BUFFER.  An encoding that has
+         * already grown past the raw pixels cannot win, and pack16 answers 0
+         * the moment it passes its cap - so on a picture that does not
+         * compress it now gives up after a few hundred bytes instead of
+         * walking all 5120 twice.  On a picture that does compress nothing
+         * changes: it never reaches the cap.
+         */
+        const uint32_t room = FR_MAX_PAYLOAD - 12u;
+        /*
+         * A PICTURE THAT DID NOT COMPRESS LAST TIME PROBABLY WILL NOT NOW.
+         *
+         * Both encoders walk the whole band before they can lose, and on
+         * moving photographic or noisy content they lose every time - two
+         * passes over five kilobytes per band, on the path that decides the
+         * frame rate.  So after enough failures in a row they are skipped, and
+         * one band in sixty-four still tries, which is what notices a picture
+         * that has become flat again.  A picture that compresses never reaches
+         * the threshold, so nothing changes for it.
+         */
+        const uint32_t p = (s_nocomp < 8u || (s_bandseq & 63u) == 0u)
+                               ? pack16(out, npx, s_cand + 12u,
+                                        (best < room) ? best : room)
+                               : 0u;
+        const bool tried = (s_nocomp < 8u || (s_bandseq & 63u) == 0u);
+        s_bandseq++;
         if (p != 0 && p < best) {
             best = p;
             best_op = FR_PACK;
             best_len = p;
         }
-        const uint32_t q =
-            encode_indexed(out, npx, s_cand + 12u + (best_op == FR_PACK ? p : 0u),
-                           FR_MAX_PAYLOAD - 12u - (best_op == FR_PACK ? p : 0u));
+        const uint32_t used = (best_op == FR_PACK) ? p : 0u;
+        const uint32_t left = room - used;
+        const uint32_t q = tried ? encode_indexed(out, npx, s_cand + 12u + used,
+                                                  (best < left) ? best : left)
+                                 : 0u;
         if (q != 0 && q < best) {
             /* It won; move it to the front of the candidate buffer. */
             uint8_t *from = s_cand + 12u + p;
@@ -763,6 +915,16 @@ static void rem_blit_rect(ag_handle_t h, const ag_blit_t *b)
             best = q;
             best_op = FR_IDX;
             best_len = q;
+        }
+
+        if (tried) {
+            if (best_op == FR_BAND) {
+                if (s_nocomp < 255u) {
+                    s_nocomp++;
+                }
+            } else {
+                s_nocomp = 0;
+            }
         }
 
         if (best_op == FR_BAND) {
@@ -954,11 +1116,15 @@ ag_err_t ag_driver_init(void)
     }
     if (wire[0] == 's' || wire[0] == 'S') {
         s_wire = RD_WIRE_SPI;
+    } else if (wire[0] == 'n' || wire[0] == 'N') {
+        s_wire = RD_WIRE_NONE;
     }
     if (ag_api()->cfg != NULL && AG_HAS(ag_api()->cfg, get_int)) {
         s_bus = ag_api()->cfg->get_int("remdisp.bus", s_bus);
         s_cs = ag_api()->cfg->get_int("remdisp.cs", s_cs);
         s_khz = (uint32_t)ag_api()->cfg->get_int("remdisp.khz", (int32_t)s_khz);
+        s_baud = (uint32_t)ag_api()->cfg->get_int("remdisp.baud",
+                                                  (int32_t)s_baud);
         s_blk = (uint32_t)ag_api()->cfg->get_int("remdisp.block",
                                                  (int32_t)s_blk);
         const int32_t g = ag_api()->cfg->get_int("remdisp.gap_us",
@@ -993,10 +1159,10 @@ ag_err_t ag_driver_init(void)
             return err;
         }
     } else {
-        err = io->uart_config(LINK_PORT, LINK_BAUD, 8, 0, 1);
+        err = io->uart_config(LINK_PORT, s_baud, 8, 0, 1);
         if (err != AG_OK) {
             ag_printf("REMDISP: uart%d at %u baud: %s\n", LINK_PORT,
-                      (unsigned)LINK_BAUD, ag_strerror(err));
+                      (unsigned)s_baud, ag_strerror(err));
             ag_printf("REMDISP: set [uart%d] tx/rx in C:\\BOARD.CFG\n",
                       LINK_PORT);
             return err;
@@ -1024,7 +1190,12 @@ ag_err_t ag_driver_init(void)
      * a run over SPI printed `uart1 at 4000000 baud` and cost an hour of
      * looking for a fault in the wrong half of the system.
      */
-    if (s_wire == RD_WIRE_SPI) {
+    if (s_wire == RD_WIRE_NONE) {
+        ag_printf("REMDISP: no wire - frames are built and dropped; "
+                  "%ux%u cells, pixels in %u-row bands\n",
+                  (unsigned)REM_COLS, (unsigned)REM_ROWS,
+                  (unsigned)BAND_ROWS);
+    } else if (s_wire == RD_WIRE_SPI) {
         ag_printf("REMDISP: spi%d cs%d at %u kHz, blocks of %u; %ux%u cells, "
                   "pixels in %u-row bands\n",
                   s_bus, s_cs, (unsigned)s_khz, (unsigned)s_blk,
@@ -1033,7 +1204,7 @@ ag_err_t ag_driver_init(void)
     } else {
         ag_printf("REMDISP: uart%d at %u baud; %ux%u cells, "
                   "pixels in %u-row bands\n",
-                  LINK_PORT, (unsigned)LINK_BAUD, (unsigned)REM_COLS,
+                  LINK_PORT, (unsigned)s_baud, (unsigned)REM_COLS,
                   (unsigned)REM_ROWS, (unsigned)BAND_ROWS);
     }
     return AG_OK;

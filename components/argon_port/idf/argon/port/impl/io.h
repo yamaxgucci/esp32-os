@@ -31,6 +31,15 @@
  * transfer costs the same setup whatever it carries, and a panel being fed a
  * frame cares about nothing else.
  */
+/*
+ * 8192, and 16384 was tried and put back.  A transfer costs the same setup
+ * whatever it carries, so a longer one is worth having: sixteen-row bands
+ * would have halved every per-frame cost.  It does not fit on the
+ * Touch-LCD-2 - the slave service needs 2 * SLOTS * block of DMA-capable
+ * INTERNAL memory in ONE piece and that board, with its panel up, has 150 KB
+ * free and 100 KB as its largest block.  Twelve-row bands (7774 a frame) take
+ * the same gain within this limit.
+ */
 #define AG_PORT_SPI_MAX_XFER 8192
 
 /*

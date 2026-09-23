@@ -520,6 +520,27 @@ typedef struct {
      * never do should not pay for it at open.
      */
     uint8_t  *zero;
+    /*
+     * Where a long MASTER write is staged so it can cross in one transaction.
+     * Made the first time a bus sends something longer than the bounce buffer
+     * and kept; a bus that never does pays nothing.  See the note in
+     * spi_xfer_locked.
+     */
+    uint8_t  *staging;
+    /*
+     * The other half of the staging pair, and the transaction in flight.
+     *
+     * A long write is QUEUED rather than polled: the engine clocks it out of
+     * one half while the caller fills the other, so the time on the wire and
+     * the time spent building the next frame overlap instead of adding up.
+     * Measured on the screen path at 40 MHz: 1.55 ms of the 2.55 ms a band
+     * took was the CPU sitting in spi_device_polling_transmit doing nothing.
+     *
+     * Anything else that touches the bus reaps this first - see spi_drain.
+     */
+    spi_transaction_t tx_trans[2];
+    int               tx_which;
+    bool              tx_busy;
 } spi_state_t;
 
 static spi_state_t s_spi[AG_PORT_SPI_SLOTS];
@@ -723,6 +744,7 @@ ag_err_t ag_port_spi_slave_open(int bus, int sck, int mosi, int miso, int cs,
 }
 
 static ag_err_t spi_set_khz_locked(int bus, int cs, uint32_t khz);
+static ag_err_t spi_drain(int bus, spi_device_handle_t dev);
 
 ag_err_t ag_port_spi_set_khz(int bus, int cs, uint32_t khz)
 {
@@ -757,6 +779,8 @@ static ag_err_t spi_set_khz_locked(int bus, int cs, uint32_t khz)
         /* Speed is fixed when a device is created, so change it by throwing
          * the device away; the next transfer builds one at the new speed. */
         if (d->dev != NULL) {
+            /* A queued write still belongs to this device. */
+            (void)spi_drain(bus, d->dev);
             (void)spi_bus_remove_device(d->dev);
         }
         d->dev = NULL;
@@ -806,7 +830,9 @@ static ag_err_t spi_device_for(int bus, int cs, spi_device_handle_t *out)
         .clock_speed_hz = (int)(khz * 1000u),
         .mode = 0,
         .spics_io_num = cs,
-        .queue_size = 1,
+        /* One in flight is all this port ever queues - see the
+         * staging pair in spi_state_t - but it must be allowed. */
+        .queue_size = 2,
     };
 
     const ag_err_t err = from_esp(
@@ -849,6 +875,24 @@ ag_err_t ag_port_spi_xfer(int bus, int cs, const void *tx, void *rx, size_t len)
     return err;
 }
 
+/*
+ * Wait for a queued long write to finish.  Every other path through the bus
+ * calls this first: a transaction still in flight owns one half of the staging
+ * pair and the device, and starting anything else on top of it is how a driver
+ * that queues gets the reputation of being unreliable.
+ */
+static ag_err_t spi_drain(int bus, spi_device_handle_t dev)
+{
+    if (!s_spi[bus].tx_busy) {
+        return AG_OK;
+    }
+    spi_transaction_t *done = NULL;
+    const esp_err_t    ae =
+        spi_device_get_trans_result(dev, &done, portMAX_DELAY);
+    s_spi[bus].tx_busy = false;
+    return from_esp(ae);
+}
+
 static ag_err_t spi_xfer_locked(int bus, int cs, const void *tx, void *rx,
                                 size_t len)
 {
@@ -856,6 +900,16 @@ static ag_err_t spi_xfer_locked(int bus, int cs, const void *tx, void *rx,
     ag_err_t            err = spi_device_for(bus, cs, &dev);
     if (err != AG_OK) {
         return err;
+    }
+
+    const bool long_write = (rx == NULL && tx != NULL &&
+                             len > AG_PORT_SPI_BOUNCE &&
+                             len <= AG_PORT_SPI_MAX_XFER);
+    if (!long_write) {
+        const ag_err_t d = spi_drain(bus, dev);
+        if (d != AG_OK) {
+            return d;
+        }
     }
 
     /*
@@ -870,7 +924,7 @@ static ag_err_t spi_xfer_locked(int bus, int cs, const void *tx, void *rx,
      * A write-only transfer from DMA-capable memory needs neither the copy nor
      * the cap.  Anything else still goes through the bounce, in pieces.
      */
-    if (rx == NULL && tx != NULL && esp_ptr_dma_capable(tx)) {
+    if (!long_write && rx == NULL && tx != NULL && esp_ptr_dma_capable(tx)) {
         spi_transaction_t direct = {
             .length = len * 8u,
             .tx_buffer = tx,
@@ -881,13 +935,62 @@ static ag_err_t spi_xfer_locked(int bus, int cs, const void *tx, void *rx,
 
     if (len > AG_PORT_SPI_BOUNCE) {
         /*
-         * Has to be copied, so it goes a bounce-buffer at a time.  Only for a
-         * write: chopping a transfer that also reads would drop chip select
-         * between the halves, and a chip being read mid-command would not
-         * survive that.
+         * Has to be copied, and the copy used to go a bounce-buffer at a time.
+         * Only for a write: chopping a transfer that also reads would drop
+         * chip select between the halves, and a chip being read mid-command
+         * would not survive that.
          */
         if (rx != NULL) {
             return -AG_EINVAL;
+        }
+
+        /*
+         * ONE TRANSACTION, AND IT IS WORTH SIXTEEN KILOBYTES.  Cutting the
+         * write into bounce-sized pieces cost a transaction per kilobyte, and
+         * a transaction is not free at either end: the far side must ARM a
+         * block for each one.  Measured on the boards at 40 MHz, a 5194-byte
+         * frame became 5.3 transactions and the receiving service threw away
+         * 24 MB of what arrived because it could not drain that many blocks -
+         * 11.8 MB of picture for 72 MB of wire.
+         *
+         * So a bus that actually sends something long gets a staging buffer
+         * the size of the longest transfer, made once and kept.  A bus that
+         * never does pays nothing, which is why this is not simply a bigger
+         * AG_PORT_SPI_BOUNCE: the panel buses on every other board would pay
+         * for it too.
+         */
+        if (s_spi[bus].staging == NULL) {
+            s_spi[bus].staging =
+                ag_port_alloc_aligned(4, 2u * AG_PORT_SPI_MAX_XFER, AG_MEM_DMA);
+        }
+        if (s_spi[bus].staging != NULL) {
+            /*
+             * Reap the previous one FIRST - it owns the half that is about to
+             * be filled - and only then copy and queue.  The call returns with
+             * the bytes still going out, which is the whole point: the caller
+             * builds the next frame during them.
+             */
+            const ag_err_t d = spi_drain(bus, dev);
+            if (d != AG_OK) {
+                return d;
+            }
+            const int      w = s_spi[bus].tx_which;
+            uint8_t *const half =
+                s_spi[bus].staging + (size_t)w * AG_PORT_SPI_MAX_XFER;
+            memcpy(half, tx, len);
+            s_spi[bus].tx_trans[w] = (spi_transaction_t){
+                .length = len * 8u,
+                .tx_buffer = half,
+                .rx_buffer = NULL,
+            };
+            const esp_err_t ae = spi_device_queue_trans(
+                dev, &s_spi[bus].tx_trans[w], portMAX_DELAY);
+            if (ae != ESP_OK) {
+                return from_esp(ae);
+            }
+            s_spi[bus].tx_busy = true;
+            s_spi[bus].tx_which = w ^ 1;
+            return AG_OK;
         }
         /*
          * Chip select must NOT come up between the pieces.  It used to, and

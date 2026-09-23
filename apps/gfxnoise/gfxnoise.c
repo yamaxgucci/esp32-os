@@ -30,8 +30,13 @@ AG_APP("GFXNOISE", "1.0", "argon", AG_AXE_NEEDS_GFX);
 
 #define NOISE_BAND_MAX 16u
 #define NOISE_W_MAX    640u
+/*
+ * One band, plus slack to slide the window through.  The slack is what makes
+ * consecutive frames differ without costing anything to produce.
+ */
+#define POOL_SLACK     4096u
 
-static uint16_t s_band[NOISE_W_MAX * NOISE_BAND_MAX];
+static uint16_t s_pool[NOISE_W_MAX * NOISE_BAND_MAX + POOL_SLACK];
 
 static uint32_t s_rng = 0x2545F491u;
 
@@ -86,6 +91,12 @@ int ag_main(int argc, char **argv)
     ag_printf("gfxnoise: %ux%u, bands of %u rows, %u s\n", (unsigned)w,
               (unsigned)h, (unsigned)rows, (unsigned)secs);
 
+    for (uint32_t i = 0; i < (uint32_t)(NOISE_W_MAX * NOISE_BAND_MAX +
+                                       POOL_SLACK); i++) {
+        s_pool[i] = (uint16_t)xorshift();
+    }
+
+    uint32_t        off = 0;
     uint32_t        frames = 0;
     uint32_t        bytes = 0;
     const ag_time_t t0 = ag_micros();
@@ -96,12 +107,25 @@ int ag_main(int argc, char **argv)
             const uint16_t n =
                 ((uint16_t)(h - y0) < rows) ? (uint16_t)(h - y0) : (uint16_t)rows;
 
-            for (uint32_t i = 0; i < (uint32_t)w * n; i++) {
-                s_band[i] = (uint16_t)xorshift();
+            /*
+             * THE NOISE IS MADE ONCE AND THEN SLID, and that is the whole
+             * difference between measuring a wire and measuring this program.
+             * Drawing every pixel with the generator cost more than the
+             * transport did: the sender reported 1950 KB/s at 40 MHz while
+             * the wire was idle waiting for it. The pool below is one band
+             * longer than a band, so every frame starts at a different offset
+             * in it - the bytes never repeat against the previous frame, so
+             * nothing packs and nothing indexes, and the cost per band is one
+             * pointer.
+             */
+            const uint16_t *src = s_pool + off;
+            off += 61u; /* prime-ish, so the window does not fall into step */
+            if (off > POOL_SLACK) {
+                off = 0;
             }
 
             const ag_blit_t b = {
-                .px = s_band,
+                .px = src,
                 .stride = (uint32_t)w * sizeof(uint16_t),
                 .surf_w = w,
                 .surf_h = h,

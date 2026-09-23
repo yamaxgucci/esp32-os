@@ -57,7 +57,7 @@ AG_APP("REMTERM", "1.1", "argon", 0);
 #define FR_IDX    'I' /* a palette and indices                               */
 
 /* Both numbers have to match remdisp.c exactly. */
-#define BAND_ROWS      8u
+#define BAND_ROWS      12u
 #define BAND_MAX_PX    (BAND_ROWS * 320u)
 #define FR_MAX_PAYLOAD (12u + BAND_MAX_PX * 2u + BAND_MAX_PX / 64u + 16u)
 
@@ -216,7 +216,14 @@ static bool unpack_indexed(const uint8_t *in, uint32_t len, uint32_t npx)
  * for the length it was given or for the timeout, so a long timeout on a big
  * read would hold a keystroke back for as long as the line stayed quiet.
  */
-#define RX_CHUNK 1024u
+/*
+ * A read costs the same whatever it brings back, and at SPI rates THIS end is
+ * what overflows: the service ring is 16 KB and a 40 MHz wire fills it in
+ * three milliseconds, so the fewer round trips spent collecting a 5194-byte
+ * frame the better.  8192 takes any frame this protocol can send in one read
+ * or two.
+ */
+#define RX_CHUNK 8192u
 
 static uint8_t  s_rx[RX_CHUNK];
 static uint32_t s_have;
@@ -271,6 +278,93 @@ static int next_byte(uint32_t ms)
         s_at = 0;
     }
     return (int)s_rx[s_at++];
+}
+
+/*
+ * THE BODY OF A FRAME, IN ONE GO.
+ *
+ * It used to come through next_byte, which is a call, two bounds checks and a
+ * refill test PER BYTE - five thousand of them for a single band.  At the
+ * rates the SPI transport reaches, that is what decides the picture: the
+ * service's receive ring overflows while this end is still walking a loop, and
+ * the counters show tens of megabytes dropped with the wire nowhere near busy.
+ *
+ * So the payload is taken straight out of the read buffer by memcpy, refilling
+ * as needed, and the checksum is folded a word at a time afterwards.  The
+ * boundaries are the same as next_byte's: a refill that brings nothing is a
+ * short read, and the caller treats it exactly as before.
+ */
+static bool next_bulk(uint8_t *dst, uint32_t len, uint32_t ms)
+{
+    uint32_t got = 0;
+    while (got < len) {
+        if (s_at >= s_have) {
+            /*
+             * STRAIGHT INTO THE CALLER'S BUFFER when there is a lot still to
+             * come.  Going through the read buffer costs a second copy of
+             * every pixel, and this end is the one that overruns: the service
+             * ring is 16 KB, the wire fills it in milliseconds, and every
+             * microsecond spent copying is a frame broken in the middle.  The
+             * small tail still goes through the buffer, because a read that
+             * asks for exactly what is left would wait for it.
+             */
+            const uint32_t want = len - got;
+            if (want >= 512u) {
+                int32_t n;
+                if (s_spi != 0) {
+                    n = g_ag_api->io->spi_link_read(s_spi, dst + got, want, ms);
+                } else {
+                    n = ag_uart_read(LINK_PORT, dst + got, want, ms);
+                }
+                if (n <= 0) {
+                    return false;
+                }
+                got += (uint32_t)n;
+                continue;
+            }
+            int32_t n;
+            if (s_spi != 0) {
+                n = g_ag_api->io->spi_link_read(s_spi, s_rx, sizeof(s_rx), ms);
+            } else {
+                n = ag_uart_read(LINK_PORT, s_rx, sizeof(s_rx), ms);
+            }
+            if (n <= 0) {
+                return false;
+            }
+            s_have = (uint32_t)n;
+            s_at = 0;
+        }
+        uint32_t take = s_have - s_at;
+        if (take > len - got) {
+            take = len - got;
+        }
+        memcpy(dst + got, s_rx + s_at, take);
+        s_at += take;
+        got += take;
+    }
+    return true;
+}
+
+static uint8_t xor8(const uint8_t *p, uint32_t n)
+{
+    uint32_t acc = 0;
+    while (n != 0u && (((uintptr_t)p & 3u) != 0u)) {
+        acc ^= (uint32_t)*p++;
+        n--;
+    }
+    while (n >= 4u) {
+        uint32_t w;
+        memcpy(&w, p, sizeof(w));
+        acc ^= (w & 0xFFu) ^ ((w >> 8) & 0xFFu) ^ ((w >> 16) & 0xFFu) ^
+               (w >> 24);
+        p += 4;
+        n -= 4u;
+    }
+    while (n != 0u) {
+        acc ^= (uint32_t)*p++;
+        n--;
+    }
+    return (uint8_t)acc;
 }
 
 static uint32_t get16(const uint8_t *p)
@@ -531,21 +625,11 @@ int ag_main(int argc, char **argv)
         }
 
         static uint8_t payload[FR_MAX_PAYLOAD];
-        uint8_t        sum = 0;
-        bool           short_read = false;
-        for (uint32_t i = 0; i < len; i++) {
-            const int p = next_byte(20);
-            if (p < 0) {
-                short_read = true;
-                break;
-            }
-            payload[i] = (uint8_t)p;
-            sum = (uint8_t)(sum ^ (uint8_t)p);
-        }
-        if (short_read) {
+        if (!next_bulk(payload, len, 20)) {
             stray++;
             continue;
         }
+        const uint8_t sum = xor8(payload, len);
         const int claimed = next_byte(20);
         if (claimed < 0 || (uint8_t)claimed != sum) {
             bad++;
@@ -696,8 +780,9 @@ int ag_main(int argc, char **argv)
      * block that arrived and was rebuilt wrong.  Read here because the shell
      * cannot: the link closes with the application that opened it.
      */
+    ag_spilink_stats_t st;
+    memset(&st, 0, sizeof(st));
     if (s_spi != 0 && AG_HAS(g_ag_api->io, spi_link_stats)) {
-        ag_spilink_stats_t st;
         if (g_ag_api->io->spi_link_stats(s_spi, &st) == AG_OK) {
             ag_printf("spilink: %u blocks, %u with data, %u unarmed, "
                       "%u dropped\n",
@@ -727,18 +812,37 @@ int ag_main(int argc, char **argv)
     const ag_handle_t f = ag_open("c:\\remterm.txt",
                                   AG_O_WRONLY | AG_O_CREATE | AG_O_TRUNC);
     if (f >= 0) {
+        /*
+         * THE TRANSPORT'S OWN NUMBERS GO IN THE FILE TOO.  They used to be
+         * printed and nothing else, and the console is exactly what cannot be
+         * trusted to carry them: this board repaints its screen, so a run
+         * whose picture plainly arrived came back with no report at all. A
+         * file does not repaint.
+         */
         static const char *const k_names[] = {
             "rows=", " rects=", " kpixels=", " bad=", " stray=",
             " flow_ms=", " kpixels_per_s=", " packed=", " indexed=", " wirekb=",
+            " blocks=", " blocks_data=", " unarmed=", " dropped=",
+            " timeouts=", " stalls=", " rebuilds=",
         };
         const uint32_t vals[] = {rows,    bands,        px,
                                  bad,     stray,        flow_ms,
                                  kpx_s,   packedframes, idxframes,
-                                 wirekb};
+                                 wirekb,
+                                 st.blocks_clocked,
+                                 st.blocks_data,
+                                 st.blocks_unarmed,
+                                 st.bytes_dropped,
+                                 st.timeouts,
+                                 st.stalls,
+                                 st.recoveries};
 
-        char out[256];
+        char out[512];
         out[0] = '\0';
-        for (uint32_t i = 0; i < 10u; i++) {
+        /* Every name that is in the table, not a count typed beside it:
+         * the seven transport counters added later were written nowhere
+         * because this said ten. */
+        for (uint32_t i = 0; i < sizeof(k_names) / sizeof(k_names[0]); i++) {
             char num[24];
             (void)ag_strlcat(out, k_names[i], sizeof(out));
             (void)ag_strlcat(out, ag_utoa(vals[i], num, sizeof(num), 0, false),
