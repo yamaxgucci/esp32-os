@@ -29,6 +29,8 @@
 
 #include <argon/device.h>
 #include <argon/port/mem.h>
+
+#include "net/rdpaint.h"
 #include <argon/libc.h>
 #include <argon/linkprov.h>
 #include <argon/log.h>
@@ -87,6 +89,12 @@ enum {
     RD_TEXTINFO, /* -> cols, rows                                          */
     RD_TEXTROW,  /* poured: row then cells                                 */
     RD_TEXTCUR,  /* poured: col, row, visible                              */
+    /*
+     * poured, but RELIABLY and never dropped: what changed on the screen
+     * since the far end last showed it, packed (net/rdpaint.h).  The far
+     * screen is a copy kept by what arrives, so a lost one would stay lost.
+     */
+    RD_BLITZ,
 };
 
 static void put32(uint8_t *p, uint32_t v)
@@ -573,21 +581,41 @@ static ag_err_t rd_gfxinfo(ag_handle_t h, ag_gfxinfo_t *out)
 }
 
 /*
- * A BLIT, CUT INTO PIECES THAT FIT.  Not reassembled at the far end: every
- * piece is a complete rectangle with its own geometry, so a piece that is lost
- * costs its own pixels and nothing else - the same trade a screen over a wire
- * has always made.  It is cut by ROWS first and then across, because a run
- * along a row is what the far end can put on the glass in one go.
+ * A painter's payload out: RD_BLITZ, reliable, on the painter's own task -
+ * which is why it may wait for the wire, and why one buffer serves.
  */
-static void rd_blit(ag_handle_t h, const ag_blit_t *b)
+static ag_err_t rd_send_z(uint32_t handle, const uint8_t *pay, uint16_t len)
 {
-    rdev_t *p = proxy_of(h);
-    if (p == NULL || b == NULL || b->px == NULL || b->w == 0 || b->h == 0) {
-        return;
+    if (s_blitmsg == NULL) {
+        s_blitmsg = (uint8_t *)ag_port_alloc(RD_HDR + RD_POUR_CAP, AG_MEM_BYTE);
+        if (s_blitmsg == NULL) {
+            return -AG_ENOMEM;
+        }
     }
-    if (ensure_open(p) != AG_OK) {
-        return;
+    if (len > RD_POUR_CAP) {
+        return -AG_EINVAL;
     }
+    uint8_t *const msg = s_blitmsg;
+    msg[0] = RD_BLITZ;
+    msg[1] = RD_F_NOREPLY;
+    put16(msg + 2, 0);
+    put32(msg + 4, handle);
+    put32(msg + 8, 0);
+    put32(msg + 12, 0);
+    memcpy(msg + RD_HDR, pay, len);
+    const int32_t r = ag_linkprov_send(RD_CHAN, AG_LINK_BULK, msg,
+                                       (uint16_t)(RD_HDR + len));
+    return (r >= 0) ? AG_OK : (ag_err_t)r;
+}
+
+/*
+ * THE FALLBACK, for a board with no memory for the painter's two pictures: a
+ * blit cut into pieces that fit.  Not reassembled at the far end: every piece
+ * is a complete rectangle with its own geometry, so a piece that is lost costs
+ * its own pixels and nothing else.
+ */
+static void rd_blit_raw(rdev_t *p, const ag_blit_t *b)
+{
 
     const uint8_t *rows = (const uint8_t *)b->px;
     if (s_blitmsg == NULL) {
@@ -643,6 +671,33 @@ static void rd_blit(ag_handle_t h, const ag_blit_t *b)
                 RD_CHAN, AG_LINK_STREAM, msg,
                 (uint16_t)(RD_HDR + RD_BLIT_HDR + (uint32_t)n * rh * 2u));
         }
+    }
+}
+
+/*
+ * A BLIT IS NOTED, NOT SENT.  This runs under the device registry, from the
+ * application's present, and sending here held the registry for as long as
+ * the wire took.  The screen's painter (net/rdpaint.c) sends only what
+ * changed since the far screen last showed it, packed, on its own task - so
+ * nothing the application does knows the screen is across a wire, and a wire
+ * slower than the application costs frames, not the registry.
+ *
+ * Measured before (24 Sep, SPI 40 MHz, noise at 320x240): 29.7 frames/s
+ * raw.  Nothing is packed there - noise does not pack - so that number is
+ * the floor this has to keep.
+ */
+static void rd_blit(ag_handle_t h, const ag_blit_t *b)
+{
+    rdev_t *p = proxy_of(h);
+    if (p == NULL || b == NULL || b->px == NULL || b->w == 0 || b->h == 0) {
+        return;
+    }
+    if (ensure_open(p) != AG_OK) {
+        return;
+    }
+    if (!rdp_damage(b, (uint32_t)p->far_handle, rd_pour_payload(),
+                    rd_send_z)) {
+        rd_blit_raw(p, b); /* no memory for the painter: every pixel, raw */
     }
 }
 
@@ -1215,6 +1270,8 @@ static uint32_t serve_poured_class(ag_device_t *dev, const rd_period_t *pd)
         d->blit_rect(0, &bl);
         return want;
     }
+    case RD_BLITZ:
+        return rdp_draw(d, pay, plen);
     case RD_TEXTROW: {
         if (d == NULL || d->text_row == NULL || plen < 4u) {
             return 0;
@@ -1278,7 +1335,18 @@ static void take_period(const uint8_t *b, uint16_t n)
                ag_node_peer_name() != NULL ? ag_node_peer_name() : "the wire");
     }
 
-    const uint32_t next = (s_ring_w + 1u) % RD_RING;
+    uint32_t next = (s_ring_w + 1u) % RD_RING;
+    if (next == s_ring_r && b[0] == RD_BLITZ) {
+        /*
+         * A screen kept by what changed cannot miss a change: this waits for
+         * the pour task, and the wire waits behind it - which is the screen
+         * being slower than the wire, said as back-pressure.
+         */
+        for (int k = 0; k < 1000 && next == s_ring_r; k++) {
+            ag_port_task_delay(1);
+            next = (s_ring_w + 1u) % RD_RING;
+        }
+    }
     if (next == s_ring_r) {
         s_pour_lost++; /* full: this one missed its moment */
         return;

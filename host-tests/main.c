@@ -8,6 +8,7 @@
 int ag_test_failures = 0;
 int ag_test_checks = 0;
 
+void run_rdcodec_tests(void);
 void run_path_tests(void);
 void run_cfg_tests(void);
 void run_screen_tests(void);
@@ -46,6 +47,7 @@ void run_stm32ldr_tests(void);
 
 int main(void)
 {
+    run_rdcodec_tests();
     run_path_tests();
     run_cfg_tests();
     run_screen_tests();

@@ -148,6 +148,8 @@ add_executable(argon_tests
     "${ARGON_ROOT}/apps/common/rlink/ag_rlink.c"
     test_atproto.c
     "${ARGON_ROOT}/apps/common/atproto/ag_atproto.c"
+    test_rdcodec.c
+    "${ARGON_ROOT}/components/argon_kernel/src/net/rdcodec.c"
     test_espldr.c
     "${ARGON_ROOT}/apps/common/esp8266/ag_espldr.c"
     test_stm32ldr.c
@@ -164,6 +166,7 @@ add_executable(argon_tests
 target_include_directories(argon_tests BEFORE PRIVATE
     "${ARGON_ROOT}/tools/host_stub")
 target_include_directories(argon_tests PRIVATE
+    "${ARGON_ROOT}/components/argon_kernel/src"
     "${ARGON_ROOT}/tools"
     "${ARGON_ROOT}/apps/common/agvm"
     ${ARGON_INCLUDES}

@@ -13,7 +13,14 @@
  * and the number that comes out the other end is the transport's own.  It is
  * the video case, made reproducible: a frame that has to cross in full.
  *
- *   gfxnoise [seconds] [rows]
+ *   gfxnoise [seconds] [rows] [noise|box|flat]
+ *
+ *   noise  every frame new noise: nothing to pack, nothing unchanged - the
+ *          wire's own number (the default)
+ *   box    one still picture of noise and a 48x48 square moving across it:
+ *          what a screen that sends only what changed is for
+ *   flat   eight bars of flat colour, a new colour every frame: every pixel
+ *          changes, and every row packs
  *
  * `rows` is the height of one presented band, eight by default, which is what
  * REMDISP cuts a frame into.  The run reports the frames it pushed and the
@@ -37,6 +44,10 @@ AG_APP("GFXNOISE", "1.0", "argon", AG_AXE_NEEDS_GFX);
 #define POOL_SLACK     4096u
 
 static uint16_t s_pool[NOISE_W_MAX * NOISE_BAND_MAX + POOL_SLACK];
+/* one band being made, for the modes that are not a slice of the pool */
+static uint16_t s_band[NOISE_W_MAX * NOISE_BAND_MAX];
+
+#define BOX 48u
 
 static uint32_t s_rng = 0x2545F491u;
 
@@ -66,6 +77,7 @@ int ag_main(int argc, char **argv)
 
     uint32_t secs = (argc >= 2) ? number(argv[1]) : 10u;
     uint32_t rows = (argc >= 3) ? number(argv[2]) : 8u;
+    const char mode = (argc >= 4) ? argv[3][0] : 'n'; /* n, b or f */
 
     if (secs == 0u) {
         secs = 10u;
@@ -97,6 +109,8 @@ int ag_main(int argc, char **argv)
     }
 
     uint32_t        off = 0;
+    uint32_t        box_x = 0;
+    int32_t         box_dx = 4;
     uint32_t        frames = 0;
     uint32_t        bytes = 0;
     const ag_time_t t0 = ag_micros();
@@ -119,9 +133,37 @@ int ag_main(int argc, char **argv)
              * pointer.
              */
             const uint16_t *src = s_pool + off;
-            off += 61u; /* prime-ish, so the window does not fall into step */
-            if (off > POOL_SLACK) {
-                off = 0;
+            if (mode == 'b') {
+                /* the same noise for this band every frame, and the square
+                 * over it where it is now */
+                const uint32_t by = (h - BOX) / 2u;
+                for (uint32_t k = 0; k < (uint32_t)w * n; k++) {
+                    s_band[k] = s_pool[((uint32_t)y0 * 97u + k) % POOL_SLACK];
+                }
+                for (uint32_t r = 0; r < n; r++) {
+                    const uint32_t y = y0 + r;
+                    if (y < by || y >= by + BOX) {
+                        continue;
+                    }
+                    for (uint32_t c = 0; c < BOX && box_x + c < w; c++) {
+                        s_band[r * w + box_x + c] = 0xFFFFu;
+                    }
+                }
+                src = s_band;
+            } else if (mode == 'f') {
+                for (uint32_t r = 0; r < n; r++) {
+                    for (uint32_t x = 0; x < w; x++) {
+                        const uint32_t bar = x * 8u / w;
+                        s_band[r * w + x] =
+                            (uint16_t)((frames * 2654435761u) ^ (bar * 0x1111u));
+                    }
+                }
+                src = s_band;
+            } else {
+                off += 61u; /* prime-ish, so the window does not fall into step */
+                if (off > POOL_SLACK) {
+                    off = 0;
+                }
             }
 
             const ag_blit_t b = {
@@ -142,6 +184,13 @@ int ag_main(int argc, char **argv)
             bytes += (uint32_t)w * n * 2u;
         }
         frames++;
+        if (mode == 'b') {
+            if ((int32_t)box_x + box_dx < 0 ||
+                box_x + (uint32_t)box_dx + BOX > w) {
+                box_dx = -box_dx;
+            }
+            box_x = (uint32_t)((int32_t)box_x + box_dx);
+        }
         /*
          * Nothing sleeps here on purpose: the point is to keep the wire as
          * busy as the sender can make it, so what is measured is the wire and

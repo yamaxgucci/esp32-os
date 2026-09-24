@@ -1,0 +1,52 @@
+/*
+ * ArgonOS - a neighbour's screen, kept up to date by what changed.
+ *
+ * The screen proxy's side of drawing on a board across the cluster link
+ * (net/noderdev.c).  An application draws and presents as it does on any
+ * screen; nothing it calls knows the screen is across a wire.  What the proxy
+ * hands here is only "these rows of this surface were presented" - under the
+ * device registry, so it is noted and nothing more - and a task of the
+ * painter's own does the rest outside every lock:
+ *
+ *   - it keeps ONE copy of the screen - no second frame buffer - and sends
+ *     only what differs from it: per row, from the first changed pixel to the
+ *     last (a moving pointer is a few rows of a few pixels, not a band);
+ *   - it packs what it sends (net/rdcodec.h): flat stretches almost vanish,
+ *     noise costs a byte in 257;
+ *   - it sends reliably, so the two screens cannot drift apart; a message
+ *     that could not be sent makes the whole screen go again;
+ *   - it is always painting the LATEST picture: presents that come while it
+ *     is sending are folded into the next pass, so a wire slower than the
+ *     application costs frames, never lag.
+ *
+ * The receiving board needs no framebuffer: rdp_draw unpacks each run into
+ * one row's worth of pixels and hands it to its panel.
+ *
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
+ */
+#ifndef ARGON_NET_RDPAINT_H
+#define ARGON_NET_RDPAINT_H
+
+#include <stdbool.h>
+#include <stdint.h>
+
+#include <argon/abi.h>
+
+/* Sends one packed payload to the far screen, reliably; AG_OK or why not. */
+typedef ag_err_t (*rdp_send_fn)(uint32_t handle, const uint8_t *pay,
+                                uint16_t len);
+
+/*
+ * A presented rectangle to bring the far screen up to.  `room` is the most
+ * one payload may be.  Called under the device registry: compares it with
+ * the painter's one picture, copies in what differs, marks it, wakes the
+ * painter and returns.  False when there is no memory for the picture (or
+ * the surface outgrew it): the caller then sends the pixels itself, raw.
+ */
+bool rdp_damage(const ag_blit_t *b, uint32_t handle, uint16_t room,
+                rdp_send_fn send);
+
+/* One payload onto a local screen; the pixels drawn, 0 if it was not one. */
+uint32_t rdp_draw(const ag_display_ops_t *d, const uint8_t *pay, uint16_t len);
+
+#endif /* ARGON_NET_RDPAINT_H */

@@ -4,7 +4,7 @@ What a neighbour's screen gets over the cluster link, with no screen on the
 bench.
 
     python tools/remscreen.py --master COM6 --slave COM8 [--secs 10] [--rows 8]
-                              [--wire spi|uart]
+                              [--wire spi|uart] [--mode noise|box|flat]
 
 The slave board (the one that would have the panel) loads NULLDISP.SYS, a
 display that draws nothing and says in its journal, once a second, what
@@ -43,6 +43,10 @@ def main():
     ap.add_argument("--secs", type=int, default=10)
     ap.add_argument("--rows", type=int, default=8)
     ap.add_argument("--wire", choices=("spi", "uart"), default="spi")
+    # what GFXNOISE draws: noise (nothing packs), box (a square over a still
+    # picture: what sending only changes is for), flat (every pixel changes,
+    # every row packs)
+    ap.add_argument("--mode", choices=("noise", "box", "flat"), default="noise")
     a = ap.parse_args()
 
     m = Board(a.master, 115200, Sink(), False)
@@ -74,20 +78,24 @@ def main():
         # graphics
         t0 = time.time()
         m.buf = bytearray()
-        m.send(("gfxnoise %d %d\r\n" % (a.secs, a.rows)).encode())
+        m.send(("gfxnoise %d %d %s\r\n" % (a.secs, a.rows, a.mode)).encode())
         # its own last line, not the first prompt that comes by
         m.wait_for(b"frames/s", a.secs + 30.0)
         m.pump(1.0)
         from linkbench import clean, visible
         t = clean(visible(bytes(m.buf)).decode("latin-1"))
         dt = time.time() - t0
-        g = re.findall(r"gfxnoise: [^(\n]*?(?=gfxnoise:|\(\d\)|$|\n)", t)
-        for line in (g or [t[-300:]]):
-            print("master: %s" % line.strip()[:120])
+        fps = re.findall(r"(\d+) KB/s offered, (\d+) frames/s", t)
+        print("master: gfxnoise drew %s frames/s (%s KB/s)" %
+              ((fps[-1][1], fps[-1][0]) if fps else ("?", "?")))
         print("master: gfxnoise took %.1f s" % dt)
         for hit in journal(s, r"(?:nulldisp|rdev): [^\n]*?(?=[IWE] \(\d+\) |\(\d\) C:|$)",
                            3 * a.secs + 20)[-(2 * a.secs + 6):]:
             print("slave:  %s" % hit.strip()[:120])
+        # the sender's painter: whole screens brought up to date a second
+        for hit in journal(m, r"rdpaint: [^\n]*?(?=[IWE] \(\d+\) |\(\d\) C:|$)",
+                           3 * a.secs + 20)[-(a.secs + 4):]:
+            print("master: %s" % hit.strip()[:120])
 
         # text
         for cmd in ("dir c:\\", "type c:\\system.cfg", "dir c:\\drv"):
