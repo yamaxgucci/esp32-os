@@ -270,6 +270,14 @@ static void print_spilink(void)
                               (unsigned)sp.bytes_dropped, (unsigned)sp.timeouts,
                               (unsigned)sp.stalls);
         }
+        /* a framed link (ABI 0.60): what its own acknowledgements did */
+        if (sp.frame != 0u) {
+            ag_console_printf("        frame %u B: %u bad, %u holes asked for, "
+                              "%u sent again, %u restarts of the other end\n",
+                              (unsigned)sp.frame, (unsigned)sp.frames_bad,
+                              (unsigned)sp.seq_gaps, (unsigned)sp.rewinds,
+                              (unsigned)sp.peer_restarts);
+        }
         if (sp.recoveries != 0u || sp.errors != 0u || sp.task_stuck) {
             ag_console_printf("        %u rebuilds, %u errors (last %d)%s\n",
                               (unsigned)sp.recoveries, (unsigned)sp.errors,

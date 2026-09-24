@@ -118,6 +118,7 @@
 
 #include <argon/port/io.h>
 #include <argon/port/mem.h>
+#include <argon/port/random.h>
 #include <argon/port/sync.h>
 #include <argon/port/task.h>
 #include <argon/port/time.h>
@@ -234,10 +235,18 @@
  *   12-13 payload bytes that follow (segments: the stream bytes they
  *         stand for)
  *   14-15 room: free bytes in the SENDER's receive ring when it built this
- *   16-19 checksum of bytes 0..15 and the payload
+ *   16-19 the sender's session: a random number drawn when its link opened
+ *   20-23 checksum of bytes 0..19 and the payload
  *
  * The stream is the payloads, in order.  A side with nothing to say still
  * sends a header: that is how the other side learns its room and its ack.
+ *
+ * A NEW SESSION IS A NEW STREAM.  When the other end's session changes - it
+ * rebooted, or its link was closed and opened again - everything this end had
+ * of the old stream, both ways, is thrown away and both begin again at offset
+ * zero: the other end remembers none of it, and a survivor that waited for
+ * the old offsets would wait for ever.  A writer or a reader caught inside a
+ * block is told (-AG_EIO) rather than left to finish it into the new stream.
  *
  * THE FRAME IS THE SMALLER OF THE TWO ENDS' (24 Sep).  Each end opens with
  * its own largest frame - the caller's, or `frame` under [wire] in its
@@ -278,7 +287,7 @@
  * and last block numbers.  The sender keeps no list of its blocks: it reads
  * their record headers out of the transmit ring, where they are anyway.
  */
-#define SPILINK_HDR 20u
+#define SPILINK_HDR 24u
 /* frame sizes are said in these units, and the first frames are this long */
 #define SPILINK_UNIT  64u
 #define SPILINK_HELLO 64u
@@ -482,6 +491,13 @@ typedef struct {
     uint32_t last_rx_len;
     uint32_t rewinds;
     uint32_t naks;
+    /* this end's session, the other end's as last heard, and a count that
+     * moves when the other end starts over (a block caught across it is cut) */
+    uint32_t sess;
+    uint32_t peer_sess;
+    bool     peer_sess_known;
+    uint32_t epoch;
+    uint32_t peer_restarts;
     uint32_t starve_data;
     uint32_t starve_credit;
     uint32_t peer_room;
@@ -819,7 +835,7 @@ static uint32_t frame_sum(const uint8_t *f, uint32_t len)
     uint32_t a = 0x6A09E667u;
     uint32_t b = 0;
     const uint32_t *w = (const uint32_t *)f;
-    for (unsigned k = 0; k < 4u; k++) {
+    for (unsigned k = 0; k < 5u; k++) {
         a += w[k];
         b += a;
     }
@@ -1090,6 +1106,12 @@ static uint32_t frame_build(spilink_t *s, uint8_t *f, uint32_t allow,
         }
         if (limit > 0u) {
             n = ring_peek_at(&s->tx, s->sent_off, f + SPILINK_HDR, limit);
+            if (s->infl_n == 0u) {
+                /* the retransmit clock starts with the first frame out, not
+                 * at the last ack: after a quiet spell that was long ago, and
+                 * every answer of an exchange went twice (127 of 794) */
+                s->ack_at = ag_port_us();
+            }
             s->infl[s->infl_n].off = start;
             s->infl[s->infl_n].blk = blk;
             s->infl[s->infl_n].n = (uint16_t)n;
@@ -1150,7 +1172,8 @@ static uint32_t frame_build(spilink_t *s, uint8_t *f, uint32_t allow,
     put32(f + 8, s->rx_next);
     put16(f + 12, span);
     put16(f + 14, room);
-    put32(f + 16, frame_sum(f, body));
+    put32(f + 16, s->sess);
+    put32(f + 20, frame_sum(f, body));
     return n;
 }
 
@@ -1186,6 +1209,40 @@ static void ask_again(spilink_t *s, int64_t now)
         s->nak_at = now;
         s->seq_gaps++;
     }
+}
+
+/*
+ * The other end has started over: both streams begin again at zero, and what
+ * this end still held of the old ones is gone - the other end has none of
+ * it.  The frame size is agreed again, as the other end is saying hello.
+ */
+static void peer_restarted(spilink_t *s, uint32_t sess)
+{
+    lock(s);
+    s->peer_sess = sess;
+    s->epoch++;
+    s->peer_restarts++;
+    s->tx.head = s->tx.tail = s->tx.count = 0;
+    s->tx_base = 0;
+    s->sent_off = 0;
+    s->infl_n = 0;
+    s->resend = false;
+    s->resend_whole = false;
+    s->blk_next = 0;
+    s->next_block = 0;
+    s->rx.head = s->rx.tail = s->rx.count = 0;
+    s->rx_next = 0;
+    s->ooo_n = 0;
+    s->refused = false;
+    s->nak_pending = false;
+    s->nak_sent = false;
+    s->agreed = false;
+    s->peer_known = false;
+    unlock(s);
+    /* a writer waiting for room and a reader waiting for bytes both look at
+     * the epoch when they wake */
+    (void)ag_port_sem_give(s->space_sem);
+    (void)ag_port_sem_give(s->rx_sem);
 }
 
 /* A segmented payload that stands for exactly `span` stream bytes. */
@@ -1245,7 +1302,7 @@ static uint32_t frame_rx(spilink_t *s, const uint8_t *f, uint32_t got)
                                    : 0u;
     const int64_t  now = ag_port_us();
     if (body > pay || body > got - SPILINK_HDR || span > pay ||
-        frame_sum(f, body) != get32(f + 16)) {
+        frame_sum(f, body) != get32(f + 20)) {
         count(s, &s->frames_bad, 1u);
         ask_again(s, now);
         return 0u;
@@ -1254,6 +1311,12 @@ static uint32_t frame_rx(spilink_t *s, const uint8_t *f, uint32_t got)
         count(s, &s->frames_bad, 1u);
         ask_again(s, now);
         return 0u;
+    }
+    if (!s->peer_sess_known) {
+        s->peer_sess = get32(f + 16);
+        s->peer_sess_known = true;
+    } else if (get32(f + 16) != s->peer_sess) {
+        peer_restarted(s, get32(f + 16));
     }
     if (!s->agreed) {
         /* a peer that says nothing (0) is taken to be this end's size */
@@ -1879,6 +1942,7 @@ static void stats_of(const spilink_t *s, ag_spilink_stats_t *out)
     out->short_frames = s->short_frames;
     out->rewinds = s->rewinds;
     out->naks = s->naks;
+    out->peer_restarts = s->peer_restarts;
     out->starve_data = s->starve_data;
     out->starve_credit = s->starve_credit;
     out->frame = s->agreed ? s->frame : 0u;
@@ -2253,6 +2317,11 @@ ag_err_t ag_spilink_open2(int bus, int cs, uint32_t khz, uint32_t block,
     s->last_rx_len = 0;
     s->rewinds = 0;
     s->naks = 0;
+    ag_port_random(&s->sess, sizeof(s->sess));
+    s->sess |= 1u; /* never 0 */
+    s->peer_sess = 0;
+    s->peer_sess_known = false;
+    s->peer_restarts = 0;
     s->starve_data = 0;
     s->starve_credit = 0;
     s->peer_known = false;
@@ -2519,6 +2588,7 @@ int32_t ag_spilink_send(int bus, const void *buf, size_t len, uint32_t flags,
             (void)ring_put(&s->tx, hdr, SPILINK_REC);
             const uint8_t *p = (const uint8_t *)buf;
             size_t         done = ring_put(&s->tx, p, (uint32_t)len);
+            const uint32_t epoch = s->epoch;
             unlock(s);
             for (;;) {
                 if (s->master) {
@@ -2535,6 +2605,10 @@ int32_t ag_spilink_send(int bus, const void *buf, size_t len, uint32_t flags,
                 if (!s->open) {
                     unlock(s);
                     return -AG_ENODEV;
+                }
+                if (s->epoch != epoch) {
+                    unlock(s);
+                    return -AG_EIO; /* the other end started over */
                 }
                 done += ring_put(&s->tx, p + done, (uint32_t)(len - done));
                 unlock(s);
@@ -2595,7 +2669,8 @@ int32_t ag_spilink_recv(int bus, void *buf, size_t cap,
              * the second arrived took its first piece off the room of every
              * frame (Z->C3 81% of the wire against 92% for bytes, measured).
              */
-            uint32_t done = 0;
+            uint32_t       done = 0;
+            const uint32_t epoch = s->epoch;
             for (;;) {
                 uint32_t have = s->rx.count;
                 if (have > len - done) {
@@ -2618,6 +2693,10 @@ int32_t ag_spilink_recv(int bus, void *buf, size_t cap,
                 if (!s->open) {
                     unlock(s);
                     return -AG_ENODEV;
+                }
+                if (s->epoch != epoch) {
+                    unlock(s);
+                    return -AG_EIO; /* the other end started over */
                 }
             }
         }

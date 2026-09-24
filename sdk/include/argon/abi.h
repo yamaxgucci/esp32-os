@@ -1710,6 +1710,7 @@ typedef struct {
     uint32_t starve_data;    /* frames sent empty: nothing unsent to send  */
     uint32_t starve_credit;  /* frames sent empty: data, but no room/window*/
     uint32_t frame;          /* the frame both ends agreed on, 0 not yet   */
+    uint32_t peer_restarts;  /* times the other end started a new session  */
 } ag_spilink_stats_t;
 
 /* spi_link_open2 flags (ABI 0.60). */

@@ -148,10 +148,9 @@
       "src": ["apps/nodelink/nodelink.c", "apps/common/nlink/ag_nlink.c"] },
     {
       "out": "LINKSPI.SYS", "group": "core",
-      "_note": "The same wire driver over a four-wire SPI cable instead of a UART: nodelink's frame assembler, classes and windows, with a byte ring feeding fixed full-duplex blocks through io->spi_xfer (or spi_slave_xfer). Both bench boards are ESP32-S3, so one Xtensa image serves either end and the role - master or slave, who holds the clock - is a SYSTEM.CFG line rather than a second build. Loaded by hand for the SPI test (`drv load c:\\drv\\linkspi.sys`), which is why nothing auto-loads it.",
-      "cflags": "-Os -ffunction-sections -fdata-sections -DNL_QUANTUM=2048u",
-      "include": ["apps/common", "apps/common/nlink"],
-      "src": ["apps/linkspi/linkspi.c", "apps/common/nlink/ag_nlink.c"] },
+      "_note": "The cluster wire over a four-wire SPI cable: one message is one block of the kernel's framed link (io->spi_link_open2 in block mode, ABI 0.60), which clocks, checksums, acknowledges and sends again on its own - no nlink underneath any more. One image serves either end; the role - master or slave, who holds the clock - is a SYSTEM.CFG line. Built for the current target (group core), so the C3 gets a RISC-V one. Loaded by hand (`drv load c:\\drv\\linkspi.sys`) after NODELINK is unloaded, because the two share pins on the Zero-C3 cable.",
+      "include": ["apps/common"],
+      "src": ["apps/linkspi/linkspi.c"] },
     {
       "out": "NODELN32.SYS", "group": "board",
       "_note": "The same wire driver for an LX6 - the CYD is an ESP32, the S3 an ESP32-S3, and a .AXE or .SYS built for one throws an illegal instruction on the other rather than refusing to load. Two boards joined by this wire therefore need two images of it, and the only difference is the compiler. Needed to test the cluster on real hardware at all.",

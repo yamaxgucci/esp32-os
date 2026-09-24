@@ -64,6 +64,12 @@ def up(b, name):
     # card that is not there and its length moves from 0.2 s to 5 s
     b.wait_for(b"C:\\>", 40.0)
     b.pump(1.0)
+    # A C3's USB-Serial-JTAG ignores the RTS pulse (see wireblk.py), so the
+    # system is asked to restart itself as well.
+    b.buf = bytearray()
+    b.send(b"reboot\r\n")
+    b.wait_for(b"C:\\>", 40.0)
+    b.pump(1.0)
     say(b, "", 3.0)
     return name
 
@@ -137,6 +143,11 @@ def main():
         if dr:
             print("slave faults:  %s unarmed, %s dropped, %s timeouts, %s stalls"
                   % dr[-1])
+        for b, who in ((m, "master"), (s, "slave")):
+            tt = say(b, "link", 10.0)
+            fr = re.findall(r"frame \d+ B:[^\n]*", tt)
+            if fr:
+                print("%s link:   %s" % (who, fr[-1].strip()))
         for b, who in ((m, "master"), (s, "slave")):
             j = say(b, "log", 10.0)
             for hit in re.findall(r"W \(\d+\) (?:linkspi|spilink|link|rdev)[^|]{0,160}", j)[-4:]:
