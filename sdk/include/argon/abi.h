@@ -1861,6 +1861,10 @@ typedef struct ag_io_api {
      */
     ag_err_t (*spi_link_open2)(int bus, int cs, uint32_t khz, uint32_t frame,
                                uint32_t flags);
+    /* ABI 0.60: write all of buf, waiting for room; returns what was taken
+     * once timeout_ms passes with nothing more accepted */
+    int32_t (*spi_link_write_wait)(int bus, const void *buf, size_t len,
+                                   uint32_t timeout_ms);
 } ag_io_api_t;
 
 /* ------------------------------------------------------------------------ */

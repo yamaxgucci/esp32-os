@@ -592,6 +592,11 @@ int ag_main(int argc, char **argv)
             } else {
                 build(s_blk, block, seq);
                 uint32_t off = 0;
+                if (AG_HAS(io, spi_link_write_wait)) {
+                    const int32_t w =
+                        io->spi_link_write_wait(bus, s_blk, block, 200);
+                    off = (w > 0) ? (uint32_t)w : 0u;
+                }
                 while (off < block && ag_micros() < until) {
                     const int32_t n =
                         io->spi_link_write(bus, s_blk + off, block - off);

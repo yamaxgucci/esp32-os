@@ -87,6 +87,8 @@ ag_err_t ag_spilink_stats(int bus, ag_spilink_stats_t *out);
  * caller keeps the remainder and comes back.
  */
 int32_t ag_spilink_write(int bus, const void *buf, size_t len);
+int32_t ag_spilink_write_wait(int bus, const void *buf, size_t len,
+                              uint32_t timeout_ms);
 
 /*
  * Bytes taken from the RX ring, or -AG_EAGAIN when nothing arrived inside

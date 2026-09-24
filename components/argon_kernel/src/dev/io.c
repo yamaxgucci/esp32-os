@@ -1395,6 +1395,7 @@ const ag_io_api_t ag_io_api_table = {
     .spi_link_read = io_spi_link_read,
     .spi_link_stats = io_spi_link_stats,
     .spi_link_open2 = io_spi_link_open2,
+    .spi_link_write_wait = ag_spilink_write_wait,
 };
 
 ag_err_t ag_io_init(void)

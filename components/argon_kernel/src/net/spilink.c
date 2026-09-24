@@ -377,6 +377,9 @@ typedef struct {
     uint32_t hist_at;
     /* Written by a writer, taken by an idle master so it clocks at once. */
     ag_port_sem_t tx_sem;
+    /* Given by the service whenever it frees transmit ring: a writer that
+     * found the ring full waits on this instead of guessing with a sleep. */
+    ag_port_sem_t space_sem;
     uint32_t frames_bad;
     uint32_t seq_gaps;
     uint32_t wire_us;
@@ -819,6 +822,9 @@ static ag_err_t slot_arm(spilink_t *s, unsigned i, uint32_t *carried)
         lock(s);
         ring_commit(&s->tx, n);
         unlock(s);
+        if (n > 0u) {
+            (void)ag_port_sem_give(s->space_sem);
+        }
         *carried = n;
         return AG_OK;
     }
@@ -1145,6 +1151,9 @@ static void spilink_master_task(void *arg)
         s->hist_at = (s->hist_at + 1u) % SPILINK_AHEAD;
         s->blocks_clocked++;
         unlock(s);
+        if (n > 0u) {
+            (void)ag_port_sem_give(s->space_sem);
+        }
 
         const uint32_t got = deliver_framed(s, rxf, s->block);
         if (n > 0u || got > 0u) {
@@ -1233,8 +1242,10 @@ static ag_err_t link_teardown(spilink_t *s, ag_spilink_stats_t *out)
     s->stop = true;
     unlock(s);
 
-    /* A reader blocked in read() has to see the link close under it. */
+    /* A reader blocked in read() has to see the link close under it, and so
+     * does a writer waiting for room. */
     (void)ag_port_sem_give(s->rx_sem);
+    (void)ag_port_sem_give(s->space_sem);
 
     bool gone = true;
     if (s->task != NULL) {
@@ -1402,8 +1413,11 @@ ag_err_t ag_spilink_open2(int bus, int cs, uint32_t khz, uint32_t block,
     if (s->tx_sem == NULL) {
         s->tx_sem = ag_port_sem_new_binary();
     }
+    if (s->space_sem == NULL) {
+        s->space_sem = ag_port_sem_new_binary();
+    }
     if (s->lock == NULL || s->rx_sem == NULL || s->exit_sem == NULL ||
-        s->tx_sem == NULL) {
+        s->tx_sem == NULL || s->space_sem == NULL) {
         return -AG_ENOMEM;
     }
 
@@ -1683,6 +1697,50 @@ int32_t ag_spilink_write(int bus, const void *buf, size_t len)
 
     /* Nothing was dropped: what did not fit is still the caller's. */
     return (n > 0u) ? (int32_t)n : -AG_EAGAIN;
+}
+
+/*
+ * Write all of `buf`, waiting for room as the service makes it, or until
+ * `timeout_ms` has passed with nothing more taken.  Returns what was taken.
+ *
+ * Why it exists: a caller of the plain write that found the ring full could
+ * only sleep and try again, and the shortest sleep there is is a tick - a
+ * millisecond, in which a 40 MHz link empties 4 KB and then clocks frames
+ * with nothing in them.  Measured: 72% of the wire with 8 KB writes, the
+ * same with the receiver checking nothing, so it was never the receiver.
+ */
+int32_t ag_spilink_write_wait(int bus, const void *buf, size_t len,
+                              uint32_t timeout_ms)
+{
+    const int idx = link_index(bus);
+    if (idx < 0 || buf == NULL || len == 0) {
+        return -AG_EINVAL;
+    }
+    spilink_t *const s = &s_link[idx];
+    if (s->lock == NULL) {
+        return -AG_ENODEV;
+    }
+    const uint8_t *p = (const uint8_t *)buf;
+    size_t         done = 0;
+    while (done < len) {
+        lock(s);
+        if (!s->open) {
+            unlock(s);
+            break;
+        }
+        const uint32_t n = ring_put(&s->tx, p + done, (uint32_t)(len - done));
+        const bool     wake = s->master && n > 0u;
+        unlock(s);
+        if (wake) {
+            (void)ag_port_sem_give(s->tx_sem);
+        }
+        done += n;
+        if (done < len &&
+            !ag_port_sem_take(s->space_sem, ticks_at_least(timeout_ms))) {
+            break;
+        }
+    }
+    return (done > 0u) ? (int32_t)done : -AG_EAGAIN;
 }
 
 int32_t ag_spilink_read(int bus, void *buf, size_t len, uint32_t timeout_ms)
