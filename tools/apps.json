@@ -146,6 +146,10 @@
     { "out": "NODELINK.SYS", "group": "core",
       "include": ["apps/common", "apps/common/nlink"],
       "src": ["apps/nodelink/nodelink.c", "apps/common/nlink/ag_nlink.c"] },
+    { "out": "NULLDISP.SYS", "group": "core",
+      "_note": "A screen with no glass: a 320x240 RGB565 display with a text mode that draws nothing and says once a second in the journal what reached it - frames/s, KB/s, text rows. For measuring a neighbour's picture over the cluster link on a bench with no panel.",
+      "include": ["apps/common"],
+      "src": ["apps/nulldisp/nulldisp.c"] },
     {
       "out": "LINKSPI.SYS", "group": "core",
       "_note": "The cluster wire over a four-wire SPI cable: one message is one block of the kernel's framed link (io->spi_link_open2 in block mode, ABI 0.60), which clocks, checksums, acknowledges and sends again on its own - no nlink underneath any more. One image serves either end; the role - master or slave, who holds the clock - is a SYSTEM.CFG line. Built for the current target (group core), so the C3 gets a RISC-V one. Loaded by hand (`drv load c:\\drv\\linkspi.sys`) after NODELINK is unloaded, because the two share pins on the Zero-C3 cable.",

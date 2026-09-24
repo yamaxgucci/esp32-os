@@ -350,16 +350,16 @@ static void route(wire_t *w, uint8_t chan, const ag_link_addr_t *from,
 #define READER_BUF_MIN 288u
 #define READER_BUF_MAX 4096u
 
-static void reader_task(void *arg)
+/* The reader's buffer for the driver on this wire now: its mtu plus room for
+ * whatever header the driver keeps on top, never below the 288 every service
+ * was written against. */
+static uint32_t reader_cap(const wire_t *w)
 {
-    wire_t  *w = (wire_t *)arg;
     uint32_t cap = READER_BUF_MIN;
     if (w->ops != NULL && w->ops->info != NULL) {
         ag_link_info_t li;
         memset(&li, 0, sizeof(li));
         if (w->ops->info(w->dev, &li) == AG_OK && li.mtu > 0u) {
-            /* The payload plus room for whatever header the driver keeps on
-             * top of its own mtu. */
             cap = li.mtu + 64u;
         }
     }
@@ -369,24 +369,48 @@ static void reader_task(void *arg)
     if (cap > READER_BUF_MAX) {
         cap = READER_BUF_MAX;
     }
-    uint8_t *buf = (uint8_t *)ag_port_alloc(cap, AG_MEM_BYTE);
-    if (buf == NULL) {
-        ag_log(AG_LOG_ERROR, "link",
-               "%s: no %u bytes for the reader; falling back to 288", w->name,
-               (unsigned)cap);
-        cap = READER_BUF_MIN;
-        buf = (uint8_t *)ag_port_alloc(cap, AG_MEM_BYTE);
-        if (buf == NULL) {
-            w->reader = NULL;
-            ag_port_task_delete(NULL);
-            return;
-        }
-    }
+    return cap;
+}
+
+/*
+ * SIZED AGAIN WHEN THE WIRE'S DRIVER CHANGES.  The reader outlives the device
+ * it was started for: `drv unload NODELINK`, `drv load linkspi.sys` and
+ * `link use node1` rebind the wire under a reader that is still running, and
+ * a buffer sized once, for NODELINK's 248 bytes, cut every 1 948-byte
+ * rectangle LINKSPI carried to 312 - and the screen service threw each one
+ * away as short.  The whole picture crossed the wire and none of it arrived.
+ */
+static void reader_task(void *arg)
+{
+    wire_t            *w = (wire_t *)arg;
+    const ag_device_t *sized = NULL;
+    uint32_t           cap = 0;
+    uint8_t           *buf = NULL;
 
     while (!w->reader_stop) {
         if (w->ops == NULL) {
             ag_port_task_delay(ag_port_ms_to_ticks(20));
             continue;
+        }
+        if (buf == NULL || w->dev != sized) {
+            const uint32_t want = reader_cap(w);
+            sized = w->dev;
+            if (buf == NULL || want != cap) {
+                ag_port_free(buf);
+                cap = want;
+                buf = (uint8_t *)ag_port_alloc(cap, AG_MEM_BYTE);
+                if (buf == NULL) {
+                    ag_log(AG_LOG_ERROR, "link",
+                           "%s: no %u bytes for the reader; falling back to "
+                           "288",
+                           w->name, (unsigned)cap);
+                    cap = READER_BUF_MIN;
+                    buf = (uint8_t *)ag_port_alloc(cap, AG_MEM_BYTE);
+                }
+                if (buf == NULL) {
+                    break;
+                }
+            }
         }
         uint8_t        chan = 0;
         ag_link_addr_t from;
