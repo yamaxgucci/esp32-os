@@ -26,6 +26,10 @@
 
 /* The port must already be up at its baud (io does that). */
 ag_err_t ag_uartlink_open(int port, uint32_t frame, uint32_t flags);
+
+/* The largest frame a link opened with `frame` allocates for: 0 is the
+ * board's [wire] frame.  io sizes the port's rings by it. */
+uint32_t ag_uartlink_frame(uint32_t frame);
 ag_err_t ag_uartlink_close(int port, ag_spilink_stats_t *out);
 ag_err_t ag_uartlink_stats(int port, ag_spilink_stats_t *out);
 int32_t  ag_uartlink_write(int port, const void *buf, size_t len);
@@ -35,6 +39,13 @@ int32_t  ag_uartlink_send(int port, const void *buf, size_t len, uint32_t flags,
                           uint32_t timeout_ms);
 int32_t  ag_uartlink_recv(int port, void *buf, size_t cap,
                           ag_spilink_block_t *info, uint32_t timeout_ms);
+/* A block in two parts, head then buf (ABI 0.62). */
+int32_t  ag_uartlink_send2(int port, const void *head, size_t hlen,
+                           const void *buf, size_t len, uint32_t flags,
+                           uint32_t timeout_ms);
+int32_t  ag_uartlink_recv2(int port, void *head, size_t hcap, void *buf,
+                           size_t cap, ag_spilink_block_t *info,
+                           uint32_t timeout_ms);
 int32_t  ag_uartlink_read(int port, void *buf, size_t len, uint32_t timeout_ms);
 
 #endif /* ARGON_UARTLINK_H */

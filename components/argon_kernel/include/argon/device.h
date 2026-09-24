@@ -102,6 +102,9 @@ struct ag_device {
      * inside somebody's driver.
      */
     uint32_t calls;
+    /* ...and calls straight into its class ops (ag_dev_call_begin), counted
+     * under a small lock of their own rather than the registry's */
+    uint32_t direct;
     /*
      * This device's own lock, from the lock interface below, held across a call
      * into it in place of the registry lock.  NULL means there is none and the
@@ -156,6 +159,10 @@ typedef struct {
     void (*call_close)(void *ctx, void *iolock);
     void (*call_hold)(void *ctx, void *iolock);
     void (*call_release)(void *ctx, void *iolock);
+    /* the direct-call count's lock: a plain one, held for a few
+     * instructions, taken inside `lock` and never around it */
+    void (*count_lock)(void *ctx);
+    void (*count_unlock)(void *ctx);
     void *ctx;
 } ag_dev_lock_t;
 
@@ -251,7 +258,9 @@ uint32_t ag_dev_calls_of_owner(const void *owner);
 /*
  * A call straight into a driver's class ops, counted like the calls above so
  * an unload waits for it to come out - but WITHOUT the device's lock, which a
- * link's recv would hold for its whole timeout and so shut out every send.
+ * link's recv would hold for its whole timeout and so shut out every send,
+ * and without the registry's, which the console holds across a remote
+ * screen's op while that op waits for an answer this very call brings in.
  *
  * The link provider's reader sits inside a driver's recv almost all the time.
  * Uncounted, `drv unload NODELINK` gave the image back under it: the fini

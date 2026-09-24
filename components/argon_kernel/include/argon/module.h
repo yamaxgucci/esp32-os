@@ -34,6 +34,9 @@ typedef struct {
     char version[16];
     size_t code_bytes;
     size_t data_bytes;
+    /* internal memory it took to load and start - its image's data and all
+     * its init allocated, the kernel services it opened included */
+    int32_t held_bytes;
 } ag_modinfo_t;
 
 /*

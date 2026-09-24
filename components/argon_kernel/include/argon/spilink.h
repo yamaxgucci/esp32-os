@@ -93,6 +93,13 @@ int32_t ag_spilink_send(int bus, const void *buf, size_t len, uint32_t flags,
                         uint32_t timeout_ms);
 int32_t ag_spilink_recv(int bus, void *buf, size_t cap,
                         ag_spilink_block_t *info, uint32_t timeout_ms);
+/* A block in two parts, head then buf (ABI 0.62). */
+int32_t ag_spilink_send2(int bus, const void *head, size_t hlen,
+                         const void *buf, size_t len, uint32_t flags,
+                         uint32_t timeout_ms);
+int32_t ag_spilink_recv2(int bus, void *head, size_t hcap, void *buf,
+                         size_t cap, ag_spilink_block_t *info,
+                         uint32_t timeout_ms);
 
 /*
  * Bytes taken from the RX ring, or -AG_EAGAIN when nothing arrived inside

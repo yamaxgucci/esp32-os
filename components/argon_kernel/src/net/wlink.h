@@ -346,6 +346,12 @@ int32_t wl_send(wlink_t *w, const void *buf, size_t len, uint32_t flags,
                 uint32_t timeout_ms);
 int32_t wl_recv(wlink_t *w, void *buf, size_t cap, ag_spilink_block_t *info,
                 uint32_t timeout_ms);
+/* The same, the block in two parts: `head` then `buf`, one block on the wire.
+ * recv2 fills head first; it returns the bytes placed in both. */
+int32_t wl_send2(wlink_t *w, const void *head, size_t hlen, const void *buf,
+                 size_t len, uint32_t flags, uint32_t timeout_ms);
+int32_t wl_recv2(wlink_t *w, void *head, size_t hcap, void *buf, size_t cap,
+                 ag_spilink_block_t *info, uint32_t timeout_ms);
 int32_t wl_read(wlink_t *w, void *buf, size_t len, uint32_t timeout_ms);
 /* The protocol's counters into a stats struct. */
 void wl_stats(const wlink_t *w, ag_spilink_stats_t *out);

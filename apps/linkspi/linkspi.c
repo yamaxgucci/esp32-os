@@ -77,11 +77,11 @@ typedef struct {
     bool     link_open;
     char     dev[AG_DEV_NAME_MAX];
 
-    /* One writer and one reader a link: the kernel's rule for block mode. */
+    /* One writer and one reader a link: the kernel's rule for block mode.
+     * The head goes beside the caller's bytes, not in front of a copy of
+     * them (send2/recv2): 4 KB of buffers here once did nothing else. */
     ag_mutex_t txlock;
     ag_mutex_t rxlock;
-    uint8_t    txbuf[LSPI_HEAD + LSPI_MTU];
-    uint8_t    rxbuf[LSPI_HEAD + LSPI_MTU];
 
     bool     heard;
     uint32_t sent, received, tx_bytes, rx_bytes;
@@ -157,16 +157,14 @@ static int32_t send_common(ag_device_t *dev, uint8_t chan, uint8_t cls,
     }
     const bool stream = (cls == AG_LINK_STREAM);
 
+    uint8_t head[LSPI_HEAD];
+    head[0] = cls;
+    head[1] = chan;
+    put16(head + 2, dst);
+    put16(head + 4, src);
     TASK->mutex_lock(nd->txlock, UINT32_MAX);
-    nd->txbuf[0] = cls;
-    nd->txbuf[1] = chan;
-    put16(nd->txbuf + 2, dst);
-    put16(nd->txbuf + 4, src);
-    if (len > 0) {
-        memcpy(nd->txbuf + LSPI_HEAD, buf, len);
-    }
-    const int32_t w = IO->spi_link_send(
-        nd->bus, nd->txbuf, LSPI_HEAD + len,
+    const int32_t w = IO->spi_link_send2(
+        nd->bus, head, LSPI_HEAD, buf, len,
         stream ? 0u : AG_SPILINK_RELIABLE, stream ? 1u : LSPI_SEND_MS);
     int32_t r;
     if (w > 0) {
@@ -226,9 +224,10 @@ static int32_t recv_common(ag_device_t *dev, uint8_t *chan, void *buf,
         const int32_t left = (int32_t)(deadline - now_ms());
         ag_spilink_block_t bi;
         memset(&bi, 0, sizeof(bi));
-        const int32_t n = IO->spi_link_recv(nd->bus, nd->rxbuf,
-                                            sizeof(nd->rxbuf), &bi,
-                                            (left > 0) ? (uint32_t)left : 0u);
+        uint8_t       head[LSPI_HEAD];
+        const int32_t n = IO->spi_link_recv2(nd->bus, head, LSPI_HEAD, buf, max,
+                                             &bi,
+                                             (left > 0) ? (uint32_t)left : 0u);
         if (n == 0 && (bi.flags & AG_SPILINK_LOST) != 0u) {
             /* stream messages the wire lost, and the link says which */
             nd->stream_dropped += (uint32_t)(uint16_t)(bi.last - bi.no) + 1u;
@@ -242,22 +241,21 @@ static int32_t recv_common(ag_device_t *dev, uint8_t *chan, void *buf,
             r = n;
             break;
         }
-        if ((uint32_t)n < LSPI_HEAD || nd->rxbuf[0] >= AG_LINK_CLASSES) {
+        if ((uint32_t)n < LSPI_HEAD || head[0] >= AG_LINK_CLASSES) {
             nd->malformed++;
             continue;
         }
-        const uint32_t len = (uint32_t)n - LSPI_HEAD;
-        const uint32_t take = (len < max) ? len : (uint32_t)max;
-        memcpy(buf, nd->rxbuf + LSPI_HEAD, take);
-        *chan = nd->rxbuf[1];
+        /* the bytes are in buf already, cut at max by the link */
+        const uint32_t take = (uint32_t)n - LSPI_HEAD;
+        *chan = head[1];
         if (from != NULL) {
-            from->cls = nd->rxbuf[0];
-            from->dst = get16(nd->rxbuf + 2);
-            from->src = get16(nd->rxbuf + 4);
+            from->cls = head[0];
+            from->dst = get16(head + 2);
+            from->src = get16(head + 4);
         }
         nd->heard = true;
         nd->received++;
-        nd->rx_bytes += len;
+        nd->rx_bytes += take;
         r = (int32_t)take;
         break;
     }
@@ -508,8 +506,8 @@ ag_err_t ag_driver_init(void)
     }
     /* The framed link in block mode is ABI 0.60; there is no fallback to the
      * raw path this driver used to be - on the C3 it did not even open. */
-    if (!AG_HAS(IO, spi_link_open2) || !AG_HAS(IO, spi_link_send) ||
-        !AG_HAS(IO, spi_link_recv) || !AG_HAS(IO, spi_link_close)) {
+    if (!AG_HAS(IO, spi_link_open2) || !AG_HAS(IO, spi_link_send2) ||
+        !AG_HAS(IO, spi_link_recv2) || !AG_HAS(IO, spi_link_close)) {
         ag_log(AG_LOG_ERROR, "linkspi",
                "this kernel has no framed SPI link in block mode (ABI 0.60)");
         return -AG_ENOSYS;

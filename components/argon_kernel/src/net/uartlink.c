@@ -454,6 +454,17 @@ static void tx_task(void *arg)
 /* Open and close                                                          */
 /* ---------------------------------------------------------------------- */
 
+uint32_t ag_uartlink_frame(uint32_t frame)
+{
+    if (frame == 0u) {
+        /* the board's own: how much memory a link may cost is its business */
+        const int32_t v =
+            ag_cfg_get_int(ag_sysconfig(), "wire.frame", (int32_t)4096);
+        frame = (v > 0) ? (uint32_t)v : 4096u;
+    }
+    return (frame > WL_FRAME_MAX) ? WL_FRAME_MAX : frame;
+}
+
 ag_err_t ag_uartlink_open(int port, uint32_t frame, uint32_t flags)
 {
     if (port < 0 || port >= UL_PORTS) {
@@ -483,15 +494,7 @@ ag_err_t ag_uartlink_open(int port, uint32_t frame, uint32_t flags)
         w->tx_sem == NULL || u->exit_sem == NULL) {
         return -AG_ENOMEM;
     }
-    if (frame == 0u) {
-        /* the board's own: how much memory a link may cost is its business */
-        const int32_t v =
-            ag_cfg_get_int(ag_sysconfig(), "wire.frame", (int32_t)4096);
-        frame = (v > 0) ? (uint32_t)v : 4096u;
-    }
-    if (frame > WL_FRAME_MAX) {
-        frame = WL_FRAME_MAX;
-    }
+    frame = ag_uartlink_frame(frame);
     if (frame < WL_HELLO || frame % WL_UNIT != 0u) {
         return -AG_EINVAL;
     }
@@ -503,7 +506,9 @@ ag_err_t ag_uartlink_open(int port, uint32_t frame, uint32_t flags)
     if (dma) {
         ag_err_t le = -AG_ENOTSUP;
         if (flags & AG_UARTLINK_RING) {
-            le = ag_port_uart_dma_listen_ring(port);
+            /* what the other end may have in flight is our room, three
+             * frames: four, and the reader's moment on top */
+            le = ag_port_uart_dma_listen_ring(port, 4u * frame);
             if (le == -AG_ENOTSUP) {
                 /* not on this chip (the S3): the DMA's receive as it is */
                 ag_log(AG_LOG_WARN, "uartlink",
@@ -711,6 +716,24 @@ int32_t ag_uartlink_recv(int port, void *buf, size_t cap,
 {
     wlink_t *const w = wl_of(port);
     return (w == NULL) ? -AG_EINVAL : wl_recv(w, buf, cap, info, timeout_ms);
+}
+
+int32_t ag_uartlink_send2(int port, const void *head, size_t hlen,
+                       const void *buf, size_t len, uint32_t flags,
+                       uint32_t timeout_ms)
+{
+    wlink_t *const w = wl_of(port);
+    return (w == NULL) ? -AG_EINVAL
+                       : wl_send2(w, head, hlen, buf, len, flags, timeout_ms);
+}
+
+int32_t ag_uartlink_recv2(int port, void *head, size_t hcap, void *buf,
+                       size_t cap, ag_spilink_block_t *info,
+                       uint32_t timeout_ms)
+{
+    wlink_t *const w = wl_of(port);
+    return (w == NULL) ? -AG_EINVAL
+                       : wl_recv2(w, head, hcap, buf, cap, info, timeout_ms);
 }
 
 int32_t ag_uartlink_read(int port, void *buf, size_t len, uint32_t timeout_ms)

@@ -343,7 +343,28 @@ typedef struct {
     bool            fault_reported;
 } spilink_t;
 
-static spilink_t s_link[AG_SPI_BUSES];
+/*
+ * On the heap, made by the first open of a bus and kept (the lock and the
+ * wakes in it outlive a close), as uartlink's are: 1 200 bytes of statics
+ * on every board for a link most never open, and the S3's emulator build
+ * was 320 bytes over its DRAM (25 Sep 2026).
+ */
+static spilink_t *s_link[AG_SPI_BUSES];
+
+static spilink_t *link_make(int idx)
+{
+    if (s_link[idx] == NULL) {
+        spilink_t *s = ag_port_alloc(sizeof(*s), AG_MEM_FAST);
+        if (s == NULL) {
+            s = ag_port_alloc(sizeof(*s), AG_MEM_BYTE);
+        }
+        if (s != NULL) {
+            memset(s, 0, sizeof(*s));
+        }
+        s_link[idx] = s;
+    }
+    return s_link[idx];
+}
 
 static int link_index(int bus)
 {
@@ -1179,8 +1200,9 @@ static void spilink_on_revoke(ag_device_t *dev)
         return;
     }
     for (unsigned i = 0; i < AG_SPI_BUSES; i++) {
-        if (s_link[i].w.open && s_link[i].owner == dev->owner) {
-            (void)link_teardown(&s_link[i], NULL);
+        spilink_t *const s = s_link[i];
+        if (s != NULL && s->w.open && s->owner == dev->owner) {
+            (void)link_teardown(s, NULL);
         }
     }
 }
@@ -1234,7 +1256,10 @@ ag_err_t ag_spilink_open2(int bus, int cs, uint32_t khz, uint32_t block,
         return -AG_EINVAL;
     }
 
-    spilink_t *const s = &s_link[idx];
+    spilink_t *const s = link_make(idx);
+    if (s == NULL) {
+        return -AG_ENOMEM;
+    }
 
     /*
      * Created once and kept.  Each is checked on its own, so an open that
@@ -1460,14 +1485,15 @@ ag_err_t ag_spilink_close(int bus, ag_spilink_stats_t *out)
     if (idx < 0) {
         return -AG_ERANGE;
     }
-    if (s_link[idx].w.lock == NULL) {
+    spilink_t *const s = s_link[idx];
+    if (s == NULL || s->w.lock == NULL) {
         return -AG_ENODEV;
     }
     if (out != NULL) {
         memset(out, 0, sizeof(*out));
         out->last_error = AG_OK;
     }
-    return link_teardown(&s_link[idx], out);
+    return link_teardown(s, out);
 }
 
 /*
@@ -1491,8 +1517,8 @@ ag_err_t ag_spilink_stats(int bus, ag_spilink_stats_t *out)
         return -AG_EINVAL;
     }
 
-    spilink_t *const s = &s_link[idx];
-    if (s->w.lock == NULL) {
+    spilink_t *const s = s_link[idx];
+    if (s == NULL || s->w.lock == NULL) {
         return -AG_ENODEV;
     }
 
@@ -1534,7 +1560,7 @@ ag_err_t ag_spilink_stats(int bus, ag_spilink_stats_t *out)
 static wlink_t *wl_of(int bus)
 {
     const int idx = link_index(bus);
-    return (idx < 0) ? NULL : &s_link[idx].w;
+    return (idx < 0 || s_link[idx] == NULL) ? NULL : &s_link[idx]->w;
 }
 
 int32_t ag_spilink_write(int bus, const void *buf, size_t len)
@@ -1562,6 +1588,24 @@ int32_t ag_spilink_recv(int bus, void *buf, size_t cap,
 {
     wlink_t *const w = wl_of(bus);
     return (w == NULL) ? -AG_EINVAL : wl_recv(w, buf, cap, info, timeout_ms);
+}
+
+int32_t ag_spilink_send2(int bus, const void *head, size_t hlen,
+                       const void *buf, size_t len, uint32_t flags,
+                       uint32_t timeout_ms)
+{
+    wlink_t *const w = wl_of(bus);
+    return (w == NULL) ? -AG_EINVAL
+                       : wl_send2(w, head, hlen, buf, len, flags, timeout_ms);
+}
+
+int32_t ag_spilink_recv2(int bus, void *head, size_t hcap, void *buf,
+                       size_t cap, ag_spilink_block_t *info,
+                       uint32_t timeout_ms)
+{
+    wlink_t *const w = wl_of(bus);
+    return (w == NULL) ? -AG_EINVAL
+                       : wl_recv2(w, head, hcap, buf, cap, info, timeout_ms);
 }
 
 int32_t ag_spilink_read(int bus, void *buf, size_t len, uint32_t timeout_ms)

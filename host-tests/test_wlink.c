@@ -314,11 +314,110 @@ static void a_restart_starts_the_stream_over(void)
     end_close(&b);
 }
 
+/* ---------------------------------------------------------------------- */
+
+/*
+ * A block in two parts, as NODELINK and LINKSPI send one: a 6-byte head and
+ * the caller's bytes, joined only on the wire, and taken apart again on the
+ * way out - head first, the rest into the caller's buffer, cut where it
+ * ends.  Blocks longer than a frame, over a wire that loses and damages.
+ */
+static void blocks_in_two_parts(void)
+{
+    static wlink_t a, b;
+    end_open(&a, AG_SPILINK_BLOCKS);
+    end_open(&b, AG_SPILINK_BLOCKS);
+    const uint32_t count = 400u;
+    uint32_t       sent = 0, good = 0, cut_right = 0, bad = 0;
+    for (uint32_t steps = 0; steps < 400000u && good < count; steps++) {
+        tick();
+        /* in: head + body, whole blocks only (one thread: never wait) */
+        while (sent < count) {
+            /* longer than a frame, and no more: this reader takes a block
+             * only once it is all in, so one near the receive ring's size
+             * would wait for room the reader will not make (recv itself
+             * takes a block as it comes) */
+            const uint32_t len = 1u + (sent * 97u) % 800u;
+            if (ring_space(&a.tx) < WL_REC + 6u + len) {
+                break;
+            }
+            uint8_t head[6], body[1100];
+            for (uint32_t i = 0; i < 6u; i++) {
+                head[i] = (uint8_t)(0xA0u + sent + i);
+            }
+            for (uint32_t i = 0; i < len; i++) {
+                body[i] = pat(sent * 1000u + i);
+            }
+            CHECK(wl_send2(&a, head, 6u, body, len, AG_SPILINK_RELIABLE, 0u) ==
+                  (int32_t)(6u + len));
+            sent++;
+        }
+        one_frame(&a, &b, 5u, 2u);
+        one_frame(&b, &a, 5u, 2u);
+        /* out: every whole block, into a head and a buffer that is short
+         * for one block in three */
+        for (;;) {
+            if (b.rx.count < WL_REC) {
+                break;
+            }
+            uint8_t h[WL_REC];
+            (void)ring_peek(&b.rx, h, WL_REC);
+            const uint32_t len = (uint32_t)h[0] | ((uint32_t)h[1] << 8);
+            if (b.rx.count < WL_REC + len) {
+                break;
+            }
+            const uint32_t no = good + bad;
+            const uint32_t body_len = len - 6u;
+            const uint32_t cap = (no % 3u == 0u) ? body_len / 2u : 1100u;
+            uint8_t        head[6], buf[1100];
+            ag_spilink_block_t bi;
+            memset(&bi, 0, sizeof(bi));
+            const int32_t n = wl_recv2(&b, head, 6u, buf, cap, &bi, 0u);
+            const uint32_t want = 6u + ((body_len < cap) ? body_len : cap);
+            bool ok = (n == (int32_t)want);
+            for (uint32_t i = 0; ok && i < 6u; i++) {
+                ok = (head[i] == (uint8_t)(0xA0u + no + i));
+            }
+            for (uint32_t i = 0; ok && i + 6u < want; i++) {
+                ok = (buf[i] == pat(no * 1000u + i));
+            }
+            if (ok) {
+                good++;
+                cut_right += (want < len) ? 1u : 0u;
+            } else {
+                bad++;
+            }
+        }
+    }
+    printf("  wlink two parts: %u of %u blocks whole, %u of them cut at the "
+           "buffer's end as asked, %u wrong\n",
+           (unsigned)good, (unsigned)count, (unsigned)cut_right, (unsigned)bad);
+    if (good != count) {
+        uint8_t h[WL_REC] = {0};
+        if (b.rx.count >= WL_REC) {
+            (void)ring_peek(&b.rx, h, WL_REC);
+        }
+        printf("  stuck: sent %u, a.tx %u (sent_off %u), b.rx %u of %u, "
+               "next block len %u, a allowance edge %u next %u\n",
+               (unsigned)sent, (unsigned)a.tx.count, (unsigned)a.sent_off,
+               (unsigned)b.rx.count, (unsigned)b.rx.cap,
+               (unsigned)((uint32_t)h[0] | ((uint32_t)h[1] << 8)),
+               (unsigned)(a.peer_ack + a.peer_room),
+               (unsigned)(a.tx_base + a.sent_off));
+    }
+    CHECK(good == count);
+    CHECK(bad == 0u);
+    CHECK(cut_right > 0u);
+    end_close(&a);
+    end_close(&b);
+}
+
 int main(void)
 {
     bytes_through_a_bad_wire();
     blocks_through_a_bad_wire();
     a_restart_starts_the_stream_over();
+    blocks_in_two_parts();
     printf("%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
 }

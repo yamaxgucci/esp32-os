@@ -14,6 +14,7 @@
 #include <argon/path.h>
 #include <argon/probe.h>
 #include <argon/service.h>
+#include <argon/port/mem.h>
 #include <argon/port/task.h>
 #include <argon/port/time.h>
 
@@ -26,6 +27,7 @@ typedef struct {
     char             path[AG_PATH_MAX];
     ag_loaded_app_t  app;
     ag_module_fini_fn fini;
+    int32_t          held; /* internal memory load + init took */
 } module_t;
 
 static module_t               s_modules[AG_MODULE_MAX];
@@ -182,6 +184,7 @@ ag_err_t ag_module_load_hinted(const char *path, const char *cwd,
     }
 
     memset(slot, 0, sizeof(*slot));
+    const size_t free0 = ag_port_mem_free(AG_MEM_FAST);
     ag_err_t err = ag_loader_load(path, cwd, &slot->app);
     if (err != AG_OK) {
         return err;
@@ -242,6 +245,7 @@ ag_err_t ag_module_load_hinted(const char *path, const char *cwd,
         return err;
     }
 
+    slot->held = (int32_t)free0 - (int32_t)ag_port_mem_free(AG_MEM_FAST);
     ag_log(AG_LOG_INFO, "modules", "loaded %s v%s from %s", name,
            slot->app.header.version, path);
     return AG_OK;
@@ -284,6 +288,7 @@ ag_err_t ag_module_info(uint32_t index, ag_modinfo_t *out)
             memcpy(out->path, s_modules[i].path, sizeof(out->path) - 1u);
             out->code_bytes = s_modules[i].app.header.code.size;
             out->data_bytes = s_modules[i].app.header.data.size;
+            out->held_bytes = s_modules[i].held;
             return AG_OK;
         }
         seen++;

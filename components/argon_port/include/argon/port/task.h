@@ -66,4 +66,18 @@
 #include <argon/port/mem.h>
 #include <argon/port/impl/task.h>
 
+/*
+ * Every task the machine is running - ours and the layer's below - with what
+ * its stack costs: who holds the memory, since a stack is most of what a
+ * task costs.  Fills up to `max`, returns how many there are.
+ */
+typedef struct {
+    char     name[16];
+    uint32_t stack_bytes;  /* the whole stack */
+    uint32_t stack_unused; /* never touched yet */
+    unsigned prio;
+} ag_port_task_info_t;
+
+uint32_t ag_port_task_list(ag_port_task_info_t *out, uint32_t max);
+
 #endif /* ARGON_PORT_TASK_H */

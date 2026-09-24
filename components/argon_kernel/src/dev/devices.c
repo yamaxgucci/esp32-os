@@ -128,6 +128,20 @@ static void dev_unlock(void *ctx)
     ag_port_mutex_give_recursive(s_dev_mutex);
 }
 
+static ag_port_mutex_t s_count_mutex;
+
+static void dev_count_lock(void *ctx)
+{
+    (void)ctx;
+    (void)ag_port_mutex_take(s_count_mutex, AG_PORT_FOREVER);
+}
+
+static void dev_count_unlock(void *ctx)
+{
+    (void)ctx;
+    (void)ag_port_mutex_give(s_count_mutex);
+}
+
 /*
  * Is this task inside the registry - and therefore, in practice, inside a
  * driver?
@@ -323,6 +337,12 @@ ag_err_t ag_devices_init(void)
             return -AG_ENOMEM;
         }
     }
+    if (s_count_mutex == NULL) {
+        s_count_mutex = ag_port_mutex_new();
+        if (s_count_mutex == NULL) {
+            return -AG_ENOMEM;
+        }
+    }
 
     const ag_dev_lock_t lock = {
         .lock = dev_lock,
@@ -331,6 +351,8 @@ ag_err_t ag_devices_init(void)
         .call_close = dev_call_close,
         .call_hold = dev_call_hold,
         .call_release = dev_call_release,
+        .count_lock = dev_count_lock,
+        .count_unlock = dev_count_unlock,
         .ctx = NULL,
     };
     ag_err_t err = ag_dev_init(&lock);

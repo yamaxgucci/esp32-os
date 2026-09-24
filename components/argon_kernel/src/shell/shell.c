@@ -404,10 +404,55 @@ static bool narrow_screen(void)
     return s == NULL || s->cols < 60;
 }
 
+/*
+ * `mem /t`: the tasks, and their stacks - most of what a task costs, and the
+ * part of "used by the system" no other list names.  Largest first.
+ */
+static int mem_tasks(void)
+{
+    enum { MAX_TASKS = 48 };
+    ag_port_task_info_t *t =
+        ag_port_alloc(sizeof(*t) * MAX_TASKS, AG_MEM_BYTE);
+    if (t == NULL) {
+        ag_console_puts("mem: no memory for the list\n");
+        return 1;
+    }
+    uint32_t n = ag_port_task_list(t, MAX_TASKS);
+    const uint32_t all = n;
+    if (n > MAX_TASKS) {
+        n = MAX_TASKS;
+    }
+    for (uint32_t i = 1; i < n; i++) { /* a few dozen: insertion is enough */
+        const ag_port_task_info_t x = t[i];
+        uint32_t k = i;
+        while (k > 0 && t[k - 1].stack_bytes < x.stack_bytes) {
+            t[k] = t[k - 1];
+            k--;
+        }
+        t[k] = x;
+    }
+    uint32_t sum = 0, unused = 0;
+    ag_console_puts("  task              stack   unused  prio\n");
+    for (uint32_t i = 0; i < n; i++) {
+        ag_console_printf("  %-16s %6u  %6u  %4u\n", t[i].name,
+                          (unsigned)t[i].stack_bytes,
+                          (unsigned)t[i].stack_unused, t[i].prio);
+        sum += t[i].stack_bytes;
+        unused += t[i].stack_unused;
+    }
+    ag_console_printf("  %u tasks, %u KB of stacks, %u KB of it never used\n",
+                      (unsigned)all, (unsigned)(sum / 1024),
+                      (unsigned)(unused / 1024));
+    ag_port_free(t);
+    return 0;
+}
+
 static int cmd_mem(int argc, char **argv)
 {
-    (void)argc;
-    (void)argv;
+    if (argc > 1 && (strcmp(argv[1], "/t") == 0 ||
+                     strcmp(argv[1], "tasks") == 0)) {
+        return mem_tasks();
+    }
 
     const size_t int_free = ag_port_mem_free(AG_MEM_FAST);
     const size_t int_total = ag_port_mem_total(AG_MEM_FAST);
@@ -670,18 +715,27 @@ static int cmd_boot(int argc, char **argv)
 
     ag_console_printf("boot took %u us%s\n\n", (unsigned)r->boot_us,
                       r->degraded ? "  (degraded)" : "");
+    /* internal memory, as `mem` counts "used by the system": what the chip's
+     * layer held before the first stage, what each stage kept, what now */
+    ag_console_printf("  %-11s            %9s  %+7d B\n", "before", "",
+                      (int)r->entry_used);
     for (int i = 0; i < AG_STAGE_COUNT; i++) {
         if (r->stage_result[i] == -AG_ENOSYS) {
             ag_console_printf("  %-11s not implemented yet\n",
                               k_stage_names[i]);
         } else if (r->stage_result[i] == AG_OK) {
-            ag_console_printf("  %-11s ok         %6u us\n", k_stage_names[i],
-                              (unsigned)r->stage_us[i]);
+            ag_console_printf("  %-11s ok         %6u us  %+7d B\n",
+                              k_stage_names[i], (unsigned)r->stage_us[i],
+                              (int)r->stage_mem[i]);
         } else {
             ag_console_printf("  %-11s FAILED     err %d\n", k_stage_names[i],
                               (int)r->stage_result[i]);
         }
     }
+
+    ag_console_printf("  %-11s            %9s  %7u B\n", "in use now", "",
+                      (unsigned)(ag_port_mem_total(AG_MEM_FAST) -
+                                 ag_port_mem_free(AG_MEM_FAST)));
 
     ag_console_printf("\nrecovery: %s",
                       ag_boot_in_recovery() ? "ACTIVE" : "off");
@@ -2623,7 +2677,7 @@ static int cmd_drv(int argc, char **argv)
         return 1;
     }
 
-    ag_console_puts("name      version  code       data       path\n");
+    ag_console_puts("name      version  code       data       held       path\n");
 
     uint32_t shown = 0;
     for (uint32_t i = 0;; i++) {
@@ -2634,11 +2688,15 @@ static int cmd_drv(int argc, char **argv)
 
         char code[16];
         char data[16];
+        char held[16];
         human_size(info.code_bytes, code, sizeof(code));
         human_size(info.data_bytes, data, sizeof(data));
+        /* what loading and starting it took from internal memory */
+        human_size(info.held_bytes > 0 ? (size_t)info.held_bytes : 0u, held,
+                   sizeof(held));
 
-        ag_console_printf("%-9s %-8s %-10s %-10s %s\n", info.name,
-                          info.version, code, data, info.path);
+        ag_console_printf("%-9s %-8s %-10s %-10s %-10s %s\n", info.name,
+                          info.version, code, data, held, info.path);
         shown++;
     }
 
@@ -5473,7 +5531,7 @@ static int cmd_uartbridge(int argc, char **argv)
 static const ag_command_t k_commands[] = {
     {"help", "", "list these commands", cmd_help},
     {"ver", "", "version and hardware", cmd_ver},
-    {"mem", "", "memory usage", cmd_mem},
+    {"mem", "[/t]", "memory usage; /t: every task and its stack", cmd_mem},
     {"boot", "[recovery|normal]", "boot report; set/clear recovery marker",
      cmd_boot},
     {"log", "[-n N|clear]", "system journal", cmd_log},

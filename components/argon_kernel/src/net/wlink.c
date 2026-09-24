@@ -849,10 +849,38 @@ int32_t wl_write_wait(wlink_t *s, const void *buf, size_t len,
  * transmit ring together, and the block is remembered until it is
  * acknowledged, with its number and whether it is worth sending again.
  */
+/* Of two parts taken as one, from byte `done` on: what the ring took. */
+static uint32_t put2(ring_t *r, const uint8_t *a, uint32_t alen,
+                     const uint8_t *b, uint32_t blen, uint32_t done)
+{
+    uint32_t put = 0;
+    if (done < alen) {
+        put = ring_put(r, a + done, alen - done);
+        if (done + put < alen) {
+            return put;
+        }
+    }
+    const uint32_t bd = done + put - alen;
+    return put + ((bd < blen) ? ring_put(r, b + bd, blen - bd) : 0u);
+}
+
 int32_t wl_send(wlink_t *s, const void *buf, size_t len, uint32_t flags,
                 uint32_t timeout_ms)
 {
-    if (buf == NULL || len == 0 || len > 0xFFFFu) {
+    return wl_send2(s, NULL, 0u, buf, len, flags, timeout_ms);
+}
+
+/*
+ * The block in two parts - a driver's own head, and the caller's bytes - so
+ * the driver needs no buffer of its own to join them: NODELINK and LINKSPI
+ * each kept 4 KB a wire for nothing else (25 Sep 2026).
+ */
+int32_t wl_send2(wlink_t *s, const void *head, size_t hlen, const void *body,
+                 size_t blen, uint32_t flags, uint32_t timeout_ms)
+{
+    const size_t len = hlen + blen;
+    if ((head == NULL && hlen != 0u) || (body == NULL && blen != 0u) ||
+        len == 0 || len > 0xFFFFu) {
         return -AG_EINVAL;
     }
     if (s->lock == NULL) {
@@ -885,8 +913,9 @@ int32_t wl_send(wlink_t *s, const void *buf, size_t len, uint32_t flags,
             hdr[5] = 0;
             put16(hdr + 6, no);
             (void)ring_put(&s->tx, hdr, WL_REC);
-            const uint8_t *p = (const uint8_t *)buf;
-            size_t         done = ring_put(&s->tx, p, (uint32_t)len);
+            const uint8_t *const a = (const uint8_t *)head;
+            const uint8_t *const b = (const uint8_t *)body;
+            size_t done = put2(&s->tx, a, (uint32_t)hlen, b, (uint32_t)blen, 0u);
             const uint32_t epoch = s->epoch;
             unlock(s);
             for (;;) {
@@ -909,7 +938,8 @@ int32_t wl_send(wlink_t *s, const void *buf, size_t len, uint32_t flags,
                     unlock(s);
                     return -AG_EIO; /* the other end started over */
                 }
-                done += ring_put(&s->tx, p + done, (uint32_t)(len - done));
+                done += put2(&s->tx, a, (uint32_t)hlen, b, (uint32_t)blen,
+                             (uint32_t)done);
                 unlock(s);
             }
         }
@@ -928,8 +958,41 @@ int32_t wl_send(wlink_t *s, const void *buf, size_t len, uint32_t flags,
 int32_t wl_recv(wlink_t *s, void *buf, size_t cap, ag_spilink_block_t *info,
                 uint32_t timeout_ms)
 {
+    return wl_recv2(s, NULL, 0u, buf, cap, info, timeout_ms);
+}
+
+/* Of `have` bytes at block offset `done`: into head, then buf, as far as
+ * each reaches; the rest is dropped.  What was placed. */
+static uint32_t take2(ring_t *r, uint8_t *head, uint32_t hcap, uint8_t *buf,
+                      uint32_t cap, uint32_t done, uint32_t have)
+{
+    uint32_t placed = 0, gone = 0;
+    if (done < hcap && head != NULL) {
+        const uint32_t k = (hcap - done < have) ? hcap - done : have;
+        (void)ring_take(r, head + done, k);
+        placed += k;
+        gone += k;
+    }
+    const uint32_t at = done + gone; /* block offset now */
+    if (gone < have && at >= hcap && buf != NULL && at - hcap < cap) {
+        const uint32_t room = cap - (at - hcap);
+        const uint32_t k = (room < have - gone) ? room : have - gone;
+        (void)ring_take(r, buf + (at - hcap), k);
+        placed += k;
+        gone += k;
+    }
+    ring_commit(r, have - gone);
+    return placed;
+}
+
+int32_t wl_recv2(wlink_t *s, void *head, size_t hcap, void *buf, size_t cap,
+                 ag_spilink_block_t *info, uint32_t timeout_ms)
+{
     if (info == NULL) {
         return -AG_EINVAL;
+    }
+    if (head == NULL) {
+        hcap = 0u;
     }
     if (s->lock == NULL || !s->blocks) {
         return (s->lock == NULL) ? -AG_ENODEV : -AG_EINVAL;
@@ -950,9 +1013,6 @@ int32_t wl_recv(wlink_t *s, void *buf, size_t cap, ag_spilink_block_t *info,
             info->last = (uint16_t)get16(hdr + 6);
             info->flags = hdr[4];
             const uint32_t len = get16(hdr);
-            const uint32_t n = (buf == NULL) ? 0u
-                               : (len < cap) ? len
-                                             : (uint32_t)cap;
             if (hdr[4] & WL_REC_LOST) {
                 /* a LOST record arrives whole, in one frame */
                 ring_commit(&s->rx, len);
@@ -967,20 +1027,15 @@ int32_t wl_recv(wlink_t *s, void *buf, size_t cap, ag_spilink_block_t *info,
              * the second arrived took its first piece off the room of every
              * frame (Z->C3 81% of the wire against 92% for bytes, measured).
              */
-            uint32_t       done = 0;
+            uint32_t       done = 0, n = 0;
             const uint32_t epoch = s->epoch;
             for (;;) {
                 uint32_t have = s->rx.count;
                 if (have > len - done) {
                     have = len - done;
                 }
-                const uint32_t into = (done < n) ? ((n - done < have) ? n - done
-                                                                      : have)
-                                                 : 0u;
-                if (into > 0u) {
-                    (void)ring_take(&s->rx, (uint8_t *)buf + done, into);
-                }
-                ring_commit(&s->rx, have - into);
+                n += take2(&s->rx, (uint8_t *)head, (uint32_t)hcap,
+                           (uint8_t *)buf, (uint32_t)cap, done, have);
                 done += have;
                 unlock(s);
                 room_made(s);

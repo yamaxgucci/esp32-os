@@ -55,6 +55,18 @@
  */
 #define AG_IO_UART_RX_BUF 8192
 #define AG_IO_UART_TX_BUF 2048
+/*
+ * A port whose link goes by DMA reads and writes neither ring: the DMA takes
+ * the FIFO itself.  The driver stays installed (the line's settings go
+ * through it) with the least it accepts - on the C3's 16 Mbaud wire the two
+ * rings were 10 KB of a 97 KB link that nothing ever touched.
+ */
+#define AG_IO_UART_DMA_RX_BUF 256
+#define AG_IO_UART_DMA_TX_BUF 0
+
+/* A port up, with the driver's rings this size if it comes up now. */
+static ag_err_t uart_bring_up_sized(int port, const ag_port_uart_cfg_t *want,
+                                    uint32_t rx_bytes, uint32_t tx_bytes);
 
 /*
  * A caller with more to send than AG_PORT_SPI_MAX_XFER splits it, and a chip
@@ -845,10 +857,20 @@ static ag_err_t io_uart_link_open(int port, uint32_t baud, uint32_t frame,
     }
     const ag_port_uart_cfg_t cfg = {
         .baud = baud, .data_bits = 8, .parity = 0, .stop_bits = 1};
+    /*
+     * Through the driver, its receive ring holds what the other end may have
+     * in flight - this end's room, three frames - and not the 8 KB a reader
+     * with no flow control needs: the link's own task empties it at once.
+     */
+    const bool     dma = (flags & AG_UARTLINK_DMA) != 0u;
+    const uint32_t f = ag_uartlink_frame(frame);
     lock();
-    ag_err_t err = uart_bring_up(port, &cfg);
+    ag_err_t err = dma ? uart_bring_up_sized(port, &cfg, AG_IO_UART_DMA_RX_BUF,
+                                             AG_IO_UART_DMA_TX_BUF)
+                       : uart_bring_up_sized(port, &cfg, 4u * f,
+                                             AG_IO_UART_TX_BUF);
     unlock();
-    if (err == AG_OK && (flags & AG_UARTLINK_DMA) != 0u &&
+    if (err == AG_OK && dma &&
         !ag_port_uart_dma_ready(port)) {
         err = -AG_ENOTSUP; /* asked for DMA on a port that has none */
     }
@@ -1084,6 +1106,13 @@ static bool uart_cfg_same(const ag_port_uart_cfg_t *a,
 
 static ag_err_t uart_bring_up(int port, const ag_port_uart_cfg_t *want)
 {
+    return uart_bring_up_sized(port, want, AG_IO_UART_RX_BUF,
+                               AG_IO_UART_TX_BUF);
+}
+
+static ag_err_t uart_bring_up_sized(int port, const ag_port_uart_cfg_t *want,
+                                    uint32_t rx_bytes, uint32_t tx_bytes)
+{
     if (port < 0 || port >= AG_UART_PORTS) {
         return -AG_ERANGE;
     }
@@ -1125,9 +1154,8 @@ static ag_err_t uart_bring_up(int port, const ag_port_uart_cfg_t *want)
 
         /* The port applies uart_cfg itself as the last thing open() does, so
          * there is nothing to apply again here. */
-        const ag_err_t rc = ag_port_uart_open(port, &uart_cfg,
-                                              AG_IO_UART_RX_BUF,
-                                              AG_IO_UART_TX_BUF);
+        const ag_err_t rc =
+            ag_port_uart_open(port, &uart_cfg, rx_bytes, tx_bytes);
         if (rc != AG_OK) {
             return rc;
         }
@@ -1442,6 +1470,10 @@ const ag_io_api_t ag_io_api_table = {
     .uart_link_read = ag_uartlink_read,
     .uart_link_send = ag_uartlink_send,
     .uart_link_recv = ag_uartlink_recv,
+    .spi_link_send2 = ag_spilink_send2,
+    .spi_link_recv2 = ag_spilink_recv2,
+    .uart_link_send2 = ag_uartlink_send2,
+    .uart_link_recv2 = ag_uartlink_recv2,
 };
 
 ag_err_t ag_io_init(void)

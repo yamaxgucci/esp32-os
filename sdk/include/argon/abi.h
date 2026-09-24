@@ -385,7 +385,7 @@ extern "C" {
  *      garbage.  Any future append needs the same guarantee and has it.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 61u
+#define AG_ABI_MINOR 62u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -1939,6 +1939,24 @@ typedef struct ag_io_api {
                               uint32_t flags, uint32_t timeout_ms);
     int32_t (*uart_link_recv)(int port, void *buf, size_t cap,
                               ag_spilink_block_t *info, uint32_t timeout_ms);
+    /*
+     * ABI 0.62: a block in two parts - a head the driver puts on, and the
+     * caller's bytes - one block on the wire, so a driver needs no buffer of
+     * its own to join or split them.  recv2 fills head first and returns the
+     * bytes placed in both; what does not fit is dropped.
+     */
+    int32_t (*spi_link_send2)(int bus, const void *head, size_t hlen,
+                              const void *buf, size_t len, uint32_t flags,
+                              uint32_t timeout_ms);
+    int32_t (*spi_link_recv2)(int bus, void *head, size_t hcap, void *buf,
+                              size_t cap, ag_spilink_block_t *info,
+                              uint32_t timeout_ms);
+    int32_t (*uart_link_send2)(int port, const void *head, size_t hlen,
+                               const void *buf, size_t len, uint32_t flags,
+                               uint32_t timeout_ms);
+    int32_t (*uart_link_recv2)(int port, void *head, size_t hcap, void *buf,
+                               size_t cap, ag_spilink_block_t *info,
+                               uint32_t timeout_ms);
 } ag_io_api_t;
 
 /* ------------------------------------------------------------------------ */

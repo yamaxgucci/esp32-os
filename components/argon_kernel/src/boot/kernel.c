@@ -26,6 +26,7 @@
 #include <argon/textpanel.h>
 
 #include <argon/nodeboot.h>
+#include <argon/port/mem.h>
 #include <argon/port/time.h>
 #include <argon/port/task.h>
 #include <argon/port/uart.h>
@@ -354,6 +355,14 @@ void ag_kernel_main(void)
     const int64_t t0 = ag_port_us();
 
     memset(&s_report, 0, sizeof(s_report));
+    /*
+     * Who holds the memory, by stage.  `mem` says only how much the system
+     * holds (137 KB on the C3, with no way to say whose), and "the system" is
+     * everything from the chip's own layer up; this is the same figure taken
+     * apart as it is built up.
+     */
+    s_report.entry_used = (uint32_t)(ag_port_mem_total(AG_MEM_FAST) -
+                                     ag_port_mem_free(AG_MEM_FAST));
 
     bool fatal_failure = false;
 
@@ -367,8 +376,11 @@ void ag_kernel_main(void)
         }
 
         const int64_t ts = ag_port_us();
+        const size_t  free0 = ag_port_mem_free(AG_MEM_FAST);
         const ag_err_t err = st->fn();
         s_report.stage_us[i] = (uint32_t)(ag_port_us() - ts);
+        s_report.stage_mem[i] =
+            (int32_t)free0 - (int32_t)ag_port_mem_free(AG_MEM_FAST);
         s_report.stage_result[i] = err;
 
         /*

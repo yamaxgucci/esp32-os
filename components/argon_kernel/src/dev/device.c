@@ -29,6 +29,22 @@ static void unlock(void)
     }
 }
 
+/* The direct calls' count (ag_dev_call_begin): its own small lock, taken
+ * inside the registry's where both are needed, never around it. */
+static void count_lock(void)
+{
+    if (s_lock.count_lock != NULL) {
+        s_lock.count_lock(s_lock.ctx);
+    }
+}
+
+static void count_unlock(void)
+{
+    if (s_lock.count_unlock != NULL) {
+        s_lock.count_unlock(s_lock.ctx);
+    }
+}
+
 /* The registry's own lock, for the caller that reaches past the registry into
  * a driver's class vtable.  See the header for why that needs one. */
 void ag_dev_lock_hold(void) { lock(); }
@@ -62,7 +78,8 @@ static bool call_enter(ag_device_t *dev)
  * once the last handle and the last call have gone. */
 static void reap_locked(ag_device_t *dev)
 {
-    if (dev->used && dev->revoked && dev->open_count == 0 && dev->calls == 0) {
+    if (dev->used && dev->revoked && dev->open_count == 0 && dev->calls == 0 &&
+        dev->direct == 0) {
         if (dev->iolock != NULL && s_lock.call_close != NULL) {
             s_lock.call_close(s_lock.ctx, dev->iolock);
         }
@@ -259,7 +276,7 @@ ag_err_t ag_dev_unregister(ag_device_t *dev)
     /* A call still inside the driver is as good a reason to refuse as an open
      * handle, and for the stronger one: the memory the vtable points into is
      * about to be handed back. */
-    if (dev->open_count > 0 || dev->calls > 0) {
+    if (dev->open_count > 0 || dev->calls > 0 || dev->direct > 0) {
         unlock();
         return -AG_EBUSY;
     }
@@ -309,13 +326,20 @@ static uint32_t revoke_locked(ag_device_t *dev)
     }
 
     const uint32_t still_open = dev->open_count;
-    if (still_open == 0 && dev->calls == 0) {
+    /* decided with the direct calls counted and new ones shut out at once:
+     * ag_dev_call_begin looks at `revoked` under the same small lock */
+    count_lock();
+    const bool idle = still_open == 0 && dev->calls == 0 && dev->direct == 0;
+    if (!idle) {
+        dev->revoked = true;
+    }
+    count_unlock();
+    if (idle) {
         if (dev->iolock != NULL && s_lock.call_close != NULL) {
             s_lock.call_close(s_lock.ctx, dev->iolock);
         }
         memset(dev, 0, sizeof(*dev));
     } else {
-        dev->revoked = true;
         /*
          * The driver is told once, here, rather than once per handle: the
          * hardware is gone, and asking it to close each open would be asking it
@@ -346,24 +370,36 @@ uint32_t ag_dev_calls_of_owner(const void *owner)
     lock();
     for (int i = 0; i < AG_DEV_MAX; i++) {
         if (s_devices[i].used && s_devices[i].owner == owner) {
-            n += s_devices[i].calls;
+            count_lock();
+            n += s_devices[i].calls + s_devices[i].direct;
+            count_unlock();
         }
     }
     unlock();
     return n;
 }
 
+/*
+ * NOT UNDER THE REGISTRY LOCK, and that is the point.  The first version took
+ * it for a moment on every call, and so tied every link to it: the console
+ * holds the registry across a remote screen's class op, which waits for the
+ * far board's answer - and the answer comes in through the link's reader,
+ * which now waited for the registry.  Each such op sat out its whole timeout;
+ * a program with a screen next door took 80 s to start, and the picture
+ * never came (Zero-C3, 25 Sep 2026).  A small lock of its own, taken inside
+ * the registry's and never around it.
+ */
 bool ag_dev_call_begin(ag_device_t *dev)
 {
     if (dev == NULL) {
         return false;
     }
-    lock();
+    count_lock();
     const bool ok = dev->used && !dev->revoked;
     if (ok) {
-        dev->calls++;
+        dev->direct++;
     }
-    unlock();
+    count_unlock();
     return ok;
 }
 
@@ -372,12 +408,19 @@ void ag_dev_call_end(ag_device_t *dev)
     if (dev == NULL) {
         return;
     }
-    lock();
-    if (dev->calls > 0) {
-        dev->calls--;
+    count_lock();
+    if (dev->direct > 0) {
+        dev->direct--;
     }
-    reap_locked(dev);
-    unlock();
+    const bool last = dev->direct == 0 && dev->revoked;
+    count_unlock();
+    if (last) {
+        /* the device went while this call was out: its slot is freed by the
+         * last one to leave - rare, and nobody waits on the registry for it */
+        lock();
+        reap_locked(dev);
+        unlock();
+    }
 }
 
 uint32_t ag_dev_revoke_owner(const void *owner)

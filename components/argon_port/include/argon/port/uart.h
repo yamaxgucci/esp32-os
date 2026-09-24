@@ -135,9 +135,11 @@ ag_err_t ag_port_uart_dma_listen(int port);
  * line closes the descriptor it is in and the DMA goes on into the next -
  * where IDF's driver stops the channel at every pause and the receive has to
  * be mounted again, and at 16 Mbaud the FIFO holds 80 us of what arrives
- * meanwhile.  -AG_ENOTSUP where this build cannot reach the driver's channel.
+ * meanwhile.  `bytes` is the ring (0: the other receive's two rings' worth):
+ * a framed link needs only what its peer may have in flight.  -AG_ENOTSUP
+ * where this build cannot reach the driver's channel.
  */
-ag_err_t ag_port_uart_dma_listen_ring(int port);
+ag_err_t ag_port_uart_dma_listen_ring(int port, uint32_t bytes);
 /* Pieces of what arrived that were thrown away: overwritten in the ring
  * before anybody read them, or pushed out of a full queue of them. */
 uint32_t ag_port_uart_dma_overruns(int port);

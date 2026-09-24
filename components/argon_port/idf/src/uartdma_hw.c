@@ -37,6 +37,7 @@
 #include "freertos/task.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_rom_sys.h"
 
 /*
  * The receive that is never stopped (ag_port_uart_dma_listen_ring): where
@@ -50,6 +51,12 @@
 #include "esp_private/gdma_link.h" /* the never-stopped receive's own list */
 #else
 #define AG_UART_DMA_RING 0
+#endif
+#if AG_UHCI_PRIVATE
+/* IDF's controller, private to its driver: the receive's state (rx_task)
+ * and, for the ring, its channel */
+#include "hal/uhci_hal.h"
+#include "uhci_private.h"
 #endif
 
 /*
@@ -415,6 +422,21 @@ static void rx_task(void *arg)
         d->rx_gen[r]++;
         d->rx_now = r;
         d->rx_active = true;
+#if AG_UHCI_PRIVATE
+        /*
+         * NOT BEFORE IDF IS DONE WITH THE LAST ONE.  Its handler tells us the
+         * receive ended and only then stops the channel and marks the
+         * controller ready; on the S3 this task wakes on the other core in
+         * between, and the mount failed ("controller not in enable state",
+         * every pause of the line) and waited a tick - 1.5 KB of 16 Mbaud
+         * with nothing receiving it.  The handler is microseconds from done.
+         */
+        for (int k = 0; k < 200 && atomic_load(&d->ctrl->rx_dir.rx_fsm) !=
+                                       UHCI_RX_FSM_ENABLE;
+             k++) {
+            esp_rom_delay_us(1);
+        }
+#endif
         if (uhci_receive(d->ctrl, d->rx_ring[r], AG_DMA_RX_RING) != ESP_OK) {
             d->rx_active = false;
             vTaskDelay(1);
@@ -456,8 +478,6 @@ static ag_err_t rx_start(int port, dma_port_t *d)
 }
 
 #if AG_UART_DMA_RING
-#include "hal/uhci_hal.h"
-#include "uhci_private.h"
 
 /* One descriptor of the ring closed - full, or cut short by an idle line -
  * and the DMA already in the next.  Nothing is stopped or mounted here. */
@@ -484,7 +504,7 @@ static bool IRAM_ATTR ring_done(gdma_channel_handle_t chan,
     return woken == pdTRUE;
 }
 
-ag_err_t ag_port_uart_dma_listen_ring(int port)
+ag_err_t ag_port_uart_dma_listen_ring(int port, uint32_t bytes)
 {
     if (port < 0 || port >= AG_PORT_UART_MAX) {
         return -AG_EINVAL;
@@ -498,14 +518,19 @@ ag_err_t ag_port_uart_dma_listen_ring(int port)
     }
     uhci_controller_t *const c = d->ctrl;
     /*
-     * Both rings' worth of memory as one ring of 1 KB descriptors - a list
-     * of our own, since IDF's has only as many nodes as its one receive
-     * needs (3 on the C3, each near the 4095-byte limit).  1 KB is 640 us at
-     * 16 Mbaud, and a reader has all but one of them before one is written
-     * over: 10 ms on the C3.
+     * One ring of 1 KB descriptors - a list of our own, since IDF's has only
+     * as many nodes as its one receive needs (3 on the C3, each near the
+     * 4095-byte limit).  1 KB is 640 us at 16 Mbaud, and a reader has all but
+     * one of them before one is written over.  As big as the caller says: a
+     * framed link needs only what its peer may have in flight, where both of
+     * the other receive's rings (16 KB on the C3) are for a reader nothing
+     * holds back.
      */
     const uint32_t node = 1024u;
-    const uint32_t nodes = (2u * AG_DMA_RX_RING) / node;
+    uint32_t       nodes = (bytes != 0u ? bytes : 2u * AG_DMA_RX_RING) / node;
+    if (nodes < 4u) {
+        nodes = 4u;
+    }
     const gdma_link_list_config_t lc = {.num_items = nodes,
                                         .item_alignment = 4};
     if (gdma_new_link_list(&lc, &d->ring_link) != ESP_OK) {
@@ -554,9 +579,10 @@ ag_err_t ag_port_uart_dma_listen_ring(int port)
     return AG_OK;
 }
 #else
-ag_err_t ag_port_uart_dma_listen_ring(int port)
+ag_err_t ag_port_uart_dma_listen_ring(int port, uint32_t bytes)
 {
     (void)port;
+    (void)bytes;
     return -AG_ENOTSUP;
 }
 #endif
@@ -638,9 +664,10 @@ ag_err_t ag_port_uart_dma_listen(int port)
     return -AG_ENOTSUP;
 }
 
-ag_err_t ag_port_uart_dma_listen_ring(int port)
+ag_err_t ag_port_uart_dma_listen_ring(int port, uint32_t bytes)
 {
     (void)port;
+    (void)bytes;
     return -AG_ENOTSUP;
 }
 
