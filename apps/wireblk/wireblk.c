@@ -32,7 +32,9 @@
 #include <argon/argon.h>
 #include <argon/libc.h>
 
-AG_APP("WIREBLK", "1.0", "argon", 0);
+/* 16 KB of arena, the least a named heap may be: the default is a quarter of
+ * the free pool, and on the C3 the SPI link's one piece is what that took */
+AG_APP_SIZED("WIREBLK", "1.0", "argon", 0, 0, 16384);
 
 #define BLK_MAX  8192u
 
@@ -444,6 +446,7 @@ int ag_main(int argc, char **argv)
     uint32_t burn = 0;
     uint32_t frame = 4096;
     bool     sink = false;
+    uint32_t drop = 0;
     for (int i = 6, bare = 0; i < argc; i++) {
         const char *a = argv[i];
         if (starts(a, "burn=")) {
@@ -456,6 +459,9 @@ int ag_main(int argc, char **argv)
             s_uart_port = (int)number(a + 5);
         } else if (starts(a, "frame=")) {
             frame = number(a + 6);
+        } else if (starts(a, "drop=")) {
+            /* test: this end drops every Nth data frame on arrival */
+            drop = number(a + 5);
         } else if (starts(a, "sink=")) {
             /* diagnosis: take the bytes and count them, check nothing - how
              * much a receiver can TAKE, apart from what checking costs */
@@ -499,7 +505,7 @@ int ag_main(int argc, char **argv)
         e = -AG_ENOSYS;
     } else {
         e = io->spi_link_open2(bus, cs, rate, frame,
-                               AG_SPILINK_FRAMED |
+                               AG_SPILINK_FRAMED | AG_SPILINK_DROP(drop) |
                                    (spim ? AG_SPILINK_MASTER : 0u));
     }
     if (e != AG_OK) {
@@ -710,13 +716,15 @@ int ag_main(int argc, char **argv)
             io->spi_link_stats(bus, &st) == AG_OK) {
             ag_printf("wireblk link %s: frames=%u data=%u bad=%u gaps=%u "
                       "dropped=%u wire_us=%u loop_us=%u reorders=%u "
-                      "short=%u unarmed=%u errors=%u\n",
+                      "short=%u unarmed=%u rewinds=%u naks=%u sd=%u sc=%u errors=%u\n",
                       wire, (unsigned)st.blocks_clocked,
                       (unsigned)st.blocks_data,
                       (unsigned)st.frames_bad, (unsigned)st.seq_gaps,
                       (unsigned)st.bytes_dropped, (unsigned)st.wire_us,
                       (unsigned)st.loop_us, (unsigned)st.reorders,
                       (unsigned)st.short_frames, (unsigned)st.blocks_unarmed,
+                      (unsigned)st.rewinds, (unsigned)st.naks,
+                      (unsigned)st.starve_data, (unsigned)st.starve_credit,
                       (unsigned)st.errors);
         }
         (void)io->spi_link_close(bus);

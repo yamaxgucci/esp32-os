@@ -1705,11 +1705,18 @@ typedef struct {
     uint32_t loop_us;        /* master: time of whole passes, in total     */
     uint32_t reorders;       /* slave: blocks back out of the armed order  */
     uint32_t short_frames;   /* slave: frames the master clocked short     */
+    uint32_t rewinds;        /* times this end went back and sent again    */
+    uint32_t naks;           /* times this end asked the other to          */
+    uint32_t starve_data;    /* frames sent empty: nothing unsent to send  */
+    uint32_t starve_credit;  /* frames sent empty: data, but no room/window*/
 } ag_spilink_stats_t;
 
 /* spi_link_open2 flags (ABI 0.60). */
 #define AG_SPILINK_MASTER 1u /* this end holds the clock                   */
 #define AG_SPILINK_FRAMED 2u /* transactions carry a header: see spilink.c */
+/* test only: (N << 8) drops every Nth data frame on arrival, to prove the
+ * link sends it again */
+#define AG_SPILINK_DROP(n) (((uint32_t)(n) & 0xFFu) << 8)
 
 typedef struct ag_io_api {
     uint32_t size;
