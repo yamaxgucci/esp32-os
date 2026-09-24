@@ -129,6 +129,15 @@ ag_err_t ag_port_uart_dma_settle(int port, uint32_t max_out);
 int32_t  ag_port_uart_dma_read(int port, void *buf, size_t len,
                                uint32_t timeout_ms);
 ag_err_t ag_port_uart_dma_listen(int port);
+/*
+ * The same, receiving WITHOUT STOPPING: one ring of descriptors, taken up
+ * once, that the DMA goes round for as long as the port is open.  An idle
+ * line closes the descriptor it is in and the DMA goes on into the next -
+ * where IDF's driver stops the channel at every pause and the receive has to
+ * be mounted again, and at 16 Mbaud the FIFO holds 80 us of what arrives
+ * meanwhile.  -AG_ENOTSUP where this build cannot reach the driver's channel.
+ */
+ag_err_t ag_port_uart_dma_listen_ring(int port);
 /* Pieces of what arrived that were thrown away: overwritten in the ring
  * before anybody read them, or pushed out of a full queue of them. */
 uint32_t ag_port_uart_dma_overruns(int port);

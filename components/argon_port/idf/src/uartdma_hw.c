@@ -36,6 +36,21 @@
 #include "freertos/queue.h"
 #include "freertos/task.h"
 #include "esp_heap_caps.h"
+#include "esp_log.h"
+
+/*
+ * The receive that is never stopped (ag_port_uart_dma_listen_ring): where
+ * this build reaches IDF's channel, and not on the S3.  There the channel's
+ * interrupt will not be allocated a second time ("alloc interrupt failed"),
+ * and its IRAM and DRAM are one SRAM - code it cannot use put the emulator's
+ * build 184 bytes over (25 Sep 2026).
+ */
+#if AG_UHCI_PRIVATE && !CONFIG_IDF_TARGET_ESP32S3
+#define AG_UART_DMA_RING 1
+#include "esp_private/gdma_link.h" /* the never-stopped receive's own list */
+#else
+#define AG_UART_DMA_RING 0
+#endif
 
 /*
  * One controller per port, made on first use and never taken down: a display
@@ -80,7 +95,14 @@ typedef struct {
     volatile bool            rx_active;  /* a receive is mounted on rx_now */
     int                      port;
     volatile uint32_t        rx_overrun;
-
+#if AG_UART_DMA_RING
+    /* the ring that is never stopped (ag_port_uart_dma_listen_ring) */
+    bool                     ring;
+    uint32_t                 ring_nodes;
+    uint32_t                 ring_node;
+    volatile uint32_t        ring_done; /* descriptors closed so far */
+    gdma_link_list_handle_t  ring_link; /* ours: IDF's has 3 to 5 nodes */
+#endif
 } dma_port_t;
 
 static dma_port_t s_dma[AG_PORT_UART_MAX];
@@ -155,7 +177,8 @@ static bool IRAM_ATTR on_tx_done(uhci_controller_handle_t ctrl,
 typedef struct {
     const uint8_t *p;
     uint32_t       n;
-    uint32_t       off;  /* bytes from its mount's start to where it begins */
+    uint32_t       off;  /* bytes from its mount's start to where it begins;
+                          * in a ring: the number of its descriptor */
     uint32_t       gen;  /* which mount of its ring */
     uint8_t        ring;
 } rx_piece_t;
@@ -344,6 +367,13 @@ int32_t ag_port_uart_dma_write(int port, const void *buf, size_t len)
  */
 static bool piece_ok(const dma_port_t *d, const rx_piece_t *pc)
 {
+#if AG_UART_DMA_RING
+    if (d->ring) {
+        /* its descriptor comes round again after `nodes` more: until then
+         * nothing has written over it */
+        return (uint32_t)(d->ring_done - pc->off) < d->ring_nodes;
+    }
+#endif
     const uint8_t  r = pc->ring;
     const uint32_t g = d->rx_gen[r];
     const bool     busy = d->rx_active && d->rx_now == r;
@@ -425,6 +455,112 @@ static ag_err_t rx_start(int port, dma_port_t *d)
     return AG_OK;
 }
 
+#if AG_UART_DMA_RING
+#include "hal/uhci_hal.h"
+#include "uhci_private.h"
+
+/* One descriptor of the ring closed - full, or cut short by an idle line -
+ * and the DMA already in the next.  Nothing is stopped or mounted here. */
+static bool IRAM_ATTR ring_done(gdma_channel_handle_t chan,
+                                gdma_event_data_t *ev, void *user)
+{
+    (void)chan;
+    dma_port_t      *d = (dma_port_t *)user;
+    BaseType_t       woken = pdFALSE;
+    const uint32_t   k = d->ring_done % d->ring_nodes;
+    const uint32_t   n = ev->flags.normal_eof
+                             ? (uint32_t)gdma_link_count_buffer_size_till_eof(
+                                   d->ring_link, k)
+                             : d->ring_node;
+    const rx_piece_t piece = {d->rx_ring[0] + (size_t)k * d->ring_node, n,
+                              d->ring_done, 0, 0};
+    d->ring_done++;
+    if (n > 0u && xQueueSendFromISR(d->rx_q, &piece, &woken) != pdTRUE) {
+        rx_piece_t old;
+        (void)xQueueReceiveFromISR(d->rx_q, &old, &woken);
+        (void)xQueueSendFromISR(d->rx_q, &piece, &woken);
+        d->rx_overrun++;
+    }
+    return woken == pdTRUE;
+}
+
+ag_err_t ag_port_uart_dma_listen_ring(int port)
+{
+    if (port < 0 || port >= AG_PORT_UART_MAX) {
+        return -AG_EINVAL;
+    }
+    dma_port_t *d = dma_for(port);
+    if (d == NULL) {
+        return -AG_ENOTSUP;
+    }
+    if (d->rx_q != NULL) {
+        return d->ring ? AG_OK : -AG_EBUSY; /* the other kind is running */
+    }
+    uhci_controller_t *const c = d->ctrl;
+    /*
+     * Both rings' worth of memory as one ring of 1 KB descriptors - a list
+     * of our own, since IDF's has only as many nodes as its one receive
+     * needs (3 on the C3, each near the 4095-byte limit).  1 KB is 640 us at
+     * 16 Mbaud, and a reader has all but one of them before one is written
+     * over: 10 ms on the C3.
+     */
+    const uint32_t node = 1024u;
+    const uint32_t nodes = (2u * AG_DMA_RX_RING) / node;
+    const gdma_link_list_config_t lc = {.num_items = nodes,
+                                        .item_alignment = 4};
+    if (gdma_new_link_list(&lc, &d->ring_link) != ESP_OK) {
+        return -AG_ENOMEM;
+    }
+    d->port = port;
+    d->rx_q = xQueueCreate(AG_DMA_RX_EVQ, sizeof(rx_piece_t));
+    d->rx_ring[0] = heap_caps_malloc((size_t)node * nodes,
+                                     MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    if (d->rx_q == NULL || d->rx_ring[0] == NULL) {
+        return -AG_ENOMEM;
+    }
+    d->ring = true;
+    d->ring_nodes = nodes;
+    d->ring_node = node;
+    d->ring_done = 0;
+    gdma_buffer_mount_config_t mc[nodes];
+    memset(mc, 0, sizeof(mc));
+    for (uint32_t k = 0; k < nodes; k++) {
+        mc[k].buffer = d->rx_ring[0] + (size_t)k * node;
+        mc[k].buffer_alignment = 4;
+        mc[k].length = node;
+        mc[k].flags.mark_final = GDMA_FINAL_LINK_TO_DEFAULT; /* round */
+    }
+    const gdma_rx_event_callbacks_t cb = {.on_recv_done = ring_done};
+    esp_err_t e = gdma_register_rx_event_callbacks(
+        c->rx_dir.dma_chan, (gdma_rx_event_callbacks_t *)&cb, d);
+    if (e == ESP_OK) {
+        e = gdma_link_mount_buffers(d->ring_link, 0, mc, nodes, NULL);
+        if (e != ESP_OK) {
+            ESP_LOGW("uartdma", "uart%d ring: mount: %s", port,
+                     esp_err_to_name(e));
+        }
+    } else {
+        ESP_LOGW("uartdma", "uart%d ring: callbacks: %s", port,
+                 esp_err_to_name(e));
+    }
+    if (e != ESP_OK) {
+        return -AG_EIO;
+    }
+    /* two readers of one FIFO would each get half the bytes */
+    uart_disable_rx_intr((uart_port_t)port);
+    gdma_reset(c->rx_dir.dma_chan);
+    gdma_start(c->rx_dir.dma_chan,
+               gdma_link_get_head_addr(d->ring_link));
+    return AG_OK;
+}
+#else
+ag_err_t ag_port_uart_dma_listen_ring(int port)
+{
+    (void)port;
+    return -AG_ENOTSUP;
+}
+#endif
+
 uint32_t ag_port_uart_dma_overruns(int port)
 {
     dma_port_t *d = (port >= 0 && port < AG_PORT_UART_MAX) ? dma_for(port)
@@ -497,6 +633,12 @@ bool ag_port_uart_dma_ready(int port)
 }
 
 ag_err_t ag_port_uart_dma_listen(int port)
+{
+    (void)port;
+    return -AG_ENOTSUP;
+}
+
+ag_err_t ag_port_uart_dma_listen_ring(int port)
 {
     (void)port;
     return -AG_ENOTSUP;

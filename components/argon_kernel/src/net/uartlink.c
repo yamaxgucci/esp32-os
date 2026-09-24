@@ -19,9 +19,10 @@
  *
  *   - data, and room for it at the other end;
  *   - a frame to send again, or a hole of its own to ask about;
- *   - an acknowledgement owed: a frame's worth taken in since it last said,
- *     or UL_ACK_US since it took in any;
- *   - room made (its reader has taken half a frame since it last said);
+ *   - an acknowledgement owed: UL_ACK_FRAMES frames' worth taken in since it
+ *     last said, or UL_ACK_US since it took in any;
+ *   - room made (its reader has taken as much since it last said, or has
+ *     emptied the ring);
  *   - nothing for UL_KEEP_US - which is also how two ends that have not yet
  *     heard each other find out, at UL_HELLO_US.
  *
@@ -74,14 +75,31 @@
 #define UL_HELLO_US  20000
 #define UL_KEEP_US   100000
 /*
- * An acknowledgement alone goes when a whole frame's worth has come in since
- * the last one said, or UL_ACK_US after it came in, whichever is first - not
- * for every frame: one 24-byte frame back for each one received was ~1 800 a
- * second from the C3, every one of them a piece of its own in the Zero's
- * receive queue, and the queue threw some away (hole reports among them,
- * each then a 50 ms wait).  Room made goes at half a frame.
+ * An acknowledgement alone goes when UL_ACK_FRAMES frames' worth have come in
+ * since the last one said, or UL_ACK_US after any came in, whichever is
+ * first; room made goes at the same UL_ACK_FRAMES frames.  The receive ring
+ * holds three, so the sender never runs dry waiting.
+ *
+ * NOT FOR EVERY FRAME, TWICE OVER.  One 24-byte frame back for each one
+ * received was ~1 800 a second from the C3, each a piece of its own in the
+ * Zero's receive queue, and the queue threw some away.  And at 16 Mbaud every
+ * frame a board SENDS while it receives costs it bits: on the Zero-C3 pair
+ * the C3's receive lost single 1s between 0s (0xB5 read as 0xB1, the frame
+ * the right length and wrong) - 150 to 180 frames in five seconds with an
+ * answer for each frame or half-frame of room, 45 with one for every two,
+ * none at 8 or 10 Mbaud, none with the C3 silent.  92% of the wire became 97%
+ * (25 Sep 2026).
  */
+#define UL_ACK_FRAMES 2u
 #define UL_ACK_US    2000
+/*
+ * Fewer reports make a lost one dearer: a sender its last report held back
+ * sends nothing more, so nothing tells the receiver its answer went missing
+ * - and the C3's receive turns bits in the Zero's acknowledgements too (27
+ * to 72 in five seconds of C3->Z).  So a receiver the line has gone quiet on
+ * says it again, UL_ACK_US apart, this many times.
+ */
+#define UL_RETELLS   3u
 #define UL_PRIO      9u
 #define UL_STACK     3072u
 #define UL_STOP_MS   500u
@@ -107,6 +125,10 @@ typedef struct {
     uint32_t ack_sent;
     uint32_t space_sent;
     int64_t  last_tx;
+    /* when the other last sent anything new, and the reports since */
+    uint32_t rx_seen;
+    int64_t  rx_seen_at;
+    uint32_t retells;
 
     volatile bool  stop;
     ag_port_task_t rx_task;
@@ -116,6 +138,20 @@ typedef struct {
     uint32_t frames_tx;
     uint32_t frames_rx;
     uint32_t skipped;
+
+    /*
+     * What a damaged frame WAS, told by where the next good one began: nearer
+     * than its length said - bytes fell out of the line; exactly its length -
+     * the bytes are all there and some are wrong.  `abs` counts every byte
+     * the parse buffer has let go of, so a place in it is a place in the line.
+     */
+    uint32_t abs;
+    uint32_t bad_at;
+    uint32_t bad_len;
+    bool     bad_open;
+    uint32_t dmg_short;   /* frames bytes fell out of */
+    uint32_t dmg_missing; /* ... and how many bytes, all told */
+    uint32_t dmg_inplace; /* frames the right length and wrong */
     uint32_t errors;
     ag_err_t last_error;
 } uartlink_t;
@@ -205,6 +241,7 @@ static void find_frames(uartlink_t *u)
         if (at != 0u) {
             memmove(u->pbuf, f, left);
             u->have = left;
+            u->abs += at;
             at = 0;
             f = u->pbuf;
         }
@@ -223,9 +260,24 @@ static void find_frames(uartlink_t *u)
         if (wl_sum(f, len - WL_HDR) != get32(f + 20)) {
             /* not a frame after all, or a damaged one: a step, and look
              * again - its length may be as wrong as the rest of it */
+            if (!u->bad_open) {
+                u->bad_open = true;
+                u->bad_at = u->abs;
+                u->bad_len = len;
+            }
             at = 1;
             u->skipped++;
             continue;
+        }
+        if (u->bad_open) {
+            const uint32_t dist = u->abs - u->bad_at;
+            if (dist < u->bad_len) {
+                u->dmg_short++;
+                u->dmg_missing += u->bad_len - dist;
+            } else if (dist == u->bad_len) {
+                u->dmg_inplace++;
+            }
+            u->bad_open = false;
         }
         (void)wl_rx(&u->w, f, len);
         u->frames_rx++;
@@ -235,6 +287,7 @@ static void find_frames(uartlink_t *u)
     if (at > 0u) {
         memmove(u->pbuf, u->pbuf + at, u->have - at);
         u->have -= at;
+        u->abs += at;
     }
     if (any) {
         /* an acknowledgement is owed now, and maybe a frame sent again */
@@ -305,8 +358,9 @@ static void tx_task(void *arg)
 {
     uartlink_t *u = (uartlink_t *)arg;
     wlink_t    *w = &u->w;
+    uint32_t    wait_ms = UL_TICK_MS;
     while (!u->stop) {
-        (void)ag_port_sem_take(w->tx_sem, ticks_at_least(UL_TICK_MS));
+        (void)ag_port_sem_take(w->tx_sem, ticks_at_least(wait_ms));
         while (!u->stop) {
             wl_rto_check(w);
             const int64_t now = ag_port_us();
@@ -324,15 +378,38 @@ static void tx_task(void *arg)
             const bool again = w->resend || w->nak_pending;
             const uint32_t pay = w->frame - WL_HDR;
             const uint32_t unacked = w->rx_next - u->ack_sent;
-            const bool     ack = unacked >= pay ||
+            const bool     ack = unacked >= UL_ACK_FRAMES * pay ||
                              (unacked > 0u && now - u->last_tx >= UL_ACK_US);
             const uint32_t space = ring_space(&w->rx);
-            const bool     roomy = space >= u->space_sent + pay / 2u &&
-                               space > u->space_sent;
+            /* room: what the sender may still send on the last report, and
+             * what a report now would add to it - told when that is
+             * UL_ACK_FRAMES frames, or half of one to a sender short of a
+             * frame */
+            const uint32_t left =
+                (u->space_sent > unacked) ? u->space_sent - unacked : 0u;
+            const uint32_t gain = (space > left) ? space - left : 0u;
+            const bool     roomy = gain >= UL_ACK_FRAMES * pay ||
+                               (left < pay && gain >= pay / 2u);
+            if (w->rx_next != u->rx_seen) {
+                u->rx_seen = w->rx_next;
+                u->rx_seen_at = now;
+                u->retells = 0;
+            }
+            /* the last report lost?  A sender it held back says nothing
+             * more, so it is told again - a few times, then left to the
+             * keep-alive */
+            const bool retell = w->peer_known && u->retells < UL_RETELLS &&
+                                space >= pay &&
+                                now - u->rx_seen_at >= UL_ACK_US &&
+                                now - u->last_tx >= UL_ACK_US;
+            wait_ms = (unacked > 0u || (w->peer_known &&
+                                        u->retells < UL_RETELLS))
+                          ? (uint32_t)(UL_ACK_US / 1000)
+                          : UL_TICK_MS;
             unlock(u);
             const bool quiet = (now - u->last_tx) >=
                                (w->peer_known ? UL_KEEP_US : UL_HELLO_US);
-            if (!data && !again && !ack && !roomy && !quiet) {
+            if (!data && !again && !ack && !roomy && !retell && !quiet) {
                 break;
             }
             /* the older transmit buffer back: the other may still be on
@@ -359,6 +436,9 @@ static void tx_task(void *arg)
             u->ack_sent = get32(f + 8);
             u->space_sent = space;
             u->last_tx = now;
+            if (retell) {
+                u->retells++;
+            }
             u->txk = u->dma ? (u->txk + 1u) % UL_TXBUF : 0u;
             u->frames_tx++;
         }
@@ -421,7 +501,19 @@ ag_err_t ag_uartlink_open(int port, uint32_t frame, uint32_t flags)
      * and the next open on a C3 found no 21 KB in one piece */
     const bool dma = (flags & AG_UARTLINK_DMA) != 0u;
     if (dma) {
-        const ag_err_t le = ag_port_uart_dma_listen(port);
+        ag_err_t le = -AG_ENOTSUP;
+        if (flags & AG_UARTLINK_RING) {
+            le = ag_port_uart_dma_listen_ring(port);
+            if (le == -AG_ENOTSUP) {
+                /* not on this chip (the S3): the DMA's receive as it is */
+                ag_log(AG_LOG_WARN, "uartlink",
+                       "uart%d: no never-stopped receive here; plain DMA",
+                       port);
+            }
+        }
+        if (le == -AG_ENOTSUP) {
+            le = ag_port_uart_dma_listen(port);
+        }
         if (le != AG_OK) {
             return le;
         }
@@ -479,6 +571,14 @@ ag_err_t ag_uartlink_open(int port, uint32_t frame, uint32_t flags)
     u->frames_tx = 0;
     u->frames_rx = 0;
     u->skipped = 0;
+    u->rx_seen = 0;
+    u->rx_seen_at = 0;
+    u->retells = 0;
+    u->abs = 0;
+    u->bad_open = false;
+    u->dmg_short = 0;
+    u->dmg_missing = 0;
+    u->dmg_inplace = 0;
     u->errors = 0;
     u->last_error = AG_OK;
     w->open = true;
@@ -526,6 +626,9 @@ ag_err_t ag_uartlink_stats(int port, ag_spilink_stats_t *out)
     out->blocks_data = u->frames_rx;
     out->timeouts = u->skipped;
     out->stalls = ag_port_uart_dma_overruns(u->port);
+    out->short_frames = u->dmg_short;
+    out->wire_us = u->dmg_missing;
+    out->blocks_unarmed = u->dmg_inplace;
     out->errors = u->errors;
     out->last_error = u->last_error;
     unlock(u);

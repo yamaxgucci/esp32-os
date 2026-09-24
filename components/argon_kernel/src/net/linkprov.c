@@ -49,6 +49,35 @@ static int    s_sel = -1; /* what `link use` last bound; -1 is none */
 
 static const char s_none[] = "none";
 
+/*
+ * A wire's driver, held for one call into it: an unload waits until it is let
+ * go (ag_dev_call_begin).  on_revoke below only clears the pointers, and a task
+ * that read them a moment earlier - the reader, inside recv nearly always - was
+ * still in the image when it was given back.  The pointers are read once and
+ * checked again once held, so a wire rebound in between is not called with the
+ * other driver's ops.
+ */
+typedef struct {
+    const ag_link_ops_t *ops;
+    ag_device_t         *dev;
+} held_t;
+
+static bool hold(const wire_t *w, held_t *h)
+{
+    h->ops = w->ops;
+    h->dev = w->dev;
+    if (h->ops == NULL || h->dev == NULL || !ag_dev_call_begin(h->dev)) {
+        return false;
+    }
+    if (w->ops != h->ops || w->dev != h->dev) {
+        ag_dev_call_end(h->dev);
+        return false;
+    }
+    return true;
+}
+
+static void let_go(held_t *h) { ag_dev_call_end(h->dev); }
+
 /* The wire a call on this task means: the one it is reading, else the
  * selected one.  Both can be absent, and then there is no wire at all. */
 static wire_t *current(void)
@@ -216,8 +245,13 @@ static void relay(wire_t *arrived, uint8_t chan, const ag_link_addr_t *a,
      * here instead of going home.
      */
     for (unsigned tries = 0;; tries++) {
-        const int32_t r =
-            s_wire[to].ops->send_a(s_wire[to].dev, chan, buf, len, a);
+        held_t h;
+        if (!hold(&s_wire[to], &h)) {
+            relay_drop(2, a->dst, "the wire out of here has gone");
+            return;
+        }
+        const int32_t r = h.ops->send_a(h.dev, chan, buf, len, a);
+        let_go(&h);
         if (r >= 0) {
             s_relayed++;
             return;
@@ -356,12 +390,15 @@ static void route(wire_t *w, uint8_t chan, const ag_link_addr_t *from,
 static uint32_t reader_cap(const wire_t *w)
 {
     uint32_t cap = READER_BUF_MIN;
-    if (w->ops != NULL && w->ops->info != NULL) {
+    held_t   h;
+    if (hold(w, &h)) {
         ag_link_info_t li;
         memset(&li, 0, sizeof(li));
-        if (w->ops->info(w->dev, &li) == AG_OK && li.mtu > 0u) {
+        if (h.ops->info != NULL && h.ops->info(h.dev, &li) == AG_OK &&
+            li.mtu > 0u) {
             cap = li.mtu + 64u;
         }
+        let_go(&h);
     }
     if (cap < READER_BUF_MIN) {
         cap = READER_BUF_MIN;
@@ -415,7 +452,12 @@ static void reader_task(void *arg)
         uint8_t        chan = 0;
         ag_link_addr_t from;
         memset(&from, 0, sizeof(from));
-        const int32_t n = w->ops->recv_a(w->dev, &chan, buf, cap, 50, &from);
+        held_t h;
+        if (!hold(w, &h)) {
+            continue; /* gone meanwhile: the next lap waits for a new one */
+        }
+        const int32_t n = h.ops->recv_a(h.dev, &chan, buf, cap, 50, &from);
+        let_go(&h);
         if (n <= 0) {
             continue;
         }
@@ -600,12 +642,14 @@ int32_t ag_linkprov_index_of(const char *name)
 static int32_t send_addressed(int32_t wire, uint16_t dst, uint8_t chan,
                               uint8_t cls, const void *buf, size_t len)
 {
-    if (wire < 0 || (unsigned)wire >= LINK_WIRES ||
-        s_wire[wire].ops == NULL) {
+    held_t h;
+    if (wire < 0 || (unsigned)wire >= LINK_WIRES || !hold(&s_wire[wire], &h)) {
         return -AG_ENODEV;
     }
     const ag_link_addr_t to = {dst, ag_linkprov_here(), cls};
-    return s_wire[wire].ops->send_a(s_wire[wire].dev, chan, buf, len, &to);
+    const int32_t r = h.ops->send_a(h.dev, chan, buf, len, &to);
+    let_go(&h);
+    return r;
 }
 
 int32_t ag_linkprov_send_on(int32_t wire, uint8_t chan, uint8_t cls,
@@ -631,8 +675,10 @@ int32_t ag_linkprov_send_to_on(int32_t wire, uint16_t dst, uint8_t chan,
 void ag_linkprov_poll_all(uint32_t ms)
 {
     for (unsigned i = 0; i < LINK_WIRES; i++) {
-        if (s_wire[i].ops != NULL) {
-            s_wire[i].ops->poll(s_wire[i].dev, ms);
+        held_t h;
+        if (hold(&s_wire[i], &h)) {
+            h.ops->poll(h.dev, ms);
+            let_go(&h);
         }
     }
 }
@@ -739,7 +785,12 @@ ag_err_t ag_linkprov_use(const char *name)
 
     reader_start(w);
 
-    const ag_err_t e = w->ops->start(w->dev);
+    held_t   h;
+    ag_err_t e = -AG_ENODEV;
+    if (hold(w, &h)) {
+        e = h.ops->start(h.dev);
+        let_go(&h);
+    }
     if (e != AG_OK) {
         ag_log(AG_LOG_ERROR, "link", "%s did not start: %d", w->name, (int)e);
         w->reader_stop = true;
@@ -772,7 +823,13 @@ ag_err_t ag_linkprov_use(const char *name)
 bool ag_linkprov_up(void)
 {
     const wire_t *w = current();
-    return (w != NULL) && w->ops->up(w->dev);
+    held_t        h;
+    if (w == NULL || !hold(w, &h)) {
+        return false;
+    }
+    const bool up = h.ops->up(h.dev);
+    let_go(&h);
+    return up;
 }
 
 /*
@@ -795,8 +852,10 @@ int32_t ag_linkprov_send(uint8_t chan, uint8_t cls, const void *buf, size_t len)
 void ag_linkprov_poll(uint32_t ms)
 {
     wire_t *w = current();
-    if (w != NULL) {
-        w->ops->poll(w->dev, ms);
+    held_t  h;
+    if (w != NULL && hold(w, &h)) {
+        h.ops->poll(h.dev, ms);
+        let_go(&h);
     }
 }
 
@@ -824,7 +883,13 @@ ag_err_t ag_linkprov_stats(ag_link_stats_t *out)
      * of them would remember.
      */
     memset(out, 0, sizeof(*out));
-    return w->ops->stats(w->dev, out);
+    held_t h;
+    if (!hold(w, &h)) {
+        return -AG_ENODEV;
+    }
+    const ag_err_t e = h.ops->stats(h.dev, out);
+    let_go(&h);
+    return e;
 }
 
 /*
@@ -850,8 +915,14 @@ ag_err_t ag_linkprov_info(ag_link_info_t *out)
     memset(out, 0, sizeof(*out));
     const size_t need =
         offsetof(ag_link_ops_t, info) + sizeof(((ag_link_ops_t *)0)->info);
-    if (w->ops->size >= need && w->ops->info != NULL &&
-        w->ops->info(w->dev, out) == AG_OK && out->mtu > 0) {
+    held_t     h;
+    const bool held = hold(w, &h);
+    const bool told = held && h.ops->size >= need && h.ops->info != NULL &&
+                      h.ops->info(h.dev, out) == AG_OK;
+    if (held) {
+        let_go(&h);
+    }
+    if (told && out->mtu > 0) {
         if (out->bytes_per_sec == 0) {
             out->bytes_per_sec = AG_LINK_DEFAULT_RATE;
         }

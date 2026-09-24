@@ -353,6 +353,33 @@ uint32_t ag_dev_calls_of_owner(const void *owner)
     return n;
 }
 
+bool ag_dev_call_begin(ag_device_t *dev)
+{
+    if (dev == NULL) {
+        return false;
+    }
+    lock();
+    const bool ok = dev->used && !dev->revoked;
+    if (ok) {
+        dev->calls++;
+    }
+    unlock();
+    return ok;
+}
+
+void ag_dev_call_end(ag_device_t *dev)
+{
+    if (dev == NULL) {
+        return;
+    }
+    lock();
+    if (dev->calls > 0) {
+        dev->calls--;
+    }
+    reap_locked(dev);
+    unlock();
+}
+
 uint32_t ag_dev_revoke_owner(const void *owner)
 {
     uint32_t gone = 0;

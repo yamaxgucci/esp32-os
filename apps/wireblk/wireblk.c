@@ -465,6 +465,7 @@ int ag_main(int argc, char **argv)
     uint32_t frame = 0; /* 0: the board's own, [wire] frame in SYSTEM.CFG */
     bool     sink = false;
     bool     nodma = false; /* uartl through the driver, not the DMA */
+    bool     ring = false;  /* uartl receiving into a ring never stopped */
     uint32_t drop = 0;
     /* blocks=N: the link carries blocks; every Nth one is sent without
      * AG_SPILINK_RELIABLE (N = 1: none reliable, 0: bytes, not blocks) */
@@ -487,6 +488,8 @@ int ag_main(int argc, char **argv)
         } else if (starts(a, "drop=")) {
             /* test: this end drops every Nth data frame on arrival */
             drop = number(a + 5);
+        } else if (starts(a, "ring=")) {
+            ring = (number(a + 5) != 0u);
         } else if (starts(a, "nodma=")) {
             nodma = (number(a + 6) != 0u);
         } else if (starts(a, "sink=")) {
@@ -540,6 +543,7 @@ int ag_main(int argc, char **argv)
             e = io->uart_link_open(UART_PORT, rate, frame,
                                    AG_SPILINK_DROP(drop) |
                                        (nodma ? 0u : AG_UARTLINK_DMA) |
+                                       (ring ? AG_UARTLINK_RING : 0u) |
                                        (blocks ? AG_SPILINK_BLOCKS : 0u));
             lk = (lk_t){UART_PORT,
                         io->uart_link_write,

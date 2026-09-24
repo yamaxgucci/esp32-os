@@ -248,6 +248,23 @@ uint32_t ag_dev_revoke_owner(const void *owner);
  */
 uint32_t ag_dev_calls_of_owner(const void *owner);
 
+/*
+ * A call straight into a driver's class ops, counted like the calls above so
+ * an unload waits for it to come out - but WITHOUT the device's lock, which a
+ * link's recv would hold for its whole timeout and so shut out every send.
+ *
+ * The link provider's reader sits inside a driver's recv almost all the time.
+ * Uncounted, `drv unload NODELINK` gave the image back under it: the fini
+ * closed the link, recv came out at once and was called again, and the reader
+ * was standing in NODELINK's code when it was freed (a load fault on the C3,
+ * MEPC = image + 0x1c, 25 Sep 2026).
+ *
+ * begin is false when the device is gone or revoked: then do not call.  Every
+ * true is paired with one end.
+ */
+bool ag_dev_call_begin(ag_device_t *dev);
+void ag_dev_call_end(ag_device_t *dev);
+
 /* NULL when there is no such device, or when it has been revoked. */
 ag_device_t *ag_dev_find(const char *name);
 

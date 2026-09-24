@@ -1717,6 +1717,9 @@ typedef struct {
  * its driver - the S3, the C3, the C6; not the ESP32, not the emulator.  The
  * wire's configuration says which. */
 #define AG_UARTLINK_DMA 16u
+/* ... and the receive never stopped: a ring of descriptors the DMA goes round
+ * (the port's own, not IDF's receive, which stops at every pause) */
+#define AG_UARTLINK_RING 32u
 
 /* spi_link_open2 flags (ABI 0.60). */
 #define AG_SPILINK_MASTER 1u /* this end holds the clock                   */
@@ -1917,7 +1920,11 @@ typedef struct ag_io_api {
      * BOARD.CFG's pins.  flags are spi_link_open2's AG_SPILINK_BLOCKS and
      * AG_SPILINK_DROP, and AG_UARTLINK_DMA; the stats are the SPI link's
      * struct, with blocks_clocked frames sent, blocks_data frames received
-     * and timeouts the bytes skipped while looking for a frame.
+     * and timeouts the bytes skipped while looking for a frame; stalls the
+     * port's receive pieces lost to a reader behind; and each damaged frame
+     * told by where the next good one began: short_frames the ones bytes
+     * fell out of (wire_us those bytes), blocks_unarmed the ones the right
+     * length and wrong - bits the line turned.
      */
     ag_err_t (*uart_link_open)(int port, uint32_t baud, uint32_t frame,
                                uint32_t flags);

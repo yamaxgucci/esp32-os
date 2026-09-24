@@ -25,8 +25,11 @@
  *   uart  = 1           the port; its pins are BOARD.CFG's uart<N>
  *   baud  = 921600
  *   dma   = no          yes: by the UART's DMA (the S3, the C3, the C6) -
- *                       what 16 Mbaud needs; no: through the port's driver,
- *                       which every chip and the emulator have
+ *                       what 16 Mbaud needs; ring: the same, receiving into
+ *                       a ring the DMA never stops going round (no bytes
+ *                       lost to a receive mounted again after each pause);
+ *                       no: through the port's driver, which every chip and
+ *                       the emulator have
  *   frame = 1024        this wire's largest frame; [wire] frame if not said
  *
  * `[link]` with no number is the first, because every board that has one wire
@@ -365,12 +368,6 @@ static int32_t cfg_int(const char *key, int32_t dflt)
                                           : dflt;
 }
 
-static bool cfg_bool(const char *key, bool dflt)
-{
-    return AG_HAS(ag_api()->cfg, get_bool) ? ag_api()->cfg->get_bool(key, dflt)
-                                           : dflt;
-}
-
 static void node_free(node_t *nd)
 {
     if (nd->txlock != NULL) {
@@ -389,7 +386,12 @@ static ag_err_t wire_up(uint32_t i)
         return -AG_ENOENT; /* nobody asked for this one */
     }
     const uint32_t baud = (uint32_t)cfg_int(k_baud_key[i], (int32_t)ND_BAUD);
-    const bool     dma = cfg_bool(k_dma_key[i], false);
+    char how[8] = "no";
+    if (AG_HAS(ag_api()->cfg, get_str)) {
+        (void)ag_api()->cfg->get_str(k_dma_key[i], how, sizeof(how));
+    }
+    const bool ring = (ag_strcmp(how, "ring") == 0);
+    const bool dma = ring || (ag_strcmp(how, "yes") == 0);
     const int32_t  frame = cfg_int(k_frame_key[i], 0);
 
     node_t *nd = (node_t *)ag_malloc_caps(sizeof(node_t), AG_MEM_DEFAULT);
@@ -412,7 +414,8 @@ static ag_err_t wire_up(uint32_t i)
 
     const ag_err_t le = IO->uart_link_open(
         uart, baud, (frame > 0) ? (uint32_t)frame : 0u,
-        AG_SPILINK_BLOCKS | (dma ? AG_UARTLINK_DMA : 0u));
+        AG_SPILINK_BLOCKS | (dma ? AG_UARTLINK_DMA : 0u) |
+            (ring ? AG_UARTLINK_RING : 0u));
     if (le != AG_OK) {
         ag_log(AG_LOG_ERROR, "nodelink",
                "uart%d would not open as a link at %u baud%s: %d (its pins "
@@ -444,7 +447,8 @@ static ag_err_t wire_up(uint32_t i)
     s_wires++;
     ag_log(AG_LOG_INFO, "nodelink",
            "/dev/%s on uart%d at %u baud%s - bind with `link use %s`", name,
-           uart, (unsigned)baud, dma ? " by DMA" : "", name);
+           uart, (unsigned)baud, ring ? " by DMA, ring" : dma ? " by DMA" : "",
+           name);
     return AG_OK;
 }
 

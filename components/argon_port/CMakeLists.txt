@@ -137,6 +137,15 @@ idf_component_register(
 
 # Analogue input, off by default: linking esp_adc runs a constructor that stops
 # the boot under QEMU, and QEMU is how this system is verified.
+# The UART's receive by DMA without stopping (uartdma_hw.c, AG_UART_DMA_RING)
+# takes over the receive channel of IDF's UHCI controller, whose struct is
+# private to the driver: its header, and nothing else of it, from there.
+if(EXISTS "${IDF_PATH}/components/esp_driver_uart/src/uhci_private.h")
+    target_include_directories(${COMPONENT_LIB} PRIVATE
+        "${IDF_PATH}/components/esp_driver_uart/src")
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE AG_UHCI_PRIVATE=1)
+endif()
+
 if(CONFIG_ARGON_ENABLE_ADC)
     idf_component_get_property(adc_lib esp_adc COMPONENT_LIB)
     target_link_libraries(${COMPONENT_LIB} PRIVATE ${adc_lib})
