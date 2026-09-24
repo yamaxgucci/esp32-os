@@ -122,6 +122,8 @@
 #include <argon/port/task.h>
 #include <argon/port/time.h>
 
+#include "core/sysconfig.h"
+
 /*
  * Three, and not four: the port's slave pool is AG_PORT_SPI_SLAVE_QUEUE deep
  * (io_hw.c) and slot 0 of it belongs for good to spi_slave_xfer, which the rest
@@ -223,9 +225,10 @@
  *
  *   0     0xA5
  *   1     flags: 1 data, 2 "I have a hole at my ack", 4 segments,
- *         8 "... and it is a frame I had no room for: send it as it was"
+ *         8 "... and it is a frame I had no room for: send it as it was",
+ *         16 sent by the master
  *   2     0x5A
- *   3     0
+ *   3     the largest frame the SENDER can take, in 64-byte units
  *   4-7   where this frame's bytes start in the stream (little endian)
  *   8-11  ack: every byte before this offset has arrived
  *   12-13 payload bytes that follow (segments: the stream bytes they
@@ -235,6 +238,17 @@
  *
  * The stream is the payloads, in order.  A side with nothing to say still
  * sends a header: that is how the other side learns its room and its ack.
+ *
+ * THE FRAME IS THE SMALLER OF THE TWO ENDS' (24 Sep).  Each end opens with
+ * its own largest frame - the caller's, or `frame` under [wire] in its
+ * SYSTEM.CFG - and allocates for that alone, so a C3 that says 2048 pays for
+ * 2 KB frames whatever its peer can take.  Byte 3 of every header says it.
+ * The master clocks SPILINK_HELLO-byte frames until it has read a header of
+ * the slave's, and then the smaller of the two; the slave, which learns the
+ * master's size from the first hello, puts data in a frame only once the
+ * master clocks that size - before, its frames would be cut by the short
+ * clock.  Nothing is sent by either end before that, which is how it was
+ * already: no data goes until the other end's room is known.
  *
  * NOTHING IS LOST, AND ONLY WHAT IS LOST IS SENT AGAIN (24 Sep).  A payload
  * leaves the transmit ring only when the other side's ack passes it.  A frame
@@ -265,9 +279,15 @@
  * their record headers out of the transmit ring, where they are anyway.
  */
 #define SPILINK_HDR 20u
+/* frame sizes are said in these units, and the first frames are this long */
+#define SPILINK_UNIT  64u
+#define SPILINK_HELLO 64u
+/* the frame when neither the caller nor SYSTEM.CFG names one */
+#define SPILINK_FRAME_DEFAULT 4096u
 #define SPILINK_F_DATA 1u
 #define SPILINK_F_NAK  2u
 #define SPILINK_F_REFUSED 8u
+#define SPILINK_F_MASTER 16u
 #define SPILINK_F_SEG  4u
 #define SPILINK_SEG_SKIP 0x8000u
 /* frames a sender may have out and unacknowledged, and the out-of-order
@@ -426,6 +446,10 @@ typedef struct {
     bool     resend_whole; /* the receiver refused it: nothing is skipped */
     uint32_t resend_off;
     int64_t  ack_at;
+    /* the frame both ends run at, the smaller of their two; until they have
+     * heard each other, SPILINK_HELLO and no data */
+    uint32_t frame;
+    bool     agreed;
     /* block mode, sending: where the next record header is in the stream,
      * at or after the first byte not yet sent, and the next block number.
      * A list of the blocks out, 32 of them, held 64-byte blocks to 11% of
@@ -838,7 +862,7 @@ static uint32_t get32(const uint8_t *p)
 /* Bytes the peer may be sent now: its room, less what is already on the way. */
 static uint32_t peer_allowance(const spilink_t *s, uint32_t in_flight)
 {
-    if (!s->peer_known || s->peer_room <= in_flight) {
+    if (!s->agreed || !s->peer_known || s->peer_room <= in_flight) {
         return 0u;
     }
     return s->peer_room - in_flight;
@@ -997,7 +1021,7 @@ static uint32_t seg_build(const spilink_t *s, uint32_t off, uint32_t n,
 static uint32_t frame_build(spilink_t *s, uint8_t *f, uint32_t allow,
                             uint32_t room_less, bool *nak_was)
 {
-    const uint32_t pay = s->block - SPILINK_HDR;
+    const uint32_t pay = s->frame - SPILINK_HDR;
     const int      ix = link_index(s->bus);
     uint32_t       flags = 0;
     uint32_t       off = 0;
@@ -1119,9 +1143,9 @@ static uint32_t frame_build(spilink_t *s, uint8_t *f, uint32_t allow,
         room = 0xFFFFu;
     }
     f[0] = 0xA5u;
-    f[1] = (uint8_t)flags;
+    f[1] = (uint8_t)(flags | (s->master ? SPILINK_F_MASTER : 0u));
     f[2] = 0x5Au;
-    f[3] = 0u;
+    f[3] = (uint8_t)(s->block / SPILINK_UNIT);
     put32(f + 4, off);
     put32(f + 8, s->rx_next);
     put16(f + 12, span);
@@ -1199,6 +1223,17 @@ static uint32_t frame_rx(spilink_t *s, const uint8_t *f, uint32_t got)
         return 0u;
     }
     const uint32_t flags = f[1];
+    /*
+     * A frame from this end's own side is an ECHO: a slave not yet armed
+     * sends back what it last took in, and the master's 64-byte hello is
+     * exactly its hardware buffer.  Taken for the slave's, the master
+     * agreed on its own frame size (4096 against the C3's 2048, and half
+     * the wire, measured) - and an echo of data would be data.
+     */
+    if (((flags & SPILINK_F_MASTER) != 0u) == s->master) {
+        count(s, &s->frames_bad, 1u);
+        return 0u;
+    }
     const uint32_t off = get32(f + 4);
     const uint32_t ack = get32(f + 8);
     const uint32_t span = get16(f + 12);
@@ -1219,6 +1254,12 @@ static uint32_t frame_rx(spilink_t *s, const uint8_t *f, uint32_t got)
         count(s, &s->frames_bad, 1u);
         ask_again(s, now);
         return 0u;
+    }
+    if (!s->agreed) {
+        /* a peer that says nothing (0) is taken to be this end's size */
+        const uint32_t peer = (f[3] != 0u) ? f[3] * SPILINK_UNIT : s->block;
+        s->frame = (peer < s->block) ? peer : s->block;
+        s->agreed = s->master || got >= s->frame;
     }
     const bool carries = (flags & (SPILINK_F_DATA | SPILINK_F_SEG)) != 0u;
     if (s->drop_every != 0u && carries &&
@@ -1573,7 +1614,7 @@ static void spilink_task(void *arg)
                 }
                 armq_remove(s, (uint8_t)found);
                 mine = (uint8_t)found;
-                if (s->framed && got < s->block) {
+                if (s->framed && s->agreed && got < s->frame) {
                     count(s, &s->short_frames, 1u);
                 }
                 s->armed--;
@@ -1686,7 +1727,6 @@ static void spilink_master_task(void *arg)
     spilink_t *s = (spilink_t *)arg;
     uint8_t *const txf = s->mbuf;
     uint8_t *const rxf = s->mbuf + s->block;
-    const uint32_t pay = s->block - SPILINK_HDR;
 
     int64_t pass0 = ag_port_us();
     int64_t hot_until = 0;
@@ -1706,9 +1746,11 @@ static void spilink_master_task(void *arg)
         for (unsigned k = 0; k < SPILINK_AHEAD; k++) {
             pending += s->hist[k];
         }
-        uint32_t allow = peer_allowance(s, pending);
-        if (allow > pay) {
-            allow = pay;
+        /* the size of this pass's frame: SPILINK_HELLO until agreed */
+        const uint32_t fl = s->frame;
+        uint32_t       allow = peer_allowance(s, pending);
+        if (allow > fl - SPILINK_HDR) {
+            allow = fl - SPILINK_HDR;
         }
         unlock(s);
         rto_check(s);
@@ -1717,7 +1759,7 @@ static void spilink_master_task(void *arg)
 
         const int64_t  w0 = ag_port_us();
         const ag_err_t rc =
-            ag_port_spi_xfer_dma(s->bus, s->cs, txf, rxf, s->block);
+            ag_port_spi_xfer_dma(s->bus, s->cs, txf, rxf, fl);
         const int64_t  w1 = ag_port_us();
         if (rc != AG_OK) {
             frame_unbuild(s, n, nak_was);
@@ -1735,7 +1777,7 @@ static void spilink_master_task(void *arg)
         s->blocks_clocked++;
         unlock(s);
 
-        const uint32_t got = frame_rx(s, rxf, s->block);
+        const uint32_t got = frame_rx(s, rxf, fl);
         lock(s);
         /* data not yet sent, or frames out and waiting for their ack */
         const bool more = (s->tx.count > s->sent_off) || s->infl_n > 0u;
@@ -1793,6 +1835,7 @@ static void stats_of(const spilink_t *s, ag_spilink_stats_t *out)
     out->naks = s->naks;
     out->starve_data = s->starve_data;
     out->starve_credit = s->starve_credit;
+    out->frame = s->agreed ? s->frame : 0u;
 }
 
 static void free_open_memory(spilink_t *s)
@@ -1969,7 +2012,18 @@ ag_err_t ag_spilink_open2(int bus, int cs, uint32_t khz, uint32_t block,
     if (master && !framed) {
         return -AG_EINVAL;
     }
-    if (framed && block <= SPILINK_HDR) {
+    if (framed && block == 0u) {
+        /* the board's own: how much memory a link may cost is its business */
+        const int32_t v = ag_cfg_get_int(ag_sysconfig(), "wire.frame",
+                                         (int32_t)SPILINK_FRAME_DEFAULT);
+        block = (v > 0) ? (uint32_t)v : SPILINK_FRAME_DEFAULT;
+        if (block > AG_PORT_SPI_MAX_XFER) {
+            block = AG_PORT_SPI_MAX_XFER;
+        }
+    }
+    /* a frame's size travels in 64-byte units, and the first frames are
+     * SPILINK_HELLO long, which every frame must be able to take */
+    if (framed && (block < SPILINK_HELLO || block % SPILINK_UNIT != 0u)) {
         return -AG_EINVAL;
     }
     /*
@@ -2117,6 +2171,8 @@ ag_err_t ag_spilink_open2(int bus, int cs, uint32_t khz, uint32_t block,
     s->rx = (ring_t){.mem = s->rxmem, .cap = s->rxcap};
     s->master = master;
     s->framed = framed;
+    s->frame = framed ? SPILINK_HELLO : block;
+    s->agreed = !framed;
     s->tx_base = 0;
     s->sent_off = 0;
     s->infl_n = 0;

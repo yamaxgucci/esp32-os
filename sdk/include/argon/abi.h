@@ -1709,6 +1709,7 @@ typedef struct {
     uint32_t naks;           /* times this end asked the other to          */
     uint32_t starve_data;    /* frames sent empty: nothing unsent to send  */
     uint32_t starve_credit;  /* frames sent empty: data, but no room/window*/
+    uint32_t frame;          /* the frame both ends agreed on, 0 not yet   */
 } ag_spilink_stats_t;
 
 /* spi_link_open2 flags (ABI 0.60). */
@@ -1878,7 +1879,10 @@ typedef struct ag_io_api {
      * transaction is a `frame`-byte frame whose header says how much of it is
      * data and how much room the sender has, so the stream carries no padding
      * and never overruns the far end.  Read, write, close and stats are the
-     * spi_link_* calls above.  A master must be framed.
+     * spi_link_* calls above.  A master must be framed.  `frame` is this
+     * end's largest, a multiple of 64, or 0 for the board's own ([wire]
+     * frame in SYSTEM.CFG, 4096 if it says none); the link runs at the
+     * smaller of the two ends', which stats report once they have agreed.
      */
     ag_err_t (*spi_link_open2)(int bus, int cs, uint32_t khz, uint32_t frame,
                                uint32_t flags);

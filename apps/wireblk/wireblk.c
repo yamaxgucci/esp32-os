@@ -444,7 +444,7 @@ int ag_main(int argc, char **argv)
     uint32_t gap = 0;
     int      bus = 2;
     uint32_t burn = 0;
-    uint32_t frame = 4096;
+    uint32_t frame = 0; /* 0: the board's own, [wire] frame in SYSTEM.CFG */
     bool     sink = false;
     uint32_t drop = 0;
     /* blocks=N: the link carries blocks; every Nth one is sent without
@@ -750,7 +750,8 @@ int ag_main(int argc, char **argv)
             io->spi_link_stats(bus, &st) == AG_OK) {
             ag_printf("wireblk link %s: frames=%u data=%u bad=%u gaps=%u "
                       "dropped=%u wire_us=%u loop_us=%u reorders=%u "
-                      "short=%u unarmed=%u rewinds=%u naks=%u sd=%u sc=%u errors=%u\n",
+                      "short=%u unarmed=%u rewinds=%u naks=%u sd=%u sc=%u "
+                      "errors=%u frame=%u\n",
                       wire, (unsigned)st.blocks_clocked,
                       (unsigned)st.blocks_data,
                       (unsigned)st.frames_bad, (unsigned)st.seq_gaps,
@@ -759,7 +760,7 @@ int ag_main(int argc, char **argv)
                       (unsigned)st.short_frames, (unsigned)st.blocks_unarmed,
                       (unsigned)st.rewinds, (unsigned)st.naks,
                       (unsigned)st.starve_data, (unsigned)st.starve_credit,
-                      (unsigned)st.errors);
+                      (unsigned)st.errors, (unsigned)st.frame);
         }
         (void)io->spi_link_close(bus);
     }
