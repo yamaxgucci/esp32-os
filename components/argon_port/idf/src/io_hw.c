@@ -547,6 +547,10 @@ typedef struct {
     spi_transaction_t tx_trans[2];
     int               tx_which;
     bool              tx_busy;
+    /* ag_port_spi_xfer_start/finish: the transfers queued, oldest first */
+    spi_transaction_t q_trans[2];
+    uint8_t           q_head;
+    uint8_t           q_n;
 } spi_state_t;
 
 static spi_state_t s_spi[AG_PORT_SPI_SLOTS];
@@ -926,6 +930,75 @@ static ag_err_t spi_drain(int bus, spi_device_handle_t dev)
         spi_device_get_trans_result(dev, &done, portMAX_DELAY);
     s_spi[bus].tx_busy = false;
     return from_esp(ae);
+}
+
+ag_err_t ag_port_spi_xfer_start(int bus, int cs, const void *tx, void *rx,
+                                size_t len)
+{
+    if (len == 0 || len > AG_PORT_SPI_MAX_XFER || tx == NULL || rx == NULL) {
+        return -AG_EINVAL;
+    }
+    if (!esp_ptr_dma_capable(tx) || !esp_ptr_dma_capable(rx) ||
+        ((uintptr_t)tx & 3u) != 0u || ((uintptr_t)rx & 3u) != 0u) {
+        return -AG_EINVAL;
+    }
+    if (!spi_valid(bus) || !s_spi[bus].up || s_spi[bus].lock == NULL) {
+        return -AG_ENODEV;
+    }
+    if (s_spi[bus].slave) {
+        return -AG_EINVAL;
+    }
+    xSemaphoreTakeRecursive(s_spi[bus].lock, portMAX_DELAY);
+    spi_device_handle_t dev = NULL;
+    ag_err_t            err = (s_spi[bus].q_n >= 2u) ? -AG_EBUSY : AG_OK;
+    if (err == AG_OK) {
+        err = spi_device_for(bus, cs, &dev);
+    }
+    if (err == AG_OK) {
+        err = spi_drain(bus, dev);
+    }
+    if (err == AG_OK) {
+        spi_transaction_t *const t =
+            &s_spi[bus].q_trans[(s_spi[bus].q_head + s_spi[bus].q_n) % 2u];
+        memset(t, 0, sizeof(*t));
+        t->length = len * 8u;
+        t->tx_buffer = tx;
+        t->rx_buffer = rx;
+        err = from_esp(spi_device_queue_trans(dev, t, portMAX_DELAY));
+        if (err == AG_OK) {
+            s_spi[bus].q_n++;
+        }
+    }
+    xSemaphoreGiveRecursive(s_spi[bus].lock);
+    return err;
+}
+
+ag_err_t ag_port_spi_xfer_finish(int bus, int cs, uint32_t timeout_ms)
+{
+    if (!spi_valid(bus) || !s_spi[bus].up || s_spi[bus].lock == NULL) {
+        return -AG_ENODEV;
+    }
+    if (s_spi[bus].q_n == 0u) {
+        return -AG_EINVAL;
+    }
+    spi_device_handle_t dev = NULL;
+    ag_err_t            err = spi_device_for(bus, cs, &dev);
+    if (err != AG_OK) {
+        return err;
+    }
+    /* not under the bus lock: the other half, start, must be able to queue
+     * the next transfer while this one is waited for */
+    spi_transaction_t *done = NULL;
+    err = from_esp(spi_device_get_trans_result(
+        dev, &done, (timeout_ms == UINT32_MAX) ? portMAX_DELAY
+                                               : pdMS_TO_TICKS(timeout_ms)));
+    if (err == AG_OK) {
+        xSemaphoreTakeRecursive(s_spi[bus].lock, portMAX_DELAY);
+        s_spi[bus].q_head = (uint8_t)((s_spi[bus].q_head + 1u) % 2u);
+        s_spi[bus].q_n--;
+        xSemaphoreGiveRecursive(s_spi[bus].lock);
+    }
+    return err;
 }
 
 static ag_err_t spi_xfer_locked(int bus, int cs, const void *tx, void *rx,

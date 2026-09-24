@@ -263,6 +263,16 @@ ag_err_t ag_port_spi_xfer(int bus, int cs, const void *tx, void *rx,
  */
 ag_err_t ag_port_spi_xfer_dma(int bus, int cs, const void *tx, void *rx,
                               size_t len);
+/*
+ * The same in two halves, so that a service can keep TWO transfers queued and
+ * the next goes on the wire as the current one ends, with no pass of the
+ * caller's in between.  Start queues one (-AG_EBUSY with two out); finish
+ * waits for the oldest, UINT32_MAX for ever.  The caller must be the bus's
+ * only user while it does this, and must not mix it with the other calls.
+ */
+ag_err_t ag_port_spi_xfer_start(int bus, int cs, const void *tx, void *rx,
+                                size_t len);
+ag_err_t ag_port_spi_xfer_finish(int bus, int cs, uint32_t timeout_ms);
 
 ag_err_t ag_port_spi_slave_open(int bus, int sck, int mosi, int miso, int cs,
                                 uint32_t khz);

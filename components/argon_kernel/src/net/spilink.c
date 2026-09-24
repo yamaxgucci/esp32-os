@@ -1703,86 +1703,135 @@ static void spilink_task(void *arg)
 /*
  * THE MASTER END OF A FRAMED LINK.
  *
- * One frame per pass: the header and as much of the TX ring as the slave has
- * room for go out while the slave's frame comes in, and the task sleeps in
- * the port for the length of it (ag_port_spi_xfer_dma - no polling, no
- * staging copy).  Back to back while either side has something to carry.
- * Idle, it waits on the writers' semaphore for SPILINK_POLL_MS and then
- * clocks a frame anyway, because that frame is the slave's only way to speak.
+ * TWO FRAMES QUEUED.  The next frame is built while the current one crosses
+ * and is queued behind it (ag_port_spi_xfer_start), so it goes on the wire
+ * as the current one ends: sequentially, the ~100 us of every pass between
+ * two transfers was wire time lost, a sixth of it with 2 KB frames at 20 MHz
+ * and a quarter at 40 (86% and 77%, measured).  The task sleeps in the port
+ * while a transfer crosses; it never spins.
  *
- * THE WORK BETWEEN TWO FRAMES IS NOT WASTE, IT IS THE SLAVE'S TIME.  A version
- * that prepared the next frame while this one crossed and started it within
- * microseconds of the last gained nothing measurable and broke the link: the
- * C3 could no longer take up its next armed frame in time, 1354 of 7134 of
- * its frames came back with no header, the slave counted thousands of the
- * master's frames it never saw, and a frame it picked up late was clocked
- * shifted - damaged blocks, on a wire that had had none.  The pass as it is
- * leaves some 100 us between frames and the C3 has never missed one in it.
+ * THE SLAVE KEEPS UP WITH NO GAP.  A first version of this (23 Sep) broke
+ * the link - 1354 of 7134 frames came back with no header, frames clocked
+ * shifted - and that was blamed on the C3 having no time to take up its
+ * next armed frame.  More likely it was two faults found after it: the
+ * slave matched completions to slots by the order they were armed in, and
+ * its armed frames outlived close.  Measured 24 Sep with the port waiting
+ * 20, 10, 5 and 0 us in the driver's interrupt before each queued transfer:
+ * 88.7, 90.7, 92.0 and 92.9% at 40 MHz, and not one frame missed at 0.  The
+ * driver's own
+ * interrupt between two queued transfers is the slave's time, and it is
+ * enough.  A frame missed anyway would be caught by its checksum and offset
+ * and sent again.
  *
- * It never spins, for the reason at the top of this file: every pass blocks,
- * in the transfer or in the wait.
+ * Idle, it clocks one frame per SPILINK_POLL_MS, because that frame is the
+ * slave's only way to speak.  Frames are built from the slave's room one
+ * frame staler than before, so one more of this end's frames is counted as
+ * on its way (SPILINK_AHEAD + 1).
  */
+#define SPILINK_MHIST (SPILINK_AHEAD + 1u)
+
 static void spilink_master_task(void *arg)
 {
     spilink_t *s = (spilink_t *)arg;
-    uint8_t *const txf = s->mbuf;
-    uint8_t *const rxf = s->mbuf + s->block;
+    uint8_t *const txf[2] = {s->mbuf, s->mbuf + 2u * s->block};
+    uint8_t *const rxf[2] = {s->mbuf + s->block, s->mbuf + 3u * s->block};
+    uint32_t       qlen[2] = {0, 0}; /* the frame length each was clocked at */
+    uint32_t       qdata[2] = {0, 0};
+    unsigned       head = 0;         /* the oldest queued */
+    unsigned       out = 0;          /* how many are queued */
 
     int64_t pass0 = ag_port_us();
     int64_t hot_until = 0;
+    bool    first = true;
     for (;;) {
-        if (s->stop) {
-            break;
+        const bool hot = ag_port_us() < hot_until;
+        if (out == 0u) {
+            if (s->stop) {
+                break;
+            }
+            if (!hot && !first) {
+                /* quiet: a writer's wake, or the poll, and then one frame */
+                (void)ag_port_sem_take(s->tx_sem,
+                                       ticks_at_least(SPILINK_POLL_MS));
+            }
+            first = false;
+        }
+        if (!s->stop && (out == 0u || (out < 2u && hot))) {
+            /*
+             * The slave's room came with its last frame, reckoned when the
+             * slave ARMED it - SPILINK_AHEAD frames before it was clocked -
+             * and this end has queued one more since: all of those are taken
+             * off.
+             */
+            lock(s);
+            uint32_t pending = 0;
+            for (unsigned k = 0; k < SPILINK_MHIST; k++) {
+                pending += s->hist[k];
+            }
+            /* the size of this frame: SPILINK_HELLO until agreed */
+            const uint32_t fl = s->frame;
+            uint32_t       allow = peer_allowance(s, pending);
+            if (allow > fl - SPILINK_HDR) {
+                allow = fl - SPILINK_HDR;
+            }
+            unlock(s);
+            rto_check(s);
+            const unsigned slot = (head + out) % 2u;
+            bool           nak_was = false;
+            const uint32_t n = frame_build(s, txf[slot], allow, 0u, &nak_was);
+            const ag_err_t rc = ag_port_spi_xfer_start(s->bus, s->cs,
+                                                       txf[slot], rxf[slot],
+                                                       fl);
+            if (rc != AG_OK) {
+                frame_unbuild(s, n, nak_was);
+                note_error(s, rc);
+                if (out == 0u) {
+                    sleep_at_least(SPILINK_IDLE_MS);
+                    continue;
+                }
+            } else {
+                lock(s);
+                s->hist[s->hist_at] = n;
+                s->hist_at = (s->hist_at + 1u) % SPILINK_MHIST;
+                unlock(s);
+                qlen[slot] = fl;
+                qdata[slot] = n;
+                out++;
+                if (out < 2u && hot) {
+                    continue; /* fill the pipe before waiting on it */
+                }
+            }
+        }
+        if (out == 0u) {
+            continue; /* the start was refused */
         }
 
-        /*
-         * The slave's room came with its last frame, and it was reckoned when
-         * the slave ARMED that frame - SPILINK_AHEAD frames before it was
-         * clocked.  Everything this end sent in the last that-many frames may
-         * not be in it, so all of that is taken off.
-         */
-        lock(s);
-        uint32_t pending = 0;
-        for (unsigned k = 0; k < SPILINK_AHEAD; k++) {
-            pending += s->hist[k];
-        }
-        /* the size of this pass's frame: SPILINK_HELLO until agreed */
-        const uint32_t fl = s->frame;
-        uint32_t       allow = peer_allowance(s, pending);
-        if (allow > fl - SPILINK_HDR) {
-            allow = fl - SPILINK_HDR;
-        }
-        unlock(s);
-        rto_check(s);
-        bool           nak_was = false;
-        const uint32_t n = frame_build(s, txf, allow, 0u, &nak_was);
-
+        /* the oldest transfer: wait for it, and take in what it brought */
         const int64_t  w0 = ag_port_us();
-        const ag_err_t rc =
-            ag_port_spi_xfer_dma(s->bus, s->cs, txf, rxf, fl);
+        const ag_err_t rc = ag_port_spi_xfer_finish(s->bus, s->cs, 1000u);
         const int64_t  w1 = ag_port_us();
+        const unsigned slot = head;
+        head = (head + 1u) % 2u;
+        out--;
         if (rc != AG_OK) {
-            frame_unbuild(s, n, nak_was);
+            /* lost, as far as the stream knows: its ack never comes, and
+             * the frame is sent again */
             note_error(s, rc);
-            sleep_at_least(SPILINK_IDLE_MS);
             continue;
         }
-
         lock(s);
         s->wire_us += (uint32_t)(w1 - w0);
         s->loop_us += (uint32_t)(w1 - pass0);
         pass0 = w1;
-        s->hist[s->hist_at] = n;
-        s->hist_at = (s->hist_at + 1u) % SPILINK_AHEAD;
         s->blocks_clocked++;
         unlock(s);
 
-        const uint32_t got = frame_rx(s, rxf, fl);
+        const uint32_t got = frame_rx(s, rxf[slot], qlen[slot]);
         lock(s);
         /* data not yet sent, or frames out and waiting for their ack */
         const bool more = (s->tx.count > s->sent_off) || s->infl_n > 0u;
         unlock(s);
-        if (n > 0u || got > 0u) {
+        if (qdata[slot] > 0u || got > 0u) {
             count(s, &s->blocks_data, 1u);
         }
 
@@ -1795,15 +1844,12 @@ static void spilink_master_task(void *arg)
          * link stays hot for SPILINK_HOT_US after the last frame that carried
          * anything, either way, and only a quiet longer than that is idle.
          */
-        const int64_t now = ag_port_us();
-        if (n > 0u || got > 0u || more) {
-            hot_until = now + SPILINK_HOT_US;
-        }
-        if (now >= hot_until) {
-            (void)ag_port_sem_take(s->tx_sem, ticks_at_least(SPILINK_POLL_MS));
+        if (qdata[slot] > 0u || got > 0u || more) {
+            hot_until = ag_port_us() + SPILINK_HOT_US;
         }
     }
 
+    /* nothing queued is left behind: close frees what the engine writes */
     (void)ag_port_sem_give(s->exit_sem);
     ag_port_task_delete(NULL);
 }
@@ -2097,18 +2143,27 @@ ag_err_t ag_spilink_open2(int bus, int cs, uint32_t khz, uint32_t block,
          * that does not fit is not acknowledged, and it comes again.
          */
         const uint32_t pay = block - SPILINK_HDR;
-        /* the transmit ring is also what a frame is sent AGAIN from: it has
+        /*
+         * The transmit ring is also what a frame is sent AGAIN from: it has
          * to hold every frame out and not yet acknowledged, and one more
-         * ready.  Four frames: a slave has three out at once (two armed,
-         * one clocked and waiting for the ack that rides the master's next
-         * frame), and with a ring of three the space an ack freed was armed
-         * empty before its writer could run - one frame in four sent
-         * nothing, 69.8% of the wire on any block size, measured */
-        const uint32_t txeach = (4u * pay + 3u) & ~3u;
-        /* the master, usually the bigger part, takes a frame more - its
-         * room is the slave's whole allowance, and a slave has none to spare */
+         * ready.  A slave has four out at once - two armed, one clocked, and
+         * one the master has but has not answered yet, because the master
+         * queues its next frame before it reads the last (see the master
+         * task) - so five.  A ring one frame short sends a frame in every
+         * few empty: with four and a sequential master it was three, and
+         * the ring of three cost 69.8% of the wire, measured; with the
+         * master pipelined, four held 2 KB frames to 75%.  A master hears
+         * its acks later still, from frames the slave armed two ahead: six.
+         *
+         * The receive ring, likewise, is one frame deeper on both ends than
+         * a sequential master needed: SPILINK_AHEAD + 2 on a slave (C3
+         * receiving at 70% with + 1), + 3 on a master, usually the bigger
+         * part, whose room is the slave's whole allowance.  With 2 KB frames
+         * a C3 slave's link is then 26 KB in all.
+         */
+        const uint32_t txeach = ((master ? 6u : 5u) * pay + 3u) & ~3u;
         const uint32_t rxeach =
-            ((SPILINK_AHEAD + (master ? 2u : 1u)) * pay + 3u) & ~3u;
+            ((SPILINK_AHEAD + (master ? 3u : 2u)) * pay + 3u) & ~3u;
         s->txcap = framed ? txeach : SPILINK_TX_RING;
         s->rxcap = framed ? rxeach : SPILINK_RX_RING;
     }
@@ -2117,14 +2172,16 @@ ag_err_t ag_spilink_open2(int bus, int cs, uint32_t khz, uint32_t block,
     s->txmem = NULL;
     s->rxmem = NULL;
     s->onepiece = false;
-    const size_t frames = master ? 2u * (size_t)block
+    /* a master queues two transfers, each a frame out and a frame in */
+    const size_t frames = master ? 4u * (size_t)block
                                  : 2u * (size_t)s->nslots * (size_t)block;
     /*
      * ONE PIECE FIRST.  On the C3 a 4 KB framed slave once needed 24 KB of
      * frames and two 16 KB rings, 56 KB, with 81 KB free and the largest free
      * block 61 KB - and asked for as three, the third was refused: the first
      * two took the big block apart and what was left was all smaller than
-     * 16 KB.  Now it is 40 KB (SPILINK_AHEAD), and as one allocation.  The rings are then DMA-capable memory they
+     * 16 KB.  Now it is one allocation - 26 KB at the C3's 2 KB frames, and
+     * a 4 KB frame (52 KB) no longer fits it.  The rings are then DMA-capable memory they
      * do not need to be, which on the C3 is all its memory anyway; a part
      * that cannot find the one piece gets the three instead.
      */
