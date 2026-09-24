@@ -241,104 +241,276 @@ static const ag_net_ops_t *s_ops = &s_builtin;
 static ag_device_t        *s_dev; /* NULL for built-in */
 static char                s_name[AG_DEV_NAME_MAX] = "builtin";
 
+/*
+ * The provider, held for one call into it: an unload waits until it is let go
+ * (ag_dev_call_begin), as linkprov's wires are.  on_revoke only swings the
+ * pointers back to the built-in stack, and a task that read them a moment
+ * earlier - an accept or a recv sits inside the radio's code for its whole
+ * timeout - was still in the image when `drv unload` gave it back.
+ *
+ * The pointers are read once and checked again once held, so a provider
+ * switched in between is not called with the other one's ops.  The built-in
+ * stack is part of the kernel and is not counted; a NULL device with ops that
+ * are not the built-in ones is a switch half-seen, and is refused like any
+ * other.  Even the AG_HAS probes hold: the ops table is the driver's own data.
+ */
+typedef struct {
+    const ag_net_ops_t *ops;
+    ag_device_t        *dev;
+} held_t;
+
+static bool hold(held_t *h)
+{
+    h->ops = s_ops;
+    h->dev = s_dev;
+    if (h->dev == NULL) {
+        return h->ops == &s_builtin;
+    }
+    if (h->ops == NULL || !ag_dev_call_begin(h->dev)) {
+        return false;
+    }
+    if (s_ops != h->ops || s_dev != h->dev) {
+        ag_dev_call_end(h->dev);
+        return false;
+    }
+    return true;
+}
+
+static void let_go(held_t *h) { ag_dev_call_end(h->dev); } /* NULL: no-op */
+
 /* ------------------------------------------------------------------------ */
 /* Dispatch.  One indirect call each; the client above cannot tell which     */
-/* provider it reached.                                                       */
+/* provider it reached.  A provider that went away mid-call answers ENODEV.   */
 /* ------------------------------------------------------------------------ */
 
-ag_err_t ag_netprov_start(void) { return s_ops->start(s_dev); }
-bool     ag_netprov_ready(void) { return s_ops->ready(s_dev); }
-ag_err_t ag_netprov_ifaddr(uint32_t *addr) { return s_ops->ifaddr(s_dev, addr); }
+ag_err_t ag_netprov_start(void)
+{
+    held_t h;
+    if (!hold(&h)) {
+        return -AG_ENODEV;
+    }
+    const ag_err_t e = h.ops->start(h.dev);
+    let_go(&h);
+    return e;
+}
+bool ag_netprov_ready(void)
+{
+    held_t h;
+    if (!hold(&h)) {
+        return false;
+    }
+    const bool r = h.ops->ready(h.dev);
+    let_go(&h);
+    return r;
+}
+ag_err_t ag_netprov_ifaddr(uint32_t *addr)
+{
+    held_t h;
+    if (!hold(&h)) {
+        return -AG_ENODEV;
+    }
+    const ag_err_t e = h.ops->ifaddr(h.dev, addr);
+    let_go(&h);
+    return e;
+}
 ag_err_t ag_netprov_resolve(const char *host, uint32_t *addr)
 {
-    return s_ops->resolve(s_dev, host, addr);
+    held_t h;
+    if (!hold(&h)) {
+        return -AG_ENODEV;
+    }
+    const ag_err_t e = h.ops->resolve(h.dev, host, addr);
+    let_go(&h);
+    return e;
 }
-int ag_netprov_listen(uint16_t port) { return s_ops->listen(s_dev, port); }
+int ag_netprov_listen(uint16_t port)
+{
+    held_t h;
+    if (!hold(&h)) {
+        return -AG_ENODEV;
+    }
+    const int r = h.ops->listen(h.dev, port);
+    let_go(&h);
+    return r;
+}
 int ag_netprov_accept(int lfd, uint32_t timeout_ms)
 {
-    return s_ops->accept(s_dev, lfd, timeout_ms);
+    held_t h;
+    if (!hold(&h)) {
+        return -AG_ENODEV;
+    }
+    const int r = h.ops->accept(h.dev, lfd, timeout_ms);
+    let_go(&h);
+    return r;
 }
 int ag_netprov_connect(uint32_t addr, uint16_t port, uint32_t timeout_ms)
 {
-    return s_ops->connect(s_dev, addr, port, timeout_ms);
+    held_t h;
+    if (!hold(&h)) {
+        return -AG_ENODEV;
+    }
+    const int r = h.ops->connect(h.dev, addr, port, timeout_ms);
+    let_go(&h);
+    return r;
 }
 int32_t ag_netprov_send(int fd, const void *buf, size_t len)
 {
-    return s_ops->send(s_dev, fd, buf, len);
+    held_t h;
+    if (!hold(&h)) {
+        return -AG_ENODEV;
+    }
+    const int32_t r = h.ops->send(h.dev, fd, buf, len);
+    let_go(&h);
+    return r;
 }
 int32_t ag_netprov_recv(int fd, void *buf, size_t len)
 {
-    return s_ops->recv(s_dev, fd, buf, len);
+    held_t h;
+    if (!hold(&h)) {
+        return -AG_ENODEV;
+    }
+    const int32_t r = h.ops->recv(h.dev, fd, buf, len);
+    let_go(&h);
+    return r;
 }
-void     ag_netprov_close(int fd) { s_ops->net_close(s_dev, fd); }
+/*
+ * Also reached from on_revoke, through ag_net_reset_sockets, with the registry
+ * lock held: the watchers run before the slot is marked revoked, so the hold
+ * still succeeds there and the going radio closes its own sockets, as before.
+ */
+void ag_netprov_close(int fd)
+{
+    held_t h;
+    if (!hold(&h)) {
+        return;
+    }
+    h.ops->net_close(h.dev, fd);
+    let_go(&h);
+}
 ag_err_t ag_netprov_nonblock(int fd, bool on)
 {
-    return s_ops->nonblock(s_dev, fd, on);
+    held_t h;
+    if (!hold(&h)) {
+        return -AG_ENODEV;
+    }
+    const ag_err_t e = h.ops->nonblock(h.dev, fd, on);
+    let_go(&h);
+    return e;
 }
 int ag_netprov_wait_readable(int fd, uint32_t timeout_ms)
 {
-    return s_ops->wait_readable(s_dev, fd, timeout_ms);
+    held_t h;
+    if (!hold(&h)) {
+        return -AG_ENODEV;
+    }
+    const int r = h.ops->wait_readable(h.dev, fd, timeout_ms);
+    let_go(&h);
+    return r;
 }
 int32_t ag_netprov_recv_now(int fd, void *buf, size_t len)
 {
-    return s_ops->recv_now(s_dev, fd, buf, len);
+    held_t h;
+    if (!hold(&h)) {
+        return -AG_ENODEV;
+    }
+    const int32_t r = h.ops->recv_now(h.dev, fd, buf, len);
+    let_go(&h);
+    return r;
 }
 
 /* ------------------------------------------------------------------------ */
 /* The station half.  AG_HAS on every call and not once at bind time: the     */
 /* provider can change under a caller that is holding no lock, and the six    */
-/* come as a set, so probing one of them answers for all.                     */
+/* come as a set, so probing one of them answers for all.  The probe is made  */
+/* on the held ops, so the answer is about the table that is then called.     */
 /* ------------------------------------------------------------------------ */
 
-bool ag_netprov_has_wifi(void) { return AG_HAS(s_ops, wifi_status); }
+bool ag_netprov_has_wifi(void)
+{
+    held_t h;
+    if (!hold(&h)) {
+        return false;
+    }
+    const bool r = AG_HAS(h.ops, wifi_status);
+    let_go(&h);
+    return r;
+}
 
 ag_err_t ag_netprov_wifi_start(void)
 {
-    if (!AG_HAS(s_ops, wifi_start)) {
+    held_t h;
+    if (!hold(&h)) {
         return -AG_ENODEV;
     }
-    return s_ops->wifi_start(s_dev);
+    const ag_err_t e =
+        AG_HAS(h.ops, wifi_start) ? h.ops->wifi_start(h.dev) : -AG_ENODEV;
+    let_go(&h);
+    return e;
 }
 
 ag_err_t ag_netprov_wifi_stop(void)
 {
-    if (!AG_HAS(s_ops, wifi_stop)) {
+    held_t h;
+    if (!hold(&h)) {
         return -AG_ENODEV;
     }
-    return s_ops->wifi_stop(s_dev);
+    const ag_err_t e =
+        AG_HAS(h.ops, wifi_stop) ? h.ops->wifi_stop(h.dev) : -AG_ENODEV;
+    let_go(&h);
+    return e;
 }
 
 ag_err_t ag_netprov_wifi_scan(ag_wifi_ap_t *out, uint32_t max, uint32_t *found)
 {
-    if (!AG_HAS(s_ops, wifi_scan)) {
+    held_t h;
+    if (!hold(&h)) {
         return -AG_ENODEV;
     }
-    return s_ops->wifi_scan(s_dev, out, max, found);
+    const ag_err_t e = AG_HAS(h.ops, wifi_scan)
+                           ? h.ops->wifi_scan(h.dev, out, max, found)
+                           : -AG_ENODEV;
+    let_go(&h);
+    return e;
 }
 
 ag_err_t ag_netprov_wifi_connect(const char *ssid, const char *pass,
                                  const uint8_t bssid[6])
 {
-    if (!AG_HAS(s_ops, wifi_connect)) {
+    held_t h;
+    if (!hold(&h)) {
         return -AG_ENODEV;
     }
-    return s_ops->wifi_connect(s_dev, ssid, pass, bssid);
+    const ag_err_t e = AG_HAS(h.ops, wifi_connect)
+                           ? h.ops->wifi_connect(h.dev, ssid, pass, bssid)
+                           : -AG_ENODEV;
+    let_go(&h);
+    return e;
 }
 
 ag_err_t ag_netprov_wifi_disconnect(void)
 {
-    if (!AG_HAS(s_ops, wifi_disconnect)) {
+    held_t h;
+    if (!hold(&h)) {
         return -AG_ENODEV;
     }
-    return s_ops->wifi_disconnect(s_dev);
+    const ag_err_t e = AG_HAS(h.ops, wifi_disconnect)
+                           ? h.ops->wifi_disconnect(h.dev)
+                           : -AG_ENODEV;
+    let_go(&h);
+    return e;
 }
 
 ag_err_t ag_netprov_wifi_status(ag_wifi_status_t *out)
 {
-    if (!AG_HAS(s_ops, wifi_status)) {
+    held_t h;
+    if (!hold(&h)) {
         return -AG_ENODEV;
     }
-    return s_ops->wifi_status(s_dev, out);
+    const ag_err_t e = AG_HAS(h.ops, wifi_status)
+                           ? h.ops->wifi_status(h.dev, out)
+                           : -AG_ENODEV;
+    let_go(&h);
+    return e;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -405,7 +577,7 @@ static void announce_when_ready(void)
 {
     const ag_port_ticks_t start = ag_port_ticks();
     const ag_port_ticks_t budget = ag_port_ms_to_ticks(4000);
-    while (!s_ops->ready(s_dev)) {
+    while (!ag_netprov_ready()) {
         if ((ag_port_ticks() - start) >= budget) {
             ag_log(AG_LOG_INFO, "net", "%s: no address yet", s_name);
             return;
@@ -413,7 +585,7 @@ static void announce_when_ready(void)
         ag_port_task_delay(ag_port_ms_to_ticks(50));
     }
     uint32_t addr = 0;
-    if (s_ops->ifaddr(s_dev, &addr) == AG_OK) {
+    if (ag_netprov_ifaddr(&addr) == AG_OK) {
         ag_log(AG_LOG_INFO, "net", "%s ip %u.%u.%u.%u", s_name,
                (unsigned)(addr >> 24), (unsigned)((addr >> 16) & 0xffu),
                (unsigned)((addr >> 8) & 0xffu), (unsigned)(addr & 0xffu));
@@ -463,7 +635,7 @@ ag_err_t ag_netprov_use_device(const char *name)
     strncpy(s_name, dev->name, sizeof(s_name) - 1);
     s_name[sizeof(s_name) - 1] = '\0';
 
-    const ag_err_t e = s_ops->start(s_dev);
+    const ag_err_t e = ag_netprov_start();
     if (e != AG_OK) {
         ag_log(AG_LOG_ERROR, "net", "%s did not start: %d", s_name, (int)e);
         /* Fall back so the system is never left with a dead provider. */
