@@ -1717,6 +1717,20 @@ typedef struct {
 /* test only: (N << 8) drops every Nth data frame on arrival, to prove the
  * link sends it again */
 #define AG_SPILINK_DROP(n) (((uint32_t)(n) & 0xFFu) << 8)
+/* open2: the link carries numbered BLOCKS (spi_link_send / spi_link_recv)
+ * rather than bytes */
+#define AG_SPILINK_BLOCKS 4u
+/* spi_link_send: send this block again if it is lost or damaged */
+#define AG_SPILINK_RELIABLE 1u
+/* ag_spilink_block_t.flags: blocks no..last were lost and not sent again */
+#define AG_SPILINK_LOST 0x80u
+
+typedef struct {
+    uint16_t no;    /* the block's number, counted by the sender from 0 */
+    uint16_t last;  /* LOST: the last of the blocks lost; else == no     */
+    uint8_t  flags; /* AG_SPILINK_RELIABLE as sent, or AG_SPILINK_LOST   */
+    uint8_t  rsv[3];
+} ag_spilink_block_t;
 
 typedef struct ag_io_api {
     uint32_t size;
@@ -1872,6 +1886,16 @@ typedef struct ag_io_api {
      * once timeout_ms passes with nothing more accepted */
     int32_t (*spi_link_write_wait)(int bus, const void *buf, size_t len,
                                    uint32_t timeout_ms);
+    /*
+     * ABI 0.60, block mode: one block in, sent again if lost only when
+     * flags has AG_SPILINK_RELIABLE (a block that is not must fit a frame);
+     * one block out, in the order sent, or a LOST notice for blocks that
+     * were lost and not sent again.
+     */
+    int32_t (*spi_link_send)(int bus, const void *buf, size_t len,
+                             uint32_t flags, uint32_t timeout_ms);
+    int32_t (*spi_link_recv)(int bus, void *buf, size_t cap,
+                             ag_spilink_block_t *info, uint32_t timeout_ms);
 } ag_io_api_t;
 
 /* ------------------------------------------------------------------------ */

@@ -219,41 +219,57 @@
  * and 34% of the line was what that came to.
  *
  * So in a framed link a transaction is a FRAME of the size given at open, and
- * its first sixteen bytes are a header:
+ * its first twenty bytes are a header:
  *
  *   0     0xA5
- *   1     flags: 1 = the frame carries data, 2 = "send again from my ack"
- *   2-3   this frame's number, if it carries data (little endian)
- *   4-5   ack: the number of the next data frame this end expects
- *   6-7   payload bytes that follow, 0 .. frame-16
- *   8-9   room: free bytes in the SENDER's receive ring when it built this
- *   10    0x5A
- *   11    0
- *   12-15 checksum of bytes 0..11 and the payload
+ *   1     flags: 1 data, 2 "I have a hole at my ack", 4 skip notice
+ *   2     0x5A
+ *   3     0
+ *   4-7   where this frame's bytes start in the stream (little endian)
+ *   8-11  ack: every byte before this offset has arrived
+ *   12-13 payload bytes that follow (skip: the bytes the notice stands for)
+ *   14-15 room: free bytes in the SENDER's receive ring when it built this
+ *   16-19 checksum of bytes 0..15 and the payload
  *
- * The stream is the payloads, in order, and nothing else: padding is never
- * delivered, and a side that has nothing to say still sends a header, which
- * is how the other side learns its room and its ack.  Neither side ever sends
- * more than the other said it had room for, less what is already on its way.
+ * The stream is the payloads, in order.  A side with nothing to say still
+ * sends a header: that is how the other side learns its room and its ack.
  *
- * AND NOTHING IS LOST (24 Sep): a frame's payload leaves the transmit ring
- * only when the other side acknowledges it.  A receiver takes data frames
- * strictly in order; a gap or a bad checksum makes it ask, once, for the
- * frames from its ack on, and the sender goes back and sends them again
- * (go-back-N, out of the ring it never freed).  The acknowledgements ride in
- * the frames going the other way, which both sides send anyway, so the
- * protocol costs no transaction of its own and no waiting for one: the
- * sender keeps up to SPILINK_WIN frames unacknowledged.
+ * NOTHING IS LOST, AND ONLY WHAT IS LOST IS SENT AGAIN (24 Sep).  A payload
+ * leaves the transmit ring only when the other side's ack passes it.  A frame
+ * that arrives after a hole is put straight into its place in the receive
+ * ring - its offset says where - and the reader is given bytes only up to
+ * the first hole, so a receiver needs no memory of its own for this.  It
+ * says, once per hole, "I have a hole at my ack", and the sender sends the
+ * one frame that starts there again; 50 ms with no ack does the same.  Acks
+ * ride the frames going the other way, which both sides send anyway.
+ *
+ * BLOCKS (AG_SPILINK_BLOCKS).  An application may write BLOCKS instead of
+ * bytes: each goes into the stream as an 8-byte record header - length,
+ * block number, flags - and its bytes, and a block not marked
+ * AG_SPILINK_RELIABLE is one that is not worth sending again (a piece of a
+ * screen the next update will cover).  A lost frame with anything reliable
+ * in it is sent again whole; a lost frame of ONLY the others is replaced by
+ * a SKIP notice naming the blocks, which the receiver turns into a LOST
+ * record of the same size in the same place.  So the reader gets
+ * every block in order, or knows exactly which ones it will never get, and
+ * the price is two bytes of block number per block.
  */
-#define SPILINK_HDR 16u
+#define SPILINK_HDR 20u
 #define SPILINK_F_DATA 1u
 #define SPILINK_F_NAK  2u
-/* frames a sender may have out and unacknowledged */
+#define SPILINK_F_SKIP 4u
+/* frames a sender may have out and unacknowledged, and the out-of-order
+ * frames a receiver will hold beyond its hole */
 #define SPILINK_WIN 8u
-/* no acknowledgement for this long with frames out: send them again */
+/* no acknowledgement for this long with frames out: send the first again */
 #define SPILINK_RTO_US 50000
-/* a receiver asks again for the same gap only after this long */
+/* a receiver says "hole" again for the same hole only after this long */
 #define SPILINK_NAK_US 20000
+/* the record header in front of every block, in block mode */
+#define SPILINK_REC 8u
+#define SPILINK_REC_LOST 0x80u
+/* blocks written and not yet acknowledged, in block mode */
+#define SPILINK_RECQ 32u
 /*
  * TWO FRAMES AHEAD, in a framed link, and it is a constant of the protocol
  * rather than of one end: the slave keeps this many frames armed, and the
@@ -385,21 +401,47 @@ typedef struct {
      * on their way that the room they are compared with did not yet count.
      */
     bool     peer_known;
-    /* ARQ, the sending half: bytes past the ring head already sent (in
-     * frames not yet acknowledged), those frames, and the next number */
+    /* the sending half: the stream offset of the ring's head (everything
+     * before it acknowledged), bytes past the head sent at least once, the
+     * frames out, and a frame to send again */
+    uint32_t tx_base;
     uint32_t sent_off;
-    uint16_t next_seq;
     struct {
-        uint16_t seq;
+        uint32_t off;
         uint16_t n;
+        uint16_t first; /* blocks in it, block mode */
+        uint16_t last;
+        bool     skippable;
     } infl[SPILINK_WIN];
     uint32_t infl_n;
+    bool     resend;
+    uint32_t resend_off;
     int64_t  ack_at;
-    /* ... the receiving half */
-    uint16_t rx_expect;
+    /* block mode, sending: the blocks written and not yet acknowledged */
+    bool     blocks;
+    /* allocated at open in block mode only: every byte of this structure is
+     * static on every bus, and on the C3 the static memory is what the
+     * link's one piece had to fit beside */
+    struct spilink_rec {
+        uint32_t off;
+        uint32_t total;
+        uint16_t no;
+        bool     reliable;
+    } *rec;
+    uint32_t rec_head;
+    uint32_t rec_n;
+    uint16_t next_block;
+    /* the receiving half: everything before rx_next is in the ring; ranges
+     * after a hole, already written into their places */
+    uint32_t rx_next;
+    struct {
+        uint32_t off;
+        uint32_t n;
+    } ooo[SPILINK_WIN];
+    uint32_t ooo_n;
     bool     nak_pending;
     bool     nak_sent;
-    uint16_t nak_expect;
+    uint32_t nak_expect;
     int64_t  nak_at;
     /* test only: drop every Nth data frame on arrival (open2 flags >> 8) */
     uint32_t drop_every;
@@ -747,7 +789,7 @@ static uint32_t frame_sum(const uint8_t *f, uint32_t len)
     uint32_t a = 0x6A09E667u;
     uint32_t b = 0;
     const uint32_t *w = (const uint32_t *)f;
-    for (unsigned k = 0; k < 3u; k++) {
+    for (unsigned k = 0; k < 4u; k++) {
         a += w[k];
         b += a;
     }
@@ -771,21 +813,20 @@ static void put16(uint8_t *p, uint32_t v)
     p[1] = (uint8_t)(v >> 8);
 }
 
+static void put32(uint8_t *p, uint32_t v)
+{
+    put16(p, v);
+    put16(p + 2, v >> 16);
+}
+
 static uint32_t get16(const uint8_t *p)
 {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8);
 }
 
-static void rewind_tx(spilink_t *s)
+static uint32_t get32(const uint8_t *p)
 {
-    if (s->infl_n == 0u) {
-        return;
-    }
-    s->next_seq = s->infl[0].seq;
-    s->sent_off = 0;
-    s->infl_n = 0;
-    s->ack_at = ag_port_us();
-    s->rewinds++;
+    return get16(p) | (get16(p + 2) << 16);
 }
 
 /* Bytes the peer may be sent now: its room, less what is already on the way. */
@@ -795,23 +836,6 @@ static uint32_t peer_allowance(const spilink_t *s, uint32_t in_flight)
         return 0u;
     }
     return s->peer_room - in_flight;
-}
-
-/* A received payload into the RX ring, and the reader woken. */
-static void frame_put(spilink_t *s, const uint8_t *payload, uint32_t len)
-{
-    if (len == 0u) {
-        return;
-    }
-    lock(s);
-    const uint32_t put = ring_put(&s->rx, payload, len);
-    if (put < len) {
-        s->bytes_dropped += (len - put);
-    }
-    unlock(s);
-    if (put > 0u) {
-        (void)ag_port_sem_give(s->rx_sem);
-    }
 }
 
 /* Copy out without removing, starting `off` bytes past the head. */
@@ -833,49 +857,183 @@ static uint32_t ring_peek_at(const ring_t *r, uint32_t off, uint8_t *dst,
     return n;
 }
 
+/* Write `n` bytes `delta` past the tail, not yet counted as in the ring;
+ * src NULL writes zeros.  The caller has checked delta + n fits. */
+static void ring_write_at(ring_t *r, uint32_t delta, const uint8_t *src,
+                          uint32_t n)
+{
+    const uint32_t start = (r->tail + delta) % r->cap;
+    const uint32_t first = r->cap - start;
+    const uint32_t a0 = (n < first) ? n : first;
+    if (src != NULL) {
+        memcpy(r->mem + start, src, a0);
+        if (n > a0) {
+            memcpy(r->mem, src + a0, n - a0);
+        }
+    } else {
+        memset(r->mem + start, 0, a0);
+        if (n > a0) {
+            memset(r->mem, 0, n - a0);
+        }
+    }
+}
+
+static void ring_advance(ring_t *r, uint32_t n)
+{
+    r->tail = (r->tail + n) % r->cap;
+    r->count += n;
+}
+
+/* Receive ring bytes beyond the tail already taken by frames after a hole. */
+static uint32_t ooo_reserved(const spilink_t *s)
+{
+    if (s->ooo_n == 0u) {
+        return 0u;
+    }
+    return s->ooo[s->ooo_n - 1u].off + s->ooo[s->ooo_n - 1u].n - s->rx_next;
+}
+
+/* What frame_build did, so a slave whose arm is refused can take it back. */
+static struct {
+    uint8_t  kind; /* 0 nothing, 1 new frame, 2 a frame sent again */
+    uint32_t n;
+    uint32_t resend_off;
+} s_undo[AG_SPI_BUSES];
+
 /*
- * Fill a frame: header, and as much NOT YET SENT data as `allow` lets.  The
- * data stays in the ring - it is freed by the acknowledgement, not here.
- * Returns the payload length; `*nak_was` says whether a request to send
- * again went out in it, so a slave whose arm is refused can put it back.
+ * Fill a frame.  A frame to send again goes first - the one frame the other
+ * side has a hole at, or a SKIP notice in its place when it held only blocks
+ * not worth sending again - and otherwise as much NOT YET SENT data as
+ * `allow` lets, whole unreliable blocks and any reliable ones.  Nothing is
+ * freed here; the acknowledgement does that.  Returns the data bytes in it.
  */
 static uint32_t frame_build(spilink_t *s, uint8_t *f, uint32_t allow,
                             uint32_t room_less, bool *nak_was)
 {
     const uint32_t pay = s->block - SPILINK_HDR;
+    const int      ix = link_index(s->bus);
+    uint32_t       flags = 0;
+    uint32_t       off = 0;
+    uint32_t       n = 0;     /* data bytes */
+    uint32_t       span = 0;  /* stream bytes this frame stands for */
+    uint32_t       body = 0;  /* payload bytes after the header */
+    s_undo[ix].kind = 0;
+
     lock(s);
-    const uint32_t avail =
-        (s->tx.count > s->sent_off) ? s->tx.count - s->sent_off : 0u;
-    uint32_t n = (avail < allow) ? avail : allow;
-    if (n > pay) {
-        n = pay;
+    if (s->resend) {
+        s->resend = false;
+        for (uint32_t k = 0; k < s->infl_n; k++) {
+            if (s->infl[k].off != s->resend_off) {
+                continue;
+            }
+            off = s->infl[k].off;
+            span = s->infl[k].n;
+            if (s->infl[k].skippable) {
+                flags = SPILINK_F_SKIP;
+                put16(f + SPILINK_HDR, s->infl[k].first);
+                put16(f + SPILINK_HDR + 2, s->infl[k].last);
+                body = 4;
+            } else {
+                flags = SPILINK_F_DATA;
+                n = ring_peek_at(&s->tx, off - s->tx_base, f + SPILINK_HDR,
+                                 span);
+                body = n;
+            }
+            s_undo[ix].kind = 2;
+            s_undo[ix].resend_off = off;
+            break;
+        }
     }
-    if (s->infl_n >= SPILINK_WIN) {
-        n = 0; /* the window is full: nothing new until something is acked */
+    if (flags == 0u && s->infl_n < SPILINK_WIN) {
+        const uint32_t start = s->tx_base + s->sent_off;
+        const uint32_t avail =
+            (s->tx.count > s->sent_off) ? s->tx.count - s->sent_off : 0u;
+        uint32_t limit = (avail < allow) ? avail : allow;
+        if (limit > pay) {
+            limit = pay;
+        }
+        uint32_t first = 0, last = 0;
+        bool     skippable = false;
+        if (s->blocks && limit > 0u) {
+            /*
+             * Blocks of both kinds share a frame: a frame is SKIPPED on loss
+             * only if nothing in it is reliable, and any other frame is sent
+             * again whole, which a block not worth sending again does not
+             * mind.  Cutting frames at every change of kind cost a quarter of
+             * the wire with one block in eight unreliable, and so did
+             * refusing to cut an unreliable block (74%, measured).  Any
+             * block may be cut; what a skip notice may stand for is only a
+             * frame of WHOLE unreliable blocks, so a frame holding a piece
+             * of any block is sent again if lost, like a reliable one.
+             */
+            uint32_t pos = start;
+            uint32_t take = 0;
+            bool     any = false;
+            bool     reliable_in = false;
+            for (uint32_t k = 0; k < s->rec_n && take < limit; k++) {
+                const uint32_t q = (s->rec_head + k) % SPILINK_RECQ;
+                const uint32_t rend = s->rec[q].off + s->rec[q].total;
+                if (rend <= pos) {
+                    continue;
+                }
+                uint32_t chunk = rend - pos;
+                if (pos != s->rec[q].off) {
+                    reliable_in = true; /* the tail of a block cut before */
+                }
+                if (chunk > limit - take) {
+                    chunk = limit - take;
+                    reliable_in = true; /* a block cut here */
+                }
+                if (!any) {
+                    first = s->rec[q].no;
+                    any = true;
+                }
+                reliable_in = reliable_in || s->rec[q].reliable;
+                take += chunk;
+                pos += chunk;
+                last = s->rec[q].no;
+                if (pos < rend) {
+                    break;
+                }
+            }
+            limit = take;
+            skippable = any && !reliable_in;
+        }
+        if (limit > 0u) {
+            n = ring_peek_at(&s->tx, s->sent_off, f + SPILINK_HDR, limit);
+            s->infl[s->infl_n].off = start;
+            s->infl[s->infl_n].n = (uint16_t)n;
+            s->infl[s->infl_n].first = (uint16_t)first;
+            s->infl[s->infl_n].last = (uint16_t)last;
+            s->infl[s->infl_n].skippable = skippable;
+            s->infl_n++;
+            s->sent_off += n;
+            flags = SPILINK_F_DATA;
+            off = start;
+            span = n;
+            body = n;
+            s_undo[ix].kind = 1;
+            s_undo[ix].n = n;
+        }
     }
-    if (n > 0u) {
-        n = ring_peek_at(&s->tx, s->sent_off, f + SPILINK_HDR, n);
-    } else if (avail == 0u) {
-        s->starve_data++;
-    } else {
-        s->starve_credit++;
-    }
-    uint32_t space = ring_space(&s->rx) + s->last_rx_len;
+    /*
+     * One frame's payload counted as room beyond what is free: the reader
+     * takes what arrived before the room is looked at again - and in block
+     * mode the start of a block cut across two frames cannot be taken until
+     * the second arrives, which strict counting charged to every frame (74%
+     * of the wire, measured).  A frame that does not fit is not
+     * acknowledged and comes again, so this can cost a resend, never data.
+     */
+    uint32_t space = ring_space(&s->rx) + pay;
+    const uint32_t held = ooo_reserved(s);
+    space = (space > held) ? space - held : 0u;
     if (space > s->rxcap) {
         space = s->rxcap;
     }
     unlock(s);
 
-    uint32_t flags = 0;
-    uint32_t seq = 0;
-    if (n > 0u) {
-        flags |= SPILINK_F_DATA;
-        seq = s->next_seq;
-        s->infl[s->infl_n].seq = s->next_seq;
-        s->infl[s->infl_n].n = (uint16_t)n;
-        s->infl_n++;
-        s->sent_off += n;
-        s->next_seq++;
+    if (flags == 0u) {
+        s->starve_data += (s->tx.count > s->sent_off) ? 0u : 1u;
     }
     *nak_was = s->nak_pending;
     if (s->nak_pending) {
@@ -889,76 +1047,103 @@ static uint32_t frame_build(spilink_t *s, uint8_t *f, uint32_t allow,
     }
     f[0] = 0xA5u;
     f[1] = (uint8_t)flags;
-    put16(f + 2, seq);
-    put16(f + 4, s->rx_expect);
-    put16(f + 6, n);
-    put16(f + 8, room);
-    f[10] = 0x5Au;
-    f[11] = 0u;
-    const uint32_t sum = frame_sum(f, n);
-    f[12] = (uint8_t)sum;
-    f[13] = (uint8_t)(sum >> 8);
-    f[14] = (uint8_t)(sum >> 16);
-    f[15] = (uint8_t)(sum >> 24);
+    f[2] = 0x5Au;
+    f[3] = 0u;
+    put32(f + 4, off);
+    put32(f + 8, s->rx_next);
+    put16(f + 12, span);
+    put16(f + 14, room);
+    put32(f + 16, frame_sum(f, body));
     return n;
 }
 
 /* Take back what frame_build did, for a frame that never went out. */
 static void frame_unbuild(spilink_t *s, uint32_t n, bool nak_was)
 {
-    if (n > 0u && s->infl_n > 0u) {
+    const int ix = link_index(s->bus);
+    (void)n;
+    if (s_undo[ix].kind == 1u && s->infl_n > 0u) {
         s->infl_n--;
-        s->sent_off -= n;
-        s->next_seq--;
+        s->sent_off -= s_undo[ix].n;
+    } else if (s_undo[ix].kind == 2u) {
+        s->resend = true;
+        s->resend_off = s_undo[ix].resend_off;
     }
+    s_undo[ix].kind = 0;
     if (nak_was) {
         s->nak_pending = true;
         s->naks--;
     }
 }
 
+static void ask_again(spilink_t *s, int64_t now)
+{
+    if (!s->nak_sent || s->nak_expect != s->rx_next ||
+        now - s->nak_at > SPILINK_NAK_US) {
+        s->nak_pending = true;
+        s->nak_sent = true;
+        s->nak_expect = s->rx_next;
+        s->nak_at = now;
+        s->seq_gaps++;
+    }
+}
+
 /*
- * One received frame: acknowledgements applied to what this end sent, a
- * request to send again honoured, and data taken if it is the next in order.
- * Returns the payload length delivered.
+ * One received frame: its ack applied to what this end sent, a hole report
+ * honoured, and its bytes put where they belong.  Returns the bytes that
+ * reached the reader.
  */
 static uint32_t frame_rx(spilink_t *s, const uint8_t *f, uint32_t got)
 {
     const uint32_t pay = s->block - SPILINK_HDR;
-    if (got < SPILINK_HDR || f[0] != 0xA5u || f[10] != 0x5Au) {
+    if (got < SPILINK_HDR || f[0] != 0xA5u || f[2] != 0x5Au) {
         count(s, &s->frames_bad, 1u);
         return 0u;
     }
     const uint32_t flags = f[1];
-    const uint16_t seq = (uint16_t)get16(f + 2);
-    const uint16_t ack = (uint16_t)get16(f + 4);
-    const uint32_t len = get16(f + 6);
-    const uint32_t room = get16(f + 8);
-    const uint32_t sum = (uint32_t)f[12] | ((uint32_t)f[13] << 8) |
-                         ((uint32_t)f[14] << 16) | ((uint32_t)f[15] << 24);
+    const uint32_t off = get32(f + 4);
+    const uint32_t ack = get32(f + 8);
+    const uint32_t span = get16(f + 12);
+    const uint32_t room = get16(f + 14);
+    const uint32_t body = (flags & SPILINK_F_SKIP)   ? 4u
+                          : (flags & SPILINK_F_DATA) ? span
+                                                     : 0u;
     const int64_t  now = ag_port_us();
-    if (len > pay || len > got - SPILINK_HDR || frame_sum(f, len) != sum) {
-        /* damaged: nothing in it can be believed, the data least of all */
+    if (body > pay || body > got - SPILINK_HDR || span > pay ||
+        frame_sum(f, body) != get32(f + 16)) {
         count(s, &s->frames_bad, 1u);
-        s->nak_pending = true;
+        ask_again(s, now);
         return 0u;
     }
-    if (s->drop_every != 0u && (flags & SPILINK_F_DATA) &&
+    const bool carries = (flags & (SPILINK_F_DATA | SPILINK_F_SKIP)) != 0u;
+    if (s->drop_every != 0u && carries &&
         (++s->drop_count % s->drop_every) == 0u) {
         return 0u; /* test: this frame never arrived */
     }
 
+    /* the ack: free what it passes */
     lock(s);
     s->peer_room = room;
     s->peer_known = true;
     bool freed = false;
-    while (s->infl_n > 0u && (int16_t)(ack - s->infl[0].seq) > 0) {
-        ring_commit(&s->tx, s->infl[0].n);
-        s->sent_off -= s->infl[0].n;
-        for (uint32_t k = 1; k < s->infl_n; k++) {
-            s->infl[k - 1] = s->infl[k];
+    const uint32_t d = ack - s->tx_base;
+    if ((int32_t)d > 0 && d <= s->sent_off) {
+        ring_commit(&s->tx, d);
+        s->sent_off -= d;
+        s->tx_base = ack;
+        while (s->infl_n > 0u &&
+               (int32_t)(s->infl[0].off + s->infl[0].n - ack) <= 0) {
+            for (uint32_t k = 1; k < s->infl_n; k++) {
+                s->infl[k - 1] = s->infl[k];
+            }
+            s->infl_n--;
         }
-        s->infl_n--;
+        while (s->rec_n > 0u &&
+               (int32_t)(s->rec[s->rec_head].off + s->rec[s->rec_head].total -
+                         ack) <= 0) {
+            s->rec_head = (s->rec_head + 1u) % SPILINK_RECQ;
+            s->rec_n--;
+        }
         freed = true;
     }
     unlock(s);
@@ -966,55 +1151,98 @@ static uint32_t frame_rx(spilink_t *s, const uint8_t *f, uint32_t got)
         s->ack_at = now;
         (void)ag_port_sem_give(s->space_sem);
     }
-    if ((flags & SPILINK_F_NAK) && s->infl_n > 0u) {
-        rewind_tx(s);
+    if ((flags & SPILINK_F_NAK) && s->infl_n > 0u &&
+        (int32_t)(ack - s->tx_base) == 0) {
+        s->resend = true;
+        s->resend_off = s->tx_base;
+        s->rewinds++;
     }
-
-    if ((flags & SPILINK_F_DATA) == 0u) {
+    if (!carries || span == 0u) {
         return 0u;
     }
-    const int16_t d = (int16_t)(seq - s->rx_expect);
-    if (d == 0) {
-        lock(s);
-        const bool fits = ring_space(&s->rx) >= len;
-        unlock(s);
-        if (!fits) {
-            /* not taken, so not acknowledged: it comes again */
-            count(s, &s->bytes_dropped, len);
-            if (!s->nak_sent || now - s->nak_at > SPILINK_NAK_US) {
-                s->nak_pending = true;
-                s->nak_sent = true;
-                s->nak_expect = s->rx_expect;
-                s->nak_at = now;
+
+    /* the bytes: a repeat, the next in order, or after a hole */
+    if ((int32_t)(off + span - s->rx_next) <= 0 ||
+        (int32_t)(off - s->rx_next) < 0) {
+        return 0u;
+    }
+    const uint32_t delta = off - s->rx_next;
+    for (uint32_t k = 0; k < s->ooo_n; k++) {
+        if (s->ooo[k].off == off) {
+            return 0u; /* already have it */
+        }
+    }
+    lock(s);
+    const bool fits = delta + span <= ring_space(&s->rx) &&
+                      (delta == 0u || s->ooo_n < SPILINK_WIN);
+    unlock(s);
+    if (!fits) {
+        /* not taken, so not acknowledged: it comes again */
+        s->bytes_dropped += span;
+        ask_again(s, now);
+        return 0u;
+    }
+    lock(s);
+    if (flags & SPILINK_F_DATA) {
+        ring_write_at(&s->rx, delta, f + SPILINK_HDR, span);
+    } else {
+        /* a SKIP notice: the reader gets a LOST record of the same size */
+        uint8_t rec[SPILINK_REC];
+        put16(rec, span - SPILINK_REC);
+        put16(rec + 2, get16(f + SPILINK_HDR));
+        rec[4] = SPILINK_REC_LOST;
+        rec[5] = 0;
+        put16(rec + 6, get16(f + SPILINK_HDR + 2));
+        ring_write_at(&s->rx, delta, rec, SPILINK_REC);
+        ring_write_at(&s->rx, delta + SPILINK_REC, NULL, span - SPILINK_REC);
+    }
+    uint32_t delivered = 0;
+    if (delta == 0u) {
+        ring_advance(&s->rx, span);
+        s->rx_next += span;
+        delivered = span;
+        s->last_rx_len = span;
+        while (s->ooo_n > 0u && s->ooo[0].off == s->rx_next) {
+            ring_advance(&s->rx, s->ooo[0].n);
+            s->rx_next += s->ooo[0].n;
+            delivered += s->ooo[0].n;
+            for (uint32_t k = 1; k < s->ooo_n; k++) {
+                s->ooo[k - 1] = s->ooo[k];
             }
-            return 0u;
+            s->ooo_n--;
         }
-        frame_put(s, f + SPILINK_HDR, len);
-        s->last_rx_len = len;
-        s->rx_expect++;
+    } else {
+        uint32_t at = s->ooo_n;
+        while (at > 0u && (int32_t)(s->ooo[at - 1u].off - off) > 0) {
+            s->ooo[at] = s->ooo[at - 1u];
+            at--;
+        }
+        s->ooo[at].off = off;
+        s->ooo[at].n = span;
+        s->ooo_n++;
+    }
+    unlock(s);
+    if (delivered > 0u) {
         s->nak_sent = false;
-        return len;
-    }
-    if (d > 0) {
-        /* a gap: ask once for everything from rx_expect, and not again for
-         * the same gap unless the ask itself seems to have been lost */
-        s->seq_gaps++;
-        if (!s->nak_sent || s->nak_expect != s->rx_expect ||
-            now - s->nak_at > SPILINK_NAK_US) {
-            s->nak_pending = true;
-            s->nak_sent = true;
-            s->nak_expect = s->rx_expect;
-            s->nak_at = now;
+        (void)ag_port_sem_give(s->rx_sem);
+        if (s->ooo_n > 0u) {
+            ask_again(s, now); /* a further hole behind the one just filled */
         }
+    } else {
+        ask_again(s, now);
     }
-    return 0u; /* ahead (dropped until the gap is filled) or a repeat */
+    return delivered;
 }
 
-/* No acknowledgement for too long with frames out: send them again. */
+/* No acknowledgement for too long with frames out: send the first again. */
 static void rto_check(spilink_t *s)
 {
-    if (s->infl_n > 0u && ag_port_us() - s->ack_at > SPILINK_RTO_US) {
-        rewind_tx(s);
+    const int64_t now = ag_port_us();
+    if (s->infl_n > 0u && now - s->ack_at > SPILINK_RTO_US) {
+        s->resend = true;
+        s->resend_off = s->tx_base;
+        s->ack_at = now;
+        s->rewinds++;
     }
 }
 
@@ -1760,11 +1988,24 @@ ag_err_t ag_spilink_open2(int bus, int cs, uint32_t khz, uint32_t block,
     s->rx = (ring_t){.mem = s->rxmem, .cap = s->rxcap};
     s->master = master;
     s->framed = framed;
+    s->tx_base = 0;
     s->sent_off = 0;
-    s->next_seq = 0;
     s->infl_n = 0;
+    s->resend = false;
+    s->resend_off = 0;
     s->ack_at = ag_port_us();
-    s->rx_expect = 0;
+    s->blocks = (flags & AG_SPILINK_BLOCKS) != 0u;
+    if (s->blocks && s->rec == NULL) {
+        s->rec = ag_port_alloc(SPILINK_RECQ * sizeof(*s->rec), AG_MEM_BYTE);
+    }
+    if (s->blocks && s->rec == NULL) {
+        s->blocks = false; /* no memory for the block list: refuse below */
+    }
+    s->rec_head = 0;
+    s->rec_n = 0;
+    s->next_block = 0;
+    s->rx_next = 0;
+    s->ooo_n = 0;
     s->nak_pending = false;
     s->nak_sent = false;
     s->nak_expect = 0;
@@ -1993,6 +2234,141 @@ int32_t ag_spilink_write_wait(int bus, const void *buf, size_t len,
         }
     }
     return (done > 0u) ? (int32_t)done : -AG_EAGAIN;
+}
+
+/*
+ * BLOCK MODE.  One block in: its record header and its bytes go into the
+ * transmit ring together, and the block is remembered until it is
+ * acknowledged, with its number and whether it is worth sending again.
+ */
+int32_t ag_spilink_send(int bus, const void *buf, size_t len, uint32_t flags,
+                        uint32_t timeout_ms)
+{
+    const int idx = link_index(bus);
+    if (idx < 0 || buf == NULL || len == 0 || len > 0xFFFFu) {
+        return -AG_EINVAL;
+    }
+    spilink_t *const s = &s_link[idx];
+    if (s->lock == NULL) {
+        return -AG_ENODEV;
+    }
+    const bool     reliable = (flags & AG_SPILINK_RELIABLE) != 0u;
+    const uint32_t need = SPILINK_REC + (uint32_t)len;
+    if (!s->blocks || need > s->txcap) {
+        return -AG_EINVAL;
+    }
+    for (;;) {
+        lock(s);
+        if (!s->open) {
+            unlock(s);
+            return -AG_ENODEV;
+        }
+        if (ring_space(&s->tx) >= SPILINK_REC && s->rec_n < SPILINK_RECQ) {
+            /*
+             * The header now and the bytes as room is made: waiting for room
+             * for the WHOLE block left a 2 KB block waiting while a frame
+             * went out half empty (81% of the wire, measured).  The frame
+             * builder takes only what is in the ring, and a block cut across
+             * frames is simply sent again whole if lost.  One writer a link.
+             */
+            uint8_t hdr[SPILINK_REC];
+            const uint16_t no = s->next_block++;
+            put16(hdr, (uint32_t)len);
+            put16(hdr + 2, no);
+            hdr[4] = reliable ? AG_SPILINK_RELIABLE : 0u;
+            hdr[5] = 0;
+            put16(hdr + 6, no);
+            const uint32_t q = (s->rec_head + s->rec_n) % SPILINK_RECQ;
+            s->rec[q].off = s->tx_base + s->tx.count;
+            s->rec[q].total = need;
+            s->rec[q].no = no;
+            s->rec[q].reliable = reliable;
+            s->rec_n++;
+            (void)ring_put(&s->tx, hdr, SPILINK_REC);
+            const uint8_t *p = (const uint8_t *)buf;
+            size_t         done = ring_put(&s->tx, p, (uint32_t)len);
+            unlock(s);
+            for (;;) {
+                if (s->master) {
+                    (void)ag_port_sem_give(s->tx_sem);
+                }
+                if (done >= len) {
+                    return (int32_t)len;
+                }
+                /* the header is in: the rest of the block has to follow,
+                 * however long room takes, or the stream would be cut */
+                (void)ag_port_sem_take(s->space_sem,
+                                       ticks_at_least(timeout_ms));
+                lock(s);
+                if (!s->open) {
+                    unlock(s);
+                    return -AG_ENODEV;
+                }
+                done += ring_put(&s->tx, p + done, (uint32_t)(len - done));
+                unlock(s);
+            }
+        }
+        unlock(s);
+        if (!ag_port_sem_take(s->space_sem, ticks_at_least(timeout_ms))) {
+            return -AG_EAGAIN;
+        }
+    }
+}
+
+/*
+ * One block out, in order: its bytes into `buf` (cut at `cap`), and in
+ * `*info` its number and flags - or, for blocks that were lost and not sent
+ * again, AG_SPILINK_LOST with the first and last of them, and no bytes.
+ */
+int32_t ag_spilink_recv(int bus, void *buf, size_t cap,
+                        ag_spilink_block_t *info, uint32_t timeout_ms)
+{
+    const int idx = link_index(bus);
+    if (idx < 0 || info == NULL) {
+        return -AG_EINVAL;
+    }
+    spilink_t *const s = &s_link[idx];
+    if (s->lock == NULL || !s->blocks) {
+        return (s->lock == NULL) ? -AG_ENODEV : -AG_EINVAL;
+    }
+    const ag_port_ticks_t start = ag_port_ticks();
+    const ag_port_ticks_t span = ticks_at_least(timeout_ms);
+    for (;;) {
+        lock(s);
+        if (!s->open) {
+            unlock(s);
+            return -AG_ENODEV;
+        }
+        uint8_t hdr[SPILINK_REC];
+        if (s->rx.count >= SPILINK_REC) {
+            (void)ring_peek(&s->rx, hdr, SPILINK_REC);
+            const uint32_t len = get16(hdr);
+            if (s->rx.count >= SPILINK_REC + len) {
+                ring_commit(&s->rx, SPILINK_REC);
+                info->no = (uint16_t)get16(hdr + 2);
+                info->last = (uint16_t)get16(hdr + 6);
+                info->flags = hdr[4];
+                const uint32_t n = (buf == NULL) ? 0u
+                                   : (len < cap) ? len
+                                                 : (uint32_t)cap;
+                const bool lost = (hdr[4] & SPILINK_REC_LOST) != 0u;
+                if (!lost && n > 0u) {
+                    (void)ring_take(&s->rx, buf, n);
+                    ring_commit(&s->rx, len - n);
+                } else {
+                    ring_commit(&s->rx, len);
+                }
+                unlock(s);
+                return lost ? 0 : (int32_t)n;
+            }
+        }
+        unlock(s);
+        const ag_port_ticks_t used = (ag_port_ticks_t)(ag_port_ticks() - start);
+        if (used >= span) {
+            return -AG_EAGAIN;
+        }
+        (void)ag_port_sem_take(s->rx_sem, span - used);
+    }
 }
 
 int32_t ag_spilink_read(int bus, void *buf, size_t len, uint32_t timeout_ms)

@@ -447,6 +447,10 @@ int ag_main(int argc, char **argv)
     uint32_t frame = 4096;
     bool     sink = false;
     uint32_t drop = 0;
+    /* blocks=N: the link carries blocks; every Nth one is sent without
+     * AG_SPILINK_RELIABLE (N = 1: none reliable, 0: bytes, not blocks) */
+    uint32_t blocks = 0;
+    uint32_t lost_told = 0;
     for (int i = 6, bare = 0; i < argc; i++) {
         const char *a = argv[i];
         if (starts(a, "burn=")) {
@@ -459,6 +463,8 @@ int ag_main(int argc, char **argv)
             s_uart_port = (int)number(a + 5);
         } else if (starts(a, "frame=")) {
             frame = number(a + 6);
+        } else if (starts(a, "blocks=")) {
+            blocks = number(a + 7);
         } else if (starts(a, "drop=")) {
             /* test: this end drops every Nth data frame on arrival */
             drop = number(a + 5);
@@ -506,6 +512,7 @@ int ag_main(int argc, char **argv)
     } else {
         e = io->spi_link_open2(bus, cs, rate, frame,
                                AG_SPILINK_FRAMED | AG_SPILINK_DROP(drop) |
+                                   (blocks ? AG_SPILINK_BLOCKS : 0u) |
                                    (spim ? AG_SPILINK_MASTER : 0u));
     }
     if (e != AG_OK) {
@@ -598,7 +605,18 @@ int ag_main(int argc, char **argv)
             } else {
                 build(s_blk, block, seq);
                 uint32_t off = 0;
-                if (AG_HAS(io, spi_link_write_wait)) {
+                if (blocks != 0u && AG_HAS(io, spi_link_send)) {
+                    const uint32_t fl =
+                        ((seq % blocks) == 0u) ? 0u : AG_SPILINK_RELIABLE;
+                    const int32_t w =
+                        io->spi_link_send(bus, s_blk, block, fl, 200);
+                    off = (w > 0) ? (uint32_t)w : 0u;
+                    if (off != block) {
+                        off = block; /* refused: counted, not retried */
+                        refused++;
+                        sent--;
+                    }
+                } else if (AG_HAS(io, spi_link_write_wait)) {
                     const int32_t w =
                         io->spi_link_write_wait(bus, s_blk, block, 200);
                     off = (w > 0) ? (uint32_t)w : 0u;
@@ -676,6 +694,19 @@ int ag_main(int argc, char **argv)
                 n = io->uart_dma_read(UART_PORT, s_rx, s_rxcap, 200);
             } else if (uart) {
                 n = io->uart_read(UART_PORT, s_rx, s_rxcap, 20);
+            } else if (blocks != 0u && AG_HAS(io, spi_link_recv)) {
+                ag_spilink_block_t bi;
+                n = io->spi_link_recv(bus, s_cur, block, &bi, 20);
+                if (n == 0 && (bi.flags & AG_SPILINK_LOST)) {
+                    lost_told += (uint32_t)(uint16_t)(bi.last - bi.no) + 1u;
+                }
+                if (n == (int32_t)block) {
+                    /* a whole block, already in s_cur: check it there */
+                    finish(&r);
+                } else if (n > 0) {
+                    r.bad++;
+                }
+                n = 0;
             } else {
                 n = io->spi_link_read(bus, s_rx, s_rxcap, 20);
             }
@@ -695,6 +726,9 @@ int ag_main(int argc, char **argv)
             r.stray = 0;
         }
         report(wire, rate, &r);
+        if (blocks != 0u) {
+            ag_printf("wireblk blocks: lost and told=%u\n", (unsigned)lost_told);
+        }
         diag_write();
     }
 
