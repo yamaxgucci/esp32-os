@@ -72,6 +72,7 @@ set(ARGON_KERNEL_SRCS
     "src/net/netmsg.c"
     "src/net/netio.c"
     "src/net/spilink.c"
+    "src/net/wlink.c"
     "src/net/httpc.c"
     "src/net/ftpc.c"
     "src/net/ssh.c"

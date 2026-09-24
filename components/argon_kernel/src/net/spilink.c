@@ -124,6 +124,7 @@
 #include <argon/port/time.h>
 
 #include "core/sysconfig.h"
+#include "net/wlink.h"
 
 /*
  * Three, and not four: the port's slave pool is AG_PORT_SPI_SLAVE_QUEUE deep
@@ -211,104 +212,11 @@
 #define SPILINK_FAULT_REPORT_MS 5000u
 
 /*
- * FRAMED: EVERY TRANSACTION SAYS WHAT IN IT IS DATA (ABI 0.60).
- *
- * The first shape of this link moved raw blocks: whatever was in the slot was
- * the stream, so a side with nothing to say clocked zeros and the other side
- * took them in as bytes - 826 blocks for 69 that carried anything, measured -
- * and neither side could know whether the other had room.  A caller that
- * wanted its own framing had to make each of ITS blocks one transaction,
- * which at 64 bytes and 20 MHz is a transaction's setup for 26 us of wire,
- * and 34% of the line was what that came to.
- *
- * So in a framed link a transaction is a FRAME of the size given at open, and
- * its first twenty bytes are a header:
- *
- *   0     0xA5
- *   1     flags: 1 data, 2 "I have a hole at my ack", 4 segments,
- *         8 "... and it is a frame I had no room for: send it as it was",
- *         16 sent by the master
- *   2     0x5A
- *   3     the largest frame the SENDER can take, in 64-byte units
- *   4-7   where this frame's bytes start in the stream (little endian)
- *   8-11  ack: every byte before this offset has arrived
- *   12-13 payload bytes that follow (segments: the stream bytes they
- *         stand for)
- *   14-15 room: free bytes in the SENDER's receive ring when it built this
- *   16-19 the sender's session: a random number drawn when its link opened
- *   20-23 checksum of bytes 0..19 and the payload
- *
- * The stream is the payloads, in order.  A side with nothing to say still
- * sends a header: that is how the other side learns its room and its ack.
- *
- * A NEW SESSION IS A NEW STREAM.  When the other end's session changes - it
- * rebooted, or its link was closed and opened again - everything this end had
- * of the old stream, both ways, is thrown away and both begin again at offset
- * zero: the other end remembers none of it, and a survivor that waited for
- * the old offsets would wait for ever.  A writer or a reader caught inside a
- * block is told (-AG_EIO) rather than left to finish it into the new stream.
- *
- * THE FRAME IS THE SMALLER OF THE TWO ENDS' (24 Sep).  Each end opens with
- * its own largest frame - the caller's, or `frame` under [wire] in its
- * SYSTEM.CFG - and allocates for that alone, so a C3 that says 2048 pays for
- * 2 KB frames whatever its peer can take.  Byte 3 of every header says it.
- * The master clocks SPILINK_HELLO-byte frames until it has read a header of
- * the slave's, and then the smaller of the two; the slave, which learns the
- * master's size from the first hello, puts data in a frame only once the
- * master clocks that size - before, its frames would be cut by the short
- * clock.  Nothing is sent by either end before that, which is how it was
- * already: no data goes until the other end's room is known.
- *
- * NOTHING IS LOST, AND ONLY WHAT IS LOST IS SENT AGAIN (24 Sep).  A payload
- * leaves the transmit ring only when the other side's ack passes it.  A frame
- * that arrives after a hole is put straight into its place in the receive
- * ring - its offset says where - and the reader is given bytes only up to
- * the first hole, so a receiver needs no memory of its own for this.  It
- * says, once per hole, "I have a hole at my ack", and the sender sends the
- * one frame that starts there again; 50 ms with no ack does the same.  Acks
- * ride the frames going the other way, which both sides send anyway.
- *
- * BLOCKS (AG_SPILINK_BLOCKS).  An application may write BLOCKS instead of
- * bytes: each goes into the stream as an 8-byte record header - length,
- * block number, flags - and its bytes, and a block not marked
- * AG_SPILINK_RELIABLE is one that is not worth sending again (a piece of a
- * screen the next update will cover).  A lost frame with anything reliable
- * in it is sent again - but made of SEGMENTS: the pieces of reliable blocks
- * and of blocks cut by the frame's edges as bytes, and each run of whole
- * unreliable blocks as a notice naming them, which the receiver turns into
- * a LOST record of the same size in the same place.  So the reader gets
- * every block in order, or knows exactly which ones it will never get, and
- * the price is two bytes of block number per block.  (Skipping only a frame
- * made wholly of unreliable blocks skipped nothing: blocks are cut at the
- * frame's edges nearly always, and "lost and told" was 0 with every block
- * unreliable, measured.)  A segmented payload is its length (2 bytes) and
- * then segments, each a 2-byte head - bit 15 set for a notice, the stream
- * bytes it stands for below - and then its bytes, or for a notice the first
- * and last block numbers.  The sender keeps no list of its blocks: it reads
- * their record headers out of the transmit ring, where they are anyway.
+ * THE FRAMES THEMSELVES - their header, sessions, what is sent again and what
+ * is skipped, the frame size both ends agree on - are the protocol's and live
+ * in net/wlink.h; this file is how they cross an SPI bus.
  */
-#define SPILINK_HDR 24u
-/* frame sizes are said in these units, and the first frames are this long */
-#define SPILINK_UNIT  64u
-#define SPILINK_HELLO 64u
-/* the frame when neither the caller nor SYSTEM.CFG names one */
-#define SPILINK_FRAME_DEFAULT 4096u
-#define SPILINK_F_DATA 1u
-#define SPILINK_F_NAK  2u
-#define SPILINK_F_REFUSED 8u
-#define SPILINK_F_MASTER 16u
-#define SPILINK_F_SEG  4u
-#define SPILINK_SEG_SKIP 0x8000u
-/* frames a sender may have out and unacknowledged, and the out-of-order
- * frames a receiver will hold beyond its hole */
-#define SPILINK_WIN 8u
-/* no acknowledgement for this long with frames out: send the first again */
-#define SPILINK_RTO_US 50000
-/* a receiver says "hole" again for the same hole only after this long */
-#define SPILINK_NAK_US 20000
-/* the record header in front of every block, in block mode */
-#define SPILINK_REC 8u
-#define SPILINK_REC_LOST 0x80u
+
 /*
  * TWO FRAMES AHEAD, in a framed link, and it is a constant of the protocol
  * rather than of one end: the slave keeps this many frames armed, and the
@@ -338,95 +246,22 @@
 #define SPILINK_HOT_US 5000
 
 /* ---------------------------------------------------------------------- */
-/* Fixed-size rings, no allocation after open                             */
-/* ---------------------------------------------------------------------- */
-
-typedef struct {
-    uint8_t *mem;
-    uint32_t cap; /* any size; indices wrap by remainder */
-    uint32_t head; /* next byte to read */
-    uint32_t tail; /* next byte to write */
-    uint32_t count;
-} ring_t;
-
-static uint32_t ring_space(const ring_t *r) { return r->cap - r->count; }
-
-/*
- * Copy out without removing.  A block is filled from the ring and then armed,
- * and the arm can be refused (the port is full); consuming the bytes for a
- * block that never went out would lose them.  The head bytes cannot move under
- * this peek, because the only writer appends at the tail.
- */
-static uint32_t ring_peek(const ring_t *r, uint8_t *dst, uint32_t want)
-{
-    const uint32_t n = (want < r->count) ? want : r->count;
-    const uint32_t first = r->cap - r->head;
-    const uint32_t a = (n < first) ? n : first;
-
-    memcpy(dst, r->mem + r->head, a);
-    if (n > a) {
-        memcpy(dst + a, r->mem, n - a);
-    }
-    return n;
-}
-
-/* Caller holds the lock.  Pairs with ring_peek: the bytes are on the wire now. */
-static void ring_commit(ring_t *r, uint32_t n)
-{
-    r->head = (r->head + n) % r->cap;
-    r->count -= n;
-}
-
-static uint32_t ring_put(ring_t *r, const uint8_t *src, uint32_t want)
-{
-    const uint32_t space = ring_space(r);
-    const uint32_t n = (want < space) ? want : space;
-    const uint32_t first = r->cap - r->tail;
-    const uint32_t a = (n < first) ? n : first;
-
-    memcpy(r->mem + r->tail, src, a);
-    if (n > a) {
-        memcpy(r->mem, src + a, n - a);
-    }
-    r->tail = (r->tail + n) % r->cap;
-    r->count += n;
-    return n;
-}
-
-static uint32_t ring_take(ring_t *r, uint8_t *dst, uint32_t want)
-{
-    const uint32_t n = (want < r->count) ? want : r->count;
-    const uint32_t first = r->cap - r->head;
-    const uint32_t a = (n < first) ? n : first;
-
-    memcpy(dst, r->mem + r->head, a);
-    if (n > a) {
-        memcpy(dst + a, r->mem, n - a);
-    }
-    r->head = (r->head + n) % r->cap;
-    r->count -= n;
-    return n;
-}
-
-/* ---------------------------------------------------------------------- */
 /* One open link                                                          */
 /* ---------------------------------------------------------------------- */
 
 typedef struct {
-    bool     open;
+    /*
+     * The protocol: rings, acknowledgements, blocks, sessions, the frame
+     * size, the lock and the wakes (net/wlink.h).  A raw link uses its rings
+     * and lock and nothing else of it.
+     */
+    wlink_t  w;
     int      bus;
     int      cs;
     uint32_t khz;
-    uint32_t block;
-    /* Which end of the clock, and whether the transactions carry headers. */
-    bool     master;
-    bool     framed;
     /* Frames a slave keeps armed: SPILINK_SLOTS raw, SPILINK_AHEAD framed. */
     uint32_t nslots;
-    /* The two rings' sizes for this open: framed links size them by frame. */
-    uint32_t txcap;
-    uint32_t rxcap;
-    /* A master's frame pair, transmit then receive, DMA-capable. */
+    /* A master's frame pairs, transmit then receive, DMA-capable. */
     uint8_t *mbuf;
     /*
      * Set when the frames and both rings are one allocation, starting at the
@@ -434,83 +269,13 @@ typedef struct {
      */
     bool     onepiece;
     /*
-     * Framed bookkeeping.  peer_room is the last room the other side said it
-     * had; reaped_used (slave) is the payload of the frame just reaped, and
-     * hist[] (master) the payloads of the last SLOTS frames - both are bytes
-     * on their way that the room they are compared with did not yet count.
+     * reaped_used (slave) is the payload of the frame just reaped, and hist[]
+     * (master) the payloads of the last frames - both are bytes on their way
+     * that the room they are compared with did not yet count.
      */
-    bool     peer_known;
-    /* the sending half: the stream offset of the ring's head (everything
-     * before it acknowledged), bytes past the head sent at least once, the
-     * frames out, and a frame to send again */
-    uint32_t tx_base;
-    uint32_t sent_off;
-    struct {
-        uint32_t off;
-        uint32_t blk; /* block mode: its first record header, >= off */
-        uint16_t n;
-    } infl[SPILINK_WIN];
-    uint32_t infl_n;
-    bool     resend;
-    bool     resend_whole; /* the receiver refused it: nothing is skipped */
-    uint32_t resend_off;
-    int64_t  ack_at;
-    /* the frame both ends run at, the smaller of their two; until they have
-     * heard each other, SPILINK_HELLO and no data */
-    uint32_t frame;
-    bool     agreed;
-    /* block mode, sending: where the next record header is in the stream,
-     * at or after the first byte not yet sent, and the next block number.
-     * A list of the blocks out, 32 of them, held 64-byte blocks to 11% of
-     * the wire (measured); the headers in the ring are that list already */
-    bool     blocks;
-    uint32_t blk_next;
-    uint16_t next_block;
-    /* the receiving half: everything before rx_next is in the ring; ranges
-     * after a hole, already written into their places */
-    uint32_t rx_next;
-    struct {
-        uint32_t off;
-        uint32_t n;
-    } ooo[SPILINK_WIN];
-    uint32_t ooo_n;
-    /* a frame this end threw away for want of room: a hole it made itself,
-     * which it must remember past the filling of the hole before it */
-    bool     refused;
-    uint32_t refused_off;
-    bool     nak_pending;
-    bool     nak_sent;
-    uint32_t nak_expect;
-    int64_t  nak_at;
-    /* test only: drop every Nth data frame on arrival (open2 flags >> 8) */
-    uint32_t drop_every;
-    uint32_t drop_count;
-    /* the payload of the last frame put in the RX ring: counted as room,
-     * because the reader takes it before the room is next looked at, and a
-     * frame that turns out not to fit is simply not acknowledged */
-    uint32_t last_rx_len;
-    uint32_t rewinds;
-    uint32_t naks;
-    /* this end's session, the other end's as last heard, and a count that
-     * moves when the other end starts over (a block caught across it is cut) */
-    uint32_t sess;
-    uint32_t peer_sess;
-    bool     peer_sess_known;
-    uint32_t epoch;
-    uint32_t peer_restarts;
-    uint32_t starve_data;
-    uint32_t starve_credit;
-    uint32_t peer_room;
     uint32_t reaped_used;
     uint32_t hist[SPILINK_SLOTS];
     uint32_t hist_at;
-    /* Written by a writer, taken by an idle master so it clocks at once. */
-    ag_port_sem_t tx_sem;
-    /* Given by the service whenever it frees transmit ring: a writer that
-     * found the ring full waits on this instead of guessing with a sleep. */
-    ag_port_sem_t space_sem;
-    uint32_t frames_bad;
-    uint32_t seq_gaps;
     uint32_t wire_us;
     uint32_t loop_us;
     uint32_t reorders;
@@ -534,60 +299,35 @@ typedef struct {
     const void *owner;
 
     /*
-     * The armed blocks: SPILINK_SLOTS transmit blocks first, then the same
-     * number of receive blocks.  Allocated once, at open, word-aligned and
-     * DMA-capable, and handed to the port for as long as a transaction is in
-     * flight.  The port uses them as the DMA engine's buffers and keeps the
-     * pointers until the block is reaped, so one pair per transaction is the
-     * only arrangement with no reuse window in it.
+     * The armed blocks: transmit blocks first, then the same number of receive
+     * blocks.  Allocated once, at open, word-aligned and DMA-capable, and
+     * handed to the port for as long as a transaction is in flight.
      */
     uint8_t *slots;
 
     uint8_t *txmem;
     uint8_t *rxmem;
-    ring_t   tx;
-    ring_t   rx;
 
     /*
-     * The order the transactions were armed in.  The port brings blocks back
-     * in that order, so a completion belongs to the buffers at the head of this
-     * queue.  The slot number the port names is its own numbering, not an index
-     * into anything here - slot 0 of its pool is spi_slave_xfer's and is never
-     * handed to this service - so the arm order is what maps a completion to
-     * the caller's buffers, and it is also what keeps every armed slot reaped
-     * before its memory is armed again.
+     * The order the transactions were armed in, and per slot the real bytes
+     * armed into it and whether it is still in flight.  Touched only by the
+     * service task, which is why they need no lock.
      */
     uint8_t  armq[SPILINK_SLOTS];
     uint32_t qhead;
     uint32_t qcount;
-    /*
-     * Per slot: the real bytes armed into it and whether it is still in
-     * flight.  Touched only by the service task, which is why they need no
-     * lock - nothing else reads them while the task runs.
-     */
     uint32_t used[SPILINK_SLOTS];
     bool     live[SPILINK_SLOTS];
     uint32_t armed;
 
     volatile bool  stop;
     ag_port_task_t task;
-
-    /*
-     * The lock and the two semaphores are created on the first open and kept
-     * for the boot.  A reader blocked on the wake semaphore must not have it
-     * freed underneath it, and whoever closes the link is not necessarily the
-     * task that was reading; four small objects per bus is the price of not
-     * having a use-after-free there.
-     */
-    ag_port_mutex_t lock;
-    ag_port_sem_t   rx_sem;
-    ag_port_sem_t   exit_sem;
+    ag_port_sem_t  exit_sem;
 
     /* Written by the service task, read by close and by the stats call. */
     uint32_t blocks_clocked;
     uint32_t blocks_data;
     uint32_t blocks_unarmed;
-    uint32_t bytes_dropped;
     uint32_t timeouts;
     uint32_t stalls;
     uint32_t recoveries;
@@ -595,10 +335,7 @@ typedef struct {
     ag_err_t last_error;
     /*
      * Liveness for the stall detector and for the rate-limited fault line, in
-     * the port's own ticks: when the current silence started (with a flag,
-     * because tick zero is a real time and "never" has to be told from it), and
-     * when a fault was last printed.  Unsigned tick subtraction wraps
-     * correctly, so nothing here needs a wall clock.
+     * the port's own ticks.
      */
     ag_port_ticks_t quiet_since;
     bool            quiet_started;
@@ -616,19 +353,19 @@ static int link_index(int bus)
 
 static void lock(spilink_t *s)
 {
-    (void)ag_port_mutex_take(s->lock, AG_PORT_FOREVER);
+    (void)ag_port_mutex_take(s->w.lock, AG_PORT_FOREVER);
 }
 
-static void unlock(spilink_t *s) { (void)ag_port_mutex_give(s->lock); }
+static void unlock(spilink_t *s) { (void)ag_port_mutex_give(s->w.lock); }
 
 static uint8_t *slot_tx(const spilink_t *s, unsigned i)
 {
-    return s->slots + (size_t)i * s->block;
+    return s->slots + (size_t)i * s->w.block;
 }
 
 static uint8_t *slot_rx(const spilink_t *s, unsigned i)
 {
-    return s->slots + (size_t)(s->nslots + i) * s->block;
+    return s->slots + (size_t)(s->nslots + i) * s->w.block;
 }
 
 /*
@@ -828,657 +565,6 @@ static void armq_remove(spilink_t *s, uint8_t slot)
  * cheap side of the never-empty invariant, which matters because on this wire
  * most blocks of a quiet link are exactly that.
  */
-static uint32_t frame_sum(const uint8_t *f, uint32_t len)
-{
-    /* two running sums over words: cheap enough for 4 KB a frame on a C3,
-     * and a flipped bit, a dropped byte or a swapped word all change it */
-    uint32_t a = 0x6A09E667u;
-    uint32_t b = 0;
-    const uint32_t *w = (const uint32_t *)f;
-    for (unsigned k = 0; k < 5u; k++) {
-        a += w[k];
-        b += a;
-    }
-    const uint8_t  *p = f + SPILINK_HDR;
-    const uint32_t *pw = (const uint32_t *)p;
-    const uint32_t  words = len / 4u;
-    for (uint32_t k = 0; k < words; k++) {
-        a += pw[k];
-        b += a;
-    }
-    for (uint32_t k = words * 4u; k < len; k++) {
-        a += p[k];
-        b += a;
-    }
-    return a ^ ((b << 13) | (b >> 19));
-}
-
-static void put16(uint8_t *p, uint32_t v)
-{
-    p[0] = (uint8_t)v;
-    p[1] = (uint8_t)(v >> 8);
-}
-
-static void put32(uint8_t *p, uint32_t v)
-{
-    put16(p, v);
-    put16(p + 2, v >> 16);
-}
-
-static uint32_t get16(const uint8_t *p)
-{
-    return (uint32_t)p[0] | ((uint32_t)p[1] << 8);
-}
-
-static uint32_t get32(const uint8_t *p)
-{
-    return get16(p) | (get16(p + 2) << 16);
-}
-
-/* Bytes the peer may be sent now: its room, less what is already on the way. */
-static uint32_t peer_allowance(const spilink_t *s, uint32_t in_flight)
-{
-    if (!s->agreed || !s->peer_known || s->peer_room <= in_flight) {
-        return 0u;
-    }
-    return s->peer_room - in_flight;
-}
-
-/* Copy out without removing, starting `off` bytes past the head. */
-static uint32_t ring_peek_at(const ring_t *r, uint32_t off, uint8_t *dst,
-                             uint32_t want)
-{
-    if (off >= r->count) {
-        return 0u;
-    }
-    const uint32_t avail = r->count - off;
-    const uint32_t n = (want < avail) ? want : avail;
-    const uint32_t start = (r->head + off) % r->cap;
-    const uint32_t first = r->cap - start;
-    const uint32_t a0 = (n < first) ? n : first;
-    memcpy(dst, r->mem + start, a0);
-    if (n > a0) {
-        memcpy(dst + a0, r->mem, n - a0);
-    }
-    return n;
-}
-
-/* Write `n` bytes `delta` past the tail, not yet counted as in the ring;
- * src NULL writes zeros.  The caller has checked delta + n fits. */
-static void ring_write_at(ring_t *r, uint32_t delta, const uint8_t *src,
-                          uint32_t n)
-{
-    const uint32_t start = (r->tail + delta) % r->cap;
-    const uint32_t first = r->cap - start;
-    const uint32_t a0 = (n < first) ? n : first;
-    if (src != NULL) {
-        memcpy(r->mem + start, src, a0);
-        if (n > a0) {
-            memcpy(r->mem, src + a0, n - a0);
-        }
-    } else {
-        memset(r->mem + start, 0, a0);
-        if (n > a0) {
-            memset(r->mem, 0, n - a0);
-        }
-    }
-}
-
-static void ring_advance(ring_t *r, uint32_t n)
-{
-    r->tail = (r->tail + n) % r->cap;
-    r->count += n;
-}
-
-/* Receive ring bytes beyond the tail already taken by frames after a hole. */
-static uint32_t ooo_reserved(const spilink_t *s)
-{
-    if (s->ooo_n == 0u) {
-        return 0u;
-    }
-    return s->ooo[s->ooo_n - 1u].off + s->ooo[s->ooo_n - 1u].n - s->rx_next;
-}
-
-/* What frame_build did, so a slave whose arm is refused can take it back. */
-static struct {
-    uint8_t  kind; /* 0 nothing, 1 new frame, 2 a frame sent again */
-    uint32_t n;
-    uint32_t resend_off;
-    uint32_t blk_next;
-} s_undo[AG_SPI_BUSES];
-
-/*
- * A lost frame of blocks, as segments: stream bytes [off, off + n), whose
- * first record header is at `blk`, into `p`.  Returns the payload length,
- * or 0 if no block in it may be skipped or the segments would not fit
- * `pay` - the frame then goes again as it was.
- */
-static uint32_t seg_build(const spilink_t *s, uint32_t off, uint32_t n,
-                          uint32_t blk, uint8_t *p, uint32_t pay,
-                          uint32_t *data)
-{
-    const uint32_t end = off + n;
-    uint32_t       used = 2;
-    uint32_t       open = 0; /* the data segment being added to, or 0 */
-    uint32_t       pos = off;
-    uint32_t       b = blk;
-    bool           skipped = false;
-    *data = 0;
-    while ((int32_t)(pos - end) < 0) {
-        uint32_t upto;
-        if ((int32_t)(pos - b) < 0) {
-            upto = ((int32_t)(b - end) < 0) ? b : end;
-        } else {
-            uint8_t h[SPILINK_REC];
-            (void)ring_peek_at(&s->tx, b - s->tx_base, h, SPILINK_REC);
-            uint32_t bend = b + SPILINK_REC + get16(h);
-            if (!(h[4] & AG_SPILINK_RELIABLE) && (int32_t)(bend - end) <= 0) {
-                /* a run of whole unreliable blocks: one notice */
-                const uint32_t first = get16(h + 2);
-                uint32_t       last = first;
-                while ((int32_t)(bend - end) < 0) {
-                    (void)ring_peek_at(&s->tx, bend - s->tx_base, h,
-                                       SPILINK_REC);
-                    const uint32_t nb = bend + SPILINK_REC + get16(h);
-                    if ((h[4] & AG_SPILINK_RELIABLE) ||
-                        (int32_t)(nb - end) > 0) {
-                        break;
-                    }
-                    last = get16(h + 2);
-                    bend = nb;
-                }
-                if (used + 6u > pay) {
-                    return 0u;
-                }
-                put16(p + used, SPILINK_SEG_SKIP | (bend - pos));
-                put16(p + used + 2, first);
-                put16(p + used + 4, last);
-                used += 6u;
-                open = 0;
-                skipped = true;
-                pos = b = bend;
-                continue;
-            }
-            upto = ((int32_t)(bend - end) < 0) ? bend : end;
-            b = bend;
-        }
-        /* bytes [pos, upto) as they are */
-        const uint32_t len = upto - pos;
-        if (open == 0u) {
-            if (used + 2u + len > pay) {
-                return 0u;
-            }
-            open = used;
-            put16(p + used, 0);
-            used += 2u;
-        } else if (used + len > pay) {
-            return 0u;
-        }
-        (void)ring_peek_at(&s->tx, pos - s->tx_base, p + used, len);
-        put16(p + open, get16(p + open) + len);
-        used += len;
-        *data += len;
-        pos = upto;
-    }
-    if (!skipped) {
-        return 0u;
-    }
-    put16(p, used - 2u);
-    return used;
-}
-
-/*
- * Fill a frame.  A frame to send again goes first - the one frame the other
- * side has a hole at, in segments when it held blocks not worth sending
- * again - and otherwise as much NOT YET SENT data as `allow` lets.  Nothing
- * is freed here; the acknowledgement does that.  Returns the data bytes in
- * it.
- */
-static uint32_t frame_build(spilink_t *s, uint8_t *f, uint32_t allow,
-                            uint32_t room_less, bool *nak_was)
-{
-    const uint32_t pay = s->frame - SPILINK_HDR;
-    const int      ix = link_index(s->bus);
-    uint32_t       flags = 0;
-    uint32_t       off = 0;
-    uint32_t       n = 0;     /* data bytes */
-    uint32_t       span = 0;  /* stream bytes this frame stands for */
-    uint32_t       body = 0;  /* payload bytes after the header */
-    s_undo[ix].kind = 0;
-
-    lock(s);
-    if (s->resend) {
-        s->resend = false;
-        for (uint32_t k = 0; k < s->infl_n; k++) {
-            if (s->infl[k].off != s->resend_off) {
-                continue;
-            }
-            off = s->infl[k].off;
-            span = s->infl[k].n;
-            /* blocks are skipped only for a frame the wire lost, never for
-             * one the receiver threw away for want of room: that is not a
-             * loss the application was willing to take */
-            body = (s->blocks && !s->resend_whole)
-                       ? seg_build(s, off, span, s->infl[k].blk,
-                                   f + SPILINK_HDR, pay, &n)
-                       : 0u;
-            if (body > 0u) {
-                flags = SPILINK_F_SEG;
-            } else {
-                flags = SPILINK_F_DATA;
-                n = ring_peek_at(&s->tx, off - s->tx_base, f + SPILINK_HDR,
-                                 span);
-                body = n;
-            }
-            s_undo[ix].kind = 2;
-            s_undo[ix].resend_off = off;
-            break;
-        }
-    }
-    if (flags == 0u && s->infl_n < SPILINK_WIN) {
-        const uint32_t start = s->tx_base + s->sent_off;
-        const uint32_t avail =
-            (s->tx.count > s->sent_off) ? s->tx.count - s->sent_off : 0u;
-        uint32_t limit = (avail < allow) ? avail : allow;
-        if (limit > pay) {
-            limit = pay;
-        }
-        const uint32_t blk = s->blk_next;
-        if (s->blocks && limit > 0u) {
-            /*
-             * Blocks of both kinds share a frame, and any block may be cut
-             * by its edges: cutting frames at every change of kind cost a
-             * quarter of the wire with one block in eight unreliable, and so
-             * did refusing to cut an unreliable block (74%, measured).  What
-             * is not sent again is sorted out only if the frame is lost.
-             * Here the record headers are only walked past, so the next
-             * frame knows where its first one is.
-             */
-            const uint32_t end = start + limit;
-            uint32_t       b = s->blk_next;
-            while ((int32_t)(b - end) < 0) {
-                uint8_t h[SPILINK_REC];
-                (void)ring_peek_at(&s->tx, b - s->tx_base, h, SPILINK_REC);
-                b += SPILINK_REC + get16(h);
-            }
-            s_undo[ix].blk_next = s->blk_next;
-            s->blk_next = b;
-        }
-        if (limit > 0u) {
-            n = ring_peek_at(&s->tx, s->sent_off, f + SPILINK_HDR, limit);
-            if (s->infl_n == 0u) {
-                /* the retransmit clock starts with the first frame out, not
-                 * at the last ack: after a quiet spell that was long ago, and
-                 * every answer of an exchange went twice (127 of 794) */
-                s->ack_at = ag_port_us();
-            }
-            s->infl[s->infl_n].off = start;
-            s->infl[s->infl_n].blk = blk;
-            s->infl[s->infl_n].n = (uint16_t)n;
-            s->infl_n++;
-            s->sent_off += n;
-            flags = SPILINK_F_DATA;
-            off = start;
-            span = n;
-            body = n;
-            s_undo[ix].kind = 1;
-            s_undo[ix].n = n;
-        }
-    }
-    /*
-     * One frame's payload counted as room beyond what is free: the reader
-     * takes what arrived before the room is looked at again - and in block
-     * mode the start of a block cut across two frames cannot be taken until
-     * the second arrives, which strict counting charged to every frame (74%
-     * of the wire, measured).  A frame that does not fit is not
-     * acknowledged and comes again, so this can cost a resend, never data.
-     *
-     * Not while a hole is open: the reader then takes nothing, and the
-     * piece of a block before the hole stays in the ring until it is
-     * filled, so the frame promised beyond the room did not fit and was
-     * thrown away - a new hole behind every hole (block mode under 5%
-     * loss: 762 KB thrown away in 5 s, 24% of the wire, measured).
-     */
-    const bool     hole = s->ooo_n > 0u || s->nak_sent || s->refused;
-    uint32_t       space = ring_space(&s->rx) + (hole ? 0u : pay);
-    const uint32_t held = ooo_reserved(s);
-    space = (space > held) ? space - held : 0u;
-    if (space > s->rxcap) {
-        space = s->rxcap;
-    }
-    unlock(s);
-
-    if (flags == 0u) {
-        s->starve_data += (s->tx.count > s->sent_off) ? 0u : 1u;
-    }
-    *nak_was = s->nak_pending;
-    if (s->nak_pending) {
-        flags |= SPILINK_F_NAK;
-        if (s->refused && s->refused_off == s->rx_next) {
-            flags |= SPILINK_F_REFUSED;
-        }
-        s->nak_pending = false;
-        s->naks++;
-    }
-    uint32_t room = (space > room_less) ? space - room_less : 0u;
-    if (room > 0xFFFFu) {
-        room = 0xFFFFu;
-    }
-    f[0] = 0xA5u;
-    f[1] = (uint8_t)(flags | (s->master ? SPILINK_F_MASTER : 0u));
-    f[2] = 0x5Au;
-    f[3] = (uint8_t)(s->block / SPILINK_UNIT);
-    put32(f + 4, off);
-    put32(f + 8, s->rx_next);
-    put16(f + 12, span);
-    put16(f + 14, room);
-    put32(f + 16, s->sess);
-    put32(f + 20, frame_sum(f, body));
-    return n;
-}
-
-/* Take back what frame_build did, for a frame that never went out. */
-static void frame_unbuild(spilink_t *s, uint32_t n, bool nak_was)
-{
-    const int ix = link_index(s->bus);
-    (void)n;
-    if (s_undo[ix].kind == 1u && s->infl_n > 0u) {
-        s->infl_n--;
-        s->sent_off -= s_undo[ix].n;
-        if (s->blocks) {
-            s->blk_next = s_undo[ix].blk_next;
-        }
-    } else if (s_undo[ix].kind == 2u) {
-        s->resend = true;
-        s->resend_off = s_undo[ix].resend_off;
-    }
-    s_undo[ix].kind = 0;
-    if (nak_was) {
-        s->nak_pending = true;
-        s->naks--;
-    }
-}
-
-static void ask_again(spilink_t *s, int64_t now)
-{
-    if (!s->nak_sent || s->nak_expect != s->rx_next ||
-        now - s->nak_at > SPILINK_NAK_US) {
-        s->nak_pending = true;
-        s->nak_sent = true;
-        s->nak_expect = s->rx_next;
-        s->nak_at = now;
-        s->seq_gaps++;
-    }
-}
-
-/*
- * The other end has started over: both streams begin again at zero, and what
- * this end still held of the old ones is gone - the other end has none of
- * it.  The frame size is agreed again, as the other end is saying hello.
- */
-static void peer_restarted(spilink_t *s, uint32_t sess)
-{
-    lock(s);
-    s->peer_sess = sess;
-    s->epoch++;
-    s->peer_restarts++;
-    s->tx.head = s->tx.tail = s->tx.count = 0;
-    s->tx_base = 0;
-    s->sent_off = 0;
-    s->infl_n = 0;
-    s->resend = false;
-    s->resend_whole = false;
-    s->blk_next = 0;
-    s->next_block = 0;
-    s->rx.head = s->rx.tail = s->rx.count = 0;
-    s->rx_next = 0;
-    s->ooo_n = 0;
-    s->refused = false;
-    s->nak_pending = false;
-    s->nak_sent = false;
-    s->agreed = false;
-    s->peer_known = false;
-    unlock(s);
-    /* a writer waiting for room and a reader waiting for bytes both look at
-     * the epoch when they wake */
-    (void)ag_port_sem_give(s->space_sem);
-    (void)ag_port_sem_give(s->rx_sem);
-}
-
-/* A segmented payload that stands for exactly `span` stream bytes. */
-static bool seg_check(const uint8_t *p, uint32_t body, uint32_t span)
-{
-    uint32_t at = 2u;
-    uint32_t total = 0;
-    while (at < body) {
-        if (at + 2u > body) {
-            return false;
-        }
-        const uint32_t head = get16(p + at);
-        const uint32_t len = head & ~SPILINK_SEG_SKIP;
-        const uint32_t size = (head & SPILINK_SEG_SKIP) ? 4u : len;
-        if (((head & SPILINK_SEG_SKIP) && len <= SPILINK_REC) || len == 0u ||
-            at + 2u + size > body) {
-            return false;
-        }
-        total += len;
-        at += 2u + size;
-    }
-    return at == body && total == span;
-}
-
-/*
- * One received frame: its ack applied to what this end sent, a hole report
- * honoured, and its bytes put where they belong.  Returns the bytes that
- * reached the reader.
- */
-static uint32_t frame_rx(spilink_t *s, const uint8_t *f, uint32_t got)
-{
-    const uint32_t pay = s->block - SPILINK_HDR;
-    if (got < SPILINK_HDR || f[0] != 0xA5u || f[2] != 0x5Au) {
-        count(s, &s->frames_bad, 1u);
-        return 0u;
-    }
-    const uint32_t flags = f[1];
-    /*
-     * A frame from this end's own side is an ECHO: a slave not yet armed
-     * sends back what it last took in, and the master's 64-byte hello is
-     * exactly its hardware buffer.  Taken for the slave's, the master
-     * agreed on its own frame size (4096 against the C3's 2048, and half
-     * the wire, measured) - and an echo of data would be data.
-     */
-    if (((flags & SPILINK_F_MASTER) != 0u) == s->master) {
-        count(s, &s->frames_bad, 1u);
-        return 0u;
-    }
-    const uint32_t off = get32(f + 4);
-    const uint32_t ack = get32(f + 8);
-    const uint32_t span = get16(f + 12);
-    const uint32_t room = get16(f + 14);
-    const uint32_t body =
-        (flags & SPILINK_F_SEG)
-            ? ((got >= SPILINK_HDR + 2u) ? 2u + get16(f + SPILINK_HDR) : ~0u)
-        : (flags & SPILINK_F_DATA) ? span
-                                   : 0u;
-    const int64_t  now = ag_port_us();
-    if (body > pay || body > got - SPILINK_HDR || span > pay ||
-        frame_sum(f, body) != get32(f + 20)) {
-        count(s, &s->frames_bad, 1u);
-        ask_again(s, now);
-        return 0u;
-    }
-    if ((flags & SPILINK_F_SEG) && !seg_check(f + SPILINK_HDR, body, span)) {
-        count(s, &s->frames_bad, 1u);
-        ask_again(s, now);
-        return 0u;
-    }
-    if (!s->peer_sess_known) {
-        s->peer_sess = get32(f + 16);
-        s->peer_sess_known = true;
-    } else if (get32(f + 16) != s->peer_sess) {
-        peer_restarted(s, get32(f + 16));
-    }
-    if (!s->agreed) {
-        /* a peer that says nothing (0) is taken to be this end's size */
-        const uint32_t peer = (f[3] != 0u) ? f[3] * SPILINK_UNIT : s->block;
-        s->frame = (peer < s->block) ? peer : s->block;
-        s->agreed = s->master || got >= s->frame;
-    }
-    const bool carries = (flags & (SPILINK_F_DATA | SPILINK_F_SEG)) != 0u;
-    if (s->drop_every != 0u && carries &&
-        (++s->drop_count % s->drop_every) == 0u) {
-        return 0u; /* test: this frame never arrived */
-    }
-
-    /* the ack: free what it passes */
-    lock(s);
-    s->peer_room = room;
-    s->peer_known = true;
-    bool freed = false;
-    const uint32_t d = ack - s->tx_base;
-    if ((int32_t)d > 0 && d <= s->sent_off) {
-        ring_commit(&s->tx, d);
-        s->sent_off -= d;
-        s->tx_base = ack;
-        while (s->infl_n > 0u &&
-               (int32_t)(s->infl[0].off + s->infl[0].n - ack) <= 0) {
-            for (uint32_t k = 1; k < s->infl_n; k++) {
-                s->infl[k - 1] = s->infl[k];
-            }
-            s->infl_n--;
-        }
-        freed = true;
-    }
-    unlock(s);
-    if (freed) {
-        s->ack_at = now;
-        (void)ag_port_sem_give(s->space_sem);
-    }
-    if ((flags & SPILINK_F_NAK) && s->infl_n > 0u &&
-        (int32_t)(ack - s->tx_base) == 0) {
-        s->resend = true;
-        s->resend_whole = (flags & SPILINK_F_REFUSED) != 0u;
-        s->resend_off = s->tx_base;
-        s->rewinds++;
-    }
-    if (!carries || span == 0u) {
-        return 0u;
-    }
-
-    /* the bytes: a repeat, the next in order, or after a hole */
-    if ((int32_t)(off + span - s->rx_next) <= 0 ||
-        (int32_t)(off - s->rx_next) < 0) {
-        return 0u;
-    }
-    const uint32_t delta = off - s->rx_next;
-    for (uint32_t k = 0; k < s->ooo_n; k++) {
-        if (s->ooo[k].off == off) {
-            return 0u; /* already have it */
-        }
-    }
-    lock(s);
-    const bool fits = delta + span <= ring_space(&s->rx) &&
-                      (delta == 0u || s->ooo_n < SPILINK_WIN);
-    unlock(s);
-    if (!fits) {
-        /* not taken, so not acknowledged: it comes again */
-        s->bytes_dropped += span;
-        if (!s->refused || (int32_t)(off - s->refused_off) < 0) {
-            s->refused = true;
-            s->refused_off = off;
-        }
-        ask_again(s, now);
-        return 0u;
-    }
-    lock(s);
-    if (flags & SPILINK_F_DATA) {
-        ring_write_at(&s->rx, delta, f + SPILINK_HDR, span);
-    } else {
-        /* segments: bytes where they go, and for each notice a LOST record
-         * of the same size; the reader passes over the rest unread */
-        const uint8_t *p = f + SPILINK_HDR + 2u;
-        const uint8_t *const pe = f + SPILINK_HDR + body;
-        uint32_t       at = delta;
-        while (p < pe) {
-            const uint32_t head = get16(p);
-            const uint32_t len = head & ~SPILINK_SEG_SKIP;
-            if (head & SPILINK_SEG_SKIP) {
-                uint8_t rec[SPILINK_REC];
-                put16(rec, len - SPILINK_REC);
-                put16(rec + 2, get16(p + 2));
-                rec[4] = SPILINK_REC_LOST;
-                rec[5] = 0;
-                put16(rec + 6, get16(p + 4));
-                ring_write_at(&s->rx, at, rec, SPILINK_REC);
-                p += 6;
-            } else {
-                ring_write_at(&s->rx, at, p + 2, len);
-                p += 2u + len;
-            }
-            at += len;
-        }
-    }
-    uint32_t delivered = 0;
-    if (delta == 0u) {
-        ring_advance(&s->rx, span);
-        s->rx_next += span;
-        delivered = span;
-        s->last_rx_len = span;
-        while (s->ooo_n > 0u && s->ooo[0].off == s->rx_next) {
-            ring_advance(&s->rx, s->ooo[0].n);
-            s->rx_next += s->ooo[0].n;
-            delivered += s->ooo[0].n;
-            for (uint32_t k = 1; k < s->ooo_n; k++) {
-                s->ooo[k - 1] = s->ooo[k];
-            }
-            s->ooo_n--;
-        }
-    } else {
-        uint32_t at = s->ooo_n;
-        while (at > 0u && (int32_t)(s->ooo[at - 1u].off - off) > 0) {
-            s->ooo[at] = s->ooo[at - 1u];
-            at--;
-        }
-        s->ooo[at].off = off;
-        s->ooo[at].n = span;
-        s->ooo_n++;
-    }
-    if (s->refused && (int32_t)(s->rx_next - s->refused_off) > 0) {
-        s->refused = false; /* the frame thrown away has come again */
-    }
-    unlock(s);
-    if (delivered > 0u) {
-        s->nak_sent = false;
-        (void)ag_port_sem_give(s->rx_sem);
-        /*
-         * A further hole behind the one just filled: one between frames
-         * held, or the frame this end threw away itself.  Forgetting the
-         * second kind promised room again, the frame after it did not fit
-         * either, and every window of frames made a new hole (24% of the
-         * wire with block mode under 5% loss, measured).
-         */
-        if (s->ooo_n > 0u || s->refused) {
-            ask_again(s, now);
-        }
-    } else {
-        ask_again(s, now);
-    }
-    return delivered;
-}
-
-/* No acknowledgement for too long with frames out: send the first again. */
-static void rto_check(spilink_t *s)
-{
-    const int64_t now = ag_port_us();
-    if (s->infl_n > 0u && now - s->ack_at > SPILINK_RTO_US) {
-        s->resend = true;
-        s->resend_whole = false;
-        s->resend_off = s->tx_base;
-        s->ack_at = now;
-        s->rewinds++;
-    }
-}
-
 static ag_err_t slot_arm(spilink_t *s, unsigned i, uint32_t *carried)
 {
     uint8_t *const tx = slot_tx(s, i);
@@ -1486,7 +572,7 @@ static ag_err_t slot_arm(spilink_t *s, unsigned i, uint32_t *carried)
 
     *carried = 0;
 
-    if (s->framed) {
+    if (s->w.framed) {
         /*
          * The master's room, as its last frame said, less every payload of
          * ours it had not yet received when it said so: the frame just
@@ -1499,15 +585,15 @@ static ag_err_t slot_arm(spilink_t *s, unsigned i, uint32_t *carried)
                 in_flight += s->used[k];
             }
         }
-        const uint32_t allow = peer_allowance(s, in_flight);
+        const uint32_t allow = wl_allowance(&s->w, in_flight);
         unlock(s);
         bool nak_was = false;
-        n = frame_build(s, tx, allow, 0u, &nak_was);
+        n = wl_build(&s->w, tx, allow, 0u, &nak_was, NULL);
 
         const ag_err_t err =
-            ag_port_spi_slave_arm(s->bus, tx, slot_rx(s, i), s->block);
+            ag_port_spi_slave_arm(s->bus, tx, slot_rx(s, i), s->w.block);
         if (err != AG_OK) {
-            frame_unbuild(s, n, nak_was);
+            wl_unbuild(&s->w, n, nak_was);
             return err;
         }
         *carried = n;
@@ -1515,21 +601,21 @@ static ag_err_t slot_arm(spilink_t *s, unsigned i, uint32_t *carried)
     }
 
     lock(s);
-    n = ring_peek(&s->tx, tx, s->block);
+    n = ring_peek(&s->w.tx, tx, s->w.block);
     unlock(s);
 
-    if (n > 0u && n < s->block) {
-        memset(tx + n, 0, s->block - n);
+    if (n > 0u && n < s->w.block) {
+        memset(tx + n, 0, s->w.block - n);
     }
 
     const ag_err_t err = ag_port_spi_slave_arm(
-        s->bus, (n > 0u) ? (const void *)tx : NULL, slot_rx(s, i), s->block);
+        s->bus, (n > 0u) ? (const void *)tx : NULL, slot_rx(s, i), s->w.block);
     if (err != AG_OK) {
         return err;
     }
 
     lock(s);
-    ring_commit(&s->tx, n);
+    ring_commit(&s->w.tx, n);
     unlock(s);
 
     *carried = n;
@@ -1545,29 +631,29 @@ static void deliver(spilink_t *s, unsigned slot, uint32_t got)
     uint8_t *const rx = slot_rx(s, slot);
     uint32_t       n = got;
 
-    if (s->framed) {
-        (void)frame_rx(s, rx, got);
+    if (s->w.framed) {
+        (void)wl_rx(&s->w, rx, got);
         return;
     }
 
-    if (n > s->block) {
-        n = s->block;
+    if (n > s->w.block) {
+        n = s->w.block;
     }
     if (n == 0u) {
         return;
     }
 
     lock(s);
-    const uint32_t put = ring_put(&s->rx, rx, n);
+    const uint32_t put = ring_put(&s->w.rx, rx, n);
     if (put < n) {
-        s->bytes_dropped += (n - put);
+        s->w.bytes_dropped += (n - put);
     }
     unlock(s);
 
     if (put > 0u) {
         /* A count and not a flag: two blocks can arrive before the reader
          * wakes, and one give per block is what lets it see both. */
-        (void)ag_port_sem_give(s->rx_sem);
+        (void)ag_port_sem_give(s->w.rx_sem);
     }
 }
 
@@ -1588,8 +674,8 @@ static void spilink_task(void *arg)
          */
         bool clocked = false;
 
-        if (s->framed) {
-            rto_check(s);
+        if (s->w.framed) {
+            wl_rto_check(&s->w);
         }
 
         /*
@@ -1677,7 +763,7 @@ static void spilink_task(void *arg)
                 }
                 armq_remove(s, (uint8_t)found);
                 mine = (uint8_t)found;
-                if (s->framed && s->agreed && got < s->frame) {
+                if (s->w.framed && s->w.agreed && got < s->w.frame) {
                     count(s, &s->short_frames, 1u);
                 }
                 s->armed--;
@@ -1796,8 +882,8 @@ static void spilink_task(void *arg)
 static void spilink_master_task(void *arg)
 {
     spilink_t *s = (spilink_t *)arg;
-    uint8_t *const txf[2] = {s->mbuf, s->mbuf + 2u * s->block};
-    uint8_t *const rxf[2] = {s->mbuf + s->block, s->mbuf + 3u * s->block};
+    uint8_t *const txf[2] = {s->mbuf, s->mbuf + 2u * s->w.block};
+    uint8_t *const rxf[2] = {s->mbuf + s->w.block, s->mbuf + 3u * s->w.block};
     uint32_t       qlen[2] = {0, 0}; /* the frame length each was clocked at */
     uint32_t       qdata[2] = {0, 0};
     unsigned       head = 0;         /* the oldest queued */
@@ -1814,7 +900,7 @@ static void spilink_master_task(void *arg)
             }
             if (!hot && !first) {
                 /* quiet: a writer's wake, or the poll, and then one frame */
-                (void)ag_port_sem_take(s->tx_sem,
+                (void)ag_port_sem_take(s->w.tx_sem,
                                        ticks_at_least(SPILINK_POLL_MS));
             }
             first = false;
@@ -1831,22 +917,23 @@ static void spilink_master_task(void *arg)
             for (unsigned k = 0; k < SPILINK_MHIST; k++) {
                 pending += s->hist[k];
             }
-            /* the size of this frame: SPILINK_HELLO until agreed */
-            const uint32_t fl = s->frame;
-            uint32_t       allow = peer_allowance(s, pending);
-            if (allow > fl - SPILINK_HDR) {
-                allow = fl - SPILINK_HDR;
+            /* the size of this frame: WL_HELLO until agreed */
+            const uint32_t fl = s->w.frame;
+            uint32_t       allow = wl_allowance(&s->w, pending);
+            if (allow > fl - WL_HDR) {
+                allow = fl - WL_HDR;
             }
             unlock(s);
-            rto_check(s);
+            wl_rto_check(&s->w);
             const unsigned slot = (head + out) % 2u;
             bool           nak_was = false;
-            const uint32_t n = frame_build(s, txf[slot], allow, 0u, &nak_was);
+            const uint32_t n =
+                wl_build(&s->w, txf[slot], allow, 0u, &nak_was, NULL);
             const ag_err_t rc = ag_port_spi_xfer_start(s->bus, s->cs,
                                                        txf[slot], rxf[slot],
                                                        fl);
             if (rc != AG_OK) {
-                frame_unbuild(s, n, nak_was);
+                wl_unbuild(&s->w, n, nak_was);
                 note_error(s, rc);
                 if (out == 0u) {
                     sleep_at_least(SPILINK_IDLE_MS);
@@ -1889,10 +976,10 @@ static void spilink_master_task(void *arg)
         s->blocks_clocked++;
         unlock(s);
 
-        const uint32_t got = frame_rx(s, rxf[slot], qlen[slot]);
+        const uint32_t got = wl_rx(&s->w, rxf[slot], qlen[slot]);
         lock(s);
         /* data not yet sent, or frames out and waiting for their ack */
-        const bool more = (s->tx.count > s->sent_off) || s->infl_n > 0u;
+        const bool more = (s->w.tx.count > s->w.sent_off) || s->w.infl_n > 0u;
         unlock(s);
         if (qdata[slot] > 0u || got > 0u) {
             count(s, &s->blocks_data, 1u);
@@ -1926,26 +1013,26 @@ static void stats_of(const spilink_t *s, ag_spilink_stats_t *out)
     out->blocks_clocked = s->blocks_clocked;
     out->blocks_data = s->blocks_data;
     out->blocks_unarmed = s->blocks_unarmed;
-    out->bytes_dropped = s->bytes_dropped;
+    out->bytes_dropped = s->w.bytes_dropped;
     out->timeouts = s->timeouts;
     out->stalls = s->stalls;
     out->recoveries = s->recoveries;
     out->errors = s->errors;
     out->last_error = s->last_error;
-    out->open = s->open;
+    out->open = s->w.open;
     out->task_stuck = false;
-    out->frames_bad = s->frames_bad;
-    out->seq_gaps = s->seq_gaps;
+    out->frames_bad = s->w.frames_bad;
+    out->seq_gaps = s->w.seq_gaps;
     out->wire_us = s->wire_us;
     out->loop_us = s->loop_us;
     out->reorders = s->reorders;
     out->short_frames = s->short_frames;
-    out->rewinds = s->rewinds;
-    out->naks = s->naks;
-    out->peer_restarts = s->peer_restarts;
-    out->starve_data = s->starve_data;
-    out->starve_credit = s->starve_credit;
-    out->frame = s->agreed ? s->frame : 0u;
+    out->rewinds = s->w.rewinds;
+    out->naks = s->w.naks;
+    out->peer_restarts = s->w.peer_restarts;
+    out->starve_data = s->w.starve_data;
+    out->starve_credit = s->w.starve_credit;
+    out->frame = s->w.agreed ? s->w.frame : 0u;
 }
 
 static void free_open_memory(spilink_t *s)
@@ -1963,8 +1050,8 @@ static void free_open_memory(spilink_t *s)
     s->slots = NULL;
     s->txmem = NULL;
     s->rxmem = NULL;
-    memset(&s->tx, 0, sizeof(s->tx));
-    memset(&s->rx, 0, sizeof(s->rx));
+    memset(&s->w.tx, 0, sizeof(s->w.tx));
+    memset(&s->w.rx, 0, sizeof(s->w.rx));
 }
 
 /*
@@ -1974,19 +1061,19 @@ static void free_open_memory(spilink_t *s)
 static ag_err_t link_teardown(spilink_t *s, ag_spilink_stats_t *out)
 {
     lock(s);
-    if (!s->open) {
+    if (!s->w.open) {
         unlock(s);
         return -AG_ENODEV;
     }
     /* No new traffic, and the task leaves at its next look at `stop`. */
-    s->open = false;
+    s->w.open = false;
     s->stop = true;
     unlock(s);
 
     /* A reader blocked in read() has to see the link close under it, and so
      * does a writer waiting for room. */
-    (void)ag_port_sem_give(s->rx_sem);
-    (void)ag_port_sem_give(s->space_sem);
+    (void)ag_port_sem_give(s->w.rx_sem);
+    (void)ag_port_sem_give(s->w.space_sem);
 
     bool gone = true;
     if (s->task != NULL) {
@@ -2028,7 +1115,7 @@ static ag_err_t link_teardown(spilink_t *s, ag_spilink_stats_t *out)
      * pool lent out once it returns; only then is the memory given back.
      */
     bool may_free = true;
-    if (!s->master && s->armed > 0u) {
+    if (!s->w.master && s->armed > 0u) {
         /* if the reset is refused, the memory is left to the engine for good:
          * a leak is a number in `mem`, a DMA write into reused memory is not */
         may_free = (ag_port_spi_slave_reset(s->bus) == AG_OK);
@@ -2052,13 +1139,13 @@ static ag_err_t link_teardown(spilink_t *s, ag_spilink_stats_t *out)
     s->task = NULL;
     s->stop = false;
     s->owner = NULL;
-    s->block = 0;
+    s->w.block = 0;
     s->khz = 0;
     s->cs = AG_PIN_NONE;
     s->blocks_clocked = 0;
     s->blocks_data = 0;
     s->blocks_unarmed = 0;
-    s->bytes_dropped = 0;
+    s->w.bytes_dropped = 0;
     s->timeouts = 0;
     s->stalls = 0;
     s->recoveries = 0;
@@ -2092,7 +1179,7 @@ static void spilink_on_revoke(ag_device_t *dev)
         return;
     }
     for (unsigned i = 0; i < AG_SPI_BUSES; i++) {
-        if (s_link[i].open && s_link[i].owner == dev->owner) {
+        if (s_link[i].w.open && s_link[i].owner == dev->owner) {
             (void)link_teardown(&s_link[i], NULL);
         }
     }
@@ -2125,15 +1212,15 @@ ag_err_t ag_spilink_open2(int bus, int cs, uint32_t khz, uint32_t block,
     if (framed && block == 0u) {
         /* the board's own: how much memory a link may cost is its business */
         const int32_t v = ag_cfg_get_int(ag_sysconfig(), "wire.frame",
-                                         (int32_t)SPILINK_FRAME_DEFAULT);
-        block = (v > 0) ? (uint32_t)v : SPILINK_FRAME_DEFAULT;
+                                         (int32_t)WL_FRAME_DEFAULT);
+        block = (v > 0) ? (uint32_t)v : WL_FRAME_DEFAULT;
         if (block > AG_PORT_SPI_MAX_XFER) {
             block = AG_PORT_SPI_MAX_XFER;
         }
     }
     /* a frame's size travels in 64-byte units, and the first frames are
-     * SPILINK_HELLO long, which every frame must be able to take */
-    if (framed && (block < SPILINK_HELLO || block % SPILINK_UNIT != 0u)) {
+     * WL_HELLO long, which every frame must be able to take */
+    if (framed && (block < WL_HELLO || block % WL_UNIT != 0u)) {
         return -AG_EINVAL;
     }
     /*
@@ -2153,28 +1240,28 @@ ag_err_t ag_spilink_open2(int bus, int cs, uint32_t khz, uint32_t block,
      * Created once and kept.  Each is checked on its own, so an open that
      * failed halfway leaves nothing that a later open cannot finish.
      */
-    if (s->lock == NULL) {
-        s->lock = ag_port_mutex_new();
+    if (s->w.lock == NULL) {
+        s->w.lock = ag_port_mutex_new();
     }
-    if (s->rx_sem == NULL) {
-        s->rx_sem = ag_port_sem_new_counting(255u, 0u);
+    if (s->w.rx_sem == NULL) {
+        s->w.rx_sem = ag_port_sem_new_counting(255u, 0u);
     }
     if (s->exit_sem == NULL) {
         s->exit_sem = ag_port_sem_new_binary();
     }
-    if (s->tx_sem == NULL) {
-        s->tx_sem = ag_port_sem_new_binary();
+    if (s->w.tx_sem == NULL) {
+        s->w.tx_sem = ag_port_sem_new_binary();
     }
-    if (s->space_sem == NULL) {
-        s->space_sem = ag_port_sem_new_binary();
+    if (s->w.space_sem == NULL) {
+        s->w.space_sem = ag_port_sem_new_binary();
     }
-    if (s->lock == NULL || s->rx_sem == NULL || s->exit_sem == NULL ||
-        s->tx_sem == NULL || s->space_sem == NULL) {
+    if (s->w.lock == NULL || s->w.rx_sem == NULL || s->exit_sem == NULL ||
+        s->w.tx_sem == NULL || s->w.space_sem == NULL) {
         return -AG_ENOMEM;
     }
 
     lock(s);
-    if (s->open) {
+    if (s->w.open) {
         unlock(s);
         return -AG_EBUSY;
     }
@@ -2206,7 +1293,7 @@ ag_err_t ag_spilink_open2(int bus, int cs, uint32_t khz, uint32_t block,
          * sending again.  Being optimistic is safe because of that: a frame
          * that does not fit is not acknowledged, and it comes again.
          */
-        const uint32_t pay = block - SPILINK_HDR;
+        const uint32_t pay = block - WL_HDR;
         /*
          * The transmit ring is also what a frame is sent AGAIN from: it has
          * to hold every frame out and not yet acknowledged, and one more
@@ -2228,8 +1315,8 @@ ag_err_t ag_spilink_open2(int bus, int cs, uint32_t khz, uint32_t block,
         const uint32_t txeach = ((master ? 6u : 5u) * pay + 3u) & ~3u;
         const uint32_t rxeach =
             ((SPILINK_AHEAD + (master ? 3u : 2u)) * pay + 3u) & ~3u;
-        s->txcap = framed ? txeach : SPILINK_TX_RING;
-        s->rxcap = framed ? rxeach : SPILINK_RX_RING;
+        s->w.txcap = framed ? txeach : SPILINK_TX_RING;
+        s->w.rxcap = framed ? rxeach : SPILINK_RX_RING;
     }
     s->slots = NULL;
     s->mbuf = NULL;
@@ -2250,7 +1337,7 @@ ag_err_t ag_spilink_open2(int bus, int cs, uint32_t khz, uint32_t block,
      * that cannot find the one piece gets the three instead.
      */
     uint8_t *const one = ag_port_alloc_aligned(
-        4u, frames + (size_t)s->txcap + (size_t)s->rxcap, AG_MEM_DMA);
+        4u, frames + (size_t)s->w.txcap + (size_t)s->w.rxcap, AG_MEM_DMA);
     if (one != NULL) {
         s->onepiece = true;
         if (master) {
@@ -2259,15 +1346,15 @@ ag_err_t ag_spilink_open2(int bus, int cs, uint32_t khz, uint32_t block,
             s->slots = one;
         }
         s->txmem = one + frames;
-        s->rxmem = s->txmem + s->txcap;
+        s->rxmem = s->txmem + s->w.txcap;
     } else {
         if (master) {
             s->mbuf = ag_port_alloc_aligned(4u, frames, AG_MEM_DMA);
         } else {
             s->slots = ag_port_alloc_aligned(4u, frames, AG_MEM_DMA);
         }
-        s->txmem = ag_port_alloc(s->txcap, AG_MEM_BYTE);
-        s->rxmem = ag_port_alloc(s->rxcap, AG_MEM_BYTE);
+        s->txmem = ag_port_alloc(s->w.txcap, AG_MEM_BYTE);
+        s->rxmem = ag_port_alloc(s->w.rxcap, AG_MEM_BYTE);
     }
     if ((master ? s->mbuf == NULL : s->slots == NULL) || s->txmem == NULL ||
         s->rxmem == NULL) {
@@ -2279,58 +1366,32 @@ ag_err_t ag_spilink_open2(int bus, int cs, uint32_t khz, uint32_t block,
                bus,
                (unsigned)frames,
                (master ? s->mbuf : s->slots) ? "ok" : "REFUSED",
-               (unsigned)s->txcap, s->txmem ? "ok" : "REFUSED",
-               (unsigned)s->rxcap, s->rxmem ? "ok" : "REFUSED");
+               (unsigned)s->w.txcap, s->txmem ? "ok" : "REFUSED",
+               (unsigned)s->w.rxcap, s->rxmem ? "ok" : "REFUSED");
         free_open_memory(s);
         unlock(s);
         return -AG_ENOMEM;
     }
 
-    memset(s->txmem, 0, s->txcap);
-    memset(s->rxmem, 0, s->rxcap);
-    s->tx = (ring_t){.mem = s->txmem, .cap = s->txcap};
-    s->rx = (ring_t){.mem = s->rxmem, .cap = s->rxcap};
-    s->master = master;
-    s->framed = framed;
-    s->frame = framed ? SPILINK_HELLO : block;
-    s->agreed = !framed;
-    s->tx_base = 0;
-    s->sent_off = 0;
-    s->infl_n = 0;
-    s->resend = false;
-    s->resend_whole = false;
-    s->resend_off = 0;
-    s->ack_at = ag_port_us();
-    s->blocks = (flags & AG_SPILINK_BLOCKS) != 0u;
-    s->blk_next = 0;
-    s->next_block = 0;
-    s->rx_next = 0;
-    s->ooo_n = 0;
-    s->refused = false;
-    s->refused_off = 0;
-    s->nak_pending = false;
-    s->nak_sent = false;
-    s->nak_expect = 0;
-    s->nak_at = 0;
-    s->drop_every = (flags >> 8) & 0xFFu;
-    s->drop_count = 0;
-    s->last_rx_len = 0;
-    s->rewinds = 0;
-    s->naks = 0;
-    ag_port_random(&s->sess, sizeof(s->sess));
-    s->sess |= 1u; /* never 0 */
-    s->peer_sess = 0;
-    s->peer_sess_known = false;
-    s->peer_restarts = 0;
-    s->starve_data = 0;
-    s->starve_credit = 0;
-    s->peer_known = false;
-    s->peer_room = 0;
+    memset(s->txmem, 0, s->w.txcap);
+    memset(s->rxmem, 0, s->w.rxcap);
+    s->w.tx = (ring_t){.mem = s->txmem, .cap = s->w.txcap};
+    s->w.rx = (ring_t){.mem = s->rxmem, .cap = s->w.rxcap};
+    s->w.master = master;
+    s->w.framed = framed;
+    /* an SPI slave may hear the master's own frames echoed back, agrees the
+     * frame only once the master clocks it, and wakes nobody on a write -
+     * its frames go when the master clocks them */
+    s->w.role_check = true;
+    s->w.agree_by_len = !master;
+    s->w.kick_writes = master;
+    s->w.kick_reads = false;
+    wl_reset(&s->w, block, flags);
     s->reaped_used = 0;
     memset(s->hist, 0, sizeof(s->hist));
     s->hist_at = 0;
-    s->frames_bad = 0;
-    s->seq_gaps = 0;
+    s->w.frames_bad = 0;
+    s->w.seq_gaps = 0;
     s->wire_us = 0;
     s->loop_us = 0;
     s->reorders = 0;
@@ -2344,7 +1405,7 @@ ag_err_t ag_spilink_open2(int bus, int cs, uint32_t khz, uint32_t block,
     s->bus = bus;
     s->cs = cs;
     s->khz = khz;
-    s->block = block;
+    s->w.block = block;
     s->sck = sck;
     s->mosi = mosi;
     s->miso = miso;
@@ -2352,7 +1413,7 @@ ag_err_t ag_spilink_open2(int bus, int cs, uint32_t khz, uint32_t block,
     s->blocks_clocked = 0;
     s->blocks_data = 0;
     s->blocks_unarmed = 0;
-    s->bytes_dropped = 0;
+    s->w.bytes_dropped = 0;
     s->timeouts = 0;
     s->stalls = 0;
     s->recoveries = 0;
@@ -2366,7 +1427,7 @@ ag_err_t ag_spilink_open2(int bus, int cs, uint32_t khz, uint32_t block,
      * ag_driver_init, which is where a .SYS opens a link.
      */
     s->owner = ag_module_loading();
-    s->open = true;
+    s->w.open = true;
     unlock(s);
 
     /*
@@ -2379,7 +1440,7 @@ ag_err_t ag_spilink_open2(int bus, int cs, uint32_t khz, uint32_t block,
                              "spilink", SPILINK_TASK_STACK, s, SPILINK_PRIO,
                              core, 0, &s->task)) {
         lock(s);
-        s->open = false;
+        s->w.open = false;
         s->stop = false;
         free_open_memory(s);
         s->task = NULL;
@@ -2399,7 +1460,7 @@ ag_err_t ag_spilink_close(int bus, ag_spilink_stats_t *out)
     if (idx < 0) {
         return -AG_ERANGE;
     }
-    if (s_link[idx].lock == NULL) {
+    if (s_link[idx].w.lock == NULL) {
         return -AG_ENODEV;
     }
     if (out != NULL) {
@@ -2431,7 +1492,7 @@ ag_err_t ag_spilink_stats(int bus, ag_spilink_stats_t *out)
     }
 
     spilink_t *const s = &s_link[idx];
-    if (s->lock == NULL) {
+    if (s->w.lock == NULL) {
         return -AG_ENODEV;
     }
 
@@ -2466,310 +1527,45 @@ ag_err_t ag_spilink_stats(int bus, ag_spilink_stats_t *out)
     return AG_OK;
 }
 
-int32_t ag_spilink_write(int bus, const void *buf, size_t len)
+/* ---------------------------------------------------------------------- */
+/* The reader's and the writer's calls: the protocol's (net/wlink.c)       */
+/* ---------------------------------------------------------------------- */
+
+static wlink_t *wl_of(int bus)
 {
     const int idx = link_index(bus);
-    if (idx < 0 || buf == NULL || len == 0) {
-        return -AG_EINVAL;
-    }
-
-    spilink_t *const s = &s_link[idx];
-    if (s->lock == NULL) {
-        return -AG_ENODEV;
-    }
-
-    /* A ring this size cannot hold more, so the rest is the caller's to bring
-     * back - and saying so is what "-AG_EAGAIN rather than dropping" means. */
-    lock(s);
-    if (!s->open) {
-        unlock(s);
-        return -AG_ENODEV;
-    }
-    const uint32_t want = (len > s->txcap) ? s->txcap : (uint32_t)len;
-    const uint32_t n = ring_put(&s->tx, buf, want);
-    const bool     wake = s->master && n > 0u;
-    unlock(s);
-
-    /* An idle master is waiting out its poll; this is something to clock. */
-    if (wake) {
-        (void)ag_port_sem_give(s->tx_sem);
-    }
-
-    /* Nothing was dropped: what did not fit is still the caller's. */
-    return (n > 0u) ? (int32_t)n : -AG_EAGAIN;
+    return (idx < 0) ? NULL : &s_link[idx].w;
 }
 
-/*
- * Write all of `buf`, waiting for room as the service makes it, or until
- * `timeout_ms` has passed with nothing more taken.  Returns what was taken.
- *
- * Why it exists: a caller of the plain write that found the ring full could
- * only sleep and try again, and the shortest sleep there is is a tick - a
- * millisecond, in which a 40 MHz link empties 4 KB and then clocks frames
- * with nothing in them.  Measured: 72% of the wire with 8 KB writes, the
- * same with the receiver checking nothing, so it was never the receiver.
- */
+int32_t ag_spilink_write(int bus, const void *buf, size_t len)
+{
+    wlink_t *const w = wl_of(bus);
+    return (w == NULL) ? -AG_EINVAL : wl_write(w, buf, len);
+}
+
 int32_t ag_spilink_write_wait(int bus, const void *buf, size_t len,
                               uint32_t timeout_ms)
 {
-    const int idx = link_index(bus);
-    if (idx < 0 || buf == NULL || len == 0) {
-        return -AG_EINVAL;
-    }
-    spilink_t *const s = &s_link[idx];
-    if (s->lock == NULL) {
-        return -AG_ENODEV;
-    }
-    const uint8_t *p = (const uint8_t *)buf;
-    size_t         done = 0;
-    while (done < len) {
-        lock(s);
-        if (!s->open) {
-            unlock(s);
-            break;
-        }
-        const uint32_t n = ring_put(&s->tx, p + done, (uint32_t)(len - done));
-        const bool     wake = s->master && n > 0u;
-        unlock(s);
-        if (wake) {
-            (void)ag_port_sem_give(s->tx_sem);
-        }
-        done += n;
-        if (done < len &&
-            !ag_port_sem_take(s->space_sem, ticks_at_least(timeout_ms))) {
-            break;
-        }
-    }
-    return (done > 0u) ? (int32_t)done : -AG_EAGAIN;
+    wlink_t *const w = wl_of(bus);
+    return (w == NULL) ? -AG_EINVAL : wl_write_wait(w, buf, len, timeout_ms);
 }
 
-/*
- * BLOCK MODE.  One block in: its record header and its bytes go into the
- * transmit ring together, and the block is remembered until it is
- * acknowledged, with its number and whether it is worth sending again.
- */
 int32_t ag_spilink_send(int bus, const void *buf, size_t len, uint32_t flags,
                         uint32_t timeout_ms)
 {
-    const int idx = link_index(bus);
-    if (idx < 0 || buf == NULL || len == 0 || len > 0xFFFFu) {
-        return -AG_EINVAL;
-    }
-    spilink_t *const s = &s_link[idx];
-    if (s->lock == NULL) {
-        return -AG_ENODEV;
-    }
-    const bool     reliable = (flags & AG_SPILINK_RELIABLE) != 0u;
-    const uint32_t need = SPILINK_REC + (uint32_t)len;
-    if (!s->blocks || need > s->txcap) {
-        return -AG_EINVAL;
-    }
-    for (;;) {
-        lock(s);
-        if (!s->open) {
-            unlock(s);
-            return -AG_ENODEV;
-        }
-        if (ring_space(&s->tx) >= SPILINK_REC) {
-            /*
-             * The header now and the bytes as room is made: waiting for room
-             * for the WHOLE block left a 2 KB block waiting while a frame
-             * went out half empty (81% of the wire, measured).  The frame
-             * builder takes only what is in the ring, and a block cut across
-             * frames is simply sent again whole if lost.  One writer a link.
-             */
-            uint8_t hdr[SPILINK_REC];
-            const uint16_t no = s->next_block++;
-            put16(hdr, (uint32_t)len);
-            put16(hdr + 2, no);
-            hdr[4] = reliable ? AG_SPILINK_RELIABLE : 0u;
-            hdr[5] = 0;
-            put16(hdr + 6, no);
-            (void)ring_put(&s->tx, hdr, SPILINK_REC);
-            const uint8_t *p = (const uint8_t *)buf;
-            size_t         done = ring_put(&s->tx, p, (uint32_t)len);
-            const uint32_t epoch = s->epoch;
-            unlock(s);
-            for (;;) {
-                if (s->master) {
-                    (void)ag_port_sem_give(s->tx_sem);
-                }
-                if (done >= len) {
-                    return (int32_t)len;
-                }
-                /* the header is in: the rest of the block has to follow,
-                 * however long room takes, or the stream would be cut */
-                (void)ag_port_sem_take(s->space_sem,
-                                       ticks_at_least(timeout_ms));
-                lock(s);
-                if (!s->open) {
-                    unlock(s);
-                    return -AG_ENODEV;
-                }
-                if (s->epoch != epoch) {
-                    unlock(s);
-                    return -AG_EIO; /* the other end started over */
-                }
-                done += ring_put(&s->tx, p + done, (uint32_t)(len - done));
-                unlock(s);
-            }
-        }
-        unlock(s);
-        if (!ag_port_sem_take(s->space_sem, ticks_at_least(timeout_ms))) {
-            return -AG_EAGAIN;
-        }
-    }
+    wlink_t *const w = wl_of(bus);
+    return (w == NULL) ? -AG_EINVAL : wl_send(w, buf, len, flags, timeout_ms);
 }
 
-/*
- * One block out, in order: its bytes into `buf` (cut at `cap`), and in
- * `*info` its number and flags - or, for blocks that were lost and not sent
- * again, AG_SPILINK_LOST with the first and last of them, and no bytes.
- */
 int32_t ag_spilink_recv(int bus, void *buf, size_t cap,
                         ag_spilink_block_t *info, uint32_t timeout_ms)
 {
-    const int idx = link_index(bus);
-    if (idx < 0 || info == NULL) {
-        return -AG_EINVAL;
-    }
-    spilink_t *const s = &s_link[idx];
-    if (s->lock == NULL || !s->blocks) {
-        return (s->lock == NULL) ? -AG_ENODEV : -AG_EINVAL;
-    }
-    const ag_port_ticks_t start = ag_port_ticks();
-    const ag_port_ticks_t span = ticks_at_least(timeout_ms);
-    for (;;) {
-        lock(s);
-        if (!s->open) {
-            unlock(s);
-            return -AG_ENODEV;
-        }
-        uint8_t hdr[SPILINK_REC];
-        if (s->rx.count >= SPILINK_REC) {
-            (void)ring_peek(&s->rx, hdr, SPILINK_REC);
-            ring_commit(&s->rx, SPILINK_REC);
-            info->no = (uint16_t)get16(hdr + 2);
-            info->last = (uint16_t)get16(hdr + 6);
-            info->flags = hdr[4];
-            const uint32_t len = get16(hdr);
-            const uint32_t n = (buf == NULL) ? 0u
-                               : (len < cap) ? len
-                                             : (uint32_t)cap;
-            if (hdr[4] & SPILINK_REC_LOST) {
-                /* a LOST record arrives whole, in one frame */
-                ring_commit(&s->rx, len);
-                unlock(s);
-                return 0;
-            }
-            /*
-             * The block is taken as it arrives, and the call waits for the
-             * rest, however long - as a writer does for room once its header
-             * is in.  Leaving a block cut across two frames in the ring until
-             * the second arrived took its first piece off the room of every
-             * frame (Z->C3 81% of the wire against 92% for bytes, measured).
-             */
-            uint32_t       done = 0;
-            const uint32_t epoch = s->epoch;
-            for (;;) {
-                uint32_t have = s->rx.count;
-                if (have > len - done) {
-                    have = len - done;
-                }
-                const uint32_t into = (done < n) ? ((n - done < have) ? n - done
-                                                                      : have)
-                                                 : 0u;
-                if (into > 0u) {
-                    (void)ring_take(&s->rx, (uint8_t *)buf + done, into);
-                }
-                ring_commit(&s->rx, have - into);
-                done += have;
-                unlock(s);
-                if (done >= len) {
-                    return (int32_t)n;
-                }
-                (void)ag_port_sem_take(s->rx_sem, ticks_at_least(100));
-                lock(s);
-                if (!s->open) {
-                    unlock(s);
-                    return -AG_ENODEV;
-                }
-                if (s->epoch != epoch) {
-                    unlock(s);
-                    return -AG_EIO; /* the other end started over */
-                }
-            }
-        }
-        unlock(s);
-        const ag_port_ticks_t used = (ag_port_ticks_t)(ag_port_ticks() - start);
-        if (used >= span) {
-            return -AG_EAGAIN;
-        }
-        (void)ag_port_sem_take(s->rx_sem, span - used);
-    }
+    wlink_t *const w = wl_of(bus);
+    return (w == NULL) ? -AG_EINVAL : wl_recv(w, buf, cap, info, timeout_ms);
 }
 
 int32_t ag_spilink_read(int bus, void *buf, size_t len, uint32_t timeout_ms)
 {
-    const int idx = link_index(bus);
-    if (idx < 0 || buf == NULL || len == 0) {
-        return -AG_EINVAL;
-    }
-
-    spilink_t *const s = &s_link[idx];
-    if (s->lock == NULL) {
-        return -AG_ENODEV;
-    }
-
-    /*
-     * A minute is a link reader's idea of forever, and treating it that way
-     * keeps ag_port_ms_to_ticks away from a value that would overflow it.
-     */
-    const bool      forever = (timeout_ms >= 60000u);
-    ag_port_ticks_t span = forever ? 0u : ticks_at_least(timeout_ms);
-    const ag_port_ticks_t slice = ticks_at_least(SPILINK_WAIT_SLICE_MS);
-    const ag_port_ticks_t start = ag_port_ticks();
-    const uint32_t        want =
-        (len > s->rxcap && s->rxcap != 0u) ? s->rxcap : (uint32_t)len;
-
-    for (;;) {
-        lock(s);
-        if (!s->open) {
-            unlock(s);
-            return -AG_ENODEV;
-        }
-        const uint32_t n = ring_take(&s->rx, buf, want);
-        unlock(s);
-
-        if (n > 0u) {
-            return (int32_t)n;
-        }
-        if (timeout_ms == 0u) {
-            return -AG_EAGAIN;
-        }
-
-        ag_port_ticks_t wait = slice;
-        if (!forever) {
-            const ag_port_ticks_t used =
-                (ag_port_ticks_t)(ag_port_ticks() - start);
-            if (used >= span) {
-                return -AG_EAGAIN;
-            }
-            const ag_port_ticks_t left = span - used;
-            if (left < wait) {
-                wait = left;
-            }
-            if (wait == 0u) {
-                wait = 1u; /* a wait of no ticks is a poll, and this is a wait */
-            }
-        }
-
-        /*
-         * Outside the lock: a read with a timeout is a wait, and holding the
-         * ring while waiting would stop the service task from delivering into
-         * it.  The wake is a count, so a block that arrived between the empty
-         * check and this take is not lost.
-         */
-        (void)ag_port_sem_take(s->rx_sem, wait);
-    }
+    wlink_t *const w = wl_of(bus);
+    return (w == NULL) ? -AG_EINVAL : wl_read(w, buf, len, timeout_ms);
 }
