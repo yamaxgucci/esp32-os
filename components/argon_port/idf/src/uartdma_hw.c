@@ -143,7 +143,14 @@ static bool IRAM_ATTR on_tx_done(uhci_controller_handle_t ctrl,
 /* the DMA may be anywhere inside the node after the last one it finished,
  * and a descriptor holds at most 4095 bytes */
 #define AG_DMA_RX_NODE_MAX 4096u
-#define AG_DMA_RX_EVQ      (2u * (AG_DMA_RX_RING / 4095u + 1u) + 4u)
+/*
+ * The pieces waiting to be read: a ring's worth of whole descriptors, and 32
+ * more for short ones.  A framed link's acknowledgements are 24 bytes each
+ * with a pause either side, so every one is a piece of its own - some 1 800 a
+ * second from the C3 - and with room for 14 the Zero threw hundreds away in
+ * five seconds (reports of holes among them).  20 bytes a place.
+ */
+#define AG_DMA_RX_EVQ      (2u * (AG_DMA_RX_RING / 4095u + 1u) + 36u)
 
 typedef struct {
     const uint8_t *p;
@@ -304,6 +311,20 @@ ag_err_t ag_port_uart_dma_drain(int port)
     return AG_OK;
 }
 
+ag_err_t ag_port_uart_dma_settle(int port, uint32_t max_out)
+{
+    dma_port_t *d = dma_for(port);
+    if (d == NULL) {
+        return -AG_ENOTSUP;
+    }
+    while (d->out > max_out) {
+        if (!wait_one(d)) {
+            return -AG_ETIMEDOUT;
+        }
+    }
+    return AG_OK;
+}
+
 int32_t ag_port_uart_dma_write(int port, const void *buf, size_t len)
 {
     const int32_t n = ag_port_uart_dma_submit(port, buf, len);
@@ -404,6 +425,25 @@ static ag_err_t rx_start(int port, dma_port_t *d)
     return AG_OK;
 }
 
+uint32_t ag_port_uart_dma_overruns(int port)
+{
+    dma_port_t *d = (port >= 0 && port < AG_PORT_UART_MAX) ? dma_for(port)
+                                                           : NULL;
+    return (d != NULL) ? d->rx_overrun : 0u;
+}
+
+ag_err_t ag_port_uart_dma_listen(int port)
+{
+    if (port < 0 || port >= AG_PORT_UART_MAX) {
+        return -AG_EINVAL;
+    }
+    dma_port_t *d = dma_for(port);
+    if (d == NULL) {
+        return -AG_ENOTSUP;
+    }
+    return (d->rx_q == NULL) ? rx_start(port, d) : AG_OK;
+}
+
 int32_t ag_port_uart_dma_read(int port, void *buf, size_t len,
                               uint32_t timeout_ms)
 {
@@ -456,6 +496,18 @@ bool ag_port_uart_dma_ready(int port)
     return false;
 }
 
+ag_err_t ag_port_uart_dma_listen(int port)
+{
+    (void)port;
+    return -AG_ENOTSUP;
+}
+
+uint32_t ag_port_uart_dma_overruns(int port)
+{
+    (void)port;
+    return 0u;
+}
+
 int32_t ag_port_uart_dma_write(int port, const void *buf, size_t len)
 {
     (void)port;
@@ -475,6 +527,13 @@ int32_t ag_port_uart_dma_submit(int port, const void *buf, size_t len)
 ag_err_t ag_port_uart_dma_drain(int port)
 {
     (void)port;
+    return -AG_ENOTSUP;
+}
+
+ag_err_t ag_port_uart_dma_settle(int port, uint32_t max_out)
+{
+    (void)port;
+    (void)max_out;
     return -AG_ENOTSUP;
 }
 

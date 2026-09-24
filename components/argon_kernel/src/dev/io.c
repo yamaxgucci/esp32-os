@@ -24,6 +24,7 @@
 #include <argon/log.h>
 #include <argon/proc.h>
 #include <argon/spilink.h>
+#include <argon/uartlink.h>
 
 #include <argon/port/io.h>
 #include <argon/port/mem.h>
@@ -831,6 +832,40 @@ static bool io_uart_dma_ready(int port)
     return ag_port_uart_dma_ready(port);
 }
 
+/*
+ * The framed link over a UART (ABI 0.61): the port up at the baud asked for,
+ * with BOARD.CFG's pins, exactly as uart_config brings it up, and its DMA -
+ * then the link's own tasks own it until close.
+ */
+static ag_err_t io_uart_link_open(int port, uint32_t baud, uint32_t frame,
+                                  uint32_t flags)
+{
+    if (baud == 0u) {
+        return -AG_EINVAL;
+    }
+    const ag_port_uart_cfg_t cfg = {
+        .baud = baud, .data_bits = 8, .parity = 0, .stop_bits = 1};
+    lock();
+    ag_err_t err = uart_bring_up(port, &cfg);
+    unlock();
+    if (err == AG_OK && !ag_port_uart_dma_ready(port)) {
+        err = -AG_ENOTSUP;
+    }
+    if (err == AG_OK) {
+        err = ag_uartlink_open(port, frame, flags);
+    }
+    if (err != AG_OK) {
+        ag_log(AG_LOG_WARN, "io", "uart%d link open failed: %d", port,
+               (int)err);
+    }
+    return err;
+}
+
+static ag_err_t io_uart_link_close(int port)
+{
+    return ag_uartlink_close(port, NULL);
+}
+
 static int32_t io_uart_dma_read(int port, void *buf, size_t len,
                                 uint32_t timeout_ms)
 {
@@ -1398,6 +1433,14 @@ const ag_io_api_t ag_io_api_table = {
     .spi_link_write_wait = ag_spilink_write_wait,
     .spi_link_send = ag_spilink_send,
     .spi_link_recv = ag_spilink_recv,
+    .uart_link_open = io_uart_link_open,
+    .uart_link_close = io_uart_link_close,
+    .uart_link_stats = ag_uartlink_stats,
+    .uart_link_write = ag_uartlink_write,
+    .uart_link_write_wait = ag_uartlink_write_wait,
+    .uart_link_read = ag_uartlink_read,
+    .uart_link_send = ag_uartlink_send,
+    .uart_link_recv = ag_uartlink_recv,
 };
 
 ag_err_t ag_io_init(void)

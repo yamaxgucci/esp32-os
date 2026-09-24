@@ -385,7 +385,7 @@ extern "C" {
  *      garbage.  Any future append needs the same guarantee and has it.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 60u
+#define AG_ABI_MINOR 61u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -1903,6 +1903,29 @@ typedef struct ag_io_api {
                              uint32_t flags, uint32_t timeout_ms);
     int32_t (*spi_link_recv)(int bus, void *buf, size_t cap,
                              ag_spilink_block_t *info, uint32_t timeout_ms);
+    /*
+     * ABI 0.61: the same framed link over a UART - the same frames, sent
+     * again when lost, blocks, sessions, the frame agreed as the smaller of
+     * the two boards' (`frame` 0: [wire] frame in SYSTEM.CFG) - carried by
+     * DMA, each frame the length it is, both ends equal.  The port comes up
+     * at `baud` with BOARD.CFG's pins.  flags are spi_link_open2's
+     * AG_SPILINK_BLOCKS and AG_SPILINK_DROP; the stats are the SPI link's
+     * struct, with blocks_clocked frames sent, blocks_data frames received
+     * and timeouts the bytes skipped while looking for a frame.
+     */
+    ag_err_t (*uart_link_open)(int port, uint32_t baud, uint32_t frame,
+                               uint32_t flags);
+    ag_err_t (*uart_link_close)(int port);
+    ag_err_t (*uart_link_stats)(int port, ag_spilink_stats_t *out);
+    int32_t (*uart_link_write)(int port, const void *buf, size_t len);
+    int32_t (*uart_link_write_wait)(int port, const void *buf, size_t len,
+                                    uint32_t timeout_ms);
+    int32_t (*uart_link_read)(int port, void *buf, size_t len,
+                              uint32_t timeout_ms);
+    int32_t (*uart_link_send)(int port, const void *buf, size_t len,
+                              uint32_t flags, uint32_t timeout_ms);
+    int32_t (*uart_link_recv)(int port, void *buf, size_t cap,
+                              ag_spilink_block_t *info, uint32_t timeout_ms);
 } ag_io_api_t;
 
 /* ------------------------------------------------------------------------ */

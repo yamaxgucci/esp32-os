@@ -537,6 +537,12 @@ uint32_t wl_rx(wlink_t *s, const uint8_t *f, uint32_t got)
         count(s, &s->frames_bad, 1u);
         return 0u;
     }
+    /* this end's own session: its own frame, come back (a wire with no
+     * roles has only this to tell an echo by) */
+    if (get32(f + 16) == s->sess) {
+        count(s, &s->frames_bad, 1u);
+        return 0u;
+    }
     const uint32_t off = get32(f + 4);
     const uint32_t ack = get32(f + 8);
     const uint32_t span = get16(f + 12);

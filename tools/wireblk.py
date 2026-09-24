@@ -131,7 +131,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--zero", required=True)
     ap.add_argument("--lcd", required=True)
-    ap.add_argument("--wire", choices=("uart", "uartcpu", "spi"), required=True)
+    ap.add_argument("--wire", choices=("uart", "uartcpu", "uartl", "spi"), required=True)
     ap.add_argument("--rates", required=True)
     ap.add_argument("--blocks", required=True)
     ap.add_argument("--secs", type=int, default=5)

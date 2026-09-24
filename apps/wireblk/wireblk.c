@@ -14,6 +14,9 @@
  *          ring and the interrupt, for comparison
  *   spim   this board is the SPI MASTER (it holds the clock), <rate> in kHz
  *   spis   this board is the SPI SLAVE, <rate> in kHz
+ *   uartl  the kernel's framed link over the UART (ABI 0.61): the same
+ *          frames as the SPI link - acknowledged, sent again when lost -
+ *          at <rate> baud; both ends run it
  *
  *          Both ends are the kernel's framed SPI link (io->spi_link_open2,
  *          ABI 0.60): a stream carried in `frame=N`-byte transactions (4096
@@ -33,8 +36,11 @@
 #include <argon/libc.h>
 
 /* 16 KB of arena, the least a named heap may be: the default is a quarter of
- * the free pool, and on the C3 the SPI link's one piece is what that took */
-AG_APP_SIZED("WIREBLK", "1.0", "argon", 0, 0, 16384);
+ * the free pool, and on the C3 the SPI link's one piece is what that took.
+ * A 6 KB stack, not the default 16: it used 4, and on the C3 the other ten
+ * were the UART link's memory (no 4 + 17 KB for it once the port's receive
+ * rings were up, measured) */
+AG_APP_SIZED("WIREBLK", "1.0", "argon", 0, 6144, 16384);
 
 #define BLK_MAX  8192u
 
@@ -429,6 +435,18 @@ static uint8_t *buf_alloc(size_t n)
 
 /* ---- main ---------------------------------------------------------------- */
 
+/* The framed link's calls, for whichever wire carries it. */
+typedef struct {
+    int id; /* the SPI bus, or the UART port */
+    int32_t (*write)(int, const void *, size_t);
+    int32_t (*write_wait)(int, const void *, size_t, uint32_t);
+    int32_t (*read)(int, void *, size_t, uint32_t);
+    int32_t (*send)(int, const void *, size_t, uint32_t, uint32_t);
+    int32_t (*recv)(int, void *, size_t, ag_spilink_block_t *, uint32_t);
+    ag_err_t (*stats)(int, ag_spilink_stats_t *);
+    ag_err_t (*close)(int);
+} lk_t;
+
 int ag_main(int argc, char **argv)
 {
     if (argc < 6) {
@@ -485,11 +503,14 @@ int ag_main(int argc, char **argv)
     const ag_io_api_t *io = g_ag_api->io;
 
     const bool uartcpu = (wire[0] == 'u' && wire[4] == 'c');
-    const bool uart = (wire[0] == 'u');
+    const bool uartl = (wire[0] == 'u' && wire[4] == 'l');
+    const bool uart = (wire[0] == 'u') && !uartl;
     const bool spim = (wire[0] == 's' && wire[3] == 'm');
     const bool spis = (wire[0] == 's' && wire[3] == 's');
-    if (!uart && !spim && !spis) {
-        ag_printf("wireblk: wire is uart, spim or spis\n");
+    /* the kernel's framed link, over either wire: one set of calls below */
+    const bool framed = spim || spis || uartl;
+    if (!uart && !framed) {
+        ag_printf("wireblk: wire is uart, uartcpu, uartl, spim or spis\n");
         return 1;
     }
     if (block < 16u || block > BLK_MAX) {
@@ -505,11 +526,37 @@ int ag_main(int argc, char **argv)
      * just been put when they were asked for first.
      */
     ag_err_t e = AG_OK;
+    lk_t     lk;
+    memset(&lk, 0, sizeof(lk));
     if (uart) {
         e = io->uart_config(UART_PORT, rate, 8, 0, 1);
+    } else if (uartl) {
+        if (!AG_HAS(io, uart_link_recv)) {
+            e = -AG_ENOSYS;
+        } else {
+            e = io->uart_link_open(UART_PORT, rate, frame,
+                                   AG_SPILINK_DROP(drop) |
+                                       (blocks ? AG_SPILINK_BLOCKS : 0u));
+            lk = (lk_t){UART_PORT,
+                        io->uart_link_write,
+                        io->uart_link_write_wait,
+                        io->uart_link_read,
+                        io->uart_link_send,
+                        io->uart_link_recv,
+                        io->uart_link_stats,
+                        io->uart_link_close};
+        }
     } else if (!AG_HAS(io, spi_link_open2)) {
         e = -AG_ENOSYS;
     } else {
+        lk = (lk_t){bus,
+                    io->spi_link_write,
+                    io->spi_link_write_wait,
+                    io->spi_link_read,
+                    io->spi_link_send,
+                    io->spi_link_recv,
+                    io->spi_link_stats,
+                    io->spi_link_close};
         e = io->spi_link_open2(bus, cs, rate, frame,
                                AG_SPILINK_FRAMED | AG_SPILINK_DROP(drop) |
                                    (blocks ? AG_SPILINK_BLOCKS : 0u) |
@@ -549,8 +596,8 @@ int ag_main(int argc, char **argv)
         ag_free(s_blk);
         ag_free(s_rx);
         ag_free(s_cur);
-        if (spim || spis) {
-            (void)io->spi_link_close(bus);
+        if (framed) {
+            (void)lk.close(lk.id);
         }
         return 1;
     }
@@ -605,25 +652,23 @@ int ag_main(int argc, char **argv)
             } else {
                 build(s_blk, block, seq);
                 uint32_t off = 0;
-                if (blocks != 0u && AG_HAS(io, spi_link_send)) {
+                if (blocks != 0u && lk.send != NULL) {
                     const uint32_t fl =
                         ((seq % blocks) == 0u) ? 0u : AG_SPILINK_RELIABLE;
-                    const int32_t w =
-                        io->spi_link_send(bus, s_blk, block, fl, 200);
+                    const int32_t w = lk.send(lk.id, s_blk, block, fl, 200);
                     off = (w > 0) ? (uint32_t)w : 0u;
                     if (off != block) {
                         off = block; /* refused: counted, not retried */
                         refused++;
                         sent--;
                     }
-                } else if (AG_HAS(io, spi_link_write_wait)) {
-                    const int32_t w =
-                        io->spi_link_write_wait(bus, s_blk, block, 200);
+                } else if (lk.write_wait != NULL) {
+                    const int32_t w = lk.write_wait(lk.id, s_blk, block, 200);
                     off = (w > 0) ? (uint32_t)w : 0u;
                 }
                 while (off < block && ag_micros() < until) {
                     const int32_t n =
-                        io->spi_link_write(bus, s_blk + off, block - off);
+                        lk.write(lk.id, s_blk + off, block - off);
                     if (n > 0) {
                         off += (uint32_t)n;
                     } else {
@@ -649,7 +694,7 @@ int ag_main(int argc, char **argv)
         }
         const uint32_t ms = (uint32_t)((ag_micros() - t0) / 1000u);
         /* what is still in the link's ring goes out before the close */
-        if (spim || spis) {
+        if (framed) {
             ag_delay(300);
         }
         ag_printf("wireblk tx %s rate=%u block=%u sent=%u refused=%u ms=%u "
@@ -694,9 +739,9 @@ int ag_main(int argc, char **argv)
                 n = io->uart_dma_read(UART_PORT, s_rx, s_rxcap, 200);
             } else if (uart) {
                 n = io->uart_read(UART_PORT, s_rx, s_rxcap, 20);
-            } else if (blocks != 0u && AG_HAS(io, spi_link_recv)) {
+            } else if (blocks != 0u && lk.recv != NULL) {
                 ag_spilink_block_t bi;
-                n = io->spi_link_recv(bus, s_cur, block, &bi, 20);
+                n = lk.recv(lk.id, s_cur, block, &bi, 20);
                 if (n == 0 && (bi.flags & AG_SPILINK_LOST)) {
                     lost_told += (uint32_t)(uint16_t)(bi.last - bi.no) + 1u;
                 }
@@ -708,7 +753,7 @@ int ag_main(int argc, char **argv)
                 }
                 n = 0;
             } else {
-                n = io->spi_link_read(bus, s_rx, s_rxcap, 20);
+                n = lk.read(lk.id, s_rx, s_rxcap, 20);
             }
             if (n > 0 && sink) {
                 const uint64_t now = ag_micros();
@@ -743,15 +788,14 @@ int ag_main(int argc, char **argv)
                   (unsigned)s_burn_work[0], (unsigned)s_burn_work[1]);
     }
 
-    if (spim || spis) {
+    if (framed) {
         ag_spilink_stats_t st;
         memset(&st, 0, sizeof(st));
-        if (AG_HAS(io, spi_link_stats) &&
-            io->spi_link_stats(bus, &st) == AG_OK) {
+        if (lk.stats != NULL && lk.stats(lk.id, &st) == AG_OK) {
             ag_printf("wireblk link %s: frames=%u data=%u bad=%u gaps=%u "
                       "dropped=%u wire_us=%u loop_us=%u reorders=%u "
                       "short=%u unarmed=%u rewinds=%u naks=%u sd=%u sc=%u "
-                      "errors=%u frame=%u\n",
+                      "errors=%u frame=%u to=%u st=%u\n",
                       wire, (unsigned)st.blocks_clocked,
                       (unsigned)st.blocks_data,
                       (unsigned)st.frames_bad, (unsigned)st.seq_gaps,
@@ -760,9 +804,10 @@ int ag_main(int argc, char **argv)
                       (unsigned)st.short_frames, (unsigned)st.blocks_unarmed,
                       (unsigned)st.rewinds, (unsigned)st.naks,
                       (unsigned)st.starve_data, (unsigned)st.starve_credit,
-                      (unsigned)st.errors, (unsigned)st.frame);
+                      (unsigned)st.errors, (unsigned)st.frame,
+                      (unsigned)st.timeouts, (unsigned)st.stalls);
         }
-        (void)io->spi_link_close(bus);
+        (void)lk.close(lk.id);
     }
     for (uint32_t i = 0; i < DMA_RING; i++) {
         if (s_dmabuf[i] != NULL) {

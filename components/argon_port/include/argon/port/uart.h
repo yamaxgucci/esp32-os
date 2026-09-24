@@ -111,10 +111,27 @@ int32_t  ag_port_uart_dma_write(int port, const void *buf, size_t len);
  */
 int32_t  ag_port_uart_dma_submit(int port, const void *buf, size_t len);
 ag_err_t ag_port_uart_dma_drain(int port);
+/*
+ * Wait until at most `max_out` submitted transfers are still out.  They
+ * finish in the order they were submitted, so a caller that rotates through
+ * N buffers gets the oldest one back by settling to N - 1 - without waiting
+ * for the rest, which drain would.
+ */
+ag_err_t ag_port_uart_dma_settle(int port, uint32_t max_out);
 
-/* Receive by DMA into the caller's buffer; len a multiple of 4096. */
+/*
+ * Receive by DMA into the caller's buffer: what has arrived, up to len,
+ * waiting up to timeout_ms for the first byte.  The receive side (two rings,
+ * kept for good) is set up on the first read - or by listen, which does only
+ * that: a caller that allocates for itself afterwards does not leave the
+ * rings in the middle of the hole its own memory makes when it is freed.
+ */
 int32_t  ag_port_uart_dma_read(int port, void *buf, size_t len,
                                uint32_t timeout_ms);
+ag_err_t ag_port_uart_dma_listen(int port);
+/* Pieces of what arrived that were thrown away: overwritten in the ring
+ * before anybody read them, or pushed out of a full queue of them. */
+uint32_t ag_port_uart_dma_overruns(int port);
 
 #include <argon/port/impl/uart.h>
 
