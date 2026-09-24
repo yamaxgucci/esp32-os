@@ -848,8 +848,9 @@ static ag_err_t io_uart_link_open(int port, uint32_t baud, uint32_t frame,
     lock();
     ag_err_t err = uart_bring_up(port, &cfg);
     unlock();
-    if (err == AG_OK && !ag_port_uart_dma_ready(port)) {
-        err = -AG_ENOTSUP;
+    if (err == AG_OK && (flags & AG_UARTLINK_DMA) != 0u &&
+        !ag_port_uart_dma_ready(port)) {
+        err = -AG_ENOTSUP; /* asked for DMA on a port that has none */
     }
     if (err == AG_OK) {
         err = ag_uartlink_open(port, frame, flags);

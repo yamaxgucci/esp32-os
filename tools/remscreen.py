@@ -4,12 +4,14 @@ What a neighbour's screen gets over the cluster link, with no screen on the
 bench.
 
     python tools/remscreen.py --master COM6 --slave COM8 [--secs 10] [--rows 8]
+                              [--wire spi|uart]
 
 The slave board (the one that would have the panel) loads NULLDISP.SYS, a
 display that draws nothing and says in its journal, once a second, what
 reached it: frames/s (pixels over the surface), KB/s, rectangles, text rows.
-Both boards swap NODELINK for LINKSPI, the master attaches the slave's
-devices (`link devs`), and then:
+With --wire spi both boards swap NODELINK for LINKSPI; with --wire uart the
+wire is the one each board bound at boot from its [link] sections.  The
+master attaches the slave's devices (`link devs`), and then:
 
   graphics  GFXNOISE on the master for --secs, in bands of --rows: noise, so
             nothing compresses and every band crosses whole;
@@ -40,6 +42,7 @@ def main():
     ap.add_argument("--slave", required=True)
     ap.add_argument("--secs", type=int, default=10)
     ap.add_argument("--rows", type=int, default=8)
+    ap.add_argument("--wire", choices=("spi", "uart"), default="spi")
     a = ap.parse_args()
 
     m = Board(a.master, 115200, Sink(), False)
@@ -47,18 +50,21 @@ def main():
     try:
         up(m, "master")
         up(s, "slave")
-        for b in (s, m):
-            say(b, "drv unload NODELINK", 10.0)
+        if a.wire == "spi":
+            for b in (s, m):
+                say(b, "drv unload NODELINK", 10.0)
         t = say(s, "drv load c:\\drv\\nulldisp.sys", 10.0)
         print("slave: %s" % ("NULLDISP loaded" if "NULLDISP:" in t
                              else "NULLDISP DID NOT LOAD"))
-        for b in (s, m):
-            t = say(b, "drv load c:\\drv\\linkspi.sys", 15.0)
-            ok = re.search(r"/dev/node1 on spi\d cs\d+ as \w+ at (\d+) kHz", t)
-            print("%s: %s" % ("slave" if b is s else "master",
-                              ok.group(0) if ok else "LINKSPI DID NOT LOAD"))
-        for b in (s, m):
-            say(b, "link use node1", 10.0)
+        if a.wire == "spi":
+            for b in (s, m):
+                t = say(b, "drv load c:\\drv\\linkspi.sys", 15.0)
+                ok = re.search(r"/dev/node1 on spi\d cs\d+ as \w+ at (\d+) kHz",
+                               t)
+                print("%s: %s" % ("slave" if b is s else "master",
+                                  ok.group(0) if ok else "LINKSPI DID NOT LOAD"))
+            for b in (s, m):
+                say(b, "link use node1", 10.0)
         time.sleep(2.0)
         t = say(m, "link devs", 20.0)
         lines = [l for l in t.splitlines() if "lcd0" in l or "display" in l]

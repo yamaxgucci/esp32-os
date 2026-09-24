@@ -148,8 +148,6 @@ add_executable(argon_tests
     "${ARGON_ROOT}/apps/common/rlink/ag_rlink.c"
     test_atproto.c
     "${ARGON_ROOT}/apps/common/atproto/ag_atproto.c"
-    test_nlink.c
-    "${ARGON_ROOT}/apps/common/nlink/ag_nlink.c"
     test_espldr.c
     "${ARGON_ROOT}/apps/common/esp8266/ag_espldr.c"
     test_stm32ldr.c
@@ -381,3 +379,22 @@ foreach(target argon_tests vtdump cchost engine_smoke synth_smoke ckt_smoke
 endforeach()
 
 add_test(NAME argon_tests COMMAND argon_tests)
+
+# The framed link's protocol, both ends and a lossy wire in one process.  Its
+# own executable because it stands the port's locks, clock and randomness in
+# with stubs (wlink_stub/, first on the path), and every other test reaches
+# those headers through the `bare` port.
+add_executable(wlink_tests
+    test_wlink.c
+    "${ARGON_ROOT}/components/argon_kernel/src/net/wlink.c")
+target_include_directories(wlink_tests BEFORE PRIVATE
+    "${CMAKE_CURRENT_LIST_DIR}/wlink_stub")
+target_include_directories(wlink_tests PRIVATE
+    "${ARGON_ROOT}/components/argon_kernel/src"
+    ${ARGON_INCLUDES})
+if(MSVC)
+    target_compile_definitions(wlink_tests PRIVATE _CRT_SECURE_NO_WARNINGS)
+else()
+    target_compile_options(wlink_tests PRIVATE -Wall -Wextra -Wno-unused-parameter)
+endif()
+add_test(NAME wlink_tests COMMAND wlink_tests)

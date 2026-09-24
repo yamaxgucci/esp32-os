@@ -32,6 +32,12 @@ CONFIG_SPIRAM_USE_CAPS_ALLOC=y
 # DRAM once PSRAM's own management took its share.
 CONFIG_ARGON_APP_ARENA_KB=64
 
+# No host helper: H: is the emulator's, and on this board UART1 is the wire to
+# the C3.  Left on, HostFS opened it at 115200 for three seconds after boot,
+# sent its pings down the cluster wire and read from the port the link's DMA
+# reads - and the IDF said "uhci_receive: controller not in enable state".
+CONFIG_ARGON_ENABLE_HOSTFS=n
+
 # Take the real-radio network path, not the OpenCores-MAC one.  The primary
 # esp32s3 target is QEMU, where "networking" means the emulated OpenEth device
 # and the boot brings it up unconditionally; on real silicon that MAC does not

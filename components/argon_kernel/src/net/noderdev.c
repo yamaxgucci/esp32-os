@@ -539,8 +539,10 @@ static uint16_t rd_pour_payload(void)
 }
 
 /* The message a blit is cut into: the display path is serialised by the
- * device registry, so one buffer, and not 2 KB on a caller's stack. */
-static uint8_t s_blitmsg[RD_HDR + RD_POUR_CAP];
+ * device registry, so one buffer, and not 2 KB on a caller's stack - nor in
+ * the kernel's statics, where a board that never draws on a neighbour paid
+ * for it and the S3 emulator build ran out of DRAM: made on the first blit. */
+static uint8_t *s_blitmsg;
 
 static rdev_t *proxy_of(ag_handle_t h);
 
@@ -588,6 +590,12 @@ static void rd_blit(ag_handle_t h, const ag_blit_t *b)
     }
 
     const uint8_t *rows = (const uint8_t *)b->px;
+    if (s_blitmsg == NULL) {
+        s_blitmsg = (uint8_t *)ag_port_alloc(RD_HDR + RD_POUR_CAP, AG_MEM_BYTE);
+        if (s_blitmsg == NULL) {
+            return;
+        }
+    }
     uint8_t *const msg = s_blitmsg;
     const uint16_t pixroom = (uint16_t)((rd_pour_payload() - RD_BLIT_HDR) / 2u);
 

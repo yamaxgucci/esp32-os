@@ -33,9 +33,16 @@
  * frames are built two transactions before they are clocked.)
  *
  * Two tasks, at the SPI link's priority: one receiving (it blocks in the
- * DMA read), one sending (it blocks on the protocol's wake).  Two transmit
+ * read), one sending (it blocks on the protocol's wake).
+ *
+ * BY DMA OR BY THE DRIVER, and the wire's configuration says which
+ * (AG_UARTLINK_DMA).  By DMA (UHCI - the S3, the C3, the C6) two transmit
  * buffers go round: frames finish in the order they were given, so settling
- * the DMA to one out gives the older back.
+ * the DMA to one out gives the older back; 16 Mbaud needs this.  By the
+ * driver - every chip, the ESP32 that has no UHCI and the emulator that has
+ * none either - a frame is copied into the driver's ring and read out of
+ * its interrupt's, which at the cluster's 460 800 and 921 600 baud costs
+ * nothing that matters.
  *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
@@ -82,6 +89,7 @@
 typedef struct {
     wlink_t w;
     int     port;
+    bool    dma; /* by the UART's DMA, or through its driver */
     /* two allocations: the transmit buffers, which the DMA reads and so must
      * be in memory it can reach, and the frame finder's buffer with the two
      * rings, which can be anywhere - on the Zero, PSRAM; as one 42 KB piece
@@ -112,7 +120,13 @@ typedef struct {
     ag_err_t last_error;
 } uartlink_t;
 
-static uartlink_t s_ul[UL_PORTS];
+/*
+ * On the heap, made by the first open of a port and kept (the lock and the
+ * wakes in it have to outlive a close), and not three of them in the
+ * kernel's statics: a few hundred bytes each, and the S3's emulator build
+ * then overflowed its DRAM by 2 816 - for ports most boards never open.
+ */
+static uartlink_t *s_ul[UL_PORTS];
 
 static void lock(uartlink_t *u) { (void)ag_port_mutex_take(u->w.lock, AG_PORT_FOREVER); }
 
@@ -140,7 +154,31 @@ static void note_error(uartlink_t *u, ag_err_t e)
 
 static uartlink_t *ul_of(int port)
 {
-    return (port >= 0 && port < UL_PORTS) ? &s_ul[port] : NULL;
+    return (port >= 0 && port < UL_PORTS) ? s_ul[port] : NULL;
+}
+
+static uartlink_t *ul_make(int port)
+{
+    if (port < 0 || port >= UL_PORTS) {
+        return NULL;
+    }
+    if (s_ul[port] == NULL) {
+        uartlink_t *u = ag_port_alloc(sizeof(*u), AG_MEM_FAST);
+        if (u == NULL) {
+            u = ag_port_alloc(sizeof(*u), AG_MEM_BYTE);
+        }
+        if (u != NULL) {
+            memset(u, 0, sizeof(*u));
+        }
+        s_ul[port] = u;
+    }
+    return s_ul[port];
+}
+
+/* Out of range, or a port no link was ever opened on. */
+static ag_err_t ul_absent(int port)
+{
+    return (port >= 0 && port < UL_PORTS) ? -AG_ENODEV : -AG_ERANGE;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -204,12 +242,51 @@ static void find_frames(uartlink_t *u)
     }
 }
 
+/* What has arrived, up to UL_READ, waiting UL_READ_MS for the first byte. */
+static int32_t take_in(uartlink_t *u)
+{
+    uint8_t *const at = u->pbuf + u->have;
+    if (u->dma) {
+        return ag_port_uart_dma_read(u->port, at, UL_READ, UL_READ_MS);
+    }
+    /* the driver's read waits for ALL it is asked for: so what is there,
+     * or one byte with the wait */
+    const int32_t there = ag_port_uart_pending(u->port);
+    if (there > 0) {
+        return ag_port_uart_read(u->port, at,
+                                 ((uint32_t)there < UL_READ) ? (uint32_t)there
+                                                             : UL_READ,
+                                 0u);
+    }
+    return ag_port_uart_read(u->port, at, 1u, UL_READ_MS);
+}
+
+/* A frame out.  By DMA the buffer is the hardware's until it is settled
+ * back; through the driver it is copied and the caller's again at once. */
+static int32_t put_out(uartlink_t *u, const uint8_t *f, uint32_t len)
+{
+    if (u->dma) {
+        return ag_port_uart_dma_submit(u->port, f, len);
+    }
+    uint32_t done = 0;
+    while (done < len) {
+        const int32_t n = ag_port_uart_write(u->port, f + done, len - done);
+        if (n < 0) {
+            return n;
+        }
+        if (n == 0) {
+            ag_port_task_delay(1);
+        }
+        done += (uint32_t)n;
+    }
+    return (int32_t)len;
+}
+
 static void rx_task(void *arg)
 {
     uartlink_t *u = (uartlink_t *)arg;
     while (!u->stop) {
-        const int32_t n = ag_port_uart_dma_read(u->port, u->pbuf + u->have,
-                                                UL_READ, UL_READ_MS);
+        const int32_t n = take_in(u);
         if (n <= 0) {
             continue;
         }
@@ -260,16 +337,19 @@ static void tx_task(void *arg)
             }
             /* the older transmit buffer back: the other may still be on
              * the wire */
-            ag_err_t e = ag_port_uart_dma_settle(u->port, UL_TXBUF - 1u);
-            if (e != AG_OK) {
-                note_error(u, e);
-                break;
+            if (u->dma) {
+                const ag_err_t e =
+                    ag_port_uart_dma_settle(u->port, UL_TXBUF - 1u);
+                if (e != AG_OK) {
+                    note_error(u, e);
+                    break;
+                }
             }
             uint8_t *const f = u->txf[u->txk];
             bool           nak_was = false;
             uint32_t       wire = 0;
             const uint32_t n = wl_build(w, f, allow, 0u, &nak_was, &wire);
-            const int32_t  rc = ag_port_uart_dma_submit(u->port, f, wire);
+            const int32_t  rc = put_out(u, f, wire);
             if (rc < 0) {
                 wl_unbuild(w, n, nak_was);
                 note_error(u, (ag_err_t)rc);
@@ -279,11 +359,13 @@ static void tx_task(void *arg)
             u->ack_sent = get32(f + 8);
             u->space_sent = space;
             u->last_tx = now;
-            u->txk = (u->txk + 1u) % UL_TXBUF;
+            u->txk = u->dma ? (u->txk + 1u) % UL_TXBUF : 0u;
             u->frames_tx++;
         }
     }
-    (void)ag_port_uart_dma_drain(u->port);
+    if (u->dma) {
+        (void)ag_port_uart_dma_drain(u->port);
+    }
     (void)ag_port_sem_give(u->exit_sem);
     ag_port_task_delete(NULL);
 }
@@ -294,9 +376,12 @@ static void tx_task(void *arg)
 
 ag_err_t ag_uartlink_open(int port, uint32_t frame, uint32_t flags)
 {
-    uartlink_t *const u = ul_of(port);
-    if (u == NULL) {
+    if (port < 0 || port >= UL_PORTS) {
         return -AG_ERANGE;
+    }
+    uartlink_t *const u = ul_make(port);
+    if (u == NULL) {
+        return -AG_ENOMEM;
     }
     wlink_t *const w = &u->w;
     if (w->lock == NULL) {
@@ -334,9 +419,12 @@ ag_err_t ag_uartlink_open(int port, uint32_t frame, uint32_t flags)
     /* the port's receive rings first, which it keeps: allocated after this
      * link's memory they sat in the middle of its hole when it was freed,
      * and the next open on a C3 found no 21 KB in one piece */
-    const ag_err_t le = ag_port_uart_dma_listen(port);
-    if (le != AG_OK) {
-        return le;
+    const bool dma = (flags & AG_UARTLINK_DMA) != 0u;
+    if (dma) {
+        const ag_err_t le = ag_port_uart_dma_listen(port);
+        if (le != AG_OK) {
+            return le;
+        }
     }
 
     lock(u);
@@ -348,7 +436,7 @@ ag_err_t ag_uartlink_open(int port, uint32_t frame, uint32_t flags)
     w->txcap = (4u * pay + 3u) & ~3u;
     w->rxcap = (3u * pay + 3u) & ~3u;
     u->pcap = frame + UL_READ;
-    const size_t dbytes = (size_t)UL_TXBUF * frame;
+    const size_t dbytes = (size_t)(dma ? UL_TXBUF : 1u) * frame;
     const size_t bytes = (size_t)u->pcap + w->txcap + w->rxcap;
     u->dmem = ag_port_alloc_aligned(4u, dbytes, AG_MEM_DMA);
     u->mem = (u->dmem != NULL) ? ag_port_alloc(bytes, AG_MEM_BYTE) : NULL;
@@ -362,7 +450,7 @@ ag_err_t ag_uartlink_open(int port, uint32_t frame, uint32_t flags)
         return -AG_ENOMEM;
     }
     for (unsigned k = 0; k < UL_TXBUF; k++) {
-        u->txf[k] = u->dmem + (size_t)k * frame;
+        u->txf[k] = u->dmem + (dma ? (size_t)k * frame : 0u);
     }
     uint8_t *p = u->mem;
     u->pbuf = p;
@@ -381,6 +469,7 @@ ag_err_t ag_uartlink_open(int port, uint32_t frame, uint32_t flags)
     w->kick_reads = true;
     wl_reset(w, frame, flags);
     u->port = port;
+    u->dma = dma;
     u->txk = 0;
     u->have = 0;
     u->ack_sent = 0;
@@ -422,7 +511,7 @@ ag_err_t ag_uartlink_stats(int port, ag_spilink_stats_t *out)
 {
     uartlink_t *const u = ul_of(port);
     if (u == NULL) {
-        return -AG_ERANGE;
+        return ul_absent(port);
     }
     if (out == NULL) {
         return -AG_EINVAL;
@@ -447,7 +536,7 @@ ag_err_t ag_uartlink_close(int port, ag_spilink_stats_t *out)
 {
     uartlink_t *const u = ul_of(port);
     if (u == NULL) {
-        return -AG_ERANGE;
+        return ul_absent(port);
     }
     if (u->w.lock == NULL || !u->w.open) {
         return -AG_ENODEV;

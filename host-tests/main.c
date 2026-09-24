@@ -40,7 +40,6 @@ void run_desktop_tests(void);
 void run_fsops_tests(void);
 void run_rlink_tests(void);
 void run_atproto_tests(void);
-void run_nlink_tests(void);
 void run_cluframe_tests(void);
 void run_espldr_tests(void);
 void run_stm32ldr_tests(void);
@@ -79,7 +78,6 @@ int main(void)
     run_fsops_tests();
     run_rlink_tests();
     run_atproto_tests();
-    run_nlink_tests();
     run_cluframe_tests();
     run_espldr_tests();
     run_stm32ldr_tests();

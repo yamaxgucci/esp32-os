@@ -1713,6 +1713,11 @@ typedef struct {
     uint32_t peer_restarts;  /* times the other end started a new session  */
 } ag_spilink_stats_t;
 
+/* uart_link_open (ABI 0.61): by the UART's DMA (UHCI) rather than through
+ * its driver - the S3, the C3, the C6; not the ESP32, not the emulator.  The
+ * wire's configuration says which. */
+#define AG_UARTLINK_DMA 16u
+
 /* spi_link_open2 flags (ABI 0.60). */
 #define AG_SPILINK_MASTER 1u /* this end holds the clock                   */
 #define AG_SPILINK_FRAMED 2u /* transactions carry a header: see spilink.c */
@@ -1907,9 +1912,10 @@ typedef struct ag_io_api {
      * ABI 0.61: the same framed link over a UART - the same frames, sent
      * again when lost, blocks, sessions, the frame agreed as the smaller of
      * the two boards' (`frame` 0: [wire] frame in SYSTEM.CFG) - carried by
-     * DMA, each frame the length it is, both ends equal.  The port comes up
-     * at `baud` with BOARD.CFG's pins.  flags are spi_link_open2's
-     * AG_SPILINK_BLOCKS and AG_SPILINK_DROP; the stats are the SPI link's
+     * DMA (AG_UARTLINK_DMA) or through the port's driver, each frame the
+     * length it is, both ends equal.  The port comes up at `baud` with
+     * BOARD.CFG's pins.  flags are spi_link_open2's AG_SPILINK_BLOCKS and
+     * AG_SPILINK_DROP, and AG_UARTLINK_DMA; the stats are the SPI link's
      * struct, with blocks_clocked frames sent, blocks_data frames received
      * and timeouts the bytes skipped while looking for a frame.
      */
