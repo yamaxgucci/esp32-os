@@ -1888,9 +1888,11 @@ typedef struct ag_io_api {
                                    uint32_t timeout_ms);
     /*
      * ABI 0.60, block mode: one block in, sent again if lost only when
-     * flags has AG_SPILINK_RELIABLE (a block that is not must fit a frame);
-     * one block out, in the order sent, or a LOST notice for blocks that
-     * were lost and not sent again.
+     * flags has AG_SPILINK_RELIABLE, of any size up to the link's transmit
+     * ring; one block out, in the order sent, or a LOST notice for blocks
+     * that were lost and not sent again.  One writer and one reader a link:
+     * once a call has begun a block it waits for the rest of it, whatever
+     * the timeout, as the stream cannot be cut inside a block.
      */
     int32_t (*spi_link_send)(int bus, const void *buf, size_t len,
                              uint32_t flags, uint32_t timeout_ms);
