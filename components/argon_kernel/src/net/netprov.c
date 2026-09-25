@@ -623,8 +623,16 @@ ag_err_t ag_netprov_use_device(const char *name)
         ag_log(AG_LOG_ERROR, "net", "%s is not a network device", name);
         return -AG_EINVAL;
     }
+    /* The table is the driver's own data: read it counted, like a call.  If
+     * the driver goes between here and the bind, on_revoke does not know it
+     * yet - but the start below cannot hold it, fails, and falls back. */
+    if (!ag_dev_call_begin(dev)) {
+        return -AG_ENODEV;
+    }
     const ag_net_ops_t *ops = (const ag_net_ops_t *)dev->class_ops;
-    if (!ops_complete(ops)) {
+    const bool          complete = ops_complete(ops);
+    ag_dev_call_end(dev);
+    if (!complete) {
         ag_log(AG_LOG_ERROR, "net", "%s: incomplete net ops", name);
         return -AG_ENOTSUP;
     }
