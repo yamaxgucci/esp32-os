@@ -12,6 +12,7 @@
 #include <argon/audio.h>
 #include <argon/board.h>
 #include <argon/cmdline.h>
+#include <argon/devdefault.h>
 #include <argon/codepage.h>
 #include <argon/budget.h>
 #include <argon/console.h>
@@ -1790,8 +1791,69 @@ static void dev_flag_text(uint32_t flags, char *out, size_t len)
  * "what does this board have", which on a system whose whole point is being
  * brought up on an unknown board is the first question anybody asks.
  */
+/*
+ * `dev default [class [name|auto]]` - which device a class uses when a
+ * program names none: where sound comes out, which screen a program draws on.
+ * The names are the ones `dev` lists; a neighbour's devices are in that list
+ * like this board's own, and nothing here asks which wire one is on.
+ */
+static const struct {
+    const char    *word;
+    ag_dev_class_t cls;
+} k_default_classes[] = {
+    {"audio", AG_DEV_AUDIO},
+    {"display", AG_DEV_DISPLAY},
+    {"net", AG_DEV_NET},
+    {"input", AG_DEV_INPUT},
+};
+
+static int cmd_dev_default(int argc, char **argv)
+{
+    const size_t n = sizeof(k_default_classes) / sizeof(k_default_classes[0]);
+    if (argc < 3) {
+        for (size_t i = 0; i < n; i++) {
+            const char *c = ag_dev_default_chosen(k_default_classes[i].cls);
+            ag_console_printf("%-8s %s\n", k_default_classes[i].word,
+                              (c != NULL) ? c : "auto");
+        }
+        return 0;
+    }
+    for (size_t i = 0; i < n; i++) {
+        if (ag_path_icmp(argv[2], k_default_classes[i].word) != 0) {
+            continue;
+        }
+        const ag_dev_class_t cls = k_default_classes[i].cls;
+        if (argc < 4) {
+            const char *c = ag_dev_default_chosen(cls);
+            ag_console_printf("%s\n", (c != NULL) ? c : "auto");
+            return 0;
+        }
+        const bool automatic = ag_path_icmp(argv[3], "auto") == 0;
+        const ag_err_t err = ag_dev_default_choose(cls, automatic ? NULL : argv[3]);
+        if (err != AG_OK) {
+            ag_console_printf("dev default: %s\n",
+                              ag_loader_api()->sys->strerror(err));
+            return 1;
+        }
+        if (automatic) {
+            ag_console_printf("%s: back to the best there is\n", argv[2]);
+        } else if (ag_dev_find(argv[3]) == NULL) {
+            ag_console_printf("%s: %s is not in the list (yet); nothing until it "
+                              "is\n", argv[2], argv[3]);
+        } else {
+            ag_console_printf("%s: %s\n", argv[2], argv[3]);
+        }
+        return 0;
+    }
+    ag_console_puts("usage: dev default [audio|display|net|input [name|auto]]\n");
+    return 1;
+}
+
 static int cmd_dev(int argc, char **argv)
 {
+    if (argc > 1 && ag_path_icmp(argv[1], "default") == 0) {
+        return cmd_dev_default(argc, argv);
+    }
     if (argc > 1) {
         ag_device_t *dev = ag_dev_find(argv[1]);
         if (dev == NULL) {
@@ -5723,7 +5785,8 @@ static const ag_command_t k_commands[] = {
     {"fm", "[left] [right]", "file manager, two panels", cmd_fm},
     {"edit", "[file]", "create or edit a text file", cmd_edit},
     {"gfxdump", "[/live] <file.ppm>", "save framebuffer as PPM", cmd_gfxdump},
-    {"dev", "[name]", "list devices, or describe one", cmd_dev},
+    {"dev", "[name | default [class [name|auto]]]",
+     "list devices, describe one, or choose a class's default", cmd_dev},
     {"drv", "[load|unload|install|uninstall|probe]",
      "modules: list, load, install to C:, unload, I2C probe", cmd_drv},
     {"io", "[pin [mode]] | i2c <bus> | spi <bus> <hex...> | xclk <pin> [hz] | adc [ch]",

@@ -37,6 +37,18 @@ ag_device_t *ag_dev_find_anywhere(const char *name);
  */
 ag_device_t *ag_dev_default(ag_dev_class_t cls, const char *const *prefer);
 
+/*
+ * The operator's choice, at run time: `dev default audio zero.pcm0`.  A name
+ * from the one device list - this board's or a neighbour's, the list does not
+ * say which wire - and it comes before [cluster] in SYSTEM.CFG and before the
+ * class's own preference.  NULL or "" gives the choice back.  -AG_EINVAL for a
+ * class that has no default; the name is not checked, because the device it
+ * names may be a board that has not come up yet.
+ */
+ag_err_t ag_dev_default_choose(ag_dev_class_t cls, const char *name);
+/* What was chosen for the class, or NULL. */
+const char *ag_dev_default_chosen(ag_dev_class_t cls);
+
 #ifdef __cplusplus
 }
 #endif

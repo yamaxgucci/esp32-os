@@ -59,6 +59,53 @@ static const char *cfg_key(ag_dev_class_t cls)
     }
 }
 
+/*
+ * What the operator chose at run time, per class that has a default.  Before
+ * the config: a line typed now means now, and a setting in a file means "when
+ * nobody has said otherwise".
+ */
+#define DEFAULT_CLASSES 4
+static char s_chosen[DEFAULT_CLASSES][AG_DEV_NAME_MAX];
+
+static int chosen_slot(ag_dev_class_t cls)
+{
+    switch (cls) {
+    case AG_DEV_AUDIO:
+        return 0;
+    case AG_DEV_DISPLAY:
+        return 1;
+    case AG_DEV_NET:
+        return 2;
+    case AG_DEV_INPUT:
+        return 3;
+    default:
+        return -1;
+    }
+}
+
+ag_err_t ag_dev_default_choose(ag_dev_class_t cls, const char *name)
+{
+    const int slot = chosen_slot(cls);
+    if (slot < 0) {
+        return -AG_EINVAL;
+    }
+    if (name == NULL || name[0] == '\0') {
+        s_chosen[slot][0] = '\0';
+        return AG_OK;
+    }
+    if (strlen(name) >= sizeof(s_chosen[slot])) {
+        return -AG_EINVAL; /* no device could be registered under it */
+    }
+    strcpy(s_chosen[slot], name);
+    return AG_OK;
+}
+
+const char *ag_dev_default_chosen(ag_dev_class_t cls)
+{
+    const int slot = chosen_slot(cls);
+    return (slot >= 0 && s_chosen[slot][0] != '\0') ? s_chosen[slot] : NULL;
+}
+
 static ag_device_t *named_in_config(ag_dev_class_t cls)
 {
     const char *key = cfg_key(cls);
@@ -110,6 +157,16 @@ ag_device_t *ag_dev_find_anywhere(const char *name)
 
 ag_device_t *ag_dev_default(ag_dev_class_t cls, const char *const *prefer)
 {
+    /*
+     * The chosen device, or nothing: a choice that does not resolve is not
+     * quietly replaced by another device, because "I said the CYD and it
+     * played on the Zero" is the one answer worse than silence.  `dev default`
+     * says so when it is set; the mixer says "nowhere to send sound".
+     */
+    const char *chosen = ag_dev_default_chosen(cls);
+    if (chosen != NULL) {
+        return ag_dev_find(chosen);
+    }
     ag_device_t *d = named_in_config(cls);
     if (d != NULL) {
         return d;

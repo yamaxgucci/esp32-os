@@ -99,8 +99,8 @@ uint32_t ag_proc_unmet_needs(uint32_t axe_flags)
  * runtime: its internal SRAM is one pool seen through two windows, and the
  * static window ends where the code arena and IRAM push it.  The merge of
  * 25 Sep 2026 left the S3 7 400 bytes past that end with nothing wasted;
- * the table is taken at boot from PSRAM where there is some, and from the
- * internal heap where there is not - the same memory the window held.
+ * these 8.9 KB are the same internal memory either way (AG_MEM_FAST), taken
+ * at boot from the heap instead of from the window.
  */
 static proc_t           *s_procs;
 static uint32_t          s_proc_n;
@@ -2288,17 +2288,12 @@ ag_err_t ag_proc_init(void)
     }
 
     /*
-     * PSRAM first where there is some.  Nothing reads the table from an
-     * interrupt (the thread budgets keep slots of their own) and the fault
-     * handler that does read it cannot run with the cache off anyway; on the
-     * S3 these 8.9 KB of internal memory were what a remote device's worker
-     * task then failed to get (nodetest share, 25 Sep 2026).
+     * Internal memory, and NOT PSRAM, measured: the table is walked on almost
+     * every call into the kernel (current(), the owner of every file), and with
+     * it in PSRAM an emulated S3 took 190 s to receive a 4 KB file over its
+     * console and a nodetest pair lost its link (25 Sep 2026).
      */
-    s_procs = ag_port_alloc(sizeof(proc_t) * AG_PROC_MAX,
-                            AG_MEM_SLOW | AG_MEM_BYTE);
-    if (s_procs == NULL) {
-        s_procs = ag_port_alloc(sizeof(proc_t) * AG_PROC_MAX, AG_MEM_FAST);
-    }
+    s_procs = ag_port_alloc(sizeof(proc_t) * AG_PROC_MAX, AG_MEM_FAST);
     if (s_procs == NULL) {
         return -AG_ENOMEM;
     }
