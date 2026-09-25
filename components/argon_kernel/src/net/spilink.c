@@ -354,7 +354,7 @@ static spilink_t *s_link[AG_SPI_BUSES];
 static spilink_t *link_make(int idx)
 {
     if (s_link[idx] == NULL) {
-        spilink_t *s = ag_port_alloc(sizeof(*s), AG_MEM_FAST);
+        spilink_t *s = ag_port_alloc(sizeof(*s), AG_MEM_FAST | AG_MEM_BYTE);
         if (s == NULL) {
             s = ag_port_alloc(sizeof(*s), AG_MEM_BYTE);
         }

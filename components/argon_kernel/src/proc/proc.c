@@ -2293,7 +2293,7 @@ ag_err_t ag_proc_init(void)
      * it in PSRAM an emulated S3 took 190 s to receive a 4 KB file over its
      * console and a nodetest pair lost its link (25 Sep 2026).
      */
-    s_procs = ag_port_alloc(sizeof(proc_t) * AG_PROC_MAX, AG_MEM_FAST);
+    s_procs = ag_port_alloc(sizeof(proc_t) * AG_PROC_MAX, AG_MEM_FAST | AG_MEM_BYTE);
     if (s_procs == NULL) {
         return -AG_ENOMEM;
     }

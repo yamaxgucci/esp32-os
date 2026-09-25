@@ -658,6 +658,7 @@ def main():
         args.gxx = re.sub(r"gcc(\.exe)?$", lambda m: "g++" + (m.group(1) or ""),
                           args.gcc)
 
+    link_arch = []
     # An .AXE is freestanding: it links -nostdlib and carries its own libc
     # (apps/common/libc). Without this, the compiler recognises the standard
     # idioms - and rewrites the shim's own `while (s[n]) n++` into a *call to
@@ -694,6 +695,13 @@ def main():
         # rv32imc is the common denominator: it runs on the C3, and on the C6,
         # whose extra atomics are a superset.  One image for both boards.
         args.cflags += " -march=rv32imc_zicsr_zifencei -mabi=ilp32"
+        # And at the LINK, which picks the libgcc.  Without the pair there the
+        # driver takes its default multilib, whose soft-float helpers read the
+        # rounding mode with `frrm` - an F-extension instruction the C3 does
+        # not have.  TONE was the first image to reach one and died on it with
+        # an illegal instruction (25 Sep 2026); every image that ever divides
+        # two floats would have.
+        link_arch = ["-march=rv32imc_zicsr_zifencei", "-mabi=ilp32"]
 
     if args.arch == "xtensa":
         pass
@@ -741,6 +749,7 @@ def main():
 
         elf_path = os.path.join(workdir, "image.elf")
         ldflags = args.ldflags.split() if args.ldflags else []
+        ldflags += link_arch
         run([args.gcc, "-nostdlib", "-nostartfiles",
              "-Wl,--emit-relocs", "-Wl,-T", script,
              "-Wl,--no-warn-rwx-segments", "-o", elf_path] + ldflags +

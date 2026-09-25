@@ -260,6 +260,14 @@ typedef struct {
     char    qualified[AG_DEV_NAME_MAX];
     int32_t far_handle;
     bool    used;
+    /*
+     * A sound device's two formats: what the caller writes (`in`) and what
+     * goes over the wire and is set on the far device (`wire`).  They differ
+     * when the wire cannot carry the caller's - see fit_to_wire.  Zero rate is
+     * "no format set", and then bytes go through untouched.
+     */
+    uint32_t in_rate, wire_rate;
+    uint8_t  in_ch, wire_ch;
 } rdev_t;
 
 /*
@@ -379,9 +387,9 @@ static uint32_t s_sent_dropped;
  */
 static int32_t pour(rdev_t *p, const void *buf, size_t len, uint64_t off)
 {
-    uint8_t buf2[RD_HDR + RD_MAX_PAYLOAD];
-    if (len > RD_MAX_PAYLOAD) {
-        len = RD_MAX_PAYLOAD;
+    static uint8_t buf2[RD_HDR + RD_POUR_CAP];
+    if (len > RD_POUR_CAP) {
+        len = RD_POUR_CAP;
     }
     buf2[0] = RD_WRITE;
     buf2[1] = RD_F_NOREPLY;
@@ -407,6 +415,101 @@ static int32_t pour(rdev_t *p, const void *buf, size_t len, uint64_t off)
     return (int32_t)len;
 }
 
+/*
+ * SOUND THAT FITS THE WIRE, and all of the caller's period.
+ *
+ * Two faults lived here.  A write was cut to RD_MAX_PAYLOAD (224 bytes), the
+ * size of a request, so a mixer period of 1 764 bytes arrived as its first
+ * eighth: the CYD received a fifth of the stream and played nothing a person
+ * could hear (25 Sep 2026).  It is now sent in pieces of a stream frame.  And
+ * 44.1 kHz stereo is 176 KB/s where the C3-CYD wire carries 82: no piecing
+ * fixes that, so the far device is opened at a format the wire can carry and
+ * the stream is brought down to it here - to one channel first, then halving
+ * the rate - by averaging, which is also the filter the halving needs.  The
+ * caller writes what it always wrote; on a wire that can carry it, nothing is
+ * changed at all.
+ */
+static uint8_t s_fit_buf[RD_POUR_CAP];
+
+static int32_t pour_audio(rdev_t *p, const void *buf, size_t len, uint64_t off)
+{
+    const uint8_t *src = (const uint8_t *)buf;
+    const bool     convert = p->in_rate != 0u && p->wire_rate != 0u &&
+                         (p->in_rate != p->wire_rate || p->in_ch != p->wire_ch);
+    if (!convert) {
+        for (size_t at = 0; at < len;) {
+            const size_t n = (len - at > RD_POUR_CAP) ? RD_POUR_CAP : len - at;
+            (void)pour(p, src + at, n, off + at);
+            at += n;
+        }
+        return (int32_t)len;
+    }
+
+    const uint32_t step = p->in_rate / p->wire_rate; /* 1, 2 or 4 */
+    const size_t   in_frame = (size_t)p->in_ch * 2u;
+    const size_t   frames = len / in_frame;
+    const int16_t *in = (const int16_t *)buf;
+    size_t         out = 0;
+    for (size_t f = 0; f + step <= frames; f += step) {
+        int32_t acc[2] = {0, 0};
+        for (uint32_t k = 0; k < step; k++) {
+            for (uint8_t c = 0; c < p->in_ch; c++) {
+                acc[(p->wire_ch == 1u) ? 0 : c] += in[(f + k) * p->in_ch + c];
+            }
+        }
+        const int32_t div = (int32_t)step * ((p->wire_ch == 1u) ? p->in_ch : 1);
+        for (uint8_t c = 0; c < p->wire_ch; c++) {
+            const int16_t v = (int16_t)(acc[c] / div);
+            s_fit_buf[out++] = (uint8_t)(v & 0xff);
+            s_fit_buf[out++] = (uint8_t)((uint16_t)v >> 8);
+            if (out + 4u > sizeof(s_fit_buf)) {
+                (void)pour(p, s_fit_buf, out, off);
+                out = 0;
+            }
+        }
+    }
+    if (out > 0) {
+        (void)pour(p, s_fit_buf, out, off);
+    }
+    return (int32_t)len;
+}
+
+/*
+ * The format the wire can carry, for a caller's: at most two thirds of what
+ * the link says it sustains, the rest left to everything else on it.
+ */
+static void fit_to_wire(rdev_t *p, const ag_audio_fmt_t *want, ag_audio_fmt_t *far)
+{
+    *far = *want;
+    ag_link_info_t li;
+    uint32_t       room = 0;
+    if (ag_linkprov_info(&li) == AG_OK) {
+        room = li.bytes_per_sec / 3u * 2u;
+    }
+    if (room != 0u) {
+        while ((uint32_t)far->rate * far->channels * 2u > room) {
+            if (far->channels > 1u) {
+                far->channels = 1;
+            } else if (far->rate >= 16000u && want->rate / (far->rate / 2u) <= 4u) {
+                far->rate /= 2u;
+            } else {
+                break;
+            }
+        }
+    }
+    p->in_rate = want->rate;
+    p->in_ch = want->channels;
+    p->wire_rate = far->rate;
+    p->wire_ch = far->channels;
+    if (far->rate != want->rate || far->channels != want->channels) {
+        ag_log(AG_LOG_INFO, TAG,
+               "%s: %u Hz %u ch is more than the wire carries; %u Hz %u ch "
+               "over it",
+               p->qualified, (unsigned)want->rate, (unsigned)want->channels,
+               (unsigned)far->rate, (unsigned)far->channels);
+    }
+}
+
 static int32_t rd_write(ag_device_t *dev, const void *buf, size_t len,
                         uint64_t off)
 {
@@ -414,12 +517,12 @@ static int32_t rd_write(ag_device_t *dev, const void *buf, size_t len,
     if (p == NULL) {
         return -AG_ENODEV;
     }
-    if (len > RD_MAX_PAYLOAD) {
+    if (dev->cls != AG_DEV_AUDIO && len > RD_MAX_PAYLOAD) {
         len = RD_MAX_PAYLOAD;
     }
 
     if (dev->cls == AG_DEV_AUDIO) {
-        return pour(p, buf, len, off);
+        return pour_audio(p, buf, len, off);
     }
 
     /*
@@ -459,6 +562,17 @@ static ag_err_t rd_ioctl(ag_device_t *dev, uint32_t cmd, void *arg,
      * would quietly turn every one of those into a no-op that reports success.
      */
     uint16_t back = (uint16_t)arglen;
+    if (dev->cls == AG_DEV_AUDIO && cmd == AG_IOC_AUDIO_SETFMT && arg != NULL &&
+        arglen >= sizeof(ag_audio_fmt_t) &&
+        ((const ag_audio_fmt_t *)arg)->bits == 16u) {
+        ag_audio_fmt_t far;
+        fit_to_wire(p, (const ag_audio_fmt_t *)arg, &far);
+        back = (uint16_t)sizeof(far);
+        const int32_t r = ask(RD_IOCTL, (uint32_t)p->far_handle, cmd, 0,
+                              AG_LINK_CONTROL, &far, (uint16_t)sizeof(far),
+                              &far, &back);
+        return (r < 0) ? (ag_err_t)r : AG_OK;
+    }
     const int32_t r = ask(RD_IOCTL, (uint32_t)p->far_handle, cmd, 0,
                           AG_LINK_CONTROL, arg, (uint16_t)arglen, arg, &back);
     return (r < 0) ? (ag_err_t)r : AG_OK;
@@ -856,9 +970,13 @@ static ag_port_task_t s_worker;
  * of them.  So one task waits here, and a small ring absorbs the difference
  * between a wire that delivers in bursts and a converter that consumes evenly.
  *
- * Four because that is about forty milliseconds - enough to ride out a burst,
- * short enough that a period which has been waiting that long is already too
- * old to be worth playing.
+ * Ten, not four.  Four was "about forty milliseconds" of 10 ms periods, but a
+ * period is not what arrives: the link packs messages into its frames, and a
+ * 2 KB frame on the C3-CYD wire carries seven 256-byte periods at once.  Four
+ * slots held three of them and dropped the rest - exactly a third of the
+ * C3's sound on the CYD, 1 720 of 5 168 periods, twice, with the wire
+ * perfect (25 Sep 2026).  Ten holds a whole frame's worth and a little more;
+ * 20 KB, taken only on a board that something is poured at.
  *
  * FULL MEANS THE NEWEST IS DROPPED, not the oldest, and that is what makes this
  * safe without a lock: only the reader task moves the write end and only the
@@ -866,7 +984,7 @@ static ag_port_task_t s_worker;
  * that cannot be taken now has missed its moment, which is the same rule the
  * sending side follows.
  */
-#define RD_RING 4
+#define RD_RING 10
 
 typedef struct {
     /*
@@ -1207,11 +1325,35 @@ static void pour_task(void *arg)
                 s_ring_r = (s_ring_r + 1u) % RD_RING;
                 continue;
             }
-            const int32_t n = ag_dev_write(dev, pd->data, pd->len, pd->off);
-            if (n > 0) {
+            /*
+             * All of the period, waiting for room.  A converter's write does
+             * not wait (audio_hw.c says why: its caller may hold the registry)
+             * and takes what fits - so a period that arrived in a burst of
+             * frames found the converter full and was counted lost whole: a
+             * third of the C3's sound on the CYD, with the wire perfect.  This
+             * task holds nothing, so it is the one place that CAN wait; a
+             * period is 10-12 ms, and after 40 without room the rest is given
+             * up on rather than delaying every period behind it.
+             */
+            uint32_t done = 0;
+            for (int waited = 0; done < pd->len && waited < 40;) {
+                const int32_t n = ag_dev_write(dev, pd->data + done,
+                                               pd->len - done, pd->off + done);
+                if (n < 0) {
+                    break;
+                }
+                if (n == 0) {
+                    ag_port_task_delay(ag_port_ms_to_ticks(1));
+                    waited++;
+                    continue;
+                }
+                done += (uint32_t)n;
+            }
+            if (done > 0) {
                 s_pour_periods++;
-                s_pour_bytes += (uint32_t)n;
-            } else {
+                s_pour_bytes += done;
+            }
+            if (done < pd->len) {
                 s_pour_lost++;
             }
         } else {

@@ -1,10 +1,15 @@
 /*
  * ArgonOS - a test tone straight to the audio output.
  *
- * A pure sine into /dev/pcm0, at a frequency, a level and a length you choose:
+ * A pure sine at a frequency, a level and a length you choose, into the
+ * system's sound - wherever `dev default audio` says it comes out, this board
+ * or a neighbour - or into a device you name:
  *
- *   run t:\tone.axe                 440 Hz, level 50, 15 s
+ *   run t:\tone.axe                 440 Hz, level 50, 15 s, the default
  *   run t:\tone.axe 1000 80 20      1 kHz, level 80, 20 s
+ *   run t:\tone.axe 440 60 8 pcm0   this board's own converter, by name
+ *   run t:\tone.axe 440 60 8 cyd.pcm0   a neighbour's, by the name `dev` lists
+ *   run t:\tone.axe sweep 60 30     a glide, 200 -> 1600 -> 200 Hz
  *
  * The level IS the volume: this DAC has no gain of its own, so loudness is the
  * amplitude of the samples and nothing else.  A steady tone is also the
@@ -48,7 +53,14 @@ static int parse_int(const char *s, int def)
 
 int ag_main(int argc, char **argv)
 {
-    int freq = parse_int((argc > 1) ? argv[1] : NULL, 440);
+    /*
+     * "sweep" in place of a frequency: the pitch glides 200 -> 1600 -> 200 Hz,
+     * one way in four seconds.  A dropout on a steady tone is a click; on a
+     * glide it is also a jump in the pitch, so a gap in a stream that crosses
+     * a wire is heard even when it is short.
+     */
+    const bool sweep = (argc > 1) && argv[1][0] == 's';
+    int freq = sweep ? 200 : parse_int((argc > 1) ? argv[1] : NULL, 440);
     int vol  = parse_int((argc > 2) ? argv[2] : NULL, 50);
     int secs = parse_int((argc > 3) ? argv[3] : NULL, 15);
 
@@ -58,31 +70,64 @@ int ag_main(int argc, char **argv)
     if (vol > 100) vol = 100;
     if (secs < 1) secs = 1;
 
+    /*
+     * The mixer by default, not /dev/pcm0: pcm0 is THIS board's converter, and
+     * on a board with none (the C3) the tone had nowhere to go even with a
+     * neighbour's speaker in the device list.  The mixer sends it to the
+     * system's sound device, which is the one `dev default audio` names.
+     */
+    char        path[40] = "/dev/";
+    const char *name = (argc > 4) ? argv[4] : "pcmmix";
+    size_t      at = 5;
+    for (size_t k = 0; name[k] != '\0' && at + 1 < sizeof(path); k++) {
+        path[at++] = name[k];
+    }
+    path[at] = '\0';
+
     const int16_t amp = (int16_t)(32767 * vol / 100);
-    ag_printf("tone: %d Hz, level %d (amp %d), %d s -> /dev/pcm0\n", freq, vol,
-              (int)amp, secs);
+    if (sweep) {
+        ag_printf("tone: sweep 200-1600 Hz, level %d (amp %d), %d s -> %s\n",
+                  vol, (int)amp, secs, path);
+    } else {
+        ag_printf("tone: %d Hz, level %d (amp %d), %d s -> %s\n", freq, vol,
+                  (int)amp, secs, path);
+    }
     ag_printf("Ctrl+C to stop.\n");
 
-    const ag_handle_t h = ag_audio_out_open_dev("/dev/pcm0", RATE_HZ, CHANNELS);
+    const ag_handle_t h = ag_audio_out_open_dev(path, RATE_HZ, CHANNELS);
     if (h < 0) {
-        ag_printf("cannot open /dev/pcm0 (%d) - is [audio] set in BOARD.CFG?\n",
-                  (int)h);
+        ag_printf("cannot open %s (%d)\n", path, (int)h);
         return 1;
     }
 
-    const float    step = 6.2831853f * (float)freq / (float)RATE_HZ;
-    float          phase = 0.0f;
+    /*
+     * The pitch is a ratio per sample: log-linear, so each octave takes the
+     * same time and the glide sounds even rather than rushing at the top.
+     * 200 -> 1600 is three octaves in four seconds.
+     */
+    const float up = powf(1600.0f / 200.0f, 1.0f / (4.0f * (float)RATE_HZ));
+    float       hz = (float)freq;
+    float       dir = up;
+    float       phase = 0.0f;
     const uint64_t want = (uint64_t)secs * RATE_HZ;
     uint64_t       done = 0;
 
     while (done < want && !ag_interrupted()) {
         for (int i = 0; i < FRAMES; i++) {
-            const int16_t s = (int16_t)((float)amp * sinf(phase));
-            s_buf[i * 2] = s;
-            s_buf[i * 2 + 1] = s;
-            phase += step;
+            const int16_t smp = (int16_t)((float)amp * sinf(phase));
+            s_buf[i * 2] = smp;
+            s_buf[i * 2 + 1] = smp;
+            phase += 6.2831853f * hz / (float)RATE_HZ;
             if (phase >= 6.2831853f) {
                 phase -= 6.2831853f;
+            }
+            if (sweep) {
+                hz *= dir;
+                if (hz >= 1600.0f) {
+                    dir = 1.0f / up;
+                } else if (hz <= 200.0f) {
+                    dir = up;
+                }
             }
         }
         const int32_t n = ag_dev_write(h, s_buf, sizeof(s_buf));

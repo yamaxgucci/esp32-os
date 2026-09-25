@@ -197,7 +197,7 @@ ag_err_t ag_log_init(void)
         s_storage = ag_port_alloc(AG_JOURNAL_BYTES, AG_MEM_SLOW | AG_MEM_BYTE);
     }
     if (s_storage == NULL) {
-        s_storage = ag_port_alloc(AG_JOURNAL_BYTES, AG_MEM_FAST);
+        s_storage = ag_port_alloc(AG_JOURNAL_BYTES, AG_MEM_FAST | AG_MEM_BYTE);
     }
     if (s_storage == NULL) {
         return -AG_ENOMEM;

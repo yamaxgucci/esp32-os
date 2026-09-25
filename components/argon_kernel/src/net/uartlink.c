@@ -199,7 +199,7 @@ static uartlink_t *ul_make(int port)
         return NULL;
     }
     if (s_ul[port] == NULL) {
-        uartlink_t *u = ag_port_alloc(sizeof(*u), AG_MEM_FAST);
+        uartlink_t *u = ag_port_alloc(sizeof(*u), AG_MEM_FAST | AG_MEM_BYTE);
         if (u == NULL) {
             u = ag_port_alloc(sizeof(*u), AG_MEM_BYTE);
         }
