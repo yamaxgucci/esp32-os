@@ -78,7 +78,13 @@ $log = 'build\proctest.log'
 
 $t = Transcript $log
 Check $t 'reapwait late: wait 0, code 0, again -2' 'late-wait-gets-the-code'
-Check $t 'reapwait kill: wait -92, code -92, again -2' 'killed-child-kept-for-its-parent'
+# The wait is what is checked, not the code: SPIN listens, and a kill asks
+# first, so the child may end itself (code 0) in the moment between the asking
+# and the deleting - both are a killed child kept for its parent.  The fault
+# this guards against is -2, the child collected before the wait.
+$kill = [regex]::Match($t, 'reapwait kill: wait -92, code (-92|0), again -2')
+Note $kill.Success 'killed-child-kept-for-its-parent' `
+    $(if (-not $kill.Success) { "no 'reapwait kill: wait -92, code -92|0, again -2'" })
 Check $t 'reapwait leave: not waiting' 'parent-left-without-waiting'
 # The LAST ps, which is the one after the orphan had its tick.
 $ps = $t.LastIndexOf('C:\>ps')

@@ -30,6 +30,8 @@
 #include <argon/device.h>
 #include <argon/port/mem.h>
 
+#include "proc/proc_internal.h"
+
 #include "net/rdpaint.h"
 #include <argon/libc.h>
 #include <argon/linkprov.h>
@@ -1415,8 +1417,9 @@ static void on_msg(uint8_t chan, const void *data, uint16_t n, void *ctx)
     memcpy(s_req, b, n);
     s_req_len = n;
     s_working = true;
-    if (!ag_port_task_create(worker, "rdevsrv", 4096, NULL, 1,
-                             AG_PORT_ANY_CORE, 0, &s_worker)) {
+    /* As nodeproc's worker: internal stack, else PSRAM (see there). */
+    if (!ag_proc_task_create(worker, "rdevsrv", 4096, NULL, 1,
+                             AG_PORT_ANY_CORE, &s_worker)) {
         s_working = false;
         reply(b[0], get16(b + 2), -AG_ENOMEM, AG_LINK_CONTROL, NULL, 0);
     }

@@ -18,6 +18,8 @@
 #include <argon/proc.h>
 
 #include <argon/port/mem.h>
+
+#include "proc/proc_internal.h"
 #include <argon/port/task.h>
 #include <argon/port/time.h>
 
@@ -482,8 +484,11 @@ static void serve_run(const uint8_t *payload, uint16_t len)
      * not be a node that stops answering its own user - and the wire's own
      * driver task is below applications for the same reason.
      */
-    if (!ag_port_task_create(run_task, "noderun", 6144, NULL, 1,
-                             AG_PORT_ANY_CORE, 0, &s_run_task)) {
+    /* Internal stack if it can be had, PSRAM if not: after the merge of
+     * 25 Sep 2026 an S3 with a 192 KB code arena had 5 KB internal left and
+     * refused every remote run with -12. */
+    if (!ag_proc_task_create(run_task, "noderun", 6144, NULL, 1,
+                             AG_PORT_ANY_CORE, &s_run_task)) {
         s_serving_run = false;
         (void)send_msg(from, NP_OP_EXIT, -AG_ENOMEM, NULL, 0);
     }

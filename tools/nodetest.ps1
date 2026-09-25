@@ -311,8 +311,15 @@ if ($Scenario -eq 'raw' -or $Scenario -eq 'both') {
     # is the distinction the program exists for: a corrupt block means the line
     # is too fast for the wiring, a lost one means the receiver could not keep
     # up, and they are cured in opposite directions.
+    # Two shapes: the one LINK printed on the cluster line, and main's (since
+    # the merge of 25 Sep 2026 LINK.AXE is main's: `rx bytes= ok=` then
+    # `rx bad= lost= stray=`).  Either is read into the same five numbers.
     $m = [regex]::Match($b,
         'got (\d+) bytes, (\d+) blocks ok, (\d+) corrupt, (\d+) lost, (\d+) stray')
+    if (-not $m.Success) {
+        $m = [regex]::Match($b,
+            'rx bytes=(\d+) ok=(\d+)\s+rx bad=(\d+) lost=(\d+) stray=(\d+)')
+    }
     if (-not $m.Success) {
         $tail = ($b -split "`n" | Where-Object { $_ -match 'block|byte|B/s|arrived' } |
                  Select-Object -Last 4) -join ' | '
@@ -532,10 +539,11 @@ if ($Scenario -eq 'link' -or $Scenario -eq 'both') {
             ("{0} bad" -f $lb.Groups[3].Value)
     }
 
-    # The driver says "listening" only when its service task started (ABI 0.50),
-    # which is the difference between a link and a node: without it nothing
-    # reads the wire unless somebody is inside a `link` command.
-    Check $a 'listening' 'link-service-task-started'
+    # The link is up on its own, not only inside a `link` command.  This used
+    # to be the driver's "listening", said when its own service task started;
+    # since 24 Sep 2026 NODELINK rides the kernel's framed UART link, whose
+    # tasks are the kernel's, and what it says is the port and the baud.
+    Check $a 'nodelink: /dev/node0 on uart1' 'link-service-task-started'
 }
 
 # ------------------------------------------- a program run on the other node ---
@@ -1554,7 +1562,7 @@ if ($Scenario -eq 'link' -or $Scenario -eq 'both') {
     Stop-Emulators
 
     $u = Transcript 'build\nodetest-unload.log'
-    Check $u 'listening' 'unload-task-started'
+    Check $u 'nodelink: /dev/node0 on uart1' 'unload-task-started'
     Check $u 'unloaded NODELINK' 'unload-succeeded'
     Check $u 'node0: no such device' 'unload-device-gone'
     # The binding let go.  "link on node0" here would be the use-after-free.
