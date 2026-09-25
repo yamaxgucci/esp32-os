@@ -65,6 +65,12 @@ typedef struct {
     /* Its data guard has already been reported: say it once, not every tick. */
     bool              guard_said;
     bool              has_waiter; /* somebody is in ag_proc_wait for it      */
+    /*
+     * The process that spawned this one, or AG_PID_KERNEL when the shell, a
+     * driver or the kernel did.  While that process lives, this one's zombie
+     * is kept for it - see held_for_collecting in proc.c.
+     */
+    ag_pid_t          parent;
     volatile bool     signalled;
     jmp_buf           exit_jump;
 
