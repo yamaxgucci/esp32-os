@@ -936,6 +936,34 @@ static ag_err_t copy_args(proc_t *p, int argc, char **argv)
     return AG_OK;
 }
 
+/*
+ * The last thing a process task does: say it is finished and wake whoever is
+ * waiting, AS ONE STEP, under the table lock.
+ *
+ * Two steps is how the C3 died in xclutest on 25 Sep 2026 (`assert failed:
+ * xQueueGenericSend queue.c:936 (pxQueue)`).  ZOMBIE was set first and
+ * p->done read after, and anything between the two - the two log lines of a
+ * failed load, which for a guest go down the wire to the asking node, or
+ * nothing more than a tick - let the supervisor see a zombie that nobody was
+ * waiting for yet and reap it.  reap() frees the semaphore and zeroes the
+ * slot, so this task then gave NULL; had a spawn taken the slot meanwhile, it
+ * would have woken somebody else's waiter instead.  Held open by a 300 ms
+ * pause after ZOMBIE, it failed on the first run of an image for the other
+ * processor, backtrace in proc_task.
+ *
+ * With the lock held nothing can reap in between, and once it is let go the
+ * semaphore has been given and nothing of the slot is touched again - the
+ * stack is the task's own and goes with it.
+ */
+static void proc_finished(proc_t *p)
+{
+    lock();
+    p->state = AG_PS_ZOMBIE;
+    ag_port_sem_give(p->done);
+    unlock();
+    ag_port_task_delete(NULL);
+}
+
 static void proc_task(void *arg)
 {
     proc_t *p = (proc_t *)arg;
@@ -954,15 +982,13 @@ static void proc_task(void *arg)
         p->load_pending = false;
         if (load_err != AG_OK) {
             p->exit_code = (int32_t)load_err;
-            p->state = AG_PS_ZOMBIE;
+            /* Said while the slot is still ours: see proc_finished. */
             ag_log(AG_LOG_ERROR, "proc", "%s (pid %u): %s (%d)",
                    p->name, (unsigned)p->pid, ag_loader_why(load_err),
                    (int)load_err);
             ag_log(AG_LOG_DEBUG, "proc", "%s (pid %u) failed to load: %d",
                    p->name, (unsigned)p->pid, (int)load_err);
-            ag_port_sem_t done_fail = p->done;
-            ag_port_sem_give(done_fail);
-            ag_port_task_delete(NULL);
+            proc_finished(p);
             return;
         }
         apply_task_priority(p);
@@ -984,10 +1010,7 @@ static void proc_task(void *arg)
     const entry_fn entry = (entry_fn)p->app.binding.entry;
     if (entry == NULL) {
         p->exit_code = (int32_t)-AG_EINVAL;
-        p->state = AG_PS_ZOMBIE;
-        ag_port_sem_t done_bad = p->done;
-        ag_port_sem_give(done_bad);
-        ag_port_task_delete(NULL);
+        proc_finished(p);
         return;
     }
 
@@ -997,7 +1020,6 @@ static void proc_task(void *arg)
     /* else: came back through ag_proc_exit, which set exit_code already */
 
     p->stack_unused = (uint32_t)ag_port_task_stack_unused(NULL);
-    p->state = AG_PS_ZOMBIE;
 
     /*
      * The line saying it ended is NOT written here, and where it went instead
@@ -1019,9 +1041,7 @@ static void proc_task(void *arg)
      */
 
     /* Nothing may touch the process after this: whoever waits for it owns it. */
-    ag_port_sem_t done = p->done;
-    ag_port_sem_give(done);
-    ag_port_task_delete(NULL);
+    proc_finished(p);
 }
 
 static proc_t *free_slot(void)
@@ -1071,6 +1091,8 @@ static ag_err_t spawn_common(proc_t *p, uint32_t flags, ag_pid_t *out_pid)
 
     const bool background = (flags & (uint32_t)AG_SPAWN_BACKGROUND) != 0;
     p->state = AG_PS_LOADING;
+    /* Before the task exists: it can be over before this function returns. */
+    p->has_waiter = (flags & AG_SPAWN_KERNEL_WAITS) != 0;
     p->prev_foreground = s_foreground;
     if (!background) {
         s_foreground = p->pid;
@@ -1392,7 +1414,9 @@ ag_err_t ag_proc_exec(const char *path, int argc, char **argv, uint32_t flags,
 {
     ag_pid_t pid = 0;
     ag_err_t err = ag_proc_spawn(path, argc, argv,
-                                 flags & ~(uint32_t)AG_SPAWN_BACKGROUND, &pid);
+                                 (flags & ~(uint32_t)AG_SPAWN_BACKGROUND) |
+                                     AG_SPAWN_KERNEL_WAITS,
+                                 &pid);
     if (err != AG_OK) {
         return err;
     }

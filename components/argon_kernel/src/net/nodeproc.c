@@ -349,7 +349,8 @@ static void run_task(void *arg)
     ag_pid_t pid = 0;
     ag_err_t err = ag_proc_spawn_sink(
         argv[0], argc, argv,
-        (uint32_t)AG_SPAWN_BACKGROUND | (uint32_t)AG_SPAWN_NO_SESSION,
+        (uint32_t)AG_SPAWN_BACKGROUND | (uint32_t)AG_SPAWN_NO_SESSION |
+            AG_SPAWN_KERNEL_WAITS,
         out_sink, NULL, &pid);
     if (err == AG_OK) {
         /*
@@ -427,7 +428,8 @@ static void run_task(void *arg)
             argv[0] = mine;
             err = ag_proc_spawn_sink(
                 argv[0], argc, argv,
-                (uint32_t)AG_SPAWN_BACKGROUND | (uint32_t)AG_SPAWN_NO_SESSION,
+                (uint32_t)AG_SPAWN_BACKGROUND | (uint32_t)AG_SPAWN_NO_SESSION |
+                    AG_SPAWN_KERNEL_WAITS,
                 out_sink, NULL, &pid);
             if (err == AG_OK) {
                 err = serve_guest(pid, &code);

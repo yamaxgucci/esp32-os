@@ -67,6 +67,21 @@ ag_err_t ag_proc_exec(const char *path, int argc, char **argv, uint32_t flags,
 uint32_t ag_proc_unmet_needs(uint32_t axe_flags);
 
 /*
+ * Kernel callers only, never through the ABI: "I am about to ag_proc_wait for
+ * this one".  Spawn then marks the waiter before the task exists.
+ *
+ * Without it there is a gap between the spawn returning and the wait starting,
+ * and a program that is over inside that gap - an image that will not load
+ * here ends in a millisecond - is a zombie nobody waits for.  The supervisor
+ * collects those every 250 ms, and then the wait finds no such pid and answers
+ * -AG_ENOENT instead of the program's own code.  For a run served to another
+ * node that is the difference between "built for another processor, run my
+ * own build" and "did not run": the cascade reads that code.  The task that
+ * waits there is below applications, so the gap is widest exactly there.
+ */
+#define AG_SPAWN_KERNEL_WAITS (1u << 31)
+
+/*
  * Starts it and returns its pid without waiting.  Image load runs on the new
  * process task so the caller (shell) is not blocked on HostFS/XIP.
  */

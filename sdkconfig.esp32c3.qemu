@@ -57,3 +57,11 @@ CONFIG_ESP32C3_REV_MIN_0=y
 # later rather than a clean panic here, so it is worth remembering that this
 # line exists.  The board build keeps the guard.
 CONFIG_ESP_SYSTEM_HW_STACK_GUARD=n
+
+# A BACKTRACE IN THE PANIC.  Without it a RISC-V panic prints the registers of
+# the panic handler itself - MEPC in panic_abort, RA one frame up in the same
+# file - and the caller that actually failed is somewhere in a stack dump that
+# only `idf.py monitor` can decode.  With the unwind tables in the image the
+# chip walks its own stack and prints the chain.  It costs flash, not RAM, and
+# only here.
+CONFIG_ESP_SYSTEM_USE_EH_FRAME=y
