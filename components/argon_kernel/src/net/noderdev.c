@@ -446,7 +446,10 @@ static uint8_t s_fit_buf[RD_POUR_CAP];
  * PACE_LEAD_US ahead of the clock, which is also the cushion the far board
  * starts with.
  */
-#define PACE_LEAD_US 80000
+/* Half the far ring (10 periods of 5.8 ms): 80 ms was more than the ring held,
+ * so it sat full, the receiver paced frames out (508 in 15 s) and a person
+ * heard each one as a click. */
+#define PACE_LEAD_US 30000
 
 static void pace_audio(rdev_t *p, size_t len)
 {
