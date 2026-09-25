@@ -677,6 +677,16 @@ uint32_t ag_port_uart_dma_overruns(int port)
     return 0u;
 }
 
+int32_t ag_port_uart_dma_read(int port, void *buf, size_t len,
+                              uint32_t timeout_ms)
+{
+    (void)port;
+    (void)buf;
+    (void)len;
+    (void)timeout_ms;
+    return -AG_ENOTSUP;
+}
+
 int32_t ag_port_uart_dma_write(int port, const void *buf, size_t len)
 {
     (void)port;

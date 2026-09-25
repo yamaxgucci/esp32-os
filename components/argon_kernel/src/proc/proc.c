@@ -90,7 +90,20 @@ uint32_t ag_proc_unmet_needs(uint32_t axe_flags)
 /* How long a process is given to leave the kernel before it is killed anyway. */
 #define AG_PROC_KILL_GRACE_MS 500
 
-static proc_t            s_procs[AG_PROC_MAX];
+/*
+ * The table, on the heap from ag_proc_init, and walked only up to s_proc_n -
+ * zero until then, so a lookup before it exists (a fault early in the boot)
+ * finds nobody rather than a NULL.
+ *
+ * Not static storage, and the reason is the ESP32-S3's link and not the
+ * runtime: its internal SRAM is one pool seen through two windows, and the
+ * static window ends where the code arena and IRAM push it.  The merge of
+ * 25 Sep 2026 left the S3 7 400 bytes past that end with nothing wasted;
+ * these 8.9 KB are the same internal memory either way (AG_MEM_FAST), taken
+ * at boot from the heap instead of from the window.
+ */
+static proc_t           *s_procs;
+static uint32_t          s_proc_n;
 static ag_port_mutex_t        s_lock;
 static ag_pid_t          s_next_pid = 1;
 static ag_pid_t          s_foreground = AG_PID_KERNEL;
@@ -165,13 +178,13 @@ static proc_t *current(void)
 {
     const ag_port_task_t me = ag_port_task_self();
 
-    for (uint32_t i = 0; i < AG_PROC_MAX; i++) {
+    for (uint32_t i = 0; i < s_proc_n; i++) {
         if (s_procs[i].used && s_procs[i].task == me) {
             return &s_procs[i];
         }
     }
 
-    for (uint32_t i = 0; i < AG_PROC_MAX; i++) {
+    for (uint32_t i = 0; i < s_proc_n; i++) {
         proc_t *p = &s_procs[i];
         if (!p->used) {
             continue;
@@ -193,7 +206,7 @@ static proc_t *by_pid(ag_pid_t pid)
     if (pid == AG_PID_KERNEL) {
         return NULL;
     }
-    for (uint32_t i = 0; i < AG_PROC_MAX; i++) {
+    for (uint32_t i = 0; i < s_proc_n; i++) {
         if (s_procs[i].used && s_procs[i].pid == pid) {
             return &s_procs[i];
         }
@@ -1131,7 +1144,7 @@ static void proc_task(void *arg)
 
 static proc_t *free_slot(void)
 {
-    for (uint32_t i = 0; i < AG_PROC_MAX; i++) {
+    for (uint32_t i = 0; i < s_proc_n; i++) {
         if (!s_procs[i].used) {
             return &s_procs[i];
         }
@@ -1591,7 +1604,7 @@ uint32_t ag_proc_check_guards(void)
      * supervisor, which must not be the task holding it while that happens.
      */
     lock();
-    for (uint32_t i = 0; i < AG_PROC_MAX && n < AG_PROC_MAX; i++) {
+    for (uint32_t i = 0; i < s_proc_n && n < AG_PROC_MAX; i++) {
         proc_t *p = &s_procs[i];
         if (!p->used || p->state == AG_PS_ZOMBIE || p->guard_said) {
             continue;
@@ -1711,7 +1724,7 @@ uint32_t ag_proc_reap_finished(void)
     uint32_t reaped = 0;
 
     lock();
-    for (uint32_t i = 0; i < AG_PROC_MAX; i++) {
+    for (uint32_t i = 0; i < s_proc_n; i++) {
         proc_t *p = &s_procs[i];
         if (!p->used || p->state != AG_PS_ZOMBIE || p->has_waiter) {
             continue;
@@ -1757,7 +1770,7 @@ ag_err_t ag_proc_set_foreground(ag_pid_t pid)
 uint32_t ag_proc_count(void)
 {
     uint32_t n = 0;
-    for (uint32_t i = 0; i < AG_PROC_MAX; i++) {
+    for (uint32_t i = 0; i < s_proc_n; i++) {
         if (s_procs[i].used) {
             n++;
         }
@@ -1789,7 +1802,7 @@ ag_err_t ag_proc_info(uint32_t index, ag_procinfo_t *out)
 
     lock();
     uint32_t seen = 0;
-    for (uint32_t i = 0; i < AG_PROC_MAX; i++) {
+    for (uint32_t i = 0; i < s_proc_n; i++) {
         const proc_t *p = &s_procs[i];
         if (!p->used) {
             continue;
@@ -2184,7 +2197,7 @@ ag_pid_t ag_proc_overdue(uint32_t *late_by_ms)
     uint32_t       late = 0;
 
     lock();
-    for (uint32_t i = 0; i < AG_PROC_MAX; i++) {
+    for (uint32_t i = 0; i < s_proc_n; i++) {
         const proc_t *p = &s_procs[i];
 
         if (!p->used || p->watchdog_ms == 0) {
@@ -2221,7 +2234,12 @@ ag_err_t ag_proc_init(void)
         return -AG_ENOMEM;
     }
 
-    memset(s_procs, 0, sizeof(s_procs));
+    s_procs = ag_port_alloc(sizeof(proc_t) * AG_PROC_MAX, AG_MEM_FAST);
+    if (s_procs == NULL) {
+        return -AG_ENOMEM;
+    }
+    memset(s_procs, 0, sizeof(proc_t) * AG_PROC_MAX);
+    s_proc_n = AG_PROC_MAX;
     s_foreground = AG_PID_KERNEL;
 
     /* From now on the VFS knows whose files it is holding. */

@@ -211,3 +211,10 @@ CONFIG_ARGON_CONSOLE_ROWS=25
 # its sdkconfig said forty.  A number here is only worth writing now that it
 # arrives.
 CONFIG_ARGON_DEV_MAX=48
+
+# The timer task at 2 KB, not 4.  Its one client on this board is the kernel's
+# lock watch (ag_port_lockwatch_start: a line a second at most, formatted into
+# 160 bytes), there is no radio here to add others, and measured it had used
+# 225 bytes of the 4089 it was given - on a board where the merge of 25 Sep 2026
+# had just cost twelve kilobytes of heap.
+CONFIG_ESP_TIMER_TASK_STACK_SIZE=2048

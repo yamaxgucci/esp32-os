@@ -45,8 +45,15 @@
  * frame store below, and about two kilobytes for its own state.  The file is
  * read into a buffer that GROWS rather than one sized for the largest
  * imaginable image, so a two-kilobyte program costs two kilobytes.
+ *
+ * 32 KB since 25 Sep 2026: the merge with main cost the C3 twelve kilobytes of
+ * heap (the VFS miss cache, the thread budgets, the timer task behind the lock
+ * watch), its largest block after the wire driver came down to 40 KB, and 48
+ * was refused again in exactly the place described above.  8 KB of frames,
+ * the file and the data part of the programs in this tree, and the state, fit
+ * in 32 with room.
  */
-AG_APP_SIZED("AGVM", "1.0", "argon", 0, 8 * 1024, 48 * 1024);
+AG_APP_SIZED("AGVM", "1.0", "argon", 0, 8 * 1024, 32 * 1024);
 
 /*
  * The frame store, and why it is one block taken up front.

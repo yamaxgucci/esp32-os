@@ -12,18 +12,24 @@
 
 #include <argon/port/log.h>
 #include <argon/port/time.h>
+#include <argon/port/mem.h>
 #include <argon/port/sync.h>
 #include <argon/port/task.h>
 
 /*
- * Static storage, in internal RAM, available before any allocator has run.  4 KB
- * is roughly two hundred lines: enough to hold a whole boot plus recent history,
- * which is what the journal is for.  It is charged against the kernel's memory
- * budget deliberately - see docs/00-architecture.md section 10.
+ * 4 KB is roughly two hundred lines: enough to hold a whole boot plus recent
+ * history, which is what the journal is for.  It is charged against the
+ * kernel's memory budget deliberately - see docs/00-architecture.md section 10.
+ *
+ * Taken at ag_log_init, in PSRAM where there is some: nothing reads it from an
+ * interrupt, and a line is not stored before init anyway (s_ready).  It was
+ * static internal RAM until the ESP32-S3's static window ran out (25 Sep 2026,
+ * see s_procs in proc.c); on the S3 this is also 4 KB the internal heap gets
+ * back, and on a board without PSRAM it is the same internal memory as before.
  */
 #define AG_JOURNAL_BYTES 4096
 
-static char         s_storage[AG_JOURNAL_BYTES];
+static char        *s_storage;
 static ag_journal_t s_journal;
 static bool         s_echo = true;
 static bool         s_ready;
@@ -187,8 +193,17 @@ static int log_vprintf(const char *fmt, va_list ap)
 
 ag_err_t ag_log_init(void)
 {
+    if (s_storage == NULL) {
+        s_storage = ag_port_alloc(AG_JOURNAL_BYTES, AG_MEM_SLOW | AG_MEM_BYTE);
+    }
+    if (s_storage == NULL) {
+        s_storage = ag_port_alloc(AG_JOURNAL_BYTES, AG_MEM_FAST);
+    }
+    if (s_storage == NULL) {
+        return -AG_ENOMEM;
+    }
     const ag_err_t err = ag_journal_init(&s_journal, s_storage,
-                                         sizeof(s_storage));
+                                         AG_JOURNAL_BYTES);
     if (err != AG_OK) {
         return err;
     }
