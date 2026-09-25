@@ -584,6 +584,13 @@ switch ($Command.ToLowerInvariant()) {
         exit $LASTEXITCODE
     }
 
+    'proctest' {
+        # Who collects a finished process: a parent slow to wait still gets its
+        # child's code, a killed child is kept for it, an orphan is swept up.
+        Invoke-Ps1 (Join-Path $PSScriptRoot 'proctest.ps1') $Rest
+        exit $LASTEXITCODE
+    }
+
     'nodetest' {
         # Two whole ArgonOS kernels in two emulators, their UART1 ports joined
         # to each other, measured with apps\link - the cluster's wire, with no

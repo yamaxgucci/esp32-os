@@ -1102,8 +1102,9 @@ static ag_pid_t api_spawn(const char *path, int argc, const char **argv,
                           uint32_t flags)
 {
     ag_pid_t       pid = 0;
-    /* An application that set the kernel's own bit and never waited would
-     * leave a zombie that nothing ever collects. */
+    /* The kernel's own bit is not for applications: their children are kept
+     * for them by parentage instead (held_for_collecting in proc.c), and one
+     * that set it and never waited would leave a zombie nothing collects. */
     const ag_err_t err = ag_proc_spawn(path, argc, (char **)argv,
                                        flags & ~AG_SPAWN_KERNEL_WAITS, &pid);
 

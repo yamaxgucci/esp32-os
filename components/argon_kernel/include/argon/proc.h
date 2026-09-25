@@ -78,6 +78,11 @@ uint32_t ag_proc_unmet_needs(uint32_t axe_flags);
  * node that is the difference between "built for another processor, run my
  * own build" and "did not run": the cascade reads that code.  The task that
  * waits there is below applications, so the gap is widest exactly there.
+ *
+ * An application has no such bit: a zombie is kept for the process that
+ * spawned it for as long as that process lives, which closes the same gap
+ * for every program without asking anything of it.  The kernel's waiters are
+ * not processes, so they need the bit.
  */
 #define AG_SPAWN_KERNEL_WAITS (1u << 31)
 

@@ -1093,6 +1093,8 @@ static ag_err_t spawn_common(proc_t *p, uint32_t flags, ag_pid_t *out_pid)
     p->state = AG_PS_LOADING;
     /* Before the task exists: it can be over before this function returns. */
     p->has_waiter = (flags & AG_SPAWN_KERNEL_WAITS) != 0;
+    const proc_t *spawner = current();
+    p->parent = (spawner != NULL) ? spawner->pid : AG_PID_KERNEL;
     p->prev_foreground = s_foreground;
     if (!background) {
         s_foreground = p->pid;
@@ -1494,6 +1496,33 @@ ag_err_t ag_proc_signal(ag_pid_t pid)
     return AG_OK;
 }
 
+/*
+ * True while somebody other than the supervisor will collect this process:
+ * a waiter inside ag_proc_wait, or the process that spawned it, for as long as
+ * that one lives.  Called with the table locked.
+ *
+ * The parent half is what Unix does with zombies, and for the same reason.  An
+ * application's spawn and its wait are two calls, and between them it is not
+ * waiting - a program that ends inside that gap (an image that will not load
+ * ends in a millisecond) was collected by the supervisor, and the wait that
+ * followed answered -AG_ENOENT instead of the child's code.  A wait taken in
+ * slices has the gap again between every slice, and the desktop waits in
+ * slices of 200 ms so that Ctrl+C can reach the child: a kill there found
+ * nobody waiting and collected the child on the spot, and the desktop then
+ * waited for ever for a pid that no longer existed.  The kernel's own waiters
+ * mark themselves at spawn (AG_SPAWN_KERNEL_WAITS); an application cannot, so
+ * its children are kept for it instead.
+ *
+ * The price is Unix's too: a program that spawns and never waits keeps its
+ * finished children's slots until it ends itself.  When it does, the next
+ * supervisor tick finds them with no parent and collects them.  Pids are never
+ * reused, so a parent that is gone cannot be mistaken for a new process.
+ */
+static bool held_for_collecting(const proc_t *p)
+{
+    return p->has_waiter || by_pid(p->parent) != NULL;
+}
+
 ag_err_t ag_proc_kill(ag_pid_t pid, const char *reason)
 {
     lock();
@@ -1559,22 +1588,22 @@ ag_err_t ag_proc_kill(ag_pid_t pid, const char *reason)
     p->state = AG_PS_ZOMBIE;
 
     /*
-     * Whoever is waiting for it owns the collecting, so it is woken; with nobody
-     * waiting, the killer does it here and now, so that ps right after a kill
+     * Whoever will collect it owns the collecting - a waiter, or a parent that
+     * may wait later - so the token is given and the slot left alone.  With
+     * nobody, the killer does it here and now, so that ps right after a kill
      * shows the truth rather than a corpse the supervisor has not swept up yet.
+     *
+     * Given under the lock, as proc_finished does: once the lock is let go a
+     * held zombie is its collector's, and may already be gone.
      */
-    ag_port_sem_t done = p->done;
-    const bool        waited_for = p->has_waiter;
-    if (!waited_for) {
+    if (held_for_collecting(p)) {
+        ag_port_sem_give(p->done);
+    } else {
         reap(p);
     }
     unlock();
 
     console_restore();
-
-    if (waited_for && done != NULL) {
-        ag_port_sem_give(done);
-    }
     return AG_OK;
 }
 
@@ -1585,7 +1614,7 @@ uint32_t ag_proc_reap_finished(void)
     lock();
     for (uint32_t i = 0; i < AG_PROC_MAX; i++) {
         proc_t *p = &s_procs[i];
-        if (!p->used || p->state != AG_PS_ZOMBIE || p->has_waiter) {
+        if (!p->used || p->state != AG_PS_ZOMBIE || held_for_collecting(p)) {
             continue;
         }
         reap(p);
