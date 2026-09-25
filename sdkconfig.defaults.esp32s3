@@ -74,3 +74,12 @@ CONFIG_ARGON_ENABLE_AUDIO=y
 # devices.  USB-serial-JTAG becomes an additional console endpoint at runtime
 # once the console multiplexer exists.
 CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+
+# mDNS - its task and its buffers - in PSRAM, which every S3 here has.  It
+# answers <hostname>.local a few times a minute; nothing about that needs
+# internal memory, and on this chip internal memory is what is short: after
+# the merge of 25 Sep 2026 the responder's 4 KB internal stack was the
+# difference between a nodetest guest starting the 6 KB task a remote run is
+# served on and refusing it with -12.
+CONFIG_MDNS_TASK_CREATE_FROM_SPIRAM=y
+CONFIG_MDNS_MEMORY_ALLOC_SPIRAM=y

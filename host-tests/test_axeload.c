@@ -271,6 +271,23 @@ static void test_validate(void)
     AG_CHECK_INT(ag_axe_validate(h, a.size, AG_ARCH_XTENSA, h->abi_major,
                                  (uint16_t)(h->abi_minor - 1)),
                  -AG_EABI);
+
+    /* The cluster line's pre-merge numbers (0.53..0.62) read a table that
+     * moved; main's (up to 0.52) and 0.63 on are the ones a 0.63 kernel runs. */
+    {
+        ag_axe_header_t *w = (ag_axe_header_t *)(void *)h;
+        const uint16_t   was = w->abi_minor;
+        w->abi_minor = 60u;
+        AG_CHECK_INT(ag_axe_validate(h, a.size, AG_ARCH_XTENSA, 0u, 63u),
+                     -AG_EABI);
+        w->abi_minor = 53u;
+        AG_CHECK_INT(ag_axe_validate(h, a.size, AG_ARCH_XTENSA, 0u, 63u),
+                     -AG_EABI);
+        w->abi_minor = 52u;
+        AG_CHECK_INT(ag_axe_validate(h, a.size, AG_ARCH_XTENSA, 0u, 63u),
+                     AG_OK);
+        w->abi_minor = was;
+    }
     AG_CHECK_INT(ag_axe_validate(h, a.size, AG_ARCH_XTENSA,
                                  (uint16_t)(h->abi_major + 1), h->abi_minor),
                  -AG_EABI);

@@ -152,7 +152,7 @@ extern "C" {
 #define ABI_MINOR_GFX26  26
 #define ABI_MINOR_FOCUS  20
 #define ABI_MINOR_CLUSTER 63 /* 0.52 on main's line is a kernel without clu */
-#define ABI_MINOR_MIGRATE 53
+#define ABI_MINOR_MIGRATE 63 /* 53 is a pre-merge cluster number the loader now refuses */
 
 /*
  * Which machine to write instructions for.  The numbers are ag_axe_arch_t's,
