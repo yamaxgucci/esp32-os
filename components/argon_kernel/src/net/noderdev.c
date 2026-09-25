@@ -287,6 +287,8 @@ struct rdev {
     /* where it is: this board's wire to it, and the node's name hash */
     int32_t  wire;
     uint16_t node;
+    /* whose it is: a neighbour (the wire's index) or a node beyond one */
+    int8_t   src;
     /* a screen, and a panel rather than a buffer (see pick_display) */
     bool     display;
     bool     panel;
@@ -1782,8 +1784,28 @@ ag_err_t ag_noderdev_serve(void)
  * One owner token per wire: ag_dev_revoke_owner takes a neighbour's devices
  * out and leaves everybody else's.
  */
-static uint8_t s_owner_tok[AG_LINK_WIRES];
-static bool    s_attached_on[AG_LINK_WIRES];
+/*
+ * AND BEYOND THEM.  A node two hops away - the CYD, seen from the Zero across
+ * the C3 - is a source of devices like a neighbour, reached out of the wire it
+ * is heard through and addressed by its own name, so the board in between
+ * passes every question on and every answer back.  Its sources come after the
+ * wires': RD_FAR of them, learned from the cluster's list of far nodes.
+ */
+#define RD_FAR  4
+#define RD_SRCS ((int32_t)AG_LINK_WIRES + RD_FAR)
+static uint8_t s_owner_tok[RD_SRCS];
+static bool    s_attached_on[RD_SRCS];
+static int32_t s_far_wire[RD_FAR];
+static char    s_far_name[RD_FAR][AG_NODE_NAME_MAX];
+/*
+ * When a far node's devices last failed to attach, and so when to ask again.
+ * The cluster's list of far nodes comes every two seconds and each one is a
+ * chance; the CYD heard of the Zero while the Zero was still restarting, its
+ * three tries timed out, and it never asked again (26 Sep 2026).
+ */
+#define RD_FAR_RETRY_MS 30000u
+static uint32_t s_far_failed_ms[RD_FAR];
+static bool     s_far_failed[RD_FAR];
 
 /*
  * The screen, chosen among every neighbour's: A PANEL BEATS A BUFFER IN
@@ -1816,14 +1838,14 @@ static void pick_display(void)
     }
 }
 
-static uint32_t detach_wire(int32_t wire)
+static uint32_t detach_src(int32_t src)
 {
-    if (wire < 0 || wire >= (int32_t)AG_LINK_WIRES) {
+    if (src < 0 || src >= RD_SRCS) {
         return 0;
     }
-    const uint32_t gone = ag_dev_revoke_owner((const void *)&s_owner_tok[wire]);
+    const uint32_t gone = ag_dev_revoke_owner((const void *)&s_owner_tok[src]);
     for (int i = 0; s_proxy != NULL && i < RD_MAX_PROXIES; i++) {
-        if (s_proxy[i].used && s_proxy[i].wire == wire) {
+        if (s_proxy[i].used && s_proxy[i].src == src) {
             if (s_display_proxy == &s_proxy[i]) {
                 s_display_proxy = NULL;
                 s_display_real = false;
@@ -1831,12 +1853,12 @@ static uint32_t detach_wire(int32_t wire)
             memset(&s_proxy[i], 0, sizeof(s_proxy[i]));
         }
     }
-    s_attached_on[wire] = false;
+    s_attached_on[src] = false;
     pick_display();
     return gone;
 }
 
-static int32_t attach_locked(int32_t wire, uint32_t timeout_ms);
+static int32_t attach_locked(int32_t src, uint32_t timeout_ms);
 
 /*
  * One attach at a time: the shell's `link devs` and the docking task can both
@@ -1844,7 +1866,7 @@ static int32_t attach_locked(int32_t wire, uint32_t timeout_ms);
  */
 static ag_port_mutex_t s_att_lock;
 
-int32_t ag_noderdev_attach_on(int32_t wire, uint32_t timeout_ms)
+static int32_t attach_src(int32_t src, uint32_t timeout_ms)
 {
     if (s_att_lock == NULL) {
         s_att_lock = ag_port_mutex_new();
@@ -1855,19 +1877,33 @@ int32_t ag_noderdev_attach_on(int32_t wire, uint32_t timeout_ms)
     if (!ag_port_mutex_take(s_att_lock, ag_port_ms_to_ticks(20000))) {
         return -AG_EBUSY;
     }
-    const int32_t r = attach_locked(wire, timeout_ms);
+    const int32_t r = attach_locked(src, timeout_ms);
     (void)ag_port_mutex_give(s_att_lock);
     return r;
 }
 
-static int32_t attach_locked(int32_t wire, uint32_t timeout_ms)
+int32_t ag_noderdev_attach_on(int32_t wire, uint32_t timeout_ms)
 {
+    if (wire < 0 || wire >= (int32_t)AG_LINK_WIRES) {
+        return -AG_ENODEV;
+    }
+    return attach_src(wire, timeout_ms);
+}
+
+static int32_t attach_locked(int32_t src, uint32_t timeout_ms)
+{
+    if (src < 0 || src >= RD_SRCS) {
+        return -AG_EINVAL;
+    }
+    const bool    far = src >= (int32_t)AG_LINK_WIRES;
+    const int32_t wire = far ? s_far_wire[src - (int32_t)AG_LINK_WIRES] : src;
     if (wire < 0 || wire >= (int32_t)AG_LINK_WIRES ||
         ag_linkprov_name_at(wire) == NULL) {
         return -AG_ENODEV;
     }
-    const char *peer = ag_node_peer_name_at(wire);
-    if (peer == NULL) {
+    const char *peer = far ? s_far_name[src - (int32_t)AG_LINK_WIRES]
+                           : ag_node_peer_name_at(wire);
+    if (peer == NULL || peer[0] == '\0') {
         /*
          * No name, no qualified names - and a proxy called `pcm0` beside this
          * node's own `pcm0` is exactly the ambiguity the naming scheme exists
@@ -1906,7 +1942,9 @@ static int32_t attach_locked(int32_t wire, uint32_t timeout_ms)
     if (info == NULL) {
         return -AG_ENOMEM;
     }
-    const int32_t n = ag_nodedev_list_on(wire, info, RD_MAX_PROXIES, timeout_ms);
+    const uint16_t node = ag_node_hash(pn);
+    const int32_t  n =
+        ag_nodedev_list_to(wire, node, info, RD_MAX_PROXIES, timeout_ms);
     if (n < 0) {
         ag_port_free(info);
         return n;
@@ -1914,7 +1952,7 @@ static int32_t attach_locked(int32_t wire, uint32_t timeout_ms)
 
     /* What was there before goes first: a neighbour that says hello again has
      * started over, and every handle it gave out is gone with it. */
-    (void)detach_wire(wire);
+    (void)detach_src(src);
 
     int32_t made = 0;
     int32_t skipped = 0;
@@ -1997,7 +2035,8 @@ static int32_t attach_locked(int32_t wire, uint32_t timeout_ms)
         p->far_handle = -1;
         p->used = true;
         p->wire = wire;
-        p->node = ag_node_hash(pn);
+        p->node = node;
+        p->src = (int8_t)src;
         /*
          * A display gets the class vtable as well as the byte one.  Without it
          * the graphics layer walks past this device and the screen on the
@@ -2015,7 +2054,7 @@ static int32_t attach_locked(int32_t wire, uint32_t timeout_ms)
             .ops = &k_proxy_ops,
             .class_ops = p->display ? (const void *)&k_proxy_display_ops : NULL,
             .priv = p,
-            .owner = (const void *)&s_owner_tok[wire],
+            .owner = (const void *)&s_owner_tok[src],
         };
         const ag_err_t re = ag_dev_register(&desc, NULL);
         if (re != AG_OK) {
@@ -2038,10 +2077,10 @@ static int32_t attach_locked(int32_t wire, uint32_t timeout_ms)
         made++;
     }
     ag_port_free(info);
-    s_attached_on[wire] = (made > 0);
+    s_attached_on[src] = (made > 0);
     pick_display();
-    ag_log(AG_LOG_INFO, TAG, "%d device(s) of %s are here now (wire %s)",
-           (int)made, pn, ag_linkprov_name_at(wire));
+    ag_log(AG_LOG_INFO, TAG, "%d device(s) of %s are here now (%s %s)",
+           (int)made, pn, far ? "through" : "wire", ag_linkprov_name_at(wire));
     if (skipped > 0) {
         ag_log(AG_LOG_INFO, TAG,
                "%d more are %s's own neighbours', reached through it, not "
@@ -2063,8 +2102,8 @@ int32_t ag_noderdev_attach(uint32_t timeout_ms)
 uint32_t ag_noderdev_detach(void)
 {
     uint32_t gone = 0;
-    for (int32_t w = 0; w < (int32_t)AG_LINK_WIRES; w++) {
-        gone += detach_wire(w);
+    for (int32_t src = 0; src < RD_SRCS; src++) {
+        gone += detach_src(src);
     }
     return gone;
 }
@@ -2126,7 +2165,7 @@ static void attach_task(void *arg)
             w++;
         }
         s_want &= ~(1u << w);
-        s_att_wire = w;
+        s_att_wire = w; /* a source, which for a neighbour is its wire */
         /*
          * Three tries a second apart.  The neighbour that has just said hello
          * is still starting its own services, and a listing it has no answer
@@ -2134,24 +2173,33 @@ static void attach_task(void *arg)
          */
         int32_t r = -AG_ETIMEDOUT;
         for (int t = 0; t < 3; t++) {
-            r = ag_noderdev_attach_on(w, 4000u);
+            r = attach_src(w, 4000u);
             if (r >= 0 || (r != -AG_ETIMEDOUT && r != -AG_EAGAIN &&
                            r != -AG_EBUSY)) {
                 break;
             }
             ag_port_task_delay(ag_port_ms_to_ticks(1000));
         }
+        if (w >= (int32_t)AG_LINK_WIRES) {
+            const int k = (int)(w - (int32_t)AG_LINK_WIRES);
+            s_far_failed[k] = (r < 0);
+            s_far_failed_ms[k] = (uint32_t)(ag_port_us() / 1000);
+        }
         if (r < 0) {
             ag_log(AG_LOG_WARN, TAG,
-                   "%s's devices did not attach: %d (`link devs` asks again)",
-                   ag_node_peer_name_at(w) != NULL ? ag_node_peer_name_at(w)
-                                                   : "the neighbour",
+                   "%s's devices did not attach: %d (asked again later)",
+                   w >= (int32_t)AG_LINK_WIRES
+                       ? s_far_name[w - (int32_t)AG_LINK_WIRES]
+                   : ag_node_peer_name_at(w) != NULL ? ag_node_peer_name_at(w)
+                                                     : "the neighbour",
                    (int)r);
         }
         s_att_wire = -1;
     }
     ag_port_task_delete(NULL);
 }
+
+static void want_src(int32_t src);
 
 void ag_noderdev_peer_named(int32_t wire, bool again)
 {
@@ -2168,7 +2216,12 @@ void ag_noderdev_peer_named(int32_t wire, bool again)
                    (s_want & (1u << wire)) != 0u)) {
         return;
     }
-    s_want |= (1u << wire);
+    want_src(wire);
+}
+
+static void want_src(int32_t src)
+{
+    s_want |= (1u << src);
     if (s_att_running) {
         return;
     }
@@ -2180,4 +2233,44 @@ void ag_noderdev_peer_named(int32_t wire, bool again)
         ag_log(AG_LOG_WARN, TAG, "no task to attach the neighbour's devices; "
                                  "`link devs` does it by hand");
     }
+}
+
+void ag_noderdev_far_named(int32_t via, const char *name)
+{
+    if (!s_auto || via < 0 || via >= (int32_t)AG_LINK_WIRES || name == NULL ||
+        name[0] == '\0' || strlen(name) >= AG_NODE_NAME_MAX) {
+        return;
+    }
+    int free_slot = -1;
+    for (int k = 0; k < RD_FAR; k++) {
+        if (strcmp(s_far_name[k], name) == 0) {
+            if (s_far_wire[k] == via &&
+                (s_attached_on[(int32_t)AG_LINK_WIRES + k] ||
+                 s_att_wire == (int32_t)AG_LINK_WIRES + k ||
+                 (s_want & (1u << ((int32_t)AG_LINK_WIRES + k))) != 0u)) {
+                return; /* heard of again, and already here or on its way */
+            }
+            /* a failure is asked again, but not at every list */
+            if (s_far_wire[k] == via && s_far_failed[k] &&
+                (uint32_t)(ag_port_us() / 1000) - s_far_failed_ms[k] <
+                    RD_FAR_RETRY_MS) {
+                return;
+            }
+            free_slot = k;
+            break;
+        }
+        if (free_slot < 0 && s_far_name[k][0] == '\0') {
+            free_slot = k;
+        }
+    }
+    if (free_slot < 0) {
+        ag_log(AG_LOG_WARN, TAG,
+               "%s is beyond a neighbour, and there is room for %d such nodes' "
+               "devices; raise RD_FAR",
+               name, RD_FAR);
+        return;
+    }
+    ag_strlcpy(s_far_name[free_slot], name, sizeof(s_far_name[free_slot]));
+    s_far_wire[free_slot] = via;
+    want_src((int32_t)AG_LINK_WIRES + free_slot);
 }

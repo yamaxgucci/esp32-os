@@ -156,6 +156,19 @@ function Invoke-Pair {
         [string[]]$SendA
     )
     $putForB = @($PutBoth) + @($PutB)
+    # B DOES NOT START TALKING UNTIL A HAS ITS FILES.
+    #
+    # The mirror of the wait further down (A starts after B's deliveries), and
+    # the half that was missing.  B's script runs on a clock of its own - a
+    # `link poll` of so many seconds - and a delivery to A that had to be sent
+    # again costs three minutes: B had finished and left before A said a word,
+    # and every check after that read a wire that carried nothing (26 Sep
+    # 2026: the run, share and job scenarios in one nodetest).  A says it is
+    # ready with a file; B's first step waits for it.  No `$` in the step:
+    # it is evaluated once by qemu-boot before the child PowerShell sees it.
+    $readyA = "build\nodetest-$Tag-a.ready"
+    Remove-Item $readyA -ErrorAction SilentlyContinue
+    $SendB = @("!powershell -NoProfile -Command `"for (;;) { if (Test-Path $readyA) { break }; Start-Sleep -Milliseconds 500 }`"") + @($SendB)
     $runner = "build\nodetest-$Tag-b.ps1"
     $lines = @("Set-Location '$root'", "& '$(Join-Path $PSScriptRoot 'qemu-boot.ps1')' ``")
     $lines += "    -Port 5566 -NetPort 5578 -TimeoutSec $TimeoutSec ``"
@@ -219,6 +232,7 @@ function Invoke-Pair {
             -TimeoutSec $TimeoutSec -LinkPort $linkPort -KeepOtherEmulators `
             -Flash 'build\qemu_flash_a.bin' `
             -Tag "a-$Tag" -LogPath "build\nodetest-$Tag-a.log" `
+            -ReadyFile $readyA `
             -Put (@($PutBoth) + @($PutA)) -Send $SendA | Out-Null
     } finally {
         if (-not $procB.WaitForExit($TimeoutSec * 2000)) {

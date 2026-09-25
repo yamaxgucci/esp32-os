@@ -13,6 +13,7 @@
 #include <argon/linkprov.h>
 #include <argon/log.h>
 #include <argon/nodename.h>
+#include <argon/noderdev.h>
 
 #include <argon/port/mem.h>
 #include <argon/port/sync.h>
@@ -729,6 +730,10 @@ static void peers_learn(const uint8_t *body, uint32_t len)
                 break;
             }
         }
+        /* new to this board, or heard through another wire: its devices */
+        const bool fresh = (slot == NC_PEERS) || s_peer[slot].via != via ||
+                           (uint32_t)(now - s_peer[slot].seen_ms) >
+                               NC_PEERS_TTL_MS;
         for (uint32_t k = 0; slot == NC_PEERS && k < NC_PEERS; k++) {
             if (!s_peer[k].used) {
                 slot = k;
@@ -755,6 +760,13 @@ static void peers_learn(const uint8_t *body, uint32_t len)
         p->via = via;
         p->seen_ms = now;
         ag_port_mutex_give(s_peerlock);
+        /*
+         * Every time it is heard of, not only the first: noderdev keeps what
+         * is attached and asks again after a failure, and a node that was
+         * heard of while it was restarting would otherwise never be asked.
+         */
+        (void)fresh;
+        ag_noderdev_far_named(via, name);
     }
 }
 

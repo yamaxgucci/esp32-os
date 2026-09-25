@@ -44,6 +44,10 @@ int32_t ag_nodedev_list(ag_devinfo_t *out, uint32_t max, uint32_t timeout_ms);
 /* The same, of the neighbour on one wire (-1: the wire this call means). */
 int32_t ag_nodedev_list_on(int32_t wire, ag_devinfo_t *out, uint32_t max,
                            uint32_t timeout_ms);
+/* The same, of any node: `dst` its name hash, `wire` the first hop to it -
+ * the board in between passes the question on and the answer back. */
+int32_t ag_nodedev_list_to(int32_t wire, uint16_t dst, ag_devinfo_t *out,
+                           uint32_t max, uint32_t timeout_ms);
 
 /*
  * "Could you run a program that needs this?"  `axe_flags` is a .AXE flags word;

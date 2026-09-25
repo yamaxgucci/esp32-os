@@ -201,6 +201,12 @@ function Invoke-XPair {
         [string[]]$PutA,
         [string[]]$SendA
     )
+    # And B does not start talking until A has ITS files: the other half of the
+    # wait below, written up at Invoke-Pair in tools\nodetest.ps1 (26 Sep 2026:
+    # a delivery to A sent again, B gone by the time A spoke, 12 of 22 checks).
+    $readyA = "build\xclutest-$Tag-a.ready"
+    Remove-Item $readyA -ErrorAction SilentlyContinue
+    $SendB = @("!powershell -NoProfile -Command `"for (;;) { if (Test-Path $readyA) { break }; Start-Sleep -Milliseconds 500 }`"") + @($SendB)
     $runner = "build\xclutest-$Tag-b.ps1"
     $q = { param($a) '@(' + (($a | ForEach-Object { "'$_'" }) -join ',') + ')' }
     $lines = @("Set-Location '$root'",
@@ -253,6 +259,7 @@ function Invoke-XPair {
             -TimeoutSec $TimeoutSec -LinkPort $linkPort -KeepOtherEmulators `
             -Flash "build\qemu_flash_xclu_a.bin" `
             -Tag "a-$Tag" -LogPath "build\xclutest-$Tag-a.log" `
+            -ReadyFile $readyA `
             -Put $PutA -Send $SendA | Out-Null
     } finally {
         if (-not $procB.WaitForExit($TimeoutSec * 2000)) {

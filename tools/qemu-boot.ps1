@@ -110,6 +110,9 @@ param(
     # that listens.  Exactly one of the pair listens; the other connects.
     [int]$LinkPort = 0,
     [switch]$LinkListen,
+    # A file this guest creates once its -Put deliveries are in, so the OTHER
+    # guest of a pair can wait for it before it starts talking (nodetest.ps1).
+    [string]$ReadyFile = '',
 
     # Which flash image, and whether to leave other emulators alone.
     #
@@ -723,6 +726,7 @@ try {
             # recv rewrites the file from the beginning, so a retry cannot
             # leave behind the truncation it is there to repair.
             $sent = $false
+            $began = Get-Date
             foreach ($attempt in 1..3) {
                 if ($attempt -gt 1) {
                     Write-Host ("  attempt $attempt of 3 - the guest stopped " +
@@ -777,17 +781,34 @@ try {
             # Generous, and scaled: writing to the RAM disk is instant, but the
             # same file onto FAT on flash is a sector rewrite every 64 bytes and
             # takes seconds per kilobyte.
-            Send-Line 'END'
             # Wait for this transfer's own length, not a bare "bytes written":
             # a previous Put's report can still be on the scrolling screen and
             # would look like a new one if only the words were counted.
+            #
+            # Counted before `END` goes, so nothing that answers it can be in
+            # the count.  A transfer that is sent again costs this wait - 183 s
+            # for NODELINK.SYS - and on 26 Sep 2026 that was four times in one
+            # nodetest, each long enough for node B to finish its script and
+            # leave.  Why the report was not seen in time is not known yet: the
+            # lines below say how long each part took, to find out.
             $done = "$($bytes.Length) bytes written"
+            [void](Read-Available)
             $written = Count-Of $done
+            $lines_done = Get-Date
+            Send-Line 'END'
             if (Wait-Text -Needle $done -Was $written `
                           -Seconds (120 + $bytes.Length / 64)) {
                     $sent = $true
+                    # When: a transfer that takes minutes is what decides
+                    # whether the other guest of a pair is still there.
+                    Write-Host ("  {0}: lines in {1:N1} s, written {2:N1} s after END" -f
+                                $guest, ($lines_done - $began).TotalSeconds,
+                                ((Get-Date) - $lines_done).TotalSeconds)
                     break
                 }
+                Write-Host ("  {0}: no '{1}' {2:N0} s after END (seen {3} before it)" -f
+                            $guest, $done, ((Get-Date) - $lines_done).TotalSeconds,
+                            $written) -ForegroundColor Yellow
             }
             if (-not $sent) {
                 throw ("$guest did not arrive after three attempts: recv " +
@@ -807,6 +828,11 @@ try {
         # seconds; see tools\nodetest.ps1.
         Write-Host '--- deliveries done ---'
 
+    }
+
+    # Ready, deliveries or none: the other guest of a pair waits for this.
+    if ($found -and $ReadyFile) {
+        Set-Content -Path $ReadyFile -Value 'ready' -Encoding ascii
     }
 
     if ($found -and $Send.Count -gt 0) {

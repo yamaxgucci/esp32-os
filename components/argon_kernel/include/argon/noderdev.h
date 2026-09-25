@@ -69,6 +69,10 @@ int32_t ag_noderdev_wire_for(uint32_t axe_flags);
 /* `again`: the neighbour started over (it asked), so what it lent before is
  * gone even if its devices are here; otherwise only a wire with none yet. */
 void ag_noderdev_peer_named(int32_t wire, bool again);
+/* A node beyond a neighbour, heard of through wire `via` (the cluster's list
+ * of far nodes): its devices too, addressed to it, the neighbour passing them
+ * on. */
+void ag_noderdev_far_named(int32_t via, const char *name);
 
 #ifdef __cplusplus
 }

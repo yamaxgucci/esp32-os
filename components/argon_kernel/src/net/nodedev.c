@@ -266,6 +266,19 @@ int32_t ag_nodedev_list(ag_devinfo_t *out, uint32_t max, uint32_t timeout_ms)
 int32_t ag_nodedev_list_on(int32_t wire, ag_devinfo_t *out, uint32_t max,
                            uint32_t timeout_ms)
 {
+    /* Addressed to the neighbour on that wire by its name, when it has said
+     * one: 0 is "whoever reads it", which the neighbour is too. */
+    uint16_t dst = 0;
+    if (wire >= 0) {
+        const char *peer = ag_node_peer_name_at(wire);
+        dst = (peer != NULL) ? ag_node_hash(peer) : 0u;
+    }
+    return ag_nodedev_list_to(wire, dst, out, max, timeout_ms);
+}
+
+int32_t ag_nodedev_list_to(int32_t wire, uint16_t dst, ag_devinfo_t *out,
+                           uint32_t max, uint32_t timeout_ms)
+{
     if (out == NULL || max == 0u) {
         return -AG_EINVAL;
     }
@@ -275,13 +288,6 @@ int32_t ag_nodedev_list_on(int32_t wire, ag_devinfo_t *out, uint32_t max,
     /* The answer arrives on the reader; asking from it waits for itself. */
     if (ag_linkprov_in_reader()) {
         return -AG_EBUSY;
-    }
-    /* Addressed to the neighbour on that wire by its name, when it has said
-     * one: 0 is "whoever reads it", which the neighbour is too. */
-    uint16_t dst = 0;
-    if (wire >= 0) {
-        const char *peer = ag_node_peer_name_at(wire);
-        dst = (peer != NULL) ? ag_node_hash(peer) : 0u;
     }
     if (!s_listening) {
         const ag_err_t e = ag_nodedev_start();
